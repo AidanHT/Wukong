@@ -16,6 +16,7 @@ harnesses that consume them live in `crates/wukongc/tests/` and reach this direc
 | `run/lib/` | 2 (`mathlib.wk`, `deep.wk`) | Support modules for `run/import_multi.wk`. **Not fixtures** — harnesses use non-recursive `read_dir`. |
 | `fail/` | **113** top-level `*.wk` | Must be **rejected at compile time** with a specific stable diagnostic code. Directory is `tests/fail`, **not** `tests/compile-fail`. |
 | `fail/lib/` | 2 (`badlib.wk`, `dup.wk`) | Support for import fixtures. **Not fixtures.** |
+| `warn/` | 12 top-level `*.wk` | Must **compile** and produce exactly the warnings (lints) their `// EXPECT-WARN:` / `// EXPECT-ERROR:` / `// EXPECT-NONE` lines list, in order. |
 | `imports/` | 6 | Flat import-graph fixtures consumed **only** by `crates/wukong_driver/src/loader.rs` unit tests. E2e harnesses ignore this directory. |
 
 See each subdirectory's `README.md` for format details and landmines.
@@ -52,6 +53,20 @@ module tests.fail.array_index_oob
 - Harness drives `--error-format=json --emit=mir` and asserts stderr contains `"code":"<code>"`.
 - Never renumber or recycle a code. `E0001` is retired.
 
+## Fixture format — `warn/`
+
+```wk
+// FLAGS: -D warnings
+// EXPECT-ERROR: W0001
+module tests.warn.deny_warnings_flag
+```
+
+- `// EXPECT-WARN: <code>` / `// EXPECT-ERROR: <code>` — one per expected diagnostic, in emission
+  order (source order); the harness compares the **whole** JSON stream, so an extra warning fails.
+- `// EXPECT-NONE` — the program must compile with no diagnostic at all.
+- `// FLAGS: <args>` — extra arguments, appended to `--error-format=json --emit=mir`.
+- Exit status must be 1 when an `EXPECT-ERROR` is listed, 0 otherwise.
+
 ## Gates over this corpus
 
 `crates/wukongc/tests/run.rs` — `run_suite`, `optimization_is_observationally_invariant`,
@@ -59,6 +74,9 @@ module tests.fail.array_index_oob
 
 `crates/wukongc/tests/fail.rs` — `compile_fail_suite`, `lexer_and_parser_diagnostics_are_reachable`,
 `every_catalogued_code_is_exercised`, `imported_file_diagnostics_carry_their_own_path`.
+
+`crates/wukongc/tests/warn.rs` — `warn_suite` over `warn/`; `corpus_is_warning_free` (lints
+`run/` and `examples/`) is `#[ignore]`d until the corpus is brought to zero warnings.
 
 `crates/wukongc/tests/determinism.rs` — fresh-process byte identity for MIR, object, and diagnostic
 emission.

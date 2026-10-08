@@ -208,6 +208,10 @@ pub use scratch::{
     scratch_reset, wukong_rt_scratch_alloc, wukong_rt_scratch_mark, wukong_rt_scratch_release,
 };
 
+/// `extern "C"` support: the C-symbol resolver the JIT and the interpreter share, and the
+/// interpreter's scalar call marshalling.
+pub mod cffi;
+
 /// `bf16` (the "brain float": an `f32` truncated to its top 16 bits) round-to-nearest-even from an
 /// `f32`, returning the 16 stored bits. This is the single shared definition the interpreter, the
 /// native backend (which emits the identical integer arithmetic in CLIF), and the bf16 GEMM packer

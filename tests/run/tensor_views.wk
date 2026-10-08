@@ -1,0 +1,87 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 4
+// EXPECT-OUT: 6
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 15
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 40
+// EXPECT-OUT: 50
+// EXPECT-OUT: 60
+// EXPECT-OUT: 6
+// EXPECT-OUT: 150
+// EXPECT-OUT: 21
+// EXPECT-OUT: 51
+// EXPECT-OUT: 150
+module tests.run.tensor_views
+
+// Rank-reducing VIEWS and reshape: indexing a contiguous tensor with fewer indices than its rank is
+// the sub-tensor of the remaining axes — `m[1]` on a [2, 3] matrix is its second row, a
+// `Tensor[f32, 3]` that names part of the same buffer (no copy) — and `x as Tensor[..]` views a
+// buffer under a new shape with the same element count. A view can be bound, indexed further,
+// passed to a shape-generic function, written through, returned, and iterated (`for r in m` walks
+// the rows). Every value printed is derived from the scalar meaning of the source, one lane each.
+
+fn row_sum<N>(r: Tensor[f32, N]) -> f32 {
+    let mut s: f32 = 0.0;
+    for i in 0..N {
+        s = s + r[i];
+    }
+    return s;
+}
+
+fn scale_row<N>(mut r: Tensor[f32, N], k: f32) {
+    for i in 0..N {
+        r[i] = r[i] * k;
+    }
+}
+
+fn total<M, N>(a: Tensor[f32, M, N]) -> f32 {
+    let mut s: f32 = 0.0;
+    for i in 0..M {
+        for j in 0..N {
+            s = s + a[i, j];
+        }
+    }
+    return s;
+}
+
+// A view returned from a function: the row of `a` the caller asked for.
+fn row<M, N>(a: Tensor[f32, M, N], i: i64) -> Tensor[f32, N] {
+    return a[i];
+}
+
+fn main() -> i32 {
+    let mut buf: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    // m = [[1, 2, 3], [4, 5, 6]]
+    let m = buf as Tensor[f32, 2, 3];
+    let r1 = m[1];
+    print(r1[0] as i32); // 4
+    print(r1[2] as i32); // 6
+    // An index into a view is the full index: m[0][2] == m[0, 2] == 3.
+    print(m[0][2] as i32);
+    print(row_sum(m[0]) as i32); // 1 + 2 + 3 = 6
+    print(row_sum(m[1]) as i32); // 4 + 5 + 6 = 15
+    // Writing through a view writes the original buffer: row 1 becomes 40 50 60.
+    scale_row(m[1], 10.0);
+    for i in 0..6 {
+        print(buf[i] as i32); // 1 2 3 40 50 60
+    }
+    // `for` over a rank-2 tensor yields its rows: 1+2+3 = 6, then 40+50+60 = 150.
+    for r in m {
+        print(row_sum(r) as i32);
+    }
+    // A rank-3 view: cube[t] = t as [2, 2, 3]; block 1 holds 6..11, its row 0 is 6 7 8.
+    let mut cube: [f32; 12] = [0.0; 12];
+    for t in 0..12 {
+        cube[t] = t as f32;
+    }
+    let c = cube as Tensor[f32, 2, 2, 3];
+    print(row_sum(c[1][0]) as i32); // 6 + 7 + 8 = 21
+    print(total(c[1]) as i32); // 6 + 7 + 8 + 9 + 10 + 11 = 51
+    print(row_sum(row(m, 1)) as i32); // the scaled row: 150
+    return 0;
+}

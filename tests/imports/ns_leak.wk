@@ -1,0 +1,7 @@
+// Loader unit-test fixture: calls the ROOT file's `root_only` without importing the root. Imports
+// are per file, so this must not resolve (the old flat namespace let it through).
+module ns_leak
+
+pub fn leak() -> i32 {
+    return root_only();
+}

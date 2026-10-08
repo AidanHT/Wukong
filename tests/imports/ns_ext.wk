@@ -1,0 +1,11 @@
+// Loader unit-test fixture: declares the same C function as the importing root, with the same
+// signature. One C symbol, one declaration after loading.
+module ns_ext
+
+extern "C" {
+    fn cos(x: f64) -> f64;
+}
+
+pub fn twice_cos(x: f64) -> f64 {
+    return cos(x) * 2.0;
+}

@@ -1,23 +1,18 @@
 // EXPECT-CODE: E0406
 module tests.fail.generic_array_length
 
-// `Ty::Array` carries a plain integer length and has no representation for a symbolic extent
-// (unlike `Ty::Tensor`, whose `Dim::Var` is bound per call site). A generic array length was
-// exempted from the name check and then evaluated to 0 here, while mir_build lowered a bare
-// `MirType::Ptr` — the same two-crate desync as `array_len_not_constant.wk`, reached through a
-// spelling that looks like the shape-generic code this language exists to express. Say so, and
-// name the `Tensor[T, N]` spelling that really is checked.
-fn sum<N>(a: [f32; N], n: i64) -> f32 {
-    let mut s: f32 = 0.0;
-    let mut i: i64 = 0;
-    while i < n {
-        s = s + a[i];
-        i = i + 1;
-    }
-    return s;
+// A generic length is the shape of a PARAMETER (`fn f<N>(a: [f32; N])` is the shape-generic buffer
+// `Tensor[f32, N]`, bound per call), but a LOCAL array of generic length would need stack storage
+// whose size is only known at run time. It used to be exempted from the name check and evaluate to
+// 0 here while mir_build lowered a bare pointer slot — the two-crate desync of
+// `array_len_not_constant.wk`. It is reported instead.
+fn scratch<N>(a: [f32; N]) -> f32 {
+    let mut tmp: [f32; N];
+    tmp[0] = a[0];
+    return tmp[0];
 }
 
 fn main() -> i32 {
     let x: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
-    return sum(x, 4) as i32;
+    return scratch(x) as i32;
 }

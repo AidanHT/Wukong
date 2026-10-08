@@ -7,11 +7,25 @@
 use crate::{Function, Inst, Op, Program, Terminator, ValueId};
 use wukong_span::Interner;
 
-/// Render a whole program: every function in `funcs` order, one blank line apart. `Program::statics`
-/// is *not* rendered, so a `global_addr <sym>` line is the only trace a string literal leaves in the
-/// dump. Neither are `Function::vec_kernels` — a `veckernel #k(…)` line shows the call, not the recipe.
+/// Render a whole program: its `extern "C"` declarations (one `declare` line each, then a blank
+/// line — nothing at all for a program with none), then every function in `funcs` order, one blank
+/// line apart. `Program::statics` is *not* rendered, so a `global_addr <sym>` line is the only trace
+/// a string literal leaves in the dump. Neither are `Function::vec_kernels` — a `veckernel #k(…)`
+/// line shows the call, not the recipe.
 pub fn print_program(p: &Program, interner: &Interner) -> String {
     let mut out = String::new();
+    for e in &p.externs {
+        let params: Vec<String> = e.params.iter().map(|q| q.ty.display()).collect();
+        out.push_str(&format!(
+            "declare extern \"C\" fn {}({}) -> {}\n",
+            interner.resolve(e.name),
+            params.join(", "),
+            e.ret.ty.display()
+        ));
+    }
+    if !p.externs.is_empty() {
+        out.push('\n');
+    }
     for f in &p.funcs {
         out.push_str(&print_function(f, interner));
         out.push('\n');

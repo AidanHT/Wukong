@@ -1,0 +1,17 @@
+// EXPECT-CODE: E0501
+module tests.fail.array_param_tensor_length
+
+// A fixed-size array parameter fed a tensor had no unification arm at all, so `last4` accepted a
+// tensor of any size — a tensor is a base pointer, the ABI agreed, and the callee indexed whatever
+// buffer it was given. The tensor must hold exactly the array's length.
+fn last4(a: [f32; 4]) -> f32 {
+    return a[3];
+}
+
+fn f(t: Tensor[f32, 2]) -> f32 {
+    return last4(t);
+}
+
+fn main() -> i32 {
+    return 0;
+}

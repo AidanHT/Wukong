@@ -4856,6 +4856,57 @@ fn unknown_external_symbol_fails_the_compile() {
     assert!(err.contains("unbound_foreign_function"), "{err}");
 }
 
+/// A DECLARED `extern "C"` function (`Program::externs`) is imported with its C signature: the JIT
+/// binds the host symbol and the call runs (toupper('a' = 97) = 'A' = 65), and an object leaves the
+/// symbol to the linker. A declared symbol no loaded C library defines is a clean error from the
+/// JIT, not cranelift-jit's finalization panic.
+#[test]
+fn declared_extern_c_function_is_imported_and_called() {
+    use wukong_mir::{Builder, ExternFn, ExternParam, MirType, Op, Program};
+    fn program_calling(interner: &mut Interner, callee: &str) -> Program {
+        let main = interner.intern("main");
+        let func = interner.intern(callee);
+        let mut b = Builder::new(main, MirType::I32);
+        let c = b.build(MirType::I32, Op::ConstInt(97, MirType::I32));
+        let v = b.build(
+            MirType::I32,
+            Op::Call {
+                func,
+                args: vec![c],
+            },
+        );
+        b.ret(Some(v));
+        let mut program = Program::new();
+        program.funcs.push(b.finish());
+        let int = ExternParam {
+            ty: MirType::I32,
+            signed: true,
+        };
+        program.externs.push(ExternFn {
+            name: func,
+            params: vec![int.clone()],
+            ret: int,
+        });
+        program
+    }
+    let mut interner = Interner::new();
+    let program = program_calling(&mut interner, "toupper");
+    assert!(wukong_mir::verify::verify_program(&program).is_empty());
+    let main = interner.intern("main");
+    let (code, _) = crate::jit_run(&program, main, &interner).expect("toupper resolves");
+    assert_eq!(code, 65);
+    crate::emit_object(&program, &interner).expect("an object leaves the import to the linker");
+
+    let program = program_calling(&mut interner, "zz_no_such_c_symbol_anywhere");
+    let err = crate::jit_compile(&program, main, &interner)
+        .err()
+        .expect("an unresolvable extern must fail the JIT compile");
+    assert!(
+        err.contains("unresolved external symbol `zz_no_such_c_symbol_anywhere`"),
+        "{err}"
+    );
+}
+
 #[test]
 fn runtime_kernel_with_unhandled_arity_fails_the_compile() {
     let src = "module m\nfn mm(a:[f32;64],b:[f32;64],mut c:[f32;64]) { \
@@ -5564,6 +5615,7 @@ fn vector_ops_interp_matches_native() {
     let prog = Program {
         funcs: vec![b.finish()],
         statics: Vec::new(),
+        externs: Vec::new(),
         level: MirLevel::Low,
     };
     for f in &prog.funcs {

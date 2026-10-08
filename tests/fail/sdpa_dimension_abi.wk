@@ -1,0 +1,16 @@
+// EXPECT-CODE: C0001
+module tests.fail.sdpa_dimension_abi
+
+// The attention kernel takes its `s`/`d` as SIGNED 64-bit integers. A constant dimension of 2^63 is a
+// well-typed `u64`, but it has no representation in that ABI: passed through, it would become a
+// negative extent the kernel silently treats as empty. It is not a shape error (no operand disagrees
+// with anything — the value is simply unrepresentable downstream), so it is the codegen limit C0001
+// at the dimension, never a call with a wrapped extent.
+
+fn main() -> i32 {
+    let q: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+    let mut out: [f32; 4] = [0.0; 4];
+    sdpa(q, q, q, out, 9223372036854775808u64, 2, 1.0, 0);
+    print(out[0]);
+    return 0;
+}

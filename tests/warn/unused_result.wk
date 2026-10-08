@@ -1,0 +1,20 @@
+// EXPECT-WARN: W0006
+// EXPECT-WARN: W0004
+module tests.warn.unused_result
+
+// The motivating typo: `==` written where `=` was meant. The comparison is computed and thrown
+// away (W0004), so the `mut` output buffer is never written (W0006, reported at the parameter,
+// which comes first in the file). Both compile silently without the lints.
+fn copy(a: [f32; 4], mut out: [f32; 4]) {
+    for i in 0..4 {
+        out[i] == a[i];
+    }
+}
+
+fn main() -> i32 {
+    let a: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let mut o: [f32; 4] = [0.0; 4];
+    copy(a, o);
+    print(o[0]);
+    return 0;
+}

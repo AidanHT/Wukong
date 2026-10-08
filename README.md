@@ -86,6 +86,15 @@ not duplicate them. In summary, Wukong:
   `@unchecked` on a `fn` is the explicit opt-out. Runtime indices into fixed-size arrays and
   constant-shape tensors, and the extents handed to recognized runtime kernels, are not yet checked.
   A pointer used as a condition (`if p`) is a null test.
+- **Abstraction without indirection.** `impl` blocks give structs and enums methods and associated
+  functions; traits with bounds (`<T: Shape>`, `where`) and function-typed parameters
+  (`f: fn(f32) -> f32`) are dispatched statically — every generic and higher-order function is
+  specialized per instantiation, so no vtable or function pointer exists at run time
+  (`tests/run/{methods_impl,traits_static_dispatch,fn_params}.wk`).
+- **Kernels callable by name.** `matmul`, `linear`, `softmax`, `layernorm`, `rmsnorm`, `transpose`, the
+  buffer activations (`gelu(x, out)`, …), `sum`/`dot` and `sdpa` reach the tuned runtime kernels
+  directly, with real shape signatures (`E0409` when a dimension cannot be inferred) — the explicit
+  door beside the loop-nest recognizers (`tests/run/builtin_*.wk`).
 - **Zero hidden cost.** No GC, no implicit copies of large aggregates, no surprise allocations.
 - **Domain-aware optimization (implementation today).** The compiler **recognizes a matmul nest** (the
   `ikj` accumulate and `ijk` dot-product forms, incl. `nn.Linear` `A·Bᵀ`) and may lower it to a tuned
@@ -99,10 +108,19 @@ not duplicate them. In summary, Wukong:
   tensor ops is still planned **as a CPU MIR pass**; on GPU, `wukong_codegen_gpu`'s fusion planner and
   `--backend=gpu-native` can compile an eligible whole program into a cooperative megakernel. These
   recognizers are invisible to the user — you still write the loop nest in `.wk`.
-- **Interop (planned).** A clean C ABI (`@extern("C")` / `@export`) is designed to call into
-  BLAS/cuBLAS and embed Wukong kernels in C/C++/CUDA stacks. Attribute names are validated against
-  the closed language set; unknown names report `E0306`. General C ABI symbol export/import
-  remains planned (see the roadmap).
+- **Interop.** Calling C runs today: an `extern "C" { fn ldexp(x: f64, e: i32) -> f64; }` block
+  is imported by the native backend (JIT-bound from the host process, or left to the linker for
+  `--emit=exe`), and the interpreter calls the same host symbol for scalar signatures, so the two
+  stay bit-exact (`tests/run/extern_c_libm.wk`). Exporting Wukong kernels under a stable C name
+  (`@export`) and the `@extern("C")` attribute spelling remain planned; attribute names are
+  validated against the closed language set (unknown names report `E0306`).
+- **Warnings for kernels that compile but compute nothing.** A program that checks clean is linted
+  (`W0001`–`W0007`, `W0030`/`W0031`): an unused variable or an accumulator that is never read, a
+  `mut` output buffer that is never written, `out[i] == a[i] + b[i];` written for `=`, unreachable
+  code, an unreachable function, a missing `;`, and a `(`/`[`/`-` at the start of a line that
+  silently continues the expression above. Levels come from `-A/-W/-D <lint>` (`-D warnings`) and
+  `@allow/@warn/@deny(<lint>)`; see `docs/language-guide.md`. A Unicode lookalike of ASCII
+  punctuation (`−` U+2212 for `-`) is `E0105`, naming the character it imitates.
 
 ## Runs the real GPT-2 124M end-to-end
 

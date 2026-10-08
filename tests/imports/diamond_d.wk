@@ -2,6 +2,6 @@
 // diamond_c, must be loaded exactly once.
 module diamond_d
 
-fn shared_leaf() -> i32 {
+pub fn shared_leaf() -> i32 {
     return 7;
 }

@@ -28,11 +28,16 @@
 
 mod alias;
 mod bounds;
+mod builtins;
 mod canon;
+mod defer;
+mod externs;
 #[cfg(test)]
 mod fp_contract_tests;
+mod methods;
 mod noalias;
 mod par_grain;
+mod shape_ops;
 mod tile;
 mod tindex;
 
@@ -87,6 +92,9 @@ struct Mono {
     /// Instances to lower, in discovery order (deterministic): (instance symbol, original symbol,
     /// substitution).
     instances: Vec<(Symbol, Symbol, HashMap<Symbol, Ty>)>,
+    /// Each function's function-typed parameters: (parameter index, pseudo-generic key). Those keys
+    /// are also in `type_generics`, bound to `Ty::Named(<function>)` (see `methods.rs`).
+    fn_value_keys: HashMap<Symbol, Vec<(usize, Symbol)>>,
     /// Module string table: decoded UTF-8 bytes (with the trailing NUL) -> the `.rodata` blob's
     /// symbol. Built by [`collect_static_strings`] and read by the `ExprKind::Str` lowering to emit
     /// `Op::GlobalAddr(sym)`. Threaded to the real function lowerer via the already-passed `&Mono`,
@@ -264,6 +272,23 @@ fn mono_type_name(ty: &Ty, interner: &Interner) -> String {
 /// Bind the value-type generics `tg` by matching a parameter type against a concrete argument type.
 fn bind_generics(param_ty: &Ty, arg_ty: &Ty, tg: &[Symbol], subst: &mut HashMap<Symbol, Ty>) {
     match (param_ty, arg_ty) {
+        // A function-typed parameter binds the type generics of its signature from the bound
+        // function's (`fn map<T>(f: fn(T) -> T, x: T)` with `square: fn(f32) -> f32`).
+        (
+            Ty::Fn {
+                params: ps,
+                ret: pr,
+            },
+            Ty::Fn {
+                params: as_,
+                ret: ar,
+            },
+        ) => {
+            for (p, a) in ps.iter().zip(as_) {
+                bind_generics(p, a, tg, subst);
+            }
+            bind_generics(pr, ar, tg, subst);
+        }
         (Ty::Named(g), a) if tg.contains(g) => {
             if !ty_has_generic(a, tg) {
                 subst.entry(*g).or_insert_with(|| a.clone());
@@ -306,6 +331,7 @@ struct MonoCollector<'a> {
     sema: &'a SemaResult,
     interner: &'a mut Interner,
     type_generics: HashMap<Symbol, Vec<Symbol>>,
+    fn_value_keys: HashMap<Symbol, Vec<(usize, Symbol)>>,
     fn_bodies: HashMap<Symbol, &'a Block>,
     instance_of: HashMap<(Symbol, String), Symbol>,
     instances: Vec<(Symbol, Symbol, HashMap<Symbol, Ty>)>,
@@ -323,7 +349,14 @@ impl MonoCollector<'_> {
         if !p.is_single() {
             return;
         }
-        let name = p.first().sym;
+        // A call through a function-typed parameter is a call of the function this instance binds.
+        let name =
+            methods::bound_fn(p.first().sym, outer, self.interner).unwrap_or_else(|| p.first().sym);
+        self.handle_named_call(name, args, outer);
+    }
+
+    /// [`Self::handle_call`] once the callee is resolved to the function `name`.
+    fn handle_named_call(&mut self, name: Symbol, args: &[Expr], outer: &HashMap<Symbol, Ty>) {
         let tg = match self.type_generics.get(&name) {
             Some(g) if !g.is_empty() => g,
             _ => return,
@@ -346,6 +379,17 @@ impl MonoCollector<'_> {
                 &resolved
             };
             bind_generics(pty, aty, tg, &mut subst);
+        }
+        // Each function-typed parameter binds to the function its argument names.
+        if let Some(keys) = self.fn_value_keys.get(&name) {
+            for &(i, key) in keys {
+                if let Some(f) = args
+                    .get(i)
+                    .and_then(|a| methods::fn_value_of(a, outer, self.sema, self.interner))
+                {
+                    subst.insert(key, Ty::Named(f));
+                }
+            }
         }
         let Some(canon) = canon_type_args(tg, &subst, self.interner) else {
             return;
@@ -439,7 +483,11 @@ impl MonoCollector<'_> {
                 for a in args {
                     self.walk_expr(a, subst);
                 }
-                self.handle_call(callee, args, subst);
+                // A call through a trait bound reaches the instantiated type's method.
+                match methods::dispatch_in_instance(e, callee, args, subst, self.sema) {
+                    Some((target, full)) => self.handle_named_call(target, &full, subst),
+                    None => self.handle_call(callee, args, subst),
+                }
             }
             ExprKind::Index { base, indices } => {
                 self.walk_expr(base, subst);
@@ -499,13 +547,20 @@ impl MonoCollector<'_> {
 /// so instance names can be interned (needs `&mut interner`).
 fn collect_mono(module: &Module, sema: &SemaResult, interner: &mut Interner) -> Mono {
     let mut type_generics: HashMap<Symbol, Vec<Symbol>> = HashMap::default();
+    let mut fn_value_keys: HashMap<Symbol, Vec<(usize, Symbol)>> = HashMap::default();
     let mut fn_bodies: HashMap<Symbol, &Block> = HashMap::default();
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
             if let Some(body) = &f.body {
                 fn_bodies.insert(f.name.sym, body);
                 if let Some(DefKind::Fn(sig)) = sema.defs.lookup(f.name.sym).map(|d| &d.kind) {
-                    let tg = fn_type_generics(sig);
+                    let mut tg = fn_type_generics(sig);
+                    // A function-typed parameter specializes like a type generic (`methods.rs`).
+                    let keys = methods::fn_value_keys(f, sig, interner);
+                    tg.extend(keys.iter().map(|&(_, k)| k));
+                    if !keys.is_empty() {
+                        fn_value_keys.insert(f.name.sym, keys);
+                    }
                     if !tg.is_empty() {
                         type_generics.insert(f.name.sym, tg);
                     }
@@ -522,6 +577,7 @@ fn collect_mono(module: &Module, sema: &SemaResult, interner: &mut Interner) -> 
         sema,
         interner,
         type_generics,
+        fn_value_keys,
         fn_bodies,
         instance_of: HashMap::default(),
         instances: Vec::new(),
@@ -550,6 +606,7 @@ fn collect_mono(module: &Module, sema: &SemaResult, interner: &mut Interner) -> 
         instance_of: c.instance_of,
         type_generics: c.type_generics,
         instances: c.instances,
+        fn_value_keys: c.fn_value_keys,
         // Populated separately by the caller (`lower_program`) via `collect_static_strings`, which
         // also needs `&mut interner`; kept out of the generic-collection walk to avoid coupling.
         strings: HashMap::default(),
@@ -1035,6 +1092,36 @@ fn lower_program_pooled(
     locate: &dyn Fn(Span) -> String,
     pool: usize,
 ) -> (Program, Vec<Diagnostic>, bool) {
+    // First of all, before the two normalizations below: every method call whose target sema
+    // resolved becomes the plain call of its function, so everything below sees an ordinary call
+    // (`methods.rs`).
+    let desugared = methods::desugar_module(module, sema);
+    let desugared_sema = desugared.as_ref().map(|(_, extra)| {
+        let mut s = sema.clone();
+        s.types.extend(extra.iter().map(|(id, t)| (*id, t.clone())));
+        s
+    });
+    let module: &Module = desugared.as_ref().map(|(m, _)| m).unwrap_or(module);
+    let sema: &SemaResult = desugared_sema.as_ref().unwrap_or(sema);
+
+    // Then `defer`: it copies each deferred expression onto every exit of its block, so the
+    // normalizations, recognizers and lowerers below only ever see plain statements (see
+    // `defer.rs`). It runs AFTER the method desugaring so a deferred `x.m()` is copied as the plain
+    // call it became; every copy carries its original's sema records (types, call dimensions,
+    // builtin calls, trait-bound method calls) under its fresh id. `None` — nothing cloned — for
+    // the common module without a `defer`.
+    let deferred = match defer::lower_defers(module, sema, interner) {
+        Ok(d) => d,
+        Err(diags) => return (Program::new(), diags, false),
+    };
+    let defer_sema = deferred.as_ref().map(|(_, extra)| {
+        let mut s = sema.clone();
+        extra.apply(&mut s);
+        s
+    });
+    let module: &Module = deferred.as_ref().map(|(m, _)| m).unwrap_or(module);
+    let sema: &SemaResult = defer_sema.as_ref().unwrap_or(sema);
+
     // Two AST normalizations run back to back, before anything looks at the tree, because every
     // kernel recognizer and the autovectorizer match a *syntactic* shape on the raw AST.
     //
@@ -1069,6 +1156,9 @@ fn lower_program_pooled(
     // precondition the recognizer cannot establish from inside one function; this supplies the
     // missing half. See `alias.rs`.
     let alias_facts = alias::AliasFacts::analyze(module, sema);
+    // Functions a trait-bound call or a function-typed parameter can reach: calls `alias.rs` cannot
+    // see, so none of them may claim provably disjoint buffer parameters.
+    let dispatch_taint = methods::dispatch_taint(module, sema);
     // Runtime symbols the matmul recognizer lowers a GEMM nest to (interned once, threaded down).
     let gemm = GemmSyms {
         recognize: opts.recognize,
@@ -1085,6 +1175,7 @@ fn lower_program_pooled(
         println_str: interner.intern("println_str"),
         print_u: interner.intern("print_u"),
         println_u: interner.intern("println_u"),
+        assert_fn: interner.intern("assert"),
         nt: interner.intern("wukong_sgemm_nt"),
         nt_par: interner.intern("wukong_sgemm_nt_parallel"),
         tn: interner.intern("wukong_sgemm_tn"),
@@ -1113,6 +1204,7 @@ fn lower_program_pooled(
         bias_bcast: interner.intern("wukong_bias_bcast_f32"),
         bias_bcast_par: interner.intern("wukong_bias_bcast_f32_parallel"),
         sred_par: interner.intern("wukong_sreduce_f32_parallel"),
+        sred: interner.intern("wukong_sreduce_f32"),
         argreduce: interner.intern("wukong_argreduce_f32"),
         argreduce_par: interner.intern("wukong_argreduce_f32_parallel"),
         norm: interner.intern("wukong_norm_f32"),
@@ -1259,6 +1351,9 @@ fn lower_program_pooled(
     let (str_table, statics) = collect_static_strings(module, sema, interner);
     mono.strings = str_table;
     program.statics = statics;
+    // `extern "C"` declarations become the program's import table (see `externs.rs`): the one
+    // place every backend resolves a call to a C function's signature and symbol.
+    program.externs = externs::lower_externs(module, sema, interner, &mut diags);
     // Mint the synthetic `"<local>.<field>"` names for every struct-field buffer base the module
     // indexes, so a recognizer holding only `&Interner` can name `l.wq` as an operand and
     // `kernel_base_ptr` can resolve it. Must run before any recognizer probe looks at the tree.
@@ -1357,7 +1452,10 @@ fn lower_program_pooled(
                 // means some call site in this program can hand two of this function's buffer
                 // parameters the same array, so no recognizer inside it may emit a kernel whose
                 // contract is "operands disjoint". See `alias.rs` for the decision and its reasons.
-                let gemm = alias_gemm(gemm, alias_facts.alias_free(f.name.sym));
+                let gemm = alias_gemm(
+                    gemm,
+                    alias_facts.alias_free(f.name.sym) && !dispatch_taint.contains(&f.name.sym),
+                );
                 // ---- The whole-function kernel interceptions ------------------------------------
                 //
                 // Every arm in this block replaces the function's ordinary lowering with a
@@ -2128,7 +2226,10 @@ fn lower_program_pooled(
             let gemm = strict_fp_gemm(gemm, strict_fp_fns.contains(orig));
             // Aliasing is a property of the ORIGINAL function's call sites: every instantiation of
             // a type-generic template shares them.
-            let gemm = alias_gemm(gemm, alias_facts.alias_free(*orig));
+            let gemm = alias_gemm(
+                gemm,
+                alias_facts.alias_free(*orig) && !dispatch_taint.contains(orig),
+            );
             let func = lower_fn(
                 f,
                 body,
@@ -2505,6 +2606,7 @@ fn parallel_spec<'a>(
         par: None,
         tile_queue: vec![],
         param_arrays: vec![],
+        dyn_extents: HashMap::default(),
     };
     for (p, ty) in f.params.iter().zip(&param_tys) {
         let base = proof.builder.add_param(MirType::Ptr);
@@ -2572,6 +2674,7 @@ fn is_batched_norm_fn(
 
         tile_queue: vec![],
         param_arrays: vec![],
+        dyn_extents: HashMap::default(),
     };
     probe.match_batched_norm(pat, iter, lb).is_some()
 }
@@ -2626,6 +2729,7 @@ fn is_bias_bcast_fn(
 
         tile_queue: vec![],
         param_arrays: vec![],
+        dyn_extents: HashMap::default(),
     };
     probe.match_bias_bcast(pat, iter, lb).is_some()
 }
@@ -2705,6 +2809,7 @@ fn lower_fn(
         par,
         tile_queue,
         param_arrays: vec![],
+        dyn_extents: HashMap::default(),
     };
 
     // The sret pointer is parameter 0 — declared before the real params so the call site can prepend
@@ -2718,20 +2823,29 @@ fn lower_fn(
     // Tensor[f32, M, N])`): each symbolic dim is threaded in as a leading `i64` param and bound
     // under its symbol name, so the body's index strides / matmul dims / value uses resolve it at
     // runtime. Placed right after any sret pointer, before the real params — matching the argument
-    // order `lower_call` prepends. A no-op for a non-generic function.
-    fl.bind_dim_params(&param_tys);
+    // order `lower_call` prepends. A no-op for a non-generic function. The `?`-axis extents that
+    // follow them are attached to their parameter's binding below.
+    let dyn_params = fl.bind_dim_params(&param_tys);
 
     // Declare all parameters first (so their value ids are contiguous), then materialize each.
     // Arrays AND aggregates (tuples/structs) are passed by base pointer (ABI type `Ptr`); scalars by
     // value. `mir_ty_of` (registry-aware) resolves a named-struct param to its byte-buffer `Array`
     // type — the free `mir_ty` falls back to `I32`, which mistyped a struct param as a scalar (the
     // root of the by-value-struct miscompile and the `mem2reg` panic that promoted that bogus slot).
-    let param_abis: Vec<MirType> = param_tys.iter().map(|pty| fl.param_abi(pty)).collect();
-    let param_vals: Vec<ValueId> = param_abis
+    // A function-typed parameter has no runtime value (it is specialized away, `methods.rs`), so
+    // it declares no MIR parameter.
+    let param_abis: Vec<Option<MirType>> = param_tys
         .iter()
-        .map(|abi| fl.builder.add_param(abi.clone()))
+        .map(|pty| methods::param_has_value(pty).then(|| fl.param_abi(pty)))
         .collect();
-    for ((p, pty), val) in f.params.iter().zip(&param_tys).zip(param_vals) {
+    let param_vals: Vec<Option<ValueId>> = param_abis
+        .iter()
+        .map(|abi| abi.as_ref().map(|abi| fl.builder.add_param(abi.clone())))
+        .collect();
+    for (pi, ((p, pty), val)) in f.params.iter().zip(&param_tys).zip(param_vals).enumerate() {
+        let Some(val) = val else {
+            continue;
+        };
         if ty_is_buffer_param(pty) {
             fl.param_arrays.push((val, pty.clone()));
         }
@@ -2755,6 +2869,7 @@ fn lower_fn(
             // A struct parameter arrives as its buffer pointer, so its buffer fields are addressable
             // right here: record them so `l.wq[…]` is a kernel operand like a bare `wq[…]`.
             fl.bind_field_bases(p.name.sym, val, pty);
+            fl.record_param_extents(&dyn_params, pi, val, p.name.sym, body);
         } else {
             let slot = fl.builder.alloca(mty.clone());
             fl.builder.build_void(Op::Store {
@@ -2762,6 +2877,7 @@ fn lower_fn(
                 value: val,
             });
             fl.bind_slice(p.name.sym, slot, mty, is_slice);
+            fl.record_param_extents(&dyn_params, pi, slot, p.name.sym, body);
         }
     }
 
@@ -2930,6 +3046,7 @@ fn lower_parallel(
 
             tile_queue: vec![],
             param_arrays: vec![],
+            dyn_extents: HashMap::default(),
         };
         let start = fl.builder.add_param(MirType::I64);
         let end = fl.builder.add_param(MirType::I64);
@@ -3022,6 +3139,7 @@ fn lower_parallel(
 
             tile_queue: vec![],
             param_arrays: vec![],
+            dyn_extents: HashMap::default(),
         };
         let param_vals: Vec<ValueId> = param_tys
             .iter()
@@ -3178,6 +3296,8 @@ struct GemmSyms {
     /// two's-complement reinterpretation the default signed `print` would show.
     print_u: Symbol,
     println_u: Symbol,
+    /// The `assert` intrinsic, through which a kernel builtin's runtime extent check traps.
+    assert_fn: Symbol,
     nt: Symbol,
     nt_par: Symbol,
     /// The transposed-A weight-gradient kernel (`wukong_sgemm_tn[_parallel]`): `C = Aᵀ·B`, where A is
@@ -3282,6 +3402,8 @@ struct GemmSyms {
     /// -> f32`): a reduction loop in a `@parallel` function lowers to this. It is bit-equal to the
     /// serial `wukong_sreduce_f32` the interpreter calls, so native and interp stay bit-exact.
     sred_par: Symbol,
+    /// Serial `wukong_sreduce_f32` — the `sum`/`amax`/`amin`/`dot` builtins outside `@parallel`.
+    sred: Symbol,
     /// The deterministic argmax/argmin reduction (`wukong_argreduce_f32(x, n, op) -> i64`, lowest
     /// index on ties). Serial form (bit-identical to the parallel one), which the interpreter also
     /// calls — so a recognized argmax loop stays exact across backends.
@@ -3848,6 +3970,12 @@ struct FnLowerer<'a> {
     /// the fail-closed form of LANDMINE 1. Stacked in lockstep with `scopes` (`push_scope` /
     /// `pop_scope`) so a shadowing `let l: Other` in an inner block does not outlive its scope.
     field_bases: Vec<HashMap<Symbol, (Symbol, ValueId, ValueId, MirType)>>,
+    /// The run-time extent of each `?` axis of a tensor PARAMETER (and of an immutable view of
+    /// one): `(binding slot, axis)` -> the slot holding the hidden `i64` extent the caller passed
+    /// (`shape_ops::dynamic_extent_params`). Keyed by the binding's slot value, which is unique in a
+    /// function, so a shadowing binding of the same name is simply absent. Read by
+    /// `tensor_axis_extent` for `t.dim(k)`, an interior `?` stride and a `for` over a `?` tensor.
+    dyn_extents: HashMap<(ValueId, usize), ValueId>,
 }
 
 impl FnLowerer<'_> {
@@ -4350,7 +4478,8 @@ impl FnLowerer<'_> {
                 _ => Ty::Error,
             },
             Unit => Ty::Unit,
-            Int(_) => Ty::Error,
+            // A function type is never a local's annotation (sema: E0411).
+            Int(_) | Fn { .. } => Ty::Error,
         }
     }
 
@@ -4414,8 +4543,13 @@ impl FnLowerer<'_> {
     /// order and contents come from [`symbolic_dim_params`] — identical to what [`lower_call`]
     /// prepends at the call site, so the ABI matches by construction. Called after any sret pointer
     /// and before the real params, so the hidden dims occupy the leading (post-sret) parameter slots.
-    /// A no-op for a non-generic function (returns `0`), keeping every existing ABI byte-identical.
-    fn bind_dim_params(&mut self, param_tys: &[Ty]) -> usize {
+    ///
+    /// After the symbolic dims come the hidden extents of the `?` axes
+    /// ([`shape_ops::dynamic_extent_params`]): one `i64` per `?` axis of each tensor parameter, each
+    /// spilled to a slot and returned as `(parameter index, axis, slot)` so the caller can attach it
+    /// to the parameter's binding once that exists (`record_param_extents`). A no-op for a
+    /// signature with neither, keeping every existing ABI byte-identical.
+    fn bind_dim_params(&mut self, param_tys: &[Ty]) -> Vec<(usize, usize, ValueId)> {
         let dims = symbolic_dim_params(param_tys);
         for &sym in &dims {
             let val = self.builder.add_param(MirType::I64);
@@ -4426,7 +4560,17 @@ impl FnLowerer<'_> {
             });
             self.bind(sym, slot, MirType::I64);
         }
-        dims.len()
+        let mut dynamic = Vec::new();
+        for (pi, axis) in shape_ops::dynamic_extent_params(param_tys) {
+            let val = self.builder.add_param(MirType::I64);
+            let slot = self.builder.alloca(MirType::I64);
+            self.builder.build_void(Op::Store {
+                ptr: slot,
+                value: val,
+            });
+            dynamic.push((pi, axis, slot));
+        }
+        dynamic
     }
 
     /// Size in bytes of `ty`, resolving named structs through the sema registry — the registry-aware
@@ -9379,7 +9523,12 @@ impl FnLowerer<'_> {
 
     fn lower_stmt(&mut self, s: &Stmt) {
         match &s.kind {
-            StmtKind::Let { pat, ty, init, .. } => {
+            StmtKind::Let {
+                pat,
+                ty,
+                init,
+                mutable,
+            } => {
                 let mty = match (ty, init) {
                     // An aggregate (struct/tuple) initializer — a literal OR a value (a call that
                     // returns a struct/tuple by value, or an aggregate variable) — sizes its slot
@@ -9515,6 +9664,10 @@ impl FnLowerer<'_> {
                 match &pat.kind {
                     ast::PatKind::Ident(name) => {
                         self.bind_slice(*name, slot, mty, is_slice);
+                        // An immutable tensor view keeps the run-time `?` extents of what it views.
+                        if let (Some(e), false) = (init, *mutable) {
+                            self.inherit_dyn_extents(e, slot);
+                        }
                         // `let l: Layer = Layer { … }` — record the struct's buffer fields so a
                         // kernel nest over `l.wq[…]` resolves its base like a bare local's. The
                         // slot is this `let`'s own storage, so the field addresses stay valid for
@@ -9676,7 +9829,9 @@ impl FnLowerer<'_> {
                 self.terminated = true;
             }
             StmtKind::Defer(e) => {
-                // Defer semantics (run at scope exit) are not modeled yet; lower for effects.
+                // `defer::lower_defers` rewrites every `defer` away before any function is
+                // lowered, so this is unreachable; a lowerer fed an un-normalized body fails
+                // loudly rather than running the expression at the wrong time.
                 self.unsupported(e.span, "defer");
                 self.lower_expr_stmt(e);
             }
@@ -13978,15 +14133,18 @@ impl FnLowerer<'_> {
                 self.scan_region_expr(rhs, sc);
             }
             // Only pure scalar math intrinsics: a user call could write captured buffers, and
-            // `print`/`assert` have cross-iteration-ordered side effects.
+            // `print`/`assert` have cross-iteration-ordered side effects. A named kernel builtin
+            // shares its name with a scalar intrinsic (`gelu(x, out)` vs `gelu(x)`) but writes a
+            // whole buffer, so it is never pure here.
             ExprKind::Call { callee, args, .. } => {
                 // The RNG scalars (`rand_f32(seed, i)`, …) are pure too: counter-based, no state.
-                let pure_math = single_path(callee)
-                    .map(|s| {
-                        math_intrinsic(self.interner.resolve(s)).is_some()
-                            || self.is_pure_ml_builtin(s)
-                    })
-                    .unwrap_or(false);
+                let pure_math = !self.sema.builtin_calls.contains_key(&e.id)
+                    && single_path(callee)
+                        .map(|s| {
+                            math_intrinsic(self.interner.resolve(s)).is_some()
+                                || self.is_pure_ml_builtin(s)
+                        })
+                        .unwrap_or(false);
                 if !pure_math {
                     sc.ok = false;
                     return;
@@ -14311,6 +14469,7 @@ impl FnLowerer<'_> {
                 par: None,
                 tile_queue: vec![],
                 param_arrays: vec![],
+                dyn_extents: HashMap::default(),
             };
             let start = fl.builder.add_param(MirType::I64);
             let end = fl.builder.add_param(MirType::I64);
@@ -14386,6 +14545,8 @@ impl FnLowerer<'_> {
         let (elem, is_slice) = match self.expr_ty(e) {
             Ty::Array { elem, .. } => (*elem, false),
             Ty::Slice(elem) => (*elem, true),
+            // A tensor iterates its leading axis — elements, or row views (`shape_ops`).
+            Ty::Tensor { .. } => return self.lower_for_tensor(label, pat, e, body),
             _ => return false,
         };
         let elem_mir = self.mir_ty_of(&elem);
@@ -19667,20 +19828,19 @@ impl FnLowerer<'_> {
     }
 
     /// Materialize a tensor shape dimension as an `i64` MIR value: a `Const` directly, a symbolic
-    /// `Var` loaded from its bound hidden dim param (coerced to `i64`), or `None` for a runtime `?`
-    /// (`Dynamic`) that has no threaded value. The shape-index companion of the matmul recognizer's
-    /// [`dim_value`] (which materializes the recognizer's own `Dim` enum the same way).
-    fn tensor_dim_value(&mut self, d: wukong_types::Dim) -> Option<ValueId> {
+    /// `Var` loaded from its bound hidden dim param (coerced to `i64`), a derived extent (`2*N`)
+    /// computed from those (`shape_ops::emit_dim_poly`), or `None` for a runtime `?` (`Dynamic`),
+    /// whose value is not a property of the shape (see `tensor_axis_extent`). The shape-index
+    /// companion of the matmul recognizer's [`dim_value`] (which materializes the recognizer's own
+    /// `Dim` enum the same way).
+    fn tensor_dim_value(&mut self, d: &wukong_types::Dim) -> Option<ValueId> {
         match d {
             wukong_types::Dim::Const(n) => Some(
                 self.builder
-                    .build(MirType::I64, Op::ConstInt(n as i128, MirType::I64)),
+                    .build(MirType::I64, Op::ConstInt(*n as i128, MirType::I64)),
             ),
-            wukong_types::Dim::Var(sym) => {
-                let (slot, ty) = self.lookup(sym)?;
-                let v = self.builder.build(ty.clone(), Op::Load(slot, ty.clone()));
-                Some(self.coerce_to(v, &ty, &MirType::I64, true))
-            }
+            wukong_types::Dim::Var(sym) => self.dim_var_value(*sym),
+            wukong_types::Dim::Expr(p) => self.emit_dim_poly(p, &|me, s| me.dim_var_value(s)),
             wukong_types::Dim::Dynamic => None,
         }
     }
@@ -19714,7 +19874,7 @@ impl FnLowerer<'_> {
         ) {
             return None;
         }
-        let dims = shape.0; // owned (`Dim` is `Copy`)
+        let dims = shape.0;
         let rank = dims.len();
         if rank == 0 || rank != indices.len() {
             return None;
@@ -19724,7 +19884,7 @@ impl FnLowerer<'_> {
         let mut strides: Vec<Option<ValueId>> = vec![None; rank];
         if matches!(layout, wukong_types::Layout::ColMajor) {
             for k in 1..rank {
-                let prev = self.tensor_dim_value(dims[k - 1])?;
+                let prev = self.tensor_axis_extent(base, &dims, k - 1)?;
                 strides[k] = Some(match strides[k - 1] {
                     None => prev,
                     Some(s_prev) => self
@@ -19734,7 +19894,7 @@ impl FnLowerer<'_> {
             }
         } else {
             for k in (0..rank.saturating_sub(1)).rev() {
-                let next = self.tensor_dim_value(dims[k + 1])?;
+                let next = self.tensor_axis_extent(base, &dims, k + 1)?;
                 strides[k] = Some(match strides[k + 1] {
                     None => next,
                     Some(s_next) => self
@@ -20989,6 +21149,13 @@ impl FnLowerer<'_> {
                             bind_generics(pty, &self.expr_ty(a), tg, &mut subst);
                         }
                     }
+                    for &(i, key) in mono.fn_value_keys.get(&name).map_or(&[][..], |v| &v[..]) {
+                        if let Some(f) = args.get(i).and_then(|a| {
+                            methods::fn_value_of(a, &self.subst, self.sema, self.interner)
+                        }) {
+                            subst.insert(key, Ty::Named(f));
+                        }
+                    }
                     if let Some(canon) = canon_type_args(tg, &subst, self.interner) {
                         if let Some(&inst) = mono.instance_of.get(&(name, canon)) {
                             let ret_mir = self.mir_ty_of(&subst_ty(&ret_ty, &subst));
@@ -21008,12 +21175,20 @@ impl FnLowerer<'_> {
     /// caller pins the sizes; then (b) the **argument shapes** — a const dim passes its constant, a
     /// symbolic dim its caller-side hidden-param value (`lookup`), and a decaying array its length —
     /// so a generic caller forwarding its own symbolic tensor (`fn g<P,Q>(a: Tensor[f32,P,Q]){ f(a) }`)
-    /// threads `P, Q` through. A dimension that neither source determines is a hard `C0001` compile
-    /// error (a placeholder `0` keeps the MIR well-formed) — better a clean error than a miscompiled
-    /// stride; the fix is an explicit turbofish.
+    /// threads `P, Q` through; then (c) **sema's solved binding** for the call
+    /// (`SemaResult::call_dims`), which is how a dimension that appears only inside a derived extent
+    /// (`Tensor[f32, 2*N]` fed 8 elements, `N = 4`) gets its value; and last (d) the **run-time
+    /// extent** of a caller's `?` axis passed where the callee has a symbolic dim. A dimension that
+    /// none of them determines is a hard `C0001` compile error (a placeholder `0` keeps the MIR
+    /// well-formed) — better a clean error than a miscompiled stride; the fix is an explicit
+    /// turbofish.
+    ///
+    /// After the dims come the extents of the callee's `?` axes
+    /// ([`shape_ops::dynamic_extent_params`]), each read off the argument (`arg_axis_extent`).
     fn call_dim_args(
         &mut self,
         name: Symbol,
+        callee_id: ast::NodeId,
         generic_args: &[ast::TypeExpr],
         args: &[Expr],
         span: Span,
@@ -21023,7 +21198,8 @@ impl FnLowerer<'_> {
             _ => return Vec::new(),
         };
         let hidden = symbolic_dim_params(&params);
-        if hidden.is_empty() {
+        let dynamic = shape_ops::dynamic_extent_params(&params);
+        if hidden.is_empty() && dynamic.is_empty() {
             return Vec::new();
         }
         let mut dim_map: HashMap<Symbol, ValueId> = HashMap::default();
@@ -21042,7 +21218,41 @@ impl FnLowerer<'_> {
             let aty = self.expr_ty(arg);
             self.collect_call_dims(pty, &aty, &hidden, &mut dim_map);
         }
-        let mut out = Vec::with_capacity(hidden.len());
+        // (c) Sema's binding, in the caller's terms, for a dim no argument shape spells directly.
+        let sema = self.sema;
+        if let Some(bound) = sema.call_dims.get(&callee_id) {
+            for (g, d) in bound {
+                if hidden.contains(g) && !dim_map.contains_key(g) {
+                    if let Some(v) = self.tensor_dim_value(d) {
+                        dim_map.insert(*g, v);
+                    }
+                }
+            }
+        }
+        // (d) A caller's run-time `?` extent forwarded to a callee's symbolic dim (`gsum<N>(a:
+        // Tensor[f32, N])` called with a `Tensor[f32, ?]` parameter). Sema leaves `N` unbound —
+        // `?` is the lenient escape hatch — but the extent is known at run time here, so it is
+        // passed rather than the call refused. Only a dim nothing above determined.
+        for (pty, arg) in params.iter().zip(args) {
+            let (Ty::Tensor { shape: ps, .. }, Ty::Tensor { shape: as_, .. }) =
+                (pty, self.expr_ty(arg))
+            else {
+                continue;
+            };
+            if ps.rank() != as_.rank() {
+                continue;
+            }
+            for (axis, (p, a)) in ps.0.iter().zip(&as_.0).enumerate() {
+                if let (wukong_types::Dim::Var(g), wukong_types::Dim::Dynamic) = (p, a) {
+                    if hidden.contains(g) && !dim_map.contains_key(g) {
+                        if let Some(v) = self.tensor_axis_extent(arg, &as_.0, axis) {
+                            dim_map.insert(*g, v);
+                        }
+                    }
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(hidden.len() + dynamic.len());
         let mut missing = false;
         for g in &hidden {
             match dim_map.get(g) {
@@ -21061,6 +21271,31 @@ impl FnLowerer<'_> {
                 span,
                 "call to a symbolic-generic tensor function whose dimensions cannot be inferred \
                  from the arguments (supply an explicit turbofish, e.g. `f::<2, 3>(…)`)",
+            );
+        }
+        let mut missing_extent = false;
+        for &(pi, axis) in &dynamic {
+            let v = match (params.get(pi), args.get(pi)) {
+                (Some(pty), Some(arg)) => self.arg_axis_extent(pty, arg, axis, &dim_map),
+                _ => None,
+            };
+            match v {
+                Some(v) => out.push(v),
+                None => {
+                    missing_extent = true;
+                    out.push(
+                        self.builder
+                            .build(MirType::I64, Op::ConstInt(0, MirType::I64)),
+                    );
+                }
+            }
+        }
+        if missing_extent {
+            self.unsupported(
+                span,
+                "call passing a tensor whose run-time `?` extent is not known here (pass a tensor \
+                 with a fixed or generic extent on that axis, a fixed-size array, or a `?` \
+                 parameter of the caller)",
             );
         }
         out
@@ -21103,12 +21338,10 @@ impl FnLowerer<'_> {
     ) {
         match (pty, aty) {
             (Ty::Tensor { shape: ps, .. }, Ty::Tensor { shape: as_, .. }) => {
-                let pd = ps.0.clone();
-                let ad = as_.0.clone();
-                for (p, a) in pd.iter().zip(&ad) {
+                for (p, a) in ps.0.iter().zip(&as_.0) {
                     if let wukong_types::Dim::Var(g) = p {
                         if hidden.contains(g) && !dim_map.contains_key(g) {
-                            if let Some(v) = self.tensor_dim_value(*a) {
+                            if let Some(v) = self.tensor_dim_value(a) {
                                 dim_map.insert(*g, v);
                             }
                         }
@@ -21119,7 +21352,8 @@ impl FnLowerer<'_> {
             // (the same rank-1 length binding sema's `unify` performs).
             (Ty::Tensor { shape: ps, .. }, Ty::Array { len, .. }) => {
                 if ps.0.len() == 1 {
-                    if let wukong_types::Dim::Var(g) = ps.0[0] {
+                    if let wukong_types::Dim::Var(g) = &ps.0[0] {
+                        let g = *g;
                         if hidden.contains(&g) && !dim_map.contains_key(&g) {
                             let v = self
                                 .builder
@@ -21144,11 +21378,19 @@ impl FnLowerer<'_> {
         args: &[Expr],
         e: &Expr,
     ) -> ValueId {
+        // A call through a function-typed parameter or a trait bound (`methods.rs`).
+        if let Some(v) = self.lower_dispatched_call(callee, generic_args, args, e) {
+            return v;
+        }
         // `Enum::Variant(args)` constructing a data-carrying tuple-payload variant: build its buffer
         // (a value in call-syntax, not a function call). `callee` is `Field { Path(Enum), Variant }`.
         if let ExprKind::Field { base, name } = &callee.kind {
             if let Some(enum_sym) = self.field_base_data_enum(base, name.sym) {
                 return self.lower_enum_value(enum_sym, name.sym, VariantCtor::Tuple(args));
+            }
+            // `t.dim(k)` / `t.len()` on a tensor or a fixed-size array — the extent of one axis.
+            if let Some(v) = self.lower_extent_method(base, name.sym, args) {
+                return v;
             }
             // `s.len()` on a slice — the element count, loaded from the fat pointer's offset 8.
             if args.is_empty()
@@ -21179,6 +21421,7 @@ impl FnLowerer<'_> {
                     let argvals: Vec<ValueId> = args
                         .iter()
                         .enumerate()
+                        .filter(|(i, _)| param_tys.get(*i).is_none_or(methods::param_has_value))
                         .map(|(i, a)| self.lower_arg_coerced(a, param_tys.get(i)))
                         .collect();
                     // A call to a type-generic function is redirected to its monomorphized instance
@@ -21191,7 +21434,7 @@ impl FnLowerer<'_> {
                     // in the same ABI order `lower_fn`/`lower_matmul_fn` declare the hidden params.
                     // Empty for every non-generic-tensor callee, so those call sites stay byte-
                     // identical. They lead the real args, after any sret pointer.
-                    let dim_args = self.call_dim_args(name, generic_args, args, e.span);
+                    let dim_args = self.call_dim_args(name, callee.id, generic_args, args, e.span);
                     if matches!(ret, MirType::Array(..)) {
                         // The callee returns an aggregate by value (sret ABI): allocate the
                         // destination buffer here, pass it as the hidden leading argument, and yield
@@ -21232,6 +21475,11 @@ impl FnLowerer<'_> {
                             args: call_args,
                         },
                     );
+                }
+                // A named kernel builtin (`matmul`, `softmax`, `gelu(x, out)`, `sdpa`, …) that sema
+                // shape-checked lowers straight to its runtime kernel (see `builtins.rs`).
+                if let Some(v) = self.lower_kernel_builtin(e, args) {
+                    return v;
                 }
                 // The heap builtins `alloc_<T>(n)` / `free(s)` lower to the wukong_rt_alloc/free
                 // runtime calls plus slice fat-pointer construction.
@@ -21493,14 +21741,14 @@ impl FnLowerer<'_> {
     /// `lower_call` falls through. Both backends call the identical kernel, so the fused online
     /// softmax stays bit-for-bit exact — the same contract as the GEMM dispatch.
     ///
-    /// `sdpa` has no signature in wukong_sema, so **nothing upstream checks its operands** and this is
-    /// the only place the kernel's contract — four `f32` buffers, each valid for `s*d` elements — can
-    /// be enforced. Without the check the call reaches the kernel with whatever the caller wrote: an
-    /// f32 immediate in a pointer slot (native SIGSEGV, interp `expected a pointer`), an f64/i32 array
-    /// reinterpreted as f32 (a silent wrong answer that also *diverges* between the backends), or a
-    /// buffer shorter than `s*d` (native writes past its end). Any of those declines, which routes the
-    /// call to `lower_call`'s catalogued C0001 at the call site — the same way `lower_heap_builtin`
-    /// declines a malformed `free` rather than miscompiling it.
+    /// `sdpa` now has a real signature in `wukong_sema::builtins` (four `f32` buffers, integer
+    /// `s`/`d`, and — for constant `s`/`d` — every statically sized operand holding `s*d` elements,
+    /// as `E0501`/`E0502` at the operand), and a call that passed it is lowered by
+    /// `builtins::lower_sdpa_builtin`, which adds the runtime extent checks and the output-overlap
+    /// guard this path lacks. This path is reached only by a call sema did not record. Its checks
+    /// stay as a belt-and-braces backstop: an f32 immediate in a pointer slot (native SIGSEGV,
+    /// interp `expected a pointer`), an f64/i32 array reinterpreted as f32, or a buffer shorter than
+    /// `s*d` would each be a silent miscompile, so any of them declines to `lower_call`'s C0001.
     fn lower_attention(&mut self, name: Symbol, args: &[Expr]) -> Option<ValueId> {
         if self.interner.resolve(name) != "sdpa" || args.len() != 8 {
             return None;
@@ -23624,6 +23872,11 @@ impl FnLowerer<'_> {
 
     fn lower_cast(&mut self, operand: &Expr, e: &Expr) -> ValueId {
         let v = self.lower_expr(operand);
+        // `x as Tensor[T, …]` is a reshape: the same contiguous buffer under a new shape (sema proved
+        // the element count unchanged), so the value is the operand's base pointer — no copy.
+        if matches!(self.expr_ty(e), Ty::Tensor { .. }) {
+            return v;
+        }
         let from = self.expr_mir(operand);
         let to = self.expr_mir(e);
         if from == to {
@@ -25112,7 +25365,9 @@ fn tensor_inner_stride(base: &Expr, sema: &SemaResult) -> Option<Dim> {
     match &shape.0[1] {
         wukong_types::Dim::Const(v) => Some(Dim::Lit(*v as i64)),
         wukong_types::Dim::Var(s) => Some(Dim::Var(*s)),
-        wukong_types::Dim::Dynamic => None,
+        // A derived inner extent (`2*K`) has no recognizer `Dim`; the access lowers through the
+        // general strided path instead.
+        wukong_types::Dim::Dynamic | wukong_types::Dim::Expr(_) => None,
     }
 }
 
@@ -27930,6 +28185,7 @@ fn lower_matmul_fn(
 
         tile_queue: vec![],
         param_arrays: vec![],
+        dyn_extents: HashMap::default(),
     };
     // A symbolic-generic matmul (`fn matmul<M, N, K>(a: Tensor[f32, M, K], …)`) reaches this
     // whole-function path too. Bind its hidden runtime-dim params first (leading, before the real
@@ -29644,6 +29900,7 @@ fn xent_bwd_fn(
 
         tile_queue: vec![],
         param_arrays: vec![],
+        dyn_extents: HashMap::default(),
     };
     probe.match_xent_bwd(pat, iter, lb).is_some()
 }
@@ -29693,6 +29950,7 @@ fn xent_fn(
 
         tile_queue: vec![],
         param_arrays: vec![],
+        dyn_extents: HashMap::default(),
     };
     probe.match_xent(pat, iter, lb).is_some()
 }
@@ -29750,6 +30008,7 @@ fn logsumexp_fn(
 
         tile_queue: vec![],
         param_arrays: vec![],
+        dyn_extents: HashMap::default(),
     };
     probe.match_logsumexp(pat, iter, lb).is_some()
 }
@@ -29895,6 +30154,7 @@ fn probe_single_for(
 
         tile_queue: vec![],
         param_arrays: vec![],
+        dyn_extents: HashMap::default(),
     };
     check(&probe, pat, iter, lb)
 }
@@ -30927,7 +31187,12 @@ fn lower_i8matmul_fn(
 
         tile_queue: vec![],
         param_arrays: vec![],
+        dyn_extents: HashMap::default(),
     };
+    // The hidden runtime-dim / `?`-extent parameters lead the real ones exactly as `lower_fn` and
+    // `lower_matmul_fn` declare them, so a caller's `call_dim_args` matches this wrapper's ABI too.
+    // A no-op for a constant-shape signature.
+    fl.bind_dim_params(&param_tys);
     let param_vals: Vec<ValueId> = param_tys
         .iter()
         .map(|pty| fl.builder.add_param(param_abi_ty(pty)))

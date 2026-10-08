@@ -19,6 +19,40 @@ pub enum ItemKind {
     Const(ConstDecl),
     Import(Import),
     Extern(ExternBlock),
+    /// `trait Name { fn m(self, …) -> R; … }` — an interface: a set of method signatures.
+    Trait(TraitDecl),
+    /// `impl Type { … }` / `impl Trait for Type { … }`. The methods are NOT stored here: the parser
+    /// flattens each into an ordinary top-level [`ItemKind::Fn`] item named `Type.method` (a
+    /// `.`-joined symbol no source identifier can spell), so every pass that handles functions
+    /// handles methods unchanged. This item records what sema needs to resolve `x.method(..)` /
+    /// `Type::method(..)` and to check a trait implementation.
+    Impl(ImplDecl),
+}
+
+/// A trait declaration. Each method is a signature-only [`FnDecl`]; a method that takes a receiver
+/// has a first parameter named `self` typed `Self` (the parser desugars `self` / `mut self` /
+/// `&self` / `&mut self`). A default body parses (and is rejected by sema).
+#[derive(Clone, Debug)]
+pub struct TraitDecl {
+    pub name: Ident,
+    pub is_pub: bool,
+    pub methods: Vec<FnDecl>,
+}
+
+/// An `impl` block: the type it extends, the trait it implements (if any), and its methods.
+#[derive(Clone, Debug)]
+pub struct ImplDecl {
+    pub self_ty: Path,
+    pub trait_ref: Option<Path>,
+    pub methods: Vec<ImplMethod>,
+}
+
+/// One method of an `impl` block: its name as written, and the symbol of the flattened top-level
+/// function that implements it (`Type.method`).
+#[derive(Clone, Debug)]
+pub struct ImplMethod {
+    pub name: Ident,
+    pub fn_name: Symbol,
 }
 
 #[derive(Clone, Debug)]
@@ -51,6 +85,9 @@ pub struct Param {
 #[derive(Clone, Debug)]
 pub struct GenericParam {
     pub kind: GenericParamKind,
+    /// Trait bounds on a type parameter: `<T: Shape + Named>`, or a `where T: Shape` clause, which
+    /// the parser folds in here. Empty for an unbounded parameter.
+    pub bounds: Vec<Path>,
     pub span: Span,
 }
 

@@ -234,14 +234,39 @@ pub struct StaticData {
     pub bytes: Vec<u8>,
 }
 
-/// A whole compiled program: its functions, read-only static data, and an inert `level` field
-/// (always [`MirLevel::Low`] — read that type's note before relying on it).
+/// One parameter or the result of an [`ExternFn`]: its MIR type plus the signedness the C ABI
+/// needs to extend a narrow integer (MIR integers are signless). `signed` is `false` for floats,
+/// pointers and `void`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExternParam {
+    pub ty: MirType,
+    pub signed: bool,
+}
+
+/// A C function declared in an `extern "C"` block. A call names it with an ordinary
+/// [`Op::Call`] whose `func` is no MIR function's name; every backend resolves that name here:
+/// Cranelift imports the symbol (the JIT binds it from the host process, an object leaves it to the
+/// linker), the LLVM emitter writes a `declare`, and the interpreter calls the same host symbol for
+/// a scalar signature (`wukong_runtime::cffi`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExternFn {
+    /// The C symbol name (never module-mangled).
+    pub name: Symbol,
+    pub params: Vec<ExternParam>,
+    /// `MirType::Void` for a C `void` function.
+    pub ret: ExternParam,
+}
+
+/// A whole compiled program: its functions, read-only static data, the C functions it imports, and
+/// an inert `level` field (always [`MirLevel::Low`] — read that type's note before relying on it).
 #[derive(Clone, Debug)]
 pub struct Program {
     pub funcs: Vec<Function>,
     /// Read-only data blobs (string literals) referenced by `Op::GlobalAddr`; each `name` is a
     /// symbol interned once in `mir_build`, unique per distinct content.
     pub statics: Vec<StaticData>,
+    /// `extern "C"` functions, in declaration order, unique by name.
+    pub externs: Vec<ExternFn>,
     pub level: MirLevel,
 }
 
@@ -250,12 +275,18 @@ impl Program {
         Program {
             funcs: Vec::new(),
             statics: Vec::new(),
+            externs: Vec::new(),
             level: MirLevel::Low,
         }
     }
 
     pub fn function(&self, name: Symbol) -> Option<&Function> {
         self.funcs.iter().find(|f| f.name == name)
+    }
+
+    /// The `extern "C"` declaration named `name`, if the program imports one.
+    pub fn extern_fn(&self, name: Symbol) -> Option<&ExternFn> {
+        self.externs.iter().find(|e| e.name == name)
     }
 }
 

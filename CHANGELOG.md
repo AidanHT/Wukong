@@ -264,6 +264,111 @@ All notable changes to Wukong are documented here. The format is loosely based o
 - **Sampling kernels** `topk_f32`, `argsort_f32` / `argsort_desc_f32` and `sample_categorical`, each
   defined by one total order (NaN largest, ties to the lower index).
 
+### Shape-typed tensors: dimension arithmetic, views, reshape, extents, generic array parameters
+
+- **Dimension expressions** in tensor types: `+ - * / %` and parentheses over literals, generic
+  dimensions and `const`s (`Tensor[f32, S, 3*D]`, `H*HD`, `(L - K)/S + 1`), held in a canonical
+  polynomial normal form (`wukong_types::dim`) so equal extents are equal types; a call solves a
+  dimension that appears only inside an expression (`2*N = 8`, `N = 4`), or the one a flat array's
+  element count leaves free (`M*N = 12` with `N = 4`), and publishes the binding
+  (`SemaResult::call_dims`) for the hidden-dimension ABI. New `E0505` for an expression that is not
+  an extent.
+- **Rank-reducing views**: `a[i]` on a rank-2 tensor is the row, a zero-copy `Tensor` view; chained
+  `a[i][j]` is `a[i, j]`; `for row in a` iterates rows. A view used as a scalar is `E0401`, assigned
+  to is `E0507`, and written through when it views a non-`mut` parameter is `E0304`.
+- **Reshape** `x as Tensor[..]` with a provably unchanged element count (`E0506` otherwise).
+- **Extents** `t.dim(k)` / `t.len()` on tensors and arrays; a `?` axis of a tensor parameter now
+  carries its run-time extent as a hidden argument (readable, iterable, usable as an interior stride,
+  and binding a callee's generic dimension when the tensor is forwarded).
+- **Shape-generic array parameters**: `fn f<N>(a: [f32; N])` is `Tensor[f32, N]` instead of a
+  length that silently evaluated to 0. A fixed-size array parameter now rejects a tensor argument of
+  another size (it had no unification arm).
+
+### Modules, `defer` and C FFI (gap/lang-modules — P15.22, P15.3)
+
+- **Per-file module namespaces.** Items are private unless `pub` (E0312); `import a.b as c` binds a
+  qualifier, `import a.b.{x, y}` selects, and a plain `import a.b` brings `pub` items in
+  unqualified plus the `b::` qualifier. Imports are no longer transitive; two modules may share a
+  private name; an ambiguous unqualified use of two plain imports is E0313. Qualified names work in
+  calls, struct literals, enum variants/patterns and types (`g::Vec2` / `g.Vec2`). *Breaking:* a
+  library item another file uses must now be `pub`, and a file must import what it names
+  (`examples/gpt2_config.wk` and the import fixtures were updated).
+- **`defer` executes** on every backend: every exit of its block, LIFO, values before defers.
+  `defer x += 1;` parses. Control flow out of a defer, or rebinding a name it uses while pending, is
+  E0314.
+- **`extern "C"` calls execute**: `Program::externs`, Cranelift imports bound to the host symbol,
+  the interpreter calling the same symbol for scalar signatures (pointer signatures and unresolvable
+  symbols are a C0001 before the run), LLVM `declare`s with `signext`/`zeroext`. A declaration type
+  with no C mapping is C0001.
+
+### Methods, traits and function-typed parameters
+
+- **Added: `impl` blocks** — methods and associated functions on structs and enums, `Self`, the four
+  receiver forms, auto-deref through a reference; each method is the function `Type.method`.
+- **Added: traits with static dispatch** — `trait`, `impl Trait for Type` (conformance checked),
+  bounds `<T: Trait>` and `where` clauses (previously parsed and dropped), resolved per
+  monomorphized instance. New codes `E0315` (unresolved method / trait / impl target) and `E0410`
+  (trait implementation or bound not satisfied).
+- **Added: function-typed parameters** `fn(A) -> R`, bound to a named function at each call and
+  specialized per function (no function pointers). New code `E0411`.
+
+### Named kernel builtins and an `sdpa` shape signature
+
+- **Added: shape-checked kernel builtins callable by name** — `matmul`, `matmul_nt`, `matmul_tn`,
+  `linear`, `transpose`, `softmax`, `log_softmax`, `layernorm`, `rmsnorm`, the two-argument
+  activations (`gelu(x, out)`, …), `sum`/`amax`/`amin`/`dot` (new `wukong_sema::builtins`, lowered by
+  `wukong_mir_build::builtins`). New code `E0409` (a builtin dimension nothing fixes).
+- **Fixed: `sdpa` had no signature in sema** — a wrong element type or a too-short buffer is now
+  `E0502`/`E0501` at the operand instead of `C0001` at the call, runtime-sized operands are checked
+  at run time, and an `out` overlapping `q`/`k`/`v` computes through scratch.
+
+### Diagnostic surface: suggestions, JSON v1, `--emit=check`, color env, `--explain` examples (`gap2/diag-surface`)
+
+- **Structured suggestions.** `wukong_diag` gains `Suggestion { span, replacement, message,
+  applicability }` and `Applicability`, with `Diagnostic::suggest`/`suggest_with`, plus a shared
+  `did_you_mean`/`levenshtein`. Suggestions render as a `help:` line and are emitted in JSON.
+- **JSON schema v1.** Each span now carries `line_end`, `col_end`, `byte_start`, `byte_end`; each
+  diagnostic gains `suggestions`, `children`, a `rendered` (plain-text) field and a top-level
+  `"version":1`. The v0 prefix (`severity`, `code`, `message`, `spans`, `notes`) is unchanged, so
+  the compile-fail gate keeps parsing. Nine driver `eprintln!("error: …")` sites that bypassed the
+  JSON stream now emit real diagnostics through `--error-format`.
+- **Renderer.** A secondary label in another file gets a `::: file:line:col` header instead of
+  showing a bare line number under the root file's arrow; carets are padded by display width so they
+  stay aligned under CJK/wide characters; diagnostics are separated by a blank line and followed by
+  an "aborting due to N previous errors" summary; `--error-limit=<n>` caps printed errors.
+- **`--emit=check`.** Runs lex, parse, import resolution and sema, reports diagnostics, and stops
+  before MIR lowering — a fast editor check loop with no `C0001` lowering limits in the way.
+- **Color.** `--color=auto` now honors `NO_COLOR`, `CLICOLOR_FORCE` and `TERM=dumb`, and enables
+  Windows VT processing (falling back to no color when stderr is not a configurable console).
+- **`--explain`.** `entry!` gains optional `bad:`/`good:` worked examples; `crates/wukongc/tests/explain.rs`
+  compiles each (`bad` must produce exactly its code, `good` must check clean) so an example cannot
+  drift from its rule. A bare `--explain` now lists every code with its title.
+
+### Lints and parser hygiene (wave 2, `gap2/lints-and-parser-hygiene`)
+
+- **`E0105` confusable characters.** A pasted Unicode lookalike of ASCII punctuation or whitespace
+  (`−` U+2212, `×`, `≤`, fullwidth brackets, curly quotes, no-break and zero-width spaces) names its
+  code point and the ASCII character it imitates, and lexes as that character, so it costs one
+  error instead of `E0101` plus a parser error. Other non-ASCII characters keep `E0101`, now naming
+  the code point instead of `\u{..}`; a leading byte-order mark is skipped.
+- **Parser recovery.** `E0200` names every token tried at the position ("expected one of `,` or
+  `)`, found `return`"), is anchored just after the previous token when the parser has already
+  moved to the next line, and labels the unclosed opener of a missing `)`/`]`/`}` (an unclosed
+  `{` no longer points only at end of file). A token the lexer already rejected no longer draws a
+  second parser error (`1 $ 2`, `g(1 $)` are one `E0101` each). "found" names keywords and
+  punctuation in backticks and identifiers by name.
+- **Warnings.** The compiler's first lints, `W0001`–`W0007`: `unused_variables`, `unused_mut`,
+  `unreachable_code`, `unused_result` (`out[i] == a[i] + b[i];` written for `=`), `dead_code`,
+  `unwritten_output` (a `mut` output buffer never stored to) and `unknown_lints`. Levels from
+  `-A/-W/-D <lint>` (`-D warnings`) and `@allow/@warn/@deny(<lint>)` on a function, parameter or
+  statement. Warnings print after errors; `tests/warn/` + `crates/wukongc/tests/warn.rs` pin each
+  lint's full output, and the catalogue-coverage gates now include `W` codes.
+- **Statement terminators.** A missing `;` is `W0030 missing_semicolon` (Rust's exemptions: after
+  a block-like statement, and before `}` for anything but a `let`); a `(`, `[` or touching `-` at
+  the start of a line that continues the expression above (`acc = a[i]` then `(b + c)` parses as
+  a call) is `W0031 ambiguous_continuation`. The parse itself is unchanged; `E0210` is reserved for
+  promoting a missing `;` to an error.
+
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
 - **Gate added: every recognizer-dependent corpus program is held to its own generic lowering.**

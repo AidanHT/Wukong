@@ -29,6 +29,15 @@
 //! out of bounds is exactly where the flat spelling already differed from itself, and matching the
 //! flat spelling bit-for-bit is the point.
 //!
+//! **Rank-reducing views.** The same pass gives a partial index its lowering. Sema types `a[i]` on
+//! a `Tensor[T, M, N]` as the VIEW `Tensor[T, N]` — the row, a sub-buffer of `a` — and the address
+//! of a row is the address of its first element, so the view is rewritten to `&a[i, 0]` (padded
+//! with zero indices to full rank, then flattened like any other full index). Every downstream
+//! path already lowers an element address, and no recognizer mistakes it for an element read: the
+//! one-index spelling `a[flat]` on a rank-2 base means "element" after this pass, never "row". An
+//! index INTO a view, `a[i][j]`, is first folded back into the full index `a[i, j]` it means, so the
+//! chained spelling is flattened and recognized exactly like the direct one.
+//!
 //! Synthesized nodes get fresh [`NodeId`]s minted downward from just under `NodeId::DUMMY` (see
 //! [`FRESH_ID_TOP`] for why "one past the largest *typed* id" is not collision-free), and their
 //! types are handed back to the caller to merge into the type table, so `expr_ty` answers for them
@@ -162,9 +171,10 @@ impl Linearizer<'_> {
         for d in &shape.0 {
             match d {
                 Dim::Const(n) => extents.push(*n),
-                // A symbolic / runtime extent has no compile-time stride; `lower_multi_index_dyn`
-                // builds it from the hidden dim params instead, and stays the only path for it.
-                Dim::Var(_) | Dim::Dynamic => return None,
+                // A symbolic / derived / runtime extent has no compile-time stride;
+                // `lower_multi_index_dyn` builds it from the hidden dim params instead, and stays the
+                // only path for it.
+                Dim::Var(_) | Dim::Expr(_) | Dim::Dynamic => return None,
             }
         }
         let mut count: u64 = 1;
@@ -219,7 +229,9 @@ impl Linearizer<'_> {
     fn index_scalar(&self, indices: &[Expr]) -> Option<Scalar> {
         let mut found: Option<Scalar> = None;
         for ix in indices {
-            let Some(Ty::Scalar(s)) = self.types.get(&ix.id) else {
+            // A zero this pass padded a view with is typed in `extra`, not in sema's table.
+            let Some(Ty::Scalar(s)) = self.types.get(&ix.id).or_else(|| self.extra.get(&ix.id))
+            else {
                 return None;
             };
             // `Char` is nominally an integer in MIR but is never a sane index; `size() >= 4` keeps
@@ -289,7 +301,103 @@ impl Linearizer<'_> {
         }
     }
 
+    /// Is `e` a partial index — an `Index` of a TENSOR that sema typed as a tensor (the VIEW of the
+    /// axes it left open)? A full index of a tensor is typed as its element. The base is checked
+    /// too: indexing a pointer to (or an array of) tensor handles also yields a tensor-typed value,
+    /// and that is an element, not a view.
+    fn is_view(&self, e: &Expr) -> bool {
+        let ExprKind::Index { base, .. } = &e.kind else {
+            return false;
+        };
+        matches!(self.types.get(&e.id), Some(Ty::Tensor { .. }))
+            && matches!(self.types.get(&base.id), Some(Ty::Tensor { .. }))
+    }
+
+    /// Fold an index INTO a view back into the full index it means: `a[i][j]` is `a[i, j]`, and
+    /// `(x as Tensor[f32, R, C])[r][c]` is `(x as …)[r, c]`. Repeats for a longer chain. The node
+    /// keeps its own id, so its type is still the one sema gave the whole chain.
+    fn merge_view_chain(&mut self, e: &mut Expr) {
+        while let ExprKind::Index { base, indices } = &mut e.kind {
+            if !self.is_view(base) {
+                return;
+            }
+            let span = base.span;
+            let inner = std::mem::replace(
+                base.as_mut(),
+                Expr {
+                    id: NodeId::DUMMY,
+                    kind: ExprKind::TupleLit(Vec::new()),
+                    span,
+                },
+            );
+            let ExprKind::Index {
+                base: inner_base,
+                indices: mut inner_indices,
+            } = inner.kind
+            else {
+                return; // unreachable: `is_view` checked the kind
+            };
+            inner_indices.append(indices);
+            *base = inner_base;
+            *indices = inner_indices;
+            self.changed = true;
+        }
+    }
+
+    /// Rewrite the partial index `e` (`a[i]`, a view) to `&a[i, 0, …]` — the address of the view's
+    /// first element — with the padded full index flattened when its shape allows. The address
+    /// node keeps `e`'s id and so its view type; the element access inside is a fresh node typed as
+    /// the element. `None` leaves `e` alone (only when fresh ids run out, which needs billions).
+    fn rewrite_view(&mut self, e: &mut Expr) -> Option<()> {
+        let ExprKind::Index { base, indices } = &e.kind else {
+            return None;
+        };
+        let Some(Ty::Tensor { shape, elem, .. }) = self.types.get(&base.id) else {
+            return None;
+        };
+        let (rank, elem) = (shape.0.len(), *elem);
+        // The zero padding takes the type of the written indices (so a uniform index list stays
+        // uniform and still flattens), defaulting to `i64`.
+        let sc = indices
+            .iter()
+            .find_map(|ix| match self.types.get(&ix.id) {
+                Some(Ty::Scalar(s)) if s.is_int() && *s != Scalar::Char => Some(*s),
+                _ => None,
+            })
+            .unwrap_or(Scalar::I64);
+        let base = (**base).clone();
+        let mut full = indices.clone();
+        while full.len() < rank {
+            full.push(self.int_lit(0, sc, e.span)?);
+        }
+        let inner_kind = match self.flatten(&base, &full) {
+            Some(flat) => ExprKind::Index {
+                base: Box::new(base),
+                indices: vec![flat],
+            },
+            None => ExprKind::Index {
+                base: Box::new(base),
+                indices: full,
+            },
+        };
+        let id = self.fresh()?;
+        self.extra.insert(id, Ty::Scalar(elem));
+        let inner = Expr {
+            id,
+            kind: inner_kind,
+            span: e.span,
+        };
+        e.kind = ExprKind::Unary {
+            op: ast::UnOp::Ref,
+            expr: Box::new(inner),
+        };
+        self.changed = true;
+        Some(())
+    }
+
     fn expr(&mut self, e: &mut Expr) {
+        // An index into a view is the full index it means; fold it before anything else looks.
+        self.merge_view_chain(e);
         // Children first, so a nested multi-index (`w[a[i, j], k]`) is already flat when the outer
         // access is considered.
         match &mut e.kind {
@@ -361,6 +469,11 @@ impl Linearizer<'_> {
             }
         }
 
+        // A partial index is a view: its address, not an element (see the module docs).
+        if self.is_view(e) {
+            self.rewrite_view(e);
+            return;
+        }
         let flat = match &e.kind {
             ExprKind::Index { base, indices } if indices.len() >= 2 => self.flatten(base, indices),
             _ => None,

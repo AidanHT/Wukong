@@ -40,10 +40,11 @@
 
 use wukong_span::FxHashMap as HashMap;
 
-use wukong_ast::{Expr, ExprKind, TypeExpr, TypeKind};
+use wukong_ast::{Expr, ExprKind, NodeId, TypeExpr, TypeKind};
 use wukong_span::{Span, Symbol};
 use wukong_types::{Dim, Layout, Scalar, Shape, Ty};
 
+use crate::tensor::PendingDimEq;
 use crate::{DefKind, FnSig, Sema};
 
 /// Result types for the math intrinsics the backends lower directly (`sqrt`, `rsqrt`, `exp`, `log`,
@@ -52,7 +53,7 @@ use crate::{DefKind, FnSig, Sema};
 /// is unknown — except for `abs`/`round`/`floor`/`ceil`/`trunc`, which *preserve* the argument's type
 /// including an integer one (see the comment below). Returns `None` for any other callee — that keeps
 /// `type_call` lenient on the unmodeled-builtin path (`min`, `f32x8::load`, …).
-fn intrinsic_ret_ty(name: &str, args: &[Ty]) -> Option<Ty> {
+pub(crate) fn intrinsic_ret_ty(name: &str, args: &[Ty]) -> Option<Ty> {
     let float_ty = match args.first() {
         Some(Ty::Scalar(s)) if s.is_float() => Ty::Scalar(*s),
         Some(Ty::Vector { elem, lanes }) if elem.is_float() => Ty::Vector {
@@ -120,9 +121,9 @@ fn is_structural_kind(t: &Ty) -> bool {
 /// is what makes an `E0502` actionable — "expected 512, found 513" leaves the reader counting axes
 /// across two signatures, while "dimension mismatch on `K`" names the thing to fix.
 #[derive(Clone, Copy)]
-struct DimSite {
-    axis: usize,
-    name: Option<Symbol>,
+pub(crate) struct DimSite {
+    pub(crate) axis: usize,
+    pub(crate) name: Option<Symbol>,
 }
 
 /// The dimension variable a shape spells at `axis`, if any.
@@ -174,6 +175,13 @@ impl Sema<'_> {
         if let ExprKind::Path(p) = &callee.kind {
             if p.is_single() {
                 let name = p.first().sym;
+                // A call through a function-typed parameter (a local shadows a function of the
+                // same name).
+                if let Some(t) =
+                    self.type_fn_param_call(name, callee, generic_args, args, &mut arg_tys, span)
+                {
+                    return t;
+                }
                 if let Some(def) = self.defs.lookup(name) {
                     if let DefKind::Fn(sig) = &def.kind {
                         let sig = sig.clone();
@@ -200,7 +208,10 @@ impl Sema<'_> {
                                 ret: Box::new(sig.ret.clone()),
                             },
                         );
-                        return self.check_fn_call(&sig, generic_args, &arg_tys, span);
+                        // Function-valued arguments and trait bounds (`methods.rs`).
+                        self.check_fn_value_args(&sig, args, &arg_tys);
+                        self.check_call_bounds(name, &sig, generic_args, &arg_tys, span);
+                        return self.check_fn_call(&sig, generic_args, &arg_tys, span, callee.id);
                     }
                 }
                 // A few math builtins are lowered directly by the backends, so their *result*
@@ -217,6 +228,14 @@ impl Sema<'_> {
                     // interpreter ran it on the raw value and silently produced garbage: a backend
                     // divergence on accepted input. Reject it here. (Tensors are not aggregates by
                     // `is_aggregate_ty`, so tensor intrinsics stay lenient, as do `Unknown` args.)
+                    if let Some(t) = arg_tys.iter().find(|t| matches!(t, Ty::Tensor { .. })) {
+                        // A whole tensor — most often a view from an index list one short of the
+                        // rank — has no scalar value to apply the function to.
+                        let what = format!("the math function `{}`", self.sym_str(name));
+                        let msg = self.whole_tensor_message(t, &what);
+                        self.error(span, "E0401", msg);
+                        return Ty::Unknown;
+                    }
                     if let Some(bad) = arg_tys.iter().find(|t| {
                         matches!(
                             t,
@@ -433,6 +452,13 @@ impl Sema<'_> {
                         // garbage), while the interpreter and -O2 (mem2reg) produced 0 — a divergence
                         // that broke BOTH invariants at once. Reject it (E0401), consistent with `()`
                         // already being non-computable in an arithmetic operand.
+                        if let Some(t @ Ty::Tensor { .. }) = arg_tys.first() {
+                            let what = format!("`{nm}`");
+                            let msg = self.whole_tensor_message(t, &what);
+                            self.error(span, "E0401", msg);
+                            self.types.insert(callee.id, Ty::Unknown);
+                            return Ty::Unknown;
+                        }
                         if matches!(arg_tys.first(), Some(Ty::Unit)) {
                             self.error(
                                 span,
@@ -475,12 +501,17 @@ impl Sema<'_> {
         // length, an `i64`. Without this the call typed `Unknown` and a range bound `0..s.len()`
         // defaulted the loop counter to `i32` while mir_build lowers the length as an `i64` load —
         // a mixed-width `Cmp` the MIR verifier rejects (an ICE on `for i in 0..s.len()`).
+        //
+        // `t.len()` / `t.dim(k)` on a tensor or a fixed-size array are the same kind of query — the
+        // run-time extent of one axis — so they are typed together (`tensor::type_extent_method`).
         if let ExprKind::Field { base, name } = &callee.kind {
-            if args.is_empty() && self.sym_str(name.sym) == "len" {
+            let method = self.sym_str(name.sym);
+            let (is_len, is_dim) = (method == "len", method == "dim");
+            if is_len || is_dim {
                 let bty = self.type_expr(base);
-                if matches!(bty, Ty::Slice(_)) {
+                if let Some(t) = self.type_extent_method(&bty, is_dim, args, span) {
                     self.types.insert(callee.id, Ty::Unknown);
-                    return Ty::Scalar(Scalar::I64);
+                    return t;
                 }
             }
         }
@@ -489,12 +520,13 @@ impl Sema<'_> {
         Ty::Unknown
     }
 
-    fn check_fn_call(
+    pub(crate) fn check_fn_call(
         &mut self,
         sig: &FnSig,
         generic_args: &[TypeExpr],
         arg_tys: &[Ty],
         span: Span,
+        call_id: NodeId,
     ) -> Ty {
         if arg_tys.len() != sig.params.len() {
             self.error(
@@ -558,6 +590,10 @@ impl Sema<'_> {
             }
         }
 
+        // A derived parameter extent (`Tensor[f32, 2*N]`) binds nothing while the parameters are
+        // walked: `unify_dim` queues its equation, and `solve_pending_dims` solves the queue once every
+        // plain `N` has been bound, so the order the parameters are written in does not matter.
+        let outer_pending = std::mem::take(&mut self.pending_dims);
         for (param, arg) in sig.params.iter().zip(arg_tys) {
             // Infer VALUE-TYPE generics (a `Ty::Named(g)` parameter position) from the concrete
             // argument type, so `id(c)` with `c: f32` binds `T := f32` and the whole call types as
@@ -583,6 +619,21 @@ impl Sema<'_> {
             // substitution that produced `p` — rides along so a mismatch can be reported against the
             // name the signature wrote (`K`), not just the extent it resolved to.
             self.unify_decl(p, arg, Some(param), &mut dims, span, false);
+        }
+        let pending = std::mem::replace(&mut self.pending_dims, outer_pending);
+        self.solve_pending_dims(&sig.generics, &mut dims, pending);
+        // A derived extent of the RETURN type must still be an extent once this call's dims are
+        // known (`-> Tensor[f32, N - 4]` called with `N = 2` has no result shape).
+        self.check_derived_extents(&sig.ret, &dims, span);
+        // Publish the call's dimension bindings: lowering takes a hidden runtime-dim argument that
+        // no argument shape spells directly (one solved from `2*N`) from this table.
+        let bound: Vec<(Symbol, Dim)> = sig
+            .generics
+            .iter()
+            .filter_map(|g| dims.get(g).map(|d| (*g, d.clone())))
+            .collect();
+        if !bound.is_empty() {
+            self.call_dims.insert(call_id, bound);
         }
 
         apply_subst(&sig.ret, &dims, &tys)
@@ -682,7 +733,8 @@ impl Sema<'_> {
                         axis,
                         name: dim_var_at(decl_shape, axis).or_else(|| dim_var_at(Some(ps), axis)),
                     };
-                    self.unify_dim(*pd, *ad, dims, span, rigid, site);
+                    let decl_dim = decl_shape.and_then(|s| s.0.get(axis));
+                    self.unify_dim(pd, ad, decl_dim, dims, span, rigid, site);
                 }
             }
             // Array → tensor *decay*: an `Array` argument is intentionally accepted for a tensor
@@ -732,14 +784,44 @@ impl Sema<'_> {
                 // diverged (interpreter traps OOB, native reads past the buffer). A multi-dim tensor
                 // stays on the total-element-count check below (an array length can't be split into
                 // symbolic factors).
+                //
+                // A derived extent (`Tensor[f32, 2*N]`, the type a `[f32; 2*N]` parameter has) goes
+                // through the same `unify_dim`, which queues `2*N = len` for the solver; so does a
+                // rank-2+ shape with a symbolic axis, whose whole ELEMENT COUNT must equal the
+                // length (`Tensor[f32, N, 4]` fed a `[f32; 12]` solves `4*N = 12`, so `N = 3`): the
+                // count is the one relation an array length can pin down.
+                let decl_shape = tensor_shape_of(decl);
                 if shape.0.len() == 1 {
-                    if let Dim::Var(_) = shape.0[0] {
+                    if shape.0[0].is_symbolic() {
                         let site = DimSite {
                             axis: 0,
-                            name: dim_var_at(tensor_shape_of(decl), 0)
-                                .or_else(|| dim_var_at(Some(shape), 0)),
+                            name: dim_var_at(decl_shape, 0).or_else(|| dim_var_at(Some(shape), 0)),
                         };
-                        self.unify_dim(shape.0[0], Dim::Const(*len), dims, span, rigid, site);
+                        let decl_dim = decl_shape.and_then(|s| s.0.first());
+                        self.unify_dim(
+                            &shape.0[0],
+                            &Dim::Const(*len),
+                            decl_dim,
+                            dims,
+                            span,
+                            rigid,
+                            site,
+                        );
+                    }
+                } else if !rigid
+                    && shape.0.iter().any(Dim::is_symbolic)
+                    && !shape.0.iter().any(|d| matches!(d, Dim::Dynamic))
+                {
+                    let count_of = decl_shape.unwrap_or(shape);
+                    if let Ok(count) = Dim::product(&count_of.0) {
+                        if count.is_symbolic() {
+                            self.pending_dims.push(PendingDimEq {
+                                decl: count,
+                                arg: Dim::Const(*len),
+                                span,
+                                axis: None,
+                            });
+                        }
                     }
                 }
                 // The array must supply a whole number of the tensor's *known* (const) sub-slabs.
@@ -826,6 +908,88 @@ impl Sema<'_> {
                 }
                 self.unify_decl(pe, ae, decl_pointee(decl), dims, span, rigid);
             }
+            // A fixed-size ARRAY parameter fed a TENSOR — the reverse of array-to-tensor decay. There
+            // was no arm, so it fell to the lenient `_` and `fn takes4(a: [f32; 4])` accepted any
+            // tensor: `Tensor[f32, 8]`, a `.col_major` one, or a shape-generic `Tensor[f32, N]` (the
+            // type a `[f32; N]` parameter has) whose `N` nothing relates to 4. A tensor is a base
+            // pointer, so the ABI agrees and the callee simply indexed past a short buffer. The
+            // buffer must be contiguous, of the same element, and hold exactly `len` elements — a
+            // count that is symbolic cannot be assumed to be `len` (the `Const`-vs-`Var` rule in
+            // `unify_dim`); a `?` extent stays the documented lenient escape hatch.
+            (
+                Ty::Array {
+                    elem: pe, len: pl, ..
+                },
+                Ty::Tensor {
+                    elem: ae,
+                    shape,
+                    layout,
+                },
+            ) => {
+                if *layout != Layout::Contiguous {
+                    self.error(
+                        span,
+                        "E0502",
+                        format!(
+                            "tensor layout mismatch: expected a row-major array, found {}",
+                            layout_name(layout)
+                        ),
+                    );
+                }
+                // A nested array (`[[f32; 3]; 2]`) is the same row-major buffer of scalar leaves, so
+                // the element and the count are its LEAVES' (`f32`, 6), not its outer element's; an
+                // array of non-scalar leaves (structs, tuples) holds nothing a tensor can, and stays
+                // on the lenient path it had.
+                let leaves =
+                    scalar_leaves(pe).and_then(|(s, n)| n.checked_mul(*pl).map(|c| (s, c)));
+                let Some((leaf, pl)) = leaves else {
+                    return;
+                };
+                if leaf != *ae {
+                    self.error(
+                        span,
+                        "E0502",
+                        format!(
+                            "tensor element type mismatch: expected `{}`, found `{}`",
+                            leaf.name(),
+                            ae.name()
+                        ),
+                    );
+                }
+                match Dim::product(&shape.0) {
+                    Ok(Dim::Const(n)) if n == pl => {}
+                    Ok(Dim::Dynamic) => {}
+                    Ok(Dim::Const(n)) => self.error(
+                        span,
+                        "E0501",
+                        format!(
+                            "array length mismatch: expected an array of length {pl}, found a \
+                             tensor of {n} element{}",
+                            if n == 1 { "" } else { "s" }
+                        ),
+                    ),
+                    Ok(count) => {
+                        let (c, sh) = (self.dim_str(&count), self.shape_str(shape));
+                        self.error(
+                            span,
+                            "E0502",
+                            format!(
+                                "array length mismatch: expected an array of length {pl}, found a \
+                                 tensor of shape {sh} whose element count `{c}` is not a \
+                                 compile-time constant"
+                            ),
+                        );
+                    }
+                    Err(_) => self.error(
+                        span,
+                        "E0502",
+                        format!(
+                            "array length mismatch: expected an array of length {pl}, found a \
+                             tensor whose element count overflows"
+                        ),
+                    ),
+                }
+            }
             // A tuple parameter fed a tuple argument: the arity must agree and each element must
             // unify. There was no `(Tuple, Tuple)` arm either, so `fn f(t: (i32, i32, i32))` fed a
             // `(i32, i32)` compiled clean and `t.2` read past the caller's buffer — interp trapped,
@@ -845,8 +1009,16 @@ impl Sema<'_> {
                         ),
                     );
                 } else {
-                    for (p, a) in ps.iter().zip(as_) {
-                        self.unify_decl(p, a, None, dims, span, rigid);
+                    // Thread the declared element through, like every other structural arm, so a
+                    // tensor inside a tuple is still unified against the extents its signature
+                    // WROTE (a derived extent is solved in the callee's own names).
+                    let decl_items = match decl {
+                        Some(Ty::Tuple(ds)) if ds.len() == ps.len() => Some(ds),
+                        _ => None,
+                    };
+                    for (i, (p, a)) in ps.iter().zip(as_).enumerate() {
+                        let d = decl_items.and_then(|ds| ds.get(i));
+                        self.unify_decl(p, a, d, dims, span, rigid);
                     }
                 }
             }
@@ -1047,10 +1219,15 @@ impl Sema<'_> {
         }
     }
 
+    /// Unify one parameter extent `pd` (substituted with the bindings made so far) against the
+    /// argument's `ad`. `decl_dim` is the parameter's DECLARED extent at this axis, in the callee's
+    /// own dimension names, when the caller can see it.
+    #[allow(clippy::too_many_arguments)]
     fn unify_dim(
         &mut self,
-        pd: Dim,
-        ad: Dim,
+        pd: &Dim,
+        ad: &Dim,
+        decl_dim: Option<&Dim>,
         dims: &mut HashMap<Symbol, Dim>,
         span: Span,
         rigid: bool,
@@ -1067,7 +1244,8 @@ impl Sema<'_> {
         // the buffer, a backend divergence on a program that should never have compiled. Call-site
         // unification stays `rigid == false` and keeps inferring (a callee's dim var binds from the
         // argument shapes). `dims_equal` already implements the rigid relation (`Var(x)==Var(y)` iff
-        // same symbol; `Const` vs `Var` = false; `Dynamic` matches anything, so `?` stays lenient).
+        // same symbol; `Const` vs `Var` = false; `Dynamic` matches anything, so `?` stays lenient),
+        // and a derived extent compares by its normal form: `2*N` matches `N + N` and nothing else.
         if rigid {
             if !dims_equal(pd, ad) {
                 self.error(
@@ -1083,23 +1261,36 @@ impl Sema<'_> {
             }
             return;
         }
+        // A DERIVED parameter extent (`2*N`, `H*HD`) binds nothing on its own: it is an equation
+        // over the callee's dims, queued for `solve_pending_dims` once every parameter has bound
+        // what it can. It is queued in the callee's DECLARED names, never in the substituted form:
+        // a binding can bring a caller symbol into the substituted extent that has the same name as
+        // a still-unbound callee dim, and solving that would conflate the two.
+        if let Some(decl @ Dim::Expr(_)) = decl_dim {
+            if !matches!(ad, Dim::Dynamic) {
+                self.pending_dims.push(PendingDimEq {
+                    decl: decl.clone(),
+                    arg: ad.clone(),
+                    span,
+                    axis: Some(site.axis),
+                });
+            }
+            return;
+        }
         match pd {
-            Dim::Var(v) => match dims.get(&v) {
+            Dim::Var(v) => match dims.get(v) {
                 // Reached when the binding for `v` is itself a dimension VARIABLE — a turbofish
                 // `f::<N>` from a caller whose own generic shares the callee's name — since
                 // `apply_subst` has already rewritten a binding to a constant before `unify` runs.
                 // Same wording as the constant arm: one dimension-mismatch shape for the family.
                 Some(bound) => {
-                    if !dims_equal(*bound, ad) {
+                    if !dims_equal(bound, ad) {
+                        let (want, got) = (self.dim_str(bound), self.dim_str(ad));
+                        let at = self.dim_site(site);
                         self.error(
                             span,
                             "E0502",
-                            format!(
-                                "dimension mismatch on {}: expected {}, found {}",
-                                self.dim_site(site),
-                                self.dim_str(*bound),
-                                self.dim_str(ad)
-                            ),
+                            format!("dimension mismatch on {at}: expected {want}, found {got}"),
                         );
                     }
                 }
@@ -1109,7 +1300,7 @@ impl Sema<'_> {
                     // (`dims_equal` treats `?` as matching anything), masking a real conflict. Leave
                     // `N` unbound so a concrete sibling binds it and subsequent ones are checked.
                     if !matches!(ad, Dim::Dynamic) {
-                        dims.insert(v, ad);
+                        dims.insert(*v, ad.clone());
                     }
                 }
             },
@@ -1127,9 +1318,10 @@ impl Sema<'_> {
                 // mode closes on the return path was left open here on the call path: `fn fwd<N>(a:
                 // Tensor[f32, N]) { takes64(a) }` compiled clean and `fwd([1.0, 2.0])` read 248 bytes
                 // past an 8-byte stack array (interp trapped, native returned 0). `Dim::Dynamic`
-                // stays the documented `?` escape hatch.
-                Dim::Var(v) => {
-                    let name = self.sym_str(v).to_string();
+                // stays the documented `?` escape hatch. A caller's DERIVED extent (`2*N`) makes
+                // the same unprovable claim.
+                Dim::Var(_) | Dim::Expr(_) => {
+                    let name = self.dim_str(ad);
                     let at = self.dim_site(site);
                     self.error(
                         span,
@@ -1143,6 +1335,20 @@ impl Sema<'_> {
                 }
                 _ => {}
             },
+            // The declared extent was a plain `N` that an earlier argument already bound to a derived
+            // extent of the CALLER's (`N := 2*K`), so `pd` is that binding, in the caller's terms,
+            // and this is a comparison — exactly the bound-`Var` arm above.
+            Dim::Expr(_) => {
+                if !dims_equal(pd, ad) {
+                    let (want, got) = (self.dim_str(pd), self.dim_str(ad));
+                    let at = self.dim_site(site);
+                    self.error(
+                        span,
+                        "E0502",
+                        format!("dimension mismatch on {at}: expected {want}, found {got}"),
+                    );
+                }
+            }
             Dim::Dynamic => {}
         }
     }
@@ -1155,7 +1361,7 @@ impl Sema<'_> {
     /// then mir_build inlined the const and the index went out of bounds (interp traps, native reads
     /// past the buffer: a backend divergence on a program that should never have compiled). The depth
     /// cap guards against a recursive const (separately reported as E0403) looping here.
-    fn eval_index_const(&self, e: &Expr) -> Option<i64> {
+    pub(crate) fn eval_index_const(&self, e: &Expr) -> Option<i64> {
         self.eval_index_const_depth(e, 0)
     }
 
@@ -1221,8 +1427,12 @@ impl Sema<'_> {
         // kind it is talking about, and the arm binds the pointee out of the type by value.
         let base_is_slice = matches!(base_ty, Ty::Slice(_));
         match base_ty {
-            Ty::Tensor { elem, shape, .. } => {
-                if indices.len() != shape.rank() {
+            Ty::Tensor {
+                elem,
+                shape,
+                layout,
+            } => {
+                if indices.len() > shape.rank() {
                     let dims = self.shape_str(&shape);
                     self.error(
                         span,
@@ -1260,6 +1470,12 @@ impl Sema<'_> {
                                 }
                             }
                         }
+                    }
+                    // Fewer indices than the rank select the sub-tensor of the remaining axes — a
+                    // VIEW of the same buffer, not an element (`a[i]` on `Tensor[f32, M, N]` is a
+                    // `Tensor[f32, N]`, the row). The leading indices were bounds-checked above.
+                    if indices.len() < shape.rank() {
+                        return self.partial_index_type(elem, &shape, &layout, indices.len(), span);
                     }
                 }
                 Ty::Scalar(elem)
@@ -1336,35 +1552,46 @@ impl Sema<'_> {
     }
 
     /// A shape as a diagnostic renders it: `[M, K]`, `[512, 513]`, `[?]`.
-    fn shape_str(&self, s: &Shape) -> String {
-        let dims: Vec<String> = s.0.iter().map(|d| self.dim_str(*d)).collect();
+    pub(crate) fn shape_str(&self, s: &Shape) -> String {
+        let dims: Vec<String> = s.0.iter().map(|d| self.dim_str(d)).collect();
         format!("[{}]", dims.join(", "))
     }
 
     /// How a diagnostic points at one axis: ``` `K` (axis 1) ``` when the shape names it, `axis 1`
     /// when it is a bare constant.
-    fn dim_site(&self, site: DimSite) -> String {
+    pub(crate) fn dim_site(&self, site: DimSite) -> String {
         match site.name {
             Some(n) => format!("`{}` (axis {})", self.sym_str(n), site.axis),
             None => format!("axis {}", site.axis),
         }
     }
 
-    fn dim_str(&self, d: Dim) -> String {
-        match d {
-            Dim::Const(n) => n.to_string(),
-            Dim::Var(s) => self.sym_str(s).to_string(),
-            Dim::Dynamic => "?".to_string(),
-        }
+    pub(crate) fn dim_str(&self, d: &Dim) -> String {
+        d.display(self.interner)
     }
 }
 
-fn dims_equal(a: Dim, b: Dim) -> bool {
+/// The scalar leaf type of a (possibly nested) fixed-size array element and how many leaves one
+/// element holds: `f32` is `(f32, 1)`, `[f32; 3]` is `(f32, 3)`. `None` for a non-scalar leaf or an
+/// overflowing count.
+fn scalar_leaves(t: &Ty) -> Option<(Scalar, u64)> {
+    match t {
+        Ty::Scalar(s) => Some((*s, 1)),
+        Ty::Array { elem, len, .. } => {
+            let (s, n) = scalar_leaves(elem)?;
+            Some((s, n.checked_mul(*len)?))
+        }
+        _ => None,
+    }
+}
+
+/// Rigid dimension equality: `?` matches anything; otherwise the two normal forms must be identical
+/// (`Var(x) == Var(y)` iff the same symbol, a `Const` never equals a symbolic extent, and two derived
+/// extents are equal iff their canonical polynomials are, so `2*N` equals `N + N`).
+pub(crate) fn dims_equal(a: &Dim, b: &Dim) -> bool {
     match (a, b) {
         (Dim::Dynamic, _) | (_, Dim::Dynamic) => true,
-        (Dim::Const(x), Dim::Const(y)) => x == y,
-        (Dim::Var(x), Dim::Var(y)) => x == y,
-        _ => false,
+        _ => a == b,
     }
 }
 
@@ -1373,7 +1600,12 @@ fn dims_equal(a: Dim, b: Dim) -> bool {
 /// reference / slice / array / tuple structure exactly like [`apply_subst`]. Only *type* generics are
 /// bound (a dimension generic is a `Dim::Var` inside a shape, never a `Ty::Named`); a first binding
 /// wins, and an `Unknown`/`Error` argument binds nothing (it would poison every later use of `g`).
-fn infer_type_generics(param: &Ty, arg: &Ty, generics: &[Symbol], tys: &mut HashMap<Symbol, Ty>) {
+pub(crate) fn infer_type_generics(
+    param: &Ty,
+    arg: &Ty,
+    generics: &[Symbol],
+    tys: &mut HashMap<Symbol, Ty>,
+) {
     match (param, arg) {
         (Ty::Named(g), a) if generics.contains(g) => {
             if !matches!(a, Ty::Unknown | Ty::Error) {
@@ -1391,6 +1623,23 @@ fn infer_type_generics(param: &Ty, arg: &Ty, generics: &[Symbol], tys: &mut Hash
                 infer_type_generics(p, a, generics, tys);
             }
         }
+        // A function-typed parameter bound to a function binds through its signature
+        // (`fn map<T>(f: fn(T) -> T, x: T)` called with `square: fn(f32) -> f32`).
+        (
+            Ty::Fn {
+                params: ps,
+                ret: pr,
+            },
+            Ty::Fn {
+                params: as_,
+                ret: ar,
+            },
+        ) => {
+            for (p, a) in ps.iter().zip(as_) {
+                infer_type_generics(p, a, generics, tys);
+            }
+            infer_type_generics(pr, ar, generics, tys);
+        }
         _ => {}
     }
 }
@@ -1399,7 +1648,7 @@ fn infer_type_generics(param: &Ty, arg: &Ty, generics: &[Symbol], tys: &mut Hash
 /// bound type, and each `Dim::Var` in a tensor shape becomes its binding in `dims`. A var with no
 /// binding is left **as-is** (not an error): the caller unifies parameter by parameter, so a dim can
 /// still be bound by a later argument, and an unbound dim in the *return* type stays symbolic.
-fn apply_subst(ty: &Ty, dims: &HashMap<Symbol, Dim>, tys: &HashMap<Symbol, Ty>) -> Ty {
+pub(crate) fn apply_subst(ty: &Ty, dims: &HashMap<Symbol, Dim>, tys: &HashMap<Symbol, Ty>) -> Ty {
     match ty {
         Ty::Named(v) => tys.get(v).cloned().unwrap_or_else(|| ty.clone()),
         Ty::Tensor {
@@ -1411,8 +1660,12 @@ fn apply_subst(ty: &Ty, dims: &HashMap<Symbol, Dim>, tys: &HashMap<Symbol, Ty>) 
                 .0
                 .iter()
                 .map(|d| match d {
-                    Dim::Var(v) => dims.get(v).copied().unwrap_or(*d),
-                    other => *other,
+                    Dim::Var(v) => dims.get(v).cloned().unwrap_or_else(|| d.clone()),
+                    // A derived extent re-normalizes under the bindings (`2*N` with `N := 3` is the
+                    // constant 6). One that stops being an extent for this binding (`N - 4` at
+                    // `N = 2`) is reported by `check_derived_extents`; here it is the lenient `?`.
+                    Dim::Expr(_) => d.subst(&|s| dims.get(&s).cloned()).unwrap_or(Dim::Dynamic),
+                    other => other.clone(),
                 })
                 .collect();
             Ty::Tensor {
@@ -1436,6 +1689,10 @@ fn apply_subst(ty: &Ty, dims: &HashMap<Symbol, Dim>, tys: &HashMap<Symbol, Ty>) 
             shared: *shared,
         },
         Ty::Tuple(items) => Ty::Tuple(items.iter().map(|i| apply_subst(i, dims, tys)).collect()),
+        Ty::Fn { params, ret } => Ty::Fn {
+            params: params.iter().map(|p| apply_subst(p, dims, tys)).collect(),
+            ret: Box::new(apply_subst(ret, dims, tys)),
+        },
         other => other.clone(),
     }
 }

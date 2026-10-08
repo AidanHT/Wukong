@@ -1,0 +1,19 @@
+// Loader unit-test fixture: a second module with its own private `helper`, plus a public `a_val`
+// that clashes with ns_a's — a glob import of both makes an unqualified USE of `a_val` ambiguous.
+module ns_b
+
+pub fn b_val() -> i32 {
+    return helper() * 2;
+}
+
+fn helper() -> i32 {
+    return 20;
+}
+
+pub fn a_val() -> i32 {
+    return 99;
+}
+
+pub enum Unit {
+    One,
+}

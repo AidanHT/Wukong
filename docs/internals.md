@@ -113,7 +113,9 @@ backends sit behind the `Backend` trait in `wukong_backend`.
 source
   → lexer        (wukong_lexer::tokenize)
   → parser       (wukong_parser::parse_module_tokens_from)  -> AST (NodeId watermark threaded)
-  → loader       (wukong_driver::loader::load_imports)  splice `import`ed files -> one flat module
+  → loader       (wukong_driver::loader::load_imports)  load `import`ed files, resolve each file's
+                 names in its own module scope (pub / as / {x, y}), rename imported items to unique
+                 `<module>.<name>` symbols, splice -> one module
   → sema         (wukong_sema::check)                  name res, types, SHAPE check
   → mir_build    (wukong_mir_build::lower_program)     -> MIR (scalar SSA; always MirLevel::Low)
   → opt          (wukong_opt::optimize)                fixpoint passes
@@ -125,6 +127,19 @@ source
                  | textual LLVM IR (--emit=llvm-ir)
 ```
 
+Two front-end surfaces lower to plain calls before any recognizer sees the tree. **Methods**: the
+parser flattens each `impl` method into a top-level function `Type.method` (receiver desugared to a
+`self: Type` parameter) beside an `ItemKind::Impl` marker; `wukong_sema::methods` builds the method
+tables, checks trait conformance and bounds, and records every resolved call; `wukong_mir_build`'s
+`methods::desugar_module` then rewrites `x.m(a)` to `Type.m(x, a)` ahead of `tindex`/`canon`/alias
+analysis. A call through a trait bound resolves per monomorphized instance, and a function-typed
+parameter is a pseudo-generic (`$fn$<param>` bound to `Ty::Named(<fn>)`), specialized away with no
+runtime value; the functions such calls reach are excluded from the alias-free fact.
+**Kernel builtins**: `wukong_sema::builtins` shape-checks `matmul`/`softmax`/…/`sdpa` and records each
+call's resolved dimensions (`SemaResult::builtin_calls`); `wukong_mir_build::builtins` lowers it to one
+runtime kernel behind runtime extent checks (trapping through `assert`) and an output-overlap guard
+(scratch + copy-out), independent of `@generic`/recognition.
+
 `wukong_driver::compile` orchestrates this and honors `--emit=<stage>` to stop early. Every stage
 prints its artifact on stdout except `--emit=obj` and `--emit=exe`, which write a file (`-o <path>`).
 Two combinations are usage errors rather than silently discarded work: `--run` with an explicit
@@ -132,6 +147,8 @@ Two combinations are usage errors rather than silently discarded work: `--run` w
 `obj`/`exe`. Diagnostics from every stage flow through a single `emit_diag` honoring
 `--error-format`.
 
+`--emit=check` returns after sema and the lints (lex, parse, imports, sema, lints; no MIR lowering),
+printing any lint warnings and exiting 0 when no error (or denied lint) was reported.
 `--emit=tokens` and `--emit=ast` return *before* import loading, so they show the root file only;
 every later stage — and `--run` — sees the merged program. A verifier failure is an internal compiler
 error (a bug in a pass), reported as prose and mapped to a non-zero exit, never a user diagnostic;
@@ -159,6 +176,47 @@ So adding a diagnostic is always three edits: the catalogue entry, an emit site 
 bare `"Ennnn"` literal (the scanner skips comment lines, so prose may cite codes freely, but a
 `format!`-built code is invisible to it), and a fixture or probe.
 
+The lexer's one table-driven diagnostic is `E0105`: `wukong_lexer`'s `confusables` module lists the
+Unicode lookalikes of ASCII punctuation, operators and whitespace (after rustc's
+`unicode_chars.rs`), each with its name, the ASCII text it imitates and a recovery — produce that
+token, skip it as whitespace, or (for a quote, which cannot open a literal) an error token — so the
+parse after a pasted `−` is the parse of `-`. A table test pins that every token replacement is
+spelled exactly like the token it produces.
+
+The parser's recovery state is two small stacks on `Parser`, both maintained by `bump`: `delims`,
+the open `(`/`[`/`{` not yet closed (a closer pops its innermost matching opener and anything
+unmatched above it), and `expected`, every token an `eat` tried and failed to find since the last
+consumed token. A failed `expect` reports `expected one of <expected ∪ wanted>`, anchors at
+`prev_span().shrink_to_hi()` when the token found is on a later line, labels the innermost matching
+opener of a missing closer (then drops it, so the next failure labels the next opener out), and steps
+over the lexer's `Error` tokens first — `Parser::error` likewise drops a complaint about an `Error`
+token, which the lexer has already reported.
+
+Warnings (`W0xxx`) come from `wukong_sema::lints`, a pass separate from `wukong_sema::check` so
+that `check`'s result — and every test pinning its exact diagnostics — is unchanged. The driver
+calls `lints::run` only after a clean `check`, then `lints::apply_levels`, which resolves each
+finding's level (the lint's default, then the command line's `-A/-W/-D`, then the innermost
+`@allow/@warn/@deny` whose item, parameter or statement span contains the finding) and drops,
+keeps or promotes it. A denied lint stops the build before lowering; warnings are held back and
+rendered after lowering's diagnostics, so a failed build's first diagnostic is always an error.
+The pass does its own scope-faithful name resolution over the AST and reads only `SemaResult`'s
+node types and def map. Each lint errs toward silence — `unreachable_code` reuses sema's
+definite-return rule for divergence (a `match` diverges only with a catch-all arm) so the user can
+always delete what it reports. `dead_code` roots come from the driver (`lint_options_for`: `main`,
+the autodiff root, everything under `--emit=obj|llvm-ir`). Lint codes are catalogued like errors;
+`catalog_coverage.rs` scans `"Wnnnn"` literals too, and a `tests/warn` fixture (the whole stream,
+in order, is compared by `warn.rs`) exercises each one.
+
+The parser contributes two lints of its own, `W0030` (a statement's missing `;`) and `W0031` (a
+line-leading `(`, `[` or touching `-` that continues the expression above), into a separate
+`Parser::lints` list. Only `parse_module_tokens_with_lints` returns it (as `ParseOutput::lints`);
+every other entry point drops it, so the many callers that assert a parse produced no diagnostic
+are untouched by a warning. `W0030` stays quiet for a statement that pushed an error or contains a
+lexer `Error` token (its `;` is not what is missing); `W0031` fires only when the innermost open
+delimiter is a `{`, i.e. where a statement could have begun. The driver keeps the root file's
+parser lints until the lint stage and resolves them with the sema lints in one `apply_levels`
+call; on any earlier failure it renders them after the errors (`render_lints`).
+
 The terminal renderer is rustc-style (carets, gutters, `--> file:line:col`). Two rendering rules are
 contractual: a caret run is as wide as the span's *rendered* width, never the column difference, and
 both the echoed source line and the caret padding expand tabs at a fixed `TAB_WIDTH = 4` — so carets
@@ -167,8 +225,13 @@ multi-line span underlines only its first line. Reported line/col are unaffected
 does not change; if you touch `TAB_WIDTH`, `rendered_width` or `expand_tabs`, touch all three.
 
 `--error-format=json` emits one JSON object per line (JSON Lines) for tooling: `severity`, an optional
-`code`, `message`, a `spans` array of `{file, line, col, primary, label}` (dummy spans omitted; `col`
-is the span's start — there is no end position), and a `notes` array of `{kind, message}`. The writer
+`code`, `message`, a `spans` array of `{file, line, col, primary, label, line_end, col_end,
+byte_start, byte_end}` (dummy spans omitted; `line`/`col` are the span's start, `line_end`/`col_end`
+its exclusive end), and a `notes` array of `{kind, message}` — that prefix is schema v0 and never
+moves. Schema v1 appends `suggestions` (`{message, replacement, applicability, span}`, `span` null
+when dummy), `children` (rustc-style `{severity, message, spans}` mirroring the notes), `rendered`
+(the color-off human form) and a final `"version":1`. Driver-level errors with no source span (IO,
+`--train`, autodiff, run and link failures) go through the same writer as code-less diagnostics. The writer
 is hand-rolled (no serde): `"`, `\`, `\n`, `\r`, `\t` get short escapes and every other character
 below `0x20` becomes `\u00xx`, so the line always stays parseable. `crates/wukongc/tests/fail.rs`
 greps for the literal substring `"code":"Ennnn"`, so key order and the absence of whitespace around
@@ -276,8 +339,9 @@ range for the owning function's `vec_kernels` and its result matches the recipe 
 yields its lane type, an elementwise one yields nothing); and terminators are type-correct, including
 branch-argument arity/types and the function return type. Blocks unreachable from the entry keep their
 type checks with the dominance rule switched off. Given a whole `Program`, `verify_program`
-additionally cross-checks every call against the callee's declared signature — external symbols
-(`print`, the `wukong_*` kernels) are exempt.
+additionally cross-checks every call against the callee's declared signature, including the
+`extern "C"` imports in `Program::externs` — compiler-owned external symbols (`print`, the
+`wukong_*` kernels) are exempt.
 
 It runs before every backend entry — `--run` and `--emit=llvm-ir|obj|exe` all go through
 `wukong_driver::verify_or_ice` — and inside `--emit=mir`/`--emit=mir-high`, where the dump is printed
@@ -791,7 +855,8 @@ initializer's (which is what rejects a narrowing annotation like `let ib: i32 = 
 `i: i64` silently becoming full-width arithmetic). `/` and `%` are excluded from the pure set
 because they can trap and a trap must not be re-sited under a branch that may not be taken; calls,
 indexing and field access are excluded because their value depends on memory a later statement may
-have written. A function containing a `defer` declines outright, and a local or parameter that
+have written. (`defer` never reaches this pass: `defer.rs` copies every deferred expression onto
+its block's exits as the first normalization of `lower_program_with`.) A local or parameter that
 shadows a const keeps that const unfolded in that function. The pass answers "nothing to do" from a
 read-only feasibility scan, so a program it cannot help never pays for the AST copy.
 

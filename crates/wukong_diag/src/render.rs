@@ -64,15 +64,35 @@ impl Renderer {
             }
         }
 
-        // Source frames, one per label (sorted by position).
+        // Source frames, one per label (sorted by position). A label in a *different file* than the
+        // one currently shown gets a `::: file:line:col` header first, so a secondary label in an
+        // imported file is never printed under the root file's `-->` arrow with only its own line
+        // number (the long-standing cross-file bug: E0300 duplicate-across-imports showed the second
+        // definition's line with no hint it lived in another file).
         let mut labels: Vec<&crate::Label> =
             d.labels.iter().filter(|l| !l.span.is_dummy()).collect();
         labels.sort_by_key(|l| (l.span.source.0, l.span.lo));
 
         if !labels.is_empty() {
+            // The `-->` arrow established the primary span's file as the current context.
+            let mut cur_source = d.primary_span().map(|s| s.source);
             out.push('\n');
             out.push_str(&format!("{pad} {bar}"));
             for l in &labels {
+                if Some(l.span.source) != cur_source {
+                    cur_source = Some(l.span.source);
+                    let loc = sm.span_location(l.span);
+                    let colons = self.paint(BLUE, ":::");
+                    out.push('\n');
+                    out.push_str(&format!(
+                        "{pad} {colons} {}:{}:{}",
+                        sm.name(l.span.source),
+                        loc.line,
+                        loc.col
+                    ));
+                    out.push('\n');
+                    out.push_str(&format!("{pad} {bar}"));
+                }
                 self.render_label(&mut out, l, sm, width, &bar);
             }
             out.push('\n');
@@ -88,6 +108,28 @@ impl Renderer {
             out.push('\n');
             let eq = self.paint(BLUE, "=");
             out.push_str(&format!("{pad} {eq} {}: {text}", self.paint(BOLD, tag)));
+        }
+
+        // Structured suggestions: a `help:` line carrying the message and, when the fix is a
+        // concrete one-line replacement, the replacement text itself in backticks. The precise
+        // span+replacement travels in the JSON stream (see `to_json`) for an editor to apply; the
+        // terminal form stays compact and never tries to splice a multi-line edit into one line.
+        for s in &d.suggestions {
+            out.push('\n');
+            let eq = self.paint(BLUE, "=");
+            let tag = self.paint(BOLD, "help");
+            let single_line = !s.replacement.contains('\n');
+            if single_line && !s.replacement.is_empty() {
+                out.push_str(&format!(
+                    "{pad} {eq} {tag}: {}: `{}`",
+                    s.message, s.replacement
+                ));
+            } else if single_line && s.replacement.is_empty() {
+                // A deletion: there is no text to show, so name the action.
+                out.push_str(&format!("{pad} {eq} {tag}: {} (remove it)", s.message));
+            } else {
+                out.push_str(&format!("{pad} {eq} {tag}: {}", s.message));
+            }
         }
 
         out
@@ -166,11 +208,45 @@ fn rendered_width(s: &str, start: usize, end: usize) -> usize {
             break;
         }
         if i >= start {
-            width += if c == '\t' { TAB_WIDTH } else { 1 };
+            width += if c == '\t' {
+                TAB_WIDTH
+            } else {
+                char_display_width(c)
+            };
         }
         i += 1;
     }
     width + end.saturating_sub(i.max(start))
+}
+
+/// Terminal cell width of a single character: 2 for East-Asian wide and fullwidth forms (and the
+/// common wide emoji blocks), 1 otherwise. A tab is handled separately by the caller.
+///
+/// This is a small dependency-free table — enough to keep carets aligned under CJK text or an emoji
+/// in a comment or string, which is the drift the char-count column measure produced. It is not a
+/// full Unicode width implementation; zero-width combining marks are counted as 1 (rare in source).
+fn char_display_width(c: char) -> usize {
+    let u = c as u32;
+    let wide = matches!(u,
+        0x1100..=0x115F       // Hangul Jamo
+        | 0x2E80..=0x303E     // CJK radicals, Kangxi, CJK symbols/punctuation
+        | 0x3041..=0x33FF     // Hiragana, Katakana, CJK compat
+        | 0x3400..=0x4DBF     // CJK Ext A
+        | 0x4E00..=0x9FFF     // CJK Unified Ideographs
+        | 0xA000..=0xA4CF     // Yi
+        | 0xAC00..=0xD7A3     // Hangul Syllables
+        | 0xF900..=0xFAFF     // CJK Compatibility Ideographs
+        | 0xFE30..=0xFE4F     // CJK Compatibility Forms
+        | 0xFF00..=0xFF60     // Fullwidth Forms
+        | 0xFFE0..=0xFFE6     // Fullwidth signs
+        | 0x1F300..=0x1FAFF   // emoji & pictographs
+        | 0x20000..=0x3FFFD   // CJK Ext B+
+    );
+    if wide {
+        2
+    } else {
+        1
+    }
 }
 
 /// `s` with each tab replaced by [`TAB_WIDTH`] spaces, so it lines up with [`rendered_width`].
@@ -261,6 +337,69 @@ error[E0501]: shape mismatch
         assert_eq!(
             r,
             "error: could not find input file\n  = note: check the path"
+        );
+    }
+
+    #[test]
+    fn secondary_label_in_another_file_gets_a_colon_header() {
+        let mut sm = SourceMap::new();
+        let a = sm.add("a.wk", "aaa\n");
+        let b = sm.add("b.wk", "bbb\n");
+        let d = Diagnostic::error("duplicate definition")
+            .with_code("E0300")
+            .primary(Span::new(a, 0, 3), "first")
+            .secondary(Span::new(b, 0, 3), "second");
+        let r = Renderer::new(false).render(&d, &sm);
+        let expected = "\
+error[E0300]: duplicate definition
+ --> a.wk:1:1
+  |
+1 | aaa
+  | ^^^ first
+  ::: b.wk:1:1
+  |
+1 | bbb
+  | --- second
+  |";
+        assert_eq!(r, expected);
+    }
+
+    #[test]
+    fn caret_aligns_under_a_wide_character() {
+        // 你 is an East-Asian wide character (2 terminal cells); the caret under the following `x`
+        // must be padded by 2, not 1, or it drifts one column left.
+        let (sm, id) = sm_with("你x\n");
+        let span = Span::new(id, 3, 4); // the `x` (你 is 3 UTF-8 bytes)
+        let d = Diagnostic::error("bad").primary(span, "here");
+        let r = Renderer::new(false).render(&d, &sm);
+        let expected = "\
+error: bad
+ --> test.wk:1:2
+  |
+1 | 你x
+  |   ^ here
+  |";
+        assert_eq!(r, expected);
+    }
+
+    #[test]
+    fn renders_a_suggestion_as_a_help_line() {
+        use crate::Applicability;
+        let (sm, id) = sm_with("fn main() {\n    let x = 0;\n    x = 1;\n}\n");
+        let span = Span::new(id, 20, 21); // the `x` in `let x`
+        let d = Diagnostic::error("cannot assign twice to immutable binding `x`")
+            .with_code("E0304")
+            .primary(Span::new(id, 31, 32), "cannot assign")
+            .suggest_with(
+                span,
+                "consider making this binding mutable",
+                "mut x",
+                Applicability::MachineApplicable,
+            );
+        let r = Renderer::new(false).render(&d, &sm);
+        assert!(
+            r.ends_with("= help: consider making this binding mutable: `mut x`"),
+            "{r}"
         );
     }
 

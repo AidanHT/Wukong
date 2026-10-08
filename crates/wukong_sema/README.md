@@ -22,6 +22,13 @@ parse → wukong_sema::check → wukong_mir_build::lower_program → opt → bac
 `wukong_driver::compile` refuses `mir_build` if any returned diagnostic `is_error()`. `SemaResult`
 (`types`, `defs`, `consts`) is the contract `mir_build` reads.
 
+**Lints** (`src/lints.rs`, the compiler's warnings `W0001`–`W0007`) are a separate pass, not part
+of `check`: the driver calls `lints::run(module, &SemaResult, …)` only after a clean `check`, then
+`lints::apply_levels` (defaults, `-A/-W/-D`, innermost `@allow/@warn/@deny`; also applied to the
+parser's `W0030`/`W0031`). `check`'s own diagnostics are unchanged by them; the attribute validator
+accepts `@allow/@warn/@deny` everywhere. Each lint errs toward silence — `unreachable_code` reuses
+this crate's definite-return rule for divergence.
+
 ## Entry point
 
 `check(module, &Interner) -> (SemaResult, Vec<Diagnostic>)` at `src/lib.rs:316`.

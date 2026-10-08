@@ -1,6 +1,6 @@
 //! Type syntax: the surface forms a programmer writes for types.
 
-use crate::{Expr, NodeId, Path};
+use crate::{BinOp, Expr, NodeId, Path};
 use wukong_span::{Span, Symbol};
 
 /// A type as written in source. Resolved to a `wukong_types::Type` during semantic analysis.
@@ -48,6 +48,12 @@ pub enum TypeKind {
         dims: Vec<Dim>,
         layout: Option<Layout>,
     },
+    /// A function type `fn(A, B) -> R` (`ret: None` for `()`). Legal only as the type of a function
+    /// parameter, which every call site must bind to a named function known at compile time.
+    Fn {
+        params: Vec<TypeExpr>,
+        ret: Option<Box<TypeExpr>>,
+    },
 }
 
 /// One dimension of a tensor type.
@@ -66,6 +72,14 @@ pub enum DimKind {
     Named(Symbol),
     /// A dynamic (runtime) extent: `?`.
     Dynamic,
+    /// A derived extent: arithmetic on dimensions, `N*2`, `H*HD`, `(L - K)/S + 1`. The parser builds
+    /// it only from `+ - * / %` (and parentheses, which reuse the inner node), so `op` is always one
+    /// of `Add`, `Sub`, `Mul`, `Div`, `Rem`; sema folds it into `wukong_types::Dim`'s normal form.
+    Binary {
+        op: BinOp,
+        lhs: Box<Dim>,
+        rhs: Box<Dim>,
+    },
 }
 
 /// Physical memory layout of a tensor.

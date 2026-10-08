@@ -1,0 +1,17 @@
+// EXPECT-CODE: E0411
+module tests.fail.fn_value_binding
+
+// A function may be passed to a parameter of function type — the callee is then specialized for
+// that function at compile time — but it is not a run-time value: there are no function pointers,
+// so binding one to a local (and later calling through the local) has nothing to call. Rejected at
+// the `let`. tests/run/fn_params.wk is the positive control.
+
+fn square(x: f32) -> f32 {
+    return x * x;
+}
+
+fn main() -> i32 {
+    let g = square;
+    print(g(3.0));
+    return 0;
+}

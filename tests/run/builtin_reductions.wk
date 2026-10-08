@@ -1,0 +1,63 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: -3
+// EXPECT-OUT: 45.5
+// EXPECT-OUT: 1092
+// EXPECT-OUT: 0
+// EXPECT-OUT: 190
+// EXPECT-OUT: 19
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: -inf
+// EXPECT-OUT: inf
+module tests.run.builtin_reductions
+
+// The reduction builtins `sum(x)`, `amax(x)`, `amin(x)` and `dot(x, y)`, each one
+// wukong_sreduce_f32 call returning an f32. The inputs are halves and small integers, so every sum
+// is exact in f32 whatever the kernel's lane order; the expectations are the definitions evaluated
+// by hand:
+//
+//   x = -3, -2.5, ..., 3 (13 elements: one 8-lane group plus a 5-element tail)
+//   sum(x) = 0, amax(x) = 3, amin(x) = -3, dot(x, x) = 2·(9 + 6.25 + 4 + 2.25 + 1 + 0.25) = 45.5
+//   y[i] = i^2:  dot(x, y) = 0.5·sum(i^3) - 3·sum(i^2) = 0.5·6084 - 3·650 = 1092
+//   the `@parallel` twin (wukong_sreduce_f32_parallel) is bit-identical: sum(x) = 0 again
+//   a runtime-sized slice 0, 1, ..., 19: sum = 190, amax = 19, amin = 0
+//   an empty slice: the reduction identities — sum 0, amax -inf, amin +inf.
+
+@parallel
+fn parallel_sum(x: [f32; 13]) -> f32 {
+    return sum(x);
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 13] = [0.0; 13];
+    let mut y: [f32; 13] = [0.0; 13];
+    for i in 0..13 {
+        x[i] = (i as f32) * 0.5 - 3.0;
+        y[i] = (i * i) as f32;
+    }
+    print(sum(x));
+    print(amax(x));
+    print(amin(x));
+    print(dot(x, x));
+    print(dot(x, y));
+    print(parallel_sum(x));
+
+    let s = alloc_f32(20);
+    for i in 0..20 {
+        s[i] = i as f32;
+    }
+    print(sum(s));
+    print(amax(s));
+    print(amin(s));
+
+    let e = alloc_f32(0);
+    print(sum(e));
+    print(amax(e));
+    print(amin(e));
+    free(s);
+    free(e);
+    return 0;
+}

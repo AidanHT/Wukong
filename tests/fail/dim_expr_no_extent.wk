@@ -1,0 +1,16 @@
+// EXPECT-CODE: E0505
+module tests.fail.dim_expr_no_extent
+
+// A tensor dimension may be arithmetic on dimensions (`3*D`, `H*HD`, `(L - K)/S + 1`), but it must
+// still denote an extent. With `W = 2`, `2*W - 5` folds to -1: there is no tensor of that shape, and
+// the fold must be reported rather than wrapped to a huge unsigned extent or clamped to a plausible
+// one (either would size and bounds-check a buffer the source never described).
+const W: usize = 2;
+
+fn first(a: Tensor[f32, 2*W - 5]) -> f32 {
+    return 0.0;
+}
+
+fn main() -> i32 {
+    return 0;
+}

@@ -1,0 +1,138 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 321
+// EXPECT-OUT: 871
+// EXPECT-OUT: 2369
+// EXPECT-OUT: 6439
+// EXPECT-OUT: 2500
+// EXPECT-OUT: 2500
+// EXPECT-OUT: 2500
+// EXPECT-OUT: 2500
+// EXPECT-OUT: 10
+// EXPECT-OUT: 16
+// EXPECT-OUT: 27
+// EXPECT-OUT: 44
+// EXPECT-OUT: 72
+// EXPECT-OUT: 119
+// EXPECT-OUT: 196
+// EXPECT-OUT: 323
+// EXPECT-OUT: 533
+// EXPECT-OUT: 879
+// EXPECT-OUT: 1450
+// EXPECT-OUT: 2390
+// EXPECT-OUT: 3941
+// EXPECT-OUT: -34402
+// EXPECT-OUT: -24402
+// EXPECT-OUT: -14402
+// EXPECT-OUT: -4402
+// EXPECT-OUT: -13863
+// EXPECT-OUT: -13863
+// EXPECT-OUT: -13863
+// EXPECT-OUT: -13863
+// EXPECT-OUT: 321
+// EXPECT-OUT: 871
+// EXPECT-OUT: 2369
+// EXPECT-OUT: 6439
+// EXPECT-OUT: -13416
+// EXPECT-OUT: 1056
+// EXPECT-OUT: -7764
+// EXPECT-OUT: -8416
+// EXPECT-OUT: -10690
+// EXPECT-OUT: -690
+// EXPECT-OUT: -10000
+// EXPECT-OUT: -11036
+// EXPECT-OUT: 3651
+// EXPECT-OUT: 7303
+// EXPECT-OUT: 21909
+// EXPECT-OUT: 7303
+// EXPECT-OUT: -4714
+// EXPECT-OUT: 0
+// EXPECT-OUT: 9428
+// EXPECT-OUT: 9428
+// EXPECT-OUT: 3651
+// EXPECT-OUT: 7303
+// EXPECT-OUT: 21909
+// EXPECT-OUT: 7303
+// EXPECT-OUT: -4714
+// EXPECT-OUT: 0
+// EXPECT-OUT: 9428
+// EXPECT-OUT: 9428
+module tests.run.builtin_norms
+
+// The row-wise normalization builtins over the last axis: `softmax` / `log_softmax`
+// (wukong_norm_f32) and `layernorm` / `rmsnorm` (wukong_norm_affine_f32). Every lane is printed as
+// round(y * 10000). The expected values are the defining formulas evaluated in f64, independently
+// of the kernels (the kernels are f32 with polynomial `exp`/`log`, so expectations are rounded to
+// 1e-4; every expected lane sits at least 1.8e-6 away from a rounding boundary, an order of
+// magnitude more than the kernels' f32 error on these inputs):
+//
+//   softmax(x)[i]     = exp(x[i] - max x) / sum_j exp(x[j] - max x)
+//   log_softmax(x)[i] = x[i] - max x - log(sum_j exp(x[j] - max x))
+//   layernorm(x)[i]   = (x[i] - mean) / sqrt(var + eps) * gamma[i] + beta[i], var biased (1/C)
+//   rmsnorm(x)[i]     = x[i] / sqrt(mean(x^2) + eps) * gamma[i]
+//
+// Rows: [1, 2, 3, 4] (softmax -> 0.032059, 0.087144, 0.236883, 0.643914) and a uniform row
+// [0, 0, 0, 0] (0.25 each); a 13-element vector -3, -2.5, ..., 3 as ONE row (no turbofish: a
+// row-wise builtin defaults to one row), which runs one 8-lane group plus a 5-element tail; an
+// in-place call `softmax(y, y)`; layernorm over [[1, 2, 3, 4], [-2, 0, 2, 8]] with
+// gamma = [1, 2, 0.5, -1], beta = [0, 1, -1, 0.5] — C = 4 comes from gamma's length and R = 2
+// from x's — and rmsnorm with gamma = [1, 1, 2, 0.5], once over arrays and once over runtime-sized
+// slices with a runtime row count.
+
+fn show(x: []f32) {
+    for i in 0..x.len() {
+        print(round(x[i] * 10000.0) as i32);
+    }
+}
+
+fn main() -> i32 {
+    let x: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0];
+    let mut y: [f32; 8] = [0.0; 8];
+    softmax::<2, 4>(x, y);
+    show(y);
+
+    let mut v: [f32; 13] = [0.0; 13];
+    for i in 0..13 {
+        v[i] = (i as f32) * 0.5 - 3.0;
+    }
+    let mut sv: [f32; 13] = [0.0; 13];
+    softmax(v, sv);
+    show(sv);
+
+    let mut ly: [f32; 8] = [0.0; 8];
+    log_softmax::<2, 4>(x, ly);
+    show(ly);
+
+    let mut inplace: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    softmax(inplace, inplace);
+    show(inplace);
+
+    let xl: [f32; 8] = [1.0, 2.0, 3.0, 4.0, -2.0, 0.0, 2.0, 8.0];
+    let gamma: [f32; 4] = [1.0, 2.0, 0.5, -1.0];
+    let beta: [f32; 4] = [0.0, 1.0, -1.0, 0.5];
+    let mut ln: [f32; 8] = [0.0; 8];
+    layernorm(xl, gamma, beta, ln, 0.00001);
+    show(ln);
+
+    let g2: [f32; 4] = [1.0, 1.0, 2.0, 0.5];
+    let mut rn: [f32; 8] = [0.0; 8];
+    rmsnorm(xl, g2, rn, 0.00001);
+    show(rn);
+
+    let sx = alloc_f32(8);
+    let sg = alloc_f32(4);
+    let so = alloc_f32(8);
+    for i in 0..8 {
+        sx[i] = xl[i];
+    }
+    for i in 0..4 {
+        sg[i] = g2[i];
+    }
+    let rows: i64 = 2;
+    rmsnorm::<rows, 4>(sx, sg, so, 0.00001);
+    show(so);
+    free(sx);
+    free(sg);
+    free(so);
+    return 0;
+}

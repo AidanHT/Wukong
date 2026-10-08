@@ -1,0 +1,16 @@
+// EXPECT-WARN: W0005
+module tests.warn.dead_code
+
+// `helper` is reachable from no entry point; `twice` is called by `main`.
+fn helper(x: i32) -> i32 {
+    return x + 1;
+}
+
+fn twice(x: i32) -> i32 {
+    return x * 2;
+}
+
+fn main() -> i32 {
+    print(twice(21));
+    return 0;
+}

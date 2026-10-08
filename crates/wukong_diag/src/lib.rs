@@ -72,6 +72,37 @@ pub struct Label {
     pub primary: bool,
 }
 
+/// How confident the compiler is that a [`Suggestion`] can be applied without human review.
+///
+/// This mirrors rustc's `Applicability`. Tooling (`wukongc --fix`, an editor's quick-fix) applies
+/// only [`Applicability::MachineApplicable`] edits automatically; everything else is advisory.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Applicability {
+    /// The replacement is correct and complete; applying it will not change meaning in a surprising
+    /// way (for example inserting a missing `mut`).
+    MachineApplicable,
+    /// The replacement is probably what the user meant but should be reviewed (a did-you-mean
+    /// rename, where a different candidate might be intended).
+    MaybeIncorrect,
+    /// The replacement contains placeholders the user must fill in before it compiles.
+    HasPlaceholders,
+    /// It is unknown whether the replacement is safe to apply mechanically.
+    Unspecified,
+}
+
+/// A concrete, machine-readable fix: replace the source covered by `span` with `replacement`.
+///
+/// Suggestions are rendered under the diagnostic as a `help:` line and emitted in the JSON stream
+/// so an editor can offer a one-click fix. A deletion is a suggestion with an empty `replacement`;
+/// an insertion is a zero-width `span` (its `lo == hi`) with a non-empty `replacement`.
+#[derive(Clone, Debug)]
+pub struct Suggestion {
+    pub span: Span,
+    pub replacement: String,
+    pub message: String,
+    pub applicability: Applicability,
+}
+
 /// A single diagnostic. Build it fluently:
 ///
 /// ```
@@ -90,6 +121,8 @@ pub struct Diagnostic {
     pub message: String,
     pub labels: Vec<Label>,
     pub notes: Vec<(NoteKind, String)>,
+    /// Structured, applicable fixes. Empty for most diagnostics; rendered after the notes.
+    pub suggestions: Vec<Suggestion>,
 }
 
 impl Diagnostic {
@@ -100,6 +133,7 @@ impl Diagnostic {
             message: message.into(),
             labels: Vec::new(),
             notes: Vec::new(),
+            suggestions: Vec::new(),
         }
     }
 
@@ -145,6 +179,35 @@ impl Diagnostic {
 
     pub fn help(mut self, message: impl Into<String>) -> Diagnostic {
         self.notes.push((NoteKind::Help, message.into()));
+        self
+    }
+
+    /// Attach a structured fix the user *probably* wants ([`Applicability::MaybeIncorrect`]), such
+    /// as a did-you-mean rename. Use [`Diagnostic::suggest_with`] for any other applicability.
+    pub fn suggest(
+        self,
+        span: Span,
+        message: impl Into<String>,
+        replacement: impl Into<String>,
+    ) -> Diagnostic {
+        self.suggest_with(span, message, replacement, Applicability::MaybeIncorrect)
+    }
+
+    /// Attach a structured fix with an explicit [`Applicability`]. A `MachineApplicable` suggestion
+    /// is one a tool may apply without review (for example inserting a missing `mut `).
+    pub fn suggest_with(
+        mut self,
+        span: Span,
+        message: impl Into<String>,
+        replacement: impl Into<String>,
+        applicability: Applicability,
+    ) -> Diagnostic {
+        self.suggestions.push(Suggestion {
+            span,
+            replacement: replacement.into(),
+            message: message.into(),
+            applicability,
+        });
         self
     }
 
@@ -204,6 +267,58 @@ impl DiagnosticSink {
     }
 }
 
+/// Levenshtein (edit) distance between two strings, counted in Unicode scalar values.
+///
+/// Classic two-row dynamic program, `O(a·b)` time and `O(min(a,b))` extra space. Used by
+/// [`did_you_mean`]; kept here so every producer shares one "did you mean" implementation rather
+/// than re-deriving it (sema's `nearest_generic` historically had the only copy).
+pub fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    // Index the shorter string across the row so the row stays `min(|a|,|b|)+1` wide.
+    let (a, b) = if a.len() < b.len() { (b, a) } else { (a, b) };
+    if b.is_empty() {
+        return a.len();
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            curr[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(curr[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
+/// The candidate closest to `want` by [`levenshtein`] distance, if one is close enough to be worth
+/// suggesting. Returns `None` when nothing is within the threshold.
+///
+/// The threshold is `max(1, want.len()/3)` scalar values, matching rustc's rule of thumb, so a
+/// one-character typo in a short name is caught while unrelated names are not. The tie-break is
+/// deterministic: the smallest distance wins, and on an exact tie the first candidate in iteration
+/// order is kept (so callers get a stable suggestion regardless of hash ordering — feed a sorted
+/// iterator for reproducibility).
+pub fn did_you_mean<'a, I>(want: &str, candidates: I) -> Option<&'a str>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let max_dist = (want.chars().count() / 3).max(1);
+    let mut best: Option<(usize, &'a str)> = None;
+    for cand in candidates {
+        if cand == want {
+            continue;
+        }
+        let d = levenshtein(want, cand);
+        if d <= max_dist && best.map(|(bd, _)| d < bd).unwrap_or(true) {
+            best = Some((d, cand));
+        }
+    }
+    best.map(|(_, c)| c)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +337,52 @@ mod tests {
         assert_eq!(d.labels.len(), 1);
         assert_eq!(d.notes.len(), 2);
         assert_eq!(d.primary_span(), Some(sp));
+    }
+
+    #[test]
+    fn suggest_records_a_structured_fix() {
+        let sp = Span::new(SourceId(0), 4, 4);
+        let d = Diagnostic::error("cannot assign twice to immutable binding `x`")
+            .with_code("E0304")
+            .primary(sp, "cannot assign")
+            .suggest_with(
+                sp,
+                "consider making it mutable",
+                "mut ",
+                Applicability::MachineApplicable,
+            );
+        assert_eq!(d.suggestions.len(), 1);
+        assert_eq!(d.suggestions[0].replacement, "mut ");
+        assert_eq!(
+            d.suggestions[0].applicability,
+            Applicability::MachineApplicable
+        );
+    }
+
+    #[test]
+    fn levenshtein_basic_distances() {
+        assert_eq!(levenshtein("", ""), 0);
+        assert_eq!(levenshtein("abc", "abc"), 0);
+        assert_eq!(levenshtein("abc", "abd"), 1);
+        assert_eq!(levenshtein("kitten", "sitting"), 3);
+        assert_eq!(levenshtein("", "abc"), 3);
+    }
+
+    #[test]
+    fn did_you_mean_picks_the_nearest_within_threshold() {
+        let cands = ["parallel", "generic", "tile", "inline"];
+        assert_eq!(did_you_mean("parellel", cands), Some("parallel"));
+        // Nothing close: a short, unrelated name is not suggested.
+        assert_eq!(did_you_mean("zzzzzzzz", cands), None);
+        // An exact match is never suggested against itself.
+        assert_eq!(did_you_mean("tile", cands), None);
+    }
+
+    #[test]
+    fn did_you_mean_tie_break_is_first_in_order() {
+        // "ab" is distance 1 from both "ab_" candidates; the first in iteration order wins.
+        let cands = ["abx", "aby"];
+        assert_eq!(did_you_mean("ab", cands), Some("abx"));
     }
 
     #[test]

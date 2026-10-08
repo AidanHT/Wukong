@@ -1,0 +1,52 @@
+// RUN: --run
+// EXPECT-OUT: 48
+// EXPECT-OUT: 25
+// EXPECT-OUT: 15
+// EXPECT-OUT: 9000000000
+// EXPECT-OUT: 65
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-EXIT: 0
+module extern_c_libm
+
+// Calling C (P15.3). An `extern "C"` block used to parse and type-check, then the call was a
+// runtime "unknown function" on the interpreter and was silently DELETED by native codegen. Now
+// each declaration becomes a MIR import: native binds the host C symbol, the interpreter calls the
+// very same symbol, and the LLVM emitter declares it. Every expected value is exact by hand, so
+// no C runtime's last-bit rounding is involved:
+//
+//   ldexp(3, 4)          = 3 * 2^4                    = 48
+//   fmod(17.5, 5)        = 2.5,  * 10                 = 25
+//   fmodf(7.5, 2)        = 1.5,  * 10                 = 15      (an f32 in and out)
+//   llabs(-9000000000)   = 9000000000                           (an i64 beyond i32)
+//   toupper('a' = 97)    = 'A'                        = 65
+//   fdim(5, 3)           = max(5 - 3, 0)              = 2
+//   scaled(10)           = ldexp(1, 10) = 1024: a Wukong function calling C, its value tested
+
+extern "C" {
+    fn ldexp(x: f64, e: i32) -> f64;
+    fn fmod(x: f64, y: f64) -> f64;
+    fn fmodf(x: f32, y: f32) -> f32;
+    fn llabs(x: i64) -> i64;
+    fn toupper(c: i32) -> i32;
+    fn fdim(x: f64, y: f64) -> f64;
+}
+
+fn scaled(k: i32) -> f64 {
+    return ldexp(1.0, k);
+}
+
+fn main() -> i32 {
+    print(ldexp(3.0, 4) as i64);
+    print((fmod(17.5, 5.0) * 10.0) as i64);
+    print((fmodf(7.5, 2.0) * 10.0) as i32);
+    print(llabs(-9000000000));
+    print(toupper(97));
+    print(fdim(5.0, 3.0) as i64);
+    if scaled(10) == 1024.0 {
+        print(1);
+    } else {
+        print(0);
+    }
+    return 0;
+}

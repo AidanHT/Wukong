@@ -1,0 +1,16 @@
+// Imported by tests/run/import_namespaces.wk twice: `import lib.stats.{bump};` (selective) and
+// `import lib.stats as st;` (alias). Its private `helper` collides by name with lib/geom.wk's and the
+// root's; its public `norm1` collides with lib/geom.wk's — all legal across modules.
+module lib.stats
+
+fn helper(a: i32) -> i32 {
+    return a + 1000;
+}
+
+pub fn bump(a: i32) -> i32 {
+    return helper(a);
+}
+
+pub fn norm1(a: i32) -> i32 {
+    return a * 10;
+}

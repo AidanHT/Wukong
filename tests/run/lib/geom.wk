@@ -1,0 +1,38 @@
+// Imported by tests/run/import_namespaces.wk through `import lib.geom as g;`. Its `helper` and
+// `abs_i` are PRIVATE: callable here, invisible to the importer, and free to share a name with a
+// `helper` in any other module.
+module lib.geom
+
+pub struct Vec2 {
+    pub x: i32,
+    pub y: i32,
+}
+
+pub enum Axis {
+    X,
+    Y,
+}
+
+pub const SCALE: i32 = 3;
+
+fn helper(v: Vec2) -> i32 {
+    return v.x * SCALE;
+}
+
+fn abs_i(a: i32) -> i32 {
+    if a < 0 {
+        return -a;
+    }
+    return a;
+}
+
+pub fn norm1(v: Vec2) -> i32 {
+    return helper(v) + abs_i(v.y);
+}
+
+pub fn pick(v: Vec2, a: Axis) -> i32 {
+    return match a {
+        Axis::X => v.x,
+        Axis::Y => v.y,
+    };
+}

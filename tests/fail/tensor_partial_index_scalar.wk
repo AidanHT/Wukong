@@ -1,0 +1,17 @@
+// EXPECT-CODE: E0401
+module tests.fail.tensor_partial_index_scalar
+
+// One index short of the rank is a VIEW of the remaining axes, not an element: `a[i]` on a [3, 3]
+// matrix is row `i`, a `Tensor[f32, 3]`. The forgotten second index of a trace must therefore still
+// be a compile error where the row is used as a number — never a pointer added to a float.
+fn trace(a: Tensor[f32, 3, 3]) -> f32 {
+    let mut s: f32 = 0.0;
+    for i in 0..3 {
+        s = s + a[i];
+    }
+    return s;
+}
+
+fn main() -> i32 {
+    return 0;
+}

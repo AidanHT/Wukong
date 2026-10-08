@@ -109,9 +109,11 @@ const FN_ITEM_OR_FOR: &[&str] = &["tile"];
 /// parameter's storage promise; `wukong_mir_build` reads it off the parameter it is written on.
 const PARAM_ONLY: &[&str] = &[crate::noalias::NOALIAS_ATTR];
 
-/// Is `name` (the bare attribute name, without the `@`) part of the v1 known set?
+/// Is `name` (the bare attribute name, without the `@`) part of the v1 known set? The lint-level
+/// attributes (`@allow`, `@warn`, `@deny`) are known too, wherever they are written; their
+/// arguments are checked by `crate::lints` (an unknown lint name is `W0007`).
 pub fn is_known(name: &str) -> bool {
-    KNOWN_ATTRS.contains(&name)
+    KNOWN_ATTRS.contains(&name) || crate::lints::is_level_attr(name)
 }
 
 /// Where an attribute was written. Only used to phrase the placement diagnostic.
@@ -620,5 +622,19 @@ fn f(mut o: [i32; 4]) { for i in 0..4 { o[i] = i; } }"
             codes("fn f() { @simd @align(32) for i in 0..4 { let x: i32 = i; } }"),
             Vec::<&str>::new()
         );
+    }
+
+    /// The lint-level attributes are legal on an item, a parameter and a statement — the three
+    /// extents a lint level can govern. Their arguments are the lint pass's business (`W0007`).
+    #[test]
+    fn lint_level_attributes_are_known_everywhere() {
+        assert_eq!(
+            codes(
+                "@allow(dead_code)\nfn f(@allow(unused_variables) x: i32) { \
+                 @deny(unused_mut) let y: i32 = 1; @warn(warnings) let z: i32 = y; }"
+            ),
+            Vec::<&str>::new()
+        );
+        assert_eq!(codes("@alow(dead_code)\nfn f() {}"), vec!["E0306"]);
     }
 }

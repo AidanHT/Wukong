@@ -1,0 +1,127 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 4
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 6
+// EXPECT-OUT: 8
+// EXPECT-OUT: 10
+// EXPECT-OUT: 12
+// EXPECT-OUT: 14
+// EXPECT-OUT: 16
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 15
+// EXPECT-OUT: 15
+// EXPECT-OUT: 15
+// EXPECT-OUT: 15
+module tests.run.tensor_dim_arith
+
+// A tensor dimension may be arithmetic on dimensions — `3*D`, `N + N` — held in a canonical
+// normal form, so a shape relation a model actually has can be written in the type instead of a
+// comment beside a flat array.
+//
+// Fused QKV: one [S, 3*D] projection holds Q, K and V side by side. `D` appears in `qkv`'s type
+// only inside `3*D`, so the call SOLVES it (`3*D = 6`, so `D = 2`) and every other parameter is
+// checked against that binding; inside the body the row stride of `qkv` is the derived extent
+// `3*D`, computed at run time from the hidden dimension parameter.
+fn split_qkv<S, D>(
+    qkv: Tensor[f32, S, 3*D],
+    mut q: Tensor[f32, S, D],
+    mut k: Tensor[f32, S, D],
+    mut v: Tensor[f32, S, D],
+) {
+    for s in 0..S {
+        for d in 0..D {
+            q[s, d] = qkv[s, d];
+            k[s, d] = qkv[s, D + d];
+            v[s, d] = qkv[s, 2*D + d];
+        }
+    }
+}
+
+// `2*N` and `N + N` are the same extent in normal form, so the body may return its argument
+// under either spelling; a caller sees the substituted extent (8 here).
+fn as_double<N>(a: Tensor[f32, 2*N]) -> Tensor[f32, N + N] {
+    return a;
+}
+
+// `N` is solved from the argument's length (`2*N = 8`) and is an ordinary value in the body.
+fn half_len<N>(a: Tensor[f32, 2*N]) -> i64 {
+    return N as i64;
+}
+
+// `N` binds directly from `bias`; the element count of the decaying `m` is then `M*N`, which with
+// `N = 4` is the solvable `4*M = 12`, so `M = 3`. `col[j]` sums column `j` of the [M, N] matrix.
+fn col_sums<M, N>(m: Tensor[f32, M, N], bias: Tensor[f32, N], mut col: Tensor[f32, N]) -> i64 {
+    for j in 0..N {
+        let mut s: f32 = bias[j];
+        for i in 0..M {
+            s = s + m[i, j];
+        }
+        col[j] = s;
+    }
+    return M as i64;
+}
+
+fn main() -> i32 {
+    // buf[t] = t, viewed as a [2, 6] matrix: row 0 holds 0..5, row 1 holds 6..11.
+    let mut buf: [f32; 12] = [0.0; 12];
+    for t in 0..12 {
+        buf[t] = t as f32;
+    }
+    let mut q: [f32; 4] = [0.0; 4];
+    let mut k: [f32; 4] = [0.0; 4];
+    let mut v: [f32; 4] = [0.0; 4];
+    split_qkv(buf as Tensor[f32, 2, 6], q, k, v);
+    // q[s, d] = row s, columns 0..2 -> 0 1 | 6 7
+    for i in 0..4 {
+        print(q[i] as i32);
+    }
+    // k[s, d] = row s, columns 2..4 -> 2 3 | 8 9
+    for i in 0..4 {
+        print(k[i] as i32);
+    }
+    // v[s, d] = row s, columns 4..6 -> 4 5 | 10 11
+    for i in 0..4 {
+        print(v[i] as i32);
+    }
+
+    // e[t] = 2*t + 2 -> 2 4 6 ... 16
+    let mut e: [f32; 8] = [0.0; 8];
+    for t in 0..8 {
+        e[t] = (2 * t + 2) as f32;
+    }
+    print(half_len(e));
+    let d = as_double(e);
+    for t in 0..8 {
+        print(d[t] as i32);
+    }
+
+    // m[i, j] = 1 + i for i in 0..3 (every column holds 1, 2, 3), bias[j] = 9: each column sum is
+    // 9 + 1 + 2 + 3 = 15, and the solved row count is 3.
+    let mut m: [f32; 12] = [0.0; 12];
+    for t in 0..12 {
+        m[t] = (1 + t / 4) as f32;
+    }
+    let bias: [f32; 4] = [9.0; 4];
+    let mut col: [f32; 4] = [0.0; 4];
+    print(col_sums(m, bias, col));
+    print(col.len());
+    for j in 0..4 {
+        print(col[j] as i32);
+    }
+    return 0;
+}

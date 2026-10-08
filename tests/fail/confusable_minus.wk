@@ -1,0 +1,11 @@
+// EXPECT-CODE: E0105
+module tests.fail.confusable_minus
+
+/// A minus sign pasted from a paper (U+2212 MINUS SIGN) looks like `-` but is not ASCII. The
+/// lexer names the code point and the character it imitates, then reads it as `-`, so this is the
+/// file's only diagnostic: no follow-on parser error at the same place.
+fn main() -> i32 {
+    let a: i32 = 5;
+    let b: i32 = 3;
+    return a − b;
+}

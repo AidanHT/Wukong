@@ -2647,6 +2647,58 @@ fn signature_of(
     sig
 }
 
+/// The C-ABI signature of an `extern "C"` import. A narrow integer is marked for sign or zero
+/// extension per its declared signedness — the C ABI leaves extending a `char`/`short`/`bool`
+/// argument to the caller — and `bool` (`i1`, an `i8` in CLIF) is unsigned.
+fn extern_signature(
+    e: &wukong_mir::ExternFn,
+    ptr_ty: Type,
+    call_conv: cranelift_codegen::isa::CallConv,
+) -> Signature {
+    let abi = |p: &wukong_mir::ExternParam| -> Option<AbiParam> {
+        let t = cl_type(&p.ty, ptr_ty)?;
+        let param = AbiParam::new(t);
+        Some(if p.ty.is_int() && t.bits() < 64 {
+            if p.signed {
+                param.sext()
+            } else {
+                param.uext()
+            }
+        } else {
+            param
+        })
+    };
+    let mut sig = Signature::new(call_conv);
+    sig.params.extend(e.params.iter().filter_map(&abi));
+    if let Some(r) = abi(&e.ret) {
+        sig.returns.push(r);
+    }
+    sig
+}
+
+/// Bind every `extern "C"` import of `program` to the address `wukong_runtime::cffi` resolves —
+/// the very address the interpreter calls, which is what keeps the two backends bit-exact on a C
+/// function. An unresolvable symbol is a clean error here instead of cranelift-jit's panic when it
+/// finalizes the relocation.
+fn bind_extern_symbols(
+    builder: &mut cranelift_jit::JITBuilder,
+    program: &Program,
+    interner: &Interner,
+) -> Result<(), String> {
+    for e in &program.externs {
+        let name = interner.resolve(e.name);
+        let addr = wukong_runtime::cffi::resolve_c_symbol(name).ok_or_else(|| {
+            format!(
+                "unresolved external symbol `{name}`: no C library loaded into this process \
+                 defines it (an `extern \"C\"` function must come from the C runtime, libm, or \
+                 another library the process has loaded)"
+            )
+        })?;
+        builder.symbol(name, addr);
+    }
+    Ok(())
+}
+
 /// Should the Cranelift IR verifier run? It is a **check-only** pass — it inspects the CLIF for
 /// well-formedness and never modifies the function or the emitted machine code, so toggling it is
 /// byte-identical. Cranelift defaults it *on* ("makes compilation slower but catches many bugs"),
@@ -3780,6 +3832,18 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?;
         ids.insert(f.name, id);
     }
+    // `extern "C"` functions: imported under their C names with the C-ABI signature. They join
+    // `ids` only while the bodies are lowered — so a call to one takes the ordinary user-call path
+    // in `lower_call` — and leave it before `ids` is returned, since an import has no finalized
+    // body to hand out. The JIT binds each one up front (`bind_extern_symbols`); an object leaves it
+    // to the linker.
+    for e in &program.externs {
+        let sig = extern_signature(e, ptr_ty, call_conv);
+        let id = module
+            .declare_function(interner.resolve(e.name), Linkage::Import, &sig)
+            .map_err(|err| err.to_string())?;
+        ids.insert(e.name, id);
+    }
 
     // Declare + define each read-only static-data blob (string literals). `writable = false` lands
     // them in the read-only data section (`.rodata`/`.rdata`); `Linkage::Local` keeps them internal.
@@ -3862,6 +3926,9 @@ fn populate_module<M: Module>(
             &kernel_ids,
             &asserting,
         )?;
+    }
+    for e in &program.externs {
+        ids.remove(&e.name);
     }
     Ok(ids)
 }
@@ -4872,6 +4939,7 @@ fn jit_compile_entry(
     );
     builder.symbol(RT_FMOD_F64, rt_fmod_f64 as *const u8);
     builder.symbol(RT_FMOD_F32, rt_fmod_f32 as *const u8);
+    bind_extern_symbols(&mut builder, program, interner)?;
     let mut module = JITModule::new(builder);
 
     let ids = populate_module(&mut module, program, interner, false)?;
@@ -5494,6 +5562,7 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     );
     builder.symbol(RT_FMOD_F64, rt_fmod_f64 as *const u8);
     builder.symbol(RT_FMOD_F32, rt_fmod_f32 as *const u8);
+    bind_extern_symbols(&mut builder, program, interner)?;
     let mut module = JITModule::new(builder);
     let ids = populate_module(&mut module, program, interner, false)?;
     module.finalize_definitions().map_err(|e| e.to_string())?;

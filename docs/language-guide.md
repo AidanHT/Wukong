@@ -39,6 +39,18 @@ A file conventionally begins with a `module` declaration; the header is **option
 informational (see *Modules & imports*), so a single-file program may omit it. Execution starts at
 `fn main() -> i32`, and the integer it returns becomes the process exit code.
 
+## Source text ✅
+
+Source files are UTF-8; a leading byte-order mark is ignored. Outside string literals, char
+literals and comments the text is **ASCII**: identifiers are letters, digits and `_` (a Greek
+letter must be spelled out, `alpha` for `α`; `E0101` names the code point and suggests the
+spelling). A Unicode character that merely *looks* like ASCII — `−` (U+2212 MINUS SIGN) or a dash
+for `-`, `×` for `*`, `≤` for `<=`, fullwidth punctuation, curly quotes, a no-break or zero-width
+space — is `E0105`, which names the code point and the ASCII character it imitates. The compiler
+then reads it as that ASCII token (a lookalike space is skipped), so one character pasted from a
+paper costs one error (`tests/fail/confusable_minus.wk`); a lookalike quote cannot open a literal
+and is an error token.
+
 ## Modules & imports ✅
 
 ```wukong
@@ -48,19 +60,43 @@ import lib.mathlib
 
 A module path is dotted, and `import` makes a program **multi-file**: `import a.b` — in any file of
 the program — loads `a/b.wk`, resolved relative to the directory of the **root** source file passed
-to `wukongc`, and splices its items into one merged **flat namespace**. Cross-file calls, consts,
-structs, and enums then just work, with no qualification (`tests/run/import_multi.wk`). Each file is
-loaded exactly once, by canonical path: an import **cycle** (`a` imports `b` imports `a`) or diamond
-is not an error, and every item still lands exactly once. A top-level name defined in two files is
-the ordinary duplicate-name error (E0300), pointing at **both** definitions; an import that resolves
-to no file is **E0305** (`wukongc --explain E0305`). A diagnostic inside an imported file renders
-with that file's own path and line.
+to `wukongc`. Each file is loaded exactly once, by canonical path: an import **cycle** (`a` imports
+`b` imports `a`) or diamond is not an error. An import that resolves to no file is **E0305**
+(`wukongc --explain E0305`), and a diagnostic inside an imported file renders with that file's own
+path and line.
 
-The `module` header itself remains informational — it does not participate in resolution and need
-not match the path a file was imported under. `import x as y` aliases and `import x.{a, b}` item
-lists parse but neither rename nor restrict anything yet (v1 is a flat namespace) 🟡. Note that
-`--emit=tokens|ast` dump the **root file only**; every later stage — and `--run` on either backend —
-sees the merged multi-file program.
+**Every file is a module with its own namespace** ✅. Its top-level items (`fn`, `struct`, `enum`,
+`const`, and the functions of an `extern` block) are **private** unless declared `pub`, and a file
+sees only its own items plus what *its own* imports bring in — imports are not transitive. Three
+import forms:
+
+```wukong
+import lib.mathlib;          // every `pub` item of lib/mathlib.wk, unqualified — and `mathlib::item`
+import lib.geom as g;        // only the qualifier: g::norm1(v), g::Vec2 { .. }, g::Axis::Y, g::SCALE
+import lib.stats.{bump};     // exactly `bump`, unqualified
+```
+
+A qualified name works in every position: calls and values (`g::norm1(v)`), struct literals
+(`g::Vec2 { x: 1, y: 2 }`), enum variants and patterns (`g::Axis::Y`), and types (`fn f(v: g::Vec2)`,
+or the item-level spelling `g.Vec2`). Two modules may each define a private `helper` — or both export
+`norm1` — without colliding (`tests/run/import_namespaces.wk`). The rules:
+
+- naming a **private** item of another module — by `import m.{x}`, by `m::x`, or by expecting a plain
+  `import m;` to bring it in — is **E0312**;
+- a definition in the file itself, or an explicit `import m.{x}`, **shadows** a plain import; two
+  plain imports that both export a name make an unqualified **use** of it ambiguous (**E0313**), never
+  a silent choice — qualify it, select it explicitly, or rename an import with `as`;
+- an explicit `import m.{x}` of a name the file also defines, or one `as` name bound to two modules,
+  is the ordinary duplicate-name error (**E0300**);
+- local variables, parameters and generic parameters shadow imported items exactly as they shadow
+  local ones.
+
+Field-level `pub` (`pub x: i32` inside a struct) is accepted but not yet enforced 🟡: a struct's
+fields are readable wherever the struct is. An imported item keeps its source name in every
+diagnostic, prefixed by its module path (`lib.geom.Vec2`). The `module` header itself remains
+informational — it does not participate in resolution and need not match the path a file was
+imported under. Note that `--emit=tokens|ast` dump the **root file only**; every later stage — and
+`--run` on either backend — sees the whole resolved program.
 
 ## Functions ✅
 
@@ -97,6 +133,33 @@ error (`E0300`, "the name … is reserved for a compiler runtime kernel"): that 
 the runtime kernels the compiler's own recognizers emit, and a user function of the same name used to
 hijack kernel dispatch silently. The restriction applies to function names only — a `let`, `const`,
 `struct` or `enum` may still be named `wukong_*`.
+
+### Function-typed parameters ✅
+
+A parameter may have a **function type**, `fn(A, B) -> R` (`fn(A)` for `()`), and every call binds it
+to a function **named at compile time** — a non-generic top-level function, or the caller's own
+function-typed parameter passed along:
+
+```wukong
+fn square(x: f32) -> f32 { return x * x; }
+fn apply(f: fn(f32) -> f32, x: f32) -> f32 { return f(x); }
+fn twice(f: fn(f32) -> f32, x: f32) -> f32 { return apply(f, apply(f, x)); }
+
+fn main() -> i32 {
+    print(twice(square, 3.0));             // 81
+    return 0;
+}
+```
+
+There are no function pointers at run time: the callee is **specialized per bound function** exactly
+like a type-generic function is per type (`apply$square`), the function parameter carries no value,
+and a call through it is a direct call — inlinable, and visible to every kernel recognizer. A
+type-generic higher-order function binds its type parameters from the function argument too
+(`fn fold3<T>(op: fn(T, T) -> T, a: T, b: T, c: T) -> T`). The rules (`E0411` otherwise): a function
+type is only a parameter's type (not a local, field, element, return type or `extern` parameter); a
+function cannot be bound to a `let` or passed to a non-function parameter; the argument must name a
+function, not compute one; and a function-typed parameter is neither `mut` nor named after a builtin
+(`gelu`, `print`, …). A wrong signature is the ordinary `E0401` type mismatch. `tests/run/fn_params.wk`.
 
 ## Bindings ✅
 
@@ -135,10 +198,14 @@ in a type (`let a: [i32; N]`, including a const-references-const chain;
 `tests/run/const_array_length.wk`), and when one `const` references another
 (`tests/run/top_level_const.wk`). An array length is an integer literal (any radix, with `_`
 separators and an optional suffix — `[i32; 0x10]` is 16 elements) or a top-level `const`; simple
-arithmetic on those folds too (`[i32; 2 + 2]`). A **generic** parameter name is not a usable length: it
-is exempt from the name check but evaluates to **0**, so `[i32; N]` inside `fn f<N>` is a zero-length
-array and any constant index into it is `E0501` — use a `const`. Any other name is `E0301`, not a
-silent length of 0, and a fixed-size array may hold at most `u32::MAX` elements (`E0401` past that).
+arithmetic on those folds too (`[i32; 2 + 2]`). A **generic** length is the shape of a
+**parameter**: `fn sum<N>(a: [f32; N])` (or `[f32; 2*N]`) takes a shape-generic buffer — it is the
+`Tensor[f32, N]` it denotes, so each call binds `N` from its argument's length and the body indexes
+it, iterates it, and reads `a.len()` (`tests/run/generic_array_param.wk`). A **local** array or a
+**return** type of generic length would need storage whose size is only known at run time, and is
+`E0406` (`tests/fail/generic_array_length.wk`); so is a generic length whose element is not a scalar.
+Any other name is `E0301`, not a silent length of 0, and a fixed-size array may hold at most
+`u32::MAX` elements (`E0401` past that).
 
 ## Literals ✅
 
@@ -339,6 +406,63 @@ Because a by-reference parameter aliases the caller's storage, mutating an aggre
 requires `mut` on it (see *Functions* above) — a non-`mut` aggregate parameter is effectively
 read-only, and a `mut` one is the in-place output buffer a kernel writes.
 
+## Methods and `impl` blocks ✅
+
+```wukong
+struct Vec2 { x: f32, y: f32 }
+
+impl Vec2 {
+    fn new(x: f32, y: f32) -> Self { return Self { x: x, y: y }; }   // associated function
+    fn dot(self, o: Vec2) -> f32 { return self.x * o.x + self.y * o.y; }
+    fn scale(&mut self, k: f32) { self.x = self.x * k; self.y = self.y * k; }
+}
+
+fn main() -> i32 {
+    let mut v = Vec2::new(3.0, 4.0);
+    v.scale(2.0);                          // mutates `v` in place
+    print(v.dot(v));                       // 100
+    return 0;
+}
+```
+
+An `impl` block adds functions to a struct or an enum. A function whose first parameter is the
+receiver is a **method**, called `x.m(..)`; one without is an **associated function**, called
+`Type::m(..)`. Inside the block `Self` names the type. Receivers follow the parameter rules above —
+an aggregate is passed by reference, so `self` and `&self` read the caller's value and `mut self` /
+`&mut self` may write it in place — and a receiver reached through a reference or pointer
+(`p.dot(q)` with `p: &Vec2`) is dereferenced automatically. Dispatch is **static**: each method is
+the ordinary function `Type.method`, and `x.m(a)` is exactly the call `Type.m(x, a)`, so methods
+inline, specialize and alias-check like any call. A misspelled method, an associated function called
+with method syntax, or an `impl` of something that is not a struct or enum is `E0315`.
+`tests/run/methods_impl.wk`.
+
+## Traits ✅
+
+```wukong
+trait Shape {
+    fn area(self) -> f32;
+    fn unit() -> Self;
+}
+
+impl Shape for Rect {
+    fn area(self) -> f32 { return self.w * self.h; }
+    fn unit() -> Self { return Rect { w: 1.0, h: 1.0 }; }
+}
+
+fn total<T: Shape>(a: T, b: T) -> f32 { return a.area() + b.area(); }   // or `where T: Shape`
+```
+
+A trait is a set of method signatures (`Self` is the implementing type). `impl Trait for Type` must
+define exactly those methods with exactly those signatures — a missing, extra or mismatched method is
+`E0410`, and so is a default method body, which traits do not have. A type parameter bounded by
+traits (`<T: Shape + Named>`, or a `where` clause) may call their methods on its values (`a.area()`)
+and their associated functions on itself (`T::unit()`, when `T` is the type of a parameter). Dispatch
+is **static, by monomorphization**: each call instantiates `total` at a concrete type and the
+instance calls that type's `impl` directly — no vtable, no indirect call — so a call at a type with
+no `impl Shape` is rejected at the call (`E0410`). Not supported yet: generic traits or trait
+methods, default methods, two traits on one type that define the same method name (both are the
+function `Type.method`), and generic structs/enums (`Buf<T>`). `tests/run/traits_static_dispatch.wk`.
+
 ## Enums ✅
 
 ```wukong
@@ -376,7 +500,8 @@ the shared `K` above must agree on both operands. Mismatches are **compile error
 faults:
 
 - `E0501` — **rank / element-count** errors: a different number of dimensions, indexing a tensor with
-  the wrong number of indices, a compile-time-constant index past a static dimension, a fixed-size
+  more indices than its rank (fewer select a view), a compile-time-constant index past a static
+  dimension, a fixed-size
   array whose length cannot satisfy the tensor's element count (exactly the element count when every
   dim is a literal; a multiple of the product of the literal dims when a symbolic/`?` dim is still
   free), and a kind clash — a scalar, SIMD vector, `[]T` slice, tuple or struct value passed where a
@@ -390,6 +515,11 @@ faults:
   not match the declared generic list.
 - `E0504` — a tensor type named a dimension that is not a declared generic parameter, an integer
   literal, `?`, or a `const` (reported with a did-you-mean hint against the nearest declared generic).
+- `E0505` — a dimension expression that is not an extent: it folds to a negative constant, divides by
+  zero, overflows, or uses `?` as an operand — at the declaration, or for the dimensions a call binds.
+- `E0506` — a reshape (`x as Tensor[…]`) whose element count is not provably unchanged.
+- `E0507` — a misused view or extent query: a partial index of a non-contiguous tensor, an
+  assignment to a view (`a[i] = …` on a rank-2 `a`), or a `.dim(k)` whose axis is not a constant.
 
 **A shape error names what disagrees.** The primary message carries the dimension and both values,
 so the fix is readable without opening the callee:
@@ -407,14 +537,63 @@ the message names the ranks, the shapes, or the layout instead. The same text re
 verbatim as the `message` field of `--error-format=json`, alongside the unchanged `code`.
 
 Run `wukongc --explain E0502` for a worked example. Dimensions may be integer literals, a declared
-symbolic generic name, the name of a top-level `const`, or `?` for an unknown dimension. `?` does not
-carry a queryable runtime extent: there is no tensor `.dim()` accessor, and indexing that requires
-an unknown interior stride declines during lowering. Use a symbolic generic dimension when
-executable extents are needed. A `const` dim
+symbolic generic name, the name of a top-level `const`, `?` for a run-time dimension, or **arithmetic
+on dimensions** (below). A `const` dim
 resolves to its integer **value**, so it is a fixed dimension like a literal — `const D: usize = 3;
 Tensor[f32, 2, D]` really is 3 wide, and `a[1, 3]` on it is `E0501`. A declared generic shadows a
 same-named `const`. Any other name is `E0504` rather than a silently-introduced new symbolic dimension.
 Tensor element types must be scalars (`E0302`).
+
+**Dimension arithmetic ✅.** A dimension may be computed from others with `+ - * / %` and
+parentheses — `Tensor[f32, S, 3*D]` (a fused QKV projection), `Tensor[f32, S, H*HD]`, `Tensor[f32,
+(L - K)/S + 1]`. `/` is floor division and `%` the matching non-negative remainder (truncation, for
+the non-negative operands an extent has). The checker keeps every such extent in a **canonical
+normal form** (an integer polynomial over the dimension variables, with irreducible `/`/`%` terms),
+so two spellings of one extent are one type — `2*N` and `N + N`, `H*HD` and `HD*H`, `(2*N + 3)/2`
+and `N + 1` — and a body may return its `Tensor[f32, 2*N]` argument as `Tensor[f32, N + N]`. Equality
+is *sound, not complete*: a relation the normal form cannot prove (`D` against `H*(D/H)`, which loses
+the remainder) is rejected, never assumed. At a call, a dimension that appears only inside an
+expression is **solved** from the argument: `Tensor[f32, 2*N]` fed 8 elements binds `N = 4`, and fed
+7 elements is `E0502` (no whole-number `N`); a caller's own `M` against `2*N` is `E0502` unless the
+caller can prove `M` even by spelling it `2*K`. A flat array fed to a rank-2+ tensor solves the one
+dimension its element count leaves free: `Tensor[f32, M, N]` beside a `Tensor[f32, N]` of 4 elements,
+fed 12, binds `M = 3`. A dimension expression must be an extent (`E0505`):
+`Tensor[f32, 2 - 5]`, a division by zero, or a `?` operand are rejected, as is a call that makes a
+result extent `N - 4` negative. In lowering, every variable of a derived extent is a hidden dimension
+parameter and the extent is recomputed from them in the same normal form the checker compared
+(`tests/run/tensor_dim_arith.wk`).
+
+**Views: partial indexing ✅.** Indexing a contiguous tensor with **fewer indices than its rank** is
+the sub-tensor of the remaining axes — a *view* of the same buffer, not a copy: `m[i]` on a
+`Tensor[f32, M, N]` is the row `Tensor[f32, N]`, `c[b, h]` on a rank-4 tensor a `[S, D]` panel.
+A view can be bound (`let r = m[i];`), indexed further (`m[i][j]` is exactly `m[i, j]`), passed to a
+shape-generic function, returned from one, written through, and iterated: `for row in m` walks the
+rows of a rank-2+ tensor (and the elements of a rank-1 one). The leading indices are bounds-checked
+like any constant index. A view is never a scalar — the commonest way to get one is a forgotten
+index, so using it as a number (`s + a[i]`, `print(a[i])`, `exp(a[i])`, a condition, a comparison) is
+`E0401` naming the view's type; and it is not an assignable place (`a[i] = b[i]` would have to copy a
+row: `E0507`). Only a contiguous (row-major) tensor has row views (`E0507` for `.col_major` and the
+other layouts). Writing through a view of a non-`mut` parameter is `E0304`, exactly like writing the
+parameter (`tests/run/tensor_views.wk`).
+
+**Reshape ✅.** `x as Tensor[T, d0, d1, …]` views a contiguous buffer — a tensor, or a fixed-size
+array of scalars — under a new shape without copying. The element type must be the same (it moves no
+data: `E0502`), both sides contiguous, and the element count **provably** unchanged (`E0506`):
+`x as Tensor[f32, S, H, HD]` from a `Tensor[f32, S, H*HD]` is accepted (`S*(H*HD)` = `S*H*HD`), from
+`Tensor[f32, S, D]` it is not. A `?` extent has no count to prove and is rejected
+(`tests/run/tensor_reshape_heads.wk`).
+
+**Extents ✅.** `t.dim(k)` is the extent of axis `k` and `t.len()` the extent of axis 0, as `i64`, on
+a tensor or a fixed-size array (`.len()` also on a slice). The axis must be a compile-time constant in
+range (`E0507`, `E0501`). A fixed axis folds to its constant and a symbolic or derived one is computed
+from the hidden dimension parameters. A **`?` axis of a tensor parameter carries its run-time
+extent**: the caller passes it as one more hidden `i64` argument — read off a tensor argument's own
+shape, or a decaying array's length divided by the parameter's other extents — so the callee can read
+it (`a.dim(0)`), loop to it, iterate the tensor, use it as the row stride of an interior `?` axis,
+forward it to another `?` parameter, and pass the tensor where a callee has a generic dimension (which
+the run-time extent then binds); an immutable view of the parameter keeps the extents of the axes
+it keeps. A `?` extent that is not known at a call (a `?` tensor *returned* by a call, say) is a clean
+`C0001` there, never a guessed value (`tests/run/tensor_extent.wk`).
 
 **Layout.** A tensor type may carry a physical-layout suffix, which must come last inside the
 brackets: `Tensor[f32, M, N, .contiguous]` (the default, row-major), `.col_major`, `.strided`, or
@@ -440,8 +619,9 @@ binds `M, N, K` from the operands) — with two limits. A callee parameter with 
 cannot be satisfied by the caller's own generic dim (`fn fwd<N>(a: Tensor[f32, N]) { takes64(a) }` is
 `E0502`: a universally-quantified dimension cannot be *assumed* equal to 64 — declare the callee's
 parameter `?` when the size is a runtime value). And a `?` argument never *binds* a callee's symbolic
-dim, so a later concrete sibling still binds it and every subsequent operand is checked against that
-binding. A constant index past a static tensor dimension, like a fixed-size array, is `E0501`.
+dim for checking, so a later concrete sibling still binds it and every subsequent operand is checked
+against that binding; when nothing else determines the dim, lowering passes the `?` argument's run-time
+extent (`tests/run/tensor_extent.wk`). A constant index past a static tensor dimension, like a fixed-size array, is `E0501`.
 
 **What runs today.** A tensor with **compile-time-constant shape** executes end-to-end on both
 backends: multi-dimensional indexing `a[i, j]` flattens to a row-major GEP off the base pointer (a
@@ -830,17 +1010,75 @@ lowers to PTX `.shared` SMEM and `sync_block()` to `bar.sync 0` (`wukong_codegen
 - `now_ns()` — a zero-argument monotonic nanosecond clock returning `i64`, for in-process timing
   (`let t1 = now_ns(); … let dt = now_ns() - t1;`). Any argument is `E0503`. Only *differences* between
   reads are meaningful, so a program's stdout stays backend-identical.
-- `sdpa(q, k, v, out, s, d, scale, causal)` — fused scaled-dot-product attention for one `[s, d]`
-  head: `out = softmax(scale·Q·Kᵀ [+ causal mask])·V`, computed by one runtime kernel with no S×S score
-  buffer. `q`/`k`/`v`/`out` must be `f32` arrays, `[]f32` slices, or tensor views; `s`, `d` and
-  `causal` are integers and `scale` is a float. When `s` and `d` are compile-time constants every
-  buffer whose type pins an extent must hold `s*d` elements. `sdpa` has no signature in sema, so its
-  whole contract is enforced at lowering: a malformed call is a catalogued `C0001` at the call site,
-  never a crash (`tests/fail/sdpa_operand_type.wk`, `sdpa_operand_extent.wk`).
+- `sdpa(q, k, v, out, s, d, scale, causal)` — fused scaled-dot-product attention; one of the
+  shape-checked kernel builtins below.
 
 These are recognized by the MIR builder and implemented directly by the interpreter (and, on the
 native backend, by the runtime). A user-defined function of the same name shadows any of these
 builtins.
+
+### Kernel builtins ✅
+
+The tuned runtime kernels are callable **by name**, not only through a loop nest a recognizer happens
+to match. Each builtin has a real shape signature that sema checks with the same codes a generic
+function's call gets, and each lowers to exactly one runtime kernel on every backend (the
+interpreter calls the same symbol), so it is the explicit way to say "I mean this kernel" — and it
+still means it under `@generic` or with recognition switched off. All operands are `f32` buffers
+(a `Tensor[f32, ..]`, an `[f32; N]` array, or a `[]f32` slice), row-major:
+
+| builtin | shape signature | kernel |
+|---|---|---|
+| `matmul::<M, K, N>(a, b, out)` | `a: [M, K]`, `b: [K, N]`, `out: [M, N]` | `wukong_sgemm` |
+| `matmul_nt::<M, K, N>(a, b, out)` | `a: [M, K]`, `b: [N, K]`, `out = a·bᵀ` | `wukong_sgemm_nt` |
+| `matmul_tn::<M, K, N>(a, b, out)` | `a: [K, M]`, `b: [K, N]`, `out = aᵀ·b` | `wukong_sgemm_tn` |
+| `linear::<M, K, N>(x, w, b, out)` | `x: [M, K]`, `w: [N, K]`, `b: [N]`, `out = x·wᵀ + b` | `wukong_sgemm_nt_epi` |
+| `transpose::<R, C>(x, out)` | `x: [R, C]`, `out: [C, R]` | `wukong_transpose_f32` |
+| `softmax`, `log_softmax ::<R, C>(x, out)` | `x, out: [R, C]`, over the last axis | `wukong_norm_f32` |
+| `layernorm::<R, C>(x, gamma, beta, out, eps)` | `x, out: [R, C]`, `gamma, beta: [C]` | `wukong_norm_affine_f32` |
+| `rmsnorm::<R, C>(x, gamma, out, eps)` | `x, out: [R, C]`, `gamma: [C]` | `wukong_norm_affine_f32` |
+| `exp`, `log`, `tanh`, `sigmoid`, `silu`, `gelu`, `relu (x, out)` | `x, out: [N]` | `wukong_vmath_f32` |
+| `sum`, `amax`, `amin (x) -> f32`; `dot(x, y) -> f32` | `x, y: [N]` | `wukong_sreduce_f32` |
+| `sdpa(q, k, v, out, s, d, scale, causal)` | each buffer holds at least `s·d` | `wukong_attention_f32` |
+
+The one-argument `gelu(x)`/`exp(x)`/… stay the scalar math intrinsics; only the two-argument buffer
+form is the kernel. A user function — or a local — of the same name shadows a builtin.
+
+**Where the dimensions come from**, first binding wins: an explicit turbofish (an integer literal, a
+`const`, a generic dimension, or an in-scope integer variable, which is then a *runtime* extent);
+the shape of each `Tensor` operand, unified axis by axis (a conflict is `E0502`, a rank clash
+`E0501`); the length of a fixed array, which fixes the one dimension of its shape still free (so
+`linear(x, w, b, out)` over arrays reads N from `b`, then M from `out`, then K from `x`); a
+row-wise operation's row count defaults to 1; and last a slice's runtime length. A dimension nothing
+fixes is **`E0409`** — `matmul(a, b, c)` over three flat arrays could be any factorization, so it
+needs `matmul::<2, 3, 4>(a, b, c)`. A static array whose length disagrees with its shape is `E0501`,
+a non-`f32` operand `E0502`, and writing the output through a non-`mut` aggregate parameter
+`E0304`. `sdpa`'s `s`/`d` are values: when both are constants, every operand whose type pins an
+extent must hold `s·d` elements (`E0501`) and a rank-2 tensor operand must be `[s, d]` (`E0502`).
+
+What the lowering guarantees on top of the kernel call:
+
+- **Runtime extents are checked.** A runtime dimension must lie in `0..=i32::MAX`, and an operand
+  whose length is only known at run time (a slice, or an array against a runtime dimension) must hold
+  exactly its shape's elements (`sdpa`: at least `s·d`). A violation traps like a failed `assert`
+  (exit 1, `assertion failed`) instead of reading or writing past a buffer
+  (`tests/run/builtin_extent_trap.wk`). A constant extent the kernels' signed 64-bit ABI cannot
+  carry is the codegen limit `C0001` (`tests/fail/sdpa_dimension_abi.wk`).
+- **Value semantics.** A builtin reads its inputs as they were before the call, even when the output
+  overlaps one: the call compares address ranges at run time and, on overlap, computes into scratch
+  and copies the result out (`matmul::<2, 2, 2>(p, q, p)` is `p·q`). An elementwise or row-wise
+  builtin spelled in place with one name (`softmax(x, x)`) runs in place with no test.
+- **Empty contractions.** `matmul` with `K = 0` is the zero matrix and `linear` the broadcast bias,
+  although the GEMM kernels themselves write nothing for `K = 0`.
+- Inside a `@parallel` function each call uses the kernel's multicore twin, which is bit-identical.
+- Reductions follow the kernel's documented lane order and identities: an empty `sum` is `0`, an
+  empty `amax`/`amin` is `-inf`/`+inf`.
+
+`sum` and `dot` lower to the same single `wukong_sreduce_f32` call the reduction recognizer emits,
+which the autodiff tape already differentiates; `amax`/`amin` have no VJP, and the buffer-writing
+builtins add the overlap branch, which the single-block autodiff tape does not take yet. Fixtures: `tests/run/builtin_matmul.wk`, `builtin_norms.wk`, `builtin_activations.wk`,
+`builtin_reductions.wk`, `sdpa_blocks.wk` (two query blocks, D = 9, both mask modes), each printing
+every lane against hand-derived values; `tests/fail/builtin_dim_uninferable.wk`,
+`sdpa_operand_extent.wk`, `sdpa_operand_type.wk`.
 
 ### Math intrinsics ✅
 
@@ -1095,9 +1333,43 @@ differential contract exactly like a use after `free`. Zero-length requests and 
 behave as for `alloc_<T>` (null data natively, a diagnostic in the interpreter) and still count
 toward the mark (`tests/run/alloc_scratch_arena.wk`).
 
-No garbage collector and no hidden allocations beyond what you `alloc_*` or `scratch_*`: *named*
-allocator selection (`System`, `Pool` — 🔵) and cleanup via `defer` (🔵) are still being wired to
-the surface. **`@parallel` functions
+No garbage collector and no hidden allocations beyond what you `alloc_*` or `scratch_*`; cleanup pairs
+with `defer` (✅, below), and *named* allocator selection (`System`, `Pool` — 🔵) is still being
+wired to the surface.
+
+### Scope-exit cleanup: `defer` ✅
+
+`defer <expr>;` runs `<expr>` when control leaves the enclosing block — however it leaves:
+
+```wukong
+fn sum_scratch(n: i64) -> i32 {
+    let mut buf: []f32 = alloc_f32(n);
+    defer free(buf);                 // runs on every exit below
+    if n == 0i64 {
+        return 0;                    // runs free(buf), then returns
+    }
+    // ... fill and sum buf ...
+    return s as i32;                 // `s as i32` is computed FIRST, then free(buf) runs
+}
+```
+
+- **Every exit**: falling off the end of the block, `return` (all pending defers of the function),
+  and `break`/`continue` (the defers of every block inside the targeted loop — so a `defer` in a
+  loop body runs once per iteration).
+- **LIFO**: several defers run in reverse order of registration, innermost block first.
+- **Values first**: a returned value, a `break` value, and a block's tail value are computed *before*
+  the defers run, so `defer n += 1; return n;` returns the old `n`.
+- `<expr>` may be any expression, including a block, and `defer x += 1;` defers an assignment.
+- **E0314**: a deferred expression may not leave itself (`return`, or `break`/`continue` to a loop
+  outside it), and a name it uses may not be rebound (`let`, `for`, a match binding) while it is
+  pending — its copies at the exits would silently read the new binding.
+- A failed `assert` aborts without running defers.
+
+`defer` runs on every backend (`tests/run/defer_scope_exit.wk`): it is lowered by copying the
+deferred expression onto each exit before any other lowering, so the interpreter, the native JIT,
+`--emit=exe`, the LLVM emitter, the kernel recognizers and autodiff all see ordinary statements.
+
+**`@parallel` functions
 execute today** (✅): the native backend outlines the loop body into its own function and dispatches it
 across CPU cores through the `wukong_runtime` rayon-backed C-ABI entry point
 `wukong_parallel_for(n, body, env)`, which hands each worker a contiguous chunk of `[0, n)` and returns
@@ -1107,8 +1379,9 @@ SIMD). The interpreter runs the same range sequentially, so results stay differe
 The whole-function vehicle fires on a narrow shape: **every** parameter must be a fixed-size array
 (`[T; N]`) — a `[]T` slice, a `Tensor[..]`, a pointer or a scalar parameter declines — the body must be
 exactly one unlabelled `for i in 0..hi { … }` over a half-open, unit-step range starting at literal `0`,
-and the body must not `return`, `defer`, or `break`/`continue` out of that loop (a `break`/`continue`
-inside an *inner* loop is fine). Anything the recognizer cannot prove declines **silently to the
+and the body must not `return` or `break`/`continue` out of that loop (a `break`/`continue`
+inside an *inner* loop is fine; a `defer` is lowered to ordinary statements first, so a body holding
+one is no longer a lone `for` and declines). Anything the recognizer cannot prove declines **silently to the
 ordinary serial lowering**: the program is still correct, it just does not use more than one core. A
 `@parallel` function whose body is instead a recognized kernel nest (a matmul, GEMV, batched norm,
 transpose, elementwise activation, …) is intercepted *before* the outliner and dispatches the multicore
@@ -1142,6 +1415,44 @@ trip count fits one grain runs once without a fork, and the runtime's multicore 
 (`wukong_*_parallel`) split only when the work — rows × columns × a per-element cost — can repay the
 fork (`WUKONG_PAR_MIN_WORK` moves that threshold); below it they run their serial twin. Every one of
 those choices is scheduling only: the output is bit-identical at every thread count.
+
+## Calling C: `extern "C"` ✅
+
+```wukong
+extern "C" {
+    fn ldexp(x: f64, e: i32) -> f64;
+    fn llabs(x: i64) -> i64;
+    pub fn fmodf(x: f32, y: f32) -> f32;   // `pub` exports the declaration to importing modules
+}
+
+fn main() -> i32 {
+    print(ldexp(3.0, 4) as i64);   // 48
+    return 0;
+}
+```
+
+An `extern "C"` block declares C functions by their C symbol names; calls type-check against the
+declared signature like any other call (`tests/run/extern_c_libm.wk`). A signature may use integers
+(signedness is honored for narrow ones), `bool`, `f32`, `f64`, and raw pointers / references; anything
+without a C mapping — a slice, array, tuple, struct, enum, tensor, SIMD vector, `f16`/`bf16`, or a
+generic signature — is **C0001** at the declaration (pass `*T` plus a length instead). Variadic C
+functions (`printf`) cannot be declared.
+
+- **Native** (`--backend=native`, `--emit=obj|exe`): the symbol is imported with the C ABI. The JIT
+  binds it from the running process — the C runtime and libm, plus anything already loaded (on
+  Windows the Universal CRT is loaded on demand, so all of C99's libm is reachable) — and an
+  unresolvable symbol is a clean error; an object file leaves it to the linker.
+- **Interpreter**: calls the **same host symbol** through a scalar marshaller, so the two backends run
+  identical machine code and stay bit-exact even for a libm function whose last bit differs between
+  C runtimes. It supports up to 4 parameters, each an integer, `bool`, `f32` or `f64`, and a `void`,
+  integer, `f32` or `f64` result. A pointer signature (the interpreter's memory is slots, not bytes)
+  or an unresolvable symbol is refused **before the run** with C0001 — use `--backend=native`.
+- **LLVM text** (`--emit=llvm-ir`): a `declare` with `signext`/`zeroext` on narrow integers.
+- `--backend=gpu-native` declines a program that calls C (the usual UNSUPPORTED skip).
+
+The same C function declared identically in several modules is one symbol (the duplicates merge);
+an `extern` named after a builtin's lowering symbol (`print`, `print_u`, …) is E0300, and the
+`wukong_` prefix stays reserved.
 
 ## File I/O ✅
 
@@ -1272,6 +1583,58 @@ algorithm or backend:
   `u = rand_f32(seed, step)` the draw is a pure function of `(probs, seed, step)`, so temperature,
   top-k and top-p sampling are a few lines over these three kernels.
 
+## Warnings (lints) ✅
+
+A program that type- and shape-checks clean is linted: the compiler warns about code that compiles
+but is probably not what was meant. A warning never changes what a program computes and never
+stops a build unless its level says so. Each lint has a stable code (`wukongc --explain W0001`)
+and a name:
+
+| Code | Name | Reports |
+|---|---|---|
+| `W0001` | `unused_variables` | a `let`, parameter, `for` variable or `match` binding never read — including an accumulator that is only ever assigned (`acc += x` with `acc` never read) |
+| `W0002` | `unused_mut` | a scalar or pointer binding declared `mut` that is never reassigned or borrowed (`*p = v` writes the pointee, not `p`) |
+| `W0003` | `unreachable_code` | code after a `return`/`break`/`continue` or after a construct that diverges on every path, judged exactly as the definite-return check judges it |
+| `W0004` | `unused_result` | an expression statement whose value is thrown away with no effect — above all `out[i] == a[i] + b[i];` written for `=` |
+| `W0005` | `dead_code` | a function of the compiled file no entry point reaches (`main`, the `--grad-of` function under `--emit=grad`/`--train`, `pub`, `@export`/`@extern`); nothing under `--emit=obj`/`llvm-ir` or in a file with no `main` |
+| `W0006` | `unwritten_output` | a `mut` array/slice/tensor/tuple/struct parameter — an output buffer — that is never stored to, assigned, passed on or borrowed |
+| `W0007` | `unknown_lints` | an `@allow`/`@warn`/`@deny` argument that names no lint |
+| `W0030` | `missing_semicolon` | a statement without its `;` (see below) |
+| `W0031` | `ambiguous_continuation` | a `(` or `[`, or a `-` touching its operand, at the start of a line, continuing the expression above it |
+
+A name prefixed with `_` (`_scratch`) is never reported as unused. Levels: **allow** (silent),
+**warn** (the default for every lint) and **deny** (an error; the build fails). Set them on the
+command line — `-A <lint>`, `-W <lint>`, `-D <lint>`, where `<lint>` is a name, a code or
+`warnings` (every lint), so `-D warnings` fails the build on any warning — or in source, on a
+function, a parameter or a statement:
+
+```wukong
+@allow(dead_code)
+fn kept_for_later() -> i32 { return 1; }
+
+fn main() -> i32 {
+    @allow(unused_variables)
+    let scratch: i32 = 7;
+    return 0;
+}
+```
+
+The innermost attribute wins over an outer one and over the command line; `-D warnings` applies to
+every lint still at warning level, so it does not resurrect an allowed one. Warnings are printed
+after any error. The lints that need types run only on a program that checks clean; the parser's
+two (`W0030`, `W0031`) are reported for the compiled file even when a later stage fails, since a
+line that silently continued the one above is often why it failed. The fixtures in `tests/warn/`
+pin each lint's exact output.
+
+**Statements end with `;`.** It may be left out only after a block-like statement — `if`,
+`match`, `loop`, `while`, `for`, a `{ … }` block — and, for any statement but a `let`, right
+before the `}` that closes the block (Rust's rule). Leaving it out elsewhere still parses the same
+(`W0030` is a warning, not yet an error), but it is what makes the next hazard possible: a `(`
+or `[` that starts a line is a call or an index of the expression on the line above, and so is a
+`-` that starts a line and touches its operand (`-1`). `acc = a[i]` followed by `(b + c)` on the
+next line is `acc = a[i](b + c)`; `W0031` reports it. A `- y` with a space is the ordinary way to
+continue a long subtraction and is not reported.
+
 ## Command-line interface
 
 ```
@@ -1284,9 +1647,10 @@ wukongc [OPTIONS] <input.wk>
                       native = Cranelift JIT; gpu / gpu-native require --features gpu + a CUDA device
                       aliases: interpreter = interp, cranelift = native, cuda = gpu,
                       gpu-lower = gpu-native; any other value is a usage error (exit 2)
---emit=<stage>        tokens | ast | mir-high | mir (alias mir-low) | grad | llvm-ir | obj | exe
+--emit=<stage>        tokens | ast | check | mir-high | mir (alias mir-low) | grad | llvm-ir | obj | exe
                       (default: exe)
                       grad = reverse-mode backward MIR of a loss fn (see --grad-of/--grad-wrt)
+                      check = run lex/parse/imports/sema only (no lowering); the fast typo loop
 --grad-of=<fn>        function to differentiate for --emit=grad / --train   (default: loss)
 --grad-wrt=<i,..>     buffer-parameter indices to differentiate w.r.t. (default: every buffer
                       parameter of the loss fn; with --train, every one EXCEPT the last, which is
@@ -1308,16 +1672,34 @@ wukongc [OPTIONS] <input.wk>
                       on unix). Rejected with --run and with every other stage, which print their
                       artifact on stdout — redirect instead.
 --error-format=<f>    human | json   (default: human)
---explain <CODE>      print an extended explanation for an error code
---color=<when>        auto | always | never   (default: auto — colour when stderr is a terminal)
+                      json spans carry byte/line end positions, plus suggestions, children,
+                      a rendered field and "version":1 (the v0 severity/code/message prefix is
+                      unchanged)
+-A|-W|-D <lint>       allow / warn on / deny (report as an error) a lint; <lint> is a name
+                      (unused_variables), its code (W0001) or `warnings` (every lint):
+                      `-D warnings` fails the build on any warning. Repeatable; `-Dwarnings`
+                      works too; an unknown lint is a usage error (exit 2). See "Warnings (lints)"
+--error-limit=<n>     print at most n errors before suppressing the rest (0 = unlimited; default)
+--explain [CODE]      print an extended explanation for an error code; no code lists every code
+--color=<when>        auto | always | never   (default: auto)
+                      auto honours NO_COLOR, CLICOLOR_FORCE and TERM=dumb, and enables Windows VT
 -h, --help            print the usage text and exit 0
 -V, --version         print the version and exit 0
 ```
 
 Use `--emit` to inspect any stage of the pipeline, e.g. `wukongc --emit=mir -O2 kernel.wk` to see
-the optimized IR, or `wukongc --emit=ast kernel.wk` to see the parse tree. `--run` and
-`--emit=<stage>` cannot be combined; pick one. A usage error prints `error: <msg>` plus the usage text
-on stderr and exits **2**.
+the optimized IR, or `wukongc --emit=ast kernel.wk` to see the parse tree. `wukongc --emit=check
+kernel.wk` runs the front end (lex, parse, imports, sema, then the lints) and stops before
+lowering — the fast loop for an editor or `--error-format=json` consumer, with no `C0001` lowering
+limits in the way. `--run` and `--emit=<stage>` cannot be combined; pick one. A usage error prints `error: <msg>` plus the
+usage text on stderr and exits **2**.
+
+Diagnostics render rustc-style: a label in another file gets its own `::: file:line:col` header, and
+a diagnostic may carry a `help:` suggestion (a concrete replacement). `--error-format=json` emits
+one object per diagnostic whose spans include byte and line/column end positions, plus `suggestions`,
+`children`, a `rendered` plain-text copy and `"version":1`; the `severity`/`code`/`message` prefix is
+stable. `--color=auto` honours `NO_COLOR`, `CLICOLOR_FORCE` and `TERM=dumb` and turns on Windows VT
+processing; `--error-limit=<n>` caps how many errors print before the rest are suppressed.
 
 Reverse-mode autodiff is CLI-driven too: `wukongc --emit=grad --grad-of=loss model.wk` prints the
 backward MIR of a loss function, and `wukongc --train --train-opt=adamw model.wk` runs its

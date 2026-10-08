@@ -30,13 +30,55 @@ keeping the output printed before it, with exit status 1 (`tests/run/assert_fail
 Cranelift provides JIT execution with `--run --backend=native` and object/exe output with
 `--emit=obj|exe`, with **no LLVM toolchain required**. See `BENCHMARKS.md` for cross-language numbers.
 
-- **Multi-file modules**: `import a.b` loads `a/b.wk` (resolved against the *root* source file's
-  directory) and splices its items into one merged flat namespace, so cross-file fns/consts/structs
-  just work on both backends (`tests/run/import_multi.wk`). Files load once each — an import cycle
-  or diamond dedups by canonical path, never errors. An unresolvable import is `E0305`; a cross-file
-  duplicate name is the ordinary `E0300`, pointing at both definitions with each file's own
-  path/line. (`import … as …` / `import x.{a,b}` parse but don't rename/restrict yet;
-  `--emit=tokens|ast` stay root-file-only by design.)
+- **Multi-file modules with real namespaces**: `import a.b` loads `a/b.wk` (resolved against the
+  *root* source file's directory); files load once each — an import cycle or diamond dedups by
+  canonical path, never errors — and an unresolvable import is `E0305`. Every file is its own
+  module: items are private unless `pub` (`E0312` otherwise), imports are per file and not
+  transitive, `import a.b;` brings `b`'s `pub` items in unqualified plus the `b::` qualifier,
+  `import a.b as c;` binds only `c::`, and `import a.b.{x, y};` selects. Two modules may define the
+  same private name; two plain imports exporting one name make an unqualified *use* ambiguous
+  (`E0313`). Qualified names work in calls, values, struct literals, enum variants/patterns and types
+  (`tests/run/import_namespaces.wk`, `tests/run/import_multi.wk`). Resolution is a loader pass that
+  renames each imported item to the unique symbol `<module>.<name>`, so sema, MIR and every backend
+  are unchanged. (Field-level `pub` is accepted, not enforced; `--emit=tokens|ast` stay
+  root-file-only by design.)
+- **`defer`** runs at every exit of its block — fallthrough, `return`, `break`/`continue` — LIFO,
+  innermost block first, with returned/broken/tail values computed before the defers
+  (`tests/run/defer_scope_exit.wk`). It is a first AST normalization in `mir_build`, so every backend,
+  recognizer and autodiff sees plain statements; control flow out of a deferred expression or
+  rebinding a name a pending defer uses is `E0314`.
+- **C FFI**: `extern "C"` declarations become `Program::externs` imports. Native binds the host C
+  symbol (JIT) or leaves it to the linker (`--emit=obj|exe`); the interpreter calls the *same* symbol
+  for scalar signatures (≤ 4 int/`bool`/`f32`/`f64` args) and refuses a pointer signature or an
+  unresolvable symbol before the run (`C0001`); the LLVM emitter declares it with
+  `signext`/`zeroext`. Types without a C mapping are `C0001` at the declaration
+  (`tests/run/extern_c_libm.wk`).
+- **Named kernel builtins with shape signatures** (`matmul`/`matmul_nt`/`matmul_tn`, `linear`,
+  `transpose`, `softmax`/`log_softmax`, `layernorm`/`rmsnorm`, the two-argument activations
+  `exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu`/`relu(x, out)`, `sum`/`amax`/`amin`/`dot`, and `sdpa`):
+  each lowers to exactly one runtime kernel on both backends regardless of recognition, after sema
+  unifies its dimensions like a generic call (`E0409` when nothing fixes one; `E0501`/`E0502` on a
+  disagreement). Runtime extents are checked (a violation traps like `assert`), an output that
+  overlaps an input computes through scratch (value semantics), and an empty contraction is the zero
+  matrix (`tests/run/builtin_*.wk`, `tests/run/sdpa_blocks.wk`). `sdpa` gained its shape signature
+  here; it used to be checked only at lowering, as `C0001`. See the guide's "Kernel builtins".
+- **Methods, traits and function-typed parameters — all static dispatch.** `impl Type { .. }`
+  methods (`x.m(a)`, `Type::m(a)`, `self`/`&self`/`&mut self`/`mut self`, `Self`, auto-deref through a
+  reference) lower to the plain function `Type.method`; `trait` + `impl Trait for Type` are checked
+  for conformance (`E0410`), and a bounded type parameter (`<T: Shape>` / `where T: Shape`) calls
+  trait methods through monomorphization; a `fn(A) -> R` parameter is specialized per bound
+  function (`apply$square`), so no function pointer exists at run time (`E0411` outside a parameter).
+  Calls such a specialization makes are invisible to the alias analysis, so every function they can
+  reach forgoes disjointness-requiring kernels (`tests/run/{methods_impl,traits_static_dispatch,fn_params}.wk`).
+- **Diagnostics and tooling surface.** `--emit=check` runs the front end (lex/parse/imports/sema,
+  then the lints) and stops before lowering — a fast editor loop with no `C0001` lowering limits.
+  `--error-format=json`
+  is a stable schema (v1): spans carry byte and line/column end positions, and each diagnostic
+  carries `suggestions`, `children`, a `rendered` copy and `"version":1`, with the v0
+  `severity`/`code`/`message` prefix unchanged. Diagnostics may carry a `help:` suggestion (span +
+  replacement), a label in another file gets a `::: file:line:col` header, `--color=auto` honours
+  `NO_COLOR`/`CLICOLOR_FORCE`/`TERM=dumb` (and enables Windows VT), and `--explain` with no code
+  lists every catalogued code. (A full LSP is out of scope; see MASTER_PLAN §3.6.)
 - Functions (including recursion and mutual recursion — the interpreter oracle runs on a
   512 MiB worker thread, so ordinary recursion does not overflow the host's small default stack), and
   direct calls. *Caveat:* the tree-walking interpreter's call frames are ~an order of magnitude larger
@@ -283,6 +325,23 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   a `@parallel` symbolic-shape function (a matmul reaches the multicore `wukong_sgemm_parallel`; an
   elementwise nest runs correctly through the ordinary path, exactly as a constant-shape `@parallel`
   tensor function does).
+- **Shape arithmetic, views, reshape and extents** run on both backends. A dimension may be computed
+  from others (`Tensor[f32, S, 3*D]`, `H*HD`, `(L - K)/S + 1`) and is held in a canonical polynomial
+  normal form, so `2*N` and `N + N` are one type, and a call solves a dimension that appears only
+  inside one (`2*N = 8`, `N = 4`) — `tests/run/tensor_dim_arith.wk`. Indexing with fewer indices than
+  the rank is a zero-copy **view** of the remaining axes (`m[i]` is a row; `m[i][j]` is `m[i, j]`; `for
+  row in m` walks rows), lowered as the address of the view's first element, so no recognizer can
+  mistake it for an element read — `tests/run/tensor_views.wk`. `x as Tensor[..]` reshapes a
+  contiguous buffer when the element count is provably equal — `tests/run/tensor_reshape_heads.wk`.
+  `t.dim(k)` / `t.len()` read extents, including a `?` axis of a tensor parameter, whose run-time
+  extent the caller passes as a hidden argument (and which binds a callee's generic dimension when
+  the tensor is forwarded) — `tests/run/tensor_extent.wk`. Not yet: a strided
+  view (a column, a transpose, a `lo..hi` sub-range) — a tensor value carries no stride vector, so
+  views are prefixes of the leading axes of a contiguous buffer; a reshape or a view of a `?`
+  dimension's *count*; a `?` extent of a tensor returned by a call (a clean `C0001`); and kernel
+  recognition over a *derived* inner extent — a `Tensor[f32, S, H*HD]` nest lowers through the
+  general strided path, because the GEMM recognizer's stride matcher only knows literal and
+  single-variable extents.
 - **Matmul → GEMM dispatch**: the compiler recognizes a matmul loop nest (the `ikj` accumulate and
   `ijk` dot-product forms, including the `nn.Linear` `C = A·Bᵀ` spelling) and lowers the whole nest
   to a tuned register-blocked (6×16), cache-tiled, packed **AVX2/FMA** microkernel in the runtime —
@@ -554,6 +613,39 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   `@align`, `@export`), so a typo like `@parellel` no longer compiles to a program with none of the requested
   behavior. The four discarded attributes stay discarded wherever they parse.
 - Intrinsics `print`/`println`/`assert`.
+- **Source-text diagnostics.** A Unicode lookalike of ASCII punctuation or whitespace (`−` U+2212
+  for `-`, `×`, `≤`, fullwidth brackets, curly quotes, no-break/zero-width spaces; ~50 entries) is
+  **`E0105`**, naming the code point and the ASCII character it imitates, and the lexer reads it
+  *as* that character, so a paste from a paper costs one error, not a lexer error plus a parser
+  cascade. Any other non-ASCII character stays `E0101`, now naming the code point (`α` (U+03B1))
+  instead of `\u{3b1}`, with a spelled-out suggestion for Greek letters. Identifiers stay ASCII:
+  Unicode (XID) identifiers need a symbol-mangling decision because PTX must be ASCII.
+- **Parser recovery.** A failed `E0200` names the whole set of tokens the parser tried ("expected one
+  of `,` or `)`"), is anchored just after the previous token when the parser had already moved on to
+  the next line (where the missing `)` or `;` goes), and labels the unclosed opener of a missing
+  `)`/`]`/`}` from a delimiter stack kept in step with every consumed token. A token the lexer
+  already rejected never draws a second parser error. Not yet: rustc's indentation-based "this
+  delimiter might not be properly closed" guess, and resynchronizing at the next statement after a
+  bad one (the parser still recovers token by token).
+- **Warnings (lints).** The compiler's first warnings (`wukong_sema::lints`, run after a clean
+  sema): `W0001 unused_variables`, `W0002 unused_mut`, `W0003 unreachable_code` (divergence judged
+  exactly as the definite-return check judges it), `W0004 unused_result` (`out[i] == x;` written
+  for `=`), `W0005 dead_code`, `W0006 unwritten_output` (a `mut` aggregate parameter never stored
+  to) and `W0007 unknown_lints`. Levels come from rustc-style `-A/-W/-D <lint>` (`-D warnings`) and
+  `@allow/@warn/@deny(<lint>)` on a function, parameter or statement, innermost first. Warnings
+  print after errors, so `tests/fail`'s first-diagnostic contract holds; `tests/warn/` pins each
+  lint's exact output (`crates/wukongc/tests/warn.rs`). Not yet: `unused_imports` (waits for the
+  module-scoped resolver), the corpus held to zero warnings (the census test is `#[ignore]`d until a
+  first full run blesses `tests/run` and `examples/`), and machine-applicable suggestions.
+- **Statement terminators.** `;` stays optional where it always was, but leaving it out is now
+  **`W0030 missing_semicolon`** (Rust's exemptions: after a block-like statement, and before the
+  closing `}` for anything but a `let`), and a `(`/`[` — or a `-` touching its operand — at the
+  start of a line, which silently continues the expression above (`acc = a[i]` then `(b + c)` is
+  a call), is **`W0031 ambiguous_continuation`** (only where a statement could begin; `- y` with a
+  space stays silent). The parser hands both out on a separate channel
+  (`parse_module_tokens_with_lints`), so no caller asserting a clean parse changes. `E0210` is
+  reserved for making a missing `;` an error. Not yet: imported files' parser lints (the loader
+  still uses the lint-free entry point), and `defer` statements' terminator.
 - The optimizer (`-O0..-O3`), backed by CFG and dominator analyses: whole-program **inlining**
   bottom-up over the call graph (non-recursive callees before their callers, scored by a cost model),
   **mem2reg** (alloca → SSA), constant folding, algebraic simplification, CFG cleanup
@@ -940,11 +1032,14 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   more, a *reduction* at a trip ≥ 2048 (statically or by a run-time trip test); the recognized
   kernels get 256-bit AVX2 via the runtime microkernels.)
 - **Attributes:** sema validates the closed set `@parallel`, `@generic`, `@tile`, `@extern`,
-  `@noalias`, `@unchecked`, `@strict_fp`, `@inline`, `@simd`, `@align`, and `@export`; unknown names
-  and restricted-placement violations report `E0306`. `@noalias` (parameter-only) is consumed end to
-  end — see the alias bullet below. Name acceptance does not promise execution: general `@simd`/`@align`/`@export`
-  behavior and C ABI interop remain incomplete. `@parallel` executes and consumes `grain = G`
-  (every other `@parallel` argument is `E0306`); `@generic` opts out of recognizers. `@tile` performs loop
+  `@noalias`, `@unchecked`, `@strict_fp`, `@inline`, `@simd`, `@align`, and `@export` (plus the
+  lint-level `@allow`/`@warn`/`@deny`, legal anywhere, whose unknown lint names are `W0007`); unknown
+  names and restricted-placement violations report `E0306`. `@noalias` (parameter-only) is consumed
+  end to end — see the alias bullet below. Name acceptance does not promise execution: general
+  `@simd`/`@align`/`@export` behavior remains incomplete, and the attribute spelling of C interop
+  (`@extern("C")`) is still discarded — calling C goes through an `extern "C" { … }` block, which
+  does execute. `@parallel` executes and consumes `grain = G` (every other `@parallel` argument is
+  `E0306`); `@generic` opts out of recognizers. `@tile` performs loop
   strip-mining and reports `E0309` when it cannot apply. Malformed attribute syntax reports `E0207`.
 - **Non-contiguous tensor layouts** `.col_major` / `.strided` / `.tiled(N, M)`: they parse (an unknown
   layout name is `E0204`), they are part of the tensor type, and they are enforced across a call
@@ -984,7 +1079,8 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   not yet executed" above). The *general loop* vectorizer already reaches true 256-bit AVX2 for large
   trips via a raw machine-code emitter (see "Works end to end" and "Known limitations"); it is
   *source-level* `f32x8` values that still do not execute.
-- A minimal stdlib of reusable functions/collections. (The language surface once grouped here —
+- A minimal stdlib of reusable functions/collections — the module system it needs (private items,
+  `pub`, per-file namespaces, `as` / `{x, y}` imports) now exists. (The language surface once grouped here —
   structs, enums including data-carrying tagged unions, slices, and multi-dimensional indexing
   `a[i, j]` — now runs end to end; see "Works end to end" above.)
 - AMDGPU/ROCm device codegen (the NVIDIA PTX path already ships behind `--features gpu`, and
@@ -1106,9 +1202,11 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   Unfoldable lengths report `E0406`; unknown names report `E0301`. Invalid lengths use an error
   type, separate from a genuine zero-length array. Calls, returns, assignments and nested aggregate
   agreement check zero extents too, while preserving compatible inferred empty literals.
-  A **symbolic** array length (a generic `N`) has no fixed-array representation and reports `E0406`
-  in both parameters and locals; use `Tensor[T, N]` for generic dimensions. Matmul *dimensions* may be runtime
-  values — a runtime-dimension matmul still dispatches to the GEMM kernel.
+  A **symbolic** array length (a generic `N`, or `2*N`) is the shape of a **parameter**: `fn f<N>(a:
+  [f32; N])` takes the shape-generic buffer `Tensor[f32, N]`, bound per call from the argument's
+  length (`tests/run/generic_array_param.wk`). A local or a return type of generic length (which would
+  need run-time-sized storage) and a non-scalar element still report `E0406`. Matmul *dimensions* may be
+  runtime values — a runtime-dimension matmul still dispatches to the GEMM kernel.
 - Ordered comparison (`< <= > >=`) is not defined on `bool`, so a **chained comparison** `a < b < c`
   (which parses left-associatively as `(a < b) < c`) is a compile error (`E0401`) rather than a silent
   wrong result — write `a < b && b < c` (`tests/fail/chained_comparison.wk`). Equality `==`/`!=`

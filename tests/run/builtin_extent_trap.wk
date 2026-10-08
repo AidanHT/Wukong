@@ -1,0 +1,20 @@
+// RUN: --run
+// EXPECT-EXIT: 1
+// EXPECT-OUT-NONE
+// EXPECT-STDERR: assertion failed
+module tests.run.builtin_extent_trap
+
+// A kernel builtin over runtime-sized operands checks their extents at run time. `gelu(x, out)`
+// takes N from `x` (4 elements) and `out` must hold exactly N — a 3-element `out` would have the
+// kernel write one f32 past the end of its buffer. The lowering's extent check traps through the
+// `assert` intrinsic instead (exit 1, `assertion failed`, nothing printed), identically on the
+// interpreter and natively. With static extents the same mismatch is the compile-time E0501
+// (tests/fail/sdpa_operand_extent.wk is the attention twin of that).
+
+fn main() -> i32 {
+    let x = alloc_f32(4);
+    let out = alloc_f32(3);
+    gelu(x, out);
+    print(out[0]);
+    return 0;
+}

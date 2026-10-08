@@ -1,8 +1,8 @@
-// Imported by tests/fail/import_duplicate.wk: defines the same `clash` as the root file.
+// Imported by tests/fail/import_duplicate.wk: exports the same name `clash` the root file defines.
 // (The fail harness scans tests/fail/*.wk non-recursively, so this library is never compiled
 // standalone.)
 module lib.dup
 
-fn clash() -> i32 {
+pub fn clash() -> i32 {
     return 2;
 }

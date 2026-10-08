@@ -14,6 +14,10 @@
 
 use wukong_span::{Interner, Symbol};
 
+pub mod dim;
+
+pub use dim::{DimAtom, DimError, DimOp, DimPoly, Monomial};
+
 /// A primitive scalar type.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Scalar {
@@ -114,13 +118,116 @@ impl Scalar {
     }
 }
 
-/// One extent of a tensor shape: a compile-time constant, a bound symbolic variable, or a
-/// runtime-dynamic dimension.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+/// One extent of a tensor shape: a compile-time constant, a bound symbolic variable, a runtime-dynamic
+/// dimension, or a derived extent computed from other dimensions.
+///
+/// **Invariant:** a `Dim` is always in normal form. A derived extent that folds to a constant is a
+/// `Const`, one that is exactly a single variable is a `Var`, and only a genuinely compound
+/// expression is an `Expr` (built through [`Dim::from_poly`] / [`Dim::binary`], never by hand). That
+/// is what makes the derived `==` *semantic* equality for everything the normal form can prove:
+/// `Tensor[f32, N + N]` and `Tensor[f32, 2*N]` are the same type.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Dim {
     Const(u64),
     Var(Symbol),
     Dynamic,
+    /// A derived extent — `3*D`, `H*HD`, `(L - K)/S + 1` — in the canonical polynomial normal form of
+    /// [`dim`]. Never a bare constant or a bare variable.
+    Expr(Box<DimPoly>),
+}
+
+impl Dim {
+    /// The extent as a polynomial, or `None` for a runtime `?`.
+    pub fn to_poly(&self) -> Option<DimPoly> {
+        match self {
+            Dim::Const(n) => Some(DimPoly::constant(*n as i128)),
+            Dim::Var(s) => Some(DimPoly::var(*s)),
+            Dim::Expr(p) => Some((**p).clone()),
+            Dim::Dynamic => None,
+        }
+    }
+
+    /// The normal-form `Dim` of a polynomial: a `Const` when it folds to a constant (which must be a
+    /// valid extent — non-negative and within `u64`), a `Var` when it is one variable, else `Expr`.
+    pub fn from_poly(p: DimPoly) -> Result<Dim, DimError> {
+        if let Some(c) = p.as_constant() {
+            if c < 0 {
+                return Err(DimError::Negative(c));
+            }
+            return u64::try_from(c)
+                .map(Dim::Const)
+                .map_err(|_| DimError::Overflow);
+        }
+        if let Some(s) = p.as_var() {
+            return Ok(Dim::Var(s));
+        }
+        Ok(Dim::Expr(Box::new(p)))
+    }
+
+    /// `a <op> b` in normal form. A runtime `?` operand makes the result `?`.
+    pub fn binary(op: DimOp, a: &Dim, b: &Dim) -> Result<Dim, DimError> {
+        let (Some(x), Some(y)) = (a.to_poly(), b.to_poly()) else {
+            return Ok(Dim::Dynamic);
+        };
+        let r = match op {
+            DimOp::Add => x.add(&y)?,
+            DimOp::Sub => x.sub(&y)?,
+            DimOp::Mul => x.mul(&y)?,
+            DimOp::Div => x.floor_div(&y)?,
+            DimOp::Rem => x.rem(&y)?,
+        };
+        Dim::from_poly(r)
+    }
+
+    /// The product of `dims` — the element count of a shape — in normal form (`1` for an empty
+    /// list). `?` if any factor is `?`.
+    pub fn product(dims: &[Dim]) -> Result<Dim, DimError> {
+        let mut acc = Dim::Const(1);
+        for d in dims {
+            acc = Dim::binary(DimOp::Mul, &acc, d)?;
+        }
+        Ok(acc)
+    }
+
+    /// Substitute each variable `s` bound by `f`, re-normalizing a derived extent. A variable bound
+    /// to `?` makes a derived extent that mentions it `?` as well.
+    pub fn subst(&self, f: &dyn Fn(Symbol) -> Option<Dim>) -> Result<Dim, DimError> {
+        match self {
+            Dim::Var(s) => Ok(f(*s).unwrap_or(Dim::Var(*s))),
+            Dim::Const(_) | Dim::Dynamic => Ok(self.clone()),
+            Dim::Expr(p) => {
+                if p.vars().iter().any(|s| matches!(f(*s), Some(Dim::Dynamic))) {
+                    return Ok(Dim::Dynamic);
+                }
+                let q = p.substitute(&|s| f(s).and_then(|d| d.to_poly()))?;
+                Dim::from_poly(q)
+            }
+        }
+    }
+
+    /// Every dimension variable this extent mentions, once each, in deterministic order.
+    pub fn vars(&self) -> Vec<Symbol> {
+        match self {
+            Dim::Var(s) => vec![*s],
+            Dim::Expr(p) => p.vars(),
+            Dim::Const(_) | Dim::Dynamic => Vec::new(),
+        }
+    }
+
+    /// A symbolic extent: a variable or a derived expression (known per call, not per program).
+    pub fn is_symbolic(&self) -> bool {
+        matches!(self, Dim::Var(_) | Dim::Expr(_))
+    }
+
+    /// Render for a diagnostic or a type display: `512`, `N`, `?`, `2*N + 1`.
+    pub fn display(&self, interner: &Interner) -> String {
+        match self {
+            Dim::Const(n) => n.to_string(),
+            Dim::Var(s) => interner.resolve(*s).to_string(),
+            Dim::Dynamic => "?".to_string(),
+            Dim::Expr(p) => p.display(interner),
+        }
+    }
 }
 
 /// A tensor shape — an ordered list of dimensions; its length is the rank.
@@ -138,14 +245,12 @@ impl Shape {
     /// each such dim is threaded to the callee as a hidden `i64` parameter — but the ABI *order* is
     /// decided by `wukong_mir_build::symbolic_dim_params`, which de-duplicates across the parameter
     /// list. Both sides must keep it a `Vec`: an unordered container here is a nondeterministic ABI.
+    ///
+    /// A derived extent (`Dim::Expr`, e.g. `2*N`) contributes every variable it mentions, in its
+    /// canonical order: the variables are what a caller must supply, the expression is recomputed
+    /// from them inside the callee.
     pub fn symbolic_dims(&self) -> Vec<Symbol> {
-        self.0
-            .iter()
-            .filter_map(|d| match d {
-                Dim::Var(s) => Some(*s),
-                _ => None,
-            })
-            .collect()
+        self.0.iter().flat_map(|d| d.vars()).collect()
     }
 }
 
@@ -333,7 +438,7 @@ impl Ty {
             Ty::Tensor { elem, shape, .. } => {
                 let mut parts = vec![elem.name().to_string()];
                 for d in &shape.0 {
-                    parts.push(dim_str(*d, interner));
+                    parts.push(d.display(interner));
                 }
                 format!("Tensor[{}]", parts.join(", "))
             }
@@ -345,14 +450,6 @@ impl Ty {
             Ty::Unknown => "_".to_string(),
             Ty::Error => "<error>".to_string(),
         }
-    }
-}
-
-fn dim_str(d: Dim, interner: &Interner) -> String {
-    match d {
-        Dim::Const(n) => n.to_string(),
-        Dim::Var(s) => interner.resolve(s).to_string(),
-        Dim::Dynamic => "?".to_string(),
     }
 }
 
@@ -598,5 +695,108 @@ mod tests {
             layout: Layout::Contiguous,
         };
         assert_eq!(t.display(&i), "Tensor[f32, M, N]");
+    }
+
+    fn v(s: Symbol) -> Dim {
+        Dim::Var(s)
+    }
+
+    fn c(n: u64) -> Dim {
+        Dim::Const(n)
+    }
+
+    fn bin(op: DimOp, a: &Dim, b: &Dim) -> Dim {
+        Dim::binary(op, a, b).expect("valid dimension expression")
+    }
+
+    #[test]
+    fn dimension_expressions_have_one_normal_form() {
+        let mut i = Interner::new();
+        let (n, h, hd) = (i.intern("N"), i.intern("H"), i.intern("HD"));
+        // `N + N` and `2*N` are one type; so are `H*HD` and `HD*H`.
+        assert_eq!(bin(DimOp::Add, &v(n), &v(n)), bin(DimOp::Mul, &c(2), &v(n)));
+        assert_eq!(
+            bin(DimOp::Mul, &v(h), &v(hd)),
+            bin(DimOp::Mul, &v(hd), &v(h))
+        );
+        // Folding never leaves a compound form for a constant or a single variable.
+        assert_eq!(bin(DimOp::Mul, &c(3), &c(4)), c(12));
+        assert_eq!(bin(DimOp::Sub, &bin(DimOp::Add, &v(n), &c(1)), &c(1)), v(n));
+        assert_eq!(bin(DimOp::Div, &bin(DimOp::Mul, &c(3), &v(n)), &c(3)), v(n));
+        // `(2*N + 3) / 2` is `N + 1` for every integer `N` (the residual 3 splits as 2*1 + 1).
+        let two_n_3 = bin(DimOp::Add, &bin(DimOp::Mul, &c(2), &v(n)), &c(3));
+        assert_eq!(
+            bin(DimOp::Div, &two_n_3, &c(2)),
+            bin(DimOp::Add, &v(n), &c(1))
+        );
+        assert_eq!(bin(DimOp::Rem, &two_n_3, &c(2)), c(1));
+        // A residual that is not constant stays an atom, and prints as written.
+        let half = bin(DimOp::Div, &bin(DimOp::Add, &v(n), &c(1)), &c(2));
+        assert!(matches!(half, Dim::Expr(_)));
+        assert_eq!(half.display(&i), "(N + 1)/2");
+        // A non-constant divisor is never cancelled: `(H*HD)/H` is not `HD` at `H = 0`.
+        let hhd = bin(DimOp::Mul, &v(h), &v(hd));
+        assert!(matches!(bin(DimOp::Div, &hhd, &v(h)), Dim::Expr(_)));
+        assert_eq!(bin(DimOp::Sub, &v(n), &c(1)).display(&i), "N - 1");
+        assert_eq!(bin(DimOp::Mul, &c(3), &v(n)).display(&i), "3*N");
+    }
+
+    #[test]
+    fn dimension_expression_errors_are_reported_not_wrapped() {
+        assert_eq!(
+            Dim::binary(DimOp::Sub, &c(2), &c(5)),
+            Err(DimError::Negative(-3))
+        );
+        assert_eq!(
+            Dim::binary(DimOp::Div, &c(8), &c(0)),
+            Err(DimError::BadDivisor(0))
+        );
+        assert_eq!(
+            Dim::binary(DimOp::Mul, &c(u64::MAX), &c(2)),
+            Err(DimError::Overflow)
+        );
+        // A `?` operand is unknown, not an error.
+        assert_eq!(
+            Dim::binary(DimOp::Mul, &Dim::Dynamic, &c(2)),
+            Ok(Dim::Dynamic)
+        );
+    }
+
+    #[test]
+    fn substitution_and_linear_solving() {
+        let mut i = Interner::new();
+        let (n, m) = (i.intern("N"), i.intern("M"));
+        let e = bin(DimOp::Add, &bin(DimOp::Mul, &c(2), &v(n)), &v(m));
+        // Bind N := 3 (M stays symbolic), then M := 4.
+        let partial = e
+            .subst(&|s| (s == n).then_some(c(3)))
+            .expect("substitution");
+        assert_eq!(partial, bin(DimOp::Add, &v(m), &c(6)));
+        let full = partial
+            .subst(&|s| (s == m).then_some(c(4)))
+            .expect("substitution");
+        assert_eq!(full, c(10));
+        // A binding to `?` makes the derived extent `?`.
+        assert_eq!(
+            e.subst(&|s| (s == m).then_some(Dim::Dynamic)),
+            Ok(Dim::Dynamic)
+        );
+        // `2*N + M` is linear in N with coefficient 2 and remainder M.
+        let p = e.to_poly().unwrap();
+        let (a, rest) = p.linear_in(n).expect("linear in N");
+        assert_eq!(a, 2);
+        assert_eq!(Dim::from_poly(rest), Ok(v(m)));
+        // `N*M` is not linear in N with a constant coefficient.
+        assert!(bin(DimOp::Mul, &v(n), &v(m))
+            .to_poly()
+            .unwrap()
+            .linear_in(n)
+            .is_none());
+        // Evaluation agrees with the folded value.
+        let three_n = bin(DimOp::Mul, &c(3), &v(n)).to_poly().unwrap();
+        assert_eq!(three_n.eval(&|s| (s == n).then_some(7)), Some(21));
+        // The symbolic dims of a shape include the variables of derived extents.
+        let sh = Shape(vec![e.clone(), v(n)]);
+        assert_eq!(sh.symbolic_dims(), vec![n, m, n]);
     }
 }

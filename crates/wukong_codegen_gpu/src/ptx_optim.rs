@@ -442,6 +442,7 @@ mod tests {
             let prog = Program {
                 funcs: vec![kernel],
                 statics: Vec::new(),
+                externs: Vec::new(),
                 level: MirLevel::Low,
             };
 
