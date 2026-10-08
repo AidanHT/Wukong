@@ -40,6 +40,7 @@
 //!   - a clamped range under a counted tile covers `0..min(NT*T, M)` (a base at or past `M` yields an
 //!     empty range), which is `0..M` iff `NT*T >= M`;
 //!   - a full-tile range under a counted tile names no extent at all and is declined.
+//!
 //!   Each condition is checked at compile time when its operands are constants; otherwise it is
 //!   tested at run time on entry to the window, and the window as written is the fallback.
 //! * **Only the order differs**, and the order is what the GEMM recognizer + `emit_sgemm` already

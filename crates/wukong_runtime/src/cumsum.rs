@@ -409,7 +409,13 @@ mod tests {
                 for j in 0..8 {
                     out[b + j] = v[j] + carry;
                 }
-                carry = v[7] + carry;
+                // Operand order is the point: this models `_mm256_add_ps(tot, carry)` with the
+                // block total FIRST, which decides the surviving NaN payload when both are NaN.
+                // `carry += v[7]` would put `carry` first, so the assign-op rewrite is refused.
+                #[allow(clippy::assign_op_pattern)]
+                {
+                    carry = v[7] + carry;
+                }
                 b += 8;
             }
             for j in b..n {

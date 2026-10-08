@@ -1107,7 +1107,7 @@ mod tests {
         wukong_ast::print::print_module(&out, &interner)
             .lines()
             .map(str::trim)
-            .filter(|l| keep(*l))
+            .filter(|l| keep(l))
             .map(str::to_string)
             .collect()
     }

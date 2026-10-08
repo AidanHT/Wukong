@@ -160,11 +160,7 @@ fn is_index_by(e: &Expr, arr: Symbol, v: Symbol) -> bool {
 /// no-`x` check.
 fn resource_stmt(s: &mut Stmt, x: Symbol, o: Symbol, only: Option<Symbol>) {
     match &mut s.kind {
-        StmtKind::Let { init, .. } => {
-            if let Some(e) = init {
-                resource_expr(e, x, o, only);
-            }
-        }
+        StmtKind::Let { init: Some(e), .. } => resource_expr(e, x, o, only),
         StmtKind::Assign { target, value, .. } => {
             if let ExprKind::Index { indices, .. } = &mut target.kind {
                 for i in indices {

@@ -1444,7 +1444,7 @@ pub fn asinh(x: f64) -> f64 {
     if e >= 0x3ff + 26 {
         // |x| >= 2^26 or inf or NaN
         ax = log(ax) + LN2;
-    } else if e >= 0x3ff + 1 {
+    } else if e > 0x3ff {
         // |x| >= 2
         ax = log(2.0 * ax + 1.0 / ((ax * ax + 1.0).sqrt() + ax));
     } else if e >= 0x3ff - 26 {

@@ -7039,7 +7039,8 @@ mod tests {
                             );
                         }
                         for r in 0..MR {
-                            for j in 0..NR {
+                            // `hostile` is `[f32; NR]`, so this walks exactly `j in 0..NR`.
+                            for (j, &lane) in hostile.iter().enumerate() {
                                 let idx = r * NR + j;
                                 let want = if r < mr && j < nr {
                                     // SAFETY: `j < NR` indexes the NR-long bias when non-null.
@@ -7056,7 +7057,7 @@ mod tests {
                                     c[idx],
                                     c[idx].to_bits(),
                                     c_raw[idx],
-                                    hostile[j]
+                                    lane
                                 );
                             }
                         }

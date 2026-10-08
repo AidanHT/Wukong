@@ -38,11 +38,9 @@ pub fn npy_dtype(descr: &str) -> i64 {
         Some(&o @ (b'<' | b'>' | b'|' | b'=')) => (o, &descr[1..]),
         _ => return DT_UNSUPPORTED,
     };
-    let little = match order {
-        b'<' | b'|' => true,
-        b'=' => cfg!(target_endian = "little"),
-        _ => false,
-    };
+    // `=` is native order, so it is little-endian only on a little-endian host. (Clippy's
+    // `matches!(order, b'<' | b'|' | b'=')` suggestion would drop that host test.)
+    let little = matches!(order, b'<' | b'|') || (order == b'=' && cfg!(target_endian = "little"));
     let dt = match kind {
         "f2" => DT_F16,
         "f4" => DT_F32,
@@ -350,7 +348,7 @@ mod tests {
     /// pads (the whole preamble a multiple of 64 bytes, ending in a newline).
     fn npy_file(dict: &str, payload: &[u8]) -> Vec<u8> {
         let mut header = dict.as_bytes().to_vec();
-        while (10 + header.len() + 1) % 64 != 0 {
+        while !(10 + header.len() + 1).is_multiple_of(64) {
             header.push(b' ');
         }
         header.push(b'\n');
