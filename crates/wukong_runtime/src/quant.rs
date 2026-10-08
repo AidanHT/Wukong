@@ -180,9 +180,14 @@ pub fn quantize_row_q4_0(x: &[f32], out: &mut [u8]) {
         let d = max / -8.0;
         let id = if d != 0.0 { 1.0 / d } else { 0.0 };
         o[..2].copy_from_slice(&crate::f32_to_f16_bits(d).to_le_bytes());
-        // A padded element is 0, which quantizes to the zero nibble 8.
+        // A padded element is 0, which quantizes to the zero nibble 8. So does a NaN (and an
+        // infinite element, whose `id` is zero): `(NaN + 8.5) as i8` is 0, the most negative
+        // nibble, which would silently decode a NaN weight as `-8·d` instead of the documented 0.
         let nib = |e: usize| -> u8 {
             let v = blk.get(e).copied().unwrap_or(0.0) * id;
+            if v.is_nan() {
+                return 8;
+            }
             ((v + 8.5) as i8).min(15) as u8
         };
         for j in 0..QK / 2 {
@@ -686,6 +691,21 @@ mod tests {
             assert_eq!(dequant(QFormat::Q4, &q4, e), want, "q4 element {e}");
         }
         assert_eq!(q4[2], ((x4[0] + 8.0) as u8) | (((x4[16] + 8.0) as u8) << 4));
+    }
+
+    /// A NaN element is ignored by the scale and quantizes to zero in both formats (Q8_0 quant 0,
+    /// Q4_0 nibble 8), as the module docs promise — not to Q4_0's most negative nibble.
+    #[test]
+    fn a_nan_element_quantizes_to_zero() {
+        let mut x: Vec<f32> = (0..QK).map(|e| (e % 7) as f32 - 3.0).collect();
+        x[1] = -8.0;
+        x[5] = f32::NAN;
+        let q8 = pack(&x, QK, QFormat::Q8);
+        assert_eq!(q8[2 + 5], 0);
+        let q4 = pack(&x, QK, QFormat::Q4);
+        assert_eq!(&q4[0..2], &[0x00, 0x3C]);
+        assert_eq!(q4[2 + 5] & 0x0F, 8);
+        assert_eq!(dequant(QFormat::Q4, &q4, 5), 0.0);
     }
 
     /// With exactly representable weights and activations (every block scale 1) the GEMV is the
