@@ -1,4 +1,4 @@
-// EXPECT-CODE: E0401
+// EXPECT-CODE: E0436
 module tests.fail.void_condition
 
 // A branch condition cannot be `()` (the result of a void-returning call): it lowered to a `cond_br`

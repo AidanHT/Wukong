@@ -1,4 +1,4 @@
-// EXPECT-CODE: E0401
+// EXPECT-CODE: E0435
 module tests.fail.enum_payload_arity
 
 // A tuple-payload variant must be constructed with exactly its declared number of fields. `Add` has

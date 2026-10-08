@@ -26,6 +26,37 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `[first, .., last]` on fixed-size arrays, and `if let` / `while let` / `let … else` (the `else`
   must diverge), all checked by the exhaustiveness analysis; a refutable pattern in a plain `let` is
   the new `E0442`.
+### Name resolution: every name resolves or is a coded error (`gap2/sema-resolution`)
+
+- **New codes `E0320`–`E0324`.** An unknown function (`E0320`), field (`E0321`), method of a builtin
+  type (`E0322`), a call of a non-function (`E0323`, which names the missing-`;` trap) and an unknown
+  type name (`E0324`, also a struct literal of an undeclared name and a trait used as a type) are
+  resolution errors with a structured did-you-mean suggestion. Each used to type as a lenient
+  `Unknown` and fail in lowering as the codegen limit `C0001`; an undeclared type name was silently
+  lowered as an `i32` slot. Trait method signatures, bodiless functions and `sizeof` operands are
+  now checked for unknown type names too, and an unknown enum variant named as a value
+  (`Color::Gren`) is the `E0301` its call and pattern forms already were.
+- **One builtin callee registry** (`wukong_sema::is_builtin_callee` / `is_statement_builtin`, in
+  `builtins.rs`) is shared by sema and `mir_build`; a single-name call that reaches lowering
+  unresolved is an internal compiler error rather than `C0001`.
+- **Call-site provenance.** A shape conflict at a call (`E0502`) is reported at the conflicting
+  argument and labels the argument axis or turbofish that fixed the dimension and the callee's
+  parameter (Futhark-style "fixed here"); an arity error (`E0503`) names the callee (`Type::method`
+  for a method, counting after the receiver), labels its definition and each extra argument, and
+  lists the missing parameters. The `E0502` headline is unchanged; the `E0503` headline now names
+  the callee ("function `add` takes 2 arguments but 3 were supplied", where it read "this function
+  takes 2 argument(s) but 3 were supplied").
+- **New code `E0520`: cannot infer a dimension of a call.** A dimension the callee's parameter shapes
+  use that nothing fixes (no turbofish, argument shape, solvable element count or `?` argument
+  extent) is reported at the call with the turbofish to write; it used to surface in lowering as
+  `C0001`. A `const` named in a turbofish (`f::<W>(t)`) is now its value, as in a type, where it was
+  an opaque variable that lowering replaced with the `?` argument's run-time extent.
+- **`E0401` split by rule into `E0430`–`E0437`.** Struct-literal field errors (`E0430`), malformed
+  or out-of-range literals and enum discriminants (`E0431`), invalid escapes (`E0432`), operators not
+  defined for their operand type (`E0433`), a missing return value (`E0434`), misused enum payloads
+  (`E0435`), non-boolean conditions (`E0436`) and builtin arguments of the wrong kind (`E0437`) each
+  have a stable code and an `--explain` page with a compile-tested example; `E0401` stays for plain
+  expected/found mismatches. The 45 affected `tests/fail` fixtures moved with their rule.
 
 ### Optimizer memory passes: SROA, path DSE, loop deletion, guarded LICM, scalar promotion (`gap/opt-memory`)
 

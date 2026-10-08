@@ -1,4 +1,4 @@
-// EXPECT-CODE: E0401
+// EXPECT-CODE: E0431
 module tests.fail.literal_out_of_range
 
 // An unsuffixed integer literal that does not fit the narrow type it adapts to is a compile error,

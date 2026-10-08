@@ -36,13 +36,15 @@ mod methods;
 mod noalias;
 mod patterns;
 mod promote;
+mod provenance;
+mod resolve;
 mod shape;
 mod tensor;
 mod usefulness;
 
 pub use builtins::{
-    builtin_dims, builtin_operand_dims, builtin_output, kernel_builtin, Activation, BuiltinCall,
-    BuiltinDim, KernelBuiltin,
+    builtin_dims, builtin_operand_dims, builtin_output, is_builtin_callee, is_statement_builtin,
+    kernel_builtin, Activation, BuiltinCall, BuiltinDim, KernelBuiltin,
 };
 pub use methods::{MethodCall, MethodResolution};
 
@@ -420,6 +422,8 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         infer_pinned: HashMap::default(),
         builtin_calls: HashMap::default(),
         methods: methods::MethodState::default(),
+        resolve: resolve::ResolveState::default(),
+        provenance: provenance::ProvenanceState::default(),
     };
     // Attribute legality (`attrs`): an attribute names no value and has no type, so this walk needs
     // nothing the collection pass builds and runs first — an unknown `@bogus` is reported even in a
@@ -532,6 +536,10 @@ struct Sema<'a> {
     builtin_calls: HashMap<NodeId, BuiltinCall>,
     /// Methods, traits and function-typed parameters (`methods.rs`).
     methods: methods::MethodState,
+    /// Name-resolution diagnostics state (`resolve.rs`).
+    resolve: resolve::ResolveState,
+    /// Where each call's dimensions were bound, for its diagnostics (`provenance.rs`).
+    provenance: provenance::ProvenanceState,
 }
 
 /// One entry of [`Sema::loop_ctx`] — a loop currently being type-checked.
@@ -645,7 +653,7 @@ impl<'a> Sema<'a> {
                                 None => {
                                     self.error(
                                         d.span,
-                                        "E0401",
+                                        "E0431",
                                         "an enum discriminant must be a compile-time integer \
                                          constant (an integer literal, or arithmetic on integer \
                                          literals)",
@@ -662,7 +670,7 @@ impl<'a> Sema<'a> {
                             let sp = v.discriminant.as_ref().map_or(item.span, |d| d.span);
                             self.error(
                                 sp,
-                                "E0401",
+                                "E0431",
                                 format!(
                                     "enum discriminant `{disc}` is out of range for the 32-bit \
                                      enum representation ({}..={})",
@@ -851,6 +859,35 @@ impl<'a> Sema<'a> {
                         self.generics.clear();
                     }
                 }
+                // A function declared without a body is never visited by `check_fn`, so its
+                // signature is checked here (an unknown type name in it is `E0324`).
+                ItemKind::Fn(f) if f.body.is_none() => {
+                    self.generics = generic_names(&f.generics);
+                    for p in &f.params {
+                        self.lower_param_type(false, &p.ty);
+                    }
+                    if let Some(t) = &f.ret {
+                        self.lower_type(t);
+                    }
+                    self.generics.clear();
+                }
+                // A trait's method signatures are lowered once, by `collect_methods`, before this
+                // pass; inside a trait `Self` names the implementing type.
+                ItemKind::Trait(tr) => {
+                    for f in &tr.methods {
+                        self.generics = generic_names(&f.generics);
+                        if let Some(s) = self.interner.get("Self") {
+                            self.generics.insert(s);
+                        }
+                        for p in &f.params {
+                            self.lower_type(&p.ty);
+                        }
+                        if let Some(t) = &f.ret {
+                            self.lower_type(t);
+                        }
+                        self.generics.clear();
+                    }
+                }
                 _ => {}
             }
         }
@@ -1014,6 +1051,7 @@ impl<'a> Sema<'a> {
 
     fn collect_fn(&mut self, f: &FnDecl) {
         self.check_unique_decl_names(&Self::generic_decl_names(&f.generics), "generic parameter");
+        self.record_fn_params(f);
         self.generics = generic_names(&f.generics);
         let params = f
             .params
@@ -1171,7 +1209,12 @@ impl<'a> Sema<'a> {
                 if let Some(sc) = Scalar::from_name(s) {
                     Ty::Scalar(sc)
                 } else {
-                    // A generic type variable or a (possibly later-defined) named type.
+                    // A generic type variable or a (possibly later-defined) named type. Once every
+                    // item is registered, a name that is neither is `E0324` (`resolve.rs`) — it used
+                    // to be accepted here and lowered as an `i32` slot.
+                    if self.checking_bodies {
+                        self.check_type_name(p, name, t.span);
+                    }
                     Ty::Named(name)
                 }
             }
@@ -1810,7 +1853,7 @@ impl<'a> Sema<'a> {
         if !matches!(self.ret_ty, Ty::Unit | Ty::Unknown | Ty::Error) && !returns_value {
             self.error(
                 body.span,
-                "E0401",
+                "E0434",
                 "not all control-flow paths return a value (this function can fall off its end)"
                     .to_string(),
             );
@@ -1983,13 +2026,13 @@ impl<'a> Sema<'a> {
     /// "truthy" condition like `if 5` is intentionally allowed and stays unaffected.
     fn check_condition(&mut self, cond: &Expr) {
         let t = self.type_expr(cond);
-        if self.reject_tensor_value(&t, "a condition", cond.span) {
+        if self.reject_tensor_value(&t, "a condition", cond.span, "E0436") {
             return;
         }
         if matches!(t, Ty::Unit) {
             self.error(
                 cond.span,
-                "E0401",
+                "E0436",
                 "a condition cannot be `()` (a unit / void value); use a boolean or numeric value"
                     .to_string(),
             );
@@ -2002,7 +2045,7 @@ impl<'a> Sema<'a> {
             // text — the same failure the pointer case had before it became a null test.
             self.error(
                 cond.span,
-                "E0401",
+                "E0436",
                 format!(
                     "a condition must be a boolean, a number or a pointer, found `{}`",
                     t.display(self.interner)
@@ -2294,7 +2337,7 @@ impl<'a> Sema<'a> {
                     // A literal field value adapts to (and is range-checked against) the declared
                     // field type, exactly like a `let` annotation: `S { v: 9000000000 }` lowers the
                     // literal at the field's i64 width instead of the default i32, and a
-                    // `S { x: 9000000000 }` for an `x: i32` field is a hard E0401, not a silent
+                    // `S { x: 9000000000 }` for an `x: i32` field is a hard E0431, not a silent
                     // low-32-bit truncation both backends agree on. Aggregate fields adapt
                     // element-wise (a `[i8; N]` / tuple field).
                     if self.literal_adapts(fty, &f.value) {
@@ -2352,14 +2395,14 @@ impl<'a> Sema<'a> {
                 }
                 None => {
                     let nm = self.sym_str(name).to_string();
-                    self.error(f.name.span, "E0401", format!("struct has no field `{nm}`"));
+                    self.error(f.name.span, "E0430", format!("struct has no field `{nm}`"));
                 }
             }
             if seen.contains(&name) {
                 let nm = self.sym_str(name).to_string();
                 self.error(
                     f.name.span,
-                    "E0401",
+                    "E0430",
                     format!("field `{nm}` is initialized more than once"),
                 );
             } else {
@@ -2376,7 +2419,7 @@ impl<'a> Sema<'a> {
                 let s = if missing.len() == 1 { "" } else { "s" };
                 self.error(
                     span,
-                    "E0401",
+                    "E0430",
                     format!(
                         "missing field{s} {} in this struct initializer",
                         missing.join(", ")
@@ -2651,7 +2694,7 @@ impl<'a> Sema<'a> {
                 }
                 // A literal assigned to a place adapts to (and is range-checked against) the place's
                 // type, the same rule `let` and struct-init already apply — so `p = 9000000000` for
-                // an i32 place is a hard E0401 instead of a silent low-32-bit truncation both backends
+                // an i32 place is a hard E0431 instead of a silent low-32-bit truncation both backends
                 // agree on, and `p = 9000000000` for an i64 place lowers the literal at i64 width.
                 // Plain `=` only (a value store); the compound forms below are a different check, and
                 // the helpers no-op on a non-scalar/unknown place type.
@@ -2696,7 +2739,7 @@ impl<'a> Sema<'a> {
                     }) {
                         self.error(
                             target.span,
-                            "E0401",
+                            "E0433",
                             format!(
                                 "compound assignment `{}` is not defined for `{}` values; only \
                                  scalars and SIMD vectors support `{}`",
@@ -2880,7 +2923,7 @@ impl<'a> Sema<'a> {
                         if !matches!(ret, Ty::Unit | Ty::Unknown | Ty::Error) {
                             self.error(
                                 s.span,
-                                "E0401",
+                                "E0434",
                                 format!(
                                     "this function must return a value of type `{}`, but this \
                                      `return;` has none",
@@ -3114,7 +3157,7 @@ impl<'a> Sema<'a> {
         if v < lo || v > hi {
             self.error(
                 pat.span,
-                "E0401",
+                "E0431",
                 format!(
                     "literal `{v}` is out of range for `{}` ({lo}..={hi})",
                     sc.name()
@@ -3125,7 +3168,7 @@ impl<'a> Sema<'a> {
 
     /// Type-check and bind a data-carrying enum-variant pattern `Enum::Variant(..)` / `Enum::Variant
     /// { .. }`. Resolves the variant, rejects an unknown variant (E0301), a payload-kind mismatch or
-    /// a wrong tuple arity (E0401), and binds each payload sub-pattern to its declared field type.
+    /// a wrong tuple arity (E0435), and binds each payload sub-pattern to its declared field type.
     /// On any error it still binds the sub-patterns (to `Unknown`) so the arm body type-checks
     /// without cascading.
     fn check_variant_pattern(&mut self, path: &Path, fields: &VariantPat, span: Span) {
@@ -3163,7 +3206,7 @@ impl<'a> Sema<'a> {
                 if subs.len() != tys.len() {
                     self.error(
                         span,
-                        "E0401",
+                        "E0435",
                         format!(
                             "enum variant `{qual}` has {} field(s), but the pattern binds {}",
                             tys.len(),
@@ -3199,7 +3242,7 @@ impl<'a> Sema<'a> {
             (_, VariantPayload::Unit) => {
                 self.error(
                     span,
-                    "E0401",
+                    "E0435",
                     format!(
                         "enum variant `{qual}` has no payload to destructure; match it as `{qual}`"
                     ),
@@ -3209,7 +3252,7 @@ impl<'a> Sema<'a> {
             (VariantPat::Tuple(_), VariantPayload::Struct(_)) => {
                 self.error(
                     span,
-                    "E0401",
+                    "E0435",
                     format!(
                         "enum variant `{qual}` is a struct variant; destructure it with `{{ .. }}`"
                     ),
@@ -3219,7 +3262,7 @@ impl<'a> Sema<'a> {
             (VariantPat::Struct(_), VariantPayload::Tuple(_)) => {
                 self.error(
                     span,
-                    "E0401",
+                    "E0435",
                     format!(
                         "enum variant `{qual}` is a tuple variant; destructure it with `( .. )`"
                     ),
@@ -3249,7 +3292,7 @@ impl<'a> Sema<'a> {
     /// If `callee(args)` is `Enum::Variant(args)` constructing a **tuple-payload** variant, type-check
     /// it (arity + per-field types) and return the enum's nominal type. Returns `None` when the callee
     /// is not an enum-variant path (an ordinary function/method call — falls through to `type_call`).
-    /// A unit / struct variant reached this way is a mis-spelled constructor and is rejected (E0401).
+    /// A unit / struct variant reached this way is a mis-spelled constructor and is rejected (E0435).
     fn type_variant_construction(
         &mut self,
         callee: &Expr,
@@ -3301,7 +3344,7 @@ impl<'a> Sema<'a> {
                 if args.len() != tys.len() {
                     self.error(
                         span,
-                        "E0401",
+                        "E0435",
                         format!(
                             "enum variant `{qual}` takes {} field(s), but {} were supplied",
                             tys.len(),
@@ -3320,7 +3363,7 @@ impl<'a> Sema<'a> {
                 }
                 self.error(
                     span,
-                    "E0401",
+                    "E0435",
                     format!("enum variant `{qual}` has no payload; write it as `{qual}`"),
                 );
             }
@@ -3330,7 +3373,7 @@ impl<'a> Sema<'a> {
                 }
                 self.error(
                     span,
-                    "E0401",
+                    "E0435",
                     format!(
                         "enum variant `{qual}` is a struct variant; construct it with `{qual} {{ .. }}`"
                     ),
@@ -3580,7 +3623,7 @@ impl<'a> Sema<'a> {
             if v < lo || v > hi {
                 self.error(
                     e.span,
-                    "E0401",
+                    "E0431",
                     format!(
                         "literal `{v}` is out of range for `{}` ({lo}..={hi})",
                         sc.name()
@@ -3605,12 +3648,12 @@ impl<'a> Sema<'a> {
     ///    `skip_while`, which is why it saw code point 0 and reported nothing.
     fn check_unicode_escapes(&mut self, sym: Symbol, span: Span) {
         if let Some(msg) = malformed_escape(self.sym_str(sym)) {
-            self.error(span, "E0401", msg);
+            self.error(span, "E0432", msg);
         }
         if let Some(cp) = bad_unicode_escape(self.sym_str(sym)) {
             self.error(
                 span,
-                "E0401",
+                "E0432",
                 format!(
                     "`\\u{{{cp:X}}}` is not a Unicode scalar value (the maximum is \\u{{10FFFF}}, \
                      and \\u{{D800}}..=\\u{{DFFF}} are surrogates)"
@@ -3637,7 +3680,7 @@ impl<'a> Sema<'a> {
                 if int_literal_well_formed(&text) {
                     Ty::Scalar(int_lit_scalar(&text))
                 } else {
-                    self.error(e.span, "E0401", format!("invalid integer literal `{text}`"));
+                    self.error(e.span, "E0431", format!("invalid integer literal `{text}`"));
                     Ty::Error
                 }
             }
@@ -3648,7 +3691,7 @@ impl<'a> Sema<'a> {
                 if float_literal_well_formed(&text) {
                     Ty::Scalar(float_lit_scalar(&text))
                 } else {
-                    self.error(e.span, "E0401", format!("invalid float literal `{text}`"));
+                    self.error(e.span, "E0431", format!("invalid float literal `{text}`"));
                     Ty::Error
                 }
             }
@@ -3701,7 +3744,7 @@ impl<'a> Sema<'a> {
                         | Ty::Tensor { .. } => {
                             self.error(
                                 expr.span,
-                                "E0401",
+                                "E0433",
                                 format!(
                                     "cannot dereference a value of type `{}`; only a pointer or \
                                      reference can be dereferenced with `*`",
@@ -3728,12 +3771,17 @@ impl<'a> Sema<'a> {
                     // one short of the rank produces one); stay lenient for `Unknown`.
                     UnOp::Neg | UnOp::Not => {
                         let glyph = if matches!(op, UnOp::Neg) { "-" } else { "!" };
-                        if self.reject_tensor_value(&t, &format!("unary `{glyph}`"), expr.span) {
+                        if self.reject_tensor_value(
+                            &t,
+                            &format!("unary `{glyph}`"),
+                            expr.span,
+                            "E0433",
+                        ) {
                             Ty::Unknown
                         } else if self.is_noncomputable_operand(&t) {
                             self.error(
                                 expr.span,
-                                "E0401",
+                                "E0433",
                                 format!(
                                     "cannot apply unary `{glyph}` to a value of type `{}`",
                                     t.display(self.interner)
@@ -3745,10 +3793,10 @@ impl<'a> Sema<'a> {
                         {
                             // `~`/`!` is a bitwise complement — undefined on a float. mir_build emitted
                             // a bitwise-not on float SSA (the interpreter truncates to int, Cranelift
-                            // takes the raw IEEE bits then fptosi — a gate-blind interp!=native). E0401.
+                            // takes the raw IEEE bits then fptosi — a gate-blind interp!=native). E0433.
                             self.error(
                                 expr.span,
-                                "E0401",
+                                "E0433",
                                 "bitwise complement `!`/`~` requires an integer operand, not a float"
                                     .to_string(),
                             );
@@ -3811,7 +3859,7 @@ impl<'a> Sema<'a> {
                     {
                         self.error(
                             e.span,
-                            "E0401",
+                            "E0433",
                             format!(
                                 "binary operator `{}` is not defined for `{}` values; operate on \
                                  their fields or elements instead",
@@ -3843,7 +3891,7 @@ impl<'a> Sema<'a> {
                             "pointer arithmetic is not supported; take an element address with \
                              `&arr[i]`"
                         };
-                        self.error(e.span, "E0401", msg.to_string());
+                        self.error(e.span, "E0433", msg.to_string());
                         return Ty::Unknown;
                     }
                 }
@@ -3859,7 +3907,7 @@ impl<'a> Sema<'a> {
                 {
                     self.error(
                         e.span,
-                        "E0401",
+                        "E0433",
                         format!(
                             "arithmetic operator `{}` is not defined for `bool`",
                             op.glyph()
@@ -3871,7 +3919,7 @@ impl<'a> Sema<'a> {
                 // operand reached mir_build, which emitted an integer bitwise/shift MIR op on float SSA
                 // values: the interpreter truncated-to-int-then-bitwise while Cranelift took the raw
                 // IEEE bits then fptosi (a gate-blind interp!=native), and a float SHIFT crashed the
-                // verifier at -O0 / panicked mem2reg at -O2. Reject with E0401 (Rust rejects `f32 & f32`
+                // verifier at -O0 / panicked mem2reg at -O2. Reject with E0433 (Rust rejects `f32 & f32`
                 // likewise). Concrete-float-only, so Unknown/Error stay lenient.
                 if matches!(op, BitAnd | BitOr | BitXor | Shl | Shr)
                     && [&l, &r]
@@ -3880,7 +3928,7 @@ impl<'a> Sema<'a> {
                 {
                     self.error(
                         e.span,
-                        "E0401",
+                        "E0433",
                         format!(
                             "bitwise/shift operator `{}` requires integer operands, not float",
                             op.glyph()
@@ -3898,7 +3946,7 @@ impl<'a> Sema<'a> {
                         if self.is_aggregate_ty(&l) || self.is_aggregate_ty(&r) {
                             self.error(
                                 e.span,
-                                "E0401",
+                                "E0433",
                                 "`==`/`!=` is not defined for aggregate (struct/tuple/array) \
                                  values; compare their fields or elements instead"
                                     .to_string(),
@@ -3921,7 +3969,7 @@ impl<'a> Sema<'a> {
                         } {
                             self.error(
                                 e.span,
-                                "E0401",
+                                "E0433",
                                 format!(
                                     "cannot compare `bool` with `{}`; a chained comparison like \
                                      `a == b == c` parses as `(a == b) == c` — write \
@@ -3945,7 +3993,7 @@ impl<'a> Sema<'a> {
                         {
                             self.error(
                                 e.span,
-                                "E0401",
+                                "E0433",
                                 format!(
                                     "ordered comparison `{}` is not defined for `bool`; a chained \
                                      comparison like `a < b < c` parses as `(a < b) < c` — write \
@@ -3978,7 +4026,7 @@ impl<'a> Sema<'a> {
                                 };
                                 self.error(
                                     e.span,
-                                    "E0401",
+                                    "E0433",
                                     format!(
                                         "comparison mixes signed `{s}` and unsigned `{u}`: the result \
                                          depends on which operand's signedness the compare uses, so \
@@ -4068,7 +4116,7 @@ impl<'a> Sema<'a> {
                                     let vname = self.sym_str(name.sym).to_string();
                                     self.error(
                                         e.span,
-                                        "E0401",
+                                        "E0435",
                                         format!(
                                             "enum variant `{ename}::{vname}` carries a payload; \
                                              construct it with its fields (`{ename}::{vname}(..)` or \
@@ -4084,7 +4132,8 @@ impl<'a> Sema<'a> {
                 let t = self.type_expr(base);
                 // A field access on a struct value — or on a pointer/reference to a struct, which
                 // auto-derefs (`p.x` on a `&Pt` / `*mut Pt`) — resolves to the declared field type.
-                // Anything else (a method, an unmodeled builtin) stays lenient (`Unknown`).
+                // A field the type does not have is `E0321` (`resolve.rs`); a type used as a
+                // namespace (`T::X`, `f32::MAX`) and an unmodelled base stay lenient (`Unknown`).
                 let struct_name = match &t {
                     Ty::Named(n) => Some(*n),
                     Ty::Ptr { pointee, .. } | Ty::Ref { pointee, .. } => match pointee.as_ref() {
@@ -4093,19 +4142,21 @@ impl<'a> Sema<'a> {
                     },
                     _ => None,
                 };
-                match struct_name {
-                    Some(struct_name) => self
-                        .defs
-                        .lookup(struct_name)
-                        .and_then(|d| match &d.kind {
-                            DefKind::Struct(fields) => fields
-                                .iter()
-                                .find(|(fname, _)| *fname == name.sym)
-                                .map(|(_, fty)| fty.clone()),
-                            _ => None,
-                        })
-                        .unwrap_or(Ty::Unknown),
-                    None => Ty::Unknown,
+                let field = struct_name.and_then(|struct_name| {
+                    self.defs.lookup(struct_name).and_then(|d| match &d.kind {
+                        DefKind::Struct(fields) => fields
+                            .iter()
+                            .find(|(fname, _)| *fname == name.sym)
+                            .map(|(_, fty)| fty.clone()),
+                        _ => None,
+                    })
+                });
+                match field {
+                    Some(fty) => fty,
+                    None if self.is_type_namespace(base) => {
+                        self.report_namespace_member(base, *name)
+                    }
+                    None => self.report_missing_field(&t, *name),
                 }
             }
             ExprKind::TupleField { base, index } => {
@@ -4130,7 +4181,8 @@ impl<'a> Sema<'a> {
                             Ty::Error
                         }
                     },
-                    _ => Ty::Unknown,
+                    // Only a tuple has numbered fields (`E0321`, `resolve.rs`).
+                    other => self.report_numbered_field(&other, *index, e.span),
                 }
             }
             ExprKind::Cast { expr, ty } => {
@@ -4178,7 +4230,7 @@ impl<'a> Sema<'a> {
                             }
                             Some(_) => self.error(
                                 e.span,
-                                "E0401",
+                                "E0435",
                                 format!(
                                     "enum variant `{qual}` is not a struct variant; construct it as \
                                      `{qual}(..)` or `{qual}`"
@@ -4207,7 +4259,8 @@ impl<'a> Sema<'a> {
                                 self.check_struct_literal(&decl, fields, rest.is_some(), e.span);
                                 Ty::Named(n)
                             }
-                            None => Ty::Unknown,
+                            // `E0324`: a literal of a name that is no struct (`resolve.rs`).
+                            None => self.report_unknown_struct(path),
                         }
                     }
                     None => Ty::Unknown,
@@ -4313,7 +4366,11 @@ impl<'a> Sema<'a> {
             ExprKind::Loop { label, body } => {
                 self.type_loop(label.as_ref().map(|l| l.sym), body, true)
             }
-            ExprKind::SizeOf(_) | ExprKind::AlignOf(_) => Ty::Scalar(Scalar::Usize),
+            ExprKind::SizeOf(t) | ExprKind::AlignOf(t) => {
+                // The operand's type names must resolve (`E0324`) like any other type's.
+                self.check_type_expr_names(t);
+                Ty::Scalar(Scalar::Usize)
+            }
         }
     }
 
@@ -4703,7 +4760,7 @@ fn int_lit_scalar(text: &str) -> Scalar {
     // mis-default in the first place. Growing the default to the narrowest type that holds the value
     // mirrors an unconstrained `{integer}` literal and keeps every existing narrowing check honest: a
     // pinned annotation still wins (`let x: i32 = 9000000000` re-adapts the literal back to i32 and
-    // range-checks it -> E0401), while a wider return / field / bare-expression context now lowers
+    // range-checks it -> E0431), while a wider return / field / bare-expression context now lowers
     // the true value. A magnitude past i64 but within u64 (e.g. `9223372036854775808`) widens one
     // more rung to `u64` — it must not silently truncate to i32 either (`… as u64` was baking
     // `const.i32 0` on both backends, gate-blind).
@@ -5201,15 +5258,15 @@ mod tests {
 
     #[test]
     fn heap_builtin_misuse_is_rejected() {
-        // A non-integer length is an E0401 (the `alloc("x")` class of misuse) …
-        assert!(errors("fn f() { let s = alloc_f32(\"x\"); }").contains(&"E0401"));
-        assert!(errors("fn f() { let s = alloc_i32(1.5); }").contains(&"E0401"));
+        // A non-integer length is an E0437 (the `alloc("x")` class of misuse) …
+        assert!(errors("fn f() { let s = alloc_f32(\"x\"); }").contains(&"E0437"));
+        assert!(errors("fn f() { let s = alloc_i32(1.5); }").contains(&"E0437"));
         // … the wrong arity is an E0503 …
         assert!(errors("fn f() { let s = alloc_f32(); }").contains(&"E0503"));
         assert!(errors("fn f() { let s = alloc_f32(1, 2); }").contains(&"E0503"));
         assert!(errors("fn f() { free(); }").contains(&"E0503"));
-        // … and freeing a non-slice is an E0401.
-        assert!(errors("fn f() { free(5); }").contains(&"E0401"));
+        // … and freeing a non-slice is an E0437.
+        assert!(errors("fn f() { free(5); }").contains(&"E0437"));
     }
 
     #[test]
@@ -5228,11 +5285,11 @@ mod tests {
             "scratch_mark is an i64: {:?}",
             errors(annotated)
         );
-        assert!(errors("fn f() { let s = scratch_f32(1.5); }").contains(&"E0401"));
+        assert!(errors("fn f() { let s = scratch_f32(1.5); }").contains(&"E0437"));
         assert!(errors("fn f() { let s = scratch_i64(); }").contains(&"E0503"));
         assert!(errors("fn f() { let m = scratch_mark(1); }").contains(&"E0503"));
         assert!(errors("fn f() { scratch_release(); }").contains(&"E0503"));
-        assert!(errors("fn f() { scratch_release(2.0); }").contains(&"E0401"));
+        assert!(errors("fn f() { scratch_release(2.0); }").contains(&"E0437"));
     }
 
     #[test]
@@ -5266,31 +5323,31 @@ mod tests {
 
     #[test]
     fn file_io_builtin_misuse_is_rejected() {
-        // A non-`*u8` path is an E0401 …
+        // A non-`*u8` path is an E0437 …
         assert!(
-            errors("fn f() { let s = alloc_f32(4); let n = read_f32(5, s); }").contains(&"E0401")
+            errors("fn f() { let s = alloc_f32(4); let n = read_f32(5, s); }").contains(&"E0437")
         );
-        // … a buffer whose element type does not match the name's dtype is an E0401 …
+        // … a buffer whose element type does not match the name's dtype is an E0437 …
         assert!(
             errors("fn f() { let s = alloc_i32(4); let n = read_f32(\"in.bin\", s); }")
-                .contains(&"E0401")
+                .contains(&"E0437")
         );
         assert!(
             errors("fn f() { let s = alloc_f32(4); let n = write_u8(\"o.bin\", s); }")
-                .contains(&"E0401")
+                .contains(&"E0437")
         );
         // … and the later-wave dtypes reject a mismatched buffer element the same way (a `[]f64`
-        // handed to `read_i8`, or a `[]i32` handed to `write_f64`, is an E0401) …
+        // handed to `read_i8`, or a `[]i32` handed to `write_f64`, is an E0437) …
         assert!(
             errors("fn f() { let s = alloc_f64(4); let n = read_i8(\"in.bin\", s); }")
-                .contains(&"E0401")
+                .contains(&"E0437")
         );
         assert!(
             errors("fn f() { let s = alloc_i32(4); let n = write_f64(\"o.bin\", s); }")
-                .contains(&"E0401")
+                .contains(&"E0437")
         );
-        // … a non-slice buffer is an E0401 …
-        assert!(errors("fn f() { let n = read_f32(\"in.bin\", 3); }").contains(&"E0401"));
+        // … a non-slice buffer is an E0437 …
+        assert!(errors("fn f() { let n = read_f32(\"in.bin\", 3); }").contains(&"E0437"));
         // … and the wrong arity is an E0503.
         assert!(errors("fn f() { let n = read_f32(\"in.bin\"); }").contains(&"E0503"));
         assert!(
@@ -5354,14 +5411,14 @@ mod tests {
     fn malformed_numeric_literals_are_rejected() {
         // A mistyped radix / empty radix / bad digit / value past u64 / garbled float lexes as one
         // numeric token, fails to parse, and used to lower *silently to 0* (both backends agreed on
-        // the wrong value) — now a hard E0401.
+        // the wrong value) — now a hard E0431.
         for src in [
             "fn f() { let x = 0z123; }",
             "fn f() { let x = 0x; }",
             "fn f() { let x = 0b2; }",
             "fn f() { let x = 1.5z; }",
         ] {
-            assert!(errors(src).contains(&"E0401"), "expected E0401 for {src:?}");
+            assert!(errors(src).contains(&"E0431"), "expected E0431 for {src:?}");
         }
         // Every well-formed literal stays clean (guards against over-rejection): radix, separators,
         // type suffixes, u64::MAX, and the float forms.
@@ -5376,9 +5433,12 @@ mod tests {
             "fn f() { let x = 5f32; }",
             "fn f() { let x = 9000000000; }",
         ] {
+            // Before the split this was `E0401`, the catch-all: keep ruling that out too, so a
+            // valid program regressing to a plain type mismatch is still caught here.
+            let es = errors(src);
             assert!(
-                !errors(src).contains(&"E0401"),
-                "unexpected E0401 for {src:?}"
+                !es.contains(&"E0431") && !es.contains(&"E0401"),
+                "unexpected type error for {src:?}: {es:?}"
             );
         }
     }
@@ -5409,13 +5469,13 @@ mod tests {
     fn ordered_comparison_on_bool_is_rejected() {
         // A chained comparison `a < b < c` parses left-associatively as `(a < b) < c`; the inner
         // `<` yields a bool, so the outer silently compares a bool against an int. Reject a concrete
-        // bool operand to an ordered comparison (`< <= > >=`). E0401.
+        // bool operand to an ordered comparison (`< <= > >=`). E0433.
         for src in [
             "fn f(a: i32) -> bool { return 1 < a < 2; }",
             "fn f(a: i32) -> bool { return a > 0 > 1; }",
             "fn f() -> bool { let x = true; let y = false; return x < y; }",
         ] {
-            assert!(errors(src).contains(&"E0401"), "expected E0401 for {src:?}");
+            assert!(errors(src).contains(&"E0433"), "expected E0433 for {src:?}");
         }
         // No false positives: ordinary int/float ordering, the correct `&&` chain, and `==`/`!=`
         // and `&&`/`||`/`!` on bool all stay clean (only ORDERED comparison rejects bool).
@@ -5425,9 +5485,12 @@ mod tests {
             "fn f(a: f32, b: f32) -> bool { return a >= b; }",
             "fn f() -> bool { let x = true; let y = false; return x == y || !x; }",
         ] {
+            // Before the split this was `E0401`, the catch-all: keep ruling that out too, so a
+            // valid program regressing to a plain type mismatch is still caught here.
+            let es = errors(src);
             assert!(
-                !errors(src).contains(&"E0401"),
-                "unexpected E0401 for {src:?}"
+                !es.contains(&"E0433") && !es.contains(&"E0401"),
+                "unexpected type error for {src:?}: {es:?}"
             );
         }
     }
@@ -5437,13 +5500,13 @@ mod tests {
         // `a == b == c` parses as `(a == b) == c`; the inner `==` yields a bool, so the outer
         // compares a bool against a non-bool scalar (the bool coerced to 0/1) — `5 == 3 == 0`
         // evaluated to `true`. Equality between bool and a non-bool scalar is rejected, completing
-        // the chained-comparison guard for `==`/`!=`. E0401.
+        // the chained-comparison guard for `==`/`!=`. E0433.
         for src in [
             "fn f() -> bool { return 5 == 3 == 0; }",
             "fn f() -> bool { return 1 != 2 != 3; }",
             "fn f(a: i32) -> bool { return 1 < a == 0; }", // (1 < a) == 0  ->  bool == int
         ] {
-            assert!(errors(src).contains(&"E0401"), "expected E0401 for {src:?}");
+            assert!(errors(src).contains(&"E0433"), "expected E0433 for {src:?}");
         }
         // No false positives: `bool == bool`, `int == int`, and comparison-of-comparisons stay clean.
         for src in [
@@ -5451,9 +5514,12 @@ mod tests {
             "fn f(a: i32, b: i32) -> bool { return a == b; }",
             "fn f(a: i32, b: i32, c: i32, d: i32) -> bool { return (a < b) == (c < d); }",
         ] {
+            // Before the split this was `E0401`, the catch-all: keep ruling that out too, so a
+            // valid program regressing to a plain type mismatch is still caught here.
+            let es = errors(src);
             assert!(
-                !errors(src).contains(&"E0401"),
-                "unexpected E0401 for {src:?}"
+                !es.contains(&"E0433") && !es.contains(&"E0401"),
+                "unexpected type error for {src:?}: {es:?}"
             );
         }
     }
@@ -5461,13 +5527,13 @@ mod tests {
     #[test]
     fn bool_arithmetic_and_index_rejected() {
         // bool is not a number: it cannot be an arithmetic / shift operand or an array index (it
-        // would silently coerce to 0/1 — `true + 1 == 2`, `a[true] == a[1]`). E0401.
+        // would silently coerce to 0/1 — `true + 1 == 2`, `a[true] == a[1]`). E0433.
         for src in [
             "fn f() -> i32 { let x = true; return x + 1; }",
             "fn f() -> i32 { let x = true; return x * 3; }",
             "fn f() -> i32 { let a: [i32; 2] = [1, 2]; return a[true]; }",
         ] {
-            assert!(errors(src).contains(&"E0401"), "expected E0401 for {src:?}");
+            assert!(errors(src).contains(&"E0433"), "expected E0433 for {src:?}");
         }
         // Still fine: bitwise `& | ^` and `&&`/`||`/`!` on bool, and an integer index.
         for src in [
@@ -5475,9 +5541,12 @@ mod tests {
             "fn f() -> bool { let a = true; return !a && (a || a); }",
             "fn f() -> i32 { let a: [i32; 2] = [10, 20]; let i = 1; return a[i]; }",
         ] {
+            // Before the split this was `E0401`, the catch-all: keep ruling that out too, so a
+            // valid program regressing to a plain type mismatch is still caught here.
+            let es = errors(src);
             assert!(
-                !errors(src).contains(&"E0401"),
-                "unexpected E0401 for {src:?}"
+                !es.contains(&"E0433") && !es.contains(&"E0401"),
+                "unexpected type error for {src:?}: {es:?}"
             );
         }
     }
@@ -5760,7 +5829,7 @@ mod tests {
         let view = "fn f(a: Tensor[f32, 4, 4]) { let x = a[0]; }";
         assert!(errors(view).is_empty(), "a row view: {:?}", errors(view));
         let used = "fn f(a: Tensor[f32, 4, 4]) -> f32 { return a[0] + 1.0; }";
-        assert_message_has(used, "E0401", &["Tensor[f32, 4]", "index every axis"]);
+        assert_message_has(used, "E0433", &["Tensor[f32, 4]", "index every axis"]);
     }
 
     #[test]
@@ -5881,7 +5950,7 @@ mod tests {
             r#"fn f() { let c = '\u{D800}'; }"#,
         ] {
             assert!(
-                errors(src).contains(&"E0401"),
+                errors(src).contains(&"E0432"),
                 "expected an invalid Unicode escape: {:?}",
                 errors(src)
             );
@@ -5919,20 +5988,20 @@ mod tests {
         // check, so it truncated and matched a DIFFERENT value — stealing the arm that covers it.
         let wide = "fn f(x: i32) -> i32 { return match x { 4294967296 => 1, 0 => 2, _ => 0 }; }";
         assert!(
-            errors(wide).contains(&"E0401"),
+            errors(wide).contains(&"E0431"),
             "expected an out-of-range pattern literal: {:?}",
             errors(wide)
         );
         let narrow = "fn g(x: i8) -> i32 { return match x { 200 => 1, _ => 0 }; }";
         assert!(
-            errors(narrow).contains(&"E0401"),
+            errors(narrow).contains(&"E0431"),
             "expected an out-of-range pattern literal: {:?}",
             errors(narrow)
         );
         // Range-pattern bounds are checked the same way …
         let rng = "fn h(x: i8) -> i32 { return match x { 0..=200 => 1, _ => 0 }; }";
         assert!(
-            errors(rng).contains(&"E0401"),
+            errors(rng).contains(&"E0431"),
             "expected an out-of-range range bound: {:?}",
             errors(rng)
         );
@@ -5947,7 +6016,7 @@ mod tests {
         // renumbering the rest of the enum with no diagnostic at all.
         let bad = "const OP_MUL: i32 = 10; enum Op { Add = 1, Mul = OP_MUL, Div }";
         assert!(
-            errors(bad).contains(&"E0401"),
+            errors(bad).contains(&"E0431"),
             "expected a non-constant discriminant error: {:?}",
             errors(bad)
         );
@@ -6646,7 +6715,7 @@ mod tests {
             "fn f(k: i32, a: [i8; 2]) -> i8 { let r: [i8; 2] = if k == 0 { a } else { [300, 0] }; return r[0]; }",
         ] {
             assert!(
-                errors(bad).contains(&"E0401"),
+                errors(bad).contains(&"E0431"),
                 "an out-of-range literal that ADAPTS must be rejected, not re-stamped into a constant too wide for its own type (`{bad}`): {:?}",
                 errors(bad)
             );
@@ -6848,7 +6917,7 @@ mod tests {
         // wrote, with both backends agreeing so no differential gate could see it.
         let unknown = "fn f() { println(\"A\\dB\"); }";
         assert!(
-            errors(unknown).contains(&"E0401"),
+            errors(unknown).contains(&"E0432"),
             "an unknown escape must be reported: {:?}",
             errors(unknown)
         );
@@ -6857,7 +6926,7 @@ mod tests {
         // `println("AAF")` printed just `A`.
         let no_brace = "fn f() { println(\"A\\u0041F\"); }";
         assert!(
-            errors(no_brace).contains(&"E0401"),
+            errors(no_brace).contains(&"E0432"),
             "a `\\u` with no brace must be reported: {:?}",
             errors(no_brace)
         );
@@ -6868,13 +6937,13 @@ mod tests {
         // valid 0x41 — so BOTH validators stayed silent while `decode_escape` deleted `Zoo`.
         let unclosed = "fn f() { println(\"A\\u{41Zoo\"); }";
         assert!(
-            errors(unclosed).contains(&"E0401"),
+            errors(unclosed).contains(&"E0432"),
             "an unterminated `\\u{{` must be reported: {:?}",
             errors(unclosed)
         );
         let lone = "fn f() -> char { return '\\d'; }";
         assert!(
-            errors(lone).contains(&"E0401"),
+            errors(lone).contains(&"E0432"),
             "an unknown escape in a char literal must be reported: {:?}",
             errors(lone)
         );
@@ -6889,7 +6958,7 @@ mod tests {
         // The pre-existing out-of-range check must still fire, and must not be masked by the new one.
         let surrogate = "fn f() { println(\"A\\u{D800}B\"); }";
         assert!(
-            errors(surrogate).contains(&"E0401"),
+            errors(surrogate).contains(&"E0432"),
             "a surrogate code point must still be reported: {:?}",
             errors(surrogate)
         );

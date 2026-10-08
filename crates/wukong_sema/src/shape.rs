@@ -12,7 +12,7 @@
 //!    explicit turbofish or inferred from the arguments; a conflicting binding is a `E0502`
 //!    dimension mismatch and a differing rank is `E0501`. Value-*type* generics (`fn f<T>`) are
 //!    bound by `infer_type_generics` and substituted by `apply_subst`.
-//!  * **Indexing** (`type_index`): a non-indexable base is `E0401`, a wrong index count is `E0501`,
+//!  * **Indexing** (`type_index`): a non-indexable base is `E0433`, a wrong index count is `E0501`,
 //!    and a compile-time-constant index outside a static dimension / array length is `E0501` too.
 //!
 //! `unify` has **two modes**, and the `rigid` flag is load-bearing (see `unify_dim`):
@@ -44,6 +44,7 @@ use wukong_ast::{Expr, ExprKind, NodeId, TypeExpr, TypeKind};
 use wukong_span::{Span, Symbol};
 use wukong_types::{Dim, Layout, Scalar, Shape, Ty};
 
+use crate::provenance::CallSite;
 use crate::tensor::PendingDimEq;
 use crate::{DefKind, FnSig, Sema};
 
@@ -221,7 +222,15 @@ impl Sema<'_> {
                         // Function-valued arguments and trait bounds (`methods.rs`).
                         self.check_fn_value_args(&sig, args, &arg_tys);
                         self.check_call_bounds(name, &sig, generic_args, &arg_tys, span);
-                        return self.check_fn_call(&sig, generic_args, &arg_tys, span, callee.id);
+                        let site = CallSite::new(Some(name), None, args);
+                        return self.check_fn_call(
+                            &sig,
+                            generic_args,
+                            &arg_tys,
+                            span,
+                            callee.id,
+                            &site,
+                        );
                     }
                 }
                 // A few math builtins are lowered directly by the backends, so their *result*
@@ -243,7 +252,7 @@ impl Sema<'_> {
                         // rank — has no scalar value to apply the function to.
                         let what = format!("the math function `{}`", self.sym_str(name));
                         let msg = self.whole_tensor_message(t, &what);
-                        self.error(span, "E0401", msg);
+                        self.error(span, "E0437", msg);
                         return Ty::Unknown;
                     }
                     if let Some(bad) = arg_tys.iter().find(|t| {
@@ -254,7 +263,7 @@ impl Sema<'_> {
                     }) {
                         self.error(
                             span,
-                            "E0401",
+                            "E0437",
                             format!(
                                 "`{}` expects a scalar, vector, or tensor argument, not a value of \
                                  type `{}`",
@@ -295,7 +304,7 @@ impl Sema<'_> {
                             Ty::Unknown | Ty::Error => {}
                             other => self.error(
                                 span,
-                                "E0401",
+                                "E0437",
                                 format!(
                                     "`{}` expects an integer element count, found a value of type \
                                      `{}`",
@@ -324,7 +333,7 @@ impl Sema<'_> {
                             Ty::Slice(_) | Ty::Unknown | Ty::Error => {}
                             other => self.error(
                                 span,
-                                "E0401",
+                                "E0437",
                                 format!(
                                     "`free` expects a slice returned by an `alloc_*` builtin, \
                                      found a value of type `{}`",
@@ -336,7 +345,7 @@ impl Sema<'_> {
                     return Ty::Unit;
                 }
                 // The ML builtins typed in `ml_builtins.rs` (see its module docs): each result is
-                // concrete, and misuse is rejected (E0503 arity, E0401 operand, E0304 a write
+                // concrete, and misuse is rejected (E0503 arity, E0437 operand, E0304 a write
                 // through a non-`mut` aggregate parameter) before mir_build lowers the call.
                 let interner = self.interner;
                 if let Some(ret) =
@@ -400,7 +409,7 @@ impl Sema<'_> {
                             Ty::Unknown | Ty::Error => {}
                             other => self.error(
                                 span,
-                                "E0401",
+                                "E0437",
                                 format!(
                                     "`scratch_release` expects an integer mark from \
                                      `scratch_mark()`, found a value of type `{}`",
@@ -460,19 +469,19 @@ impl Sema<'_> {
                         // statement arms. mir_build lowered the unit `let` to an `alloca void` and the
                         // read to a `load void`: native -O0 read uninitialized stack (nondeterministic
                         // garbage), while the interpreter and -O2 (mem2reg) produced 0 — a divergence
-                        // that broke BOTH invariants at once. Reject it (E0401), consistent with `()`
+                        // that broke BOTH invariants at once. Reject it (E0437), consistent with `()`
                         // already being non-computable in an arithmetic operand.
                         if let Some(t @ Ty::Tensor { .. }) = arg_tys.first() {
                             let what = format!("`{nm}`");
                             let msg = self.whole_tensor_message(t, &what);
-                            self.error(span, "E0401", msg);
+                            self.error(span, "E0437", msg);
                             self.types.insert(callee.id, Ty::Unknown);
                             return Ty::Unknown;
                         }
                         if matches!(arg_tys.first(), Some(Ty::Unit)) {
                             self.error(
                                 span,
-                                "E0401",
+                                "E0437",
                                 format!(
                                     "`{nm}` cannot print a `()` value; supply a printable scalar \
                                      (an `if` with no `else`, or a `match` with statement arms, \
@@ -501,9 +510,14 @@ impl Sema<'_> {
                     self.types.insert(callee.id, Ty::Unknown);
                     return Ty::Unknown;
                 }
-                // Unresolved or non-function callee: lenient (builtins like `min`).
                 self.types.insert(callee.id, Ty::Unknown);
-                return Ty::Unknown;
+                // `print`/`println`/`assert` with a valid argument list: `mir_build` lowers them.
+                if crate::is_statement_builtin(self.sym_str(name)) {
+                    return Ty::Unknown;
+                }
+                // Every function, function-typed parameter and builtin family was tried above, so
+                // the name does not resolve to anything callable: `E0320`/`E0323` (`resolve.rs`).
+                return self.report_unresolved_callee(name, callee.span);
             }
         }
 
@@ -517,17 +531,39 @@ impl Sema<'_> {
         if let ExprKind::Field { base, name } = &callee.kind {
             let method = self.sym_str(name.sym);
             let (is_len, is_dim) = (method == "len", method == "dim");
+            // `type_method_call` has already typed a receiver that is not a bare name (and recorded
+            // its type); typing it again would report every error inside it — an unknown field or
+            // callee (`p.zz.len()`, `foo(1).len()`) — twice.
+            let cached = match base.kind {
+                ExprKind::Path(_) => None,
+                _ => self.types.get(&base.id).cloned(),
+            };
+            let bty = match cached {
+                Some(t) => t,
+                None => self.type_expr(base),
+            };
             if is_len || is_dim {
-                let bty = self.type_expr(base);
                 if let Some(t) = self.type_extent_method(&bty, is_dim, args, span) {
                     self.types.insert(callee.id, Ty::Unknown);
                     return t;
                 }
             }
+            // Any other method of a builtin type, or a struct field called like a method
+            // (`resolve.rs`). Struct and enum methods were typed by `type_method_call`; a type
+            // used as a namespace (`T::m(..)` on a generic, `f32x8::load(..)`) stays lenient.
+            self.types.insert(callee.id, Ty::Unknown);
+            if self.is_type_namespace(base) {
+                return Ty::Unknown;
+            }
+            return self.check_builtin_method(&bty, *name, args, span);
         }
-        // Field/method or complex callee: type it (so its base is recorded) and stay lenient.
-        self.type_expr(callee);
-        Ty::Unknown
+        // A multi-segment path stays the lenient unmodelled callee it always was; any other
+        // expression called as a function must have a function type (`E0323`, `resolve.rs`).
+        let t = self.type_expr(callee);
+        if matches!(callee.kind, ExprKind::Path(_)) {
+            return Ty::Unknown;
+        }
+        self.check_value_callee(callee, &t)
     }
 
     pub(crate) fn check_fn_call(
@@ -537,38 +573,28 @@ impl Sema<'_> {
         arg_tys: &[Ty],
         span: Span,
         call_id: NodeId,
+        site: &CallSite,
     ) -> Ty {
         if arg_tys.len() != sig.params.len() {
-            self.error(
-                span,
-                "E0503",
-                format!(
-                    "this function takes {} argument(s) but {} were supplied",
-                    sig.params.len(),
-                    arg_tys.len()
-                ),
-            );
+            // Names the callee, labels its definition and the extra / missing arguments.
+            self.report_call_arity(sig.params.len(), arg_tys.len(), span, site);
             return sig.ret.clone();
         }
 
         let mut dims: HashMap<Symbol, Dim> = HashMap::default();
         let mut tys: HashMap<Symbol, Ty> = HashMap::default();
 
+        if !generic_args.is_empty() && generic_args.len() != sig.generics.len() {
+            self.report_generic_arity(sig.generics.len(), generic_args.len(), span, site);
+            // Don't continue into the misaligned `zip` below, which would bind dims off-by-one
+            // and report a spurious secondary E0502.
+            return sig.ret.clone();
+        }
+        // Record where every dimension is bound from here on, so a conflict can name the argument
+        // or turbofish that fixed it (`provenance.rs`).
+        let outer_call = self.begin_call(site);
+        let errors_before = self.diags.len();
         if !generic_args.is_empty() {
-            if generic_args.len() != sig.generics.len() {
-                self.error(
-                    span,
-                    "E0503",
-                    format!(
-                        "this function takes {} generic argument(s) but {} were supplied",
-                        sig.generics.len(),
-                        generic_args.len()
-                    ),
-                );
-                // Don't continue into the misaligned `zip` below, which would bind dims off-by-one
-                // and report a spurious secondary E0502.
-                return sig.ret.clone();
-            }
             for (g, ga) in sig.generics.iter().zip(generic_args) {
                 match &ga.kind {
                     // Decode with the same radix/`_`/suffix-aware parser mir_build's
@@ -580,6 +606,7 @@ impl Sema<'_> {
                     TypeKind::Int(s) => {
                         let n = crate::parse_u64_text(self.sym_str(*s)).unwrap_or(0);
                         dims.insert(*g, Dim::Const(n));
+                        self.note_turbofish_dim(*g, ga.span);
                     }
                     TypeKind::Path(p) if p.is_single() => {
                         let nm = p.first().sym;
@@ -588,7 +615,21 @@ impl Sema<'_> {
                                 tys.insert(*g, Ty::Scalar(sc));
                             }
                             None => {
-                                dims.insert(*g, Dim::Var(nm));
+                                // A top-level `const` (not shadowed by a local or one of the
+                                // caller's generics) is its VALUE, exactly as a `const` dimension
+                                // in a type is (`lower_dim`). Bound as `Var(C)` it named no slot,
+                                // so lowering fell back to a `?` argument's run-time extent and
+                                // `f::<C>(t)` disagreed with `f::<4>(t)`.
+                                let is_const = !self.generics.contains(&nm)
+                                    && self.lookup_local(nm).is_none()
+                                    && self.consts.contains_key(&nm);
+                                let d = if is_const {
+                                    Dim::Const(self.const_length(nm, 0))
+                                } else {
+                                    Dim::Var(nm)
+                                };
+                                dims.insert(*g, d);
+                                self.note_turbofish_dim(*g, ga.span);
                             }
                         }
                     }
@@ -604,7 +645,10 @@ impl Sema<'_> {
         // walked: `unify_dim` queues its equation, and `solve_pending_dims` solves the queue once every
         // plain `N` has been bound, so the order the parameters are written in does not matter.
         let outer_pending = std::mem::take(&mut self.pending_dims);
-        for (param, arg) in sig.params.iter().zip(arg_tys) {
+        for (i, (param, arg)) in sig.params.iter().zip(arg_tys).enumerate() {
+            // A mismatch is reported at the argument, not the whole call.
+            let arg_span = site.arg_span(i).unwrap_or(span);
+            self.set_call_arg(Some((i, arg_span)));
             // Infer VALUE-TYPE generics (a `Ty::Named(g)` parameter position) from the concrete
             // argument type, so `id(c)` with `c: f32` binds `T := f32` and the whole call types as
             // `f32` — its result can then be cast/used at the concrete type, and `mir_build`
@@ -628,10 +672,15 @@ impl Sema<'_> {
             // from the argument shapes (`rigid == false`). `param` — the DECLARED type, before the
             // substitution that produced `p` — rides along so a mismatch can be reported against the
             // name the signature wrote (`K`), not just the extent it resolved to.
-            self.unify_decl(p, arg, Some(param), &mut dims, span, false);
+            self.unify_decl(p, arg, Some(param), &mut dims, arg_span, false);
         }
+        self.set_call_arg(None);
         let pending = std::mem::replace(&mut self.pending_dims, outer_pending);
         self.solve_pending_dims(&sig.generics, &mut dims, pending);
+        // Every dimension the callee's parameters use must now be known — bound, solved, or a `?`
+        // argument's run-time extent — or lowering has no value to pass for it (`E0520`).
+        self.check_call_dims_bound(sig, arg_tys, &dims, span, site, errors_before);
+        self.end_call(outer_call);
         // A derived extent of the RETURN type must still be an extent once this call's dims are
         // known (`-> Tensor[f32, N - 4]` called with `N = 2` has no result shape).
         self.check_derived_extents(&sig.ret, &dims, span);
@@ -1297,11 +1346,9 @@ impl Sema<'_> {
                     if !dims_equal(bound, ad) {
                         let (want, got) = (self.dim_str(bound), self.dim_str(ad));
                         let at = self.dim_site(site);
-                        self.error(
-                            span,
-                            "E0502",
-                            format!("dimension mismatch on {at}: expected {want}, found {got}"),
-                        );
+                        let msg =
+                            format!("dimension mismatch on {at}: expected {want}, found {got}");
+                        self.report_dim_conflict(span, msg, site, &want, &got);
                     }
                 }
                 None => {
@@ -1311,17 +1358,15 @@ impl Sema<'_> {
                     // `N` unbound so a concrete sibling binds it and subsequent ones are checked.
                     if !matches!(ad, Dim::Dynamic) {
                         dims.insert(*v, ad.clone());
+                        self.note_dim_bound(*v, site.axis);
                     }
                 }
             },
             Dim::Const(pc) => match ad {
                 Dim::Const(ac) if pc != ac => {
                     let at = self.dim_site(site);
-                    self.error(
-                        span,
-                        "E0502",
-                        format!("dimension mismatch on {at}: expected {pc}, found {ac}"),
-                    )
+                    let msg = format!("dimension mismatch on {at}: expected {pc}, found {ac}");
+                    self.report_dim_conflict(span, msg, site, &pc.to_string(), &ac.to_string());
                 }
                 // A caller's own universally-quantified dim cannot be ASSUMED equal to the callee's
                 // fixed size — that is a claim the checker cannot prove, and the very hole `rigid`
@@ -1333,15 +1378,13 @@ impl Sema<'_> {
                 Dim::Var(_) | Dim::Expr(_) => {
                     let name = self.dim_str(ad);
                     let at = self.dim_site(site);
-                    self.error(
-                        span,
-                        "E0502",
-                        format!(
-                            "dimension mismatch on {at}: expected {pc}, found the generic dimension \
-                             `{name}` (a universally-quantified dimension cannot be assumed equal \
-                             to {pc}; declare the parameter `?` if the size is a runtime value)"
-                        ),
+                    let msg = format!(
+                        "dimension mismatch on {at}: expected {pc}, found the generic dimension \
+                         `{name}` (a universally-quantified dimension cannot be assumed equal \
+                         to {pc}; declare the parameter `?` if the size is a runtime value)"
                     );
+                    let found = format!("`{name}`");
+                    self.report_dim_conflict(span, msg, site, &pc.to_string(), &found);
                 }
                 _ => {}
             },
@@ -1352,11 +1395,8 @@ impl Sema<'_> {
                 if !dims_equal(pd, ad) {
                     let (want, got) = (self.dim_str(pd), self.dim_str(ad));
                     let at = self.dim_site(site);
-                    self.error(
-                        span,
-                        "E0502",
-                        format!("dimension mismatch on {at}: expected {want}, found {got}"),
-                    );
+                    let msg = format!("dimension mismatch on {at}: expected {want}, found {got}");
+                    self.report_dim_conflict(span, msg, site, &want, &got);
                 }
             }
             Dim::Dynamic => {}
@@ -1404,7 +1444,7 @@ impl Sema<'_> {
             if matches!(ix_ty, Ty::Scalar(Scalar::Bool)) {
                 self.error(
                     ix.span,
-                    "E0401",
+                    "E0433",
                     "array index must be an integer, not `bool`".to_string(),
                 );
             }
@@ -1425,7 +1465,7 @@ impl Sema<'_> {
             let disp = base_ty.display(self.interner);
             self.error(
                 span,
-                "E0401",
+                "E0433",
                 format!(
                     "cannot index a value of type `{disp}` with `[..]`; only arrays, tensors, \
                      slices, and pointers are indexable (use `.field` / `.0` for a struct / tuple)"

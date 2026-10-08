@@ -1,4 +1,4 @@
-// EXPECT-CODE: E0401
+// EXPECT-CODE: E0437
 module tests.fail.intrinsic_aggregate
 
 // A math intrinsic (sqrt/exp/log/sin/abs/...) operates on a scalar, vector, or tensor — never an

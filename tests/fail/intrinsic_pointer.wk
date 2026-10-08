@@ -1,4 +1,4 @@
-// EXPECT-CODE: E0401
+// EXPECT-CODE: E0437
 module tests.fail.intrinsic_pointer
 
 // A math intrinsic operates on a scalar (an integer is promoted to float), a vector, or a tensor —

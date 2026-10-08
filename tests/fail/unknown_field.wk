@@ -1,0 +1,12 @@
+// EXPECT-CODE: E0321
+module tests.fail.unknown_field
+
+// `p.z` on a struct with only `x` and `y`. The access used to type as `Unknown` and fail in lowering
+// as the codegen limit `C0001` ("field access on a non-struct value"); it is a resolution error that
+// lists the struct's fields now.
+struct Point { x: f32, y: f32 }
+
+fn main() -> i32 {
+    let p = Point { x: 1.0, y: 2.0 };
+    return p.z as i32;
+}

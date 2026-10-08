@@ -1,4 +1,4 @@
-// EXPECT-CODE: E0401
+// EXPECT-CODE: E0433
 module tests.fail.bool_arithmetic
 
 // `bool` is not a number: using it as an operand to a true arithmetic operator silently coerced it

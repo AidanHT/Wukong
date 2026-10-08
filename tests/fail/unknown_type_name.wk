@@ -1,0 +1,12 @@
+// EXPECT-CODE: E0324
+module tests.fail.unknown_type_name
+
+// `flot` names no type. An undeclared type name used to be accepted as a nominal type, which lowering
+// sizes as a 32-bit integer slot; it is a resolution error now.
+fn half(x: flot) -> f32 {
+    return x * 0.5;
+}
+
+fn main() -> i32 {
+    return half(4.0) as i32;
+}

@@ -1,4 +1,4 @@
-// EXPECT-CODE: E0401
+// EXPECT-CODE: E0433
 module tests.fail.mixed_sign_comparison
 
 // An ordered comparison between a SIGNED and an UNSIGNED integer is rejected. It lowers to a `Cmp`
@@ -11,7 +11,7 @@ module tests.fail.mixed_sign_comparison
 fn main() -> i32 {
     let a: i32 = -1;
     let b: u32 = 1;
-    if a < b {          // E0401: comparison mixes signed `i32` and unsigned `u32`
+    if a < b {          // E0433: comparison mixes signed `i32` and unsigned `u32`
         print(1);
     } else {
         print(0);

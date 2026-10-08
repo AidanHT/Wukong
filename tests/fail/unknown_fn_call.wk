@@ -1,0 +1,15 @@
+// EXPECT-CODE: E0320
+module tests.fail.unknown_fn_call
+
+// A call to a function that does not exist — here a one-letter typo of `square`. Sema used to type
+// the unresolved callee as a lenient `Unknown`, so the program reached lowering and failed there with
+// the codegen limit `C0001` ("`call` is not yet supported by codegen"), blaming the compiler for the
+// programmer's typo. It is a resolution error now, with a did-you-mean suggestion for `square`
+// (pinned in `crates/wukongc/tests/fail.rs`).
+fn square(x: f32) -> f32 {
+    return x * x;
+}
+
+fn main() -> i32 {
+    return sqare(3.0) as i32;
+}

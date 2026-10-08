@@ -86,6 +86,34 @@ another architecture or OS is not supported. A native-backend failure is a catal
   replacement), a label in another file gets a `::: file:line:col` header, `--color=auto` honours
   `NO_COLOR`/`CLICOLOR_FORCE`/`TERM=dumb` (and enables Windows VT), and `--explain` with no code
   lists every catalogued code. (A full LSP is out of scope; see MASTER_PLAN §3.6.)
+- **Name resolution is total.** Every called name, field, builtin-type method and type name resolves
+  or is a resolution error with a did-you-mean suggestion: `E0320` (unknown function), `E0321` (no
+  such field), `E0322` (no such method on a builtin type), `E0323` (calling a non-function — the
+  missing-`;` trap), `E0324` (unknown type, struct literal of an undeclared name, a trait used as a
+  type). These used to type as a lenient `Unknown` and fail in lowering as the codegen limit `C0001`,
+  and an undeclared type name was lowered as an `i32` slot. One builtin callee registry
+  (`wukong_sema::is_builtin_callee`) is read by `mir_build` too, so a single-name call that reaches
+  lowering unresolved is an internal compiler error, not a codegen limit
+  (`tests/fail/{unknown_fn_call,unknown_field,builtin_method_unknown,call_non_function,unknown_type_name,struct_literal_unknown}.wk`).
+- **Call-site shape errors carry provenance.** An `E0502` at a call is reported at the conflicting
+  argument, with labels naming the argument axis or turbofish that fixed the dimension and the
+  callee parameter that declares it; `E0503` names the callee and labels its definition and the
+  extra or missing arguments (pinned in JSON by `crates/wukongc/tests/fail.rs`).
+- **Every call dimension is known at type-check time.** A dimension a callee's parameter shapes use
+  that no turbofish, argument shape, solvable element count or `?` argument extent fixes is `E0520`
+  at the call (with the turbofish to write), instead of the lowering-time `C0001` it used to be
+  (`tests/fail/dim_uninferable.wk`). A `const` named in a turbofish is its value, as in a type — it
+  used to be an opaque variable that lowering replaced with a `?` argument's run-time extent
+  (`tests/run/turbofish_const_dim.wk`). Still open: a turbofish naming a run-time *variable*
+  (`f::<n>(..)`) binds the dimension to that variable by name, so an escaping result type re-reads
+  `n` — mutating or shadowing `n` after the call changes that tensor's extent.
+- **`E0401` is a plain type mismatch again.** The catch-all was split by rule, each with its own
+  `--explain` page and a compile-tested erroneous/fixed example: `E0430` struct-literal fields, `E0431`
+  malformed or out-of-range literals (and enum discriminants), `E0432` invalid escapes, `E0433`
+  operators applied to a type they are not defined for (including indexing and `*`), `E0434` a missing
+  return value, `E0435` misused enum payloads, `E0436` non-boolean conditions and `E0437` builtin
+  arguments of the wrong kind. `E0401` keeps expected/found mismatches, invalid casts, a value `break`
+  out of a statement loop and layout/length limits.
 - Functions (including recursion and mutual recursion — the interpreter oracle runs on a
   512 MiB worker thread, so ordinary recursion does not overflow the host's small default stack), and
   direct calls. *Caveat:* the tree-walking interpreter's call frames are ~an order of magnitude larger
@@ -214,7 +242,7 @@ another architecture or OS is not supported. A native-backend failure is a catal
   `wukong_rt_alloc`/`wukong_rt_free` runtime calls plus fat-pointer construction — **no new MIR
   op**, and the optimizer's conservative call handling (no CSE/DSE/LICM across calls) keeps stores
   to alloc'd memory and allocation identity sound at every `-O` level. Misuse is a compile error
-  (non-integer count / freeing a non-slice E0401, arity E0503 — `tests/fail/heap_*.wk`);
+  (non-integer count / freeing a non-slice E0437, arity E0503 — `tests/fail/heap_*.wk`);
   double-free, freeing a non-alloc slice, or use-after-free is **undefined on native** and
   mark-and-forget (harmless, never a crash) in the interpreter. interp == native bit-for-bit and
   -O0 == -O3 (`tests/run/heap_{alloc,alloc_fn,zero_init,len}.wk`, `differential_heap_alloc`, and
@@ -235,7 +263,7 @@ another architecture or OS is not supported. A native-backend failure is a catal
   per-call `mark; scratch_…; release` stops allocating after its first call. Chunks never move and
   grow geometrically. The interpreter mirrors the count and reuses a released region at the same
   depth, so its memory stays bounded too. Lowered to opaque `wukong_rt_scratch_{alloc,mark,release}`
-  calls like the heap builtins; misuse is E0401/E0503; use after release is undefined on native,
+  calls like the heap builtins; misuse is E0437/E0503; use after release is undefined on native,
   like use after `free` (`tests/run/alloc_scratch_arena.wk`, also in the AOT gate). Not yet: an
   uninitialized variant, an arena handle a program can pass around, and `@align(N)` (still parsed
   and discarded — every heap and scratch allocation is already 64-byte aligned).
@@ -1310,7 +1338,7 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   need run-time-sized storage) and a non-scalar element still report `E0406`. Matmul *dimensions* may be
   runtime values — a runtime-dimension matmul still dispatches to the GEMM kernel.
 - Ordered comparison (`< <= > >=`) is not defined on `bool`, so a **chained comparison** `a < b < c`
-  (which parses left-associatively as `(a < b) < c`) is a compile error (`E0401`) rather than a silent
+  (which parses left-associatively as `(a < b) < c`) is a compile error (`E0433`) rather than a silent
   wrong result — write `a < b && b < c` (`tests/fail/chained_comparison.wk`). Equality `==`/`!=`
   between a `bool` and a non-bool scalar is likewise rejected, so the `==`/`!=` chain `5 == 3 == 0` is
   caught too (`tests/fail/chained_equality.wk`).

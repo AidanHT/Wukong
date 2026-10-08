@@ -1,4 +1,4 @@
-// EXPECT-CODE: E0401
+// EXPECT-CODE: E0434
 module tests.fail.missing_return
 
 // A function that promises a value must produce one on every path. Here the `n <= 0` path falls off

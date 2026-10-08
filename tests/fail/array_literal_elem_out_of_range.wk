@@ -1,4 +1,4 @@
-// EXPECT-CODE: E0401
+// EXPECT-CODE: E0431
 module tests.fail.array_literal_elem_out_of_range
 
 // An array literal now adapts its elements to the annotated element type (so a typed buffer can be

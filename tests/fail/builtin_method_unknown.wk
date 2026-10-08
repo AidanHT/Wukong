@@ -1,0 +1,14 @@
+// EXPECT-CODE: E0322
+module tests.fail.builtin_method_unknown
+
+// A slice has `.len()` and nothing else: `.dim(k)` is a tensor and array method. The call used to
+// type as an unmodelled `Unknown` and fail in lowering as `C0001`; it is a resolution error that names
+// the methods a slice does have now.
+fn first_extent(s: []f32) -> i64 {
+    return s.dim(0);
+}
+
+fn main() -> i32 {
+    let a: [f32; 3] = [1.0, 2.0, 3.0];
+    return first_extent(a) as i32;
+}

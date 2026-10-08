@@ -21423,7 +21423,7 @@ impl FnLowerer<'_> {
             };
             self.diags.push(
                 Diagnostic::error(format!("literal `{v}` is out of range for `{name}`"))
-                    .with_code("E0401")
+                    .with_code("E0431")
                     .primary(span, "this pattern can never match the scrutinee"),
             );
             return None;
@@ -22408,7 +22408,30 @@ impl FnLowerer<'_> {
         for a in args {
             self.lower_expr(a);
         }
-        self.unsupported(e.span, "call");
+        // Sema resolves every single-name callee — a function, a function-typed parameter, or a
+        // registered builtin — and rejects anything else (`E0320`/`E0323`). A name that is none of
+        // those reaching here is a compiler bug, not a codegen limit; a builtin some lowering above
+        // declined (a non-numeric `min`, say) and a method of the unlowered SIMD surface remain the
+        // codegen limit `C0001`.
+        let unresolved = match &callee.kind {
+            ExprKind::Path(p) if p.is_single() => Some(p.first().sym).filter(|&name| {
+                self.lookup(name).is_none()
+                    && self.sema.defs.lookup(name).is_none()
+                    && !wukong_sema::is_builtin_callee(self.interner.resolve(name))
+            }),
+            _ => None,
+        };
+        match unresolved {
+            Some(name) => {
+                let msg = format!(
+                    "call to `{}`, which name resolution did not resolve, reached lowering",
+                    self.interner.resolve(name)
+                );
+                self.diags
+                    .push(Diagnostic::bug(msg).primary(e.span, "unresolved callee"));
+            }
+            None => self.unsupported(e.span, "call"),
+        }
         let t = self.expr_mir(e);
         self.const_zero(t)
     }
@@ -32785,9 +32808,11 @@ const ATAN_P: [f64; 4] = [
 /// Names that lower to runtime/interpreter intrinsics rather than user functions. Exactly the three
 /// statement-shaped builtins — *not* a general "is this a builtin" predicate: the ~50 math/activation
 /// names live in `math_intrinsic`, and the heap, file-I/O, `now_ns` and `sdpa` builtins are matched by
-/// name inside `lower_call`. `lower_call` is its only caller (no callers outside this crate).
+/// name inside `lower_call`. `lower_call` is its only caller (no callers outside this crate). The
+/// set is sema's builtin registry entry ([`wukong_sema::is_statement_builtin`]), so the two crates
+/// cannot disagree about which calls sema leaves for this lowering.
 pub fn is_intrinsic(name: &str) -> bool {
-    matches!(name, "print" | "println" | "assert")
+    wukong_sema::is_statement_builtin(name)
 }
 
 /// Parse an integer literal's source text to its value. Handles the radix prefixes `0x`/`0o`/`0b`

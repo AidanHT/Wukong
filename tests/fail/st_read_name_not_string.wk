@@ -1,8 +1,8 @@
-// EXPECT-CODE: E0401
+// EXPECT-CODE: E0437
 module tests.fail.st_read_name_not_string
 
 // `st_read_<T>(path, name, buf)` looks a tensor up by name, so its second argument must be a `*u8`
-// string like the path. An integer there is rejected at the call (E0401) rather than read as an
+// string like the path. An integer there is rejected at the call (E0437) rather than read as an
 // address.
 fn main() -> i32 {
     let mut w: [f32; 4] = [0.0; 4];

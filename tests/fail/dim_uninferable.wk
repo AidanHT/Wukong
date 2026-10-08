@@ -1,0 +1,22 @@
+// EXPECT-CODE: E0520
+module tests.fail.dim_uninferable
+
+// A rank-2 symbolic tensor parameter fed a flat 12-element array: the array fixes only the element
+// count, `M * N = 12`, which has more than one solution, so neither dimension is known — and the
+// compiled `total` takes both as hidden arguments. Sema used to accept the call and leave it to
+// lowering, which reported the codegen limit `C0001`; it is the shape error E0520 now, with a help
+// that spells the turbofish (`total::<M, N>(..)`).
+fn total<M, N>(a: Tensor[f32, M, N]) -> f32 {
+    let mut s: f32 = 0.0;
+    for i in 0..M {
+        for j in 0..N {
+            s = s + a[i, j];
+        }
+    }
+    return s;
+}
+
+fn main() -> i32 {
+    let a: [f32; 12] = [1.0; 12];
+    return total(a) as i32;
+}

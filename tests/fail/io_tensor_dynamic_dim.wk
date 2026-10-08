@@ -1,9 +1,9 @@
-// EXPECT-CODE: E0401
+// EXPECT-CODE: E0437
 module tests.fail.io_tensor_dynamic_dim
 
 // A typed read moves exactly as many elements as its destination holds, so the destination's
 // element count must be known at the call. A tensor with a `?` dimension has no such count, and a
-// read into it would have to guess one: it is rejected at the call (E0401) with a hint to name or
+// read into it would have to guess one: it is rejected at the call (E0437) with a hint to name or
 // size the dimension. A fixed array, a slice, or a tensor whose dims are constants or bound
 // dimension variables are all accepted.
 fn load(mut t: Tensor[f32, ?]) -> i64 {

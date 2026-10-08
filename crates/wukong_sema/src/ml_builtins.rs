@@ -5,7 +5,7 @@
 //! Like the heap and timing builtins, these are typed nominally here — the call's result is a
 //! concrete type, so `let n = read_bf16_at(p, off, w)` composes in arithmetic — and every misuse is
 //! rejected with the standard codes before `wukong_mir_build` lowers the call structurally:
-//! a wrong arity is `E0503`, a wrong operand kind or element type `E0401`, and a builtin that writes
+//! a wrong arity is `E0503`, a wrong operand kind or element type `E0437`, and a builtin that writes
 //! a non-`mut` aggregate parameter `E0304` (exactly what `p[i] = …` through that parameter is).
 //! [`ml_builtin`] is the one name table; `mir_build` matches the same enum, so the two cannot
 //! disagree about which names are builtins or what element type each one moves.
@@ -249,14 +249,14 @@ impl Sema<'_> {
         Some(ret)
     }
 
-    /// A NUL-terminated `*u8` string (a literal or a `*u8` binding); anything else is `E0401`.
+    /// A NUL-terminated `*u8` string (a literal or a `*u8` binding); anything else is `E0437`.
     fn ml_str_arg(&mut self, name: &str, arg: &Expr, ty: &Ty, i: usize, what: &str) {
         match ty {
             Ty::Ptr { pointee, .. } if matches!(pointee.as_ref(), Ty::Scalar(Scalar::U8)) => {}
             Ty::Unknown | Ty::Error => {}
             other => self.error(
                 arg.span,
-                "E0401",
+                "E0437",
                 format!(
                     "`{name}` expects a `*u8` {what} as its {} argument, found a value of type \
                      `{}`",
@@ -292,7 +292,7 @@ impl Sema<'_> {
             let kind = if float { "a float" } else { "an integer" };
             self.error(
                 arg.span,
-                "E0401",
+                "E0437",
                 format!(
                     "`{name}` expects {kind} {what}, found a value of type `{}`",
                     ty.display(self.interner)
@@ -326,7 +326,7 @@ impl Sema<'_> {
                 if *layout != Layout::Contiguous {
                     self.error(
                         span,
-                        "E0401",
+                        "E0437",
                         format!(
                             "`{name}` moves elements in row-major order, so its {} argument must \
                              be a contiguous tensor, not a `{}` one",
@@ -339,7 +339,7 @@ impl Sema<'_> {
                 if shape.0.iter().any(|d| matches!(d, Dim::Dynamic)) {
                     self.error(
                         span,
-                        "E0401",
+                        "E0437",
                         format!(
                             "`{name}` needs the element count of its {} argument, but `{}` has a \
                              `?` dimension; give the dimension a name or a size",
@@ -357,7 +357,7 @@ impl Sema<'_> {
         if !ok {
             self.error(
                 span,
-                "E0401",
+                "E0437",
                 format!(
                     "`{name}` expects a {} buffer as its {} argument, found a value of type `{}`",
                     buffer_desc(elem),
@@ -478,12 +478,12 @@ mod tests {
             // A `?` dimension leaves the element count unknown.
             (
                 "fn f(mut t: Tensor[f32, ?]) -> i64 { return read_f32(\"a\", t); }",
-                "E0401",
+                "E0437",
             ),
             // The element type is exact: f16 is not bf16.
             (
                 "fn f() -> i64 { return read_bf16(\"a\", alloc_f16(2)); }",
-                "E0401",
+                "E0437",
             ),
             // Writing a non-`mut` by-reference parameter.
             (
@@ -497,11 +497,11 @@ mod tests {
             // A tensor name must be a string, an offset an integer.
             (
                 "fn f(mut w: [f32; 4]) -> i64 { return st_read_f32(\"a\", 3, w); }",
-                "E0401",
+                "E0437",
             ),
             (
                 "fn f(mut w: [f32; 4]) -> i64 { return read_f32_at(\"a\", 1.5, w); }",
-                "E0401",
+                "E0437",
             ),
             // Arity.
             ("fn f() -> i64 { return file_size(); }", "E0503"),
@@ -528,7 +528,7 @@ mod tests {
             // The results are typed, not lenient: a u32 is not an f32.
             ("fn f() { let x: f32 = rand_u32(1, 2); }", "E0401"),
             // The seed is an integer's bits; a float has none to offer.
-            ("fn f() -> f32 { return rand_f32(0.5, 1); }", "E0401"),
+            ("fn f() -> f32 { return rand_f32(0.5, 1); }", "E0437"),
             // The fill writes its buffer.
             ("fn f(w: [f32; 4]) { rand_fill_f32(w, 1, 2); }", "E0304"),
             ("fn f() -> f32 { return randn_f32(1); }", "E0503"),
@@ -556,11 +556,11 @@ mod tests {
             // The variate is a float, the index buffer i64.
             (
                 "fn f(p: []f32) -> i64 { return sample_categorical(p, 1); }",
-                "E0401",
+                "E0437",
             ),
             (
                 "fn f(x: []f32, mut i: []i32) -> i64 { return argsort_f32(x, i); }",
-                "E0401",
+                "E0437",
             ),
             (
                 "fn f(p: []f32) -> i64 { return sample_categorical(p); }",

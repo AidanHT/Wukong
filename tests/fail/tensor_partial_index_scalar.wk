@@ -1,4 +1,4 @@
-// EXPECT-CODE: E0401
+// EXPECT-CODE: E0433
 module tests.fail.tensor_partial_index_scalar
 
 // One index short of the rank is a VIEW of the remaining axes, not an element: `a[i]` on a [3, 3]

@@ -1,0 +1,12 @@
+// EXPECT-CODE: E0324
+module tests.fail.struct_literal_unknown
+
+// A struct literal of a name no struct has (`Pointt`). The literal used to type as `Unknown` and
+// lower to a 4-byte placeholder slot with no fields at all; it is a resolution error now, with a
+// did-you-mean suggestion for `Point`.
+struct Point { x: f32, y: f32 }
+
+fn main() -> i32 {
+    let p = Pointt { x: 1.0, y: 2.0 };
+    return 0;
+}

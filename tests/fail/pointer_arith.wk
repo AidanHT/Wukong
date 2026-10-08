@@ -1,4 +1,4 @@
-// EXPECT-CODE: E0401
+// EXPECT-CODE: E0433
 module tests.fail.pointer_arith
 
 // Pointer arithmetic (`p + 1`) is not supported. Sema used to accept it, then mir_build emitted an

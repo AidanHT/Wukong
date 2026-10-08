@@ -1,4 +1,4 @@
-// EXPECT-CODE: E0401
+// EXPECT-CODE: E0431
 module tests.fail.malformed_int_literal
 
 // A mistyped radix prefix used to lex as a single `Int` token with a bogus suffix (`0z123` => suffix
