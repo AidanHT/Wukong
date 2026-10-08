@@ -17,7 +17,7 @@ use wukong_mir::MirType;
 use wukong_span::{FxHashSet as HashSet, Symbol};
 
 use crate::{
-    affine_stride, exprs_struct_eq, fusable_for, fuse_for_bodies, set_or_check, single_path,
+    affine_stride, canon, exprs_struct_eq, fusable_for, fuse_for_bodies, set_or_check, single_path,
     uses_any, vector_width, FnLowerer,
 };
 
@@ -179,6 +179,65 @@ impl FnLowerer<'_> {
         accepted.then_some(limit)
     }
 
+    /// Would a single-range loop with this body over loop variable `j` be claimed by one of the
+    /// elementwise kernel recognizers — the probes `try_vectorize_for` (and its `@parallel`-chunk
+    /// twin `try_vectorize_ranged`) and the low-precision map arms of `lower_for` try before the
+    /// generic vectorizer? Pure and structural: the recognizers' own matchers, over the body as
+    /// written and over its value-binding view, without the range / alias checks their emitters add
+    /// (an emitter that later declines only costs a fusion, never a kernel). `false` whenever
+    /// recognition is off, where no loop dispatches anything.
+    ///
+    /// This is what keeps same-range fusion from eating kernels: fusing `out[i] = gelu(x[i])` with
+    /// `out[i] = out[i] * 2.0` produces a two-statement body that vectorizes but is no kernel's
+    /// shape, so the fused loop ran as one 128-bit loop with `gelu` inlined, where the loops apart
+    /// dispatch `wukong_vmath_f32` and `wukong_velem_f32` (their `_parallel` twins in a `@parallel`
+    /// function).
+    pub(crate) fn elementwise_kernel_body(&self, j: Symbol, body: &ast::Block) -> bool {
+        if !self.gemm.recognize {
+            return false;
+        }
+        let probes = |b: &ast::Block| {
+            self.match_vmath_body(j, b, None).is_some()
+                || self.match_vmath2_body(j, b).is_some()
+                || self.match_velem_body(j, b).is_some()
+                || self.match_vhorner_body(j, b).is_some()
+                || self.match_dequant_body(j, b).is_some()
+        };
+        probes(body)
+            || self.match_lowp_axpby(body, j).is_some()
+            || self.match_lowp_axpby_narrow(body, j).is_some()
+            || self.match_vmath_narrow(body, j).is_some()
+            || canon::inline_value_lets(body, self.sema, self.interner).is_some_and(|v| probes(&v))
+    }
+
+    /// Cut a dependence-safe fusion prefix of `m` loops (from [`Self::fusable_prefix`]) so that
+    /// fusion never trades a recognized kernel for the generic vectorizer: when no member loop's
+    /// body is an elementwise kernel's shape ([`Self::elementwise_kernel_body`]), or the fused body
+    /// itself is one, all `m` loops fuse; otherwise only the loops before the first kernel member
+    /// may, re-planned, and `None` means none fuse (the caller lowers the first loop on its own and
+    /// tries again from the next statement, so the kernel loop is lowered alone and the loops after
+    /// it can still fuse with each other). Returns the prefix length and its fused body.
+    pub(crate) fn kernel_preserving_prefix(
+        &self,
+        loops: &[Stmt],
+        j: Symbol,
+        m: usize,
+    ) -> Option<(usize, ast::Block)> {
+        let first_kernel = loops[..m].iter().position(|s| {
+            fusable_for(s).is_some_and(|(_, _, body)| self.elementwise_kernel_body(j, body))
+        });
+        let fused = fuse_for_bodies(&loops[..m]);
+        let Some(k) = first_kernel else {
+            return Some((m, fused));
+        };
+        if self.elementwise_kernel_body(j, &fused) {
+            return Some((m, fused));
+        }
+        // The loops before `k` are kernel-free, so their own fusable prefix needs no re-check.
+        let m = self.fusable_prefix(&loops[..k], j)?;
+        Some((m, fuse_for_bodies(&loops[..m])))
+    }
+
     /// The fusion search `fusable_prefix` replaces: build each candidate prefix, longest first, and
     /// ask `vectorizable`. Kept as the reference the debug-build cross-check compares against.
     pub(crate) fn fusable_prefix_reference(&self, loops: &[Stmt], j: Symbol) -> Option<usize> {
@@ -192,7 +251,7 @@ impl FnLowerer<'_> {
 #[cfg(test)]
 mod tests {
     use crate::lower_program;
-    use wukong_mir::Program;
+    use wukong_mir::{Op, Program};
     use wukong_span::{Interner, SourceId};
 
     /// Lower `src`, requiring no diagnostics and verifier-clean MIR. In a debug build every fusion
@@ -257,5 +316,91 @@ mod tests {
             "fn chain() -> f32 {{ let mut a: [f32; 64] = [1.0; 64]; {body} return a[63]; }}"
         );
         lower(&src);
+    }
+
+    /// The callee names of every `Call` in function `name`, in program order.
+    fn callees(src: &str, name: &str) -> Vec<String> {
+        let mut interner = Interner::new();
+        let (module, pdiags) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pdiags.is_empty(), "parse: {pdiags:?}");
+        let (sema, sdiags) = wukong_sema::check(&module, &interner);
+        assert!(sdiags.iter().all(|d| !d.is_error()), "sema: {sdiags:?}");
+        let (program, diags) = lower_program(&module, &sema, &mut interner);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        for f in &program.funcs {
+            let errors = wukong_mir::verify::verify_function(f);
+            assert!(errors.is_empty(), "{errors:?}");
+        }
+        let f = program
+            .funcs
+            .iter()
+            .find(|f| interner.resolve(f.name) == name)
+            .expect("function lowered");
+        f.blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter_map(|i| match &i.op {
+                Op::Call { func, .. } => Some(interner.resolve(*func).to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Two adjacent same-range loops that each dispatch an elementwise kernel alone — a `gelu`
+    /// (`wukong_vmath_f32`) and a scale (`wukong_velem_f32`) — must still dispatch both. Their
+    /// fused two-statement body vectorizes but is no kernel's shape, so fusing them traded both
+    /// 256-bit kernels (multicore in a `@parallel` function) for one 128-bit loop with `gelu`
+    /// inlined: for slices once they reached the vectorizer, and for `[f32; N]` arrays before
+    /// that. Covered for both operand spellings, serial and `@parallel`.
+    #[test]
+    fn fusion_keeps_the_member_loops_elementwise_kernels() {
+        for params in [
+            "x: []f32, mut out: []f32",
+            "x: [f32; 20000], mut out: [f32; 20000]",
+        ] {
+            for parallel in [false, true] {
+                let attr = if parallel { "@parallel " } else { "" };
+                let src = format!(
+                    "{attr}fn k({params}) {{
+                        for i in 0..20000 {{ out[i] = gelu(x[i]); }}
+                        for i in 0..20000 {{ out[i] = out[i] * 2.0; }}
+                    }}
+                    fn main() -> i32 {{
+                        let x: [f32; 20000] = [0.5; 20000];
+                        let mut o: [f32; 20000] = [0.0; 20000];
+                        k(x, o);
+                        return 0;
+                    }}"
+                );
+                let calls = callees(&src, "k");
+                let suffix = if parallel { "_parallel" } else { "" };
+                for kernel in ["wukong_vmath_f32", "wukong_velem_f32"] {
+                    let want = format!("{kernel}{suffix}");
+                    assert!(
+                        calls.contains(&want),
+                        "{params} parallel={parallel}: {want} missing; calls {calls:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The cut keeps fusion where it costs no kernel: the two plain loops ahead of a kernel loop
+    /// are re-planned as a fusion of their own, and the two activation loops after them fuse into a
+    /// body that is itself a kernel's shape (one `wukong_vmath_f32` call per statement), so both
+    /// activations still dispatch.
+    #[test]
+    fn fusion_cuts_before_a_kernel_member_and_keeps_kernel_shaped_fusions() {
+        let calls = callees(
+            "fn k(mut a: [f32; 4096], mut b: [f32; 4096], mut c: [f32; 4096], x: [f32; 4096]) {
+                for i in 0..4096 { a[i] = x[i] * x[i] + b[i]; }
+                for i in 0..4096 { b[i] = a[i] - x[i] * c[i]; }
+                for i in 0..4096 { c[i] = tanh(x[i]); }
+                for i in 0..4096 { a[i] = exp(x[i]); }
+            }",
+            "k",
+        );
+        let vmath = calls.iter().filter(|c| *c == "wukong_vmath_f32").count();
+        assert_eq!(vmath, 2, "calls {calls:?}");
     }
 }

@@ -5854,8 +5854,10 @@ impl FnLowerer<'_> {
     /// concatenated body the vectorizer accepts, lower them as a single fused loop and return how
     /// many statements were consumed. The vectorizer's "no written array touched at a second index"
     /// rule, applied to the fused body, is exactly the condition that makes fusion dependence-safe,
-    /// so a successful check both authorizes and SIMD-accelerates the fusion. Returns `None`
-    /// otherwise (and the caller lowers the first statement normally).
+    /// so a successful check both authorizes and SIMD-accelerates the fusion. The run stops short of
+    /// a loop an elementwise kernel would claim alone, unless the fused body is itself a kernel's
+    /// shape (`kernel_preserving_prefix`). Returns `None` otherwise (and the caller lowers the first
+    /// statement normally).
     fn try_fuse_run(&mut self, stmts: &[Stmt]) -> Option<usize> {
         let (pat0, iter0, _) = fusable_for(&stmts[0])?;
         let var = match &pat0.kind {
@@ -5900,8 +5902,10 @@ impl FnLowerer<'_> {
             run > 16 || m == self.fusable_prefix_reference(&stmts[..run], var),
             "fusion planner disagrees with the reference search"
         );
-        let m = m?;
-        let fused = fuse_for_bodies(&stmts[..m]);
+        // A member loop an elementwise kernel would claim on its own is not fused into a body no
+        // kernel claims (`fuse.rs`): the kernel is wider than the fused 128-bit loop, and in a
+        // `@parallel` function it is the multicore one.
+        let (m, fused) = self.kernel_preserving_prefix(&stmts[..run], var, m?)?;
         self.lower_for(None, pat0, iter0, &fused, &[]);
         Some(m)
     }
