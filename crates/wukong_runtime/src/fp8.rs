@@ -8,9 +8,11 @@
 //!
 //! These are the **reference** conversions. The language's `f8e4m3_to_f32` / `f32_to_f8e4m3` /
 //! `f8e5m2_to_f32` / `f32_to_f8e5m2` builtins do not call them — `wukong_mir_build` lowers each to
-//! plain integer MIR on the `f32` bit pattern, so the conversions vectorize and agree bit-for-bit on
-//! every backend by construction — and `wukong_interp`'s `fp8_builtins_match_the_runtime_reference`
-//! pins that lowering to these functions on all 256 codes and on every rounding boundary. They are
+//! plain integer MIR on the `f32` bit pattern, so the conversions agree bit-for-bit on every
+//! backend by construction (they use right shifts, which the loop vectorizer does not widen, so a
+//! conversion loop stays scalar) — and `wukong_codegen_cranelift`'s
+//! `fp8_builtins_match_the_runtime_reference` pins that lowering, on the interpreter and on native,
+//! to these functions on all 256 codes and on every rounding boundary. They are
 //! written differently on purpose: decoding by the formula `±2^(e−bias)·(1 + m/2ᵖ)`, encoding by
 //! exact `f64` scaling and an explicit round-half-to-even, then a table lookup of the code.
 //!

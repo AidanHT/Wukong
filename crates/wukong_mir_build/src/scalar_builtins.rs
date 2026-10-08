@@ -5,7 +5,9 @@
 //! **Plain MIR, by design.** Everything but four bit counts and three special functions is built
 //! from compares, selects, shifts, masks, `bitcast`s and adds — so it needs no backend support and
 //! the interpreter and every backend agree bit-for-bit by construction (the MIR loop vectorizer
-//! treats it as ordinary arithmetic). `popcount`/`clz`/`ctz`/`bswap` are one [`Op::IntUnary`] each
+//! sees ordinary ops, but it does not widen a right shift, so a loop using a shift-based builtin —
+//! `rotl`/`rotr`, `mulhi`, the f16/bf16 and FP8 bit conversions — stays scalar).
+//! `popcount`/`clz`/`ctz`/`bswap` are one [`Op::IntUnary`] each
 //! (one machine instruction; scalar only, so the vectorizer declines a loop containing one), and
 //! `erfc`/`erfinv`/`lgamma` are one call of the double-precision library (`wukong_rt_math_f64`
 //! with an `M64_*` code — every precision computes in `f64` and rounds once).
