@@ -88,7 +88,13 @@ impl FnLowerer<'_> {
                 .builder
                 .build(MirType::I64, Op::ConstInt(0, MirType::I64));
             let e = self.lower_range_bound(end, &ity, signed);
-            return self.try_vectorize_ranged(j, zero, e, &MirType::I64, body, false);
+            // Same compile-time trip rule as `try_vectorize_for`: a literal end lets the 256-bit
+            // paths decide on size statically; a runtime end stays `None` and is decided at run time.
+            let known_trip = match (self.const_usize_expr(start), self.const_usize_expr(end)) {
+                (Some(a), Some(b)) if b >= a => Some(u64::from(b - a)),
+                _ => None,
+            };
+            return self.try_vectorize_ranged(j, zero, e, &MirType::I64, body, false, known_trip);
         }
         // A run-time test needs a second, recognizer-free lowering of the loop as the fallback; that
         // lowering re-enters `lower_for` with recognition off, which is also what keeps this arm
