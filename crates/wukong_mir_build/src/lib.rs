@@ -5355,10 +5355,17 @@ impl FnLowerer<'_> {
             _ => return None,
         };
         let (start0, end0) = range_bounds(iter0)?;
-        // Maximal run of for-loops over the identical (var, start, end).
+        // Maximal run of for-loops over the identical (var, start, end). The run ends at a
+        // `@generic` loop: the fused body is lowered with recognition on, so fusing one would hand
+        // its body to the elementwise recognizers. `lower_block` keeps fusion off only when such a
+        // loop is within `dispatch.rs`'s window horizon, and a run has no length bound.
+        if dispatch::has_generic(&stmts[0].attrs, self.interner) {
+            return None;
+        }
         let mut run = 1;
         while run < stmts.len() {
             match fusable_for(&stmts[run]) {
+                Some(_) if dispatch::has_generic(&stmts[run].attrs, self.interner) => break,
                 Some((p, it, _)) => {
                     let same = matches!(&p.kind, ast::PatKind::Ident(s) if *s == var)
                         && range_bounds(it).is_some_and(|(s, e)| {
