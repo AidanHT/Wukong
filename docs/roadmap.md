@@ -863,8 +863,9 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   more, a *reduction* at a trip ≥ 2048 (statically or by a run-time trip test); the recognized
   kernels get 256-bit AVX2 via the runtime microkernels.)
 - **Attributes:** sema validates the closed set `@parallel`, `@generic`, `@tile`, `@extern`,
-  `@inline`, `@simd`, `@align`, and `@export`; unknown names and restricted-placement violations
-  report `E0306`. Name acceptance does not promise execution: general `@simd`/`@align`/`@export`
+  `@noalias`, `@inline`, `@simd`, `@align`, and `@export`; unknown names and restricted-placement
+  violations report `E0306`. `@noalias` (parameter-only) is consumed end to end — see the alias
+  bullet below. Name acceptance does not promise execution: general `@simd`/`@align`/`@export`
   behavior and C ABI interop remain incomplete. `@parallel` executes, though its scheduling
   arguments are not consumed; `@generic` opts out of recognizers. `@tile` performs loop
   strip-mining and reports `E0309` when it cannot apply. Malformed attribute syntax reports `E0207`.
@@ -984,8 +985,16 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   do not imply non-aliasing. `parallel_dependence.wk` checks the shifted in-place recurrence
   that previously returned the same wrong answer on both backends after unsafe SIMD lowering.
   Whole-function parallel outlining uses the shared region dependence proof as well.
-  The MIR alias analysis remains conservative for parameters. Distinct local allocations and
-  call-site proofs can establish disjointness; the language has no general `restrict` promise.
+  The MIR alias analysis is conservative for parameters unless the source promises otherwise:
+  `@noalias` on a parameter (C's `restrict`) makes it disjoint from every other parameter, gives a
+  promised slice's elements their own provenance, and — when nothing derived from it escapes — keeps
+  it apart from untracked pointers and callees. The loop dependence test, the vectorizer's runtime
+  alias guard, Cranelift's alias regions (Heap/Table) and pure fat-pointer loads, the LLVM IR
+  (`ptr noalias`), the GEMM-class recognizers (array/static-tensor parameters only) and the
+  `@parallel` region outliner all consume it. Sema rejects provably aliased call sites and re-pointing
+  a promised view parameter (`E0316`); an unprovable violation is undefined, as in C. Without the
+  attribute nothing changes: distinct local allocations and call-site proofs remain the only
+  disjointness facts.
   This repair does not establish safe dispatch for every runtime recognizer. Remaining family
   coverage and oracle-marshalling gaps are listed in the
   [closeout checklist](sota-campaign-2026-09/CLOSEOUT-CHECKLIST.md).
@@ -1064,13 +1073,16 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   slot accessed at a width other than its own stay in memory (the interpreter and `cse`/`dse` handle
   those directly); a loop-invariant cell of one that a loop both reads and writes is still carried in
   a register by `promote` when nothing else in the loop may alias it.
-- A **`[]T` slice parameter still re-loads its data pointer at every element access.** A slice is a
-  16-byte `{ data, len }` fat pointer passed *by address*, so the base comes from
-  `load ptr (gep <param>, 0)` — a load out of caller-owned memory, not out of a local slot — and
-  `mem2reg` has nothing to promote. `licm` now hoists a loop-invariant load through a parameter when
-  it runs on every iteration (behind a first-iteration guard) and no store in the loop may alias it,
-  so a read-only slice loop reads its base once; a loop that writes through any other loaded pointer
-  still reloads, and removing that needs a `noalias` fact about the fat pointer.
+- A **`[]T` slice parameter still re-loads its data pointer at every element access** unless it is
+  `@noalias` or the loop only reads. A slice is a 16-byte `{ data, len }` fat pointer passed *by
+  address*, so the base comes from `load ptr (gep <param>, 0)` — a load out of caller-owned memory,
+  not out of a local slot — and `mem2reg` has nothing to promote. For a `@noalias` slice whose fat
+  pointer the function never writes or publishes, `licm` hoists that load (the header is a live
+  16-byte object for the whole call, and no store in the loop can reach it) and Cranelift marks it
+  `readonly` + `can_move`. For an unpromised slice `licm` hoists the load only when it runs on every
+  iteration (behind a first-iteration guard) and no store in the loop may alias it, so a read-only
+  slice loop reads its base once; a loop that writes through any other loaded pointer still reloads,
+  because another parameter may alias its header.
 - **String literals live in a read-only static-data section** (`.rodata`), referenced by address via
   `Op::GlobalAddr` and deduped by content (one blob per unique literal). So **returning or threading a
   `*u8`** that points at a literal created inside a callee is valid — the pointer outlives the frame,

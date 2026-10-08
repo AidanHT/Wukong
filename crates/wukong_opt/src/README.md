@@ -21,7 +21,7 @@
 | `vectorize.rs` | `Vectorize` — 128-bit SIMD widening with scalar epilogue; constant `i16`/`i32` left shifts use wrapping multiply |
 | `inline.rs` | `inline_program` — bottom-up call-graph SCC inlining with per-site growth budgets |
 | `unroll.rs` | `unroll_program` — partial loop unrolling at `-O2`+ |
-| `alias.rs` | `AliasInfo`, `Prov` — provenance for load/store disambiguation |
+| `alias.rs` | `AliasInfo`, `Prov` — provenance for load/store disambiguation, plus the `@noalias` parameter facts (`promised_storage`, `is_invariant_slice_header`, `promised_disjoint_bases`) |
 | `loop_info.rs` | Natural-loop analysis (induction vars, trip counts, dependences) |
 | `fxhash.rs` | `FxHashMap`/`FxHashSet` — crate-internal fixed-seed hasher |
 

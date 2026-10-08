@@ -435,19 +435,30 @@ and disjoint constant byte intervals off one base (`may_alias_sized`). "Non-esca
 literally — the address may appear only as the pointer operand of a `gep`/`load`/`store`, and any
 other use publishes it.
 
-**Two distinct pointer parameters may alias.** Wukong makes no promise otherwise: nothing rejects
-`f(a, a)`, and there is no `restrict`/`&mut` annotation to carry a promise, so the analysis returns
-"may alias" and `tests/run/alias_slice_params.wk` pins the behaviour that depends on it. This is the
-single biggest fact the optimizer is missing, and closing it is a **language** decision, not an
-analysis one — see the roadmap.
+**Two distinct pointer parameters may alias — unless the source promised otherwise.** For an
+ordinary parameter nothing rejects `f(a, a)`, so the analysis returns "may alias" and
+`tests/run/alias_slice_params.wk` pins the behaviour that depends on it. The language decision that
+closes the gap is the `@noalias` parameter attribute (C's `restrict`): `wukong_sema::noalias` rejects
+the call sites and re-pointings that provably break it (`E0316`), `wukong_mir_build` records it as
+`wukong_mir::ParamAttrs` on the MIR parameter (printed `noalias`), and `AliasInfo` then answers
+"disjoint" for a promised parameter against every other parameter, gives a promised slice's elements
+their own provenance (`Prov::ParamData`, demoted if the fat pointer is ever written or published), and
+— when nothing derived from the parameter escapes — keeps its storage apart from untracked pointers
+and callees (`promised_storage`, `is_call_proof`). The loop dependence test and the vectorizer's
+runtime alias guard ask `promised_disjoint_bases`; Cranelift maps promised storage to its own alias
+regions (`Heap` written, `Table` read-only) and marks an invariant promised fat-pointer load
+`readonly + can_move`; the LLVM emitter writes `ptr noalias`. Every one of these facts is gated on a
+promise: a function without one builds no per-parameter table and analyzes exactly as before.
 
 `is_dereferenceable(ptr, bytes)` is a separate question that only a *speculating* transform asks: may
-this access run on a path the program might not have taken? It is true only for a known in-bounds
+this access run on a path the program might not have taken? It is true for a known in-bounds
 offset into an `alloca` of this function, which is live for the whole function and default-initialized
-by both backends. That is what lets `Licm` hoist a loop-invariant load out of a possibly-zero-trip
-loop for a local `[]T`/struct/tuple unconditionally. Through a parameter it needs more: the load must
-run on every iteration, and it is then read through `select(first_test, addr, dummy)` so the
-preheader never touches the parameter's memory on an entry that would not have.
+by both backends, and for an offset inside the 16-byte fat pointer of a `@noalias` slice parameter,
+which the caller keeps alive for the whole call. That is what lets `Licm` hoist a loop-invariant load
+out of a possibly-zero-trip loop for a local `[]T`/struct/tuple or a promised slice's `data` field
+unconditionally. Through any other parameter it needs more: the load must run on every iteration, and
+it is then read through `select(first_test, addr, dummy)` so the preheader never touches the
+parameter's memory on an entry that would not have.
 
 Two more folds are refused for the same `-O0` ≡ `-O{1,2,3}` reason. A bf16/f16 constant is never
 folded — arithmetic or comparison — because the folder rounds to the f32 grid while the backends round

@@ -2863,6 +2863,7 @@ mod verify_gate_tests {
             value_types: vec![MirType::I32],
             entry: BlockId(0),
             vec_kernels: Vec::new(),
+            param_attrs: Vec::new(),
         };
         Program {
             funcs: vec![f],

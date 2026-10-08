@@ -28,6 +28,7 @@
 
 mod alias;
 mod canon;
+mod noalias;
 mod tile;
 mod tindex;
 
@@ -2331,6 +2332,7 @@ fn parallel_spec<'a>(
         let base = proof.builder.add_param(MirType::Ptr);
         proof.param_arrays.push((base, ty.clone()));
         proof.bind(p.name.sym, base, mir_ty(ty));
+        noalias::record_param(&mut proof.builder, p, ty, base, interner);
     }
     // The mixed-radix proof needs a known iteration domain. An unknown bound conservatively
     // retains serial execution; it must never be guessed from the array's storage extent.
@@ -2555,6 +2557,8 @@ fn lower_fn(
         if ty_is_buffer_param(pty) {
             fl.param_arrays.push((val, pty.clone()));
         }
+        // A `@noalias` promise rides on the MIR parameter (`noalias.rs`).
+        noalias::record_param(&mut fl.builder, p, pty, val, interner);
         // A statically-shaped contiguous tensor param binds as the buffer it *is* — `[T; d0·…·dn]` —
         // not as an opaque `Ptr`. Both spellings arrive as the same base pointer (`param_abi` maps
         // `Array(..)` back to `Ptr`, so the ABI is byte-identical), but only the `Array` form takes
@@ -9751,21 +9755,29 @@ impl FnLowerer<'_> {
     ///
     /// Callers that are allowed *one* aliasing pair (a kernel documenting `dx` may alias `dy`) pass
     /// only the pairs that must be disjoint.
+    ///
+    /// A fourth fact settles a pair the call-site bit cannot: a `@noalias` promise between two
+    /// parameters ([`Self::promised_disjoint`]). The source states it and sema rejects the call
+    /// sites that provably break it, so it holds whatever the rest of the program does.
     fn provably_disjoint(&self, a: Symbol, b: Symbol) -> bool {
         self.all_provably_disjoint(&[a, b])
     }
 
     /// The N-operand form of [`Self::provably_disjoint`]; see there for the whole argument.
     fn all_provably_disjoint(&self, syms: &[Symbol]) -> bool {
-        if !self.gemm.alias_free {
-            return false;
-        }
         for (i, a) in syms.iter().enumerate() {
             if syms[i + 1..].contains(a) {
                 return false;
             }
         }
-        true
+        if self.gemm.alias_free {
+            return true;
+        }
+        syms.len() >= 2
+            && syms
+                .iter()
+                .enumerate()
+                .all(|(i, a)| syms[i + 1..].iter().all(|b| self.promised_disjoint(*a, *b)))
     }
 
     /// [`Self::kernel_base_ptrs`] for a kernel whose operands must be mutually disjoint: resolves
@@ -13272,9 +13284,11 @@ impl FnLowerer<'_> {
     //    cross-iteration scheduling differs, and iterations never overlap writes, so serial ==
     //    parallel bit-for-bit and the interpreter (sequential `[0, N)`) == native (chunks).
     //  * Captured array storage must be a fresh alloca or a scalar-element array parameter.
-    //    Names with the same MIR base, and same-typed parameters that the caller could alias, are
-    //    proved as ONE buffer over the union of their accesses. Derived pointers and aggregate
-    //    parameters decline because their overlapping subobjects need an offset-aware proof.
+    //    Names with the same MIR base, and parameters over the same element scalar that the caller
+    //    could alias (whatever their declared lengths), are proved as ONE buffer over the union of
+    //    their accesses — unless a `@noalias` promise separates the pair. Derived pointers and
+    //    aggregate parameters decline because their overlapping subobjects need an offset-aware
+    //    proof.
     //
     // Autodiff note: a function containing a region tapes to an `Op::Call` of
     // `wukong_parallel_for` (a void call with no VJP rule), so `--emit=grad`/`--train` over such a
@@ -13342,9 +13356,12 @@ impl FnLowerer<'_> {
             self.prove_region_slices(hh, n, &accs.iter().collect::<Vec<_>>())?;
         }
         // Prove the union for aliases of one MIR base, including aggregate match bindings, and
-        // for same-typed parameters that the caller may bind to one array. `region_capture` only
-        // admits direct scalar-element array parameters or fresh allocas: derived pointers and
-        // aggregate parameters could overlap at different offsets or element sizes and decline.
+        // for parameters that the caller may bind to one array. "May" is decided by storage class,
+        // not by `Ty` equality (P1.20): a declared length is no evidence that two array parameters
+        // are different buffers, so every parameter over the same element scalar joins the group —
+        // unless a `@noalias` promise separates the two (`noalias.rs`). `region_capture` only admits
+        // direct scalar-element array parameters or fresh allocas: derived pointers and aggregate
+        // parameters could overlap at different offsets or element sizes and decline.
         for arr in &sc.written {
             let (base, _) = self.lookup(*arr)?;
             let wty = self.buffer_param_ty(*arr);
@@ -13353,7 +13370,10 @@ impl FnLowerer<'_> {
                 .iter()
                 .filter(|c| {
                     self.lookup(**c).is_some_and(|(other, _)| other == base)
-                        || (wty.is_some() && self.buffer_param_ty(**c) == wty)
+                        || (wty.is_some_and(|w| {
+                            self.buffer_param_ty(**c)
+                                .is_some_and(|t| noalias::could_share_storage(w, t))
+                        }) && !self.promised_disjoint(*arr, **c))
                 })
                 .filter_map(|c| sc.accesses.get(c))
                 .collect();

@@ -1799,6 +1799,8 @@ fn dependence(ctx: &LoopCtx<'_>, l: &NaturalLoop, accesses: &[MemAccess]) -> Dep
     }
     let mut needs_runtime_check = false;
     let mut reloaded_base = false;
+    // Built at most once, and only for a function with a `@noalias` parameter (`alias.rs`).
+    let mut promised = crate::alias::PromisedBases::new(ctx.f);
     for (i, a) in accesses.iter().enumerate() {
         for b in &accesses[i + 1..] {
             if a.kind == AccessKind::Load && b.kind == AccessKind::Load {
@@ -1836,7 +1838,8 @@ fn dependence(ctx: &LoopCtx<'_>, l: &NaturalLoop, accesses: &[MemAccess]) -> Dep
                 }
                 continue;
             }
-            if distinct_allocas(ctx, ba, bb) {
+            // Distinct slots, or storage a `@noalias` parameter promised apart (`alias.rs`).
+            if distinct_allocas(ctx, ba, bb) || promised.disjoint(ba, bb) {
                 continue;
             }
             needs_runtime_check = true;
@@ -2374,6 +2377,7 @@ mod tests {
             value_types,
             entry: BlockId(0),
             vec_kernels: Vec::new(),
+            param_attrs: Vec::new(),
         }
     }
 

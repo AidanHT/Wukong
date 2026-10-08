@@ -436,10 +436,21 @@ fn emit_function(
         }
     }
 
+    // A `@noalias` parameter is LLVM's `noalias` argument attribute verbatim: for the duration of
+    // the call, memory reached through it is not reached through any pointer not based on it. The
+    // attribute is only legal on a pointer, which every promised (buffer) parameter is.
     let params: Vec<String> = f
         .params
         .iter()
-        .map(|p| format!("{} %v{}", llvm_ty(f.value_type(*p)), p.0))
+        .enumerate()
+        .map(|(i, p)| {
+            let attr = if f.param_attr(i).noalias && *f.value_type(*p) == MirType::Ptr {
+                " noalias"
+            } else {
+                ""
+            };
+            format!("{}{} %v{}", llvm_ty(f.value_type(*p)), attr, p.0)
+        })
         .collect();
     let _ = writeln!(
         out,
@@ -1108,5 +1119,19 @@ mod tests {
             !out.contains("alloca"),
             "scalars should be promoted:\n{out}"
         );
+    }
+
+    /// A `@noalias` parameter is LLVM's `noalias` argument attribute, on that parameter only.
+    #[test]
+    fn a_promised_parameter_is_emitted_noalias() {
+        let out = ir(
+            "fn k(@noalias mut o: [f32; 4], x: [f32; 4]) { o[0] = x[0]; } \
+             fn main() -> i32 { return 0; }",
+        );
+        assert!(
+            out.contains("define void @k(ptr noalias %v0, ptr %v1)"),
+            "{out}"
+        );
+        assert_eq!(out.matches("noalias").count(), 1, "{out}");
     }
 }

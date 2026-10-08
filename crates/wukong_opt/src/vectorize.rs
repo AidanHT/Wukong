@@ -1770,6 +1770,8 @@ fn plan_guards(
             .all(|p| p[0].g.lo == p[1].g.lo && p[0].g.terms == p[1].g.terms);
 
     let mut guards = Vec::new();
+    // Built at most once, and only for a function with a `@noalias` parameter (`alias.rs`).
+    let mut promised = crate::alias::PromisedBases::new(f);
     for i in 0..bases.len() {
         for j in i + 1..bases.len() {
             let (ga, gb) = (&bases[i], &bases[j]);
@@ -1784,7 +1786,12 @@ fn plan_guards(
             if ga.g.base.same_object(gb.g.base) {
                 return None;
             }
-            if distinct_alloca_pair(f, ga.g.base, gb.g.base) {
+            // Provably distinct objects need no range test: two slots, or storage a `@noalias`
+            // parameter promised apart (`alias.rs`) — which also spares a pair whose index the
+            // guard could not have expressed.
+            if distinct_alloca_pair(f, ga.g.base, gb.g.base)
+                || promised.disjoint(ga.g.base, gb.g.base)
+            {
                 continue;
             }
             // The whole group's index must be `1·iv + invariants + k` for the touched range to be

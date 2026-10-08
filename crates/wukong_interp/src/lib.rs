@@ -5230,6 +5230,7 @@ mod tests {
             value_types: vec![MirType::I32, MirType::Vec(Box::new(MirType::I32), 4)],
             entry: BlockId(0),
             vec_kernels: Vec::new(),
+            param_attrs: Vec::new(),
         };
         let mut program = Program::new();
         program.funcs.push(f);

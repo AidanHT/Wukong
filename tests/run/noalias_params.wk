@@ -1,0 +1,229 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 2
+// EXPECT-OUT: 9
+// EXPECT-OUT: 13
+// EXPECT-OUT: 17
+// EXPECT-OUT: 15
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 99
+// EXPECT-OUT: 11
+// EXPECT-OUT: 21
+// EXPECT-OUT: 31
+// EXPECT-OUT: 41
+// EXPECT-OUT: 21
+// EXPECT-OUT: 41
+// EXPECT-OUT: 61
+// EXPECT-OUT: 81
+// EXPECT-OUT: 14
+// EXPECT-OUT: 20
+// EXPECT-OUT: 26
+// EXPECT-OUT: 32
+// EXPECT-OUT: 20
+// EXPECT-OUT: 30
+// EXPECT-OUT: 40
+// EXPECT-OUT: 50
+// EXPECT-OUT: 26
+// EXPECT-OUT: 40
+// EXPECT-OUT: 54
+// EXPECT-OUT: 68
+// EXPECT-OUT: 32
+// EXPECT-OUT: 50
+// EXPECT-OUT: 68
+// EXPECT-OUT: 86
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+module tests.run.noalias_params
+
+// `@noalias` on a parameter is C's `restrict`: for the duration of a call, the storage it points
+// into is reached only through it. Every consumer of the promise is exercised here — the alias
+// analysis (CSE/LICM/DSE and the loop dependence test), the vectorizer's runtime alias guard, the
+// Cranelift alias regions and the pure fat-pointer loads, the kernel recognizers' disjointness guard,
+// and the `@parallel` region outliner — and every call site KEEPS the promise, so the program has
+// exactly one meaning: the interpreter's, at every -O level and on both backends.
+//
+// Every value is the scalar meaning of the source, derived by hand (never read back from the
+// compiler) and printed lane by lane, never as a sum. All arithmetic is on small integers or
+// multiples of 0.5, exact in f32, so FMA contraction cannot move a result.
+
+// 1) The general path (`@generic` keeps the recognizers out): the store to `y[i]` cannot change
+//    `x`, so the loop needs no runtime alias check. y = 8,7,..,1 ; x = 1,..,8 ; a = 2
+//    -> y[i] = (8 - i) + 2 * (i + 1) = 10 + i  ->  10 .. 17
+@generic
+fn axpy(@noalias mut y: [f32; 8], x: [f32; 8], a: f32) {
+    for i in 0..8 {
+        y[i] = y[i] + a * x[i];
+    }
+}
+
+// 2) The promise separates `out` from `x`, but never `out` from itself: the read of `out[i - 1]`
+//    sees the store of the previous iteration, a loop-carried dependence nothing may break.
+//    x = 1..6, out = 0:
+//      i=1: out[1] = 1+2+3 = 6,   out[0] = 0 + 2  = 2
+//      i=2: out[2] = 2+3+4 = 9,   out[1] = 6 + 3  = 9
+//      i=3: out[3] = 3+4+5 = 12,  out[2] = 9 + 4  = 13
+//      i=4: out[4] = 4+5+6 = 15,  out[3] = 12 + 5 = 17
+//    -> 2 9 13 17 15 0
+fn stencil(@noalias mut out: []f32, x: []f32, n: i64) {
+    let mut i: i64 = 1i64;
+    while i < n - 1i64 {
+        out[i] = x[i - 1i64] + x[i] + x[i + 1i64];
+        out[i - 1i64] = out[i - 1i64] + x[i];
+        i = i + 1i64;
+    }
+}
+
+// 3) A promised slice whose fat pointer nothing writes: its data-pointer load may leave the loop,
+//    including a loop that trips zero times (the fat pointer is the caller's live object, so the
+//    early read is safe). s[i] = i * 0.5 -> printed doubled: 0 .. 7; then a zero-trip call on an
+//    empty heap slice, after which 99 is printed.
+fn ramp(@noalias mut s: []f32, n: i64) {
+    let mut i: i64 = 0i64;
+    while i < n {
+        s[i] = (i as f32) * 0.5;
+        i = i + 1i64;
+    }
+}
+
+// 4) A call inside the loop cannot reach promised storage nothing passed it, but the print must
+//    still observe every update in order. acc = 1,1,1,1 ; x = 10,20,30,40
+//    first call  -> 11 21 31 41 ; second call -> 21 41 61 81
+fn accumulate(@noalias mut acc: [i32; 4], x: [i32; 4]) {
+    for i in 0..4 {
+        acc[i] = acc[i] + x[i];
+        print(acc[i]);
+    }
+}
+
+// 5) A recognized GEMM whose A and B may legitimately be ONE buffer (`go(x, x, z)` squares x), so
+//    the whole-program call-site fact says "may alias" for this function — but `c` is promised,
+//    which is all the kernel needs (it writes C while reading A and B). A[i][k] = i + k:
+//    C[i][j] = sum_k (i+k)(k+j):
+//      14 20 26 32 / 20 30 40 50 / 26 40 54 68 / 32 50 68 86
+fn mm(a: [f32; 16], b: [f32; 16], @noalias mut c: [f32; 16]) {
+    for i in 0..4 {
+        for j in 0..4 {
+            let mut s: f32 = 0.0;
+            for k in 0..4 {
+                s = s + a[i * 4 + k] * b[k * 4 + j];
+            }
+            c[i * 4 + j] = s;
+        }
+    }
+}
+
+fn go(p: [f32; 16], q: [f32; 16], mut r: [f32; 16]) {
+    mm(p, q, r);
+}
+
+// 6) A `@parallel` region the outliner may thread only because `out` is promised apart from `w`:
+//    the gather index `ids[t]` carries no region digit, so without the promise the two parameters
+//    would have to be proved as one buffer and the region would stay serial
+//    (`tests/run/parallel_region_alias.wk` is that unpromised spelling). w[i] = i ;
+//    ids[t] = (3t + 1) % 8 = 1 4 7 2 5 0 3 6 ; out[2t + d] = w[2 ids[t] + d] = 2 ids[t] + d
+//    -> 2 3 8 9 14 15 4 5 10 11 0 1 6 7 12 13
+@generic
+@parallel
+fn gather(w: [f32; 16], @noalias mut out: [f32; 16], ids: [i32; 8]) {
+    let mut guard: i32 = 0;
+    guard = guard + 1;
+    for t in 0..8 {
+        for d in 0..2 {
+            out[t * 2 + d] = w[ids[t] * 2 + d];
+        }
+    }
+}
+
+fn main() -> i32 {
+    // 1)
+    let mut y: [f32; 8] = [8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0];
+    let x: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+    axpy(y, x, 2.0);
+    for i in 0..8 {
+        print(y[i] as i32);
+    }
+
+    // 2)
+    let mut o6: [f32; 6] = [0.0; 6];
+    let x6: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    stencil(o6, x6, 6i64);
+    for i in 0..6 {
+        print(o6[i] as i32);
+    }
+
+    // 3)
+    let mut r: [f32; 8] = [0.0; 8];
+    ramp(r, 8i64);
+    for i in 0..8 {
+        print((r[i] * 2.0) as i32);
+    }
+    let mut empty: []f32 = alloc_f32(0i64);
+    ramp(empty, 0i64);
+    free(empty);
+    print(99);
+
+    // 4)
+    let mut acc: [i32; 4] = [1, 1, 1, 1];
+    let xs: [i32; 4] = [10, 20, 30, 40];
+    accumulate(acc, xs);
+    accumulate(acc, xs);
+
+    // 5)
+    let mut m: [f32; 16] = [0.0; 16];
+    for i in 0..4 {
+        for k in 0..4 {
+            m[i * 4 + k] = (i + k) as f32;
+        }
+    }
+    let mut z: [f32; 16] = [0.0; 16];
+    go(m, m, z);
+    for i in 0..16 {
+        print(z[i] as i32);
+    }
+
+    // 6)
+    let mut ids: [i32; 8] = [0; 8];
+    for t in 0..8 {
+        ids[t] = ((t * 3 + 1) % 8) as i32;
+    }
+    let mut w: [f32; 16] = [0.0; 16];
+    for i in 0..16 {
+        w[i] = i as f32;
+    }
+    let mut out: [f32; 16] = [0.0; 16];
+    gather(w, out, ids);
+    for i in 0..16 {
+        print(out[i] as i32);
+    }
+    return 0;
+}

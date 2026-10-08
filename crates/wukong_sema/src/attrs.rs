@@ -5,10 +5,11 @@
 //! discarded* — so `@parellel` (a typo of `@parallel`) compiled to a single-threaded program with no
 //! diagnostic at all, which is exactly the failure mode an attribute is supposed to prevent.
 //!
-//! The set below is closed on purpose. `parallel`, `generic`, `tile` and `extern` are the four the
-//! language intends to consume; `inline`, `simd`, `align` and `export` are parsed-and-discarded
-//! today and stay in the set so existing programs keep compiling. Anything else is an error, which
-//! also means a future attribute cannot be *used* before it is *implemented*.
+//! The set below is closed on purpose. `parallel`, `generic`, `tile`, `extern` and `noalias` are
+//! the five the language intends to consume; `inline`, `simd`, `align` and `export` are
+//! parsed-and-discarded today and stay in the set so existing programs keep compiling. Anything
+//! else is an error, which also means a future attribute cannot be *used* before it is
+//! *implemented*.
 //!
 //! Placement is checked here too, but only where a misplaced attribute would be a silent lie.
 //! `@generic` (suppress the kernel recognizers for one function, see `wukong_mir_build`) is read
@@ -16,8 +17,9 @@
 //! nothing implements. `@tile` is read from the function item (into a width queue) or from the
 //! `for` statement it sits on, and from nowhere else — so on a `struct`, a parameter, a `let` or a
 //! `while` it used to be accepted and dropped, a schedule written on a loop being the sharpest of
-//! those. Every other attribute's placement is unchecked in v1 — the ones that are discarded are
-//! discarded wherever they appear.
+//! those. `@noalias` is a promise about one parameter's storage (see `crate::noalias`), so it is
+//! legal on a parameter and nowhere else, and takes no arguments. Every other attribute's placement
+//! is unchecked in v1 — the ones that are discarded are discarded wherever they appear.
 //!
 //! This walk is independent of name resolution and types (an attribute names no value), so
 //! [`check`] runs before the collection pass and reports every offending attribute in one go.
@@ -26,10 +28,10 @@ use wukong_ast::{Attr, Block, Expr, ExprKind, ForIter, Item, ItemKind, Module, S
 use wukong_diag::Diagnostic;
 use wukong_span::Interner;
 
-/// Every attribute name the v1 language accepts, in the order the diagnostic lists them: the four
+/// Every attribute name the v1 language accepts, in the order the diagnostic lists them: the five
 /// that are (or are being) consumed first, then the four that are parsed and discarded.
 pub const KNOWN_ATTRS: &[&str] = &[
-    "parallel", "generic", "tile", "extern", "inline", "simd", "align", "export",
+    "parallel", "generic", "tile", "extern", "noalias", "inline", "simd", "align", "export",
 ];
 
 /// Attributes that are read from a function item and therefore mean nothing anywhere else.
@@ -39,6 +41,10 @@ const FN_ITEM_ONLY: &[&str] = &["generic"];
 /// else. `@tile` is a loop schedule: `lower_program_with` reads it off the `fn` into a width queue
 /// and `lower_for` reads it off the loop. In every other position nothing reads it at all.
 const FN_ITEM_OR_FOR: &[&str] = &["tile"];
+
+/// Attributes that describe one function parameter and mean nothing anywhere else. `@noalias` is the
+/// parameter's storage promise; `wukong_mir_build` reads it off the parameter it is written on.
+const PARAM_ONLY: &[&str] = &[crate::noalias::NOALIAS_ATTR];
 
 /// Is `name` (the bare attribute name, without the `@`) part of the v1 known set?
 pub fn is_known(name: &str) -> bool {
@@ -126,6 +132,29 @@ fn check_attr(a: &Attr, place: Place, interner: &Interner, diags: &mut Vec<Diagn
             .primary(a.span, "only a `fn` item may carry this attribute")
             .help(format!("move `@{name}` onto the enclosing `fn`")),
         );
+        return;
+    }
+    if PARAM_ONLY.contains(&name) {
+        if place != Place::Param {
+            diags.push(
+                Diagnostic::error(format!(
+                    "attribute `@{name}` is not valid on {}",
+                    place.what()
+                ))
+                .with_code("E0306")
+                .primary(a.span, "only a function parameter may carry this attribute")
+                .help(format!(
+                    "write `@{name}` before the parameter it describes: `fn f(@{name} mut out: []f32)`"
+                )),
+            );
+        } else if !a.args.is_empty() {
+            diags.push(
+                Diagnostic::error(format!("attribute `@{name}` takes no arguments"))
+                    .with_code("E0306")
+                    .primary(a.span, "the promise has no parameters of its own")
+                    .help(format!("write the bare `@{name}`")),
+            );
+        }
         return;
     }
     if !matches!(place, Place::FnItem | Place::ForStmt) && FN_ITEM_OR_FOR.contains(&name) {
@@ -291,10 +320,45 @@ mod tests {
 
     #[test]
     fn every_known_attribute_is_accepted_on_a_fn() {
-        for name in KNOWN_ATTRS {
+        for name in KNOWN_ATTRS.iter().filter(|n| !PARAM_ONLY.contains(*n)) {
             let src = format!("@{name}\nfn f() {{ let x: i32 = 1; }}");
             assert_eq!(codes(&src), Vec::<&str>::new(), "@{name} was rejected");
         }
+    }
+
+    /// `@noalias` is a promise about one parameter's storage: legal there (with or without `mut`,
+    /// on every buffer spelling), and nowhere else.
+    #[test]
+    fn noalias_is_accepted_on_a_parameter() {
+        assert_eq!(
+            codes(
+                "fn f(@noalias mut o: [f32; 4], @noalias x: []f32, @noalias p: *f32) { o[0] = 1.0; }"
+            ),
+            Vec::<&str>::new()
+        );
+    }
+
+    #[test]
+    fn noalias_is_rejected_off_a_parameter() {
+        assert_eq!(codes("@noalias\nfn f() {}"), vec!["E0306"], "fn item");
+        assert_eq!(
+            codes("fn f() { @noalias let x: i32 = 1; }"),
+            vec!["E0306"],
+            "statement"
+        );
+        assert_eq!(
+            codes("@noalias\nstruct S { x: i32 }"),
+            vec!["E0306"],
+            "struct item"
+        );
+    }
+
+    #[test]
+    fn noalias_takes_no_arguments() {
+        assert_eq!(
+            codes("fn f(@noalias(strict) mut o: [f32; 4]) { o[0] = 1.0; }"),
+            vec!["E0306"]
+        );
     }
 
     #[test]
