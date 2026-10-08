@@ -21246,7 +21246,7 @@ impl FnLowerer<'_> {
             };
             self.diags.push(
                 Diagnostic::error(format!("literal `{v}` is out of range for `{name}`"))
-                    .with_code("E0401")
+                    .with_code("E0431")
                     .primary(span, "this pattern can never match the scrutinee"),
             );
             return None;
