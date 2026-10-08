@@ -264,12 +264,20 @@ and exactly one `Terminator` (`Ret`, `Br`, `CondBr`, `Switch`, `Unreachable`). `
 branch on an `i8`..`i64` scrutinee whose case values are stored canonically (sign-extended from the
 type's width) and pairwise distinct; only `wukong_opt`'s late switch formation creates one, and the
 verifier, interpreter, Cranelift (`cranelift_frontend::Switch`), textual LLVM (`switch`) and every
-terminator visitor handle it (the `gpu-native` lowering declines it). `Op` has 24 variants: constants
+terminator visitor handle it (the `gpu-native` lowering declines it). `Op` has 27 variants: constants
 (`ConstInt`/`ConstFloat`), `Bin`/`Cmp`/`Cast`, the unary `Neg`/`Not`, `Select`, memory
 (`Alloca`/`Load`/`Store`/`Gep`), `Call`, `Barrier` (cooperative thread-block fence from
 `sync_block()`), the float/SIMD primitives
-(`Splat`/`ExtractLane`/`Iota`/`Fma`/`Sqrt`/`Round`), the address-of ops (`FuncAddr`, `GlobalAddr`),
-and `VecKernelCall`. Of the SIMD three, `Splat` broadcasts one scalar to every lane, `ExtractLane`
+(`Splat`/`ExtractLane`/`Iota`/`Fma`/`Sqrt`/`Round`), the lane-moving SIMD ops
+(`Widen`/`Narrow`/`Shuffle`/`InsertLane`), the address-of ops (`FuncAddr`, `GlobalAddr`), and
+`VecKernelCall`. `Widen` converts one half of a vector's lanes to twice their width (`SExt`/`ZExt`
+/`FpExt`) and `Narrow` joins two vectors into one of half the lane width (truncating, saturating
+signed or unsigned, or `f64 -> f32`) — the two ops that let one loop compute at several lane widths;
+`Shuffle` is a two-source constant lane permutation and `InsertLane` writes one lane. `Bin` has one
+operand-shape exception: a vector **shifted by a scalar** amount of its lane type, masked to the
+lane width exactly as a scalar shift is (the shape every vector ISA's shift takes). All four are pure
+lane maps, so the interpreter and the native backend agree on them bit for bit; `gpu-native`
+scalarizes them. Of the SIMD three, `Splat` broadcasts one scalar to every lane, `ExtractLane`
 reads one lane back out (the only way from vector to scalar form, and what keeps a widened float
 reduction's accumulate serial), and `Iota` is the lane-index ramp `<0, 1, .., n-1>` — the one
 non-uniform vector *source*, since every other op is lane-wise and so any expression over splatted

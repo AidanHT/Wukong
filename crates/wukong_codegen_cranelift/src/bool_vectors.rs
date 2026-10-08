@@ -148,7 +148,122 @@ fn scalarize(f: &mut Function) -> Result<(), String> {
                         }
                         Op::Splat(v) => Op::Cast(CastKind::Bitcast, *v, (**ty).clone()),
                         Op::Iota(_) => Op::ConstInt(k as i128, (**ty).clone()),
-                        Op::Bin(op, a, b) => Op::Bin(*op, lane(*a)?, lane(*b)?),
+                        Op::Bin(op, a, b) => {
+                            // A vector shifted by a scalar reads that one amount in every lane.
+                            let amount = if original_types[b.0 as usize].is_vector() {
+                                lane(*b)?
+                            } else {
+                                *b
+                            };
+                            Op::Bin(*op, lane(*a)?, amount)
+                        }
+                        // The lane-moving ops index their operands' lanes directly: their lane
+                        // counts differ from the result's, which is what `lane` refuses.
+                        Op::Widen { v, half, kind } => {
+                            let first = half.first_lane(2 * *n) as usize;
+                            let src = lanes[v.0 as usize]
+                                .get(first + k)
+                                .copied()
+                                .ok_or("widen reads past its operand's lanes")?;
+                            Op::Cast(*kind, src, (**ty).clone())
+                        }
+                        Op::Narrow { lo, hi, kind } => {
+                            let half = *n as usize / 2;
+                            let src = if k < half {
+                                lanes[lo.0 as usize].get(k)
+                            } else {
+                                lanes[hi.0 as usize].get(k - half)
+                            }
+                            .copied()
+                            .ok_or("narrow reads past its operands' lanes")?;
+                            let wide = original_types[lo.0 as usize].lane_type().clone();
+                            match kind {
+                                wukong_mir::NarrowKind::Trunc => {
+                                    Op::Cast(CastKind::Trunc, src, (**ty).clone())
+                                }
+                                wukong_mir::NarrowKind::FpTrunc => {
+                                    Op::Cast(CastKind::FpTrunc, src, (**ty).clone())
+                                }
+                                wukong_mir::NarrowKind::SatSigned
+                                | wukong_mir::NarrowKind::SatUnsigned => {
+                                    let bits = match **ty {
+                                        MirType::I8 => 8,
+                                        MirType::I16 => 16,
+                                        _ => 32,
+                                    };
+                                    let (min, max): (i128, i128) =
+                                        if *kind == wukong_mir::NarrowKind::SatSigned {
+                                            (-(1 << (bits - 1)), (1 << (bits - 1)) - 1)
+                                        } else {
+                                            (0, (1 << bits) - 1)
+                                        };
+                                    let types = &mut f.value_types;
+                                    let lo_c = emit(
+                                        types,
+                                        &mut out,
+                                        wide.clone(),
+                                        Op::ConstInt(min, wide.clone()),
+                                    );
+                                    let hi_c = emit(
+                                        types,
+                                        &mut out,
+                                        wide.clone(),
+                                        Op::ConstInt(max, wide.clone()),
+                                    );
+                                    let below = emit(
+                                        types,
+                                        &mut out,
+                                        MirType::I1,
+                                        Op::Cmp(CmpOp::Slt, src, lo_c),
+                                    );
+                                    let raised = emit(
+                                        types,
+                                        &mut out,
+                                        wide.clone(),
+                                        Op::Select(below, lo_c, src),
+                                    );
+                                    let above = emit(
+                                        types,
+                                        &mut out,
+                                        MirType::I1,
+                                        Op::Cmp(CmpOp::Sgt, raised, hi_c),
+                                    );
+                                    let clamped = emit(
+                                        types,
+                                        &mut out,
+                                        wide.clone(),
+                                        Op::Select(above, hi_c, raised),
+                                    );
+                                    Op::Cast(CastKind::Trunc, clamped, (**ty).clone())
+                                }
+                            }
+                        }
+                        Op::Shuffle { a, b, mask } => {
+                            let width = *n as usize;
+                            let m = *mask
+                                .get(k)
+                                .ok_or("shuffle mask is shorter than its result")?
+                                as usize;
+                            let src = if m < width {
+                                lanes[a.0 as usize].get(m)
+                            } else {
+                                lanes[b.0 as usize].get(m - width)
+                            }
+                            .copied()
+                            .ok_or("shuffle mask entry is out of range")?;
+                            Op::Cast(CastKind::Bitcast, src, (**ty).clone())
+                        }
+                        Op::InsertLane(v, s, idx) => {
+                            let src = if k == *idx as usize {
+                                *s
+                            } else {
+                                lanes[v.0 as usize]
+                                    .get(k)
+                                    .copied()
+                                    .ok_or("insertlane reads past its operand's lanes")?
+                            };
+                            Op::Cast(CastKind::Bitcast, src, (**ty).clone())
+                        }
                         Op::Neg(v) => Op::Neg(lane(*v)?),
                         Op::Not(v) => Op::Not(lane(*v)?),
                         Op::Cast(kind, v, _) => Op::Cast(*kind, lane(*v)?, (**ty).clone()),

@@ -477,6 +477,10 @@ fn safe_to_hoist(op: &Op, mem: &LoopMem) -> bool {
         | Op::Splat(..)
         | Op::ExtractLane(..)
         | Op::Iota(..)
+        | Op::Widen { .. }
+        | Op::Narrow { .. }
+        | Op::Shuffle { .. }
+        | Op::InsertLane(..)
         | Op::Fma(..)
         | Op::Sqrt(..)
         | Op::Round(..) => true,

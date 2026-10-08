@@ -9,14 +9,16 @@
 
 mod builder;
 mod inst;
+#[cfg(test)]
+mod lane_op_tests;
 pub mod print;
 pub mod vec_kernel;
 pub mod verify;
 
 pub use builder::Builder;
 pub use inst::{
-    switch_case_value, AddrSpace, BinOp, CastKind, CmpOp, Inst, Op, RoundMode, SwitchCase,
-    Terminator,
+    narrow_result, switch_case_value, widen_result, AddrSpace, BinOp, CastKind, CmpOp, Half, Inst,
+    NarrowKind, Op, RoundMode, SwitchCase, Terminator,
 };
 pub use vec_kernel::{
     host_supports_vec_kernels, op_operands, op_produces_value, VecBin, VecCmp, VecKernel, VecLane,

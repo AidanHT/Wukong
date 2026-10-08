@@ -821,6 +821,10 @@ impl AliasInfo {
             | Op::Splat(..)
             | Op::ExtractLane(..)
             | Op::Iota(..)
+            | Op::Widen { .. }
+            | Op::Narrow { .. }
+            | Op::Shuffle { .. }
+            | Op::InsertLane(..)
             | Op::Fma(..)
             | Op::Sqrt(..)
             | Op::Round(..)

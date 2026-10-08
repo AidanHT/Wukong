@@ -523,7 +523,11 @@ pub fn optimize_timed(program: &mut Program, opt_level: u8) -> Timings {
 /// Apply `f` to every value *used* (read) by an operation, in place.
 pub(crate) fn map_op_uses(op: &mut Op, mut f: impl FnMut(ValueId) -> ValueId) {
     match op {
-        Op::Bin(_, a, b) | Op::Cmp(_, a, b) => {
+        Op::Bin(_, a, b)
+        | Op::Cmp(_, a, b)
+        | Op::Narrow { lo: a, hi: b, .. }
+        | Op::Shuffle { a, b, .. }
+        | Op::InsertLane(a, b, _) => {
             *a = f(*a);
             *b = f(*b);
         }
@@ -533,6 +537,7 @@ pub(crate) fn map_op_uses(op: &mut Op, mut f: impl FnMut(ValueId) -> ValueId) {
         | Op::Load(a, _)
         | Op::Splat(a)
         | Op::ExtractLane(a, _)
+        | Op::Widen { v: a, .. }
         | Op::Sqrt(a)
         | Op::Round(_, a) => {
             *a = f(*a);
@@ -616,7 +621,11 @@ pub(crate) fn map_term_uses(t: &mut Terminator, mut f: impl FnMut(ValueId) -> Va
 /// Visit (read-only) every value used by an operation.
 pub(crate) fn each_op_use(op: &Op, f: &mut impl FnMut(ValueId)) {
     match op {
-        Op::Bin(_, a, b) | Op::Cmp(_, a, b) => {
+        Op::Bin(_, a, b)
+        | Op::Cmp(_, a, b)
+        | Op::Narrow { lo: a, hi: b, .. }
+        | Op::Shuffle { a, b, .. }
+        | Op::InsertLane(a, b, _) => {
             f(*a);
             f(*b);
         }
@@ -626,6 +635,7 @@ pub(crate) fn each_op_use(op: &Op, f: &mut impl FnMut(ValueId)) {
         | Op::Load(a, _)
         | Op::Splat(a)
         | Op::ExtractLane(a, _)
+        | Op::Widen { v: a, .. }
         | Op::Sqrt(a)
         | Op::Round(_, a) => f(*a),
         Op::Select(c, a, b) | Op::Fma(c, a, b) => {

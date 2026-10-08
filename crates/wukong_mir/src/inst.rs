@@ -164,6 +164,13 @@ pub enum AddrSpace {
 pub enum Op {
     ConstInt(i128, MirType),
     ConstFloat(f64, MirType),
+    /// Both operands and the result share one type — with one exception. A **vector shifted by a
+    /// scalar** (`Shl`/`LShr`/`AShr` whose left operand and result are `Vec(T, n)` and whose right
+    /// operand is the lane type `T`) shifts every lane by that one amount, masked to the lane width
+    /// exactly as a scalar shift masks it. That is the shape every vector ISA has (Cranelift's
+    /// `ishl`/`ushr`/`sshr` take a scalar amount, x86's `psllw`/`psrad` take one count), so the loop
+    /// vectorizer emits it for a uniform shift amount. A lane-wise amount (`Vec` by `Vec`) stays
+    /// legal MIR for the interpreter and the LLVM text path, but no vectorizer produces it.
     Bin(BinOp, ValueId, ValueId),
     Cmp(CmpOp, ValueId, ValueId),
     /// Arithmetic negation (`-x`); `FNeg` for floats is folded here by result type.
@@ -246,6 +253,56 @@ pub enum Op {
     /// (`mov.b64`) — exact for the same reason the interpreter can store lanes untruncated: the
     /// verifier admits integer lanes only, and `n` is at most 16.
     Iota(MirType),
+    /// Convert one half of a SIMD vector's lanes to the type twice as wide: the operand is
+    /// `Vec(T, n)`, the result `Vec(T2, n/2)`, and result lane `k` is source lane
+    /// `half.first_lane(n) + k` converted by `kind` — `SExt`/`ZExt` from an integer lane to the
+    /// integer type of twice its width, or `FpExt` from `f32` to `f64` ([`widen_result`] is the
+    /// complete table). Every lane is exactly the scalar `Cast(kind, ..)` of its source lane.
+    ///
+    /// It exists because a widening cast changes the lane count. A loop that loads `i8` and
+    /// computes in `f32` covers sixteen iterations per `<16 x i8>` load but only four per
+    /// `<4 x f32>` value, so one source vector becomes several result vectors — `Lo` and `Hi` are
+    /// the two halves that make that split expressible. Cranelift lowers it to
+    /// `swiden_low/high`, `uwiden_low/high` or `fvpromote_low` (`pmovsx`/`punpck`/`cvtps2pd`), the
+    /// textual-LLVM emitter to a half-width `shufflevector` plus `sext`/`zext`/`fpext`, and the GPU
+    /// path scalarizes it. Pure and side-effect-free.
+    Widen {
+        v: ValueId,
+        half: Half,
+        kind: CastKind,
+    },
+    /// The inverse of [`Op::Widen`]: two vectors `Vec(T2, n)` become one `Vec(T, 2n)` of half the
+    /// lane width, the lanes of `lo` first and then the lanes of `hi`, each reduced by `kind` (see
+    /// [`NarrowKind`] and [`narrow_result`]). Every lane is a pure function of its own source lane,
+    /// so interp and native agree lane by lane. Cranelift lowers it to `snarrow`/`unarrow`
+    /// (`packss`/`packus`), to a masked `unarrow` for truncation, and to `fvdemote` plus a merge
+    /// shuffle for `f64 -> f32`. Pure and side-effect-free.
+    Narrow {
+        lo: ValueId,
+        hi: ValueId,
+        kind: NarrowKind,
+    },
+    /// A two-source constant lane permutation: `a` and `b` are both `Vec(T, n)`, the result is
+    /// `Vec(T, n)`, and result lane `k` is lane `mask[k]` of the concatenation `a ++ b` (so an index
+    /// below `n` reads `a`, one in `n..2n` reads `b`). `mask.len()` is exactly `n` — the verifier
+    /// checks both. A pure lane copy, so it is bit-exact on every backend for every lane type.
+    ///
+    /// The loop vectorizer uses it to split an interleaved access group (`x[2i]`, `x[2i+1]`) out of
+    /// contiguous vector loads and to interleave values back before contiguous stores. Cranelift
+    /// lowers it to its byte `shuffle` (`pshufb`, or `shufps`/`punpck`/`pshufd` for the masks those
+    /// cover); the textual-LLVM emitter to `shufflevector`. Pure and side-effect-free.
+    Shuffle {
+        a: ValueId,
+        b: ValueId,
+        mask: Vec<u8>,
+    },
+    /// Write one lane of a SIMD vector: the operand is a `Vec(T, n)`, the scalar is a `T`, the index
+    /// is `< n`, and the result is the same vector with lane `k` replaced. The inverse of
+    /// [`Op::ExtractLane`], and the way the loop vectorizer packs per-lane scalar results (a gather,
+    /// a division x86 cannot widen) back into a vector for the widened ops that consume them.
+    /// Cranelift emits `insertlane`; the textual-LLVM emitter `insertelement`. Pure and
+    /// side-effect-free.
+    InsertLane(ValueId, ValueId, u32),
     /// Fused multiply-add: `a * b + c` with a *single* rounding. The front-end contracts a float
     /// `x + y*z` into this; it is faster (one instruction) and more accurate than separate
     /// `FMul`+`FAdd`. All three operands and the result share one float type (scalar or `Vec`).
@@ -292,6 +349,104 @@ pub enum RoundMode {
     Ceil,
     /// Toward zero (`trunc`).
     Trunc,
+}
+
+/// Which half of a SIMD vector's lanes an [`Op::Widen`] reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Half {
+    /// Lanes `0 .. n/2`.
+    Lo,
+    /// Lanes `n/2 .. n`.
+    Hi,
+}
+
+impl Half {
+    pub fn name(self) -> &'static str {
+        match self {
+            Half::Lo => "lo",
+            Half::Hi => "hi",
+        }
+    }
+
+    /// The first source lane this half reads, for a source vector of `n` lanes.
+    pub fn first_lane(self, n: u32) -> u32 {
+        match self {
+            Half::Lo => 0,
+            Half::Hi => n / 2,
+        }
+    }
+}
+
+/// How an [`Op::Narrow`] reduces each lane to half its width. Every kind is a pure function of one
+/// source lane, read as the *signed* value the interpreter holds it as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NarrowKind {
+    /// Keep the low bits: two's-complement wraparound, exactly the scalar `CastKind::Trunc`.
+    Trunc,
+    /// Clamp to the narrow type's signed range (`packss`). The composition of two of these is the
+    /// clamp to the narrower range, which is how a saturating `f32 -> i8` is built: `i32 -> i16 ->
+    /// i8`, each step saturating.
+    SatSigned,
+    /// Clamp the signed source to `0 ..= 2^w - 1` and keep that bit pattern (`packus`): `-5` becomes
+    /// `0`, `300` becomes `255` in an `i16 -> i8` step.
+    SatUnsigned,
+    /// `f64 -> f32`, rounding to nearest-even: the scalar `CastKind::FpTrunc`.
+    FpTrunc,
+}
+
+impl NarrowKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            NarrowKind::Trunc => "trunc",
+            NarrowKind::SatSigned => "sat.s",
+            NarrowKind::SatUnsigned => "sat.u",
+            NarrowKind::FpTrunc => "fptrunc",
+        }
+    }
+}
+
+/// The result type of [`Op::Widen`] over `src` by `kind`, or `None` when the pair is not one the op
+/// admits: an integer lane of 8, 16 or 32 bits sign- or zero-extended to twice its width, or `f32`
+/// extended to `f64`, over an even lane count.
+pub fn widen_result(src: &MirType, kind: CastKind) -> Option<MirType> {
+    let MirType::Vec(lane, n) = src else {
+        return None;
+    };
+    if *n < 2 || !n.is_multiple_of(2) {
+        return None;
+    }
+    let to = match (kind, &**lane) {
+        (CastKind::SExt | CastKind::ZExt, MirType::I8) => MirType::I16,
+        (CastKind::SExt | CastKind::ZExt, MirType::I16) => MirType::I32,
+        (CastKind::SExt | CastKind::ZExt, MirType::I32) => MirType::I64,
+        (CastKind::FpExt, MirType::F32) => MirType::F64,
+        _ => return None,
+    };
+    Some(MirType::Vec(Box::new(to), n / 2))
+}
+
+/// The result type of [`Op::Narrow`] whose two operands are each `src`, or `None` when the pair is
+/// not one the op admits. Truncation takes `i16`/`i32`/`i64` lanes; the two saturating kinds take
+/// `i16`/`i32` (there is no packed 64-to-32 saturation to lower them to); `FpTrunc` takes `f64`.
+pub fn narrow_result(src: &MirType, kind: NarrowKind) -> Option<MirType> {
+    let MirType::Vec(lane, n) = src else {
+        return None;
+    };
+    if *n == 0 {
+        return None;
+    }
+    let to = match (kind, &**lane) {
+        (NarrowKind::Trunc | NarrowKind::SatSigned | NarrowKind::SatUnsigned, MirType::I16) => {
+            MirType::I8
+        }
+        (NarrowKind::Trunc | NarrowKind::SatSigned | NarrowKind::SatUnsigned, MirType::I32) => {
+            MirType::I16
+        }
+        (NarrowKind::Trunc, MirType::I64) => MirType::I32,
+        (NarrowKind::FpTrunc, MirType::F64) => MirType::F32,
+        _ => return None,
+    };
+    Some(MirType::Vec(Box::new(to), n.checked_mul(2)?))
 }
 
 /// One instruction: an optional result value plus its operation.

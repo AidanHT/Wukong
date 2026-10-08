@@ -439,7 +439,14 @@ impl<'a> Verifier<'a> {
                 if self.use_val(*l) & self.use_val(*r) {
                     if let Some(res) = self.result_ty(result) {
                         self.expect_ty(*l, &res, b.name());
-                        self.expect_ty(*r, &res, b.name());
+                        // The one operand-shape exception: a vector shifted by a scalar amount of
+                        // its lane type (see `Op::Bin`).
+                        let by_scalar = matches!(b, BinOp::Shl | BinOp::LShr | BinOp::AShr)
+                            && res.is_vector()
+                            && self.ty(*r) == Some(res.lane_type());
+                        if !by_scalar {
+                            self.expect_ty(*r, &res, b.name());
+                        }
                         // Classify by lane type so vector arithmetic (`<4 x f32> fadd`) is checked
                         // against its `f32` lanes, not the aggregate `Vec` type.
                         let lane = res.lane_type();
@@ -789,6 +796,126 @@ impl<'a> Verifier<'a> {
                         "iota must be a vector of integer lanes, got {}",
                         ty.display()
                     )),
+                }
+            }
+            // The lane-count-changing conversions. Each result type is a function of the operand
+            // type and the kind, so it is recomputed and compared: a mismatch would have the
+            // interpreter build one lane count and a backend read another.
+            Op::Widen { v, half: _, kind } => {
+                if self.use_val(*v) {
+                    if let (Some(vt), Some(res)) = (self.ty(*v).cloned(), self.result_ty(result)) {
+                        match crate::inst::widen_result(&vt, *kind) {
+                            Some(want) if want == res => {}
+                            Some(want) => self.err(format!(
+                                "widen.{} of {} must yield {}, got {}",
+                                kind.name(),
+                                vt.display(),
+                                want.display(),
+                                res.display()
+                            )),
+                            None => self.err(format!(
+                                "widen.{} does not apply to {}",
+                                kind.name(),
+                                vt.display()
+                            )),
+                        }
+                    }
+                }
+            }
+            Op::Narrow { lo, hi, kind } => {
+                if self.use_val(*lo) & self.use_val(*hi) {
+                    let (lt, ht) = (self.ty(*lo).cloned(), self.ty(*hi).cloned());
+                    if let (Some(lt), Some(ht), Some(res)) = (lt, ht, self.result_ty(result)) {
+                        if lt != ht {
+                            self.err(format!(
+                                "narrow operands differ: {} vs {}",
+                                lt.display(),
+                                ht.display()
+                            ));
+                        }
+                        match crate::inst::narrow_result(&lt, *kind) {
+                            Some(want) if want == res => {}
+                            Some(want) => self.err(format!(
+                                "narrow.{} of {} must yield {}, got {}",
+                                kind.name(),
+                                lt.display(),
+                                want.display(),
+                                res.display()
+                            )),
+                            None => self.err(format!(
+                                "narrow.{} does not apply to {}",
+                                kind.name(),
+                                lt.display()
+                            )),
+                        }
+                    }
+                }
+            }
+            // Both operands one vector type, one mask entry per lane, every entry naming a lane of
+            // `a ++ b`. The interpreter indexes the concatenation directly, so an out-of-range
+            // entry would be a panic there rather than a diagnostic.
+            Op::Shuffle { a, b, mask } => {
+                if self.use_val(*a) & self.use_val(*b) {
+                    if let (Some(at), Some(bt)) = (self.ty(*a).cloned(), self.ty(*b).cloned()) {
+                        if at != bt {
+                            self.err(format!(
+                                "shuffle operands differ: {} vs {}",
+                                at.display(),
+                                bt.display()
+                            ));
+                        }
+                        match &at {
+                            MirType::Vec(_, n) => {
+                                if mask.len() != *n as usize {
+                                    self.err(format!(
+                                        "shuffle of {} needs {n} mask entries, got {}",
+                                        at.display(),
+                                        mask.len()
+                                    ));
+                                }
+                                if let Some(bad) = mask.iter().find(|&&m| u32::from(m) >= 2 * *n) {
+                                    self.err(format!(
+                                        "shuffle mask entry {bad} is out of range for two {}",
+                                        at.display()
+                                    ));
+                                }
+                            }
+                            _ => self.err(format!(
+                                "shuffle operands must be vectors, got {}",
+                                at.display()
+                            )),
+                        }
+                        self.check_result_is(result, &at);
+                    }
+                }
+            }
+            Op::InsertLane(v, s, k) => {
+                if self.use_val(*v) & self.use_val(*s) {
+                    if let (Some(vt), Some(st)) = (self.ty(*v).cloned(), self.ty(*s).cloned()) {
+                        match &vt {
+                            MirType::Vec(lane, n) => {
+                                if *k >= *n {
+                                    self.err(format!(
+                                        "insertlane index {k} is out of range for {}",
+                                        vt.display()
+                                    ));
+                                }
+                                if **lane != st {
+                                    self.err(format!(
+                                        "insertlane into {} takes a {}, got {}",
+                                        vt.display(),
+                                        lane.display(),
+                                        st.display()
+                                    ));
+                                }
+                            }
+                            _ => self.err(format!(
+                                "insertlane operand must be a vector, got {}",
+                                vt.display()
+                            )),
+                        }
+                        self.check_result_is(result, &vt);
+                    }
                 }
             }
         }

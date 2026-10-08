@@ -391,6 +391,13 @@ enum Key {
     Fma(u32, u32, u32),
     Sqrt(u32),
     Round(u8, u32),
+    /// Operand, half and cast kind; the result type is a function of those three.
+    Widen(u32, u8, u8),
+    Narrow(u32, u32, u8),
+    /// Both operands and the packed mask ([`pack_shuffle_mask`]). The operands fix the lane count,
+    /// and the packing records the mask length besides, so two different masks never share a key.
+    Shuffle(u32, u32, u128),
+    InsertLane(u32, u32, u32),
     /// A call to a callee that reads nothing the caller can see, by symbol and interned arguments:
     /// its result is a function of the argument values alone.
     PureCall(u32, u32),
@@ -950,6 +957,10 @@ impl Numbering<'_> {
             Op::Fma(a, b, c) => Key::Fma(m(*a), m(*b), m(*c)),
             Op::Sqrt(a) => Key::Sqrt(m(*a)),
             Op::Round(mode, a) => Key::Round(*mode as u8, m(*a)),
+            Op::Widen { v, half, kind } => Key::Widen(m(*v), *half as u8, *kind as u8),
+            Op::Narrow { lo, hi, kind } => Key::Narrow(m(*lo), m(*hi), *kind as u8),
+            Op::Shuffle { a, b, mask } => Key::Shuffle(m(*a), m(*b), pack_shuffle_mask(mask)?),
+            Op::InsertLane(v, s, k) => Key::InsertLane(m(*v), m(*s), *k),
             Op::Load(..)
             | Op::Store { .. }
             | Op::Call { .. }
@@ -958,6 +969,23 @@ impl Numbering<'_> {
             | Op::Barrier => return None,
         })
     }
+}
+
+/// A shuffle mask as one integer key: six bits per entry (every entry is below `2n <= 32`) and the
+/// length in the top bits. `None` — the shuffle is simply not value-numbered — for a mask too long
+/// or with an entry too large to pack, which no verified 128-bit shuffle has.
+fn pack_shuffle_mask(mask: &[u8]) -> Option<u128> {
+    if mask.len() > 20 {
+        return None;
+    }
+    let mut packed: u128 = (mask.len() as u128) << 120;
+    for (i, &m) in mask.iter().enumerate() {
+        if m >= 64 {
+            return None;
+        }
+        packed |= u128::from(m) << (6 * i);
+    }
+    Some(packed)
 }
 
 /// Follow the rewrite table to the final target. Targets are final when recorded (see

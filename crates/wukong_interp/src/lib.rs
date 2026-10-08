@@ -1309,6 +1309,10 @@ impl<'a, 'k> Interp<'a, 'k> {
                     | Op::Select(..)
                     | Op::Splat(..)
                     | Op::Iota(..)
+                    | Op::Widen { .. }
+                    | Op::Narrow { .. }
+                    | Op::Shuffle { .. }
+                    | Op::InsertLane(..)
                     | Op::Fma(..)
                     | Op::Sqrt(..)
                     | Op::Round(..)
@@ -1546,6 +1550,10 @@ impl<'a, 'k> Interp<'a, 'k> {
             // lane masks to its own width, and `n` is at most 16, so no lane can exceed any lane
             // type this op accepts.
             Op::Iota(_) => return Err("SIMD operation requires a vector result".into()),
+            // Like `Splat`/`Iota`, the lane-moving ops always produce a vector (`eval_vector`).
+            Op::Widen { .. } | Op::Narrow { .. } | Op::Shuffle { .. } | Op::InsertLane(..) => {
+                return Err("SIMD operation requires a vector result".into())
+            }
             // Fused multiply-add `a*b + c`, single-rounded via `mul_add` so it stays bit-identical
             // to the native `fma`. Lane-wise for vectors, each lane rounded to its lane type.
             Op::Fma(a, b, c) => apply_fma(reg(regs, *a), reg(regs, *b), reg(regs, *c), rty),
@@ -1571,12 +1579,102 @@ impl<'a, 'k> Interp<'a, 'k> {
         Ok(match op {
             Op::Bin(b, l, r) => {
                 let av = self.vec_lanes(reg(regs, *l), *n as usize)?;
-                let bv = self.vec_lanes(reg(regs, *r), *n as usize)?;
                 let lane = (**lane).clone();
-                let lanes = collect_lanes(
-                    (0..*n as usize)
-                        .map(|i| mask_lane(apply_bin(*b, av[i], bv[i], Some(&lane)), &lane)),
-                )?;
+                let lanes = if func.value_type(*r).is_vector() {
+                    let bv = self.vec_lanes(reg(regs, *r), *n as usize)?;
+                    collect_lanes(
+                        (0..*n as usize)
+                            .map(|i| mask_lane(apply_bin(*b, av[i], bv[i], Some(&lane)), &lane)),
+                    )?
+                } else {
+                    // A vector shifted by one scalar amount (`Op::Bin`'s one operand-shape
+                    // exception, which the verifier admits for shifts only): every lane is the
+                    // scalar shift of that lane by the same amount, masked to the lane width.
+                    let amount = reg(regs, *r);
+                    collect_lanes(
+                        (0..*n as usize)
+                            .map(|i| mask_lane(apply_bin(*b, av[i], amount, Some(&lane)), &lane)),
+                    )?
+                };
+                self.push_vec(lanes)?
+            }
+            // Result lane `k` is source lane `first + k` under the scalar cast of the same kind, so
+            // a widened lane can never differ from what the scalar loop computes for it.
+            Op::Widen { v, half, kind } => {
+                let (from_lane, src_n) = match func.value_type(*v) {
+                    MirType::Vec(l, m) => ((**l).clone(), *m),
+                    other => {
+                        return Err(format!(
+                            "widen operand is {}, not a vector",
+                            other.display()
+                        ))
+                    }
+                };
+                let first = half.first_lane(src_n) as usize;
+                if first + *n as usize > src_n as usize {
+                    return Err(
+                        "widen reads past its operand's lanes (MIR invariant violation)".into(),
+                    );
+                }
+                let xs = self.vec_lanes(reg(regs, *v), src_n as usize)?;
+                let to_lane = (**lane).clone();
+                let lanes = collect_lanes((0..*n as usize).map(|i| {
+                    mask_lane(
+                        apply_cast(*kind, xs[first + i], &from_lane, &to_lane),
+                        &to_lane,
+                    )
+                }))?;
+                self.push_vec(lanes)?
+            }
+            // The lanes of `lo`, then the lanes of `hi`, each reduced on its own.
+            Op::Narrow { lo, hi, kind } => {
+                let half = (*n / 2) as usize;
+                let lo_lanes = self.vec_lanes(reg(regs, *lo), half)?;
+                let hi_lanes = self.vec_lanes(reg(regs, *hi), half)?;
+                let to_lane = (**lane).clone();
+                let lanes = collect_lanes((0..*n as usize).map(|i| {
+                    let x = if i < half {
+                        lo_lanes[i]
+                    } else {
+                        hi_lanes[i - half]
+                    };
+                    narrow_lane(*kind, x, &to_lane)
+                }))?;
+                self.push_vec(lanes)?
+            }
+            // Lane `k` is lane `mask[k]` of `a ++ b`: a pure copy, whatever the lane type.
+            Op::Shuffle { a, b, mask } => {
+                let av = self.vec_lanes(reg(regs, *a), *n as usize)?;
+                let bv = self.vec_lanes(reg(regs, *b), *n as usize)?;
+                let width = *n as usize;
+                if mask.len() != width || mask.iter().any(|&m| m as usize >= 2 * width) {
+                    return Err(
+                        "shuffle mask does not fit its operands (MIR invariant violation)".into(),
+                    );
+                }
+                let lanes = collect_lanes(mask.iter().map(|&m| {
+                    let m = m as usize;
+                    if m < width {
+                        av[m]
+                    } else {
+                        bv[m - width]
+                    }
+                }))?;
+                self.push_vec(lanes)?
+            }
+            Op::InsertLane(v, s, k) => {
+                let xs = self.vec_lanes(reg(regs, *v), *n as usize)?;
+                if *k >= *n {
+                    return Err("insertlane index out of range".into());
+                }
+                let value = reg(regs, *s);
+                let lanes = collect_lanes((0..*n as usize).map(|i| {
+                    if i == *k as usize {
+                        value
+                    } else {
+                        xs[i]
+                    }
+                }))?;
                 self.push_vec(lanes)?
             }
             Op::Cmp(c, l, r) => {
@@ -5075,6 +5173,27 @@ fn mask_lane(v: Value, lane: &MirType) -> Value {
     match v {
         Value::Int(i) if lane.is_int() => Value::Int(mask(i, lane)),
         other => other,
+    }
+}
+
+/// One lane of an `Op::Narrow` into the lane type `to`, from a source lane held (like every
+/// interpreter integer) as its sign-extended value. The saturating kinds clamp that signed value —
+/// `packss` to the signed range, `packus` to `0 ..= 2^w - 1` — and the result is then held in the
+/// narrow type's own canonical form, so `SatUnsigned` 255 into `i8` is the byte `0xFF`, i.e. `-1`.
+fn narrow_lane(kind: wukong_mir::NarrowKind, x: Value, to: &MirType) -> Value {
+    use wukong_mir::NarrowKind;
+    let bits = int_bits(to);
+    match kind {
+        NarrowKind::Trunc => Value::Int(mask(x.as_int(), to)),
+        NarrowKind::SatSigned => {
+            let (min, max) = (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1);
+            Value::Int(x.as_int().clamp(min, max))
+        }
+        NarrowKind::SatUnsigned => {
+            let max = (1i128 << bits) - 1;
+            Value::Int(mask(x.as_int().clamp(0, max), to))
+        }
+        NarrowKind::FpTrunc => Value::Float(x.as_float() as f32 as f64),
     }
 }
 

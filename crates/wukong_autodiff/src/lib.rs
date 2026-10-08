@@ -678,8 +678,13 @@ impl<'a> Vjp<'a> {
                 | Op::Neg(a)
                 | Op::Not(a)
                 | Op::Splat(a)
-                | Op::ExtractLane(a, _) => stack.push(*a),
-                Op::Bin(_, a, b) | Op::Cmp(_, a, b) => {
+                | Op::ExtractLane(a, _)
+                | Op::Widen { v: a, .. } => stack.push(*a),
+                Op::Bin(_, a, b)
+                | Op::Cmp(_, a, b)
+                | Op::Narrow { lo: a, hi: b, .. }
+                | Op::Shuffle { a, b, .. }
+                | Op::InsertLane(a, b, _) => {
                     stack.push(*a);
                     stack.push(*b);
                 }
@@ -1199,6 +1204,22 @@ pub(crate) fn map_operands(op: &Op, mut f: impl FnMut(ValueId) -> ValueId) -> Op
         Op::Splat(v) => Op::Splat(f(*v)),
         Op::ExtractLane(v, k) => Op::ExtractLane(f(*v), *k),
         Op::Iota(ty) => Op::Iota(ty.clone()),
+        Op::Widen { v, half, kind } => Op::Widen {
+            v: f(*v),
+            half: *half,
+            kind: *kind,
+        },
+        Op::Narrow { lo, hi, kind } => Op::Narrow {
+            lo: f(*lo),
+            hi: f(*hi),
+            kind: *kind,
+        },
+        Op::Shuffle { a, b, mask } => Op::Shuffle {
+            a: f(*a),
+            b: f(*b),
+            mask: mask.clone(),
+        },
+        Op::InsertLane(v, s, k) => Op::InsertLane(f(*v), f(*s), *k),
         Op::Fma(a, b, c) => Op::Fma(f(*a), f(*b), f(*c)),
         Op::Sqrt(v) => Op::Sqrt(f(*v)),
         Op::Round(m, v) => Op::Round(*m, f(*v)),
@@ -1238,6 +1259,10 @@ fn op_name(op: &Op) -> &'static str {
         Op::Splat(..) => "splat",
         Op::ExtractLane(..) => "extractlane",
         Op::Iota(..) => "iota",
+        Op::Widen { .. } => "widen",
+        Op::Narrow { .. } => "narrow",
+        Op::Shuffle { .. } => "shuffle",
+        Op::InsertLane(..) => "insertlane",
         Op::Fma(..) => "fma",
         Op::Sqrt(..) => "sqrt",
         Op::Round(..) => "round",
