@@ -71,10 +71,27 @@ unsafe fn inclusive_scan8(v: std::arch::x86_64::__m256) -> std::arch::x86_64::__
 }
 
 /// AVX2 inclusive prefix sum of one row. Processes the row in 8-element blocks: in-lane scan
-/// ([`inclusive_scan8`]), add the running `carry` to all lanes, store, then update `carry` from lane 7
-/// (the block's full inclusive sum). A scalar tail folds `cols % 8` left-to-right (`carry += x; out =
-/// carry`) — matching `cumsum_row_scalar`'s recurrence exactly for the tail, and continuing the same
-/// `carry` so the row stays a single prefix sum.
+/// ([`inclusive_scan8`]), add the running `carry` to all lanes, store, then advance `carry` by the
+/// block's total (lane 7 of the scan). A scalar tail folds `cols % 8` left-to-right (`carry += x;
+/// out = carry`) — matching `cumsum_row_scalar`'s recurrence exactly for the tail, and continuing the
+/// same `carry` so the row stays a single prefix sum.
+///
+/// THE LOOP-CARRIED CHAIN IS ONE `vaddps`. The carry used to be re-derived from the stored result —
+/// `carry = permutevar8x32(scan + carry, 7)` — which put a lane-crossing `vpermps` (3-cycle latency,
+/// shuffle port only) on the recurrence next to the add, so only one 8-element block's carry was ever
+/// in flight: ~5 cycles per 8 elements on the chain. The block total is a function of the loaded
+/// block alone, so its broadcast is now taken from `scan` — off the chain, overlapping freely with
+/// the next blocks' scans — and the carry advances by `carry = tot + carry`, one 2-cycle add per
+/// block. The loop is then bound by its four shuffle-port uops per block (the three inside
+/// [`inclusive_scan8`] plus the broadcast), not by latency.
+///
+/// This is **bit-identical** to the previous kernel, not merely close: lane 7 of `scan + carry` is
+/// `scan[7] + carry` with `scan` as the first operand, and `tot + carry` is the same addition with
+/// the same operand order in every (broadcast) lane — so even a NaN payload resolves identically.
+/// `avx2_matches_the_documented_block_recurrence_bit_for_bit` pins it against an independent scalar
+/// model of the recurrence. A multi-block scan that pre-sums block totals would shorten the chain
+/// further but reassociates the running sum; it would change every corpus value printed from a
+/// dispatched cumsum, for a chain that is no longer the bound.
 ///
 /// # Safety
 /// `x`/`out` valid for `cols` f32 from `base` (distinct or aliasing); AVX2 available.
@@ -94,7 +111,9 @@ unsafe fn cumsum_row_avx2(x: *const f32, out: *mut f32, base: usize, cols: usize
         let scan = inclusive_scan8(v);
         let res = _mm256_add_ps(scan, carry);
         _mm256_storeu_ps(ob.add(i), res);
-        carry = _mm256_permutevar8x32_ps(res, last_lane);
+        // The block total, broadcast — depends on `v` only, so it is off the carried chain.
+        let tot = _mm256_permutevar8x32_ps(scan, last_lane);
+        carry = _mm256_add_ps(tot, carry);
         i += 8;
     }
     // Scalar tail — strict left-to-right, continuing the same carry (identical to the scalar twin's
@@ -355,6 +374,74 @@ mod tests {
             let sb: Vec<u32> = s.iter().map(|f| f.to_bits()).collect();
             let pb: Vec<u32> = p.iter().map(|f| f.to_bits()).collect();
             assert_eq!(sb, pb, "serial != parallel on non-finite {rows}x{cols}");
+        }
+    }
+
+    /// The AVX2 kernel is a FIXED reassociation, and this pins exactly which one, bit for bit, against
+    /// an independent scalar model: per 8-element block the Hillis-Steele tree `w = v + shr1(v)`,
+    /// `u = w + shr2(w)`, `r = u + shr4(u)` (vacated lanes filled with `+0.0`, the shifted operand
+    /// second), then `out = r + carry` and `carry = r[7] + carry`; the `cols % 8` tail runs
+    /// `carry = carry + x`. The data mixes signed zeros (which `+0.0` fill turns into `+0.0` in the
+    /// low lanes), magnitudes that round differently under different association, and values large
+    /// enough that the carry dominates — so moving the carry off the stored result, or reordering
+    /// any add, shows up here as a bit difference.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn avx2_matches_the_documented_block_recurrence_bit_for_bit() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let model = |x: &[f32]| -> Vec<f32> {
+            let n = x.len();
+            let mut out = vec![0.0f32; n];
+            let mut carry = 0.0f32;
+            let mut b = 0;
+            while b + 8 <= n {
+                let mut v = [0.0f32; 8];
+                v.copy_from_slice(&x[b..b + 8]);
+                for s in [1usize, 2, 4] {
+                    let prev = v;
+                    for j in 0..8 {
+                        let sh = if j >= s { prev[j - s] } else { 0.0 };
+                        v[j] = prev[j] + sh;
+                    }
+                }
+                for j in 0..8 {
+                    out[b + j] = v[j] + carry;
+                }
+                carry = v[7] + carry;
+                b += 8;
+            }
+            for j in b..n {
+                carry += x[j];
+                out[j] = carry;
+            }
+            out
+        };
+        for &cols in &[1usize, 7, 8, 9, 16, 31, 64, 100, 257, 1000] {
+            let x: Vec<f32> = (0..cols)
+                .map(|i| match i % 7 {
+                    0 => -0.0,
+                    1 => 0.0,
+                    2 => 1.0e7 + i as f32,
+                    3 => -3.25e-3 * i as f32,
+                    4 => 0.1,
+                    5 => -(i as f32) * 1.5,
+                    _ => 3.0e-5,
+                })
+                .collect();
+            let want = model(&x);
+            let mut got = vec![0.0f32; cols];
+            unsafe { wukong_cumsum_f32(x.as_ptr(), got.as_mut_ptr(), 1, cols as i64) };
+            for t in 0..cols {
+                assert_eq!(
+                    got[t].to_bits(),
+                    want[t].to_bits(),
+                    "cols={cols} t={t}: kernel {} vs model {}",
+                    got[t],
+                    want[t]
+                );
+            }
         }
     }
 

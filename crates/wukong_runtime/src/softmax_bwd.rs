@@ -12,9 +12,12 @@
 //! `y·(dy − s)` over the row.
 //!
 //! The dot is delegated to the **identical bit-exact `wukong_sreduce_f32(RED_DOT)`** the `@parallel`
-//! dot dispatch already uses (8-lane accumulators + a fixed-order horizontal combine, serial ==
-//! parallel == its scalar twin), so this kernel introduces **no new reduction-accumulation order** to
-//! reason about — it is the proven dot plus a pure elementwise map. Rows are independent, so the
+//! dot dispatch already uses (eight independent 8-lane FMA chains over 64-element blocks + a fixed
+//! halving tree and horizontal combine — see `reduce.rs`; serial == parallel == its scalar twin), so
+//! this kernel introduces **no new reduction-accumulation order** to reason about — it is the proven
+//! dot plus a pure elementwise map. Those eight chains are what keep the per-row dot off the FMA
+//! latency bound at the cache-resident widths this kernel sees (`cols` ≤ a few thousand); rows
+//! shorter than 64 keep the single-chain bits exactly. Rows are independent, so the
 //! `_parallel` form maps the per-row routine across cores and is **bit-identical** to the serial one
 //! (no cross-row combine); the interpreter marshals the serial form, so the differential oracle stays
 //! exact. (The dot's lane reassociation is the documented reassociated-reduction exception: every
