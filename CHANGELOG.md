@@ -79,6 +79,31 @@ All notable changes to Wukong are documented here. The format is loosely based o
   still accepted with no definite-assignment rule; that hazard is recorded under **Known
   limitations / sharp edges** in `docs/roadmap.md`.
 
+### Lints and parser hygiene (wave 2, `gap2/lints-and-parser-hygiene`)
+
+- **`E0105` confusable characters.** A pasted Unicode lookalike of ASCII punctuation or whitespace
+  (`−` U+2212, `×`, `≤`, fullwidth brackets, curly quotes, no-break and zero-width spaces) names its
+  code point and the ASCII character it imitates, and lexes as that character, so it costs one
+  error instead of `E0101` plus a parser error. Other non-ASCII characters keep `E0101`, now naming
+  the code point instead of `\u{..}`; a leading byte-order mark is skipped.
+- **Parser recovery.** `E0200` names every token tried at the position ("expected one of `,` or
+  `)`, found `return`"), is anchored just after the previous token when the parser has already
+  moved to the next line, and labels the unclosed opener of a missing `)`/`]`/`}` (an unclosed
+  `{` no longer points only at end of file). A token the lexer already rejected no longer draws a
+  second parser error (`1 $ 2`, `g(1 $)` are one `E0101` each). "found" names keywords and
+  punctuation in backticks and identifiers by name.
+- **Warnings.** The compiler's first lints, `W0001`–`W0007`: `unused_variables`, `unused_mut`,
+  `unreachable_code`, `unused_result` (`out[i] == a[i] + b[i];` written for `=`), `dead_code`,
+  `unwritten_output` (a `mut` output buffer never stored to) and `unknown_lints`. Levels from
+  `-A/-W/-D <lint>` (`-D warnings`) and `@allow/@warn/@deny(<lint>)` on a function, parameter or
+  statement. Warnings print after errors; `tests/warn/` + `crates/wukongc/tests/warn.rs` pin each
+  lint's full output, and the catalogue-coverage gates now include `W` codes.
+- **Statement terminators.** A missing `;` is `W0030 missing_semicolon` (Rust's exemptions: after
+  a block-like statement, and before `}` for anything but a `let`); a `(`, `[` or touching `-` at
+  the start of a line that continues the expression above (`acc = a[i]` then `(b + c)` parses as
+  a call) is `W0031 ambiguous_continuation`. The parse itself is unchanged; `E0210` is reserved for
+  promoting a missing `;` to an error.
+
 ### October 5 contraction semantics and coverage
 
 - Preserve empty lowp/integer GEMM, residual, dual-store and fused-window source stores;

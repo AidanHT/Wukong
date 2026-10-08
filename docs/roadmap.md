@@ -526,6 +526,39 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   `@export`), so a typo like `@parellel` no longer compiles to a program with none of the requested
   behavior. The four discarded attributes stay discarded wherever they parse.
 - Intrinsics `print`/`println`/`assert`.
+- **Source-text diagnostics.** A Unicode lookalike of ASCII punctuation or whitespace (`−` U+2212
+  for `-`, `×`, `≤`, fullwidth brackets, curly quotes, no-break/zero-width spaces; ~50 entries) is
+  **`E0105`**, naming the code point and the ASCII character it imitates, and the lexer reads it
+  *as* that character, so a paste from a paper costs one error, not a lexer error plus a parser
+  cascade. Any other non-ASCII character stays `E0101`, now naming the code point (`α` (U+03B1))
+  instead of `\u{3b1}`, with a spelled-out suggestion for Greek letters. Identifiers stay ASCII:
+  Unicode (XID) identifiers need a symbol-mangling decision because PTX must be ASCII.
+- **Parser recovery.** A failed `E0200` names the whole set of tokens the parser tried ("expected one
+  of `,` or `)`"), is anchored just after the previous token when the parser had already moved on to
+  the next line (where the missing `)` or `;` goes), and labels the unclosed opener of a missing
+  `)`/`]`/`}` from a delimiter stack kept in step with every consumed token. A token the lexer
+  already rejected never draws a second parser error. Not yet: rustc's indentation-based "this
+  delimiter might not be properly closed" guess, and resynchronizing at the next statement after a
+  bad one (the parser still recovers token by token).
+- **Warnings (lints).** The compiler's first warnings (`wukong_sema::lints`, run after a clean
+  sema): `W0001 unused_variables`, `W0002 unused_mut`, `W0003 unreachable_code` (divergence judged
+  exactly as the definite-return check judges it), `W0004 unused_result` (`out[i] == x;` written
+  for `=`), `W0005 dead_code`, `W0006 unwritten_output` (a `mut` aggregate parameter never stored
+  to) and `W0007 unknown_lints`. Levels come from rustc-style `-A/-W/-D <lint>` (`-D warnings`) and
+  `@allow/@warn/@deny(<lint>)` on a function, parameter or statement, innermost first. Warnings
+  print after errors, so `tests/fail`'s first-diagnostic contract holds; `tests/warn/` pins each
+  lint's exact output (`crates/wukongc/tests/warn.rs`). Not yet: `unused_imports` (waits for the
+  module-scoped resolver), the corpus held to zero warnings (the census test is `#[ignore]`d until a
+  first full run blesses `tests/run` and `examples/`), and machine-applicable suggestions.
+- **Statement terminators.** `;` stays optional where it always was, but leaving it out is now
+  **`W0030 missing_semicolon`** (Rust's exemptions: after a block-like statement, and before the
+  closing `}` for anything but a `let`), and a `(`/`[` — or a `-` touching its operand — at the
+  start of a line, which silently continues the expression above (`acc = a[i]` then `(b + c)` is
+  a call), is **`W0031 ambiguous_continuation`** (only where a statement could begin; `- y` with a
+  space stays silent). The parser hands both out on a separate channel
+  (`parse_module_tokens_with_lints`), so no caller asserting a clean parse changes. `E0210` is
+  reserved for making a missing `;` an error. Not yet: imported files' parser lints (the loader
+  still uses the lint-free entry point), and `defer` statements' terminator.
 - The optimizer (`-O0..-O3`), backed by CFG and dominator analyses: whole-program **inlining**
   bottom-up over the call graph (non-recursive callees before their callers, scored by a cost model),
   **mem2reg** (alloca → SSA), constant folding, algebraic simplification, CFG cleanup

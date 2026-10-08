@@ -1,0 +1,13 @@
+// EXPECT-WARN: W0002
+module tests.warn.unused_mut
+
+// `limit` is declared `mut` but never reassigned; `n` is, so only `limit` is reported.
+fn main() -> i32 {
+    let mut limit: i32 = 10;
+    let mut n: i32 = 0;
+    while n < limit {
+        n += 3;
+    }
+    print(n);
+    return 0;
+}

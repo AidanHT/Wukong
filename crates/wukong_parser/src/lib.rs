@@ -15,7 +15,10 @@ use wukong_span::{Interner, SourceId, Span, Symbol};
 use TokenKind as T;
 
 mod items;
-pub use items::{parse_module, parse_module_tokens, parse_module_tokens_from};
+pub use items::{
+    parse_module, parse_module_tokens, parse_module_tokens_from, parse_module_tokens_with_lints,
+    ParseOutput,
+};
 
 /// Parse a standalone expression (for tests and a future REPL).
 pub fn parse_expr_str(
@@ -67,6 +70,19 @@ pub(crate) struct Parser<'a> {
     depth_exceeded: bool,
     /// Inside an `impl Type { … }` block: `Type`'s name, which every `Self` in the block denotes.
     pub(crate) self_ty: Option<Symbol>,
+    /// The open delimiters consumed so far and not yet closed (innermost last), kept in step with
+    /// [`Parser::bump`]. A failed `expect` of a closer labels its opener ("this `(` is not
+    /// closed"), which for an unclosed `{` is the only pointer back to where the problem is: the
+    /// failure itself is reported at end of file.
+    delims: Vec<(TokenKind, Span)>,
+    /// The tokens an `eat` has tried, and failed to find, at the current position (cleared by every
+    /// [`Parser::bump`]). A failed `expect` reports them with its own token as the set the parser
+    /// would have accepted — "expected one of `,` or `)`" — rather than naming only the last one.
+    expected: Vec<TokenKind>,
+    /// Lint findings (`W0030` missing `;`, `W0031` ambiguous line continuation): warnings, kept
+    /// apart from `diags` so a caller that asserts a clean parse is not failed by a warning. Only
+    /// [`parse_module_tokens_with_lints`] hands them out; the driver resolves their levels.
+    pub(crate) lints: Vec<Diagnostic>,
 }
 
 impl<'a> Parser<'a> {
@@ -82,6 +98,9 @@ impl<'a> Parser<'a> {
             depth: 0,
             depth_exceeded: false,
             self_ty: None,
+            delims: Vec::new(),
+            expected: Vec::new(),
+            lints: Vec::new(),
         }
     }
 
@@ -135,8 +154,28 @@ impl<'a> Parser<'a> {
         let t = self.tok();
         if t.kind != T::Eof {
             self.pos += 1;
+            self.track_delim(t);
         }
+        self.expected.clear();
         t
+    }
+
+    /// Keep [`Parser::delims`] in step with the token just consumed. A closer pops its innermost
+    /// matching opener together with any unmatched openers above it — a recovery bump past a stray
+    /// closer must not leave a stale opener for a later error to point at; a closer with no
+    /// matching opener changes nothing.
+    fn track_delim(&mut self, t: Token) {
+        match t.kind {
+            T::LParen | T::LBracket | T::LBrace => self.delims.push((t.kind, t.span)),
+            T::RParen | T::RBracket | T::RBrace => {
+                if let Some(open) = opener_of(t.kind) {
+                    if let Some(i) = self.delims.iter().rposition(|(k, _)| *k == open) {
+                        self.delims.truncate(i);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     fn eat(&mut self, k: TokenKind) -> bool {
@@ -144,21 +183,89 @@ impl<'a> Parser<'a> {
             self.bump();
             true
         } else {
+            if !self.expected.contains(&k) {
+                self.expected.push(k);
+            }
             false
         }
     }
 
+    /// The current token as the "found …" of a diagnostic: a keyword or punctuation in backticks
+    /// (`` `;` ``), an identifier with its name (`` identifier `b` ``), any other category as its
+    /// noun ("integer literal", "end of file").
+    fn found(&self) -> String {
+        let k = self.kind();
+        match k.glyph() {
+            Some(g) => format!("`{g}`"),
+            None if k == T::Ident => {
+                let sp = self.span();
+                format!("identifier `{}`", &self.src[sp.lo as usize..sp.hi as usize])
+            }
+            None => k.describe().to_string(),
+        }
+    }
+
+    /// Whether the current token starts on a later line than the previous token ends: the parser
+    /// has already moved on to the next line, which is where a missing `;`/`)` leaves it.
+    fn on_new_line(&self) -> bool {
+        if self.pos == 0 {
+            return false;
+        }
+        let (prev, cur) = (self.prev_span(), self.span());
+        prev.hi <= cur.lo
+            && self
+                .src
+                .get(prev.hi as usize..cur.lo as usize)
+                .is_some_and(|gap| gap.contains('\n'))
+    }
+
+    /// Consume `k`, or report `E0200` without consuming anything. The message names every token
+    /// the parser tried at this position ("expected one of `,` or `)`"). When the token found sits
+    /// on a later line, the error is anchored just after the previous token — where the missing
+    /// token goes — with the token it ran into as a secondary label, instead of on the next line's
+    /// first token. A missing closer also labels its unclosed opener.
     fn expect(&mut self, k: TokenKind) -> bool {
+        // The lexer has already reported an invalid token. Step over it (and any run of them) so
+        // the token wanted here is still found right after it: `g(1 $)` costs the lexer's one
+        // error, not that plus "expected `)`, found invalid token" plus a stray-`)` cascade.
+        while self.at(T::Error) {
+            self.bump();
+        }
         if self.at(k) {
             self.bump();
-            true
-        } else {
-            let found = self.kind().describe();
-            let want = k.glyph().unwrap_or_else(|| k.describe());
-            let sp = self.span();
-            self.error(sp, "E0200", format!("expected `{want}`, found {found}"));
-            false
+            return true;
         }
+        // Past the nesting limit every recovery diagnostic is suppressed (see `error`).
+        if self.depth_exceeded {
+            return false;
+        }
+        let mut want = std::mem::take(&mut self.expected);
+        if !want.contains(&k) {
+            want.push(k);
+        }
+        let want = describe_set(&want);
+        let found = self.found();
+        let cur = self.span();
+        let mut d = Diagnostic::error(format!("expected {want}, found {found}")).with_code("E0200");
+        d = if self.on_new_line() {
+            d.primary(
+                self.prev_span().shrink_to_hi(),
+                format!("expected {want} here"),
+            )
+            .secondary(cur, format!("unexpected {found}"))
+        } else {
+            d.primary(cur, format!("expected {want}"))
+        };
+        if let Some(open) = opener_of(k) {
+            if let Some(i) = self.delims.iter().rposition(|(o, _)| *o == open) {
+                let glyph = open.glyph().unwrap_or("delimiter");
+                d = d.secondary(self.delims[i].1, format!("this `{glyph}` is not closed"));
+                // Reported once: the next failed closer labels the next opener out.
+                self.delims.truncate(i);
+            }
+        }
+        self.diags.push(d);
+        false
     }
 
     fn error(&mut self, span: Span, code: &'static str, msg: impl Into<String>) {
@@ -168,8 +275,87 @@ impl<'a> Parser<'a> {
         if self.depth_exceeded {
             return;
         }
+        // A complaint about the current token when that token is the lexer's `Error` token: the
+        // lexer already reported the character (E0101/E0105), so "expected …, found invalid token"
+        // here would be a second error for one stray character.
+        if self.at(T::Error) && span == self.span() {
+            return;
+        }
         self.diags
             .push(Diagnostic::error(msg).with_code(code).primary(span, ""));
+    }
+
+    // ---- Statement-terminator lints (`W0030`, `W0031`) ----
+
+    /// End a statement: consume its `;`, or record `W0030` (see [`Parser::missing_semi`]).
+    fn end_stmt(&mut self, start: usize, mark: usize, what: &str, before_brace_ok: bool) {
+        if !self.eat(T::Semi) {
+            self.missing_semi(start, mark, what, before_brace_ok);
+        }
+    }
+
+    /// `W0030`: the statement that began at token `start` is not followed by `;`. Not reported
+    /// before the block's closing `}` when `before_brace_ok` (every statement but a `let`, as in
+    /// Rust), at end of file (the block's missing `}` is the error there), or for a statement that
+    /// is already broken: one that pushed an error since `mark` (the error count when it began), or
+    /// that a character rejected by the lexer cut short — its `;` is not what is missing.
+    fn missing_semi(&mut self, start: usize, mark: usize, what: &str, before_brace_ok: bool) {
+        if (before_brace_ok && self.at(T::RBrace))
+            || self.at(T::Eof)
+            || self.at(T::Error)
+            || self.diags.len() > mark
+            || self.tokens[start..self.pos]
+                .iter()
+                .any(|t| t.kind == T::Error)
+        {
+            return;
+        }
+        let mut d = Diagnostic::warning(format!("missing `;` after {what}"))
+            .with_code("W0030")
+            .primary(self.prev_span().shrink_to_hi(), "expected `;` here");
+        if !self.on_new_line() {
+            d = d.secondary(self.span(), "the next statement starts on the same line");
+        }
+        self.lints.push(d.help(
+            "end the statement with `;`. It may be left out only after a block-like statement \
+             (`if`, `match`, `loop`, `while`, `for`, `{ … }`) and, for any statement but a `let`, \
+             before the `}` that closes the block",
+        ));
+    }
+
+    /// `W0031`: the current token — a `(` or `[` about to be parsed as a call or index of the
+    /// expression before it, or a binary `-` — starts a new line, so the expression on the line
+    /// above continues into this one although the two read as separate statements (`acc = a[i]`
+    /// then `(b + c)` on the next line parse as the call `a[i](b + c)`). Reported only in statement
+    /// context — the innermost open delimiter is a `{` — where a new statement could have begun;
+    /// inside `(…)` or `[…]` none can, so nothing is ambiguous.
+    fn ambiguous_continuation(&mut self, reads_as: &str) {
+        let statement_context = matches!(self.delims.last(), Some((T::LBrace, _)));
+        if !(statement_context && self.on_new_line()) {
+            return;
+        }
+        let glyph = self.kind().glyph().unwrap_or("token");
+        let d = Diagnostic::warning(format!(
+            "`{glyph}` at the start of a line continues the expression on the line above"
+        ))
+        .with_code("W0031")
+        .primary(self.span(), format!("this `{glyph}` {reads_as}"))
+        .secondary(self.prev_span(), "the expression it continues ends here")
+        .help(
+            "if a new statement starts here, end the previous one with `;`; if the continuation is \
+             meant, move this token to the end of the line above",
+        );
+        self.lints.push(d);
+    }
+
+    /// Whether the current `-` (about to be read as a binary minus) starts a line and touches the
+    /// operand after it — `x` then `-1` on the next line, which reads as a negated new statement.
+    /// A `- y` with a space keeps the usual continued-subtraction style silent.
+    fn minus_reads_as_prefix(&self) -> bool {
+        let minus = self.span();
+        self.tokens
+            .get(self.pos + 1)
+            .is_some_and(|next| next.span.lo == minus.hi)
     }
 
     /// Maximum nesting depth of the recursive grammar productions before the parser bails with
@@ -226,7 +412,7 @@ impl<'a> Parser<'a> {
             self.error(
                 span,
                 "E0201",
-                format!("expected identifier, found {}", self.kind().describe()),
+                format!("expected identifier, found {}", self.found()),
             );
             Ident {
                 sym: self.interner.intern("«error»"),
@@ -389,7 +575,7 @@ impl<'a> Parser<'a> {
                 self.error(
                     sp,
                     "E0203",
-                    format!("expected type, found {}", self.kind().describe()),
+                    format!("expected type, found {}", self.found()),
                 );
                 self.bump();
                 TypeKind::Unit
@@ -685,6 +871,9 @@ impl<'a> Parser<'a> {
                 self.too_deep(sp);
                 break;
             }
+            if op == BinOp::Sub && self.minus_reads_as_prefix() {
+                self.ambiguous_continuation("subtracts from the expression above, not negates");
+            }
             self.bump();
             let rhs = self.parse_expr_bp(bp + 1);
             let span = lhs.span.to(rhs.span);
@@ -805,6 +994,7 @@ impl<'a> Parser<'a> {
             }
             match self.kind() {
                 T::LParen => {
+                    self.ambiguous_continuation("calls the expression above");
                     let args = self.parse_args();
                     lhs = self.finish_expr(
                         start,
@@ -816,6 +1006,7 @@ impl<'a> Parser<'a> {
                     );
                 }
                 T::LBracket => {
+                    self.ambiguous_continuation("indexes the expression above");
                     let bracket = self.span();
                     self.bump();
                     let mut indices = Vec::new();
@@ -1159,7 +1350,7 @@ impl<'a> Parser<'a> {
                 self.error(
                     sp,
                     "E0202",
-                    format!("expected an expression, found {}", self.kind().describe()),
+                    format!("expected an expression, found {}", self.found()),
                 );
                 self.bump();
                 self.finish_expr(start, ExprKind::TupleLit(Vec::new()))
@@ -1341,11 +1532,15 @@ impl<'a> Parser<'a> {
         let mut tail = None;
         while !self.at(T::RBrace) && !self.at(T::Eof) {
             let before = self.pos;
+            // The error count when this statement began: `missing_semi` stays quiet about a
+            // statement that has already been reported as broken.
+            let mark = self.diags.len();
             let stmt_start = self.span();
             let attrs = self.parse_attrs();
             match self.kind() {
                 T::Let => {
                     let k = self.parse_let();
+                    self.end_stmt(before, mark, "a `let` statement", false);
                     stmts.push(self.mk_stmt(attrs, k, stmt_start));
                 }
                 T::Const => {
@@ -1361,7 +1556,7 @@ impl<'a> Parser<'a> {
                     let ty = Some(self.parse_type());
                     self.expect(T::Eq);
                     let init = Some(self.parse_expr());
-                    self.eat(T::Semi);
+                    self.end_stmt(before, mark, "a `const` statement", false);
                     let k = StmtKind::Let {
                         pat,
                         mutable: false,
@@ -1377,7 +1572,7 @@ impl<'a> Parser<'a> {
                     } else {
                         Some(self.parse_expr())
                     };
-                    self.eat(T::Semi);
+                    self.end_stmt(before, mark, "`return`", true);
                     stmts.push(self.mk_stmt(attrs, StmtKind::Return(e), stmt_start));
                 }
                 T::Break => {
@@ -1395,7 +1590,7 @@ impl<'a> Parser<'a> {
                     } else {
                         Some(self.parse_expr())
                     };
-                    self.eat(T::Semi);
+                    self.end_stmt(before, mark, "`break`", true);
                     stmts.push(self.mk_stmt(attrs, StmtKind::Break(label, value), stmt_start));
                 }
                 T::Continue => {
@@ -1405,7 +1600,7 @@ impl<'a> Parser<'a> {
                     } else {
                         None
                     };
-                    self.eat(T::Semi);
+                    self.end_stmt(before, mark, "`continue`", true);
                     stmts.push(self.mk_stmt(attrs, StmtKind::Continue(label), stmt_start));
                 }
                 T::Defer => {
@@ -1469,7 +1664,7 @@ impl<'a> Parser<'a> {
                     if let Some(op) = cur_assign_op(self.kind()) {
                         self.bump();
                         let value = self.parse_expr();
-                        self.eat(T::Semi);
+                        self.end_stmt(before, mark, "an assignment", true);
                         stmts.push(self.mk_stmt(
                             attrs,
                             StmtKind::Assign {
@@ -1485,6 +1680,10 @@ impl<'a> Parser<'a> {
                         tail = Some(Box::new(e));
                         break;
                     } else {
+                        // A block-like expression ends its own statement (Rust's rule).
+                        if !is_block_like(&e) {
+                            self.missing_semi(before, mark, "an expression statement", true);
+                        }
                         stmts.push(self.mk_stmt(attrs, StmtKind::Expr(e), stmt_start));
                     }
                 }
@@ -1530,7 +1729,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        self.eat(T::Semi);
+        // The terminating `;` is the caller's (`parse_block`'s `end_stmt`).
         StmtKind::Let {
             pat,
             mutable,
@@ -1793,10 +1992,7 @@ impl<'a> Parser<'a> {
                     self.error(
                         start,
                         "E0206",
-                        format!(
-                            "expected an integer after `-`, found {}",
-                            self.kind().describe()
-                        ),
+                        format!("expected an integer after `-`, found {}", self.found()),
                     );
                     PatKind::Wildcard
                 }
@@ -1813,7 +2009,7 @@ impl<'a> Parser<'a> {
                 self.error(
                     start,
                     "E0206",
-                    format!("expected a pattern, found {}", self.kind().describe()),
+                    format!("expected a pattern, found {}", self.found()),
                 );
                 self.bump();
                 PatKind::Wildcard
@@ -2028,6 +2224,43 @@ fn binop_bp(op: BinOp) -> u8 {
         Shl | Shr => 7,
         Add | Sub => 8,
         Mul | Div | Rem => 9,
+    }
+}
+
+/// An expression that ends its own statement, as in Rust: a `{ … }` block, `if`, `match` or
+/// `loop`. Statement position needs no `;` after one.
+fn is_block_like(e: &Expr) -> bool {
+    matches!(
+        e.kind,
+        ExprKind::Block(_) | ExprKind::If { .. } | ExprKind::Match { .. } | ExprKind::Loop { .. }
+    )
+}
+
+/// The opening delimiter a closing one matches (`)` → `(`), or `None` for any other token.
+fn opener_of(k: TokenKind) -> Option<TokenKind> {
+    Some(match k {
+        T::RParen => T::LParen,
+        T::RBracket => T::LBracket,
+        T::RBrace => T::LBrace,
+        _ => return None,
+    })
+}
+
+/// "`)`", "one of `,` or `)`", "one of `,`, `.` or `)`" — a set of tokens for an "expected …"
+/// message, in the order the parser tried them. A lexical category reads as its noun
+/// ("identifier"), a fixed token as its glyph in backticks.
+fn describe_set(kinds: &[TokenKind]) -> String {
+    let names: Vec<String> = kinds
+        .iter()
+        .map(|k| match k.glyph() {
+            Some(g) => format!("`{g}`"),
+            None => k.describe().to_string(),
+        })
+        .collect();
+    match names.as_slice() {
+        [] => "a token".to_string(),
+        [one] => one.clone(),
+        [init @ .., last] => format!("one of {} or {last}", init.join(", ")),
     }
 }
 
@@ -2429,6 +2662,100 @@ mod tests {
             .expect("the parser must not overflow its stack on deeply nested structural input");
     }
 
+    /// A failed `expect` names every token the parser tried at that position, not just the last.
+    #[test]
+    fn expected_token_sets_name_every_alternative() {
+        let first = |src: &str| -> String {
+            let mut i = Interner::new();
+            let (_e, d) = parse_expr_str(src, SourceId(0), &mut i);
+            assert_eq!(d[0].code, Some("E0200"), "{src}: {d:?}");
+            d[0].message.clone()
+        };
+        assert_eq!(
+            first("f(a b)"),
+            "expected one of `,` or `)`, found identifier `b`"
+        );
+        assert_eq!(
+            first("[1, 2 3]"),
+            "expected one of `,` or `]`, found integer literal"
+        );
+        assert_eq!(
+            first("(1, 2 3)"),
+            "expected one of `,` or `)`, found integer literal"
+        );
+        // A lone requirement still reads as one token.
+        assert_eq!(first("(1 + 2;"), "expected `)`, found `;`");
+    }
+
+    /// A missing closer at the end of a line is reported where it is missing — just after the last
+    /// token of that line — not on the first token of the next line, which is what the parser had
+    /// moved on to. The token it ran into and the unclosed opener are secondary labels.
+    #[test]
+    fn missing_closer_is_anchored_after_the_previous_line() {
+        let src = "fn main() -> i32 {\n    let x: i32 = f(1, 2\n    return x;\n}\n";
+        let mut i = Interner::new();
+        let (_m, d) = parse_module(src, SourceId(0), &mut i);
+        let e = &d[0];
+        assert_eq!(e.code, Some("E0200"), "{d:?}");
+        assert_eq!(e.message, "expected one of `,` or `)`, found `return`");
+        let after_two = (src.find("2\n").unwrap() + 1) as u32;
+        let primary = e.primary_span().unwrap();
+        assert_eq!((primary.lo, primary.hi), (after_two, after_two));
+        let at = |needle: &str| src.find(needle).unwrap() as u32;
+        let secondary: Vec<u32> = e
+            .labels
+            .iter()
+            .filter(|l| !l.primary)
+            .map(|l| l.span.lo)
+            .collect();
+        assert!(secondary.contains(&at("return")), "{e:?}");
+        assert!(
+            secondary.contains(&at("(1, 2")),
+            "the opener must be labelled: {e:?}"
+        );
+    }
+
+    /// An unclosed `{` used to be "expected `}`, found end of file" pointing at the end of the
+    /// file and nowhere else; the brace that was never closed is now labelled.
+    #[test]
+    fn unclosed_brace_labels_its_opener() {
+        let src = "fn main() -> i32 {\n    if true {\n        return 1;\n    }\n    return 0;\n";
+        let mut i = Interner::new();
+        let (_m, d) = parse_module(src, SourceId(0), &mut i);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].message, "expected `}`, found end of file");
+        let opener = src.find('{').unwrap() as u32;
+        assert!(
+            d[0].labels
+                .iter()
+                .any(|l| !l.primary && l.span.lo == opener && l.message.contains("not closed")),
+            "{:?}",
+            d[0]
+        );
+    }
+
+    /// A character the lexer rejects costs exactly one diagnostic: the parser no longer adds
+    /// "expected an expression, found invalid token" (or a type / item / pattern variant of it) at
+    /// the same place.
+    #[test]
+    fn a_stray_character_costs_one_diagnostic() {
+        for src in [
+            "fn main() -> i32 {\n    let x: i32 = 1 $ 2;\n    return x;\n}\n",
+            "fn f(x: $) {}\n",
+            "$\nfn f() {}\n",
+            "fn f() -> i32 { match 1 { $ => 0, _ => 1 } }\n",
+            "fn f() -> i32 { return g(1 $); }\n",
+        ] {
+            let mut i = Interner::new();
+            let (_m, d) = parse_module(src, SourceId(0), &mut i);
+            assert_eq!(
+                d.iter().map(|x| x.code).collect::<Vec<_>>(),
+                vec![Some("E0101")],
+                "{src}"
+            );
+        }
+    }
+
     /// Moderately nested but entirely realistic input stays well under the limit and parses cleanly.
     #[test]
     fn moderate_nesting_parses_cleanly() {
@@ -2490,5 +2817,109 @@ mod tests {
             d.is_empty(),
             "wide shallow block should parse cleanly, got {d:?}"
         );
+    }
+
+    /// Parse `src` as a module through the driver's entry point; return the error codes and the
+    /// lint codes separately.
+    fn lint_codes(src: &str) -> (Vec<&'static str>, Vec<&'static str>) {
+        let mut i = Interner::new();
+        let (tokens, lexed) = wukong_lexer::tokenize(src, SourceId(0));
+        let out = parse_module_tokens_with_lints(&tokens, src, &mut i, 0);
+        let errors = lexed
+            .iter()
+            .chain(&out.diags)
+            .filter_map(|d| d.code)
+            .collect();
+        assert!(out
+            .lints
+            .iter()
+            .all(|d| d.severity == wukong_diag::Severity::Warning));
+        (errors, out.lints.iter().filter_map(|d| d.code).collect())
+    }
+
+    /// `W0030`: a statement's missing `;` is a warning (the parse is unchanged), anchored just
+    /// after the statement; the Rust exemptions hold — no `;` is needed after a block-like
+    /// statement, nor before the closing `}` for anything but a `let`.
+    #[test]
+    fn missing_semicolon_is_w0030_with_rust_exemptions() {
+        let src =
+            "fn main() -> i32 {\n    let a: i32 = 3\n    print(a)\n    a = 4\n    return a\n}\n";
+        let (errors, lints) = lint_codes(src);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            lints,
+            vec!["W0030", "W0030", "W0030"],
+            "let, print(a), a = 4"
+        );
+        let mut i = Interner::new();
+        let (tokens, _) = wukong_lexer::tokenize(src, SourceId(0));
+        let out = parse_module_tokens_with_lints(&tokens, src, &mut i, 0);
+        let after_three = (src.find("3\n").unwrap() + 1) as u32;
+        let at = out.lints[0].primary_span().unwrap();
+        assert_eq!((at.lo, at.hi), (after_three, after_three));
+        // Block-like statements, statements before `}`, and the old terminated forms are clean.
+        let clean = "fn main() -> i32 {\n    let x: i32 = 1;\n    if x > 0 { print(x); }\n    \
+                     loop { break }\n    match x { _ => { } }\n    while x < 0 { }\n    { print(2) }\n    \
+                     return x\n}\n";
+        assert_eq!(lint_codes(clean), (Vec::<&str>::new(), Vec::<&str>::new()));
+        // A `let` needs its `;` even before `}`.
+        assert_eq!(lint_codes("fn f() { let y: i32 = 2 }").1, vec!["W0030"]);
+        // Two statements on one line: still a missing `;`.
+        assert_eq!(
+            lint_codes("fn f() { let y: i32 = 2 let z: i32 = 3; }").1,
+            vec!["W0030"]
+        );
+    }
+
+    /// A statement that is already broken — a parse error inside it, or a character the lexer
+    /// rejected — is not also reported as missing its `;`.
+    #[test]
+    fn broken_statement_draws_no_w0030() {
+        let (errors, lints) =
+            lint_codes("fn main() -> i32 {\n    let x: i32 = 1 $ 2;\n    return x;\n}\n");
+        assert_eq!(errors, vec!["E0101"]);
+        assert_eq!(lints, Vec::<&str>::new());
+        let (errors, lints) =
+            lint_codes("fn main() -> i32 {\n    let x: i32 = f(1, 2\n    return x;\n}\n");
+        assert_eq!(errors, vec!["E0200"]);
+        assert_eq!(lints, Vec::<&str>::new());
+    }
+
+    /// `W0031`: a `(`, `[` or touching `-` that starts a line continues the expression above it.
+    /// Inside `(…)`/`[…]` no statement can begin, so nothing is reported there; a `- y` with a space
+    /// is the ordinary continued-subtraction style.
+    #[test]
+    fn line_leading_continuation_is_w0031() {
+        let src = "fn main() -> i32 {\n    let x: i32 = f\n    (2);\n    let y: i32 = a\n    [0];\n    \
+                   let z: i32 = x\n    -1;\n    let w: i32 = x * 10\n        - y;\n    return 0;\n}\n";
+        let (errors, lints) = lint_codes(src);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(lints, vec!["W0031", "W0031", "W0031"], "`(`, `[`, `-1`");
+        // The call still parses as a call: the lint changes no parse.
+        let mut i = Interner::new();
+        let (m, _) = parse_module(src, SourceId(0), &mut i);
+        let ItemKind::Fn(f) = &m.items[0].kind else {
+            panic!("expected a fn item")
+        };
+        let StmtKind::Let {
+            init: Some(init), ..
+        } = &f.body.as_ref().unwrap().stmts[0].kind
+        else {
+            panic!("expected `let x = …`")
+        };
+        assert!(matches!(init.kind, ExprKind::Call { .. }), "{init:?}");
+        // Inside parentheses a line-leading `(` or `-1` is unambiguous.
+        let inside =
+            "fn main() -> i32 {\n    let x: i32 = g(f\n        (2),\n        3\n        -1);\n    \
+                      return x;\n}\n";
+        assert_eq!(lint_codes(inside), (Vec::<&str>::new(), Vec::<&str>::new()));
+    }
+
+    /// The entry points other than `parse_module_tokens_with_lints` never report a lint.
+    #[test]
+    fn plain_entry_points_drop_lints() {
+        let mut i = Interner::new();
+        let (_m, d) = parse_module("fn f() { let y: i32 = 2 }", SourceId(0), &mut i);
+        assert!(d.is_empty(), "{d:?}");
     }
 }

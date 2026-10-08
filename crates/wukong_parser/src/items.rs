@@ -33,11 +33,41 @@ pub fn parse_module_tokens_from(
     interner: &mut Interner,
     first_node_id: u32,
 ) -> (Module, Vec<Diagnostic>, u32) {
+    let out = parse_module_tokens_with_lints(tokens, src, interner, first_node_id);
+    (out.module, out.diags, out.next_node)
+}
+
+/// Everything one parse produces: see [`parse_module_tokens_with_lints`].
+pub struct ParseOutput {
+    pub module: Module,
+    /// Parser errors (the lexer's diagnostics are the caller's, as for the other entry points).
+    pub diags: Vec<Diagnostic>,
+    /// The first `NodeId` after the last one allocated (see [`parse_module_tokens_from`]).
+    pub next_node: u32,
+    /// The parser's lint findings, as warnings with their lint code: `W0030` (a statement's `;` is
+    /// missing) and `W0031` (a `(`, `[` or touching `-` at the start of a line continues the
+    /// expression above it). Their levels (`-A/-W/-D`, `@allow` …) are not applied here.
+    pub lints: Vec<Diagnostic>,
+}
+
+/// [`parse_module_tokens_from`], plus the parser's lint findings in [`ParseOutput::lints`] — the
+/// driver's entry point. The other entry points drop the lints, so a caller that asserts a parse
+/// produced no diagnostic is not failed by a warning.
+pub fn parse_module_tokens_with_lints(
+    tokens: &[Token],
+    src: &str,
+    interner: &mut Interner,
+    first_node_id: u32,
+) -> ParseOutput {
     let mut p = Parser::new(tokens, src, interner);
     p.next_node = first_node_id;
-    let m = p.module();
-    let next = p.next_node;
-    (m, std::mem::take(&mut p.diags), next)
+    let module = p.module();
+    ParseOutput {
+        module,
+        diags: std::mem::take(&mut p.diags),
+        next_node: p.next_node,
+        lints: std::mem::take(&mut p.lints),
+    }
 }
 
 /// Convenience entry that lexes and parses in one step (tests / standalone use). Returns both
@@ -103,7 +133,7 @@ impl Parser<'_> {
                     format!(
                         "expected an item (fn, struct, enum, const, import, extern, trait, impl), \
                          found {}",
-                        self.kind().describe()
+                        self.found()
                     ),
                 );
                 self.recover_item();

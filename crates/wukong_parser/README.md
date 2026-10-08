@@ -5,8 +5,9 @@ Hand-written **recursive descent** for items, statements, types and patterns, pl
 nodes. Allocates `NodeId`s, interns identifiers and literal text, and recovers from every error —
 it never panics and never gives up on the rest of the file.
 
-**Place in pipeline:** after `tokenize`, before `wukong_sema`. `wukong_driver` calls
-`parse_module_tokens_from` so imported files get disjoint `NodeId` ranges.
+**Place in pipeline:** after `tokenize`, before `wukong_sema`. `wukong_driver` parses the root file
+with `parse_module_tokens_with_lints` (which also returns the parser's lints) and the import loader
+calls `parse_module_tokens_from`, so imported files get disjoint `NodeId` ranges.
 
 ## Key files
 
@@ -23,6 +24,10 @@ it never panics and never gives up on the rest of the file.
 
 - `parse_module_tokens(tokens, src, &mut Interner) -> (Module, Vec<Diagnostic>)`
 - `parse_module_tokens_from(…, first_node_id) -> (Module, Vec<Diagnostic>, u32)` — multi-file
+- `parse_module_tokens_with_lints(…, first_node_id) -> ParseOutput` — the same, plus `lints`: the
+  parser's warnings `W0030` (missing `;`) and `W0031` (a line-leading `(`, `[` or touching `-` that
+  continues the expression above). Every other entry point drops them, so a caller asserting a
+  clean parse is never failed by a warning.
 - `parse_module(src, SourceId, &mut Interner)` — lex + parse (tests)
 - `parse_expr_str` / `parse_type_str` — standalone parse for tests
 
@@ -40,6 +45,8 @@ it never panics and never gives up on the rest of the file.
 | `E0207` | `parse_attr_arg` / `parse_attr_val` |
 | `E0208` | `parse_item` — expected item at module scope |
 | `E0209` | `too_deep` — nesting limit |
+| `W0030` | `missing_semi` (lint channel) — statement without `;`; quiet after an error in the statement |
+| `W0031` | `ambiguous_continuation` (lint channel) — only where the innermost open delimiter is `{` |
 
 Codes are stable — never renumber, never recycle. Fixtures: `tests/fail/expected_expr.wk` (E0202),
 `expected_item.wk` (E0208), `deep_nesting.wk` + `deep_blocks.wk` (E0209); others in

@@ -1,0 +1,17 @@
+// EXPECT-WARN: W0003
+module tests.warn.unreachable_code
+
+// The `print` after the `return` never runs: one warning for the block, on its first dead
+// statement.
+fn clamp(x: i32) -> i32 {
+    if x > 100 {
+        return 100;
+        print(x);
+    }
+    return x;
+}
+
+fn main() -> i32 {
+    print(clamp(250));
+    return 0;
+}

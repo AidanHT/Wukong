@@ -16,6 +16,7 @@ use wukong_diag::{Diagnostic, DiagnosticSink, Renderer};
 use wukong_span::{Interner, SourceMap};
 
 pub use wukong_diag::{all_explanations, explain, Explanation};
+pub use wukong_sema::lints::{LintLevel, LintLevels, LINTS};
 
 /// The GPU offloading bridge (`--backend=gpu`), compiled only with the `gpu` feature.
 #[cfg(feature = "gpu")]
@@ -111,6 +112,10 @@ pub struct Options {
     pub opt_level: u8,
     /// Validate MIR after each optimizer pass, including in release builds (`--verify-each`).
     pub verify_each: bool,
+    /// Lint levels from the command line (`-A/-W/-D <lint>`, `-D warnings`), applied on top of each
+    /// lint's default; `@allow/@warn/@deny` attributes in the source refine them per item. See
+    /// `wukong_sema::lints`.
+    pub lint_levels: LintLevels,
     pub color: bool,
     pub error_format: ErrorFormat,
     /// Which backend to run/emit with. `--run` defaults to the interpreter (the reference oracle);
@@ -179,6 +184,7 @@ impl Default for Options {
             run: false,
             opt_level: 0,
             verify_each: false,
+            lint_levels: LintLevels::default(),
             color: true,
             error_format: ErrorFormat::Human,
             backend: BackendKind::Interp,
@@ -296,8 +302,14 @@ pub fn compile(opts: &Options) -> i32 {
 
     // --- Parsing ---
     let mut interner = Interner::new();
-    let (mut module, parse_diags, mut next_node) =
-        wukong_parser::parse_module_tokens_from(&tokens, sm.source(id), &mut interner, 0);
+    // The root file's parser lints (`W0030`/`W0031`) wait for the lint stage below, where every
+    // lint's level is resolved together; imported files are parsed by the loader without them.
+    let wukong_parser::ParseOutput {
+        mut module,
+        diags: parse_diags,
+        mut next_node,
+        lints: parse_lints,
+    } = wukong_parser::parse_module_tokens_with_lints(&tokens, sm.source(id), &mut interner, 0);
     // The AST owns its data; keep root tokens out of the import/sema/backend memory peak.
     drop(tokens);
     for d in parse_diags {
@@ -310,8 +322,9 @@ pub fn compile(opts: &Options) -> i32 {
     // (`--emit=mir-high` onward, `--run`) sees.
     if opts.emit == EmitStage::Ast {
         render_all(opts.error_format, &renderer, &sink, &sm);
+        let denied = render_lints(parse_lints, &module, &interner, opts, &renderer, &sm);
         print_artifact(&wukong_ast::print::print_module(&module, &interner));
-        return if sink.has_errors() {
+        return if sink.has_errors() || denied {
             exit::COMPILE_ERROR
         } else {
             exit::OK
@@ -320,6 +333,7 @@ pub fn compile(opts: &Options) -> i32 {
 
     if sink.has_errors() {
         render_all(opts.error_format, &renderer, &sink, &sm);
+        render_lints(parse_lints, &module, &interner, opts, &renderer, &sm);
         return exit::COMPILE_ERROR;
     }
 
@@ -341,6 +355,7 @@ pub fn compile(opts: &Options) -> i32 {
     );
     render_all(opts.error_format, &renderer, &sink, &sm);
     if sink.has_errors() {
+        render_lints(parse_lints, &module, &interner, opts, &renderer, &sm);
         return exit::COMPILE_ERROR;
     }
     drop(sink);
@@ -351,9 +366,34 @@ pub fn compile(opts: &Options) -> i32 {
         emit_diag(d, opts.error_format, &renderer, &sm);
     }
     if sema_diags.iter().any(|d| d.is_error()) {
+        // The parser's lints still print — after the errors — when sema fails: a `(` that
+        // continued the line above (`W0031`) is often why a call does not type-check.
+        render_lints(parse_lints, &module, &interner, opts, &renderer, &sm);
         return exit::COMPILE_ERROR;
     }
     drop(sema_diags);
+
+    // --- Lints (`W0xxx`; see `wukong_sema::lints`) ---
+    // Only a program that checks clean is linted. Levels (`-A/-W/-D`, `@allow/@warn/@deny`) are
+    // resolved now, while the AST is alive, and a denied lint stops the build here as an error.
+    // Warnings are held back and printed after lowering's diagnostics, so a failed build always
+    // leads with an error — the contract `tests/fail` pins on the first diagnostic.
+    let mut found = parse_lints;
+    found.extend(wukong_sema::lints::run(
+        &module,
+        &sema,
+        &interner,
+        &lint_options_for(opts),
+    ));
+    let lint_diags = wukong_sema::lints::apply_levels(found, &module, &interner, &opts.lint_levels);
+    if lint_diags.iter().any(Diagnostic::is_error) {
+        let (denied, warned): (Vec<&Diagnostic>, Vec<&Diagnostic>) =
+            lint_diags.iter().partition(|d| d.is_error());
+        for d in denied.into_iter().chain(warned) {
+            emit_diag(d, opts.error_format, &renderer, &sm);
+        }
+        return exit::COMPILE_ERROR;
+    }
 
     // For `--train`, recover the loss function's buffer element counts from the semantic types now,
     // while the `[f32; N]` / `Tensor[..]` annotations are still available (they are lost once the
@@ -384,6 +424,11 @@ pub fn compile(opts: &Options) -> i32 {
     for d in &lower_diags {
         emit_diag(d, opts.error_format, &renderer, &sm);
     }
+    // The held-back lint warnings, after any lowering error (see the lint stage above).
+    for d in &lint_diags {
+        emit_diag(d, opts.error_format, &renderer, &sm);
+    }
+    drop(lint_diags);
     drop(sm);
     let lowering_failed = lower_diags.iter().any(|d| d.is_error());
     drop(lower_diags);
@@ -2009,6 +2054,40 @@ fn emit_diag(d: &Diagnostic, fmt: ErrorFormat, renderer: &Renderer, sm: &SourceM
 fn render_all(fmt: ErrorFormat, renderer: &Renderer, sink: &DiagnosticSink, sm: &SourceMap) {
     for d in sink.diagnostics() {
         emit_diag(d, fmt, renderer, sm);
+    }
+}
+
+/// Resolve the levels of `lints` (the parser's, on a build that stops before the lint stage)
+/// against `module` and render them, after whatever was rendered before. Returns whether any was
+/// denied, i.e. is now an error.
+fn render_lints(
+    lints: Vec<Diagnostic>,
+    module: &wukong_ast::Module,
+    interner: &Interner,
+    opts: &Options,
+    renderer: &Renderer,
+    sm: &SourceMap,
+) -> bool {
+    let lints = wukong_sema::lints::apply_levels(lints, module, interner, &opts.lint_levels);
+    for d in &lints {
+        emit_diag(d, opts.error_format, renderer, sm);
+    }
+    lints.iter().any(Diagnostic::is_error)
+}
+
+/// What the lint pass must know about how this build's artifact is used: which functions besides
+/// `main` an outside caller enters (`dead_code`'s roots). Under `--emit=grad`/`--train` the driver
+/// itself calls the `--grad-of` function by name; an `--emit=obj`/`--emit=llvm-ir` artifact is
+/// linked by a host that may call any of its exported functions.
+fn lint_options_for(opts: &Options) -> wukong_sema::lints::LintOptions {
+    let grad = opts.grad.train || opts.emit == EmitStage::Grad;
+    wukong_sema::lints::LintOptions {
+        roots: if grad {
+            vec![opts.grad.of.clone().unwrap_or_else(|| "loss".to_string())]
+        } else {
+            Vec::new()
+        },
+        library: !opts.run && !grad && matches!(opts.emit, EmitStage::Obj | EmitStage::LlvmIr),
     }
 }
 

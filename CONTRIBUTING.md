@@ -175,6 +175,15 @@ code some stage emits with no entry (`every_emitted_code_is_catalogued`) and an 
 Verify the fixture against the real binary; plausible spellings often reach a *different* code, and
 write the body against what the check actually rejects, not what it was designed to reject.
 
+**A warning (lint)** follows the same three steps with a `W` code: a `Lint { name, code, default }`
+row in `LINTS` (`crates/wukong_sema/src/lints.rs`) — the name is what `-A/-W/-D` and
+`@allow/@warn/@deny` take — an `entry!("W00nn", …)` in the catalogue's warning block, and a
+`tests/warn/<name>.wk` fixture listing every diagnostic it must produce, in order, as
+`// EXPECT-WARN: W00nn` lines (`// EXPECT-ERROR:` for a denied lint, `// EXPECT-NONE` for a program
+that must stay silent, `// FLAGS:` for extra arguments). `crates/wukongc/tests/warn.rs` compares the
+whole JSON diagnostic stream, so a fixture pins what a lint must NOT say as much as what it must. A
+lint must err toward silence: a finding the user cannot fix without an `@allow` is a lint bug.
+
 ## Adding an optimizer pass
 
 Implement `wukong_opt::Pass` and register it in `PassManager::standard` — the level tests there are

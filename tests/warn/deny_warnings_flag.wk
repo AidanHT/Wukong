@@ -1,0 +1,9 @@
+// FLAGS: -D warnings
+// EXPECT-ERROR: W0001
+module tests.warn.deny_warnings_flag
+
+// `-D warnings` makes every warning an error, so an unused variable fails the build.
+fn main() -> i32 {
+    let unused: i32 = 3;
+    return 0;
+}

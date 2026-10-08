@@ -6,9 +6,9 @@
 //! is told the code is unknown — and the catalogue could keep an entry for a code no stage
 //! produces, documenting a rule that does not exist. Both directions are gated here.
 //!
-//! The scan is textual: every `"Ennnn"` / `"Cnnnn"` string literal under `crates/`, excluding
-//! `target/` build output and `wukong_diag` itself (whose code strings are the catalogue and its
-//! own tests, not emissions). Codes are always written as literals at the `self.error(..)` /
+//! The scan is textual: every `"Ennnn"` / `"Cnnnn"` / `"Wnnnn"` string literal under `crates/`,
+//! excluding `target/` build output and `wukong_diag` itself (whose code strings are the catalogue
+//! and its own tests, not emissions). Codes are always written as literals at the `self.error(..)` /
 //! `.with_code(..)` site, so this sees all of them. Note the reverse direction accepts a mention
 //! from any source file, including a `#[cfg(test)]` module: it catches an entry with no reference
 //! anywhere, not one whose only reference is a test.
@@ -47,7 +47,8 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Every `"Ennnn"` / `"Cnnnn"` string literal in `src`, paired with its 1-based line.
+/// Every `"Ennnn"` / `"Cnnnn"` / `"Wnnnn"` (error, codegen-limit, warning) string literal in `src`,
+/// paired with its 1-based line.
 ///
 /// Comment lines are skipped. A code named in prose is *documentation*, not an emit site, and
 /// counting it makes this gate fire on a file that merely explains the numbering — which is what
@@ -64,7 +65,7 @@ fn codes_in(src: &str) -> Vec<(String, usize)> {
         let b = line.as_bytes();
         for j in 0..b.len().saturating_sub(6) {
             if b[j] == b'"'
-                && (b[j + 1] == b'E' || b[j + 1] == b'C')
+                && matches!(b[j + 1], b'E' | b'C' | b'W')
                 && b[j + 2..j + 6].iter().all(u8::is_ascii_digit)
                 && b[j + 6] == b'"'
             {

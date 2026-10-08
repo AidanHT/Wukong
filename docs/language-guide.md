@@ -39,6 +39,18 @@ A file conventionally begins with a `module` declaration; the header is **option
 informational (see *Modules & imports*), so a single-file program may omit it. Execution starts at
 `fn main() -> i32`, and the integer it returns becomes the process exit code.
 
+## Source text ✅
+
+Source files are UTF-8; a leading byte-order mark is ignored. Outside string literals, char
+literals and comments the text is **ASCII**: identifiers are letters, digits and `_` (a Greek
+letter must be spelled out, `alpha` for `α`; `E0101` names the code point and suggests the
+spelling). A Unicode character that merely *looks* like ASCII — `−` (U+2212 MINUS SIGN) or a dash
+for `-`, `×` for `*`, `≤` for `<=`, fullwidth punctuation, curly quotes, a no-break or zero-width
+space — is `E0105`, which names the code point and the ASCII character it imitates. The compiler
+then reads it as that ASCII token (a lookalike space is skipped), so one character pasted from a
+paper costs one error (`tests/fail/confusable_minus.wk`); a lookalike quote cannot open a literal
+and is an error token.
+
 ## Modules & imports ✅
 
 ```wukong
@@ -1132,6 +1144,58 @@ round-trip is **differentially
 tested to agree bit-for-bit** across the interpreter and the native Cranelift backend, exactly as the
 ✅ maturity legend requires.
 
+## Warnings (lints) ✅
+
+A program that type- and shape-checks clean is linted: the compiler warns about code that compiles
+but is probably not what was meant. A warning never changes what a program computes and never
+stops a build unless its level says so. Each lint has a stable code (`wukongc --explain W0001`)
+and a name:
+
+| Code | Name | Reports |
+|---|---|---|
+| `W0001` | `unused_variables` | a `let`, parameter, `for` variable or `match` binding never read — including an accumulator that is only ever assigned (`acc += x` with `acc` never read) |
+| `W0002` | `unused_mut` | a scalar or pointer binding declared `mut` that is never reassigned or borrowed (`*p = v` writes the pointee, not `p`) |
+| `W0003` | `unreachable_code` | code after a `return`/`break`/`continue` or after a construct that diverges on every path, judged exactly as the definite-return check judges it |
+| `W0004` | `unused_result` | an expression statement whose value is thrown away with no effect — above all `out[i] == a[i] + b[i];` written for `=` |
+| `W0005` | `dead_code` | a function of the compiled file no entry point reaches (`main`, the `--grad-of` function under `--emit=grad`/`--train`, `pub`, `@export`/`@extern`); nothing under `--emit=obj`/`llvm-ir` or in a file with no `main` |
+| `W0006` | `unwritten_output` | a `mut` array/slice/tensor/tuple/struct parameter — an output buffer — that is never stored to, assigned, passed on or borrowed |
+| `W0007` | `unknown_lints` | an `@allow`/`@warn`/`@deny` argument that names no lint |
+| `W0030` | `missing_semicolon` | a statement without its `;` (see below) |
+| `W0031` | `ambiguous_continuation` | a `(` or `[`, or a `-` touching its operand, at the start of a line, continuing the expression above it |
+
+A name prefixed with `_` (`_scratch`) is never reported as unused. Levels: **allow** (silent),
+**warn** (the default for every lint) and **deny** (an error; the build fails). Set them on the
+command line — `-A <lint>`, `-W <lint>`, `-D <lint>`, where `<lint>` is a name, a code or
+`warnings` (every lint), so `-D warnings` fails the build on any warning — or in source, on a
+function, a parameter or a statement:
+
+```wukong
+@allow(dead_code)
+fn kept_for_later() -> i32 { return 1; }
+
+fn main() -> i32 {
+    @allow(unused_variables)
+    let scratch: i32 = 7;
+    return 0;
+}
+```
+
+The innermost attribute wins over an outer one and over the command line; `-D warnings` applies to
+every lint still at warning level, so it does not resurrect an allowed one. Warnings are printed
+after any error. The lints that need types run only on a program that checks clean; the parser's
+two (`W0030`, `W0031`) are reported for the compiled file even when a later stage fails, since a
+line that silently continued the one above is often why it failed. The fixtures in `tests/warn/`
+pin each lint's exact output.
+
+**Statements end with `;`.** It may be left out only after a block-like statement — `if`,
+`match`, `loop`, `while`, `for`, a `{ … }` block — and, for any statement but a `let`, right
+before the `}` that closes the block (Rust's rule). Leaving it out elsewhere still parses the same
+(`W0030` is a warning, not yet an error), but it is what makes the next hazard possible: a `(`
+or `[` that starts a line is a call or an index of the expression on the line above, and so is a
+`-` that starts a line and touches its operand (`-1`). `acc = a[i]` followed by `(b + c)` on the
+next line is `acc = a[i](b + c)`; `W0031` reports it. A `- y` with a space is the ordinary way to
+continue a long subtraction and is not reported.
+
 ## Command-line interface
 
 ```
@@ -1165,6 +1229,10 @@ wukongc [OPTIONS] <input.wk>
                       on unix). Rejected with --run and with every other stage, which print their
                       artifact on stdout — redirect instead.
 --error-format=<f>    human | json   (default: human)
+-A|-W|-D <lint>       allow / warn on / deny (report as an error) a lint; <lint> is a name
+                      (unused_variables), its code (W0001) or `warnings` (every lint):
+                      `-D warnings` fails the build on any warning. Repeatable; `-Dwarnings`
+                      works too; an unknown lint is a usage error (exit 2). See "Warnings (lints)"
 --explain <CODE>      print an extended explanation for an error code
 --color=<when>        auto | always | never   (default: auto — colour when stderr is a terminal)
 -h, --help            print the usage text and exit 0

@@ -1,0 +1,14 @@
+// EXPECT-NONE
+module tests.warn.allow_attribute
+
+// `@allow` silences a lint for the item or statement it is written on, and nowhere else.
+@allow(dead_code)
+fn unused_helper() -> i32 {
+    return 1;
+}
+
+fn main() -> i32 {
+    @allow(unused_variables)
+    let scratch: i32 = 7;
+    return 0;
+}

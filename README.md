@@ -103,6 +103,13 @@ not duplicate them. In summary, Wukong:
   stay bit-exact (`tests/run/extern_c_libm.wk`). Exporting Wukong kernels under a stable C name
   (`@export`) and the `@extern("C")` attribute spelling remain planned; attribute names are
   validated against the closed language set (unknown names report `E0306`).
+- **Warnings for kernels that compile but compute nothing.** A program that checks clean is linted
+  (`W0001`–`W0007`, `W0030`/`W0031`): an unused variable or an accumulator that is never read, a
+  `mut` output buffer that is never written, `out[i] == a[i] + b[i];` written for `=`, unreachable
+  code, an unreachable function, a missing `;`, and a `(`/`[`/`-` at the start of a line that
+  silently continues the expression above. Levels come from `-A/-W/-D <lint>` (`-D warnings`) and
+  `@allow/@warn/@deny(<lint>)`; see `docs/language-guide.md`. A Unicode lookalike of ASCII
+  punctuation (`−` U+2212 for `-`) is `E0105`, naming the character it imitates.
 
 ## Runs the real GPT-2 124M end-to-end
 
