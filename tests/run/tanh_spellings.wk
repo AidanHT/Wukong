@@ -50,10 +50,15 @@ fn main() -> i32 {
     let x: [f32; 12] = [-3.0, -0.8, -0.75, -0.5, -0.3, 0.0, 0.000000014901161193847656, 0.3, 0.76, 2.0, 5.0, -0.000000014901161193847656];
     let mut dispatched: [f32; 12] = [0.0; 12];
     let mut composed: [f32; 12] = [0.0; 12];
-    let s: f32 = 1.0;
     for i in 0..12 {
         dispatched[i] = tanh(x[i]);
     }
+    // This `let` sits between the two loops on purpose. Adjacent `for` loops over an identical
+    // range are fused into one loop whenever the fused body vectorizes (`try_fuse_run`), and the
+    // fused two-statement body is no elementwise kernel's shape, so with the loops adjacent NEITHER
+    // spelling dispatched and this fixture compared the inlined `tanh` with itself. Separated, the
+    // first loop is the `wukong_vmath_f32` dispatch the comparison is about (see the census).
+    let s: f32 = 1.0;
     for i in 0..12 {
         composed[i] = tanh(x[i]) * s;
     }

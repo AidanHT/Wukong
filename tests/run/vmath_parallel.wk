@@ -19,11 +19,18 @@ module tests.run.vmath_parallel
 // cranelift signature/import (declare_function + declare_func_in_func + the by-name emit arm), so the
 // call fell through and the gelu became a silent NO-OP on native (out stayed x*2, un-gelu'd). gelu is
 // strongly nonlinear, so a no-op would flip every sample below — this fixture catches that exact class.
+//
+// The `let n` between the two loops keeps them apart on purpose. Adjacent `for` loops over an
+// identical range are fused whenever the fused body vectorizes (`try_fuse_run`); since slices reach
+// the vectorizer, the fused `x*2.0` + `gelu` body does, and that two-statement body is no elementwise
+// kernel's shape. With the loops adjacent, f dispatched nothing at all — neither
+// wukong_velem_f32_parallel nor the wukong_vmath_f32_parallel this fixture exists to guard.
 
 @parallel
 fn f(x: []f32, mut out: []f32) {
     for i in 0..20000 { out[i] = x[i] * 2.0; }
-    for i in 0..20000 { out[i] = gelu(out[i]); }
+    let n: i64 = 20000;
+    for i in 0..n { out[i] = gelu(out[i]); }
 }
 
 fn main() -> i32 {

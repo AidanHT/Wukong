@@ -1295,8 +1295,10 @@ module tests.run.embedding_alias_parallel
 // On the campaign base `embed(ids, buf, buf)` printed 2432, 2456, 2400, 1120, 1280 over five
 // consecutive native runs — a data race whose answer is only sometimes right. Both nests are
 // order-dependent in place (`ids[t] < 8`, so every source row is overwritten while the loop runs), so
-// the serial kernel — which touches the same rows in the same order as the nest — is the only correct
-// lowering, and the numbers below are what the scalar nests compute, verified independently.
+// the overlapping case must run the nest itself, and the numbers below are what the scalar nests
+// compute, verified independently. The run-time range test's may-overlap arm is the ORIGINAL source
+// loop (`kernel_guard.rs`), not the serial kernel it once was: `wukong_embedding_f32` copies eight
+// lanes at a time and its own `# Safety` requires non-overlapping operands too.
 //
 // The distinct-buffer calls keep the non-overlapping path (the run-time range test's true arm, which
 // still dispatches `wukong_embedding_f32_parallel` / `wukong_scatter_add_f32_parallel`) covered.
