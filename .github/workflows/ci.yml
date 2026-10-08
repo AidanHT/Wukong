@@ -11,7 +11,14 @@ name: CI
 # perform it.
 on:
   push:
-    branches: [main, 'sota/**']
+    # Campaign work lives off-main on long-lived branch families (AGENT-PROTOCOL.md "Base and
+    # branches"): `sota/**` workstreams, `gap*/**` gap-closeout branches, `integrate/**` integration
+    # bases and `closeout/**` continuation branches. A PR into any base already runs the full matrix
+    # (`pull_request:` carries no branch filter), but campaign branches are merged directly far more
+    # often than they are PR'd, so the only way CI sees them is a push trigger that names the family.
+    # Listing them here makes the two-OS matrix, the `-D warnings` policy and the MSRV/Miri jobs fire
+    # on a push to a campaign branch instead of staying dark until the one large merge to `main`.
+    branches: [main, 'sota/**', 'gap*/**', 'integrate/**', 'closeout/**']
   pull_request:
 
 env:
@@ -266,3 +273,70 @@ jobs:
 
       - name: Check the workspace on the declared MSRV
         run: cargo check --workspace --locked
+
+  # MIRI IS THE ONLY GATE THAT CAN SEE A MEMORY ERROR. `wukong_runtime` is 650+ unsafe blocks and
+  # 150+ C-ABI entry points of raw-pointer arithmetic, and until this job nothing in the tree -- no
+  # sanitizer, no valgrind, no fuzzer -- could observe an out-of-bounds access, a use of
+  # uninitialized memory, or an aliasing-rule violation. The crate is already shaped for Miri: every
+  # kernel dispatches through `is_x86_feature_detected!("avx2")`, which Miri evaluates to FALSE, so
+  # on the interpreter every entry falls to its portable scalar twin -- and those twins are the exact
+  # raw-pointer code this job exercises. The AVX2 intrinsic bodies are never reached under Miri (it
+  # does not model the x86 vector ISA), which is both why the scalar twins exist and why this lane is
+  # possible at all.
+  #
+  # WHAT THE CURATED FILTER IS AND WHY `continue-on-error: false` is scoped to it. The one step that
+  # MUST pass runs `boundary_extents` -- the per-module nonpositive/boundary-extent tests, which call
+  # only the SERIAL dispatched entry points (never a `_parallel` arm, so Miri never starts a rayon
+  # pool), on small well-formed disjoint buffers. Those take the scalar path under Miri and exercise
+  # the guard + raw-pointer body of every module's entry without touching rayon, the filesystem, the
+  # clock or an AVX2 intrinsic -- the four things the finder named as Miri blockers. It is a subset I
+  # can justify line by line, which is the bar a blocking gate has to clear.
+  #
+  # The second step runs the FULL `--lib` suite under `continue-on-error: true`: informational
+  # coverage of the whole scalar surface that must not block a campaign branch, because the broad
+  # suite still contains rayon-backed `_parallel`, `std::fs` file-I/O and `std::time` tests that Miri
+  # cannot run under `-Zmiri-disable-isolation` alone (those are follow-up `#[cfg_attr(miri, ignore)]`
+  # work). `-Zmiri-disable-isolation` lets the clock/`getrandom` syscalls through; permissive
+  # provenance accepts the crate's `ptr as usize`/`usize as *const T` smuggling on the serial surface.
+  miri:
+    name: Miri (wukong_runtime scalar twins)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly + Miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Its own key: Miri builds a distinct (nightly, miri-instrumented) `target/` graph.
+          key: ${{ runner.os }}-cargo-miri-${{ hashFiles('**/Cargo.lock') }}
+
+      # `+nightly` explicitly overrides `rust-toolchain.toml` (which pins `stable`), and `miri setup`
+      # builds Miri's sysroot once so the first `miri test` does not time out doing it inline.
+      - name: Miri setup
+        run: cargo +nightly miri setup --locked
+
+      # The blocking gate: the curated scalar-twin subset only. `-Zmiri-permissive-provenance`
+      # accepts the pointer<->integer smuggling the kernels use; `-Zmiri-disable-isolation` allows
+      # the degenerate tests' time/rng-free entry calls through without a sandbox denial.
+      - name: Miri -- scalar twins (boundary + degenerate extents)
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-permissive-provenance
+        run: cargo +nightly miri test -p wukong_runtime --locked --lib boundary_extents
+
+      # Informational: the whole scalar lib surface. Allowed to fail -- it still includes rayon,
+      # filesystem and clock tests that need per-test `#[cfg_attr(miri, ignore)]` before they are
+      # Miri-clean. Read the first fault, not the count.
+      - name: Miri -- full scalar lib surface (informational)
+        continue-on-error: true
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-permissive-provenance
+        run: cargo +nightly miri test -p wukong_runtime --locked --lib
