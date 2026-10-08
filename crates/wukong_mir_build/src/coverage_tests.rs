@@ -537,6 +537,39 @@ fn ragged(a: [f32; 1024], b: [f32; 1024], mut c: [f32; 1024]) {
     );
 }
 
+/// Every op of `f`, in block order.
+fn ops(f: &Function) -> Vec<&Op> {
+    f.blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .map(|i| &i.op)
+        .collect()
+}
+
+/// `min`/`max` on integers used to be `C0001`; they are a compare in the result type's signedness
+/// and a select.
+#[test]
+fn min_and_max_lower_to_a_compare_and_a_select() {
+    let src = "module m
+fn f(a: usize, b: usize, c: i32, d: i32) -> usize {
+    let lo: usize = min(a, b);
+    let hi: i32 = max(c, d);
+    return lo + (hi as usize);
+}
+";
+    let (prog, _, interner) = lower_src(src);
+    let ops = ops(func(&prog, &interner, "f"));
+    assert!(
+        ops.iter().any(|o| matches!(o, Op::Cmp(CmpOp::Ult, ..))),
+        "usize min compares unsigned"
+    );
+    assert!(
+        ops.iter().any(|o| matches!(o, Op::Cmp(CmpOp::Sgt, ..))),
+        "i32 max compares signed"
+    );
+    assert!(ops.iter().filter(|o| matches!(o, Op::Select(..))).count() >= 2);
+}
+
 // ---- P12.14: per-loop `@generic` and the dispatch report ---------------------------------------
 
 #[test]

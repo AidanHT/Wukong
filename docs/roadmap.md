@@ -384,6 +384,11 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   an integer (integer `abs` = `select(x<0, −x, x)`; rounding an integer is the identity), and `sqrt` /
   the transcendentals promote an integer operand to `f32` — so they no longer emit the float-op-on-int
   MIR that the native backend rejected and the interpreter ran lossily (`tests/run/int_math.wk`).
+- **`min(a, b)` / `max(a, b)`** (2026-10-08, `gap/recognizer-coverage`): integer (and float)
+  minimum/maximum, a compare in the result type's signedness plus a select, so a `usize` compares
+  unsigned; on floats they are `fmin`/`fmax`; the result is the operands' common type, as for `+`.
+  Before this a call was `C0001` — which made the ragged-tile spelling `for i in i0..min(i0 + T, M)`
+  (the one `examples/matmul.wk` uses) impossible to compile at all (`tests/run/min_max_builtin.wk`).
 - **Convolution via im2col + GEMM**: a conv written as an im2col gather followed by a matmul has its
   matmul recognized and dispatched to the tuned GEMM microkernel (the XLA/cuDNN lowering), so Wukong
   runs a 3×3 conv **~1.55× faster** than a hand-written direct convolution in C — and 1.12× *slower*

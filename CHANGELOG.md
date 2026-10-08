@@ -13,6 +13,8 @@ All notable changes to Wukong are documented here. The format is loosely based o
   and log-softmax (`wukong_norm_f32(x, o, …)`), hand-tiled matmuls (`for … step T` and `while` tile
   loops), and elementwise loops over a `usize` counter or a symbolic tensor dim (behind a run-time
   `end >= 0` test). Fixtures `tests/run/spelling_*.wk` print every lane.
+- **`min(a, b)` / `max(a, b)` builtins** for integers (compared in the result type's signedness) and
+  floats (exactly `fmin`/`fmax`); a call used to be `C0001` (`tests/run/min_max_builtin.wk`).
 - **`@generic` on a `for`/`while` loop** opts that loop (and everything in it) out of kernel
   recognition; it was legal on a `fn` item only. No recognizer replaces code containing one: a
   window is not formed over it, an enclosing loop is not matched as a whole nest (its other inner

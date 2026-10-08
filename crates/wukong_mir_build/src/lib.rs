@@ -34,6 +34,7 @@ mod coverage_tests;
 mod detile;
 mod dispatch;
 mod elementwise;
+mod minmax;
 mod softmax_oop;
 mod tile;
 mod tindex;
@@ -20661,6 +20662,10 @@ impl FnLowerer<'_> {
                 }
                 // Fused attention `sdpa(...)` lowers to one runtime-kernel call (no S×S scores).
                 if let Some(v) = self.lower_attention(name, args) {
+                    return v;
+                }
+                // `min(a, b)` / `max(a, b)`, integer or float (`minmax.rs`).
+                if let Some(v) = self.lower_min_max(name, args, e) {
                     return v;
                 }
                 // Math builtins (sqrt/rsqrt/exp/fmax/fmin) lower to primitive ops. User functions

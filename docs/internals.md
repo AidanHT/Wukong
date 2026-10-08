@@ -539,7 +539,9 @@ lane type, so lane `k` always computes exactly what scalar iteration `base+k` wo
 family (`round`/`floor`/`ceil`/`trunc`) as one lane op, `fmax`/`fmin` as a lane compare + blend, and the
 transcendentals and activations (`exp`, `log`, `tanh`, `sigmoid`, `silu`, `gelu`, …) as their inline f32
 polynomial expanded per lane — only for an f32 lane, and only while the name does not resolve to a user
-`fn` (a user `fn gelu` wins and the loop stays scalar). `@parallel` per-thread chunks go through the
+`fn` (a user `fn gelu` wins and the loop stays scalar). The integer-or-float `min`/`max` builtins
+(`wukong_mir_build/src/minmax.rs`, a compare in the result's signedness + `select`) are deliberately
+not in that set yet, so a body calling them stays scalar. `@parallel` per-thread chunks go through the
 same vectorizer, so they run SIMD × cores.
 
 Cranelift's CLIF vector ISA still caps at 128-bit — a 256-bit `f32x8` SSA value is rejected at

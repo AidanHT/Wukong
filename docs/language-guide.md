@@ -717,6 +717,13 @@ Accuracy depends on the operation and input range; this suite has no uniform 1-U
   dispatch to the two-input 256-bit `wukong_vmath2_f32` kernel, and the inlined form is bit-identical
   to it.
 - `fmax(a, b)` / `fmin(a, b)`.
+- `min(a, b)` / `max(a, b)` — integer **or** float minimum/maximum (`a < b ? a : b`, `a > b ? a : b`).
+  On integers the compare uses the result type's signedness, so a `usize` compares unsigned (the
+  largest `u64` stays the largest, it is not `-1`); on floats they are exactly `fmin`/`fmax`. The result is
+  the operands' common type, as for `a + b`: the wider integer, or the float when either is one. This is
+  what a ragged loop tile is written with: `for i in i0..min(i0 + T, M)`
+  (`tests/run/min_max_builtin.wk`). They are not auto-vectorizer intrinsics yet, so a loop body that
+  calls them stays scalar — in a hot float loop write `fmin`/`fmax`.
 
 These intrinsics also accept **integer** operands: `abs`/`round`/`floor`/`ceil`/`trunc` are
 type-preserving on an integer (integer `abs` is `select(x < 0, −x, x)`; rounding an integer is the
