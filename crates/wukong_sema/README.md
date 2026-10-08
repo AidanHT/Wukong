@@ -9,9 +9,14 @@ backends.
 Runs after the parser, before `wukong_mir_build`. Annotates the AST through side tables keyed by
 `NodeId` and **never rewrites the tree** (except re-typing an adapted literal's side-table entry).
 
-The checker is deliberately **lenient** about constructs it does not model (builtin methods,
-`f32x8::load`, `row_ptr`): those yield `Ty::Unknown`, which unifies with anything. Errors are
-reserved for what can be proved wrong.
+The checker is deliberately **lenient** about the few constructs it does not model — the
+explicit-SIMD surface (`f32x8::load`, `p.offset(i)`, `t.row_ptr(r)`), a type used as a namespace, and
+a receiver whose type is a generic parameter: those yield `Ty::Unknown`, which unifies with anything.
+Errors are reserved for what can be proved wrong — and a name that resolves to nothing is provably
+wrong: an unknown function, field, builtin-type method or type name is a resolution error
+(`E0320`–`E0324`, `src/resolve.rs`), never an `Unknown` left for lowering to reject as `C0001`. The
+builtin callee registry (`is_builtin_callee`, `src/builtins.rs`) is shared with `mir_build`, which
+treats a single-name call it cannot resolve as an internal compiler error.
 
 ## Pipeline fit
 
@@ -57,7 +62,7 @@ Sema emits every `E03xx` / `E04xx` / `E05xx` except `E0305` (unresolved import �
 
 | band | codes | examples |
 |---|---|---|
-| `E03xx` resolution | `E0300`–`E0304` | duplicate def, name not found, immutability |
+| `E03xx` resolution | `E0300`–`E0304`, `E0320`–`E0324` | duplicate def, name not found, immutability; unknown function / field / builtin method, calling a non-function, unknown type (`src/resolve.rs`) |
 | `E04xx` types | `E0401`–`E0405` | type mismatch, recursive types/consts, non-exhaustive `match` |
 | `E05xx` shapes | `E0501`–`E0504` | rank/index mismatch, dim/layout mismatch, arity, unknown dim |
 

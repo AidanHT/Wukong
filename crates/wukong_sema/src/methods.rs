@@ -103,6 +103,14 @@ pub(crate) struct MethodState {
     pub(crate) fn_type_ok: bool,
 }
 
+impl MethodState {
+    /// Whether `name` is a trait this program declares (a trait named where a type belongs is its
+    /// own `E0324` message, `resolve.rs`).
+    pub(crate) fn is_trait(&self, name: Symbol) -> bool {
+        self.traits.contains_key(&name)
+    }
+}
+
 /// `Self` (as `Ty::Named(self_sym)`) replaced by `to` throughout `t`.
 fn subst_self(t: &Ty, self_sym: Symbol, to: &Ty) -> Ty {
     match t {

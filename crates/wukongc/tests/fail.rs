@@ -388,3 +388,68 @@ fn imported_file_diagnostics_carry_their_own_path() {
         "the E0401 span must carry the imported file's own line (6):\n{line}"
     );
 }
+
+/// A resolution error must carry what an editor needs to fix it, in the stream an editor reads: the
+/// primary label, and the structured did-you-mean replacement (`suggestions[].replacement`), not
+/// only prose. Each entry is a fixture, its first code, and substrings of its first JSON line.
+const RESOLUTION_JSON: &[(&str, &str, &[&str])] = &[
+    (
+        "unknown_fn_call.wk",
+        "E0320",
+        &[
+            "\"message\":\"cannot find function `sqare` in this scope\"",
+            "\"label\":\"not found in this scope\"",
+            "\"replacement\":\"square\"",
+        ],
+    ),
+    (
+        "unknown_field.wk",
+        "E0321",
+        &[
+            "\"message\":\"no field `z` on type `Point`\"",
+            "the fields of `Point` are `x` and `y`",
+        ],
+    ),
+    (
+        "builtin_method_unknown.wk",
+        "E0322",
+        &["\"message\":\"no method named `dim` found for type `[]f32`\""],
+    ),
+    (
+        "call_non_function.wk",
+        "E0323",
+        &[
+            "\"message\":\"expected function, found `f32`\"",
+            "end the previous one with `;`",
+        ],
+    ),
+    (
+        "struct_literal_unknown.wk",
+        "E0324",
+        &[
+            "\"message\":\"cannot find struct `Pointt` in this scope\"",
+            "\"replacement\":\"Point\"",
+        ],
+    ),
+];
+
+#[test]
+fn resolution_errors_carry_labels_and_suggestions_in_json() {
+    for (fixture, code, needles) in RESOLUTION_JSON {
+        let p = fail_dir().join(fixture);
+        let (ok, stderr) = compile_json(&p);
+        assert!(!ok, "{fixture}: expected a compile error");
+        assert_eq!(
+            first_error_code(&stderr),
+            Some(*code),
+            "{fixture}: {stderr}"
+        );
+        let line = stderr.lines().next().unwrap_or_default();
+        for needle in *needles {
+            assert!(
+                line.contains(needle),
+                "{fixture}: the first {code} diagnostic must contain {needle:?}:\n{line}"
+            );
+        }
+    }
+}

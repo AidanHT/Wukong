@@ -438,6 +438,181 @@ fn dims_same(a: &Dim, b: &Dim) -> bool {
     }
 }
 
+// ---- The builtin callee registry ----
+//
+// Every name a call may spell for a builtin, across all of its families: the statement builtins
+// below, the scalar math intrinsics (`shape::intrinsic_ret_ty`), the named kernel builtins
+// ([`kernel_builtin`]), the heap and scratch allocators, the timing and barrier builtins, and the ML
+// I/O / RNG / sampling family ([`crate::ml_builtin`]). `type_call` types each family and then reports
+// any single-name callee that is none of them as a resolution error (`E0320`/`E0323`,
+// `resolve.rs`), so a name that reaches `wukong_mir_build::lower_call` unlowered is a compiler bug,
+// not a user's typo: `mir_build` asks [`is_builtin_callee`] to tell the two apart. A new builtin is
+// registered here and typed in `type_call` (or its family's module) in the same change.
+
+/// The statement-shaped builtins `print(x)`, `println(x)` and `assert(cond)`. `type_call` checks
+/// their arity and argument kind and leaves the call itself to `wukong_mir_build`, which lowers them
+/// to the `print*`/`assert` intrinsics both backends implement (`mir_build::is_intrinsic` is this
+/// predicate).
+pub fn is_statement_builtin(name: &str) -> bool {
+    matches!(name, "print" | "println" | "assert")
+}
+
+/// The scalar math intrinsics, exactly the names `shape::intrinsic_ret_ty` types (pinned by a unit
+/// test) — `wukong_mir_build` lowers them in `math_intrinsic` and, for `min`/`max`, `minmax.rs`.
+const MATH_INTRINSICS: &[&str] = &[
+    "abs",
+    "round",
+    "floor",
+    "ceil",
+    "trunc",
+    "min",
+    "max",
+    "sqrt",
+    "rsqrt",
+    "exp",
+    "log",
+    "pow",
+    "exp2",
+    "log2",
+    "exp10",
+    "log10",
+    "expm1",
+    "log1p",
+    "sinh",
+    "cosh",
+    "asinh",
+    "acosh",
+    "atanh",
+    "atan",
+    "tan",
+    "asin",
+    "acos",
+    "atan2",
+    "hypot",
+    "cbrt",
+    "erf",
+    "sin",
+    "cos",
+    "tanh",
+    "sigmoid",
+    "silu",
+    "gelu",
+    "silu_backward",
+    "gelu_backward",
+    "sigmoid_backward",
+    "tanh_backward",
+    "elu_backward",
+    "softplus_backward",
+    "elu",
+    "leaky_relu",
+    "softplus",
+    "mish",
+    "selu",
+    "tanhshrink",
+    "hardsigmoid",
+    "hardswish",
+    "softsign",
+    "logsigmoid",
+    "fmax",
+    "fmin",
+];
+
+/// The named kernel builtins, exactly [`kernel_builtin`]'s spellings (pinned by a unit test).
+const KERNEL_BUILTINS: &[&str] = &[
+    "matmul",
+    "matmul_nt",
+    "matmul_tn",
+    "linear",
+    "transpose",
+    "softmax",
+    "log_softmax",
+    "layernorm",
+    "rmsnorm",
+    "sum",
+    "amax",
+    "amin",
+    "dot",
+    "sdpa",
+    "relu",
+    "exp",
+    "log",
+    "tanh",
+    "sigmoid",
+    "silu",
+    "gelu",
+];
+
+/// The builtins with one fixed spelling that no other table lists.
+const FIXED_BUILTINS: &[&str] = &[
+    "print",
+    "println",
+    "assert",
+    "free",
+    "now_ns",
+    "sync_block",
+    "scratch_mark",
+    "scratch_release",
+    "file_size",
+    "rand_u32",
+    "rand_f32",
+    "randn_f32",
+    "rand_fill_f32",
+    "topk_f32",
+    "argsort_f32",
+    "argsort_desc_f32",
+    "sample_categorical",
+];
+
+/// The element types the typed file-I/O and heap families are spelled with (`read_f32`,
+/// `alloc_u16`, …) — [`crate::io_dtype`]'s twelve.
+const IO_DTYPES: &[&str] = &[
+    "f32", "f64", "f16", "bf16", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64",
+];
+
+/// The element types of the scratch family (`scratch_f32`, …) — [`crate::scratch_alloc_elem`]'s.
+const SCRATCH_DTYPES: &[&str] = &["f32", "f64", "i32", "i64", "i8", "u8", "f16", "bf16"];
+
+/// Whether `name` is a builtin callee of any family (see the registry notes above). Arity-blind: the
+/// activations are builtins whether they are called as the scalar intrinsic or the buffer kernel.
+pub fn is_builtin_callee(name: &str) -> bool {
+    is_statement_builtin(name)
+        || crate::shape::intrinsic_ret_ty(name, &[]).is_some()
+        || kernel_builtin(name, 2).is_some()
+        || crate::heap_alloc_elem(name).is_some()
+        || crate::scratch_alloc_elem(name).is_some()
+        || name == "free"
+        || crate::is_scratch_mark(name)
+        || crate::is_scratch_release(name)
+        || crate::ml_builtin(name).is_some()
+        || crate::is_now_ns(name)
+        || crate::is_sync_block(name)
+}
+
+/// Every builtin callee spelling, sorted and de-duplicated: the candidates of the "a function with
+/// a similar name exists" suggestion on `E0320`. Sorted, so the suggestion is deterministic.
+pub fn builtin_callee_names() -> Vec<String> {
+    let mut names: Vec<String> = MATH_INTRINSICS
+        .iter()
+        .chain(KERNEL_BUILTINS)
+        .chain(FIXED_BUILTINS)
+        .map(|s| s.to_string())
+        .collect();
+    for t in IO_DTYPES {
+        names.push(format!("read_{t}"));
+        names.push(format!("read_{t}_at"));
+        names.push(format!("write_{t}"));
+        names.push(format!("st_read_{t}"));
+        names.push(format!("npy_read_{t}"));
+        names.push(format!("alloc_{t}"));
+    }
+    for t in SCRATCH_DTYPES {
+        names.push(format!("scratch_{t}"));
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
 impl Sema<'_> {
     /// Type a call whose callee is a named kernel builtin, or return `None` when it is not one (so
     /// `type_call` handles it). A top-level definition of the same name shadows the builtin.
@@ -1476,5 +1651,45 @@ mod tests {
             "fn f(q: Tensor[f32, 2, 2], mut o: Tensor[f32, 3, 2]) { sdpa(q, q, q, o, 2, 2, \
                       1.0, 0); }";
         assert!(analyze(tensor).1.contains(&"E0502"));
+    }
+
+    /// Every spelling the registry lists is typed by some builtin family, and the per-family tables
+    /// it is built from agree with the predicates `type_call` actually consults — so the
+    /// did-you-mean candidates of `E0320` never propose a name the compiler would then reject.
+    #[test]
+    fn the_callee_registry_agrees_with_every_family() {
+        let names = builtin_callee_names();
+        assert!(names.len() > 100, "{}", names.len());
+        for name in &names {
+            assert!(
+                is_builtin_callee(name),
+                "`{name}` is listed but no family types it"
+            );
+        }
+        for name in MATH_INTRINSICS {
+            assert!(
+                crate::shape::intrinsic_ret_ty(name, &[]).is_some(),
+                "`{name}` is not a math intrinsic"
+            );
+        }
+        for name in KERNEL_BUILTINS {
+            assert!(
+                kernel_builtin(name, 2).is_some(),
+                "`{name}` is not a kernel"
+            );
+        }
+        for name in ["print", "println", "assert"] {
+            assert!(is_statement_builtin(name), "{name}");
+        }
+        for typo in [
+            "matmull",
+            "printf",
+            "prnt",
+            "len",
+            "alloc_bool",
+            "read_usize",
+        ] {
+            assert!(!is_builtin_callee(typo), "`{typo}` must not be a builtin");
+        }
     }
 }

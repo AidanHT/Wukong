@@ -161,6 +161,29 @@ function cannot be bound to a `let` or passed to a non-function parameter; the a
 function, not compute one; and a function-typed parameter is neither `mut` nor named after a builtin
 (`gelu`, `print`, …). A wrong signature is the ordinary `E0401` type mismatch. `tests/run/fn_params.wk`.
 
+## Name resolution ✅
+
+Every name a program uses resolves, or the program is rejected with a resolution code — a typo is
+never accepted and left for code generation to trip over. When a close name exists the error carries
+a "did you mean" suggestion, which `--error-format=json` emits as a structured replacement an editor
+can apply.
+
+| code | what does not resolve |
+|---|---|
+| `E0301` | a value: `does_not_exist + 1` |
+| `E0320` | a called function — no `fn`, function-typed parameter or builtin has the name (`sqare(x)`: did you mean `square`?) |
+| `E0321` | a field: `p.z` on a struct without `z` (the struct's fields are listed), any field of an enum value or of a builtin type (`x.re` on an `f32`), a numbered field of a non-tuple (`x.0`) |
+| `E0322` | a method of a builtin type: an array, slice or tensor has `len()`, an array or tensor `dim(k)`, and nothing else; math functions are free functions — `sqrt(x)`, not `x.sqrt()` |
+| `E0323` | a call of something that is not a function: a local, a constant, a struct or enum name, a type (`f32(x)` — write `x as f32`), a struct field. The usual cause is a missing `;`: a `(` that begins a line continues the expression above it |
+| `E0324` | a type: not a scalar, `Tensor[..]`/`vec[..]`, a declared struct or enum, or a generic parameter in scope (`flot`; `F32` and `float` suggest `f32`); also a struct literal of an undeclared name and a trait written where a type belongs |
+| `E0315` | a method or associated function of a struct or enum (see *Methods*) |
+
+Three things stay accepted without being modelled: the explicit-SIMD surface (`f32x8::load(p)`,
+`p.offset(i)`, `t.row_ptr(r)`, a vector's `store`/`fma`), which type-checks and is the codegen limit
+`C0001` until it lowers; a type used as a namespace (`f32::MAX`, `T::m()` on an unbounded generic);
+and a method of a generic receiver (`x.len()` on `x: T`), resolved per instantiation when the
+function is lowered.
+
 ## Bindings ✅
 
 ```wukong

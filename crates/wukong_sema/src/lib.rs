@@ -33,12 +33,13 @@ mod dependency;
 mod layout;
 mod methods;
 mod noalias;
+mod resolve;
 mod shape;
 mod tensor;
 
 pub use builtins::{
-    builtin_dims, builtin_operand_dims, builtin_output, kernel_builtin, Activation, BuiltinCall,
-    BuiltinDim, KernelBuiltin,
+    builtin_dims, builtin_operand_dims, builtin_output, is_builtin_callee, is_statement_builtin,
+    kernel_builtin, Activation, BuiltinCall, BuiltinDim, KernelBuiltin,
 };
 pub use methods::{MethodCall, MethodResolution};
 
@@ -412,6 +413,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         tensor_views: Vec::new(),
         builtin_calls: HashMap::default(),
         methods: methods::MethodState::default(),
+        resolve: resolve::ResolveState::default(),
     };
     // Attribute legality (`attrs`): an attribute names no value and has no type, so this walk needs
     // nothing the collection pass builds and runs first — an unknown `@bogus` is reported even in a
@@ -514,6 +516,8 @@ struct Sema<'a> {
     builtin_calls: HashMap<NodeId, BuiltinCall>,
     /// Methods, traits and function-typed parameters (`methods.rs`).
     methods: methods::MethodState,
+    /// Name-resolution diagnostics state (`resolve.rs`).
+    resolve: resolve::ResolveState,
 }
 
 /// One entry of [`Sema::loop_ctx`] — a loop currently being type-checked.
@@ -813,6 +817,35 @@ impl<'a> Sema<'a> {
                         self.generics = generic_names(&f.generics);
                         for p in &f.params {
                             self.lower_param_type(false, &p.ty);
+                        }
+                        if let Some(t) = &f.ret {
+                            self.lower_type(t);
+                        }
+                        self.generics.clear();
+                    }
+                }
+                // A function declared without a body is never visited by `check_fn`, so its
+                // signature is checked here (an unknown type name in it is `E0324`).
+                ItemKind::Fn(f) if f.body.is_none() => {
+                    self.generics = generic_names(&f.generics);
+                    for p in &f.params {
+                        self.lower_param_type(false, &p.ty);
+                    }
+                    if let Some(t) = &f.ret {
+                        self.lower_type(t);
+                    }
+                    self.generics.clear();
+                }
+                // A trait's method signatures are lowered once, by `collect_methods`, before this
+                // pass; inside a trait `Self` names the implementing type.
+                ItemKind::Trait(tr) => {
+                    for f in &tr.methods {
+                        self.generics = generic_names(&f.generics);
+                        if let Some(s) = self.interner.get("Self") {
+                            self.generics.insert(s);
+                        }
+                        for p in &f.params {
+                            self.lower_type(&p.ty);
                         }
                         if let Some(t) = &f.ret {
                             self.lower_type(t);
@@ -1140,7 +1173,12 @@ impl<'a> Sema<'a> {
                 if let Some(sc) = Scalar::from_name(s) {
                     Ty::Scalar(sc)
                 } else {
-                    // A generic type variable or a (possibly later-defined) named type.
+                    // A generic type variable or a (possibly later-defined) named type. Once every
+                    // item is registered, a name that is neither is `E0324` (`resolve.rs`) — it used
+                    // to be accepted here and lowered as an `i32` slot.
+                    if self.checking_bodies {
+                        self.check_type_name(p, name, t.span);
+                    }
                     Ty::Named(name)
                 }
             }
@@ -3969,7 +4007,8 @@ impl<'a> Sema<'a> {
                 let t = self.type_expr(base);
                 // A field access on a struct value — or on a pointer/reference to a struct, which
                 // auto-derefs (`p.x` on a `&Pt` / `*mut Pt`) — resolves to the declared field type.
-                // Anything else (a method, an unmodeled builtin) stays lenient (`Unknown`).
+                // A field the type does not have is `E0321` (`resolve.rs`); a type used as a
+                // namespace (`T::X`, `f32::MAX`) and an unmodelled base stay lenient (`Unknown`).
                 let struct_name = match &t {
                     Ty::Named(n) => Some(*n),
                     Ty::Ptr { pointee, .. } | Ty::Ref { pointee, .. } => match pointee.as_ref() {
@@ -3978,19 +4017,19 @@ impl<'a> Sema<'a> {
                     },
                     _ => None,
                 };
-                match struct_name {
-                    Some(struct_name) => self
-                        .defs
-                        .lookup(struct_name)
-                        .and_then(|d| match &d.kind {
-                            DefKind::Struct(fields) => fields
-                                .iter()
-                                .find(|(fname, _)| *fname == name.sym)
-                                .map(|(_, fty)| fty.clone()),
-                            _ => None,
-                        })
-                        .unwrap_or(Ty::Unknown),
-                    None => Ty::Unknown,
+                let field = struct_name.and_then(|struct_name| {
+                    self.defs.lookup(struct_name).and_then(|d| match &d.kind {
+                        DefKind::Struct(fields) => fields
+                            .iter()
+                            .find(|(fname, _)| *fname == name.sym)
+                            .map(|(_, fty)| fty.clone()),
+                        _ => None,
+                    })
+                });
+                match field {
+                    Some(fty) => fty,
+                    None if self.is_type_namespace(base) => Ty::Unknown,
+                    None => self.report_missing_field(&t, *name),
                 }
             }
             ExprKind::TupleField { base, index } => {
@@ -4015,7 +4054,8 @@ impl<'a> Sema<'a> {
                             Ty::Error
                         }
                     },
-                    _ => Ty::Unknown,
+                    // Only a tuple has numbered fields (`E0321`, `resolve.rs`).
+                    other => self.report_numbered_field(&other, *index, e.span),
                 }
             }
             ExprKind::Cast { expr, ty } => {
@@ -4092,7 +4132,8 @@ impl<'a> Sema<'a> {
                                 self.check_struct_literal(&decl, fields, rest.is_some(), e.span);
                                 Ty::Named(n)
                             }
-                            None => Ty::Unknown,
+                            // `E0324`: a literal of a name that is no struct (`resolve.rs`).
+                            None => self.report_unknown_struct(path),
                         }
                     }
                     None => Ty::Unknown,
@@ -4201,7 +4242,11 @@ impl<'a> Sema<'a> {
             ExprKind::Loop { label, body } => {
                 self.type_loop(label.as_ref().map(|l| l.sym), body, true)
             }
-            ExprKind::SizeOf(_) | ExprKind::AlignOf(_) => Ty::Scalar(Scalar::Usize),
+            ExprKind::SizeOf(t) | ExprKind::AlignOf(t) => {
+                // The operand's type names must resolve (`E0324`) like any other type's.
+                self.check_type_expr_names(t);
+                Ty::Scalar(Scalar::Usize)
+            }
         }
     }
 

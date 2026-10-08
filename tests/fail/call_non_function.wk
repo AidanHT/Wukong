@@ -1,0 +1,15 @@
+// EXPECT-CODE: E0323
+module tests.fail.call_non_function
+
+// The missing-`;` trap: a `(` that begins a line continues the expression above it, so the two
+// lines below are ONE statement, `acc = a[1](b + 1.0) * 2.0;` — a call of the `f32` element `a[1]`.
+// It used to reach lowering as an unmodelled call (`C0001`); calling a value that is not a function
+// is a resolution error now, whose help names the `;` (and the parser's `W0031` warning follows it).
+fn main() -> i32 {
+    let a: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let b: f32 = 1.0;
+    let mut acc: f32 = 0.0;
+    acc = a[1]
+    (b + 1.0) * 2.0;
+    return acc as i32;
+}

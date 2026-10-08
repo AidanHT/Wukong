@@ -5,6 +5,19 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Name resolution: every name resolves or is a coded error (`gap2/sema-resolution`)
+
+- **New codes `E0320`–`E0324`.** An unknown function (`E0320`), field (`E0321`), method of a builtin
+  type (`E0322`), a call of a non-function (`E0323`, which names the missing-`;` trap) and an unknown
+  type name (`E0324`, also a struct literal of an undeclared name and a trait used as a type) are
+  resolution errors with a structured did-you-mean suggestion. Each used to type as a lenient
+  `Unknown` and fail in lowering as the codegen limit `C0001`; an undeclared type name was silently
+  lowered as an `i32` slot. Trait method signatures, bodiless functions and `sizeof` operands are
+  now checked for unknown type names too.
+- **One builtin callee registry** (`wukong_sema::is_builtin_callee` / `is_statement_builtin`, in
+  `builtins.rs`) is shared by sema and `mir_build`; a single-name call that reaches lowering
+  unresolved is an internal compiler error rather than `C0001`.
+
 ### Optimizer memory passes: SROA, path DSE, loop deletion, guarded LICM, scalar promotion (`gap/opt-memory`)
 
 - **SROA** (`-O2`, ahead of mem2reg): an array/struct/tuple local whose every access is at a constant

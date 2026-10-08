@@ -498,9 +498,14 @@ impl Sema<'_> {
                     self.types.insert(callee.id, Ty::Unknown);
                     return Ty::Unknown;
                 }
-                // Unresolved or non-function callee: lenient (builtins like `min`).
                 self.types.insert(callee.id, Ty::Unknown);
-                return Ty::Unknown;
+                // `print`/`println`/`assert` with a valid argument list: `mir_build` lowers them.
+                if crate::is_statement_builtin(self.sym_str(name)) {
+                    return Ty::Unknown;
+                }
+                // Every function, function-typed parameter and builtin family was tried above, so
+                // the name does not resolve to anything callable: `E0320`/`E0323` (`resolve.rs`).
+                return self.report_unresolved_callee(name, callee.span);
             }
         }
 
@@ -514,17 +519,29 @@ impl Sema<'_> {
         if let ExprKind::Field { base, name } = &callee.kind {
             let method = self.sym_str(name.sym);
             let (is_len, is_dim) = (method == "len", method == "dim");
+            let bty = self.type_expr(base);
             if is_len || is_dim {
-                let bty = self.type_expr(base);
                 if let Some(t) = self.type_extent_method(&bty, is_dim, args, span) {
                     self.types.insert(callee.id, Ty::Unknown);
                     return t;
                 }
             }
+            // Any other method of a builtin type, or a struct field called like a method
+            // (`resolve.rs`). Struct and enum methods were typed by `type_method_call`; a type
+            // used as a namespace (`T::m(..)` on a generic, `f32x8::load(..)`) stays lenient.
+            self.types.insert(callee.id, Ty::Unknown);
+            if self.is_type_namespace(base) {
+                return Ty::Unknown;
+            }
+            return self.check_builtin_method(&bty, *name, args, span);
         }
-        // Field/method or complex callee: type it (so its base is recorded) and stay lenient.
-        self.type_expr(callee);
-        Ty::Unknown
+        // A multi-segment path stays the lenient unmodelled callee it always was; any other
+        // expression called as a function must have a function type (`E0323`, `resolve.rs`).
+        let t = self.type_expr(callee);
+        if matches!(callee.kind, ExprKind::Path(_)) {
+            return Ty::Unknown;
+        }
+        self.check_value_callee(callee, &t)
     }
 
     pub(crate) fn check_fn_call(

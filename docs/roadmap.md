@@ -86,6 +86,15 @@ another architecture or OS is not supported. A native-backend failure is a catal
   replacement), a label in another file gets a `::: file:line:col` header, `--color=auto` honours
   `NO_COLOR`/`CLICOLOR_FORCE`/`TERM=dumb` (and enables Windows VT), and `--explain` with no code
   lists every catalogued code. (A full LSP is out of scope; see MASTER_PLAN §3.6.)
+- **Name resolution is total.** Every called name, field, builtin-type method and type name resolves
+  or is a resolution error with a did-you-mean suggestion: `E0320` (unknown function), `E0321` (no
+  such field), `E0322` (no such method on a builtin type), `E0323` (calling a non-function — the
+  missing-`;` trap), `E0324` (unknown type, struct literal of an undeclared name, a trait used as a
+  type). These used to type as a lenient `Unknown` and fail in lowering as the codegen limit `C0001`,
+  and an undeclared type name was lowered as an `i32` slot. One builtin callee registry
+  (`wukong_sema::is_builtin_callee`) is read by `mir_build` too, so a single-name call that reaches
+  lowering unresolved is an internal compiler error, not a codegen limit
+  (`tests/fail/{unknown_fn_call,unknown_field,builtin_method_unknown,call_non_function,unknown_type_name,struct_literal_unknown}.wk`).
 - Functions (including recursion and mutual recursion — the interpreter oracle runs on a
   512 MiB worker thread, so ordinary recursion does not overflow the host's small default stack), and
   direct calls. *Caveat:* the tree-walking interpreter's call frames are ~an order of magnitude larger

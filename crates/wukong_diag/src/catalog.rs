@@ -349,6 +349,68 @@ static CATALOG: &[Explanation] = &[
          interpreter, exactly as with `restrict` in C."
     ),
     entry!(
+        "E0320",
+        "cannot find function",
+        "A call names a function that does not exist: no `fn` of this program, no function-typed \
+         parameter in scope, and no builtin (`sqrt`, `matmul`, `alloc_f32`, `read_f32`, `print`, \
+         …) has that name. The usual cause is a typo, and the diagnostic suggests the closest \
+         existing name. A function of another module is only visible after an `import` of that \
+         module (and only if it is `pub`); a method is called on its value, `v.norm()`, or as \
+         `Type::norm(v)`. This used to compile as an unmodelled call and fail in lowering with the \
+         misleading codegen limit `C0001`.",
+        bad: "module ex.e0320\nfn square(x: f32) -> f32 {\n    return x * x;\n}\nfn main() -> i32 {\n    return sqare(3.0) as i32;\n}\n",
+        good: "module ex.e0320\nfn square(x: f32) -> f32 {\n    return x * x;\n}\nfn main() -> i32 {\n    return square(3.0) as i32;\n}\n"
+    ),
+    entry!(
+        "E0321",
+        "no such field",
+        "A field access names a field the value's type does not have: `p.z` on a struct with only \
+         `x` and `y`, a field of an enum value, or any field of a builtin type (`x.re` on an \
+         `f32`, `t.0` on a tensor). The diagnostic lists the struct's fields and suggests the \
+         closest one. Only a struct has named fields and only a tuple has numbered ones (`t.0`); \
+         an array, slice, tensor or pointer element is read by indexing (`a[i]`), and `len`/`dim` \
+         are methods (`a.len()`).",
+        bad: "module ex.e0321\nstruct Point { x: f32, y: f32 }\nfn main() -> i32 {\n    let p = Point { x: 1.0, y: 2.0 };\n    return p.z as i32;\n}\n",
+        good: "module ex.e0321\nstruct Point { x: f32, y: f32 }\nfn main() -> i32 {\n    let p = Point { x: 1.0, y: 2.0 };\n    return p.y as i32;\n}\n"
+    ),
+    entry!(
+        "E0322",
+        "no such method on a builtin type",
+        "A method call on a value of a builtin type names a method that type does not have. The \
+         builtin method surface is small: `len()` on an array, slice or tensor and `dim(k)` on an \
+         array or tensor, plus the explicit-SIMD spellings (`row_ptr`, `offset`, `store`, `fma`) \
+         that type-check but are not lowered yet. Math functions are free functions, not \
+         methods: write `sqrt(x)`, not `x.sqrt()`. A struct or enum's methods are the ones its \
+         `impl` blocks define (a missing one is `E0315`).",
+        bad: "module ex.e0322\nfn main() -> i32 {\n    let x: f32 = 4.0;\n    return x.sqrt() as i32;\n}\n",
+        good: "module ex.e0322\nfn main() -> i32 {\n    let x: f32 = 4.0;\n    return sqrt(x) as i32;\n}\n"
+    ),
+    entry!(
+        "E0323",
+        "expected function, found a non-function",
+        "Something that is not a function is called: a local variable or parameter (`scale(3.0)` \
+         with `scale: f32`), a constant, a struct or enum name, a type (`f32(x)` — convert with \
+         `x as f32`), a struct field (`p.w(1)`), or an expression whose value is not a function. \
+         A common cause is a missing `;`: a `(` that begins a line continues the expression on \
+         the line above, so `acc = a[i]` followed by `(b + c) * 2;` is the call `a[i](b + c)`. \
+         Only functions and function-typed parameters can be called.",
+        bad: "module ex.e0323\nfn main() -> i32 {\n    let scale: f32 = 2.0;\n    let y: f32 = scale(3.0);\n    return y as i32;\n}\n",
+        good: "module ex.e0323\nfn main() -> i32 {\n    let scale: f32 = 2.0;\n    let y: f32 = scale * 3.0;\n    return y as i32;\n}\n"
+    ),
+    entry!(
+        "E0324",
+        "cannot find type",
+        "A type names nothing: it is not a scalar (`f32`, `i64`, `bool`, …), not `Tensor[..]` or \
+         `vec[..]`, not a struct or enum declared in this program, and not a generic parameter of \
+         the enclosing item. The diagnostic suggests the closest type, and the Wukong spelling of \
+         a C or Python name (`float` is `f32`, `int` is `i32`, `double` is `f64`). A struct \
+         literal of an undeclared name, and a trait used where a type belongs, are reported with \
+         this code too (bound a generic parameter by the trait instead: `fn f<T: Shape>(x: T)`). \
+         An unknown type name used to be accepted and silently lowered as a 32-bit integer slot.",
+        bad: "module ex.e0324\nfn main() -> i32 {\n    let x: flot = 2.5;\n    return x as i32;\n}\n",
+        good: "module ex.e0324\nfn main() -> i32 {\n    let x: f32 = 2.5;\n    return x as i32;\n}\n"
+    ),
+    entry!(
         "E0401",
         "type mismatch",
         "A value's type does not match the type required by its context — for example a `let` with \
