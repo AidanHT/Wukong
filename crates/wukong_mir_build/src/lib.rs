@@ -54,6 +54,9 @@ mod ucount;
 // The lowering of the ML builtins `wukong_sema::ml_builtins` types (see the module docs).
 mod ml_builtins;
 
+// The printing builtins, routed by the printed value's source type (see the module docs).
+mod text;
+
 use std::cell::{Cell, RefCell};
 
 use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -1408,6 +1411,7 @@ fn lower_program_pooled(
         rt_scratch_mark: interner.intern("wukong_rt_scratch_mark"),
         rt_scratch_release: interner.intern("wukong_rt_scratch_release"),
         ml: ml_builtins::MlSyms::new(interner),
+        text: text::TextSyms::new(interner),
         rt_read_f32: interner.intern("wukong_rt_read_f32"),
         rt_read_i32: interner.intern("wukong_rt_read_i32"),
         rt_read_i64: interner.intern("wukong_rt_read_i64"),
@@ -3838,6 +3842,8 @@ struct GemmSyms {
     rt_scratch_release: Symbol,
     /// The runtime entries `ml_builtins.rs` lowers the ML builtins to (`wukong_rt_read_dt`, …).
     ml: ml_builtins::MlSyms,
+    /// The symbols `text.rs` lowers the printing builtins to (`print_bool`, …).
+    text: text::TextSyms,
     /// The 12 raw file-I/O runtime entry points (`wukong_rt_{read,write}_{f32,i32,i64,u8,f64,i8}`)
     /// backing the `read_<T>(path, buf)` / `write_<T>(path, buf)` builtins. Each takes `(path: *const
     /// u8, data: *T, len: i64)` and returns an `i64`: the element count on success, or -1 (open/create
@@ -22151,6 +22157,12 @@ impl FnLowerer<'_> {
                     // number is already non-differential — the interpreter prints a slot index, native
                     // a real address — so no well-formed program loses behavior here.)
                     let nm = self.interner.resolve(name);
+                    // A `bool` / `char` argument prints as `true`/`false` / its glyph (`text.rs`).
+                    if (nm == "print" || nm == "println") && args.len() == 1 {
+                        if let Some(v) = self.lower_print_scalar(nm == "println", &args[0]) {
+                            return v;
+                        }
+                    }
                     if (nm == "print" || nm == "println")
                         && args.len() == 1
                         && self.is_string_arg(&args[0])

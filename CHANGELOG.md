@@ -5,6 +5,18 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Text and process I/O (`gap2/text-and-process-io`)
+
+- **Every scalar prints at its own type** (Rust's `Display`), on the interpreter, the JIT, a linked
+  executable (rustc shim and C fallback) and the textual LLVM module alike: an `f32` prints its
+  shortest round-trip digits at `f32` precision (`print(0.1)` prints `0.1`, not
+  `0.10000000149011612`; `f16`/`bf16` print as their `f32`), a `bool` prints `true`/`false` (was
+  `1`/`0`), and a `char` prints its UTF-8 glyph (was its code point; a non-scalar value prints
+  U+FFFD). New runtime printers `wukong_rt_print_f32` / `_bool` / `_char`; `--backend=gpu-native`
+  replays f32 and bool print records the same way. Fixtures printing an `f32` or a comparison were
+  re-derived (`print_float_display`, `activation_backward_int_args`, `transcendental_kernel`,
+  `operators`); new `tests/run/print_scalar_types.wk`.
+
 ### Optimizer memory passes: SROA, path DSE, loop deletion, guarded LICM, scalar promotion (`gap/opt-memory`)
 
 - **SROA** (`-O2`, ahead of mem2reg): an array/struct/tuple local whose every access is at a constant

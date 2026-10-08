@@ -1,13 +1,13 @@
 // RUN: --run
 // EXPECT-EXIT: 0
-// EXPECT-OUT: 2.1659281253814697
-// EXPECT-OUT: 2.1659281253814697
-// EXPECT-OUT: 1.8553410768508911
-// EXPECT-OUT: 0.3932238519191742
-// EXPECT-OUT: 0.8399486541748047
+// EXPECT-OUT: 2.1659281
+// EXPECT-OUT: 2.1659281
+// EXPECT-OUT: 1.8553411
+// EXPECT-OUT: 0.39322385
+// EXPECT-OUT: 0.83994865
 // EXPECT-OUT: 2
-// EXPECT-OUT: 1.4621171951293945
-// EXPECT-OUT: 0.8399486541748047
+// EXPECT-OUT: 1.4621172
+// EXPECT-OUT: 0.83994865
 module tests.run.activation_backward_int_args
 
 // The six activation-BACKWARD intrinsics with integer operands. Every *forward* intrinsic lowers
@@ -15,7 +15,10 @@ module tests.run.activation_backward_int_args
 // used a bare `lower_expr`, feeding an `i32` straight into the float ops:
 // `gelu_backward(1, 2)` ICEd with raw verifier text ("fmul: v0 has type i32 but expected f32") on
 // both backends. The first two lines are the contract: the promoted integer call must equal the
-// float call exactly. The last line covers the MIXED form (float x, integer dy).
+// float call exactly. The last line covers the MIXED form (float x, integer dy). Each result is an
+// `f32` and prints its shortest round-trip digits at f32 precision (2.1659281 is the f32 whose
+// exact value is 2.1659281253814697 — the same bits the lines pinned when f32 printed as its f64
+// widening).
 fn main() -> i32 {
     let xi: i32 = 1;
     let di: i32 = 2;

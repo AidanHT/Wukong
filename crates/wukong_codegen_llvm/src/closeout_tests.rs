@@ -284,21 +284,23 @@ fn prints_and_asserts_use_the_aot_runtime_abi() {
     for decl in [
         "declare void @wukong_rt_print_i64(i64)",
         "declare void @wukong_rt_print_f64(double)",
+        "declare void @wukong_rt_print_f32(float)",
         "declare void @wukong_rt_print_u64(i64)",
         "declare void @wukong_rt_print_str(ptr)",
         "declare void @wukong_rt_assert(i64)",
     ] {
         assert!(text.contains(decl), "{decl}:\n{text}");
     }
-    // Exactly Cranelift's widening: ints sign-extend, booleans zero-extend, every float (f16/bf16
-    // live in f32 registers) widens exactly to double, pointers print their address.
+    // Exactly Cranelift's routing: ints sign-extend, booleans zero-extend, an f64 prints as a
+    // double, an f32 (and an f16/bf16, which live in f32 registers) prints at f32 precision through
+    // `wukong_rt_print_f32` with no widening, pointers print their address.
     for line in [
         "sext i8 %v0 to i64",
         "sext i32 %v1 to i64",
-        "fpext float %v2 to double",
+        "call void @wukong_rt_print_f32(float %v2)",
         "call void @wukong_rt_print_f64(double %v3)",
-        "fpext float %v4 to double",
-        "fpext float %v5 to double",
+        "call void @wukong_rt_print_f32(float %v4)",
+        "call void @wukong_rt_print_f32(float %v5)",
         "zext i1 %v6 to i64",
         "call void @wukong_rt_print_i64(i64 %v7)",
         "ptrtoint ptr %v8 to i64",

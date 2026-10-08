@@ -1,0 +1,92 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: true
+// EXPECT-OUT: false
+// EXPECT-OUT: true
+// EXPECT-OUT: false
+// EXPECT-OUT: A
+// EXPECT-OUT: z
+// EXPECT-OUT: é
+// EXPECT-OUT: €
+// EXPECT-OUT: 😀
+// EXPECT-OUT: �
+// EXPECT-OUT: 65
+// EXPECT-OUT: 0.1
+// EXPECT-OUT: 0.33333334
+// EXPECT-OUT: 340282350000000000000000000000000000000
+// EXPECT-OUT: 0.0000001
+// EXPECT-OUT: -0
+// EXPECT-OUT: inf
+// EXPECT-OUT: NaN
+// EXPECT-OUT: 0.099975586
+// EXPECT-OUT: 0.100097656
+// EXPECT-OUT: 65504
+// EXPECT-OUT: 0.1
+// EXPECT-OUT: 0.10000000149011612
+module tests.run.print_scalar_types
+
+/// Every scalar prints at its own type (Rust's `Display` for that type), on every backend:
+///
+/// * a `bool` prints `true` / `false` — a literal, a comparison, a `bool` binding and a `bool`
+///   function result alike (they used to print `1` / `0`);
+/// * a `char` prints its glyph, UTF-8 encoded (it used to print its code point); a value that is
+///   not a Unicode scalar value — here `0xDFFF as char`, a surrogate — prints U+FFFD. An explicit
+///   `as i32` still prints the code point;
+/// * an `f32` prints the shortest decimal that parses back to that `f32` (it used to print the
+///   17-digit expansion of the `f64` it widens to). `f16` and `bf16` values live in `f32` registers
+///   and print as that `f32`, as the `half` crate's `Display` does; an `f64` keeps its own shortest
+///   digits, so `x as f64` of the f32 0.1 still prints the widened value.
+///
+/// Every line is derived from those rules, not recorded: f32 0.1 = 13421773 * 2^-27, shortest
+/// "0.1"; f32 1/3 = 11184811 * 2^-25, shortest "0.33333334"; f32::MAX = (2 - 2^-23) * 2^127,
+/// shortest digits 34028235 then 31 zeros; f32 1e-7 rounds back from "0.0000001"; -0.0, 1/0 and
+/// 0/0 spell `-0`, `inf`, `NaN`; f16 0.1 = 0x2E66 = 0.0999755859375, shortest f32 digits
+/// 0.099975586; bf16 0.1 = 0x3DCD = 0.10009765625, shortest f32 digits 0.100097656; 65504 is f16's
+/// largest finite value; the f32 0.1 widened to f64 is 0.100000001490116119384765625, shortest f64
+/// digits 0.10000000149011612.
+fn is_even(n: i32) -> bool {
+    return n % 2 == 0;
+}
+
+fn main() -> i32 {
+    print(true);
+    println(false);
+    print(is_even(4));
+    let b: bool = is_even(7);
+    print(b);
+
+    print('A');
+    let c: char = 'z';
+    println(c);
+    print('\u{E9}');
+    print('\u{20AC}');
+    print('\u{1F600}');
+    let s: u32 = 57343;
+    print(s as char);
+    print('A' as i32);
+
+    let x: f32 = 0.1;
+    print(x);
+    let one: f32 = 1.0;
+    let three: f32 = 3.0;
+    print(one / three);
+    let big: f32 = 3.4028235e38;
+    print(big);
+    let small: f32 = 1e-7;
+    print(small);
+    let z: f32 = 0.0;
+    print(-z);
+    print(one / z);
+    print(z / z);
+
+    let h: f16 = 0.1;
+    print(h);
+    let g: bf16 = 0.1;
+    print(g);
+    let hm: f16 = 65504.0;
+    print(hm);
+
+    print(0.1f64);
+    print(x as f64);
+    return 0;
+}

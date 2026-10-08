@@ -628,7 +628,10 @@ another architecture or OS is not supported. A native-backend failure is a catal
   closed v1 set (`@parallel`, `@generic`, `@tile`, `@extern`, `@strict_fp`, `@inline`, `@simd`,
   `@align`, `@export`), so a typo like `@parellel` no longer compiles to a program with none of the requested
   behavior. The four discarded attributes stay discarded wherever they parse.
-- Intrinsics `print`/`println`/`assert`.
+- Intrinsics `print`/`println`/`assert`. Every scalar prints at its own type, identically on every
+  backend and in a linked executable: an `f32` (and an `f16`/`bf16`) prints its shortest round-trip
+  digits at `f32` precision, an `f64` at `f64` precision, a `bool` as `true`/`false`, a `char` as its
+  UTF-8 glyph (`tests/run/print_scalar_types.wk`).
 - **Source-text diagnostics.** A Unicode lookalike of ASCII punctuation or whitespace (`−` U+2212
   for `-`, `×`, `≤`, fullwidth brackets, curly quotes, no-break/zero-width spaces; ~50 entries) is
   **`E0105`**, naming the code point and the ASCII character it imitates, and the lexer reads it

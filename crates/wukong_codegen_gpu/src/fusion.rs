@@ -121,7 +121,9 @@ pub fn classify_call(name: &str) -> CallClass {
         "wukong_velem_f32" | "wukong_velem_f32_parallel" => Velem,
         "wukong_axpby_bf16" | "wukong_axpby_f16" => Axpby,
         "wukong_parallel_for" => ParallelFor,
-        "print" | "println" | "assert" => return CallClass::SideEffect,
+        "print" | "println" | "print_bool" | "println_bool" | "assert" => {
+            return CallClass::SideEffect
+        }
         _ => return CallClass::Other,
     };
     CallClass::Coop(kind)
@@ -384,7 +386,7 @@ fn parallel_for_is_cooperative(
             for inst in &b.insts {
                 if let Op::Call { func: callee, .. } = &inst.op {
                     let nm = interner.resolve(*callee);
-                    if matches!(nm, "print" | "println") {
+                    if matches!(nm, "print" | "println" | "print_bool" | "println_bool") {
                         return Err(format!(
                             "outlined @parallel body `{}` prints (one record per thread, not per \
                              iteration)",

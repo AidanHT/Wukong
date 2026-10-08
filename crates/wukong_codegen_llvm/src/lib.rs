@@ -238,6 +238,9 @@ const RT_PRINT_I64: &str = "wukong_rt_print_i64";
 const RT_PRINT_U64: &str = "wukong_rt_print_u64";
 const RT_PRINT_F64: &str = "wukong_rt_print_f64";
 const RT_PRINT_STR: &str = "wukong_rt_print_str";
+const RT_PRINT_F32: &str = "wukong_rt_print_f32";
+const RT_PRINT_BOOL: &str = "wukong_rt_print_bool";
+const RT_PRINT_CHAR: &str = "wukong_rt_print_char";
 const RT_ASSERT: &str = "wukong_rt_assert";
 
 /// A built-in the MIR calls by its source name and the runtime implements under another.
@@ -245,22 +248,31 @@ const RT_ASSERT: &str = "wukong_rt_assert";
 enum Intrinsic {
     PrintInt,
     PrintUint,
+    /// An `f64` value.
     PrintFloat,
+    /// An `f32` value, or an `f16`/`bf16` one held in a `float` register: printed at `f32`
+    /// precision, not as the `double` it widens to.
+    PrintF32,
     PrintStr,
+    PrintBool,
+    PrintChar,
     Assert,
 }
 
 impl Intrinsic {
-    /// The same classification the Cranelift backend applies (`classify_intrinsic`).
-    fn classify(name: &str, first_is_float: bool) -> Option<Intrinsic> {
+    /// The same classification the Cranelift backend applies (`classify_intrinsic`): a `print`
+    /// picks its printer by the MIR type of its first argument.
+    fn classify(name: &str, first: Option<&MirType>) -> Option<Intrinsic> {
         match name {
-            "print" | "println" => Some(if first_is_float {
-                Intrinsic::PrintFloat
-            } else {
-                Intrinsic::PrintInt
+            "print" | "println" => Some(match first {
+                Some(MirType::F32 | MirType::F16 | MirType::BF16) => Intrinsic::PrintF32,
+                Some(t) if t.is_float() => Intrinsic::PrintFloat,
+                _ => Intrinsic::PrintInt,
             }),
             "print_str" | "println_str" => Some(Intrinsic::PrintStr),
             "print_u" | "println_u" => Some(Intrinsic::PrintUint),
+            "print_bool" | "println_bool" => Some(Intrinsic::PrintBool),
+            "print_char" | "println_char" => Some(Intrinsic::PrintChar),
             "assert" => Some(Intrinsic::Assert),
             _ => None,
         }
@@ -271,15 +283,23 @@ impl Intrinsic {
             Intrinsic::PrintInt => RT_PRINT_I64,
             Intrinsic::PrintUint => RT_PRINT_U64,
             Intrinsic::PrintFloat => RT_PRINT_F64,
+            Intrinsic::PrintF32 => RT_PRINT_F32,
             Intrinsic::PrintStr => RT_PRINT_STR,
+            Intrinsic::PrintBool => RT_PRINT_BOOL,
+            Intrinsic::PrintChar => RT_PRINT_CHAR,
             Intrinsic::Assert => RT_ASSERT,
         }
     }
 
     fn param(self) -> &'static str {
         match self {
-            Intrinsic::PrintInt | Intrinsic::PrintUint | Intrinsic::Assert => "i64",
+            Intrinsic::PrintInt
+            | Intrinsic::PrintUint
+            | Intrinsic::PrintBool
+            | Intrinsic::PrintChar
+            | Intrinsic::Assert => "i64",
             Intrinsic::PrintFloat => "double",
+            Intrinsic::PrintF32 => "float",
             Intrinsic::PrintStr => "ptr",
         }
     }
@@ -309,8 +329,8 @@ fn callee(
         return Callee::Defined;
     }
     let name = interner.resolve(func);
-    let first_is_float = args.first().is_some_and(|a| f.value_type(*a).is_float());
-    if let Some(intrinsic) = Intrinsic::classify(name, first_is_float) {
+    let first = args.first().map(|a| f.value_type(*a));
+    if let Some(intrinsic) = Intrinsic::classify(name, first) {
         Callee::Intrinsic(intrinsic)
     } else if name.starts_with("wukong_") {
         Callee::Runtime
@@ -1271,7 +1291,14 @@ impl Emitter<'_> {
                 let Some(&a) = args.first() else { return };
                 match intrinsic {
                     Intrinsic::PrintFloat => format!("double {}", self.to_f64(out, a)),
+                    // f32, f16 and bf16 all live in `float` registers (`reg_mir`).
+                    Intrinsic::PrintF32 => format!("float {}", self.operand(a)),
                     Intrinsic::PrintStr => format!("ptr {}", self.operand(a)),
+                    // mir_build zero-extends a `bool`/`char` before the call; an `i64` passes
+                    // through unchanged.
+                    Intrinsic::PrintBool | Intrinsic::PrintChar => {
+                        format!("i64 {}", self.to_i64(out, a, false))
+                    }
                     _ => format!("i64 {}", self.to_i64(out, a, true)),
                 }
             }

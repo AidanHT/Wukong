@@ -2,16 +2,17 @@
 // EXPECT-EXIT: 0
 // EXPECT-OUT: 4
 // EXPECT-OUT: 10
-// EXPECT-OUT: 1
-// EXPECT-OUT: 1
-// EXPECT-OUT: 1
-// EXPECT-OUT: 1
-// EXPECT-OUT: 1
-// EXPECT-OUT: 0
+// EXPECT-OUT: true
+// EXPECT-OUT: true
+// EXPECT-OUT: true
+// EXPECT-OUT: true
+// EXPECT-OUT: true
+// EXPECT-OUT: false
 // EXPECT-OUT: 200
 module tests.run.operators
 
-/// All compound-assignment operators, the six comparison operators, and unary `!`.
+/// All compound-assignment operators, the six comparison operators, and unary `!`. A comparison is
+/// a `bool`, and a `bool` prints `true`/`false`.
 fn main() -> i32 {
     let mut a: i32 = 20;
     a += 5; // 25
@@ -27,12 +28,12 @@ fn main() -> i32 {
     b ^= 3; // 10
     print(b);
 
-    print(1 == 1); // 1
-    print(1 != 2); // 1
-    print(2 < 3); // 1
-    print(3 <= 3); // 1
-    print(4 > 1); // 1
-    print(5 >= 9); // 0
+    print(1 == 1); // true
+    print(1 != 2); // true
+    print(2 < 3); // true
+    print(3 <= 3); // true
+    print(4 > 1); // true
+    print(5 >= 9); // false
 
     let t: bool = true;
     if !t { print(100); } else { print(200); }

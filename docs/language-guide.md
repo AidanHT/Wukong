@@ -1044,12 +1044,23 @@ lowers to PTX `.shared` SMEM and `sync_block()` to `bar.sync 0` (`wukong_codegen
 
 ## Built-in intrinsics ✅
 
-- `print(x)` — print one value followed by a newline. A signed integer or float prints as itself; an
-  **unsigned** integer prints its unsigned magnitude (a high-bit-set `u32`/`u64` is not shown as a
-  negative); a `*u8` (a string literal) prints its NUL-terminated bytes rather than the pointer.
+- `print(x)` — print one value followed by a newline, **rendered at its own type** (Rust's
+  `Display` for that type), identically on every backend and in a linked executable:
+  - a signed integer prints as itself; an **unsigned** integer prints its unsigned magnitude (a
+    high-bit-set `u32`/`u64` is not shown as a negative);
+  - a float prints the **shortest** decimal that parses back to the same value *at its own
+    precision*, positionally (`inf`, `-inf`, `NaN`, `-0` spelled out): `print(0.1)` of an `f32`
+    prints `0.1`, not the `0.10000000149011612` of the `f64` it widens to. `f16`/`bf16` values live
+    in `f32` registers and print as that `f32` (as the `half` crate's `Display` does); write
+    `x as f64` to see the widened value;
+  - a `bool` prints `true` / `false`; a `char` prints its glyph, UTF-8 encoded (a value that is not
+    a Unicode scalar value — a surrogate, or above U+10FFFF via `as char` — prints U+FFFD); `c as
+    i32` prints the code point;
+  - a `*u8` (a string literal) prints its NUL-terminated bytes rather than the pointer.
+
   `print()` with no argument prints a bare newline. More than one argument is `E0503` (arguments are
   not concatenated), and a `()` value — from an `else`-less `if`, or a `match` with statement arms —
-  is `E0401`.
+  is `E0401`. `tests/run/print_scalar_types.wk`, `tests/run/print_float_display.wk`.
 - `println(x)` — alias of `print` (both already append the newline).
 - `assert(cond)` — stop the program at once if `cond` is false (zero); a no-op otherwise. Exactly
   one argument (`E0503` otherwise). A float condition means `cond != 0.0`, so `assert(0.5)` passes.

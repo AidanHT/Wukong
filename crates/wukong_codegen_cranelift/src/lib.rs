@@ -48,6 +48,9 @@ mod avx2;
 // The runtime entries of the ML builtins, declared, JIT-bound and called from one table.
 mod ml_rt;
 
+// The runtime entries of the text builtins (the per-type scalar printers), the same way.
+mod text_rt;
+
 // --- The minimal runtime the generated code calls back into ---------------------------------
 //
 // `print`/`println`/`assert` lower to calls to these symbols. For the JIT they are real Rust
@@ -116,6 +119,13 @@ fn take_failure() -> Option<String> {
     }
     let recorded = FAILURE_MESSAGE.lock().ok().and_then(|mut m| m.take());
     Some(recorded.unwrap_or_else(|| "assertion failed".to_owned()))
+}
+
+/// Append `bytes` to the run's captured stdout — the one sink every JIT print entry writes through.
+pub(crate) fn emit_stdout(bytes: &[u8]) {
+    if let Ok(mut o) = OUTPUT.lock() {
+        o.extend_from_slice(bytes);
+    }
 }
 
 extern "C" fn rt_print_i64(x: i64) {
@@ -586,22 +596,34 @@ pub fn classify_error(message: &str) -> NativeErrorKind {
 enum Intrinsic {
     PrintInt,
     PrintUint,
+    /// An `f64` value: `wukong_rt_print_f64`.
     PrintFloat,
+    /// An `f32` value, or an `f16`/`bf16` one held in an `f32` register: `wukong_rt_print_f32`,
+    /// which prints the shortest round-trip digits at `f32` precision (`wukong_runtime::fmt`).
+    PrintF32,
     PrintStr,
+    PrintBool,
+    PrintChar,
     Assert,
 }
 
-fn classify_intrinsic(name: &str, arg_is_float: bool) -> Option<Intrinsic> {
+/// `arg` is the MIR type of the call's first argument, when it has one. A `print` of a float picks
+/// its printer by that type, so an `f32` prints at its own precision instead of as the `f64` it
+/// widens to — the interpreter makes the same choice from the same type.
+fn classify_intrinsic(name: &str, arg: Option<&MirType>) -> Option<Intrinsic> {
     match name {
-        "print" | "println" => Some(if arg_is_float {
-            Intrinsic::PrintFloat
-        } else {
-            Intrinsic::PrintInt
+        "print" | "println" => Some(match arg {
+            Some(MirType::F32 | MirType::F16 | MirType::BF16) => Intrinsic::PrintF32,
+            Some(t) if t.is_float() => Intrinsic::PrintFloat,
+            _ => Intrinsic::PrintInt,
         }),
         // mir_build routes a `*u8` (string) argument to these symbols (see `print_str` in GemmSyms).
         "print_str" | "println_str" => Some(Intrinsic::PrintStr),
         // mir_build routes an unsigned-integer argument here (zero-extended to 64 bits).
         "print_u" | "println_u" => Some(Intrinsic::PrintUint),
+        // mir_build routes a `bool` / `char` argument here (zero-extended to 64 bits).
+        "print_bool" | "println_bool" => Some(Intrinsic::PrintBool),
+        "print_char" | "println_char" => Some(Intrinsic::PrintChar),
         "assert" => Some(Intrinsic::Assert),
         _ => None,
     }
@@ -2237,6 +2259,10 @@ impl<'a> FnTranslator<'a> {
         if let Some(result) = self.lower_ml_rt_call(name, args) {
             return result;
         }
+        // The text builtins' entries (the `text_rt` table).
+        if let Some(result) = self.lower_text_rt_call(name, args) {
+            return result;
+        }
         // Everything above dispatches a runtime kernel on (name, arity). `rt_ids` holds exactly
         // the runtime symbols this function is responsible for, so reaching here with one of them
         // means a recognizer emitted an arity no arm accepts. Unknown `wukong_` names must also
@@ -2257,11 +2283,8 @@ impl<'a> FnTranslator<'a> {
             }
             return None;
         }
-        let arg_is_float = args
-            .first()
-            .map(|a| self.ty_of(*a).is_float())
-            .unwrap_or(false);
-        let Some(intr) = classify_intrinsic(name, arg_is_float) else {
+        let arg_ty = args.first().map(|a| self.ty_of(*a).clone());
+        let Some(intr) = classify_intrinsic(name, arg_ty.as_ref()) else {
             if self.layout_err.is_none() {
                 self.layout_err = Some(format!(
                     "unsupported external call `{name}`: native codegen has no declared ABI or symbol binding"
@@ -2292,6 +2315,17 @@ impl<'a> FnTranslator<'a> {
                     let v = self.coerce_to_f64(a);
                     let fref = self.runtime_ref(RT_PRINT_F64);
                     self.builder.ins().call(fref, &[v]);
+                }
+            }
+            // The per-type scalar printers live in the `text_rt` table; each takes the one value.
+            Intrinsic::PrintF32 | Intrinsic::PrintBool | Intrinsic::PrintChar => {
+                let entry = match intr {
+                    Intrinsic::PrintF32 => text_rt::RT_PRINT_F32,
+                    Intrinsic::PrintBool => text_rt::RT_PRINT_BOOL,
+                    _ => text_rt::RT_PRINT_CHAR,
+                };
+                if let Some(a) = args.first() {
+                    self.lower_text_rt_call(entry, std::slice::from_ref(a));
                 }
             }
             Intrinsic::PrintStr => {
@@ -3967,6 +4001,7 @@ fn populate_module<M: Module>(
         (RT_FMOD_F32, rt.fmod_f32),
     ]);
     ml_rt::declare(module, ptr_ty, call_conv, &mut rt_ids)?;
+    text_rt::declare(module, ptr_ty, call_conv, &mut rt_ids)?;
 
     // Declare all user functions first so calls resolve regardless of definition order.
     let mut ids: HashMap<Symbol, FuncId> = HashMap::new();
@@ -4666,8 +4701,9 @@ fn jit_compile_entry(
     );
     builder.symbol(RT_WRITE_I8, wukong_runtime::wukong_rt_write_i8 as *const u8);
     builder.symbol(RT_WRITE_U8, wukong_runtime::wukong_rt_write_u8 as *const u8);
-    // The ML builtins' entries (the `ml_rt` table).
+    // The ML builtins' entries (the `ml_rt` table), and the text builtins' (the `text_rt` table).
     ml_rt::bind_jit(&mut builder);
+    text_rt::bind_jit(&mut builder);
     builder.symbol(RT_NOW_NS, wukong_runtime::wukong_now_ns as *const u8);
     // The guarded run's parallel-for: the runtime's, wrapped in the cancellation ABI that brings a
     // failing region body's diagnostic back to its caller in iteration order (`rt_parallel_for`).
@@ -5298,8 +5334,9 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     );
     builder.symbol(RT_WRITE_I8, wukong_runtime::wukong_rt_write_i8 as *const u8);
     builder.symbol(RT_WRITE_U8, wukong_runtime::wukong_rt_write_u8 as *const u8);
-    // The ML builtins' entries (the `ml_rt` table).
+    // The ML builtins' entries (the `ml_rt` table), and the text builtins' (the `text_rt` table).
     ml_rt::bind_jit(&mut builder);
+    text_rt::bind_jit(&mut builder);
     builder.symbol(RT_NOW_NS, wukong_runtime::wukong_now_ns as *const u8);
     builder.symbol(
         RT_PARALLEL_FOR,

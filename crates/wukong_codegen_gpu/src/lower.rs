@@ -85,7 +85,9 @@ use wukong_span::{Interner, Symbol};
 // --- Device context-buffer layout (u64 slots) -----------------------------------------------
 // [0] = record count (atomic), [1] = assert-failed flag, [2] = exit code (i64), [3] = reserved;
 // records start at slot 4, two u64 each: [tag, payload]. tag 0 = int (payload = i64 bits), 1 =
-// float (payload = f64 bits). Byte offsets are what the PTX uses.
+// f64 (payload = f64 bits), 2 = f32 (payload = the f64 bits of the exactly-widened f32, replayed at
+// f32 precision), 3 = bool (payload = 0/1, replayed as `false`/`true`). Byte offsets are what the
+// PTX uses.
 const CTX_COUNT_OFF: u64 = 0;
 const CTX_ASSERT_OFF: u64 = 8;
 const CTX_EXIT_OFF: u64 = 16;
@@ -94,6 +96,11 @@ const RECORD_BYTES: u64 = 16;
 /// Capacity of the print-record buffer. Generous for the test corpus; overflow is *detected* (the
 /// atomic counter still advances) and surfaced as an error rather than silently corrupting memory.
 const RECORD_CAP: u64 = 1 << 16;
+/// Print-record tags (see the context-buffer layout above).
+const TAG_INT: u64 = 0;
+const TAG_F64: u64 = 1;
+const TAG_F32: u64 = 2;
+const TAG_BOOL: u64 = 3;
 
 /// The PTX name of the launched entry kernel (a thin `.visible .entry` wrapper).
 const KERNEL_NAME: &str = "wukong_kernel";
@@ -2439,7 +2446,10 @@ impl<'a> FnEmit<'a> {
         let name = self.interner.resolve(func).to_string();
         // Side effects share both paths (their record/flag writes are mega-guarded internally).
         match name.as_str() {
-            "print" | "println" => return self.lower_print(args),
+            "print" | "println" => return self.lower_print(args, false),
+            // mir_build routes a `bool` here, zero-extended to `i64`; the host replays the record
+            // as `true`/`false`, the text every CPU backend prints.
+            "print_bool" | "println_bool" => return self.lower_print(args, true),
             "assert" => return self.lower_assert(args),
             _ => {}
         }
@@ -3047,7 +3057,11 @@ impl<'a> FnEmit<'a> {
         self.emit("}");
     }
 
-    fn lower_print(&mut self, args: &[ValueId]) -> Result<(), String> {
+    /// `print`/`println` of one value as a `(tag, payload)` record (see the context-buffer layout).
+    /// `boolean` is the `print_bool` route: an integer payload the host replays as `true`/`false`.
+    /// An `f32` (and an `f16`/`bf16`, which live in `f32` registers) is widened exactly to `f64`
+    /// for the record and tagged so the host prints it at `f32` precision, as the CPU does.
+    fn lower_print(&mut self, args: &[ValueId], boolean: bool) -> Result<(), String> {
         let arg = *args
             .first()
             .ok_or_else(|| format!("{UNSUPPORTED} print with no argument"))?;
@@ -3059,12 +3073,15 @@ impl<'a> FnEmit<'a> {
                 let fd = self.fresh(RC::F64);
                 self.emit(&format!("cvt.f64.f32 {fd}, {f};"));
                 self.emit(&format!("mov.b64 {pl}, {fd};"));
+                (TAG_F32, pl)
             } else {
                 self.emit(&format!("mov.b64 {pl}, {f};"));
+                (TAG_F64, pl)
             }
-            (1u64, pl)
+        } else if boolean {
+            (TAG_BOOL, self.reg(arg))
         } else {
-            (0u64, self.reg(arg))
+            (TAG_INT, self.reg(arg))
         };
         self.emit_record(tag, &payload);
         Ok(())
@@ -4927,10 +4944,12 @@ pub(crate) fn decode_ctx(out: &[u64]) -> Result<(i64, Vec<u8>), String> {
     for i in 0..count as usize {
         let tag = out[base + 2 * i];
         let payload = out[base + 2 * i + 1];
-        let line = if tag == 1 {
-            format!("{}\n", f64::from_bits(payload))
-        } else {
-            format!("{}\n", payload as i64)
+        let line = match tag {
+            TAG_F64 => format!("{}\n", f64::from_bits(payload)),
+            // Exact: the payload is an f32 widened to f64.
+            TAG_F32 => format!("{}\n", f64::from_bits(payload) as f32),
+            TAG_BOOL => format!("{}\n", payload != 0),
+            _ => format!("{}\n", payload as i64),
         };
         stdout.extend_from_slice(line.as_bytes());
     }

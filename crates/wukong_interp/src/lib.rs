@@ -1435,17 +1435,30 @@ impl<'a, 'k> Interp<'a, 'k> {
                 Value::Ptr((base as i128 + off * slot_count(elem) as i128) as usize)
             }
             Op::Barrier => Value::Unit,
-            Op::Call { func, args } => {
+            Op::Call { func: callee, args } => {
                 let mut argv = self.call_args.pop().unwrap_or_default();
                 argv.extend(args.iter().map(|a| reg(regs, *a)));
-                let result = if let Some(index) = self.function_index(*func) {
+                let result = if let Some(index) = self.function_index(*callee) {
                     let callee = &self.program.funcs[index];
                     self.run_function(callee, &argv)
-                } else if let Some(ext) = self.program.extern_fn(*func) {
+                } else if let Some(ext) = self.program.extern_fn(*callee) {
                     call_extern(ext, &argv, self.interner)
                 } else {
-                    let name = self.interner.resolve(*func);
-                    self.intrinsic(name, &argv)
+                    let name = self.interner.resolve(*callee);
+                    // A float `print` picks its printer by the argument's MIR type, as native does
+                    // (`classify_intrinsic`): an `f32` (or an `f16`/`bf16`, which lives in an `f32`)
+                    // prints at its own precision. Every other print routes by name below.
+                    let narrow_float = args.first().is_some_and(|a| {
+                        matches!(
+                            func.value_type(*a),
+                            MirType::F32 | MirType::F16 | MirType::BF16
+                        )
+                    });
+                    if narrow_float && matches!(name, "print" | "println") {
+                        self.print_f32(&argv)
+                    } else {
+                        self.intrinsic(name, &argv)
+                    }
                 };
                 argv.clear();
                 self.call_args.push(argv);
@@ -1767,6 +1780,16 @@ impl<'a, 'k> Interp<'a, 'k> {
         }
     }
 
+    /// `print`/`println` of an `f32` (or an `f16`/`bf16` held in one): the value's shortest
+    /// round-trip digits at `f32` precision. The slot holds the value's exact `f64` image, so the
+    /// narrowing is exact.
+    fn print_f32(&mut self, args: &[Value]) -> Result<Value, String> {
+        let x = args.first().map_or(0.0, |v| v.as_float()) as f32;
+        let text = wukong_runtime::fmt::f32_line(x);
+        self.stdout.extend_from_slice(text.as_bytes());
+        Ok(Value::Unit)
+    }
+
     fn intrinsic(&mut self, name: &str, args: &[Value]) -> Result<Value, String> {
         match name {
             "print" | "println" => {
@@ -1789,6 +1812,21 @@ impl<'a, 'k> Interp<'a, 'k> {
                     Value::Int(i) => format!("{}\n", i as u64),
                     other => format!("{}\n", other.as_int() as u64),
                 };
+                self.stdout.extend_from_slice(text.as_bytes());
+                Ok(Value::Unit)
+            }
+            // A `bool` / `char` argument to `print`/`println` (mir_build zero-extends it to 64 bits
+            // and routes it here): `true`/`false`, or the character's glyph. Native's
+            // `rt_print_bool`/`rt_print_char` render through the same `wukong_runtime::fmt`.
+            "print_bool" | "println_bool" => {
+                let v = args.first().map_or(0, |v| v.as_int() as i64);
+                let text = wukong_runtime::fmt::bool_line(v);
+                self.stdout.extend_from_slice(text.as_bytes());
+                Ok(Value::Unit)
+            }
+            "print_char" | "println_char" => {
+                let v = args.first().map_or(0, |v| v.as_int() as i64);
+                let text = wukong_runtime::fmt::char_line(v);
                 self.stdout.extend_from_slice(text.as_bytes());
                 Ok(Value::Unit)
             }

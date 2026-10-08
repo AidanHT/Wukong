@@ -538,10 +538,10 @@ fn cc_fallback_discovered_from_the_cli_matches_run() {
         emitted.2
     );
     let ran = outcome(Command::new(&exe).current_dir(&tmp));
-    // Hand-derived: 7.25 % 2.0 = 1.25 exactly; f32 0.1 widens to 0.100000001490116119384765625,
-    // whose shortest round-trip f64 digits are 0.10000000149011612; 1/3 rounds to the double whose
-    // shortest digits are 0.3333333333333333; u64::MAX prints unsigned.
-    let expected = "1.25\n0.10000000149011612\n0.3333333333333333\n-7\n18446744073709551615\n";
+    // Hand-derived: 7.25 % 2.0 = 1.25 exactly; an f32 prints at its own precision, and "0.1" is
+    // the shortest decimal that rounds back to the f32 0.1 (13421773 * 2^-27); 1/3 rounds to the
+    // double whose shortest digits are 0.3333333333333333; u64::MAX prints unsigned.
+    let expected = "1.25\n0.1\n0.3333333333333333\n-7\n18446744073709551615\n";
     assert_eq!((ran.0, ran.1.as_str()), (Some(3), expected), "{}", ran.2);
     let oracle = outcome(
         Command::new(env!("CARGO_BIN_EXE_wukongc"))

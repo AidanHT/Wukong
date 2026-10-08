@@ -244,7 +244,17 @@ pub(crate) fn not_differentiable_reason(name: &str) -> Option<&'static str> {
 pub(crate) fn is_effect_only(name: &str) -> bool {
     matches!(
         name,
-        "print" | "println" | "print_str" | "println_str" | "print_u" | "println_u" | "assert"
+        "print"
+            | "println"
+            | "print_str"
+            | "println_str"
+            | "print_u"
+            | "println_u"
+            | "print_bool"
+            | "println_bool"
+            | "print_char"
+            | "println_char"
+            | "assert"
     ) || name == "wukong_rt_free"
         || name.starts_with("wukong_rt_write_")
 }

@@ -1,7 +1,7 @@
 // RUN: --run
 // EXPECT-EXIT: 0
-// EXPECT-OUT: 1.6487213373184204
-// EXPECT-OUT: 1.6487213373184204
+// EXPECT-OUT: 1.6487213
+// EXPECT-OUT: 1.6487213
 module tests.run.transcendental_kernel
 
 // An `out[i] = exp(x[i])` loop dispatches to the 256-bit `wukong_vmath_f32` microkernel (the same
@@ -12,7 +12,9 @@ module tests.run.transcendental_kernel
 // WHAT THE TWO EXPECTATIONS ABOVE ACTUALLY ARE — read this before changing them.
 //
 // They are a BIT-EXACT SNAPSHOT of this kernel's current output, not a derived value.
-// 1.6487213373184204 is the f64 widening of f32 bits 0x3FD3094D. The true exp(0.5) is
+// 1.6487213 is the shortest round-trip form of f32 bits 0x3FD3094D, whose exact value is
+// 1.6487213373184204 (an f32 prints at its own precision; the correctly-rounded neighbour
+// 0x3FD3094C prints 1.6487212, so the line still pins the bits). The true exp(0.5) is
 // 1.6487212707001282 and the correctly-rounded f32 is 0x3FD3094C = 1.6487212181091309, so the
 // pinned value is +0.559 ULP from the truth while the correctly-rounded one is -0.441 ULP: the
 // snapshot is one ULP high, and it was recorded from compiler output in violation of this corpus's
