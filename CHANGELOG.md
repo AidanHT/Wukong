@@ -5,6 +5,16 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Training: transformer gradients and a data-driven `--train` loop (`gap2/training-loop-and-transformer-grads`)
+
+- **Autodiff: the fused scaled-dot-product attention is differentiable** (N83). `wukong_attention_f32`
+  (the `sdpa` kernel, causal or not, with a constant or run-time causal flag) has a VJP: the
+  FlashAttention recompute — `P = softmax(scale·Q·Kᵀ)` rebuilt with `wukong_sgemm_nt_alpha` and the
+  row softmax, then `dV = Pᵀ·dO`, `dS = softmax_bwd(P, dO·Vᵀ)·scale`, `dQ = dS·K`, `dK = dSᵀ·Q` on the
+  tuned GEMMs and `wukong_softmax_bwd_f32`. Gated against an f64 closed form and the finite
+  difference (`wukong_autodiff` `tests/attention.rs`), including self-attention over one buffer.
+  The tape now differentiates 50 forward kernel symbols.
+
 ### Optimizer memory passes: SROA, path DSE, loop deletion, guarded LICM, scalar promotion (`gap/opt-memory`)
 
 - **SROA** (`-O2`, ahead of mem2reg): an array/struct/tuple local whose every access is at a constant

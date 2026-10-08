@@ -6,10 +6,11 @@
 | `tape.rs` | Buffer tape core: the `Kernel` families and the `FORWARD_KERNELS` table (recognition, arity, dispatch from one source of truth), `Syms`, gradient accumulation (`begin`/`end`), heap scratch, the write-after-write rule, reductions, `velem`, `vmath`, the norms |
 | `tape_linalg.rs` | GEMM family (NN, NT, TN, α-scaled, fused epilogue), GEMV / GEVM, broadcast bias, transpose, column reductions |
 | `tape_nn.rs` | All 36 activation backwards (`act_backward`), the `vmath2` family, cross-entropy / log-sum-exp / entropy / KL, RoPE, embedding |
+| `tape_attn.rs` | The fused scaled-dot-product attention (`wukong_attention_f32`): the FlashAttention recompute of the weights, then the four adjoint GEMMs and the fused softmax backward |
 | `coverage.rs` | `NOT_DIFFERENTIABLE`: every emitted runtime symbol the tape declines, with the reason a user sees; effect-only calls (`print`, `assert`, ...) |
 | `inline.rs` | Call flattening: splice straight-line helper functions into the loss before differentiation |
 | `optim.rs` | `build_adamw_step`, `adamw_step_name`, `hp` index module for AdamW hyperparameters |
-| `tests.rs` + `tests/` | Finite-difference + closed-form gate: per-rule tests, `kernels.rs` (new families), `memory.rs` (accumulation, in-place, stores), `calls.rs` (helpers, Hessian-vector products), `mirror.rs` (recognizer ↔ autodiff coupling) |
+| `tests.rs` + `tests/` | Finite-difference + closed-form gate: per-rule tests, `kernels.rs` (new families), `attention.rs` (the fused attention), `memory.rs` (accumulation, in-place, stores), `calls.rs` (helpers, Hessian-vector products), `mirror.rs` (recognizer ↔ autodiff coupling) |
 
 ## Adding a kernel rule
 

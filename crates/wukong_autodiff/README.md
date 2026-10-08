@@ -37,7 +37,7 @@ or the callee.
 
 **Buffer tape (`tape.rs`, `tape_linalg.rs`, `tape_nn.rs`)** — one gradient buffer per forward
 buffer. Every recognized kernel family is listed once in `tape::FORWARD_KERNELS` (recognition,
-arity and dispatch from one table; 49 symbols, serial and `@parallel`). The backward emits the
+arity and dispatch from one table; 50 symbols, serial and `@parallel`). The backward emits the
 runtime's own tuned kernels — transposed GEMM spellings, `wukong_{softmax,layernorm,rmsnorm}_bwd_f32`,
 the fused `wukong_vmath2_f32` backward codes, `wukong_xent_bwd_f32`, `wukong_rope_bwd_f32`,
 `wukong_scatter_add_f32` — in the `@parallel` spelling when the forward used it. Gradients

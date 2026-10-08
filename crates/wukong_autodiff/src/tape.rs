@@ -4,12 +4,12 @@
 //! elementwise activations (`wukong_vmath_f32`, `wukong_vmath2_f32`), streaming affine / Hadamard /
 //! quotient maps (`wukong_velem_f32`), reductions (`wukong_sreduce_f32`), the row-wise norms
 //! (`wukong_norm_f32`, `wukong_norm_affine_f32`), the broadcast bias, transposes, column reductions,
-//! the classification losses and the transformer pieces (RoPE, embedding gather) — each also in its
-//! `@parallel` spelling. The interpreter runs the *same* kernels, so a forward MIR function can be a
-//! tape of these calls plus a final scalar loss. Where the scalar core ([`crate::Vjp`]) tracks an
-//! adjoint per SSA value, this module tracks an adjoint per **buffer** (memory), the PyTorch-style
-//! picture tensor ops need: each forward buffer has a gradient buffer, set by a consumer's VJP and
-//! read by the producer's.
+//! the classification losses and the transformer pieces (RoPE, embedding gather, the fused
+//! scaled-dot-product attention) — each also in its `@parallel` spelling where the runtime has one.
+//! The interpreter runs the *same* kernels, so a forward MIR function can be a tape of these calls
+//! plus a final scalar loss. Where the scalar core ([`crate::Vjp`]) tracks an adjoint per SSA value,
+//! this module tracks an adjoint per **buffer** (memory), the PyTorch-style picture tensor ops need:
+//! each forward buffer has a gradient buffer, set by a consumer's VJP and read by the producer's.
 //!
 //! The backward emits **more tuned kernel calls**: the GEMM adjoints are the runtime's own
 //! transposed GEMM spellings (`wukong_sgemm_nt` / `wukong_sgemm_tn`), the norm backwards are the
@@ -171,6 +171,7 @@ pub(crate) enum Kernel {
     Kldiv,
     Rope,
     Embedding,
+    Attention,
 }
 
 /// Every forward kernel symbol the tape differentiates: `(symbol, family, @parallel spelling)`.
@@ -230,6 +231,8 @@ pub(crate) const FORWARD_KERNELS: &[(&str, Kernel, bool)] = &[
     ("wukong_rope_f32_parallel", Kernel::Rope, true),
     ("wukong_embedding_f32", Kernel::Embedding, false),
     ("wukong_embedding_f32_parallel", Kernel::Embedding, true),
+    // No `_parallel` twin: multi-head work is spread by the caller, not inside the kernel.
+    ("wukong_attention_f32", Kernel::Attention, false),
 ];
 
 impl Kernel {
@@ -258,6 +261,7 @@ impl Kernel {
             Kernel::Kldiv => 5,        // (p, q, out, rows, cols)
             Kernel::Rope => 5,         // (x, inv_freq, out, rows, half)
             Kernel::Embedding => 6,    // (out, weight, ids, t, h, v)
+            Kernel::Attention => 8,    // (q, k, v, out, s, d, scale, causal)
         }
     }
 
@@ -267,6 +271,7 @@ impl Kernel {
         match self {
             Kernel::Sreduce => None,
             Kernel::Embedding => Some(0),
+            Kernel::Attention => Some(3),
             Kernel::Vmath
             | Kernel::Norm
             | Kernel::NormAffine
@@ -319,6 +324,8 @@ pub(crate) struct Syms {
     pub sgemm_tn_par: Symbol,
     /// The fused-epilogue GEMM, emitted with the IDENTITY epilogue to recompute a pre-activation.
     pub sgemm_nt_epi: Symbol,
+    /// `C = α·A·Bᵀ`, emitted to recompute the attention weights `scale·Q·Kᵀ`.
+    pub sgemm_nt_alpha: Symbol,
     pub sgemv_alpha: Symbol,
     pub sgevm: Symbol,
     pub vmath: Symbol,
@@ -373,6 +380,7 @@ impl Syms {
             sgemm_tn: it.intern("wukong_sgemm_tn"),
             sgemm_tn_par: it.intern("wukong_sgemm_tn_parallel"),
             sgemm_nt_epi: it.intern("wukong_sgemm_nt_epi"),
+            sgemm_nt_alpha: it.intern("wukong_sgemm_nt_alpha"),
             sgemv_alpha: it.intern("wukong_sgemv_alpha"),
             sgevm: it.intern("wukong_sgevm_f32"),
             vmath: it.intern("wukong_vmath_f32"),
@@ -563,6 +571,7 @@ impl<'a> Vjp<'a> {
             Kernel::Kldiv => self.diff_kldiv(args)?,
             Kernel::Rope => self.diff_rope(args, par)?,
             Kernel::Embedding => self.diff_embedding(args, par)?,
+            Kernel::Attention => self.diff_attention(args)?,
         }
         self.kill_overwritten(kind, args);
         Ok(())
@@ -678,6 +687,7 @@ impl<'a> Vjp<'a> {
                 self.mul64(rh, two)
             }
             Kernel::Embedding => self.dims_product(&[args[3], args[4]]),
+            Kernel::Attention => self.dims_product(&[args[4], args[5]]),
         };
         Some(n)
     }

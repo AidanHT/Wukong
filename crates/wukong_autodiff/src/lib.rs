@@ -49,6 +49,7 @@ mod coverage;
 mod inline;
 pub mod optim;
 mod tape;
+mod tape_attn;
 mod tape_linalg;
 mod tape_nn;
 use tape::{Kernel, Syms};

@@ -1014,12 +1014,12 @@ and after backward optimization and verifies the complete training program befor
 `--verify-each` additionally checks each optimization pass; gradient MIR emission also verifies its output.
 
 **Kernel coverage.** Every runtime symbol `wukong_mir_build` can emit has an explicit autodiff
-disposition, enforced by `every_emitted_kernel_symbol_is_differentiable_or_declined_by_name`: 49
-forward symbols (25 kernel families, serial and `@parallel`) have VJP rules, and the rest are
+disposition, enforced by `every_emitted_kernel_symbol_is_differentiable_or_declined_by_name`: 50
+forward symbols (26 kernel families, serial and `@parallel`) have VJP rules, and the rest are
 listed with the reason a decline reports (index-valued arg-reductions, half-precision storage,
-quantized operands, scans, pooling, the fused attention kernel, the training-backward kernels
-themselves, I/O). The differentiable families: the whole f32 GEMM family — plain `A·B`, `nn.Linear`
-`A·Bᵀ`, the weight-gradient `Aᵀ·B`, the α-scaled attention-score GEMM and the fused
+quantized operands, scans, pooling, the training-backward kernels themselves, I/O). The
+differentiable families: the whole f32 GEMM family — plain `A·B`, `nn.Linear` `A·Bᵀ`, the
+weight-gradient `Aᵀ·B`, the α-scaled attention-score GEMM and the fused
 `act(A·Bᵀ + bias)` epilogue (identity / ReLU / GELU / SiLU) — GEMV and GEVM (plain and α-scaled), the
 broadcast bias (pure add or any fused activation, in place or not), transpose, column sum / mean /
 sum-of-squares, `sreduce_f32` (SUM, DOT, SSD, SUMSQ, MAX, MIN, MAXABS — ties split evenly — SUMABS,
@@ -1027,7 +1027,14 @@ ABSDIFF), `velem_f32` (affine, product and quotient, with identity / ReLU / ReLU
 `vmath_f32` activation codes, the two-input `vmath2_f32` family (pow, atan2, hypot and the SwiGLU /
 GeGLU / GLU gates), `norm_f32` (softmax, log-softmax, LayerNorm, RMSNorm, L2-norm), `norm_affine_f32`,
 softmax cross-entropy, log-sum-exp, entropy, KL divergence, rotary position embedding (including a
-trainable frequency table) and the embedding gather.
+trainable frequency table), the embedding gather and the fused scaled-dot-product attention
+(`wukong_attention_f32`, causal or not — its backward is the FlashAttention recompute: the weights
+are rebuilt with the α-scaled score GEMM and the row softmax, then `dV = Pᵀ·dO`, `dS =
+softmax_bwd(P, dO·Vᵀ)·scale`, `dQ = dS·K`, `dK = dSᵀ·Q`, all on the tuned GEMM and
+`wukong_softmax_bwd_f32` kernels). A source `sdpa(...)` call, like every named kernel builtin that
+writes an output buffer other than its own input, still lowers behind a run-time output-overlap
+dispatch (a branch), so a loss that makes such a call is not single-block and is refused by the
+straight-line contract; spell the layer with the recognized loops to train it from source.
 
 **The backward rides the tuned kernels.** The GEMM adjoints are the runtime's own transposed GEMM
 spellings (no synthesized transpose); softmax / LayerNorm / RMSNorm backward are the runtime's

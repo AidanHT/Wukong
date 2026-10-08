@@ -1794,8 +1794,11 @@ before execution. A loss may call helper functions at any `-O` level: straight-l
 spliced into the loss before it is differentiated, and a helper that cannot be (multi-block or
 recursive) is named in the refusal. Every recognized tensor kernel either has a VJP — the whole
 f32 GEMM family including the fused bias/activation epilogue, all activations, the norms,
-cross-entropy, RoPE, the embedding gather — or declines by name with the reason
-(`docs/roadmap.md`, *Automatic differentiation*).
+cross-entropy, RoPE, the embedding gather, the fused attention kernel — or declines by name with
+the reason (`docs/roadmap.md`, *Automatic differentiation*). A named kernel builtin that writes an
+output buffer other than its own input (`matmul(a, b, c)`, `softmax(x, y)`, `sdpa(...)`) lowers
+behind a run-time output-overlap dispatch — a branch — so a loss that calls one is not single-block
+and is refused; write that layer as the recognized loops to train it.
 
 **✅ AOT gradient:** `wukongc --emit=obj --grad-of=loss -o model.o model.wk` exports `loss_grad`
 next to `loss` (C ABI: the loss's parameters, then one caller-zeroed gradient buffer per
