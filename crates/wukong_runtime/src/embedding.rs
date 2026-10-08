@@ -136,10 +136,6 @@ unsafe fn embedding_rows(
     }
 }
 
-/// Row count below which the parallel gather just runs serially (the rayon split is not worth its
-/// overhead on a small lookup).
-const EMBEDDING_PAR_MIN: usize = 64;
-
 /// `out[t, :] = weight[ids[t], :]` over a `[T, H]` output, `[V, H]` weight table, and length-`T` `i32`
 /// `ids` — embedding lookup, single-threaded.
 ///
@@ -179,7 +175,8 @@ pub unsafe extern "C" fn wukong_embedding_f32(
 /// Multi-threaded `out[t, :] = weight[ids[t], :]`: the independent `T` output rows are spread across
 /// cores. Each row writes a disjoint `out` slice and only reads `weight`/`ids`, so the result is
 /// **bit-identical to [`wukong_embedding_f32`]** (a permutation/gather, no accumulation — thread
-/// count and order are irrelevant). Below `EMBEDDING_PAR_MIN` rows it runs the serial path.
+/// count and order are irrelevant). Below the shared work gate (`par::fork_rows`, tokens x hidden)
+/// it runs the serial path.
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_embedding_f32`], including its non-positive-extent rule.
@@ -198,7 +195,7 @@ pub unsafe extern "C" fn wukong_embedding_f32_parallel(
     // Past the sign guard the extents are ordinary magnitudes; `per`/`nchunks` below are derived
     // from `t`, so this conversion must come after it.
     let (t, h, v) = (t as usize, h as usize, v.max(0) as usize);
-    if t < EMBEDDING_PAR_MIN {
+    if !crate::par::fork_rows(t, h, crate::par::W_STREAM) {
         embedding_rows(out, weight, ids, h, v, 0, t);
         return;
     }
@@ -268,7 +265,7 @@ mod tests {
             (4, 64, 3),
             (100, 70, 23),
             (1, 257, 2),
-            (200, 16, 50), // > EMBEDDING_PAR_MIN so the multicore path runs
+            (200, 16, 50), // many rows, so the multicore path runs
         ] {
             // Distinct, exactly-representable weight values so any mis-gather shows as a bit mismatch.
             let weight: Vec<f32> = (0..v * h).map(|i| i as f32 * 0.5 - 3.0).collect();

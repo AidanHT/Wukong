@@ -72,9 +72,6 @@ unsafe fn cumprod_rows(x: *const f32, out: *mut f32, cols: usize, r0: usize, r1:
     }
 }
 
-/// Row count below which the parallel scan just runs serially.
-const CUMPROD_PAR_MIN: usize = 64;
-
 /// `out[r, i] = Π_{k<=i} x[r, k]` over a `[rows, cols]` row-major matrix — single-threaded
 /// (4-row-interleaved for ILP). Each row is an independent inclusive prefix product.
 ///
@@ -92,7 +89,7 @@ pub unsafe extern "C" fn wukong_cumprod_f32(x: *const f32, out: *mut f32, rows: 
 /// Multicore prefix product — **bit-identical** to [`wukong_cumprod_f32`]. Rows are independent, so the
 /// parallel path slices the rows into one contiguous chunk per core and runs the *identical*
 /// 4-row-interleaved [`cumprod_rows`] on each — independent of thread count, bit-equal to serial. Below
-/// `CUMPROD_PAR_MIN` rows it runs serial.
+/// the shared work gate (`par::fork_rows`, rows x cols) it runs serial.
 ///
 /// # Safety
 /// `x`, `out` valid for `rows * cols` f32; each row written by exactly one task (disjoint sub-slices).
@@ -107,7 +104,7 @@ pub unsafe extern "C" fn wukong_cumprod_f32_parallel(
         return;
     }
     let (rows, cols) = (rows as usize, cols as usize);
-    if rows < CUMPROD_PAR_MIN {
+    if !crate::par::fork_rows(rows, cols, crate::par::W_STREAM) {
         cumprod_rows(x, out, cols, 0, rows);
         return;
     }
@@ -176,10 +173,10 @@ mod tests {
     }
 
     /// Serial and parallel must be **bit-for-bit identical** (rows independent). Exercised above
-    /// `CUMPROD_PAR_MIN` so the rayon path runs, across varied `cols`.
+    /// the old 64-row gate so the rayon path runs, across varied `cols`.
     #[test]
     fn serial_equals_parallel_bit_for_bit() {
-        let rows = CUMPROD_PAR_MIN + 137;
+        let rows = 64 + 137;
         for &cols in &[1usize, 7, 8, 17, 64, 333] {
             let x = fill(rows * cols);
             let mut s = vec![0.0f32; rows * cols];

@@ -180,17 +180,20 @@ static CATALOG: &[Explanation] = &[
         "unknown or misplaced attribute",
         "An `@attribute` is not one Wukong knows, or is not legal where it was written. The known \
          set is closed: `@parallel`, `@generic`, `@tile`, `@extern`, `@noalias`, `@unchecked`, \
-         `@inline`, `@simd`, `@align`, `@export`. Anything else — most importantly a typo of a real one, \
-         `@parellel` — used to be accepted and discarded, so the program compiled with none of the \
-         requested behavior and no diagnostic. Placement: `@generic` (opt this function out of \
-         kernel recognition) is read from the `fn` item, so it is rejected on a statement, a \
-         parameter, or a non-`fn` item rather than silently promising a per-loop opt-out; \
-         `@unchecked` (drop this function's slice bounds checks) is read from the `fn` item for the \
-         same reason. `@noalias` describes one parameter's storage, so it is legal only on a parameter, takes no \
+         `@strict_fp`, `@inline`, `@simd`, `@align`, `@export`. Anything else — most importantly a \
+         typo of a real one, `@parellel` — used to be accepted and discarded, so the program \
+         compiled with none of the requested behavior and no diagnostic. Placement: `@generic` (opt \
+         this function out of kernel recognition) and `@strict_fp` (source-order float evaluation) \
+         are read from the `fn` item, so each is rejected on a statement, a parameter, or a \
+         non-`fn` item rather than silently promising a per-loop opt-out; `@unchecked` (drop this \
+         function's slice bounds checks) is read from the `fn` item for the same reason. \
+         `@noalias` describes one parameter's storage, so it is legal only on a parameter, takes no \
          arguments, and only on a parameter passed by pointer (an array, slice, tensor, pointer, \
          reference, tuple or struct) — on a scalar there is no storage to promise anything about. \
-         The parsed-but-discarded attributes (`@inline`, `@simd`, `@align`, `@export`) stay legal \
-         wherever they parse."
+         Arguments: `@parallel` takes nothing or exactly `grain = G` with `1 <= G <= 2^31` (each \
+         worker then claims runs of at least G iterations); an unknown key, a positional argument \
+         or an out-of-range grain is rejected instead of discarded. The parsed-but-discarded \
+         attributes (`@inline`, `@simd`, `@align`, `@export`) stay legal wherever they parse."
     ),
     entry!(
         "E0307",

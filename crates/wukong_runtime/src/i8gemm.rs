@@ -27,11 +27,23 @@
 //!
 //! The compiler recognizes a `u8×i8→i32` `C = A·Bᵀ` nest and lowers it to one [`wukong_i8gemm_nt`]
 //! call (the int8 sibling of `wukong_sgemm_nt`); the interpreter marshals its abstract memory through
-//! the **identical** kernel, so the differential oracle stays bit-for-bit exact. Rows of `C` are
-//! independent, so the `_parallel` entry maps the per-row routine across cores: `serial == parallel`
-//! with no cross-row combine, independent of thread count.
-
-use rayon::prelude::*;
+//! the **identical** kernel, so the differential oracle stays bit-for-bit exact.
+//!
+//! **Cache blocking (P9.5, 2026-10).** Until then the whole kernel was `for each pair of A rows:
+//! stream ALL of B`, with no blocking at all, so B — the weight matrix — was re-read from memory
+//! once per two rows of A: at a quantized FFN shape (m=512, n=3072, k=768) that is 256 passes over
+//! 2.4 MB of weights, ~600 MB of traffic for a 1.2 GMAC problem, capping `vpdpbusd` (the one
+//! instruction on this part with 4x the f32 FMA MAC rate) at memory bandwidth exactly where int8
+//! should win. Both operands are already contiguous over the contraction, so — unlike f32 — no
+//! repacking is needed (the dot kernels consume 32-byte runs of each row directly); what was missing
+//! is a column block of B kept L2-resident while every A row streams past it. [`i8_col_block`]
+//! sizes that block to [`I8_B_BLOCK_BYTES`] of B, the serial entries walk column blocks outermost,
+//! and the `_parallel` entries split C into a 2D grid of (row block × column block) tasks
+//! ([`i8_par_grid`]) instead of one task per row — so a decode-shaped call (m = 1..8), which used to
+//! run on at most m cores, now spreads its columns across the pool, and every task reuses its B
+//! block across up to 32 rows. Every C element is still one full-`k` dot from the same per-row
+//! helpers, so blocking changes no bit (and wrapping `i32` addition is order-immaterial anyway):
+//! `serial == parallel` with no cross-task combine, independent of thread count and grid.
 
 /// Scalar reference: `sum_t (a[t] as i32) * (b[t] as i32)` over `k` elements, wrapping `i32`. Backs
 /// the AVX2 tail and the no-AVX2 fallback, and is the differential reference for the unit tests.
@@ -186,20 +198,6 @@ unsafe fn gemm_row_nt_avx2(arow: *const u8, b: *const i8, crow: *mut i32, k: usi
     while j < n {
         *crow.add(j) = dot_i8_avx2(arow, b.add(j * k), k);
         j += 1;
-    }
-}
-
-/// Scalar `C = A·Bᵀ` nest — the no-AVX2 fallback (and the non-x86 path). Identical math to the AVX2
-/// kernel.
-///
-/// # Safety
-/// `a` valid for `m*k` `u8`, `b` for `n*k` `i8`, `c` for `m*n` `i32`.
-unsafe fn gemm_nt_scalar(a: *const u8, b: *const i8, c: *mut i32, m: usize, k: usize, n: usize) {
-    for i in 0..m {
-        let arow = a.add(i * k);
-        for j in 0..n {
-            *c.add(i * n + j) = dot_i8_scalar(arow, b.add(j * k), k);
-        }
     }
 }
 
@@ -417,10 +415,130 @@ unsafe fn gemm_2rows_nt_vnni(
     }
 }
 
+/// Which int8 dot-product body a call runs. Detected **once per call** ([`i8_tier`]), never per
+/// element, so the hot loops are branch-free `target_feature` code; all three tiers produce the same
+/// `i32` for every input (wrapping `i32` is associative and commutative mod 2³²).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum I8Tier {
+    /// AVX-VNNI `vpdpbusd`, 2×4 register tile.
+    #[cfg(target_arch = "x86_64")]
+    Vnni,
+    /// AVX2 widen + `vpmaddwd`, 1×4 register tile.
+    #[cfg(target_arch = "x86_64")]
+    Avx2,
+    /// The portable scalar nest.
+    Scalar,
+}
+
+/// The densest tier this host supports: VNNI → AVX2 → scalar.
+fn i8_tier() -> I8Tier {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avxvnni") {
+            return I8Tier::Vnni;
+        }
+        if is_x86_feature_detected!("avx2") {
+            return I8Tier::Avx2;
+        }
+    }
+    I8Tier::Scalar
+}
+
+/// Bytes of B (`ncb` rows of `k` int8 weights) one column block keeps resident while every A row
+/// streams past it: 1 MiB, half the 2 MiB P-core L2 of the development part (the other half holds
+/// the streamed A rows, the C rows and whatever else is live), and the full per-core share of an
+/// E-core cluster's 4 MiB L2. Blocking-only: no result bit depends on it.
+const I8_B_BLOCK_BYTES: usize = 1 << 20;
+
+/// Column-block width (B rows per block) for a contraction length `k`: as many rows as fit
+/// [`I8_B_BLOCK_BYTES`], rounded down to the 4-column register tile and never below one tile, so
+/// the per-row helpers' 1-column tails only ever run at the true matrix edge.
+fn i8_col_block(k: usize) -> usize {
+    (I8_B_BLOCK_BYTES / k.max(1)).max(4) & !3
+}
+
+/// The `_parallel` task grid: `rb` rows by `cb` columns per task. `rb` is even (so the VNNI tier
+/// keeps its 2-row tile) and at most 32 — every task re-reads its B block from L2 once per row pair,
+/// so taller tasks reuse it longer; `cb` is a multiple of 4 in `[4, i8_col_block(k)]`, rounded DOWN
+/// from `n / (column blocks wanted)` so the grid reaches `3 × nthreads` tasks whenever the 4-column
+/// granularity allows — a short (decode) GEMM spreads its columns across the pool instead of
+/// leaving it idle (pinned by `i8_par_grid_policy`). Throughput-only: every C element is the same
+/// full-`k` dot whatever the grid.
+fn i8_par_grid(m: usize, n: usize, k: usize, nthreads: usize) -> (usize, usize) {
+    const RB_MAX: usize = 32;
+    let target = 3 * nthreads.max(1);
+    let rb = RB_MAX.min(m.div_ceil(2) * 2);
+    let col_blocks_wanted = target.div_ceil(m.div_ceil(rb));
+    let cb = ((n / col_blocks_wanted) & !3).clamp(4, i8_col_block(k));
+    (rb, cb)
+}
+
+/// Rows `[i0, i0 + mr)` × columns `[j0, j0 + nc)` of `C = A·Bᵀ`, written to `out` with row stride
+/// `ldo` (`out` addresses the block's top-left `C` element, or a scratch tile). Every element is the
+/// full-`k` dot of the per-row helpers the unblocked kernel used, so any tiling of rows and columns
+/// produces the same `i32`s. The VNNI tier walks the rows in pairs (the 2×4 tile: each B-row chunk
+/// loaded once feeds both rows), the others one row at a time.
+///
+/// # Safety
+/// `a` valid for rows `[i0, i0 + mr)` of `k` `u8`; `b` for rows `[j0, j0 + nc)` of `k` `i8`; `out`
+/// for `mr` rows of `nc` `i32` at stride `ldo`; `tier` from [`i8_tier`] on this host.
+#[allow(clippy::too_many_arguments)]
+unsafe fn i8_tile(
+    tier: I8Tier,
+    a: *const u8,
+    b: *const i8,
+    k: usize,
+    i0: usize,
+    mr: usize,
+    j0: usize,
+    nc: usize,
+    out: *mut i32,
+    ldo: usize,
+) {
+    let bj = b.add(j0 * k);
+    match tier {
+        #[cfg(target_arch = "x86_64")]
+        I8Tier::Vnni => {
+            let mut r = 0;
+            while r + 2 <= mr {
+                gemm_2rows_nt_vnni(
+                    a.add((i0 + r) * k),
+                    a.add((i0 + r + 1) * k),
+                    bj,
+                    out.add(r * ldo),
+                    out.add((r + 1) * ldo),
+                    k,
+                    nc,
+                );
+                r += 2;
+            }
+            if r < mr {
+                gemm_row_nt_vnni(a.add((i0 + r) * k), bj, out.add(r * ldo), k, nc);
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        I8Tier::Avx2 => {
+            for r in 0..mr {
+                gemm_row_nt_avx2(a.add((i0 + r) * k), bj, out.add(r * ldo), k, nc);
+            }
+        }
+        I8Tier::Scalar => {
+            for r in 0..mr {
+                let (arow, orow) = (a.add((i0 + r) * k), out.add(r * ldo));
+                for j in 0..nc {
+                    *orow.add(j) = dot_i8_scalar(arow, bj.add(j * k), k);
+                }
+            }
+        }
+    }
+}
+
 /// Quantized `nn.Linear` `C = A·Bᵀ` (serial): `A` is `[m,k]` `u8` row-major, `B` is `[n,k]` `i8`
 /// row-major (so `B`'s rows are the weight vectors), `C` is `[m,n]` `i32` row-major. Detects the SIMD
 /// tier **once** per call (not per element) — AVX-VNNI (2×4 register tile) → widen+`vpmaddwd` AVX2
 /// (1×4) → scalar nest — and all three are bit-identical (wrapping `i32` is order-immaterial).
+/// Column blocks of [`i8_col_block`] B rows are walked outermost, so each block is read from memory
+/// once and from L2 by every row of A (see the module header).
 ///
 /// # Safety
 /// `a` valid for `m*k` `u8`, `b` for `n*k` `i8`, `c` for `m*n` `i32`.
@@ -437,43 +555,21 @@ pub unsafe extern "C" fn wukong_i8gemm_nt(
         return;
     }
     let (m, k, n) = (m as usize, k as usize, n as usize);
-    #[cfg(target_arch = "x86_64")]
-    {
-        // VNNI (vpdpbusd) is the densest path; widen+madd AVX2 is the fallback; scalar otherwise.
-        // VNNI runs a 2×4 register tile (two C-rows at a time) so each B-row load feeds both rows.
-        if is_x86_feature_detected!("avxvnni") {
-            let mut i = 0usize;
-            while i + 2 <= m {
-                // SAFETY: rows i, i+1 of A/C valid; b valid for n*k.
-                gemm_2rows_nt_vnni(
-                    a.add(i * k),
-                    a.add((i + 1) * k),
-                    b,
-                    c.add(i * n),
-                    c.add((i + 1) * n),
-                    k,
-                    n,
-                );
-                i += 2;
-            }
-            if i < m {
-                gemm_row_nt_vnni(a.add(i * k), b, c.add(i * n), k, n);
-            }
-            return;
-        }
-        if is_x86_feature_detected!("avx2") {
-            for i in 0..m {
-                gemm_row_nt_avx2(a.add(i * k), b, c.add(i * n), k, n);
-            }
-            return;
-        }
+    let tier = i8_tier();
+    let ncb = i8_col_block(k);
+    let mut j0 = 0;
+    while j0 < n {
+        let nc = (n - j0).min(ncb);
+        // SAFETY: rows [0, m) of A, B rows [j0, j0+nc), C's column block at row stride n.
+        i8_tile(tier, a, b, k, 0, m, j0, nc, c.add(j0), n);
+        j0 += nc;
     }
-    gemm_nt_scalar(a, b, c, m, k, n);
 }
 
-/// Multicore `C = A·Bᵀ` — **bit-identical** to [`wukong_i8gemm_nt`]. Each `C[i,j]` is an independent
-/// dot, so rows are mapped across cores with no cross-row combine; the result is independent of thread
-/// count and the interpreter (serial) agrees with the native `@parallel` path exactly.
+/// Multicore `C = A·Bᵀ` — **bit-identical** to [`wukong_i8gemm_nt`]. C is split into the
+/// [`i8_par_grid`] 2D grid of disjoint (row block × column block) tasks, each computing its
+/// elements with the same full-`k` per-row helpers, so the result is independent of thread count
+/// and grid and the interpreter (serial) agrees with the native `@parallel` path exactly.
 ///
 /// # Safety
 /// Same as [`wukong_i8gemm_nt`].
@@ -489,43 +585,47 @@ pub unsafe extern "C" fn wukong_i8gemm_nt_parallel(
     if m <= 0 || k <= 0 || n <= 0 {
         return;
     }
-    let (m, k, n) = (m as usize, k as usize, n as usize);
+    let (mu, ku, nu) = (m as usize, k as usize, n as usize);
+    // Work gate + width-1 fast path (`par::fork_units`, m*k*n int8 MACs): a small int8 GEMM no
+    // longer forks at all. The independent units are the grid's (row x 4-column) cells, not the rows:
+    // the 2D grid below splits a single-token (m = 1) decode GEMM across its columns, so gating on
+    // `m` alone would keep exactly that case serial. Integer math, cells independent: bit-identical.
+    if !crate::par::fork_units(i8_units(mu, nu), i8_work(mu, ku, nu)) {
+        return wukong_i8gemm_nt(a, b, c, m, k, n);
+    }
+    let (m, k, n) = (mu, ku, nu);
     // Raw pointers cross the rayon boundary as integers (same pattern as the parallel GEMM/reduce).
     let (au, bu, cu) = (a as usize, b as usize, c as usize);
-    // Detect the SIMD tier once, not per row — each row then runs the identical per-row kernel the
-    // serial path uses, so serial == parallel bit-for-bit regardless of thread count.
-    #[cfg(target_arch = "x86_64")]
-    let vnni = is_x86_feature_detected!("avxvnni");
-    #[cfg(target_arch = "x86_64")]
-    let avx2 = is_x86_feature_detected!("avx2");
-    // This fork can be the process's FIRST rayon touch, so it must provision the global pool first —
-    // [`crate::ensure_global_pool`]'s stated precondition. Forking bare builds rayon's default
-    // 2 MiB-stack registry, so the runtime's later 16 MiB `build_global` silently loses the race and
-    // outlined `@parallel` region bodies are left on undersized stacks. Idempotent (`Once`) and
-    // provisioning-only: the work split below is unchanged, so serial == parallel stays bit-exact.
-    crate::ensure_global_pool();
-    (0..m).into_par_iter().for_each(|i| {
-        let (a, b, c) = (au as *const u8, bu as *const i8, cu as *mut i32);
-        // SAFETY: disjoint output row i; pointers valid for the declared extents by contract.
-        unsafe {
-            let arow = a.add(i * k);
-            let crow = c.add(i * n);
-            #[cfg(target_arch = "x86_64")]
-            {
-                if vnni {
-                    gemm_row_nt_vnni(arow, b, crow, k, n);
-                    return;
-                }
-                if avx2 {
-                    gemm_row_nt_avx2(arow, b, crow, k, n);
-                    return;
-                }
-            }
-            for j in 0..n {
-                *crow.add(j) = dot_i8_scalar(arow, b.add(j * k), k);
-            }
+    let tier = i8_tier();
+    // The (row block x column block) grid of `i8_par_grid`, sized for the pool that actually runs it
+    // (`wuk_pool_width`, which also provisions the 16 MiB-stack global pool before any fork), with
+    // the tasks claimed from the shared queue on the unified kernel pool (`par::claim_chunks`) so
+    // this kernel runs beside its neighbours instead of on the bare global registry. Every C element
+    // is the same full-`k` dot whatever the grid or the claim order: bit-identical.
+    let (rb, cb) = i8_par_grid(m, n, k, crate::wuk_pool_width());
+    let (nrb, ncbs) = (m.div_ceil(rb), n.div_ceil(cb));
+    crate::par::claim_chunks(nrb * ncbs, 1, true, |lo, hi| {
+        for t in lo..hi {
+            let (i0, j0) = ((t / ncbs) * rb, (t % ncbs) * cb);
+            let (mr, nc) = ((m - i0).min(rb), (n - j0).min(cb));
+            let (a, b, c) = (au as *const u8, bu as *const i8, cu as *mut i32);
+            // SAFETY: each task owns the disjoint C block [i0, i0+mr) x [j0, j0+nc); A and B are
+            // read-only and valid for the declared extents by contract; `tier` was detected above.
+            unsafe { i8_tile(tier, a, b, k, i0, mr, j0, nc, c.add(i0 * n + j0), n) };
         }
     });
+}
+
+/// The int8 GEMM's weighted work for the shared fork gate: `m·k·n` MACs scaled down by
+/// [`crate::par::I8_MACS_PER_WORK`] (saturating). Scheduling-only.
+fn i8_work(m: usize, k: usize, n: usize) -> usize {
+    m.saturating_mul(k).saturating_mul(n) / crate::par::I8_MACS_PER_WORK
+}
+
+/// The int8 GEMM's independent units for the shared fork gate: the (row x 4-column) cells that
+/// [`i8_par_grid`]'s finest grid can hand to distinct workers. Scheduling-only.
+fn i8_units(m: usize, n: usize) -> usize {
+    m.saturating_mul(n.div_ceil(4))
 }
 
 /// Dequantize one i32 C row in place to `dst`: `dst[j] = act((src[j] as f32)·scale_a·scale_b[j]
@@ -566,11 +666,14 @@ unsafe fn dequant_row(
 
 /// Quantized `nn.Linear` with a **fused per-channel dequant epilogue**:
 /// `out_f32 = act(((A·Bᵀ) as f32)·scale_a·scale_b[j] (+ bias[j]))`. The i32 accumulator never round-
-/// trips through main memory: each C row is computed into a small L1-resident i32 scratch by the *same*
-/// proven `vpdpbusd` per-row helpers `wukong_i8gemm_nt` uses (so the integer GEMM stays bit-exact),
-/// then immediately dequantized to f32. gcc/cuBLAS **cannot** fuse this — their int8 GEMM emits i32 and
-/// the dequant is a separate kernel — so it is the decode-regime win, where the dequant pass is a
-/// non-trivial fraction of a thin-M GEMM. The 2-row VNNI tile is preserved (B-row loads feed both rows).
+/// trips through main memory: each pair of C rows of one column block is computed into a small
+/// L1-resident i32 tile by the *same* proven per-row helpers `wukong_i8gemm_nt` uses (so the integer
+/// GEMM stays bit-exact), then immediately dequantized to f32. gcc/cuBLAS **cannot** fuse this — their
+/// int8 GEMM emits i32 and the dequant is a separate kernel — so it is the decode-regime win, where
+/// the dequant pass is a non-trivial fraction of a thin-M GEMM. The 2-row VNNI tile is preserved
+/// (B-row loads feed both rows) and the column blocks are those of [`wukong_i8gemm_nt`]: the
+/// dequant is per element, so applying it one column block at a time (with `scale_b`/`bias` offset
+/// to the block) computes exactly the same f32 for every element.
 ///
 /// `scale_a` = per-tensor activation scale; `scale_b` = per-output-channel weight scale (length `n`);
 /// `bias` = per-output-channel (length `n`) or null; `act` = 0/1/2/3 (id/ReLU/GELU/SiLU).
@@ -598,52 +701,104 @@ pub unsafe extern "C" fn wukong_i8gemm_nt_deq(
         return;
     }
     let (m, k, n) = (m as usize, k as usize, n as usize);
-    let mut rows = vec![0i32; 2 * n]; // L1-resident scratch for up to 2 C rows
-    let r0 = rows.as_mut_ptr();
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avxvnni") {
-            let mut i = 0usize;
-            while i + 2 <= m {
-                gemm_2rows_nt_vnni(a.add(i * k), a.add((i + 1) * k), b, r0, r0.add(n), k, n);
-                dequant_row(r0, out.add(i * n), n, scale_a, scale_b, bias, act);
+    let tier = i8_tier();
+    let ncb = i8_col_block(k);
+    deq_block(
+        tier,
+        a,
+        b,
+        out,
+        DeqArgs {
+            k,
+            n,
+            scale_a,
+            scale_b,
+            bias,
+            act,
+        },
+        0,
+        m,
+        0,
+        n,
+        ncb,
+    );
+}
+
+/// The per-call constants of a fused-dequant int8 GEMM, bundled so a block body can be handed
+/// across a rayon boundary as one `Send` value (see [`wukong_i8gemm_nt_deq_parallel`]).
+#[derive(Clone, Copy)]
+struct DeqArgs {
+    k: usize,
+    n: usize,
+    scale_a: f32,
+    scale_b: *const f32,
+    bias: *const f32,
+    act: i64,
+}
+// SAFETY: the pointers are read-only views the caller guarantees for the whole call; every task
+// joins before the extern entry returns, exactly the lifetime discipline of the `usize`-smuggled
+// operand pointers beside them.
+unsafe impl Send for DeqArgs {}
+unsafe impl Sync for DeqArgs {}
+
+/// Rows `[i0, i0 + mr)` × columns `[j0, j0 + nc)` of the fused-dequant GEMM, walked in column blocks
+/// of at most `cb`: each pair of rows of a column block is computed into an L1-resident i32 tile by
+/// [`i8_tile`] and dequantized straight into `out` by [`dequant_row`], with `scale_b`/`bias` offset to
+/// the block (a null bias stays null).
+///
+/// # Safety
+/// The [`wukong_i8gemm_nt_deq`] operand contract for the whole matrix; the block lies inside it.
+#[allow(clippy::too_many_arguments)]
+unsafe fn deq_block(
+    tier: I8Tier,
+    a: *const u8,
+    b: *const i8,
+    out: *mut f32,
+    d: DeqArgs,
+    i0: usize,
+    mr: usize,
+    j0: usize,
+    nc: usize,
+    cb: usize,
+) {
+    let width = nc.min(cb);
+    let mut tile = vec![0i32; 2 * width];
+    let t = tile.as_mut_ptr();
+    let mut jb = j0;
+    while jb < j0 + nc {
+        let w = (j0 + nc - jb).min(cb);
+        let scale_bj = d.scale_b.add(jb);
+        let bias_j = if d.bias.is_null() {
+            d.bias
+        } else {
+            d.bias.add(jb)
+        };
+        let mut i = i0;
+        while i < i0 + mr {
+            let rows = (i0 + mr - i).min(2);
+            i8_tile(tier, a, b, d.k, i, rows, jb, w, t, w);
+            for r in 0..rows {
                 dequant_row(
-                    r0.add(n),
-                    out.add((i + 1) * n),
-                    n,
-                    scale_a,
-                    scale_b,
-                    bias,
-                    act,
+                    t.add(r * w),
+                    out.add((i + r) * d.n + jb),
+                    w,
+                    d.scale_a,
+                    scale_bj,
+                    bias_j,
+                    d.act,
                 );
-                i += 2;
             }
-            if i < m {
-                gemm_row_nt_vnni(a.add(i * k), b, r0, k, n);
-                dequant_row(r0, out.add(i * n), n, scale_a, scale_b, bias, act);
-            }
-            return;
+            i += rows;
         }
-        if is_x86_feature_detected!("avx2") {
-            for i in 0..m {
-                gemm_row_nt_avx2(a.add(i * k), b, r0, k, n);
-                dequant_row(r0, out.add(i * n), n, scale_a, scale_b, bias, act);
-            }
-            return;
-        }
-    }
-    for i in 0..m {
-        let arow = a.add(i * k);
-        for j in 0..n {
-            *r0.add(j) = dot_i8_scalar(arow, b.add(j * k), k);
-        }
-        dequant_row(r0, out.add(i * n), n, scale_a, scale_b, bias, act);
+        jb += w;
     }
 }
 
-/// Multicore fused-dequant `nn.Linear` — **bit-identical** to [`wukong_i8gemm_nt_deq`] (rows are
-/// independent; each maps to a core with its own i32 scratch row, dequantized by the identical
-/// `dequant_row`). The interpreter calls the serial form, so serial == parallel == interp.
+/// Multicore fused-dequant `nn.Linear` — **bit-identical** to [`wukong_i8gemm_nt_deq`]: the same
+/// [`i8_par_grid`] tasks as [`wukong_i8gemm_nt_parallel`], each running [`deq_block`] on its disjoint
+/// block with its own i32 tile (one allocation per task, where the per-row form allocated one per
+/// row), dequantized by the identical `dequant_row`. The interpreter calls the serial form, so
+/// serial == parallel == interp.
 ///
 /// # Safety
 /// Same as [`wukong_i8gemm_nt_deq`].
@@ -664,49 +819,46 @@ pub unsafe extern "C" fn wukong_i8gemm_nt_deq_parallel(
     if m <= 0 || k <= 0 || n <= 0 {
         return;
     }
-    let (m, k, n) = (m as usize, k as usize, n as usize);
-    let (au, bu, ou, sbu, biu) = (
-        a as usize,
-        b as usize,
-        out as usize,
-        scale_b as usize,
-        bias as usize,
-    );
-    #[cfg(target_arch = "x86_64")]
-    let vnni = is_x86_feature_detected!("avxvnni");
-    #[cfg(target_arch = "x86_64")]
-    let avx2 = is_x86_feature_detected!("avx2");
-    // This fork can be the process's FIRST rayon touch, so it must provision the global pool first —
-    // [`crate::ensure_global_pool`]'s stated precondition. Forking bare builds rayon's default
-    // 2 MiB-stack registry, so the runtime's later 16 MiB `build_global` silently loses the race and
-    // outlined `@parallel` region bodies are left on undersized stacks. Idempotent (`Once`) and
-    // provisioning-only: the work split below is unchanged, so serial == parallel stays bit-exact.
-    crate::ensure_global_pool();
-    (0..m).into_par_iter().for_each(|i| {
-        // SAFETY: disjoint output row i; per-row i32 scratch; pointers valid by contract.
-        unsafe {
-            let (a, b, out) = (au as *const u8, bu as *const i8, ou as *mut f32);
-            let (scale_b, bias) = (sbu as *const f32, biu as *const f32);
-            let mut row = vec![0i32; n];
-            let r = row.as_mut_ptr();
-            let arow = a.add(i * k);
-            #[cfg(target_arch = "x86_64")]
-            {
-                if vnni {
-                    gemm_row_nt_vnni(arow, b, r, k, n);
-                } else if avx2 {
-                    gemm_row_nt_avx2(arow, b, r, k, n);
-                } else {
-                    for j in 0..n {
-                        *r.add(j) = dot_i8_scalar(arow, b.add(j * k), k);
-                    }
-                }
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            for j in 0..n {
-                *r.add(j) = dot_i8_scalar(arow, b.add(j * k), k);
-            }
-            dequant_row(r, out.add(i * n), n, scale_a, scale_b, bias, act);
+    let (mu, ku, nu) = (m as usize, k as usize, n as usize);
+    // Work gate + width-1 fast path, as in `wukong_i8gemm_nt_parallel`.
+    if !crate::par::fork_units(i8_units(mu, nu), i8_work(mu, ku, nu)) {
+        return wukong_i8gemm_nt_deq(a, b, out, m, k, n, scale_a, scale_b, bias, act);
+    }
+    let (m, k, n) = (mu, ku, nu);
+    let (au, bu, ou) = (a as usize, b as usize, out as usize);
+    let d = DeqArgs {
+        k,
+        n,
+        scale_a,
+        scale_b,
+        bias,
+        act,
+    };
+    let tier = i8_tier();
+    // Same grid, pool and claim queue as `wukong_i8gemm_nt_parallel`; each task runs `deq_block` on
+    // its disjoint block with its own i32 tile, dequantized by the identical `dequant_row`.
+    let (rb, cb) = i8_par_grid(m, n, k, crate::wuk_pool_width());
+    let (nrb, ncbs) = (m.div_ceil(rb), n.div_ceil(cb));
+    crate::par::claim_chunks(nrb * ncbs, 1, true, |lo, hi| {
+        for t in lo..hi {
+            let (i0, j0) = ((t / ncbs) * rb, (t % ncbs) * cb);
+            let (mr, nc) = ((m - i0).min(rb), (n - j0).min(cb));
+            // SAFETY: each task owns the disjoint output block [i0, i0+mr) x [j0, j0+nc) and its
+            // own i32 tile; operands are read-only and valid by contract; `tier` was detected above.
+            unsafe {
+                deq_block(
+                    tier,
+                    au as *const u8,
+                    bu as *const i8,
+                    ou as *mut f32,
+                    d,
+                    i0,
+                    mr,
+                    j0,
+                    nc,
+                    cb,
+                )
+            };
         }
     });
 }
@@ -979,6 +1131,216 @@ mod tests {
             );
         }
         assert_eq!(cs, cp, "serial != parallel");
+    }
+
+    /// The cache-blocked kernel against the exact integer reference at a shape DERIVED from the
+    /// blocking constant, so it spans three column blocks (two full, one ragged) whatever
+    /// [`I8_B_BLOCK_BYTES`] is tuned to, with a `k` that is not a multiple of the 32-byte VNNI
+    /// step (so every dot has a scalar tail) and an odd `m` (so the VNNI tier's single-row tail
+    /// runs). Checked: the serial entry, the parallel entry (bit-for-bit), the portable scalar tier
+    /// driven directly on the same blocks, and both fused-dequant entries against the unfused
+    /// formula — every value exact, no tolerance.
+    #[test]
+    fn blocked_kernel_matches_i64_reference_across_column_blocks() {
+        let k = 4000usize;
+        let ncb = i8_col_block(k);
+        let (m, n) = (7usize, 2 * ncb + 6);
+        assert_eq!(n.div_ceil(ncb), 3, "shape must span three column blocks");
+        let a = fill_u8(m * k);
+        let b = fill_i8(n * k);
+        let mut want = vec![0i32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc: i64 = 0;
+                for t in 0..k {
+                    acc += a[i * k + t] as i64 * b[j * k + t] as i64;
+                }
+                want[i * n + j] = acc as i32;
+            }
+        }
+        let (mi, ki, ni) = (m as i64, k as i64, n as i64);
+        let mut serial = vec![0i32; m * n];
+        let mut par = vec![0i32; m * n];
+        let mut scalar = vec![0i32; m * n];
+        unsafe {
+            wukong_i8gemm_nt(a.as_ptr(), b.as_ptr(), serial.as_mut_ptr(), mi, ki, ni);
+            wukong_i8gemm_nt_parallel(a.as_ptr(), b.as_ptr(), par.as_mut_ptr(), mi, ki, ni);
+            let mut j0 = 0;
+            while j0 < n {
+                let nc = (n - j0).min(ncb);
+                i8_tile(
+                    I8Tier::Scalar,
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    k,
+                    0,
+                    m,
+                    j0,
+                    nc,
+                    scalar.as_mut_ptr().add(j0),
+                    n,
+                );
+                j0 += nc;
+            }
+        }
+        assert_eq!(serial, want, "blocked serial != i64 reference");
+        assert_eq!(par, want, "blocked parallel != i64 reference");
+        assert_eq!(scalar, want, "scalar tier != i64 reference");
+        // Fused dequant, serial and parallel, against the unfused formula on the exact i32s.
+        let scale_a = 0.0125f32;
+        let scale_b: Vec<f32> = (0..n).map(|j| 0.002 + (j % 7) as f32 * 0.0005).collect();
+        let bias: Vec<f32> = (0..n).map(|j| (j % 11) as f32 * 0.25 - 1.0).collect();
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+        for &act in &[0i64, 1, 3] {
+            let mut expect = vec![0f32; m * n];
+            for i in 0..m {
+                for j in 0..n {
+                    let mut v = (want[i * n + j] as f32) * scale_a * scale_b[j];
+                    v += bias[j];
+                    expect[i * n + j] = match act {
+                        1 => {
+                            if v > 0.0 {
+                                v
+                            } else {
+                                0.0
+                            }
+                        }
+                        3 => crate::vmath::silu1(v),
+                        _ => v,
+                    };
+                }
+            }
+            let mut got = vec![0f32; m * n];
+            let mut got_par = vec![0f32; m * n];
+            unsafe {
+                wukong_i8gemm_nt_deq(
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    got.as_mut_ptr(),
+                    mi,
+                    ki,
+                    ni,
+                    scale_a,
+                    scale_b.as_ptr(),
+                    bias.as_ptr(),
+                    act,
+                );
+                wukong_i8gemm_nt_deq_parallel(
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    got_par.as_mut_ptr(),
+                    mi,
+                    ki,
+                    ni,
+                    scale_a,
+                    scale_b.as_ptr(),
+                    bias.as_ptr(),
+                    act,
+                );
+            }
+            assert_eq!(
+                bits(&got),
+                bits(&expect),
+                "blocked deq != unfused (act {act})"
+            );
+            assert_eq!(
+                bits(&got_par),
+                bits(&expect),
+                "blocked deq parallel != unfused (act {act})"
+            );
+        }
+    }
+
+    /// Decode- and prefill-shaped calls: `m` from 1 (a single token, which the per-row parallel
+    /// split used to run on ONE core) to a tall odd `m`, with `n` below, at and above one 4-column
+    /// tile. Serial == parallel bit-for-bit for the plain and fused-dequant entries.
+    #[test]
+    fn parallel_grid_matches_serial_on_decode_and_tall_shapes() {
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+        for &(m, k, n) in &[
+            (1usize, 96usize, 3usize),
+            (1, 768, 300),
+            (2, 33, 64),
+            (3, 257, 129),
+            (37, 64, 41),
+        ] {
+            let a = fill_u8(m * k);
+            let b = fill_i8(n * k);
+            let (mi, ki, ni) = (m as i64, k as i64, n as i64);
+            let (mut s, mut p) = (vec![0i32; m * n], vec![0i32; m * n]);
+            let scale_b: Vec<f32> = (0..n).map(|j| 0.01 + j as f32 * 1e-4).collect();
+            let (mut ds, mut dp) = (vec![0f32; m * n], vec![0f32; m * n]);
+            unsafe {
+                wukong_i8gemm_nt(a.as_ptr(), b.as_ptr(), s.as_mut_ptr(), mi, ki, ni);
+                wukong_i8gemm_nt_parallel(a.as_ptr(), b.as_ptr(), p.as_mut_ptr(), mi, ki, ni);
+                wukong_i8gemm_nt_deq(
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    ds.as_mut_ptr(),
+                    mi,
+                    ki,
+                    ni,
+                    0.5,
+                    scale_b.as_ptr(),
+                    std::ptr::null(),
+                    1,
+                );
+                wukong_i8gemm_nt_deq_parallel(
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    dp.as_mut_ptr(),
+                    mi,
+                    ki,
+                    ni,
+                    0.5,
+                    scale_b.as_ptr(),
+                    std::ptr::null(),
+                    1,
+                );
+            }
+            assert_eq!(s, p, "serial != parallel ({m}x{k}x{n})");
+            assert_eq!(bits(&ds), bits(&dp), "deq serial != parallel ({m}x{k}x{n})");
+        }
+    }
+
+    /// [`i8_par_grid`] as a pure policy: an even row block in `[2, 32]`, a column block that is a
+    /// multiple of the 4-column tile inside `[4, i8_col_block(k)]`, and at least `3 × nthreads`
+    /// tasks whenever the 4-column granularity allows that many — in particular a single-token
+    /// decode GEMM must fill a 16-thread pool rather than run on one core.
+    #[test]
+    fn i8_par_grid_policy() {
+        for &(m, n, k, threads) in &[
+            (1usize, 3072usize, 768usize, 16usize),
+            (1, 7, 768, 16),
+            (8, 4096, 4096, 16),
+            (512, 3072, 768, 16),
+            (37, 41, 64, 4),
+            (2048, 50257, 768, 22),
+        ] {
+            let (rb, cb) = i8_par_grid(m, n, k, threads);
+            assert!(
+                (2..=32).contains(&rb) && rb.is_multiple_of(2),
+                "rb {rb} (m{m} n{n} k{k} t{threads})"
+            );
+            assert!(
+                (4..=i8_col_block(k)).contains(&cb) && cb.is_multiple_of(4),
+                "cb {cb} (m{m} n{n} k{k} t{threads})"
+            );
+            let nrb = m.div_ceil(rb);
+            let tasks = nrb * n.div_ceil(cb);
+            let possible = nrb * n.div_ceil(4);
+            assert!(
+                tasks >= (3 * threads).min(possible),
+                "only {tasks} tasks (m{m} n{n} k{k} t{threads}, {possible} possible)"
+            );
+        }
+        // The single-token decode GEMM now spreads over the pool.
+        let (rb, cb) = i8_par_grid(1, 3072, 768, 16);
+        assert_eq!(rb, 2);
+        assert!(
+            3072usize.div_ceil(cb) >= 48,
+            "decode grid has too few tasks"
+        );
     }
 
     #[test]

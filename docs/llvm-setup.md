@@ -37,6 +37,12 @@ even that needs no LLVM installed (it is just text on stdout):
 wukongc --emit=llvm-ir -O2 examples/fib.wk    # print textual LLVM IR
 ```
 
+The emitted IR has no fast-math flags. Every contraction the compiler performs is already an
+explicit `llvm.fma.*` call, and a `@strict_fp` function (or any function under `--fp=strict`)
+contains none. Plain `fmul`/`fadd` are meant to stay separately rounded. If you compile the IR
+yourself with `-ffp-contract=fast` or `-ffast-math`, the backend may fuse or reassociate them, and
+the results will differ from `--run` (see the language guide, "Floating-point semantics").
+
 The only reason to install LLVM is to take that emitted textual IR and compile it yourself with an
 external `clang`/`llc`, or to build a future in-process `inkwell` backend. Neither is required for
 `--run`, `--backend=native`, `--emit=obj`, or `--emit=exe`.

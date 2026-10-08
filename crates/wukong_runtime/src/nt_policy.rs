@@ -1,30 +1,48 @@
 //! Shared non-temporal-store threshold for CPU streaming kernels.
 //!
-//! `WUKONG_NT_MIN_BYTES` is an optional strictly positive ASCII decimal byte count.
-//! Unset, non-Unicode, empty, signed, whitespace-containing, zero and overflowing
-//! values fall back to the historical 10 MiB default. Leading zeroes are accepted.
-//! The first caller caches the process-wide value; later environment changes have
-//! no effect. Configure the variable before starting the process.
+//! The default is derived from the probed last-level cache ([`crate::topology`]): three quarters of
+//! one L3 instance, clamped to `[4 MiB, 64 MiB]` — glibc's rule for the same decision in `memcpy`.
+//! When no L3 size can be probed it falls back to the historical 10 MiB. The old fixed 10 MiB was
+//! justified as "this machine's L3" while this machine's L3 is 24 MiB; on every other host it was
+//! not derived from anything. The crossover itself is unmeasured — the override below is the
+//! adjacent-run A/B instrument for measuring it.
 //!
-//! This is an explicit scheduling override, not cache-size detection or a claim
-//! that 10 MiB is optimal. Each family retains its own saturated traffic accounting.
+//! `WUKONG_NT_MIN_BYTES` overrides the default with an explicit strictly positive ASCII decimal
+//! byte count. Unset, non-Unicode, empty, signed, whitespace-containing, zero and overflowing
+//! values are ignored (the derived default applies). Leading zeroes are accepted. The first caller
+//! caches the process-wide value; later environment changes have no effect. Configure the variable
+//! before starting the process.
+//!
+//! Throughput-only: a non-temporal and an ordinary store write the same bits, so neither the
+//! default nor the override can change a result. Each family retains its own saturated traffic
+//! accounting.
 
 use std::sync::OnceLock;
 
-const DEFAULT_NT_MIN_BYTES: usize = 10 * 1024 * 1024;
+/// The fallback when the host's last-level cache could not be probed (pinned by the tests).
+#[cfg(test)]
+const DEFAULT_NT_MIN_BYTES: usize = crate::topology::NT_FALLBACK_BYTES;
 
-fn parse_nt_min_bytes(value: Option<&str>) -> usize {
+/// The explicit override, or `None` for anything but a strictly positive ASCII decimal.
+fn parse_nt_min_bytes(value: Option<&str>) -> Option<usize> {
     value
         .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_NT_MIN_BYTES)
+}
+
+/// The default threshold for this host: derived from the probed L3 (see the module docs).
+fn derived_nt_min_bytes() -> usize {
+    crate::topology::nt_threshold_from_l3(crate::topology::host_topology().l3_bytes)
 }
 
 #[inline]
 pub(crate) fn nt_min_bytes() -> usize {
     static BYTES: OnceLock<usize> = OnceLock::new();
-    *BYTES.get_or_init(|| parse_nt_min_bytes(std::env::var("WUKONG_NT_MIN_BYTES").ok().as_deref()))
+    *BYTES.get_or_init(|| {
+        parse_nt_min_bytes(std::env::var("WUKONG_NT_MIN_BYTES").ok().as_deref())
+            .unwrap_or_else(derived_nt_min_bytes)
+    })
 }
 
 // Only tests that deliberately allocate a whole NT-regime working set use this
@@ -66,6 +84,8 @@ mod tests {
     #[test]
     fn parser_accepts_only_positive_ascii_decimal_bytes() {
         assert_eq!(DEFAULT_NT_MIN_BYTES, 10 * 1024 * 1024);
+        let derived = derived_nt_min_bytes();
+        assert!((4 << 20..=64 << 20).contains(&derived) || derived == DEFAULT_NT_MIN_BYTES);
         for value in [
             None,
             Some(""),
@@ -79,23 +99,20 @@ mod tests {
             Some("1MiB"),
             Some("１２"),
         ] {
-            assert_eq!(parse_nt_min_bytes(value), DEFAULT_NT_MIN_BYTES, "{value:?}");
+            assert_eq!(parse_nt_min_bytes(value), None, "{value:?}");
         }
         for (value, expected) in [
             ("1", 1),
             ("0004096", 4096),
             ("10485760", DEFAULT_NT_MIN_BYTES),
         ] {
-            assert_eq!(parse_nt_min_bytes(Some(value)), expected);
+            assert_eq!(parse_nt_min_bytes(Some(value)), Some(expected));
         }
         assert_eq!(
             parse_nt_min_bytes(Some(&usize::MAX.to_string())),
-            usize::MAX
+            Some(usize::MAX)
         );
-        assert_eq!(
-            parse_nt_min_bytes(Some(&format!("{}0", usize::MAX))),
-            DEFAULT_NT_MIN_BYTES
-        );
+        assert_eq!(parse_nt_min_bytes(Some(&format!("{}0", usize::MAX))), None);
     }
 
     #[test]
@@ -149,28 +166,25 @@ mod tests {
             println!("NT policy child: {expected} bytes");
             return;
         }
+        // Without a valid override the child derives the same host default the parent does (same
+        // machine, same inherited environment).
+        let derived = derived_nt_min_bytes();
         let mut cases: Vec<(Option<std::ffi::OsString>, usize)> = vec![
-            (None, DEFAULT_NT_MIN_BYTES),
+            (None, derived),
             (Some("4096".into()), 4096),
-            (Some("0".into()), DEFAULT_NT_MIN_BYTES),
-            (Some("+4096".into()), DEFAULT_NT_MIN_BYTES),
+            (Some("0".into()), derived),
+            (Some("+4096".into()), derived),
             (Some(usize::MAX.to_string().into()), usize::MAX),
         ];
         #[cfg(windows)]
         {
             use std::os::windows::ffi::OsStringExt;
-            cases.push((
-                Some(std::ffi::OsString::from_wide(&[0xd800])),
-                DEFAULT_NT_MIN_BYTES,
-            ));
+            cases.push((Some(std::ffi::OsString::from_wide(&[0xd800])), derived));
         }
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStringExt;
-            cases.push((
-                Some(std::ffi::OsString::from_vec(vec![0xff])),
-                DEFAULT_NT_MIN_BYTES,
-            ));
+            cases.push((Some(std::ffi::OsString::from_vec(vec![0xff])), derived));
         }
         for (value, expected) in cases {
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());

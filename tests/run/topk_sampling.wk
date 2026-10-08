@@ -1,0 +1,119 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 8
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 75
+// EXPECT-OUT: 30
+// EXPECT-OUT: 30
+// EXPECT-OUT: 10
+// EXPECT-OUT: 9
+// EXPECT-OUT: 2
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 0
+// EXPECT-OUT: 5
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 8
+// EXPECT-OUT: 4
+// EXPECT-OUT: 10
+// EXPECT-OUT: 4
+// EXPECT-OUT: 8
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 5
+// EXPECT-OUT: 0
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 2
+// EXPECT-OUT: 9
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 5
+// EXPECT-OUT: 5
+// EXPECT-OUT: 5
+// EXPECT-OUT: 1
+// EXPECT-OUT: 5
+// EXPECT-OUT: -1
+// EXPECT-OUT: 5
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+module tests.run.topk_sampling
+
+// The decoding kernels, every output lane printed. One total order defines each result (so it is
+// unique, whatever the selection algorithm): descending is "larger first, NaN largest of all, ties
+// to the lower index"; ascending is "smaller first, NaN last, ties to the lower index" (a stable
+// sort). `-0.0` and `0.0` tie. Expected values are those orders applied by hand to
+//   x = [0.5, 3.0, -1.0, 3.0, NaN, 2.0, -0.0, 0.0, 7.5, -2.25]
+//   * topk_f32 into 4-lane buffers: k = 4, idx = [4, 8, 1, 3] (NaN, 7.5, then the two tied 3.0s in
+//     index order), vals = [NaN, 7.5, 3.0, 3.0] — the NaN lane is checked as `v != v`, the rest
+//     printed times 10;
+//   * argsort_f32: [9, 2, 6, 7, 0, 5, 1, 3, 8, 4] (-0.0 at 6 before 0.0 at 7, NaN last);
+//   * argsort_desc_f32: [4, 8, 1, 3, 5, 0, 6, 7, 2, 9].
+// sample_categorical over p = [0, 1, NaN, 2, -4, 1]: only positive finite weights have mass, so the
+// masses are [0, 1, 0, 2, 0, 1] with total 4 and the inverse CDF is u·4 < 1 -> 1, < 3 -> 3, else
+// 5 (the first index whose running mass EXCEEDS u·4). u = 0, 0.2, 0.25, 0.5, 0.75, 0.99, 1 give
+// 1 1 3 3 5 5 5; u is clamped to [0, 1], so -1 gives 1 and 2 gives 5; all-zero weights give -1.
+// Finally six draws with u = rand_f32(7, step): u = 0.9546, 0.4070, 0.0061, 0.3902, 0.2899,
+// 0.3386 (word0 >> 8 over 2^24, from the Philox definition) -> 5 3 1 3 3 3.
+
+fn main() -> i32 {
+    let zero: f32 = 0.0;
+    let nan: f32 = zero / zero;
+    let mut x: [f32; 10] = [0.5, 3.0, -1.0, 3.0, 0.0, 2.0, -0.0, 0.0, 7.5, -2.25];
+    x[4] = nan;
+
+    let mut vals: [f32; 4] = [0.0; 4];
+    let mut idx: [i64; 4] = [0; 4];
+    print(topk_f32(x, vals, idx));
+    for j in 0..4 {
+        print(idx[j]);
+    }
+    if vals[0] != vals[0] {
+        print(1);
+    } else {
+        print(0);
+    }
+    for j in 1..4 {
+        print((vals[j] * 10.0) as i32);
+    }
+
+    let mut order: [i64; 10] = [0; 10];
+    print(argsort_f32(x, order));
+    for j in 0..10 {
+        print(order[j]);
+    }
+    print(argsort_desc_f32(x, order));
+    for j in 0..10 {
+        print(order[j]);
+    }
+
+    let mut p: [f32; 6] = [0.0, 1.0, 0.0, 2.0, -4.0, 1.0];
+    p[2] = nan;
+    print(sample_categorical(p, 0.0));
+    print(sample_categorical(p, 0.2));
+    print(sample_categorical(p, 0.25));
+    print(sample_categorical(p, 0.5));
+    print(sample_categorical(p, 0.75));
+    print(sample_categorical(p, 0.99));
+    print(sample_categorical(p, 1.0));
+    print(sample_categorical(p, -1.0));
+    print(sample_categorical(p, 2.0));
+    let none: [f32; 3] = [0.0, -1.0, 0.0];
+    print(sample_categorical(none, 0.5));
+    let mut step: i64 = 0;
+    while step < 6 {
+        print(sample_categorical(p, rand_f32(7, step)));
+        step = step + 1;
+    }
+    return 0;
+}

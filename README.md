@@ -70,11 +70,11 @@ not duplicate them. In summary, Wukong:
   parallel schedules (`@parallel`) are part of the language rather than a soup of intrinsics and
   `#pragma`s. Honest status: a user-written `vec[f32, 8]` *value* parses and type-checks but does not
   execute yet (`f32x8::load(..)` is a hard `C0001`); `@parallel` (bare form), `@generic`, `@tile`,
-  `@unchecked` and the parameter attribute `@noalias` (a checked `restrict` promise, `E0316` on a
-  provably aliased call) have consumers today, and a `@tile` the compiler cannot apply — an
-  unsupported loop form, a width that is not a positive integer literal — is `E0309` rather than a
-  silent drop, while
-  `@simd`/`@align`/`@extern`/`@export` and `@parallel`'s `grain =` argument parse and are inert — layout is
+  `@unchecked`, `@strict_fp` and the parameter attribute `@noalias` (a checked `restrict` promise,
+  `E0316` on a provably aliased call) have consumers today, and a `@tile` the compiler cannot apply —
+  an unsupported loop form, a width that is not a positive integer literal — is `E0309` rather than a
+  silent drop, while `@parallel(grain = G)` sets the per-worker iteration run (any other `@parallel`
+  argument is `E0306`), while `@simd`/`@align`/`@extern`/`@export` parse and are inert — layout is
   enforced across call boundaries; the default row-major (contiguous) layout and `.col_major` both
   lower multi-dimensional indexing (`.col_major` is byte-identical to `a[i + j*M]`); `.strided` /
   `.tiled(…)` still reject indexing (`C0001`). Runtime-sized memory is `alloc_<T>`/`free` (64-byte
@@ -91,7 +91,8 @@ not duplicate them. In summary, Wukong:
   `ikj` accumulate and `ijk` dot-product forms, incl. `nn.Linear` `A·Bᵀ`) and may lower it to a tuned
   **register-blocked, cache-tiled, packed AVX2/FMA GEMM microkernel**. It also **auto-vectorizes**
   elementwise loops (incl. branchy ones via if-conversion) and **reductions** to SIMD, contracts
-  `x + y*z` to a **fused multiply-add**, **fuses** adjacent elementwise loops, and
+  `x + y*z` to a **fused multiply-add** (a documented, deterministic floating-point contract;
+  `@strict_fp` / `--fp=strict` evaluate in source order instead), **fuses** adjacent elementwise loops, and
   **auto-parallelizes** `@parallel` loops across cores. Underneath, an SSA optimizer (inlining, SROA,
   mem2reg, const-fold, CSE, DSE, DCE, loop deletion, LICM, scalar promotion, loop unrolling) runs at
   `-O1` and above. Op-graph fusion across

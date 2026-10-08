@@ -1,0 +1,18 @@
+// EXPECT-CODE: E0304
+module tests.fail.topk_nonmut_output
+
+// `topk_f32(x, vals, idx)` writes `vals` and `idx`. A slice parameter is passed by reference, so
+// writing one that was not declared `mut` would mutate the caller's buffer behind an immutable
+// parameter — exactly what `vals[0] = ...` through it is rejected for (E0304). The input `x` is
+// only read and needs no `mut`.
+fn best(x: []f32, vals: []f32, mut idx: []i64) -> i64 {
+    return topk_f32(x, vals, idx);
+}
+
+fn main() -> i32 {
+    let x: []f32 = alloc_f32(4);
+    let mut v: []f32 = alloc_f32(2);
+    let mut i: []i64 = alloc_i64(2);
+    let k: i64 = best(x, v, i);
+    return 0;
+}

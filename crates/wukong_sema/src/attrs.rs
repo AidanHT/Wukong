@@ -5,29 +5,79 @@
 //! discarded* — so `@parellel` (a typo of `@parallel`) compiled to a single-threaded program with no
 //! diagnostic at all, which is exactly the failure mode an attribute is supposed to prevent.
 //!
-//! The set below is closed on purpose. `parallel`, `generic`, `tile`, `extern`, `noalias` and
-//! `unchecked` are the ones the language consumes (`@unchecked` removes the slice bounds checks from
-//! one function — the explicit opt-out of the safe default, read by `wukong_mir_build`); `inline`,
-//! `simd`, `align` and `export` are parsed-and-discarded today and stay in the set so existing
-//! programs keep compiling. Anything else is an error, which also means a future attribute cannot be
-//! *used* before it is *implemented*.
+//! The set below is closed on purpose. `parallel`, `generic`, `tile`, `extern`, `noalias`,
+//! `unchecked` and `strict_fp` are the ones the language consumes (`@unchecked` removes the slice
+//! bounds checks from one function — the explicit opt-out of the safe default, read by
+//! `wukong_mir_build`); `inline`, `simd`, `align` and `export` are parsed-and-discarded today and
+//! stay in the set so existing programs keep compiling. Anything else is an error, which also means
+//! a future attribute cannot be *used* before it is *implemented*.
 //!
 //! Placement is checked here too, but only where a misplaced attribute would be a silent lie.
-//! `@generic` (suppress the kernel recognizers for one function, see `wukong_mir_build`) is read
-//! from the **function item**, so accepting it on a statement would promise a per-loop opt-out that
-//! nothing implements. `@tile` is read from the function item (into a width queue) or from the
-//! `for` statement it sits on, and from nowhere else — so on a `struct`, a parameter, a `let` or a
-//! `while` it used to be accepted and dropped, a schedule written on a loop being the sharpest of
-//! those. `@noalias` is a promise about one parameter's storage (see `crate::noalias`), so it is
-//! legal on a parameter and nowhere else, and takes no arguments. Every other attribute's placement
-//! is unchecked in v1 — the ones that are discarded are discarded wherever they appear.
+//! `@generic` (suppress the kernel recognizers for one function, see `wukong_mir_build`) and
+//! `@strict_fp` (evaluate that function's float arithmetic in source order, no FMA contraction or
+//! reduction reassociation) are read from the **function item**, so accepting either on a statement
+//! would promise a per-loop opt-out that nothing implements. `@tile` is read from the function item
+//! (into a width queue) or from the `for` statement it sits on, and from nowhere else — so on a
+//! `struct`, a parameter, a `let` or a `while` it used to be accepted and dropped, a schedule
+//! written on a loop being the sharpest of those. `@noalias` is a promise about one parameter's
+//! storage (see `crate::noalias`), so it is legal on a parameter and nowhere else, and takes no
+//! arguments. Every other attribute's placement is unchecked in v1 — the ones that are discarded
+//! are discarded wherever they appear.
+//!
+//! Arguments are checked where an attribute consumes them. `@parallel` takes no argument or exactly
+//! `grain = <positive integer>` ([`parallel_grain`]): `wukong_mir_build` hands each worker at least
+//! `grain` consecutive iterations of the function's parallel loop. `@parallel(grain = 0)`,
+//! `@parallel(chunk = 4)` or `@parallel(4)` used to compile with the argument silently discarded.
 //!
 //! This walk is independent of name resolution and types (an attribute names no value), so
 //! [`check`] runs before the collection pass and reports every offending attribute in one go.
 
-use wukong_ast::{Attr, Block, Expr, ExprKind, ForIter, Item, ItemKind, Module, Stmt, StmtKind};
+use wukong_ast::{
+    Attr, AttrArg, AttrVal, Block, Expr, ExprKind, ForIter, Item, ItemKind, Module, Stmt, StmtKind,
+};
 use wukong_diag::Diagnostic;
-use wukong_span::Interner;
+use wukong_span::{Interner, Span};
+
+/// The largest `@parallel(grain = G)` accepted: 2^31 iterations per claimed chunk, so the compiler's
+/// `start·G` / `end·G` scaling stays far inside `i64` for any trip count the outliner accepts.
+pub const MAX_PARALLEL_GRAIN: u64 = 1 << 31;
+
+/// The grain a `@parallel` attribute requests: `Ok(1)` with no argument, `Ok(G)` for exactly one
+/// `grain = G` with `1 <= G <=` [`MAX_PARALLEL_GRAIN`], and `Err((span, reason))` for anything else
+/// — an unknown key, a positional argument, a repeated `grain`, a non-integer or out-of-range value.
+/// `attr` must be a `@parallel` attribute. Shared by this module's `E0306` check and by
+/// `wukong_mir_build`, which reads the grain off the function item.
+pub fn parallel_grain(attr: &Attr, interner: &Interner) -> Result<u64, (Span, &'static str)> {
+    let mut grain = None;
+    for arg in attr.args() {
+        let AttrArg::KeyValue { key, value } = arg else {
+            let span = match arg {
+                AttrArg::Word(_, s) | AttrArg::Int(_, s) | AttrArg::Str(_, s) => *s,
+                AttrArg::KeyValue { key, .. } => key.span,
+            };
+            return Err((span, "`@parallel` takes only `grain = <positive integer>`"));
+        };
+        if interner.resolve(key.sym) != "grain" {
+            return Err((
+                key.span,
+                "`@parallel` has no such argument; the only one is `grain`",
+            ));
+        }
+        if grain.is_some() {
+            return Err((key.span, "`grain` is given more than once"));
+        }
+        let AttrVal::Int(text) = value else {
+            return Err((key.span, "`grain` must be a positive integer literal"));
+        };
+        match interner.resolve(*text).parse::<u64>() {
+            Ok(g) if (1..=MAX_PARALLEL_GRAIN).contains(&g) => grain = Some(g),
+            Ok(0) => return Err((key.span, "`grain` must be at least 1")),
+            Ok(_) => return Err((key.span, "`grain` must be at most 2147483648")),
+            Err(_) => return Err((key.span, "`grain` must be a positive integer literal")),
+        }
+    }
+    Ok(grain.unwrap_or(1))
+}
 
 /// Every attribute name the v1 language accepts, in the order the diagnostic lists them: the ones
 /// that are (or are being) consumed first, then the four that are parsed and discarded.
@@ -38,6 +88,7 @@ pub const KNOWN_ATTRS: &[&str] = &[
     "extern",
     "noalias",
     "unchecked",
+    "strict_fp",
     "inline",
     "simd",
     "align",
@@ -47,7 +98,7 @@ pub const KNOWN_ATTRS: &[&str] = &[
 /// Attributes that are read from a function item and therefore mean nothing anywhere else.
 /// `@unchecked` is per function on purpose: a bounds-check opt-out has to be visible where the
 /// unchecked accesses are written, not inherited from a caller.
-const FN_ITEM_ONLY: &[&str] = &["generic", "unchecked"];
+const FN_ITEM_ONLY: &[&str] = &["generic", "unchecked", "strict_fp"];
 
 /// Attributes read from a function item **or** from the `for` statement they sit on, and nowhere
 /// else. `@tile` is a loop schedule: `lower_program_with` reads it off the `fn` into a width queue
@@ -122,6 +173,20 @@ fn check_item(item: &Item, interner: &Interner, diags: &mut Vec<Diagnostic>) {
 
 fn check_attr(a: &Attr, place: Place, interner: &Interner, diags: &mut Vec<Diagnostic>) {
     let name = interner.resolve(a.name.sym);
+    if name == "parallel" {
+        if let Err((span, why)) = parallel_grain(a, interner) {
+            diags.push(
+                Diagnostic::error(format!("invalid `@parallel` argument: {why}"))
+                    .with_code("E0306")
+                    .primary(span, "not a valid `@parallel` argument")
+                    .help(
+                        "write `@parallel` or `@parallel(grain = G)` with G a positive integer: \
+                         each worker then claims at least G consecutive iterations",
+                    ),
+            );
+        }
+        return;
+    }
     if !is_known(name) {
         diags.push(
             Diagnostic::error(format!("unknown attribute `@{name}`"))
@@ -373,6 +438,48 @@ mod tests {
         );
     }
 
+    /// P15.15: `@parallel`'s argument list is no longer parsed-and-discarded. `grain = G` with a
+    /// positive integer is the one accepted argument, on a function or a statement; every other
+    /// spelling — the verifier's `@parallel(grain = 99999, bogus_key = 7)` included — is `E0306`.
+    #[test]
+    fn parallel_accepts_only_a_positive_grain() {
+        for ok in [
+            "@parallel\nfn f() { let x: i32 = 1; }",
+            "@parallel(grain = 1)\nfn f() { let x: i32 = 1; }",
+            "@parallel(grain = 64)\nfn f() { let x: i32 = 1; }",
+            "@parallel(grain = 2147483648)\nfn f() { let x: i32 = 1; }",
+            "fn f() { @parallel(grain = 4) for i in 0..8 { let x: i32 = i; } }",
+        ] {
+            assert_eq!(codes(ok), Vec::<&str>::new(), "{ok}");
+        }
+        for bad in [
+            "@parallel(grain = 0)\nfn f() {}",
+            "@parallel(grain = 2147483649)\nfn f() {}",
+            "@parallel(chunk = 4)\nfn f() {}",
+            "@parallel(4)\nfn f() {}",
+            "@parallel(grain = fast)\nfn f() {}",
+            "@parallel(grain = 2, grain = 4)\nfn f() {}",
+            "@parallel(grain = 99999, bogus_key = 7)\nfn f() {}",
+            "fn f() { @parallel(grain = 0) for i in 0..8 { let x: i32 = i; } }",
+        ] {
+            assert_eq!(codes(bad), vec!["E0306"], "{bad}");
+        }
+    }
+
+    #[test]
+    fn parallel_grain_reads_the_value() {
+        let mut interner = Interner::new();
+        let src = "@parallel(grain = 12)\nfn f() {}\n@parallel\nfn g() {}";
+        let (module, pdiags) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let grains: Vec<u64> = module
+            .items
+            .iter()
+            .map(|it| parallel_grain(&it.attrs[0], &interner).unwrap())
+            .collect();
+        assert_eq!(grains, vec![12, 1]);
+    }
+
     #[test]
     fn unknown_attribute_is_rejected() {
         assert_eq!(codes("@bogus\nfn f() {}"), vec!["E0306"]);
@@ -433,6 +540,27 @@ fn f(s: []i32) -> i32 { return s[0]; }"
             codes("@generic\nstruct S { x: i32 }"),
             vec!["E0306"],
             "struct"
+        );
+    }
+
+    /// `@strict_fp` is read off the function item too: on a loop it would read as "this loop is
+    /// strict" while the lowering never looks there, so it is rejected rather than ignored.
+    #[test]
+    fn strict_fp_is_rejected_off_a_fn_item() {
+        assert_eq!(
+            codes("fn f(mut o: [f32; 4]) { @strict_fp for i in 0..4 { o[i] = 1.0; } }"),
+            vec!["E0306"],
+            "for statement"
+        );
+        assert_eq!(
+            codes("fn f(@strict_fp x: f32) {}"),
+            vec!["E0306"],
+            "parameter"
+        );
+        assert_eq!(
+            codes("@strict_fp\nfn f(x: f32, y: f32, z: f32) -> f32 { return x + y * z; }"),
+            Vec::<&str>::new(),
+            "fn item"
         );
     }
 

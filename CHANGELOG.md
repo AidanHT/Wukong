@@ -155,6 +155,115 @@ All notable changes to Wukong are documented here. The format is loosely based o
   width. This is what fuses a helper-call chain after inlining, which the AST-level fusion in
   `mir_build` cannot see (`wukong_opt::fuse`, `tests/run/fused_helper_chain.wk`).
 
+### Runtime GEMM: single-sweep B packing, masked edge tiles, copy-free `Aᵀ·B`, blocked int8
+
+- **f32 GEMM.** A macro-block whose B panel is swept by one row block (serial `m ≤ MC`, every 2D
+  block) packs B a micropanel at a time with the next micropanel's source prefetched under the FMAs
+  (`WUKONG_GEMM_FUSED_PACK=0` restores the whole-panel pack); the A packer is vectorized; edge tiles
+  run row-trimmed K loops and a 256-bit masked writeback (fused epilogue included); `C = Aᵀ·B`
+  packs A straight from its `[k, m]` storage instead of transposing an `m·k` scratch copy; bf16/f16
+  inputs widen with SIMD into reused per-thread scratch. Every result bit is unchanged.
+- **int8 GEMM.** Column-blocked so B stays L2-resident across all A rows; the `_parallel` entries
+  use a (row block × column block) task grid, so a single-token decode GEMM fills the pool.
+- **Numeric contract.** `docs/language-guide.md` ("What a matmul computes") and `docs/internals.md`
+  now state the recognized matmul's accumulation order, what does and does not change it, its
+  error bound, and how it relates to an unrecognized nest; new fixtures
+  `tests/run/gemm_blocked_every_lane.wk` (three K-blocks, full and edge tiles, NN/NT/TN, every
+  lane) and `tests/run/lang_generic_gemm_fma_order.wk` (generic vs recognized, bit-exact FMA chain).
+
+### Runtime kernels (`gap/runtime-kernels`)
+
+- **Reductions run eight independent accumulator chains.** `wukong_sreduce_f32` (dot / ssd / sum /
+  sumsq / abs-sums / max-family, also the per-row dot of softmax backward), `wukong_{sum,dot}_f16`,
+  the softmax / log-softmax / logsumexp row max and RMSNorm backward's two row reductions no longer
+  sit on one loop-carried FMA/max chain. Inputs shorter than one block (64 elements; 32 for RMSNorm
+  backward) keep their exact previous bits; longer f32/f16 sums and dots reassociate toward pairwise
+  summation (more accurate, pinned by f64-distance tests); softmax outputs are bit-unchanged.
+- **AVX2 bf16/f16 transpose** (16x8 in-register tile), an off-chain cumsum carry (bit-identical), and
+  the fused bias/half-output/half-input activations now inline their 8-lane kernel instead of
+  calling it through a function pointer per vector (bit-identical; `WUKONG_VMATH_FNPTR=1` A/Bs it).
+- **Fixed: causal `sdpa` read future `V` rows.** A NaN/inf `V` row above the diagonal reached earlier
+  queries through a zero weight (`0·NaN`); masked keys are now skipped. The attention module states
+  its numeric contract, and its W15 probe gained a same-microkernel materialized control.
+
+### Double-precision transcendentals and one `tanh` (`gap/f64-math`, P15.2 + P13.2)
+
+- **Every `f64` transcendental is now double precision.** `exp`, `log`, `exp2`/`log2`/`exp10`/
+  `log10`, `expm1`/`log1p`, `sin`/`cos`/`tan`, `asin`/`acos`/`atan`/`atan2`, `sinh`/`cosh`/`tanh`,
+  `asinh`/`acosh`/`atanh`, `erf`, `cbrt`, `pow`, `hypot` — and the activations composed from them
+  (`sigmoid`, `silu`, `gelu`, `softplus`, `mish`, `elu`, `selu`, `logsigmoid`, the `*_backward`
+  family) — lower on an `f64` operand to one call of the new runtime library
+  `wukong_runtime::math64` (`wukong_rt_math_f64` / `wukong_rt_math2_f64`): pure Rust, no platform
+  libm, no FMA, the fdlibm/musl algorithms with Payne–Hanek trig reduction, ≤1 ULP for the core
+  (≤2 for the hyperbolics, ≤3 for `exp10`), C23 special values, identical bits on the interpreter,
+  the native JIT and the AOT link, declared from the call site by the textual-LLVM emitter. Before,
+  every one of them was demoted to the f32 polynomial and promoted back (`exp(1.0f64)` printed the
+  f32 value of e), and no corpus fixture printed enough digits to see it. The scalar autodiff
+  differentiates every code in closed form (`exp' = exp`, `tanh' = 1 − tanh²`, `∂pow/∂b = ln a·aᵇ`,
+  …). Gates: `math64`'s mpmath reference tables with per-function ULP bounds and the special-value
+  table, `wukong_codegen_cranelift`'s `math_f64.rs` (interp == native == library on both opt levels,
+  LLVM/object imports, AD), `tests/run/transcendental_f64.wk` (twelve digits of each).
+- **`tanh` is one function.** The inlined scalar/SIMD `tanh` now mirrors the runtime's ≤1-ULP
+  piecewise kernel op-for-op, so a dispatched loop, a composed expression, `@generic` and
+  `WUKONG_NO_RECOGNIZE` agree bit-for-bit — `−0` stays `−0` and `tanh(x) == x` for |x| < 2⁻¹³,
+  where the old exp-composed form returned `+0.0` below 2⁻²⁵ and drifted up to 80 ULP from the
+  kernel. The composed activations keep the exp-composed block as their private building block,
+  matching their kernels unchanged. Gates: `tanh_unify.rs` (`dispatched_tanh_equals_composed_tanh`,
+  every lane over ~1100 arguments on both backends), `tests/run/tanh_spellings.wk`.
+
+### Floating-point contract: `@strict_fp`, `--fp=strict`, documented contraction (`gap/fp-contract`)
+
+- **Added `@strict_fp` and `--fp=<fast|strict>`.** A strict function evaluates its float arithmetic
+  in source order with one rounding per operation: no FMA contraction, sequential float reductions,
+  no kernel recognizers (implies `@generic`); elementwise loops and integer reductions still
+  vectorize. `--fp=strict` applies it program-wide and is refused with `--emit=grad`/`--train`.
+  Fixtures `tests/run/strict_fp.wk`, `strict_fp_cli.wk`, `fp_contract_rules.wk`.
+- **Documented the floating-point contract** in the language guide ("Floating-point semantics"):
+  the exact contraction rule (the LEFT product of `a*b + c*d` is fused), the three reduction trees and
+  why `@parallel` (or its silent decline) changes low-order bits, and why the 8,192-element reduction
+  chunk is a numerical constant rather than a cache knob.
+- **Fixed: `hardsigmoid(NaN)` returned 0.** Its clamp's ordered compares turned a NaN into the
+  bound; the runtime kernel, its scalar twin and the inlined MIR now return the input NaN
+  (quieted), so every vmath op except the by-definition `relu` is NaN in, NaN out. The contract is
+  a per-op table in `wukong_runtime/src/vmath.rs`, asserted over all 36 op codes
+  (`vmath_every_op_returns_nan_for_nan`, `tests/run/hardsigmoid_nan.wk`). `softplus`'s scalar twin
+  no longer spells its ReLU `f32::max`, and the exhaustive log sweep gained a pass over every
+  positive subnormal.
+
+### Parallel dispatch: work gates, host topology, `@parallel(grain = G)`, `--threads`
+
+- **Every `_parallel` runtime kernel now forks on work, not on one extent.** One shared gate
+  (`wukong_runtime::par`) replaces ~22 single-dimension `*_PAR_MIN` constants: fork iff there are
+  >= 2 rows/stripes/channels, rows x cols x a per-element cost reaches `WUKONG_PAR_MIN_WORK`
+  (default 2^18 stream element-ops), and the pool has a second worker. A 7 x 50257 cross-entropy now
+  forks, an 8 x 2 one no longer does; the fused-norm, int8-GEMM and per-channel-dequant entries
+  gained the gate they lacked. Bits are unchanged (serial == parallel by construction).
+- **Shared claim-queue scheduler.** `wukong_parallel_for`, the int8 GEMM (claiming the cells of its
+  row block x column block grid) and per-channel dequant run through one atomic claim queue on the
+  unified pool; a one-worker pool or a one-granule range runs
+  the body once without forking, still on a 16 MiB worker stack (the width-1 inline-stack gap is closed).
+- **Host topology probe.** Usable logical/physical cores honour affinity masks and cgroup quotas (the
+  physical-core pool is now built under `taskset`); L1D/L2/L3 come from CPUID or sysfs, with
+  `WUKONG_CPU_PHYSICAL` / `WUKONG_CACHE_{L1D,L2,L3}_KB` overrides. The non-temporal-store threshold
+  defaults to 3/4 of the probed L3 (10 MiB fallback; `WUKONG_NT_MIN_BYTES` still overrides).
+- **`@parallel(grain = G)` is consumed** and every other `@parallel` argument is `E0306`; the
+  32-region outlining cap is gone; **`wukongc --threads=<n>`** (and `WUKONG_NUM_THREADS`) sets the
+  worker count.
+
+### ML I/O and randomness
+
+- **Typed file I/O over every fixed-width dtype**: `read_<T>` / `write_<T>` / `read_<T>_at(path,
+  byte_off, buf)` for `f32 f64 f16 bf16 i8 i16 i32 i64 u8 u16 u32 u64`, `file_size(path)`, and
+  `alloc_i16/u16/u32/u64`; a buffer may be a slice, a `[T; N]` array or a contiguous `Tensor`. Native
+  reads land straight in the destination (no staging copy). Fixed: the interpreter decoded a read `u8`
+  zero-extended, so `read_u8` then `b == 200` printed 0 there and 1 natively.
+- **Checkpoint readers** `st_read_<T>` (safetensors) and `npy_read_<T>` (`.npy`) with load-time dtype,
+  rank, dims and count checks, and exact `bf16`/`f16` → `f32` widening.
+- **Counter-based RNG** `rand_u32` / `rand_f32` / `randn_f32(seed, ctr)` (Philox4x32-10, lowered to
+  integer MIR, checked against the Random123 known answers) and the `rand_fill_f32` kernel.
+- **Sampling kernels** `topk_f32`, `argsort_f32` / `argsort_desc_f32` and `sample_categorical`, each
+  defined by one total order (NaN largest, ties to the lower index).
+
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
 - **Gate added: every recognizer-dependent corpus program is held to its own generic lowering.**

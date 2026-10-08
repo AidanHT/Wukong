@@ -118,6 +118,10 @@ pub struct Options {
     /// Autodiff / training options (see [`GradOptions`]). Only consulted by `--emit=grad` and
     /// `--train`; inert for every other stage.
     pub grad: GradOptions,
+    /// Strict floating-point mode for the whole program (`--fp=strict`; `false` is the default
+    /// `--fp=fast`): `@strict_fp` on every function — no FMA contraction, no reassociated float
+    /// reduction, no kernel recognizer. Threaded to [`wukong_mir_build::LowerOptions::strict_fp`].
+    pub strict_fp: bool,
 }
 
 /// Options for the autodiff CLI surface: which loss function to differentiate, which of its buffer
@@ -182,6 +186,7 @@ impl Default for Options {
             error_format: ErrorFormat::Human,
             backend: BackendKind::Interp,
             grad: GradOptions::default(),
+            strict_fp: false,
         }
     }
 }
@@ -239,6 +244,7 @@ fn lower_options_for(opts: &Options) -> wukong_mir_build::LowerOptions {
     wukong_mir_build::LowerOptions {
         recognize: !no_recognize(),
         vec_kernels: !matches!(opts.backend, BackendKind::GpuLower),
+        strict_fp: opts.strict_fp,
     }
 }
 
@@ -260,6 +266,22 @@ pub fn compile(opts: &Options) -> i32 {
             "error: {what}: {NO_RECOGNIZE_ENV} is set, and autodiff is not supported with kernel \
              recognition off (the VJP rules are kernel-shaped). Unset {NO_RECOGNIZE_ENV}, or drop \
              {what}."
+        );
+        return exit::COMPILE_ERROR;
+    }
+    // `--fp=strict` turns recognition off for every function (a recognized kernel fixes its own
+    // summation tree), so it meets the same autodiff limit as the environment switch above.
+    if opts.strict_fp && (opts.grad.train || opts.emit == EmitStage::Grad) {
+        let what = if opts.grad.train {
+            "--train"
+        } else {
+            "--emit=grad"
+        };
+        eprintln!(
+            "error: {what}: `--fp=strict` turns kernel recognition off for the whole program, and \
+             autodiff is not supported with recognition off (the VJP rules are kernel-shaped). \
+             Drop `--fp=strict`; `@strict_fp` on individual functions leaves recognition (and \
+             autodiff) intact everywhere else."
         );
         return exit::COMPILE_ERROR;
     }
@@ -795,8 +817,52 @@ float wukong_rt_trig_f32(float x, long long op) {
 }
 "#;
 
+// The f64 transcendental ABI (`wukong_rt_math_f64(x, op)` / `wukong_rt_math2_f64(a, b, op)`) for the
+// C fallback link only. The op codes are `wukong_runtime`'s `VM_*` / `VM2_*` (the compiler emits them
+// as constants). This uses the host libm, so unlike the rustc-driven link — which resolves the
+// symbols out of the runtime rlib and is therefore bit-identical to the oracle — a C-fallback exe
+// may differ from `--run` in the last ULP; the fallback already cannot print floats at all, so this
+// is not a new divergence class. Unknown op codes are the identity, matching the Rust entry.
+const WUKONG_MATH64_C: &str = r#"
+double wukong_rt_math_f64(double x, long long op) {
+    switch (op) {
+        case 0: return exp(x);
+        case 1: return log(x);
+        case 2: return tanh(x);
+        case 15: return sin(x);
+        case 16: return cos(x);
+        case 17: return erf(x);
+        case 18: return exp2(x);
+        case 19: return log2(x);
+        case 20: return sinh(x);
+        case 21: return cosh(x);
+        case 22: return asinh(x);
+        case 23: return acosh(x);
+        case 24: return atanh(x);
+        case 25: return atan(x);
+        case 26: return expm1(x);
+        case 27: return log1p(x);
+        case 28: return pow(10.0, x);
+        case 29: return log10(x);
+        case 32: return tan(x);
+        case 33: return asin(x);
+        case 34: return acos(x);
+        case 35: return cbrt(x);
+        default: return x;
+    }
+}
+double wukong_rt_math2_f64(double a, double b, long long op) {
+    switch (op) {
+        case 0: return pow(a, b);
+        case 1: return atan2(a, b);
+        case 2: return hypot(a, b);
+        default: return a;
+    }
+}
+"#;
+
 fn c_runtime_source() -> String {
-    format!("{WUKONG_RT_C}\n{WUKONG_TRIG_C}\n{WUKONG_SCRATCH_C}")
+    format!("{WUKONG_RT_C}\n{WUKONG_TRIG_C}\n{WUKONG_SCRATCH_C}\n{WUKONG_MATH64_C}")
 }
 
 /// A per-invocation scratch directory for the generated `--emit=exe` link inputs (the Rust link

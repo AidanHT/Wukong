@@ -1,0 +1,22 @@
+// EXPECT-CODE: E0306
+module tests.fail.strict_fp_on_stmt
+
+// `@strict_fp` is read from the FUNCTION item (`wukong_mir_build::lower_program` switches strict
+// floating point on per function), so on a loop it would be a promise nothing keeps: the parser
+// accepts statement attributes, and this `x + y*z` would still have been contracted into one fused
+// multiply-add while its author believed they had asked for two roundings. Placement is E0306, with
+// the fix in the help text -- move it to the `fn`.
+fn axpy(x: [f32; 4], y: [f32; 4], mut out: [f32; 4]) {
+    @strict_fp
+    for i in 0..4 {
+        out[i] = out[i] + x[i] * y[i];
+    }
+}
+
+fn main() -> i32 {
+    let x: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let y: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+    let mut out: [f32; 4] = [0.0; 4];
+    axpy(x, y, out);
+    return 0;
+}

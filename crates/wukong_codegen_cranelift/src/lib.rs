@@ -41,6 +41,9 @@ pub use backend::CraneliftBackend;
 // 128-bit). Owned by this session; additive.
 mod avx2;
 
+// The runtime entries of the ML builtins, declared, JIT-bound and called from one table.
+mod ml_rt;
+
 // --- The minimal runtime the generated code calls back into ---------------------------------
 //
 // `print`/`println`/`assert` lower to calls to these symbols. For the JIT they are real Rust
@@ -353,6 +356,8 @@ const RT_SGEMM_F16_NT_EPI: &str = "wukong_sgemm_f16_nt_epi";
 const RT_SGEMM_F16_NT_EPI_PAR: &str = "wukong_sgemm_f16_nt_epi_parallel";
 const RT_VMATH: &str = "wukong_vmath_f32";
 const RT_TRIG_F32: &str = "wukong_rt_trig_f32";
+const RT_MATH_F64: &str = "wukong_rt_math_f64";
+const RT_MATH2_F64: &str = "wukong_rt_math2_f64";
 const RT_VMATH_PARALLEL: &str = "wukong_vmath_f32_parallel";
 const RT_VMATH2: &str = "wukong_vmath2_f32";
 const RT_SOFTMAX_BWD: &str = "wukong_softmax_bwd_f32";
@@ -1578,6 +1583,23 @@ impl<'a> FnTranslator<'a> {
             let call = self.builder.ins().call(fref, &[x, op]);
             return Some(self.builder.inst_results(call)[0]);
         }
+        // The f64 transcendental library: wukong_rt_math_f64(x: f64, op: i64) -> f64 and its
+        // two-argument twin — value-returning, the same pure-Rust function the interpreter calls.
+        if name == RT_MATH_F64 && args.len() == 2 {
+            let x = self.val(args[0]);
+            let op = self.coerce_to_i64(args[1]);
+            let fref = self.runtime_ref(RT_MATH_F64);
+            let call = self.builder.ins().call(fref, &[x, op]);
+            return Some(self.builder.inst_results(call)[0]);
+        }
+        if name == RT_MATH2_F64 && args.len() == 3 {
+            let a = self.val(args[0]);
+            let b = self.val(args[1]);
+            let op = self.coerce_to_i64(args[2]);
+            let fref = self.runtime_ref(RT_MATH2_F64);
+            let call = self.builder.ins().call(fref, &[a, b, op]);
+            return Some(self.builder.inst_results(call)[0]);
+        }
         // The vectorized elementwise transcendental: wukong_vmath_f32(x, out, n, op) — two pointers
         // and two i64 (element count, op code). The 256-bit AVX2 kernel an `out[i]=f(x[i])` loop
         // lowers to.
@@ -2164,6 +2186,10 @@ impl<'a> FnTranslator<'a> {
                 .call(fref, &[q, out, rows, cols, scale, op]);
             return None;
         }
+        // The ML builtins' entries (the `ml_rt` table).
+        if let Some(result) = self.lower_ml_rt_call(name, args) {
+            return result;
+        }
         // Everything above dispatches a runtime kernel on (name, arity). `rt_ids` holds exactly
         // the runtime symbols this function is responsible for, so reaching here with one of them
         // means a recognizer emitted an arity no arm accepts. Unknown `wukong_` names must also
@@ -2477,6 +2503,8 @@ struct RtFuncs {
     sgemm_f16_nt_epi_par: FuncId,
     vmath: FuncId,
     trig_f32: FuncId,
+    math_f64: FuncId,
+    math2_f64: FuncId,
     vmath_par: FuncId,
     vmath2: FuncId,
     softmax_bwd: FuncId,
@@ -2821,6 +2849,17 @@ fn populate_module<M: Module>(
     sig_trig.params.push(AbiParam::new(types::F32));
     sig_trig.params.push(AbiParam::new(types::I64));
     sig_trig.returns.push(AbiParam::new(types::F32));
+    // wukong_rt_math_f64(x: f64, op: i64) -> f64 and wukong_rt_math2_f64(a, b: f64, op: i64) -> f64:
+    // the double-precision transcendental library every f64 transcendental lowers to.
+    let mut sig_math_f64 = Signature::new(call_conv);
+    sig_math_f64.params.push(AbiParam::new(types::F64));
+    sig_math_f64.params.push(AbiParam::new(types::I64));
+    sig_math_f64.returns.push(AbiParam::new(types::F64));
+    let mut sig_math2_f64 = Signature::new(call_conv);
+    sig_math2_f64.params.push(AbiParam::new(types::F64));
+    sig_math2_f64.params.push(AbiParam::new(types::F64));
+    sig_math2_f64.params.push(AbiParam::new(types::I64));
+    sig_math2_f64.returns.push(AbiParam::new(types::F64));
     // wukong_vmath2_f32(x, y, out: ptr, n: i64, op: i64) — two-input transcendental (pow/atan2/hypot).
     let mut sig_vmath2 = Signature::new(call_conv);
     sig_vmath2.params.push(AbiParam::new(ptr_ty));
@@ -3185,6 +3224,12 @@ fn populate_module<M: Module>(
         trig_f32: module
             .declare_function(RT_TRIG_F32, Linkage::Import, &sig_trig)
             .map_err(|e| e.to_string())?,
+        math_f64: module
+            .declare_function(RT_MATH_F64, Linkage::Import, &sig_math_f64)
+            .map_err(|e| e.to_string())?,
+        math2_f64: module
+            .declare_function(RT_MATH2_F64, Linkage::Import, &sig_math2_f64)
+            .map_err(|e| e.to_string())?,
         vmath_par: module
             .declare_function(RT_VMATH_PARALLEL, Linkage::Import, &sig_vmath)
             .map_err(|e| e.to_string())?,
@@ -3547,7 +3592,7 @@ fn populate_module<M: Module>(
 
     // Module-wide symbol membership is also the arity-error guard. Per-function
     // signature imports are created lazily by FnTranslator::runtime_ref.
-    let rt_ids: HashMap<&'static str, FuncId> = HashMap::from([
+    let mut rt_ids: HashMap<&'static str, FuncId> = HashMap::from([
         (RT_PRINT_I64, rt.print_i64),
         (RT_PRINT_U64, rt.print_u64),
         (RT_PRINT_STR, rt.print_str),
@@ -3604,6 +3649,8 @@ fn populate_module<M: Module>(
         (RT_SGEMM_F16_NT_EPI_PAR, rt.sgemm_f16_nt_epi_par),
         (RT_VMATH, rt.vmath),
         (RT_TRIG_F32, rt.trig_f32),
+        (RT_MATH_F64, rt.math_f64),
+        (RT_MATH2_F64, rt.math2_f64),
         (RT_VMATH_PARALLEL, rt.vmath_par),
         (RT_VMATH2, rt.vmath2),
         (RT_SOFTMAX_BWD, rt.softmax_bwd),
@@ -3721,6 +3768,7 @@ fn populate_module<M: Module>(
         (RT_FMOD_F64, rt.fmod_f64),
         (RT_FMOD_F32, rt.fmod_f32),
     ]);
+    ml_rt::declare(module, ptr_ty, call_conv, &mut rt_ids)?;
 
     // Declare all user functions first so calls resolve regardless of definition order.
     let mut ids: HashMap<Symbol, FuncId> = HashMap::new();
@@ -4343,6 +4391,8 @@ fn jit_compile_entry(
     );
     builder.symbol(RT_WRITE_I8, wukong_runtime::wukong_rt_write_i8 as *const u8);
     builder.symbol(RT_WRITE_U8, wukong_runtime::wukong_rt_write_u8 as *const u8);
+    // The ML builtins' entries (the `ml_rt` table).
+    ml_rt::bind_jit(&mut builder);
     builder.symbol(RT_NOW_NS, wukong_runtime::wukong_now_ns as *const u8);
     // The guarded run's parallel-for: the runtime's, wrapped in the cancellation ABI that brings a
     // failing region body's diagnostic back to its caller in iteration order (`rt_parallel_for`).
@@ -4446,6 +4496,11 @@ fn jit_compile_entry(
     );
     builder.symbol(RT_VMATH, wukong_runtime::wukong_vmath_f32 as *const u8);
     builder.symbol(RT_TRIG_F32, wukong_runtime::wukong_rt_trig_f32 as *const u8);
+    builder.symbol(RT_MATH_F64, wukong_runtime::wukong_rt_math_f64 as *const u8);
+    builder.symbol(
+        RT_MATH2_F64,
+        wukong_runtime::wukong_rt_math2_f64 as *const u8,
+    );
     builder.symbol(
         RT_VMATH_PARALLEL,
         wukong_runtime::wukong_vmath_f32_parallel as *const u8,
@@ -4957,6 +5012,8 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     );
     builder.symbol(RT_WRITE_I8, wukong_runtime::wukong_rt_write_i8 as *const u8);
     builder.symbol(RT_WRITE_U8, wukong_runtime::wukong_rt_write_u8 as *const u8);
+    // The ML builtins' entries (the `ml_rt` table).
+    ml_rt::bind_jit(&mut builder);
     builder.symbol(RT_NOW_NS, wukong_runtime::wukong_now_ns as *const u8);
     builder.symbol(
         RT_PARALLEL_FOR,
@@ -5061,6 +5118,11 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     );
     builder.symbol(RT_VMATH, wukong_runtime::wukong_vmath_f32 as *const u8);
     builder.symbol(RT_TRIG_F32, wukong_runtime::wukong_rt_trig_f32 as *const u8);
+    builder.symbol(RT_MATH_F64, wukong_runtime::wukong_rt_math_f64 as *const u8);
+    builder.symbol(
+        RT_MATH2_F64,
+        wukong_runtime::wukong_rt_math2_f64 as *const u8,
+    );
     builder.symbol(
         RT_VMATH_PARALLEL,
         wukong_runtime::wukong_vmath_f32_parallel as *const u8,

@@ -6,6 +6,7 @@
 | `canon.rs` | Semantics-preserving AST respelling so recognizers see canonical loop nests |
 | `tindex.rs` | `a[i, j]` on static tensors → single linear index before recognizers run |
 | `noalias.rs` | `@noalias` → MIR `ParamAttrs` (`record_param`); the name-level disjointness proof the recognizers and the `@parallel` region outliner use (`promised_disjoint`, `could_share_storage`) |
+| `par_grain.rs` | `@parallel(grain = G)`: chunk-count emission at the `wukong_parallel_for` call and the chunk-span -> iteration mapping in the outlined body |
 
 No `tests/` directory — tests are `#[cfg(test)] mod tests` at the bottom of `lib.rs`.
 

@@ -67,7 +67,13 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   with cheap inline bit-math (it's the top 16 bits of an `f32`); f16's IEEE-half layout has no such
   shortcut and Cranelift x64 has no f16 convert lowering, so f16 cast/load/store call shared `half`-crate
   shims (`wukong_f32_to_f16_bits`/`wukong_f16_bits_to_f32`) the interpreter uses too — bit-exact by
-  construction. `f64` is full. (The GPU adds tensor-core fp16/bf16/fp8 GEMM on top.)
+  construction. `f64` is full: arithmetic in double precision, and every transcendental on an
+  `f64` operand (the whole `exp`/`log`/trig/inverse-trig/hyperbolic/`erf`/`cbrt`/`pow`/`hypot` set
+  and the activations composed from them) is one call into the runtime's pure-Rust double-precision
+  library `wukong_runtime::math64` — ≤1 ULP for the core, Payne–Hanek trig reduction for every
+  finite argument, C23 special values, identical bits on the interpreter, the JIT and the AOT link
+  (it used to be the f32 polynomial behind a demote/promote pair; `tests/run/transcendental_f64.wk`
+  prints twelve digits of each). (The GPU adds tensor-core fp16/bf16/fp8 GEMM on top.)
 - **Mixed-precision (bf16 *and* f16) CPU suite → SIMD dispatch**: low-precision `[bf16]`/`[f16]` arrays
   read through an `as f32` widening cast (lossless: `<<16` for bf16, F16C `vcvtph2ps` for f16) with
   **f32 accumulate/compute** — the standard ML contract — are recognized and lowered to half-precision
@@ -177,18 +183,45 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   like use after `free` (`tests/run/alloc_scratch_arena.wk`, also in the AOT gate). Not yet: an
   uninitialized variant, an arena handle a program can pass around, and `@align(N)` (still parsed
   and discarded — every heap and scratch allocation is already 64-byte aligned).
-- **Typed file I/O** — `read_<T>(path, buf) -> i64` and `write_<T>(path, buf) -> i64` over the dtypes
-  {`f32`, `f64`, `i32`, `i64`, `i8`, `u8`}, where `path` is a `*u8` string literal and `buf` a `[]T`
-  slice (typically from `alloc_<T>`). The on-disk format is frozen and **headerless: raw contiguous
-  little-endian elements**, no magic and no length prefix, encoded with `to_le_bytes`/`from_le_bytes`
-  regardless of host endianness, so a blob written by one backend is byte-identical to the other's.
-  Contract: the open is attempted **first**, so a missing or unopenable path is `-1` even for
-  `len <= 0`; a read then transfers `n = min(len, file_size / sizeof)` elements (a trailing partial
-  element is ignored, `buf[n..]` left as allocated) and returns `n`, or `-2` on a mid-read I/O error;
-  a write creates/truncates and returns `len` (`-1` create failed, `-2` write error). Lowered to
-  opaque `wukong_rt_{read,write}_<T>` runtime calls — **no new MIR op** — and the interpreter
-  implements the identical contract, so interp == native
-  (`tests/run/io_roundtrip_{f32,f64,i32,i64,i8,u8}.wk`, `io_missing_file.wk`, `io_partial_read.wk`).
+- **Typed file I/O** — `read_<T>(path, buf) -> i64`, `write_<T>(path, buf) -> i64`,
+  `read_<T>_at(path, byte_off, buf) -> i64` and `file_size(path) -> i64` over **every fixed-width
+  numeric dtype** (`f32 f64 f16 bf16 i8 i16 i32 i64 u8 u16 u32 u64`), where `path` is a `*u8` and
+  `buf` a `[]T` slice, a `[T; N]` array or a contiguous `Tensor[T, …]` with no `?` dimension (writing a
+  non-`mut` aggregate parameter is E0304, like `p[i] = …`). The on-disk format is frozen and
+  **headerless: raw contiguous little-endian elements**, no magic and no length prefix, so a blob
+  written by one backend is byte-identical to the other's. Contract: the open is attempted **first**,
+  so a missing or unopenable path is `-1` even for `len <= 0`; a read then transfers
+  `n = min(len, (file_size - byte_off) / sizeof)` elements (a trailing partial element is ignored,
+  `buf[n..]` left as allocated; a negative offset is `-2`) and returns `n`, or `-2` on a mid-read I/O
+  error; a write creates/truncates and returns `len` (`-1` create failed, `-2` write error). Native
+  reads land **straight in the destination** (the original reader staged a second full-size copy).
+  The six original dtypes keep their `wukong_rt_{read,write}_<T>` symbols; every other dtype and every
+  offset read lowers to the dtype-coded `wukong_rt_{read,write}_dt` — **no new MIR op** — and the
+  interpreter runs the same planning code (`wukong_runtime::fileio`), so interp == native
+  (`tests/run/io_roundtrip_{f32,f64,i32,i64,i8,u8}.wk`, `io_missing_file.wk`, `io_partial_read.wk`,
+  `io_typed_dtypes.wk`). A `u8` read from a file now decodes to the same canonical slot value as a
+  stored `u8` in the interpreter (it was zero-extended there, so `b == 200` printed 0 under the
+  interpreter and 1 natively).
+- **Checkpoint readers** — `st_read_<T>(path, name, buf)` (safetensors) and `npy_read_<T>(path, buf)`
+  (NumPy `.npy` v1–v3) parse the header in the runtime (strict JSON / Python-literal parsers, no new
+  dependency) and check the stored tensor against the destination **at load time**: dtype (a
+  `BF16`/`F16` payload widens exactly into `f32`), a `Tensor` destination's rank and every dimension,
+  the exact element count, Fortran order refused. Codes `-1` open, `-2` I/O, `-3` dtype, `-4` shape,
+  `-5` name, `-6` malformed header; the destination is untouched on every one but `-2`. Runtime unit
+  tests cover the parsers and every code; `tests/run/io_safetensors.wk` and `io_npy.wk` assemble files
+  byte by byte and print every lane.
+- **Counter-based RNG** — `rand_u32` / `rand_f32` / `randn_f32(seed, ctr)` are Philox4x32-10 (key
+  = the seed's two words, counter = `(ctr lo, ctr hi, 0, 0)`; `rand_u32(0, 0)` is Random123's known
+  answer `0x6627e8d5`), lowered to plain integer MIR (`zext`/`mul`/`lshr`/`trunc`/`xor`), so they are
+  bit-identical across backends by construction and accepted in `@parallel` regions; `randn_f32` is
+  Box–Muller on the compiler's `log`/`cos`. `rand_fill_f32(buf, seed, ctr0)` is the same stream as one
+  runtime kernel. The runtime reference (`wukong_runtime::random`) is checked against all three
+  Random123 `philox4x32_10` known-answer vectors, and an interpreter test checks the MIR lowering
+  against it over seeds and counters that exercise both 32-bit halves (`tests/run/rand_philox.wk`).
+- **Sampling kernels** — `topk_f32(x, vals, idx)`, stable `argsort_f32` / `argsort_desc_f32(x, idx)`
+  and `sample_categorical(probs, u)` (inverse CDF over positive, finite weights), each defined by one
+  total order (NaN largest, ties to the lower index) so the answer is unique; the interpreter calls the
+  same safe runtime functions (`tests/run/topk_sampling.wk`).
 - **Radix & char literals**: hex `0xFF` / octal `0o17` / binary `0b1010` integer literals with `_`
   digit separators and type suffixes (`tests/run/radix_literals.wk`), and char literals `'A'` (the
   one-character / `\xHH` / `\u{…}` escapes) typed `char` — a 32-bit Unicode scalar value,
@@ -488,6 +521,13 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   one more decline: a modelled body-local that is reassigned inside an inner loop, whose snapshot is
   not flow-sensitive. Verify with `wukongc --emit=mir -O2 f.wk` and look for a `_parallel` symbol or a
   `wukong$par$` region.
+  `@parallel(grain = G)` is consumed (each worker claims runs of at least `G` iterations; any other
+  `@parallel` argument is `E0306`), any number of regions per program is outlined (the old 32-region
+  pool is grown on demand), and the thread count is set with `--threads=<n>` / `WUKONG_NUM_THREADS`.
+  The runtime's `_parallel` kernels fork only when rows x columns x a per-element cost clears one
+  shared work threshold (`WUKONG_PAR_MIN_WORK`); the threshold is anchored to the existing
+  velem/vmath crossovers, **not yet measured per family**. There is still no user-written
+  cross-thread combine (no atomics, no `@reduce`): a loop-carried accumulator declines to serial.
 - **`@generic`** on a function turns the kernel recognizers **off for that function**: none of the
   four probe sites (whole-function interception, the per-loop `match_*` cascade, `lower_block`'s
   statement windows, the vectorizer's elementwise probes) fire inside it, so its loops compile as
@@ -499,9 +539,19 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   feature (see `docs/internals.md`): recognizers are otherwise gate-blind, so this is the only way to
   compile and time the honest generic lowering of the same program. Autodiff refuses to run under the
   instrument, by name.
+- **`@strict_fp`** on a function (and **`--fp=strict`** for the whole program) evaluates its float
+  arithmetic in source order with one IEEE rounding per operation: no FMA contraction (`x + y*z`
+  stays a rounded multiply and a rounded add, in scalar code, vector bodies, 256-bit recipes and
+  scalar remainders), float reductions keep their sequential fold, and the kernel recognizers are off
+  (it implies `@generic`). Elementwise loops and integer reductions still vectorize. Per function,
+  survives inlining in both directions, identical at every `-O` level and on both backends
+  (`tests/run/strict_fp.wk`, `strict_fp_cli.wk`; the default contraction rule, including "the LEFT
+  product of `a*b + c*d` is fused", is pinned by `tests/run/fp_contract_rules.wk`). `--fp=strict`
+  is refused with `--emit=grad`/`--train`. The language guide's "Floating-point semantics" section
+  is the user-facing contract.
 - Unknown or misplaced `@attributes` are **`E0306`**, not silence: the name is checked against the
-  closed v1 set (`@parallel`, `@generic`, `@tile`, `@extern`, `@inline`, `@simd`, `@align`,
-  `@export`), so a typo like `@parellel` no longer compiles to a program with none of the requested
+  closed v1 set (`@parallel`, `@generic`, `@tile`, `@extern`, `@strict_fp`, `@inline`, `@simd`,
+  `@align`, `@export`), so a typo like `@parellel` no longer compiles to a program with none of the requested
   behavior. The four discarded attributes stay discarded wherever they parse.
 - Intrinsics `print`/`println`/`assert`.
 - The optimizer (`-O0..-O3`), backed by CFG and dominator analyses: whole-program **inlining**
@@ -890,11 +940,11 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   more, a *reduction* at a trip ≥ 2048 (statically or by a run-time trip test); the recognized
   kernels get 256-bit AVX2 via the runtime microkernels.)
 - **Attributes:** sema validates the closed set `@parallel`, `@generic`, `@tile`, `@extern`,
-  `@noalias`, `@inline`, `@simd`, `@align`, and `@export`; unknown names and restricted-placement
-  violations report `E0306`. `@noalias` (parameter-only) is consumed end to end — see the alias
-  bullet below. Name acceptance does not promise execution: general `@simd`/`@align`/`@export`
-  behavior and C ABI interop remain incomplete. `@parallel` executes, though its scheduling
-  arguments are not consumed; `@generic` opts out of recognizers. `@tile` performs loop
+  `@noalias`, `@unchecked`, `@strict_fp`, `@inline`, `@simd`, `@align`, and `@export`; unknown names
+  and restricted-placement violations report `E0306`. `@noalias` (parameter-only) is consumed end to
+  end — see the alias bullet below. Name acceptance does not promise execution: general `@simd`/`@align`/`@export`
+  behavior and C ABI interop remain incomplete. `@parallel` executes and consumes `grain = G`
+  (every other `@parallel` argument is `E0306`); `@generic` opts out of recognizers. `@tile` performs loop
   strip-mining and reports `E0309` when it cannot apply. Malformed attribute syntax reports `E0207`.
 - **Non-contiguous tensor layouts** `.col_major` / `.strided` / `.tiled(N, M)`: they parse (an unknown
   layout name is `E0204`), they are part of the tensor type, and they are enforced across a call
@@ -941,6 +991,25 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   reverse-mode autodiff already ships as the `wukong_autodiff` crate — both above).
 
 ## Known limitations / sharp edges
+
+- **Fast-mode float results depend on how a reduction is compiled.** Under the default `--fp=fast`
+  an `f32` reduction is evaluated on one of three trees — the source fold (a loop nothing
+  vectorizes), the sequential vectorizer's lane partition, or the `@parallel` kernel's fixed
+  8,192-element chunks — and adding or removing `@parallel`, or a reduction declining its kernel,
+  moves it between them, changing low-order bits with no diagnostic. Each tree is deterministic
+  (independent of threads, `-O` level, backend and host). Use `@strict_fp` where bits must not
+  depend on the spelling. Also by design: a compound `s += y*z` outside a vectorized reduction is not
+  contracted while `s = s + y*z` is, and there is no explicit `fma(a, b, c)` intrinsic yet, so a
+  strict function cannot request a single-rounding multiply-add.
+
+- **ML I/O and randomness gaps.** No memory-mapped load yet (`map_<T>`: every checkpoint load copies
+  once, straight into the destination), no GGUF reader and no quantized block types; `.npy` reads
+  little-endian arrays only.
+  A fill loop `for i { out[i] = rand_f32(seed, base + i) }` is not recognized into `rand_fill_f32`,
+  and the loop vectorizer declines it (mixed 32/64-bit widths), so the scalar builtins run one
+  element at a time; `randn_f32` has no fill kernel.
+  `topk_f32` has no VJP (autodiff refuses it rather than drop the gradient).
+  None of these is measured yet.
 
 - **A view local read before it is assigned is undefined, and the language has no rule that says so.**
   *(Table measured 2026-08-23 on `lang/w2e-recognizer-gate`; sema still has no definite-assignment

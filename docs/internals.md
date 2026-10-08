@@ -61,7 +61,10 @@ cycles):
 wukong_span      Span, SourceMap (line index), string Interner / Symbol
 wukong_runtime   the AVX2/FMA microkernels the recognizers dispatch to (GEMM/GEMV, vmath,
                   reductions, norms, int8, bf16/f16) + the rayon-backed `wukong_parallel_for` that
-                  `@parallel` lowers to — a leaf: no workspace deps, and both the interpreter and
+                  `@parallel` lowers to + `math64`, the pure-Rust double-precision transcendental
+                  library (fdlibm/musl algorithms, ≤1 ULP core, Payne–Hanek trig reduction) that
+                  every `f64` `exp`/`log`/`sin`/`pow`/… lowers to as one `wukong_rt_math_f64` /
+                  `wukong_rt_math2_f64` call — a leaf: no workspace deps, and both the interpreter and
                   the native backend call into it. It also backs the language's allocators:
                   `wukong_rt_alloc` (64-byte-aligned zeroed heap) and `scratch` (the per-thread
                   LIFO arena behind `scratch_<T>`/`scratch_mark`/`scratch_release`; the
@@ -718,6 +721,26 @@ vectorize only on the sequential path, never the `@parallel` one (folding into a
 across threads would race). The tree is a build contract, not a promise of strict source-order
 summation or stability across compiler releases.
 
+The contraction rule is exact and syntactic (`FnLowerer::try_contract_fma`, mirrored by `vec_try_fma`
+and the 256-bit recipe's `Add` arm): only a binary `+` with a `*` operand contracts; `x - y*z`, a
+product bound by `let`, and a compound `s += y*z` outside a vectorized reduction do not; and when both
+operands are products the **left** one is fused (`a*b + c*d` → `fma(a, b, round(c*d))`). The language
+guide's "Floating-point semantics" section is the user-facing statement and
+`tests/run/fp_contract_rules.wk` pins each clause; `fp_contract_tests.rs` pins the MIR shape.
+
+**Strict floating point** (`@strict_fp`, `--fp=strict` → `LowerOptions::strict_fp`) is decided
+entirely here. `strict_fp_gemm` stamps `GemmSyms::strict_fp` and clears `GemmSyms::recognize` for the
+function (and its monomorphized instances and outlined `@parallel` regions, which inherit the struct).
+The four contraction sites return early on the flag, and `try_vectorize_for` drops a float reduction
+before `emit_reduction`, so the loop lowers as its sequential scalar fold; integer reductions and
+elementwise loops still vectorize. No other crate needs to know: `wukong_opt` never reassociates (its
+vectorizer folds reduction lanes in index order, its unroller keeps one accumulator) and never
+creates an `Op::Fma`; Cranelift lowers `fadd`/`fmul` without fusion; the LLVM emitter writes no
+fast-math flags. That is also why the mode survives inlining in both directions — a strict body's
+separately rounded ops and a fast body's `Fma`s are already fixed in MIR when the inliner moves them.
+The driver refuses `--fp=strict` with `--emit=grad`/`--train` for the reason it refuses
+`WUKONG_NO_RECOGNIZE`: the VJP rules are keyed on recognized kernels.
+
 ## Spelling canonicalization before recognition
 
 Every recognizer below matches a *syntactic* shape on the raw AST, inside `lower_program` — before
@@ -845,6 +868,34 @@ runs parallel at ~94–110% of MKL-all rather than deliberately serial). This is
 it is why the win over gcc/rustc's naive nest *grows* with size (their version falls out of cache; the
 packed kernel does not).
 
+Four refinements (2026-10, the P9 runtime findings) remove the remaining non-compute work, none of
+which changes a bit:
+
+- **Single-sweep B packing.** When a macro-block's packed B panel would be swept by exactly one row
+  block — the serial kernel at `m ≤ MC` and every 2D block-parallel block — `macro_kernel_packb`
+  packs each `KC×NR` micropanel into a 24 KB L1-resident buffer immediately before the row sweep
+  that consumes it, and threads a `PfWalk` through that sweep's FMA loop (one `PREFETCHT1` per four
+  K steps) so the *next* micropanel's source is in L2 when it is packed. The whole-panel pack stays
+  for `m > MC`, where every extra `ic` pass re-reads it. `WUKONG_GEMM_FUSED_PACK=0` restores the
+  whole-panel pack everywhere (an A/B instrument; the default is unmeasured at landing).
+- **Edge tiles.** A tile with fewer than 6 valid rows runs a row-trimmed K loop (only the live
+  rows' FMAs), and every partial tile — and every fused-epilogue partial tile — writes back with the
+  full-tile path's own 256-bit sequence under a `vmaskmovps` column mask instead of a scalar
+  element loop.
+- **`Aᵀ·B` without a copy.** The kernel takes an `at` flag: A stored `[k, m]` is packed straight
+  from its storage (each `[kc][MR]` panel row is six *consecutive* stored floats), so the TN
+  weight-gradient entries no longer allocate, zero and transpose an `m·k` scratch matrix.
+- **Half inputs.** The bf16/f16 entries widen into a reused per-thread scratch (no per-call
+  allocation) with 8-lane bodies (`vpslld` for bf16, F16C for f16), and the TN form widens A in its
+  stored layout and dispatches with `at`.
+
+The int8 kernel (`wukong_runtime::i8gemm`) needs no repacking — both operands are contiguous over
+the contraction and `vpdpbusd` consumes 32-byte runs directly — but it does need blocking: column
+blocks of 1 MiB of B (`i8_col_block`) are walked outermost so every A row streams past an
+L2-resident block, and the `_parallel` entries split C into a (row block × column block) task grid
+(`i8_par_grid`) rather than one task per row, which also lets a single-token decode GEMM use the
+whole pool.
+
 Recognition is always *optional*. When the emitter cannot represent a shape the matcher accepted — an
 unsupported transpose combination, an unbound operand, a peeled α or a bias the NT-only epilogue kernel
 has no room for — `emit_sgemm` returns `false` and the nest lowers as the ordinary scalar loops. The
@@ -857,13 +908,54 @@ Crucially this stays inside the differential oracle: the interpreter, on a `wuko
 marshals the result back — so native and interpreter agree bit-for-bit despite the reassociated
 accumulation (the parallel kernel is bit-identical to the serial one by construction).
 
+### What a recognized matmul computes — the GEMM numeric contract
+
+`interp == native` holds for a recognized matmul because both backends call one function, which is
+a property of the *implementation*; this section is the property of the *result* that the tests pin
+independently of that.
+
+- **Order.** For each `(i, j)` independently, K is split by `select_kc(k)` into
+  `nb = ceil(k / kc)` equal-ish blocks of at most `KC = 384` steps (a multiple of 4). Each block
+  accumulates ascending `p` from `+0.0` with **one rounding per step** (`vfmadd`; `f32::mul_add` in
+  the scalar twin) and is folded into C with one more rounding (`beta_eff = 1.0` after the first
+  block); a non-zero caller `beta` is a flag that makes the first block accumulate too (never a
+  scale). The fused epilogue `act(alpha·x + bias[j])` is applied once, after the final block, and is
+  bit-identical to the unfused sequence.
+- **Invariant under** `MC`, `NC`, the 6×16 register tile, packing (whole-panel or single-sweep,
+  row-major or transposed A), edge-tile handling, the AVX-512 twin, every parallel schedule and
+  thread count, every `WUKONG_GEMM_*` knob, and the AVX2-versus-portable choice: a host without
+  AVX2+FMA — and every non-x86 target — runs `sgemm_scalar`, which follows the same order with a
+  correctly-rounded `mul_add`. Pinned by `sgemm_scalar_matches_avx2_bit_for_bit` (every layout,
+  `beta`, epilogue and 1–3 K-blocks), the serial==parallel tests of every schedule,
+  `fused_b_pack_is_bit_identical_to_the_classic_pack` and
+  `tn_direct_pack_matches_nn_on_the_transpose_in_every_schedule`.
+- **A function of `KC`.** Retuning the K-block cap changes the low bits of every recognized matmul,
+  so `select_kc_partition_is_pinned` pins the partition by value. Like the reduction partition
+  above, the order is a build contract: stable across hosts, thread counts and backends, **not**
+  promised across releases.
+- **Error bound.** Every reference test asserts
+  `|got − exact| ≤ γ_r · (Σ_p |a_ip|·|b_pj| + |β·c_ij|)` against an f64 reference, with
+  `r = kc + nb − 1 (+1 when β ≠ 0)` and `γ_r = r·u/(1 − r·u)`, `u = 2⁻²⁴` — netlib's Level-3 BLAS
+  test scaling (`SMMCH`) with this order's own rounding count (Higham, Lemma 3.1). The test shape
+  lists are derived from `MR/NR/MC/KC/NC` and `assert_blocking_coverage` fails if a retune leaves a
+  blocking regime (multiple K-blocks, a second MC or NC block, the L2-capped column split, full and
+  edge tiles) unreached.
+- **Half inputs** widen exactly and then follow the f32 contract; **int8** is exact modulo 2³²
+  (wrapping `i32` addition is associative, so blocking and threading cannot change a bit).
+- **Unrecognized matmuls** (declined, `@generic`, `WUKONG_NO_RECOGNIZE`) compute the loop as written
+  under the FMA-contraction and reduction-partition rules above. The two coincide when K is below one
+  vector group (pinned with fused-vs-unfused-distinguishing data by
+  `tests/run/lang_generic_gemm_fma_order.wk`); beyond that they may differ in the last bits.
+  `tests/run/gemm_blocked_every_lane.wk` uses integer data (exact in any order) to check all three
+  f32 kernel forms lane by lane across three K-blocks and full and edge tiles end to end.
+
 ### Turning recognition off: `WUKONG_NO_RECOGNIZE` (an instrument, not a feature)
 
-That bit-for-bit agreement is also why recognizers are **gate-blind**. A recognizer fires identically
-on the interpreter and on native at every `-O` level — both call the same `wukong_runtime` symbol — so
-`native_matches_interpreter` and the opt-invariance suites pass whether the kernel fired or not, and
-whether it was right or not. Nothing observable distinguishes "the compiler lowered this loop well"
-from "a pattern matcher swapped in a hand-written kernel."
+The interpreter/native bit-for-bit agreement is also why recognizers are **gate-blind**. A recognizer
+fires identically on the interpreter and on native at every `-O` level — both call the same
+`wukong_runtime` symbol — so `native_matches_interpreter` and the opt-invariance suites pass whether
+the kernel fired or not, and whether it was right or not. Nothing observable distinguishes "the
+compiler lowered this loop well" from "a pattern matcher swapped in a hand-written kernel."
 
 Setting `WUKONG_NO_RECOGNIZE` (to any value) builds the program with the recognizers off:
 `wukong_driver::compile` turns it into `wukong_mir_build::LowerOptions { recognize: false }`, which
@@ -925,13 +1017,34 @@ AOT training and measured training performance remain separate gaps.
 
 The bias, dequantization, low-precision, vector-elementwise and vector-math kernels share
 `crates/wukong_runtime/src/nt_policy.rs`. Their existing saturated byte-traffic formulas
-select non-temporal stores at a default **10 MiB** threshold. This value is a historical
-default, not a detected cache size or a measured optimum for the current host.
+select non-temporal stores once the traffic reaches a threshold derived from the host: three
+quarters of one probed L3 instance, clamped to `[4 MiB, 64 MiB]` (glibc's `memcpy` rule for the
+same decision), with the historical **10 MiB** as the fallback when no L3 size can be probed. The
+cache size comes from `crates/wukong_runtime/src/topology.rs` (CPUID leaf 4 / `0x8000_001D`, Linux
+sysfs as the fallback; `WUKONG_CACHE_L3_KB` overrides it). The derivation is a rule, not a
+measured optimum for the current host.
 
 Set `WUKONG_NT_MIN_BYTES` before starting the process to override the threshold in bytes.
 It accepts a positive ASCII decimal integer that fits `usize`, including leading zeroes.
 Absent, non-Unicode, empty, signed, whitespace-containing, zero and overflowing values
-fall back to 10 MiB. The first use caches the value for the process lifetime.
+are ignored and the derived default applies. The first use caches the value for the process
+lifetime. Either way the choice is throughput-only: an NT store writes the same bits.
+
+### Parallel dispatch policy
+
+Every `_parallel` runtime entry asks `crates/wukong_runtime/src/par.rs` whether to fork: at least
+two independent units (rows, column stripes, channels), weighted work (rows x cols x a per-element
+cost: 1 stream, 4 row-normalization, 16 transcendental) of at least `WUKONG_PAR_MIN_WORK` (default
+2^18, not yet measured per family), and a pool with a second worker. Below that it tail-calls its
+serial twin, which is bit-identical by the crate's serial == parallel law. Under `cfg(test)` the
+threshold is zero, so the crate's own serial == parallel tests always fork; the compiler-level
+differential gates run the production default, so set `WUKONG_PAR_MIN_WORK=1` to push their small
+shapes through the multicore paths. `par::claim_chunks` is the shared atomic claim queue behind
+`wukong_parallel_for`, the int8 GEMM (whose claimed units are the cells of its `i8_par_grid`
+row block x column block grid, and whose fork gate counts (row x 4-column) cells rather than rows,
+so a single-token decode GEMM still forks) and per-channel dequant. `@parallel(grain = G)` is applied in
+`wukong_mir_build` (`par_grain.rs`): the call passes `ceil(n / G)` chunk indices and the outlined
+body maps its chunk span back to iterations, so the runtime ABI is unchanged.
 
 Tests that require streaming execution derive their sizes from the actual policy, retain
 existing numerical cases/tail residues, and count executed non-temporal stores. Their

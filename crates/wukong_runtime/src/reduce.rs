@@ -23,13 +23,43 @@
 //! serial sibling when there is one chunk or `wuk_pool_width() <= 1`). (`fmax`/
 //! `fmin` are *not* associative on NaN/±0, but determinism here rests on the FIXED decomposition and
 //! ascending combine, not on associativity — the serial and parallel forms evaluate the identical
-//! expression tree.) Within a chunk the AVX2 path and the scalar twin are also bit-identical (lane `j`
-//! folds elements `≡ j (mod 8)`, then a fixed-order horizontal combine; `f32::mul_add` is the same
-//! fused op as `_mm256_fmadd`, and the scalar `(a > b) ? a : b` is the same as `_mm256_max_ps`).
+//! expression tree.) Within a chunk the AVX2 path and the scalar twin are also bit-identical (the
+//! same fixed 64-lane partition documented below, then a fixed-order horizontal combine;
+//! `f32::mul_add` is the same fused op as `_mm256_fmadd`, and the scalar `(a > b) ? a : b` is the same
+//! as `_mm256_max_ps`).
 //!
-//! At `N = 2^20` a dot is *memory-bound* (a single core already saturates load bandwidth at ~44
-//! GB/s), so one 8-lane accumulator per chunk is enough to be bandwidth-bound; the win is spreading
-//! chunks across cores to reach *aggregate* bandwidth — exactly how `saxpy@parallel` hits ~130 GB/s.
+//! # The per-chunk partition (`RUNROLL` = 8 accumulator chains)
+//!
+//! A chunk `[lo, hi)` is walked in `RBLOCK` = 64-element blocks. Block element `lo + 64·b + 8·t + j`
+//! folds into **accumulator `t`, lane `j`** (`t, j ∈ 0..8`), in ascending `b`. The `< 64` remainder is
+//! walked in 8-element steps into accumulator 0 (lane `j` takes element `+ j`), the eight accumulator
+//! vectors are combined by the fixed halving tree `acc[t] = fold2(acc[t + h], acc[t])` for
+//! `h = 4, 2, 1`, the `< 8` ragged tail folds into lanes `0..` of the result, and [`hcombine8`]
+//! closes the eight lanes. The partition is a pure function of the chunk length — never of the ISA,
+//! the thread count or the call site.
+//!
+//! Why eight chains. The single-accumulator form this replaced was **latency** bound, not bandwidth
+//! bound, at every cache-resident size: one loop-carried `vfmadd` per 8 elements at 4 cycles of
+//! latency is 0.5 cycles/element while the two FMA ports and two load ports could retire 8 elements a
+//! cycle. That is the regime that matters most here — `softmax_bwd` calls this dot once per row
+//! (`cols ≤ 4096`, L1/L2-resident), and every `RCHUNK` is 32 KB. At DRAM-sized `N` the chunk loop is
+//! bandwidth bound either way, and the multicore entry is what reaches aggregate bandwidth. This is
+//! the same lever `lowp.rs` pulled for the bf16 reductions (`BF_K = 8`) and `norm.rs` for the
+//! row-norm reductions (`UNROLL = 8`); llama.cpp's `ggml_vec_dot_f32` (`GGML_F32_ARR`) and oneDNN's
+//! reduction kernels carry the same multi-accumulator unroll.
+//!
+//! Two consequences worth stating. A chunk shorter than `RBLOCK` never enters the blocked loop, so
+//! its bits are **identical** to the pre-unroll single-accumulator kernel (the tree only meets
+//! identity-valued accumulators, and `x + 0.0`, `(-∞ > x) ? -∞ : x` and `(+∞ < x) ? +∞ : x` all
+//! return `x` exactly). Longer chunks reassociate the additive folds toward pairwise summation, which
+//! tightens the error bound (`partition_is_closer_to_f64_than_one_chain` pins the direction). The
+//! max-family folds pick an element, so on NaN-free data they return the same *value* under any
+//! partition; only which of `+0.0`/`-0.0` represents a zero maximum, and whether a NaN survives the
+//! `maxps` fold, depend on the documented order.
+//!
+//! Each op is **monomorphized** (`reduce_chunk_avx2_mono::<OP>`), so the per-step `match op` is
+//! resolved at compile time instead of sitting in the loop body — the shape `velem.rs` and `vmath.rs`
+//! measured into their own kernels.
 
 use rayon::prelude::*;
 
@@ -92,12 +122,30 @@ pub(crate) fn fold2(a: f32, b: f32, op: i64) -> f32 {
     }
 }
 
-// Fixed chunk size in elements — independent of thread count, which is what makes the parallel
-// partial decomposition deterministic. 8192 f32 = 32 KB (an L1's worth) per chunk; at N=2^20 that is
-// 128 chunks, plenty for rayon work-stealing to balance the P+E hybrid, and the 128-entry partial
-// array combines in negligible time. Must stay constant for serial/parallel/interp to agree.
+// Fixed chunk size in elements: a NUMERICAL-CONTRACT constant, not a cache-tuning knob (P13.9).
+//
+// It defines the summation tree of every recognized f32/bf16/f16 reduction — partials per chunk,
+// folded in ascending chunk order — so it is fixed on every host, independent of thread count, and
+// it is what makes serial == parallel == interpreter. Changing it changes every such reduction's
+// low-order bits; like the vectorizer's reduction partition it may change only with a compiler
+// release, and the user-facing statement of it is the language guide's "Floating-point semantics".
+//
+// The old justification here, "8192 f32 = 32 KB, an L1's worth", was both inconsistent (gemm.rs
+// sizes its blocking for this host's 48 KB P-core L1D; 32 KB is the E-core L1D) and beside the
+// point: a streaming reduction reads each element exactly once, so whether a chunk fits in L1 buys
+// nothing. What the length does set is SCHEDULING — how many independent tasks exist (128 at
+// N = 2^20, ample for work-stealing across the P+E hybrid) and how long the partial array is — and
+// load balance can be retuned per host by changing how many fixed chunks one task claims, which
+// moves no bit. The elementwise maps' chunk constants (`velem::VCHUNK`, `vmath::VMATH_CHUNK`) are
+// the opposite case: a map has nothing to reassociate, so those are free scheduling knobs.
 // `pub(crate)` so the bf16/f16 parallel reductions in `lowp.rs` cut on the *same* fixed boundary.
 pub(crate) const RCHUNK: usize = 8192;
+
+/// Independent accumulator vectors per chunk (see the module header's partition). Changing it changes
+/// result bits; the scalar twin reads the same constant, so the twins move together.
+const RUNROLL: usize = 8;
+/// Elements consumed per blocked step: `RUNROLL` 8-lane vectors.
+const RBLOCK: usize = RUNROLL * 8;
 
 /// One element's contribution folded into accumulator `a` (the fused-multiply-add form, so the AVX2
 /// `_mm256_fmadd_ps` lanes match this lane-for-lane). `yi` is ignored for the unary ops.
@@ -153,81 +201,166 @@ unsafe fn reduce_chunk(x: *const f32, y: *const f32, lo: usize, hi: usize, op: i
     unsafe { reduce_chunk_scalar(x, y, lo, hi, op) }
 }
 
-/// Portable reference: 8 scalar lane accumulators mirroring the AVX2 register lane-for-lane. Used on
-/// non-AVX2 targets; the unit tests pin it bit-identical to the AVX2 path where that is available.
+/// The fixed halving tree over the `RUNROLL` accumulator vectors: `acc[t] = fold2(acc[t + h], acc[t])`
+/// for `h = RUNROLL/2, …, 1`, lane-wise, leaving the result in `acc[0]`. The AVX2 twin spells the same
+/// tree with `_mm256_{add,max,min}_ps(acc[t + h], acc[t])`, whose operand order matches `fold2(a, b)`
+/// (`(a > b) ? a : b` is MAXPS returning its *second* source on a tie or an unordered compare). With
+/// the higher accumulator as the first operand an identity-valued one (`0.0`, `-∞`, `+∞`) returns the
+/// lower one unchanged — NaN included — which is what keeps sub-`RBLOCK` chunks bit-identical to the
+/// single-accumulator kernel.
+#[inline(always)]
+fn combine_tree(acc: &mut [[f32; 8]; RUNROLL], op: i64) {
+    let mut w = RUNROLL;
+    while w > 1 {
+        let h = w / 2;
+        let (lo, hi) = acc.split_at_mut(h);
+        for (l, r) in lo.iter_mut().zip(hi.iter()) {
+            for (lj, rj) in l.iter_mut().zip(r.iter()) {
+                *lj = fold2(*rj, *lj, op);
+            }
+        }
+        w = h;
+    }
+}
+
+/// Portable reference: `RUNROLL` × 8 scalar lane accumulators in the partition the module header
+/// documents, mirroring the AVX2 registers lane-for-lane. Used on non-AVX2 targets; the unit tests pin
+/// it bit-identical to the AVX2 path where that is available.
 ///
 /// # Safety
 /// `x`/`y` valid on `[lo, hi)`.
 unsafe fn reduce_chunk_scalar(x: *const f32, y: *const f32, lo: usize, hi: usize, op: i64) -> f32 {
-    let mut acc = [ident(op); 8];
-    let len = hi - lo;
-    let nsteps = len / 8;
-    for s in 0..nsteps {
-        let base = lo + s * 8;
-        for (j, a) in acc.iter_mut().enumerate() {
-            let i = base + j;
-            // SAFETY: i < hi.
-            *a = contrib(*a, unsafe { *x.add(i) }, unsafe { *y.add(i) }, op);
+    let mut acc = [[ident(op); 8]; RUNROLL];
+    let mut i = lo;
+    // Blocked body: element `i + 8t + j` folds into accumulator `t`, lane `j`.
+    while i + RBLOCK <= hi {
+        for (t, at) in acc.iter_mut().enumerate() {
+            for (j, a) in at.iter_mut().enumerate() {
+                let k = i + 8 * t + j;
+                // SAFETY: k < i + RBLOCK <= hi.
+                *a = contrib(*a, unsafe { *x.add(k) }, unsafe { *y.add(k) }, op);
+            }
         }
+        i += RBLOCK;
     }
+    // `< RBLOCK` remainder, whole 8-element steps, all into accumulator 0.
+    while i + 8 <= hi {
+        for (j, a) in acc[0].iter_mut().enumerate() {
+            // SAFETY: i + j < i + 8 <= hi.
+            *a = contrib(*a, unsafe { *x.add(i + j) }, unsafe { *y.add(i + j) }, op);
+        }
+        i += 8;
+    }
+    combine_tree(&mut acc, op);
     // Tail (< 8 elements) folds into lanes 0.. in order — identical to the AVX2 store-then-tail.
-    let tail = lo + nsteps * 8;
-    for (j, a) in acc.iter_mut().enumerate().take(len - nsteps * 8) {
-        let i = tail + j;
-        // SAFETY: i < hi.
-        *a = contrib(*a, unsafe { *x.add(i) }, unsafe { *y.add(i) }, op);
+    let mut lanes = acc[0];
+    for (j, a) in lanes.iter_mut().enumerate().take(hi - i) {
+        // SAFETY: i + j < hi.
+        *a = contrib(*a, unsafe { *x.add(i + j) }, unsafe { *y.add(i + j) }, op);
     }
-    hcombine8(acc, op)
+    hcombine8(lanes, op)
 }
 
-/// AVX2 chunk reduce: one `__m256` accumulator (lane `j` sums elements `≡ j (mod 8)` over the chunk),
-/// then the tail and horizontal combine in scalar so the result is bit-identical to the scalar twin.
+/// AVX2 chunk reduce: dispatch once on `op` to the monomorphized body, so the per-step op `match`
+/// is a compile-time constant inside the loop. An unknown op runs the scalar twin, which folds
+/// nothing (`contrib`'s `_ => a`) and returns the identity combine — the same `0.0` the old in-loop
+/// `_ => acc` arm produced.
 ///
 /// # Safety
 /// `x`/`y` valid on `[lo, hi)`; AVX2+FMA must be available.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn reduce_chunk_avx2(x: *const f32, y: *const f32, lo: usize, hi: usize, op: i64) -> f32 {
+    match op {
+        RED_DOT => reduce_chunk_avx2_mono::<RED_DOT>(x, y, lo, hi),
+        RED_SSD => reduce_chunk_avx2_mono::<RED_SSD>(x, y, lo, hi),
+        RED_SUM => reduce_chunk_avx2_mono::<RED_SUM>(x, y, lo, hi),
+        RED_SUMSQ => reduce_chunk_avx2_mono::<RED_SUMSQ>(x, y, lo, hi),
+        RED_MAX => reduce_chunk_avx2_mono::<RED_MAX>(x, y, lo, hi),
+        RED_MIN => reduce_chunk_avx2_mono::<RED_MIN>(x, y, lo, hi),
+        RED_MAXABS => reduce_chunk_avx2_mono::<RED_MAXABS>(x, y, lo, hi),
+        RED_SUMABS => reduce_chunk_avx2_mono::<RED_SUMABS>(x, y, lo, hi),
+        RED_ABSDIFF => reduce_chunk_avx2_mono::<RED_ABSDIFF>(x, y, lo, hi),
+        _ => reduce_chunk_scalar(x, y, lo, hi, op),
+    }
+}
+
+/// The AVX2 chunk reduce for one op, `RUNROLL` independent `__m256` chains over the module header's
+/// partition, then the same tree, tail and horizontal combine as [`reduce_chunk_scalar`] — so the two
+/// are bit-identical.
+///
+/// # Safety
+/// `x`/`y` valid on `[lo, hi)`; AVX2+FMA must be available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn reduce_chunk_avx2_mono<const OP: i64>(
+    x: *const f32,
+    y: *const f32,
+    lo: usize,
+    hi: usize,
+) -> f32 {
     use std::arch::x86_64::*;
+    let neg0 = _mm256_set1_ps(-0.0);
+    // One element-block's contribution folded into `$acc` — the lane op `contrib` mirrors
+    // (mul_add↔fmadd, `(a > xi) ? a : xi`↔`max_ps(acc, xv)`, `f32::abs`↔`andnot(-0.0, v)`). A macro,
+    // not a `#[target_feature]` helper, so it is guaranteed to expand inline in this loop.
+    macro_rules! step {
+        ($acc:expr, $i:expr) => {{
+            let i = $i;
+            let xv = _mm256_loadu_ps(x.add(i));
+            match OP {
+                RED_DOT => _mm256_fmadd_ps(xv, _mm256_loadu_ps(y.add(i)), $acc),
+                RED_SSD => {
+                    let d = _mm256_sub_ps(xv, _mm256_loadu_ps(y.add(i)));
+                    _mm256_fmadd_ps(d, d, $acc)
+                }
+                RED_SUM => _mm256_add_ps(xv, $acc),
+                RED_SUMSQ => _mm256_fmadd_ps(xv, xv, $acc),
+                RED_MAX => _mm256_max_ps($acc, xv),
+                RED_MIN => _mm256_min_ps($acc, xv),
+                RED_MAXABS => _mm256_max_ps($acc, _mm256_andnot_ps(neg0, xv)),
+                RED_SUMABS => _mm256_add_ps($acc, _mm256_andnot_ps(neg0, xv)),
+                RED_ABSDIFF => {
+                    let d = _mm256_sub_ps(xv, _mm256_loadu_ps(y.add(i)));
+                    _mm256_add_ps($acc, _mm256_andnot_ps(neg0, d))
+                }
+                _ => $acc,
+            }
+        }};
+    }
     // `set1(ident)` is `setzero` for the additive ops (+0.0 = all-zero bits), and ∓∞ for max/min.
-    let mut acc = _mm256_set1_ps(ident(op));
-    let len = hi - lo;
-    let nsteps = len / 8;
-    for s in 0..nsteps {
-        let i = lo + s * 8;
-        let xv = _mm256_loadu_ps(x.add(i));
-        acc = match op {
-            RED_DOT => _mm256_fmadd_ps(xv, _mm256_loadu_ps(y.add(i)), acc),
-            RED_SSD => {
-                let d = _mm256_sub_ps(xv, _mm256_loadu_ps(y.add(i)));
-                _mm256_fmadd_ps(d, d, acc)
-            }
-            RED_SUM => _mm256_add_ps(xv, acc),
-            RED_SUMSQ => _mm256_fmadd_ps(xv, xv, acc),
-            RED_MAX => _mm256_max_ps(acc, xv), // `(acc > xv) ? acc : xv`, lane-wise
-            RED_MIN => _mm256_min_ps(acc, xv),
-            // |xv| via `andnot(-0.0, xv)` (clear the sign bit) ≡ the scalar `f32::abs`, then max.
-            RED_MAXABS => _mm256_max_ps(acc, _mm256_andnot_ps(_mm256_set1_ps(-0.0), xv)),
-            // Σ|x|: clear the sign bit (andnot -0.0) then add — bit-identical to `contrib`'s xi.abs().
-            RED_SUMABS => _mm256_add_ps(acc, _mm256_andnot_ps(_mm256_set1_ps(-0.0), xv)),
-            // Σ|x−y|: subtract (as RED_SSD) then clear the sign bit, then add — matches `contrib`.
-            RED_ABSDIFF => {
-                let d = _mm256_sub_ps(xv, _mm256_loadu_ps(y.add(i)));
-                _mm256_add_ps(acc, _mm256_andnot_ps(_mm256_set1_ps(-0.0), d))
-            }
-            _ => acc,
-        };
+    let mut acc = [_mm256_set1_ps(ident(OP)); RUNROLL];
+    let mut i = lo;
+    while i + RBLOCK <= hi {
+        for (t, at) in acc.iter_mut().enumerate() {
+            *at = step!(*at, i + 8 * t);
+        }
+        i += RBLOCK;
     }
-    let mut tmp = [ident(op); 8];
-    _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
-    // Scalar tail into the same lanes — `contrib` matches the AVX2 lane op exactly (mul_add↔fmadd,
-    // `(a > xi) ? a : xi` ↔ max_ps).
-    let tail = lo + nsteps * 8;
-    for (j, t) in tmp.iter_mut().enumerate().take(len - nsteps * 8) {
-        let i = tail + j;
-        *t = contrib(*t, *x.add(i), *y.add(i), op);
+    while i + 8 <= hi {
+        acc[0] = step!(acc[0], i);
+        i += 8;
     }
-    hcombine8(tmp, op)
+    // The halving tree, `fold2(acc[t + h], acc[t])` lane-wise (see `combine_tree`).
+    let mut w = RUNROLL;
+    while w > 1 {
+        let h = w / 2;
+        for t in 0..h {
+            acc[t] = match OP {
+                RED_MAX | RED_MAXABS => _mm256_max_ps(acc[t + h], acc[t]),
+                RED_MIN => _mm256_min_ps(acc[t + h], acc[t]),
+                _ => _mm256_add_ps(acc[t + h], acc[t]),
+            };
+        }
+        w = h;
+    }
+    let mut lanes = [ident(OP); 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), acc[0]);
+    // Scalar tail into the same lanes, exactly as the twin.
+    for (j, a) in lanes.iter_mut().enumerate().take(hi - i) {
+        *a = contrib(*a, *x.add(i + j), *y.add(i + j), OP);
+    }
+    hcombine8(lanes, OP)
 }
 
 /// `sum_i f(x[i], y[i])` for `i in 0..n` (serial). For `RED_SUM`/`RED_SUMSQ`, `y` is ignored (callers
@@ -651,13 +784,138 @@ mod tests {
         if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
             return;
         }
-        for &n in &[8usize, 9, 17, 8191, 8192, 8193] {
+        // Every seam of the partition: below one 8-step, the 8-step remainder, the `RBLOCK` = 64
+        // blocked body at its edges (63/64/65, 127/128/129), blocks + remainder + tail together
+        // (200 = 3·64 + 8 + 0, 211 = 3·64 + 16 + 3), and the whole-chunk sizes.
+        for &n in &[
+            1usize, 7, 8, 9, 17, 63, 64, 65, 71, 72, 127, 128, 129, 200, 211, 8191, 8192, 8193,
+        ] {
             let (x, y) = fill(n);
             for &op in &OPS {
                 let s = unsafe { reduce_chunk_scalar(x.as_ptr(), y.as_ptr(), 0, n, op) };
                 let v = unsafe { reduce_chunk_avx2(x.as_ptr(), y.as_ptr(), 0, n, op) };
                 assert_eq!(s.to_bits(), v.to_bits(), "scalar != avx2 at n={n} op={op}");
             }
+        }
+    }
+
+    /// The twin gate above runs on finite data. The values that desync an accumulator layout are the
+    /// ones no `fill()` produces: signed zeros (which `+` and MAXPS resolve by operand order) and a
+    /// NaN parked in a *non-zero* chain, which must reach the result through the halving tree in the
+    /// same lane on both sides. Positions 70, 119 and 190 sit in chains 0, 6 and 7 (blocks 1, 1 and
+    /// 2); 300 lands in the 8-step remainder at `n = 305` and in chain 5 of block 4 at `n = 1000`.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn scalar_matches_avx2_on_nan_and_signed_zero_chunks() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return;
+        }
+        for &n in &[64usize, 135, 200, 305, 1000] {
+            for case in 0..4 {
+                let (mut x, mut y) = fill(n);
+                match case {
+                    0 => {
+                        for i in (0..n).step_by(3) {
+                            x[i] = if i % 2 == 0 { 0.0 } else { -0.0 };
+                            y[i] = -0.0;
+                        }
+                    }
+                    1 => x.iter_mut().for_each(|v| *v = -0.0),
+                    2 => {
+                        for &p in &[70usize, 119, 190, 300] {
+                            if p < n {
+                                x[p] = f32::NAN;
+                            }
+                        }
+                    }
+                    _ => {
+                        if n > 133 {
+                            y[133] = f32::NAN;
+                            x[71] = f32::INFINITY;
+                            x[72] = f32::NEG_INFINITY;
+                        }
+                    }
+                }
+                for &op in &OPS {
+                    let s = unsafe { reduce_chunk_scalar(x.as_ptr(), y.as_ptr(), 0, n, op) };
+                    let v = unsafe { reduce_chunk_avx2(x.as_ptr(), y.as_ptr(), 0, n, op) };
+                    assert_eq!(
+                        s.to_bits(),
+                        v.to_bits(),
+                        "scalar != avx2 n={n} case={case} op={op}: {s} vs {v}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The pre-unroll kernel's partition, spelled independently of the code under test: lane `i % 8`
+    /// folds element `i` in ascending order, then the fixed 8-lane combine.
+    fn one_chain(x: &[f32], y: &[f32], op: i64) -> f32 {
+        let mut lanes = [ident(op); 8];
+        for (i, (&xi, &yi)) in x.iter().zip(y).enumerate() {
+            lanes[i % 8] = contrib(lanes[i % 8], xi, yi, op);
+        }
+        hcombine8(lanes, op)
+    }
+
+    /// A chunk shorter than `RBLOCK` never enters the blocked body, so it must keep the exact bits of
+    /// the single-accumulator kernel — on every op, and on NaN / signed-zero / infinite data as well
+    /// as finite data. This is the property that keeps every short `@parallel` reduction in the
+    /// corpus byte-for-byte where it was.
+    #[test]
+    fn sub_block_chunks_keep_the_single_chain_bits() {
+        for n in 1usize..RBLOCK {
+            let (mut x, y) = fill(n);
+            if n > 5 {
+                x[5] = -0.0;
+            }
+            if n > 9 {
+                x[n - 1] = f32::NAN;
+            }
+            if n > 20 {
+                x[20] = f32::NEG_INFINITY;
+            }
+            for &op in &OPS {
+                let yp = if unary(op) { &x } else { &y };
+                let got = unsafe { wukong_sreduce_f32(x.as_ptr(), yp.as_ptr(), n as i64, op) };
+                // `wukong_sreduce_f32` folds its single chunk partial into `ident(op)` once more.
+                let want = fold2(ident(op), one_chain(&x, yp, op), op);
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "n={n} op={op}: {got} vs one-chain {want}"
+                );
+            }
+        }
+    }
+
+    /// The eight-chain partition is a reassociation toward pairwise summation, so on a long,
+    /// all-positive chunk it must land measurably closer to the exact sum than the one-chain kernel
+    /// it replaced — not merely "different". Data and margin checked offline with an exact
+    /// (rational-arithmetic) emulation of both partitions: at `n = RCHUNK` the one-chain relative
+    /// error is 1.51e-6 (sum) / 8.83e-7 (dot) against 1.44e-7 / 1.56e-7 for the partition, so the
+    /// factor-of-two margin asserted here has ~5x of slack.
+    #[test]
+    fn partition_is_closer_to_f64_than_one_chain() {
+        let n = RCHUNK;
+        let x: Vec<f32> = (0..n).map(|i| 1.0f32 + (i % 7) as f32 * 0.1).collect();
+        let y: Vec<f32> = (0..n).map(|i| 1.0f32 + (i % 5) as f32 * 0.03).collect();
+        for &op in &[RED_SUM, RED_DOT] {
+            let want: f64 = if op == RED_SUM {
+                x.iter().map(|&v| v as f64).sum()
+            } else {
+                x.iter().zip(&y).map(|(&a, &b)| a as f64 * b as f64).sum()
+            };
+            let got = unsafe { wukong_sreduce_f32(x.as_ptr(), y.as_ptr(), n as i64, op) };
+            let old = one_chain(&x, &y, op);
+            let e_got = (got as f64 - want).abs() / want.abs();
+            let e_old = (old as f64 - want).abs() / want.abs();
+            assert!(
+                e_got * 2.0 <= e_old,
+                "op={op}: partition rel err {e_got:.3e} is not clearly below the one-chain \
+                 {e_old:.3e} (got {got}, one-chain {old}, f64 {want})"
+            );
         }
     }
 

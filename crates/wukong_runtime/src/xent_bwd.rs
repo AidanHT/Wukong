@@ -242,9 +242,6 @@ pub unsafe extern "C" fn wukong_xent_bwd_f32(
     }
 }
 
-/// Row count below which the parallel cross-entropy backward just runs serially.
-const XENT_BWD_PAR_MIN: usize = 8;
-
 /// Multi-threaded cross-entropy backward: rows are mapped across cores, each computed by the identical
 /// per-row routine — so the result is **bit-identical to [`wukong_xent_bwd_f32`]** (rows are
 /// independent, no cross-row combine, so thread count is irrelevant and the interpreter's serial call
@@ -264,7 +261,7 @@ pub unsafe extern "C" fn wukong_xent_bwd_f32_parallel(
         return;
     }
     let (r, c) = (rows as usize, cols as usize);
-    if r < XENT_BWD_PAR_MIN {
+    if !crate::par::fork_rows(r, c, crate::par::W_TRANSCENDENTAL) {
         wukong_xent_bwd_f32(x, target, dx, rows, cols);
         return;
     }
@@ -488,7 +485,7 @@ mod tests {
     #[test]
     fn out_of_range_labels_keep_the_plain_softmax_serial_and_parallel() {
         for &cols in &[1usize, 7, 8, 9, 17, 64] {
-            let rows = 16usize; // ≥ XENT_BWD_PAR_MIN, so the parallel entry really forks
+            let rows = 16usize; // >= 2 rows: the parallel entry forks in the test build (par.rs)
             let x = fill(rows * cols);
             let mut tg = fill_targets(rows, cols);
             let bad = [-1, -100, i32::MIN, cols as i32, i32::MAX];

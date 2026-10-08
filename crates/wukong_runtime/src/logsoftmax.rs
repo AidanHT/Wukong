@@ -38,7 +38,8 @@
 //! - the **`_parallel` variant equals the serial one bit-for-bit** — rows are independent, so the
 //!   parallel entry just maps the identical per-row routine across rows (no cross-row combine, no
 //!   thread-count-dependent chunking), so the result does not depend on core count; below
-//!   `LOGSOFTMAX_PAR_MIN` rows it tail-calls the serial entry outright, same bits again.
+//!   the shared work gate (`par::fork_rows`: rows x cols x a transcendental weight) it tail-calls
+//!   the serial entry outright, same bits again.
 //!
 //! A non-positive `rows` or `cols` is a no-op at all four entries. Unlike `norm.rs`, these `_parallel`
 //! entries fork with a bare `into_par_iter()` on the **global** pool (after `ensure_global_pool()`)
@@ -61,28 +62,13 @@ fn hsum8(a: [f32; 8]) -> f32 {
 }
 
 /// Fixed-order horizontal max of 8 lane accumulators (balanced tree). It folds with `f32::max`
-/// (= `maxNum`, which *drops* a NaN), **not** the [`maxps`] semantics the 8-lane accumulation uses —
+/// (= `maxNum`, which *drops* a NaN), **not** the MAXPS semantics the 8-lane accumulation uses —
 /// safe only because it is the same function on both paths (the AVX2 body stores its `__m256` to
 /// `[f32; 8]` and calls this), so the two row maxima agree by construction on NaN rows as well as
 /// finite ones; `scalar_matches_avx2_on_nan_rows` pins that. Same shape as `norm::hmax8`.
 #[inline(always)]
 fn hmax8(a: [f32; 8]) -> f32 {
     (a[0].max(a[1]).max(a[2].max(a[3]))).max(a[4].max(a[5]).max(a[6].max(a[7])))
-}
-
-/// `_mm256_max_ps(a, b)` semantics spelled out: `a > b ? a : b`. **Not** `f32::max` (= `maxNum`),
-/// which returns the non-NaN operand — MAXPS returns its *second* source whenever the compare is
-/// unordered, so a NaN in the freshly loaded operand poisons the accumulator lane while a NaN already
-/// in the accumulator is dropped. The scalar row-max twin folds with this so it mirrors the AVX2 body
-/// bit-for-bit on NaN rows too (pinned by `scalar_matches_avx2_on_nan_rows`). Same shape as
-/// `norm::maxps` — keep the two identical.
-#[inline(always)]
-fn maxps(a: f32, b: f32) -> f32 {
-    if a > b {
-        a
-    } else {
-        b
-    }
 }
 
 // --- scalar twins (the AVX2 tail + the no-AVX2 fallback) ------------------------------------------
@@ -98,18 +84,9 @@ fn maxps(a: f32, b: f32) -> f32 {
 unsafe fn lse_off_scalar(x: *const f32, n: usize) -> f32 {
     let nb = n / 8;
     let t = nb * 8;
-    // 1) row max — lane j folds elements ≡ j (mod 8), tail into lanes 0.. (identical to softmax).
-    let mut mx = [f32::NEG_INFINITY; 8];
-    for s in 0..nb {
-        let b = s * 8;
-        for (j, mxj) in mx.iter_mut().enumerate() {
-            *mxj = maxps(*mxj, *x.add(b + j));
-        }
-    }
-    for (j, mxj) in mx.iter_mut().enumerate().take(n - t) {
-        *mxj = mxj.max(*x.add(t + j));
-    }
-    let m = hmax8(mx);
+    // 1) row max — `norm.rs`'s own 8-chain MAXPS pass (the same function, not a copy), so `m` is the
+    //    `NORM_LOGSOFTMAX` row max by construction.
+    let m = hmax8(crate::norm::rowmax8_scalar(x, n));
     // 2) s = Σ exp(x − m) — same lane structure as softmax's sum, same `exp1` per element.
     let mut sm = [0.0f32; 8];
     for s in 0..nb {
@@ -149,9 +126,10 @@ unsafe fn logsumexp_row_scalar(x: *const f32, out: *mut f32, n: usize) {
 
 // --- AVX2 kernels (mirror the scalar twins lane-for-lane on finite inputs) -------------------------
 
-/// `off = m + log(Σ exp(x_i − m))` for one row, AVX2/FMA. The max and Σexp passes are byte-identical
-/// to `norm.rs`'s `softmax_row_avx2` accumulation (8-wide `_mm256_max_ps` / `exp8` body + an `exp1`
-/// scalar tail folded into the same lanes), then store to `[f32; 8]` and call the same `hmax8`/`hsum8`
+/// `off = m + log(Σ exp(x_i − m))` for one row, AVX2/FMA. The max pass IS `norm.rs`'s
+/// (`rowmax8_avx2`, eight MAXPS chains) and the Σexp pass is byte-identical to `softmax_row_avx2`'s
+/// accumulation (8-wide `exp8` body + an `exp1` scalar tail folded into the same lanes); both end by
+/// storing to `[f32; 8]` and calling the same `hmax8`/`hsum8`
 /// — so `m`, `s`, and `off` match the scalar twin bit-for-bit; the only transcendental beyond `exp` is
 /// one scalar `log1` on the same sum bits.
 ///
@@ -161,23 +139,12 @@ unsafe fn logsumexp_row_scalar(x: *const f32, out: *mut f32, n: usize) {
 #[target_feature(enable = "avx2,fma")]
 unsafe fn lse_off_avx2(x: *const f32, n: usize) -> f32 {
     use std::arch::x86_64::*;
-    // 1) max — identical to softmax_row_avx2.
-    let mut mxv = _mm256_set1_ps(f32::NEG_INFINITY);
-    let mut i = 0;
-    while i + 8 <= n {
-        mxv = _mm256_max_ps(mxv, _mm256_loadu_ps(x.add(i)));
-        i += 8;
-    }
-    let mut mx = [0.0f32; 8];
-    _mm256_storeu_ps(mx.as_mut_ptr(), mxv);
-    for (j, mxj) in mx.iter_mut().enumerate().take(n - i) {
-        *mxj = mxj.max(*x.add(i + j));
-    }
-    let m = hmax8(mx);
+    // 1) max — the shared `norm.rs` 8-chain pass, identical to softmax_row_avx2's.
+    let m = hmax8(crate::norm::rowmax8_avx2(x, n));
     let mb = _mm256_set1_ps(m);
     // 2) s = Σ exp(x − m) — exp8 lanes + exp1 tail, identical to softmax's accumulation, no out store.
     let mut sv = _mm256_setzero_ps();
-    i = 0;
+    let mut i = 0;
     while i + 8 <= n {
         sv = _mm256_add_ps(sv, exp8(_mm256_sub_ps(_mm256_loadu_ps(x.add(i)), mb)));
         i += 8;
@@ -258,10 +225,6 @@ unsafe fn logsumexp_row(x: *const f32, out: *mut f32, n: usize) {
 
 // --- C-ABI entry points ---------------------------------------------------------------------------
 
-/// Row count below which the parallel variants just run serially (rayon's per-row overhead isn't worth
-/// it for a handful of rows).
-const LOGSOFTMAX_PAR_MIN: usize = 8;
-
 /// Batched **log-softmax** over a `[rows, cols]` row-major matrix (serial): for each row,
 /// `out[r,i] = x[r,i] − m_r − log(Σ_i exp(x[r,i] − m_r))`. `x`/`out` may alias (in-place); each row's
 /// reductions read `x` before that row's `out` is written.
@@ -305,7 +268,7 @@ pub unsafe extern "C" fn wukong_logsoftmax_f32_parallel(
         return;
     }
     let (r, c) = (rows as usize, cols as usize);
-    if r < LOGSOFTMAX_PAR_MIN {
+    if !crate::par::fork_rows(r, c, crate::par::W_TRANSCENDENTAL) {
         wukong_logsoftmax_f32(x, out, rows, cols);
         return;
     }
@@ -358,7 +321,7 @@ pub unsafe extern "C" fn wukong_logsumexp_f32_parallel(
         return;
     }
     let (r, c) = (rows as usize, cols as usize);
-    if r < LOGSOFTMAX_PAR_MIN {
+    if !crate::par::fork_rows(r, c, crate::par::W_TRANSCENDENTAL) {
         wukong_logsumexp_f32(x, out, rows, cols);
         return;
     }
@@ -384,7 +347,7 @@ pub unsafe extern "C" fn wukong_logsumexp_f32_parallel(
 mod tests {
     use super::*;
 
-    const EPS_PAR: usize = LOGSOFTMAX_PAR_MIN;
+    const EPS_PAR: usize = 8; // the old row gate; the test build forks every shape with >= 2 rows
 
     // Deterministic, mildly varied input (no RNG — reproducible). `sin`/`cos` of the index, scaled and
     // shifted, so values span a useful range (incl. negatives) without being trivially uniform.

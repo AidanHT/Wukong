@@ -12,8 +12,8 @@
 //!  2. **Fused activation.** The common form is `act(x + bias)` (a Linear's bias-add immediately
 //!     followed by ReLU/GELU/SiLU). The activation folds an `exp`/`erf` C/Rust keep scalar, so the
 //!     fused 256-bit pass wins like the `vmath` activation dispatch — and reuses the *exact* `vmath`
-//!     activation ([`crate::vmath::apply1`] scalar / [`crate::vmath::vmath8_for`] vector), so the fused
-//!     result is bit-for-bit `wukong_vmath_f32(x + b)`.
+//!     activation ([`crate::vmath::apply1`] scalar / the 8-lane kernel [`crate::vmath::with_act8`]
+//!     inlines into this kernel's loop), so the fused result is bit-for-bit `wukong_vmath_f32(x + b)`.
 //!
 //! Determinism / twin contract: the AVX2 lanes and the scalar tail/fallback share the exact same
 //! per-element sequence (`x + b[j]`, one IEEE add, then the shared activation lane), so every lane of
@@ -61,6 +61,19 @@ unsafe fn bias_scalar(
     }
 }
 
+/// AVX2 dispatcher: the op is resolved **once**, here, and the row loop [`bias_avx2_loop`] is
+/// instantiated with the activation as a generic callable — through [`crate::vmath::with_act8`] for a
+/// `VM_*` code (one instantiation per kernel, polynomial inlined), or with the identity for
+/// [`BIAS_ACT_NONE`] / an unrecognized op (the sum unmodified, matching `apply1`'s identity). The
+/// identity instantiation is gcc's own tight load→add→store loop.
+///
+/// It used to hand the loop a `vmath8_for` function pointer, and the shipped binary called it once
+/// per vector — `vmovaps %ymm0,0x80(%rsp)` / `vzeroupper` / `call *%r15` / reload, on each of the four
+/// unrolled chains, with the polynomial's constants rematerialized inside the callee every time
+/// (P9.3, disassembled from the release build). The ×4 unroll could not overlap four opaque calls.
+///
+/// # Safety
+/// `x`/`out` valid for `rows*cols` f32, `b` for `cols`; AVX2+FMA available.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn bias_avx2(
@@ -71,12 +84,54 @@ unsafe fn bias_avx2(
     cols: usize,
     op: i64,
 ) {
+    struct Body {
+        x: *const f32,
+        b: *const f32,
+        out: *mut f32,
+        rows: usize,
+        cols: usize,
+        op: i64,
+    }
+    impl crate::vmath::Act8Body for Body {
+        unsafe fn run<F: Fn(std::arch::x86_64::__m256) -> std::arch::x86_64::__m256>(self, f: F) {
+            // SAFETY: the dispatcher's contract — buffers valid, AVX2+FMA checked.
+            unsafe { bias_avx2_loop(self.x, self.b, self.out, self.rows, self.cols, self.op, f) }
+        }
+    }
+    let body = Body {
+        x,
+        b,
+        out,
+        rows,
+        cols,
+        op,
+    };
+    if !crate::vmath::with_act8(op, body) {
+        bias_avx2_loop(x, b, out, rows, cols, op, |v| v);
+    }
+}
+
+/// The broadcast-bias row loop for one activation `act` (the identity for a pure add): `out[i, j] =
+/// act(x[i, j] + b[j])`, ×4-unrolled — four independent load→add→act chains with no branch, hiding
+/// the load/add latency the way gcc's unrolled auto-vectorization of this nest does, and now also
+/// four independent *inlined* polynomial chains — with the non-temporal store regime and a scalar
+/// tail on the identical per-element op ([`bias1`]).
+///
+/// # Safety
+/// `x`/`out` valid for `rows*cols` f32, `b` for `cols`; AVX2+FMA available; `act` an avx2+fma lane
+/// op equal lane-for-lane to `apply1(op, ·)`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn bias_avx2_loop<F: Fn(std::arch::x86_64::__m256) -> std::arch::x86_64::__m256>(
+    x: *const f32,
+    b: *const f32,
+    out: *mut f32,
+    rows: usize,
+    cols: usize,
+    op: i64,
+    act: F,
+) {
     use std::arch::x86_64::*;
-    // The 8-lane activation (or `None` for identity / an unrecognized op → the sum unmodified). Resolved
-    // once here and dispatched on **once** (the `match` below), so the hot loop carries no per-block
-    // branch — the identity bias-add compiles to gcc's own tight load→add→store loop, and the activation
-    // path folds `f` inline. `vmath8_for` is the vector twin of `apply1`, so lanes == the scalar tail.
-    let act8 = crate::vmath::vmath8_for(op);
     let nt = use_nt(rows.saturating_mul(cols));
     let addv = |xr: *const f32, j: usize| {
         _mm256_add_ps(_mm256_loadu_ps(xr.add(j)), _mm256_loadu_ps(b.add(j)))
@@ -91,56 +146,44 @@ unsafe fn bias_avx2(
             }
         };
     }
-    // The per-row loop, parameterized by `$mk(xr, j)` → the 8-lane result at column `j`. Instantiated
-    // once per activation branch (below), so `$mk` is a fixed inlined expression — the ×4 unroll then
-    // runs four independent load→add(→act) chains with no branch, hiding the load/add latency the way
-    // gcc's unrolled auto-vectorization of this (fully inner-unit-stride) nest does.
-    macro_rules! run {
-        ($mk:expr) => {
-            for i in 0..rows {
-                let xr = x.add(i * cols);
-                let outr = out.add(i * cols);
-                let mut j = 0usize;
-                // Peel a scalar prologue until this row's `out` is 32-byte aligned (vmovntps faults on a
-                // misaligned address); regular stores don't need it.
-                if nt {
-                    while j < cols && (outr.add(j) as usize) & 31 != 0 {
-                        *outr.add(j) = bias1(op, *xr.add(j), *b.add(j));
-                        j += 1;
-                    }
-                }
-                while j + 32 <= cols {
-                    if nt {
-                        // `wrapping_add`, not `add`: the target is deliberately past the end of `x`
-                        // on the final rows (see `PF_AHEAD`), which `add`'s in-bounds precondition
-                        // forbids. A prefetch of an unmapped address is architecturally a no-op.
-                        _mm_prefetch(xr.wrapping_add(j + PF_AHEAD) as *const i8, _MM_HINT_T0);
-                    }
-                    let r0 = $mk(xr, j);
-                    let r1 = $mk(xr, j + 8);
-                    let r2 = $mk(xr, j + 16);
-                    let r3 = $mk(xr, j + 24);
-                    store!(outr.add(j), r0);
-                    store!(outr.add(j + 8), r1);
-                    store!(outr.add(j + 16), r2);
-                    store!(outr.add(j + 24), r3);
-                    j += 32;
-                }
-                while j + 8 <= cols {
-                    store!(outr.add(j), $mk(xr, j));
-                    j += 8;
-                }
-                // Scalar tail (`cols` not a multiple of 8) — the identical per-element op as the lanes.
-                while j < cols {
-                    *outr.add(j) = bias1(op, *xr.add(j), *b.add(j));
-                    j += 1;
-                }
+    for i in 0..rows {
+        let xr = x.add(i * cols);
+        let outr = out.add(i * cols);
+        let mut j = 0usize;
+        // Peel a scalar prologue until this row's `out` is 32-byte aligned (vmovntps faults on a
+        // misaligned address); regular stores don't need it.
+        if nt {
+            while j < cols && (outr.add(j) as usize) & 31 != 0 {
+                *outr.add(j) = bias1(op, *xr.add(j), *b.add(j));
+                j += 1;
             }
-        };
-    }
-    match act8 {
-        None => run!(&addv),
-        Some(f) => run!(|xr, j| f(addv(xr, j))),
+        }
+        while j + 32 <= cols {
+            if nt {
+                // `wrapping_add`, not `add`: the target is deliberately past the end of `x` on the
+                // final rows (see `PF_AHEAD`), which `add`'s in-bounds precondition forbids. A
+                // prefetch of an unmapped address is architecturally a no-op.
+                _mm_prefetch(xr.wrapping_add(j + PF_AHEAD) as *const i8, _MM_HINT_T0);
+            }
+            let r0 = act(addv(xr, j));
+            let r1 = act(addv(xr, j + 8));
+            let r2 = act(addv(xr, j + 16));
+            let r3 = act(addv(xr, j + 24));
+            store!(outr.add(j), r0);
+            store!(outr.add(j + 8), r1);
+            store!(outr.add(j + 16), r2);
+            store!(outr.add(j + 24), r3);
+            j += 32;
+        }
+        while j + 8 <= cols {
+            store!(outr.add(j), act(addv(xr, j)));
+            j += 8;
+        }
+        // Scalar tail (`cols` not a multiple of 8) — the identical per-element op as the lanes.
+        while j < cols {
+            *outr.add(j) = bias1(op, *xr.add(j), *b.add(j));
+            j += 1;
+        }
     }
     if nt {
         _mm_sfence(); // non-temporal stores are weakly ordered; fence before the buffer is read back.
@@ -374,6 +417,49 @@ mod tests {
                         "op {op} rows {rows} cols {cols} k {k}"
                     );
                 }
+            }
+        }
+    }
+
+    /// Every activation code now runs its OWN monomorphized instantiation of the row loop (the
+    /// kernel is inlined through `vmath::with_act8` instead of called through a pointer), so each
+    /// instantiation has to be exercised on its own: all `VM_*` codes, the `BIAS_ACT_NONE` identity
+    /// and an off-table code, AVX2 lanes vs the scalar twin bit-for-bit, on a row that hits the ×4
+    /// body, the 8-wide remainder and the scalar tail (45 = 32 + 8 + 5). Mixed-sign sums put the
+    /// domain-restricted ops (log, acosh, atanh, asin, ...) on both sides of their domain edge, where
+    /// the lanes must still reproduce the scalar NaN bits.
+    #[test]
+    fn every_activation_instantiation_matches_the_scalar_twin() {
+        use crate::vmath::VM_CBRT;
+        let (rows, cols) = (5usize, 45usize);
+        let n = rows * cols;
+        let x: Vec<f32> = (0..n)
+            .map(|i| (i as f32 - (n / 2) as f32) * 0.027)
+            .collect();
+        let b: Vec<f32> = (0..cols).map(|j| (j % 9) as f32 * 0.11 - 0.4).collect();
+        let ops: Vec<i64> = (0..=VM_CBRT).chain([BIAS_ACT_NONE, VM_CBRT + 1]).collect();
+        for &op in &ops {
+            let mut got = vec![0.0f32; n];
+            let mut want = vec![0.0f32; n];
+            unsafe {
+                wukong_bias_bcast_f32(
+                    x.as_ptr(),
+                    b.as_ptr(),
+                    got.as_mut_ptr(),
+                    rows as i64,
+                    cols as i64,
+                    op,
+                );
+                bias_scalar(x.as_ptr(), b.as_ptr(), want.as_mut_ptr(), rows, cols, op);
+            }
+            for k in 0..n {
+                assert_eq!(
+                    got[k].to_bits(),
+                    want[k].to_bits(),
+                    "op {op} k {k}: {} vs {}",
+                    got[k],
+                    want[k]
+                );
             }
         }
     }

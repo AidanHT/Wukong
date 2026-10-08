@@ -1,0 +1,92 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 500
+// EXPECT-OUT: 666
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1
+// EXPECT-OUT: 0
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 500
+// EXPECT-OUT: 666
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1
+// EXPECT-OUT: 0
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+module tests.run.hardsigmoid_nan
+
+// NaN in, NaN out for `hardsigmoid` (P9.7). Its clamp `min(max(x + 3, 0), 6)` is built from ordered
+// compares, which are false on a NaN, so a NaN used to come back as the bound: hardsigmoid(NaN) was
+// 0 and every NaN lane below printed 0 — a diverged activation silently turned into a plausible
+// value. PyTorch returns NaN, and so does every other Wukong math intrinsic. Each spelling is
+// checked: the scalar intrinsic, the dispatched `wukong_vmath_f32` loop (`hs_kernel`), and the
+// inlined, auto-vectorized loop (`@generic` `hs_inline`), lanes 0..7 and the scalar tail lane 8.
+//
+// Printed: -1 for a NaN, otherwise (v * 1000) as i32. Finite values by hand, with 1/6 rounded to
+// f32 (0.16666667163...):
+//   hardsigmoid(-4) = clamp(-1, 0, 6)/6 = 0                     ->    0
+//   hardsigmoid(0)  = 3 * (1/6) = 0.5000000149 -> f32 0.5       ->  500
+//   hardsigmoid(1)  = 4 * (1/6) = 0.6666666865 -> f32 0.6666667 ->  666
+//   hardsigmoid(4)  = clamp(7, 0, 6)/6 = 6 * (1/6) -> f32 1.0   -> 1000
+//   hardswish(NaN)  = NaN * hardsigmoid(NaN) = NaN              ->   -1
+
+fn show(v: f32) {
+    if v != v {
+        print(-1);
+    } else {
+        print((v * 1000.0) as i32);
+    }
+}
+
+fn hs_kernel(x: [f32; 9], mut out: [f32; 9]) {
+    for i in 0..9 {
+        out[i] = hardsigmoid(x[i]);
+    }
+}
+
+@generic
+fn hs_inline(x: [f32; 9], mut out: [f32; 9]) {
+    for i in 0..9 {
+        out[i] = hardsigmoid(x[i]);
+    }
+}
+
+fn main() -> i32 {
+    let big: f32 = 1.0e30;
+    let inf: f32 = big * big;
+    let nan: f32 = inf - inf;
+
+    show(hardsigmoid(nan)); // -1
+    show(hardswish(nan)); // -1
+
+    let mut x: [f32; 9] = [0.0; 9];
+    x[0] = nan;
+    x[1] = -4.0;
+    x[2] = 0.0;
+    x[3] = 1.0;
+    x[4] = 4.0;
+    x[5] = nan;
+    x[6] = -4.0;
+    x[7] = nan;
+    x[8] = nan; // the scalar tail
+
+    let mut k: [f32; 9] = [0.0; 9];
+    hs_kernel(x, k);
+    for i in 0..9 {
+        show(k[i]); // -1 0 500 666 1000 -1 0 -1 -1
+    }
+
+    let mut g: [f32; 9] = [0.0; 9];
+    hs_inline(x, g);
+    for i in 0..9 {
+        show(g[i]); // -1 0 500 666 1000 -1 0 -1 -1
+    }
+    return 0;
+}

@@ -143,10 +143,6 @@ pub unsafe extern "C" fn wukong_entropy_f32(p: *const f32, out: *mut f32, rows: 
     }
 }
 
-/// Row count below which the parallel variant just runs serially (rayon's per-row overhead isn't worth
-/// it for a handful of rows).
-const ENTROPY_PAR_MIN: usize = 8;
-
 /// Multicore **Shannon entropy** — **bit-identical** to [`wukong_entropy_f32`]. Rows are independent,
 /// so each is computed by the same per-row routine regardless of which thread runs it; there is no
 /// cross-row combine, so the result does not depend on thread count and the interpreter's serial call
@@ -165,7 +161,7 @@ pub unsafe extern "C" fn wukong_entropy_f32_parallel(
         return;
     }
     let (r, c) = (rows as usize, cols as usize);
-    if r < ENTROPY_PAR_MIN {
+    if !crate::par::fork_rows(r, c, crate::par::W_TRANSCENDENTAL) {
         wukong_entropy_f32(p, out, rows, cols);
         return;
     }
@@ -267,9 +263,9 @@ mod tests {
     #[test]
     fn serial_matches_parallel_bit_for_bit() {
         for &(rows, cols) in &[
-            (ENTROPY_PAR_MIN, 1usize),
-            (ENTROPY_PAR_MIN, 7),
-            (ENTROPY_PAR_MIN, 8),
+            (8, 1usize),
+            (8, 7),
+            (8, 8),
             (17, 33),
             (40, 100),
             (64, 257),

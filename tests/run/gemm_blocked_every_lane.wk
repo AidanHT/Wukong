@@ -1,0 +1,155 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT-VALUES: 87 152 -214 -160 199 -172 -169 -91 177 83 133 -156 113 296 -113 -263 -16
+// EXPECT-OUT-VALUES: -128 47 -261 6 -3 -127 140 -398 -108 -25 -80 141 -75 215 160 36 4
+// EXPECT-OUT-VALUES: -71 10 185 155 -103 -14 -61 9 -172 -167 47 -174 366 -104 -43 -141 177
+// EXPECT-OUT-VALUES: -48 177 2 -274 154 -71 -75 -111 189 -3 72 -115 195 36 -178 -148 -58
+// EXPECT-OUT-VALUES: 145 123 -96 -6 71 -26 -21 -282 -96 8 -39 131 58 -28 -58 83 234
+// EXPECT-OUT-VALUES: -308 1 -160 -78 -29 -151 16 -11 44 -49 -14 241 -181 146 164 -196 101
+// EXPECT-OUT-VALUES: 38 49 -190 -150 -61 -38 -219 -29 371 -123 -108 -159 -46 116 97 35 -185
+// EXPECT-OUT-VALUES: 17 18 -283 -35 -181 -307 24 99 -174 -82 -430 -298 107 49 80 -99 -5
+// EXPECT-OUT-VALUES: -187 -141 206 -204 262 109 -226 -329 -62 -276 18 314 -170 107 -120 -184 1157
+// EXPECT-OUT-VALUES: -258 -167 11 -69 306 354 -362 136 31 -33 105 -176 -48 -63 -244 -269 115
+// EXPECT-OUT-VALUES: -519 73 -51 351 198 -142 -232 411 200 -37 781 -704 131 -233 -140 -50 175
+// EXPECT-OUT-VALUES: 151 294 -151 -103 185 -391 -83 97 103 73 260 250 158 53 211 -173 235
+// EXPECT-OUT-VALUES: 270 59 110 32 -37 -51 427 201 -108 -178 -147 -107 -81 92 182 350 -370
+// EXPECT-OUT-VALUES: -200 -271 181 167 -658 213 158 -18 -338 141 453 -46 -206 226 77 -400 336
+// EXPECT-OUT-VALUES: -65 58 160 -82 111 17 -98 203 -68 58 11 76 -127 -9 -64 -235 29
+// EXPECT-OUT-VALUES: 7 70 56 22 63 -87 -86 9 -49 6 -130 -1 51 -88 76 -236 21
+// EXPECT-OUT-VALUES: 207 -157 -769 119 -96 -236 155 -253 22 -198 75 -261 143 52 -40 152 -18
+// EXPECT-OUT-VALUES: 301 144 -300 14 -54 -105 -25 -232 15 70 -219 -54 71 -148 30 -345 -114
+// EXPECT-OUT-VALUES: 29 -158 -409 -59 -58 -292 37 -97 47 -139 67 -95 173 92 -91 -167 -98
+// EXPECT-OUT-VALUES: -24 94 373 -61 -30 48 -36 22 222 241 -16 97 124 -125 91 88 56
+// EXPECT-OUT-VALUES: 90 68 -47 125 -100 57 -88 -174 46 40 -78 15 15 -97 173 -87 -3
+module tests.run.gemm_blocked_every_lane
+
+// The three recognized f32 GEMM forms at a shape that crosses the kernel's K BLOCKING, printing every
+// lane. P3.9 of the 2026-09 SOTA sweep: before this fixture every GEMM/linear program in tests/run had
+// K <= ~15 and M, N below one 6x16 register tile, so the whole corpus never executed the K-block
+// accumulation (the `beta_eff = 1` C readback between blocks), a full 6x16 microkernel tile, or the
+// packers' vector paths — the regime every benchmark measures.
+//
+// Shape: M = 7, K = 805, N = 17 for each of
+//   * NN  `C = A.B`    (`matmul`, dispatched to `wukong_sgemm`),
+//   * NT  `C = A.Bt`   (`linear`, dispatched to `wukong_sgemm_nt`),
+//   * TN  `C = At.B`   (the nest in `main`, dispatched to `wukong_sgemm_tn`, A stored [K, M]).
+// K = 805 = 2*KC + 37 with KC = 384, so `select_kc(805) = 272` splits every dot into THREE K-blocks
+// (272 + 272 + 261) and C is read back and accumulated twice. M = 7 = one full 6-row panel plus a
+// 1-row edge, N = 17 = one full 16-column panel plus a 1-column edge, so each call runs a full 6x16
+// tile, a row-edge tile, a column-edge tile and a 1x1 corner — the full-tile vector writeback, the
+// row-trimmed K loop and the masked edge writeback. The TN form exercises the transposed-A packer
+// (A packed straight from its [K, M] storage). The packed A panels are long enough (272 steps) for
+// the 8-step vector A packer, and the NT B panel for the 8x8 transposing B packer.
+//
+// RECOGNIZED KERNELS ARE GATE-BLIND: interp and native call the same `wukong_sgemm*` symbols at every
+// -O level, so `native_matches_interpreter` and both invariance gates are blind to a wrong kernel. The
+// EXPECT-OUT block is the whole proof, and it is the whole output: 3 x 119 lanes, row-major, NN then
+// NT then TN.
+//
+// PROOF THE RECOGNIZERS FIRE (by hand after touching a recognizer or the kernel; no gate can):
+//     cargo run -q -p wukongc -- --emit=mir -O2 tests/run/gemm_blocked_every_lane.wk | grep wukong_
+// prints one `call wukong_sgemm`, one `call wukong_sgemm_nt` and one `call wukong_sgemm_tn`.
+//
+// WHERE THE EXPECTED VALUES COME FROM. The scalar semantics of the three nests, evaluated in exact
+// integer arithmetic by an independent reference (never recorded from compiler output):
+//     NN  a[i,k] = ((3i^2 + 7k + 4ik + 3) mod 17) - 8      b[k,j] = ((2j^2 + 5k + 7jk + 11) mod 23) - 11
+//     NT  x[i,k] = ((5i^2 + 3k + 2ik + 1) mod 19) - 9      w[j,k] = ((3j^2 + k + jk + 5) mod 23) - 11
+//     TN  a[k,i] = ((i^2 + 5k + 3ik + 2) mod 13) - 6       b[k,j] = ((5j^2 + k + jk + 4) mod 19) - 9
+//     c[i,j] = sum over k in 0..805 of the products.
+// Every operand is an integer in [-11, 11] and every partial sum is bounded by 805*11*11 < 2^24, so
+// f32 is EXACT under any order the kernel accumulates in: the expected values do not depend on the
+// blocking, and any value that moves is a kernel defect, not rounding. Every modulus is prime and
+// every k-coefficient is nonzero modulo it for every row/column used, so no operand row or column is
+// constant in k (a constant row against a column that sums to zero over 805 = 35*23 steps would print
+// a row of exact zeros that no defect can move). Dropping any one of the three K-blocks changes at
+// least 118 of the 119 lanes of every case, misaligning A against B by one contraction step
+// changes at least 113, there is no zero lane, and both signs appear in every case (103-113
+// distinct values per case).
+fn matmul(a: Tensor[f32, 7, 805], b: Tensor[f32, 805, 17], mut c: Tensor[f32, 7, 17]) {
+    for i in 0..7 {
+        for j in 0..17 {
+            let mut s: f32 = 0.0;
+            for k in 0..805 {
+                s = s + a[i, k] * b[k, j];
+            }
+            c[i, j] = s;
+        }
+    }
+}
+
+fn linear(x: Tensor[f32, 7, 805], w: Tensor[f32, 17, 805], mut y: Tensor[f32, 7, 17]) {
+    for i in 0..7 {
+        for j in 0..17 {
+            let mut s: f32 = 0.0;
+            for k in 0..805 {
+                s = s + x[i, k] * w[j, k];
+            }
+            y[i, j] = s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    // One [7 x 805] and one [805 x 17] buffer, refilled for each case (all three operand pairs have
+    // these element counts), and one 7 x 17 output.
+    let mut abuf: [f32; 5635] = [0.0; 5635];
+    let mut bbuf: [f32; 13685] = [0.0; 13685];
+    let mut c: [f32; 119] = [0.0; 119];
+
+    // NN: a is [M, K], b is [K, N].
+    for i in 0..7 {
+        for k in 0..805 {
+            abuf[i * 805 + k] = (((3 * i * i + 7 * k + 4 * i * k + 3) % 17 - 8) as f32);
+        }
+    }
+    for k in 0..805 {
+        for j in 0..17 {
+            bbuf[k * 17 + j] = (((2 * j * j + 5 * k + 7 * j * k + 11) % 23 - 11) as f32);
+        }
+    }
+    matmul(abuf, bbuf, c);
+    for t in 0..119 {
+        print(c[t] as i32);
+    }
+
+    // NT: x is [M, K], w is [N, K].
+    for i in 0..7 {
+        for k in 0..805 {
+            abuf[i * 805 + k] = (((5 * i * i + 3 * k + 2 * i * k + 1) % 19 - 9) as f32);
+        }
+    }
+    for j in 0..17 {
+        for k in 0..805 {
+            bbuf[j * 805 + k] = (((3 * j * j + k + j * k + 5) % 23 - 11) as f32);
+        }
+    }
+    linear(abuf, bbuf, c);
+    for t in 0..119 {
+        print(c[t] as i32);
+    }
+
+    // TN: A stored [K, M] (the weight-gradient layout), B stored [K, N].
+    for k in 0..805 {
+        for i in 0..7 {
+            abuf[k * 7 + i] = (((i * i + 5 * k + 3 * i * k + 2) % 13 - 6) as f32);
+        }
+    }
+    for k in 0..805 {
+        for j in 0..17 {
+            bbuf[k * 17 + j] = (((5 * j * j + k + j * k + 4) % 19 - 9) as f32);
+        }
+    }
+    for i in 0..7 {
+        for j in 0..17 {
+            let mut s: f32 = 0.0;
+            for k in 0..805 {
+                s = s + abuf[k * 7 + i] * bbuf[k * 17 + j];
+            }
+            c[i * 17 + j] = s;
+        }
+    }
+    for t in 0..119 {
+        print(c[t] as i32);
+    }
+    return 0;
+}

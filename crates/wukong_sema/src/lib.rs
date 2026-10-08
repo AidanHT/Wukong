@@ -24,6 +24,7 @@
 //! and `const` is registered.
 
 mod attrs;
+pub use attrs::{parallel_grain, MAX_PARALLEL_GRAIN};
 mod dependency;
 mod layout;
 mod noalias;
@@ -40,6 +41,11 @@ use wukong_diag::Diagnostic;
 use wukong_span::{Interner, Span, Symbol};
 use wukong_types::{Dim, Layout, Scalar, Shape, Ty};
 
+// The ML builtins (see `ml_builtins.rs`): typed there, and the name table re-exported so
+// `wukong_mir_build` lowers exactly the set sema types.
+mod ml_builtins;
+pub use ml_builtins::{io_dtype, io_dtype_code, ml_builtin, ml_builtin_is_pure, MlBuiltin};
+
 /// The element scalar of a typed heap-allocation builtin (`alloc_f32` → `F32`), or `None` for any
 /// other name. The v1 heap surface is this per-scalar `alloc_<T>(n) -> []T` family plus `free(s)`
 /// (not a generic `alloc<T>`): sema types builtins nominally in one place, and `mir_build` — which
@@ -55,12 +61,19 @@ pub fn heap_alloc_elem(name: &str) -> Option<Scalar> {
         "alloc_u8" => Scalar::U8,
         "alloc_f16" => Scalar::F16,
         "alloc_bf16" => Scalar::Bf16,
+        // The remaining fixed-width integers, so every element type the typed file-I/O family
+        // moves (`read_u16`, `st_read_u32`, …) has a heap buffer to land in.
+        "alloc_i16" => Scalar::I16,
+        "alloc_u16" => Scalar::U16,
+        "alloc_u32" => Scalar::U32,
+        "alloc_u64" => Scalar::U64,
         _ => return None,
     })
 }
 
 /// The element scalar of a scratch-allocation builtin (`scratch_f32` → `F32`), or `None` for any
-/// other name — the temporary-storage twin of [`heap_alloc_elem`], over the same element types.
+/// other name — the temporary-storage twin of [`heap_alloc_elem`], over its original eight element
+/// types (the `i16`/`u16`/`u32`/`u64` heap allocators added for typed file I/O have no scratch twin).
 /// `scratch_<T>(n) -> []T` hands out `n` zeroed, 64-byte-aligned elements from the running
 /// thread's scratch arena; [`is_scratch_mark`] / [`is_scratch_release`] name the two builtins that
 /// scope them (see `wukong_runtime::scratch` for the contract). A user-defined function of the same
@@ -89,23 +102,17 @@ pub fn is_scratch_release(name: &str) -> bool {
     name == "scratch_release"
 }
 
-/// The buffer-element scalar of a file-I/O intrinsic (`read_f32`/`write_f32` → `F32`), or `None`
-/// for any other name. The file-I/O surface is the per-scalar `read_<T>(path, buf) -> i64` /
-/// `write_<T>(path, buf) -> i64` family over the dtypes {f32, f64, i32, i64, i8, u8}: sema types
-/// these builtins nominally in one place (like [`heap_alloc_elem`]), validating that `path` is a
-/// `*u8` and `buf` is a `[]T` slice of this element type. `mir_build` shares the same table to
-/// select the runtime symbol and element byte size. A user-defined function of the same name
-/// shadows the builtin (checked before the builtin path).
+/// The buffer-element scalar of a file-I/O intrinsic (`read_f32`/`write_f32`/`read_bf16_at` →
+/// `F32`/`F32`/`Bf16`), or `None` for any other name. The file-I/O surface is the per-scalar
+/// `read_<T>(path, buf) -> i64` / `write_<T>(path, buf) -> i64` / `read_<T>_at(path, byte_off, buf)
+/// -> i64` family over the twelve fixed-width numeric dtypes ([`io_dtype`]); the whole family, with
+/// its typing rules, lives in `ml_builtins.rs` and [`ml_builtin`] is its one name table. A
+/// user-defined function of the same name shadows the builtin (checked before the builtin path).
 pub fn file_io_elem(name: &str) -> Option<Scalar> {
-    Some(match name {
-        "read_f32" | "write_f32" => Scalar::F32,
-        "read_f64" | "write_f64" => Scalar::F64,
-        "read_i32" | "write_i32" => Scalar::I32,
-        "read_i64" | "write_i64" => Scalar::I64,
-        "read_i8" | "write_i8" => Scalar::I8,
-        "read_u8" | "write_u8" => Scalar::U8,
-        _ => return None,
-    })
+    match ml_builtin(name)? {
+        MlBuiltin::Read(s) | MlBuiltin::Write(s) | MlBuiltin::ReadAt(s) => Some(s),
+        _ => None,
+    }
 }
 
 /// Whether `name` is the `now_ns()` timing intrinsic: a zero-argument call returning a monotonic

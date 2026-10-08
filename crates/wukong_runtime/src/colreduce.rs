@@ -507,14 +507,11 @@ unsafe fn colreduce_range(
     colreduce_scalar(x, out, rows, cols, j0, j1, kind);
 }
 
-/// Column count below which the parallel reduction just runs serially.
-const COLREDUCE_PAR_MIN: usize = 256;
-
 /// Multi-threaded `out[j] = ⊕_i x[i, j]`: the **columns** are split into disjoint stripes across cores
 /// (each core folds its column range over all rows). Each stripe writes a disjoint slice of `out`, and
 /// every column is folded in the same i-ascending order regardless of the split — so the result is
 /// **bit-identical to the serial kernel** the interpreter marshals (no cross-stripe combine). Below
-/// `COLREDUCE_PAR_MIN` columns it runs serial.
+/// the shared work gate (`par::fork_units`, rows x cols) it runs serial.
 ///
 /// # Safety
 /// `x` valid for `rows*cols`, `out` for `cols` f32, non-overlapping.
@@ -524,7 +521,8 @@ unsafe fn colreduce_parallel(x: *const f32, out: *mut f32, rows: i64, cols: i64,
         return;
     }
     let (r, c) = (rows as usize, cols as usize);
-    if c < COLREDUCE_PAR_MIN {
+    // Work gate on rows x cols (units = 32-column stripes) + width-1 fast path; see `par`.
+    if !crate::par::fork_units(c.div_ceil(32), r.saturating_mul(c)) {
         colreduce_range(x, out, r, c, 0, c, kind);
         return;
     }
@@ -924,7 +922,7 @@ mod tests {
             (33, 17),
             (64, 100),
             (128, 257),
-            (50, 1000), // > COLREDUCE_PAR_MIN so the multicore stripes run
+            (50, 1000), // many 32-column stripes, so the multicore stripes run
         ] {
             // Distinct values per cell so max/min have a unique answer; an exact integer range so a
             // reordering (if any path had one) would show as a bit mismatch.

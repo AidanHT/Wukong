@@ -1,0 +1,107 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+module tests.run.fp_contract_rules
+
+// The default (`--fp=fast`) FMA-contraction rule, every clause of it, as the language guide's
+// "Floating-point semantics" section states it. Nothing here is a recorded compiler output: each
+// value follows from IEEE-754 single precision by hand.
+//
+// Inputs, all exact in f32:
+//   x = -(1 + 2^-11),  y = z = 1 + 2^-12,  w = 1,  nx = 1 + 2^-11
+//   y*z exactly            = 1 + 2^-11 + 2^-24. That is a tie between 1 + 2^-11 (even last bit)
+//                            and 1 + 2^-11 + 2^-23, so round(y*z) = 1 + 2^-11.
+//   x + round(y*z)         = 0                   (two roundings)
+//   fma(y, z, x)           = 2^-24               (one rounding)
+// Every result is printed as (r * 2^24) as i32 — the scale is exact — so a fused value prints 1
+// and a twice-rounded one prints 0.
+
+// 1. `x + y*z` contracts...
+fn addend_left(x: f32, y: f32, z: f32) -> f32 {
+    return x + y * z;
+}
+
+// 2. ...and so does `y*z + x` (the product on either side).
+fn addend_right(x: f32, y: f32, z: f32) -> f32 {
+    return y * z + x;
+}
+
+// 3. Two products: the LEFT one is fused, the right one rounded first.
+//    y*z + x*w = fma(y, z, round(x*w)) = fma(y, z, x) = 2^-24          -> 1
+fn left_product_is_y_z(x: f32, y: f32, z: f32, w: f32) -> f32 {
+    return y * z + x * w;
+}
+
+// 4. The same two products swapped: x*w + y*z = fma(x, w, round(y*z)) = x + (1 + 2^-11) = 0
+//    -> 0. Swapping the operands of a two-product `+` is a numerical edit, not a refactor.
+fn left_product_is_x_w(x: f32, y: f32, z: f32, w: f32) -> f32 {
+    return x * w + y * z;
+}
+
+// 5. Subtraction never contracts: nx - y*z = (1 + 2^-11) - round(y*z) = +0          -> 0
+//    (fused it would be -2^-24, printing -1).
+fn difference(nx: f32, y: f32, z: f32) -> f32 {
+    return nx - y * z;
+}
+
+// 6. A product reached through a `let` is already rounded: x + p = 0                 -> 0
+fn product_through_let(x: f32, y: f32, z: f32) -> f32 {
+    let p: f32 = y * z;
+    return x + p;
+}
+
+// 7. A compound `+=` rounds its right-hand side first (outside a vectorized float reduction,
+//    whose accumulator tree is its own documented contract): s = x; s += y*z gives 0  -> 0
+fn compound_add(x: f32, y: f32, z: f32) -> f32 {
+    let mut s: f32 = x;
+    s += y * z;
+    return s;
+}
+
+// 8. A vectorized loop and its scalar tail apply the same rule: nine identical triples, lanes
+//    0 and 7 from the vector body, lane 8 from the remainder, all fused                  -> 1 1 1
+fn loop_lanes(x: [f32; 9], y: [f32; 9], z: [f32; 9], mut o: [f32; 9]) {
+    for i in 0..9 {
+        o[i] = x[i] + y[i] * z[i];
+    }
+}
+
+fn main() -> i32 {
+    let x: f32 = -1.00048828125;
+    let y: f32 = 1.000244140625;
+    let z: f32 = 1.000244140625;
+    let w: f32 = 1.0;
+    let nx: f32 = 1.00048828125;
+
+    print((addend_left(x, y, z) * 16777216.0) as i32); // 1
+    print((addend_right(x, y, z) * 16777216.0) as i32); // 1
+    print((left_product_is_y_z(x, y, z, w) * 16777216.0) as i32); // 1
+    print((left_product_is_x_w(x, y, z, w) * 16777216.0) as i32); // 0
+    print((difference(nx, y, z) * 16777216.0) as i32); // 0
+    print((product_through_let(x, y, z) * 16777216.0) as i32); // 0
+    print((compound_add(x, y, z) * 16777216.0) as i32); // 0
+
+    let mut xs: [f32; 9] = [0.0; 9];
+    let mut ys: [f32; 9] = [0.0; 9];
+    let mut zs: [f32; 9] = [0.0; 9];
+    let mut o: [f32; 9] = [0.0; 9];
+    for c in 0..9 {
+        xs[c] = x;
+        ys[c] = y;
+        zs[c] = z;
+    }
+    loop_lanes(xs, ys, zs, o);
+    print((o[0] * 16777216.0) as i32); // 1
+    print((o[7] * 16777216.0) as i32); // 1
+    print((o[8] * 16777216.0) as i32); // 1
+    return 0;
+}

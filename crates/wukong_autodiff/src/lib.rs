@@ -263,6 +263,17 @@ impl<'a> Vjp<'a> {
             if self.is_kernel(*func) {
                 return self.diff_kernel_call(*func, args, inst.result);
             }
+            // The ML I/O and randomness entries carry an explicit decision (see `tape.rs`).
+            match tape::ml_call_gradient(self.it.resolve(*func)) {
+                Some(tape::MlCallGradient::Constant) => return Ok(()),
+                Some(tape::MlCallGradient::Refuse) => {
+                    return Err(format!(
+                        "autodiff: no VJP rule for buffer-writing call `{}`",
+                        self.it.resolve(*func)
+                    ))
+                }
+                None => {}
+            }
             // An unrecognized call that writes buffers (void result) could feed a downstream
             // gradient; we cannot prove its contribution is zero, so refuse rather than silently
             // emit a wrong (zero) gradient. (Value-returning unknown calls fall through to the
@@ -366,6 +377,50 @@ impl<'a> Vjp<'a> {
                     let contribution = self.fmul(g, derivative, &ty);
                     self.accum(args[0], contribution);
                 }
+            }
+            // The f64 transcendental library (`wukong_rt_math_f64(x, op)`): value-returning and
+            // pure, with a closed-form derivative in `x` and the forward result, so like the f32
+            // trig call it stays a single-block scalar AD candidate rather than a buffer kernel.
+            Op::Call { func, args } if *func == self.syms.math_f64 => {
+                if args.len() != 2
+                    || ty != MirType::F64
+                    || self.fwd.value_type(args[0]) != &MirType::F64
+                {
+                    return Err("autodiff: invalid f64 math ABI".into());
+                }
+                let Some(Op::ConstInt(op, MirType::I64)) = self.def_op.get(&args[1]).copied()
+                else {
+                    return Err("autodiff: f64 math operation must be a constant i64".into());
+                };
+                let op = *op as i64;
+                let x = self.remap(args[0]);
+                let r = self.remap(old_r);
+                let derivative = self.math_f64_derivative(op, x, r);
+                let contribution = self.fmul(g, derivative, &ty);
+                self.accum(args[0], contribution);
+            }
+            // The two-argument twin (`pow`/`atan2`/`hypot`): both partials are closed forms.
+            Op::Call { func, args } if *func == self.syms.math2_f64 => {
+                if args.len() != 3
+                    || ty != MirType::F64
+                    || self.fwd.value_type(args[0]) != &MirType::F64
+                    || self.fwd.value_type(args[1]) != &MirType::F64
+                {
+                    return Err("autodiff: invalid f64 two-argument math ABI".into());
+                }
+                let Some(Op::ConstInt(op, MirType::I64)) = self.def_op.get(&args[2]).copied()
+                else {
+                    return Err("autodiff: f64 math operation must be a constant i64".into());
+                };
+                let op = *op as i64;
+                let a = self.remap(args[0]);
+                let b = self.remap(args[1]);
+                let r = self.remap(old_r);
+                let (da, db) = self.math2_f64_derivatives(op, a, b, r);
+                let ca = self.fmul(g, da, &ty);
+                self.accum(args[0], ca);
+                let cb = self.fmul(g, db, &ty);
+                self.accum(args[1], cb);
             }
             // d(a + b) = (g, g)
             Op::Bin(BinOp::FAdd, a, b) => {
@@ -665,6 +720,201 @@ impl<'a> Vjp<'a> {
     }
     fn fconst(&mut self, x: f64, ty: &MirType) -> ValueId {
         self.b.build(ty.clone(), Op::ConstFloat(x, ty.clone()))
+    }
+
+    /// One call of the f64 transcendental library in the new function: `wukong_rt_math_f64(x, op)`.
+    fn math_f64_call(&mut self, op: i64, x: ValueId) -> ValueId {
+        let code = self
+            .b
+            .build(MirType::I64, Op::ConstInt(op as i128, MirType::I64));
+        self.b.build(
+            MirType::F64,
+            Op::Call {
+                func: self.syms.math_f64,
+                args: vec![x, code],
+            },
+        )
+    }
+
+    /// `wukong_rt_math2_f64(a, b, op)` in the new function.
+    fn math2_f64_call(&mut self, op: i64, a: ValueId, b: ValueId) -> ValueId {
+        let code = self
+            .b
+            .build(MirType::I64, Op::ConstInt(op as i128, MirType::I64));
+        self.b.build(
+            MirType::F64,
+            Op::Call {
+                func: self.syms.math2_f64,
+                args: vec![a, b, code],
+            },
+        )
+    }
+
+    /// `f'(x)` for the f64 library code `op` (the runtime's public `VM_*` codes), given the replayed
+    /// argument `x` and the replayed forward result `r = f(x)`, which the closed forms reuse where
+    /// they can (`exp' = exp`, `tanh' = 1 − tanh²`, …). A code the runtime treats as the identity
+    /// has derivative 1, matching.
+    fn math_f64_derivative(&mut self, op: i64, x: ValueId, r: ValueId) -> ValueId {
+        let ty = MirType::F64;
+        let one = self.fconst(1.0, &ty);
+        match op {
+            // exp' = exp
+            0 => r,
+            // log' = 1/x
+            1 => self.fdiv(one, x, &ty),
+            // tanh' = 1 − tanh²
+            2 => {
+                let r2 = self.fmul(r, r, &ty);
+                self.b.build(ty.clone(), Op::Bin(BinOp::FSub, one, r2))
+            }
+            // sin' = cos
+            15 => self.math_f64_call(16, x),
+            // cos' = −sin
+            16 => {
+                let s = self.math_f64_call(15, x);
+                self.neg(s, &ty)
+            }
+            // erf' = (2/√π)·exp(−x²)
+            17 => {
+                let x2 = self.fmul(x, x, &ty);
+                let nx2 = self.neg(x2, &ty);
+                let e = self.math_f64_call(0, nx2);
+                let c = self.fconst(std::f64::consts::FRAC_2_SQRT_PI, &ty);
+                self.fmul(c, e, &ty)
+            }
+            // exp2' = exp2·ln2
+            18 => {
+                let c = self.fconst(std::f64::consts::LN_2, &ty);
+                self.fmul(r, c, &ty)
+            }
+            // log2' = 1/(x·ln2)
+            19 => {
+                let c = self.fconst(std::f64::consts::LN_2, &ty);
+                let d = self.fmul(x, c, &ty);
+                self.fdiv(one, d, &ty)
+            }
+            // sinh' = cosh
+            20 => self.math_f64_call(21, x),
+            // cosh' = sinh
+            21 => self.math_f64_call(20, x),
+            // asinh' = 1/√(x²+1)
+            22 => {
+                let x2 = self.fmul(x, x, &ty);
+                let s = self.fadd(x2, one, &ty);
+                let root = self.b.build(ty.clone(), Op::Sqrt(s));
+                self.fdiv(one, root, &ty)
+            }
+            // acosh' = 1/√(x²−1)
+            23 => {
+                let x2 = self.fmul(x, x, &ty);
+                let s = self.b.build(ty.clone(), Op::Bin(BinOp::FSub, x2, one));
+                let root = self.b.build(ty.clone(), Op::Sqrt(s));
+                self.fdiv(one, root, &ty)
+            }
+            // atanh' = 1/(1−x²)
+            24 => {
+                let x2 = self.fmul(x, x, &ty);
+                let d = self.b.build(ty.clone(), Op::Bin(BinOp::FSub, one, x2));
+                self.fdiv(one, d, &ty)
+            }
+            // atan' = 1/(1+x²)
+            25 => {
+                let x2 = self.fmul(x, x, &ty);
+                let d = self.fadd(one, x2, &ty);
+                self.fdiv(one, d, &ty)
+            }
+            // expm1' = exp — computed directly, not as `expm1 + 1`: for x ≪ 0 the forward result is
+            // −1 + e^x and adding 1 back cancels to the ≈1e-16 absolute error of that sum (at
+            // x = −20.5 the relative error of `r + 1` is 3e-9; `exp(x)` stays ≤ 1 ULP).
+            26 => self.math_f64_call(0, x),
+            // log1p' = 1/(1+x)
+            27 => {
+                let d = self.fadd(one, x, &ty);
+                self.fdiv(one, d, &ty)
+            }
+            // exp10' = exp10·ln10
+            28 => {
+                let c = self.fconst(std::f64::consts::LN_10, &ty);
+                self.fmul(r, c, &ty)
+            }
+            // log10' = 1/(x·ln10)
+            29 => {
+                let c = self.fconst(std::f64::consts::LN_10, &ty);
+                let d = self.fmul(x, c, &ty);
+                self.fdiv(one, d, &ty)
+            }
+            // tan' = 1 + tan²
+            32 => {
+                let r2 = self.fmul(r, r, &ty);
+                self.fadd(one, r2, &ty)
+            }
+            // asin' = 1/√(1−x²)
+            33 => {
+                let x2 = self.fmul(x, x, &ty);
+                let s = self.b.build(ty.clone(), Op::Bin(BinOp::FSub, one, x2));
+                let root = self.b.build(ty.clone(), Op::Sqrt(s));
+                self.fdiv(one, root, &ty)
+            }
+            // acos' = −1/√(1−x²)
+            34 => {
+                let x2 = self.fmul(x, x, &ty);
+                let s = self.b.build(ty.clone(), Op::Bin(BinOp::FSub, one, x2));
+                let root = self.b.build(ty.clone(), Op::Sqrt(s));
+                let d = self.fdiv(one, root, &ty);
+                self.neg(d, &ty)
+            }
+            // cbrt' = 1/(3·cbrt²)
+            35 => {
+                let r2 = self.fmul(r, r, &ty);
+                let three = self.fconst(3.0, &ty);
+                let d = self.fmul(three, r2, &ty);
+                self.fdiv(one, d, &ty)
+            }
+            // The runtime returns `x` for any other code.
+            _ => one,
+        }
+    }
+
+    /// `(∂f/∂a, ∂f/∂b)` for the two-argument f64 library code `op` (the runtime's `VM2_*` codes),
+    /// given the replayed arguments and the replayed forward result `r = f(a, b)`.
+    fn math2_f64_derivatives(
+        &mut self,
+        op: i64,
+        a: ValueId,
+        b: ValueId,
+        r: ValueId,
+    ) -> (ValueId, ValueId) {
+        let ty = MirType::F64;
+        match op {
+            // pow(a, b): ∂/∂a = b·a^(b−1), ∂/∂b = ln(a)·a^b
+            0 => {
+                let one = self.fconst(1.0, &ty);
+                let bm1 = self.b.build(ty.clone(), Op::Bin(BinOp::FSub, b, one));
+                let p = self.math2_f64_call(0, a, bm1);
+                let da = self.fmul(b, p, &ty);
+                let la = self.math_f64_call(1, a);
+                let db = self.fmul(la, r, &ty);
+                (da, db)
+            }
+            // atan2(a, b): ∂/∂a = b/(a²+b²), ∂/∂b = −a/(a²+b²)
+            1 => {
+                let a2 = self.fmul(a, a, &ty);
+                let b2 = self.fmul(b, b, &ty);
+                let den = self.fadd(a2, b2, &ty);
+                let da = self.fdiv(b, den, &ty);
+                let q = self.fdiv(a, den, &ty);
+                let db = self.neg(q, &ty);
+                (da, db)
+            }
+            // hypot(a, b): ∂/∂a = a/r, ∂/∂b = b/r
+            2 => {
+                let da = self.fdiv(a, r, &ty);
+                let db = self.fdiv(b, r, &ty);
+                (da, db)
+            }
+            // The runtime returns `a` for any other code.
+            _ => (self.fconst(1.0, &ty), self.fconst(0.0, &ty)),
+        }
     }
 
     /// Clone a forward op with every operand value remapped into the new value space.

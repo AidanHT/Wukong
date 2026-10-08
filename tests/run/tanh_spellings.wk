@@ -1,0 +1,74 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -99505
+// EXPECT-OUT: -66403
+// EXPECT-OUT: -63514
+// EXPECT-OUT: -46211
+// EXPECT-OUT: -29131
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 29131
+// EXPECT-OUT: 64107
+// EXPECT-OUT: 96402
+// EXPECT-OUT: 99990
+// EXPECT-OUT: 0
+// EXPECT-OUT: -99505
+// EXPECT-OUT: -66403
+// EXPECT-OUT: -63514
+// EXPECT-OUT: -46211
+// EXPECT-OUT: -29131
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 29131
+// EXPECT-OUT: 64107
+// EXPECT-OUT: 96402
+// EXPECT-OUT: 99990
+// EXPECT-OUT: 0
+// EXPECT-OUT: 64107
+// EXPECT-OUT: 1024
+// EXPECT-OUT: 1024
+// EXPECT-OUT: -1024
+// EXPECT-OUT: -1024
+module tests.run.tanh_spellings
+
+// The language has ONE `tanh` (P13.2). A dispatched `for i { out[i] = tanh(x[i]) }` loop runs the
+// runtime's ≤1-ULP piecewise kernel; a composed use (`tanh(x[i]) * s`, which the recognizer
+// declines and the vectorizer lowers as inlined 128-bit MIR) and a standalone scalar call must
+// compute the same function. They did not: the inlined form was `1 − 2/(exp(2x) + 1)`, which
+// drifted up to 80 ULP from the kernel near |x| ≈ 0.027 and returned +0.0 for every |x| < 2^-25,
+// sign included. The two 2^-26 lanes below print 0 at the 1e5 scale either way, so they are
+// re-printed at the 2^36 scale, where the kernel's exact `x` gives ±1024 and the old composed
+// form gave 0 — on BOTH spellings now.
+//
+// Expected values are the true f32-argument tanh values, computed with mpmath at 200 bits and
+// truncated after scaling by 1e5 (five significant digits; a 1-ULP f32 difference cannot move
+// them — every scaled fractional part sits in [0.26, 0.93]). `tanh(2^-26)·2^36 = 2^10` exactly
+// because the kernel returns `x` itself below 2^-13 and both factors are powers of two. Bit-level
+// agreement across the spellings is pinned by `wukong_codegen_cranelift`'s
+// `dispatched_tanh_equals_composed_tanh`; this fixture is the corpus witness.
+fn main() -> i32 {
+    let x: [f32; 12] = [-3.0, -0.8, -0.75, -0.5, -0.3, 0.0, 0.000000014901161193847656, 0.3, 0.76, 2.0, 5.0, -0.000000014901161193847656];
+    let mut dispatched: [f32; 12] = [0.0; 12];
+    let mut composed: [f32; 12] = [0.0; 12];
+    let s: f32 = 1.0;
+    for i in 0..12 {
+        dispatched[i] = tanh(x[i]);
+    }
+    for i in 0..12 {
+        composed[i] = tanh(x[i]) * s;
+    }
+    for i in 0..12 {
+        print((dispatched[i] * 100000.0) as i32);
+    }
+    for i in 0..12 {
+        print((composed[i] * 100000.0) as i32);
+    }
+    let scalar: f32 = tanh(x[8]);
+    print((scalar * 100000.0) as i32);
+    let scale36: f32 = 68719476736.0;
+    print((dispatched[6] * scale36) as i64);
+    print((composed[6] * scale36) as i64);
+    print((dispatched[11] * scale36) as i64);
+    print((composed[11] * scale36) as i64);
+    return 0;
+}

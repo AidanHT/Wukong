@@ -29,9 +29,15 @@
 mod alias;
 mod bounds;
 mod canon;
+#[cfg(test)]
+mod fp_contract_tests;
 mod noalias;
+mod par_grain;
 mod tile;
 mod tindex;
+
+// The lowering of the ML builtins `wukong_sema::ml_builtins` types (see the module docs).
+mod ml_builtins;
 
 use std::cell::{Cell, RefCell};
 
@@ -931,6 +937,15 @@ pub struct LowerOptions {
     /// body is ever found miscompiled. This option is the *other* conjunct, chosen by the pipeline
     /// rather than the environment.
     pub vec_kernels: bool,
+
+    /// Strict floating-point mode for the WHOLE program (`--fp=strict`; `false`, the default, is
+    /// `--fp=fast`). It is the program-wide spelling of the `@strict_fp` function attribute and
+    /// means exactly what that attribute means for every function: no FMA contraction of a source
+    /// `x + y*z`, no reassociating float-reduction vectorization, and no kernel recognizer (a
+    /// recognized GEMM / reduction / norm kernel fixes its own summation tree). What remains is
+    /// evaluation in source order with one IEEE rounding per source operation, vectorized only
+    /// lane-wise. See `strict_fp_gemm` and `docs/language-guide.md` "Floating-point semantics".
+    pub strict_fp: bool,
 }
 
 impl Default for LowerOptions {
@@ -938,6 +953,7 @@ impl Default for LowerOptions {
         LowerOptions {
             recognize: true,
             vec_kernels: true,
+            strict_fp: false,
         }
     }
 }
@@ -953,8 +969,9 @@ impl Default for LowerOptions {
 ///
 /// Needs `&mut Interner` because it interns the ~160 runtime kernel symbols (`GemmSyms`), the
 /// monomorphized instance names (`id$f32`), the `.rodata` string-literal blobs, and the
-/// `PAR_REGION_MAX`-entry pool of outlined-region symbols — the per-function lowerer holds only a
-/// shared `&Interner` and cannot mint names itself.
+/// pool of outlined-region symbols (`PAR_REGION_MAX` entries, grown on demand — see
+/// [`lower_program_with`]) — the per-function lowerer holds only a shared `&Interner` and cannot
+/// mint names itself.
 pub fn lower_program(
     module: &Module,
     sema: &SemaResult,
@@ -990,6 +1007,34 @@ pub fn lower_program_located(
     opts: LowerOptions,
     locate: &dyn Fn(Span) -> String,
 ) -> (Program, Vec<Diagnostic>) {
+    // The outlined-region symbols must be interned before lowering starts (the lowerer holds only a
+    // shared `&Interner`), so the pool is sized up front. A program that outlines more mid-function
+    // `@parallel` regions than the pool holds used to keep the extras serial with no diagnostic; now
+    // the lowering reports that it ran out and is simply redone with a pool four times larger.
+    // Lowering is a pure function of (module, sema, options, pool size) and interning is idempotent,
+    // so the redo produces exactly the program a big-enough first pool would have, and only programs
+    // past the pool pay for it.
+    let mut pool = PAR_REGION_MAX;
+    loop {
+        let (program, diags, exhausted) =
+            lower_program_pooled(module, sema, interner, opts, locate, pool);
+        if !exhausted || pool >= PAR_REGION_POOL_LIMIT {
+            return (program, diags);
+        }
+        pool = (pool * 4).min(PAR_REGION_POOL_LIMIT);
+    }
+}
+
+/// One lowering attempt with a `pool`-entry outlined-region symbol pool. The third result is `true`
+/// when some `@parallel` region stayed serial only because the pool was exhausted.
+fn lower_program_pooled(
+    module: &Module,
+    sema: &SemaResult,
+    interner: &mut Interner,
+    opts: LowerOptions,
+    locate: &dyn Fn(Span) -> String,
+    pool: usize,
+) -> (Program, Vec<Diagnostic>, bool) {
     // Two AST normalizations run back to back, before anything looks at the tree, because every
     // kernel recognizer and the autovectorizer match a *syntactic* shape on the raw AST.
     //
@@ -1028,6 +1073,9 @@ pub fn lower_program_located(
     let gemm = GemmSyms {
         recognize: opts.recognize,
         vec_kernels: opts.vec_kernels,
+        // Program-wide `--fp=strict`. Applied per function by `strict_fp_gemm` below, beside the
+        // `@strict_fp` attribute it is the global spelling of.
+        strict_fp: opts.strict_fp,
         // Overwritten per function, below. The module-level default is the conservative one, so a
         // recognizer reached through a path that forgot to set it declines rather than miscompiles.
         alias_free: false,
@@ -1055,6 +1103,8 @@ pub fn lower_program_located(
         vmath_par: interner.intern("wukong_vmath_f32_parallel"),
         vmath2: interner.intern("wukong_vmath2_f32"),
         trig_f32: interner.intern("wukong_rt_trig_f32"),
+        math_f64: interner.intern("wukong_rt_math_f64"),
+        math2_f64: interner.intern("wukong_rt_math2_f64"),
         vmath_bf16: interner.intern("wukong_vmath_bf16"),
         vmath_f16: interner.intern("wukong_vmath_f16"),
         velem: interner.intern("wukong_velem_f32"),
@@ -1181,6 +1231,7 @@ pub fn lower_program_located(
         rt_scratch_alloc: interner.intern("wukong_rt_scratch_alloc"),
         rt_scratch_mark: interner.intern("wukong_rt_scratch_mark"),
         rt_scratch_release: interner.intern("wukong_rt_scratch_release"),
+        ml: ml_builtins::MlSyms::new(interner),
         rt_read_f32: interner.intern("wukong_rt_read_f32"),
         rt_read_i32: interner.intern("wukong_rt_read_i32"),
         rt_read_i64: interner.intern("wukong_rt_read_i64"),
@@ -1222,7 +1273,7 @@ pub fn lower_program_located(
     let mut par_regions = ParRegions {
         pfor: interner.intern("wukong_parallel_for"),
         syms: if any_parallel {
-            (0..PAR_REGION_MAX)
+            (0..pool)
                 .map(|i| interner.intern(&format!("wukong$par${i}")))
                 .collect()
         } else {
@@ -1230,6 +1281,8 @@ pub fn lower_program_located(
         },
         next: 0,
         funcs: Vec::new(),
+        grain: 1,
+        exhausted: false,
     };
     let no_subst: HashMap<Symbol, Ty> = HashMap::default();
     // Functions carrying `@generic`. Collected once by name — names are unique at module scope
@@ -1255,6 +1308,17 @@ pub fn lower_program_located(
             _ => None,
         })
         .collect();
+    // Functions carrying `@strict_fp`, keyed by name for the same reason as `generic_fns`: the
+    // monomorphization loop has only the original function's symbol.
+    let strict_fp_fns: HashSet<Symbol> = module
+        .items
+        .iter()
+        .filter(|item| has_strict_fp_attr(item, interner))
+        .filter_map(|item| match &item.kind {
+            ast::ItemKind::Fn(f) => Some(f.name.sym),
+            _ => None,
+        })
+        .collect();
     let fn_tiles: HashMap<Symbol, Vec<u64>> = module
         .items
         .iter()
@@ -1269,6 +1333,9 @@ pub fn lower_program_located(
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
             if let Some(body) = &f.body {
+                // `@parallel(grain = G)`: every region this function outlines hands each worker
+                // runs of at least G iterations (see `par_grain`). 1 for every other function.
+                par_regions.grain = par_grain::item_grain(item, interner);
                 // A type-generic function (`fn id<T>(x: T)`) is lowered once per concrete
                 // instantiation, below — skip the generic template itself. Dimension-only generics
                 // (`fn f<N>(a: Tensor[f32, N])`) are not type-generic and lower normally here.
@@ -1283,6 +1350,9 @@ pub fn lower_program_located(
                 let gemm = generic_gemm(gemm, generic_fns.contains(&f.name.sym));
                 // `@unchecked`: lower this function's slice accesses without bounds checks.
                 let gemm = unchecked_gemm(gemm, unchecked_fns.contains(&f.name.sym));
+                // `@strict_fp` (or `--fp=strict`): no contraction, no float-reduction
+                // reassociation, no recognizers — for this function alone. See `strict_fp_gemm`.
+                let gemm = strict_fp_gemm(gemm, strict_fp_fns.contains(&f.name.sym));
                 // Whole-program aliasing, stamped on beside the `@generic` opt-out: `false` here
                 // means some call site in this program can hand two of this function's buffer
                 // parameters the same array, so no recognizer inside it may emit a kernel whose
@@ -1976,7 +2046,16 @@ pub fn lower_program_located(
                         let par_sym = interner.intern(&format!("{base}$par"));
                         let pfor_sym = interner.intern("wukong_parallel_for");
                         let (outlined, wrapper) = lower_parallel(
-                            f, par_sym, pfor_sym, idx, hi, loop_body, sema, interner, gemm,
+                            f,
+                            par_sym,
+                            pfor_sym,
+                            idx,
+                            hi,
+                            loop_body,
+                            sema,
+                            interner,
+                            gemm,
+                            par_regions.grain,
                             &mut diags,
                         );
                         // Both halves are built with an empty tile queue (`lower_parallel`), so a
@@ -2045,6 +2124,8 @@ pub fn lower_program_located(
             // A `@generic` template's instances inherit the opt-out (keyed on the ORIGINAL name).
             let gemm = generic_gemm(gemm, generic_fns.contains(orig));
             let gemm = unchecked_gemm(gemm, unchecked_fns.contains(orig));
+            // ...and so do the instances of a `@strict_fp` template.
+            let gemm = strict_fp_gemm(gemm, strict_fp_fns.contains(orig));
             // Aliasing is a property of the ORIGINAL function's call sites: every instantiation of
             // a type-generic template shares them.
             let gemm = alias_gemm(gemm, alias_facts.alias_free(*orig));
@@ -2070,7 +2151,7 @@ pub fn lower_program_located(
     program.funcs.append(&mut par_regions.funcs);
     // Give every slice bounds failure its `file:line:col` (a `.rodata` string; see `bounds.rs`).
     bounds::attach_sites(&mut program, interner, gemm.bounds_fail, locate);
-    (program, diags)
+    (program, diags, par_regions.exhausted)
 }
 
 /// Does this item carry a `@parallel` attribute?
@@ -2117,6 +2198,46 @@ fn unchecked_gemm(gemm: GemmSyms, is_unchecked: bool) -> GemmSyms {
 fn generic_gemm(gemm: GemmSyms, is_generic: bool) -> GemmSyms {
     if is_generic {
         GemmSyms {
+            recognize: false,
+            ..gemm
+        }
+    } else {
+        gemm
+    }
+}
+
+/// Does this item carry `@strict_fp` — "evaluate my float arithmetic in source order, one rounding
+/// per operation"? `wukong_sema::attrs` rejects the attribute anywhere but a `fn` item.
+fn has_strict_fp_attr(item: &ast::Item, interner: &Interner) -> bool {
+    item.attrs
+        .iter()
+        .any(|a| interner.resolve(a.name.sym) == "strict_fp")
+}
+
+/// `gemm` in strict floating-point mode when the function being lowered is `@strict_fp` or the
+/// whole program is (`--fp=strict`, already stamped on `gemm.strict_fp`).
+///
+/// Strict mode is three switches, and all three are needed for the promise "the result is the
+/// source expression evaluated left to right, each `+ - * /` rounded once" to hold:
+///
+/// * **no contraction** — `x + y*z` stays a rounded multiply and a rounded add (the fast-mode
+///   default fuses it into one `Fma`, which rounds once and therefore answers differently);
+/// * **no float-reduction vectorization** — `s += f(x[i])` keeps its sequential fold instead of
+///   the lane-partitioned tree. Integer reductions are exact under any order and still vectorize;
+///   elementwise loops still vectorize, because lane `k` runs exactly scalar iteration `i + k`;
+/// * **no kernel recognizers** (the `@generic` switch) — a recognized GEMM, reduction, norm or
+///   affine kernel substitutes its own blocking, accumulator tree and FMA use for the loop the user
+///   wrote, which no per-op flag inside the runtime could undo.
+///
+/// The optimizer needs no switch: `wukong_opt` never reassociates (its vectorizer folds reduction
+/// lanes in index order, its unroller keeps one accumulator) and never creates an `Fma`, and the
+/// Cranelift and LLVM backends lower `fadd`/`fmul` without contraction. So the mode is fully decided
+/// here, at lowering, and survives inlining: a strict function inlined into a fast caller keeps its
+/// separately-rounded operations, and a fast callee inlined into a strict caller keeps its `Fma`s.
+fn strict_fp_gemm(gemm: GemmSyms, is_strict: bool) -> GemmSyms {
+    if is_strict || gemm.strict_fp {
+        GemmSyms {
+            strict_fp: true,
             recognize: false,
             ..gemm
         }
@@ -2754,6 +2875,10 @@ fn merge_repr_ty(result_ty: &MirType) -> MirType {
 ///     array base pointers back from `env`;
 ///   * the original `f.name(params…)` — a wrapper that packs the parameter pointers into a stack
 ///     `env`, then calls `wukong_parallel_for(hi, &par, env)`.
+///
+/// With `@parallel(grain = G)`, `G > 1`, the wrapper passes `ceil(hi / G)` chunks instead and
+/// appends the address of a stack slot holding `hi` to `env`; the body loads it and maps its chunk
+/// span back to iterations (see `par_grain`). `hi` is evaluated once, in the wrapper, either way.
 #[allow(clippy::too_many_arguments)]
 fn lower_parallel(
     f: &FnDecl,
@@ -2765,6 +2890,7 @@ fn lower_parallel(
     sema: &SemaResult,
     interner: &Interner,
     gemm: GemmSyms,
+    grain: u64,
     diags: &mut Vec<Diagnostic>,
 ) -> (Function, Function) {
     let (param_tys, ret_ty) = match sema.defs.lookup(f.name.sym).map(|d| &d.kind) {
@@ -2837,6 +2963,27 @@ fn lower_parallel(
             // the serial spelling.
             fl.bind_field_bases(p.name.sym, base, pty);
         }
+        // Grain > 1: the runtime hands over CHUNK indices; recover the trip count the wrapper
+        // stored behind `env[k]` and map the chunk span back to iterations.
+        let (start, end) = if grain > 1 {
+            let kidx = fl
+                .builder
+                .build(MirType::I64, Op::ConstInt(k as i128, MirType::I64));
+            let slot = fl.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: env,
+                    index: kidx,
+                    elem: MirType::Ptr,
+                },
+            );
+            let np = fl.builder.build(MirType::Ptr, Op::Load(slot, MirType::Ptr));
+            let n = fl.builder.build(MirType::I64, Op::Load(np, MirType::I64));
+            let chunks = par_grain::emit_chunks(&mut fl.builder, n, grain);
+            par_grain::emit_iteration_bounds(&mut fl.builder, start, end, n, chunks, grain)
+        } else {
+            (start, end)
+        };
         // The index variable's source type (the range's element type) drives the loop so the
         // body's index arithmetic matches sema; the i64 runtime bounds are coerced into it.
         let ity = fl.expr_mir(hi);
@@ -2880,9 +3027,11 @@ fn lower_parallel(
             .iter()
             .map(|pty| fl.builder.add_param(param_abi_ty(pty)))
             .collect();
+        // One pointer per parameter, plus the trip-count slot's address when a grain applies.
+        let env_len = k + usize::from(grain > 1);
         let env = fl
             .builder
-            .alloca(MirType::Array(Box::new(MirType::Ptr), k as u32));
+            .alloca(MirType::Array(Box::new(MirType::Ptr), env_len as u32));
         for (idx_k, pv) in param_vals.iter().enumerate() {
             let kidx = fl
                 .builder
@@ -2903,6 +3052,32 @@ fn lower_parallel(
         let n_raw = fl.lower_expr(hi);
         let n_ty = fl.operand_mir(n_raw, hi);
         let n = fl.coerce_to(n_raw, &n_ty, &MirType::I64, fl.signed(hi));
+        let n = if grain > 1 {
+            // Publish the trip count to the body through `env[k]`, then hand the runtime chunks.
+            let nslot = fl.builder.alloca(MirType::I64);
+            fl.builder.build_void(Op::Store {
+                ptr: nslot,
+                value: n,
+            });
+            let kidx = fl
+                .builder
+                .build(MirType::I64, Op::ConstInt(k as i128, MirType::I64));
+            let slot = fl.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: env,
+                    index: kidx,
+                    elem: MirType::Ptr,
+                },
+            );
+            fl.builder.build_void(Op::Store {
+                ptr: slot,
+                value: nslot,
+            });
+            par_grain::emit_chunks(&mut fl.builder, n, grain)
+        } else {
+            n
+        };
         let bodyaddr = fl.builder.build(MirType::Ptr, Op::FuncAddr(par_sym));
         fl.builder.build_void(Op::Call {
             func: pfor_sym,
@@ -2923,11 +3098,16 @@ fn lower_parallel(
     (outlined, wrapper)
 }
 
-/// Cap on outlined mid-function `@parallel` loop regions per program. The outlined-body symbols
-/// must be interned before lowering starts (the lowerer holds only a shared `&Interner`), so a
-/// fixed pool is pre-interned up front; a program with more independent-iteration loops than this
-/// simply keeps the extras serial (correct, just not parallel).
+/// Initial size of the outlined mid-function `@parallel` region symbol pool. The outlined-body
+/// symbols must be interned before lowering starts (the lowerer holds only a shared `&Interner`), so
+/// a pool is pre-interned up front; a program that outlines more regions than this is lowered
+/// again with a pool four times larger ([`lower_program_with`]), so no region stays serial for
+/// want of a name.
 const PAR_REGION_MAX: usize = 32;
+
+/// Upper bound on the region pool the redo loop grows to — far past any real program (each entry
+/// is one outlined loop); it only guarantees that the loop terminates.
+const PAR_REGION_POOL_LIMIT: usize = 1 << 16;
 
 /// State for outlining mid-function `@parallel` loop regions (see
 /// [`FnLowerer::try_emit_parallel_region`]): the `wukong_parallel_for` runtime symbol, the
@@ -2941,6 +3121,11 @@ struct ParRegions {
     syms: Vec<Symbol>,
     next: usize,
     funcs: Vec<Function>,
+    /// The `@parallel(grain = G)` of the function currently being lowered (1 by default).
+    grain: u64,
+    /// Set when a region stayed serial because `syms` ran out — the signal for
+    /// [`lower_program_with`] to redo the lowering with a larger pool.
+    exhausted: bool,
 }
 
 /// The runtime entry points the recognizers dispatch to: the four GEMM kernels (`C = A·B` and the
@@ -2961,6 +3146,14 @@ struct GemmSyms {
     /// what `--backend=gpu-native` needs, since `VecKernelCall` carries Win64-ABI bytes no PTX
     /// backend can lower.
     vec_kernels: bool,
+    /// Strict floating-point mode for the function being lowered (`@strict_fp`, or the program-wide
+    /// [`LowerOptions::strict_fp`]). Rides here for the reason `recognize` does: this struct is
+    /// copied into every lowerer, recipe builder and outlined `@parallel` region, so the mode cannot
+    /// be dropped on the way down. Set only through [`strict_fp_gemm`], which also clears
+    /// `recognize`. Read at the four FMA-contraction sites (`try_contract_fma`, `vec_try_fma`, the
+    /// 256-bit recipe's `Add` arm, the reduction accumulators) and at the float-reduction
+    /// vectorizer gate in `try_vectorize_for`.
+    strict_fp: bool,
     /// Whole-program answer to "can two DISTINCT names for a buffer in the function being lowered
     /// reach the same storage?" — either because a call site binds two of its buffer parameters to
     /// one array, or because two operand names in its own body resolve onto one buffer (a
@@ -3045,6 +3238,14 @@ struct GemmSyms {
     vmath: Symbol,
     /// Value-returning scalar trig, also the exceptional-lane fallback for vector MIR.
     trig_f32: Symbol,
+    /// The double-precision transcendental library (`wukong_rt_math_f64(x, op)`, `op` a `VMATH_*`
+    /// code): every `f64` `exp`/`log`/`sin`/… lowers to one call of it, on every backend, instead
+    /// of the f32 polynomial it used to be demoted to. Pure Rust in `wukong_runtime::math64`, so
+    /// the interpreter and native agree bit-for-bit (see `emit_math_f64`).
+    math_f64: Symbol,
+    /// The two-argument twin (`wukong_rt_math2_f64(a, b, op)`, `op` a `VMATH2_*` code) for the
+    /// `f64` `pow`/`atan2`/`hypot`.
+    math2_f64: Symbol,
     /// The **two-input** twin (`wukong_vmath2_f32(x, y, out, n, op)`): an `out[i] = f(x[i], y[i])`
     /// loop for `pow`/`atan2`/`hypot` lowers to this — the 256-bit kernel, vs the inlined 128-bit poly.
     vmath2: Symbol,
@@ -3374,6 +3575,8 @@ struct GemmSyms {
     rt_scratch_alloc: Symbol,
     rt_scratch_mark: Symbol,
     rt_scratch_release: Symbol,
+    /// The runtime entries `ml_builtins.rs` lowers the ML builtins to (`wukong_rt_read_dt`, …).
+    ml: ml_builtins::MlSyms,
     /// The 12 raw file-I/O runtime entry points (`wukong_rt_{read,write}_{f32,i32,i64,u8,f64,i8}`)
     /// backing the `read_<T>(path, buf)` / `write_<T>(path, buf)` builtins. Each takes `(path: *const
     /// u8, data: *T, len: i64)` and returns an `i64`: the element count on success, or -1 (open/create
@@ -13777,8 +13980,12 @@ impl FnLowerer<'_> {
             // Only pure scalar math intrinsics: a user call could write captured buffers, and
             // `print`/`assert` have cross-iteration-ordered side effects.
             ExprKind::Call { callee, args, .. } => {
+                // The RNG scalars (`rand_f32(seed, i)`, …) are pure too: counter-based, no state.
                 let pure_math = single_path(callee)
-                    .map(|s| math_intrinsic(self.interner.resolve(s)).is_some())
+                    .map(|s| {
+                        math_intrinsic(self.interner.resolve(s)).is_some()
+                            || self.is_pure_ml_builtin(s)
+                    })
                     .unwrap_or(false);
                 if !pure_math {
                     sc.ok = false;
@@ -14000,7 +14207,9 @@ impl FnLowerer<'_> {
     /// [`lower_parallel`]'s two halves, but as a *statement* inside a larger function.
     ///
     /// Returns `false` — emitting nothing, so the caller lowers the loop serially — when the module's
-    /// pre-interned region-symbol pool (`PAR_REGION_MAX`) is exhausted. A captured `[]T` slice must
+    /// pre-interned region-symbol pool is exhausted; that is recorded, and `lower_program_with`
+    /// redoes the lowering with a larger pool, so the final program never keeps a region serial for
+    /// that reason. A captured `[]T` slice must
     /// have its `slice_slots` record carried across the env into the outlined body's re-bind, or
     /// `kernel_base_ptr` in there would mistake the fat-pointer buffer for the data.
     fn emit_parallel_region(
@@ -14011,15 +14220,22 @@ impl FnLowerer<'_> {
         body: &Block,
         captures: &[Symbol],
     ) -> bool {
-        // Reserve an outlined-body symbol from the pool (pool exhausted -> stay serial).
-        let (par_sym, pfor) = match self.par.as_deref_mut() {
+        // Reserve an outlined-body symbol from the pool. Pool exhausted -> stay serial in THIS
+        // attempt and flag it; `lower_program_with` then redoes the lowering with a larger pool.
+        let (par_sym, pfor, grain) = match self.par.as_deref_mut() {
             Some(p) if p.next < p.syms.len() => {
                 let s = p.syms[p.next];
                 p.next += 1;
-                (s, p.pfor)
+                (s, p.pfor, p.grain)
             }
-            _ => return false,
+            Some(p) => {
+                p.exhausted = true;
+                return false;
+            }
+            None => return false,
         };
+        // `@parallel(grain = G)`: the call passes ceil(n / G) chunk indices (see `par_grain`).
+        let chunks = par_grain::const_chunks(n, grain);
         // A captured array's bound ValueId IS its base pointer; a captured scalar's is its alloca
         // slot pointer. Both are pointer-shaped, so the env is a uniform pointer table. Scalars are
         // read-only inside the region (matcher-enforced), so sharing the slot is race-free.
@@ -14059,7 +14275,7 @@ impl FnLowerer<'_> {
         }
         let nv = self
             .builder
-            .build(MirType::I64, Op::ConstInt(n as i128, MirType::I64));
+            .build(MirType::I64, Op::ConstInt(chunks as i128, MirType::I64));
         let addr = self.builder.build(MirType::Ptr, Op::FuncAddr(par_sym));
         self.builder.build_void(Op::Call {
             func: pfor,
@@ -14114,6 +14330,18 @@ impl FnLowerer<'_> {
                 let base = fl.builder.build(MirType::Ptr, Op::Load(slot, MirType::Ptr));
                 fl.bind_slice(*sym, base, mty.clone(), *is_slice);
             }
+            // Grain > 1: map the runtime's chunk span back to iterations of the literal trip count.
+            let (start, end) = if grain > 1 {
+                let nc = fl
+                    .builder
+                    .build(MirType::I64, Op::ConstInt(n as i128, MirType::I64));
+                let cc = fl
+                    .builder
+                    .build(MirType::I64, Op::ConstInt(chunks as i128, MirType::I64));
+                par_grain::emit_iteration_bounds(&mut fl.builder, start, end, nc, cc, grain)
+            } else {
+                (start, end)
+            };
             fl.lower_ranged_loop(hh, start, end, ity.clone(), body);
             if !fl.terminated {
                 fl.builder.ret(None);
@@ -16059,7 +16287,14 @@ impl FnLowerer<'_> {
         if !signed {
             return false;
         }
-        let reduction = self.reduction_of(body, j);
+        // A float reduction is vectorized by REASSOCIATING it (lane accumulators, then a fixed
+        // combine tree), which `@strict_fp` forbids: it keeps the sequential fold. The body then
+        // fails `vectorizable` (it assigns an outer scalar) and lowers as the scalar loop, which
+        // `wukong_opt`'s order-preserving vectorizer may still widen without moving the fold.
+        // Integer reductions are exact in any order and stay vectorized.
+        let reduction = self
+            .reduction_of(body, j)
+            .filter(|(_, _, lane, _, _)| !(self.gemm.strict_fp && lane.is_float()));
         if reduction.is_none() && self.vectorizable(body, j).is_none() {
             return false;
         }
@@ -16892,10 +17127,11 @@ impl FnLowerer<'_> {
                 // 0..7 and 1 for the tail lane — one loop, two answers, on both backends at every -O
                 // level. `WUKONG_P4_NO_256=1` printed 1 for both, so the knob was changing the
                 // program's numbers rather than only its instruction selection. The leaves lower in
-                // source order, matching the twins.
+                // source order, matching the twins. Under `@strict_fp` neither twin contracts, so
+                // the recipe emits the plain `Mul` + `Add` below instead.
                 // Integer lanes have no fused multiply-add (and the scalar tail does not contract
                 // them either), so only a float lane contracts.
-                if matches!(op, Add) && r.lane.is_float() {
+                if matches!(op, Add) && r.lane.is_float() && !self.gemm.strict_fp {
                     if let ExprKind::Binary {
                         op: Mul,
                         lhs: y,
@@ -18311,7 +18547,9 @@ impl FnLowerer<'_> {
         w: u32,
         vlocals: &mut HashMap<Symbol, ValueId>,
     ) -> ValueId {
-        if lane.is_float() {
+        // `@strict_fp` never reaches here with a float lane (`try_vectorize_for` declines the float
+        // reduction), but the accumulate honours the mode on its own rather than lean on that.
+        if lane.is_float() && !self.gemm.strict_fp {
             if let ExprKind::Binary {
                 op: ast::BinOp::Mul,
                 lhs,
@@ -18334,7 +18572,7 @@ impl FnLowerer<'_> {
 
     /// Scalar `acc + addend`, fusing `acc + a*b` into one `Fma` for floats; plain `Add` for ints.
     fn scalar_accumulate(&mut self, acc: ValueId, addend: &Expr, ty: &MirType) -> ValueId {
-        if ty.is_float() {
+        if ty.is_float() && !self.gemm.strict_fp {
             if let ExprKind::Binary {
                 op: ast::BinOp::Mul,
                 lhs,
@@ -18797,6 +19035,11 @@ impl FnLowerer<'_> {
                 } => Some((lhs.as_ref(), rhs.as_ref())),
                 _ => None,
             }
+        }
+        // `@strict_fp`: the scalar remainder (`try_contract_fma`) does not contract, so neither
+        // may the vector body, or one loop would compute two functions.
+        if self.gemm.strict_fp {
+            return None;
         }
         if let Some((y, z)) = as_fmul(lhs) {
             let yv = self.vec_lower_value(y, j, lane, vty, w, vlocals);
@@ -20636,6 +20879,22 @@ impl FnLowerer<'_> {
     /// instead of twice — faster (a single `vfmadd`) and more accurate — and the interpreter
     /// mirrors it with `mul_add`, so the native and interpreter backends stay bit-identical.
     /// Returns `None` when the shape or types don't permit it; the caller then emits a plain add.
+    ///
+    /// The contraction rule is part of the language's floating-point contract (language guide,
+    /// "Floating-point semantics"), so it is spelled out here exactly:
+    ///
+    /// * only a binary `+` whose operand is *syntactically* a `*` contracts (parentheses are not
+    ///   an AST node, so `x + (y*z)` contracts too). `x - y*z` does not, and neither does a
+    ///   product reached through a `let` (`let p = y*z; x + p`). For `x + a*b*c` the top-level
+    ///   product is `(a*b)*c`, so it becomes `fma(round(a*b), c, x)`;
+    /// * when **both** operands are products (`a*b + c*d`), the **left** product is fused and the
+    ///   right one is rounded first: `fma(a, b, round(c*d))`. Which side wins changes the result,
+    ///   so swapping the operands of such a `+` is a numerical edit, not a refactor
+    ///   (`tests/run/fp_contract_rules.wk` pins both spellings);
+    /// * in a `@strict_fp` function (or under `--fp=strict`) nothing contracts.
+    ///
+    /// The vector twins (`vec_try_fma`, the 256-bit recipe's `Add` arm) apply the identical rule,
+    /// so a vectorized loop and its scalar remainder agree lane-for-lane.
     fn try_contract_fma(
         &mut self,
         op: ast::BinOp,
@@ -20643,7 +20902,7 @@ impl FnLowerer<'_> {
         rhs: &Expr,
         ty: &MirType,
     ) -> Option<ValueId> {
-        if op != ast::BinOp::Add || !ty.is_float() {
+        if op != ast::BinOp::Add || !ty.is_float() || self.gemm.strict_fp {
             return None;
         }
         // A local `fn` (not a closure) so the borrow of the returned sub-exprs ties to the
@@ -20979,9 +21238,8 @@ impl FnLowerer<'_> {
                 if let Some(v) = self.lower_heap_builtin(name, args) {
                     return v;
                 }
-                // The file-I/O builtins `read_<T>(path, buf)` / `write_<T>(path, buf)` lower to one
-                // wukong_rt_{read,write}_<T>(path, data, len) runtime call.
-                if let Some(v) = self.lower_file_io(self.interner.resolve(name), args) {
+                // The ML builtins lower in `ml_builtins.rs` (see its module docs).
+                if let Some(v) = self.lower_ml_builtin(name, args) {
                     return v;
                 }
                 // The `now_ns()` timing intrinsic lowers to one zero-argument `wukong_now_ns() -> i64`
@@ -21193,55 +21451,6 @@ impl FnLowerer<'_> {
         Some(sbuf)
     }
 
-    /// The raw file-I/O builtins `read_<T>(path, buf)` / `write_<T>(path, buf)` (for T in
-    /// f32/i32/i64/u8) each lower to a single `wukong_rt_{read,write}_<T>(path, data, len)` runtime
-    /// call returning `i64` — the element count on success, or -1 (open/create fail) / -2 (io error).
-    /// `path` lowers to its `*u8` pointer directly (a string literal / `*u8` binding *is* its address,
-    /// exactly like `print_str`); `buf` is a slice whose `{data,len}` are read out of the fat pointer
-    /// (`SLICE_PTR_OFF`/`SLICE_LEN_OFF`). Both backends emit the identical opaque `Op::Call`, so the
-    /// headerless little-endian file format stays byte-for-byte and return-code identical (the same
-    /// differential contract as the heap/GEMM dispatch). A user function of the same name shadows the
-    /// builtin because `lower_call` resolves `DefKind::Fn` before reaching here. Returns `None` for
-    /// any other name or arity so the generic unsupported-call path handles it rather than miscompile.
-    fn lower_file_io(&mut self, name: &str, args: &[Expr]) -> Option<ValueId> {
-        let func = match name {
-            "read_f32" => self.gemm.rt_read_f32,
-            "read_i32" => self.gemm.rt_read_i32,
-            "read_i64" => self.gemm.rt_read_i64,
-            "read_u8" => self.gemm.rt_read_u8,
-            "read_f64" => self.gemm.rt_read_f64,
-            "read_i8" => self.gemm.rt_read_i8,
-            "write_f32" => self.gemm.rt_write_f32,
-            "write_i32" => self.gemm.rt_write_i32,
-            "write_i64" => self.gemm.rt_write_i64,
-            "write_u8" => self.gemm.rt_write_u8,
-            "write_f64" => self.gemm.rt_write_f64,
-            "write_i8" => self.gemm.rt_write_i8,
-            _ => return None,
-        };
-        // Sema guarantees `(path: *u8, buf: []T)` (E0401/E0503 otherwise); decline anything else so
-        // the generic unsupported-call path reports it rather than indexing a missing argument.
-        if args.len() != 2 {
-            return None;
-        }
-        // `path`: the `*u8` pointer value itself (a string literal lowers to a `.rodata` GlobalAddr,
-        // a `*u8` binding to its pointer) — passed straight through as `path: *const u8`.
-        let path = self.lower_expr(&args[0]);
-        // `buf`: pull the base pointer and element count out of the slice's fat pointer {data,len}.
-        let sbuf = self.lower_expr(&args[1]);
-        let dp = self.field_ptr(sbuf, SLICE_PTR_OFF);
-        let data = self.builder.build(MirType::Ptr, Op::Load(dp, MirType::Ptr));
-        let lp = self.field_ptr(sbuf, SLICE_LEN_OFF);
-        let len = self.builder.build(MirType::I64, Op::Load(lp, MirType::I64));
-        Some(self.builder.build(
-            MirType::I64,
-            Op::Call {
-                func,
-                args: vec![path, data, len],
-            },
-        ))
-    }
-
     /// Lower the `now_ns()` timing intrinsic to one zero-argument `wukong_now_ns() -> i64` runtime
     /// call — a monotonic process-lifetime nanosecond clock for in-process benchmarking. Returns
     /// `None` for any other name or a nonzero arity (sema already rejected the latter with E0503) so
@@ -21408,9 +21617,14 @@ impl FnLowerer<'_> {
             }
             // exp2(x)=exp(x·ln2), log2(x)=log(x)·log2(e), sinh/cosh=(eˣ∓e⁻ˣ)/2 — composed from the
             // shared exp/log so they vectorize and stay bit-exact across backends; the dispatched
-            // 256-bit kernel mirrors this op-for-op.
+            // 256-bit kernel mirrors this op-for-op. In `f64` the composition would lose
+            // `|x|·ε` relative accuracy in the `x·ln2` product, so each base-2/base-10 function is
+            // its own < 1 ULP runtime routine instead.
             MathIntrinsic::Exp2 => {
                 let x = self.lower_math_arg(args.first()?, &rty);
+                if matches!(rty.lane_type(), MirType::F64) {
+                    return Some(self.emit_math_f64(x, VMATH_EXP2, &rty));
+                }
                 let ln2 = self.splat_const_f(std::f64::consts::LN_2, &rty);
                 let xl = self
                     .builder
@@ -21419,6 +21633,9 @@ impl FnLowerer<'_> {
             }
             MathIntrinsic::Log2 => {
                 let x = self.lower_math_arg(args.first()?, &rty);
+                if matches!(rty.lane_type(), MirType::F64) {
+                    return Some(self.emit_math_f64(x, VMATH_LOG2, &rty));
+                }
                 let lx = self.emit_log(x, &rty);
                 let log2e = self.splat_const_f(std::f64::consts::LOG2_E, &rty);
                 Some(
@@ -21428,6 +21645,9 @@ impl FnLowerer<'_> {
             }
             MathIntrinsic::Exp10 => {
                 let x = self.lower_math_arg(args.first()?, &rty);
+                if matches!(rty.lane_type(), MirType::F64) {
+                    return Some(self.emit_math_f64(x, VMATH_EXP10, &rty));
+                }
                 let ln10 = self.splat_const_f(std::f64::consts::LN_10, &rty);
                 let xl = self
                     .builder
@@ -21436,6 +21656,9 @@ impl FnLowerer<'_> {
             }
             MathIntrinsic::Log10 => {
                 let x = self.lower_math_arg(args.first()?, &rty);
+                if matches!(rty.lane_type(), MirType::F64) {
+                    return Some(self.emit_math_f64(x, VMATH_LOG10, &rty));
+                }
                 let lx = self.emit_log(x, &rty);
                 let log10e = self.splat_const_f(std::f64::consts::LOG10_E, &rty);
                 Some(
@@ -21757,25 +21980,99 @@ impl FnLowerer<'_> {
         self.coerce_to(v, &from, rty, signed)
     }
 
-    /// `exp(x)` as a fast, deterministic polynomial (≈1 ULP of the true `exp`). Always computed in
-    /// `f32`; for an `f64` result the argument is demoted and the result promoted (exact in both
-    /// backends). Works on a scalar or a SIMD-vector `f32`.
+    /// `exp(x)`: for `f32` the fast, deterministic 8-bucket polynomial (≈1 ULP of the true `exp`,
+    /// scalar or SIMD vector, mirroring the runtime kernel value-for-value); for `f64` one call into
+    /// the runtime's double-precision library (see [`Self::emit_math_f64`]) — full double precision,
+    /// not the f32 polynomial behind a demote/promote pair that an `f64` `exp` used to be.
     fn emit_exp(&mut self, x: ValueId, rty: &MirType) -> ValueId {
-        let want_f64 = matches!(rty.lane_type(), MirType::F64);
-        let f32ty = float_ty_like(rty, MirType::F32);
-        let xf = if want_f64 {
-            self.builder
-                .build(f32ty.clone(), Op::Cast(CastKind::FpTrunc, x, f32ty.clone()))
-        } else {
-            x
-        };
-        let r = self.emit_exp_f32(xf, &f32ty);
-        if want_f64 {
-            self.builder
-                .build(rty.clone(), Op::Cast(CastKind::FpExt, r, rty.clone()))
-        } else {
-            r
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_EXP, rty);
         }
+        let f32ty = float_ty_like(rty, MirType::F32);
+        self.emit_exp_f32(x, &f32ty)
+    }
+
+    /// An `f64` transcendental as one call of `wukong_rt_math_f64(x, op)` (`op` a `VMATH_*` code),
+    /// the runtime's pure-Rust double-precision library (`wukong_runtime::math64`: fdlibm/musl
+    /// algorithms, ≤1 ULP for the core, Payne–Hanek trig reduction, every special value). The
+    /// interpreter calls the same Rust function the JIT binds and the AOT link resolves, so the
+    /// three backends agree bit-for-bit; the textual-LLVM emitter declares the symbol from the
+    /// call site. A `Vec` of `f64` is handled lane by lane (the autovectorizer never vectorizes an
+    /// f64 transcendental, so this is the robustness path, not a hot one).
+    fn emit_math_f64(&mut self, x: ValueId, op: u32, rty: &MirType) -> ValueId {
+        let opcode = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(op as i128, MirType::I64));
+        let func = self.gemm.math_f64;
+        self.emit_f64_lanewise(rty, &[x], move |this, lanes| {
+            this.builder.build(
+                MirType::F64,
+                Op::Call {
+                    func,
+                    args: vec![lanes[0], opcode],
+                },
+            )
+        })
+    }
+
+    /// The two-argument twin of [`Self::emit_math_f64`]: `wukong_rt_math2_f64(a, b, op)` with a
+    /// `VMATH2_*` code (`pow`, `atan2`, `hypot`).
+    fn emit_math2_f64(&mut self, a: ValueId, b: ValueId, op: u32, rty: &MirType) -> ValueId {
+        let opcode = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(op as i128, MirType::I64));
+        let func = self.gemm.math2_f64;
+        self.emit_f64_lanewise(rty, &[a, b], move |this, lanes| {
+            this.builder.build(
+                MirType::F64,
+                Op::Call {
+                    func,
+                    args: vec![lanes[0], lanes[1], opcode],
+                },
+            )
+        })
+    }
+
+    /// Apply the scalar `f64` operation `scalar_op` to `inputs` (every one of type `rty`):
+    /// directly when `rty` is the scalar `f64`, or lane by lane through a stack array when it is a
+    /// `Vec` of `f64` — the same extract/store/load route `emit_trig_f32`'s exceptional-lane path
+    /// uses, so the result is an ordinary vector value.
+    fn emit_f64_lanewise(
+        &mut self,
+        rty: &MirType,
+        inputs: &[ValueId],
+        scalar_op: impl Fn(&mut Self, &[ValueId]) -> ValueId,
+    ) -> ValueId {
+        let MirType::Vec(_, lanes) = rty else {
+            return scalar_op(self, inputs);
+        };
+        let lanes = *lanes;
+        let storage = self
+            .builder
+            .alloca(MirType::Array(Box::new(MirType::F64), lanes));
+        let mut lane_inputs = Vec::with_capacity(inputs.len());
+        for lane in 0..lanes {
+            lane_inputs.clear();
+            for &v in inputs {
+                let value = self.builder.build(MirType::F64, Op::ExtractLane(v, lane));
+                lane_inputs.push(value);
+            }
+            let output = scalar_op(self, &lane_inputs);
+            let index = self
+                .builder
+                .build(MirType::I64, Op::ConstInt(lane as i128, MirType::I64));
+            let ptr = self.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: storage,
+                    index,
+                    elem: MirType::F64,
+                },
+            );
+            self.builder.build_void(Op::Store { ptr, value: output });
+        }
+        self.builder
+            .build(rty.clone(), Op::Load(storage, rty.clone()))
     }
 
     /// `sigmoid(x) = 1 / (1 + exp(-x))`, built on the exp polynomial. Works on a scalar or a SIMD
@@ -21791,9 +22088,149 @@ impl FnLowerer<'_> {
             .build(rty.clone(), Op::Bin(BinOp::FDiv, one, denom))
     }
 
-    /// `tanh(x) = 1 - 2 / (exp(2x) + 1)`, built on the exp polynomial (same identity the GELU tanh
-    /// approximation uses). Works on a scalar or a SIMD vector; bit-identical across backends.
+    /// `tanh(x)`, the language's one `tanh`: for `f32` the ≤1-ULP piecewise kernel — the degree-5
+    /// odd polynomial `x + (x·t)·P(t)` below `TANH_XC`, the rotated 8-bucket `exp` reduction
+    /// `1 − 2/(E+1)` above, blended on `|x| > TANH_XC`, sign restored by `copysign` — mirroring
+    /// the runtime's `tanh1`/`tanh8` (`VM_TANH`) **op-for-op**: every `Fma` is its `mul_add`/
+    /// `fmadd`, the clamp is its NaN-to-second-operand `min`, the bucket lookup is the same
+    /// 3-level select tree `emit_exp_f32` uses for `vpermps`. So a dispatched `for i { o[i] =
+    /// tanh(x[i]) }` loop, a composed/scalar `tanh`, `@generic` and `WUKONG_NO_RECOGNIZE` all
+    /// compute the same bits on every lane, −0 and |x| < 2⁻²⁵ included (the old exp-composed
+    /// inline form returned `+0.0` there and drifted up to 80 ULP from the kernel). Works on a
+    /// scalar or a SIMD vector; for `f64` it is one call of the runtime's double-precision `tanh`.
     fn emit_tanh(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_TANH, rty);
+        }
+        let fty = rty;
+        let ity = float_ty_like(fty, MirType::I32);
+        let mty = mask_ty(fty);
+        let ax = self.emit_abs(x, fty);
+        // |x| ≤ TANH_XC: x + (x·t)·P(t), Horner in t = x² (P[5] innermost, P[0] last).
+        let t = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FMul, ax, ax));
+        let mut p = self.splat_const_f(TANH_P[5], fty);
+        for &c in TANH_P[..5].iter().rev() {
+            let cc = self.splat_const_f(c, fty);
+            p = self.builder.build(fty.clone(), Op::Fma(t, p, cc));
+        }
+        let w = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, ax, t));
+        let y_poly = self.builder.build(fty.clone(), Op::Fma(w, p, ax));
+        // |x| > TANH_XC: 1 − 2/(E+1), E = 2^k·M from the rotated 8-bucket exp reduction of
+        // 2·min(|x|, 10). The clamp keeps 2^k normal for ±∞ and the saturated band; a NaN fails
+        // the ordered compare and takes the clamp, exactly like the kernel's `min_ps`.
+        let clamp = self.splat_const_f(TANH_EXP_CLAMP, fty);
+        let below = self
+            .builder
+            .build(mty.clone(), Op::Cmp(CmpOp::Folt, ax, clamp));
+        let axc = self
+            .builder
+            .build(fty.clone(), Op::Select(below, ax, clamp));
+        let x2 = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FAdd, axc, axc));
+        let scale = self.splat_const_f(EXP_TBL_SCALE, fty);
+        let magic = self.splat_const_f(EXP_MAGIC, fty);
+        let tt = self.builder.build(fty.clone(), Op::Fma(x2, scale, magic));
+        let n = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FSub, tt, magic));
+        // m = bits(tt) − TANH_EXP_MBIAS = n + 1020: bits 2..0 index the rotated table, m >> 3 is
+        // the biased exponent of 2^k.
+        let bits = self
+            .builder
+            .build(ity.clone(), Op::Cast(CastKind::Bitcast, tt, ity.clone()));
+        let mb = self.splat_const_i(TANH_EXP_MBIAS, &ity);
+        let m = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::Sub, bits, mb));
+        let neg_c1 = self.splat_const_f(-EXP_TBL_C1, fty);
+        let neg_c2 = self.splat_const_f(-EXP_TBL_C2, fty);
+        let r = self.builder.build(fty.clone(), Op::Fma(n, neg_c1, x2));
+        let r = self.builder.build(fty.clone(), Op::Fma(n, neg_c2, r));
+        let zero_i = self.splat_const_i(0, &ity);
+        let bit_mask = |this: &mut Self, bit: i128| {
+            let c = this.splat_const_i(bit, &ity);
+            let and = this.builder.build(ity.clone(), Op::Bin(BinOp::And, m, c));
+            this.builder
+                .build(mty.clone(), Op::Cmp(CmpOp::Ne, and, zero_i))
+        };
+        let b0 = bit_mask(self, 1);
+        let b1 = bit_mask(self, 2);
+        let b2 = bit_mask(self, 4);
+        let consts: Vec<ValueId> = TANH_EXP_T
+            .iter()
+            .map(|&v| self.splat_const_f(v, fty))
+            .collect();
+        let s01 = self
+            .builder
+            .build(fty.clone(), Op::Select(b0, consts[1], consts[0]));
+        let s23 = self
+            .builder
+            .build(fty.clone(), Op::Select(b0, consts[3], consts[2]));
+        let s45 = self
+            .builder
+            .build(fty.clone(), Op::Select(b0, consts[5], consts[4]));
+        let s67 = self
+            .builder
+            .build(fty.clone(), Op::Select(b0, consts[7], consts[6]));
+        let s0123 = self.builder.build(fty.clone(), Op::Select(b1, s23, s01));
+        let s4567 = self.builder.build(fty.clone(), Op::Select(b1, s67, s45));
+        let tj = self
+            .builder
+            .build(fty.clone(), Op::Select(b2, s4567, s0123));
+        // e^r − 1 = r·(1 + r/2 + r²/6 + r³/24), then M = T + T·(e^r − 1) in one rounding.
+        let q4 = self.splat_const_f(TANH_EXP_Q4, fty);
+        let q3 = self.splat_const_f(TANH_EXP_Q3, fty);
+        let half = self.splat_const_f(0.5, fty);
+        let one = self.splat_const_f(1.0, fty);
+        let q = self.builder.build(fty.clone(), Op::Fma(r, q4, q3));
+        let q = self.builder.build(fty.clone(), Op::Fma(r, q, half));
+        let q = self.builder.build(fty.clone(), Op::Fma(r, q, one));
+        let pm1 = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, r, q));
+        let mm = self.builder.build(fty.clone(), Op::Fma(tj, pm1, tj));
+        // 2^k from the biased exponent m >> 3, shift-free: (m & ~7)·2^20 == (m >> 3) << 23
+        // (m ≥ 1020 > 0 always, so the two spellings agree) — `emit_exp_f32`'s vector-legal form.
+        let low3 = self.splat_const_i(-8, &ity);
+        let mhi = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::And, m, low3));
+        let pow = self.splat_const_i(1_048_576, &ity);
+        let shifted = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::Mul, mhi, pow));
+        let pow2 = self.builder.build(
+            fty.clone(),
+            Op::Cast(CastKind::Bitcast, shifted, fty.clone()),
+        );
+        // E + 1 is exact (M ∈ [0.648, 1.354), k ≤ 24); the reciprocal rounds once, the fma once.
+        let d = self.builder.build(fty.clone(), Op::Fma(mm, pow2, one));
+        let rr = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FDiv, one, d));
+        let neg2 = self.splat_const_f(-2.0, fty);
+        let y_exp = self.builder.build(fty.clone(), Op::Fma(neg2, rr, one));
+        let xc = self.splat_const_f(TANH_XC, fty);
+        let big = self.builder.build(mty, Op::Cmp(CmpOp::Fogt, ax, xc));
+        let y = self
+            .builder
+            .build(fty.clone(), Op::Select(big, y_exp, y_poly));
+        // copysign(y, x): the magnitude is non-negative on both branches, so this is the kernel's
+        // and-not/or ending bit-for-bit — and it SETS the sign on a NaN rather than xor-flipping it.
+        self.emit_copysign(y, x, fty)
+    }
+
+    /// The exp-*composed* `tanh(x) = 1 − 2/(exp(2x) + 1)` — **not** the language's `tanh` (that is
+    /// [`Self::emit_tanh`]) but the private building block of the composed activations `gelu`,
+    /// `mish`, `tanhshrink`, `tanh_backward` and `gelu_backward`, whose dispatched runtime kernels
+    /// (`gelu8`/`mish8`/…) are built on the same `tanh_exp1`/`tanh_exp8` so each composed
+    /// activation stays bit-identical to its kernel. Scalar or SIMD; for `f64` there is no kernel
+    /// twin to match, so it is the runtime's accurate double-precision `tanh`.
+    fn emit_tanh_exp(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_TANH, rty);
+        }
         let two = self.splat_const_f(2.0, rty);
         let twox = self
             .builder
@@ -21828,7 +22265,7 @@ impl FnLowerer<'_> {
         let t = self.builder.build(rty.clone(), Op::Fma(c1, x3, x)); // 0.044715·x³ + x
         let c0 = self.splat_const_f(0.7978845608, rty);
         let inner = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, c0, t));
-        let th = self.emit_tanh(inner, rty);
+        let th = self.emit_tanh_exp(inner, rty);
         let one = self.splat_const_f(1.0, rty);
         let onep = self
             .builder
@@ -21870,7 +22307,7 @@ impl FnLowerer<'_> {
         let x3 = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x2, x));
         let t = self.builder.build(rty.clone(), Op::Fma(c1, x3, x)); // c1·x³ + x
         let inner = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, c0, t));
-        let u = self.emit_tanh(inner, rty);
+        let u = self.emit_tanh_exp(inner, rty);
         let onep = self
             .builder
             .build(rty.clone(), Op::Bin(BinOp::FAdd, one, u));
@@ -21923,7 +22360,7 @@ impl FnLowerer<'_> {
     /// `tanh_backward(x, dy) = dy · (1 − tanh²(x))`. Mirrors `tanh_bwd8`/`tanh_bwd_2`, so the inlined
     /// fallback equals the 256-bit dispatch. The tanh-gate (RNN/LSTM cell) training gradient.
     fn emit_tanh_backward(&mut self, x: ValueId, dy: ValueId, rty: &MirType) -> ValueId {
-        let t = self.emit_tanh(x, rty);
+        let t = self.emit_tanh_exp(x, rty);
         let one = self.splat_const_f(1.0, rty);
         let t2 = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, t, t));
         let sech2 = self
@@ -22006,7 +22443,7 @@ impl FnLowerer<'_> {
     /// `mish(x) = x · tanh(softplus(x))`, the self-gated smooth activation. Mirrors `mish8` op-for-op.
     fn emit_mish(&mut self, x: ValueId, rty: &MirType) -> ValueId {
         let sp = self.emit_softplus(x, rty);
-        let th = self.emit_tanh(sp, rty);
+        let th = self.emit_tanh_exp(sp, rty);
         let result = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, th));
         self.emit_quiet_nan(x, result, rty)
     }
@@ -22061,13 +22498,16 @@ impl FnLowerer<'_> {
 
     /// `tanhshrink(x) = x − tanh(x)`. Mirrors `tanhshrink8`.
     fn emit_tanhshrink(&mut self, x: ValueId, rty: &MirType) -> ValueId {
-        let th = self.emit_tanh(x, rty);
+        let th = self.emit_tanh_exp(x, rty);
         self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, x, th))
     }
 
     /// `hardsigmoid(x) = clamp(x+3, 0, 6)·(1/6)`. The clamp is `Cmp(Fogt)`/`Cmp(Folt)` + `Select`,
-    /// which matches the AVX2 `hardsigmoid8` (`max_ps`/`min_ps`) bit-for-bit (ordered compares are
-    /// false for NaN, so both return the bound).
+    /// which matches the AVX2 `hardsigmoid8` (`max_ps`/`min_ps`) bit-for-bit. Its ordered compares
+    /// are false on a NaN, so the clamp alone would map NaN to the bound `0`; a NaN input instead
+    /// selects `y = x + 3` (the input NaN, quieted), mirroring the runtime's `hardsigmoid1`/
+    /// `hardsigmoid8` — NaN in, NaN out. `Fone` is the unordered `!=` on every backend, so
+    /// `x != x` is the NaN test; a `Select` (not a bitcast) keeps the formula differentiable.
     fn emit_hardsigmoid(&mut self, x: ValueId, rty: &MirType) -> ValueId {
         let three = self.splat_const_f(3.0, rty);
         let y = self
@@ -22083,9 +22523,11 @@ impl FnLowerer<'_> {
             .builder
             .build(mask_ty(rty), Op::Cmp(CmpOp::Folt, lo, six));
         let hi = self.builder.build(rty.clone(), Op::Select(lt6, lo, six));
+        let isnan = self.builder.build(mask_ty(rty), Op::Cmp(CmpOp::Fone, x, x));
+        let h = self.builder.build(rty.clone(), Op::Select(isnan, y, hi));
         let inv6 = self.splat_const_f(1.0 / 6.0, rty);
         self.builder
-            .build(rty.clone(), Op::Bin(BinOp::FMul, hi, inv6))
+            .build(rty.clone(), Op::Bin(BinOp::FMul, h, inv6))
     }
 
     /// `hardswish(x) = x · hardsigmoid(x)`. Mirrors `hardswish8`.
@@ -22094,25 +22536,15 @@ impl FnLowerer<'_> {
         self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, hs))
     }
 
-    /// `erf(x)` (the Gauss error function — `exact` GELU is `0.5·x·(1 + erf(x/√2))`). Always computed
-    /// in `f32`; an `f64` result is demoted/promoted like `exp`/`log`. Works on a scalar or a SIMD
-    /// vector; bit-identical across backends because every step is a primitive op (see `emit_erf_f32`).
+    /// `erf(x)` (the Gauss error function — `exact` GELU is `0.5·x·(1 + erf(x/√2))`). In `f32` the
+    /// Abramowitz–Stegun fit below (scalar or SIMD vector; bit-identical across backends because
+    /// every step is a primitive op); in `f64` the runtime's < 1 ULP fdlibm `erf`.
     fn emit_erf(&mut self, x: ValueId, rty: &MirType) -> ValueId {
-        let want_f64 = matches!(rty.lane_type(), MirType::F64);
-        let f32ty = float_ty_like(rty, MirType::F32);
-        let xf = if want_f64 {
-            self.builder
-                .build(f32ty.clone(), Op::Cast(CastKind::FpTrunc, x, f32ty.clone()))
-        } else {
-            x
-        };
-        let r = self.emit_erf_f32(xf, &f32ty);
-        if want_f64 {
-            self.builder
-                .build(rty.clone(), Op::Cast(CastKind::FpExt, r, rty.clone()))
-        } else {
-            r
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_ERF, rty);
         }
+        let f32ty = float_ty_like(rty, MirType::F32);
+        self.emit_erf_f32(x, &f32ty)
     }
 
     /// The erf approximation in `f32` (Abramowitz–Stegun 7.1.26, ~1.5e-7 error). `|x|` and the
@@ -22173,6 +22605,10 @@ impl FnLowerer<'_> {
     /// `sinh8`/`cosh8` kernel mirrors this op-for-op (`-x` via `·-1` to match). Finite extremes
     /// inherit exp's saturation; input NaNs are explicitly preserved and quieted.
     fn emit_sinh_cosh(&mut self, x: ValueId, rty: &MirType, is_cosh: bool) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            let op = if is_cosh { VMATH_COSH } else { VMATH_SINH };
+            return self.emit_math_f64(x, op, rty);
+        }
         let neg1 = self.splat_const_f(-1.0, rty);
         let nx = self
             .builder
@@ -22197,6 +22633,9 @@ impl FnLowerer<'_> {
     /// `log` on `|x|+√(…) ≥ 1` dodges the `x+√(x²+1)` cancellation for large negative `x`). Reuses
     /// `emit_abs`/`emit_log`; works on a scalar or a SIMD vector, bit-identical across backends.
     fn emit_asinh(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_ASINH, rty);
+        }
         let ax = self.emit_abs(x, rty);
         let x2 = self
             .builder
@@ -22214,6 +22653,9 @@ impl FnLowerer<'_> {
     /// `acosh(x) = log(x + √(x²−1))` for `x ≥ 1` (`√` of a negative → `NaN` below, matching `libm`).
     /// Reuses `emit_log`; works on a scalar or a SIMD vector, bit-identical across backends.
     fn emit_acosh(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_ACOSH, rty);
+        }
         let x2 = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, x));
         let one = self.splat_const_f(1.0, rty);
         let inner = self
@@ -22227,6 +22669,9 @@ impl FnLowerer<'_> {
     /// `atanh(x) = ½·log((1+x)/(1−x))` for `|x| < 1` (the Fisher z-transform). Reuses `emit_log`;
     /// works on a scalar or a SIMD vector, bit-identical across backends.
     fn emit_atanh(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_ATANH, rty);
+        }
         let one = self.splat_const_f(1.0, rty);
         let num = self
             .builder
@@ -22247,6 +22692,9 @@ impl FnLowerer<'_> {
     /// (the `0·∞` otherwise). Reuses `emit_exp`/`emit_log`; mirrors `expm1_1`/`expm1_8` op-for-op, so for
     /// finite `x` the inlined form equals the dispatched kernel. Scalar or SIMD; bit-identical backends.
     fn emit_expm1(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_EXPM1, rty);
+        }
         let u = self.emit_exp(x, rty);
         let one = self.splat_const_f(1.0, rty);
         let um1 = self
@@ -22281,6 +22729,9 @@ impl FnLowerer<'_> {
     /// `log1p(x) = ln(1+x)` via Kahan's stable correction `log(u)·x/(u−1)`, `u = 1+x`, guarding `u==1 → x`.
     /// Reuses `emit_log`; mirrors `log1p_1`/`log1p_8` op-for-op. Scalar or SIMD; bit-identical backends.
     fn emit_log1p(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_LOG1P, rty);
+        }
         let one = self.splat_const_f(1.0, rty);
         let u = self
             .builder
@@ -22305,25 +22756,17 @@ impl FnLowerer<'_> {
             .build(rty.clone(), Op::Select(is_inf, inf, result))
     }
 
-    /// `sin(x)` (`is_cos == false`) or `cos(x)` (`true`) as a fast, deterministic polynomial. Always
-    /// computed in `f32`; an `f64` result is demoted/promoted like `exp`. Works on a scalar or a SIMD
-    /// vector; bit-identical across backends. Enables rotary position embeddings (RoPE).
+    /// `sin(x)` (`is_cos == false`) or `cos(x)` (`true`): in `f32` the fast, deterministic
+    /// polynomial (scalar or SIMD vector, bit-identical across backends; enables rotary position
+    /// embeddings); in `f64` the runtime's fdlibm `sin`/`cos` with Payne–Hanek reduction, < 1 ULP
+    /// for every finite argument.
     fn emit_trig(&mut self, x: ValueId, rty: &MirType, is_cos: bool) -> ValueId {
-        let want_f64 = matches!(rty.lane_type(), MirType::F64);
-        let f32ty = float_ty_like(rty, MirType::F32);
-        let xf = if want_f64 {
-            self.builder
-                .build(f32ty.clone(), Op::Cast(CastKind::FpTrunc, x, f32ty.clone()))
-        } else {
-            x
-        };
-        let r = self.emit_trig_f32(xf, &f32ty, is_cos);
-        if want_f64 {
-            self.builder
-                .build(rty.clone(), Op::Cast(CastKind::FpExt, r, rty.clone()))
-        } else {
-            r
+        if matches!(rty.lane_type(), MirType::F64) {
+            let op = if is_cos { VMATH_COS } else { VMATH_SIN };
+            return self.emit_math_f64(x, op, rty);
         }
+        let f32ty = float_ty_like(rty, MirType::F32);
+        self.emit_trig_f32(x, &f32ty, is_cos)
     }
 
     /// Standalone scalar trig stays a single SSA call so it remains differentiable. Vector
@@ -22512,24 +22955,15 @@ impl FnLowerer<'_> {
         }
     }
 
-    /// `atan(x)`, computed in `f32` (demote/promote an `f64` result like `exp`). Works on a scalar or
-    /// a SIMD vector; bit-identical across backends. Enables angle/geometry ops and `atan2`-style schemes.
+    /// `atan(x)`: in `f32` the Cephes polynomial (scalar or SIMD vector; bit-identical across
+    /// backends); in `f64` the runtime's < 1 ULP fdlibm `atan`. Enables angle/geometry ops and
+    /// `atan2`-style schemes.
     fn emit_atan(&mut self, x: ValueId, rty: &MirType) -> ValueId {
-        let want_f64 = matches!(rty.lane_type(), MirType::F64);
-        let f32ty = float_ty_like(rty, MirType::F32);
-        let xf = if want_f64 {
-            self.builder
-                .build(f32ty.clone(), Op::Cast(CastKind::FpTrunc, x, f32ty.clone()))
-        } else {
-            x
-        };
-        let r = self.emit_atan_f32(xf, &f32ty);
-        if want_f64 {
-            self.builder
-                .build(rty.clone(), Op::Cast(CastKind::FpExt, r, rty.clone()))
-        } else {
-            r
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_ATAN, rty);
         }
+        let f32ty = float_ty_like(rty, MirType::F32);
+        self.emit_atan_f32(x, &f32ty)
     }
 
     /// The Cephes `atan` poly in `f32` (`fty` is `f32` or a `Vec` of `f32`) — mirrors `atan1`/`atan8`
@@ -22596,6 +23030,9 @@ impl FnLowerer<'_> {
     /// `tan(x) = sin(x)/cos(x)` — reuses `emit_trig` (which mirrors `sincos1`/`sin8`), so the composed
     /// and dispatched forms agree. Works on a scalar or a SIMD vector.
     fn emit_tan(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_TAN, rty);
+        }
         let s = self.emit_trig(x, rty, false);
         let c = self.emit_trig(x, rty, true);
         self.builder.build(rty.clone(), Op::Bin(BinOp::FDiv, s, c))
@@ -22604,6 +23041,9 @@ impl FnLowerer<'_> {
     /// `asin(x) = atan(x/√(1−x²))` over `[−1, 1]` — mirrors `asin1`/`asin8` op-for-op (`x²`, `1−x²`,
     /// `Op::Sqrt`, divide, then `emit_atan`), so dispatched and composed agree bit-for-bit on `f32`.
     fn emit_asin(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_ASIN, rty);
+        }
         let x2 = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, x));
         let one = self.splat_const_f(1.0, rty);
         let om = self
@@ -22617,6 +23057,9 @@ impl FnLowerer<'_> {
     /// `acos(x) = π/2 − asin(x)` over `[−1, 1]` — mirrors `acos1`/`acos8`. The π/2 constant is the same
     /// `FRAC_PI_2 as f32` the kernel uses, so it matches bit-for-bit.
     fn emit_acos(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_ACOS, rty);
+        }
         let asin = self.emit_asin(x, rty);
         let pio2 = self.splat_const_f(ATAN_PIO2, rty);
         self.builder
@@ -22627,6 +23070,9 @@ impl FnLowerer<'_> {
     /// reusing `emit_exp`/`emit_log`. Bitwise copysign retains negative zero and NaN signs.
     /// Works scalar or vector; bit-identical to the dispatched kernel.
     fn emit_cbrt(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_CBRT, rty);
+        }
         let ax = self.emit_abs(x, rty);
         let lx = self.emit_log(ax, rty);
         let third = self.splat_const_f(1.0 / 3.0, rty);
@@ -22647,6 +23093,11 @@ impl FnLowerer<'_> {
     /// Positive-base power with exact x^0 and 1^y identities, before NaN handling.
     /// Other inputs retain the runtime's exp(y * log(x)) approximation contract.
     fn emit_pow(&mut self, x: ValueId, y: ValueId, rty: &MirType) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            // The runtime's fdlibm `pow`: the same `x^0 = 1` / `1^y = 1` identities (NaN included),
+            // plus the full negative-base and integer-exponent contract, < 1 ULP.
+            return self.emit_math2_f64(x, y, VMATH2_POW, rty);
+        }
         let lx = self.emit_log(x, rty);
         let ylx = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, y, lx));
         let ordinary = self.emit_exp(ylx, rty);
@@ -22670,6 +23121,11 @@ impl FnLowerer<'_> {
     /// Full-circle angle, including signed-zero axes and infinite diagonals.
     /// Ordinary finite nonzero inputs retain atan(y/x) and the runtime quadrant correction.
     fn emit_atan2(&mut self, y: ValueId, x: ValueId, rty: &MirType) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            // The runtime's fdlibm `atan2`: the same signed-zero axis / infinite-diagonal table
+            // the inline form spells out below, at < 1 ULP.
+            return self.emit_math2_f64(y, x, VMATH2_ATAN2, rty);
+        }
         let mty = mask_ty(rty);
         let q = self.builder.build(rty.clone(), Op::Bin(BinOp::FDiv, y, x));
         let angle = self.emit_atan(q, rty);
@@ -22733,8 +23189,13 @@ impl FnLowerer<'_> {
     /// `hypot(a, b) = √(a² + b²)`, the overflow-safe 2-norm/magnitude (gradient norms, complex modulus,
     /// 2-D distance). Scaled by `m = max(|a|, |b|)` so `(a/m)² + (b/m)² ≤ 2` never overflows; the `m = 0`
     /// case (both zero) is guarded to `0` (else `0/0 = NaN`). All primitive ops, so it vectorizes and is
-    /// bit-identical across backends. Works scalar or vector.
+    /// bit-identical across backends. Works scalar or vector. In `f64` it is the runtime's < 1 ULP musl
+    /// `hypot` (exact double-double squares, scaled against over/underflow, the same `±∞`-beats-NaN
+    /// table the inline form spells out below).
     fn emit_hypot(&mut self, a: ValueId, b: ValueId, rty: &MirType) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math2_f64(a, b, VMATH2_HYPOT, rty);
+        }
         let mty = mask_ty(rty);
         let aa = self.emit_abs(a, rty);
         let bb = self.emit_abs(b, rty);
@@ -22915,25 +23376,15 @@ impl FnLowerer<'_> {
         self.emit_quiet_nan(input, result, fty)
     }
 
-    /// `log(x)` (natural log) as a fast, deterministic polynomial (≈1 ULP of the true `log`). Always
-    /// computed in `f32`; for an `f64` result the argument is demoted and the result promoted (the
-    /// same f32-precision model `exp` uses). Works on a scalar or a SIMD-vector `f32`.
+    /// `log(x)` (natural log): for `f32` the fast, deterministic 8-bucket polynomial (≈1 ULP of
+    /// the true `log`, scalar or SIMD vector, mirroring the runtime kernel value-for-value); for
+    /// `f64` one call into the runtime's double-precision library, like `emit_exp`.
     fn emit_log(&mut self, x: ValueId, rty: &MirType) -> ValueId {
-        let want_f64 = matches!(rty.lane_type(), MirType::F64);
-        let f32ty = float_ty_like(rty, MirType::F32);
-        let xf = if want_f64 {
-            self.builder
-                .build(f32ty.clone(), Op::Cast(CastKind::FpTrunc, x, f32ty.clone()))
-        } else {
-            x
-        };
-        let r = self.emit_log_f32(xf, &f32ty);
-        if want_f64 {
-            self.builder
-                .build(rty.clone(), Op::Cast(CastKind::FpExt, r, rty.clone()))
-        } else {
-            r
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_LOG, rty);
         }
+        let f32ty = float_ty_like(rty, MirType::F32);
+        self.emit_log_f32(x, &f32ty)
     }
 
     /// The natural log in `f32` (`fty` is `f32` or a `Vec` of `f32`): the 8-bucket table reduction,
@@ -31065,6 +31516,43 @@ const EXP_TBL_T: [f64; 8] = [
 /// — the Chebyshev shift of the r² coefficient that absorbs the even r⁴/24 truncation term.
 const EXP_TBL_P2: f64 = 0.5000647902488708;
 const EXP_TBL_P3: f64 = 1.0 / 6.0; // rounds f64→f32 to the same bits as the runtime's f32 1/6
+
+// `tanh` constants: the ≤1-ULP two-region kernel (mirrors `wukong_runtime`'s `vmath::tanh1`/`tanh8`
+// op-for-op — see the `TANH_*` block there for the design and the error budget). Every literal is
+// the exact decimal expansion of the runtime's f32 constant (an f32 value is exactly representable
+// in f64, so `splat_const_f`'s f64→f32 rounding is the identity on it); the mirror is pinned
+// lane-for-lane against the kernel by `wukong_codegen_cranelift`'s
+// `dispatched_tanh_equals_composed_tanh` (tests/tanh_unify.rs), including −0 and |x| < 2⁻²⁵.
+/// Crossover: the odd polynomial below, the exp form above.
+const TANH_XC: f64 = 0.75;
+/// `min(|x|, 10)` keeps `2^k` normal for ±∞ and the saturated band.
+const TANH_EXP_CLAMP: f64 = 10.0;
+/// Degree-5 minimax `P(t)` with `tanh(x) = x + x³·P(x²)` on `[0, 0.75²]`, `P[0]` first.
+const TANH_P: [f64; 6] = [
+    -0.33333316445350647,
+    0.1333269476890564,
+    -0.053892724215984344,
+    0.021452033892273903,
+    -0.007657255511730909,
+    0.0017369358101859689,
+];
+/// `bits(EXP_MAGIC) − (127·8 + 4)`: `m = bits(t) − TANH_EXP_MBIAS = n + 1020`, so `m >> 3` is
+/// the biased exponent of `2^k` with `k = (n + 4) >> 3` and `m & 7` indexes the rotated table.
+const TANH_EXP_MBIAS: i128 = 0x4B40_0000 - 1020;
+/// `TANH_EXP_T[i] = 2^{(i−4)/8}`: `EXP_TBL_T` rotated by 4 with the top half halved (exact).
+const TANH_EXP_T: [f64; 8] = [
+    EXP_TBL_T[4] * 0.5,
+    EXP_TBL_T[5] * 0.5,
+    EXP_TBL_T[6] * 0.5,
+    EXP_TBL_T[7] * 0.5,
+    EXP_TBL_T[0],
+    EXP_TBL_T[1],
+    EXP_TBL_T[2],
+    EXP_TBL_T[3],
+];
+/// `1/6` and `1/24` as the runtime's f32 constants (exact decimals of `0x3e2aaaab`/`0x3d2aaaab`).
+const TANH_EXP_Q3: f64 = 0.1666666716337204;
+const TANH_EXP_Q4: f64 = 0.0416666679084301;
 
 /// Natural-log constants: the 8-bucket table reduction (mirrors `wukong_runtime`'s
 /// `vmath::log1`/`log8` value-for-value — see the algorithm write-up there). `x = z·2^k` with

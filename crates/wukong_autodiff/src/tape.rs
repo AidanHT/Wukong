@@ -173,6 +173,14 @@ pub(crate) struct Syms {
     /// `wukong_colsum_f32(x, out, rows, cols)` — `out[j] = Σ_i x[i·cols + j]`. Emit-only: it is the
     /// bias gradient (`db = colsum(dout)`) and the learned-`gamma`/`beta` gradients.
     pub colsum: Symbol,
+    /// `wukong_rt_math_f64(x, op)` — the value-returning f64 transcendental library an `f64`
+    /// `exp`/`log`/`sin`/… lowers to. **Not** a kernel (it writes no buffer): it is differentiated
+    /// on the scalar path in `lib.rs` (`diff_inst`), where its derivative is a closed form in `x`
+    /// and the forward result, emitted as further calls of this symbol. Recorded here so the VJP
+    /// can emit those calls without a mutable interner.
+    pub math_f64: Symbol,
+    /// `wukong_rt_math2_f64(a, b, op)` — the two-argument twin (`pow`/`atan2`/`hypot`); same rule.
+    pub math2_f64: Symbol,
 }
 
 impl Syms {
@@ -197,6 +205,8 @@ impl Syms {
             bias: it.intern("wukong_bias_bcast_f32"),
             bias_parallel: it.intern("wukong_bias_bcast_f32_parallel"),
             colsum: it.intern("wukong_colsum_f32"),
+            math_f64: it.intern("wukong_rt_math_f64"),
+            math2_f64: it.intern("wukong_rt_math2_f64"),
         }
     }
 }
@@ -1921,5 +1931,30 @@ impl<'a> Vjp<'a> {
 
     fn cf32(&mut self, x: f64) -> ValueId {
         self.b.build(F32, Op::ConstFloat(x, F32))
+    }
+}
+
+/// What the reverse walk does at a call to one of the ML I/O and randomness runtime entries, none of
+/// which is a tensor kernel with a VJP. The decision is explicit per entry so a new one is a choice,
+/// not a fall-through:
+/// * the typed reads (`wukong_rt_read_*`, `wukong_rt_st_read`, `wukong_rt_npy_read`), `argsort` and
+///   `sample_categorical` return an `i64` and are left to the scalar path: what they produce — file
+///   data, integer indices — is constant with respect to every input, so it carries no gradient;
+/// * [`MlCallGradient::Constant`]: `wukong_rand_fill_f32` writes counter-based random numbers that
+///   depend on no input — skipped exactly like a constant store (`[0.0; N]`), never refused;
+/// * [`MlCallGradient::Refuse`]: `wukong_topk_f32` writes `vals`, a differentiable function of `x`
+///   (`torch.topk` scatters the gradient back to the selected indices), and it has no VJP rule yet —
+///   so differentiating through it is an error rather than a silently dropped gradient.
+pub(crate) enum MlCallGradient {
+    Constant,
+    Refuse,
+}
+
+/// The [`MlCallGradient`] of the runtime entry `name`, or `None` for any other callee.
+pub(crate) fn ml_call_gradient(name: &str) -> Option<MlCallGradient> {
+    match name {
+        "wukong_rand_fill_f32" => Some(MlCallGradient::Constant),
+        "wukong_topk_f32" => Some(MlCallGradient::Refuse),
+        _ => None,
     }
 }

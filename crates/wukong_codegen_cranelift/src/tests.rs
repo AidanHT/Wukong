@@ -3110,8 +3110,9 @@ fn differential_dequant_perchan() {
 /// The embedding lookup `out[t,:] = weight[ids[t],:]` (the first layer of every LLM) dispatches to
 /// `wukong_embedding_f32`. The native run gathers via the AVX2 kernel; the interpreter marshals the
 /// identical serial kernel — pure data movement (a row copy), so they are bit-identical by
-/// construction. Covers the serial form and a large-T `@parallel` form (T past the kernel's multicore
-/// threshold so the rayon row-split actually runs, still bit-equal to serial).
+/// construction. Covers the serial form and a `@parallel` form that reaches the `_parallel` entry.
+/// At 80 x 4 the entry's shared work gate (`wukong_runtime::par`, default 2^18 element-ops) keeps
+/// the gather serial; set `WUKONG_PAR_MIN_WORK=1` to force the rayon row-split through this test.
 #[test]
 fn differential_embedding() {
     // Small serial gather: T=4, V=4, H=3, ids hitting row 0, the last row, and a repeat.
@@ -3123,7 +3124,7 @@ fn differential_embedding() {
          let mut acc: f32 = 0.0; for i in 0..12 { acc = acc + out[i]; } \
          print(acc); print(out[0]); print(out[11]); return 0; }"
         .to_string();
-    // Large @parallel gather: T=80 (> EMBEDDING_PAR_MIN=64, so the multicore split runs), V=8, H=4.
+    // @parallel gather: T=80, V=8, H=4 (multicore split only under `WUKONG_PAR_MIN_WORK=1`).
     let parallel = "@parallel\nfn embed(ids: [i32; 80], weight: [f32; 32], mut out: [f32; 320]) { \
          for t in 0..80 { for d in 0..4 { out[t * 4 + d] = weight[ids[t] * 4 + d]; } } } \
          fn main() -> i32 { let mut weight: [f32; 32] = [0.0; 32]; \
@@ -5669,8 +5670,9 @@ fn scaled_gemv_dispatches_and_matches() {
         );
     }
 
-    // @parallel differential: M=300 exceeds GEMV_PAR_MIN_ROWS, so the real multicore kernel runs
-    // natively while the interpreter marshals the serial one — bit-identical (rows independent).
+    // @parallel differential: native calls the `_parallel` entry while the interpreter marshals the
+    // serial one — bit-identical (rows independent). At 300 x 16 the shared work gate
+    // (`wukong_runtime::par`) keeps it serial; `WUKONG_PAR_MIN_WORK=1` forces the multicore split.
     let par = "@parallel\nfn scores(k: [f32; 4800], q: [f32; 16], mut y: [f32; 300]) { \
          for i in 0..300 { let mut acc: f32 = 0.0; \
          for d in 0..16 { acc = acc + k[i*16+d]*q[d]; } \
@@ -5782,9 +5784,10 @@ fn gevm_dispatches_and_matches() {
         );
     }
 
-    // @parallel differential: cols=300 exceeds GEVM_PAR_MIN, so the real column-striped multicore
-    // kernel runs natively while the interpreter marshals the serial one — bit-identical (each
-    // column's ascending-i chain is self-contained regardless of the stripe split).
+    // @parallel differential: native calls the column-striped `_parallel` entry while the
+    // interpreter marshals the serial one — bit-identical (each column's ascending-i chain is
+    // self-contained regardless of the stripe split). At 16 x 300 the shared work gate
+    // (`wukong_runtime::par`) keeps it serial; `WUKONG_PAR_MIN_WORK=1` forces the stripes.
     let par = "@parallel\nfn readout(w: [f32; 16], a: [f32; 4800], mut out: [f32; 300]) { \
          for j in 0..300 { let mut s: f32 = 0.0; \
          for i in 0..16 { s = s + w[i]*a[i*300+j]; } \

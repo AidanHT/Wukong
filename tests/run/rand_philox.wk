@@ -1,0 +1,130 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1713891541
+// EXPECT-OUT: 4175744164
+// EXPECT-OUT: 3823634032
+// EXPECT-OUT: 1539146673
+// EXPECT-OUT: 2391789588
+// EXPECT-OUT: 1140706576
+// EXPECT-OUT: 3493829221
+// EXPECT-OUT: 6694888
+// EXPECT-OUT: 16311500
+// EXPECT-OUT: 14936070
+// EXPECT-OUT: 6012291
+// EXPECT-OUT: 9342928
+// EXPECT-OUT: 4455885
+// EXPECT-OUT: 13647770
+// EXPECT-OUT: 991
+// EXPECT-OUT: -153
+// EXPECT-OUT: 380
+// EXPECT-OUT: -1200
+// EXPECT-OUT: -276
+// EXPECT-OUT: -456
+// EXPECT-OUT: -78
+// EXPECT-OUT: 13869879
+// EXPECT-OUT: 2221751
+// EXPECT-OUT: 5742801
+// EXPECT-OUT: 9573716
+// EXPECT-OUT: 2134195
+// EXPECT-OUT: 10415838
+// EXPECT-OUT: 4180424
+// EXPECT-OUT: 11937434
+// EXPECT-OUT: 8
+// EXPECT-OUT: 11855514
+// EXPECT-OUT: 12185713
+// EXPECT-OUT: 7509719
+// EXPECT-OUT: 12878219
+// EXPECT-OUT: 4421918
+// EXPECT-OUT: 13035388
+// EXPECT-OUT: 9923295
+// EXPECT-OUT: 3128403
+// EXPECT-OUT: 15621767
+// EXPECT-OUT: 7435210
+// EXPECT-OUT: 2690875
+// EXPECT-OUT: 14110640
+// EXPECT-OUT: 6122070
+// EXPECT-OUT: 10715282
+// EXPECT-OUT: 13183963
+// EXPECT-OUT: 1827371
+// EXPECT-OUT: 16
+module tests.run.rand_philox
+
+// The counter-based RNG builtins: Philox4x32-10 with key (seed lo, seed hi) and counter
+// (ctr lo, ctr hi, 0, 0). Every expected value comes from the generator's definition, not from a
+// backend: an independent Python transcription of the block function that reproduces all three
+// Random123 known-answer vectors (the first line here IS word 0 of Random123's all-zero vector,
+// 0x6627e8d5). The pairs exercise a negative seed (high key word 0xffffffff), a counter of exactly
+// 2^32 (low word 0, high word 1) and a counter of -1 (both words all-ones).
+//
+//  * `rand_u32` prints the raw word (an unsigned print);
+//  * `rand_f32` is that word's top 24 bits over 2^24 — printed times 2^24, so the integer is
+//    exactly `word >> 8`;
+//  * `randn_f32` is one Box-Muller sample sqrt(-2 ln u1) cos(2 pi u2) from words 0 and 1, with
+//    u1 = ((w0 >> 8) + 1) / 2^24 and u2 = (w1 >> 8) / 2^24; printed times 1000 and truncated. The
+//    reference is the f64 formula; every chosen sample sits at least 0.08 units from a truncation
+//    boundary, far outside the f32 pipeline's ~5e-3-unit error;
+//  * `rand_fill_f32(buf, seed, ctr0)` (a runtime kernel) writes `rand_f32(seed, ctr0 + i)`: every
+//    lane is printed, then checked equal to the inline builtin (8 of 8);
+//  * a `@parallel` loop calling `rand_f32(seed, i)` — the RNG keeps no state, so chunking the loop
+//    across threads cannot change a lane: every lane is printed, then compared (16 of 16).
+
+@parallel
+fn fill_par(mut out: [f32; 16], seed: i64) {
+    for i in 0..16 {
+        out[i] = rand_f32(seed, i);
+    }
+}
+
+fn main() -> i32 {
+    print(rand_u32(0, 0));
+    print(rand_u32(0, 1));
+    print(rand_u32(1, 0));
+    print(rand_u32(42, 7));
+    print(rand_u32(-1, 3));
+    print(rand_u32(12345, 4294967296));
+    print(rand_u32(-7, -1));
+
+    let scale: f32 = 16777216.0;
+    print((rand_f32(0, 0) * scale) as i64);
+    print((rand_f32(0, 1) * scale) as i64);
+    print((rand_f32(1, 0) * scale) as i64);
+    print((rand_f32(42, 7) * scale) as i64);
+    print((rand_f32(-1, 3) * scale) as i64);
+    print((rand_f32(12345, 4294967296) * scale) as i64);
+    print((rand_f32(-7, -1) * scale) as i64);
+
+    print((randn_f32(0, 0) * 1000.0) as i32);
+    print((randn_f32(0, 1) * 1000.0) as i32);
+    print((randn_f32(1, 0) * 1000.0) as i32);
+    print((randn_f32(42, 7) * 1000.0) as i32);
+    print((randn_f32(2024, 11) * 1000.0) as i32);
+    print((randn_f32(5, 5) * 1000.0) as i32);
+    print((randn_f32(9, 123456789) * 1000.0) as i32);
+
+    let mut a: [f32; 8] = [0.0; 8];
+    rand_fill_f32(a, 1234, -4);
+    let mut same: i32 = 0;
+    let mut i: i64 = 0;
+    while i < 8 {
+        print((a[i] * scale) as i64);
+        if a[i] == rand_f32(1234, i - 4) {
+            same = same + 1;
+        }
+        i = i + 1;
+    }
+    print(same);
+
+    let mut p: [f32; 16] = [0.0; 16];
+    fill_par(p, 99);
+    let mut psame: i32 = 0;
+    let mut j: i64 = 0;
+    while j < 16 {
+        print((p[j] * scale) as i64);
+        if p[j] == rand_f32(99, j) {
+            psame = psame + 1;
+        }
+        j = j + 1;
+    }
+    print(psame);
+    return 0;
+}

@@ -22,8 +22,12 @@ fn main() -> i32 {
     print((asinh(sinh(x)) * 10000.0) as i32); // 10000
     let y: f32 = 1.5;
     print((acosh(cosh(y)) * 10000.0) as i32); // 15000
+    // Rounded, not truncated: 0.7f32 is 0.69999998807…, so the exact round trip scales to
+    // 6999.99988 and a truncating `as i32` prints 6999 for any 1-ULP-low result. `tanh` is
+    // ≤1 ULP (tanh(0.7f32) is one ULP below the correctly rounded value), so the identity holds
+    // to the f32 accuracy of the two functions, which is what this line pins.
     let z: f32 = 0.7;
-    print((atanh(tanh(z)) * 10000.0) as i32); // 7000
+    print((atanh(tanh(z)) * 10000.0 + 0.5) as i32); // 7000
 
     // Direct scalar values (the inlined-MIR path).
     let a: f32 = 0.5;

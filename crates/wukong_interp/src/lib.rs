@@ -300,13 +300,20 @@ fn read_file_elements(
                     let x = bytes[off] as i8;
                     Value::Int(x as i128)
                 }
-                // wukong_rt_read_u8
-                _ => Value::Int(bytes[off] as i128),
+                // wukong_rt_read_u8 — sign-extended like every integer slot: `exec` masks each
+                // integer result to its width sign-extended and a `Load` returns the slot verbatim,
+                // so the `u8` byte 0xC8 must be `Int(-56)`, exactly what a `200u8` constant or a
+                // `u8` store leaves. Zero-extended, `b == 200` and `b > 150` (unsigned) compared a
+                // different representation of the same byte: 0 here, 1 natively.
+                _ => Value::Int(bytes[off] as i8 as i128),
             };
         }
     }
     Ok(Value::Int(n as i128))
 }
+
+// The interpreter twins of the ML builtins' runtime entries, beside the frozen decoder above.
+mod ml_io;
 
 /// Pointers at or above this value encode a function index (`FUNC_TAG + idx`) rather than a memory
 /// address — how `Op::FuncAddr` is represented for `parallel_for` to call back. Real `alloca`
@@ -3067,6 +3074,28 @@ impl<'a, 'k> Interp<'a, 'k> {
                     args[1].as_int() as i64,
                 ) as f64))
             }
+            // The double-precision transcendental library an `f64` `exp`/`log`/`sin`/… lowers to:
+            // the identical pure-Rust function the JIT binds and the AOT link resolves, called on
+            // the f64 the slot holds (no narrowing), so the oracle is the native result bit-for-bit.
+            "wukong_rt_math_f64" => {
+                if args.len() != 2 {
+                    return Err("wukong_rt_math_f64 expects two arguments".into());
+                }
+                Ok(Value::Float(wukong_runtime::wukong_rt_math_f64(
+                    args[0].as_float(),
+                    args[1].as_int() as i64,
+                )))
+            }
+            "wukong_rt_math2_f64" => {
+                if args.len() != 3 {
+                    return Err("wukong_rt_math2_f64 expects three arguments".into());
+                }
+                Ok(Value::Float(wukong_runtime::wukong_rt_math2_f64(
+                    args[0].as_float(),
+                    args[1].as_float(),
+                    args[2].as_int() as i64,
+                )))
+            }
             // `wukong_vmath2_f32(x, y, out, n, op)` — the two-input 256-bit kernel (pow/atan2/hypot)
             // an `out[i] = f(x[i], y[i])` loop lowers to. Marshal `n` f32 from x AND y, call the
             // *identical* runtime kernel the native backend calls, write the result back — so the
@@ -4857,7 +4886,11 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
-            other => Err(format!("call to unknown function or intrinsic `{other}`")),
+            // The ML builtins' runtime entries live in `ml_io.rs`; anything it does not claim is
+            // an unknown callee.
+            other => self
+                .ml_intrinsic(other, args)
+                .unwrap_or_else(|| Err(format!("call to unknown function or intrinsic `{other}`"))),
         }
     }
 }

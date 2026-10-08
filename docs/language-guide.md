@@ -217,10 +217,21 @@ with the sign bit for signed integers and with zero for unsigned integers. These
 interpreter and native backend contracts, including optimized execution.
 
 Float-to-integer `as` casts truncate toward zero and saturate at the destination range; NaN
-becomes zero, and negative values cast to unsigned integers become zero. Basic `f64` arithmetic
-uses double precision, but the current transcendental lowering (`exp`, `log`, `sin`, `cos`,
-`erf`, `atan`, and functions built from them) computes through `f32`. An `f64` result from those
-functions does **not** provide double-precision transcendental accuracy.
+becomes zero, and negative values cast to unsigned integers become zero. `f64` is double
+precision throughout: arithmetic, and every transcendental on an `f64` operand — `exp`, `log`,
+`exp2`/`log2`/`exp10`/`log10`, `expm1`/`log1p`, `sin`/`cos`/`tan`, `asin`/`acos`/`atan`/`atan2`,
+`sinh`/`cosh`/`tanh`, `asinh`/`acosh`/`atanh`, `erf`, `cbrt`, `pow`, `hypot`, and the activations
+built on them — is one call into the runtime's pure-Rust double-precision library
+(`wukong_runtime::math64`: the fdlibm/musl algorithms, no platform libm, no FMA), so the
+interpreter, the native JIT and the AOT executable return the same bits on every host. The core
+(`exp`, `log`, the base-2/base-10 family, `expm1`, `log1p`, `pow`, `hypot`, `sin`/`cos`/`tan` on
+**every** finite argument via Payne–Hanek reduction, the inverse trig, `erf`, `cbrt`) is within
+**1 ULP** of the correctly rounded value; the hyperbolics `sinh`/`cosh`/`tanh`/`asinh`/`acosh`/
+`atanh` within 2 ULP; `exp10` within 3. The C23 special values hold (`exp(−∞) = +0`,
+`log(±0) = −∞`, `sin(±∞) = NaN`, `atan2`'s full quadrant table, `pow(x, ±0) = pow(1, y) = 1` even
+for NaN, odd functions return `−0` for `−0`, and every function is exactly `x` below its linear
+threshold, sign included). `tests/run/transcendental_f64.wk` prints twelve significant digits of
+each.
 
 ## Control flow ✅
 
@@ -459,6 +470,7 @@ runtime size is outside the defined contract, like any runtime index
 
 ```wukong
 @generic
+@strict_fp
 @inline
 @simd
 @tile(64, 64)
@@ -471,22 +483,31 @@ fn k(@noalias mut out: []f32, x: []f32) { … }
 
 Attribute *syntax* is parsed on functions, parameters and statements (a missing argument value is
 `E0207`), and the attribute **name is validated against a closed set** (✅): `@parallel`, `@generic`,
-`@tile`, `@extern`, `@noalias`, `@unchecked`, `@inline`, `@simd`, `@align`, `@export`. Anything else —
-`@bogus(1, 2)`, and far more usefully a typo of a real one such as `@parellel` — is **`E0306`**, where it
-used to be accepted and discarded in silence (`tests/fail/unknown_attr.wk`, `unknown_attr_typo.wk`).
-Four attributes have a consumer on a **function**: **`@parallel`** (✅), which makes its loop execute
-across CPU cores, **`@generic`** (✅), which opts the function out of the kernel recognizers (below),
-**`@tile`** (✅), which strip-mines loops (below), and **`@unchecked`** (✅), which removes the
-function's slice bounds checks (see *Memory and parallelism*; on anything but a `fn` item it is
-`E0306`). One has a consumer on a **parameter**: **`@noalias`** (✅), a promise about the storage the
-parameter points into (below).
-Everything else in the list above — `@inline`, `@simd`, `@align`, `@extern`, `@export`, and
-`@parallel`'s own `grain = …` argument — is parsed and discarded (🔵). `@tile` is consumed as loop
+`@tile`, `@extern`, `@noalias`, `@unchecked`, `@strict_fp`, `@inline`, `@simd`, `@align`, `@export`.
+Anything else — `@bogus(1, 2)`, and far more usefully a typo of a real one such as `@parellel` — is
+**`E0306`**, where it used to be accepted and discarded in silence (`tests/fail/unknown_attr.wk`,
+`unknown_attr_typo.wk`). Five attributes have a consumer on a **function**: **`@parallel`** (✅),
+which makes its loop execute across CPU cores, **`@generic`** (✅), which opts the function out of
+the kernel recognizers (below), **`@strict_fp`** (✅), which evaluates the function's float
+arithmetic in source order (below), **`@tile`** (✅), which strip-mines loops (below), and
+**`@unchecked`** (✅), which removes the function's slice bounds checks (see *Memory and
+parallelism*; on anything but a `fn` item it is `E0306`). One has a consumer on a **parameter**:
+**`@noalias`** (✅), a promise about the storage the parameter points into (below).
+`@parallel(grain = G)` (✅) is consumed too: each worker claims runs of at least `G` consecutive
+iterations of the function's parallel loop (whole-function or mid-function region), the knob an
+OpenMP `schedule(dynamic, G)` or a TBB grain size gives — useful when one iteration is too cheap to be
+worth a claim of its own. `@parallel` accepts nothing else: an unknown key (`@parallel(chunk = 4)`), a
+positional argument, a repeated `grain`, or a grain outside `1..=2^31` is **`E0306`**
+(`tests/fail/parallel_bad_grain.wk`), where the whole argument list used to be silently discarded. The
+grain changes scheduling only, never results (`tests/run/parallel_grain.wk` prints every lane at grains
+that do not divide the trip count).
+Everything else in the list above — `@inline`, `@simd`, `@align`, `@extern` and `@export` — is
+parsed and discarded (🔵). `@tile` is consumed as loop
 strip-mining (see below), and when it cannot be applied it is **`E0309`**, not a silent drop. A
 *discarded* attribute on a statement or loop is dropped there too:
 `@parallel` must sit on the function, and the mid-function parallel region is derived from the enclosing function's
-attribute, not from one written on the loop. `@generic` in that position is an error, not a silent
-drop.
+attribute, not from one written on the loop. `@generic` and `@strict_fp` in that position are an
+error, not a silent drop.
 
 ### `@generic` — “I meant this loop” ✅
 
@@ -502,13 +523,16 @@ fn saxpy(a: f32, x: [f32; 4], y: [f32; 4], mut out: [f32; 4]) {
 probes fire inside it, so its loops are compiled as written (auto-vectorized, but not replaced by a
 tuned `wukong_*` kernel). Everything that is *not* a recognizer still applies — auto-vectorization,
 loop fusion, FMA contraction, `@parallel` outlining, and the whole optimizer — and the builtins you
-call by name (`alloc_f32`, `read_f32`, `sdpa`, …) still lower to their runtime entry points.
+call by name (`alloc_f32`, `read_f32`, `sdpa`, …) still lower to their runtime entry points. To also
+turn off FMA contraction and reduction reassociation, use `@strict_fp` (which implies `@generic`).
 
 Two reasons to reach for it. First, honesty: a recognized kernel is invisible to every behavioral
 gate, so `@generic` is how you write the loop you want measured (`tests/run/lang_generic_saxpy.wk`,
 `lang_generic_naive_gemm.wk` are the same body with and without the attribute — the MIR then holds
 exactly one kernel call). Second, control: it is the escape hatch when a nest merely *looks* like a
-GEMM and you want your own arithmetic order.
+GEMM and you want your own arithmetic order — the two orders are spelled out under **What a matmul
+computes** below, and `tests/run/lang_generic_gemm_fma_order.wk` pins the size at which they
+provably coincide.
 
 It must sit on the `fn`. `@generic` on a statement or a loop is **`E0306`** — the attribute is read
 from the function item, so accepting it there would promise a per-loop opt-out that does not exist
@@ -523,6 +547,16 @@ it, or a mid-function region whose modelled body-local is reassigned inside an i
 result is always correct — the fallback is the ordinary scalar/vectorized loop — but the parallel
 speedup is silently absent, so check with `wukongc --emit=mir -O2 f.wk | grep wukong_parallel_for`.
 Fixtures: `tests/run/parallel_control_flow.wk`, `parallel_region_reassigned_local.wk`.
+
+"Correct" here means *a* correct evaluation of the program under the fast floating-point contract,
+not *the same bits*. An `f32` **reduction** has three possible summation orders depending on how it
+is compiled — the source's left-to-right fold (`@strict_fp`, or a loop no path vectorizes), the
+sequential vectorizer's lane-partitioned tree, and the `@parallel` reduction kernel's fixed
+8192-element chunks (see [Floating-point semantics](#floating-point-semantics-)) — and adding
+`@parallel`, removing it, or making the reduction loop decline (a `step`, an `..=` range, an `f64`
+accumulator) moves the loop between the last two, which changes low-order bits. Each order is
+deterministic on its own: independent of thread count, `-O` level, backend and host. Write
+`@strict_fp` when the bits must not depend on the spelling.
 
 A sequential `for` **reduction** — `s += e`, `s = s + e`, any `+` chain holding `s` once
 (`s = s + x + y` is `s += x + y`), or a running `fmax`/`fmin`, over an `f32`, `f64`, `i32` or `i64`
@@ -539,6 +573,46 @@ reassociated order, not strict source-order summation, and it is a compiler-rele
 not promised stable across releases or equal to a different recognized runtime kernel's order. A loop
 that is not vectorized (a `while`, a declined body, or a slice access out of bounds at run time) keeps
 the strict left fold it spells.
+
+
+### What a matmul computes ✅
+
+A matmul nest that the compiler recognizes (`c[i,j] = Σ a[i,k]·b[k,j]` and its `nn.Linear`, `Aᵀ·B`,
+fused-epilogue and α-scaled spellings) runs the `wukong_sgemm*` kernel family, and that kernel has a
+fixed arithmetic order:
+
+- **Each `c[i,j]` is its own reduction.** K is split into `nb = ceil(K / kc)` blocks with
+  `kc = select_kc(K)` — the fewest equal-ish blocks of at most 384 steps, rounded to a multiple of 4
+  (`K = 805` → 272 + 272 + 261). Each block accumulates **ascending k from +0.0 with one rounding per
+  step** (a fused multiply-add), and the blocks are folded into `c` in order with one rounding each.
+  `beta = 1` (accumulate into the existing `c`) adds one more rounding up front.
+- **A fused epilogue is exact.** `act(alpha·(A·Bᵀ) + bias)` is applied once, after the last block,
+  and is bit-identical to computing the plain matmul and then applying the activation in a separate
+  loop.
+- **Nothing else changes the bits.** Thread count and `@parallel`, the scheduler, the cache-block
+  sizes other than the K block, packing, tile shapes, the `WUKONG_GEMM_*` tuning knobs, AVX2 versus
+  the portable fallback (a host without AVX2+FMA, or any non-x86 target, runs a scalar twin that
+  uses the same order with a correctly-rounded `mul_add`), and the interpreter versus the native
+  backend all produce the same bits.
+- **What does change them:** the 384-step K-block cap is part of the result. It is a compiler-build
+  contract, like the reduction partition above: stable across hosts, thread counts and backends,
+  **not** promised across releases — a retune moves the low bits of every recognized matmul.
+- **Accuracy.** Every runtime test checks `|c − exact| ≤ γ_r · Σ_k |a_ik|·|b_kj|` against an f64
+  reference, with `r = kc + nb − 1` (plus one for `beta = 1`) and `γ_r = r·u / (1 − r·u)`,
+  `u = 2⁻²⁴` — the netlib Level-3 BLAS test criterion with the rounding count this order performs.
+- **Half and int8 inputs.** bf16/f16 operands are widened exactly and then follow the f32 order; the
+  int8 `u8×i8→i32` kernel is exact (wrapping `i32`, any order gives the same bits).
+
+A matmul that is **not** recognized — declined by the matcher, written under `@generic`, or built
+with `WUKONG_NO_RECOGNIZE` — computes the loop as written: `s + a*b` contracts to one FMA, and the
+inner reduction follows the vectorized-reduction partition described above. The two orders coincide
+when the contraction is shorter than one vector group (K ≤ 3), and the corpus pins exactly that with
+non-dyadic data whose fused and unfused results differ in every lane
+(`tests/run/lang_generic_gemm_fma_order.wk`). Past that, a recognized and an unrecognized matmul may
+differ in the last bits: both are documented reassociations of the same sum, and neither is "the"
+exact answer. Integer-valued data whose partial sums stay below 2²⁴ is exact under
+any order, which is how `tests/run/gemm_blocked_every_lane.wk` checks all three kernel forms across
+three K-blocks and full and edge tiles lane by lane.
 
 Separately, loop **auto-vectorization, FMA contraction, and elementwise fusion run automatically**
 (✅) — a plain `for i in 0..n { out[i] = a*x[i] + y[i] }` is vectorized, fused with an adjacent loop,
@@ -566,6 +640,47 @@ case rather than being an f32-only gate: a `bf16`/`f16` array read through the e
 (`tests/run/parallel_reduce_lowp.wk`), while the *uncast* spelling `s = s + x[k]` stays a scalar loop
 (`tests/run/parallel_reduce_elem_bf16.wk`); an `f64` reduction has no kernel and always declines.
 Explicit `@simd`-typed vector values are still under construction (🔵); `@tile` ships (next section).
+
+### `@strict_fp` — source-order floating point ✅
+
+```wukong
+@strict_fp
+fn residual(x: f32, w: f32, b: f32) -> f32 {
+    return x + w * b;            // a rounded multiply, then a rounded add: no FMA
+}
+```
+
+`@strict_fp` on a **function** evaluates that function's floating-point arithmetic exactly as
+written: left to right, one IEEE-754 rounding per `+ - * /`, no fused multiply-add, no reassociated
+reduction. Concretely, inside the function
+
+- **no FMA contraction**: `x + y*z` is `round(x + round(y*z))`, in scalar code, in a vectorized
+  loop body and in its scalar remainder alike;
+- **float reductions keep their sequential fold**: `s = s + x[i]` adds the elements in index order
+  (it may still run SIMD loads and multiplies, but the additions stay one chain). Integer reductions
+  are exact in any order and still vectorize, and so do elementwise loops, whose lane `k` performs
+  exactly the operations of scalar iteration `i + k`;
+- **no kernel recognizers** — `@strict_fp` implies `@generic`, because a recognized GEMM,
+  reduction or norm kernel brings its own blocking, accumulator tree and FMA use. `@parallel` still
+  outlines independent iterations; a reduction in a strict `@parallel` function runs serially.
+
+What it does not change: the definition of a math intrinsic (`exp`, `fmax`, …) or of a named kernel
+builtin (`sdpa`, …) — those are functions with their own documented algorithms, which may use FMA
+internally. A strict function always gets an intrinsic's *inlined* form; an elementwise loop that a
+fast function would have dispatched to `wukong_vmath_f32` therefore uses the inlined polynomial,
+which matches the kernel except where [Math intrinsics](#math-intrinsics-) says otherwise (the
+standalone `tanh` kernel is a different approximation). Strictness is
+a property of the function *body*: a fast function called from a strict one keeps its contractions,
+even after the optimizer inlines it, and vice versa (`tests/run/strict_fp.wk`). The optimizer itself
+never reassociates, contracts, or applies algebraic float identities in either mode, so the choice is
+fixed at lowering and is identical at every `-O` level and on both backends.
+
+`--fp=strict` applies the attribute to every function of the program (`tests/run/strict_fp_cli.wk`);
+it is refused with `--emit=grad`/`--train`, whose VJP rules need the recognized kernels. Like
+`@generic`, `@strict_fp` must sit on the `fn` — on a statement, loop or parameter it is **`E0306`**.
+Strict code gives up FMA throughput, reduction ILP and the tuned kernels; reach for it where the
+result must match a reference evaluated in source order (a C/NumPy port, a checksum, a numerical
+test), not as a default.
 
 ### `@tile` — loop strip-mining ✅
 
@@ -794,10 +909,112 @@ requires fresh matched-peer measurements. `erf`, `sin` and `cos` are among those
 `sin`/`cos` loop and an exact erf-GELU loop compile to). What does *not* dispatch is a **composed or
 scalar** use — an intrinsic inside a larger expression, or a single call outside an elementwise `for` —
 which instead auto-vectorizes the inlined polynomial at 128-bit; `sqrt`/`rsqrt` also stay inline, being
-hardware instructions. A recognized standalone `tanh` loop uses the runtime's piecewise approximation.
-Scalar or composed `tanh` uses `1 - 2/(exp(2*x) + 1)`; these paths can differ in finite results and
-the sign of zero. Backend agreement for a fixed lowering path does not imply bitwise equality between
-dispatched and inlined spellings. Composed activations such as GELU retain the exp-based tanh formula.
+hardware instructions. `tanh` is **one function however it is spelled**: a dispatched `tanh` loop,
+a scalar `tanh(x)`, a composed `tanh(x) * s` and a `@generic` loop all compute the runtime's ≤1-ULP
+piecewise kernel bit-for-bit — the inlined form mirrors it op-for-op (the same FMA chain, the same
+NaN-to-clamp `min`, the same table lookup), including `−0 → −0` and `tanh(x) == x` for every
+|x| < 2⁻¹³ (`tests/run/tanh_spellings.wk`; `dispatched_tanh_equals_composed_tanh` pins every lane).
+The composed activations `gelu`, `mish`, `tanhshrink`, `tanh_backward` and `gelu_backward` keep the
+exp-composed `1 − 2/(exp(2x) + 1)` as their *internal* building block, because their dispatched
+kernels are built on it and each activation stays bit-identical to its kernel; that block is not
+the language's `tanh`. On `f64` every spelling is the double-precision runtime `tanh`.
+
+## Floating-point semantics ✅
+
+Wukong's float model is IEEE-754 binary32/binary64, round-to-nearest-ties-to-even, in one of two
+modes. **fast** (the default, `--fp=fast`) licenses exactly two value-changing transformations —
+FMA contraction and reassociation of float reductions — plus the substitution of a recognized
+kernel, which brings its own documented order. **strict** (`@strict_fp` on a function,
+`--fp=strict` for the program; see [`@strict_fp`](#strict_fp--source-order-floating-point-)) licenses
+none of them. Everything else holds in both modes:
+
+- `+ - * /` and `sqrt` on `f32`/`f64` are correctly rounded IEEE operations. Subnormal inputs and
+  results are honoured (no flush-to-zero or denormals-are-zero mode is ever set), and NaN, ±∞ and
+  signed zero follow IEEE: nothing assumes finite math or ignores the sign of zero. The optimizer
+  applies **no algebraic float rewrite** (`x + 0.0`, `x * 0.0`, `x / c → x * (1/c)`, `x - x` are
+  left alone) and constant-folds each operation at its own precision.
+- `bf16`/`f16` arithmetic is carried out in `f32` and rounded to the half grid at every value.
+- Comparisons are IEEE-ordered: `==`, `<`, `<=`, `>`, `>=` are false when either side is NaN and
+  `!=` is true. `fmax(a, b)` is `a > b ? a : b` and `fmin(a, b)` is `a < b ? a : b` — the x86
+  `maxps`/`minps` rule, *not* IEEE `maxNum`: with a NaN in either operand, or a `+0`/`-0` tie, they
+  return `b`.
+- A float→int `as` cast saturates, and NaN converts to 0.
+- For a given mode, every backend (interpreter, native JIT, AOT objects) and every `-O` level
+  computes the same bits. The mode is decided once, during lowering; the optimizer never
+  contracts or reassociates, Cranelift lowers `fadd`/`fmul` as written, and the LLVM-IR emitter
+  writes plain `fadd`/`fmul` with no fast-math flags and an `Op::Fma` as the `llvm.fma` intrinsic.
+
+**FMA contraction (fast mode).** A binary `+` with a `*` operand becomes one fused multiply-add,
+rounded once (`tests/run/fp_contract_rules.wk` pins every clause):
+
+- `x + y*z` and `y*z + x` both become `fma(y, z, x)`. Parentheses are not significant, so
+  `x + (y*z)` contracts too; `x + a*b*c` fuses its top-level product, `fma(round(a*b), c, x)`.
+- When **both** operands are products the **left** one is fused: `a*b + c*d` is
+  `fma(a, b, round(c*d))`. Which product wins changes the result, so swapping the operands of such a
+  `+` is a numerical edit, not a refactor.
+- Never contracted: `x - y*z`; a product reached through a binding (`let p = y*z; x + p`); and a
+  compound `s += y*z` outside a vectorized float reduction, which rounds the product first (the
+  spelling `s = s + y*z` contracts).
+- A vectorized float reduction accumulates `s += x[i]*y[i]` (either spelling) with one FMA per
+  lane — part of the reduction tree below.
+- A vectorized loop body, its 256-bit recipe and its scalar remainder apply the identical rule, so
+  every lane of one loop agrees.
+
+This is the contract of Clang's `-ffp-contract=on` (fusion within one expression, never across
+statements). GCC's GNU-dialect default, `-ffp-contract=fast`, also fuses across statements; Wukong
+never does. `--fp=strict` / `@strict_fp` is `-ffp-contract=off`.
+
+**Reduction order (fast mode).** A float sum loop `s = s + e(i)` (or `s += e(i)`) is reassociated,
+into one of two fixed trees depending on how it is compiled:
+
+- **Sequential vectorized**: the vectorizer's lane-partitioned tree — `U` independent eight-lane
+  accumulators (`U` from the recipe's register pressure), combined in accumulator order, then lanes
+  0–7 folded in order, then the loop's initial value, then the scalar tail. The partition depends on
+  the expression only, never on the host ISA, the 2,048-element 256-bit threshold or
+  `WUKONG_P4_NO_256` (the `@parallel` paragraph under [Attributes](#attributes-) and
+  `docs/internals.md` give the full rule). Other float element types keep the portable 128-bit
+  partition.
+- **`@parallel` reduction kernel**: in a `@parallel` function a recognized `f32` reduction (dot
+  product, sum, squared distance, max/min/absmax — the shapes listed under
+  [Attributes](#attributes-)) calls
+  `wukong_sreduce_f32_parallel`. The array is cut into **fixed 8,192-element chunks**; within a
+  chunk, 64-element blocks feed eight independent eight-lane accumulators (block element `8·t + j`
+  folds into accumulator `t`, lane `j`; one FMA per element for the product forms), the `< 64`
+  remainder folds in 8-element steps into accumulator 0, the accumulators combine by the fixed
+  halving tree `acc[t] = acc[t + h] ⊕ acc[t]` for `h = 4, 2, 1`, the `< 8` tail folds into the low
+  lanes, the lanes combine as `((l0+l1)+(l2+l3))+((l4+l5)+(l6+l7))`, and the chunk partials fold in
+  ascending chunk order. A chunk shorter than 64 elements therefore runs on one accumulator.
+  `bf16`/`f16` reductions widen to `f32` and cut on the same boundary. The result is the same on
+  one core or sixteen, natively or in the interpreter.
+
+The two trees differ from each other and from the source's left-to-right fold, so adding or removing
+`@parallel` — or a reduction declining the kernel (a `step`, an `..=` range, an `f64` accumulator) —
+changes low-order bits; see the `@parallel` note under [Attributes](#attributes-). Max/min reductions
+use the same trees; their finite non-zero result is order-independent, but because `fmax`/`fmin`
+return `b` on a NaN or a `±0` tie, *which* NaN or which zero survives can depend on the order.
+
+*Why 8,192.* The chunk length is part of the numerical contract, not a cache-tuning knob. It is
+fixed — the same on every host — because the serial kernel, the parallel kernel and the interpreter
+must cut the array at the same boundaries to agree. A streaming reduction reads each element once,
+so a chunk's cache residency buys nothing; the length only sets how many independent tasks exist
+(128 at 2^20 elements) and how long the partial array is, and load balancing can be tuned by how
+many chunks one task claims without moving a bit. Changing 8,192 would change every recognized
+reduction's result, so like the vectorizer's partition it changes only with a compiler release.
+
+**Recognized kernels (fast mode).** A loop nest the compiler recognizes is replaced by a tuned
+runtime kernel that evaluates the same mathematical expression in its own documented order — a GEMM
+blocks and packs the `K` sum and accumulates with FMA, a fused softmax/norm kernel reduces each row
+with its own lane tree. The result is deterministic and identical across backends, thread counts and
+`-O` levels, but it is not the source's order; `@generic` keeps the loop (with contraction and the
+vectorizer's reduction tree), `@strict_fp` keeps the source order.
+
+**NaN in the math intrinsics.** Every math intrinsic returns a NaN for a NaN argument. *Which* NaN
+(sign and payload) is pinned only where the runtime documents it — its elementwise kernels return
+the input NaN, quieted, for `exp`, `log`, `tanh`, `atan`, `asinh`, `cbrt`, `silu`, `mish`, `sinh`,
+`cosh` and `hardsigmoid` (the per-op table heads `wukong_runtime/src/vmath.rs`). The exceptions are by
+definition: `fmax`/`fmin` (the `maxps` rule above), `pow(x, ±0) = pow(1, y) = 1`, `hypot(±∞, NaN) = +∞`,
+and a ReLU *written* as `if x > 0.0 { x } else { 0.0 }`, which maps NaN to `0` because the source
+comparison does — the recognized ReLU kernel computes exactly that.
 
 ## Memory and parallelism
 
@@ -805,7 +1022,8 @@ dispatched and inlined spellings. Composed activations such as GELU retain the e
 runtime length `n`, and `free(s)` releases it — the first runtime-sized buffers in the language
 (everything else is a fixed-size stack array). The v1 surface is the typed per-scalar family —
 `alloc_f32` / `alloc_f64` / `alloc_i32` / `alloc_i64` / `alloc_i8` / `alloc_u8` / `alloc_f16` /
-`alloc_bf16` — chosen over a generic `alloc<T>(n)` for a small, predictable surface typed in one
+`alloc_bf16` / `alloc_i16` / `alloc_u16` / `alloc_u32` / `alloc_u64` (every element type the typed file
+I/O below moves) — chosen over a generic `alloc<T>(n)` for a small, predictable surface typed in one
 place (a user-defined function of the same name shadows the builtin). The count may be any integer
 type; a **negative count yields an empty slice** (`len() == 0`). Contents are deterministically
 zero on both backends — calloc'd bytes on native, typed zero values in the interpreter — so a
@@ -907,17 +1125,28 @@ to hit a *captured fixed-size array* at an index carrying the loop variable as a
 (`hh*C + …`, or the tiled `t/C` / `t%C` pair); per-iteration scratch must be a `let` local inside the
 body. It declines — and the loop lowers serially — for a loop-carried accumulator (a write to a
 captured scalar), a non-affine or offset index, a local bound to a slice/pointer/reference (it might
-alias a capture), a call other than a pure math intrinsic (`print` would reorder output), a
+alias a capture), a call other than a pure math intrinsic or a counter-based RNG scalar (`rand_u32`,
+`rand_f32`, `randn_f32` — stateless, so chunking cannot change a lane; `print` would reorder output), a
 `match`/`loop` expression in the body, a `return`/`defer`, and a labelled or loop-level
 `break`/`continue`. Two array **parameters** over the same element type may be one caller buffer
 whatever their declared lengths, so the proof covers the union of their accesses — unless a
 `@noalias` promise separates the pair, which lets a gather from one parameter into another thread.
-At most 32 such regions are outlined per program; further ones stay serial.
+There is no cap on the number of regions per program (the compiler used to keep
+every region past the 32nd serial, silently).
+
+**How many threads, and when they are used.** The workers are one pool per process, sized to the
+CPUs the process may use (affinity mask and container quota respected) — or to `--threads=<n>` for a
+`wukongc --run`/`--train`, or `WUKONG_NUM_THREADS=<n>` for any process, including a built executable.
+On a machine whose cores carry SMT siblings the pool has one worker per *physical* core. A region whose
+trip count fits one grain runs once without a fork, and the runtime's multicore kernels
+(`wukong_*_parallel`) split only when the work — rows × columns × a per-element cost — can repay the
+fork (`WUKONG_PAR_MIN_WORK` moves that threshold); below it they run their serial twin. Every one of
+those choices is scheduling only: the output is bit-identical at every thread count.
 
 ## File I/O ✅
 
-**Reading and writing typed blobs runs today** (✅): a small per-scalar family loads and stores raw
-binary buffers, so a program can pull weights or a dataset **off disk** instead of synthesizing them.
+**Reading and writing typed blobs runs today** (✅): a per-scalar family loads and stores raw binary
+buffers, so a program can pull weights or a dataset **off disk** instead of synthesizing them.
 
 ```wukong
 let mut w: []f32 = alloc_f32(768 * 768);       // zero-initialized, runtime-sized
@@ -927,34 +1156,121 @@ if n < 0 { return 1; }                           // -1 = couldn't open, -2 = io 
 let written: i64 = write_f32("out.bin", w);      // flush w as raw little-endian f32
 ```
 
-The surface is `read_<T>(path: *u8, buf: []T) -> i64` and `write_<T>(path: *u8, buf: []T) -> i64`
-for **`T` in {`f32`, `f64`, `i32`, `i64`, `i8`, `u8`}** — the same typed, declared-in-one-place convention as the
-`alloc_<T>` family. The on-disk format is **headerless raw little-endian**: element `i` of `buf` is
-the `sizeof(T)` bytes at byte offset `i · sizeof(T)`, and nothing else — no shape, dtype tag, or
-length prefix (you carry those out of band, the way a `.bin` weight shard does).
+The surface is `read_<T>(path: *u8, buf) -> i64`, `write_<T>(path: *u8, buf) -> i64` and
+`read_<T>_at(path: *u8, byte_off, buf) -> i64` for **every fixed-width numeric `T`** — `f32`, `f64`,
+`f16`, `bf16`, `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, the same typed, declared-in-one-place
+convention as the `alloc_<T>` family — plus `file_size(path: *u8) -> i64` (the byte length, `-1` if
+the file can't be opened). The on-disk format is **headerless raw little-endian**: element `i` of
+`buf` is the `sizeof(T)` bytes at byte offset `i · sizeof(T)`, and nothing else — no shape, dtype tag,
+or length prefix (for files that carry those, see *Checkpoints* below).
+
+`buf` is a **`[]T` slice, a `[T; N]` array, or a contiguous `Tensor[T, …]`** whose every dimension is
+known at the call (a constant or a bound dimension variable; a `?` dimension is `E0401`), and its
+element type must be exactly `T` (a `[]i32` handed to `read_f32` is `E0401`, not a silent wrong
+stride). A builtin that writes `buf` through a non-`mut` slice, array or tensor **parameter** is
+`E0304`, exactly as `p[i] = …` through that parameter is.
 
 - **`read_<T>(path, buf)`** fills `buf` from the file and returns the **element count read** =
-  `min(buf.len(), file_bytes / sizeof(T))`, so a short file reads only what it has and a long one
+  `min(len(buf), file_bytes / sizeof(T))`, so a short file reads only what it has and a long one
   fills `buf` and stops. It returns **`-1`** if the file can't be opened and **`-2`** on an io
-  error; on either failure — and for the tail `buf[n..]` left over from a short read — the
-  destination slots are **untouched**, so a zero-initialized `alloc_<T>` buffer stays defined.
-  **Ordering is part of the contract**: the open is attempted *before* the count is computed, so an
-  unopenable path returns `-1` even for an empty `buf` — `read_f32("missing.bin", empty)` is `-1`, not
-  `0`. On an openable path an empty `buf` reads nothing and returns `0`. Both backends implement this
-  order.
-- **`write_<T>(path, buf)`** **creates or truncates** `path`, writes all `buf.len()` elements as
+  error. After `-1`, and for the tail `buf[n..]` left over from a short read, the destination slots
+  are **untouched**, so a zero-initialized `alloc_<T>` buffer stays defined; after a `-2` (a mid-read
+  device error) the first `n` slots are unspecified, because the native read lands straight in the
+  destination — there is no second, staging copy of the data. **Ordering is part of the contract**:
+  the open is attempted *before* the count is computed, so an unopenable path returns `-1` even for
+  an empty `buf` — `read_f32("missing.bin", empty)` is `-1`, not `0`. On an openable path an empty
+  `buf` reads nothing and returns `0`. Both backends implement this order.
+- **`read_<T>_at(path, byte_off, buf)`** is the same read starting `byte_off` bytes into the file,
+  so one tensor can be read out of a shard: `n = min(len(buf), (file_bytes - byte_off) / sizeof(T))`,
+  `0` at or past the end, **`-2`** for a negative offset. `byte_off` may be any integer type.
+- **`write_<T>(path, buf)`** **creates or truncates** `path`, writes all `len(buf)` elements as
   little-endian bytes, and returns the **count written** (**`-1`** if the file can't be created,
   **`-2`** on an io error).
 
 `path` is any NUL-terminated `*u8` — usually a string literal (the `.rodata` pointer described under
-*Literals*), but a `*u8` binding works too. Anything else is `E0401`, and a wrong arity is `E0503`;
-`buf` must be a `[]T` slice whose element type matches the name's dtype (a `[]i32` handed to `read_f32`
-is `E0401`, not a silent wrong stride). Both directions are implemented by the `wukong_runtime` layer
-on the native backend and mirrored **byte-for-byte** by the interpreter — the `-1`/`-2`/count return
-codes, the little-endian layout, and the `u8`-narrowing store are identical — so a read/write
-round-trip is **differentially
-tested to agree bit-for-bit** across the interpreter and the native Cranelift backend, exactly as the
-✅ maturity legend requires.
+*Literals*), but a `*u8` binding works too. Anything else is `E0401`, and a wrong arity is `E0503`.
+Both directions are implemented by the `wukong_runtime` layer on the native backend and mirrored by
+the interpreter on the same planning code — the return codes, the little-endian layout, the narrowing
+store, and the canonical value of every element read (a `u8`/`u16`/`u32` read from a file compares
+exactly like the same value stored by the program) — so a read/write round-trip is **differentially
+tested to agree bit-for-bit** across the interpreter and the native Cranelift backend.
+
+### Checkpoints: safetensors and `.npy` ✅
+
+`st_read_<T>(path: *u8, name: *u8, buf) -> i64` loads the tensor called `name` from a
+**safetensors** file, and `npy_read_<T>(path: *u8, buf) -> i64` the array of a NumPy **`.npy`** file
+(format versions 1–3), for the same twelve `T` and the same buffer forms. Each parses the file's
+header — a small, strict JSON or Python-literal parser in the runtime, no dependency — and checks the
+stored tensor against the destination **at load time**, the load-time half of shape safety:
+
+```wukong
+fn load_wte(path: *u8, mut wte: Tensor[f32, 50257, 768]) -> i64 {
+    return st_read_f32(path, "wte.weight", wte);   // -4 unless the file says [50257, 768]
+}
+```
+
+- the stored **dtype** must equal `T` — except that a `BF16`/`F16` (or `'<f2'`) payload **widens
+  exactly** into an `f32` destination, so an f32 program loads a half-precision checkpoint directly;
+- a shape-typed **`Tensor`** destination must match the stored **rank and every dimension**, not just
+  the element count (`[768, 50257]` is not `[50257, 768]`); an array or slice destination must hold
+  **exactly** the stored element count (a checkpoint load is an equality, not the raw reads' `min`);
+- a `fortran_order: True` `.npy` of rank ≥ 2 is refused: a row-major destination would receive its
+  transpose.
+
+The result is the element count, or a negative code: **`-1`** can't open, **`-2`** io error, **`-3`**
+dtype mismatch, **`-4`** shape or count mismatch, **`-5`** no tensor of that name (safetensors),
+**`-6`** malformed header (bad magic or JSON, a payload outside the file, a byte length that disagrees
+with dtype × shape, a duplicated name). On every negative code but `-2` the destination is untouched.
+Supported stored dtypes are `F32 F64 F16 BF16 I8 I16 I32 I64 U8 U16 U32 U64` (safetensors) and the
+little-endian `f2 f4 f8 i1 i2 i4 i8 u1 u2 u4 u8` descrs (`.npy`); `BOOL`, the fp8 formats, a
+big-endian array and a structured dtype parse and then report `-3`. A memory-mapped, zero-copy load
+(`map_<T>`) is not implemented yet: every load copies once, straight into the destination.
+
+## Random numbers and sampling ✅
+
+Wukong's random numbers are **counter-based** — Philox4x32-10, the generator of Random123, cuRAND and
+Triton's `tl.rand`: each value is a pure function of a `seed` and a `counter`, so there is no
+generator state to create, share or advance, and a stream is reproducible under any split — across
+`@parallel` chunks, across the interpreter and native code, across runs.
+
+```wukong
+for i in 0..n {
+    w[i] = randn_f32(seed, i) * 0.02;                  // element i is always the same number
+}
+let keep: bool = rand_f32(seed, step * n + i) >= p;    // a dropout mask is a counter, not a state
+```
+
+- **`rand_u32(seed, ctr) -> u32`** — word 0 of the Philox4x32-10 block with key `(seed lo, seed hi)`
+  and counter `(ctr lo, ctr hi, 0, 0)`; `rand_u32(0, 0)` is `0x6627e8d5`, Random123's published
+  known answer. `seed` and `ctr` may be any integer type (their 64 bits, as `x as u64` gives them).
+- **`rand_f32(seed, ctr) -> f32`** — the top 24 bits of that word times 2⁻²⁴: uniform on `[0, 1)`,
+  every value an exact multiple of 2⁻²⁴.
+- **`randn_f32(seed, ctr) -> f32`** — a standard normal sample by Box–Muller from words 0 and 1,
+  `sqrt(-2 ln u1) · cos(2π u2)` with `u1 ∈ (0, 1]`, computed in `f32` on the compiler's own `log` and
+  `cos`: bit-identical across backends, and close to (not bit-equal with) an `f64` reference.
+- **`rand_fill_f32(buf, seed, ctr0)`** — `buf[i] = rand_f32(seed, ctr0 + i)` for every element of a
+  `[]f32`, `[f32; N]` or contiguous `f32` tensor, as one runtime kernel.
+
+The scalar builtins lower to plain integer MIR (a 32×32→64 multiply, shifts, xors), so they need no
+runtime call and are accepted inside a `@parallel` region. To autodiff they are constants:
+`rand_fill_f32` contributes no gradient, like a constant store.
+
+**Sampling kernels** (✅), each defined by one total order so the result is unique whatever the
+algorithm or backend:
+
+- **`topk_f32(x, vals, idx) -> i64`** — the `k = min(len(x), len(vals), len(idx))` largest elements
+  of the `f32` buffer `x`, in descending order, into `vals` (values) and the `i64` buffer `idx`
+  (indices); returns `k`. **NaN ranks largest** and ties (including `-0.0` against `0.0`) go to the
+  **lower index** — `torch.topk`'s order. An output may alias `x`. It has no gradient rule yet, so
+  autodiff refuses it rather than drop the gradient.
+- **`argsort_f32(x, idx) -> i64`** / **`argsort_desc_f32(x, idx) -> i64`** — a **stable** argsort (ties
+  keep index order; NaN last ascending, first descending) of `x` into `idx`; a shorter `idx` receives
+  the prefix of the order. Returns `min(len(x), len(idx))`.
+- **`sample_categorical(probs, u) -> i64`** — one draw from the unnormalized weights `probs` by inverse
+  CDF at the float `u`: the first index whose running mass exceeds `u · total`, where only positive,
+  finite weights have mass; `u` is clamped to `[0, 1]`; `-1` when no weight has mass. With
+  `u = rand_f32(seed, step)` the draw is a pure function of `(probs, seed, step)`, so temperature,
+  top-k and top-p sampling are a few lines over these three kernels.
 
 ## Command-line interface
 
@@ -984,6 +1300,9 @@ wukongc [OPTIONS] <input.wk>
 --train-seed=<n>      seed for the deterministic buffer initialization      (default: 0x5EED1234)
 --train-weight-decay=<f>  AdamW decoupled decay; finite, non-negative       (default: 0)
 -O0|-O1|-O2|-O3       optimization level (default: -O0; -O3 currently runs the -O2 pipeline)
+--fp=<mode>           fast | strict   (default: fast). strict = @strict_fp on every function: no
+                      FMA contraction, source-order float reductions, no kernel recognizers (see
+                      "Floating-point semantics"). Rejected with --emit=grad and --train (exit 1).
 -o <path>             write the artifact to <path> — only with --emit=obj or --emit=exe (default:
                       <stem>.o for objects; executables get <stem>.exe on Windows and plain <stem>
                       on unix). Rejected with --run and with every other stage, which print their

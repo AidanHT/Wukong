@@ -99,10 +99,6 @@ unsafe fn lrscan_rows(
     }
 }
 
-/// Row count below which the parallel scan just runs serially: each row is a light scalar pass, so the
-/// rayon split only pays for itself once there are many independent rows to spread across cores.
-const LRSCAN_PAR_MIN: usize = 64;
-
 /// `out[r,t] = h_t` where `h_t = a[r,t]·h_{t-1} + b[r,t]`, `h_{-1} = 0`, over a `[rows, cols]` row-major
 /// matrix — single-threaded (4-row-interleaved for ILP). Each row is an independent first-order linear
 /// recurrence (the hidden state resets to 0 at the start of every row).
@@ -129,7 +125,7 @@ pub unsafe extern "C" fn wukong_lrscan_f32(
 /// independent (each row's `h` starts at 0 and never crosses rows), so the parallel path slices the rows
 /// into one contiguous chunk per core and runs the *identical* 4-row-interleaved [`lrscan_rows`] on each
 /// — the result is independent of thread count and equals the serial kernel the interpreter marshals,
-/// bit-for-bit. Below `LRSCAN_PAR_MIN` rows it runs serial.
+/// bit-for-bit. Below the shared work gate (`par::fork_rows`, rows x cols) it runs serial.
 ///
 /// # Safety
 /// `a`, `b`, and `out` must each be valid for `rows * cols` f32; each row is written by exactly one task
@@ -146,7 +142,7 @@ pub unsafe extern "C" fn wukong_lrscan_f32_parallel(
         return;
     }
     let (rows, cols) = (rows as usize, cols as usize);
-    if rows < LRSCAN_PAR_MIN {
+    if !crate::par::fork_rows(rows, cols, crate::par::W_STREAM) {
         lrscan_rows(a, b, out, cols, 0, rows);
         return;
     }
@@ -240,10 +236,10 @@ mod tests {
 
     /// Serial and parallel must be **bit-for-bit identical** (rows independent, no cross-row combine — the
     /// parallel path runs the same 4-row-interleaved scan over disjoint row chunks). Exercised above
-    /// `LRSCAN_PAR_MIN` so the rayon path actually runs, across varied `cols` (short rows included).
+    /// the old 64-row gate so the rayon path actually runs, across varied `cols` (short rows included).
     #[test]
     fn serial_equals_parallel_bit_for_bit() {
-        let rows = LRSCAN_PAR_MIN + 137; // > threshold so the multicore path runs
+        let rows = 64 + 137; // many rows, so the multicore path runs
         for &cols in &[1usize, 7, 8, 17, 64, 333] {
             let a = fill_a(rows * cols);
             let b = fill_b(rows * cols);
