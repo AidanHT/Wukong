@@ -34,7 +34,7 @@ use wukong_ast::{
 use wukong_diag::Diagnostic;
 use wukong_sema::SemaResult;
 use wukong_span::{FxHashMap, Interner, Span, Symbol};
-use wukong_types::Ty;
+use wukong_types::{Dim, Ty};
 
 /// Fresh `NodeId`s are minted DOWNWARD from here. The parser hands ids out upward from 0 and
 /// `tindex` mints downward from `u32::MAX - 1` but never at or below `u32::MAX / 2`, so this band
@@ -42,14 +42,26 @@ use wukong_types::Ty;
 const DEFER_ID_TOP: u32 = u32::MAX / 2 - 1;
 const DEFER_ID_FLOOR: u32 = u32::MAX / 4;
 
+/// What a rewrite adds to sema's `NodeId`-keyed tables for the nodes it created: every copy of a
+/// deferred expression carries its original's entries under its fresh id.
+pub(crate) struct DeferOverlay {
+    /// Entries layered over `sema.types`.
+    pub(crate) types: FxHashMap<NodeId, Ty>,
+    /// Entries layered over `sema.call_dims` (keyed by a call's CALLEE id): a copied call to a
+    /// shape-generic function keeps the dimension bindings sema solved for the original, which
+    /// the hidden runtime-dim ABI reads.
+    pub(crate) call_dims: FxHashMap<NodeId, Vec<(Symbol, Dim)>>,
+}
+
 /// Rewrite every `defer` in `module` away. `Ok(None)`: the module has no `defer` and nothing was
-/// cloned. `Ok(Some((module, types)))`: the rewritten module and the type entries of its new nodes
-/// (to be layered over `sema.types`). `Err`: the E0314 diagnostics — the module must not be lowered.
+/// cloned. `Ok(Some((module, overlay)))`: the rewritten module and the sema entries of its new
+/// nodes (to be layered over `sema.types` / `sema.call_dims`). `Err`: the E0314 diagnostics — the
+/// module must not be lowered.
 pub(crate) fn lower_defers(
     module: &Module,
     sema: &SemaResult,
     interner: &mut Interner,
-) -> Result<Option<(Module, FxHashMap<NodeId, Ty>)>, Vec<Diagnostic>> {
+) -> Result<Option<(Module, DeferOverlay)>, Vec<Diagnostic>> {
     let has_defer = module.items.iter().any(|item| match &item.kind {
         ItemKind::Fn(f) => f.body.as_ref().is_some_and(block_has_defer),
         _ => false,
@@ -61,6 +73,8 @@ pub(crate) fn lower_defers(
     let mut d = Desugar {
         base: &sema.types,
         extra: FxHashMap::default(),
+        base_call_dims: &sema.call_dims,
+        extra_call_dims: FxHashMap::default(),
         interner,
         next_id: DEFER_ID_TOP,
         diags: Vec::new(),
@@ -78,7 +92,13 @@ pub(crate) fn lower_defers(
         }
     }
     if d.diags.is_empty() {
-        Ok(Some((out, d.extra)))
+        Ok(Some((
+            out,
+            DeferOverlay {
+                types: d.extra,
+                call_dims: d.extra_call_dims,
+            },
+        )))
     } else {
         Err(d.diags)
     }
@@ -105,6 +125,10 @@ struct Desugar<'a> {
     base: &'a FxHashMap<NodeId, Ty>,
     /// Types of the nodes this pass creates.
     extra: FxHashMap<NodeId, Ty>,
+    /// Sema's call dimension bindings for the original nodes.
+    base_call_dims: &'a FxHashMap<NodeId, Vec<(Symbol, Dim)>>,
+    /// Call dimension bindings of the copies this pass creates.
+    extra_call_dims: FxHashMap<NodeId, Vec<(Symbol, Dim)>>,
     interner: &'a mut Interner,
     next_id: u32,
     diags: Vec<Diagnostic>,
@@ -536,6 +560,14 @@ impl Desugar<'_> {
         let new = self.fresh();
         if let Some(t) = self.ty(*id).cloned() {
             self.extra.insert(new, t);
+        }
+        let dims = self
+            .extra_call_dims
+            .get(id)
+            .or_else(|| self.base_call_dims.get(id))
+            .cloned();
+        if let Some(dims) = dims {
+            self.extra_call_dims.insert(new, dims);
         }
         *id = new;
     }

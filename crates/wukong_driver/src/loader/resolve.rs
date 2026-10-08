@@ -640,17 +640,31 @@ impl Rewriter<'_> {
             TypeKind::Tensor { elem, dims, .. } => {
                 self.ty(elem);
                 for d in dims {
-                    if let wukong_ast::DimKind::Named(sym) = &mut d.kind {
-                        let id = Ident {
-                            sym: *sym,
-                            span: d.span,
-                        };
-                        if let Some(s) = self.unqualified(id) {
-                            *sym = s;
-                        }
-                    }
+                    self.dim(d);
                 }
             }
+        }
+    }
+
+    /// A tensor dimension: a named extent (a generic or a `const`) resolves like any value name,
+    /// and a derived extent (`3*D`, `(L - K)/S + 1`) resolves each operand, so an imported
+    /// module's `const` is found inside dimension arithmetic too.
+    fn dim(&mut self, d: &mut wukong_ast::Dim) {
+        match &mut d.kind {
+            wukong_ast::DimKind::Named(sym) => {
+                let id = Ident {
+                    sym: *sym,
+                    span: d.span,
+                };
+                if let Some(s) = self.unqualified(id) {
+                    *sym = s;
+                }
+            }
+            wukong_ast::DimKind::Binary { lhs, rhs, .. } => {
+                self.dim(lhs);
+                self.dim(rhs);
+            }
+            wukong_ast::DimKind::Int(_) | wukong_ast::DimKind::Dynamic => {}
         }
     }
 

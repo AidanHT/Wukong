@@ -981,7 +981,10 @@ pub fn lower_program_with(
     };
     let defer_sema = deferred.as_ref().map(|(_, extra)| {
         let mut s = sema.clone();
-        s.types.extend(extra.iter().map(|(id, t)| (*id, t.clone())));
+        s.types
+            .extend(extra.types.iter().map(|(id, t)| (*id, t.clone())));
+        s.call_dims
+            .extend(extra.call_dims.iter().map(|(id, d)| (*id, d.clone())));
         s
     });
     let module: &Module = deferred.as_ref().map(|(m, _)| m).unwrap_or(module);
