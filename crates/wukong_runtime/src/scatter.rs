@@ -289,6 +289,7 @@ mod tests {
             // The caller pre-zeros the accumulator table; the kernel only adds.
             let mut got = vec![0.0f32; v * h];
             let mut got_par = vec![0.0f32; v * h];
+            // SAFETY: all scatter buffers are sized v*h; serial and parallel share the shape.
             unsafe {
                 wukong_scatter_add_f32(
                     got.as_mut_ptr(),
@@ -348,6 +349,7 @@ mod tests {
             let want = naive(&grad_out, ids, t, h, v);
             let mut got = vec![0.0f32; v * h];
             let mut got_par = vec![0.0f32; v * h];
+            // SAFETY: all buffers are sized v*h for the dispatched scatter.
             unsafe {
                 wukong_scatter_add_f32(
                     got.as_mut_ptr(),
@@ -385,6 +387,7 @@ mod tests {
         let want = naive(&grad_out, &ids, t, h, v);
         let mut got = vec![0.0f32; v * h];
         let mut got_par = vec![0.0f32; v * h];
+        // SAFETY: `got` and `got_par` are sized v*h; ids/updates sized for the call.
         unsafe {
             wukong_scatter_add_f32(
                 got.as_mut_ptr(),
@@ -420,6 +423,7 @@ mod tests {
         let grad_out = [1.0f32; 8];
         let ids = [0i32; 2];
         let mut grad_w = vec![42.0f32; 8];
+        // SAFETY: `grad_w` holds 8 f32 and `ids` 2 i32; the degenerate extent is a no-op.
         unsafe {
             wukong_scatter_add_f32(
                 grad_w.as_mut_ptr(),
@@ -470,6 +474,7 @@ mod tests {
                     let mut output = [42.0f32; 8];
                     // The other dimensions deliberately cannot describe these buffers. The
                     // non-positive dimension must short-circuit before reads, products, or work.
+                    // SAFETY: the nonpositive dimension short-circuits before any pointer read; the other dims deliberately cannot describe these buffers.
                     unsafe {
                         kernel(
                             output.as_mut_ptr(),

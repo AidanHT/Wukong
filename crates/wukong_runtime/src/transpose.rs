@@ -598,6 +598,7 @@ mod tests {
         let (rows, cols) = (2usize, 3usize);
         let src = [0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0];
         let mut dst = vec![f32::from_bits(0x7fc0_0001); rows * cols];
+        // SAFETY: `src` sized rows*cols, `dst` sized cols*rows; a nonpositive rows is a no-op.
         unsafe {
             wukong_transpose_f32(src.as_ptr(), dst.as_mut_ptr(), 0, cols as i64);
         }
@@ -605,6 +606,7 @@ mod tests {
             dst.iter().all(|v| v.to_bits() == 0x7fc0_0001),
             "nonpositive rows must not write dst"
         );
+        // SAFETY: `src` sized rows*cols, `dst` sized cols*rows; the positive call writes the transpose.
         unsafe {
             wukong_transpose_f32(src.as_ptr(), dst.as_mut_ptr(), rows as i64, cols as i64);
         }
@@ -653,6 +655,7 @@ mod tests {
             let want = naive_transpose(&src, r, c);
             let mut got = vec![0.0f32; r * c];
             let mut got_par = vec![0.0f32; r * c];
+            // SAFETY: `got`/`got_par` are sized r*c for the dispatched f32 transpose.
             unsafe {
                 wukong_transpose_f32(src.as_ptr(), got.as_mut_ptr(), r as i64, c as i64);
                 wukong_transpose_f32_parallel(
@@ -699,6 +702,7 @@ mod tests {
             }
             let mut got = vec![0u16; r * c];
             let mut got_par = vec![0u16; r * c];
+            // SAFETY: `got`/`got_par` are sized r*c for the dispatched u16 transpose.
             unsafe {
                 wukong_transpose_u16(src.as_ptr(), got.as_mut_ptr(), r as i64, c as i64);
                 wukong_transpose_u16_parallel(
@@ -749,6 +753,7 @@ mod tests {
             let src: Vec<u16> = (0..r * c).map(|t| (t as u16).wrapping_mul(40503)).collect();
             let mut s = vec![0u16; r * c];
             let mut v = vec![0u16; r * c];
+            // SAFETY: `s`/`v` are sized r*c (serial vs parallel u16).
             unsafe {
                 transpose_rows(src.as_ptr(), s.as_mut_ptr(), r, c, 0, r);
                 transpose_rows_u16_avx2(src.as_ptr(), v.as_mut_ptr(), r, c, 0, r);
@@ -756,6 +761,7 @@ mod tests {
             assert_eq!(s, v, "u16 avx2 != scalar block at {r}x{c}");
             if r > B {
                 let mut w = vec![0u16; r * c];
+                // SAFETY: `w` is sized r*c (parallel path above the threshold).
                 unsafe {
                     transpose_rows_u16_avx2(src.as_ptr(), w.as_mut_ptr(), r, c, 0, B);
                     transpose_rows_u16_avx2(src.as_ptr(), w.as_mut_ptr(), r, c, B, r);
@@ -830,6 +836,7 @@ mod tests {
                 .collect();
             let mut s = vec![0.0f32; r * c];
             let mut v = vec![0.0f32; r * c];
+            // SAFETY: `s`/`v` are sized r*c (serial vs parallel f32).
             unsafe {
                 transpose_rows(src.as_ptr(), s.as_mut_ptr(), r, c, 0, r);
                 transpose_rows_f32_avx2(src.as_ptr(), v.as_mut_ptr(), r, c, 0, r);
@@ -838,6 +845,7 @@ mod tests {
             // Split into two row windows the way the parallel entry does, and demand the same bits.
             if r > B {
                 let mut w = vec![0.0f32; r * c];
+                // SAFETY: `w` is sized r*c (parallel path above the threshold).
                 unsafe {
                     transpose_rows_f32_avx2(src.as_ptr(), w.as_mut_ptr(), r, c, 0, B);
                     transpose_rows_f32_avx2(src.as_ptr(), w.as_mut_ptr(), r, c, B, r);

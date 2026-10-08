@@ -454,6 +454,7 @@ mod tests {
         let (rows, cols) = (2usize, 3usize);
         let x = [3.0f32, 1.0, 2.0, 0.5, 9.0, 4.0];
         let mut out = vec![-7i32; cols];
+        // SAFETY: `x` sized rows*cols, `out` sized cols; a nonpositive rows is a no-op.
         unsafe {
             wukong_colargmax_i32(x.as_ptr(), out.as_mut_ptr(), 0, cols as i64);
         }
@@ -461,6 +462,7 @@ mod tests {
             out.iter().all(|&v| v == -7),
             "nonpositive rows must not write out"
         );
+        // SAFETY: `x` sized rows*cols, `out` sized cols; the positive call writes cols.
         unsafe {
             wukong_colargmax_i32(x.as_ptr(), out.as_mut_ptr(), rows as i64, cols as i64);
         }
@@ -545,6 +547,7 @@ mod tests {
                 } else {
                     (wukong_colargmin_i32, wukong_colargmin_i32_parallel)
                 };
+                // SAFETY: `x` sized rows*cols; the argmax/argmin outputs `got`/`got_par` are sized cols.
                 unsafe {
                     f(x.as_ptr(), got.as_mut_ptr(), rows as i64, cols as i64);
                     fp(x.as_ptr(), got_par.as_mut_ptr(), rows as i64, cols as i64);
@@ -601,6 +604,7 @@ mod tests {
         let mut amax_p = vec![0i32; cols];
         let mut amin = vec![0i32; cols];
         let mut amin_p = vec![0i32; cols];
+        // SAFETY: `x` sized rows*cols; `amin`/`amin_p` sized cols (serial vs parallel).
         unsafe {
             wukong_colargmax_i32(x.as_ptr(), amax.as_mut_ptr(), rows as i64, cols as i64);
             wukong_colargmax_i32_parallel(
@@ -655,6 +659,7 @@ mod tests {
         x[(rows - 1) * cols] = 1.0; // unique max at row 16777217 (> 2^24)
         let mut got = vec![0i32; cols];
         let mut want = vec![0i32; cols];
+        // SAFETY: `x` sized rows*cols; `got`/`want` sized cols.
         unsafe {
             wukong_colargmax_i32(x.as_ptr(), got.as_mut_ptr(), rows as i64, cols as i64);
             colarg_scalar(x.as_ptr(), want.as_mut_ptr(), rows, cols, 0, cols, true);
@@ -694,6 +699,7 @@ mod tests {
                 for is_max in [true, false] {
                     let mut s = vec![-7i32; cols]; // sentinel: never a legal row index
                     let mut v = vec![-7i32; cols];
+                    // SAFETY: `x` sized rows*cols; `s`/`v` sized cols.
                     unsafe {
                         colarg_scalar(x.as_ptr(), s.as_mut_ptr(), rows, cols, 0, cols, is_max);
                         colarg_avx2(x.as_ptr(), v.as_mut_ptr(), rows, cols, 0, cols, is_max);
@@ -768,6 +774,7 @@ mod tests {
             let mut s = vec![-7i32; cols];
             let mut v = vec![-7i32; cols];
             let mut p = vec![-7i32; cols];
+            // SAFETY: `x` sized rows*cols; `v`/`p` sized cols.
             unsafe {
                 colarg_scalar(x.as_ptr(), s.as_mut_ptr(), rows, cols, 0, cols, is_max);
                 colarg_avx2(x.as_ptr(), v.as_mut_ptr(), rows, cols, 0, cols, is_max);

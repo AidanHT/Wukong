@@ -299,7 +299,9 @@ pub unsafe extern "C" fn wukong_dequant_f32(
 /// `_parallel` kernels use).
 #[derive(Clone, Copy)]
 struct Addr(usize);
+// SAFETY: `Addr` is a bare usize address; the parallel dequant hands each worker a DISJOINT output band, so sharing the base across threads is race-free.
 unsafe impl Send for Addr {}
+// SAFETY: see above -- each worker touches a disjoint output range, so `Addr` is safe to share by reference across threads.
 unsafe impl Sync for Addr {}
 
 /// Multicore dequant — **bit-identical** to [`wukong_dequant_f32`]. The map is elementwise, so `[0,n)`
@@ -596,6 +598,7 @@ mod tests {
         let n = crate::nt_policy::test_min_bytes() / 8 + 35;
         let q = vec![6i32; n];
         assert!(use_nt(n, 4));
+        // SAFETY: `check_nt_output` supplies an `out` buffer of n f32; `q` holds n quantized values and `scale` the per-channel factors.
         crate::velem::check_nt_output(n, -99.0, 3.0, |out| unsafe {
             wukong_dequant_f32(q.as_ptr().cast(), out, n as i64, 0.5, DQ_I32 | DQ_ID);
         });
@@ -605,6 +608,7 @@ mod tests {
         let q = vec![6i32; n];
         let scale = vec![0.5; cols];
         assert!(use_nt(n, 4));
+        // SAFETY: `check_nt_output` supplies an `out` buffer of n f32; `q` holds n values and `scale` cols factors.
         crate::velem::check_nt_output(n, -99.0, 3.0, |out| unsafe {
             wukong_dequant_perchan_f32(
                 q.as_ptr().cast(),
@@ -662,9 +666,11 @@ mod tests {
             ] {
                 let op = act | width;
                 let mut want = vec![0f32; n];
+                // SAFETY: `qptr` has n quantized elements and `want` n f32; dequant_scalar writes exactly n.
                 unsafe { dequant_scalar(qptr, want.as_mut_ptr(), n, scale, op) };
                 let mut got = vec![0f32; n];
                 let mut got_par = vec![0f32; n];
+                // SAFETY: `qptr` has n quantized elements; `got`/`got_par` are n f32 (serial vs parallel).
                 unsafe {
                     wukong_dequant_f32(qptr, got.as_mut_ptr(), n as i64, scale, op);
                     wukong_dequant_f32_parallel(qptr, got_par.as_mut_ptr(), n as i64, scale, op);
@@ -697,6 +703,7 @@ mod tests {
         let qi32 = fill_i32(n);
         let scale = 0.007f32;
         let mut got = vec![0f32; n];
+        // SAFETY: `q`/`got` are sized n for the dispatched dequant.
         unsafe {
             wukong_dequant_f32(
                 qi32.as_ptr() as *const u8,
@@ -733,7 +740,9 @@ mod tests {
                 let op = act | width;
                 let mut want = vec![0f32; n];
                 for i in 0..rows {
+                    // SAFETY: `qptr` has rows*cols quantized elements; row i starts at a valid in-bounds offset.
                     let qrow = unsafe { qptr.add(i * cols * if width == DQ_I32 { 4 } else { 1 }) };
+                    // SAFETY: the per-row `qrow` has cols readable elements and the output row cols writable f32.
                     unsafe {
                         perchan_row_scalar(
                             qrow,
@@ -746,6 +755,7 @@ mod tests {
                 }
                 let mut got = vec![0f32; n];
                 let mut got_par = vec![0f32; n];
+                // SAFETY: `qptr` has n quantized elements; `got`/`got_par` are n f32.
                 unsafe {
                     wukong_dequant_perchan_f32(
                         qptr,
@@ -788,6 +798,7 @@ mod tests {
             let q = fill_i8(n.max(1));
             let mut got = vec![0f32; n];
             let mut want = vec![0f32; n];
+            // SAFETY: `q`/`got`/`want` are each sized n for this dequant case.
             unsafe {
                 if n > 0 {
                     dequant_scalar(

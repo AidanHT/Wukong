@@ -505,6 +505,7 @@ mod tests {
                 }
                 let mut got = vec![0.0f32; rows * cols];
                 let mut got_par = vec![0.0f32; rows * cols];
+                // SAFETY: `got`/`got_par` sized rows*cols for the dispatched backward.
                 unsafe {
                     wukong_rmsnorm_bwd_f32(
                         x.as_ptr(),
@@ -569,6 +570,7 @@ mod tests {
                 };
                 let mut a = vec![0.0f32; n];
                 let mut b = vec![0.0f32; n];
+                // SAFETY: `a`/`b` hold n f32 for the per-row comparison.
                 unsafe {
                     rmsnorm_bwd_row_scalar(x.as_ptr(), dy.as_ptr(), gptr, a.as_mut_ptr(), n, EPS);
                     rmsnorm_bwd_row_avx2(x.as_ptr(), dy.as_ptr(), gptr, b.as_mut_ptr(), n, EPS);
@@ -625,7 +627,9 @@ mod tests {
                     // The two reductions, lane for lane. Every NaN that enters them is the one
                     // canonical `f32::NAN` (or a product of it), so their lanes are bit-comparable
                     // even on the NaN rows — this is where the partition is pinned.
+                    // SAFETY: `x`/`dy`/`gptr` sized for one row of n; ss_gx_8_scalar reads n.
                     let (ss_s, gx_s) = unsafe { ss_gx_8_scalar(x.as_ptr(), dy.as_ptr(), gptr, n) };
+                    // SAFETY: AVX2 confirmed by the test's feature guard; `x`/`dy`/`gptr` sized for one row of n.
                     let (ss_v, gx_v) = unsafe { ss_gx_8_avx2(x.as_ptr(), dy.as_ptr(), gptr, n) };
                     for j in 0..8 {
                         assert_eq!(
@@ -641,6 +645,7 @@ mod tests {
                     }
                     let mut a = vec![0.0f32; n];
                     let mut b = vec![0.0f32; n];
+                    // SAFETY: `a`/`b` hold n f32 for the per-row comparison.
                     unsafe {
                         rmsnorm_bwd_row_scalar(
                             x.as_ptr(),
@@ -717,6 +722,7 @@ mod tests {
                 std::ptr::null()
             };
             let mut got = vec![0.0f32; n];
+            // SAFETY: `got` sized n for the dispatched backward; inputs sized for the shape.
             unsafe {
                 wukong_rmsnorm_bwd_f32(
                     x.as_ptr(),
@@ -763,6 +769,7 @@ mod tests {
         let ones = vec![1.0f32; cols];
         let mut with_ones = vec![0.0f32; rows * cols];
         let mut with_null = vec![0.0f32; rows * cols];
+        // SAFETY: `with_ones`/`with_null` sized rows*cols (gamma present vs null).
         unsafe {
             wukong_rmsnorm_bwd_f32(
                 x.as_ptr(),
@@ -798,6 +805,7 @@ mod tests {
         let x = fill_x(8);
         let dy = fill_dy(8);
         let mut dx = vec![42.0f32; 8];
+        // SAFETY: `dy` sized for one row, `dx` 8 f32; the degenerate extent is a no-op.
         unsafe {
             wukong_rmsnorm_bwd_f32(
                 x.as_ptr(),

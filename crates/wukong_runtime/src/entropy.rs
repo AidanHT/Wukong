@@ -229,7 +229,9 @@ mod tests {
                 let p = fill_probs(rows, cols);
                 for row in 0..rows {
                     let off = row * cols;
+                    // SAFETY: `p` row slice has cols readable f32 from off.
                     let a = unsafe { entropy_row_scalar(p[off..].as_ptr(), cols) };
+                    // SAFETY: AVX2 confirmed by the test's feature guard; `p` row slice has cols readable f32.
                     let b = unsafe { entropy_row_avx2(p[off..].as_ptr(), cols) };
                     assert_eq!(
                         a.to_bits(),
@@ -248,6 +250,7 @@ mod tests {
         for &(rows, cols) in &[(1usize, 1usize), (3, 7), (4, 64), (5, 257), (8, 512)] {
             let p = fill_probs(rows, cols);
             let mut got = vec![0.0f32; rows];
+            // SAFETY: `p` sized rows*cols and `got` sized rows for the dispatched call.
             unsafe {
                 wukong_entropy_f32(p.as_ptr(), got.as_mut_ptr(), rows as i64, cols as i64);
             }
@@ -280,6 +283,7 @@ mod tests {
             let p = fill_probs(rows, cols);
             let mut s = vec![0.0f32; rows];
             let mut par = vec![0.0f32; rows];
+            // SAFETY: `p` sized rows*cols; `s` and `par` sized rows (serial vs parallel).
             unsafe {
                 wukong_entropy_f32(p.as_ptr(), s.as_mut_ptr(), rows as i64, cols as i64);
                 wukong_entropy_f32_parallel(p.as_ptr(), par.as_mut_ptr(), rows as i64, cols as i64);
@@ -301,6 +305,7 @@ mod tests {
         for &cols in &[1usize, 2, 5, 8, 9, 16, 17, 100, 1000] {
             let p = vec![1.0f32 / cols as f32; cols];
             let mut got = [0.0f32; 1];
+            // SAFETY: `p` holds cols f32 and `got` one f32 (a single row).
             unsafe {
                 wukong_entropy_f32(p.as_ptr(), got.as_mut_ptr(), 1, cols as i64);
             }
@@ -318,6 +323,7 @@ mod tests {
     fn degenerate_shapes_are_noops() {
         let p = fill_probs(1, 8);
         let mut buf = vec![42.0f32; 8];
+        // SAFETY: `p` sized for one row, `buf` holds 8 f32; the degenerate extent is a no-op.
         unsafe {
             wukong_entropy_f32(p.as_ptr(), buf.as_mut_ptr(), 0, 4);
             wukong_entropy_f32(p.as_ptr(), buf.as_mut_ptr(), 2, 0);

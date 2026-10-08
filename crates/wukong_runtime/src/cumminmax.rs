@@ -382,6 +382,7 @@ mod tests {
     fn scalar_ref(x: &[f32], rows: usize, cols: usize, ext: Ext) -> Vec<f32> {
         let mut out = vec![0.0f32; rows * cols];
         for r in 0..rows {
+            // SAFETY: `x` and `out` are sized rows*cols; cummm_row_scalar writes row r's [r*cols, +cols).
             unsafe { cummm_row_scalar(x.as_ptr(), out.as_mut_ptr(), r * cols, cols, ext) };
         }
         out
@@ -398,6 +399,7 @@ mod tests {
 
                 // cummax
                 let mut got_max = vec![0.0f32; rows * cols];
+                // SAFETY: `x` and `got_max` are sized rows*cols for the dispatched cummax.
                 unsafe {
                     wukong_cummax_f32(x.as_ptr(), got_max.as_mut_ptr(), rows as i64, cols as i64);
                 }
@@ -408,6 +410,7 @@ mod tests {
 
                 // cummin
                 let mut got_min = vec![0.0f32; rows * cols];
+                // SAFETY: `x` and `got_min` are sized rows*cols for the dispatched cummin.
                 unsafe {
                     wukong_cummin_f32(x.as_ptr(), got_min.as_mut_ptr(), rows as i64, cols as i64);
                 }
@@ -432,6 +435,7 @@ mod tests {
             let mut p_max = vec![0.0f32; rows * cols];
             let mut s_min = vec![0.0f32; rows * cols];
             let mut p_min = vec![0.0f32; rows * cols];
+            // SAFETY: `x` sized rows*cols; `s_min`/`p_min` sized rows*cols (serial vs parallel).
             unsafe {
                 wukong_cummax_f32(x.as_ptr(), s_max.as_mut_ptr(), rows as i64, cols as i64);
                 wukong_cummax_f32_parallel(
@@ -485,6 +489,7 @@ mod tests {
             let mut p_max = vec![0.0f32; rows * cols];
             let mut s_min = vec![0.0f32; rows * cols];
             let mut p_min = vec![0.0f32; rows * cols];
+            // SAFETY: `x` sized rows*cols; `s_min`/`p_min` sized rows*cols.
             unsafe {
                 wukong_cummax_f32(x.as_ptr(), s_max.as_mut_ptr(), rows as i64, cols as i64);
                 wukong_cummax_f32_parallel(
@@ -538,6 +543,7 @@ mod tests {
 
                 let mut got_max = vec![0.0f32; cols];
                 let mut got_min = vec![0.0f32; cols];
+                // SAFETY: `got_max`/`got_min` hold cols f32 (a single row).
                 unsafe {
                     wukong_cummax_f32(x.as_ptr(), got_max.as_mut_ptr(), 1, cols as i64);
                     wukong_cummin_f32(x.as_ptr(), got_min.as_mut_ptr(), 1, cols as i64);
@@ -582,6 +588,7 @@ mod tests {
             let cols = x.len();
             let mut got_max = vec![0.0f32; cols];
             let mut got_min = vec![0.0f32; cols];
+            // SAFETY: `got_max`/`got_min` hold cols f32 (a single row).
             unsafe {
                 wukong_cummax_f32(x.as_ptr(), got_max.as_mut_ptr(), 1, cols as i64);
                 wukong_cummin_f32(x.as_ptr(), got_min.as_mut_ptr(), 1, cols as i64);
@@ -613,6 +620,7 @@ mod tests {
         let asc: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let mut max_asc = [0.0f32; 8];
         let mut min_asc = [0.0f32; 8];
+        // SAFETY: `asc`/`max_asc`/`min_asc` each hold 8 f32; the call runs one row of 8.
         unsafe {
             wukong_cummax_f32(asc.as_ptr(), max_asc.as_mut_ptr(), 1, 8);
             wukong_cummin_f32(asc.as_ptr(), min_asc.as_mut_ptr(), 1, 8);
@@ -627,6 +635,7 @@ mod tests {
         let desc: [f32; 8] = [8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0];
         let mut max_desc = [0.0f32; 8];
         let mut min_desc = [0.0f32; 8];
+        // SAFETY: `desc`/`max_desc`/`min_desc` each hold 8 f32; the call runs one row of 8.
         unsafe {
             wukong_cummax_f32(desc.as_ptr(), max_desc.as_mut_ptr(), 1, 8);
             wukong_cummin_f32(desc.as_ptr(), min_desc.as_mut_ptr(), 1, 8);
@@ -642,6 +651,7 @@ mod tests {
         let mixed: [f32; 8] = [3.0, 1.0, 9.0, 2.0, -4.0, 7.0, 0.0, 9.0];
         let mut max_mx = [0.0f32; 8];
         let mut min_mx = [0.0f32; 8];
+        // SAFETY: `mixed`/`max_mx`/`min_mx` each hold 8 f32; the call runs one row of 8.
         unsafe {
             wukong_cummax_f32(mixed.as_ptr(), max_mx.as_mut_ptr(), 1, 8);
             wukong_cummin_f32(mixed.as_ptr(), min_mx.as_mut_ptr(), 1, 8);

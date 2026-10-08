@@ -574,6 +574,7 @@ mod tests {
         let gamma = vec![1.0f32; cols];
         let mut dx = vec![f32::from_bits(0x7fc0_0001); rows * cols];
         let eps_bits = (1e-5f32).to_bits() as i64;
+        // SAFETY: `x`/`dy`/`gamma`/`dx` sized for the shape; a nonpositive rows is a no-op.
         unsafe {
             wukong_layernorm_bwd_f32(
                 x.as_ptr(),
@@ -589,6 +590,7 @@ mod tests {
             dx.iter().all(|v| v.to_bits() == 0x7fc0_0001),
             "nonpositive rows must not write dx"
         );
+        // SAFETY: `x`/`dy`/`gamma`/`dx` sized for the shape; the positive call writes dx.
         unsafe {
             wukong_layernorm_bwd_f32(
                 x.as_ptr(),
@@ -643,6 +645,7 @@ mod tests {
         };
         for row in 0..rows {
             let off = row * cols;
+            // SAFETY: per-row offset off has cols readable/writable f32; the reference writes one row.
             unsafe {
                 let (mean, rstd, s1c, s2c) =
                     stats_row_scalar(x[off..].as_ptr(), dy[off..].as_ptr(), gptr, cols, EPS);
@@ -690,6 +693,7 @@ mod tests {
                 let want = reference(&x, &dy, gamma_opt, rows, cols);
                 let mut got = vec![0.0f32; rows * cols];
                 let mut got_par = vec![0.0f32; rows * cols];
+                // SAFETY: `got`/`got_par` sized rows*cols for the dispatched backward.
                 unsafe {
                     wukong_layernorm_bwd_f32(
                         x.as_ptr(),
@@ -754,8 +758,10 @@ mod tests {
                 };
                 // stats: scalar vs avx2 must agree bit-for-bit.
                 let (ms, rs, a1s, a2s) =
+                    // SAFETY: `x`/`dy` hold n f32 and `gptr` n (or null); stats_row_scalar reads one row of n.
                     unsafe { stats_row_scalar(x.as_ptr(), dy.as_ptr(), gptr, n, EPS) };
                 let (mv, rv, a1v, a2v) =
+                    // SAFETY: AVX2 confirmed by the test's feature guard; `x`/`dy`/`gptr` sized for one row of n.
                     unsafe { stats_row_avx2(x.as_ptr(), dy.as_ptr(), gptr, n, EPS) };
                 assert_eq!(
                     ms.to_bits(),
@@ -780,6 +786,7 @@ mod tests {
                 // apply: scalar vs avx2 must agree bit-for-bit.
                 let mut a = vec![0.0f32; n];
                 let mut b = vec![0.0f32; n];
+                // SAFETY: `a`/`b` hold n f32 for the per-row comparison.
                 unsafe {
                     apply_row_scalar(
                         x.as_ptr(),
@@ -862,8 +869,10 @@ mod tests {
                         std::ptr::null()
                     };
                     let (ms, rs, a1s, a2s) =
+                        // SAFETY: `x`/`dy`/`gptr` sized for one row of n; stats_row_scalar reads n.
                         unsafe { stats_row_scalar(x.as_ptr(), dy.as_ptr(), gptr, n, EPS) };
                     let (mv, rv, a1v, a2v) =
+                        // SAFETY: AVX2 confirmed by the test's feature guard; `x`/`dy`/`gptr` sized for one row of n.
                         unsafe { stats_row_avx2(x.as_ptr(), dy.as_ptr(), gptr, n, EPS) };
                     for (sv, vv, what) in [
                         (ms, mv, "mean"),
@@ -879,6 +888,7 @@ mod tests {
                     }
                     let mut a = vec![0.0f32; n];
                     let mut b = vec![0.0f32; n];
+                    // SAFETY: `a`/`b` hold n f32 for the per-row comparison.
                     unsafe {
                         apply_row_scalar(
                             x.as_ptr(),
@@ -939,6 +949,7 @@ mod tests {
         let dy = fill_dy(COLS);
         let gamma = fill_gamma(COLS);
         let (_, rstd, _, _) =
+            // SAFETY: `x`/`dy`/`gamma` hold COLS f32; stats_row_scalar reads one row of COLS.
             unsafe { stats_row_scalar(x.as_ptr(), dy.as_ptr(), gamma.as_ptr(), COLS, EPS) };
 
         // f64 truth over the identical f32 inputs.
@@ -989,6 +1000,7 @@ mod tests {
                 std::ptr::null()
             };
             let mut got = vec![0.0f32; rows * cols];
+            // SAFETY: `got` sized rows*cols for the dispatched backward; inputs sized for the shape.
             unsafe {
                 wukong_layernorm_bwd_f32(
                     x.as_ptr(),

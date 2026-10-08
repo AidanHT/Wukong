@@ -191,6 +191,7 @@ mod tests {
         let a = vec![0.5f32; rows * cols];
         let b = vec![1.0f32; rows * cols];
         let mut out = vec![f32::from_bits(0x7fc0_0001); rows * cols];
+        // SAFETY: `a`, `b` and `out` are sized rows*cols; a nonpositive extent is a no-op.
         unsafe {
             wukong_lrscan_f32(a.as_ptr(), b.as_ptr(), out.as_mut_ptr(), rows as i64, 0);
         }
@@ -198,6 +199,7 @@ mod tests {
             out.iter().all(|v| v.to_bits() == 0x7fc0_0001),
             "nonpositive cols must not write out"
         );
+        // SAFETY: `a`, `b` and `out` are sized rows*cols; the positive call writes that span.
         unsafe {
             wukong_lrscan_f32(
                 a.as_ptr(),
@@ -252,6 +254,7 @@ mod tests {
                 let a = fill_a(rows * cols);
                 let b = fill_b(rows * cols);
                 let mut got = vec![0.0f32; rows * cols];
+                // SAFETY: `a`, `b` and `got` are sized rows*cols for the dispatched call.
                 unsafe {
                     wukong_lrscan_f32(
                         a.as_ptr(),
@@ -278,6 +281,7 @@ mod tests {
             let b = fill_b(rows * cols);
             let mut s = vec![0.0f32; rows * cols];
             let mut p = vec![0.0f32; rows * cols];
+            // SAFETY: `a`, `b`, `s` and `p` are each sized rows*cols (serial vs parallel).
             unsafe {
                 wukong_lrscan_f32(
                     a.as_ptr(),
@@ -307,6 +311,7 @@ mod tests {
         let a = [0.5f32, 0.5, 0.5, 0.5];
         let b = [1.0f32, 1.0, 1.0, 1.0];
         let mut got = [0.0f32; 4];
+        // SAFETY: `a`, `b` and `got` hold 4 f32 (one row of four).
         unsafe {
             wukong_lrscan_f32(a.as_ptr(), b.as_ptr(), got.as_mut_ptr(), 1, 4);
         }
@@ -334,6 +339,7 @@ mod tests {
             }
         }
         let mut got2 = [0.0f32; 16];
+        // SAFETY: all buffers are sized for the shape under test (got2 holds 16 f32).
         unsafe {
             wukong_lrscan_f32(a2.as_ptr(), b2.as_ptr(), got2.as_mut_ptr(), 8, 2);
         }

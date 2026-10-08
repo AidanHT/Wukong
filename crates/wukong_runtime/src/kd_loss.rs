@@ -344,7 +344,9 @@ mod tests {
                 for row in 0..rows {
                     let off = row * cols;
                     let a =
+                        // SAFETY: `x` and `q` row slices have cols readable f32 from off.
                         unsafe { kd_loss_row_scalar(x[off..].as_ptr(), q[off..].as_ptr(), cols) };
+                    // SAFETY: AVX2 confirmed by the test's feature guard; `x` and `q` row slices have cols readable f32.
                     let b = unsafe { kd_loss_row_avx2(x[off..].as_ptr(), q[off..].as_ptr(), cols) };
                     assert_eq!(
                         a.to_bits(),
@@ -365,6 +367,7 @@ mod tests {
             let x = fill(rows * cols);
             let q = fill_q(rows, cols);
             let mut got = vec![0.0f32; rows];
+            // SAFETY: `x`/`q` sized rows*cols and `got` sized rows for the dispatched call.
             unsafe {
                 wukong_kd_loss_f32(
                     x.as_ptr(),
@@ -400,6 +403,7 @@ mod tests {
             let q = fill_q(rows, cols);
             let mut s = vec![0.0f32; rows];
             let mut p = vec![0.0f32; rows];
+            // SAFETY: `x`/`q` sized rows*cols; `s` and `p` sized rows (serial vs parallel).
             unsafe {
                 wukong_kd_loss_f32(
                     x.as_ptr(),
@@ -444,6 +448,7 @@ mod tests {
 
             let mut soft = vec![0.0f32; rows];
             let mut hard = vec![0.0f32; rows];
+            // SAFETY: `x`/`q` sized rows*cols; `soft` and `hard` sized rows.
             unsafe {
                 wukong_kd_loss_f32(
                     x.as_ptr(),
@@ -482,6 +487,7 @@ mod tests {
             let x = vec![0.7f32; cols];
             let q = fill_q(1, cols); // a normalized strictly-positive soft target
             let mut got = [0.0f32; 1];
+            // SAFETY: `x`/`q` hold cols f32 and `got` one f32 (a single row).
             unsafe {
                 wukong_kd_loss_f32(x.as_ptr(), q.as_ptr(), got.as_mut_ptr(), 1, cols as i64);
             }
@@ -500,6 +506,7 @@ mod tests {
         let x = fill(8);
         let q = fill_q(2, 4);
         let mut out = vec![42.0f32; 2];
+        // SAFETY: `x`/`q` sized for the shape, `out` holds 2 f32; the degenerate extent is a no-op.
         unsafe {
             wukong_kd_loss_f32(x.as_ptr(), q.as_ptr(), out.as_mut_ptr(), 0, 4);
             wukong_kd_loss_f32(x.as_ptr(), q.as_ptr(), out.as_mut_ptr(), 2, 0);

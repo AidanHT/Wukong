@@ -316,6 +316,7 @@ mod tests {
         assert!(use_nt(n));
         let x = vec![2.0; n];
         let b = vec![1.0; cols];
+        // SAFETY: `check_nt_output` supplies an `out` buffer of n f32; `x` holds n f32 and `b` cols.
         crate::velem::check_nt_output(n, -99.0, 3.0, |out| unsafe {
             wukong_bias_bcast_f32(
                 x.as_ptr(),
@@ -346,6 +347,7 @@ mod tests {
                 for path in 0..3 {
                     let mut got = x.clone();
                     let p = got.as_mut_ptr();
+                    // SAFETY: `got` holds n f32; the call runs bias in place (out == x == p).
                     unsafe {
                         match path {
                             0 => bias_scalar(p, b.as_ptr(), p, rows, cols, op),
@@ -405,6 +407,7 @@ mod tests {
             let b: Vec<f32> = (0..cols).map(|j| (j as f32 % 11.0) * 0.25 - 1.3).collect();
             for &op in &[BIAS_ACT_NONE, VM_RELU, VM_GELU, VM_SILU] {
                 let mut got = vec![0.0f32; n];
+                // SAFETY: `x`/`b`/`got` are sized for the shape; `got` is rows*cols.
                 unsafe {
                     wukong_bias_bcast_f32(
                         x.as_ptr(),
@@ -416,6 +419,7 @@ mod tests {
                     );
                 }
                 let mut want = vec![0.0f32; n];
+                // SAFETY: `want` is sized rows*cols and its inputs sized for the shape.
                 unsafe {
                     bias_scalar(x.as_ptr(), b.as_ptr(), want.as_mut_ptr(), rows, cols, op);
                 }
@@ -450,6 +454,7 @@ mod tests {
         for &op in &ops {
             let mut got = vec![0.0f32; n];
             let mut want = vec![0.0f32; n];
+            // SAFETY: `got`/`want` are each sized rows*cols.
             unsafe {
                 wukong_bias_bcast_f32(
                     x.as_ptr(),
@@ -484,6 +489,7 @@ mod tests {
         for &op in &[BIAS_ACT_NONE, VM_RELU, VM_GELU] {
             let mut ser = vec![0.0f32; n];
             let mut par = vec![0.0f32; n];
+            // SAFETY: `ser`/`par` are each sized rows*cols (serial vs parallel).
             unsafe {
                 wukong_bias_bcast_f32(
                     x.as_ptr(),
@@ -518,6 +524,7 @@ mod tests {
         let x: Vec<f32> = (0..n).map(|i| (i as f32 % 91.0) * 0.031 - 1.4).collect();
         let b: Vec<f32> = (0..cols).map(|j| (j as f32 % 17.0) * 0.13 - 1.05).collect();
         let mut got = vec![0.0f32; n];
+        // SAFETY: `b` holds cols and `got` rows*cols.
         unsafe {
             wukong_bias_bcast_f32(
                 x.as_ptr(),
@@ -571,6 +578,7 @@ mod relu_zero_contract_tests {
                 .map(|i| CASES[(i + offset) % CASES.len()].1)
                 .collect();
             let mut out = vec![-99.0; rows * cols];
+            // SAFETY: `x`/`b` sized rows*cols/cols and `out` sized rows*cols.
             unsafe {
                 bias_scalar(
                     x.as_ptr(),
@@ -592,6 +600,7 @@ mod relu_zero_contract_tests {
                 } else {
                     wukong_bias_bcast_f32
                 };
+                // SAFETY: the dispatched bias writes `out`, sized rows*cols, from inputs sized for the shape.
                 unsafe {
                     kernel(
                         x.as_ptr(),
@@ -610,6 +619,7 @@ mod relu_zero_contract_tests {
             #[cfg(target_arch = "x86_64")]
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
                 out.fill(-99.0);
+                // SAFETY: AVX2 confirmed by the enclosing feature guard; the buffers are sized rows*cols.
                 unsafe {
                     bias_avx2(
                         x.as_ptr(),

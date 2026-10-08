@@ -265,6 +265,7 @@ mod tests {
         let (rows, cols) = (2usize, 3usize);
         let x = [3.0f32, 1.0, 2.0, 0.5, 9.0, 4.0];
         let mut out = vec![-7i32; rows];
+        // SAFETY: `x` sized rows*cols, `out` sized rows; a nonpositive rows is a no-op.
         unsafe {
             wukong_rowargmax_i32(x.as_ptr(), out.as_mut_ptr(), 0, cols as i64);
         }
@@ -272,6 +273,7 @@ mod tests {
             out.iter().all(|&v| v == -7),
             "nonpositive rows must not write out"
         );
+        // SAFETY: `x` sized rows*cols, `out` sized rows; the positive call writes rows.
         unsafe {
             wukong_rowargmax_i32(x.as_ptr(), out.as_mut_ptr(), rows as i64, cols as i64);
         }
@@ -330,7 +332,9 @@ mod tests {
         let planted = (1usize << 24) + 1; // odd and > 2^24 ⇒ not representable in f32
         x[planted] = 1.0;
         let mut got = vec![0i32; rows];
+        // SAFETY: `x` holds the single planted row; rowarg_scalar reads cols.
         let want = unsafe { rowarg_scalar(x.as_ptr(), cols, true) };
+        // SAFETY: `x` sized rows*cols, `got` sized rows.
         unsafe { wukong_rowargmax_i32(x.as_ptr(), got.as_mut_ptr(), rows as i64, cols as i64) };
         assert_eq!(
             want, planted as i32,
@@ -371,6 +375,7 @@ mod tests {
                 } else {
                     (wukong_rowargmin_i32, wukong_rowargmin_i32_parallel)
                 };
+                // SAFETY: `x` sized rows*cols; the dispatched argmax/argmin outputs are sized rows.
                 unsafe {
                     f(x.as_ptr(), got.as_mut_ptr(), rows as i64, cols as i64);
                     fp(x.as_ptr(), got_par.as_mut_ptr(), rows as i64, cols as i64);
@@ -411,6 +416,7 @@ mod tests {
         let mut amax_p = vec![0i32; rows];
         let mut amin = vec![0i32; rows];
         let mut amin_p = vec![0i32; rows];
+        // SAFETY: `x` sized rows*cols; `amin`/`amin_p` sized rows (serial vs parallel).
         unsafe {
             wukong_rowargmax_i32(x.as_ptr(), amax.as_mut_ptr(), rows as i64, cols as i64);
             wukong_rowargmax_i32_parallel(
@@ -457,6 +463,7 @@ mod tests {
         }
         let mut got = vec![0i32; rows];
         let mut got_p = vec![0i32; rows];
+        // SAFETY: `x` sized rows*cols; `got`/`got_p` sized rows.
         unsafe {
             wukong_rowargmax_i32(x.as_ptr(), got.as_mut_ptr(), rows as i64, cols as i64);
             wukong_rowargmax_i32_parallel(x.as_ptr(), got_p.as_mut_ptr(), rows as i64, cols as i64);
@@ -480,7 +487,9 @@ mod tests {
         for &cols in &[1usize, 7, 8, 9, 15, 16, 17, 31, 33, 64, 100, 1000] {
             let x = fill(1, cols);
             for is_max in [true, false] {
+                // SAFETY: `x` holds one row of cols f32; rowarg_scalar reads cols.
                 let s = unsafe { rowarg_scalar(x.as_ptr(), cols, is_max) };
+                // SAFETY: AVX2 confirmed by the enclosing feature guard; `x` holds one row of cols f32.
                 let v = unsafe { rowarg_avx2(x.as_ptr(), cols, is_max) };
                 assert_eq!(s, v, "scalar != avx2 at cols={cols} is_max={is_max}");
             }
@@ -514,6 +523,7 @@ mod tests {
                     let want = naive(&x, rows, cols, is_max);
                     let mut serial = vec![-1; rows];
                     let mut parallel = vec![-1; rows];
+                    // SAFETY: `x` sized rows*cols; `serial`/`parallel` sized rows.
                     unsafe {
                         rowarg_serial(
                             x.as_ptr(),
@@ -537,9 +547,11 @@ mod tests {
             for row in cases {
                 for is_max in [true, false] {
                     let want = naive(&row, 1, cols, is_max)[0];
+                    // SAFETY: `row` holds cols f32; rowarg_scalar reads cols.
                     assert_eq!(unsafe { rowarg_scalar(row.as_ptr(), cols, is_max) }, want);
                     #[cfg(target_arch = "x86_64")]
                     if is_x86_feature_detected!("avx2") {
+                        // SAFETY: AVX2 confirmed by the enclosing feature guard; `row` holds cols f32.
                         assert_eq!(unsafe { rowarg_avx2(row.as_ptr(), cols, is_max) }, want);
                     }
                 }

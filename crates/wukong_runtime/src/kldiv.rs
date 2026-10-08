@@ -233,7 +233,9 @@ mod tests {
                 let q = fill_probs(rows, cols, 1.7);
                 for row in 0..rows {
                     let off = row * cols;
+                    // SAFETY: `p` and `q` row slices have cols readable f32 from off.
                     let a = unsafe { kldiv_row_scalar(p[off..].as_ptr(), q[off..].as_ptr(), cols) };
+                    // SAFETY: AVX2 confirmed by the test's feature guard; `p` and `q` row slices have cols readable f32.
                     let b = unsafe { kldiv_row_avx2(p[off..].as_ptr(), q[off..].as_ptr(), cols) };
                     assert_eq!(
                         a.to_bits(),
@@ -254,6 +256,7 @@ mod tests {
             let p = fill_probs(rows, cols, 0.0);
             let q = fill_probs(rows, cols, 1.7);
             let mut got = vec![0.0f32; rows];
+            // SAFETY: `p`/`q` sized rows*cols and `got` sized rows for the dispatched call.
             unsafe {
                 wukong_kldiv_f32(
                     p.as_ptr(),
@@ -290,6 +293,7 @@ mod tests {
             let q = fill_probs(rows, cols, 1.7);
             let mut s = vec![0.0f32; rows];
             let mut par = vec![0.0f32; rows];
+            // SAFETY: `p`/`q` sized rows*cols; `s` and `par` sized rows (serial vs parallel).
             unsafe {
                 wukong_kldiv_f32(
                     p.as_ptr(),
@@ -325,6 +329,7 @@ mod tests {
             let rows = 3usize;
             let p = fill_probs(rows, cols, 0.4);
             let mut got = vec![0.0f32; rows];
+            // SAFETY: `p`/`q` sized rows*cols and `got` sized rows.
             unsafe {
                 // q == p.
                 wukong_kldiv_f32(
@@ -347,6 +352,7 @@ mod tests {
         let p = fill_probs(2, 4, 0.0);
         let q = fill_probs(2, 4, 1.0);
         let mut out = vec![42.0f32; 2];
+        // SAFETY: `p`/`q` sized for the shape, `out` holds 2 f32; the degenerate extent is a no-op.
         unsafe {
             wukong_kldiv_f32(p.as_ptr(), q.as_ptr(), out.as_mut_ptr(), 0, 4);
             wukong_kldiv_f32(p.as_ptr(), q.as_ptr(), out.as_mut_ptr(), 2, 0);

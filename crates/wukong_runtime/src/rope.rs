@@ -248,6 +248,7 @@ mod tests {
                 let x = fill_x(dim);
                 let mut a = vec![0.0f32; dim];
                 let mut b = vec![0.0f32; dim];
+                // SAFETY: `a` and `b` hold dim f32; the row call writes dim elements.
                 unsafe {
                     rope_row_scalar(pos, inv_freq.as_ptr(), x.as_ptr(), a.as_mut_ptr(), half);
                     rope_row_avx2(pos, inv_freq.as_ptr(), x.as_ptr(), b.as_mut_ptr(), half);
@@ -283,6 +284,7 @@ mod tests {
             let inv_freq = fill_inv_freq(half);
             let mut got = vec![0.0f32; rows * dim];
             let mut got_par = vec![0.0f32; rows * dim];
+            // SAFETY: `got` and `got_par` are sized rows*dim for the dispatched call.
             unsafe {
                 wukong_rope_f32(
                     x.as_ptr(),
@@ -321,6 +323,7 @@ mod tests {
         let x = fill_x(rows * dim);
         let inv_freq = fill_inv_freq(half);
         let mut got = vec![0.0f32; rows * dim];
+        // SAFETY: `x`/`got` sized rows*dim and `inv_freq` sized half.
         unsafe {
             wukong_rope_f32(
                 x.as_ptr(),
@@ -363,6 +366,7 @@ mod tests {
         let x = fill_x(rows * dim);
         let inv_freq = fill_inv_freq(half);
         let mut out = vec![0.0f32; rows * dim];
+        // SAFETY: `inv_freq` sized half and `out` sized rows*dim.
         unsafe {
             wukong_rope_f32(
                 x.as_ptr(),
@@ -400,6 +404,7 @@ mod tests {
         let inv_freq = fill_inv_freq(half);
         let mut out = vec![0.0f32; rows * dim];
         let mut inplace = x.clone();
+        // SAFETY: `out` and `inplace` are each sized rows*dim (out-of-place vs in-place).
         unsafe {
             wukong_rope_f32(
                 x.as_ptr(),
@@ -434,6 +439,7 @@ mod tests {
         let inv_freq = fill_inv_freq(4);
         let x = fill_x(8);
         let mut out = vec![42.0f32; 8];
+        // SAFETY: `x` and `out` hold 8 f32; the degenerate extent is a no-op.
         unsafe {
             wukong_rope_f32(x.as_ptr(), inv_freq.as_ptr(), out.as_mut_ptr(), 0, 4);
             wukong_rope_f32(x.as_ptr(), inv_freq.as_ptr(), out.as_mut_ptr(), 2, 0);

@@ -880,6 +880,7 @@ mod tests {
         let (rows, cols) = (2usize, 3usize);
         let x = [1.0f32; 6];
         let mut out = vec![f32::from_bits(0x7fc0_0001); cols];
+        // SAFETY: `x` sized rows*cols, `out` sized cols; a nonpositive rows is a no-op.
         unsafe {
             wukong_colsum_f32(x.as_ptr(), out.as_mut_ptr(), 0, cols as i64);
         }
@@ -887,6 +888,7 @@ mod tests {
             out.iter().all(|v| v.to_bits() == 0x7fc0_0001),
             "nonpositive rows must not write out"
         );
+        // SAFETY: `x` sized rows*cols, `out` sized cols; the positive call writes cols.
         unsafe {
             wukong_colsum_f32(x.as_ptr(), out.as_mut_ptr(), rows as i64, cols as i64);
         }
@@ -997,6 +999,7 @@ mod tests {
                     ColKind::Rms => (wukong_colrms_f32, wukong_colrms_f32_parallel),
                     ColKind::SumSq => (wukong_colsumsq_f32, wukong_colsumsq_f32_parallel),
                 };
+                // SAFETY: `x` sized rows*cols; the dispatched col-reduction outputs are sized cols.
                 unsafe {
                     f(x.as_ptr(), got.as_mut_ptr(), rows as i64, cols as i64);
                     fp(x.as_ptr(), got_par.as_mut_ptr(), rows as i64, cols as i64);
@@ -1107,6 +1110,7 @@ mod tests {
                 ] {
                     let mut s = vec![f32::from_bits(0x7f80_0001); cols]; // sentinel: a signalling NaN
                     let mut v = vec![f32::from_bits(0x7f80_0001); cols];
+                    // SAFETY: `x` sized rows*cols; `s`/`v` sized cols (serial vs parallel).
                     unsafe {
                         colreduce_scalar(x.as_ptr(), s.as_mut_ptr(), rows, cols, 0, cols, kind);
                         colreduce_avx2(x.as_ptr(), v.as_mut_ptr(), rows, cols, 0, cols, kind);
@@ -1198,6 +1202,7 @@ mod tests {
                             *b = pool[(k * 7 + j0 * 3 + rows) % pool.len()];
                         }
                         let (mut s, mut v) = (base.clone(), base.clone());
+                        // SAFETY: `s`/`v` are clones sized for the output (cols).
                         unsafe {
                             colreduce_finalize(s.as_mut_ptr(), j0, j0 + len, rows, kind);
                             colreduce_finalize_avx2(v.as_mut_ptr(), j0, j0 + len, rows, kind);
@@ -1309,6 +1314,7 @@ mod tests {
                 let mut s = vec![0.0f32; cols];
                 let mut v = vec![0.0f32; cols];
                 let mut p = vec![0.0f32; cols];
+                // SAFETY: `x` sized rows*cols; `v`/`p` sized cols.
                 unsafe {
                     colreduce_scalar(x.as_ptr(), s.as_mut_ptr(), rows, cols, 0, cols, kind);
                     colreduce_avx2(x.as_ptr(), v.as_mut_ptr(), rows, cols, 0, cols, kind);
@@ -1353,6 +1359,7 @@ mod tests {
         // …and through the public entry point, over a 2-row column.
         let x = [0.0f32, -0.0];
         let mut got = [1.0f32];
+        // SAFETY: `x` holds 2 f32 (one column of two rows); `got` one f32 (colmax, signed-zero).
         unsafe { wukong_colmax_f32(x.as_ptr(), got.as_mut_ptr(), 2, 1) };
         assert_eq!(
             got[0].to_bits(),
@@ -1360,6 +1367,7 @@ mod tests {
             "colmax lost the ±0 tie rule"
         );
         let mut got = [1.0f32];
+        // SAFETY: `x` holds 2 f32; `got` one f32 (colmin, signed-zero).
         unsafe { wukong_colmin_f32(x.as_ptr(), got.as_mut_ptr(), 2, 1) };
         assert_eq!(
             got[0].to_bits(),

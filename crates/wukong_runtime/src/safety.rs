@@ -149,7 +149,9 @@ mod tests {
             "index out of bounds: the len is 3 but the index is -1 at main.wk:7:12"
         );
         let site = b"a.wk:1:2\0";
+        // SAFETY: `site` points at a NUL-terminated byte string valid for the call.
         assert_eq!(unsafe { site_str(site.as_ptr()) }, "a.wk:1:2");
+        // SAFETY: a null pointer is an explicitly handled input to `site_str`.
         assert_eq!(unsafe { site_str(std::ptr::null()) }, "");
     }
 }

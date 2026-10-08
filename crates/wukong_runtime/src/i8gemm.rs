@@ -743,7 +743,9 @@ struct DeqArgs {
 // SAFETY: the pointers are read-only views the caller guarantees for the whole call; every task
 // joins before the extern entry returns, exactly the lifetime discipline of the `usize`-smuggled
 // operand pointers beside them.
+// SAFETY: `DeqArgs` bundles raw operand addresses for the parallel dequant; each worker writes a DISJOINT output band, so sharing it across threads is race-free.
 unsafe impl Send for DeqArgs {}
+// SAFETY: see above -- disjoint output bands make `DeqArgs` safe to share across threads.
 unsafe impl Sync for DeqArgs {}
 
 /// Rows `[i0, i0 + mr)` × columns `[j0, j0 + nc)` of the fused-dequant GEMM, walked in column blocks
@@ -881,6 +883,7 @@ mod tests {
         let a = vec![1u8; m * k];
         let b = vec![1i8; n * k];
         let mut c = vec![-7i32; m * n];
+        // SAFETY: `a`/`b`/`c` sized m*k/n*k/m*n; a nonpositive m is a no-op.
         unsafe {
             wukong_i8gemm_nt(
                 a.as_ptr(),
@@ -892,6 +895,7 @@ mod tests {
             );
         }
         assert!(c.iter().all(|&v| v == -7), "nonpositive m must not write c");
+        // SAFETY: `a`/`b`/`c` sized m*k/n*k/m*n; the positive call writes c.
         unsafe {
             wukong_i8gemm_nt(
                 a.as_ptr(),
@@ -926,7 +930,9 @@ mod tests {
         for &k in &[1usize, 7, 15, 16, 17, 31, 32, 33, 48, 64, 100, 257, 1024] {
             let a = fill_u8(k);
             let b = fill_i8(k);
+            // SAFETY: `a`/`b` hold k quantized values; dot_i8_scalar reads k.
             let s = unsafe { dot_i8_scalar(a.as_ptr(), b.as_ptr(), k) };
+            // SAFETY: AVX2 confirmed by the enclosing feature guard; `a`/`b` hold k values.
             let v = unsafe { dot_i8_avx2(a.as_ptr(), b.as_ptr(), k) };
             assert_eq!(s, v, "scalar != avx2 at k={k}");
         }
@@ -949,7 +955,9 @@ mod tests {
                 b.as_ptr().wrapping_add(2 * k),
                 b.as_ptr().wrapping_add(3 * k),
             );
+            // SAFETY: AVX2 confirmed by the enclosing feature guard; `a` holds k u8 and b0..b3 each k i8.
             let got = unsafe { dot4_i8_avx2(a.as_ptr(), b0, b1, b2, b3, k) };
+            // SAFETY: the four reference dots read k each from `a` and the b pointers (scalar).
             let want = unsafe {
                 (
                     dot_i8_scalar(a.as_ptr(), b0, k),
@@ -980,7 +988,9 @@ mod tests {
                 b.as_ptr().wrapping_add(2 * k),
                 b.as_ptr().wrapping_add(3 * k),
             );
+            // SAFETY: AVX-VNNI confirmed by the enclosing feature guard; `a` holds k u8 and b0..b3 each k i8.
             let got = unsafe { dot4_i8_vnni(a.as_ptr(), b0, b1, b2, b3, k) };
+            // SAFETY: the four reference dots read k each (scalar).
             let want = unsafe {
                 (
                     dot_i8_scalar(a.as_ptr(), b0, k),
@@ -1005,10 +1015,13 @@ mod tests {
             let b = fill_i8(4 * k);
             let (a0, a1) = (a.as_ptr(), a.as_ptr().wrapping_add(k));
             let bp = |c: usize| b.as_ptr().wrapping_add(c * k);
+            // SAFETY: AVX-VNNI confirmed by the enclosing feature guard; a0/a1 each k u8 and bp(0..3) each k i8.
             let got = unsafe { dot2x4_i8_vnni(a0, a1, bp(0), bp(1), bp(2), bp(3), k) };
             let mut want = [0i32; 8];
             for col in 0..4 {
+                // SAFETY: `a0` and `bp(col)` each hold k values (scalar reference).
                 want[col] = unsafe { dot_i8_scalar(a0, bp(col), k) };
+                // SAFETY: `a1` and `bp(col)` each hold k values (scalar reference).
                 want[col + 4] = unsafe { dot_i8_scalar(a1, bp(col), k) };
             }
             assert_eq!(got, want, "dot2x4_vnni != 8×scalar at k={k}");
@@ -1034,6 +1047,7 @@ mod tests {
             let bias: Vec<f32> = (0..n).map(|j| (j as f32) * 0.01 - 0.05).collect();
             // i32 GEMM reference (the unfused path the dequant fuses).
             let mut ci = vec![0i32; m * n];
+            // SAFETY: `a`/`b` sized m*k/n*k; `ci` sized m*n (the i32 reference).
             unsafe {
                 wukong_i8gemm_nt(
                     a.as_ptr(),
@@ -1075,6 +1089,7 @@ mod tests {
                     }
                     let mut got = vec![0f32; m * n];
                     let mut got_par = vec![0f32; m * n];
+                    // SAFETY: `a`/`b` sized m*k/n*k; `got`/`got_par` sized m*n (dequant).
                     unsafe {
                         wukong_i8gemm_nt_deq(
                             a.as_ptr(),
@@ -1122,6 +1137,7 @@ mod tests {
         let a = fill_u8(m * k);
         let b = fill_i8(n * k);
         let mut c = vec![0i32; m * n];
+        // SAFETY: `a`/`b` sized m*k/n*k; `c` sized m*n for the dispatched i8 GEMM.
         unsafe {
             wukong_i8gemm_nt(
                 a.as_ptr(),
@@ -1150,6 +1166,7 @@ mod tests {
         let b = fill_i8(n * k);
         let mut cs = vec![0i32; m * n];
         let mut cp = vec![0i32; m * n];
+        // SAFETY: `cs`/`cp` sized m*n (serial vs parallel).
         unsafe {
             wukong_i8gemm_nt(
                 a.as_ptr(),
@@ -1200,6 +1217,7 @@ mod tests {
         let mut serial = vec![0i32; m * n];
         let mut par = vec![0i32; m * n];
         let mut scalar = vec![0i32; m * n];
+        // SAFETY: `par`/`scalar` sized m*n.
         unsafe {
             wukong_i8gemm_nt(a.as_ptr(), b.as_ptr(), serial.as_mut_ptr(), mi, ki, ni);
             wukong_i8gemm_nt_parallel(a.as_ptr(), b.as_ptr(), par.as_mut_ptr(), mi, ki, ni);
@@ -1250,6 +1268,7 @@ mod tests {
             }
             let mut got = vec![0f32; m * n];
             let mut got_par = vec![0f32; m * n];
+            // SAFETY: `got`/`got_par` sized m*n (dequant).
             unsafe {
                 wukong_i8gemm_nt_deq(
                     a.as_ptr(),
@@ -1308,6 +1327,7 @@ mod tests {
             let (mut s, mut p) = (vec![0i32; m * n], vec![0i32; m * n]);
             let scale_b: Vec<f32> = (0..n).map(|j| 0.01 + j as f32 * 1e-4).collect();
             let (mut ds, mut dp) = (vec![0f32; m * n], vec![0f32; m * n]);
+            // SAFETY: `ds`/`dp` sized m*n; `scale_b` sized n.
             unsafe {
                 wukong_i8gemm_nt(a.as_ptr(), b.as_ptr(), s.as_mut_ptr(), mi, ki, ni);
                 wukong_i8gemm_nt_parallel(a.as_ptr(), b.as_ptr(), p.as_mut_ptr(), mi, ki, ni);
@@ -1388,9 +1408,11 @@ mod tests {
         let k = 100_000usize;
         let a = vec![255u8; k];
         let b = vec![127i8; k];
+        // SAFETY: `a`/`b` hold k values; dot_i8_scalar reads k.
         let s = unsafe { dot_i8_scalar(a.as_ptr(), b.as_ptr(), k) };
         #[cfg(target_arch = "x86_64")]
         if is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 confirmed by the enclosing feature guard; `a`/`b` hold k values.
             let v = unsafe { dot_i8_avx2(a.as_ptr(), b.as_ptr(), k) };
             assert_eq!(s, v, "scalar != avx2 under overflow");
         }

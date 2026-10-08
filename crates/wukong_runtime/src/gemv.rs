@@ -327,6 +327,7 @@ mod tests {
         let a = vec![1.0f32; m * n];
         let x = vec![1.0f32; n];
         let mut y = vec![f32::from_bits(0x7fc0_0001); m];
+        // SAFETY: `a`/`x`/`y` sized m*n/n/m; a nonpositive m is a no-op.
         unsafe {
             wukong_sgemv(a.as_ptr(), x.as_ptr(), y.as_mut_ptr(), 0, n as i64);
         }
@@ -334,6 +335,7 @@ mod tests {
             y.iter().all(|v| v.to_bits() == 0x7fc0_0001),
             "nonpositive m must not write y"
         );
+        // SAFETY: `a`/`x`/`y` sized m*n/n/m; the positive call writes y.
         unsafe {
             wukong_sgemv(a.as_ptr(), x.as_ptr(), y.as_mut_ptr(), m as i64, n as i64);
         }
@@ -386,6 +388,7 @@ mod tests {
             }
             let mut got = vec![0.0f32; m];
             let mut got_par = vec![0.0f32; m];
+            // SAFETY: `got`/`got_par` sized m for the dispatched gemv; `a`/`x` sized m*n/n.
             unsafe {
                 wukong_sgemv(a.as_ptr(), x.as_ptr(), got.as_mut_ptr(), m as i64, n as i64);
                 wukong_sgemv_parallel(
@@ -427,6 +430,7 @@ mod tests {
             let a = fill(5, m * n);
             let x = fill(6, n);
             let mut plain = vec![0.0f32; m];
+            // SAFETY: `plain` sized m; `a`/`x` sized m*n/n.
             unsafe {
                 wukong_sgemv(
                     a.as_ptr(),
@@ -443,6 +447,7 @@ mod tests {
                     .collect();
                 let mut got = vec![0.0f32; m];
                 let mut got_par = vec![0.0f32; m];
+                // SAFETY: `got`/`got_par` sized m (alpha-scaled gemv).
                 unsafe {
                     wukong_sgemv_alpha(
                         a.as_ptr(),
@@ -472,6 +477,7 @@ mod tests {
             }
             // alpha == 1.0 must be byte-identical to the plain kernel.
             let mut a1 = vec![0.0f32; m];
+            // SAFETY: `a1` sized m; comparing alpha==1 against the plain kernel.
             unsafe {
                 wukong_sgemv_alpha(
                     a.as_ptr(),
@@ -545,9 +551,11 @@ mod tests {
                     best * 1e3
                 );
             };
+            // SAFETY: bench buffers `ap`/`xp`/`yp` sized m*n/n/m for the single-core timing.
             bench("sgemv (1 core)", &|| unsafe {
                 wukong_sgemv(ap, xp, yp, m as i64, n as i64);
             });
+            // SAFETY: bench buffers sized m*n/n/m for the parallel timing.
             bench("sgemv (parallel)", &|| unsafe {
                 wukong_sgemv_parallel(ap, xp, yp, m as i64, n as i64);
             });

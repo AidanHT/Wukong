@@ -381,6 +381,7 @@ mod tests {
             // log-softmax: full row of outputs.
             let mut a = vec![0.0f32; n];
             let mut b = vec![0.0f32; n];
+            // SAFETY: `a`/`b` hold n f32 for the scalar vs avx2 comparison.
             unsafe {
                 logsoftmax_row_scalar(x.as_ptr(), a.as_mut_ptr(), n);
                 logsoftmax_row_avx2(x.as_ptr(), b.as_mut_ptr(), n);
@@ -397,6 +398,7 @@ mod tests {
             // log-sum-exp: one scalar.
             let mut sa = [0.0f32; 1];
             let mut sb = [0.0f32; 1];
+            // SAFETY: `sa`/`sb` hold one f32 each (the reduced LSE, scalar vs avx2).
             unsafe {
                 logsumexp_row_scalar(x.as_ptr(), sa.as_mut_ptr(), n);
                 logsumexp_row_avx2(x.as_ptr(), sb.as_mut_ptr(), n);
@@ -430,6 +432,7 @@ mod tests {
                 x[nan_at - 8] = 1.0; // the row maximum, same lane as the NaN, earlier chunk
                 x[nan_at] = f32::NAN;
                 let (sa, sb) =
+                    // SAFETY: AVX2 confirmed by the test's feature guard; `x` holds n f32 (with an injected NaN).
                     unsafe { (lse_off_scalar(x.as_ptr(), n), lse_off_avx2(x.as_ptr(), n)) };
                 assert_eq!(
                     sa.to_bits(),
@@ -448,6 +451,7 @@ mod tests {
             let x = fill(rows * cols);
             let mut ls = vec![0.0f32; rows * cols];
             let mut lse = vec![0.0f32; rows];
+            // SAFETY: `ls` sized rows*cols and `lse` rows for the dispatched call; `x` sized rows*cols.
             unsafe {
                 wukong_logsoftmax_f32(x.as_ptr(), ls.as_mut_ptr(), rows as i64, cols as i64);
                 wukong_logsumexp_f32(x.as_ptr(), lse.as_mut_ptr(), rows as i64, cols as i64);
@@ -507,6 +511,7 @@ mod tests {
             // log-softmax.
             let mut s = vec![0.0f32; rows * cols];
             let mut p = vec![0.0f32; rows * cols];
+            // SAFETY: `s`/`p` sized rows*cols (serial vs parallel).
             unsafe {
                 wukong_logsoftmax_f32(x.as_ptr(), s.as_mut_ptr(), rows as i64, cols as i64);
                 wukong_logsoftmax_f32_parallel(
@@ -526,6 +531,7 @@ mod tests {
             // log-sum-exp.
             let mut sl = vec![0.0f32; rows];
             let mut pl = vec![0.0f32; rows];
+            // SAFETY: `sl`/`pl` sized rows (serial vs parallel LSE).
             unsafe {
                 wukong_logsumexp_f32(x.as_ptr(), sl.as_mut_ptr(), rows as i64, cols as i64);
                 wukong_logsumexp_f32_parallel(
@@ -553,6 +559,7 @@ mod tests {
         let x = fill(rows * cols);
         let mut oop = vec![0.0f32; rows * cols];
         let mut ip = x.clone();
+        // SAFETY: `oop` sized rows*cols (out-of-place) and `ip` an in-place clone.
         unsafe {
             wukong_logsoftmax_f32(x.as_ptr(), oop.as_mut_ptr(), rows as i64, cols as i64);
             wukong_logsoftmax_f32(ip.as_ptr(), ip.as_mut_ptr(), rows as i64, cols as i64);
@@ -602,6 +609,7 @@ mod tests {
             let mut via_norm = vec![0.0f32; rows * cols];
             let mut via_logsoftmax = vec![0.0f32; rows * cols];
             let mut lse = vec![0.0f32; rows];
+            // SAFETY: `via_logsoftmax` sized rows*cols and `lse` rows.
             unsafe {
                 wukong_norm_f32(
                     x.as_ptr(),
@@ -646,6 +654,7 @@ mod tests {
     fn degenerate_shapes_are_noops() {
         let x = fill(8);
         let mut buf = vec![42.0f32; 8];
+        // SAFETY: `x` sized for one row, `buf` holds 8 f32; the degenerate extent is a no-op.
         unsafe {
             wukong_logsoftmax_f32(x.as_ptr(), buf.as_mut_ptr(), 0, 4);
             wukong_logsoftmax_f32(x.as_ptr(), buf.as_mut_ptr(), 2, 0);

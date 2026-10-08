@@ -251,6 +251,7 @@ mod tests {
         let w = vec![1.0f32; rows];
         let a = vec![1.0f32; rows * cols];
         let mut out = vec![f32::from_bits(0x7fc0_0001); cols];
+        // SAFETY: `w`/`a`/`out` are sized rows / rows*cols / cols; a nonpositive cols is a no-op.
         unsafe {
             wukong_sgevm_f32(
                 w.as_ptr(),
@@ -265,6 +266,7 @@ mod tests {
             out.iter().all(|v| v.to_bits() == 0x7fc0_0001),
             "nonpositive cols must not write out"
         );
+        // SAFETY: `w` sized rows, `a` rows*cols, `out` cols, and `out` is disjoint from both.
         unsafe {
             wukong_sgevm_f32(
                 w.as_ptr(),
@@ -381,6 +383,7 @@ mod tests {
                 }
                 let mut got = vec![0.0f32; cols];
                 let mut got_par = vec![0.0f32; cols];
+                // SAFETY: `got`/`got_par` are sized cols; `w` and `a` are sized rows / rows*cols.
                 unsafe {
                     wukong_sgevm_f32(
                         w.as_ptr(),
@@ -430,6 +433,7 @@ mod tests {
                 want[j] = acc * alpha as f64;
             }
             let mut got = vec![0.0f32; cols];
+            // SAFETY: `out` is sized cols; `w` and `a` are sized for the shape.
             unsafe {
                 wukong_sgevm_f32(
                     w.as_ptr(),

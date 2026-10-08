@@ -874,6 +874,7 @@ mod tests {
         let k = vec![0.1f32; s * d];
         let v = vec![1.0f32; s * d];
         let mut o = vec![f32::from_bits(0x7fc0_0001); s * d];
+        // SAFETY: `q`/`k`/`v`/`o` are each sized s*d; a nonpositive s is a no-op.
         unsafe {
             wukong_attention_f32(
                 q.as_ptr(),
@@ -890,6 +891,7 @@ mod tests {
             o.iter().all(|x| x.to_bits() == 0x7fc0_0001),
             "nonpositive s must not write o"
         );
+        // SAFETY: `q`/`k`/`v`/`o` are each sized s*d; the positive call writes s*d.
         unsafe {
             wukong_attention_f32(
                 q.as_ptr(),
@@ -990,6 +992,7 @@ mod tests {
         let scale = 1.0 / (d as f32).sqrt();
         let want = naive(&q, &k, &v, s, d, scale, causal);
         let mut got = vec![0.0f32; s * d];
+        // SAFETY: `q`/`k`/`v`/`o` are each sized s*d for the dispatched attention.
         unsafe {
             wukong_attention_f32(
                 q.as_ptr(),
@@ -1083,6 +1086,7 @@ mod tests {
                 let mut vn = fill(3, s * d);
                 vn[0] = f32::NAN;
                 let mut got = vec![0.0f32; s * d];
+                // SAFETY: `q`/`k`/`v`/`o` are each sized s*d (v carries an injected NaN).
                 unsafe {
                     wukong_attention_f32(
                         q.as_ptr(),
@@ -1107,6 +1111,7 @@ mod tests {
                 qn[d] = f32::NAN; // Q row 1, lane 0
                 let v = fill(3, s * d);
                 let mut got = vec![0.0f32; s * d];
+                // SAFETY: `q`/`k`/`v`/`o` are each sized s*d.
                 unsafe {
                     wukong_attention_f32(
                         qn.as_ptr(),
@@ -2140,6 +2145,7 @@ mod tests {
                 } else {
                     f64::NAN
                 };
+                // SAFETY: all benchmark buffers are sized for the shape under test.
                 let fused = bench(&|| unsafe {
                     wukong_attention_f32(qp, kp, vp, op, s as i64, d as i64, scale, causal as i64);
                 });

@@ -80,6 +80,7 @@ pub(crate) fn check_nt_output<T: Copy + PartialEq + std::fmt::Debug>(
     let base = out.as_mut_ptr();
     // Deliberately start one element past a 32-byte boundary, within the allocation.
     let offset = ((32 - (base as usize & 31)) & 31) / std::mem::size_of::<T>() + 1;
+    // SAFETY: `offset` keeps `p` within `base`'s allocation -- one element past the next 32-byte boundary.
     let p = unsafe { base.add(offset) };
     assert_ne!(p as usize & 31, 0);
     NT_STORE_CHECKS.with(|count| count.set(0));
@@ -743,6 +744,7 @@ mod tests {
         assert_nt_aligned(p);
         // Invoke the same pre-store check directly through Rust's unwindable ABI.
         // No intrinsic or extern-C function is called with the misaligned pointer.
+        // SAFETY: `p.add(1)` stays within the test allocation; `assert_nt_aligned` only inspects the address, never dereferences it.
         let result = std::panic::catch_unwind(|| assert_nt_aligned(unsafe { p.add(1) }));
         let payload = result.expect_err("misalignment must fail before the intrinsic");
         let message = payload
@@ -761,10 +763,12 @@ mod tests {
         let n = crate::nt_policy::test_min_bytes() / 8 + 35;
         let x = vec![2.0; n];
         assert!(use_nt(n, 2));
+        // SAFETY: `check_nt_output` supplies an `out` buffer of n f32; `x` holds n f32.
         check_nt_output(n, -99.0, 3.0, |out| unsafe {
             wukong_velem_f32(x.as_ptr(), x.as_ptr(), out, n as i64, 1.0, 0.0, 1.0, VE_ID);
         });
         let coeffs = [1.0, 1.0];
+        // SAFETY: `check_nt_output` supplies an `out` buffer of n f32; `coeffs` holds the polynomial constants.
         check_nt_output(n, -99.0, 3.0, |out| unsafe {
             wukong_vhorner_f32(x.as_ptr(), out, n as i64, coeffs.as_ptr(), 2);
         });
@@ -792,6 +796,7 @@ mod tests {
         ];
         for &(op, a, b, c) in cases {
             let mut got = vec![0.0f32; n];
+            // SAFETY: `got` holds n f32; the inputs are sized n for the elementwise case.
             unsafe {
                 wukong_velem_f32(
                     x.as_ptr(),
@@ -825,6 +830,7 @@ mod tests {
         let x: Vec<f32> = (0..n).map(|i| i as f32 * 0.3 - 5.0).collect();
         let y: Vec<f32> = (0..n).map(|i| i as f32 * -0.7 + 2.0).collect();
         let mut got = vec![0.0f32; n];
+        // SAFETY: `x`/`y`/`got` are each sized n for the binary elementwise call.
         unsafe {
             wukong_velem_f32(
                 x.as_ptr(),
@@ -859,6 +865,7 @@ mod tests {
             vec![1e-5f32, 1e-4, 1e-3, 1e-2, 1e-1], // the deg-4 poly benchmark
         ] {
             let mut got = vec![0.0f32; n];
+            // SAFETY: `got` and its inputs are each sized n.
             unsafe {
                 wukong_vhorner_f32(
                     x.as_ptr(),
@@ -886,6 +893,7 @@ mod tests {
         let n = 70_000usize;
         let x: Vec<f32> = (0..n).map(|i| (i as f32 % 23.0) - 11.0).collect();
         let mut got = vec![0.0f32; n];
+        // SAFETY: `x`/`got` are each sized n.
         unsafe {
             wukong_velem_f32(
                 x.as_ptr(),
@@ -914,6 +922,7 @@ mod tests {
         let x: Vec<f32> = (0..n).map(|i| (i as f32 % 17.0) - 8.0).collect();
         let y: Vec<f32> = (0..n).map(|i| (i as f32 % 13.0) + 1.5).collect(); // 1.5..=13.5, never 0
         let mut got = vec![0.0f32; n];
+        // SAFETY: `x`/`y`/`got` are each sized n (y is nonzero for the quotient op).
         unsafe {
             wukong_velem_f32(
                 x.as_ptr(),
@@ -973,6 +982,7 @@ mod tests {
             for &(op, a, b, c) in cases {
                 let mut s = vec![0.0f32; n];
                 let mut p = vec![0.0f32; n];
+                // SAFETY: `s` and `p` are each sized n (serial vs parallel), inputs sized n.
                 unsafe {
                     wukong_velem_f32(
                         x.as_ptr(),

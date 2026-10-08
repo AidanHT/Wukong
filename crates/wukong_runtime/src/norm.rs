@@ -1190,6 +1190,7 @@ mod tests {
                 ] {
                     let x = vec![special; n];
                     let mut scalar = vec![0.0; n];
+                    // SAFETY: `x`/`scalar` sized n (special-value scalar twin).
                     unsafe {
                         if op == NORM_SOFTMAX {
                             softmax_row_scalar(x.as_ptr(), scalar.as_mut_ptr(), n);
@@ -1204,6 +1205,7 @@ mod tests {
                     #[cfg(target_arch = "x86_64")]
                     if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
                         let mut lanes = vec![0.0; n];
+                        // SAFETY: AVX2+FMA confirmed by the enclosing feature guard; `x`/`lanes` sized n.
                         unsafe {
                             if op == NORM_SOFTMAX {
                                 softmax_row_avx2(x.as_ptr(), lanes.as_mut_ptr(), n);
@@ -1219,6 +1221,7 @@ mod tests {
                 let mut x = vec![f32::NEG_INFINITY; n];
                 x[n / 2] = 3.0;
                 let mut out = vec![0.0; n];
+                // SAFETY: `x`/`out` sized n (a single row).
                 unsafe { wukong_norm_f32(x.as_ptr(), out.as_mut_ptr(), 1, n as i64, 0, op) };
                 for (i, actual) in out.into_iter().enumerate() {
                     let expected: f32 = match (op, i == n / 2) {
@@ -1252,6 +1255,7 @@ mod tests {
             for &op in &OPS {
                 let mut a = vec![0.0f32; n];
                 let mut b = vec![0.0f32; n];
+                // SAFETY: `x`/`a`/`b` sized n; the scalar and avx2 twins each read n (AVX2+FMA guarded above).
                 unsafe {
                     match op {
                         NORM_SOFTMAX => {
@@ -1543,6 +1547,7 @@ mod tests {
                 let x: Vec<f32> = (0..n).map(gen).collect();
                 // SAFETY: both twins read exactly `n` f32; AVX2+FMA detected above.
                 let (s, v) =
+                    // SAFETY: both twins read exactly n f32; AVX2+FMA detected above.
                     unsafe { (rowmax8_scalar(x.as_ptr(), n), rowmax8_avx2(x.as_ptr(), n)) };
                 for j in 0..8 {
                     assert_eq!(
@@ -1638,6 +1643,7 @@ mod tests {
                 for &op in &[NORM_SOFTMAX, NORM_LOGSOFTMAX] {
                     let mut a = vec![0.0f32; n];
                     let mut b = vec![0.0f32; n];
+                    // SAFETY: `x`/`a`/`b` sized n; the scalar and avx2 twins each read n (AVX2+FMA guarded above).
                     unsafe {
                         if op == NORM_SOFTMAX {
                             softmax_row_scalar(x.as_ptr(), a.as_mut_ptr(), n);
@@ -1668,6 +1674,7 @@ mod tests {
         for &op in &OPS {
             let mut s = vec![0.0f32; rows * cols];
             let mut p = vec![0.0f32; rows * cols];
+            // SAFETY: `s`/`p` sized rows*cols (serial vs parallel).
             unsafe {
                 wukong_norm_f32(
                     x.as_ptr(),
@@ -1704,6 +1711,7 @@ mod tests {
         for &op in &OPS {
             let mut oop = vec![0.0f32; n];
             let mut ip = x.clone();
+            // SAFETY: `oop` sized n (out-of-place) and `ip` an in-place clone.
             unsafe {
                 wukong_norm_f32(
                     x.as_ptr(),
@@ -1741,6 +1749,7 @@ mod tests {
 
         // softmax
         let mut sm = vec![0.0f32; n];
+        // SAFETY: `x`/`sm` sized n (softmax).
         unsafe {
             wukong_norm_f32(x.as_ptr(), sm.as_mut_ptr(), 1, n as i64, 0, NORM_SOFTMAX);
         }
@@ -1756,6 +1765,7 @@ mod tests {
 
         // log-softmax — reuse `mx` and `den` (= Σ exp(x-mx)) from the softmax block; ls = log(den).
         let mut lsm = vec![0.0f32; n];
+        // SAFETY: `x`/`lsm` sized n (log-softmax).
         unsafe {
             wukong_norm_f32(
                 x.as_ptr(),
@@ -1783,6 +1793,7 @@ mod tests {
 
         // layernorm
         let mut ln = vec![0.0f32; n];
+        // SAFETY: `x`/`ln` sized n (layernorm).
         unsafe {
             wukong_norm_f32(
                 x.as_ptr(),
@@ -1807,6 +1818,7 @@ mod tests {
 
         // rmsnorm
         let mut rn = vec![0.0f32; n];
+        // SAFETY: `x`/`rn` sized n (rmsnorm).
         unsafe {
             wukong_norm_f32(
                 x.as_ptr(),
@@ -1830,6 +1842,7 @@ mod tests {
 
         // l2norm — `out[i] = x[i] / sqrt(Σ x[i]² + eps)` (RMSNorm without the mean divisor).
         let mut l2 = vec![0.0f32; n];
+        // SAFETY: `x`/`l2` sized n (l2norm).
         unsafe {
             wukong_norm_f32(
                 x.as_ptr(),
@@ -1866,6 +1879,7 @@ mod tests {
         let mut buf = vec![42.0f32; 8];
         for &(rows, cols) in &[(0i64, 4i64), (2, 0), (-1, 4), (3, -2), (0, 0), (-1, -1)] {
             for &op in &OPS {
+                // SAFETY: a degenerate rows/cols pair is a no-op; no pointer is read.
                 unsafe {
                     wukong_norm_f32(
                         x.as_ptr(),
@@ -1946,6 +1960,7 @@ mod tests {
                 };
                 let mut a = vec![0.0f32; n];
                 let mut b = vec![0.0f32; n];
+                // SAFETY: `x`/`a`/`b` sized n; the scalar and avx2 affine twins each read n (AVX2+FMA guarded above).
                 unsafe {
                     if op == NORM_LAYERNORM {
                         layernorm_affine_row_scalar(
@@ -2005,6 +2020,7 @@ mod tests {
         for &op in &[NORM_LAYERNORM, NORM_RMSNORM] {
             let mut s = vec![0.0f32; rows * cols];
             let mut p = vec![0.0f32; rows * cols];
+            // SAFETY: `s`/`p` sized rows*cols (serial vs parallel).
             unsafe {
                 wukong_norm_affine_f32(
                     x.as_ptr(),
@@ -2047,6 +2063,7 @@ mod tests {
 
         // LayerNorm: (x-mean)/sqrt(var+eps) * gamma + beta
         let mut ln = vec![0.0f32; n];
+        // SAFETY: `x`/`ln` sized n; gamma/beta sized cols for the affine layernorm.
         unsafe {
             wukong_norm_affine_f32(
                 x.as_ptr(),
@@ -2073,6 +2090,7 @@ mod tests {
 
         // RMSNorm: x/sqrt(mean(x^2)+eps) * gamma  (no beta)
         let mut rn = vec![0.0f32; n];
+        // SAFETY: `x`/`rn` sized n; gamma sized cols for the affine rmsnorm.
         unsafe {
             wukong_norm_affine_f32(
                 x.as_ptr(),
@@ -2109,6 +2127,7 @@ mod tests {
         for &op in &[NORM_LAYERNORM, NORM_RMSNORM] {
             let mut plain = vec![0.0f32; n];
             let mut aff = vec![0.0f32; n];
+            // SAFETY: `plain`/`aff` sized n (plain vs affine).
             unsafe {
                 wukong_norm_f32(
                     x.as_ptr(),

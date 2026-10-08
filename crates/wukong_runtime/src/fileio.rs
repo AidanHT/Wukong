@@ -546,13 +546,16 @@ mod tests {
         }
         let f = Scratch::new("read_at", &bytes);
         let mut out = [7u16; 5];
+        // SAFETY: `out` holds 5 u16; the read fetches 5 elements from offset 3 of the scratch file.
         let n = unsafe { wukong_rt_read_dt(f.ptr(), 3, out.as_mut_ptr() as *mut u8, 5, DT_U16) };
         assert_eq!(n, 4);
         assert_eq!(out, [1, 0x8000, 0xFFFF, 0x1234, 7]);
         // The frozen whole-file entry reads the same bytes from offset 0.
         let mut b = [0u8; 4];
+        // SAFETY: `b` holds 4 u8; the whole-file entry reads 4 bytes from offset 0.
         let n = unsafe { wukong_rt_read_dt(f.ptr(), 0, b.as_mut_ptr(), 4, DT_U8) };
         assert_eq!((n, b), (4, [0xEE, 0xEE, 0xEE, 1]));
+        // SAFETY: `f.ptr()` is a valid NUL-terminated path for the scratch file.
         assert_eq!(unsafe { wukong_rt_file_size(f.ptr()) }, 11);
     }
 
@@ -562,16 +565,20 @@ mod tests {
         let mut out = [9i32; 2];
         let p = missing.as_ptr() as *const u8;
         assert_eq!(
+            // SAFETY: a missing-file path with n == 0 is handled without a read; `out` is untouched.
             unsafe { wukong_rt_read_dt(p, 0, out.as_mut_ptr() as *mut u8, 0, DT_I32) },
             IO_OPEN_FAILED
         );
         assert_eq!(
+            // SAFETY: a negative offset is rejected without a read; `out` is untouched.
             unsafe { wukong_rt_read_dt(p, -4, out.as_mut_ptr() as *mut u8, 2, DT_I32) },
             IO_OPEN_FAILED
         );
         assert_eq!(out, [9, 9]);
+        // SAFETY: a missing-file path returns IO_OPEN_FAILED from file_size without a read.
         assert_eq!(unsafe { wukong_rt_file_size(p) }, IO_OPEN_FAILED);
         assert_eq!(
+            // SAFETY: a missing-file path is rejected without touching the output buffer.
             unsafe {
                 wukong_rt_read_dt(std::ptr::null(), 0, out.as_mut_ptr() as *mut u8, 2, DT_I32)
             },
@@ -583,12 +590,14 @@ mod tests {
     fn write_dt_round_trips_little_endian() {
         let f = Scratch::new("write", &[]);
         let src: [u64; 3] = [0x0102_0304_0506_0708, u64::MAX, 0];
+        // SAFETY: `src` holds 3 u64; the write emits exactly 3 elements.
         let n = unsafe { wukong_rt_write_dt(f.ptr(), src.as_ptr() as *const u8, 3, DT_U64) };
         assert_eq!(n, 3);
         let on_disk = std::fs::read(&f.0).unwrap();
         let want: Vec<u8> = src.iter().flat_map(|v| v.to_le_bytes()).collect();
         assert_eq!(on_disk, want);
         // A zero-length write truncates and returns 0 without touching the (null) data pointer.
+        // SAFETY: a zero-length write truncates and returns 0 without touching the null data pointer.
         let n = unsafe { wukong_rt_write_dt(f.ptr(), std::ptr::null(), 0, DT_F16) };
         assert_eq!(n, 0);
         assert_eq!(std::fs::read(&f.0).unwrap(), Vec::<u8>::new());

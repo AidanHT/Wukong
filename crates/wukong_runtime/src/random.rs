@@ -152,6 +152,7 @@ mod tests {
     #[test]
     fn fill_is_the_scalar_stream_and_wraps_the_counter() {
         let mut out = [0f32; 5];
+        // SAFETY: `out` holds 5 f32 and the call fills exactly 5 (the negative arg is a stream offset, not a length).
         unsafe { wukong_rand_fill_f32(out.as_mut_ptr(), 5, 42, -2) };
         for (i, &x) in out.iter().enumerate() {
             let ctr = (-2i64 as u64).wrapping_add(i as u64);
@@ -160,7 +161,9 @@ mod tests {
         // Lane 2 is counter 0 after the wrap.
         assert_eq!(out[2], rand_f32(42, 0));
         let mut untouched = [7f32; 2];
+        // SAFETY: n == 0 is a no-op; `untouched` holds 2 f32.
         unsafe { wukong_rand_fill_f32(untouched.as_mut_ptr(), 0, 1, 1) };
+        // SAFETY: negative n is a no-op; `untouched` holds 2 f32.
         unsafe { wukong_rand_fill_f32(untouched.as_mut_ptr(), -3, 1, 1) };
         assert_eq!(untouched, [7.0; 2]);
     }
