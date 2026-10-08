@@ -139,6 +139,7 @@ Two combinations are usage errors rather than silently discarded work: `--run` w
 `obj`/`exe`. Diagnostics from every stage flow through a single `emit_diag` honoring
 `--error-format`.
 
+`--emit=check` returns after sema (lex, parse, imports, sema; no MIR lowering), exiting 0 when clean.
 `--emit=tokens` and `--emit=ast` return *before* import loading, so they show the root file only;
 every later stage — and `--run` — sees the merged program. A verifier failure is an internal compiler
 error (a bug in a pass), reported as prose and mapped to a non-zero exit, never a user diagnostic;
@@ -215,8 +216,13 @@ multi-line span underlines only its first line. Reported line/col are unaffected
 does not change; if you touch `TAB_WIDTH`, `rendered_width` or `expand_tabs`, touch all three.
 
 `--error-format=json` emits one JSON object per line (JSON Lines) for tooling: `severity`, an optional
-`code`, `message`, a `spans` array of `{file, line, col, primary, label}` (dummy spans omitted; `col`
-is the span's start — there is no end position), and a `notes` array of `{kind, message}`. The writer
+`code`, `message`, a `spans` array of `{file, line, col, primary, label, line_end, col_end,
+byte_start, byte_end}` (dummy spans omitted; `line`/`col` are the span's start, `line_end`/`col_end`
+its exclusive end), and a `notes` array of `{kind, message}` — that prefix is schema v0 and never
+moves. Schema v1 appends `suggestions` (`{message, replacement, applicability, span}`, `span` null
+when dummy), `children` (rustc-style `{severity, message, spans}` mirroring the notes), `rendered`
+(the color-off human form) and a final `"version":1`. Driver-level errors with no source span (IO,
+`--train`, autodiff, run and link failures) go through the same writer as code-less diagnostics. The writer
 is hand-rolled (no serde): `"`, `\`, `\n`, `\r`, `\t` get short escapes and every other character
 below `0x20` becomes `\u00xx`, so the line always stays parseable. `crates/wukongc/tests/fail.rs`
 greps for the literal substring `"code":"Ennnn"`, so key order and the absence of whitespace around

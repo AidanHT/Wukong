@@ -1208,9 +1208,10 @@ wukongc [OPTIONS] <input.wk>
                       native = Cranelift JIT; gpu / gpu-native require --features gpu + a CUDA device
                       aliases: interpreter = interp, cranelift = native, cuda = gpu,
                       gpu-lower = gpu-native; any other value is a usage error (exit 2)
---emit=<stage>        tokens | ast | mir-high | mir (alias mir-low) | grad | llvm-ir | obj | exe
+--emit=<stage>        tokens | ast | check | mir-high | mir (alias mir-low) | grad | llvm-ir | obj | exe
                       (default: exe)
                       grad = reverse-mode backward MIR of a loss fn (see --grad-of/--grad-wrt)
+                      check = run lex/parse/imports/sema only (no lowering); the fast typo loop
 --grad-of=<fn>        function to differentiate for --emit=grad / --train   (default: loss)
 --grad-wrt=<i,..>     buffer-parameter indices to differentiate w.r.t. (default: every buffer
                       parameter of the loss fn; with --train, every one EXCEPT the last, which is
@@ -1229,20 +1230,34 @@ wukongc [OPTIONS] <input.wk>
                       on unix). Rejected with --run and with every other stage, which print their
                       artifact on stdout — redirect instead.
 --error-format=<f>    human | json   (default: human)
+                      json spans carry byte/line end positions, plus suggestions, children,
+                      a rendered field and "version":1 (the v0 severity/code/message prefix is
+                      unchanged)
 -A|-W|-D <lint>       allow / warn on / deny (report as an error) a lint; <lint> is a name
                       (unused_variables), its code (W0001) or `warnings` (every lint):
                       `-D warnings` fails the build on any warning. Repeatable; `-Dwarnings`
                       works too; an unknown lint is a usage error (exit 2). See "Warnings (lints)"
---explain <CODE>      print an extended explanation for an error code
---color=<when>        auto | always | never   (default: auto — colour when stderr is a terminal)
+--error-limit=<n>     print at most n errors before suppressing the rest (0 = unlimited; default)
+--explain [CODE]      print an extended explanation for an error code; no code lists every code
+--color=<when>        auto | always | never   (default: auto)
+                      auto honours NO_COLOR, CLICOLOR_FORCE and TERM=dumb, and enables Windows VT
 -h, --help            print the usage text and exit 0
 -V, --version         print the version and exit 0
 ```
 
 Use `--emit` to inspect any stage of the pipeline, e.g. `wukongc --emit=mir -O2 kernel.wk` to see
-the optimized IR, or `wukongc --emit=ast kernel.wk` to see the parse tree. `--run` and
-`--emit=<stage>` cannot be combined; pick one. A usage error prints `error: <msg>` plus the usage text
-on stderr and exits **2**.
+the optimized IR, or `wukongc --emit=ast kernel.wk` to see the parse tree. `wukongc --emit=check
+kernel.wk` runs the front end (lex, parse, imports, sema) and stops before lowering — the fast loop
+for an editor or `--error-format=json` consumer, with no `C0001` lowering limits in the way. `--run`
+and `--emit=<stage>` cannot be combined; pick one. A usage error prints `error: <msg>` plus the
+usage text on stderr and exits **2**.
+
+Diagnostics render rustc-style: a label in another file gets its own `::: file:line:col` header, and
+a diagnostic may carry a `help:` suggestion (a concrete replacement). `--error-format=json` emits
+one object per diagnostic whose spans include byte and line/column end positions, plus `suggestions`,
+`children`, a `rendered` plain-text copy and `"version":1`; the `severity`/`code`/`message` prefix is
+stable. `--color=auto` honours `NO_COLOR`, `CLICOLOR_FORCE` and `TERM=dumb` and turns on Windows VT
+processing; `--error-limit=<n>` caps how many errors print before the rest are suppressed.
 
 Reverse-mode autodiff is CLI-driven too: `wukongc --emit=grad --grad-of=loss model.wk` prints the
 backward MIR of a loss function, and `wukongc --train --train-opt=adamw model.wk` runs its

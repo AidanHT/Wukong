@@ -26,6 +26,8 @@ cargo test -p wukongc --test run
 |---|---|
 | `emit.rs` | intermediate `--emit` stages produce expected artifacts |
 | `examples.rs` | `examples/*.wk` smoke through the CLI |
+| `diag_json.rs` | `--error-format=json` schema v1 against the real binary: the v0 prefix is unchanged and the v1 fields (end positions, byte range, `suggestions`, `children`, `rendered`, `version`) are present |
+| `explain.rs` | `--explain` lists every code, prints each entry, and every catalogue `bad:`/`good:` example is compiled under `--emit=check` (bad yields exactly its code first, good checks clean) |
 | `gpt2_config.rs` | GPT-2 config fixture |
 | `tensor_parity.rs` | vector-kernel recipe parity (host-gated) |
 

@@ -67,6 +67,15 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   function (`apply$square`), so no function pointer exists at run time (`E0411` outside a parameter).
   Calls such a specialization makes are invisible to the alias analysis, so every function they can
   reach forgoes disjointness-requiring kernels (`tests/run/{methods_impl,traits_static_dispatch,fn_params}.wk`).
+- **Diagnostics and tooling surface.** `--emit=check` runs the front end (lex/parse/imports/sema,
+  then the lints) and stops before lowering — a fast editor loop with no `C0001` lowering limits.
+  `--error-format=json`
+  is a stable schema (v1): spans carry byte and line/column end positions, and each diagnostic
+  carries `suggestions`, `children`, a `rendered` copy and `"version":1`, with the v0
+  `severity`/`code`/`message` prefix unchanged. Diagnostics may carry a `help:` suggestion (span +
+  replacement), a label in another file gets a `::: file:line:col` header, `--color=auto` honours
+  `NO_COLOR`/`CLICOLOR_FORCE`/`TERM=dumb` (and enables Windows VT), and `--explain` with no code
+  lists every catalogued code. (A full LSP is out of scope; see MASTER_PLAN §3.6.)
 - Functions (including recursion and mutual recursion — the interpreter oracle runs on a
   512 MiB worker thread, so ordinary recursion does not overflow the host's small default stack), and
   direct calls. *Caveat:* the tree-walking interpreter's call frames are ~an order of magnitude larger
