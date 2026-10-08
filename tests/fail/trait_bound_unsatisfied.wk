@@ -1,0 +1,36 @@
+// EXPECT-CODE: E0410
+module tests.fail.trait_bound_unsatisfied
+
+// A generic function bounded by a trait may only be instantiated at a type that implements it:
+// the body calls `x.area()`, and dispatch is static, so an instance at `Circle` — which has no
+// `impl Shape for Circle` — would have no `area` to call. The call site is rejected with the
+// unsatisfied bound named (`Circle: Shape`). tests/run/traits_static_dispatch.wk is the positive
+// control.
+
+trait Shape {
+    fn area(self) -> f32;
+}
+
+struct Square {
+    s: f32,
+}
+
+struct Circle {
+    r: f32,
+}
+
+impl Shape for Square {
+    fn area(self) -> f32 {
+        return self.s * self.s;
+    }
+}
+
+fn double_area<T: Shape>(x: T) -> f32 {
+    return 2.0 * x.area();
+}
+
+fn main() -> i32 {
+    let c = Circle { r: 1.0 };
+    print(double_area(c));
+    return 0;
+}

@@ -1,0 +1,203 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 38
+// EXPECT-OUT: 44
+// EXPECT-OUT: 50
+// EXPECT-OUT: 56
+// EXPECT-OUT: 83
+// EXPECT-OUT: 98
+// EXPECT-OUT: 113
+// EXPECT-OUT: 128
+// EXPECT-OUT: 38
+// EXPECT-OUT: 44
+// EXPECT-OUT: 50
+// EXPECT-OUT: 56
+// EXPECT-OUT: 83
+// EXPECT-OUT: 98
+// EXPECT-OUT: 113
+// EXPECT-OUT: 128
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 15
+// EXPECT-OUT: 38
+// EXPECT-OUT: 44
+// EXPECT-OUT: 50
+// EXPECT-OUT: 56
+// EXPECT-OUT: 83
+// EXPECT-OUT: 98
+// EXPECT-OUT: 113
+// EXPECT-OUT: 128
+// EXPECT-OUT: 1.5
+// EXPECT-OUT: 1
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 4.5
+// EXPECT-OUT: 4
+// EXPECT-OUT: 8
+// EXPECT-OUT: 15
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 2
+// EXPECT-OUT: 5
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 19
+// EXPECT-OUT: 22
+// EXPECT-OUT: 43
+// EXPECT-OUT: 50
+// EXPECT-OUT: 38
+// EXPECT-OUT: 44
+// EXPECT-OUT: 50
+// EXPECT-OUT: 56
+// EXPECT-OUT: 83
+// EXPECT-OUT: 98
+// EXPECT-OUT: 113
+// EXPECT-OUT: 128
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1.5
+// EXPECT-OUT: -2
+// EXPECT-OUT: 1.5
+// EXPECT-OUT: -2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 38
+// EXPECT-OUT: 44
+// EXPECT-OUT: 50
+// EXPECT-OUT: 56
+// EXPECT-OUT: 83
+// EXPECT-OUT: 98
+// EXPECT-OUT: 113
+// EXPECT-OUT: 128
+module tests.run.builtin_matmul
+
+// The named GEMM-family builtins, called by name instead of through a recognized loop nest:
+// `matmul` (wukong_sgemm), `matmul_nt` (wukong_sgemm_nt), `matmul_tn` (wukong_sgemm_tn), `linear`
+// (wukong_sgemm_nt_epi) and `transpose` (wukong_transpose_f32), plus the `_parallel` twin from a
+// `@parallel` function. Every lane is printed. The expected values are the scalar definitions —
+// out[i][j] = sum_k a[i][k] * b[k][j] and its transposed forms — evaluated by hand over small
+// integers, so every product and sum is exact in f32 and any summation order gives the same bits:
+//
+//   a = [[1,2,3],[4,5,6]] (2x3), b = [[1,2,3,4],[5,6,7,8],[9,10,11,12]] (3x4)
+//   a·b      = [[38,44,50,56],[83,98,113,128]]
+//   w (4x3)  = [[1,0,0],[0,1,0],[0,0,1],[1,1,1]];  a·wᵀ = [[1,2,3,6],[4,5,6,15]]
+//   aᵀ stored [K=3, M=2] = [1,4,2,5,3,6], so matmul_tn(aᵀ, b) = a·b again
+//   linear(a, w, bias=[0.5,-1,2,0]) = a·wᵀ + bias = [[1.5,1,5,6],[4.5,4,8,15]]
+//   transpose(a) = [[1,4],[2,5],[3,6]]
+//   p = [[1,2],[3,4]], q = [[5,6],[7,8]]: p·q = [[19,22],[43,50]] — computed INTO p, so the
+//     builtin must read p as it was before the call (the lowering runs the kernel into scratch
+//     when the output overlaps an input); an in-place GEMM would print something else.
+//   An empty contraction (K = 0, both as a runtime value and as a constant) is the zero matrix,
+//     and `linear` over K = 0 is the bias broadcast down every row: [[1.5,-2],[1.5,-2]]. The
+//     runtime kernels write nothing at all for K = 0, so the 7.0 sentinels would survive without
+//     the lowering's empty-contraction fill.
+//
+// Gate-blind like every kernel fixture: `--emit=mir -O2` must show the wukong_sgemm* calls.
+
+fn show(x: []f32) {
+    for i in 0..x.len() {
+        print(x[i]);
+    }
+}
+
+fn mm_tensor(a: Tensor[f32, 2, 3], b: Tensor[f32, 3, 4], mut c: Tensor[f32, 2, 4]) {
+    // Every dimension is inferred from the operand shapes.
+    matmul(a, b, c);
+}
+
+@parallel
+fn mm_parallel(a: [f32; 6], b: [f32; 12], mut c: [f32; 8]) {
+    matmul::<2, 3, 4>(a, b, c);
+}
+
+fn main() -> i32 {
+    let a: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let b: [f32; 12] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+
+    // (1) a·b over flat arrays, extents from the turbofish.
+    let mut c: [f32; 8] = [0.0; 8];
+    matmul::<2, 3, 4>(a, b, c);
+    show(c);
+
+    // (2) the same product through tensor-typed parameters.
+    let mut c2: [f32; 8] = [0.0; 8];
+    mm_tensor(a, b, c2);
+    show(c2);
+
+    // (3) a·wᵀ.
+    let w: [f32; 12] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+    let mut c3: [f32; 8] = [0.0; 8];
+    matmul_nt::<2, 3, 4>(a, w, c3);
+    show(c3);
+
+    // (4) aᵀ·b with a stored transposed.
+    let at: [f32; 6] = [1.0, 4.0, 2.0, 5.0, 3.0, 6.0];
+    let mut c4: [f32; 8] = [0.0; 8];
+    matmul_tn::<2, 3, 4>(at, b, c4);
+    show(c4);
+
+    // (5) linear: N from the bias, then M from the output, then K from x — no turbofish.
+    let bias: [f32; 4] = [0.5, -1.0, 2.0, 0.0];
+    let mut c5: [f32; 8] = [0.0; 8];
+    linear(a, w, bias, c5);
+    show(c5);
+
+    // (6) transpose.
+    let mut t: [f32; 6] = [0.0; 6];
+    transpose::<2, 3>(a, t);
+    show(t);
+
+    // (7) the output is also an input.
+    let mut p: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let q: [f32; 4] = [5.0, 6.0, 7.0, 8.0];
+    matmul::<2, 2, 2>(p, q, p);
+    show(p);
+
+    // (8) runtime-sized slices with a runtime M.
+    let sa = alloc_f32(6);
+    let sb = alloc_f32(12);
+    let sc = alloc_f32(8);
+    for i in 0..6 {
+        sa[i] = a[i];
+    }
+    for i in 0..12 {
+        sb[i] = b[i];
+    }
+    let m: i64 = 2;
+    matmul::<m, 3, 4>(sa, sb, sc);
+    show(sc);
+
+    // (9) empty contractions: runtime K = 0, the same for `linear`, and a constant K = 0.
+    let e = alloc_f32(0);
+    let k0: i64 = 0;
+    let mut z: [f32; 4] = [7.0; 4];
+    matmul::<2, k0, 2>(e, e, z);
+    show(z);
+    let bias2: [f32; 2] = [1.5, -2.0];
+    let mut z2: [f32; 4] = [7.0; 4];
+    linear::<2, k0, 2>(e, e, bias2, z2);
+    show(z2);
+    let mut z3: [f32; 4] = [7.0; 4];
+    matmul::<2, 0, 2>(e, e, z3);
+    show(z3);
+
+    // (10) the multicore twin, bit-identical to the serial kernel.
+    let mut c6: [f32; 8] = [0.0; 8];
+    mm_parallel(a, b, c6);
+    show(c6);
+
+    free(sa);
+    free(sb);
+    free(sc);
+    free(e);
+    return 0;
+}

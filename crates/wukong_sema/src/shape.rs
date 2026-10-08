@@ -53,7 +53,7 @@ use crate::{DefKind, FnSig, Sema};
 /// is unknown — except for `abs`/`round`/`floor`/`ceil`/`trunc`, which *preserve* the argument's type
 /// including an integer one (see the comment below). Returns `None` for any other callee — that keeps
 /// `type_call` lenient on the unmodeled-builtin path (`min`, `f32x8::load`, …).
-fn intrinsic_ret_ty(name: &str, args: &[Ty]) -> Option<Ty> {
+pub(crate) fn intrinsic_ret_ty(name: &str, args: &[Ty]) -> Option<Ty> {
     let float_ty = match args.first() {
         Some(Ty::Scalar(s)) if s.is_float() => Ty::Scalar(*s),
         Some(Ty::Vector { elem, lanes }) if elem.is_float() => Ty::Vector {
@@ -175,6 +175,13 @@ impl Sema<'_> {
         if let ExprKind::Path(p) = &callee.kind {
             if p.is_single() {
                 let name = p.first().sym;
+                // A call through a function-typed parameter (a local shadows a function of the
+                // same name).
+                if let Some(t) =
+                    self.type_fn_param_call(name, callee, generic_args, args, &mut arg_tys, span)
+                {
+                    return t;
+                }
                 if let Some(def) = self.defs.lookup(name) {
                     if let DefKind::Fn(sig) = &def.kind {
                         let sig = sig.clone();
@@ -201,6 +208,9 @@ impl Sema<'_> {
                                 ret: Box::new(sig.ret.clone()),
                             },
                         );
+                        // Function-valued arguments and trait bounds (`methods.rs`).
+                        self.check_fn_value_args(&sig, args, &arg_tys);
+                        self.check_call_bounds(name, &sig, generic_args, &arg_tys, span);
                         return self.check_fn_call(&sig, generic_args, &arg_tys, span, callee.id);
                     }
                 }
@@ -511,7 +521,7 @@ impl Sema<'_> {
         Ty::Unknown
     }
 
-    fn check_fn_call(
+    pub(crate) fn check_fn_call(
         &mut self,
         sig: &FnSig,
         generic_args: &[TypeExpr],
@@ -1591,7 +1601,12 @@ pub(crate) fn dims_equal(a: &Dim, b: &Dim) -> bool {
 /// reference / slice / array / tuple structure exactly like [`apply_subst`]. Only *type* generics are
 /// bound (a dimension generic is a `Dim::Var` inside a shape, never a `Ty::Named`); a first binding
 /// wins, and an `Unknown`/`Error` argument binds nothing (it would poison every later use of `g`).
-fn infer_type_generics(param: &Ty, arg: &Ty, generics: &[Symbol], tys: &mut HashMap<Symbol, Ty>) {
+pub(crate) fn infer_type_generics(
+    param: &Ty,
+    arg: &Ty,
+    generics: &[Symbol],
+    tys: &mut HashMap<Symbol, Ty>,
+) {
     match (param, arg) {
         (Ty::Named(g), a) if generics.contains(g) => {
             if !matches!(a, Ty::Unknown | Ty::Error) {
@@ -1609,6 +1624,23 @@ fn infer_type_generics(param: &Ty, arg: &Ty, generics: &[Symbol], tys: &mut Hash
                 infer_type_generics(p, a, generics, tys);
             }
         }
+        // A function-typed parameter bound to a function binds through its signature
+        // (`fn map<T>(f: fn(T) -> T, x: T)` called with `square: fn(f32) -> f32`).
+        (
+            Ty::Fn {
+                params: ps,
+                ret: pr,
+            },
+            Ty::Fn {
+                params: as_,
+                ret: ar,
+            },
+        ) => {
+            for (p, a) in ps.iter().zip(as_) {
+                infer_type_generics(p, a, generics, tys);
+            }
+            infer_type_generics(pr, ar, generics, tys);
+        }
         _ => {}
     }
 }
@@ -1617,7 +1649,7 @@ fn infer_type_generics(param: &Ty, arg: &Ty, generics: &[Symbol], tys: &mut Hash
 /// bound type, and each `Dim::Var` in a tensor shape becomes its binding in `dims`. A var with no
 /// binding is left **as-is** (not an error): the caller unifies parameter by parameter, so a dim can
 /// still be bound by a later argument, and an unbound dim in the *return* type stays symbolic.
-fn apply_subst(ty: &Ty, dims: &HashMap<Symbol, Dim>, tys: &HashMap<Symbol, Ty>) -> Ty {
+pub(crate) fn apply_subst(ty: &Ty, dims: &HashMap<Symbol, Dim>, tys: &HashMap<Symbol, Ty>) -> Ty {
     match ty {
         Ty::Named(v) => tys.get(v).cloned().unwrap_or_else(|| ty.clone()),
         Ty::Tensor {
@@ -1658,6 +1690,10 @@ fn apply_subst(ty: &Ty, dims: &HashMap<Symbol, Dim>, tys: &HashMap<Symbol, Ty>) 
             shared: *shared,
         },
         Ty::Tuple(items) => Ty::Tuple(items.iter().map(|i| apply_subst(i, dims, tys)).collect()),
+        Ty::Fn { params, ret } => Ty::Fn {
+            params: params.iter().map(|p| apply_subst(p, dims, tys)).collect(),
+            ret: Box::new(apply_subst(ret, dims, tys)),
+        },
         other => other.clone(),
     }
 }

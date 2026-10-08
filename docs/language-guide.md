@@ -122,6 +122,33 @@ the runtime kernels the compiler's own recognizers emit, and a user function of 
 hijack kernel dispatch silently. The restriction applies to function names only — a `let`, `const`,
 `struct` or `enum` may still be named `wukong_*`.
 
+### Function-typed parameters ✅
+
+A parameter may have a **function type**, `fn(A, B) -> R` (`fn(A)` for `()`), and every call binds it
+to a function **named at compile time** — a non-generic top-level function, or the caller's own
+function-typed parameter passed along:
+
+```wukong
+fn square(x: f32) -> f32 { return x * x; }
+fn apply(f: fn(f32) -> f32, x: f32) -> f32 { return f(x); }
+fn twice(f: fn(f32) -> f32, x: f32) -> f32 { return apply(f, apply(f, x)); }
+
+fn main() -> i32 {
+    print(twice(square, 3.0));             // 81
+    return 0;
+}
+```
+
+There are no function pointers at run time: the callee is **specialized per bound function** exactly
+like a type-generic function is per type (`apply$square`), the function parameter carries no value,
+and a call through it is a direct call — inlinable, and visible to every kernel recognizer. A
+type-generic higher-order function binds its type parameters from the function argument too
+(`fn fold3<T>(op: fn(T, T) -> T, a: T, b: T, c: T) -> T`). The rules (`E0411` otherwise): a function
+type is only a parameter's type (not a local, field, element, return type or `extern` parameter); a
+function cannot be bound to a `let` or passed to a non-function parameter; the argument must name a
+function, not compute one; and a function-typed parameter is neither `mut` nor named after a builtin
+(`gelu`, `print`, …). A wrong signature is the ordinary `E0401` type mismatch. `tests/run/fn_params.wk`.
+
 ## Bindings ✅
 
 ```wukong
@@ -346,6 +373,63 @@ no aggregate ever rides in a register and the two backends agree (`tests/run/{st
 Because a by-reference parameter aliases the caller's storage, mutating an aggregate parameter
 requires `mut` on it (see *Functions* above) — a non-`mut` aggregate parameter is effectively
 read-only, and a `mut` one is the in-place output buffer a kernel writes.
+
+## Methods and `impl` blocks ✅
+
+```wukong
+struct Vec2 { x: f32, y: f32 }
+
+impl Vec2 {
+    fn new(x: f32, y: f32) -> Self { return Self { x: x, y: y }; }   // associated function
+    fn dot(self, o: Vec2) -> f32 { return self.x * o.x + self.y * o.y; }
+    fn scale(&mut self, k: f32) { self.x = self.x * k; self.y = self.y * k; }
+}
+
+fn main() -> i32 {
+    let mut v = Vec2::new(3.0, 4.0);
+    v.scale(2.0);                          // mutates `v` in place
+    print(v.dot(v));                       // 100
+    return 0;
+}
+```
+
+An `impl` block adds functions to a struct or an enum. A function whose first parameter is the
+receiver is a **method**, called `x.m(..)`; one without is an **associated function**, called
+`Type::m(..)`. Inside the block `Self` names the type. Receivers follow the parameter rules above —
+an aggregate is passed by reference, so `self` and `&self` read the caller's value and `mut self` /
+`&mut self` may write it in place — and a receiver reached through a reference or pointer
+(`p.dot(q)` with `p: &Vec2`) is dereferenced automatically. Dispatch is **static**: each method is
+the ordinary function `Type.method`, and `x.m(a)` is exactly the call `Type.m(x, a)`, so methods
+inline, specialize and alias-check like any call. A misspelled method, an associated function called
+with method syntax, or an `impl` of something that is not a struct or enum is `E0315`.
+`tests/run/methods_impl.wk`.
+
+## Traits ✅
+
+```wukong
+trait Shape {
+    fn area(self) -> f32;
+    fn unit() -> Self;
+}
+
+impl Shape for Rect {
+    fn area(self) -> f32 { return self.w * self.h; }
+    fn unit() -> Self { return Rect { w: 1.0, h: 1.0 }; }
+}
+
+fn total<T: Shape>(a: T, b: T) -> f32 { return a.area() + b.area(); }   // or `where T: Shape`
+```
+
+A trait is a set of method signatures (`Self` is the implementing type). `impl Trait for Type` must
+define exactly those methods with exactly those signatures — a missing, extra or mismatched method is
+`E0410`, and so is a default method body, which traits do not have. A type parameter bounded by
+traits (`<T: Shape + Named>`, or a `where` clause) may call their methods on its values (`a.area()`)
+and their associated functions on itself (`T::unit()`, when `T` is the type of a parameter). Dispatch
+is **static, by monomorphization**: each call instantiates `total` at a concrete type and the
+instance calls that type's `impl` directly — no vtable, no indirect call — so a call at a type with
+no `impl Shape` is rejected at the call (`E0410`). Not supported yet: generic traits or trait
+methods, default methods, two traits on one type that define the same method name (both are the
+function `Type.method`), and generic structs/enums (`Buf<T>`). `tests/run/traits_static_dispatch.wk`.
 
 ## Enums ✅
 
@@ -723,17 +807,75 @@ lowers to PTX `.shared` SMEM and `sync_block()` to `bar.sync 0` (`wukong_codegen
 - `now_ns()` — a zero-argument monotonic nanosecond clock returning `i64`, for in-process timing
   (`let t1 = now_ns(); … let dt = now_ns() - t1;`). Any argument is `E0503`. Only *differences* between
   reads are meaningful, so a program's stdout stays backend-identical.
-- `sdpa(q, k, v, out, s, d, scale, causal)` — fused scaled-dot-product attention for one `[s, d]`
-  head: `out = softmax(scale·Q·Kᵀ [+ causal mask])·V`, computed by one runtime kernel with no S×S score
-  buffer. `q`/`k`/`v`/`out` must be `f32` arrays, `[]f32` slices, or tensor views; `s`, `d` and
-  `causal` are integers and `scale` is a float. When `s` and `d` are compile-time constants every
-  buffer whose type pins an extent must hold `s*d` elements. `sdpa` has no signature in sema, so its
-  whole contract is enforced at lowering: a malformed call is a catalogued `C0001` at the call site,
-  never a crash (`tests/fail/sdpa_operand_type.wk`, `sdpa_operand_extent.wk`).
+- `sdpa(q, k, v, out, s, d, scale, causal)` — fused scaled-dot-product attention; one of the
+  shape-checked kernel builtins below.
 
 These are recognized by the MIR builder and implemented directly by the interpreter (and, on the
 native backend, by the runtime). A user-defined function of the same name shadows any of these
 builtins.
+
+### Kernel builtins ✅
+
+The tuned runtime kernels are callable **by name**, not only through a loop nest a recognizer happens
+to match. Each builtin has a real shape signature that sema checks with the same codes a generic
+function's call gets, and each lowers to exactly one runtime kernel on every backend (the
+interpreter calls the same symbol), so it is the explicit way to say "I mean this kernel" — and it
+still means it under `@generic` or with recognition switched off. All operands are `f32` buffers
+(a `Tensor[f32, ..]`, an `[f32; N]` array, or a `[]f32` slice), row-major:
+
+| builtin | shape signature | kernel |
+|---|---|---|
+| `matmul::<M, K, N>(a, b, out)` | `a: [M, K]`, `b: [K, N]`, `out: [M, N]` | `wukong_sgemm` |
+| `matmul_nt::<M, K, N>(a, b, out)` | `a: [M, K]`, `b: [N, K]`, `out = a·bᵀ` | `wukong_sgemm_nt` |
+| `matmul_tn::<M, K, N>(a, b, out)` | `a: [K, M]`, `b: [K, N]`, `out = aᵀ·b` | `wukong_sgemm_tn` |
+| `linear::<M, K, N>(x, w, b, out)` | `x: [M, K]`, `w: [N, K]`, `b: [N]`, `out = x·wᵀ + b` | `wukong_sgemm_nt_epi` |
+| `transpose::<R, C>(x, out)` | `x: [R, C]`, `out: [C, R]` | `wukong_transpose_f32` |
+| `softmax`, `log_softmax ::<R, C>(x, out)` | `x, out: [R, C]`, over the last axis | `wukong_norm_f32` |
+| `layernorm::<R, C>(x, gamma, beta, out, eps)` | `x, out: [R, C]`, `gamma, beta: [C]` | `wukong_norm_affine_f32` |
+| `rmsnorm::<R, C>(x, gamma, out, eps)` | `x, out: [R, C]`, `gamma: [C]` | `wukong_norm_affine_f32` |
+| `exp`, `log`, `tanh`, `sigmoid`, `silu`, `gelu`, `relu (x, out)` | `x, out: [N]` | `wukong_vmath_f32` |
+| `sum`, `amax`, `amin (x) -> f32`; `dot(x, y) -> f32` | `x, y: [N]` | `wukong_sreduce_f32` |
+| `sdpa(q, k, v, out, s, d, scale, causal)` | each buffer holds at least `s·d` | `wukong_attention_f32` |
+
+The one-argument `gelu(x)`/`exp(x)`/… stay the scalar math intrinsics; only the two-argument buffer
+form is the kernel. A user function — or a local — of the same name shadows a builtin.
+
+**Where the dimensions come from**, first binding wins: an explicit turbofish (an integer literal, a
+`const`, a generic dimension, or an in-scope integer variable, which is then a *runtime* extent);
+the shape of each `Tensor` operand, unified axis by axis (a conflict is `E0502`, a rank clash
+`E0501`); the length of a fixed array, which fixes the one dimension of its shape still free (so
+`linear(x, w, b, out)` over arrays reads N from `b`, then M from `out`, then K from `x`); a
+row-wise operation's row count defaults to 1; and last a slice's runtime length. A dimension nothing
+fixes is **`E0409`** — `matmul(a, b, c)` over three flat arrays could be any factorization, so it
+needs `matmul::<2, 3, 4>(a, b, c)`. A static array whose length disagrees with its shape is `E0501`,
+a non-`f32` operand `E0502`, and writing the output through a non-`mut` aggregate parameter
+`E0304`. `sdpa`'s `s`/`d` are values: when both are constants, every operand whose type pins an
+extent must hold `s·d` elements (`E0501`) and a rank-2 tensor operand must be `[s, d]` (`E0502`).
+
+What the lowering guarantees on top of the kernel call:
+
+- **Runtime extents are checked.** A runtime dimension must lie in `0..=i32::MAX`, and an operand
+  whose length is only known at run time (a slice, or an array against a runtime dimension) must hold
+  exactly its shape's elements (`sdpa`: at least `s·d`). A violation traps like a failed `assert`
+  (exit 1, `assertion failed`) instead of reading or writing past a buffer
+  (`tests/run/builtin_extent_trap.wk`). A constant extent the kernels' signed 64-bit ABI cannot
+  carry is the codegen limit `C0001` (`tests/fail/sdpa_dimension_abi.wk`).
+- **Value semantics.** A builtin reads its inputs as they were before the call, even when the output
+  overlaps one: the call compares address ranges at run time and, on overlap, computes into scratch
+  and copies the result out (`matmul::<2, 2, 2>(p, q, p)` is `p·q`). An elementwise or row-wise
+  builtin spelled in place with one name (`softmax(x, x)`) runs in place with no test.
+- **Empty contractions.** `matmul` with `K = 0` is the zero matrix and `linear` the broadcast bias,
+  although the GEMM kernels themselves write nothing for `K = 0`.
+- Inside a `@parallel` function each call uses the kernel's multicore twin, which is bit-identical.
+- Reductions follow the kernel's documented lane order and identities: an empty `sum` is `0`, an
+  empty `amax`/`amin` is `-inf`/`+inf`.
+
+`sum` and `dot` lower to the same single `wukong_sreduce_f32` call the reduction recognizer emits,
+which the autodiff tape already differentiates; `amax`/`amin` have no VJP, and the buffer-writing
+builtins add the overlap branch, which the single-block autodiff tape does not take yet. Fixtures: `tests/run/builtin_matmul.wk`, `builtin_norms.wk`, `builtin_activations.wk`,
+`builtin_reductions.wk`, `sdpa_blocks.wk` (two query blocks, D = 9, both mask modes), each printing
+every lane against hand-derived values; `tests/fail/builtin_dim_uninferable.wk`,
+`sdpa_operand_extent.wk`, `sdpa_operand_type.wk`.
 
 ### Math intrinsics ✅
 

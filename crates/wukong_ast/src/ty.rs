@@ -48,6 +48,12 @@ pub enum TypeKind {
         dims: Vec<Dim>,
         layout: Option<Layout>,
     },
+    /// A function type `fn(A, B) -> R` (`ret: None` for `()`). Legal only as the type of a function
+    /// parameter, which every call site must bind to a named function known at compile time.
+    Fn {
+        params: Vec<TypeExpr>,
+        ret: Option<Box<TypeExpr>>,
+    },
 }
 
 /// One dimension of a tensor type.

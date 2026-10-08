@@ -1,0 +1,24 @@
+// EXPECT-CODE: E0315
+module tests.fail.method_not_found
+
+// A method call on a struct that has no such method. Before `impl` blocks existed, `v.nrom()` typed
+// as an unmodelled call and only died in codegen with a `C0001` that named no method; now a struct's
+// methods are a table sema consults, so the misspelling is a resolution error at the call naming
+// the method and the type. tests/run/methods_impl.wk is the positive control.
+
+struct Vec2 {
+    x: f32,
+    y: f32,
+}
+
+impl Vec2 {
+    fn norm2(self) -> f32 {
+        return self.x * self.x + self.y * self.y;
+    }
+}
+
+fn main() -> i32 {
+    let v = Vec2 { x: 3.0, y: 4.0 };
+    print(v.nrom2());
+    return 0;
+}

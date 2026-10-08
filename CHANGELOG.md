@@ -42,6 +42,27 @@ All notable changes to Wukong are documented here. The format is loosely based o
   symbols are a C0001 before the run), LLVM `declare`s with `signext`/`zeroext`. A declaration type
   with no C mapping is C0001.
 
+### Methods, traits and function-typed parameters
+
+- **Added: `impl` blocks** — methods and associated functions on structs and enums, `Self`, the four
+  receiver forms, auto-deref through a reference; each method is the function `Type.method`.
+- **Added: traits with static dispatch** — `trait`, `impl Trait for Type` (conformance checked),
+  bounds `<T: Trait>` and `where` clauses (previously parsed and dropped), resolved per
+  monomorphized instance. New codes `E0315` (unresolved method / trait / impl target) and `E0410`
+  (trait implementation or bound not satisfied).
+- **Added: function-typed parameters** `fn(A) -> R`, bound to a named function at each call and
+  specialized per function (no function pointers). New code `E0411`.
+
+### Named kernel builtins and an `sdpa` shape signature
+
+- **Added: shape-checked kernel builtins callable by name** — `matmul`, `matmul_nt`, `matmul_tn`,
+  `linear`, `transpose`, `softmax`, `log_softmax`, `layernorm`, `rmsnorm`, the two-argument
+  activations (`gelu(x, out)`, …), `sum`/`amax`/`amin`/`dot` (new `wukong_sema::builtins`, lowered by
+  `wukong_mir_build::builtins`). New code `E0409` (a builtin dimension nothing fixes).
+- **Fixed: `sdpa` had no signature in sema** — a wrong element type or a too-short buffer is now
+  `E0502`/`E0501` at the operand instead of `C0001` at the call, runtime-sized operands are checked
+  at run time, and an `out` overlapping `q`/`k`/`v` computes through scratch.
+
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
 - **Gate added: every recognizer-dependent corpus program is held to its own generic lowering.**

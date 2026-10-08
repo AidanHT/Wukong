@@ -50,6 +50,23 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   unresolvable symbol before the run (`C0001`); the LLVM emitter declares it with
   `signext`/`zeroext`. Types without a C mapping are `C0001` at the declaration
   (`tests/run/extern_c_libm.wk`).
+- **Named kernel builtins with shape signatures** (`matmul`/`matmul_nt`/`matmul_tn`, `linear`,
+  `transpose`, `softmax`/`log_softmax`, `layernorm`/`rmsnorm`, the two-argument activations
+  `exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu`/`relu(x, out)`, `sum`/`amax`/`amin`/`dot`, and `sdpa`):
+  each lowers to exactly one runtime kernel on both backends regardless of recognition, after sema
+  unifies its dimensions like a generic call (`E0409` when nothing fixes one; `E0501`/`E0502` on a
+  disagreement). Runtime extents are checked (a violation traps like `assert`), an output that
+  overlaps an input computes through scratch (value semantics), and an empty contraction is the zero
+  matrix (`tests/run/builtin_*.wk`, `tests/run/sdpa_blocks.wk`). `sdpa` gained its shape signature
+  here; it used to be checked only at lowering, as `C0001`. See the guide's "Kernel builtins".
+- **Methods, traits and function-typed parameters — all static dispatch.** `impl Type { .. }`
+  methods (`x.m(a)`, `Type::m(a)`, `self`/`&self`/`&mut self`/`mut self`, `Self`, auto-deref through a
+  reference) lower to the plain function `Type.method`; `trait` + `impl Trait for Type` are checked
+  for conformance (`E0410`), and a bounded type parameter (`<T: Shape>` / `where T: Shape`) calls
+  trait methods through monomorphization; a `fn(A) -> R` parameter is specialized per bound
+  function (`apply$square`), so no function pointer exists at run time (`E0411` outside a parameter).
+  Calls such a specialization makes are invisible to the alias analysis, so every function they can
+  reach forgoes disjointness-requiring kernels (`tests/run/{methods_impl,traits_static_dispatch,fn_params}.wk`).
 - Functions (including recursion and mutual recursion — the interpreter oracle runs on a
   512 MiB worker thread, so ordinary recursion does not overflow the host's small default stack), and
   direct calls. *Caveat:* the tree-walking interpreter's call frames are ~an order of magnitude larger

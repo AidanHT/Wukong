@@ -257,6 +257,19 @@ static CATALOG: &[Explanation] = &[
          rebinding."
     ),
     entry!(
+        "E0315",
+        "unresolved trait, impl target or method",
+        "A name used by a method, trait or bound does not resolve. Four situations reach this code: \
+         a method call names no method of the receiver's type (`v.nrom()` on a struct with no \
+         `nrom`, or `Type::f(..)` naming no associated function); an associated function (one with \
+         no `self`) is called with method syntax, or a trait method is called the other way round; \
+         an `impl` names a type that is not a struct or enum of this program, or a trait that does \
+         not exist (likewise a bound `T: Tr` or a `where` clause naming no type parameter); or a \
+         method is called on a type parameter that none of its trait bounds provides — add the \
+         bound (`fn f<T: Shape>(x: T)`). Fix the spelling, declare the method in an `impl` block, \
+         or bound the type parameter by a trait that has it."
+    ),
+    entry!(
         "E0401",
         "type mismatch",
         "A value's type does not match the type required by its context — for example a `let` with \
@@ -306,6 +319,44 @@ static CATALOG: &[Explanation] = &[
          so `[T; N]` inside `fn f<N>(..)` folded to length 0. Where the extent really is a \
          per-call-site parameter, spell the value `Tensor[T, N]`, whose dimensions are shape-checked \
          symbolically and bound at each call; where it is a fixed size, declare a `const`."
+    ),
+    entry!(
+        "E0409",
+        "kernel builtin dimension cannot be inferred",
+        "A named kernel builtin (`matmul`, `linear`, `transpose`, `softmax`, `layernorm`, `gelu`, \
+         `sum`, …) is shape-checked like a generic function: each of its dimensions must be fixed \
+         by an explicit turbofish (`matmul::<M, K, N>(a, b, out)`), by the shape of a \
+         `Tensor[f32, ..]` operand, by the length of a fixed `[f32; N]` array operand (which fixes \
+         the one dimension of its shape that is still free), or by the runtime length of a `[]f32` \
+         slice operand. A row-wise operation's row count defaults to 1. This error means none of \
+         those fixed the named dimension — for example `matmul(a, b, out)` over three flat arrays, \
+         where a 6-element `a` could be 2x3 or 3x2. Supply the dimensions explicitly with a \
+         turbofish, or pass tensors whose types carry the shape."
+    ),
+    entry!(
+        "E0410",
+        "trait implementation or bound not satisfied",
+        "A trait contract is broken. Either an `impl Trait for Type` does not match the trait — a \
+         trait method is missing, an extra method is not a member of the trait, a method's \
+         receiver, parameters or return type differ from the trait's signature (with `Self` read as \
+         `Type`), or a trait method has a default body or generic parameters, which traits do not \
+         support — or a generic function bounded by a trait is called at a type that has no \
+         `impl Trait for Type`. Dispatch is static (each call instantiates the function at a \
+         concrete type), so the instance would have no method to call. Implement the trait for the \
+         type, or call the function at a type that implements it."
+    ),
+    entry!(
+        "E0411",
+        "function value outside a function-typed parameter",
+        "Functions are passed by name to parameters of function type (`fn apply(f: fn(f32) -> f32, \
+         x: f32)`), and the callee is specialized for that function at compile time — there are no \
+         function pointers at run time. So a function type may only be the type of a parameter of a \
+         function with a body (not a local, field, element, return type or `extern` parameter); the \
+         argument must name a non-generic top-level function or forward the caller's own \
+         function-typed parameter; a function may not be bound to a `let` or passed to a \
+         non-function parameter; and a function-typed parameter may be neither `mut` nor named \
+         after a builtin (`gelu`, `print`, …), whose name the compiler reads as the builtin. Pass \
+         the function directly at each call instead."
     ),
     entry!(
         "E0501",

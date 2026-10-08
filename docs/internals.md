@@ -119,6 +119,19 @@ source
                  | textual LLVM IR (--emit=llvm-ir)
 ```
 
+Two front-end surfaces lower to plain calls before any recognizer sees the tree. **Methods**: the
+parser flattens each `impl` method into a top-level function `Type.method` (receiver desugared to a
+`self: Type` parameter) beside an `ItemKind::Impl` marker; `wukong_sema::methods` builds the method
+tables, checks trait conformance and bounds, and records every resolved call; `wukong_mir_build`'s
+`methods::desugar_module` then rewrites `x.m(a)` to `Type.m(x, a)` ahead of `tindex`/`canon`/alias
+analysis. A call through a trait bound resolves per monomorphized instance, and a function-typed
+parameter is a pseudo-generic (`$fn$<param>` bound to `Ty::Named(<fn>)`), specialized away with no
+runtime value; the functions such calls reach are excluded from the alias-free fact.
+**Kernel builtins**: `wukong_sema::builtins` shape-checks `matmul`/`softmax`/…/`sdpa` and records each
+call's resolved dimensions (`SemaResult::builtin_calls`); `wukong_mir_build::builtins` lowers it to one
+runtime kernel behind runtime extent checks (trapping through `assert`) and an output-overlap guard
+(scratch + copy-out), independent of `@generic`/recognition.
+
 `wukong_driver::compile` orchestrates this and honors `--emit=<stage>` to stop early. Every stage
 prints its artifact on stdout except `--emit=obj` and `--emit=exe`, which write a file (`-o <path>`).
 Two combinations are usage errors rather than silently discarded work: `--run` with an explicit

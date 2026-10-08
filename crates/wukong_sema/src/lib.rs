@@ -24,10 +24,18 @@
 //! and `const` is registered.
 
 mod attrs;
+mod builtins;
 mod dependency;
 mod layout;
+mod methods;
 mod shape;
 mod tensor;
+
+pub use builtins::{
+    builtin_dims, builtin_operand_dims, builtin_output, kernel_builtin, Activation, BuiltinCall,
+    BuiltinDim, KernelBuiltin,
+};
+pub use methods::{MethodCall, MethodResolution};
 
 use std::cell::RefCell;
 
@@ -184,6 +192,13 @@ pub struct SemaResult {
     /// `mir_build` reads it for a hidden runtime-dim argument no argument shape spells directly — a
     /// dimension solved from a derived extent (`Tensor[f32, 2*N]` fed 8 elements binds `N = 4`).
     pub call_dims: HashMap<NodeId, Vec<(Symbol, Dim)>>,
+    /// Every call to a named kernel builtin (`matmul`, `softmax`, `sdpa`, …) that shape-checked
+    /// cleanly, keyed by the call expression: which builtin, and how each of its dimensions was
+    /// resolved. `mir_build` lowers the call from this record, so the two crates cannot disagree on
+    /// an extent. See `builtins.rs`.
+    pub builtin_calls: HashMap<NodeId, BuiltinCall>,
+    /// The `impl` method tables and every method call, as resolved (see `methods.rs`).
+    pub methods: MethodResolution,
 }
 
 /// Collect the struct names a type contains *by value* — directly (`Ty::Named`) or nested inside an
@@ -352,6 +367,8 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         pending_dims: Vec::new(),
         call_dims: HashMap::default(),
         tensor_views: Vec::new(),
+        builtin_calls: HashMap::default(),
+        methods: methods::MethodState::default(),
     };
     // Attribute legality (`attrs`): an attribute names no value and has no type, so this walk needs
     // nothing the collection pass builds and runs first — an unknown `@bogus` is reported even in a
@@ -359,6 +376,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
     attrs::check(module, interner, &mut s.diags);
     s.collect(module);
     s.refresh_collected_types(module);
+    s.collect_methods(module);
     s.check_recursive_types(module);
     s.check_recursive_consts(module);
     // The undeclared-tensor-dimension check (`lower_dim`) fires only from here on: by the body pass
@@ -383,6 +401,8 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
             .map(|(name, init)| (name, init.clone()))
             .collect(),
         call_dims: s.call_dims,
+        builtin_calls: s.builtin_calls,
+        methods: s.methods.resolution,
     };
     (result, s.diags)
 }
@@ -444,6 +464,10 @@ struct Sema<'a> {
     /// E0304 rule (`tensor::note_tensor_view`). Reset with the other per-scope stacks in
     /// `push_scope`/`pop_scope`/`check_fn`/`check_const`.
     tensor_views: Vec<HashMap<Symbol, Symbol>>,
+    /// The resolved named-kernel-builtin calls, published as [`SemaResult::builtin_calls`].
+    builtin_calls: HashMap<NodeId, BuiltinCall>,
+    /// Methods, traits and function-typed parameters (`methods.rs`).
+    methods: methods::MethodState,
 }
 
 /// One entry of [`Sema::loop_ctx`] — a loop currently being type-checked.
@@ -601,6 +625,8 @@ impl<'a> Sema<'a> {
                     }
                 }
                 ItemKind::Import(_) => {}
+                // Collected by `collect_methods` once every signature is final.
+                ItemKind::Trait(_) | ItemKind::Impl(_) => {}
             }
         }
     }
@@ -674,7 +700,7 @@ impl<'a> Sema<'a> {
         let params = f
             .params
             .iter()
-            .map(|p| self.lower_param_type(&p.ty))
+            .map(|p| self.lower_param_type(f.body.is_some(), &p.ty))
             .collect();
         let ret = f
             .ret
@@ -740,7 +766,7 @@ impl<'a> Sema<'a> {
                     for f in &blk.items {
                         self.generics = generic_names(&f.generics);
                         for p in &f.params {
-                            self.lower_param_type(&p.ty);
+                            self.lower_param_type(false, &p.ty);
                         }
                         if let Some(t) = &f.ret {
                             self.lower_type(t);
@@ -915,7 +941,7 @@ impl<'a> Sema<'a> {
         let params = f
             .params
             .iter()
-            .map(|p| self.lower_param_type(&p.ty))
+            .map(|p| self.lower_param_type(f.body.is_some(), &p.ty))
             .collect();
         let ret = match &f.ret {
             Some(t) => self.lower_type(t),
@@ -1057,6 +1083,10 @@ impl<'a> Sema<'a> {
     }
 
     fn lower_type(&mut self, t: &TypeExpr) -> Ty {
+        // Only the outermost type of a parameter may be a function type: taking the flag here
+        // means every nested lowering (an element, a pointee, a function type's own parameters)
+        // sees it cleared.
+        let fn_ok = std::mem::take(&mut self.methods.fn_type_ok);
         let ty = match &t.kind {
             TypeKind::Path(p) => {
                 let name = p.segments.last().unwrap().sym;
@@ -1131,6 +1161,9 @@ impl<'a> Sema<'a> {
                     shape,
                     layout,
                 }
+            }
+            TypeKind::Fn { params, ret } => {
+                self.lower_fn_type(fn_ok, params, ret.as_deref(), t.span)
             }
         };
         self.check_layout(&ty, t.span);
@@ -1605,6 +1638,7 @@ impl<'a> Sema<'a> {
             .iter()
             .any(|a| self.interner.resolve(a.name.sym) == "parallel");
         self.generics = generic_names(&f.generics);
+        self.enter_fn_bounds(f.name.sym);
         self.scopes.clear();
         self.scopes.push(HashMap::default());
         // Mirror the scope reset for immutability tracking (these reset `scopes` directly instead of
@@ -1629,7 +1663,8 @@ impl<'a> Sema<'a> {
                     format!("duplicate parameter name `{nm}`"),
                 );
             }
-            let ty = self.lower_param_type(&p.ty);
+            let ty = self.lower_param_type(true, &p.ty);
+            self.check_fn_param_decl(p, &ty);
             // A parameter without `mut` is immutable: track it so reassigning it (`p = …`) or
             // mutating it through a projection (`p.f = …` on an aggregate, which — passed by
             // reference — would reach the caller) is E0304. Record its type either way, so the
@@ -2403,6 +2438,7 @@ impl<'a> Sema<'a> {
                     (None, Some(i)) => i.clone(),
                     (None, None) => Ty::Unknown,
                 };
+                let bound = self.checked_let_type(bound, s.span);
                 // What the binding views is read BEFORE the name is bound, so a shadowing view
                 // (`let a = a[0];`) still resolves its initializer to the parameter it reads.
                 self.note_tensor_view(pat, &bound, init.as_ref());
@@ -3085,6 +3121,13 @@ impl<'a> Sema<'a> {
             _ => None,
         };
         let payload_opt = resolved?; // not an enum → ordinary call
+
+        // `Enum::f(..)` naming no variant but a function of an `impl Enum` block (an associated
+        // function, or a method called with its receiver spelled as the first argument) is a
+        // method call, typed by `type_method_call` — not a misspelled variant.
+        if payload_opt.is_none() && self.methods.resolution.table.contains_key(&(ename, vname)) {
+            return None;
+        }
         let qual = format!("{}::{}", self.sym_str(ename), self.sym_str(vname));
         let Some(payload) = payload_opt else {
             for a in args {
@@ -3816,6 +3859,10 @@ impl<'a> Sema<'a> {
                 // `type_call` (which would type the `Enum::Variant` callee as a bare value and
                 // reject it as an incomplete constructor).
                 if let Some(t) = self.type_variant_construction(callee, args, e.span) {
+                    t
+                } else if let Some(t) = self.type_method_call(e, callee, generic_args, args) {
+                    t
+                } else if let Some(t) = self.type_kernel_builtin(e, callee, generic_args, args) {
                     t
                 } else {
                     self.type_call(callee, generic_args, args, e.span)

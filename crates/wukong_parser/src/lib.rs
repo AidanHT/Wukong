@@ -65,6 +65,8 @@ pub(crate) struct Parser<'a> {
     /// [`Parser::error`]) silences the follow-on recovery cascade — the unmatched `)`/`]` and
     /// "expected …" errors that unwinding a half-parsed monster construct would otherwise spew.
     depth_exceeded: bool,
+    /// Inside an `impl Type { … }` block: `Type`'s name, which every `Self` in the block denotes.
+    pub(crate) self_ty: Option<Symbol>,
 }
 
 impl<'a> Parser<'a> {
@@ -79,6 +81,7 @@ impl<'a> Parser<'a> {
             no_struct_lit: false,
             depth: 0,
             depth_exceeded: false,
+            self_ty: None,
         }
     }
 
@@ -209,7 +212,14 @@ impl<'a> Parser<'a> {
         if self.at(T::Ident) {
             let span = self.span();
             self.bump();
-            let sym = self.intern_span(span);
+            let mut sym = self.intern_span(span);
+            // Inside an `impl` block, `Self` names the implementing type — in a type, a path
+            // (`Self::new`), a struct literal (`Self { .. }`) and a pattern alike.
+            if let Some(ty) = self.self_ty {
+                if self.interner.resolve(sym) == "Self" {
+                    sym = ty;
+                }
+            }
             Ident { sym, span }
         } else {
             let span = self.span();
@@ -353,6 +363,25 @@ impl<'a> Parser<'a> {
                 let s = self.intern_span(self.span());
                 self.bump();
                 TypeKind::Int(s)
+            }
+            // `fn(A, B) -> R` — a function type (sema allows it only as a parameter's type).
+            T::Fn => {
+                self.bump();
+                self.expect(T::LParen);
+                let mut params = Vec::new();
+                while !self.at(T::RParen) && !self.at(T::Eof) {
+                    params.push(self.parse_type());
+                    if !self.eat(T::Comma) {
+                        break;
+                    }
+                }
+                self.expect(T::RParen);
+                let ret = if self.eat(T::Arrow) {
+                    Some(Box::new(self.parse_type()))
+                } else {
+                    None
+                };
+                TypeKind::Fn { params, ret }
             }
             T::Ident => self.parse_named_type(),
             _ => {

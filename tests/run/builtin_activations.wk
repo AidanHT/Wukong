@@ -1,0 +1,138 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 5
+// EXPECT-OUT: 8
+// EXPECT-OUT: 14
+// EXPECT-OUT: 22
+// EXPECT-OUT: 37
+// EXPECT-OUT: 61
+// EXPECT-OUT: 100
+// EXPECT-OUT: 165
+// EXPECT-OUT: 272
+// EXPECT-OUT: 448
+// EXPECT-OUT: 739
+// EXPECT-OUT: 1218
+// EXPECT-OUT: 2009
+// EXPECT-OUT: -693
+// EXPECT-OUT: 0
+// EXPECT-OUT: 405
+// EXPECT-OUT: 693
+// EXPECT-OUT: 916
+// EXPECT-OUT: 1099
+// EXPECT-OUT: 1253
+// EXPECT-OUT: 1386
+// EXPECT-OUT: 1504
+// EXPECT-OUT: 1609
+// EXPECT-OUT: 1705
+// EXPECT-OUT: 1792
+// EXPECT-OUT: 1872
+// EXPECT-OUT: -995
+// EXPECT-OUT: -987
+// EXPECT-OUT: -964
+// EXPECT-OUT: -905
+// EXPECT-OUT: -762
+// EXPECT-OUT: -462
+// EXPECT-OUT: 0
+// EXPECT-OUT: 462
+// EXPECT-OUT: 762
+// EXPECT-OUT: 905
+// EXPECT-OUT: 964
+// EXPECT-OUT: 987
+// EXPECT-OUT: 995
+// EXPECT-OUT: 47
+// EXPECT-OUT: 76
+// EXPECT-OUT: 119
+// EXPECT-OUT: 182
+// EXPECT-OUT: 269
+// EXPECT-OUT: 378
+// EXPECT-OUT: 500
+// EXPECT-OUT: 622
+// EXPECT-OUT: 731
+// EXPECT-OUT: 818
+// EXPECT-OUT: 881
+// EXPECT-OUT: 924
+// EXPECT-OUT: 953
+// EXPECT-OUT: -142
+// EXPECT-OUT: -190
+// EXPECT-OUT: -238
+// EXPECT-OUT: -274
+// EXPECT-OUT: -269
+// EXPECT-OUT: -189
+// EXPECT-OUT: 0
+// EXPECT-OUT: 311
+// EXPECT-OUT: 731
+// EXPECT-OUT: 1226
+// EXPECT-OUT: 1762
+// EXPECT-OUT: 2310
+// EXPECT-OUT: 2858
+// EXPECT-OUT: -4
+// EXPECT-OUT: -15
+// EXPECT-OUT: -45
+// EXPECT-OUT: -100
+// EXPECT-OUT: -159
+// EXPECT-OUT: -154
+// EXPECT-OUT: 0
+// EXPECT-OUT: 346
+// EXPECT-OUT: 841
+// EXPECT-OUT: 1400
+// EXPECT-OUT: 1955
+// EXPECT-OUT: 2485
+// EXPECT-OUT: 2996
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 1500
+// EXPECT-OUT: 2000
+// EXPECT-OUT: 2500
+// EXPECT-OUT: 3000
+module tests.run.builtin_activations
+
+// The two-argument activation builtins `act(x, out)` — `exp`, `log`, `tanh`, `sigmoid`, `silu`,
+// `gelu`, `relu` — each one wukong_vmath_f32 call over a 13-element buffer (one 8-lane AVX2 group
+// plus a 5-element tail), every lane printed. The one-argument forms (`gelu(x)`) are still the
+// scalar math intrinsics; only the buffer form is the kernel builtin.
+//
+// x = -3, -2.5, ..., 3 (exact in f32). The expectations are the defining formulas evaluated in f64,
+// independently of the kernel, then scaled and rounded: exp prints round(100·e^x); the others print
+// round(1000·y), with log over x + 3.5 (0.5 .. 6.5), sigmoid(x) = 1 / (1 + e^-x),
+// silu(x) = x·sigmoid(x), gelu(x) = 0.5·x·(1 + tanh(sqrt(2/pi)·(x + 0.044715·x^3))) (the tanh
+// form the runtime and the scalar intrinsic both define), relu(x) = x > 0 ? x : 0. Every expected
+// lane is at least 4e-6 relative (plus 1e-3 scaled units) away from a rounding boundary, far more
+// than the kernels' f32 error.
+
+fn show(x: []f32, scale: f32) {
+    for i in 0..x.len() {
+        print(round(x[i] * scale) as i32);
+    }
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 13] = [0.0; 13];
+    let mut xp: [f32; 13] = [0.0; 13];
+    for i in 0..13 {
+        x[i] = (i as f32) * 0.5 - 3.0;
+        xp[i] = x[i] + 3.5;
+    }
+    let mut y: [f32; 13] = [0.0; 13];
+    exp(x, y);
+    show(y, 100.0);
+    log(xp, y);
+    show(y, 1000.0);
+    tanh(x, y);
+    show(y, 1000.0);
+    sigmoid(x, y);
+    show(y, 1000.0);
+    silu(x, y);
+    show(y, 1000.0);
+    gelu(x, y);
+    show(y, 1000.0);
+    relu(x, y);
+    show(y, 1000.0);
+    return 0;
+}

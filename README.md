@@ -77,6 +77,15 @@ not duplicate them. In summary, Wukong:
   lower multi-dimensional indexing (`.col_major` is byte-identical to `a[i + j*M]`); `.strided` /
   `.tiled(…)` still reject indexing (`C0001`). Arena/scratch/pool allocator selection is not
   implemented (the language's only runtime-sized memory today is `alloc_<T>`/`free`).
+- **Abstraction without indirection.** `impl` blocks give structs and enums methods and associated
+  functions; traits with bounds (`<T: Shape>`, `where`) and function-typed parameters
+  (`f: fn(f32) -> f32`) are dispatched statically — every generic and higher-order function is
+  specialized per instantiation, so no vtable or function pointer exists at run time
+  (`tests/run/{methods_impl,traits_static_dispatch,fn_params}.wk`).
+- **Kernels callable by name.** `matmul`, `linear`, `softmax`, `layernorm`, `rmsnorm`, `transpose`, the
+  buffer activations (`gelu(x, out)`, …), `sum`/`dot` and `sdpa` reach the tuned runtime kernels
+  directly, with real shape signatures (`E0409` when a dimension cannot be inferred) — the explicit
+  door beside the loop-nest recognizers (`tests/run/builtin_*.wk`).
 - **Zero hidden cost.** No GC, no implicit copies of large aggregates, no surprise allocations.
 - **Domain-aware optimization (implementation today).** The compiler **recognizes a matmul nest** (the
   `ikj` accumulate and `ijk` dot-product forms, incl. `nn.Linear` `A·Bᵀ`) and may lower it to a tuned

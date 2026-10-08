@@ -1,0 +1,115 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 9
+// EXPECT-OUT: -3
+// EXPECT-OUT: 81
+// EXPECT-OUT: 2.5
+// EXPECT-OUT: 4
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 9
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: -1
+// EXPECT-OUT: -2
+// EXPECT-OUT: -3
+// EXPECT-OUT: -16
+// EXPECT-OUT: 16
+// EXPECT-OUT: 6
+// EXPECT-OUT: 9
+// EXPECT-OUT: 12
+// EXPECT-OUT: 4.5
+module tests.run.fn_params
+
+// Function-typed parameters (`f: fn(f32) -> f32`). Each call binds the parameter to a named
+// function known at compile time, and the callee is specialized per bound function
+// (`apply$square`, `apply$negate`, ...), so a call through `f` is a direct call — no function
+// pointer exists at run time. Covered: a direct higher-order call, forwarding a function
+// parameter to another higher-order function, a map over a buffer, two function parameters
+// composed, a type-generic `fold3<T>` whose `T` is bound by the function argument, and a
+// parameter that shadows a top-level function of the same name. Expectations by hand:
+//   square(3) = 9, negate(3) = -3, twice(square, 3) = 81, twice(halve, 10) = 2.5
+//   map square over -2..3 = 4 1 0 1 4 9; map negate = 2 1 0 -1 -2 -3 (0 - 0 is +0)
+//   compose(square, negate, 4) = -16; compose(negate, square, 4) = 16
+//   fold3(add, 1, 2, 3) = 6; fold3(max, 4, 9, 2) = 9; fold3(mul, 1.5, 2, 4) = 12
+//   shadow(halve, 9) = 4.5 (the parameter `square`, not the function `square`)
+
+fn square(x: f32) -> f32 {
+    return x * x;
+}
+
+fn negate(x: f32) -> f32 {
+    return 0.0 - x;
+}
+
+fn halve(x: f32) -> f32 {
+    return x * 0.5;
+}
+
+fn apply(f: fn(f32) -> f32, x: f32) -> f32 {
+    return f(x);
+}
+
+fn twice(f: fn(f32) -> f32, x: f32) -> f32 {
+    return apply(f, apply(f, x));
+}
+
+fn map_into(f: fn(f32) -> f32, x: [f32; 6], mut out: [f32; 6]) {
+    for i in 0..6 {
+        out[i] = f(x[i]);
+    }
+}
+
+fn compose(f: fn(f32) -> f32, g: fn(f32) -> f32, x: f32) -> f32 {
+    return g(f(x));
+}
+
+fn fold3<T>(op: fn(T, T) -> T, a: T, b: T, c: T) -> T {
+    return op(op(a, b), c);
+}
+
+fn add_i(a: i32, b: i32) -> i32 {
+    return a + b;
+}
+
+fn max_i(a: i32, b: i32) -> i32 {
+    if a > b {
+        return a;
+    }
+    return b;
+}
+
+fn mul_f(a: f32, b: f32) -> f32 {
+    return a * b;
+}
+
+fn shadow(square: fn(f32) -> f32, x: f32) -> f32 {
+    return square(x);
+}
+
+fn main() -> i32 {
+    print(apply(square, 3.0));
+    print(apply(negate, 3.0));
+    print(twice(square, 3.0));
+    print(twice(halve, 10.0));
+    let x: [f32; 6] = [-2.0, -1.0, 0.0, 1.0, 2.0, 3.0];
+    let mut y: [f32; 6] = [0.0; 6];
+    map_into(square, x, y);
+    for i in 0..6 {
+        print(y[i]);
+    }
+    map_into(negate, x, y);
+    for i in 0..6 {
+        print(y[i]);
+    }
+    print(compose(square, negate, 4.0));
+    print(compose(negate, square, 4.0));
+    print(fold3(add_i, 1, 2, 3));
+    print(fold3(max_i, 4, 9, 2));
+    print(fold3(mul_f, 1.5, 2.0, 4.0));
+    print(shadow(halve, 9.0));
+    return 0;
+}
