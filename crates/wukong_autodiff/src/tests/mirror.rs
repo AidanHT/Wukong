@@ -29,8 +29,11 @@ fn mir_build_symbols() -> BTreeSet<String> {
             let len = tail
                 .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
                 .unwrap_or(tail.len());
-            // A bare `"wukong_"` (a prefix test in lowering) is not a symbol.
-            if len > "wukong_".len() && tail[len..].starts_with('"') {
+            // A bare `"wukong_"` (a prefix test in lowering) is not a symbol, and neither is any
+            // literal handed to `starts_with` (`dispatch.rs`'s `"wukong_rt_"` service-prefix test, a
+            // test's `"wukong_col"` family check): a prefix names a set, never one emitted call.
+            let prefix_test = rest[..at].trim_end().ends_with("starts_with(");
+            if len > "wukong_".len() && tail[len..].starts_with('"') && !prefix_test {
                 out.insert(tail[..len].to_string());
             }
             rest = &tail[len..];
