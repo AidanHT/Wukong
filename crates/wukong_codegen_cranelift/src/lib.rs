@@ -2826,6 +2826,11 @@ fn make_isa_for(
 }
 
 /// The host ISA ([`TargetCpu::Native`]) with an explicit backend configuration.
+///
+/// Test-only since the `--target-cpu` merge: every production caller (the JIT and the object
+/// emitter) now picks its target explicitly through [`make_isa_full`]; this host shorthand remains
+/// for `backend_opt_tests`, which pins the `-O` level → Cranelift `opt_level` mapping.
+#[cfg(test)]
 fn make_isa_with(
     pic: bool,
     verify: bool,

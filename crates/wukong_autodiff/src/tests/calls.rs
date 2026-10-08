@@ -220,7 +220,7 @@ fn hessian_vector_product_matches_closed_form_and_fd() {
     let hv_name = hv.name;
     let prog = program_of(vec![fwd.func.clone(), gdot, hv]);
     // hv(x, out, v, hv_out)
-    let mut bufs = vec![vec![x0, x1], vec![0.0], vec![v0, v1], vec![0.0, 0.0]];
+    let mut bufs = [vec![x0, x1], vec![0.0], vec![v0, v1], vec![0.0, 0.0]];
     {
         let mut views: Vec<&mut [f64]> = bufs.iter_mut().map(|b| b.as_mut_slice()).collect();
         run_kernel_f64(&prog, hv_name, &mut views, &it).expect("hvp run failed");
@@ -232,7 +232,7 @@ fn hessian_vector_product_matches_closed_form_and_fd() {
     let g1_name = g1.name;
     let prog1 = program_of(vec![fwd.func.clone(), g1]);
     let grad_at = |x: [f64; 2], it: &Interner| -> Vec<f64> {
-        let mut bufs = vec![x.to_vec(), vec![0.0], vec![0.0, 0.0]];
+        let mut bufs = [x.to_vec(), vec![0.0], vec![0.0, 0.0]];
         let mut views: Vec<&mut [f64]> = bufs.iter_mut().map(|b| b.as_mut_slice()).collect();
         run_kernel_f64(&prog1, g1_name, &mut views, it).expect("grad run failed");
         bufs[2].clone()

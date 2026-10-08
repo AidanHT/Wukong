@@ -381,9 +381,12 @@ fn f64_two_argument_transcendentals_match_runtime_on_both_backends() {
 /// The activations compose the library calls in MIR, so an `f64` `sigmoid`/`gelu`/`softplus`/…
 /// is double precision too: both backends agree bit-for-bit, and the value is within a few ULP of
 /// the host-libm composition (the old f32 demotion was ~2^27 ULP away).
+/// A named host-libm reference composition for one `f64` activation.
+type HostReference = (&'static str, fn(f64) -> f64);
+
 #[test]
 fn f64_composed_activations_are_double_precision() {
-    let reference: [(&str, fn(f64) -> f64); 8] = [
+    let reference: [HostReference; 8] = [
         ("sigmoid", |x| 1.0 / (1.0 + (-x).exp())),
         ("silu", |x| x / (1.0 + (-x).exp())),
         ("softplus", |x| x.max(0.0) + (1.0 + (-x.abs()).exp()).ln()),
