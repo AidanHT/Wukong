@@ -101,10 +101,11 @@ fn i8map(x: [i8; 19], mut o: [i8; 19], n: i64) {
     }
 }
 
-/// The one (operator, lane type) pair the x64 backend cannot lower: there is no packed BYTE
-/// multiply on x86 (`pmullw` is 16-bit, `pmulld` 32-bit, and no 8-bit form exists), so the pass
-/// has to leave this loop scalar. It is here because getting that wrong is not a slow program but
-/// a failed compile, and nothing else in the corpus multiplies `i8` in a loop.
+/// The one (operator, lane type) pair the x64 backend cannot lower directly: there is no packed
+/// BYTE multiply on x86 (`pmullw` is 16-bit, `pmulld` 32-bit, and no 8-bit form exists). The pass
+/// therefore multiplies in `i16` halves and truncates back (the low byte of a product does not
+/// depend on how the operands were extended). It is here because handing Cranelift an
+/// `imul.i8x16` is not a slow program but a failed compile.
 fn i8mul(x: [i8; 19], mut o: [i8; 19], n: i64) {
     let mut i: i64 = 0;
     while i < n {
@@ -197,7 +198,7 @@ fn main() -> i32 {
     let mut k: i64 = 0;
     while k < N { print(o8[k] as i32); k = k + 1; }
 
-    // (2) o8[i] = 3*(i - 9), every lane -- the loop the backend forces to stay scalar.
+    // (2) o8[i] = 3*(i - 9), every lane -- the byte multiply, done in i16 halves.
     i8mul(a8, o8, N);
     k = 0;
     while k < N { print(o8[k] as i32); k = k + 1; }

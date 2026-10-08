@@ -63,7 +63,7 @@
 //!
 //! # Width
 //!
-//! `W` is `128 / lane_bits`, i.e. `<4 x f32>`, `<2 x f64>`, `<8 x i16>`, `<16 x i8>`. That is not a
+//! Every vector is 128 bits — `<4 x f32>`, `<2 x f64>`, `<8 x i16>`, `<16 x i8>`. That is not a
 //! guess about what the machine wants — it is the widest vector Cranelift will legalize. A
 //! `<8 x f32>` reaches the x64 backend as `Unsupported("Unexpected SSA-value type: f32x8")` and
 //! fails the compile; the repo's 256-bit path is a separate mechanism (`VecKernel` +
@@ -71,6 +71,15 @@
 //! vectorizes itself — f32/f64/i32/i64 elementwise bodies and reductions, over arrays, slices and
 //! tensors. With AVX enabled Cranelift VEX-encodes the 128-bit ops, and two of them retire per
 //! cycle, so a memory-bound loop saturates the same bandwidth a 256-bit one would.
+//!
+//! The **group width** `W` — how many scalar iterations one vector iteration covers — is set by the
+//! *narrowest* lane the widened body holds: `W = 16 / narrowest_bytes`, LLVM LoopVectorize's rule.
+//! A wider value is then split into **parts**: in a loop that loads `i8` and computes in `f32`,
+//! `W = 16`, the bytes are one `<16 x i8>` and every `f32` value is four `<4 x f32>` parts, part `p`
+//! holding iterations `4p .. 4p+3`. The lane-count-changing casts between them are `Op::Widen` and
+//! `Op::Narrow` chains (`cast_route`), so an `i8` dequantize, a `u8` image normalize, an `f32 -> i8`
+//! saturating quantize and an `i8` dot into an `i32` accumulator all widen. A value is never split
+//! across more than [`MAX_PARTS`] vectors.
 //!
 //! # `bf16` / `f16` are deliberately excluded
 //!
@@ -109,7 +118,8 @@
 //! you: how many times the fixpoint went round.
 
 use wukong_mir::{
-    BasicBlock, BinOp, BlockId, CastKind, CmpOp, Function, Inst, MirType, Op, Terminator, ValueId,
+    BasicBlock, BinOp, BlockId, CastKind, CmpOp, Function, Half, Inst, MirType, NarrowKind, Op,
+    Terminator, ValueId,
 };
 
 use crate::fxhash::{FxHashMap, FxHashSet};
@@ -236,18 +246,73 @@ fn vec_of(lane: &MirType, w: u32) -> MirType {
     MirType::Vec(Box::new(lane.clone()), w)
 }
 
+/// The most 128-bit vectors one widened value may be split across: the body's widest lane at most
+/// four times its narrowest. An `i8` stream beside an `i64` one (eight parts per `i64` value) is
+/// declined rather than turned into a body eight times the size of its scalar original.
+const MAX_PARTS: u32 = 4;
+
+/// The one full-width vector type a lane type is widened to: `<4 x f32>`, `<16 x i8>`, ...
+fn part_ty(lane: &MirType) -> MirType {
+    vec_of(
+        lane,
+        lanes_of(lane).expect("a widened lane type has a vector width"),
+    )
+}
+
+/// How many [`part_ty`] vectors hold one value of lane type `lane` in a group of `w` iterations.
+fn parts_of(lane: &MirType, w: u32) -> usize {
+    (w / lanes_of(lane).expect("a widened lane type has a vector width")) as usize
+}
+
+/// The integer lane type of a byte width.
+fn int_of_bytes(bytes: u32) -> MirType {
+    match bytes {
+        1 => MirType::I8,
+        2 => MirType::I16,
+        4 => MirType::I32,
+        _ => MirType::I64,
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Planning
 // ---------------------------------------------------------------------------------------------
 
 /// One widened value: either kept scalar (the same value in every lane, or an address) or widened
-/// to a `W`-lane vector.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// to the `W` lanes of a group.
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum Wide {
     /// Loop-invariant, or an address/index that is uniform across the group.
     Uniform(ValueId),
-    /// A `Vec(lane, W)` value whose lane `k` holds what scalar iteration `i + k` computed.
-    Vector(ValueId),
+    /// The [`parts_of`] full-width vectors of one value, lowest iterations first: lane `k` of part
+    /// `p` holds what scalar iteration `i + p·L + k` computed, `L` lanes per part.
+    Vector(Vec<ValueId>),
+}
+
+/// How a lane conversion is spelled once the group's values are split into parts. Decided from the
+/// lane types alone by [`cast_route`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CastRoute {
+    /// One lane-wise `Cast` of the same kind per part (equal lane widths).
+    Same,
+    /// An integer cast between two types of one width: the bits do not change, so the parts are
+    /// reused as they are.
+    Identity,
+    /// `SExt`/`ZExt` doublings (`Op::Widen`) up to the target width — then, for an int-to-float
+    /// conversion, one same-width `SiToFp`. A zero-extended value is non-negative, so `SiToFp` of it
+    /// is exactly the `UiToFp` of the original.
+    WidenInt { ext: CastKind, then_fp: bool },
+    /// Truncating halvings (`Op::Narrow`) down to the target width.
+    TruncInt,
+    /// `f32 -> i16/i8`: a saturating `FpToSi` to `i32`, then saturating halvings. Each step clamps
+    /// into the next range, and the composition of nested clamps is the clamp to the innermost
+    /// range — which is exactly the scalar saturating cast. `unsigned` makes the last step clamp to
+    /// `0 ..= 2^w - 1` (a `FpToUi`).
+    FloatToNarrowInt { unsigned: bool },
+    /// `f32 -> f64`: each part's two halves (`Op::Widen`).
+    FpExt,
+    /// `f64 -> f32`: pairs of parts joined (`Op::Narrow`).
+    FpTrunc,
 }
 
 /// How one instruction of the scalar body is reproduced in the vector body.
@@ -259,14 +324,15 @@ enum Plan {
     /// re-reading its own data pointer out of the fat pointer. Emitted once, in the guard block,
     /// instead of once per lane group. See [`emit_body`] for why that is the same program.
     InvariantPtrLoad,
-    /// Widen it: same opcode, vector-typed result, operands splatted as needed.
+    /// Widen it: same opcode per part, operands splatted as needed. A shift by a uniform amount
+    /// keeps the amount scalar (`Op::Bin`'s vector-by-scalar shape); an `i8` multiply, which x86
+    /// cannot do packed, goes through `i16` halves and truncates back.
     Widen,
-    /// A constant left shift becomes wrapping multiplication by this power of two. MIR's
-    /// lane-wise shift operand shape cannot be passed directly to Cranelift's vector shift.
-    ShiftLeftConstant(i64),
-    /// A `Load` whose address is affine unit-stride: becomes a `Vec` load.
+    /// A conversion, by the route [`cast_route`] chose.
+    Cast(CastRoute),
+    /// A `Load` whose address is affine unit-stride: becomes one `Vec` load per part.
     VecLoad,
-    /// A `Store` whose address is affine unit-stride: becomes a `Vec` store.
+    /// A `Store` whose address is affine unit-stride: becomes one `Vec` store per part.
     VecStore,
     /// A reduction's combining instruction. Not emitted inline — every accumulate is folded
     /// serially at the end of the vector body by [`emit_reduction_fold`].
@@ -325,7 +391,7 @@ struct VecPlan {
     iv_ty: MirType,
     /// How to advance the trip: either a compile-time vector count, or `end` for `end - start`.
     trip: TripPlan,
-    /// Lane count.
+    /// The group width: scalar iterations per vector iteration, `16 / narrowest lane bytes`.
     w: u32,
     /// One entry per element of `lin`, in order.
     plans: Vec<Plan>,
@@ -338,10 +404,9 @@ struct VecPlan {
     /// Runtime checks that each loop-invariant data load's address lies outside each stored range
     /// (see [`plan_guards`]); conjoined with `guards`.
     point_guards: Vec<PointGuard>,
-    /// Element type the guard ranges are measured in (all guarded accesses share it).
-    guard_elem: MirType,
     /// May two guarded bases be *equal* (rather than disjoint)? Only when every guarded access
-    /// sits at the same constant offset from its base, so an equal pair is at distance 0.
+    /// sits at the same constant offset from its base and moves in the same element type, so an
+    /// equal pair is at distance 0.
     guard_allows_equal: bool,
     /// Where the body reads the induction variable as a **value** rather than as an address.
     ramp: IvRamp,
@@ -354,7 +419,9 @@ struct VecPlan {
 /// that reads it as a *value* — `if c == target`, `(i as f32)`, `o[i] = i` — needs the opposite:
 /// lane `k` must see `i + k`, the counter scalar iteration `i + k` would have had. That vector is
 /// `splat(i) + iota` (the step is 1, enforced by [`iv_verdict`]), and `iota` is exactly why
-/// [`wukong_mir::Op::Iota`] exists — no expression over splatted scalars is lane-varying.
+/// [`wukong_mir::Op::Iota`] exists — no expression over splatted scalars is lane-varying. When the
+/// counter is wider than the group's narrowest lane the ramp is split into parts like any other
+/// value, part `p` being `splat(i + p·L) + iota`.
 ///
 /// The two faces coexist. The *same* `v533` is a `gep` index (uniform) and a compare operand
 /// (ramp) in the same body, so the role is decided per instruction, not per value:
@@ -363,10 +430,10 @@ struct VecPlan {
 ///
 /// Only the induction variable itself gets a ramp. A value *derived* from it (`i + 1`, `i * 2`,
 /// `sext i`) used as a value is still declined: its ramp would be the same arithmetic over
-/// `ramp(i)`, which is expressible for `add`/`sub`/`mul` but not for the `shl` and `sext` the same
-/// closure admits (a MIR vector shift takes a per-lane amount Cranelift cannot lower, and a
-/// widening cast changes the lane count), and getting one of those right and the other wrong is
-/// worse than declining both.
+/// `ramp(i)` — expressible now for every op the address closure admits, the `sext` through
+/// `Op::Widen` and the `shl` through the vector-by-scalar shift — but the closure classifies those
+/// values as addresses, and splitting one value into an address role and a value role at once is a
+/// separate change from this one, which is worse to get half right than to decline.
 #[derive(Clone, Debug)]
 struct IvRamp {
     /// The induction variable's `ValueId` in the *original* loop.
@@ -450,6 +517,9 @@ struct GuardBase {
     terms: Vec<(ValueId, i64)>,
     lo: i64,
     hi: i64,
+    /// The element type every index in the group counts in. Per group, because one loop may read
+    /// `i8` and write `f32`: a range measured in the wrong element size would test the wrong bytes.
+    elem: MirType,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -634,17 +704,46 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
     }
     let iv_value_use = classify_iv_uses(f, &lin, iv.value)
         .ok_or("the induction variable is used for something other than addressing")?;
+    access_shape_verdict(l)?;
 
-    // ---- width, from the memory the loop touches ----------------------------------------------
-    let w = pick_width(l).ok_or("no single lane width for the loop's accesses")?;
-    // A lane ramp only makes sense at the width the rest of the body runs at: lane `k` of the ramp
-    // has to be the induction variable of the same scalar iteration lane `k` of every other vector
-    // in the group belongs to. An `i64` counter over `f32` data would want a 4-lane ramp of 8-byte
-    // lanes, which is 256 bits — past what the backend legalizes (see [`VEC_BYTES`]) and, more to
-    // the point, a different group size from the data.
-    if !iv_value_use.is_empty() && lanes_of(&iv_ty) != Some(w) {
-        return Err("the induction variable is read as a value at a width its lanes cannot hold");
+    // ---- per-instruction plan -----------------------------------------------------------------
+    let ramp = IvRamp {
+        iv: iv.value,
+        ty: iv_ty.clone(),
+        value_use: iv_value_use,
+    };
+    let (plans, vector_ty, reductions) =
+        plan_body(f, l, &lin, &ramp).ok_or("an instruction in the body cannot be widened")?;
+
+    // ---- width, from the narrowest lane the widened body holds --------------------------------
+    // Every value that becomes a vector, every affine access (a uniform stored value is splatted to
+    // its own type), the lane ramp and every reduction. `W` covers one full vector of the narrowest;
+    // each wider value is split into parts, at most `MAX_PARTS` of them.
+    let mut narrowest = u32::MAX;
+    let mut widest = 0;
+    let affine_tys = l
+        .accesses
+        .iter()
+        .filter(|a| matches!(a.addr, AddrForm::Affine { .. }))
+        .map(|a| &a.value_ty);
+    let ramp_ty = ramp.needed().then_some(&ramp.ty);
+    for t in vector_ty
+        .values()
+        .chain(affine_tys)
+        .chain(ramp_ty)
+        .chain(reductions.iter().map(|r| &r.ty))
+    {
+        let b = lane_bytes(t).ok_or("a widened value has no vector lane type")?;
+        narrowest = narrowest.min(b);
+        widest = widest.max(b);
     }
+    if widest == 0 {
+        return Err("nothing in the body becomes a vector");
+    }
+    if widest / narrowest > MAX_PARTS {
+        return Err("the body's lane widths would split one value across more than four vectors");
+    }
+    let w = VEC_BYTES / narrowest;
 
     // ---- trip count ---------------------------------------------------------------------------
     let trip = match &l.trip {
@@ -666,17 +765,8 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
         _ => return Err("trip count is not a unit-step half-open range"),
     };
 
-    // ---- per-instruction plan -----------------------------------------------------------------
-    let ramp = IvRamp {
-        iv: iv.value,
-        ty: iv_ty.clone(),
-        value_use: iv_value_use,
-    };
-    let (plans, vector_ty, reductions) =
-        plan_body(f, l, &lin, w, &ramp).ok_or("an instruction in the body cannot be widened")?;
-
     // ---- runtime alias guard ------------------------------------------------------------------
-    let (guards, point_guards, guard_elem, guard_allows_equal) =
+    let (guards, point_guards, guard_allows_equal) =
         plan_guards(f, l).ok_or("the runtime alias check cannot be expressed")?;
 
     Ok(VecPlan {
@@ -693,7 +783,6 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
         reductions,
         guards,
         point_guards,
-        guard_elem,
         guard_allows_equal,
         ramp,
     })
@@ -1159,9 +1248,10 @@ enum Role {
 ///
 /// The list is the ops [`plan_body`] knows how to widen, minus the ones whose operands are
 /// addresses. It is a filter, not a promise: `plan_body` still has to accept the widened form (an
-/// integer divide, an `i8` multiply and direct shifts are refused there by [`bin_widenable`], and a
-/// lane-width-changing cast by [`cast_widenable`]), so anything this lets through and that cannot
-/// actually be widened comes back as a plain decline rather than bad MIR.
+/// integer divide is refused there by [`bin_widenable`], a shift whose amount is the ramp because
+/// that amount varies per lane, and a cast with no exact vector form by [`cast_route`]), so anything
+/// this lets through and that cannot actually be widened comes back as a plain decline rather than
+/// bad MIR.
 fn ramp_consumable(op: &Op) -> bool {
     matches!(
         op,
@@ -1176,34 +1266,34 @@ fn ramp_consumable(op: &Op) -> bool {
     )
 }
 
-/// The lane count, from the element types the loop's affine accesses transfer. Every widened access
-/// has to agree on it: a body mixing `f32` and `f64` streams would need two different group sizes.
-fn pick_width(l: &NaturalLoop) -> Option<u32> {
-    let mut w: Option<u32> = None;
+/// Every affine access must move one element of a vectorizable lane type per iteration. The group
+/// width is no longer one access's lane count — [`plan_loop`] derives it from the narrowest lane of
+/// the whole widened body — so what is left to check here is the shape of each access on its own.
+fn access_shape_verdict(l: &NaturalLoop) -> Result<(), &'static str> {
     for a in &l.accesses {
         let AddrForm::Affine { elem, .. } = &a.addr else {
             continue;
         };
         if a.addr.const_stride() != Some(1) {
-            return None; // a strided access is a gather, not a vector load
+            return Err("an access is strided, which is a gather, not a vector load");
         }
         // The `gep`'s unit and the value transferred must be the same type, or `base + index`
         // does not step one transferred element per lane.
         if *elem != a.value_ty {
-            return None;
+            return Err("an access moves a different type than its index counts in");
         }
-        let lanes = lanes_of(&a.value_ty)?;
-        match w {
-            None => w = Some(lanes),
-            Some(prev) if prev == lanes => {}
-            Some(_) => return None,
+        if lane_bytes(&a.value_ty).is_none() {
+            return Err("an access moves a type with no vector lane form");
         }
     }
-    w
+    Ok(())
 }
 
 /// Decide, for every instruction of the body, whether it stays scalar or is widened — and check
 /// that every widened one *can* be. Returns `None` the moment one cannot.
+///
+/// The decisions do not depend on the group width: whether a value is a vector, and which lane type
+/// it has, follows from the dataflow alone, so [`plan_loop`] picks the width from this result.
 // Plans, widened types, and reduction plans travel together to exactly one caller; the tuple is
 // the seam, not an abstraction worth naming.
 #[allow(clippy::type_complexity)]
@@ -1211,7 +1301,6 @@ fn plan_body(
     f: &Function,
     l: &NaturalLoop,
     lin: &[LinInst],
-    w: u32,
     ramp: &IvRamp,
 ) -> Option<(Vec<Plan>, FxHashMap<u32, MirType>, Vec<RedPlan>)> {
     let access_at: FxHashMap<(u32, usize), &MemAccess> = l
@@ -1322,7 +1411,7 @@ fn plan_body(
                     return None;
                 }
                 let vt = f.value_type(*then_val).clone();
-                if vt != *f.value_type(*else_val) || lanes_of(&vt)? != w {
+                if vt != *f.value_type(*else_val) || lane_bytes(&vt).is_none() {
                     return None;
                 }
                 // A predicated store must be a *lane* selection: with a uniform `i1` condition
@@ -1354,7 +1443,7 @@ fn plan_body(
                 // smoothing `if c == t { qt } else { qo }` takes after if-conversion.
                 let vec_cond = is_vec(&vector_ty, *cond);
                 if vec_cond || is_vec(&vector_ty, *then_arg) || is_vec(&vector_ty, *else_arg) {
-                    if !vec_cond || lanes_of(&ty)? != w {
+                    if !vec_cond || lane_bytes(&ty).is_none() {
                         return None;
                     }
                     vector_ty.insert(param.0, ty);
@@ -1389,9 +1478,7 @@ fn plan_body(
         let plan = match &inst.op {
             Op::Load(_, ty) => match access_at.get(&(block, i)).map(|a| &a.addr) {
                 Some(AddrForm::Affine { .. }) => {
-                    if lanes_of(ty)? != w {
-                        return None;
-                    }
+                    lane_bytes(ty)?;
                     vector_ty.insert(inst.result?.0, ty.clone());
                     Plan::VecLoad
                 }
@@ -1409,10 +1496,7 @@ fn plan_body(
             },
             Op::Store { ptr: _, value } => match access_at.get(&(block, i)).map(|a| &a.addr) {
                 Some(AddrForm::Affine { .. }) => {
-                    let vt = f.value_type(*value);
-                    if lanes_of(vt)? != w {
-                        return None;
-                    }
+                    lane_bytes(f.value_type(*value))?;
                     Plan::VecStore
                 }
                 // Every lane would write the same address; only one wins, and which one is not the
@@ -1427,23 +1511,29 @@ fn plan_body(
                 Plan::Scalar
             }
             Op::ConstInt(..) | Op::ConstFloat(..) => Plan::Scalar,
-            Op::Bin(op, _, rhs) => {
+            Op::Bin(op, lhs, rhs) => {
                 if !operand_is_vec {
                     Plan::Scalar
                 } else {
                     let ty = f.value_type(inst.result?).clone();
-                    if lanes_of(&ty)? != w {
+                    lane_bytes(&ty)?;
+                    let ok = match op {
+                        // A shift by an amount that is the same in every lane keeps that amount
+                        // scalar — `Op::Bin`'s vector-by-scalar shape, which is what every vector
+                        // ISA's shift takes. A per-lane amount (`x[i] << y[i]`) has no such form.
+                        BinOp::Shl | BinOp::LShr | BinOp::AShr => {
+                            lane_at(&vector_ty, at, *lhs).is_some()
+                                && lane_at(&vector_ty, at, *rhs).is_none()
+                        }
+                        // x86 has no packed byte multiply; `emit_bin` goes through `i16` halves.
+                        BinOp::Mul if ty == MirType::I8 => true,
+                        _ => bin_widenable(*op, &ty),
+                    };
+                    if !ok {
                         return None;
                     }
-                    let plan = if *op == BinOp::Shl {
-                        Plan::ShiftLeftConstant(left_shift_factor(f, *rhs, &ty)?)
-                    } else if bin_widenable(*op, &ty) {
-                        Plan::Widen
-                    } else {
-                        return None;
-                    };
                     vector_ty.insert(inst.result?.0, ty);
-                    plan
+                    Plan::Widen
                 }
             }
             Op::Cmp(..) => {
@@ -1455,15 +1545,20 @@ fn plan_body(
                     // immaterial — including when it is the induction variable's ramp, which is
                     // how `if c == target` becomes a per-lane mask instead of one scalar bool.
                     let mut lane: Option<MirType> = None;
+                    let mut compares_masks = false;
                     each_op_use(&inst.op, &mut |u| {
                         if let Some(t) = lane_at(&vector_ty, at, u) {
                             lane = Some(t);
                         }
+                        compares_masks |= *f.value_type(u) == MirType::I1;
                     });
-                    let lane = lane?;
-                    if lanes_of(&lane)? != w {
+                    // Two masks are not two values: the interpreter's lanes are `0`/`1` and the
+                    // native ones `0`/`-1`, which agree under a `select` and nowhere else.
+                    if compares_masks {
                         return None;
                     }
+                    let lane = lane?;
+                    lane_bytes(&lane)?;
                     vector_ty.insert(inst.result?.0, mask_lane(&lane));
                     Plan::Widen
                 }
@@ -1477,8 +1572,8 @@ fn plan_body(
                     //
                     // The *arms*, by contrast, need not already be vectors. `select(mask, k1, k2)`
                     // with two loop-invariant operands is a perfectly ordinary lane-varying value —
-                    // `widen_op` splats whichever arm is not already a vector, through `to_vector`,
-                    // exactly as it does for a partly-uniform `Bin`/`Fma`/`Cmp` — and
+                    // `emit_widened` splats whichever arm is not already a vector, through
+                    // `to_vector`, exactly as it does for a partly-uniform `Bin`/`Fma`/`Cmp` — and
                     // `select(mask, splat(a), splat(b))` computes in each lane what the scalar loop
                     // computed. Requiring both arms to be vectors declined a whole family of
                     // bodies: a `relu` is `fmax(x[i], 0.0)`, i.e. `select(x[i] > 0, x[i], 0.0)`,
@@ -1491,9 +1586,7 @@ fn plan_body(
                         return None;
                     }
                     let ty = f.value_type(inst.result?).clone();
-                    if lanes_of(&ty)? != w {
-                        return None;
-                    }
+                    lane_bytes(&ty)?;
                     vector_ty.insert(inst.result?.0, ty);
                     Plan::Widen
                 }
@@ -1503,9 +1596,7 @@ fn plan_body(
                     Plan::Scalar
                 } else {
                     let ty = f.value_type(inst.result?).clone();
-                    if lanes_of(&ty)? != w {
-                        return None;
-                    }
+                    lane_bytes(&ty)?;
                     vector_ty.insert(inst.result?.0, ty);
                     Plan::Widen
                 }
@@ -1514,17 +1605,15 @@ fn plan_body(
                 if !operand_is_vec {
                     Plan::Scalar
                 } else {
-                    // A widening or narrowing cast changes the lane count, which would split or
-                    // merge groups. Only same-width lane conversions are one-for-one.
-                    let from = &lane_at(&vector_ty, at, *v)?;
-                    if lane_bytes(from) != lane_bytes(to)
-                        || lanes_of(to)? != w
-                        || !cast_widenable(*kind, to)
-                    {
+                    // A mask is not a value (see the `Cmp` arm), so a bool-to-int cast of one
+                    // stays declined.
+                    if *f.value_type(*v) == MirType::I1 {
                         return None;
                     }
+                    let from = lane_at(&vector_ty, at, *v)?;
+                    let route = cast_route(*kind, &from, to)?;
                     vector_ty.insert(inst.result?.0, to.clone());
-                    Plan::Widen
+                    Plan::Cast(route)
                 }
             }
             // A call may do anything; an alloca inside the body would allocate per lane group; a
@@ -1534,12 +1623,10 @@ fn plan_body(
         plans.push(plan);
     }
 
-    // Every reduction must actually be foldable: its inputs have to be vectors of this width, or
-    // the "extract W lanes and accumulate serially" step has nothing to extract.
+    // Every reduction must actually be foldable: its inputs have to be vectors, or the "extract W
+    // lanes and accumulate serially" step has nothing to extract.
     for r in &reductions {
-        if lanes_of(&r.ty)? != w {
-            return None;
-        }
+        lane_bytes(&r.ty)?;
         match (r.addend, r.fma_factors) {
             (Some((a, _)), None) => {
                 if !is_vec(&vector_ty, a) {
@@ -1557,7 +1644,7 @@ fn plan_body(
     Some((plans, vector_ty, reductions))
 }
 
-/// May this binary operator be applied lane-wise at this result type?
+/// May this binary operator be applied lane-wise, vector by vector, at this result type?
 ///
 /// The three exclusions are all about what the x64 backend can actually lower, and none of them
 /// degrades gracefully — so this predicate is the only thing standing between a widened body and
@@ -1567,29 +1654,24 @@ fn plan_body(
 /// * **Integer multiply at `i8` lanes.** x86 has `pmullw` (16-bit) and `pmulld` (32-bit) but no
 ///   8-bit packed multiply, and Cranelift does not synthesize one out of two 16-bit halves:
 ///   `imul.i8x16` reaches the x64 backend as
-///   `Unsupported("should be implemented in ISLE: inst = imul.i8x16 ..")`.
-/// * **Every shift, at every width.** This one is not a missing instruction, it is a *shape*
-///   mismatch, and it is the reason to state all of this in terms of measurements rather than
-///   intuition. A MIR vector shift is lane-wise: each lane of `a` shifted by the matching lane of
-///   `b`, which is what the interpreter does. Cranelift's `ishl`/`ushr`/`sshr` are not that — they
-///   take a **scalar** shift amount broadcast to every lane, so handing them the splatted vector
-///   this pass builds is a type error:
+///   `Unsupported("should be implemented in ISLE: inst = imul.i8x16 ..")`. The body planner widens
+///   it anyway, through `i16` halves ([`emit_bin`]); a reduction's vector accumulator, whose
+///   combine is this predicate's question, keeps the serial fold.
+/// * **Every shift, vector by vector.** This one is not a missing instruction, it is a *shape*
+///   mismatch. A lane-wise shift takes each lane of `a` by the matching lane of `b`; Cranelift's
+///   `ishl`/`ushr`/`sshr` take a **scalar** amount for every lane, so handing them a splatted vector
+///   is a type error:
 ///
 ///   ```text
 ///   arg 1 (v29) with type i32x4 failed to satisfy type set ValueTypeSet { lanes: {0}, .. }
 ///   ```
 ///
-///   The CLIF verifier says exactly that — but **only in a debug build**. In release it is off,
-///   the malformed `ishl.i32x4` goes straight to lowering, and `o[i] = x[i] << 2` at `-O2` ends as
-///   a panic inside Cranelift's ISLE (`no rule matched for term bitcast_xmm_to_gpr`). A program
-///   that runs at `-O0` and crashes the compiler at `-O2`, in the shipping configuration only.
-///
-///   Directly widening a shift needs one of two things this pass does not have: a MIR vector shift that
-///   takes a scalar amount (a cross-crate operand-shape change, and a real one — `x[i] >> 8` in a
-///   quantization loop is worth it), or AVX2's genuine per-lane `vpsllvd`/`vpsravd`, which
-///   Cranelift does not expose. Constant left shifts instead use [`left_shift_factor`] to emit
-///   existing wrapping vector multiplication at `i16`/`i32`; other widths, variable shifts and right
-///   shifts are still refused.
+///   The CLIF verifier says exactly that — but **only in a debug build**. In release it is off, the
+///   malformed `ishl.i32x4` goes straight to lowering, and the compile panics inside Cranelift's ISLE
+///   (`no rule matched for term bitcast_xmm_to_gpr`): a program that runs at `-O0` and crashes the
+///   compiler at `-O2`, in the shipping configuration only. The body planner therefore widens a
+///   shift only when its amount is uniform, through MIR's vector-by-*scalar* shift, which is exactly
+///   Cranelift's shape; a per-lane amount stays scalar.
 ///
 /// Those are the only three. An 82-case (operator x lane type) matrix over `i8`/`i16`/`i32`/
 /// `i64`/`f32`/`f64` — add, sub, mul, and, or, xor, shl, ashr, neg, not, compare+select, the
@@ -1606,24 +1688,6 @@ fn bin_widenable(op: BinOp, ty: &MirType) -> bool {
         BinOp::Add | BinOp::Sub | BinOp::Mul => lane.is_int(),
         BinOp::And | BinOp::Or | BinOp::Xor => true,
     }
-}
-
-/// `x << k` is `x * 2^(k mod bits)` in wrapping integer arithmetic. Both the interpreter and
-/// native scalar lowering mask the shift count to the lane width, including negative and oversized
-/// counts. Construct the identical low-bit multiplier for `i16`/`i32` lanes. An `i64x2` multiply is
-/// legal, but Cranelift 0.124.3 does not strength-reduce a splatted power-of-two operand and its
-/// non-AVX-512 fallback needs several packed operations. Leave that width scalar until measured.
-/// No vector shift reaches Cranelift and no source-level overflow promise is needed.
-fn left_shift_factor(f: &Function, rhs: ValueId, ty: &MirType) -> Option<i64> {
-    if !matches!(ty, MirType::I16 | MirType::I32) {
-        return None;
-    }
-    let bits = lane_bytes(ty)? * 8;
-    let Op::ConstInt(k, _) = op_of(f, rhs)? else {
-        return None;
-    };
-    let shift = (*k as u32) & (bits - 1);
-    Some((1u64 << shift) as i64)
 }
 
 /// Casts that are one-for-one at a fixed lane width, and that the x64 backend can lower at that
@@ -1645,6 +1709,50 @@ fn cast_widenable(k: CastKind, to: &MirType) -> bool {
         CastKind::SiToFp | CastKind::UiToFp | CastKind::Bitcast => true,
         _ => false,
     }
+}
+
+/// How the scalar cast `kind` from lane type `from` to lane type `to` is spelled over parts, or
+/// `None` when it has no exact vector form here.
+///
+/// Every route is an exact lane map: each lane of the result is what the scalar cast computes for
+/// the same lane. The ones that are not offered say why:
+///
+/// * an integer to a *narrower* float (`i64 -> f32`) would have to round twice;
+/// * a float to a 64-bit integer, or `f64` to any integer, needs the packed `cvttpd2qq` /
+///   `fcvt_to_sint_sat.i64x2` that [`cast_widenable`] documents Cranelift does not have;
+/// * `f32 -> i64` would go through `f64`, which is that same conversion.
+///
+/// Same-width integer casts (`i32 as u32` lowers to an equal-width `Trunc`) change no bits, so their
+/// parts are reused unchanged.
+fn cast_route(kind: CastKind, from: &MirType, to: &MirType) -> Option<CastRoute> {
+    use CastKind::*;
+    let (fb, tb) = (lane_bytes(from)?, lane_bytes(to)?);
+    Some(match kind {
+        SExt | ZExt | Trunc if from.is_int() && to.is_int() && fb == tb => CastRoute::Identity,
+        _ if fb == tb => {
+            if !cast_widenable(kind, to) {
+                return None;
+            }
+            CastRoute::Same
+        }
+        SExt | ZExt if from.is_int() && to.is_int() && fb < tb => CastRoute::WidenInt {
+            ext: kind,
+            then_fp: false,
+        },
+        Trunc if from.is_int() && to.is_int() && fb > tb => CastRoute::TruncInt,
+        SiToFp | UiToFp if from.is_int() && to.is_float() && fb < tb => CastRoute::WidenInt {
+            ext: if kind == SiToFp { SExt } else { ZExt },
+            then_fp: true,
+        },
+        FpToSi | FpToUi if *from == MirType::F32 && to.is_int() && tb < 4 => {
+            CastRoute::FloatToNarrowInt {
+                unsigned: kind == FpToUi,
+            }
+        }
+        FpExt if *from == MirType::F32 && *to == MirType::F64 => CastRoute::FpExt,
+        FpTrunc if *from == MirType::F64 && *to == MirType::F32 => CastRoute::FpTrunc,
+        _ => return None,
+    })
 }
 
 /// The runtime pointer-range checks this loop needs.
@@ -1689,11 +1797,7 @@ fn cast_widenable(k: CastKind, to: &MirType) -> bool {
 /// overlapping and once with disjoint windows, and prints every lane of both buffers against
 /// hand-derived expectations. Deleting the `Select` on `emit_alias_checks`'s result makes it fail 7
 /// of its 96 lines.
-#[allow(clippy::type_complexity)]
-fn plan_guards(
-    f: &Function,
-    l: &NaturalLoop,
-) -> Option<(Vec<GuardPair>, Vec<PointGuard>, MirType, bool)> {
+fn plan_guards(f: &Function, l: &NaturalLoop) -> Option<(Vec<GuardPair>, Vec<PointGuard>, bool)> {
     // A symbolic addend is only usable in the guard if it is available there, and the guard sits in
     // front of the header. `AffineExpr` deliberately also accepts a value *defined inside* the loop
     // whose operands are all invariant (`loop_info::value_invariant` — that is what keeps the
@@ -1714,8 +1818,9 @@ fn plan_guards(
     // addend has to *be* that type. It usually is; the exception is a `sext`, which the affine
     // decomposition looks through (`Op::Cast(SExt, ..)`), leaving a narrower value behind.
     let iv_ty = l.primary()?.ty.clone();
-    // The unit-stride requirement is stated here rather than inherited from `pick_width`, which has
-    // already imposed it on every affine access: the range arithmetic below assumes it outright.
+    // The unit-stride requirement is stated here rather than inherited from
+    // `access_shape_verdict`, which has already imposed it on every affine access: the range
+    // arithmetic below assumes it outright.
     let usable_terms = |ix: &crate::loop_info::AffineExpr| {
         ix.coeff.as_const() == Some(1)
             && ix.terms.iter().all(|(v, m)| {
@@ -1759,23 +1864,23 @@ fn plan_guards(
                     terms: index.terms.clone(),
                     lo: index.konst,
                     hi: index.konst,
+                    elem: elem.clone(),
                 },
                 stored: is_store,
                 elem: elem.clone(),
             }),
         }
     }
-    let elem = bases
-        .first()
-        .map(|gr| gr.elem.clone())
-        .unwrap_or(MirType::I8);
     // Conservative, and only ever *adds* an accepted case at runtime: two ranges may be reported
     // "equal, therefore at distance 0" only when every group touches a single offset and all of
-    // them share it, symbolic part included.
+    // them share it, symbolic part and element type included. Two equal pointers moving in
+    // different element types (`f32` written where `i8` is read) are not at distance 0 — iteration
+    // `i` writes bytes `4i .. 4i+4` that iteration `4i` then reads — so a mixed-width loop never
+    // takes the equality exit.
     let uniform_offset = bases.iter().all(|gr| gr.g.lo == gr.g.hi)
-        && bases
-            .windows(2)
-            .all(|p| p[0].g.lo == p[1].g.lo && p[0].g.terms == p[1].g.terms);
+        && bases.windows(2).all(|p| {
+            p[0].g.lo == p[1].g.lo && p[0].g.terms == p[1].g.terms && p[0].elem == p[1].elem
+        });
 
     let mut guards = Vec::new();
     // Built at most once, and only for a function with a `@noalias` parameter (`alias.rs`).
@@ -1858,7 +1963,7 @@ fn plan_guards(
             });
         }
     }
-    Some((guards, points, elem, uniform_offset))
+    Some((guards, points, uniform_offset))
 }
 
 /// Is `k` representable in this integer type? The guard materializes a symbolic addend's
@@ -1964,9 +2069,12 @@ fn apply(f: &mut Function, p: &VecPlan) {
     let guard_params: Vec<ValueId> = header_tys.iter().map(|t| e.value(t.clone())).collect();
     let guard = e.block(guard_params.clone(), Terminator::Unreachable);
     let mut vh_params: Vec<ValueId> = header_tys.iter().map(|t| e.value(t.clone())).collect();
+    // One header parameter per part of each vector accumulator, reductions in order — the layout
+    // `emit_body` reads them back in.
     for r in &vacc {
-        let vt = vec_of(&r.ty, p.w);
-        vh_params.push(e.value(vt));
+        for _ in 0..parts_of(&r.ty, p.w) {
+            vh_params.push(e.value(part_ty(&r.ty)));
+        }
     }
     let vh = e.block(vh_params.clone(), Terminator::Unreachable);
     let vb = e.block(Vec::new(), Terminator::Unreachable);
@@ -1988,8 +2096,10 @@ fn apply(f: &mut Function, p: &VecPlan) {
     for r in &vacc {
         let id = red_identity(r.kind).expect("vector_acc implies an identity");
         let scalar = e.push(guard, r.ty.clone(), Op::ConstInt(id as i128, r.ty.clone()));
-        let vt = vec_of(&r.ty, p.w);
-        guard_args.push(e.push(guard, vt, Op::Splat(scalar)));
+        let identity = e.push(guard, part_ty(&r.ty), Op::Splat(scalar));
+        for _ in 0..parts_of(&r.ty, p.w) {
+            guard_args.push(identity);
+        }
     }
     e.f.blocks[guard.0 as usize].term = Terminator::Br {
         target: vh,
@@ -2016,12 +2126,23 @@ fn apply(f: &mut Function, p: &VecPlan) {
     // ---- vector exit: hand the original loop the advanced values -------------------------------
     // A vector accumulator is folded here, once, rather than in the body — the whole point of
     // keeping `W` independent partials.
+    //
+    // The operator is associative and commutative (`vector_acc` admits integer `add`/`mul`/bitwise
+    // only), so the parts are first combined lane-wise into one vector and its lanes then folded
+    // into the scalar accumulator: any order gives the same integer, wraparound included.
     let mut exit_args = vh_params[..header_tys.len()].to_vec();
-    for (i, r) in vacc.iter().enumerate() {
-        let vec = vh_params[header_tys.len() + i];
-        let mut acc = exit_args[r.param_index];
+    let mut next_param = header_tys.len();
+    for r in &vacc {
+        let n = parts_of(&r.ty, p.w);
+        let parts = vh_params[next_param..next_param + n].to_vec();
+        next_param += n;
         let op = red_binop(r.kind);
-        for k in 0..p.w {
+        let mut vec = parts[0];
+        for &q in &parts[1..] {
+            vec = e.push(vx, part_ty(&r.ty), Op::Bin(op, vec, q));
+        }
+        let mut acc = exit_args[r.param_index];
+        for k in 0..lanes_of(&r.ty).expect("a widened reduction type") {
             let lane = e.push(vx, r.ty.clone(), Op::ExtractLane(vec, k));
             acc = e.push(vx, r.ty.clone(), Op::Bin(op, acc, lane));
         }
@@ -2212,7 +2333,7 @@ fn range_of(
             Op::Gep {
                 ptr: base,
                 index: idx,
-                elem: p.guard_elem.clone(),
+                elem: g.elem.clone(),
             },
         );
         e.push(
@@ -2270,17 +2391,31 @@ fn emit_body(
     // lane `k` holds `i + k` — the counter scalar iteration `i + k` would have had. The step is 1
     // (`iv_verdict`), and MIR `Add` wraps exactly as the scalar `i + 1` chain does, so the two agree
     // even across an integer overflow. The `iota` is a constant with no operands, so LICM lifts it
-    // into the guard and only the `splat` and the `add` remain per group.
+    // into the guard and only the `splat` and the `add` remain per group. A counter wider than the
+    // group's narrowest lane is split into parts like any other value: part `p` is
+    // `splat(i + p·L) + iota`, which is again `i + k` in every lane by the same wrapping argument.
     //
     // Emitted once, before the body, and mapped in and out per instruction below: the *same*
     // induction variable is a `gep` index (uniform) and a compare operand (ramp) in the same block,
     // and the plan says which role each step is.
     let iv_scalar = vh_params[p.iv_index];
-    let ramp = p.ramp.needed().then(|| {
-        let vt = vec_of(&p.ramp.ty, p.w);
+    let ramp: Option<Vec<ValueId>> = p.ramp.needed().then(|| {
+        let ty = p.ramp.ty.clone();
+        let vt = part_ty(&ty);
+        let per_part = lanes_of(&ty).expect("an integer induction variable has a vector width");
         let iota = e.push(vb, vt.clone(), Op::Iota(vt.clone()));
-        let base = e.push(vb, vt.clone(), Op::Splat(iv_scalar));
-        e.push(vb, vt, Op::Bin(BinOp::Add, base, iota))
+        (0..parts_of(&ty, p.w))
+            .map(|k| {
+                let first = if k == 0 {
+                    iv_scalar
+                } else {
+                    let off = e.int(vb, &ty, (k as u32 * per_part) as i64);
+                    e.push(vb, ty.clone(), Op::Bin(BinOp::Add, iv_scalar, off))
+                };
+                let base = e.push(vb, vt.clone(), Op::Splat(first));
+                e.push(vb, vt.clone(), Op::Bin(BinOp::Add, base, iota))
+            })
+            .collect()
     });
 
     for (i, step) in p.lin.iter().enumerate() {
@@ -2289,10 +2424,11 @@ fn emit_body(
         // scalar. Set at the top of every iteration rather than restored at the bottom: the body
         // below leaves through half a dozen `continue`s and one missed restore would splat the
         // group's first counter into all `W` lanes.
-        if ramp.is_some() {
-            let face = match (ramp, p.ramp.value_use.contains(&i)) {
-                (Some(r), true) => Wide::Vector(r),
-                _ => Wide::Uniform(iv_scalar),
+        if let Some(r) = &ramp {
+            let face = if p.ramp.value_use.contains(&i) {
+                Wide::Vector(r.clone())
+            } else {
+                Wide::Uniform(iv_scalar)
             };
             map.insert(p.ramp.iv.0, face);
         }
@@ -2311,19 +2447,21 @@ fn emit_body(
                 },
             ) => {
                 let lane = e.f.value_type(*then_val).clone();
-                let vty = vec_of(&lane, p.w);
-                let mask = resolve_vector(&map, *cond);
+                let mask = mask_for(e, vb, &map, *cond, &lane);
                 let a = to_vector(e, vb, &map, *then_val, &lane, p.w);
                 let b = to_vector(e, vb, &map, *else_val, &lane, p.w);
-                let blended = e.push(vb, vty, Op::Select(mask, a, b));
                 let ptr = resolve_uniform(&map, *ptr);
-                e.push_void(
-                    vb,
-                    Op::Store {
-                        ptr,
-                        value: blended,
-                    },
-                );
+                for (k, ((m, x), y)) in mask.iter().zip(&a).zip(&b).enumerate() {
+                    let blended = e.push(vb, part_ty(&lane), Op::Select(*m, *x, *y));
+                    let at = part_ptr(e, vb, ptr, &lane, k);
+                    e.push_void(
+                        vb,
+                        Op::Store {
+                            ptr: at,
+                            value: blended,
+                        },
+                    );
+                }
                 continue;
             }
             (
@@ -2338,11 +2476,12 @@ fn emit_body(
                 match p.vector_ty.get(&param.0) {
                     Some(lane) => {
                         let lane = lane.clone();
-                        let vty = vec_of(&lane, p.w);
-                        let mask = resolve_vector(&map, *cond);
+                        let mask = mask_for(e, vb, &map, *cond, &lane);
                         let a = to_vector(e, vb, &map, *then_arg, &lane, p.w);
                         let b = to_vector(e, vb, &map, *else_arg, &lane, p.w);
-                        let nv = e.push(vb, vty, Op::Select(mask, a, b));
+                        let nv = (0..a.len())
+                            .map(|k| e.push(vb, part_ty(&lane), Op::Select(mask[k], a[k], b[k])))
+                            .collect();
                         map.insert(param.0, Wide::Vector(nv));
                     }
                     None => {
@@ -2399,9 +2538,17 @@ fn emit_body(
                     unreachable!("VecLoad plan on a non-load")
                 };
                 let ptr = resolve_uniform(&map, *ptr);
-                let vty = vec_of(ty, p.w);
-                let nv = e.push(vb, vty.clone(), Op::Load(ptr, vty));
-                map.insert(inst.result.expect("load has a result").0, Wide::Vector(nv));
+                let vty = part_ty(ty);
+                let parts = (0..parts_of(ty, p.w))
+                    .map(|k| {
+                        let at = part_ptr(e, vb, ptr, ty, k);
+                        e.push(vb, vty.clone(), Op::Load(at, vty.clone()))
+                    })
+                    .collect();
+                map.insert(
+                    inst.result.expect("load has a result").0,
+                    Wide::Vector(parts),
+                );
             }
             Plan::VecStore => {
                 let Op::Store { ptr, value } = &inst.op else {
@@ -2409,30 +2556,27 @@ fn emit_body(
                 };
                 let lane = e.f.value_type(*value).clone();
                 let ptr = resolve_uniform(&map, *ptr);
-                let value = to_vector(e, vb, &map, *value, &lane, p.w);
-                e.push_void(vb, Op::Store { ptr, value });
+                let values = to_vector(e, vb, &map, *value, &lane, p.w);
+                for (k, value) in values.into_iter().enumerate() {
+                    let at = part_ptr(e, vb, ptr, &lane, k);
+                    e.push_void(vb, Op::Store { ptr: at, value });
+                }
             }
             Plan::Widen => {
                 let r = inst.result.expect("a widened op has a result");
                 let lane = p.vector_ty[&r.0].clone();
-                let vty = vec_of(&lane, p.w);
-                let op = widen_op(e, vb, &map, &inst.op, p, &vty);
-                let nv = e.push(vb, vty, op);
-                map.insert(r.0, Wide::Vector(nv));
+                let parts = emit_widened(e, vb, &map, &inst.op, p.w, &lane);
+                map.insert(r.0, Wide::Vector(parts));
             }
-            Plan::ShiftLeftConstant(factor) => {
-                let Op::Bin(BinOp::Shl, lhs, _) = &inst.op else {
-                    unreachable!("ShiftLeftConstant plan on a non-left-shift")
+            Plan::Cast(route) => {
+                let Op::Cast(kind, x, to) = &inst.op else {
+                    unreachable!("Cast plan on a non-cast")
                 };
-                let r = inst.result.expect("a shift has a result");
-                let lane = p.vector_ty[&r.0].clone();
-                let vty = vec_of(&lane, p.w);
-                let lhs = to_vector(e, vb, &map, *lhs, &lane, p.w);
-                // The multiplier is invariant and non-trapping, so construct its broadcast once.
-                let factor = e.int(guard, &lane, *factor);
-                let factor = e.push(guard, vty.clone(), Op::Splat(factor));
-                let nv = e.push(vb, vty, Op::Bin(BinOp::Mul, lhs, factor));
-                map.insert(r.0, Wide::Vector(nv));
+                let r = inst.result.expect("a cast has a result");
+                let from = e.f.value_type(*x).clone();
+                let xs = to_vector(e, vb, &map, *x, &from, p.w);
+                let parts = emit_cast(e, vb, *kind, xs, &from, to, *route);
+                map.insert(r.0, Wide::Vector(parts));
             }
         }
     }
@@ -2448,8 +2592,8 @@ fn emit_body(
     // safe: an accumulator is a register value, so no store in the body can change what it reads,
     // and its own operands are all defined above.
     //
-    // A reassociable reduction just combines the whole addend vector into its vector accumulator —
-    // one instruction, `W` independent partials. A float one folds `W` lanes into the scalar
+    // A reassociable reduction just combines the whole addend into its vector accumulator — one
+    // instruction per part, `W` independent partials. A float one folds `W` lanes into the scalar
     // accumulator in index order, which is a `W`-long dependent chain and is the price of not
     // reassociating.
     let mut acc_of: FxHashMap<usize, ValueId> = FxHashMap::default();
@@ -2457,16 +2601,17 @@ fn emit_body(
     let header_len = header_params.len();
     for r in &p.reductions {
         if r.vector_acc {
-            let vt = vec_of(&r.ty, p.w);
-            let cur = vh_params[header_len + vacc_next.len()];
+            let n = parts_of(&r.ty, p.w);
+            let first = header_len + vacc_next.len();
+            let cur = vh_params[first..first + n].to_vec();
             let (a, _) = r.addend.expect("vector_acc implies a binary combine");
             let addend = to_vector(e, vb, &map, a, &r.ty, p.w);
-            let next = e.push(vb, vt, Op::Bin(red_binop(r.kind), cur, addend));
-            vacc_next.push(next);
+            let next = emit_bin(e, vb, red_binop(r.kind), &cur, &addend, &r.ty);
+            vacc_next.extend(next);
             continue;
         }
         let init = vh_params[r.param_index];
-        let out = emit_reduction_fold(e, vb, &map, r, init, p.w);
+        let out = emit_reduction_fold(e, vb, &map, r, init);
         acc_of.insert(r.param_index, out);
     }
 
@@ -2500,7 +2645,7 @@ fn emit_body(
             .any(|r| r.vector_acc && r.param_index == k)
         {
             // The scalar accumulator of a vector-accumulated reduction is carried unchanged; the
-            // partials live in the extra parameter appended below.
+            // partials live in the extra parameters appended below.
             out.push(vh_params[k]);
         } else {
             out.push(resolve_uniform(&map, *a));
@@ -2516,7 +2661,8 @@ fn emit_body(
 /// would have entering iteration `i`, and lane `k` is combined into it exactly where scalar
 /// iteration `i + k` would have combined its own value — same operator, same operand order, same
 /// intermediate roundings. Nothing is reassociated, so an `f32` sum produces bit-identical output
-/// to the scalar loop and the interpreter oracle agrees with the native backend.
+/// to the scalar loop and the interpreter oracle agrees with the native backend. With the value split
+/// into parts, "index order" is part 0's lanes, then part 1's: exactly iterations `i, i+1, ..`.
 ///
 /// An `fma` accumulate re-fuses its two factors per lane rather than multiplying and adding
 /// separately, because `fma(x, y, acc)` rounds once and `acc + x*y` rounds twice.
@@ -2531,12 +2677,11 @@ fn emit_reduction_fold(
     map: &FxHashMap<u32, Wide>,
     r: &RedPlan,
     init: ValueId,
-    w: u32,
 ) -> ValueId {
     let mut acc = init;
     match (r.addend, r.fma_factors) {
         (Some((a, left_is_acc)), None) => {
-            let lanes = extract_lanes(e, vb, map, a, &r.ty, w);
+            let lanes = extract_lanes(e, vb, map, a, &r.ty);
             let op = red_binop(r.kind);
             for lane in lanes {
                 let (x, y) = if left_is_acc {
@@ -2548,10 +2693,10 @@ fn emit_reduction_fold(
             }
         }
         (None, Some((x, y))) => {
-            let xs = extract_lanes(e, vb, map, x, &r.ty, w);
-            let ys = extract_lanes(e, vb, map, y, &r.ty, w);
-            for k in 0..w as usize {
-                acc = e.push(vb, r.ty.clone(), Op::Fma(xs[k], ys[k], acc));
+            let xs = extract_lanes(e, vb, map, x, &r.ty);
+            let ys = extract_lanes(e, vb, map, y, &r.ty);
+            for (xk, yk) in xs.into_iter().zip(ys) {
+                acc = e.push(vb, r.ty.clone(), Op::Fma(xk, yk, acc));
             }
         }
         _ => unreachable!("plan_body rejected any other reduction shape"),
@@ -2559,22 +2704,23 @@ fn emit_reduction_fold(
     acc
 }
 
-/// The `w` lane values of a vector, lowest index first.
+/// Every lane value of a widened value, lowest iteration first (part 0's lanes, then part 1's).
 fn extract_lanes(
     e: &mut Emit<'_>,
     vb: BlockId,
     map: &FxHashMap<u32, Wide>,
     v: ValueId,
     lane: &MirType,
-    w: u32,
 ) -> Vec<ValueId> {
-    let vec = match map.get(&v.0) {
-        Some(Wide::Vector(x)) => *x,
-        _ => unreachable!("plan_body proved this operand is a vector"),
-    };
-    (0..w)
-        .map(|k| e.push(vb, lane.clone(), Op::ExtractLane(vec, k)))
-        .collect()
+    let parts = resolve_vector(map, v);
+    let per_part = lanes_of(lane).expect("a widened lane type has a vector width");
+    let mut out = Vec::with_capacity(parts.len() * per_part as usize);
+    for part in parts {
+        for k in 0..per_part {
+            out.push(e.push(vb, lane.clone(), Op::ExtractLane(part, k)));
+        }
+    }
+    out
 }
 
 /// The identity element of a reassociable reduction, as a raw integer constant: the value every
@@ -2608,67 +2754,302 @@ fn red_binop(k: RedKind) -> BinOp {
     }
 }
 
-/// Rebuild an operation with every operand widened to a vector.
-fn widen_op(
+/// The address of part `k` of a widened access at `ptr`: `k` full vectors of `elem` further on.
+fn part_ptr(e: &mut Emit<'_>, vb: BlockId, ptr: ValueId, elem: &MirType, k: usize) -> ValueId {
+    if k == 0 {
+        return ptr;
+    }
+    let per_part = lanes_of(elem).expect("a widened access has a vector width");
+    let index = e.int(vb, &MirType::I64, k as i64 * per_part as i64);
+    e.push(
+        vb,
+        MirType::Ptr,
+        Op::Gep {
+            ptr,
+            index,
+            elem: elem.clone(),
+        },
+    )
+}
+
+/// Rebuild one lane-wise operation over parts, every operand widened to the result's parts.
+///
+/// `lane` is the result's lane type. For a compare that is the mask, while the operands keep their
+/// own type (the scalar operand type, which a widened value always has as its lane type).
+fn emit_widened(
     e: &mut Emit<'_>,
     vb: BlockId,
     map: &FxHashMap<u32, Wide>,
     op: &Op,
-    p: &VecPlan,
-    vty: &MirType,
-) -> Op {
-    // For a compare the result type is the mask, but the operands keep their own lane type.
-    let operand_lane = |v: ValueId| -> MirType {
-        match map.get(&v.0) {
-            Some(Wide::Vector(x)) => match e_ty(e, *x) {
-                MirType::Vec(l, _) => (*l).clone(),
-                other => other,
-            },
-            _ => vty.lane_type().clone(),
-        }
-    };
+    w: u32,
+    lane: &MirType,
+) -> Vec<ValueId> {
+    let pty = part_ty(lane);
     match op {
         Op::Bin(b, x, y) => {
-            let lane = vty.lane_type().clone();
-            let x = to_vector(e, vb, map, *x, &lane, p.w);
-            let y = to_vector(e, vb, map, *y, &lane, p.w);
-            Op::Bin(*b, x, y)
+            let xs = to_vector(e, vb, map, *x, lane, w);
+            if matches!(b, BinOp::Shl | BinOp::LShr | BinOp::AShr)
+                && !matches!(map.get(&y.0), Some(Wide::Vector(_)))
+            {
+                // The amount is the same in every lane: keep it scalar (`Op::Bin`'s
+                // vector-by-scalar shape), masked to the lane width by every backend exactly as
+                // the scalar shift masks it.
+                let amount = resolve_uniform(map, *y);
+                return xs
+                    .into_iter()
+                    .map(|x| e.push(vb, pty.clone(), Op::Bin(*b, x, amount)))
+                    .collect();
+            }
+            let ys = to_vector(e, vb, map, *y, lane, w);
+            emit_bin(e, vb, *b, &xs, &ys, lane)
         }
         Op::Cmp(c, x, y) => {
-            let lane = operand_lane(*x);
-            let lane = if matches!(map.get(&x.0), Some(Wide::Vector(_))) {
-                lane
-            } else {
-                operand_lane(*y)
-            };
-            let x = to_vector(e, vb, map, *x, &lane, p.w);
-            let y = to_vector(e, vb, map, *y, &lane, p.w);
-            Op::Cmp(*c, x, y)
-        }
-        Op::Neg(x) => Op::Neg(to_vector(e, vb, map, *x, vty.lane_type(), p.w)),
-        Op::Not(x) => Op::Not(to_vector(e, vb, map, *x, vty.lane_type(), p.w)),
-        Op::Sqrt(x) => Op::Sqrt(to_vector(e, vb, map, *x, vty.lane_type(), p.w)),
-        Op::Round(m, x) => Op::Round(*m, to_vector(e, vb, map, *x, vty.lane_type(), p.w)),
-        Op::Fma(a, b, c) => {
-            let lane = vty.lane_type().clone();
-            let a = to_vector(e, vb, map, *a, &lane, p.w);
-            let b = to_vector(e, vb, map, *b, &lane, p.w);
-            let c = to_vector(e, vb, map, *c, &lane, p.w);
-            Op::Fma(a, b, c)
+            let operand = e_ty(e, *x);
+            let xs = to_vector(e, vb, map, *x, &operand, w);
+            let ys = to_vector(e, vb, map, *y, &operand, w);
+            xs.into_iter()
+                .zip(ys)
+                .map(|(a, b)| e.push(vb, pty.clone(), Op::Cmp(*c, a, b)))
+                .collect()
         }
         Op::Select(c, a, b) => {
-            let lane = vty.lane_type().clone();
-            let c = resolve_vector(map, *c);
-            let a = to_vector(e, vb, map, *a, &lane, p.w);
-            let b = to_vector(e, vb, map, *b, &lane, p.w);
-            Op::Select(c, a, b)
+            let mask = mask_for(e, vb, map, *c, lane);
+            let a = to_vector(e, vb, map, *a, lane, w);
+            let b = to_vector(e, vb, map, *b, lane, w);
+            (0..a.len())
+                .map(|k| e.push(vb, pty.clone(), Op::Select(mask[k], a[k], b[k])))
+                .collect()
         }
-        Op::Cast(k, x, to) => {
-            let from = operand_lane(*x);
-            let x = to_vector(e, vb, map, *x, &from, p.w);
-            Op::Cast(*k, x, vec_of(to.lane_type(), p.w))
+        Op::Neg(x) | Op::Not(x) | Op::Sqrt(x) | Op::Round(_, x) => {
+            let xs = to_vector(e, vb, map, *x, lane, w);
+            xs.into_iter()
+                .map(|x| {
+                    let one = match op {
+                        Op::Neg(_) => Op::Neg(x),
+                        Op::Not(_) => Op::Not(x),
+                        Op::Sqrt(_) => Op::Sqrt(x),
+                        Op::Round(m, _) => Op::Round(*m, x),
+                        _ => unreachable!("matched above"),
+                    };
+                    e.push(vb, pty.clone(), one)
+                })
+                .collect()
+        }
+        Op::Fma(a, b, c) => {
+            let a = to_vector(e, vb, map, *a, lane, w);
+            let b = to_vector(e, vb, map, *b, lane, w);
+            let c = to_vector(e, vb, map, *c, lane, w);
+            (0..a.len())
+                .map(|k| e.push(vb, pty.clone(), Op::Fma(a[k], b[k], c[k])))
+                .collect()
         }
         other => unreachable!("plan_body accepted an op it cannot widen: {other:?}"),
+    }
+}
+
+/// `op` applied part by part. An `i8` multiply — which x86 has no packed instruction for, at any
+/// width — is done in `i16`: both operands are sign-extended half by half, multiplied, and the
+/// products truncated back. The low eight bits of a product do not depend on how the operands were
+/// extended, so every lane is exactly the scalar wrapping `i8` product.
+fn emit_bin(
+    e: &mut Emit<'_>,
+    vb: BlockId,
+    op: BinOp,
+    xs: &[ValueId],
+    ys: &[ValueId],
+    lane: &MirType,
+) -> Vec<ValueId> {
+    let pty = part_ty(lane);
+    if op == BinOp::Mul && *lane == MirType::I8 {
+        let wide = part_ty(&MirType::I16);
+        let mut out = Vec::with_capacity(xs.len());
+        for (&x, &y) in xs.iter().zip(ys) {
+            let mut halves = [x; 2];
+            for (slot, half) in halves.iter_mut().zip([Half::Lo, Half::Hi]) {
+                let xw = e.push(
+                    vb,
+                    wide.clone(),
+                    Op::Widen {
+                        v: x,
+                        half,
+                        kind: CastKind::SExt,
+                    },
+                );
+                let yw = e.push(
+                    vb,
+                    wide.clone(),
+                    Op::Widen {
+                        v: y,
+                        half,
+                        kind: CastKind::SExt,
+                    },
+                );
+                *slot = e.push(vb, wide.clone(), Op::Bin(BinOp::Mul, xw, yw));
+            }
+            out.push(e.push(
+                vb,
+                pty.clone(),
+                Op::Narrow {
+                    lo: halves[0],
+                    hi: halves[1],
+                    kind: NarrowKind::Trunc,
+                },
+            ));
+        }
+        return out;
+    }
+    xs.iter()
+        .zip(ys)
+        .map(|(&x, &y)| e.push(vb, pty.clone(), Op::Bin(op, x, y)))
+        .collect()
+}
+
+/// Spell a conversion over parts, by the route [`cast_route`] chose. `from` and `to` are the scalar
+/// lane types; `xs` are the source's parts.
+fn emit_cast(
+    e: &mut Emit<'_>,
+    vb: BlockId,
+    kind: CastKind,
+    xs: Vec<ValueId>,
+    from: &MirType,
+    to: &MirType,
+    route: CastRoute,
+) -> Vec<ValueId> {
+    match route {
+        CastRoute::Same => cast_parts(e, vb, kind, xs, to),
+        CastRoute::Identity => xs,
+        CastRoute::WidenInt { ext, then_fp } => {
+            let to_bytes = lane_bytes(to).expect("a widened lane type");
+            let ints = widen_chain(e, vb, xs, from, &int_of_bytes(to_bytes), ext);
+            if then_fp {
+                cast_parts(e, vb, CastKind::SiToFp, ints, to)
+            } else {
+                ints
+            }
+        }
+        CastRoute::TruncInt => narrow_chain(e, vb, xs, from, to, |_| NarrowKind::Trunc),
+        CastRoute::FloatToNarrowInt { unsigned } => {
+            let ints = cast_parts(e, vb, CastKind::FpToSi, xs, &MirType::I32);
+            narrow_chain(e, vb, ints, &MirType::I32, to, |last| {
+                if last && unsigned {
+                    NarrowKind::SatUnsigned
+                } else {
+                    NarrowKind::SatSigned
+                }
+            })
+        }
+        CastRoute::FpExt => widen_chain(e, vb, xs, from, to, CastKind::FpExt),
+        CastRoute::FpTrunc => narrow_chain(e, vb, xs, from, to, |_| NarrowKind::FpTrunc),
+    }
+}
+
+/// One lane-wise `Cast` of kind `k` per part, to `to`'s full-width vector.
+fn cast_parts(
+    e: &mut Emit<'_>,
+    vb: BlockId,
+    k: CastKind,
+    xs: Vec<ValueId>,
+    to: &MirType,
+) -> Vec<ValueId> {
+    xs.into_iter()
+        .map(|x| e.push(vb, part_ty(to), Op::Cast(k, x, part_ty(to))))
+        .collect()
+}
+
+/// Double the lane width of every part, `kind` (`SExt`/`ZExt`/`FpExt`) at a time, until it is
+/// `to`'s: each part becomes its low and its high half, in that order, so the parts stay in
+/// iteration order.
+fn widen_chain(
+    e: &mut Emit<'_>,
+    vb: BlockId,
+    mut parts: Vec<ValueId>,
+    from: &MirType,
+    to: &MirType,
+    kind: CastKind,
+) -> Vec<ValueId> {
+    let target = lane_bytes(to).expect("a widened lane type");
+    let mut cur = from.clone();
+    while lane_bytes(&cur).expect("a widened lane type") < target {
+        let next = if kind == CastKind::FpExt {
+            MirType::F64
+        } else {
+            int_of_bytes(lane_bytes(&cur).expect("a widened lane type") * 2)
+        };
+        let nty = part_ty(&next);
+        let mut out = Vec::with_capacity(parts.len() * 2);
+        for x in parts {
+            for half in [Half::Lo, Half::Hi] {
+                out.push(e.push(vb, nty.clone(), Op::Widen { v: x, half, kind }));
+            }
+        }
+        parts = out;
+        cur = next;
+    }
+    parts
+}
+
+/// Halve the lane width of the parts, two at a time, until it is `to`'s. `step_kind` picks each
+/// step's narrowing; it is told whether the step is the last one (the one that lands on `to`).
+fn narrow_chain(
+    e: &mut Emit<'_>,
+    vb: BlockId,
+    mut parts: Vec<ValueId>,
+    from: &MirType,
+    to: &MirType,
+    step_kind: impl Fn(bool) -> NarrowKind,
+) -> Vec<ValueId> {
+    let target = lane_bytes(to).expect("a widened lane type");
+    let mut cur = from.clone();
+    while lane_bytes(&cur).expect("a widened lane type") > target {
+        let half = lane_bytes(&cur).expect("a widened lane type") / 2;
+        let next = if cur == MirType::F64 {
+            MirType::F32
+        } else {
+            int_of_bytes(half)
+        };
+        let kind = step_kind(half == target);
+        let nty = part_ty(&next);
+        parts = parts
+            .chunks(2)
+            .map(|pair| {
+                e.push(
+                    vb,
+                    nty.clone(),
+                    Op::Narrow {
+                        lo: pair[0],
+                        hi: pair[1],
+                        kind,
+                    },
+                )
+            })
+            .collect();
+        cur = next;
+    }
+    parts
+}
+
+/// The parts of the lane mask `c`, re-expressed at the lane width of `value_lane` so they can blend
+/// values of that type. A compare's mask has its *operands'* lane width — `x[i] > 0.0` over `f32`
+/// is four `<4 x i32>` parts — while the selected values may be narrower or wider. Narrowing
+/// truncates and widening sign-extends: both turn an all-ones lane into an all-ones lane and zero
+/// into zero (and the interpreter's `1` lanes into `1`), so the selection is unchanged.
+fn mask_for(
+    e: &mut Emit<'_>,
+    vb: BlockId,
+    map: &FxHashMap<u32, Wide>,
+    c: ValueId,
+    value_lane: &MirType,
+) -> Vec<ValueId> {
+    let parts = resolve_vector(map, c);
+    let from = match e_ty(e, parts[0]) {
+        MirType::Vec(l, _) => *l,
+        other => other,
+    };
+    let to = mask_lane(value_lane);
+    if lane_bytes(&from) > lane_bytes(&to) {
+        narrow_chain(e, vb, parts, &from, &to, |_| NarrowKind::Trunc)
+    } else {
+        widen_chain(e, vb, parts, &from, &to, CastKind::SExt)
     }
 }
 
@@ -2689,14 +3070,14 @@ fn resolve_uniform(map: &FxHashMap<u32, Wide>, v: ValueId) -> ValueId {
     }
 }
 
-fn resolve_vector(map: &FxHashMap<u32, Wide>, v: ValueId) -> ValueId {
+fn resolve_vector(map: &FxHashMap<u32, Wide>, v: ValueId) -> Vec<ValueId> {
     match map.get(&v.0) {
-        Some(Wide::Vector(x)) => *x,
+        Some(Wide::Vector(x)) => x.clone(),
         _ => unreachable!("plan_body proved this operand is a vector"),
     }
 }
 
-/// A value as a vector: itself if already widened, otherwise broadcast across every lane.
+/// A value as parts: itself if already widened, otherwise one broadcast reused for every part.
 fn to_vector(
     e: &mut Emit<'_>,
     vb: BlockId,
@@ -2704,18 +3085,14 @@ fn to_vector(
     v: ValueId,
     lane: &MirType,
     w: u32,
-) -> ValueId {
-    match map.get(&v.0) {
-        Some(Wide::Vector(x)) => *x,
-        Some(Wide::Uniform(x)) => {
-            let vt = vec_of(lane, w);
-            e.push(vb, vt, Op::Splat(*x))
-        }
-        None => {
-            let vt = vec_of(lane, w);
-            e.push(vb, vt, Op::Splat(v))
-        }
-    }
+) -> Vec<ValueId> {
+    let scalar = match map.get(&v.0) {
+        Some(Wide::Vector(x)) => return x.clone(),
+        Some(Wide::Uniform(x)) => *x,
+        None => v,
+    };
+    let splat = e.push(vb, part_ty(lane), Op::Splat(scalar));
+    vec![splat; parts_of(lane, w)]
 }
 
 /// Point every edge of `t` that goes to `from` at `to`, keeping its arguments.
@@ -3084,19 +3461,19 @@ mod tests {
         assert!(is_widened(back, "k"), "i64 -> f64 should widen");
     }
 
-    /// A MIR vector shift is lane-wise; Cranelift's is a broadcast of one scalar amount. Widening
-    /// `x[i] << 2` therefore built an `ishl.i32x4` whose second operand was a vector, which the
-    /// CLIF verifier rejects — and the verifier only runs in a debug build, so in release the same
-    /// program reached lowering and panicked inside Cranelift's ISLE. Only constant left shifts
-    /// at `i16`/`i32` now widen through a different opcode. The legal but costly `i64x2` multiply
-    /// fallback remains excluded until its profitability is measured.
+    /// Cranelift's vector shifts take one *scalar* amount for every lane, and so does MIR's
+    /// vector-by-scalar `Bin` shape — so a shift whose amount is the same in every lane widens at
+    /// every integer width, `>>` as well as `<<`, by a literal or by a loop-invariant value. Each
+    /// emitted shift keeps its amount scalar (asserted on the MIR). A per-lane amount (`x[i] <<
+    /// y[i]`) still stays scalar: handing Cranelift a vector amount is the CLIF type error that, in a
+    /// release build with the verifier off, crashed the compiler inside ISLE.
     #[test]
-    fn shifts_widen_only_through_a_supported_constant_multiply() {
+    fn a_uniform_shift_widens_at_every_width_and_a_per_lane_one_does_not() {
         for (ty, lit) in [
-            ("i8", "(2 as i8)"),
-            ("i16", "(2 as i16)"),
-            ("i32", "2"),
-            ("i64", "2"),
+            ("i8", "(3 as i8)"),
+            ("i16", "(3 as i16)"),
+            ("i32", "3"),
+            ("i64", "3"),
         ] {
             for op in ["<<", ">>"] {
                 let src = format!(
@@ -3104,34 +3481,93 @@ mod tests {
                      while i < n {{ o[i] = x[i] {op} {lit}; i = i + 1; }} }} \
                      fn main() -> i32 {{ return 0; }}"
                 );
-                assert_eq!(
-                    is_widened(&src, "k"),
-                    op == "<<" && matches!(ty, "i16" | "i32"),
-                    "{ty} {op} eligibility"
-                );
+                assert!(is_widened(&src, "k"), "{ty} {op} by a literal must widen");
             }
             let variable = format!(
                 "fn k(x: [{ty}; 64], mut o: [{ty}; 64], amount: {ty}, n: i64) {{ \
                  let mut i: i64 = 0; while i < n {{ \
-                 o[i] = x[i] << amount; i = i + 1; }} }} \
+                 o[i] = x[i] >> amount; i = i + 1; }} }} \
+                 fn main() -> i32 {{ return 0; }}"
+            );
+            let (program, mut interner) = optimized(&variable, 2);
+            let f = program.function(interner.intern("k")).expect("no fn k");
+            let shifts: Vec<(bool, bool)> = f
+                .blocks
+                .iter()
+                .flat_map(|b| b.insts.iter())
+                .filter_map(|i| match &i.op {
+                    Op::Bin(BinOp::AShr | BinOp::LShr | BinOp::Shl, a, b) => {
+                        Some((f.value_type(*a).is_vector(), f.value_type(*b).is_vector()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                shifts.contains(&(true, false)),
+                "{ty}: no vector-by-scalar shift in {shifts:?}"
+            );
+            assert!(
+                !shifts.contains(&(true, true)),
+                "{ty}: a shift took a vector amount: {shifts:?}"
+            );
+            let per_lane = format!(
+                "fn k(x: [{ty}; 64], y: [{ty}; 64], mut o: [{ty}; 64], n: i64) {{ \
+                 let mut i: i64 = 0; while i < n {{ \
+                 o[i] = x[i] << y[i]; i = i + 1; }} }} \
                  fn main() -> i32 {{ return 0; }}"
             );
             assert!(
-                !is_widened(&variable, "k"),
-                "{ty} variable shift must stay scalar"
+                !is_widened(&per_lane, "k"),
+                "{ty} per-lane shift must stay scalar"
             );
         }
     }
 
-    /// x86 has no packed byte multiply, so an `i8` product may not be widened. Getting this wrong
-    /// is not a slow program: `imul.i8x16` is `Unsupported` out of Cranelift, i.e. a program that
-    /// runs at `-O0` and fails to compile at `-O2`. The loop is left entirely scalar.
+    /// Every width, both directions, negative values and an amount past the lane width (masked, as
+    /// the scalar shift masks it): `-O2` must print what `-O0` prints.
     #[test]
-    fn an_i8_multiply_is_refused() {
+    fn uniform_shifts_agree_with_the_scalar_loop() {
+        for (ty, amount) in [("i8", 11), ("i16", 9), ("i32", 33), ("i64", 61)] {
+            let src = format!(
+                "fn k(x: []{ty}, mut a: []{ty}, mut b: []{ty}, s: {ty}, n: i64) {{ \
+                 let mut i: i64 = 0; while i < n {{ a[i] = x[i] >> s; b[i] = x[i] << s; \
+                 i = i + 1; }} }} \
+                 fn main() -> i32 {{ let mut x: []{ty} = alloc_{ty}(37); \
+                 let mut a: []{ty} = alloc_{ty}(37); let mut b: []{ty} = alloc_{ty}(37); \
+                 let mut j: i64 = 0; while j < 37 {{ x[j] = ((j * 7 - 120) as {ty}); j = j + 1; }} \
+                 k(x, a, b, ({amount} as {ty}), 37); \
+                 j = 0; while j < 37 {{ print(a[j] as i64); print(b[j] as i64); j = j + 1; }} \
+                 free(x); free(a); free(b); return 0; }}"
+            );
+            scalar_and_vector_agree(&src);
+        }
+    }
+
+    /// x86 has no packed byte multiply, and Cranelift does not synthesize one (`imul.i8x16` is
+    /// `Unsupported`), so an `i8` product used to keep its whole loop scalar. It now widens through
+    /// `i16`: both operands are sign-extended half by half, multiplied, and truncated back — the low
+    /// eight bits of a product do not depend on how the operands were extended.
+    #[test]
+    fn an_i8_multiply_widens_through_i16() {
         let src = "fn k(x: [i8; 64], mut o: [i8; 64], n: i64) { let mut i: i64 = 0; \
                    while i < n { o[i] = x[i] * (3 as i8); i = i + 1; } } \
                    fn main() -> i32 { return 0; }";
-        assert!(!is_widened(src, "k"), "an i8 product must not be widened");
+        let vs = vector_values(src, "k");
+        assert!(
+            vs.contains(&(MirType::I8, 16)) && vs.contains(&(MirType::I16, 8)),
+            "expected <16 x i8> data multiplied in <8 x i16> halves: {vs:?}"
+        );
+        scalar_and_vector_agree(
+            "fn k(x: []i8, y: []i8, mut o: []i8, n: i64) { let mut i: i64 = 0; \
+             while i < n { o[i] = x[i] * y[i] + (1 as i8); i = i + 1; } } \
+             fn main() -> i32 { let mut x: []i8 = alloc_i8(37); \
+             let mut y: []i8 = alloc_i8(37); let mut o: []i8 = alloc_i8(37); \
+             let mut j: i64 = 0; \
+             while j < 37 { x[j] = ((j * 9 - 150) as i8); y[j] = ((j * 5 + 3) as i8); j = j + 1; } \
+             k(x, y, o, 37); \
+             j = 0; while j < 37 { print(o[j] as i32); j = j + 1; } \
+             free(x); free(y); free(o); return 0; }",
+        );
     }
 
     /// The same exclusion reached through the *reduction* path, where the combine is built by
@@ -3149,6 +3585,186 @@ mod tests {
         assert!(
             vs.iter().all(|(l, n)| *l == MirType::I8 && *n == 16),
             "{vs:?}"
+        );
+    }
+
+    // ---- mixed lane widths ---------------------------------------------------------------------
+
+    /// The group width follows the NARROWEST lane: `u8` pixels in, `f32` out is sixteen iterations
+    /// per group — one `<16 x u8>` load, two zero-extending widen steps, four `<4 x f32>` parts —
+    /// and every lane must still be what the scalar `(px as f32)` computed.
+    #[test]
+    fn a_u8_to_f32_normalize_widens_in_parts() {
+        let src = "fn k(px: []u8, mut o: []f32, n: i64) { let mut i: i64 = 0; \
+                   while i < n { o[i] = (px[i] as f32) * 0.25 - 3.0; i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        let vs = vector_values(src, "k");
+        for want in [
+            (MirType::I8, 16),
+            (MirType::I16, 8),
+            (MirType::I32, 4),
+            (MirType::F32, 4),
+        ] {
+            assert!(vs.contains(&want), "missing {want:?} in {vs:?}");
+        }
+        scalar_and_vector_agree(
+            "fn k(px: []u8, mut o: []f32, n: i64) { let mut i: i64 = 0; \
+             while i < n { o[i] = (px[i] as f32) * 0.25 - 3.0; i = i + 1; } } \
+             fn main() -> i32 { let mut px: []u8 = alloc_u8(37); let mut o: []f32 = alloc_f32(37); \
+             let mut j: i64 = 0; while j < 37 { px[j] = ((j * 29 + 7) as u8); j = j + 1; } \
+             k(px, o, 37); \
+             j = 0; while j < 37 { print((o[j] * 4.0) as i32); j = j + 1; } \
+             free(px); free(o); return 0; }",
+        );
+    }
+
+    /// `f32 -> i8` and `f32 -> u8` saturate. Spelled as one saturating `f32 -> i32` and then
+    /// saturating packs, the nested clamps compose to exactly the scalar clamp — including at the
+    /// edges, which the inputs here straddle (`±200`, `NaN`-free, every lane printed).
+    #[test]
+    fn a_saturating_float_to_byte_quantize_agrees_with_the_scalar_loop() {
+        let src = "fn k(x: []f32, mut q: []i8, mut u: []u8, n: i64) { let mut i: i64 = 0; \
+                   while i < n { q[i] = (x[i] * 4.0) as i8; u[i] = (x[i] * 4.0) as u8; \
+                   i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        let vs = vector_values(src, "k");
+        assert!(
+            vs.contains(&(MirType::I8, 16)) && vs.contains(&(MirType::F32, 4)),
+            "the quantize did not widen: {vs:?}"
+        );
+        scalar_and_vector_agree(
+            "fn k(x: []f32, mut q: []i8, mut u: []u8, n: i64) { let mut i: i64 = 0; \
+             while i < n { q[i] = (x[i] * 4.0) as i8; u[i] = (x[i] * 4.0) as u8; \
+             i = i + 1; } } \
+             fn main() -> i32 { let mut x: []f32 = alloc_f32(37); let mut q: []i8 = alloc_i8(37); \
+             let mut u: []u8 = alloc_u8(37); \
+             let mut j: i64 = 0; while j < 37 { x[j] = ((j as f32) - 18.0) * 2.9; j = j + 1; } \
+             k(x, q, u, 37); \
+             j = 0; while j < 37 { print(q[j] as i32); print(u[j] as i32); j = j + 1; } \
+             free(x); free(q); free(u); return 0; }",
+        );
+    }
+
+    /// The int8 dot product: `acc_i32 += (a[i] as i32) * (b[i] as i32)`. Sixteen bytes per group,
+    /// sign-extended to four `<4 x i32>` parts, multiplied, and summed into a four-part vector
+    /// accumulator — integer addition is associative including its wraparound, so the parts and lanes
+    /// may be combined in any order and the answer is still the scalar one to the bit.
+    #[test]
+    fn an_i8_dot_into_an_i32_accumulator_widens() {
+        let src =
+            "fn k(a: []i8, b: []i8, n: i64) -> i32 { let mut s: i32 = 0; let mut i: i64 = 0; \
+                   while i < n { s = s + (a[i] as i32) * (b[i] as i32); i = i + 1; } return s; } \
+                   fn main() -> i32 { return 0; }";
+        let vs = vector_values(src, "k");
+        assert!(
+            vs.contains(&(MirType::I8, 16)) && vs.contains(&(MirType::I32, 4)),
+            "the i8 dot did not widen: {vs:?}"
+        );
+        scalar_and_vector_agree(
+            "fn k(a: []i8, b: []i8, n: i64) -> i32 { let mut s: i32 = 0; let mut i: i64 = 0; \
+             while i < n { s = s + (a[i] as i32) * (b[i] as i32); i = i + 1; } return s; } \
+             fn main() -> i32 { let mut a: []i8 = alloc_i8(37); let mut b: []i8 = alloc_i8(37); \
+             let mut j: i64 = 0; \
+             while j < 37 { a[j] = ((j * 11 - 128) as i8); b[j] = ((127 - j * 13) as i8); j = j + 1; } \
+             print(k(a, b, 37)); free(a); free(b); return 0; }",
+        );
+    }
+
+    /// An `f32` stream accumulated in `f64`: four iterations per group, each `<4 x f32>` widened to
+    /// two `<2 x f64>` parts, then folded serially in iteration order — a float sum is never
+    /// reassociated, at any width.
+    #[test]
+    fn an_f32_stream_summed_in_f64_widens_and_folds_in_order() {
+        let src = "fn k(x: []f32, n: i64) -> f64 { let mut s: f64 = 0.0; let mut i: i64 = 0; \
+                   while i < n { s = s + (x[i] as f64); i = i + 1; } return s; } \
+                   fn main() -> i32 { return 0; }";
+        let vs = vector_values(src, "k");
+        assert!(
+            vs.contains(&(MirType::F32, 4)) && vs.contains(&(MirType::F64, 2)),
+            "the f32->f64 sum did not widen: {vs:?}"
+        );
+        scalar_and_vector_agree(
+            "fn k(x: []f32, n: i64) -> f64 { let mut s: f64 = 0.0; let mut i: i64 = 0; \
+             while i < n { s = s + (x[i] as f64); i = i + 1; } return s; } \
+             fn main() -> i32 { let mut x: []f32 = alloc_f32(37); \
+             let mut j: i64 = 0; while j < 37 { x[j] = ((j as f32) + 0.1) * 1.7; j = j + 1; } \
+             print((k(x, 37) * 1024.0) as i64); free(x); return 0; }",
+        );
+    }
+
+    /// A narrowing store: `i32` arithmetic truncated into an `i16` stream, eight iterations per group
+    /// — two `<4 x i32>` parts joined by one truncating narrow.
+    #[test]
+    fn an_i32_result_truncated_into_i16_widens() {
+        let src = "fn k(x: []i32, mut o: []i16, n: i64) { let mut i: i64 = 0; \
+                   while i < n { o[i] = (x[i] * 3 + 7) as i16; i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        let vs = vector_values(src, "k");
+        assert!(
+            vs.contains(&(MirType::I16, 8)) && vs.contains(&(MirType::I32, 4)),
+            "the truncating store did not widen: {vs:?}"
+        );
+        scalar_and_vector_agree(
+            "fn k(x: []i32, mut o: []i16, n: i64) { let mut i: i64 = 0; \
+             while i < n { o[i] = (x[i] * 3 + 7) as i16; i = i + 1; } } \
+             fn main() -> i32 { let mut x: []i32 = alloc_i32(37); let mut o: []i16 = alloc_i16(37); \
+             let mut j: i64 = 0; while j < 37 { x[j] = ((j - 18) * 4099) as i32; j = j + 1; } \
+             k(x, o, 37); \
+             j = 0; while j < 37 { print(o[j] as i32); j = j + 1; } \
+             free(x); free(o); return 0; }",
+        );
+    }
+
+    /// A lane mask computed at one width selecting values of another: `x[i] < 0.0` over `f32` is four
+    /// `<4 x i32>` mask parts, while the merged value is one `<16 x i8>`. The mask is narrowed
+    /// (truncation keeps all-ones and zero lanes exactly) before it blends.
+    #[test]
+    fn a_wide_mask_selects_narrow_values() {
+        let src = "fn k(x: []f32, y: []i8, mut o: []i8, n: i64) { let mut i: i64 = 0; \
+                   while i < n { let mut t: i8 = y[i]; if x[i] < 0.0 { t = 0 as i8; } \
+                   o[i] = t; i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        assert!(
+            is_widened(src, "k"),
+            "the mixed-width triangle did not widen"
+        );
+        scalar_and_vector_agree(
+            "fn k(x: []f32, y: []i8, mut o: []i8, n: i64) { let mut i: i64 = 0; \
+             while i < n { let mut t: i8 = y[i]; if x[i] < 0.0 { t = 0 as i8; } \
+             o[i] = t; i = i + 1; } } \
+             fn main() -> i32 { let mut x: []f32 = alloc_f32(37); let mut y: []i8 = alloc_i8(37); \
+             let mut o: []i8 = alloc_i8(37); \
+             let mut j: i64 = 0; \
+             while j < 37 { x[j] = ((j % 5) as f32) - 2.0; y[j] = ((j * 3 + 1) as i8); j = j + 1; } \
+             k(x, y, o, 37); \
+             j = 0; while j < 37 { print(o[j] as i32); j = j + 1; } \
+             free(x); free(y); free(o); return 0; }",
+        );
+    }
+
+    /// An `i64` counter compared as a value over `f32` data: the ramp is two `<2 x i64>` parts and
+    /// its mask is narrowed to the `f32` value's width before the select. (The previous rule — "the
+    /// ramp's lane count must equal the data's" — declined this outright.)
+    #[test]
+    fn an_i64_counter_compared_over_f32_data_widens() {
+        let src = "fn k(x: []f32, mut o: []f32, t: i64, n: i64) { let mut i: i64 = 0; \
+                   while i < n { let q: f32 = if i == t { 8.0 } else { 2.0 }; \
+                   o[i] = x[i] * q; i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        let vs = vector_values(src, "k");
+        assert!(
+            vs.contains(&(MirType::I64, 2)) && vs.contains(&(MirType::F32, 4)),
+            "the i64 ramp over f32 data did not widen: {vs:?}"
+        );
+        scalar_and_vector_agree(
+            "fn k(x: []f32, mut o: []f32, t: i64, n: i64) { let mut i: i64 = 0; \
+             while i < n { let q: f32 = if i == t { 8.0 } else { 2.0 }; \
+             o[i] = x[i] * q; i = i + 1; } } \
+             fn main() -> i32 { let mut x: []f32 = alloc_f32(23); let mut o: []f32 = alloc_f32(23); \
+             let mut j: i64 = 0; while j < 23 { x[j] = (j as f32) + 1.0; j = j + 1; } \
+             k(x, o, 17, 23); \
+             j = 0; while j < 23 { print(o[j] as i32); j = j + 1; } \
+             free(x); free(o); return 0; }",
         );
     }
 
@@ -3196,10 +3812,10 @@ mod tests {
     }
 
     /// The induction variable is uniform across a group only as an *address*. Used as a value it is
-    /// `i + k` in lane `k`, so the widened body reads it through the lane ramp `splat(i) + iota` —
-    /// and that ramp is only expressible when its lane count is the group size the rest of the body
-    /// runs at. An `i64` counter over `f32` data would need four 8-byte lanes, i.e. a 256-bit
-    /// vector, so it is declined rather than splatted.
+    /// `i + k` in lane `k`, so the widened body reads it through the lane ramp `splat(i) + iota`.
+    /// An `i64` counter over `f32` data is now two `<2 x i64>` ramp parts — but this body converts
+    /// that counter to `f32`, and an integer-to-narrower-float conversion has no exact packed form
+    /// (`i64 -> f64 -> f32` rounds twice), so the loop is still declined rather than splatted.
     #[test]
     fn a_counter_whose_lanes_do_not_match_the_data_width_is_declined() {
         let src = "fn k(mut o: []f32, n: i64) { let mut i: i64 = 0; \
@@ -3695,7 +4311,7 @@ mod tests {
 
     // ---- a lane mask selecting between uniform arms -------------------------------------------
 
-    /// `select(mask, a, b)` with both arms loop-invariant is still lane-varying, and `widen_op`
+    /// `select(mask, a, b)` with both arms loop-invariant is still lane-varying, and `emit_widened`
     /// splats them exactly as it does a `Bin` operand. Requiring both arms to be vectors declined
     /// every table-driven transcendental the front end inlines — `exp` picks its 2^k coefficients
     /// with a chain of exactly such selects, so one of them made the whole loop unwidenable.
