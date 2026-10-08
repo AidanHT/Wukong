@@ -62,9 +62,12 @@ wukong_span      Span, SourceMap (line index), string Interner / Symbol
 wukong_runtime   the AVX2/FMA microkernels the recognizers dispatch to (GEMM/GEMV, vmath,
                   reductions, norms, int8, bf16/f16) + the rayon-backed `wukong_parallel_for` that
                   `@parallel` lowers to — a leaf: no workspace deps, and both the interpreter and
-                  the native backend call into it. The bump `Arena` and the sequential
-                  `parallel_for` are reference surface with no caller anywhere in the workspace
-                  (the kernels use thread-local `Vec` scratch)
+                  the native backend call into it. It also backs the language's allocators:
+                  `wukong_rt_alloc` (64-byte-aligned zeroed heap) and `scratch` (the per-thread
+                  LIFO arena behind `scratch_<T>`/`scratch_mark`/`scratch_release`; the
+                  interpreter mirrors its mark count and region reuse). The bump `Arena` and the
+                  sequential `parallel_for` are reference surface with no caller anywhere in the
+                  workspace (the kernels use thread-local `Vec` scratch)
 wukong_diag      Diagnostic, Severity, error-code catalog, JSON + terminal renderers
 wukong_lexer     &str -> tokens (+ @attributes, error recovery)
 wukong_ast       AST nodes, NodeId, pretty-printer; owns `BinOp::fold_const_len` +
@@ -78,8 +81,8 @@ wukong_mir       MIR data, builder, pretty-printer, verifier, `VecKernel` (the 2
 wukong_mir_build typed AST -> MIR (alloca-per-local lowering; SIMD loop auto-vectorization)
 wukong_opt       pass manager + analyses (cfg, dominators) + transforms (inlining, sroa,
                   mem2reg, simplify, simplify-cfg, simplify-phis, dce, cse, dse,
-                  loop-delete, licm, promote, loop unrolling) plus the `alias` provenance
-                  analysis every memory transform queries
+                  loop-delete, licm, bounds-check elimination, promote, loop unrolling) plus
+                  the `alias` provenance analysis every memory transform queries
 wukong_autodiff  reverse-mode autodiff as a MIR->MIR transform (scalar + tensor-tape VJP
                   rules, fused AdamW; finite-difference-gated) — the training backward path (driven by --emit=grad / --train)
 wukong_backend   `Backend` trait + `Artifact`
@@ -318,7 +321,7 @@ invalidated, and the call-effect table for the callees optimized so far. A cache
 |-----------------|-------|--------------|
 | `inline_program`| -O2   | inline non-recursive callees **bottom-up over the call graph** (reverse topological order from Tarjan SCCs, so a helper chain collapses in one sweep), scored by a cost model rather than one blanket size cap, then drop callees left uncalled; runs before the function pipeline so the spliced code optimizes in context |
 | `Sroa`          | -O2   | scalar replacement of aggregates, ahead of `Mem2Reg`: split a local `Array` slot whose every access is a load/store through a constant-index `gep` chain into one scalar slot per accessed leaf. Each access carries its interpreter slot *and* native byte offset; one cell must be one byte range of one type, distinct cells disjoint, so the split preserves both memory models; a leaf whose fresh default differs from the byte it replaces needs a must-be-written proof |
-| `Mem2Reg`       | -O1   | promote scalar int/float **and pointer** `alloca` slots to block-parameter SSA via dominance-frontier phi placement and a dominator-tree rename (a pointer slot only when it is provably written before it is read — see below) |
+| `Mem2Reg`       | -O1   | promote scalar int/float **and pointer** `alloca` slots to block-parameter SSA via dominance-frontier phi placement and a dominator-tree rename (a pointer slot's read-before-write path gets the null `inttoptr 0` — see below) |
 | `Simplify`    | -O1   | constant folding + algebraic identities (`x+0`, `x*1`, `x*0`, `x^x`, `x&x`, `x\|x`, `x%1`) and integer self-comparison folding |
 | `SimplifyCfg` | -O1   | constant-branch folding, straight-line block merging, and unreachable-block pruning (with renumbering) |
 | `SimplifyPhis`| -O1   | drop dead and trivial block parameters that mem2reg introduced |
@@ -328,6 +331,7 @@ invalidated, and the call-effect table for the callees optimized so far. A cache
 | `LoopCanon`   | -O2   | canonicalize loop entry/latch structure before loop-invariant code motion |
 | `LoopDelete`  | -O2   | bypass a loop with a preheader, one exit edge and no side effect whose values nobody outside uses, when it provably terminates (a constant trip count whose induction variable never wraps, or a unit-step strict bound) — what removes an initialization loop `Dse` emptied |
 | `Licm`        | -O2   | hoist loop-invariant, side-effect-free, non-trapping ops to the loop preheader — including a **load** nothing in the body may write, when it is dereferenceable, sits in the header (which runs on every entry), or runs on every iteration of a single-exit loop, in which case it reads through `select(first_test, addr, dummy)` so a zero-trip entry reads a private dummy slot, and a call to a callee summarized as speculatable |
+| `Bce`         | -O2   | slice bounds-check elimination: version an innermost counted loop on a preheader guard (`start < end`, then per check `lo <=u hi && hi <u len` at the two ends of the index range, overflow-safe) so a check-free copy runs when every check is proved and the original, checked loop runs otherwise; a caller-owned slice header is read early only behind the guards of the checks that precede it (`bce.rs`) |
 | `Promote`     | -O2   | scalar promotion: a loop-invariant location the loop both reads and writes, with no other possibly aliasing access, is loaded once in the preheader, accessed through a fresh slot (which `Mem2Reg` turns into a loop-carried value next sweep) and stored back on every dedicated exit, with the same speculation rules as `Licm` and a store-safety rule (private slot, or a store that runs whenever the loop does) |
 | `Vectorize`   | -O2   | widen eligible canonical MIR loops after LICM, then feed the result through the normal fixpoint cleanup |
 | `unroll_program`| -O2 | unroll a counted two-block loop: **completely** when its exact trip count is at most 32 and the copies total at most 128 instructions; otherwise 4x (body up to 16 instructions) or 2x (up to 32), with a wrap-safe guard and a remainder that is a loop for an unknown trip count, nothing when the factor divides a known one, and straight-line copies for a known leftover; runs **after** the function pipeline, and the functions it changed get a reduced simplify + simplify-cfg + simplify-phis + cse + dce cleanup sweep |
@@ -379,28 +383,21 @@ promotes integer, float and pointer slots and leaves arrays, vectors, address-ta
 slot accessed at a width other than its own type in memory. For an integer or float slot a read
 before any write becomes a zero constant, matching the interpreter's zero-initialized memory.
 
-A **pointer** slot has no such zero — `inttoptr 0` is a genuine null on the native backend but a
-*valid, addressable* slot in the interpreter, so materializing one would trade a stack slot for an
-interp-vs-native divergence — so only the definitely-initialized subset is promoted: the **first
-access to the slot inside its own `alloca`'s block `B` must be a store**, and `B` must be the entry
-block or have an empty dominance frontier. SSA dominance makes `B` dominate every block that
-mentions the slot (a use is dominated by the `alloca` that defines it) and a block is straight-line,
-so every access outside `B` happens after all of `B`. `DF(B) = ∅` makes the set of blocks `B`
-dominates closed under both successors and predecessors, so the iterated dominance frontier of the
-store blocks — and every predecessor of every block that receives a phi, which is exactly where the
-renamer asks for a reaching definition — stays inside it, and the rename stack is never empty. The
-entry block gets its own arm because a back edge can put it in its own frontier while it still
-dominates everything.
-
-That admits the case the restriction exists for: `mir_build` gives every pointer-typed parameter —
-`*T`, `&T`, and every `Tensor[…]`, all `MirType::Ptr` — an `alloca ptr` plus a `store <param>` in
-the entry block, and then re-loads that base pointer at *every* element access; the `DF(B) = ∅` arm
-adds the same parameters after `-O2` inlining has spliced a callee's entry block into the middle of
-a caller block. Promoting them removes 3 of the 5 loads per element from a three-operand `Tensor`
-loop (`tests/run/ptr_slot_promotion.wk`) and leaves **no `alloca ptr` at all** across the run corpus
-at `-O2`, and it compounds: deleting `store <slot>, <ptr slot>` can un-escape the pointee so a later
-fixpoint round promotes that too. A pointer local whose `alloca` and initializing store are separated
-by a branch keeps its slot.
+A **pointer** slot's zero is the null pointer, `inttoptr 0`. That used to be unsound — interpreter
+slot 0 was the first live allocation of a run, so a materialized null would have aliased real memory
+(the reverted `PtrToInt(p) != 0` attempt, `0900352`) — and mem2reg promoted only the
+definitely-initialized subset of pointer slots. The interpreter now reserves slot 0 as a
+never-allocated null at every entry point (`wukong_interp::NULL_SLOT`; a load or store through it is
+the diagnostic `null pointer dereference`), so its zero-initialized pointer memory and native's
+`inttoptr 0` are the same null and every pointer slot is promoted like an integer slot: a
+read-before-write path gets the null, materialized once in the entry block as `inttoptr (i64 0)`.
+The same reservation is what lets `mir_build` lower a pointer condition (`if p`, `while p`, `p && q`)
+as the null test `ptrtoint p != 0`; it used to reach `cond_br` unchanged and fail verification with
+no span. That matters for the case pointer promotion was written for — `mir_build` gives every
+pointer-typed parameter (`*T`, `&T`, every `Tensor[…]`) an `alloca ptr` plus a `store <param>` and
+re-loads the base pointer at every element access (`tests/run/ptr_slot_promotion.wk`) — and now also
+for a pointer local whose `alloca` and initializing store are separated by a branch, which used to
+keep its slot and reload it on every use (`tests/run/pointer_null_condition.wk`).
 
 A `[]T` **slice** parameter is *not* covered: a slice is a 16-byte `{ data, len }` fat pointer passed
 by address, so its base comes from `load ptr (gep <param>, 0)` — caller-owned memory, not a local

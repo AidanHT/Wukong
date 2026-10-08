@@ -77,10 +77,9 @@ fn guarded_calls_own_code_reset_state_and_propagate_nested_assertions() {
             .err()
             .unwrap()
             .contains("no parameters"));
-        assert!(jit_module(&program, &it)
-            .err()
-            .unwrap()
-            .contains("raw JIT function pointers"));
+        // The raw API compiles it as well, with raw-mode failure semantics (a failed assertion
+        // aborts the process), so only the guarded handle below is run.
+        assert!(jit_module(&program, &it).is_ok());
         jit_compile_buffer_kernel(&program, entry, &it).unwrap()
     }; // MIR, interner and compilation temporaries gone; the handle alone retains the code.
     let mut data = [5.0f32];

@@ -83,6 +83,10 @@ fn census_path() -> PathBuf {
         .join("recognizer-census.txt")
 }
 
+/// The slice bounds-failure intrinsic. A safety edge, not a dispatched kernel: how many survive
+/// `-O2` is a property of bounds-check elimination, so the census does not record it.
+const BOUNDS_FAIL: &str = "wukong_rt_bounds_fail";
+
 /// Runtime symbols plus multiplicity witnesses and the number of inline vector-recipe calls.
 /// Keep bare symbols so the original symbol/fixture floors retain their meaning.
 fn kernel_calls(mir: &str) -> BTreeSet<String> {
@@ -93,6 +97,9 @@ fn kernel_calls(mir: &str) -> BTreeSet<String> {
         let end = rest
             .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .unwrap_or(rest.len());
+        if &rest[..end] == BOUNDS_FAIL {
+            continue;
+        }
         *counts.entry(rest[..end].to_string()).or_default() += 1;
     }
     for (symbol, count) in counts {

@@ -1,0 +1,100 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT-VALUES: 0 0 0 0 0
+// EXPECT-OUT-VALUES: 1 3 0 36579
+// EXPECT-OUT-VALUES: 1 220 7 6 5
+// EXPECT-OUT-VALUES: 0 0 0 0 0 0 495
+// EXPECT-OUT-VALUES: 0 0 0 0 2.5
+// EXPECT-OUT-VALUES: 0 0
+module tests.run.alloc_scratch_arena
+
+// The scratch allocator: `scratch_<T>(n)` hands out `n` zeroed elements from a per-thread arena,
+// `scratch_mark()` is the number of live scratch allocations, and `scratch_release(m)` releases
+// every allocation made after mark `m` was taken, LIFO, so the memory is reused. Every value below
+// is derived by hand from those three rules, on both backends and at every -O level:
+//
+// * A run starts at mark 0. `a` (4 lanes) reads all-zero before it is written: 0 0 0 0 0.
+// * `a` becomes 1 11 21 31; a heap buffer `h` (an ordinary `alloc_i32`) becomes 7 6 5.
+// * `inner` = 1 (only `a` is live). `b` (6 lanes) and a zero-length `z` take the count to 3 — a
+//   zero-length allocation counts — and `z.len()` is 0. `b` = 100..105 folds (t = t*3 + x) to
+//   ((((100*3+101)*3+102)*3+103)*3+104)*3+105 = 36579.
+// * `scratch_release(inner)` drops `b` and `z`: the mark is 1 again, and `a` and `h` are untouched:
+//   fold(a) = ((1*3+11)*3+21)*3+31 = 220, then 7 6 5.
+// * `c` (6 lanes) reuses `b`'s memory natively and must read all-zero again even though `b` was
+//   written: 0 0 0 0 0 0. With c[0] = 2 and c[5] = 9 it folds to 2*3^5 + 9 = 495.
+// * Released again, the same bytes come back as `f`, now `f32`, and still read as zero (0 0 0 0);
+//   f[1] = 2.5 prints 2.5.
+// * `scratch_release(-1)` releases everything (mark 0); a mark past the count (5) releases nothing
+//   (still 0).
+//
+// Every loop is an integer store or a recurrence, so no kernel recognizer fires.
+
+fn fold(s: []i32) -> i32 {
+    let mut t: i32 = 0;
+    for i in 0..s.len() {
+        t = t * 3 + s[i];
+    }
+    return t;
+}
+
+fn main() -> i32 {
+    let base: i64 = scratch_mark();
+    print(base);
+    let mut a: []i32 = scratch_i32(4);
+    print(a[0]);
+    print(a[1]);
+    print(a[2]);
+    print(a[3]);
+    for i in 0..4 {
+        a[i] = (i as i32) * 10 + 1;
+    }
+    let mut h: []i32 = alloc_i32(3);
+    for i in 0..3 {
+        h[i] = 7 - (i as i32);
+    }
+
+    let inner: i64 = scratch_mark();
+    print(inner);
+    let mut b: []i32 = scratch_i32(6);
+    let z: []u8 = scratch_u8(0);
+    print(scratch_mark());
+    print(z.len());
+    for i in 0..6 {
+        b[i] = 100 + (i as i32);
+    }
+    print(fold(b));
+
+    scratch_release(inner);
+    print(scratch_mark());
+    print(fold(a));
+    print(h[0]);
+    print(h[1]);
+    print(h[2]);
+
+    let mut c: []i32 = scratch_i32(6);
+    print(c[0]);
+    print(c[1]);
+    print(c[2]);
+    print(c[3]);
+    print(c[4]);
+    print(c[5]);
+    c[0] = 2;
+    c[5] = 9;
+    print(fold(c));
+
+    scratch_release(inner);
+    let mut f: []f32 = scratch_f32(4);
+    print(f[0]);
+    print(f[1]);
+    print(f[2]);
+    print(f[3]);
+    f[1] = 2.5;
+    print(f[1]);
+
+    scratch_release(-1);
+    print(scratch_mark());
+    scratch_release(5);
+    print(scratch_mark());
+    free(h);
+    return 0;
+}

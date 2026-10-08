@@ -29,10 +29,16 @@ calls `run_with_output` directly — see `wukong_backend`.
 `Value::Ptr(usize)` is a slot index; `Gep` computes `base + index * slot_count(elem)`. Memory is
 never freed (`wukong_rt_free` is a deliberate no-op).
 
-**LANDMINE — address 0 is a valid address.** The first pointer taken in a run has slot index 0. A
-pointer condition can *never* be lowered as `PtrToInt(p) != 0` — that was tried and reverted
-(0900352) because it traded a loud ICE for a silent interp/native divergence. A correct fix needs a
-null test both backends genuinely share.
+**Address 0 is the reserved null (`NULL_SLOT`).** Every public entry point starts its memory with
+one never-allocated sentinel slot (`NULL_SENTINEL`), so no `alloca`, heap block, static or
+kernel-entry buffer ever lands at slot 0 and `Value::Ptr(0)` means what `inttoptr 0` means natively.
+A load or store through it is a `null pointer dereference` diagnostic. That is what makes the
+`PtrToInt(p) != 0` pointer-condition lowering (reverted once at 0900352, when slot 0 was the first
+live allocation) and mem2reg's null for a read-before-write pointer slot sound. **Keep it:** a new
+entry point that builds an `Interp` must start from `null_reserved_memory()`, or the first
+allocation of its run reads as null again. (The unit tests that build an `Interp` by hand with an
+empty `memory` keep their old addressing; the null checks fire only when slot 0 holds the
+sentinel.)
 
 ## `Accelerator` trait — `--backend=gpu` hook seam
 

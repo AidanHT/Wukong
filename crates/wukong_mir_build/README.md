@@ -94,8 +94,11 @@ Both fold through `BinOp::fold_const_len`; operand bound clamp to `u32::MAX` is 
    their own `bind_slice` — no shared path.
 2. **Recognizers GATE-BLIND** — see above. Runtime kernel tests and lane-printing fixtures are the
    only real proof.
-3. **Pointer truthiness** (`src/lib.rs:16443`) — `if p` still falls through unchanged; `PtrToInt !=
-   0` was reverted. Interpreter address 0 is valid; no shared null test exists.
+3. **Pointer truthiness** — `if p` / `while p` lower to `ptrtoint p != 0`, sound because the
+   interpreter reserves slot 0 as null (`wukong_interp::NULL_SLOT`); an aggregate, slice, tensor,
+   vector or function condition is `E0401` in sema. Slice accesses `s[i]` carry a bounds check
+   (`src/bounds.rs`, a dead-end failure block calling `wukong_rt_bounds_fail`) unless the function
+   is `@unchecked`; `wukong_opt::bce` keys on exactly that shape.
 4. **`mono_type_name` must stay injective** — non-injective mangling merges instances and corrupts ABI.
 5. **New `_parallel` recognizer** — must mirror `wukong_autodiff/src/tape.rs` (`Syms`, `is_kernel`,
    `diff_kernel_call`) or `@parallel` backward breaks.

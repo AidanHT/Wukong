@@ -422,6 +422,31 @@ pub trait Accelerator {
     }
 }
 
+/// The slot index the interpreter reserves as the **null pointer**.
+///
+/// Every public entry point starts its flat memory with one never-allocated sentinel at slot 0, so
+/// no `alloca`, heap allocation, static blob or kernel-entry buffer can ever be placed there and
+/// `Value::Ptr(0)` means exactly what `inttoptr 0` means natively: null. Before this, slot 0 was the
+/// first live allocation of a run, which is why a pointer condition could never be lowered as
+/// `PtrToInt(p) != 0` (reverted at 0900352: `let p = &mut v; if p` read the first local as null in
+/// the interpreter and non-null natively), why mem2reg could not materialize a null for a
+/// read-before-write pointer slot, and why the interpreter could not share native's null at all.
+/// A load or store through it is reported as a null dereference instead of reading the sentinel.
+pub const NULL_SLOT: usize = 0;
+
+/// The value parked in [`NULL_SLOT`]. A vector handle no arena can hold (`usize::MAX`), so it is
+/// never produced by a legal store — vector stores scatter lanes, and nested vector handles are
+/// rejected — and a read that slips past the explicit null checks fails as an invalid handle or a
+/// type-confused kernel operand instead of yielding a plausible number. It also marks the
+/// reservation: the null checks below fire only when slot 0 holds it, so the unit tests that build
+/// an `Interp` by hand with a buffer at slot 0 keep their original addressing.
+const NULL_SENTINEL: Value = Value::VecRef(usize::MAX);
+
+/// Fresh run memory with [`NULL_SLOT`] reserved.
+fn null_reserved_memory() -> Vec<Value> {
+    vec![NULL_SENTINEL]
+}
+
 /// Run `entry` (typically `main`) and return its integer result as a process exit code.
 pub fn run(program: &Program, entry: Symbol, interner: &Interner) -> Result<i64, String> {
     Ok(run_with_output(program, entry, interner)?.0)
@@ -433,6 +458,20 @@ pub fn run_with_output(
     entry: Symbol,
     interner: &Interner,
 ) -> Result<(i64, Vec<u8>), String> {
+    let (result, stdout) = run_capturing(program, entry, interner);
+    result.map(|code| (code, stdout))
+}
+
+/// Run `entry` and return its exit code or its run error **together with everything it printed
+/// before it stopped** — also when it stopped on a runtime failure (a failed `assert`, a slice
+/// bounds failure). A linked executable has always kept that output (its prints reach stdout as
+/// they happen); `wukongc --run` prints it before the error so all three execution paths show the
+/// same thing, and the differential gate compares it.
+pub fn run_capturing(
+    program: &Program,
+    entry: Symbol,
+    interner: &Interner,
+) -> (Result<i64, String>, Vec<u8>) {
     // The tree-walker recurses on the *host* call stack — one host frame per Wukong call — so a
     // deeply recursive Wukong program would overflow the default main-thread stack and **abort**
     // the process (a stack overflow is uncatchable). The interpreter is the correctness oracle; an
@@ -442,14 +481,18 @@ pub fn run_with_output(
     // reports a diagnostic instead of overflowing even 512 MiB. Every other public entry point
     // does the same — they are all the same tree-walker.
     with_big_stack(|| {
-        let func = program
-            .function(entry)
-            .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
+        let Some(func) = program.function(entry) else {
+            return (
+                Err(format!("no entry function `{}`", interner.resolve(entry))),
+                Vec::new(),
+            );
+        };
         let mut interp = Interp {
             program,
             interner,
-            memory: Vec::new(),
+            memory: null_reserved_memory(),
             stdout: Vec::new(),
+            scratch_arena: ScratchSlots::default(),
             frames: Vec::new(),
             call_args: Vec::new(),
             scratch: Vec::with_capacity(8),
@@ -462,8 +505,8 @@ pub fn run_with_output(
             accel: None,
             depth: 0,
         };
-        let result = interp.run_function(func, &[])?;
-        Ok((result.as_int() as i64, interp.stdout))
+        let result = interp.run_function(func, &[]).map(|v| v.as_int() as i64);
+        (result, interp.stdout)
     })
 }
 
@@ -540,8 +583,9 @@ pub fn run_with_output_accel(
         let mut interp = Interp {
             program,
             interner,
-            memory: Vec::new(),
+            memory: null_reserved_memory(),
             stdout: Vec::new(),
+            scratch_arena: ScratchSlots::default(),
             frames: Vec::new(),
             call_args: Vec::new(),
             scratch: Vec::with_capacity(8),
@@ -648,8 +692,9 @@ fn run_kernel_f32_inner(
         let mut interp = Interp {
             program,
             interner,
-            memory: Vec::new(),
+            memory: null_reserved_memory(),
             stdout: Vec::new(),
+            scratch_arena: ScratchSlots::default(),
             frames: Vec::new(),
             call_args: Vec::new(),
             scratch: Vec::with_capacity(8),
@@ -717,8 +762,9 @@ pub fn run_kernel_f64(
         let mut interp = Interp {
             program,
             interner,
-            memory: Vec::new(),
+            memory: null_reserved_memory(),
             stdout: Vec::new(),
+            scratch_arena: ScratchSlots::default(),
             frames: Vec::new(),
             call_args: Vec::new(),
             scratch: Vec::with_capacity(8),
@@ -777,8 +823,9 @@ pub fn run_kernel_i8(
         let mut interp = Interp {
             program,
             interner,
-            memory: Vec::new(),
+            memory: null_reserved_memory(),
             stdout: Vec::new(),
+            scratch_arena: ScratchSlots::default(),
             frames: Vec::new(),
             call_args: Vec::new(),
             scratch: Vec::with_capacity(8),
@@ -818,11 +865,25 @@ pub fn run_kernel_i8(
     })
 }
 
+/// The interpreter's model of the scratch allocator (`scratch_<T>` / `scratch_mark` /
+/// `scratch_release`; the contract and the native arena are in `wukong_runtime::scratch`). The
+/// mark is the number of live scratch allocations — the same count native reports — and a
+/// released region becomes reusable by the next allocation made at its depth.
+#[derive(Default)]
+struct ScratchSlots {
+    /// One `(base slot, capacity in slots)` per live scratch allocation, oldest first.
+    live: Vec<(usize, usize)>,
+    /// `free[d]`: the region most recently released from depth `d`, if not yet reused.
+    free: Vec<Option<(usize, usize)>>,
+}
+
 struct Interp<'a, 'k> {
     program: &'a Program,
     interner: &'a Interner,
     memory: Vec<Value>,
     stdout: Vec<u8>,
+    /// The scratch allocations of this run (see [`ScratchSlots`]).
+    scratch_arena: ScratchSlots,
     /// Recycled register files, one per active call depth. Pooling them keeps recursion and
     /// call-heavy code from allocating a fresh vector on every call.
     frames: Vec<Vec<Value>>,
@@ -925,6 +986,11 @@ macro_rules! dim {
 }
 
 impl<'a, 'k> Interp<'a, 'k> {
+    /// Is `slot` the reserved null pointer of this run? See [`NULL_SLOT`] / [`NULL_SENTINEL`].
+    fn is_null(&self, slot: usize) -> bool {
+        slot == NULL_SLOT && self.memory.first() == Some(&NULL_SENTINEL)
+    }
+
     fn function_index(&mut self, symbol: Symbol) -> Option<usize> {
         self.function_indices
             .get_or_insert_with(|| symbol_indices(self.program.funcs.iter().map(|f| f.name)))
@@ -1256,6 +1322,9 @@ impl<'a, 'k> Interp<'a, 'k> {
             // load reads one. Both `gep` to the element address first.
             Op::Load(p, ty) => {
                 let idx = ptr(reg(regs, *p))?;
+                if self.is_null(idx) {
+                    return Err("null pointer dereference (load)".into());
+                }
                 if let MirType::Vec(lane, n) = ty {
                     let mut lanes = Vec::new();
                     lanes
@@ -1295,6 +1364,9 @@ impl<'a, 'k> Interp<'a, 'k> {
             }
             Op::Store { ptr: p, value } => {
                 let idx = ptr(reg(regs, *p))?;
+                if self.is_null(idx) {
+                    return Err("null pointer dereference (store)".into());
+                }
                 match reg(regs, *value) {
                     // A vector store scatters its lanes across contiguous scalar slots.
                     Value::VecRef(vi) => {
@@ -1687,6 +1759,13 @@ impl<'a, 'k> Interp<'a, 'k> {
             // low byte) until the NUL terminator, then render as UTF-8. Native renders the identical
             // bytes via `rt_print_str`, so the differential gate holds.
             "print_str" | "println_str" => {
+                // Native's `rt_print_str` returns without writing anything (not even the newline)
+                // for a null string. Slot 0 is the shared null now (`NULL_SLOT`), so mirror it.
+                if let Some(Value::Ptr(p)) = args.first().copied() {
+                    if self.is_null(p) {
+                        return Ok(Value::Unit);
+                    }
+                }
                 let mut bytes = Vec::new();
                 if let Some(Value::Ptr(base)) = args.first().copied() {
                     let mut i = base;
@@ -1717,6 +1796,21 @@ impl<'a, 'k> Interp<'a, 'k> {
                     Err("assertion failed".to_string())
                 }
             }
+            // `wukong_rt_bounds_fail(index, len, site)` — the failure edge of a checked slice access
+            // `s[i]` (`index <u len` was false). `site` is the `.rodata` `file:line:col` string the
+            // lowering attached. The message comes from the one formatter the JIT and the linked
+            // executable also use, so all three paths report the same text and stop at this point.
+            "wukong_rt_bounds_fail" => {
+                let index = args.first().map_or(0, |v| v.as_int()) as i64;
+                let len = args.get(1).map_or(0, |v| v.as_int()) as i64;
+                let site = match args.get(2).copied() {
+                    Some(Value::Ptr(base)) if !self.is_null(base) => {
+                        file_read_path(&self.memory, base)?
+                    }
+                    _ => String::new(),
+                };
+                Err(wukong_runtime::bounds_failure_message(index, len, &site))
+            }
             // `wukong_rt_alloc(count, elem_size, elem_is_float) -> ptr` — the heap allocation
             // backing the `alloc_<T>(n)` builtins. A heap object in the slot-indexed memory model
             // is exactly an alloca-shaped run: `count` contiguous typed-zero slots (one per scalar
@@ -1727,10 +1821,11 @@ impl<'a, 'k> Interp<'a, 'k> {
             // zero on both backends (the determinism contract).
             //
             // **Exhaustion.** The native `wukong_rt_alloc` returns null when the allocator cannot
-            // satisfy the request (crates/wukong_runtime/src/lib.rs). The interpreter cannot return
-            // null: its pointers are slot indices and index 0 is a perfectly ordinary live slot (the
-            // first allocation of a run), so `Value::Ptr(0)` would alias real memory and turn an
-            // out-of-memory condition into silent corruption. It reports a diagnostic instead —
+            // satisfy the request (crates/wukong_runtime/src/lib.rs). Slot 0 is now a reserved
+            // null (`NULL_SLOT`), so the interpreter *could* return the same null — but a null
+            // slice whose length field still says `count` would only move the failure to the first
+            // element access (a null dereference here, a segfault natively). It reports a
+            // diagnostic at the allocation instead —
             // `try_reserve` rather than `resize`, so the request never reaches Rust's allocation-
             // error handler, which `abort()`s the process with a raw `memory allocation of N bytes
             // failed` message no caller can catch. One element costs one 32-byte `Value` slot here
@@ -1774,6 +1869,70 @@ impl<'a, 'k> Interp<'a, 'k> {
             // interpreter; a use-after-free still reads the old values here while being undefined
             // on native — such programs are outside the differential contract (documented UB).
             "wukong_rt_free" => Ok(Value::Unit),
+            // `wukong_rt_scratch_alloc(count, elem_size, elem_is_float) -> ptr` — `scratch_<T>(n)`
+            // (the contract is in `wukong_runtime::scratch`). `count` typed-zero slots exactly like
+            // `wukong_rt_alloc`, counted as one live scratch allocation — a zero-length one too, as
+            // natively, so `scratch_mark()` agrees. The region released last from this depth is
+            // handed out again when it is large enough, re-zeroed as native re-zeroes its reused
+            // bytes, so a balanced `mark; scratch_…; release` loop reuses one region instead of
+            // growing the run's memory every iteration.
+            "wukong_rt_scratch_alloc" => {
+                let count = args.first().map(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+                let is_float = args.get(2).map(|v| v.as_int()).unwrap_or(0) != 0;
+                let zero = if is_float {
+                    Value::Float(0.0)
+                } else {
+                    Value::Int(0)
+                };
+                let depth = self.scratch_arena.live.len();
+                let reuse = self
+                    .scratch_arena
+                    .free
+                    .get_mut(depth)
+                    .and_then(Option::take)
+                    .filter(|&(_, cap)| cap >= count);
+                let (base, cap) = match reuse {
+                    Some(region) => region,
+                    None => {
+                        // The same ceiling and the same `try_reserve` guard as `wukong_rt_alloc`.
+                        const MAX_SLOTS: usize = 1 << 31;
+                        if count > MAX_SLOTS {
+                            return Err(format!(
+                                "interpreter heap exhausted allocating {count} element(s)"
+                            ));
+                        }
+                        let idx = self.memory.len();
+                        self.memory.try_reserve(count).map_err(|_| {
+                            format!("interpreter heap exhausted allocating {count} element(s)")
+                        })?;
+                        self.memory.resize(idx + count, zero);
+                        (idx, count)
+                    }
+                };
+                self.memory[base..base + count].fill(zero);
+                self.scratch_arena.live.push((base, cap));
+                Ok(Value::Ptr(base))
+            }
+            // `wukong_rt_scratch_mark() -> i64` — `scratch_mark()`: the live scratch-allocation
+            // count, the backend-independent value native's arena reports.
+            "wukong_rt_scratch_mark" => Ok(Value::Int(self.scratch_arena.live.len() as i128)),
+            // `wukong_rt_scratch_release(mark)` — `scratch_release(m)`: pop the allocations made
+            // after `mark`, each becoming the reusable region of its depth. A negative mark
+            // releases them all; a mark at or past the count releases nothing.
+            "wukong_rt_scratch_release" => {
+                let mark = args.first().map(|v| v.as_int()).unwrap_or(0).max(0);
+                let mark = usize::try_from(mark).unwrap_or(usize::MAX);
+                let arena = &mut self.scratch_arena;
+                while arena.live.len() > mark {
+                    let depth = arena.live.len() - 1;
+                    let region = arena.live.pop();
+                    if arena.free.len() <= depth {
+                        arena.free.resize(depth + 1, None);
+                    }
+                    arena.free[depth] = region;
+                }
+                Ok(Value::Unit)
+            }
             // `wukong_now_ns() -> i64` — the `now_ns()` timing intrinsic. Call the *same*
             // `wukong_runtime` clock the native backend links (a monotonic process-lifetime epoch),
             // so both backends read one clock. The value is inherently non-deterministic, but a
@@ -5330,6 +5489,7 @@ mod tests {
             interner: &interner,
             memory: Vec::new(),
             stdout: Vec::new(),
+            scratch_arena: ScratchSlots::default(),
             frames: Vec::new(),
             call_args: Vec::new(),
             scratch: Vec::new(),
@@ -5443,6 +5603,7 @@ mod tests {
             interner: &interner,
             memory: Vec::new(),
             stdout: Vec::new(),
+            scratch_arena: ScratchSlots::default(),
             frames: Vec::new(),
             call_args: Vec::new(),
             scratch: Vec::new(),
@@ -5665,6 +5826,7 @@ mod tests {
                                     .map(Value::Float)
                                     .collect(),
                                 stdout: Vec::new(),
+                                scratch_arena: ScratchSlots::default(),
                                 frames: Vec::new(),
                                 call_args: Vec::new(),
                                 scratch: Vec::new(),
@@ -6004,6 +6166,54 @@ mod tests {
         let main = interner.intern("main");
         assert!(run(&program, main, &interner).is_err());
     }
+
+    /// `NULL_SLOT` is reserved in every run: the first `alloca` of a run is not address 0, so a
+    /// pointer null test agrees with native (`inttoptr 0` is null there, and nothing else is). The
+    /// first case is the exact reproducer the `PtrToInt(p) != 0` lowering was reverted on at
+    /// 0900352 — `p` addresses the first local, which used to *be* slot 0 and read as null.
+    #[test]
+    fn address_zero_is_never_a_live_allocation() {
+        let lower = |src: &str| {
+            let mut interner = Interner::new();
+            let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+            assert!(pd.is_empty(), "parse: {pd:?}");
+            let (sema, sd) = wukong_sema::check(&module, &interner);
+            assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
+            let (program, ld) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+            assert!(ld.iter().all(|d| !d.is_error()), "lower: {ld:?}");
+            assert!(
+                wukong_mir::verify::verify_program(&program).is_empty(),
+                "a pointer condition must lower to verifier-clean MIR: {src}"
+            );
+            (program, interner)
+        };
+        let first_local = "fn main() -> i32 { let mut v: i32 = 7; let p: *mut i32 = &mut v; \
+                           if p { return 1; } return 0; }";
+        let (program, mut interner) = lower(first_local);
+        let main = interner.intern("main");
+        assert_eq!(run(&program, main, &interner), Ok(1));
+
+        let null = "fn main() -> i32 { let q: *mut i32 = 0 as *mut i32; \
+                    if q { return 1; } return 2; }";
+        let (program, mut interner) = lower(null);
+        let main = interner.intern("main");
+        assert_eq!(run(&program, main, &interner), Ok(2));
+
+        // Dereferencing the null is a diagnostic, not a read of the reserved sentinel slot.
+        let deref = "fn main() -> i32 { let q: *mut i32 = 0 as *mut i32; return *q; }";
+        let (program, mut interner) = lower(deref);
+        let main = interner.intern("main");
+        let err = run(&program, main, &interner).unwrap_err();
+        assert!(err.contains("null pointer dereference"), "{err}");
+
+        // A kernel-entry buffer is laid out after the reserved slot too.
+        let kernel = "fn k(mut a: [f32; 2]) { a[0] = a[0] + 1.0; a[1] = a[1] * 2.0; }";
+        let (program, mut interner) = lower(kernel);
+        let k = interner.intern("k");
+        let mut buf = [3.0f32, 5.0];
+        run_kernel_f32(&program, k, &mut [&mut buf], &interner).unwrap();
+        assert_eq!(buf, [4.0, 10.0]);
+    }
 }
 
 #[cfg(test)]
@@ -6017,3 +6227,6 @@ mod kernel_extent_marshalling_tests;
 
 #[cfg(test)]
 mod transfer_bounds_tests;
+
+#[cfg(test)]
+mod scratch_tests;

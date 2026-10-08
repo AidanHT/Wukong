@@ -53,6 +53,61 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `[f32; 32]` source and a `[f32; 16]` destination were two buffers by fiat. Parameters over the same
   element scalar now form one group whatever their declared lengths, unless a promise separates them.
 
+### Language safety (gap/lang-safety)
+
+- **A scratch allocator, and cache-line-aligned heap memory.** `scratch_<T>(n) -> []T` (the eight
+  `alloc_<T>` element types), `scratch_mark() -> i64` and `scratch_release(m)` expose a per-thread
+  LIFO bump arena for temporaries (`wukong_runtime::scratch`, in the spirit of Odin's temp allocator
+  and Zig's arena reset): zeroed, 64-byte-aligned slices whose memory is reused after a release, so
+  a kernel that needs a buffer per call stops paying a system allocation, a free and fresh-page
+  faults on every call. The mark is the count of live scratch allocations, so it is the same value
+  on the interpreter (which mirrors the count and reuses released regions), the JIT and a linked
+  executable (the `cc` fallback carries a C twin). `wukong_rt_alloc` now returns 64-byte-aligned
+  data (was 16), in the C fallback too. `tests/run/alloc_scratch_arena.wk` (every lane, derived by hand;
+  also in the AOT gate), runtime and sema unit tests.
+
+- **A runtime failure means one thing on every execution path.** `wukongc --run` now prints the
+  stdout a program produced before a failed `assert` or slice bounds check (then `error: …`, exit 1)
+  instead of discarding it, so it agrees with a linked executable, and the differential gate now
+  compares that output across the interpreter and the JIT (`wukong_interp::run_capturing`,
+  `JitProgram::run_capturing`, `jit_run_capturing`). Failure-capable `@parallel` region bodies are
+  no longer a native compile error ("assertion-capable callback … requires a cancellation ABI"):
+  the guarded JIT binds `wukong_parallel_for` to `rt_parallel_for`, which keeps each span's
+  failure in a per-thread slot, skips spans after an already-failed one, and reports the failure of
+  the lowest-starting failed span — the failure the in-order interpreter reports — to a caller that
+  then returns at once. The raw `jit_module` API accepts assertions with abort-on-failure semantics,
+  as it already did for bounds checks. `tests/run/assert_fail_trailing_output.wk`, added with
+  `slice_bounds_oob.wk` to the `exe.rs` AOT gate.
+
+- **Bounds-check elimination (`wukong_opt::bce`, `-O2`).** An innermost counted loop whose slice
+  checks are provable is versioned on a preheader guard: `start < end`, then per check
+  `lo <=u hi && hi <u len` at the two ends of an index of the form `±iv + invariant` (sound under
+  wrapping arithmetic), with each slice length shown stable by `alias` plus Wukong's no-punning
+  rule. The check-free copy runs when every guard passes — and is then a single-exit loop the
+  vectorizer accepts — while the original, checked loop runs otherwise and fails at exactly the same
+  iteration. A caller-owned header is read early only behind the guards of the checks that precede
+  it. Unit tests in `bce.rs` compare -O0 and -O2 results and diagnostics, in and out of range.
+
+- **Slice accesses are bounds-checked.** `s[i]` on a `[]T` now compares `i` against the length in
+  the slice's own fat pointer (`i <u len`, so a negative index fails too) and, out of range, stops
+  with `error: index out of bounds: the len is N but the index is I at file.wk:line:col`, exit 1 —
+  the same text and the same stopping point on the interpreter, the Cranelift JIT and a linked
+  executable (`wukong_rt_bounds_fail`; one formatter in `wukong_runtime::safety`, mirrored by the C
+  fallback shim). The site is attached by the new `wukong_mir_build::lower_program_located`, which
+  the driver calls with its source map. `@unchecked` on a function is the explicit opt-out. Before
+  this, an out-of-range slice index read or wrote past the buffer natively (classic UB) while the
+  interpreter reported `load out of bounds`. `tests/run/slice_bounds_{oob,negative,in_range}.wk`.
+
+- **A pointer condition is a null test, and the interpreter has a real null.** The interpreter
+  reserves slot 0 at every entry point (`wukong_interp::NULL_SLOT`), so `0 as *T` is the same null
+  on both backends and a load/store through it is the diagnostic `null pointer dereference`. `if p`,
+  `while p` and `p && q` on a pointer now lower to `ptrtoint p != 0` instead of reaching `cond_br`
+  as a raw pointer and failing verification with no span (the lowering reverted at `0900352` is now
+  sound). mem2reg promotes every pointer slot, materializing `inttoptr 0` on a read-before-write
+  path, so a pointer local initialized behind a branch no longer stays in memory. An aggregate,
+  slice, tensor, vector or function-valued condition is now `E0401` rather than a verifier ICE.
+  `tests/run/pointer_null_condition.wk`, `tests/fail/condition_aggregate.wk`.
+
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
 - **Gate added: every recognizer-dependent corpus program is held to its own generic lowering.**

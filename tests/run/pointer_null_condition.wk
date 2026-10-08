@@ -1,0 +1,74 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 30
+// EXPECT-OUT: 5
+module tests.run.pointer_null_condition
+
+// A pointer used as a condition is a null test: `if p` means `p != null`, on every backend and at
+// every -O level. Before the interpreter reserved slot 0 as a never-allocated null, `if p` reached
+// `cond_br` as a raw pointer and both backends rejected it with unspanned verifier text; the
+// `PtrToInt(p) != 0` lowering that would have fixed it was reverted at 0900352 because the first
+// local of a run lived at interpreter slot 0 and so read as null (the first case below printed 0
+// under the interpreter and 1 natively).
+//
+// Expected values are the plain scalar semantics, derived by hand: the address of a live local is
+// non-null (1); `0 as *T` is null (0); `p` is assigned `&mut v` on the third iteration, so the
+// final test dereferences v = 3 and returns 3 * 10 = 30; the `while p` loop runs until the fifth
+// iteration nulls `p`, so k = 5. The third case also exercises mem2reg promoting a pointer local
+// whose first store sits behind a branch (it now gets a null on the unwritten path).
+
+fn first_local_is_not_null() -> i32 {
+    let mut v: i32 = 7;
+    let p: *mut i32 = &mut v;
+    if p {
+        return 1;
+    }
+    return 0;
+}
+
+fn null_is_false() -> i32 {
+    let q: *mut i32 = 0 as *mut i32;
+    if q {
+        return 1;
+    }
+    return 0;
+}
+
+fn conditionally_assigned() -> i32 {
+    let mut v: i32 = 3;
+    let mut n: i32 = 0;
+    let mut p: *mut i32 = 0 as *mut i32;
+    while n < 4 {
+        if n == 2 {
+            p = &mut v;
+        }
+        n = n + 1;
+    }
+    if p {
+        return *p * 10;
+    }
+    return 0;
+}
+
+fn while_pointer() -> i32 {
+    let mut v: i32 = 3;
+    let mut p: *mut i32 = &mut v;
+    let mut k: i32 = 0;
+    while p {
+        k = k + 1;
+        if k == 5 {
+            p = 0 as *mut i32;
+        }
+    }
+    return k;
+}
+
+fn main() -> i32 {
+    print(first_local_is_not_null());
+    print(null_is_false());
+    print(conditionally_assigned());
+    print(while_pointer());
+    return 0;
+}

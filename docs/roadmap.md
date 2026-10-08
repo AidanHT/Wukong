@@ -22,8 +22,11 @@ checked-but-not-executed, and what is planned — so expectations match reality.
 ## Works end to end (interpreter `--run`, **and native code** `--backend=native`)
 
 The MIR interpreter and **Cranelift native backend** execute the supported language subset.
-Corpus differential tests compare outputs across optimization levels. Unsupported constructs,
-assertion-output differences, and C-link fallback output remain documented limitations.
+Corpus differential tests compare outputs across optimization levels. Unsupported constructs and
+C-link fallback output remain documented limitations. A runtime failure (a failed `assert`, a slice
+index out of bounds) stops the program at the same statement on every path — interpreter, JIT,
+linked executable, and inside a `@parallel` region (the earliest failing iteration is reported) —
+keeping the output printed before it, with exit status 1 (`tests/run/assert_fail_trailing_output.wk`).
 Cranelift provides JIT execution with `--run --backend=native` and object/exe output with
 `--emit=obj|exe`, with **no LLVM toolchain required**. See `BENCHMARKS.md` for cross-language numbers.
 
@@ -131,8 +134,8 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   call site (`let s: []T = arr` / `f(arr)`). A write through the slice aliases the backing array. The
   16-byte fat pointer is a by-pointer aggregate the two backends address identically, so interp ==
   native bit-for-bit and -O0 == -O3 (`tests/run/slice_basics.wk`). The element types must match on
-  the unsizing coercion, and a scalar passed where a slice is expected is E0401; slice indexing is a
-  runtime-length view (unchecked, like a pointer — a slice has no static length to bounds-check).
+  the unsizing coercion, and a scalar passed where a slice is expected is E0401; slice indexing is
+  checked against the runtime length in the fat pointer (see *Slice accesses are bounds-checked*).
 - **Heap allocation (v1)** — `alloc_<T>(n) -> []T` and `free(s)`: the first *runtime-sized* buffers
   (every other buffer is a fixed-size stack array). The surface is the typed per-scalar family
   `alloc_f32`/`f64`/`i32`/`i64`/`i8`/`u8`/`f16`/`bf16` (chosen over a generic `alloc<T>` — sema types
@@ -155,6 +158,20 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   emits `wukong_vmath_f32`, and velem / GEMM / reduction nests over slices dispatch too. What still
   declines on a slice base is the *general* auto-vectorizer — the same loop written over slices emits
   no vector ops where the fixed-array form does (a future perf lever, correctness unaffected).
+  Native heap data is **64-byte aligned** (the runtime's `HEAP_ALIGN`, mirrored by the `cc`
+  fallback shim), not the system allocator's 16.
+- **Scratch allocation** — `scratch_<T>(n) -> []T`, `scratch_mark() -> i64`,
+  `scratch_release(m)`: a per-thread bump arena for temporaries (`wukong_runtime::scratch`), the
+  temporary-storage design of Odin/Jai/Zig. Zeroed, 64-byte-aligned slices; the mark is the count of
+  live scratch allocations (identical on every backend); a release pops everything allocated after
+  its mark, LIFO, and the bytes are reused (and re-zeroed) by the next allocations, so a balanced
+  per-call `mark; scratch_…; release` stops allocating after its first call. Chunks never move and
+  grow geometrically. The interpreter mirrors the count and reuses a released region at the same
+  depth, so its memory stays bounded too. Lowered to opaque `wukong_rt_scratch_{alloc,mark,release}`
+  calls like the heap builtins; misuse is E0401/E0503; use after release is undefined on native,
+  like use after `free` (`tests/run/alloc_scratch_arena.wk`, also in the AOT gate). Not yet: an
+  uninitialized variant, an arena handle a program can pass around, and `@align(N)` (still parsed
+  and discarded — every heap and scratch allocation is already 64-byte aligned).
 - **Typed file I/O** — `read_<T>(path, buf) -> i64` and `write_<T>(path, buf) -> i64` over the dtypes
   {`f32`, `f64`, `i32`, `i64`, `i8`, `u8`}, where `path` is a `*u8` string literal and `buf` a `[]T`
   slice (typically from `alloc_<T>`). The on-disk format is frozen and **headerless: raw contiguous
@@ -936,12 +953,13 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   The MIR shows the cause directly: `v0 = alloca ptr` then `v2 = load ptr v0` — a load of a slot
   nothing ever stored. The interpreter's own `-O0`/`-O2` disagreement is an opt-invariance violation
   the gate cannot see, because until now no corpus program used a `Tensor` local at all.
-  **Null-initializing the slot is not the fix** — interpreter address 0 is a valid address (reverted
-  `PtrToInt(p) != 0` attempt, `0900352`), so a null handle is undetectable there and would trade a crash for a
-  silent wrong answer. Giving the local backing storage is not the fix either: whole-value assignment
-  to a view rebinds the handle, and a buffer-typed slot would have to copy. The fix is a
-  **definite-assignment rule** for pointer-backed locals, which is a language feature and belongs
-  with the Phase 7 work, not a patch at the lowering.
+  The interpreter half of this is fixed: slot 0 is now a reserved null (`wukong_interp::NULL_SLOT`),
+  so the unstored handle is a genuine null at every level and the interpreter reports
+  `null pointer dereference (store)` at both `-O0` and `-O2` instead of disagreeing with itself.
+  Native still faults on the null store. Giving the local backing storage is not the fix: whole-value
+  assignment to a view rebinds the handle, and a buffer-typed slot would have to copy. The remaining
+  fix is a **definite-assignment rule** for pointer-backed locals, which is a language feature and
+  belongs with the Phase 7 work, not a patch at the lowering.
 
 - `bf16` **and** `f16` are both real 2-byte storage (round-to-nearest-even), f32 compute, with a full
   symmetric mixed-precision op suite (reductions, max-family, axpby, activations — see above) **and a
@@ -1049,30 +1067,33 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   `while (i < n)`), not Rust-style range capture: mutating `n` inside the body changes the remaining
   iteration count. Defensible for a low-level kernel language, but worth knowing. A descending range
   with a negative step runs zero iterations (the condition stays `i < hi`).
-- No **runtime** bounds checking on array indexing (manual memory is a decided constraint). A
+- **Slice accesses are bounds-checked at runtime** (default on; `@unchecked` on a function opts it
+  out). `s[i]` is compared against the length in the slice's fat pointer, and an out-of-range access
+  stops the program with `error: index out of bounds: the len is N but the index is I at
+  file:line:col`, exit 1, identically on the interpreter, the JIT and a linked executable
+  (`tests/run/slice_bounds_*.wk`). `-O2` removes the checks from innermost counted loops by
+  versioning them on a preheader guard (`wukong_opt::bce`); a loop with a call, a `break`, a
+  non-affine index or a header written inside it keeps them. Still unchecked: a **runtime** index into a fixed-size array
+  or a constant-shape tensor (the static length is known, so this is the same machinery with a
+  constant bound — not yet wired), and the extents a recognized kernel call reads. A
   **compile-time-constant** index past the end is still caught at compile time (`E0501`) — for both a
   fixed-size array (`a[5]` on a `[T; 4]`) and a static tensor dimension (`a[5, 0]` on a
-  `Tensor[f32, 2, 2]`); runtime/computed indices remain unchecked. On such an out-of-bounds access the
-  backends differ: the interpreter (the oracle) *traps* on an index it can detect as out of range (a
+  `Tensor[f32, 2, 2]`). On an unchecked out-of-bounds access the backends differ: the interpreter (the oracle) *traps* on an index it can detect as out of range (a
   debugging aid — its memory is a bounded slot vector), while the native backend reads/writes past the
   buffer, classic UB like C (and an optimization level can even change the garbage observed). An
   out-of-bounds program is therefore outside the defined contract — the differential gate's bit-for-bit
   `interp == native` and `-O0 == -O3` invariants hold only for well-defined programs.
-- `mem2reg` promotes scalar integer, float **and pointer** slots. A pointer slot qualifies only when
-  it is provably written before it is read: the first access inside its own `alloca`'s block must be
-  a store, and that block must be the entry block or have an empty dominance frontier. That covers
-  every pointer-typed *parameter* (`*T`, `&T`, and every `Tensor[…]`, all of which lower to one MIR
-  `ptr`) — the case that matters, since the front end otherwise re-loads the base pointer from its
-  stack slot at every element access — including after `-O2` inlining has spliced a callee's entry
-  block into the middle of a caller block. A pointer local whose `alloca` and initializing store are
-  separated by a branch keeps its slot: promoting it would need a typed "undefined" pointer for the
-  read-before-write path, and there is no sound one (`inttoptr 0` is a genuine null natively but a
-  *valid, addressable* slot in the interpreter). At `-O2`, `sroa` first splits an array, struct or
-  tuple local whose every access is at a constant position into scalar leaf slots, which mem2reg then
-  promotes. Arrays indexed by a computed index, vectors, address-taken locals of any type, and any
-  slot accessed at a width other than its own stay in memory (the interpreter and `cse`/`dse` handle
-  those directly); a loop-invariant cell of one that a loop both reads and writes is still carried in
-  a register by `promote` when nothing else in the loop may alias it.
+- `mem2reg` promotes scalar integer, float **and pointer** slots. A pointer slot read before it is
+  written on some path gets the null pointer (`inttoptr 0`) there, exactly what the interpreter's
+  zero-initialized slot holds now that it reserves address 0 as a never-allocated null
+  (`wukong_interp::NULL_SLOT`); before that reservation only definitely-initialized pointer slots
+  could be promoted, and a pointer local initialized behind a branch kept its slot. At `-O2`, `sroa`
+  first splits an array, struct or tuple local whose every access is at a constant position into
+  scalar leaf slots, which mem2reg then promotes. Arrays indexed by a computed index, vectors,
+  address-taken locals of any type, and any slot accessed at a width other than its own stay in
+  memory (the interpreter and `cse`/`dse` handle those directly); a loop-invariant cell of one that a
+  loop both reads and writes is still carried in a register by `promote` when nothing else in the
+  loop may alias it.
 - A **`[]T` slice parameter still re-loads its data pointer at every element access** unless it is
   `@noalias` or the loop only reads. A slice is a 16-byte `{ data, len }` fat pointer passed *by
   address*, so the base comes from `load ptr (gep <param>, 0)` — a load out of caller-owned memory,

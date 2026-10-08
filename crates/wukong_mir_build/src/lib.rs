@@ -27,6 +27,7 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 mod alias;
+mod bounds;
 mod canon;
 mod noalias;
 mod tile;
@@ -46,7 +47,8 @@ use wukong_mir::{
     RoundMode, ValueId, VecBin, VecCmp, VecKernel, VecOp, VecRedOp, VecReduce,
 };
 use wukong_sema::{
-    heap_alloc_elem, is_now_ns, is_sync_block, DefKind, EnumVariant, SemaResult, VariantPayload,
+    heap_alloc_elem, is_now_ns, is_scratch_mark, is_scratch_release, is_sync_block,
+    scratch_alloc_elem, DefKind, EnumVariant, SemaResult, VariantPayload,
 };
 use wukong_span::{Interner, Span, Symbol};
 use wukong_types::Ty;
@@ -964,11 +966,29 @@ pub fn lower_program(
 /// [`lower_program`] with the construction knobs spelled out. Separate entry point rather than a
 /// fourth parameter on `lower_program`, because ~20 call sites across the workspace (the optimizer's
 /// examples, both benches, every backend's tests) want the defaults and should not have to say so.
+///
+/// Runtime safety failures (a slice index out of bounds) carry no source location through this
+/// entry point; [`lower_program_located`] attaches one.
 pub fn lower_program_with(
     module: &Module,
     sema: &SemaResult,
     interner: &mut Interner,
     opts: LowerOptions,
+) -> (Program, Vec<Diagnostic>) {
+    lower_program_located(module, sema, interner, opts, &|_| String::new())
+}
+
+/// [`lower_program_with`], plus the source location every runtime safety failure reports.
+/// `locate` renders a span start as `file:line:col` (an empty string means "unknown"); the driver
+/// passes its source map's view, so an out-of-bounds slice access prints where it happened on the
+/// interpreter, the JIT and a linked executable alike. A separate entry point for the same reason
+/// `lower_program_with` is one: only the driver has a source map to offer.
+pub fn lower_program_located(
+    module: &Module,
+    sema: &SemaResult,
+    interner: &mut Interner,
+    opts: LowerOptions,
+    locate: &dyn Fn(Span) -> String,
 ) -> (Program, Vec<Diagnostic>) {
     // Two AST normalizations run back to back, before anything looks at the tree, because every
     // kernel recognizer and the autovectorizer match a *syntactic* shape on the raw AST.
@@ -1158,6 +1178,9 @@ pub fn lower_program_with(
         attn: interner.intern("wukong_attention_f32"),
         rt_alloc: interner.intern("wukong_rt_alloc"),
         rt_free: interner.intern("wukong_rt_free"),
+        rt_scratch_alloc: interner.intern("wukong_rt_scratch_alloc"),
+        rt_scratch_mark: interner.intern("wukong_rt_scratch_mark"),
+        rt_scratch_release: interner.intern("wukong_rt_scratch_release"),
         rt_read_f32: interner.intern("wukong_rt_read_f32"),
         rt_read_i32: interner.intern("wukong_rt_read_i32"),
         rt_read_i64: interner.intern("wukong_rt_read_i64"),
@@ -1171,6 +1194,9 @@ pub fn lower_program_with(
         rt_write_f64: interner.intern("wukong_rt_write_f64"),
         rt_write_i8: interner.intern("wukong_rt_write_i8"),
         now_ns: interner.intern("wukong_now_ns"),
+        bounds_fail: interner.intern("wukong_rt_bounds_fail"),
+        // Overwritten per function by `@unchecked`, below; checked is the default.
+        bounds_checks: true,
     };
     // Collect every concrete instantiation of every type-generic function (needs `&mut interner` to
     // intern the instance names), then lower the module. A type-generic function is NOT lowered here
@@ -1218,6 +1244,17 @@ pub fn lower_program_with(
             _ => None,
         })
         .collect();
+    // Functions carrying `@unchecked`: the slice bounds-check opt-out. Keyed by name for the same
+    // reason as `generic_fns` — the instance loop below has only the template's symbol.
+    let unchecked_fns: HashSet<Symbol> = module
+        .items
+        .iter()
+        .filter(|item| has_attr(item, interner, "unchecked"))
+        .filter_map(|item| match &item.kind {
+            ast::ItemKind::Fn(f) => Some(f.name.sym),
+            _ => None,
+        })
+        .collect();
     let fn_tiles: HashMap<Symbol, Vec<u64>> = module
         .items
         .iter()
@@ -1244,6 +1281,8 @@ pub fn lower_program_with(
                 // takes, because the switch rides on that struct and it is copied down into every
                 // recognizer and probe from here.
                 let gemm = generic_gemm(gemm, generic_fns.contains(&f.name.sym));
+                // `@unchecked`: lower this function's slice accesses without bounds checks.
+                let gemm = unchecked_gemm(gemm, unchecked_fns.contains(&f.name.sym));
                 // Whole-program aliasing, stamped on beside the `@generic` opt-out: `false` here
                 // means some call site in this program can hand two of this function's buffer
                 // parameters the same array, so no recognizer inside it may emit a kernel whose
@@ -2005,6 +2044,7 @@ pub fn lower_program_with(
         if let Some((f, body)) = fn_decls.get(orig) {
             // A `@generic` template's instances inherit the opt-out (keyed on the ORIGINAL name).
             let gemm = generic_gemm(gemm, generic_fns.contains(orig));
+            let gemm = unchecked_gemm(gemm, unchecked_fns.contains(orig));
             // Aliasing is a property of the ORIGINAL function's call sites: every instantiation of
             // a type-generic template shares them.
             let gemm = alias_gemm(gemm, alias_facts.alias_free(*orig));
@@ -2028,6 +2068,8 @@ pub fn lower_program_with(
     // The outlined bodies of every mid-function `@parallel` loop region, collected while lowering
     // the functions above. Appended last — backends resolve functions by name, so order is free.
     program.funcs.append(&mut par_regions.funcs);
+    // Give every slice bounds failure its `file:line:col` (a `.rodata` string; see `bounds.rs`).
+    bounds::attach_sites(&mut program, interner, gemm.bounds_fail, locate);
     (program, diags)
 }
 
@@ -2053,6 +2095,21 @@ fn has_generic_attr(item: &ast::Item, interner: &Interner) -> bool {
 /// the way down. See `alias.rs`.
 fn alias_gemm(gemm: GemmSyms, alias_free: bool) -> GemmSyms {
     GemmSyms { alias_free, ..gemm }
+}
+
+/// Does this item carry the attribute `@name`? `wukong_sema::attrs` has already checked placement.
+fn has_attr(item: &ast::Item, interner: &Interner, name: &str) -> bool {
+    item.attrs
+        .iter()
+        .any(|a| interner.resolve(a.name.sym) == name)
+}
+
+/// `gemm` with slice bounds checks cleared when the function being lowered is `@unchecked`.
+fn unchecked_gemm(gemm: GemmSyms, is_unchecked: bool) -> GemmSyms {
+    GemmSyms {
+        bounds_checks: gemm.bounds_checks && !is_unchecked,
+        ..gemm
+    }
 }
 
 /// `gemm` with recognition cleared when the function being lowered is `@generic`. Per-function
@@ -3311,6 +3368,12 @@ struct GemmSyms {
     /// backing the `alloc_<T>(n)` builtins, and its `wukong_rt_free(data)` release twin.
     rt_alloc: Symbol,
     rt_free: Symbol,
+    /// The scratch allocator behind `scratch_<T>(n)` / `scratch_mark()` / `scratch_release(m)`
+    /// (`wukong_runtime::scratch`): `wukong_rt_scratch_alloc` shares `wukong_rt_alloc`'s ABI,
+    /// `wukong_rt_scratch_mark() -> i64`, `wukong_rt_scratch_release(mark: i64)`.
+    rt_scratch_alloc: Symbol,
+    rt_scratch_mark: Symbol,
+    rt_scratch_release: Symbol,
     /// The 12 raw file-I/O runtime entry points (`wukong_rt_{read,write}_{f32,i32,i64,u8,f64,i8}`)
     /// backing the `read_<T>(path, buf)` / `write_<T>(path, buf)` builtins. Each takes `(path: *const
     /// u8, data: *T, len: i64)` and returns an `i64`: the element count on success, or -1 (open/create
@@ -3331,6 +3394,12 @@ struct GemmSyms {
     /// nanosecond clock for in-process benchmarking. No arguments; both backends read the same
     /// clock (the interpreter calls `wukong_runtime::wukong_now_ns` directly).
     now_ns: Symbol,
+    /// The failure edge of a checked slice access: `wukong_rt_bounds_fail(index: i64, len: i64,
+    /// site: *u8)`, which never returns normally (see `bounds.rs`).
+    bounds_fail: Symbol,
+    /// Emit slice bounds checks (`true`, the default). Cleared per function by `@unchecked`, at the
+    /// same place `@generic` clears `recognize`; it rides here for the same reason that does.
+    bounds_checks: bool,
 }
 
 // Elementwise-math op codes — must match `wukong_runtime::vmath`'s `VM_*` (mir_build does not depend
@@ -18877,18 +18946,28 @@ impl FnLowerer<'_> {
             // unaffected.
             let zero = self.builder.build(ty.clone(), Op::ConstInt(0, ty.clone()));
             self.builder.build(MirType::I1, Op::Cmp(CmpOp::Ne, v, zero))
+        } else if ty == MirType::Ptr
+            && matches!(self.expr_ty(cond), Ty::Ptr { .. } | Ty::Ref { .. })
+        {
+            // A **pointer** condition (`if p`, `while p`, `p && q`) is a null test: `p != null`.
+            // This lowering was tried once and reverted (0900352) because the interpreter's first
+            // allocation lived at slot 0 and so read as null (`let p = &mut v; if p` printed 0
+            // there and 1 natively). The interpreter now reserves slot 0 as a never-allocated
+            // null (`wukong_interp::NULL_SLOT`), so `PtrToInt(p) == 0` holds on both backends for
+            // exactly the null pointer (`0 as *T`, a failed native allocation) and for nothing
+            // else. Before this the pointer reached `cond_br` unchanged and both backends rejected
+            // it with raw, unspanned verifier text.
+            let bits = self
+                .builder
+                .build(MirType::I64, Op::Cast(CastKind::PtrToInt, v, MirType::I64));
+            let zero = self
+                .builder
+                .build(MirType::I64, Op::ConstInt(0, MirType::I64));
+            self.builder
+                .build(MirType::I1, Op::Cmp(CmpOp::Ne, bits, zero))
         } else {
-            // NOTE: a **pointer** condition (`if p`) still falls through here unchanged and both
-            // backends reject it with raw verifier text and no span ("cond_br condition: v2 has
-            // type ptr but expected i1"). A `PtrToInt(p) != 0` lowering was tried and reverted: it
-            // is *silently wrong in the interpreter*, whose addresses are slot indices starting at
-            // 0, so the first pointer taken in a function has address 0 and reads as null. `let mut
-            // v: i32 = 7; let p = &mut v; if p` printed 0 under the interpreter and 1 natively —
-            // trading a loud ICE for a silent interp/native divergence, the worse failure. A
-            // correct lowering needs a null test the two backends genuinely share (a dedicated
-            // `IsNull` op, or the interpreter reserving address 0 as never-allocated), not a
-            // comparison on `PtrToInt`.
-
+            // Any other non-scalar condition is rejected by sema's `check_condition`; pass the
+            // value through so a path that slipped past it still fails loudly in the verifier.
             v
         }
     }
@@ -19471,14 +19550,22 @@ impl FnLowerer<'_> {
                 // For a slice `s[i]`, the GEP base is the slice's *data* pointer — loaded from the fat
                 // pointer's offset 0 — not the 16-byte fat-pointer buffer itself. An array/pointer base
                 // GEPs off its own base directly.
+                let mut slice_buf = None;
                 let base_ptr = if matches!(base_ty, Ty::Slice(_)) {
                     let sbuf = self.place_base_ptr(base);
+                    slice_buf = Some(sbuf);
                     let dp = self.field_ptr(sbuf, SLICE_PTR_OFF);
                     self.builder.build(MirType::Ptr, Op::Load(dp, MirType::Ptr))
                 } else {
                     self.place_base_ptr(base)
                 };
                 let idx = self.lower_index_i64(&indices[0]);
+                // A slice's length is in its own fat pointer: check `idx <u len` before the access
+                // (base, then index, then the check — the order Rust evaluates `s[i]` in). Arrays
+                // and constant-shape tensors are checked statically; see `bounds.rs`.
+                if let Some(sbuf) = slice_buf {
+                    self.emit_slice_bounds_check(sbuf, idx, e.span);
+                }
                 // Prefer the element type from the base's array/slice type; fall back to the indexed
                 // expression's own type (tensors/pointers). Resolve through the registry-aware
                 // `mir_ty_of` so a struct/tuple element becomes its byte-buffer `Array` type (the GEP
@@ -21003,8 +21090,38 @@ impl FnLowerer<'_> {
     /// fat pointer's data field and emits a void `wukong_rt_free(data)`. Both are opaque
     /// `Op::Call`s to the optimizer, which treats calls conservatively (no CSE/DSE/LICM across
     /// them), so allocation identity and stores into the allocation are preserved.
+    ///
+    /// The scratch family lowers the same way: `scratch_<T>(n)` is the identical slice construction
+    /// around `wukong_rt_scratch_alloc` (same ABI as `wukong_rt_alloc`), `scratch_mark()` is a
+    /// `wukong_rt_scratch_mark() -> i64` call and `scratch_release(m)` a void
+    /// `wukong_rt_scratch_release(m as i64)`. Opaque calls again, so nothing moves across them.
     fn lower_heap_builtin(&mut self, name: Symbol, args: &[Expr]) -> Option<ValueId> {
         let nm = self.interner.resolve(name);
+        if is_scratch_mark(nm) {
+            if !args.is_empty() {
+                return None;
+            }
+            let func = self.gemm.rt_scratch_mark;
+            return Some(
+                self.builder
+                    .build(MirType::I64, Op::Call { func, args: vec![] }),
+            );
+        }
+        if is_scratch_release(nm) {
+            if args.len() != 1 {
+                return None;
+            }
+            let mty = self.expr_mir(&args[0]);
+            let signed = self.signed(&args[0]);
+            let mv = self.lower_expr(&args[0]);
+            let mark = self.coerce_to(mv, &mty, &MirType::I64, signed);
+            let func = self.gemm.rt_scratch_release;
+            self.builder.build_void(Op::Call {
+                func,
+                args: vec![mark],
+            });
+            return Some(self.const_zero(MirType::I32));
+        }
         if nm == "free" {
             // Sema guarantees a single slice argument (E0401/E0503 otherwise); decline anything
             // else so the generic unsupported-call path reports it rather than miscompiling.
@@ -21021,7 +21138,10 @@ impl FnLowerer<'_> {
             });
             return Some(self.const_zero(MirType::I32));
         }
-        let elem = heap_alloc_elem(nm)?;
+        let (elem, func) = match heap_alloc_elem(nm) {
+            Some(elem) => (elem, self.gemm.rt_alloc),
+            None => (scratch_alloc_elem(nm)?, self.gemm.rt_scratch_alloc),
+        };
         if args.len() != 1 {
             return None;
         }
@@ -21048,7 +21168,6 @@ impl FnLowerer<'_> {
             MirType::I64,
             Op::ConstInt(elem.is_float() as i128, MirType::I64),
         );
-        let func = self.gemm.rt_alloc;
         let data = self.builder.build(
             MirType::Ptr,
             Op::Call {
@@ -31258,6 +31377,28 @@ mod tests {
 
     fn prog_calls(prog: &Program, interner: &Interner, callee: &str) -> bool {
         prog.funcs.iter().any(|f| fn_calls(f, interner, callee))
+    }
+
+    /// The consumer of `@unchecked`: a slice access is lowered with its bounds check (a failure edge
+    /// calling `wukong_rt_bounds_fail`) by default, and without one in a function carrying the
+    /// attribute -- and only in that function. A `tests/run` fixture cannot witness this (an
+    /// in-range access prints the same either way), so the lowered MIR is the evidence.
+    #[test]
+    fn unchecked_removes_slice_bounds_checks_from_its_own_function_only() {
+        let (prog, diags, mut interner) = lower(
+            "fn checked(s: []i32, i: i64) -> i32 { return s[i]; }
+             @unchecked
+             fn raw(s: []i32, i: i64) -> i32 { return s[i]; }
+             fn main() -> i32 { let a: [i32; 2] = [3, 4]; return checked(a, 1) + raw(a, 0); }",
+        );
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        let checked = prog.function(interner.intern("checked")).unwrap();
+        let raw = prog.function(interner.intern("raw")).unwrap();
+        assert!(fn_calls(checked, &interner, "wukong_rt_bounds_fail"));
+        assert!(!fn_calls(raw, &interner, "wukong_rt_bounds_fail"));
+        for f in &prog.funcs {
+            assert!(verify_function(f).is_empty(), "{:?}", verify_function(f));
+        }
     }
 
     /// [`lower`] with explicit [`LowerOptions`].

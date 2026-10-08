@@ -70,10 +70,11 @@ truth source.
 - **`MirLevel` is NOT an invariant** — do not write `if program.level == MirLevel::High`. Every
   `Program` starts at `Low`; nothing reads `level` in the pipeline.
 - **`Round(Nearest)` is ties-to-EVEN** — interpreter must use `round_ties_even()`, not `round()`.
-- **Pointer truthiness** — interpreter addresses are slot indices starting at **0** (address 0 is
-  valid). A `PtrToInt(p) != 0` lowering was tried in `mir_build` and reverted (`lib.rs:16443`): it
-  traded a loud verifier ICE for silent interp/native divergence. No shared null test exists today —
-  a correct fix needs a dedicated `IsNull` op or reserving address 0 in the interpreter.
+- **Pointer truthiness** — `if p` lowers to `ptrtoint p != 0`. That is sound only because the
+  interpreter reserves slot 0 as a never-allocated null (`wukong_interp::NULL_SLOT`); before that
+  reservation the first allocation of a run had address 0 and the same lowering was reverted
+  (0900352) as a silent interp/native divergence. Any new interpreter entry point must keep the
+  reservation.
 - **Recipe buffer capacity** — opaque pointer operands do not carry lengths; verification checks
   recipe indices but does not prove that call-site pointer/scalar buffers are large enough.
 - **Release verification is opt-in per pass** — use `--verify-each`; default release compilation

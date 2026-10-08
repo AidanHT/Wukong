@@ -190,10 +190,10 @@ impl wukong_opt::Pass for Counted {
     }
 }
 
-/// Slot layout of the attribution table: the thirteen standard `-O2` passes in pipeline order, then
+/// Slot layout of the attribution table: the fourteen standard `-O2` passes in pipeline order, then
 /// the two whole-program stages, then the cleanup pipeline's five passes (kept separate because they
 /// run under a different driver instance and belong to the unrolling stage's cost).
-const STANDARD: usize = 13;
+const STANDARD: usize = 14;
 const SLOT_INLINE: usize = STANDARD;
 const SLOT_UNROLL: usize = STANDARD + 1;
 const SLOT_CLEANUP: usize = STANDARD + 2;
@@ -226,8 +226,9 @@ fn attributed_standard() -> wukong_opt::PassManager {
     pm.add(counted_pass(8, Box::new(LoopCanon)));
     pm.add(counted_pass(9, Box::new(LoopDelete)));
     pm.add(counted_pass(10, Box::new(Licm)));
-    pm.add(counted_pass(11, Box::new(Promote)));
-    pm.add(counted_pass(12, Box::new(Vectorize::default())));
+    pm.add(counted_pass(11, Box::new(Bce)));
+    pm.add(counted_pass(12, Box::new(Promote)));
+    pm.add(counted_pass(13, Box::new(Vectorize::default())));
     pm
 }
 

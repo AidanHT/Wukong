@@ -241,8 +241,11 @@ impl Sema<'_> {
                 // here (like the math intrinsics) so `let s = alloc_f32(n)` infers `[]f32` and the
                 // slice composes with the existing machinery (`s[i]`, `s.len()`, `for x in s`,
                 // call-site passing). Misuse is rejected with the standard arity/type codes —
-                // mir_build lowers these structurally, so a malformed call must not reach it.
-                if let Some(elem) = crate::heap_alloc_elem(self.sym_str(name)) {
+                // mir_build lowers these structurally, so a malformed call must not reach it. The
+                // scratch family `scratch_<T>(n) -> []T` has the identical signature.
+                if let Some(elem) = crate::heap_alloc_elem(self.sym_str(name))
+                    .or_else(|| crate::scratch_alloc_elem(self.sym_str(name)))
+                {
                     self.types.insert(callee.id, Ty::Unknown);
                     if args.len() != 1 {
                         self.error(
@@ -382,6 +385,52 @@ impl Sema<'_> {
                         );
                     }
                     return Ty::Scalar(Scalar::I64);
+                }
+                // `scratch_mark() -> i64` and `scratch_release(mark)`: the scope of the scratch
+                // allocations (`scratch_<T>`, above). The mark is a count of live allocations, so it
+                // is an ordinary `i64` on every backend; the release takes any integer.
+                if crate::is_scratch_mark(self.sym_str(name)) {
+                    self.types.insert(callee.id, Ty::Unknown);
+                    if !args.is_empty() {
+                        self.error(
+                            span,
+                            "E0503",
+                            format!(
+                                "`scratch_mark` takes no arguments, but {} were supplied",
+                                args.len()
+                            ),
+                        );
+                    }
+                    return Ty::Scalar(Scalar::I64);
+                }
+                if crate::is_scratch_release(self.sym_str(name)) {
+                    self.types.insert(callee.id, Ty::Unknown);
+                    if args.len() != 1 {
+                        self.error(
+                            span,
+                            "E0503",
+                            format!(
+                                "`scratch_release` takes exactly 1 argument (a mark from \
+                                 `scratch_mark()`), but {} were supplied",
+                                args.len()
+                            ),
+                        );
+                    } else {
+                        match &arg_tys[0] {
+                            Ty::Scalar(s) if s.is_int() => {}
+                            Ty::Unknown | Ty::Error => {}
+                            other => self.error(
+                                span,
+                                "E0401",
+                                format!(
+                                    "`scratch_release` expects an integer mark from \
+                                     `scratch_mark()`, found a value of type `{}`",
+                                    other.display(self.interner)
+                                ),
+                            ),
+                        }
+                    }
+                    return Ty::Unit;
                 }
                 // `sync_block()` — a cooperative thread-block barrier. Legal only inside a `@parallel`
                 // function (the GPU maps it to `bar.sync`; CPU backends treat it as a no-op).

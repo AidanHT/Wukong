@@ -25,6 +25,7 @@ alias_transpose_inplace.wk:
 alias_transpose_inplace8.wk:
 alias_unknown_republish.wk: wukong_rt_alloc wukong_rt_alloc*4
 alias_view_binding_block_value.wk: wukong_rt_alloc wukong_rt_alloc*5
+alloc_scratch_arena.wk: wukong_rt_alloc wukong_rt_free wukong_rt_scratch_alloc wukong_rt_scratch_alloc*5 wukong_rt_scratch_mark wukong_rt_scratch_mark*6 wukong_rt_scratch_release wukong_rt_scratch_release*4
 annotated_mixed_width_binop.wk:
 argmax.wk: wukong_argreduce_f32 wukong_argreduce_f32*3
 argmax_seed_edges.wk: veckernel*2 wukong_argreduce_f32 wukong_argreduce_f32*5
@@ -35,6 +36,7 @@ array_of_struct.wk:
 array_of_tuple.wk:
 assert.wk:
 assert_fail.wk:
+assert_fail_trailing_output.wk:
 atan.wk: wukong_vmath_f32
 atan2_hypot.wk: wukong_vmath2_f32
 attention.wk: wukong_norm_f32 wukong_sgemm wukong_sgemm_nt
@@ -284,6 +286,7 @@ parallel_region_alias.wk:
 parallel_region_decline.wk: wukong_velem_f32_parallel
 parallel_region_reassigned_local.wk: veckernel*2
 pointer.wk:
+pointer_null_condition.wk:
 pool2d_partial_window.wk:
 pow.wk:
 power.wk:
@@ -327,6 +330,9 @@ shift_width.wk:
 signed_cmp_highbit_fold.wk:
 silu_backward.wk: wukong_vmath2_f32
 slice_basics.wk:
+slice_bounds_in_range.wk:
+slice_bounds_negative.wk:
+slice_bounds_oob.wk:
 slice_destination_spellings.wk:
 slice_len_loop.wk:
 slice_param_kernel_base.wk: wukong_sgemm_nt

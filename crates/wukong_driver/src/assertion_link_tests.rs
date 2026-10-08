@@ -27,12 +27,15 @@ fn assertion_aot_rust_and_c_shims_stop_before_trailing_effects() {
     std::fs::write(&rust_shim, WUKONG_RT_SHIM).unwrap();
     let c_shim = dir.join("shim.c");
     std::fs::write(&c_shim, WUKONG_RT_C).unwrap();
-    for (name, source, status, stdout) in [
+    const ASSERTION: &str = "assertion failed";
+    const BOUNDS: &str = "error: index out of bounds: the len is 2 but the index is 2";
+    for (name, source, status, stdout, diagnostic_line) in [
         (
             "direct",
             "fn main() -> i32 { print(10); assert(false); print(99); return 0; }",
             1,
             "10\n",
+            ASSERTION,
         ),
         (
             "nested",
@@ -41,6 +44,7 @@ fn assertion_aot_rust_and_c_shims_stop_before_trailing_effects() {
                     fn main() -> i32 { print(10); let x: i32 = middle(); print(40); return x; }",
             1,
             "10\n20\n",
+            ASSERTION,
         ),
         (
             "success",
@@ -48,6 +52,19 @@ fn assertion_aot_rust_and_c_shims_stop_before_trailing_effects() {
                      fn main() -> i32 { print(10); let x: i32 = leaf(); print(40); return x; }",
             5,
             "10\n20\n21\n40\n",
+            "",
+        ),
+        (
+            // A slice bounds failure in a callee: the executable resolves the failure edge to
+            // `wukong_runtime::wukong_rt_bounds_fail` (Rust link) or the C shim's twin, both of
+            // which print the shared diagnostic and exit 1 at the access.
+            "bounds",
+            "fn get(s: []i32, i: i64) -> i32 { print(i); return s[i]; }
+                     fn main() -> i32 { let a: [i32; 2] = [3, 4]; print(get(a, 1));
+                     print(get(a, 2)); print(99); return 0; }",
+            1,
+            "1\n4\n2\n",
+            BOUNDS,
         ),
     ] {
         let (program, interner) = lower_assertion_fixture(source);
@@ -104,7 +121,7 @@ fn assertion_aot_rust_and_c_shims_stop_before_trailing_effects() {
             if status == 1 {
                 assert_eq!(
                     diagnostic.lines().collect::<Vec<_>>(),
-                    ["assertion failed"],
+                    [diagnostic_line],
                     "{name}/{flavor}"
                 );
             } else {
