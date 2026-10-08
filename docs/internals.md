@@ -109,7 +109,8 @@ source
   → sema         (wukong_sema::check)                  name res, types, SHAPE check
   → mir_build    (wukong_mir_build::lower_program)     -> MIR (scalar SSA; always MirLevel::Low)
   → opt          (wukong_opt::optimize)                fixpoint passes
-  → autodiff     (wukong_autodiff::grad)               --emit=grad / --train only; forces >= -O1
+  → autodiff     (wukong_autodiff::grad)               --emit=grad / --train / --emit=obj --grad-of;
+                                                        forces >= -O1
   → verify       (wukong_mir::verify, via wukong_driver::verify_or_ice)
                  gate on --run and on every AOT exit
   → backend      interpreter (--run) | Cranelift native (--backend=native / --emit=obj|exe)

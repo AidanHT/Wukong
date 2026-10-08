@@ -227,8 +227,11 @@ contraction, loop fusion, and `@parallel` multicore execution over fixed-size-ar
 autodiff**
 (`wukong_autodiff`, driven from the CLI via `--emit=grad` / `--train`) emits the training backward
 pass and runs a fwd→bwd→optimizer (SGD/AdamW) loop on the interpreter or native Cranelift JIT.
-Training accepts concrete f32 arrays and dense tensors; AOT training and measured training speedups
-remain open. See the [training CLI contract](docs/language-guide.md#command-line-interface).
+Every recognized tensor kernel has a VJP (riding the runtime's tuned backward kernels) or a named
+refusal, losses may call helper functions, `--emit=obj --grad-of=<fn>` exports the gradient ahead
+of time, and scalar-path losses have Hessian-vector products. Training accepts concrete f32 arrays
+and dense tensors; an AOT training loop and measured training speedups remain open. See the
+[training CLI contract](docs/language-guide.md#command-line-interface).
 Tuples and structs (incl. nested struct-in-struct, **by-value parameters and `-> Struct` returns** via
 an sret ABI, nested tuple fields `t.0.1`, and whole-aggregate assignment), pointers/references
 (`&mut`/`*p`), and `loop`/`while`/`for` with `break`/`continue` (incl. **labeled loops** `'outer: …`

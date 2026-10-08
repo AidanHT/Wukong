@@ -912,7 +912,8 @@ wukongc [OPTIONS] <input.wk>
 --emit=<stage>        tokens | ast | mir-high | mir (alias mir-low) | grad | llvm-ir | obj | exe
                       (default: exe)
                       grad = reverse-mode backward MIR of a loss fn (see --grad-of/--grad-wrt)
---grad-of=<fn>        function to differentiate for --emit=grad / --train   (default: loss)
+--grad-of=<fn>        function to differentiate for --emit=grad / --train   (default: loss);
+                      with --emit=obj, also exports <fn>_grad in the object
 --grad-wrt=<i,..>     buffer-parameter indices to differentiate w.r.t. (default: every buffer
                       parameter of the loss fn; with --train, every one EXCEPT the last, which is
                       the scalar loss output). An index that is out of range, not a buffer
@@ -948,7 +949,16 @@ backward MIR of a loss function, and `wukongc --train --train-opt=adamw model.wk
 fwd→bwd→optimizer training loop. Both flags force at least `-O1` no matter what level you pass — the
 autodiff transform consumes single-block SSA (mem2reg + simplify-cfg) — so `--emit=grad -O0` still
 prints optimized MIR. Generated backward MIR is also optimized with that minimum and verified
-before execution.
+before execution. A loss may call helper functions at any `-O` level: straight-line helpers are
+spliced into the loss before it is differentiated, and a helper that cannot be (multi-block or
+recursive) is named in the refusal. Every recognized tensor kernel either has a VJP — the whole
+f32 GEMM family including the fused bias/activation epilogue, all activations, the norms,
+cross-entropy, RoPE, the embedding gather — or declines by name with the reason
+(`docs/roadmap.md`, *Automatic differentiation*).
+
+**✅ AOT gradient:** `wukongc --emit=obj --grad-of=loss -o model.o model.wk` exports `loss_grad`
+next to `loss` (C ABI: the loss's parameters, then one caller-zeroed gradient buffer per
+`--grad-wrt` entry), for a host training loop to link. Without `--grad-of`, `--emit=obj` is unchanged.
 
 **✅ CPU training:** `--train` honors `--backend=interp` (the default) and `--backend=native`.
 Every loss parameter must be a concrete f32 array (including nested arrays) or a dense f32 tensor
@@ -958,5 +968,5 @@ AdamW accepts finite nonnegative `--train-weight-decay`, while SGD rejects nonze
 
 `--train --run` trains the selected loss without calling `main`. Combining `--train` with any
 explicit `--emit=<stage>` or `-o` is a usage error (exit 2). GPU training selectors are unsupported
-by this CPU trainer. AOT training remains unavailable, and no training speedup is established by
-the correctness checks.
+by this CPU trainer. An AOT training loop remains unavailable (the AOT *gradient* is above), and
+no training speedup is established by the correctness checks.

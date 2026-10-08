@@ -255,11 +255,14 @@ pub fn compile(opts: &Options) -> i32 {
     // so a taped program built without them meets buffer-writing loops it has no rule for. The
     // failure mode this prevents is the repo's standing rule for autodiff holes — a named refusal,
     // never a silently zero gradient.
-    if no_recognize() && (opts.grad.train || opts.emit == EmitStage::Grad) {
+    if no_recognize() && (opts.grad.train || opts.emit == EmitStage::Grad || exports_gradient(opts))
+    {
         let what = if opts.grad.train {
             "--train"
-        } else {
+        } else if opts.emit == EmitStage::Grad {
             "--emit=grad"
+        } else {
+            "--grad-of (with --emit=obj)"
         };
         eprintln!(
             "error: {what}: {NO_RECOGNIZE_ENV} is set, and autodiff is not supported with kernel \
@@ -428,10 +431,10 @@ pub fn compile(opts: &Options) -> i32 {
     };
 
     // --- Optimization ---
-    // The autodiff transform (`--emit=grad` / `--train`) consumes single-block SSA, so it forces at
-    // least `-O1` (mem2reg + simplify-cfg) regardless of the requested level. Every other path honors
-    // the requested level exactly.
-    let opt_level = if opts.emit == EmitStage::Grad || opts.grad.train {
+    // The autodiff transform (`--emit=grad` / `--train` / an exported gradient) consumes single-block
+    // SSA, so it forces at least `-O1` (mem2reg + simplify-cfg) regardless of the requested level.
+    // Every other path honors the requested level exactly.
+    let opt_level = if opts.emit == EmitStage::Grad || opts.grad.train || exports_gradient(opts) {
         opts.opt_level.max(1)
     } else {
         opts.opt_level
@@ -459,6 +462,12 @@ pub fn compile(opts: &Options) -> i32 {
     }
     if opts.emit == EmitStage::Grad {
         return emit_grad(&program, &mut interner, opts);
+    }
+    if exports_gradient(opts) {
+        if let Err(e) = append_gradient(&mut program, &mut interner, opts) {
+            eprintln!("error: --emit=obj --grad-of: {e}");
+            return exit::COMPILE_ERROR;
+        }
     }
 
     // --- Run via the selected backend (interpreter by default, Cranelift JIT with --backend=native) ---
@@ -1491,7 +1500,7 @@ fn autodiff_roots(
     interner: &mut Interner,
     opts: &Options,
 ) -> Result<Vec<wukong_span::Symbol>, String> {
-    if opts.emit != EmitStage::Grad && !opts.grad.train {
+    if opts.emit != EmitStage::Grad && !opts.grad.train && !exports_gradient(opts) {
         return Ok(Vec::new());
     }
     let name = opts.grad.of.as_deref().unwrap_or("loss");
@@ -1500,6 +1509,34 @@ fn autodiff_roots(
         return Err(missing_grad_target(name));
     }
     Ok(vec![symbol])
+}
+
+/// Whether this invocation exports a gradient ahead of time: `--emit=obj` with an explicit
+/// `--grad-of=<fn>`.
+fn exports_gradient(opts: &Options) -> bool {
+    opts.emit == EmitStage::Obj && opts.grad.of.is_some() && !opts.grad.train
+}
+
+/// `--emit=obj --grad-of=<fn>`: the ahead-of-time gradient. Appends the generated `<fn>_grad` to the
+/// program so the object exports the backward next to the forward — C ABI: the loss's parameters,
+/// then one caller-zeroed gradient buffer per `--grad-wrt` entry, gradients accumulated into them —
+/// for a host training loop (or any C/C++/Rust caller) to link against, with no compiler at run
+/// time. The forward it differentiates is the call-flattened one (`wukong_autodiff::inline_calls`),
+/// so the exported backward calls no helper the object might not define.
+fn append_gradient(
+    program: &mut wukong_mir::Program,
+    interner: &mut Interner,
+    opts: &Options,
+) -> Result<(), String> {
+    let (_, gradfn) = build_grad(program, interner, opts)?;
+    if program.function(gradfn.name).is_some() {
+        return Err(format!(
+            "the program already defines `{}`; rename it or differentiate another function",
+            interner.resolve(gradfn.name)
+        ));
+    }
+    program.funcs.push(gradfn);
+    Ok(())
 }
 
 fn missing_grad_target(name: &str) -> String {
@@ -1522,7 +1559,12 @@ fn build_grad(
         .function(sym)
         .ok_or_else(|| missing_grad_target(&name))?;
     let wrt = grad_wrt(func, &opts.grad.wrt, opts.grad.train)?;
-    let gradfn = wukong_autodiff::grad(func, &wrt, interner)?;
+    // Splice straight-line helper functions into the loss first, so a loss written as composed
+    // functions differentiates at every -O level (not only where -O2's inliner happened to fire).
+    // The flattened forward is the one returned and run, so `--train` never calls a helper the
+    // training program does not contain.
+    let func = wukong_autodiff::inline_calls(program, func);
+    let gradfn = wukong_autodiff::grad(&func, &wrt, interner)?;
     // Autodiff synthesizes MIR after optimization, so its output needs a verifier boundary even
     // without --verify-each. Keep every callee definition available for signature checks before
     // this function can hand generated MIR to emission or training.
@@ -1557,7 +1599,7 @@ fn build_grad(
     // that complete context at the output boundary, even when per-pass verification is disabled.
     wukong_opt::verify_program_stage(&checked, "autodiff optimization")
         .map_err(|failure| failure.to_string())?;
-    Ok((func.clone(), gradfn))
+    Ok((func, gradfn))
 }
 
 /// The parameter indices to differentiate w.r.t.: the explicit `--grad-wrt` list (validated to be
@@ -2597,6 +2639,22 @@ mod grad_cli_tests {
 
     // --- Activation backward: a `matmul → act → sum` model, act backward riding wukong_vmath2_f32. ---
 
+    /// The number of GEMM adjoint calls in printed gradient MIR. The forward GEMMs here are all the
+    /// `nn.Linear` spelling (`wukong_sgemm_nt*`), so every plain `wukong_sgemm*` and weight-gradient
+    /// `wukong_sgemm_tn*` call — serial, or `@parallel` when the forward was — is an adjoint: `dX`
+    /// rides the NN GEMM, `dW` the TN GEMM (no synthesized transpose).
+    fn gemm_adjoints(mir: &str) -> usize {
+        [
+            "wukong_sgemm(",
+            "wukong_sgemm_parallel(",
+            "wukong_sgemm_tn(",
+            "wukong_sgemm_tn_parallel(",
+        ]
+        .iter()
+        .map(|name| mir.matches(name).count())
+        .sum()
+    }
+
     /// The printed MIR of `{loss, loss_grad}` for the given source, so a test can assert the emitted
     /// backward rides a particular runtime kernel (the recognized backward is otherwise gate-blind).
     fn grad_mir(src: &str, of: &str, wrt: &[usize]) -> String {
@@ -2639,8 +2697,8 @@ mod grad_cli_tests {
                 "{act}: backward does not ride wukong_vmath2_f32\n{mir}"
             );
             assert!(
-                mir.contains("wukong_sgemm("),
-                "{act}: matmul backward does not ride wukong_sgemm\n{mir}"
+                gemm_adjoints(&mir) > 0,
+                "{act}: matmul backward does not ride the tuned GEMM\n{mir}"
             );
             // Data kept modest so the activations stay in a well-conditioned range for the difference.
             let mut seed = 0xE1F5u64 ^ (act.as_bytes()[0] as u64);
@@ -2837,7 +2895,7 @@ mod grad_cli_tests {
             "silu backward missing\n{mir}"
         );
         assert_eq!(
-            mir.matches("wukong_sgemm(").count(),
+            gemm_adjoints(&mir),
             3,
             "expected 3 GEMM adjoints (dW2, dA, dW1)\n{mir}"
         );
@@ -2952,6 +3010,9 @@ mod assertion_link_tests;
 
 #[cfg(test)]
 mod generated_verify_tests;
+
+#[cfg(test)]
+mod grad_model_tests;
 
 #[cfg(test)]
 mod cc_print_tests;

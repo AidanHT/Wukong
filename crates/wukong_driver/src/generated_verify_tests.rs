@@ -88,12 +88,14 @@ fn default_grad_checks_calls_introduced_only_by_the_backward() {
     let input = b.add_param(MirType::Ptr);
     let output = b.add_param(MirType::Ptr);
     let count = b.build(MirType::I64, Op::ConstInt(1, MirType::I64));
-    let sum = b.build(MirType::I64, Op::ConstInt(2, MirType::I64));
+    // The self-dot `Σ x²` (RED_DOT with both operands the same buffer): its backward is one velem
+    // scale, `dx = 2g·x`.
+    let dot = b.build(MirType::I64, Op::ConstInt(0, MirType::I64));
     let loss = b.build(
         MirType::F32,
         Op::Call {
             func: reduce,
-            args: vec![input, input, count, sum],
+            args: vec![input, input, count, dot],
         },
     );
     b.build_void(Op::Store {
@@ -101,8 +103,8 @@ fn default_grad_checks_calls_introduced_only_by_the_backward() {
         value: loss,
     });
     b.ret(Some(loss));
-    // Only the backward calls velem, to fill the gradient with ones. This unused definition
-    // is valid MIR, but its zero-parameter signature conflicts with that generated call.
+    // Only the backward calls velem, to scale the gradient. This unused definition is valid MIR,
+    // but its zero-parameter signature conflicts with that generated call.
     let mut callee = Builder::new(velem, MirType::Void);
     callee.ret(None);
     let mut program = Program::new();
