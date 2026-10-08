@@ -1247,9 +1247,9 @@ wukongc [OPTIONS] <input.wk>
 
 Use `--emit` to inspect any stage of the pipeline, e.g. `wukongc --emit=mir -O2 kernel.wk` to see
 the optimized IR, or `wukongc --emit=ast kernel.wk` to see the parse tree. `wukongc --emit=check
-kernel.wk` runs the front end (lex, parse, imports, sema) and stops before lowering — the fast loop
-for an editor or `--error-format=json` consumer, with no `C0001` lowering limits in the way. `--run`
-and `--emit=<stage>` cannot be combined; pick one. A usage error prints `error: <msg>` plus the
+kernel.wk` runs the front end (lex, parse, imports, sema, then the lints) and stops before
+lowering — the fast loop for an editor or `--error-format=json` consumer, with no `C0001` lowering
+limits in the way. `--run` and `--emit=<stage>` cannot be combined; pick one. A usage error prints `error: <msg>` plus the
 usage text on stderr and exits **2**.
 
 Diagnostics render rustc-style: a label in another file gets its own `::: file:line:col` header, and

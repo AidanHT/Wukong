@@ -139,7 +139,8 @@ Two combinations are usage errors rather than silently discarded work: `--run` w
 `obj`/`exe`. Diagnostics from every stage flow through a single `emit_diag` honoring
 `--error-format`.
 
-`--emit=check` returns after sema (lex, parse, imports, sema; no MIR lowering), exiting 0 when clean.
+`--emit=check` returns after sema and the lints (lex, parse, imports, sema, lints; no MIR lowering),
+printing any lint warnings and exiting 0 when no error (or denied lint) was reported.
 `--emit=tokens` and `--emit=ast` return *before* import loading, so they show the root file only;
 every later stage — and `--run` — sees the merged program. A verifier failure is an internal compiler
 error (a bug in a pass), reported as prose and mapped to a non-zero exit, never a user diagnostic;

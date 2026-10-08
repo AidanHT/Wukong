@@ -48,9 +48,10 @@ mod loader;
 pub enum EmitStage {
     Tokens,
     Ast,
-    /// Run the front end only — lex, parse, import resolution and sema — and stop before MIR
-    /// lowering (`--emit=check`). Reports every diagnostic sema produces and exits 0 when clean,
-    /// with no lowering (`C0001`) limits in the way. The fast check loop an editor drives.
+    /// Run the front end only — lex, parse, import resolution, sema and the lints — and stop
+    /// before MIR lowering (`--emit=check`). Reports every diagnostic sema and the lints produce and
+    /// exits 0 when nothing is an error (a denied lint is one), with no lowering (`C0001`) limits in
+    /// the way. The fast check loop an editor drives.
     Check,
     MirHigh,
     Mir,
