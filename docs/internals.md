@@ -823,7 +823,7 @@ vectorizer folds reduction lanes in index order, its unroller keeps one accumula
 creates an `Op::Fma`; Cranelift lowers `fadd`/`fmul` without fusion; the LLVM emitter writes no
 fast-math flags. That is also why the mode survives inlining in both directions — a strict body's
 separately rounded ops and a fast body's `Fma`s are already fixed in MIR when the inliner moves them.
-The driver refuses `--fp=strict` with `--emit=grad`/`--train` for the reason it refuses
+The driver refuses `--fp=strict` with `--emit=grad`/`--train`/`--emit=obj --grad-of` for the reason it refuses
 `WUKONG_NO_RECOGNIZE`: the VJP rules are keyed on recognized kernels.
 
 ## Spelling canonicalization before recognition

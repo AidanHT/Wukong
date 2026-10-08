@@ -622,7 +622,7 @@ another architecture or OS is not supported. A native-backend failure is a catal
   survives inlining in both directions, identical at every `-O` level and on both backends
   (`tests/run/strict_fp.wk`, `strict_fp_cli.wk`; the default contraction rule, including "the LEFT
   product of `a*b + c*d` is fused", is pinned by `tests/run/fp_contract_rules.wk`). `--fp=strict`
-  is refused with `--emit=grad`/`--train`. The language guide's "Floating-point semantics" section
+  is refused with `--emit=grad`/`--train`/`--emit=obj --grad-of`. The language guide's "Floating-point semantics" section
   is the user-facing contract.
 - Unknown or misplaced `@attributes` are **`E0306`**, not silence: the name is checked against the
   closed v1 set (`@parallel`, `@generic`, `@tile`, `@extern`, `@strict_fp`, `@inline`, `@simd`,

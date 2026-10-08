@@ -12,10 +12,16 @@
 //! Adding a recognizer: give its kernel a VJP rule (an entry in `tape::FORWARD_KERNELS` plus the
 //! rule), or list it here with an honest reason.
 
-/// Runtime routines the scalar core (`lib.rs::diff_inst`) differentiates as value-returning calls.
-/// (Read only by the coupling test: the scalar core matches the one routine by name.)
+/// Runtime routines the scalar core (`lib.rs::diff_inst`) differentiates as value-returning calls:
+/// the f32 trig routine and the double-precision library (`wukong_rt_math_f64` /
+/// `wukong_rt_math2_f64`, closed-form derivatives per op code). (Read only by the coupling test:
+/// the scalar core matches each routine by name.)
 #[cfg(test)]
-pub(crate) const SCALAR_CORE: &[&str] = &["wukong_rt_trig_f32"];
+pub(crate) const SCALAR_CORE: &[&str] = &[
+    "wukong_rt_trig_f32",
+    "wukong_rt_math_f64",
+    "wukong_rt_math2_f64",
+];
 
 const INDEX_VALUED: &str = "returns an index (argmax / argmin): piecewise constant, so its \
                             derivative is zero almost everywhere and undefined at a tie";
@@ -30,6 +36,7 @@ const SCAN: &str = "a scan (prefix recurrence) has no VJP rule yet";
 const COLUMN_STAT: &str = "this column statistic has no VJP rule yet (colsum, colmean and \
                            colsumsq are differentiable)";
 const NO_GRADIENT: &str = "carries no gradient";
+const FILE_READ: &str = "a file read overwrites its buffer with data; it carries no gradient";
 
 /// Every non-differentiable symbol `wukong_mir_build` can emit, with the reason a decline reports.
 pub(crate) const NOT_DIFFERENTIABLE: &[(&str, &str)] = &[
@@ -182,6 +189,45 @@ pub(crate) const NOT_DIFFERENTIABLE: &[(&str, &str)] = &[
     ("wukong_rt_write_i64", NO_GRADIENT),
     ("wukong_rt_write_i8", NO_GRADIENT),
     ("wukong_rt_write_u8", NO_GRADIENT),
+    // The ML I/O and randomness entries (see `tape::ml_call_gradient` for the per-entry decision).
+    ("wukong_rt_read_dt", FILE_READ),
+    ("wukong_rt_st_read", FILE_READ),
+    ("wukong_rt_npy_read", FILE_READ),
+    ("wukong_rt_write_dt", NO_GRADIENT),
+    ("wukong_rt_file_size", NO_GRADIENT),
+    (
+        "wukong_rand_fill_f32",
+        "counter-based random numbers depend on no input; the fill carries no gradient",
+    ),
+    (
+        "wukong_argsort_f32",
+        "an argsort writes indices: piecewise constant, so it carries no gradient",
+    ),
+    (
+        "wukong_sample_categorical_f32",
+        "a categorical draw returns an index: a discrete sample carries no gradient",
+    ),
+    (
+        "wukong_topk_f32",
+        "top-k has no VJP rule yet (the gradient would scatter back to the selected indices); \
+         autodiff refuses it rather than drop the gradient",
+    ),
+    // Scratch-arena bookkeeping and the slice bounds-failure edge.
+    (
+        "wukong_rt_scratch_alloc",
+        "scratch-arena storage: the tape does not model scratch lifetimes; allocate buffers on \
+         the gradient path with `alloc_<T>`",
+    ),
+    ("wukong_rt_scratch_mark", NO_GRADIENT),
+    (
+        "wukong_rt_scratch_release",
+        "scratch-arena bookkeeping: the tape does not model scratch lifetimes; allocate buffers \
+         on the gradient path with `alloc_<T>`",
+    ),
+    (
+        "wukong_rt_bounds_fail",
+        "the failure edge of a slice bounds check: it never returns, so it carries no gradient",
+    ),
 ];
 
 /// The reason `name` is not differentiable, when the table knows it.

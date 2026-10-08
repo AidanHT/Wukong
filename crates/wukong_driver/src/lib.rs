@@ -332,12 +332,16 @@ pub fn compile(opts: &Options) -> i32 {
         return exit::COMPILE_ERROR;
     }
     // `--fp=strict` turns recognition off for every function (a recognized kernel fixes its own
-    // summation tree), so it meets the same autodiff limit as the environment switch above.
-    if opts.strict_fp && (opts.grad.train || opts.emit == EmitStage::Grad) {
+    // summation tree), so it meets the same autodiff limit as the environment switch above — for
+    // every autodiff consumer, the ahead-of-time `--emit=obj --grad-of` export included.
+    if opts.strict_fp && (opts.grad.train || opts.emit == EmitStage::Grad || exports_gradient(opts))
+    {
         let what = if opts.grad.train {
             "--train"
-        } else {
+        } else if opts.emit == EmitStage::Grad {
             "--emit=grad"
+        } else {
+            "--emit=obj --grad-of"
         };
         eprintln!(
             "error: {what}: `--fp=strict` turns kernel recognition off for the whole program, and \

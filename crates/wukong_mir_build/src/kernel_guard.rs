@@ -121,6 +121,17 @@ impl FnLowerer<'_> {
             KernelAliasPlan::Decline => return false,
             KernelAliasPlan::Version(checks) => checks,
         };
+        // A `@noalias` promise settles a pair the call-site bit cannot (`promised_disjoint`): the
+        // source states it and sema rejects the call sites that provably break it, so that pair
+        // needs no run-time test. Only when every remaining pair is promised does the kernel
+        // dispatch unguarded, as `all_provably_disjoint` answers the compile-time question.
+        let checks: Vec<OperandPair> = checks
+            .into_iter()
+            .filter(|p| !self.promised_disjoint(syms[p.a], syms[p.b]))
+            .collect();
+        if checks.is_empty() {
+            return true;
+        }
         if self.gemm.guard != KernelGuard::Ready {
             return false;
         }

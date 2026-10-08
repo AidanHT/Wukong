@@ -56,9 +56,31 @@ impl FnLowerer<'_> {
                 scan.locals.insert(*name);
                 true
             }
-            // Compound and plain assignment validate identically.
-            StmtKind::Assign { target, value, .. } => {
+            StmtKind::Assign { target, op, value } => {
                 if !self.vec_check_value(value, j, &scan.locals, &mut scan.lane, &mut scan.acc) {
+                    return false;
+                }
+                // A compound assign lowers through `compound_binop` as ONE lane-wise op, so it is
+                // vectorizable only where that op has a vector form on every backend: `+ - *`
+                // always, `/` on a float lane (x86 has no SIMD integer divide — the same rule
+                // `vec_check_value` applies to a written-out `/`), the bitwise ops on an integer
+                // lane. `%` (no vector remainder) and the shifts (a per-lane shift amount Cranelift
+                // cannot lower) keep the loop scalar instead of reaching the backend as MIR it
+                // rejects. The answer depends only on this statement and the lane already pinned,
+                // so it stays prefix-monotone for the fusion planner.
+                let lane_float = scan.lane.as_ref().is_some_and(|l| l.is_float());
+                let op_ok = match op {
+                    ast::AssignOp::Assign
+                    | ast::AssignOp::Add
+                    | ast::AssignOp::Sub
+                    | ast::AssignOp::Mul => true,
+                    ast::AssignOp::Div => lane_float,
+                    ast::AssignOp::BitAnd | ast::AssignOp::BitOr | ast::AssignOp::BitXor => {
+                        !lane_float
+                    }
+                    ast::AssignOp::Rem | ast::AssignOp::Shl | ast::AssignOp::Shr => false,
+                };
+                if !op_ok {
                     return false;
                 }
                 match &target.kind {

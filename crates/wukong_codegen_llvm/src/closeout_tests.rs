@@ -499,6 +499,7 @@ fn discarded_defined_return_and_vector_kernel_reduction() {
     // dot(x, y): two unit-stride loads, folded with a fused `acc = fma(x, y, acc)`.
     let kernel = b.add_vec_kernel(wukong_mir::VecKernel {
         name: i.intern("dot"),
+        lane: wukong_mir::VecLane::F32,
         streams: 2,
         scalars: 0,
         ops: vec![
@@ -571,6 +572,7 @@ fn discarded_defined_return_and_vector_kernel_reduction() {
     // out[i] = x[i] != x[i] ? x[i] : -(x[i] * s)
     let kernel = b.add_vec_kernel(wukong_mir::VecKernel {
         name: i.intern("map"),
+        lane: wukong_mir::VecLane::F32,
         streams: 2,
         scalars: 1,
         ops: vec![

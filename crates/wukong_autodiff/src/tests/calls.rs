@@ -11,6 +11,7 @@ fn program_of(funcs: Vec<Function>) -> Program {
     Program {
         funcs,
         statics: Vec::new(),
+        externs: Vec::new(),
         level: wukong_mir::MirLevel::Low,
     }
 }

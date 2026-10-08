@@ -129,6 +129,7 @@ fn baseline_levels_refuse_raw_avx2_kernels() {
     let n = b.add_param(MirType::I64);
     let kernel = b.add_vec_kernel(wukong_mir::VecKernel {
         name: i.intern("copy"),
+        lane: wukong_mir::VecLane::F32,
         streams: 2,
         scalars: 0,
         ops: vec![

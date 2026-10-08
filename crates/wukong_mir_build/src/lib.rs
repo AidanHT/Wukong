@@ -32834,6 +32834,9 @@ mod tests {
                 wukong_mir::Terminator::CondBr {
                     then_blk, else_blk, ..
                 } => vec![*then_blk, *else_blk],
+                wukong_mir::Terminator::Switch { cases, default, .. } => {
+                    cases.iter().map(|c| c.target).chain([*default]).collect()
+                }
                 wukong_mir::Terminator::Ret(_) | wukong_mir::Terminator::Unreachable => vec![],
             }
         };

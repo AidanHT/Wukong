@@ -142,7 +142,7 @@ fn assertion_propagation_reaches_the_whole_chain_in_any_order() {
          fn main() -> i32 { return a() + e(); }",
         0,
     );
-    let actual = asserting_functions(&program, &interner).unwrap();
+    let actual = asserting_functions(&program, &interner);
     let expected: HashSet<Symbol> = ["a", "b", "c", "d", "main"]
         .into_iter()
         .map(|name| interner.intern(name))

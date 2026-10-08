@@ -216,7 +216,7 @@ All notable changes to Wukong are documented here. The format is loosely based o
 - **Added `@strict_fp` and `--fp=<fast|strict>`.** A strict function evaluates its float arithmetic
   in source order with one rounding per operation: no FMA contraction, sequential float reductions,
   no kernel recognizers (implies `@generic`); elementwise loops and integer reductions still
-  vectorize. `--fp=strict` applies it program-wide and is refused with `--emit=grad`/`--train`.
+  vectorize. `--fp=strict` applies it program-wide and is refused with `--emit=grad`/`--train`/`--emit=obj --grad-of`.
   Fixtures `tests/run/strict_fp.wk`, `strict_fp_cli.wk`, `fp_contract_rules.wk`.
 - **Documented the floating-point contract** in the language guide ("Floating-point semantics"):
   the exact contraction rule (the LEFT product of `a*b + c*d` is fused), the three reduction trees and

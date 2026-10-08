@@ -54,6 +54,7 @@ fn grad_program(
         funcs: vec![fwd, g],
         level: MirLevel::Low,
         statics: program.statics.clone(),
+        externs: program.externs.clone(),
     };
     (prog, f, gn)
 }

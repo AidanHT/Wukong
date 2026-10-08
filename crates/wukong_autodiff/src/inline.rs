@@ -16,7 +16,7 @@
 
 use crate::map_operands;
 use std::collections::{HashMap, HashSet};
-use wukong_mir::{BasicBlock, Function, Inst, Op, Program, Terminator, ValueId};
+use wukong_mir::{BasicBlock, Function, Inst, Op, Program, SwitchCase, Terminator, ValueId};
 use wukong_span::Symbol;
 
 /// The deepest helper chain spliced. A bound, not a policy: real models nest a handful deep.
@@ -93,6 +93,24 @@ fn flatten(program: &Program, f: &Function, stack: &mut Vec<Symbol>) -> Option<F
             else_blk: *else_blk,
             else_args: else_args.iter().map(|&a| mapv(a)).collect(),
         },
+        Terminator::Switch {
+            scrutinee,
+            cases,
+            default,
+            default_args,
+        } => Terminator::Switch {
+            scrutinee: mapv(*scrutinee),
+            cases: cases
+                .iter()
+                .map(|c| SwitchCase {
+                    value: c.value,
+                    target: c.target,
+                    args: c.args.iter().map(|&a| mapv(a)).collect(),
+                })
+                .collect(),
+            default: *default,
+            default_args: default_args.iter().map(|&a| mapv(a)).collect(),
+        },
         Terminator::Unreachable => Terminator::Unreachable,
     };
     Some(Function {
@@ -108,6 +126,7 @@ fn flatten(program: &Program, f: &Function, stack: &mut Vec<Symbol>) -> Option<F
         value_types,
         entry: f.entry,
         vec_kernels: f.vec_kernels.clone(),
+        param_attrs: f.param_attrs.clone(),
     })
 }
 

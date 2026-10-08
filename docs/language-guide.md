@@ -908,7 +908,7 @@ never reassociates, contracts, or applies algebraic float identities in either m
 fixed at lowering and is identical at every `-O` level and on both backends.
 
 `--fp=strict` applies the attribute to every function of the program (`tests/run/strict_fp_cli.wk`);
-it is refused with `--emit=grad`/`--train`, whose VJP rules need the recognized kernels. Like
+it is refused with `--emit=grad`/`--train`/`--emit=obj --grad-of`, whose VJP rules need the recognized kernels. Like
 `@generic`, `@strict_fp` must sit on the `fn` — on a statement, loop or parameter it is **`E0306`**.
 Strict code gives up FMA throughput, reduction ILP and the tuned kernels; reach for it where the
 result must match a reference evaluated in source order (a C/NumPy port, a checksum, a numerical
@@ -1661,7 +1661,7 @@ and a name:
 | `W0002` | `unused_mut` | a scalar or pointer binding declared `mut` that is never reassigned or borrowed (`*p = v` writes the pointee, not `p`) |
 | `W0003` | `unreachable_code` | code after a `return`/`break`/`continue` or after a construct that diverges on every path, judged exactly as the definite-return check judges it |
 | `W0004` | `unused_result` | an expression statement whose value is thrown away with no effect — above all `out[i] == a[i] + b[i];` written for `=` |
-| `W0005` | `dead_code` | a function of the compiled file no entry point reaches (`main`, the `--grad-of` function under `--emit=grad`/`--train`, `pub`, `@export`/`@extern`); nothing under `--emit=obj`/`llvm-ir` or in a file with no `main` |
+| `W0005` | `dead_code` | a function of the compiled file no entry point reaches (`main`, the `--grad-of` function under `--emit=grad`/`--train`/`--emit=obj --grad-of`, `pub`, `@export`/`@extern`); nothing under `--emit=obj`/`llvm-ir` or in a file with no `main` |
 | `W0006` | `unwritten_output` | a `mut` array/slice/tensor/tuple/struct parameter — an output buffer — that is never stored to, assigned, passed on or borrowed |
 | `W0007` | `unknown_lints` | an `@allow`/`@warn`/`@deny` argument that names no lint |
 | `W0030` | `missing_semicolon` | a statement without its `;` (see below) |
