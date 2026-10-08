@@ -245,3 +245,49 @@ fn native_optimization_is_observationally_invariant() {
         mismatches.join("\n")
     );
 }
+
+/// Pin the `-O2` == `-O3` equivalence explicitly.
+///
+/// `wukong_opt` gates its passes on `>= 1` and `>= 2` only, so `-O3` is byte-identical to `-O2`
+/// today and the `-O3` arm of the two invariance suites above cannot fail. Those arms are kept as
+/// forward insurance — but a silent arm cannot *announce* the day the equivalence breaks; it just
+/// quietly starts doing real work. This test is the announcement: it compares the emitted MIR of
+/// `-O2` and `-O3` directly, so the first pass that gates on `>= 3` fails here **by name** with a
+/// message telling the author the `-O3` invariance arms now carry real coverage and their
+/// expectations must be re-derived — instead of that change slipping in unremarked. It is cheap:
+/// a handful of programs, two `--emit=mir` spawns each, no execution.
+#[test]
+fn o3_mir_is_byte_identical_to_o2() {
+    fn emit_mir(path: &Path, level: &str) -> (Option<i32>, Vec<u8>) {
+        let out = Command::new(env!("CARGO_BIN_EXE_wukongc"))
+            .arg("--emit=mir")
+            .arg(level)
+            .arg(path)
+            .output()
+            .expect("failed to spawn wukongc");
+        (out.status.code(), out.stdout)
+    }
+    // Programs that put real work through the optimizer: a GEMM nest, a multi-pass norm, scans, an
+    // elementwise transcendental loop, a GEMM+epilogue, and a parallel reduction.
+    for name in [
+        "tensor_matmul.wk",
+        "softmax.wk",
+        "scan_1d.wk",
+        "transcendental_kernel.wk",
+        "linear_bias_relu.wk",
+        "parallel_reduce.wk",
+    ] {
+        let p = run_dir().join(name);
+        let (c2, m2) = emit_mir(&p, "-O2");
+        let (c3, m3) = emit_mir(&p, "-O3");
+        assert_eq!(c2, Some(0), "{name}: --emit=mir -O2 failed to compile");
+        assert_eq!(c3, Some(0), "{name}: --emit=mir -O3 failed to compile");
+        assert!(
+            m2 == m3,
+            "{name}: `--emit=mir -O3` is no longer byte-identical to `-O2`. A wukong_opt pass now \
+             gates on `>= 3`, so the -O3 arm of optimization_is_observationally_invariant and its \
+             native twin now carry real coverage — re-derive their expectations and update this \
+             pin's documentation in the same change."
+        );
+    }
+}

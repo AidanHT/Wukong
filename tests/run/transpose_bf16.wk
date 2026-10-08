@@ -2,7 +2,9 @@
 // EXPECT-EXIT: 0
 // EXPECT-OUT: 1
 // EXPECT-OUT: 4
+// EXPECT-OUT: 2
 // EXPECT-OUT: 5
+// EXPECT-OUT: 3
 // EXPECT-OUT: 6
 module tests.run.transpose_bf16
 
@@ -23,10 +25,14 @@ fn main() -> i32 {
             dst[j * 2 + i] = src[i * 3 + j];
         }
     }
-    // dst = srcᵀ = [[1,4],[2,5],[3,6]] = [1,4, 2,5, 3,6].
+    // dst = srcᵀ = [[1,4],[2,5],[3,6]] = [1,4, 2,5, 3,6]. Every lane printed, in index order, so a
+    // transposed/mis-strided 16-bit move or a dropped column is visible (dst[2] and dst[4] used to
+    // be skipped, which hid exactly a two-lane permutation).
     print((dst[0] as f32) as i32); // 1
     print((dst[1] as f32) as i32); // 4
+    print((dst[2] as f32) as i32); // 2
     print((dst[3] as f32) as i32); // 5
+    print((dst[4] as f32) as i32); // 3
     print((dst[5] as f32) as i32); // 6
     return 0;
 }

@@ -52,6 +52,128 @@ fn wukongc(args: &[&str], path: &Path, no_recognize: bool) -> (Option<i32>, Stri
     )
 }
 
+// -------------------------------------------------------------------------------------------------
+// The recognition on/off output comparator.
+//
+// The two differentials below (the named cascade-head test and the corpus sweep) compare a
+// program's stdout with recognition on against the same program with it off. Historically that
+// comparison was byte-exact. That makes the instrument *un-pointable* at the one class of program
+// it most needs to cover: with recognition on, a reducing or accumulating kernel (a reassociated
+// 8-lane AVX2 fold, a GEMM accumulated per KC block) computes a legitimately different bit pattern
+// from the sequential loop the generic lowering emits — the documented `c*sqrt(K)*eps` reduction
+// exception. A byte-exact comparator reads that as a miscompile, so it can only be pointed at data
+// where every value is exactly representable (which is why the corpus fixtures are built that way,
+// tests/CLAUDE.md), and its sensitivity is capped by each fixture's arithmetic rather than by the
+// kernel.
+//
+// `compare_outputs` gives the comparison a numeric mode: bit-exact by default (so sign of zero,
+// NaN spelling and every integer stay fully observable, and every entry-free fixture is unchanged),
+// and a per-fixture relative tolerance for the fixtures whose kernel reassociates. The tolerance is
+// not free-form: it is declared with its derivation in `REASSOCIATION_TOLERANCES`.
+// -------------------------------------------------------------------------------------------------
+
+/// Per-fixture relative tolerance for the recognition on/off differential, each with the derivation
+/// of its bound. A fixture with no entry is held to **bit-exact** equality — the default, and what
+/// every current corpus fixture gets, so this table being empty is a no-op.
+///
+/// This is the extension point the instrument lacked. A fixture that prints raw reduction or GEMM
+/// lanes at a measurement size (above the kernel's vector step, where the reassociated and
+/// sequential orders genuinely diverge) is added here with its `c*sqrt(K)*eps` bound, and the gate
+/// then inspects its mantissas instead of being restricted to data where neutrality is free. Keep
+/// each bound cited the way `corpus_lint.rs::DECLARED_TOLERANCES` requires of the run corpus.
+const REASSOCIATION_TOLERANCES: &[(&str, f64)] = &[];
+
+/// The declared tolerance for a fixture, or `None` (bit-exact) when it has no entry.
+fn tolerance_for(name: &str) -> Option<f64> {
+    REASSOCIATION_TOLERANCES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, t)| *t)
+}
+
+/// `|a - e| <= rel * |e|`, with the three cases the plain formula gets wrong — a NaN never matches,
+/// and a zero or infinite reference demands exact equality. Mirrors `common/mod.rs::approx_eq`, the
+/// comparator the run corpus already uses for its `EXPECT-OUT-APPROX` lines.
+fn approx_eq(a: f64, e: f64, rel: f64) -> bool {
+    if a.is_nan() || e.is_nan() {
+        return false;
+    }
+    if e == 0.0 || e.is_infinite() {
+        return a == e;
+    }
+    (a - e).abs() <= rel * e.abs()
+}
+
+/// Compare two stdout captures that must agree up to recognition.
+///
+/// With `tol == None` the bytes must match exactly: this is the default and preserves every
+/// observable distinction (sign of zero, NaN spelling, integers). With `tol == Some(rel)`, lines
+/// that are not textually equal are compared numerically — both sides must parse as a single `f64`
+/// and agree within `rel` relative error (the generic lowering's value is the reference); a
+/// non-numeric mismatch, a line-count change, or a NaN is still a failure. Returns the first
+/// disagreement.
+fn compare_outputs(on: &str, off: &str, tol: Option<f64>) -> Result<(), String> {
+    if on == off {
+        return Ok(());
+    }
+    let Some(rel) = tol else {
+        return Err(format!(
+            "recognition off changed the observable output and no tolerance is declared for this \
+             fixture\n    on  = {on:?}\n    off = {off:?}"
+        ));
+    };
+    let on_lines: Vec<&str> = on.lines().collect();
+    let off_lines: Vec<&str> = off.lines().collect();
+    if on_lines.len() != off_lines.len() {
+        return Err(format!(
+            "stdout line count differs with recognition off: on={} off={}",
+            on_lines.len(),
+            off_lines.len()
+        ));
+    }
+    for (i, (a, b)) in on_lines.iter().zip(&off_lines).enumerate() {
+        if a == b {
+            continue;
+        }
+        let (Ok(av), Ok(bv)) = (a.trim().parse::<f64>(), b.trim().parse::<f64>()) else {
+            return Err(format!(
+                "line {}: {a:?} (on) vs {b:?} (off) differ and are not both numeric",
+                i + 1
+            ));
+        };
+        // The generic lowering (recognition off) is the language's definition of the answer, so it
+        // is the reference the tolerance is relative to.
+        if !approx_eq(av, bv, rel) {
+            return Err(format!(
+                "line {}: {a:?} (on) vs {b:?} (off) exceed the declared relative tolerance {rel:e}",
+                i + 1
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The comparator preserves bit-exact strictness by default and only relaxes where a tolerance is
+/// declared — proven directly so the instrument's own second side cannot go vacuous.
+#[test]
+fn the_output_comparator_is_strict_by_default_and_bounded_under_tolerance() {
+    // Exact match: OK with or without a tolerance.
+    assert!(compare_outputs("1\n2\n3\n", "1\n2\n3\n", None).is_ok());
+    assert!(compare_outputs("1\n2\n3\n", "1\n2\n3\n", Some(1e-3)).is_ok());
+    // Any difference with no declared tolerance is a hard failure (the default every fixture gets).
+    assert!(compare_outputs("1\n2\n", "1\n3\n", None).is_err());
+    // Sign of zero is observable and the default path preserves it.
+    assert!(compare_outputs("-0\n", "0\n", None).is_err());
+    // Under a tolerance: within the bound is accepted, outside it is rejected.
+    assert!(compare_outputs("1000.001\n", "1000.0\n", Some(1e-5)).is_ok());
+    assert!(compare_outputs("1000.5\n", "1000.0\n", Some(1e-5)).is_err());
+    // A NaN never matches a finite value, even under a tolerance.
+    assert!(compare_outputs("NaN\n", "0\n", Some(1e-3)).is_err());
+    // A non-numeric mismatch and a line-count change are failures regardless of tolerance.
+    assert!(compare_outputs("hello\n", "world\n", Some(1e-3)).is_err());
+    assert!(compare_outputs("1\n2\n", "1\n", Some(1e-3)).is_err());
+}
+
 /// The MIR of a matmul nest contains the tuned GEMM dispatch — the baseline the instrument is
 /// measured against. If this ever stops holding, the test below is vacuous.
 #[test]
@@ -161,13 +283,17 @@ fn no_recognize_keeps_the_program_correct_on_both_backends() {
                 let off = wukongc(&["--run", opt, backend], &p, true);
                 assert_eq!(on.0, Some(0), "{name} {opt} {backend}: {}", on.2);
                 assert_eq!(off.0, Some(0), "{name} {opt} {backend}: {}", off.2);
-                assert_eq!(
-                    (on.0, &on.1),
-                    (off.0, &off.1),
-                    "{name} {opt} {backend}: recognition off changed the observable behavior\n\
-                     stderr(off): {}",
-                    off.2
-                );
+                // Exit codes agree (both Some(0) above); the stdout comparison goes through the
+                // tolerance-aware comparator so a fixture that prints a reassociating kernel's raw
+                // lanes can declare its `c*sqrt(K)*eps` bound in REASSOCIATION_TOLERANCES instead of
+                // being restricted to data where neutrality is free. With no entry it is bit-exact.
+                if let Err(why) = compare_outputs(&on.1, &off.1, tolerance_for(name)) {
+                    panic!(
+                        "{name} {opt} {backend}: recognition off changed the observable output\n{why}\n\
+                         stderr(off): {}",
+                        off.2
+                    );
+                }
             }
         }
     }
@@ -425,9 +551,14 @@ fn every_recognizer_dependent_program_agrees_with_its_generic_lowering() {
                 "{} @ {opt} {backend}: the corpus program itself failed",
                 c.name
             );
-            if on != off {
+            if on.0 != off.0 {
                 mismatches.push(format!(
-                    "{} @ {opt} {backend} (recognizes {dependent:?}):\n    on  = {on:?}\n    off = {off:?}",
+                    "{} @ {opt} {backend} (recognizes {dependent:?}): exit {:?} (on) vs {:?} (off)",
+                    c.name, on.0, off.0
+                ));
+            } else if let Err(why) = compare_outputs(&on.1, &off.1, tolerance_for(&c.name)) {
+                mismatches.push(format!(
+                    "{} @ {opt} {backend} (recognizes {dependent:?}):\n    {why}",
                     c.name
                 ));
             }
@@ -484,4 +615,106 @@ fn the_recognizer_dependent_corpus_holds_its_floor() {
         census.len(),
         kernels.len()
     );
+}
+
+// -------------------------------------------------------------------------------------------------
+// The emittable-vs-emitted census (P12.4).
+//
+// `wukong_mir_build` interns a large set of `wukong_*` runtime symbols it CAN lower a nest to. Only
+// some of them fire anywhere in `tests/run`; the rest are live emit sites with no corpus witness —
+// and the campaign's audit found the uncovered set is dominated by the `_parallel` twins, whose only
+// difference from their covered serial form is chunking and pool routing (so a `_parallel` kernel can
+// be wrong in a way its serial twin is not, with nothing to catch it). A `_parallel` kernel is also
+// the arm the autodiff mirror rule is weakest on.
+//
+// This is the EXPLICIT CENSUS the campaign asked for in place of one fixture per family (adding those
+// fixtures is the corpus's job, and needs hand-derived every-lane values). It records membership so
+// the blind spot is written down rather than implicit, and floors the two surfaces so a catastrophic
+// loss of emit sites or corpus coverage fails by name. It deliberately makes NO assertion about the
+// composition of the never-emitted set: this harness scans only `tests/run`, while the audit measured
+// `tests/run` + `examples` + `bench/kernels`, so a serial symbol covered only by an example would
+// appear uncovered here — a scope artefact, not a regression. The breakdown is printed for the reader.
+// -------------------------------------------------------------------------------------------------
+
+/// Runtime symbols that are not recognized kernels: the timer and the generic `@parallel` outliner,
+/// plus the whole `wukong_rt_*` family (allocator, free, and the file-I/O read/write and trig
+/// intrinsics). Excluded from both sides so the census counts recognized kernels, not plumbing.
+fn is_support(sym: &str) -> bool {
+    sym.starts_with("wukong_rt_") || sym == "wukong_now_ns" || sym == "wukong_parallel_for"
+}
+
+/// Every `wukong_*` symbol `wukong_mir_build` interns, extracted textually from its source (the same
+/// discipline as `runtime_surface_tests.rs` and the diagnostic-catalogue scan: the intern sites are
+/// string literals, so a textual pass is faithful and needs no compile).
+fn emittable_runtime_symbols() -> BTreeSet<String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("wukong_mir_build")
+        .join("src")
+        .join("lib.rs");
+    let src = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    const NEEDLE: &str = ".intern(\"wukong_";
+    let mut out = BTreeSet::new();
+    let mut rest = src.as_str();
+    while let Some(i) = rest.find(NEEDLE) {
+        // Position at the start of the symbol name (`wukong_...`), inside the string literal.
+        let sym_start = i + ".intern(\"".len();
+        let tail = &rest[sym_start..];
+        // The literal ends at the closing quote.
+        let end = tail.find('"').unwrap_or(tail.len());
+        let sym = &tail[..end];
+        if !is_support(sym) {
+            out.insert(sym.to_string());
+        }
+        rest = &tail[end..];
+    }
+    out
+}
+
+/// Record the emittable / emitted / never-emitted split, floor the two surfaces, and print the
+/// never-emitted set partitioned into `_parallel` twins and everything else.
+#[test]
+fn the_emittable_runtime_surface_census_is_recorded_and_floored() {
+    /// `wukong_mir_build` still interns a large kernel surface. A drop below this means a whole
+    /// family of emit sites was deleted. Measured well above this; floored with headroom.
+    const EMITTABLE_FLOOR: usize = 120;
+    /// Distinct kernels the `tests/run` corpus actually emits. Mirrors `KERNEL_FLOOR`.
+    const EMITTED_FLOOR: usize = 85;
+
+    let emittable = emittable_runtime_symbols();
+    let emitted: BTreeSet<String> = corpus_census()
+        .iter()
+        .flat_map(|c| c.on.iter().cloned())
+        .filter(|s| !is_support(s))
+        .collect();
+
+    assert!(
+        emittable.len() >= EMITTABLE_FLOOR,
+        "wukong_mir_build now interns only {} runtime kernel symbols (floor {EMITTABLE_FLOOR}) — a \
+         family of emit sites was removed",
+        emittable.len()
+    );
+    assert!(
+        emitted.len() >= EMITTED_FLOOR,
+        "the tests/run corpus now emits only {} distinct runtime kernels (floor {EMITTED_FLOOR})",
+        emitted.len()
+    );
+
+    let never: Vec<&String> = emittable.difference(&emitted).collect();
+    let (parallel, serial): (Vec<&&String>, Vec<&&String>) =
+        never.iter().partition(|s| s.ends_with("_parallel"));
+
+    eprintln!(
+        "emittable-vs-emitted census: {} emittable kernels, {} emitted by tests/run, {} never \
+         emitted here ({} _parallel twins, {} serial — serial entries are mostly scope artefacts, \
+         covered by examples/ or bench/kernels which this harness does not scan)",
+        emittable.len(),
+        emitted.len(),
+        never.len(),
+        parallel.len(),
+        serial.len(),
+    );
+    eprintln!("  never-emitted _parallel twins: {parallel:?}");
+    eprintln!("  never-emitted serial: {serial:?}");
 }

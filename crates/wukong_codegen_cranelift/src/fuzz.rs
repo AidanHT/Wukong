@@ -552,7 +552,22 @@ fn fuzz_full_buffer_interp_vs_native() {
     let mut rng = Rng(0xC0FFEE123);
     let mut runs = 0u64;
 
+    // What this fuzzer actually proves depends on whether a kernel is recognized. For a kernel whose
+    // lowered MIR calls a `wukong_*` symbol, interp and native marshal into the SAME runtime function,
+    // so the bit-exact comparison is a check of the recognizer's base pointers and extents at every
+    // remainder boundary (the class that produced the slice-param base-pointer defect) — valuable,
+    // but NOT a check that the kernel computes the right value. For a kernel that does NOT dispatch,
+    // the two sides are independent codegen and the comparison is a genuine kernel-correctness check.
+    // The `vmath_kernels_match_f64_reference` test covers the transcendental dispatching kernels
+    // against an independent oracle; this split records which class each kernel fell in and refuses
+    // to let the non-dispatching class go empty — the exact way a refactor that made every kernel
+    // recognized would turn this whole test vacuous while leaving it green.
+    let mut all_names: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
+    let mut dispatching_names: std::collections::BTreeSet<&'static str> =
+        std::collections::BTreeSet::new();
+
     for k in kernels() {
+        all_names.insert(k.name);
         let sizes = if matches!(k.name, "matmul" | "linear") || k.name.starts_with("tensor") {
             MM_SIZES
         } else {
@@ -573,6 +588,14 @@ fn fuzz_full_buffer_interp_vs_native() {
                     wukong_mir_build::lower_program(&module, &sema, &mut interner);
                 assert!(ld.iter().all(|d| !d.is_error()), "{}: lower {ld:?}", k.name);
                 wukong_opt::optimize(&mut program, opt);
+                // Classify once per kernel, from the un-reordered opt=0 lowering: a recognizer fires
+                // in mir_build (before the optimizer), so its call is already present here.
+                if opt == 0 {
+                    let mir = wukong_mir::print::print_program(&program, &interner);
+                    if mir.contains("call wukong_") {
+                        dispatching_names.insert(k.name);
+                    }
+                }
                 let handle = crate::jit_module(&program, &interner).expect("jit_module");
                 let ptr = handle.func_ptr(kbench).expect("func_ptr kbench");
                 let native: K3 = unsafe { std::mem::transmute(ptr) };
@@ -616,6 +639,31 @@ fn fuzz_full_buffer_interp_vs_native() {
     }
     // A floor so an accidental empty corpus (e.g. a refactor that drops every kernel) fails loudly.
     assert!(runs > 1000, "fuzzer ran too few cases: {runs}");
+
+    let dispatching = dispatching_names.len();
+    let non_dispatching = all_names.len() - dispatching;
+    eprintln!(
+        "fuzzer classification: {} kernels total — {dispatching} dispatch a wukong_* symbol \
+         (interp-vs-native checks the recognizer's base pointers/extents), {non_dispatching} do not \
+         (interp-vs-native checks kernel values). Dispatching: {dispatching_names:?}",
+        all_names.len()
+    );
+    // The interp-vs-native arm only PROVES a kernel's value where neither side dispatches (otherwise
+    // both marshal into one runtime symbol). If that class ever empties, this test still runs >1000
+    // cases and stays green while proving nothing about any kernel — the precise vacuity this gate
+    // exists to refuse. (The transcendental dispatching kernels keep their own oracle in
+    // `vmath_kernels_match_f64_reference`.)
+    assert!(
+        non_dispatching > 0,
+        "every fuzzer kernel now lowers to a recognized wukong_* call, so the interp-vs-native \
+         bit-exact comparison is two callers of one runtime function for every case and proves \
+         nothing about kernel values — add or restore a non-recognized kernel to the corpus"
+    );
+    assert!(
+        dispatching > 0,
+        "no fuzzer kernel dispatches a recognized wukong_* call — the recognizer base-pointer/extent \
+         coverage this fuzzer is relied on for is gone"
+    );
 }
 
 type K3i8 = unsafe extern "C" fn(*const u8, *const i8, *mut i32);

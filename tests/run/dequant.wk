@@ -1,5 +1,7 @@
 // RUN: --run
 // EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: -1
 // EXPECT-OUT: 1
 // EXPECT-OUT: 2
 // EXPECT-OUT: 4
@@ -27,10 +29,6 @@ fn main() -> i32 {
     for j in 0..32 {
         out[j] = (q[j] as f32) * scale;
     }
-    print(round(out[4]) as i32); // 4 * 0.25 = 1
-    print(round(out[8]) as i32); // 8 * 0.25 = 2
-    print(round(out[16]) as i32); // 16 * 0.25 = 4
-    print(round(out[28]) as i32); // 28 * 0.25 = 7
 
     // int8 weight dequant with a fused ReLU: out2[j] = max((q2[j] as f32) * 0.5, 0).
     let mut q2: [i8; 32] = [0 as i8; 32];
@@ -42,6 +40,36 @@ fn main() -> i32 {
     for j in 0..32 {
         out2[j] = fmax((q2[j] as f32) * scale2, 0.0);
     }
+
+    // Every lane against the scalar definition (the kernel is gate-blind, and printing four of 32
+    // lanes let a permutation or partial write in the other 28 pass). `want` is a scalar temp, not
+    // an array store, so it is not itself recognized as a second dequant map. A count of 0 and a
+    // first-bad-index of -1 mean all 64 lanes (both buffers) are exact; integer->f32 with a
+    // power-of-two scale is exact, so there is no tolerance here.
+    let mut bad: i32 = 0;
+    let mut first: i32 = -1;
+    for j in 0..32 {
+        let want: f32 = (q[j] as f32) * scale;
+        if out[j] != want {
+            bad = bad + 1;
+            if first < 0 { first = j as i32; }
+        }
+    }
+    for j in 0..32 {
+        let want2: f32 = fmax((q2[j] as f32) * scale2, 0.0);
+        if out2[j] != want2 {
+            bad = bad + 1;
+            if first < 0 { first = (32 + j) as i32; }
+        }
+    }
+    print(bad); // 0
+    print(first); // -1
+
+    print(round(out[4]) as i32); // 4 * 0.25 = 1
+    print(round(out[8]) as i32); // 8 * 0.25 = 2
+    print(round(out[16]) as i32); // 16 * 0.25 = 4
+    print(round(out[28]) as i32); // 28 * 0.25 = 7
+
     print(round(out2[0]) as i32); // max(-16*0.5,0) = 0
     print(round(out2[16]) as i32); // max(0*0.5,0)  = 0
     print(round(out2[20]) as i32); // max(4*0.5,0)  = 2

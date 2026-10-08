@@ -29,10 +29,20 @@
 //! Source, flags, compiler/target, and inherited ambient configuration are inputs held fixed for
 //! each comparison; these checks do not establish independence from environment configuration.
 //!
-//! CAVEAT worth stating so a pass is not over-read: the "three independent hash seeds" mechanism
-//! only bites std `HashMap`/`HashSet`. The optimizer's `FxHash*` maps have a FIXED seed and are
-//! cross-process reproducible by construction, so these gates cannot detect an insertion-order
-//! dependency in those. That axis needs a different instrument.
+//! The environment axis has its own arm, [`mir_emission_does_not_depend_on_ambient_kill_switches`]:
+//! every other test here inherits the ambient environment into all three child processes, so a
+//! `WUKONG_*` kill-switch exported in the developer's shell is held equal across the comparison and
+//! is invisible to it. That arm pins the emitted MIR against a run with the known compilation-
+//! affecting variables explicitly removed, turning "a stray exported kill-switch silently changed my
+//! build" into a named failure.
+//!
+//! CAVEAT worth stating so a pass is not over-read, and a KNOWN GAP recorded here rather than left
+//! implicit: the "three independent hash seeds" mechanism only bites std `HashMap`/`HashSet`. The
+//! optimizer's `FxHash*` maps have a FIXED seed and are cross-process reproducible by construction,
+//! so these gates cannot detect an insertion-order dependency in those. Closing it needs an
+//! instrument these process-level tests cannot provide — a debug-only seed override or a
+//! shuffled-insertion-order build inside `wukong_opt` — so it is tracked as an open gap, not a
+//! property any test in this file establishes.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -113,6 +123,37 @@ fn emit_obj_o2(path: &Path, dst: &Path, serial_codegen: bool) -> Option<Vec<u8>>
         return None;
     }
     std::fs::read(dst).ok()
+}
+
+/// The `WUKONG_*` environment variables that change the MIR `--emit=mir` prints. Enumerated so the
+/// hermeticity arm below is grounded rather than guessing: `WUKONG_NO_RECOGNIZE` removes recognizer
+/// dispatch (`wukong_driver`), `WUKONG_P4_NO_256` disables the 256-bit veckernel recipe
+/// (`wukong_mir_build`), and the three optimizer kill-switches gate vectorization, unrolling and the
+/// induction-variable ramp (`wukong_opt`). Pure tracing switches (`WUKONG_VEC_TRACE`), the linker
+/// (`WUKONG_BUILD_RUSTC`) and the GPU-only variables are deliberately excluded: they do not alter
+/// the emitted MIR. A new kill-switch that does must be added here in the same change.
+const MIR_AFFECTING_ENV: &[&str] = &[
+    "WUKONG_NO_RECOGNIZE",
+    "WUKONG_P4_NO_256",
+    "WUKONG_NO_VECTORIZE",
+    "WUKONG_NO_UNROLL",
+    "WUKONG_NO_IV_RAMP",
+];
+
+/// `--emit=mir -O2` for one program in a fresh process with `removed` cleared from the child's
+/// environment; returns (succeeded, stdout-bytes).
+fn emit_mir_o2_without(path: &Path, removed: &[&str]) -> (bool, Vec<u8>) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_wukongc"));
+    for v in removed {
+        cmd.env_remove(v);
+    }
+    let out = cmd
+        .arg("--emit=mir")
+        .arg("-O2")
+        .arg(path)
+        .output()
+        .expect("failed to spawn wukongc");
+    (out.status.success(), out.stdout)
 }
 
 /// The JSON diagnostic stream for one compile-fail fixture in a fresh process; returns stderr bytes.
@@ -405,4 +446,50 @@ fn diagnostic_emission_is_deterministic_across_processes() {
         "diagnostic determinism: compared {compared} of {} fixtures x3 processes",
         fixtures.len()
     );
+}
+
+/// The emitted MIR must not depend on any ambient `WUKONG_*` kill-switch.
+///
+/// Every other gate in this file inherits the ambient environment into all of its child processes,
+/// so a developer who has `WUKONG_NO_VECTORIZE` (or any of [`MIR_AFFECTING_ENV`]) exported from an
+/// earlier A/B gets a different `--emit=mir` on every one of those runs and none of them notices —
+/// the setting is held equal across the comparison. This arm is the one that can see it: it compiles
+/// each program once under the ambient environment and once with every known compilation-affecting
+/// variable explicitly removed, and asserts the bytes match. In a clean environment (CI) both runs
+/// are identical and this is a cheap confirmation; in a shell with a kill-switch exported it fails
+/// by name, which is exactly the "pure function of its input" claim the module header makes, checked
+/// against the one input the other arms silently share.
+///
+/// Representative rather than a corpus sweep: programs chosen so every switch in the list is live —
+/// a recognized GEMM and a recognized transcendental loop (recognition + the 256-bit recipe), an
+/// elementwise and a scan loop (vectorization, the IV ramp, unrolling).
+#[test]
+fn mir_emission_does_not_depend_on_ambient_kill_switches() {
+    for name in [
+        "tensor_matmul.wk",
+        "transcendental_kernel.wk",
+        "softmax.wk",
+        "saxpy.wk",
+        "scan_1d.wk",
+    ] {
+        let p = repo_dir("run").join(name);
+        let (ok_ambient, ambient) = emit_mir_o2(&p);
+        let (ok_hermetic, hermetic) = emit_mir_o2_without(&p, MIR_AFFECTING_ENV);
+        assert!(
+            ok_ambient && ok_hermetic,
+            "{name}: `--emit=mir -O2` failed (ambient ok={ok_ambient}, hermetic ok={ok_hermetic})"
+        );
+        assert!(
+            !ambient.is_empty(),
+            "{name}: `--emit=mir -O2` produced no MIR to compare"
+        );
+        assert!(
+            ambient == hermetic,
+            "{name}: the emitted MIR depends on an ambient WUKONG_* kill-switch — one of \
+             {MIR_AFFECTING_ENV:?} is exported in this environment and is silently changing the \
+             build. Compilation must be a pure function of its input; unset it before building, or \
+             if you added a new kill-switch, add it to MIR_AFFECTING_ENV in the same change."
+        );
+    }
+    eprintln!("environment hermeticity: 5 programs, ambient vs {MIR_AFFECTING_ENV:?}-cleared MIR");
 }

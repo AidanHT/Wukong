@@ -4,17 +4,36 @@
 // EXPECT-OUT: 25378
 // EXPECT-OUT: 24621
 // EXPECT-OUT: 34621
+// EXPECT-OUT: 5
+// EXPECT-OUT: 7
+// EXPECT-OUT: 52.5
+// EXPECT-OUT: 103.5
 module tests.run.sdpa
 
 // Fused scaled-dot-product attention: out = softmax(scale·Q·Kᵀ)·V, computed by the runtime
 // flash-attention kernel (no S×S score matrix). One head, S=2 tokens, D=2.
 //
-// With Q = K = I and scale = 1, the score rows are [1,0] and [0,1], so each row's weights are
-// softmax([1,0]) = [e/(e+1), 1/(e+1)] = [0.731059, 0.268941]:
+// CASE 1 — non-causal, Q = K = I, scale = 1. Score rows are [1,0] and [0,1], so each row's weights
+// are softmax([1,0]) = [e/(e+1), 1/(e+1)] = [0.731059, 0.268941]:
 //   out0 = 0.731059·[1,2] + 0.268941·[3,4] = [1.53788, 2.53788]
 //   out1 = 0.268941·[1,2] + 0.731059·[3,4] = [2.46212, 3.46212]
 // Printed ×10000 (truncated): 15378 / 25378 / 24621 / 34621 — hand-computed, independent of the
 // kernel (the differential gate alone can't catch a recognizer bug, since both backends run it).
+//
+// CASE 2 — CAUSAL mask ON (the last argument is 1). Case 1 never takes the causal branch, which is
+// the branch that matters for decoding, and its output is not exactly representable so it can only
+// be pinned through a truncating cast. Case 2 is constructed so every output lane is an EXACT f32
+// and so that the causal flag is observable:
+//   V = [[5,7],[100,200]] (the two value rows are very different), K's two rows are EQUAL.
+//   Row 0 under causal attends ONLY key 0, softmax of a single score is exactly 1, so
+//     out row0 = V row0 = [5, 7]   EXACTLY.
+//   Row 1 attends keys 0 and 1; K's rows are equal so the two scores are equal, softmax is exactly
+//     [0.5, 0.5], so  out row1 = 0.5·([5,7]+[100,200]) = [52.5, 103.5]  EXACTLY.
+// If the causal flag were dropped (treated as 0), row 0 would attend both keys with equal scores
+// and print [52.5, 103.5] instead of [5, 7] — so the exact lanes 5/7 are the causal assertion.
+// Q's values do not affect either row here (row 0 sees one key; row 1's scores are equal because
+// K's rows are), and neither does the scale; what case 2 proves exactly is the causal masking, the
+// V read and the S/D shape plumbing. The non-causal weighting of case 1 covers the softmax itself.
 fn main() -> i32 {
     let q: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
     let k: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
@@ -25,5 +44,16 @@ fn main() -> i32 {
     print((out[1] * 10000.0) as i32);
     print((out[2] * 10000.0) as i32);
     print((out[3] * 10000.0) as i32);
+
+    // Case 2: causal ON, exact lanes. K's two rows are equal ([3,1] and [3,1]).
+    let q2: [f32; 4] = [2.0, 3.0, 1.0, 4.0];
+    let k2: [f32; 4] = [3.0, 1.0, 3.0, 1.0];
+    let v2: [f32; 4] = [5.0, 7.0, 100.0, 200.0];
+    let mut out2: [f32; 4] = [-12345.0, -12345.0, -12345.0, -12345.0];
+    sdpa(q2, k2, v2, out2, 2, 2, 1.0, 1);
+    print(out2[0]); // 5     — row0 attends only key0 under the causal mask -> V row0
+    print(out2[1]); // 7
+    print(out2[2]); // 52.5  — row1 weights exactly [0.5,0.5] (equal scores) -> 0.5*(V0+V1)
+    print(out2[3]); // 103.5
     return 0;
 }

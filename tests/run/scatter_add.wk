@@ -1,8 +1,10 @@
 // RUN: --run
 // EXPECT-EXIT: 0
 // EXPECT-OUT: 8
+// EXPECT-OUT: 10
 // EXPECT-OUT: 12
 // EXPECT-OUT: 14
+// EXPECT-OUT: 16
 // EXPECT-OUT: 18
 // EXPECT-OUT: 78
 module tests.run.scatter_add
@@ -29,9 +31,14 @@ fn main() -> i32 {
 
     // row 0 = grad_out[0] + grad_out[2] = [1,2,3] + [7,8,9]    = [8,10,12]
     // row 1 = grad_out[1] + grad_out[3] = [4,5,6] + [10,11,12] = [14,16,18]
+    // Every lane printed individually, in index order: grad_w[1] and grad_w[4] used to be pinned
+    // only through the conservation sum below, so swapping them (a mis-strided accumulate within a
+    // row) was invisible. Now each of the six lanes is asserted on its own.
     print(grad_w[0] as i32); // 8
+    print(grad_w[1] as i32); // 10
     print(grad_w[2] as i32); // 12
     print(grad_w[3] as i32); // 14
+    print(grad_w[4] as i32); // 16
     print(grad_w[5] as i32); // 18
 
     // Conservation: Σ grad_w == Σ grad_out = 1+2+...+12 = 78 (every token's gradient lands somewhere).

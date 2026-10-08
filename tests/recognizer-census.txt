@@ -386,7 +386,7 @@ traits_static_dispatch.wk:
 transcendental.wk:
 transcendental_f64.wk: wukong_rt_math2_f64 wukong_rt_math2_f64*4 wukong_rt_math_f64 wukong_rt_math_f64*41
 transcendental_kernel.wk: wukong_vmath_f32
-transcendental_sweep.wk: wukong_vmath_f32 wukong_vmath_f32*3 wukong_vmath_f32_parallel wukong_vmath_f32_parallel*2
+transcendental_sweep.wk: wukong_vmath_f32 wukong_vmath_f32*4 wukong_vmath_f32_parallel wukong_vmath_f32_parallel*2
 transformer_block.wk: wukong_norm_f32 wukong_norm_f32*3 wukong_sgemm wukong_sgemm_nt wukong_sgemm_nt*3 wukong_velem_f32 wukong_velem_f32*2
 transformer_block_tensor.wk: veckernel*2 wukong_norm_f32 wukong_norm_f32*3 wukong_sgemm wukong_sgemm_nt wukong_sgemm_nt*3
 transpose.wk:
