@@ -5416,9 +5416,12 @@ mod tests {
             "fn f() { let x = 5f32; }",
             "fn f() { let x = 9000000000; }",
         ] {
+            // Before the split this was `E0401`, the catch-all: keep ruling that out too, so a
+            // valid program regressing to a plain type mismatch is still caught here.
+            let es = errors(src);
             assert!(
-                !errors(src).contains(&"E0431"),
-                "unexpected E0431 for {src:?}"
+                !es.contains(&"E0431") && !es.contains(&"E0401"),
+                "unexpected type error for {src:?}: {es:?}"
             );
         }
     }
@@ -5465,9 +5468,12 @@ mod tests {
             "fn f(a: f32, b: f32) -> bool { return a >= b; }",
             "fn f() -> bool { let x = true; let y = false; return x == y || !x; }",
         ] {
+            // Before the split this was `E0401`, the catch-all: keep ruling that out too, so a
+            // valid program regressing to a plain type mismatch is still caught here.
+            let es = errors(src);
             assert!(
-                !errors(src).contains(&"E0433"),
-                "unexpected E0433 for {src:?}"
+                !es.contains(&"E0433") && !es.contains(&"E0401"),
+                "unexpected type error for {src:?}: {es:?}"
             );
         }
     }
@@ -5491,9 +5497,12 @@ mod tests {
             "fn f(a: i32, b: i32) -> bool { return a == b; }",
             "fn f(a: i32, b: i32, c: i32, d: i32) -> bool { return (a < b) == (c < d); }",
         ] {
+            // Before the split this was `E0401`, the catch-all: keep ruling that out too, so a
+            // valid program regressing to a plain type mismatch is still caught here.
+            let es = errors(src);
             assert!(
-                !errors(src).contains(&"E0433"),
-                "unexpected E0433 for {src:?}"
+                !es.contains(&"E0433") && !es.contains(&"E0401"),
+                "unexpected type error for {src:?}: {es:?}"
             );
         }
     }
@@ -5515,9 +5524,12 @@ mod tests {
             "fn f() -> bool { let a = true; return !a && (a || a); }",
             "fn f() -> i32 { let a: [i32; 2] = [10, 20]; let i = 1; return a[i]; }",
         ] {
+            // Before the split this was `E0401`, the catch-all: keep ruling that out too, so a
+            // valid program regressing to a plain type mismatch is still caught here.
+            let es = errors(src);
             assert!(
-                !errors(src).contains(&"E0433"),
-                "unexpected E0433 for {src:?}"
+                !es.contains(&"E0433") && !es.contains(&"E0401"),
+                "unexpected type error for {src:?}: {es:?}"
             );
         }
     }
