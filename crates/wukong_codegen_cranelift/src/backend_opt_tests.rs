@@ -112,6 +112,7 @@ fn parallel_jit_population_matches_serial() {
                 main,
                 &interner,
                 false,
+                crate::TargetCpu::Native,
                 BackendOpt::default(),
                 parallel,
             )
