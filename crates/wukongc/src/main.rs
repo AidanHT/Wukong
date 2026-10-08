@@ -36,7 +36,9 @@ OPTIONS:
     --train-weight-decay=<f>  AdamW decoupled weight decay, finite and >= 0 (default: 0)
     --train-opt=<o>    Optimizer: sgd, adamw  (default: sgd)
     --train-seed=<n>   Seed for deterministic buffer initialization
-    --run              Compile and run (interpreter by default; see --backend)
+    --run              Compile and run (interpreter by default; see --backend). The program's
+                       stdout streams as it runs: per line on a terminal, in blocks into a pipe
+                       or a file
     --backend=<b>      Execution backend: interp, native, gpu, gpu-native  (default: interp)
                        (gpu/gpu-native require --features gpu and a CUDA device; gpu is the
                        recognizer offload, gpu-native lowers the whole program's MIR to PTX)

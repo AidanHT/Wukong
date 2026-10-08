@@ -18,7 +18,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Mutex;
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -121,31 +121,78 @@ fn take_failure() -> Option<String> {
     Some(recorded.unwrap_or_else(|| "assertion failed".to_owned()))
 }
 
-/// Append `bytes` to the run's captured stdout — the one sink every JIT print entry writes through.
+/// How a guarded run's stdout leaves [`OUTPUT`]: [`STREAM_CAPTURE`] keeps it for the caller
+/// ([`JitProgram::run_capturing`]); the two streaming modes ([`JitProgram::run_streaming`]) write it
+/// through to the process's stdout at every newline, or once [`STREAM_BLOCK`] bytes are buffered.
+static STREAM_MODE: AtomicU8 = AtomicU8::new(STREAM_CAPTURE);
+const STREAM_CAPTURE: u8 = 0;
+const STREAM_LINES: u8 = 1;
+const STREAM_BLOCKS: u8 = 2;
+/// The block a block-buffered streaming run writes stdout in (the interpreter's, too).
+const STREAM_BLOCK: usize = 1 << 16;
+
+/// Write everything buffered in `o` to the process's stdout and clear it.
+fn drain_output(o: &mut Vec<u8>) {
+    use std::io::Write as _;
+    let out = std::io::stdout();
+    let mut out = out.lock();
+    let _ = out.write_all(o);
+    let _ = out.flush();
+    o.clear();
+}
+
+/// Append `bytes` to the run's stdout — the one sink every JIT print entry writes through. A
+/// streaming run writes it on to the process's stdout per [`STREAM_MODE`].
 pub(crate) fn emit_stdout(bytes: &[u8]) {
+    let mode = STREAM_MODE.load(Ordering::SeqCst);
     if let Ok(mut o) = OUTPUT.lock() {
         o.extend_from_slice(bytes);
+        let write = match mode {
+            STREAM_LINES => bytes.contains(&b'\n'),
+            STREAM_BLOCKS => o.len() >= STREAM_BLOCK,
+            _ => false,
+        };
+        if write {
+            drain_output(&mut o);
+        }
+    }
+}
+
+/// Turns streaming on for one guarded run; dropping it (also while a panic unwinds) turns it off
+/// and writes out what is still buffered.
+struct StreamGuard;
+
+impl StreamGuard {
+    fn on(line_buffered: bool) -> StreamGuard {
+        let mode = if line_buffered {
+            STREAM_LINES
+        } else {
+            STREAM_BLOCKS
+        };
+        STREAM_MODE.store(mode, Ordering::SeqCst);
+        StreamGuard
+    }
+}
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        STREAM_MODE.store(STREAM_CAPTURE, Ordering::SeqCst);
+        drain_output(&mut OUTPUT.lock().unwrap_or_else(|e| e.into_inner()));
     }
 }
 
 extern "C" fn rt_print_i64(x: i64) {
-    if let Ok(mut o) = OUTPUT.lock() {
-        o.extend_from_slice(format!("{x}\n").as_bytes());
-    }
+    emit_stdout(format!("{x}\n").as_bytes());
 }
 
 // `print`/`println` of an *unsigned* integer lowers to this (mir_build zero-extends the value to 64
 // bits first). Renders the bits as `u64` — the identical text the interpreter's `print_u` produces.
 extern "C" fn rt_print_u64(x: u64) {
-    if let Ok(mut o) = OUTPUT.lock() {
-        o.extend_from_slice(format!("{x}\n").as_bytes());
-    }
+    emit_stdout(format!("{x}\n").as_bytes());
 }
 
 extern "C" fn rt_print_f64(x: f64) {
-    if let Ok(mut o) = OUTPUT.lock() {
-        o.extend_from_slice(format!("{x}\n").as_bytes());
-    }
+    emit_stdout(format!("{x}\n").as_bytes());
 }
 
 // `print`/`println` of a `*u8` string lowers to this. Reads the NUL-terminated byte buffer the
@@ -156,16 +203,15 @@ extern "C" fn rt_print_str(ptr: *const u8) {
         return;
     }
     // SAFETY: `ptr` is a Wukong string buffer, always NUL-terminated by the `ExprKind::Str` lowering.
-    unsafe {
+    let mut line = unsafe {
         let mut len = 0usize;
         while *ptr.add(len) != 0 {
             len += 1;
         }
-        if let Ok(mut o) = OUTPUT.lock() {
-            o.extend_from_slice(std::slice::from_raw_parts(ptr, len));
-            o.push(b'\n');
-        }
-    }
+        std::slice::from_raw_parts(ptr, len).to_vec()
+    };
+    line.push(b'\n');
+    emit_stdout(&line);
 }
 
 extern "C" fn rt_assert(cond: i64) {
@@ -4477,6 +4523,27 @@ impl JitProgram {
         match take_failure() {
             Some(failure) => (Err(failure), out),
             None => (Ok(exit_code), out),
+        }
+    }
+
+    /// Run once with stdout **streamed** to the process's stdout as it is produced — what
+    /// `wukongc --run --backend=native` does, the native twin of `wukong_interp::run_streaming`:
+    /// `line_buffered` writes at every newline (an interactive terminal), otherwise in 64 KiB blocks.
+    /// Everything still buffered is written out before this returns, also when the run stopped on a
+    /// runtime failure, which is returned as the error. Same stack and failure contract as
+    /// [`JitProgram::run_capturing`]; the bytes are exactly the ones it would have captured.
+    pub fn run_streaming(&self, line_buffered: bool) -> Result<i64, String> {
+        let _guard = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        reset_failure();
+        let stream = StreamGuard::on(line_buffered);
+        let code = self.code as usize;
+        let ret = self.ret.clone();
+        let exit_code = run_on_big_stack(move || unsafe { invoke_code(code, &ret) });
+        drop(stream);
+        match take_failure() {
+            Some(failure) => Err(failure),
+            None => Ok(exit_code),
         }
     }
 

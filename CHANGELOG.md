@@ -26,6 +26,10 @@ All notable changes to Wukong are documented here. The format is loosely based o
   writers `write_stdout` / `write_stderr` / `write_text`. New **`E0449`** (malformed format string)
   and **`E0450`** (placeholder count or spec/type mismatch). One `wukong_runtime::fmt` renders for
   every backend (`tests/run/printf_format.wk`, `tests/run/print_aggregate.wk`).
+- **`--run` streams stdout** on the interpreter and the native JIT (new
+  `wukong_interp::run_streaming`, `JitProgram::run_streaming`): per line on a terminal, in 64 KiB
+  blocks into a pipe or file, so a training loop shows its progress instead of nothing until it
+  ends. The bytes are the ones a capturing run returns; the differential gates still capture.
 
 ### Optimizer memory passes: SROA, path DSE, loop deletion, guarded LICM, scalar promotion (`gap/opt-memory`)
 

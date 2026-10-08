@@ -639,6 +639,10 @@ another architecture or OS is not supported. A native-backend failure is a catal
   `eprint` / `eprintln`, and the raw byte writers `write_stdout` / `write_stderr` / `write_text`
   (`tests/run/printf_format.wk`). 🟡 The `cc` fallback link has no formatting runtime, and there is
   still no string *type* beyond `*u8` (a `sprintf` buffer is a `[u8; N]`).
+- **`--run` streams stdout** on the interpreter and the native JIT — per line on a terminal, in
+  64 KiB blocks into a pipe — instead of holding everything until the program ends, so a training
+  loop shows its progress and output printed before a runtime failure is already out. The GPU
+  backends still collect their output and print it after the device run.
 - **Source-text diagnostics.** A Unicode lookalike of ASCII punctuation or whitespace (`−` U+2212
   for `-`, `×`, `≤`, fullwidth brackets, curly quotes, no-break/zero-width spaces; ~50 entries) is
   **`E0105`**, naming the code point and the ASCII character it imitates, and the lexer reads it

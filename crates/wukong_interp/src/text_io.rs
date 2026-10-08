@@ -68,7 +68,7 @@ impl Interp<'_, '_> {
             if target == TARGET_STDERR {
                 let _ = std::io::stderr().lock().write_all(bytes);
             } else {
-                self.stdout.extend_from_slice(bytes);
+                self.emit_stdout(bytes);
             }
             let end = pos.saturating_add(i64::try_from(bytes.len()).unwrap_or(i64::MAX));
             return Ok(Value::Int(i128::from(end)));

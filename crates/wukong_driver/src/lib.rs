@@ -696,15 +696,22 @@ pub fn compile(opts: &Options) -> i32 {
         } else {
             "run"
         });
-        // The CPU paths report what the program printed *before* a runtime failure (a failed
-        // `assert`, a slice index out of bounds) along with the failure, so `--run` shows the same
-        // stdout a linked executable does — the output is printed, then `error: …`, exit 1.
+        // The CPU paths STREAM the program's stdout as it is produced — at every newline on a
+        // terminal, in 64 KiB blocks into a pipe or file — so a long run shows its progress, and a
+        // run that stops on a runtime failure (a failed `assert`, a slice index out of bounds) has
+        // already shown everything it printed before it: the same stdout a linked executable
+        // shows, then `error: …`, exit 1. The GPU paths still collect their output and print it
+        // here, after the device run.
+        let line_buffered = std::io::IsTerminal::is_terminal(&std::io::stdout());
         let split = |r: Result<(i64, Vec<u8>), String>| match r {
             Ok((code, out)) => (Ok(code), out),
             Err(e) => (Err(e), Vec::new()),
         };
         let (result, stdout) = match opts.backend {
-            BackendKind::Interp => wukong_interp::run_capturing(&program, main, &interner),
+            BackendKind::Interp => (
+                wukong_interp::run_streaming(&program, main, &interner, line_buffered),
+                Vec::new(),
+            ),
             // Compile and run are separate steps so a *compile* failure is rendered as a
             // catalogued diagnostic (honouring `--error-format=json`), while a *run-time* failure
             // (an assertion, a bounds check) keeps the `error: <message>` form below, after the
@@ -721,7 +728,7 @@ pub fn compile(opts: &Options) -> i32 {
                 ) {
                     Ok(compiled) => {
                         timer.begin("run");
-                        compiled.run_capturing()
+                        (compiled.run_streaming(line_buffered), Vec::new())
                     }
                     Err(message) => {
                         emit_diag(

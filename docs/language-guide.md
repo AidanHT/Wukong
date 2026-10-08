@@ -1766,6 +1766,9 @@ continue a long subtraction and is not reported.
 wukongc [OPTIONS] <input.wk>
 
 --run                 compile and execute (interpreter by default; see --backend).
+                      The program's stdout streams as it runs (per line on a terminal, in 64 KiB
+                      blocks into a pipe or file) on interp and native, so a long run shows its
+                      progress and a failing one has shown everything it printed before the error.
                       Mutually exclusive with --emit=<stage>: the compiler honours exactly one of
                       them, so the combination is rejected rather than silently discarding one.
 --backend=<b>         interp | native | gpu | gpu-native   (default: interp)

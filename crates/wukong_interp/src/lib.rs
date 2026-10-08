@@ -10,6 +10,7 @@
 //! does depend on the workspace's `wukong_runtime`, so a recognized kernel call runs the *identical*
 //! microkernel the native backend links.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use wukong_backend::{Artifact, Backend};
 use wukong_mir::{
@@ -475,6 +476,25 @@ pub fn run_with_output(
     result.map(|code| (code, stdout))
 }
 
+/// How a run's stdout leaves the interpreter — see [`run_streaming`]. Thread-local because every
+/// run executes on its own [`with_big_stack`] worker thread, and set only there.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StdoutMode {
+    /// Collect everything for the caller (`run_capturing`, the kernel entries, the tests).
+    Capture,
+    /// Write through to the process's stdout at every newline (an interactive terminal).
+    LineBuffered,
+    /// Write through to the process's stdout in blocks of [`STREAM_BLOCK`] bytes (a pipe or file).
+    BlockBuffered,
+}
+
+thread_local! {
+    static STDOUT_MODE: Cell<StdoutMode> = const { Cell::new(StdoutMode::Capture) };
+}
+
+/// The block a block-buffered streaming run writes stdout in.
+const STREAM_BLOCK: usize = 1 << 16;
+
 /// Run `entry` and return its exit code or its run error **together with everything it printed
 /// before it stopped** — also when it stopped on a runtime failure (a failed `assert`, a slice
 /// bounds failure). A linked executable has always kept that output (its prints reach stdout as
@@ -485,6 +505,36 @@ pub fn run_capturing(
     entry: Symbol,
     interner: &Interner,
 ) -> (Result<i64, String>, Vec<u8>) {
+    run_with_stdout(program, entry, interner, StdoutMode::Capture)
+}
+
+/// Run `entry` with its stdout **streamed** to the process's stdout as it is produced, rather than
+/// collected until it ends — what `wukongc --run` does, so a long run shows its progress and a run
+/// that fails has already shown everything it printed before the failure. `line_buffered` writes at
+/// every newline (pass it for an interactive terminal); otherwise output goes out in 64 KiB blocks,
+/// as C's stdio and CPython buffer a pipe. Whatever is still buffered is flushed before this returns,
+/// on success and on a runtime failure alike. The bytes are exactly the ones [`run_capturing`]
+/// would have returned.
+pub fn run_streaming(
+    program: &Program,
+    entry: Symbol,
+    interner: &Interner,
+    line_buffered: bool,
+) -> Result<i64, String> {
+    let mode = if line_buffered {
+        StdoutMode::LineBuffered
+    } else {
+        StdoutMode::BlockBuffered
+    };
+    run_with_stdout(program, entry, interner, mode).0
+}
+
+fn run_with_stdout(
+    program: &Program,
+    entry: Symbol,
+    interner: &Interner,
+    mode: StdoutMode,
+) -> (Result<i64, String>, Vec<u8>) {
     // The tree-walker recurses on the *host* call stack — one host frame per Wukong call — so a
     // deeply recursive Wukong program would overflow the default main-thread stack and **abort**
     // the process (a stack overflow is uncatchable). The interpreter is the correctness oracle; an
@@ -494,6 +544,7 @@ pub fn run_capturing(
     // reports a diagnostic instead of overflowing even 512 MiB. Every other public entry point
     // does the same — they are all the same tree-walker.
     with_big_stack(|| {
+        STDOUT_MODE.with(|m| m.set(mode));
         let Some(func) = program.function(entry) else {
             return (
                 Err(format!("no entry function `{}`", interner.resolve(entry))),
@@ -519,6 +570,7 @@ pub fn run_capturing(
             depth: 0,
         };
         let result = interp.run_function(func, &[]).map(|v| v.as_int() as i64);
+        interp.flush_stdout();
         (result, interp.stdout)
     })
 }
@@ -1783,13 +1835,40 @@ impl<'a, 'k> Interp<'a, 'k> {
         }
     }
 
+    /// Append printed bytes to this run's stdout. A streaming run ([`run_streaming`]) writes them
+    /// through to the process's stdout at a newline (line-buffered) or once a block has filled.
+    fn emit_stdout(&mut self, bytes: &[u8]) {
+        self.stdout.extend_from_slice(bytes);
+        let write = match STDOUT_MODE.with(Cell::get) {
+            StdoutMode::Capture => false,
+            StdoutMode::LineBuffered => bytes.contains(&b'\n'),
+            StdoutMode::BlockBuffered => self.stdout.len() >= STREAM_BLOCK,
+        };
+        if write {
+            self.flush_stdout();
+        }
+    }
+
+    /// In a streaming run, write out everything buffered so far (a capturing run keeps it).
+    fn flush_stdout(&mut self) {
+        use std::io::Write as _;
+        if STDOUT_MODE.with(Cell::get) == StdoutMode::Capture {
+            return;
+        }
+        let out = std::io::stdout();
+        let mut out = out.lock();
+        let _ = out.write_all(&self.stdout);
+        let _ = out.flush();
+        self.stdout.clear();
+    }
+
     /// `print`/`println` of an `f32` (or an `f16`/`bf16` held in one): the value's shortest
     /// round-trip digits at `f32` precision. The slot holds the value's exact `f64` image, so the
     /// narrowing is exact.
     fn print_f32(&mut self, args: &[Value]) -> Result<Value, String> {
         let x = args.first().map_or(0.0, |v| v.as_float()) as f32;
         let text = wukong_runtime::fmt::f32_line(x);
-        self.stdout.extend_from_slice(text.as_bytes());
+        self.emit_stdout(text.as_bytes());
         Ok(Value::Unit)
     }
 
@@ -1803,7 +1882,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                     Value::VecRef(_) => "<vector>\n".to_string(),
                     Value::Unit => "\n".to_string(),
                 };
-                self.stdout.extend_from_slice(text.as_bytes());
+                self.emit_stdout(text.as_bytes());
                 Ok(Value::Unit)
             }
             // The unsigned twin of `print`/`println` (mir_build routes an unsigned-integer argument
@@ -1815,7 +1894,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                     Value::Int(i) => format!("{}\n", i as u64),
                     other => format!("{}\n", other.as_int() as u64),
                 };
-                self.stdout.extend_from_slice(text.as_bytes());
+                self.emit_stdout(text.as_bytes());
                 Ok(Value::Unit)
             }
             // A `bool` / `char` argument to `print`/`println` (mir_build zero-extends it to 64 bits
@@ -1824,13 +1903,13 @@ impl<'a, 'k> Interp<'a, 'k> {
             "print_bool" | "println_bool" => {
                 let v = args.first().map_or(0, |v| v.as_int() as i64);
                 let text = wukong_runtime::fmt::bool_line(v);
-                self.stdout.extend_from_slice(text.as_bytes());
+                self.emit_stdout(text.as_bytes());
                 Ok(Value::Unit)
             }
             "print_char" | "println_char" => {
                 let v = args.first().map_or(0, |v| v.as_int() as i64);
                 let text = wukong_runtime::fmt::char_line(v);
-                self.stdout.extend_from_slice(text.as_bytes());
+                self.emit_stdout(text.as_bytes());
                 Ok(Value::Unit)
             }
             // A `*u8` string argument to `print`/`println` (lowered to these symbols by mir_build):
@@ -1859,7 +1938,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 let mut text = String::from_utf8_lossy(&bytes).into_owned();
                 text.push('\n');
-                self.stdout.extend_from_slice(text.as_bytes());
+                self.emit_stdout(text.as_bytes());
                 Ok(Value::Unit)
             }
             "assert" => {
