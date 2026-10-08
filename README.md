@@ -96,7 +96,10 @@ not duplicate them. In summary, Wukong:
 - **Kernels callable by name.** `matmul`, `linear`, `softmax`, `layernorm`, `rmsnorm`, `transpose`, the
   buffer activations (`gelu(x, out)`, …), `sum`/`dot` and `sdpa` reach the tuned runtime kernels
   directly, with real shape signatures (`E0409` when a dimension cannot be inferred) — the explicit
-  door beside the loop-nest recognizers (`tests/run/builtin_*.wk`).
+  door beside the loop-nest recognizers (`tests/run/builtin_*.wk`). The decode builtins `sdpa_kv`
+  (KV-cache / grouped-query attention), `kv_append`, `gemv_bf16`/`gemv_f16` and the llama.cpp
+  `Q8_0`/`Q4_0` packers and GEMVs check their geometry against their operands at run time
+  (`tests/run/decode_*.wk`).
 - **Zero hidden cost.** No GC, no implicit copies of large aggregates, no surprise allocations.
 - **Domain-aware optimization (implementation today).** The compiler **recognizes a matmul nest** (the
   `ikj` accumulate and `ijk` dot-product forms, incl. `nn.Linear` `A·Bᵀ`, written naively or
