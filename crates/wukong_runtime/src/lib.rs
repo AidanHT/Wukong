@@ -216,6 +216,10 @@ pub mod cffi;
 /// interpreter, the JIT and a linked executable.
 pub mod fmt;
 
+/// The process interface of a program — its arguments, environment, standard input and `exit` —
+/// shared by the interpreter, the JIT and a linked executable.
+pub mod process;
+
 /// `bf16` (the "brain float": an `f32` truncated to its top 16 bits) round-to-nearest-even from an
 /// `f32`, returning the 16 stored bits. This is the single shared definition the interpreter, the
 /// native backend (which emits the identical integer arithmetic in CLIF), and the bf16 GEMM packer

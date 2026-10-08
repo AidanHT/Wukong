@@ -12,6 +12,12 @@
 //! | `write_stdout(buf, n)` / `write_stderr(buf, n)` | the first `n` bytes of `buf` | `i64` count |
 //! | `write_text(path, buf, n)` | the file `path`, created or truncated | `i64` count or `< 0` |
 //!
+//! And the process interface (`wukong_runtime::process`): `arg_count() -> i64`, `arg(i) -> *u8`
+//! (the empty string when out of range; `arg(0)` is the program), `arg_i64(i, default) -> i64`,
+//! `arg_f32(i, default) -> f32`, `env(name) -> *u8` (the empty string when unset),
+//! `read_stdin_u8(buf) -> i64` (standard input until the buffer is full or input ends) and
+//! `exit(code)` (end the program with `code`, as returning it from `main` would).
+//!
 //! **What prints (E0448).** A scalar (integer, float, `bool`, `char`), a `*u8` string, a C-style
 //! enum (its discriminant), and — rendered structurally, like Rust's `{:?}` — an array, a slice of
 //! scalars, a tuple or a struct whose every element prints; a reference prints what it refers to.
@@ -378,6 +384,20 @@ pub enum TextBuiltin {
     WriteBytes { stderr: bool },
     /// `write_text(path, buf, n) -> i64`.
     WriteText,
+    /// `arg_count() -> i64`.
+    ArgCount,
+    /// `arg(i) -> *u8`.
+    Arg,
+    /// `arg_i64(i, default) -> i64`.
+    ArgI64,
+    /// `arg_f32(i, default) -> f32`.
+    ArgF32,
+    /// `env(name) -> *u8`.
+    Env,
+    /// `exit(code)`.
+    Exit,
+    /// `read_stdin_u8(buf) -> i64`.
+    ReadStdin,
 }
 
 /// The text builtin `name` denotes, or `None`. (`print` / `println` are the original intrinsics,
@@ -398,6 +418,13 @@ pub fn text_builtin(name: &str) -> Option<TextBuiltin> {
         "write_stdout" => TextBuiltin::WriteBytes { stderr: false },
         "write_stderr" => TextBuiltin::WriteBytes { stderr: true },
         "write_text" => TextBuiltin::WriteText,
+        "arg_count" => TextBuiltin::ArgCount,
+        "arg" => TextBuiltin::Arg,
+        "arg_i64" => TextBuiltin::ArgI64,
+        "arg_f32" => TextBuiltin::ArgF32,
+        "env" => TextBuiltin::Env,
+        "exit" => TextBuiltin::Exit,
+        "read_stdin_u8" => TextBuiltin::ReadStdin,
         _ => return None,
     })
 }
@@ -712,7 +739,113 @@ impl Sema<'_> {
                 );
                 i64_ty
             }
+            TextBuiltin::ArgCount
+            | TextBuiltin::Arg
+            | TextBuiltin::ArgI64
+            | TextBuiltin::ArgF32
+            | TextBuiltin::Env
+            | TextBuiltin::Exit
+            | TextBuiltin::ReadStdin => self.type_process_builtin(b, name, args, arg_tys, span),
         })
+    }
+
+    /// The process interface: `arg_count`, `arg`, `arg_i64`, `arg_f32`, `env`, `exit`,
+    /// `read_stdin_u8` (see the module docs).
+    fn type_process_builtin(
+        &mut self,
+        b: TextBuiltin,
+        name: &str,
+        args: &[Expr],
+        arg_tys: &mut [Ty],
+        span: Span,
+    ) -> Ty {
+        let str_ty = Ty::Ptr {
+            mutable: false,
+            pointee: Box::new(Ty::Scalar(Scalar::U8)),
+        };
+        let (shape, ret): (&str, Ty) = match b {
+            TextBuiltin::ArgCount => ("no arguments", Ty::Scalar(Scalar::I64)),
+            TextBuiltin::Arg => ("an integer index", str_ty.clone()),
+            TextBuiltin::ArgI64 => (
+                "an integer index and an integer default",
+                Ty::Scalar(Scalar::I64),
+            ),
+            TextBuiltin::ArgF32 => (
+                "an integer index and a float default",
+                Ty::Scalar(Scalar::F32),
+            ),
+            TextBuiltin::Env => ("a `*u8` variable name", str_ty.clone()),
+            TextBuiltin::Exit => ("an integer exit code", Ty::Unit),
+            _ => ("a `[]u8` or `[u8; N]` buffer", Ty::Scalar(Scalar::I64)),
+        };
+        let want = match b {
+            TextBuiltin::ArgCount => 0,
+            TextBuiltin::ArgI64 | TextBuiltin::ArgF32 => 2,
+            _ => 1,
+        };
+        if args.len() != want {
+            self.error(
+                span,
+                "E0503",
+                format!(
+                    "`{name}` takes {shape}, but {} argument(s) were supplied",
+                    args.len()
+                ),
+            );
+            return ret;
+        }
+        match b {
+            TextBuiltin::Arg | TextBuiltin::ArgI64 | TextBuiltin::ArgF32 => {
+                self.check_int_arg(name, &args[0], &mut arg_tys[0], "argument index");
+                if b == TextBuiltin::ArgI64 {
+                    self.check_int_arg(name, &args[1], &mut arg_tys[1], "default");
+                } else if b == TextBuiltin::ArgF32 {
+                    self.check_float_arg(name, &args[1], &mut arg_tys[1], "default");
+                }
+            }
+            TextBuiltin::Exit => self.check_int_arg(name, &args[0], &mut arg_tys[0], "exit code"),
+            TextBuiltin::Env => match &arg_tys[0] {
+                Ty::Ptr { pointee, .. } if matches!(pointee.as_ref(), Ty::Scalar(Scalar::U8)) => {}
+                Ty::Unknown | Ty::Error => {}
+                other => self.error(
+                    args[0].span,
+                    "E0401",
+                    format!(
+                        "`{name}` expects a `*u8` variable name, found a value of type `{}`",
+                        other.display(self.interner)
+                    ),
+                ),
+            },
+            TextBuiltin::ReadStdin => {
+                self.check_u8_buffer(name, &args[0], &arg_tys[0], 0, true);
+            }
+            _ => {}
+        }
+        ret
+    }
+
+    /// A float operand; an unsuffixed literal adapts to `f32`.
+    fn check_float_arg(&mut self, name: &str, arg: &Expr, ty: &mut Ty, what: &str) {
+        let target = Ty::Scalar(Scalar::F32);
+        if self.literal_adapts(&target, arg) {
+            self.retype_adapted_literal(arg, &target);
+            *ty = target;
+        }
+        let ok = match ty {
+            Ty::Scalar(s) => s.is_float(),
+            Ty::Unknown | Ty::Error => true,
+            _ => false,
+        };
+        if !ok {
+            self.error(
+                arg.span,
+                "E0401",
+                format!(
+                    "`{name}` expects a float {what}, found a value of type `{}`",
+                    ty.display(self.interner)
+                ),
+            );
+        }
     }
 
     /// The format string and arguments of `printf` / `eprintf` / `sprintf`.
@@ -1057,6 +1190,40 @@ mod tests {
             (
                 "fn main() -> i32 { let b: [u8; 4] = [0; 4]; return write_text(b, 1) as i32; }",
                 "E0503",
+            ),
+        ];
+        for (src, code) in cases {
+            let got = errors(src);
+            assert!(got.first() == Some(&code), "{src}: {got:?}");
+        }
+    }
+
+    #[test]
+    fn process_builtins_are_typed() {
+        let ok = "fn main() -> i32 { let n: i64 = arg_count(); let p: *u8 = arg(1); \
+                  let k: i64 = arg_i64(2, 10); let x: f32 = arg_f32(3, 0.5); \
+                  let h: *u8 = env(\"HOME\"); let mut b: [u8; 8] = [0; 8]; \
+                  let r: i64 = read_stdin_u8(b); if n > 9 { exit(2); } \
+                  print(p); print(h); return (k + r) as i32 + x as i32; }";
+        assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
+        let cases = [
+            ("fn main() -> i32 { return arg_count(1) as i32; }", "E0503"),
+            ("fn main() -> i32 { print(arg(1.5)); return 0; }", "E0401"),
+            (
+                "fn main() -> i32 { return arg_f32(1, true) as i32; }",
+                "E0401",
+            ),
+            ("fn main() -> i32 { print(env(3)); return 0; }", "E0401"),
+            ("fn main() -> i32 { exit(); return 0; }", "E0503"),
+            (
+                "fn f(b: [u8; 4]) -> i64 { return read_stdin_u8(b); } \
+                 fn main() -> i32 { return 0; }",
+                "E0304",
+            ),
+            // `exit` returns nothing to bind.
+            (
+                "fn main() -> i32 { let x: i32 = exit(1); return x; }",
+                "E0401",
             ),
         ];
         for (src, code) in cases {

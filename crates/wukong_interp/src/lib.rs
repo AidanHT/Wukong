@@ -319,8 +319,13 @@ fn read_file_elements(
 // The interpreter twins of the ML builtins' runtime entries, beside the frozen decoder above.
 mod ml_io;
 
-// The interpreter twins of the text runtime entries (`printf`, `sprintf`, structural `print`).
+// The interpreter twins of the text runtime entries (`printf`, `sprintf`, structural `print`) and
+// of the process interface (`arg`, `env`, `read_stdin_u8`, `exit`).
 mod text_io;
+
+/// Install the program's argument vector (`arg(0)` is the program) for an in-process run — the
+/// interpreter's, and the JIT's, which reads the same `wukong_runtime` state.
+pub use wukong_runtime::process::set_program_args;
 
 /// Pointers at or above this value encode a function index (`FUNC_TAG + idx`) rather than a memory
 /// address — how `Op::FuncAddr` is represented for `parallel_for` to call back. Real `alloca`
@@ -569,7 +574,11 @@ fn run_with_stdout(
             accel: None,
             depth: 0,
         };
-        let result = interp.run_function(func, &[]).map(|v| v.as_int() as i64);
+        let result = match interp.run_function(func, &[]) {
+            Ok(v) => Ok(v.as_int() as i64),
+            // `exit(code)` stops the run with the sentinel error; the code is the run's result.
+            Err(e) => wukong_runtime::process::exit_code_of(&e).ok_or(e),
+        };
         interp.flush_stdout();
         (result, interp.stdout)
     })
@@ -664,8 +673,11 @@ pub fn run_with_output_accel(
             accel: unsafe { accel.reborrow() },
             depth: 0,
         };
-        let result = interp.run_function(func, &[])?;
-        Ok((result.as_int() as i64, interp.stdout))
+        let code = match interp.run_function(func, &[]) {
+            Ok(v) => v.as_int() as i64,
+            Err(e) => wukong_runtime::process::exit_code_of(&e).ok_or(e)?,
+        };
+        Ok((code, interp.stdout))
     })
 }
 

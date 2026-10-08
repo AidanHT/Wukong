@@ -18,7 +18,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
 use std::sync::Mutex;
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -102,6 +102,29 @@ fn record_failure(message: impl FnOnce() -> String) {
         }
     }
     ASSERT_FAILED.store(true, Ordering::SeqCst);
+}
+
+/// The exit code of a guarded run that `exit(code)` ended — read with the failure it is recorded
+/// as ([`wukong_runtime::process::EXIT_SENTINEL`]).
+static EXIT_CODE: AtomicI64 = AtomicI64::new(0);
+
+/// `exit(code)` in a guarded run: remember the code and stop the run the way a failed `assert`
+/// does — every generated caller returns at once — so the host reports `code` as the run's result.
+pub(crate) fn record_exit(code: i64) {
+    EXIT_CODE.store(code, Ordering::SeqCst);
+    record_failure(|| wukong_runtime::process::EXIT_SENTINEL.to_owned());
+}
+
+/// The outcome of a guarded run whose entry returned `exit_code`: its failure, the code `exit`
+/// ended it with, or `exit_code`.
+fn run_outcome(exit_code: i64) -> Result<i64, String> {
+    match take_failure() {
+        Some(f) if f == wukong_runtime::process::EXIT_SENTINEL => {
+            Ok(EXIT_CODE.load(Ordering::SeqCst))
+        }
+        Some(failure) => Err(failure),
+        None => Ok(exit_code),
+    }
 }
 
 /// Clear the failure state at the start of a guarded run.
@@ -252,6 +275,13 @@ extern "C" fn rt_assert_abort(cond: i64) {
         eprintln!("error: assertion failed");
         std::process::abort();
     }
+}
+
+// The raw-function-pointer (`jit_module`) binding of `wukong_rt_exit`: a raw caller has no run an
+// `exit(code)` could end and report, so it is fatal there, as a failed assertion is.
+extern "C" fn rt_exit_abort(code: i64) {
+    eprintln!("error: exit({code}) called from code run through a raw function pointer");
+    std::process::abort();
 }
 
 // The raw-mode binding of `wukong_rt_assert_failed`. A raw module aborts on any failure (an
@@ -2305,6 +2335,18 @@ impl<'a> FnTranslator<'a> {
         if let Some(result) = self.lower_ml_rt_call(name, args) {
             return result;
         }
+        // `exit(code)`: record the code, then return through every caller at once, exactly as after
+        // a failed `assert` (a linked executable's `wukong_rt_exit` ends the process instead).
+        if name == text_rt::RT_EXIT && args.len() == 1 {
+            let code = self.coerce_to_i64(args[0]);
+            let fref = self.runtime_ref(text_rt::RT_EXIT);
+            self.builder.ins().call(fref, &[code]);
+            let status = self.runtime_ref(RT_ASSERT_FAILED);
+            let check = self.builder.ins().call(status, &[]);
+            let stopped = self.builder.inst_results(check)[0];
+            self.return_on_assert_failure(stopped, false);
+            return None;
+        }
         // The text builtins' entries (the `text_rt` table).
         if let Some(result) = self.lower_text_rt_call(name, args) {
             return result;
@@ -2958,10 +3000,13 @@ fn make_isa_full(
         .map_err(|e| e.to_string())
 }
 
-/// Is `func` (not a user function) one of the runtime failure intrinsics — a builtin `assert`, or the
-/// failure edge of a checked slice access? Either one stops the run.
+/// Is `func` (not a user function) one of the runtime failure intrinsics — a builtin `assert`, the
+/// failure edge of a checked slice access, or `exit`? Each one stops the run.
 fn is_failure_intrinsic(func: Symbol, interner: &Interner) -> bool {
-    matches!(interner.resolve(func), "assert" | RT_BOUNDS_FAIL)
+    matches!(
+        interner.resolve(func),
+        "assert" | RT_BOUNDS_FAIL | text_rt::RT_EXIT
+    )
 }
 
 /// The functions that can stop the run and so must be polled after every call to them: one that
@@ -4520,10 +4565,7 @@ impl JitProgram {
         let ret = self.ret.clone();
         let exit_code = run_on_big_stack(move || unsafe { invoke_code(code, &ret) });
         let out = OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        match take_failure() {
-            Some(failure) => (Err(failure), out),
-            None => (Ok(exit_code), out),
-        }
+        (run_outcome(exit_code), out)
     }
 
     /// Run once with stdout **streamed** to the process's stdout as it is produced — what
@@ -4541,10 +4583,7 @@ impl JitProgram {
         let ret = self.ret.clone();
         let exit_code = run_on_big_stack(move || unsafe { invoke_code(code, &ret) });
         drop(stream);
-        match take_failure() {
-            Some(failure) => Err(failure),
-            None => Ok(exit_code),
-        }
+        run_outcome(exit_code)
     }
 
     /// Run once for timing: clears (but does not clone) the capture buffer so repeated prints don't
@@ -4566,11 +4605,8 @@ impl JitProgram {
         // every call at scratch mark 0, as a fresh run (and the interpreter) does.
         wukong_runtime::scratch_reset();
         let result = unsafe { self.invoke() };
-        if take_failure().is_some() {
-            1
-        } else {
-            result
-        }
+        // A failure exits 1, as the process would; `exit(code)` exits `code`.
+        run_outcome(result).unwrap_or(1)
     }
 }
 
@@ -5404,6 +5440,8 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     // The ML builtins' entries (the `ml_rt` table), and the text builtins' (the `text_rt` table).
     ml_rt::bind_jit(&mut builder);
     text_rt::bind_jit(&mut builder);
+    // Raw mode: a raw caller has no run an `exit` could end, so it is fatal, as a failed assert is.
+    builder.symbol(text_rt::RT_EXIT, rt_exit_abort as *const u8);
     builder.symbol(RT_NOW_NS, wukong_runtime::wukong_now_ns as *const u8);
     builder.symbol(
         RT_PARALLEL_FOR,

@@ -9,7 +9,9 @@ const USAGE: &str = "\
 wukongc — the Wukong compiler
 
 USAGE:
-    wukongc [OPTIONS] <input.wk>
+    wukongc [OPTIONS] <input.wk> [-- <program args>...]
+    wukongc [OPTIONS] -              (read the program from standard input)
+    wukongc [OPTIONS] -e <source>    (the program is the <source> argument)
 
 OPTIONS:
     --verify-each     Verify MIR after every optimizer pass (also in release builds)
@@ -73,6 +75,10 @@ OPTIONS:
                        works. In source: @allow(<lint>), @warn(..), @deny(..)
     --error-limit=<n>  Print at most n errors before suppressing the rest (0 = unlimited; default)
     --explain [CODE]   Print the extended explanation for an error code (no code: list all codes)
+    -e <source>        Compile the program text <source> instead of a file (`-` reads it
+                       from standard input instead)
+    -- <args>...       Everything after `--` is passed to the program `--run` executes:
+                       arg(1), arg(2), ... (arg(0) is the program); needs --run
     -h, --help         Print this help
     -V, --version      Print version
 
@@ -80,6 +86,8 @@ EXAMPLES:
     wukongc --emit=tokens examples/vadd.wk
     wukongc --run examples/gemm.wk
     wukongc --emit=grad --grad-of=loss model.wk
+    wukongc --run model.wk -- data/weights.bin 64
+    wukongc --run -e 'fn main() -> i32 { printf(\"{}\\n\", 6 * 7); return 0; }'
 ";
 
 fn main() -> ExitCode {
@@ -300,6 +308,7 @@ fn set_lint_level(
 fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     let mut opts = Options::default();
     let mut input: Option<PathBuf> = None;
+    let mut inline_source: Option<String> = None;
     let mut emit_explicit = false;
     let mut color_choice = ColorChoice::Auto;
 
@@ -326,6 +335,21 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 return Ok(None);
             }
             "--run" => opts.run = true,
+            // Everything after `--` belongs to the program `--run` executes, not to the compiler.
+            "--" => {
+                opts.program_args = args[i + 1..].to_vec();
+                break;
+            }
+            "-e" => {
+                i += 1;
+                let src = args
+                    .get(i)
+                    .ok_or("`-e` requires the program source as its argument")?;
+                if inline_source.is_some() {
+                    return Err("`-e` given twice: pass the whole program in one `-e`".into());
+                }
+                inline_source = Some(src.clone());
+            }
             "--verify-each" => opts.verify_each = true,
             _ if arg.starts_with("--remarks=") => {
                 let kind = &arg["--remarks=".len()..];
@@ -510,8 +534,30 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     // NO_COLOR / CLICOLOR_FORCE / TERM conventions, and VT setup on Windows.
     opts.color = resolve_color(color_choice);
 
-    let input = input.ok_or("no input file given")?;
-    opts.input = input;
+    match (input, inline_source) {
+        (Some(_), Some(_)) => {
+            return Err(
+                "give the program either as an input file (or `-` for standard input) or as \
+                 `-e <source>`, not both"
+                    .to_string(),
+            )
+        }
+        (Some(path), None) => opts.input = path,
+        (None, Some(src)) => {
+            opts.input = PathBuf::from("<command-line>");
+            opts.source = Some(src);
+        }
+        (None, None) => return Err("no input file given".to_string()),
+    }
+
+    // Program arguments are for the program `--run` executes; anywhere else they would be dropped
+    // in silence.
+    if !opts.program_args.is_empty() && !opts.run {
+        return Err(
+            "arguments after `--` are passed to the program by `--run`, which was not given"
+                .to_string(),
+        );
+    }
 
     // A requested `--emit=<stage>` and `--run` cannot both be honoured: the driver dispatches
     // exactly ONE of them and silently drops the other, while still exiting 0. Which one wins
@@ -710,6 +756,42 @@ mod tests {
             .unwrap();
         assert_eq!(o.emit, EmitStage::Check);
         assert!(USAGE.contains("check ="));
+    }
+
+    /// Everything after `--` is the program's, verbatim — flags included — and needs `--run`;
+    /// `-e` replaces the input file, and `-` stays the input name the driver reads stdin for.
+    #[test]
+    fn program_arguments_inline_source_and_stdin_parse() {
+        let parse = |a: &[&str]| parse_args(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let o = parse(&["--run", "p.wk", "--", "a", "-O2", "--", "42"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(o.input, PathBuf::from("p.wk"));
+        assert_eq!(o.program_args, ["a", "-O2", "--", "42"]);
+        assert!(
+            o.run && o.opt_level == 0,
+            "flags after `--` are not the compiler's"
+        );
+        assert!(parse(&["--run", "p.wk", "--"])
+            .unwrap()
+            .unwrap()
+            .program_args
+            .is_empty());
+        let err = parse(&["p.wk", "--", "a"]).unwrap_err();
+        assert!(err.contains("--run"), "{err}");
+        let o = parse(&["--run", "-e", "fn main() -> i32 { return 0; }"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(o.source.as_deref(), Some("fn main() -> i32 { return 0; }"));
+        assert_eq!(o.input, PathBuf::from("<command-line>"));
+        assert!(parse(&["-e"]).is_err());
+        assert!(parse(&["p.wk", "-e", "x"]).is_err());
+        assert!(parse(&["-e", "x", "-e", "y"]).is_err());
+        let o = parse(&["--run", "-"]).unwrap().unwrap();
+        assert_eq!((o.input, o.source), (PathBuf::from("-"), None));
+        for flag in ["-e <source>", "-- <args>", "standard input"] {
+            assert!(USAGE.contains(flag), "USAGE must document {flag}");
+        }
     }
 
     #[test]

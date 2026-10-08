@@ -1125,6 +1125,24 @@ linked executable all render through, so the bytes cannot depend on the backend.
 fallback link of `--emit=exe` (no `rustc`) has no formatting runtime: such a program fails to link
 there, loudly. `tests/run/printf_format.wk`, `tests/fail/printf_*.wk`.
 
+### Program arguments, environment, standard input, exit ✅
+
+| builtin | result |
+|---|---|
+| `arg_count()` | `i64`: the number of arguments, the program itself included |
+| `arg(i)` | `*u8`: argument `i` (`arg(0)` is the program); the empty string when out of range |
+| `arg_i64(i, default)` / `arg_f32(i, default)` | argument `i` parsed as a number, or `default` when absent or unparsable |
+| `env(name)` | `*u8`: the environment variable `name`, the empty string when unset |
+| `read_stdin_u8(buf)` | `i64`: standard input read into a `[]u8` / `[u8; N]` until it is full or input ends |
+| `exit(code)` | ends the program with status `code`, as returning `code` from `main` does |
+
+`wukongc --run prog.wk -- data/weights.bin 64` passes everything after `--` to the program
+(`arg(1)` is `data/weights.bin`, `arg_i64(2, 16)` is 64); a linked executable reads its own
+`argv`. Everything printed before `exit` is written out first, and on the native JIT `exit` from a
+nested call returns through every caller at once, exactly as a failed `assert` does. A string
+returned by `arg` or `env` is valid for the rest of the run and usable directly as a `read_*` /
+`write_*` path. `tests/run/process_exit.wk`, `crates/wukongc/tests/process_io.rs`.
+
 These are recognized by the MIR builder and implemented directly by the interpreter (and, on the
 native backend, by the runtime). A user-defined function of the same name shadows any of these
 builtins.
@@ -1763,8 +1781,12 @@ continue a long subtraction and is not reported.
 ## Command-line interface
 
 ```
-wukongc [OPTIONS] <input.wk>
+wukongc [OPTIONS] <input.wk> [-- <program args>...]
+wukongc [OPTIONS] -              read the program from standard input (named <stdin>)
+wukongc [OPTIONS] -e <source>    the program is the <source> argument itself
 
+--                    everything after it is passed to the program --run executes: arg(1),
+                      arg(2), ... (arg(0) is the program); without --run it is a usage error
 --run                 compile and execute (interpreter by default; see --backend).
                       The program's stdout streams as it runs (per line on a terminal, in 64 KiB
                       blocks into a pipe or file) on interp and native, so a long run shows its

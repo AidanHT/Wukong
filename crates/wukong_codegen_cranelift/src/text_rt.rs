@@ -30,6 +30,9 @@ pub(crate) const RT_PRINT_F32: &str = "wukong_rt_print_f32";
 pub(crate) const RT_PRINT_BOOL: &str = "wukong_rt_print_bool";
 /// `print`/`println` of a `char` (mir_build zero-extends it to `i64`): `(x: i64)`.
 pub(crate) const RT_PRINT_CHAR: &str = "wukong_rt_print_char";
+/// `exit(code)`: `(code: i64)`. Lowered by `lower_call` itself (it must return through the
+/// callers), declared and bound from this table.
+pub(crate) const RT_EXIT: &str = "wukong_rt_exit";
 
 /// The ABI class of one parameter or return value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,6 +155,11 @@ extern "C" fn rt_fmt_lit(
     unsafe { jit_emit(target, buf, cap, pos, &bytes[..n]) }
 }
 
+// `exit(code)` in a guarded run (see `record_exit`).
+extern "C" fn rt_exit(code: i64) {
+    crate::record_exit(code);
+}
+
 // One parameter per C-ABI operand, deliberately: the entry mirrors `wukong_rt_fmt_slice`.
 #[allow(clippy::too_many_arguments)]
 extern "C" fn rt_fmt_slice(
@@ -185,7 +193,7 @@ extern "C" fn rt_fmt_slice(
 
 /// The table. The addresses are taken here, at run time, because a function-pointer-to-raw-pointer
 /// cast is not a constant expression.
-pub(crate) fn entries() -> [Entry; 9] {
+pub(crate) fn entries() -> [Entry; 16] {
     use Abi::{Ptr, F32, F64, I64};
     [
         Entry {
@@ -243,6 +251,50 @@ pub(crate) fn entries() -> [Entry; 9] {
             params: &[I64, Ptr, I64, I64, Ptr, I64, I64, I64],
             ret: Some(I64),
             addr: rt_fmt_slice as *const u8,
+        },
+        // The process interface: the runtime's own entries (the program's arguments are the
+        // runtime's state, installed by the host), except `exit`, which ends the guarded run.
+        Entry {
+            name: "wukong_rt_arg_count",
+            params: &[],
+            ret: Some(I64),
+            addr: wukong_runtime::process::wukong_rt_arg_count as *const u8,
+        },
+        Entry {
+            name: "wukong_rt_arg",
+            params: &[I64],
+            ret: Some(Ptr),
+            addr: wukong_runtime::process::wukong_rt_arg as *const u8,
+        },
+        Entry {
+            name: "wukong_rt_arg_i64",
+            params: &[I64, I64],
+            ret: Some(I64),
+            addr: wukong_runtime::process::wukong_rt_arg_i64 as *const u8,
+        },
+        Entry {
+            name: "wukong_rt_arg_f32",
+            params: &[I64, F32],
+            ret: Some(F32),
+            addr: wukong_runtime::process::wukong_rt_arg_f32 as *const u8,
+        },
+        Entry {
+            name: "wukong_rt_env",
+            params: &[Ptr],
+            ret: Some(Ptr),
+            addr: wukong_runtime::process::wukong_rt_env as *const u8,
+        },
+        Entry {
+            name: "wukong_rt_read_stdin",
+            params: &[Ptr, I64],
+            ret: Some(I64),
+            addr: wukong_runtime::process::wukong_rt_read_stdin as *const u8,
+        },
+        Entry {
+            name: RT_EXIT,
+            params: &[I64],
+            ret: None,
+            addr: rt_exit as *const u8,
         },
     ]
 }

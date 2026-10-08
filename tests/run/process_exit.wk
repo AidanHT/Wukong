@@ -1,0 +1,30 @@
+// RUN: --run
+// EXPECT-EXIT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 7
+// EXPECT-OUT: 0.5
+// EXPECT-OUT: -2
+// EXPECT-OUT:
+// EXPECT-OUT: leaving with 3
+module tests.run.process_exit
+
+/// The process interface with no program arguments (this suite runs `wukongc --run <file>`, so the
+/// program's argument vector is just its own name), and `exit`:
+/// * `arg_count()` is 1 — `arg(0)`, the program;
+/// * `arg_i64(i, default)` / `arg_f32(i, default)` of an absent argument — index 1, 2, or a
+///   negative index — return the default: 7, 0.5, -2;
+/// * `env` of an unset variable is the empty string, which prints as an empty line;
+/// * `exit(3)` ends the program with status 3 at once: the line before it is printed, the line
+///   after it never is, and `main`'s own `return 0` is never reached — on the interpreter, the
+///   JIT (which returns through every caller) and a linked executable alike.
+fn main() -> i32 {
+    print(arg_count());
+    print(arg_i64(1, 7));
+    print(arg_f32(2, 0.5));
+    print(arg_i64(-1, -2));
+    print(env("WUKONG_TEST_SURELY_UNSET_VARIABLE_7F3A2C"));
+    print("leaving with 3");
+    exit(3);
+    print("not reached");
+    return 0;
+}

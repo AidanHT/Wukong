@@ -1,5 +1,8 @@
 //! The interpreter twins of the text runtime entries (`wukong_runtime::fmt`): the formatting calls
-//! `printf`, `sprintf`, the structural `print` of an aggregate and the raw byte writers lower to.
+//! `printf`, `sprintf`, the structural `print` of an aggregate and the raw byte writers lower to —
+//! and of the process interface (`wukong_runtime::process`: arguments, environment, standard input,
+//! `exit`). A string the process interface returns (`arg(i)`, `env(name)`) is copied into fresh
+//! byte slots per call, NUL-terminated like a string literal's static data.
 //!
 //! Every arm renders through the runtime's own pure functions — `format_int`, `format_f32`,
 //! `format_seq`, the [`fmt::buffer_write`] plan — so the bytes and the returned position cannot
@@ -12,6 +15,7 @@ use std::io::Write;
 
 use wukong_runtime::fileio::DT_U8;
 use wukong_runtime::fmt::{self, Spec, TARGET_BUFFER, TARGET_STDERR};
+use wukong_runtime::process;
 
 use crate::{Interp, Value};
 
@@ -55,8 +59,69 @@ impl Interp<'_, '_> {
                 self.text_emit(args, &bytes[..n])
             }
             "wukong_rt_fmt_slice" => self.text_fmt_slice(args),
+            "wukong_rt_arg_count" => Ok(Value::Int(i128::from(process::arg_count()))),
+            "wukong_rt_arg" => {
+                let arg = process::arg_cstr(int(args, 0)).to_bytes();
+                Ok(self.text_alloc_str(arg))
+            }
+            "wukong_rt_arg_i64" => {
+                let arg = process::arg_cstr(int(args, 0)).to_bytes();
+                let v = process::parse_i64_arg(arg, int(args, 1));
+                Ok(Value::Int(i128::from(v)))
+            }
+            "wukong_rt_arg_f32" => {
+                let arg = process::arg_cstr(int(args, 0)).to_bytes();
+                let v = process::parse_f32_arg(arg, float(args, 1) as f32);
+                Ok(Value::Float(f64::from(v)))
+            }
+            "wukong_rt_env" => self.text_env(args),
+            "wukong_rt_read_stdin" => self.text_read_stdin(args),
+            // The run stops here; `run_capturing` / `run_streaming` report the code as its result.
+            "wukong_rt_exit" => Err(format!("{}{}", process::EXIT_SENTINEL, int(args, 0))),
             _ => return None,
         })
+    }
+
+    /// Copy `bytes` into fresh slots, NUL-terminated, and return their base: a `*u8` string.
+    fn text_alloc_str(&mut self, bytes: &[u8]) -> Value {
+        let base = self.memory.len();
+        self.memory
+            .extend(bytes.iter().map(|&b| Value::Int(i128::from(b))));
+        self.memory.push(Value::Int(0));
+        Value::Ptr(base)
+    }
+
+    /// `wukong_rt_env(name) -> *u8`.
+    fn text_env(&mut self, args: &[Value]) -> Result<Value, String> {
+        let name = match args.first() {
+            Some(Value::Ptr(p)) if !self.is_null(*p) => self.text_read_bytes(*p, -1)?,
+            _ => Vec::new(),
+        };
+        let value = process::env_cstr(&name).to_bytes();
+        Ok(self.text_alloc_str(value))
+    }
+
+    /// `wukong_rt_read_stdin(buf, cap) -> i64`: each byte read lands in its slot as the canonical
+    /// `u8` value a `read_u8` would decode.
+    fn text_read_stdin(&mut self, args: &[Value]) -> Result<Value, String> {
+        let cap = usize::try_from(int(args, 1)).unwrap_or(0);
+        let base = match args.first() {
+            Some(Value::Ptr(p)) if !self.is_null(*p) && cap > 0 => *p,
+            _ => return Ok(Value::Int(0)),
+        };
+        if base
+            .checked_add(cap)
+            .is_none_or(|end| end > self.memory.len())
+        {
+            return Err("read_stdin_u8: buffer out of bounds".into());
+        }
+        let mut bytes = vec![0u8; cap];
+        let n = process::read_stdin_into(&mut bytes);
+        let got = usize::try_from(n).unwrap_or(0);
+        for (k, &b) in bytes[..got].iter().enumerate() {
+            self.memory[base + k] = crate::ml_io::decode_elem(DT_U8, &[b]);
+        }
+        Ok(Value::Int(i128::from(n)))
     }
 
     /// Deliver formatted `bytes` to the sink named by the leading `(target, buf, cap, pos)`

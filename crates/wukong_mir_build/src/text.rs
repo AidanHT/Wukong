@@ -27,6 +27,10 @@
 //!   and names (`", "`, `"P { "`) travel as up to eight bytes packed into an `i64` constant
 //!   (`wukong_rt_fmt_lit`), so no data section is needed for them.
 //!
+//! **The process interface** (`arg_count`, `arg`, `arg_i64`, `arg_f32`, `env`, `read_stdin_u8`,
+//! `exit`) lowers to one call each of a `wukong_rt_*` entry of `wukong_runtime::process`, its
+//! integer operands widened to `i64` and its float operand to `f32`.
+//!
 //! Every call is an opaque `Op::Call`, so no optimizer moves output across another side effect;
 //! the interpreter and the native backends render through the same runtime functions, so the bytes
 //! printed cannot depend on the backend. `--backend=gpu-native` declines the `wukong_rt_fmt_*`
@@ -55,6 +59,13 @@ pub(crate) struct TextSyms {
     fmt_str: Symbol,
     fmt_lit: Symbol,
     fmt_slice: Symbol,
+    arg_count: Symbol,
+    arg: Symbol,
+    arg_i64: Symbol,
+    arg_f32: Symbol,
+    env: Symbol,
+    exit: Symbol,
+    read_stdin: Symbol,
 }
 
 impl TextSyms {
@@ -70,6 +81,13 @@ impl TextSyms {
             fmt_str: interner.intern("wukong_rt_fmt_str"),
             fmt_lit: interner.intern("wukong_rt_fmt_lit"),
             fmt_slice: interner.intern("wukong_rt_fmt_slice"),
+            arg_count: interner.intern("wukong_rt_arg_count"),
+            arg: interner.intern("wukong_rt_arg"),
+            arg_i64: interner.intern("wukong_rt_arg_i64"),
+            arg_f32: interner.intern("wukong_rt_arg_f32"),
+            env: interner.intern("wukong_rt_env"),
+            exit: interner.intern("wukong_rt_exit"),
+            read_stdin: interner.intern("wukong_rt_read_stdin"),
         }
     }
 }
@@ -217,7 +235,72 @@ impl FnLowerer<'_> {
                     },
                 ))
             }
+            TextBuiltin::ArgCount
+            | TextBuiltin::Arg
+            | TextBuiltin::ArgI64
+            | TextBuiltin::ArgF32
+            | TextBuiltin::Env
+            | TextBuiltin::Exit
+            | TextBuiltin::ReadStdin => self.lower_process_builtin(b, args),
         }
+    }
+
+    /// The process interface: one `wukong_runtime::process` entry per call.
+    fn lower_process_builtin(&mut self, b: TextBuiltin, args: &[Expr]) -> Option<ValueId> {
+        let syms = self.gemm.text;
+        let (func, ret, operands) = match b {
+            TextBuiltin::ArgCount => (syms.arg_count, MirType::I64, Vec::new()),
+            TextBuiltin::Arg => {
+                let i = self.text_i64_operand(args.first()?);
+                (syms.arg, MirType::Ptr, vec![i])
+            }
+            TextBuiltin::ArgI64 => {
+                let i = self.text_i64_operand(args.first()?);
+                let d = self.text_i64_operand(args.get(1)?);
+                (syms.arg_i64, MirType::I64, vec![i, d])
+            }
+            TextBuiltin::ArgF32 => {
+                let i = self.text_i64_operand(args.first()?);
+                let e = args.get(1)?;
+                let from = self.expr_mir(e);
+                let signed = self.signed(e);
+                let v = self.lower_expr(e);
+                let d = self.coerce_to(v, &from, &MirType::F32, signed);
+                (syms.arg_f32, MirType::F32, vec![i, d])
+            }
+            TextBuiltin::Env => {
+                let name = self.lower_expr(args.first()?);
+                (syms.env, MirType::Ptr, vec![name])
+            }
+            TextBuiltin::ReadStdin => {
+                let (data, cap) = self.text_u8_buffer(args.first()?)?;
+                (syms.read_stdin, MirType::I64, vec![data, cap])
+            }
+            TextBuiltin::Exit => {
+                let code = self.text_i64_operand(args.first()?);
+                self.builder.build_void(Op::Call {
+                    func: syms.exit,
+                    args: vec![code],
+                });
+                return Some(self.const_zero(MirType::I32));
+            }
+            _ => return None,
+        };
+        Some(self.builder.build(
+            ret,
+            Op::Call {
+                func,
+                args: operands,
+            },
+        ))
+    }
+
+    /// An integer operand widened to `i64` by its own signedness.
+    fn text_i64_operand(&mut self, e: &Expr) -> ValueId {
+        let from = self.expr_mir(e);
+        let signed = self.signed(e);
+        let v = self.lower_expr(e);
+        self.coerce_to(v, &from, &MirType::I64, signed)
     }
 
     fn text_const(&mut self, v: i64) -> ValueId {
@@ -309,10 +392,7 @@ impl FnLowerer<'_> {
     /// The byte count operand `n` of a raw write, clamped to `[0, len]`: a negative count writes
     /// nothing and a count past the buffer writes the whole buffer, never beyond it.
     fn text_clamped_count(&mut self, n: &Expr, len: ValueId) -> ValueId {
-        let from = self.expr_mir(n);
-        let signed = self.signed(n);
-        let v = self.lower_expr(n);
-        let v = self.coerce_to(v, &from, &MirType::I64, signed);
+        let v = self.text_i64_operand(n);
         let zero = self.text_const(0);
         let neg = self
             .builder

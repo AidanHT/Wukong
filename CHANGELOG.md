@@ -30,6 +30,10 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `wukong_interp::run_streaming`, `JitProgram::run_streaming`): per line on a terminal, in 64 KiB
   blocks into a pipe or file, so a training loop shows its progress instead of nothing until it
   ends. The bytes are the ones a capturing run returns; the differential gates still capture.
+- **Process interface**: `arg_count()`, `arg(i)`, `arg_i64(i, default)`, `arg_f32(i, default)`,
+  `env(name)`, `read_stdin_u8(buf)` and `exit(code)` (`wukong_runtime::process`); `wukongc --run
+  prog.wk -- a b` passes `a b` to the program. `wukongc -` reads the program from standard input
+  (it used to fail to open a file named `-`) and `wukongc -e <source>` takes it inline.
 
 ### Optimizer memory passes: SROA, path DSE, loop deletion, guarded LICM, scalar promotion (`gap/opt-memory`)
 

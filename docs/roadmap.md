@@ -639,6 +639,12 @@ another architecture or OS is not supported. A native-backend failure is a catal
   `eprint` / `eprintln`, and the raw byte writers `write_stdout` / `write_stderr` / `write_text`
   (`tests/run/printf_format.wk`). 🟡 The `cc` fallback link has no formatting runtime, and there is
   still no string *type* beyond `*u8` (a `sprintf` buffer is a `[u8; N]`).
+- **Process interface**: `arg_count` / `arg` / `arg_i64` / `arg_f32` (program arguments after
+  `wukongc --run prog.wk -- …`, or a linked executable's own `argv`), `env`, `read_stdin_u8` and
+  `exit(code)` (which returns through every caller on the JIT, like a failed `assert`).
+  `wukongc -` reads the program from standard input and `wukongc -e <source>` takes it inline
+  (`tests/run/process_exit.wk`, `crates/wukongc/tests/process_io.rs`). 🟡 No interactive REPL yet,
+  and no line-at-a-time stdin read.
 - **`--run` streams stdout** on the interpreter and the native JIT — per line on a terminal, in
   64 KiB blocks into a pipe — instead of holding everything until the program ends, so a training
   loop shows its progress and output printed before a runtime failure is already out. The GPU

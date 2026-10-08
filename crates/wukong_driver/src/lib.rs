@@ -163,6 +163,13 @@ pub struct Options {
     /// replaced with a recognized runtime kernel call, naming the kernel symbols. Pure observation —
     /// the MIR, and therefore every artifact and run, is identical with it on or off.
     pub remarks_dispatch: bool,
+    /// The program's source text when it does not come from the file `input` — `wukongc -e
+    /// <source>` (then `input` is only a display name). An `input` of `-` with no `source` reads
+    /// the program from standard input.
+    pub source: Option<String>,
+    /// The arguments after `--`, passed to the program `--run` executes: `arg(1)`, `arg(2)`, …
+    /// (`arg(0)` is the program's own name).
+    pub program_args: Vec<String>,
 }
 
 /// Options for the autodiff CLI surface: which loss function to differentiate, which of its buffer
@@ -235,6 +242,8 @@ impl Default for Options {
             grad: GradOptions::default(),
             strict_fp: false,
             remarks_dispatch: false,
+            source: None,
+            program_args: Vec::new(),
         }
     }
 }
@@ -307,6 +316,21 @@ fn lower_options_for(opts: &Options) -> wukong_mir_build::LowerOptions {
     }
 }
 
+/// Does this compile read its program from standard input (`wukongc -` with no `-e`)?
+fn reads_stdin(opts: &Options) -> bool {
+    opts.source.is_none() && opts.input == Path::new("-")
+}
+
+/// The name the program's source goes by in diagnostics and as `arg(0)`: the input path, or
+/// `<stdin>` for a program read from standard input (`-e` sets `input` to its own display name).
+fn source_name(opts: &Options) -> String {
+    if reads_stdin(opts) {
+        "<stdin>".to_string()
+    } else {
+        opts.input.display().to_string()
+    }
+}
+
 /// Run the pipeline for `opts`, printing artifacts to stdout and diagnostics to stderr.
 /// Returns a process exit code.
 pub fn compile(opts: &Options) -> i32 {
@@ -355,19 +379,28 @@ pub fn compile(opts: &Options) -> i32 {
     // Declared before every other local so it reports last, on every exit path (see `report`).
     let mut timer = report::PassTimer::new(opts);
     timer.begin("read");
-    let src = match std::fs::read_to_string(&opts.input) {
+    // The program comes from `-e <source>`, from standard input (`-`), or from the input file.
+    let src = match &opts.source {
+        Some(s) => Ok(s.clone()),
+        None if reads_stdin(opts) => {
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut s).map(|_| s)
+        }
+        None => std::fs::read_to_string(&opts.input),
+    };
+    let src = match src {
         Ok(s) => s,
         Err(e) => {
             emit_driver_error(
                 opts,
-                format!("could not read `{}`: {}", opts.input.display(), e),
+                format!("could not read `{}`: {}", source_name(opts), e),
             );
             return exit::IO_ERROR;
         }
     };
 
     let mut sm = SourceMap::new();
-    let id = sm.add(opts.input.display().to_string(), src);
+    let id = sm.add(source_name(opts), src);
     let renderer = Renderer::new(opts.color);
     let mut sink = DiagnosticSink::new();
 
@@ -691,6 +724,11 @@ pub fn compile(opts: &Options) -> i32 {
             }
         }
         let main = interner.intern("main");
+        // The program's argument vector: its own name, then everything after `--`. The
+        // interpreter and the JIT read it from the one `wukong_runtime` state.
+        wukong_interp::set_program_args(
+            std::iter::once(source_name(opts)).chain(opts.program_args.iter().cloned()),
+        );
         timer.begin(if opts.backend == BackendKind::Native {
             "jit-compile"
         } else {
@@ -1372,11 +1410,15 @@ fn emit_native(
         }
     };
 
-    let stem = opts
-        .input
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "out".to_string());
+    // A program from `-e` or standard input has no file name to take a stem from.
+    let stem = if opts.source.is_some() || reads_stdin(opts) {
+        "out".to_string()
+    } else {
+        opts.input
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "out".to_string())
+    };
 
     let is_obj = opts.emit == EmitStage::Obj;
     // The scratch directory has to exist BEFORE the object is written, because under `--emit=exe` the

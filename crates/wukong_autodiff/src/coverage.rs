@@ -39,6 +39,8 @@ const NO_GRADIENT: &str = "carries no gradient";
 const FILE_READ: &str = "a file read overwrites its buffer with data; it carries no gradient";
 const TEXT_OUTPUT: &str = "formatted text output (`printf`, `sprintf`, a structural `print`) \
                            writes text, not a differentiated buffer; it carries no gradient";
+const PROCESS_INPUT: &str = "the program's arguments, environment and standard input come from \
+                             outside the program; they carry no gradient";
 
 /// Every non-differentiable symbol `wukong_mir_build` can emit, with the reason a decline reports.
 pub(crate) const NOT_DIFFERENTIABLE: &[(&str, &str)] = &[
@@ -221,6 +223,17 @@ pub(crate) const NOT_DIFFERENTIABLE: &[(&str, &str)] = &[
     ("wukong_rt_fmt_str", TEXT_OUTPUT),
     ("wukong_rt_fmt_lit", TEXT_OUTPUT),
     ("wukong_rt_fmt_slice", TEXT_OUTPUT),
+    // The process interface (`text.rs`).
+    ("wukong_rt_arg_count", PROCESS_INPUT),
+    ("wukong_rt_arg", PROCESS_INPUT),
+    ("wukong_rt_arg_i64", PROCESS_INPUT),
+    ("wukong_rt_arg_f32", PROCESS_INPUT),
+    ("wukong_rt_env", PROCESS_INPUT),
+    ("wukong_rt_read_stdin", PROCESS_INPUT),
+    (
+        "wukong_rt_exit",
+        "`exit` ends the program; a loss function that can exit has no gradient to take",
+    ),
     // Scratch-arena bookkeeping and the slice bounds-failure edge.
     (
         "wukong_rt_scratch_alloc",
