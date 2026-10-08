@@ -123,6 +123,37 @@ All notable changes to Wukong are documented here. The format is loosely based o
   integer block dots).
 - Shapes are checked at run time against the operands (a bad geometry traps like a failed `assert`);
   every kernel has a bit-exact AVX2/portable twin pair; none is differentiable or measured yet.
+### Training: transformer gradients and a data-driven `--train` loop (`gap2/training-loop-and-transformer-grads`)
+
+- **Autodiff: the fused scaled-dot-product attention is differentiable** (N83). `wukong_attention_f32`
+  (the `sdpa` kernel, causal or not, with a constant or run-time causal flag) has a VJP: the
+  FlashAttention recompute — `P = softmax(scale·Q·Kᵀ)` rebuilt with `wukong_sgemm_nt_alpha` and the
+  row softmax, then `dV = Pᵀ·dO`, `dS = softmax_bwd(P, dO·Vᵀ)·scale`, `dQ = dS·K`, `dK = dSᵀ·Q` on the
+  tuned GEMMs and `wukong_softmax_bwd_f32`. Gated against an f64 closed form and the finite
+  difference (`wukong_autodiff` `tests/attention.rs`), including self-attention over one buffer.
+  The tape now differentiates 50 forward kernel symbols.
+- **Fix: the `--train` initializer was single-signed** (N80). It kept 31 bits of the LCG state
+  (`seed >> 33`) and divided by `u32::MAX`, so every seeded buffer lay in `[-0.4, 0)` — an all-negative
+  init that starts a ReLU net mostly dead. It now takes the top 24 bits scaled by `2^-24` (uniform
+  `[0, 1)`, exact in f32), then `(u - 0.5)·0.8`: uniform in `[-0.4, 0.4)`. The hand-derived
+  `tests/run/autodiff_train_*.wk` trajectories were re-derived from the corrected formula (new seeds
+  keep every printed value clear of a six-decimal rounding boundary).
+- **`--train` trains on data** (N82, stage 1). `--train-init=<i>=<path>` loads a buffer,
+  `--train-data=<i>=<path>` streams a fixed input from a file of whole batches (update `s` reads batch
+  `s mod batches` from disk into the live buffer, O(batch) memory), `--train-save=<i>=<path>` writes
+  the trained buffer — all raw little-endian f32, the `read_f32`/`write_f32` layout. `--train-clip=<f>`
+  clips the global gradient norm (`clip_grad_norm_`), `--train-warmup=<n>` ramps the rate linearly and
+  `--train-schedule=cosine` decays it (`CosineAnnealingLR`); the run header names any non-default
+  policy. The loop no longer clones every buffer per step (nor four per tensor plus three copy-backs
+  for AdamW): it runs in place, snapshotting only the buffers the forward writes, which the new
+  `wukong_autodiff::written_params` reports from the tape's kernel table. Gates:
+  `crates/wukongc/tests/training_data.rs` (hand-derived trajectories and saved weights, interp ==
+  native), the driver's `training` unit tests, `wukong_autodiff` `tests/writes.rs`.
+- **A language model trains end to end:** `tests/run/train_tiny_lm.wk` is a two-layer char-level LM
+  (embedding gather, tanh hidden layer, output projection, softmax cross-entropy over every next
+  character) written as recognized loops; `crates/wukongc/tests/train_lm.rs` trains it with `--train`
+  on the interpreter and the native JIT at `-O0`/`-O2` and holds the trajectory to an f64 reference of
+  the same model (12.4066 -> 8.6545 over three SGD steps), byte-identical across all four runs.
 
 ### Optimizer memory passes: SROA, path DSE, loop deletion, guarded LICM, scalar promotion (`gap/opt-memory`)
 

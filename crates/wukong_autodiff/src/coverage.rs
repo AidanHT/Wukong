@@ -57,11 +57,6 @@ pub(crate) const NOT_DIFFERENTIABLE: &[(&str, &str)] = &[
     ("wukong_colargmax_i32_parallel", INDEX_VALUED),
     ("wukong_colargmin_i32", INDEX_VALUED),
     ("wukong_colargmin_i32_parallel", INDEX_VALUED),
-    (
-        "wukong_attention_f32",
-        "the fused scaled-dot-product attention has no backward kernel yet; spell attention as \
-         matmul + softmax + matmul (each differentiable) to train it",
-    ),
     ("wukong_avgpool2d_f32", "2-D pooling has no VJP rule yet"),
     (
         "wukong_avgpool2d_f32_parallel",

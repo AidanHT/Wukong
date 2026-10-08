@@ -1,10 +1,10 @@
-// RUN: --train --grad-wrt=0 --train-steps=2 --train-lr=0.25 --train-seed=274
+// RUN: --train --grad-wrt=0 --train-steps=2 --train-lr=0.25 --train-seed=163
 // EXPECT-EXIT: 0
 // EXPECT-OUT: train: 2 step(s), lr=0.25, optimizer=sgd
-// EXPECT-OUT: step    0: loss 0.030085
-// EXPECT-OUT: step    1: loss 0.007521
-// EXPECT-OUT: step    2: loss 0.001880
-// EXPECT-OUT: loss 0.030085 -> 0.001880  (16.00x reduction)
+// EXPECT-OUT: step    0: loss 0.024479
+// EXPECT-OUT: step    1: loss 0.006120
+// EXPECT-OUT: step    2: loss 0.001530
+// EXPECT-OUT: loss 0.024479 -> 0.001530  (16.00x reduction)
 module tests.run.autodiff_train_helper
 
 // `--train` of a loss written as NESTED HELPER FUNCTIONS, at the default -O0 (autodiff floors it
@@ -13,12 +13,12 @@ module tests.run.autodiff_train_helper
 // the loss before it is differentiated (`wukong_autodiff::inline_calls`), bottom-up, so `norm2`'s
 // own call to `sq` is flattened too. Every expected line is derived from scalar semantics:
 //
-// * The 2 initial weights come from `--train`'s documented deterministic init with seed 274 (the
+// * The 2 initial weights come from `--train`'s documented deterministic init with seed 163 (the
 //   LCG and f32 formula in tests/run/autodiff_train_sumsq.wk), computed independently in Python with
-//   f32 rounding after every operation: w = [-0.15665999, -0.074448898].
-// * L = sq(w0) + sq(w1) = f32(f32(w0²) + f32(w1²)) = 0.030084990.
+//   f32 rounding after every operation: w = [-0.14936581, 0.046571206] (one of each sign).
+// * L = sq(w0) + sq(w1) = f32(f32(w0²) + f32(w1²)) = 0.024479022.
 // * dL/dw = 2w (the product rule on `a * a`: g·a + g·a), so SGD with lr = 1/4 gives w - w/2 = w/2
-//   EXACTLY in f32 and divides the loss by exactly 4 per step: 0.030084990 / 4^k, ratio 16. Each
+//   EXACTLY in f32 and divides the loss by exactly 4 per step: 0.024479022 / 4^k, ratio 16. Each
 //   printed value sits >= 200 ULPs from a six-decimal rounding boundary.
 //
 // `main` exercises the same loss for the differential gates, on exact values.

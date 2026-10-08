@@ -67,7 +67,7 @@ fn training_weight_decay_and_autodiff_targets() {
                 let seed = 7u64
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407);
-                let mut w = (((seed >> 33) as f32) / (u32::MAX as f32) - 0.5) * 0.8;
+                let mut w = (((seed >> 40) as f32) * (1.0 / 16_777_216.0) - 0.5) * 0.8;
                 let mut expected = vec![format!("step {:>4}: loss {w:.6}", 0)];
                 let (mut m, mut v) = (0.0f32, 0.0f32);
                 for t in 1..=2 {

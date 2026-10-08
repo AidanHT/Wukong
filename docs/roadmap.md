@@ -1092,12 +1092,12 @@ and after backward optimization and verifies the complete training program befor
 `--verify-each` additionally checks each optimization pass; gradient MIR emission also verifies its output.
 
 **Kernel coverage.** Every runtime symbol `wukong_mir_build` can emit has an explicit autodiff
-disposition, enforced by `every_emitted_kernel_symbol_is_differentiable_or_declined_by_name`: 49
-forward symbols (25 kernel families, serial and `@parallel`) have VJP rules, and the rest are
+disposition, enforced by `every_emitted_kernel_symbol_is_differentiable_or_declined_by_name`: 50
+forward symbols (26 kernel families, serial and `@parallel`) have VJP rules, and the rest are
 listed with the reason a decline reports (index-valued arg-reductions, half-precision storage,
-quantized operands, scans, pooling, the fused attention kernel, the training-backward kernels
-themselves, I/O). The differentiable families: the whole f32 GEMM family — plain `A·B`, `nn.Linear`
-`A·Bᵀ`, the weight-gradient `Aᵀ·B`, the α-scaled attention-score GEMM and the fused
+quantized operands, scans, pooling, the training-backward kernels themselves, I/O). The
+differentiable families: the whole f32 GEMM family — plain `A·B`, `nn.Linear` `A·Bᵀ`, the
+weight-gradient `Aᵀ·B`, the α-scaled attention-score GEMM and the fused
 `act(A·Bᵀ + bias)` epilogue (identity / ReLU / GELU / SiLU) — GEMV and GEVM (plain and α-scaled), the
 broadcast bias (pure add or any fused activation, in place or not), transpose, column sum / mean /
 sum-of-squares, `sreduce_f32` (SUM, DOT, SSD, SUMSQ, MAX, MIN, MAXABS — ties split evenly — SUMABS,
@@ -1105,7 +1105,14 @@ ABSDIFF), `velem_f32` (affine, product and quotient, with identity / ReLU / ReLU
 `vmath_f32` activation codes, the two-input `vmath2_f32` family (pow, atan2, hypot and the SwiGLU /
 GeGLU / GLU gates), `norm_f32` (softmax, log-softmax, LayerNorm, RMSNorm, L2-norm), `norm_affine_f32`,
 softmax cross-entropy, log-sum-exp, entropy, KL divergence, rotary position embedding (including a
-trainable frequency table) and the embedding gather.
+trainable frequency table), the embedding gather and the fused scaled-dot-product attention
+(`wukong_attention_f32`, causal or not — its backward is the FlashAttention recompute: the weights
+are rebuilt with the α-scaled score GEMM and the row softmax, then `dV = Pᵀ·dO`, `dS =
+softmax_bwd(P, dO·Vᵀ)·scale`, `dQ = dS·K`, `dK = dSᵀ·Q`, all on the tuned GEMM and
+`wukong_softmax_bwd_f32` kernels). A source `sdpa(...)` call, like every named kernel builtin that
+writes an output buffer other than its own input, still lowers behind a run-time output-overlap
+dispatch (a branch), so a loss that makes such a call is not single-block and is refused by the
+straight-line contract; spell the layer with the recognized loops to train it from source.
 
 **The backward rides the tuned kernels.** The GEMM adjoints are the runtime's own transposed GEMM
 spellings (no synthesized transpose); softmax / LayerNorm / RMSNorm backward are the runtime's
@@ -1141,7 +1148,15 @@ object (C ABI: the loss's parameters, then one caller-zeroed gradient buffer per
 entry), so a host training loop links the backward with no compiler at run time. An AOT
 *training loop* (`--train --emit=exe`) is still open. `--train-opt=sgd|adamw` selects the optimizer;
 `--train-weight-decay` accepts finite nonnegative AdamW decay (default zero) and rejects nonzero
-decay with SGD. Source-driven gradient tests (helper functions at O0–O3, the fused linear-bias-ReLU
+decay with SGD. **`--train` trains on data:** `--train-init=<i>=<path>` loads a buffer,
+`--train-data=<i>=<path>` streams a fixed input one batch per update (batch `s mod batches`, read from
+disk into the live buffer), `--train-save=<i>=<path>` writes the trained buffer — all raw
+little-endian f32, the `read_f32`/`write_f32` layout — and `--train-clip` (global-norm clipping),
+`--train-warmup` and `--train-schedule=cosine` set the update policy. The loop no longer copies
+every buffer per step: the gradient runs in place, and only the buffers the forward writes
+(`wukong_autodiff::written_params`, which knows each kernel's output operand) are snapshotted around
+it. The `--train` initializer draws uniformly from `[-0.4, 0.4)` (it was single-signed, `[-0.4, 0)`,
+before). Training remains a CLI loop — an in-language `grad_of` is a declared non-goal. Source-driven gradient tests (helper functions at O0–O3, the fused linear-bias-ReLU
 layer, the cross-entropy head, a fanned-out reduction), the real-CLI `training_options` and
 `autodiff_cli` tests (the latter trains a GEMM + bias model on the interpreter and the native JIT and
 requires byte-identical trajectories at O0–O3) and the hand-derived `tests/run/autodiff_train_*.wk`

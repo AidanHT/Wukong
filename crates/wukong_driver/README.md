@@ -59,6 +59,11 @@ verify inside `emit_mir` after dumping (so broken MIR is still visible).
 
 - **`Options::default()`:** `emit=Exe`, `run=false`, `opt_level=0`, `backend=Interp`.
 - **Autodiff forces `-O1` minimum** when `--emit=grad` or `--train` (single-block SSA input).
+- **`--train` runs in place** (`train_loop_with_buffers`): one buffer vector for the whole run; only
+  the buffers `wukong_autodiff::written_params` says the forward writes are snapshotted around each
+  gradient run. `src/training.rs` holds the file plumbing (`--train-init`, streamed `--train-data`,
+  `--train-save`, raw little-endian f32), the learning-rate schedule and the global-norm clip. A
+  default run (no warmup, constant schedule, no clip) is bit-identical to the old copying loop.
 - **Exit codes:** `0` OK, `1` COMPILE_ERROR, `2` UNIMPLEMENTED, `3` IO_ERROR.
 - Artifacts print to **stdout**; diagnostics and `wrote <file>` notes go to **stderr**.
 

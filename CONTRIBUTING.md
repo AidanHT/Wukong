@@ -243,7 +243,11 @@ showcase program.
 
 Training changes need focused driver and real-CLI coverage: `native_training_tests` checks exact
 trajectories, final weights and fixed inputs on both CPU backends, while `native_training` checks
-backend selection and invalid buffer/artifact options. Changes to the native buffer dispatcher
+backend selection and invalid buffer/artifact options, `training_data` the file, clip and schedule
+options through the binary, and `train_lm` a whole language model against an f64 reference. A loss
+whose forward writes one of its parameters must keep its per-step semantics: the in-place loop
+restores exactly the buffers `wukong_autodiff::written_params` reports, so a new write channel
+there needs a `tests/writes.rs` case. Changes to the native buffer dispatcher
 also require the `guarded_kernel` ownership, signature and assertion tests. Training performance
 requires separate measurements; these are correctness gates.
 

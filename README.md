@@ -272,7 +272,10 @@ pass and runs a fwd→bwd→optimizer (SGD/AdamW) loop on the interpreter or nat
 Every recognized tensor kernel has a VJP (riding the runtime's tuned backward kernels) or a named
 refusal, losses may call helper functions, `--emit=obj --grad-of=<fn>` exports the gradient ahead
 of time, and scalar-path losses have Hessian-vector products. Training accepts concrete f32 arrays
-and dense tensors; an AOT training loop and measured training speedups remain open. See the
+and dense tensors, loads weights and streams data batches from raw f32 files (`--train-init`,
+`--train-data`), writes the trained weights (`--train-save`), and clips and schedules the update
+(`--train-clip`, `--train-warmup`, `--train-schedule=cosine`); an AOT training loop and measured
+training speedups remain open. See the
 [training CLI contract](docs/language-guide.md#command-line-interface).
 Tuples and structs (incl. nested struct-in-struct, **by-value parameters and `-> Struct` returns** via
 an sret ABI, nested tuple fields `t.0.1`, and whole-aggregate assignment), pointers/references

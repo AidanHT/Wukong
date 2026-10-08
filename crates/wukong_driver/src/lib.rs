@@ -195,6 +195,20 @@ pub struct GradOptions {
     pub train_opt: TrainOpt,
     /// Seed for the deterministic buffer initialization the training loop uses (`--train-seed=<u64>`).
     pub train_seed: u64,
+    /// Buffers loaded from little-endian f32 files instead of the seeded init
+    /// (`--train-init=<i>=<path>`, repeatable); each file holds exactly the buffer's elements.
+    pub train_init: Vec<(usize, PathBuf)>,
+    /// Fixed-input buffers streamed from little-endian f32 files of whole batches, one batch per
+    /// update (`--train-data=<i>=<path>`, repeatable): update `s` reads batch `s mod batches`.
+    pub train_data: Vec<(usize, PathBuf)>,
+    /// Buffers written to little-endian f32 files after training (`--train-save=<i>=<path>`).
+    pub train_save: Vec<(usize, PathBuf)>,
+    /// Global gradient-norm clip (`--train-clip=<f>`, finite and positive); `None` = no clipping.
+    pub train_clip: Option<f32>,
+    /// Linear learning-rate warmup updates (`--train-warmup=<n>`).
+    pub train_warmup: usize,
+    /// The learning-rate schedule after the warmup (`--train-schedule=constant|cosine`).
+    pub train_schedule: TrainSchedule,
 }
 
 impl Default for GradOptions {
@@ -208,6 +222,12 @@ impl Default for GradOptions {
             train_weight_decay: 0.0,
             train_opt: TrainOpt::Sgd,
             train_seed: 0x5EED_1234,
+            train_init: Vec::new(),
+            train_data: Vec::new(),
+            train_save: Vec::new(),
+            train_clip: None,
+            train_warmup: 0,
+            train_schedule: TrainSchedule::Constant,
         }
     }
 }
@@ -2344,15 +2364,21 @@ fn loss_param_lens(
         .collect()
 }
 
-/// A tiny deterministic LCG producing `f32` in ~`[-0.4, 0.4]` — seeds the `--train` buffers so a run
-/// is reproducible (honest: no hidden entropy) and a test can assert a specific loss trajectory.
+/// A tiny deterministic LCG producing `f32` uniform in `[-0.4, 0.4)` — seeds the `--train` buffers so
+/// a run is reproducible (honest: no hidden entropy) and a test can assert a specific loss trajectory.
+///
+/// The draw is the standard u64 -> f32 conversion: the TOP 24 bits of the state, scaled by `2^-24`
+/// (exact in f32), give `u` uniform in `[0, 1)`; `(u - 0.5)·0.8` is then symmetric about zero. (It
+/// used to keep 31 bits, `seed >> 33`, and divide by `u32::MAX`, so `u` never reached 0.5 and every
+/// value lay in `[-0.4, 0)`: an all-negative init that starts a ReLU net mostly dead.)
 fn train_rand(seed: &mut u64, n: usize) -> Vec<f32> {
     (0..n)
         .map(|_| {
             *seed = seed
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
-            (((*seed >> 33) as f32) / (u32::MAX as f32) - 0.5) * 0.8
+            let u = ((*seed >> 40) as f32) * (1.0 / 16_777_216.0);
+            (u - 0.5) * 0.8
         })
         .collect()
 }
@@ -2361,18 +2387,21 @@ fn train_rand(seed: &mut u64, n: usize) -> Vec<f32> {
 ///
 /// Convention: `--grad-wrt` names the **trainable** buffer parameters (the weights); every other
 /// buffer is fixed input data; the **last** parameter is the scalar loss output `[f32; 1]`. All
-/// buffers are seeded deterministically (`--train-seed`); each step runs the gradient kernel (which
-/// replays the forward, so it yields both the loss and the gradients), then applies SGD or the fused
-/// AdamW kernel to the weights. The printed trajectory is the honest end-to-end signal — on a
-/// convex objective it strictly decreases.
+/// buffers are seeded deterministically (`--train-seed`), then any `--train-init` file replaces its
+/// buffer; `--train-data` streams one batch of a fixed input per update. Each step runs the
+/// gradient kernel (which replays the forward, so it yields both the loss and the gradients),
+/// optionally clips the global gradient norm (`--train-clip`), then applies SGD or the fused AdamW
+/// kernel at the scheduled rate (`--train-warmup`, `--train-schedule`). The printed trajectory is the
+/// honest end-to-end signal — on a convex objective it strictly decreases — and `--train-save`
+/// writes the trained buffers out.
 fn run_train(
     program: &wukong_mir::Program,
     interner: &mut Interner,
     opts: &Options,
     lens: &[usize],
 ) -> i32 {
-    match train_loop(program, interner, opts, lens) {
-        Ok(traj) => {
+    match train_loop_with_buffers(program, interner, opts, lens) {
+        Ok((traj, bufs)) => {
             use std::io::Write;
             let mut out = String::new();
             let opt = match opts.grad.train_opt {
@@ -2384,8 +2413,20 @@ fn run_train(
             } else {
                 format!(", weight_decay={}", opts.grad.train_weight_decay)
             };
+            // The update policy, named only where it differs from the default (so a default run
+            // prints the header it always has).
+            let mut policy = String::new();
+            if let Some(clip) = opts.grad.train_clip {
+                policy.push_str(&format!(", clip={clip}"));
+            }
+            if opts.grad.train_warmup > 0 {
+                policy.push_str(&format!(", warmup={}", opts.grad.train_warmup));
+            }
+            if opts.grad.train_schedule == TrainSchedule::Cosine {
+                policy.push_str(", schedule=cosine");
+            }
             out.push_str(&format!(
-                "train: {} step(s), lr={}, optimizer={opt}{decay}\n",
+                "train: {} step(s), lr={}, optimizer={opt}{decay}{policy}\n",
                 traj.len().saturating_sub(1),
                 opts.grad.train_lr
             ));
@@ -2403,6 +2444,13 @@ fn run_train(
                 ));
             }
             let _ = std::io::stdout().write_all(out.as_bytes());
+            for (i, path) in &opts.grad.train_save {
+                if let Err(e) = training::save_f32(path, &bufs[*i]) {
+                    emit_driver_error(opts, format!("--train: {e}"));
+                    return exit::IO_ERROR;
+                }
+                eprint_line(&format!("wrote {}", path.display()));
+            }
             exit::OK
         }
         Err(e) => {
@@ -2414,7 +2462,9 @@ fn run_train(
 
 /// The testable core of `--train`: build the {forward, backward, optimizer} program, initialize the
 /// buffers, run the loop, and return the loss trajectory (`traj[i]` = loss after `i` updates, with a
-/// final entry after the last update — so `traj.len() == steps + 1`).
+/// final entry after the last update — so `traj.len() == steps + 1`). `run_train` itself calls
+/// [`train_loop_with_buffers`], which also returns the final buffers for `--train-save`.
+#[cfg(test)]
 fn train_loop(
     program: &wukong_mir::Program,
     interner: &mut Interner,
@@ -2482,9 +2532,33 @@ fn train_loop_with_buffers(
     if wrt.contains(&loss_out) {
         return Err("--grad-wrt must not include the loss-output parameter (the last one)".into());
     }
+    let gopt = &opts.grad;
+    training::validate(
+        &gopt.train_init,
+        &gopt.train_data,
+        &gopt.train_save,
+        nparams,
+        loss_out,
+        &wrt,
+    )?;
+    if gopt.train_clip.is_some_and(|c| !c.is_finite() || c <= 0.0) {
+        return Err("--train-clip must be finite and positive".into());
+    }
+    // Read the initial buffers and open the data before the (costly) build, so a wrong path or a
+    // file of the wrong size fails at once.
+    let mut inits = Vec::with_capacity(gopt.train_init.len());
+    for (i, path) in &gopt.train_init {
+        inits.push((*i, training::read_init(path, *i, lens[*i])?));
+    }
+    let mut streams = Vec::with_capacity(gopt.train_data.len());
+    for (i, path) in &gopt.train_data {
+        streams.push(training::DataStream::open(path, *i, lens[*i])?);
+    }
 
     // Build {forward, backward} plus one fused AdamW kernel per distinct trainable-tensor size.
     let (fwd, gradfn) = build_grad(program, interner, opts)?;
+    // The buffers the forward may write, beside the loss output (see the restore below).
+    let written = wukong_autodiff::written_params(&fwd, interner);
     let (fwd_name, gname) = (fwd.name, gradfn.name);
     let mut funcs = vec![fwd, gradfn];
     let mut adamw: std::collections::HashMap<usize, wukong_span::Symbol> =
@@ -2521,14 +2595,31 @@ fn train_loop_with_buffers(
     let executor =
         training_native::TrainingExecutor::new(&mut train_prog, interner, opts.backend, entries)?;
 
-    // Deterministic buffer init; the loss output is zeroed, moment state starts at zero.
+    // Deterministic buffer init (every buffer draws in order, so a `--train-init` file replacing one
+    // buffer leaves the others' values unchanged); the loss output is zeroed, moment state starts
+    // at zero.
     let mut seed = opts.grad.train_seed;
     let mut bufs: Vec<Vec<f32>> = lens.iter().map(|&n| train_rand(&mut seed, n)).collect();
     bufs[loss_out] = vec![0.0; 1];
+    for (i, values) in inits {
+        bufs[i] = values;
+    }
+    // The gradient entry's buffers — the forward's, then one gradient per trainable weight — live
+    // for the whole run and are updated in place: no buffer is copied per step. A buffer the forward
+    // may write (other than the loss output) is snapshotted before each gradient run and put back
+    // after it, so every step sees its data, and the optimizer its weights, exactly as they were
+    // before the forward ran — the semantics of a fresh per-step copy, paid only for the buffers
+    // the forward writes (none, for a loss whose buffers only feed kernels).
+    bufs.extend(wrt.iter().map(|&wi| vec![0.0; lens[wi]]));
+    let restore: Vec<usize> = (0..nparams)
+        .filter(|&i| i != loss_out && written[i])
+        .collect();
+    let mut snapshot: Vec<Vec<f32>> = restore.iter().map(|&i| vec![0.0; lens[i]]).collect();
     let mut mstate: Vec<Vec<f32>> = wrt.iter().map(|&wi| vec![0.0; lens[wi]]).collect();
     let mut vstate: Vec<Vec<f32>> = wrt.iter().map(|&wi| vec![0.0; lens[wi]]).collect();
+    let mut hpbuf = vec![0.0f32; hp::LEN];
 
-    let lr = opts.grad.train_lr;
+    let steps = opts.grad.train_steps;
     let (beta1, beta2, eps) = (0.9f64, 0.999f64, 1e-8f64);
     // Grown amortized rather than pre-reserved: `--train-steps` is an unvalidated CLI integer, and
     // reserving from it let `--train-steps=999999999999` abort inside the allocator ("memory
@@ -2540,27 +2631,47 @@ fn train_loop_with_buffers(
         executor.run(prog, entry, bufs, it)
     };
 
-    for step in 0..opts.grad.train_steps {
-        // The gradient kernel replays the forward, so one call gives the current loss + the gradients.
-        let mut gbufs: Vec<Vec<f32>> = bufs.clone();
-        for &wi in &wrt {
-            gbufs.push(vec![0.0; lens[wi]]);
+    for step in 0..steps {
+        for stream in &mut streams {
+            let i = stream.index;
+            stream.load(step, &mut bufs[i])?;
         }
-        run(&train_prog, gname, &mut gbufs, interner)?;
-        traj.push(gbufs[loss_out][0]);
+        for (saved, &i) in snapshot.iter_mut().zip(&restore) {
+            saved.copy_from_slice(&bufs[i]);
+        }
+        bufs[loss_out][0] = 0.0;
+        for g in &mut bufs[nparams..] {
+            g.fill(0.0);
+        }
+        // The gradient kernel replays the forward, so one call gives the current loss + the gradients.
+        run(&train_prog, gname, &mut bufs, interner)?;
+        traj.push(bufs[loss_out][0]);
+        for (saved, &i) in snapshot.iter().zip(&restore) {
+            bufs[i].copy_from_slice(saved);
+        }
 
+        let (params, grads) = bufs.split_at_mut(nparams);
+        if let Some(max_norm) = opts.grad.train_clip {
+            training::clip_global_norm(grads, max_norm);
+        }
+        let lr = training::lr_at(
+            opts.grad.train_lr,
+            step,
+            steps,
+            opts.grad.train_warmup,
+            opts.grad.train_schedule,
+        );
         match opts.grad.train_opt {
             TrainOpt::Sgd => {
-                for (i, &wi) in wrt.iter().enumerate() {
-                    let g = &gbufs[nparams + i];
-                    for (wv, &gv) in bufs[wi].iter_mut().zip(g) {
+                for (g, &wi) in grads.iter().zip(&wrt) {
+                    for (wv, &gv) in params[wi].iter_mut().zip(g) {
                         *wv -= lr * gv;
                     }
                 }
             }
             TrainOpt::AdamW => {
                 let t = (step + 1) as i32;
-                let mut hpbuf = vec![0.0f32; hp::LEN];
+                hpbuf.fill(0.0);
                 hpbuf[hp::LR] = lr;
                 hpbuf[hp::BETA1] = beta1 as f32;
                 hpbuf[hp::BETA2] = beta2 as f32;
@@ -2570,24 +2681,44 @@ fn train_loop_with_buffers(
                 hpbuf[hp::BC2] = (1.0 - beta2.powi(t)) as f32;
                 for (i, &wi) in wrt.iter().enumerate() {
                     let aname = adamw[&lens[wi]];
-                    let mut ab = vec![
-                        bufs[wi].clone(),
-                        gbufs[nparams + i].clone(),
-                        mstate[i].clone(),
-                        vstate[i].clone(),
-                        hpbuf.clone(),
+                    // The kernel's five buffers are moved in and back out — no copies.
+                    let mut ab = [
+                        std::mem::take(&mut params[wi]),
+                        std::mem::take(&mut grads[i]),
+                        std::mem::take(&mut mstate[i]),
+                        std::mem::take(&mut vstate[i]),
+                        std::mem::take(&mut hpbuf),
                     ];
-                    run(&train_prog, aname, &mut ab, interner)?;
-                    bufs[wi] = ab[0].clone();
-                    mstate[i] = ab[2].clone();
-                    vstate[i] = ab[3].clone();
+                    let ran = run(&train_prog, aname, &mut ab[..], interner);
+                    let [w, g, m, v, h] = ab;
+                    params[wi] = w;
+                    grads[i] = g;
+                    mstate[i] = m;
+                    vstate[i] = v;
+                    hpbuf = h;
+                    ran?;
                 }
             }
         }
     }
-    // One final forward to report the loss after the last update.
+    // One final forward to report the loss after the last update (on the batch the next update
+    // would see).
+    for stream in &mut streams {
+        let i = stream.index;
+        stream.load(steps, &mut bufs[i])?;
+    }
+    bufs[loss_out][0] = 0.0;
+    bufs.truncate(nparams);
+    for (saved, &i) in snapshot.iter_mut().zip(&restore) {
+        saved.copy_from_slice(&bufs[i]);
+    }
     run(&train_prog, fwd_name, &mut bufs, interner)?;
     traj.push(bufs[loss_out][0]);
+    // The returned buffers are what `--train-save` writes: the trained values, not whatever the
+    // reporting forward left in a buffer it writes (the same restore every training step does).
+    for (saved, &i) in snapshot.iter().zip(&restore) {
+        bufs[i].copy_from_slice(saved);
+    }
     Ok((traj, bufs))
 }
 
@@ -3483,6 +3614,7 @@ mod grad_cli_tests {
                 train_weight_decay: 0.0,
                 train_opt: opt,
                 train_seed: seed,
+                ..GradOptions::default()
             },
             ..Options::default()
         };
@@ -3509,6 +3641,26 @@ mod grad_cli_tests {
         };
         let lens = loss_param_lens(&sema, &mut interner, &opts).expect("param sizes");
         assert_eq!(lens, vec![12, 8, 6, 1], "x[12], w[8], t[6], out[1]");
+    }
+
+    /// N80: the `--train` initializer covers its documented range symmetrically. It used to keep
+    /// 31 bits of the LCG state and divide by `u32::MAX`, so every value lay in `[-0.4, 0)`.
+    #[test]
+    fn train_init_is_uniform_and_symmetric_about_zero() {
+        let mut seed = GradOptions::default().train_seed;
+        let v = train_rand(&mut seed, 4096);
+        assert!(
+            v.iter().all(|x| (-0.4..0.4).contains(x)),
+            "out of [-0.4, 0.4)"
+        );
+        let negative = v.iter().filter(|&&x| x < 0.0).count();
+        assert!(
+            (1848..=2248).contains(&negative),
+            "{negative} of 4096 negative"
+        );
+        let mean = v.iter().map(|&x| f64::from(x)).sum::<f64>() / v.len() as f64;
+        assert!(mean.abs() < 0.02, "mean {mean}");
+        assert!(v.iter().any(|&x| x > 0.35) && v.iter().any(|&x| x < -0.35));
     }
 
     #[test]
@@ -5357,4 +5509,6 @@ mod gpu_e2e_tests {
 
 #[cfg(test)]
 mod native_training_tests;
+mod training;
 mod training_native;
+pub use training::TrainSchedule;

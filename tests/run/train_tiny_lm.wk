@@ -1,0 +1,88 @@
+// RUN: --train --grad-wrt=0,1,2 --train-steps=3 --train-lr=0.5 --train-seed=11
+// EXPECT-EXIT: 0
+module tests.run.train_tiny_lm
+
+// A two-layer character-level language model trained end to end by `--train` (N83 / N82): an
+// embedding gather, a tanh hidden layer, an output projection and the softmax cross-entropy of
+// every next character, all written as the loops the recognizers turn into kernels, so the
+// gradient rides the tape's embedding (scatter-add), GEMM, tanh and cross-entropy VJPs.
+//
+//   x  = emb[ids]                  [T=6, H=4]   wukong_embedding_f32_parallel
+//   h  = tanh(x · w1ᵀ)             [6, 4]       wukong_sgemm_nt_parallel + wukong_vmath_f32_parallel
+//   lg = h · w2ᵀ                   [6, V=8]     wukong_sgemm_nt_parallel
+//   L  = Σ_t xent(lg[t], tgt[t])                wukong_xent_fwd_f32_parallel + wukong_sreduce_f32_parallel
+//
+// The sequence "abcabd" (ids 1 2 3 1 2 4) predicts its own next characters (2 3 1 2 4, then 0).
+// Every parameter is trained. The trajectory is not pinned here (a six-decimal loss near 12 sits
+// below the f32 resolution of the runtime's exp/tanh kernels); `crates/wukongc/tests/train_lm.rs`
+// runs this file on both backends and checks it against an f64 reference of the same model and the
+// same seeded weights: 12.406603, 11.984528, 10.952965, 8.654537 — a strict decrease.
+//
+// `main` evaluates the loss at all-zero weights for the differential gates: every hidden unit is
+// tanh(0) = 0, every logit 0, so each position costs ln 8 and L = 6·ln 8 = 12.476649…; × 1000,
+// truncated, that is 12476 on every backend and level.
+
+@parallel
+fn loss(emb: [f32; 32], w1: [f32; 16], w2: [f32; 32], mut out: [f32; 1]) -> f32 {
+    let ids: [i32; 6] = [1, 2, 3, 1, 2, 4];
+    let tgt: [i32; 6] = [2, 3, 1, 2, 4, 0];
+    let mut x: [f32; 24] = [0.0; 24];
+    let mut z: [f32; 24] = [0.0; 24];
+    let mut h: [f32; 24] = [0.0; 24];
+    let mut lg: [f32; 48] = [0.0; 48];
+    let mut lv: [f32; 6] = [0.0; 6];
+    for t in 0..6 {
+        for d in 0..4 {
+            x[t * 4 + d] = emb[ids[t] * 4 + d];
+        }
+    }
+    for i in 0..6 {
+        for j in 0..4 {
+            let mut s: f32 = 0.0;
+            for k in 0..4 {
+                s = s + x[i * 4 + k] * w1[j * 4 + k];
+            }
+            z[i * 4 + j] = s;
+        }
+    }
+    for e in 0..24 {
+        h[e] = tanh(z[e]);
+    }
+    for i in 0..6 {
+        for j in 0..8 {
+            let mut s: f32 = 0.0;
+            for k in 0..4 {
+                s = s + h[i * 4 + k] * w2[j * 4 + k];
+            }
+            lg[i * 8 + j] = s;
+        }
+    }
+    for r in 0..6 {
+        let mut m: f32 = lg[r * 8];
+        for c in 0..8 {
+            m = fmax(m, lg[r * 8 + c]);
+        }
+        let mut se: f32 = 0.0;
+        for c in 0..8 {
+            se = se + exp(lg[r * 8 + c] - m);
+        }
+        lv[r] = m + log(se) - lg[r * 8 + tgt[r]];
+    }
+    let mut l: f32 = 0.0;
+    for q in 0..6 {
+        l = l + lv[q];
+    }
+    out[0] = l;
+    return l;
+}
+
+fn main() -> i32 {
+    let emb: [f32; 32] = [0.0; 32];
+    let w1: [f32; 16] = [0.0; 16];
+    let w2: [f32; 32] = [0.0; 32];
+    let mut out: [f32; 1] = [0.0];
+    let l: f32 = loss(emb, w1, w2, out);
+    print((l * 1000.0) as i32);
+    print((out[0] * 1000.0) as i32);
+    return 0;
+}

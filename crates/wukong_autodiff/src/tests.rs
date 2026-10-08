@@ -15,10 +15,12 @@ use wukong_interp::run_kernel_f64;
 
 // The kernel-family, memory-model, call/second-order and recognizer-mirror gates, each a submodule
 // over the helpers below.
+mod attention;
 mod calls;
 mod kernels;
 mod memory;
 mod mirror;
+mod writes;
 use wukong_mir::{BinOp, Builder, Function, MirType, Op, Program, ValueId};
 use wukong_span::{Interner, Symbol};
 

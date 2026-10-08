@@ -13,7 +13,13 @@ grad(func: &Function, wrt: &[usize], interner: &mut Interner) -> Result<Function
 inline_calls(program: &Program, func: &Function) -> Function          // splice straight-line helpers
 grad_dot(func, wrt, interner) -> Result<Function, String>             // <v, ∇L>, single-block
 hvp(func, wrt, interner) -> Result<(Function, Function), String>      // (grad_dot, Hessian·v)
+written_params(func: &Function, interner: &Interner) -> Vec<bool>     // which buffers func may write
 ```
+
+`written_params` is the tape's kernel knowledge turned outward: a recognized kernel writes only its
+output operand, so a weight that only feeds kernels is provably unchanged by a call; stores,
+unrecognized calls and pointer escapes are conservatively writes. The `--train` loop uses it to run
+the gradient on the live buffers and snapshot only the buffers the forward writes.
 
 Contract on `func`:
 
@@ -37,7 +43,7 @@ or the callee.
 
 **Buffer tape (`tape.rs`, `tape_linalg.rs`, `tape_nn.rs`)** — one gradient buffer per forward
 buffer. Every recognized kernel family is listed once in `tape::FORWARD_KERNELS` (recognition,
-arity and dispatch from one table; 49 symbols, serial and `@parallel`). The backward emits the
+arity and dispatch from one table; 50 symbols, serial and `@parallel`). The backward emits the
 runtime's own tuned kernels — transposed GEMM spellings, `wukong_{softmax,layernorm,rmsnorm}_bwd_f32`,
 the fused `wukong_vmath2_f32` backward codes, `wukong_xent_bwd_f32`, `wukong_rope_bwd_f32`,
 `wukong_scatter_add_f32` — in the `@parallel` spelling when the forward used it. Gradients
