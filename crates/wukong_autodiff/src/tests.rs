@@ -93,10 +93,15 @@ fn fd_grad(
     for &wi in wrt {
         let mut g = vec![0.0; fwd.lens[wi]];
         for j in 0..fwd.lens[wi] {
+            // Each side of the difference starts from a FRESH copy of the inputs: the forward kernel
+            // writes its buffers back (`run_kernel_*` copies final memory out), so an in-place
+            // forward (`x = softmax(x)`) would otherwise leave `x` overwritten by the `+eps` run and
+            // the `-eps` run would difference against a different point entirely.
+            let orig = inputs[wi][j];
             let mut bufs = inputs.to_vec();
-            let orig = bufs[wi][j];
             bufs[wi][j] = orig + eps;
             let lp = loss_at(prog, fwd.func.name, &mut bufs, fwd.loss_out, interner);
+            let mut bufs = inputs.to_vec();
             bufs[wi][j] = orig - eps;
             let lm = loss_at(prog, fwd.func.name, &mut bufs, fwd.loss_out, interner);
             g[j] = (lp - lm) / (2.0 * eps);
@@ -603,10 +608,15 @@ fn fd_grad_f32(
     for &wi in wrt {
         let mut g = vec![0.0; fwd.lens[wi]];
         for j in 0..fwd.lens[wi] {
+            // Each side of the difference starts from a FRESH copy of the inputs: the forward kernel
+            // writes its buffers back (`run_kernel_*` copies final memory out), so an in-place
+            // forward (`x = softmax(x)`) would otherwise leave `x` overwritten by the `+eps` run and
+            // the `-eps` run would difference against a different point entirely.
+            let orig = inputs[wi][j];
             let mut bufs = inputs.to_vec();
-            let orig = bufs[wi][j];
             bufs[wi][j] = orig + eps;
             let lp = loss_at_f32(prog, fwd.func.name, &mut bufs, fwd.loss_out, it);
+            let mut bufs = inputs.to_vec();
             bufs[wi][j] = orig - eps;
             let lm = loss_at_f32(prog, fwd.func.name, &mut bufs, fwd.loss_out, it);
             g[j] = (lp - lm) / (2.0 * eps as f64);

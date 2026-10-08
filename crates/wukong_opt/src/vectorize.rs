@@ -602,6 +602,14 @@ fn iv_verdict(l: &NaturalLoop) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Would this pass widen `l` as it stands? The same verdict [`pick`] reaches for a loop it has not
+/// widened yet, for a caller that must not trade a widenable loop away (`fuse`'s profit rule).
+/// `l` must be analyzed to at least [`loop_info::Stages::Memory`]; less reads as "no", because the
+/// unrun stages' defaults are the conservative answers.
+pub(crate) fn would_widen(f: &Function, l: &NaturalLoop) -> bool {
+    plan_loop(f, l).is_ok()
+}
+
 fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
     // ---- structure -------------------------------------------------------------------------
     let (preheader, body) = structural_verdict(f, l)?;
@@ -3311,9 +3319,15 @@ mod tests {
     // ---- if-conversion -------------------------------------------------------------------------
 
     /// A diamond whose two arms store to the same address becomes one masked store.
+    ///
+    /// `@unchecked`, because the arms' slice accesses are *conditional*: `bce` may not read a
+    /// parameter slice's length ahead of a check that does not run on every iteration, so with
+    /// bounds checks the check-free copy keeps the arms' checks as extra exits and nothing reaches
+    /// if-conversion. The opt-out gives the plain diamond this case is about.
     #[test]
     fn a_diamond_body_is_if_converted() {
-        let src = "fn k(x: []f32, y: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
+        let src =
+            "@unchecked fn k(x: []f32, y: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
                    while i < n { let xi: f32 = x[i]; \
                    if xi > 0.0 { o[i] = xi * 2.0 + y[i]; } else { o[i] = y[i] - xi; } \
                    i = i + 1; } } \

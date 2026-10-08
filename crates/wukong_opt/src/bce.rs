@@ -1062,7 +1062,7 @@ fn apply(f: &mut Function, p: &Plan) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::optimize;
+    use crate::optimize_preserving;
     use wukong_span::{Interner, SourceId};
 
     fn lower(src: &str) -> (wukong_mir::Program, Interner) {
@@ -1076,20 +1076,35 @@ mod tests {
         (program, interner)
     }
 
+    /// Lower and optimize `src` at `level`, then run `main`.
+    ///
+    /// Every function other than `main` is kept as an entry point. `-O2` still inlines each call
+    /// into `main` (so the result checked below is the inlined program's), but it also optimizes
+    /// the function on its own, with its slices as opaque parameters. That copy is the one this
+    /// pass has to work on: inlined into `main`, the slices are local arrays whose lengths scalar
+    /// replacement turns into constants, and the checks fold away (or the whole loop unrolls)
+    /// before a guard is ever needed, which would leave nothing here to observe.
     fn run(src: &str, level: u8) -> (wukong_mir::Program, Interner, Result<i64, String>) {
         let (mut program, mut interner) = lower(src);
-        optimize(&mut program, level);
+        let main = interner.intern("main");
+        let roots: Vec<wukong_span::Symbol> = program
+            .funcs
+            .iter()
+            .map(|f| f.name)
+            .filter(|n| *n != main)
+            .collect();
+        optimize_preserving(&mut program, level, &roots);
         for f in &program.funcs {
             let errors = wukong_mir::verify::verify_function(f);
             assert!(errors.is_empty(), "-O{level}: {errors:?}");
         }
-        let main = interner.intern("main");
         let result = wukong_interp::run(&program, main, &interner);
         (program, interner, result)
     }
 
     /// Program-wide `(loops, loops still carrying a check, original-loop checks marked as proved)`.
-    /// Counted over every function because `-O2` may inline the function the loop was written in.
+    /// Counted over every function because `-O2` inlines the function the loop was written in (and
+    /// [`run`] keeps that function too).
     fn census(p: &wukong_mir::Program) -> (usize, usize, usize) {
         let (mut loops, mut checked, mut marked) = (0, 0, 0);
         for f in &p.funcs {

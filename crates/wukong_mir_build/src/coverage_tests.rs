@@ -200,8 +200,14 @@ fn keep(x: [f32; 64], mut o: [f32; 64], mut p: [f32; 64]) {
 
 // ---- P12.10: the hand-expanded GELU ------------------------------------------------------------
 
+/// The kernel-order expansion used to fold into `VMATH_GELU`, on the premise that the source's
+/// `tanh` is the kernel's internal `tanh_exp1`. Since the language's `tanh` became the runtime's
+/// piecewise kernel on every spelling (`5f423d1e`) while `gelu` keeps `tanh_exp1`, the expansion is
+/// a different function in the last bits, and substituting the kernel would change the answer
+/// (`tests/run/spelling_value_bindings.wk` pins the inline values lane by lane). So it must not
+/// dispatch the GELU kernel — in either spelling.
 #[test]
-fn the_kernel_order_gelu_expansion_dispatches_vmath_gelu() {
+fn the_kernel_order_gelu_expansion_no_longer_dispatches_vmath_gelu() {
     let src = "module m
 fn inline_form(x: [f32; 64], mut o: [f32; 64]) {
     for i in 0..64 {
@@ -218,13 +224,13 @@ fn hoisted_form(x: [f32; 64], mut o: [f32; 64]) {
     let (prog, _, interner) = lower_src(src);
     for name in ["inline_form", "hoisted_form"] {
         let f = func(&prog, &interner, name);
-        assert_eq!(kernels(f, &interner), vec!["wukong_vmath_f32"], "{name}");
-        let args = call_args(f, &interner, "wukong_vmath_f32");
-        assert_eq!(
-            const_int(f, args[0][3]),
-            Some(VMATH_GELU as i128),
-            "{name}: the op must be VMATH_GELU"
-        );
+        for args in call_args(f, &interner, "wukong_vmath_f32") {
+            assert_ne!(
+                const_int(f, args[3]),
+                Some(VMATH_GELU as i128),
+                "{name}: the expansion must not be substituted by the GELU kernel"
+            );
+        }
     }
 }
 

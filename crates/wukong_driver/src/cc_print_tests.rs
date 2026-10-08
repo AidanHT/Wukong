@@ -79,27 +79,29 @@ fn forced_c_link_preserves_integer_output_and_float_computation() {
 /// the double, closest when several do), then the linked executable is also compared with the
 /// interpreter byte for byte. The values cover each layout branch (integral, fractional, leading
 /// zeros, trailing zeros past the digits), the f32-widened 0.1, signed zero, NaN, both infinities,
-/// the smallest subnormal and a power of two whose shortest form needs zero padding.
+/// the smallest subnormal and a power of two whose shortest form needs zero padding. The f64 cases
+/// carry an explicit `f64` suffix: an unsuffixed float literal defaults to `f32` (language guide,
+/// Literals), so a bare `print(0.1)` would print the f32-widened `0.10000000149011612`.
 #[test]
 fn forced_c_link_prints_floats_exactly_like_the_oracle() {
     let (program, mut interner) = lower(
         "fn main() -> i32 {
              let z: f64 = 0.0;
-             print(0.1);
+             print(0.1f64);
              let a: f32 = 0.1;
              print(a);
              let mut e21: f64 = 1.0;
              let mut k: i32 = 0;
              while k < 21 { e21 = e21 * 10.0; k = k + 1; }
              print(e21);
-             print(0.0000001);
+             print(0.0000001f64);
              print(-z);
              print(z / z);
              print(1.0 / z);
              print(-1.0 / z);
-             print(123456789.125);
-             print(2.5);
-             print(1.0);
+             print(123456789.125f64);
+             print(2.5f64);
+             print(1.0f64);
              let third: f64 = 1.0 / 3.0;
              print(third);
              let mut tiny: f64 = 1.0;

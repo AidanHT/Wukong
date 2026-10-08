@@ -5566,18 +5566,88 @@ mod tests {
             "negative M must leave C untouched"
         );
 
-        // Fused attention (`wukong_attention_f32`): negative sequence length.
-        assert_eq!(
-            run_main(
-                "fn main() -> i32 { let mut q: [f32; 16] = [0.0; 16]; let mut k: [f32; 16] = [0.0; 16]; \
+        // Fused attention (`wukong_attention_f32`): non-positive sequence length.
+        //
+        // The source-level `sdpa(..)` is a shape-checked kernel builtin (65541ffd): a runtime
+        // extent outside `0..=i32::MAX` traps through `assert` BEFORE the kernel is reached, so a
+        // negative `s` can no longer arrive at `wukong_attention_f32` from source. An empty `s`
+        // still passes the builtin's checks and reaches the kernel, which must be a no-op.
+        let sdpa_with_s = |s: &str| {
+            format!(
+                "fn main() -> i32 {{ let mut q: [f32; 16] = [0.0; 16]; let mut k: [f32; 16] = [0.0; 16]; \
                    let mut v: [f32; 16] = [0.0; 16]; let mut o: [f32; 16] = [1.0; 16]; \
-                   for i in 0..16 { q[i] = (i as f32) * 0.1; k[i] = (i as f32) * 0.2; \
-                     v[i] = (i as f32) * 0.5; } \
-                   sdpa(q, k, v, o, -1, 4, 0.5, 0); return (o[0] * 100.0) as i32; }"
-            ),
+                   for i in 0..16 {{ q[i] = (i as f32) * 0.1; k[i] = (i as f32) * 0.2; \
+                     v[i] = (i as f32) * 0.5; }} \
+                   sdpa(q, k, v, o, {s}, 4, 0.5, 0); return (o[0] * 100.0) as i32; }}"
+            )
+        };
+        assert_eq!(
+            run_main(&sdpa_with_s("0")),
             100,
-            "negative S must leave the attention output untouched"
+            "an empty S must leave the attention output untouched"
         );
+        {
+            let src = sdpa_with_s("-1");
+            let mut interner = Interner::new();
+            let (module, pd) = wukong_parser::parse_module(&src, SourceId(0), &mut interner);
+            assert!(pd.is_empty(), "parse: {pd:?}");
+            let (sema, sd) = wukong_sema::check(&module, &interner);
+            assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
+            let (program, _ld) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+            let main = interner.intern("main");
+            assert_eq!(
+                run(&program, main, &interner).unwrap_err(),
+                "assertion failed",
+                "the sdpa builtin must trap a negative runtime S before the kernel"
+            );
+        }
+
+        // The kernel-level contract the builtin check now shields: a negative `s` handed straight
+        // to `wukong_attention_f32` (as hand-built MIR or a recognizer could) is a no-op, exactly
+        // as the runtime kernel the native backend calls treats it — never a wrapped `usize`.
+        let program = Program::default();
+        let interner = Interner::new();
+        let mut interp = Interp {
+            program: &program,
+            interner: &interner,
+            memory: Vec::new(),
+            stdout: Vec::new(),
+            scratch_arena: ScratchSlots::default(),
+            frames: Vec::new(),
+            call_args: Vec::new(),
+            scratch: Vec::new(),
+            vecs: Vec::new(),
+            #[cfg(test)]
+            vector_peak: 0,
+            data_addrs: HashMap::new(),
+            function_indices: None,
+            static_indices: None,
+            accel: None,
+            depth: 0,
+        };
+        let initial: Vec<Value> = (0..64).map(|i| Value::Float(f64::from(i) * 0.25)).collect();
+        for s in [0, -1, i128::from(i64::MIN)] {
+            interp.memory.clone_from(&initial);
+            interp
+                .intrinsic(
+                    "wukong_attention_f32",
+                    &[
+                        Value::Ptr(0),
+                        Value::Ptr(16),
+                        Value::Ptr(32),
+                        Value::Ptr(48),
+                        Value::Int(s),
+                        Value::Int(4),
+                        Value::Float(0.5),
+                        Value::Int(0),
+                    ],
+                )
+                .unwrap();
+            assert_eq!(
+                interp.memory, initial,
+                "S = {s} must leave the attention output untouched"
+            );
+        }
     }
 
     #[test]

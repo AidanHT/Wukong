@@ -1655,10 +1655,12 @@ mod tests {
     #[test]
     fn emits_phi_nodes_for_optimized_loops() {
         // After mem2reg the loop carries its counter/accumulator as block parameters; the emitter
-        // must lower those to phi nodes with one entry per predecessor edge.
+        // must lower those to phi nodes with one entry per predecessor edge. The trip count is a
+        // parameter: since 975bc417 (complete unrolling of known trip counts <= 32) a constant
+        // `while i < 10` is fully unrolled and folds to `ret i32 45`, leaving no loop to carry phis.
         let out = ir_opt(
-            "fn main() -> i32 { let mut s: i32 = 0; let mut i: i32 = 0; \
-             while i < 10 { s = s + i; i = i + 1; } return s; }",
+            "fn sum(n: i32) -> i32 { let mut s: i32 = 0; let mut i: i32 = 0; \
+             while i < n { s = s + i; i = i + 1; } return s; }",
             2,
         );
         assert!(out.contains("phi i32"), "expected phi nodes:\n{out}");

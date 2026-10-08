@@ -1,3 +1,6 @@
+#[path = "support/alias_guard.rs"]
+mod alias_guard;
+
 use std::fmt::Write;
 use wukong_mir::{Op, Program};
 use wukong_span::{Interner, SourceId};
@@ -140,6 +143,10 @@ fn dispatches(program: &Program, interner: &Interner) -> Vec<String> {
         .collect()
 }
 
+fn unguarded_dispatches(program: &Program, interner: &Interner) -> Vec<String> {
+    alias_guard::unguarded_dispatches(program, interner, &|name| name.starts_with("wukong_xent_"))
+}
+
 fn check(direction: Direction, local_view: bool) {
     let expected = expected(direction);
     for alias in [true, false] {
@@ -162,8 +169,18 @@ fn check(direction: Direction, local_view: bool) {
                         [format!("wukong_xent_{direction}_f32{suffix}")],
                         "{label}"
                     );
+                } else if recognize {
+                    // Run-time alias versioning (`wukong_mir_build::kernel_guard`) dispatches a
+                    // may-alias call site behind a `ptrtoint` overlap test whose other arm is the
+                    // ORIGINAL source loop, so the kernel may be present -- but never unguarded.
+                    // Check this before native execution: an unguarded aliased call would race.
+                    // The every-lane comparison below proves the guard took the source loop.
+                    let unguarded = unguarded_dispatches(&program, &interner);
+                    assert!(
+                        unguarded.is_empty(),
+                        "{label}: unguarded dispatch {unguarded:?}"
+                    );
                 } else {
-                    // Check this before native execution: an aliased parallel call would race.
                     assert!(calls.is_empty(), "{label}: unexpected dispatch {calls:?}");
                 }
                 let entry = interner.intern("entry");
@@ -177,6 +194,13 @@ fn check(direction: Direction, local_view: bool) {
                         calls.is_empty(),
                         "{label} O{level}"
                     );
+                    if alias {
+                        let unguarded = unguarded_dispatches(&optimized, &interner);
+                        assert!(
+                            unguarded.is_empty(),
+                            "{label} O{level}: unguarded dispatch {unguarded:?}"
+                        );
+                    }
                     assert!(
                         optimized_calls.iter().all(|call| calls.contains(call)),
                         "{label} O{level}: unexpected dispatch {optimized_calls:?}"

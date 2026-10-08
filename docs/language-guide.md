@@ -1215,12 +1215,12 @@ The composed activations `gelu`, `mish`, `tanhshrink`, `tanh_backward` and `gelu
 exp-composed `1 − 2/(exp(2x) + 1)` as their *internal* building block, because their dispatched
 kernels are built on it and each activation stays bit-identical to its kernel; that block is not
 the language's `tanh`. On `f64` every spelling is the double-precision runtime `tanh`.
-The tanh-approximation GELU written out by hand dispatches to the same kernel as `gelu()` when it is
-written in the kernel's own association — `0.5 * v * (1.0 + tanh(0.7978845608 * (v + 0.044715 * (v *
-v * v))))`, either operand order for each single `*`/`+` — because that spelling's inline evaluation is
-the kernel's, operation for operation (the source's `v + c*x3` contracts to the kernel's one FMA).
-HuggingFace's literal `0.044715 * v * v * v` rounds the cubic term differently and stays inline, and
-so does the erf form, which is a different function from the tanh approximation.
+The tanh-approximation GELU written out by hand — `0.5 * v * (1.0 + tanh(0.7978845608 * (v +
+0.044715 * (v * v * v))))`, in any association — is therefore **not** `gelu()`: its `tanh` is the
+language's piecewise one, `gelu`'s is the exp-composed block, and the two differ in the last bits on
+ordinary inputs. It lowers as written (vectorized, with the inline `tanh`) and is never substituted by
+the GELU kernel (`tests/run/spelling_value_bindings.wk`); call `gelu()` for the kernel. The erf form
+is a different function again.
 
 ## Floating-point semantics ✅
 

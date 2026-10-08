@@ -183,7 +183,13 @@ fn host1(op: i64, x: f64) -> Option<f64> {
         VM_COSH => x.cosh(),
         VM_ASINH => x.asinh(),
         VM_ACOSH => x.acosh(),
-        VM_ATANH => x.atanh(),
+        // std's `atanh` is `0.5 * ln_1p(2x / (1 - x))`. For x near -1 the quotient is near -1, so
+        // `ln_1p` cancels and amplifies the quotient's half-ULP rounding: at x = -0.999999 the host
+        // returns -7.254328619281081 while the correctly rounded value (50-digit Decimal) is
+        // -7.254328619247669, ~4.6e-12 relative. For x near +1, `1 - x` is exact (Sterbenz) and the
+        // log of the large quotient is well conditioned, so take the host value on |x| and apply
+        // atanh's odd symmetry (`signum` keeps -0.0 and NaN).
+        VM_ATANH => x.signum() * x.abs().atanh(),
         VM_ATAN => x.atan(),
         VM_EXPM1 => x.exp_m1(),
         VM_LOG1P => x.ln_1p(),

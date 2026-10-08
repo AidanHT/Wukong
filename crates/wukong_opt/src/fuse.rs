@@ -390,8 +390,14 @@ fn plan_pair(
             }
         }
     }
-    // Profit: never trade a widenable loop for a fused one the vectorizer would refuse.
-    let (w1, w2) = (l1.is_vectorizable_shape(), l2.is_vectorizable_shape());
+    // Profit: never trade a widenable loop for a fused one the vectorizer would refuse. The
+    // verdict is the vectorizer's own, not the dependence shape alone: a loop that reads a 64-bit
+    // counter as an `f32` value has a vectorizable *shape* and is still declined, and fusing it
+    // with a widenable reduction loop would cost that loop its vector body.
+    let (w1, w2) = (
+        crate::vectorize::would_widen(f, l1),
+        crate::vectorize::would_widen(f, l2),
+    );
     if w1 != w2 {
         return None;
     }
@@ -519,8 +525,13 @@ mod tests {
     use wukong_mir::{Builder, Program};
     use wukong_span::{Interner, SourceId};
 
-    /// `f(n)`: three loops over `0..n` on two 8-element stack buffers — `t[i] = 3i`, then
+    /// `f(n)`: three loops over `0..n` on two 8-element stack buffers — `t[i] = i`, then
     /// `o[j] = t[j] + 1`, then `acc += o[k]` — returning `acc`. All three fuse into one.
+    ///
+    /// Every one of the three is a loop the vectorizer widens on its own (the first stores its
+    /// counter, which a lane ramp answers), so fusion's profit rule is not what decides here. A
+    /// first loop storing `3 * i` would not do: the vectorizer declines a scaled counter read as a
+    /// value, and fusion then rightly refuses to give the second loop's vector body away for it.
     fn three_loops(it: &mut Interner, shift: i128) -> Function {
         let mut b = Builder::new(it.intern("f"), MirType::I32);
         let n = b.add_param(MirType::I32);
@@ -571,9 +582,7 @@ mod tests {
                 elem: MirType::I32,
             },
         );
-        let three = b.build(MirType::I32, Op::ConstInt(3, MirType::I32));
-        let v = b.build(MirType::I32, Op::Bin(BinOp::Mul, i, three));
-        b.build_void(Op::Store { ptr: pt, value: v });
+        b.build_void(Op::Store { ptr: pt, value: i });
         let one = b.build(MirType::I32, Op::ConstInt(1, MirType::I32));
         let i2 = b.build(MirType::I32, Op::Bin(BinOp::Add, i, one));
         b.br(h1, vec![i2]);
@@ -673,10 +682,10 @@ mod tests {
     fn three_adjacent_loops_fuse_into_one() {
         let mut it = Interner::new();
         let mut f = three_loops(&mut it, 0);
-        // acc = Σ (3i + 1) over 0..n: n = 0 -> 0, 1 -> 1, 4 -> 22, 8 -> 92.
+        // acc = Σ (i + 1) over 0..n: n = 0 -> 0, 1 -> 1, 4 -> 10, 8 -> 36.
         let ns = [0, 1, 4, 8];
         let before = run_n(&f, &mut it, &ns);
-        assert_eq!(before, b"0\n1\n22\n92\n".to_vec());
+        assert_eq!(before, b"0\n1\n10\n36\n".to_vec());
         assert_eq!(loop_count(&f), 3);
         assert!(LoopFuse.run_function(&mut f, &mut CfgAnalyses::default()));
         assert!(wukong_mir::verify::verify_function(&f).is_empty());
@@ -699,12 +708,12 @@ mod tests {
     fn a_read_ahead_of_the_writer_blocks_fusion() {
         let mut it = Interner::new();
         let mut f = three_loops(&mut it, 1);
-        // o[j] = t[j + 1] + 1 = 3(j + 1) + 1 for j + 1 < n, and t[n] = 100 + n + ... untouched
-        // slot: o[n - 1] = (100 + n) + 1. acc = Σ_{j < n-1} (3j + 4) + 101 + n.
+        // o[j] = t[j + 1] + 1 = (j + 1) + 1 for j + 1 < n, and t[n] is the untouched slot
+        // 100 + n: o[n - 1] = (100 + n) + 1. acc = Σ_{j < n-1} (j + 2) + 101 + n.
         let ns = [0, 1, 4, 8];
         let before = run_n(&f, &mut it, &ns);
-        // n = 0: 0. n = 1: 102. n = 4: (4 + 7 + 10) + 105 = 126. n = 8: (4+7+..+22) + 109 = 200.
-        assert_eq!(before, b"0\n102\n126\n200\n".to_vec());
+        // n = 0: 0. n = 1: 102. n = 4: (2 + 3 + 4) + 105 = 114. n = 8: (2+3+..+8) + 109 = 144.
+        assert_eq!(before, b"0\n102\n114\n144\n".to_vec());
         LoopFuse.run_function(&mut f, &mut CfgAnalyses::default());
         assert!(wukong_mir::verify::verify_function(&f).is_empty());
         assert_eq!(

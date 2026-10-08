@@ -174,6 +174,21 @@ impl Sema<'_> {
         dims: &mut HashMap<Symbol, Dim>,
         eq: &PendingDimEq,
     ) -> Solve {
+        // A turbofish may bind a dimension to an in-scope integer VARIABLE (`rowsum::<m, n>(..)`
+        // with `n` computed at run time): mir_build threads the live value through the hidden dim
+        // parameter, and the compile-time check degrades to the runtime-`?` level for that dim,
+        // exactly as the rank-1 path does (`unify_dim` binds a runtime name leniently). An equation
+        // whose bindings mention such a value has no compile-time answer — `n*m` is not provably 12
+        // nor provably not — so it is retired unchecked instead of reported as a mismatch.
+        let runtime_bound = eq
+            .decl
+            .vars()
+            .iter()
+            .filter_map(|s| dims.get(s))
+            .any(|d| d.vars().iter().any(|v| self.is_runtime_dim_value(*v)));
+        if runtime_bound {
+            return Solve::Progress;
+        }
         let unbound: Vec<Symbol> = eq
             .decl
             .vars()
@@ -302,6 +317,12 @@ impl Sema<'_> {
             ),
         }
         Solve::Progress
+    }
+
+    /// Is `s`, appearing in a dimension binding, a run-time integer VALUE (a local named in a
+    /// turbofish) rather than a dimension of the enclosing function?
+    fn is_runtime_dim_value(&self, s: Symbol) -> bool {
+        !self.generics.contains(&s) && self.lookup_local(s).is_some()
     }
 
     /// After a call's dimensions are bound, every derived extent in `ty` (the call's result type)
@@ -866,6 +887,26 @@ mod tests {
             "fn f<M, N>(a: Tensor[f32, M, N], b: Tensor[f32, N]) -> f32 { return a[0, 0] + b[0]; } \
              fn g() -> f32 { let x: [f32; 10] = [0.0; 10]; let y: [f32; 4] = [0.0; 4]; \
              return f(x, y); }",
+            "E0502",
+        );
+    }
+
+    /// A turbofish that binds dimensions to run-time integer VALUES (`f::<m, n>(..)`) leaves the
+    /// element-count equation of a decaying array unanswerable at compile time: `m*n` is neither
+    /// provably 12 nor provably not. It degrades to the runtime-`?` level (as the rank-1 path
+    /// does) instead of an E0502 — `tests/run/generic_shape_runtime.wk` is the end-to-end form. A
+    /// caller's own generic dimension stays checked.
+    #[test]
+    fn a_turbofish_of_runtime_values_leaves_the_element_count_unchecked() {
+        ok(
+            "fn f<M, N>(a: Tensor[f32, M, N], mut o: Tensor[f32, M]) { o[0] = a[0, 0]; } \
+            fn g(n: i64) { let x: [f32; 12] = [0.0; 12]; let mut y: [f32; 3] = [0.0; 3]; \
+            let m = 3; f::<m, n>(x, y); }",
+        );
+        rejects(
+            "fn f<M, N>(a: Tensor[f32, M, N]) -> f32 { return a[0, 0]; } \
+             fn g<P, Q>(t: Tensor[f32, P, Q]) -> f32 { let x: [f32; 12] = [0.0; 12]; \
+             return f::<P, Q>(x); }",
             "E0502",
         );
     }

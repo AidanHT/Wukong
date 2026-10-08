@@ -4090,8 +4090,9 @@ struct FnLowerer<'a> {
     /// The enclosing function's buffer parameters, MIR base pointer -> declared type. Tracking the
     /// actual value also recognizes aggregate match bindings that alias a parameter, and prevents
     /// a local shadowing its name from inheriting the parameter's alias classification.
-    /// Empty on every lowerer that carries `par: None`, which is every lowerer that cannot emit a
-    /// region.
+    /// Region analysis reads it only on a lowerer that can emit a region (`par: Some`); the
+    /// whole-function GEMM wrappers (`lower_matmul_fn`, `lower_i8matmul_fn`) fill it as well, for
+    /// `promised_disjoint`. Empty on every other lowerer.
     param_arrays: Vec<(ValueId, Ty)>,
     /// The bound slot values that hold a `[]T` **slice** fat pointer, recorded by `bind_slice` at
     /// every binding site whose sema type is `Ty::Slice`. `kernel_base_ptr` needs this because the
@@ -15448,13 +15449,9 @@ impl FnLowerer<'_> {
                 }
             }
         }
-        // The tanh-approximation GELU written out by hand (HF `gelu_new`'s formula) dispatches to
-        // the same `VMATH_GELU` the `gelu()` call does — but only in the one association that is
-        // the kernel's own arithmetic, so the substitution changes no bit. See
-        // `match_gelu_tanh_expansion` for what is accepted and what is (deliberately) not.
-        if let Some(x_sym) = self.match_gelu_tanh_expansion(value, j, batch) {
-            return Some((out_sym, x_sym, VMATH_GELU, MirType::F32));
-        }
+        // The tanh-approximation GELU written out by hand is deliberately NOT folded into
+        // `VMATH_GELU`: the language's `tanh` is not the kernel's internal `tanh_exp1`, so the
+        // expansion is a different function in the last bits (see `elementwise.rs`).
         let ExprKind::Call { callee, args, .. } = &value.kind else {
             return None;
         };
@@ -24516,7 +24513,17 @@ impl FnLowerer<'_> {
         if matches!(self.expr_ty(e), Ty::Tensor { .. }) {
             return v;
         }
-        let from = self.expr_mir(operand);
+        // An integer operand's EMITTED width can exceed sema's: a range counter is driven at the
+        // wider of its bounds (`range_counter_type`), so in `for k in 0..n` with `n: i64` the
+        // counter `k` is an i64 value while sema types it from the literal-`0` start as i32. Taking
+        // sema's width here cast that i64 with `sext .. to i64`, an ICE at the verifier (`k as i64`
+        // in the generic lowering of an argmax loop). The cast starts from the value actually built,
+        // exactly as the arithmetic and compare arms read their operands (`operand_mir`).
+        let sema_from = self.expr_mir(operand);
+        let from = match self.builder.value_type(v) {
+            vt if vt.is_int() && sema_from.is_int() => vt.clone(),
+            _ => sema_from,
+        };
         let to = self.expr_mir(e);
         if from == to {
             return v;
@@ -28840,6 +28847,15 @@ fn lower_matmul_fn(
         .map(|pty| fl.builder.add_param(param_abi_ty(pty)))
         .collect();
     for ((p, pty), val) in f.params.iter().zip(&param_tys).zip(param_vals) {
+        // Mirrors `lower_fn`: this wrapper IS the function's MIR, so a `@noalias` promise must ride
+        // on its parameter here too (`noalias.rs`), or every value-level consumer loses it. And
+        // `emit_sgemm`'s alias guard settles a promised pair by NAME (`promised_disjoint`), which
+        // needs the storage-bound parameter record; without it `mm(a, b, @noalias mut c)` under an
+        // aliasing call site kept a run-time guard the promise exists to remove.
+        if ty_is_buffer_param(pty) {
+            fl.param_arrays.push((val, pty.clone()));
+        }
+        noalias::record_param(&mut fl.builder, p, pty, val, interner);
         // `param_slot_ty`: a statically-shaped tensor param binds as its buffer, so it is not
         // spilled to a `ptr` slot the kernel wrapper never reads (dead alloca+store that survived
         // into every caller that inlined this wrapper). A `[]T` slice binds as its fat-pointer
@@ -31839,6 +31855,11 @@ fn lower_i8matmul_fn(
         .map(|pty| fl.builder.add_param(param_abi_ty(pty)))
         .collect();
     for ((p, pty), val) in f.params.iter().zip(&param_tys).zip(param_vals) {
+        // The int8 twin of `lower_matmul_fn`'s `@noalias` record — same reasoning.
+        if ty_is_buffer_param(pty) {
+            fl.param_arrays.push((val, pty.clone()));
+        }
+        noalias::record_param(&mut fl.builder, p, pty, val, interner);
         // `param_slot_ty`: a statically-shaped tensor param binds as its buffer, so it is not
         // spilled to a `ptr` slot the kernel wrapper never reads (dead alloca+store that survived
         // into every caller that inlined this wrapper). A `[]T` slice binds as its fat-pointer
@@ -32738,6 +32759,38 @@ mod tests {
         assert!(diags.is_empty(), "{diags:?}");
         for function in &program.funcs {
             assert!(verify_function(function).is_empty());
+        }
+    }
+
+    /// A range counter is driven at the wider of its bounds, so `k` in `for k in 0..n` (`n: i64`)
+    /// is an i64 VALUE that sema types as i32 (the literal-`0` start). A cast of it must start from
+    /// the emitted width: `k as i64` was `sext i64 to i64` (a verifier ICE, reached by the generic
+    /// lowering of every argmax loop once recognition is off), and `k as i32` must truncate.
+    #[test]
+    fn a_cast_of_a_widened_range_counter_starts_from_its_emitted_width() {
+        let src = "fn f(n: i64) -> i64 {
+    let mut bi: i64 = 6;
+    let mut lo: i32 = 0;
+    for k in 0..n {
+        bi = k as i64;
+        lo = k as i32;
+    }
+    return bi + (lo as i64);
+}
+";
+        for recognize in [true, false] {
+            let (program, diags, _) = lower_with(
+                src,
+                LowerOptions {
+                    recognize,
+                    ..LowerOptions::default()
+                },
+            );
+            assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+            for function in &program.funcs {
+                let errs = verify_function(function);
+                assert!(errs.is_empty(), "recognize={recognize}: {errs:?}");
+            }
         }
     }
 

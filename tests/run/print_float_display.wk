@@ -28,6 +28,8 @@ module tests.run.print_float_display
 /// positionally - never in exponent form - with `inf`, `-inf`, `NaN` and `-0` spelled out. `f32`,
 /// `f16` and `bf16` values print as the `f64` they widen to exactly.
 ///
+/// The f64 lines spell their literals `f64`: an unsuffixed float literal is `f32` (language guide,
+/// "Literals"), so a bare `print(0.1)` prints the f32 0.1 and `123456789.125` is not even an f32.
 /// Every expected line is derived from that rule, not recorded: 0.1 (f64) is "0.1"; the f32 0.1
 /// is 13421773 * 2^-27 = 0.100000001490116119384765625, whose shortest round-trip f64 digits are
 /// 0.10000000149011612; 10^21 = 2^21 * 5^21 is exact and has no fractional digits; 2^-1074 needs
@@ -38,7 +40,7 @@ module tests.run.print_float_display
 /// 205 * 2^-11 = 0.10009765625.
 fn main() -> i32 {
     let z: f64 = 0.0;
-    print(0.1);
+    print(0.1f64);
     let a: f32 = 0.1;
     print(a);
     let mut e21: f64 = 1.0;
@@ -48,12 +50,12 @@ fn main() -> i32 {
         k = k + 1;
     }
     print(e21);
-    print(0.0000001);
+    print(0.0000001f64);
     print(-z);
     print(z / z);
     print(1.0 / z);
     print(-1.0 / z);
-    print(123456789.125);
+    print(123456789.125f64);
     print(2.5);
     print(1.0);
     let third: f64 = 1.0 / 3.0;

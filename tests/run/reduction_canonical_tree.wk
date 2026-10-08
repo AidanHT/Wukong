@@ -41,6 +41,8 @@ module tests.run.reduction_canonical_tree
 // part and the scalar tail alike.
 //
 // Inputs: a[i] = f32(i) * f32(0.1) and b[i] = 1 / (i % 5 + 3), rounded in the element type.
+// The f64 product spells `0.1f64`: an unsuffixed float literal is `f32`, and beside an `f64`
+// operand it is widened, so `(i as f64) * 0.1` would multiply by f64(f32(0.1)), not f64(0.1).
 // The run-time trips are 5 (tail only), 37 (one 32-element block and a 5-element tail), 61 (one
 // block, three 8-element groups, a 5-element tail) and 2100 (above the 2048 crossover, where an
 // AVX2 host takes the 256-bit kernel after its run-time trip test); the literal trips are 100
@@ -91,7 +93,7 @@ fn main() -> i32 {
     while i < 2100 {
         a[i] = (i as f32) * 0.1;
         b[i] = 1.0 / (((i % 5) as f32) + 3.0);
-        a64[i] = (i as f64) * 0.1;
+        a64[i] = (i as f64) * 0.1f64;
         b64[i] = 1.0 / (((i % 5) as f64) + 3.0);
         i = i + 1;
     }

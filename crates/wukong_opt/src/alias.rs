@@ -328,14 +328,23 @@ impl AliasInfo {
                         continue;
                     }
                     match &inst.op {
+                        // A base's own classification is a fact that moves too: in round 1 a
+                        // `gep` laid out before its base reads the default `Unknown` and so does
+                        // not itself change, and only the base moves. Counting just the `gep`s
+                        // ended the sweep there, leaving every such `gep` `Unknown` — so a load
+                        // through it was not a read of the slot, `dse` saw the slot as never read,
+                        // and deleted its constant-offset stores (an inlined call ahead of the
+                        // slot's block was enough: `hardsigmoid_nan.wk`, -O2, recognition off).
                         Op::Alloca { ty, .. } => {
                             let fact = &mut info.facts[r];
+                            changed |= fact.prov != Prov::Alloca(res) || fact.offset != 0;
                             fact.prov = Prov::Alloca(res);
                             fact.offset = 0;
                             fact.alloca_bytes = byte_size(ty).unwrap_or(u32::MAX);
                         }
                         Op::GlobalAddr(sym) => {
                             let fact = &mut info.facts[r];
+                            changed |= fact.prov != Prov::Global(*sym) || fact.offset != 0;
                             fact.prov = Prov::Global(*sym);
                             fact.offset = 0;
                         }
@@ -936,7 +945,7 @@ impl<'f> PromisedBases<'f> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wukong_mir::{BinOp, Builder, CmpOp};
+    use wukong_mir::{AddrSpace, BinOp, Builder, CmpOp};
     use wukong_span::Interner;
 
     /// `Fact` is allocated one-per-SSA-value on the compiler's hot path, so its size is a real
@@ -1129,6 +1138,53 @@ mod tests {
             args: vec![],
         };
         assert!(info.may_clobber(a, 8, &call));
+    }
+
+    /// The inliner splices a callee's blocks ahead of the caller's remaining code, so a caller's
+    /// `alloca` can itself sit in a block laid out AFTER the `gep`s that use it. Round 1 then
+    /// classifies the base but leaves each such `gep` at its default `Unknown` — no `gep` fact
+    /// moves — and the sweep must not take that for a fixpoint. It did: the loads through those
+    /// `gep`s stopped counting as reads of the slot, `dse` judged the slot never read and deleted a
+    /// constant-offset store into it (`tests/run/hardsigmoid_nan.wk` at -O2, recognition off).
+    #[test]
+    fn provenance_settles_when_the_alloca_itself_is_laid_out_after_its_geps() {
+        let mut it = Interner::new();
+        let mut b = Builder::new(it.intern("late_alloca"), MirType::Void);
+        let use_blk = b.new_block();
+        let def_blk = b.new_block();
+
+        // entry -> def_blk -> use_blk, laid out entry, use_blk, def_blk.
+        let z = b.build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        let four = b.build(MirType::I64, Op::ConstInt(4, MirType::I64));
+        b.br(def_blk, vec![]);
+
+        b.switch_to(def_blk);
+        let a = b.build(
+            MirType::Ptr,
+            Op::Alloca {
+                ty: blob(16),
+                space: AddrSpace::Local,
+            },
+        );
+        b.br(use_blk, vec![]);
+
+        b.switch_to(use_blk);
+        let g = gep(&mut b, a, four);
+        b.build(MirType::I32, Op::Load(g, MirType::I32));
+        let g0 = gep(&mut b, a, z);
+        b.ret(None);
+        let f = b.finish();
+        assert!(
+            wukong_mir::verify::verify_function(&f).is_empty(),
+            "{:?}",
+            wukong_mir::verify::verify_function(&f)
+        );
+
+        let info = AliasInfo::analyze(&f);
+        assert_eq!(info.prov(g), Prov::Alloca(a), "gep lost its late alloca");
+        assert_eq!(info.base_and_offset(g), Some((Prov::Alloca(a), 4)));
+        assert_eq!(info.base_and_offset(g0), Some((Prov::Alloca(a), 0)));
+        assert!(info.may_alias_sized(g, 4, a, 16));
     }
 
     #[test]

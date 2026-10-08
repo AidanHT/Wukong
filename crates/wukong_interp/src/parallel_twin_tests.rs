@@ -340,32 +340,38 @@ fn fused_scaled_quantized_and_half_gemm_twins_equal_their_serial_kernels() {
             );
         }
         assert_eq!(bits(&cs), bits(&cp), "sgemm_nt_epi beta {beta}");
-        // `C = alpha·(A·Bᵀ)`, the attention-score form.
-        let (mut cs, mut cp) = (seed.clone(), seed.clone());
-        // SAFETY: as above.
-        unsafe {
-            wukong_runtime::wukong_sgemm_nt_alpha(
-                a.as_ptr(),
-                b.as_ptr(),
-                cs.as_mut_ptr(),
-                mi,
-                ki,
-                ni,
-                beta,
-                0.125,
-            );
-            wukong_runtime::wukong_sgemm_nt_alpha_parallel(
-                a.as_ptr(),
-                b.as_ptr(),
-                cp.as_mut_ptr(),
-                mi,
-                ki,
-                ni,
-                beta,
-                0.125,
-            );
+        // `C = alpha·(A·Bᵀ)`, the attention-score form. Only `beta == 0` is inside this kernel's
+        // contract: alpha is folded into the same writeback as the beta accumulate, so `beta != 0`
+        // would compute `alpha·(C_old + A·Bᵀ)`, and `gemm_dispatch` `debug_assert`s the
+        // combination away (faa60779). No recognizer arm emits it (`wukong_mir_build` pins
+        // `beta: 0` on the α arm; autodiff's `require_beta_zero` refuses it).
+        if beta == 0 {
+            let (mut cs, mut cp) = (seed.clone(), seed.clone());
+            // SAFETY: as above.
+            unsafe {
+                wukong_runtime::wukong_sgemm_nt_alpha(
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    cs.as_mut_ptr(),
+                    mi,
+                    ki,
+                    ni,
+                    beta,
+                    0.125,
+                );
+                wukong_runtime::wukong_sgemm_nt_alpha_parallel(
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    cp.as_mut_ptr(),
+                    mi,
+                    ki,
+                    ni,
+                    beta,
+                    0.125,
+                );
+            }
+            assert_eq!(bits(&cs), bits(&cp), "sgemm_nt_alpha beta {beta}");
         }
-        assert_eq!(bits(&cs), bits(&cp), "sgemm_nt_alpha beta {beta}");
         // bf16 operands, f32 accumulate and output.
         let (mut cs, mut cp) = (seed.clone(), seed.clone());
         // SAFETY: ah is m*k and bh is n*k bf16 bits; c is m*n.

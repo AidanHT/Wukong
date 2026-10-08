@@ -122,7 +122,7 @@ impl FnLowerer<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wukong_mir::{Op, Program};
+    use wukong_mir::{CastKind, Op, Program};
     use wukong_span::SourceId;
 
     fn arr(s: Scalar, len: u64) -> Ty {
@@ -170,6 +170,20 @@ mod tests {
             .flat_map(|f| f.blocks.iter())
             .flat_map(|b| b.insts.iter())
             .filter(|i| matches!(&i.op, Op::Call { func, .. } if interner.resolve(*func) == callee))
+            .count()
+    }
+
+    /// The `ptrtoint` range ends of the run-time alias guards `kernel_guard.rs` builds in function
+    /// `f` (`lo = ptrtoint(base)`, `hi = ptrtoint(gep(base, n))` per range-tested operand). The
+    /// sources below take no pointer's address anywhere else, so a nonzero count IS a versioned
+    /// dispatch and zero is an unguarded one.
+    fn guard_range_ends(prog: &Program, interner: &Interner, f: &str) -> usize {
+        prog.funcs
+            .iter()
+            .filter(|func| interner.resolve(func.name) == f)
+            .flat_map(|func| func.blocks.iter())
+            .flat_map(|b| b.insts.iter())
+            .filter(|i| matches!(i.op, Op::Cast(CastKind::PtrToInt, _, _)))
             .count()
     }
 
@@ -232,22 +246,30 @@ fn main() -> i32 {
 ";
 
     /// `go(x, x, z)` legitimately hands `mm` one buffer as both A and B (it squares `x`), so the
-    /// whole-program call-site fact says `mm`'s parameters may alias and every
-    /// disjointness-requiring kernel in it declines. The GEMM needs only C apart from A and B —
-    /// exactly what `@noalias` on `c` states — so with the promise it dispatches again.
+    /// whole-program call-site fact says `mm`'s parameters may alias, so the GEMM can only be
+    /// dispatched behind a run-time alias test (`kernel_guard.rs`) whose may-overlap arm is the
+    /// scalar nest. The GEMM needs only C apart from A and B — exactly what `@noalias` on `c`
+    /// states — so with the promise both pairs are settled at compile time and the kernel
+    /// dispatches with no guard at all.
     #[test]
     fn a_promise_lets_the_gemm_dispatch_where_the_call_site_fact_cannot() {
         let (prog, it) = lower(&MATMUL.replace("CPARAM", "mut c"));
-        assert_eq!(
-            calls(&prog, &it, "wukong_sgemm"),
-            0,
-            "without a promise the may-alias call site must keep the scalar nest"
+        assert_eq!(calls(&prog, &it, "wukong_sgemm"), 1);
+        assert!(
+            guard_range_ends(&prog, &it, "mm") > 0,
+            "without a promise the may-alias call site must keep the scalar nest behind a \
+             run-time alias guard"
         );
         let (prog, it) = lower(&MATMUL.replace("CPARAM", "@noalias mut c"));
         assert_eq!(
             calls(&prog, &it, "wukong_sgemm"),
             1,
             "the promise on C is the disjointness the kernel needs"
+        );
+        assert_eq!(
+            guard_range_ends(&prog, &it, "mm"),
+            0,
+            "the promise settles both C pairs at compile time: no run-time guard"
         );
     }
 
@@ -304,7 +326,8 @@ fn main() -> i32 {
     /// Slices are never trusted by NAME: a callee that receives one and reassigns its `mut`
     /// parameter re-points the caller's fat pointer, so two slice parameter names can come to denote
     /// one buffer without either being written here. The GEMM over promised slices therefore still
-    /// rests on the call-site fact (and the value-level analysis keeps every slice fact it can).
+    /// rests on the call-site fact — under a may-alias call site it keeps its run-time alias guard
+    /// (and the value-level analysis keeps every slice fact it can).
     #[test]
     fn slice_parameters_are_not_trusted_by_name() {
         let src = MATMUL.replace(
@@ -312,14 +335,19 @@ fn main() -> i32 {
             "a: []f32, b: []f32, @noalias mut c: []f32",
         );
         let (prog, it) = lower(&src);
-        assert_eq!(calls(&prog, &it, "wukong_sgemm"), 0);
-        // Control: the same slice GEMM dispatches when no call site aliases anything, so the zero
-        // above is the name-level refusal and not a slice GEMM that never fires.
+        assert_eq!(calls(&prog, &it, "wukong_sgemm"), 1);
+        assert!(
+            guard_range_ends(&prog, &it, "mm") > 0,
+            "a promise on a slice NAME must not remove the run-time alias guard"
+        );
+        // Control: the same slice GEMM dispatches unguarded when no call site aliases anything, so
+        // the guard above is the name-level refusal and not a slice GEMM that is always guarded.
         let disjoint = src.replace(
             "go(x, x, z);",
             "let mut y: [f32; 16] = [0.0; 16];\n    go(x, y, z);",
         );
         let (prog, it) = lower(&disjoint);
         assert_eq!(calls(&prog, &it, "wukong_sgemm"), 1);
+        assert_eq!(guard_range_ends(&prog, &it, "mm"), 0);
     }
 }

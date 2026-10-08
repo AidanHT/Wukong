@@ -1,3 +1,6 @@
+#[path = "support/alias_guard.rs"]
+mod alias_guard;
+
 use std::fmt::Write;
 use wukong_mir::{Op, Program};
 use wukong_span::{Interner, SourceId};
@@ -208,6 +211,12 @@ fn lower(source: &str, recognize: bool) -> (Program, Interner) {
     (program, interner)
 }
 
+fn is_norm_bwd_kernel(name: &str) -> bool {
+    [Family::Softmax, Family::RmsNorm, Family::LayerNorm]
+        .iter()
+        .any(|family| name.starts_with(family.kernel()))
+}
+
 fn dispatches(program: &Program, interner: &Interner) -> Vec<String> {
     program
         .funcs
@@ -217,14 +226,15 @@ fn dispatches(program: &Program, interner: &Interner) -> Vec<String> {
         .filter_map(|inst| match &inst.op {
             Op::Call { func, .. } => {
                 let name = interner.resolve(*func);
-                [Family::Softmax, Family::RmsNorm, Family::LayerNorm]
-                    .iter()
-                    .any(|family| name.starts_with(family.kernel()))
-                    .then(|| name.to_string())
+                is_norm_bwd_kernel(name).then(|| name.to_string())
             }
             _ => None,
         })
         .collect()
+}
+
+fn unguarded_dispatches(program: &Program, interner: &Interner) -> Vec<String> {
+    alias_guard::unguarded_dispatches(program, interner, &is_norm_bwd_kernel)
 }
 
 fn assert_gamma_rows_stay_sequential(program: &Program, interner: &Interner, label: &str) {
@@ -293,10 +303,19 @@ fn check(family: Family, local_view: bool) {
                 if recognize && alias == Alias::None {
                     let suffix = if parallel { "_parallel" } else { "" };
                     assert_eq!(calls, [format!("{}{suffix}", family.kernel())], "{label}");
+                } else if recognize {
+                    // Run-time alias versioning (`wukong_mir_build::kernel_guard`) dispatches a
+                    // may-alias call site behind a `ptrtoint` overlap test whose other arm is
+                    // the ORIGINAL source loop, so the kernel may be present -- but never
+                    // unguarded. Prove that before executing a potentially racing kernel; the
+                    // every-lane comparison below then proves the guard chose the source loop
+                    // (or an exact in-place kernel, softmax/RMSNorm dy) on these aliases.
+                    let unguarded = unguarded_dispatches(&program, &interner);
+                    assert!(
+                        unguarded.is_empty(),
+                        "{label}: unguarded dispatch {unguarded:?}"
+                    );
                 } else {
-                    // Whole-program alias facts conservatively decline all these aliases,
-                    // including softmax/RMSNorm dy aliases tolerated by the runtime's exact
-                    // in-place ABI. Prove fallback before executing a potentially racing kernel.
                     assert!(calls.is_empty(), "{label}: unexpected dispatch {calls:?}");
                 }
                 let entry = interner.intern("entry");
@@ -317,6 +336,13 @@ fn check(family: Family, local_view: bool) {
                         calls.is_empty(),
                         "{label} O{level}"
                     );
+                    if alias != Alias::None {
+                        let unguarded = unguarded_dispatches(&optimized, &interner);
+                        assert!(
+                            unguarded.is_empty(),
+                            "{label} O{level}: unguarded dispatch {unguarded:?}"
+                        );
+                    }
                     assert!(
                         optimized_calls.iter().all(|call| calls.contains(call)),
                         "{label} O{level}: unexpected dispatch {optimized_calls:?}"

@@ -66,22 +66,24 @@
 // EXPECT-OUT: 1
 module tests.run.spelling_value_bindings
 
-// Two respellings that must keep the 256-bit elementwise kernels AND compute exactly what the
-// loops say (P12.7, P12.10):
+// Respellings that must compute exactly what the loops say (P12.7, P12.10):
 //
 //   * naming the loaded value first - `let v = x[i]; o[i] = gelu(v);` - the most common respelling
-//     in real code, mandatory once the value is used twice (`v * sigmoid(v)`);
-//   * the hand-expanded tanh GELU, in the association that IS the kernel's arithmetic
-//     (`0.5*v*(1 + tanh(C0*(v + C1*(v*v*v))))`; the source contracts `v + C1*x3` to one FMA,
-//     exactly the kernel's `GELU_C1.mul_add(x3, x)`).
+//     in real code, mandatory once the value is used twice (`v * sigmoid(v)`); it keeps the 256-bit
+//     elementwise kernels;
+//   * the hand-expanded tanh GELU (`0.5*v*(1 + tanh(C0*(v + C1*(v*v*v))))`). It used to be folded
+//     into the GELU kernel on the premise that the source's `tanh` is the kernel's internal
+//     `1 - 2/(exp(2z)+1)`. The language's `tanh` is now the runtime's piecewise kernel on every
+//     spelling, while `gelu` keeps the exp-composed block inside, so the expansion is NOT `gelu`
+//     bit for bit (it differs at x = -4, -3.5, -3, -2, -1.5 and 0.5 here) and must lower as written.
 //
 // Values: x[i] = 0.5*i - 4 over 16 lanes. The first block is gelu(x)*1000 truncated toward zero,
 // the second silu(x) = x/(1+e^-x) *1000 truncated, both from the exact formulas in f64 (every lane
 // sits >= 0.05 away from an integer boundary, far beyond the kernels' f32 error); the third is
 // 2*x + y = 2*(0.5*i - 4) + i = 2*i - 8, exact. The last block is one flag per lane: 1 iff the
-// dispatched results equal, BIT FOR BIT, the same formulas evaluated by a `while` loop - which no
-// recognizer sees - including `gelu(v) == the expansion`, the premise of the GELU fold. A partially
-// correct kernel or a fold that changed a rounding prints a 0 in its own lane.
+// `for`-loop results equal, BIT FOR BIT, the same formulas evaluated by a `while` loop - which no
+// recognizer sees. A partially correct kernel, or a substitution that changed a rounding (the old
+// expansion-to-`gelu` fold would print 0 in the six lanes above), prints a 0 in its own lane.
 
 fn gelu_hoisted(x: [f32; 16], mut o: [f32; 16]) {
     for i in 0..16 {
@@ -144,7 +146,7 @@ fn main() -> i32 {
         let eref: f32 = 0.5 * v * (1.0 + tanh(0.7978845608 * (v + 0.044715 * (v * v * v))));
         let sref: f32 = v * sigmoid(v);
         let mut ok: i32 = 0;
-        if g1[k] == gref && g2[k] == eref && gref == eref && sw[k] == sref {
+        if g1[k] == gref && g2[k] == eref && sw[k] == sref {
             ok = 1;
         }
         print(ok);

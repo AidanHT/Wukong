@@ -1679,7 +1679,20 @@ fn combine_kind(
     }
 }
 
-/// How many times `v` is read inside the loop (instruction operands and terminator arguments).
+/// How many times `v` is read inside the loop (instruction operands and terminator arguments),
+/// **not** counting an argument the header passes along an edge that leaves the loop.
+///
+/// That edge is taken only when the exit test fails, after the last combine, so what it carries is
+/// the finished value — exactly what a read after the loop sees, which was never an observed
+/// partial. It is also how every loop whose exit block is shared looks: `bce`'s versioning, for
+/// one, merges the check-free copy and the original into one exit, so each copy's header hands its
+/// accumulator over as a branch argument (`cond_br c, body, exit(acc)`). Counting that argument
+/// turned every such reduction into a [`Carried::Recurrence`] and declined it. A consumer that
+/// rewrites the loop keeps the original header as the place the loop leaves from (the vectorizer
+/// feeds the reduced value back into it), so the argument stays correct.
+///
+/// Any other exit — a `break` out of the body, or a header that returns — is still counted: those
+/// can leave with a partial.
 fn uses_in_loop(ctx: &LoopCtx<'_>, l: &NaturalLoop, v: ValueId) -> usize {
     let mut n = 0;
     for &b in &l.blocks {
@@ -1691,9 +1704,23 @@ fn uses_in_loop(ctx: &LoopCtx<'_>, l: &NaturalLoop, v: ValueId) -> usize {
                 }
             });
         }
-        crate::each_term_use(&blk.term, &mut |u| {
-            if u == v {
-                n += 1;
+        if b != l.header {
+            crate::each_term_use(&blk.term, &mut |u| {
+                if u == v {
+                    n += 1;
+                }
+            });
+            continue;
+        }
+        match &blk.term {
+            Terminator::CondBr { cond: u, .. }
+            | Terminator::Switch { scrutinee: u, .. }
+            | Terminator::Ret(Some(u)) => n += usize::from(*u == v),
+            Terminator::Br { .. } | Terminator::Ret(None) | Terminator::Unreachable => {}
+        }
+        blk.term.for_each_edge(|target, args| {
+            if l.blocks.contains(&target) {
+                n += args.iter().filter(|&&u| u == v).count();
             }
         });
     }
@@ -2984,6 +3011,34 @@ mod tests {
         (f, best)
     }
 
+    /// The accesses of `l` that move with the induction variable — the slice *data* accesses.
+    ///
+    /// Slice indexing is bounds-checked, so a checked `x[i]` also reads the fat pointer's length
+    /// word on every iteration: `load i64 (gep x, 8 : i8)`, an affine address whose index does not
+    /// move (coefficient zero, constant 8). Those are asserted to be exactly that here and left
+    /// out, so the cases below keep inspecting the data accesses they were written about.
+    fn moving_accesses(l: &NaturalLoop) -> Vec<&MemAccess> {
+        let mut moving = Vec::new();
+        for a in &l.accesses {
+            let AddrForm::Affine { index, elem, .. } = &a.addr else {
+                continue;
+            };
+            if index.coeff == Coeff::Zero {
+                assert!(
+                    a.kind == AccessKind::Load
+                        && a.value_ty == MirType::I64
+                        && *elem == MirType::I8
+                        && index.terms.is_empty()
+                        && index.konst == 8,
+                    "a non-moving affine access that is not a slice length read: {a:?}"
+                );
+                continue;
+            }
+            moving.push(a);
+        }
+        moving
+    }
+
     #[test]
     fn a_slice_access_decomposes_to_base_plus_iv() {
         // The `while` spelling on purpose: `for i in 0..n { o[i] = x[i] * 2.0; }` is matched by a
@@ -2994,12 +3049,9 @@ mod tests {
                    fn main() -> i32 { return 0; }";
         let (_, l) = kernel_loop(src, "k");
         let l = &l;
-        // Two data accesses; the `[]f32` base re-loads are `Invariant`, not `Affine`.
-        let affine: Vec<&MemAccess> = l
-            .accesses
-            .iter()
-            .filter(|a| matches!(a.addr, AddrForm::Affine { .. }))
-            .collect();
+        // Two data accesses; the `[]f32` base re-loads are `Invariant`, not `Affine`, and the
+        // bounds checks' length reads do not move (see `moving_accesses`).
+        let affine = moving_accesses(l);
         assert_eq!(affine.len(), 2, "one load and one store: {:?}", l.accesses);
         for a in &affine {
             assert_eq!(a.addr.const_stride(), Some(1), "unit stride: {:?}", a.addr);
@@ -3019,8 +3071,7 @@ mod tests {
                    fn main() -> i32 { return 0; }";
         let (_, l) = kernel_loop(src, "k");
         let l = &l;
-        let konsts: Vec<i64> = l
-            .accesses
+        let konsts: Vec<i64> = moving_accesses(l)
             .iter()
             .filter_map(|a| match &a.addr {
                 AddrForm::Affine { index, .. } => Some(index.konst),
