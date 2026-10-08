@@ -508,6 +508,16 @@ another architecture or OS is not supported. A native-backend failure is a catal
   `assemble_kernel` still refuses on the same predicate, but that is now a backstop: it fires only if
   the two ever disagree.
   saxpy/poly/relu/relu6 vectorize.
+- **General loop vectorization** (`wukong_opt::vectorize`, `-O2`): a counted loop the front end did
+  not vectorize — a `while`, an inlined body, a declined `for` — widens at MIR level in 128-bit
+  vectors. The group width follows the body's **narrowest** lane and wider values are split into
+  parts, so mixed-width bodies widen: an `i8`/`u8` load computed in `f32`, a saturating `f32 -> i8`
+  quantize, an `i8` dot into an `i32` accumulator, an `f32` stream summed in `f64`. Complete
+  interleave groups `x[k*i + r]` (`k` up to 4 — complex multiply, RGB pixels, in-place RoPE) load and
+  store through lane shuffles; a shift by a uniform amount widens at every integer width; an `i8`
+  multiply goes through `i16`. A step with no vector form — a gather, an integer divide or
+  remainder, a per-lane shift amount, `f64 -> i64` — is **replicated** lane by lane while the rest
+  widens (`tests/run/vectorized_{mixed_widths,interleave,replicate}.wk` print every lane).
 - **FMA contraction**: a float `x + y*z` becomes one fused multiply-add (`Op::Fma`, a hardware
   `vfmadd`), on both the scalar and vector paths; the interpreter mirrors it with `mul_add`, so the
   two backends stay bit-identical.
@@ -1323,6 +1333,14 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   a promised view parameter (`E0316`); an unprovable violation is undefined, as in C. Without the
   attribute nothing changes: distinct local allocations and call-site proofs remain the only
   disjointness facts.
+- **What the general MIR loop vectorizer still leaves scalar** (`wukong_opt::vectorize`): a reverse
+  (`i = i - 1`) or non-unit-step loop; a strided access outside a *complete* interleave group (a
+  gap, or a stride above 4); a scatter (a store through a data-dependent index); and a gather whose
+  index is bounds-checked (a checked slice keeps a data-dependent check no guard can cover — the
+  gather widens from an array, or under `@unchecked`) or whose object a store in the loop may reach
+  (two unpromised slices may be one buffer). Replication is a heuristic, not a measurement: a body
+  whose only work is the replicated step (`o[i] = lut[q[i]]`, `o[i] = x[i] as i64` from `f64`)
+  stays scalar, and no AVX2 `vgatherdps` is ever emitted. None of these forms has been timed.
 - **An aliased call to a recognized kernel means what the source loop means.** Every multi-buffer
   recognizer emit site — GEMM in all its forms, GEMV/GEVM, transpose, pooling, the column/row/arg
   reductions, the losses, the norm backwards, RoPE, the scans, embedding/scatter, the fused norms,

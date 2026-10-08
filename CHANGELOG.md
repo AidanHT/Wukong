@@ -86,6 +86,30 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `env(name)`, `read_stdin_u8(buf)` and `exit(code)` (`wukong_runtime::process`); `wukongc --run
   prog.wk -- a b` passes `a b` to the program. `wukongc -` reads the program from standard input
   (it used to fail to open a file named `-`) and `wukongc -e <source>` takes it inline.
+### General loop vectorizer: mixed lane widths, interleave groups, replication (`gap2/vec-dataflow`)
+
+- **Mixed lane widths** (N34): `wukong_opt::vectorize` sizes the group from the narrowest lane in
+  the body (`W = 16 / bytes`, still 128-bit vectors) and splits wider values into up to four parts,
+  converting between widths with the new `Op::Widen`/`Op::Narrow`. An `i8` dequantize, a `u8`
+  normalize, a saturating `f32 -> i8`/`u8` quantize, an `i8` dot into an `i32` accumulator, an
+  `f32` stream summed in `f64` and an `i64` counter over `f32` data now widen instead of declining.
+- **Interleaved accesses** (N35): complete groups `x[k*i + r]` for every residue `r`, `k` in 2..=4
+  (complex multiply, RGB pixels, in-place RoPE), load or store as `k` contiguous vectors split with
+  `Op::Shuffle`. The dependence test proves `x[2i]` and `x[2i+1]` never meet (a GCD test), and
+  bounds-check elimination now proves `s[2*i + 1]`-shaped indices (`|k| <= 4`).
+- **Replication** (N37): a step with no vector form runs once per lane and is packed with
+  `Op::InsertLane` while the rest of the body widens: a **gather** from storage no store in the loop
+  can reach (the stored buffer `@noalias`-promised, or the table a local whose address never
+  escapes; the gathered index must be unchecked — an array, or an `@unchecked` function), integer
+  divide/remainder, a per-lane shift amount and a conversion with no packed route. Taken only
+  beside at least as much widened arithmetic (`tests/run/vectorized_replicate.wk`).
+- **Vector shifts and the `i8` multiply** (N42): a shift by a uniform amount widens at every integer
+  width as a vector shifted by a scalar (a new `Op::Bin` shape, masked like the scalar shift), and
+  an `i8` multiply widens through `i16` halves.
+- New MIR ops `Widen`, `Narrow`, `Shuffle`, `InsertLane` (pure lane maps: interpreter, Cranelift,
+  textual LLVM and a scalarizing `gpu-native` lowering); `Op` now has 27 variants.
+- Still scalar: reverse (`step -1`) loops, gapped interleave groups, scatters, and AVX2 `vgather`
+  (not used even where available). No performance claim is made; nothing here was measured.
 
 ### Optimizer memory passes: SROA, path DSE, loop deletion, guarded LICM, scalar promotion (`gap/opt-memory`)
 

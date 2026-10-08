@@ -264,12 +264,20 @@ and exactly one `Terminator` (`Ret`, `Br`, `CondBr`, `Switch`, `Unreachable`). `
 branch on an `i8`..`i64` scrutinee whose case values are stored canonically (sign-extended from the
 type's width) and pairwise distinct; only `wukong_opt`'s late switch formation creates one, and the
 verifier, interpreter, Cranelift (`cranelift_frontend::Switch`), textual LLVM (`switch`) and every
-terminator visitor handle it (the `gpu-native` lowering declines it). `Op` has 24 variants: constants
+terminator visitor handle it (the `gpu-native` lowering declines it). `Op` has 27 variants: constants
 (`ConstInt`/`ConstFloat`), `Bin`/`Cmp`/`Cast`, the unary `Neg`/`Not`, `Select`, memory
 (`Alloca`/`Load`/`Store`/`Gep`), `Call`, `Barrier` (cooperative thread-block fence from
 `sync_block()`), the float/SIMD primitives
-(`Splat`/`ExtractLane`/`Iota`/`Fma`/`Sqrt`/`Round`), the address-of ops (`FuncAddr`, `GlobalAddr`),
-and `VecKernelCall`. Of the SIMD three, `Splat` broadcasts one scalar to every lane, `ExtractLane`
+(`Splat`/`ExtractLane`/`Iota`/`Fma`/`Sqrt`/`Round`), the lane-moving SIMD ops
+(`Widen`/`Narrow`/`Shuffle`/`InsertLane`), the address-of ops (`FuncAddr`, `GlobalAddr`), and
+`VecKernelCall`. `Widen` converts one half of a vector's lanes to twice their width (`SExt`/`ZExt`
+/`FpExt`) and `Narrow` joins two vectors into one of half the lane width (truncating, saturating
+signed or unsigned, or `f64 -> f32`) — the two ops that let one loop compute at several lane widths;
+`Shuffle` is a two-source constant lane permutation and `InsertLane` writes one lane. `Bin` has one
+operand-shape exception: a vector **shifted by a scalar** amount of its lane type, masked to the
+lane width exactly as a scalar shift is (the shape every vector ISA's shift takes). All four are pure
+lane maps, so the interpreter and the native backend agree on them bit for bit; `gpu-native`
+scalarizes them. Of the SIMD three, `Splat` broadcasts one scalar to every lane, `ExtractLane`
 reads one lane back out (the only way from vector to scalar form, and what keeps a widened float
 reduction's accumulate serial), and `Iota` is the lane-index ramp `<0, 1, .., n-1>` — the one
 non-uniform vector *source*, since every other op is lane-wise and so any expression over splatted
@@ -433,6 +441,27 @@ invalidated, and the call-effect table for the callees optimized so far. A cache
 
 `-O3` currently runs the same pass pipeline as `-O2`: there are no `-O3`-exclusive passes yet
 (`PassManager::standard` adds passes at `-O1` and `-O2` only).
+
+**The MIR loop vectorizer** (`src/vectorize.rs`) widens a canonical counted loop (unit step, one
+straight-line body or one if-converted diamond) into 128-bit vectors, keeping the original loop as
+the scalar epilogue. Its invariant is that lane `k` of a group executes exactly what scalar
+iteration `i + k` would have, so interp and native stay bit-identical and `-O0` matches `-O2`. The
+group width is `W = 16 / narrowest lane bytes` over everything the body widens (LLVM
+LoopVectorize's rule); a wider value is up to four parts, and lane-count-changing casts are
+`Widen`/`Narrow` chains with exact lane semantics (a saturating `f32 -> i8` goes through `i32`; an
+unsigned-to-float through a zero-extend). A **complete interleave group** — accesses `x[k*i + r]` for
+every residue `r` of a stride `k <= 4`, all loads or all stores, one element type — becomes `k`
+contiguous vector accesses and a tree of two-source `Shuffle`s; `loop_info::never_the_same_element`
+(a GCD test) proves two stores `x[2i]`/`x[2i+1]` never meet, and the runtime alias guard scales each
+range by its stride. A step with **no vector form** is replicated (LLVM VPlan's REPLICATE recipe):
+it runs once per lane on that lane's own scalars, and its result is packed with `InsertLane` only
+where a widened step reads it. That covers integer division (MIR's scalar forms never trap), a
+per-lane shift amount, a cast with no route, and a **gather** — `loop_info` gives a load whose index
+is data the object it reads (`MemAccess::gather_base`) and accepts it only when no store in the loop
+can reach that object (two slots, `@noalias`, or a non-escaping local). Two guards keep replication
+honest: the induction variable's scalar *address* face may never meet a lane-varying operand
+(`x[i + q[i]]` is declined, not replicated with the group's first `i`), and replication is taken only
+beside at least as much widened arithmetic. Scatters, reverse loops and gapped groups stay scalar.
 
 **Unrolling never reassociates.** Splitting a float reduction across several accumulators would
 break the 4-cycle `addss` dependency chain, and it computes a different number — which breaks both

@@ -1532,6 +1532,14 @@ impl<'a> FnEmit<'a> {
                     rty.display()
                 ))
             }
+            // Like `Splat` and `Iota`: these always produce a vector, which `lower_vec_inst`
+            // scalarizes above, so a scalar result here is malformed MIR the verifier rejects.
+            Op::Widen { .. } | Op::Narrow { .. } | Op::Shuffle { .. } | Op::InsertLane(..) => {
+                return Err(format!(
+                    "{UNSUPPORTED} SIMD lane op with a non-vector result type {} (malformed MIR)",
+                    rty.display()
+                ))
+            }
             Op::FuncAddr(sym) => {
                 // Record the target for the `wukong_parallel_for` special-case; the value itself is
                 // never materialized as a device function pointer, so emit no instruction.
@@ -2310,7 +2318,14 @@ impl<'a> FnEmit<'a> {
             }
             Op::Bin(op, l, r2) => {
                 let la = self.lanes(*l)?;
-                let lb = self.lanes(*r2)?;
+                // A vector shifted by one scalar amount (`wukong_mir::Op::Bin`'s one operand-shape
+                // exception) reads that amount in every lane; `bin_into` masks it per lane width
+                // exactly as it masks a scalar shift.
+                let lb = if self.ty(*r2).is_vector() {
+                    self.lanes(*r2)?
+                } else {
+                    vec![self.reg(*r2); n]
+                };
                 let mut ls = Vec::with_capacity(n);
                 for i in 0..n {
                     let d = self.fresh(lane_rc);
@@ -2418,6 +2433,113 @@ impl<'a> FnEmit<'a> {
                 for i in 0..n {
                     let d = self.fresh(RC::Rd);
                     self.emit(&format!("mov.b64 {d}, {i};"));
+                    ls.push(d);
+                }
+                ls
+            }
+            // One half of the source lanes, each converted exactly as the scalar cast of the same
+            // kind converts it (`cast_into` is the scalar path's own emitter).
+            Op::Widen { v, half, kind } => {
+                let src_ty = self.ty(*v);
+                let from_lane = src_ty.lane_type().clone();
+                let src_n = match &src_ty {
+                    MirType::Vec(_, m) => *m,
+                    _ => 0,
+                };
+                let off = half.first_lane(src_n) as usize;
+                let lv = self.lanes(*v)?;
+                let mut ls = Vec::with_capacity(n);
+                for i in 0..n {
+                    let src = lv.get(off + i).cloned().ok_or_else(|| {
+                        format!(
+                            "{UNSUPPORTED} SIMD `Widen` reads past the lanes of v{}",
+                            v.0
+                        )
+                    })?;
+                    let d = self.fresh(lane_rc);
+                    self.cast_into(&d, *kind, &src, &from_lane, &lane)?;
+                    ls.push(d);
+                }
+                ls
+            }
+            // The lanes of `lo` then the lanes of `hi`, each reduced on its own. The saturating
+            // kinds clamp the canonical (sign-extended) 64-bit lane and re-canonicalize it.
+            Op::Narrow { lo, hi, kind } => {
+                let from_lane = self.ty(*lo).lane_type().clone();
+                let mut srcs = self.lanes(*lo)?;
+                srcs.extend(self.lanes(*hi)?);
+                if srcs.len() != n {
+                    return Err(format!(
+                        "{UNSUPPORTED} SIMD `Narrow` of v{} and v{} does not fill {n} lanes",
+                        lo.0, hi.0
+                    ));
+                }
+                let mut ls = Vec::with_capacity(n);
+                for src in &srcs {
+                    let d = self.fresh(lane_rc);
+                    match kind {
+                        wukong_mir::NarrowKind::Trunc => {
+                            self.cast_into(&d, CastKind::Trunc, src, &from_lane, &lane)?
+                        }
+                        wukong_mir::NarrowKind::FpTrunc => {
+                            self.cast_into(&d, CastKind::FpTrunc, src, &from_lane, &lane)?
+                        }
+                        wukong_mir::NarrowKind::SatSigned | wukong_mir::NarrowKind::SatUnsigned => {
+                            let bits = int_bits(&lane);
+                            let (min, max): (i64, i64) =
+                                if *kind == wukong_mir::NarrowKind::SatSigned {
+                                    (-(1i64 << (bits - 1)), (1i64 << (bits - 1)) - 1)
+                                } else {
+                                    (0, (1i64 << bits) - 1)
+                                };
+                            let t = self.fresh(RC::Rd);
+                            self.emit(&format!("mov.b64 {t}, {};", min as u64));
+                            self.emit(&format!("max.s64 {d}, {src}, {t};"));
+                            self.emit(&format!("mov.b64 {t}, {};", max as u64));
+                            self.emit(&format!("min.s64 {d}, {d}, {t};"));
+                            self.mask_int(&d, &lane);
+                        }
+                    }
+                    ls.push(d);
+                }
+                ls
+            }
+            // A lane permutation is register copies.
+            Op::Shuffle { a, b, mask } => {
+                let mut srcs = self.lanes(*a)?;
+                srcs.extend(self.lanes(*b)?);
+                let mut ls = Vec::with_capacity(n);
+                for &m in mask {
+                    let src = srcs.get(m as usize).cloned().ok_or_else(|| {
+                        format!(
+                            "{UNSUPPORTED} SIMD `Shuffle` mask entry {m} is past the lanes of \
+                             v{} and v{}",
+                            a.0, b.0
+                        )
+                    })?;
+                    let d = self.fresh(lane_rc);
+                    self.emit(&format!("mov.{} {d}, {src};", mov_ty(lane_rc)));
+                    ls.push(d);
+                }
+                ls
+            }
+            // Every lane copied, lane `k` from the scalar.
+            Op::InsertLane(v, s, k) => {
+                let lv = self.lanes(*v)?;
+                let k = *k as usize;
+                if k >= lv.len() {
+                    return Err(format!(
+                        "{UNSUPPORTED} SIMD `InsertLane` lane {k} is past the {} lane(s) of v{}",
+                        lv.len(),
+                        v.0
+                    ));
+                }
+                let sr = self.reg(*s);
+                let mut ls = Vec::with_capacity(lv.len());
+                for (i, src) in lv.iter().enumerate() {
+                    let d = self.fresh(lane_rc);
+                    let from = if i == k { &sr } else { src };
+                    self.emit(&format!("mov.{} {d}, {from};", mov_ty(lane_rc)));
                     ls.push(d);
                 }
                 ls

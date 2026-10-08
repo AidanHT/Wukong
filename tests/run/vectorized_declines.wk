@@ -578,7 +578,10 @@ module tests.run.vectorized_declines
 //    and a secondary IV stepping by 2. The IV is the same in every lane ONLY when it is a `gep`
 //    index; splatting it anywhere else writes the group's first value into all W lanes. That was a
 //    real miscompile during development -- interp and native agreed on the wrong answer, and only
-//    the -O0-vs-O2 comparison saw it.
+//    the -O0-vs-O2 comparison saw it. (The first two are no longer refused: an `i64` counter
+//    converted to `f32` has no exact packed form, so the conversion now runs lane by lane, each
+//    lane from its own `i + k`, and the arithmetic around it widens. They stay here because a lane
+//    handed the wrong counter is exactly what this file catches.)
 //  * **Reverse iteration and a step of 2.** Neither is a unit-stride ascending loop.
 //  * **`break`, `continue` and an early `return`.** Each puts an exit somewhere other than the
 //    header, so the trip count is not the header test's and lanes past the exit must not run.

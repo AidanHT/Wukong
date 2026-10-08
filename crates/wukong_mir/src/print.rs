@@ -122,6 +122,17 @@ fn fmt_op(op: &Op, interner: &Interner) -> String {
         Op::Splat(v) => format!("splat {}", val(*v)),
         Op::ExtractLane(v, k) => format!("extractlane {}, {k}", val(*v)),
         Op::Iota(ty) => format!("iota {}", ty.display()),
+        Op::Widen { v, half, kind } => {
+            format!("widen.{}.{} {}", kind.name(), half.name(), val(*v))
+        }
+        Op::Narrow { lo, hi, kind } => {
+            format!("narrow.{} {}, {}", kind.name(), val(*lo), val(*hi))
+        }
+        Op::Shuffle { a, b, mask } => {
+            let m: Vec<String> = mask.iter().map(|k| k.to_string()).collect();
+            format!("shuffle {}, {}, [{}]", val(*a), val(*b), m.join(", "))
+        }
+        Op::InsertLane(v, s, k) => format!("insertlane {}, {}, {k}", val(*v), val(*s)),
         Op::Fma(a, b, c) => format!("fma {}, {}, {}", val(*a), val(*b), val(*c)),
         Op::Sqrt(a) => format!("sqrt {}", val(*a)),
         Op::VecKernelCall {

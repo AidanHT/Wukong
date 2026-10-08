@@ -1256,6 +1256,15 @@ impl<'a> FnTranslator<'a> {
                     .insert(cranelift_codegen::ir::ConstantData::from(bytes.as_slice()));
                 self.builder.ins().vconst(vec_ty, handle)
             }
+            Op::Widen { v, half, kind } => self.lower_widen(*v, *half, *kind),
+            Op::Narrow { lo, hi, kind } => self.lower_narrow(*lo, *hi, *kind),
+            Op::Shuffle { a, b, mask } => self.lower_shuffle(*a, *b, mask),
+            // `insertlane` exists for every 128-bit lane type the verifier admits.
+            Op::InsertLane(v, s, k) => {
+                let x = self.val(*v);
+                let y = self.val(*s);
+                self.builder.ins().insertlane(x, y, *k as u8)
+            }
             // Fused multiply-add: Cranelift `fma(a, b, c)` is `a*b + c` with one rounding, lowering
             // to a hardware `vfmadd` (scalar or 128-bit vector) on FMA3 hosts.
             Op::Fma(a, b, c) => {
@@ -1497,6 +1506,116 @@ impl<'a> FnTranslator<'a> {
             let clamped = self.builder.ins().umin(wide, hic);
             self.builder.ins().ireduce(to_ty, clamped)
         }
+    }
+
+    /// Reinterpret a 128-bit vector as `ty` (the same bits). Cranelift requires a byte order on a
+    /// `bitcast` that changes the lane count; every vector here lives in a little-endian register.
+    fn vec_bitcast(&mut self, ty: Type, x: Value) -> Value {
+        if self.dfg_ty(x) == ty {
+            return x;
+        }
+        let flags = MemFlags::new().with_endianness(cranelift_codegen::ir::Endianness::Little);
+        self.builder.ins().bitcast(ty, flags, x)
+    }
+
+    /// A byte shuffle of two 128-bit vectors: result byte `i` is byte `bytes[i]` of `a ++ b`.
+    fn byte_shuffle(&mut self, a: Value, b: Value, bytes: &[u8], ty: Type) -> Value {
+        let a8 = self.vec_bitcast(types::I8X16, a);
+        let b8 = self.vec_bitcast(types::I8X16, b);
+        let imm = self
+            .builder
+            .func
+            .dfg
+            .immediates
+            .push(cranelift_codegen::ir::ConstantData::from(bytes));
+        let r = self.builder.ins().shuffle(a8, b8, imm);
+        self.vec_bitcast(ty, r)
+    }
+
+    /// `Op::Widen`: one half of the source lanes at twice the width. `f32 -> f64` has only a
+    /// low-half instruction (`cvtps2pd`), so the high half is first moved down with a `pshufd`-shaped
+    /// byte shuffle — one Cranelift lowers without SSSE3.
+    fn lower_widen(&mut self, v: ValueId, half: wukong_mir::Half, kind: CastKind) -> Value {
+        use wukong_mir::Half;
+        let x = self.val(v);
+        match (kind, half) {
+            (CastKind::SExt, Half::Lo) => self.builder.ins().swiden_low(x),
+            (CastKind::SExt, Half::Hi) => self.builder.ins().swiden_high(x),
+            (CastKind::ZExt, Half::Lo) => self.builder.ins().uwiden_low(x),
+            (CastKind::ZExt, Half::Hi) => self.builder.ins().uwiden_high(x),
+            // `FpExt`, `f32x4 -> f64x2`: the only other kind the verifier admits.
+            (_, Half::Lo) => self.builder.ins().fvpromote_low(x),
+            (_, Half::Hi) => {
+                let bytes: Vec<u8> = (8..16).chain(8..16).collect();
+                let hi = self.byte_shuffle(x, x, &bytes, types::F32X4);
+                self.builder.ins().fvpromote_low(hi)
+            }
+        }
+    }
+
+    /// `Op::Narrow`. The saturating kinds are `snarrow`/`unarrow` (`packss`/`packus`). Truncation
+    /// first masks every lane to its low half-width bits — which puts it in range, so the unsigned
+    /// saturating pack then keeps exactly those bits — except at 64-bit lanes, where no pack exists
+    /// and the low dwords are picked out with a `shufps`-shaped shuffle. `f64 -> f32` demotes each
+    /// operand (`cvtpd2ps`, high half zeroed) and joins the two low halves (`punpcklqdq`).
+    fn lower_narrow(&mut self, lo: ValueId, hi: ValueId, kind: wukong_mir::NarrowKind) -> Value {
+        use wukong_mir::NarrowKind;
+        let (l, h) = (self.val(lo), self.val(hi));
+        let wide = self.dfg_ty(l);
+        match kind {
+            NarrowKind::SatSigned => self.builder.ins().snarrow(l, h),
+            NarrowKind::SatUnsigned => self.builder.ins().unarrow(l, h),
+            NarrowKind::Trunc if wide == types::I64X2 => {
+                let bytes: [u8; 16] = [0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27];
+                self.byte_shuffle(l, h, &bytes, types::I32X4)
+            }
+            NarrowKind::Trunc => {
+                let lane = wide.lane_type();
+                let low_bits: i64 = if lane == types::I16 { 0xFF } else { 0xFFFF };
+                let m = self.builder.ins().iconst(lane, low_bits);
+                let mask = self.builder.ins().splat(wide, m);
+                let lm = self.builder.ins().band(l, mask);
+                let hm = self.builder.ins().band(h, mask);
+                self.builder.ins().unarrow(lm, hm)
+            }
+            NarrowKind::FpTrunc => {
+                let ld = self.builder.ins().fvdemote(l);
+                let hd = self.builder.ins().fvdemote(h);
+                let bytes: Vec<u8> = (0..8).chain(16..24).collect();
+                self.byte_shuffle(ld, hd, &bytes, types::F32X4)
+            }
+        }
+    }
+
+    /// `Op::Shuffle`: lane `k` is lane `mask[k]` of `a ++ b`, as a byte shuffle over the lane width.
+    /// Without SSSE3 Cranelift lowers a general byte shuffle to a `pshufb` *libcall* that neither
+    /// the JIT nor a plain link provides, so a baseline (`--target-cpu=x86-64`) build moves the
+    /// lanes one at a time instead — slower, and the same bits.
+    fn lower_shuffle(&mut self, a: ValueId, b: ValueId, mask: &[u8]) -> Value {
+        let (av, bv) = (self.val(a), self.val(b));
+        let vty = self.dfg_ty(av);
+        let n = vty.lane_count();
+        if !self.decls.ssse3 {
+            let mut acc = av;
+            for (k, &m) in mask.iter().enumerate() {
+                let (src, j) = if u32::from(m) < n {
+                    (av, m)
+                } else {
+                    (bv, m - n as u8)
+                };
+                let x = self.builder.ins().extractlane(src, j);
+                acc = self.builder.ins().insertlane(acc, x, k as u8);
+            }
+            return acc;
+        }
+        let w = (vty.lane_bits() / 8) as u8;
+        let mut bytes = Vec::with_capacity(16);
+        for &m in mask {
+            for j in 0..w {
+                bytes.push(m * w + j);
+            }
+        }
+        self.byte_shuffle(av, bv, &bytes, vty)
     }
 
     /// Round an `f32` to bf16 precision and back to `f32`, emitting the *identical* integer
@@ -4323,6 +4442,16 @@ fn build_function_clif(
 struct Decls<'a> {
     d: &'a cranelift_module::ModuleDeclarations,
     asserting: &'a HashSet<Symbol>,
+    /// Whether the target ISA has SSSE3 (`pshufb`), which decides how `Op::Shuffle` is lowered.
+    ssse3: bool,
+}
+
+/// Does `isa` have SSSE3? Read off the ISA's own flags, so `--target-cpu` levels and host detection
+/// answer the same question the instruction selector asks.
+fn isa_has_ssse3(isa: &dyn cranelift_codegen::isa::TargetIsa) -> bool {
+    cranelift_codegen::isa::TargetIsa::isa_flags(isa)
+        .iter()
+        .any(|v| v.name == "has_ssse3" && v.as_bool() == Some(true))
 }
 
 impl Decls<'_> {
@@ -4388,11 +4517,13 @@ fn define_functions_serial<M: Module>(
     let mut ctx = module.make_context();
     let mut fbctx = FunctionBuilderContext::new();
     let mut scratch = TranslationScratch::default();
+    let ssse3 = isa_has_ssse3(module.isa());
     for (fi, f) in program.funcs.iter().enumerate() {
         {
             let decls = Decls {
                 d: module.declarations(),
                 asserting,
+                ssse3,
             };
             build_function_clif(
                 &decls,
@@ -4447,6 +4578,7 @@ fn define_functions_parallel<M: Module>(
         let decls = Decls {
             d: module.declarations(),
             asserting,
+            ssse3: isa_has_ssse3(module.isa()),
         };
         let isa = module.isa();
         program
@@ -6102,6 +6234,9 @@ fn emit_object_full(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod lane_op_tests;
 
 #[cfg(test)]
 mod assertion_tests;

@@ -597,6 +597,11 @@ pub struct MemAccess {
     /// The type transferred (the `Load`'s result type / the stored value's type).
     pub value_ty: MirType,
     pub addr: AddrForm,
+    /// For a **load** whose address is [`AddrForm::Unknown`] only because its index does not
+    /// follow the induction variable — a gather, `lut[q[i]]` — the object it reads, when the
+    /// pointer is one `gep` off a known base. The dependence test accepts such a load when nothing
+    /// the loop stores can be that object. `None` for every other access.
+    pub gather_base: Option<MemBase>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1530,6 +1535,15 @@ impl<'a> LoopCtx<'a> {
         }
     }
 
+    /// The object a gathered address reads: `p` is one `gep` off a pointer [`Self::mem_base`]
+    /// recognizes, whatever its index.
+    fn gather_base(&self, p: ValueId) -> Option<MemBase> {
+        match self.op_of(p)? {
+            Op::Gep { ptr, .. } => self.mem_base(*ptr),
+            _ => None,
+        }
+    }
+
     /// Decompose the address `p` into `base + index · elem`.
     ///
     /// A chain of `gep`s over the *same* element type folds into one index (`gep(gep(b, j), k)` is
@@ -1595,6 +1609,10 @@ fn collect_accesses(
                 _ => continue,
             };
             let addr = ctx.addr_form(ptr, memo);
+            let gather_base = match (&addr, kind) {
+                (AddrForm::Unknown, AccessKind::Load) => ctx.gather_base(ptr),
+                _ => None,
+            };
             out.push(MemAccess {
                 block: b,
                 inst: i,
@@ -1602,6 +1620,7 @@ fn collect_accesses(
                 ptr,
                 value_ty,
                 addr,
+                gather_base,
             });
         }
     }
@@ -1799,7 +1818,9 @@ fn classify_carried(
 /// * their bases are provably different objects (two distinct `alloca`s);
 /// * their bases are the same object *and* their index expressions are identical, which puts them
 ///   at dependence distance 0 — the same element in the same iteration, which is a
-///   loop-*independent* dependence that widening preserves.
+///   loop-*independent* dependence that widening preserves;
+/// * their bases are the same object and the GCD test proves they never touch the same element at
+///   all ([`never_the_same_element`]: `x[2i]` beside `x[2i+1]`).
 ///
 /// A same-object pair at a **non-zero** distance is reported [`MemDep::Carried`] even when the
 /// distance is large enough to be harmless at a given width: the width is not known here, and
@@ -1821,16 +1842,53 @@ fn dependence(ctx: &LoopCtx<'_>, l: &NaturalLoop, accesses: &[MemAccess]) -> Dep
             }
         }
     }
-    if accesses.iter().any(|a| matches!(a.addr, AddrForm::Unknown)) {
-        return carried("an address the analysis could not decompose");
-    }
     let mut needs_runtime_check = false;
     let mut reloaded_base = false;
     // Built at most once, and only for a function with a `@noalias` parameter (`alias.rs`).
     let mut promised = crate::alias::PromisedBases::new(ctx.f);
+    // A gathered load (`lut[q[i]]`) reads some element of a known object at an index this analysis
+    // cannot follow, so no distance can be computed for it. It is independent of every store in
+    // the loop exactly when the store's object is provably a different one: two distinct slots, a
+    // `@noalias` promise, or the alias analysis's provenance (a local table whose address never
+    // escapes cannot be what a parameter points into). Any other unknown address — a store through
+    // one, or a pointer the analysis cannot trace to an object — may touch anything.
+    let mut alias: Option<crate::alias::AliasInfo> = None;
+    let handle = |m: MemBase| match m {
+        MemBase::Outer(v) => v,
+        MemBase::ReloadedOuter { value, .. } => value,
+    };
+    for a in accesses
+        .iter()
+        .filter(|a| matches!(a.addr, AddrForm::Unknown))
+    {
+        let Some(gb) = a.gather_base else {
+            return carried("an address the analysis could not decompose");
+        };
+        for s in accesses.iter().filter(|s| s.kind == AccessKind::Store) {
+            let Some(sb) = s.addr.base() else {
+                return carried("an address the analysis could not decompose");
+            };
+            let apart = !gb.same_object(sb)
+                && (distinct_allocas(ctx, gb, sb)
+                    || promised.disjoint(gb, sb)
+                    || !alias
+                        .get_or_insert_with(|| crate::alias::AliasInfo::analyze(ctx.f))
+                        .may_alias(handle(gb), handle(sb)));
+            if !apart {
+                return carried("a gathered load may read what the loop stores");
+            }
+        }
+        if matches!(gb, MemBase::ReloadedOuter { .. }) {
+            reloaded_base = true;
+        }
+    }
     for (i, a) in accesses.iter().enumerate() {
         for b in &accesses[i + 1..] {
             if a.kind == AccessKind::Load && b.kind == AccessKind::Load {
+                continue;
+            }
+            // A gather was settled against every store above.
+            if matches!(a.addr, AddrForm::Unknown) || matches!(b.addr, AddrForm::Unknown) {
                 continue;
             }
             let (Some(ba), Some(bb)) = (a.addr.base(), b.addr.base()) else {
@@ -1860,7 +1918,7 @@ fn dependence(ctx: &LoopCtx<'_>, l: &NaturalLoop, accesses: &[MemAccess]) -> Dep
                     (AddrForm::Invariant(_), AddrForm::Invariant(_)) => true,
                     _ => false,
                 };
-                if !same_index {
+                if !same_index && !never_the_same_element(a, b) {
                     return carried("two accesses to one object at a non-zero distance");
                 }
                 continue;
@@ -1891,6 +1949,44 @@ fn dependence(ctx: &LoopCtx<'_>, l: &NaturalLoop, accesses: &[MemAccess]) -> Dep
             }
             MemDep::Carried => unreachable!(),
         },
+    }
+}
+
+/// Can two accesses to one object provably never touch the same element, in any pair of iterations?
+///
+/// The GCD test, in the one shape it is exact for: both indices are `k·iv + T + c` with the same
+/// constant stride `k`, the same invariant part `T` and the same element type, each access moving
+/// exactly one element. Then `k·i₁ + c₁ = k·i₂ + c₂` needs `k | (c₂ - c₁)`, so when `k` does not
+/// divide the difference of the constants there is no solution at all — `x[2i]` and `x[2i+1]`
+/// interleave and never meet. That is what lets a complex multiply's `o[2i] = re; o[2i+1] = im`
+/// (two stores to one object) reach the vectorizer's interleave groups instead of being reported
+/// as a carried dependence. Any other pair answers `false`, which keeps the blunt test's verdict.
+pub(crate) fn never_the_same_element(a: &MemAccess, b: &MemAccess) -> bool {
+    let (
+        AddrForm::Affine {
+            index: ia,
+            elem: ea,
+            ..
+        },
+        AddrForm::Affine {
+            index: ib,
+            elem: eb,
+            ..
+        },
+    ) = (&a.addr, &b.addr)
+    else {
+        return false;
+    };
+    if ea != eb || a.value_ty != *ea || b.value_ty != *eb || ia.terms != ib.terms {
+        return false;
+    }
+    match (ia.coeff, ib.coeff) {
+        (Coeff::Const(k), Coeff::Const(k2)) if k == k2 && k != 0 => ib
+            .konst
+            .checked_sub(ia.konst)
+            .and_then(|d| d.checked_rem(k))
+            .is_some_and(|r| r != 0),
+        _ => false,
     }
 }
 
@@ -3097,6 +3193,25 @@ mod tests {
         );
         assert_eq!(l.dep.memory, MemDep::Carried);
         assert!(!l.is_vectorizable_shape());
+    }
+
+    /// The same gather with the stored slice promised apart (`@noalias`). The gathered load still
+    /// has no distance, but it needs none: no store in the loop can reach the object it reads, so
+    /// the loop is not carried. The access keeps its `Unknown` address and records the object.
+    #[test]
+    fn a_gather_from_storage_no_store_can_reach_is_independent() {
+        let src = "fn k(idx: []i32, x: []f32, @noalias mut o: []f32, n: i64) { \
+                   for i in 0..n { o[i] = x[idx[i] as i64]; } } \
+                   fn main() -> i32 { return 0; }";
+        let (_, l) = kernel_loop(src, "k");
+        let gather = l
+            .accesses
+            .iter()
+            .find(|a| matches!(a.addr, AddrForm::Unknown))
+            .expect("the gathered load");
+        assert_eq!(gather.kind, AccessKind::Load);
+        assert!(gather.gather_base.is_some(), "no object for {gather:?}");
+        assert_ne!(l.dep.memory, MemDep::Carried, "{}", l.dep.reason);
     }
 
     // ---- stage 4: carried values -------------------------------------------------------------

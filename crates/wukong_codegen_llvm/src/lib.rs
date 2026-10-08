@@ -889,13 +889,42 @@ impl Emitter<'_> {
                         MirType::I64 => 64,
                         _ => unreachable!("integer shift type"),
                     };
-                    let mask = int_literal(mir_ty, width - 1);
-                    let _ = writeln!(
-                        out,
-                        "  %v{}.shift = and {ty} {}, {mask}",
-                        value.0,
-                        self.operand(*r)
-                    );
+                    let amount_ty = self.mir(*r).clone();
+                    if mir_ty.is_vector() && !amount_ty.is_vector() {
+                        // A vector shifted by one scalar amount: mask the scalar, then splat it,
+                        // so the `shl`/`lshr`/`ashr` below sees the per-lane operand LLVM needs.
+                        let lanes = match mir_ty {
+                            MirType::Vec(_, n) => *n,
+                            _ => 1,
+                        };
+                        let lane_ty = llvm_ty(&amount_ty);
+                        let _ = writeln!(
+                            out,
+                            "  %v{0}.amt = and {lane_ty} {1}, {2}",
+                            value.0,
+                            self.operand(*r),
+                            width - 1
+                        );
+                        let _ = writeln!(
+                            out,
+                            "  %v{0}.ins = insertelement {ty} poison, {lane_ty} %v{0}.amt, i32 0",
+                            value.0
+                        );
+                        let _ = writeln!(
+                            out,
+                            "  %v{0}.shift = shufflevector {ty} %v{0}.ins, {ty} poison, \
+                             <{lanes} x i32> zeroinitializer",
+                            value.0
+                        );
+                    } else {
+                        let mask = int_literal(mir_ty, width - 1);
+                        let _ = writeln!(
+                            out,
+                            "  %v{}.shift = and {ty} {}, {mask}",
+                            value.0,
+                            self.operand(*r)
+                        );
+                    }
                     let _ = writeln!(
                         out,
                         "  {res}{} {ty} {}, %v{}.shift",
@@ -1117,6 +1146,110 @@ impl Emitter<'_> {
                 };
                 let items: Vec<String> = (0..n).map(|k| format!("{lane} {k}")).collect();
                 format!("{res}add {vty} zeroinitializer, <{}>", items.join(", "))
+            }
+            // One half of the lanes (a half-width `shufflevector`), then the scalar cast's own
+            // vector form: `sext`/`zext`/`fpext`.
+            Op::Widen { v, half, kind } => {
+                let r = inst.result.expect("widen has a result");
+                let (n_src, src_lane) = match self.mir(*v) {
+                    MirType::Vec(l, n) => (*n, (**l).clone()),
+                    other => (1, other.clone()),
+                };
+                let n = n_src / 2;
+                let first = half.first_lane(n_src);
+                let idx: Vec<String> = (first..first + n).map(|k| format!("i32 {k}")).collect();
+                let half_ty = llvm_ty(&MirType::Vec(Box::new(src_lane), n));
+                let src_ty = self.ty(*v);
+                let _ = writeln!(
+                    out,
+                    "  %v{}.half = shufflevector {src_ty} {}, {src_ty} poison, <{n} x i32> <{}>",
+                    r.0,
+                    self.operand(*v),
+                    idx.join(", ")
+                );
+                format!(
+                    "{res}{} {half_ty} %v{}.half to {}",
+                    cast_name(*kind),
+                    r.0,
+                    self.ty(r)
+                )
+            }
+            // Concatenate (a double-width `shufflevector`), clamp for the saturating kinds, then
+            // `trunc`/`fptrunc` the whole concatenation.
+            Op::Narrow { lo, hi, kind } => {
+                let r = inst.result.expect("narrow has a result");
+                let (n, wide_lane) = match self.mir(*lo) {
+                    MirType::Vec(l, n) => (*n, (**l).clone()),
+                    other => (1, other.clone()),
+                };
+                let m = 2 * n;
+                let cat_mir = MirType::Vec(Box::new(wide_lane), m);
+                let cat = llvm_ty(&cat_mir);
+                let src_ty = self.ty(*lo);
+                let idx: Vec<String> = (0..m).map(|k| format!("i32 {k}")).collect();
+                let _ = writeln!(
+                    out,
+                    "  %v{}.cat = shufflevector {src_ty} {}, {src_ty} {}, <{m} x i32> <{}>",
+                    r.0,
+                    self.operand(*lo),
+                    self.operand(*hi),
+                    idx.join(", ")
+                );
+                let rty = self.ty(r);
+                match kind {
+                    wukong_mir::NarrowKind::FpTrunc => {
+                        format!("{res}fptrunc {cat} %v{}.cat to {rty}", r.0)
+                    }
+                    wukong_mir::NarrowKind::Trunc => {
+                        format!("{res}trunc {cat} %v{}.cat to {rty}", r.0)
+                    }
+                    wukong_mir::NarrowKind::SatSigned | wukong_mir::NarrowKind::SatUnsigned => {
+                        let bits: u32 = match self.mir(r).lane_type() {
+                            MirType::I8 => 8,
+                            MirType::I16 => 16,
+                            _ => 32,
+                        };
+                        let (min, max): (i64, i64) = if *kind == wukong_mir::NarrowKind::SatSigned {
+                            (-(1i64 << (bits - 1)), (1i64 << (bits - 1)) - 1)
+                        } else {
+                            (0, (1i64 << bits) - 1)
+                        };
+                        let lo_lit = int_literal(&cat_mir, min);
+                        let hi_lit = int_literal(&cat_mir, max);
+                        let v = r.0;
+                        let _ = writeln!(out, "  %v{v}.lt = icmp slt {cat} %v{v}.cat, {lo_lit}");
+                        let _ = writeln!(
+                            out,
+                            "  %v{v}.c1 = select <{m} x i1> %v{v}.lt, {cat} {lo_lit}, {cat} %v{v}.cat"
+                        );
+                        let _ = writeln!(out, "  %v{v}.gt = icmp sgt {cat} %v{v}.c1, {hi_lit}");
+                        let _ = writeln!(
+                            out,
+                            "  %v{v}.c2 = select <{m} x i1> %v{v}.gt, {cat} {hi_lit}, {cat} %v{v}.c1"
+                        );
+                        format!("{res}trunc {cat} %v{v}.c2 to {rty}")
+                    }
+                }
+            }
+            Op::Shuffle { a, b, mask } => {
+                let vty = self.ty(*a);
+                let idx: Vec<String> = mask.iter().map(|k| format!("i32 {k}")).collect();
+                format!(
+                    "{res}shufflevector {vty} {}, {vty} {}, <{} x i32> <{}>",
+                    self.operand(*a),
+                    self.operand(*b),
+                    mask.len(),
+                    idx.join(", ")
+                )
+            }
+            Op::InsertLane(v, s, k) => {
+                let vty = self.ty(*v);
+                format!(
+                    "{res}insertelement {vty} {}, {} {}, i32 {k}",
+                    self.operand(*v),
+                    self.ty(*s),
+                    self.operand(*s)
+                )
             }
             Op::Fma(a, b, c) => {
                 let r = inst.result.unwrap();
@@ -1580,6 +1713,9 @@ mod closeout_tests;
 
 #[cfg(test)]
 mod semantic_tests;
+
+#[cfg(test)]
+mod lane_op_tests;
 
 #[cfg(test)]
 mod tests {

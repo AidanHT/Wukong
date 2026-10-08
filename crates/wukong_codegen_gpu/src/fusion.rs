@@ -187,12 +187,17 @@ fn op_operands(op: &Op) -> Vec<ValueId> {
         | Op::FuncAddr(_)
         | Op::GlobalAddr(_)
         | Op::Iota(_) => Vec::new(),
-        Op::Bin(_, a, b) | Op::Cmp(_, a, b) => vec![*a, *b],
+        Op::Bin(_, a, b)
+        | Op::Cmp(_, a, b)
+        | Op::Narrow { lo: a, hi: b, .. }
+        | Op::Shuffle { a, b, .. }
+        | Op::InsertLane(a, b, _) => vec![*a, *b],
         Op::Neg(a)
         | Op::Not(a)
         | Op::Sqrt(a)
         | Op::Splat(a)
         | Op::Round(_, a)
+        | Op::Widen { v: a, .. }
         | Op::ExtractLane(a, _) => vec![*a],
         Op::Cast(_, a, _) => vec![*a],
         Op::Select(c, a, b) => vec![*c, *a, *b],

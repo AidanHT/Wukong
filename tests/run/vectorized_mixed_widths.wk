@@ -1,0 +1,444 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -5
+// EXPECT-OUT: 24
+// EXPECT-OUT: 53
+// EXPECT-OUT: 82
+// EXPECT-OUT: 111
+// EXPECT-OUT: 140
+// EXPECT-OUT: 169
+// EXPECT-OUT: 198
+// EXPECT-OUT: 227
+// EXPECT-OUT: 0
+// EXPECT-OUT: 29
+// EXPECT-OUT: 58
+// EXPECT-OUT: 87
+// EXPECT-OUT: 116
+// EXPECT-OUT: 145
+// EXPECT-OUT: 174
+// EXPECT-OUT: 203
+// EXPECT-OUT: 232
+// EXPECT-OUT: 5
+// EXPECT-OUT: 34
+// EXPECT-OUT: 63
+// EXPECT-OUT: 92
+// EXPECT-OUT: 121
+// EXPECT-OUT: 150
+// EXPECT-OUT: 179
+// EXPECT-OUT: 208
+// EXPECT-OUT: 237
+// EXPECT-OUT: 10
+// EXPECT-OUT: 39
+// EXPECT-OUT: 68
+// EXPECT-OUT: 97
+// EXPECT-OUT: 126
+// EXPECT-OUT: 155
+// EXPECT-OUT: 184
+// EXPECT-OUT: 213
+// EXPECT-OUT: 242
+// EXPECT-OUT: 15
+// EXPECT-OUT: -128
+// EXPECT-OUT: 0
+// EXPECT-OUT: -128
+// EXPECT-OUT: 0
+// EXPECT-OUT: -128
+// EXPECT-OUT: 0
+// EXPECT-OUT: -128
+// EXPECT-OUT: 0
+// EXPECT-OUT: -128
+// EXPECT-OUT: 0
+// EXPECT-OUT: -128
+// EXPECT-OUT: 0
+// EXPECT-OUT: -128
+// EXPECT-OUT: 0
+// EXPECT-OUT: -127
+// EXPECT-OUT: 0
+// EXPECT-OUT: -116
+// EXPECT-OUT: 0
+// EXPECT-OUT: -104
+// EXPECT-OUT: 0
+// EXPECT-OUT: -92
+// EXPECT-OUT: 0
+// EXPECT-OUT: -81
+// EXPECT-OUT: 0
+// EXPECT-OUT: -69
+// EXPECT-OUT: 0
+// EXPECT-OUT: -58
+// EXPECT-OUT: 0
+// EXPECT-OUT: -46
+// EXPECT-OUT: 0
+// EXPECT-OUT: -34
+// EXPECT-OUT: 0
+// EXPECT-OUT: -23
+// EXPECT-OUT: 0
+// EXPECT-OUT: -11
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 11
+// EXPECT-OUT: 11
+// EXPECT-OUT: 23
+// EXPECT-OUT: 23
+// EXPECT-OUT: 34
+// EXPECT-OUT: 34
+// EXPECT-OUT: 46
+// EXPECT-OUT: 46
+// EXPECT-OUT: 58
+// EXPECT-OUT: 58
+// EXPECT-OUT: 69
+// EXPECT-OUT: 69
+// EXPECT-OUT: 81
+// EXPECT-OUT: 81
+// EXPECT-OUT: 92
+// EXPECT-OUT: 92
+// EXPECT-OUT: 104
+// EXPECT-OUT: 104
+// EXPECT-OUT: 116
+// EXPECT-OUT: 116
+// EXPECT-OUT: 127
+// EXPECT-OUT: 127
+// EXPECT-OUT: 127
+// EXPECT-OUT: 139
+// EXPECT-OUT: 127
+// EXPECT-OUT: 150
+// EXPECT-OUT: 127
+// EXPECT-OUT: 162
+// EXPECT-OUT: 127
+// EXPECT-OUT: 174
+// EXPECT-OUT: 127
+// EXPECT-OUT: 185
+// EXPECT-OUT: 127
+// EXPECT-OUT: 197
+// EXPECT-OUT: 127
+// EXPECT-OUT: 208
+// EXPECT-OUT: -73648
+// EXPECT-OUT: -15
+// EXPECT-OUT: 32
+// EXPECT-OUT: -15
+// EXPECT-OUT: 60
+// EXPECT-OUT: -14
+// EXPECT-OUT: 88
+// EXPECT-OUT: -13
+// EXPECT-OUT: 116
+// EXPECT-OUT: -12
+// EXPECT-OUT: -112
+// EXPECT-OUT: -11
+// EXPECT-OUT: -84
+// EXPECT-OUT: -10
+// EXPECT-OUT: -56
+// EXPECT-OUT: -9
+// EXPECT-OUT: -28
+// EXPECT-OUT: -8
+// EXPECT-OUT: 0
+// EXPECT-OUT: -8
+// EXPECT-OUT: 28
+// EXPECT-OUT: -7
+// EXPECT-OUT: 56
+// EXPECT-OUT: -6
+// EXPECT-OUT: 84
+// EXPECT-OUT: -5
+// EXPECT-OUT: 112
+// EXPECT-OUT: -4
+// EXPECT-OUT: -116
+// EXPECT-OUT: -3
+// EXPECT-OUT: -88
+// EXPECT-OUT: -2
+// EXPECT-OUT: -60
+// EXPECT-OUT: -1
+// EXPECT-OUT: -32
+// EXPECT-OUT: -1
+// EXPECT-OUT: -4
+// EXPECT-OUT: 0
+// EXPECT-OUT: 24
+// EXPECT-OUT: 1
+// EXPECT-OUT: 52
+// EXPECT-OUT: 2
+// EXPECT-OUT: 80
+// EXPECT-OUT: 3
+// EXPECT-OUT: 108
+// EXPECT-OUT: 4
+// EXPECT-OUT: -120
+// EXPECT-OUT: 5
+// EXPECT-OUT: -92
+// EXPECT-OUT: 6
+// EXPECT-OUT: -64
+// EXPECT-OUT: 6
+// EXPECT-OUT: -36
+// EXPECT-OUT: 7
+// EXPECT-OUT: -8
+// EXPECT-OUT: 8
+// EXPECT-OUT: 20
+// EXPECT-OUT: 9
+// EXPECT-OUT: 48
+// EXPECT-OUT: 10
+// EXPECT-OUT: 76
+// EXPECT-OUT: 11
+// EXPECT-OUT: 104
+// EXPECT-OUT: 12
+// EXPECT-OUT: -124
+// EXPECT-OUT: 13
+// EXPECT-OUT: -96
+// EXPECT-OUT: 13
+// EXPECT-OUT: -68
+// EXPECT-OUT: 14
+// EXPECT-OUT: -40
+// EXPECT-OUT: 15
+// EXPECT-OUT: -12
+// EXPECT-OUT: -16
+// EXPECT-OUT: 16
+// EXPECT-OUT: -104
+// EXPECT-OUT: 120
+// EXPECT-OUT: -98
+// EXPECT-OUT: 10
+// EXPECT-OUT: -68
+// EXPECT-OUT: -76
+// EXPECT-OUT: -14
+// EXPECT-OUT: 118
+// EXPECT-OUT: 64
+// EXPECT-OUT: 80
+// EXPECT-OUT: -90
+// EXPECT-OUT: 66
+// EXPECT-OUT: 36
+// EXPECT-OUT: 76
+// EXPECT-OUT: -70
+// EXPECT-OUT: 110
+// EXPECT-OUT: 104
+// EXPECT-OUT: -88
+// EXPECT-OUT: 46
+// EXPECT-OUT: -6
+// EXPECT-OUT: 12
+// EXPECT-OUT: 100
+// EXPECT-OUT: 2
+// EXPECT-OUT: -26
+// EXPECT-OUT: 16
+// EXPECT-OUT: -128
+// EXPECT-OUT: 54
+// EXPECT-OUT: 50
+// EXPECT-OUT: 116
+// EXPECT-OUT: -4
+// EXPECT-OUT: -54
+// EXPECT-OUT: -34
+// EXPECT-OUT: 56
+// EXPECT-OUT: -40
+// EXPECT-OUT: -66
+// EXPECT-OUT: -22
+// EXPECT-OUT: 92
+// EXPECT-OUT: 370
+// EXPECT-OUT: -24731
+// EXPECT-OUT: -12434
+// EXPECT-OUT: -137
+// EXPECT-OUT: 12160
+// EXPECT-OUT: 24457
+// EXPECT-OUT: -28782
+// EXPECT-OUT: -16485
+// EXPECT-OUT: -4188
+// EXPECT-OUT: 8109
+// EXPECT-OUT: 20406
+// EXPECT-OUT: 32703
+// EXPECT-OUT: -20536
+// EXPECT-OUT: -8239
+// EXPECT-OUT: 4058
+// EXPECT-OUT: 16355
+// EXPECT-OUT: 28652
+// EXPECT-OUT: -24587
+// EXPECT-OUT: -12290
+// EXPECT-OUT: 7
+// EXPECT-OUT: 12304
+// EXPECT-OUT: 24601
+// EXPECT-OUT: -28638
+// EXPECT-OUT: -16341
+// EXPECT-OUT: -4044
+// EXPECT-OUT: 8253
+// EXPECT-OUT: 20550
+// EXPECT-OUT: -32689
+// EXPECT-OUT: -20392
+// EXPECT-OUT: -8095
+// EXPECT-OUT: 4202
+// EXPECT-OUT: 16499
+// EXPECT-OUT: 28796
+// EXPECT-OUT: -24443
+// EXPECT-OUT: -12146
+// EXPECT-OUT: 151
+// EXPECT-OUT: 12448
+// EXPECT-OUT: 24745
+
+module tests.run.vectorized_mixed_widths
+
+// Loops whose element types differ in width, which the general loop vectorizer
+// (`wukong_opt::vectorize`) now widens at the group width of the NARROWEST lane: sixteen
+// iterations per vector iteration when an `i8`/`u8` stream is present, with every wider value
+// split into parts (`<16 x i8>` bytes beside four `<4 x f32>` parts) and the conversions between
+// them spelled with `widen`/`narrow` lane ops. Before, any lane-width-changing cast, any `i8`
+// multiply and any vector shift kept the whole loop scalar.
+//
+// N = 37 = two 16-iteration groups and a 5-element scalar epilogue, so every kernel runs a vector
+// part AND hands over to the scalar loop. Every lane is printed (never a checksum, except the two
+// reductions, which are the point of their kernels), and every expectation was derived by hand
+// from the scalar semantics of the loop:
+//
+//   normalize  o = px*0.25 - 3.0 printed as o*4 = px - 12, px = (29j + 7) mod 256.
+//   quantize   q = (x*4) as i8, u = (x*4) as u8: truncate toward zero, then SATURATE to
+//              [-128, 127] / [0, 255]; x = f32(f32(j - 18) * f32(2.9)) spans about +-52, so
+//              x*4 crosses both bounds of both types.
+//   dot8       sum of a*b in i32, a = (11j - 128) as i8, b = (127 - 13j) as i8 (both wrap).
+//   shifts     x >> 3 (arithmetic) and x << 2 (wrapping) at i8, x = (7j - 120) as i8 -- negative
+//              values included; the amount is the same in every lane, which is what the vector
+//              shift takes.
+//   mul8       x * y wrapping at i8, y = (5j + 3) as i8: x86 has no packed byte multiply, so the
+//              vector form multiplies in i16 halves and truncates back.
+//   sum64      an f32 stream accumulated in f64 (serial, never reassociated), x = j*0.5 - 4,
+//              printed as 2*sum.
+//   narrow16   (x*3 + 7) wrapping at i32, then truncated to i16, x = (j - 18)*4099.
+//
+// Re-check that the loops really widen (this fixture alone cannot see that -- interp and native
+// agree whether or not they do):
+//     wukongc --emit=mir -O2 tests/run/vectorized_mixed_widths.wk | grep -E "widen|narrow"
+
+fn normalize(px: []u8, mut o: []f32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        o[i] = (px[i] as f32) * 0.25 - 3.0;
+        i = i + 1;
+    }
+}
+
+fn quantize(x: []f32, mut q: []i8, mut u: []u8, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        q[i] = (x[i] * 4.0) as i8;
+        u[i] = (x[i] * 4.0) as u8;
+        i = i + 1;
+    }
+}
+
+fn dot8(a: []i8, b: []i8, n: i64) -> i32 {
+    let mut s: i32 = 0;
+    let mut i: i64 = 0;
+    while i < n {
+        s = s + (a[i] as i32) * (b[i] as i32);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn shifts(x: []i8, mut a: []i8, mut b: []i8, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        a[i] = x[i] >> (3 as i8);
+        b[i] = x[i] << (2 as i8);
+        i = i + 1;
+    }
+}
+
+fn mul8(x: []i8, y: []i8, mut o: []i8, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        o[i] = x[i] * y[i];
+        i = i + 1;
+    }
+}
+
+fn sum64(x: []f32, n: i64) -> f64 {
+    let mut s: f64 = 0.0;
+    let mut i: i64 = 0;
+    while i < n {
+        s = s + (x[i] as f64);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn narrow16(x: []i32, mut o: []i16, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        o[i] = (x[i] * 3 + 7) as i16;
+        i = i + 1;
+    }
+}
+
+fn main() -> i32 {
+    let n: i64 = 37;
+    let mut px: []u8 = alloc_u8(n);
+    let mut of: []f32 = alloc_f32(n);
+    let mut xf: []f32 = alloc_f32(n);
+    let mut q: []i8 = alloc_i8(n);
+    let mut u: []u8 = alloc_u8(n);
+    let mut a8: []i8 = alloc_i8(n);
+    let mut b8: []i8 = alloc_i8(n);
+    let mut x8: []i8 = alloc_i8(n);
+    let mut y8: []i8 = alloc_i8(n);
+    let mut r8: []i8 = alloc_i8(n);
+    let mut s8: []i8 = alloc_i8(n);
+    let mut h: []f32 = alloc_f32(n);
+    let mut x32: []i32 = alloc_i32(n);
+    let mut o16: []i16 = alloc_i16(n);
+    let mut j: i64 = 0;
+    while j < n {
+        px[j] = (j * 29 + 7) as u8;
+        xf[j] = ((j as f32) - 18.0) * 2.9;
+        a8[j] = (j * 11 - 128) as i8;
+        b8[j] = (127 - j * 13) as i8;
+        x8[j] = (j * 7 - 120) as i8;
+        y8[j] = (j * 5 + 3) as i8;
+        h[j] = (j as f32) * 0.5 - 4.0;
+        x32[j] = ((j - 18) * 4099) as i32;
+        j = j + 1;
+    }
+
+    normalize(px, of, n);
+    j = 0;
+    while j < n {
+        print((of[j] * 4.0) as i32);
+        j = j + 1;
+    }
+
+    quantize(xf, q, u, n);
+    j = 0;
+    while j < n {
+        print(q[j] as i32);
+        print(u[j] as i32);
+        j = j + 1;
+    }
+
+    print(dot8(a8, b8, n));
+
+    shifts(x8, r8, s8, n);
+    j = 0;
+    while j < n {
+        print(r8[j] as i32);
+        print(s8[j] as i32);
+        j = j + 1;
+    }
+
+    mul8(x8, y8, r8, n);
+    j = 0;
+    while j < n {
+        print(r8[j] as i32);
+        j = j + 1;
+    }
+
+    print((sum64(h, n) * 2.0) as i64);
+
+    narrow16(x32, o16, n);
+    j = 0;
+    while j < n {
+        print(o16[j] as i32);
+        j = j + 1;
+    }
+
+    free(px);
+    free(of);
+    free(xf);
+    free(q);
+    free(u);
+    free(a8);
+    free(b8);
+    free(x8);
+    free(y8);
+    free(r8);
+    free(s8);
+    free(h);
+    free(x32);
+    free(o16);
+    return 0;
+}
