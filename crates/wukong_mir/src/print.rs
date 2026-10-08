@@ -124,6 +124,7 @@ fn fmt_op(op: &Op, interner: &Interner) -> String {
         Op::Iota(ty) => format!("iota {}", ty.display()),
         Op::Fma(a, b, c) => format!("fma {}, {}, {}", val(*a), val(*b), val(*c)),
         Op::Sqrt(a) => format!("sqrt {}", val(*a)),
+        Op::IntUnary(op, a) => format!("{} {}", op.name(), val(*a)),
         Op::VecKernelCall {
             kernel,
             ptrs,

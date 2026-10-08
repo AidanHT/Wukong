@@ -15,7 +15,7 @@ pub mod verify;
 
 pub use builder::Builder;
 pub use inst::{
-    switch_case_value, AddrSpace, BinOp, CastKind, CmpOp, Inst, Op, RoundMode, SwitchCase,
+    switch_case_value, AddrSpace, BinOp, CastKind, CmpOp, Inst, IntUnOp, Op, RoundMode, SwitchCase,
     Terminator,
 };
 pub use vec_kernel::{

@@ -1183,6 +1183,18 @@ impl<'a> FnTranslator<'a> {
                     wukong_mir::RoundMode::Trunc => self.builder.ins().trunc(x),
                 }
             }
+            // One scalar integer instruction each (x64: `popcnt`/`lzcnt`/`tzcnt`/`bswap`, or the
+            // backend's fallback sequence where the CPU lacks the extension). The result has the
+            // operand's type; the verifier admits only i8..i64 scalars, and no i8 `bswap`.
+            Op::IntUnary(op, v) => {
+                let x = self.val(*v);
+                match op {
+                    wukong_mir::IntUnOp::Popcnt => self.builder.ins().popcnt(x),
+                    wukong_mir::IntUnOp::Clz => self.builder.ins().clz(x),
+                    wukong_mir::IntUnOp::Ctz => self.builder.ins().ctz(x),
+                    wukong_mir::IntUnOp::Bswap => self.builder.ins().bswap(x),
+                }
+            }
         };
         if let Some(r) = res {
             // Normalise the result to its declared type so `vmap[r]` always has the MIR type's

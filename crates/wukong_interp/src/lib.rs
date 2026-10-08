@@ -1553,6 +1553,14 @@ impl<'a, 'k> Interp<'a, 'k> {
             // sqrt stays bit-identical to the native `fsqrt`.
             Op::Sqrt(v) => apply_sqrt(reg(regs, *v), rty),
             Op::Round(mode, v) => apply_round(*mode, reg(regs, *v), rty),
+            // Bit counting / byte reversal on the operand's own-width bit pattern (the verifier
+            // admits scalar i8..i64 only). `IntUnOp::eval` is the definition the hardware
+            // instruction computes; `exec` re-canonicalizes the result to the type's width.
+            Op::IntUnary(op, v) => {
+                let bits = rty.map(int_bits).unwrap_or(64);
+                let x = uval(reg(regs, *v).as_int(), bits) as u64;
+                Value::Int(i128::from(op.eval(x, bits)))
+            }
         })
     }
 

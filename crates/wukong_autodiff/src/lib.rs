@@ -677,6 +677,7 @@ impl<'a> Vjp<'a> {
                 Op::Cast(_, a, _)
                 | Op::Neg(a)
                 | Op::Not(a)
+                | Op::IntUnary(_, a)
                 | Op::Splat(a)
                 | Op::ExtractLane(a, _) => stack.push(*a),
                 Op::Bin(_, a, b) | Op::Cmp(_, a, b) => {
@@ -1202,6 +1203,7 @@ pub(crate) fn map_operands(op: &Op, mut f: impl FnMut(ValueId) -> ValueId) -> Op
         Op::Fma(a, b, c) => Op::Fma(f(*a), f(*b), f(*c)),
         Op::Sqrt(v) => Op::Sqrt(f(*v)),
         Op::Round(m, v) => Op::Round(*m, f(*v)),
+        Op::IntUnary(o, v) => Op::IntUnary(*o, f(*v)),
         Op::VecKernelCall {
             kernel,
             ptrs,
@@ -1241,6 +1243,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::Fma(..) => "fma",
         Op::Sqrt(..) => "sqrt",
         Op::Round(..) => "round",
+        Op::IntUnary(o, _) => o.name(),
         Op::VecKernelCall { .. } => "veckernel",
     }
 }

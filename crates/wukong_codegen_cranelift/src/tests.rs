@@ -6583,3 +6583,78 @@ fn switch_terminator_matches_the_oracle() {
     let native = crate::jit_run(&program, main_name, &interner).unwrap();
     assert_eq!(native, (0, expected), "native");
 }
+
+/// `Op::IntUnary` (the `popcount`/`clz`/`ctz`/`bswap` builtins) on every integer width: the native
+/// instruction agrees with `IntUnOp::eval` — the bit-pattern definition the interpreter executes,
+/// whose own values are hand-derived in `wukong_mir` — on zero, one, a lone low-byte top bit, a
+/// mixed pattern, all-ones and the sign bit, and the interpreter agrees with native on stdout.
+#[test]
+fn int_unary_matches_its_definition_on_every_width() {
+    use wukong_mir::{Builder, CastKind, IntUnOp, MirType, Op, Program};
+    let mut interner = Interner::new();
+    let main_name = interner.intern("main");
+    let print = interner.intern("print");
+    let widths = [
+        (MirType::I8, 8u32),
+        (MirType::I16, 16),
+        (MirType::I32, 32),
+        (MirType::I64, 64),
+    ];
+    let ops = [IntUnOp::Popcnt, IntUnOp::Clz, IntUnOp::Ctz, IntUnOp::Bswap];
+    let inputs: [u64; 6] = [
+        0,
+        1,
+        0x80,
+        0x0123_4567_89AB_CDEF,
+        u64::MAX,
+        0x8000_0000_0000_0000,
+    ];
+    let mut program = Program::new();
+    let mut m = Builder::new(main_name, MirType::I32);
+    let mut expected = String::new();
+    for (ty, bits) in &widths {
+        for op in ops {
+            if op == IntUnOp::Bswap && *bits == 8 {
+                continue; // no i8 bswap: the front end lowers `bswap` of a byte to the byte
+            }
+            let fname = interner.intern(&format!("{}_{bits}", op.name()));
+            let mut b = Builder::new(fname, ty.clone());
+            let x = b.add_param(ty.clone());
+            let r = b.build(ty.clone(), Op::IntUnary(op, x));
+            b.ret(Some(r));
+            program.funcs.push(b.finish());
+            for &input in &inputs {
+                // The canonical (sign-extended) image of the operand's low `bits` bits.
+                let shift = 128 - *bits;
+                let canon = ((input as i128) << shift) >> shift;
+                let c = m.build(ty.clone(), Op::ConstInt(canon, ty.clone()));
+                let v = m.build(
+                    ty.clone(),
+                    Op::Call {
+                        func: fname,
+                        args: vec![c],
+                    },
+                );
+                let wide = if *bits == 64 {
+                    v
+                } else {
+                    m.build(MirType::I64, Op::Cast(CastKind::ZExt, v, MirType::I64))
+                };
+                m.build_void(Op::Call {
+                    func: print,
+                    args: vec![wide],
+                });
+                expected.push_str(&format!("{}\n", op.eval(input, *bits) as i64));
+            }
+        }
+    }
+    let zero = m.build(MirType::I32, Op::ConstInt(0, MirType::I32));
+    m.ret(Some(zero));
+    program.funcs.push(m.finish());
+    let errors = wukong_mir::verify::verify_program(&program);
+    assert!(errors.is_empty(), "{errors:?}");
+    let oracle = wukong_interp::run_with_output(&program, main_name, &interner).unwrap();
+    assert_eq!(oracle, (0, expected.clone().into_bytes()), "interpreter");
+    let native = crate::jit_run(&program, main_name, &interner).unwrap();
+    assert_eq!(native, (0, expected.into_bytes()), "native");
+}

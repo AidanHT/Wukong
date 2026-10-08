@@ -391,6 +391,7 @@ enum Key {
     Fma(u32, u32, u32),
     Sqrt(u32),
     Round(u8, u32),
+    IntUnary(u8, u32),
     /// A call to a callee that reads nothing the caller can see, by symbol and interned arguments:
     /// its result is a function of the argument values alone.
     PureCall(u32, u32),
@@ -950,6 +951,7 @@ impl Numbering<'_> {
             Op::Fma(a, b, c) => Key::Fma(m(*a), m(*b), m(*c)),
             Op::Sqrt(a) => Key::Sqrt(m(*a)),
             Op::Round(mode, a) => Key::Round(*mode as u8, m(*a)),
+            Op::IntUnary(op, a) => Key::IntUnary(*op as u8, m(*a)),
             Op::Load(..)
             | Op::Store { .. }
             | Op::Call { .. }

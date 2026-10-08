@@ -479,7 +479,8 @@ fn safe_to_hoist(op: &Op, mem: &LoopMem) -> bool {
         | Op::Iota(..)
         | Op::Fma(..)
         | Op::Sqrt(..)
-        | Op::Round(..) => true,
+        | Op::Round(..)
+        | Op::IntUnary(..) => true,
         // Integer division/remainder can trap on a zero divisor, so they are not speculatable.
         Op::Bin(b, ..) => !matches!(b, BinOp::SDiv | BinOp::UDiv | BinOp::SRem | BinOp::URem),
         // A speculatable callee always returns, reads nothing and cannot trap: with invariant
