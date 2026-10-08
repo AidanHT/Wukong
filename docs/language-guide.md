@@ -118,7 +118,7 @@ already did (`tests/run/binary_const_adapt.wk`); the folded value is still range
 `let v: i8 = 100 + 100` is rejected. A typed value must match its
 annotation exactly (see error `E0401`) — and for an aggregate that means the shape too: an array
 literal and an array **repeat** initializer must both supply exactly the annotated length, so
-`let a: [i32; 4] = [7; 2];` is `E0401`, not a slot silently filled out to 4. An unsuffixed literal
+`let a: [i32; 4] = [7; 2];` is `E0401`, not a slot silently filled out to 4. A repeat `[v; n]` evaluates `v` **once** and copies it into every slot, for an aggregate element too: `[make(); 3]` calls `make` once (`tests/run/array_repeat_aggregate_once.wk`). An unsuffixed literal
 that does not fit the type it adapts to
 is rejected (`E0401`, e.g. `let x: i8 = 200;`, or `s.x = 9000000000;` for an `i32` field), not
 silently wrapped. With **no** annotation an unsuffixed integer literal defaults to `i32`, but one that
@@ -937,6 +937,15 @@ wukongc [OPTIONS] <input.wk>
                       <stem>.o for objects; executables get <stem>.exe on Windows and plain <stem>
                       on unix). Rejected with --run and with every other stage, which print their
                       artifact on stdout — redirect instead.
+--verify-each         verify MIR after every optimizer pass (also in release builds)
+--time-passes         print per-stage compile times to stderr when the compile ends, with the
+                      optimizer's per-pass and Cranelift's codegen/object-write splits and a MIR
+                      size summary (heaviest functions); one JSON line under --error-format=json
+--time-trace=<f>      write the same timings to <f> as Chrome trace-event JSON
+                      (chrome://tracing, Perfetto, speedscope)
+--depfile=<f>         write a Make-syntax dependency file (root + every import, plus an empty rule
+                      per import as gcc -MP does); target = the -o artifact for --emit=obj/exe,
+                      otherwise <f> itself. Rejected with --emit=tokens/ast (they stop before imports)
 --error-format=<f>    human | json   (default: human)
 --explain <CODE>      print an extended explanation for an error code
 --color=<when>        auto | always | never   (default: auto — colour when stderr is a terminal)

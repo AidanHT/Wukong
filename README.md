@@ -38,7 +38,8 @@ wukongc --emit=exe -O2 --target-cpu=x86-64 examples/fib.wk  # portable AOT execu
 
 `--run` defaults to the interpreter; add `--backend=native` for the Cranelift JIT. GPU backends
 require building with `--features gpu` and a CUDA device. See `wukongc --help` for `--emit`,
-`-O0`…`-O3`, `--grad-of` / `--train`, and the rest of the CLI.
+`-O0`…`-O3`, `--grad-of` / `--train`, and the rest of the CLI; `--time-passes` shows where a
+compile's time went, and `--depfile=<f>` writes a Make dependency rule over the imported files.
 
 ## Why Wukong
 

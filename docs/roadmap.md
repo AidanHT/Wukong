@@ -507,6 +507,13 @@ another architecture or OS is not supported. A native-backend failure is a catal
   verify *after* dumping on purpose, so a broken program still prints the MIR that explains why).
   Across the run suite and kernels it removes ~42% of IR ops
   (~48–54% on the heavy transformer/GEMM kernels) and runs ~1.5–2.5x faster than `-O0`.
+- Compile-time self-reporting and build integration: `--time-passes` (per-stage table on stderr,
+  with per-optimizer-pass and Cranelift codegen/object-write splits and the heaviest MIR functions;
+  one JSON line under `--error-format=json`), `--time-trace=<f>` (Chrome trace-event JSON) and
+  `--depfile=<f>` (Make rule naming the root and every imported file). `--run`/`--emit=exe` compile
+  only what `main` reaches; `-O0` native code is built at Cranelift `opt_level=none`, and the JIT
+  compiles functions in parallel. Not yet: several artifacts from one `--emit=a,b` invocation (each
+  stage is still its own compile), per-function timing in the trace, or a parallel optimizer.
 
 ## GPU backend (NVIDIA, behind `--features gpu`) — RTX 4050 (`sm_89`) and H100 (`sm_90a`)
 

@@ -136,6 +136,21 @@ the ICE lines go to stderr first and a failure only changes the exit code — so
 prints the MIR that shows why. `wukong_opt`'s per-pass verify-each is `#[cfg(debug_assertions)]`, so
 in a release compiler this gate is the only verification that runs.
 
+**Compile-time shape of a compile.** For `--run` and `--emit=exe` (one entry point, `main`) the driver
+drops every function `main` cannot reach through calls or `FuncAddr` after lowering
+(`wukong_driver::prune`); `--emit=obj` exports everything and the MIR dumps, autodiff stages and
+`--backend=gpu-native` keep the whole program. The native backend follows the source level:
+`-O0` builds the Cranelift ISA at `opt_level=none`, `-O1`+ at `speed` (`BackendOpt`), and both the JIT
+and the object path compile functions in parallel (`WUKONG_PAR_CODEGEN=0` serializes). Lowering
+keeps aggregate copies straight-line only when a gradient was requested
+(`LowerOptions::unroll_for_autodiff`), capped at 1 KiB per operation. `--time-passes` (stderr table,
+or one JSON line under `--error-format=json`) and `--time-trace=<f>` (Chrome trace JSON) report what a
+compile spent per stage, with the optimizer's per-pass breakdown (`optimize_timed`, byte-identical
+MIR), Cranelift's codegen/object-write split and the heaviest MIR functions (`wukong_driver::report`).
+The timer is inert unless asked for and reports from its `Drop`, so every exit path prints.
+`--depfile=<f>` writes a Make rule over the `SourceMap`'s files — exactly the root and each import
+the loader read — with gcc `-MP`-style empty rules for the imports.
+
 ## Diagnostics
 
 Every diagnostic has a stable code (`E01xx` lexer, `E02xx` parser, `E03xx` name res, `E04xx` types,

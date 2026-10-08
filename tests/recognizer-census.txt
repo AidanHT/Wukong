@@ -33,6 +33,7 @@ array.wk:
 array_assign_extent.wk:
 array_of_struct.wk:
 array_of_tuple.wk:
+array_repeat_aggregate_once.wk:
 assert.wk:
 assert_fail.wk:
 atan.wk: wukong_vmath_f32
