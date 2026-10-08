@@ -516,58 +516,6 @@ static CATALOG: &[Explanation] = &[
          the function directly at each call instead."
     ),
     entry!(
-        "E0440",
-        "mixed-type arithmetic with no lossless common type",
-        "An arithmetic or bitwise operator combines two values of different scalar types, and no \
-         type holds every value of both: `i32` with `u32` (or any signed with an unsigned type at \
-         least as wide), an integer with a float that cannot represent all of it exactly (`i32` \
-         with `f32`, `i64` with `f64`), `f16` with `bf16`, or `char` with any other type. Such an \
-         operation used to pick a type by width and then by operand ORDER, so `a / b` and `b / a` \
-         could compute in different types and `u32 / i64` divided UNSIGNED (`7 / -2 == 0`). \
-         Implicit promotion now only widens, and in either order: integers of one signedness to the \
-         wider one, an unsigned integer to a strictly wider signed one (`u32 + i64` is `i64`), \
-         `f16`/`bf16` to `f32` to `f64`, and an integer to a float that holds it exactly (8- and \
-         16-bit integers to `f32`, up to 32-bit integers to `f64`). A signed value known never to \
-         be negative — a `for` counter that starts at a non-negative literal and is never \
-         assigned, or a non-negative `const` — also converts to an unsigned type at least as wide, \
-         so `i * n` with `n: usize` stays legal. An unsuffixed literal adapts to the other operand \
-         and never needs a cast; `<<`/`>>` take any integer amount. Convert an operand with `as` \
-         to the type the result should have.",
-        bad: "module ex.e0440\nfn ratio(a: u32, b: i32) -> i32 {\n    return a / b;\n}\nfn main() -> i32 {\n    return ratio(7, -2);\n}\n",
-        good: "module ex.e0440\nfn ratio(a: u32, b: i32) -> i64 {\n    return (a as i64) / (b as i64);\n}\nfn main() -> i32 {\n    return ratio(7, -2) as i32;\n}\n"
-    ),
-    entry!(
-        "E0441",
-        "compound assignment would not fit back into its place",
-        "A compound assignment `x op= v` means `x = x op v`, so the value it stores is the result of \
-         `x op v`, and that must have `x`'s own type — the rule a plain assignment already follows. \
-         So `v` may be of `x`'s type, of a type that promotes into it losslessly (`i64 += i32`, \
-         `f64 += f32`, `i32 += u8`; see E0440), or an unsuffixed literal (which must fit an \
-         integer place). An operand that is wider (`f32 += f64`, `i32 += i64`), of the other kind \
-         (`i32 += f32`) or of an incomparable type (`i32 += u32`) is rejected: the compound form used \
-         to convert the operand down to the place first, so `s += x` with `s: f32` and `x: f64` \
-         silently accumulated in `f32`, and `acc += -1.0` on an integer `acc` changed nothing. Convert \
-         the operand with `as`, or give the place the wider type. A `let` initialized from a bare \
-         literal and not annotated — `let mut s = 0.0;` — takes its type from its first such use, \
-         so it becomes an `f64` accumulator here with no annotation. A shift (`<<=`, `>>=`) takes an \
-         amount of any integer type.",
-        bad: "module ex.e0441\nfn total(x: f64) -> f32 {\n    let mut s: f32 = 0.5;\n    s += x;\n    return s;\n}\nfn main() -> i32 {\n    return total(1.5) as i32;\n}\n",
-        good: "module ex.e0441\nfn total(x: f64) -> f64 {\n    let mut s = 0.5;\n    s += x;\n    return s;\n}\nfn main() -> i32 {\n    return total(1.5) as i32;\n}\n"
-    ),
-    entry!(
-        "E0442",
-        "refutable pattern in `let`",
-        "The pattern of a plain `let` must match every value of its type, because the names it binds \
-         have to exist afterwards. `let Shape::Circle { r } = s;` leaves `r` unbound when `s` is \
-         any other shape, and `let (0, x) = t;` when `t.0` is not 0, so both are rejected; the \
-         diagnostic names a value the pattern misses, found by the same analysis as E0405. Use \
-         `let … else` to leave the enclosing function or loop when the value does not match — \
-         `let Shape::Circle { r } = s else { return 0.0; };` — or a `match`. Destructuring patterns \
-         that cannot fail are fine: a tuple, struct or array of names (`let (a, b) = t;`, \
-         `let Point { x, y } = p;`, `let [first, .., last] = a;`), and the single variant of a \
-         one-variant enum.",
-        bad: "module ex.e0442\nenum Shape { Circle(i32), Square(i32) }\nfn radius(s: Shape) -> i32 {\n    let Shape::Circle(r) = s;\n    return r;\n}\nfn main() -> i32 {\n    return radius(Shape::Circle(3));\n}\n",
-        good: "module ex.e0442\nenum Shape { Circle(i32), Square(i32) }\nfn radius(s: Shape) -> i32 {\n    let Shape::Circle(r) = s else {\n        return 0;\n    };\n    return r;\n}\nfn main() -> i32 {\n    return radius(Shape::Circle(3));\n}\n"
         "E0430",
         "struct literal field error",
         "A struct literal (and a struct-payload enum variant, `E::V { .. }`) initializes every field \
@@ -660,6 +608,62 @@ static CATALOG: &[Explanation] = &[
          dimension. The message names the argument and what it must be.",
         bad: "module ex.e0437\nfn main() -> i32 {\n    let s = alloc_f32(2.5);\n    free(s);\n    return 0;\n}\n",
         good: "module ex.e0437\nfn main() -> i32 {\n    let s = alloc_f32(4);\n    free(s);\n    return 0;\n}\n"
+    ),
+    entry!(
+        "E0440",
+        "mixed-type arithmetic with no lossless common type",
+        "An arithmetic or bitwise operator combines two values of different scalar types, and no \
+         type holds every value of both: `i32` with `u32` (or any signed with an unsigned type at \
+         least as wide), an integer with a float that cannot represent all of it exactly (`i32` \
+         with `f32`, `i64` with `f64`), `f16` with `bf16`, or `char` with any other type. Such an \
+         operation used to pick a type by width and then by operand ORDER, so `a / b` and `b / a` \
+         could compute in different types and `u32 / i64` divided UNSIGNED (`7 / -2 == 0`). \
+         Implicit promotion now only widens, and in either order: integers of one signedness to the \
+         wider one, an unsigned integer to a strictly wider signed one (`u32 + i64` is `i64`), \
+         `f16`/`bf16` to `f32` to `f64`, and an integer to a float that holds it exactly (8- and \
+         16-bit integers to `f32`, up to 32-bit integers to `f64`). A signed value known never to \
+         be negative — a `for` counter that starts at a non-negative literal and is never \
+         assigned, or a non-negative `const` — also converts to an unsigned type at least as wide, \
+         so `i * n` with `n: usize` stays legal. An unsuffixed literal adapts to the other operand \
+         and never needs a cast; `<<`/`>>` take any integer amount. Convert an operand with `as` \
+         to the type the result should have.",
+        bad: "module ex.e0440\nfn ratio(a: u32, b: i32) -> i32 {\n    return a / b;\n}\nfn main() -> i32 {\n    return ratio(7, -2);\n}\n",
+        good: "module ex.e0440\nfn ratio(a: u32, b: i32) -> i64 {\n    return (a as i64) / (b as i64);\n}\nfn main() -> i32 {\n    return ratio(7, -2) as i32;\n}\n"
+    ),
+    entry!(
+        "E0441",
+        "compound assignment would not fit back into its place",
+        "A compound assignment `x op= v` means `x = x op v`, so the value it stores is the result of \
+         `x op v`, and that must have `x`'s own type — the rule a plain assignment already follows. \
+         So `v` may be of `x`'s type, of a type that promotes into it losslessly (`i64 += i32`, \
+         `f64 += f32`, `i32 += u8`; see E0440), or an unsuffixed literal (which must fit an \
+         integer place). An operand that is wider (`f32 += f64`, `i32 += i64`), of the other kind \
+         (`i32 += f32`) or of an incomparable type (`i32 += u32`) is rejected: the compound form used \
+         to convert the operand down to the place first, so `s += x` with `s: f32` and `x: f64` \
+         silently accumulated in `f32`, and `acc += -1.0` on an integer `acc` changed nothing. Convert \
+         the operand with `as`, or give the place the wider type. A `let` initialized from a bare \
+         literal and not annotated — `let mut s = 0.0;` — takes its type from its first such use, \
+         so it becomes an `f64` accumulator here with no annotation. A shift (`<<=`, `>>=`) takes an \
+         amount of any integer type.",
+        bad: "module ex.e0441\nfn total(x: f64) -> f32 {\n    let mut s: f32 = 0.5;\n    s += x;\n    return s;\n}\nfn main() -> i32 {\n    return total(1.5) as i32;\n}\n",
+        good: "module ex.e0441\nfn total(x: f64) -> f64 {\n    let mut s = 0.5;\n    s += x;\n    return s;\n}\nfn main() -> i32 {\n    return total(1.5) as i32;\n}\n"
+    ),
+    entry!(
+        "E0442",
+        "refutable pattern in `let`",
+        "The pattern of a plain `let` must match every value of its type, because the names it binds \
+         have to exist afterwards. `let Shape::Circle { r } = s;` leaves `r` unbound when `s` is \
+         any other shape, and `let (0, x) = t;` when `t.0` is not 0, so both are rejected; the \
+         diagnostic names a value the pattern misses, found by the same analysis as E0405. Use \
+         `let … else` to leave the enclosing function or loop when the value does not match — \
+         `let Shape::Circle { r } = s else { return 0.0; };` — or a `match`. Destructuring patterns \
+         that cannot fail are fine: a tuple, struct or array of names (`let (a, b) = t;`, \
+         `let Point { x, y } = p;`, `let [first, .., last] = a;`), and the single variant of a \
+         one-variant enum.",
+        bad: "module ex.e0442\nenum Shape { Circle(i32), Square(i32) }\nfn radius(s: Shape) -> i32 {\n    let Shape::Circle(r) = s;\n    return r;\n}\nfn main() -> i32 {\n    return radius(Shape::Circle(3));\n}\n",
+        good: "module ex.e0442\nenum Shape { Circle(i32), Square(i32) }\nfn radius(s: Shape) -> i32 {\n    let Shape::Circle(r) = s else {\n        return 0;\n    };\n    return r;\n}\nfn main() -> i32 {\n    return radius(Shape::Circle(3));\n}\n"
+    ),
+    entry!(
         "E0448",
         "value has no printed form",
         "`print`, `println`, `print_raw`, `eprint`, `eprintln` and every `printf` / `eprintf` / \
