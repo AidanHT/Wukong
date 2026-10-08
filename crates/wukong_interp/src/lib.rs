@@ -5916,3 +5916,9 @@ mod kernel_extent_marshalling_tests;
 
 #[cfg(test)]
 mod transfer_bounds_tests;
+
+#[cfg(test)]
+mod scalar_contract_tests;
+
+#[cfg(test)]
+mod runtime_surface_tests;
