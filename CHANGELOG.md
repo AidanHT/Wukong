@@ -5,6 +5,19 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Scalar builtins: integer bit ops, saturating/overflow arithmetic, float bits, special functions, FP8 (`gap2/scalar-intrinsics-and-types`)
+
+- New builtins: `clamp`, `fma` (one rounding), `popcount`/`clz`/`ctz`/`bswap` (one instruction each,
+  a new `Op::IntUnary`), `rotl`/`rotr`, `sat_add`/`sat_sub`/`sat_cast::<T>`, `mulhi`,
+  `widening_mul`, `overflowing_add`/`_sub`/`_mul -> (T, bool)`, `bits`/`f32_from_bits`/
+  `f64_from_bits`/`f16_from_bits`/`bf16_from_bits`, `isnan`/`isinf`/`isfinite`/`signbit`,
+  `copysign`, `ldexp`, `frexp`, `erfc`/`erfinv`/`lgamma` (f64 runtime, ≤ 3 ULP), `logaddexp`, and
+  OCP FP8 `f8e4m3_to_f32`/`f8e5m2_to_f32`/`f32_to_f8e4m3`/`f32_to_f8e5m2` on `u8` storage.
+- **Breaking:** `fmax`/`fmin` on an integer variable is now `E0445` (it rounded integers above 2^24
+  through `f32`); use `max`/`min`. New codes `E0446` (wrong operand kind or bit width for an integer
+  builtin) and `E0447` (mixed integer types where the type is the result). A `u128`/`i128` literal
+  suffix is `E0401` (there is no 128-bit type).
+
 ### Optimizer memory passes: SROA, path DSE, loop deletion, guarded LICM, scalar promotion (`gap/opt-memory`)
 
 - **SROA** (`-O2`, ahead of mem2reg): an array/struct/tuple local whose every access is at a constant

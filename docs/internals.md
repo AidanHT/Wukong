@@ -268,10 +268,12 @@ terminator visitor handle it (the `gpu-native` lowering declines it). `Op` has 2
 (`ConstInt`/`ConstFloat`), `Bin`/`Cmp`/`Cast`, the unary `Neg`/`Not`, `Select`, memory
 (`Alloca`/`Load`/`Store`/`Gep`), `Call`, `Barrier` (cooperative thread-block fence from
 `sync_block()`), the float/SIMD primitives
-(`Splat`/`ExtractLane`/`Iota`/`Fma`/`Sqrt`/`Round`), the address-of ops (`FuncAddr`, `GlobalAddr`),
-and `VecKernelCall`. Of the SIMD three, `Splat` broadcasts one scalar to every lane, `ExtractLane`
-reads one lane back out (the only way from vector to scalar form, and what keeps a widened float
-reduction's accumulate serial), and `Iota` is the lane-index ramp `<0, 1, .., n-1>` — the one
+(`Splat`/`ExtractLane`/`Iota`/`Fma`/`Sqrt`/`Round`), `IntUnary` (`popcnt`/`clz`/`ctz`/`bswap` on a
+scalar `i8`..`i64`, semantics in `IntUnOp::eval`; no `i8` `bswap`, never widened by the vectorizer,
+declined by `gpu-native`), the address-of ops (`FuncAddr`, `GlobalAddr`), and `VecKernelCall`. Of
+the SIMD three, `Splat` broadcasts one scalar to every lane, `ExtractLane` reads one lane back out
+(the only way from vector to scalar form, and what keeps a widened float reduction's accumulate
+serial), and `Iota` is the lane-index ramp `<0, 1, .., n-1>` — the one
 non-uniform vector *source*, since every other op is lane-wise and so any expression over splatted
 scalars is the same in every lane. The loop vectorizer needs it to widen a body that reads its
 induction variable as a value rather than as an address: lane `k` is scalar iteration `i + k`, so
