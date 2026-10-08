@@ -598,8 +598,17 @@ report allocation errors. Some remaining paths still allocate infallibly; a diag
 possible resource-exhaustion case is not established.
 
 `run_with_output` returns `(exit_code, stdout)`; intrinsics like `print` format into the captured
-stdout buffer. `f32` ops are computed in `f32` (single rounding), and an `int → f32` cast rounds
-straight to `f32` (not via `f64`), so the interpreter matches native's single conversion bit-for-bit.
+stdout buffer. `wukongc --run` uses `run_streaming` instead (and the JIT `JitProgram::run_streaming`),
+which writes the same bytes through to the process's stdout as they are produced: per line on a
+terminal, in 64 KiB blocks into a pipe. Every printed value is rendered by `wukong_runtime::fmt` (the
+interpreter's `text_io.rs`, the JIT's `text_rt.rs` and a linked executable all call it), so a scalar
+prints at its own type (`f32` shortest round-trip, `bool` as `true`/`false`, `char` as its glyph) and
+`printf` / structural aggregate printing cannot differ between backends; `exit(code)` is an error
+carrying `wukong_runtime::process::EXIT_SENTINEL` in the interpreter and a recorded failure that
+returns through every caller on the JIT, reported as the run's exit code by both.
+
+`f32` ops are computed in `f32` (single rounding), and an `int → f32` cast rounds straight to `f32`
+(not via `f64`), so the interpreter matches native's single conversion bit-for-bit.
 Integer results are likewise normalized to their declared MIR width on every write (`i1` stays an
 unsigned 0/1), so two's-complement wrapping matches the machine; a `Load` is exempt because memory
 holds one typed value per slot and the compiler's byte-wise aggregate copies move wider payload slots
