@@ -63,8 +63,8 @@ Sema emits every `E03xx` / `E04xx` / `E05xx` except `E0305` (unresolved import �
 | band | codes | examples |
 |---|---|---|
 | `E03xx` resolution | `E0300`–`E0304`, `E0320`–`E0324` | duplicate def, name not found, immutability; unknown function / field / builtin method, calling a non-function, unknown type (`src/resolve.rs`) |
-| `E04xx` types | `E0401`–`E0405` | type mismatch, recursive types/consts, non-exhaustive `match` |
-| `E05xx` shapes | `E0501`–`E0504` | rank/index mismatch, dim/layout mismatch, arity, unknown dim |
+| `E04xx` types | `E0401`–`E0411`, `E0430`–`E0437` | type mismatch, recursive types/consts, non-exhaustive `match`; struct-literal fields, literals, escapes, operators, missing return value, enum payloads, conditions, builtin arguments |
+| `E05xx` shapes | `E0501`–`E0507`, `E0520` | rank/index mismatch, dim/layout mismatch, arity, unknown dim, derived extents, views; a call dimension nothing fixes |
 
 Prose lives in `wukong_diag/src/catalog.rs` — codes are stable; never renumber.
 

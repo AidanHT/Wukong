@@ -709,7 +709,7 @@ impl Sema<'_> {
                 None => {
                     self.error(
                         ga.span,
-                        "E0401",
+                        "E0437",
                         format!(
                             "`{builtin}` dimension `{}` is not a representable extent",
                             self.sym_str(*s)
@@ -730,7 +730,7 @@ impl Sema<'_> {
                         other => {
                             self.error(
                                 ga.span,
-                                "E0401",
+                                "E0437",
                                 format!(
                                     "a `{builtin}` dimension must be an integer, but `{}` has \
                                      type `{}`",
@@ -760,7 +760,7 @@ impl Sema<'_> {
             _ => {
                 self.error(
                     ga.span,
-                    "E0401",
+                    "E0437",
                     format!("a `{builtin}` turbofish argument must be an integer extent"),
                 );
                 None
@@ -814,7 +814,7 @@ impl Sema<'_> {
     }
 
     /// Classify buffer argument `arg_ty` of `builtin` (parameter `pname`), reporting a non-`f32`
-    /// element (`E0502`), a non-contiguous tensor (`E0502`) or a non-buffer (`E0401`).
+    /// element (`E0502`), a non-contiguous tensor (`E0502`) or a non-buffer (`E0437`).
     fn classify_builtin_operand(
         &mut self,
         arg_ty: &Ty,
@@ -896,7 +896,7 @@ impl Sema<'_> {
             other => {
                 self.error(
                     span,
-                    "E0401",
+                    "E0437",
                     format!(
                         "operand `{pname}` of `{builtin}` must be an `f32` buffer (a \
                          `Tensor[f32, ..]`, an `[f32; N]` array or a `[]f32` slice), found a value \
@@ -991,7 +991,7 @@ impl Sema<'_> {
                         Ty::Unknown | Ty::Error => {}
                         other => self.error(
                             args[i].span,
-                            "E0401",
+                            "E0437",
                             format!(
                                 "`{name}` of `{builtin}` must be a numeric scalar, found a value \
                                  of type `{}`",
@@ -1331,7 +1331,7 @@ impl Sema<'_> {
             {
                 self.error(
                     args[i].span,
-                    "E0401",
+                    "E0437",
                     format!(
                         "operand `{name}` of `sdpa` must be an `f32` buffer (a `Tensor[f32, ..]`, \
                          an `[f32; N]` array, a `[]f32` slice, or a reference to an array or slice), \
@@ -1353,7 +1353,7 @@ impl Sema<'_> {
                 Ty::Unknown | Ty::Error => {}
                 other => self.error(
                     args[i].span,
-                    "E0401",
+                    "E0437",
                     format!(
                         "`{what}` of `sdpa` must be an integer extent, found a value of type `{}`",
                         other.display(self.interner)
@@ -1366,7 +1366,7 @@ impl Sema<'_> {
             Ty::Unknown | Ty::Error => {}
             other => self.error(
                 args[6].span,
-                "E0401",
+                "E0437",
                 format!(
                     "`scale` of `sdpa` must be a numeric scalar, found a value of type `{}`",
                     other.display(self.interner)
@@ -1378,7 +1378,7 @@ impl Sema<'_> {
             Ty::Unknown | Ty::Error => {}
             other => self.error(
                 args[7].span,
-                "E0401",
+                "E0437",
                 format!(
                     "`causal` of `sdpa` must be an integer or `bool` flag, found a value of type \
                      `{}`",
@@ -1645,7 +1645,7 @@ mod tests {
         assert!(analyze(&wrong).1.contains(&"E0502"));
 
         let scalar = ok.replace("sdpa(q, q, q, o", "sdpa(1.0, q, q, o");
-        assert!(analyze(&scalar).1.contains(&"E0401"));
+        assert!(analyze(&scalar).1.contains(&"E0437"));
 
         let tensor =
             "fn f(q: Tensor[f32, 2, 2], mut o: Tensor[f32, 3, 2]) { sdpa(q, q, q, o, 2, 2, \

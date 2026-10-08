@@ -1,4 +1,4 @@
-// EXPECT-CODE: E0401
+// EXPECT-CODE: E0433
 module tests.fail.tensor_whole_arith
 
 // Whole-tensor arithmetic (`a + b` on two Tensor values) is not supported — it type-checks (the

@@ -413,9 +413,18 @@ static CATALOG: &[Explanation] = &[
     entry!(
         "E0401",
         "type mismatch",
-        "A value's type does not match the type required by its context — for example a `let` with \
-         an explicit annotation whose initializer has a different type. Unsuffixed numeric \
-         literals adapt to an annotation, but typed values must match exactly."
+        "A value's type does not match the type its context requires: a `let` annotation, an \
+         assignment's place, the function's declared return type, a call's parameter, a struct \
+         field, or the other arm of an `if`/`match`. Unsuffixed numeric literals adapt to the \
+         expected type, but typed values must match exactly — convert with `as`. A few other type \
+         errors carry this code too: an `as` cast between types that have no conversion, `break` \
+         with a value out of a loop whose value is discarded, a type too large to lay out, and an \
+         array longer than `u32::MAX` elements. The more specific families have codes of their \
+         own: struct-literal fields (`E0430`), literals (`E0431`), escapes (`E0432`), operators \
+         (`E0433`), a missing return value (`E0434`), enum payloads (`E0435`), conditions \
+         (`E0436`) and the arguments of builtins (`E0437`).",
+        bad: "module ex.e0401\nfn main() -> i32 {\n    let a: i64 = 5;\n    let b: i32 = a;\n    return b;\n}\n",
+        good: "module ex.e0401\nfn main() -> i32 {\n    let a: i64 = 5;\n    let b: i32 = a as i32;\n    return b;\n}\n"
     ),
     entry!(
         "E0402",
@@ -500,6 +509,100 @@ static CATALOG: &[Explanation] = &[
          non-function parameter; and a function-typed parameter may be neither `mut` nor named \
          after a builtin (`gelu`, `print`, …), whose name the compiler reads as the builtin. Pass \
          the function directly at each call instead."
+    ),
+    entry!(
+        "E0430",
+        "struct literal field error",
+        "A struct literal (and a struct-payload enum variant, `E::V { .. }`) initializes every field \
+         of its type exactly once and nothing else. A field the type does not have, a field written \
+         twice, and a field left out are each rejected — a missing field would otherwise be an \
+         uninitialized read. Rust's functional-update shorthand `..base` is not supported. A field \
+         VALUE of the wrong type is the plain mismatch `E0401`.",
+        bad: "module ex.e0430\nstruct Point { x: i32, y: i32 }\nfn main() -> i32 {\n    let p = Point { x: 7 };\n    return p.x;\n}\n",
+        good: "module ex.e0430\nstruct Point { x: i32, y: i32 }\nfn main() -> i32 {\n    let p = Point { x: 7, y: 0 };\n    return p.x;\n}\n"
+    ),
+    entry!(
+        "E0431",
+        "malformed or out-of-range literal",
+        "A numeric literal that does not parse (`0z12`, an empty radix `0x`, a bad digit `0b2`, \
+         `1.5e`), or an integer literal whose value does not fit the type it is used at — the type \
+         an unsuffixed literal adapts to from an annotation, a parameter, a field, an assignment, a \
+         return type or a `match` scrutinee (`let x: i8 = 200`) — is rejected instead of wrapping \
+         silently. A constant expression of literals is checked by its folded value \
+         (`let v: i8 = 100 + 100`). An enum discriminant must be such a constant and fit the \
+         32-bit enum representation. Use a wider type, or convert with `as`, which wraps by \
+         definition.",
+        bad: "module ex.e0431\nfn main() -> i32 {\n    let x: i8 = 200;\n    return x as i32;\n}\n",
+        good: "module ex.e0431\nfn main() -> i32 {\n    let x: i16 = 200;\n    return x as i32;\n}\n"
+    ),
+    entry!(
+        "E0432",
+        "invalid escape in a literal",
+        "A `\\` escape in a string or character literal must be one the language decodes: `\\n`, \
+         `\\r`, `\\t`, `\\\\`, `\\'`, `\\\"`, `\\0`, `\\xHH`, or `\\u{..}` — braces required and \
+         closed — naming a Unicode scalar value (at most `\\u{10FFFF}`, and not a surrogate in \
+         `\\u{D800}`..`\\u{DFFF}`). Any other escape used to decode to a string the source never \
+         wrote (`\"A\\dB\"` printed `AdB`). Write `\\\\` for a literal backslash.",
+        bad: "module ex.e0432\nfn main() -> i32 {\n    println(\"A\\dB\");\n    return 0;\n}\n",
+        good: "module ex.e0432\nfn main() -> i32 {\n    println(\"A\\\\dB\");\n    return 0;\n}\n"
+    ),
+    entry!(
+        "E0433",
+        "operator not defined for the operand type",
+        "An operator is applied to a value of a type it is not defined for: arithmetic, bitwise or \
+         shift operators on a struct, tuple, array, `()`, pointer (no pointer arithmetic — take \
+         `&a[i]`) or whole tensor (operate elementwise); arithmetic or ordered comparison on \
+         `bool`; bitwise, shift or `!`/`~` on a float; `==`/`!=` on an aggregate (compare its \
+         fields); a comparison of `bool` with a number or of signed with unsigned integers (a \
+         chained comparison `a < b < c` parses as `(a < b) < c`); a compound assignment such as \
+         `a += b` on an aggregate; `*x` on a non-pointer; and indexing `x[i]` on a scalar, struct \
+         or tuple, or with a `bool` index.",
+        bad: "module ex.e0433\nstruct P { x: i32 }\nfn main() -> i32 {\n    let a = P { x: 1 };\n    let b = P { x: 1 };\n    if a == b {\n        return 1;\n    }\n    return 0;\n}\n",
+        good: "module ex.e0433\nstruct P { x: i32 }\nfn main() -> i32 {\n    let a = P { x: 1 };\n    let b = P { x: 1 };\n    if a.x == b.x {\n        return 1;\n    }\n    return 0;\n}\n"
+    ),
+    entry!(
+        "E0434",
+        "missing return value",
+        "A function that declares a return type must produce a value on every path: its body can \
+         fall off its end (an `if` with no `else`, a loop that can exit), or a bare `return;` \
+         returns nothing. Either would hand the caller an uninitialized value. Return a value on \
+         every path, as in Rust.",
+        bad: "module ex.e0434\nfn pick(n: i32) -> i32 {\n    if n > 0 {\n        return 1;\n    }\n}\nfn main() -> i32 {\n    return pick(-5);\n}\n",
+        good: "module ex.e0434\nfn pick(n: i32) -> i32 {\n    if n > 0 {\n        return 1;\n    }\n    return 0;\n}\nfn main() -> i32 {\n    return pick(-5);\n}\n"
+    ),
+    entry!(
+        "E0435",
+        "enum variant payload misused",
+        "A variant is written or matched with a payload shape it does not have: a tuple variant \
+         constructed or destructured with the wrong number of fields (`Op::Add(1)` for \
+         `Add(i32, i32)`), a payload variant used bare as a value (`Op::Add`), a unit variant given \
+         a payload, or a tuple variant written with braces / a struct variant with parentheses. \
+         Write the variant the way it is declared.",
+        bad: "module ex.e0435\nenum Op { Add(i32, i32), Nop }\nfn main() -> i32 {\n    let a = Op::Add(1);\n    return 0;\n}\n",
+        good: "module ex.e0435\nenum Op { Add(i32, i32), Nop }\nfn main() -> i32 {\n    let a = Op::Add(1, 2);\n    return match a {\n        Op::Add(x, y) => x + y,\n        Op::Nop => 0,\n    };\n}\n"
+    ),
+    entry!(
+        "E0436",
+        "condition is not a boolean, number or pointer",
+        "The condition of an `if` or `while` must be a `bool`, a number (nonzero is true) or a \
+         pointer (non-null is true). A `()` value — a call of a function that returns nothing, an \
+         `if` with no `else` — or an aggregate, slice, tensor view, SIMD vector or function value \
+         has no truth value. Compare explicitly (`if s.len() > 0`).",
+        bad: "module ex.e0436\nfn nothing() {}\nfn main() -> i32 {\n    if nothing() {\n        return 1;\n    }\n    return 0;\n}\n",
+        good: "module ex.e0436\nfn ready() -> bool {\n    return true;\n}\nfn main() -> i32 {\n    if ready() {\n        return 1;\n    }\n    return 0;\n}\n"
+    ),
+    entry!(
+        "E0437",
+        "builtin argument of the wrong kind",
+        "A builtin was given an argument of a kind it cannot take: a math function (`sqrt`, `exp`, \
+         …) a struct, pointer or whole tensor; `alloc_<T>`/`scratch_<T>` a non-integer count; \
+         `free` something that is not a slice; `print` a `()` value or a whole tensor; a file-I/O \
+         builtin a path that is not a `*u8` string, an offset that is not an integer, or a buffer \
+         of the wrong element type or with a `?` dimension; an RNG builtin a float seed; a kernel \
+         builtin (`matmul`, `sdpa`, …) an operand that is not an `f32` buffer or a non-integer \
+         dimension. The message names the argument and what it must be.",
+        bad: "module ex.e0437\nfn main() -> i32 {\n    let s = alloc_f32(2.5);\n    free(s);\n    return 0;\n}\n",
+        good: "module ex.e0437\nfn main() -> i32 {\n    let s = alloc_f32(4);\n    free(s);\n    return 0;\n}\n"
     ),
     entry!(
         "E0501",

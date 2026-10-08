@@ -27,6 +27,12 @@ All notable changes to Wukong are documented here. The format is loosely based o
   extent) is reported at the call with the turbofish to write; it used to surface in lowering as
   `C0001`. A `const` named in a turbofish (`f::<W>(t)`) is now its value, as in a type, where it was
   an opaque variable that lowering replaced with the `?` argument's run-time extent.
+- **`E0401` split by rule into `E0430`–`E0437`.** Struct-literal field errors (`E0430`), malformed
+  or out-of-range literals and enum discriminants (`E0431`), invalid escapes (`E0432`), operators not
+  defined for their operand type (`E0433`), a missing return value (`E0434`), misused enum payloads
+  (`E0435`), non-boolean conditions (`E0436`) and builtin arguments of the wrong kind (`E0437`) each
+  have a stable code and an `--explain` page with a compile-tested example; `E0401` stays for plain
+  expected/found mismatches. The 45 affected `tests/fail` fixtures moved with their rule.
 
 ### Optimizer memory passes: SROA, path DSE, loop deletion, guarded LICM, scalar promotion (`gap/opt-memory`)
 

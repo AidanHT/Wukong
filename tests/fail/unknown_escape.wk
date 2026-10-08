@@ -1,4 +1,4 @@
-// EXPECT-CODE: E0401
+// EXPECT-CODE: E0432
 module tests.fail.unknown_escape
 
 // mir_build's `decode_escape` ends `Some(c) => c as u32`, so any escape outside

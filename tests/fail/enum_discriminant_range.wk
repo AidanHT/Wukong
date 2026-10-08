@@ -1,4 +1,4 @@
-// EXPECT-CODE: E0401
+// EXPECT-CODE: E0431
 module tests.fail.enum_discriminant_range
 
 // An enum value lowers to a 32-bit discriminant, so a discriminant outside the i32 range cannot be

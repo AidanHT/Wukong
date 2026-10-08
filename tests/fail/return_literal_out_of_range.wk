@@ -1,4 +1,4 @@
-// EXPECT-CODE: E0401
+// EXPECT-CODE: E0431
 module tests.fail.return_literal_out_of_range
 
 // An integer literal returned where a narrower type is declared used to be silently truncated to its

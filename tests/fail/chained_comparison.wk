@@ -1,4 +1,4 @@
-// EXPECT-CODE: E0401
+// EXPECT-CODE: E0433
 module tests.fail.chained_comparison
 
 // `1 < a < 2` parses left-associatively as `(1 < a) < 2`. The inner `1 < a` is a `bool`, so the

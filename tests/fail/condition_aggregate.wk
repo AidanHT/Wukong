@@ -1,4 +1,4 @@
-// EXPECT-CODE: E0401
+// EXPECT-CODE: E0436
 module tests.fail.condition_aggregate
 
 // A slice (like any aggregate, tensor view, SIMD vector or function value) has no truth value. A

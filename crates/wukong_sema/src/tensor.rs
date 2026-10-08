@@ -369,24 +369,30 @@ impl Sema<'_> {
         )
     }
 
-    /// `E0401` when either operand of binary `op` is a whole tensor. Returns whether it reported.
+    /// `E0433` when either operand of binary `op` is a whole tensor. Returns whether it reported.
     pub(crate) fn reject_tensor_operands(&mut self, l: &Ty, r: &Ty, op: BinOp, span: Span) -> bool {
         let Some(t) = [l, r].into_iter().find(|t| matches!(t, Ty::Tensor { .. })) else {
             return false;
         };
         let msg = self.whole_tensor_message(t, &format!("binary operator `{}`", op.glyph()));
-        self.error(span, "E0401", msg);
+        self.error(span, "E0433", msg);
         true
     }
 
-    /// `E0401` when `t` is a whole tensor used as a scalar (a condition, a printed value, a unary
-    /// operand, a math intrinsic argument). Returns whether it reported.
-    pub(crate) fn reject_tensor_value(&mut self, t: &Ty, what: &str, span: Span) -> bool {
+    /// `code` when `t` is a whole tensor used as a scalar — a condition (`E0436`) or a unary operand
+    /// (`E0433`). Returns whether it reported.
+    pub(crate) fn reject_tensor_value(
+        &mut self,
+        t: &Ty,
+        what: &str,
+        span: Span,
+        code: &'static str,
+    ) -> bool {
         if !matches!(t, Ty::Tensor { .. }) {
             return false;
         }
         let msg = self.whole_tensor_message(t, what);
-        self.error(span, "E0401", msg);
+        self.error(span, code, msg);
         true
     }
 
@@ -952,18 +958,38 @@ mod tests {
         ok("fn f(a: Tensor[f32, 4, 3]) -> f32 { return a[1][2]; }");
         ok("fn sum<N>(r: Tensor[f32, N]) -> f32 { return r[0]; } \
             fn f(a: Tensor[f32, 4, 3]) -> f32 { return sum(a[1]); }");
-        // A view is never a scalar: each use as one is a type error naming the view.
-        for bad in [
-            "fn f(a: Tensor[f32, 4, 3]) -> f32 { return a[1] + 1.0; }",
-            "fn f(a: Tensor[f32, 4, 3]) -> f32 { let x: f32 = a[1]; return x; }",
-            "fn f(a: Tensor[f32, 4, 3]) { print(a[1]); }",
-            "fn f(a: Tensor[f32, 4, 3]) -> f32 { return exp(a[1]); }",
-            "fn f(a: Tensor[f32, 4, 3]) { if a[1] { } }",
-            "fn f(a: Tensor[f32, 4, 3]) -> bool { return a[1] < a[2]; }",
-            "fn f(a: Tensor[f32, 4, 3]) -> f32 { return -a[1]; }",
-            "fn f(a: Tensor[f32, 4, 3]) { let mut x: f32 = 0.0; x = a[1]; }",
+        // A view is never a scalar: each use as one is an error naming the view, with the code of
+        // the rule it breaks — an operator (`E0433`), a condition (`E0436`), a builtin's argument
+        // (`E0437`), or a plain mismatch against a scalar place (`E0401`).
+        for (bad, code) in [
+            (
+                "fn f(a: Tensor[f32, 4, 3]) -> f32 { return a[1] + 1.0; }",
+                "E0433",
+            ),
+            (
+                "fn f(a: Tensor[f32, 4, 3]) -> f32 { let x: f32 = a[1]; return x; }",
+                "E0401",
+            ),
+            ("fn f(a: Tensor[f32, 4, 3]) { print(a[1]); }", "E0437"),
+            (
+                "fn f(a: Tensor[f32, 4, 3]) -> f32 { return exp(a[1]); }",
+                "E0437",
+            ),
+            ("fn f(a: Tensor[f32, 4, 3]) { if a[1] { } }", "E0436"),
+            (
+                "fn f(a: Tensor[f32, 4, 3]) -> bool { return a[1] < a[2]; }",
+                "E0433",
+            ),
+            (
+                "fn f(a: Tensor[f32, 4, 3]) -> f32 { return -a[1]; }",
+                "E0433",
+            ),
+            (
+                "fn f(a: Tensor[f32, 4, 3]) { let mut x: f32 = 0.0; x = a[1]; }",
+                "E0401",
+            ),
         ] {
-            rejects(bad, "E0401");
+            rejects(bad, code);
         }
         // The leading indices are still bounds-checked.
         rejects(

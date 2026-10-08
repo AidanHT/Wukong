@@ -206,11 +206,11 @@ annotation exactly (see error `E0401`) — and for an aggregate that means the s
 literal and an array **repeat** initializer must both supply exactly the annotated length, so
 `let a: [i32; 4] = [7; 2];` is `E0401`, not a slot silently filled out to 4. A repeat `[v; n]` evaluates `v` **once** and copies it into every slot, for an aggregate element too: `[make(); 3]` calls `make` once (`tests/run/array_repeat_aggregate_once.wk`). An unsuffixed literal
 that does not fit the type it adapts to
-is rejected (`E0401`, e.g. `let x: i8 = 200;`, or `s.x = 9000000000;` for an `i32` field), not
+is rejected (`E0431`, e.g. `let x: i8 = 200;`, or `s.x = 9000000000;` for an `i32` field), not
 silently wrapped. With **no** annotation an unsuffixed integer literal defaults to `i32`, but one that
 does not fit widens to the narrowest type that holds it — `i64`, and then `u64` for a magnitude in
 `(i64::MAX, u64::MAX]` — so its value is never silently truncated
-(`tests/run/int_literal_widen.wk`); a value past `u64` is malformed (`E0401`). Use a suffix
+(`tests/run/int_literal_widen.wk`); a value past `u64` is malformed (`E0431`). Use a suffix
 (`9000000000i64`, `3000000000u32`) to pick a specific type.
 
 A `let` binding may **destructure a tuple** — `let (a, b) = …`, nested `let ((m, n), o) = …`, or a
@@ -235,16 +235,16 @@ Any other name is `E0301`, not a silent length of 0, and a fixed-size array may 
 Integer literals may be **decimal, hex `0xFF`, octal `0o17`, or binary `0b1010`**, with `_` digit
 separators (`1_000_000`) and an optional type suffix (`250u8`) (`tests/run/radix_literals.wk`). A
 malformed literal — a mistyped radix like `0z123`, an empty `0x`, a bad digit `0b2`, a garbled float
-`1.5z`, or a value past `u64` — is a compile error (`E0401`), never silently zeroed
+`1.5z`, or a value past `u64` — is a compile error (`E0431`), never silently zeroed
 (`tests/fail/malformed_int_literal.wk`). A **float literal** takes `_` separators and an optional
 exponent, and its suffix may be `f32`, `f64`, `f16`, `bf16`, or the bare C-style `f` (= `f32`);
 unsuffixed it defaults to **`f32`** (`5f`, `1.5`, `1_000.5e-3`, `0.5bf16`). A malformed one — `1.5z`,
-an incomplete exponent `1.5e`, a doubled suffix `5ff` — is `E0401`, never silently `0.0`. A
+an incomplete exponent `1.5e`, a doubled suffix `5ff` — is `E0431`, never silently `0.0`. A
 **char literal** `'A'` has type **`char`** (a 32-bit Unicode scalar value) — covering the
 one-character escapes (`\n` `\r` `\t` `\\` `\'` `\"` `\0`), `\xHH` hex, and `\u{…}` Unicode escapes. A
 char literal holds **exactly one** Unicode scalar value, and the compiler enforces it: an empty `''`
 and a multi-codepoint `'ab'` are `E0104`, and a `\u{…}` above `\u{10FFFF}` or inside the surrogate
-range `\u{D800}..=\u{DFFF}` is `E0401` (in a string literal too) — none of these is silently decoded
+range `\u{D800}..=\u{DFFF}` is `E0432` (in a string literal too) — none of these is silently decoded
 to `0`. `char` is a usable annotated type (`let c: char = 'A'`) and is interconvertible with the
 integer types via `as` in both directions, so it can be cast, compared, and used in arithmetic
 (`tests/run/char_literals.wk`, `tests/run/char_type.wk`).
@@ -273,7 +273,7 @@ concatenation/indexing/length operators — a string is a NUL-terminated `*u8` i
 | Enums       | C-style `enum E { A = 10, B }` (variant = its `i32` discriminant) **and data-carrying** `V(i32)` / `V { f: T }` variants | ✅ |
 | Slices      | `[]T` — fat pointer `{data, len}`; `.len()`, **bounds-checked** indexed load/store, iteration, array→slice unsizing | ✅ |
 | SIMD vectors| `f32x4`/`i32x4`, generic `vec[T, N]` — the type **parses and type-checks** (a non-scalar element is `E0302`, a lane/element mismatch at a call is `E0401`), but no vector value can be constructed in source (`f32x4::load(p)` is `C0001`) and float-vector arithmetic is an internal error, so nothing uses it. SIMD ships through the **automatic** 128-bit/256-bit loop vectorizer, which needs no vector type in source. | 🔵 |
-| Tensors     | `Tensor[f32, M, N]` — shape checking, and **indexing** (`a[i, j]`) for both const and symbolic-generic dims, on the default `contiguous` layout. A constant-shape tensor costs **nothing** over the hand-flattened `[f32; M*N]` + `a[i*N + j]` spelling: the two compile to byte-identical MIR, same kernel dispatch and same vectorization. `.col_major` indexing executes for constant-shape tensors (`a[i, j]` is byte-identical to `a[i + j*M]`). `.strided`/`.tiled(…)` type-check but cannot be indexed (`C0001`). Whole-tensor arithmetic (`a + b`) is `E0401` — operate elementwise. | ✅ |
+| Tensors     | `Tensor[f32, M, N]` — shape checking, and **indexing** (`a[i, j]`) for both const and symbolic-generic dims, on the default `contiguous` layout. A constant-shape tensor costs **nothing** over the hand-flattened `[f32; M*N]` + `a[i*N + j]` spelling: the two compile to byte-identical MIR, same kernel dispatch and same vectorization. `.col_major` indexing executes for constant-shape tensors (`a[i, j]` is byte-identical to `a[i + j*M]`). `.strided`/`.tiled(…)` type-check but cannot be indexed (`C0001`). Whole-tensor arithmetic (`a + b`) is `E0433` — operate elementwise. | ✅ |
 
 `&x` and `&mut x` have type `*T` and `*mut T`. A `&T`/`&mut T` **parameter** accepts them
 (`fn deref(p: &i32) -> i32 { return *p; }` with `deref(&x)`), but the two spellings are distinct types
@@ -285,7 +285,7 @@ null test — `p != null` — with the same answer on every backend and at every
 interpreter reserves its address 0 as a never-allocated null so it agrees with native here, and a
 load or store through null is the interpreter diagnostic `null pointer dereference` (native faults).
 A condition must be a boolean, a number (nonzero is true) or a pointer: an aggregate, slice, tensor
-view, SIMD vector or function value is `E0401`.
+view, SIMD vector or function value is `E0436`.
 
 ## Operators ✅
 
@@ -296,7 +296,7 @@ spelling. Precedence follows **Rust's** table, resolved by a Pratt parser: `||` 
 < `|` < `^` < `&` < `<<`/`>>` < `+`/`-` < `*`/`/`/`%`, all left-associative. Note this differs from C
 for the bitwise operators — `1 | 2 == 2` is `(1 | 2) == 2` here, not `1 | (2 == 2)`. A **chained
 comparison** is rejected rather than silently mis-parsed: `a < b < c` would parse as `(a < b) < c`, so
-it is an `E0401` that names the fix (`a < b && b < c`); the equality form `a == b == c` is caught the
+it is an `E0433` that names the fix (`a < b && b < c`); the equality form `a == b == c` is caught the
 same way whenever the third operand is not itself a `bool` (an all-`bool` chain still parses as
 `(a == b) == c`). Compound assignment (`+=`, `*=`, `<<=`, `>>=`, …) is supported.
 
@@ -384,7 +384,7 @@ optional `if` guard, and `match` works in both value and statement position. See
 `tests/run/{match_expr,match_patterns,match_tuple}.wk`.
 
 A literal pattern must be **in range for the scrutinee's type**: `match n { 200 => … }` against an
-`i8` is an `E0401` ("literal `200` is out of range for `i8` (-128..=127)"), not a value truncated to
+`i8` is an `E0431` ("literal `200` is out of range for `i8` (-128..=127)"), not a value truncated to
 the scrutinee's width. The same check applies to both bounds of a range pattern.
 
 A `match` must be **exhaustive**, like Rust — and in **every** position, value *and* statement (an
@@ -503,8 +503,8 @@ enum Shape { Circle { r: i32 }, Rect { w: i32, h: i32 } }  // struct-payload var
 A **C-style enum** gives each variant an integer discriminant — explicit (`= 10`) or
 auto-incrementing from the previous. An explicit discriminant must be a compile-time integer
 **literal, or arithmetic on literals** (`= 0x10`, `= -1`, `= 4 * 8`); a reference to a top-level
-`const` is **not** accepted yet and is an `E0401` rather than being silently renumbered. Because an
-enum value lowers to a 4-byte discriminant, a value outside the `i32` range is also `E0401`.
+`const` is **not** accepted yet and is an `E0431` rather than being silently renumbered. Because an
+enum value lowers to a 4-byte discriminant, a value outside the `i32` range is also `E0431`.
 A variant `E::Name` *is* its discriminant, so it can be bound to
 a `let`, compared (`==`), cast (`Code::Ok as i32`), and used as a `match` pattern
 (`tests/run/enum_cstyle.wk`). **Data-carrying (tagged-union) variants** also run: a variant may
@@ -622,7 +622,8 @@ shape-generic function, returned from one, written through, and iterated: `for r
 rows of a rank-2+ tensor (and the elements of a rank-1 one). The leading indices are bounds-checked
 like any constant index. A view is never a scalar — the commonest way to get one is a forgotten
 index, so using it as a number (`s + a[i]`, `print(a[i])`, `exp(a[i])`, a condition, a comparison) is
-`E0401` naming the view's type; and it is not an assignable place (`a[i] = b[i]` would have to copy a
+rejected naming the view's type (`E0433` for an operator, `E0436` for a condition, `E0437` for
+a builtin's argument, `E0401` against a scalar place); and it is not an assignable place (`a[i] = b[i]` would have to copy a
 row: `E0507`). Only a contiguous (row-major) tensor has row views (`E0507` for `.col_major` and the
 other layouts). Writing through a view of a non-`mut` parameter is `E0304`, exactly like writing the
 parameter (`tests/run/tensor_views.wk`).
@@ -659,7 +660,7 @@ with its declared `-> Tensor[…]` is rejected — `E0501` when the rank differs
 value, the element type or the layout differs (`tests/fail/shape_return_mismatch.wk`). The same rule is
 applied to the operands of an elementwise binary operator (`tests/fail/shape_binop_mismatch.wk`), but
 note that **whole-tensor arithmetic is not a supported operation**: `a + b` on two `Tensor` values is
-`E0401` ("operate on elements in a loop") whatever the shapes, so the shape diagnostic is an additional
+`E0433` ("operate on elements in a loop") whatever the shapes, so the shape diagnostic is an additional
 report on a program that is rejected anyway. Elementwise tensor work is written with indexed scalars —
 `c[i, j] = a[i, j] + b[i, j]`. Inside a **generic** function these body checks treat the function's
 own dimension variables as **rigid** — `N` matches only `N`, never another generic or a constant — so
@@ -1096,7 +1097,7 @@ lowers to PTX `.shared` SMEM and `sync_block()` to `bar.sync 0` (`wukong_codegen
   negative); a `*u8` (a string literal) prints its NUL-terminated bytes rather than the pointer.
   `print()` with no argument prints a bare newline. More than one argument is `E0503` (arguments are
   not concatenated), and a `()` value — from an `else`-less `if`, or a `match` with statement arms —
-  is `E0401`.
+  is `E0437`.
 - `println(x)` — alias of `print` (both already append the newline).
 - `assert(cond)` — stop the program at once if `cond` is false (zero); a no-op otherwise. Exactly
   one argument (`E0503` otherwise). A float condition means `cond != 0.0`, so `assert(0.5)` passes.
@@ -1588,8 +1589,8 @@ the file can't be opened). The on-disk format is **headerless raw little-endian*
 or length prefix (for files that carry those, see *Checkpoints* below).
 
 `buf` is a **`[]T` slice, a `[T; N]` array, or a contiguous `Tensor[T, …]`** whose every dimension is
-known at the call (a constant or a bound dimension variable; a `?` dimension is `E0401`), and its
-element type must be exactly `T` (a `[]i32` handed to `read_f32` is `E0401`, not a silent wrong
+known at the call (a constant or a bound dimension variable; a `?` dimension is `E0437`), and its
+element type must be exactly `T` (a `[]i32` handed to `read_f32` is `E0437`, not a silent wrong
 stride). A builtin that writes `buf` through a non-`mut` slice, array or tensor **parameter** is
 `E0304`, exactly as `p[i] = …` through that parameter is.
 
@@ -1611,7 +1612,7 @@ stride). A builtin that writes `buf` through a non-`mut` slice, array or tensor 
   **`-2`** on an io error).
 
 `path` is any NUL-terminated `*u8` — usually a string literal (the `.rodata` pointer described under
-*Literals*), but a `*u8` binding works too. Anything else is `E0401`, and a wrong arity is `E0503`.
+*Literals*), but a `*u8` binding works too. Anything else is `E0437`, and a wrong arity is `E0503`.
 Both directions are implemented by the `wukong_runtime` layer on the native backend and mirrored by
 the interpreter on the same planning code — the return codes, the little-endian layout, the narrowing
 store, and the canonical value of every element read (a `u8`/`u16`/`u32` read from a file compares

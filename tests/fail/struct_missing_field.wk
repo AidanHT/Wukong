@@ -1,4 +1,4 @@
-// EXPECT-CODE: E0401
+// EXPECT-CODE: E0430
 module tests.fail.struct_missing_field
 
 // A struct literal that omits a field used to compile with no diagnostic; then reading the omitted

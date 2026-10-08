@@ -1,4 +1,4 @@
-// EXPECT-CODE: E0401
+// EXPECT-CODE: E0433
 module tests.fail.aggregate_equality
 
 // `==`/`!=` on a struct (or tuple/array) is rejected: an aggregate value is a base pointer, so the

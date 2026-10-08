@@ -64,7 +64,7 @@ not duplicate them. In summary, Wukong:
   parameter carries its dims — and its layout — into the callee contract, so handing a
   `Tensor[f32, 512, 512]` to a `Tensor[f32, 513, 512]` parameter, or returning the wrong shape, is a *type
   error* (E0501/E0502), not a segfault at 3 a.m. There is no whole-tensor `*` operator:
-  whole-tensor arithmetic is rejected outright (E0401, "operate on elements in a loop"), and a
+  whole-tensor arithmetic is rejected outright (E0433, "operate on elements in a loop"), and a
   matmul is written as an indexed loop nest — which the compiler then recognizes and dispatches
   (below). C/C++ cannot express this; Rust cannot express it ergonomically.
 - **The knobs kernels need, as language constructs.** SIMD vector types (`vec[f32, 8]`), tensor data

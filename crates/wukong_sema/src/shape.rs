@@ -12,7 +12,7 @@
 //!    explicit turbofish or inferred from the arguments; a conflicting binding is a `E0502`
 //!    dimension mismatch and a differing rank is `E0501`. Value-*type* generics (`fn f<T>`) are
 //!    bound by `infer_type_generics` and substituted by `apply_subst`.
-//!  * **Indexing** (`type_index`): a non-indexable base is `E0401`, a wrong index count is `E0501`,
+//!  * **Indexing** (`type_index`): a non-indexable base is `E0433`, a wrong index count is `E0501`,
 //!    and a compile-time-constant index outside a static dimension / array length is `E0501` too.
 //!
 //! `unify` has **two modes**, and the `rigid` flag is load-bearing (see `unify_dim`):
@@ -249,7 +249,7 @@ impl Sema<'_> {
                         // rank — has no scalar value to apply the function to.
                         let what = format!("the math function `{}`", self.sym_str(name));
                         let msg = self.whole_tensor_message(t, &what);
-                        self.error(span, "E0401", msg);
+                        self.error(span, "E0437", msg);
                         return Ty::Unknown;
                     }
                     if let Some(bad) = arg_tys.iter().find(|t| {
@@ -260,7 +260,7 @@ impl Sema<'_> {
                     }) {
                         self.error(
                             span,
-                            "E0401",
+                            "E0437",
                             format!(
                                 "`{}` expects a scalar, vector, or tensor argument, not a value of \
                                  type `{}`",
@@ -301,7 +301,7 @@ impl Sema<'_> {
                             Ty::Unknown | Ty::Error => {}
                             other => self.error(
                                 span,
-                                "E0401",
+                                "E0437",
                                 format!(
                                     "`{}` expects an integer element count, found a value of type \
                                      `{}`",
@@ -330,7 +330,7 @@ impl Sema<'_> {
                             Ty::Slice(_) | Ty::Unknown | Ty::Error => {}
                             other => self.error(
                                 span,
-                                "E0401",
+                                "E0437",
                                 format!(
                                     "`free` expects a slice returned by an `alloc_*` builtin, \
                                      found a value of type `{}`",
@@ -342,7 +342,7 @@ impl Sema<'_> {
                     return Ty::Unit;
                 }
                 // The ML builtins typed in `ml_builtins.rs` (see its module docs): each result is
-                // concrete, and misuse is rejected (E0503 arity, E0401 operand, E0304 a write
+                // concrete, and misuse is rejected (E0503 arity, E0437 operand, E0304 a write
                 // through a non-`mut` aggregate parameter) before mir_build lowers the call.
                 let interner = self.interner;
                 if let Some(ret) =
@@ -406,7 +406,7 @@ impl Sema<'_> {
                             Ty::Unknown | Ty::Error => {}
                             other => self.error(
                                 span,
-                                "E0401",
+                                "E0437",
                                 format!(
                                     "`scratch_release` expects an integer mark from \
                                      `scratch_mark()`, found a value of type `{}`",
@@ -466,19 +466,19 @@ impl Sema<'_> {
                         // statement arms. mir_build lowered the unit `let` to an `alloca void` and the
                         // read to a `load void`: native -O0 read uninitialized stack (nondeterministic
                         // garbage), while the interpreter and -O2 (mem2reg) produced 0 — a divergence
-                        // that broke BOTH invariants at once. Reject it (E0401), consistent with `()`
+                        // that broke BOTH invariants at once. Reject it (E0437), consistent with `()`
                         // already being non-computable in an arithmetic operand.
                         if let Some(t @ Ty::Tensor { .. }) = arg_tys.first() {
                             let what = format!("`{nm}`");
                             let msg = self.whole_tensor_message(t, &what);
-                            self.error(span, "E0401", msg);
+                            self.error(span, "E0437", msg);
                             self.types.insert(callee.id, Ty::Unknown);
                             return Ty::Unknown;
                         }
                         if matches!(arg_tys.first(), Some(Ty::Unit)) {
                             self.error(
                                 span,
-                                "E0401",
+                                "E0437",
                                 format!(
                                     "`{nm}` cannot print a `()` value; supply a printable scalar \
                                      (an `if` with no `else`, or a `match` with statement arms, \
@@ -1431,7 +1431,7 @@ impl Sema<'_> {
             if matches!(ix_ty, Ty::Scalar(Scalar::Bool)) {
                 self.error(
                     ix.span,
-                    "E0401",
+                    "E0433",
                     "array index must be an integer, not `bool`".to_string(),
                 );
             }
@@ -1452,7 +1452,7 @@ impl Sema<'_> {
             let disp = base_ty.display(self.interner);
             self.error(
                 span,
-                "E0401",
+                "E0433",
                 format!(
                     "cannot index a value of type `{disp}` with `[..]`; only arrays, tensors, \
                      slices, and pointers are indexable (use `.field` / `.0` for a struct / tuple)"

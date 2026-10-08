@@ -1,4 +1,4 @@
-// EXPECT-CODE: E0401
+// EXPECT-CODE: E0433
 module tests.fail.compound_assign_aggregate
 
 // A compound assignment `a += b` means `a = a + b`. That implied `+` is undefined on an aggregate:

@@ -1,4 +1,4 @@
-// EXPECT-CODE: E0401
+// EXPECT-CODE: E0433
 module tests.fail.deref_scalar
 
 // `*x` requires a pointer or reference operand. Dereferencing a scalar used to fall through sema's
