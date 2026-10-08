@@ -5173,10 +5173,12 @@ impl FnLowerer<'_> {
             let generic_window =
                 any_generic && dispatch::window_has_generic(&b.stmts[i..], self.interner);
             if self.gemm.recognize && !generic_window {
-                // A hand-tiled GEMM — tile loops (`for i0 in 0..M step T` or the `let mut i0 = 0;
-                // while i0 < M { …; i0 = i0 + T; }` pair) around their point loops — is presented to
-                // the GEMM recognizer as the untiled nest it enumerates, so blocking a matmul no
-                // longer costs the kernel. One statement (a tile `for`) or two (the `while` pair).
+                // A hand-tiled GEMM — tile loops (`for i0 in 0..M step T`, the `let mut i0 = 0;
+                // while i0 < M { …; i0 = i0 + T; }` pair, or the counted `for it in 0..NT { let i0 =
+                // it * T; … }`) around full or `min`-clamped point loops — is presented to the GEMM
+                // recognizer as the untiled nest it enumerates (behind a run-time cover test when the
+                // extents are not constants), so blocking a matmul no longer costs the kernel. One
+                // statement (a tile `for`) or two (the `while` pair). See `detile.rs`.
                 if let Some(n) = self.try_detiled_gemm(b, i) {
                     i += n;
                     continue;
