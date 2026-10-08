@@ -61,6 +61,23 @@ fn edge_args(f: &Function) -> EdgeArgs {
                     .or_default()
                     .push((pred, else_args.clone()));
             }
+            // Every switch edge leaves through its own forwarding block (see `emit_term`), so each
+            // edge is a distinct phi predecessor even when two cases share a target.
+            Terminator::Switch {
+                cases,
+                default,
+                default_args,
+                ..
+            } => {
+                for (i, c) in cases.iter().enumerate() {
+                    map.entry(c.target.0)
+                        .or_default()
+                        .push((format!("bb{}.s{i}", b.id.0), c.args.clone()));
+                }
+                map.entry(default.0)
+                    .or_default()
+                    .push((format!("bb{}.sd", b.id.0), default_args.clone()));
+            }
             Terminator::Ret(_) | Terminator::Unreachable => {}
         }
     }
@@ -436,10 +453,21 @@ fn emit_function(
         }
     }
 
+    // A `@noalias` parameter is LLVM's `noalias` argument attribute verbatim: for the duration of
+    // the call, memory reached through it is not reached through any pointer not based on it. The
+    // attribute is only legal on a pointer, which every promised (buffer) parameter is.
     let params: Vec<String> = f
         .params
         .iter()
-        .map(|p| format!("{} %v{}", llvm_ty(f.value_type(*p)), p.0))
+        .enumerate()
+        .map(|(i, p)| {
+            let attr = if f.param_attr(i).noalias && *f.value_type(*p) == MirType::Ptr {
+                " noalias"
+            } else {
+                ""
+            };
+            format!("{}{} %v{}", llvm_ty(f.value_type(*p)), attr, p.0)
+        })
         .collect();
     let _ = writeln!(
         out,
@@ -929,6 +957,28 @@ impl Emitter<'_> {
                 }
                 line
             }
+            Terminator::Switch {
+                scrutinee,
+                cases,
+                default,
+                ..
+            } => {
+                let id = block.id.0;
+                let ty = self.ty(*scrutinee);
+                let mut line = format!(
+                    "switch {ty} {}, label %bb{id}.sd [",
+                    self.operand(*scrutinee)
+                );
+                for (i, c) in cases.iter().enumerate() {
+                    let _ = write!(line, " {ty} {}, label %bb{id}.s{i}", c.value);
+                }
+                line.push_str(" ]");
+                for (i, c) in cases.iter().enumerate() {
+                    let _ = write!(line, "\nbb{id}.s{i}:\n  br label %bb{}", c.target.0);
+                }
+                let _ = write!(line, "\nbb{id}.sd:\n  br label %bb{}", default.0);
+                line
+            }
             Terminator::Unreachable => "unreachable".to_string(),
         };
         let _ = writeln!(out, "  {line}");
@@ -1108,5 +1158,19 @@ mod tests {
             !out.contains("alloca"),
             "scalars should be promoted:\n{out}"
         );
+    }
+
+    /// A `@noalias` parameter is LLVM's `noalias` argument attribute, on that parameter only.
+    #[test]
+    fn a_promised_parameter_is_emitted_noalias() {
+        let out = ir(
+            "fn k(@noalias mut o: [f32; 4], x: [f32; 4]) { o[0] = x[0]; } \
+             fn main() -> i32 { return 0; }",
+        );
+        assert!(
+            out.contains("define void @k(ptr noalias %v0, ptr %v1)"),
+            "{out}"
+        );
+        assert_eq!(out.matches("noalias").count(), 1, "{out}");
     }
 }

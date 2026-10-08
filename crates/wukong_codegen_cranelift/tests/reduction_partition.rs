@@ -44,7 +44,8 @@ fn source() -> String {
                 "max" => "fmax(s, a[i])",
                 "min" => "fmin(s, a[i])",
                 // Four distinct hoisted constants and several simultaneously live operands
-                // force the shared recipe's register-pressure cap below U=4.
+                // leave room for one register bank beside the four accumulators: the wide kernel
+                // shares that bank between its unrolled copies, and the tree stays U=4.
                 "pressure" => {
                     "s + a[i] * ((b[i] + 1.0) * (b[i] + 2.0) + (b[i] + 3.0) * (b[i] + 4.0))"
                 }
@@ -104,8 +105,8 @@ fn cases(op: &str, n: usize) -> Vec<Case> {
     if op == "pressure" {
         let mut case = plain("exact pressure expression", 1.0, 7.0, 7.0 + 14.0 * n as f32);
         case.b.fill(0.0);
-        // U=1 sends indices 0, 8, 16 to one lane in order: cancellation finishes before
-        // the final 14 is added. With b=0 the exact multiplier is 14.
+        // U=4 sends indices 0, 8, 16 to lane 0 of accumulators 0, 1, 2, combined in that order:
+        // cancellation finishes before the final 14 is added. With b=0 the exact multiplier is 14.
         let expected = match n {
             0 => 0.0,
             1..=8 => f32::from_bits(0x7360_0000), // 14 * 2^100, exactly representable
@@ -206,19 +207,13 @@ fn reduction_partition_is_independent_of_width_and_threshold() {
                 kernels
                     .iter()
                     .any(|k| interner.resolve(k.name).starts_with("pressure_")
-                        && k.reduction_unroll() < 4),
-                "must exercise pressure-limited U"
+                        && k.reduction_banks() < k.reduction_unroll()),
+                "must exercise shared register banks"
             );
+            // The canonical tree: register pressure changes the schedule, never the accumulator
+            // count, for every body.
             for k in &kernels {
-                if interner.resolve(k.name).starts_with("pressure_") {
-                    assert_eq!(
-                        k.reduction_unroll(),
-                        1,
-                        "pressure cancellation oracle requires U=1"
-                    );
-                } else {
-                    assert_eq!(k.reduction_unroll(), 4, "simple reduction partition");
-                }
+                assert_eq!(k.reduction_unroll(), 4, "canonical reduction partition");
             }
         } else {
             assert!(kernels.is_empty(), "portable mode emitted raw kernels");

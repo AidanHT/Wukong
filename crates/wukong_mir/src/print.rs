@@ -22,10 +22,21 @@ pub fn print_program(p: &Program, interner: &Interner) -> String {
 /// Render a single function.
 pub fn print_function(f: &Function, interner: &Interner) -> String {
     let mut out = String::new();
+    // A `@noalias` promise is printed on the parameter it covers, so a dump shows which facts the
+    // optimizer was entitled to. Nothing is printed for a parameter that promises nothing, which
+    // keeps every pre-existing dump byte-identical.
     let params: Vec<String> = f
         .params
         .iter()
-        .map(|v| format!("{} {}", val(*v), f.value_type(*v).display()))
+        .enumerate()
+        .map(|(i, v)| {
+            let mark = if f.param_attr(i).noalias {
+                " noalias"
+            } else {
+                ""
+            };
+            format!("{} {}{}", val(*v), f.value_type(*v).display(), mark)
+        })
         .collect();
     out.push_str(&format!(
         "fn {}({}) -> {} {{\n",
@@ -141,6 +152,25 @@ fn fmt_term(t: &Terminator) -> String {
             else_blk.0,
             fmt_args(else_args)
         ),
+        // `switch v3, bb7(v2) [0: bb2(v1), -1: bb4]` -- LLVM's order: scrutinee, default, cases.
+        Terminator::Switch {
+            scrutinee,
+            cases,
+            default,
+            default_args,
+        } => {
+            let arms: Vec<String> = cases
+                .iter()
+                .map(|c| format!("{}: bb{}{}", c.value, c.target.0, fmt_args(&c.args)))
+                .collect();
+            format!(
+                "switch {}, bb{}{} [{}]",
+                val(*scrutinee),
+                default.0,
+                fmt_args(default_args),
+                arms.join(", ")
+            )
+        }
         Terminator::Unreachable => "unreachable".to_string(),
     }
 }

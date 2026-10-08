@@ -763,15 +763,16 @@ pub enum MemDep {
 #[derive(Clone, Debug)]
 pub struct DepSummary {
     pub memory: MemDep,
-    /// A short human-readable justification, for the dump.
-    pub reason: String,
+    /// A short human-readable justification, for the dump. Always a literal: every forest rebuild
+    /// constructs one per loop, and the production compile never reads it.
+    pub reason: &'static str,
 }
 
 impl Default for DepSummary {
     fn default() -> DepSummary {
         DepSummary {
             memory: MemDep::Carried,
-            reason: "not analyzed".to_string(),
+            reason: "not analyzed",
         }
     }
 }
@@ -1781,9 +1782,9 @@ fn classify_carried(
 /// [`MemDep::IndependentIfBasesDisjoint`] instead of failing it — see that variant for the
 /// obligation that creates.
 fn dependence(ctx: &LoopCtx<'_>, l: &NaturalLoop, accesses: &[MemAccess]) -> DepSummary {
-    let carried = |why: &str| DepSummary {
+    let carried = |why: &'static str| DepSummary {
         memory: MemDep::Carried,
-        reason: why.to_string(),
+        reason: why,
     };
     // A call may read or write anything, and `VecKernelCall` writes through its output streams.
     for &b in &l.blocks {
@@ -1798,6 +1799,8 @@ fn dependence(ctx: &LoopCtx<'_>, l: &NaturalLoop, accesses: &[MemAccess]) -> Dep
     }
     let mut needs_runtime_check = false;
     let mut reloaded_base = false;
+    // Built at most once, and only for a function with a `@noalias` parameter (`alias.rs`).
+    let mut promised = crate::alias::PromisedBases::new(ctx.f);
     for (i, a) in accesses.iter().enumerate() {
         for b in &accesses[i + 1..] {
             if a.kind == AccessKind::Load && b.kind == AccessKind::Load {
@@ -1835,7 +1838,8 @@ fn dependence(ctx: &LoopCtx<'_>, l: &NaturalLoop, accesses: &[MemAccess]) -> Dep
                 }
                 continue;
             }
-            if distinct_allocas(ctx, ba, bb) {
+            // Distinct slots, or storage a `@noalias` parameter promised apart (`alias.rs`).
+            if distinct_allocas(ctx, ba, bb) || promised.disjoint(ba, bb) {
                 continue;
             }
             needs_runtime_check = true;
@@ -1851,12 +1855,12 @@ fn dependence(ctx: &LoopCtx<'_>, l: &NaturalLoop, accesses: &[MemAccess]) -> Dep
     DepSummary {
         memory,
         reason: match memory {
-            MemDep::Independent => "every conflicting pair is provably independent".into(),
+            MemDep::Independent => "every conflicting pair is provably independent",
             MemDep::IndependentIfBasesStable => {
-                "independent, assuming a re-loaded base pointer does not change".into()
+                "independent, assuming a re-loaded base pointer does not change"
             }
             MemDep::IndependentIfBasesDisjoint => {
-                "independent if unrelated bases are equal or disjoint (runtime check owed)".into()
+                "independent if unrelated bases are equal or disjoint (runtime check owed)"
             }
             MemDep::Carried => unreachable!(),
         },
@@ -2003,6 +2007,20 @@ fn args_to(t: &Terminator, target: BlockId) -> Option<&[ValueId]> {
             (false, true) => Some(else_args),
             (false, false) => None,
         },
+        Terminator::Switch {
+            cases,
+            default,
+            default_args,
+            ..
+        } => {
+            let mut into = cases
+                .iter()
+                .filter(|c| c.target == target)
+                .map(|c| c.args.as_slice())
+                .chain((*default == target).then_some(default_args.as_slice()));
+            let first = into.next()?;
+            into.all(|args| args == first).then_some(first)
+        }
         _ => None,
     }
 }
@@ -2373,6 +2391,7 @@ mod tests {
             value_types,
             entry: BlockId(0),
             vec_kernels: Vec::new(),
+            param_attrs: Vec::new(),
         }
     }
 
@@ -2992,8 +3011,11 @@ mod tests {
 
     #[test]
     fn a_constant_offset_shows_up_in_the_index_constant() {
-        let src = "fn k(x: []f32, mut o: []f32, n: i64) { \
-                   for i in 0..n { o[i] = x[i + 3]; } } \
+        // `while`, like the case above: a `for` over two provably disjoint slices is widened by
+        // `mir_build`'s own vectorizer, leaving 128-bit strip loops (or a 256-bit kernel call) in
+        // place of the one scalar loop this inspects.
+        let src = "fn k(x: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
+                   while i < n { o[i] = x[i + 3]; i = i + 1; } } \
                    fn main() -> i32 { return 0; }";
         let (_, l) = kernel_loop(src, "k");
         let l = &l;
@@ -3028,10 +3050,13 @@ mod tests {
 
     // ---- stage 4: carried values -------------------------------------------------------------
 
+    /// This and the integer case below are spelled as counting `while` loops: a `for` reduction
+    /// over a `[]T` slice is vectorized by `mir_build` itself (the canonical reduction tree), which
+    /// leaves strip loops over vector accumulators in place of the one scalar loop inspected here.
     #[test]
     fn a_float_sum_is_a_non_reassociable_reduction() {
-        let src = "fn k(x: []f32, n: i64) -> f32 { let mut s: f32 = 0.0; \
-                   for i in 0..n { s = s + x[i]; } return s; } \
+        let src = "fn k(x: []f32, n: i64) -> f32 { let mut s: f32 = 0.0; let mut i: i64 = 0; \
+                   while i < n { s = s + x[i]; i = i + 1; } return s; } \
                    fn main() -> i32 { return 0; }";
         let (_, l) = kernel_loop(src, "k");
         let l = &l;
@@ -3046,8 +3071,8 @@ mod tests {
 
     #[test]
     fn an_integer_sum_is_a_reassociable_reduction() {
-        let src = "fn k(x: []i32, n: i64) -> i32 { let mut s: i32 = 0; \
-                   for i in 0..n { s = s + x[i]; } return s; } \
+        let src = "fn k(x: []i32, n: i64) -> i32 { let mut s: i32 = 0; let mut i: i64 = 0; \
+                   while i < n { s = s + x[i]; i = i + 1; } return s; } \
                    fn main() -> i32 { return 0; }";
         let (_, l) = kernel_loop(src, "k");
         let l = &l;

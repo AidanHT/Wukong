@@ -20,7 +20,9 @@
 //! Order comes from Tarjan's strongly-connected components over the call graph, which emits each SCC
 //! only after every SCC it calls. A function in a non-trivial SCC — or with a self-edge — is
 //! recursive, and is never inlined into anything (splicing it could not terminate). That replaces the
-//! old leaf-only rule, which forbade recursion by forbidding *all* calls.
+//! old leaf-only rule, which forbade recursion by forbidding *all* calls. Self-recursion that is all
+//! tail calls is rewritten into a loop first (`tre::pre_inline`), so such a function is not recursive
+//! by the time the call graph is built.
 //!
 //! # The cost model
 //!
@@ -94,6 +96,9 @@ pub(crate) fn inline_program_preserving(program: &mut Program, roots: &[Symbol])
     if n == 0 {
         return false;
     }
+    // A function whose every self-call is a tail call becomes a loop first, so the call graph
+    // below no longer marks it recursive and it can be inlined like any other callee (`tre`).
+    let pre = crate::tre::pre_inline(program);
     // Symbol -> index. Names are unique per program (the driver merges imports by qualified name).
     let index: FxHashMap<Symbol, u32> = program
         .funcs
@@ -164,7 +169,7 @@ pub(crate) fn inline_program_preserving(program: &mut Program, roots: &[Symbol])
     let mut has_loop: FxHashMap<Symbol, bool> = FxHashMap::default();
     let mut specializations = FxHashMap::default();
 
-    let mut changed = false;
+    let mut changed = pre;
     let mut inlined: FxHashSet<Symbol> = FxHashSet::default();
 
     for comp in &sccs {
@@ -458,7 +463,7 @@ fn func_insts(f: &Function) -> usize {
 /// strongly-connected components of the CFG: a block is in a loop exactly when its component has
 /// more than one member, or it branches to itself. This needs no dominator information, which keeps
 /// the inliner off the (more expensive) analyses the function-level pipeline builds later.
-fn loop_blocks(f: &Function) -> Vec<bool> {
+pub(crate) fn loop_blocks(f: &Function) -> Vec<bool> {
     let adj: Vec<Vec<u32>> = f
         .blocks
         .iter()
@@ -486,7 +491,7 @@ fn loop_blocks(f: &Function) -> Vec<bool> {
 /// from it. The recursion is turned into an explicit stack because both call graphs and CFGs here
 /// can be thousands of nodes deep in generated model code, and blowing the *compiler's* stack is not
 /// an acceptable failure mode.
-fn strongly_connected(adj: &[Vec<u32>]) -> Vec<Vec<u32>> {
+pub(crate) fn strongly_connected(adj: &[Vec<u32>]) -> Vec<Vec<u32>> {
     let n = adj.len();
     const UNVISITED: u32 = u32::MAX;
     let mut index = vec![UNVISITED; n];
@@ -660,6 +665,24 @@ fn remap_term(
             then_args: margs(then_args),
             else_blk: bmap(*else_blk),
             else_args: margs(else_args),
+        },
+        Terminator::Switch {
+            scrutinee,
+            cases,
+            default,
+            default_args,
+        } => Terminator::Switch {
+            scrutinee: mapv(*scrutinee),
+            cases: cases
+                .iter()
+                .map(|c| wukong_mir::SwitchCase {
+                    value: c.value,
+                    target: bmap(c.target),
+                    args: margs(&c.args),
+                })
+                .collect(),
+            default: bmap(*default),
+            default_args: margs(default_args),
         },
         Terminator::Unreachable => Terminator::Unreachable,
     }

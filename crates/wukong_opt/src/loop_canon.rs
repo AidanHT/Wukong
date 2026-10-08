@@ -201,6 +201,16 @@ fn redirect(t: &mut Terminator, from: BlockId, to: BlockId) {
                 *else_blk = to;
             }
         }
+        Terminator::Switch { cases, default, .. } => {
+            for c in cases.iter_mut() {
+                if c.target == from {
+                    c.target = to;
+                }
+            }
+            if *default == from {
+                *default = to;
+            }
+        }
         Terminator::Ret(_) | Terminator::Unreachable => {}
     }
 }
@@ -208,7 +218,7 @@ fn redirect(t: &mut Terminator, from: BlockId, to: BlockId) {
 /// A block whose two `cond_br` arms both reach `target` with *different* argument lists cannot be
 /// funnelled through one forwarding block: the single forwarded argument list would have to be both.
 /// (Identical argument lists are fine — that edge is one CFG edge, and `simplify_cfg` folds the
-/// branch to a `br` anyway.)
+/// branch to a `br` anyway.) The same holds for any two `switch` edges into `target`.
 fn ambiguous_edge(f: &Function, from: BlockId, target: BlockId) -> bool {
     match &f.blocks[from.0 as usize].term {
         Terminator::CondBr {
@@ -218,6 +228,22 @@ fn ambiguous_edge(f: &Function, from: BlockId, target: BlockId) -> bool {
             else_args,
             ..
         } => *then_blk == target && *else_blk == target && then_args != else_args,
+        Terminator::Switch {
+            cases,
+            default,
+            default_args,
+            ..
+        } => {
+            let mut into = cases
+                .iter()
+                .filter(|c| c.target == target)
+                .map(|c| c.args.as_slice())
+                .chain((*default == target).then_some(default_args.as_slice()));
+            match into.next() {
+                Some(first) => into.any(|args| args != first),
+                None => false,
+            }
+        }
         _ => false,
     }
 }
@@ -776,6 +802,7 @@ mod tests {
             value_types,
             entry: BlockId(0),
             vec_kernels: Vec::new(),
+            param_attrs: Vec::new(),
         }
     }
 

@@ -15,7 +15,9 @@
 //! (including the function return type). Given a whole [`Program`], [`verify_program`] additionally
 //! checks each call against its callee's declared signature at the driver's verification boundary.
 //! Cast kinds must agree with source/destination categories and widths, and every registered
-//! vector recipe is checked for valid SSA operands, stream/scalar indices and reduction shape.
+//! vector recipe is checked for valid SSA operands, stream/scalar indices and reduction shape. A
+//! `veckernel` call whose pointer or scalar table is a local slot must have a slot large enough for
+//! every stream and scalar its recipe uses.
 
 use std::collections::{HashMap, HashSet};
 
@@ -72,6 +74,7 @@ fn verify(f: &Function, sigs: Option<&FnSigs>) -> Vec<String> {
         defined: HashSet::new(),
         live: HashSet::new(),
         dom_check: false,
+        slots: None,
     };
     v.run();
     v.errors
@@ -88,17 +91,8 @@ struct Verifier<'a> {
     live: HashSet<u32>,
     /// Whether `live` is meaningful right now (false while checking unreachable blocks).
     dom_check: bool,
-}
-
-/// The at-most-two blocks a terminator can transfer control to.
-fn successors(t: &Terminator) -> [Option<u32>; 2] {
-    match t {
-        Terminator::Br { target, .. } => [Some(target.0), None],
-        Terminator::CondBr {
-            then_blk, else_blk, ..
-        } => [Some(then_blk.0), Some(else_blk.0)],
-        Terminator::Ret(_) | Terminator::Unreachable => [None, None],
-    }
+    /// `alloca` result -> its slot type, built the first time a `veckernel` call needs it.
+    slots: Option<HashMap<u32, &'a MirType>>,
 }
 
 /// Sentinel for "no immediate dominator yet" in the Cooper–Harvey–Kennedy fixpoint below.
@@ -157,7 +151,7 @@ fn intersect(mut a: u32, mut b: u32, idom: &[u32], rpo_num: &[usize]) -> u32 {
     a
 }
 
-impl Verifier<'_> {
+impl<'a> Verifier<'a> {
     fn err(&mut self, msg: impl Into<String>) {
         self.errors.push(msg.into());
     }
@@ -236,13 +230,14 @@ impl Verifier<'_> {
         let mut stack: Vec<(u32, usize)> = vec![(entry as u32, 0)];
         visited[entry] = true;
         while let Some(&mut (b, i)) = stack.last_mut() {
-            if i >= 2 {
+            let term = &f.blocks[b as usize].term;
+            if i >= term.edge_count() {
                 post.push(b);
                 stack.pop();
                 continue;
             }
             stack.last_mut().expect("stack is non-empty here").1 += 1;
-            if let Some(s) = successors(&f.blocks[b as usize].term)[i] {
+            if let Some(s) = term.edge_target(i).map(|s| s.0) {
                 if (s as usize) < n && !visited[s as usize] {
                     visited[s as usize] = true;
                     stack.push((s, 0));
@@ -254,11 +249,11 @@ impl Verifier<'_> {
             if !visited[b] {
                 continue;
             }
-            for s in successors(&blk.term).into_iter().flatten() {
-                if (s as usize) < n {
-                    preds[s as usize].push(b as u32);
+            blk.term.for_each_edge(|s, _| {
+                if (s.0 as usize) < n {
+                    preds[s.0 as usize].push(b as u32);
                 }
-            }
+            });
         }
         // `Builder::alloca` parks stack slots in the entry block because it runs exactly once, and
         // mem2reg never places a merge parameter there only because nothing branches back to it.
@@ -626,11 +621,12 @@ impl Verifier<'_> {
                 // gentler of the two — it `get`s and reports "unknown kernel index"). A pass that
                 // re-parents the call into another function leaves it dangling, so range-check it
                 // here — this is the one operand the type rules below cannot see.
+                // `Some(Some(lane type))` for a reduction, `Some(None)` for an elementwise kernel.
                 let kind = self
                     .f
                     .vec_kernels
                     .get(*kernel as usize)
-                    .map(|k| k.reduce.is_some());
+                    .map(|k| k.reduce.map(|_| k.lane.mir_type()));
                 match kind {
                     None => {
                         let have = self.f.vec_kernels.len();
@@ -639,23 +635,35 @@ impl Verifier<'_> {
                              (the function has {have} kernels)"
                         ));
                     }
-                    // A reduction kernel returns its horizontal fold as `f32`; an elementwise one
-                    // writes through its output streams and yields nothing. The two have different
-                    // backend signatures, so the call's result must agree with the recipe.
-                    Some(true) if result.is_none() => self.err(format!(
+                    // A reduction kernel returns its horizontal fold in its lane type; an
+                    // elementwise one writes through its output streams and yields nothing. The two
+                    // have different backend signatures, so the call's result must agree with the
+                    // recipe.
+                    Some(Some(_)) if result.is_none() => self.err(format!(
                         "veckernel #{kernel} is a reduction but the call takes no result"
                     )),
-                    Some(true) => self.check_result_is(result, &MirType::F32),
-                    Some(false) if result.is_some() => self.err(format!(
+                    Some(Some(lane_ty)) => self.check_result_is(result, &lane_ty),
+                    Some(None) if result.is_some() => self.err(format!(
                         "veckernel #{kernel} is elementwise but the call takes a result"
                     )),
-                    Some(false) => {}
+                    Some(None) => {}
                 }
                 if self.use_val(*ptrs) {
                     self.expect_ty(*ptrs, &MirType::Ptr, "veckernel ptrs");
                 }
                 if self.use_val(*scalars) {
                     self.expect_ty(*scalars, &MirType::Ptr, "veckernel scalars");
+                }
+                let counts = self
+                    .f
+                    .vec_kernels
+                    .get(*kernel as usize)
+                    .map(|k| (k.streams, k.scalars, k.lane.mir_type()));
+                // The scalar table holds one lane-typed invariant per slot (`*const T`, T the
+                // kernel's lane type), so it is sized in elements of that type.
+                if let Some((streams, invariants, lane_ty)) = counts {
+                    self.check_kernel_table(*ptrs, &MirType::Ptr, streams, "pointer");
+                    self.check_kernel_table(*scalars, &lane_ty, invariants, "scalar");
                 }
                 if self.use_val(*n) {
                     if let Some(t) = self.ty(*n) {
@@ -782,6 +790,45 @@ impl Verifier<'_> {
         }
     }
 
+    /// The slot type of the `alloca` that defines `v`, if one does.
+    fn slot_type(&mut self, v: ValueId) -> Option<&'a MirType> {
+        let f = self.f;
+        self.slots
+            .get_or_insert_with(|| {
+                f.blocks
+                    .iter()
+                    .flat_map(|b| &b.insts)
+                    .filter_map(|inst| match (&inst.op, inst.result) {
+                        (Op::Alloca { ty, .. }, Some(r)) => Some((r.0, ty)),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .get(&v.0)
+            .copied()
+    }
+
+    /// A kernel's pointer table needs one entry per stream its recipe reads or writes, and its
+    /// scalar table one per invariant: the AVX2 assembler and the interpreter's marshalling both
+    /// index them by the recipe's counts with no bound check, so a short table is an out-of-bounds
+    /// read on both backends. Provable when the table is a local slot of `elem`s (how lowering
+    /// builds both); any other table is left to the producer.
+    fn check_kernel_table(&mut self, table: ValueId, elem: &MirType, needed: u32, what: &str) {
+        let Some(ty) = self.slot_type(table) else {
+            return;
+        };
+        let entries = match ty {
+            MirType::Array(e, n) if **e == *elem => *n,
+            t if t == elem => 1,
+            _ => return,
+        };
+        if entries < needed {
+            self.err(format!(
+                "veckernel {what} table holds {entries} entries but its recipe uses {needed}"
+            ));
+        }
+    }
+
     fn check_result_is(&mut self, result: Option<ValueId>, want: &MirType) {
         if let Some(r) = result {
             if let Some(t) = self.ty(r) {
@@ -827,7 +874,53 @@ impl Verifier<'_> {
                 self.check_edge(*then_blk, then_args, nblocks);
                 self.check_edge(*else_blk, else_args, nblocks);
             }
+            Terminator::Switch {
+                scrutinee,
+                cases,
+                default,
+                default_args,
+            } => {
+                if self.use_val(*scrutinee) {
+                    self.check_switch_cases(*scrutinee, cases);
+                }
+                for c in cases {
+                    self.check_edge(c.target, &c.args, nblocks);
+                }
+                self.check_edge(*default, default_args, nblocks);
+            }
             Terminator::Unreachable => {}
+        }
+    }
+
+    /// A switch scrutinee is a scalar `i8`..`i64`, and its case values are canonical for that type
+    /// and pairwise distinct (a duplicate could never be taken, and the Cranelift lowering rejects
+    /// one outright).
+    fn check_switch_cases(&mut self, scrutinee: ValueId, cases: &[crate::SwitchCase]) {
+        let Some(ty) = self.ty(scrutinee).cloned() else {
+            return;
+        };
+        if crate::switch_case_value(0, &ty).is_none() {
+            self.err(format!(
+                "switch scrutinee {scrutinee:?} has type {}, but must be i8, i16, i32 or i64",
+                ty.display()
+            ));
+            return;
+        }
+        let mut seen: HashSet<i128> = HashSet::new();
+        for c in cases {
+            if crate::switch_case_value(c.value, &ty) != Some(c.value) {
+                self.err(format!(
+                    "switch case value {} is not a canonical {} (sign-extended from its width)",
+                    c.value,
+                    ty.display()
+                ));
+            }
+            if !seen.insert(c.value) {
+                self.err(format!(
+                    "switch case value {} appears more than once",
+                    c.value
+                ));
+            }
         }
     }
 
@@ -957,10 +1050,11 @@ mod tests {
 
     #[test]
     fn malformed_veckernel_recipes_are_reported_before_pressure_analysis() {
-        use crate::{VecBin, VecKernel, VecOp, VecRedOp, VecReduce};
+        use crate::{VecBin, VecKernel, VecLane, VecOp, VecRedOp, VecReduce};
         let mut i = Interner::new();
         let template = VecKernel {
             name: i.intern("kernel"),
+            lane: VecLane::F32,
             streams: 1,
             scalars: 1,
             unroll: 1,
@@ -1028,6 +1122,33 @@ mod tests {
         let mut zero_unroll = template.clone();
         zero_unroll.unroll = 0;
         cases.push((zero_unroll, "unroll"));
+        // Integer lanes have no division, fused multiply-add or square root, and an immediate is an
+        // f32 bit pattern that means nothing on any other lane.
+        let mut int_div = template.clone();
+        int_div.lane = VecLane::I32;
+        int_div.ops[2] = VecOp::Bin {
+            op: VecBin::Div,
+            a: 0,
+            b: 1,
+        };
+        cases.push((int_div, "needs a float lane"));
+        let mut int_sqrt = template.clone();
+        int_sqrt.lane = VecLane::I64;
+        int_sqrt.ops[2] = VecOp::Sqrt { a: 0 };
+        cases.push((int_sqrt, "needs a float lane"));
+        let mut wide_const = template.clone();
+        wide_const.lane = VecLane::F64;
+        wide_const.ops[1] = VecOp::Const { bits: 0 };
+        cases.push((wide_const, "non-f32 lane"));
+        let mut int_max = template.clone();
+        int_max.lane = VecLane::I32;
+        int_max.ops.pop();
+        int_max.reduce = Some(VecReduce {
+            op: VecRedOp::Fmax,
+            value: 2,
+            fma: None,
+        });
+        cases.push((int_max, "integer reduction"));
         for (kernel, expected) in cases {
             let mut b = Builder::new(i.intern("f"), MirType::Void);
             b.add_vec_kernel(kernel.clone());
@@ -1039,12 +1160,80 @@ mod tests {
         }
     }
 
+    /// `out = x + s` over one stream and one scalar, called with tables of the given sizes; `None`
+    /// passes the table in as a parameter instead of a local slot.
+    fn kernel_call(ptr_slots: Option<u32>, scalar_slots: Option<u32>, streams: u32) -> Vec<String> {
+        use crate::{VecBin, VecKernel, VecLane, VecOp};
+        let mut i = Interner::new();
+        let mut b = Builder::new(i.intern("f"), MirType::Void);
+        let table = |b: &mut Builder, slots: Option<u32>, elem: MirType| match slots {
+            Some(n) => b.alloca(MirType::Array(Box::new(elem), n)),
+            None => b.add_param(MirType::Ptr),
+        };
+        let ptrs = table(&mut b, ptr_slots, MirType::Ptr);
+        let scalars = table(&mut b, scalar_slots, MirType::F32);
+        let ops = vec![
+            VecOp::Load { stream: 0 },
+            VecOp::Splat { scalar: 0 },
+            VecOp::Bin {
+                op: VecBin::Add,
+                a: 0,
+                b: 1,
+            },
+            VecOp::Store {
+                stream: streams - 1,
+                val: 2,
+            },
+        ];
+        let kernel = b.add_vec_kernel(VecKernel {
+            name: i.intern("k"),
+            lane: VecLane::F32,
+            streams,
+            scalars: 1,
+            unroll: 1,
+            ops,
+            reduce: None,
+        });
+        let n = b.build(MirType::I64, Op::ConstInt(8, MirType::I64));
+        b.build_void(Op::VecKernelCall {
+            kernel,
+            ptrs,
+            scalars,
+            n,
+        });
+        b.ret(None);
+        verify_function(&b.finish())
+    }
+
+    #[test]
+    fn veckernel_tables_must_hold_every_stream_and_scalar_the_recipe_uses() {
+        assert!(kernel_call(Some(2), Some(1), 2).is_empty());
+        assert!(kernel_call(Some(1), Some(1), 1).is_empty());
+        // Tables handed in from elsewhere are the producer's obligation.
+        assert!(kernel_call(None, None, 2).is_empty());
+        let short = kernel_call(Some(1), Some(1), 2);
+        assert!(
+            short
+                .iter()
+                .any(|e| e.contains("pointer table holds 1 entries but its recipe uses 2")),
+            "{short:?}"
+        );
+        let no_scalars = kernel_call(Some(1), Some(0), 1);
+        assert!(
+            no_scalars
+                .iter()
+                .any(|e| e.contains("scalar table holds 0 entries but its recipe uses 1")),
+            "{no_scalars:?}"
+        );
+    }
+
     #[test]
     fn valid_veckernel_masks_and_fused_reductions_verify() {
-        use crate::{VecCmp, VecKernel, VecOp, VecRedOp, VecReduce};
+        use crate::{VecCmp, VecKernel, VecLane, VecOp, VecRedOp, VecReduce};
         let mut i = Interner::new();
         let mut kernel = VecKernel {
             name: i.intern("k"),
+            lane: VecLane::F32,
             streams: 1,
             scalars: 1,
             unroll: 2,
@@ -1067,6 +1256,14 @@ mod tests {
         };
         assert!(kernel.validate().is_empty());
         assert!(kernel.pressure().is_some());
+        // The same masked body is well-formed on every lane type, and a compare-select is inside
+        // the emitter's coverage for all four.
+        for lane in [VecLane::F64, VecLane::I32, VecLane::I64] {
+            let mut other = kernel.clone();
+            other.lane = lane;
+            assert!(other.validate().is_empty(), "{lane:?}");
+            assert!(other.pressure().is_some(), "{lane:?}");
+        }
         kernel.ops.truncate(2);
         // The unused value field is not an operand when a fused product feeds the reduction.
         kernel.reduce = Some(VecReduce {
@@ -1456,5 +1653,83 @@ mod tests {
         b.ret(Some(z));
         let p = program_of(vec![callee, answer, b.finish()]);
         assert!(verify_program(&p).is_empty(), "{:?}", verify_program(&p));
+    }
+
+    /// A switch on `x: i8` with cases `values`, each case and the default returning a distinct
+    /// constant; the default passes `x` to a parameter, so edge arguments are checked too.
+    fn switch_fn(scrut_ty: MirType, values: &[i128]) -> crate::Function {
+        let mut i = Interner::new();
+        let mut b = Builder::new(i.intern("sw"), MirType::I64);
+        let x = b.add_param(scrut_ty.clone());
+        let mut cases = Vec::new();
+        let mut arms = Vec::new();
+        for &v in values {
+            let blk = b.new_block();
+            cases.push(crate::SwitchCase {
+                value: v,
+                target: blk,
+                args: vec![],
+            });
+            arms.push((blk, v));
+        }
+        let dflt = b.new_block();
+        let p = b.block_param(dflt, scrut_ty);
+        b.switch(x, cases, dflt, vec![x]);
+        for (blk, v) in arms {
+            b.switch_to(blk);
+            let r = b.build(MirType::I64, Op::ConstInt(v, MirType::I64));
+            b.ret(Some(r));
+        }
+        b.switch_to(dflt);
+        let r = b.build(MirType::I64, Op::ConstInt(99, MirType::I64));
+        let _ = p;
+        b.ret(Some(r));
+        b.finish()
+    }
+
+    #[test]
+    fn accepts_a_well_formed_switch() {
+        let f = switch_fn(MirType::I8, &[0, 1, -1, 127, -128]);
+        assert!(verify_function(&f).is_empty(), "{:?}", verify_function(&f));
+    }
+
+    #[test]
+    fn detects_non_canonical_and_duplicate_switch_cases() {
+        // 255 is the byte -1 spelled unsigned: not canonical for i8.
+        let errs = verify_function(&switch_fn(MirType::I8, &[0, 255]));
+        assert!(errs.iter().any(|e| e.contains("canonical")), "{errs:?}");
+        let errs = verify_function(&switch_fn(MirType::I32, &[3, 7, 3]));
+        assert!(
+            errs.iter().any(|e| e.contains("more than once")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn detects_a_switch_on_a_non_integer_scrutinee() {
+        for ty in [MirType::I1, MirType::F32, MirType::Ptr] {
+            let errs = verify_function(&switch_fn(ty, &[0]));
+            assert!(
+                errs.iter().any(|e| e.contains("switch scrutinee")),
+                "{errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn switch_edges_are_dominance_and_arity_checked() {
+        let mut f = switch_fn(MirType::I64, &[1, 2]);
+        // The default edge loses its argument: an arity error on that edge alone.
+        if let Terminator::Switch { default_args, .. } = &mut f.blocks[0].term {
+            default_args.clear();
+        }
+        let errs = verify_function(&f);
+        assert!(errs.iter().any(|e| e.contains("parameters")), "{errs:?}");
+        // Every case target is reachable through the switch, so it is dominance-checked: the
+        // printer and the walk agree on the edge order.
+        let f = switch_fn(MirType::I64, &[1, 2]);
+        assert_eq!(f.blocks[0].term.edge_count(), 3);
+        assert_eq!(f.blocks[0].term.edge_target(2), Some(crate::BlockId(3)));
+        assert_eq!(f.blocks[0].term.edge_target(3), None);
     }
 }

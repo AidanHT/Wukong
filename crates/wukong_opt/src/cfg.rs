@@ -7,18 +7,55 @@
 use wukong_mir::{BlockId, Function, Terminator};
 
 /// The successor blocks of a terminator. A `cond_br` whose two arms target the same block is
-/// reported once (it is a single CFG edge as far as reachability/dominance are concerned).
+/// reported once (it is a single CFG edge as far as reachability/dominance are concerned), and so
+/// is a block that several `switch` edges reach: the distinct targets, in first-edge order.
 pub(crate) fn successors(t: &Terminator) -> impl DoubleEndedIterator<Item = BlockId> {
-    // A terminator has at most two distinct successors. Keep them inline instead of allocating
-    // a Vec for every visited block in every CFG consumer.
+    // Every terminator but a `switch` has at most two distinct successors. Keep those inline
+    // instead of allocating a Vec for every visited block in every CFG consumer.
     let targets = match t {
         Terminator::Br { target, .. } => [Some(*target), None],
         Terminator::CondBr {
             then_blk, else_blk, ..
         } => [Some(*then_blk), (then_blk != else_blk).then_some(*else_blk)],
         Terminator::Ret(_) | Terminator::Unreachable => [None, None],
+        Terminator::Switch { .. } => {
+            let mut distinct: Vec<BlockId> = Vec::new();
+            t.for_each_edge(|s, _| {
+                if !distinct.contains(&s) {
+                    distinct.push(s);
+                }
+            });
+            return Successors::Many(distinct.into_iter());
+        }
     };
-    targets.into_iter().flatten()
+    Successors::Inline(targets.into_iter().flatten())
+}
+
+/// [`successors`]' iterator: the inline pair every two-way terminator fits in, or the distinct
+/// targets of a `switch`.
+enum Successors {
+    Inline(std::iter::Flatten<std::array::IntoIter<Option<BlockId>, 2>>),
+    Many(std::vec::IntoIter<BlockId>),
+}
+
+impl Iterator for Successors {
+    type Item = BlockId;
+
+    fn next(&mut self) -> Option<BlockId> {
+        match self {
+            Successors::Inline(it) => it.next(),
+            Successors::Many(it) => it.next(),
+        }
+    }
+}
+
+impl DoubleEndedIterator for Successors {
+    fn next_back(&mut self) -> Option<BlockId> {
+        match self {
+            Successors::Inline(it) => it.next_back(),
+            Successors::Many(it) => it.next_back(),
+        }
+    }
 }
 
 /// Predecessor blocks (unique, in source order) for every block, indexed by block id.
@@ -114,6 +151,12 @@ fn remap_term(t: &mut Terminator, remap: &[u32]) {
         } => {
             then_blk.0 = remap[then_blk.0 as usize];
             else_blk.0 = remap[else_blk.0 as usize];
+        }
+        Terminator::Switch { cases, default, .. } => {
+            for c in cases.iter_mut() {
+                c.target.0 = remap[c.target.0 as usize];
+            }
+            default.0 = remap[default.0 as usize];
         }
         Terminator::Ret(_) | Terminator::Unreachable => {}
     }

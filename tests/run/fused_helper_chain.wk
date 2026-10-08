@@ -1,0 +1,111 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 80
+// EXPECT-OUT: 84
+// EXPECT-OUT: 88
+// EXPECT-OUT: 92
+// EXPECT-OUT: 96
+// EXPECT-OUT: 100
+// EXPECT-OUT: 104
+// EXPECT-OUT: 108
+// EXPECT-OUT: 112
+// EXPECT-OUT: 116
+// EXPECT-OUT: 120
+// EXPECT-OUT: 124
+// EXPECT-OUT: 128
+// EXPECT-OUT: 132
+// EXPECT-OUT: 136
+// EXPECT-OUT: 140
+// EXPECT-OUT: 144
+// EXPECT-OUT: 148
+// EXPECT-OUT: 152
+// EXPECT-OUT: 156
+// EXPECT-OUT: 160
+// EXPECT-OUT: 164
+// EXPECT-OUT: 168
+// EXPECT-OUT: 172
+// EXPECT-OUT: -15
+// EXPECT-OUT: -9
+// EXPECT-OUT: -3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 9
+// EXPECT-OUT: 15
+// EXPECT-OUT: 21
+// EXPECT-OUT: 27
+// EXPECT-OUT: 33
+// EXPECT-OUT: 39
+// EXPECT-OUT: 45
+// EXPECT-OUT: 51
+// EXPECT-OUT: 57
+// EXPECT-OUT: 63
+// EXPECT-OUT: 69
+// EXPECT-OUT: 75
+// EXPECT-OUT: 81
+// EXPECT-OUT: 87
+// EXPECT-OUT: 93
+// EXPECT-OUT: 99
+// EXPECT-OUT: 105
+// EXPECT-OUT: 111
+// EXPECT-OUT: 117
+// EXPECT-OUT: 999
+module tests.run.fused_helper_chain
+
+// A model written as helper calls: `affine` produces `t`, `combine` consumes it. Each helper is one
+// counted loop, so the two only become adjacent loops after inlining, where `wukong_opt::fuse` merges
+// them (with the initialization loop before them) into one loop over 0..24 -- every access to a
+// shared buffer uses the identical index, and the distinct local buffers cannot alias. `ahead` reads
+// `t2[i + 1]`, one element past what the producer writes on the same iteration, so fusing it with
+// `affine25` would read before the write: those two must stay apart. Every lane is pinned.
+//
+// Expected values by hand: a[i] = 2i - 7, b[i] = 50 - i,
+//   o[i] = (3 a[i] + 1) + 2 b[i] = (6i - 20) + (100 - 2i) = 4i + 80
+//   u[i] = t2[i + 1] - 1 = (6(i + 1) - 20) - 1 = 6i - 15 for i < 23, and u[23] = t2[24] - 1 = 999
+
+fn affine(a: [i32; 24], mut t: [i32; 24]) {
+    for i in 0..24 {
+        t[i] = a[i] * 3 + 1;
+    }
+}
+
+fn combine(t: [i32; 24], b: [i32; 24], mut o: [i32; 24]) {
+    for i in 0..24 {
+        o[i] = t[i] + b[i] * 2;
+    }
+}
+
+fn affine25(a: [i32; 24], mut t: [i32; 25]) {
+    for i in 0..24 {
+        t[i] = a[i] * 3 + 1;
+    }
+}
+
+fn ahead(t: [i32; 25], mut u: [i32; 24]) {
+    for i in 0..24 {
+        u[i] = t[i + 1] - 1;
+    }
+}
+
+fn main() -> i32 {
+    let mut a: [i32; 24] = [0; 24];
+    let mut b: [i32; 24] = [0; 24];
+    for i in 0..24 {
+        a[i] = i * 2 - 7;
+        b[i] = 50 - i;
+    }
+    let mut t: [i32; 24] = [0; 24];
+    let mut o: [i32; 24] = [0; 24];
+    affine(a, t);
+    combine(t, b, o);
+    for i in 0..24 {
+        print(o[i]);
+    }
+    let mut t2: [i32; 25] = [0; 25];
+    t2[24] = 1000;
+    let mut u: [i32; 24] = [0; 24];
+    affine25(a, t2);
+    ahead(t2, u);
+    for i in 0..24 {
+        print(u[i]);
+    }
+    return 0;
+}

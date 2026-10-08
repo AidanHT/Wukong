@@ -69,22 +69,32 @@ not duplicate them. In summary, Wukong:
   layout declared in the type (`Tensor[f32, 512, 512, .col_major]`, `.tiled(64, 64)`, strided) and
   parallel schedules (`@parallel`) are part of the language rather than a soup of intrinsics and
   `#pragma`s. Honest status: a user-written `vec[f32, 8]` *value* parses and type-checks but does not
-  execute yet (`f32x8::load(..)` is a hard `C0001`); `@parallel` (bare form), `@generic` and `@tile`
-  have consumers today, and a `@tile` the compiler cannot apply — an unsupported loop form, a width
-  that is not a positive integer literal — is `E0309` rather than a silent drop, while
+  execute yet (`f32x8::load(..)` is a hard `C0001`); `@parallel` (bare form), `@generic`, `@tile`,
+  `@unchecked` and the parameter attribute `@noalias` (a checked `restrict` promise, `E0316` on a
+  provably aliased call) have consumers today, and a `@tile` the compiler cannot apply — an
+  unsupported loop form, a width that is not a positive integer literal — is `E0309` rather than a
+  silent drop, while
   `@simd`/`@align`/`@extern`/`@export` and `@parallel`'s `grain =` argument parse and are inert — layout is
   enforced across call boundaries; the default row-major (contiguous) layout and `.col_major` both
   lower multi-dimensional indexing (`.col_major` is byte-identical to `a[i + j*M]`); `.strided` /
-  `.tiled(…)` still reject indexing (`C0001`). Arena/scratch/pool allocator selection is not
-  implemented (the language's only runtime-sized memory today is `alloc_<T>`/`free`).
+  `.tiled(…)` still reject indexing (`C0001`). Runtime-sized memory is `alloc_<T>`/`free` (64-byte
+  aligned, zeroed) plus a per-thread LIFO scratch arena (`scratch_<T>(n)` / `scratch_mark()` /
+  `scratch_release(m)`); there is no uninitialized or user-selectable allocator yet.
+- **Checked slices.** Every `s[i]` on a `[]T` slice is checked against the length in its fat pointer
+  on every backend (`index out of bounds: the len is N but the index is I at file:line:col`, exit 1);
+  `-O2` removes the checks from counted loops by versioning them on one preheader guard, and
+  `@unchecked` on a `fn` is the explicit opt-out. Runtime indices into fixed-size arrays and
+  constant-shape tensors, and the extents handed to recognized runtime kernels, are not yet checked.
+  A pointer used as a condition (`if p`) is a null test.
 - **Zero hidden cost.** No GC, no implicit copies of large aggregates, no surprise allocations.
 - **Domain-aware optimization (implementation today).** The compiler **recognizes a matmul nest** (the
   `ikj` accumulate and `ijk` dot-product forms, incl. `nn.Linear` `A·Bᵀ`) and may lower it to a tuned
   **register-blocked, cache-tiled, packed AVX2/FMA GEMM microkernel**. It also **auto-vectorizes**
   elementwise loops (incl. branchy ones via if-conversion) and **reductions** to SIMD, contracts
   `x + y*z` to a **fused multiply-add**, **fuses** adjacent elementwise loops, and
-  **auto-parallelizes** `@parallel` loops across cores. Underneath, an SSA optimizer (inlining, mem2reg,
-  const-fold, CSE, DSE, DCE, LICM, loop unrolling) runs at `-O1` and above. Op-graph fusion across
+  **auto-parallelizes** `@parallel` loops across cores. Underneath, an SSA optimizer (inlining, SROA,
+  mem2reg, const-fold, CSE, DSE, DCE, loop deletion, LICM, scalar promotion, loop unrolling) runs at
+  `-O1` and above. Op-graph fusion across
   tensor ops is still planned **as a CPU MIR pass**; on GPU, `wukong_codegen_gpu`'s fusion planner and
   `--backend=gpu-native` can compile an eligible whole program into a cooperative megakernel. These
   recognizers are invisible to the user — you still write the loop nest in `.wk`.
@@ -187,7 +197,8 @@ source.wk
 Wukong IR (MIR)         one block-parameter SSA IR; mir_build emits it scalar-and-low directly —
    │                    there is no second level (`--emit=mir-high` means MIR *before* the
    │                    optimizer, not a different IR level)
-   │  optimization passes (mem2reg → SSA, const-fold, CSE, DSE, DCE, LICM, simplify-cfg;
+   │  optimization passes (SROA + mem2reg → SSA, const-fold, CSE, DSE, DCE, loop deletion,
+   │                       LICM, scalar promotion, simplify-cfg;
    │                       inlining; partial loop unrolling (-O2, never reassociating); op-graph fusion across tensor ops is planned on the CPU path;
    │                       the GPU backend has it — see below)
    ▼
@@ -209,8 +220,10 @@ AVX2+FMA encodings, so it requires an **x86-64 Windows host with AVX2 + FMA**
 (`wukong_mir::host_supports_vec_kernels`, which `avx2::host_supports_kernels` delegates to). On any
 other host the vectorizer consults that same predicate and never builds a 256-bit recipe in the first
 place, so those loops stay on the portable 128-bit CLIF path — the identical lowering
-`WUKONG_P4_NO_256=1` forces, and result-identical by construction. Everything still compiles and
-runs; only the widest lane is unavailable. The interpreter needs none of this. A **GPU backend** (NVIDIA, PTX via the driver JIT — no CUDA toolkit) is
+`WUKONG_P4_NO_256=1` forces, and result-identical by construction: elementwise lanes carry no
+reassociation, and a vectorized reduction computes the same canonical summation tree in both forms
+(`docs/internals.md`, "The canonical reduction tree"). Everything still compiles and runs; only the
+widest lane is unavailable. The interpreter needs none of this. A **GPU backend** (NVIDIA, PTX via the driver JIT — no CUDA toolkit) is
 behind `--features gpu`, and LLVM is an optional *textual-IR* emitter exposed via `--emit=llvm-ir` (always built; no feature flag).
 
 ## Status

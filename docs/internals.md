@@ -22,8 +22,9 @@ interchangeable ways to run the same program; they are not the product on their 
    Windows host with runtime AVX2+FMA3. That test is one function —
    `wukong_mir::host_supports_vec_kernels` — and **the vectorizer consults it too**, so off-gate the
    recipe is simply never built and the loop keeps the 128-bit CLIF form, exactly as
-   `WUKONG_P4_NO_256=1` forces. Everything else — front end, optimizer, interpreter, and the ordinary
-   Cranelift lowering — is host-agnostic.
+   `WUKONG_P4_NO_256=1` forces. That changes speed, never a result: a vectorized reduction computes
+   the same canonical tree in both forms (see the vectorizer section). Everything else — front end,
+   optimizer, interpreter, and the ordinary Cranelift lowering — is host-agnostic.
 2. **One SSA MIR, built low.** Instead of separate HIR/MIR/LIR there is a single block-structured
    SSA IR, and `wukong_mir_build` produces scalar SSA (explicit loops, `alloca`/`load`/`store`, SIMD
    ops) *directly* — there is one lowering stage, not two. The `MirLevel` enum and `Program::level`
@@ -61,9 +62,12 @@ wukong_span      Span, SourceMap (line index), string Interner / Symbol
 wukong_runtime   the AVX2/FMA microkernels the recognizers dispatch to (GEMM/GEMV, vmath,
                   reductions, norms, int8, bf16/f16) + the rayon-backed `wukong_parallel_for` that
                   `@parallel` lowers to — a leaf: no workspace deps, and both the interpreter and
-                  the native backend call into it. The bump `Arena` and the sequential
-                  `parallel_for` are reference surface with no caller anywhere in the workspace
-                  (the kernels use thread-local `Vec` scratch)
+                  the native backend call into it. It also backs the language's allocators:
+                  `wukong_rt_alloc` (64-byte-aligned zeroed heap) and `scratch` (the per-thread
+                  LIFO arena behind `scratch_<T>`/`scratch_mark`/`scratch_release`; the
+                  interpreter mirrors its mark count and region reuse). The bump `Arena` and the
+                  sequential `parallel_for` are reference surface with no caller anywhere in the
+                  workspace (the kernels use thread-local `Vec` scratch)
 wukong_diag      Diagnostic, Severity, error-code catalog, JSON + terminal renderers
 wukong_lexer     &str -> tokens (+ @attributes, error recovery)
 wukong_ast       AST nodes, NodeId, pretty-printer; owns `BinOp::fold_const_len` +
@@ -75,10 +79,11 @@ wukong_sema      name resolution + type checking + SHAPE checking
 wukong_mir       MIR data, builder, pretty-printer, verifier, `VecKernel` (the 256-bit AVX2
                   recipe). `MirLevel` lives here too but is inert — see Design bet 2.
 wukong_mir_build typed AST -> MIR (alloca-per-local lowering; SIMD loop auto-vectorization)
-wukong_opt       pass manager + analyses (cfg, dominators) + transforms (inlining,
-                  mem2reg, simplify, simplify-cfg, simplify-phis, dce, cse, dse, licm,
-                  loop unrolling) plus the `alias` provenance analysis every memory
-                  transform queries
+wukong_opt       pass manager + analyses (cfg, dominators) + transforms (inlining, sroa,
+                  mem2reg, simplify, simplify-cfg, simplify-phis, dce, tre, cse, dse,
+                  loop-delete, fuse, licm, bounds-check elimination, unswitch, promote,
+                  loop unrolling, switch formation) plus the `alias` provenance analysis
+                  every memory transform queries
 wukong_autodiff  reverse-mode autodiff as a MIR->MIR transform (scalar + tensor-tape VJP
                   rules, fused AdamW; finite-difference-gated) — the training backward path (driven by --emit=grad / --train)
 wukong_backend   `Backend` trait + `Artifact`
@@ -170,7 +175,11 @@ greps for the literal substring `"code":"Ennnn"`, so key order and the absence o
 
 A `Function` owns a value arena (`ValueId -> MirType`), a list of `BasicBlock`s, and an entry block.
 Each block has typed parameters, a straight-line list of `Inst { result: Option<ValueId>, op: Op }`,
-and exactly one `Terminator` (`Ret`, `Br`, `CondBr`, `Unreachable`). `Op` has 24 variants: constants
+and exactly one `Terminator` (`Ret`, `Br`, `CondBr`, `Switch`, `Unreachable`). `Switch` is a multi-way
+branch on an `i8`..`i64` scrutinee whose case values are stored canonically (sign-extended from the
+type's width) and pairwise distinct; only `wukong_opt`'s late switch formation creates one, and the
+verifier, interpreter, Cranelift (`cranelift_frontend::Switch`), textual LLVM (`switch`) and every
+terminator visitor handle it (the `gpu-native` lowering declines it). `Op` has 24 variants: constants
 (`ConstInt`/`ConstFloat`), `Bin`/`Cmp`/`Cast`, the unary `Neg`/`Not`, `Select`, memory
 (`Alloca`/`Load`/`Store`/`Gep`), `Call`, `Barrier` (cooperative thread-block fence from
 `sync_block()`), the float/SIMD primitives
@@ -216,7 +225,9 @@ SSA registers (see below), which is what makes the value-based passes effective.
 There is **no dedicated aggregate MIR type**. A tuple or struct is a flat, padded byte buffer whose
 local value *is* its base pointer (the convention arrays already follow); `t.0` / `s.f` is a typed
 `load`/`store` at the field's byte offset, and `mem2reg` leaves the aggregate slot in memory (its
-address is taken by every `gep`). Nested aggregates
+address is taken by every `gep`) — unless, at `-O2`, `sroa` has split it first: when every access
+reaches it through constant-index `gep`s, each accessed leaf becomes its own scalar slot that
+`mem2reg` then promotes. Nested aggregates
 (a struct/tuple field that is itself a struct, or an array of structs) lay out recursively — the
 registry-aware layout helpers resolve a named-struct field that the leaf type crate marks unsized — and
 an aggregate field initialized from a *non-literal* value is a leaf-precise deep copy, not a flat
@@ -259,7 +270,7 @@ the entry block exists, its parameters equal `Function::params` exactly, and it 
 `block.id` equals the block's index; operand/result types line up per op (float-ness classified by
 *lane* type, so a `<4 x f32>` `fadd` checks against `f32`); a `VecKernelCall`'s `kernel` index is in
 range for the owning function's `vec_kernels` and its result matches the recipe kind (a reduction
-yields an `f32`, an elementwise one yields nothing); and terminators are type-correct, including
+yields its lane type, an elementwise one yields nothing); and terminators are type-correct, including
 branch-argument arity/types and the function return type. Blocks unreachable from the entry keep their
 type checks with the dominance rule switched off. Given a whole `Program`, `verify_program`
 additionally cross-checks every call against the callee's declared signature — external symbols
@@ -287,7 +298,9 @@ the operand's defining line for its type.
 `wukong_opt::optimize` first runs a whole-program **inliner** (`-O2`), then `PassManager` runs a
 list of function-level `Pass`es to a per-function fixpoint (capped at 100 sweeps), then a
 whole-program **loop unroller** (`-O2`) with a reduced cleanup sweep over just the functions it
-changed. The fixpoint uses
+changed. Functions are optimized **callees first** (call-graph SCCs in Tarjan order), and each SCC is
+summarized as soon as it is done (`src/effects.rs`), so a caller's passes know which of its calls
+have no side effect. The fixpoint uses
 per-pass **clean-tracking**: a pass is a deterministic function of the MIR, so one that reported "no
 change" cannot fire again until some *other* pass mutates the function; clean passes are skipped and
 any mutation re-dirties all of them. That changes only how often a pass runs, never the sequence of
@@ -304,20 +317,33 @@ mem2reg/CSE/LICM results the verifier does not catch. Passes that only touch ins
 parameters or edge arguments leave the cache alone, and the prune-first passes (`mem2reg`, `cse`,
 `licm`) use the free `all_reachable` test to skip their reachability DFS in the steady state.
 
+The pass manager's cache is *managed*: it also holds the function's `AliasInfo`, shared by `cse`,
+`dse` and `licm` while nothing mutates and dropped as soon as any pass reports a change or the CFG is
+invalidated, and the call-effect table for the callees optimized so far. A cache built by hand (tests,
+`inline`'s specialization) is unmanaged and recomputes alias facts on every request.
+
 | Pass            | Level | What it does |
 |-----------------|-------|--------------|
-| `inline_program`| -O2   | inline non-recursive callees **bottom-up over the call graph** (reverse topological order from Tarjan SCCs, so a helper chain collapses in one sweep), scored by a cost model rather than one blanket size cap, then drop callees left uncalled; runs before the function pipeline so the spliced code optimizes in context |
-| `Mem2Reg`       | -O1   | promote scalar int/float **and pointer** `alloca` slots to block-parameter SSA via dominance-frontier phi placement and a dominator-tree rename (a pointer slot only when it is provably written before it is read — see below) |
+| `inline_program`| -O2   | first rewrite every fully tail-recursive function into a loop (`tre::pre_inline`, on a mem2reg'd copy), then inline non-recursive callees **bottom-up over the call graph** (reverse topological order from Tarjan SCCs, so a helper chain collapses in one sweep), scored by a cost model rather than one blanket size cap, then drop callees left uncalled; runs before the function pipeline so the spliced code optimizes in context |
+| `Sroa`          | -O2   | scalar replacement of aggregates, ahead of `Mem2Reg`: split a local `Array` slot whose every access is a load/store through a constant-index `gep` chain into one scalar slot per accessed leaf. Each access carries its interpreter slot *and* native byte offset; one cell must be one byte range of one type, distinct cells disjoint, so the split preserves both memory models; a leaf whose fresh default differs from the byte it replaces needs a must-be-written proof |
+| `Mem2Reg`       | -O1   | promote scalar int/float **and pointer** `alloca` slots to block-parameter SSA via dominance-frontier phi placement and a dominator-tree rename (a pointer slot's read-before-write path gets the null `inttoptr 0` — see below) |
 | `Simplify`    | -O1   | constant folding + algebraic identities (`x+0`, `x*1`, `x*0`, `x^x`, `x&x`, `x\|x`, `x%1`) and integer self-comparison folding |
-| `SimplifyCfg` | -O1   | constant-branch folding, straight-line block merging, and unreachable-block pruning (with renumbering) |
+| `SimplifyCfg` | -O1   | constant-branch folding (including a constant or degenerate `switch`), jump threading of an `i1` constant edge argument through an empty test block (never past a loop header), straight-line block merging, folding a branch into a predecessor that reaches the same destination (one `cond_br` on `and`/`or`, speculating at most four pure non-trapping non-memory instructions — `src/branch_fold.rs`), and unreachable-block pruning (with renumbering) |
 | `SimplifyPhis`| -O1   | drop dead and trivial block parameters that mem2reg introduced |
-| `Dce`         | -O1   | remove pure instructions whose results are unused, and dead allocas |
-| `Cse`         | -O2   | dominator-tree value numbering (a pure computation is reused by every block it dominates, via a scoped table) plus **intra-block** load forwarding keyed on `(address value, accessed type)`, with `alias` deciding which entries a store or call invalidates |
-| `Dse`         | -O2   | dead-store elimination (a store fully overwritten by a later one with no intervening read that `alias` says could observe it) |
+| `Dce`         | -O1   | remove pure instructions whose results are unused, dead allocas, and unused calls to callees summarized as side-effect free and always returning |
+| `Tre`         | -O1   | tail-recursion elimination: a self-call whose result is returned becomes a branch to a loop header carrying the parameters; integer `add`/`mul`/`and`/`or`/`xor` accumulator recursion (`n * f(n - 1)`) gets an accumulator parameter (never a float op); a function with a frame slot left is skipped (`src/tre.rs`) |
+| `Cse`         | -O2   | global value numbering: dominator-tree value numbering (a pure computation is reused by every block it dominates, via a scoped table); load forwarding keyed on `(address value, accessed type)` along single-predecessor edges and **through joins** (the intersection of the predecessors' exit states — a location every edge knows with different values becomes a lazily created block parameter); block-parameter numbering (trivial and duplicate parameters); a phi for an expression every arm of a join computed; and calls to side-effect-free callees numbered (read nothing) or forwarded like loads (read memory). `alias` decides which entries a store or opaque call invalidates. Loop headers start with an empty memory table |
+| `Dse`         | -O2   | dead-store elimination: a store overwritten at the same must-alias location (same base and constant offset, not just the same SSA value) before any read in its block, or on **every path** out of it for a stable location (a constant in-bounds offset of an entry-block slot, or of a parameter), or retired by the end of the function for a slot no callee can name; plus every store into a never-read private slot that is provably in bounds — a constant offset, or a loop induction variable over a constant range inside the slot in both memory models |
 | `LoopCanon`   | -O2   | canonicalize loop entry/latch structure before loop-invariant code motion |
-| `Licm`        | -O2   | hoist loop-invariant, side-effect-free, non-trapping ops to the loop preheader — including a **load**, when `alias` proves nothing in the body writes it *and* the access is dereferenceable |
+| `LoopDelete`  | -O2   | bypass a loop with a preheader, one exit edge and no side effect whose values nobody outside uses, when it provably terminates (a constant trip count whose induction variable never wraps, or a unit-step strict bound) — what removes an initialization loop `Dse` emptied |
+| `LoopFuse`    | -O2   | fuse two adjacent innermost two-block counted loops over the same range: the second's pure preheader moves ahead, its body joins the first's, and every cross-loop access pair with a write must be the identical affine index on one object or proved disjoint; never fuses a widenable loop with an unwidenable one (`src/fuse.rs`) |
+| `Licm`        | -O2   | hoist loop-invariant, side-effect-free, non-trapping ops to the loop preheader — including a **load** nothing in the body may write, when it is dereferenceable, sits in the header (which runs on every entry), or runs on every iteration of a single-exit loop, in which case it reads through `select(first_test, addr, dummy)` so a zero-trip entry reads a private dummy slot, and a call to a callee summarized as speculatable |
+| `Bce`         | -O2   | slice bounds-check elimination: version an innermost counted loop on a preheader guard (`start < end`, then per check `lo <=u hi && hi <u len` at the two ends of the index range, overflow-safe) so a check-free copy runs when every check is proved and the original, checked loop runs otherwise; a caller-owned slice header is read early only behind the guards of the checks that precede it (`bce.rs`) |
+| `LoopUnswitch`| -O2   | after LICM: split a counted unit-step loop whose body branches on `iv` against an invariant at the clamped iteration where the guard changes (two back-to-back loops, each with the guard decided), or unswitch a branch on an invariant `i1` into a preheader branch between the loop and a copy; innermost loops without calls or frame slots, size-capped (`src/unswitch.rs`) |
+| `Promote`     | -O2   | scalar promotion: a loop-invariant location the loop both reads and writes, with no other possibly aliasing access, is loaded once in the preheader, accessed through a fresh slot (which `Mem2Reg` turns into a loop-carried value next sweep) and stored back on every dedicated exit, with the same speculation rules as `Licm` and a store-safety rule (private slot, or a store that runs whenever the loop does) |
 | `Vectorize`   | -O2   | widen eligible canonical MIR loops after LICM, then feed the result through the normal fixpoint cleanup |
-| `unroll_program`| -O2 | unroll a counted two-block loop 4x, with a wrap-safe guard and a remainder loop; runs **after** the function pipeline, and the functions it changed get a reduced cse+dce cleanup sweep |
+| `unroll_program`| -O2 | unroll a counted two-block loop: **completely** when its exact trip count is at most 32 and the copies total at most 128 instructions; otherwise 4x (body up to 16 instructions) or 2x (up to 32), with a wrap-safe guard and a remainder that is a loop for an unknown trip count, nothing when the factor divides a known one, and straight-line copies for a known leftover; runs **after** the function pipeline, and the functions it changed get a reduced simplify + simplify-cfg + simplify-phis + cse + dce cleanup sweep |
+| `FormSwitches` | -O2 | once, after unrolling: turn a chain of four or more `cmp.eq`/`cmp.ne` tests of one integer scrutinee against constants into one `switch` terminator, hoisting the pure link compares into the head; a trapping (`unreachable`) fall-through stays the default, because sema's exhaustiveness check is lenient and that block can be reached (`src/switch_form.rs`) |
 
 `-O3` currently runs the same pass pipeline as `-O2`: there are no `-O3`-exclusive passes yet
 (`PassManager::standard` adds passes at `-O1` and `-O2` only).
@@ -337,6 +363,25 @@ and a wrapped limit sends every iteration to the remainder loop instead of runni
 end of the range. `tests/run/loop_unroll.wk` pins that guard, the `trip mod 4` remainder, and the
 zero-trip case. `WUKONG_NO_UNROLL=1` disables the pass.
 
+A **known trip count** is computed in the induction variable's own width and predicate, and only
+when the final increment does not wrap (an `i8` loop stepping by 2 to `127` never ends, so its
+closed-form count is not its behavior and it is treated as unknown). With it the unroller replaces a
+short loop by its iterations — the header keeps its instructions as iteration 0's test, every body
+copy feeds the next header copy, a final header copy produces the exit values — and gives a partially
+unrolled loop no remainder loop at all: none when the factor divides the count, straight-line copies
+for the leftover otherwise.
+
+**Call effects** (`src/effects.rs`). A user function is summarized only when calling it has no side
+effect: every store targets its own frame, every call is to a summarized callee or its own SCC (the
+greatest fixpoint, so recursion is fine), no barrier or shared slot or element-wise vector kernel,
+and no pointer return, pointer compare or `ptrtoint` unless the pointer was handed in or names static
+data. The summary records whether it reads caller-visible memory, whether it always returns (no
+loop, recursion or `unreachable`), and whether it is speculatable (always returns, reads nothing, no
+integer division, and no load or store outside a known in-bounds offset of its own frame — exactly
+what LICM would speculate itself). External `print`/`wukong_*` symbols are never summarized. The
+post-unroll cleanup (`PassManager::run_subset`) re-summarizes the whole program from its unrolled
+bodies first, so a callee whose short loop was unrolled away now counts as always returning.
+
 One splice detail generalizes to every MIR pass: `Op::VecKernelCall.kernel` is a **function-local**
 index, not a `ValueId`, so value renaming neither sees nor fixes it, and `inline_call_site` must carry
 the callee's recipes into the caller and rebase every copied index (see the vectorizer section).
@@ -347,40 +392,35 @@ promotes integer, float and pointer slots and leaves arrays, vectors, address-ta
 slot accessed at a width other than its own type in memory. For an integer or float slot a read
 before any write becomes a zero constant, matching the interpreter's zero-initialized memory.
 
-A **pointer** slot has no such zero — `inttoptr 0` is a genuine null on the native backend but a
-*valid, addressable* slot in the interpreter, so materializing one would trade a stack slot for an
-interp-vs-native divergence — so only the definitely-initialized subset is promoted: the **first
-access to the slot inside its own `alloca`'s block `B` must be a store**, and `B` must be the entry
-block or have an empty dominance frontier. SSA dominance makes `B` dominate every block that
-mentions the slot (a use is dominated by the `alloca` that defines it) and a block is straight-line,
-so every access outside `B` happens after all of `B`. `DF(B) = ∅` makes the set of blocks `B`
-dominates closed under both successors and predecessors, so the iterated dominance frontier of the
-store blocks — and every predecessor of every block that receives a phi, which is exactly where the
-renamer asks for a reaching definition — stays inside it, and the rename stack is never empty. The
-entry block gets its own arm because a back edge can put it in its own frontier while it still
-dominates everything.
-
-That admits the case the restriction exists for: `mir_build` gives every pointer-typed parameter —
-`*T`, `&T`, and every `Tensor[…]`, all `MirType::Ptr` — an `alloca ptr` plus a `store <param>` in
-the entry block, and then re-loads that base pointer at *every* element access; the `DF(B) = ∅` arm
-adds the same parameters after `-O2` inlining has spliced a callee's entry block into the middle of
-a caller block. Promoting them removes 3 of the 5 loads per element from a three-operand `Tensor`
-loop (`tests/run/ptr_slot_promotion.wk`) and leaves **no `alloca ptr` at all** across the run corpus
-at `-O2`, and it compounds: deleting `store <slot>, <ptr slot>` can un-escape the pointee so a later
-fixpoint round promotes that too. A pointer local whose `alloca` and initializing store are separated
-by a branch keeps its slot.
+A **pointer** slot's zero is the null pointer, `inttoptr 0`. That used to be unsound — interpreter
+slot 0 was the first live allocation of a run, so a materialized null would have aliased real memory
+(the reverted `PtrToInt(p) != 0` attempt, `0900352`) — and mem2reg promoted only the
+definitely-initialized subset of pointer slots. The interpreter now reserves slot 0 as a
+never-allocated null at every entry point (`wukong_interp::NULL_SLOT`; a load or store through it is
+the diagnostic `null pointer dereference`), so its zero-initialized pointer memory and native's
+`inttoptr 0` are the same null and every pointer slot is promoted like an integer slot: a
+read-before-write path gets the null, materialized once in the entry block as `inttoptr (i64 0)`.
+The same reservation is what lets `mir_build` lower a pointer condition (`if p`, `while p`, `p && q`)
+as the null test `ptrtoint p != 0`; it used to reach `cond_br` unchanged and fail verification with
+no span. That matters for the case pointer promotion was written for — `mir_build` gives every
+pointer-typed parameter (`*T`, `&T`, every `Tensor[…]`) an `alloca ptr` plus a `store <param>` and
+re-loads the base pointer at every element access (`tests/run/ptr_slot_promotion.wk`) — and now also
+for a pointer local whose `alloca` and initializing store are separated by a branch, which used to
+keep its slot and reload it on every use (`tests/run/pointer_null_condition.wk`).
 
 A `[]T` **slice** parameter is *not* covered: a slice is a 16-byte `{ data, len }` fat pointer passed
 by address, so its base comes from `load ptr (gep <param>, 0)` — caller-owned memory, not a local
-slot. Hoisting that needs loop-invariant load motion, and `licm` performs that only for a
-**dereferenceable** access, which a pointer into caller-owned memory is not (see the alias analysis
-below).
+slot. Hoisting that needs loop-invariant load motion: `licm` hoists such a load when it runs on every
+iteration (behind a first-iteration guard) **and** no store in the loop may alias it — and every write
+through a slice goes through a pointer loaded the same way, of unknown provenance, so a slice loop
+that writes anything still reloads (the vectorizer hoists those bases under its own runtime guard).
+Removing the rest needs a `noalias` fact.
 
 `Cse`/`Dse` still handle the residual memory (load forwarding and its dual) for the slots that stay
 in memory. `Licm` uses the dominator
 analysis to find natural loops and only hoists into loops that already have a preheader, so it is
-always legal; stores, calls, vector-kernel calls, allocas, and integer division/remainder (which can
-trap on a zero divisor) are never moved. Float predicates are never folded on self-comparison
+always legal; stores, vector-kernel calls, allocas, integer division/remainder (which can trap on a
+zero divisor) and calls other than to a speculatable side-effect-free callee are never moved. Float predicates are never folded on self-comparison
 (NaN != NaN).
 
 ### Alias analysis (`wukong_opt::alias`)
@@ -401,17 +441,30 @@ and disjoint constant byte intervals off one base (`may_alias_sized`). "Non-esca
 literally — the address may appear only as the pointer operand of a `gep`/`load`/`store`, and any
 other use publishes it.
 
-**Two distinct pointer parameters may alias.** Wukong makes no promise otherwise: nothing rejects
-`f(a, a)`, and there is no `restrict`/`&mut` annotation to carry a promise, so the analysis returns
-"may alias" and `tests/run/alias_slice_params.wk` pins the behaviour that depends on it. This is the
-single biggest fact the optimizer is missing, and closing it is a **language** decision, not an
-analysis one — see the roadmap.
+**Two distinct pointer parameters may alias — unless the source promised otherwise.** For an
+ordinary parameter nothing rejects `f(a, a)`, so the analysis returns "may alias" and
+`tests/run/alias_slice_params.wk` pins the behaviour that depends on it. The language decision that
+closes the gap is the `@noalias` parameter attribute (C's `restrict`): `wukong_sema::noalias` rejects
+the call sites and re-pointings that provably break it (`E0316`), `wukong_mir_build` records it as
+`wukong_mir::ParamAttrs` on the MIR parameter (printed `noalias`), and `AliasInfo` then answers
+"disjoint" for a promised parameter against every other parameter, gives a promised slice's elements
+their own provenance (`Prov::ParamData`, demoted if the fat pointer is ever written or published), and
+— when nothing derived from the parameter escapes — keeps its storage apart from untracked pointers
+and callees (`promised_storage`, `is_call_proof`). The loop dependence test and the vectorizer's
+runtime alias guard ask `promised_disjoint_bases`; Cranelift maps promised storage to its own alias
+regions (`Heap` written, `Table` read-only) and marks an invariant promised fat-pointer load
+`readonly + can_move`; the LLVM emitter writes `ptr noalias`. Every one of these facts is gated on a
+promise: a function without one builds no per-parameter table and analyzes exactly as before.
 
 `is_dereferenceable(ptr, bytes)` is a separate question that only a *speculating* transform asks: may
-this access run on a path the program might not have taken? It is true only for a known in-bounds
+this access run on a path the program might not have taken? It is true for a known in-bounds
 offset into an `alloca` of this function, which is live for the whole function and default-initialized
-by both backends. That is what lets `Licm` hoist a loop-invariant load out of a possibly-zero-trip
-loop for a local `[]T`/struct/tuple, and what stops it doing the same through a parameter.
+by both backends, and for an offset inside the 16-byte fat pointer of a `@noalias` slice parameter,
+which the caller keeps alive for the whole call. That is what lets `Licm` hoist a loop-invariant load
+out of a possibly-zero-trip loop for a local `[]T`/struct/tuple or a promised slice's `data` field
+unconditionally. Through any other parameter it needs more: the load must run on every iteration, and
+it is then read through `select(first_test, addr, dummy)` so the preheader never touches the
+parameter's memory on an entry that would not have.
 
 Two more folds are refused for the same `-O0` ≡ `-O{1,2,3}` reason. A bf16/f16 constant is never
 folded — arithmetic or comparison — because the folder rounds to the f32 grid while the backends round
@@ -542,19 +595,54 @@ polynomial expanded per lane — only for an f32 lane, and only while the name d
 `fn` (a user `fn gelu` wins and the loop stays scalar). `@parallel` per-thread chunks go through the
 same vectorizer, so they run SIMD × cores.
 
+The vectorizer streams over every buffer form a kernel is written over: a `[T; N]` array, a
+contiguous `Tensor[T, …]` of constant **or symbolic** extents, and a `[]T` slice. Each stream's data
+pointer resolves through `kernel_base_ptr`, the rule every recognizer already uses (an `Array`-bound
+name *is* its storage; a `Ptr`-bound tensor and a slice's fat pointer hold it one load away). The two
+runtime-sized forms bring two facts only the run time knows, and `vector_guarded_end` tests both once,
+ahead of the loop, as loop versioning: every slice access must stay inside the slice's length over the
+whole range, and every written stream must be disjoint from every other stream of the body whenever
+either one is runtime-addressed. If either test fails the vector part covers nothing and the scalar
+remainder — the loop exactly as written — does all the work. The overlap test is the run-time alias
+check gcc and LLVM version a loop on; it is needed on top of the whole-program `provably_disjoint`
+fact because that fact assumes every caller is visible, which an `--emit=obj` export, a harness
+entering through a raw pointer, or one of the call-borrowed views `alias.rs` lists as holes all
+violate. A pair of two `[T; N]` arrays keeps the static fact alone. Two lane-type rules keep the
+vector lanes equal to the scalar tail: integer lanes compare **signed** in both vector forms (AVX2 has
+only `vpcmpgt*`), so an ordered compare of unsigned operands keeps the loop scalar; and a compound
+assign vectorizes only where its one lane-wise op exists (`/` on a float lane, the bitwise ops on an
+integer lane, never `%` or a shift).
+
 Cranelift's CLIF vector ISA still caps at 128-bit — a 256-bit `f32x8` SSA value is rejected at
 `define_function` (the `cranelift_still_rejects_f32x8` / `p4_probe_vec256_ops` tripwires keep that
-documented). So for an eligible f32 elementwise body the vectorizer captures the loop as a flat,
-backend-agnostic `VecKernel` recipe and, when register pressure fits, emits one `Op::VecKernelCall`:
-the Cranelift backend assembles that recipe to **true 256-bit AVX2 machine code** via `iced-x86`
+documented). So for an eligible body the vectorizer captures the loop as a flat, backend-agnostic
+`VecKernel` recipe and, when register pressure fits, emits one `Op::VecKernelCall`: the Cranelift
+backend assembles that recipe to **true 256-bit AVX2 machine code** via `iced-x86`
 (`wukong_codegen_cranelift::avx2`, VEX-encoded), while the interpreter marshals the *same* recipe
 lane-wise — so the two stay bit-identical (elementwise lanes carry no reassociation, so the gate
-holds element-for-element). `Op::VecKernelCall.kernel` is an index into the *owning* function's
+holds element-for-element). A recipe has one lane type (`VecLane`): **f32** (8 lanes, the `*ps`
+family), **f64** (4 lanes, `*pd`), and the wrapping integer lanes **i32** (8 lanes,
+`vpaddd`/`vpsubd`/`vpmulld`) and **i64** (4 lanes, `vpaddq`/`vpsubq` — AVX2 has no 64-bit lane
+multiply, so `VecKernel::pressure` refuses one and that body keeps the 128-bit strips). The reference
+evaluators (`eval_lane`, `eval_reduction`) are generic over the matching Rust type, so each lane type
+has exactly the arithmetic its instruction family performs. A kernel keeps up to eleven stream base
+pointers in GPRs (the volatile r9/r10/r11/rdx plus the callee-saved rsi/rdi/rbx/r12–r15 it pushes),
+so the five-plus-stream bodies of fused epilogues stay 256-bit. An elementwise kernel whose
+output-only streams are all 32-byte aligned and whose streamed traffic reaches 10 MiB (the runtime's
+`nt_policy` default) stores them with `vmovnt*` and `sfence`s before returning — the read-for-ownership
+a cacheable store pays on a stream larger than the caches is the largest lever on a bandwidth-bound
+loop; the choice is made inside the kernel at run time and only picks which store instruction writes
+the identical values (`WUKONG_P4_NO_NT=1` assembles only the cacheable form). There is deliberately no
+software prefetch: the hardware prefetchers already track unit-stride streams, and `gcc -O3` emits none
+either. Stack-slot alignment stays at 16: Cranelift aligns a slot's *offset* within a frame whose base
+is only 16-byte aligned, so a 32-byte request would not be honoured. A literal trip shorter than one
+register group keeps the inlined strips (the kernel could only be called with `n = 0`); a runtime
+trip always takes the kernel. `Op::VecKernelCall.kernel` is an index into the *owning* function's
 `vec_kernels` recipe table, not a `ValueId`, so a MIR pass that moves instructions between functions
 must copy the callee's recipes into the caller and shift every copied index (`wukong_opt::inline` does
 exactly that; without it a spliced call names one of the caller's own recipes). The verifier
 range-checks the index and requires the call's result to match the recipe kind: a reduction recipe
-yields an `f32`, an elementwise one yields nothing.
+yields its lane type, an elementwise one yields nothing.
 
 That assembler path is host-gated: `wukong_mir::host_supports_vec_kernels()` requires
 `target_arch = "x86_64"` **and** `target_os = "windows"` **and** runtime AVX2 + FMA3, because the
@@ -570,29 +658,65 @@ fallback already existed. `assemble_kernel`'s `Err` is now a backstop: reaching 
 disagreed with the emitter, which is a bug rather than a platform outcome. The kernels are assembled
 while the module is populated — the same code path for the JIT and for `--emit=obj` — so an emitted
 object is host-ISA- and host-ABI-specific.
-`WUKONG_P4_NO_256` forces the portable 128-bit path — a same-run A/B knob and a kill-switch. The
-float-reduction path has an analogous 256-bit kernel, gated to large trips
-(`VEC256_REDUCTION_MIN_TRIP` = 2048 elements) because the out-of-line call loses to the inlined
-128-bit reduction on small arrays.
+`WUKONG_P4_NO_256` forces the portable 128-bit path — a same-run A/B knob and a kill-switch; it
+changes instruction selection and never a result, reductions included (below).
 
 Two refinements target the dominant ML arithmetic. A float `x + y*z` **contracts to a fused
 multiply-add** (`Op::Fma`, one rounding, a hardware `vfmadd`) in both the scalar and vector lowering
 paths; the interpreter mirrors it with `mul_add`, so the two backends stay bit-identical. And a
-**float reduction** `for k in .. { s = s + x[k]*y[k] }` (or `s += ..`) is recognised and lowered to
-independent vector-lane accumulators (each an FMA chain), a cleanup loop, a horizontal fold, and a
-scalar remainder. For f32 expressions representable by a fitting wide recipe, `prepare_reduction`
-fixes the logical partition before the ISA, ABI, trip-count, or kill-switch gate. Its U comes from
-the recipe's register-pressure calculation. The portable path uses 2U four-lane vectors to represent
-the same U eight-lane accumulators: main stride 8U, cleanup stride 8 into accumulator zero, sequential
-cross-U combination, then a sequential lane-0..7 fold. The scalar seed is combined once afterward;
-without a complete group it is preserved unchanged before the scalar tail. The raw wide emitter's
-ABI and positive-group arithmetic are unchanged. `reduction_partition_is_independent_of_width_and_threshold`
-checks both flags, backends and O0/O2 against explicit cancellation, seed and exceptional-value
-oracles, including pressure-limited U and dynamic bounds. Portable MIR and register pressure can
-increase; the performance cost has not been measured. Other types and recipe-ineligible expressions
-retain their existing portable partition. Reductions vectorize only on the sequential path, never
-the `@parallel` one (folding into a shared accumulator across threads would race). Reassociation is
-a build contract, not a promise of strict source-order summation or stability across compiler releases.
+**reduction** `for k in .. { s = s + x[k]*y[k] }` (or `s += ..`, a running `fmax`/`fmin`, or any `+`
+chain that holds `s` once — `s = s + x + y` is the reduction `s += x + y`) over an f32, f64, i32 or
+i64 accumulator is recognised and lowered to independent lane accumulators (an FMA chain when the
+addend is a product), a cleanup loop, a horizontal fold, and a scalar remainder.
+
+### The canonical reduction tree
+
+A vectorized float reduction regroups its addends, and the grouping decides the low bits of the
+answer. That grouping is fixed **once, as part of the language**, and every lowering of the loop
+computes it: the 256-bit kernel, the portable 128-bit strips, the interpreter, every `-O` level, every
+host, a literal trip or a runtime one, any addend. With `L` lanes per 256-bit register (8 for f32/i32,
+4 for f64/i64) and `U = 4` (`VEC_UNROLL`):
+
+1. `U` accumulators of `L` lanes, initialised to the fold identity (`+0.0`, `-∞` for max, `+∞` for min).
+2. Main loop: element `i + u·L + l` of each `U·L` block folds into accumulator `u`, lane `l`.
+3. Cleanup: every remaining full `L`-element group folds into accumulator 0.
+4. Accumulators `1..U` fold into accumulator 0 lane-wise, in order `1, 2, 3`.
+5. Lanes `0..L` of accumulator 0 fold left to right into one value `r`.
+6. If at least one full group ran, the scalar seed `s` becomes `fold(s, r)`; otherwise the seed is
+   untouched (a `-0.0` or NaN seed is never disturbed by the identity).
+7. The `< L` remaining elements fold into `s` one at a time, in index order.
+
+`fold` is `+` — a single-rounded `fma(x, y, acc)` when the addend is a product `x*y` — or the x86
+operand-order `max`/`min` (`acc > x ? acc : x`, which matches `vmaxps` on ties and NaN). Integer sums
+wrap and are exact under any grouping; they use the same tree anyway. The reference implementation is
+`VecKernel::eval_reduction` with its module docs in `wukong_mir::vec_kernel`; the portable form
+represents each logical accumulator as a pair of 128-bit vectors (`emit_reduction_portable`,
+`finish_portable_reduction`), and `tests/run/reduction_canonical_tree.wk` pins the tree with
+hand-evaluated values at sizes that exercise every step.
+
+What is deliberately **not** an input to the tree: the host ISA or OS (`host_supports_vec_kernels`),
+`WUKONG_P4_NO_256`, the lowering option that keeps recipes away from the PTX backend, whether the
+trip is a literal, and the addend's register pressure. The last used to pick the 256-bit kernel's
+accumulator count, so the same `.wk` source summed differently on a Linux CI box, under the kill
+switch, or after an innocuous edit to the addend. A body too large for `U` accumulators beside one bank
+of its own registers now simply does not take the kernel (`VecKernel::reduction_fits`); one that fits
+beside the accumulators but not `U` times over shares register banks between the unrolled copies
+(`reduction_banks`) — that changes the schedule, never the grouping.
+
+Which form runs is a performance choice only: the raw-AVX2 kernel when the recipe fits and the trip
+reaches `VEC256_REDUCTION_MIN_TRIP` (2048 elements, the measured crossover of the out-of-line call
+against the inlined form for the highest-pressure body), the portable form otherwise. A literal trip
+decides it statically; a runtime trip — the `fn k(a: []f32, n: i64)` shape every real kernel has —
+carries both forms behind one run-time compare, since both compute the same tree. Two cases fall
+outside the tree, both by construction: when `vector_guarded_end` sends a loop scalar (an
+out-of-bounds slice access or an overlap, i.e. a program whose scalar semantics the vectorized loop
+must not change) the whole loop is the strict left fold the source spells; and a loop the front end
+does not vectorize (a `while`, or a body it declines) reaches `wukong_opt::vectorize`, which never
+reassociates a float accumulate. Recognized kernels (`wukong_sreduce_*` and friends) define their own
+documented reduction order, chosen by the program's spelling and never by the host. Reductions
+vectorize only on the sequential path, never the `@parallel` one (folding into a shared accumulator
+across threads would race). The tree is a build contract, not a promise of strict source-order
+summation or stability across compiler releases.
 
 ## Spelling canonicalization before recognition
 

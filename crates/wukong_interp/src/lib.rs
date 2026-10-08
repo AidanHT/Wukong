@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use wukong_backend::{Artifact, Backend};
 use wukong_mir::{
     BasicBlock, BinOp, CastKind, CmpOp, Function, MirType, Op, Program, Terminator, ValueId,
+    VecKernel, VecLane, VecOp, VecValue,
 };
 use wukong_span::{Interner, Symbol};
 
@@ -67,8 +68,68 @@ impl Value {
         }
     }
 
+    /// The integer-buffer twin of [`Self::kernel_float`]: an integer slot is an `Int`, and anything
+    /// else in a buffer a kernel reads as integers is type confusion, reported rather than coerced.
+    fn kernel_int(self, context: &str) -> Result<i128, String> {
+        match self {
+            Value::Int(i) => Ok(i),
+            Value::Float(_) => Err(format!("{context}: integer buffer contains a float slot")),
+            Value::Ptr(_) => Err(format!("{context}: integer buffer contains a pointer slot")),
+            Value::VecRef(_) => Err(format!("{context}: integer buffer contains a vector slot")),
+            Value::Unit => Err(format!(
+                "{context}: integer buffer contains an uninitialized slot"
+            )),
+        }
+    }
+
     fn truthy(self) -> bool {
         self.as_int() != 0
+    }
+}
+
+/// How one [`VecLane`]'s values travel through slot memory: the same representation the scalar
+/// `Load`/`Store` arms use for that MIR type (a float slot holds the value as an `f64`, an integer
+/// slot the sign-extended value in an `i128`), so a recipe and the scalar tail beside it read and
+/// write identical slots.
+trait KernelLaneValue: VecValue {
+    fn read(v: Value, context: &str) -> Result<Self, String>;
+    fn write(self) -> Value;
+}
+
+impl KernelLaneValue for f32 {
+    fn read(v: Value, context: &str) -> Result<Self, String> {
+        Ok(v.kernel_float(context)? as f32)
+    }
+    fn write(self) -> Value {
+        Value::Float(self as f64)
+    }
+}
+
+impl KernelLaneValue for f64 {
+    fn read(v: Value, context: &str) -> Result<Self, String> {
+        v.kernel_float(context)
+    }
+    fn write(self) -> Value {
+        Value::Float(self)
+    }
+}
+
+impl KernelLaneValue for i32 {
+    fn read(v: Value, context: &str) -> Result<Self, String> {
+        // Slots hold the value sign-extended; the low 32 bits are the lane.
+        Ok(v.kernel_int(context)? as i32)
+    }
+    fn write(self) -> Value {
+        Value::Int(self as i128)
+    }
+}
+
+impl KernelLaneValue for i64 {
+    fn read(v: Value, context: &str) -> Result<Self, String> {
+        Ok(v.kernel_int(context)? as i64)
+    }
+    fn write(self) -> Value {
+        Value::Int(self as i128)
     }
 }
 
@@ -361,6 +422,31 @@ pub trait Accelerator {
     }
 }
 
+/// The slot index the interpreter reserves as the **null pointer**.
+///
+/// Every public entry point starts its flat memory with one never-allocated sentinel at slot 0, so
+/// no `alloca`, heap allocation, static blob or kernel-entry buffer can ever be placed there and
+/// `Value::Ptr(0)` means exactly what `inttoptr 0` means natively: null. Before this, slot 0 was the
+/// first live allocation of a run, which is why a pointer condition could never be lowered as
+/// `PtrToInt(p) != 0` (reverted at 0900352: `let p = &mut v; if p` read the first local as null in
+/// the interpreter and non-null natively), why mem2reg could not materialize a null for a
+/// read-before-write pointer slot, and why the interpreter could not share native's null at all.
+/// A load or store through it is reported as a null dereference instead of reading the sentinel.
+pub const NULL_SLOT: usize = 0;
+
+/// The value parked in [`NULL_SLOT`]. A vector handle no arena can hold (`usize::MAX`), so it is
+/// never produced by a legal store — vector stores scatter lanes, and nested vector handles are
+/// rejected — and a read that slips past the explicit null checks fails as an invalid handle or a
+/// type-confused kernel operand instead of yielding a plausible number. It also marks the
+/// reservation: the null checks below fire only when slot 0 holds it, so the unit tests that build
+/// an `Interp` by hand with a buffer at slot 0 keep their original addressing.
+const NULL_SENTINEL: Value = Value::VecRef(usize::MAX);
+
+/// Fresh run memory with [`NULL_SLOT`] reserved.
+fn null_reserved_memory() -> Vec<Value> {
+    vec![NULL_SENTINEL]
+}
+
 /// Run `entry` (typically `main`) and return its integer result as a process exit code.
 pub fn run(program: &Program, entry: Symbol, interner: &Interner) -> Result<i64, String> {
     Ok(run_with_output(program, entry, interner)?.0)
@@ -372,6 +458,20 @@ pub fn run_with_output(
     entry: Symbol,
     interner: &Interner,
 ) -> Result<(i64, Vec<u8>), String> {
+    let (result, stdout) = run_capturing(program, entry, interner);
+    result.map(|code| (code, stdout))
+}
+
+/// Run `entry` and return its exit code or its run error **together with everything it printed
+/// before it stopped** — also when it stopped on a runtime failure (a failed `assert`, a slice
+/// bounds failure). A linked executable has always kept that output (its prints reach stdout as
+/// they happen); `wukongc --run` prints it before the error so all three execution paths show the
+/// same thing, and the differential gate compares it.
+pub fn run_capturing(
+    program: &Program,
+    entry: Symbol,
+    interner: &Interner,
+) -> (Result<i64, String>, Vec<u8>) {
     // The tree-walker recurses on the *host* call stack — one host frame per Wukong call — so a
     // deeply recursive Wukong program would overflow the default main-thread stack and **abort**
     // the process (a stack overflow is uncatchable). The interpreter is the correctness oracle; an
@@ -381,14 +481,18 @@ pub fn run_with_output(
     // reports a diagnostic instead of overflowing even 512 MiB. Every other public entry point
     // does the same — they are all the same tree-walker.
     with_big_stack(|| {
-        let func = program
-            .function(entry)
-            .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
+        let Some(func) = program.function(entry) else {
+            return (
+                Err(format!("no entry function `{}`", interner.resolve(entry))),
+                Vec::new(),
+            );
+        };
         let mut interp = Interp {
             program,
             interner,
-            memory: Vec::new(),
+            memory: null_reserved_memory(),
             stdout: Vec::new(),
+            scratch_arena: ScratchSlots::default(),
             frames: Vec::new(),
             call_args: Vec::new(),
             scratch: Vec::with_capacity(8),
@@ -401,8 +505,8 @@ pub fn run_with_output(
             accel: None,
             depth: 0,
         };
-        let result = interp.run_function(func, &[])?;
-        Ok((result.as_int() as i64, interp.stdout))
+        let result = interp.run_function(func, &[]).map(|v| v.as_int() as i64);
+        (result, interp.stdout)
     })
 }
 
@@ -479,8 +583,9 @@ pub fn run_with_output_accel(
         let mut interp = Interp {
             program,
             interner,
-            memory: Vec::new(),
+            memory: null_reserved_memory(),
             stdout: Vec::new(),
+            scratch_arena: ScratchSlots::default(),
             frames: Vec::new(),
             call_args: Vec::new(),
             scratch: Vec::with_capacity(8),
@@ -587,8 +692,9 @@ fn run_kernel_f32_inner(
         let mut interp = Interp {
             program,
             interner,
-            memory: Vec::new(),
+            memory: null_reserved_memory(),
             stdout: Vec::new(),
+            scratch_arena: ScratchSlots::default(),
             frames: Vec::new(),
             call_args: Vec::new(),
             scratch: Vec::with_capacity(8),
@@ -656,8 +762,9 @@ pub fn run_kernel_f64(
         let mut interp = Interp {
             program,
             interner,
-            memory: Vec::new(),
+            memory: null_reserved_memory(),
             stdout: Vec::new(),
+            scratch_arena: ScratchSlots::default(),
             frames: Vec::new(),
             call_args: Vec::new(),
             scratch: Vec::with_capacity(8),
@@ -716,8 +823,9 @@ pub fn run_kernel_i8(
         let mut interp = Interp {
             program,
             interner,
-            memory: Vec::new(),
+            memory: null_reserved_memory(),
             stdout: Vec::new(),
+            scratch_arena: ScratchSlots::default(),
             frames: Vec::new(),
             call_args: Vec::new(),
             scratch: Vec::with_capacity(8),
@@ -757,11 +865,25 @@ pub fn run_kernel_i8(
     })
 }
 
+/// The interpreter's model of the scratch allocator (`scratch_<T>` / `scratch_mark` /
+/// `scratch_release`; the contract and the native arena are in `wukong_runtime::scratch`). The
+/// mark is the number of live scratch allocations — the same count native reports — and a
+/// released region becomes reusable by the next allocation made at its depth.
+#[derive(Default)]
+struct ScratchSlots {
+    /// One `(base slot, capacity in slots)` per live scratch allocation, oldest first.
+    live: Vec<(usize, usize)>,
+    /// `free[d]`: the region most recently released from depth `d`, if not yet reused.
+    free: Vec<Option<(usize, usize)>>,
+}
+
 struct Interp<'a, 'k> {
     program: &'a Program,
     interner: &'a Interner,
     memory: Vec<Value>,
     stdout: Vec<u8>,
+    /// The scratch allocations of this run (see [`ScratchSlots`]).
+    scratch_arena: ScratchSlots,
     /// Recycled register files, one per active call depth. Pooling them keeps recursion and
     /// call-heavy code from allocating a fresh vector on every call.
     frames: Vec<Vec<Value>>,
@@ -864,6 +986,11 @@ macro_rules! dim {
 }
 
 impl<'a, 'k> Interp<'a, 'k> {
+    /// Is `slot` the reserved null pointer of this run? See [`NULL_SLOT`] / [`NULL_SENTINEL`].
+    fn is_null(&self, slot: usize) -> bool {
+        slot == NULL_SLOT && self.memory.first() == Some(&NULL_SENTINEL)
+    }
+
     fn function_index(&mut self, symbol: Symbol) -> Option<usize> {
         self.function_indices
             .get_or_insert_with(|| symbol_indices(self.program.funcs.iter().map(|f| f.name)))
@@ -990,8 +1117,158 @@ impl<'a, 'k> Interp<'a, 'k> {
                     pass_args(regs, &mut self.scratch, func.block(tgt), bargs);
                     cur = tgt;
                 }
+                // Exactly a `cmp.eq` chain in case order: the scrutinee's integer value (held
+                // sign-extended, which is the canonical form every case value is stored in) against
+                // each case, falling back to the default.
+                Terminator::Switch {
+                    scrutinee,
+                    cases,
+                    default,
+                    default_args,
+                } => {
+                    let x = reg(regs, *scrutinee).as_int();
+                    let (tgt, bargs) = match cases.iter().find(|c| c.value == x) {
+                        Some(c) => (c.target, &c.args),
+                        None => (*default, default_args),
+                    };
+                    pass_args(regs, &mut self.scratch, func.block(tgt), bargs);
+                    cur = tgt;
+                }
                 Terminator::Unreachable => return Err("execution reached `unreachable`".into()),
             }
+        }
+    }
+
+    /// Marshal one `Op::VecKernelCall` of a recipe whose lanes are `T` through slot memory: the
+    /// interpreter half of the differential pair whose other half is `codegen_cranelift::avx2`.
+    /// `stream_bases`/`scalars` are read from the two pointer tables, `count` is the vector part's
+    /// element count. A reduction returns its horizontal fold (steps 1-5 of the canonical tree in
+    /// `wukong_mir::vec_kernel`); an elementwise recipe writes its stores and returns `Unit`.
+    fn run_vec_kernel<T: KernelLaneValue>(
+        &mut self,
+        kern: &VecKernel,
+        ptrs_base: usize,
+        scalars_base: usize,
+        count: usize,
+    ) -> Result<Value, String> {
+        // Output-only streams need not contain initialized numeric values. Only recipe
+        // loads read memory; scalar tails beyond count remain untouched and unchecked.
+        let mut read_streams = vec![false; kern.streams as usize];
+        let mut read_scalars = vec![false; kern.scalars as usize];
+        for (index, op) in kern.ops.iter().enumerate() {
+            if let VecOp::Splat { scalar } = op {
+                *read_scalars
+                    .get_mut(*scalar as usize)
+                    .ok_or("veckernel scalar index out of bounds")? = true;
+            }
+            if let VecOp::Load { stream } = op {
+                let reads = read_streams
+                    .get_mut(*stream as usize)
+                    .ok_or("veckernel load stream out of bounds")?;
+                // eval_lane forwards a preceding store of this stream; that load never
+                // consumes the original destination slot, which may be undefined.
+                if !kern.ops[..index].iter().any(|previous| {
+                    matches!(previous, VecOp::Store { stream: written, .. } if written == stream)
+                }) {
+                    *reads = true;
+                }
+            }
+        }
+        // Resolve the stream base slots and the invariant scalars once.
+        let mut stream_bases: Vec<usize> = Vec::with_capacity(kern.streams as usize);
+        for s in 0..kern.streams as usize {
+            stream_bases.push(ptr(*self
+                .memory
+                .get(ptrs_base + s)
+                .ok_or("veckernel ptrs out of bounds")?)?);
+        }
+        let mut scalar_vals: Vec<T> = Vec::with_capacity(kern.scalars as usize);
+        for (k, &read) in read_scalars.iter().enumerate() {
+            scalar_vals.push(if read {
+                T::read(
+                    *self
+                        .memory
+                        .get(scalars_base + k)
+                        .ok_or("veckernel scalars out of bounds")?,
+                    "veckernel scalar",
+                )?
+            } else {
+                T::unused()
+            });
+        }
+        if kern.reduce.is_some() {
+            // Reduction kernel: fold every lane's addend and return the horizontal result in the
+            // lane type (the caller combines the initial accumulator and folds the scalar tail).
+            // Reads only — no stores. Same reassociation `eval_reduction` pins for both backends,
+            // so this equals the native kernel's return bit-for-bit.
+            let lanes = kern.lane.lanes() as usize;
+            let vlen = count / lanes * lanes;
+            // Validate and convert every element the evaluator will read up front, so its
+            // callbacks cannot fail; a partial lane group beyond `vlen` is never read.
+            let mut columns: Vec<Vec<T>> = Vec::with_capacity(stream_bases.len());
+            for (s, &b) in stream_bases.iter().enumerate() {
+                if read_streams[s] {
+                    let end = b
+                        .checked_add(vlen)
+                        .ok_or("veckernel reduction load out of bounds")?;
+                    let values = self
+                        .memory
+                        .get(b..end)
+                        .ok_or("veckernel reduction load out of bounds")?;
+                    let mut column = Vec::with_capacity(vlen);
+                    for value in values {
+                        column.push(T::read(*value, "veckernel reduction")?);
+                    }
+                    columns.push(column);
+                } else {
+                    columns.push(Vec::new());
+                }
+            }
+            let r = kern.eval_reduction(
+                vlen,
+                |s, e| columns[s as usize][e],
+                |k| scalar_vals[k as usize],
+            );
+            Ok(r.write())
+        } else {
+            // Elementwise: one `eval_lane` per element — snapshot this lane's stream inputs,
+            // run the recipe, write its stores back. Load-before-store within a lane keeps
+            // in-place streams exact; distinct lanes never alias (the vectorizer's no-alias
+            // precondition), so no hazard.
+            let mut stores: Vec<(u32, T)> = Vec::new();
+            let mut loads: Vec<T> = Vec::with_capacity(stream_bases.len());
+            let mut scratch = wukong_mir::vec_kernel::VecKernelScratch::<T>::default();
+            for i in 0..count {
+                loads.clear();
+                for (s, &b) in stream_bases.iter().enumerate() {
+                    loads.push(if read_streams[s] {
+                        T::read(
+                            *self
+                                .memory
+                                .get(b + i)
+                                .ok_or("veckernel load out of bounds")?,
+                            "veckernel load",
+                        )?
+                    } else {
+                        T::unused()
+                    });
+                }
+                stores.clear();
+                kern.eval_lane_with_scratch(
+                    &mut scratch,
+                    |s| loads[s as usize],
+                    |k| scalar_vals[k as usize],
+                    |s, v| stores.push((s, v)),
+                );
+                for &(s, v) in &stores {
+                    let slot = stream_bases[s as usize] + i;
+                    *self
+                        .memory
+                        .get_mut(slot)
+                        .ok_or("veckernel store out of bounds")? = v.write();
+                }
+            }
+            Ok(Value::Unit)
         }
     }
 
@@ -1062,6 +1339,9 @@ impl<'a, 'k> Interp<'a, 'k> {
             // load reads one. Both `gep` to the element address first.
             Op::Load(p, ty) => {
                 let idx = ptr(reg(regs, *p))?;
+                if self.is_null(idx) {
+                    return Err("null pointer dereference (load)".into());
+                }
                 if let MirType::Vec(lane, n) = ty {
                     let mut lanes = Vec::new();
                     lanes
@@ -1101,6 +1381,9 @@ impl<'a, 'k> Interp<'a, 'k> {
             }
             Op::Store { ptr: p, value } => {
                 let idx = ptr(reg(regs, *p))?;
+                if self.is_null(idx) {
+                    return Err("null pointer dereference (store)".into());
+                }
                 match reg(regs, *value) {
                     // A vector store scatters its lanes across contiguous scalar slots.
                     Value::VecRef(vi) => {
@@ -1151,9 +1434,10 @@ impl<'a, 'k> Interp<'a, 'k> {
             // backend executes hand-assembled AVX2; the oracle marshals the same `VecKernel` recipe
             // element-by-element through slot memory so the two agree bit-for-bit. `ptrs` points at
             // `streams` slots each holding a stream's (already `start`-offset) base pointer, `scalars`
-            // at `scalars` invariant f32s, and `n` is the multiple-of-8 lane count (the caller runs
-            // the scalar tail). The recipe is a function-local list borrowed from `func` (a shared
-            // reference), independent of the `&mut self.memory` writes below.
+            // at `scalars` invariant values of the recipe's lane type, and `n` is the
+            // multiple-of-lanes element count (the caller runs the scalar tail). The recipe is a
+            // function-local list borrowed from `func` (a shared reference), independent of the
+            // `&mut self` the marshalling below needs.
             Op::VecKernelCall {
                 kernel,
                 ptrs,
@@ -1167,114 +1451,19 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let ptrs_base = ptr(reg(regs, *ptrs))?;
                 let scalars_base = ptr(reg(regs, *scalars))?;
                 let count = reg(regs, *n).as_int().max(0) as usize;
-                // Output-only streams need not contain initialized numeric values. Only recipe
-                // loads read memory; scalar tails beyond count remain untouched and unchecked.
-                let mut read_streams = vec![false; kern.streams as usize];
-                let mut read_scalars = vec![false; kern.scalars as usize];
-                for (index, op) in kern.ops.iter().enumerate() {
-                    if let wukong_mir::VecOp::Splat { scalar } = op {
-                        *read_scalars
-                            .get_mut(*scalar as usize)
-                            .ok_or("veckernel scalar index out of bounds")? = true;
+                match kern.lane {
+                    VecLane::F32 => {
+                        self.run_vec_kernel::<f32>(kern, ptrs_base, scalars_base, count)?
                     }
-                    if let wukong_mir::VecOp::Load { stream } = op {
-                        let reads = read_streams
-                            .get_mut(*stream as usize)
-                            .ok_or("veckernel load stream out of bounds")?;
-                        // eval_lane forwards a preceding store of this stream; that load never
-                        // consumes the original destination slot, which may be undefined.
-                        if !kern.ops[..index].iter().any(|previous| {
-                            matches!(previous, wukong_mir::VecOp::Store { stream: written, .. } if written == stream)
-                        }) {
-                            *reads = true;
-                        }
+                    VecLane::F64 => {
+                        self.run_vec_kernel::<f64>(kern, ptrs_base, scalars_base, count)?
                     }
-                }
-                // Resolve the stream base slots and the invariant scalars once.
-                let mut stream_bases: Vec<usize> = Vec::with_capacity(kern.streams as usize);
-                for s in 0..kern.streams as usize {
-                    stream_bases.push(ptr(*self
-                        .memory
-                        .get(ptrs_base + s)
-                        .ok_or("veckernel ptrs out of bounds")?)?);
-                }
-                let mut scalar_vals: Vec<f32> = Vec::with_capacity(kern.scalars as usize);
-                for (k, &read) in read_scalars.iter().enumerate() {
-                    scalar_vals.push(if read {
-                        self.memory
-                            .get(scalars_base + k)
-                            .ok_or("veckernel scalars out of bounds")?
-                            .kernel_float("veckernel scalar")? as f32
-                    } else {
-                        0.0
-                    });
-                }
-                if kern.reduce.is_some() {
-                    // Reduction kernel: fold every lane's addend and return the horizontal result as
-                    // an f32 (the caller combines the initial accumulator and folds the scalar tail).
-                    // Reads only — no stores. Same reassociation `eval_reduction` pins for both
-                    // backends, so this equals the native kernel's return bit-for-bit.
-                    for (s, &b) in stream_bases.iter().enumerate() {
-                        if read_streams[s] {
-                            let end = b
-                                .checked_add(count)
-                                .ok_or("veckernel reduction load out of bounds")?;
-                            let values = self
-                                .memory
-                                .get(b..end)
-                                .ok_or("veckernel reduction load out of bounds")?;
-                            // The reduction evaluator ignores a partial eight-lane suffix.
-                            for value in &values[..count / 8 * 8] {
-                                value.kernel_float("veckernel reduction")?;
-                            }
-                        }
+                    VecLane::I32 => {
+                        self.run_vec_kernel::<i32>(kern, ptrs_base, scalars_base, count)?
                     }
-                    // eval_reduction's callbacks cannot fail. Every numeric load above was checked,
-                    // and the read-only fold cannot change the validated values before conversion.
-                    let mem = &self.memory;
-                    let r = kern.eval_reduction(
-                        count,
-                        |s, e| mem[stream_bases[s as usize] + e].as_float() as f32,
-                        |k| scalar_vals[k as usize],
-                    );
-                    Value::Float(r as f64)
-                } else {
-                    // Elementwise: one `eval_lane` per element — snapshot this lane's stream inputs,
-                    // run the recipe, write its stores back. Load-before-store within a lane keeps
-                    // in-place streams exact; distinct lanes never alias (the vectorizer's no-alias
-                    // precondition), so no hazard.
-                    let mut stores: Vec<(u32, f32)> = Vec::new();
-                    let mut loads: Vec<f32> = Vec::with_capacity(stream_bases.len());
-                    let mut scratch = wukong_mir::vec_kernel::VecKernelScratch::default();
-                    for i in 0..count {
-                        loads.clear();
-                        for (s, &b) in stream_bases.iter().enumerate() {
-                            loads.push(if read_streams[s] {
-                                self.memory
-                                    .get(b + i)
-                                    .ok_or("veckernel load out of bounds")?
-                                    .kernel_float("veckernel load")?
-                                    as f32
-                            } else {
-                                0.0
-                            });
-                        }
-                        stores.clear();
-                        kern.eval_lane_with_scratch(
-                            &mut scratch,
-                            |s| loads[s as usize],
-                            |k| scalar_vals[k as usize],
-                            |s, v| stores.push((s, v)),
-                        );
-                        for &(s, v) in &stores {
-                            let slot = stream_bases[s as usize] + i;
-                            *self
-                                .memory
-                                .get_mut(slot)
-                                .ok_or("veckernel store out of bounds")? = Value::Float(v as f64);
-                        }
+                    VecLane::I64 => {
+                        self.run_vec_kernel::<i64>(kern, ptrs_base, scalars_base, count)?
                     }
-                    Value::Unit
                 }
             }
             // A function address: a pointer the interpreter tags with the function's index so the
@@ -1587,6 +1776,13 @@ impl<'a, 'k> Interp<'a, 'k> {
             // low byte) until the NUL terminator, then render as UTF-8. Native renders the identical
             // bytes via `rt_print_str`, so the differential gate holds.
             "print_str" | "println_str" => {
+                // Native's `rt_print_str` returns without writing anything (not even the newline)
+                // for a null string. Slot 0 is the shared null now (`NULL_SLOT`), so mirror it.
+                if let Some(Value::Ptr(p)) = args.first().copied() {
+                    if self.is_null(p) {
+                        return Ok(Value::Unit);
+                    }
+                }
                 let mut bytes = Vec::new();
                 if let Some(Value::Ptr(base)) = args.first().copied() {
                     let mut i = base;
@@ -1617,6 +1813,21 @@ impl<'a, 'k> Interp<'a, 'k> {
                     Err("assertion failed".to_string())
                 }
             }
+            // `wukong_rt_bounds_fail(index, len, site)` — the failure edge of a checked slice access
+            // `s[i]` (`index <u len` was false). `site` is the `.rodata` `file:line:col` string the
+            // lowering attached. The message comes from the one formatter the JIT and the linked
+            // executable also use, so all three paths report the same text and stop at this point.
+            "wukong_rt_bounds_fail" => {
+                let index = args.first().map_or(0, |v| v.as_int()) as i64;
+                let len = args.get(1).map_or(0, |v| v.as_int()) as i64;
+                let site = match args.get(2).copied() {
+                    Some(Value::Ptr(base)) if !self.is_null(base) => {
+                        file_read_path(&self.memory, base)?
+                    }
+                    _ => String::new(),
+                };
+                Err(wukong_runtime::bounds_failure_message(index, len, &site))
+            }
             // `wukong_rt_alloc(count, elem_size, elem_is_float) -> ptr` — the heap allocation
             // backing the `alloc_<T>(n)` builtins. A heap object in the slot-indexed memory model
             // is exactly an alloca-shaped run: `count` contiguous typed-zero slots (one per scalar
@@ -1627,10 +1838,11 @@ impl<'a, 'k> Interp<'a, 'k> {
             // zero on both backends (the determinism contract).
             //
             // **Exhaustion.** The native `wukong_rt_alloc` returns null when the allocator cannot
-            // satisfy the request (crates/wukong_runtime/src/lib.rs). The interpreter cannot return
-            // null: its pointers are slot indices and index 0 is a perfectly ordinary live slot (the
-            // first allocation of a run), so `Value::Ptr(0)` would alias real memory and turn an
-            // out-of-memory condition into silent corruption. It reports a diagnostic instead —
+            // satisfy the request (crates/wukong_runtime/src/lib.rs). Slot 0 is now a reserved
+            // null (`NULL_SLOT`), so the interpreter *could* return the same null — but a null
+            // slice whose length field still says `count` would only move the failure to the first
+            // element access (a null dereference here, a segfault natively). It reports a
+            // diagnostic at the allocation instead —
             // `try_reserve` rather than `resize`, so the request never reaches Rust's allocation-
             // error handler, which `abort()`s the process with a raw `memory allocation of N bytes
             // failed` message no caller can catch. One element costs one 32-byte `Value` slot here
@@ -1674,6 +1886,70 @@ impl<'a, 'k> Interp<'a, 'k> {
             // interpreter; a use-after-free still reads the old values here while being undefined
             // on native — such programs are outside the differential contract (documented UB).
             "wukong_rt_free" => Ok(Value::Unit),
+            // `wukong_rt_scratch_alloc(count, elem_size, elem_is_float) -> ptr` — `scratch_<T>(n)`
+            // (the contract is in `wukong_runtime::scratch`). `count` typed-zero slots exactly like
+            // `wukong_rt_alloc`, counted as one live scratch allocation — a zero-length one too, as
+            // natively, so `scratch_mark()` agrees. The region released last from this depth is
+            // handed out again when it is large enough, re-zeroed as native re-zeroes its reused
+            // bytes, so a balanced `mark; scratch_…; release` loop reuses one region instead of
+            // growing the run's memory every iteration.
+            "wukong_rt_scratch_alloc" => {
+                let count = args.first().map(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+                let is_float = args.get(2).map(|v| v.as_int()).unwrap_or(0) != 0;
+                let zero = if is_float {
+                    Value::Float(0.0)
+                } else {
+                    Value::Int(0)
+                };
+                let depth = self.scratch_arena.live.len();
+                let reuse = self
+                    .scratch_arena
+                    .free
+                    .get_mut(depth)
+                    .and_then(Option::take)
+                    .filter(|&(_, cap)| cap >= count);
+                let (base, cap) = match reuse {
+                    Some(region) => region,
+                    None => {
+                        // The same ceiling and the same `try_reserve` guard as `wukong_rt_alloc`.
+                        const MAX_SLOTS: usize = 1 << 31;
+                        if count > MAX_SLOTS {
+                            return Err(format!(
+                                "interpreter heap exhausted allocating {count} element(s)"
+                            ));
+                        }
+                        let idx = self.memory.len();
+                        self.memory.try_reserve(count).map_err(|_| {
+                            format!("interpreter heap exhausted allocating {count} element(s)")
+                        })?;
+                        self.memory.resize(idx + count, zero);
+                        (idx, count)
+                    }
+                };
+                self.memory[base..base + count].fill(zero);
+                self.scratch_arena.live.push((base, cap));
+                Ok(Value::Ptr(base))
+            }
+            // `wukong_rt_scratch_mark() -> i64` — `scratch_mark()`: the live scratch-allocation
+            // count, the backend-independent value native's arena reports.
+            "wukong_rt_scratch_mark" => Ok(Value::Int(self.scratch_arena.live.len() as i128)),
+            // `wukong_rt_scratch_release(mark)` — `scratch_release(m)`: pop the allocations made
+            // after `mark`, each becoming the reusable region of its depth. A negative mark
+            // releases them all; a mark at or past the count releases nothing.
+            "wukong_rt_scratch_release" => {
+                let mark = args.first().map(|v| v.as_int()).unwrap_or(0).max(0);
+                let mark = usize::try_from(mark).unwrap_or(usize::MAX);
+                let arena = &mut self.scratch_arena;
+                while arena.live.len() > mark {
+                    let depth = arena.live.len() - 1;
+                    let region = arena.live.pop();
+                    if arena.free.len() <= depth {
+                        arena.free.resize(depth + 1, None);
+                    }
+                    arena.free[depth] = region;
+                }
+                Ok(Value::Unit)
+            }
             // `wukong_now_ns() -> i64` — the `now_ns()` timing intrinsic. Call the *same*
             // `wukong_runtime` clock the native backend links (a monotonic process-lifetime epoch),
             // so both backends read one clock. The value is inherently non-deterministic, but a
@@ -5130,6 +5406,7 @@ mod tests {
             value_types: vec![MirType::I32, MirType::Vec(Box::new(MirType::I32), 4)],
             entry: BlockId(0),
             vec_kernels: Vec::new(),
+            param_attrs: Vec::new(),
         };
         let mut program = Program::new();
         program.funcs.push(f);
@@ -5229,6 +5506,7 @@ mod tests {
             interner: &interner,
             memory: Vec::new(),
             stdout: Vec::new(),
+            scratch_arena: ScratchSlots::default(),
             frames: Vec::new(),
             call_args: Vec::new(),
             scratch: Vec::new(),
@@ -5342,6 +5620,7 @@ mod tests {
             interner: &interner,
             memory: Vec::new(),
             stdout: Vec::new(),
+            scratch_arena: ScratchSlots::default(),
             frames: Vec::new(),
             call_args: Vec::new(),
             scratch: Vec::new(),
@@ -5564,6 +5843,7 @@ mod tests {
                                     .map(Value::Float)
                                     .collect(),
                                 stdout: Vec::new(),
+                                scratch_arena: ScratchSlots::default(),
                                 frames: Vec::new(),
                                 call_args: Vec::new(),
                                 scratch: Vec::new(),
@@ -5903,6 +6183,54 @@ mod tests {
         let main = interner.intern("main");
         assert!(run(&program, main, &interner).is_err());
     }
+
+    /// `NULL_SLOT` is reserved in every run: the first `alloca` of a run is not address 0, so a
+    /// pointer null test agrees with native (`inttoptr 0` is null there, and nothing else is). The
+    /// first case is the exact reproducer the `PtrToInt(p) != 0` lowering was reverted on at
+    /// 0900352 — `p` addresses the first local, which used to *be* slot 0 and read as null.
+    #[test]
+    fn address_zero_is_never_a_live_allocation() {
+        let lower = |src: &str| {
+            let mut interner = Interner::new();
+            let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+            assert!(pd.is_empty(), "parse: {pd:?}");
+            let (sema, sd) = wukong_sema::check(&module, &interner);
+            assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
+            let (program, ld) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+            assert!(ld.iter().all(|d| !d.is_error()), "lower: {ld:?}");
+            assert!(
+                wukong_mir::verify::verify_program(&program).is_empty(),
+                "a pointer condition must lower to verifier-clean MIR: {src}"
+            );
+            (program, interner)
+        };
+        let first_local = "fn main() -> i32 { let mut v: i32 = 7; let p: *mut i32 = &mut v; \
+                           if p { return 1; } return 0; }";
+        let (program, mut interner) = lower(first_local);
+        let main = interner.intern("main");
+        assert_eq!(run(&program, main, &interner), Ok(1));
+
+        let null = "fn main() -> i32 { let q: *mut i32 = 0 as *mut i32; \
+                    if q { return 1; } return 2; }";
+        let (program, mut interner) = lower(null);
+        let main = interner.intern("main");
+        assert_eq!(run(&program, main, &interner), Ok(2));
+
+        // Dereferencing the null is a diagnostic, not a read of the reserved sentinel slot.
+        let deref = "fn main() -> i32 { let q: *mut i32 = 0 as *mut i32; return *q; }";
+        let (program, mut interner) = lower(deref);
+        let main = interner.intern("main");
+        let err = run(&program, main, &interner).unwrap_err();
+        assert!(err.contains("null pointer dereference"), "{err}");
+
+        // A kernel-entry buffer is laid out after the reserved slot too.
+        let kernel = "fn k(mut a: [f32; 2]) { a[0] = a[0] + 1.0; a[1] = a[1] * 2.0; }";
+        let (program, mut interner) = lower(kernel);
+        let k = interner.intern("k");
+        let mut buf = [3.0f32, 5.0];
+        run_kernel_f32(&program, k, &mut [&mut buf], &interner).unwrap();
+        assert_eq!(buf, [4.0, 10.0]);
+    }
 }
 
 #[cfg(test)]
@@ -5916,3 +6244,6 @@ mod kernel_extent_marshalling_tests;
 
 #[cfg(test)]
 mod transfer_bounds_tests;
+
+#[cfg(test)]
+mod scratch_tests;

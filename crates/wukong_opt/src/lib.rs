@@ -2,17 +2,27 @@
 //!
 //! Passes run to a fixpoint at `-O1` and above, in this order. The pipeline first promotes stack
 //! slots to SSA registers, which is what makes the value-based transforms bite:
+//!  * **sroa** — split an aggregate slot whose every access is at a constant position into one
+//!    scalar slot per accessed leaf, for mem2reg to promote in the same sweep (`-O2`).
 //!  * **mem2reg** — promote scalar and pointer `alloca`/`load`/`store` to block-parameter SSA.
 //!  * **simplify** — constant folding and algebraic identities (`x+0`, `x*1`, `x*0`, ...).
 //!  * **simplify-cfg** — fold constant branches, merge straight-line blocks, prune dead blocks.
 //!  * **simplify-phis** — drop dead/trivial block parameters mem2reg introduced.
 //!  * **dce** — remove pure instructions whose results are never used, and unused allocas.
-//!  * **cse** — dominator-tree value numbering with load forwarding across unique incoming edges
-//!    (`-O2`).
-//!  * **dse** — dead-store elimination (`-O2`).
+//!  * **cse** — global value numbering: dominator-tree value numbering, load forwarding along
+//!    single-predecessor edges and through joins (intersecting the incoming memory states),
+//!    block-parameter numbering, and phi insertion for values every arm of a join computed (`-O2`).
+//!  * **dse** — dead-store elimination: must-alias overwrites in a block and along every path,
+//!    end-of-lifetime stores to private slots, and stores into slots nothing reads (`-O2`).
 //!  * **loop-canon** — one shape per loop: a preheader, a single latch, one exit-test polarity
 //!    (`-O2`).
-//!  * **licm** — hoist loop-invariant work into an existing preheader (`-O2`).
+//!  * **loop-delete** — remove a provably finite loop that has no observable effect, such as an
+//!    initialization loop dse emptied (`-O2`).
+//!  * **licm** — hoist loop-invariant work into an existing preheader, including loads that run on
+//!    every iteration, behind a first-iteration guard (`-O2`).
+//!  * **bce** — slice bounds-check elimination by loop versioning on a preheader guard (`-O2`).
+//!  * **promote** — keep a loop-invariant memory location the loop reads and writes in a register:
+//!    one load in the preheader, one store per exit (`-O2`).
 //!  * **vectorize** — widen a canonical loop body to 128-bit SIMD (if-converting a conditional
 //!    body to a lane mask), with the original loop kept as its scalar epilogue (`-O2`).
 //!
@@ -21,13 +31,28 @@
 //! (`Ty::Ptr`/`Ref`/`Tensor`/`Slice` all become a bare `MirType::Ptr`) otherwise makes unanswerable.
 //! It is a pure analysis, safe to build from anywhere, and the Cranelift backend uses it too.
 //!
+//! Functions are optimized callees first, and each call-graph SCC is summarized from its optimized
+//! body as soon as it is done: a callee whose calls have no side effect is then value-numbered,
+//! deleted when dead, and hoisted when invariant, like any instruction (the `effects` module).
+//!
+//! From `-O1` the fixpoint also runs **tre** ([`Tre`]): a function's tail calls to itself (and
+//! integer accumulator recursion such as `n * fact(n - 1)`) become a loop. At `-O2`, between
+//! `loop-canon` and `licm`, **fuse** ([`LoopFuse`]) merges two adjacent counted loops over the same
+//! range when no dependence crosses them; and between `bce` and `promote`, **unswitch**
+//! ([`LoopUnswitch`]) splits a counted loop at the iteration where a guard on its induction variable
+//! changes, or unswitches a branch on an invariant.
+//!
 //! At `-O2` and above, whole-program inlining ([`inline_program`]) runs once *before* the
-//! per-function pipeline, and partial loop unrolling ([`unroll_program`]) runs once *after* it — the
-//! pipeline is then re-run over the functions unrolling changed, so the duplicated bodies get the
-//! same cse/simplify/dce treatment as everything else. `-O3` adds nothing to any of it — see
+//! per-function pipeline, and loop unrolling ([`unroll_program`] — complete for a small known trip
+//! count, partial otherwise) runs once *after* it — a reduced pipeline is then re-run over the
+//! functions unrolling changed, so the duplicated bodies get the same simplify/cse/dce treatment as
+//! everything else. Last of all, [`FormSwitches`] turns each chain of equality tests on one
+//! scrutinee into a single `switch` terminator (once, after every loop transform — see
+//! `switch_form`). `-O3` adds nothing to any of it — see
 //! [`PassManager::standard`].
 
 pub mod alias;
+mod bce;
 mod cache;
 mod cfg;
 pub mod coalesce;
@@ -35,22 +60,33 @@ mod cse;
 mod dce;
 mod dom;
 mod dse;
+mod effects;
 mod fxhash;
 mod inline;
 mod licm;
 mod loop_canon;
+mod loop_delete;
 pub mod loop_info;
 mod mem2reg;
 mod phi;
+mod promote;
 mod simplify;
 mod simplify_cfg;
+mod sroa;
 mod unroll;
 mod vectorize;
 mod verify_each;
 
+mod branch_fold;
+mod fuse;
+mod switch_form;
+mod tre;
+mod unswitch;
+
 pub use verify_each::{verify_program_stage, VerificationFailure};
 
 pub use alias::{type_bytes, AliasInfo, Prov};
+pub use bce::Bce;
 pub use cache::CfgAnalyses;
 pub use coalesce::{
     analyze_function as coalesce_function, CoalesceHint, CoalescePlan, VectorWidth,
@@ -61,15 +97,25 @@ pub use dse::Dse;
 pub use inline::inline_program;
 pub use licm::Licm;
 pub use loop_canon::LoopCanon;
+pub use loop_delete::LoopDelete;
 pub use mem2reg::Mem2Reg;
 pub use phi::SimplifyPhis;
+pub use promote::Promote;
 pub use simplify::Simplify;
 pub use simplify_cfg::SimplifyCfg;
+pub use sroa::Sroa;
 pub use unroll::unroll_program;
 pub use vectorize::Vectorize;
 
+pub use fuse::LoopFuse;
+pub use switch_form::{form_switches, FormSwitches};
+pub use tre::Tre;
+pub use unswitch::LoopUnswitch;
+
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use effects::{CallEffects, CallGraph};
 use wukong_mir::{Op, Program, Terminator, ValueId};
 
 /// A function-level transform. Returns whether it changed anything.
@@ -154,12 +200,19 @@ impl PassManager {
         let mut pm = PassManager::new();
         if opt_level >= 1 {
             // Promotion comes first: every later pass is far more effective on SSA values than on
-            // memory traffic. The whole list then runs to a fixpoint.
+            // memory traffic. The whole list then runs to a fixpoint. At `-O2` scalar replacement
+            // runs just ahead of mem2reg, so an aggregate it splits is promoted in the same sweep.
+            // `-O1` keeps the plain promotion shape the autodiff transform is built against.
+            if opt_level >= 2 {
+                pm.add(Box::new(Sroa));
+            }
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(Simplify));
             pm.add(Box::new(SimplifyCfg));
             pm.add(Box::new(SimplifyPhis));
             pm.add(Box::new(Dce));
+            // A self-call in tail position becomes a branch back to the top (`tre`).
+            pm.add(Box::new(Tre));
         }
         if opt_level >= 2 {
             // CSE feeds Simplify/DCE more constants and dead values; the fixpoint loop reruns all.
@@ -168,9 +221,28 @@ impl PassManager {
             // Put every loop into one shape before LICM runs: LICM hoists only into a preheader
             // that already exists, so a loop given one here becomes hoistable in the same sweep.
             pm.add(Box::new(LoopCanon));
+            // A loop dse emptied still runs every trip; with a preheader now guaranteed, delete
+            // whichever loops provably terminate without doing anything observable.
+            pm.add(Box::new(LoopDelete));
+            // Fuse adjacent counted loops over the same range once they are canonical, before LICM
+            // fills the second loop's preheader with loads (`fuse`).
+            pm.add(Box::new(LoopFuse));
             // LICM hoists invariant work out of loops; rerunning the pipeline then cleans up and
             // can expose further invariants (e.g. across nested loops).
             pm.add(Box::new(Licm));
+            // Slice bounds checks are extra loop exits, which no later loop transform accepts:
+            // version each counted loop on one preheader guard so its proved checks disappear
+            // (`bce.rs`). After LICM, so invariant addresses and lengths are already hoisted; before
+            // unswitching and the vectorizer, so the check-free, single-exit copy is what they see.
+            pm.add(Box::new(Bce));
+            // With invariant conditions hoisted, decide a guard on the induction variable or on an
+            // invariant once, by splitting or unswitching the loop, so the vectorizer below sees
+            // branch-free bodies (`unswitch`).
+            pm.add(Box::new(LoopUnswitch));
+            // With the invariant loads hoisted (and a slice loop versioned into a check-free copy
+            // with a single exit), a location the loop still both reads and writes is a
+            // memory-carried reduction: keep it in a register for the loop's duration.
+            pm.add(Box::new(Promote));
             // Widening comes last, on the cleanest MIR the pipeline produces: canonical loops with
             // one latch and one exit-test polarity, invariants already hoisted, and dead code gone.
             // Everything it emits is fed back through the fixpoint, so the vector body gets the
@@ -187,54 +259,120 @@ impl PassManager {
     /// `Mem2Reg` (the pass refuses to duplicate a header or body containing an `Alloca`, so there is
     /// no new stack slot to promote), `Dse`, or `Licm` (LICM already ran over this same body, and
     /// every instruction the copies add depends on the induction variable). The synthesized
-    /// wrap-safe preheader guard, however, contains new arithmetic and a select that Simplify
-    /// must fold when the bound is constant. Keep cleanup local to values: proving a remainder
-    /// loop empty through the main loop's exit parameters needs separate exit-value analysis.
-    fn unroll_cleanup() -> PassManager {
+    /// wrap-safe preheader guard contains new arithmetic and a select that `Simplify` folds when
+    /// the bound is constant. A completely unrolled loop leaves its header as a straight-line
+    /// block with a single predecessor: `SimplifyCfg` merges it into the preheader, which turns the
+    /// header parameters into the entry values, `Simplify` then folds every copy's induction
+    /// variable into a constant, and `SimplifyPhis` drops what is left of the parameters. (A
+    /// constant trip count needs no remainder loop at all — the unroller knows it exactly.)
+    ///
+    /// Public, with [`PassManager::run_subset`], so that a measurement replica of [`optimize`] can
+    /// wrap exactly these passes and drive them exactly as `optimize` does.
+    pub fn unroll_cleanup() -> PassManager {
         let mut pm = PassManager::new();
         pm.add(Box::new(Simplify));
+        pm.add(Box::new(SimplifyCfg));
+        pm.add(Box::new(SimplifyPhis));
         pm.add(Box::new(Cse));
         pm.add(Box::new(Dce));
         pm
     }
 
     pub fn run(&self, program: &mut Program) {
-        for f in &mut program.funcs {
-            self.run_function(f, None);
-        }
+        // Preserve the legacy library API's debug assertion, while the fallible API below is
+        // available to release callers and never turns a verifier error into a panic.
+        self.run_program(program, None, cfg!(debug_assertions))
+            .unwrap_or_else(|failure| panic!("{failure}"));
     }
 
     /// Run with fallible verification in every build profile. Check each pass that actually ran,
     /// including one reporting no mutation, and whole-program call signatures at the boundaries.
     pub fn run_verified(&self, program: &mut Program) -> Result<(), VerificationFailure> {
         verify_program_stage(program, "pipeline input")?;
-        for f in &mut program.funcs {
-            self.run_function_checked(f, None, true)?;
-        }
+        self.run_program(program, None, true)?;
         verify_program_stage(program, "pipeline output")
+    }
+
+    /// Run the pipeline over just the functions at `funcs`, in that order — what [`optimize`] does
+    /// to the functions loop unrolling changed. Every function's passes see the call effects of the
+    /// whole program *as it stands*, summarized afresh, so a callee whose loop was just unrolled
+    /// away is judged by its new body. Public so a measurement replica that wraps these passes runs
+    /// the identical sequence (`wukong_bench compile-work` checks it byte for byte).
+    pub fn run_subset(&self, program: &mut Program, funcs: &[usize]) {
+        self.run_subset_checked(program, funcs, cfg!(debug_assertions))
+            .unwrap_or_else(|failure| panic!("{failure}"));
+    }
+
+    fn run_subset_checked(
+        &self,
+        program: &mut Program,
+        funcs: &[usize],
+        verify_each: bool,
+    ) -> Result<(), VerificationFailure> {
+        if funcs.is_empty() || self.passes.is_empty() {
+            return Ok(());
+        }
+        let effects = Rc::new(CallEffects::of(program));
+        for &i in funcs {
+            self.run_function_checked(
+                &mut program.funcs[i],
+                None,
+                verify_each,
+                Some(Rc::clone(&effects)),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Run the pipeline over every function, callees before callers, summarizing each call-graph
+    /// SCC as soon as its members are optimized so that their callers — processed later — can treat
+    /// side-effect-free calls like instructions. The order is a pure function of the program, so
+    /// the output is as deterministic as before; only which function is optimized first changed.
+    fn run_program(
+        &self,
+        program: &mut Program,
+        mut timings: Option<&mut Timings>,
+        verify_each: bool,
+    ) -> Result<(), VerificationFailure> {
+        if self.passes.is_empty() {
+            return Ok(());
+        }
+        let mut effects = Rc::new(CallEffects::default());
+        let graph = CallGraph::of(program);
+        for (scc, members) in graph.sccs.iter().enumerate() {
+            for &i in members {
+                self.run_function_checked(
+                    &mut program.funcs[i as usize],
+                    timings.as_deref_mut(),
+                    verify_each,
+                    Some(Rc::clone(&effects)),
+                )?;
+            }
+            // Every function's cache (and its handle on the table) is gone by now, so this updates
+            // the table in place.
+            graph.summarize(program, scc, Rc::make_mut(&mut effects));
+        }
+        Ok(())
     }
 
     /// The fixpoint driver. `timings` is `None` on the production path (zero overhead); the bench
     /// harness passes `Some(..)` to accumulate per-pass wall time. The `timings` branch does not
     /// change which passes run or in what order, so the resulting MIR is identical either way.
-    fn run_function(&self, f: &mut wukong_mir::Function, timings: Option<&mut Timings>) {
-        // Preserve the legacy library API's debug assertion, while the fallible API below is
-        // available to release callers and never turns a verifier error into a panic.
-        self.run_function_checked(f, timings, cfg!(debug_assertions))
-            .unwrap_or_else(|failure| panic!("{failure}"));
-    }
-
     fn run_function_checked(
         &self,
         f: &mut wukong_mir::Function,
         mut timings: Option<&mut Timings>,
         verify_each: bool,
+        effects: Option<Rc<CallEffects>>,
     ) -> Result<(), VerificationFailure> {
         // One analysis cache per function, shared across every pass and every fixpoint iteration.
         // It is invalidated by the passes that restructure the CFG (see their `run_function`), so it
         // stays valid — and reused — across the long tail of the fixpoint where only instructions
-        // move. The cache never changes what a pass computes, only how often it recomputes it.
-        let mut cache = CfgAnalyses::default();
+        // move. The cache never changes what a pass computes, only how often it recomputes it. It is
+        // *managed*: every reported mutation is passed on below, which is what lets it hand one
+        // function's alias facts to several memory passes in a row. It also carries the call
+        // effects of the functions optimized so far.
+        let mut cache = CfgAnalyses::managed(effects);
         // Fixpoint with per-pass clean-tracking. A pass is a *deterministic* function of the MIR, so a
         // pass that ran and reported "no change" cannot do anything until some OTHER pass mutates the
         // function — re-running it on identical MIR would again be a no-op. We therefore skip
@@ -262,6 +400,7 @@ impl PassManager {
                 };
                 if did {
                     changed = true;
+                    cache.note_mutation();
                     // A mutation may have created work for every pass again (including earlier ones
                     // already run this sweep, and `p` itself). Re-dirty all; they re-run next sweep.
                     clean.iter_mut().for_each(|c| *c = false);
@@ -303,20 +442,16 @@ pub fn optimize_preserving(program: &mut Program, opt_level: u8, roots: &[wukong
     if opt_level >= 2 {
         inline::inline_program_preserving(program, roots);
     }
-    let pm = PassManager::standard(opt_level);
-    pm.run(program);
+    PassManager::standard(opt_level).run(program);
     // Unrolling runs after the pipeline, not inside its fixpoint: it needs the canonical two-block
     // counted loop that mem2reg/simplify-cfg produce, and re-running it on its own output would
     // unroll the same loop again every sweep. Only the functions it touched are re-optimized, so a
     // program with no unrollable loop pays one scan and nothing more.
     if opt_level >= 2 {
         let changed = unroll_program(program);
-        if !changed.is_empty() {
-            let cleanup = PassManager::unroll_cleanup();
-            for i in changed {
-                cleanup.run_function(&mut program.funcs[i], None);
-            }
-        }
+        PassManager::unroll_cleanup().run_subset(program, &changed);
+        // Last, and outside the fixpoint: a multi-way branch must not reach the loop passes.
+        switch_form::form_switches(program);
     }
 }
 
@@ -344,10 +479,9 @@ pub fn optimize_verified_preserving(
     if opt_level >= 2 {
         let changed = unroll_program(program);
         verify_program_stage(program, "unroll")?;
-        let cleanup = PassManager::unroll_cleanup();
-        for i in changed {
-            cleanup.run_function_checked(&mut program.funcs[i], None, true)?;
-        }
+        PassManager::unroll_cleanup().run_subset_checked(program, &changed, true)?;
+        switch_form::form_switches(program);
+        verify_program_stage(program, "form-switches")?;
     }
     verify_program_stage(program, "optimization output")
 }
@@ -364,10 +498,9 @@ pub fn optimize_timed(program: &mut Program, opt_level: u8) -> Timings {
         inline_program(program);
         t.inline = i0.elapsed();
     }
-    let pm = PassManager::standard(opt_level);
-    for f in &mut program.funcs {
-        pm.run_function(f, Some(&mut t));
-    }
+    PassManager::standard(opt_level)
+        .run_program(program, Some(&mut t), cfg!(debug_assertions))
+        .unwrap_or_else(|failure| panic!("{failure}"));
     if opt_level >= 2 {
         // The unroll bucket is the pass *and* its cleanup sweep: that sum is the cost unrolling
         // actually adds, which is the number worth reporting. Keeping the cleanup out of the
@@ -376,13 +509,10 @@ pub fn optimize_timed(program: &mut Program, opt_level: u8) -> Timings {
         // differently).
         let u0 = Instant::now();
         let changed = unroll_program(program);
-        if !changed.is_empty() {
-            let cleanup = PassManager::unroll_cleanup();
-            for i in changed {
-                cleanup.run_function(&mut program.funcs[i], None);
-            }
-        }
+        PassManager::unroll_cleanup().run_subset(program, &changed);
         t.unroll = u0.elapsed();
+        // Counted in `total` only: one scan per function, and a cleanup only where one formed.
+        switch_form::form_switches(program);
     }
     t.total = start.elapsed();
     t
@@ -465,6 +595,20 @@ pub(crate) fn map_term_uses(t: &mut Terminator, mut f: impl FnMut(ValueId) -> Va
                 *a = f(*a);
             }
         }
+        Terminator::Switch {
+            scrutinee,
+            cases,
+            default_args,
+            ..
+        } => {
+            *scrutinee = f(*scrutinee);
+            for a in cases.iter_mut().flat_map(|c| c.args.iter_mut()) {
+                *a = f(*a);
+            }
+            for a in default_args {
+                *a = f(*a);
+            }
+        }
         Terminator::Ret(None) | Terminator::Unreachable => {}
     }
 }
@@ -534,6 +678,16 @@ pub(crate) fn each_term_use(t: &Terminator, f: &mut impl FnMut(ValueId)) {
             then_args.iter().for_each(|a| f(*a));
             else_args.iter().for_each(|a| f(*a));
         }
+        Terminator::Switch {
+            scrutinee,
+            cases,
+            default_args,
+            ..
+        } => {
+            f(*scrutinee);
+            cases.iter().flat_map(|c| &c.args).for_each(|a| f(*a));
+            default_args.iter().for_each(|a| f(*a));
+        }
         Terminator::Ret(None) | Terminator::Unreachable => {}
     }
 }
@@ -600,11 +754,14 @@ mod tests {
         let (program, lower) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
         assert!(lower.iter().all(|d| !d.is_error()), "{lower:?}");
         let shifted = program.function(interner.intern("shifted")).unwrap();
+        // Either vector form counts: on an AVX2+FMA3/Win64 host the eight-lane i32 body takes the
+        // 256-bit recipe (a `veckernel` call, no `<N x i32>` values), elsewhere the 128-bit strips.
         assert!(
             shifted
                 .value_types
                 .iter()
-                .any(wukong_mir::MirType::is_vector),
+                .any(wukong_mir::MirType::is_vector)
+                || !shifted.vec_kernels.is_empty(),
             "proven-disjoint shifted arrays should retain AST SIMD"
         );
         for level in [0, 2] {
@@ -675,21 +832,24 @@ mod tests {
         // The same `x - x` / `x <cmp> x` identities as above, but written so the front-end
         // vectorizes the loop body: the Bin/Cmp results are then `<N x iW>`, which cannot hold the
         // scalar `ConstInt` the fold would materialize. Declining the fold is the only legal answer.
+        // Each trip is below one 256-bit register of its lane type (8 i32, 4 i64), so the loop keeps
+        // the 128-bit `<N x iW>` strips on every host instead of becoming a raw-AVX2 `veckernel`
+        // call, which carries no vector values for the fold to see.
         let cases = [
             (
-                "fn main() -> i32 { let mut n: [i32; 8] = [8; 8]; \
-                 for i in 0..8 { n[i] = n[i] - n[i]; } return n[0] + n[7] + 7; }",
+                "fn main() -> i32 { let mut n: [i32; 7] = [8; 7]; \
+                 for i in 0..7 { n[i] = n[i] - n[i]; } return n[0] + n[6] + 7; }",
                 7,
             ),
             (
-                "fn main() -> i32 { let mut n: [i64; 16] = [8; 16]; \
-                 for i in 0..16 { n[i] = n[i] - n[i]; } return (n[0] + n[15] + 7) as i32; }",
+                "fn main() -> i32 { let mut n: [i64; 3] = [8; 3]; \
+                 for i in 0..3 { n[i] = n[i] - n[i]; } return (n[0] + n[2] + 7) as i32; }",
                 7,
             ),
             (
-                "fn main() -> i32 { let mut n: [i32; 16] = [8; 16]; let mut o: [i32; 16] = [0; 16]; \
-                 for i in 0..16 { o[i] = if n[i] < n[i] { 1 } else { 2 }; } \
-                 return o[0] + o[15]; }",
+                "fn main() -> i32 { let mut n: [i32; 7] = [8; 7]; let mut o: [i32; 7] = [0; 7]; \
+                 for i in 0..7 { o[i] = if n[i] < n[i] { 1 } else { 2 }; } \
+                 return o[0] + o[6]; }",
                 4,
             ),
         ];
@@ -1005,6 +1165,59 @@ mod tests {
     }
 
     #[test]
+    fn sroa_keeps_a_register_blocked_accumulator_out_of_memory() {
+        // The canonical hand-blocked reduction: four partial sums in a `[f32; 4]`, each updated at a
+        // constant index every iteration. Every access is at a constant position, so at -O2 the slot
+        // is split into four scalar slots that mem2reg promotes — no `[4 x f32]` slot survives
+        // anywhere in the program, and the sums are carried in registers.
+        //
+        // x[k] = k, so acc[j] = sum over i in 0..4 of (4i + j) = 24 + 4j = [24, 28, 32, 36], and
+        // 24 + 2*28 + 3*32 + 4*36 = 320.
+        let src = "fn blocked(x: [f32; 16]) -> f32 { \
+                     let mut acc: [f32; 4] = [0.0; 4]; let mut i: i64 = 0; \
+                     while i < 4 { \
+                       acc[0] = acc[0] + x[4 * i]; acc[1] = acc[1] + x[4 * i + 1]; \
+                       acc[2] = acc[2] + x[4 * i + 2]; acc[3] = acc[3] + x[4 * i + 3]; \
+                       i = i + 1; } \
+                     return acc[0] + acc[1] * 2.0 + acc[2] * 3.0 + acc[3] * 4.0; } \
+                   fn main() -> i32 { let mut x: [f32; 16] = [0.0; 16]; let mut k: i64 = 0; \
+                     while k < 16 { x[k] = k as f32; k = k + 1; } \
+                     return blocked(x) as i32; }";
+        for lvl in [0, 1, 2, 3] {
+            assert_eq!(run_main_opt(src, lvl), 320, "level {lvl}");
+        }
+        let blocks_of_four = |p: &wukong_mir::Program| {
+            p.funcs
+                .iter()
+                .flat_map(|f| &f.blocks)
+                .flat_map(|b| &b.insts)
+                .filter(|i| {
+                    matches!(
+                        &i.op,
+                        Op::Alloca { ty: wukong_mir::MirType::Array(e, 4), .. }
+                            if **e == wukong_mir::MirType::F32
+                    )
+                })
+                .count()
+        };
+        let (mut prog, _) = lower(src);
+        assert_eq!(
+            blocks_of_four(&prog),
+            1,
+            "the front end gives `acc` one slot"
+        );
+        optimize(&mut prog, 2);
+        for f in &prog.funcs {
+            assert!(wukong_mir::verify::verify_function(f).is_empty());
+        }
+        assert_eq!(
+            blocks_of_four(&prog),
+            0,
+            "the accumulator slot must be split and promoted at -O2"
+        );
+    }
+
+    #[test]
     fn inlining_removes_calls_and_preserves_results() {
         // `sq` is a small leaf function. At -O2 it is inlined into main and then constant-folded
         // away entirely, leaving no call. The result must be unchanged across all levels.
@@ -1156,7 +1369,8 @@ mod tests {
     #[test]
     fn recursion_is_not_inlined() {
         // A recursive function is not a leaf, so it must survive -O2 with its self-call intact and
-        // still compute correctly.
+        // still compute correctly. Tail-recursion elimination turns the accumulating `fib(n-2)`
+        // into a loop iteration (`tre`), so exactly the non-tail `fib(n-1)` call remains.
         let src = "fn fib(n: i32) -> i32 { if n < 2 { return n; } return fib(n-1) + fib(n-2); } \
                    fn main() -> i32 { return fib(12); }";
         assert_eq!(run_main_opt(src, 2), 144);
@@ -1169,7 +1383,137 @@ mod tests {
             .flat_map(|b| &b.insts)
             .filter(|i| matches!(i.op, wukong_mir::Op::Call { .. }))
             .count();
-        assert!(calls >= 2, "recursive fib should keep its self-calls");
+        assert_eq!(calls, 1, "recursive fib should keep its non-tail self-call");
+    }
+
+    #[test]
+    fn side_effect_free_calls_are_numbered_deleted_and_hoisted() {
+        // The bare pipeline, so no inliner hides the calls: `heavy`'s summary is what acts. Two
+        // identical calls become one, a call whose result is never read disappears, and the
+        // invariant call in the loop moves to its preheader.
+        let src = "fn heavy(x: i64) -> i64 { return x * x + 7; } \
+                   fn main() -> i32 { let a: i64 = 6; \
+                     let s: i64 = heavy(a) + heavy(a); \
+                     let unused: i64 = heavy(a + 1); \
+                     let mut t: i64 = 0; let mut i: i64 = 0; \
+                     while i < 10 { t = t + heavy(5); i = i + 1; } \
+                     return (s + t) as i32; }";
+        let (mut prog, mut interner) = lower(src);
+        let main = interner.intern("main");
+        let heavy = interner.intern("heavy");
+        // heavy(6) * 2 + heavy(5) * 10 = 43 * 2 + 32 * 10.
+        assert_eq!(wukong_interp::run(&prog, main, &interner).unwrap(), 406);
+        PassManager::standard(2).run(&mut prog);
+        for f in &prog.funcs {
+            assert!(wukong_mir::verify::verify_function(f).is_empty());
+        }
+        let main_fn = find_fn(&prog, &interner, "main");
+        let in_loop = inline::loop_blocks(main_fn);
+        let mut calls = 0;
+        for (bi, b) in main_fn.blocks.iter().enumerate() {
+            for inst in &b.insts {
+                if matches!(inst.op, wukong_mir::Op::Call { func, .. } if func == heavy) {
+                    calls += 1;
+                    assert!(
+                        !in_loop[bi],
+                        "the invariant call stayed in the loop\n{}",
+                        wukong_mir::print::print_function(main_fn, &interner)
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            calls,
+            2,
+            "{}",
+            wukong_mir::print::print_function(main_fn, &interner)
+        );
+        assert_eq!(wukong_interp::run(&prog, main, &interner).unwrap(), 406);
+        for lvl in [0, 1, 2, 3] {
+            assert_eq!(run_main_opt(src, lvl), 406, "level {lvl}");
+        }
+    }
+
+    #[test]
+    fn the_post_unroll_cleanup_judges_callees_by_their_unrolled_bodies() {
+        // `tri` loops a constant five times, so before unrolling it might not return and the dead
+        // `tri(a)` in `main` has to stay. Complete unrolling leaves `tri` straight-line; the
+        // cleanup re-summarizes the program from the unrolled bodies, and `main` — changed by
+        // unrolling too, so cleaned up as well — then drops the dead call. Driven by hand, without
+        // the inliner, which would otherwise absorb `tri`.
+        //
+        // s runs x, 2x, 4x+1, 8x+4, 16x+11, 32x+26, so tri(4) = 154; x runs 1, 3, 10, 32, 99, 301.
+        let src = "fn tri(x: i64) -> i64 { let mut s: i64 = x; let mut k: i64 = 0; \
+                     while k < 5 { s = s * 2 + k; k = k + 1; } return s; } \
+                   fn main() -> i32 { let a: i64 = 3; let unused: i64 = tri(a); \
+                     let mut x: i64 = 1; let mut i: i64 = 0; \
+                     while i < 5 { x = x * 3 + i; i = i + 1; } \
+                     return (x + tri(a + 1)) as i32; }";
+        for lvl in [0, 1, 2, 3] {
+            assert_eq!(run_main_opt(src, lvl), 455, "level {lvl}");
+        }
+        let (mut prog, mut interner) = lower(src);
+        let tri = interner.intern("tri");
+        let main = interner.intern("main");
+        let calls_to_tri = |p: &Program| {
+            p.funcs
+                .iter()
+                .flat_map(|f| &f.blocks)
+                .flat_map(|b| &b.insts)
+                .filter(|i| matches!(i.op, Op::Call { func, .. } if func == tri))
+                .count()
+        };
+        PassManager::standard(2).run(&mut prog);
+        assert_eq!(
+            calls_to_tri(&prog),
+            2,
+            "a callee with a loop may not return, so the dead call stays"
+        );
+        let changed = unroll_program(&mut prog);
+        let index_of =
+            |name: wukong_span::Symbol| prog.funcs.iter().position(|f| f.name == name).unwrap();
+        assert!(
+            changed.contains(&index_of(tri)) && changed.contains(&index_of(main)),
+            "both loops must be unrolled completely: {changed:?}"
+        );
+        PassManager::unroll_cleanup().run_subset(&mut prog, &changed);
+        assert!(wukong_mir::verify::verify_program(&prog).is_empty());
+        assert_eq!(
+            calls_to_tri(&prog),
+            1,
+            "{}",
+            wukong_mir::print::print_program(&prog, &interner)
+        );
+        assert_eq!(wukong_interp::run(&prog, main, &interner).unwrap(), 455);
+    }
+
+    #[test]
+    fn a_short_constant_loop_is_unrolled_completely_and_folds_to_its_value() {
+        // `x = x * 3 + k` five times: a recurrence no vectorizer or recognizer takes. With a known
+        // trip count of 5 the unroller replaces the loop by its iterations, the cleanup merges the
+        // header into its preheader, and every copy folds: `main` returns a constant.
+        let src = "fn main() -> i32 { let mut x: i32 = 1; let mut k: i32 = 0; \
+                   while k < 5 { x = x * 3 + k; k = k + 1; } return x; }";
+        for lvl in [0, 1, 2, 3] {
+            assert_eq!(run_main_opt(src, lvl), 301, "level {lvl}");
+        }
+        let (mut prog, mut interner) = lower(src);
+        optimize(&mut prog, 2);
+        let main_fn = find_fn(&prog, &interner, "main");
+        let shown = wukong_mir::print::print_function(main_fn, &interner);
+        assert!(
+            !inline::loop_blocks(main_fn).iter().any(|&b| b),
+            "the loop must be gone\n{shown}"
+        );
+        let returns_301 = main_fn.blocks.iter().any(|b| match b.term {
+            Terminator::Ret(Some(v)) => b.insts.iter().any(|i| {
+                i.result == Some(v) && matches!(i.op, Op::ConstInt(301, wukong_mir::MirType::I32))
+            }),
+            _ => false,
+        });
+        assert!(returns_301, "{shown}");
+        let main = interner.intern("main");
+        assert_eq!(wukong_interp::run(&prog, main, &interner).unwrap(), 301);
     }
 
     #[test]
@@ -1256,7 +1600,7 @@ mod tests {
         // `mem2reg_promotes_an_inlined_callees_pointer_parameter` (inlining splices a callee's
         // `alloca ptr` into the middle of a caller block), plus
         // `mem2reg_ptr_promotion_keeps_the_pointee_in_memory` and
-        // `mem2reg_leaves_a_late_initialized_pointer_slot_in_memory` for its refusal cases.
+        // `mem2reg_promotes_a_late_initialized_pointer_slot_to_null_on_the_uninit_path`.
         //
         // The data-dependent branch keeps every elementwise recognizer from firing, so this is
         // general code, not a dispatched kernel.
@@ -1358,13 +1702,14 @@ mod tests {
     }
 
     #[test]
-    fn mem2reg_leaves_a_late_initialized_pointer_slot_in_memory() {
+    fn mem2reg_promotes_a_late_initialized_pointer_slot_to_null_on_the_uninit_path() {
         // A pointer slot first written *outside* the entry block can be read before it is written
-        // on some path. Promotion would have to materialize an "undefined" pointer, and there is no
-        // sound one: `inttoptr 0` is null natively but a valid, addressable slot in the interpreter.
-        // Mem2Reg must leave such a slot in memory. Here `p`'s store is inside the loop body, so
-        // the entry block never initializes it. Later CSE can forward the body-local load from
-        // that store and DSE/DCE can remove the unread slot without inventing a pointer value.
+        // on some path, so promoting it needs a value for "not yet written". That value used to be
+        // unsound: `inttoptr 0` is null natively but was the interpreter's first live allocation,
+        // so this slot had to stay in memory and be re-loaded on every use. The interpreter now
+        // reserves slot 0 as null (`wukong_interp::NULL_SLOT`), so the uninitialized path gets the
+        // same null on both backends and the slot is promoted by mem2reg itself. Here `p`'s store
+        // is inside the loop body, so the loop header merges the null with the body's `&mut a`.
         let src = "fn main() -> i32 { let mut a: i32 = 5; let mut t: i32 = 0; \
                    let mut i: i32 = 0; \
                    while i < 3 { let p: *mut i32 = &mut a; t = t + *p; i = i + 1; } \
@@ -1375,25 +1720,90 @@ mod tests {
         }
         let (slots, _) = count_ptr_slots_and_reloads(find_fn(&prog, &interner, "main"));
         assert_eq!(
-            slots, 1,
-            "a late-initialized pointer slot must stay in memory"
+            slots, 0,
+            "a late-initialized pointer slot must be promoted, with null on the unwritten path"
         );
+        let has_null = find_fn(&prog, &interner, "main")
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| {
+                matches!(
+                    i.op,
+                    wukong_mir::Op::Cast(
+                        wukong_mir::CastKind::IntToPtr,
+                        _,
+                        wukong_mir::MirType::Ptr
+                    )
+                )
+            });
+        assert!(has_null, "the read-before-write path must see `inttoptr 0`");
         for f in &prog.funcs {
             assert!(wukong_mir::verify::verify_function(f).is_empty());
         }
         let main = interner.intern("main");
         assert_eq!(wukong_interp::run(&prog, main, &interner).unwrap(), 15);
-        // Retain the full-pipeline semantic check separately from the promotion invariant.
         optimize(&mut prog, 2);
         assert_eq!(
             count_ptr_slots_and_reloads(find_fn(&prog, &interner, "main")),
             (0, 0),
-            "forwarded pointer stores and reloads should become dead"
+            "no pointer slot or reload may survive the full pipeline"
         );
         for f in &prog.funcs {
             assert!(wukong_mir::verify::verify_function(f).is_empty());
         }
         assert_eq!(wukong_interp::run(&prog, main, &interner).unwrap(), 15);
         assert_eq!(run_main_opt(src, 0), 15);
+    }
+
+    #[test]
+    fn pointer_conditions_are_null_tests_at_every_level() {
+        // `if p` on a pointer lowers to `ptrtoint p != 0`. The reproducer that forced the revert
+        // at 0900352 is the first case: the first local's address used to be interpreter slot 0
+        // and so read as null. A null from `0 as *T`, a conditionally assigned pointer (promoted
+        // by mem2reg with a null on the unassigned path) and `while p` are covered too.
+        // Expected values are the obvious scalar semantics: the address of a live local is
+        // non-null, `0 as *T` is null.
+        let cases = [
+            (
+                "fn main() -> i32 { let mut v: i32 = 7; let p: *mut i32 = &mut v; \
+              if p { return 1; } return 0; }",
+                1,
+            ),
+            (
+                "fn main() -> i32 { let q: *mut i32 = 0 as *mut i32; \
+              if q { return 1; } return 2; }",
+                2,
+            ),
+            (
+                "fn main() -> i32 { let mut v: i32 = 3; let mut n: i32 = 0; \
+              let mut p: *mut i32 = 0 as *mut i32; \
+              while n < 4 { if n == 2 { p = &mut v; } n = n + 1; } \
+              if p { return *p * 10; } return 0; }",
+                30,
+            ),
+            (
+                "fn main() -> i32 { let mut v: i32 = 3; let mut p: *mut i32 = &mut v; \
+              let mut k: i32 = 0; \
+              while p { k = k + 1; if k == 5 { p = 0 as *mut i32; } } return k; }",
+                5,
+            ),
+        ];
+        for (src, expect) in cases {
+            for lvl in [0, 1, 2, 3] {
+                assert_eq!(run_main_opt(src, lvl), expect, "level {lvl}: {src}");
+            }
+            let (mut prog, _) = lower(src);
+            for f in &prog.funcs {
+                assert!(
+                    wukong_mir::verify::verify_function(f).is_empty(),
+                    "-O0 MIR must verify: {src}"
+                );
+            }
+            optimize(&mut prog, 2);
+            for f in &prog.funcs {
+                assert!(wukong_mir::verify::verify_function(f).is_empty(), "{src}");
+            }
+        }
     }
 }

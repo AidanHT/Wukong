@@ -1,0 +1,19 @@
+// EXPECT-CODE: E0316
+module tests.fail.noalias_aliased_call
+
+// `@noalias` on `out` promises that nothing else the call can reach overlaps it, and the optimizer
+// acts on that promise: the store to `out[i]` is assumed not to change `x`, so loads move across it,
+// the loop vectorizes with no runtime alias check, and Cranelift files the two in different alias
+// classes. Passing one array as BOTH arguments breaks the promise in a way the compiler can see, so
+// it is rejected here instead of being compiled into code whose answer depends on the -O level.
+fn scale(@noalias mut out: [f32; 4], x: [f32; 4]) {
+    for i in 0..4 {
+        out[i] = x[i] * 2.0;
+    }
+}
+
+fn main() -> i32 {
+    let mut a: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    scale(a, a);
+    return 0;
+}

@@ -190,14 +190,24 @@ impl wukong_opt::Pass for Counted {
     }
 }
 
-/// Slot layout of the attribution table: the ten standard `-O2` passes in pipeline order, then the
-/// two whole-program stages, then the cleanup pipeline's two passes (kept separate because they run
-/// under a different driver instance and belong to the unrolling stage's cost).
-const SLOT_INLINE: usize = 10;
-const SLOT_UNROLL: usize = 11;
-const SLOT_CLEANUP_CSE: usize = 12;
-const SLOT_CLEANUP_DCE: usize = 13;
-const SLOTS: usize = 14;
+/// Slot layout of the attribution table: the seventeen standard `-O2` passes in pipeline order, then
+/// the two whole-program stages, then the cleanup pipeline's five passes (kept separate because they
+/// run under a different driver instance and belong to the unrolling stage's cost), then the late
+/// `switch` formation.
+const STANDARD: usize = 17;
+const SLOT_INLINE: usize = STANDARD;
+const SLOT_UNROLL: usize = STANDARD + 1;
+const SLOT_CLEANUP: usize = STANDARD + 2;
+/// `PassManager::unroll_cleanup`'s passes, in its order.
+const CLEANUP_NAMES: [&str; 5] = [
+    "cleanup:simplify",
+    "cleanup:simplify-cfg",
+    "cleanup:simplify-phis",
+    "cleanup:cse",
+    "cleanup:dce",
+];
+const SLOT_SWITCHES: usize = SLOT_CLEANUP + CLEANUP_NAMES.len();
+const SLOTS: usize = SLOT_SWITCHES + 1;
 
 fn counted_pass(slot: usize, p: Box<dyn wukong_opt::Pass>) -> Box<dyn wukong_opt::Pass> {
     Box::new(Counted { inner: p, slot })
@@ -207,37 +217,46 @@ fn counted_pass(slot: usize, p: Box<dyn wukong_opt::Pass>) -> Box<dyn wukong_opt
 fn attributed_standard() -> wukong_opt::PassManager {
     use wukong_opt::*;
     let mut pm = PassManager::new();
-    pm.add(counted_pass(0, Box::new(Mem2Reg)));
-    pm.add(counted_pass(1, Box::new(Simplify)));
-    pm.add(counted_pass(2, Box::new(SimplifyCfg)));
-    pm.add(counted_pass(3, Box::new(SimplifyPhis)));
-    pm.add(counted_pass(4, Box::new(Dce)));
-    pm.add(counted_pass(5, Box::new(Cse)));
-    pm.add(counted_pass(6, Box::new(Dse)));
-    pm.add(counted_pass(7, Box::new(LoopCanon)));
-    pm.add(counted_pass(8, Box::new(Licm)));
-    pm.add(counted_pass(9, Box::new(Vectorize::default())));
+    pm.add(counted_pass(0, Box::new(Sroa)));
+    pm.add(counted_pass(1, Box::new(Mem2Reg)));
+    pm.add(counted_pass(2, Box::new(Simplify)));
+    pm.add(counted_pass(3, Box::new(SimplifyCfg)));
+    pm.add(counted_pass(4, Box::new(SimplifyPhis)));
+    pm.add(counted_pass(5, Box::new(Dce)));
+    pm.add(counted_pass(6, Box::new(Tre)));
+    pm.add(counted_pass(7, Box::new(Cse)));
+    pm.add(counted_pass(8, Box::new(Dse)));
+    pm.add(counted_pass(9, Box::new(LoopCanon)));
+    pm.add(counted_pass(10, Box::new(LoopDelete)));
+    pm.add(counted_pass(11, Box::new(LoopFuse)));
+    pm.add(counted_pass(12, Box::new(Licm)));
+    pm.add(counted_pass(13, Box::new(Bce)));
+    pm.add(counted_pass(14, Box::new(LoopUnswitch)));
+    pm.add(counted_pass(15, Box::new(Promote)));
+    pm.add(counted_pass(16, Box::new(Vectorize::default())));
     pm
 }
 
-/// The post-unroll cleanup pipeline (`cse` → `dce`), wrapped.
+/// The post-unroll cleanup pipeline (`simplify` → `simplify-cfg` → `simplify-phis` → `cse` →
+/// `dce`, `PassManager::unroll_cleanup`'s order), wrapped.
 fn attributed_cleanup() -> wukong_opt::PassManager {
     use wukong_opt::*;
     let mut pm = PassManager::new();
-    pm.add(counted_pass(SLOT_CLEANUP_CSE, Box::new(Cse)));
-    pm.add(counted_pass(SLOT_CLEANUP_DCE, Box::new(Dce)));
+    pm.add(counted_pass(SLOT_CLEANUP, Box::new(Simplify)));
+    pm.add(counted_pass(SLOT_CLEANUP + 1, Box::new(SimplifyCfg)));
+    pm.add(counted_pass(SLOT_CLEANUP + 2, Box::new(SimplifyPhis)));
+    pm.add(counted_pass(SLOT_CLEANUP + 3, Box::new(Cse)));
+    pm.add(counted_pass(SLOT_CLEANUP + 4, Box::new(Dce)));
     pm
 }
 
 /// Run the `-O2` optimizer over `p` with per-pass attribution, mirroring [`wukong_opt::optimize`]
-/// stage for stage: inline → standard fixpoint → unroll → cleanup of the changed functions.
+/// stage for stage: inline → standard fixpoint → unroll → cleanup of the changed functions →
+/// switch formation.
 ///
-/// The cleanup is the one place `optimize` does something this replica cannot call directly (it
-/// runs the private `run_function` on just the changed functions). Each changed function is moved
-/// into a single-function `Program` shell — whose `Vec` is reserved *before* counting starts, so the
-/// move itself allocates nothing — and the public `PassManager::run` is applied to that shell. The
-/// per-function pipeline is function-local, so the mutation sequence is identical; the
-/// byte-identical check in `measure_one` is what proves it.
+/// The cleanup goes through the same public `PassManager::run_subset` that `optimize` uses, so the
+/// changed functions are cleaned in the same order with the same call-effect summaries of the rest
+/// of the program; the byte-identical check in `measure_one` is what proves the replica exact.
 fn optimize_attributed(p: &mut wukong_mir::Program) -> Vec<PassWork> {
     PASS_ACC.with(|acc| {
         let mut acc = acc.borrow_mut();
@@ -247,21 +266,16 @@ fn optimize_attributed(p: &mut wukong_mir::Program) -> Vec<PassWork> {
     let (_, inline) = counted(|| wukong_opt::inline_program(p));
     attributed_standard().run(p);
     let cleanup = attributed_cleanup();
-    let mut shell = wukong_mir::Program {
-        funcs: Vec::with_capacity(1),
-        statics: Vec::new(),
-        level: p.level,
-    };
     let (changed, unroll) = counted(|| wukong_opt::unroll_program(p));
-    for i in changed {
-        let placeholder = placeholder_function(&p.funcs[i]);
-        let f = std::mem::replace(&mut p.funcs[i], placeholder);
-        shell.funcs.push(f);
-        cleanup.run(&mut shell);
-        p.funcs[i] = shell.funcs.pop().unwrap();
-    }
+    cleanup.run_subset(p, &changed);
+    let (_, switches) = counted(|| wukong_opt::form_switches(p));
     PASS_ACC.with(|acc| {
         let mut acc = acc.borrow_mut();
+        acc[SLOT_SWITCHES] = PassWork {
+            name: "form-switches",
+            calls: 1,
+            work: switches,
+        };
         acc[SLOT_INLINE] = PassWork {
             name: "inline",
             calls: 1,
@@ -272,24 +286,11 @@ fn optimize_attributed(p: &mut wukong_mir::Program) -> Vec<PassWork> {
             calls: 1,
             work: unroll,
         };
-        acc[SLOT_CLEANUP_CSE].name = "cleanup:cse";
-        acc[SLOT_CLEANUP_DCE].name = "cleanup:dce";
+        for (k, name) in CLEANUP_NAMES.iter().enumerate() {
+            acc[SLOT_CLEANUP + k].name = *name;
+        }
         acc.clone()
     })
-}
-
-/// An allocation-free stand-in left in a function's slot while it is being cleaned up in the shell.
-/// Shares the original's `Symbol`/`MirType` (both `Copy`/cheap) and owns no heap memory.
-fn placeholder_function(f: &wukong_mir::Function) -> wukong_mir::Function {
-    wukong_mir::Function {
-        name: f.name,
-        params: Vec::new(),
-        ret: wukong_mir::MirType::Void,
-        blocks: Vec::new(),
-        value_types: Vec::new(),
-        entry: f.entry,
-        vec_kernels: Vec::new(),
-    }
 }
 
 // ===================================================================================================
@@ -479,7 +480,7 @@ pub fn report(files: &[PathBuf]) {
     let opt = stage_tot[4];
     let residual = opt.since(attributed);
     let max_iter = rows.iter().map(|r| r.max_iterations).max().unwrap_or(0);
-    let sum_calls: u64 = agg[..10].iter().map(|p| p.calls).sum();
+    let sum_calls: u64 = agg[..STANDARD].iter().map(|p| p.calls).sum();
     println!(
         "\noptimizer attribution (summed over corpus; counting adapters around the production \
          PassManager, byte-identical to `optimize`):\n  {:<14} {:>9} {:>12} {:>14} {:>8}",
@@ -528,7 +529,7 @@ pub fn report(files: &[PathBuf]) {
     rows.sort_by(|a, b| a.name.cmp(&b.name));
     for r in &rows {
         let bytes: u64 = r.stage.iter().map(|w| w.bytes).sum();
-        let calls: u64 = r.passes[..10].iter().map(|p| p.calls).sum();
+        let calls: u64 = r.passes[..STANDARD].iter().map(|p| p.calls).sum();
         println!(
             "{:<28} {:>7} {:>7} {:>7} {:>8} {:>8} {:>8} {:>8} {:>10} {:>7} {:>7}",
             trunc(&r.name, 28),

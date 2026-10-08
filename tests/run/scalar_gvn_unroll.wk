@@ -1,0 +1,150 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 301
+// EXPECT-OUT: 7
+// EXPECT-OUT: 360
+// EXPECT-OUT: 59369
+// EXPECT-OUT: 723924
+// EXPECT-OUT: 13
+// EXPECT-OUT: 6
+// EXPECT-OUT: 289
+// EXPECT-OUT: 287
+// EXPECT-OUT: 45328197212
+// EXPECT-OUT: 191773142050
+module tests.run.scalar_gvn_unroll
+
+/// The scalar optimizer's newer shapes, end to end on both backends and at every -O level (the
+/// differential and invariance gates re-run this file; `-O0` never builds any of these shapes, so
+/// they are the reference):
+///
+///  * **complete unrolling** of loops with a known trip count — five iterations of a recurrence, a
+///    loop that never runs, and a stride-3 loop;
+///  * **4x unrolling with a known trip count**: 4096 iterations need no remainder at all, 4099 leave
+///    three iterations that run as straight-line code instead of a remainder loop;
+///  * **global value numbering through a join**: both arms of an `if` store to one array element,
+///    and the read after the join becomes a phi of the stored values; an expression both arms
+///    compute is reused after the join instead of recomputed;
+///  * **side-effect-free calls**: `heavy` is too large to inline, so two identical calls become one,
+///    a call whose result is unused disappears, and the invariant call in the loop is hoisted.
+///
+/// Every printed value is derived from the scalar semantics written here, not recorded from the
+/// compiler: `x = 3x + k` for k = 0..4 from 1 is 3, 10, 32, 99, 301; `s = 2s + i` for i = 0, 3, ...,
+/// 18 is 0, 3, 12, 33, 78, 171, 360; the two hashes are `h = (31h + q) mod 1000003` over
+/// q < 4096 and q < 4099; `heavy(x) = 3^20 * x + (3^20 - 1) / 2` = 22664098606 for 6 and
+/// 19177314205 for 5. Conditions and the call arguments come from an opaque zero read back out of
+/// heap memory, so none of it can be constant-folded away before the transforms under test run.
+
+fn heavy(x: i64) -> i64 {
+    let mut h: i64 = x;
+    h = h * 3 + 1;
+    h = h * 3 + 1;
+    h = h * 3 + 1;
+    h = h * 3 + 1;
+    h = h * 3 + 1;
+    h = h * 3 + 1;
+    h = h * 3 + 1;
+    h = h * 3 + 1;
+    h = h * 3 + 1;
+    h = h * 3 + 1;
+    h = h * 3 + 1;
+    h = h * 3 + 1;
+    h = h * 3 + 1;
+    h = h * 3 + 1;
+    h = h * 3 + 1;
+    h = h * 3 + 1;
+    h = h * 3 + 1;
+    h = h * 3 + 1;
+    h = h * 3 + 1;
+    h = h * 3 + 1;
+    return h;
+}
+
+fn pick(c: bool, a: i32, b: i32) -> i32 {
+    let mut slot: [i32; 2] = [5, 6];
+    if c {
+        slot[1] = a * 3;
+    } else {
+        slot[1] = b - 4;
+    }
+    return slot[1] + 1;
+}
+
+fn arms(c: bool, a: i64) -> i64 {
+    let mut r: i64 = 0;
+    if c {
+        r = a * a + 1;
+    } else {
+        r = a * a - 1;
+    }
+    return r + a * a;
+}
+
+fn main() -> i32 {
+    let mut z: []i32 = alloc_i32(4);
+    z[0] = 0;
+    let o: i32 = z[0];
+    let o64: i64 = o as i64;
+
+    // Complete unrolling.
+    let mut x: i32 = 1;
+    let mut k: i32 = 0;
+    while k < 5 {
+        x = x * 3 + k;
+        k = k + 1;
+    }
+    print(x);
+    let mut zt: i32 = 7;
+    let mut j: i32 = 9;
+    while j < 3 {
+        zt = zt * 2;
+        j = j + 1;
+    }
+    print(zt);
+    let mut s: i64 = 0;
+    let mut i: i64 = 0;
+    while i < 20 {
+        s = s * 2 + i;
+        i = i + 3;
+    }
+    print(s);
+
+    // 4x with a known trip count: no remainder, then a three-iteration straight-line remainder.
+    let mut h1: i64 = 0;
+    let mut q: i64 = 0;
+    while q < 4096 {
+        h1 = (h1 * 31 + q) % 1000003;
+        q = q + 1;
+    }
+    print(h1);
+    let mut h2: i64 = 0;
+    let mut r: i64 = 0;
+    while r < 4099 {
+        h2 = (h2 * 31 + r) % 1000003;
+        r = r + 1;
+    }
+    print(h2);
+
+    // Value numbering through joins.
+    let flag: bool = o == 0;
+    let other: bool = o != 0;
+    print(pick(flag, 4, 9));
+    print(pick(other, 4, 9));
+    print(arms(flag, 12 + o64));
+    print(arms(other, 12 + o64));
+
+    // Side-effect-free calls.
+    let v: i64 = 6 + o64;
+    let twice: i64 = heavy(v) + heavy(v);
+    let unused: i64 = heavy(v + 1);
+    print(twice);
+    let mut acc: i64 = 0;
+    let mut n: i64 = 0;
+    while n < 10 + o64 {
+        acc = acc + heavy(5 + o64);
+        n = n + 1;
+    }
+    print(acc);
+
+    free(z);
+    return 0;
+}

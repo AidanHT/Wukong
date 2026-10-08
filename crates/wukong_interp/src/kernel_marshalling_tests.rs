@@ -9,6 +9,7 @@ fn interpreter<'a>(program: &'a Program, interner: &'a Interner) -> Interp<'a, '
         interner,
         memory: Vec::new(),
         stdout: Vec::new(),
+        scratch_arena: ScratchSlots::default(),
         frames: Vec::new(),
         call_args: Vec::new(),
         scratch: Vec::new(),
@@ -430,6 +431,7 @@ fn vector_program(interner: &mut Interner, reduction: bool) -> Program {
     }
     func.vec_kernels.push(VecKernel {
         name,
+        lane: wukong_mir::VecLane::F32,
         streams: 2,
         scalars: 2,
         unroll: 1,

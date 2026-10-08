@@ -179,13 +179,18 @@ static CATALOG: &[Explanation] = &[
         "E0306",
         "unknown or misplaced attribute",
         "An `@attribute` is not one Wukong knows, or is not legal where it was written. The known \
-         set is closed: `@parallel`, `@generic`, `@tile`, `@extern`, `@inline`, `@simd`, `@align`, \
-         `@export`. Anything else — most importantly a typo of a real one, `@parellel` — used to be \
-         accepted and discarded, so the program compiled with none of the requested behavior and no \
-         diagnostic. Placement: `@generic` (opt this function out of kernel recognition) is read \
-         from the `fn` item, so it is rejected on a statement, a parameter, or a non-`fn` item \
-         rather than silently promising a per-loop opt-out. The parsed-but-discarded attributes \
-         (`@inline`, `@simd`, `@align`, `@export`) stay legal wherever they parse."
+         set is closed: `@parallel`, `@generic`, `@tile`, `@extern`, `@noalias`, `@unchecked`, \
+         `@inline`, `@simd`, `@align`, `@export`. Anything else — most importantly a typo of a real one, \
+         `@parellel` — used to be accepted and discarded, so the program compiled with none of the \
+         requested behavior and no diagnostic. Placement: `@generic` (opt this function out of \
+         kernel recognition) is read from the `fn` item, so it is rejected on a statement, a \
+         parameter, or a non-`fn` item rather than silently promising a per-loop opt-out; \
+         `@unchecked` (drop this function's slice bounds checks) is read from the `fn` item for the \
+         same reason. `@noalias` describes one parameter's storage, so it is legal only on a parameter, takes no \
+         arguments, and only on a parameter passed by pointer (an array, slice, tensor, pointer, \
+         reference, tuple or struct) — on a scalar there is no storage to promise anything about. \
+         The parsed-but-discarded attributes (`@inline`, `@simd`, `@align`, `@export`) stay legal \
+         wherever they parse."
     ),
     entry!(
         "E0307",
@@ -219,6 +224,27 @@ static CATALOG: &[Explanation] = &[
          where it stood, and a function-item queue additionally SHIFTED, so the next loop was \
          strip-mined at the wrong width. Either drop the attribute or write the loop in the form it \
          can rewrite."
+    ),
+    entry!(
+        "E0316",
+        "`@noalias` promise broken",
+        "A `@noalias` parameter promises that, for the duration of a call, the storage it points \
+         into is reached only through that parameter — nothing else the call can name overlaps it \
+         (C's `restrict`, LLVM's `noalias`). The optimizer relies on it: a store through the \
+         promised parameter is assumed not to change any other argument, so loads move across it, \
+         loops vectorize without a runtime alias check, and recognized kernels dispatch. Two \
+         spellings break the promise provably and are rejected. (1) A call passes the promised \
+         parameter's argument together with another buffer argument rooted in the same storage: \
+         `k(a, a)`, `k(s, a)` after `let s: []f32 = a`, `k(p.w, p)` (a field and its struct), or \
+         `k(m[0], m[1])` (element indices are not compared, so two elements of one array count as \
+         one buffer). Two different fields of one struct, `k(p.w, p.b)`, are fine. Copy one side \
+         into a fresh local first, or drop the attribute if the callee must accept aliased \
+         arguments. (2) A `@noalias` parameter of view type (`[]T`, `*T`, `&T`, a tensor) is \
+         reassigned as a whole (`s = t`), which would point the promised name at storage the \
+         promise never covered; write through it (`s[i] = …`) or bind a local view instead. A call \
+         whose arguments the compiler cannot prove to overlap is accepted: if they do overlap, the \
+         program has broken its promise, and optimized native code may differ from the \
+         interpreter, exactly as with `restrict` in C."
     ),
     entry!(
         "E0401",

@@ -5,6 +5,156 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Optimizer memory passes: SROA, path DSE, loop deletion, guarded LICM, scalar promotion (`gap/opt-memory`)
+
+- **SROA** (`-O2`, ahead of mem2reg): an array/struct/tuple local whose every access is at a constant
+  position is split into scalar leaf slots that mem2reg promotes, checked against both the
+  interpreter's slot layout and native byte layout (P10.1).
+- **DSE** matches overwrites must-alias (base + constant offset), proves stores dead along every path
+  and at the end of a private slot's lifetime, and deletes loop-bounded stores into never-read slots;
+  the new **loop-delete** pass removes the loops it empties (P10.4).
+- **LICM** hoists a load that runs on every iteration of a single-exit loop through a parameter,
+  reading through `select(first_test, addr, dummy)` so zero-trip entries never touch it (P10.3); the
+  new **promote** pass keeps a loop-invariant location the loop reads and writes in a register (P10.2).
+
+### Vectorizer: 256-bit lanes for f64/i32/i64, runtime-sized streams, one reduction tree (`gap/vectorizer`)
+
+- The raw-AVX2 recipe path covers f64 (4 lanes), i32 (8) and i64 (4) as well as f32, keeps up to
+  eleven stream bases (five-plus-stream fused bodies stay 256-bit), and switches large aligned
+  output-only streams to non-temporal stores at run time (`WUKONG_P4_NO_NT=1` disables that).
+- `[]T` slices and symbolic-shape tensors reach the vectorizer, behind a one-time run-time bounds and
+  overlap check that keeps the loop scalar when it fails.
+- A vectorized reduction computes one **canonical summation tree** on every path, host and `-O`
+  level (`docs/internals.md`); a runtime trip reaches the 256-bit reduction through a run-time trip
+  test, and `s = s + x + y` is recognized as the reduction `s += x + y`. An ordered compare of
+  unsigned integer lanes now keeps its loop scalar instead of comparing signed in the vector lanes.
+- `wukong_opt::vectorize` no longer declines a whole loop for one invariant scalar load beside a
+  store: the load gets a run-time point check against each stored range.
+
+### `@noalias` parameters: a checked restrict promise the whole pipeline consumes
+
+- **Language: `@noalias` on a parameter** (C's `restrict`, LLVM's `noalias`) promises that, for the
+  duration of a call, the storage it points into is reached only through it. Legal only on a
+  parameter passed by pointer (array, slice, tensor, pointer, reference, tuple, struct), with no
+  arguments; anywhere else it is `E0306`. **New code `E0316`** rejects a call that passes the
+  promised argument together with another buffer argument rooted in the same storage (`k(a, a)`, a
+  view of the same array, a field with its struct, two elements of one array) and re-pointing a
+  promised view parameter (`s = t`). `tests/fail/noalias_*.wk`, `tests/run/noalias_params.wk`.
+- **Optimizer and backends consume it.** MIR carries `ParamAttrs` per parameter (printed `noalias`);
+  `wukong_opt::alias` treats a promised parameter as disjoint from every other parameter, gives a
+  promised slice's elements their own provenance, and keeps non-escaping promised storage apart from
+  untracked pointers and callees; the loop dependence test and the vectorizer's runtime alias guard
+  skip pairs it separates; LICM hoists a promised slice's data-pointer re-read; Cranelift tags
+  promised storage with its own alias regions and marks the invariant fat-pointer loads pure; the
+  LLVM emitter writes `ptr noalias`; the GEMM-class recognizers and the `@parallel` region outliner
+  accept a promise as a disjointness proof. A program without the attribute lowers to byte-identical
+  MIR (P11.1).
+- **Fix: the region outliner grouped possibly-aliased parameters by exact `Ty` equality** (P1.20), so a
+  `[f32; 32]` source and a `[f32; 16]` destination were two buffers by fiat. Parameters over the same
+  element scalar now form one group whatever their declared lengths, unless a promise separates them.
+
+### Language safety (gap/lang-safety)
+
+- **A scratch allocator, and cache-line-aligned heap memory.** `scratch_<T>(n) -> []T` (the eight
+  `alloc_<T>` element types), `scratch_mark() -> i64` and `scratch_release(m)` expose a per-thread
+  LIFO bump arena for temporaries (`wukong_runtime::scratch`, in the spirit of Odin's temp allocator
+  and Zig's arena reset): zeroed, 64-byte-aligned slices whose memory is reused after a release, so
+  a kernel that needs a buffer per call stops paying a system allocation, a free and fresh-page
+  faults on every call. The mark is the count of live scratch allocations, so it is the same value
+  on the interpreter (which mirrors the count and reuses released regions), the JIT and a linked
+  executable (the `cc` fallback carries a C twin). `wukong_rt_alloc` now returns 64-byte-aligned
+  data (was 16), in the C fallback too. `tests/run/alloc_scratch_arena.wk` (every lane, derived by hand;
+  also in the AOT gate), runtime and sema unit tests.
+
+- **A runtime failure means one thing on every execution path.** `wukongc --run` now prints the
+  stdout a program produced before a failed `assert` or slice bounds check (then `error: …`, exit 1)
+  instead of discarding it, so it agrees with a linked executable, and the differential gate now
+  compares that output across the interpreter and the JIT (`wukong_interp::run_capturing`,
+  `JitProgram::run_capturing`, `jit_run_capturing`). Failure-capable `@parallel` region bodies are
+  no longer a native compile error ("assertion-capable callback … requires a cancellation ABI"):
+  the guarded JIT binds `wukong_parallel_for` to `rt_parallel_for`, which keeps each span's
+  failure in a per-thread slot, skips spans after an already-failed one, and reports the failure of
+  the lowest-starting failed span — the failure the in-order interpreter reports — to a caller that
+  then returns at once. The raw `jit_module` API accepts assertions with abort-on-failure semantics,
+  as it already did for bounds checks. `tests/run/assert_fail_trailing_output.wk`, added with
+  `slice_bounds_oob.wk` to the `exe.rs` AOT gate.
+
+- **Bounds-check elimination (`wukong_opt::bce`, `-O2`).** An innermost counted loop whose slice
+  checks are provable is versioned on a preheader guard: `start < end`, then per check
+  `lo <=u hi && hi <u len` at the two ends of an index of the form `±iv + invariant` (sound under
+  wrapping arithmetic), with each slice length shown stable by `alias` plus Wukong's no-punning
+  rule. The check-free copy runs when every guard passes — and is then a single-exit loop the
+  vectorizer accepts — while the original, checked loop runs otherwise and fails at exactly the same
+  iteration. A caller-owned header is read early only behind the guards of the checks that precede
+  it. Unit tests in `bce.rs` compare -O0 and -O2 results and diagnostics, in and out of range.
+
+- **Slice accesses are bounds-checked.** `s[i]` on a `[]T` now compares `i` against the length in
+  the slice's own fat pointer (`i <u len`, so a negative index fails too) and, out of range, stops
+  with `error: index out of bounds: the len is N but the index is I at file.wk:line:col`, exit 1 —
+  the same text and the same stopping point on the interpreter, the Cranelift JIT and a linked
+  executable (`wukong_rt_bounds_fail`; one formatter in `wukong_runtime::safety`, mirrored by the C
+  fallback shim). The site is attached by the new `wukong_mir_build::lower_program_located`, which
+  the driver calls with its source map. `@unchecked` on a function is the explicit opt-out. Before
+  this, an out-of-range slice index read or wrote past the buffer natively (classic UB) while the
+  interpreter reported `load out of bounds`. `tests/run/slice_bounds_{oob,negative,in_range}.wk`.
+
+- **A pointer condition is a null test, and the interpreter has a real null.** The interpreter
+  reserves slot 0 at every entry point (`wukong_interp::NULL_SLOT`), so `0 as *T` is the same null
+  on both backends and a load/store through it is the diagnostic `null pointer dereference`. `if p`,
+  `while p` and `p && q` on a pointer now lower to `ptrtoint p != 0` instead of reaching `cond_br`
+  as a raw pointer and failing verification with no span (the lowering reverted at `0900352` is now
+  sound). mem2reg promotes every pointer slot, materializing `inttoptr 0` on a read-before-write
+  path, so a pointer local initialized behind a branch no longer stays in memory. An aggregate,
+  slice, tensor, vector or function-valued condition is now `E0401` rather than a verifier ICE.
+  `tests/run/pointer_null_condition.wk`, `tests/fail/condition_aggregate.wk`.
+
+### CFG and loop transforms (`gap2/cfg-and-loop-transforms`)
+
+- **MIR `switch` terminator, formed from compare chains at `-O2`.** `Terminator::Switch` is a
+  multi-way branch on an `i8`..`i64` scrutinee with canonical (sign-extended), pairwise-distinct
+  case values, checked by the verifier and executed by the interpreter, Cranelift
+  (`cranelift_frontend::Switch`: jump table, bit tests or search tree) and the textual LLVM emitter;
+  `gpu-native` declines it. `wukong_opt::switch_form` turns a chain of four or more `cmp.eq`/`cmp.ne`
+  tests of one scrutinee into one `switch` once, after every loop transform, and `simplify-cfg`
+  folds a constant or degenerate `switch`. An `unreachable` fall-through is kept as the default:
+  sema's exhaustiveness check is lenient, so that block can be reached, and the interpreter stops
+  there (`tests/run/match_dense_enum_switch.wk`).
+- **Jump threading and branch folding in `simplify-cfg` (`-O1`+).** An edge that passes an `i1`
+  constant into an empty block branching on that parameter is retargeted to the successor the
+  constant decides (never past a loop header, never when the parameter is read elsewhere), and a
+  branch whose only-predecessor successor re-tests to one of its destinations becomes one branch on
+  `and`/`or` (`not` where needed), speculating at most four pure, non-trapping, non-memory
+  instructions. `a && b` / `a || b` guards are now one `cond_br`, so a loop guarded by one is a
+  single diamond the vectorizer can flatten (`wukong_opt::branch_fold`,
+  `tests/run/band_mask_and.wk`). Loads and divisions are never speculated.
+- **Tail-recursion elimination (`-O1`+).** A self-call whose result the block returns (directly or
+  through an empty return block) becomes a branch back to a loop header that carries the
+  parameters; `ret op(f(..), x)` with an integer `add`/`mul`/`and`/`or`/`xor` is rewritten with an
+  accumulator (exact: these are associative and commutative in wrapping arithmetic; float
+  operations are never reassociated). Functions with a remaining frame slot are left alone. At
+  `-O2` the inliner rewrites fully tail-recursive functions first, so they are no longer recursive
+  and become inlinable (`wukong_opt::tre`). A tail-recursive function that recursed past the
+  interpreter's call-depth limit at `-O0` now runs as a loop at `-O1`+.
+- **Loop unswitching and induction-variable range splitting (`-O2`, after LICM, before the
+  vectorizer).** A counted unit-step loop whose body branches on `iv <, <=, >, >= inv` (matching
+  the exit test's signedness) runs as two back-to-back loops split at the clamped first iteration
+  where the guard changes (`max(start, min(inv, end))`, or `inv < end ? max(start, inv + 1) : end`
+  so `inv + 1` never wraps), each with the guard decided; a branch on a loop-invariant `i1` is
+  decided once in the preheader between the loop and a copy. Both copies visit iterations in the
+  original order, so results are bit-identical; the causal mask `if j > i { .. }` becomes a loop
+  that never stores and one that always does. Innermost loops only, no calls or frame slots, at
+  most 128 instructions per loop and 4096 per function (`wukong_opt::unswitch`,
+  `tests/run/causal_mask_split.wk`). The bench's `compile-work` attribution replica mirrors the new
+  pipeline stages.
+- **MIR loop fusion (`-O2`, after loop canonicalization).** Two adjacent innermost two-block counted
+  loops with the same start, end, predicate and induction type merge into one when the second
+  reads nothing the first defines, the second's preheader is pure and reached only from the first,
+  and every cross-loop pair of accesses with a write is either the identical affine index on one
+  object (nonzero constant stride) or proved disjoint by the alias analysis. A widenable loop is
+  never fused with one the vectorizer would refuse, and widenable loops fuse only at one access
+  width. This is what fuses a helper-call chain after inlining, which the AST-level fusion in
+  `mir_build` cannot see (`wukong_opt::fuse`, `tests/run/fused_helper_chain.wk`).
+
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
 - **Gate added: every recognizer-dependent corpus program is held to its own generic lowering.**

@@ -372,8 +372,22 @@ pub fn compile(opts: &Options) -> i32 {
     // environment reads inside a recognizer; `lower_options_for` is where that choice lives and why
     // the requested backend is part of it.
     let lower_opts = lower_options_for(opts);
+    // Runtime safety failures (an out-of-bounds slice index) report where they happened. The
+    // location is rendered here, where the source map lives, and baked into `.rodata` by the
+    // lowering, so the interpreter, the JIT and a linked executable all print the same text.
+    let locate = |span: wukong_span::Span| -> String {
+        let id = span.source;
+        if span.is_dummy()
+            || id.0 as usize >= sm.file_count()
+            || span.lo as usize > sm.source(id).len()
+        {
+            return String::new();
+        }
+        let loc = sm.span_location(span);
+        format!("{}:{}:{}", sm.name(id), loc.line, loc.col)
+    };
     let (mut program, lower_diags) =
-        wukong_mir_build::lower_program_with(&module, &sema, &mut interner, lower_opts);
+        wukong_mir_build::lower_program_located(&module, &sema, &mut interner, lower_opts, &locate);
     // MIR and train_lens own everything needed downstream. Release completed frontend
     // artifacts before optimization and codegen allocate their working sets.
     drop(module);
@@ -458,18 +472,29 @@ pub fn compile(opts: &Options) -> i32 {
             return exit::COMPILE_ERROR;
         }
         let main = interner.intern("main");
-        let result = match opts.backend {
-            BackendKind::Interp => wukong_interp::run_with_output(&program, main, &interner),
-            BackendKind::Native => wukong_codegen_cranelift::jit_run(&program, main, &interner),
-            BackendKind::Gpu => run_on_gpu(&program, main, &interner),
-            BackendKind::GpuLower => run_on_gpu_lower(&program, main, &interner),
+        // The CPU paths report what the program printed *before* a runtime failure (a failed
+        // `assert`, a slice index out of bounds) along with the failure, so `--run` shows the same
+        // stdout a linked executable does — the output is printed, then `error: …`, exit 1.
+        let split = |r: Result<(i64, Vec<u8>), String>| match r {
+            Ok((code, out)) => (Ok(code), out),
+            Err(e) => (Err(e), Vec::new()),
         };
-        return match result {
-            Ok((exit_code, stdout)) => {
-                use std::io::Write;
-                let _ = std::io::stdout().write_all(&stdout);
-                exit_code as i32
+        let (result, stdout) = match opts.backend {
+            BackendKind::Interp => wukong_interp::run_capturing(&program, main, &interner),
+            BackendKind::Native => {
+                wukong_codegen_cranelift::jit_run_capturing(&program, main, &interner)
             }
+            BackendKind::Gpu => split(run_on_gpu(&program, main, &interner)),
+            BackendKind::GpuLower => split(run_on_gpu_lower(&program, main, &interner)),
+        };
+        {
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            let _ = out.write_all(&stdout);
+            let _ = out.flush();
+        }
+        return match result {
+            Ok(exit_code) => exit_code as i32,
             Err(e) => {
                 eprintln!("error: {e}");
                 exit::COMPILE_ERROR
@@ -599,6 +624,7 @@ fn run_on_gpu_lower(
 /// it must never print an approximation. [`WUKONG_RT_SHIM`] provides the full print implementation.
 const WUKONG_RT_C: &str = "#include <stdio.h>\n\
 #include <stdlib.h>\n\
+#include <stdint.h>\n\
 #include <math.h>\n\
 #ifdef _WIN32\n\
 #include <io.h>\n\
@@ -617,16 +643,108 @@ void wukong_rt_print_f64(double x) {\n\
 }\n\
 void wukong_rt_assert(long long c) { if (!c) { fprintf(stderr, \"assertion failed\\n\"); exit(1); } }\n\
 long long wukong_rt_assert_failed(void) { return 0; }\n\
+/* A failed slice bounds check. Mirrors `wukong_runtime::bounds_failure_message` byte for byte, and\n\
+   exits with the status `wukongc --run` reports for a runtime failure. */\n\
+void wukong_rt_bounds_fail(long long index, long long len, const char* site) {\n\
+    fflush(stdout);\n\
+    if (site && site[0]) fprintf(stderr, \"error: index out of bounds: the len is %lld but the index is %lld at %s\\n\", len, index, site);\n\
+    else fprintf(stderr, \"error: index out of bounds: the len is %lld but the index is %lld\\n\", len, index);\n\
+    exit(1);\n\
+}\n\
 double wukong_rt_fmod_f64(double a, double b) { return fmod(a, b); }\n\
 float wukong_rt_fmod_f32(float a, float b) { return fmodf(a, b); }\n\
-/* Heap builtins (alloc_<T>/free). calloc zero-initializes — the determinism contract — and\n\
-   handles the count*size overflow; a negative count clamps to an empty (null) allocation. */\n\
+/* Heap builtins (alloc_<T>/free). calloc zero-initializes — the determinism contract. The block\n\
+   is over-allocated so the data pointer sits on a 64-byte boundary, the runtime's `HEAP_ALIGN`,\n\
+   with the block's own address stored just below it for free. An empty or overflowing request is\n\
+   null, as in the runtime. */\n\
 void* wukong_rt_alloc(long long count, long long elem_size, long long elem_is_float) {\n\
     (void)elem_is_float;\n\
-    if (count < 0 || elem_size <= 0) return 0;\n\
-    return calloc((size_t)count, (size_t)elem_size);\n\
+    if (count <= 0 || elem_size <= 0) return 0;\n\
+    if ((unsigned long long)count > ((size_t)-1 - 128) / (unsigned long long)elem_size) return 0;\n\
+    char* raw = (char*)calloc(1, (size_t)count * (size_t)elem_size + 64 + sizeof(void*));\n\
+    if (!raw) return 0;\n\
+    char* data = (char*)(((uintptr_t)raw + sizeof(void*) + 63) & ~(uintptr_t)63);\n\
+    ((void**)data)[-1] = raw;\n\
+    return data;\n\
 }\n\
-void wukong_rt_free(void* p) { free(p); }\n";
+void wukong_rt_free(void* p) { if (p) free(((void**)p)[-1]); }\n";
+
+/// The `cc` fallback's scratch allocator (`scratch_<T>` / `scratch_mark` / `scratch_release`), a C
+/// mirror of `wukong_runtime::scratch`: zeroed 64-byte-aligned bump allocations in chunks that never
+/// move, each at least twice the largest before it, released LIFO to a mark that counts live
+/// allocations. One arena, because this fallback runtime has no threads.
+const WUKONG_SCRATCH_C: &str = r#"
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+typedef struct { char* raw; char* base; size_t cap; } wk_scratch_chunk;
+typedef struct { size_t cur, off; } wk_scratch_mark;
+static wk_scratch_chunk* wk_sc_chunks;
+static size_t wk_sc_n, wk_sc_cur, wk_sc_off;
+static wk_scratch_mark* wk_sc_marks;
+static size_t wk_sc_nmarks, wk_sc_capmarks;
+void* wukong_rt_scratch_alloc(long long count, long long elem_size, long long elem_is_float) {
+    (void)elem_is_float;
+    if (wk_sc_nmarks == wk_sc_capmarks) {
+        size_t cap = wk_sc_capmarks ? 2 * wk_sc_capmarks : 64;
+        wk_scratch_mark* m = (wk_scratch_mark*)realloc(wk_sc_marks, cap * sizeof(wk_scratch_mark));
+        if (!m) abort();
+        wk_sc_marks = m;
+        wk_sc_capmarks = cap;
+    }
+    wk_sc_marks[wk_sc_nmarks].cur = wk_sc_cur;
+    wk_sc_marks[wk_sc_nmarks].off = wk_sc_off;
+    wk_sc_nmarks++;
+    if (count <= 0 || elem_size <= 0) return 0;
+    if ((unsigned long long)count > (unsigned long long)(PTRDIFF_MAX / 2) / (unsigned long long)elem_size) return 0;
+    size_t bytes = (size_t)count * (size_t)elem_size;
+    for (;;) {
+        if (wk_sc_cur < wk_sc_n) {
+            wk_scratch_chunk* c = &wk_sc_chunks[wk_sc_cur];
+            size_t start = (wk_sc_off + 63) & ~(size_t)63;
+            if (start <= c->cap && bytes <= c->cap - start) {
+                wk_sc_off = start + bytes;
+                memset(c->base + start, 0, bytes);
+                return c->base + start;
+            }
+            if (wk_sc_cur + 1 < wk_sc_n && wk_sc_chunks[wk_sc_cur + 1].cap >= bytes) {
+                wk_sc_cur++;
+                wk_sc_off = 0;
+                continue;
+            }
+        }
+        size_t grown = 0;
+        for (size_t i = 0; i < wk_sc_n; i++)
+            if (wk_sc_chunks[i].cap > grown) grown = wk_sc_chunks[i].cap;
+        size_t cap = bytes;
+        if (cap < ((size_t)1 << 20)) cap = (size_t)1 << 20;
+        if (cap < 2 * grown) cap = 2 * grown;
+        cap = (cap + 63) & ~(size_t)63;
+        char* raw = (char*)malloc(cap + 64);
+        if (!raw) return 0;
+        size_t keep = wk_sc_n ? wk_sc_cur + 1 : 0;
+        for (size_t i = keep; i < wk_sc_n; i++) free(wk_sc_chunks[i].raw);
+        wk_sc_n = keep;
+        wk_scratch_chunk* cs = (wk_scratch_chunk*)realloc(wk_sc_chunks, (keep + 1) * sizeof(wk_scratch_chunk));
+        if (!cs) { free(raw); return 0; }
+        wk_sc_chunks = cs;
+        wk_sc_chunks[keep].raw = raw;
+        wk_sc_chunks[keep].base = (char*)(((uintptr_t)raw + 63) & ~(uintptr_t)63);
+        wk_sc_chunks[keep].cap = cap;
+        wk_sc_n = keep + 1;
+        wk_sc_cur = keep;
+        wk_sc_off = 0;
+    }
+}
+long long wukong_rt_scratch_mark(void) { return (long long)wk_sc_nmarks; }
+void wukong_rt_scratch_release(long long mark) {
+    size_t m = mark < 0 ? 0 : (size_t)mark;
+    if (m >= wk_sc_nmarks) return;
+    wk_sc_cur = wk_sc_marks[m].cur;
+    wk_sc_off = wk_sc_marks[m].off;
+    wk_sc_nmarks = m;
+}
+"#;
 
 // Scalar-only C link fallback. Keep operations/constants in lockstep with runtime/vmath.rs,
 // including explicit fmaf and nonfinite bits; plain sinf/cosf for every input would differ
@@ -678,7 +796,7 @@ float wukong_rt_trig_f32(float x, long long op) {
 "#;
 
 fn c_runtime_source() -> String {
-    format!("{WUKONG_RT_C}\n{WUKONG_TRIG_C}")
+    format!("{WUKONG_RT_C}\n{WUKONG_TRIG_C}\n{WUKONG_SCRATCH_C}")
 }
 
 /// A per-invocation scratch directory for the generated `--emit=exe` link inputs (the Rust link
@@ -2863,6 +2981,7 @@ mod verify_gate_tests {
             value_types: vec![MirType::I32],
             entry: BlockId(0),
             vec_kernels: Vec::new(),
+            param_attrs: Vec::new(),
         };
         Program {
             funcs: vec![f],

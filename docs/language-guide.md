@@ -181,7 +181,7 @@ concatenation/indexing/length operators — a string is a NUL-terminated `*u8` i
 | Tuples      | `(A, B, …)`, field access `t.0`, nested `t.0.1`       | ✅     |
 | Structs     | `struct S { … }`, literal `S { f: v }`, field `s.f`  | ✅     |
 | Enums       | C-style `enum E { A = 10, B }` (variant = its `i32` discriminant) **and data-carrying** `V(i32)` / `V { f: T }` variants | ✅ |
-| Slices      | `[]T` — fat pointer `{data, len}`; `.len()`, indexed load/store, iteration, array→slice unsizing | ✅ |
+| Slices      | `[]T` — fat pointer `{data, len}`; `.len()`, **bounds-checked** indexed load/store, iteration, array→slice unsizing | ✅ |
 | SIMD vectors| `f32x4`/`i32x4`, generic `vec[T, N]` — the type **parses and type-checks** (a non-scalar element is `E0302`, a lane/element mismatch at a call is `E0401`), but no vector value can be constructed in source (`f32x4::load(p)` is `C0001`) and float-vector arithmetic is an internal error, so nothing uses it. SIMD ships through the **automatic** 128-bit/256-bit loop vectorizer, which needs no vector type in source. | 🔵 |
 | Tensors     | `Tensor[f32, M, N]` — shape checking, and **indexing** (`a[i, j]`) for both const and symbolic-generic dims, on the default `contiguous` layout. A constant-shape tensor costs **nothing** over the hand-flattened `[f32; M*N]` + `a[i*N + j]` spelling: the two compile to byte-identical MIR, same kernel dispatch and same vectorization. `.col_major` indexing executes for constant-shape tensors (`a[i, j]` is byte-identical to `a[i + j*M]`). `.strided`/`.tiled(…)` type-check but cannot be indexed (`C0001`). Whole-tensor arithmetic (`a + b`) is `E0401` — operate elementwise. | ✅ |
 
@@ -189,6 +189,13 @@ concatenation/indexing/length operators — a string is a NUL-terminated `*u8` i
 (`fn deref(p: &i32) -> i32 { return *p; }` with `deref(&x)`), but the two spellings are distinct types
 elsewhere, so a local must be annotated with the pointer form — `let p: *i32 = &x;`, not
 `let p: &i32 = &x;` (that is `E0401`).
+
+`0 as *T` is the null pointer, and a pointer used as a condition (`if p`, `while p`, `p && q`) is a
+null test — `p != null` — with the same answer on every backend and at every `-O` level (✅). The
+interpreter reserves its address 0 as a never-allocated null so it agrees with native here, and a
+load or store through null is the interpreter diagnostic `null pointer dereference` (native faults).
+A condition must be a boolean, a number (nonzero is true) or a pointer: an aggregate, slice, tensor
+view, SIMD vector or function value is `E0401`.
 
 ## Operators ✅
 
@@ -263,7 +270,9 @@ fn classify(n: i32) -> i32 {
 }
 ```
 
-`match` evaluates its scrutinee once and lowers to an if-else chain over the arms. Patterns are
+`match` evaluates its scrutinee once and lowers to an if-else chain over the arms (at `-O2`, a run
+of four or more equality tests on one integer scrutinee becomes a single `switch`, which the native
+backend emits as a jump table or a search tree; the semantics are the chain's). Patterns are
 integer/bool **literals**, **or-patterns** `A | B | C`, half-open `lo..hi` / inclusive `lo..=hi`
 **ranges** whose bounds are integer or char **literals** (a `const` bound such as `0..N` parses but
 does not lower — it reports `C0001` at the pattern; inline the literal), **enum-variant** patterns
@@ -457,16 +466,20 @@ runtime size is outside the defined contract, like any runtime index
 @align(32)
 @extern("C")
 @export("wukong_saxpy")
+fn k(@noalias mut out: []f32, x: []f32) { … }
 ```
 
 Attribute *syntax* is parsed on functions, parameters and statements (a missing argument value is
 `E0207`), and the attribute **name is validated against a closed set** (✅): `@parallel`, `@generic`,
-`@tile`, `@extern`, `@inline`, `@simd`, `@align`, `@export`. Anything else — `@bogus(1, 2)`, and far
-more usefully a typo of a real one such as `@parellel` — is **`E0306`**, where it used to be accepted
-and discarded in silence (`tests/fail/unknown_attr.wk`, `unknown_attr_typo.wk`). Three attributes have
-a consumer on a **function**: **`@parallel`** (✅), which makes its loop execute across CPU cores,
-**`@generic`** (✅), which opts the function out of the kernel recognizers (below), and **`@tile`** (✅),
-which strip-mines loops (below).
+`@tile`, `@extern`, `@noalias`, `@unchecked`, `@inline`, `@simd`, `@align`, `@export`. Anything else —
+`@bogus(1, 2)`, and far more usefully a typo of a real one such as `@parellel` — is **`E0306`**, where it
+used to be accepted and discarded in silence (`tests/fail/unknown_attr.wk`, `unknown_attr_typo.wk`).
+Four attributes have a consumer on a **function**: **`@parallel`** (✅), which makes its loop execute
+across CPU cores, **`@generic`** (✅), which opts the function out of the kernel recognizers (below),
+**`@tile`** (✅), which strip-mines loops (below), and **`@unchecked`** (✅), which removes the
+function's slice bounds checks (see *Memory and parallelism*; on anything but a `fn` item it is
+`E0306`). One has a consumer on a **parameter**: **`@noalias`** (✅), a promise about the storage the
+parameter points into (below).
 Everything else in the list above — `@inline`, `@simd`, `@align`, `@extern`, `@export`, and
 `@parallel`'s own `grain = …` argument — is parsed and discarded (🔵). `@tile` is consumed as loop
 strip-mining (see below), and when it cannot be applied it is **`E0309`**, not a silent drop. A
@@ -511,16 +524,21 @@ result is always correct — the fallback is the ordinary scalar/vectorized loop
 speedup is silently absent, so check with `wukongc --emit=mir -O2 f.wk | grep wukong_parallel_for`.
 Fixtures: `tests/run/parallel_control_flow.wk`, `parallel_region_reassigned_local.wk`.
 
-Sequential vectorized **f32 reductions** that fit the wide arithmetic recipe use one logical
-eight-lane partition on both the 128-bit and 256-bit paths. The recipe's register pressure fixes
-the number of independent accumulators; complete groups are combined in accumulator order, then
-lanes 0 through 7 are folded in order, then the original scalar seed is combined once, followed
-by the scalar tail. With no complete eight-element group, the scalar tail starts from the original
-seed unchanged. The host ISA, the 2,048-element width threshold, `WUKONG_P4_NO_256`, and the portable
-lowering option therefore do not change this reduction's arithmetic order. This is a reassociated
-order, not strict source-order summation, and the recipe/partition is a compiler-build contract:
-it is not promised stable across releases or equivalent to a different recognized runtime kernel.
-Other element types and expressions outside the wide recipe keep their ordinary portable lowering.
+A sequential `for` **reduction** — `s += e`, `s = s + e`, any `+` chain holding `s` once
+(`s = s + x + y` is `s += x + y`), or a running `fmax`/`fmin`, over an `f32`, `f64`, `i32` or `i64`
+accumulator — is vectorized with a **canonical summation tree** that is part of the language, not of
+the build: four accumulators of one 256-bit register's lanes (8 for `f32`/`i32`, 4 for `f64`/`i64`),
+element `i + u·L + l` of each block into accumulator `u`, lane `l`; leftover full groups into
+accumulator 0; accumulators combined in order 1, 2, 3; lanes folded left to right; the original seed
+combined once (left untouched when no full group ran); then the remaining elements one at a time. The
+host ISA and OS, the 2,048-element width threshold, a literal versus a runtime trip,
+`WUKONG_P4_NO_256`, the `-O` level and the addend's register pressure choose only the instruction
+form, never this order — the interpreter, the 128-bit strips and the 256-bit kernel all compute it
+(`tests/run/reduction_canonical_tree.wk`; the full statement is in `docs/internals.md`). It is a
+reassociated order, not strict source-order summation, and it is a compiler-release contract: it is
+not promised stable across releases or equal to a different recognized runtime kernel's order. A loop
+that is not vectorized (a `while`, a declined body, or a slice access out of bounds at run time) keeps
+the strict left fold it spells.
 
 Separately, loop **auto-vectorization, FMA contraction, and elementwise fusion run automatically**
 (✅) — a plain `for i in 0..n { out[i] = a*x[i] + y[i] }` is vectorized, fused with an adjacent loop,
@@ -602,6 +620,58 @@ attribute-placement code `@generic` off a `fn` item carries, and for the same re
 nothing to strip-mine, and the attribute used to sit there reading exactly as if it applied
 (`tests/fail/tile_on_while.wk`).
 
+### `@noalias` — a parameter's storage promise ✅
+
+```wukong
+fn axpy(@noalias mut y: []f32, x: []f32, a: f32) {
+    for i in 0..y.len() { y[i] = y[i] + a * x[i]; }
+}
+```
+
+`@noalias` on a parameter promises that, **for the duration of a call, the storage it points into is
+reached only through that parameter** — nothing else the call can name overlaps it. It is C's
+`restrict` and LLVM's `noalias` argument attribute, and it is the one fact an optimizer cannot derive
+for itself: without it two buffer parameters may be the same caller buffer (`axpy(v, v, 2.0)` is
+legal), so a store to `y[i]` has to be assumed to change `x[i + 1]`. With it:
+
+- the alias analysis (`wukong_opt::alias`) treats the promised parameter as disjoint from every other
+  parameter, and — when nothing derived from it escapes the function — from every pointer it lost
+  track of and from every callee, so CSE forwards loads across stores to it, LICM hoists a slice's
+  data-pointer re-read out of the loop, and DSE sees through it;
+- the loop dependence test and the vectorizer's runtime alias guard need no range check for a pair it
+  separates — and a loop whose guard could not have been expressed vectorizes anyway;
+- the Cranelift backend files its accesses in alias regions of their own (a store to `y` no longer
+  clobbers a load of `x`), and marks the slice's fat-pointer loads pure so they are hoisted; the
+  textual LLVM IR carries `ptr noalias`;
+- a recognized kernel that needs disjoint operands (a GEMM writing `C` while reading `A`/`B`) may
+  dispatch on the promise even where some call site elsewhere aliases other parameters — for
+  fixed-size array and statically-shaped tensor parameters, whose names cannot be re-pointed;
+- a `@parallel` region may thread a loop whose promised destination is read through a gather index
+  from another parameter (`tests/run/noalias_params.wk` prints every lane of each case).
+
+One promise is enough for a pair: `y` above is disjoint from `x` even though `x` promised nothing,
+which is why marking only the **written** buffers is the usual spelling. The attribute is legal only on
+a parameter, takes no arguments, and only on a parameter passed by pointer (an array, slice, tensor,
+pointer, reference, tuple or struct); anywhere else — on a `fn`, a statement, a scalar parameter — it
+is **`E0306`** (`tests/fail/noalias_on_scalar.wk`).
+
+**What the compiler checks (`E0316`).** A call that passes the promised parameter's argument together
+with another buffer argument rooted in the same storage is rejected: `axpy(v, v, 2.0)`
+(`tests/fail/noalias_aliased_call.wk`), a view of the same array (`let s: []f32 = v; axpy(s, v, 2.0)`,
+`tests/fail/noalias_aliased_view.wk`), a field together with its struct (`k(p.w, p)`), or two elements
+of one array (`k(m[0], m[1])` — element indices are not compared, the same conservative line Rust's
+borrow checker draws). Two different fields of one struct, `k(p.w, p.b)`, are fine. And a promised
+parameter of view type (`[]T`, `*T`, `&T`, a tensor) cannot be re-pointed as a whole (`y = other`,
+`tests/fail/noalias_reassigned_slice.wk`); writing *through* it is the point, and a fixed array
+parameter is assigned by copy, so reassigning one is fine.
+
+**What it does not check.** A call whose arguments the compiler cannot prove to overlap — two views of
+unknown origin, a pointer read out of memory, the caller's own unpromised parameters passed on — is
+accepted. If they do overlap after all, the program has broken its promise: the interpreter still
+computes the sequential meaning, but optimized native code may not, exactly as with `restrict` in C.
+That is why the attribute is opt-in; nothing changes for a program that does not write it (its MIR is
+byte-identical).
+
 ### `shared [T; N]` and `sync_block()` ✅
 
 ```wukong
@@ -634,8 +704,14 @@ lowers to PTX `.shared` SMEM and `sync_block()` to `bar.sync 0` (`wukong_codegen
   not concatenated), and a `()` value — from an `else`-less `if`, or a `match` with statement arms —
   is `E0401`.
 - `println(x)` — alias of `print` (both already append the newline).
-- `assert(cond)` — trap with a nonzero exit code if `cond` is false (zero); a no-op otherwise. Exactly
+- `assert(cond)` — stop the program at once if `cond` is false (zero); a no-op otherwise. Exactly
   one argument (`E0503` otherwise). A float condition means `cond != 0.0`, so `assert(0.5)` passes.
+  A failed assertion means the same thing on every execution path: no statement after it runs (in
+  the failing function or any caller), everything printed before it stays on stdout, `assertion
+  failed` goes to stderr and the exit status is `1` — under `wukongc --run` on the interpreter and
+  on `--backend=native`, and in an `--emit=exe` executable. Inside a `@parallel` region the run
+  reports the failure of the earliest iteration that fails, as the in-order interpreter does. A
+  slice index out of bounds stops the program the same way.
 - `now_ns()` — a zero-argument monotonic nanosecond clock returning `i64`, for in-process timing
   (`let t1 = now_ns(); … let dt = now_ns() - t1;`). Any argument is `E0503`. Only *differences* between
   reads are meaningful, so a program's stdout stays backend-identical.
@@ -733,11 +809,18 @@ runtime length `n`, and `free(s)` releases it — the first runtime-sized buffer
 place (a user-defined function of the same name shadows the builtin). The count may be any integer
 type; a **negative count yields an empty slice** (`len() == 0`). Contents are deterministically
 zero on both backends — calloc'd bytes on native, typed zero values in the interpreter — so a
-read-before-write is well-defined. The result is an ordinary slice: `s[i]`, `s.len()`,
+read-before-write is well-defined. Natively every allocation starts on a **64-byte (cache-line)
+boundary**, in a linked executable too, so aligned 256-bit accesses and non-temporal store streams
+need no peeling prologue and two threads splitting a buffer at a line boundary never false-share.
+The result is an ordinary slice: `s[i]`, `s.len()`,
 `for x in s`, and fn-boundary passing/mutation all compose (`tests/run/heap_*.wk`) — and a slice is a
 first-class **kernel operand**: an `alloc_*` buffer handed to a matmul/GEMV nest, a norm, an activation
 loop, a reduction, a scan or `sdpa` dispatches to the same tuned runtime kernel a fixed-size `[T; N]`
-array does, so a runtime-sized weight blob is not a slow path.
+array does, so a runtime-sized weight blob is not a slow path. A loop no kernel matches is
+auto-vectorized over a slice (or a symbolic-shape tensor) exactly as over an array, 256-bit included,
+behind a one-time run-time check that every slice access is in bounds and that no written slice
+overlaps another buffer the loop touches; if either check fails the loop runs as written, scalar
+(`tests/run/vec256_runtime_streams.wk`).
 
 ```wukong
 let mut acts: []f32 = alloc_f32(tokens * hidden);   // zero-initialized, runtime-sized
@@ -747,19 +830,56 @@ for i in 0..acts.len() {
 free(acts);
 ```
 
+**Slice accesses are bounds-checked** (✅): `s[i]` compares `i` against the length in `s`'s own fat
+pointer (one unsigned compare, so a negative index fails too) and, out of range, stops the program
+with `error: index out of bounds: the len is N but the index is I at file.wk:line:col` and exit
+status 1 — identically on the interpreter, the native JIT and a linked executable. At `-O2` a
+bounds-check elimination pass versions each counted loop on one guard computed before it, so a loop
+whose accesses are provably in range runs a copy with no check at all (and stays vectorizable),
+while an out-of-range loop runs the original and stops at exactly the same iteration. `@unchecked` on
+a function removes its checks — the explicit, visible opt-out, like Rust's `get_unchecked`; an
+out-of-range access there is undefined behaviour on the native backend. Fixed-size arrays and
+constant-shape tensors are checked at compile time for constant indices (`E0501`); a *runtime* index
+into a fixed-size array is not yet checked. A recognized kernel (a loop the compiler replaces with a
+runtime kernel call) runs over the extent the loop names and is not checked against slice lengths.
+
 Freeing anything not returned by `alloc_*`, double-freeing, or touching a slice after `free` is
 **undefined behavior** on the native backend; the interpreter's mark-and-forget model (its
 run-scoped memory is never reclaimed) never crashes on it, but such programs are outside the
 differential contract. Allocation failure is the one place the two backends differ by construction. On
 the native backend a failed (or zero-byte) allocation yields a slice whose data pointer is **null**,
-which must not be dereferenced. The interpreter cannot mirror that — its pointers are slot indices and
-index 0 is an ordinary live slot — so it reports `interpreter heap exhausted allocating N element(s)` as
-a diagnostic and exits 1 instead of returning a null slice. A program must therefore not branch on
+which must not be dereferenced. The interpreter does not mirror that: a null slice whose length still
+says `n` would only move the failure to the first element access, so it reports `interpreter heap
+exhausted allocating N element(s)` as a diagnostic and exits 1 instead of returning a null slice. A program must therefore not branch on
 allocation success and expect backend-identical behaviour.
 
-No garbage collector and no hidden allocations beyond what you `alloc_*`: *named* allocator
-selection (`System`, `Arena`, `Scratch`, `Pool` — 🔵) and cleanup via `defer` (🔵) are still being
-wired to the surface. **`@parallel` functions
+**Scratch allocation runs today** (✅): `scratch_<T>(n)` (the same eight element types as
+`alloc_<T>`) returns a zero-initialized, 64-byte-aligned `[]T` from a per-thread **scratch arena**
+for temporaries, `scratch_mark()` returns the number of live scratch allocations as an `i64`, and
+`scratch_release(m)` releases every scratch allocation made after mark `m` was taken — LIFO, like
+Odin's temp allocator or Zig's arena reset. Released memory is handed out again (zeroed again), so a
+kernel that needs a buffer per call stops paying a system allocation, a free and fresh-page faults
+every time: after its first call, a balanced `mark; scratch_…; release` allocates nothing.
+
+```wukong
+fn layer(x: []f32, mut out: []f32) {
+    let m: i64 = scratch_mark();
+    let mut tmp: []f32 = scratch_f32(x.len());   // zeroed, 64-byte aligned
+    // … fill and consume tmp …
+    scratch_release(m);                          // tmp is dead from here on
+}
+```
+
+The mark is a *count*, so it is the same value on every backend. A negative mark releases
+everything; a mark at or past the current count releases nothing. Using a slice after it has been
+released is undefined behaviour on the native backend (its bytes are reused), outside the
+differential contract exactly like a use after `free`. Zero-length requests and allocation failure
+behave as for `alloc_<T>` (null data natively, a diagnostic in the interpreter) and still count
+toward the mark (`tests/run/alloc_scratch_arena.wk`).
+
+No garbage collector and no hidden allocations beyond what you `alloc_*` or `scratch_*`: *named*
+allocator selection (`System`, `Pool` — 🔵) and cleanup via `defer` (🔵) are still being wired to
+the surface. **`@parallel` functions
 execute today** (✅): the native backend outlines the loop body into its own function and dispatches it
 across CPU cores through the `wukong_runtime` rayon-backed C-ABI entry point
 `wukong_parallel_for(n, body, env)`, which hands each worker a contiguous chunk of `[0, n)` and returns
@@ -789,7 +909,10 @@ body. It declines — and the loop lowers serially — for a loop-carried accumu
 captured scalar), a non-affine or offset index, a local bound to a slice/pointer/reference (it might
 alias a capture), a call other than a pure math intrinsic (`print` would reorder output), a
 `match`/`loop` expression in the body, a `return`/`defer`, and a labelled or loop-level
-`break`/`continue`. At most 32 such regions are outlined per program; further ones stay serial.
+`break`/`continue`. Two array **parameters** over the same element type may be one caller buffer
+whatever their declared lengths, so the proof covers the union of their accesses — unless a
+`@noalias` promise separates the pair, which lets a gather from one parameter into another thread.
+At most 32 such regions are outlined per program; further ones stay serial.
 
 ## File I/O ✅
 

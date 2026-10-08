@@ -25,6 +25,7 @@ alias_transpose_inplace.wk:
 alias_transpose_inplace8.wk:
 alias_unknown_republish.wk: wukong_rt_alloc wukong_rt_alloc*4
 alias_view_binding_block_value.wk: wukong_rt_alloc wukong_rt_alloc*5
+alloc_scratch_arena.wk: wukong_rt_alloc wukong_rt_free wukong_rt_scratch_alloc wukong_rt_scratch_alloc*5 wukong_rt_scratch_mark wukong_rt_scratch_mark*6 wukong_rt_scratch_release wukong_rt_scratch_release*4
 annotated_mixed_width_binop.wk:
 argmax.wk: wukong_argreduce_f32 wukong_argreduce_f32*3
 argmax_seed_edges.wk: veckernel*2 wukong_argreduce_f32 wukong_argreduce_f32*5
@@ -35,12 +36,14 @@ array_of_struct.wk:
 array_of_tuple.wk:
 assert.wk:
 assert_fail.wk:
+assert_fail_trailing_output.wk:
 atan.wk: wukong_vmath_f32
 atan2_hypot.wk: wukong_vmath2_f32
 attention.wk: wukong_norm_f32 wukong_sgemm wukong_sgemm_nt
 avgpool.wk: wukong_avgpool2d_f32
 axpby_f16.wk: wukong_axpby_f16
 axpby_half_out.wk: wukong_axpby_bf16_out wukong_axpby_f16_out
+band_mask_and.wk:
 batched_activation.wk: wukong_vmath_f32 wukong_vmath_f32*2
 batched_affine_rmsnorm.wk: wukong_norm_affine_f32
 batched_layernorm.wk: wukong_norm_f32
@@ -61,6 +64,7 @@ canon_decline.wk:
 cast_to_bool.wk:
 casts.wk:
 causal_attention.wk: veckernel*1 wukong_sgemm wukong_sgemm_nt
+causal_mask_split.wk:
 cbrt.wk: wukong_vmath_f32 wukong_vmath_f32*2
 char_literals.wk:
 char_match.wk:
@@ -130,6 +134,7 @@ for_step.wk:
 for_step_gemm.wk: veckernel*4
 frem.wk:
 fuse_if_relu.wk: wukong_velem_f32 wukong_velem_f32*3
+fused_helper_chain.wk:
 gate.wk: wukong_vmath2_f32 wukong_vmath2_f32*2
 gate_backward.wk: wukong_vmath2_f32 wukong_vmath2_f32*2
 gcd.wk:
@@ -227,6 +232,7 @@ loop_counter_wider_bound.wk:
 loop_i64_bound.wk:
 loop_unroll.wk: wukong_rt_alloc wukong_rt_free
 lrscan.wk: veckernel*1 wukong_lrscan_f32
+match_dense_enum_switch.wk:
 match_enum_mixed_coverage.wk:
 match_exhaustive_enum.wk:
 match_expr.wk:
@@ -246,6 +252,7 @@ matmul_fn_declined_shape.wk:
 matmul_memacc.wk: wukong_sgemm wukong_sgemm_nt
 matmul_tn.wk: wukong_sgemm_tn wukong_sgemm_tn*2
 maxpool.wk: wukong_maxpool2d_f32
+memory_opt_loops.wk:
 mish.wk: wukong_vmath_f32
 mixed_sign_compare_highbit.wk:
 mixed_sign_compare_ok.wk:
@@ -283,6 +290,7 @@ parallel_region_alias.wk:
 parallel_region_decline.wk: wukong_velem_f32_parallel
 parallel_region_reassigned_local.wk: veckernel*2
 pointer.wk:
+pointer_null_condition.wk:
 pool2d_partial_window.wk:
 pow.wk:
 power.wk:
@@ -309,6 +317,7 @@ rowarg_elem_nonf32.wk:
 rowargmax.wk: wukong_rowargmax_i32 wukong_rowargmin_i32
 rowloss_elem_f64.wk:
 saxpy.wk: wukong_velem_f32
+scalar_gvn_unroll.wk: wukong_rt_alloc wukong_rt_free
 scaled_gemm.wk: wukong_sgemm_nt_alpha
 scaled_gemm_batched.wk: wukong_sgemm_nt_alpha
 scaled_gemm_parallel.wk: wukong_sgemm_nt_alpha_parallel
@@ -325,6 +334,9 @@ shift_width.wk:
 signed_cmp_highbit_fold.wk:
 silu_backward.wk: wukong_vmath2_f32
 slice_basics.wk:
+slice_bounds_in_range.wk:
+slice_bounds_negative.wk:
+slice_bounds_oob.wk:
 slice_destination_spellings.wk:
 slice_len_loop.wk:
 slice_param_kernel_base.wk: wukong_sgemm_nt
@@ -336,6 +348,7 @@ softmax_fused.wk: wukong_norm_f32 wukong_norm_f32*2
 softplus.wk: wukong_vmath_f32
 softsign_logsigmoid.wk: wukong_vmath_f32
 sret_diverging_arms.wk:
+sroa_aggregate_locals.wk:
 string_literal.wk:
 string_return.wk:
 struct.wk:
@@ -346,6 +359,7 @@ struct_field_kernel_base.wk: wukong_norm_affine_f32 wukong_sgemm_nt_epi
 struct_fn.wk:
 struct_nested.wk:
 struct_return.wk:
+tail_recursion.wk:
 tanhshrink.wk: wukong_vmath_f32
 tensor_1d_kernels.wk: wukong_sreduce_f32_parallel wukong_velem_f32 wukong_vmath_f32
 tensor_add.wk: veckernel*1

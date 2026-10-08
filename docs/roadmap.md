@@ -22,8 +22,11 @@ checked-but-not-executed, and what is planned — so expectations match reality.
 ## Works end to end (interpreter `--run`, **and native code** `--backend=native`)
 
 The MIR interpreter and **Cranelift native backend** execute the supported language subset.
-Corpus differential tests compare outputs across optimization levels. Unsupported constructs,
-assertion-output differences, and C-link fallback output remain documented limitations.
+Corpus differential tests compare outputs across optimization levels. Unsupported constructs and
+C-link fallback output remain documented limitations. A runtime failure (a failed `assert`, a slice
+index out of bounds) stops the program at the same statement on every path — interpreter, JIT,
+linked executable, and inside a `@parallel` region (the earliest failing iteration is reported) —
+keeping the output printed before it, with exit status 1 (`tests/run/assert_fail_trailing_output.wk`).
 Cranelift provides JIT execution with `--run --backend=native` and object/exe output with
 `--emit=obj|exe`, with **no LLVM toolchain required**. See `BENCHMARKS.md` for cross-language numbers.
 
@@ -48,7 +51,10 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   differential oracle down with it. Recursion past the cap is still a **resource limit outside the
   bit-for-bit differential contract** — the oracle *refuses* where the native backend still completes,
   the same "outside the defined contract" status as an out-of-bounds access. Raising the cap past its
-  measured ceiling would reintroduce the abort; lowering it would reject working programs.
+  measured ceiling would reintroduce the abort; lowering it would reject working programs. At `-O1`
+  and above tail-recursion elimination turns a self-call in tail position into a loop, so a
+  tail-recursive function no longer consumes call depth there (an unbounded tail recursion then
+  loops until the interpreter's step guard stops it instead of hitting the depth cap).
 - `let`/`let mut`/`const`, shadowing, block-as-expression values, **`let` tuple destructuring**
   (`let (a, b) = …`, nested patterns, `_`; `tests/run/let_destructure.wk`), and a **top-level
   `const` used as a value** (its initializer inlined at every use site — arithmetic, array index,
@@ -112,8 +118,10 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   `_` patterns, **or-patterns** `1 | 2 | 3`, half-open `0..10` / inclusive `0..=10` **range** patterns,
   **enum-variant** patterns `Color::Red` (matched by discriminant), and **tuple** patterns `(0, _)`
   (per-field tests + bindings, nesting and composition like `(0 | 1, y)`), each with an optional `if`
-  guard. The scrutinee is evaluated once and the whole `match` lowers to an if-else chain
-  (`tests/run/{match_expr,match_patterns,match_tuple}.wk`).
+  guard. The scrutinee is evaluated once and the whole `match` lowers to an if-else chain; at `-O2`
+  four or more equality tests on one integer scrutinee become one MIR `switch` (a Cranelift jump
+  table or search tree; the `gpu-native` backend declines it)
+  (`tests/run/{match_expr,match_patterns,match_tuple,match_dense_enum_switch}.wk`).
 - **C-style enums** `enum Code { Ok = 10, Err }` — explicit or auto-incrementing discriminants; a
   variant *is* its integer discriminant, usable in `let`, `==`, `as i32`, and as a `match` pattern
   (`tests/run/enum_cstyle.wk`).
@@ -131,8 +139,8 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   call site (`let s: []T = arr` / `f(arr)`). A write through the slice aliases the backing array. The
   16-byte fat pointer is a by-pointer aggregate the two backends address identically, so interp ==
   native bit-for-bit and -O0 == -O3 (`tests/run/slice_basics.wk`). The element types must match on
-  the unsizing coercion, and a scalar passed where a slice is expected is E0401; slice indexing is a
-  runtime-length view (unchecked, like a pointer — a slice has no static length to bounds-check).
+  the unsizing coercion, and a scalar passed where a slice is expected is E0401; slice indexing is
+  checked against the runtime length in the fat pointer (see *Slice accesses are bounds-checked*).
 - **Heap allocation (v1)** — `alloc_<T>(n) -> []T` and `free(s)`: the first *runtime-sized* buffers
   (every other buffer is a fixed-size stack array). The surface is the typed per-scalar family
   `alloc_f32`/`f64`/`i32`/`i64`/`i8`/`u8`/`f16`/`bf16` (chosen over a generic `alloc<T>` — sema types
@@ -155,6 +163,20 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   emits `wukong_vmath_f32`, and velem / GEMM / reduction nests over slices dispatch too. What still
   declines on a slice base is the *general* auto-vectorizer — the same loop written over slices emits
   no vector ops where the fixed-array form does (a future perf lever, correctness unaffected).
+  Native heap data is **64-byte aligned** (the runtime's `HEAP_ALIGN`, mirrored by the `cc`
+  fallback shim), not the system allocator's 16.
+- **Scratch allocation** — `scratch_<T>(n) -> []T`, `scratch_mark() -> i64`,
+  `scratch_release(m)`: a per-thread bump arena for temporaries (`wukong_runtime::scratch`), the
+  temporary-storage design of Odin/Jai/Zig. Zeroed, 64-byte-aligned slices; the mark is the count of
+  live scratch allocations (identical on every backend); a release pops everything allocated after
+  its mark, LIFO, and the bytes are reused (and re-zeroed) by the next allocations, so a balanced
+  per-call `mark; scratch_…; release` stops allocating after its first call. Chunks never move and
+  grow geometrically. The interpreter mirrors the count and reuses a released region at the same
+  depth, so its memory stays bounded too. Lowered to opaque `wukong_rt_scratch_{alloc,mark,release}`
+  calls like the heap builtins; misuse is E0401/E0503; use after release is undefined on native,
+  like use after `free` (`tests/run/alloc_scratch_arena.wk`, also in the AOT gate). Not yet: an
+  uninitialized variant, an arena handle a program can pass around, and `@align(N)` (still parsed
+  and discarded — every heap and scratch allocation is already 64-byte aligned).
 - **Typed file I/O** — `read_<T>(path, buf) -> i64` and `write_<T>(path, buf) -> i64` over the dtypes
   {`f32`, `f64`, `i32`, `i64`, `i8`, `u8`}, where `path` is a `*u8` string literal and `buf` a `[]T`
   slice (typically from `alloc_<T>`). The on-disk format is frozen and **headerless: raw contiguous
@@ -332,13 +354,19 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   on the native backend (only a **half-open, unit-step** range vectorizes: an inclusive `a..=b` or a
   `step s` loop lowers as the plain scalar loop — correct, just unaccelerated — and the
   recognized-kernel cascade declines those two forms for the same reason). Where the body fits the
-  raw-AVX2 recipe (f32 lanes, register pressure within the 16 YMM registers) an **elementwise** loop
-  is instead emitted as **true 256-bit AVX2** by a raw machine-code path
+  raw-AVX2 recipe (f32, f64, i32 or i64 lanes; up to eleven streams; register pressure within the 16
+  YMM registers) a loop is instead emitted as **true 256-bit AVX2** by a raw machine-code path
   (`crates/wukong_codegen_cranelift/src/avx2.rs`, VEX-encoded via `iced-x86`) that sidesteps
-  Cranelift's 128-bit CLIF cap (`WUKONG_P4_NO_256` disables it) — with **no** trip-count requirement,
-  so a 32-element loop and a runtime-`n` loop both take it. Only a float **reduction** additionally
-  requires a *compile-time-known* trip ≥ 2048 (`VEC256_REDUCTION_MIN_TRIP`), below which the inlined
-  128-bit reduction wins. The raw-AVX2 emitter is **host-gated**:
+  Cranelift's 128-bit CLIF cap (`WUKONG_P4_NO_256` disables it). The loop may stream over `[T; N]`
+  arrays, `[]T` slices and constant- or symbolic-shape tensors alike; a slice or `Ptr`-bound tensor
+  gets a one-time run-time bounds and overlap check that sends the loop scalar if it fails. An
+  **elementwise** loop takes the kernel at any trip that holds one register group, literal or
+  runtime (large output-only streams switch to non-temporal stores inside the kernel). A
+  **reduction** takes it at a trip ≥ 2048 (`VEC256_REDUCTION_MIN_TRIP`) — decided statically for a
+  literal trip and by one run-time compare for a runtime `n` — and computes the language's
+  **canonical reduction tree** either way, so the form never changes the sum (`docs/internals.md`,
+  "The canonical reduction tree"). `s = s + x + y` is the reduction `s += x + y`. The raw-AVX2
+  emitter is **host-gated**:
   `wukong_mir::host_supports_vec_kernels()` requires **x86-64 Windows with AVX2 + FMA** (the emitted
   body hardcodes the Win64 rcx/rdx/r8 argument registers, and there is no in-kernel fallback).
   `mir_build` tests that predicate alongside `WUKONG_P4_NO_256`, so off-gate no recipe is built and
@@ -479,8 +507,13 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
 - The optimizer (`-O0..-O3`), backed by CFG and dominator analyses: whole-program **inlining**
   bottom-up over the call graph (non-recursive callees before their callers, scored by a cost model),
   **mem2reg** (alloca → SSA), constant folding, algebraic simplification, CFG cleanup
-  with block merging, dead/trivial block-parameter elimination, DCE, dominator-tree CSE with load
-  forwarding, DSE, **loop-invariant code motion**, and **partial loop unrolling** (4×, with a
+  with block merging, **jump threading** of constant short-circuit edges and **branch folding** into
+  one `and`/`or` branch, **tail-recursion elimination** (plain and integer-accumulator, `-O1`+; a
+  fully tail-recursive function becomes inlinable at `-O2`), a late **`switch` formation** from
+  equality chains, dead/trivial block-parameter elimination, DCE, dominator-tree CSE with load
+  forwarding, DSE, **loop-invariant code motion**, **MIR loop fusion** of adjacent same-range loops
+  after inlining (`-O2`), **loop unswitching** and **induction-variable
+  range splitting** of guarded loop bodies (`-O2`), and **partial loop unrolling** (4×, with a
   wrap-safe guard and a remainder loop; it never reassociates, so a float reduction keeps its exact
   serial accumulate — measured 28% on an integer reduction, 10% on an elementwise store loop, 4% on a
   float reduction). Guarded by an `-O0`-vs-`-O{1,2,3}` differential
@@ -853,12 +886,13 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   (`f32x4`), so a wider explicit `f32x8` cannot lower even once execution lands — it must split into
   128-bit halves. (Loop auto-vectorization above is separate and *does* run — 128-bit + unrolling by
   default, and now **true 256-bit AVX2** via a raw machine-code emitter that sidesteps this CLIF cap —
-  no trip-count requirement for an elementwise body; only a float *reduction* needs a
-  compile-time-known trip ≥ 2048; the recognized kernels get 256-bit AVX2 via the
-  runtime microkernels.)
+  for f32, f64, i32 and i64 lanes; an elementwise body takes it at any trip of one register group or
+  more, a *reduction* at a trip ≥ 2048 (statically or by a run-time trip test); the recognized
+  kernels get 256-bit AVX2 via the runtime microkernels.)
 - **Attributes:** sema validates the closed set `@parallel`, `@generic`, `@tile`, `@extern`,
-  `@inline`, `@simd`, `@align`, and `@export`; unknown names and restricted-placement violations
-  report `E0306`. Name acceptance does not promise execution: general `@simd`/`@align`/`@export`
+  `@noalias`, `@inline`, `@simd`, `@align`, and `@export`; unknown names and restricted-placement
+  violations report `E0306`. `@noalias` (parameter-only) is consumed end to end — see the alias
+  bullet below. Name acceptance does not promise execution: general `@simd`/`@align`/`@export`
   behavior and C ABI interop remain incomplete. `@parallel` executes, though its scheduling
   arguments are not consumed; `@generic` opts out of recognizers. `@tile` performs loop
   strip-mining and reports `E0309` when it cannot apply. Malformed attribute syntax reports `E0207`.
@@ -929,12 +963,13 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   The MIR shows the cause directly: `v0 = alloca ptr` then `v2 = load ptr v0` — a load of a slot
   nothing ever stored. The interpreter's own `-O0`/`-O2` disagreement is an opt-invariance violation
   the gate cannot see, because until now no corpus program used a `Tensor` local at all.
-  **Null-initializing the slot is not the fix** — interpreter address 0 is a valid address (reverted
-  `PtrToInt(p) != 0` attempt, `0900352`), so a null handle is undetectable there and would trade a crash for a
-  silent wrong answer. Giving the local backing storage is not the fix either: whole-value assignment
-  to a view rebinds the handle, and a buffer-typed slot would have to copy. The fix is a
-  **definite-assignment rule** for pointer-backed locals, which is a language feature and belongs
-  with the Phase 7 work, not a patch at the lowering.
+  The interpreter half of this is fixed: slot 0 is now a reserved null (`wukong_interp::NULL_SLOT`),
+  so the unstored handle is a genuine null at every level and the interpreter reports
+  `null pointer dereference (store)` at both `-O0` and `-O2` instead of disagreeing with itself.
+  Native still faults on the null store. Giving the local backing storage is not the fix: whole-value
+  assignment to a view rebinds the handle, and a buffer-typed slot would have to copy. The remaining
+  fix is a **definite-assignment rule** for pointer-backed locals, which is a language feature and
+  belongs with the Phase 7 work, not a patch at the lowering.
 
 - `bf16` **and** `f16` are both real 2-byte storage (round-to-nearest-even), f32 compute, with a full
   symmetric mixed-precision op suite (reductions, max-family, axpby, activations — see above) **and a
@@ -949,9 +984,10 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   a footprint win on the call-bound activations); see "Works end to end" above.
 - The *general* vectorizer emits **128-bit CLIF by default** — Cranelift's vector ISA still rejects a
   256-bit `f32x8` SSA value (verified empirically on Cranelift 0.124, pinned as the
-  `cranelift_still_rejects_f32x8`/`p4_probe_vec256_ops` tripwire tests). An elementwise f32 loop is
-  instead dispatched to a **raw-AVX2 256-bit machine-code emitter** at any trip count; a float
-  **reduction** takes it only at a **large, compile-time-known trip (~≥2048 elems)**
+  `cranelift_still_rejects_f32x8`/`p4_probe_vec256_ops` tripwire tests). An f32/f64/i32/i64
+  elementwise loop is instead dispatched to a **raw-AVX2 256-bit machine-code emitter** at any trip
+  of one register group or more; a **reduction** takes it at a **trip ≥ 2048 elements**, tested
+  statically for a literal trip and at run time for a runtime one
   (`crates/wukong_codegen_cranelift/src/avx2.rs`, VEX-encoded via `iced-x86`;
   `WUKONG_P4_NO_256` disables it) — the same way the GEMM/vmath runtime microkernels reach 256-bit,
   and precisely *why* that raw emitter exists (Cranelift can't legalize the wider lane). That path is
@@ -962,17 +998,31 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   runs), and `assemble_kernel` refuses as a backstop rather than emit non-executable code.
   `WUKONG_P4_NO_256=1` forces the 128-bit CLIF path and is **result-identical** for the supported
   recipes. Elementwise FMA contraction is pinned by `p4_kill_switch_is_result_identical`; reductions
-  use the same pressure-limited logical eight-lane partition at both widths, pinned by
+  compute the canonical tree — four accumulators of one 256-bit register's lanes, a fixed combine
+  order, a fixed seed fold — at both widths, for every lane type and every addend: register pressure
+  changes only how the kernel schedules its copies, never the accumulator count. That is pinned by
+  `p4_kill_switch_is_result_identical` (reductions at literal trips ≥ 2048 and runtime trips on both
+  sides of the run-time trip test), by
   `reduction_partition_is_independent_of_width_and_threshold` with cancellation and exceptional-value
-  oracles. Below the call threshold, small or runtime-unknown reduction trips use paired four-lane
-  vectors to reproduce that partition. The portable register/MIR cost remains unmeasured.
+  oracles, and by the hand-evaluated `tests/run/reduction_canonical_tree.wk`. The portable form
+  represents each logical accumulator as two 128-bit vectors; its register/MIR cost against the old
+  four-vector form remains unmeasured, and so does the reduction crossover for low-pressure bodies
+  (2048 was measured on the highest-pressure body).
   The AST loop vectorizer requires a disjointness proof for differently named buffers paired
   with a write. Potentially aliased parameters retain scalar execution; named parameters alone
   do not imply non-aliasing. `parallel_dependence.wk` checks the shifted in-place recurrence
   that previously returned the same wrong answer on both backends after unsafe SIMD lowering.
   Whole-function parallel outlining uses the shared region dependence proof as well.
-  The MIR alias analysis remains conservative for parameters. Distinct local allocations and
-  call-site proofs can establish disjointness; the language has no general `restrict` promise.
+  The MIR alias analysis is conservative for parameters unless the source promises otherwise:
+  `@noalias` on a parameter (C's `restrict`) makes it disjoint from every other parameter, gives a
+  promised slice's elements their own provenance, and — when nothing derived from it escapes — keeps
+  it apart from untracked pointers and callees. The loop dependence test, the vectorizer's runtime
+  alias guard, Cranelift's alias regions (Heap/Table) and pure fat-pointer loads, the LLVM IR
+  (`ptr noalias`), the GEMM-class recognizers (array/static-tensor parameters only) and the
+  `@parallel` region outliner all consume it. Sema rejects provably aliased call sites and re-pointing
+  a promised view parameter (`E0316`); an unprovable violation is undefined, as in C. Without the
+  attribute nothing changes: distinct local allocations and call-site proofs remain the only
+  disjointness facts.
   This repair does not establish safe dispatch for every runtime recognizer. Remaining family
   coverage and oracle-marshalling gaps are listed in the
   [closeout checklist](sota-campaign-2026-09/CLOSEOUT-CHECKLIST.md).
@@ -1027,32 +1077,43 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   `while (i < n)`), not Rust-style range capture: mutating `n` inside the body changes the remaining
   iteration count. Defensible for a low-level kernel language, but worth knowing. A descending range
   with a negative step runs zero iterations (the condition stays `i < hi`).
-- No **runtime** bounds checking on array indexing (manual memory is a decided constraint). A
+- **Slice accesses are bounds-checked at runtime** (default on; `@unchecked` on a function opts it
+  out). `s[i]` is compared against the length in the slice's fat pointer, and an out-of-range access
+  stops the program with `error: index out of bounds: the len is N but the index is I at
+  file:line:col`, exit 1, identically on the interpreter, the JIT and a linked executable
+  (`tests/run/slice_bounds_*.wk`). `-O2` removes the checks from innermost counted loops by
+  versioning them on a preheader guard (`wukong_opt::bce`); a loop with a call, a `break`, a
+  non-affine index or a header written inside it keeps them. Still unchecked: a **runtime** index into a fixed-size array
+  or a constant-shape tensor (the static length is known, so this is the same machinery with a
+  constant bound — not yet wired), and the extents a recognized kernel call reads. A
   **compile-time-constant** index past the end is still caught at compile time (`E0501`) — for both a
   fixed-size array (`a[5]` on a `[T; 4]`) and a static tensor dimension (`a[5, 0]` on a
-  `Tensor[f32, 2, 2]`); runtime/computed indices remain unchecked. On such an out-of-bounds access the
-  backends differ: the interpreter (the oracle) *traps* on an index it can detect as out of range (a
+  `Tensor[f32, 2, 2]`). On an unchecked out-of-bounds access the backends differ: the interpreter (the oracle) *traps* on an index it can detect as out of range (a
   debugging aid — its memory is a bounded slot vector), while the native backend reads/writes past the
   buffer, classic UB like C (and an optimization level can even change the garbage observed). An
   out-of-bounds program is therefore outside the defined contract — the differential gate's bit-for-bit
   `interp == native` and `-O0 == -O3` invariants hold only for well-defined programs.
-- `mem2reg` promotes scalar integer, float **and pointer** slots. A pointer slot qualifies only when
-  it is provably written before it is read: the first access inside its own `alloca`'s block must be
-  a store, and that block must be the entry block or have an empty dominance frontier. That covers
-  every pointer-typed *parameter* (`*T`, `&T`, and every `Tensor[…]`, all of which lower to one MIR
-  `ptr`) — the case that matters, since the front end otherwise re-loads the base pointer from its
-  stack slot at every element access — including after `-O2` inlining has spliced a callee's entry
-  block into the middle of a caller block. A pointer local whose `alloca` and initializing store are
-  separated by a branch keeps its slot: promoting it would need a typed "undefined" pointer for the
-  read-before-write path, and there is no sound one (`inttoptr 0` is a genuine null natively but a
-  *valid, addressable* slot in the interpreter). Arrays, vectors, address-taken locals of any type,
-  and any slot accessed at a width other than its own stay in memory (the interpreter and `cse`/`dse`
-  handle those directly).
-- A **`[]T` slice parameter still re-loads its data pointer at every element access.** A slice is a
-  16-byte `{ data, len }` fat pointer passed *by address*, so the base comes from
-  `load ptr (gep <param>, 0)` — a load out of caller-owned memory, not out of a local slot — and
-  `mem2reg` has nothing to promote. Removing it needs loop-invariant load motion (or a `noalias`
-  fact about the fat pointer), not slot promotion; `licm` does not hoist loads today.
+- `mem2reg` promotes scalar integer, float **and pointer** slots. A pointer slot read before it is
+  written on some path gets the null pointer (`inttoptr 0`) there, exactly what the interpreter's
+  zero-initialized slot holds now that it reserves address 0 as a never-allocated null
+  (`wukong_interp::NULL_SLOT`); before that reservation only definitely-initialized pointer slots
+  could be promoted, and a pointer local initialized behind a branch kept its slot. At `-O2`, `sroa`
+  first splits an array, struct or tuple local whose every access is at a constant position into
+  scalar leaf slots, which mem2reg then promotes. Arrays indexed by a computed index, vectors,
+  address-taken locals of any type, and any slot accessed at a width other than its own stay in
+  memory (the interpreter and `cse`/`dse` handle those directly); a loop-invariant cell of one that a
+  loop both reads and writes is still carried in a register by `promote` when nothing else in the
+  loop may alias it.
+- A **`[]T` slice parameter still re-loads its data pointer at every element access** unless it is
+  `@noalias` or the loop only reads. A slice is a 16-byte `{ data, len }` fat pointer passed *by
+  address*, so the base comes from `load ptr (gep <param>, 0)` — a load out of caller-owned memory,
+  not out of a local slot — and `mem2reg` has nothing to promote. For a `@noalias` slice whose fat
+  pointer the function never writes or publishes, `licm` hoists that load (the header is a live
+  16-byte object for the whole call, and no store in the loop can reach it) and Cranelift marks it
+  `readonly` + `can_move`. For an unpromised slice `licm` hoists the load only when it runs on every
+  iteration (behind a first-iteration guard) and no store in the loop may alias it, so a read-only
+  slice loop reads its base once; a loop that writes through any other loaded pointer still reloads,
+  because another parameter may alias its header.
 - **String literals live in a read-only static-data section** (`.rodata`), referenced by address via
   `Op::GlobalAddr` and deduped by content (one blob per unique literal). So **returning or threading a
   `*u8`** that points at a literal created inside a callee is valid — the pointer outlives the frame,

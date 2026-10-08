@@ -14,18 +14,20 @@
 //! that keeps a per-slot stack of the reaching definition. Reads become the reaching value, writes
 //! update it, and each CFG edge is given the arguments its destination's phis expect.
 //!
-//! Integer, float and pointer slots are promoted. An integer/float slot read before any write on
-//! some path becomes a zero constant of its type, materialized once per type at the top of the entry
-//! block, which is what the interpreter's zero-initialized memory would have yielded. A pointer slot
-//! has no such natural zero, so only the definitely-initialized subset is promoted
-//! ([`initialized_ptr_slots`]) — which is exactly the case that matters, since `mir_build` gives every
-//! pointer-typed parameter (`*T`, `&T`, `Tensor[…]`) an `alloca ptr` + `store` in the entry block and
-//! then re-`load`s the base pointer at *every* element access. Array and vector slots stay in memory.
+//! Integer, float and pointer slots are promoted. A slot read before any write on some path becomes
+//! a zero constant of its type, materialized once per type at the top of the entry block, which is
+//! what the interpreter's zero-initialized memory would have yielded. A pointer slot's zero is the
+//! null pointer, `inttoptr 0`: the interpreter reserves slot 0 as a never-allocated null
+//! (`wukong_interp::NULL_SLOT`), so its zero-initialized pointer memory reads as exactly the null
+//! native's `inttoptr 0` is. (Before that reservation slot 0 was the first live allocation of a run,
+//! and only the definitely-initialized subset of pointer slots could be promoted; a pointer local
+//! whose initializing store sat behind a branch kept its slot and was re-loaded at every use.) Array
+//! and vector slots stay in memory.
 
 use crate::fxhash::{FxHashMap, FxHashSet};
 use std::collections::{BTreeMap, BTreeSet};
 
-use wukong_mir::{Function, Inst, MirType, Op, Terminator, ValueId};
+use wukong_mir::{CastKind, Function, Inst, MirType, Op, Terminator, ValueId};
 
 use crate::{cfg, each_op_use, each_term_use, map_op_uses, map_term_uses, CfgAnalyses, Pass};
 
@@ -46,18 +48,7 @@ impl Pass for Mem2Reg {
             cfg::prune_unreachable(f);
             cache.invalidate();
         }
-        let mut promotable = find_promotable(f);
-        // A pointer slot additionally has to be provably written before it is read — see
-        // `initialized_ptr_slots`. That test needs dominance frontiers, so only pay for them when
-        // some candidate is actually a pointer (`promote` would compute them anyway if we proceed,
-        // and the cache hands back the same result).
-        if promotable.values().any(|ty| matches!(ty, MirType::Ptr)) {
-            let init = {
-                let (df, _) = cache.df_and_children(f);
-                initialized_ptr_slots(f, &promotable, df)
-            };
-            promotable.retain(|slot, ty| !matches!(ty, MirType::Ptr) || init.contains(slot));
-        }
+        let promotable = find_promotable(f);
         if promotable.is_empty() {
             return pruned;
         }
@@ -66,9 +57,8 @@ impl Pass for Mem2Reg {
     }
 }
 
-/// A slot type is promotable to a register if it is a scalar integer or float. Arrays and vectors
-/// are left in memory. Pointers are handled too, but only for the definitely-initialized subset —
-/// see [`initialized_ptr_slots`] for why they need the extra condition.
+/// A slot type is promotable to a register if it is a scalar integer, float or pointer. Arrays and
+/// vectors are left in memory.
 fn is_promotable_ty(ty: &MirType) -> bool {
     ty.is_int() || ty.is_float() || matches!(ty, MirType::Ptr)
 }
@@ -135,81 +125,6 @@ fn find_promotable(f: &Function) -> BTreeMap<u32, MirType> {
     cand
 }
 
-/// The pointer slots that are provably **written before they are read**.
-///
-/// A read-before-write slot is promoted to a zero constant of the slot's type — what the
-/// interpreter's zero-initialized memory would have yielded. There is no such constant for a
-/// pointer: `inttoptr 0` is a genuine null on the native backend but a *valid, addressable* slot in
-/// the interpreter (interp address 0 is a real address — the standing cross-cutting landmine), so
-/// synthesizing one would trade a stack slot for an interp-vs-native divergence. Rather than reason
-/// about undef we simply refuse any pointer slot that could be read first.
-///
-/// A slot qualifies when the **first access to it inside its own alloca's block `B` is a store**,
-/// and `B` is either the entry block or has an empty dominance frontier. Why that is sufficient:
-///
-/// * SSA dominance makes `B` dominate every block that mentions the slot at all (a use must be
-///   dominated by the `alloca` that defines it), and a block is straight-line, so every access
-///   outside `B` happens after all of `B` — hence after the store.
-/// * `DF(B) = ∅` means the set `S` of blocks `B` dominates is closed under *both* successors (a
-///   successor of a dominated block is dominated, else it would be in `DF(B)`) and predecessors (a
-///   predecessor outside `S` would give a path to a dominated block that bypasses `B`). So the
-///   iterated dominance frontier of the store blocks, *and every predecessor of every block that
-///   receives a phi*, lie inside `S` — which is exactly the set of program points at which the
-///   renamer asks for a reaching definition. The stack is therefore never empty.
-/// * The entry block is admitted directly: it dominates everything, so the same argument holds even
-///   when a back edge puts the entry itself in its own frontier.
-///
-/// This admits the case the pass exists for — `mir_build` gives every pointer-typed parameter
-/// (`*T`, `&T`, and every `Tensor[…]`) an `alloca ptr` immediately followed by `store <param>` in
-/// the entry block — and, after `-O2` inlining has spliced a callee's entry block into the middle of
-/// a caller block, that callee's pointer parameters too. It excludes a pointer whose `alloca` and
-/// initializing store are separated by a branch (`mir_build` hoists a local's `alloca` to the entry
-/// block but emits its store at the `let`, so `let p = &mut a;` after a loop keeps its slot).
-///
-/// One pass per phase classifies every candidate at once — a per-slot scan would be
-/// `O(slots × block length)`, and the entry block holds one `alloca` per local of the whole function.
-fn initialized_ptr_slots(
-    f: &Function,
-    cand: &BTreeMap<u32, MirType>,
-    df: &[Vec<u32>],
-) -> FxHashSet<u32> {
-    // Phase 1: each pointer candidate's home block (where its `alloca` is).
-    let mut home: FxHashMap<u32, u32> = FxHashMap::default();
-    for b in &f.blocks {
-        for inst in &b.insts {
-            if let (Some(r), Op::Alloca { .. }) = (inst.result, &inst.op) {
-                if matches!(cand.get(&r.0), Some(MirType::Ptr)) {
-                    home.insert(r.0, b.id.0);
-                }
-            }
-        }
-    }
-    // Phase 2: was the first access inside the home block a store? (Accesses in any other block are
-    // dominated by the home block, so they cannot come first.)
-    let mut first_is_store: FxHashMap<u32, bool> = FxHashMap::default();
-    for b in &f.blocks {
-        for inst in &b.insts {
-            match &inst.op {
-                Op::Store { ptr, .. } if home.get(&ptr.0) == Some(&b.id.0) => {
-                    first_is_store.entry(ptr.0).or_insert(true);
-                }
-                Op::Load(p, _) if home.get(&p.0) == Some(&b.id.0) => {
-                    first_is_store.entry(p.0).or_insert(false);
-                }
-                _ => {}
-            }
-        }
-    }
-    first_is_store
-        .into_iter()
-        .filter(|&(slot, stored)| {
-            let b = home[&slot];
-            stored && (b == f.entry.0 || df[b as usize].is_empty())
-        })
-        .map(|(slot, _)| slot)
-        .collect()
-}
-
 fn promote(f: &mut Function, promotable: &BTreeMap<u32, MirType>, cache: &mut CfgAnalyses) {
     // The iterated dominance frontier drives phi placement; the dominator-tree children drive the
     // rename walk. Both come from the shared cache (borrow `cache`, not `f`, so the phi/rename edits
@@ -262,17 +177,20 @@ fn promote(f: &mut Function, promotable: &BTreeMap<u32, MirType>, cache: &mut Cf
         append_then: FxHashMap::default(),
         append_else: FxHashMap::default(),
         append_br: FxHashMap::default(),
+        append_switch: FxHashMap::default(),
         zero_for: FxHashMap::default(),
         new_consts: Vec::new(),
         next_value: f.value_types.len() as u32,
     };
     r.visit(f, f.entry.0);
+    let append_switch = std::mem::take(&mut r.append_switch);
     let Rename {
         replace,
         delete,
         append_then,
         append_else,
         append_br,
+        zero_for,
         new_consts,
         ..
     } = r;
@@ -296,6 +214,21 @@ fn promote(f: &mut Function, promotable: &BTreeMap<u32, MirType>, cache: &mut Cf
                 }
                 if let Some(extra) = append_else.get(&b.id.0) {
                     else_args.extend(extra.iter().copied());
+                }
+            }
+            Terminator::Switch {
+                cases,
+                default_args,
+                ..
+            } => {
+                // One list per case, then one for the default (see `Rename::append_switch`).
+                if let Some(extra) = append_switch.get(&b.id.0) {
+                    for (c, more) in cases.iter_mut().zip(extra) {
+                        c.args.extend(more.iter().copied());
+                    }
+                    if let Some(more) = extra.get(cases.len()) {
+                        default_args.extend(more.iter().copied());
+                    }
                 }
             }
             _ => {}
@@ -332,6 +265,9 @@ fn promote(f: &mut Function, promotable: &BTreeMap<u32, MirType>, cache: &mut Cf
             f.value_types.push(ty.clone());
             let op = if ty.is_float() {
                 Op::ConstFloat(0.0, ty.clone())
+            } else if *ty == MirType::Ptr {
+                // `zero_of` minted the `i64` zero before this null, so it is already emitted above.
+                Op::Cast(CastKind::IntToPtr, zero_for[&MirType::I64], MirType::Ptr)
             } else {
                 Op::ConstInt(0, ty.clone())
             };
@@ -371,6 +307,8 @@ struct Rename<'a> {
     append_then: FxHashMap<u32, Vec<ValueId>>,
     append_else: FxHashMap<u32, Vec<ValueId>>,
     append_br: FxHashMap<u32, Vec<ValueId>>,
+    /// a `switch`'s edges, keyed by source block: one list per case in order, then the default's.
+    append_switch: FxHashMap<u32, Vec<Vec<ValueId>>>,
     /// cached zero constant per type (for read-before-write).
     zero_for: FxHashMap<MirType, ValueId>,
     /// freshly allocated (value id, type) zero constants to materialize later.
@@ -386,15 +324,19 @@ impl Rename<'_> {
             return *top;
         }
         let ty = self.promotable[&var].clone();
-        // `initialized_ptr_slots` only admits a pointer slot whose first access in its own alloca's
-        // block is a store, so its reaching definition is dominated by that store and this
-        // read-before-write path is unreachable for it. There is no `const.ptr 0` to fall back on.
-        debug_assert!(
-            !matches!(ty, MirType::Ptr),
-            "pointer slot v{var} reached the read-before-write path; initialized_ptr_slots is wrong"
-        );
+        self.zero_of(ty)
+    }
+
+    /// The cached zero of `ty`, minted on first use. A pointer's zero is the null pointer,
+    /// `inttoptr (i64 0)`, which is what the interpreter's zero-initialized pointer memory holds
+    /// now that it reserves slot 0 as null. Its `i64` operand is minted *first*, so it precedes the
+    /// cast in `new_consts` — the order the entry-block materialization emits them in.
+    fn zero_of(&mut self, ty: MirType) -> ValueId {
         if let Some(z) = self.zero_for.get(&ty) {
             return *z;
+        }
+        if ty == MirType::Ptr {
+            self.zero_of(MirType::I64);
         }
         let id = ValueId(self.next_value);
         self.next_value += 1;
@@ -483,6 +425,16 @@ impl Rename<'_> {
                 let ve = self.phi_args_for(else_blk.0);
                 if !ve.is_empty() {
                     self.append_else.insert(block, ve);
+                }
+            }
+            Terminator::Switch { cases, default, .. } => {
+                let mut lists: Vec<Vec<ValueId>> = Vec::with_capacity(cases.len() + 1);
+                for c in cases {
+                    lists.push(self.phi_args_for(c.target.0));
+                }
+                lists.push(self.phi_args_for(default.0));
+                if lists.iter().any(|l| !l.is_empty()) {
+                    self.append_switch.insert(block, lists);
                 }
             }
             _ => {}

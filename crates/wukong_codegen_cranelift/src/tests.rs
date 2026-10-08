@@ -274,6 +274,12 @@ fn p4_vec256_coverage_sweep() {
 /// repeated-operand bodies below disagreed across the switch before the emitter released a repeated
 /// operand's register only once, and the `x + y*z` body disagreed before the recipe learned to
 /// contract its multiply-add like the scalar tail it shares a loop with.
+///
+/// Reductions are in the matrix too, at sizes that actually reach the 256-bit reduction kernel
+/// (literal trips ≥ `VEC256_REDUCTION_MIN_TRIP`, and runtime trips on both sides of the run-time
+/// trip test). Until the canonical tree, every size this test used sat below that gate, so it
+/// could not observe the one place the knob DID change results — the kernel's pressure-dependent
+/// accumulator count against the portable strips' fixed sixteen partials.
 #[test]
 fn p4_kill_switch_is_result_identical() {
     let _env = p4_write_lock();
@@ -354,6 +360,67 @@ fn p4_kill_switch_is_result_identical() {
             // …and the interpreter, which marshals the same recipe, agrees with both.
             let oracle = interp(&src, 3).unwrap_or_else(|e| panic!("interp [n={n}] `{body}`: {e}"));
             assert_eq!(wide, oracle, "256-bit vs interp [n={n}] `{body}`");
+        }
+    }
+
+    // Reductions, where the knob's result-identity is a claim about the summation TREE: the 256-bit
+    // kernel and the portable 128-bit strips must group the addends identically (the canonical tree
+    // of `wukong_mir::vec_kernel`). Every size here is at or above `VEC256_REDUCTION_MIN_TRIP`
+    // (2048) for a literal trip — below it both arms are the same 128-bit code and the comparison
+    // would be vacuous — and the runtime-trip spelling, which takes the kernel through a run-time
+    // trip test, also runs below it (100) so both arms of that test are compared. The addends
+    // `(k % 23) * 0.1 - 1` are not exactly representable, so any regrouping changes the printed bits.
+    let red_bodies: &[(&str, &str)] = &[
+        ("f32", "s = s + a[i] * b[i]"),
+        ("f32", "s += a[i] - b[i]"),
+        ("f32", "s = s + a[i] + b[i]"),
+        ("f32", "s = fmax(s, a[i] * b[i])"),
+        ("f64", "s = s + a[i] * b[i]"),
+        ("f64", "s += (a[i] - b[i]) * (a[i] + b[i])"),
+        ("f64", "s = fmin(s, a[i] - b[i])"),
+    ];
+    let red_src = |ty: &str, body: &str, n: usize, runtime: bool| {
+        let bound = if runtime {
+            "m".to_string()
+        } else {
+            n.to_string()
+        };
+        format!(
+            "@generic fn red(a: [{ty}; {n}], b: [{ty}; {n}], m: i64) -> {ty} {{ \
+               let mut s: {ty} = 0.5; for i in 0..{bound} {{ {body}; }} return s; }} \
+             fn main() -> i32 {{ \
+               let mut a: [{ty}; {n}] = [0.0; {n}]; let mut b: [{ty}; {n}] = [0.0; {n}]; \
+               for j in 0..{n} {{ a[j] = ((j % 23) as {ty}) * 0.1 - 1.0; \
+                                  b[j] = ((j % 7) as {ty}) * 0.3 + 0.05; }} \
+               print(red(a, b, {n})); return 0; }}"
+        )
+    };
+    for &(ty, body) in red_bodies {
+        for (n, runtime) in [
+            (2048usize, false),
+            (2056, false),
+            (4096, false),
+            (100, true),
+            (2048, true),
+            (2061, true),
+        ] {
+            let src = red_src(ty, body, n, runtime);
+            let at = format!("[{ty} n={n} runtime={runtime}] `{body}`");
+            std::env::remove_var("WUKONG_P4_NO_256");
+            let k256 = kernels(&src);
+            let wide = jit(&src, 3).unwrap_or_else(|e| panic!("256-bit {at}: {e}"));
+            let wide_o0 = jit(&src, 0).unwrap_or_else(|e| panic!("256-bit -O0 {at}: {e}"));
+            std::env::set_var("WUKONG_P4_NO_256", "1");
+            let k128 = kernels(&src);
+            let narrow = jit(&src, 3).unwrap_or_else(|e| panic!("128-bit {at}: {e}"));
+            std::env::remove_var("WUKONG_P4_NO_256");
+
+            assert!(k256 > 0, "vacuous: no 256-bit reduction kernel {at}");
+            assert_eq!(k128, 0, "WUKONG_P4_NO_256=1 still built a kernel {at}");
+            assert_eq!(wide, narrow, "WUKONG_P4_NO_256 changed a reduction {at}");
+            assert_eq!(wide, wide_o0, "-O0 vs -O3 {at}");
+            let oracle = interp(&src, 3).unwrap_or_else(|e| panic!("interp {at}: {e}"));
+            assert_eq!(wide, oracle, "256-bit vs interp {at}");
         }
     }
 }
@@ -3916,12 +3983,13 @@ fn p4_reduction_f64_reference() {
     }
 }
 
-/// The 256-bit reduction is gated on a compile-time-known trip ≥ `VEC256_REDUCTION_MIN_TRIP` (=2048):
-/// below the threshold its out-of-line call loses to the inlined 128-bit reduction, so a small (or
-/// runtime-unknown) trip must keep the 128-bit path. Verifies BOTH the gate (a `veckernel` appears only
-/// at/above the threshold) and that the gated 256-bit path is bit-exact interp-vs-native and -O0-vs-O3
-/// across the fold kinds: fused-`fma` dot/composite, a plain (non-product) addend, and non-fused
-/// `fmax`/`fmin`.
+/// The 256-bit reduction is gated on a trip ≥ `VEC256_REDUCTION_MIN_TRIP` (=2048): below the
+/// threshold its out-of-line call loses to the inlined 128-bit reduction, so a small literal trip
+/// keeps the 128-bit path (a runtime trip carries both forms behind a run-time trip test — covered
+/// by `p4_kill_switch_is_result_identical` and `reduction_partition`). Verifies BOTH the static gate
+/// (a `veckernel` appears only at/above the threshold) and that the gated 256-bit path is bit-exact
+/// interp-vs-native and -O0-vs-O3 across the fold kinds: fused-`fma` dot/composite, a plain
+/// (non-product) addend, and non-fused `fmax`/`fmin`.
 #[test]
 fn p4_reduction256_gate_and_differential() {
     let _env = p4_read_lock(); // the 256-bit path must not be switched off underneath this gate
@@ -4258,11 +4326,15 @@ fn p4_vec256_general_matches_interp() {
     };
     for n in [1usize, 7, 8, 9, 15, 16, 17, 64, 100, 257] {
         let src = prog(n);
-        // The product loop must actually reach the recipe (else the test is vacuous).
+        // The product loop must actually reach the recipe (else the test is vacuous) once a literal
+        // trip holds one full 8-lane group. Below that the kernel could only ever be called with
+        // `n = 0`, so the inlined strips are kept instead (`vec256_elementwise_min_trip`) — the
+        // differential below still runs on those sizes.
         let (p, _) = lowered(&src, 3);
-        assert!(
+        assert_eq!(
             p.funcs.iter().any(|f| !f.vec_kernels.is_empty()),
-            "n={n}: expected a synthesized vector kernel in the MIR"
+            n >= 8,
+            "n={n}: a synthesized vector kernel exactly when a full group fits"
         );
         let native = jit(&src, 3).expect("jit -O3");
         assert_eq!(
@@ -6365,4 +6437,94 @@ fn backend_compile_ab() {
         );
     }
     println!("(ver x = serial/verify: <1 verifier-off faster; par x = parallel/serial: <1 parallel faster)");
+}
+
+/// A `switch` whose edges pass block arguments, share targets and use negative and extreme case
+/// values on an `i8` scrutinee: the Cranelift lowering masks each canonical (sign-extended) case to
+/// the type's unsigned bit pattern and routes every argument-carrying edge through a trampoline.
+/// Expected values are read off the MIR by hand, and the interpreter (the oracle) must agree.
+#[test]
+fn switch_terminator_matches_the_oracle() {
+    use wukong_mir::{BinOp, Builder, CastKind, MirType, Op, Program, SwitchCase};
+    let mut interner = Interner::new();
+    let classify_name = interner.intern("classify");
+    let main_name = interner.intern("main");
+    let print = interner.intern("print");
+
+    // classify(x: i8) -> i64
+    //   switch x, bb4(x) [-1: bb1(10), 0: bb2, 5: bb1(50), 127: bb3, -128: bb2]
+    //   bb1(p) = p; bb2 = 200; bb3 = 300; bb4(q) = sext(q) + 1000
+    let mut b = Builder::new(classify_name, MirType::I64);
+    let x = b.add_param(MirType::I8);
+    let ten = b.build(MirType::I64, Op::ConstInt(10, MirType::I64));
+    let fifty = b.build(MirType::I64, Op::ConstInt(50, MirType::I64));
+    let bb1 = b.new_block();
+    let p = b.block_param(bb1, MirType::I64);
+    let bb2 = b.new_block();
+    let bb3 = b.new_block();
+    let bb4 = b.new_block();
+    let q = b.block_param(bb4, MirType::I8);
+    let case = |value: i128, target, args: Vec<wukong_mir::ValueId>| SwitchCase {
+        value,
+        target,
+        args,
+    };
+    b.switch(
+        x,
+        vec![
+            case(-1, bb1, vec![ten]),
+            case(0, bb2, vec![]),
+            case(5, bb1, vec![fifty]),
+            case(127, bb3, vec![]),
+            case(-128, bb2, vec![]),
+        ],
+        bb4,
+        vec![x],
+    );
+    b.switch_to(bb1);
+    b.ret(Some(p));
+    b.switch_to(bb2);
+    let r2 = b.build(MirType::I64, Op::ConstInt(200, MirType::I64));
+    b.ret(Some(r2));
+    b.switch_to(bb3);
+    let r3 = b.build(MirType::I64, Op::ConstInt(300, MirType::I64));
+    b.ret(Some(r3));
+    b.switch_to(bb4);
+    let wide = b.build(MirType::I64, Op::Cast(CastKind::SExt, q, MirType::I64));
+    let k = b.build(MirType::I64, Op::ConstInt(1000, MirType::I64));
+    let r4 = b.build(MirType::I64, Op::Bin(BinOp::Add, wide, k));
+    b.ret(Some(r4));
+    let classify = b.finish();
+
+    let inputs: [i128; 8] = [-1, 0, 5, 127, -128, 3, -2, 4];
+    let mut m = Builder::new(main_name, MirType::I32);
+    for v in inputs {
+        let arg = m.build(MirType::I8, Op::ConstInt(v, MirType::I8));
+        let r = m.build(
+            MirType::I64,
+            Op::Call {
+                func: classify_name,
+                args: vec![arg],
+            },
+        );
+        m.build_void(Op::Call {
+            func: print,
+            args: vec![r],
+        });
+    }
+    let zero = m.build(MirType::I32, Op::ConstInt(0, MirType::I32));
+    m.ret(Some(zero));
+
+    let mut program = Program::new();
+    program.funcs = vec![classify, m.finish()];
+    assert!(
+        wukong_mir::verify::verify_program(&program).is_empty(),
+        "{:?}",
+        wukong_mir::verify::verify_program(&program)
+    );
+    let expected = b"10\n200\n50\n300\n200\n1003\n998\n1004\n".to_vec();
+    let oracle = wukong_interp::run_with_output(&program, main_name, &interner).unwrap();
+    assert_eq!(oracle, (0, expected.clone()), "interpreter");
+    let native = crate::jit_run(&program, main_name, &interner).unwrap();
+    assert_eq!(native, (0, expected), "native");
 }

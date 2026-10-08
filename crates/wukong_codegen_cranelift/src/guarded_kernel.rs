@@ -37,7 +37,7 @@ impl JitBufferKernel {
     pub unsafe fn run(&self, buffers: &[*mut f32], entry: u64) -> Result<Vec<u8>, String> {
         let _guard = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        ASSERT_FAILED.store(false, Ordering::SeqCst);
+        reset_failure();
         let code = self.program.code as usize;
         let table = buffers.as_ptr() as usize;
         // SAFETY: the constructor validates the fixed ABI. The caller guarantees the table and
@@ -46,8 +46,8 @@ impl JitBufferKernel {
             let call: extern "C" fn(*const *mut f32, u64) = std::mem::transmute(code);
             call(table as *const *mut f32, entry);
         });
-        if ASSERT_FAILED.load(Ordering::SeqCst) {
-            return Err("assertion failed".into());
+        if let Some(failure) = take_failure() {
+            return Err(failure);
         }
         Ok(OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clone())
     }

@@ -27,7 +27,9 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 mod alias;
+mod bounds;
 mod canon;
+mod noalias;
 mod tile;
 mod tindex;
 
@@ -45,7 +47,8 @@ use wukong_mir::{
     RoundMode, ValueId, VecBin, VecCmp, VecKernel, VecOp, VecRedOp, VecReduce,
 };
 use wukong_sema::{
-    heap_alloc_elem, is_now_ns, is_sync_block, DefKind, EnumVariant, SemaResult, VariantPayload,
+    heap_alloc_elem, is_now_ns, is_scratch_mark, is_scratch_release, is_sync_block,
+    scratch_alloc_elem, DefKind, EnumVariant, SemaResult, VariantPayload,
 };
 use wukong_span::{Interner, Span, Symbol};
 use wukong_types::Ty;
@@ -963,11 +966,29 @@ pub fn lower_program(
 /// [`lower_program`] with the construction knobs spelled out. Separate entry point rather than a
 /// fourth parameter on `lower_program`, because ~20 call sites across the workspace (the optimizer's
 /// examples, both benches, every backend's tests) want the defaults and should not have to say so.
+///
+/// Runtime safety failures (a slice index out of bounds) carry no source location through this
+/// entry point; [`lower_program_located`] attaches one.
 pub fn lower_program_with(
     module: &Module,
     sema: &SemaResult,
     interner: &mut Interner,
     opts: LowerOptions,
+) -> (Program, Vec<Diagnostic>) {
+    lower_program_located(module, sema, interner, opts, &|_| String::new())
+}
+
+/// [`lower_program_with`], plus the source location every runtime safety failure reports.
+/// `locate` renders a span start as `file:line:col` (an empty string means "unknown"); the driver
+/// passes its source map's view, so an out-of-bounds slice access prints where it happened on the
+/// interpreter, the JIT and a linked executable alike. A separate entry point for the same reason
+/// `lower_program_with` is one: only the driver has a source map to offer.
+pub fn lower_program_located(
+    module: &Module,
+    sema: &SemaResult,
+    interner: &mut Interner,
+    opts: LowerOptions,
+    locate: &dyn Fn(Span) -> String,
 ) -> (Program, Vec<Diagnostic>) {
     // Two AST normalizations run back to back, before anything looks at the tree, because every
     // kernel recognizer and the autovectorizer match a *syntactic* shape on the raw AST.
@@ -1157,6 +1178,9 @@ pub fn lower_program_with(
         attn: interner.intern("wukong_attention_f32"),
         rt_alloc: interner.intern("wukong_rt_alloc"),
         rt_free: interner.intern("wukong_rt_free"),
+        rt_scratch_alloc: interner.intern("wukong_rt_scratch_alloc"),
+        rt_scratch_mark: interner.intern("wukong_rt_scratch_mark"),
+        rt_scratch_release: interner.intern("wukong_rt_scratch_release"),
         rt_read_f32: interner.intern("wukong_rt_read_f32"),
         rt_read_i32: interner.intern("wukong_rt_read_i32"),
         rt_read_i64: interner.intern("wukong_rt_read_i64"),
@@ -1170,6 +1194,9 @@ pub fn lower_program_with(
         rt_write_f64: interner.intern("wukong_rt_write_f64"),
         rt_write_i8: interner.intern("wukong_rt_write_i8"),
         now_ns: interner.intern("wukong_now_ns"),
+        bounds_fail: interner.intern("wukong_rt_bounds_fail"),
+        // Overwritten per function by `@unchecked`, below; checked is the default.
+        bounds_checks: true,
     };
     // Collect every concrete instantiation of every type-generic function (needs `&mut interner` to
     // intern the instance names), then lower the module. A type-generic function is NOT lowered here
@@ -1217,6 +1244,17 @@ pub fn lower_program_with(
             _ => None,
         })
         .collect();
+    // Functions carrying `@unchecked`: the slice bounds-check opt-out. Keyed by name for the same
+    // reason as `generic_fns` — the instance loop below has only the template's symbol.
+    let unchecked_fns: HashSet<Symbol> = module
+        .items
+        .iter()
+        .filter(|item| has_attr(item, interner, "unchecked"))
+        .filter_map(|item| match &item.kind {
+            ast::ItemKind::Fn(f) => Some(f.name.sym),
+            _ => None,
+        })
+        .collect();
     let fn_tiles: HashMap<Symbol, Vec<u64>> = module
         .items
         .iter()
@@ -1243,6 +1281,8 @@ pub fn lower_program_with(
                 // takes, because the switch rides on that struct and it is copied down into every
                 // recognizer and probe from here.
                 let gemm = generic_gemm(gemm, generic_fns.contains(&f.name.sym));
+                // `@unchecked`: lower this function's slice accesses without bounds checks.
+                let gemm = unchecked_gemm(gemm, unchecked_fns.contains(&f.name.sym));
                 // Whole-program aliasing, stamped on beside the `@generic` opt-out: `false` here
                 // means some call site in this program can hand two of this function's buffer
                 // parameters the same array, so no recognizer inside it may emit a kernel whose
@@ -2004,6 +2044,7 @@ pub fn lower_program_with(
         if let Some((f, body)) = fn_decls.get(orig) {
             // A `@generic` template's instances inherit the opt-out (keyed on the ORIGINAL name).
             let gemm = generic_gemm(gemm, generic_fns.contains(orig));
+            let gemm = unchecked_gemm(gemm, unchecked_fns.contains(orig));
             // Aliasing is a property of the ORIGINAL function's call sites: every instantiation of
             // a type-generic template shares them.
             let gemm = alias_gemm(gemm, alias_facts.alias_free(*orig));
@@ -2027,6 +2068,8 @@ pub fn lower_program_with(
     // The outlined bodies of every mid-function `@parallel` loop region, collected while lowering
     // the functions above. Appended last — backends resolve functions by name, so order is free.
     program.funcs.append(&mut par_regions.funcs);
+    // Give every slice bounds failure its `file:line:col` (a `.rodata` string; see `bounds.rs`).
+    bounds::attach_sites(&mut program, interner, gemm.bounds_fail, locate);
     (program, diags)
 }
 
@@ -2052,6 +2095,21 @@ fn has_generic_attr(item: &ast::Item, interner: &Interner) -> bool {
 /// the way down. See `alias.rs`.
 fn alias_gemm(gemm: GemmSyms, alias_free: bool) -> GemmSyms {
     GemmSyms { alias_free, ..gemm }
+}
+
+/// Does this item carry the attribute `@name`? `wukong_sema::attrs` has already checked placement.
+fn has_attr(item: &ast::Item, interner: &Interner, name: &str) -> bool {
+    item.attrs
+        .iter()
+        .any(|a| interner.resolve(a.name.sym) == name)
+}
+
+/// `gemm` with slice bounds checks cleared when the function being lowered is `@unchecked`.
+fn unchecked_gemm(gemm: GemmSyms, is_unchecked: bool) -> GemmSyms {
+    GemmSyms {
+        bounds_checks: gemm.bounds_checks && !is_unchecked,
+        ..gemm
+    }
 }
 
 /// `gemm` with recognition cleared when the function being lowered is `@generic`. Per-function
@@ -2331,6 +2389,7 @@ fn parallel_spec<'a>(
         let base = proof.builder.add_param(MirType::Ptr);
         proof.param_arrays.push((base, ty.clone()));
         proof.bind(p.name.sym, base, mir_ty(ty));
+        noalias::record_param(&mut proof.builder, p, ty, base, interner);
     }
     // The mixed-radix proof needs a known iteration domain. An unknown bound conservatively
     // retains serial execution; it must never be guessed from the array's storage extent.
@@ -2555,6 +2614,8 @@ fn lower_fn(
         if ty_is_buffer_param(pty) {
             fl.param_arrays.push((val, pty.clone()));
         }
+        // A `@noalias` promise rides on the MIR parameter (`noalias.rs`).
+        noalias::record_param(&mut fl.builder, p, pty, val, interner);
         // A statically-shaped contiguous tensor param binds as the buffer it *is* — `[T; d0·…·dn]` —
         // not as an opaque `Ptr`. Both spellings arrive as the same base pointer (`param_abi` maps
         // `Array(..)` back to `Ptr`, so the ABI is byte-identical), but only the `Array` form takes
@@ -3307,6 +3368,12 @@ struct GemmSyms {
     /// backing the `alloc_<T>(n)` builtins, and its `wukong_rt_free(data)` release twin.
     rt_alloc: Symbol,
     rt_free: Symbol,
+    /// The scratch allocator behind `scratch_<T>(n)` / `scratch_mark()` / `scratch_release(m)`
+    /// (`wukong_runtime::scratch`): `wukong_rt_scratch_alloc` shares `wukong_rt_alloc`'s ABI,
+    /// `wukong_rt_scratch_mark() -> i64`, `wukong_rt_scratch_release(mark: i64)`.
+    rt_scratch_alloc: Symbol,
+    rt_scratch_mark: Symbol,
+    rt_scratch_release: Symbol,
     /// The 12 raw file-I/O runtime entry points (`wukong_rt_{read,write}_{f32,i32,i64,u8,f64,i8}`)
     /// backing the `read_<T>(path, buf)` / `write_<T>(path, buf)` builtins. Each takes `(path: *const
     /// u8, data: *T, len: i64)` and returns an `i64`: the element count on success, or -1 (open/create
@@ -3327,6 +3394,12 @@ struct GemmSyms {
     /// nanosecond clock for in-process benchmarking. No arguments; both backends read the same
     /// clock (the interpreter calls `wukong_runtime::wukong_now_ns` directly).
     now_ns: Symbol,
+    /// The failure edge of a checked slice access: `wukong_rt_bounds_fail(index: i64, len: i64,
+    /// site: *u8)`, which never returns normally (see `bounds.rs`).
+    bounds_fail: Symbol,
+    /// Emit slice bounds checks (`true`, the default). Cleared per function by `@unchecked`, at the
+    /// same place `@generic` clears `recognize`; it rides here for the same reason that does.
+    bounds_checks: bool,
 }
 
 // Elementwise-math op codes — must match `wukong_runtime::vmath`'s `VM_*` (mir_build does not depend
@@ -9525,6 +9598,20 @@ impl FnLowerer<'_> {
             tail: None,
             span: body.span,
         };
+        // A counting `while` over `[]T` slices stays a `while`: it keeps the MIR loop vectorizer
+        // (`wukong_opt::vectorize`), whose run-time alias guard needs no whole-program disjointness
+        // proof. Only the `for` spelling routes a slice loop into this lowerer's vectorizer (and its
+        // 256-bit recipes) — the behaviour every slice `while` had before slices were streams here.
+        let mut accesses: Vec<IndexAccess> = Vec::new();
+        for st in &stripped.stmts {
+            collect_stmt_index_accesses(st, &mut accesses);
+        }
+        if accesses
+            .iter()
+            .any(|(base, _, _)| matches!(self.expr_ty(base), Ty::Slice(_)))
+        {
+            return false;
+        }
         // Commit only if the stripped body is vectorizable — a pure analysis (no MIR emitted, so no
         // risk of double-evaluating a side-effecting bound on the fallback path). This also scopes
         // normalization to elementwise loops and guarantees `try_vectorize_ranged` will succeed.
@@ -9543,6 +9630,7 @@ impl FnLowerer<'_> {
             &ity,
             &stripped,
             self.kernel_range_supported(lhs, rhs),
+            None,
         );
         debug_assert!(ok, "a vectorizable body must vectorize");
         // Restore `i` to the value the while would have left: `N` if it ran (`start < N`), else the
@@ -9736,21 +9824,29 @@ impl FnLowerer<'_> {
     ///
     /// Callers that are allowed *one* aliasing pair (a kernel documenting `dx` may alias `dy`) pass
     /// only the pairs that must be disjoint.
+    ///
+    /// A fourth fact settles a pair the call-site bit cannot: a `@noalias` promise between two
+    /// parameters ([`Self::promised_disjoint`]). The source states it and sema rejects the call
+    /// sites that provably break it, so it holds whatever the rest of the program does.
     fn provably_disjoint(&self, a: Symbol, b: Symbol) -> bool {
         self.all_provably_disjoint(&[a, b])
     }
 
     /// The N-operand form of [`Self::provably_disjoint`]; see there for the whole argument.
     fn all_provably_disjoint(&self, syms: &[Symbol]) -> bool {
-        if !self.gemm.alias_free {
-            return false;
-        }
         for (i, a) in syms.iter().enumerate() {
             if syms[i + 1..].contains(a) {
                 return false;
             }
         }
-        true
+        if self.gemm.alias_free {
+            return true;
+        }
+        syms.len() >= 2
+            && syms
+                .iter()
+                .enumerate()
+                .all(|(i, a)| syms[i + 1..].iter().all(|b| self.promised_disjoint(*a, *b)))
     }
 
     /// [`Self::kernel_base_ptrs`] for a kernel whose operands must be mutually disjoint: resolves
@@ -13257,9 +13353,11 @@ impl FnLowerer<'_> {
     //    cross-iteration scheduling differs, and iterations never overlap writes, so serial ==
     //    parallel bit-for-bit and the interpreter (sequential `[0, N)`) == native (chunks).
     //  * Captured array storage must be a fresh alloca or a scalar-element array parameter.
-    //    Names with the same MIR base, and same-typed parameters that the caller could alias, are
-    //    proved as ONE buffer over the union of their accesses. Derived pointers and aggregate
-    //    parameters decline because their overlapping subobjects need an offset-aware proof.
+    //    Names with the same MIR base, and parameters over the same element scalar that the caller
+    //    could alias (whatever their declared lengths), are proved as ONE buffer over the union of
+    //    their accesses — unless a `@noalias` promise separates the pair. Derived pointers and
+    //    aggregate parameters decline because their overlapping subobjects need an offset-aware
+    //    proof.
     //
     // Autodiff note: a function containing a region tapes to an `Op::Call` of
     // `wukong_parallel_for` (a void call with no VJP rule), so `--emit=grad`/`--train` over such a
@@ -13327,9 +13425,12 @@ impl FnLowerer<'_> {
             self.prove_region_slices(hh, n, &accs.iter().collect::<Vec<_>>())?;
         }
         // Prove the union for aliases of one MIR base, including aggregate match bindings, and
-        // for same-typed parameters that the caller may bind to one array. `region_capture` only
-        // admits direct scalar-element array parameters or fresh allocas: derived pointers and
-        // aggregate parameters could overlap at different offsets or element sizes and decline.
+        // for parameters that the caller may bind to one array. "May" is decided by storage class,
+        // not by `Ty` equality (P1.20): a declared length is no evidence that two array parameters
+        // are different buffers, so every parameter over the same element scalar joins the group —
+        // unless a `@noalias` promise separates the two (`noalias.rs`). `region_capture` only admits
+        // direct scalar-element array parameters or fresh allocas: derived pointers and aggregate
+        // parameters could overlap at different offsets or element sizes and decline.
         for arr in &sc.written {
             let (base, _) = self.lookup(*arr)?;
             let wty = self.buffer_param_ty(*arr);
@@ -13338,7 +13439,10 @@ impl FnLowerer<'_> {
                 .iter()
                 .filter(|c| {
                     self.lookup(**c).is_some_and(|(other, _)| other == base)
-                        || (wty.is_some() && self.buffer_param_ty(**c) == wty)
+                        || (wty.is_some_and(|w| {
+                            self.buffer_param_ty(**c)
+                                .is_some_and(|t| noalias::could_share_storage(w, t))
+                        }) && !self.promised_disjoint(*arr, **c))
                 })
                 .filter_map(|c| sc.accesses.get(c))
                 .collect();
@@ -15959,18 +16063,18 @@ impl FnLowerer<'_> {
         if reduction.is_none() && self.vectorizable(body, j).is_none() {
             return false;
         }
+        // A compile-time-known trip (literal `for i in A..B`) lets the 256-bit paths decide on size
+        // statically; a runtime bound stays `None` and is decided at run time where that matters
+        // (see `VEC256_REDUCTION_MIN_TRIP` and `vec256_elementwise_min_trip`).
+        let known_trip = match (self.const_usize_expr(start), self.const_usize_expr(end)) {
+            (Some(a), Some(b)) if b >= a => Some(u64::from(b - a)),
+            _ => None,
+        };
         // Lower the bounds (coerced to the index type) and hand off to the matching emitter.
         let s0 = self.lower_range_bound(start, &ity, signed);
         let e0 = self.lower_range_bound(end, &ity, signed);
         if let Some((s_sym, addend, lane, w, redop)) = reduction {
-            // A compile-time-known trip (literal `for i in A..B`) lets the 256-bit reduction gate on
-            // size; a runtime bound stays `None` and keeps the 128-bit path (see
-            // `VEC256_REDUCTION_MIN_TRIP`).
-            let known_trip = match (self.const_usize_expr(start), self.const_usize_expr(end)) {
-                (Some(a), Some(b)) if b >= a => Some((b - a) as u64),
-                _ => None,
-            };
-            self.emit_reduction(j, s0, e0, &ity, s_sym, addend, &lane, w, redop, known_trip);
+            self.emit_reduction(j, s0, e0, &ity, s_sym, &addend, &lane, w, redop, known_trip);
             true
         } else {
             self.try_vectorize_ranged(
@@ -15980,20 +16084,71 @@ impl FnLowerer<'_> {
                 &ity,
                 body,
                 self.kernel_range_supported(start, end),
+                known_trip,
             )
         }
     }
 
-    /// Recognise a vectorizable float reduction `for j in .. { s = s + <expr(j)> }` (or `s += ..`),
-    /// where `s` is an outer float scalar that the body otherwise does not touch and `<expr>` is an
-    /// elementwise value over `j` that does not read `s`. Returns `(s, addend, lane, width)`.
-    /// Vectorizing this reassociates the float sum (lane accumulators + a horizontal reduce) — the
-    /// standard reduction optimization. Pure analysis; emits no MIR.
+    /// Recognise a vectorizable reduction `for j in .. { s = s + <expr(j)> }` (or `s += ..`, or a
+    /// running `fmax`/`fmin`), where `s` is an outer float or integer scalar that the body otherwise
+    /// does not touch and `<expr>` is an elementwise value over `j` that does not read `s`. Returns
+    /// `(s, addend, lane, width, fold)`. Vectorizing this reassociates the sum (lane accumulators +
+    /// a horizontal reduce) along the canonical tree of `wukong_mir::vec_kernel` — the standard
+    /// reduction optimization, fixed so every lowering of the loop computes the same number.
+    ///
+    /// The accumulator may sit anywhere in a `+` chain: `s = s + x + y`, `s = x + s + y` and
+    /// `s = (s + x) - y` are the reductions `s += x + y` and `s += x - y`, their addend the chain with
+    /// `s` removed. Without that the left-associated spelling `((s + x) + y)` matched neither top-level
+    /// operand and the loop compiled fully scalar, while `s += x + y` took the 256-bit kernel — a 4-8x
+    /// cliff selected by parenthesization alone. Regrouping one iteration's terms as `s + (x + y)` is
+    /// the licence the vectorized reduction already takes across iterations; the scalar remainder
+    /// folds the identical rebuilt addend, so the vector part, the tail and every backend agree.
+    /// Pure analysis; emits no MIR.
+    #[allow(clippy::type_complexity)]
     fn reduction_of<'b>(
         &self,
         body: &'b Block,
         j: Symbol,
-    ) -> Option<(Symbol, &'b Expr, MirType, u32, RedOp)> {
+    ) -> Option<(Symbol, std::borrow::Cow<'b, Expr>, MirType, u32, RedOp)> {
+        use std::borrow::Cow;
+        /// `e` with the single `+`-chain occurrence of the accumulator `s` removed, or `None` when
+        /// `e` is not such a chain. A node on the path to `s` is rebuilt under its own id (so its
+        /// sema type — the accumulator's — still resolves); every other node is the original.
+        /// `s` may not be the left operand of a subtraction (`s - y` would need a negation) nor its
+        /// right one (`x - s` negates the accumulator).
+        fn strip_accumulator(e: &Expr, s: Symbol) -> Option<Expr> {
+            let ExprKind::Binary { op, lhs, rhs } = &e.kind else {
+                return None;
+            };
+            let is_s = |x: &Expr| single_path(x) == Some(s);
+            let rebuilt = |l: Expr, r: Expr| Expr {
+                id: e.id,
+                kind: ExprKind::Binary {
+                    op: *op,
+                    lhs: Box::new(l),
+                    rhs: Box::new(r),
+                },
+                span: e.span,
+            };
+            match op {
+                ast::BinOp::Add => {
+                    if is_s(lhs) {
+                        Some((**rhs).clone())
+                    } else if is_s(rhs) {
+                        Some((**lhs).clone())
+                    } else if let Some(l) = strip_accumulator(lhs, s) {
+                        Some(rebuilt(l, (**rhs).clone()))
+                    } else {
+                        strip_accumulator(rhs, s).map(|r| rebuilt((**lhs).clone(), r))
+                    }
+                }
+                ast::BinOp::Sub if !is_s(lhs) => {
+                    strip_accumulator(lhs, s).map(|l| rebuilt(l, (**rhs).clone()))
+                }
+                _ => None,
+            }
+        }
+
         if body.tail.is_some() || body.stmts.len() != 1 {
             return None;
         }
@@ -16008,22 +16163,24 @@ impl FnLowerer<'_> {
         if !(sty.is_float() || sty.is_int()) {
             return None;
         }
-        // The addend and fold kind: `s += addend` / `s = s + addend` / `s = addend + s` (sum), or
-        // `m = fmax(m, addend)` / `m = fmin(m, addend)` (running max/min, either operand order).
+        // The addend and fold kind: `s += addend` / `s = s + addend` / `s = addend + s` / a longer
+        // `+` chain holding `s` once (sum), or `m = fmax(m, addend)` / `m = fmin(m, addend)` (running
+        // max/min, either operand order).
         let is_s = |e: &Expr| single_path(e) == Some(s);
-        let (addend, redop): (&Expr, RedOp) = match op {
-            ast::AssignOp::Add => (value, RedOp::Add),
+        let (addend, redop): (Cow<'b, Expr>, RedOp) = match op {
+            ast::AssignOp::Add => (Cow::Borrowed(value), RedOp::Add),
             ast::AssignOp::Assign => match &value.kind {
                 ExprKind::Binary {
                     op: ast::BinOp::Add,
                     lhs,
                     rhs,
-                } if is_s(lhs) => (rhs, RedOp::Add),
+                } if is_s(lhs) => (Cow::Borrowed(&**rhs), RedOp::Add),
                 ExprKind::Binary {
                     op: ast::BinOp::Add,
                     lhs,
                     rhs,
-                } if is_s(rhs) => (lhs, RedOp::Add),
+                } if is_s(rhs) => (Cow::Borrowed(&**lhs), RedOp::Add),
+                ExprKind::Binary { .. } => (Cow::Owned(strip_accumulator(value, s)?), RedOp::Add),
                 ExprKind::Call { callee, args, .. } if args.len() == 2 => {
                     let red = match self.vectorizable_intrinsic(callee) {
                         Some(MathIntrinsic::Fmax) => RedOp::Fmax,
@@ -16031,9 +16188,9 @@ impl FnLowerer<'_> {
                         _ => return None,
                     };
                     if is_s(&args[0]) {
-                        (&args[1], red)
+                        (Cow::Borrowed(&args[1]), red)
                     } else if is_s(&args[1]) {
-                        (&args[0], red)
+                        (Cow::Borrowed(&args[0]), red)
                     } else {
                         return None;
                     }
@@ -16042,14 +16199,15 @@ impl FnLowerer<'_> {
             },
             _ => return None,
         };
-        if expr_uses_sym(addend, s) {
+        if expr_uses_sym(&addend, s) {
             return None;
         }
         let mut lane: Option<MirType> = None;
         let mut acc: Vec<(Symbol, &Expr, bool, bool)> = Vec::new();
-        if !self.vec_check_value(addend, j, &HashSet::default(), &mut lane, &mut acc) {
+        if !self.vec_check_value(&addend, j, &HashSet::default(), &mut lane, &mut acc) {
             return None;
         }
+        drop(acc);
         let lane = lane?;
         // Require the lane type to match the accumulator exactly, so the horizontal reduce
         // (`s = s + lane`) is well-typed — bails on a mixed-width reduction (e.g. `f64 += f32`).
@@ -16066,6 +16224,7 @@ impl FnLowerer<'_> {
 
     /// Attempt SIMD lowering of a loop whose bounds are already lowered to `ity` values (the form
     /// the `@parallel` outliner produces). Returns true on success.
+    #[allow(clippy::too_many_arguments)]
     fn try_vectorize_ranged(
         &mut self,
         j: Symbol,
@@ -16074,6 +16233,7 @@ impl FnLowerer<'_> {
         ity: &MirType,
         body: &Block,
         kernel_bounds: bool,
+        known_trip: Option<u64>,
     ) -> bool {
         // Same rule as `try_vectorize_for`: the arms in this block are kernel recognizers (this is
         // the `@parallel`-chunk twin of that probe list), so recognition off skips straight to the
@@ -16166,7 +16326,7 @@ impl FnLowerer<'_> {
         let Some((lane, w)) = self.vectorizable(body, j) else {
             return false;
         };
-        self.emit_vectorized_for(j, start_val, end_val, ity, &lane, w, body);
+        self.emit_vectorized_for(j, start_val, end_val, ity, &lane, w, body, known_trip);
         true
     }
 
@@ -16202,7 +16362,28 @@ impl FnLowerer<'_> {
                     if !self.vec_check_value(value, j, &locals, &mut lane, &mut acc) {
                         return None;
                     }
-                    let _ = op; // compound vs plain handled identically for validation
+                    // A compound assign lowers through `compound_binop` as ONE lane-wise op, so it
+                    // is vectorizable only where that op has a vector form on every backend: `+ - *`
+                    // always, `/` on a float lane (x86 has no SIMD integer divide — the same rule
+                    // `vec_check_value` applies to a written-out `/`), the bitwise ops on an integer
+                    // lane. `%` (no vector remainder) and the shifts (a per-lane shift amount
+                    // Cranelift cannot lower) keep the loop scalar instead of reaching the backend
+                    // as MIR it rejects.
+                    let lane_float = lane.as_ref().is_some_and(|l| l.is_float());
+                    let op_ok = match op {
+                        ast::AssignOp::Assign
+                        | ast::AssignOp::Add
+                        | ast::AssignOp::Sub
+                        | ast::AssignOp::Mul => true,
+                        ast::AssignOp::Div => lane_float,
+                        ast::AssignOp::BitAnd | ast::AssignOp::BitOr | ast::AssignOp::BitXor => {
+                            !lane_float
+                        }
+                        ast::AssignOp::Rem | ast::AssignOp::Shl | ast::AssignOp::Shr => false,
+                    };
+                    if !op_ok {
+                        return None;
+                    }
                     match &target.kind {
                         // scalar reassignment of an inner vector temp (e.g. Horner `r = r*v + c`)
                         ExprKind::Path(p) if p.is_single() && locals.contains(&p.first().sym) => {}
@@ -16369,6 +16550,18 @@ impl FnLowerer<'_> {
                 if has_shifted_index(tv, j) || has_shifted_index(ev, j) {
                     return false;
                 }
+                // Integer lanes are signless, and both vector lowerings compare them SIGNED (the
+                // 128-bit strips' `lane_signed` and AVX2's only ordered integer compare, `vpcmpgt`).
+                // An ordered compare of unsigned operands is therefore a different predicate — for a
+                // `u32` element at or above 2^31 the vector lanes picked the other branch from the
+                // scalar tail beside them, on both backends alike. Keep such a loop scalar; `==`/`!=`
+                // are sign-agnostic and stay vectorizable.
+                if matches!(op, Lt | Le | Gt | Ge)
+                    && !self.expr_mir(lhs).is_float()
+                    && !(self.signed(lhs) && self.signed(rhs))
+                {
+                    return false;
+                }
                 self.vec_check_value(lhs, j, locals, lane, acc)
                     && self.vec_check_value(rhs, j, locals, lane, acc)
                     && self.vec_check_value(tv, j, locals, lane, acc)
@@ -16493,29 +16686,56 @@ impl FnLowerer<'_> {
         }
     }
 
-    /// The element MIR type of an array- or tensor-valued base expression, via sema.
+    /// The element MIR type of a buffer-valued base expression the vectorizer may stream over, via
+    /// sema: a `[T; N]` array, a contiguous `Tensor[T, …]` of any (constant OR symbolic) extents, or
+    /// a `[]T` slice.
+    ///
+    /// The runtime-sized forms are the ones real kernels are written over (`alloc_f32(n)` buffers,
+    /// symbolic-shape tensors), and until they were accepted here every loop over them capped at the
+    /// scalar or 128-bit path even where the identical `[f32; N]` loop took the 256-bit kernel. Every
+    /// emitter resolves a stream's data pointer through [`Self::vec_stream_base`] — the same
+    /// `kernel_base_ptr` rule every recognizer uses: an `Array`-bound name *is* its storage, a
+    /// `Ptr`-bound tensor and a slice's fat pointer hold it one load away. A name not bound in this
+    /// scope (a module-level `const` array) is still accepted for an array, exactly as before, and
+    /// `recipe_bases_bound` keeps it off the 256-bit recipe.
+    ///
+    /// Disjointness is unchanged: `vectorizable` still demands `provably_disjoint` for every pair it
+    /// writes through, and the whole-program alias fact behind it already treats a slice or tensor
+    /// parameter — and a `[]T` view `let` — as storage that may alias.
     fn array_elem(&self, base: &Expr) -> Option<MirType> {
         match self.expr_ty(base) {
             Ty::Array { elem, .. } => Some(mir_ty(&elem)),
-            // A statically-shaped contiguous tensor *is* an array of its element type — the same
-            // buffer with a shape attached — so a loop over it is exactly as vectorizable as the
-            // `[T; N]` spelling. Without this the autovectorizer declined every tensor stream even
-            // after `tindex` normalized `a[i, j]` to the single-index form it can analyse.
-            //
-            // Both gates are load-bearing. `tensor_buffer_mir` is the same predicate the parameter
-            // binding uses, and requiring the *binding* to be `Array` is what proves `lookup(base).0`
-            // is the buffer's base pointer: a tensor bound as `Ptr` (a symbolic shape, or a tensor
-            // local) holds the pointer in a stack slot, and the emitters gep straight off the value
-            // `lookup` returns — so accepting one here would address the slot, not the data.
-            t @ Ty::Tensor { .. } => {
-                let (elem, _) = tensor_buffer_mir(&t)?;
-                match self.lookup(single_path(base)?) {
-                    Some((_, MirType::Array(..))) => Some(elem),
-                    _ => None,
+            // A contiguous tensor *is* an array of its element type — the same buffer with a shape
+            // attached — so a loop over it is exactly as vectorizable as the `[T; N]` spelling
+            // (`tindex` normalizes `a[i, j]` to the single-index form analysed here). A statically
+            // shaped one is bound as its buffer (`Array`); a symbolic one, or a tensor local, as a
+            // `Ptr` slot holding the base — both resolve through `vec_stream_base`, so the binding
+            // must exist here.
+            Ty::Tensor {
+                elem,
+                shape,
+                layout,
+            } => {
+                if !matches!(layout, wukong_types::Layout::Contiguous) || shape.0.is_empty() {
+                    return None;
                 }
+                self.lookup(single_path(base)?)?;
+                Some(MirType::from_scalar(elem))
+            }
+            // A `[]T` slice: the data pointer is the fat pointer's first word.
+            Ty::Slice(elem) => {
+                self.lookup(single_path(base)?)?;
+                Some(mir_ty(&elem))
             }
             _ => None,
         }
+    }
+
+    /// The data pointer of vectorizer stream base `sym` — [`Self::kernel_base_ptr`], the rule every
+    /// recognizer resolves its buffer operands with (identity for an `Array`-bound array or tensor,
+    /// one `Load` for a `Ptr`-bound tensor or a `[]T` slice's fat pointer).
+    fn vec_stream_base(&mut self, sym: Symbol) -> Option<ValueId> {
+        self.kernel_base_ptr(sym)
     }
 
     /// Is every stream base of a built recipe a binding this lowerer can resolve? A module-level
@@ -16530,14 +16750,21 @@ impl FnLowerer<'_> {
         r.streams.iter().all(|(b, _)| self.lookup(*b).is_some())
     }
 
-    /// Capture a validated (`vectorizable`-passing) f32 loop body as a flat [`VecKernel`] recipe for
-    /// the raw-AVX2 path, or `None` if it uses anything outside the assembler's coverage (a
-    /// transcendental, `abs`/rounding, `fmax`/`fmin`, a compound assign) — in which case the caller
-    /// keeps the 128-bit CLIF vectorizer. Records each distinct unit-stride `(base, index)` as a
+    /// Capture a validated (`vectorizable`-passing) loop body of lane type `lane` as a flat
+    /// [`VecKernel`] recipe for the raw-AVX2 path, or `None` if it uses anything outside the
+    /// assembler's coverage (a transcendental, `abs`/rounding, `fmax`/`fmin`, a compound assign, or
+    /// an op the lane's instruction family lacks) — in which case the caller keeps the 128-bit CLIF
+    /// vectorizer. Records each distinct unit-stride `(base, index)` as a
     /// stream and each loop-invariant value (a param/outer local, a stride-0 array read, or a numeric
     /// literal) as a pre-loaded scalar; the emitter lowers those sources. Pure (emits no MIR).
-    fn build_vec_recipe<'b>(&self, body: &'b Block, j: Symbol) -> Option<VecRecipe<'b>> {
+    fn build_vec_recipe<'b>(
+        &self,
+        body: &'b Block,
+        j: Symbol,
+        lane: wukong_mir::VecLane,
+    ) -> Option<VecRecipe<'b>> {
         let mut r = VecRecipe {
+            lane,
             ops: Vec::new(),
             streams: Vec::new(),
             scalars: Vec::new(),
@@ -16666,7 +16893,9 @@ impl FnLowerer<'_> {
                 // level. `WUKONG_P4_NO_256=1` printed 1 for both, so the knob was changing the
                 // program's numbers rather than only its instruction selection. The leaves lower in
                 // source order, matching the twins.
-                if matches!(op, Add) {
+                // Integer lanes have no fused multiply-add (and the scalar tail does not contract
+                // them either), so only a float lane contracts.
+                if matches!(op, Add) && r.lane.is_float() {
                     if let ExprKind::Binary {
                         op: Mul,
                         lhs: y,
@@ -16694,7 +16923,7 @@ impl FnLowerer<'_> {
                     Add => VecBin::Add,
                     Sub => VecBin::Sub,
                     Mul => VecBin::Mul,
-                    Div => VecBin::Div,
+                    Div if r.lane.is_float() => VecBin::Div,
                     _ => return None,
                 };
                 let a = self.rec_value(lhs, j, locals, r)?;
@@ -16710,7 +16939,7 @@ impl FnLowerer<'_> {
             }
             // Only `sqrt` maps to a recipe op; other intrinsics (exp/log/abs/round/fmax/…) fall back.
             ExprKind::Call { callee, args, .. } => match self.vectorizable_intrinsic(callee) {
-                Some(MathIntrinsic::Sqrt) if args.len() == 1 => {
+                Some(MathIntrinsic::Sqrt) if args.len() == 1 && r.lane.is_float() => {
                     let a = self.rec_value(&args[0], j, locals, r)?;
                     Some(push(r, VecOp::Sqrt { a }))
                 }
@@ -16738,6 +16967,13 @@ impl FnLowerer<'_> {
                     Ne => VecCmp::Ne,
                     _ => return None,
                 };
+                // An integer lane's ordered compares are the SIGNED ones (`vpcmpgt*`).
+                if !r.lane.is_float()
+                    && !matches!(pred, VecCmp::Eq | VecCmp::Ne)
+                    && !(self.signed(lhs) && self.signed(rhs))
+                {
+                    return None;
+                }
                 let a = self.rec_value(lhs, j, locals, r)?;
                 let b = self.rec_value(rhs, j, locals, r)?;
                 let mask = push(r, VecOp::Cmp { pred, a, b });
@@ -16749,47 +16985,314 @@ impl FnLowerer<'_> {
         }
     }
 
-    /// Emit the 256-bit path: register `kern`, marshal the stream base pointers and invariant
-    /// scalars onto the stack, call the kernel over the multiple-of-8 vector part `[s, s+n)`, then
-    /// run the ordinary scalar loop over the tail `[s+n, end)`.
-    #[allow(clippy::too_many_arguments)]
-    fn emit_veckernel_for(
+    /// The end of the range the VECTOR part of a loop over `[s0, end_v)` may cover: `end_v` when
+    /// every run-time precondition of the vector forms holds, `s0` otherwise — then no vector group
+    /// runs and the scalar remainder, which indexes exactly as the source is written, does all the
+    /// work. This is the vectorizer's loop versioning. It tests the two facts about a stream that
+    /// only exist at run time; a loop over statically sized `[T; N]` arrays and tensors needs
+    /// neither and emits nothing here.
+    ///
+    /// * **Bounds.** A `[]T` slice is the one stream whose extent is a run-time value. Every slice
+    ///   access must stay inside the slice's length over the whole range, so whatever the scalar
+    ///   lowering of `s[i]` does at an out-of-range index — an unchecked access, or under a
+    ///   bounds-checking build a trap — the vectorized loop does at the same element, because it
+    ///   never runs a vector group that could reach one.
+    /// * **Overlap.** A written stream must be disjoint from every other stream of the body whenever
+    ///   either of the two is runtime-addressed (a slice, or a tensor bound as a `Ptr` slot).
+    ///   `vectorizable` has already demanded the whole-program `provably_disjoint` fact for such a
+    ///   pair, but that fact rests on every caller being visible — false for a function an
+    ///   `--emit=obj` object exports or a harness enters through a raw pointer, and for the
+    ///   call-borrowed views `alias.rs` lists as holes. Both vector forms read ahead of their stores
+    ///   (a recipe's per-stream load cache, a strip's whole-group loads), so an overlap the scalar
+    ///   loop would observe keeps the loop scalar instead. This is the run-time alias check gcc and
+    ///   LLVM version a loop on; a pair of two `[T; N]` arrays keeps the static fact alone, exactly
+    ///   as before.
+    ///
+    /// Both tests agree across the backends for every in-bounds access: distinct buffers occupy
+    /// distinct slot ranges in the interpreter and distinct byte ranges natively, so the two reach
+    /// the same verdict and then compute the same values. Every validated index is affine with
+    /// stride 0 or 1 in `j`, so the first and last iterations are its extremes: the cost is two
+    /// index evaluations per participating stream and a few compares, once per loop.
+    fn vector_guarded_end(
         &mut self,
         j: Symbol,
         s0: ValueId,
         end_v: ValueId,
         ity: &MirType,
-        kern: VecKernel,
-        recipe: &VecRecipe,
-        body: &Block,
-    ) {
-        let kidx = self.builder.add_vec_kernel(kern);
+        accesses: &[IndexAccess],
+    ) -> ValueId {
+        // The body's distinct streams: one per `(base, index)` spelling, written if any access to
+        // it stores. `runtime` marks storage only known at run time — a slice, or a tensor not
+        // bound as its own buffer (a symbolic shape or a tensor local holds its base in a `Ptr`
+        // slot).
+        struct Stream<'e> {
+            sym: Symbol,
+            idx: &'e Expr,
+            elem: Option<MirType>,
+            written: bool,
+            slice: bool,
+            runtime: bool,
+        }
+        let mut streams: Vec<Stream> = Vec::new();
+        for &(base, idx, written) in accesses {
+            let Some(sym) = single_path(base) else {
+                continue; // unreachable: every validated access is a named buffer
+            };
+            if let Some(st) = streams
+                .iter_mut()
+                .find(|st| st.sym == sym && exprs_struct_eq(st.idx, idx))
+            {
+                st.written |= written;
+                continue;
+            }
+            let (slice, runtime) = match self.expr_ty(base) {
+                Ty::Slice(_) => (true, true),
+                Ty::Tensor { .. } => (
+                    false,
+                    !matches!(self.lookup(sym), Some((_, MirType::Array(..)))),
+                ),
+                _ => (false, false),
+            };
+            streams.push(Stream {
+                sym,
+                idx,
+                elem: self.array_elem(base),
+                written,
+                slice,
+                runtime,
+            });
+        }
+        // (written stream, other stream) pairs only a run-time test can separate, each unordered
+        // pair once. Two streams of one name are excluded: `vectorizable` already demanded they
+        // use the identical index.
+        let mut pairs: Vec<(usize, usize)> = Vec::new();
+        for (a, sa) in streams.iter().enumerate() {
+            for (b, sb) in streams.iter().enumerate() {
+                let once = !(sb.written && b < a);
+                if sa.written && once && sa.sym != sb.sym && (sa.runtime || sb.runtime) {
+                    pairs.push((a, b));
+                }
+            }
+        }
+        if pairs.is_empty() && !streams.iter().any(|st| st.slice) {
+            return end_v;
+        }
 
-        // n = largest multiple of 8 not exceeding the trip count (0 if it is under 8 or negative, so
-        // a short/empty loop runs entirely in the scalar tail and the kernel is never entered).
+        let first = self.builder.alloca(ity.clone());
+        self.builder.build_void(Op::Store {
+            ptr: first,
+            value: s0,
+        });
+        let one = self
+            .builder
+            .build(ity.clone(), Op::ConstInt(1, ity.clone()));
+        let last_v = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::Sub, end_v, one));
+        let last = self.builder.alloca(ity.clone());
+        self.builder.build_void(Op::Store {
+            ptr: last,
+            value: last_v,
+        });
+        let zero = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        let one64 = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(1, MirType::I64));
+        let mut ok: Option<ValueId> = None;
+        self.push_scope();
+        // Each stream's first and last element index as i64, lowered at most once and shared by
+        // both tests; and each stream's touched address range `[&b[first], &b[last] + 1)` as
+        // integers (`None` inside when its data pointer cannot be resolved).
+        let mut extremes: Vec<Option<(ValueId, ValueId)>> = vec![None; streams.len()];
+        let mut ranges: Vec<Option<Option<(ValueId, ValueId)>>> = vec![None; streams.len()];
+
+        // Bounds: `0 <= first` and `last < len` for every slice stream.
+        for (st, memo) in streams.iter().zip(extremes.iter_mut()) {
+            if !st.slice {
+                continue;
+            }
+            let Some((fat, _)) = self.lookup(st.sym) else {
+                continue; // unreachable: `array_elem` admitted only bound slices
+            };
+            let len_at = self.field_ptr(fat, SLICE_LEN_OFF);
+            let len = self
+                .builder
+                .build(MirType::I64, Op::Load(len_at, MirType::I64));
+            let (lo, hi) = self.guard_extremes(j, first, last, ity, st.idx, memo);
+            let nonneg = self
+                .builder
+                .build(MirType::I1, Op::Cmp(CmpOp::Sge, lo, zero));
+            let below = self
+                .builder
+                .build(MirType::I1, Op::Cmp(CmpOp::Slt, hi, len));
+            let both = self
+                .builder
+                .build(MirType::I1, Op::Bin(BinOp::And, nonneg, below));
+            ok = Some(self.guard_conjoin(ok, both));
+        }
+        // Overlap: the written stream's range ends before the other's begins, or after it ends.
+        for &(a, b) in &pairs {
+            let mut range = |this: &mut Self, k: usize| -> Option<(ValueId, ValueId)> {
+                if let Some(r) = ranges[k] {
+                    return r;
+                }
+                let r = match (
+                    streams[k].elem.clone(),
+                    this.vec_stream_base(streams[k].sym),
+                ) {
+                    (Some(elem), Some(base)) => {
+                        let (lo, hi) = this.guard_extremes(
+                            j,
+                            first,
+                            last,
+                            ity,
+                            streams[k].idx,
+                            &mut extremes[k],
+                        );
+                        let past = this
+                            .builder
+                            .build(MirType::I64, Op::Bin(BinOp::Add, hi, one64));
+                        let start = this.guard_address(base, lo, &elem);
+                        let stop = this.guard_address(base, past, &elem);
+                        Some((start, stop))
+                    }
+                    _ => None,
+                };
+                ranges[k] = Some(r);
+                r
+            };
+            let ra = range(self, a);
+            let rb = range(self, b);
+            let disjoint = match (ra, rb) {
+                (Some((alo, ahi)), Some((blo, bhi))) => {
+                    let a_first = self
+                        .builder
+                        .build(MirType::I1, Op::Cmp(CmpOp::Ule, ahi, blo));
+                    let b_first = self
+                        .builder
+                        .build(MirType::I1, Op::Cmp(CmpOp::Ule, bhi, alo));
+                    self.builder
+                        .build(MirType::I1, Op::Bin(BinOp::Or, a_first, b_first))
+                }
+                // A stream with no resolvable data pointer (unreachable for a validated body):
+                // nothing proves the pair apart, so the loop stays scalar.
+                _ => self
+                    .builder
+                    .build(MirType::I1, Op::ConstInt(0, MirType::I1)),
+            };
+            ok = Some(self.guard_conjoin(ok, disjoint));
+        }
+        self.pop_scope();
+        match ok {
+            Some(ok) => self.builder.build(ity.clone(), Op::Select(ok, end_v, s0)),
+            None => end_v,
+        }
+    }
+
+    /// `prev && c`, or `c` alone for the first condition of a run-time guard.
+    fn guard_conjoin(&mut self, prev: Option<ValueId>, c: ValueId) -> ValueId {
+        match prev {
+            None => c,
+            Some(p) => self.builder.build(MirType::I1, Op::Bin(BinOp::And, p, c)),
+        }
+    }
+
+    /// A guarded stream's index at the loop's first and last iteration (`j` bound to the `first`
+    /// / `last` slots in the caller's scope), as i64 — computed once into `memo`.
+    fn guard_extremes(
+        &mut self,
+        j: Symbol,
+        first: ValueId,
+        last: ValueId,
+        ity: &MirType,
+        idx: &Expr,
+        memo: &mut Option<(ValueId, ValueId)>,
+    ) -> (ValueId, ValueId) {
+        if let Some(e) = *memo {
+            return e;
+        }
+        let index_at = |this: &mut Self, slot: ValueId| -> ValueId {
+            this.bind(j, slot, ity.clone());
+            let v = this.lower_expr(idx);
+            let vty = this.operand_mir(v, idx);
+            this.coerce_to(v, &vty, &MirType::I64, this.signed(idx))
+        };
+        let lo = index_at(self, first);
+        let hi = index_at(self, last);
+        *memo = Some((lo, hi));
+        (lo, hi)
+    }
+
+    /// `&base[index]` (elements of `elem`) as an integer address, for a run-time overlap test.
+    fn guard_address(&mut self, base: ValueId, index: ValueId, elem: &MirType) -> ValueId {
+        let p = self.builder.build(
+            MirType::Ptr,
+            Op::Gep {
+                ptr: base,
+                index,
+                elem: elem.clone(),
+            },
+        );
+        self.builder
+            .build(MirType::I64, Op::Cast(CastKind::PtrToInt, p, MirType::I64))
+    }
+
+    /// Whether the 256-bit raw-AVX2 recipe path is available to this compile at all: the lowering
+    /// option (`LowerOptions::vec_kernels` — off for the PTX backend), the host gate the assembler
+    /// refuses on (`host_supports_vec_kernels`, single-sourced in `wukong_mir`: the emitted bytes
+    /// hardcode the Win64 argument registers and AVX2+FMA3), and the `WUKONG_P4_NO_256` A/B knob. Each
+    /// only ever selects the *instruction form* of a loop — every recipe computes what the 128-bit
+    /// strips compute, reductions included (`wukong_mir::vec_kernel`'s canonical tree) — so none of
+    /// them changes a program's result.
+    fn wide_kernels_enabled(&self) -> bool {
+        self.gemm.vec_kernels
+            && host_supports_vec_kernels()
+            && std::env::var_os("WUKONG_P4_NO_256").is_none()
+    }
+
+    /// Marshal the operands of a recipe call over `[s0, vec_end)` for lane type `lane`: `n` — the
+    /// largest multiple of the lane count not exceeding that trip (0 when no full group fits or the
+    /// range is empty, so the kernel body never runs) — and the stream-base and invariant-scalar
+    /// tables. `j` is bound, in a freshly pushed scope the caller pops, to a slot holding the start
+    /// element, so each stream's index expression lowers to its first element. Returns
+    /// `(n, ptrs, scalars)`.
+    #[allow(clippy::too_many_arguments)]
+    fn marshal_vec_kernel(
+        &mut self,
+        j: Symbol,
+        s0: ValueId,
+        vec_end: ValueId,
+        ity: &MirType,
+        recipe: &VecRecipe,
+        lane: wukong_mir::VecLane,
+    ) -> (ValueId, ValueId, ValueId) {
+        let lanes = i128::from(lane.lanes());
+        let elem = lane.mir_type();
         let s64 = self.coerce_to(s0, ity, &MirType::I64, true);
-        let e64 = self.coerce_to(end_v, ity, &MirType::I64, true);
+        let e64 = self.coerce_to(vec_end, ity, &MirType::I64, true);
         let trip = self
             .builder
             .build(MirType::I64, Op::Bin(BinOp::Sub, e64, s64));
-        let neg8 = self
+        let mask = self
             .builder
-            .build(MirType::I64, Op::ConstInt(-8, MirType::I64));
+            .build(MirType::I64, Op::ConstInt(-lanes, MirType::I64));
         let masked = self
             .builder
-            .build(MirType::I64, Op::Bin(BinOp::And, trip, neg8));
-        let eight = self
+            .build(MirType::I64, Op::Bin(BinOp::And, trip, mask));
+        let group = self
             .builder
-            .build(MirType::I64, Op::ConstInt(8, MirType::I64));
-        let lt8 = self
+            .build(MirType::I64, Op::ConstInt(lanes, MirType::I64));
+        let short = self
             .builder
-            .build(MirType::I1, Op::Cmp(CmpOp::Slt, trip, eight));
+            .build(MirType::I1, Op::Cmp(CmpOp::Slt, trip, group));
         let empty = self
             .builder
             .build(MirType::I1, Op::Cmp(CmpOp::Sge, s64, e64));
         let skip = self
             .builder
-            .build(MirType::I1, Op::Bin(BinOp::Or, lt8, empty));
+            .build(MirType::I1, Op::Bin(BinOp::Or, short, empty));
         let zero = self
             .builder
             .build(MirType::I64, Op::ConstInt(0, MirType::I64));
@@ -16807,13 +17310,17 @@ impl FnLowerer<'_> {
         self.push_scope();
         self.bind(j, jslot, ity.clone());
 
-        // ptrs[k] = &base_k[start + offset_k] — one entry per stream, offset to the loop start.
+        // ptrs[k] = &base_k[start + offset_k] — one entry per stream, offset to the loop start. The
+        // base is the stream's DATA pointer (`vec_stream_base`): an array's own storage, or the
+        // pointer a tensor slot / slice fat pointer holds.
         let ptrs = self.builder.alloca(MirType::Array(
             Box::new(MirType::Ptr),
             recipe.streams.len() as u32,
         ));
         for (k, (base_sym, idx_expr)) in recipe.streams.iter().enumerate() {
-            let base = self.lookup(*base_sym).expect("stream base in scope").0;
+            let base = self
+                .vec_stream_base(*base_sym)
+                .expect("stream base in scope");
             let idxv = self.lower_expr(idx_expr);
             let idx_ty = self.operand_mir(idxv, idx_expr);
             // Match scalar indexing's explicit source-signedness extension before pointer
@@ -16824,7 +17331,7 @@ impl FnLowerer<'_> {
                 Op::Gep {
                     ptr: base,
                     index: idx64,
-                    elem: MirType::F32,
+                    elem: elem.clone(),
                 },
             );
             let ki = self
@@ -16844,16 +17351,17 @@ impl FnLowerer<'_> {
             });
         }
 
-        // scalars[k] = the k-th loop-invariant f32 (a param/outer local, a stride-0 read, or a
-        // literal). At least one slot so the pointer is always valid even with no scalars.
+        // scalars[k] = the k-th loop-invariant value of the lane type (a param/outer local, a
+        // stride-0 read, or a literal). At least one slot so the pointer is always valid even with
+        // no scalars.
         let scalars = self.builder.alloca(MirType::Array(
-            Box::new(MirType::F32),
+            Box::new(elem.clone()),
             recipe.scalars.len().max(1) as u32,
         ));
         for (k, sexpr) in recipe.scalars.iter().enumerate() {
             let sv0 = self.lower_expr(sexpr);
             let sty = self.expr_mir(sexpr);
-            let sv = self.coerce_to(sv0, &sty, &MirType::F32, true);
+            let sv = self.coerce_to(sv0, &sty, &elem, self.signed(sexpr));
             let ki = self
                 .builder
                 .build(MirType::I64, Op::ConstInt(k as i128, MirType::I64));
@@ -16862,7 +17370,7 @@ impl FnLowerer<'_> {
                 Op::Gep {
                     ptr: scalars,
                     index: ki,
-                    elem: MirType::F32,
+                    elem: elem.clone(),
                 },
             );
             self.builder.build_void(Op::Store {
@@ -16870,6 +17378,27 @@ impl FnLowerer<'_> {
                 value: sv,
             });
         }
+        (n, ptrs, scalars)
+    }
+
+    /// Emit the 256-bit path: register `kern`, marshal the stream base pointers and invariant
+    /// scalars onto the stack, call the kernel over the multiple-of-lanes vector part `[s, s+n)` of
+    /// `[s, vec_end)`, then run the ordinary scalar loop over the tail `[s+n, end)`.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_veckernel_for(
+        &mut self,
+        j: Symbol,
+        s0: ValueId,
+        vec_end: ValueId,
+        end_v: ValueId,
+        ity: &MirType,
+        kern: VecKernel,
+        recipe: &VecRecipe,
+        body: &Block,
+    ) {
+        let lane = kern.lane;
+        let kidx = self.builder.add_vec_kernel(kern);
+        let (n, ptrs, scalars) = self.marshal_vec_kernel(j, s0, vec_end, ity, recipe, lane);
 
         self.builder.build_void(Op::VecKernelCall {
             kernel: kidx,
@@ -16906,31 +17435,40 @@ impl FnLowerer<'_> {
         lane: &MirType,
         w: u32,
         body: &Block,
+        known_trip: Option<u64>,
     ) {
         // First try the true 256-bit AVX2 path: capture the body as a flat `VecKernel` recipe and
-        // run it over the multiple-of-8 vector part, with a scalar tail. Only the f32 arithmetic
-        // subset the raw-AVX2 assembler covers is eligible; anything else (other lanes, a
-        // transcendental, too many streams/registers) falls through to the 128-bit CLIF strips
-        // below. Elementwise ⇒ each lane is the same f32 op order as scalar, so no reassociation:
-        // the kernel is bit-exact to the tail element-for-element, and the interp marshals the same
-        // recipe as the oracle. `WUKONG_P4_NO_256` forces the 128-bit path — a same-run A/B knob for
-        // measuring the 256-bit win, and a kill-switch should a body ever be found miscompiled.
+        // run it over the multiple-of-lanes vector part, with a scalar tail. Every lane type the
+        // raw-AVX2 assembler covers is eligible — f32 and f64, and the wrapping i32/i64 lanes —
+        // with the arithmetic subset it covers; anything else (another lane type, a transcendental,
+        // too many streams or registers) falls through to the 128-bit CLIF strips below.
+        // Elementwise ⇒ each lane is the same op order as scalar, so no reassociation: the kernel is
+        // bit-exact to the tail element-for-element, and the interp marshals the same recipe as the
+        // oracle. `WUKONG_P4_NO_256` forces the 128-bit path — a same-run A/B knob for measuring
+        // the 256-bit win, and a kill-switch should a body ever be found miscompiled.
         //
-        // `host_supports_vec_kernels()` is the same predicate `avx2::assemble_kernel` refuses on
-        // (single-sourced in `wukong_mir`), and it gates *building* the recipe for the same reason
-        // the kill-switch does: the emitted bytes hardcode the Win64 argument registers, so on any
-        // other host there is nothing to lower to. Without this test a Linux/macOS build attached a
-        // recipe the backend could never assemble and `populate_module` failed the entire compile
-        // ("avx2 assemble vec kernel 0.0: avx2: host lacks AVX2+FMA3 under the Win64 ABI these
-        // kernels encode") — declining here is the documented, result-identical 128-bit fallback.
-        if *lane == MirType::F32
-            && self.gemm.vec_kernels
-            && host_supports_vec_kernels()
-            && std::env::var_os("WUKONG_P4_NO_256").is_none()
-        {
-            if let Some(recipe) = self.build_vec_recipe(body, j) {
+        // A compile-time trip below one full register group would call the kernel with `n = 0`,
+        // so it keeps the inlined strips (`vec256_elementwise_min_trip`). A runtime trip takes the
+        // kernel: its cost is one call per loop, and the loops whose extent is only known at run
+        // time are the large ones.
+        let vlane = wukong_mir::VecLane::of(lane);
+        let big_enough = match (vlane, known_trip) {
+            (Some(vl), Some(t)) => t >= vec256_elementwise_min_trip(vl),
+            _ => true,
+        };
+        // Both vector forms stop short of an out-of-bounds slice access or an overlap between a
+        // written runtime-sized stream and another stream (`vector_guarded_end`); the scalar
+        // remainder always runs to the real end.
+        let mut accesses: Vec<IndexAccess> = Vec::new();
+        for st in &body.stmts {
+            collect_stmt_index_accesses(st, &mut accesses);
+        }
+        let vec_end = self.vector_guarded_end(j, s0, end_v, ity, &accesses);
+        if let (Some(vl), true, true) = (vlane, big_enough, self.wide_kernels_enabled()) {
+            if let Some(recipe) = self.build_vec_recipe(body, j, vl) {
                 let kern = VecKernel {
                     name: self.builder.func_name(),
+                    lane: vl,
                     streams: recipe.streams.len() as u32,
                     scalars: recipe.scalars.len() as u32,
                     ops: recipe.ops.clone(),
@@ -16938,7 +17476,7 @@ impl FnLowerer<'_> {
                     reduce: None,
                 };
                 if kern.pressure().is_some_and(|p| p.fits()) {
-                    self.emit_veckernel_for(j, s0, end_v, ity, kern, &recipe, body);
+                    self.emit_veckernel_for(j, s0, vec_end, end_v, ity, kern, &recipe, body);
                     return;
                 }
             }
@@ -16956,8 +17494,8 @@ impl FnLowerer<'_> {
         self.push_scope();
         self.bind(j, slot, ity.clone());
 
-        self.emit_vector_strip(j, slot, jtmp, end_v, ity, lane, &vty, w, VEC_UNROLL, body);
-        self.emit_vector_strip(j, slot, jtmp, end_v, ity, lane, &vty, w, 1, body);
+        self.emit_vector_strip(j, slot, jtmp, vec_end, ity, lane, &vty, w, VEC_UNROLL, body);
+        self.emit_vector_strip(j, slot, jtmp, vec_end, ity, lane, &vty, w, 1, body);
         self.emit_scalar_tail(j, slot, end_v, ity, body);
 
         self.pop_scope();
@@ -17110,21 +17648,21 @@ impl FnLowerer<'_> {
         self.terminated = false;
     }
 
-    /// Build a reduction recipe from a single addend expression (no store): the flat op body plus its
-    /// stream/scalar sources, and the value index of the addend (the op folded into the accumulator).
-    /// `None` if the addend isn't an f32 recipe or has no stream (a pure-scalar "reduction" is silly).
     /// Build the recipe for a reduction addend. Returns `(recipe, value, fma)`: `fma = Some((X, Y))`
-    /// when `fuse_mul` (an `Add` reduction) and the addend is a product `X*Y` — the product op is *not*
-    /// emitted, and the fold becomes `acc = fma(X, Y, acc)` (matching the 128-bit path's fused
-    /// accumulate: one op, one rounding, one fewer live register). Otherwise `fma = None` and the fold
-    /// reads `value` directly.
+    /// when `fuse_mul` (a float `Add` reduction) and the addend is a product `X*Y` — the product op
+    /// is *not* emitted, and the fold becomes `acc = fma(X, Y, acc)` (matching the 128-bit path's
+    /// fused accumulate: one op, one rounding, one fewer live register). Otherwise `fma = None` and
+    /// the fold reads `value` directly. `None` if the addend isn't a recipe of lane type `lane` or has
+    /// no stream (a pure-scalar "reduction" is silly).
     fn build_reduce_recipe<'b>(
         &self,
         addend: &'b Expr,
         j: Symbol,
         fuse_mul: bool,
+        lane: wukong_mir::VecLane,
     ) -> Option<(VecRecipe<'b>, u32, Option<(u32, u32)>)> {
         let fresh = || VecRecipe {
+            lane,
             ops: Vec::new(),
             streams: Vec::new(),
             scalars: Vec::new(),
@@ -17168,22 +17706,27 @@ impl FnLowerer<'_> {
         Some((r, value, None))
     }
 
-    /// Prepare the reduction's logical eight-lane partition independently of the selected ISA.
-    /// Register pressure can reduce U, so both widths must consume this exact recipe/plan.
+    /// The 256-bit reduction recipe for `addend` over lane type `lane`, if the AVX2 emitter can run
+    /// it: expressible in the recipe vocabulary, and one register bank plus the canonical tree's
+    /// `VEC_UNROLL` accumulators fit ([`VecKernel::reduction_fits`]). The tree itself does not depend
+    /// on this answer — the portable lowering computes the same one — only the instruction form.
     fn prepare_reduction<'b>(
         &self,
         addend: &'b Expr,
         j: Symbol,
         redop: RedOp,
+        lane: wukong_mir::VecLane,
     ) -> Option<(VecRecipe<'b>, VecKernel)> {
         let op = match redop {
             RedOp::Add => VecRedOp::Add,
             RedOp::Fmax => VecRedOp::Fmax,
             RedOp::Fmin => VecRedOp::Fmin,
         };
-        let (recipe, value, fma) = self.build_reduce_recipe(addend, j, redop == RedOp::Add)?;
+        let fuse = redop == RedOp::Add && lane.is_float();
+        let (recipe, value, fma) = self.build_reduce_recipe(addend, j, fuse, lane)?;
         let kern = VecKernel {
             name: self.builder.func_name(),
+            lane,
             streams: recipe.streams.len() as u32,
             scalars: recipe.scalars.len() as u32,
             ops: recipe.ops.clone(),
@@ -17194,15 +17737,16 @@ impl FnLowerer<'_> {
     }
 
     /// Emit the 256-bit AVX2 reduction path for `s <fold>= addend` over `[s0, end)`: fold the addend
-    /// across 8-wide lane accumulators (kernel), combine with the initial `s`, then a scalar tail.
-    /// The caller has prepared a fitting recipe shared with the portable partition. Both backends run
-    /// `eval_reduction`'s exact grouping; the initial-`s` combine and the tail reuse the same
-    /// `fold` the 128-bit path uses, preserving the arithmetic across widths and backends.
+    /// across the canonical tree's lane accumulators (kernel), combine with the initial `s`, then a
+    /// scalar tail. Both backends run `eval_reduction`'s exact grouping; the initial-`s` combine and
+    /// the tail reuse the same `fold` the portable path uses, preserving the arithmetic across widths
+    /// and backends.
     #[allow(clippy::too_many_arguments)]
     fn emit_reduction_256(
         &mut self,
         j: Symbol,
         s0: ValueId,
+        vec_end: ValueId,
         end_v: ValueId,
         ity: &MirType,
         s_sym: Symbol,
@@ -17211,113 +17755,14 @@ impl FnLowerer<'_> {
         recipe: VecRecipe<'_>,
         kern: VecKernel,
     ) {
+        let lane = kern.lane;
         let kidx = self.builder.add_vec_kernel(kern);
+        let (n, ptrs, scalars) = self.marshal_vec_kernel(j, s0, vec_end, ity, &recipe, lane);
 
-        // n = largest multiple of 8 ≤ trip count (0 if under 8 / negative), like the elementwise path.
-        let s64 = self.coerce_to(s0, ity, &MirType::I64, true);
-        let e64 = self.coerce_to(end_v, ity, &MirType::I64, true);
-        let trip = self
-            .builder
-            .build(MirType::I64, Op::Bin(BinOp::Sub, e64, s64));
-        let neg8 = self
-            .builder
-            .build(MirType::I64, Op::ConstInt(-8, MirType::I64));
-        let masked = self
-            .builder
-            .build(MirType::I64, Op::Bin(BinOp::And, trip, neg8));
-        let eight = self
-            .builder
-            .build(MirType::I64, Op::ConstInt(8, MirType::I64));
-        let lt8 = self
-            .builder
-            .build(MirType::I1, Op::Cmp(CmpOp::Slt, trip, eight));
-        let empty = self
-            .builder
-            .build(MirType::I1, Op::Cmp(CmpOp::Sge, s64, e64));
-        let skip = self
-            .builder
-            .build(MirType::I1, Op::Bin(BinOp::Or, lt8, empty));
-        let zero = self
-            .builder
-            .build(MirType::I64, Op::ConstInt(0, MirType::I64));
-        let n = self
-            .builder
-            .build(MirType::I64, Op::Select(skip, zero, masked));
-
-        // Bind j to a start slot so the stream index expressions and scalar sources lower cleanly.
-        let jslot = self.builder.alloca(ity.clone());
-        self.builder.build_void(Op::Store {
-            ptr: jslot,
-            value: s0,
-        });
-        self.push_scope();
-        self.bind(j, jslot, ity.clone());
-
-        // ptrs[k] = &base_k[start + offset_k]; scalars[k] = the k-th invariant f32 (as the elementwise
-        // emitter does).
-        let ptrs = self.builder.alloca(MirType::Array(
-            Box::new(MirType::Ptr),
-            recipe.streams.len() as u32,
-        ));
-        for (k, (base_sym, idx_expr)) in recipe.streams.iter().enumerate() {
-            let base = self.lookup(*base_sym).expect("stream base in scope").0;
-            let idxv = self.lower_expr(idx_expr);
-            let idx_ty = self.operand_mir(idxv, idx_expr);
-            // Match scalar indexing's explicit source-signedness extension before pointer
-            // arithmetic; raw narrow MIR indexes no longer carry that signedness.
-            let idx64 = self.coerce_to(idxv, &idx_ty, &MirType::I64, self.signed(idx_expr));
-            let sp = self.builder.build(
-                MirType::Ptr,
-                Op::Gep {
-                    ptr: base,
-                    index: idx64,
-                    elem: MirType::F32,
-                },
-            );
-            let ki = self
-                .builder
-                .build(MirType::I64, Op::ConstInt(k as i128, MirType::I64));
-            let dst = self.builder.build(
-                MirType::Ptr,
-                Op::Gep {
-                    ptr: ptrs,
-                    index: ki,
-                    elem: MirType::Ptr,
-                },
-            );
-            self.builder.build_void(Op::Store {
-                ptr: dst,
-                value: sp,
-            });
-        }
-        let scalars = self.builder.alloca(MirType::Array(
-            Box::new(MirType::F32),
-            recipe.scalars.len().max(1) as u32,
-        ));
-        for (k, sexpr) in recipe.scalars.iter().enumerate() {
-            let sv0 = self.lower_expr(sexpr);
-            let sty = self.expr_mir(sexpr);
-            let sv = self.coerce_to(sv0, &sty, &MirType::F32, true);
-            let ki = self
-                .builder
-                .build(MirType::I64, Op::ConstInt(k as i128, MirType::I64));
-            let dst = self.builder.build(
-                MirType::Ptr,
-                Op::Gep {
-                    ptr: scalars,
-                    index: ki,
-                    elem: MirType::F32,
-                },
-            );
-            self.builder.build_void(Op::Store {
-                ptr: dst,
-                value: sv,
-            });
-        }
-
-        // The kernel returns the horizontal fold of the addends over `[start, start+n)`.
+        // The kernel returns the horizontal fold of the addends over `[start, start+n)`, in the lane
+        // type — which `reduction_of` requires to equal the accumulator's.
         let r = self.builder.build(
-            MirType::F32,
+            lane.mir_type(),
             Op::VecKernelCall {
                 kernel: kidx,
                 ptrs,
@@ -17328,8 +17773,6 @@ impl FnLowerer<'_> {
 
         // Combine with the accumulator's initial value: `s = fold(s, r)` — the same fold the loop and
         // tail use, so max/min operand order and NaN behavior match the kernel's horizontal reduce.
-        // `reduction_of` requires the accumulator type to equal the lane type (f32 here), so `s_ty`
-        // is f32 and the kernel's f32 result needs no coercion.
         let (s_slot, s_ty) = self.lookup(s_sym).expect("reduction var in scope");
         let s_init = self
             .builder
@@ -17337,6 +17780,9 @@ impl FnLowerer<'_> {
         let combined = self.reduce_combine_scalar(redop, &s_ty, s_init, r);
         // With no complete vector group there is no reduction result to combine. Folding the
         // identity first can change a signed-zero or NaN seed before the scalar-only tail.
+        let zero = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(0, MirType::I64));
         let no_groups = self.builder.build(MirType::I1, Op::Cmp(CmpOp::Eq, n, zero));
         let combined = self
             .builder
@@ -17361,9 +17807,17 @@ impl FnLowerer<'_> {
         self.pop_scope();
     }
 
-    /// Emit a vectorized float reduction over `[s0, end)`. Fitting f32 recipes use the same
-    /// pressure-limited eight-lane accumulator partition at both widths, followed by one seed fold
-    /// and a scalar remainder. Other reductions retain their existing lane-width/unroll policy.
+    /// Emit a vectorized reduction over `[s0, end)` along the canonical tree of
+    /// `wukong_mir::vec_kernel` — `VEC_UNROLL` logical accumulators of one 256-bit register's lanes,
+    /// cleanup groups into accumulator 0, accumulator-order then lane-order folds, one seed combine,
+    /// a scalar tail. Every lane type and every addend uses that one tree, so the result is a pure
+    /// function of the program: the host ISA, `WUKONG_P4_NO_256`, the lowering option, whether the
+    /// trip is a literal, and the addend's register pressure choose only the instruction form.
+    ///
+    /// The form is the raw-AVX2 kernel when the recipe fits and the trip is large enough to repay
+    /// the out-of-line call (`VEC256_REDUCTION_MIN_TRIP`): decided statically for a literal trip,
+    /// and by a run-time trip test — one compare in front of both lowerings — for a runtime one, the
+    /// shape every `fn k(a: []f32, n: i64)` kernel has. Otherwise it is the portable 128-bit form.
     /// This permitted reassociation creates independent accumulator chains; it does not promise
     /// the result of a strict left-to-right scalar fold.
     #[allow(clippy::too_many_arguments)]
@@ -17380,29 +17834,92 @@ impl FnLowerer<'_> {
         redop: RedOp,
         known_trip: Option<u64>,
     ) {
-        // Choose the arithmetic partition before the ISA/ABI/trip/kill-switch gate. Portable CLIF
-        // represents each logical eight-lane accumulator with two four-lane vectors; it must also
-        // match the pressure-limited U, cleanup groups and final fold order of the raw wide kernel.
-        let prepared = if *lane == MirType::F32 && w == 4 {
-            self.prepare_reduction(addend, j, redop)
-        } else {
-            None
+        // Both vector forms stop short of an out-of-bounds slice access (`vector_guarded_end`; a
+        // reduction writes nothing, so there is no overlap to test); the scalar remainder always
+        // runs to the real end.
+        let mut accesses: Vec<IndexAccess> = Vec::new();
+        collect_index_accesses(addend, false, &mut accesses);
+        let vec_end = self.vector_guarded_end(j, s0, end_v, ity, &accesses);
+        let prepared = match wukong_mir::VecLane::of(lane) {
+            Some(vl) if self.wide_kernels_enabled() => self.prepare_reduction(addend, j, redop, vl),
+            _ => None,
         };
-        let logical_unroll = prepared.as_ref().map(|(_, kern)| kern.reduction_unroll());
-        let trip_ok = known_trip.is_some_and(|t| t >= VEC256_REDUCTION_MIN_TRIP);
-        if trip_ok
-            && *lane == MirType::F32
-            && self.gemm.vec_kernels
-            && host_supports_vec_kernels()
-            && std::env::var_os("WUKONG_P4_NO_256").is_none()
-        {
-            if let Some((recipe, kern)) = prepared {
-                self.emit_reduction_256(j, s0, end_v, ity, s_sym, addend, redop, recipe, kern);
-                return;
+        if let Some((recipe, kern)) = prepared {
+            match known_trip {
+                Some(t) if t >= VEC256_REDUCTION_MIN_TRIP => {
+                    self.emit_reduction_256(
+                        j, s0, vec_end, end_v, ity, s_sym, addend, redop, recipe, kern,
+                    );
+                    return;
+                }
+                // A literal trip below the crossover: the inlined form, statically.
+                Some(_) => {}
+                // A runtime trip: test it once and take the matching form. Both arms compute the
+                // canonical tree, so the branch selects speed, never the answer.
+                None => {
+                    let s64 = self.coerce_to(s0, ity, &MirType::I64, true);
+                    let e64 = self.coerce_to(vec_end, ity, &MirType::I64, true);
+                    let trip = self
+                        .builder
+                        .build(MirType::I64, Op::Bin(BinOp::Sub, e64, s64));
+                    let min = self.builder.build(
+                        MirType::I64,
+                        Op::ConstInt(i128::from(VEC256_REDUCTION_MIN_TRIP), MirType::I64),
+                    );
+                    let big = self
+                        .builder
+                        .build(MirType::I1, Op::Cmp(CmpOp::Sge, trip, min));
+                    let wide = self.builder.new_block();
+                    let narrow = self.builder.new_block();
+                    let join = self.builder.new_block();
+                    self.builder.cond_br(big, wide, vec![], narrow, vec![]);
+
+                    self.builder.switch_to(wide);
+                    self.terminated = false;
+                    self.emit_reduction_256(
+                        j, s0, vec_end, end_v, ity, s_sym, addend, redop, recipe, kern,
+                    );
+                    self.builder.br(join, vec![]);
+
+                    self.builder.switch_to(narrow);
+                    self.terminated = false;
+                    self.emit_reduction_portable(
+                        j, s0, vec_end, end_v, ity, s_sym, addend, lane, w, redop,
+                    );
+                    self.builder.br(join, vec![]);
+
+                    self.builder.switch_to(join);
+                    self.terminated = false;
+                    return;
+                }
             }
         }
-        let halves = if logical_unroll.is_some() { 2 } else { 1 };
-        let unroll = logical_unroll.unwrap_or(VEC_UNROLL) * halves;
+        self.emit_reduction_portable(j, s0, vec_end, end_v, ity, s_sym, addend, lane, w, redop);
+    }
+
+    /// The portable (128-bit CLIF) form of the canonical reduction tree: each of the `VEC_UNROLL`
+    /// logical accumulators is a pair of `w`-lane vectors holding its low and high halves (a logical
+    /// accumulator spans one 256-bit register, `2w` lanes), so the main strip folds `2·VEC_UNROLL`
+    /// vectors per `VEC_UNROLL·2w` elements, the cleanup strip folds one `2w` group into accumulator
+    /// 0's pair, and [`Self::finish_portable_reduction`] reproduces the kernel's combine order.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_reduction_portable(
+        &mut self,
+        j: Symbol,
+        s0: ValueId,
+        vec_end: ValueId,
+        end_v: ValueId,
+        ity: &MirType,
+        s_sym: Symbol,
+        addend: &Expr,
+        lane: &MirType,
+        w: u32,
+        redop: RedOp,
+    ) {
+        // Two `w`-lane halves per logical accumulator: `2w` lanes is one YMM register of every lane
+        // type the vectorizer handles (`w = 16 / lane bytes`).
+        let halves = 2;
+        let unroll = VEC_UNROLL * halves;
         let vty = MirType::Vec(Box::new(lane.clone()), w);
         let slot = self.builder.alloca(ity.clone());
         self.builder.build_void(Op::Store {
@@ -17436,13 +17953,13 @@ impl FnLowerer<'_> {
         self.bind(j, slot, ity.clone());
 
         self.emit_reduction_strip(
-            j, slot, jtmp, end_v, ity, lane, &vty, w, unroll, &accs, addend, redop,
+            j, slot, jtmp, vec_end, ity, lane, &vty, w, unroll, &accs, addend, redop,
         );
         self.emit_reduction_strip(
             j,
             slot,
             jtmp,
-            end_v,
+            vec_end,
             ity,
             lane,
             &vty,
@@ -17452,65 +17969,17 @@ impl FnLowerer<'_> {
             addend,
             redop,
         );
-
-        if halves == 2 {
-            self.finish_portable_reduction_256(&accs, slot, s0, ity, s_sym, lane, &vty, redop);
-            self.emit_reduction_tail(j, slot, end_v, ity, s_sym, addend, redop);
-            self.pop_scope();
-            return;
-        }
-
-        // Combine the accumulators, then horizontally reduce the lanes into `s` with the same fold
-        // (sum / max / min) the loop body used.
-        let mut total = self
-            .builder
-            .build(vty.clone(), Op::Load(accs[0], vty.clone()));
-        for &a in &accs[1..] {
-            let v = self.builder.build(vty.clone(), Op::Load(a, vty.clone()));
-            total = self.reduce_combine_vec(redop, lane, &vty, w, total, v);
-        }
-        let scratch = self
-            .builder
-            .alloca(MirType::Array(Box::new(lane.clone()), w));
-        self.builder.build_void(Op::Store {
-            ptr: scratch,
-            value: total,
-        });
-        let (s_slot, s_ty) = self.lookup(s_sym).expect("reduction var in scope");
-        for k in 0..w {
-            let idxk = self
-                .builder
-                .build(MirType::I64, Op::ConstInt(k as i128, MirType::I64));
-            let addr = self.builder.build(
-                MirType::Ptr,
-                Op::Gep {
-                    ptr: scratch,
-                    index: idxk,
-                    elem: lane.clone(),
-                },
-            );
-            let lane_v = self
-                .builder
-                .build(lane.clone(), Op::Load(addr, lane.clone()));
-            let sv = self
-                .builder
-                .build(s_ty.clone(), Op::Load(s_slot, s_ty.clone()));
-            let sum = self.reduce_combine_scalar(redop, &s_ty, sv, lane_v);
-            self.builder.build_void(Op::Store {
-                ptr: s_slot,
-                value: sum,
-            });
-        }
-
+        self.finish_portable_reduction(&accs, slot, s0, ity, s_sym, lane, &vty, w, redop);
         self.emit_reduction_tail(j, slot, end_v, ity, s_sym, addend, redop);
         self.pop_scope();
     }
 
     /// Reconstruct the wide kernel's final fold without changing its operation/operand order.
     /// Pair 2u/2u+1 holds logical accumulator u's low/high halves. Combine corresponding halves
-    /// across u first, then fold lanes 0..7, then fold that result into the original scalar seed.
+    /// across u first, then fold lanes 0..2w, then fold that result into the original scalar seed —
+    /// unless no full group ran, in which case the seed is left exactly as it was.
     #[allow(clippy::too_many_arguments)]
-    fn finish_portable_reduction_256(
+    fn finish_portable_reduction(
         &mut self,
         accs: &[ValueId],
         index_slot: ValueId,
@@ -17519,22 +17988,25 @@ impl FnLowerer<'_> {
         s_sym: Symbol,
         lane: &MirType,
         vty: &MirType,
+        w: u32,
         redop: RedOp,
     ) {
+        let logical = 2 * w;
         let scratch = self
             .builder
-            .alloca(MirType::Array(Box::new(lane.clone()), 8));
+            .alloca(MirType::Array(Box::new(lane.clone()), logical));
         for half in 0..2 {
             let mut total = self
                 .builder
                 .build(vty.clone(), Op::Load(accs[half], vty.clone()));
             for &slot in accs.iter().skip(half + 2).step_by(2) {
                 let next = self.builder.build(vty.clone(), Op::Load(slot, vty.clone()));
-                total = self.reduce_combine_vec(redop, lane, vty, 4, total, next);
+                total = self.reduce_combine_vec(redop, lane, vty, w, total, next);
             }
-            let offset = self
-                .builder
-                .build(MirType::I64, Op::ConstInt((half * 4) as i128, MirType::I64));
+            let offset = self.builder.build(
+                MirType::I64,
+                Op::ConstInt(half as i128 * i128::from(w), MirType::I64),
+            );
             let addr = self.builder.build(
                 MirType::Ptr,
                 Op::Gep {
@@ -17551,10 +18023,10 @@ impl FnLowerer<'_> {
         let mut result = self
             .builder
             .build(lane.clone(), Op::Load(scratch, lane.clone()));
-        for k in 1..8 {
+        for k in 1..logical {
             let offset = self
                 .builder
-                .build(MirType::I64, Op::ConstInt(k, MirType::I64));
+                .build(MirType::I64, Op::ConstInt(i128::from(k), MirType::I64));
             let addr = self.builder.build(
                 MirType::Ptr,
                 Op::Gep {
@@ -18344,7 +18816,13 @@ impl FnLowerer<'_> {
     /// The element address `&base[index]` (a `gep` by the scalar index, reusing the loop index slot
     /// bound for `j`), used as the base of a vector load/store.
     fn vec_elem_addr(&mut self, base: &Expr, index: &Expr, lane: &MirType) -> ValueId {
-        let base_ptr = self.lower_expr(base);
+        // The DATA pointer (`vec_stream_base`): a `[]T` slice or a `Ptr`-bound tensor holds it one
+        // load away. A name with no binding in scope (a module-level `const` array) lowers as an
+        // expression, as before. LICM hoists the per-copy reload out of the loop.
+        let base_ptr = match single_path(base).and_then(|sym| self.vec_stream_base(sym)) {
+            Some(p) => p,
+            None => self.lower_expr(base),
+        };
         let idx = self.lower_expr(index);
         self.builder.build(
             MirType::Ptr,
@@ -18373,7 +18851,7 @@ impl FnLowerer<'_> {
 
         // SIMD-vectorize the per-thread chunk too, so `@parallel` kernels run vectorized on every
         // core (parallelism × SIMD), not scalar-per-core.
-        if self.try_vectorize_ranged(idx, start, end, &ity, body, true) {
+        if self.try_vectorize_ranged(idx, start, end, &ity, body, true, None) {
             return;
         }
 
@@ -18468,18 +18946,28 @@ impl FnLowerer<'_> {
             // unaffected.
             let zero = self.builder.build(ty.clone(), Op::ConstInt(0, ty.clone()));
             self.builder.build(MirType::I1, Op::Cmp(CmpOp::Ne, v, zero))
+        } else if ty == MirType::Ptr
+            && matches!(self.expr_ty(cond), Ty::Ptr { .. } | Ty::Ref { .. })
+        {
+            // A **pointer** condition (`if p`, `while p`, `p && q`) is a null test: `p != null`.
+            // This lowering was tried once and reverted (0900352) because the interpreter's first
+            // allocation lived at slot 0 and so read as null (`let p = &mut v; if p` printed 0
+            // there and 1 natively). The interpreter now reserves slot 0 as a never-allocated
+            // null (`wukong_interp::NULL_SLOT`), so `PtrToInt(p) == 0` holds on both backends for
+            // exactly the null pointer (`0 as *T`, a failed native allocation) and for nothing
+            // else. Before this the pointer reached `cond_br` unchanged and both backends rejected
+            // it with raw, unspanned verifier text.
+            let bits = self
+                .builder
+                .build(MirType::I64, Op::Cast(CastKind::PtrToInt, v, MirType::I64));
+            let zero = self
+                .builder
+                .build(MirType::I64, Op::ConstInt(0, MirType::I64));
+            self.builder
+                .build(MirType::I1, Op::Cmp(CmpOp::Ne, bits, zero))
         } else {
-            // NOTE: a **pointer** condition (`if p`) still falls through here unchanged and both
-            // backends reject it with raw verifier text and no span ("cond_br condition: v2 has
-            // type ptr but expected i1"). A `PtrToInt(p) != 0` lowering was tried and reverted: it
-            // is *silently wrong in the interpreter*, whose addresses are slot indices starting at
-            // 0, so the first pointer taken in a function has address 0 and reads as null. `let mut
-            // v: i32 = 7; let p = &mut v; if p` printed 0 under the interpreter and 1 natively —
-            // trading a loud ICE for a silent interp/native divergence, the worse failure. A
-            // correct lowering needs a null test the two backends genuinely share (a dedicated
-            // `IsNull` op, or the interpreter reserving address 0 as never-allocated), not a
-            // comparison on `PtrToInt`.
-
+            // Any other non-scalar condition is rejected by sema's `check_condition`; pass the
+            // value through so a path that slipped past it still fails loudly in the verifier.
             v
         }
     }
@@ -19062,14 +19550,22 @@ impl FnLowerer<'_> {
                 // For a slice `s[i]`, the GEP base is the slice's *data* pointer — loaded from the fat
                 // pointer's offset 0 — not the 16-byte fat-pointer buffer itself. An array/pointer base
                 // GEPs off its own base directly.
+                let mut slice_buf = None;
                 let base_ptr = if matches!(base_ty, Ty::Slice(_)) {
                     let sbuf = self.place_base_ptr(base);
+                    slice_buf = Some(sbuf);
                     let dp = self.field_ptr(sbuf, SLICE_PTR_OFF);
                     self.builder.build(MirType::Ptr, Op::Load(dp, MirType::Ptr))
                 } else {
                     self.place_base_ptr(base)
                 };
                 let idx = self.lower_index_i64(&indices[0]);
+                // A slice's length is in its own fat pointer: check `idx <u len` before the access
+                // (base, then index, then the check — the order Rust evaluates `s[i]` in). Arrays
+                // and constant-shape tensors are checked statically; see `bounds.rs`.
+                if let Some(sbuf) = slice_buf {
+                    self.emit_slice_bounds_check(sbuf, idx, e.span);
+                }
                 // Prefer the element type from the base's array/slice type; fall back to the indexed
                 // expression's own type (tensors/pointers). Resolve through the registry-aware
                 // `mir_ty_of` so a struct/tuple element becomes its byte-buffer `Array` type (the GEP
@@ -20594,8 +21090,38 @@ impl FnLowerer<'_> {
     /// fat pointer's data field and emits a void `wukong_rt_free(data)`. Both are opaque
     /// `Op::Call`s to the optimizer, which treats calls conservatively (no CSE/DSE/LICM across
     /// them), so allocation identity and stores into the allocation are preserved.
+    ///
+    /// The scratch family lowers the same way: `scratch_<T>(n)` is the identical slice construction
+    /// around `wukong_rt_scratch_alloc` (same ABI as `wukong_rt_alloc`), `scratch_mark()` is a
+    /// `wukong_rt_scratch_mark() -> i64` call and `scratch_release(m)` a void
+    /// `wukong_rt_scratch_release(m as i64)`. Opaque calls again, so nothing moves across them.
     fn lower_heap_builtin(&mut self, name: Symbol, args: &[Expr]) -> Option<ValueId> {
         let nm = self.interner.resolve(name);
+        if is_scratch_mark(nm) {
+            if !args.is_empty() {
+                return None;
+            }
+            let func = self.gemm.rt_scratch_mark;
+            return Some(
+                self.builder
+                    .build(MirType::I64, Op::Call { func, args: vec![] }),
+            );
+        }
+        if is_scratch_release(nm) {
+            if args.len() != 1 {
+                return None;
+            }
+            let mty = self.expr_mir(&args[0]);
+            let signed = self.signed(&args[0]);
+            let mv = self.lower_expr(&args[0]);
+            let mark = self.coerce_to(mv, &mty, &MirType::I64, signed);
+            let func = self.gemm.rt_scratch_release;
+            self.builder.build_void(Op::Call {
+                func,
+                args: vec![mark],
+            });
+            return Some(self.const_zero(MirType::I32));
+        }
         if nm == "free" {
             // Sema guarantees a single slice argument (E0401/E0503 otherwise); decline anything
             // else so the generic unsupported-call path reports it rather than miscompiling.
@@ -20612,7 +21138,10 @@ impl FnLowerer<'_> {
             });
             return Some(self.const_zero(MirType::I32));
         }
-        let elem = heap_alloc_elem(nm)?;
+        let (elem, func) = match heap_alloc_elem(nm) {
+            Some(elem) => (elem, self.gemm.rt_alloc),
+            None => (scratch_alloc_elem(nm)?, self.gemm.rt_scratch_alloc),
+        };
         if args.len() != 1 {
             return None;
         }
@@ -20639,7 +21168,6 @@ impl FnLowerer<'_> {
             MirType::I64,
             Op::ConstInt(elem.is_float() as i128, MirType::I64),
         );
-        let func = self.gemm.rt_alloc;
         let data = self.builder.build(
             MirType::Ptr,
             Op::Call {
@@ -30002,15 +30530,18 @@ fn lower_i8matmul_fn(
 }
 
 /// A captured recipe for the 256-bit AVX2 vectorizer (`build_vec_recipe`): the flat op body plus the
-/// AST sources of its streams and invariant scalars, which `emit_veckernel_for` lowers to base
-/// pointers and stored f32s. Borrows the loop body it was built from.
+/// AST sources of its streams and invariant scalars, which `marshal_vec_kernel` lowers to data
+/// pointers and stored lane-typed values. Borrows the loop body it was built from.
 struct VecRecipe<'b> {
+    /// The lane type every value of the recipe has (the kernel's `VecKernel::lane`).
+    lane: wukong_mir::VecLane,
     ops: Vec<VecOp>,
     /// `(base array symbol, index expr)` per stream, unit-stride in the loop var. Dedup'd, so a
     /// read and an in-place write at the same index share one stream.
     streams: Vec<(Symbol, &'b Expr)>,
-    /// Loop-invariant f32 source expressions (a param/outer-local path, a stride-0 array read, or a
-    /// numeric literal). Dedup'd by structure to keep the hoisted-register count small.
+    /// Loop-invariant source expressions of the lane type (a param/outer-local path, a stride-0
+    /// array read, or a numeric literal). Dedup'd by structure to keep the hoisted-register count
+    /// small.
     scalars: Vec<&'b Expr>,
     /// Load CSE / store-forward cache: stream index → the recipe value that currently holds its
     /// element. A repeated `a[i]` reuses one load (lower register pressure ⇒ more unroll), and a
@@ -30063,21 +30594,90 @@ const VEC_REG_BYTES: u32 = 16;
 /// reduction-style bodies (Horner, matmul accumulate). 4×f32x4 = 16 f32/iteration.
 const VEC_UNROLL: u32 = 4;
 
-/// Minimum (compile-time-known) trip count before a float reduction takes the 256-bit AVX2 kernel
-/// instead of the inlined 128-bit CLIF reduction. The 256-bit path is an *out-of-line call* (marshal
-/// stream pointers, save/restore callee-saved YMM halves, a horizontal-reduce tail) whose fixed
-/// per-invocation overhead the 128-bit inlined path avoids entirely. Measured same-run A/B (this
-/// laptop, compute-bound `a·(a²+b²)`): N=512 → 0.52×, N=1024 → ~0.9×, N=2048 → ~1.35×. The crossover
-/// for the worst (highest-register) bodies sits below 2048, so gating on a *known* trip ≥ this value
-/// guarantees the wider kernel only fires where it wins; unknown/small trips keep the 128-bit path and
-/// never regress. (Runtime-`N` reductions could be captured with a runtime trip guard branching to the
-/// two paths — deferred, as it would wrap the correctness-critical 128-bit lowering in new control
-/// flow.)
+/// Minimum trip count before a reduction takes the 256-bit AVX2 kernel instead of the inlined
+/// 128-bit CLIF form of the same canonical tree — tested statically for a literal trip, and at run
+/// time (one compare ahead of both forms) for a runtime one; the choice never changes the result.
+/// The 256-bit path is an *out-of-line call* (marshal stream pointers, save/restore callee-saved
+/// registers, a horizontal-reduce tail) whose fixed per-invocation overhead the inlined form avoids
+/// entirely. Measured same-run A/B (this laptop, compute-bound `a·(a²+b²)`): N=512 → 0.52×,
+/// N=1024 → ~0.9×, N=2048 → ~1.35×. The crossover for the worst (highest-register) bodies sits below
+/// 2048, so this value only takes the kernel where it wins. That measurement predates the shared
+/// canonical tree (under which the portable form keeps eight accumulator vectors) and covered one
+/// body; re-measuring the crossover per body and lane type is owed.
 const VEC256_REDUCTION_MIN_TRIP: u64 = 2048;
+
+/// Minimum compile-time-known trip before an elementwise loop takes the 256-bit AVX2 kernel: one
+/// full register of `lane`'s lanes (8 f32/i32, 4 f64/i64). Below it the kernel is called with
+/// `n = 0` and does nothing — the marshalled pointer table, the call, its prologue and `vzeroupper`
+/// are pure overhead in front of the scalar tail that does all the work — so the inlined 128-bit
+/// strips are kept. A structural bound (the kernel provably cannot run), not a measured crossover:
+/// where between one group and a few the call starts to pay is unmeasured, so trips at and above
+/// one group keep the kernel they always had. A runtime trip always takes the kernel.
+fn vec256_elementwise_min_trip(lane: wukong_mir::VecLane) -> u64 {
+    u64::from(lane.lanes())
+}
 
 /// Default signedness for a lane type (only affects integer div/rem op selection).
 fn lane_signed(lane: &MirType) -> bool {
     lane.is_int()
+}
+
+/// One single-index buffer access of a vectorizer-validated loop body: `(base, index, written)`.
+type IndexAccess<'e> = (&'e Expr, &'e Expr, bool);
+
+/// Every single-index `base[index]` access in a vectorizer-validated expression (the shapes
+/// `vec_check_value` admits: arithmetic, negation, if-conversion, intrinsic calls), as
+/// `(base, index, written)` triples in source order. `written` marks the access as the place an
+/// assignment stores to (only ever the top-level target); everything it contains is a read.
+fn collect_index_accesses<'e>(e: &'e Expr, written: bool, out: &mut Vec<IndexAccess<'e>>) {
+    match &e.kind {
+        ExprKind::Index { base, indices } => {
+            if indices.len() == 1 {
+                out.push((&**base, &indices[0], written));
+            }
+            for i in indices {
+                collect_index_accesses(i, false, out);
+            }
+        }
+        ExprKind::Binary { lhs, rhs, .. } => {
+            collect_index_accesses(lhs, false, out);
+            collect_index_accesses(rhs, false, out);
+        }
+        ExprKind::Unary { expr, .. } => collect_index_accesses(expr, false, out),
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            collect_index_accesses(cond, false, out);
+            if let Some(t) = block_value(then_branch) {
+                collect_index_accesses(t, false, out);
+            }
+            if let Some(v) = else_branch.as_deref().and_then(branch_value) {
+                collect_index_accesses(v, false, out);
+            }
+        }
+        ExprKind::Call { args, .. } => {
+            for a in args {
+                collect_index_accesses(a, false, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// [`collect_index_accesses`] over one statement of a vectorizer-validated loop body: a `let`
+/// initializer (read), or an assignment's target (written — a compound assign also reads it, at
+/// the same element) and value (read).
+fn collect_stmt_index_accesses<'e>(s: &'e Stmt, out: &mut Vec<IndexAccess<'e>>) {
+    match &s.kind {
+        StmtKind::Let { init: Some(e), .. } => collect_index_accesses(e, false, out),
+        StmtKind::Assign { target, value, .. } => {
+            collect_index_accesses(target, true, out);
+            collect_index_accesses(value, false, out);
+        }
+        _ => {}
+    }
 }
 
 /// The pure tail value of a braces-only block (`{ e }`), or `None` if it has statements.
@@ -30777,6 +31377,28 @@ mod tests {
 
     fn prog_calls(prog: &Program, interner: &Interner, callee: &str) -> bool {
         prog.funcs.iter().any(|f| fn_calls(f, interner, callee))
+    }
+
+    /// The consumer of `@unchecked`: a slice access is lowered with its bounds check (a failure edge
+    /// calling `wukong_rt_bounds_fail`) by default, and without one in a function carrying the
+    /// attribute -- and only in that function. A `tests/run` fixture cannot witness this (an
+    /// in-range access prints the same either way), so the lowered MIR is the evidence.
+    #[test]
+    fn unchecked_removes_slice_bounds_checks_from_its_own_function_only() {
+        let (prog, diags, mut interner) = lower(
+            "fn checked(s: []i32, i: i64) -> i32 { return s[i]; }
+             @unchecked
+             fn raw(s: []i32, i: i64) -> i32 { return s[i]; }
+             fn main() -> i32 { let a: [i32; 2] = [3, 4]; return checked(a, 1) + raw(a, 0); }",
+        );
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        let checked = prog.function(interner.intern("checked")).unwrap();
+        let raw = prog.function(interner.intern("raw")).unwrap();
+        assert!(fn_calls(checked, &interner, "wukong_rt_bounds_fail"));
+        assert!(!fn_calls(raw, &interner, "wukong_rt_bounds_fail"));
+        for f in &prog.funcs {
+            assert!(verify_function(f).is_empty(), "{:?}", verify_function(f));
+        }
     }
 
     /// [`lower`] with explicit [`LowerOptions`].
