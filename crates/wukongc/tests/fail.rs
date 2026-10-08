@@ -33,14 +33,37 @@ fn expected_code(src: &str) -> String {
     panic!("fixture is missing an `// EXPECT-CODE:` directive");
 }
 
+/// The stage a fixture compiles to: `mir` (sema + lowering) unless the fixture names a later one
+/// with `// EMIT: <stage>`. A backend diagnostic exists only in the backend that imposes it - the
+/// native layout limit `C0002` is raised by Cranelift, which `--emit=mir` never reaches.
+fn emit_stage(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|src| {
+            src.lines().find_map(|l| {
+                l.trim_start()
+                    .strip_prefix("// EMIT:")
+                    .map(|s| s.trim().to_string())
+            })
+        })
+        .unwrap_or_else(|| "mir".to_string())
+}
+
 /// Compile `path` with the JSON diagnostic renderer; returns (succeeded, stderr).
 fn compile_json(path: &Path) -> (bool, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_wukongc"))
-        .arg("--error-format=json")
-        .arg("--emit=mir")
-        .arg(path)
-        .output()
-        .expect("spawn wukongc");
+    let stage = emit_stage(path);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_wukongc"));
+    cmd.arg("--error-format=json")
+        .arg(format!("--emit={stage}"))
+        .arg(path);
+    if stage == "obj" || stage == "exe" {
+        // A fixture that unexpectedly compiles must not drop an artifact into the source tree.
+        let stem = path.file_stem().unwrap().to_string_lossy();
+        cmd.arg("-o").arg(
+            std::env::temp_dir().join(format!("wukongc_fail_{}_{stem}.out", std::process::id())),
+        );
+    }
+    let out = cmd.output().expect("spawn wukongc");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stderr).into_owned(),

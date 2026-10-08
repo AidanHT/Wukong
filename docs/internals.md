@@ -123,7 +123,10 @@ prints its artifact on stdout except `--emit=obj` and `--emit=exe`, which write 
 Two combinations are usage errors rather than silently discarded work: `--run` with an explicit
 `--emit=<stage>` (the driver honours exactly one), and `-o` with `--run` or with any stage other than
 `obj`/`exe`. Diagnostics from every stage flow through a single `emit_diag` honoring
-`--error-format`.
+`--error-format` — including native-backend failures, which `wukong_codegen_cranelift::classify_error`
+maps to `C0002` (a layout above 4 GiB), `C0001` (a by-design decline) or an internal-compiler-error
+diagnostic. `--target-cpu` fixes the Cranelift ISA level for `--emit=obj|exe` and the native JIT and,
+below x86-64-v3, builds the MIR without the raw-AVX2 recipes (`LowerOptions::vec_kernels`).
 
 `--emit=tokens` and `--emit=ast` return *before* import loading, so they show the root file only;
 every later stage — and `--run` — sees the merged program. A verifier failure is an internal compiler
@@ -1274,11 +1277,16 @@ measurement reports retain the corpus sizes used for those runs.
   compile-fail corpus. Stated limit: the seed mechanism only bites std `HashMap`/`HashSet`; the
   optimizer's FxHash maps have a fixed seed, so these gates say nothing about insertion-order dependence
   there.
-- **AOT executables** (`crates/wukongc/tests/exe.rs`): curated fixtures are linked with `--emit=exe` and
+- **AOT executables** (`crates/wukongc/tests/exe.rs`): curated fixtures (including
+  `print_float_display.wk`, which pins how every float prints) are linked with `--emit=exe` and
   their stdout/exit compared against `--run`, extending the differential gate to the linked exe (string
-  `.rodata` and the linked `wukong_runtime` kernels). The gate probes once which link path exists on the
-  box and may skip only when neither does; a failure of the compiler's own link is reported with its
-  captured stderr. **Run it under `--release` as well as the default profile** — the two profiles hand
+  `.rodata` and the linked `wukong_runtime` kernels). `exe_matches_run_on_a_corpus_slice` does the same
+  for every 8th corpus fixture in parallel (`WUKONG_EXE_CORPUS=all` for the whole corpus), skipping only
+  documented declines (the native JIT cannot compile it either; on the C fallback, it needs a
+  `wukong_*` kernel) and failing if they exceed 10% on the rustc path, and
+  `cc_fallback_discovered_from_the_cli_matches_run` reaches the C fallback through a copied `wukongc`
+  with no runtime rlib. The gate probes once which link path exists on the box and may skip only when
+  neither does; a failure of the compiler's own link is reported with its captured stderr. **Run it under `--release` as well as the default profile** — the two profiles hand
   the linker archives of different shapes (see the bitcode/LTO paragraph in *Native backend* above), so
   a green debug run says nothing about release; `cargo test -p wukongc --release --test exe` is the only
   gate that has ever exercised the release AOT link, and it is minutes of wall time because each fixture

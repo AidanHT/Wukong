@@ -15,20 +15,27 @@ deliberately *not* retried with `cc`, so a real link bug is never swallowed. For
 by the C fallback, inability to run either linker produces exit 2 (`UNIMPLEMENTED`) and attempts
 to preserve the object. A linker that runs and fails to link produces exit 1.
 
-The `cc` fallback provides integer/bool printing, assertions, float remainder, heap operations and
-scalar trigonometry. Float printing requires the Rust link path: when that path is unavailable,
-the driver rejects float-printing programs with exit 2 before invoking the C linker. Float
-computation that prints integer results remains supported, and `--emit=obj` remains available.
-The C runtime has no string printer or recognized `wukong_*` microkernels, and MSVC-object data
-relocations can also prevent linking. The preferred rustc path formats floats through Rust's
-`Display` and links `wukong_runtime`. To run with zero external toolchain, use the interpreter:
+The `cc` fallback provides integer, bool, float and string printing, assertions, float remainder,
+heap operations and scalar trigonometry, and its output is byte-identical to `--run`: floats are
+printed exactly as the interpreter's Rust `Display` prints them (the shortest decimal that
+round-trips, written positionally, with `inf`/`-inf`/`NaN`/`-0`), derived in C from correctly rounded
+`%e` conversions checked with `strtod`, not approximated with `%g`. What the C runtime cannot
+provide is the recognized `wukong_*` microkernels — a program that calls one fails to link (loudly,
+with a `note:` naming the fallback), and on Windows the MinGW linker also cannot consume an MSVC
+object's data relocations (string literals). The preferred rustc path links `wukong_runtime` and has
+neither limitation. To run with zero external toolchain, use the interpreter:
 `wukongc --run program.wk`.
 
 Scalar sine/cosine use the same bounded polynomial and explicit FMA operations in the Rust and
 C runtimes; arguments with magnitude at least 4096 use the platform's full-range `sinf`/`cosf`.
 The C link command disables implicit FP contraction so the polynomial's separate operations
-retain their rounding. Tangent remains the quotient of the shared sine and cosine. This does
-not change the C fallback's float-printing limitation described above.
+retain their rounding. Tangent remains the quotient of the shared sine and cosine.
+
+`--target-cpu=<native|x86-64|x86-64-v2|x86-64-v3|x86-64-v4>` selects the instruction-set level of the
+object (default `native`, every feature of the compiling host). A named level is exact and
+host-independent, and below `x86-64-v3` the general vectorizer's raw-AVX2 loop kernels are not used,
+so `--emit=exe --target-cpu=x86-64` runs on any x86-64 CPU; the linked runtime kernels already pick
+their AVX2 path at run time.
 
 LLVM enters **only** through `--emit=llvm-ir`, which prints **textual LLVM IR** for inspection — and
 even that needs no LLVM installed (it is just text on stdout):
@@ -40,6 +47,33 @@ wukongc --emit=llvm-ir -O2 examples/fib.wk    # print textual LLVM IR
 The only reason to install LLVM is to take that emitted textual IR and compile it yourself with an
 external `clang`/`llc`, or to build a future in-process `inkwell` backend. Neither is required for
 `--run`, `--backend=native`, `--emit=obj`, or `--emit=exe`.
+
+### What the emitted module means
+
+The module implements the interpreter's language, not LLVM's defaults:
+
+- float `!=` is the unordered `fcmp une` (NaN `!=` NaN is true); integer division and remainder by
+  zero produce 0 and `INT_MIN / -1` wraps; shift counts are masked to the operand width — each is
+  an explicit guard, because LLVM makes all three poison;
+- `f16`/`bf16` values are computed in `float` registers and rounded onto the half/bfloat grid only
+  at constants, `fpext`/`fptrunc`, loads and stores (the interpreter's round-at-store/cast/load
+  model) — so `half`/`bfloat` appear only as memory types;
+- booleans occupy a byte in memory (`i8` storage, low bit significant), never LLVM's bit-packed
+  `<n x i1>`;
+- float literals are spelled in LLVM's exact hexadecimal form, so infinities, NaNs, tiny values and
+  decimals that are inexact in `float` are all valid IR.
+
+It names the host `target triple` (the layout is left to the consuming tool, which installs the
+target's own `datalayout`). Every external symbol it references is one the `--emit=exe` link already
+provides: `print`/`println`/`assert` lower to the same `wukong_rt_print_{i64,u64,f64,str}` /
+`wukong_rt_assert` ABI the Cranelift object calls (with the same argument widening), recognized
+kernels are called through the `wukong_runtime` C ABI (every integer argument widened to `i64`, an
+absent optional pointer passed as `ptr null`), and the general vectorizer's synthesized kernels — raw
+AVX2 bytes inside the Cranelift backend — are **defined in the module** from their backend-agnostic
+recipe, with the interpreter's exact element order and reduction reassociation. A construct that
+cannot be expressed faithfully (a `print` of a vector value, a bitcast to or from `f16`/`bf16`, two
+incompatible signatures for one external symbol) is refused with `C0001` and exit 2 rather than
+emitted wrong.
 
 ## Why textual IR (and not inkwell in-process)
 
@@ -66,8 +100,13 @@ this):
 
 ```sh
 wukongc --emit=llvm-ir -O2 examples/fib.wk > fib.ll   # textual IR
-clang fib.ll ...                                        # compile with your LLVM tools
+clang -c -O2 fib.ll -o fib.o                            # compile with your LLVM tools
 ```
+
+`fib.o` then links exactly like the object `--emit=obj` writes: its only external symbols are the
+`wukong_rt_*` print/assert shims and the `wukong_*` runtime kernels, which the `--emit=exe` link
+supplies (the rustc-driven shim plus the `wukong_runtime` rlib, or the C runtime for a kernel-free
+program).
 
 If you later want the in-process inkwell path, standardize on
 `inkwell = { version = "0.9", features = ["llvm19-1"] }` (note: LLVM 18+ use the `-1` feature

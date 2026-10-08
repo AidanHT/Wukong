@@ -33,6 +33,7 @@ conv, and serving benchmarks in the tree are Rust launchers, not `.wk` programs.
 wukongc --run examples/saxpy_array.wk              # interpreter (default)
 wukongc --run --backend=native tests/run/tensor_matmul.wk
 wukongc --emit=mir -O2 tests/run/transcendental_kernel.wk   # inspect lowered MIR
+wukongc --emit=exe -O2 --target-cpu=x86-64 examples/fib.wk  # portable AOT executable
 ```
 
 `--run` defaults to the interpreter; add `--backend=native` for the Cranelift JIT. GPU backends

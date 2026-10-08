@@ -57,6 +57,48 @@ All notable changes to Wukong are documented here. The format is loosely based o
   every `-O` level; `grad_dot`/`hvp` give Hessian-vector products; `--emit=obj --grad-of=<fn>`
   exports `<fn>_grad`.
 
+### Toolchain backends: textual LLVM, native diagnostics, target CPU, AOT runtime and gate
+
+- **`--emit=llvm-ir` now implements the oracle's language and links against the AOT runtime.**
+  `f16`/`bf16` compute in `float` registers and round only at constants, casts, loads and stores
+  (the interpreter's model — the module used to round every intermediate to the half grid);
+  booleans are bytes in memory; `print`/`assert` lower to the `wukong_rt_*` ABI and runtime kernels
+  get the runtime's `i64` integer ABI (they used to be called with `i32` arguments the C ABI
+  leaves undefined in the upper half); the vectorizer's synthesized kernels are defined in the
+  module from their recipe instead of being undefined symbols; the module names its target
+  triple. Vector low-precision casts and low-precision FMA no longer decline.
+- **Native-backend failures are catalogued diagnostics.** A Cranelift failure under
+  `--run --backend=native`, `--emit=obj` or `--emit=exe` used to be a bare `error:` line that
+  `--error-format=json` never saw. It is now classified (`wukong_codegen_cranelift::classify_error`)
+  and rendered through the diagnostic renderer: an oversized layout is the new **`C0002`** (naming
+  the type and its function; fixture `tests/fail/native_layout_too_large.wk`, reached through the new
+  `// EMIT: <stage>` fail-fixture directive), a by-design decline is `C0001`, and anything else is an
+  internal-compiler-error diagnostic.
+- **`--target-cpu=<native|x86-64|x86-64-v2|x86-64-v3|x86-64-v4>`.** `--emit=obj|exe` used to bake in
+  every ISA feature of the compiling host plus raw AVX2+FMA loop kernels with no runtime dispatch,
+  so an executable built on an AVX2 machine faulted with `#UD` on older x86-64 CPUs and nothing
+  could ask for a portable baseline. The flag sets an exact Cranelift feature set per level
+  (`wukong_codegen_cranelift::TargetCpu`); below x86-64-v3 the driver builds the MIR without the
+  raw-AVX2 recipes and the backend refuses any that reach it. `--run --backend=native` honours it
+  too (refusing a level the host lacks), which is how the baseline code is tested on this machine.
+- **The `cc`-fallback AOT runtime prints exactly what `--run` prints.** It printed floats with
+  `printf("%g")` (six significant digits) and had no `wukong_rt_print_str`, so a host without the
+  rustc link path got an executable whose output differed from the oracle; the stopgap refused
+  every float-printing program. The generated C runtime now reproduces Rust's `Display` for `f64`
+  (shortest round-trip digits from correctly rounded `%e` plus `strtod`, laid out positionally,
+  with `inf`/`-inf`/`NaN`/`-0`) and defines `wukong_rt_print_str`, so the refusal is gone; the
+  fallback now says on stderr that it is being taken. Forced-`cc` tests compare the linked
+  executable with the interpreter on hand-derived float lines (and strings off Windows).
+- **The AOT gate covers the corpus, not four programs.** `crates/wukongc/tests/exe.rs` now also links
+  a deterministic slice of `tests/run` (every 8th fixture by default, the whole corpus with
+  `WUKONG_EXE_CORPUS=all`) in parallel and compares each executable with `--run`, skipping only
+  documented capability declines (a program the native backend cannot compile either; on the C
+  fallback, one that needs a `wukong_*` kernel) and failing if declines exceed 10% on the rustc
+  path. A second test reaches the C fallback the way a user does (a copied `wukongc` with no runtime
+  rlib beside it) and checks its float/integer output against `--run`. The new fixture
+  `tests/run/print_float_display.wk` pins how every float prints (shortest round-trip digits,
+  positional, `inf`/`NaN`/`-0`, f32/f16/bf16 widening) and joins the always-linked set.
+
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
 - **Gate added: every recognizer-dependent corpus program is held to its own generic lowering.**

@@ -319,6 +319,16 @@ static CATALOG: &[Explanation] = &[
          selected backend. The interpreter and LLVM backends grow coverage over time; check the \
          language guide for the currently supported subset."
     ),
+    entry!(
+        "C0002",
+        "type too large for the native layout",
+        "The native (Cranelift) backend sizes stack slots and scales element offsets with 32-bit \
+         byte counts, so one array, vector or aggregate whose byte size exceeds 2^32 (4 GiB) cannot \
+         be laid out by `--backend=native`, `--emit=obj` or `--emit=exe`. The diagnostic names the \
+         type and the function that declares it. The interpreter has no byte layout and runs the \
+         program. Allocate the buffer on the heap (`alloc_f32(n)` and its siblings) or split it \
+         into arrays below 4 GiB."
+    ),
 ];
 
 #[cfg(test)]

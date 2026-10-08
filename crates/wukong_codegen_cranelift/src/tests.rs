@@ -6305,7 +6305,7 @@ fn backend_compile_ab() {
     // ISA-build fixed cost (attack 1: is the ISA worth caching across emit_object calls?).
     let t_isa = best_of_ms(200, || {
         let s = Instant::now();
-        let _ = crate::make_isa_verify(true, false).unwrap();
+        let _ = crate::make_isa_for(true, false, crate::TargetCpu::Native).unwrap();
         s.elapsed()
     });
     // A representative small single-function file's full backend time, to size the ISA share of the

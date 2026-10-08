@@ -1,0 +1,13 @@
+// EXPECT-CODE: C0002
+// EMIT: obj
+module tests.fail.native_layout_too_large
+
+/// A 600,000,000-element `f64` array is 4.8e9 bytes: a valid program (the interpreter runs it) whose
+/// single stack slot exceeds the native backend's 32-bit byte layout. `--emit=obj` must report the
+/// catalogued C0002 - naming the type and the declaring function - instead of a bare `error:` line
+/// that `--error-format=json` never sees.
+fn main() -> i32 {
+    let mut big: [f64; 600000000];
+    big[7] = 2.0;
+    return big[7] as i32;
+}
