@@ -109,7 +109,7 @@ parallel constructs that lowering does not handle yet, so compiling or running t
 | File          | What it shows                                         |
 |---------------|-------------------------------------------------------|
 | `vadd.wk`    | SIMD vector add over shape-typed tensors              |
-| `matmul.wk`  | tiled, parallel matmul with `Tensor[f32, M, K]` shapes |
+| `matmul.wk`  | tiled, parallel matmul with `Tensor[f32, M, K]` shapes (its explicit `f32x8` inner kernel is what is not lowered; the same tiling with a scalar inner loop dispatches `wukong_sgemm` — `tests/run/spelling_tiled_gemm_ragged.wk`) |
 | `softmax.wk` | numerically-stable softmax                            |
 
 Try the shape checker on a mismatch:

@@ -24777,7 +24777,8 @@ fn ijk_scalar_either_order<'a>(
 
 /// Try every recognized matmul spelling, in order: the `ikj` accumulate form
 /// ([`match_matmul`]), the `ijk` dot-product form with a scalar accumulator ([`match_matmul_ijk`]),
-/// and the `ijk` form that accumulates straight into `c[i*N+j]` ([`match_matmul_ijk_memacc`]).
+/// the `ijk` form that accumulates straight into `c[i*N+j]` ([`match_matmul_ijk_memacc`]), and the
+/// scalar accumulator seeded from `c[i*N+j]` (`C += A·B`, `detile::match_matmul_ijk_cseed`).
 /// `ijk` accepts j-outer/i-inner (independent loop interchange) and a counting `while` k-loop.
 fn recognize_matmul<'a>(
     pat: &Pattern,
@@ -24789,6 +24790,7 @@ fn recognize_matmul<'a>(
     match_matmul(pat, iter, body, sema, interner)
         .or_else(|| match_matmul_ijk(pat, iter, body, sema, interner))
         .or_else(|| match_matmul_ijk_memacc(pat, iter, body, sema, interner))
+        .or_else(|| detile::match_matmul_ijk_cseed(pat, iter, body, sema, interner))
 }
 
 /// Source-only preflight for a recognized GEMM whose bias can overlap its output.

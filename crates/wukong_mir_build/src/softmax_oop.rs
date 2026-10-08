@@ -48,6 +48,11 @@ impl FnLowerer<'_> {
     /// Try the out-of-place softmax / log-softmax window at `b.stmts[at..]`. Returns the number of
     /// statements consumed, having emitted the kernel, or `None` having emitted nothing.
     pub(super) fn try_fuse_out_of_place_norm(&mut self, b: &Block, at: usize) -> Option<usize> {
+        // A pending function-item `@tile` width belongs to the next loop the strip-miner can take;
+        // replacing these loops would leave it unapplied (`E0309`).
+        if !self.tile_queue.is_empty() {
+            return None;
+        }
         let stmts = &b.stmts[at..];
         if stmts.len() < 5 {
             return None;

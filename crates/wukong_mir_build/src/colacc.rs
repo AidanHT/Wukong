@@ -61,6 +61,11 @@ impl FnLowerer<'_> {
     /// Try the row-outer column-reduction window at `b.stmts[at..]` (seed, then nest). Returns the
     /// number of statements consumed, having lowered them, or `None` having emitted nothing.
     pub(super) fn try_fuse_rowouter_colreduce(&mut self, b: &Block, at: usize) -> Option<usize> {
+        // A pending function-item `@tile` width belongs to the next loop the strip-miner can take;
+        // replacing these loops would leave it unapplied (`E0309`).
+        if !self.tile_queue.is_empty() {
+            return None;
+        }
         let seed_stmt = b.stmts.get(at)?;
         let nest_stmt = b.stmts.get(at + 1)?;
         let (out, n_seed, seed, seed_is_let) = self.match_col_seed(seed_stmt)?;

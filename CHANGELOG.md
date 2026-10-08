@@ -13,6 +13,13 @@ All notable changes to Wukong are documented here. The format is loosely based o
   and log-softmax (`wukong_norm_f32(x, o, …)`), hand-tiled matmuls (`for … step T` and `while` tile
   loops), and elementwise loops over a `usize` counter or a symbolic tensor dim (behind a run-time
   `end >= 0` test). Fixtures `tests/run/spelling_*.wk` print every lane.
+- **Blocked GEMMs as they are really written dispatch `wukong_sgemm`:** ragged tiles clamped with
+  `min` (`for i in i0..min(i0 + T, M)`), the counted tiles of `examples/matmul.wk` (`for it in
+  0..(M + T - 1) / T { let i0 = it * T; let i1 = min(i0 + T, M); … }`), runtime and symbolic extents
+  (full tiles over a runtime `M` behind a run-time `M % T == 0` test; counted tiles behind
+  `ceil(M/T)*T >= M`), tile widths spelled as function-local `const`s, and a tiled contraction around
+  a scalar accumulator seeded from `C` — which on its own (`let mut s = c[i, j]; for k { s += a*b; }
+  c[i, j] = s;`) is now recognized as `C += A·B` (`tests/run/spelling_tiled_gemm_ragged.wk`).
 - **`min(a, b)` / `max(a, b)` builtins** for integers (compared in the result type's signedness) and
   floats (exactly `fmin`/`fmax`); a call used to be `C0001` (`tests/run/min_max_builtin.wk`).
 - **`@generic` on a `for`/`while` loop** opts that loop (and everything in it) out of kernel

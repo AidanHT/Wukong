@@ -9,7 +9,7 @@
 use wukong_ast::{Block, ExprKind, ItemKind, StmtKind};
 use wukong_diag::{Diagnostic, Severity};
 use wukong_mir::verify::verify_function;
-use wukong_mir::{CmpOp, Function, Op, Program, ValueId};
+use wukong_mir::{BinOp, CmpOp, Function, Op, Program, ValueId};
 use wukong_span::{Interner, SourceId};
 
 use crate::{
@@ -568,6 +568,129 @@ fn f(a: usize, b: usize, c: i32, d: i32) -> usize {
         "i32 max compares signed"
     );
     assert!(ops.iter().filter(|o| matches!(o, Op::Select(..))).count() >= 2);
+}
+
+/// The tilings a blocked GEMM is really written with: counted tiles clamped with `min` over
+/// symbolic dims (`examples/matmul.wk`'s structure), stepped tiles clamped over literal extents,
+/// full tiles over a runtime extent, and a tiled contraction around a `C`-seeded accumulation.
+#[test]
+fn ragged_counted_and_runtime_tilings_dispatch_the_gemm_kernel() {
+    let src = "module m
+fn counted<M, N, K>(a: Tensor[f32, M, K], b: Tensor[f32, K, N], mut c: Tensor[f32, M, N]) {
+    const MT: usize = 4;
+    for it in 0..((M + MT - 1) / MT) {
+        let i0 = it * MT;
+        let i1 = min(i0 + MT, M);
+        for i in i0..i1 {
+            for j in 0..N {
+                let mut s: f32 = 0.0;
+                for k in 0..K { s = s + a[i, k] * b[k, j]; }
+                c[i, j] = s;
+            }
+        }
+    }
+}
+fn stepped_min(a: [f32; 100], b: [f32; 100], mut c: [f32; 100]) {
+    for i0 in 0..10 step 4 {
+        for i in i0..min(i0 + 4, 10) {
+            for j in 0..10 {
+                let mut s: f32 = 0.0;
+                for k in 0..10 { s = s + a[i * 10 + k] * b[k * 10 + j]; }
+                c[i * 10 + j] = s;
+            }
+        }
+    }
+}
+fn runtime_rows(a: [f32; 64], b: [f32; 64], mut c: [f32; 64], m: i64) {
+    for i0 in 0..m step 4 {
+        for i in i0..i0 + 4 {
+            for j in 0..8 {
+                let mut s: f32 = 0.0;
+                for k in 0..8 { s = s + a[i * 8 + k] * b[k * 8 + j]; }
+                c[i * 8 + j] = s;
+            }
+        }
+    }
+}
+fn ktiled_cseed(a: [f32; 64], b: [f32; 64], mut c: [f32; 64]) {
+    for k0 in 0..8 step 4 {
+        for i in 0..8 {
+            for j in 0..8 {
+                let mut s: f32 = c[i * 8 + j];
+                for k in k0..k0 + 4 { s = s + a[i * 8 + k] * b[k * 8 + j]; }
+                c[i * 8 + j] = s;
+            }
+        }
+    }
+}
+";
+    let (prog, _, interner) = lower_src(src);
+    for name in ["counted", "stepped_min", "runtime_rows", "ktiled_cseed"] {
+        assert_eq!(
+            kernels(func(&prog, &interner, name), &interner),
+            vec!["wukong_sgemm"],
+            "{name}"
+        );
+    }
+    // Symbolic dims: the kernel sits behind the run-time cover test `ceil(M/4)*4 >= M`.
+    assert!(ops(func(&prog, &interner, "counted"))
+        .iter()
+        .any(|o| matches!(o, Op::Cmp(CmpOp::Uge, ..))));
+    // A runtime extent under full tiles: behind `m % 4 == 0`.
+    assert!(ops(func(&prog, &interner, "runtime_rows"))
+        .iter()
+        .any(|o| matches!(o, Op::Bin(BinOp::SRem, ..))));
+    // Literal extents prove the cover statically: no run-time test.
+    assert!(!ops(func(&prog, &interner, "stepped_min"))
+        .iter()
+        .any(|o| matches!(
+            o,
+            Op::Bin(BinOp::SRem | BinOp::URem, ..) | Op::Cmp(CmpOp::Uge, ..)
+        )));
+    // The `C`-seeded accumulation is `C += A·B`: beta = 1.
+    let f = func(&prog, &interner, "ktiled_cseed");
+    let args = call_args(f, &interner, "wukong_sgemm");
+    assert_eq!(const_int(f, args[0][6]), Some(1), "beta");
+}
+
+/// A counted tile whose point loop is a full tile names no extent (the untiled nest would run to
+/// `NT*T`, which nothing says is the data's extent), and a contraction tiled around a ZERO-seeded
+/// scalar overwrites `C` with the last tile's partial sum - not a GEMM. Both stay as written.
+#[test]
+fn tilings_that_are_not_the_untiled_nest_decline() {
+    let src = "module m
+fn counted_exact(a: [f32; 64], b: [f32; 64], mut c: [f32; 64]) {
+    for it in 0..2 {
+        let i0 = it * 4;
+        for i in i0..i0 + 4 {
+            for j in 0..8 {
+                let mut s: f32 = 0.0;
+                for k in 0..8 { s = s + a[i * 8 + k] * b[k * 8 + j]; }
+                c[i * 8 + j] = s;
+            }
+        }
+    }
+}
+fn ktiled_zero_seed(a: [f32; 64], b: [f32; 64], mut c: [f32; 64]) {
+    for k0 in 0..8 step 4 {
+        for i in 0..8 {
+            for j in 0..8 {
+                let mut s: f32 = 0.0;
+                for k in k0..k0 + 4 { s = s + a[i * 8 + k] * b[k * 8 + j]; }
+                c[i * 8 + j] = s;
+            }
+        }
+    }
+}
+";
+    let (prog, _, interner) = lower_src(src);
+    for name in ["counted_exact", "ktiled_zero_seed"] {
+        let ks = kernels(func(&prog, &interner, name), &interner);
+        assert!(
+            !ks.iter().any(|k| k.starts_with("wukong_sgemm")),
+            "{name} must not become a GEMM, got {ks:?}"
+        );
+    }
 }
 
 // ---- P12.14: per-loop `@generic` and the dispatch report ---------------------------------------

@@ -79,7 +79,8 @@ not duplicate them. In summary, Wukong:
   implemented (the language's only runtime-sized memory today is `alloc_<T>`/`free`).
 - **Zero hidden cost.** No GC, no implicit copies of large aggregates, no surprise allocations.
 - **Domain-aware optimization (implementation today).** The compiler **recognizes a matmul nest** (the
-  `ikj` accumulate and `ijk` dot-product forms, incl. `nn.Linear` `A·Bᵀ`) and may lower it to a tuned
+  `ikj` accumulate and `ijk` dot-product forms, incl. `nn.Linear` `A·Bᵀ`, written naively or
+  hand-tiled — ragged `min`-clamped tiles included) and may lower it to a tuned
   **register-blocked, cache-tiled, packed AVX2/FMA GEMM microkernel**. It also **auto-vectorizes**
   elementwise loops (incl. branchy ones via if-conversion) and **reductions** to SIMD, contracts
   `x + y*z` to a **fused multiply-add**, **fuses** adjacent elementwise loops, and
@@ -87,7 +88,9 @@ not duplicate them. In summary, Wukong:
   const-fold, CSE, DSE, DCE, LICM, loop unrolling) runs at `-O1` and above. Op-graph fusion across
   tensor ops is still planned **as a CPU MIR pass**; on GPU, `wukong_codegen_gpu`'s fusion planner and
   `--backend=gpu-native` can compile an eligible whole program into a cooperative megakernel. These
-  recognizers are invisible to the user — you still write the loop nest in `.wk`.
+  recognizers are invisible to the user — you still write the loop nest in `.wk` — unless you ask:
+  `--remarks=dispatch` notes each loop that became a kernel call, and `@generic` on a `fn` or a loop
+  keeps it as written.
 - **Interop (planned).** A clean C ABI (`@extern("C")` / `@export`) is designed to call into
   BLAS/cuBLAS and embed Wukong kernels in C/C++/CUDA stacks. Attribute names are validated against
   the closed language set; unknown names report `E0306`. General C ABI symbol export/import
