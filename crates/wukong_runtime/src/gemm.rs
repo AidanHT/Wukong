@@ -159,7 +159,7 @@ fn round_up(x: usize, m: usize) -> usize {
 /// header) — not the `1e-3·√k` absolute slack that stood here until 2026-09-13, which contained no ε
 /// at all and was 131-334× looser than the rounding scale of its own test data.
 #[inline]
-fn select_kc(k: usize) -> usize {
+pub(crate) fn select_kc(k: usize) -> usize {
     let nblocks = k.div_ceil(KC).max(1);
     round_up(k.div_ceil(nblocks), 4) // multiple of the ×4 K-unroll; ≤ KC since k/nblocks ≤ KC
 }
@@ -645,7 +645,7 @@ const ACT_SILU: u32 = 3;
 /// separate passes over `C` — the memory traffic a `α·linear → bias → act` otherwise pays. Both backends
 /// call the identical kernel, so the fused result stays bit-for-bit exact.
 #[derive(Clone, Copy)]
-struct Epilogue {
+pub(crate) struct Epilogue {
     bias: *const f32,
     act: u32,
     alpha: f32,
@@ -655,7 +655,7 @@ impl Epilogue {
     /// Apply the epilogue to value `x` at tile-local column `j` (relative to this epilogue's bias
     /// base): `act(alpha·x + bias[j])`. `# Safety`: `bias`, when non-null, must be valid at index `j`.
     #[inline]
-    unsafe fn apply(&self, x: f32, j: usize) -> f32 {
+    pub(crate) unsafe fn apply(&self, x: f32, j: usize) -> f32 {
         // The α scale multiplies the matmul result before the bias-add. `alpha == 1.0` skips the
         // multiply so the fused-epilogue callers (`nt_epi`, which pass 1.0) stay byte-identical.
         let mut y = if self.alpha != 1.0 { self.alpha * x } else { x };
@@ -1107,7 +1107,7 @@ pub unsafe extern "C" fn wukong_sgemm_tn_parallel(
 
 /// The half-precision storage a mixed-precision GEMM entry widens from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum HalfKind {
+pub(crate) enum HalfKind {
     Bf16,
     F16,
 }
@@ -1115,7 +1115,7 @@ enum HalfKind {
 impl HalfKind {
     /// The scalar widen: the crate-root definition the interpreter and every other kernel share.
     #[inline]
-    fn widen1(self, bits: u16) -> f32 {
+    pub(crate) fn widen1(self, bits: u16) -> f32 {
         match self {
             HalfKind::Bf16 => crate::bf16_bits_to_f32(bits),
             HalfKind::F16 => crate::f16_bits_to_f32(bits),
@@ -1275,6 +1275,17 @@ unsafe fn gemm_lowp_nt(
         return;
     }
     let (mu, ku, nu) = (m as usize, k as usize, n as usize);
+    if mu <= crate::gemv_half::SMALL_M {
+        // Decode-shaped (a batch of one to four tokens): stream the half `B` once in its own storage
+        // and widen it in registers (`gemv_half.rs`), instead of materializing an f32 copy of the
+        // whole weight matrix for a product that reads each weight once. Same per-(i, j) order as
+        // the GEMM below, so the bits do not change.
+        with_lowp_scratch(mu * ku, 0, |af, _| {
+            widen_into_f32(a, af, mu * ku, kind);
+            crate::gemv_half::half_nt_small_m(af, b, c, mu, ku, nu, beta as f32, kind, epi, par);
+        });
+        return;
+    }
     with_lowp_scratch(mu * ku, nu * ku, |af, bf| {
         widen_into_f32(a, af, mu * ku, kind);
         widen_into_f32(b, bf, nu * ku, kind);

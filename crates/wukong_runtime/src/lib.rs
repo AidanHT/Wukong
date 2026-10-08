@@ -194,6 +194,22 @@ pub use safetensors::wukong_rt_st_read;
 pub mod topk;
 pub use topk::{wukong_argsort_f32, wukong_sample_categorical_f32, wukong_topk_f32};
 
+// The decode builtins' runtime: KV-cache attention, half-weight GEMV (also the small-M route of the
+// half GEMM), and the GGML Q8_0 / Q4_0 block formats. Public for the interpreter's shape checks.
+pub mod attention_kv;
+pub use attention_kv::{
+    wukong_attention_kv_f32, wukong_attention_kv_f32_parallel, wukong_kv_append_f32,
+};
+pub mod gemv_half;
+pub use gemv_half::{
+    wukong_sgemv_bf16, wukong_sgemv_bf16_parallel, wukong_sgemv_f16, wukong_sgemv_f16_parallel,
+};
+pub mod quant;
+pub use quant::{
+    wukong_gemv_q4_0_f32, wukong_gemv_q4_0_f32_parallel, wukong_gemv_q8_0_f32,
+    wukong_gemv_q8_0_f32_parallel, wukong_quantize_q4_0_f32, wukong_quantize_q8_0_f32,
+};
+
 mod cumprod;
 pub use cumprod::{wukong_cumprod_f32, wukong_cumprod_f32_parallel};
 
