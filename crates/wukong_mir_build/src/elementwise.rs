@@ -49,9 +49,10 @@ impl FnLowerer<'_> {
     }
 
     /// The `@parallel`-chunk twin of [`Self::try_elementwise_kernels_on_value_view`]: the bounds are
-    /// already lowered, as `try_vectorize_ranged` has them. Only the two chunk kernels with an
-    /// infallible emitter (activation and streaming affine map) are retried; anything else falls to
-    /// the generic vectorizer over the original body, exactly as before.
+    /// already lowered, as `try_vectorize_ranged` has them. Only the activation and streaming affine
+    /// map chunk kernels are retried (either emitter may still decline, e.g. on a hoisted
+    /// coefficient that reads the output); anything else falls to the generic vectorizer over the
+    /// original body, exactly as before.
     pub(super) fn try_ranged_kernels_on_value_view(
         &mut self,
         j: Symbol,
@@ -66,14 +67,17 @@ impl FnLowerer<'_> {
         if let Some(calls) = self.match_vmath_body(j, &view, None) {
             let s = self.coerce_to(start_val, ity, &MirType::I64, true);
             let e = self.coerce_to(end_val, ity, &MirType::I64, true);
-            self.emit_vmath_calls(s, e, calls);
-            return true;
+            // A decline (an alias the run-time guard cannot range) emitted nothing but pure setup.
+            if self.emit_vmath_calls(s, e, calls) {
+                return true;
+            }
         }
         if let Some(plan) = self.match_velem_body(j, &view) {
             let s = self.coerce_to(start_val, ity, &MirType::I64, true);
             let e = self.coerce_to(end_val, ity, &MirType::I64, true);
-            self.emit_velem_call(s, e, &plan);
-            return true;
+            if self.emit_velem_call(s, e, &plan) {
+                return true;
+            }
         }
         false
     }
