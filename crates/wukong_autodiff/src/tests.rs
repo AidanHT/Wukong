@@ -20,6 +20,7 @@ mod calls;
 mod kernels;
 mod memory;
 mod mirror;
+mod writes;
 use wukong_mir::{BinOp, Builder, Function, MirType, Op, Program, ValueId};
 use wukong_span::{Interner, Symbol};
 

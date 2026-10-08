@@ -52,7 +52,9 @@ mod tape;
 mod tape_attn;
 mod tape_linalg;
 mod tape_nn;
+mod writes;
 use tape::{Kernel, Syms};
+pub use writes::written_params;
 
 /// Which function the reverse pass builds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

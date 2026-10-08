@@ -298,6 +298,15 @@ impl Kernel {
     }
 }
 
+/// The recognized forward family of the runtime symbol `name`, by name (for callers holding only a
+/// shared interner; [`Syms::kernel`] is the interned lookup the reverse pass uses).
+pub(crate) fn kernel_by_name(name: &str) -> Option<Kernel> {
+    FORWARD_KERNELS
+        .iter()
+        .find(|&&(n, _, _)| n == name)
+        .map(|&(_, kind, _)| kind)
+}
+
 /// Pick the serial or the `@parallel` spelling of an emitted backward kernel, following the forward.
 pub(crate) fn pick(serial: Symbol, parallel: Symbol, par: bool) -> Symbol {
     if par {

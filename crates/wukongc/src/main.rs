@@ -35,7 +35,16 @@ OPTIONS:
     --train-lr=<f>     Learning rate  (default: 0.01)
     --train-weight-decay=<f>  AdamW decoupled weight decay, finite and >= 0 (default: 0)
     --train-opt=<o>    Optimizer: sgd, adamw  (default: sgd)
-    --train-seed=<n>   Seed for deterministic buffer initialization
+    --train-seed=<n>   Seed for deterministic buffer initialization (uniform in [-0.4, 0.4))
+    --train-init=<i>=<path>  Load buffer <i> from <path> (raw little-endian f32, exactly the
+                       buffer's elements) instead of the seeded init. Repeatable
+    --train-data=<i>=<path>  Stream fixed-input buffer <i> from <path>, a file of whole batches
+                       (raw little-endian f32): update s trains on batch s mod batches. Repeatable
+    --train-save=<i>=<path>  Write buffer <i> (e.g. a trained weight) to <path> as raw
+                       little-endian f32 after training. Repeatable
+    --train-clip=<f>   Clip the global gradient L2 norm to <f> before each update (finite, > 0)
+    --train-warmup=<n> Ramp the learning rate linearly over the first <n> updates  (default: 0)
+    --train-schedule=<s>  Learning rate after the warmup: constant, cosine  (default: constant)
     --run              Compile and run (interpreter by default; see --backend)
     --backend=<b>      Execution backend: interp, native, gpu, gpu-native  (default: interp)
                        (gpu/gpu-native require --features gpu and a CUDA device; gpu is the
@@ -292,6 +301,17 @@ fn set_lint_level(
         .map_err(|e| format!("`{flag} {lint}`: {e}"))
 }
 
+/// `<param-index>=<path>`, the value of `--train-init`, `--train-data` and `--train-save`.
+fn indexed_path(flag: &str, v: &str) -> Result<(usize, PathBuf), String> {
+    let bad = || format!("{flag} expects <param-index>=<path>, got `{v}`");
+    let (index, path) = v.split_once('=').ok_or_else(bad)?;
+    let index = index.trim().parse::<usize>().map_err(|_| bad())?;
+    if path.is_empty() {
+        return Err(bad());
+    }
+    Ok((index, PathBuf::from(path)))
+}
+
 /// Parse CLI arguments. `Ok(None)` means a help / version / `--explain` message was already printed
 /// and we should exit successfully without compiling. The two rejected flag *combinations* are
 /// checked at the end, after the whole argv has been seen.
@@ -455,6 +475,46 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 opts.grad.train_seed = v
                     .parse()
                     .map_err(|_| format!("--train-seed expects an integer, got `{v}`"))?;
+            }
+            _ if arg.starts_with("--train-init=") => {
+                let v = &arg["--train-init=".len()..];
+                opts.grad.train_init.push(indexed_path("--train-init", v)?);
+            }
+            _ if arg.starts_with("--train-data=") => {
+                let v = &arg["--train-data=".len()..];
+                opts.grad.train_data.push(indexed_path("--train-data", v)?);
+            }
+            _ if arg.starts_with("--train-save=") => {
+                let v = &arg["--train-save=".len()..];
+                opts.grad.train_save.push(indexed_path("--train-save", v)?);
+            }
+            _ if arg.starts_with("--train-clip=") => {
+                let v = &arg["--train-clip=".len()..];
+                let clip: f32 = v
+                    .parse()
+                    .map_err(|_| format!("--train-clip expects a float, got `{v}`"))?;
+                if !clip.is_finite() || clip <= 0.0 {
+                    return Err("--train-clip must be finite and positive".into());
+                }
+                opts.grad.train_clip = Some(clip);
+            }
+            _ if arg.starts_with("--train-warmup=") => {
+                let v = &arg["--train-warmup=".len()..];
+                opts.grad.train_warmup = v.parse().map_err(|_| {
+                    format!("--train-warmup expects a non-negative integer, got `{v}`")
+                })?;
+            }
+            _ if arg.starts_with("--train-schedule=") => {
+                let v = &arg["--train-schedule=".len()..];
+                opts.grad.train_schedule = match v {
+                    "constant" => wukong_driver::TrainSchedule::Constant,
+                    "cosine" => wukong_driver::TrainSchedule::Cosine,
+                    other => {
+                        return Err(format!(
+                            "--train-schedule expects constant or cosine, got `{other}`"
+                        ))
+                    }
+                };
             }
             _ if arg.starts_with("--error-format=") => {
                 let fmt = &arg["--error-format=".len()..];
@@ -645,6 +705,70 @@ mod tests {
                 .verify_each
         );
         assert!(USAGE.contains("--verify-each"));
+    }
+
+    /// The training data, checkpoint and update-policy flags: `<i>=<path>` lists accumulate in order,
+    /// a malformed value is a usage error naming the flag, and every flag is in USAGE.
+    #[test]
+    fn training_data_and_schedule_flags_parse() {
+        let parse = |extra: &[&str]| {
+            let mut args: Vec<String> = ["--train"].iter().map(|s| s.to_string()).collect();
+            args.extend(extra.iter().map(|s| s.to_string()));
+            args.push("input.wk".to_owned());
+            parse_args(&args)
+        };
+        let plain = parse(&[]).unwrap().unwrap();
+        assert!(plain.grad.train_init.is_empty() && plain.grad.train_clip.is_none());
+        assert_eq!(plain.grad.train_warmup, 0);
+        assert_eq!(
+            plain.grad.train_schedule,
+            wukong_driver::TrainSchedule::Constant
+        );
+        let o = parse(&[
+            "--train-init=0=w.bin",
+            "--train-data=1=batches.bin",
+            "--train-data=2=labels.bin",
+            "--train-save=0=trained.bin",
+            "--train-clip=1.5",
+            "--train-warmup=10",
+            "--train-schedule=cosine",
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(o.grad.train_init, vec![(0, PathBuf::from("w.bin"))]);
+        assert_eq!(
+            o.grad.train_data,
+            vec![
+                (1, PathBuf::from("batches.bin")),
+                (2, PathBuf::from("labels.bin"))
+            ]
+        );
+        assert_eq!(o.grad.train_save, vec![(0, PathBuf::from("trained.bin"))]);
+        assert_eq!(o.grad.train_clip, Some(1.5));
+        assert_eq!(o.grad.train_warmup, 10);
+        assert_eq!(o.grad.train_schedule, wukong_driver::TrainSchedule::Cosine);
+        for (bad, flag) in [
+            ("--train-init=w.bin", "--train-init"),
+            ("--train-data=x=d.bin", "--train-data"),
+            ("--train-save=0=", "--train-save"),
+            ("--train-clip=0", "--train-clip"),
+            ("--train-clip=nan", "--train-clip"),
+            ("--train-warmup=-1", "--train-warmup"),
+            ("--train-schedule=linear", "--train-schedule"),
+        ] {
+            let err = parse(&[bad]).unwrap_err();
+            assert!(err.contains(flag), "{bad}: {err}");
+        }
+        for flag in [
+            "--train-init=<i>=<path>",
+            "--train-data=<i>=<path>",
+            "--train-save=<i>=<path>",
+            "--train-clip=<f>",
+            "--train-warmup=<n>",
+            "--train-schedule=<s>",
+        ] {
+            assert!(USAGE.contains(flag), "USAGE must document {flag}");
+        }
     }
 
     #[test]

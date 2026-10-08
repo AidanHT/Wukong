@@ -1736,6 +1736,14 @@ wukongc [OPTIONS] <input.wk>
 --train-opt=<o>       sgd | adamw                                          (default: sgd)
 --train-seed=<n>      seed for the deterministic buffer initialization      (default: 0x5EED1234)
 --train-weight-decay=<f>  AdamW decoupled decay; finite, non-negative       (default: 0)
+--train-init=<i>=<path>   load buffer <i> from <path> (raw little-endian f32, exactly the
+                      buffer's elements) instead of the seeded init; repeatable
+--train-data=<i>=<path>   stream fixed-input buffer <i> from <path>, a file of whole batches:
+                      update s trains on batch s mod batches (the final report on the next one)
+--train-save=<i>=<path>   write buffer <i> to <path> as raw little-endian f32 after training
+--train-clip=<f>      clip the global gradient L2 norm to <f> before each update (finite, > 0)
+--train-warmup=<n>    ramp the learning rate linearly over the first n updates   (default: 0)
+--train-schedule=<s>  constant | cosine: the learning rate after the warmup (default: constant)
 -O0|-O1|-O2|-O3       optimization level (default: -O0; -O3 currently runs the -O2 pipeline)
 --fp=<mode>           fast | strict   (default: fast). strict = @strict_fp on every function: no
                       FMA contraction, source-order float reductions, no kernel recognizers (see
@@ -1810,6 +1818,21 @@ Every loss parameter must be a concrete f32 array (including nested arrays) or a
 rejected. The last buffer must contain exactly one f32 for the scalar loss output. SGD and AdamW use deterministic initialization
 (every buffer drawn uniformly from `[-0.4, 0.4)` by an LCG seeded with `--train-seed`);
 AdamW accepts finite nonnegative `--train-weight-decay`, while SGD rejects nonzero decay.
+
+**✅ Training on data:** the buffers are files in the layout `read_f32`/`write_f32` use — raw
+little-endian f32 with no header, which `numpy.ndarray.astype('<f4').tofile` also writes.
+`--train-init=<i>=<path>` replaces buffer `i`'s seeded values with a file of exactly its size (a
+checkpoint, a pretrained weight). `--train-data=<i>=<path>` streams a fixed input from a file of
+whole batches, one batch per update — update `s` reads batch `s mod batches` from disk into the
+live buffer, so a dataset larger than memory trains in O(batch) space; a streamed buffer cannot also
+be a `--grad-wrt` weight. `--train-save=<i>=<path>` writes buffer `i` after training (the trained
+weights; printed as `wrote <path>` on stderr). `--train-clip=<f>` rescales every gradient by
+`f / (norm + 1e-6)` when the global L2 norm exceeds `f` (`torch.nn.utils.clip_grad_norm_`);
+`--train-warmup=<n>` ramps the rate linearly over the first `n` updates and
+`--train-schedule=cosine` then decays it as `CosineAnnealingLR` does over the rest. The run header
+names each of these when it differs from the default. Buffers are updated in place: the gradient
+runs on the live buffers, and only a buffer the forward itself writes is snapshotted and restored
+around it, so each step still sees its data and weights exactly as before the forward ran.
 
 `--train --run` trains the selected loss without calling `main`. Combining `--train` with any
 explicit `--emit=<stage>` or `-o` is a usage error (exit 2). GPU training selectors are unsupported

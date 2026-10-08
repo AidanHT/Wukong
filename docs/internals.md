@@ -1175,6 +1175,19 @@ training storage. The interpreter remains the default; `--backend=native` builds
 `JitBufferKernel` retains executable memory across steps. Each call rebuilds the pointer table
 from exclusively borrowed buffers, since optimizer updates can replace their allocations.
 
+The loop keeps one buffer vector for the whole run — the forward's buffers followed by one gradient
+per trainable weight — and updates it in place: the AdamW kernel's five operands are moved in and
+back out, and SGD writes the weights directly. Per-step copies are needed only to keep a step from
+seeing the previous step's forward writes, so the driver asks `wukong_autodiff::written_params` which
+parameters the (flattened) forward may write — a store through it, a recognized kernel's *output*
+operand, any call the tape does not recognize, any escape — and snapshots and restores just those
+around each gradient run (the loss output is reset instead). The training-file plumbing lives in
+`wukong_driver/src/training.rs`: `--train-init` reads a whole buffer, `--train-data` seeks to batch
+`step mod batches` and decodes it into the live buffer through one reused byte buffer, and
+`--train-save` writes after the run, all raw little-endian f32. The same module holds the learning-rate
+schedule (`lr_at`: linear warmup, then constant or `CosineAnnealingLR`) and the global-norm clip
+(`clip_global_norm`, the norm accumulated in f64).
+
 Native calls share the JIT run lock, output capture, assertion state and scoped large-stack worker.
 The public buffer-kernel invocation is unsafe: callers must establish storage type, extent,
 alignment, aliasing and lifetime; validating MIR and the dispatcher signature alone cannot do so.

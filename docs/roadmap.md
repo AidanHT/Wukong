@@ -1070,7 +1070,15 @@ object (C ABI: the loss's parameters, then one caller-zeroed gradient buffer per
 entry), so a host training loop links the backward with no compiler at run time. An AOT
 *training loop* (`--train --emit=exe`) is still open. `--train-opt=sgd|adamw` selects the optimizer;
 `--train-weight-decay` accepts finite nonnegative AdamW decay (default zero) and rejects nonzero
-decay with SGD. Source-driven gradient tests (helper functions at O0–O3, the fused linear-bias-ReLU
+decay with SGD. **`--train` trains on data:** `--train-init=<i>=<path>` loads a buffer,
+`--train-data=<i>=<path>` streams a fixed input one batch per update (batch `s mod batches`, read from
+disk into the live buffer), `--train-save=<i>=<path>` writes the trained buffer — all raw
+little-endian f32, the `read_f32`/`write_f32` layout — and `--train-clip` (global-norm clipping),
+`--train-warmup` and `--train-schedule=cosine` set the update policy. The loop no longer copies
+every buffer per step: the gradient runs in place, and only the buffers the forward writes
+(`wukong_autodiff::written_params`, which knows each kernel's output operand) are snapshotted around
+it. The `--train` initializer draws uniformly from `[-0.4, 0.4)` (it was single-signed, `[-0.4, 0)`,
+before). Training remains a CLI loop — an in-language `grad_of` is a declared non-goal. Source-driven gradient tests (helper functions at O0–O3, the fused linear-bias-ReLU
 layer, the cross-entropy head, a fanned-out reduction), the real-CLI `training_options` and
 `autodiff_cli` tests (the latter trains a GEMM + bias model on the interpreter and the native JIT and
 requires byte-identical trajectories at O0–O3) and the hand-derived `tests/run/autodiff_train_*.wk`

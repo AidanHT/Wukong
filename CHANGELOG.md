@@ -20,6 +20,17 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `[0, 1)`, exact in f32), then `(u - 0.5)·0.8`: uniform in `[-0.4, 0.4)`. The hand-derived
   `tests/run/autodiff_train_*.wk` trajectories were re-derived from the corrected formula (new seeds
   keep every printed value clear of a six-decimal rounding boundary).
+- **`--train` trains on data** (N82, stage 1). `--train-init=<i>=<path>` loads a buffer,
+  `--train-data=<i>=<path>` streams a fixed input from a file of whole batches (update `s` reads batch
+  `s mod batches` from disk into the live buffer, O(batch) memory), `--train-save=<i>=<path>` writes
+  the trained buffer — all raw little-endian f32, the `read_f32`/`write_f32` layout. `--train-clip=<f>`
+  clips the global gradient norm (`clip_grad_norm_`), `--train-warmup=<n>` ramps the rate linearly and
+  `--train-schedule=cosine` decays it (`CosineAnnealingLR`); the run header names any non-default
+  policy. The loop no longer clones every buffer per step (nor four per tensor plus three copy-backs
+  for AdamW): it runs in place, snapshotting only the buffers the forward writes, which the new
+  `wukong_autodiff::written_params` reports from the tape's kernel table. Gates:
+  `crates/wukongc/tests/training_data.rs` (hand-derived trajectories and saved weights, interp ==
+  native), the driver's `training` unit tests, `wukong_autodiff` `tests/writes.rs`.
 
 ### Optimizer memory passes: SROA, path DSE, loop deletion, guarded LICM, scalar promotion (`gap/opt-memory`)
 
