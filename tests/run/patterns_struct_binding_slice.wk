@@ -5,6 +5,7 @@
 // EXPECT-OUT-VALUES: 34 0
 // EXPECT-OUT-VALUES: 0 14 123 21
 // EXPECT-OUT-VALUES: 5 -1 2999 25 0
+// EXPECT-OUT-VALUES: 42
 module tests.run.patterns_struct_binding_slice
 
 // The pattern forms beyond literals, tuples and enum variants, each arm exercised, with the
@@ -24,6 +25,10 @@ struct Point {
 enum Cmd {
     Move(i32, i32),
     Stop,
+}
+
+enum Wrap {
+    Only(i32, i32),
 }
 
 // (0,0) -> 0; (0,5) -> 10; (7,0) -> 20; (3,4) -> 3*100 + 4 = 304.
@@ -101,6 +106,12 @@ fn move_len(c: Cmd) -> i32 {
     return dx * dx + dy * dy;
 }
 
+// The one variant of a one-variant enum is irrefutable: Only(4, 2) -> 4*10 + 2 = 42.
+fn only_pair(w: Wrap) -> i32 {
+    let Wrap::Only(a, b) = w;
+    return a * 10 + b;
+}
+
 fn main() -> i32 {
     print(quadrant(Point { x: 0, y: 0 }));
     print(quadrant(Point { x: 0, y: 5 }));
@@ -125,5 +136,6 @@ fn main() -> i32 {
     print(count_down(20));
     print(move_len(Cmd::Move(3, 4)));
     print(move_len(Cmd::Stop));
+    print(only_pair(Wrap::Only(4, 2)));
     return 0;
 }

@@ -9906,10 +9906,21 @@ impl FnLowerer<'_> {
                     }
                     // `let Point { x, y } = p;`, `let all @ (a, b) = t;`, `let [first, ..] = a;`:
                     // sema proved the pattern irrefutable (E0442), so binding its names at their
-                    // places within the slot is the whole job — the match machinery does it.
+                    // places within the slot is the whole job — the match machinery does it. So
+                    // does `let W::Only(v) = w;`, the one variant of a one-variant enum (which sema
+                    // accepts); any other variant pattern stays unbound here rather than reading
+                    // another variant's payload bytes.
                     ast::PatKind::Struct { .. }
                     | ast::PatKind::Binding { .. }
-                    | ast::PatKind::Slice { .. } => {
+                    | ast::PatKind::Slice { .. }
+                    | ast::PatKind::Variant { .. }
+                        if match &pat.kind {
+                            ast::PatKind::Variant { path, .. } => self
+                                .enum_variants(path.segments[0].sym)
+                                .is_some_and(|vs| vs.len() == 1),
+                            _ => true,
+                        } =>
+                    {
                         let lty = self.let_binding_ty(ty.as_ref(), init.as_ref());
                         let at = if matches!(mty, MirType::Array(..)) {
                             slot
