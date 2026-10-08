@@ -1464,9 +1464,17 @@ fn interleave_groups(
 }
 
 /// A group is emitted at ONE point: a load group at its first member in program order, a store
-/// group at its last. Every other member moves there — a load earlier, a store later — so the move
-/// must not carry it across an access to the same element, or the iteration would read a value
+/// group at its last. Every other member moves there — a load earlier, a store later — so no move
+/// may reverse the order of two accesses to the same element, or the iteration would read a value
 /// before the store it read, or store under a later access's feet.
+///
+/// The check is pairwise over **where each access ends up**, not where it started: a member is
+/// placed at its group's anchor, everything else stays put, and every pair that may touch one
+/// element (at least one of them a store) must keep its program order. Checking each member only
+/// against the accesses it passes at their *original* places is not enough, because two groups can
+/// move toward each other: `x[2i] = a; t = x[2i + 1]; x[2i + 1] = b; u = x[2i];` moves the first
+/// store down to the last one and the last load up to the first, and those two swap although
+/// neither crosses the other's starting point.
 ///
 /// Only same-object pairs can conflict: accesses to different objects are already proved disjoint,
 /// or guarded disjoint at run time, by the dependence verdict this pass requires. A same-object pair
@@ -1495,47 +1503,56 @@ fn group_order_verdict(
         .collect();
     let at_of = |a: &MemAccess| pos.get(&(a.block.0, a.inst)).copied();
     let group_of = |a: &MemAccess| member.get(&(a.block.0, a.inst)).map(|m| m.0);
-    for gi in 0..groups {
-        let members: Vec<&MemAccess> = l
-            .accesses
-            .iter()
-            .filter(|a| group_of(*a) == Some(gi))
-            .collect();
-        let mut positions = Vec::with_capacity(members.len());
-        for a in &members {
-            positions.push(at_of(*a).ok_or("an interleave group member is not in the body")?);
-        }
-        let is_load = members[0].kind == AccessKind::Load;
-        let anchor = if is_load {
-            positions.iter().copied().min()
-        } else {
-            positions.iter().copied().max()
-        }
-        .expect("a group has members");
-        for (m, &p) in members.iter().zip(&positions) {
-            let (lo, hi) = if is_load { (anchor, p) } else { (p, anchor) };
-            for other in &l.accesses {
-                // A load moving earlier crosses only stores that could feed it; a store moving
-                // later crosses every access that could read or overwrite what it wrote.
-                if group_of(other) == Some(gi) || (is_load && other.kind != AccessKind::Store) {
-                    continue;
-                }
-                let Some(q) = at_of(other) else {
-                    continue;
-                };
-                if q <= lo || q >= hi {
-                    continue;
-                }
-                let same_object = match (m.addr.base(), other.addr.base()) {
-                    (Some(x), Some(y)) => x.same_object(y),
-                    _ => true,
-                };
-                if same_object && !crate::loop_info::never_the_same_element(m, other) {
-                    return Err(
-                        "an interleave group member would move across an access to its \
-                                element",
-                    );
-                }
+    // Where each group is emitted: a load group at its first member, a store group at its last.
+    let mut anchor: Vec<Option<usize>> = vec![None; groups];
+    for a in &l.accesses {
+        let Some(g) = group_of(a) else {
+            continue;
+        };
+        let p = at_of(a).ok_or("an interleave group member is not in the body")?;
+        anchor[g] = Some(match (anchor[g], a.kind) {
+            (None, _) => p,
+            (Some(q), AccessKind::Load) => q.min(p),
+            (Some(q), AccessKind::Store) => q.max(p),
+        });
+    }
+    // Every access as (where it is, where it is emitted).
+    let placed: Vec<Option<(usize, usize)>> = l
+        .accesses
+        .iter()
+        .map(|a| {
+            let p = at_of(a)?;
+            Some((p, group_of(a).and_then(|g| anchor[g]).unwrap_or(p)))
+        })
+        .collect();
+    for (i, a) in l.accesses.iter().enumerate() {
+        let Some((pa, ea)) = placed[i] else {
+            continue;
+        };
+        for (j, b) in l.accesses.iter().enumerate().skip(i + 1) {
+            let Some((pb, eb)) = placed[j] else {
+                continue;
+            };
+            if a.kind == AccessKind::Load && b.kind == AccessKind::Load {
+                continue;
+            }
+            // One group is one emission: its members never conflict with each other (a store
+            // group writes each element once, a load group only reads).
+            let ga = group_of(a);
+            if ga.is_some() && ga == group_of(b) {
+                continue;
+            }
+            if ea != eb && (pa < pb) == (ea < eb) {
+                continue;
+            }
+            let same_object = match (a.addr.base(), b.addr.base()) {
+                (Some(x), Some(y)) => x.same_object(y),
+                _ => true,
+            };
+            if same_object && !crate::loop_info::never_the_same_element(a, b) {
+                return Err(
+                    "an interleave group member would move across an access to its element",
+                );
             }
         }
     }
@@ -5042,6 +5059,34 @@ mod tests {
                    k(x, 21); \
                    j = 0; while j < 42 { print(x[j] as i32); j = j + 1; } \
                    free(x); return 0; }";
+        let mut outs = Vec::new();
+        for level in [0u8, 2u8] {
+            let (program, mut interner) = optimized(src, level);
+            let main = interner.intern("main");
+            let run = wukong_interp::run_with_output(&program, main, &interner)
+                .unwrap_or_else(|e| panic!("-O{level}: {e}"));
+            outs.push((run.0, String::from_utf8_lossy(&run.1).to_string()));
+        }
+        assert_eq!(outs[0], outs[1], "-O0 and -O2 disagree");
+    }
+
+    /// Two groups moving TOWARD each other. `x[2i]` is stored first, and its store group is emitted
+    /// at its last member, `x[2i + 1] = ..`; `x[2i]` is read again last, and its load group is
+    /// emitted at its first member, `x[2i + 1]`'s read. Neither move passes the other's starting
+    /// point, yet the two swap: the re-read would see the element before the store. Every lane
+    /// prints `5 + x[2i + 1]`; the swapped order would print `x[2i] + x[2i + 1]` instead.
+    #[test]
+    fn two_groups_moving_toward_each_other_keep_the_scalar_answer() {
+        let src = "fn k(mut x: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
+                   while i < n { x[2 * i] = 5.0; let t: f32 = x[2 * i + 1]; \
+                   x[2 * i + 1] = t * 3.0; o[i] = x[2 * i] + t; i = i + 1; } } \
+                   fn main() -> i32 { let mut x: []f32 = alloc_f32(42); \
+                   let mut o: []f32 = alloc_f32(21); let mut j: i64 = 0; \
+                   while j < 42 { x[j] = ((j % 7) as f32) * 10.0; j = j + 1; } \
+                   k(x, o, 21); \
+                   j = 0; while j < 42 { print(x[j] as i32); j = j + 1; } \
+                   j = 0; while j < 21 { print(o[j] as i32); j = j + 1; } \
+                   free(x); free(o); return 0; }";
         let mut outs = Vec::new();
         for level in [0u8, 2u8] {
             let (program, mut interner) = optimized(src, level);
