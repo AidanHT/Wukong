@@ -528,7 +528,17 @@ impl Sema<'_> {
         if let ExprKind::Field { base, name } = &callee.kind {
             let method = self.sym_str(name.sym);
             let (is_len, is_dim) = (method == "len", method == "dim");
-            let bty = self.type_expr(base);
+            // `type_method_call` has already typed a receiver that is not a bare name (and recorded
+            // its type); typing it again would report every error inside it — an unknown field or
+            // callee (`p.zz.len()`, `foo(1).len()`) — twice.
+            let cached = match base.kind {
+                ExprKind::Path(_) => None,
+                _ => self.types.get(&base.id).cloned(),
+            };
+            let bty = match cached {
+                Some(t) => t,
+                None => self.type_expr(base),
+            };
             if is_len || is_dim {
                 if let Some(t) = self.type_extent_method(&bty, is_dim, args, span) {
                     self.types.insert(callee.id, Ty::Unknown);

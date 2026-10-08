@@ -953,6 +953,17 @@ mod tests {
         );
     }
 
+    /// A method call's receiver is typed by the method lookup and must not be typed again by the
+    /// call fallthrough, or an error inside it is reported twice.
+    #[test]
+    fn an_error_inside_a_method_receiver_is_reported_once() {
+        only(
+            "struct P { x: f32 } fn f(p: P) -> i64 { return p.zz.len(); }",
+            "E0321",
+        );
+        only("fn f() -> i64 { return foo(1).len(); }", "E0320");
+    }
+
     #[test]
     fn the_unmodelled_surface_stays_lenient() {
         for src in [
