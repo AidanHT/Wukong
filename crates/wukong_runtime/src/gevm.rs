@@ -238,6 +238,40 @@ pub unsafe extern "C" fn wukong_sgevm_f32_parallel(
 mod tests {
     use super::*;
 
+    #[test]
+    fn boundary_extents_are_safe() {
+        // P14.6: out[j] = alpha * sum_i w[i]*a[i,j]; w and a all ones, alpha 1 -> out[j] = rows.
+        let (rows, cols) = (2usize, 3usize);
+        let w = vec![1.0f32; rows];
+        let a = vec![1.0f32; rows * cols];
+        let mut out = vec![f32::from_bits(0x7fc0_0001); cols];
+        unsafe {
+            wukong_sgevm_f32(
+                w.as_ptr(),
+                a.as_ptr(),
+                out.as_mut_ptr(),
+                rows as i64,
+                0,
+                1.0,
+            );
+        }
+        assert!(
+            out.iter().all(|v| v.to_bits() == 0x7fc0_0001),
+            "nonpositive cols must not write out"
+        );
+        unsafe {
+            wukong_sgevm_f32(
+                w.as_ptr(),
+                a.as_ptr(),
+                out.as_mut_ptr(),
+                rows as i64,
+                cols as i64,
+                1.0,
+            );
+        }
+        assert_eq!(out, vec![2.0, 2.0, 2.0]);
+    }
+
     fn fill(seed: u64, n: usize) -> Vec<f32> {
         // Deterministic pseudo-random values in [-1, 1).
         let mut s = seed;

@@ -314,6 +314,26 @@ pub unsafe extern "C" fn wukong_sgemv_parallel(
 mod tests {
     use super::*;
 
+    #[test]
+    fn boundary_extents_are_safe() {
+        // P14.6: y = A*x for A [m,n] row-major, all ones -> y[i] = n.
+        let (m, n) = (2usize, 3usize);
+        let a = vec![1.0f32; m * n];
+        let x = vec![1.0f32; n];
+        let mut y = vec![f32::from_bits(0x7fc0_0001); m];
+        unsafe {
+            wukong_sgemv(a.as_ptr(), x.as_ptr(), y.as_mut_ptr(), 0, n as i64);
+        }
+        assert!(
+            y.iter().all(|v| v.to_bits() == 0x7fc0_0001),
+            "nonpositive m must not write y"
+        );
+        unsafe {
+            wukong_sgemv(a.as_ptr(), x.as_ptr(), y.as_mut_ptr(), m as i64, n as i64);
+        }
+        assert_eq!(y, vec![3.0, 3.0]);
+    }
+
     fn fill(seed: u64, n: usize) -> Vec<f32> {
         // Deterministic pseudo-random values in [-1, 1).
         let mut s = seed;

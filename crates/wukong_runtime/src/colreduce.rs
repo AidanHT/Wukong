@@ -870,6 +870,25 @@ pub unsafe extern "C" fn wukong_colsumsq_f32_parallel(
 mod tests {
     use super::*;
 
+    #[test]
+    fn boundary_extents_are_safe() {
+        // P14.6: column sum reduces down rows; the output has one entry per column.
+        let (rows, cols) = (2usize, 3usize);
+        let x = [1.0f32; 6];
+        let mut out = vec![f32::from_bits(0x7fc0_0001); cols];
+        unsafe {
+            wukong_colsum_f32(x.as_ptr(), out.as_mut_ptr(), 0, cols as i64);
+        }
+        assert!(
+            out.iter().all(|v| v.to_bits() == 0x7fc0_0001),
+            "nonpositive rows must not write out"
+        );
+        unsafe {
+            wukong_colsum_f32(x.as_ptr(), out.as_mut_ptr(), rows as i64, cols as i64);
+        }
+        assert_eq!(out, vec![2.0, 2.0, 2.0]);
+    }
+
     fn naive(x: &[f32], rows: usize, cols: usize, kind: ColKind) -> Vec<f32> {
         let mut out = vec![0.0f32; cols];
         for (j, o) in out.iter_mut().enumerate() {

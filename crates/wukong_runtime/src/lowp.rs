@@ -1593,6 +1593,28 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn boundary_extents_are_safe() {
+        // P14.6: bf16 bits 0x3F80 == 1.0; axpby with a=1,b=0 copies x; reduce sums to n.
+        let n = 3usize;
+        let x = vec![0x3F80u16; n];
+        let y = vec![0u16; n];
+        let mut out = vec![f32::from_bits(0x7fc0_0001); n];
+        unsafe {
+            wukong_axpby_bf16(x.as_ptr(), y.as_ptr(), out.as_mut_ptr(), 0, 1.0, 0.0);
+        }
+        assert!(
+            out.iter().all(|v| v.to_bits() == 0x7fc0_0001),
+            "nonpositive n must not write out"
+        );
+        unsafe {
+            wukong_axpby_bf16(x.as_ptr(), y.as_ptr(), out.as_mut_ptr(), n as i64, 1.0, 0.0);
+        }
+        assert_eq!(out, vec![1.0, 1.0, 1.0]);
+        let s = unsafe { wukong_reduce_bf16(x.as_ptr(), n as i64, crate::reduce::RED_SUM) };
+        assert_eq!(s, 3.0);
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn nt_alignment_narrow_peel() {

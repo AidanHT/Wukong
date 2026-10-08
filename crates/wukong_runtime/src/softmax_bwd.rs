@@ -154,6 +154,35 @@ pub unsafe extern "C" fn wukong_softmax_bwd_f32_parallel(
 mod tests {
     use super::*;
 
+    #[test]
+    fn boundary_extents_are_safe() {
+        // P14.6: the backward writes a finite dx for every element of a well-formed row.
+        let (rows, cols) = (1usize, 3usize);
+        let y = vec![0.3f32, 0.3, 0.4];
+        let dy = vec![1.0f32; rows * cols];
+        let mut dx = vec![f32::from_bits(0x7fc0_0001); rows * cols];
+        unsafe {
+            wukong_softmax_bwd_f32(y.as_ptr(), dy.as_ptr(), dx.as_mut_ptr(), 0, cols as i64);
+        }
+        assert!(
+            dx.iter().all(|v| v.to_bits() == 0x7fc0_0001),
+            "nonpositive rows must not write dx"
+        );
+        unsafe {
+            wukong_softmax_bwd_f32(
+                y.as_ptr(),
+                dy.as_ptr(),
+                dx.as_mut_ptr(),
+                rows as i64,
+                cols as i64,
+            );
+        }
+        assert!(
+            dx.iter().all(|v| v.is_finite()),
+            "scalar softmax backward must write finite dx"
+        );
+    }
+
     /// Reference using the **same** bit-exact dot the kernel delegates to, then the naive apply — so
     /// equality is literal (the kernel is its own oracle; this pins AVX2-apply == scalar-apply and
     /// serial == parallel across the 8-lane edge and the parallel row threshold).

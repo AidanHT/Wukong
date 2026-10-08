@@ -259,6 +259,25 @@ pub unsafe extern "C" fn wukong_rowargmin_i32_parallel(
 mod tests {
     use super::*;
 
+    #[test]
+    fn boundary_extents_are_safe() {
+        // P14.6: row argmax reduces across columns; the output has one entry per row.
+        let (rows, cols) = (2usize, 3usize);
+        let x = [3.0f32, 1.0, 2.0, 0.5, 9.0, 4.0];
+        let mut out = vec![-7i32; rows];
+        unsafe {
+            wukong_rowargmax_i32(x.as_ptr(), out.as_mut_ptr(), 0, cols as i64);
+        }
+        assert!(
+            out.iter().all(|&v| v == -7),
+            "nonpositive rows must not write out"
+        );
+        unsafe {
+            wukong_rowargmax_i32(x.as_ptr(), out.as_mut_ptr(), rows as i64, cols as i64);
+        }
+        assert_eq!(out, vec![0, 1]);
+    }
+
     /// Independent naive per-row reference: `best=0; for j in 1..cols { if x[r,j] {>,<} x[r,best] {
     /// best=j } }` — STRICT compare, so the lowest index wins on a tie (argmax uses `>`, argmin `<`).
     /// Computed without touching the kernel so it is a true oracle.

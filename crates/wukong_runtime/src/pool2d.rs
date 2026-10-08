@@ -567,6 +567,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn boundary_extents_are_safe() {
+        // P14.6: a single 2x2 max-pool window over one channel -> the window maximum.
+        let x = [1.0f32, 2.0, 3.0, 4.0];
+        let mut out = vec![f32::from_bits(0x7fc0_0001); 1];
+        unsafe {
+            wukong_maxpool2d_f32(x.as_ptr(), out.as_mut_ptr(), 1, 0, 2, 2, 2, 1, 1);
+        }
+        assert!(
+            out[0].to_bits() == 0x7fc0_0001,
+            "nonpositive h must not write out"
+        );
+        unsafe {
+            wukong_maxpool2d_f32(x.as_ptr(), out.as_mut_ptr(), 1, 2, 2, 2, 2, 1, 1);
+        }
+        assert_eq!(out, vec![4.0]);
+    }
+
+    #[test]
     fn pool2d_shared_shape_checked_spatial_extents() {
         assert_eq!(pool2d_output_dims(5, 8, 2, 3, 2, 3), Some((2, 2)));
         assert_eq!(pool2d_output_dims(4, 6, 4, 6, 99, 99), Some((1, 1)));

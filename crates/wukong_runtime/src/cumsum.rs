@@ -210,6 +210,25 @@ pub unsafe extern "C" fn wukong_cumsum_f32_parallel(
 mod tests {
     use super::*;
 
+    #[test]
+    fn boundary_extents_are_safe() {
+        // P14.6: a one-row cumulative sum over three columns.
+        let (rows, cols) = (1usize, 3usize);
+        let x = [1.0f32, 1.0, 1.0];
+        let mut out = vec![f32::from_bits(0x7fc0_0001); rows * cols];
+        unsafe {
+            wukong_cumsum_f32(x.as_ptr(), out.as_mut_ptr(), rows as i64, 0);
+        }
+        assert!(
+            out.iter().all(|v| v.to_bits() == 0x7fc0_0001),
+            "nonpositive cols must not write out"
+        );
+        unsafe {
+            wukong_cumsum_f32(x.as_ptr(), out.as_mut_ptr(), rows as i64, cols as i64);
+        }
+        assert_eq!(out, vec![1.0, 2.0, 3.0]);
+    }
+
     /// Deterministic, non-RNG input with a spread of signs/magnitudes so the prefix sums are
     /// non-trivial (and partial cancellation exercises the reassociation).
     fn fill(n: usize) -> Vec<f32> {

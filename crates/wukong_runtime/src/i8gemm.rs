@@ -874,6 +874,37 @@ pub unsafe extern "C" fn wukong_i8gemm_nt_deq_parallel(
 mod tests {
     use super::*;
 
+    #[test]
+    fn boundary_extents_are_safe() {
+        // P14.6: C = A * B^T, A [m,k] u8 ones, B [n,k] i8 ones -> C[i,j] = k.
+        let (m, k, n) = (2usize, 2usize, 2usize);
+        let a = vec![1u8; m * k];
+        let b = vec![1i8; n * k];
+        let mut c = vec![-7i32; m * n];
+        unsafe {
+            wukong_i8gemm_nt(
+                a.as_ptr(),
+                b.as_ptr(),
+                c.as_mut_ptr(),
+                0,
+                k as i64,
+                n as i64,
+            );
+        }
+        assert!(c.iter().all(|&v| v == -7), "nonpositive m must not write c");
+        unsafe {
+            wukong_i8gemm_nt(
+                a.as_ptr(),
+                b.as_ptr(),
+                c.as_mut_ptr(),
+                m as i64,
+                k as i64,
+                n as i64,
+            );
+        }
+        assert_eq!(c, vec![2, 2, 2, 2]);
+    }
+
     // Deterministic, varied fills (no RNG — reproducible). Activations span the full u8 range; weights
     // span the full i8 range, so products exercise both signs and the magnitude extremes.
     fn fill_u8(n: usize) -> Vec<u8> {

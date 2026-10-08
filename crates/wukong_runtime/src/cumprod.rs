@@ -135,6 +135,25 @@ pub unsafe extern "C" fn wukong_cumprod_f32_parallel(
 mod tests {
     use super::*;
 
+    #[test]
+    fn boundary_extents_are_safe() {
+        // P14.6: a one-row cumulative product over three columns.
+        let (rows, cols) = (1usize, 3usize);
+        let x = [2.0f32, 2.0, 2.0];
+        let mut out = vec![f32::from_bits(0x7fc0_0001); rows * cols];
+        unsafe {
+            wukong_cumprod_f32(x.as_ptr(), out.as_mut_ptr(), rows as i64, 0);
+        }
+        assert!(
+            out.iter().all(|v| v.to_bits() == 0x7fc0_0001),
+            "nonpositive cols must not write out"
+        );
+        unsafe {
+            wukong_cumprod_f32(x.as_ptr(), out.as_mut_ptr(), rows as i64, cols as i64);
+        }
+        assert_eq!(out, vec![2.0, 4.0, 8.0]);
+    }
+
     /// Inputs near 1 (in {0.5, 0.75, 1.0, 1.25, 1.5}) so the running product stays finite and modestly
     /// sized over the longest test row (no over/underflow), keeping every intermediate an ordinary finite
     /// f32 — `assert_eq!` on the bits is then meaningful.

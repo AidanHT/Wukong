@@ -865,6 +865,50 @@ unsafe fn attention_avx2(
 mod tests {
     use super::*;
 
+    #[test]
+    fn boundary_extents_are_safe() {
+        // P14.6: nonpositive extent is a no-op; a small positive extent drives the scalar path
+        // (Miri reaches the real raw-pointer body because AVX2 detection is false under Miri).
+        let (s, d) = (2usize, 2usize);
+        let q = vec![0.1f32; s * d];
+        let k = vec![0.1f32; s * d];
+        let v = vec![1.0f32; s * d];
+        let mut o = vec![f32::from_bits(0x7fc0_0001); s * d];
+        unsafe {
+            wukong_attention_f32(
+                q.as_ptr(),
+                k.as_ptr(),
+                v.as_ptr(),
+                o.as_mut_ptr(),
+                0,
+                d as i64,
+                0.125,
+                0,
+            );
+        }
+        assert!(
+            o.iter().all(|x| x.to_bits() == 0x7fc0_0001),
+            "nonpositive s must not write o"
+        );
+        unsafe {
+            wukong_attention_f32(
+                q.as_ptr(),
+                k.as_ptr(),
+                v.as_ptr(),
+                o.as_mut_ptr(),
+                s as i64,
+                d as i64,
+                0.125,
+                0,
+            );
+        }
+        // Equal scores -> softmax is uniform -> every output is the mean of v (all 1.0).
+        assert!(
+            o.iter().all(|x| x.is_finite()),
+            "scalar attention must write finite outputs"
+        );
+    }
+
     /// Shapes every correctness test walks. They straddle the 8-wide `D` remainder, the `qb % 2`
     /// and `kb % 4` score-tile edges, the `qb % 8` P*V edge, and — the ones the pre-P5 list could
     /// not reach, because the old kernel had no key blocking — the `ATT_BR = 32` query-block and

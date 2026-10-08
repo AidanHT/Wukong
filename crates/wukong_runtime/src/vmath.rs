@@ -2947,6 +2947,24 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn boundary_extents_are_safe() {
+        // P14.6: elementwise ReLU; nonpositive n is a no-op, small n drives the scalar path.
+        let x = [2.0f32, -1.0, 3.0];
+        let mut out = vec![f32::from_bits(0x7fc0_0001); x.len()];
+        unsafe {
+            wukong_vmath_f32(x.as_ptr(), out.as_mut_ptr(), 0, VM_RELU);
+        }
+        assert!(
+            out.iter().all(|v| v.to_bits() == 0x7fc0_0001),
+            "nonpositive n must not write out"
+        );
+        unsafe {
+            wukong_vmath_f32(x.as_ptr(), out.as_mut_ptr(), x.len() as i64, VM_RELU);
+        }
+        assert_eq!(out, vec![2.0, 0.0, 3.0]);
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn nt_alignment_unary_and_binary_peels() {

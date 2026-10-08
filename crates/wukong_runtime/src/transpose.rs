@@ -583,6 +583,25 @@ pub unsafe extern "C" fn wukong_transpose_u16_parallel(
 mod tests {
     use super::*;
 
+    #[test]
+    fn boundary_extents_are_safe() {
+        // P14.6: a [2,3] -> [3,2] transpose; dst[j*rows + i] = src[i*cols + j].
+        let (rows, cols) = (2usize, 3usize);
+        let src = [0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0];
+        let mut dst = vec![f32::from_bits(0x7fc0_0001); rows * cols];
+        unsafe {
+            wukong_transpose_f32(src.as_ptr(), dst.as_mut_ptr(), 0, cols as i64);
+        }
+        assert!(
+            dst.iter().all(|v| v.to_bits() == 0x7fc0_0001),
+            "nonpositive rows must not write dst"
+        );
+        unsafe {
+            wukong_transpose_f32(src.as_ptr(), dst.as_mut_ptr(), rows as i64, cols as i64);
+        }
+        assert_eq!(dst, vec![0.0, 3.0, 1.0, 4.0, 2.0, 5.0]);
+    }
+
     fn naive_transpose(src: &[f32], r: usize, c: usize) -> Vec<f32> {
         let mut dst = vec![0.0f32; r * c];
         for i in 0..r {

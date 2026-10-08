@@ -184,6 +184,35 @@ pub unsafe extern "C" fn wukong_lrscan_f32_parallel(
 mod tests {
     use super::*;
 
+    #[test]
+    fn boundary_extents_are_safe() {
+        // P14.6: a one-row linear-recurrence scan writes a finite output for every column.
+        let (rows, cols) = (1usize, 3usize);
+        let a = vec![0.5f32; rows * cols];
+        let b = vec![1.0f32; rows * cols];
+        let mut out = vec![f32::from_bits(0x7fc0_0001); rows * cols];
+        unsafe {
+            wukong_lrscan_f32(a.as_ptr(), b.as_ptr(), out.as_mut_ptr(), rows as i64, 0);
+        }
+        assert!(
+            out.iter().all(|v| v.to_bits() == 0x7fc0_0001),
+            "nonpositive cols must not write out"
+        );
+        unsafe {
+            wukong_lrscan_f32(
+                a.as_ptr(),
+                b.as_ptr(),
+                out.as_mut_ptr(),
+                rows as i64,
+                cols as i64,
+            );
+        }
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "scalar lrscan must write finite outputs"
+        );
+    }
+
     /// Per-step decay `a`, **bounded in (−1, 1)** (values in {−0.8, −0.6, …, 0.8}) so the recurrence is a
     /// contraction and `h` stays finite and modestly sized — keeping every intermediate an ordinary
     /// finite f32 (no inf/NaN, so `assert_eq!` on the bits is meaningful and the comparison is honest).

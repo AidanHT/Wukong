@@ -565,6 +565,47 @@ pub unsafe extern "C" fn wukong_layernorm_bwd_f32_parallel(
 mod tests {
     use super::*;
 
+    #[test]
+    fn boundary_extents_are_safe() {
+        // P14.6: the backward writes a finite dx for every element of a well-formed row.
+        let (rows, cols) = (2usize, 3usize);
+        let x = vec![0.5f32, -1.0, 2.0, 0.0, 1.0, -0.5];
+        let dy = vec![1.0f32; rows * cols];
+        let gamma = vec![1.0f32; cols];
+        let mut dx = vec![f32::from_bits(0x7fc0_0001); rows * cols];
+        let eps_bits = (1e-5f32).to_bits() as i64;
+        unsafe {
+            wukong_layernorm_bwd_f32(
+                x.as_ptr(),
+                dy.as_ptr(),
+                gamma.as_ptr(),
+                dx.as_mut_ptr(),
+                0,
+                cols as i64,
+                eps_bits,
+            );
+        }
+        assert!(
+            dx.iter().all(|v| v.to_bits() == 0x7fc0_0001),
+            "nonpositive rows must not write dx"
+        );
+        unsafe {
+            wukong_layernorm_bwd_f32(
+                x.as_ptr(),
+                dy.as_ptr(),
+                gamma.as_ptr(),
+                dx.as_mut_ptr(),
+                rows as i64,
+                cols as i64,
+                eps_bits,
+            );
+        }
+        assert!(
+            dx.iter().all(|v| v.is_finite()),
+            "scalar layernorm backward must write finite dx"
+        );
+    }
+
     const EPS: f32 = 1e-5;
 
     // Deterministic, mildly varied inputs (no RNG — reproducible). Distinct streams for x / dy / gamma.
