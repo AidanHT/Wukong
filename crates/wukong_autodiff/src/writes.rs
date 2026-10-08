@@ -65,17 +65,18 @@ pub fn written_params(func: &Function, interner: &Interner) -> Vec<bool> {
                 }
                 Op::Call { func: callee, args } => {
                     let name = interner.resolve(*callee);
+                    // `print`, `assert`, a file write: they read their buffers. Releasing one is
+                    // not a read, so `wukong_rt_free` stays a (conservative) write.
+                    let reads_only = is_effect_only(name) && name != "wukong_rt_free";
                     match kernel_by_name(name) {
                         Some(kind) if kind.arity() == args.len() => {
                             if let Some(oi) = kind.out_index() {
                                 mark(args[oi]);
                             }
                         }
+                        _ if reads_only => {}
                         // A kernel symbol with a foreign signature, or any other call.
-                        _ if !(is_effect_only(name) && name != "wukong_rt_free") => {
-                            args.iter().for_each(|&a| mark(a))
-                        }
-                        _ => {}
+                        _ => args.iter().for_each(|&a| mark(a)),
                     }
                 }
                 other => {

@@ -9,8 +9,9 @@
 | `tape_attn.rs` | The fused scaled-dot-product attention (`wukong_attention_f32`): the FlashAttention recompute of the weights, then the four adjoint GEMMs and the fused softmax backward |
 | `coverage.rs` | `NOT_DIFFERENTIABLE`: every emitted runtime symbol the tape declines, with the reason a user sees; effect-only calls (`print`, `assert`, ...) |
 | `inline.rs` | Call flattening: splice straight-line helper functions into the loss before differentiation |
+| `writes.rs` | `written_params`: which buffer parameters a function may write (a kernel's output operand, stores, unknown calls, escapes) — what lets `--train` run in place |
 | `optim.rs` | `build_adamw_step`, `adamw_step_name`, `hp` index module for AdamW hyperparameters |
-| `tests.rs` + `tests/` | Finite-difference + closed-form gate: per-rule tests, `kernels.rs` (new families), `attention.rs` (the fused attention), `memory.rs` (accumulation, in-place, stores), `calls.rs` (helpers, Hessian-vector products), `mirror.rs` (recognizer ↔ autodiff coupling) |
+| `tests.rs` + `tests/` | Finite-difference + closed-form gate: per-rule tests, `kernels.rs` (new families), `attention.rs` (the fused attention), `writes.rs` (`written_params`), `memory.rs` (accumulation, in-place, stores), `calls.rs` (helpers, Hessian-vector products), `mirror.rs` (recognizer ↔ autodiff coupling) |
 
 ## Adding a kernel rule
 
