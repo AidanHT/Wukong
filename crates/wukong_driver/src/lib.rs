@@ -270,9 +270,12 @@ fn no_recognize() -> bool {
 /// strips, which are the documented result-identical form, and its object runs on that level.
 fn lower_options_for(opts: &Options) -> wukong_mir_build::LowerOptions {
     wukong_mir_build::LowerOptions {
-        // Only a gradient request has an autodiff consumer for single-block float functions; every
+        // Only a gradient request (`--emit=grad`, `--train`, or the ahead-of-time export
+        // `--emit=obj --grad-of`) has an autodiff consumer for single-block float functions; every
         // other compile gets the compact copy loops (see `LowerOptions::unroll_for_autodiff`).
-        unroll_for_autodiff: opts.emit == EmitStage::Grad || opts.grad.train,
+        unroll_for_autodiff: opts.emit == EmitStage::Grad
+            || opts.grad.train
+            || exports_gradient(opts),
         recognize: !no_recognize(),
         vec_kernels: !matches!(opts.backend, BackendKind::GpuLower)
             && opts.target_cpu.allows_vec_kernels(),
@@ -537,6 +540,7 @@ pub fn compile(opts: &Options) -> i32 {
         return emit_grad(&program, &mut interner, opts);
     }
     if exports_gradient(opts) {
+        timer.begin("autodiff");
         if let Err(e) = append_gradient(&mut program, &mut interner, opts) {
             eprintln!("error: --emit=obj --grad-of: {e}");
             return exit::COMPILE_ERROR;

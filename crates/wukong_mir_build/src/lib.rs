@@ -929,9 +929,10 @@ pub struct LowerOptions {
     /// Keep the aggregate copies, zero-inits and `[agg; n]` fills of every float-returning
     /// function straight-line (up to [`AUTODIFF_UNROLL_MAX_BYTES`]) so it stays a single-block
     /// autodiff candidate. `true` by default, because library callers lower a program and then hand
-    /// any float function to `wukong_autodiff::grad`. The driver clears it unless `--emit=grad` or
-    /// `--train` asked for a gradient: an ordinary compile has no autodiff consumer, and the
-    /// unrolled form only costs IR size there (the compact counted loop is the same computation).
+    /// any float function to `wukong_autodiff::grad`. The driver clears it unless `--emit=grad`,
+    /// `--train` or `--emit=obj --grad-of` asked for a gradient: an ordinary compile has no
+    /// autodiff consumer, and the unrolled form only costs IR size there (the compact counted loop
+    /// is the same computation).
     pub unroll_for_autodiff: bool,
 
     /// Run the kernel recognizers (`true`, the default and the shipped behavior). When `false`,
