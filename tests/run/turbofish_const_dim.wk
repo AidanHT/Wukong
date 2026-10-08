@@ -1,0 +1,39 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 4
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+module tests.run.turbofish_const_dim
+
+// A `const` named in a turbofish is its VALUE, exactly as a `const` dimension in a type is
+// (`Tensor[f32, D]` with `const D: usize = 3` is 3 wide). Sema used to bind it as an opaque
+// dimension variable named after the const, which names no run-time slot, so lowering fell back to
+// the run-time extent of the `?` argument: `show::<W>(t)` saw all 6 elements of the 6-element buffer
+// while `show::<4>(t)` saw 4. Both calls below now read the first W = 4 elements. Expected values are
+// the array's own elements: the extent 4, then elements 0..4, twice.
+const W: usize = 4;
+
+fn show<N>(a: Tensor[i32, N]) {
+    print(a.dim(0));
+    for i in 0..N {
+        print(a[i]);
+    }
+}
+
+fn through(t: Tensor[i32, ?]) {
+    show::<4>(t);
+    show::<W>(t);
+}
+
+fn main() -> i32 {
+    let a: [i32; 6] = [1, 2, 3, 4, 5, 6];
+    through(a);
+    return 0;
+}

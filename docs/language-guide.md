@@ -547,6 +547,10 @@ faults:
 - `E0506` — a reshape (`x as Tensor[…]`) whose element count is not provably unchanged.
 - `E0507` — a misused view or extent query: a partial index of a non-contiguous tensor, an
   assignment to a view (`a[i] = …` on a rank-2 `a`), or a `.dim(k)` whose axis is not a constant.
+- `E0520` — a dimension of a call that nothing fixes: no turbofish, no argument shape, no solvable
+  element count and no `?` argument extent determines it — typically a `Tensor[f32, M, N]` parameter
+  fed a flat 12-element array. The help spells the turbofish (`total::<M, N>(..)`). A `const` named in
+  a turbofish (`f::<W>(t)`) is its value, exactly as in a type.
 
 **A shape error names what disagrees.** The primary message carries the dimension and both values,
 so the fix is readable without opening the callee:

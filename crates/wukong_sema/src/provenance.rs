@@ -27,9 +27,10 @@
 use wukong_ast::{Expr, FnDecl};
 use wukong_diag::Diagnostic;
 use wukong_span::{FxHashMap as HashMap, Span, Symbol};
+use wukong_types::{Dim, Ty};
 
 use crate::shape::DimSite;
-use crate::Sema;
+use crate::{FnSig, Sema};
 
 /// Where a call's dimension variable got its value.
 #[derive(Clone, Copy)]
@@ -108,6 +109,31 @@ fn arg_desc(index: usize, receiver: bool) -> String {
 
 fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// The dimension variables a parameter type's tensor shapes use, in first-seen order, through
+/// pointer, reference, slice, array and tuple structure — `mir_build`'s `collect_symbolic_dims`, the
+/// set of dimensions lowering passes as hidden arguments.
+fn collect_param_dims(t: &Ty, out: &mut Vec<Symbol>) {
+    match t {
+        Ty::Tensor { shape, .. } => {
+            for s in shape.symbolic_dims() {
+                if !out.contains(&s) {
+                    out.push(s);
+                }
+            }
+        }
+        Ty::Ptr { pointee, .. } | Ty::Ref { pointee, .. } | Ty::Slice(pointee) => {
+            collect_param_dims(pointee, out)
+        }
+        Ty::Array { elem, .. } => collect_param_dims(elem, out),
+        Ty::Tuple(items) => {
+            for it in items {
+                collect_param_dims(it, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 impl Sema<'_> {
@@ -327,6 +353,142 @@ impl Sema<'_> {
         self.diags.push(d);
     }
 
+    /// `E0520`: after a call's parameters are unified and its derived extents solved, a dimension
+    /// that the callee's parameter shapes use is still unknown. Lowering passes every such dimension
+    /// as a hidden `i64` argument (`mir_build::symbolic_dim_params`) and finds it exactly where this
+    /// check looks — a turbofish, an argument's shape, a solved equation, or the run-time extent of
+    /// a `?` axis of a tensor argument at the same position — so an unbound one used to surface only
+    /// in lowering, as the codegen limit `C0001`. Silent when the call already reported an error
+    /// (`errors_before`) or an argument's type is not known, so it never cascades.
+    pub(crate) fn check_call_dims_bound(
+        &mut self,
+        sig: &FnSig,
+        arg_tys: &[Ty],
+        dims: &HashMap<Symbol, Dim>,
+        span: Span,
+        site: &CallSite,
+        errors_before: usize,
+    ) {
+        // An argument whose type is not concrete here — not known, or a type parameter of the caller
+        // that each instantiation substitutes before lowering — may still bind a dimension then.
+        if self.diags[errors_before..].iter().any(|d| d.is_error())
+            || arg_tys.iter().any(|t| self.is_opaque_arg(t))
+        {
+            return;
+        }
+        let mut used = Vec::new();
+        for p in &sig.params {
+            collect_param_dims(p, &mut used);
+        }
+        // A `?` axis of a tensor argument passed where the parameter has a plain `N`: lowering reads
+        // the run-time extent (the `?` escape hatch binds nothing at compile time).
+        let mut at_runtime: Vec<Symbol> = Vec::new();
+        for (p, a) in sig.params.iter().zip(arg_tys) {
+            if let (Ty::Tensor { shape: ps, .. }, Ty::Tensor { shape: as_, .. }) = (p, a) {
+                if ps.rank() == as_.rank() {
+                    for (pd, ad) in ps.0.iter().zip(&as_.0) {
+                        if let (Dim::Var(g), Dim::Dynamic) = (pd, ad) {
+                            at_runtime.push(*g);
+                        }
+                    }
+                }
+            }
+        }
+        let unbound: Vec<Symbol> = used
+            .into_iter()
+            .filter(|g| {
+                sig.generics.contains(g) && !dims.contains_key(g) && !at_runtime.contains(g)
+            })
+            .collect();
+        let Some(&first) = unbound.first() else {
+            return;
+        };
+        let names: Vec<String> = unbound
+            .iter()
+            .map(|g| format!("`{}`", self.sym_str(*g)))
+            .collect();
+        let listed = match names.len() {
+            1 => names[0].clone(),
+            n => format!("{} and {}", names[..n - 1].join(", "), names[n - 1]),
+        };
+        let fname = site.callee.map(|f| self.callee_display(f));
+        let of = fname
+            .as_ref()
+            .map(|f| format!(" of `{f}`"))
+            .unwrap_or_default();
+        let (what, label) = if unbound.len() == 1 {
+            ("dimension", format!("{listed} is fixed by no argument"))
+        } else {
+            ("dimensions", format!("{listed} are fixed by no argument"))
+        };
+        let mut d = Diagnostic::error(format!("cannot infer {what} {listed}{of}"))
+            .with_code("E0520")
+            .primary(span, label);
+        // The parameter that declares the first one, and why its argument could not fix it.
+        if let Some(i) = sig.params.iter().position(|p| {
+            let mut v = Vec::new();
+            collect_param_dims(p, &mut v);
+            v.contains(&first)
+        }) {
+            if let Some(f) = site.callee {
+                if let Some(&(pname, pspan)) =
+                    self.provenance.params.get(&f).and_then(|ps| ps.get(i))
+                {
+                    if !pspan.is_dummy() {
+                        let (fs, pn) = (self.callee_display(f), self.sym_str(pname).to_string());
+                        d = d.secondary(
+                            pspan,
+                            format!(
+                                "`{}` is declared in parameter `{pn}` of `{fs}`",
+                                self.sym_str(first)
+                            ),
+                        );
+                    }
+                }
+            }
+            if let (Some(Ty::Tensor { shape, .. }), Some(Ty::Array { len, .. })) =
+                (sig.params.get(i), arg_tys.get(i))
+            {
+                if shape.rank() >= 2 {
+                    d = d.note(format!(
+                        "an array argument fixes only the element count of a multi-axis tensor \
+                         parameter, and {len} elements can be split over more than one free axis \
+                         in more than one way"
+                    ));
+                }
+            }
+        }
+        if let Some(f) = fname {
+            let args: Vec<String> = sig
+                .generics
+                .iter()
+                .map(|g| match dims.get(g) {
+                    Some(dim) => self.dim_str(dim),
+                    None => self.sym_str(*g).to_string(),
+                })
+                .collect();
+            d = d.help(format!(
+                "supply the dimensions with a turbofish: `{f}::<{}>(..)`",
+                args.join(", ")
+            ));
+        }
+        self.diags.push(d);
+    }
+
+    /// Whether `t` is `Unknown`/`Error` or mentions a type parameter of the enclosing item.
+    fn is_opaque_arg(&self, t: &Ty) -> bool {
+        match t {
+            Ty::Unknown | Ty::Error => true,
+            Ty::Named(n) => self.generics.contains(n),
+            Ty::Ptr { pointee, .. } | Ty::Ref { pointee, .. } | Ty::Slice(pointee) => {
+                self.is_opaque_arg(pointee)
+            }
+            Ty::Array { elem, .. } => self.is_opaque_arg(elem),
+            Ty::Tuple(items) => items.iter().any(|it| self.is_opaque_arg(it)),
+            _ => false,
+        }
+    }
+
     /// A function's name as the program spells it: a method `Type.m` reads `Type::m`.
     fn callee_display(&self, f: Symbol) -> String {
         let s = self.sym_str(f);
@@ -489,5 +651,82 @@ mod tests {
             generic.message,
             "function `g` takes 1 generic argument but 2 were supplied"
         );
+    }
+
+    fn codes(src: &str) -> Vec<&'static str> {
+        let mut interner = Interner::new();
+        let (module, pdiags) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pdiags.is_empty(), "parse errors: {pdiags:?}");
+        crate::check(&module, &interner)
+            .1
+            .iter()
+            .filter_map(|d| d.code)
+            .collect()
+    }
+
+    const TOTAL: &str = "fn total<M, N>(a: Tensor[f32, M, N]) -> f32 { return 0.0; } ";
+
+    #[test]
+    fn a_dimension_no_argument_fixes_is_reported_at_the_call() {
+        let d = first(
+            &format!(
+                "{TOTAL} fn main() -> i32 {{ let a: [f32; 12] = [1.0; 12]; \
+                 return total(a) as i32; }}"
+            ),
+            "E0520",
+        );
+        assert_eq!(d.message, "cannot infer dimensions `M` and `N` of `total`");
+        assert!(
+            d.notes
+                .iter()
+                .any(|(_, m)| m.contains("`total::<M, N>(..)`")),
+            "{d:?}"
+        );
+        assert_eq!(
+            labels(&d),
+            vec![
+                (true, "`M` and `N` are fixed by no argument"),
+                (false, "`M` is declared in parameter `a` of `total`"),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_source_of_a_dimension_binds_it() {
+        const S: &str = "fn s<N>(a: Tensor[f32, N]) -> f32 { return 0.0; } ";
+        for src in [
+            // A turbofish.
+            format!(
+                "{TOTAL} fn main() -> i32 {{ let a: [f32; 12] = [1.0; 12]; \
+                 return total::<3, 4>(a) as i32; }}"
+            ),
+            // Solved from the element count once the other axis is fixed.
+            "fn rows<N>(a: Tensor[f32, N, 4]) -> f32 { return 0.0; } \
+             fn main() -> i32 { let a: [f32; 12] = [1.0; 12]; return rows(a) as i32; }"
+                .to_string(),
+            // A `?` axis of a tensor argument: the run-time extent.
+            format!("{S} fn f(t: Tensor[f32, ?]) -> f32 {{ return s(t); }}"),
+            // A caller's own dimension.
+            format!("{S} fn f<M>(t: Tensor[f32, M]) -> f32 {{ return s(t); }}"),
+            // A caller's type parameter is substituted before lowering.
+            format!("{S} fn f<T>(t: T) -> f32 {{ return s(t); }}"),
+            // A `const` turbofish.
+            format!(
+                "const W: usize = 4; {S} fn f(t: Tensor[f32, ?]) -> f32 {{ return s::<W>(t); }}"
+            ),
+        ] {
+            let cs = codes(&src);
+            assert!(!cs.contains(&"E0520"), "{src}: {cs:?}");
+        }
+    }
+
+    /// A `const` named in a turbofish is its value, so the argument is checked against it.
+    #[test]
+    fn a_const_turbofish_is_its_value() {
+        let src = "const W: usize = 4; fn s<N>(a: Tensor[f32, N]) -> f32 { return 0.0; } \
+                   fn main() -> i32 { let a: [f32; 5] = [0.0; 5]; return s::<W>(a) as i32; }";
+        assert!(codes(src).contains(&"E0501"), "{:?}", codes(src));
+        let fits = src.replace("[f32; 5] = [0.0; 5]", "[f32; 4] = [0.0; 4]");
+        assert!(codes(&fits).is_empty(), "{:?}", codes(&fits));
     }
 }

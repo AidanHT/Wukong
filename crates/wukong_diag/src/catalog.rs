@@ -576,6 +576,22 @@ static CATALOG: &[Explanation] = &[
          elements with one index per axis. The axis of `t.dim(k)` must be a compile-time \
          constant, because each axis of a shape-typed value has its own extent."
     ),
+    entry!(
+        "E0520",
+        "cannot infer a dimension of a call",
+        "Every dimension a function's parameter shapes use must be known at each call, because the \
+         compiled function receives it as a hidden argument. A dimension is known when an explicit \
+         turbofish gives it (`f::<3, 4>(a)`), when an argument's tensor shape or a fixed array's \
+         length fixes it, when it can be solved from a derived extent or an element count (a \
+         `Tensor[f32, N, 4]` fed a `[f32; 12]` has `N = 3`), or, at run time, from a `?` axis of a \
+         tensor argument. This error means none of those applies — typically a multi-axis tensor \
+         parameter fed a flat array whose length could be split over its free axes in more than \
+         one way (`Tensor[f32, M, N]` fed 12 elements). Supply the dimensions with a turbofish, or \
+         pass a tensor whose type spells its shape. It used to surface only in lowering, as the \
+         codegen limit `C0001`.",
+        bad: "module ex.e0520\nfn total<M, N>(a: Tensor[f32, M, N]) -> f32 {\n    let mut s: f32 = 0.0;\n    for i in 0..M {\n        for j in 0..N {\n            s = s + a[i, j];\n        }\n    }\n    return s;\n}\nfn main() -> i32 {\n    let a: [f32; 12] = [1.0; 12];\n    return total(a) as i32;\n}\n",
+        good: "module ex.e0520\nfn total<M, N>(a: Tensor[f32, M, N]) -> f32 {\n    let mut s: f32 = 0.0;\n    for i in 0..M {\n        for j in 0..N {\n            s = s + a[i, j];\n        }\n    }\n    return s;\n}\nfn main() -> i32 {\n    let a: [f32; 12] = [1.0; 12];\n    return total::<3, 4>(a) as i32;\n}\n"
+    ),
     // ---- Warnings (lints). Each has a name for `-A/-W/-D <name>` and `@allow/@warn/@deny(name)`;
     // `-D warnings` makes every warning an error. Lints run only on a program that checks clean.
     entry!(

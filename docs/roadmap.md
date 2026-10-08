@@ -99,6 +99,14 @@ another architecture or OS is not supported. A native-backend failure is a catal
   argument, with labels naming the argument axis or turbofish that fixed the dimension and the
   callee parameter that declares it; `E0503` names the callee and labels its definition and the
   extra or missing arguments (pinned in JSON by `crates/wukongc/tests/fail.rs`).
+- **Every call dimension is known at type-check time.** A dimension a callee's parameter shapes use
+  that no turbofish, argument shape, solvable element count or `?` argument extent fixes is `E0520`
+  at the call (with the turbofish to write), instead of the lowering-time `C0001` it used to be
+  (`tests/fail/dim_uninferable.wk`). A `const` named in a turbofish is its value, as in a type — it
+  used to be an opaque variable that lowering replaced with a `?` argument's run-time extent
+  (`tests/run/turbofish_const_dim.wk`). Still open: a turbofish naming a run-time *variable*
+  (`f::<n>(..)`) binds the dimension to that variable by name, so an escaping result type re-reads
+  `n` — mutating or shadowing `n` after the call changes that tensor's extent.
 - Functions (including recursion and mutual recursion — the interpreter oracle runs on a
   512 MiB worker thread, so ordinary recursion does not overflow the host's small default stack), and
   direct calls. *Caveat:* the tree-walking interpreter's call frames are ~an order of magnitude larger

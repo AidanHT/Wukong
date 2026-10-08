@@ -22,6 +22,11 @@ All notable changes to Wukong are documented here. The format is loosely based o
   parameter (Futhark-style "fixed here"); an arity error (`E0503`) names the callee (`Type::method`
   for a method, counting after the receiver), labels its definition and each extra argument, and
   lists the missing parameters. The headline messages are unchanged.
+- **New code `E0520`: cannot infer a dimension of a call.** A dimension the callee's parameter shapes
+  use that nothing fixes (no turbofish, argument shape, solvable element count or `?` argument
+  extent) is reported at the call with the turbofish to write; it used to surface in lowering as
+  `C0001`. A `const` named in a turbofish (`f::<W>(t)`) is now its value, as in a type, where it was
+  an opaque variable that lowering replaced with the `?` argument's run-time extent.
 
 ### Optimizer memory passes: SROA, path DSE, loop deletion, guarded LICM, scalar promotion (`gap/opt-memory`)
 

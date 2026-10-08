@@ -428,6 +428,7 @@ transpose_f32_blocked.wk: wukong_transpose_f32
 trig.wk: wukong_rt_trig_f32 wukong_rt_trig_f32*6 wukong_vmath_f32 wukong_vmath_f32*3
 trig_inverse.wk: wukong_rt_trig_f32 wukong_rt_trig_f32*2 wukong_vmath_f32
 tuple.wk:
+turbofish_const_dim.wk:
 u64_literal.wk:
 uninit_zero.wk:
 unsigned.wk:

@@ -580,6 +580,7 @@ impl Sema<'_> {
         // Record where every dimension is bound from here on, so a conflict can name the argument
         // or turbofish that fixed it (`provenance.rs`).
         let outer_call = self.begin_call(site);
+        let errors_before = self.diags.len();
         if !generic_args.is_empty() {
             for (g, ga) in sig.generics.iter().zip(generic_args) {
                 match &ga.kind {
@@ -601,7 +602,20 @@ impl Sema<'_> {
                                 tys.insert(*g, Ty::Scalar(sc));
                             }
                             None => {
-                                dims.insert(*g, Dim::Var(nm));
+                                // A top-level `const` (not shadowed by a local or one of the
+                                // caller's generics) is its VALUE, exactly as a `const` dimension
+                                // in a type is (`lower_dim`). Bound as `Var(C)` it named no slot,
+                                // so lowering fell back to a `?` argument's run-time extent and
+                                // `f::<C>(t)` disagreed with `f::<4>(t)`.
+                                let is_const = !self.generics.contains(&nm)
+                                    && self.lookup_local(nm).is_none()
+                                    && self.consts.contains_key(&nm);
+                                let d = if is_const {
+                                    Dim::Const(self.const_length(nm, 0))
+                                } else {
+                                    Dim::Var(nm)
+                                };
+                                dims.insert(*g, d);
                                 self.note_turbofish_dim(*g, ga.span);
                             }
                         }
@@ -650,6 +664,9 @@ impl Sema<'_> {
         self.set_call_arg(None);
         let pending = std::mem::replace(&mut self.pending_dims, outer_pending);
         self.solve_pending_dims(&sig.generics, &mut dims, pending);
+        // Every dimension the callee's parameters use must now be known — bound, solved, or a `?`
+        // argument's run-time extent — or lowering has no value to pass for it (`E0520`).
+        self.check_call_dims_bound(sig, arg_tys, &dims, span, site, errors_before);
         self.end_call(outer_call);
         // A derived extent of the RETURN type must still be an extent once this call's dims are
         // known (`-> Tensor[f32, N - 4]` called with `N = 2` has no result shape).
