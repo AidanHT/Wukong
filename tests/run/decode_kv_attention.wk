@@ -1,0 +1,195 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 100
+// EXPECT-OUT: 101
+// EXPECT-OUT: 102
+// EXPECT-OUT: 103
+// EXPECT-OUT: 100
+// EXPECT-OUT: 101
+// EXPECT-OUT: 102
+// EXPECT-OUT: 103
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 110
+// EXPECT-OUT: 111
+// EXPECT-OUT: 112
+// EXPECT-OUT: 113
+// EXPECT-OUT: 100
+// EXPECT-OUT: 101
+// EXPECT-OUT: 102
+// EXPECT-OUT: 103
+// EXPECT-OUT: 20
+// EXPECT-OUT: 21
+// EXPECT-OUT: 22
+// EXPECT-OUT: 23
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 120
+// EXPECT-OUT: 121
+// EXPECT-OUT: 122
+// EXPECT-OUT: 123
+// EXPECT-OUT: 100
+// EXPECT-OUT: 101
+// EXPECT-OUT: 102
+// EXPECT-OUT: 103
+// EXPECT-OUT: 30
+// EXPECT-OUT: 31
+// EXPECT-OUT: 32
+// EXPECT-OUT: 33
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 130
+// EXPECT-OUT: 131
+// EXPECT-OUT: 132
+// EXPECT-OUT: 133
+// EXPECT-OUT: 100
+// EXPECT-OUT: 101
+// EXPECT-OUT: 102
+// EXPECT-OUT: 103
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 20
+// EXPECT-OUT: 21
+// EXPECT-OUT: 22
+// EXPECT-OUT: 23
+// EXPECT-OUT: 110
+// EXPECT-OUT: 111
+// EXPECT-OUT: 112
+// EXPECT-OUT: 113
+// EXPECT-OUT: 100
+// EXPECT-OUT: 101
+// EXPECT-OUT: 102
+// EXPECT-OUT: 103
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 30
+// EXPECT-OUT: 31
+// EXPECT-OUT: 32
+// EXPECT-OUT: 33
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 18
+// EXPECT-OUT: 130
+// EXPECT-OUT: 131
+// EXPECT-OUT: 132
+// EXPECT-OUT: 133
+// EXPECT-OUT: 115
+// EXPECT-OUT: 116
+// EXPECT-OUT: 117
+// EXPECT-OUT: 118
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+module tests.run.decode_kv_attention
+
+// KV-cache decode attention (`sdpa_kv`) and the cache append (`kv_append`), every output lane
+// printed. Geometry: d = 4, four query heads over two KV heads (GQA groups of two: query heads 0-1
+// read KV head 0, heads 2-3 read KV head 1), packed rows (`q_stride = 16`, `kv_stride = 8`), a
+// four-token cache filled one token per step, `scale = 1`, causal.
+//
+// Token j's keys are one-hot: KV head 0 holds e_j, KV head 1 holds e_(3-j). Its values encode
+// (token, KV head, lane): V[j][g][c] = 10j + 100g + c. A query of 200 along one axis scores 200 on
+// the key it picks and 0 on the others; exp(-200) is below the kernel's exp flush point, so that
+// key's weight is exactly 1 and every other exactly 0, and the output lane is the picked value
+// exactly. A zero query scores every visible key alike, so the output is their mean (exact here:
+// four keys, small integers). Expected values are those definitions evaluated by hand - the
+// defining formula softmax(q.k) . v over the visible keys - never read back from a backend:
+//
+//   decode step t (sq = 1, cache length t + 1, q_pos0 = t), lanes per head:
+//     head 0 picks key t on KV head 0 -> 10t + c;   head 1 picks key 0 -> c;
+//     head 2 picks key t on KV head 1 -> 10t + 100 + c;   head 3 picks key 0 -> 100 + c.
+//   chunked call over the full cache (sq = 2, q_pos0 = 2, so row 0 sees keys 0..2 and row 1 all
+//   four), with a padded query/output stride of 20 whose four pad lanes per row start at -1 and must
+//   stay -1:
+//     row 0: head 0 aims 200 at key 3 (masked) and 100 at key 1 -> key 1 wins: 10..13; head 1 picks
+//            key 2: 20..23; head 2 aims 200 at key 3 (masked) and 100 at key 1: 110..113; head 3
+//            picks key 0: 100..103.
+//     row 1: the same head-0 / head-2 queries now see key 3: 30..33 and 130..133; heads 1 and 3
+//            are zero queries: the mean over four keys, 15..18 and 115..118.
+// A wrong KV-head mapping, a mask off by one, a stride slip or a write into the pad changes a lane.
+// The census pins the dispatch: two `wukong_kv_append_f32` call sites and two
+// `wukong_attention_kv_f32` call sites.
+
+fn main() -> i32 {
+    let mut kc: [f32; 32] = [0.0; 32];
+    let mut vc: [f32; 32] = [0.0; 32];
+    let mut krow: [f32; 8] = [0.0; 8];
+    let mut vrow: [f32; 8] = [0.0; 8];
+    let mut q: [f32; 16] = [0.0; 16];
+    let mut o: [f32; 16] = [0.0; 16];
+    let mut t: i64 = 0;
+    while t < 4 {
+        let mut c: i64 = 0;
+        while c < 4 {
+            krow[c] = if c == t { 1.0 } else { 0.0 };
+            krow[4 + c] = if c == 3 - t { 1.0 } else { 0.0 };
+            vrow[c] = (10 * t + c) as f32;
+            vrow[4 + c] = (10 * t + 100 + c) as f32;
+            c = c + 1;
+        }
+        kv_append(kc, krow, t, 8);
+        kv_append(vc, vrow, t, 8);
+        c = 0;
+        while c < 16 {
+            q[c] = 0.0;
+            c = c + 1;
+        }
+        q[t] = 200.0;
+        q[4] = 200.0;
+        q[8 + 3 - t] = 200.0;
+        q[15] = 200.0;
+        sdpa_kv(q, kc, vc, o, 1, t + 1, 4, t, 4, 2, 16, 8, 1.0, true);
+        c = 0;
+        while c < 16 {
+            print(o[c]);
+            c = c + 1;
+        }
+        t = t + 1;
+    }
+
+    // A chunked prefill over the full cache: two query rows at positions 2 and 3, padded stride.
+    let mut q2: [f32; 40] = [0.0; 40];
+    let mut o2: [f32; 40] = [-1.0; 40];
+    let mut r: i64 = 0;
+    while r < 2 {
+        let base = r * 20;
+        q2[base + 3] = 200.0;
+        q2[base + 1] = 100.0;
+        q2[base + 8] = 200.0;
+        q2[base + 10] = 100.0;
+        r = r + 1;
+    }
+    q2[6] = 200.0;
+    q2[15] = 200.0;
+    sdpa_kv(q2, kc, vc, o2, 2, 4, 4, 2, 4, 2, 20, 8, 1.0, 1);
+    let mut e: i64 = 0;
+    while e < 40 {
+        print(o2[e]);
+        e = e + 1;
+    }
+    return 0;
+}
