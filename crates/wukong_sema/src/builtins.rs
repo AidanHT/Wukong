@@ -96,7 +96,7 @@ pub enum Activation {
 }
 
 /// One dimension of a builtin call, as sema resolved it. `mir_build` materializes each as an `i64`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BuiltinDim {
     /// A compile-time extent.
     Const(u64),
@@ -107,6 +107,10 @@ pub enum BuiltinDim {
     /// A runtime extent: the length of slice argument `arg`, divided by `div` (the product of the
     /// operand's other, constant, dimensions — `div` is 1 for a rank-1 operand).
     SliceLen { arg: usize, div: u64 },
+    /// A runtime extent derived from other dimensions — a tensor operand's `3*D` or `H*HD`
+    /// (`wukong_types::Dim::Expr`, never a bare constant or variable) — which `mir_build` evaluates
+    /// from the in-scope dimension bindings exactly as a tensor stride does.
+    Derived(Dim),
 }
 
 /// The resolution of one builtin call, keyed by the call expression's `NodeId`.
@@ -386,9 +390,10 @@ fn builtin_name(kind: KernelBuiltin) -> &'static str {
 }
 
 /// The inference state of one builtin dimension.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum Res {
-    /// Fixed by a turbofish, a tensor shape or an array length: a `Dim::Const` or `Dim::Var`.
+    /// Fixed by a turbofish, a tensor shape or an array length: a `Dim::Const`, a `Dim::Var`, or a
+    /// derived `Dim::Expr` from a tensor operand's shape.
     Static(Dim),
     /// The runtime length of slice argument `arg`, divided by `div`.
     Slice { arg: usize, div: u64 },
@@ -422,10 +427,13 @@ fn array_leaf(t: &Ty) -> &Ty {
     }
 }
 
-fn dims_same(a: Dim, b: Dim) -> bool {
+/// Two extents provably equal: the normal form makes structural equality semantic for constants,
+/// variables and derived extents alike (`2*N` and `N + N` are one `Dim`); a `?` equals nothing.
+fn dims_same(a: &Dim, b: &Dim) -> bool {
     match (a, b) {
         (Dim::Const(x), Dim::Const(y)) => x == y,
         (Dim::Var(x), Dim::Var(y)) => x == y,
+        (Dim::Expr(x), Dim::Expr(y)) => x == y,
         _ => false,
     }
 }
@@ -482,16 +490,12 @@ impl Sema<'_> {
         }
     }
 
-    fn builtin_dim_str(&self, d: Dim) -> String {
-        match d {
-            Dim::Const(n) => n.to_string(),
-            Dim::Var(s) => self.sym_str(s).to_string(),
-            Dim::Dynamic => "?".to_string(),
-        }
+    fn builtin_dim_str(&self, d: &Dim) -> String {
+        d.display(self.interner)
     }
 
     fn builtin_shape_str(&self, dims: &[Dim]) -> String {
-        let parts: Vec<String> = dims.iter().map(|d| self.builtin_dim_str(*d)).collect();
+        let parts: Vec<String> = dims.iter().map(|d| self.builtin_dim_str(d)).collect();
         format!("[{}]", parts.join(", "))
     }
 
@@ -598,12 +602,13 @@ impl Sema<'_> {
         if matches!(d, Dim::Dynamic) {
             return;
         }
-        match state[idx] {
+        match &state[idx] {
             None => state[idx] = Some(Res::Static(d)),
             Some(Res::Static(b)) => {
-                if !dims_same(b, d) {
-                    let extra = match (b, d) {
-                        (Dim::Const(_), Dim::Var(_)) | (Dim::Var(_), Dim::Const(_)) => {
+                if !dims_same(b, &d) {
+                    let extra = match (b, &d) {
+                        (Dim::Const(_), Dim::Var(_) | Dim::Expr(_))
+                        | (Dim::Var(_) | Dim::Expr(_), Dim::Const(_)) => {
                             " (a generic or runtime dimension cannot be assumed equal to a \
                              different extent)"
                         }
@@ -617,7 +622,7 @@ impl Sema<'_> {
                              {}{extra}",
                             spec.dims[idx],
                             self.builtin_dim_str(b),
-                            self.builtin_dim_str(d)
+                            self.builtin_dim_str(&d)
                         ),
                     );
                 }
@@ -782,8 +787,8 @@ impl Sema<'_> {
             }
             for (i, ga) in generic_args.iter().enumerate() {
                 if let Some((d, unsigned)) = self.builtin_turbofish_dim(ga, builtin) {
-                    if let (Dim::Var(name), true) = (d, unsigned) {
-                        unsigned_names.push(name);
+                    if let (Dim::Var(name), true) = (&d, unsigned) {
+                        unsigned_names.push(*name);
                     }
                     self.bind_builtin_dim(&mut state, spec, builtin, i, d, "turbofish", ga.span);
                 }
@@ -831,8 +836,9 @@ impl Sema<'_> {
             let pr = dims.len();
             let ar = shape.len();
             if ar == pr {
-                for (axis, (&di, &d)) in dims.iter().zip(&shape).enumerate() {
+                for (axis, (&di, d)) in dims.iter().zip(&shape).enumerate() {
                     let what = format!("axis {axis} of `{name}`");
+                    let d = d.clone();
                     self.bind_builtin_dim(&mut state, spec, builtin, di, d, &what, args[i].span);
                 }
             } else if spec.flat && pr == 1 {
@@ -886,7 +892,7 @@ impl Sema<'_> {
                     spec,
                     builtin,
                     dims[1],
-                    shape[0],
+                    shape[0].clone(),
                     &what,
                     args[i].span,
                 );
@@ -936,8 +942,8 @@ impl Sema<'_> {
                     if d == free[0] {
                         continue;
                     }
-                    div = match (div, state[d]) {
-                        (Some(acc), Some(Res::Static(Dim::Const(n)))) => acc.checked_mul(n),
+                    div = match (div, &state[d]) {
+                        (Some(acc), Some(Res::Static(Dim::Const(n)))) => acc.checked_mul(*n),
                         _ => None,
                     };
                 }
@@ -980,10 +986,10 @@ impl Sema<'_> {
             let mut need: Option<u64> = Some(1);
             let mut shape = Vec::with_capacity(dims.len());
             for &d in dims.iter() {
-                match state[d] {
+                match &state[d] {
                     Some(Res::Static(Dim::Const(n))) => {
-                        need = need.and_then(|acc| acc.checked_mul(n));
-                        shape.push(Dim::Const(n));
+                        need = need.and_then(|acc| acc.checked_mul(*n));
+                        shape.push(Dim::Const(*n));
                     }
                     _ => need = None,
                 }
@@ -1022,6 +1028,7 @@ impl Sema<'_> {
                     arg: *arg,
                     div: *div,
                 },
+                Some(Res::Static(d @ Dim::Expr(_))) => BuiltinDim::Derived(d.clone()),
                 // Unreachable: Dynamic is never bound and `None` returned above.
                 _ => BuiltinDim::Const(0),
             })
@@ -1061,8 +1068,8 @@ impl Sema<'_> {
                     if d == free[0] {
                         continue;
                     }
-                    prod = match (prod, state[d]) {
-                        (Some(acc), Some(Res::Static(Dim::Const(n)))) => acc.checked_mul(n),
+                    prod = match (prod, &state[d]) {
+                        (Some(acc), Some(Res::Static(Dim::Const(n)))) => acc.checked_mul(*n),
                         _ => None,
                     };
                 }
@@ -1210,14 +1217,15 @@ impl Sema<'_> {
             if shape.len() != 2 {
                 continue;
             }
-            for (axis, &dim) in shape.iter().enumerate() {
+            for (axis, dim) in shape.iter().enumerate() {
                 if matches!(dim, Dim::Dynamic) {
                     continue;
                 }
                 let which = if axis == 0 { "S" } else { "D" };
-                match sd[axis] {
-                    None => sd[axis] = Some((dim, *i)),
+                match &sd[axis] {
+                    None => sd[axis] = Some((dim.clone(), *i)),
                     Some((b, j)) => {
+                        let j = *j;
                         if !dims_same(b, dim) {
                             self.error(
                                 args[*i].span,
@@ -1236,7 +1244,7 @@ impl Sema<'_> {
                 }
                 let value = if axis == 0 { s } else { d };
                 if let (Some(v), Dim::Const(n)) = (value, dim) {
-                    if v != n {
+                    if v != *n {
                         let arg = if axis == 0 { "s" } else { "d" };
                         self.error(
                             args[*i].span,

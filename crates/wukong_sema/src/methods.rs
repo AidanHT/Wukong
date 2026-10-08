@@ -146,10 +146,11 @@ fn mentions(t: &Ty, g: Symbol) -> bool {
 
 impl Sema<'_> {
     /// Lower a parameter's type. A function type is legal here — and only here, for a function
-    /// with a body (an `extern` callback has no compile-time-known callee).
+    /// with a body (an `extern` callback has no compile-time-known callee). A shape-generic array
+    /// parameter (`[f32; N]`) is the tensor it denotes (`tensor::lower_shape_param_type`).
     pub(crate) fn lower_param_type(&mut self, has_body: bool, t: &TypeExpr) -> Ty {
         self.methods.fn_type_ok = has_body;
-        let ty = self.lower_type(t);
+        let ty = self.lower_shape_param_type(t);
         self.methods.fn_type_ok = false;
         ty
     }
@@ -679,7 +680,7 @@ impl Sema<'_> {
             ret: *ret,
         };
         self.check_fn_value_args(&sig, args, arg_tys);
-        Some(self.check_fn_call(&sig, &[], arg_tys, span))
+        Some(self.check_fn_call(&sig, &[], arg_tys, span, callee.id))
     }
 
     /// Adapt each unsuffixed numeric literal argument to its concrete scalar parameter, exactly as
@@ -933,7 +934,7 @@ impl Sema<'_> {
         };
         self.check_fn_value_args(&rest, args, arg_tys.get(offset..).unwrap_or(&[]));
         self.check_call_bounds(target, &sig, generic_args, &arg_tys, e.span);
-        self.check_fn_call(&sig, generic_args, &arg_tys, e.span)
+        self.check_fn_call(&sig, generic_args, &arg_tys, e.span, callee.id)
     }
 
     /// Type a call through the trait bounds of type parameter `g`: `x.m(..)` with `x: g`
@@ -1024,7 +1025,7 @@ impl Sema<'_> {
             params,
             ret,
         };
-        let out = self.check_fn_call(&sig, &[], &arg_tys, e.span);
+        let out = self.check_fn_call(&sig, &[], &arg_tys, e.span, callee.id);
         self.methods.resolution.calls.insert(
             e.id,
             MethodCall {

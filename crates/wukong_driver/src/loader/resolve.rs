@@ -136,7 +136,10 @@ fn decl_names(item: &Item) -> Vec<(Ident, bool, bool)> {
         ItemKind::Enum(e) => vec![(e.name, e.is_pub, false)],
         ItemKind::Const(c) => vec![(c.name, c.is_pub, false)],
         ItemKind::Extern(blk) => blk.items.iter().map(|f| (f.name, f.is_pub, true)).collect(),
-        ItemKind::Import(_) => Vec::new(),
+        ItemKind::Trait(t) => vec![(t.name, t.is_pub, false)],
+        // An `impl` block declares nothing of its own: each method is a separate top-level `Fn`
+        // item (`Type.method`) the parser flattened out of it, exported like any other function.
+        ItemKind::Import(_) | ItemKind::Impl(_) => Vec::new(),
     }
 }
 
@@ -189,6 +192,16 @@ fn rename_decls(item: &mut Item, table: &FxHashMap<Symbol, Export>) {
         ItemKind::Struct(s) => rename(&mut s.name),
         ItemKind::Enum(e) => rename(&mut e.name),
         ItemKind::Const(c) => rename(&mut c.name),
+        ItemKind::Trait(t) => rename(&mut t.name),
+        // The block's record of its flattened methods must name them by the same program-wide
+        // symbol their `Fn` items are renamed to, or sema's method table points at nothing.
+        ItemKind::Impl(imp) => {
+            for m in &mut imp.methods {
+                if let Some(e) = table.get(&m.fn_name) {
+                    m.fn_name = e.sym;
+                }
+            }
+        }
         // Extern functions keep their link name; `Import` declares nothing.
         ItemKind::Extern(_) | ItemKind::Import(_) => {}
     }
@@ -591,12 +604,30 @@ impl Rewriter<'_> {
                     self.func(f);
                 }
             }
+            // A trait's method signatures name types like any function's.
+            ItemKind::Trait(t) => {
+                for f in &mut t.methods {
+                    self.func(f);
+                }
+            }
+            // The extended type and the implemented trait resolve like any type path, so sema's
+            // method table and conformance check key on the same symbols the declarations carry.
+            ItemKind::Impl(imp) => {
+                self.path(&mut imp.self_ty);
+                if let Some(tr) = &mut imp.trait_ref {
+                    self.path(tr);
+                }
+            }
             ItemKind::Import(_) => {}
         }
     }
 
     fn generic_params(&mut self, gs: &mut [GenericParam]) {
         for g in gs {
+            // Trait bounds (`<T: Shape>`, `where T: Shape`) name traits, which are module items.
+            for b in &mut g.bounds {
+                self.path(b);
+            }
             if let GenericParamKind::Const { ty, .. } = &mut g.kind {
                 self.ty(ty);
             }
@@ -641,6 +672,14 @@ impl Rewriter<'_> {
                 self.ty(elem);
                 for d in dims {
                     self.dim(d);
+                }
+            }
+            TypeKind::Fn { params, ret } => {
+                for p in params {
+                    self.ty(p);
+                }
+                if let Some(r) = ret {
+                    self.ty(r);
                 }
             }
         }

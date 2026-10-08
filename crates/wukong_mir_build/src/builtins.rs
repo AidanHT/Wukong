@@ -96,7 +96,7 @@ fn const_tensor_len(t: &Ty) -> Option<u64> {
     for d in &shape.0 {
         match d {
             Dim::Const(c) => n = n.checked_mul(*c)?,
-            Dim::Var(_) | Dim::Dynamic => return None,
+            Dim::Var(_) | Dim::Dynamic | Dim::Expr(_) => return None,
         }
     }
     Some(n)
@@ -240,9 +240,9 @@ impl FnLowerer<'_> {
         let mut checks: Vec<ValueId> = Vec::new();
         let mut dims: Vec<ValueId> = Vec::with_capacity(call.dims.len());
         for d in &call.dims {
-            let v = match *d {
-                BuiltinDim::Const(n) => self.const_i64(n as i128),
-                BuiltinDim::Named { name, signed } => {
+            let v = match d {
+                BuiltinDim::Const(n) => self.const_i64(*n as i128),
+                &BuiltinDim::Named { name, signed } => {
                     let Some((slot, ty)) = self.lookup(name) else {
                         self.unsupported(
                             e.span,
@@ -256,7 +256,7 @@ impl FnLowerer<'_> {
                     checks.push(ok);
                     v
                 }
-                BuiltinDim::SliceLen { arg, div } => {
+                &BuiltinDim::SliceLen { arg, div } => {
                     let Some(len) = bufs.get(arg).and_then(|b| b.as_ref()?.slice_len) else {
                         self.unsupported(
                             e.span,
@@ -270,6 +270,23 @@ impl FnLowerer<'_> {
                         let dv = self.const_i64(div as i128);
                         self.builder
                             .build(MirType::I64, Op::Bin(BinOp::SDiv, len, dv))
+                    };
+                    let ok = self.extent_in_range(v);
+                    checks.push(ok);
+                    v
+                }
+                // A derived extent from a tensor operand's shape (`3*D`): evaluated from the
+                // in-scope dimension bindings exactly as a stride over that axis is.
+                BuiltinDim::Derived(dim) => {
+                    let v = dim
+                        .to_poly()
+                        .and_then(|p| self.emit_dim_poly(&p, &|me, s| me.dim_var_value(s)));
+                    let Some(v) = v else {
+                        self.unsupported(
+                            e.span,
+                            "a kernel-builtin derived dimension with no binding in scope",
+                        );
+                        return Some(self.const_zero(MirType::I32));
                     };
                     let ok = self.extent_in_range(v);
                     checks.push(ok);

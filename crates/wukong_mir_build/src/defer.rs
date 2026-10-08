@@ -32,15 +32,17 @@ use wukong_ast::{
     StmtKind, TypeExpr, TypeKind, UnOp, VariantPat,
 };
 use wukong_diag::Diagnostic;
-use wukong_sema::SemaResult;
+use wukong_sema::{BuiltinCall, MethodCall, SemaResult};
 use wukong_span::{FxHashMap, Interner, Span, Symbol};
 use wukong_types::{Dim, Ty};
 
-/// Fresh `NodeId`s are minted DOWNWARD from here. The parser hands ids out upward from 0 and
-/// `tindex` mints downward from `u32::MAX - 1` but never at or below `u32::MAX / 2`, so this band
-/// `(DEFER_ID_FLOOR, DEFER_ID_TOP]` collides with neither for any program that fits in memory.
-const DEFER_ID_TOP: u32 = u32::MAX / 2 - 1;
-const DEFER_ID_FLOOR: u32 = u32::MAX / 4;
+/// Fresh `NodeId`s are minted DOWNWARD from here. The parser hands ids out upward from 0,
+/// `tindex` mints downward from `u32::MAX - 1` but never at or below `u32::MAX / 2`, and the method
+/// desugaring (`methods.rs`, which runs just before this pass) owns `(u32::MAX / 4, u32::MAX / 2)`,
+/// so this band `(DEFER_ID_FLOOR, DEFER_ID_TOP]` collides with none of them for any program that
+/// fits in memory.
+const DEFER_ID_TOP: u32 = u32::MAX / 4 - 1;
+const DEFER_ID_FLOOR: u32 = u32::MAX / 8;
 
 /// What a rewrite adds to sema's `NodeId`-keyed tables for the nodes it created: every copy of a
 /// deferred expression carries its original's entries under its fresh id.
@@ -51,6 +53,28 @@ pub(crate) struct DeferOverlay {
     /// shape-generic function keeps the dimension bindings sema solved for the original, which
     /// the hidden runtime-dim ABI reads.
     pub(crate) call_dims: FxHashMap<NodeId, Vec<(Symbol, Dim)>>,
+    /// Entries layered over `sema.builtin_calls` (keyed by the CALL id): a copied named-kernel
+    /// builtin call (`matmul(..)`) keeps the resolution its lowering reads.
+    pub(crate) builtin_calls: FxHashMap<NodeId, BuiltinCall>,
+    /// Entries layered over `sema.methods.calls` (keyed by the CALL id): a copied trait-bound call
+    /// (`x.area()` with `x: T`) keeps the record its per-instance dispatch reads. Method calls with
+    /// a known target were already rewritten into plain calls before this pass.
+    pub(crate) method_calls: FxHashMap<NodeId, MethodCall>,
+}
+
+impl DeferOverlay {
+    /// Layer every entry over a clone of sema's result.
+    pub(crate) fn apply(&self, s: &mut SemaResult) {
+        s.types
+            .extend(self.types.iter().map(|(id, t)| (*id, t.clone())));
+        s.call_dims
+            .extend(self.call_dims.iter().map(|(id, d)| (*id, d.clone())));
+        s.builtin_calls
+            .extend(self.builtin_calls.iter().map(|(id, c)| (*id, c.clone())));
+        s.methods
+            .calls
+            .extend(self.method_calls.iter().map(|(id, c)| (*id, c.clone())));
+    }
 }
 
 /// Rewrite every `defer` in `module` away. `Ok(None)`: the module has no `defer` and nothing was
@@ -73,8 +97,10 @@ pub(crate) fn lower_defers(
     let mut d = Desugar {
         base: &sema.types,
         extra: FxHashMap::default(),
-        base_call_dims: &sema.call_dims,
+        sema,
         extra_call_dims: FxHashMap::default(),
+        extra_builtin_calls: FxHashMap::default(),
+        extra_method_calls: FxHashMap::default(),
         interner,
         next_id: DEFER_ID_TOP,
         diags: Vec::new(),
@@ -97,6 +123,8 @@ pub(crate) fn lower_defers(
             DeferOverlay {
                 types: d.extra,
                 call_dims: d.extra_call_dims,
+                builtin_calls: d.extra_builtin_calls,
+                method_calls: d.extra_method_calls,
             },
         )))
     } else {
@@ -125,10 +153,15 @@ struct Desugar<'a> {
     base: &'a FxHashMap<NodeId, Ty>,
     /// Types of the nodes this pass creates.
     extra: FxHashMap<NodeId, Ty>,
-    /// Sema's call dimension bindings for the original nodes.
-    base_call_dims: &'a FxHashMap<NodeId, Vec<(Symbol, Dim)>>,
+    /// Sema's id-keyed records for the original nodes (call dimensions, builtin calls, method
+    /// calls), which every copy inherits under its fresh id.
+    sema: &'a SemaResult,
     /// Call dimension bindings of the copies this pass creates.
     extra_call_dims: FxHashMap<NodeId, Vec<(Symbol, Dim)>>,
+    /// Builtin-call resolutions of the copies this pass creates.
+    extra_builtin_calls: FxHashMap<NodeId, BuiltinCall>,
+    /// Method-call records of the copies this pass creates.
+    extra_method_calls: FxHashMap<NodeId, MethodCall>,
     interner: &'a mut Interner,
     next_id: u32,
     diags: Vec<Diagnostic>,
@@ -564,10 +597,26 @@ impl Desugar<'_> {
         let dims = self
             .extra_call_dims
             .get(id)
-            .or_else(|| self.base_call_dims.get(id))
+            .or_else(|| self.sema.call_dims.get(id))
             .cloned();
         if let Some(dims) = dims {
             self.extra_call_dims.insert(new, dims);
+        }
+        let builtin = self
+            .extra_builtin_calls
+            .get(id)
+            .or_else(|| self.sema.builtin_calls.get(id))
+            .cloned();
+        if let Some(b) = builtin {
+            self.extra_builtin_calls.insert(new, b);
+        }
+        let method = self
+            .extra_method_calls
+            .get(id)
+            .or_else(|| self.sema.methods.calls.get(id))
+            .cloned();
+        if let Some(m) = method {
+            self.extra_method_calls.insert(new, m);
         }
         *id = new;
     }
@@ -768,6 +817,14 @@ impl Desugar<'_> {
                 }
             }
             TypeKind::Tensor { elem, .. } => self.refresh_ty(elem),
+            TypeKind::Fn { params, ret } => {
+                for p in params {
+                    self.refresh_ty(p);
+                }
+                if let Some(r) = ret {
+                    self.refresh_ty(r);
+                }
+            }
         }
     }
 }

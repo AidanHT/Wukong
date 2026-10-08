@@ -131,7 +131,9 @@ impl FnLowerer<'_> {
         Some(self.coerce_to(v, &ty, &MirType::I64, true))
     }
 
-    fn const_i64(&mut self, v: i64) -> ValueId {
+    /// An `i64` constant. (Named apart from `builtins.rs`'s `const_i64(i128)`: both are methods of
+    /// `FnLowerer`, so one name would be a duplicate definition.)
+    fn dim_i64(&mut self, v: i64) -> ValueId {
         self.builder
             .build(MirType::I64, Op::ConstInt(v as i128, MirType::I64))
     }
@@ -141,7 +143,7 @@ impl FnLowerer<'_> {
     }
 
     fn is_negative_i64(&mut self, v: ValueId) -> ValueId {
-        let zero = self.const_i64(0);
+        let zero = self.dim_i64(0);
         self.builder
             .build(MirType::I1, Op::Cmp(CmpOp::Slt, v, zero))
     }
@@ -176,7 +178,7 @@ impl FnLowerer<'_> {
                             // positive divisor an extent has).
                             let r = self.bin_i64(BinOp::SRem, nv, dv);
                             let neg = self.is_negative_i64(r);
-                            let one = self.const_i64(1);
+                            let one = self.dim_i64(1);
                             let q1 = self.bin_i64(BinOp::Sub, q, one);
                             self.builder.build(MirType::I64, Op::Select(neg, q1, q))
                         }
@@ -204,10 +206,10 @@ impl FnLowerer<'_> {
             }
             let coeff = i64::try_from(*c).ok()?;
             let t = match term {
-                None => self.const_i64(coeff),
+                None => self.dim_i64(coeff),
                 Some(t) if coeff == 1 => t,
                 Some(t) => {
-                    let k = self.const_i64(coeff);
+                    let k = self.dim_i64(coeff);
                     self.bin_i64(BinOp::Mul, t, k)
                 }
             };
@@ -218,7 +220,7 @@ impl FnLowerer<'_> {
         }
         Some(match acc {
             Some(v) => v,
-            None => self.const_i64(0),
+            None => self.dim_i64(0),
         })
     }
 
@@ -337,7 +339,7 @@ impl FnLowerer<'_> {
                         continue;
                     }
                     let v = match d {
-                        Dim::Const(n) => self.const_i64(i64::try_from(*n).ok()?),
+                        Dim::Const(n) => self.dim_i64(i64::try_from(*n).ok()?),
                         Dim::Var(g) => *dim_map.get(g)?,
                         Dim::Expr(p) => self.emit_dim_poly(p, &|_, s| dim_map.get(&s).copied())?,
                         // Two `?` axes share one array length: neither is determined.
@@ -348,7 +350,7 @@ impl FnLowerer<'_> {
                         Some(acc) => self.bin_i64(BinOp::Mul, acc, v),
                     });
                 }
-                let len_v = self.const_i64(i64::try_from(len).ok()?);
+                let len_v = self.dim_i64(i64::try_from(len).ok()?);
                 Some(match others {
                     None => len_v,
                     Some(o) => self.bin_i64(BinOp::SDiv, len_v, o),
@@ -388,7 +390,7 @@ impl FnLowerer<'_> {
                 Some(k) => k,
                 None => {
                     self.unsupported(base.span, "`.dim(k)` whose axis is not an integer constant");
-                    return Some(self.const_i64(0));
+                    return Some(self.dim_i64(0));
                 }
             }
         } else {
@@ -400,7 +402,7 @@ impl FnLowerer<'_> {
             let _ = self.lower_expr(base);
         }
         match bty {
-            Ty::Array { len, .. } => Some(self.const_i64(i64::try_from(len).unwrap_or(i64::MAX))),
+            Ty::Array { len, .. } => Some(self.dim_i64(i64::try_from(len).unwrap_or(i64::MAX))),
             Ty::Tensor { shape, .. } => match self.tensor_axis_extent(base, &shape.0, axis) {
                 Some(v) => Some(v),
                 None => {
@@ -409,7 +411,7 @@ impl FnLowerer<'_> {
                         "reading a `?` extent that is not known here (only a `?` axis of a tensor \
                          parameter, or of an immutable view of one, carries its run-time extent)",
                     );
-                    Some(self.const_i64(0))
+                    Some(self.dim_i64(0))
                 }
             },
             _ => None,
@@ -477,7 +479,7 @@ impl FnLowerer<'_> {
         let ity = MirType::I64;
 
         let slot = self.builder.alloca(ity.clone());
-        let zero = self.const_i64(0);
+        let zero = self.dim_i64(0);
         self.builder.build_void(Op::Store {
             ptr: slot,
             value: zero,
@@ -562,7 +564,7 @@ impl FnLowerer<'_> {
         self.builder.switch_to(latch);
         self.terminated = false;
         let cur = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
-        let one = self.const_i64(1);
+        let one = self.dim_i64(1);
         let next = self.bin_i64(BinOp::Add, cur, one);
         self.builder.build_void(Op::Store {
             ptr: slot,

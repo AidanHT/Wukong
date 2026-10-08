@@ -710,7 +710,7 @@ impl Sema<'_> {
     /// other symbolic dimension. Previously the length was exempt from the name check and then
     /// evaluated to 0. A local array, a return type and a non-scalar element keep the fixed-length
     /// rule (`E0406` for a generic length): they would need storage whose size is a run-time value.
-    pub(crate) fn lower_param_type(&mut self, t: &TypeExpr) -> Ty {
+    pub(crate) fn lower_shape_param_type(&mut self, t: &TypeExpr) -> Ty {
         if let TypeKind::Array {
             elem,
             len,
