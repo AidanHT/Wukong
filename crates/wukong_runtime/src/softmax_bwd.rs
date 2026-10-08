@@ -158,7 +158,7 @@ mod tests {
     fn boundary_extents_are_safe() {
         // P14.6: the backward writes a finite dx for every element of a well-formed row.
         let (rows, cols) = (1usize, 3usize);
-        let y = vec![0.3f32, 0.3, 0.4];
+        let y = [0.3f32, 0.3, 0.4];
         let dy = vec![1.0f32; rows * cols];
         let mut dx = vec![f32::from_bits(0x7fc0_0001); rows * cols];
         // SAFETY: `y`, `dy` and `dx` are sized rows*cols; a nonpositive extent is a no-op.

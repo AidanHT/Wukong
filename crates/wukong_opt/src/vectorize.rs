@@ -3379,6 +3379,8 @@ fn emit_group_load(
     let l = lanes_of(&g.elem).expect("a group moves a vector lane type") as usize;
     let vty = part_ty(&g.elem);
     let window = elem_ptr(e, vb, ptr, &g.elem, -i64::from(offset));
+    // `part` selects the same split of every source value in the group, not one vector's elements.
+    #[allow(clippy::needless_range_loop)]
     for part in 0..parts_of(&g.elem, p.w) {
         let mut vecs = Vec::with_capacity(k);
         for m in 0..k {
@@ -3403,6 +3405,8 @@ fn emit_group_load(
 /// The mirror of [`emit_group_load`]: output vector `m` of part `p` holds elements
 /// `p·k·L + m·L .. + L`, and element `m·L + t` of the part's span is lane `(m·L + t) / k` of member
 /// `(m·L + t) % k`. Exactly the elements the scalar loop writes are written, each once.
+// `part` selects the same split of every source value in the group, not one vector's elements.
+#[allow(clippy::needless_range_loop)]
 fn emit_group_store(
     e: &mut Emit<'_>,
     vb: BlockId,

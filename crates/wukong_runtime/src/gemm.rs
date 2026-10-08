@@ -8006,7 +8006,7 @@ mod tests {
             let c_init = fill(603, m * n);
             for &beta in &[0.0f32, 1.0] {
                 let mut want = c_init.clone();
-                // SAFETY (this block and the ones below): avx2+fma detected above; every buffer is
+                // SAFETY: (this block and the ones below) avx2+fma detected above; every buffer is
                 // sized for the m×k / k×n / m×n operands its kernel contract names.
                 unsafe {
                     sgemm_avx2_impl(

@@ -18,6 +18,10 @@
 //! Run: `cargo run -p wukong_runtime --release --example normfwd_split [-- <rounds>]`
 //! AGENT-LOCAL, DIRECTIONAL ONLY: shares and same-process ratios only, never the absolute ns.
 
+// Measurement probe: every unsafe block calls a runtime kernel entry on buffers this file sized
+// for that entry's documented extents. The crate-level SAFETY-comment lint targets the library.
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 use std::time::Instant;
 use wukong_runtime::{wukong_norm_f32, wukong_velem_f32};
 

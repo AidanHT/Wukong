@@ -387,10 +387,8 @@ impl Ctx<'_> {
                 };
                 let c = if let Some(k) = literal(*b) {
                     ca.checked_mul(k)?
-                } else if let Some(k) = literal(*a) {
-                    cb.checked_mul(k)?
                 } else {
-                    return None;
+                    cb.checked_mul(literal(*a)?)?
                 };
                 if c.abs() > MAX_SCALE {
                     return None;

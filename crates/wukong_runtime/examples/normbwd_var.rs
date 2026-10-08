@@ -21,6 +21,10 @@
 //! Run: `cargo run -p wukong_runtime --release --example normbwd_var [-- <rounds>]`
 //! AGENT-LOCAL, DIRECTIONAL ONLY: same-process ratios only; never quote the absolute ns.
 
+// Measurement probe: every unsafe block calls a runtime kernel entry on buffers this file sized
+// for that entry's documented extents. The crate-level SAFETY-comment lint targets the library.
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 use std::time::Instant;
 use wukong_runtime::{wukong_layernorm_bwd_f32, wukong_softmax_bwd_f32};
 

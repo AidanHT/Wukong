@@ -8,6 +8,10 @@
 //!
 //! Run: `cargo run -p wukong_runtime --release --example gemm_scaling`
 
+// Measurement probe: every unsafe block calls a runtime kernel entry on buffers this file sized
+// for that entry's documented extents. The crate-level SAFETY-comment lint targets the library.
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 use std::time::Instant;
 
 fn one<F: FnMut()>(f: &mut F, reps: u32) -> f64 {

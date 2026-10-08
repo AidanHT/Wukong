@@ -34,6 +34,10 @@
 //! (default `512,1024`); `GEMM_ORDER_NT=1` for the `A·Bᵀ` layout; `GEMM_ORDER_NO_PRELUDE=1` to
 //! skip the single-core group.
 
+// Measurement probe: every unsafe block calls a runtime kernel entry on buffers this file sized
+// for that entry's documented extents. The crate-level SAFETY-comment lint targets the library.
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 #[cfg(windows)]
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

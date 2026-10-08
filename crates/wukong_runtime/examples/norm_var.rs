@@ -22,6 +22,10 @@
 //! Run: `cargo run -p wukong_runtime --release --example norm_var [-- <n,n,..>]`
 //! Env: `CC` to pick the C compiler (default `gcc`).
 
+// Measurement probe: every unsafe block calls a runtime kernel entry on buffers this file sized
+// for that entry's documented extents. The crate-level SAFETY-comment lint targets the library.
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::process::Command;

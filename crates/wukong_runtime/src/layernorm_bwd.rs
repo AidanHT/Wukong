@@ -569,7 +569,7 @@ mod tests {
     fn boundary_extents_are_safe() {
         // P14.6: the backward writes a finite dx for every element of a well-formed row.
         let (rows, cols) = (2usize, 3usize);
-        let x = vec![0.5f32, -1.0, 2.0, 0.0, 1.0, -0.5];
+        let x = [0.5f32, -1.0, 2.0, 0.0, 1.0, -0.5];
         let dy = vec![1.0f32; rows * cols];
         let gamma = vec![1.0f32; cols];
         let mut dx = vec![f32::from_bits(0x7fc0_0001); rows * cols];

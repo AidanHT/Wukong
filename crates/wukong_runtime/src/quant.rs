@@ -831,7 +831,11 @@ mod tests {
         for r in 0..8 {
             let mut want = 0i64;
             for e in 0..k {
-                let w = if (e % QK + r) % 2 == 0 { -128i64 } else { 127 };
+                let w = if (e % QK + r).is_multiple_of(2) {
+                    -128i64
+                } else {
+                    127
+                };
                 want += w * x[e] as i64;
             }
             assert_eq!(y[r], want as f32, "row {r}");

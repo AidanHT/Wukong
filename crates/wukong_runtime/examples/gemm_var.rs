@@ -21,6 +21,10 @@
 //! `cblas_sgemm` with `transb = CblasTrans`, under the same order-swapped rounds. `GEMM_VAR_SHAPES=
 //! MxKxN[t],...` replaces the whole list with explicit shapes (`t` = NT, `B` stored `[N, K]`).
 
+// Measurement probe: every unsafe block calls a runtime kernel entry on buffers this file sized
+// for that entry's documented extents. The crate-level SAFETY-comment lint targets the library.
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 #[cfg(windows)]
 use std::path::PathBuf;
 use std::time::Instant;

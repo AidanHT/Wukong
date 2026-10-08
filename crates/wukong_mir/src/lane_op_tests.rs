@@ -148,10 +148,12 @@ fn malformed_lane_ops_are_reported() {
     let i64x2 = v(MirType::I64, 2);
 
     // A widen whose result does not halve the lanes.
-    let e = errors_of(&[i8x16.clone()], v(MirType::I16, 16), |p| Op::Widen {
-        v: p[0],
-        half: Half::Lo,
-        kind: CastKind::SExt,
+    let e = errors_of(std::slice::from_ref(&i8x16), v(MirType::I16, 16), |p| {
+        Op::Widen {
+            v: p[0],
+            half: Half::Lo,
+            kind: CastKind::SExt,
+        }
     });
     assert_reports(&e, "must yield <8 x i16>");
 
