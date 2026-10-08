@@ -135,10 +135,14 @@ in a type (`let a: [i32; N]`, including a const-references-const chain;
 `tests/run/const_array_length.wk`), and when one `const` references another
 (`tests/run/top_level_const.wk`). An array length is an integer literal (any radix, with `_`
 separators and an optional suffix — `[i32; 0x10]` is 16 elements) or a top-level `const`; simple
-arithmetic on those folds too (`[i32; 2 + 2]`). A **generic** parameter name is not a usable length: it
-is exempt from the name check but evaluates to **0**, so `[i32; N]` inside `fn f<N>` is a zero-length
-array and any constant index into it is `E0501` — use a `const`. Any other name is `E0301`, not a
-silent length of 0, and a fixed-size array may hold at most `u32::MAX` elements (`E0401` past that).
+arithmetic on those folds too (`[i32; 2 + 2]`). A **generic** length is the shape of a
+**parameter**: `fn sum<N>(a: [f32; N])` (or `[f32; 2*N]`) takes a shape-generic buffer — it is the
+`Tensor[f32, N]` it denotes, so each call binds `N` from its argument's length and the body indexes
+it, iterates it, and reads `a.len()` (`tests/run/generic_array_param.wk`). A **local** array or a
+**return** type of generic length would need storage whose size is only known at run time, and is
+`E0406` (`tests/fail/generic_array_length.wk`); so is a generic length whose element is not a scalar.
+Any other name is `E0301`, not a silent length of 0, and a fixed-size array may hold at most
+`u32::MAX` elements (`E0401` past that).
 
 ## Literals ✅
 
@@ -356,7 +360,8 @@ the shared `K` above must agree on both operands. Mismatches are **compile error
 faults:
 
 - `E0501` — **rank / element-count** errors: a different number of dimensions, indexing a tensor with
-  the wrong number of indices, a compile-time-constant index past a static dimension, a fixed-size
+  more indices than its rank (fewer select a view), a compile-time-constant index past a static
+  dimension, a fixed-size
   array whose length cannot satisfy the tensor's element count (exactly the element count when every
   dim is a literal; a multiple of the product of the literal dims when a symbolic/`?` dim is still
   free), and a kind clash — a scalar, SIMD vector, `[]T` slice, tuple or struct value passed where a
@@ -370,6 +375,11 @@ faults:
   not match the declared generic list.
 - `E0504` — a tensor type named a dimension that is not a declared generic parameter, an integer
   literal, `?`, or a `const` (reported with a did-you-mean hint against the nearest declared generic).
+- `E0505` — a dimension expression that is not an extent: it folds to a negative constant, divides by
+  zero, overflows, or uses `?` as an operand — at the declaration, or for the dimensions a call binds.
+- `E0506` — a reshape (`x as Tensor[…]`) whose element count is not provably unchanged.
+- `E0507` — a misused view or extent query: a partial index of a non-contiguous tensor, an
+  assignment to a view (`a[i] = …` on a rank-2 `a`), or a `.dim(k)` whose axis is not a constant.
 
 **A shape error names what disagrees.** The primary message carries the dimension and both values,
 so the fix is readable without opening the callee:
@@ -387,14 +397,63 @@ the message names the ranks, the shapes, or the layout instead. The same text re
 verbatim as the `message` field of `--error-format=json`, alongside the unchanged `code`.
 
 Run `wukongc --explain E0502` for a worked example. Dimensions may be integer literals, a declared
-symbolic generic name, the name of a top-level `const`, or `?` for an unknown dimension. `?` does not
-carry a queryable runtime extent: there is no tensor `.dim()` accessor, and indexing that requires
-an unknown interior stride declines during lowering. Use a symbolic generic dimension when
-executable extents are needed. A `const` dim
+symbolic generic name, the name of a top-level `const`, `?` for a run-time dimension, or **arithmetic
+on dimensions** (below). A `const` dim
 resolves to its integer **value**, so it is a fixed dimension like a literal — `const D: usize = 3;
 Tensor[f32, 2, D]` really is 3 wide, and `a[1, 3]` on it is `E0501`. A declared generic shadows a
 same-named `const`. Any other name is `E0504` rather than a silently-introduced new symbolic dimension.
 Tensor element types must be scalars (`E0302`).
+
+**Dimension arithmetic ✅.** A dimension may be computed from others with `+ - * / %` and
+parentheses — `Tensor[f32, S, 3*D]` (a fused QKV projection), `Tensor[f32, S, H*HD]`, `Tensor[f32,
+(L - K)/S + 1]`. `/` is floor division and `%` the matching non-negative remainder (truncation, for
+the non-negative operands an extent has). The checker keeps every such extent in a **canonical
+normal form** (an integer polynomial over the dimension variables, with irreducible `/`/`%` terms),
+so two spellings of one extent are one type — `2*N` and `N + N`, `H*HD` and `HD*H`, `(2*N + 3)/2`
+and `N + 1` — and a body may return its `Tensor[f32, 2*N]` argument as `Tensor[f32, N + N]`. Equality
+is *sound, not complete*: a relation the normal form cannot prove (`D` against `H*(D/H)`, which loses
+the remainder) is rejected, never assumed. At a call, a dimension that appears only inside an
+expression is **solved** from the argument: `Tensor[f32, 2*N]` fed 8 elements binds `N = 4`, and fed
+7 elements is `E0502` (no whole-number `N`); a caller's own `M` against `2*N` is `E0502` unless the
+caller can prove `M` even by spelling it `2*K`. A flat array fed to a rank-2+ tensor solves the one
+dimension its element count leaves free: `Tensor[f32, M, N]` beside a `Tensor[f32, N]` of 4 elements,
+fed 12, binds `M = 3`. A dimension expression must be an extent (`E0505`):
+`Tensor[f32, 2 - 5]`, a division by zero, or a `?` operand are rejected, as is a call that makes a
+result extent `N - 4` negative. In lowering, every variable of a derived extent is a hidden dimension
+parameter and the extent is recomputed from them in the same normal form the checker compared
+(`tests/run/tensor_dim_arith.wk`).
+
+**Views: partial indexing ✅.** Indexing a contiguous tensor with **fewer indices than its rank** is
+the sub-tensor of the remaining axes — a *view* of the same buffer, not a copy: `m[i]` on a
+`Tensor[f32, M, N]` is the row `Tensor[f32, N]`, `c[b, h]` on a rank-4 tensor a `[S, D]` panel.
+A view can be bound (`let r = m[i];`), indexed further (`m[i][j]` is exactly `m[i, j]`), passed to a
+shape-generic function, returned from one, written through, and iterated: `for row in m` walks the
+rows of a rank-2+ tensor (and the elements of a rank-1 one). The leading indices are bounds-checked
+like any constant index. A view is never a scalar — the commonest way to get one is a forgotten
+index, so using it as a number (`s + a[i]`, `print(a[i])`, `exp(a[i])`, a condition, a comparison) is
+`E0401` naming the view's type; and it is not an assignable place (`a[i] = b[i]` would have to copy a
+row: `E0507`). Only a contiguous (row-major) tensor has row views (`E0507` for `.col_major` and the
+other layouts). Writing through a view of a non-`mut` parameter is `E0304`, exactly like writing the
+parameter (`tests/run/tensor_views.wk`).
+
+**Reshape ✅.** `x as Tensor[T, d0, d1, …]` views a contiguous buffer — a tensor, or a fixed-size
+array of scalars — under a new shape without copying. The element type must be the same (it moves no
+data: `E0502`), both sides contiguous, and the element count **provably** unchanged (`E0506`):
+`x as Tensor[f32, S, H, HD]` from a `Tensor[f32, S, H*HD]` is accepted (`S*(H*HD)` = `S*H*HD`), from
+`Tensor[f32, S, D]` it is not. A `?` extent has no count to prove and is rejected
+(`tests/run/tensor_reshape_heads.wk`).
+
+**Extents ✅.** `t.dim(k)` is the extent of axis `k` and `t.len()` the extent of axis 0, as `i64`, on
+a tensor or a fixed-size array (`.len()` also on a slice). The axis must be a compile-time constant in
+range (`E0507`, `E0501`). A fixed axis folds to its constant and a symbolic or derived one is computed
+from the hidden dimension parameters. A **`?` axis of a tensor parameter carries its run-time
+extent**: the caller passes it as one more hidden `i64` argument — read off a tensor argument's own
+shape, or a decaying array's length divided by the parameter's other extents — so the callee can read
+it (`a.dim(0)`), loop to it, iterate the tensor, use it as the row stride of an interior `?` axis,
+forward it to another `?` parameter, and pass the tensor where a callee has a generic dimension (which
+the run-time extent then binds); an immutable view of the parameter keeps the extents of the axes
+it keeps. A `?` extent that is not known at a call (a `?` tensor *returned* by a call, say) is a clean
+`C0001` there, never a guessed value (`tests/run/tensor_extent.wk`).
 
 **Layout.** A tensor type may carry a physical-layout suffix, which must come last inside the
 brackets: `Tensor[f32, M, N, .contiguous]` (the default, row-major), `.col_major`, `.strided`, or
@@ -420,8 +479,9 @@ binds `M, N, K` from the operands) — with two limits. A callee parameter with 
 cannot be satisfied by the caller's own generic dim (`fn fwd<N>(a: Tensor[f32, N]) { takes64(a) }` is
 `E0502`: a universally-quantified dimension cannot be *assumed* equal to 64 — declare the callee's
 parameter `?` when the size is a runtime value). And a `?` argument never *binds* a callee's symbolic
-dim, so a later concrete sibling still binds it and every subsequent operand is checked against that
-binding. A constant index past a static tensor dimension, like a fixed-size array, is `E0501`.
+dim for checking, so a later concrete sibling still binds it and every subsequent operand is checked
+against that binding; when nothing else determines the dim, lowering passes the `?` argument's run-time
+extent (`tests/run/tensor_extent.wk`). A constant index past a static tensor dimension, like a fixed-size array, is `E0501`.
 
 **What runs today.** A tensor with **compile-time-constant shape** executes end-to-end on both
 backends: multi-dimensional indexing `a[i, j]` flattens to a row-major GEP off the base pointer (a

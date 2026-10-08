@@ -443,8 +443,67 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// One tensor dimension: an integer, a name, `?`, or arithmetic on those — `N*2`, `H*HD`,
+    /// `(L - K)/S + 1`. A restricted Pratt loop over exactly `+ - * / %` (the expression precedences:
+    /// `* / %` bind tighter than `+ -`, all left-associative) plus parentheses. Nothing else is an
+    /// extent, so the grammar stays the closed algebra sema can put in normal form; a `?` may be
+    /// written inside one, and sema rejects it there (it has no value to compute with).
     fn parse_dim(&mut self) -> Dim {
+        self.parse_dim_bp(0)
+    }
+
+    fn parse_dim_bp(&mut self, min_bp: u8) -> Dim {
+        let saved = self.depth;
+        let mut lhs = self.parse_dim_atom();
+        loop {
+            let (op, bp) = match self.kind() {
+                T::Plus => (BinOp::Add, 1),
+                T::Minus => (BinOp::Sub, 1),
+                T::Star => (BinOp::Mul, 2),
+                T::Slash => (BinOp::Div, 2),
+                T::Percent => (BinOp::Rem, 2),
+                _ => break,
+            };
+            if bp < min_bp {
+                break;
+            }
+            // Charge each fold, exactly as the expression Pratt loop does: the chain is built
+            // iteratively, but the tree it leaves is deep, and sema folds it recursively.
+            self.depth += 1;
+            if self.depth > Self::MAX_DEPTH {
+                let sp = self.span();
+                self.too_deep(sp);
+                break;
+            }
+            self.bump();
+            let rhs = self.parse_dim_bp(bp + 1);
+            let span = lhs.span.to(rhs.span);
+            lhs = Dim {
+                kind: DimKind::Binary {
+                    op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                },
+                span,
+            };
+        }
+        self.depth = saved;
+        lhs
+    }
+
+    fn parse_dim_atom(&mut self) -> Dim {
         let span = self.span();
+        // A parenthesized group recurses, so it is charged like any other nesting production.
+        let saved = self.depth;
+        self.depth += 1;
+        if self.depth > Self::MAX_DEPTH {
+            self.too_deep(span);
+            self.depth = saved;
+            return Dim {
+                kind: DimKind::Dynamic,
+                span,
+            };
+        }
         let kind = match self.kind() {
             // A dimension the decoder cannot represent is reported, not folded to 0: a 26-digit
             // extent used to become `Tensor[f32, 0]` with no diagnostic anywhere.
@@ -468,16 +527,29 @@ impl<'a> Parser<'a> {
                 self.bump();
                 DimKind::Named(sym)
             }
+            // Parentheses only group: the inner dimension is reused, its span widened over them.
+            T::LParen => {
+                self.bump();
+                let inner = self.parse_dim_bp(0);
+                self.expect(T::RParen);
+                self.depth = saved;
+                return Dim {
+                    kind: inner.kind,
+                    span: span.to(self.prev_span()),
+                };
+            }
             _ => {
                 self.error(
                     span,
                     "E0203",
-                    "expected a dimension (integer, name, or `?`)",
+                    "expected a dimension (an integer, a name, `?`, or `+ - * / %` arithmetic \
+                     on those)",
                 );
                 self.bump();
                 DimKind::Dynamic
             }
         };
+        self.depth = saved;
         Dim {
             kind,
             span: span.to(self.prev_span()),
@@ -2070,6 +2142,44 @@ mod tests {
             assert!(
                 d.iter().any(|x| x.code == Some("E0203")),
                 "`{src}` should report E0203, got {d:?}"
+            );
+        }
+    }
+
+    /// A dimension may be arithmetic on dimensions, with the expression precedences (`* / %` over
+    /// `+ -`, left-associative) and parentheses that only group. The printer makes the association
+    /// explicit, so a mis-associated `(L - K)/S + 1` would show here.
+    #[test]
+    fn dimension_arithmetic_parses_with_expression_precedence() {
+        assert_eq!(ty("Tensor[f32, N*2]"), "Tensor[f32, (N * 2)]");
+        assert_eq!(
+            ty("Tensor[f32, S, H*HD, 3*D]"),
+            "Tensor[f32, S, (H * HD), (3 * D)]"
+        );
+        assert_eq!(
+            ty("Tensor[f32, (L - K)/S + 1]"),
+            "Tensor[f32, (((L - K) / S) + 1)]"
+        );
+        assert_eq!(ty("Tensor[f32, A - B - C]"), "Tensor[f32, ((A - B) - C)]");
+        assert_eq!(ty("Tensor[f32, A + B * C]"), "Tensor[f32, (A + (B * C))]");
+        assert_eq!(ty("Tensor[f32, N % 4, ?]"), "Tensor[f32, (N % 4), ?]");
+        // The layout suffix still terminates the dim list.
+        assert_eq!(
+            ty("Tensor[f32, M*N, 2, .col_major]"),
+            "Tensor[f32, (M * N), 2, .col_major]"
+        );
+        // Anything outside the closed algebra is still E0203.
+        for src in [
+            "Tensor[f32, N << 1]",
+            "Tensor[f32, f(N)]",
+            "Tensor[f32, N*]",
+        ] {
+            let mut i = Interner::new();
+            let d = parse_type_str(src, SourceId(0), &mut i).1;
+            assert!(
+                d.iter()
+                    .any(|x| x.code == Some("E0203") || x.code == Some("E0200")),
+                "`{src}` should be rejected, got {d:?}"
             );
         }
     }

@@ -1,0 +1,63 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 10
+// EXPECT-OUT: 20
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 14
+// EXPECT-OUT: 30
+// EXPECT-OUT: 4
+// EXPECT-OUT: 8
+module tests.run.generic_array_param
+
+// A fixed-size array PARAMETER whose length is a generic dimension — `[f32; N]`, `[f32; 2*N]` — is
+// the shape-generic buffer it denotes (a `Tensor[f32, N]`): each call binds `N` from its argument's
+// length and threads it to the body as a hidden dimension parameter. The length used to be exempt
+// from the name check and then evaluate to 0, so the body indexed a "zero-length" array and an
+// interp/native divergence followed on any dynamic index. Expected values are the scalar sums of
+// the literal inputs.
+
+fn sum<N>(a: [f32; N]) -> f32 {
+    let mut s: f32 = 0.0;
+    for i in 0..N {
+        s = s + a[i];
+    }
+    return s;
+}
+
+fn fill<N>(mut a: [i32; N], v: i32) {
+    for i in 0..N {
+        a[i] = v + (i as i32);
+    }
+}
+
+// A derived length: the argument holds `N` pairs, and `N` is solved from `2*N = len`.
+fn pair_dot<N>(a: [f32; 2*N]) -> f32 {
+    let mut s: f32 = 0.0;
+    for i in 0..N {
+        s = s + a[2*i] * a[2*i + 1];
+    }
+    return s;
+}
+
+fn count<N>(a: [f32; N]) -> i64 {
+    return a.len();
+}
+
+fn main() -> i32 {
+    let x: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let y: [f32; 8] = [1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0];
+    print(sum(x) as i32); // 1 + 2 + 3 + 4 = 10
+    print(sum(y) as i32); // 1 + 1 + 2 + 2 + 3 + 3 + 4 + 4 = 20
+    let mut z: [i32; 3] = [0; 3];
+    fill(z, 7);
+    for i in 0..3 {
+        print(z[i]); // 7 8 9
+    }
+    print(pair_dot(x) as i32); // N = 2: 1*2 + 3*4 = 14
+    print(pair_dot(y) as i32); // N = 4: 1*1 + 2*2 + 3*3 + 4*4 = 30
+    print(count(x)); // 4
+    print(count(y)); // 8
+    return 0;
+}

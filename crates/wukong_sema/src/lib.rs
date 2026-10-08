@@ -27,6 +27,7 @@ mod attrs;
 mod dependency;
 mod layout;
 mod shape;
+mod tensor;
 
 use std::cell::RefCell;
 
@@ -177,6 +178,12 @@ pub struct SemaResult {
     /// literals retyped) like a `let`, so `mir_build` can lower a const reference by inlining the
     /// initializer with correct types. The `DefMap` records only a const's *type*, not its value.
     pub consts: HashMap<Symbol, Expr>,
+    /// Every resolved call's dimension bindings, keyed by the CALLEE expression's `NodeId`: each
+    /// dimension generic of the callee that the call bound, mapped to its extent in the CALLER's
+    /// terms (a constant, a caller dimension, or a derived extent over the caller's dimensions).
+    /// `mir_build` reads it for a hidden runtime-dim argument no argument shape spells directly — a
+    /// dimension solved from a derived extent (`Tensor[f32, 2*N]` fed 8 elements binds `N = 4`).
+    pub call_dims: HashMap<NodeId, Vec<(Symbol, Dim)>>,
 }
 
 /// Collect the struct names a type contains *by value* — directly (`Ty::Named`) or nested inside an
@@ -342,6 +349,9 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         layout_cache: layout::Cache::default(),
         checking_bodies: false,
         parallel_fn: false,
+        pending_dims: Vec::new(),
+        call_dims: HashMap::default(),
+        tensor_views: Vec::new(),
     };
     // Attribute legality (`attrs`): an attribute names no value and has no type, so this walk needs
     // nothing the collection pass builds and runs first — an unknown `@bogus` is reported even in a
@@ -372,6 +382,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
             .into_iter()
             .map(|(name, init)| (name, init.clone()))
             .collect(),
+        call_dims: s.call_dims,
     };
     (result, s.diags)
 }
@@ -422,6 +433,17 @@ struct Sema<'a> {
     layout_cache: layout::Cache,
     /// True while checking a `@parallel` function body (`sync_block()` is legal only here).
     parallel_fn: bool,
+    /// Derived-extent equations queued by `unify_dim` while one call's parameters are unified, and
+    /// solved by `tensor::solve_pending_dims` when they all have been. Empty between calls.
+    pending_dims: Vec<tensor::PendingDimEq>,
+    /// Each resolved call's dimension bindings, published as [`SemaResult::call_dims`].
+    call_dims: HashMap<NodeId, Vec<(Symbol, Dim)>>,
+    /// Per-scope map, kept 1:1 with `scopes`: a tensor local that VIEWS a non-`mut` aggregate
+    /// parameter (`let r = a[i];`, `for row in a`) -> that parameter. Writing through the view
+    /// mutates the caller's buffer exactly like writing `a[i, j]` does, so it is held to the same
+    /// E0304 rule (`tensor::note_tensor_view`). Reset with the other per-scope stacks in
+    /// `push_scope`/`pop_scope`/`check_fn`/`check_const`.
+    tensor_views: Vec<HashMap<Symbol, Symbol>>,
 }
 
 /// One entry of [`Sema::loop_ctx`] — a loop currently being type-checked.
@@ -649,7 +671,11 @@ impl<'a> Sema<'a> {
 
     fn resolved_fn_sig(&mut self, f: &FnDecl) -> FnSig {
         self.generics = generic_names(&f.generics);
-        let params = f.params.iter().map(|p| self.lower_type(&p.ty)).collect();
+        let params = f
+            .params
+            .iter()
+            .map(|p| self.lower_param_type(&p.ty))
+            .collect();
         let ret = f
             .ret
             .as_ref()
@@ -714,7 +740,7 @@ impl<'a> Sema<'a> {
                     for f in &blk.items {
                         self.generics = generic_names(&f.generics);
                         for p in &f.params {
-                            self.lower_type(&p.ty);
+                            self.lower_param_type(&p.ty);
                         }
                         if let Some(t) = &f.ret {
                             self.lower_type(t);
@@ -886,7 +912,11 @@ impl<'a> Sema<'a> {
     fn collect_fn(&mut self, f: &FnDecl) {
         self.check_unique_decl_names(&Self::generic_decl_names(&f.generics), "generic parameter");
         self.generics = generic_names(&f.generics);
-        let params = f.params.iter().map(|p| self.lower_type(&p.ty)).collect();
+        let params = f
+            .params
+            .iter()
+            .map(|p| self.lower_param_type(&p.ty))
+            .collect();
         let ret = match &f.ret {
             Some(t) => self.lower_type(t),
             None => Ty::Unit,
@@ -1154,6 +1184,19 @@ impl<'a> Sema<'a> {
                 Dim::Var(*s)
             }
             DimKind::Dynamic => Dim::Dynamic,
+            // A derived extent: fold both operands, then the operator, into the normal form
+            // `wukong_types::dim` defines, so `2*N` and `N + N` are one type. A WRITTEN `?` operand
+            // is reported here (an operand poisoned to `?` by an inner error is not reported again).
+            DimKind::Binary { op, lhs, rhs } => {
+                let l = self.lower_dim(lhs);
+                let r = self.lower_dim(rhs);
+                for side in [lhs, rhs] {
+                    if matches!(side.kind, DimKind::Dynamic) {
+                        self.report_dynamic_dim_operand(side.span, *op);
+                    }
+                }
+                self.fold_dim_binary(*op, &l, &r, d.span)
+            }
         }
     }
 
@@ -1529,6 +1572,8 @@ impl<'a> Sema<'a> {
         self.immutable_locals.push(HashSet::default());
         self.immutable_params.clear();
         self.immutable_params.push(HashSet::default());
+        self.tensor_views.clear();
+        self.tensor_views.push(HashMap::default());
         self.param_tys.clear();
         let ann = self.lower_type(&c.ty);
         let vty = self.type_expr(&c.value);
@@ -1568,6 +1613,8 @@ impl<'a> Sema<'a> {
         self.immutable_locals.push(HashSet::default());
         self.immutable_params.clear();
         self.immutable_params.push(HashSet::default());
+        self.tensor_views.clear();
+        self.tensor_views.push(HashMap::default());
         self.param_tys.clear();
         // Two parameters may not share a name: the second would silently shadow the first in the
         // body scope (a `fn f(a: i32, a: i64)` ran, with `a` resolving to the second), which is a
@@ -1582,7 +1629,7 @@ impl<'a> Sema<'a> {
                     format!("duplicate parameter name `{nm}`"),
                 );
             }
-            let ty = self.lower_type(&p.ty);
+            let ty = self.lower_param_type(&p.ty);
             // A parameter without `mut` is immutable: track it so reassigning it (`p = …`) or
             // mutating it through a projection (`p.f = …` on an aggregate, which — passed by
             // reference — would reach the caller) is E0304. Record its type either way, so the
@@ -1790,6 +1837,9 @@ impl<'a> Sema<'a> {
     /// "truthy" condition like `if 5` is intentionally allowed and stays unaffected.
     fn check_condition(&mut self, cond: &Expr) {
         let t = self.type_expr(cond);
+        if self.reject_tensor_value(&t, "a condition", cond.span) {
+            return;
+        }
         if matches!(t, Ty::Unit) {
             self.error(
                 cond.span,
@@ -2179,12 +2229,14 @@ impl<'a> Sema<'a> {
         self.scopes.push(HashMap::default());
         self.immutable_locals.push(HashSet::default());
         self.immutable_params.push(HashSet::default());
+        self.tensor_views.push(HashMap::default());
     }
 
     fn pop_scope(&mut self) {
         self.scopes.pop();
         self.immutable_locals.pop();
         self.immutable_params.pop();
+        self.tensor_views.pop();
     }
 
     /// Whether `name` resolves (innermost scope first) to a local bound immutably. A `mut` binding,
@@ -2351,6 +2403,9 @@ impl<'a> Sema<'a> {
                     (None, Some(i)) => i.clone(),
                     (None, None) => Ty::Unknown,
                 };
+                // What the binding views is read BEFORE the name is bound, so a shadowing view
+                // (`let a = a[0];`) still resolves its initializer to the parameter it reads.
+                self.note_tensor_view(pat, &bound, init.as_ref());
                 self.bind_pattern(pat, &bound);
                 if let Ty::Array {
                     shared: true,
@@ -2531,6 +2586,8 @@ impl<'a> Sema<'a> {
                                          (`fn …(mut {nm}: …)`) to allow in-place mutation"
                                     ),
                                 );
+                            } else if let Some(param) = self.tensor_view_root(root) {
+                                self.report_write_through_view(target.span, root, param);
                             }
                         }
                     }
@@ -2568,6 +2625,7 @@ impl<'a> Sema<'a> {
                 // place and value shapes (E0501 rank / E0502 dim), the same check the binops apply;
                 // a no-op for scalar/aggregate places.
                 self.check_binop_shapes(&target_ty, &value_ty, value.span);
+                self.check_tensor_assign(target, &target_ty, &value_ty, value.span);
             }
             StmtKind::Expr(e) => {
                 // A statement-position `loop` (`loop {…};` or `loop {…}` before another statement)
@@ -2739,6 +2797,9 @@ impl<'a> Sema<'a> {
                 let elem = self.type_for_iter(iter);
                 self.push_scope();
                 self.bind_pattern(pat, &elem);
+                if let ForIter::Expr(it) = iter {
+                    self.note_tensor_view(pat, &elem, Some(it));
+                }
                 self.loop_ctx.push(LoopCtx {
                     label: label.as_ref().map(|l| l.sym),
                     is_value: false,
@@ -2776,6 +2837,25 @@ impl<'a> Sema<'a> {
                 // — we don't newly reject other iterables here).
                 match self.type_expr(e) {
                     Ty::Array { elem, .. } | Ty::Slice(elem) => *elem,
+                    // A tensor iterates its leading axis: a rank-1 tensor yields its elements, a
+                    // contiguous rank-2+ tensor yields the row VIEWS of the remaining axes (the same
+                    // sub-tensor `t[i]` names).
+                    Ty::Tensor {
+                        elem,
+                        shape,
+                        layout,
+                    } => match shape.rank() {
+                        0 => Ty::Unknown,
+                        1 if matches!(layout, Layout::Contiguous | Layout::ColMajor) => {
+                            Ty::Scalar(elem)
+                        }
+                        _ if layout == Layout::Contiguous => Ty::Tensor {
+                            elem,
+                            shape: Shape(shape.0[1..].to_vec()),
+                            layout: Layout::Contiguous,
+                        },
+                        _ => Ty::Unknown,
+                    },
                     _ => Ty::Unknown,
                 }
             }
@@ -3411,7 +3491,11 @@ impl<'a> Sema<'a> {
                     // had accepted). Stay lenient for `Unknown`/`Error` and pointer-like types.
                     UnOp::Deref => match t {
                         Ty::Ptr { pointee, .. } | Ty::Ref { pointee, .. } => *pointee,
-                        Ty::Scalar(_) | Ty::Named(_) | Ty::Tuple(_) | Ty::Array { .. } => {
+                        Ty::Scalar(_)
+                        | Ty::Named(_)
+                        | Ty::Tuple(_)
+                        | Ty::Array { .. }
+                        | Ty::Tensor { .. } => {
                             self.error(
                                 expr.span,
                                 "E0401",
@@ -3436,11 +3520,14 @@ impl<'a> Sema<'a> {
                     // Unary `-`/`!` on an aggregate (struct/tuple/array), `()` (a void call's
                     // result), or a function value is meaningless and used to pass through unchanged,
                     // then mir_build emitted an arithmetic op on a base pointer / a dummy / a void
-                    // operand — invalid MIR (`-nothing()` crashed native). Scalars/vectors/tensors
-                    // negate fine; stay lenient for `Unknown`.
+                    // operand — invalid MIR (`-nothing()` crashed native). Scalars and vectors
+                    // negate fine; a whole tensor does not (it is a base pointer, and an index list
+                    // one short of the rank produces one); stay lenient for `Unknown`.
                     UnOp::Neg | UnOp::Not => {
-                        if self.is_noncomputable_operand(&t) {
-                            let glyph = if matches!(op, UnOp::Neg) { "-" } else { "!" };
+                        let glyph = if matches!(op, UnOp::Neg) { "-" } else { "!" };
+                        if self.reject_tensor_value(&t, &format!("unary `{glyph}`"), expr.span) {
+                            Ty::Unknown
+                        } else if self.is_noncomputable_operand(&t) {
                             self.error(
                                 expr.span,
                                 "E0401",
@@ -3490,6 +3577,12 @@ impl<'a> Sema<'a> {
                 // Operand shapes must agree (tensor-tensor / vector-vector); a mismatch is a real
                 // error regardless of whether the operator yields a value or a bool.
                 self.check_binop_shapes(&l, &r, e.span);
+                // No operator is defined on a whole tensor — arithmetic, comparison or logic. A
+                // tensor indexed with fewer indices than its rank is a VIEW, so a forgotten index
+                // lands here: say which value it was and what it is.
+                if self.reject_tensor_operands(&l, &r, *op, e.span) {
+                    return Ty::Unknown;
+                }
                 use BinOp::*;
                 // No binary operator other than `==`/`!=` (which has its own message below) is
                 // defined on an aggregate (struct/tuple/array), `()` (a void call's result), or a
@@ -3820,7 +3913,11 @@ impl<'a> Sema<'a> {
             ExprKind::Cast { expr, ty } => {
                 let from = self.type_expr(expr);
                 let to = self.lower_type(ty);
-                self.check_cast(&from, &to, e.span);
+                // `x as Tensor[T, …]` is a reshape — a zero-copy view of `x` under a new shape —
+                // judged by its own rules; every other cast keeps the conversion rules.
+                if !self.check_reshape(&from, &to, e.span) {
+                    self.check_cast(&from, &to, e.span);
+                }
                 to
             }
             ExprKind::StructLit { path, fields, rest } => {
@@ -5501,15 +5598,21 @@ mod tests {
 
     #[test]
     fn tensor_index_rank_mismatch_errors() {
-        let src = "fn f(a: Tensor[f32, 4, 4]) { let x = a[0]; }";
+        // MORE indices than the rank is an index-count error that names both counts and the shape.
+        let src = "fn f(a: Tensor[f32, 4, 4]) { let x = a[0, 1, 2]; }";
         assert!(
             errors(src).contains(&"E0501"),
             "expected a rank mismatch: {:?}",
             errors(src)
         );
-        // An index-count mismatch names how many indices were written against the tensor's rank —
-        // and the shape, so the reader knows what the missing index should range over.
-        assert_message_has(src, "E0501", &["rank 2 [4, 4]", "indexed with 1 index"]);
+        assert_message_has(src, "E0501", &["rank 2 [4, 4]", "indexed with 3 indices"]);
+        // FEWER indices select a view of the remaining axes (the row) — no longer an error in
+        // itself — but a view is not a scalar, so the forgotten index is still caught wherever the
+        // value is used as one, and the message says what was produced.
+        let view = "fn f(a: Tensor[f32, 4, 4]) { let x = a[0]; }";
+        assert!(errors(view).is_empty(), "a row view: {:?}", errors(view));
+        let used = "fn f(a: Tensor[f32, 4, 4]) -> f32 { return a[0] + 1.0; }";
+        assert_message_has(used, "E0401", &["Tensor[f32, 4]", "index every axis"]);
     }
 
     #[test]
@@ -5876,43 +5979,44 @@ mod tests {
 
     #[test]
     fn generic_array_length() {
-        // `Ty::Array` carries a plain `u64` length with no representation for a symbolic extent
-        // (unlike `Ty::Tensor`'s `Dim::Var`), so `[T; N]` was exempted from the name check and then
-        // folded to 0 here while mir_build lowered `MirType::Ptr` — the same two-crate desync.
-        let gen = "fn sum<N>(a: [f32; N], n: i64) -> f32 { return a[0]; }";
+        // A generic array length used to be exempted from the name check and then fold to 0 here
+        // while mir_build lowered `MirType::Ptr` — the two-crate desync. In a PARAMETER it is now
+        // the shape-generic buffer it denotes (`[f32; N]` is `Tensor[f32, N]`), bound per call from
+        // the argument's length; anywhere storage would need a run-time size it stays E0406.
+        let param = "fn sum<N>(a: [f32; N], n: i64) -> f32 { return a[0]; }";
         assert!(
-            errors(gen).contains(&"E0406"),
-            "a generic array length must be reported: {:?}",
-            errors(gen)
+            errors(param).is_empty(),
+            "a generic-length array parameter is a shape-generic buffer: {:?}",
+            errors(param)
         );
-        // It is still not an unresolved NAME — the distinction the older check drew stands.
-        assert!(
-            !errors(gen).contains(&"E0301"),
-            "a declared generic is not an unknown name: {:?}",
-            errors(gen)
-        );
-        // The spelling the diagnostic points at must itself be clean: a symbolic tensor extent is
-        // bound per call site and shape-checked, which is the whole point of `Tensor[T, N]`.
-        let ok = "fn sum<N>(a: Tensor[f32, N]) -> f32 { return a[0]; }";
-        assert!(
-            errors(ok).is_empty(),
-            "the Tensor spelling must stay clean: {:?}",
-            errors(ok)
-        );
-        // Recovery must NOT cascade to call sites. An unreadable extent is now Ty::Error;
-        // treating it as zero would report a false array-length mismatch against the caller.
-        let call = "fn sum<N>(a: [f32; N], n: i64) -> i64 { return n; } \
+        let call = "fn sum<N>(a: [f32; N]) -> f32 { let mut s: f32 = 0.0; \
+                    for i in 0..N { s = s + a[i]; } return s; } \
                     fn main() -> i32 { let x: [f32; 4] = [1.0, 2.0, 3.0, 4.0]; \
-                    return sum(x, 4) as i32; }";
+                    let y: [f32; 8] = [1.0; 8]; return (sum(x) + sum(y)) as i32; }";
         assert!(
-            errors(call).contains(&"E0406"),
-            "the generic length must still be reported at the declaration: {:?}",
+            errors(call).is_empty(),
+            "each call binds `N` from its argument: {:?}",
             errors(call)
         );
+        // A LOCAL array of generic length would need run-time-sized storage: still E0406, and
+        // still not an unresolved NAME.
+        let local = "fn f<N>(a: [f32; N]) { let b: [f32; N]; }";
         assert!(
-            !errors(call).contains(&"E0501"),
-            "an unreadable extent must not cascade into a call-site length mismatch: {:?}",
-            errors(call)
+            errors(local).contains(&"E0406"),
+            "a generic local array length must be reported: {:?}",
+            errors(local)
+        );
+        assert!(
+            !errors(local).contains(&"E0301"),
+            "a declared generic is not an unknown name: {:?}",
+            errors(local)
+        );
+        // So does a generic-length RETURN type (it would be a by-value array of run-time size).
+        let ret = "fn f<N>(a: [f32; N]) -> [f32; N] { return a; }";
+        assert!(
+            errors(ret).contains(&"E0406"),
+            "a generic-length array return must be reported: {:?}",
+            errors(ret)
         );
         // A generic ELEMENT type with a literal length is unaffected (tests/run/generic_typed_local.wk).
         let elem = "fn f<T>(x: T) -> T { let a: [T; 2] = [x, x]; return a[0] + a[1]; }";
@@ -6018,10 +6122,13 @@ mod tests {
     fn zero_extent_recovery_remains_distinct_from_empty_arrays() {
         for (src, code) in [
             (
-                "fn get<N>(a: [i32; N]) {} fn f(a: [i32; 1]) { get(a); }",
+                "fn get<N>(a: [i32; N]) { let b: [i32; N]; } fn f(a: [i32; 1]) { get(a); }",
                 "E0406",
             ),
-            ("const N: usize = 0; fn get<N>(a: [i32; N]) {}", "E0406"),
+            (
+                "const N: usize = 0; fn get<N>() { let a: [i32; N]; }",
+                "E0406",
+            ),
             (
                 "fn get(a: [i32; MISSING]) {} fn f(a: [i32; 1]) { get(a); }",
                 "E0301",

@@ -1,0 +1,105 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 21
+// EXPECT-OUT: 6
+// EXPECT-OUT: 21
+// EXPECT-OUT: 5
+// EXPECT-OUT: 5
+// EXPECT-OUT: 4
+// EXPECT-OUT: 3
+// EXPECT-OUT: 2
+// EXPECT-OUT: 21
+// EXPECT-OUT: 26
+module tests.run.tensor_extent
+
+// A tensor reports its own extents: `t.dim(k)` is the extent of axis `k` and `t.len()` the extent
+// of axis 0, as `i64`. A fixed axis folds to its constant and a symbolic one reads its hidden
+// dimension parameter; a `?` axis of a tensor PARAMETER is a run-time extent the caller passes as
+// one more hidden argument, so it can be read, used as a loop bound, iterated, used as the row
+// stride of an interior `?` axis, forwarded to another `?` parameter, and passed where a callee
+// has a generic dimension (which it then binds). Every expected value is the element count the
+// caller's buffer implies: a [f32; 6] seen as [?, 3] has 6 / 3 = 2 rows.
+
+fn rows(a: Tensor[f32, ?, 3]) -> i64 {
+    return a.dim(0);
+}
+
+fn cols(a: Tensor[f32, 2, ?]) -> i64 {
+    return a.dim(1);
+}
+
+fn total(a: Tensor[f32, ?, 3]) -> f32 {
+    let mut s: f32 = 0.0;
+    for i in 0..a.dim(0) {
+        for j in 0..a.dim(1) {
+            s = s + a[i, j];
+        }
+    }
+    return s;
+}
+
+// An interior `?` axis: its run-time extent is the row stride of `a[i, j]`.
+fn at(a: Tensor[f32, 2, ?], i: i64, j: i64) -> f32 {
+    return a[i, j];
+}
+
+fn sum_all(a: Tensor[f32, ?]) -> f32 {
+    let mut s: f32 = 0.0;
+    for x in a {
+        s = s + x;
+    }
+    return s;
+}
+
+// A shape-generic array parameter answers `.len()` from its hidden dimension.
+fn generic_len<N>(a: [i32; N]) -> i64 {
+    return a.len();
+}
+
+// A `?` parameter forwards its own run-time extent to another `?` parameter.
+fn forward(a: Tensor[f32, ?, 3]) -> i64 {
+    return rows(a);
+}
+
+// A `?` extent passed where the callee has a symbolic dimension binds that dimension at run time.
+fn gsum<N>(a: Tensor[f32, N]) -> f32 {
+    let mut s: f32 = 0.0;
+    for i in 0..N {
+        s = s + a[i];
+    }
+    return s;
+}
+
+fn forward_sum(a: Tensor[f32, ?]) -> f32 {
+    return gsum(a);
+}
+
+// A view of a `?` parameter keeps the extent of the axes it keeps: row 1 of a [2, ?] is a [?].
+fn last_row_len(a: Tensor[f32, 2, ?]) -> i64 {
+    let r = a[1];
+    return r.len();
+}
+
+fn main() -> i32 {
+    let buf: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    print(rows(buf)); // 6 / 3 = 2
+    print(cols(buf)); // 6 / 2 = 3
+    print(total(buf) as i32); // 1 + 2 + ... + 6 = 21
+    print(at(buf, 1, 2) as i32); // row 1, column 2 of [[1, 2, 3], [4, 5, 6]] = 6
+    print(sum_all(buf) as i32); // 21
+    let ints: [i32; 5] = [0; 5];
+    print(ints.len()); // 5
+    print(generic_len(ints)); // 5
+    let wide: [f32; 12] = [0.0; 12];
+    print(forward(wide)); // 12 / 3 = 4
+    print(last_row_len(buf)); // 3
+    // A fixed axis folds to its constant.
+    let m = buf as Tensor[f32, 2, 3];
+    print(m.len()); // 2
+    print(forward_sum(buf) as i32); // N = 6: 1 + 2 + ... + 6 = 21
+    let more: [f32; 4] = [5.0, 6.0, 7.0, 8.0];
+    print(forward_sum(more) as i32); // N = 4: 5 + 6 + 7 + 8 = 26
+    return 0;
+}

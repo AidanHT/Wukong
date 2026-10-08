@@ -111,11 +111,7 @@ impl AstPrinter<'_> {
             TypeKind::Tensor { elem, dims, layout } => {
                 let mut parts = vec![self.type_str(elem)];
                 for d in dims {
-                    parts.push(match &d.kind {
-                        DimKind::Int(n) => n.to_string(),
-                        DimKind::Named(s) => self.sym(*s).to_string(),
-                        DimKind::Dynamic => "?".to_string(),
-                    });
+                    parts.push(self.dim_str(d));
                 }
                 let lay = match layout {
                     Some(Layout::Contiguous) => ", .contiguous".to_string(),
@@ -133,6 +129,22 @@ impl AstPrinter<'_> {
                 };
                 format!("Tensor[{}{}]", parts.join(", "), lay)
             }
+        }
+    }
+
+    /// One tensor dimension as written: `512`, `N`, `?`, or a derived extent with explicit grouping
+    /// (`(N * 2)`), so the printed tree shows how the parser associated the operators.
+    fn dim_str(&self, d: &Dim) -> String {
+        match &d.kind {
+            DimKind::Int(n) => n.to_string(),
+            DimKind::Named(s) => self.sym(*s).to_string(),
+            DimKind::Dynamic => "?".to_string(),
+            DimKind::Binary { op, lhs, rhs } => format!(
+                "({} {} {})",
+                self.dim_str(lhs),
+                op.glyph(),
+                self.dim_str(rhs)
+            ),
         }
     }
 

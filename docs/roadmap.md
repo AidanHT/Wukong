@@ -228,6 +228,23 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   a `@parallel` symbolic-shape function (a matmul reaches the multicore `wukong_sgemm_parallel`; an
   elementwise nest runs correctly through the ordinary path, exactly as a constant-shape `@parallel`
   tensor function does).
+- **Shape arithmetic, views, reshape and extents** run on both backends. A dimension may be computed
+  from others (`Tensor[f32, S, 3*D]`, `H*HD`, `(L - K)/S + 1`) and is held in a canonical polynomial
+  normal form, so `2*N` and `N + N` are one type, and a call solves a dimension that appears only
+  inside one (`2*N = 8`, `N = 4`) — `tests/run/tensor_dim_arith.wk`. Indexing with fewer indices than
+  the rank is a zero-copy **view** of the remaining axes (`m[i]` is a row; `m[i][j]` is `m[i, j]`; `for
+  row in m` walks rows), lowered as the address of the view's first element, so no recognizer can
+  mistake it for an element read — `tests/run/tensor_views.wk`. `x as Tensor[..]` reshapes a
+  contiguous buffer when the element count is provably equal — `tests/run/tensor_reshape_heads.wk`.
+  `t.dim(k)` / `t.len()` read extents, including a `?` axis of a tensor parameter, whose run-time
+  extent the caller passes as a hidden argument (and which binds a callee's generic dimension when
+  the tensor is forwarded) — `tests/run/tensor_extent.wk`. Not yet: a strided
+  view (a column, a transpose, a `lo..hi` sub-range) — a tensor value carries no stride vector, so
+  views are prefixes of the leading axes of a contiguous buffer; a reshape or a view of a `?`
+  dimension's *count*; a `?` extent of a tensor returned by a call (a clean `C0001`); and kernel
+  recognition over a *derived* inner extent — a `Tensor[f32, S, H*HD]` nest lowers through the
+  general strided path, because the GEMM recognizer's stride matcher only knows literal and
+  single-variable extents.
 - **Matmul → GEMM dispatch**: the compiler recognizes a matmul loop nest (the `ikj` accumulate and
   `ijk` dot-product forms, including the `nn.Linear` `C = A·Bᵀ` spelling) and lowers the whole nest
   to a tuned register-blocked (6×16), cache-tiled, packed **AVX2/FMA** microkernel in the runtime —
@@ -987,9 +1004,11 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   Unfoldable lengths report `E0406`; unknown names report `E0301`. Invalid lengths use an error
   type, separate from a genuine zero-length array. Calls, returns, assignments and nested aggregate
   agreement check zero extents too, while preserving compatible inferred empty literals.
-  A **symbolic** array length (a generic `N`) has no fixed-array representation and reports `E0406`
-  in both parameters and locals; use `Tensor[T, N]` for generic dimensions. Matmul *dimensions* may be runtime
-  values — a runtime-dimension matmul still dispatches to the GEMM kernel.
+  A **symbolic** array length (a generic `N`, or `2*N`) is the shape of a **parameter**: `fn f<N>(a:
+  [f32; N])` takes the shape-generic buffer `Tensor[f32, N]`, bound per call from the argument's
+  length (`tests/run/generic_array_param.wk`). A local or a return type of generic length (which would
+  need run-time-sized storage) and a non-scalar element still report `E0406`. Matmul *dimensions* may be
+  runtime values — a runtime-dimension matmul still dispatches to the GEMM kernel.
 - Ordered comparison (`< <= > >=`) is not defined on `bool`, so a **chained comparison** `a < b < c`
   (which parses left-associatively as `(a < b) < c`) is a compile error (`E0401`) rather than a silent
   wrong result — write `a < b && b < c` (`tests/fail/chained_comparison.wk`). Equality `==`/`!=`

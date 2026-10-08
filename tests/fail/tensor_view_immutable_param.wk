@@ -1,0 +1,16 @@
+// EXPECT-CODE: E0304
+module tests.fail.tensor_view_immutable_param
+
+// A non-`mut` aggregate parameter may not be mutated, because it is the CALLER's buffer — and a
+// view of it (`let r = a[i]`, a row) names that same buffer. Writing through the view is writing
+// `a`, so it is held to the same rule.
+fn zero_row(a: Tensor[f32, 4, 3], i: i64) {
+    let r = a[i];
+    for j in 0..3 {
+        r[j] = 0.0;
+    }
+}
+
+fn main() -> i32 {
+    return 0;
+}

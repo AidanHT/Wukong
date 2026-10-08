@@ -436,13 +436,19 @@ fn origins_may_overlap(a: &Origin, b: &Origin) -> bool {
     }
 }
 
-/// A type that hands back storage its holder did not create — a `[]T` slice, a raw pointer or a
-/// reference. Used two ways: a *call* whose return type is one of these can be handing back one of
-/// its own arguments, and a *binding* of one of these is a view of whatever it was initialised
-/// from. An aggregate (`[T; N]`, `Tensor[..]`, a struct/tuple) is neither: it returns through the
+/// A type that hands back storage its holder did not create — a `[]T` slice, a raw pointer, a
+/// reference, or a `Tensor[..]`. Used two ways: a *call* whose return type is one of these can be
+/// handing back one of its own arguments, and a *binding* of one of these is a view of whatever it
+/// was initialised from. A tensor value IS such a view — a base pointer with a shape, never storage:
+/// `let r = a[i];` (a row of `a`), `let h = x as Tensor[..]` (a reshape of `x`) and `let t = a;`
+/// all name `a`'s / `x`'s buffer, and a tensor-returning call returns one of its arguments' buffers
+/// (it has no sret). An aggregate (`[T; N]`, a struct/tuple) is neither: it returns through the
 /// sret ABI into a buffer the caller just allocated, and it deep-copies on `let`.
 fn ty_is_borrowing(t: &Ty) -> bool {
-    matches!(t, Ty::Slice(_) | Ty::Ptr { .. } | Ty::Ref { .. })
+    matches!(
+        t,
+        Ty::Slice(_) | Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Tensor { .. }
+    )
 }
 
 /// Classify an argument expression. See [`Origin`].
