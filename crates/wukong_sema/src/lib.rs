@@ -2640,11 +2640,15 @@ impl<'a> Sema<'a> {
                 let value_ty = self.type_expr(value);
                 // Either side may be a literal-initialized binding whose type this use fixes
                 // (`infer.rs`): `s = x` makes `s` an `x`, and so does `s += x` when `x` is wider.
+                // A shift amount is a count, not an operand of the promotion (as in the binary
+                // operator arm), so `k <<= n` constrains neither `k` nor `n`.
                 let widen_only = !matches!(op, AssignOp::Assign);
-                if !self.is_literal_operand(value) {
-                    self.constrain_literal_binding(target, Some(value), &value_ty, widen_only);
+                if !matches!(op, AssignOp::Shl | AssignOp::Shr) {
+                    if !self.is_literal_operand(value) {
+                        self.constrain_literal_binding(target, Some(value), &value_ty, widen_only);
+                    }
+                    self.constrain_literal_binding(value, Some(target), &target_ty, widen_only);
                 }
-                self.constrain_literal_binding(value, Some(target), &target_ty, widen_only);
                 // A literal assigned to a place adapts to (and is range-checked against) the place's
                 // type, the same rule `let` and struct-init already apply — so `p = 9000000000` for
                 // an i32 place is a hard E0401 instead of a silent low-32-bit truncation both backends

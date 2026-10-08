@@ -23,6 +23,9 @@
 //!   keeps the default: a narrower `T` promotes into it losslessly anyway, so `let k = 2; k + x_u8`
 //!   stays the `i32` sum it always was.
 //!
+//! A shift (`<<`, `>>`, `<<=`, `>>=`) constrains neither side: its amount is a count, so
+//! `let mut k = 1; k <<= n_u64;` keeps `k` an `i32`.
+//!
 //! A use that decides the default (the same type, a narrower operand, the other kind) still
 //! *pins* the binding, so a later use cannot change it behind the first one's back: in
 //! `let k = 2; f_i32(k); x_i64 * k` the call fixes `k: i32`, and the product promotes it. A use
@@ -252,6 +255,9 @@ mod tests {
         let src = "fn g(n: i32) -> i32 { return n; } \
                    fn f(x: i64) -> i64 { let k = 2; let a = g(k); return x * k + (a as i64); }";
         assert!(codes(src).is_empty(), "{:?}", codes(src));
+        // A shift amount is a count: it does not retype the shiftee (or the shiftee the amount).
+        let src = "fn f(n: u64) -> i32 { let mut k = 1; k <<= n; return k; }";
+        assert_eq!(first_let_init_ty(src), Ty::Scalar(Scalar::I32));
         // Not an all-literal initializer: nothing to infer.
         assert_eq!(
             first_let_init_ty("fn f(x: f64) -> f64 { let y = x; return y; }"),
