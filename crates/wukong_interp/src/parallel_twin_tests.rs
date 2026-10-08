@@ -482,6 +482,8 @@ fn fused_scaled_quantized_and_half_gemm_twins_equal_their_serial_kernels() {
 
 type NormBwd = unsafe extern "C" fn(*const f32, *const f32, *const f32, *mut f32, i64, i64, i64);
 type Pool = unsafe extern "C" fn(*const f32, *mut f32, i64, i64, i64, i64, i64, i64, i64);
+/// One row-loss twin case: name, serial kernel, parallel kernel, and its two row-major inputs.
+type LossCase<'a> = (&'static str, Binary, Binary, &'a [f32], &'a [f32]);
 
 /// The row-, column- and element-parallel families the interpreter also answers with the serial
 /// kernel: norm backwards, the losses, RoPE, the extreme scans, column/row arg-reductions, the
@@ -568,7 +570,7 @@ fn row_loss_norm_pool_and_elementwise_twins_equal_their_serial_kernels() {
     assert_eq!(bits(&gs), bits(&gp), "xent_bwd");
 
     // KL divergence over two positive distributions, and soft-label cross-entropy.
-    let losses: [(&str, Binary, Binary, &[f32], &[f32]); 2] = [
+    let losses: [LossCase; 2] = [
         (
             "kldiv",
             wukong_runtime::wukong_kldiv_f32,

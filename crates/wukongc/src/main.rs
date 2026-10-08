@@ -316,10 +316,9 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             "--explain" => {
                 // `--explain <CODE>` explains one code; a bare `--explain` lists every code.
                 match args.get(i + 1) {
-                    Some(code) if !code.starts_with('-') => {
-                        i += 1;
-                        print_explanation(code)?;
-                    }
+                    // `--explain` is terminal: we return right after, so the `<CODE>` operand is
+                    // never re-read and `i` need not be advanced past it.
+                    Some(code) if !code.starts_with('-') => print_explanation(code)?,
                     _ => list_all_codes(),
                 }
                 return Ok(None);
