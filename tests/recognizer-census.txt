@@ -326,7 +326,11 @@ pool2d_partial_window.wk:
 pow.wk:
 power.wk:
 prefix_sum.wk:
+print_aggregate.wk: wukong_rt_alloc wukong_rt_alloc*3 wukong_rt_fmt_f32 wukong_rt_fmt_f32*7 wukong_rt_fmt_f64 wukong_rt_fmt_int wukong_rt_fmt_int*10 wukong_rt_fmt_lit wukong_rt_fmt_lit*70 wukong_rt_fmt_slice wukong_rt_fmt_slice*9 wukong_rt_fmt_str
 print_float_display.wk:
+print_scalar_types.wk:
+printf_format.wk: wukong_rt_fmt_f32 wukong_rt_fmt_f32*10 wukong_rt_fmt_f64 wukong_rt_fmt_f64*5 wukong_rt_fmt_int wukong_rt_fmt_int*28 wukong_rt_fmt_lit wukong_rt_fmt_lit*9 wukong_rt_fmt_str wukong_rt_fmt_str*65
+process_exit.wk: wukong_rt_arg_count wukong_rt_arg_f32 wukong_rt_arg_i64 wukong_rt_arg_i64*2 wukong_rt_env wukong_rt_exit
 ptr_slot_promotion.wk:
 radix_literals.wk:
 rand_philox.wk: wukong_parallel_for wukong_rand_fill_f32 wukong_rt_trig_f32 wukong_rt_trig_f32*7

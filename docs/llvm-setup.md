@@ -71,8 +71,12 @@ The module implements the interpreter's language, not LLVM's defaults:
 
 It names the host `target triple` (the layout is left to the consuming tool, which installs the
 target's own `datalayout`). Every external symbol it references is one the `--emit=exe` link already
-provides: `print`/`println`/`assert` lower to the same `wukong_rt_print_{i64,u64,f64,str}` /
-`wukong_rt_assert` ABI the Cranelift object calls (with the same argument widening), recognized
+provides: `print`/`println`/`assert` lower to the same
+`wukong_rt_print_{i64,u64,f64,f32,bool,char,str}` / `wukong_rt_assert` ABI the Cranelift object
+calls (with the same argument widening; an `f32`, `f16` or `bf16` prints through
+`wukong_rt_print_f32` at `f32` precision), the formatting and process builtins call the
+`wukong_rt_fmt_*` / `wukong_rt_arg*` / `wukong_rt_env` / `wukong_rt_read_stdin` / `wukong_rt_exit`
+entries of `wukong_runtime` like any other runtime call, recognized
 kernels are called through the `wukong_runtime` C ABI (every integer argument widened to `i64`, an
 absent optional pointer passed as `ptr null`), and the general vectorizer's synthesized kernels — raw
 AVX2 bytes inside the Cranelift backend — are **defined in the module** from their backend-agnostic

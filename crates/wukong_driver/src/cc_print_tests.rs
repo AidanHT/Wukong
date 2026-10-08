@@ -63,7 +63,8 @@ fn forced_c_link_preserves_integer_output_and_float_computation() {
              return 7;
          }",
     );
-    let expected = b"-9223372036854775808\n18446744073709551615\n1\n0\n1\n";
+    // A `bool` prints `true`/`false` (`wukong_rt_print_bool`), on every path.
+    let expected = b"-9223372036854775808\n18446744073709551615\ntrue\nfalse\n1\n";
     let main = interner.intern("main");
     let oracle = wukong_interp::run_with_output(&program, main, &interner).unwrap();
     assert_eq!(oracle, (7, expected.to_vec()));
@@ -76,12 +77,13 @@ fn forced_c_link_preserves_integer_output_and_float_computation() {
 /// P15.26 / P13.19: the C fallback prints floats exactly as the oracle does — Rust `Display`'s
 /// shortest round-trip digits, laid out positionally — instead of `%g`'s six significant digits.
 /// The expected lines are hand-derived from that rule (the shortest decimal that parses back to
-/// the double, closest when several do), then the linked executable is also compared with the
-/// interpreter byte for byte. The values cover each layout branch (integral, fractional, leading
-/// zeros, trailing zeros past the digits), the f32-widened 0.1, signed zero, NaN, both infinities,
-/// the smallest subnormal and a power of two whose shortest form needs zero padding. The f64 cases
-/// carry an explicit `f64` suffix: an unsuffixed float literal defaults to `f32` (language guide,
-/// Literals), so a bare `print(0.1)` would print the f32-widened `0.10000000149011612`.
+/// the value at its own precision, closest when several do), then the linked executable is also
+/// compared with the interpreter byte for byte. The values cover each layout branch (integral,
+/// fractional, leading zeros, trailing zeros past the digits), an f32 0.1 (which prints `0.1` at
+/// f32 precision, not the `0.10000000149011612` of the f64 it widens to), signed zero, NaN, both
+/// infinities, the smallest subnormal and a power of two whose shortest form needs zero padding.
+/// The f64 cases carry an explicit `f64` suffix: an unsuffixed float literal defaults to `f32`
+/// (language guide, Literals).
 #[test]
 fn forced_c_link_prints_floats_exactly_like_the_oracle() {
     let (program, mut interner) = lower(
@@ -120,7 +122,8 @@ fn forced_c_link_prints_floats_exactly_like_the_oracle() {
     let mut expected = String::new();
     for line in [
         "0.1",
-        "0.10000000149011612",
+        // The f32 0.1 (13421773 * 2^-27): "0.1" is the shortest decimal that rounds back to it.
+        "0.1",
         "1000000000000000000000",
         "0.0000001",
         "-0",
@@ -154,6 +157,76 @@ fn forced_c_link_prints_floats_exactly_like_the_oracle() {
     assert_eq!(String::from_utf8(stdout).unwrap(), expected);
 }
 
+/// The per-type scalar printers through the C fallback: an `f32` prints its shortest round-trip
+/// digits at f32 precision (the C runtime derives them by round-tripping `%e` candidates through
+/// `strtof`), a `bool` prints `true`/`false`, a `char` its UTF-8 glyph. Every expected line is
+/// hand-derived from those rules: f32 1/3 is 11184811 * 2^-25, shortest "0.33333334"; f32::MAX's
+/// shortest digits are 34028235 then 31 zeros; 1e-7 and 2^-149 (the smallest subnormal, shortest
+/// digit "1" at 1e-45) need leading zeros; f32 0.1 + 0.2 is the f32 0.3; `0xD800 as char` is a
+/// surrogate, which prints U+FFFD.
+#[test]
+fn forced_c_link_prints_f32_bool_and_char_like_the_oracle() {
+    let (program, mut interner) = lower(
+        "fn main() -> i32 {
+             let one: f32 = 1.0;
+             let three: f32 = 3.0;
+             print(one / three);
+             let big: f32 = 3.4028235e38;
+             print(big);
+             let small: f32 = 1e-7;
+             print(small);
+             let tiny: f32 = 1e-45;
+             println(tiny);
+             let p: f32 = 0.1;
+             let q: f32 = 0.2;
+             print(p + q);
+             let nz: f32 = -0.0;
+             print(nz);
+             print(1 < 2);
+             println(2 < 1);
+             let t: bool = true;
+             print(t);
+             print('A');
+             print('\\u{E9}');
+             println('\\u{20AC}');
+             print('\\u{1F600}');
+             let s: u32 = 55296;
+             print(s as char);
+             return 0;
+         }",
+    );
+    let mut expected = String::new();
+    for line in [
+        "0.33333334",
+        "340282350000000000000000000000000000000",
+        "0.0000001",
+        "0.000000000000000000000000000000000000000000001",
+        "0.3",
+        "-0",
+        "true",
+        "false",
+        "true",
+        "A",
+        "\u{E9}",
+        "\u{20AC}",
+        "\u{1F600}",
+        "\u{FFFD}",
+    ] {
+        expected.push_str(line);
+        expected.push('\n');
+    }
+    let main = interner.intern("main");
+    let oracle = wukong_interp::run_with_output(&program, main, &interner).unwrap();
+    assert_eq!(
+        String::from_utf8(oracle.1.clone()).unwrap(),
+        expected,
+        "the hand-derived lines must be the oracle's"
+    );
+    let (code, stdout) = link_with_cc_and_run(&program, &interner, "scalars");
+    assert_eq!(code, 0);
+    assert_eq!(String::from_utf8(stdout).unwrap(), expected);
+}
+
 /// `print` of a string literal links and prints through the C runtime's `wukong_rt_print_str`. Not
 /// on Windows, where the MinGW linker cannot consume the MSVC object's `.rodata` data relocation
 /// that a string literal needs (a link failure there, never different output).
@@ -178,6 +251,9 @@ fn generated_c_runtime_defines_every_print_symbol() {
         "void wukong_rt_print_i64(",
         "void wukong_rt_print_u64(",
         "void wukong_rt_print_f64(",
+        "void wukong_rt_print_f32(",
+        "void wukong_rt_print_bool(",
+        "void wukong_rt_print_char(",
         "void wukong_rt_print_str(",
         "void wukong_rt_assert(",
     ] {

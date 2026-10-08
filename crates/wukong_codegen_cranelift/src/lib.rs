@@ -18,7 +18,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
 use std::sync::Mutex;
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -47,6 +47,9 @@ mod avx2;
 
 // The runtime entries of the ML builtins, declared, JIT-bound and called from one table.
 mod ml_rt;
+
+// The runtime entries of the text builtins (the per-type scalar printers), the same way.
+mod text_rt;
 
 // --- The minimal runtime the generated code calls back into ---------------------------------
 //
@@ -101,6 +104,29 @@ fn record_failure(message: impl FnOnce() -> String) {
     ASSERT_FAILED.store(true, Ordering::SeqCst);
 }
 
+/// The exit code of a guarded run that `exit(code)` ended — read with the failure it is recorded
+/// as ([`wukong_runtime::process::EXIT_SENTINEL`]).
+static EXIT_CODE: AtomicI64 = AtomicI64::new(0);
+
+/// `exit(code)` in a guarded run: remember the code and stop the run the way a failed `assert`
+/// does — every generated caller returns at once — so the host reports `code` as the run's result.
+pub(crate) fn record_exit(code: i64) {
+    EXIT_CODE.store(code, Ordering::SeqCst);
+    record_failure(|| wukong_runtime::process::EXIT_SENTINEL.to_owned());
+}
+
+/// The outcome of a guarded run whose entry returned `exit_code`: its failure, the code `exit`
+/// ended it with, or `exit_code`.
+fn run_outcome(exit_code: i64) -> Result<i64, String> {
+    match take_failure() {
+        Some(f) if f == wukong_runtime::process::EXIT_SENTINEL => {
+            Ok(EXIT_CODE.load(Ordering::SeqCst))
+        }
+        Some(failure) => Err(failure),
+        None => Ok(exit_code),
+    }
+}
+
 /// Clear the failure state at the start of a guarded run.
 fn reset_failure() {
     ASSERT_FAILED.store(false, Ordering::SeqCst);
@@ -118,24 +144,78 @@ fn take_failure() -> Option<String> {
     Some(recorded.unwrap_or_else(|| "assertion failed".to_owned()))
 }
 
-extern "C" fn rt_print_i64(x: i64) {
+/// How a guarded run's stdout leaves [`OUTPUT`]: [`STREAM_CAPTURE`] keeps it for the caller
+/// ([`JitProgram::run_capturing`]); the two streaming modes ([`JitProgram::run_streaming`]) write it
+/// through to the process's stdout at every newline, or once [`STREAM_BLOCK`] bytes are buffered.
+static STREAM_MODE: AtomicU8 = AtomicU8::new(STREAM_CAPTURE);
+const STREAM_CAPTURE: u8 = 0;
+const STREAM_LINES: u8 = 1;
+const STREAM_BLOCKS: u8 = 2;
+/// The block a block-buffered streaming run writes stdout in (the interpreter's, too).
+const STREAM_BLOCK: usize = 1 << 16;
+
+/// Write everything buffered in `o` to the process's stdout and clear it.
+fn drain_output(o: &mut Vec<u8>) {
+    use std::io::Write as _;
+    let out = std::io::stdout();
+    let mut out = out.lock();
+    let _ = out.write_all(o);
+    let _ = out.flush();
+    o.clear();
+}
+
+/// Append `bytes` to the run's stdout — the one sink every JIT print entry writes through. A
+/// streaming run writes it on to the process's stdout per [`STREAM_MODE`].
+pub(crate) fn emit_stdout(bytes: &[u8]) {
+    let mode = STREAM_MODE.load(Ordering::SeqCst);
     if let Ok(mut o) = OUTPUT.lock() {
-        o.extend_from_slice(format!("{x}\n").as_bytes());
+        o.extend_from_slice(bytes);
+        let write = match mode {
+            STREAM_LINES => bytes.contains(&b'\n'),
+            STREAM_BLOCKS => o.len() >= STREAM_BLOCK,
+            _ => false,
+        };
+        if write {
+            drain_output(&mut o);
+        }
     }
+}
+
+/// Turns streaming on for one guarded run; dropping it (also while a panic unwinds) turns it off
+/// and writes out what is still buffered.
+struct StreamGuard;
+
+impl StreamGuard {
+    fn on(line_buffered: bool) -> StreamGuard {
+        let mode = if line_buffered {
+            STREAM_LINES
+        } else {
+            STREAM_BLOCKS
+        };
+        STREAM_MODE.store(mode, Ordering::SeqCst);
+        StreamGuard
+    }
+}
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        STREAM_MODE.store(STREAM_CAPTURE, Ordering::SeqCst);
+        drain_output(&mut OUTPUT.lock().unwrap_or_else(|e| e.into_inner()));
+    }
+}
+
+extern "C" fn rt_print_i64(x: i64) {
+    emit_stdout(format!("{x}\n").as_bytes());
 }
 
 // `print`/`println` of an *unsigned* integer lowers to this (mir_build zero-extends the value to 64
 // bits first). Renders the bits as `u64` — the identical text the interpreter's `print_u` produces.
 extern "C" fn rt_print_u64(x: u64) {
-    if let Ok(mut o) = OUTPUT.lock() {
-        o.extend_from_slice(format!("{x}\n").as_bytes());
-    }
+    emit_stdout(format!("{x}\n").as_bytes());
 }
 
 extern "C" fn rt_print_f64(x: f64) {
-    if let Ok(mut o) = OUTPUT.lock() {
-        o.extend_from_slice(format!("{x}\n").as_bytes());
-    }
+    emit_stdout(format!("{x}\n").as_bytes());
 }
 
 // `print`/`println` of a `*u8` string lowers to this. Reads the NUL-terminated byte buffer the
@@ -146,16 +226,15 @@ extern "C" fn rt_print_str(ptr: *const u8) {
         return;
     }
     // SAFETY: `ptr` is a Wukong string buffer, always NUL-terminated by the `ExprKind::Str` lowering.
-    unsafe {
+    let mut line = unsafe {
         let mut len = 0usize;
         while *ptr.add(len) != 0 {
             len += 1;
         }
-        if let Ok(mut o) = OUTPUT.lock() {
-            o.extend_from_slice(std::slice::from_raw_parts(ptr, len));
-            o.push(b'\n');
-        }
-    }
+        std::slice::from_raw_parts(ptr, len).to_vec()
+    };
+    line.push(b'\n');
+    emit_stdout(&line);
 }
 
 extern "C" fn rt_assert(cond: i64) {
@@ -196,6 +275,13 @@ extern "C" fn rt_assert_abort(cond: i64) {
         eprintln!("error: assertion failed");
         std::process::abort();
     }
+}
+
+// The raw-function-pointer (`jit_module`) binding of `wukong_rt_exit`: a raw caller has no run an
+// `exit(code)` could end and report, so it is fatal there, as a failed assertion is.
+extern "C" fn rt_exit_abort(code: i64) {
+    eprintln!("error: exit({code}) called from code run through a raw function pointer");
+    std::process::abort();
 }
 
 // The raw-mode binding of `wukong_rt_assert_failed`. A raw module aborts on any failure (an
@@ -586,22 +672,34 @@ pub fn classify_error(message: &str) -> NativeErrorKind {
 enum Intrinsic {
     PrintInt,
     PrintUint,
+    /// An `f64` value: `wukong_rt_print_f64`.
     PrintFloat,
+    /// An `f32` value, or an `f16`/`bf16` one held in an `f32` register: `wukong_rt_print_f32`,
+    /// which prints the shortest round-trip digits at `f32` precision (`wukong_runtime::fmt`).
+    PrintF32,
     PrintStr,
+    PrintBool,
+    PrintChar,
     Assert,
 }
 
-fn classify_intrinsic(name: &str, arg_is_float: bool) -> Option<Intrinsic> {
+/// `arg` is the MIR type of the call's first argument, when it has one. A `print` of a float picks
+/// its printer by that type, so an `f32` prints at its own precision instead of as the `f64` it
+/// widens to — the interpreter makes the same choice from the same type.
+fn classify_intrinsic(name: &str, arg: Option<&MirType>) -> Option<Intrinsic> {
     match name {
-        "print" | "println" => Some(if arg_is_float {
-            Intrinsic::PrintFloat
-        } else {
-            Intrinsic::PrintInt
+        "print" | "println" => Some(match arg {
+            Some(MirType::F32 | MirType::F16 | MirType::BF16) => Intrinsic::PrintF32,
+            Some(t) if t.is_float() => Intrinsic::PrintFloat,
+            _ => Intrinsic::PrintInt,
         }),
         // mir_build routes a `*u8` (string) argument to these symbols (see `print_str` in GemmSyms).
         "print_str" | "println_str" => Some(Intrinsic::PrintStr),
         // mir_build routes an unsigned-integer argument here (zero-extended to 64 bits).
         "print_u" | "println_u" => Some(Intrinsic::PrintUint),
+        // mir_build routes a `bool` / `char` argument here (zero-extended to 64 bits).
+        "print_bool" | "println_bool" => Some(Intrinsic::PrintBool),
+        "print_char" | "println_char" => Some(Intrinsic::PrintChar),
         "assert" => Some(Intrinsic::Assert),
         _ => None,
     }
@@ -2237,6 +2335,22 @@ impl<'a> FnTranslator<'a> {
         if let Some(result) = self.lower_ml_rt_call(name, args) {
             return result;
         }
+        // `exit(code)`: record the code, then return through every caller at once, exactly as after
+        // a failed `assert` (a linked executable's `wukong_rt_exit` ends the process instead).
+        if name == text_rt::RT_EXIT && args.len() == 1 {
+            let code = self.coerce_to_i64(args[0]);
+            let fref = self.runtime_ref(text_rt::RT_EXIT);
+            self.builder.ins().call(fref, &[code]);
+            let status = self.runtime_ref(RT_ASSERT_FAILED);
+            let check = self.builder.ins().call(status, &[]);
+            let stopped = self.builder.inst_results(check)[0];
+            self.return_on_assert_failure(stopped, false);
+            return None;
+        }
+        // The text builtins' entries (the `text_rt` table).
+        if let Some(result) = self.lower_text_rt_call(name, args) {
+            return result;
+        }
         // Everything above dispatches a runtime kernel on (name, arity). `rt_ids` holds exactly
         // the runtime symbols this function is responsible for, so reaching here with one of them
         // means a recognizer emitted an arity no arm accepts. Unknown `wukong_` names must also
@@ -2257,11 +2371,8 @@ impl<'a> FnTranslator<'a> {
             }
             return None;
         }
-        let arg_is_float = args
-            .first()
-            .map(|a| self.ty_of(*a).is_float())
-            .unwrap_or(false);
-        let Some(intr) = classify_intrinsic(name, arg_is_float) else {
+        let arg_ty = args.first().map(|a| self.ty_of(*a).clone());
+        let Some(intr) = classify_intrinsic(name, arg_ty.as_ref()) else {
             if self.layout_err.is_none() {
                 self.layout_err = Some(format!(
                     "unsupported external call `{name}`: native codegen has no declared ABI or symbol binding"
@@ -2292,6 +2403,17 @@ impl<'a> FnTranslator<'a> {
                     let v = self.coerce_to_f64(a);
                     let fref = self.runtime_ref(RT_PRINT_F64);
                     self.builder.ins().call(fref, &[v]);
+                }
+            }
+            // The per-type scalar printers live in the `text_rt` table; each takes the one value.
+            Intrinsic::PrintF32 | Intrinsic::PrintBool | Intrinsic::PrintChar => {
+                let entry = match intr {
+                    Intrinsic::PrintF32 => text_rt::RT_PRINT_F32,
+                    Intrinsic::PrintBool => text_rt::RT_PRINT_BOOL,
+                    _ => text_rt::RT_PRINT_CHAR,
+                };
+                if let Some(a) = args.first() {
+                    self.lower_text_rt_call(entry, std::slice::from_ref(a));
                 }
             }
             Intrinsic::PrintStr => {
@@ -2878,10 +3000,13 @@ fn make_isa_full(
         .map_err(|e| e.to_string())
 }
 
-/// Is `func` (not a user function) one of the runtime failure intrinsics — a builtin `assert`, or the
-/// failure edge of a checked slice access? Either one stops the run.
+/// Is `func` (not a user function) one of the runtime failure intrinsics — a builtin `assert`, the
+/// failure edge of a checked slice access, or `exit`? Each one stops the run.
 fn is_failure_intrinsic(func: Symbol, interner: &Interner) -> bool {
-    matches!(interner.resolve(func), "assert" | RT_BOUNDS_FAIL)
+    matches!(
+        interner.resolve(func),
+        "assert" | RT_BOUNDS_FAIL | text_rt::RT_EXIT
+    )
 }
 
 /// The functions that can stop the run and so must be polled after every call to them: one that
@@ -3967,6 +4092,7 @@ fn populate_module<M: Module>(
         (RT_FMOD_F32, rt.fmod_f32),
     ]);
     ml_rt::declare(module, ptr_ty, call_conv, &mut rt_ids)?;
+    text_rt::declare(module, ptr_ty, call_conv, &mut rt_ids)?;
 
     // Declare all user functions first so calls resolve regardless of definition order.
     let mut ids: HashMap<Symbol, FuncId> = HashMap::new();
@@ -4439,10 +4565,25 @@ impl JitProgram {
         let ret = self.ret.clone();
         let exit_code = run_on_big_stack(move || unsafe { invoke_code(code, &ret) });
         let out = OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        match take_failure() {
-            Some(failure) => (Err(failure), out),
-            None => (Ok(exit_code), out),
-        }
+        (run_outcome(exit_code), out)
+    }
+
+    /// Run once with stdout **streamed** to the process's stdout as it is produced — what
+    /// `wukongc --run --backend=native` does, the native twin of `wukong_interp::run_streaming`:
+    /// `line_buffered` writes at every newline (an interactive terminal), otherwise in 64 KiB blocks.
+    /// Everything still buffered is written out before this returns, also when the run stopped on a
+    /// runtime failure, which is returned as the error. Same stack and failure contract as
+    /// [`JitProgram::run_capturing`]; the bytes are exactly the ones it would have captured.
+    pub fn run_streaming(&self, line_buffered: bool) -> Result<i64, String> {
+        let _guard = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        reset_failure();
+        let stream = StreamGuard::on(line_buffered);
+        let code = self.code as usize;
+        let ret = self.ret.clone();
+        let exit_code = run_on_big_stack(move || unsafe { invoke_code(code, &ret) });
+        drop(stream);
+        run_outcome(exit_code)
     }
 
     /// Run once for timing: clears (but does not clone) the capture buffer so repeated prints don't
@@ -4464,11 +4605,8 @@ impl JitProgram {
         // every call at scratch mark 0, as a fresh run (and the interpreter) does.
         wukong_runtime::scratch_reset();
         let result = unsafe { self.invoke() };
-        if take_failure().is_some() {
-            1
-        } else {
-            result
-        }
+        // A failure exits 1, as the process would; `exit(code)` exits `code`.
+        run_outcome(result).unwrap_or(1)
     }
 }
 
@@ -4666,8 +4804,9 @@ fn jit_compile_entry(
     );
     builder.symbol(RT_WRITE_I8, wukong_runtime::wukong_rt_write_i8 as *const u8);
     builder.symbol(RT_WRITE_U8, wukong_runtime::wukong_rt_write_u8 as *const u8);
-    // The ML builtins' entries (the `ml_rt` table).
+    // The ML builtins' entries (the `ml_rt` table), and the text builtins' (the `text_rt` table).
     ml_rt::bind_jit(&mut builder);
+    text_rt::bind_jit(&mut builder);
     builder.symbol(RT_NOW_NS, wukong_runtime::wukong_now_ns as *const u8);
     // The guarded run's parallel-for: the runtime's, wrapped in the cancellation ABI that brings a
     // failing region body's diagnostic back to its caller in iteration order (`rt_parallel_for`).
@@ -5298,8 +5437,11 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     );
     builder.symbol(RT_WRITE_I8, wukong_runtime::wukong_rt_write_i8 as *const u8);
     builder.symbol(RT_WRITE_U8, wukong_runtime::wukong_rt_write_u8 as *const u8);
-    // The ML builtins' entries (the `ml_rt` table).
+    // The ML builtins' entries (the `ml_rt` table), and the text builtins' (the `text_rt` table).
     ml_rt::bind_jit(&mut builder);
+    text_rt::bind_jit(&mut builder);
+    // Raw mode: a raw caller has no run an `exit` could end, so it is fatal, as a failed assert is.
+    builder.symbol(text_rt::RT_EXIT, rt_exit_abort as *const u8);
     builder.symbol(RT_NOW_NS, wukong_runtime::wukong_now_ns as *const u8);
     builder.symbol(
         RT_PARALLEL_FOR,

@@ -30,6 +30,10 @@ const RESERVED: &[&str] = &[
     "println_str",
     "print_u",
     "println_u",
+    "print_bool",
+    "println_bool",
+    "print_char",
+    "println_char",
 ];
 
 /// The C-ABI declarations of every `extern "C"` function in `module`, in declaration order and

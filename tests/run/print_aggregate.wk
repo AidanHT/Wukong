@@ -1,0 +1,87 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: Point { x: 1, y: 2.5 }
+// EXPECT-OUT: Line { a: Point { x: -3, y: 0.1 }, b: Point { x: 1, y: 2.5 }, tag: 'k' }
+// EXPECT-OUT: (7, true, 'z', 1.5, "hi")
+// EXPECT-OUT: [1, -2, 3, -4]
+// EXPECT-OUT: [1.0, 0.1, -0.0]
+// EXPECT-OUT: [[1, 2], [3, 4]]
+// EXPECT-OUT: [Point { x: 5, y: 1.0 }, Point { x: 1, y: 2.5 }]
+// EXPECT-OUT: [7, 0, 65535]
+// EXPECT-OUT: [-100, 0, 127]
+// EXPECT-OUT: [0, 0, 0, ..., 0, 0, 9]
+// EXPECT-OUT: [true, false, true]
+// EXPECT-OUT: ['a', 'é']
+// EXPECT-OUT: Point { x: 1, y: 2.5 }
+// EXPECT-OUT: 0.1
+module tests.run.print_aggregate
+
+/// `print` of an aggregate prints it **structurally**, like Rust's `{:?}`, on every backend: a
+/// struct as `Name { field: value, … }`, a tuple as `(a, b)`, an array or slice as `[a, b]`, each
+/// element in `Debug` style (a float always with a point, a `char` and a string quoted). It used to
+/// print the aggregate's ADDRESS — a slot index under the interpreter and a machine address
+/// natively, so the two backends disagreed on a program that compiled cleanly.
+///
+/// Every line is derived from those rules, not recorded:
+/// * `Point { x: 1, y: 2.5 }` — `y` is the f32 2.5, Debug "2.5"; nested structs nest;
+/// * a tuple's string element prints quoted, its `char` in single quotes, its f32 1.5 as "1.5";
+/// * the f32 array `[1.0, 0.1, -0.0]`: Debug keeps the point on 1.0 and the sign of -0.0, and
+///   0.1 is the shortest f32 round-trip form;
+/// * a `[]u16` slice holds 7, 0 (the zeroed heap) and 65535; an `[]i8` holds -100, 0, 127 — every
+///   element read at its own width and signedness;
+/// * a 1500-element `[]i64` (zeroed, last element 9) is longer than 1000 and summarizes,
+///   NumPy-style: its first and last three elements around `...`;
+/// * `bool`s print `true`/`false`, `char`s quoted (`'é'` is printable, so it is not escaped);
+/// * a reference prints what it refers to — a struct, or the f64 0.1 (Display "0.1").
+struct Point {
+    x: i32,
+    y: f32,
+}
+
+struct Line {
+    a: Point,
+    b: Point,
+    tag: char,
+}
+
+fn main() -> i32 {
+    let p = Point { x: 1, y: 2.5 };
+    print(p);
+    let l = Line {
+        a: Point { x: -3, y: 0.1 },
+        b: p,
+        tag: 'k',
+    };
+    println(l);
+    let t = (7, true, 'z', 1.5, "hi");
+    print(t);
+    let a: [i32; 4] = [1, -2, 3, -4];
+    print(a);
+    let f: [f32; 3] = [1.0, 0.1, -0.0];
+    print(f);
+    let m: [[i32; 2]; 2] = [[1, 2], [3, 4]];
+    print(m);
+    let pts: [Point; 2] = [Point { x: 5, y: 1.0 }, p];
+    print(pts);
+    let mut s: []u16 = alloc_u16(3);
+    s[0] = 7;
+    s[2] = 65535;
+    print(s);
+    let mut q: []i8 = alloc_i8(3);
+    q[0] = -100;
+    q[2] = 127;
+    print(q);
+    let mut big: []i64 = alloc_i64(1500);
+    big[1499] = 9;
+    print(big);
+    let flags: [bool; 3] = [true, false, true];
+    print(flags);
+    let cs: [char; 2] = ['a', '\u{E9}'];
+    print(cs);
+    let r = &p;
+    print(r);
+    let v: f64 = 0.1;
+    let rv = &v;
+    print(rv);
+    return 0;
+}

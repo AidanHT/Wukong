@@ -163,6 +163,13 @@ pub struct Options {
     /// replaced with a recognized runtime kernel call, naming the kernel symbols. Pure observation —
     /// the MIR, and therefore every artifact and run, is identical with it on or off.
     pub remarks_dispatch: bool,
+    /// The program's source text when it does not come from the file `input` — `wukongc -e
+    /// <source>` (then `input` is only a display name). An `input` of `-` with no `source` reads
+    /// the program from standard input.
+    pub source: Option<String>,
+    /// The arguments after `--`, passed to the program `--run` executes: `arg(1)`, `arg(2)`, …
+    /// (`arg(0)` is the program's own name).
+    pub program_args: Vec<String>,
 }
 
 /// Options for the autodiff CLI surface: which loss function to differentiate, which of its buffer
@@ -235,6 +242,8 @@ impl Default for Options {
             grad: GradOptions::default(),
             strict_fp: false,
             remarks_dispatch: false,
+            source: None,
+            program_args: Vec::new(),
         }
     }
 }
@@ -307,6 +316,21 @@ fn lower_options_for(opts: &Options) -> wukong_mir_build::LowerOptions {
     }
 }
 
+/// Does this compile read its program from standard input (`wukongc -` with no `-e`)?
+fn reads_stdin(opts: &Options) -> bool {
+    opts.source.is_none() && opts.input == Path::new("-")
+}
+
+/// The name the program's source goes by in diagnostics and as `arg(0)`: the input path, or
+/// `<stdin>` for a program read from standard input (`-e` sets `input` to its own display name).
+fn source_name(opts: &Options) -> String {
+    if reads_stdin(opts) {
+        "<stdin>".to_string()
+    } else {
+        opts.input.display().to_string()
+    }
+}
+
 /// Run the pipeline for `opts`, printing artifacts to stdout and diagnostics to stderr.
 /// Returns a process exit code.
 pub fn compile(opts: &Options) -> i32 {
@@ -355,19 +379,28 @@ pub fn compile(opts: &Options) -> i32 {
     // Declared before every other local so it reports last, on every exit path (see `report`).
     let mut timer = report::PassTimer::new(opts);
     timer.begin("read");
-    let src = match std::fs::read_to_string(&opts.input) {
+    // The program comes from `-e <source>`, from standard input (`-`), or from the input file.
+    let src = match &opts.source {
+        Some(s) => Ok(s.clone()),
+        None if reads_stdin(opts) => {
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut s).map(|_| s)
+        }
+        None => std::fs::read_to_string(&opts.input),
+    };
+    let src = match src {
         Ok(s) => s,
         Err(e) => {
             emit_driver_error(
                 opts,
-                format!("could not read `{}`: {}", opts.input.display(), e),
+                format!("could not read `{}`: {}", source_name(opts), e),
             );
             return exit::IO_ERROR;
         }
     };
 
     let mut sm = SourceMap::new();
-    let id = sm.add(opts.input.display().to_string(), src);
+    let id = sm.add(source_name(opts), src);
     let renderer = Renderer::new(opts.color);
     let mut sink = DiagnosticSink::new();
 
@@ -691,20 +724,32 @@ pub fn compile(opts: &Options) -> i32 {
             }
         }
         let main = interner.intern("main");
+        // The program's argument vector: its own name, then everything after `--`. The
+        // interpreter and the JIT read it from the one `wukong_runtime` state.
+        wukong_interp::set_program_args(
+            std::iter::once(source_name(opts)).chain(opts.program_args.iter().cloned()),
+        );
         timer.begin(if opts.backend == BackendKind::Native {
             "jit-compile"
         } else {
             "run"
         });
-        // The CPU paths report what the program printed *before* a runtime failure (a failed
-        // `assert`, a slice index out of bounds) along with the failure, so `--run` shows the same
-        // stdout a linked executable does — the output is printed, then `error: …`, exit 1.
+        // The CPU paths STREAM the program's stdout as it is produced — at every newline on a
+        // terminal, in 64 KiB blocks into a pipe or file — so a long run shows its progress, and a
+        // run that stops on a runtime failure (a failed `assert`, a slice index out of bounds) has
+        // already shown everything it printed before it: the same stdout a linked executable
+        // shows, then `error: …`, exit 1. The GPU paths still collect their output and print it
+        // here, after the device run.
+        let line_buffered = std::io::IsTerminal::is_terminal(&std::io::stdout());
         let split = |r: Result<(i64, Vec<u8>), String>| match r {
             Ok((code, out)) => (Ok(code), out),
             Err(e) => (Err(e), Vec::new()),
         };
         let (result, stdout) = match opts.backend {
-            BackendKind::Interp => wukong_interp::run_capturing(&program, main, &interner),
+            BackendKind::Interp => (
+                wukong_interp::run_streaming(&program, main, &interner, line_buffered),
+                Vec::new(),
+            ),
             // Compile and run are separate steps so a *compile* failure is rendered as a
             // catalogued diagnostic (honouring `--error-format=json`), while a *run-time* failure
             // (an assertion, a bounds check) keeps the `error: <message>` form below, after the
@@ -721,7 +766,7 @@ pub fn compile(opts: &Options) -> i32 {
                 ) {
                     Ok(compiled) => {
                         timer.begin("run");
-                        compiled.run_capturing()
+                        (compiled.run_streaming(line_buffered), Vec::new())
                     }
                     Err(message) => {
                         emit_diag(
@@ -921,8 +966,9 @@ static int wk_parse_sci(const char *s, char *digits, int *n, int *dexp) {
     *n = k;
     return k > 0;
 }
-/* Does digits * 10^dexp (one digit before the point) parse back to exactly x? */
-static int wk_round_trips(const char *digits, int n, int dexp, double x) {
+/* Does digits * 10^dexp (one digit before the point) parse back to exactly x — as an f32 (strtof,
+   correctly rounded to float) when is_f32, else as an f64? */
+static int wk_round_trips(const char *digits, int n, int dexp, double x, int is_f32) {
     char buf[64];
     int k = 0;
     buf[k++] = digits[0];
@@ -932,6 +978,7 @@ static int wk_round_trips(const char *digits, int n, int dexp, double x) {
         k += n - 1;
     }
     snprintf(buf + k, sizeof buf - (size_t)k, "e%d", dexp);
+    if (is_f32) return strtof(buf, NULL) == (float)x;
     return strtod(buf, NULL) == x;
 }
 /* Step digits * 10^dexp to the adjacent n-digit decimal above (up) or below it. */
@@ -953,10 +1000,13 @@ static void wk_step(char *d, int n, int *dexp, int up) {
     while (d[i] == '0') { d[i] = '9'; i--; }
     d[i]--;
 }
-/* Rust's `Display` for f64 (see the driver's WUKONG_RT_C docs). */
-void wukong_rt_print_f64(double x) {
+/* Rust's `Display` for f64, or for f32 when is_f32 (x then holds the f32 exactly): the shortest
+   digits that round-trip at that precision (see the driver's WUKONG_RT_C docs). 17 digits always
+   round-trip an f64 and 9 always round-trip an f32. */
+static void wk_print_float(double x, int is_f32) {
     char out[400];
     char d[24], c[24];
+    int max_p = is_f32 ? 9 : 17;
     int k = 0, n = 0, e = 0, ce, p, up, found = 0, point, z;
     if (x != x) { fputs("NaN\n", stdout); return; }
     if (signbit(x)) { out[k++] = '-'; x = -x; }
@@ -966,22 +1016,22 @@ void wukong_rt_print_f64(double x) {
     } else if (x == 0.0) {
         out[k++] = '0';
     } else {
-        for (p = 1; p <= 17 && !found; p++) {
+        for (p = 1; p <= max_p && !found; p++) {
             char s[64];
             snprintf(s, sizeof s, "%.*e", p - 1, x);
             if (!wk_parse_sci(s, d, &n, &e)) continue;
-            if (wk_round_trips(d, n, e, x)) { found = 1; break; }
+            if (wk_round_trips(d, n, e, x, is_f32)) { found = 1; break; }
             for (up = 1; up >= 0 && !found; up--) {
                 memcpy(c, d, (size_t)n);
                 ce = e;
                 wk_step(c, n, &ce, up);
-                if (wk_round_trips(c, n, ce, x)) { memcpy(d, c, (size_t)n); e = ce; found = 1; }
+                if (wk_round_trips(c, n, ce, x, is_f32)) { memcpy(d, c, (size_t)n); e = ce; found = 1; }
             }
         }
         if (!found) {
-            /* Unreachable with a correctly rounded printf: 17 digits always round-trip. */
+            /* Unreachable with a correctly rounded printf: max_p digits always round-trip. */
             char s[64];
-            snprintf(s, sizeof s, "%.16e", x);
+            snprintf(s, sizeof s, "%.*e", max_p - 1, x);
             if (!wk_parse_sci(s, d, &n, &e)) { d[0] = '0'; n = 1; e = 0; }
         }
         while (n > 1 && d[n - 1] == '0') n--;
@@ -1006,6 +1056,35 @@ void wukong_rt_print_f64(double x) {
     }
     out[k++] = '\n';
     fwrite(out, 1, (size_t)k, stdout);
+}
+void wukong_rt_print_f64(double x) { wk_print_float(x, 0); }
+/* An f32 (or an f16/bf16 held in an f32 register) at its own precision: Rust's `Display` for f32. */
+void wukong_rt_print_f32(float x) { wk_print_float((double)x, 1); }
+void wukong_rt_print_bool(long long x) { fputs(x ? "true\n" : "false\n", stdout); }
+/* A char's glyph as UTF-8 plus a newline; a value that is not a Unicode scalar value (a surrogate,
+   or above U+10FFFF) prints U+FFFD, as `wukong_runtime::fmt::char_glyph` does. */
+void wukong_rt_print_char(long long x) {
+    unsigned long c = (unsigned long)(x & 0xffffffffLL);
+    unsigned char b[5];
+    int n = 0;
+    if (c > 0x10FFFFUL || (c >= 0xD800UL && c <= 0xDFFFUL)) c = 0xFFFDUL;
+    if (c < 0x80UL) {
+        b[n++] = (unsigned char)c;
+    } else if (c < 0x800UL) {
+        b[n++] = (unsigned char)(0xC0 | (c >> 6));
+        b[n++] = (unsigned char)(0x80 | (c & 0x3F));
+    } else if (c < 0x10000UL) {
+        b[n++] = (unsigned char)(0xE0 | (c >> 12));
+        b[n++] = (unsigned char)(0x80 | ((c >> 6) & 0x3F));
+        b[n++] = (unsigned char)(0x80 | (c & 0x3F));
+    } else {
+        b[n++] = (unsigned char)(0xF0 | (c >> 18));
+        b[n++] = (unsigned char)(0x80 | ((c >> 12) & 0x3F));
+        b[n++] = (unsigned char)(0x80 | ((c >> 6) & 0x3F));
+        b[n++] = (unsigned char)(0x80 | (c & 0x3F));
+    }
+    b[n++] = '\n';
+    fwrite(b, 1, (size_t)n, stdout);
 }
 /* A NUL-terminated string buffer plus a newline; a null pointer prints nothing (as the Rust shim). */
 void wukong_rt_print_str(const char *s) {
@@ -1331,11 +1410,15 @@ fn emit_native(
         }
     };
 
-    let stem = opts
-        .input
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "out".to_string());
+    // A program from `-e` or standard input has no file name to take a stem from.
+    let stem = if opts.source.is_some() || reads_stdin(opts) {
+        "out".to_string()
+    } else {
+        opts.input
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "out".to_string())
+    };
 
     let is_obj = opts.emit == EmitStage::Obj;
     // The scratch directory has to exist BEFORE the object is written, because under `--emit=exe` the
@@ -1549,6 +1632,21 @@ pub extern "C" fn wukong_rt_print_u64(x: u64) {
 pub extern "C" fn wukong_rt_print_f64(x: f64) {
     let o = std::io::stdout();
     let _ = write!(o.lock(), "{x}\n");
+}
+#[no_mangle]
+pub extern "C" fn wukong_rt_print_f32(x: f32) {
+    let o = std::io::stdout();
+    let _ = o.lock().write_all(wukong_runtime::fmt::f32_line(x).as_bytes());
+}
+#[no_mangle]
+pub extern "C" fn wukong_rt_print_bool(x: i64) {
+    let o = std::io::stdout();
+    let _ = o.lock().write_all(wukong_runtime::fmt::bool_line(x).as_bytes());
+}
+#[no_mangle]
+pub extern "C" fn wukong_rt_print_char(x: i64) {
+    let o = std::io::stdout();
+    let _ = o.lock().write_all(wukong_runtime::fmt::char_line(x).as_bytes());
 }
 #[no_mangle]
 pub extern "C" fn wukong_rt_print_str(p: *const u8) {

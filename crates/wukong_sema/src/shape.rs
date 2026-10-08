@@ -444,54 +444,24 @@ impl Sema<'_> {
                     }
                     return Ty::Unit;
                 }
-                // `print`/`println` render exactly one value.
-                // (`print(1, 2)` printed just `1`) — both backends agree, so it is not a divergence,
-                // but a quiet footgun where the programmer expects all arguments to appear. Reject a
-                // too-many-argument call (E0503). A zero-argument `print()` / `println()` (a blank
-                // line / newline) stays valid.
+                // The text builtins (`printf`, `sprintf`, `print_raw`, `eprint`, `write_stdout`, …),
+                // typed in `text.rs`.
+                if let Some(ret) =
+                    self.type_text_builtin(interner.resolve(name), args, &mut arg_tys, span)
                 {
-                    let nm = self.sym_str(name);
-                    if nm == "print" || nm == "println" {
-                        if args.len() > 1 {
-                            self.error(
-                                span,
-                                "E0503",
-                                format!(
-                                    "`{nm}` takes a single value to print, but {} were supplied",
-                                    args.len()
-                                ),
-                            );
-                            self.types.insert(callee.id, Ty::Unknown);
-                            return Ty::Unknown;
-                        }
-                        // A `()`/unit argument has no printable value — e.g. `print(x)` where
-                        // `x = if c { 1 }` (an else-less `if` is unit) or `x = match … { … }` with
-                        // statement arms. mir_build lowered the unit `let` to an `alloca void` and the
-                        // read to a `load void`: native -O0 read uninitialized stack (nondeterministic
-                        // garbage), while the interpreter and -O2 (mem2reg) produced 0 — a divergence
-                        // that broke BOTH invariants at once. Reject it (E0437), consistent with `()`
-                        // already being non-computable in an arithmetic operand.
-                        if let Some(t @ Ty::Tensor { .. }) = arg_tys.first() {
-                            let what = format!("`{nm}`");
-                            let msg = self.whole_tensor_message(t, &what);
-                            self.error(span, "E0437", msg);
-                            self.types.insert(callee.id, Ty::Unknown);
-                            return Ty::Unknown;
-                        }
-                        if matches!(arg_tys.first(), Some(Ty::Unit)) {
-                            self.error(
-                                span,
-                                "E0437",
-                                format!(
-                                    "`{nm}` cannot print a `()` value; supply a printable scalar \
-                                     (an `if` with no `else`, or a `match` with statement arms, \
-                                     yields `()`)"
-                                ),
-                            );
-                            self.types.insert(callee.id, Ty::Unknown);
-                            return Ty::Unknown;
-                        }
-                    }
+                    self.types.insert(callee.id, Ty::Unknown);
+                    return ret;
+                }
+                // `print`/`println` render at most one value, and only a printable one (`text.rs`):
+                // `print(1, 2)` (which printed just `1`) is E0503, a whole tensor or `()` is E0401,
+                // and a value with no printed form — a raw pointer, a data-carrying enum — is E0448.
+                // A zero-argument `print()` / `println()` (a blank line) stays valid.
+                let nm = interner.resolve(name);
+                if (nm == "print" || nm == "println")
+                    && !self.check_print_args(nm, args, &arg_tys, span)
+                {
+                    self.types.insert(callee.id, Ty::Unknown);
+                    return Ty::Unknown;
                 }
                 // `assert(cond)` is a builtin taking exactly one condition argument. With the wrong
                 // arity it used to fall through to a malformed void call: the interpreter read the

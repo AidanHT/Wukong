@@ -1,0 +1,10 @@
+// EXPECT-CODE: E0450
+module tests.fail.printf_arg_count
+
+// Each placeholder takes the next argument: two placeholders and one argument is a mismatch, not a
+// silently empty field.
+fn main() -> i32 {
+    let step: i32 = 1;
+    printf("step {} loss {}\n", step);
+    return 0;
+}

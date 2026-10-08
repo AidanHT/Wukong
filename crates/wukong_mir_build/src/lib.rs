@@ -54,6 +54,9 @@ mod ucount;
 // The lowering of the ML builtins `wukong_sema::ml_builtins` types (see the module docs).
 mod ml_builtins;
 
+// The printing builtins, routed by the printed value's source type (see the module docs).
+mod text;
+
 use std::cell::{Cell, RefCell};
 
 use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -1408,6 +1411,7 @@ fn lower_program_pooled(
         rt_scratch_mark: interner.intern("wukong_rt_scratch_mark"),
         rt_scratch_release: interner.intern("wukong_rt_scratch_release"),
         ml: ml_builtins::MlSyms::new(interner),
+        text: text::TextSyms::new(interner),
         rt_read_f32: interner.intern("wukong_rt_read_f32"),
         rt_read_i32: interner.intern("wukong_rt_read_i32"),
         rt_read_i64: interner.intern("wukong_rt_read_i64"),
@@ -3838,6 +3842,8 @@ struct GemmSyms {
     rt_scratch_release: Symbol,
     /// The runtime entries `ml_builtins.rs` lowers the ML builtins to (`wukong_rt_read_dt`, …).
     ml: ml_builtins::MlSyms,
+    /// The symbols `text.rs` lowers the printing builtins to (`print_bool`, …).
+    text: text::TextSyms,
     /// The 12 raw file-I/O runtime entry points (`wukong_rt_{read,write}_{f32,i32,i64,u8,f64,i8}`)
     /// backing the `read_<T>(path, buf)` / `write_<T>(path, buf)` builtins. Each takes `(path: *const
     /// u8, data: *T, len: i64)` and returns an `i64`: the element count on success, or -1 (open/create
@@ -22314,6 +22320,10 @@ impl FnLowerer<'_> {
                 if let Some(v) = self.lower_ml_builtin(name, args) {
                     return v;
                 }
+                // The text builtins (`printf`, `sprintf`, `eprint`, `write_stdout`, …; `text.rs`).
+                if let Some(v) = self.lower_text_builtin(name, args, e.span) {
+                    return v;
+                }
                 // The `now_ns()` timing intrinsic lowers to one zero-argument `wukong_now_ns() -> i64`
                 // runtime call (a monotonic process-lifetime nanosecond clock).
                 if let Some(v) = self.lower_now_ns(self.interner.resolve(name), args) {
@@ -22343,6 +22353,16 @@ impl FnLowerer<'_> {
                     // number is already non-differential — the interpreter prints a slot index, native
                     // a real address — so no well-formed program loses behavior here.)
                     let nm = self.interner.resolve(name);
+                    // A `bool` / `char` argument prints as `true`/`false` / its glyph, and an aggregate
+                    // or a reference prints structurally (`text.rs`).
+                    if (nm == "print" || nm == "println") && args.len() == 1 {
+                        if let Some(v) = self.lower_print_scalar(nm == "println", &args[0]) {
+                            return v;
+                        }
+                        if let Some(v) = self.lower_print_value(&args[0], e.span) {
+                            return v;
+                        }
+                    }
                     if (nm == "print" || nm == "println")
                         && args.len() == 1
                         && self.is_string_arg(&args[0])
@@ -32908,61 +32928,17 @@ fn decode_char_literal(text: &str) -> u32 {
 }
 
 /// Decode a string literal's raw source text (including the surrounding `"`) into its UTF-8 bytes,
-/// resolving the same escapes as a char literal (`\n` `\t` `\\` `\"` `\0`, `\xHH`, `\u{…}`); each
-/// decoded code point is re-encoded as UTF-8. The caller appends the NUL terminator. Used by the
-/// `ExprKind::Str` lowering to materialize the byte buffer.
+/// resolving the same escapes as a char literal; each decoded code point is re-encoded as UTF-8.
+/// The caller appends the NUL terminator. Used by the `ExprKind::Str` lowering to materialize the
+/// byte buffer. The one decoder lives in `wukong_sema::text`, so the format strings sema checks are
+/// exactly the bytes this lowering emits.
 fn decode_string_literal(text: &str) -> Vec<u8> {
-    let inner = text
-        .strip_prefix('"')
-        .and_then(|t| t.strip_suffix('"'))
-        .unwrap_or(text);
-    let mut out = Vec::new();
-    let mut buf = [0u8; 4];
-    let mut chars = inner.chars();
-    while let Some(c) = chars.next() {
-        let cp = if c == '\\' {
-            decode_escape(&mut chars)
-        } else {
-            c as u32
-        };
-        match char::from_u32(cp) {
-            Some(ch) => out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes()),
-            None => out.push(cp as u8),
-        }
-    }
-    out
+    wukong_sema::text::decode_string_literal(text)
 }
 
-/// Decode the body of a backslash escape (the `\` already consumed) to a code point.
+/// Decode the body of a backslash escape (the backslash already consumed) to a code point.
 fn decode_escape(chars: &mut std::str::Chars) -> u32 {
-    match chars.next() {
-        Some('n') => '\n' as u32,
-        Some('r') => '\r' as u32,
-        Some('t') => '\t' as u32,
-        Some('\\') => '\\' as u32,
-        Some('\'') => '\'' as u32,
-        Some('"') => '"' as u32,
-        Some('0') => 0,
-        // `\xHH` — up to two hex digits (the lexer consumed at most two).
-        Some('x') => chars
-            .by_ref()
-            .take(2)
-            .fold(0u32, |v, c| c.to_digit(16).map_or(v, |d| v * 16 + d)),
-        // `\u{HHHH}` — the hex digits between the braces. Saturating, so an over-long escape
-        // (`\u{100000000}`, ≥ 9 hex digits) clamps to an invalid code point instead of overflowing
-        // the accumulator and panicking the compiler; a valid code point is ≤ 6 hex digits anyway.
-        Some('u') => chars
-            .by_ref()
-            .skip_while(|&c| c != '{')
-            .skip(1)
-            .take_while(|&c| c != '}')
-            .fold(0u32, |v, c| {
-                c.to_digit(16)
-                    .map_or(v, |d| v.saturating_mul(16).saturating_add(d))
-            }),
-        Some(c) => c as u32,
-        None => 0,
-    }
+    wukong_sema::text::decode_escape(chars)
 }
 
 #[cfg(test)]

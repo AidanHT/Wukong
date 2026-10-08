@@ -1185,12 +1185,33 @@ lowers to PTX `.shared` SMEM and `sync_block()` to `bar.sync 0` (`wukong_codegen
 
 ## Built-in intrinsics ✅
 
-- `print(x)` — print one value followed by a newline. A signed integer or float prints as itself; an
-  **unsigned** integer prints its unsigned magnitude (a high-bit-set `u32`/`u64` is not shown as a
-  negative); a `*u8` (a string literal) prints its NUL-terminated bytes rather than the pointer.
-  `print()` with no argument prints a bare newline. More than one argument is `E0503` (arguments are
-  not concatenated), and a `()` value — from an `else`-less `if`, or a `match` with statement arms —
-  is `E0437`.
+- `print(x)` — print one value followed by a newline, **rendered at its own type** (Rust's
+  `Display` for that type), identically on every backend and in a linked executable:
+  - a signed integer prints as itself; an **unsigned** integer prints its unsigned magnitude (a
+    high-bit-set `u32`/`u64` is not shown as a negative);
+  - a float prints the **shortest** decimal that parses back to the same value *at its own
+    precision*, positionally (`inf`, `-inf`, `NaN`, `-0` spelled out): `print(0.1)` of an `f32`
+    prints `0.1`, not the `0.10000000149011612` of the `f64` it widens to. `f16`/`bf16` values live
+    in `f32` registers and print as that `f32` (as the `half` crate's `Display` does); write
+    `x as f64` to see the widened value;
+  - a `bool` prints `true` / `false`; a `char` prints its glyph, UTF-8 encoded (a value that is not
+    a Unicode scalar value — a surrogate, or above U+10FFFF via `as char` — prints U+FFFD); `c as
+    i32` prints the code point;
+  - a `*u8` (a string literal) prints its NUL-terminated bytes rather than the pointer.
+
+  - an **aggregate** prints **structurally**, like Rust's `{:?}`: a struct as `Point { x: 1, y:
+    2.5 }`, a tuple as `(7, 'z', "hi")`, an array or a slice of scalars as `[1, -2, 3]` — each
+    element in `Debug` style (a float always with a point, a `char` or string quoted). An array or
+    slice longer than 1000 elements prints summarized, NumPy-style: `[0, 0, 0, ..., 0, 0, 9]`;
+  - a reference prints what it refers to.
+
+  A value with no printed form is **`E0448`**: a raw pointer other than `*u8` (an address — the
+  interpreter and a native run would print different numbers; dereference it), a data-carrying enum
+  (match on it), a slice of non-scalars, a reference inside an aggregate, a SIMD vector, a function
+  value. `print()` with no argument prints a bare newline. More than one argument is `E0503`
+  (arguments are not concatenated — use `printf`), and a `()` value or a whole tensor is `E0437`.
+  `tests/run/print_scalar_types.wk`, `tests/run/print_float_display.wk`,
+  `tests/run/print_aggregate.wk`.
 - `println(x)` — alias of `print` (both already append the newline).
 - `assert(cond)` — stop the program at once if `cond` is false (zero); a no-op otherwise. Exactly
   one argument (`E0503` otherwise). A float condition means `cond != 0.0`, so `assert(0.5)` passes.
@@ -1205,6 +1226,63 @@ lowers to PTX `.shared` SMEM and `sync_block()` to `bar.sync 0` (`wukong_codegen
   reads are meaningful, so a program's stdout stays backend-identical.
 - `sdpa(q, k, v, out, s, d, scale, causal)` — fused scaled-dot-product attention; one of the
   shape-checked kernel builtins below.
+
+### Formatted output ✅
+
+| builtin | writes | result |
+|---|---|---|
+| `printf(fmt, args…)` / `eprintf(fmt, args…)` | stdout / stderr, **no** trailing newline | — |
+| `sprintf(buf, fmt, args…)` | the `[]u8` / `[u8; N]` buffer `buf`, NUL-terminated | `i64` length |
+| `print_raw(x)` | one value to stdout, no newline | — |
+| `eprint(x)` / `eprintln(x)` | one value to stderr, then a newline (both, like `print`/`println`) | — |
+| `write_stdout(buf, n)` / `write_stderr(buf, n)` | the first `n` bytes of a `u8` buffer, verbatim | `i64` count |
+| `write_text(path, buf, n)` | the first `n` bytes of a `u8` buffer to a file (created or truncated) | `i64` count, `< 0` on error |
+
+The format is a **string literal, parsed when the program is compiled** — Rust's `format!`
+grammar: `{}` / `{:spec}` placeholders take the arguments in order, `{{` / `}}` print a brace, and
+a spec is `[[fill]align][+][#][0][width][.precision][type]` (ASCII fill; `<` `^` `>`; width and
+precision at most 255; `type` one of `?` debug, `x` `X` `o` `b` radix, `e` `E` scientific). Each
+placeholder renders exactly as `format!` renders the same spec for the same type:
+
+```wukong
+printf("step {} loss {:.4}\n", step, loss);       // step 42 loss 3.1416
+printf("[{:>6}] [{:<6}] [{:^6}]\n", 7, 7, 7);    // [     7] [7     ] [  7   ]
+printf("{:#x} {:08b} {:+.2e}\n", 255, 5, 1234.5); // 0xff 00000101 +1.23e3
+let n = sprintf(path, "layer_{:03}.bin", i);      // "layer_007.bin", n = 13
+```
+
+A radix style prints an integer's bits at its own width (`{:x}` of `-1i8` is `ff`), and `{}` of an
+aggregate prints it structurally, its elements formatted with the same spec. `sprintf` has
+`snprintf` semantics: text past `len - 1` bytes is dropped, the buffer is always NUL-terminated,
+and the result is the **full** formatted length (`>= buf.len()` means it was truncated) — so
+`fmt_i64`/`fmt_f32` are spelled `sprintf(buf, "{}", x)` / `sprintf(buf, "{:.3}", x)`. A malformed
+format string (an unclosed `{`, a named argument `{x}`, an unknown type) is **`E0449`**; a
+placeholder count that differs from the argument count, or a spec that does not apply to its
+argument (`{:x}` of a float, `{:.2}` of an integer, `#` without a radix style) is **`E0450`**.
+
+Every piece of output is one call into `wukong_runtime::fmt`, which the interpreter, the JIT and a
+linked executable all render through, so the bytes cannot depend on the backend.
+`--backend=gpu-native` declines a program that formats (the usual UNSUPPORTED skip), and the `cc`
+fallback link of `--emit=exe` (no `rustc`) has no formatting runtime: such a program fails to link
+there, loudly. `tests/run/printf_format.wk`, `tests/fail/printf_*.wk`.
+
+### Program arguments, environment, standard input, exit ✅
+
+| builtin | result |
+|---|---|
+| `arg_count()` | `i64`: the number of arguments, the program itself included |
+| `arg(i)` | `*u8`: argument `i` (`arg(0)` is the program); the empty string when out of range |
+| `arg_i64(i, default)` / `arg_f32(i, default)` | argument `i` parsed as a number, or `default` when absent or unparsable |
+| `env(name)` | `*u8`: the environment variable `name`, the empty string when unset |
+| `read_stdin_u8(buf)` | `i64`: standard input read into a `[]u8` / `[u8; N]` until it is full or input ends |
+| `exit(code)` | ends the program with status `code`, as returning `code` from `main` does |
+
+`wukongc --run prog.wk -- data/weights.bin 64` passes everything after `--` to the program
+(`arg(1)` is `data/weights.bin`, `arg_i64(2, 16)` is 64); a linked executable reads its own
+`argv`. Everything printed before `exit` is written out first, and on the native JIT `exit` from a
+nested call returns through every caller at once, exactly as a failed `assert` does. A string
+returned by `arg` or `env` is valid for the rest of the run and usable directly as a `read_*` /
+`write_*` path. `tests/run/process_exit.wk`, `crates/wukongc/tests/process_io.rs`.
 
 These are recognized by the MIR builder and implemented directly by the interpreter (and, on the
 native backend, by the runtime). A user-defined function of the same name shadows any of these
@@ -1845,9 +1923,16 @@ continue a long subtraction and is not reported.
 ## Command-line interface
 
 ```
-wukongc [OPTIONS] <input.wk>
+wukongc [OPTIONS] <input.wk> [-- <program args>...]
+wukongc [OPTIONS] -              read the program from standard input (named <stdin>)
+wukongc [OPTIONS] -e <source>    the program is the <source> argument itself
 
+--                    everything after it is passed to the program --run executes: arg(1),
+                      arg(2), ... (arg(0) is the program); without --run it is a usage error
 --run                 compile and execute (interpreter by default; see --backend).
+                      The program's stdout streams as it runs (per line on a terminal, in 64 KiB
+                      blocks into a pipe or file) on interp and native, so a long run shows its
+                      progress and a failing one has shown everything it printed before the error.
                       Mutually exclusive with --emit=<stage>: the compiler honours exactly one of
                       them, so the combination is rejected rather than silently discarding one.
 --backend=<b>         interp | native | gpu | gpu-native   (default: interp)

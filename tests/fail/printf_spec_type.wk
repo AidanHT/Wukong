@@ -1,0 +1,10 @@
+// EXPECT-CODE: E0450
+module tests.fail.printf_spec_type
+
+// `{:x}` formats an integer's bits in hex; a float has no hex form in a format spec (cast it to an
+// integer first).
+fn main() -> i32 {
+    let loss: f32 = 0.25;
+    printf("{:x}\n", loss);
+    return 0;
+}

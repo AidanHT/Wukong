@@ -37,6 +37,10 @@ const COLUMN_STAT: &str = "this column statistic has no VJP rule yet (colsum, co
                            colsumsq are differentiable)";
 const NO_GRADIENT: &str = "carries no gradient";
 const FILE_READ: &str = "a file read overwrites its buffer with data; it carries no gradient";
+const TEXT_OUTPUT: &str = "formatted text output (`printf`, `sprintf`, a structural `print`) \
+                           writes text, not a differentiated buffer; it carries no gradient";
+const PROCESS_INPUT: &str = "the program's arguments, environment and standard input come from \
+                             outside the program; they carry no gradient";
 
 /// Every non-differentiable symbol `wukong_mir_build` can emit, with the reason a decline reports.
 pub(crate) const NOT_DIFFERENTIABLE: &[(&str, &str)] = &[
@@ -212,6 +216,24 @@ pub(crate) const NOT_DIFFERENTIABLE: &[(&str, &str)] = &[
         "top-k has no VJP rule yet (the gradient would scatter back to the selected indices); \
          autodiff refuses it rather than drop the gradient",
     ),
+    // The formatting entries `printf` / `sprintf` / a structural `print` lower to (`text.rs`).
+    ("wukong_rt_fmt_int", TEXT_OUTPUT),
+    ("wukong_rt_fmt_f64", TEXT_OUTPUT),
+    ("wukong_rt_fmt_f32", TEXT_OUTPUT),
+    ("wukong_rt_fmt_str", TEXT_OUTPUT),
+    ("wukong_rt_fmt_lit", TEXT_OUTPUT),
+    ("wukong_rt_fmt_slice", TEXT_OUTPUT),
+    // The process interface (`text.rs`).
+    ("wukong_rt_arg_count", PROCESS_INPUT),
+    ("wukong_rt_arg", PROCESS_INPUT),
+    ("wukong_rt_arg_i64", PROCESS_INPUT),
+    ("wukong_rt_arg_f32", PROCESS_INPUT),
+    ("wukong_rt_env", PROCESS_INPUT),
+    ("wukong_rt_read_stdin", PROCESS_INPUT),
+    (
+        "wukong_rt_exit",
+        "`exit` ends the program; a loss function that can exit has no gradient to take",
+    ),
     // Scratch-arena bookkeeping and the slice bounds-failure edge.
     (
         "wukong_rt_scratch_alloc",
@@ -244,7 +266,17 @@ pub(crate) fn not_differentiable_reason(name: &str) -> Option<&'static str> {
 pub(crate) fn is_effect_only(name: &str) -> bool {
     matches!(
         name,
-        "print" | "println" | "print_str" | "println_str" | "print_u" | "println_u" | "assert"
+        "print"
+            | "println"
+            | "print_str"
+            | "println_str"
+            | "print_u"
+            | "println_u"
+            | "print_bool"
+            | "println_bool"
+            | "print_char"
+            | "println_char"
+            | "assert"
     ) || name == "wukong_rt_free"
         || name.starts_with("wukong_rt_write_")
 }

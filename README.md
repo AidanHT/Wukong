@@ -207,7 +207,12 @@ wukongc --run examples/dot.wk           # 120
 ```
 
 `--run` defaults to the interpreter; add `--backend=native` for the same output through the Cranelift
-JIT — the examples are gated to agree.
+JIT — the examples are gated to agree. The program's stdout streams as it runs; everything after
+`--` is passed to the program (`wukongc --run prog.wk -- data.bin 64`, read with `arg(i)` /
+`arg_i64(i, default)`), `wukongc -` reads the program from standard input and `wukongc -e <source>`
+takes it inline. Output is `print` (every scalar at its own type, an aggregate structurally),
+`printf("step {} loss {:.4}\n", i, l)` with a compile-time-checked format string, `sprintf` into a
+`u8` buffer, and `exit(code)` (see the language guide, *Formatted output*).
 
 ## Architecture
 

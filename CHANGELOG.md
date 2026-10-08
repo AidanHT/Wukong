@@ -57,6 +57,35 @@ All notable changes to Wukong are documented here. The format is loosely based o
   (`E0435`), non-boolean conditions (`E0436`) and builtin arguments of the wrong kind (`E0437`) each
   have a stable code and an `--explain` page with a compile-tested example; `E0401` stays for plain
   expected/found mismatches. The 45 affected `tests/fail` fixtures moved with their rule.
+### Text and process I/O (`gap2/text-and-process-io`)
+
+- **Every scalar prints at its own type** (Rust's `Display`), on the interpreter, the JIT, a linked
+  executable (rustc shim and C fallback) and the textual LLVM module alike: an `f32` prints its
+  shortest round-trip digits at `f32` precision (`print(0.1)` prints `0.1`, not
+  `0.10000000149011612`; `f16`/`bf16` print as their `f32`), a `bool` prints `true`/`false` (was
+  `1`/`0`), and a `char` prints its UTF-8 glyph (was its code point; a non-scalar value prints
+  U+FFFD). New runtime printers `wukong_rt_print_f32` / `_bool` / `_char`; `--backend=gpu-native`
+  replays f32 and bool print records the same way. Fixtures printing an `f32` or a comparison were
+  re-derived (`print_float_display`, `activation_backward_int_args`, `transcendental_kernel`,
+  `operators`); new `tests/run/print_scalar_types.wk`.
+- **Aggregates print structurally** (Rust's `{:?}`): `print(p)` of a struct, tuple, array or slice
+  prints `Point { x: 1, y: 2.5 }`, `(7, 'z')`, `[1, 2, 3]` (a buffer past 1000 elements summarizes,
+  NumPy-style) instead of its address, which differed between the interpreter and native. A value
+  with no printed form (a raw pointer, a data-carrying enum) is the new **`E0448`**.
+- **Formatted output**: `printf` / `eprintf` / `sprintf(buf, fmt, ..) -> i64` with a format string
+  parsed at compile time (Rust's `format!` spec grammar: fill, align, `+`, `#`, `0`, width,
+  precision, `?` `x` `X` `o` `b` `e` `E`), plus `print_raw`, `eprint` / `eprintln` and the raw
+  writers `write_stdout` / `write_stderr` / `write_text`. New **`E0449`** (malformed format string)
+  and **`E0450`** (placeholder count or spec/type mismatch). One `wukong_runtime::fmt` renders for
+  every backend (`tests/run/printf_format.wk`, `tests/run/print_aggregate.wk`).
+- **`--run` streams stdout** on the interpreter and the native JIT (new
+  `wukong_interp::run_streaming`, `JitProgram::run_streaming`): per line on a terminal, in 64 KiB
+  blocks into a pipe or file, so a training loop shows its progress instead of nothing until it
+  ends. The bytes are the ones a capturing run returns; the differential gates still capture.
+- **Process interface**: `arg_count()`, `arg(i)`, `arg_i64(i, default)`, `arg_f32(i, default)`,
+  `env(name)`, `read_stdin_u8(buf)` and `exit(code)` (`wukong_runtime::process`); `wukongc --run
+  prog.wk -- a b` passes `a b` to the program. `wukongc -` reads the program from standard input
+  (it used to fail to open a file named `-`) and `wukongc -e <source>` takes it inline.
 
 ### Optimizer memory passes: SROA, path DSE, loop deletion, guarded LICM, scalar promotion (`gap/opt-memory`)
 

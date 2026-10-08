@@ -663,7 +663,27 @@ another architecture or OS is not supported. A native-backend failure is a catal
   closed v1 set (`@parallel`, `@generic`, `@tile`, `@extern`, `@strict_fp`, `@inline`, `@simd`,
   `@align`, `@export`), so a typo like `@parellel` no longer compiles to a program with none of the requested
   behavior. The four discarded attributes stay discarded wherever they parse.
-- Intrinsics `print`/`println`/`assert`.
+- Intrinsics `print`/`println`/`assert`. Every scalar prints at its own type, identically on every
+  backend and in a linked executable: an `f32` (and an `f16`/`bf16`) prints its shortest round-trip
+  digits at `f32` precision, an `f64` at `f64` precision, a `bool` as `true`/`false`, a `char` as its
+  UTF-8 glyph (`tests/run/print_scalar_types.wk`). An aggregate prints structurally, like Rust's
+  `{:?}` (`tests/run/print_aggregate.wk`); a value with no printed form (a raw pointer, a
+  data-carrying enum) is `E0448` instead of an address that differs between backends.
+- **Formatted output**: `printf` / `eprintf` / `sprintf` with a compile-time-checked format string
+  (Rust's `format!` spec grammar; `E0449` malformed, `E0450` argument mismatch), `print_raw`,
+  `eprint` / `eprintln`, and the raw byte writers `write_stdout` / `write_stderr` / `write_text`
+  (`tests/run/printf_format.wk`). 🟡 The `cc` fallback link has no formatting runtime, and there is
+  still no string *type* beyond `*u8` (a `sprintf` buffer is a `[u8; N]`).
+- **Process interface**: `arg_count` / `arg` / `arg_i64` / `arg_f32` (program arguments after
+  `wukongc --run prog.wk -- …`, or a linked executable's own `argv`), `env`, `read_stdin_u8` and
+  `exit(code)` (which returns through every caller on the JIT, like a failed `assert`).
+  `wukongc -` reads the program from standard input and `wukongc -e <source>` takes it inline
+  (`tests/run/process_exit.wk`, `crates/wukongc/tests/process_io.rs`). 🟡 No interactive REPL yet,
+  and no line-at-a-time stdin read.
+- **`--run` streams stdout** on the interpreter and the native JIT — per line on a terminal, in
+  64 KiB blocks into a pipe — instead of holding everything until the program ends, so a training
+  loop shows its progress and output printed before a runtime failure is already out. The GPU
+  backends still collect their output and print it after the device run.
 - **Source-text diagnostics.** A Unicode lookalike of ASCII punctuation or whitespace (`−` U+2212
   for `-`, `×`, `≤`, fullwidth brackets, curly quotes, no-break/zero-width spaces; ~50 entries) is
   **`E0105`**, naming the code point and the ASCII character it imitates, and the lexer reads it

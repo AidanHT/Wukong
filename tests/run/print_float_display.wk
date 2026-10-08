@@ -1,7 +1,7 @@
 // RUN: --run
 // EXPECT-EXIT: 0
 // EXPECT-OUT: 0.1
-// EXPECT-OUT: 0.10000000149011612
+// EXPECT-OUT: 0.1
 // EXPECT-OUT: 1000000000000000000000
 // EXPECT-OUT: 0.0000001
 // EXPECT-OUT: -0
@@ -15,29 +15,32 @@
 // EXPECT-OUT: 0.000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005
 // EXPECT-OUT: 1152921504606847000
 // EXPECT-OUT: 16777216
-// EXPECT-OUT: 0.30000001192092896
-// EXPECT-OUT: 0.3333333432674408
-// EXPECT-OUT: 0.0999755859375
-// EXPECT-OUT: 0.10009765625
+// EXPECT-OUT: 0.3
+// EXPECT-OUT: 0.33333334
+// EXPECT-OUT: 0.099975586
+// EXPECT-OUT: 0.100097656
 module tests.run.print_float_display
 
 /// How a float prints, pinned on every path that prints one: the interpreter (the spec), the native
 /// JIT, the linked `--emit=exe` (rustc shim or the C fallback runtime) and the textual-LLVM module's
-/// `wukong_rt_print_f64` call. The rule is Rust's `Display` for `f64`: the SHORTEST decimal digit
-/// string that parses back to the same double (the closest one when several do), written
-/// positionally - never in exponent form - with `inf`, `-inf`, `NaN` and `-0` spelled out. `f32`,
-/// `f16` and `bf16` values print as the `f64` they widen to exactly.
+/// `wukong_rt_print_f64` / `wukong_rt_print_f32` calls. The rule is Rust's `Display` at the value's
+/// own type: the SHORTEST decimal digit string that parses back to the same value at that precision
+/// (the closest one when several do), written positionally - never in exponent form - with `inf`,
+/// `-inf`, `NaN` and `-0` spelled out. An `f64` round-trips as a double; an `f32` round-trips as an
+/// `f32`; `f16` and `bf16` values live in `f32` registers and print as that `f32` (exactly what the
+/// `half` crate's `Display` prints).
 ///
 /// The f64 lines spell their literals `f64`: an unsuffixed float literal is `f32` (language guide,
 /// "Literals"), so a bare `print(0.1)` prints the f32 0.1 and `123456789.125` is not even an f32.
 /// Every expected line is derived from that rule, not recorded: 0.1 (f64) is "0.1"; the f32 0.1
-/// is 13421773 * 2^-27 = 0.100000001490116119384765625, whose shortest round-trip f64 digits are
-/// 0.10000000149011612; 10^21 = 2^21 * 5^21 is exact and has no fractional digits; 2^-1074 needs
-/// one digit, 5, after 323 zeros; 2^60 = 1152921504606846976 rounds to the 16 digits
+/// is 13421773 * 2^-27 = 0.100000001490116119384765625, and "0.1" is the shortest decimal that
+/// rounds back to it as an f32; 10^21 = 2^21 * 5^21 is exact and has no fractional digits; 2^-1074
+/// needs one digit, 5, after 323 zeros; 2^60 = 1152921504606846976 rounds to the 16 digits
 /// 1152921504606847 then pads; 16777217 is not an f32 and rounds (ties-to-even) to 16777216;
-/// f32(0.1) + f32(0.2) is the f32 0x3E99999A = 0.300000011920928955078125; f32 1/3 is
-/// 11184811 * 2^-25; f16 0.1 is 0x2E66 = 1638 * 2^-14 = 0.0999755859375 and bf16 0.1 is 0x3DCD =
-/// 205 * 2^-11 = 0.10009765625.
+/// f32(0.1) + f32(0.2) is the f32 0x3E99999A = 0.300000011920928955078125, which is also f32(0.3),
+/// so it prints "0.3"; f32 1/3 is 11184811 * 2^-25, shortest f32 digits 0.33333334; f16 0.1 is
+/// 0x2E66 = 1638 * 2^-14 = 0.0999755859375, whose shortest f32 digits are 0.099975586, and bf16 0.1
+/// is 0x3DCD = 205 * 2^-11 = 0.10009765625, shortest f32 digits 0.100097656.
 fn main() -> i32 {
     let z: f64 = 0.0;
     print(0.1f64);
