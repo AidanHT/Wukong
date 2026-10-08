@@ -401,20 +401,20 @@ fn for_each_child<'e>(e: &'e Expr, f: &mut dyn FnMut(Child<'e>)) {
         | ExprKind::Path(_)
         | ExprKind::SizeOf(_)
         | ExprKind::AlignOf(_) => {}
-        ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => f(Child::Expr(&**expr)),
-        ExprKind::Field { base, .. } | ExprKind::TupleField { base, .. } => f(Child::Expr(&**base)),
+        ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => f(Child::Expr(expr)),
+        ExprKind::Field { base, .. } | ExprKind::TupleField { base, .. } => f(Child::Expr(base)),
         ExprKind::Binary { lhs, rhs, .. } => {
-            f(Child::Expr(&**lhs));
-            f(Child::Expr(&**rhs));
+            f(Child::Expr(lhs));
+            f(Child::Expr(rhs));
         }
         ExprKind::Call { callee, args, .. } => {
-            f(Child::Expr(&**callee));
+            f(Child::Expr(callee));
             for a in args {
                 f(Child::Expr(a));
             }
         }
         ExprKind::Index { base, indices } => {
-            f(Child::Expr(&**base));
+            f(Child::Expr(base));
             for i in indices {
                 f(Child::Expr(i));
             }
@@ -424,7 +424,7 @@ fn for_each_child<'e>(e: &'e Expr, f: &mut dyn FnMut(Child<'e>)) {
                 f(Child::Expr(&fi.value));
             }
             if let Some(r) = rest {
-                f(Child::Expr(&**r));
+                f(Child::Expr(r));
             }
         }
         ExprKind::ArrayLit(xs) | ExprKind::TupleLit(xs) => {
@@ -433,8 +433,8 @@ fn for_each_child<'e>(e: &'e Expr, f: &mut dyn FnMut(Child<'e>)) {
             }
         }
         ExprKind::ArrayRepeat { value, count } => {
-            f(Child::Expr(&**value));
-            f(Child::Expr(&**count));
+            f(Child::Expr(value));
+            f(Child::Expr(count));
         }
         ExprKind::Block(b) | ExprKind::Loop { body: b, .. } => f(Child::Block(b)),
         ExprKind::If {
@@ -442,14 +442,14 @@ fn for_each_child<'e>(e: &'e Expr, f: &mut dyn FnMut(Child<'e>)) {
             then_branch,
             else_branch,
         } => {
-            f(Child::Expr(&**cond));
+            f(Child::Expr(cond));
             f(Child::Block(then_branch));
             if let Some(el) = else_branch {
-                f(Child::Expr(&**el));
+                f(Child::Expr(el));
             }
         }
         ExprKind::Match { scrutinee, arms } => {
-            f(Child::Expr(&**scrutinee));
+            f(Child::Expr(scrutinee));
             for a in arms {
                 if let Some(g) = &a.guard {
                     f(Child::Expr(g));

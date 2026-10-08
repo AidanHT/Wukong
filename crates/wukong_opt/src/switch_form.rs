@@ -310,10 +310,7 @@ fn find_chains(f: &Function, preds: &[Vec<u32>]) -> Vec<Chain> {
         }];
         let mut links: Vec<usize> = Vec::new();
         let mut cur = head;
-        loop {
-            let Some((_, (_, (cont, _)))) = test_of(f, &tests, cur) else {
-                break;
-            };
+        while let Some((_, (_, (cont, _)))) = test_of(f, &tests, cur) {
             let l = cont.0 as usize;
             if l >= n || !is_link[l] || l == head || links.contains(&l) {
                 break;
