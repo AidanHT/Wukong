@@ -25,6 +25,14 @@ loop over the same buffers:
 
 Reports compile time and ns/call per column. A missing toolchain prints `n/a` and continues.
 
+**Library-grade peers (oneMKL, resolved at runtime from `mkl_rt`; `n/a` when absent).** GEMM
+(`cblas_sgemm_64`: NN, NT, TN), GEMV (`cblas_sgemv_64`), transpose (`MKL_Somatcopy`), int8 GEMM
+(`cblas_gemm_s8u8s32_64`, held to bit equality like every int8 column), `vsMul` for the Hadamard
+row, `cblas_sdot_64` for the dot row, and fifteen VML transcendentals (exp, log, tanh, sin, cos,
+erf, exp2, log2, sinh, cosh, asinh, acosh, atan, expm1, log1p) - each in VML's default HA mode
+*and* at `VML_LA` through the explicit-mode `vms*` entry points, the accuracy-matched bar. Every
+library column is cross-checked against Wukong and dropped with a note when it disagrees.
+
 Every battery row additionally reports a **`wk(gen)` recognition-off line** (master plan §7.2): the
 same source lowered with every kernel recognizer skipped (`LowerOptions::recognize = false`, the
 `WUKONG_NO_RECOGNIZE` / `@generic` lowering), its ratio vs C and vs the recognizer-on column, and
@@ -41,6 +49,38 @@ language's §3B ratio is read from. Because the rotation times every column twic
 Wukong column's two samples is a twin control for that row, in that run, for free: `row floor 1.02x`
 is what an effect on that row has to beat, and a ratio inside it is printed `[INSIDE FLOOR]` rather
 than quoted.
+
+**The numerics gate (`src/numerics.rs`).** A cross-language mismatch is a gate, not an advisory
+line. Every section heading opens a numerics scope; a `!` mismatch marks it SUSPECT, and every
+`-> Wukong … is N.NNx faster/slower …` standing in a SUSPECT scope prints as
+`-> SUSPECT: ratio withheld` (the sentence survives only as a `. withheld:` note). Tables that carry
+their ratios in their own cells (the norm and streaming tables) print `SUSPECT` in those cells, and
+the elementwise summary geomeans exclude SUSPECT rows by name. The run ends with a
+`=== numerics gate ===` block listing every SUSPECT section and **exits 4** when there is one;
+`XBENCH_NUMERICS=report` keeps the exit code at 0 for an exploratory run and says so in the log. A
+peer column *dropped* for disagreeing (C++ vs C, a relaxed C(fast)/C(omp), an MKL ABI mismatch)
+prints no ratio, so it is not a mismatch.
+
+**Dispersion, cold start and the main-suite control (`src/dispersion.rs`).** `time_ns` keeps every
+sample it takes (the cold first call, min, median, max, last), and each position-balanced rotation
+prints one `. dispersion` line: per slot, the pass-to-pass spread (the same binary in two positions),
+median/min (within-run jitter), max/min (the worst block - the only tail this harness sees),
+cold/min (first-call cost) and the sample count, plus the rotation's within-run resolution.
+`XBENCH_ESTIMATOR=median|last` changes which statistic becomes `ns_per_call` (`last` is sustained
+throughput after the turbo window); the default is the historical minimum and the banner names the
+estimator in force. The campaign's target families (the elementwise table, colsum, colstat,
+biasadd, transpose, softmax_bwd, the two norm tables, rmsnorm_bwd, layernorm_bwd, matmul,
+matmul_skinny, matmul_tn, linear, bf16) carry a **`C(twin)` control** - the identical C source,
+compiler and flags in a second DLL, true ratio 1.00 - printed as a `. control C(twin)` line with the
+section's single-thread floor. Every single-threaded standing no larger than that floor is tagged
+`[BELOW C(twin) FLOOR …: not established]`, and the norm tables print `BELOW FLOOR` in the cell.
+All-core standings are never tagged by it: the control is single-threaded. Their control is the
+**all-core twin** - the identical `MKL(all)` call (matmul, matmul_skinny, matmul_tn, linear,
+transpose) or the identical `C(omp)` source in a second DLL (colsum, every `@parallel` table row)
+timed again at another slot - printed as `. control twin of MKL(all) … -> all-core floor F`. It is
+Finding 01's `MKL(late)/MKL(early)` control, inside the sections it was about; all-core standings
+inside it are tagged `[BELOW ALL-CORE TWIN FLOOR …]` (a cross-threading standing takes the wider
+of the two floors).
 
 Optional first CLI argument is a substring filter over kernel/section names (e.g. `saxpy`).
 

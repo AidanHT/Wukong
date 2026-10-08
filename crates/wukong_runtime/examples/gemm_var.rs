@@ -12,6 +12,14 @@
 //!
 //! Run: `cargo run -p wukong_runtime --release --example gemm_var [-- <rounds>]`
 //! Env: `WUKONG_MKL_DLL` to point at mkl_rt.dll explicitly; `GEMM_VAR_HUGE=1` adds 2048³.
+//!
+//! **Skinny and `nn.Linear` shapes (P6.7).** Finding 01 withdrew twelve `Wuk(par)`-vs-`MKL(all)`
+//! rows on the strength of THIS instrument, but it only ever ran square `C = A·B`: six of the twelve
+//! are skinny NT shapes and two are square NT (`linear`), and none of the eight had better-instrument
+//! evidence of its own. `GEMM_VAR_NT=1` appends exactly those eight - the six `matmul_skinny` shapes
+//! and the two `linear` sizes xbench measures - timed through `wukong_sgemm_nt_parallel` against
+//! `cblas_sgemm` with `transb = CblasTrans`, under the same order-swapped rounds. `GEMM_VAR_SHAPES=
+//! MxKxN[t],...` replaces the whole list with explicit shapes (`t` = NT, `B` stored `[N, K]`).
 
 #[cfg(windows)]
 use std::path::PathBuf;
@@ -113,6 +121,72 @@ fn load_mkl() -> Option<Mkl> {
     Some(api)
 }
 
+/// One GEMM shape: `C[M,N] = A[M,K] · B`, with `B` stored `[K,N]` (NN) or `[N,K]` (`nt`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Shape {
+    m: usize,
+    k: usize,
+    n: usize,
+    nt: bool,
+}
+
+impl Shape {
+    fn square(n: usize, nt: bool) -> Shape {
+        Shape { m: n, k: n, n, nt }
+    }
+
+    /// Square NN keeps its historical `256³` heading (Finding 01 quotes it); everything else
+    /// names its shape the way xbench's `matmul_skinny` / `linear` headings do.
+    fn label(&self) -> String {
+        match (self.nt, self.m == self.k && self.k == self.n) {
+            (false, true) => format!("{}³", self.n),
+            (false, false) => format!("{}x{} · {}x{} (NN)", self.m, self.k, self.k, self.n),
+            (true, _) => format!("{}x{} · ({}x{})ᵀ (NT)", self.m, self.k, self.n, self.k),
+        }
+    }
+}
+
+/// The eight NT shapes Finding 01 withdrew without an instrument of their own: xbench's six
+/// `matmul_skinny` shapes `(M, K, N)` and its two `linear` sizes.
+fn nt_presets() -> Vec<Shape> {
+    let skinny = [
+        (128, 768, 768),
+        (128, 768, 3072),
+        (128, 3072, 768),
+        (512, 768, 768),
+        (512, 768, 3072),
+        (512, 3072, 768),
+    ];
+    skinny
+        .into_iter()
+        .map(|(m, k, n)| Shape { m, k, n, nt: true })
+        .chain([512, 1024].into_iter().map(|n| Shape::square(n, true)))
+        .collect()
+}
+
+/// `GEMM_VAR_SHAPES=128x768x3072t,1024x1024x1024` - `None` on anything malformed, so a typo is an
+/// error rather than a silently shorter sweep.
+fn parse_shapes(s: &str) -> Option<Vec<Shape>> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(|t| {
+            let (dims, nt) = match t.strip_suffix('t') {
+                Some(d) => (d, true),
+                None => (t, false),
+            };
+            let v: Vec<usize> = dims
+                .split('x')
+                .map(|d| d.parse().ok().filter(|&x: &usize| x > 0))
+                .collect::<Option<Vec<_>>>()?;
+            match v[..] {
+                [m, k, n] => Some(Shape { m, k, n, nt }),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 fn median(v: &mut [f64]) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     v[v.len() / 2]
@@ -151,22 +225,48 @@ fn main() {
             sizes.retain(|n| keep.contains(n));
         }
     }
-    for ns in sizes {
-        let n2 = ns * ns;
-        // Same fill pattern as the xbench matmul section — identical operand values.
-        let a: Vec<f32> = (0..n2).map(|i| (i % 7) as f32 * 0.5 + 0.1).collect();
-        let b: Vec<f32> = (0..n2).map(|i| (i % 5) as f32 * 0.25 - 0.3).collect();
-        let mut cw = vec![0.0f32; n2];
-        let mut cm = vec![0.0f32; n2];
-        let flop = 2.0 * (ns as f64).powi(3);
-        let (ni, ap, bp) = (ns as i64, a.as_ptr(), b.as_ptr());
+    let mut shapes: Vec<Shape> = sizes.into_iter().map(|n| Shape::square(n, false)).collect();
+    if std::env::var("GEMM_VAR_NT").is_ok() {
+        shapes.extend(nt_presets());
+    }
+    if let Ok(s) = std::env::var("GEMM_VAR_SHAPES") {
+        match parse_shapes(&s) {
+            Some(list) if !list.is_empty() => shapes = list,
+            _ => {
+                eprintln!("GEMM_VAR_SHAPES={s:?} is not a list of MxKxN[t] - refusing to guess");
+                std::process::exit(2);
+            }
+        }
+    }
+    for shape in shapes {
+        let Shape { m, k, n, nt } = shape;
+        // Same fill pattern as the xbench matmul sections — identical operand values. `B` is
+        // `[K, N]` for NN and `[N, K]` for NT (the `nn.Linear` weight layout), `k * n` either way.
+        let a: Vec<f32> = (0..m * k).map(|i| (i % 7) as f32 * 0.5 + 0.1).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i % 5) as f32 * 0.25 - 0.3).collect();
+        let mut cw = vec![0.0f32; m * n];
+        let mut cm = vec![0.0f32; m * n];
+        let flop = 2.0 * m as f64 * n as f64 * k as f64;
+        let (mi, ki, ni, ap, bp) = (m as i64, k as i64, n as i64, a.as_ptr(), b.as_ptr());
         let cwp = cw.as_mut_ptr();
         let cmp = cm.as_mut_ptr();
+        // Row-major leading dimensions follow the storage: lda = K, ldc = N, and ldb = N for a
+        // `[K, N]` B or K for an `[N, K]` B taken with transb = CblasTrans (112).
+        let (transb, ldb) = if nt { (112, ki) } else { (111, ni) };
 
-        let mut wuk =
-            || unsafe { wukong_runtime::wukong_sgemm_parallel(ap, bp, cwp, ni, ni, ni, 0) };
-        let mut mklc =
-            || unsafe { (mkl.sgemm)(101, 111, 111, ni, ni, ni, 1.0, ap, ni, bp, ni, 0.0, cmp, ni) };
+        let mut wuk = || unsafe {
+            if nt {
+                wukong_runtime::wukong_sgemm_nt_parallel(ap, bp, cwp, mi, ki, ni, 0)
+            } else {
+                wukong_runtime::wukong_sgemm_parallel(ap, bp, cwp, mi, ki, ni, 0)
+            }
+        };
+        let mut mklc = || unsafe {
+            (mkl.sgemm)(
+                101, 111, transb, mi, ni, ki, 1.0, ap, ki, bp, ldb, 0.0, cmp, ni,
+            )
+        };
+        let label = shape.label();
 
         // Warm both sides (pool spawn, packing scratch, MKL's own thread wake) and ABI-check once:
         // a garbage MKL layout would otherwise read as a fast wrong answer.
@@ -184,7 +284,7 @@ fn main() {
             .fold(0.0f64, f64::max);
         assert!(
             max_rel < 1e-4,
-            "Wukong vs MKL disagree (rel {max_rel:.1e}) at {ns}³"
+            "Wukong vs MKL disagree (rel {max_rel:.1e}) at {label}"
         );
 
         // Batch reps sized off a calibration call so one batch is ~30 ms — long enough to blur
@@ -194,7 +294,7 @@ fn main() {
         let one_call = t.elapsed().as_secs_f64();
         let reps = ((0.030 / one_call).round() as usize).clamp(2, 400);
 
-        println!("\n=== {ns}³  (reps/batch={reps}, one timed batch per side per round) ===");
+        println!("\n=== {label}  (reps/batch={reps}, one timed batch per side per round) ===");
         let batch = |f: &mut dyn FnMut()| -> f64 {
             let t = Instant::now();
             for _ in 0..reps {

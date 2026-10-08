@@ -2207,7 +2207,7 @@ fn prepare_torch(
 // -------------------------------------------------------------------------------------------
 
 pub(crate) fn bench_model(cc: &str, dir: &Path) {
-    println!("=== model: end-to-end GPT-2-class transformer stack (CPU inference) ===");
+    section!("=== model: end-to-end GPT-2-class transformer stack (CPU inference) ===");
     println!(
         "  {LAYERS} pre-LN decoder blocks (MH causal attention + GELU MLP) + final LayerNorm; \
          d_model=768, heads=12, d_ff=3072."
@@ -2262,8 +2262,13 @@ pub(crate) fn bench_model(cc: &str, dir: &Path) {
         ),
     }
 
-    if interp_gate() != Some(0.0) {
-        println!(
+    // The oracle gate's verdict is carried into every size below: a model whose reduced-config
+    // forward disagrees with the interpreter has no trustworthy standing at ANY size, and each
+    // size opens its own numerics scope (see `numerics.rs`), so the failure must be re-asserted
+    // there rather than left to scroll past under this heading.
+    let gate_ok = interp_gate() == Some(0.0);
+    if !gate_ok {
+        mismatch!(
             "  ! MODEL GATE NOT BIT-EXACT — see the gate messages above; the timings below are \
              not trustworthy until this is fixed"
         );
@@ -2294,6 +2299,7 @@ pub(crate) fn bench_model(cc: &str, dir: &Path) {
                 dff: 3072,
             },
             torch.as_ref(),
+            gate_ok,
         );
         println!();
     }
@@ -2493,14 +2499,21 @@ fn interp_gate() -> Option<f64> {
     Some(worst)
 }
 
-fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
+fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>, gate_ok: bool) {
     let flops = cfg.flops_per_layer() * LAYERS as f64;
-    println!(
+    section!(
         "--- model S={} ({} tokens/forward, {:.1} GFLOP/forward) ---",
         cfg.s,
         cfg.s,
         flops / 1e9
     );
+    if !gate_ok {
+        mismatch!(
+            "  ! model interpreter gate did not pass (see the gate lines above) — every standing \
+             at S={} is withheld",
+            cfg.s
+        );
+    }
     // Sample the power state BEFORE this size and again after it. A single sample at the top of
     // the run is not enough: a size takes minutes, and an all-core burst on this box can knock the
     // adapter off mid-sweep — after which every remaining column is battery-throttled with nothing
@@ -2987,11 +3000,95 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
         }
     }
 
+    // --- full-buffer cross-checks over the final [S, D] output ---
+    // Wukong-vs-C: the GEMM/norm reductions reassociate and Wukong's ~1-ULP poly exp/tanh differ
+    // from libm, compounding over 12 layers — and the final LayerNorm re-centers every row to mean
+    // 0, so a *per-element* relative error is meaningless on the near-zero elements (catastrophic-
+    // cancellation zeros). Use the suite's **magnitude-normalized** metric `max|Δ| / max|out|`
+    // (the softmax_bwd / cumsum convention) at the usual 1e-3.
+    // Every non-PASS outcome is also collected so the run ends with ONE loud line: a `!` in the
+    // middle of a long sweep scrolls past, and this bench's callers gate on the exit code, not on
+    // stdout. A comparison that could not be made (`cross_check_rel` -> Err) is reported as NOT RUN
+    // and counted here — it is never allowed to read as agreement.
+    let unpassed = std::cell::RefCell::new(Vec::<String>::new());
+    let check = |a: &Option<MeasureModel>, b: &Option<MeasureModel>, who: &str, tol: f64| {
+        if let (Some(x), Some(z)) = (a, b) {
+            match cross_check_rel(&x.out, &z.out) {
+                Err(why) => {
+                    mismatch!("  ! cross-check {who}: NOT RUN — {why}");
+                    unpassed
+                        .borrow_mut()
+                        .push(format!("{who}: not run ({why})"));
+                }
+                Ok(rel) if rel > tol => {
+                    mismatch!("  ! full-buffer mismatch {who}: max|Δ|/max|out| = {rel:.2e} (tol {tol:.0e})");
+                    unpassed.borrow_mut().push(format!(
+                        "{who}: max|Δ|/max|out| = {rel:.2e} > tol {tol:.0e}"
+                    ));
+                }
+                Ok(rel) => {
+                    println!(
+                        "  cross-check {who}: max|Δ|/max|out| = {rel:.2e} (tol {tol:.0e}) — PASS"
+                    )
+                }
+            }
+        }
+    };
+    check(&wk_m, &c_m, "Wukong vs C", 1e-3);
+    check(&wk_m, &cpp_m, "Wukong vs C++", 1e-3);
+    check(&wk_m, &rust_m, "Wukong vs Rust", 1e-3);
+    check(&wk_m, &cfast_m, "Wukong vs C(fast)", 1e-3);
+    // Wukong vs torch: same GELU flavor (tanh approx) and eps, so the residual is the same
+    // reassociation + poly-vs-libm class as vs C — expect ~1e-5-ish at the standard 1e-3.
+    check(&wk_m, &torch1_m, "Wukong vs Torch (eager SDPA)", 1e-3);
+    // The compiled output is cross-checked exactly like the eager SDPA output — vs Wukong at the
+    // same 1e-3 magnitude-normalized tolerance (the script already gated it vs eager, so a
+    // fast-but-wrong compiled path never reached a timed column in the first place).
+    check(
+        &wk_m,
+        &torch1c_m,
+        "Wukong vs Torch (compiled max-autotune)",
+        1e-3,
+    );
+    // Serial vs @parallel Wukong: every dispatched _parallel kernel is bit-identical to its serial
+    // twin (fixed chunking / row-mapped) and the outlined glue loops are deterministic, so this one
+    // stays the strict per-element check — it is expected EXACT.
+    if let (Some(x), Some(z)) = (&wk_m, &wk_par_m) {
+        if x.out.len() != z.out.len() || x.out.is_empty() {
+            mismatch!(
+                "  ! cross-check Wukong serial vs @parallel: NOT RUN — buffer lengths {} vs {}",
+                x.out.len(),
+                z.out.len()
+            );
+            unpassed
+                .borrow_mut()
+                .push("Wukong serial vs @parallel: not run (buffer length disagreement)".into());
+        } else {
+            let (rel, at) = max_rel_err(&x.out, &z.out);
+            if rel > 0.0 {
+                mismatch!(
+                    "  ! Wukong serial vs @parallel differ at [{at}]: {} vs {} (rel {rel:.2e}) — \
+                     expected bit-exact",
+                    x.out[at],
+                    z.out[at]
+                );
+                unpassed.borrow_mut().push(format!(
+                    "Wukong serial vs @parallel: rel {rel:.2e} at [{at}], expected bit-exact"
+                ));
+            } else {
+                println!("  cross-check Wukong serial vs @parallel: BIT-EXACT");
+            }
+        }
+    }
+
+    // The standings come AFTER every cross-check above, so a size whose numerics failed prints
+    // `SUSPECT: ratio withheld` instead of a ratio (`numerics.rs`); printed first, a divergent
+    // forward would already have rendered as a clean `1.31x faster` line.
     let ratio_line =
         |wuk: &Option<MeasureModel>, peer: &Option<MeasureModel>, who: &str, peer_name: &str| {
             if let (Some(m), Some(p)) = (wuk, peer) {
                 let r = p.ns_per_fwd / m.ns_per_fwd;
-                println!(
+                standing!(
                     "  -> Wukong {who} is {:.2}x {} than {peer_name}",
                     if r >= 1.0 { r } else { 1.0 / r },
                     if r >= 1.0 { "faster" } else { "slower" }
@@ -3066,86 +3163,6 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
              single-threaded; Wuk(par), Tn(sdpa) and Tn(comp) are the multicore columns — the \
              @parallel dispatch set is printed above)"
         );
-    }
-
-    // --- full-buffer cross-checks over the final [S, D] output ---
-    // Wukong-vs-C: the GEMM/norm reductions reassociate and Wukong's ~1-ULP poly exp/tanh differ
-    // from libm, compounding over 12 layers — and the final LayerNorm re-centers every row to mean
-    // 0, so a *per-element* relative error is meaningless on the near-zero elements (catastrophic-
-    // cancellation zeros). Use the suite's **magnitude-normalized** metric `max|Δ| / max|out|`
-    // (the softmax_bwd / cumsum convention) at the usual 1e-3.
-    // Every non-PASS outcome is also collected so the run ends with ONE loud line: a `!` in the
-    // middle of a long sweep scrolls past, and this bench's callers gate on the exit code, not on
-    // stdout. A comparison that could not be made (`cross_check_rel` -> Err) is reported as NOT RUN
-    // and counted here — it is never allowed to read as agreement.
-    let unpassed = std::cell::RefCell::new(Vec::<String>::new());
-    let check = |a: &Option<MeasureModel>, b: &Option<MeasureModel>, who: &str, tol: f64| {
-        if let (Some(x), Some(z)) = (a, b) {
-            match cross_check_rel(&x.out, &z.out) {
-                Err(why) => {
-                    println!("  ! cross-check {who}: NOT RUN — {why}");
-                    unpassed
-                        .borrow_mut()
-                        .push(format!("{who}: not run ({why})"));
-                }
-                Ok(rel) if rel > tol => {
-                    println!("  ! full-buffer mismatch {who}: max|Δ|/max|out| = {rel:.2e} (tol {tol:.0e})");
-                    unpassed.borrow_mut().push(format!(
-                        "{who}: max|Δ|/max|out| = {rel:.2e} > tol {tol:.0e}"
-                    ));
-                }
-                Ok(rel) => {
-                    println!(
-                        "  cross-check {who}: max|Δ|/max|out| = {rel:.2e} (tol {tol:.0e}) — PASS"
-                    )
-                }
-            }
-        }
-    };
-    check(&wk_m, &c_m, "Wukong vs C", 1e-3);
-    check(&wk_m, &cpp_m, "Wukong vs C++", 1e-3);
-    check(&wk_m, &rust_m, "Wukong vs Rust", 1e-3);
-    check(&wk_m, &cfast_m, "Wukong vs C(fast)", 1e-3);
-    // Wukong vs torch: same GELU flavor (tanh approx) and eps, so the residual is the same
-    // reassociation + poly-vs-libm class as vs C — expect ~1e-5-ish at the standard 1e-3.
-    check(&wk_m, &torch1_m, "Wukong vs Torch (eager SDPA)", 1e-3);
-    // The compiled output is cross-checked exactly like the eager SDPA output — vs Wukong at the
-    // same 1e-3 magnitude-normalized tolerance (the script already gated it vs eager, so a
-    // fast-but-wrong compiled path never reached a timed column in the first place).
-    check(
-        &wk_m,
-        &torch1c_m,
-        "Wukong vs Torch (compiled max-autotune)",
-        1e-3,
-    );
-    // Serial vs @parallel Wukong: every dispatched _parallel kernel is bit-identical to its serial
-    // twin (fixed chunking / row-mapped) and the outlined glue loops are deterministic, so this one
-    // stays the strict per-element check — it is expected EXACT.
-    if let (Some(x), Some(z)) = (&wk_m, &wk_par_m) {
-        if x.out.len() != z.out.len() || x.out.is_empty() {
-            println!(
-                "  ! cross-check Wukong serial vs @parallel: NOT RUN — buffer lengths {} vs {}",
-                x.out.len(),
-                z.out.len()
-            );
-            unpassed
-                .borrow_mut()
-                .push("Wukong serial vs @parallel: not run (buffer length disagreement)".into());
-        } else {
-            let (rel, at) = max_rel_err(&x.out, &z.out);
-            if rel > 0.0 {
-                println!(
-                    "  ! Wukong serial vs @parallel differ at [{at}]: {} vs {} (rel {rel:.2e}) — \
-                     expected bit-exact",
-                    x.out[at], z.out[at]
-                );
-                unpassed.borrow_mut().push(format!(
-                    "Wukong serial vs @parallel: rel {rel:.2e} at [{at}], expected bit-exact"
-                ));
-            } else {
-                println!("  cross-check Wukong serial vs @parallel: BIT-EXACT");
-            }
-        }
     }
 
     // The second power sample. A state change across the size means the columns above were taken
