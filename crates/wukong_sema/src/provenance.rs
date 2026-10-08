@@ -21,8 +21,9 @@
 //! `check_fn_call` opens a [`CallCtx`] for the call, names the argument it is unifying, and
 //! `unify_dim` records where each dimension variable is bound ([`Origin`]); a conflict is reported
 //! through [`Sema::report_dim_conflict`]. Arity errors (`E0503`) name the callee and label its
-//! definition, the extra arguments, or the missing parameters. The headline messages are unchanged
-//! (`crates/wukongc/tests/fail.rs` pins them); everything added here is labels and notes.
+//! definition, the extra arguments, or the missing parameters. The `E0502` headline is unchanged
+//! (`crates/wukongc/tests/fail.rs` pins it) and everything added to it is labels and notes; the
+//! `E0503` headline now names the callee ("function `add` takes 2 arguments but 3 were supplied").
 
 use wukong_ast::{Expr, FnDecl};
 use wukong_diag::Diagnostic;

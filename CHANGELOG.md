@@ -22,7 +22,9 @@ All notable changes to Wukong are documented here. The format is loosely based o
   argument and labels the argument axis or turbofish that fixed the dimension and the callee's
   parameter (Futhark-style "fixed here"); an arity error (`E0503`) names the callee (`Type::method`
   for a method, counting after the receiver), labels its definition and each extra argument, and
-  lists the missing parameters. The headline messages are unchanged.
+  lists the missing parameters. The `E0502` headline is unchanged; the `E0503` headline now names
+  the callee ("function `add` takes 2 arguments but 3 were supplied", where it read "this function
+  takes 2 argument(s) but 3 were supplied").
 - **New code `E0520`: cannot infer a dimension of a call.** A dimension the callee's parameter shapes
   use that nothing fixes (no turbofish, argument shape, solvable element count or `?` argument
   extent) is reported at the call with the turbofish to write; it used to surface in lowering as
