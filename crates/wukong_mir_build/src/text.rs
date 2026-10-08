@@ -635,6 +635,27 @@ impl FnLowerer<'_> {
                 let sp = self.text_const(spec.pack(st::KIND_SIGNED));
                 self.text_call(sink, syms.fmt_str, &[v, n, sp]);
             }
+            // A value sema typed leniently (`Unknown`: an unmodeled builtin's result) prints by its
+            // MIR type, as the plain `print` path routes it — never a C0001 for an argument that
+            // `print` itself accepts.
+            Ty::Unknown | Ty::Error => {
+                let s = match self.builder.value_type(v) {
+                    MirType::F64 => Scalar::F64,
+                    MirType::F32 => Scalar::F32,
+                    MirType::F16 => Scalar::F16,
+                    MirType::BF16 => Scalar::Bf16,
+                    MirType::I1 => Scalar::Bool,
+                    MirType::I8 => Scalar::I8,
+                    MirType::I16 => Scalar::I16,
+                    MirType::I32 => Scalar::I32,
+                    MirType::I64 => Scalar::I64,
+                    _ => {
+                        self.unsupported(sink.span, "printing a value of this type");
+                        return;
+                    }
+                };
+                self.text_scalar(sink, v, &Ty::Scalar(s), spec);
+            }
             // Sema rejects every other type (E0448); a generic instantiation can still reach here.
             _ => self.unsupported(sink.span, "printing a value of this type"),
         }
