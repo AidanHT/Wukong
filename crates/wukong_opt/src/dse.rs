@@ -153,7 +153,7 @@ impl Pass for Dse {
     }
 
     fn run_function(&self, f: &mut Function, cache: &mut CfgAnalyses) -> bool {
-        let alias = AliasInfo::analyze(f);
+        let alias = cache.alias(f);
         let unread = unread_private_slots(f, &alias);
         let mut dead = DeadSet::new(f);
 

@@ -191,14 +191,21 @@ impl wukong_opt::Pass for Counted {
 }
 
 /// Slot layout of the attribution table: the thirteen standard `-O2` passes in pipeline order, then
-/// the two whole-program stages, then the cleanup pipeline's two passes (kept separate because they
+/// the two whole-program stages, then the cleanup pipeline's five passes (kept separate because they
 /// run under a different driver instance and belong to the unrolling stage's cost).
 const STANDARD: usize = 13;
 const SLOT_INLINE: usize = STANDARD;
 const SLOT_UNROLL: usize = STANDARD + 1;
-const SLOT_CLEANUP_CSE: usize = STANDARD + 2;
-const SLOT_CLEANUP_DCE: usize = STANDARD + 3;
-const SLOTS: usize = STANDARD + 4;
+const SLOT_CLEANUP: usize = STANDARD + 2;
+/// `PassManager::unroll_cleanup`'s passes, in its order.
+const CLEANUP_NAMES: [&str; 5] = [
+    "cleanup:simplify",
+    "cleanup:simplify-cfg",
+    "cleanup:simplify-phis",
+    "cleanup:cse",
+    "cleanup:dce",
+];
+const SLOTS: usize = SLOT_CLEANUP + CLEANUP_NAMES.len();
 
 fn counted_pass(slot: usize, p: Box<dyn wukong_opt::Pass>) -> Box<dyn wukong_opt::Pass> {
     Box::new(Counted { inner: p, slot })
@@ -224,24 +231,25 @@ fn attributed_standard() -> wukong_opt::PassManager {
     pm
 }
 
-/// The post-unroll cleanup pipeline (`cse` → `dce`), wrapped.
+/// The post-unroll cleanup pipeline (`simplify` → `simplify-cfg` → `simplify-phis` → `cse` →
+/// `dce`, `PassManager::unroll_cleanup`'s order), wrapped.
 fn attributed_cleanup() -> wukong_opt::PassManager {
     use wukong_opt::*;
     let mut pm = PassManager::new();
-    pm.add(counted_pass(SLOT_CLEANUP_CSE, Box::new(Cse)));
-    pm.add(counted_pass(SLOT_CLEANUP_DCE, Box::new(Dce)));
+    pm.add(counted_pass(SLOT_CLEANUP, Box::new(Simplify)));
+    pm.add(counted_pass(SLOT_CLEANUP + 1, Box::new(SimplifyCfg)));
+    pm.add(counted_pass(SLOT_CLEANUP + 2, Box::new(SimplifyPhis)));
+    pm.add(counted_pass(SLOT_CLEANUP + 3, Box::new(Cse)));
+    pm.add(counted_pass(SLOT_CLEANUP + 4, Box::new(Dce)));
     pm
 }
 
 /// Run the `-O2` optimizer over `p` with per-pass attribution, mirroring [`wukong_opt::optimize`]
 /// stage for stage: inline → standard fixpoint → unroll → cleanup of the changed functions.
 ///
-/// The cleanup is the one place `optimize` does something this replica cannot call directly (it
-/// runs the private `run_function` on just the changed functions). Each changed function is moved
-/// into a single-function `Program` shell — whose `Vec` is reserved *before* counting starts, so the
-/// move itself allocates nothing — and the public `PassManager::run` is applied to that shell. The
-/// per-function pipeline is function-local, so the mutation sequence is identical; the
-/// byte-identical check in `measure_one` is what proves it.
+/// The cleanup goes through the same public `PassManager::run_subset` that `optimize` uses, so the
+/// changed functions are cleaned in the same order with the same call-effect summaries of the rest
+/// of the program; the byte-identical check in `measure_one` is what proves the replica exact.
 fn optimize_attributed(p: &mut wukong_mir::Program) -> Vec<PassWork> {
     PASS_ACC.with(|acc| {
         let mut acc = acc.borrow_mut();
@@ -251,19 +259,8 @@ fn optimize_attributed(p: &mut wukong_mir::Program) -> Vec<PassWork> {
     let (_, inline) = counted(|| wukong_opt::inline_program(p));
     attributed_standard().run(p);
     let cleanup = attributed_cleanup();
-    let mut shell = wukong_mir::Program {
-        funcs: Vec::with_capacity(1),
-        statics: Vec::new(),
-        level: p.level,
-    };
     let (changed, unroll) = counted(|| wukong_opt::unroll_program(p));
-    for i in changed {
-        let placeholder = placeholder_function(&p.funcs[i]);
-        let f = std::mem::replace(&mut p.funcs[i], placeholder);
-        shell.funcs.push(f);
-        cleanup.run(&mut shell);
-        p.funcs[i] = shell.funcs.pop().unwrap();
-    }
+    cleanup.run_subset(p, &changed);
     PASS_ACC.with(|acc| {
         let mut acc = acc.borrow_mut();
         acc[SLOT_INLINE] = PassWork {
@@ -276,24 +273,11 @@ fn optimize_attributed(p: &mut wukong_mir::Program) -> Vec<PassWork> {
             calls: 1,
             work: unroll,
         };
-        acc[SLOT_CLEANUP_CSE].name = "cleanup:cse";
-        acc[SLOT_CLEANUP_DCE].name = "cleanup:dce";
+        for (k, name) in CLEANUP_NAMES.iter().enumerate() {
+            acc[SLOT_CLEANUP + k].name = *name;
+        }
         acc.clone()
     })
-}
-
-/// An allocation-free stand-in left in a function's slot while it is being cleaned up in the shell.
-/// Shares the original's `Symbol`/`MirType` (both `Copy`/cheap) and owns no heap memory.
-fn placeholder_function(f: &wukong_mir::Function) -> wukong_mir::Function {
-    wukong_mir::Function {
-        name: f.name,
-        params: Vec::new(),
-        ret: wukong_mir::MirType::Void,
-        blocks: Vec::new(),
-        value_types: Vec::new(),
-        entry: f.entry,
-        vec_kernels: Vec::new(),
-    }
 }
 
 // ===================================================================================================

@@ -4,8 +4,12 @@
 //! optimizer sweep for each preceding link. Marking backwards from the instructions we must keep
 //! removes the entire chain in one invocation. Each value is visited at most once, irrespective of
 //! block layout, so the work is linear in the value arena, instructions and operand uses.
+//!
+//! A call to a user function whose summary says it has no side effect and always returns (see the
+//! `effects` module) is as removable as arithmetic: it is not a root, and it goes once nothing
+//! reads its result — or immediately, when it has none.
 
-use wukong_mir::{Function, ValueId};
+use wukong_mir::{Function, Op, ValueId};
 
 use crate::{each_op_use, each_term_use, has_side_effects, CfgAnalyses, Pass};
 
@@ -16,7 +20,16 @@ impl Pass for Dce {
         "dce"
     }
 
-    fn run_function(&self, f: &mut Function, _cache: &mut CfgAnalyses) -> bool {
+    fn run_function(&self, f: &mut Function, cache: &mut CfgAnalyses) -> bool {
+        let effects = cache.call_effects();
+        let removable_call = |op: &Op| match op {
+            Op::Call { func, .. } => effects.as_ref().is_some_and(|e| e.removable(*func)),
+            _ => false,
+        };
+        // Must this instruction stay even if nothing reads its result?
+        let rooted = |op: &Op, has_result: bool| {
+            !removable_call(op) && (!has_result || has_side_effects(op))
+        };
         let mut definitions = vec![None; f.value_types.len()];
         let mut live = vec![false; f.value_types.len()];
         let mut work = Vec::new();
@@ -33,7 +46,7 @@ impl Pass for Dce {
                 }
                 // Preserve the existing effect classification, including instructions without a
                 // result. DCE does not introduce a new policy for potentially trapping operations.
-                if inst.result.is_none() || has_side_effects(&inst.op) {
+                if rooted(&inst.op, inst.result.is_some()) {
                     each_op_use(&inst.op, &mut |v| mark(v, &mut live, &mut work));
                 }
             }
@@ -51,8 +64,8 @@ impl Pass for Dce {
         for b in &mut f.blocks {
             let before = b.insts.len();
             b.insts.retain(|inst| match inst.result {
-                Some(r) => live[r.0 as usize] || has_side_effects(&inst.op),
-                None => true,
+                Some(r) => live[r.0 as usize] || rooted(&inst.op, true),
+                None => rooted(&inst.op, false),
             });
             if b.insts.len() != before {
                 changed = true;

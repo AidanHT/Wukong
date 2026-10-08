@@ -9,7 +9,8 @@
 //! preheader — a single out-of-loop predecessor that reaches the header by an unconditional branch
 //! (and therefore dominates it) — rather than synthesizing one; `loop-canon` gives every loop it can
 //! one first. Only side-effect-free, non-trapping operations are moved (see `safe_to_hoist`: no
-//! stores, calls, vector kernels, allocas, barriers, or integer division/remainder), so hoisting a
+//! stores, vector kernels, allocas, barriers, integer division/remainder, or calls other than to a
+//! callee summarized as speculatable), so hoisting a
 //! computation onto a path that would not have executed it can never change observable behavior.
 //!
 //! # Loads
@@ -56,7 +57,10 @@
 //! it — or leaves the loop, and leaving is only possible at the header. An inner loop could spin
 //! forever before reaching the load, so a loop with one is refused.
 
+use std::rc::Rc;
+
 use crate::alias::{type_bytes, AliasInfo, Prov};
+use crate::effects::CallEffects;
 use crate::fxhash::{FxHashMap, FxHashSet};
 use crate::loop_info::{self, NaturalLoop};
 
@@ -81,7 +85,8 @@ impl Pass for Licm {
         if f.blocks.len() < 2 {
             return false;
         }
-        let alias = AliasInfo::analyze(f);
+        let alias = cache.alias(f);
+        let effects = cache.call_effects();
         // `idom`/`preds` borrow the cache; `hoist_from_loop` mutates `f` (a different object), so
         // the two coexist for the whole loop. Hoisting never changes the block graph.
         let (idom, preds) = cache.idoms_and_preds(f);
@@ -96,7 +101,7 @@ impl Pass for Licm {
                 continue;
             };
             let body: FxHashSet<u32> = l.blocks.iter().map(|b| b.0).collect();
-            let mem = LoopMem::of(f, &body);
+            let mem = LoopMem::of(f, &body, effects.clone());
             let spec = Spec::of(f, l, &body, idom);
             changed |= hoist_from_loop(f, &body, preheader.0, &alias, &mem, &spec, &mut dummies);
         }
@@ -148,7 +153,8 @@ impl Dummies {
 }
 
 /// Everything in one loop body that can write memory, summarized once so the hoist test does not
-/// rescan the body per candidate. Stores and calls are never hoisted, so this stays valid across
+/// rescan the body per candidate. Stores are never hoisted, and the only calls that are (a
+/// speculatable callee's) write nothing and were never recorded here, so this stays valid across
 /// every round of `hoist_from_loop`.
 pub(crate) struct LoopMem {
     /// `(destination, bytes written)` for every store in the body.
@@ -158,14 +164,24 @@ pub(crate) struct LoopMem {
     pub(crate) has_call: bool,
     /// Does the body contain a barrier? Another thread may write shared memory between two.
     pub(crate) has_barrier: bool,
+    /// Call summaries: a call summarized as side-effect free writes nothing, and a speculatable one
+    /// may itself be hoisted (see the `effects` module). `None` treats every call as a writer —
+    /// what `promote` passes, because a summarized callee may still *read* the location it keeps
+    /// in a register, and the pending register value is invisible to that read.
+    effects: Option<Rc<CallEffects>>,
 }
 
 impl LoopMem {
-    pub(crate) fn of(f: &Function, body: &FxHashSet<u32>) -> LoopMem {
+    pub(crate) fn of(
+        f: &Function,
+        body: &FxHashSet<u32>,
+        effects: Option<Rc<CallEffects>>,
+    ) -> LoopMem {
         let mut mem = LoopMem {
             stores: Vec::new(),
             has_call: false,
             has_barrier: false,
+            effects,
         };
         let mut blocks: Vec<u32> = body.iter().copied().collect();
         blocks.sort_unstable();
@@ -175,6 +191,7 @@ impl LoopMem {
                     Op::Store { ptr, value } => mem
                         .stores
                         .push((*ptr, type_bytes(f.value_type(*value)).unwrap_or(u32::MAX))),
+                    Op::Call { func, .. } if mem.writes_nothing(*func) => {}
                     Op::Call { .. } | Op::VecKernelCall { .. } => mem.has_call = true,
                     Op::Barrier => mem.has_barrier = true,
                     _ => {}
@@ -192,6 +209,10 @@ impl LoopMem {
                 .stores
                 .iter()
                 .any(|&(q, qb)| alias.may_alias_sized(ptr, bytes, q, qb))
+    }
+
+    fn writes_nothing(&self, func: wukong_span::Symbol) -> bool {
+        self.effects.as_ref().is_some_and(|e| e.get(func).is_some())
     }
 }
 
@@ -439,8 +460,9 @@ pub(crate) fn dominates(a: u32, b: u32, idom: &[u32]) -> bool {
 /// May this operation be speculatively executed in the preheader (no side effects, cannot trap)?
 ///
 /// `Op::Load` is decided separately by [`load_hoist`], which needs the loop's memory effects and the
-/// alias analysis; everything here is judged on the opcode alone.
-fn safe_to_hoist(op: &Op) -> bool {
+/// alias analysis; everything here is judged on the opcode alone, plus the callee's summary for a
+/// `call`.
+fn safe_to_hoist(op: &Op, mem: &LoopMem) -> bool {
     match op {
         Op::ConstInt(..)
         | Op::ConstFloat(..)
@@ -460,9 +482,11 @@ fn safe_to_hoist(op: &Op) -> bool {
         | Op::Round(..) => true,
         // Integer division/remainder can trap on a zero divisor, so they are not speculatable.
         Op::Bin(b, ..) => !matches!(b, BinOp::SDiv | BinOp::UDiv | BinOp::SRem | BinOp::URem),
+        // A speculatable callee always returns, reads nothing and cannot trap: with invariant
+        // arguments its result is invariant and computing it early is unobservable.
+        Op::Call { func, .. } => mem.effects.as_ref().is_some_and(|e| e.hoistable(*func)),
         Op::Load(..)
         | Op::Store { .. }
-        | Op::Call { .. }
         | Op::VecKernelCall { .. }
         | Op::Alloca { .. }
         | Op::Barrier => false,
@@ -521,7 +545,7 @@ fn hoist_from_loop(
                 let Some(r) = inst.result else { continue };
                 let how = match &inst.op {
                     Op::Load(p, ty) => load_hoist(alias, *p, ty, blk, mem, spec),
-                    op => safe_to_hoist(op).then_some(Hoist::Plain),
+                    op => safe_to_hoist(op, mem).then_some(Hoist::Plain),
                 };
                 let Some(how) = how else { continue };
                 let mut invariant = true;

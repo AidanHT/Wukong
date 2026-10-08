@@ -15,8 +15,6 @@
 //!
 //! Folding and merging can make blocks unreachable, so pruning always runs last.
 
-use crate::fxhash::FxHashMap;
-
 use wukong_mir::{Function, Op, Terminator, ValueId};
 
 use crate::{cfg, map_op_uses, map_term_uses, CfgAnalyses, Pass};
@@ -48,13 +46,17 @@ impl Pass for SimplifyCfg {
     }
 }
 
-/// Map every value id that names an integer constant to its value.
-fn const_ints(f: &Function) -> FxHashMap<u32, i128> {
-    let mut m = FxHashMap::default();
+/// `ValueId -> integer constant`, dense over the value arena (the same layout `dce` uses): a
+/// branch condition is looked up once per `cond_br`, and a hash map over a dense `u32` keyspace
+/// only added hashing and growth to that.
+fn const_ints(f: &Function) -> Vec<Option<i128>> {
+    let mut m = vec![None; f.value_types.len()];
     for b in &f.blocks {
         for inst in &b.insts {
             if let (Some(r), Op::ConstInt(n, _)) = (inst.result, &inst.op) {
-                m.insert(r.0, *n);
+                if let Some(slot) = m.get_mut(r.0 as usize) {
+                    *slot = Some(*n);
+                }
             }
         }
     }
@@ -84,8 +86,8 @@ fn fold_constant_branches(f: &mut Function) -> bool {
         {
             // Same destination and arguments on both arms: unconditional.
             let identical = then_blk == else_blk && then_args == else_args;
-            let folded = match consts.get(&cond.0) {
-                Some(&n) => Some(if n != 0 {
+            let folded = match consts.get(cond.0 as usize).copied().flatten() {
+                Some(n) => Some(if n != 0 {
                     (*then_blk, then_args.clone())
                 } else {
                     (*else_blk, else_args.clone())
@@ -102,53 +104,199 @@ fn fold_constant_branches(f: &mut Function) -> bool {
     changed
 }
 
+/// The block `A` (index `ai`) can absorb, if any: the target `B` of its unconditional branch, when
+/// `B` is a different block whose only predecessor is `A`.
+fn merge_target(f: &Function, preds: &[Vec<u32>], ai: usize) -> Option<usize> {
+    let Terminator::Br { target, .. } = &f.blocks[ai].term else {
+        return None;
+    };
+    let bi = target.0 as usize;
+    (bi != ai && preds[bi].len() == 1 && preds[bi][0] == ai as u32).then_some(bi)
+}
+
 /// Fuse a block `A` that ends in `br B` into `B` whenever `A` is `B`'s only predecessor. `B`'s
 /// parameters take the values `A` passed, so they are substituted away; `B`'s instructions and
 /// terminator move into `A`, and the now-orphaned `B` is left for the pruner (`run_function`'s).
 ///
-/// Predecessors come from the cache: valid on entry (the caller invalidated after folding), and
-/// invalidated here after every merge, so they are rebuilt exactly once per merge and — the steady
-/// state — not at all when there is nothing to merge.
+/// One linear worklist sweep. Predecessors are read once and then maintained incrementally — a
+/// merge changes only `A`'s successor set (it becomes `B`'s) and orphans `B`, both of which are
+/// local updates — and each head absorbs its whole straight-line chain before the scan moves on.
+/// Every maximal chain collapses into its head whatever order the merges happen in, and the
+/// parameter substitutions compose, so the result is the one the old restart-from-block-zero loop
+/// produced; that loop rebuilt every predecessor list (one heap `Vec` per block) after each merge,
+/// O(merges x blocks) on exactly the long chains mem2reg and branch folding leave behind. The
+/// steady state, where nothing merges, reads the cached predecessors and allocates nothing.
 fn merge_straight_line(f: &mut Function, cache: &mut CfgAnalyses) -> bool {
+    let n = f.blocks.len();
+    let mut preds: Vec<Vec<u32>> = {
+        let cached = cache.predecessors(f);
+        if !(0..n).any(|ai| merge_target(f, cached, ai).is_some()) {
+            return false;
+        }
+        cached.to_vec()
+    };
+    // `B`-parameter -> the argument `A` passed for it, resolved through chains at the end. Sized
+    // lazily: most merged blocks carry no parameters.
+    let mut subst: Vec<Option<ValueId>> = Vec::new();
     let mut changed = false;
-    loop {
-        let preds = cache.predecessors(f);
-        let mut pair = None;
-        for (ai, b) in f.blocks.iter().enumerate() {
-            if let Terminator::Br { target, .. } = &b.term {
-                let bi = target.0 as usize;
-                // `B` must be a different block whose sole predecessor is `A`.
-                if bi != ai && preds[bi].len() == 1 && preds[bi][0] == ai as u32 {
-                    pair = Some((ai, bi));
-                    break;
+    for ai in 0..n {
+        while let Some(bi) = merge_target(f, &preds, ai) {
+            let args = match &f.blocks[ai].term {
+                Terminator::Br { args, .. } => args.clone(),
+                _ => unreachable!("merge_target only selects a block ending in br"),
+            };
+            let bparams = std::mem::take(&mut f.blocks[bi].params);
+            if !bparams.is_empty() && subst.is_empty() {
+                subst = vec![None; f.value_types.len()];
+            }
+            for (p, a) in bparams.iter().zip(&args) {
+                if let Some(slot) = subst.get_mut(p.0 as usize) {
+                    *slot = Some(*a);
                 }
             }
-        }
-        let Some((ai, bi)) = pair else { break };
-
-        let args = match &f.blocks[ai].term {
-            Terminator::Br { args, .. } => args.clone(),
-            _ => unreachable!("selected block ends in br"),
-        };
-        let bparams = std::mem::take(&mut f.blocks[bi].params);
-        // B's parameters are exactly the values A handed it.
-        let subst: FxHashMap<u32, ValueId> =
-            bparams.iter().zip(&args).map(|(p, a)| (p.0, *a)).collect();
-        if !subst.is_empty() {
-            for blk in &mut f.blocks {
-                for inst in &mut blk.insts {
-                    map_op_uses(&mut inst.op, |v| *subst.get(&v.0).unwrap_or(&v));
+            let b_insts = std::mem::take(&mut f.blocks[bi].insts);
+            let b_term = std::mem::replace(&mut f.blocks[bi].term, Terminator::Unreachable);
+            // `B`'s successors now see `A` in its place. `A` reached nothing but `B`, so this can
+            // never list `A` twice.
+            for s in cfg::successors(&b_term) {
+                for p in &mut preds[s.0 as usize] {
+                    if *p == bi as u32 {
+                        *p = ai as u32;
+                    }
                 }
-                map_term_uses(&mut blk.term, |v| *subst.get(&v.0).unwrap_or(&v));
             }
+            preds[bi].clear();
+            f.blocks[ai].insts.extend(b_insts);
+            f.blocks[ai].term = b_term;
+            changed = true;
         }
-
-        let b_insts = std::mem::take(&mut f.blocks[bi].insts);
-        let b_term = std::mem::replace(&mut f.blocks[bi].term, Terminator::Unreachable);
-        f.blocks[ai].insts.extend(b_insts);
-        f.blocks[ai].term = b_term;
-        cache.invalidate(); // `A`'s successors are now `B`'s, and `B` is orphaned
-        changed = true;
     }
-    changed
+    if !changed {
+        return false;
+    }
+    if !subst.is_empty() {
+        // In reachable code the chains are acyclic (each argument dominates the block it is passed
+        // into); the step bound only keeps a cycle among unreachable blocks — which the pruner
+        // deletes next — from spinning.
+        let limit = subst.len();
+        let resolve = |v: ValueId| {
+            let mut cur = v;
+            for _ in 0..limit {
+                match subst.get(cur.0 as usize).copied().flatten() {
+                    Some(next) if next != cur => cur = next,
+                    _ => break,
+                }
+            }
+            cur
+        };
+        for blk in &mut f.blocks {
+            for inst in &mut blk.insts {
+                map_op_uses(&mut inst.op, resolve);
+            }
+            map_term_uses(&mut blk.term, resolve);
+        }
+    }
+    cache.invalidate(); // merged blocks' successors moved and the absorbed blocks are orphaned
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wukong_mir::{BinOp, BlockId, Builder, MirType, Program};
+    use wukong_span::Interner;
+
+    /// `chain(x)`: the entry branches to the *last-numbered* block and every link branches to the
+    /// block numbered one below it, so each link's only predecessor sits *after* it in layout order.
+    /// Even links add one; odd links pass their parameter straight through, so a substitution can
+    /// name a parameter that is itself substituted by a later merge. One run must collapse the whole
+    /// chain into the entry and compose those substitutions back into the original arithmetic.
+    fn reverse_chain(it: &mut Interner, links: usize) -> Function {
+        let mut b = Builder::new(it.intern("chain"), MirType::I64);
+        let x = b.add_param(MirType::I64);
+        let one = b.build(MirType::I64, Op::ConstInt(1, MirType::I64));
+        let blocks: Vec<BlockId> = (0..links).map(|_| b.new_block()).collect();
+        let params: Vec<ValueId> = blocks
+            .iter()
+            .map(|&blk| b.block_param(blk, MirType::I64))
+            .collect();
+        b.br(blocks[links - 1], vec![x]);
+        for (k, (&blk, &p)) in blocks.iter().zip(&params).enumerate().rev() {
+            b.switch_to(blk);
+            let next = if k % 2 == 0 {
+                b.build(MirType::I64, Op::Bin(BinOp::Add, p, one))
+            } else {
+                p
+            };
+            if k == 0 {
+                b.ret(Some(next));
+            } else {
+                b.br(blocks[k - 1], vec![next]);
+            }
+        }
+        b.finish()
+    }
+
+    #[test]
+    fn a_reverse_laid_out_parameter_chain_collapses_in_one_run() {
+        let mut it = Interner::new();
+        let links = 64;
+        let mut f = reverse_chain(&mut it, links);
+        let mut cache = CfgAnalyses::default();
+        assert!(SimplifyCfg.run_function(&mut f, &mut cache));
+        assert_eq!(
+            f.blocks.len(),
+            1,
+            "{}",
+            wukong_mir::print::print_function(&f, &it)
+        );
+        assert!(f.blocks[0].params == f.params && f.blocks[0].params.len() == 1);
+        // Nothing left to merge: the steady state reports no change.
+        assert!(!SimplifyCfg.run_function(&mut f, &mut cache));
+
+        // chain(5) = 5 + one add per even link.
+        let chain = f.name;
+        let mut main = Builder::new(it.intern("main"), MirType::I64);
+        let five = main.build(MirType::I64, Op::ConstInt(5, MirType::I64));
+        let r = main.build(
+            MirType::I64,
+            Op::Call {
+                func: chain,
+                args: vec![five],
+            },
+        );
+        main.ret(Some(r));
+        let mut p = Program::new();
+        p.funcs = vec![f, main.finish()];
+        assert!(wukong_mir::verify::verify_program(&p).is_empty());
+        let main = it.intern("main");
+        assert_eq!(
+            wukong_interp::run(&p, main, &it).unwrap(),
+            5 + links as i64 / 2
+        );
+    }
+
+    /// A diamond has nothing to merge, and the merge scan must say so without touching the CFG.
+    #[test]
+    fn a_diamond_has_nothing_to_merge() {
+        let mut it = Interner::new();
+        let mut b = Builder::new(it.intern("d"), MirType::I64);
+        let c = b.add_param(MirType::I1);
+        let t = b.new_block();
+        let e = b.new_block();
+        let j = b.new_block();
+        let v = b.block_param(j, MirType::I64);
+        b.cond_br(c, t, vec![], e, vec![]);
+        b.switch_to(t);
+        let one = b.build(MirType::I64, Op::ConstInt(1, MirType::I64));
+        b.br(j, vec![one]);
+        b.switch_to(e);
+        let two = b.build(MirType::I64, Op::ConstInt(2, MirType::I64));
+        b.br(j, vec![two]);
+        b.switch_to(j);
+        b.ret(Some(v));
+        let mut f = b.finish();
+        assert!(!SimplifyCfg.run_function(&mut f, &mut CfgAnalyses::default()));
+        assert_eq!(f.blocks.len(), 4);
+    }
 }

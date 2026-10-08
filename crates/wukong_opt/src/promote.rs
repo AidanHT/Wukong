@@ -196,7 +196,7 @@ fn plan_loop(
     {
         return None; // an exit block also reached from outside the loop
     }
-    let mem = LoopMem::of(f, &body);
+    let mem = LoopMem::of(f, &body, None);
     if mem.has_barrier {
         return None;
     }

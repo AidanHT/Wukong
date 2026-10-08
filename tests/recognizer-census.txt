@@ -310,6 +310,7 @@ rowarg_elem_nonf32.wk:
 rowargmax.wk: wukong_rowargmax_i32 wukong_rowargmin_i32
 rowloss_elem_f64.wk:
 saxpy.wk: wukong_velem_f32
+scalar_gvn_unroll.wk: wukong_rt_alloc wukong_rt_free
 scaled_gemm.wk: wukong_sgemm_nt_alpha
 scaled_gemm_batched.wk: wukong_sgemm_nt_alpha
 scaled_gemm_parallel.wk: wukong_sgemm_nt_alpha_parallel
