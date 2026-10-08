@@ -476,6 +476,12 @@ impl Sema<'_> {
         let Some(root) = self.assign_root_param(out) else {
             return;
         };
+        // A tensor local that views a non-`mut` parameter (`let r = a[i]; softmax(x, r)`) writes
+        // the caller's buffer just like `a[i]` itself would.
+        if let Some(param) = self.tensor_view_root(root) {
+            self.report_write_through_view(out.span, root, param);
+            return;
+        }
         if self.is_immutable_param(root) && self.param_is_aggregate(root) {
             let nm = self.sym_str(root).to_string();
             self.error(
