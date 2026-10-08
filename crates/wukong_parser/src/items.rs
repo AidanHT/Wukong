@@ -397,7 +397,7 @@ impl Parser<'_> {
                     "E0208",
                     format!(
                         "expected a method signature (`fn …;`) in a trait, found {}",
-                        self.kind().describe()
+                        self.found()
                     ),
                 );
                 self.recover_member();
@@ -439,7 +439,7 @@ impl Parser<'_> {
                     "E0208",
                     format!(
                         "expected a method (`fn`) in an `impl` block, found {}",
-                        self.kind().describe()
+                        self.found()
                     ),
                 );
                 self.recover_member();

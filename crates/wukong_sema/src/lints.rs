@@ -221,7 +221,13 @@ pub fn run(
                     }
                 }
             }
-            ItemKind::Struct(_) | ItemKind::Import(_) | ItemKind::Extern(_) => {}
+            // A trait declares signatures only; an `impl` block's methods are separate `Fn` items
+            // (`Type.method`) the parser flattened out of it, linted above like any function.
+            ItemKind::Struct(_)
+            | ItemKind::Import(_)
+            | ItemKind::Extern(_)
+            | ItemKind::Trait(_)
+            | ItemKind::Impl(_) => {}
         }
     }
     dead_code(module, interner, opts, &refs, &const_refs, &mut diags);
@@ -860,6 +866,24 @@ impl<'a> FnLint<'a> {
                 generic_args,
                 args,
             } => {
+                // A method call (`x.m()`, `Type::m()`) names its function only through sema's
+                // resolution, so record that function as used for `dead_code`. A call through a
+                // trait bound has no single target: every implementation of the method stays live.
+                let sema = self.sema;
+                if let Some(mc) = sema.methods.calls.get(&e.id) {
+                    match mc.target {
+                        Some(t) => {
+                            self.globals.insert(t);
+                        }
+                        None => {
+                            for ((_, m), f) in &sema.methods.table {
+                                if *m == mc.method {
+                                    self.globals.insert(*f);
+                                }
+                            }
+                        }
+                    }
+                }
                 self.expr(callee);
                 for g in generic_args {
                     self.type_expr(g);
@@ -991,16 +1015,34 @@ impl<'a> FnLint<'a> {
             TypeKind::Tensor { elem, dims, .. } => {
                 self.type_expr(elem);
                 for d in dims {
-                    if let DimKind::Named(sym) = d.kind {
-                        match self.lookup(sym) {
-                            Some(i) => self.bindings[i].reads += 1,
-                            None => {
-                                self.globals.insert(sym);
-                            }
-                        }
-                    }
+                    self.dim(d);
                 }
             }
+            TypeKind::Fn { params, ret } => {
+                for p in params {
+                    self.type_expr(p);
+                }
+                if let Some(r) = ret {
+                    self.type_expr(r);
+                }
+            }
+        }
+    }
+
+    /// The names in one tensor dimension, including every operand of a derived extent (`3*D`).
+    fn dim(&mut self, d: &wukong_ast::Dim) {
+        match &d.kind {
+            DimKind::Named(sym) => match self.lookup(*sym) {
+                Some(i) => self.bindings[i].reads += 1,
+                None => {
+                    self.globals.insert(*sym);
+                }
+            },
+            DimKind::Binary { lhs, rhs, .. } => {
+                self.dim(lhs);
+                self.dim(rhs);
+            }
+            DimKind::Int(_) | DimKind::Dynamic => {}
         }
     }
 
@@ -1051,7 +1093,8 @@ impl<'a> FnLint<'a> {
             | TypeKind::Int(_)
             | TypeKind::Unit
             | TypeKind::Ref { .. }
-            | TypeKind::Vector { .. } => false,
+            | TypeKind::Vector { .. }
+            | TypeKind::Fn { .. } => false,
         }
     }
 
@@ -1133,7 +1176,9 @@ impl<'a> FnLint<'a> {
     fn finish(&mut self) {
         for b in &self.bindings {
             let name = self.interner.resolve(b.name);
-            if name.starts_with('_') {
+            // A method's receiver is part of its signature (a trait may require it), not a choice
+            // the body can drop.
+            if name.starts_with('_') || (name == "self" && b.kind == BindKind::Param) {
                 continue;
             }
             let what = match b.kind {
@@ -1211,6 +1256,17 @@ fn dead_code(
     if opts.library || !has_main || fns.len() != refs.len() {
         return;
     }
+    // A method of an `impl Trait for Type` block is required by the trait whether or not anything
+    // calls it, so it is a root like an exported function.
+    let trait_methods: HashSet<Symbol> = module
+        .items
+        .iter()
+        .filter_map(|it| match &it.kind {
+            ItemKind::Impl(imp) if imp.trait_ref.is_some() => Some(imp),
+            _ => None,
+        })
+        .flat_map(|imp| imp.methods.iter().map(|m| m.fn_name))
+        .collect();
     let mut live: HashSet<Symbol> = HashSet::default();
     let mut work: Vec<usize> = Vec::new();
     for (i, (f, it)) in fns.iter().enumerate() {
@@ -1223,7 +1279,8 @@ fn dead_code(
             || f.is_pub
             || exported
             || opts.roots.iter().any(|r| r == name)
-            || const_refs.contains(&f.name.sym);
+            || const_refs.contains(&f.name.sym)
+            || trait_methods.contains(&f.name.sym);
         if root && live.insert(f.name.sym) {
             work.push(i);
         }
