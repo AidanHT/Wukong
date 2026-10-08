@@ -107,6 +107,7 @@ decode_gemv_half_loop.wk: wukong_sgemv_bf16 wukong_sgemv_f16
 decode_gemv_quant.wk: wukong_gemv_q4_0_f32 wukong_gemv_q8_0_f32 wukong_quantize_q4_0_f32 wukong_quantize_q8_0_f32
 decode_kv_attention.wk: wukong_attention_kv_f32 wukong_attention_kv_f32*2 wukong_kv_append_f32 wukong_kv_append_f32*2
 decode_shape_trap.wk: wukong_kv_append_f32 wukong_kv_append_f32*2
+decode_tiny_lm.wk: wukong_attention_kv_f32 wukong_gemv_q8_0_f32 wukong_kv_append_f32 wukong_kv_append_f32*2 wukong_quantize_q8_0_f32 wukong_sgemv_bf16 wukong_sgemv_bf16*3
 defer_scope_exit.wk: wukong_rt_alloc wukong_rt_free
 dequant.wk: wukong_dequant_f32 wukong_dequant_f32*2
 dequant_perchan.wk: wukong_dequant_perchan_f32 wukong_dequant_perchan_f32*2

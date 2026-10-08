@@ -1184,6 +1184,8 @@ array or a contiguous `Tensor[T, …]`. Each returns `()`.
   kept as exact `f32`), each block's integer dot is exact, and the row accumulates
   `(d_w·d_x)·Σ w_q·x_q` in block order (`tests/run/decode_gemv_quant.wk`). The result is therefore a
   quantized approximation of `W·x` — the activation's rounding is part of the definition.
+- Together they make a decode loop: `tests/run/decode_tiny_lm.wk` generates six tokens greedily with
+  bf16 projections, `kv_append` into growing caches, GQA `sdpa_kv` and a `Q8_0` LM head.
 - Every result is bit-identical on the interpreter and natively, and between each kernel's AVX2 path
   and its portable twin. Inside a `@parallel` function the multicore twins run (bit-identical).
   An output that overlaps an input is computed from the inputs as they were before the call.

@@ -1172,8 +1172,10 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   name; the K-quant family
   (`Q4_K`, `Q6_K`) and a quantized KV cache are not implemented; `sdpa_kv` has no padding mask or
   per-sequence batch dimension, takes the output's stride from the query's, and has no backward
-  kernel (autodiff refuses it). The multi-token GPT-2 decode example over real weights is still to be
-  written. None of the decode kernels is measured yet.
+  kernel (autodiff refuses it). A whole greedy decode loop runs as a gated toy model
+  (`tests/run/decode_tiny_lm.wk`: bf16 projections, a growing KV cache, GQA attention, a Q8_0 LM head,
+  six tokens checked against an f64 reference); the multi-token GPT-2 example over real weights is
+  still to be written. None of the decode kernels is measured yet.
 - **ML I/O and randomness gaps.** No memory-mapped load yet (`map_<T>`: every checkpoint load copies
   once, straight into the destination) and no GGUF reader (the `Q8_0` / `Q4_0` block layouts exist as
   the decode builtins' packers and GEMVs, and a raw block blob loads with `read_u8`); `.npy` reads
