@@ -21621,7 +21621,17 @@ impl FnLowerer<'_> {
                 };
                 let l = self.coerce_to(l, &lty, &ty, self.signed(lhs));
                 let r = self.coerce_to(r, &rty, &ty, self.signed(rhs));
-                let bin = arith_binop(op, ty.is_float(), self.signed(lhs));
+                // `/` and `%` divide in the RESULT type, whose signedness sema settled (E0440 admits
+                // only promotions in which that type holds both operands): `u32 / i64` is a signed
+                // 64-bit divide. Reading the left operand's own signedness made it UNSIGNED, so
+                // `7 / -2` was 0 on both backends. A shift keeps its shiftee's signedness — the
+                // amount is a count, not an operand of the promotion.
+                let signed = if matches!(op, Div | Rem) {
+                    self.signed(e)
+                } else {
+                    self.signed(lhs)
+                };
+                let bin = arith_binop(op, ty.is_float(), signed);
                 let v = self.builder.build(ty.clone(), Op::Bin(bin, l, r));
                 // A bf16/f16-typed result must round to its grid at the value (see
                 // `round_half_result`) — not only in a store mem2reg may delete.

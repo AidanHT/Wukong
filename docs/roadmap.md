@@ -1308,6 +1308,13 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   wrong result — write `a < b && b < c` (`tests/fail/chained_comparison.wk`). Equality `==`/`!=`
   between a `bool` and a non-bool scalar is likewise rejected, so the `==`/`!=` chain `5 == 3 == 0` is
   caught too (`tests/fail/chained_equality.wk`).
+- **Mixed-type arithmetic** promotes only losslessly and order-independently (same-signedness
+  widening, unsigned to a strictly wider signed type, `f16`/`bf16` to `f32` to `f64`, an integer to a
+  float that holds it exactly, a never-negative `for` counter or `const` to an unsigned type); every
+  other mix is `E0440`, and `/`/`%` divide with the common type's signedness, so `u32 / i64` is a
+  signed divide (`tests/run/mixed_width_div_signedness.wk`). Not yet: `min`/`max`/`fmax`-style
+  intrinsics still pick their operands' common type by width (`wukong_sema::shape`), and `if`/`match`
+  arms of different scalar types still merge to the left arm's type on a width tie.
 - Tensor shape checking is **sound for both concrete and generic shapes**. A function's own generic
   dimension variables are **rigid** inside its body: when two shapes that both carry the function's
   generics are checked — its declared-vs-returned shape, an elementwise operator's operands, an

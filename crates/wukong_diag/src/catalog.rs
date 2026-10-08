@@ -445,6 +445,27 @@ static CATALOG: &[Explanation] = &[
          the function directly at each call instead."
     ),
     entry!(
+        "E0440",
+        "mixed-type arithmetic with no lossless common type",
+        "An arithmetic or bitwise operator combines two values of different scalar types, and no \
+         type holds every value of both: `i32` with `u32` (or any signed with an unsigned type at \
+         least as wide), an integer with a float that cannot represent all of it exactly (`i32` \
+         with `f32`, `i64` with `f64`), `f16` with `bf16`, or `char` with any other type. Such an \
+         operation used to pick a type by width and then by operand ORDER, so `a / b` and `b / a` \
+         could compute in different types and `u32 / i64` divided UNSIGNED (`7 / -2 == 0`). \
+         Implicit promotion now only widens, and in either order: integers of one signedness to the \
+         wider one, an unsigned integer to a strictly wider signed one (`u32 + i64` is `i64`), \
+         `f16`/`bf16` to `f32` to `f64`, and an integer to a float that holds it exactly (8- and \
+         16-bit integers to `f32`, up to 32-bit integers to `f64`). A signed value known never to \
+         be negative — a `for` counter that starts at a non-negative literal and is never \
+         assigned, or a non-negative `const` — also converts to an unsigned type at least as wide, \
+         so `i * n` with `n: usize` stays legal. An unsuffixed literal adapts to the other operand \
+         and never needs a cast; `<<`/`>>` take any integer amount. Convert an operand with `as` \
+         to the type the result should have.",
+        bad: "module ex.e0440\nfn ratio(a: u32, b: i32) -> i32 {\n    return a / b;\n}\nfn main() -> i32 {\n    return ratio(7, -2);\n}\n",
+        good: "module ex.e0440\nfn ratio(a: u32, b: i32) -> i64 {\n    return (a as i64) / (b as i64);\n}\nfn main() -> i32 {\n    return ratio(7, -2) as i32;\n}\n"
+    ),
+    entry!(
         "E0501",
         "rank, extent or arity mismatch",
         "Two tensors were required to have the same number of dimensions (rank) but did not. For \

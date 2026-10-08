@@ -1,0 +1,15 @@
+// EXPECT-CODE: E0440
+module tests.fail.int_float_arith
+
+// An `i64` operand mixed with an `f32` one used to convert silently to `f32`, which holds integers
+// exactly only up to 2^24: `16777217 * 1.0` came out as 16777216. Promotion now only goes where
+// every value survives (an 8- or 16-bit integer to `f32`, up to 32 bits to `f64`); anything else
+// needs an explicit `as`.
+fn scale(n: i64, x: f32) -> f32 {
+    return x * n;
+}
+
+fn main() -> i32 {
+    print(scale(16777217, 1.0) as i64);
+    return 0;
+}

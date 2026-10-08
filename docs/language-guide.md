@@ -277,6 +277,22 @@ it is an `E0401` that names the fix (`a < b && b < c`); the equality form `a == 
 same way whenever the third operand is not itself a `bool` (an all-`bool` chain still parses as
 `(a == b) == c`). Compound assignment (`+=`, `*=`, `<<=`, `>>=`, …) is supported.
 
+**Mixed-type arithmetic** (✅) promotes only where nothing is lost and the operand order cannot
+matter: two integers of one signedness compute in the wider (`i32 + i64` is `i64`); an unsigned
+integer and a *strictly wider* signed one compute in the signed type (`u32 + i64` is `i64`, so
+`u32 / i64` is a signed divide: `7 / -2 == -3`); `f16`/`bf16` widen to `f32` and `f32` to `f64`;
+an integer meets a float only when the float holds every value of it exactly (8- and 16-bit
+integers with `f32`, up to 32-bit integers with `f64`). A signed value known never to be negative —
+a `for` counter that starts at a non-negative literal and is never assigned, or a non-negative
+`const` — also converts to an unsigned type at least as wide, so `for i in 0..m { … i * n … }` with
+`n: usize` needs no cast. Every other mix — `i32` with `u32`, `i64` with `f32`, `f16` with `bf16`,
+`char` with an integer — is `E0440`; write the `as` that says which type you mean. An unsuffixed
+literal operand adapts to the other operand and never needs a cast (`x * 2`, `2.0 * x`), and with
+an equally wide typed operand it takes that operand's type on either side (`1 + x` is `u32` for
+`x: u32`). `/` and `%` divide with the signedness of that common type. A shift amount is a count
+and may be any integer type (`tests/run/mixed_width_div_signedness.wk`,
+`tests/fail/mixed_sign_arith.wk`, `tests/fail/int_float_arith.wk`).
+
 Integer arithmetic wraps at the declared width. Division and remainder by zero return zero;
 signed minimum divided by `-1` wraps to signed minimum, with remainder zero. Shift counts are
 masked to the operand width: `1i32 << 32` is `1`, and `1i32 << 33` is `2`. Right shift fills

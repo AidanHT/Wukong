@@ -1,0 +1,47 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT-VALUES: -3 0 1 -2
+// EXPECT-OUT-VALUES: -66 2 0 -3
+// EXPECT-OUT-VALUES: 150 3000000001 3000000001
+module tests.run.mixed_width_div_signedness
+
+// Arithmetic on two different scalar types computes in their lossless common type, in either
+// operand order, and `/` and `%` divide with THAT type's signedness.
+//
+// `u32 / i64`: the `u32` fits in `i64`, so the divide is a signed 64-bit one — 7 / -2 = -3
+// (truncating toward zero) and 7 % -2 = 7 - (-3)(-2) = 1. The divide used to take its signedness
+// from the left operand's own type, making it an UNSIGNED 64-bit divide: 7 / 0xFFFFFFFFFFFFFFFE = 0
+// and 7 % that = 7, identically on both backends. With the `i64` on the left it was already
+// signed: -2 / 7 = 0, -2 % 7 = -2.
+//
+// `u8 / i32` likewise: 200 / -3 = -66 and 200 % -3 = 200 - (-66)(-3) = 2 (it was an unsigned
+// divide by 0xFFFFFFFD: 0 and 200); -3 / 200 = 0 and -3 % 200 = -3.
+//
+// `i16 * f32` promotes to `f32` (every `i16` is exact there): 300 * 0.5 = 150. And a literal on
+// the LEFT of a same-width typed operand now takes that operand's type, as on the right: with
+// `x: u32 = 3000000000`, `1 + x` is the `u32` 3000000001 (it was an `i32`, printed -1294967295).
+
+fn main() -> i32 {
+    let a: u32 = 7;
+    let b: i64 = -2;
+    print(a / b);
+    print(b / a);
+    print(a % b);
+    print(b % a);
+
+    let c: u8 = 200;
+    let d: i32 = -3;
+    print(c / d);
+    print(c % d);
+    print(d / c);
+    print(d % c);
+
+    let h: i16 = 300;
+    let f: f32 = 0.5;
+    print((h * f) as i32);
+
+    let x: u32 = 3000000000;
+    print(1 + x);
+    print(x + 1);
+    return 0;
+}

@@ -13,6 +13,11 @@ All notable changes to Wukong are documented here. The format is loosely based o
   counts as covering all of `Add`, `match (p, q)` is checked, and a full `0..=255` on a `u8` is no
   longer a false `E0405`. New warning `W0020` (`unreachable_patterns`) for an arm an earlier
   unguarded arm already covers.
+- **Mixed-type arithmetic** promotes only losslessly and in either operand order; any other mix
+  (`i32` with `u32`, `i64` with `f32`, `f16` with `bf16`, `char` with an integer) is the new
+  `E0440`. `/` and `%` divide with the promoted type's signedness, so `u32 / i64` is a signed
+  divide (`7 / -2` was `0`), and a literal on the left of an equally wide typed operand takes that
+  operand's type (`1 + x` is `u32` for `x: u32`, as `x + 1` was).
 
 ### Optimizer memory passes: SROA, path DSE, loop deletion, guarded LICM, scalar promotion (`gap/opt-memory`)
 

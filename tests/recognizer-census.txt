@@ -282,6 +282,7 @@ min_max_builtin.wk:
 mish.wk: wukong_vmath_f32
 mixed_sign_compare_highbit.wk:
 mixed_sign_compare_ok.wk:
+mixed_width_div_signedness.wk:
 mono_name_collision.wk:
 multi_head_attention.wk: wukong_sgemm wukong_sgemm_nt
 mut_param.wk:

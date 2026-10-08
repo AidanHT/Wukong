@@ -33,6 +33,7 @@ mod dependency;
 mod layout;
 mod methods;
 mod noalias;
+mod promote;
 mod shape;
 mod tensor;
 mod usefulness;
@@ -411,6 +412,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         pending_dims: Vec::new(),
         call_dims: HashMap::default(),
         tensor_views: Vec::new(),
+        local_facts: Vec::new(),
         builtin_calls: HashMap::default(),
         methods: methods::MethodState::default(),
     };
@@ -511,6 +513,10 @@ struct Sema<'a> {
     /// E0304 rule (`tensor::note_tensor_view`). Reset with the other per-scope stacks in
     /// `push_scope`/`pop_scope`/`check_fn`/`check_const`.
     tensor_views: Vec<HashMap<Symbol, Symbol>>,
+    /// Per-scope map, kept 1:1 with `scopes`: what is known about a local beyond its type (see
+    /// [`LocalFact`]). Cleared for a name whenever it is re-bound in a scope, so a fact never outlives
+    /// the binding it describes.
+    local_facts: Vec<HashMap<Symbol, LocalFact>>,
     /// The resolved named-kernel-builtin calls, published as [`SemaResult::builtin_calls`].
     builtin_calls: HashMap<NodeId, BuiltinCall>,
     /// Methods, traits and function-typed parameters (`methods.rs`).
@@ -529,6 +535,15 @@ struct LoopCtx {
     /// loop's inferred type is this (or unit if it stays `None`). Tensor/vector shapes are unified
     /// across breaks exactly like `if`/`match` arms.
     break_ty: Option<Ty>,
+}
+
+/// One entry of [`Sema::local_facts`]: something known about a local beyond its type.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LocalFact {
+    /// A `for` counter over a range that starts at a non-negative literal and steps up, never
+    /// assigned in the loop body: its value is never negative, so it converts losslessly to an
+    /// unsigned type at least as wide (`i * N` with a `usize` dimension `N`; `promote.rs`).
+    NonNegCounter,
 }
 
 impl<'a> Sema<'a> {
@@ -1654,6 +1669,8 @@ impl<'a> Sema<'a> {
         self.immutable_params.push(HashSet::default());
         self.tensor_views.clear();
         self.tensor_views.push(HashMap::default());
+        self.local_facts.clear();
+        self.local_facts.push(HashMap::default());
         self.param_tys.clear();
         let ann = self.lower_type(&c.ty);
         let vty = self.type_expr(&c.value);
@@ -1696,6 +1713,8 @@ impl<'a> Sema<'a> {
         self.immutable_params.push(HashSet::default());
         self.tensor_views.clear();
         self.tensor_views.push(HashMap::default());
+        self.local_facts.clear();
+        self.local_facts.push(HashMap::default());
         self.param_tys.clear();
         // Two parameters may not share a name: the second would silently shadow the first in the
         // body scope (a `fn f(a: i32, a: i64)` ran, with `a` resolving to the second), which is a
@@ -2327,6 +2346,7 @@ impl<'a> Sema<'a> {
         self.immutable_locals.push(HashSet::default());
         self.immutable_params.push(HashSet::default());
         self.tensor_views.push(HashMap::default());
+        self.local_facts.push(HashMap::default());
     }
 
     fn pop_scope(&mut self) {
@@ -2334,6 +2354,15 @@ impl<'a> Sema<'a> {
         self.immutable_locals.pop();
         self.immutable_params.pop();
         self.tensor_views.pop();
+        self.local_facts.pop();
+    }
+
+    /// The [`LocalFact`] of the binding `name` resolves to (innermost scope first), if any.
+    fn local_fact(&self, name: Symbol) -> Option<LocalFact> {
+        let i = (0..self.scopes.len())
+            .rev()
+            .find(|&i| self.scopes[i].contains_key(&name))?;
+        self.local_facts.get(i)?.get(&name).copied()
     }
 
     /// Whether `name` resolves (innermost scope first) to a local bound immutably. A `mut` binding,
@@ -2403,6 +2432,10 @@ impl<'a> Sema<'a> {
     fn bind(&mut self, name: Symbol, ty: Ty) {
         if let Some(scope) = self.scopes.last_mut() {
             scope.insert(name, ty);
+        }
+        // A new binding starts with no facts; the binder that knows one records it afterwards.
+        if let Some(facts) = self.local_facts.last_mut() {
+            facts.remove(&name);
         }
     }
 
@@ -2895,6 +2928,7 @@ impl<'a> Sema<'a> {
                 let elem = self.type_for_iter(iter);
                 self.push_scope();
                 self.bind_pattern(pat, &elem);
+                self.note_nonneg_counter(pat, iter, body);
                 if let ForIter::Expr(it) = iter {
                     self.note_tensor_view(pat, &elem, Some(it));
                 }
@@ -3906,6 +3940,11 @@ impl<'a> Sema<'a> {
                             && self.is_generic_ty(&l)
                         {
                             l
+                        } else if let Some(t) = self.arith_promotion(*op, lhs, rhs, &l, &r, e.span)
+                        {
+                            // Two different scalars: the lossless common type, or E0440
+                            // (`promote.rs`).
+                            t
                         } else {
                             join(l, r)
                         }
