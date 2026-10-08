@@ -923,11 +923,19 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   kernel computes what the source computes. Declined on purpose, and therefore still the 128-bit
   generic loop: HuggingFace's literal `0.044715 * v * v * v` GELU and the erf GELU (no kernel computes
   them bit-for-bit — a new `vmath` opcode would); `out[j] = out[j] + x*x` (the source contracts it to
-  one FMA, the `colsumsq` kernel squares and adds — write `+=`); a tiled matmul whose tiles do not
-  divide a literal extent exactly, including the `min(i0 + T, M)` tail spelling (`min` on integers is
-  itself not lowered); a value binding read by a second store, and a float product bound to a
+  one FMA, the `colsumsq` kernel squares and adds — write `+=`); among tilings (2026-10-08: ragged
+  `min(i0 + T, M)` tails, counted `let i0 = it * T` tiles, runtime extents and tiled contractions now
+  dispatch), a counted tile whose point loop is a full `i0..i0 + T` (it names no extent), a tile width
+  that is not a literal or a `const` (a function-local `const` counts only when declared in the same
+  block as the tiled loop), a contraction tiled around a ZERO-seeded scalar (it overwrites `C` with
+  the last tile's partial sum — not a GEMM), and `examples/matmul.wk` itself, whose inner kernel is
+  written in explicit `f32x8` intrinsics that lowering does not handle yet; a value binding read by a
+  second store, and a float product bound to a
   name (inlining it beside a `+` would contract it into an FMA the `let` rounded away); and a
-  reduction over a `usize` counter. The value view and the row-outer/out-of-place windows are flat
+  plain float fold with no kernel over a `usize` counter (the generic vectorizer would reassociate a
+  sum that folds in source order today; argmax/argmin and the low-precision reduction kernels do
+  dispatch over a `usize` counter, behind the same run-time test as the maps). The value view and
+  the row-outer/out-of-place windows are flat
   (one row); the batched forms keep their existing matchers. Per-site decline remarks ("this nest
   matched GEMM but its operands are not provably disjoint") are not emitted yet: `--remarks=dispatch`
   reports what fired, not why something did not.

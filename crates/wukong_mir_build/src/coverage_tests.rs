@@ -303,6 +303,26 @@ fn powmap(x: [f32; 64], y: [f32; 64], mut o: [f32; 64], n: usize) {
     assert!(has_sge(f), "the dispatch must sit behind `end >= 0`");
 }
 
+/// Not only the elementwise maps: the proven side of the `end >= 0` test lowers the loop again with
+/// its end known to fit `i64`, so every range-based recognizer a signed counter would get fires —
+/// here the low-precision sum.
+#[test]
+fn a_runtime_usize_bound_keeps_the_low_precision_reduction_kernel() {
+    let src = "module m
+fn bsum(x: [bf16; 64], n: usize) -> f32 {
+    let mut s: f32 = 0.0;
+    for k in 0..n {
+        s = s + (x[k] as f32);
+    }
+    return s;
+}
+";
+    let (prog, _, interner) = lower_src(src);
+    let f = func(&prog, &interner, "bsum");
+    assert_eq!(kernels(f, &interner), vec!["wukong_sum_bf16"]);
+    assert!(has_sge(f), "the dispatch must sit behind `end >= 0`");
+}
+
 /// A reduction over a `usize` counter keeps its source-order fold: vectorizing it would reassociate
 /// the sum, which the unsigned spelling never did.
 #[test]

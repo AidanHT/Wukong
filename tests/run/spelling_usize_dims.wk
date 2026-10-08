@@ -48,6 +48,7 @@
 // EXPECT-OUT: -1
 // EXPECT-OUT: -1
 // EXPECT-OUT: -1
+// EXPECT-OUT: 55
 module tests.run.spelling_usize_dims
 
 // Unsigned 64-bit loop counters - a symbolic tensor dim (`fn f<N>(x: Tensor[f32, N])`, the
@@ -59,6 +60,11 @@ module tests.run.spelling_usize_dims
 //
 // x[i] = i - 5. Expected, exact in f32: a = 3*x = 3*i - 15; b[i] = 2*x + 1 = 2*i - 9 for i < 10,
 // else -1; c[i] = x*x - x = (i-5)*(i-6) for i < 13, else -1.
+//
+// The same holds beyond the elementwise maps: `bsum_prefix` is a bf16 sum over a runtime `usize`
+// bound, which takes the low-precision reduction kernel (`wukong_sum_bf16`) exactly as a signed
+// counter would. h[i] = i + 1 (exact in bf16), so the first 10 sum to 55; a kernel that ran the
+// whole buffer would print 136.
 
 fn scale1<N>(x: Tensor[f32, N], mut out: Tensor[f32, N], s: f32) {
     for i in 0..N {
@@ -76,6 +82,14 @@ fn poly_prefix(x: [f32; 16], mut out: [f32; 16], n: usize) {
     for i in 0..n {
         out[i] = x[i] * x[i] - x[i];
     }
+}
+
+fn bsum_prefix(x: [bf16; 16], n: usize) -> f32 {
+    let mut s: f32 = 0.0;
+    for k in 0..n {
+        s = s + (x[k] as f32);
+    }
+    return s;
 }
 
 fn main() -> i32 {
@@ -98,5 +112,10 @@ fn main() -> i32 {
     for i in 0..16 {
         print(c[i] as i32);
     }
+    let mut h: [bf16; 16] = [0.0 as bf16; 16];
+    for i in 0..16 {
+        h[i] = ((i + 1) as f32) as bf16;
+    }
+    print(bsum_prefix(h, 10) as i32);
     return 0;
 }

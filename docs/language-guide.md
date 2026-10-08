@@ -569,12 +569,23 @@ a float product that inlining would contract into an FMA); the cache-friendly
 out[j] += x[i*N + j] } }`, likewise `+= x*x` and `fmax`/`fmin`/absmax seeded from row 0 — the same
 `wukong_col*` kernels as the column-outer nest, performing the same operations per column); an
 **out-of-place** softmax or log-softmax that keeps `x` and writes `o` (one `wukong_norm_f32(x, o, …)`);
-and a **hand-tiled** matmul (`for i0 in 0..M step T { … for i in i0..i0 + T { … } }`, or the `let mut
-i0 = 0; while i0 < M { …; i0 = i0 + T; }` form, with literal extents the tiles divide exactly), which
-is the untiled nest it enumerates and dispatches the GEMM kernel. A loop over a `usize` counter — a
-`usize` parameter, or the dimension `N` of a `Tensor[f32, N]` — dispatches its elementwise kernel (or
-vectorizes) behind a run-time `end >= 0` test, since every kernel counts in signed `i64`; a reduction
-over such a counter keeps its source-order fold. Nor does folding the follow-up work **into** a matmul
+and a **hand-tiled** matmul, which is the untiled nest it enumerates and dispatches the GEMM kernel.
+The tile loops may be `for i0 in 0..M step T`, the `let mut i0 = 0; while i0 < M { …; i0 = i0 + T; }`
+pair, or the counted form `examples/matmul.wk` uses (`for it in 0..(M + T - 1) / T { let i0 = it *
+T; let i1 = min(i0 + T, M); … for i in i0..i1 { … } }`); a point loop spans a full tile (`i0..i0 + T`)
+or one clamped to the extent (`i0..min(i0 + T, M)`, so the tiles need not divide `M`); the extents may
+be runtime values (a symbolic `Tensor` dim, a parameter) and the tile width a literal or a `const`
+(a function-local `const` declared in the same block as the tiled loop counts too). Where the cover
+cannot be proved at compile time — full tiles over a runtime extent need `M % T == 0`, counted
+clamped tiles need `ceil(M/T)*T >= M` — it is tested at run time on entry, with the loops as written
+as the fallback. The contraction may be tiled as well, around `c[i, j] += a*b` or around a scalar
+accumulation seeded from `C` (`let mut s = c[i, j]; for k in k0..k1 { s += a[i, k] * b[k, j]; } c[i,
+j] = s;`), which on its own is `C += A·B`. A loop over a `usize` counter — a
+`usize` parameter, or the dimension `N` of a `Tensor[f32, N]` — dispatches whatever kernel the same
+loop over a signed counter would (an elementwise map, argmax/argmin, a low-precision dot, sum or
+map), or vectorizes, behind a run-time `end >= 0` test, since every kernel counts in signed `i64`; a
+plain float fold with no kernel (`s = s + x[i]`) over such a counter keeps its source-order fold.
+Nor does folding the follow-up work **into** a matmul
 store rather than writing it as its own loop: `c[i*N+j] = silu(bias[j] + s)` fuses to one
 `wukong_sgemm_nt_epi`, `c[i*N+j] = x[i*N+j] + s` (a residual from another array) and a second store
 `d[i*N+j] = d[i*N+j] * s` alongside `c[i*N+j] = s` (the SwiGLU up-projection) each lower to the same

@@ -1046,6 +1046,7 @@ fn lower_program_impl(
         alias_free: false,
         report,
         resume: false,
+        proven_end: None,
         mm: interner.intern("wukong_sgemm"),
         mm_par: interner.intern("wukong_sgemm_parallel"),
         print_str: interner.intern("print_str"),
@@ -2993,6 +2994,11 @@ struct GemmSyms {
     /// body — which turns `recognize` back on for the body's statements. See `dispatch.rs`
     /// (`FnLowerer::with_loop_attrs`). Rides here so an outlined region of that loop inherits it.
     resume: bool,
+    /// The end expression of the unsigned 64-bit range loop being lowered on the far side of its own
+    /// run-time `end >= 0` test (`ucount.rs`): [`FnLowerer::end_fits_signed_i64`] accepts exactly
+    /// that node there, so every range-based recognizer treats the loop as provably in the signed
+    /// domain. `None` everywhere else.
+    proven_end: Option<ast::NodeId>,
     mm: Symbol,
     mm_par: Symbol,
     /// Runtime print of a null-terminated string buffer (a `*u8` argument to `print`/`println`),
@@ -5025,9 +5031,12 @@ impl FnLowerer<'_> {
         // when the endpoint proves that this half cannot be visited.
         if !signed && self.signed(start) {
             let max_signed = (1u64 << (mir_byte_size(&ity) * 8 - 1)) - 1;
-            if !self
-                .const_usize_expr(end)
-                .is_some_and(|end| u64::from(end) <= max_signed)
+            // A 64-bit endpoint `ucount.rs` has tested `>= 0` at run time is at most `i64::MAX`.
+            let proven = ity == MirType::I64 && self.gemm.proven_end == Some(end.id);
+            if !proven
+                && !self
+                    .const_usize_expr(end)
+                    .is_some_and(|end| u64::from(end) <= max_signed)
             {
                 return false;
             }
@@ -5054,11 +5063,14 @@ impl FnLowerer<'_> {
     /// integer type. Anything it cannot fold — a symbolic tensor dim threaded in as a hidden `usize`
     /// parameter, `s.len()`, a runtime `usize` — declines here, because this predicate is consulted
     /// before any MIR is built and cannot introduce a branch. Those endpoints are taken instead by
-    /// `ucount.rs`, which dispatches behind a run-time `end >= 0` test with the loop as written as
-    /// the fallback.
+    /// `ucount.rs`, which emits a run-time `end >= 0` test, keeps the loop as written as the
+    /// fallback, and lowers the loop again on the other side with `GemmSyms::proven_end` naming this
+    /// very `end` node — the one place a run-time proof answers here.
     fn end_fits_signed_i64(&self, end: &Expr) -> bool {
-        self.const_runtime_u64_expr(end)
-            .is_some_and(|v| v <= i64::MAX as u64)
+        self.gemm.proven_end == Some(end.id)
+            || self
+                .const_runtime_u64_expr(end)
+                .is_some_and(|v| v <= i64::MAX as u64)
     }
 
     /// Convert through the scalar loop's common type before widening to the kernel ABI. This
