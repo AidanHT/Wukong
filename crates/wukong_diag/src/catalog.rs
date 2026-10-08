@@ -440,6 +440,49 @@ static CATALOG: &[Explanation] = &[
          the function directly at each call instead."
     ),
     entry!(
+        "E0448",
+        "value has no printed form",
+        "`print`, `println`, `print_raw`, `eprint`, `eprintln` and every `printf` / `eprintf` / \
+         `sprintf` argument print a scalar (an integer, a float, a `bool`, a `char`), a `*u8` \
+         string, a C-style enum (its discriminant) or — structurally, like Rust's `{:?}` — an \
+         array, a slice of scalars, a tuple or a struct whose every element prints; a reference \
+         prints what it refers to. A value with no printed form is rejected instead of printing \
+         something backend-dependent: a raw pointer other than `*u8` is an address (the \
+         interpreter's slot index and a native run's machine address disagree), so dereference it; \
+         a data-carrying enum prints by matching on it; a slice of non-scalars, a reference inside \
+         an aggregate, a SIMD vector or a function value prints element by element, lane by lane \
+         or not at all. (A whole tensor and `()` are `E0401` under `print`.)",
+        bad: "module ex.e0448\nfn main() -> i32 {\n    let mut x: i32 = 5;\n    let p: *mut i32 = &mut x;\n    print(p);\n    return 0;\n}\n",
+        good: "module ex.e0448\nfn main() -> i32 {\n    let mut x: i32 = 5;\n    let p: *mut i32 = &mut x;\n    print(*p);\n    return 0;\n}\n"
+    ),
+    entry!(
+        "E0449",
+        "malformed format string",
+        "The format string of `printf`, `eprintf` or `sprintf` is parsed when the program is \
+         compiled, so it must be a string literal and well-formed: each `{}` or `{:spec}` \
+         placeholder takes the next argument in order, `{{` and `}}` print a literal brace, and a \
+         spec is `[[fill]align][+][#][0][width][.precision][type]` with an ASCII fill, `<`, `^` \
+         or `>` alignment, a width and precision of at most 255, and `type` one of `?` (debug: a \
+         string or char quoted), `x`, `X`, `o`, `b` (an integer in hex, octal or binary) or `e`, \
+         `E` (scientific). An unclosed `{`, a lone `}`, a named or positional argument (`{0}`, \
+         `{x}`), a `.` with no precision or an unknown type is this error.",
+        bad: "module ex.e0449\nfn main() -> i32 {\n    printf(\"total {\", 3);\n    return 0;\n}\n",
+        good: "module ex.e0449\nfn main() -> i32 {\n    printf(\"total {}\", 3);\n    return 0;\n}\n"
+    ),
+    entry!(
+        "E0450",
+        "format arguments do not match the format string",
+        "A `printf` / `eprintf` / `sprintf` call must supply exactly one argument per placeholder, \
+         and each placeholder's spec must apply to its argument's type: `x`, `X`, `o` and `b` \
+         format an integer; `e` and `E` a number; `#` only adds the prefix of those radix styles; \
+         a precision applies to a float (its digits after the point), a string (its maximum \
+         length) or the elements of an aggregate, never to an integer, `bool` or `char`; and the \
+         `+` and `0` flags format a number. Supply the missing argument, drop the extra one, or \
+         fix the spec — or cast the value to the type the spec formats (`x as i64`).",
+        bad: "module ex.e0450\nfn main() -> i32 {\n    printf(\"{} {}\", 1);\n    return 0;\n}\n",
+        good: "module ex.e0450\nfn main() -> i32 {\n    printf(\"{} {}\", 1, 2);\n    return 0;\n}\n"
+    ),
+    entry!(
         "E0501",
         "rank, extent or arity mismatch",
         "Two tensors were required to have the same number of dimensions (rank) but did not. For \

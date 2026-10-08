@@ -631,7 +631,14 @@ another architecture or OS is not supported. A native-backend failure is a catal
 - Intrinsics `print`/`println`/`assert`. Every scalar prints at its own type, identically on every
   backend and in a linked executable: an `f32` (and an `f16`/`bf16`) prints its shortest round-trip
   digits at `f32` precision, an `f64` at `f64` precision, a `bool` as `true`/`false`, a `char` as its
-  UTF-8 glyph (`tests/run/print_scalar_types.wk`).
+  UTF-8 glyph (`tests/run/print_scalar_types.wk`). An aggregate prints structurally, like Rust's
+  `{:?}` (`tests/run/print_aggregate.wk`); a value with no printed form (a raw pointer, a
+  data-carrying enum) is `E0448` instead of an address that differs between backends.
+- **Formatted output**: `printf` / `eprintf` / `sprintf` with a compile-time-checked format string
+  (Rust's `format!` spec grammar; `E0449` malformed, `E0450` argument mismatch), `print_raw`,
+  `eprint` / `eprintln`, and the raw byte writers `write_stdout` / `write_stderr` / `write_text`
+  (`tests/run/printf_format.wk`). 🟡 The `cc` fallback link has no formatting runtime, and there is
+  still no string *type* beyond `*u8` (a `sprintf` buffer is a `[u8; N]`).
 - **Source-text diagnostics.** A Unicode lookalike of ASCII punctuation or whitespace (`−` U+2212
   for `-`, `×`, `≤`, fullwidth brackets, curly quotes, no-break/zero-width spaces; ~50 entries) is
   **`E0105`**, naming the code point and the ASCII character it imitates, and the lexer reads it

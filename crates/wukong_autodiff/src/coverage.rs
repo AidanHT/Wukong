@@ -37,6 +37,8 @@ const COLUMN_STAT: &str = "this column statistic has no VJP rule yet (colsum, co
                            colsumsq are differentiable)";
 const NO_GRADIENT: &str = "carries no gradient";
 const FILE_READ: &str = "a file read overwrites its buffer with data; it carries no gradient";
+const TEXT_OUTPUT: &str = "formatted text output (`printf`, `sprintf`, a structural `print`) \
+                           writes text, not a differentiated buffer; it carries no gradient";
 
 /// Every non-differentiable symbol `wukong_mir_build` can emit, with the reason a decline reports.
 pub(crate) const NOT_DIFFERENTIABLE: &[(&str, &str)] = &[
@@ -212,6 +214,13 @@ pub(crate) const NOT_DIFFERENTIABLE: &[(&str, &str)] = &[
         "top-k has no VJP rule yet (the gradient would scatter back to the selected indices); \
          autodiff refuses it rather than drop the gradient",
     ),
+    // The formatting entries `printf` / `sprintf` / a structural `print` lower to (`text.rs`).
+    ("wukong_rt_fmt_int", TEXT_OUTPUT),
+    ("wukong_rt_fmt_f64", TEXT_OUTPUT),
+    ("wukong_rt_fmt_f32", TEXT_OUTPUT),
+    ("wukong_rt_fmt_str", TEXT_OUTPUT),
+    ("wukong_rt_fmt_lit", TEXT_OUTPUT),
+    ("wukong_rt_fmt_slice", TEXT_OUTPUT),
     // Scratch-arena bookkeeping and the slice bounds-failure edge.
     (
         "wukong_rt_scratch_alloc",

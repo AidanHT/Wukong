@@ -1,0 +1,84 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: step 42 loss 3.1416
+// EXPECT-OUT: [   42] [42   ] [ 42  ] [   42]
+// EXPECT-OUT: [***42****] [-0007] [+42] [-7]
+// EXPECT-OUT: ff FF 0xff 0o377 0b11111111 11111111
+// EXPECT-OUT: fffffffffffffff9 FFFFFFFF
+// EXPECT-OUT: 2.5e0 2.50e0 1.2345E3
+// EXPECT-OUT: [   3.142] [2.50    ] [+2.5] [-0002.50]
+// EXPECT-OUT: 1 1.0 0.1 0.1
+// EXPECT-OUT: hey "hey" [  ab] [abc]
+// EXPECT-OUT: true false q 'q'
+// EXPECT-OUT: {literal} 100%
+// EXPECT-OUT: pair (1, 2.0) and (1, 2.0)
+// EXPECT-OUT: no newline then one
+// EXPECT-OUT: 12 + 0.5
+// EXPECT-OUT: 8
+// EXPECT-OUT: x=007|ab
+// EXPECT-OUT: 6
+// EXPECT-OUT: 123
+// EXPECT-STDERR: to stderr
+// EXPECT-STDERR: err 7
+module tests.run.printf_format
+
+/// `printf` / `eprintf` / `sprintf` take a format string literal, parsed when the program is
+/// compiled, and render each `{}` / `{:spec}` placeholder exactly as Rust's `format!` renders the
+/// same spec for the same type — on the interpreter, the JIT and a linked executable alike.
+///
+/// Every line is derived from Rust's formatting rules, not recorded from the compiler:
+/// * f32 3.14159 rounded to 4 decimals is 3.1416, to 3 is 3.142;
+/// * numbers right-align by default: `{:5}` of 42 is three spaces then 42; `^` puts the odd pad
+///   on the right (`{:*^9}` is 3 + 2 + 4); the `0` flag pads after the sign (`-0007`), `+` always
+///   prints one;
+/// * `{:x}` of 255u8 is ff; `#` adds 0x / 0o / 0b; `{:x}` of a negative integer prints its own
+///   width's two's complement (-7i64 is fffffffffffffff9, -1i32 is FFFFFFFF);
+/// * `{:e}` of 2.5 is 2.5e0 (Rust's exponent has no sign or padding), `{:.2e}` 2.50e0, and the f32
+///   1234.5 is 1.2345E3;
+/// * `{:08.2}` of -2.5 is the sign, three zeros, then 2.50;
+/// * `{}` of the f32 1.0 is 1 and `{:?}` 1.0; a string's `{:?}` is quoted; `{:.3}` of a string
+///   keeps 3 characters;
+/// * `{{` / `}}` print a brace; a tuple prints structurally, its elements in Debug style;
+/// * `printf` and `print_raw` add no newline; `eprintln`/`eprintf` write stderr, not stdout;
+/// * `sprintf` writes "x=007|ab" (8 bytes) into a 16-byte buffer and returns 8; into a 4-byte
+///   buffer, "123456" is truncated to "123" plus the NUL and the result is still the full length,
+///   6 — `snprintf` semantics.
+fn main() -> i32 {
+    let i: i32 = 42;
+    let n: i64 = -7;
+    let u: u8 = 255;
+    let x: f32 = 3.14159;
+    let d: f64 = 2.5;
+    printf("step {} loss {:.4}\n", i, x);
+    printf("[{:5}] [{:<5}] [{:^5}] [{:>5}]\n", i, i, i, i);
+    printf("[{:*^9}] [{:05}] [{:+}] [{:+}]\n", i, n, i, n);
+    printf("{:x} {:X} {:#x} {:#o} {:#b} {:08b}\n", u, u, u, u, u, u);
+    printf("{:x} {:X}\n", n, -1);
+    printf("{:e} {:.2e} {:E}\n", d, d, 1234.5);
+    printf("[{:8.3}] [{:<8.2}] [{:+.1}] [{:08.2}]\n", x, d, d, -d);
+    printf("{} {:?} {} {:?}\n", 1.0, 1.0, 0.1, 0.1);
+    printf("{} {:?} [{:>4}] [{:.3}]\n", "hey", "hey", "ab", "abcdef");
+    printf("{} {:?} {} {:?}\n", true, false, 'q', 'q');
+    printf("{{literal}} {}%\n", 100);
+    let p = (1, 2.0);
+    printf("pair {} and {:?}\n", p, p);
+    printf("no newline");
+    printf(" then one\n");
+    print_raw(12);
+    print_raw(" + ");
+    print_raw(0.5);
+    println("");
+    eprintln("to stderr");
+    eprintf("err {}\n", 7);
+    let mut buf: [u8; 16] = [0; 16];
+    let len = sprintf(buf, "x={:03}|{}", 7, "ab");
+    print(len);
+    write_stdout(buf, len);
+    print_raw("\n");
+    let mut small: [u8; 4] = [0; 4];
+    let full = sprintf(small, "{}", 123456);
+    print(full);
+    write_stdout(small, 3);
+    print_raw("\n");
+    return 0;
+}

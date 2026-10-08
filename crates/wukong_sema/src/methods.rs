@@ -176,6 +176,7 @@ impl Sema<'_> {
             || crate::kernel_builtin(nm, 2).is_some()
             || crate::heap_alloc_elem(nm).is_some()
             || crate::file_io_elem(nm).is_some()
+            || crate::text::text_builtin(nm).is_some()
             || matches!(
                 nm,
                 "print" | "println" | "assert" | "free" | "now_ns" | "sync_block"

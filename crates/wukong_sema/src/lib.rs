@@ -58,6 +58,10 @@ use wukong_types::{Dim, Layout, Scalar, Shape, Ty};
 mod ml_builtins;
 pub use ml_builtins::{io_dtype, io_dtype_code, ml_builtin, ml_builtin_is_pure, MlBuiltin};
 
+// The text builtins (see `text.rs`): what `print` accepts, the `printf` family, the format-string
+// parser and the one string-literal decoder, all shared with `wukong_mir_build`.
+pub mod text;
+
 /// The element scalar of a typed heap-allocation builtin (`alloc_f32` → `F32`), or `None` for any
 /// other name. The v1 heap surface is this per-scalar `alloc_<T>(n) -> []T` family plus `free(s)`
 /// (not a generic `alloc<T>`): sema types builtins nominally in one place, and `mir_build` — which

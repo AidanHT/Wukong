@@ -16,6 +16,16 @@ All notable changes to Wukong are documented here. The format is loosely based o
   replays f32 and bool print records the same way. Fixtures printing an `f32` or a comparison were
   re-derived (`print_float_display`, `activation_backward_int_args`, `transcendental_kernel`,
   `operators`); new `tests/run/print_scalar_types.wk`.
+- **Aggregates print structurally** (Rust's `{:?}`): `print(p)` of a struct, tuple, array or slice
+  prints `Point { x: 1, y: 2.5 }`, `(7, 'z')`, `[1, 2, 3]` (a buffer past 1000 elements summarizes,
+  NumPy-style) instead of its address, which differed between the interpreter and native. A value
+  with no printed form (a raw pointer, a data-carrying enum) is the new **`E0448`**.
+- **Formatted output**: `printf` / `eprintf` / `sprintf(buf, fmt, ..) -> i64` with a format string
+  parsed at compile time (Rust's `format!` spec grammar: fill, align, `+`, `#`, `0`, width,
+  precision, `?` `x` `X` `o` `b` `e` `E`), plus `print_raw`, `eprint` / `eprintln` and the raw
+  writers `write_stdout` / `write_stderr` / `write_text`. New **`E0449`** (malformed format string)
+  and **`E0450`** (placeholder count or spec/type mismatch). One `wukong_runtime::fmt` renders for
+  every backend (`tests/run/printf_format.wk`, `tests/run/print_aggregate.wk`).
 
 ### Optimizer memory passes: SROA, path DSE, loop deletion, guarded LICM, scalar promotion (`gap/opt-memory`)
 

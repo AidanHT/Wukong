@@ -1,0 +1,12 @@
+// EXPECT-CODE: E0448
+module tests.fail.print_raw_pointer
+
+// A raw pointer has no printed form: it is an address, and the interpreter (a slot index) and a
+// native run (a machine address) print different numbers for the same program. `print(p)` used to
+// compile and print whichever the backend had. Dereference it to print the value it points at.
+fn main() -> i32 {
+    let mut x: i32 = 5;
+    let p: *mut i32 = &mut x;
+    print(p);
+    return 0;
+}

@@ -1,0 +1,15 @@
+// EXPECT-CODE: E0448
+module tests.fail.print_data_enum
+
+// A data-carrying enum is a tag plus a payload buffer; it has no structural printed form (which
+// variant it holds is known only at run time). Match on it and print the variant's fields.
+enum Shape {
+    Circle(f32),
+    Unit,
+}
+
+fn main() -> i32 {
+    let s = Shape::Circle(1.5);
+    printf("{}\n", s);
+    return 0;
+}
