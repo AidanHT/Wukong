@@ -460,6 +460,14 @@ impl Sema<'_> {
         if self.defs.lookup(name).is_some() || self.lookup_local(name).is_some() {
             return None;
         }
+        // The decode builtins (`sdpa_kv`, `kv_append`, `gemv_bf16`, …) are typed in
+        // `decode_builtins.rs`.
+        let interner = self.interner;
+        if let Some(t) =
+            self.type_decode_builtin(interner.resolve(name), callee, generic_args, args)
+        {
+            return Some(t);
+        }
         let kind = kernel_builtin(self.sym_str(name), args.len())?;
         self.types.insert(callee.id, Ty::Unknown);
         Some(if kind == KernelBuiltin::Sdpa {

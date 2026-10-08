@@ -53,6 +53,8 @@ mod ucount;
 
 // The lowering of the ML builtins `wukong_sema::ml_builtins` types (see the module docs).
 mod ml_builtins;
+// The lowering of the decode builtins (`sdpa_kv`, `kv_append`, the half / quantized GEMVs).
+mod decode_builtins;
 
 use std::cell::{Cell, RefCell};
 
@@ -1408,6 +1410,7 @@ fn lower_program_pooled(
         rt_scratch_mark: interner.intern("wukong_rt_scratch_mark"),
         rt_scratch_release: interner.intern("wukong_rt_scratch_release"),
         ml: ml_builtins::MlSyms::new(interner),
+        decode: decode_builtins::DecodeSyms::new(interner),
         rt_read_f32: interner.intern("wukong_rt_read_f32"),
         rt_read_i32: interner.intern("wukong_rt_read_i32"),
         rt_read_i64: interner.intern("wukong_rt_read_i64"),
@@ -3838,6 +3841,8 @@ struct GemmSyms {
     rt_scratch_release: Symbol,
     /// The runtime entries `ml_builtins.rs` lowers the ML builtins to (`wukong_rt_read_dt`, …).
     ml: ml_builtins::MlSyms,
+    /// The runtime entries `decode_builtins.rs` lowers the decode builtins to.
+    decode: decode_builtins::DecodeSyms,
     /// The 12 raw file-I/O runtime entry points (`wukong_rt_{read,write}_{f32,i32,i64,u8,f64,i8}`)
     /// backing the `read_<T>(path, buf)` / `write_<T>(path, buf)` builtins. Each takes `(path: *const
     /// u8, data: *T, len: i64)` and returns an `i64`: the element count on success, or -1 (open/create
@@ -22120,6 +22125,10 @@ impl FnLowerer<'_> {
                 }
                 // The ML builtins lower in `ml_builtins.rs` (see its module docs).
                 if let Some(v) = self.lower_ml_builtin(name, args) {
+                    return v;
+                }
+                // The decode builtins lower in `decode_builtins.rs`.
+                if let Some(v) = self.lower_decode_builtin(name, args, e.span) {
                     return v;
                 }
                 // The `now_ns()` timing intrinsic lowers to one zero-argument `wukong_now_ns() -> i64`

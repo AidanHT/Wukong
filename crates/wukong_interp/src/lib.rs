@@ -317,6 +317,8 @@ fn read_file_elements(
 
 // The interpreter twins of the ML builtins' runtime entries, beside the frozen decoder above.
 mod ml_io;
+// The interpreter twins of the decode builtins' entries (KV-cache attention, half / quantized GEMV).
+mod decode;
 
 /// Pointers at or above this value encode a function index (`FUNC_TAG + idx`) rather than a memory
 /// address — how `Op::FuncAddr` is represented for `parallel_for` to call back. Real `alloca`
@@ -4828,10 +4830,11 @@ impl<'a, 'k> Interp<'a, 'k> {
                 marshal::recycle_f32(obuf);
                 Ok(Value::Unit)
             }
-            // The ML builtins' runtime entries live in `ml_io.rs`; anything it does not claim is
-            // an unknown callee.
+            // The ML builtins' runtime entries live in `ml_io.rs` and the decode builtins' in
+            // `decode.rs`; anything neither claims is an unknown callee.
             other => self
                 .ml_intrinsic(other, args)
+                .or_else(|| self.decode_intrinsic(other, args))
                 .unwrap_or_else(|| Err(format!("call to unknown function or intrinsic `{other}`"))),
         }
     }

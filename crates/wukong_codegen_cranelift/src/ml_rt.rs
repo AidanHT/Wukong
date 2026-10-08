@@ -51,7 +51,7 @@ pub(crate) struct Entry {
 
 /// The table. The addresses are taken here, at run time, because a function-pointer-to-raw-pointer
 /// cast is not a constant expression.
-pub(crate) fn entries() -> [Entry; 9] {
+pub(crate) fn entries() -> [Entry; 22] {
     use Abi::{Ptr, F32, I64};
     [
         // (path, byte_off, data, len, dtype) -> i64: `read_<T>` outside the frozen six, and every
@@ -118,8 +118,120 @@ pub(crate) fn entries() -> [Entry; 9] {
             ret: Some(I64),
             addr: wukong_runtime::wukong_sample_categorical_f32 as *const u8,
         },
+        // The decode builtins (`wukong_mir_build`'s `decode_builtins.rs`). Every buffer travels
+        // with its length and every entry returns a status the lowering asserts is zero.
+        // (q, nq, k, nk, v, nv, o, no, sq, skv, d, q_pos0, n_heads, n_kv_heads, q_stride,
+        // kv_stride, scale, causal) -> i64: `sdpa_kv`.
+        Entry {
+            name: "wukong_attention_kv_f32",
+            params: ATTENTION_KV,
+            ret: Some(I64),
+            addr: wukong_runtime::wukong_attention_kv_f32 as *const u8,
+        },
+        Entry {
+            name: "wukong_attention_kv_f32_parallel",
+            params: ATTENTION_KV,
+            ret: Some(I64),
+            addr: wukong_runtime::wukong_attention_kv_f32_parallel as *const u8,
+        },
+        // (cache, ncache, row, nrow, pos, stride) -> i64: `kv_append`.
+        Entry {
+            name: "wukong_kv_append_f32",
+            params: &[Ptr, I64, Ptr, I64, I64, I64],
+            ret: Some(I64),
+            addr: wukong_runtime::wukong_kv_append_f32 as *const u8,
+        },
+        // (w, nw, x, nx, y, ny) -> i64: `gemv_bf16` / `gemv_f16`.
+        Entry {
+            name: "wukong_sgemv_bf16",
+            params: GEMV,
+            ret: Some(I64),
+            addr: wukong_runtime::wukong_sgemv_bf16 as *const u8,
+        },
+        Entry {
+            name: "wukong_sgemv_bf16_parallel",
+            params: GEMV,
+            ret: Some(I64),
+            addr: wukong_runtime::wukong_sgemv_bf16_parallel as *const u8,
+        },
+        Entry {
+            name: "wukong_sgemv_f16",
+            params: GEMV,
+            ret: Some(I64),
+            addr: wukong_runtime::wukong_sgemv_f16 as *const u8,
+        },
+        Entry {
+            name: "wukong_sgemv_f16_parallel",
+            params: GEMV,
+            ret: Some(I64),
+            addr: wukong_runtime::wukong_sgemv_f16_parallel as *const u8,
+        },
+        // (x, nx, q, nq, k) -> i64: `quantize_q8_0` / `quantize_q4_0`.
+        Entry {
+            name: "wukong_quantize_q8_0_f32",
+            params: &[Ptr, I64, Ptr, I64, I64],
+            ret: Some(I64),
+            addr: wukong_runtime::wukong_quantize_q8_0_f32 as *const u8,
+        },
+        Entry {
+            name: "wukong_quantize_q4_0_f32",
+            params: &[Ptr, I64, Ptr, I64, I64],
+            ret: Some(I64),
+            addr: wukong_runtime::wukong_quantize_q4_0_f32 as *const u8,
+        },
+        // (w, nw, x, nx, y, ny) -> i64: `gemv_q8_0` / `gemv_q4_0`.
+        Entry {
+            name: "wukong_gemv_q8_0_f32",
+            params: GEMV,
+            ret: Some(I64),
+            addr: wukong_runtime::wukong_gemv_q8_0_f32 as *const u8,
+        },
+        Entry {
+            name: "wukong_gemv_q8_0_f32_parallel",
+            params: GEMV,
+            ret: Some(I64),
+            addr: wukong_runtime::wukong_gemv_q8_0_f32_parallel as *const u8,
+        },
+        Entry {
+            name: "wukong_gemv_q4_0_f32",
+            params: GEMV,
+            ret: Some(I64),
+            addr: wukong_runtime::wukong_gemv_q4_0_f32 as *const u8,
+        },
+        Entry {
+            name: "wukong_gemv_q4_0_f32_parallel",
+            params: GEMV,
+            ret: Some(I64),
+            addr: wukong_runtime::wukong_gemv_q4_0_f32_parallel as *const u8,
+        },
     ]
 }
+
+/// The `sdpa_kv` entry ABI: four `(buffer, length)` pairs, eight `i64` geometry values, the `f32`
+/// scale and the `i64` causal flag.
+const ATTENTION_KV: &[Abi] = &[
+    Abi::Ptr,
+    Abi::I64,
+    Abi::Ptr,
+    Abi::I64,
+    Abi::Ptr,
+    Abi::I64,
+    Abi::Ptr,
+    Abi::I64,
+    Abi::I64,
+    Abi::I64,
+    Abi::I64,
+    Abi::I64,
+    Abi::I64,
+    Abi::I64,
+    Abi::I64,
+    Abi::I64,
+    Abi::F32,
+    Abi::I64,
+];
+
+/// The checked GEMV ABI: weight, activation and output, each with its length.
+const GEMV: &[Abi] = &[Abi::Ptr, Abi::I64, Abi::Ptr, Abi::I64, Abi::Ptr, Abi::I64];
 
 /// Declare every table entry as an import and record it in `rt_ids` — the module-wide symbol set
 /// that both resolves a runtime call and arms `lower_call`'s arity guard.

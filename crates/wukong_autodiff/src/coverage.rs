@@ -37,6 +37,9 @@ const COLUMN_STAT: &str = "this column statistic has no VJP rule yet (colsum, co
                            colsumsq are differentiable)";
 const NO_GRADIENT: &str = "carries no gradient";
 const FILE_READ: &str = "a file read overwrites its buffer with data; it carries no gradient";
+const DECODE_ATTENTION: &str = "KV-cache decode attention (`sdpa_kv`) has no backward kernel: it \
+                                is an inference kernel; spell training attention as matmul + \
+                                softmax + matmul (each differentiable)";
 
 /// Every non-differentiable symbol `wukong_mir_build` can emit, with the reason a decline reports.
 pub(crate) const NOT_DIFFERENTIABLE: &[(&str, &str)] = &[
@@ -212,6 +215,24 @@ pub(crate) const NOT_DIFFERENTIABLE: &[(&str, &str)] = &[
         "top-k has no VJP rule yet (the gradient would scatter back to the selected indices); \
          autodiff refuses it rather than drop the gradient",
     ),
+    // The decode builtins (`wukong_mir_build`'s `decode_builtins.rs`): inference kernels.
+    ("wukong_attention_kv_f32", DECODE_ATTENTION),
+    ("wukong_attention_kv_f32_parallel", DECODE_ATTENTION),
+    (
+        "wukong_kv_append_f32",
+        "a KV-cache append is a decode-time row copy with no VJP rule; write the copy as a loop \
+         where a gradient must flow through it",
+    ),
+    ("wukong_sgemv_bf16", HALF_PRECISION),
+    ("wukong_sgemv_bf16_parallel", HALF_PRECISION),
+    ("wukong_sgemv_f16", HALF_PRECISION),
+    ("wukong_sgemv_f16_parallel", HALF_PRECISION),
+    ("wukong_quantize_q8_0_f32", QUANTIZED),
+    ("wukong_quantize_q4_0_f32", QUANTIZED),
+    ("wukong_gemv_q8_0_f32", QUANTIZED),
+    ("wukong_gemv_q8_0_f32_parallel", QUANTIZED),
+    ("wukong_gemv_q4_0_f32", QUANTIZED),
+    ("wukong_gemv_q4_0_f32_parallel", QUANTIZED),
     // Scratch-arena bookkeeping and the slice bounds-failure edge.
     (
         "wukong_rt_scratch_alloc",
