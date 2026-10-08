@@ -495,7 +495,9 @@ Two reasons to reach for it. First, honesty: a recognized kernel is invisible to
 gate, so `@generic` is how you write the loop you want measured (`tests/run/lang_generic_saxpy.wk`,
 `lang_generic_naive_gemm.wk` are the same body with and without the attribute — the MIR then holds
 exactly one kernel call). Second, control: it is the escape hatch when a nest merely *looks* like a
-GEMM and you want your own arithmetic order.
+GEMM and you want your own arithmetic order — the two orders are spelled out under **What a matmul
+computes** below, and `tests/run/lang_generic_gemm_fma_order.wk` pins the size at which they
+provably coincide.
 
 It must sit on the `fn`. `@generic` on a statement or a loop is **`E0306`** — the attribute is read
 from the function item, so accepting it there would promise a per-loop opt-out that does not exist
@@ -521,6 +523,45 @@ lowering option therefore do not change this reduction's arithmetic order. This 
 order, not strict source-order summation, and the recipe/partition is a compiler-build contract:
 it is not promised stable across releases or equivalent to a different recognized runtime kernel.
 Other element types and expressions outside the wide recipe keep their ordinary portable lowering.
+
+### What a matmul computes ✅
+
+A matmul nest that the compiler recognizes (`c[i,j] = Σ a[i,k]·b[k,j]` and its `nn.Linear`, `Aᵀ·B`,
+fused-epilogue and α-scaled spellings) runs the `wukong_sgemm*` kernel family, and that kernel has a
+fixed arithmetic order:
+
+- **Each `c[i,j]` is its own reduction.** K is split into `nb = ceil(K / kc)` blocks with
+  `kc = select_kc(K)` — the fewest equal-ish blocks of at most 384 steps, rounded to a multiple of 4
+  (`K = 805` → 272 + 272 + 261). Each block accumulates **ascending k from +0.0 with one rounding per
+  step** (a fused multiply-add), and the blocks are folded into `c` in order with one rounding each.
+  `beta = 1` (accumulate into the existing `c`) adds one more rounding up front.
+- **A fused epilogue is exact.** `act(alpha·(A·Bᵀ) + bias)` is applied once, after the last block,
+  and is bit-identical to computing the plain matmul and then applying the activation in a separate
+  loop.
+- **Nothing else changes the bits.** Thread count and `@parallel`, the scheduler, the cache-block
+  sizes other than the K block, packing, tile shapes, the `WUKONG_GEMM_*` tuning knobs, AVX2 versus
+  the portable fallback (a host without AVX2+FMA, or any non-x86 target, runs a scalar twin that
+  uses the same order with a correctly-rounded `mul_add`), and the interpreter versus the native
+  backend all produce the same bits.
+- **What does change them:** the 384-step K-block cap is part of the result. It is a compiler-build
+  contract, like the reduction partition above: stable across hosts, thread counts and backends,
+  **not** promised across releases — a retune moves the low bits of every recognized matmul.
+- **Accuracy.** Every runtime test checks `|c − exact| ≤ γ_r · Σ_k |a_ik|·|b_kj|` against an f64
+  reference, with `r = kc + nb − 1` (plus one for `beta = 1`) and `γ_r = r·u / (1 − r·u)`,
+  `u = 2⁻²⁴` — the netlib Level-3 BLAS test criterion with the rounding count this order performs.
+- **Half and int8 inputs.** bf16/f16 operands are widened exactly and then follow the f32 order; the
+  int8 `u8×i8→i32` kernel is exact (wrapping `i32`, any order gives the same bits).
+
+A matmul that is **not** recognized — declined by the matcher, written under `@generic`, or built
+with `WUKONG_NO_RECOGNIZE` — computes the loop as written: `s + a*b` contracts to one FMA, and the
+inner reduction follows the vectorized-reduction partition described above. The two orders coincide
+when the contraction is shorter than one vector group (K ≤ 3), and the corpus pins exactly that with
+non-dyadic data whose fused and unfused results differ in every lane
+(`tests/run/lang_generic_gemm_fma_order.wk`). Past that, a recognized and an unrecognized matmul may
+differ in the last bits: both are documented reassociations of the same sum, and neither is "the"
+exact answer. Integer-valued data whose partial sums stay below 2²⁴ is exact under
+any order, which is how `tests/run/gemm_blocked_every_lane.wk` checks all three kernel forms across
+three K-blocks and full and edge tiles lane by lane.
 
 Separately, loop **auto-vectorization, FMA contraction, and elementwise fusion run automatically**
 (✅) — a plain `for i in 0..n { out[i] = a*x[i] + y[i] }` is vectorized, fused with an adjacent loop,
