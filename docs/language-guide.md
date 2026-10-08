@@ -906,8 +906,9 @@ into one of two fixed trees depending on how it is compiled:
   remainder folds in 8-element steps into accumulator 0, the accumulators combine by the fixed
   halving tree `acc[t] = acc[t + h] ⊕ acc[t]` for `h = 4, 2, 1`, the `< 8` tail folds into the low
   lanes, the lanes combine as `((l0+l1)+(l2+l3))+((l4+l5)+(l6+l7))`, and the chunk partials fold in
-  ascending chunk order. A chunk shorter than 64 elements therefore runs on one accumulator. `bf16`/`f16` reductions widen to `f32` and cut on the same
-  boundary. The result is the same on one core or sixteen, natively or in the interpreter.
+  ascending chunk order. A chunk shorter than 64 elements therefore runs on one accumulator.
+  `bf16`/`f16` reductions widen to `f32` and cut on the same boundary. The result is the same on
+  one core or sixteen, natively or in the interpreter.
 
 The two trees differ from each other and from the source's left-to-right fold, so adding or removing
 `@parallel` — or a reduction declining the kernel (a `step`, an `..=` range, an `f64` accumulator) —
