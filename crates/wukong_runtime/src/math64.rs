@@ -67,6 +67,7 @@
     clippy::if_same_then_else
 )]
 
+use crate::special::{M64_DIGAMMA, M64_ERFC, M64_ERFINV, M64_LGAMMA};
 use crate::{
     VM2_ATAN2, VM2_HYPOT, VM2_POW, VM_ACOS, VM_ACOSH, VM_ASIN, VM_ASINH, VM_ATAN, VM_ATANH,
     VM_CBRT, VM_COS, VM_COSH, VM_ERF, VM_EXP, VM_EXP10, VM_EXP2, VM_EXPM1, VM_LOG, VM_LOG10,
@@ -80,7 +81,9 @@ use crate::{
 /// Codes implemented: `VM_EXP`, `VM_LOG`, `VM_TANH`, `VM_SIN`, `VM_COS`, `VM_ERF`, `VM_EXP2`,
 /// `VM_LOG2`, `VM_SINH`, `VM_COSH`, `VM_ASINH`, `VM_ACOSH`, `VM_ATANH`, `VM_ATAN`, `VM_EXPM1`,
 /// `VM_LOG1P`, `VM_EXP10`, `VM_LOG10`, `VM_TAN`, `VM_ASIN`, `VM_ACOS`, `VM_CBRT` — the transcendental
-/// core. The activations (`sigmoid`, `silu`, `gelu`, `softplus`, …) are composed from these in MIR
+/// core — plus the library-only special functions `M64_ERFC`, `M64_ERFINV`, `M64_LGAMMA` and
+/// `M64_DIGAMMA` ([`crate::special`]), which have no f32 kernel: an `f32` call of one widens to
+/// `f64`, comes here, and rounds back once. The activations (`sigmoid`, `silu`, `gelu`, `softplus`, …) are composed from these in MIR
 /// by `wukong_mir_build`, exactly as for f32, so they stay differentiable through primitive ops;
 /// their codes (and any other) return `x` unchanged.
 #[no_mangle]
@@ -108,6 +111,11 @@ pub extern "C" fn wukong_rt_math_f64(x: f64, op: i64) -> f64 {
         VM_ASIN => asin(x),
         VM_ACOS => acos(x),
         VM_CBRT => cbrt(x),
+        // The special functions with no f32 `vmath` kernel: every precision computes here.
+        M64_ERFC => erfc(x),
+        M64_ERFINV => crate::special::erfinv(x),
+        M64_LGAMMA => crate::special::lgamma(x),
+        M64_DIGAMMA => crate::special::digamma(x),
         _ => x,
     }
 }
@@ -1629,6 +1637,51 @@ pub fn erf(x: f64) -> f64 {
         -y
     } else {
         y
+    }
+}
+
+/// `erfc x = 1 − erf x` (fdlibm `s_erf.c`, musl `erfc`), computed without the cancellation of
+/// `1 − erf x`: below `0.84375` from the same `P/Q` fit as [`erf`], from `1/4` up rearranged as
+/// `0.5 − (x − 0.5 + x·y)`; on `[0.84375, 28)` the two rational tails of `erfc2`, whose
+/// `exp(−z²−0.5625)·exp((z−x)(z+x) + R/S)/x` keeps full relative accuracy deep into the tail; `+0`
+/// from 28 up (`2` toward `−∞`). `erfc(NaN) = NaN`, `erfc(+∞) = +0`, `erfc(−∞) = 2`. ≤ 3 ULP
+/// measured against mpmath (`special::tests::special_references_within_bound` pins sample points);
+/// relative, not absolute, accuracy in the tail, which is the point of the function.
+pub fn erfc(x: f64) -> f64 {
+    let mut ix = hi(x);
+    let sign = ix >> 31;
+    ix &= 0x7fff_ffff;
+    if ix >= 0x7ff0_0000 {
+        // erfc(NaN) = NaN, erfc(+inf) = 0, erfc(-inf) = 2
+        return 2.0 * (sign as f64) + 1.0 / x;
+    }
+    if ix < 0x3feb_0000 {
+        // |x| < 0.84375
+        if ix < 0x3c70_0000 {
+            // |x| < 2^-56
+            return 1.0 - x;
+        }
+        let z = x * x;
+        let r = PP0 + z * (PP1 + z * (PP2 + z * (PP3 + z * PP4)));
+        let s = 1.0 + z * (QQ1 + z * (QQ2 + z * (QQ3 + z * (QQ4 + z * QQ5))));
+        let y = r / s;
+        if sign != 0 || ix < 0x3fd0_0000 {
+            // x < 1/4
+            return 1.0 - (x + x * y);
+        }
+        return 0.5 - (x - 0.5 + x * y);
+    }
+    if ix < 0x403c_0000 {
+        // 0.84375 <= |x| < 28
+        if sign != 0 {
+            return 2.0 - erfc2(ix, x);
+        }
+        return erfc2(ix, x);
+    }
+    if sign != 0 {
+        2.0 - f64::from_bits(0x0010_0000_0000_0000)
+    } else {
+        0.0
     }
 }
 
@@ -3517,9 +3570,32 @@ mod tests {
     #[test]
     fn math64_dispatch_covers_every_emitted_code() {
         let core = [
-            VM_EXP, VM_LOG, VM_TANH, VM_SIN, VM_COS, VM_ERF, VM_EXP2, VM_LOG2, VM_SINH, VM_COSH,
-            VM_ASINH, VM_ACOSH, VM_ATANH, VM_ATAN, VM_EXPM1, VM_LOG1P, VM_EXP10, VM_LOG10, VM_TAN,
-            VM_ASIN, VM_ACOS, VM_CBRT,
+            VM_EXP,
+            VM_LOG,
+            VM_TANH,
+            VM_SIN,
+            VM_COS,
+            VM_ERF,
+            VM_EXP2,
+            VM_LOG2,
+            VM_SINH,
+            VM_COSH,
+            VM_ASINH,
+            VM_ACOSH,
+            VM_ATANH,
+            VM_ATAN,
+            VM_EXPM1,
+            VM_LOG1P,
+            VM_EXP10,
+            VM_LOG10,
+            VM_TAN,
+            VM_ASIN,
+            VM_ACOS,
+            VM_CBRT,
+            M64_ERFC,
+            M64_ERFINV,
+            M64_LGAMMA,
+            M64_DIGAMMA,
         ];
         for op in core {
             assert_ne!(
