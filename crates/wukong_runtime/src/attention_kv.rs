@@ -1170,7 +1170,8 @@ mod tests {
     }
 
     /// `n_heads = n_kv_heads = 1` with packed rows and `q_pos0 = 0` is the square kernel's problem;
-    /// the two kernels block differently, so they agree to the square kernel's own tolerance band.
+    /// the two kernels block differently, so they agree to twice the band each holds to the naive
+    /// reference.
     #[test]
     fn the_square_case_agrees_with_the_flash_kernel() {
         for &(s, d) in &[(1usize, 1usize), (5, 7), (33, 17), (65, 16), (130, 24)] {
@@ -1218,7 +1219,7 @@ mod tests {
                 }
                 for e in 0..s * d {
                     assert!(
-                        (a[e] - b[e]).abs() <= 1e-4 + 1e-4 * a[e].abs(),
+                        (a[e] - b[e]).abs() <= 2e-4 + 2e-4 * a[e].abs(),
                         "({s}x{d}, causal={causal}) [{e}]: flash {} kv {}",
                         a[e],
                         b[e]

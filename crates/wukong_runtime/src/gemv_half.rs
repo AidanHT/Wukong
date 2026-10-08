@@ -740,11 +740,12 @@ mod tests {
         }
     }
 
+    /// The ABI of the four checked half-GEMV entries.
+    type Entry = unsafe extern "C" fn(*const u16, i64, *const f32, i64, *mut f32, i64) -> i64;
+
     /// The checked GEMV entries: the `M = 1` row of the f32 GEMM on the widened weight, serial ==
     /// parallel, a mismatched weight length refused with nothing written, `K = 0` writes zeros, and
     /// an output aliasing the activation still sees the activation as it was before the call.
-    type Entry = unsafe extern "C" fn(*const u16, i64, *const f32, i64, *mut f32, i64) -> i64;
-
     #[test]
     fn checked_gemv_entries() {
         let entries: [(HalfKind, Entry, Entry); 2] = [

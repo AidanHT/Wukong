@@ -1,6 +1,8 @@
 //! The runtime entry points of the ML I/O and randomness builtins — dtype-coded file I/O,
 //! `file_size`, the safetensors / `.npy` readers, the Philox fill and the top-k / argsort /
-//! categorical-sampling kernels — declared, JIT-bound and called from **one table**.
+//! categorical-sampling kernels — and of the decode builtins (KV-cache attention, the KV append,
+//! the half-weight and Q8_0 / Q4_0 GEMVs and packers), declared, JIT-bound and called from **one
+//! table**.
 //!
 //! Every other runtime family in this crate is spelled out four times: a name constant, a
 //! `Signature` built by hand in `populate_module`, an `rt_ids` row, and a `builder.symbol` line in
