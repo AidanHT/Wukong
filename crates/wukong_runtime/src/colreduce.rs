@@ -570,6 +570,7 @@ unsafe fn colreduce_parallel(x: *const f32, out: *mut f32, rows: i64, cols: i64,
 ///
 /// # Safety
 /// `x` valid for `rows*cols`, `out` for `cols` f32, non-overlapping.
+/// **Aliasing: all operands disjoint** — `out` does not overlap `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_colsum_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
     if rows <= 0 || cols <= 0 {
@@ -590,6 +591,7 @@ pub unsafe extern "C" fn wukong_colsum_f32(x: *const f32, out: *mut f32, rows: i
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_colsum_f32`].
+/// **Aliasing:** that of [`wukong_colsum_f32`] — all operands disjoint: `out` does not overlap `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_colsum_f32_parallel(
     x: *const f32,
@@ -605,6 +607,7 @@ pub unsafe extern "C" fn wukong_colsum_f32_parallel(
 ///
 /// # Safety
 /// `x` valid for `rows*cols`, `out` for `cols` f32, non-overlapping.
+/// **Aliasing: all operands disjoint** — `out` does not overlap `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_colmax_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
     if rows <= 0 || cols <= 0 {
@@ -625,6 +628,7 @@ pub unsafe extern "C" fn wukong_colmax_f32(x: *const f32, out: *mut f32, rows: i
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_colmax_f32`].
+/// **Aliasing:** that of [`wukong_colmax_f32`] — all operands disjoint: `out` does not overlap `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_colmax_f32_parallel(
     x: *const f32,
@@ -640,6 +644,7 @@ pub unsafe extern "C" fn wukong_colmax_f32_parallel(
 ///
 /// # Safety
 /// `x` valid for `rows*cols`, `out` for `cols` f32, non-overlapping.
+/// **Aliasing: all operands disjoint** — `out` does not overlap `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_colmin_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
     if rows <= 0 || cols <= 0 {
@@ -660,6 +665,7 @@ pub unsafe extern "C" fn wukong_colmin_f32(x: *const f32, out: *mut f32, rows: i
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_colmin_f32`].
+/// **Aliasing:** that of [`wukong_colmin_f32`] — all operands disjoint: `out` does not overlap `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_colmin_f32_parallel(
     x: *const f32,
@@ -675,6 +681,7 @@ pub unsafe extern "C" fn wukong_colmin_f32_parallel(
 ///
 /// # Safety
 /// `x` valid for `rows*cols`, `out` for `cols` f32, non-overlapping.
+/// **Aliasing: all operands disjoint** — `out` does not overlap `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_colmaxabs_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
     if rows <= 0 || cols <= 0 {
@@ -695,6 +702,8 @@ pub unsafe extern "C" fn wukong_colmaxabs_f32(x: *const f32, out: *mut f32, rows
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_colmaxabs_f32`].
+/// **Aliasing:** that of [`wukong_colmaxabs_f32`] — all operands disjoint: `out` does not overlap
+/// `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_colmaxabs_f32_parallel(
     x: *const f32,
@@ -711,6 +720,7 @@ pub unsafe extern "C" fn wukong_colmaxabs_f32_parallel(
 ///
 /// # Safety
 /// `x` valid for `rows*cols`, `out` for `cols` f32, non-overlapping.
+/// **Aliasing: all operands disjoint** — `out` does not overlap `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_colmean_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
     if rows <= 0 || cols <= 0 {
@@ -731,6 +741,8 @@ pub unsafe extern "C" fn wukong_colmean_f32(x: *const f32, out: *mut f32, rows: 
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_colmean_f32`].
+/// **Aliasing:** that of [`wukong_colmean_f32`] — all operands disjoint: `out` does not overlap
+/// `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_colmean_f32_parallel(
     x: *const f32,
@@ -747,6 +759,7 @@ pub unsafe extern "C" fn wukong_colmean_f32_parallel(
 ///
 /// # Safety
 /// `x` valid for `rows*cols`, `out` for `cols` f32, non-overlapping.
+/// **Aliasing: all operands disjoint** — `out` does not overlap `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_coll2_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
     if rows <= 0 || cols <= 0 {
@@ -767,6 +780,7 @@ pub unsafe extern "C" fn wukong_coll2_f32(x: *const f32, out: *mut f32, rows: i6
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_coll2_f32`].
+/// **Aliasing:** that of [`wukong_coll2_f32`] — all operands disjoint: `out` does not overlap `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_coll2_f32_parallel(
     x: *const f32,
@@ -783,6 +797,7 @@ pub unsafe extern "C" fn wukong_coll2_f32_parallel(
 ///
 /// # Safety
 /// `x` valid for `rows*cols`, `out` for `cols` f32, non-overlapping.
+/// **Aliasing: all operands disjoint** — `out` does not overlap `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_colrms_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
     if rows <= 0 || cols <= 0 {
@@ -803,6 +818,7 @@ pub unsafe extern "C" fn wukong_colrms_f32(x: *const f32, out: *mut f32, rows: i
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_colrms_f32`].
+/// **Aliasing:** that of [`wukong_colrms_f32`] — all operands disjoint: `out` does not overlap `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_colrms_f32_parallel(
     x: *const f32,
@@ -819,6 +835,7 @@ pub unsafe extern "C" fn wukong_colrms_f32_parallel(
 ///
 /// # Safety
 /// `x` valid for `rows*cols`, `out` for `cols` f32, non-overlapping.
+/// **Aliasing: all operands disjoint** — `out` does not overlap `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_colsumsq_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
     if rows <= 0 || cols <= 0 {
@@ -839,6 +856,8 @@ pub unsafe extern "C" fn wukong_colsumsq_f32(x: *const f32, out: *mut f32, rows:
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_colsumsq_f32`].
+/// **Aliasing:** that of [`wukong_colsumsq_f32`] — all operands disjoint: `out` does not overlap
+/// `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_colsumsq_f32_parallel(
     x: *const f32,

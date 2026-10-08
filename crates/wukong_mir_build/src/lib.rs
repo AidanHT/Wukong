@@ -28,6 +28,7 @@
 
 mod alias;
 mod canon;
+mod kernel_guard;
 mod tile;
 mod tindex;
 
@@ -49,6 +50,9 @@ use wukong_sema::{
 };
 use wukong_span::{Interner, Span, Symbol};
 use wukong_types::Ty;
+
+use alias::OperandPair;
+use kernel_guard::{pool2d_plane, GuardOperand, KernelGuard};
 
 /// Array fills and copies with at most this many elements are unrolled to straight-line
 /// operations; larger ones lower to a counted loop to keep the IR compact.
@@ -1010,6 +1014,8 @@ pub fn lower_program_with(
         // Overwritten per function, below. The module-level default is the conservative one, so a
         // recognizer reached through a path that forgot to set it declines rather than miscompiles.
         alias_free: false,
+        // No versioning context until `emit_alias_versioned` opens one around a single emitter.
+        guard: KernelGuard::Off,
         mm: interner.intern("wukong_sgemm"),
         mm_par: interner.intern("wukong_sgemm_parallel"),
         print_str: interner.intern("print_str"),
@@ -2911,8 +2917,13 @@ struct GemmSyms {
     /// every recognizer probe, so the fact cannot be dropped on the way down. `false` is the safe
     /// value, and it is what a probe with no parameter bindings gets.
     ///
-    /// Read through [`FnLowerer::all_provably_disjoint`], never directly.
+    /// Read through [`FnLowerer::all_provably_disjoint`] and [`alias::plan_kernel_alias`], never
+    /// directly.
     alias_free: bool,
+    /// Run-time alias-versioning state of the kernel dispatch being emitted (see
+    /// `kernel_guard.rs`). `Off` everywhere except inside `FnLowerer::emit_alias_versioned`, which
+    /// sets it around exactly one emitter call, the way `recognize` is cleared around a fallback.
+    guard: KernelGuard,
     mm: Symbol,
     mm_par: Symbol,
     /// Runtime print of a null-terminated string buffer (a `*u8` argument to `print`/`println`),
@@ -5128,10 +5139,15 @@ impl FnLowerer<'_> {
                 }
                 // LayerNorm / RMSNorm / L2-norm accept the out-of-place form `out = norm(x)` (`dst != arr`),
                 // the residual-stream transformer pattern, as well as the in-place form (`dst == arr`).
+                // Each is versioned on a run-time overlap test when the compiler cannot separate
+                // `out` from `x` or from an affine operand, with the window itself on the overlapping
+                // arm (`kernel_guard.rs`), so a library norm keeps its kernel for disjoint calls.
                 if let Some((n, arr, dst, n_expr, eps, gamma, beta)) =
                     self.match_layernorm(b, i, None)
                 {
-                    if self.emit_norm(arr, dst, None, &n_expr, eps, NORM_LAYERNORM, gamma, beta) {
+                    if self.emit_versioned_stmts(&b.stmts[i..i + n], |me| {
+                        me.emit_norm(arr, dst, None, &n_expr, eps, NORM_LAYERNORM, gamma, beta)
+                    }) {
                         i += n;
                         continue;
                     }
@@ -5139,7 +5155,9 @@ impl FnLowerer<'_> {
                 if let Some((n, arr, dst, n_expr, eps, gamma, beta)) =
                     self.match_rmsnorm(b, i, None)
                 {
-                    if self.emit_norm(arr, dst, None, &n_expr, eps, NORM_RMSNORM, gamma, beta) {
+                    if self.emit_versioned_stmts(&b.stmts[i..i + n], |me| {
+                        me.emit_norm(arr, dst, None, &n_expr, eps, NORM_RMSNORM, gamma, beta)
+                    }) {
                         i += n;
                         continue;
                     }
@@ -5148,7 +5166,9 @@ impl FnLowerer<'_> {
                 // Probed after RMSNorm; the two are disjoint on the reciprocal (`/N` present xor absent),
                 // so neither steals the other's window.
                 if let Some((n, arr, dst, n_expr, eps, _g, _b)) = self.match_l2norm(b, i, None) {
-                    if self.emit_norm(arr, dst, None, &n_expr, eps, NORM_L2NORM, None, None) {
+                    if self.emit_versioned_stmts(&b.stmts[i..i + n], |me| {
+                        me.emit_norm(arr, dst, None, &n_expr, eps, NORM_L2NORM, None, None)
+                    }) {
                         i += n;
                         continue;
                     }
@@ -5160,21 +5180,30 @@ impl FnLowerer<'_> {
                 // the generic vectorizer. Fold to the serial scan kernel (1 row = no parallelism). Each
                 // window is 2 statements (`let acc` + `for`). Disjoint from the norm windows above (a
                 // norm's opening reduction loop has a 1-statement inner body, never the scan's
-                // `out[i] = acc` writeback), so probe order among them is immaterial.
+                // `out[i] = acc` writeback), so probe order among them is immaterial. Each scan's
+                // `out` may be EXACTLY its input but not a shifted view of it, so an operand pair the
+                // compiler cannot separate is versioned with the 2-statement window on the
+                // overlapping arm (`emit_versioned_stmts`), rather than declined outright.
                 if let Some(nest) = self.match_cumsum_1d(b, i) {
-                    if self.emit_cumsum(&nest, false) {
+                    if self
+                        .emit_versioned_stmts(&b.stmts[i..i + 2], |me| me.emit_cumsum(&nest, false))
+                    {
                         i += 2;
                         continue;
                     }
                 }
                 if let Some(nest) = self.match_cumprod_1d(b, i) {
-                    if self.emit_cumprod(&nest, false) {
+                    if self.emit_versioned_stmts(&b.stmts[i..i + 2], |me| {
+                        me.emit_cumprod(&nest, false)
+                    }) {
                         i += 2;
                         continue;
                     }
                 }
                 if let Some(nest) = self.match_lrscan_1d(b, i) {
-                    if self.emit_lrscan(&nest, false) {
+                    if self
+                        .emit_versioned_stmts(&b.stmts[i..i + 2], |me| me.emit_lrscan(&nest, false))
+                    {
                         i += 2;
                         continue;
                     }
@@ -6439,7 +6468,23 @@ impl FnLowerer<'_> {
     /// source omits the bounds check, so passing a huge table height keeps the kernel's out-of-range→zero
     /// clamp from ever firing on the in-range ids a well-typed program produces (both backends call the
     /// identical kernel, so the differential gate holds regardless of the sentinel value).
+    ///
+    /// **Aliasing.** `out` must be disjoint from `weight` AND from `ids` (an `i32` index buffer, so an
+    /// overlap is a type pun as well as an ordering hazard) — for the serial kernel as much as the
+    /// parallel one, because the serial `copy_row` moves eight lanes at a time and its own `# Safety`
+    /// says "non-overlapping". A pair the compiler cannot separate is versioned at run time
+    /// (`kernel_guard.rs`), and its may-overlap arm is the SOURCE LOOP, never a kernel. That replaced
+    /// a guard that fired only on the `@parallel` arm (aliasing was diagnosed as a threading hazard
+    /// when it is a single-threaded semantics hazard), routed overlap to the serial kernel its own
+    /// contract excludes, and never range-tested `ids`. `@parallel fn embed(ids, weight, mut out)`
+    /// called as `embed(ids, buf, buf)` once printed 2432 / 2456 / 2400 / 1120 / 1280 over five native
+    /// runs where the nest prints 2400.
     fn emit_embedding(&mut self, nest: &EmbeddingNest, parallel: bool) -> bool {
+        // A weight with no compile-time extent cannot be range-tested, so only a compile-time proof
+        // lets the kernel run; anything else lowers the source loop.
+        if nest.w_total.is_none() && !self.provably_disjoint(nest.out, nest.weight) {
+            return false;
+        }
         let Some([out, weight, ids]) = self.kernel_base_ptrs([nest.out, nest.weight, nest.ids])
         else {
             return false;
@@ -6454,123 +6499,37 @@ impl FnLowerer<'_> {
         let v = self
             .builder
             .build(MirType::I64, Op::ConstInt(1i128 << 48, MirType::I64));
-        let args = vec![out, weight, ids, t_rows, h, v];
-        // The parallel gather writes `out` rows from several cores while every core reads `weight`, so
-        // it is only equivalent to this nest when the two buffers do not overlap — see
-        // `emit_nonoverlapping_call`, which picks the serial kernel when they may.
-        match (parallel, nest.w_total) {
-            (true, Some(w_total)) => {
-                let out_elems = self
-                    .builder
-                    .build(MirType::I64, Op::Bin(BinOp::Mul, t_rows, h));
-                let w_elems = self
-                    .builder
-                    .build(MirType::I64, Op::ConstInt(w_total as i128, MirType::I64));
-                self.emit_nonoverlapping_call(
-                    self.gemm.embedding,
-                    self.gemm.embedding_par,
-                    args,
-                    (out, out_elems),
-                    (weight, w_elems),
-                );
-            }
-            // A weight with no compile-time extent: nothing to bound the read range with, so the
-            // overlap question cannot be settled and the serial kernel stands.
-            _ => {
-                self.builder.build_void(Op::Call {
-                    func: self.gemm.embedding,
-                    args,
-                });
-            }
+        let out_elems = self.guard_extent(t_rows, h);
+        let mut ops = vec![
+            GuardOperand::new(nest.out, out, out_elems, MirType::F32),
+            GuardOperand::new(nest.ids, ids, t_rows, MirType::I32),
+        ];
+        let mut pairs = vec![OperandPair::disjoint(0, 1)];
+        if let Some(w_total) = nest.w_total {
+            let w_elems = self
+                .builder
+                .build(MirType::I64, Op::ConstInt(w_total as i128, MirType::I64));
+            ops.push(GuardOperand::new(
+                nest.weight,
+                weight,
+                w_elems,
+                MirType::F32,
+            ));
+            pairs.push(OperandPair::disjoint(0, 2));
         }
-        true
-    }
-
-    /// Emit `par(args)` when the two f32 buffers `a[0..a_elems)` and `b[0..b_elems)` do not overlap at
-    /// run time, and `ser(args)` when they may.
-    ///
-    /// **The general rule this is one instance of.** A recognized kernel equals the nest it replaced
-    /// only under a disjointness precondition, because it reorders the loop; threading is one
-    /// consequence of violating that precondition, not the violation. The framing this comment used
-    /// to carry — "the guard the `_parallel` kernels' documented `non-overlapping` precondition
-    /// needs" — reads as though non-`@parallel` code is safe, and it is not: `fn mm(a, b, mut c)`
-    /// called `mm(x, y, x)` and `fn tr(a, mut o)` called `tr(x, x)` are both wrong at one thread,
-    /// at `-O0` and at `-O2`, with no `@parallel` anywhere.
-    ///
-    /// So there are two forms of the fix and this is only the cheaper one:
-    ///
-    /// * **Runtime versioning** (here). Usable when BOTH callees compute the nest and differ only in
-    ///   how much aliasing they tolerate. That is true of exactly two families —
-    ///   `wukong_embedding_f32{,_parallel}` and `wukong_scatter_add_f32{,_parallel}` — whose serial
-    ///   forms touch rows in the same ascending order as the nest and are therefore alias-tolerant
-    ///   whatever their `# Safety` blocks currently say. It is the LLVM `LoopVersioning` /
-    ///   Polly runtime-alias-check shape.
-    /// * **Compile-time decline** ([`FnLowerer::all_provably_disjoint`], used by GEMM, GEMV, GEVM,
-    ///   transpose, pool2d, the col/row reductions, the scans and the norm backwards). For those
-    ///   there IS no alias-tolerant callee to branch to; the only correct may-overlap arm is the
-    ///   scalar nest, and the `emit_*` contract ("bails (false) … the caller then lowers the scalar
-    ///   nest") makes that a compile-time decision. It is the `LoopIdiomRecognize` shape.
-    ///
-    /// The recognizer's symbol comparison (`out == weight`) cannot decide this: two distinct array
-    /// PARAMETERS can be bound to the same array at the call site. `@parallel fn embed(ids, weight, mut
-    /// out)` called as `embed(ids, buf, buf)` printed 2432 / 2456 / 2400 / 1120 / 1280 over five
-    /// consecutive native runs where the serial kernel and the scalar nest both print 2400.
-    ///
-    /// The test is on the byte ranges through `PtrToInt` — the one pointer cast the interpreter
-    /// (`Value::Ptr(p) -> p as i128`) and Cranelift (an integer resize) both implement. Under the
-    /// interpreter's *slot* memory the `*4` byte scaling makes both ranges wider than the real ones, so
-    /// it can only over-report overlap and pick the serial kernel; the interpreter runs one arm for both
-    /// symbols, so the choice is unobservable there. Aliasing is caught on either backend regardless:
-    /// equal bases can never satisfy `a_end <= b || b_end <= a` for non-empty ranges.
-    fn emit_nonoverlapping_call(
-        &mut self,
-        ser: Symbol,
-        par: Symbol,
-        args: Vec<ValueId>,
-        (a, a_elems): (ValueId, ValueId),
-        (b, b_elems): (ValueId, ValueId),
-    ) {
-        let esize = self
-            .builder
-            .build(MirType::I64, Op::ConstInt(4, MirType::I64));
-        let range = |me: &mut Self, p: ValueId, elems: ValueId| {
-            let lo = me
-                .builder
-                .build(MirType::I64, Op::Cast(CastKind::PtrToInt, p, MirType::I64));
-            let bytes = me
-                .builder
-                .build(MirType::I64, Op::Bin(BinOp::Mul, elems, esize));
-            let hi = me
-                .builder
-                .build(MirType::I64, Op::Bin(BinOp::Add, lo, bytes));
-            (lo, hi)
+        if !self.open_kernel_guard(&ops, &pairs) {
+            return false;
+        }
+        let func = if parallel {
+            self.gemm.embedding_par
+        } else {
+            self.gemm.embedding
         };
-        let (a_lo, a_hi) = range(self, a, a_elems);
-        let (b_lo, b_hi) = range(self, b, b_elems);
-        let a_below = self
-            .builder
-            .build(MirType::I1, Op::Cmp(CmpOp::Ule, a_hi, b_lo));
-        let b_below = self
-            .builder
-            .build(MirType::I1, Op::Cmp(CmpOp::Ule, b_hi, a_lo));
-        let disjoint = self
-            .builder
-            .build(MirType::I1, Op::Bin(BinOp::Or, a_below, b_below));
-        let par_blk = self.builder.new_block();
-        let ser_blk = self.builder.new_block();
-        let join = self.builder.new_block();
-        self.builder
-            .cond_br(disjoint, par_blk, vec![], ser_blk, vec![]);
-        self.builder.switch_to(par_blk);
         self.builder.build_void(Op::Call {
-            func: par,
-            args: args.clone(),
+            func,
+            args: vec![out, weight, ids, t_rows, h, v],
         });
-        self.builder.br(join, vec![]);
-        self.builder.switch_to(ser_blk);
-        self.builder.build_void(Op::Call { func: ser, args });
-        self.builder.br(join, vec![]);
-        self.builder.switch_to(join);
+        true
     }
 
     /// Recognize the **scatter-add / embedding-gradient backward** — the dual of the embedding gather:
@@ -6678,30 +6637,31 @@ impl FnLowerer<'_> {
         let v = self
             .builder
             .build(MirType::I64, Op::Bin(BinOp::UDiv, total, h));
-        let args = vec![grad_w, grad_out, ids, t_rows, h, v];
-        if parallel {
-            // The parallel scatter accumulates into `grad_w` from several cores while every core reads
-            // `grad_out`; two distinct array parameters can be the same array at the call site, so the
-            // kernel's non-overlap precondition is a run-time question (see `emit_nonoverlapping_call`).
-            let go_elems = self
-                .builder
-                .build(MirType::I64, Op::Bin(BinOp::Mul, t_rows, h));
-            let gw_elems = self
-                .builder
-                .build(MirType::I64, Op::ConstInt(nest.total as i128, MirType::I64));
-            self.emit_nonoverlapping_call(
-                self.gemm.scatter_add,
-                self.gemm.scatter_add_par,
-                args,
-                (grad_w, gw_elems),
-                (grad_out, go_elems),
-            );
-        } else {
-            self.builder.build_void(Op::Call {
-                func: self.gemm.scatter_add,
-                args,
-            });
+        // `grad_w` is accumulated into while `grad_out` and `ids` are read, so it must be disjoint
+        // from both — for the serial kernel too (scatter.rs's own `# Safety` says non-overlapping, and
+        // the threads are only one way to violate it). A pair the compiler cannot separate is
+        // versioned at run time, with the SOURCE LOOP on the may-overlap arm (`kernel_guard.rs`).
+        let go_elems = self.guard_extent(t_rows, h);
+        let ops = [
+            GuardOperand::new(nest.grad_w, grad_w, total, MirType::F32),
+            GuardOperand::new(nest.grad_out, grad_out, go_elems, MirType::F32),
+            GuardOperand::new(nest.ids, ids, t_rows, MirType::I32),
+        ];
+        if !self.open_kernel_guard(
+            &ops,
+            &[OperandPair::disjoint(0, 1), OperandPair::disjoint(0, 2)],
+        ) {
+            return false;
         }
+        let func = if parallel {
+            self.gemm.scatter_add_par
+        } else {
+            self.gemm.scatter_add
+        };
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![grad_w, grad_out, ids, t_rows, h, v],
+        });
         true
     }
 
@@ -8117,23 +8077,13 @@ impl FnLowerer<'_> {
         let opv = self
             .builder
             .build(MirType::I64, Op::ConstInt(op as i128, MirType::I64));
-        if gamma.is_none() && beta.is_none() {
-            let func = if batched_parallel {
-                self.gemm.norm_par
-            } else {
-                self.gemm.norm
-            };
-            self.builder.build_void(Op::Call {
-                func,
-                args: vec![xv, dstv, rows, nval, epsv, opv],
-            });
-            return true;
-        }
         // Affine: resolve gamma/beta to their array base pointers. An absent param is a null pointer,
         // built as an integer `0` (a `Ptr`-typed `ConstInt` is invalid MIR; the verifier requires
         // integer-typed int consts). On the native side ptr_ty == i64, so the i64 zero is passed as the
         // null pointer the kernel checks; the interpreter sees a `Value::Int(0)` (distinct from any
         // real array's `Value::Ptr` by variant) and marshals it as absent → scale-1 / shift-0.
+        // Resolved BEFORE the alias guard below: it is this emitter's last possible decline, and
+        // the guard's protocol forbids declining once it has opened.
         let ptr_or_null = |me: &mut Self, sym: Option<Symbol>| -> Option<ValueId> {
             match sym {
                 // Resolve through the kernel base-pointer path (not a raw slot read) so a `[]f32`
@@ -8147,8 +8097,52 @@ impl FnLowerer<'_> {
                 ),
             }
         };
-        let (Some(gptr), Some(bptr)) = (ptr_or_null(self, gamma), ptr_or_null(self, beta)) else {
+        let affine = if gamma.is_none() && beta.is_none() {
+            None
+        } else {
+            let (Some(gptr), Some(bptr)) = (ptr_or_null(self, gamma), ptr_or_null(self, beta))
+            else {
+                return false;
+            };
+            Some((gptr, bptr))
+        };
+        // norm.rs: `out` may be EXACTLY `x` (the in-place form, `dst == arr`, is the same symbol and
+        // needs no test) and must not otherwise overlap it — the kernel reads a whole row before it
+        // writes that row, while a SHIFTED `out` lets one row's stores reach the rows the source
+        // loop reads next. `gamma`/`beta` are re-read on every row's apply, so they must not overlap
+        // `out` at all. Each pair the compiler cannot separate is versioned at run time with the
+        // source window on the overlapping arm (`kernel_guard.rs`); with no versioning context it
+        // declines, which lowers the same window.
+        let total = self.guard_extent(rows, nval);
+        let mut ops = vec![
+            GuardOperand::new(arr, xv, total, MirType::F32),
+            GuardOperand::new(dst, dstv, total, MirType::F32),
+        ];
+        let mut pairs = vec![OperandPair::exact_in_place(0, 1)];
+        if let Some((gptr, bptr)) = affine {
+            if let Some(g) = gamma {
+                pairs.push(OperandPair::disjoint(ops.len(), 1));
+                ops.push(GuardOperand::new(g, gptr, nval, MirType::F32));
+            }
+            if let Some(b) = beta {
+                pairs.push(OperandPair::disjoint(ops.len(), 1));
+                ops.push(GuardOperand::new(b, bptr, nval, MirType::F32));
+            }
+        }
+        if !self.open_kernel_guard(&ops, &pairs) {
             return false;
+        }
+        let Some((gptr, bptr)) = affine else {
+            let func = if batched_parallel {
+                self.gemm.norm_par
+            } else {
+                self.gemm.norm
+            };
+            self.builder.build_void(Op::Call {
+                func,
+                args: vec![xv, dstv, rows, nval, epsv, opv],
+            });
+            return true;
         };
         let func = if batched_parallel {
             self.gemm.norm_affine_par
@@ -8192,14 +8186,17 @@ impl FnLowerer<'_> {
     ///
     /// SOUNDNESS. `src != dst` (a self-copy is not this window) and the copy's trip count is
     /// structurally the norm's `N`, so the elided pass wrote exactly the elements the kernel now
-    /// sources from `src` instead. Partial overlap between two distinct array symbols is out of
-    /// contract here for the same reason it is for every other recognizer and for the vectorizer
-    /// ("distinct array parameters are assumed not to alias (the usual kernel ABI)") — and note the
-    /// pass being removed, an 8-wide `wukong_velem_f32`, was never faithful to the scalar ascending
-    /// copy under overlap either. An affine `gamma`/`beta` cannot be the destination (the note at
-    /// that point in the body says why), which is the one thing besides overlap that would make
-    /// eliding the copy wrong. A `let` inside the window that rebinds `src` or `dst` is declined,
-    /// since the matchers below compare interned names rather than resolved bindings.
+    /// sources from `src` instead. Partial overlap between two distinct array symbols is NOT out of
+    /// contract — no such contract exists: two distinct parameters can be bound to one buffer at a
+    /// call site. Fusing is exact when `src` and `dst` are disjoint or the same buffer (the copy is
+    /// then the identity); any other overlap makes the ascending copy feed the norm values the
+    /// kernel would read from `src` before they were overwritten. So the dispatch goes through the
+    /// alias classifier like every other kernel (`emit_norm`'s guard), versioned at run time with
+    /// the copy and the window on the overlapping arm. (The pass being removed, an 8-wide
+    /// `wukong_velem_f32`, was never faithful to the scalar ascending copy under overlap either.)
+    /// An affine `gamma`/`beta` cannot be the destination (the note at that point in the body says
+    /// why). A `let` inside the window that rebinds `src` or `dst` is declined, since the matchers
+    /// below compare interned names rather than resolved bindings.
     fn try_fuse_copy_norm(&mut self, b: &Block, at: usize) -> Option<usize> {
         let (cv, n_copy, cbody) = self.as_range0_for(&b.stmts[at])?;
         let cstmt = single_stmt(cbody)?;
@@ -8237,7 +8234,13 @@ impl FnLowerer<'_> {
         if window_rebinds(window, src) || window_rebinds(window, dst) {
             return None;
         }
-        if !self.emit_norm(src, dst, None, &n_expr, eps, op, gamma, beta) {
+        // `norm(src, dst)` equals copy-then-normalize when `src` and `dst` are disjoint or the SAME
+        // buffer (the copy is then the identity); a shifted overlap is neither, and the scalar
+        // ascending copy followed by the in-place norm is the program. A pair the compiler cannot
+        // separate is versioned at run time with the copy AND the window on the overlapping arm.
+        if !self.emit_versioned_stmts(&b.stmts[at..at + 1 + n], |me| {
+            me.emit_norm(src, dst, None, &n_expr, eps, op, gamma, beta)
+        }) {
             return None;
         }
         Some(1 + n)
@@ -9712,18 +9715,22 @@ impl FnLowerer<'_> {
     /// dispatched with no disjointness reasoning at all. `fn mm(a, b, mut c)` called `mm(x, y, x)`
     /// printed `10 10 10 10 …` on **both** backends where the nest says `10 19 36 69 …`; an aliased
     /// recognized transpose printed one answer on interp, a second natively and a third with
-    /// recognition off. Declining restores the one answer the program actually has.
+    /// recognition off. Running the nest restores the one answer the program actually has.
+    ///
+    /// This is the COMPILE-TIME half. A kernel emitter does not stop at it: it asks
+    /// [`Self::open_kernel_guard`] (`kernel_guard.rs`), which classifies each constrained pair through
+    /// the same [`alias::plan_kernel_alias`] and turns a pair this test cannot prove into a run-time
+    /// overlap check with the source loop on the overlapping arm, rather than a decline.
     ///
     /// Three facts settle it, and all three are needed:
     ///
     /// * Inside the function, two operands spelled with the SAME symbol are the same storage. That
     ///   half was already tested by sixteen recognizers as `out == x`, and it is the weakest of the
-    ///   three — the guard's own doc at [`Self::emit_nonoverlapping_call`] says a symbol comparison
-    ///   "cannot decide this: two distinct array PARAMETERS can be bound to the same array at the
-    ///   call site."
+    ///   three: a symbol comparison cannot establish disjointness, because two distinct array
+    ///   PARAMETERS can be bound to the same array at the call site. It can only ever decline.
     /// * Across functions, whether any call site does exactly that. `GemmSyms::alias_free` carries
     ///   the whole-program answer (see `alias.rs`); when it is `false`, nothing in this function is
-    ///   provably disjoint from anything else and every such kernel declines.
+    ///   provably disjoint from anything else at compile time.
     /// * Inside the function again, whether two DIFFERENT symbols are one buffer. A `[]T`/`*T`/`&T`
     ///   `let` is a view — `let mut sa: []f32 = a;` stores `a`'s base pointer into `sa`'s fat
     ///   pointer with no element copy — and a borrowing place handed to an aggregate literal makes
@@ -9741,29 +9748,19 @@ impl FnLowerer<'_> {
     }
 
     /// The N-operand form of [`Self::provably_disjoint`]; see there for the whole argument.
+    ///
+    /// Answered by the same classifier every kernel emit site asks ([`alias::plan_kernel_alias`]):
+    /// `true` exactly when every pair is [`alias::KernelAlias::Disjoint`]. This is the compile-time
+    /// question only; an emitter that can version its dispatch at run time asks
+    /// [`Self::open_kernel_guard`] instead, which turns a `MayAlias` pair into an overlap test
+    /// rather than a decline.
     fn all_provably_disjoint(&self, syms: &[Symbol]) -> bool {
-        if !self.gemm.alias_free {
-            return false;
-        }
-        for (i, a) in syms.iter().enumerate() {
-            if syms[i + 1..].contains(a) {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// [`Self::kernel_base_ptrs`] for a kernel whose operands must be mutually disjoint: resolves
-    /// the base pointers only when [`Self::all_provably_disjoint`] holds for all of them, and
-    /// otherwise returns `None`, which every caller turns into "decline, lower the scalar nest".
-    fn kernel_base_ptrs_disjoint<const N: usize>(
-        &mut self,
-        syms: [Symbol; N],
-    ) -> Option<[ValueId; N]> {
-        if !self.all_provably_disjoint(&syms) {
-            return None;
-        }
-        self.kernel_base_ptrs(syms)
+        syms.iter().enumerate().all(|(i, &a)| {
+            syms[i + 1..].iter().all(|&b| {
+                alias::classify_kernel_operands(self.gemm.alias_free, a, b)
+                    == alias::KernelAlias::Disjoint
+            })
+        })
     }
 
     /// The base pointer of a kernel operand written as an *expression* — the `Expr` twin of
@@ -9789,19 +9786,6 @@ impl FnLowerer<'_> {
     /// then lowers computes `bias + s` / `alpha·s` correctly, so declining is always safe; the α and
     /// bias declines happen after a few dim/GEP instructions have been built, which are simply dead.
     fn emit_sgemm(&mut self, nest: &MatmulNest<'_>, parallel: bool) -> bool {
-        if nest
-            .bias
-            .as_ref()
-            .is_some_and(|(bias, _)| !self.provably_disjoint(nest.c, *bias))
-        {
-            return false;
-        }
-        // The kernel writes `C` in tiled order while `A`/`B` are still being read, so it equals the
-        // nest only when `C` is disjoint from both. `A` and `B` may be one buffer (`A·Aᵀ` is a real
-        // nest). Declining lowers the loop as written, which is what the program means.
-        if !self.provably_disjoint(nest.a, nest.c) || !self.provably_disjoint(nest.b, nest.c) {
-            return false;
-        }
         let (Some(a), Some(b), Some(c)) = (
             self.kernel_base_ptr(nest.a),
             self.kernel_base_ptr(nest.b),
@@ -9839,6 +9823,9 @@ impl FnLowerer<'_> {
         let beta = self
             .builder
             .build(MirType::I64, Op::ConstInt(nest.beta as i128, MirType::I64));
+        // The fused bias, when there is one, is a fourth buffer the epilogue reads while `C` is
+        // being written, so it joins the alias guard below.
+        let mut bias_operand: Option<(Symbol, ValueId)> = None;
         // Fused per-column bias `C = A·Bᵀ + bias[j]` and/or an activation written into the store
         // (`C = act(A·Bᵀ [+ bias[j]])` — the GPT-2 projection `q = x·Wᵀ + b`, the LLaMA SwiGLU gate
         // `silu(x·W1ᵀ + b1)`). Routes to the fused epilogue kernel `wukong_sgemm_nt_epi` (beta from the
@@ -9847,7 +9834,7 @@ impl FnLowerer<'_> {
         // shape (or a coexisting α, which the kernel has no parameter for) declines to the scalar nest,
         // which computes `act(bias + s)` correctly. Bit-identical to the unfused GEMM → bias →
         // activation the interpreter marshals as the oracle.
-        if nest.bias.is_some() || nest.act != EPI_ACT_IDENTITY {
+        let (func, args) = if nest.bias.is_some() || nest.act != EPI_ACT_IDENTITY {
             // Decline unless the nest is NT (and not TN), and never with a coexisting α.
             if !nest.transposed || nest.transposed_a || nest.alpha.is_some() {
                 return false;
@@ -9860,7 +9847,9 @@ impl FnLowerer<'_> {
                     let Some(bias_p) = self.kernel_base_ptr(*bias_base) else {
                         return false;
                     };
-                    self.offset_base(bias_p, bias_off)
+                    let bias_p = self.offset_base(bias_p, bias_off);
+                    bias_operand = Some((*bias_base, bias_p));
+                    bias_p
                 }
                 None => self
                     .builder
@@ -9874,20 +9863,15 @@ impl FnLowerer<'_> {
             } else {
                 self.gemm.nt_epi
             };
-            self.builder.build_void(Op::Call {
-                func,
-                args: vec![a, b, c, m, k, n, beta, bias_p, act_v],
-            });
-            return true;
-        }
-        // α-scaled `C = alpha·(A·Bᵀ)` (the attention score `QKᵀ/√d`) → `wukong_sgemm_nt_alpha`, which
-        // folds the scale into the C-tile writeback (no second pass over C). The α kernel is **NT only**;
-        // any other shape (plain `A·B`, TN) declines to the scalar nest — which computes `alpha·s`
-        // correctly — rather than emitting an UNSCALED kernel that would silently drop the scale. Batch/
-        // head offsets are already applied to `a`/`b`/`c` above, so a *batched* α matmul (multi-head
-        // attention scores) works: the per-head sub-matmul is `alpha·(A·Bᵀ)` under a constant base shift.
-        if let Some(alpha) = nest.alpha {
-            // NT only (and not TN) — see above.
+            (func, vec![a, b, c, m, k, n, beta, bias_p, act_v])
+        } else if let Some(alpha) = nest.alpha {
+            // α-scaled `C = alpha·(A·Bᵀ)` (the attention score `QKᵀ/√d`) → `wukong_sgemm_nt_alpha`,
+            // which folds the scale into the C-tile writeback (no second pass over C). The α kernel is
+            // **NT only**; any other shape (plain `A·B`, TN) declines to the scalar nest — which
+            // computes `alpha·s` correctly — rather than emitting an UNSCALED kernel that would
+            // silently drop the scale. Batch/head offsets are already applied to `a`/`b`/`c` above, so
+            // a *batched* α matmul (multi-head attention scores) works: the per-head sub-matmul is
+            // `alpha·(A·Bᵀ)` under a constant base shift.
             if !nest.transposed || nest.transposed_a {
                 return false;
             }
@@ -9899,26 +9883,43 @@ impl FnLowerer<'_> {
             } else {
                 self.gemm.nt_alpha
             };
-            self.builder.build_void(Op::Call {
-                func,
-                args: vec![a, b, c, m, k, n, beta, alpha_v],
-            });
-            return true;
-        }
-        let func = match (parallel, nest.transposed_a, nest.transposed) {
-            (false, false, false) => self.gemm.mm,
-            (true, false, false) => self.gemm.mm_par,
-            (false, false, true) => self.gemm.nt,
-            (true, false, true) => self.gemm.nt_par,
-            (false, true, false) => self.gemm.tn,
-            (true, true, false) => self.gemm.tn_par,
-            // `Aᵀ·Bᵀ` (both transposed) has no kernel; the guard above already declined it.
-            (_, true, true) => return false,
+            (func, vec![a, b, c, m, k, n, beta, alpha_v])
+        } else {
+            let func = match (parallel, nest.transposed_a, nest.transposed) {
+                (false, false, false) => self.gemm.mm,
+                (true, false, false) => self.gemm.mm_par,
+                (false, false, true) => self.gemm.nt,
+                (true, false, true) => self.gemm.nt_par,
+                (false, true, false) => self.gemm.tn,
+                (true, true, false) => self.gemm.tn_par,
+                // `Aᵀ·Bᵀ` (both transposed) has no kernel; the guard above already declined it.
+                (_, true, true) => return false,
+            };
+            (func, vec![a, b, c, m, k, n, beta])
         };
-        self.builder.build_void(Op::Call {
-            func,
-            args: vec![a, b, c, m, k, n, beta],
-        });
+        // The kernel writes `C` in tiled order while `A`/`B` (and the fused bias) are still being
+        // read, so it equals the nest only when `C` is disjoint from every one of them. `A` and `B`
+        // may be one buffer (`A·Aᵀ` is a real nest). The same symbol declines at compile time; two
+        // names the compiler cannot separate are tested at run time, with the nest as written on the
+        // overlapping arm. Every decline above has already been taken: past the guard, the call is
+        // emitted unconditionally, which `open_kernel_guard`'s protocol requires.
+        let a_elems = self.guard_extent(m, k);
+        let b_elems = self.guard_extent(k, n);
+        let c_elems = self.guard_extent(m, n);
+        let mut ops = vec![
+            GuardOperand::new(nest.a, a, a_elems, MirType::F32),
+            GuardOperand::new(nest.b, b, b_elems, MirType::F32),
+            GuardOperand::new(nest.c, c, c_elems, MirType::F32),
+        ];
+        let mut pairs = vec![OperandPair::disjoint(0, 2), OperandPair::disjoint(1, 2)];
+        if let Some((bias_sym, bias_p)) = bias_operand {
+            ops.push(GuardOperand::new(bias_sym, bias_p, n, MirType::F32));
+            pairs.push(OperandPair::disjoint(3, 2));
+        }
+        if !self.open_kernel_guard(&ops, &pairs) {
+            return false;
+        }
+        self.builder.build_void(Op::Call { func, args });
         true
     }
 
@@ -9963,13 +9964,6 @@ impl FnLowerer<'_> {
         // for a fixed `[f32; N]` array `kernel_base_ptr` returns the identical slot address, so recognized
         // fixed-array GEMV MIR is byte-for-byte unchanged.
         //
-        // `wukong_sgemv`'s own contract (gemv.rs) is "`y` must not overlap `a` or `x`": each row's
-        // dot is folded before the store, and a later row would then read a value the store already
-        // replaced. An aliased `gv(m, v, v)` was a THREE-way split — interp `30 70 110 150`, native
-        // `30 70 1051 1479`, the nest `30 215 2501 40979`. Decline to the nest.
-        if !self.provably_disjoint(nest.a, nest.y) || !self.provably_disjoint(nest.x, nest.y) {
-            return false;
-        }
         let (Some(a), Some(x), Some(y)) = (
             self.kernel_base_ptr(nest.a),
             self.kernel_base_ptr(nest.x),
@@ -9982,7 +9976,7 @@ impl FnLowerer<'_> {
         };
         // α-scaled store `y[i] = s * c` → `wukong_sgemv_alpha`: the identical row dot with the scale
         // applied exactly once on the store (the same single f32 multiply the scalar nest performs).
-        if let Some(alpha) = nest.alpha {
+        let (func, args) = if let Some(alpha) = nest.alpha {
             let Some(alpha_v) = self.alpha_value(alpha) else {
                 return false;
             };
@@ -9991,21 +9985,33 @@ impl FnLowerer<'_> {
             } else {
                 self.gemm.sgemv_alpha
             };
-            self.builder.build_void(Op::Call {
-                func,
-                args: vec![a, x, y, m, n, alpha_v],
-            });
-            return true;
-        }
-        let func = if parallel {
-            self.gemm.sgemv_par
+            (func, vec![a, x, y, m, n, alpha_v])
         } else {
-            self.gemm.sgemv
+            let func = if parallel {
+                self.gemm.sgemv_par
+            } else {
+                self.gemm.sgemv
+            };
+            (func, vec![a, x, y, m, n])
         };
-        self.builder.build_void(Op::Call {
-            func,
-            args: vec![a, x, y, m, n],
-        });
+        // `wukong_sgemv`'s own contract (gemv.rs) is "`y` must not overlap `a` or `x`": each row's
+        // dot is folded before the store, and a later row would then read a value the store already
+        // replaced. An aliased `gv(m, v, v)` was a THREE-way split — interp `30 70 110 150`, native
+        // `30 70 1051 1479`, the nest `30 215 2501 40979`. The same symbol declines; two names the
+        // compiler cannot separate are versioned at run time with the nest on the overlapping arm.
+        let a_elems = self.guard_extent(m, n);
+        let ops = [
+            GuardOperand::new(nest.a, a, a_elems, MirType::F32),
+            GuardOperand::new(nest.x, x, n, MirType::F32),
+            GuardOperand::new(nest.y, y, m, MirType::F32),
+        ];
+        if !self.open_kernel_guard(
+            &ops,
+            &[OperandPair::disjoint(0, 2), OperandPair::disjoint(1, 2)],
+        ) {
+            return false;
+        }
+        self.builder.build_void(Op::Call { func, args });
         true
     }
 
@@ -10017,11 +10023,6 @@ impl FnLowerer<'_> {
     /// would reassociate per-thread partials). One symbol serves both store forms: the unscaled
     /// nest passes α = 1.0, which the kernel skips (byte-identical to a never-scaled fold).
     fn emit_gevm(&mut self, nest: &GevmNest, parallel: bool) -> bool {
-        // gevm.rs: "`out` must not overlap `w` or `a`" — the column stripes fold ascending `i`
-        // over the whole of `a` while `out` is being written.
-        if !self.provably_disjoint(nest.w, nest.out) || !self.provably_disjoint(nest.a, nest.out) {
-            return false;
-        }
         let Some([w, a, out]) = self.kernel_base_ptrs([nest.w, nest.a, nest.out]) else {
             return false;
         };
@@ -10032,6 +10033,21 @@ impl FnLowerer<'_> {
         let Some(alpha_v) = self.alpha_value(nest.alpha.unwrap_or(AlphaScale::Lit(1.0))) else {
             return false;
         };
+        // gevm.rs: "`out` must not overlap `w` or `a`" — the column stripes fold ascending `i`
+        // over the whole of `a` while `out` is being written. Versioned at run time when the
+        // compiler cannot separate them (`kernel_guard.rs`).
+        let a_elems = self.guard_extent(rows, cols);
+        let ops = [
+            GuardOperand::new(nest.w, w, rows, MirType::F32),
+            GuardOperand::new(nest.a, a, a_elems, MirType::F32),
+            GuardOperand::new(nest.out, out, cols, MirType::F32),
+        ];
+        if !self.open_kernel_guard(
+            &ops,
+            &[OperandPair::disjoint(0, 2), OperandPair::disjoint(1, 2)],
+        ) {
+            return false;
+        }
         let func = if parallel {
             self.gemm.gevm_par
         } else {
@@ -10049,12 +10065,6 @@ impl FnLowerer<'_> {
     /// call site, so the caller lowers the scalar nest. `parallel` selects the multicore kernel (rows
     /// are independent, so it is bit-identical to the serial one the interpreter runs).
     fn emit_i8gemm(&mut self, nest: &I8MatmulNest, parallel: bool) -> bool {
-        // The kernel writes `C` in tiled order while `A`/`B` are still being read, so it equals the
-        // nest only when `C` is disjoint from both. `A` and `B` may be one buffer (`A·Aᵀ` is a real
-        // nest). Declining lowers the loop as written, which is what the program means.
-        if !self.provably_disjoint(nest.a, nest.c) || !self.provably_disjoint(nest.b, nest.c) {
-            return false;
-        }
         let Some([a, b, c]) = self.kernel_base_ptrs([nest.a, nest.b, nest.c]) else {
             return false;
         };
@@ -10065,6 +10075,24 @@ impl FnLowerer<'_> {
         ) else {
             return false;
         };
+        // The kernel writes `C` in tiled order while `A`/`B` are still being read, so it equals the
+        // nest only when `C` is disjoint from both. `A` and `B` may be one buffer (`A·Aᵀ` is a real
+        // nest). A may-alias pair is versioned at run time, with the loop as written on the
+        // overlapping arm. `u8`×`i8` inputs, `i32` output.
+        let a_elems = self.guard_extent(m, k);
+        let b_elems = self.guard_extent(k, n);
+        let c_elems = self.guard_extent(m, n);
+        let ops = [
+            GuardOperand::new(nest.a, a, a_elems, MirType::I8),
+            GuardOperand::new(nest.b, b, b_elems, MirType::I8),
+            GuardOperand::new(nest.c, c, c_elems, MirType::I32),
+        ];
+        if !self.open_kernel_guard(
+            &ops,
+            &[OperandPair::disjoint(0, 2), OperandPair::disjoint(1, 2)],
+        ) {
+            return false;
+        }
         let func = if parallel {
             self.gemm.i8nt_par
         } else {
@@ -10084,12 +10112,6 @@ impl FnLowerer<'_> {
     /// is bit-identical to the serial one the interpreter marshals). The widen is lossless, so the
     /// kernel equals the naive nest under the documented matmul reassociation.
     fn emit_lowp_gemm(&mut self, nest: &LowpMatmulNest, parallel: bool) -> bool {
-        // The kernel writes `C` in tiled order while `A`/`B` are still being read, so it equals the
-        // nest only when `C` is disjoint from both. `A` and `B` may be one buffer (`A·Aᵀ` is a real
-        // nest). Declining lowers the loop as written, which is what the program means.
-        if !self.provably_disjoint(nest.a, nest.c) || !self.provably_disjoint(nest.b, nest.c) {
-            return false;
-        }
         let Some([a, b, c]) = self.kernel_base_ptrs([nest.a, nest.b, nest.c]) else {
             return false;
         };
@@ -10100,6 +10122,13 @@ impl FnLowerer<'_> {
         ) else {
             return false;
         };
+        // The kernel writes `C` in tiled order while `A`/`B` are still being read, so it equals the
+        // nest only when `C` is disjoint from both. `A` and `B` may be one buffer (`A·Aᵀ` is a real
+        // nest). A may-alias pair is versioned at run time, with the loop as written on the
+        // overlapping arm.
+        if !self.open_lowp_gemm_guard(nest, [a, b, c], [m, k, n], None) {
+            return false;
+        }
         let beta = self
             .builder
             .build(MirType::I64, Op::ConstInt(0, MirType::I64));
@@ -10129,10 +10158,7 @@ impl FnLowerer<'_> {
     /// cross-channel combine). Max is idempotent and the avg sum order is fixed, so the kernel equals
     /// the scalar nest bit-for-bit (no reassociation exception).
     fn emit_pool2d(&mut self, nest: &Pool2dNest, parallel: bool) -> bool {
-        // pool2d.rs declares `x`/`out` non-overlapping: the AVX2 window fold reads eight
-        // contiguous input columns per output column, so a store can land on an input the next
-        // window still needs.
-        let Some([x, out]) = self.kernel_base_ptrs_disjoint([nest.x, nest.out]) else {
+        let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
         let (Some(channels), Some(h), Some(w)) = (
@@ -10150,6 +10176,31 @@ impl FnLowerer<'_> {
         ) else {
             return false;
         };
+        // pool2d.rs declares `x`/`out` non-overlapping: the AVX2 window fold reads eight
+        // contiguous input columns per output column, so a store can land on an input the next
+        // window still needs. Versioned at run time when the compiler cannot separate them. The
+        // planes are compile-time: `match_pool2d` admits only literal H/W/KH/KW/SH/SW and pins the
+        // source's own OH/OW to exactly the no-padding extent the kernel recomputes.
+        let (Some(in_plane), Some(out_plane)) =
+            (pool2d_plane(nest, false), pool2d_plane(nest, true))
+        else {
+            return false;
+        };
+        let in_plane = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(in_plane as i128, MirType::I64));
+        let out_plane = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(out_plane as i128, MirType::I64));
+        let x_elems = self.guard_extent(channels, in_plane);
+        let out_elems = self.guard_extent(channels, out_plane);
+        let ops = [
+            GuardOperand::new(nest.x, x, x_elems, MirType::F32),
+            GuardOperand::new(nest.out, out, out_elems, MirType::F32),
+        ];
+        if !self.open_kernel_guard(&ops, &[OperandPair::disjoint(0, 1)]) {
+            return false;
+        }
         let func = match (nest.op, parallel) {
             (POOL_MAX, false) => self.gemm.maxpool2d,
             (POOL_MAX, true) => self.gemm.maxpool2d_par,
@@ -10168,19 +10219,33 @@ impl FnLowerer<'_> {
     /// the scalar nest). `parallel` selects the multicore kernel (the row blocks write disjoint `dst`
     /// columns → bit-identical to the serial one, which is a plain permutation the interpreter marshals).
     fn emit_transpose(&mut self, nest: &TransposeNest, parallel: bool) -> bool {
-        // transpose.rs declares `src`/`dst` non-overlapping, and this is the family where the
-        // three implementations disagreed outright: an aliased 4x4 `tr(x, x)` printed
-        // `1 5 9 13 2 6 …` on interp and `1 2 3 4 2 6 …` natively, while the nest mirrors the
-        // upper triangle down and the blocked kernel produces a third answer again at >= 16x16.
-        // The recognizer's old test was the symbol compare `sbase == dbase`, which the guard's own
-        // doc says cannot decide the question for two parameters.
-        let Some([src, dst]) = self.kernel_base_ptrs_disjoint([nest.src, nest.dst]) else {
+        let Some([src, dst]) = self.kernel_base_ptrs([nest.src, nest.dst]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
         else {
             return false;
         };
+        // transpose.rs declares `src`/`dst` non-overlapping, and this is the family where the
+        // three implementations disagreed outright: an aliased 4x4 `tr(x, x)` printed
+        // `1 5 9 13 2 6 …` on interp and `1 2 3 4 2 6 …` natively, while the nest mirrors the
+        // upper triangle down and the blocked kernel produces a third answer again at >= 16x16.
+        // The recognizer's old test was the symbol compare `sbase == dbase`, which cannot decide
+        // the question for two parameters; the classifier can only decline on it. Two names it
+        // cannot separate are versioned at run time, with the nest on the overlapping arm.
+        let elem = if nest.elem_u16 {
+            MirType::I16
+        } else {
+            MirType::F32
+        };
+        let n = self.guard_extent(rows, cols);
+        let ops = [
+            GuardOperand::new(nest.src, src, n, elem.clone()),
+            GuardOperand::new(nest.dst, dst, n, elem),
+        ];
+        if !self.open_kernel_guard(&ops, &[OperandPair::disjoint(0, 1)]) {
+            return false;
+        }
         let func = match (parallel, nest.elem_u16) {
             (false, false) => self.gemm.transpose,
             (true, false) => self.gemm.transpose_par,
@@ -10199,16 +10264,19 @@ impl FnLowerer<'_> {
     /// `parallel` selects the multicore kernel (disjoint column stripes → bit-identical to the serial
     /// one, which sums each column in the same i-order the interpreter marshals).
     fn emit_colsum(&mut self, nest: &ColSumNest, parallel: bool) -> bool {
-        // colreduce.rs declares `x`/`out` non-overlapping on all eight reductions: `out` is `cols`
-        // long and `x` is `rows*cols`, so a store into `out[j]` can overwrite a row-0 element a
-        // later column still reads.
-        let Some([x, out]) = self.kernel_base_ptrs_disjoint([nest.x, nest.out]) else {
+        let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
         else {
             return false;
         };
+        // colreduce.rs declares `x`/`out` non-overlapping on all eight reductions: `out` is `cols`
+        // long and `x` is `rows*cols`, so a store into `out[j]` can overwrite a row-0 element a
+        // later column still reads.
+        if !self.open_reduce_guard((nest.x, x), (nest.out, out), rows, cols, cols, MirType::F32) {
+            return false;
+        }
         let func = match (nest.op, parallel) {
             (COL_MAX, false) => self.gemm.colmax,
             (COL_MAX, true) => self.gemm.colmax_par,
@@ -10239,13 +10307,6 @@ impl FnLowerer<'_> {
     /// `parallel` selects the multicore kernel (rows across cores → bit-identical to the serial one the
     /// interpreter marshals; rows are independent, no cross-row combine).
     fn emit_softmax_bwd(&mut self, nest: &SoftmaxBwdNest, parallel: bool) -> bool {
-        // softmax_bwd.rs states both halves: "`dx` may alias `dy` (the dot over a row is read
-        // before that row's `dx` is written)" but "`dx` must not overlap `y` (its row is read
-        // during the apply)". Only the second is a precondition, so only it is tested — writing the
-        // input gradient over the upstream gradient is the memory-saving spelling and stays fast.
-        if !self.provably_disjoint(nest.y, nest.dx) {
-            return false;
-        }
         let Some([y, dy, dx]) = self.kernel_base_ptrs([nest.y, nest.dy, nest.dx]) else {
             return false;
         };
@@ -10253,6 +10314,26 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
+        // softmax_bwd.rs states both halves: "`dx` may alias `dy` (the dot over a row is read
+        // before that row's `dx` is written)" but "`dx` must not overlap `y` (its row is read
+        // during the apply)". Writing the input gradient over the upstream gradient is the
+        // memory-saving spelling and stays fast — but only EXACTLY in place: a shifted `dx` over
+        // `dy` makes the 8-wide apply read lanes the source loop has already overwritten.
+        let n = self.guard_extent(rows, cols);
+        let ops = [
+            GuardOperand::new(nest.y, y, n, MirType::F32),
+            GuardOperand::new(nest.dy, dy, n, MirType::F32),
+            GuardOperand::new(nest.dx, dx, n, MirType::F32),
+        ];
+        if !self.open_kernel_guard(
+            &ops,
+            &[
+                OperandPair::disjoint(0, 2),
+                OperandPair::exact_in_place(1, 2),
+            ],
+        ) {
+            return false;
+        }
         let func = if parallel {
             self.gemm.softmax_bwd_par
         } else {
@@ -10270,15 +10351,6 @@ impl FnLowerer<'_> {
     /// selects the multicore kernel (rows across cores → bit-identical to the serial one; rows
     /// independent, no cross-row combine).
     fn emit_rmsnorm_bwd(&mut self, nest: &RmsNormBwdNest, parallel: bool) -> bool {
-        // rmsnorm_bwd.rs: "`dx` may alias `dy`" but "`dx` must not overlap `x` (each row's `x` is
-        // read during the apply after the reductions)". `gamma` is read on the same apply. Writing
-        // `dx` over the saved activation `x` is the standard way to halve a backward pass's memory,
-        // so this is a spelling a performance-minded author reaches for; it was well defined in the
-        // oracle (which marshals `x` into a scratch copy) and undefined natively.
-        if !self.provably_disjoint(nest.x, nest.dx) || !self.provably_disjoint(nest.gamma, nest.dx)
-        {
-            return false;
-        }
         let Some([x, dy, gamma, dx]) =
             self.kernel_base_ptrs([nest.x, nest.dy, nest.gamma, nest.dx])
         else {
@@ -10288,6 +10360,21 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
+        // rmsnorm_bwd.rs: "`dx` may alias `dy`" but "`dx` must not overlap `x` (each row's `x` is
+        // read during the apply after the reductions)". `gamma` is read on the same apply. Writing
+        // `dx` over the saved activation `x` is the standard way to halve a backward pass's memory,
+        // so this is a spelling a performance-minded author reaches for; it was well defined in the
+        // oracle (which marshals `x` into a scratch copy) and undefined natively. `dx` over `dy`
+        // is permitted EXACTLY in place only.
+        if !self.open_norm_bwd_guard(
+            [(nest.x, x), (nest.dy, dy), (nest.gamma, gamma)],
+            (nest.dx, dx),
+            rows,
+            cols,
+            true,
+        ) {
+            return false;
+        }
         let eps = self.builder.build(
             MirType::I64,
             Op::ConstInt(nest.eps_bits as i128, MirType::I64),
@@ -10307,14 +10394,6 @@ impl FnLowerer<'_> {
     /// Emit one `wukong_layernorm_bwd_f32[_parallel](x, dy, gamma, dx, rows, cols, eps_bits)` call for
     /// a recognized batched LayerNorm backward. Same shape as `emit_rmsnorm_bwd`.
     fn emit_layernorm_bwd(&mut self, nest: &LayerNormBwdNest, parallel: bool) -> bool {
-        // layernorm_bwd.rs is stricter than its RMSNorm sibling: "`dx` must not overlap `x`/`dy`
-        // (each row reads `x`/`dy` during its apply)" — so unlike softmax/RMSNorm backward, `dy` is
-        // a required-disjoint operand here too.
-        if !self.all_provably_disjoint(&[nest.x, nest.dy, nest.dx])
-            || !self.provably_disjoint(nest.gamma, nest.dx)
-        {
-            return false;
-        }
         let Some([x, dy, gamma, dx]) =
             self.kernel_base_ptrs([nest.x, nest.dy, nest.gamma, nest.dx])
         else {
@@ -10324,6 +10403,19 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
+        // layernorm_bwd.rs is stricter than its RMSNorm sibling: "`dx` must not overlap `x`/`dy`
+        // (each row reads `x`/`dy` during its apply)" — so unlike softmax/RMSNorm backward, `dy` is
+        // a required-disjoint operand here too. The two INPUTS `x` and `dy` may share storage; only
+        // pairs involving the output constrain the kernel.
+        if !self.open_norm_bwd_guard(
+            [(nest.x, x), (nest.dy, dy), (nest.gamma, gamma)],
+            (nest.dx, dx),
+            rows,
+            cols,
+            false,
+        ) {
+            return false;
+        }
         let eps = self.builder.build(
             MirType::I64,
             Op::ConstInt(nest.eps_bits as i128, MirType::I64),
@@ -10344,13 +10436,6 @@ impl FnLowerer<'_> {
     /// batched cross-entropy loss. Bails (false) if an operand/dim is unbound. `parallel` selects the
     /// multicore kernel (rows independent → bit-identical to serial).
     fn emit_xent(&mut self, nest: &XentNest, parallel: bool) -> bool {
-        // Different parameter/view names can reach the same storage. In particular, loss[r]
-        // can overwrite logits another row still reads, invalidating parallel row independence;
-        // the interpreter's private input copies also erase source-order dependencies. Decline
-        // both entry points unless the existing whole-program alias facts prove disjointness.
-        if !self.all_provably_disjoint(&[nest.x, nest.target, nest.loss]) {
-            return false;
-        }
         let Some([x, target, loss]) = self.kernel_base_ptrs([nest.x, nest.target, nest.loss])
         else {
             return false;
@@ -10359,6 +10444,22 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
+        // Different parameter/view names can reach the same storage. In particular, loss[r]
+        // can overwrite logits another row still reads, invalidating parallel row independence,
+        // and a `loss` over the `i32` targets is a type pun as well. Versioned at run time when the
+        // compiler cannot separate the output from either input (the two inputs are only read).
+        let n = self.guard_extent(rows, cols);
+        let ops = [
+            GuardOperand::new(nest.x, x, n, MirType::F32),
+            GuardOperand::new(nest.target, target, rows, MirType::I32),
+            GuardOperand::new(nest.loss, loss, rows, MirType::F32),
+        ];
+        if !self.open_kernel_guard(
+            &ops,
+            &[OperandPair::disjoint(0, 2), OperandPair::disjoint(1, 2)],
+        ) {
+            return false;
+        }
         let func = if parallel {
             self.gemm.xent_par
         } else {
@@ -10374,12 +10475,6 @@ impl FnLowerer<'_> {
     /// Emit one `wukong_xent_bwd_f32[_parallel](x, target, dx, rows, cols)` call for a recognized
     /// cross-entropy backward nest. Bails (false) if an operand/dim is unbound.
     fn emit_xent_bwd(&mut self, nest: &XentBwdNest, parallel: bool) -> bool {
-        // The runtime supports exact in-place x == dx, but the alias fact cannot distinguish
-        // that case from partial overlap. Keep the source loop whenever disjointness is unknown,
-        // just as the matcher already does when x and dx have the very same source symbol.
-        if !self.all_provably_disjoint(&[nest.x, nest.target, nest.dx]) {
-            return false;
-        }
         let Some([x, target, dx]) = self.kernel_base_ptrs([nest.x, nest.target, nest.dx]) else {
             return false;
         };
@@ -10387,6 +10482,24 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
+        // The runtime supports exact in-place `x == dx` (xent_bwd.rs), which the compile-time
+        // alias fact cannot distinguish from a partial overlap — the run-time guard can: `x`/`dx`
+        // is an `ExactInPlace` pair, and the `i32` targets must not overlap `dx` at all.
+        let n = self.guard_extent(rows, cols);
+        let ops = [
+            GuardOperand::new(nest.x, x, n, MirType::F32),
+            GuardOperand::new(nest.target, target, rows, MirType::I32),
+            GuardOperand::new(nest.dx, dx, n, MirType::F32),
+        ];
+        if !self.open_kernel_guard(
+            &ops,
+            &[
+                OperandPair::exact_in_place(0, 2),
+                OperandPair::disjoint(1, 2),
+            ],
+        ) {
+            return false;
+        }
         let func = if parallel {
             self.gemm.xent_bwd_par
         } else {
@@ -10411,6 +10524,28 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
+        // rope.rs / rope_bwd.rs: "`out` may alias `x` but must not otherwise overlap it", and the
+        // frequency table is read for every row, so it must not overlap `out` at all. `x`/`out`
+        // are `rows * 2*half` (each row rotates the pair `j`, `j + half`).
+        let two = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(2, MirType::I64));
+        let dim = self.guard_extent(half, two);
+        let n = self.guard_extent(rows, dim);
+        let ops = [
+            GuardOperand::new(nest.x, x, n, MirType::F32),
+            GuardOperand::new(nest.inv_freq, inv_freq, half, MirType::F32),
+            GuardOperand::new(nest.out, out, n, MirType::F32),
+        ];
+        if !self.open_kernel_guard(
+            &ops,
+            &[
+                OperandPair::exact_in_place(0, 2),
+                OperandPair::disjoint(1, 2),
+            ],
+        ) {
+            return false;
+        }
         let func = match (nest.backward, parallel) {
             (false, false) => self.gemm.rope,
             (false, true) => self.gemm.rope_par,
@@ -10434,6 +10569,12 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
+        // `out[r]` is stored after row `r` is folded, so an `out` overlapping a LATER row of `x`
+        // changes what that row reads, and the `_parallel` rows race on it. This emitter had no
+        // disjointness reasoning at all; it now versions a pair the compiler cannot separate.
+        if !self.open_reduce_guard((nest.x, x), (nest.out, out), rows, cols, rows, MirType::F32) {
+            return false;
+        }
         let func = if parallel {
             self.gemm.logsumexp_par
         } else {
@@ -10449,15 +10590,18 @@ impl FnLowerer<'_> {
     /// Emit `wukong_colarg{max,min}_i32[_parallel](x, out, rows, cols)` for a recognized per-column arg
     /// nest. Same `(ptr,ptr,i64,i64)` i32-output ABI as `emit_rowarg`; `out` is the per-column row-index.
     fn emit_colarg(&mut self, nest: &ColArgNest, parallel: bool) -> bool {
-        // colarg.rs declares `x`/`out` non-overlapping (and `out` is i32 over an f32 input, so an
-        // overlap is a type pun as well as a wrong value).
-        let Some([x, out]) = self.kernel_base_ptrs_disjoint([nest.x, nest.out]) else {
+        let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
         else {
             return false;
         };
+        // colarg.rs declares `x`/`out` non-overlapping (and `out` is i32 over an f32 input, so an
+        // overlap is a type pun as well as a wrong value).
+        if !self.open_reduce_guard((nest.x, x), (nest.out, out), rows, cols, cols, MirType::I32) {
+            return false;
+        }
         let func = match (nest.is_max, parallel) {
             (true, false) => self.gemm.colargmax,
             (true, true) => self.gemm.colargmax_par,
@@ -10474,14 +10618,17 @@ impl FnLowerer<'_> {
     /// Emit `wukong_rowarg{max,min}_i32[_parallel](x, out, rows, cols)` for a recognized per-row arg nest.
     /// Same `(ptr,ptr,i64,i64)` shape as `wukong_logsumexp_f32`, but `out` is an i32 index buffer.
     fn emit_rowarg(&mut self, nest: &RowArgNest, parallel: bool) -> bool {
-        // rowarg.rs declares `x`/`out` non-overlapping.
-        let Some([x, out]) = self.kernel_base_ptrs_disjoint([nest.x, nest.out]) else {
+        let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
         else {
             return false;
         };
+        // rowarg.rs declares `x`/`out` non-overlapping (an i32 output over an f32 input).
+        if !self.open_reduce_guard((nest.x, x), (nest.out, out), rows, cols, rows, MirType::I32) {
+            return false;
+        }
         let func = match (nest.is_max, parallel) {
             (true, false) => self.gemm.rowargmax,
             (true, true) => self.gemm.rowargmax_par,
@@ -10498,8 +10645,8 @@ impl FnLowerer<'_> {
     /// Emit `wukong_cumsum_f32[_parallel](x, out, rows, cols)` for a recognized per-row prefix sum.
     /// Same `(ptr,ptr,i64,i64)` `sig_vmath` shape; the `_parallel` one maps rows across cores.
     fn emit_cumsum(&mut self, nest: &CumsumNest, parallel: bool) -> bool {
-        // NOT gated on [`Self::all_provably_disjoint`], and the reason is worth stating because an
-        // earlier revision of this file gated it on the OPPOSITE of what the runtime says.
+        // EXACT in-place operation is never declined here, and the reason is worth stating because
+        // an earlier revision of this file gated it on the OPPOSITE of what the runtime says.
         // `wukong_cumsum_f32`'s own contract is "`x` and `out` must each be valid for `rows * cols`
         // f32; they may be distinct or alias" (cumsum.rs:133-134), and the AVX2 row scan
         // (`cumsum_row_avx2`) earns that: it loads an 8-lane block, scans it in registers, stores
@@ -10523,6 +10670,13 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
+        // EXACT in place is the documented spelling; a SHIFTED overlap is not: the AVX2 row scan
+        // loads an 8-lane block before it stores it, while the source loop reads `x[i + 1]` after
+        // its store to `out[i]` has already replaced it. So `x`/`out` is an `ExactInPlace` pair,
+        // versioned at run time when the compiler cannot tell which of the two it has.
+        if !self.open_scan_guard(&[(nest.x, x)], (nest.out, out), rows, cols) {
+            return false;
+        }
         let func = if parallel {
             self.gemm.cumsum_par
         } else {
@@ -10545,6 +10699,11 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
+        // cumprod.rs: "`out` may alias `x` (in-place-safe per row)" — exact in place only, as for
+        // `emit_cumsum`.
+        if !self.open_scan_guard(&[(nest.x, x)], (nest.out, out), rows, cols) {
+            return false;
+        }
         let func = if parallel {
             self.gemm.cumprod_par
         } else {
@@ -10568,6 +10727,10 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
+        // lrscan.rs: `out` may alias `a`/`b` in place per row — exact in place only.
+        if !self.open_scan_guard(&[(nest.a, a), (nest.b, b)], (nest.out, out), rows, cols) {
+            return false;
+        }
         let func = if parallel {
             self.gemm.lrscan_par
         } else {
@@ -10586,7 +10749,8 @@ impl FnLowerer<'_> {
         // `wukong_cummin_f32` both declare "`x` and `out` must each be valid for `rows * cols` f32;
         // they may be distinct or alias" (cumminmax.rs:272, :285), and `cummm_row_avx2` has the
         // same load-scan-store shape that earns it. The "non-overlapping" wording appears only on
-        // the three `_parallel` entries and is about the task row partition.
+        // the three `_parallel` entries and is about the task row partition. A SHIFTED overlap is
+        // not in place, though, so the pair is `ExactInPlace` and versioned like `emit_cumsum`'s.
         let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
@@ -10594,6 +10758,9 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
+        if !self.open_scan_guard(&[(nest.x, x)], (nest.out, out), rows, cols) {
+            return false;
+        }
         let func = match (nest.is_max, parallel) {
             (true, false) => self.gemm.cummax,
             (true, true) => self.gemm.cummax_par,
@@ -10616,6 +10783,10 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
+        // The per-row loss `out[r]` must not overlap either distribution it is folded from.
+        if !self.open_loss_guard([(nest.p, p), (nest.q, q)], (nest.out, out), rows, cols) {
+            return false;
+        }
         let func = if parallel {
             self.gemm.kldiv_par
         } else {
@@ -10637,6 +10808,10 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
+        // Same row-to-scalar shape as `emit_logsumexp`: `out` must not overlap `p`.
+        if !self.open_reduce_guard((nest.p, p), (nest.out, out), rows, cols, rows, MirType::F32) {
+            return false;
+        }
         let func = if parallel {
             self.gemm.entropy_par
         } else {
@@ -10658,6 +10833,10 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
+        // The per-row loss `out[r]` must not overlap the logits or the soft labels.
+        if !self.open_loss_guard([(nest.x, x), (nest.q, q)], (nest.out, out), rows, cols) {
+            return false;
+        }
         let func = if parallel {
             self.gemm.kd_loss_par
         } else {
@@ -10683,15 +10862,6 @@ impl FnLowerer<'_> {
         bias: Option<Symbol>,
         act: u32,
     ) -> bool {
-        if bias.is_some_and(|bias| !self.provably_disjoint(nest.c, bias)) {
-            return false;
-        }
-        // The kernel writes `C` in tiled order while `A`/`B` are still being read, so it equals the
-        // nest only when `C` is disjoint from both. `A` and `B` may be one buffer (`A·Aᵀ` is a real
-        // nest). Declining lowers the loop as written, which is what the program means.
-        if !self.provably_disjoint(nest.a, nest.c) || !self.provably_disjoint(nest.b, nest.c) {
-            return false;
-        }
         let Some([a, b, c]) = self.kernel_base_ptrs([nest.a, nest.b, nest.c]) else {
             return false;
         };
@@ -10705,15 +10875,23 @@ impl FnLowerer<'_> {
         // An absent bias is a null pointer, built as an integer `0` (a `Ptr`-typed `ConstInt` is invalid
         // MIR): the kernel checks `bias.is_null()`, and the interpreter distinguishes the `Value::Int(0)`
         // from a real array's `Value::Ptr` by variant — same convention as the f32 `nt_epi` epilogue.
-        let bias_ptr = match bias {
+        let (bias_ptr, bias_operand) = match bias {
             Some(s) => match self.kernel_base_ptr(s) {
-                Some(v) => v,
+                Some(v) => (v, Some((s, v))),
                 None => return false,
             },
-            None => self
-                .builder
-                .build(MirType::I64, Op::ConstInt(0, MirType::I64)),
+            None => (
+                self.builder
+                    .build(MirType::I64, Op::ConstInt(0, MirType::I64)),
+                None,
+            ),
         };
+        // The kernel writes `C` in tiled order while `A`/`B` and the epilogue bias are still being
+        // read, so it equals the nest only when `C` is disjoint from all three; versioned at run time
+        // when the compiler cannot separate them.
+        if !self.open_lowp_gemm_guard(nest, [a, b, c], [m, k, n], bias_operand) {
+            return false;
+        }
         let beta = self
             .builder
             .build(MirType::I64, Op::ConstInt(0, MirType::I64));
@@ -10832,9 +11010,6 @@ impl FnLowerer<'_> {
     /// Linear+epilogue. Bails (false) if any operand/dim is somehow unbound at the call site, so the
     /// caller falls back to lowering the matmul and the epilogue loop separately.
     fn emit_sgemm_epi(&mut self, nest: &MatmulNest<'_>, bias: Option<Symbol>, act: u32) -> bool {
-        if bias.is_some_and(|bias| !self.provably_disjoint(nest.c, bias)) {
-            return false;
-        }
         // This emitter reads neither `nest.alpha` nor `nest.bias` (the kernel has no α parameter, and
         // the `bias` argument comes from the *epilogue* loop), and `wukong_sgemm_nt_epi` reads A
         // row-major — so it cannot honour a peeled scale, a peeled store bias, or a transposed A, and
@@ -10851,12 +11026,6 @@ impl FnLowerer<'_> {
         {
             return false;
         }
-        // The kernel writes `C` in tiled order while `A`/`B` are still being read, so it equals the
-        // nest only when `C` is disjoint from both. `A` and `B` may be one buffer (`A·Aᵀ` is a real
-        // nest). Declining lowers the loop as written, which is what the program means.
-        if !self.provably_disjoint(nest.a, nest.c) || !self.provably_disjoint(nest.b, nest.c) {
-            return false;
-        }
         let Some([a, b, c]) = self.kernel_base_ptrs([nest.a, nest.b, nest.c]) else {
             return false;
         };
@@ -10871,15 +11040,38 @@ impl FnLowerer<'_> {
         // invalid MIR): the kernel checks `bias.is_null()`, and the interpreter distinguishes the
         // `Value::Int(0)` from a real array's `Value::Ptr` by variant — same convention as the affine
         // norm null params.
-        let bias_ptr = match bias {
+        let (bias_ptr, bias_operand) = match bias {
             Some(s) => match self.kernel_base_ptr(s) {
-                Some(v) => v,
+                Some(v) => (v, Some((s, v))),
                 None => return false,
             },
-            None => self
-                .builder
-                .build(MirType::I64, Op::ConstInt(0, MirType::I64)),
+            None => (
+                self.builder
+                    .build(MirType::I64, Op::ConstInt(0, MirType::I64)),
+                None,
+            ),
         };
+        // The kernel writes `C` in tiled order while `A`/`B` and the epilogue bias are still being
+        // read, so it equals the nest only when `C` is disjoint from all of them. `A` and `B` may be
+        // one buffer (`A·Aᵀ` is a real nest). The residual form (`beta = 1`) reads `C` itself, which
+        // is exact in-place by construction and not a pair. Versioned at run time when the compiler
+        // cannot separate a pair (`kernel_guard.rs`).
+        let a_elems = self.guard_extent(m, k);
+        let b_elems = self.guard_extent(k, n);
+        let c_elems = self.guard_extent(m, n);
+        let mut ops = vec![
+            GuardOperand::new(nest.a, a, a_elems, MirType::F32),
+            GuardOperand::new(nest.b, b, b_elems, MirType::F32),
+            GuardOperand::new(nest.c, c, c_elems, MirType::F32),
+        ];
+        let mut pairs = vec![OperandPair::disjoint(0, 2), OperandPair::disjoint(1, 2)];
+        if let Some((sym, ptr)) = bias_operand {
+            ops.push(GuardOperand::new(sym, ptr, n, MirType::F32));
+            pairs.push(OperandPair::disjoint(3, 2));
+        }
+        if !self.open_kernel_guard(&ops, &pairs) {
+            return false;
+        }
         let beta = self
             .builder
             .build(MirType::I64, Op::ConstInt(nest.beta as i128, MirType::I64));
@@ -10927,20 +11119,6 @@ impl FnLowerer<'_> {
         }
         // Buffer operands go through `kernel_base_ptr` (never a raw `lookup`): a `[]T` slice keeps a
         // 16-byte fat pointer in its slot, so the kernel needs the loaded DATA pointer — LANDMINE 1.
-        //
-        // The kernel writes `C` in tiled order while `A`/`B` are still being read, so it equals the
-        // nest only when `C` is disjoint from both. `A` and `B` may be one buffer (`A·Aᵀ` is a real
-        // nest). Declining lowers the loop as written, which is what the program means.
-        // `x` is the third read operand (the velem pass adds it into `C` afterwards), so it must be
-        // disjoint from `C` too. `x != c` is already this window's matcher precondition — the
-        // `x == c` spelling is the `beta = 1` accumulate and takes a different arm — but a symbol
-        // comparison is not the same statement as a storage one, which is the whole point here.
-        if !self.all_provably_disjoint(&[nest.a, nest.c])
-            || !self.all_provably_disjoint(&[nest.b, nest.c])
-            || !self.all_provably_disjoint(&[x, nest.c])
-        {
-            return false;
-        }
         let Some([a, b, c, xp]) = self.kernel_base_ptrs([nest.a, nest.b, nest.c, x]) else {
             return false;
         };
@@ -10951,6 +11129,33 @@ impl FnLowerer<'_> {
         ) else {
             return false;
         };
+        // The kernel writes `C` in tiled order while `A`/`B` are still being read, so it equals the
+        // nest only when `C` is disjoint from both. `A` and `B` may be one buffer (`A·Aᵀ` is a real
+        // nest). `x` is the third read operand (the velem pass adds it into `C` afterwards), so it
+        // must be disjoint from `C` too. `x != c` is already this window's matcher precondition — the
+        // `x == c` spelling is the `beta = 1` accumulate and takes a different arm — but a symbol
+        // comparison is not the same statement as a storage one, which is the whole point here. One
+        // guard covers BOTH calls, opened before either is emitted: a fallback taken after the GEMM
+        // had already written `C` would re-run a window whose inputs it may have clobbered.
+        let mn = self.guard_extent(m, n);
+        let a_elems = self.guard_extent(m, k);
+        let b_elems = self.guard_extent(k, n);
+        let ops = [
+            GuardOperand::new(nest.a, a, a_elems, MirType::F32),
+            GuardOperand::new(nest.b, b, b_elems, MirType::F32),
+            GuardOperand::new(nest.c, c, mn, MirType::F32),
+            GuardOperand::new(x, xp, mn, MirType::F32),
+        ];
+        if !self.open_kernel_guard(
+            &ops,
+            &[
+                OperandPair::disjoint(0, 2),
+                OperandPair::disjoint(1, 2),
+                OperandPair::disjoint(3, 2),
+            ],
+        ) {
+            return false;
+        }
         let beta = self
             .builder
             .build(MirType::I64, Op::ConstInt(nest.beta as i128, MirType::I64));
@@ -11011,19 +11216,6 @@ impl FnLowerer<'_> {
         }
         // Buffer operands through `kernel_base_ptr` — LANDMINE 1 (a `[]T` slice slot holds a fat
         // pointer, and the kernel needs the loaded data word).
-        //
-        // The kernel writes `C` in tiled order while `A`/`B` are still being read, so it equals the
-        // nest only when `C` is disjoint from both. `A` and `B` may be one buffer (`A·Aᵀ` is a real
-        // nest). Declining lowers the loop as written, which is what the program means.
-        // Two stores, so `C` and `D` must also be disjoint from each other.
-        if !self.all_provably_disjoint(&[nest.a, nest.c])
-            || !self.all_provably_disjoint(&[nest.b, nest.c])
-            || !self.all_provably_disjoint(&[nest.a, d])
-            || !self.all_provably_disjoint(&[nest.b, d])
-            || !self.all_provably_disjoint(&[nest.c, d])
-        {
-            return false;
-        }
         let Some([a, b, c, dp]) = self.kernel_base_ptrs([nest.a, nest.b, nest.c, d]) else {
             return false;
         };
@@ -11034,6 +11226,31 @@ impl FnLowerer<'_> {
         ) else {
             return false;
         };
+        // The kernel writes `C` in tiled order while `A`/`B` are still being read, so it equals the
+        // nest only when `C` is disjoint from both. `A` and `B` may be one buffer (`A·Aᵀ` is a real
+        // nest). Two stores, so `C` and `D` must also be disjoint from each other and `D` from both
+        // inputs. One guard covers BOTH calls, opened before either is emitted.
+        let mn = self.guard_extent(m, n);
+        let a_elems = self.guard_extent(m, k);
+        let b_elems = self.guard_extent(k, n);
+        let ops = [
+            GuardOperand::new(nest.a, a, a_elems, MirType::F32),
+            GuardOperand::new(nest.b, b, b_elems, MirType::F32),
+            GuardOperand::new(nest.c, c, mn, MirType::F32),
+            GuardOperand::new(d, dp, mn, MirType::F32),
+        ];
+        if !self.open_kernel_guard(
+            &ops,
+            &[
+                OperandPair::disjoint(0, 2),
+                OperandPair::disjoint(1, 2),
+                OperandPair::disjoint(0, 3),
+                OperandPair::disjoint(1, 3),
+                OperandPair::disjoint(2, 3),
+            ],
+        ) {
+            return false;
+        }
         let beta = self
             .builder
             .build(MirType::I64, Op::ConstInt(nest.beta as i128, MirType::I64));
@@ -11128,19 +11345,6 @@ impl FnLowerer<'_> {
         bias: Option<Symbol>,
         act: u32,
     ) -> bool {
-        if bias.is_some_and(|bias| !self.provably_disjoint(out, bias)) {
-            return false;
-        }
-        // The kernel writes `C` in tiled order while `A`/`B` are still being read, so it equals the
-        // nest only when `C` is disjoint from both. `A` and `B` may be one buffer (`A·Aᵀ` is a real
-        // nest). Declining lowers the loop as written, which is what the program means.
-        // The per-channel dequant scale is read on the store, so it must not be the output either.
-        if !self.all_provably_disjoint(&[nest.a, out])
-            || !self.all_provably_disjoint(&[nest.b, out])
-            || !self.all_provably_disjoint(&[scale_b, out])
-        {
-            return false;
-        }
         let Some([a, b, out_v, sb]) = self.kernel_base_ptrs([nest.a, nest.b, out, scale_b]) else {
             return false;
         };
@@ -11162,15 +11366,41 @@ impl FnLowerer<'_> {
                 .builder
                 .build(MirType::F32, Op::ConstFloat(1.0, MirType::F32)),
         };
-        let bias_ptr = match bias {
+        let (bias_ptr, bias_operand) = match bias {
             Some(s) => match self.kernel_base_ptr(s) {
-                Some(v) => v,
+                Some(v) => (v, Some((s, v))),
                 None => return false,
             },
-            None => self
-                .builder
-                .build(MirType::I64, Op::ConstInt(0, MirType::I64)),
+            None => (
+                self.builder
+                    .build(MirType::I64, Op::ConstInt(0, MirType::I64)),
+                None,
+            ),
         };
+        // The kernel dequantizes each output row while `A`/`B`, the per-channel scale and the bias
+        // are still being read, so the f32 output must be disjoint from all four; versioned at run
+        // time when the compiler cannot separate a pair (`kernel_guard.rs`).
+        let a_elems = self.guard_extent(m, k);
+        let b_elems = self.guard_extent(k, n);
+        let out_elems = self.guard_extent(m, n);
+        let mut ops = vec![
+            GuardOperand::new(nest.a, a, a_elems, MirType::I8),
+            GuardOperand::new(nest.b, b, b_elems, MirType::I8),
+            GuardOperand::new(out, out_v, out_elems, MirType::F32),
+            GuardOperand::new(scale_b, sb, n, MirType::F32),
+        ];
+        let mut pairs = vec![
+            OperandPair::disjoint(0, 2),
+            OperandPair::disjoint(1, 2),
+            OperandPair::disjoint(3, 2),
+        ];
+        if let Some((sym, ptr)) = bias_operand {
+            ops.push(GuardOperand::new(sym, ptr, n, MirType::F32));
+            pairs.push(OperandPair::disjoint(4, 2));
+        }
+        if !self.open_kernel_guard(&ops, &pairs) {
+            return false;
+        }
         let act_v = self
             .builder
             .build(MirType::I64, Op::ConstInt(act as i128, MirType::I64));
@@ -11726,11 +11956,34 @@ impl FnLowerer<'_> {
                 .builder
                 .build(MirType::F32, Op::Bin(BinOp::FAdd, cur, result)),
         };
+        let new_s = self.keep_seed_when_empty(n, cur, new_s);
         self.builder.build_void(Op::Store {
             ptr: s_slot,
             value: new_s,
         });
         true
+    }
+
+    /// The accumulator a value-returning reduction dispatch (`s = s ⊕ kernel(x, .., n)`) stores:
+    /// the combined value for a non-empty range, and the SEED, exactly, for an empty one.
+    ///
+    /// An empty range runs no iteration of the source loop, so the accumulator keeps its seed bit
+    /// for bit. The kernel answers an empty range with its identity, and combining that identity is
+    /// not the identity on every seed: `-0.0 + 0.0` is `+0.0`, and `fmax(NaN, -inf)` as the
+    /// `Cmp(Fogt)+Select` fold selects `-inf`. That is the zero-extent rule the GEMM and the
+    /// column/row reductions follow (`emit_nonempty_reduction`), applied to the reductions that
+    /// RETURN their value instead of storing it. It is a `Select`, not a branch: the kernel already
+    /// treats `n <= 0` as an empty range and touches no memory, and a straight-line function stays
+    /// straight-line, which is what `wukong_autodiff`'s tape requires of a loss.
+    fn keep_seed_when_empty(&mut self, n: ValueId, seed: ValueId, combined: ValueId) -> ValueId {
+        let zero = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        let nonempty = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Sgt, n, zero));
+        self.builder
+            .build(MirType::F32, Op::Select(nonempty, combined, seed))
     }
 
     /// Recognize a **bf16 mixed-precision** reduction body over `k`: `s = s + (x[k] as f32)` (sum) or
@@ -12074,6 +12327,11 @@ impl FnLowerer<'_> {
         let Some((out, x, y, a_expr, b_expr, is_f16)) = self.match_lowp_axpby(body, *k) else {
             return false;
         };
+        // The coefficients are evaluated once, ahead of the call (see `hoisted_reads_disjoint`).
+        let coeffs: Vec<&Expr> = [a_expr, b_expr].into_iter().flatten().collect();
+        if !self.hoisted_reads_disjoint(&coeffs, &[out]) {
+            return false;
+        }
         let Some([outv, xv, yv]) = self.kernel_base_ptrs([out, x, y]) else {
             return false;
         };
@@ -12095,6 +12353,22 @@ impl FnLowerer<'_> {
         let Some((_, n)) = self.lower_kernel_range(start, end) else {
             return false;
         };
+        // Half-width inputs and an f32 output are never one array, so any overlap between the output
+        // and either input is a pun the source loop does not perform: both pairs must be disjoint.
+        // A pair the compiler cannot separate is versioned at run time (`kernel_guard.rs`), with each
+        // range measured in its own element so both backends scale it in their own address unit.
+        let half = if is_f16 { MirType::F16 } else { MirType::BF16 };
+        let ops = [
+            GuardOperand::new(x, xv, n, half.clone()),
+            GuardOperand::new(y, yv, n, half),
+            GuardOperand::new(out, outv, n, MirType::F32),
+        ];
+        if !self.open_kernel_guard(
+            &ops,
+            &[OperandPair::disjoint(0, 2), OperandPair::disjoint(1, 2)],
+        ) {
+            return false;
+        }
         self.builder.build_void(Op::Call {
             func: if is_f16 {
                 self.gemm.axpby_f16
@@ -12140,6 +12414,11 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
+        // The coefficients are evaluated once, ahead of the call (see `hoisted_reads_disjoint`).
+        let coeffs: Vec<&Expr> = [a_expr, b_expr].into_iter().flatten().collect();
+        if !self.hoisted_reads_disjoint(&coeffs, &[out]) {
+            return false;
+        }
         let Some([outv, xv, yv]) = self.kernel_base_ptrs([out, x, y]) else {
             return false;
         };
@@ -12160,6 +12439,24 @@ impl FnLowerer<'_> {
         let Some((_, n)) = self.lower_kernel_range(start, end) else {
             return false;
         };
+        // Half in, half out, elementwise: `out` may be EXACTLY either input (the same map in place),
+        // but a SHIFTED overlap makes the 8-lane body read lanes the source loop has already
+        // overwritten. Versioned at run time when the compiler cannot tell which it has.
+        let half = if is_f16 { MirType::F16 } else { MirType::BF16 };
+        let ops = [
+            GuardOperand::new(x, xv, n, half.clone()),
+            GuardOperand::new(y, yv, n, half.clone()),
+            GuardOperand::new(out, outv, n, half),
+        ];
+        if !self.open_kernel_guard(
+            &ops,
+            &[
+                OperandPair::exact_in_place(0, 2),
+                OperandPair::exact_in_place(1, 2),
+            ],
+        ) {
+            return false;
+        }
         self.builder.build_void(Op::Call {
             func: if is_f16 {
                 self.gemm.axpby_f16_out
@@ -12285,6 +12582,17 @@ impl FnLowerer<'_> {
         let Some((_, n)) = self.lower_kernel_range(start, end) else {
             return false;
         };
+        // Half in, half out, elementwise: EXACTLY in place is the same map; a SHIFTED `out` over `x`
+        // is not (the 8-lane body loads before it stores). Versioned at run time when the compiler
+        // cannot tell which of the two it has.
+        let half = if is_f16 { MirType::F16 } else { MirType::BF16 };
+        let ops = [
+            GuardOperand::new(x, xv, n, half.clone()),
+            GuardOperand::new(out, outv, n, half),
+        ];
+        if !self.open_kernel_guard(&ops, &[OperandPair::exact_in_place(0, 1)]) {
+            return false;
+        }
         let opv = self
             .builder
             .build(MirType::I64, Op::ConstInt(opcode as i128, MirType::I64));
@@ -12412,6 +12720,7 @@ impl FnLowerer<'_> {
                 .builder
                 .build(MirType::F32, Op::Bin(BinOp::FAdd, cur, result)),
         };
+        let new_s = self.keep_seed_when_empty(n, cur, new_s);
         self.builder.build_void(Op::Store {
             ptr: s_slot,
             value: new_s,
@@ -12551,6 +12860,10 @@ impl FnLowerer<'_> {
     /// Kernels treat a nonpositive reduction extent as a no-op, but the source
     /// nest can still write its seed/finalizer. Keep the kernel for positive
     /// extents and lower the original loop otherwise, without changing that ABI.
+    ///
+    /// The same source lowering is also the may-overlap arm of the run-time alias guard (see
+    /// `kernel_guard.rs`): every emitter reached through here is versioned, so a kernel whose
+    /// operands the compiler cannot separate still dispatches when they are disjoint at run time.
     fn emit_nonempty_reduction_loop(
         &mut self,
         reduction: Dim,
@@ -12585,7 +12898,7 @@ impl FnLowerer<'_> {
         &mut self,
         reduction: Dim,
         emit: impl FnOnce(&mut Self) -> bool,
-        lower_source: impl FnOnce(&mut Self),
+        lower_source: impl Fn(&mut Self),
     ) -> bool {
         let known = match reduction {
             Dim::Lit(n) => Some(n),
@@ -12593,7 +12906,7 @@ impl FnLowerer<'_> {
             Dim::Var(_) => None,
         };
         if known.is_some_and(|n| n > 0) {
-            return emit(self);
+            return self.emit_alias_versioned(emit, &lower_source);
         }
         let Some(extent) = self.dim_value(reduction) else {
             return false;
@@ -12611,8 +12924,11 @@ impl FnLowerer<'_> {
             .cond_br(positive, kernel, vec![], scalar, vec![]);
         self.builder.switch_to(kernel);
         // A later shape/alias check can still decline. Its emitted setup is pure;
-        // route that case to the original source even for a positive extent.
-        let dispatched = emit(self);
+        // route that case to the original source even for a positive extent. A may-alias
+        // dispatch is versioned inside this arm, with its own copy of the source on the
+        // overlapping path (recognition AND `@parallel` off, which the empty-extent path below
+        // does not need).
+        let dispatched = self.emit_alias_versioned(emit, &lower_source);
         self.builder
             .br(if dispatched { join } else { scalar }, vec![]);
         self.builder.switch_to(scalar);
@@ -12818,7 +13134,9 @@ impl FnLowerer<'_> {
             // `wukong_transpose_f32` (the `_parallel` one in a `@parallel` function). Pure data movement,
             // bit-identical to the scalar nest; the block tiling is the win `-O3` won't do for a transpose.
             if let Some(nest) = match_transpose(pat, iter, body, self.sema, self.interner) {
-                if self.emit_transpose(&nest, self.parallel_fn) {
+                if self.emit_versioned_loop((label, pat, iter, body), |me| {
+                    me.emit_transpose(&nest, me.parallel_fn)
+                }) {
                     return;
                 }
             }
@@ -12827,7 +13145,9 @@ impl FnLowerer<'_> {
             // strided window gcc/rustc leave scalar; the kernel folds 8 output columns at once. Max is
             // idempotent and the avg sum order is fixed → bit-identical to the scalar nest.
             if let Some(nest) = match_pool2d(pat, iter, body, self.sema, self.interner) {
-                if self.emit_pool2d(&nest, self.parallel_fn) {
+                if self.emit_versioned_loop((label, pat, iter, body), |me| {
+                    me.emit_pool2d(&nest, me.parallel_fn)
+                }) {
                     return;
                 }
             }
@@ -12857,7 +13177,9 @@ impl FnLowerer<'_> {
             // → the fused `wukong_softmax_bwd_f32` (the `_parallel` one in a `@parallel` function). The
             // per-row dot gcc keeps scalar; the kernel reuses the bit-exact sreduce dot + an 8-wide apply.
             if let Some(nest) = match_softmax_bwd(pat, iter, body, self.sema, self.interner) {
-                if self.emit_softmax_bwd(&nest, self.parallel_fn) {
+                if self.emit_versioned_loop((label, pat, iter, body), |me| {
+                    me.emit_softmax_bwd(&nest, me.parallel_fn)
+                }) {
                     return;
                 }
             }
@@ -12865,7 +13187,9 @@ impl FnLowerer<'_> {
             // `wukong_rmsnorm_bwd_f32` (the `_parallel` one in a `@parallel` function). The two per-row
             // reductions gcc keeps scalar; the kernel folds them 8-wide then applies the gradient.
             if let Some(nest) = match_rmsnorm_bwd(pat, iter, body, self.sema, self.interner) {
-                if self.emit_rmsnorm_bwd(&nest, self.parallel_fn) {
+                if self.emit_versioned_loop((label, pat, iter, body), |me| {
+                    me.emit_rmsnorm_bwd(&nest, me.parallel_fn)
+                }) {
                     return;
                 }
             }
@@ -12873,7 +13197,9 @@ impl FnLowerer<'_> {
             // `wukong_layernorm_bwd_f32` (the `_parallel` one in a `@parallel` function). Four per-row
             // reductions gcc keeps scalar; the kernel folds them 8-wide.
             if let Some(nest) = match_layernorm_bwd(pat, iter, body, self.sema, self.interner) {
-                if self.emit_layernorm_bwd(&nest, self.parallel_fn) {
+                if self.emit_versioned_loop((label, pat, iter, body), |me| {
+                    me.emit_layernorm_bwd(&nest, me.parallel_fn)
+                }) {
                     return;
                 }
             }
@@ -12902,7 +13228,9 @@ impl FnLowerer<'_> {
             if let Some(nest) = match_rope(pat, iter, body, false, self.sema, self.interner)
                 .or_else(|| match_rope(pat, iter, body, true, self.sema, self.interner))
             {
-                if self.emit_rope(&nest, self.parallel_fn) {
+                if self.emit_versioned_loop((label, pat, iter, body), |me| {
+                    me.emit_rope(&nest, me.parallel_fn)
+                }) {
                     return;
                 }
             }
@@ -12945,7 +13273,9 @@ impl FnLowerer<'_> {
             // the AVX2 kernel folds widen+per-column-scale into one 256-bit pass. Checked in this batched
             // phase (the body is a nested loop, which the elementwise recognizers below never match).
             if let Some(nest) = self.match_dequant_perchan(pat, iter, body) {
-                if self.emit_dequant_perchan(&nest, self.parallel_fn) {
+                if self.emit_versioned_loop((label, pat, iter, body), |me| {
+                    me.emit_dequant_perchan(&nest, me.parallel_fn)
+                }) {
                     return;
                 }
             }
@@ -12963,7 +13293,9 @@ impl FnLowerer<'_> {
             // `@parallel` fn). gcc/rustc keep the loop-carried scan scalar; the SIMD Hillis-Steele + carry
             // vectorizes it. The in-lane tree reassociates (the documented exception — both backends run it).
             if let Some(nest) = self.match_cumsum(pat, iter, body) {
-                if self.emit_cumsum(&nest, self.parallel_fn) {
+                if self.emit_versioned_loop((label, pat, iter, body), |me| {
+                    me.emit_cumsum(&nest, me.parallel_fn)
+                }) {
                     return;
                 }
             }
@@ -12971,7 +13303,9 @@ impl FnLowerer<'_> {
             // in a `@parallel` fn). Loop-carried like cumsum; the kernel's lever is 4-row-interleaved ILP.
             // Bit-exact (a bare product is not fused → strict left-to-right, no reassociation).
             if let Some(nest) = self.match_cumprod(pat, iter, body) {
-                if self.emit_cumprod(&nest, self.parallel_fn) {
+                if self.emit_versioned_loop((label, pat, iter, body), |me| {
+                    me.emit_cumprod(&nest, me.parallel_fn)
+                }) {
                     return;
                 }
             }
@@ -12980,14 +13314,18 @@ impl FnLowerer<'_> {
             // auto-vectorization (scalar, like cumsum); rows independent → multicore over rows. Bit-exact
             // (the recurrence is inherently sequential within a row — no reassociation).
             if let Some(nest) = self.match_lrscan(pat, iter, body) {
-                if self.emit_lrscan(&nest, self.parallel_fn) {
+                if self.emit_versioned_loop((label, pat, iter, body), |me| {
+                    me.emit_lrscan(&nest, me.parallel_fn)
+                }) {
                     return;
                 }
             }
             // Batched per-row cumulative max / min (running extreme scan) → wukong_cum{max,min}_f32. Same
             // loop-carried scan gcc/rustc keep scalar; bit-exact (max/min select a value, no reassociation).
             if let Some(nest) = self.match_cumminmax(pat, iter, body) {
-                if self.emit_cumminmax(&nest, self.parallel_fn) {
+                if self.emit_versioned_loop((label, pat, iter, body), |me| {
+                    me.emit_cumminmax(&nest, me.parallel_fn)
+                }) {
                     return;
                 }
             }
@@ -12996,7 +13334,9 @@ impl FnLowerer<'_> {
             // one in a `@parallel` fn). The data-dependent row gather is pure data movement, bit-identical to
             // the scalar nest (no reassociation, like the transpose); rows independent → parallel == serial.
             if let Some(nest) = self.match_embedding(pat, iter, body) {
-                if self.emit_embedding(&nest, self.parallel_fn) {
+                if self.emit_versioned_loop((label, pat, iter, body), |me| {
+                    me.emit_embedding(&nest, me.parallel_fn)
+                }) {
                     return;
                 }
             }
@@ -13006,7 +13346,9 @@ impl FnLowerer<'_> {
             // probed AFTER embedding — disjoint store ops (`+=` indirect-write vs `=` indirect-read), so neither
             // steals the other's nest.
             if let Some(nest) = self.match_scatter(pat, iter, body) {
-                if self.emit_scatter(&nest, self.parallel_fn) {
+                if self.emit_versioned_loop((label, pat, iter, body), |me| {
+                    me.emit_scatter(&nest, me.parallel_fn)
+                }) {
                     return;
                 }
             }
@@ -13025,21 +13367,27 @@ impl FnLowerer<'_> {
             // A bf16 mixed-precision elementwise `for k in 0..n { out[k] = a*(x[k] as f32) + b*(y[k] as
             // f32) }` (bf16 inputs, f32 output) dispatches to the streaming axpby kernel — half-width
             // inputs, so ~1.5× the bytes saved on this memory-bound shape. Same exact-gate rationale.
-            if self.try_emit_bf16_axpby(pat, iter, body) {
+            if self.emit_versioned_loop((label, pat, iter, body), |me| {
+                me.try_emit_bf16_axpby(pat, iter, body)
+            }) {
                 return;
             }
             // A half-**output** axpby `for k { out[k] = (a*(x[k] as f32) + b*(y[k] as f32)) as bf16 }`
             // (bf16/f16 in AND out) dispatches to the narrowing streaming kernel — 6 bytes/elem vs an
             // all-f32 axpby's 12 (the narrowing store halves the write traffic). Tried after the f32-output
             // axpby (disjoint target shapes: `out:[f32]` vs `out:[bf16]` with an `as bf16` cast).
-            if self.try_emit_lowp_axpby_narrow(pat, iter, body) {
+            if self.emit_versioned_loop((label, pat, iter, body), |me| {
+                me.try_emit_lowp_axpby_narrow(pat, iter, body)
+            }) {
                 return;
             }
             // A half-**output** activation `for k { out[k] = (f((x[k] as f32))) as bf16 }` (bf16/f16 in AND
             // out) dispatches to the narrowing activation kernel — 4 bytes/elem vs the half-in/f32-out
             // activation's 6 (the KV-cache / activation-store path). Tried after the f32-output vmath
             // recognizer (disjoint target shapes: `out:[f32]` vs `out:[bf16]` with an `as bf16` cast).
-            if self.try_emit_lowp_vmath_narrow(pat, iter, body) {
+            if self.emit_versioned_loop((label, pat, iter, body), |me| {
+                me.try_emit_lowp_vmath_narrow(pat, iter, body)
+            }) {
                 return;
             }
             // A `for i in 0..R { for j in 0..C { out[i*C+j] = act(x[i*C+j] + b[j]) } }` broadcast-bias nest
@@ -13047,20 +13395,26 @@ impl FnLowerer<'_> {
             // 256-bit `wukong_bias_bcast_f32` (the `_parallel` one in a `@parallel` fn). The row-broadcast
             // operand `b[j]` is what the affine velem recognizer declines and the 128-bit generic
             // vectorizer under-widens; the kernel folds it into one 256-bit pass with the fused activation.
-            if self.try_emit_bias_bcast(pat, iter, body) {
+            if self.emit_versioned_loop((label, pat, iter, body), |me| {
+                me.try_emit_bias_bcast(pat, iter, body)
+            }) {
                 return;
             }
             // A `for r in 0..R { <per-row norm over x[r*C + i]> }` batched normalization dispatches to the
             // fused single-pass norm kernel with `rows = R` (in a `@parallel` fn, the multicore variant
             // that maps rows across cores). The real transformer shape: norm over `[batch*seq, hidden]`.
-            if self.try_emit_batched_norm(pat, iter, body) {
+            if self.emit_versioned_loop((label, pat, iter, body), |me| {
+                me.try_emit_batched_norm(pat, iter, body)
+            }) {
                 return;
             }
             // A `for r in 0..R { for j in 0..C { out[r*C + j] = f(x[r*C + j]) } }` batched activation nest
             // (the `[tokens, hidden]` FFN/attention shape) dispatches to one flat 256-bit `wukong_vmath_f32`
             // over the whole `[0, R*C)` buffer — restoring the full kernel width the offset-indexed inner
             // loop would otherwise lose to the 128-bit generic vectorizer.
-            if self.try_emit_batched_vmath(pat, iter, body) {
+            if self.emit_versioned_loop((label, pat, iter, body), |me| {
+                me.try_emit_batched_vmath(pat, iter, body)
+            }) {
                 return;
             }
         } // ---- end of the recognizer cascade ---------------------------------------------------
@@ -13109,8 +13463,17 @@ impl FnLowerer<'_> {
         }
 
         // Straight-line elementwise loops lower to SIMD (vector main loop + scalar remainder); this
-        // is purely an optimization, so on any doubt it returns false and we lower scalar below.
-        if !inclusive && step.is_none() && self.try_vectorize_for(pat, start, end, body) {
+        // is purely an optimization, so on any doubt it returns false and we lower scalar below. The
+        // 256-bit elementwise KERNEL probes inside it (vmath, vmath2, velem, vhorner, dequant) version
+        // an operand pair the compiler cannot separate on a run-time overlap test, so they run under
+        // a versioning context whose overlapping arm is this loop with recognition off — which the
+        // generic vectorizer then lowers only with its own disjointness proof, or scalar.
+        if !inclusive
+            && step.is_none()
+            && self.emit_versioned_loop((label, pat, iter, body), |me| {
+                me.try_vectorize_for(pat, start, end, body)
+            })
+        {
             return;
         }
 
@@ -13977,7 +14340,12 @@ impl FnLowerer<'_> {
                 field_bases: vec![HashMap::default()],
                 terminated: false,
                 loops: Vec::new(),
-                gemm: self.gemm,
+                // A fresh function starts with no alias-versioning context: a guard state belongs to
+                // the builder that opened it (`kernel_guard.rs`), never to an outlined body.
+                gemm: GemmSyms {
+                    guard: KernelGuard::Off,
+                    ..self.gemm
+                },
                 // The region supplies the threading; each iteration dispatches the SERIAL kernels —
                 // the identical per-iteration op sequence the non-`@parallel` spelling runs, so
                 // serial == parallel stays bit-exact (only cross-iteration scheduling differs, and
@@ -14457,14 +14825,20 @@ impl FnLowerer<'_> {
 
     /// Emit one `wukong_vmath_f32(x+s, out+s, e-s, op)` call per resolved statement over the i64
     /// range `[s, e)`. Each is a full-range pass; in source order they preserve a fused multi-statement
-    /// body's per-element semantics (an array is fully written before a later pass reads it).
+    /// body's per-element semantics (an array is fully written before a later pass reads it) — when
+    /// no output overlaps another operand except EXACTLY, which `open_elementwise_guard` settles
+    /// before any call is emitted (at compile time, or by a run-time test with the source loop on
+    /// the overlapping arm). Returns false, with only pure setup emitted, when it declines.
     fn emit_vmath_calls(
         &mut self,
         s: ValueId,
         e: ValueId,
         calls: Vec<(Symbol, Symbol, u32, MirType)>,
-    ) {
+    ) -> bool {
         let n = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e, s));
+        let mut planned = Vec::with_capacity(calls.len());
+        let mut ops = Vec::with_capacity(2 * calls.len());
+        let mut outs = Vec::with_capacity(calls.len());
         for (out_sym, x_sym, opcode, in_elem) in calls {
             // Resolve each operand's base pointer (a `Load` out of a `Tensor[..]`/pointer param's
             // slot, a no-op for an array). The matcher validated every symbol.
@@ -14489,7 +14863,7 @@ impl FnLowerer<'_> {
                 Op::Gep {
                     ptr: x_base,
                     index: s,
-                    elem: in_elem,
+                    elem: in_elem.clone(),
                 },
             );
             let outp = self.builder.build(
@@ -14503,11 +14877,18 @@ impl FnLowerer<'_> {
             let opv = self
                 .builder
                 .build(MirType::I64, Op::ConstInt(opcode as i128, MirType::I64));
-            self.builder.build_void(Op::Call {
-                func,
-                args: vec![xp, outp, n, opv],
-            });
+            ops.push(GuardOperand::new(x_sym, xp, n, in_elem));
+            outs.push(ops.len());
+            ops.push(GuardOperand::new(out_sym, outp, n, MirType::F32));
+            planned.push((func, vec![xp, outp, n, opv]));
         }
+        if !self.open_elementwise_guard(&ops, &outs) {
+            return false;
+        }
+        for (func, args) in planned {
+            self.builder.build_void(Op::Call { func, args });
+        }
+        true
     }
 
     /// Recognize an elementwise transcendental loop `for j in lo..hi { ... }` whose body is one or
@@ -14527,8 +14908,7 @@ impl FnLowerer<'_> {
         let Some((s, e)) = self.lower_kernel_range(start, end) else {
             return false;
         };
-        self.emit_vmath_calls(s, e, calls);
-        true
+        self.emit_vmath_calls(s, e, calls)
     }
 
     /// Recognize a **batched** transcendental-activation nest `for r in 0..R { for j in 0..C { out[r*C
@@ -14611,8 +14991,7 @@ impl FnLowerer<'_> {
         let zero = self
             .builder
             .build(MirType::I64, Op::ConstInt(0, MirType::I64));
-        self.emit_vmath_calls(zero, total, calls);
-        true
+        self.emit_vmath_calls(zero, total, calls)
     }
 
     /// The broadcast-bias fused-activation `op` code for a transcendental activation call `f(..)`, or
@@ -14816,14 +15195,6 @@ impl FnLowerer<'_> {
         let Some((out, x, b, rows, cols, op)) = self.match_bias_bcast(pat, iter, body) else {
             return false;
         };
-        // Every row rereads b, so writing any part of it changes later rows. The
-        // kernel and interpreter's private bias copy require b/out disjointness.
-        // x == out is safe only for the exact same row/column indexing matched
-        // above; distinct symbols may instead be shifted views of one buffer.
-        // Read/read x/b overlap needs no additional restriction.
-        if !self.provably_disjoint(out, b) || (x != out && !self.provably_disjoint(out, x)) {
-            return false;
-        }
         let Some([outv, xv, bv]) = self.kernel_base_ptrs([out, x, b]) else {
             return false;
         };
@@ -14833,6 +15204,27 @@ impl FnLowerer<'_> {
         let cty = self.expr_mir(cols);
         let cv = self.lower_expr(cols);
         let cv = self.coerce_to(cv, &cty, &MirType::I64, true);
+        // Every row rereads `b`, so writing any part of it changes later rows: `b`/`out` must be
+        // disjoint. `x == out` is safe only EXACTLY in place (the same row/column indexing matched
+        // above); distinct symbols may instead be shifted views of one buffer. Read/read `x`/`b`
+        // overlap needs no restriction. A pair the compiler cannot separate is versioned at run time
+        // with the source nest on the overlapping arm (`kernel_guard.rs`); this used to decline at
+        // compile time, which took the kernel away from every disjoint call as well.
+        let n = self.guard_extent(rv, cv);
+        let ops = [
+            GuardOperand::new(x, xv, n, MirType::F32),
+            GuardOperand::new(b, bv, cv, MirType::F32),
+            GuardOperand::new(out, outv, n, MirType::F32),
+        ];
+        if !self.open_kernel_guard(
+            &ops,
+            &[
+                OperandPair::exact_in_place(0, 2),
+                OperandPair::disjoint(1, 2),
+            ],
+        ) {
+            return false;
+        }
         let opv = self
             .builder
             .build(MirType::I64, Op::ConstInt(op as i128, MirType::I64));
@@ -14961,8 +15353,13 @@ impl FnLowerer<'_> {
         s: ValueId,
         e: ValueId,
         calls: Vec<(Symbol, Symbol, Symbol, u32)>,
-    ) {
+    ) -> bool {
         let n = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e, s));
+        // Every call's operands are resolved first and the overlap guard opened once over all of
+        // them (see `emit_vmath_calls`), so a decline leaves only pure setup behind.
+        let mut planned = Vec::with_capacity(calls.len());
+        let mut ops = Vec::with_capacity(3 * calls.len());
+        let mut outs = Vec::with_capacity(calls.len());
         for (out_sym, x_sym, y_sym, opcode) in calls {
             let out_base = self
                 .kernel_base_ptr(out_sym)
@@ -14989,12 +15386,20 @@ impl FnLowerer<'_> {
             let opv = self
                 .builder
                 .build(MirType::I64, Op::ConstInt(opcode as i128, MirType::I64));
-            let func = self.gemm.vmath2;
-            self.builder.build_void(Op::Call {
-                func,
-                args: vec![xp, yp, outp, n, opv],
-            });
+            ops.push(GuardOperand::new(x_sym, xp, n, MirType::F32));
+            ops.push(GuardOperand::new(y_sym, yp, n, MirType::F32));
+            outs.push(ops.len());
+            ops.push(GuardOperand::new(out_sym, outp, n, MirType::F32));
+            planned.push(vec![xp, yp, outp, n, opv]);
         }
+        if !self.open_elementwise_guard(&ops, &outs) {
+            return false;
+        }
+        let func = self.gemm.vmath2;
+        for args in planned {
+            self.builder.build_void(Op::Call { func, args });
+        }
+        true
     }
 
     /// Recognize a two-input transcendental loop `for j in lo..hi { out[j] = f(x[j], y[j]) }`
@@ -15011,8 +15416,7 @@ impl FnLowerer<'_> {
         let Some((s, e)) = self.lower_kernel_range(start, end) else {
             return false;
         };
-        self.emit_vmath2_calls(s, e, calls);
-        true
+        self.emit_vmath2_calls(s, e, calls)
     }
 
     /// Is `e` safe to evaluate **once**, in the loop's enclosing scope, in place of once per iteration?
@@ -15288,7 +15692,13 @@ impl FnLowerer<'_> {
     /// map over the i64 range `[s, e)`. When `y` is absent the kernel never reads it (`VE_USE_Y`
     /// unset), so the `x` pointer is reused for the unused `y` argument (a valid, never-dereferenced
     /// pointer — no need for a Ptr-typed null const, which is invalid MIR).
-    fn emit_velem_call(&mut self, s: ValueId, e: ValueId, plan: &VElemPlan) {
+    fn emit_velem_call(&mut self, s: ValueId, e: ValueId, plan: &VElemPlan) -> bool {
+        // The coefficients are evaluated once, ahead of the call: one read from a buffer the map
+        // writes (`out[j] = out[0] * x[j]`) is no operand the overlap guard can range.
+        let coeffs: Vec<&Expr> = [plan.a, plan.b, plan.c].into_iter().flatten().collect();
+        if !self.hoisted_reads_disjoint(&coeffs, &[plan.out]) {
+            return false;
+        }
         let n = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e, s));
         // Resolve each operand's base pointer (loading it out of the slot for a `Tensor[..]`/pointer
         // param; a no-op for an array operand). The matcher validated every symbol, so this resolves.
@@ -15336,10 +15746,22 @@ impl FnLowerer<'_> {
         } else {
             self.gemm.velem
         };
+        // velem.rs: `x`/`y`/`out` may be EXACTLY one buffer; a SHIFTED overlap is not the source
+        // map (`open_elementwise_guard`). An unread `y` is no operand.
+        let mut ops = vec![GuardOperand::new(plan.x, xp, n, MirType::F32)];
+        if let Some(y) = plan.y {
+            ops.push(GuardOperand::new(y, yp, n, MirType::F32));
+        }
+        let out_index = ops.len();
+        ops.push(GuardOperand::new(plan.out, outp, n, MirType::F32));
+        if !self.open_elementwise_guard(&ops, &[out_index]) {
+            return false;
+        }
         self.builder.build_void(Op::Call {
             func,
             args: vec![xp, yp, outp, n, a, b, c, opv],
         });
+        true
     }
 
     /// Recognize a streaming elementwise map `for j in lo..hi { out[j] = act(a·x[j] (+ b·y[j]) + c) }`
@@ -15357,8 +15779,7 @@ impl FnLowerer<'_> {
         let Some((s, e)) = self.lower_kernel_range(start, end) else {
             return false;
         };
-        self.emit_velem_call(s, e, &plan);
-        true
+        self.emit_velem_call(s, e, &plan)
     }
 
     // ---- int-input dequant (wukong_dequant_f32) ------------------------------------------------
@@ -15491,6 +15912,10 @@ impl FnLowerer<'_> {
     /// sequential and the `@parallel`-chunk paths (the outliner supplies the threading, so each chunk is
     /// one serial call — bit-equal to the whole-range interpreter marshal, like velem).
     fn emit_dequant_call(&mut self, s: ValueId, e: ValueId, plan: &DequantPlan) -> bool {
+        // The scale is evaluated once, ahead of the call (see `hoisted_reads_disjoint`).
+        if !self.hoisted_reads_disjoint(&[plan.scale], &[plan.out]) {
+            return false;
+        }
         let Some([q_base, out_base]) = self.kernel_base_ptrs([plan.q, plan.out]) else {
             return false;
         };
@@ -15525,6 +15950,15 @@ impl FnLowerer<'_> {
         } else {
             self.gemm.dequant
         };
+        // An integer input and an f32 output: any overlap is a mixed-width pun the source loop does
+        // not perform, so the pair is `Disjoint` (`open_elementwise_guard`).
+        let ops = [
+            GuardOperand::new(plan.q, qp, n, plan.q_elem.clone()),
+            GuardOperand::new(plan.out, outp, n, MirType::F32),
+        ];
+        if !self.open_elementwise_guard(&ops, &[1]) {
+            return false;
+        }
         self.builder.build_void(Op::Call {
             func,
             args: vec![qp, outp, n, scale, opv],
@@ -15666,14 +16100,6 @@ impl FnLowerer<'_> {
     /// maps independent rows across cores, bit-equal to serial). Returns false (fall through) if a base
     /// or dim cannot be resolved.
     fn emit_dequant_perchan(&mut self, nest: &DequantPerchanNest, parallel: bool) -> bool {
-        // The interpreter snapshots both inputs, and parallel rows read scale
-        // while writing out. Preserve live source reads by declining any output
-        // overlap; read/read q/scale overlap needs no restriction.
-        if !self.provably_disjoint(nest.out, nest.scale)
-            || !self.provably_disjoint(nest.out, nest.q)
-        {
-            return false;
-        }
         let Some([q, out, scale]) = self.kernel_base_ptrs([nest.q, nest.out, nest.scale]) else {
             return false;
         };
@@ -15681,9 +16107,25 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        // The GEP element type does not matter here (offset 0 — the whole matrix), but the kernel needs
-        // the width in `op`, which `nest.op` already carries; `q_elem` is retained only for symmetry.
-        let _ = &nest.q_elem;
+        // Parallel rows read `scale` while writing `out`, and an f32 output over the integer input is
+        // a type pun as well as an ordering hazard, so `out` must be disjoint from both; read/read
+        // `q`/`scale` overlap needs no restriction. A pair the compiler cannot separate is versioned
+        // at run time with the source nest on the overlapping arm (`kernel_guard.rs`) — it used to
+        // decline at compile time, which took the kernel away from every disjoint call too. The
+        // integer input's extent is measured in its own element (`q_elem`), so each backend scales
+        // the range end in its own address unit.
+        let n = self.guard_extent(rows, cols);
+        let ops = [
+            GuardOperand::new(nest.q, q, n, nest.q_elem.clone()),
+            GuardOperand::new(nest.out, out, n, MirType::F32),
+            GuardOperand::new(nest.scale, scale, cols, MirType::F32),
+        ];
+        if !self.open_kernel_guard(
+            &ops,
+            &[OperandPair::disjoint(0, 1), OperandPair::disjoint(2, 1)],
+        ) {
+            return false;
+        }
         let op = self
             .builder
             .build(MirType::I64, Op::ConstInt(nest.op as i128, MirType::I64));
@@ -15834,6 +16276,10 @@ impl FnLowerer<'_> {
         x_sym: Symbol,
         coeffs: &[&Expr],
     ) -> bool {
+        // The coefficients are evaluated once, into the table below (see `hoisted_reads_disjoint`).
+        if !self.hoisted_reads_disjoint(coeffs, &[out_sym]) {
+            return false;
+        }
         let Some([out_base, x_base]) = self.kernel_base_ptrs([out_sym, x_sym]) else {
             return false;
         };
@@ -15872,6 +16318,15 @@ impl FnLowerer<'_> {
             MirType::I64,
             Op::ConstInt(coeffs.len() as i128, MirType::I64),
         );
+        // `out` may be EXACTLY `x`, never a shifted view of it (`open_elementwise_guard`). The
+        // coefficient table is the fresh stack array built above, so it overlaps nothing.
+        let ops = [
+            GuardOperand::new(x_sym, xp, n, MirType::F32),
+            GuardOperand::new(out_sym, outp, n, MirType::F32),
+        ];
+        if !self.open_elementwise_guard(&ops, &[1]) {
+            return false;
+        }
         self.builder.build_void(Op::Call {
             func: self.gemm.vhorner,
             args: vec![xp, outp, n, arr, ncoeff],
@@ -16085,8 +16540,9 @@ impl FnLowerer<'_> {
             if let Some(calls) = self.match_vmath_body(j, body, None) {
                 let s = self.coerce_to(start_val, ity, &MirType::I64, true);
                 let e = self.coerce_to(end_val, ity, &MirType::I64, true);
-                self.emit_vmath_calls(s, e, calls);
-                return true;
+                if self.emit_vmath_calls(s, e, calls) {
+                    return true;
+                }
             }
             // A streaming affine map per `@parallel` chunk → the same 256-bit + non-temporal-store kernel,
             // so an `@parallel` saxpy/scale/add runs multicore × 256-bit with RFO-free stores. Elementwise,
@@ -16094,8 +16550,9 @@ impl FnLowerer<'_> {
             if let Some(plan) = self.match_velem_body(j, body) {
                 let s = self.coerce_to(start_val, ity, &MirType::I64, true);
                 let e = self.coerce_to(end_val, ity, &MirType::I64, true);
-                self.emit_velem_call(s, e, &plan);
-                return true;
+                if self.emit_velem_call(s, e, &plan) {
+                    return true;
+                }
             }
             // An int-input dequant per `@parallel` chunk → the same 256-bit `wukong_dequant_f32` over
             // `[s, e)`, so a `@parallel` dequant runs multicore × 256-bit (each thread's chunk is one serial
@@ -16111,7 +16568,15 @@ impl FnLowerer<'_> {
             // mixed-precision residual-add / saxpy runs multicore (the bandwidth payoff is largest here,
             // ≫ L3). Each chunk GEPs the half-width inputs and f32 output by `s`; elementwise, so the
             // per-chunk passes agree with the interpreter's whole-range marshal of the same kernel.
-            if let Some((out, x, y, a_expr, b_expr, is_f16)) = self.match_lowp_axpby(body, j) {
+            if let Some((out, x, y, a_expr, b_expr, is_f16)) = self
+                .match_lowp_axpby(body, j)
+                .filter(|&(out, _, _, a_expr, b_expr, _)| {
+                    // The coefficients are evaluated once per chunk, ahead of the call (see
+                    // `hoisted_reads_disjoint`).
+                    let coeffs: Vec<&Expr> = [a_expr, b_expr].into_iter().flatten().collect();
+                    self.hoisted_reads_disjoint(&coeffs, &[out])
+                })
+            {
                 if let Some([outv, xv, yv]) = self.kernel_base_ptrs([out, x, y]) {
                     let s = self.coerce_to(start_val, ity, &MirType::I64, true);
                     let e = self.coerce_to(end_val, ity, &MirType::I64, true);
@@ -16143,15 +16608,25 @@ impl FnLowerer<'_> {
                             elem: MirType::F32,
                         },
                     );
-                    self.builder.build_void(Op::Call {
-                        func: if is_f16 {
-                            self.gemm.axpby_f16
-                        } else {
-                            self.gemm.axpby_bf16
-                        },
-                        args: vec![xp, yp, outp, n, av, bv],
-                    });
-                    return true;
+                    // Half inputs and an f32 output: any overlap is a mixed-width pun, so every pair
+                    // is `Disjoint` (`open_elementwise_guard`).
+                    let half = if is_f16 { MirType::F16 } else { MirType::BF16 };
+                    let ops = [
+                        GuardOperand::new(x, xp, n, half.clone()),
+                        GuardOperand::new(y, yp, n, half),
+                        GuardOperand::new(out, outp, n, MirType::F32),
+                    ];
+                    if self.open_elementwise_guard(&ops, &[2]) {
+                        self.builder.build_void(Op::Call {
+                            func: if is_f16 {
+                                self.gemm.axpby_f16
+                            } else {
+                                self.gemm.axpby_bf16
+                            },
+                            args: vec![xp, yp, outp, n, av, bv],
+                        });
+                        return true;
+                    }
                 }
             }
             // A Horner polynomial per `@parallel` chunk → the same 256-bit AVX2 + NT-store Horner kernel.
@@ -30779,6 +31254,80 @@ mod tests {
         prog.funcs.iter().any(|f| fn_calls(f, interner, callee))
     }
 
+    /// Is `cond` the run-time alias test `kernel_guard.rs` builds: a tree of `and`/`or` over
+    /// `ule`/`eq` comparisons whose operands are `ptrtoint` range ends?
+    fn is_alias_guard_cond(defs: &HashMap<ValueId, &Op>, cond: ValueId, depth: u32) -> bool {
+        if depth > 64 {
+            return false;
+        }
+        match defs.get(&cond) {
+            Some(Op::Bin(BinOp::And | BinOp::Or, a, b)) => {
+                is_alias_guard_cond(defs, *a, depth + 1) || is_alias_guard_cond(defs, *b, depth + 1)
+            }
+            Some(Op::Cmp(CmpOp::Ule | CmpOp::Eq, a, b)) => [a, b]
+                .iter()
+                .any(|v| matches!(defs.get(*v), Some(Op::Cast(CastKind::PtrToInt, _, _)))),
+            _ => false,
+        }
+    }
+
+    /// Does `f` call `callee` from a block that is NOT behind a run-time alias guard? A guarded
+    /// call sits in a block whose every predecessor is a `cond_br` on [`is_alias_guard_cond`] with
+    /// that block as its `then` arm — the kernel arm `FnLowerer::open_kernel_guard` opens, whose
+    /// `else` arm is the source loop. An aliased program must have no unguarded kernel call: that
+    /// is the invariant the old "must lower to the scalar nest" assertions encoded, restated for
+    /// run-time versioning (the kernel may exist, but only where the operands were proven disjoint
+    /// at run time).
+    fn fn_calls_unguarded(f: &Function, interner: &Interner, callee: &str) -> bool {
+        let mut defs: HashMap<ValueId, &Op> = HashMap::default();
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let Some(r) = i.result {
+                    defs.insert(r, &i.op);
+                }
+            }
+        }
+        let targets = |t: &wukong_mir::Terminator| -> Vec<wukong_mir::BlockId> {
+            match t {
+                wukong_mir::Terminator::Br { target, .. } => vec![*target],
+                wukong_mir::Terminator::CondBr {
+                    then_blk, else_blk, ..
+                } => vec![*then_blk, *else_blk],
+                wukong_mir::Terminator::Ret(_) | wukong_mir::Terminator::Unreachable => vec![],
+            }
+        };
+        f.blocks.iter().any(|b| {
+            let calls = b.insts.iter().any(
+                |i| matches!(&i.op, Op::Call { func, .. } if interner.resolve(*func) == callee),
+            );
+            if !calls {
+                return false;
+            }
+            let preds: Vec<&wukong_mir::BasicBlock> = f
+                .blocks
+                .iter()
+                .filter(|p| targets(&p.term).contains(&b.id))
+                .collect();
+            let guarded = !preds.is_empty()
+                && preds.iter().all(|p| {
+                    matches!(
+                        &p.term,
+                        wukong_mir::Terminator::CondBr { cond, then_blk, else_blk, .. }
+                            if *then_blk == b.id
+                                && *else_blk != b.id
+                                && is_alias_guard_cond(&defs, *cond, 0)
+                    )
+                });
+            !guarded
+        })
+    }
+
+    fn prog_calls_unguarded(prog: &Program, interner: &Interner, callee: &str) -> bool {
+        prog.funcs
+            .iter()
+            .any(|f| fn_calls_unguarded(f, interner, callee))
+    }
+
     /// [`lower`] with explicit [`LowerOptions`].
     fn lower_with(src: &str, opts: LowerOptions) -> (Program, Vec<Diagnostic>, Interner) {
         let mut interner = Interner::new();
@@ -30857,8 +31406,12 @@ fn mm(a: [f32; 16], b: [f32; 16], mut c: [f32; 16]) {
             .find(|f| interner.resolve(f.name) == "mm_alias")
             .unwrap();
         assert!(
-            !fn_calls(aliased, &interner, "wukong_sgemm"),
-            "a positive extent must not bypass the alias-based kernel decline"
+            !fn_calls_unguarded(aliased, &interner, "wukong_sgemm"),
+            "a positive extent must not bypass the run-time alias guard"
+        );
+        assert!(
+            fn_calls(aliased, &interner, "wukong_sgemm"),
+            "an alias-uncertain GEMM is versioned at run time behind the guard, not declined"
         );
         let (generic, diagnostics, interner) = lower_with(
             source,
@@ -32616,7 +33169,7 @@ fn main() -> i32 {
         let (prog, diags, interner) = lower(&aliased);
         assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
         assert!(
-            !prog_calls(&prog, &interner, "wukong_sgemm"),
+            !prog_calls_unguarded(&prog, &interner, "wukong_sgemm"),
             "an aliased GEMM must lower to the scalar nest, got {:?}",
             kernel_calls(&prog, &interner)
         );
@@ -32657,7 +33210,7 @@ fn main() -> i32 {
 ";
         let (prog, _d, interner) = lower(&tr.replace("ALIASCALL", "tr(x, x);"));
         assert!(
-            !prog_calls(&prog, &interner, "wukong_transpose_f32"),
+            !prog_calls_unguarded(&prog, &interner, "wukong_transpose_f32"),
             "an aliased transpose must lower to the scalar nest, got {:?}",
             kernel_calls(&prog, &interner)
         );
@@ -32685,7 +33238,7 @@ fn main() -> i32 {
 ";
         let (prog, _d, interner) = lower(&gv.replace("ALIASCALL", "gv(m, v, v);"));
         assert!(
-            !prog_calls(&prog, &interner, "wukong_sgemv"),
+            !prog_calls_unguarded(&prog, &interner, "wukong_sgemv"),
             "an aliased GEMV must lower to the scalar nest, got {:?}",
             kernel_calls(&prog, &interner)
         );
@@ -32694,6 +33247,415 @@ fn main() -> i32 {
             prog_calls(&prog, &interner, "wukong_sgemv"),
             "a disjoint GEMV must still dispatch"
         );
+    }
+
+    /// The function named `name` in `prog`.
+    fn func_named<'p>(prog: &'p Program, interner: &Interner, name: &str) -> &'p Function {
+        prog.funcs
+            .iter()
+            .find(|f| interner.resolve(f.name) == name)
+            .unwrap_or_else(|| panic!("fn {name}"))
+    }
+
+    /// The classifier every multi-buffer emit site asks, on its own. A symbol comparison can only
+    /// ever DECLINE (the same symbol under a `Disjoint` contract) and never prove disjointness; two
+    /// different symbols are `Disjoint` only under the whole-program fact, and otherwise go to the
+    /// run-time guard; exact in-place is free when the contract permits it; and two INPUTS sharing
+    /// storage is nobody's business, because only the pairs a contract lists are constrained.
+    #[test]
+    fn kernel_alias_plan_classifies_every_constrained_pair() {
+        use super::alias::{plan_kernel_alias, KernelAliasPlan};
+        let mut interner = Interner::new();
+        let (x, y, out) = (
+            interner.intern("x"),
+            interner.intern("y"),
+            interner.intern("out"),
+        );
+        let gemm = [OperandPair::disjoint(0, 2), OperandPair::disjoint(1, 2)];
+        assert_eq!(
+            plan_kernel_alias(true, &[x, y, out], &gemm),
+            KernelAliasPlan::Dispatch,
+            "distinct names in an alias-free function need no test"
+        );
+        assert_eq!(
+            plan_kernel_alias(false, &[x, y, out], &gemm),
+            KernelAliasPlan::Version(gemm.to_vec()),
+            "distinct names the whole-program fact cannot vouch for go to the run-time guard"
+        );
+        for alias_free in [true, false] {
+            assert_eq!(
+                plan_kernel_alias(alias_free, &[x, y, x], &gemm),
+                KernelAliasPlan::Decline,
+                "the same symbol as input and output: no run-time test rescues a Disjoint contract"
+            );
+        }
+        assert_eq!(
+            plan_kernel_alias(true, &[x, x, out], &gemm),
+            KernelAliasPlan::Dispatch,
+            "two INPUTS may share storage"
+        );
+        let scan = [OperandPair::exact_in_place(0, 1)];
+        for alias_free in [true, false] {
+            assert_eq!(
+                plan_kernel_alias(alias_free, &[x, x], &scan),
+                KernelAliasPlan::Dispatch,
+                "exact in place is what an ExactInPlace contract permits"
+            );
+        }
+        assert_eq!(
+            plan_kernel_alias(false, &[x, out], &scan),
+            KernelAliasPlan::Version(scan.to_vec()),
+            "a possibly SHIFTED overlap still needs the run-time test"
+        );
+        assert_eq!(
+            plan_kernel_alias(true, &[x], &gemm),
+            KernelAliasPlan::Decline,
+            "an operand index past the list is refused, never treated as checked"
+        );
+    }
+
+    /// **Run-time versioning, not a compile-time decline.** One aliased call site used to take the
+    /// GEMM away from EVERY call of a library routine: `mm(x, y, x)` anywhere in the program made
+    /// `mm` not alias free, and `mm(x, y, z)` — perfectly disjoint — then ran the scalar nest too.
+    /// The kernel must now stay, but only behind an overlap test whose other arm is the nest as
+    /// written (`kernel_guard.rs`), and the result must verify.
+    #[test]
+    fn an_alias_uncertain_gemm_is_versioned_with_the_source_loop_on_the_overlapping_arm() {
+        let src = format!(
+            "{MATMUL_SRC}fn main() -> i32 {{
+    let mut x: [f32; 16] = [0.0; 16];
+    let mut y: [f32; 16] = [0.0; 16];
+    let mut z: [f32; 16] = [0.0; 16];
+    mm(x, y, x);
+    mm(x, y, z);
+    return 0;
+}}
+"
+        );
+        assert!(
+            !alias_free_of(&src, "mm"),
+            "mm(x, y, x) aliases mm's params 0 and 2"
+        );
+        let (prog, diags, interner) = lower(&src);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        let mm = func_named(&prog, &interner, "mm");
+        assert!(
+            fn_calls(mm, &interner, "wukong_sgemm"),
+            "the disjoint call must keep its kernel, got {:?}",
+            kernel_calls(&prog, &interner)
+        );
+        assert!(
+            !fn_calls_unguarded(mm, &interner, "wukong_sgemm"),
+            "an alias-uncertain GEMM may only run behind the run-time overlap test"
+        );
+        assert!(
+            mm.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| matches!(i.op, Op::Bin(BinOp::FMul, _, _) | Op::Fma(..))),
+            "the may-overlap arm must lower the loop as written"
+        );
+        for f in &prog.funcs {
+            let errs = verify_function(f);
+            assert!(errs.is_empty(), "{}: {errs:?}", interner.resolve(f.name));
+        }
+    }
+
+    /// The scans' documented in-place spelling survives versioning, and a shifted overlap does
+    /// not: `x`/`out` is an `ExactInPlace` pair, so the guard is "disjoint OR the same range" — an
+    /// `eq` over `ptrtoint` range ends beside the `ule` disjointness test. A shifted `out` would make
+    /// the 8-lane row scan read values the source loop has already overwritten.
+    #[test]
+    fn an_alias_uncertain_scan_guard_admits_exact_in_place() {
+        let src = "module m
+fn cs(x: [f32; 8], mut out: [f32; 8]) {
+    for r in 0..2 {
+        let mut acc: f32 = 0.0;
+        for i in 0..4 {
+            acc = acc + x[r * 4 + i];
+            out[r * 4 + i] = acc;
+        }
+    }
+}
+fn main() -> i32 {
+    let mut a: [f32; 8] = [1.0; 8];
+    let mut b: [f32; 8] = [0.0; 8];
+    cs(a, a);
+    cs(a, b);
+    return 0;
+}
+";
+        assert!(
+            !alias_free_of(src, "cs"),
+            "cs(a, a) aliases cs's two params"
+        );
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        let cs = func_named(&prog, &interner, "cs");
+        assert!(
+            fn_calls(cs, &interner, "wukong_cumsum_f32"),
+            "the scan must keep its kernel, got {:?}",
+            kernel_calls(&prog, &interner)
+        );
+        assert!(!fn_calls_unguarded(cs, &interner, "wukong_cumsum_f32"));
+        let defs: HashMap<ValueId, &Op> = cs
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter_map(|i| i.result.map(|r| (r, &i.op)))
+            .collect();
+        assert!(
+            cs.blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(
+                &i.op,
+                Op::Cmp(CmpOp::Eq, a, _)
+                    if matches!(defs.get(a), Some(Op::Cast(CastKind::PtrToInt, _, _)))
+            )),
+            "exact in-place operation must be admitted by an equality test on the range ends"
+        );
+        for f in &prog.funcs {
+            let errs = verify_function(f);
+            assert!(errs.is_empty(), "{}: {errs:?}", interner.resolve(f.name));
+        }
+    }
+
+    /// The gather's guard covers ALL THREE operands — including the `i32` index buffer the old
+    /// two-range test never looked at — and its overlapping arm is the source loop, not the serial
+    /// kernel whose own `# Safety` clause also says "non-overlapping".
+    #[test]
+    fn an_alias_uncertain_embedding_is_versioned_over_all_three_operands() {
+        let src = "module m
+fn embed(ids: [i32; 4], weight: [f32; 12], mut out: [f32; 12]) {
+    for t in 0..4 {
+        for d in 0..3 {
+            out[t * 3 + d] = weight[ids[t] * 3 + d];
+        }
+    }
+}
+fn main() -> i32 {
+    let ids: [i32; 4] = [2, 0, 3, 0];
+    let mut buf: [f32; 12] = [0.0; 12];
+    let mut o: [f32; 12] = [0.0; 12];
+    embed(ids, buf, buf);
+    embed(ids, buf, o);
+    return 0;
+}
+";
+        assert!(!alias_free_of(src, "embed"), "embed(ids, buf, buf) aliases");
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        let embed = func_named(&prog, &interner, "embed");
+        assert!(
+            fn_calls(embed, &interner, "wukong_embedding_f32"),
+            "the disjoint call must keep its kernel, got {:?}",
+            kernel_calls(&prog, &interner)
+        );
+        assert!(!fn_calls_unguarded(
+            embed,
+            &interner,
+            "wukong_embedding_f32"
+        ));
+        let range_ends = embed
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(i.op, Op::Cast(CastKind::PtrToInt, _, _)))
+            .count();
+        assert!(
+            range_ends >= 6,
+            "out, ids and weight must each contribute both range ends, found {range_ends}"
+        );
+        for f in &prog.funcs {
+            let errs = verify_function(f);
+            assert!(errs.is_empty(), "{}: {errs:?}", interner.resolve(f.name));
+        }
+    }
+
+    /// Does `f` hold the "exactly the same range" admission an `ExactInPlace` pair adds to a
+    /// run-time alias guard — an `eq` whose operand is a `ptrtoint` range end?
+    fn admits_exact_in_place(f: &Function) -> bool {
+        let defs: HashMap<ValueId, &Op> = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter_map(|i| i.result.map(|r| (r, &i.op)))
+            .collect();
+        f.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+            matches!(
+                &i.op,
+                Op::Cmp(CmpOp::Eq, a, _)
+                    if matches!(defs.get(a), Some(Op::Cast(CastKind::PtrToInt, _, _)))
+            )
+        })
+    }
+
+    /// The 256-bit ELEMENTWISE kernels (here `wukong_vmath_f32`) used to dispatch on any two buffer
+    /// names with no disjointness reasoning at all — ahead of the generic vectorizer, whose own
+    /// disjointness proof they bypassed — so a SHIFTED `out` over `x` ran the 8-lane body where the
+    /// source loop chains each store into the next element's read. They are versioned like every
+    /// other kernel now: exact in place is admitted (the in-place map), and any other overlap the
+    /// compiler cannot rule out runs the loop.
+    #[test]
+    fn an_alias_uncertain_elementwise_map_is_versioned_with_exact_in_place_admitted() {
+        let src = "module m
+fn act(x: [f32; 64], mut out: [f32; 64]) {
+    for i in 0..64 { out[i] = gelu(x[i]); }
+}
+fn main() -> i32 {
+    let mut a: [f32; 64] = [0.5; 64];
+    let mut b: [f32; 64] = [0.0; 64];
+    act(a, a);
+    act(a, b);
+    return 0;
+}
+";
+        assert!(
+            !alias_free_of(src, "act"),
+            "act(a, a) aliases act's two params"
+        );
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        let act = func_named(&prog, &interner, "act");
+        assert!(
+            fn_calls(act, &interner, "wukong_vmath_f32"),
+            "the map must keep its kernel, got {:?}",
+            kernel_calls(&prog, &interner)
+        );
+        assert!(!fn_calls_unguarded(act, &interner, "wukong_vmath_f32"));
+        assert!(
+            admits_exact_in_place(act),
+            "exact in-place operation must be admitted by an equality test on the range ends"
+        );
+        for f in &prog.funcs {
+            let errs = verify_function(f);
+            assert!(errs.is_empty(), "{}: {errs:?}", interner.resolve(f.name));
+        }
+    }
+
+    /// A statement-WINDOW kernel (here an out-of-place RMSNorm) is versioned too, with the window
+    /// itself on the overlapping arm. A shifted `out` would let one row's stores reach values the
+    /// window still reads; exact in place is the norm's documented in-place form. It used to
+    /// dispatch with no disjointness reasoning at all.
+    #[test]
+    fn an_alias_uncertain_norm_window_is_versioned_over_its_own_statements() {
+        let src = "module m
+fn rms(x: [f32; 128], mut out: [f32; 128]) {
+    let mut s: f32 = 0.0;
+    for i in 0..128 { s = s + x[i] * x[i]; }
+    let inv: f32 = rsqrt(s / 128.0 + 0.00001);
+    for i in 0..128 { out[i] = x[i] * inv; }
+}
+fn main() -> i32 {
+    let mut a: [f32; 128] = [1.0; 128];
+    let mut b: [f32; 128] = [0.0; 128];
+    rms(a, a);
+    rms(a, b);
+    return 0;
+}
+";
+        assert!(
+            !alias_free_of(src, "rms"),
+            "rms(a, a) aliases rms's two params"
+        );
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        let rms = func_named(&prog, &interner, "rms");
+        assert!(
+            fn_calls(rms, &interner, "wukong_norm_f32"),
+            "the norm must keep its kernel, got {:?}",
+            kernel_calls(&prog, &interner)
+        );
+        assert!(!fn_calls_unguarded(rms, &interner, "wukong_norm_f32"));
+        assert!(admits_exact_in_place(rms));
+        for f in &prog.funcs {
+            let errs = verify_function(f);
+            assert!(errs.is_empty(), "{}: {errs:?}", interner.resolve(f.name));
+        }
+    }
+
+    /// A value-returning reduction keeps its seed EXACTLY on an empty range. The kernel answers
+    /// `n <= 0` with its identity, and combining that identity is not the identity on every seed
+    /// (`-0.0 + 0.0` is `+0.0`; `fmax(NaN, -inf)` as `Cmp(Fogt)+Select` is `-inf`), so the stored
+    /// accumulator is selected on `n > 0` — a `Select`, not a branch, so the function stays
+    /// straight-line for autodiff's tape.
+    #[test]
+    fn a_dispatched_reduction_keeps_its_seed_on_an_empty_range() {
+        let src = "module m
+@parallel
+fn dot(x: [f32; 8], y: [f32; 8], mut out: [f32; 1]) -> f32 {
+    let mut l: f32 = 0.0;
+    for i in 0..8 { l = l + x[i] * y[i]; }
+    out[0] = l;
+    return l;
+}
+fn main() -> i32 { return 0; }
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        let dot = func_named(&prog, &interner, "dot");
+        assert!(
+            fn_calls(dot, &interner, "wukong_sreduce_f32_parallel"),
+            "the reduction must dispatch, got {:?}",
+            kernel_calls(&prog, &interner)
+        );
+        let defs: HashMap<ValueId, &Op> = dot
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter_map(|i| i.result.map(|r| (r, &i.op)))
+            .collect();
+        assert!(
+            dot.blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(
+                &i.op,
+                Op::Select(c, _, _) if matches!(defs.get(c), Some(Op::Cmp(CmpOp::Sgt, _, _)))
+            )),
+            "the combined accumulator must be selected on a non-empty range"
+        );
+        for f in &prog.funcs {
+            let errs = verify_function(f);
+            assert!(errs.is_empty(), "{}: {errs:?}", interner.resolve(f.name));
+        }
+    }
+
+    /// A coefficient the elementwise kernels HOIST — `out[0]` in `out[j] = out[0] * x[j]` — is read
+    /// once, ahead of the call, where the source loop re-reads it after `out[0]`'s own store. It is
+    /// a scalar operand, so no buffer-range guard can see it: the dispatch must decline whenever the
+    /// read's storage may be a buffer the kernel writes, and stay when it provably is not.
+    #[test]
+    fn a_hoisted_coefficient_read_from_the_output_declines_the_elementwise_kernel() {
+        let src = "module m
+fn head(x: [f32; 64], mut out: [f32; 64]) {
+    for j in 0..64 { out[j] = out[0] * x[j]; }
+}
+fn other(s: [f32; 64], x: [f32; 64], mut out: [f32; 64]) {
+    for j in 0..64 { out[j] = s[0] * x[j]; }
+}
+fn main() -> i32 {
+    let mut a: [f32; 64] = [1.0; 64];
+    let mut b: [f32; 64] = [2.0; 64];
+    let mut c: [f32; 64] = [0.0; 64];
+    head(a, b);
+    other(a, b, c);
+    return 0;
+}
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        let head = func_named(&prog, &interner, "head");
+        assert!(
+            !fn_calls(head, &interner, "wukong_velem_f32"),
+            "a coefficient read from the output must keep the loop, got {:?}",
+            kernel_calls(&prog, &interner)
+        );
+        let other = func_named(&prog, &interner, "other");
+        assert!(
+            fn_calls(other, &interner, "wukong_velem_f32"),
+            "a coefficient read from provably disjoint storage keeps the kernel, got {:?}",
+            kernel_calls(&prog, &interner)
+        );
+        for f in &prog.funcs {
+            let errs = verify_function(f);
+            assert!(errs.is_empty(), "{}: {errs:?}", interner.resolve(f.name));
+        }
     }
 
     /// **A call in TAIL position must be visible to the analysis.** `fn go(a, b, mut c) { mm(a, b,
@@ -32722,7 +33684,7 @@ fn main() -> i32 {{
         let (prog, diags, interner) = lower(&tail);
         assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
         assert!(
-            !prog_calls(&prog, &interner, "wukong_sgemm"),
+            !prog_calls_unguarded(&prog, &interner, "wukong_sgemm"),
             "a GEMM reached through an aliased tail call must lower to the scalar nest, got {:?}",
             kernel_calls(&prog, &interner)
         );
@@ -32794,7 +33756,7 @@ fn main() -> i32 {
         let (prog, diags, interner) = lower(&viewed);
         assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
         assert!(
-            !prog_calls(&prog, &interner, "wukong_transpose_f32"),
+            !prog_calls_unguarded(&prog, &interner, "wukong_transpose_f32"),
             "a transpose whose destination views its source must lower to the scalar nest, got {:?}",
             kernel_calls(&prog, &interner)
         );
@@ -32925,7 +33887,7 @@ fn main() -> i32 {
         let (prog, diags, interner) = lower(&aliased);
         assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
         assert!(
-            !prog_calls(&prog, &interner, "wukong_sgemm"),
+            !prog_calls_unguarded(&prog, &interner, "wukong_sgemm"),
             "a GEMM over a struct-field view of its own output must decline, got {:?}",
             kernel_calls(&prog, &interner)
         );
@@ -32984,7 +33946,7 @@ fn main() -> i32 {
         let (prog, diags, interner) = lower(&aliased_v);
         assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
         assert!(
-            !prog_calls(&prog, &interner, "wukong_sgemm"),
+            !prog_calls_unguarded(&prog, &interner, "wukong_sgemm"),
             "a GEMM over a VIEW OF a struct-field view of its own output must decline, got {:?}",
             kernel_calls(&prog, &interner)
         );
@@ -33058,7 +34020,7 @@ fn main() -> i32 {
         let (prog, diags, interner) = lower(&rebound);
         assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
         assert!(
-            !prog_calls(&prog, &interner, "wukong_sgemm"),
+            !prog_calls_unguarded(&prog, &interner, "wukong_sgemm"),
             "a GEMM whose A operand is a REBOUND view of its own output must decline, got {:?}",
             kernel_calls(&prog, &interner)
         );
@@ -33113,7 +34075,7 @@ fn main() -> i32 {
         let (prog, diags, interner) = lower(&rebound_arg);
         assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
         assert!(
-            !prog_calls(&prog, &interner, "wukong_sgemm"),
+            !prog_calls_unguarded(&prog, &interner, "wukong_sgemm"),
             "a GEMM reached through an argument spelled with a rebound view must decline, got {:?}",
             kernel_calls(&prog, &interner)
         );
@@ -33188,7 +34150,7 @@ fn main() -> i32 {
             let (prog, diags, interner) = lower(&aliased_arg);
             assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
             assert!(
-                !prog_calls(&prog, &interner, "wukong_sgemm"),
+                !prog_calls_unguarded(&prog, &interner, "wukong_sgemm"),
                 "a GEMM whose A argument is {spelling} over its own output must decline, got {:?}",
                 kernel_calls(&prog, &interner)
             );
@@ -33255,7 +34217,7 @@ fn main() -> i32 {
         let (prog, diags, interner) = lower(&aliased);
         assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
         assert!(
-            !prog_calls(&prog, &interner, "wukong_sgemm"),
+            !prog_calls_unguarded(&prog, &interner, "wukong_sgemm"),
             "a GEMM over a COPIED struct's view of its own output must decline, got {:?}",
             kernel_calls(&prog, &interner)
         );
@@ -33303,7 +34265,7 @@ fn main() -> i32 {
         let (prog, diags, interner) = lower(&aliased);
         assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
         assert!(
-            !prog_calls(&prog, &interner, "wukong_sgemm"),
+            !prog_calls_unguarded(&prog, &interner, "wukong_sgemm"),
             "a GEMM writing a second destructuring of its own A operand must decline, got {:?}",
             kernel_calls(&prog, &interner)
         );
@@ -33359,7 +34321,7 @@ fn main() -> i32 {
         let (prog, diags, interner) = lower(&borrows);
         assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
         assert!(
-            !prog_calls(&prog, &interner, "wukong_sgemm"),
+            !prog_calls_unguarded(&prog, &interner, "wukong_sgemm"),
             "a function binding a BORROWING enum payload must decline, got {:?}",
             kernel_calls(&prog, &interner)
         );
@@ -33446,7 +34408,7 @@ fn main() -> i32 {
             let (prog, diags, interner) = lower(&aliased);
             assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
             assert!(
-                !prog_calls(&prog, &interner, "wukong_sgemm"),
+                !prog_calls_unguarded(&prog, &interner, "wukong_sgemm"),
                 "a GEMM over {what}-valued view of its own output must decline, got {:?}",
                 kernel_calls(&prog, &interner)
             );
@@ -33518,7 +34480,7 @@ fn main() -> i32 {
         let (prog, diags, interner) = lower(&aliased);
         assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
         assert!(
-            !prog_calls(&prog, &interner, "wukong_sgemm"),
+            !prog_calls_unguarded(&prog, &interner, "wukong_sgemm"),
             "a GEMM writing a second for-each binding of its own A operand must decline, got {:?}",
             kernel_calls(&prog, &interner)
         );
@@ -33770,7 +34732,7 @@ fn main() -> i32 {
             let (prog, diags, interner) = lower(&aliased);
             assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
             assert!(
-                !prog_calls(&prog, &interner, "wukong_sgemm"),
+                !prog_calls_unguarded(&prog, &interner, "wukong_sgemm"),
                 "a GEMM reached through {site} the pass cannot classify must decline, got {:?}",
                 kernel_calls(&prog, &interner)
             );
@@ -34031,7 +34993,7 @@ fn main() -> i32 {
             let (prog, diags, interner) = lower(src);
             assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
             assert!(
-                !prog_calls(&prog, &interner, "wukong_sgemm"),
+                !prog_calls_unguarded(&prog, &interner, "wukong_sgemm"),
                 "dispatched a GEMM whose B operand `l.w` IS its output `c`; got {:?}",
                 kernel_calls(&prog, &interner)
             );

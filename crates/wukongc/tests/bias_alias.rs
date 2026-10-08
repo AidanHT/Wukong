@@ -79,6 +79,56 @@ fn invoke(path: &Path, args: &[&str], no_recognize: bool) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
+/// The block labels (`bbN`) a printed MIR line names, in order: a `cond_br`'s then- and else-arm,
+/// a `br`'s target, or a block header's own label. Values print as `vN`, so nothing else matches.
+fn block_labels(line: &str) -> Vec<&str> {
+    let mut labels = Vec::new();
+    let mut rest = line;
+    while let Some(at) = rest.find("bb") {
+        let digits = rest[at + 2..]
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len() - at - 2);
+        if digits > 0 {
+            labels.push(&rest[at..at + 2 + digits]);
+        }
+        rest = &rest[at + 2 + digits..];
+    }
+    labels
+}
+
+/// Is every `needle` call in this printed function the kernel arm of a run-time alias guard
+/// (`wukong_mir_build`'s `kernel_guard.rs`)? Each block holding the call must be entered only as
+/// the THEN arm of `cond_br` terminators, and the function must hold the `ptrtoint` range test.
+/// The guard's other arm is the source loop, so the call can only run on disjoint operands.
+fn calls_are_guarded(body: &str, needle: &str) -> bool {
+    let mut blocks: Vec<(&str, Vec<&str>)> = Vec::new();
+    for line in body.lines().map(str::trim) {
+        if line.starts_with("bb") && line.ends_with(':') {
+            blocks.push((block_labels(line)[0], Vec::new()));
+        } else if let Some((_, lines)) = blocks.last_mut() {
+            lines.push(line);
+        }
+    }
+    let calling: Vec<&str> = blocks
+        .iter()
+        .filter(|(_, lines)| lines.iter().any(|l| l.contains(needle)))
+        .map(|(label, _)| *label)
+        .collect();
+    body.contains("ptrtoint")
+        && !calling.is_empty()
+        && calling.iter().all(|label| {
+            let entries: Vec<&str> = blocks
+                .iter()
+                .filter_map(|(_, lines)| lines.last().copied())
+                .filter(|term| block_labels(term).contains(label))
+                .collect();
+            !entries.is_empty()
+                && entries.iter().all(|term| {
+                    term.starts_with("cond_br ") && block_labels(term).first() == Some(label)
+                })
+        })
+}
+
 fn check(parallel: bool) {
     let path = std::env::temp_dir().join(format!(
         "wukong-bias-alias-{}-{parallel}.wk",
@@ -94,30 +144,40 @@ fn check(parallel: bool) {
     } else {
         "wukong_bias_bcast_f32"
     };
-    for (name, count) in [
-        ("aliased", 0),
-        ("local_alias", 0),
-        ("disjoint", 1),
-        ("inplace", 1),
-        ("read_alias", 1),
+    // `aliased` and `local_alias` hand the kernel a bias that may BE the output. Their dispatch is
+    // versioned on a run-time overlap test: the one kernel call sits in the guard's disjoint arm,
+    // and the overlapping arm is the nest in source order (serial, never outlined). The other three
+    // are disjoint or exactly in place at compile time and dispatch unconditionally.
+    for (name, guarded) in [
+        ("aliased", true),
+        ("local_alias", true),
+        ("disjoint", false),
+        ("inplace", false),
+        ("read_alias", false),
     ] {
         let (_, tail) = mir
             .split_once(&format!("fn {name}("))
             .unwrap_or_else(|| panic!("missing {name}:\n{mir}"));
         let body = tail.split("\n}\n").next().unwrap();
-        assert_eq!(
-            body.matches(&format!("call {symbol}(")).count(),
-            count,
-            "{name}:\n{body}"
-        );
-        if count == 0 {
+        if guarded {
+            assert_eq!(
+                body.matches("call wukong_bias_bcast").count(),
+                1,
+                "{name}:\n{body}"
+            );
             assert!(
-                !body.contains("call wukong_bias_bcast"),
-                "unsafe bias dispatch in {name}:\n{body}"
+                calls_are_guarded(body, "call wukong_bias_bcast"),
+                "unguarded bias dispatch in {name}:\n{body}"
             );
             assert!(
                 !body.contains("call wukong_parallel_for"),
                 "aliased rows must remain ordered:\n{body}"
+            );
+        } else {
+            assert_eq!(
+                body.matches(&format!("call {symbol}(")).count(),
+                1,
+                "{name}:\n{body}"
             );
         }
     }

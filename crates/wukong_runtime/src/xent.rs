@@ -195,6 +195,9 @@ unsafe fn xent_row(x: *const f32, target: usize, n: usize) -> f32 {
 /// # Safety
 /// `x` valid for `rows*cols` f32; `target` and `loss` valid for `rows`. The label values are
 /// unconstrained — the kernel bounds them itself.
+/// **Aliasing: all operands disjoint** — `loss` must overlap neither the logits nor the `i32`
+/// targets. The compiler guarantees it for a recognized call (`wukong_mir_build`'s
+/// `kernel_guard.rs`).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_xent_fwd_f32(
     x: *const f32,
@@ -225,7 +228,9 @@ const XENT_PAR_MIN: usize = 8;
 /// agrees with this `@parallel` path exactly).
 ///
 /// # Safety
-/// Operand-size contract of [`wukong_xent_fwd_f32`].
+/// Operand-size and aliasing contract of [`wukong_xent_fwd_f32`].
+/// **Aliasing:** that of [`wukong_xent_fwd_f32`] — all operands disjoint: `loss` overlaps neither
+/// `x` nor `target`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_xent_fwd_f32_parallel(
     x: *const f32,

@@ -86,6 +86,56 @@ fn invoke(path: &Path, args: &[&str], no_recognize: bool) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
+/// The block labels (`bbN`) a printed MIR line names, in order: a `cond_br`'s then- and else-arm,
+/// a `br`'s target, or a block header's own label. Values print as `vN`, so nothing else matches.
+fn block_labels(line: &str) -> Vec<&str> {
+    let mut labels = Vec::new();
+    let mut rest = line;
+    while let Some(at) = rest.find("bb") {
+        let digits = rest[at + 2..]
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len() - at - 2);
+        if digits > 0 {
+            labels.push(&rest[at..at + 2 + digits]);
+        }
+        rest = &rest[at + 2 + digits..];
+    }
+    labels
+}
+
+/// Is every `needle` call in this printed function the kernel arm of a run-time alias guard
+/// (`wukong_mir_build`'s `kernel_guard.rs`)? Each block holding the call must be entered only as
+/// the THEN arm of `cond_br` terminators, and the function must hold the `ptrtoint` range test.
+/// The guard's other arm is the source loop, so the call can only run on disjoint operands.
+fn calls_are_guarded(body: &str, needle: &str) -> bool {
+    let mut blocks: Vec<(&str, Vec<&str>)> = Vec::new();
+    for line in body.lines().map(str::trim) {
+        if line.starts_with("bb") && line.ends_with(':') {
+            blocks.push((block_labels(line)[0], Vec::new()));
+        } else if let Some((_, lines)) = blocks.last_mut() {
+            lines.push(line);
+        }
+    }
+    let calling: Vec<&str> = blocks
+        .iter()
+        .filter(|(_, lines)| lines.iter().any(|l| l.contains(needle)))
+        .map(|(label, _)| *label)
+        .collect();
+    body.contains("ptrtoint")
+        && !calling.is_empty()
+        && calling.iter().all(|label| {
+            let entries: Vec<&str> = blocks
+                .iter()
+                .filter_map(|(_, lines)| lines.last().copied())
+                .filter(|term| block_labels(term).contains(label))
+                .collect();
+            !entries.is_empty()
+                && entries.iter().all(|term| {
+                    term.starts_with("cond_br ") && block_labels(term).first() == Some(label)
+                })
+        })
+}
+
 fn check(parallel: bool) {
     for aliases in [true, false] {
         let path = std::env::temp_dir().join(format!(
@@ -104,10 +154,10 @@ fn check(parallel: bool) {
         for no_recognize in [false, true] {
             for opt in ["-O0", "-O2"] {
                 let mir = invoke(&path, &["--emit=mir", opt], no_recognize);
-                if aliases || no_recognize {
+                if no_recognize {
                     assert!(
                         !mir.contains("call wukong_dequant"),
-                        "unsafe or disabled dispatch:\n{mir}"
+                        "disabled dispatch:\n{mir}"
                     );
                 }
                 if aliases {
@@ -124,6 +174,7 @@ fn check(parallel: bool) {
                     };
                     for ty in TYPES {
                         for name in names {
+                            let same = name.starts_with("same");
                             let name = format!("{name}_{ty}");
                             let (_, tail) = mir
                                 .split_once(&format!("fn {name}("))
@@ -134,13 +185,32 @@ fn check(parallel: bool) {
                             } else {
                                 "wukong_dequant_perchan_f32"
                             };
-                            assert_eq!(
-                                body.matches(&format!("call {symbol}(")).count(),
-                                usize::from(!aliases && !no_recognize),
-                                "{name}:\n{body}"
-                            );
-                            if aliases {
+                            if !aliases {
+                                assert_eq!(
+                                    body.matches(&format!("call {symbol}(")).count(),
+                                    usize::from(!no_recognize),
+                                    "{name}:\n{body}"
+                                );
+                            } else if no_recognize || same {
+                                // `same_*` reads its scale from the output by the SAME name:
+                                // no run-time test can make that disjoint, so it never
+                                // dispatches.
                                 assert!(!body.contains("call wukong_dequant"), "{name}:\n{body}");
+                            } else {
+                                // `argument_*` and `local_*` may hand the kernel a scale that
+                                // IS the output: the one call is versioned on a run-time
+                                // overlap test whose other arm is the ordered source nest.
+                                assert_eq!(
+                                    body.matches("call wukong_dequant").count(),
+                                    1,
+                                    "{name}:\n{body}"
+                                );
+                                assert!(
+                                    calls_are_guarded(body, "call wukong_dequant"),
+                                    "unguarded dequant dispatch in {name}:\n{body}"
+                                );
+                            }
+                            if aliases {
                                 assert!(
                                     !body.contains("call wukong_parallel_for"),
                                     "{name}:\n{body}"

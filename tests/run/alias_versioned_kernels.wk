@@ -1,0 +1,273 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 10
+// EXPECT-OUT: 14
+// EXPECT-OUT: 5
+// EXPECT-OUT: 8
+// EXPECT-OUT: 26
+// EXPECT-OUT: 30
+// EXPECT-OUT: 17
+// EXPECT-OUT: 20
+// EXPECT-OUT: 42
+// EXPECT-OUT: 46
+// EXPECT-OUT: 29
+// EXPECT-OUT: 32
+// EXPECT-OUT: 58
+// EXPECT-OUT: 62
+// EXPECT-OUT: 41
+// EXPECT-OUT: 44
+// EXPECT-OUT: 10
+// EXPECT-OUT: 14
+// EXPECT-OUT: 23
+// EXPECT-OUT: 32
+// EXPECT-OUT: 26
+// EXPECT-OUT: 30
+// EXPECT-OUT: 59
+// EXPECT-OUT: 68
+// EXPECT-OUT: 42
+// EXPECT-OUT: 46
+// EXPECT-OUT: 95
+// EXPECT-OUT: 104
+// EXPECT-OUT: 58
+// EXPECT-OUT: 62
+// EXPECT-OUT: 131
+// EXPECT-OUT: 140
+// EXPECT-OUT: 30
+// EXPECT-OUT: 70
+// EXPECT-OUT: 110
+// EXPECT-OUT: 150
+// EXPECT-OUT: 30
+// EXPECT-OUT: 215
+// EXPECT-OUT: 2501
+// EXPECT-OUT: 40979
+// EXPECT-OUT: 1
+// EXPECT-OUT: 5
+// EXPECT-OUT: 9
+// EXPECT-OUT: 13
+// EXPECT-OUT: 2
+// EXPECT-OUT: 6
+// EXPECT-OUT: 10
+// EXPECT-OUT: 14
+// EXPECT-OUT: 3
+// EXPECT-OUT: 7
+// EXPECT-OUT: 11
+// EXPECT-OUT: 15
+// EXPECT-OUT: 4
+// EXPECT-OUT: 8
+// EXPECT-OUT: 12
+// EXPECT-OUT: 16
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 2
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 3
+// EXPECT-OUT: 7
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 4
+// EXPECT-OUT: 8
+// EXPECT-OUT: 12
+// EXPECT-OUT: 16
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 10
+// EXPECT-OUT: 5
+// EXPECT-OUT: 11
+// EXPECT-OUT: 18
+// EXPECT-OUT: 26
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 10
+// EXPECT-OUT: 5
+// EXPECT-OUT: 11
+// EXPECT-OUT: 18
+// EXPECT-OUT: 26
+// EXPECT-OUT: -5
+// EXPECT-OUT: -3
+// EXPECT-OUT: -1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 5
+// EXPECT-OUT: 7
+// EXPECT-OUT: 9
+// EXPECT-OUT: -5
+// EXPECT-OUT: -3
+// EXPECT-OUT: -1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 5
+// EXPECT-OUT: 7
+// EXPECT-OUT: 9
+module tests.run.alias_versioned_kernels
+
+// One recognized library routine per family, called on DISJOINT buffers and then on ALIASED ones in
+// the same program. Every routine below is "not alias free" (some call site hands two of its buffer
+// parameters the same array), so the compiler can no longer prove its operands disjoint at compile
+// time. It used to settle that one of two wrong ways: decline the kernel for EVERY call of the
+// routine (GEMM, GEMV, transpose), or dispatch it with no disjointness reasoning at all (the scans,
+// the elementwise maps). Each dispatch is now versioned on a run-time overlap test over the operands'
+// byte ranges (`wukong_mir_build`'s `kernel_guard.rs`): the disjoint call takes the kernel, an
+// aliased call that the kernel's contract forbids runs the ORIGINAL loop, and an exactly-in-place
+// call to a kernel whose contract documents in-place operation (the scan, the affine map) keeps the
+// kernel.
+//
+// Every expectation is the scalar loop by hand over the same inputs, never a reading taken from a
+// backend. All values are small integers, exact in f32, so neither an FMA contraction nor a kernel's
+// reassociated accumulation can move a lane — and every lane is printed, per the corpus rule.
+//
+//   mm(x, y, z) : the 4x4 product x*y, out of place     -> 10 14 5 8 / 26 30 17 20 / ...
+//   mm(x, y, x) : the nest in place, each c[i*4+j] store landing before row i's later reads
+//                                                        -> 10 14 23 32 / 26 30 59 68 / ...
+//   gv(m, v, w) : y = A*v                                -> 30 70 110 150
+//   gv(m, v, v) : y = A*y, each row reading the rows already stored
+//                                                        -> 30 215 2501 40979
+//   tr(t, u)    : a true transpose
+//   tr(t, t)    : the nest in place mirrors the upper triangle down
+//                                                        -> 1 2 3 4 / 2 6 7 8 / 3 7 11 12 / 4 8 12 16
+//   cs(p, q), cs(p, p) : per-row prefix sums, the in-place spelling the scan documents
+//                                                        -> 1 3 6 10 / 5 11 18 26, both times
+//   axpb(e, g), axpb(e, e) : out = 2*x + 1, elementwise, both times -> -5 -3 -1 1 3 5 7 9
+
+fn mm(a: [f32; 16], b: [f32; 16], mut c: [f32; 16]) {
+    for i in 0..4 {
+        for j in 0..4 {
+            let mut s: f32 = 0.0;
+            for k in 0..4 {
+                s = s + a[i * 4 + k] * b[k * 4 + j];
+            }
+            c[i * 4 + j] = s;
+        }
+    }
+}
+
+fn gv(a: [f32; 16], x: [f32; 4], mut y: [f32; 4]) {
+    for i in 0..4 {
+        let mut s: f32 = 0.0;
+        for j in 0..4 {
+            s = s + a[i * 4 + j] * x[j];
+        }
+        y[i] = s;
+    }
+}
+
+fn tr(a: [f32; 16], mut o: [f32; 16]) {
+    for i in 0..4 {
+        for j in 0..4 {
+            o[j * 4 + i] = a[i * 4 + j];
+        }
+    }
+}
+
+fn cs(x: [f32; 8], mut out: [f32; 8]) {
+    for r in 0..2 {
+        let mut acc: f32 = 0.0;
+        for i in 0..4 {
+            acc = acc + x[r * 4 + i];
+            out[r * 4 + i] = acc;
+        }
+    }
+}
+
+fn axpb(x: [f32; 8], mut out: [f32; 8]) {
+    for i in 0..8 {
+        out[i] = 2.0 * x[i] + 1.0;
+    }
+}
+
+fn main() -> i32 {
+    // GEMM: b = [1 0 2 0; 0 1 0 2; 3 0 1 0; 0 3 0 1], chosen so the aliased and disjoint answers
+    // differ in eight of sixteen lanes.
+    let mut x: [f32; 16] = [0.0; 16];
+    for i in 0..16 {
+        x[i] = (i + 1) as f32;
+    }
+    let mut y: [f32; 16] = [0.0; 16];
+    y[0] = 1.0;
+    y[2] = 2.0;
+    y[5] = 1.0;
+    y[7] = 2.0;
+    y[8] = 3.0;
+    y[10] = 1.0;
+    y[13] = 3.0;
+    y[15] = 1.0;
+    let mut z: [f32; 16] = [0.0; 16];
+    mm(x, y, z);
+    for i in 0..16 {
+        print(z[i] as i32);
+    }
+    mm(x, y, x);
+    for i in 0..16 {
+        print(x[i] as i32);
+    }
+
+    // GEMV over A = 1..16 and v = 1..4.
+    let mut m: [f32; 16] = [0.0; 16];
+    for i in 0..16 {
+        m[i] = (i + 1) as f32;
+    }
+    let mut v: [f32; 4] = [0.0; 4];
+    for i in 0..4 {
+        v[i] = (i + 1) as f32;
+    }
+    let mut w: [f32; 4] = [0.0; 4];
+    gv(m, v, w);
+    for i in 0..4 {
+        print(w[i] as i32);
+    }
+    gv(m, v, v);
+    for i in 0..4 {
+        print(v[i] as i32);
+    }
+
+    // Transpose of 1..16.
+    let mut t: [f32; 16] = [0.0; 16];
+    for i in 0..16 {
+        t[i] = (i + 1) as f32;
+    }
+    let mut u: [f32; 16] = [0.0; 16];
+    tr(t, u);
+    for i in 0..16 {
+        print(u[i] as i32);
+    }
+    tr(t, t);
+    for i in 0..16 {
+        print(t[i] as i32);
+    }
+
+    // Row prefix sums of 1..8 in two rows of four.
+    let mut p: [f32; 8] = [0.0; 8];
+    for i in 0..8 {
+        p[i] = (i + 1) as f32;
+    }
+    let mut q: [f32; 8] = [0.0; 8];
+    cs(p, q);
+    for i in 0..8 {
+        print(q[i] as i32);
+    }
+    cs(p, p);
+    for i in 0..8 {
+        print(p[i] as i32);
+    }
+
+    // The affine map over -3..4.
+    let mut ea: [f32; 8] = [0.0; 8];
+    for i in 0..8 {
+        ea[i] = (i as f32) - 3.0;
+    }
+    let mut eb: [f32; 8] = [0.0; 8];
+    axpb(ea, eb);
+    for i in 0..8 {
+        print(eb[i] as i32);
+    }
+    axpb(ea, ea);
+    for i in 0..8 {
+        print(ea[i] as i32);
+    }
+    return 0;
+}

@@ -139,6 +139,8 @@ unsafe fn rope_row(pos: f32, inv_freq: *const f32, x: *const f32, out: *mut f32,
 /// # Safety
 /// `x`, `out` valid for `rows*dim = rows*2*half` f32; `inv_freq` valid for `half` f32. `out` may alias
 /// `x` but must not otherwise overlap it.
+/// **Aliasing: exactly in place, otherwise disjoint** — `out` may be EXACTLY `x`; `inv_freq` does
+/// not overlap `out`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_rope_f32(
     x: *const f32,
@@ -169,6 +171,8 @@ const ROPE_PAR_MIN: usize = 8;
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_rope_f32`].
+/// **Aliasing:** that of [`wukong_rope_f32`] — `out` may be EXACTLY `x`; `inv_freq` does not
+/// overlap `out`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_rope_f32_parallel(
     x: *const f32,

@@ -207,6 +207,8 @@ fn elem1(op: i64, x: f32, y: f32, a: f32, b: f32, c: f32) -> f32 {
 ///
 /// # Safety
 /// `x` and `out` must be valid for `n` `f32`; `y` must be valid for `n` `f32` when `op & VE_USE_Y`.
+/// **Aliasing: exactly in place, otherwise disjoint** — `x`/`y`/`out` may be EXACTLY one buffer; a
+/// SHIFTED overlap is not the elementwise source loop.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_velem_f32(
     x: *const f32,
@@ -521,6 +523,8 @@ unsafe fn velem_avx2(
 ///
 /// # Safety
 /// `x`/`out` valid for `n` f32; `y` valid for `n` f32 when the op reads it (`VE_USE_Y`/Hadamard/Div).
+/// **Aliasing: exactly in place, otherwise disjoint** — `x`/`y`/`out` may be EXACTLY one
+/// buffer; a SHIFTED overlap is not the elementwise source loop (and would race between chunks).
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn wukong_velem_f32_parallel(
@@ -594,6 +598,8 @@ fn horner1(x: f32, coeffs: &[f32]) -> f32 {
 ///
 /// # Safety
 /// `x`/`out` valid for `n` f32; `coeffs` valid for `ncoeff` f32.
+/// **Aliasing: exactly in place, otherwise disjoint** — `out` may be EXACTLY `x`; `coeffs` must not
+/// overlap `out`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_vhorner_f32(
     x: *const f32,

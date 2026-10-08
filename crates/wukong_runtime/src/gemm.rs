@@ -584,6 +584,10 @@ impl Epilogue {
 ///
 /// # Safety
 /// `a`, `b`, `c` must be valid for `m*k`, `k*n`, `m*n` `f32` elements respectively.
+/// **Aliasing: all operands disjoint** — `c` must overlap neither `a` nor `b`: `C` is written in
+/// tiled order while both are still read (`a` and `b` may share storage; both are only read). A
+/// `beta = 1` call reads `c` itself, in place by construction. The compiler versions a recognized
+/// call on a run-time overlap test (`wukong_mir_build`'s `kernel_guard.rs`).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sgemm(
     a: *const f32,
@@ -602,6 +606,10 @@ pub unsafe extern "C" fn wukong_sgemm(
 ///
 /// # Safety
 /// `a`, `b`, `c` valid for `m*k`, `n*k`, `m*n` `f32` elements respectively.
+/// **Aliasing: all operands disjoint** — `c` must overlap neither `a` nor `b`: `C` is written in
+/// tiled order while both are still read (`a` and `b` may share storage; both are only read). A
+/// `beta = 1` call reads `c` itself, in place by construction. The compiler versions a recognized
+/// call on a run-time overlap test (`wukong_mir_build`'s `kernel_guard.rs`).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sgemm_nt(
     a: *const f32,
@@ -626,6 +634,8 @@ pub unsafe extern "C" fn wukong_sgemm_nt(
 /// `a`, `b`, `c` valid for `m*k`, `n*k`, `m*n` `f32`; `bias` null or valid for `n` `f32`.
 /// When non-null, the `n`-element bias range must be disjoint from the `m*n`-element
 /// output range; rows may read bias while other output elements are written.
+/// **Aliasing: all operands disjoint** — `c` overlaps none of `a`, `b` and the epilogue bias (`C`
+/// is written in tiled order while they are still read).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sgemm_nt_epi(
     a: *const f32,
@@ -663,6 +673,10 @@ pub unsafe extern "C" fn wukong_sgemm_nt_epi(
 ///
 /// # Safety
 /// `a` valid for `m*k`, `b` for `n*k`, `c` for `m*n` `f32`.
+/// **Aliasing: all operands disjoint** — `c` must overlap neither `a` nor `b`: `C` is written in
+/// tiled order while both are still read (`a` and `b` may share storage; both are only read). A
+/// `beta = 1` call reads `c` itself, in place by construction. The compiler versions a recognized
+/// call on a run-time overlap test (`wukong_mir_build`'s `kernel_guard.rs`).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sgemm_nt_alpha(
     a: *const f32,
@@ -690,6 +704,10 @@ pub unsafe extern "C" fn wukong_sgemm_nt_alpha(
 ///
 /// # Safety
 /// `a` valid for `m*k`, `b` for `n*k`, `c` for `m*n` `f32`.
+/// **Aliasing: all operands disjoint** — `c` must overlap neither `a` nor `b`: `C` is written in
+/// tiled order while both are still read (`a` and `b` may share storage; both are only read). A
+/// `beta = 1` call reads `c` itself, in place by construction. The compiler versions a recognized
+/// call on a run-time overlap test (`wukong_mir_build`'s `kernel_guard.rs`).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sgemm_nt_alpha_parallel(
     a: *const f32,
@@ -841,6 +859,10 @@ unsafe fn gemm_dispatch(
 ///
 /// # Safety
 /// Same contract as [`wukong_sgemm`].
+/// **Aliasing: all operands disjoint** — `c` must overlap neither `a` nor `b`: `C` is written in
+/// tiled order while both are still read (`a` and `b` may share storage; both are only read). A
+/// `beta = 1` call reads `c` itself, in place by construction. The compiler versions a recognized
+/// call on a run-time overlap test (`wukong_mir_build`'s `kernel_guard.rs`).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sgemm_parallel(
     a: *const f32,
@@ -858,6 +880,10 @@ pub unsafe extern "C" fn wukong_sgemm_parallel(
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_sgemm_nt`].
+/// **Aliasing: all operands disjoint** — `c` must overlap neither `a` nor `b`: `C` is written in
+/// tiled order while both are still read (`a` and `b` may share storage; both are only read). A
+/// `beta = 1` call reads `c` itself, in place by construction. The compiler versions a recognized
+/// call on a run-time overlap test (`wukong_mir_build`'s `kernel_guard.rs`).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sgemm_nt_parallel(
     a: *const f32,
@@ -883,6 +909,8 @@ pub unsafe extern "C" fn wukong_sgemm_nt_parallel(
 /// `a`, `b`, `c` valid for `m*k`, `n*k`, `m*n` `f32`; `bias` null or valid for `n` `f32`.
 /// When non-null, the `n`-element bias range must be disjoint from the `m*n`-element
 /// output range; rows may read bias while other output elements are written.
+/// **Aliasing: all operands disjoint** — `c` overlaps none of `a`, `b` and the epilogue bias (`C`
+/// is written in tiled order while they are still read).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sgemm_nt_epi_parallel(
     a: *const f32,
@@ -928,6 +956,10 @@ unsafe fn transpose_into(src: *const f32, dst: *mut f32, rows: usize, cols: usiz
 ///
 /// # Safety
 /// `a` valid for `k*m`, `b` for `k*n`, `c` for `m*n` `f32`.
+/// **Aliasing: all operands disjoint** — `c` must overlap neither `a` nor `b`: `C` is written in
+/// tiled order while both are still read (`a` and `b` may share storage; both are only read). A
+/// `beta = 1` call reads `c` itself, in place by construction. The compiler versions a recognized
+/// call on a run-time overlap test (`wukong_mir_build`'s `kernel_guard.rs`).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sgemm_tn(
     a: *const f32,
@@ -953,6 +985,10 @@ pub unsafe extern "C" fn wukong_sgemm_tn(
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_sgemm_tn`].
+/// **Aliasing: all operands disjoint** — `c` must overlap neither `a` nor `b`: `C` is written in
+/// tiled order while both are still read (`a` and `b` may share storage; both are only read). A
+/// `beta = 1` call reads `c` itself, in place by construction. The compiler versions a recognized
+/// call on a run-time overlap test (`wukong_mir_build`'s `kernel_guard.rs`).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sgemm_tn_parallel(
     a: *const f32,
@@ -1060,6 +1096,9 @@ unsafe fn gemm_lowp_nt(
 ///
 /// # Safety
 /// `a` valid for `m*k`, `b` for `n*k` `bf16` (`u16`); `c` for `m*n` `f32`.
+/// **Aliasing: all operands disjoint** — the f32 `c` must overlap neither half-precision operand
+/// (`C` is written in tiled order while `a`/`b` are still read). The compiler versions a recognized
+/// call on a run-time overlap test (`wukong_mir_build`'s `kernel_guard.rs`).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sgemm_bf16_nt(
     a: *const u16,
@@ -1079,6 +1118,9 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_nt(
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_sgemm_bf16_nt`].
+/// **Aliasing: all operands disjoint** — the f32 `c` must overlap neither half-precision operand
+/// (`C` is written in tiled order while `a`/`b` are still read). The compiler versions a recognized
+/// call on a run-time overlap test (`wukong_mir_build`'s `kernel_guard.rs`).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sgemm_bf16_nt_parallel(
     a: *const u16,
@@ -1097,6 +1139,9 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_nt_parallel(
 ///
 /// # Safety
 /// `a` valid for `m*k`, `b` for `n*k` `f16` (`u16`); `c` for `m*n` `f32`.
+/// **Aliasing: all operands disjoint** — the f32 `c` must overlap neither half-precision operand
+/// (`C` is written in tiled order while `a`/`b` are still read). The compiler versions a recognized
+/// call on a run-time overlap test (`wukong_mir_build`'s `kernel_guard.rs`).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sgemm_f16_nt(
     a: *const u16,
@@ -1114,6 +1159,9 @@ pub unsafe extern "C" fn wukong_sgemm_f16_nt(
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_sgemm_f16_nt`].
+/// **Aliasing: all operands disjoint** — the f32 `c` must overlap neither half-precision operand
+/// (`C` is written in tiled order while `a`/`b` are still read). The compiler versions a recognized
+/// call on a run-time overlap test (`wukong_mir_build`'s `kernel_guard.rs`).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sgemm_f16_nt_parallel(
     a: *const u16,
@@ -1165,6 +1213,8 @@ unsafe fn gemm_lowp_nt_epi(
 /// `a`/`b` valid for `m*k`/`n*k` `bf16` (`u16`); `c` for `m*n` `f32`; `bias` null or valid for `n` `f32`.
 /// When non-null, the `n`-element bias range must be disjoint from the `m*n`-element
 /// output range; rows may read bias while other output elements are written.
+/// **Aliasing: all operands disjoint** — `c` overlaps none of `a`, `b` and the epilogue bias (`C`
+/// is written in tiled order while they are still read).
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn wukong_sgemm_bf16_nt_epi(
@@ -1197,6 +1247,8 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_nt_epi(
 ///
 /// # Safety
 /// Operand-size and non-overlap contracts of [`wukong_sgemm_bf16_nt_epi`].
+/// **Aliasing: all operands disjoint** — `c` overlaps none of `a`, `b` and the epilogue bias (`C`
+/// is written in tiled order while they are still read).
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn wukong_sgemm_bf16_nt_epi_parallel(
@@ -1231,6 +1283,8 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_nt_epi_parallel(
 /// `a`/`b` valid for `m*k`/`n*k` `f16` (`u16`); `c` for `m*n` `f32`; `bias` null or valid for `n` `f32`.
 /// When non-null, the `n`-element bias range must be disjoint from the `m*n`-element
 /// output range; rows may read bias while other output elements are written.
+/// **Aliasing: all operands disjoint** — `c` overlaps none of `a`, `b` and the epilogue bias (`C`
+/// is written in tiled order while they are still read).
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn wukong_sgemm_f16_nt_epi(
@@ -1263,6 +1317,8 @@ pub unsafe extern "C" fn wukong_sgemm_f16_nt_epi(
 ///
 /// # Safety
 /// Operand-size and non-overlap contracts of [`wukong_sgemm_f16_nt_epi`].
+/// **Aliasing: all operands disjoint** — `c` overlaps none of `a`, `b` and the epilogue bias (`C`
+/// is written in tiled order while they are still read).
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn wukong_sgemm_f16_nt_epi_parallel(
@@ -1337,6 +1393,9 @@ unsafe fn gemm_lowp_tn(
 ///
 /// # Safety
 /// `a` valid for `k*m`, `b` for `k*n` `bf16` (`u16`); `c` for `m*n` `f32`.
+/// **Aliasing: all operands disjoint** — the f32 `c` must overlap neither half-precision operand
+/// (`C` is written in tiled order while `a`/`b` are still read). The compiler versions a recognized
+/// call on a run-time overlap test (`wukong_mir_build`'s `kernel_guard.rs`).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sgemm_bf16_tn(
     a: *const u16,
@@ -1356,6 +1415,9 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_tn(
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_sgemm_bf16_tn`].
+/// **Aliasing: all operands disjoint** — the f32 `c` must overlap neither half-precision operand
+/// (`C` is written in tiled order while `a`/`b` are still read). The compiler versions a recognized
+/// call on a run-time overlap test (`wukong_mir_build`'s `kernel_guard.rs`).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sgemm_bf16_tn_parallel(
     a: *const u16,
@@ -1374,6 +1436,9 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_tn_parallel(
 ///
 /// # Safety
 /// `a` valid for `k*m`, `b` for `k*n` `f16` (`u16`); `c` for `m*n` `f32`.
+/// **Aliasing: all operands disjoint** — the f32 `c` must overlap neither half-precision operand
+/// (`C` is written in tiled order while `a`/`b` are still read). The compiler versions a recognized
+/// call on a run-time overlap test (`wukong_mir_build`'s `kernel_guard.rs`).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sgemm_f16_tn(
     a: *const u16,
@@ -1391,6 +1456,9 @@ pub unsafe extern "C" fn wukong_sgemm_f16_tn(
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_sgemm_f16_tn`].
+/// **Aliasing: all operands disjoint** — the f32 `c` must overlap neither half-precision operand
+/// (`C` is written in tiled order while `a`/`b` are still read). The compiler versions a recognized
+/// call on a run-time overlap test (`wukong_mir_build`'s `kernel_guard.rs`).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sgemm_f16_tn_parallel(
     a: *const u16,

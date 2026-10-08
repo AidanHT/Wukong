@@ -317,7 +317,11 @@ pointer, zero-copy) and is **returned by value** through a hidden-pointer (sret)
 no aggregate ever rides in a register and the two backends agree (`tests/run/{struct_fn,struct_return}.wk`).
 Because a by-reference parameter aliases the caller's storage, mutating an aggregate parameter
 requires `mut` on it (see *Functions* above) — a non-`mut` aggregate parameter is effectively
-read-only, and a `mut` one is the in-place output buffer a kernel writes.
+read-only, and a `mut` one is the in-place output buffer a kernel writes. Passing one buffer to two
+parameters (`mm(x, y, x)`) is legal and means exactly what the function's loops say when they run
+over the shared storage; a loop the compiler replaces with a runtime kernel keeps that meaning — the
+kernel runs only when the operands do not overlap (or overlap exactly, where the kernel supports
+in-place operation), and the loop as written runs otherwise (`tests/run/alias_versioned_kernels.wk`).
 
 ## Enums ✅
 
