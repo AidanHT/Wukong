@@ -1,9 +1,9 @@
 // RUN: --run
 // EXPECT-EXIT: 0
 // EXPECT-OUT: 0
-// EXPECT-OUT: 1
+// EXPECT-OUT: 5.5
 // EXPECT-OUT: 0
-// EXPECT-OUT: 3
+// EXPECT-OUT: 12.5
 module tests.run.linear_bias_relu_parallel
 
 // The `@parallel` fused FFN: out = relu(x · Wᵀ + bias), the matmul nest and the bias+ReLU loop fused
@@ -13,8 +13,15 @@ module tests.run.linear_bias_relu_parallel
 // serial `wukong_sgemm_nt_epi` the interpreter calls (each C tile owned by one task, same per-(i,j)
 // accumulation order), so -O0..-O3 and interp/native all agree.
 //
-// Same data as the serial linear_bias_relu: x=[[1,2],[3,4]], W=I, bias=[-10,-1]
-//   row0: relu([1,2]+[-10,-1]) = [0,1];  row1: relu([3,4]+[-10,-1]) = [0,3].
+// Identical data to the serial linear_bias_relu, deliberately, so this is the parallel kernel's
+// proof on the SAME hard case: x=[[1,2],[3,4]], W=[[2,-1],[0.5,3]] (not symmetric, so a transposed
+// or mis-strided W read is visible), bias=[-10,-1].
+//   x·Wᵀ row0 = [1·2+2·(-1), 1·0.5+2·3] = [0, 6.5];  +bias = [-10, 5.5];  relu = [0, 5.5]
+//   x·Wᵀ row1 = [3·2+4·(-1), 3·0.5+4·3] = [2, 13.5];  +bias = [-8, 12.5]; relu = [0, 12.5]
+// Every value is an integer or a half (exact in f32 under any accumulation order), so the four
+// lanes are printed RAW and compared exactly — no truncating `as i32` tolerance. `out` is poisoned
+// with -12345.0, so a kernel that declined and wrote nothing prints -12345 on the two ReLU-clamped
+// lanes instead of the buffer's own 0, and fails.
 @parallel
 fn linear(x: [f32; 4], w: [f32; 4], bias: [f32; 2], mut out: [f32; 4]) {
     for i in 0..2 {
@@ -35,13 +42,13 @@ fn linear(x: [f32; 4], w: [f32; 4], bias: [f32; 2], mut out: [f32; 4]) {
 
 fn main() -> i32 {
     let x: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
-    let w: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+    let w: [f32; 4] = [2.0, -1.0, 0.5, 3.0];
     let bias: [f32; 2] = [-10.0, -1.0];
-    let mut out: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
+    let mut out: [f32; 4] = [-12345.0, -12345.0, -12345.0, -12345.0];
     linear(x, w, bias, out);
-    print(out[0] as i32);
-    print(out[1] as i32);
-    print(out[2] as i32);
-    print(out[3] as i32);
+    print(out[0]);
+    print(out[1]);
+    print(out[2]);
+    print(out[3]);
     return 0;
 }

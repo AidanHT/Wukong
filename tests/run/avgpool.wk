@@ -6,6 +6,8 @@
 // EXPECT-OUT: 13
 // EXPECT-OUT: 35
 // EXPECT-OUT: 55
+// EXPECT-OUT: 115
+// EXPECT-OUT: 135
 module tests.run.avgpool
 
 // 2D average-pooling over a [C=2, H=4, W=4] row-major input, 2x2 window, stride 2x2, no padding →
@@ -46,5 +48,7 @@ fn main() -> i32 {
     print(out[3] as i32); // avg(11,12,15,16)=13.5 -> 13
     print(out[4] as i32); // avg(10,20,50,60)=35 -> 35
     print(out[5] as i32); // avg(30,40,70,80)=55 -> 55
+    print(out[6] as i32); // avg(90,100,130,140)=115 -> 115
+    print(out[7] as i32); // avg(110,120,150,160)=135 -> 135
     return 0;
 }
