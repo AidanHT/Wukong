@@ -263,6 +263,7 @@ match_guard_truthy.wk:
 match_pattern_widths.wk:
 match_patterns.wk:
 match_tuple.wk:
+match_u8_full_range.wk:
 matmul_accum_f32.wk: wukong_sgemm
 matmul_bf16.wk:
 matmul_bf16_tn.wk: wukong_sgemm_bf16_tn

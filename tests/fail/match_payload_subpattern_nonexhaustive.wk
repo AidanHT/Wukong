@@ -1,0 +1,25 @@
+// EXPECT-CODE: E0405
+module tests.fail.match_payload_subpattern_nonexhaustive
+
+// Every variant has an arm, but the `Add` arm only matches when the first field is 0: the values
+// `Expr::Add(i32::MIN..=-1 | 1..=i32::MAX, _)` reach no arm. The old variant-name check counted
+// `Expr::Add(0, y)` as covering all of `Add`, so this compiled and `eval(Expr::Add(3, 4))` fell
+// through to the match's `unreachable` (an interpreter error, an illegal instruction natively).
+enum Expr {
+    Num(i32),
+    Add(i32, i32),
+    Nil,
+}
+
+fn eval(e: Expr) -> i32 {
+    return match e {
+        Expr::Num(n) => n,
+        Expr::Add(0, y) => y,
+        Expr::Nil => 0,
+    };
+}
+
+fn main() -> i32 {
+    print(eval(Expr::Add(3, 4)));
+    return 0;
+}

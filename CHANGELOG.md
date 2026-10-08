@@ -5,6 +5,15 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Type soundness and patterns (`gap2/type-soundness-and-patterns`)
+
+- **Match exhaustiveness by pattern usefulness** (Maranget's algorithm, as in rustc): `E0405` now
+  sees through enum payload sub-patterns, tuples and integer/`char` ranges, and names a witness
+  pattern (`Expr::Add(i32::MIN..=-1 | 1..=i32::MAX, _)`) no arm covers. `Expr::Add(0, y)` no longer
+  counts as covering all of `Add`, `match (p, q)` is checked, and a full `0..=255` on a `u8` is no
+  longer a false `E0405`. New warning `W0020` (`unreachable_patterns`) for an arm an earlier
+  unguarded arm already covers.
+
 ### Optimizer memory passes: SROA, path DSE, loop deletion, guarded LICM, scalar promotion (`gap/opt-memory`)
 
 - **SROA** (`-O2`, ahead of mem2reg): an array/struct/tuple local whose every access is at a constant

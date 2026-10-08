@@ -187,7 +187,8 @@ another architecture or OS is not supported. A native-backend failure is a catal
   exactly like a struct — no backend change; interp == native bit-for-bit and -O0 == -O3
   (`tests/run/enum_payload_{tuple,struct}.wk`). A payload-carrying variant is *not* castable to an
   integer, and an enum that holds itself by value (`Cons(i32, List)`) is rejected as infinitely sized
-  (E0402); a non-exhaustive `match` over the variants is E0405.
+  (E0402); a non-exhaustive `match` over the variants is E0405, judged through the payload
+  sub-patterns (`Add(0, y)` does not cover all of `Add`) with a witness pattern in the message.
 - **Slices `[]T`** — a fat-pointer view `{ data: *T @ 0, len: i64 @ 8 }` over existing array storage:
   length `s.len()`, indexed read/write `s[i]`, iteration `for x in s`, and passing to a function —
   either an already-materialized slice or a fixed-size array *unsized* to a slice parameter at the
@@ -647,7 +648,8 @@ another architecture or OS is not supported. A native-backend failure is a catal
   sema): `W0001 unused_variables`, `W0002 unused_mut`, `W0003 unreachable_code` (divergence judged
   exactly as the definite-return check judges it), `W0004 unused_result` (`out[i] == x;` written
   for `=`), `W0005 dead_code`, `W0006 unwritten_output` (a `mut` aggregate parameter never stored
-  to) and `W0007 unknown_lints`. Levels come from rustc-style `-A/-W/-D <lint>` (`-D warnings`) and
+  to), `W0007 unknown_lints` and `W0020 unreachable_patterns` (a `match` arm every value of which an
+  earlier unguarded arm already matches). Levels come from rustc-style `-A/-W/-D <lint>` (`-D warnings`) and
   `@allow/@warn/@deny(<lint>)` on a function, parameter or statement, innermost first. Warnings
   print after errors, so `tests/fail`'s first-diagnostic contract holds; `tests/warn/` pins each
   lint's exact output (`crates/wukongc/tests/warn.rs`). Not yet: `unused_imports` (waits for the

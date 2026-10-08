@@ -93,6 +93,13 @@ pub const LINTS: &[Lint] = &[
         code: "W0007",
         default: LintLevel::Warn,
     },
+    // A `match` arm no value can reach, found by the pattern-usefulness analysis that also decides
+    // E0405 (`crate::usefulness`).
+    Lint {
+        name: "unreachable_patterns",
+        code: "W0020",
+        default: LintLevel::Warn,
+    },
     // The parser's statement-terminator lints (`wukong_parser::ParseOutput::lints`); `E0210` is
     // reserved for the day a missing `;` becomes an error.
     Lint {
@@ -920,6 +927,7 @@ impl<'a> FnLint<'a> {
             }
             ExprKind::Match { scrutinee, arms } => {
                 self.expr(scrutinee);
+                self.unreachable_arms(scrutinee, arms);
                 for arm in arms {
                     self.scopes.push(Vec::new());
                     self.bind_pattern(&arm.pat, BindKind::Arm, false);
@@ -1111,6 +1119,35 @@ impl<'a> FnLint<'a> {
 
     /// `W0004`: an expression statement whose value is computed and discarded with no effect —
     /// above all `out[i] == a[i] + b[i];`, a comparison where an assignment was meant.
+    /// `unreachable_patterns`: an arm whose every value an earlier unguarded arm already matches.
+    /// The verdict is sema's own exhaustiveness analysis, so a match it cannot reason about
+    /// reports nothing. An arm the parser synthesized (the `else` of an `if let`, whose pattern
+    /// carries `NodeId::DUMMY`) is never reported: the user wrote no arm there.
+    fn unreachable_arms(&mut self, scrutinee: &Expr, arms: &[MatchArm]) {
+        let sema = self.sema;
+        let Some(ty) = sema.types.get(&scrutinee.id) else {
+            return;
+        };
+        let Some(report) = crate::usefulness::analyze(&sema.defs, self.interner, ty, arms) else {
+            return;
+        };
+        for i in report.unreachable {
+            let arm = &arms[i];
+            if arm.pat.id == NodeId::DUMMY {
+                continue;
+            }
+            self.diags.push(
+                Diagnostic::warning("unreachable pattern")
+                    .with_code("W0020")
+                    .primary(
+                        arm.pat.span,
+                        "every value this matches is matched by an earlier arm",
+                    )
+                    .help("delete the arm, or move it before the arm that covers it"),
+            );
+        }
+    }
+
     fn unused_result(&mut self, e: &Expr) {
         let (msg, help): (String, Option<&str>) = match &e.kind {
             ExprKind::Binary { op, lhs, .. } => {

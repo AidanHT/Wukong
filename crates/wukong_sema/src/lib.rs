@@ -35,6 +35,7 @@ mod methods;
 mod noalias;
 mod shape;
 mod tensor;
+mod usefulness;
 
 pub use builtins::{
     builtin_dims, builtin_operand_dims, builtin_output, kernel_builtin, Activation, BuiltinCall,
@@ -1020,7 +1021,7 @@ impl<'a> Sema<'a> {
     /// `struct S { x: i32, x: i32 }` produced no declaration-site error at all (only the literal
     /// `S { x: 1, x: 2 }` was rejected, so a struct never literal-constructed compiled clean),
     /// `enum E { A, A }` compiled and RAN, and `fn f<N, N>(..)` compiled and ran. A duplicate enum
-    /// variant makes `collect_enum_coverage` count one name for two discriminants, so it feeds the
+    /// variant names one of two discriminants ambiguously, so it confuses the
     /// match-exhaustiveness reasoning behind E0405; a duplicate field means the layout carries a
     /// field no expression can ever name; a duplicate generic makes the positional turbofish zip
     /// (`FnSig.generics` × `f::<2, 3>`) bind two different arguments to one name.
@@ -4175,24 +4176,18 @@ impl<'a> Sema<'a> {
                     self.check_merge_shapes(&result, &t, Some(&arm.body), arm.body.span);
                     result = join(result, t);
                 }
-                // Exhaustiveness: a `match` with no catch-all that provably misses a case is rejected
-                // (E0405), like Rust. A *value* match would synthesize a typed-zero default in mir_build
-                // (a silent wrong answer, or invalid MIR for an aggregate); a *statement* / empty match
-                // still lowers a value-merge whose "no arm matched" fallthrough is `Unreachable`, which
-                // the interpreter traps (exit 1) but the native backend hits as an illegal instruction
-                // (a backend divergence) — so the check must NOT be gated on the result type being a
-                // value. Skip only an `Error` result (its arm already reported, avoid cascading); an
-                // unmodeled scrutinee stays lenient inside `match_is_provably_nonexhaustive`.
-                if !matches!(result, Ty::Error)
-                    && self.match_is_provably_nonexhaustive(&scrut_ty, arms)
-                {
-                    self.error(
-                        e.span,
-                        "E0405",
-                        "non-exhaustive `match`: no arm covers all possible values; add a `_` arm \
-                         (or cover every enum variant / both `bool` cases)"
-                            .to_string(),
-                    );
+                // Exhaustiveness: a `match` that provably misses a value is rejected (E0405), like
+                // Rust. A *value* match would synthesize a typed-zero default in mir_build (a silent
+                // wrong answer, or invalid MIR for an aggregate); a *statement* / empty match still
+                // lowers a value-merge whose "no arm matched" fallthrough is `Unreachable`, which the
+                // interpreter traps (exit 1) but the native backend hits as an illegal instruction (a
+                // backend divergence) — so the check must NOT be gated on the result type being a
+                // value. Skip only an `Error` result (its arm already reported, avoid cascading). The
+                // verdict is pattern usefulness (`usefulness.rs`), which sees through payload
+                // sub-patterns, tuples and integer ranges and names a value no arm covers; a match it
+                // cannot reason about gets no verdict, so this fires only on a certain miss.
+                if !matches!(result, Ty::Error) {
+                    self.report_nonexhaustive(scrutinee, &scrut_ty, arms);
                 }
                 result
             }
@@ -4223,84 +4218,45 @@ impl<'a> Sema<'a> {
         }
     }
 
-    /// Whether `arms` provably fail to cover every value of `scrut_ty` (used by E0405). Conservative:
-    /// returns `true` only when incompleteness is *certain*, so a valid match is never rejected. A
-    /// guard-less `_`/identifier arm covers everything (checked first). Otherwise: an `enum` is
-    /// covered iff every variant appears in a guard-less variant arm; a `bool` iff both `true` and
-    /// `false` appear; any other scalar (`int`/`char`/`usize` — an effectively unbounded domain)
-    /// needs a catch-all. Unmodeled scrutinees (tuple/array/tensor/struct/pointer/unknown/…) stay
-    /// lenient (`false`), matching sema's overall leniency. Guarded arms never prove coverage.
-    fn match_is_provably_nonexhaustive(&self, scrut_ty: &Ty, arms: &[MatchArm]) -> bool {
-        if arms.iter().any(arm_is_catch_all) {
-            return false;
-        }
-        if arms.is_empty() {
-            // An empty `match x {}` covers nothing, so it is non-exhaustive for any modeled, inhabited
-            // scrutinee (Wukong has no uninhabited types). The `Ty::Scalar(_)` case below already
-            // catches an empty int/char match; this also catches an empty enum / `bool` match (whose
-            // coverage arms below would read "no cases seen" as lenient). Unmodeled scrutinees stay
-            // lenient, matching the rest of this function.
-            return match scrut_ty {
-                Ty::Named(n) => {
-                    matches!(
-                        self.defs.lookup(*n).map(|d| &d.kind),
-                        Some(DefKind::Enum(_))
-                    )
-                }
-                Ty::Scalar(_) => true,
-                _ => false,
-            };
-        }
-        match scrut_ty {
-            Ty::Named(n) => match self.defs.lookup(*n).map(|d| &d.kind) {
-                Some(DefKind::Enum(variants)) => {
-                    // Coverage per variant: a variant pattern covers its name; an int-literal /
-                    // range pattern covers the variants whose DISCRIMINANT it matches (an enum
-                    // value IS its discriminant at runtime, and `int as Enum` is rejected, so the
-                    // declared discriminants are the whole domain). Previously a match by raw
-                    // discriminant stayed lenient — `match e { 0 => .., 1 => .. }` on a
-                    // three-variant enum compiled, and the missed variant silently took
-                    // mir_build's zero default on BOTH backends (a gate-blind wrong answer). It
-                    // also falsely rejected a mixed exhaustive match (`E::A | 1 | 2`), whose int
-                    // arms contributed nothing. Any guard-less pattern the collector can't reason
-                    // about keeps the whole match lenient, so incompleteness stays *certain*.
-                    let mut covered = HashSet::default();
-                    let mut spans: Vec<(i64, i64)> = Vec::new();
-                    for a in arms {
-                        if a.guard.is_none()
-                            && !collect_enum_coverage(
-                                &a.pat,
-                                &mut covered,
-                                &mut spans,
-                                self.interner,
-                            )
-                        {
-                            return false;
-                        }
-                    }
-                    // All arms guarded (guards never prove coverage): lenient.
-                    if covered.is_empty() && spans.is_empty() {
-                        return false;
-                    }
-                    variants.iter().any(|v| {
-                        !covered.contains(&v.name)
-                            && !spans.iter().any(|(l, h)| *l <= v.disc && v.disc <= *h)
-                    })
-                }
-                _ => false, // a non-enum `Named` (struct / generic / forward ref): lenient
-            },
-            Ty::Scalar(Scalar::Bool) => {
-                let (mut t, mut f) = (false, false);
-                for a in arms {
-                    if a.guard.is_none() {
-                        collect_bool_cases(&a.pat, &mut t, &mut f);
-                    }
-                }
-                (t || f) && !(t && f) // uses bool patterns but misses one case
-            }
-            Ty::Scalar(_) => true, // int/char/usize/…: unbounded, and no catch-all reached here
-            _ => false,
-        }
+    /// Report E0405 when `arms` provably miss a value of `scrut_ty`, naming one (a *witness*): the
+    /// usefulness analysis (`usefulness.rs`) decides, and stays silent on a match it cannot reason
+    /// about. A guarded arm never counts toward coverage, because its guard may be false; an empty
+    /// match covers nothing (Wukong has no uninhabited types).
+    fn report_nonexhaustive(&mut self, scrutinee: &Expr, scrut_ty: &Ty, arms: &[MatchArm]) {
+        let Some(report) = usefulness::analyze(&self.defs, self.interner, scrut_ty, arms) else {
+            return;
+        };
+        let Some(w) = report.missing else {
+            return;
+        };
+        let more = if w.more == 0 {
+            String::new()
+        } else {
+            format!(" (and {} more)", w.more)
+        };
+        let msg = if arms.is_empty() {
+            format!(
+                "non-exhaustive `match`: it has no arms, so no value of type `{}` is covered",
+                scrut_ty.display(self.interner)
+            )
+        } else {
+            format!(
+                "non-exhaustive `match`: pattern `{}`{more} not covered",
+                w.pattern
+            )
+        };
+        self.diags.push(
+            Diagnostic::error(msg)
+                .with_code("E0405")
+                .primary(
+                    scrutinee.span,
+                    format!("pattern `{}` not covered", w.pattern),
+                )
+                .help(
+                    "add an arm for the missing values, or a `_ => ...` arm; a guarded arm \
+                     (`if ...`) does not count, because its guard may be false",
+                ),
+        );
     }
 }
 
@@ -4535,51 +4491,6 @@ fn arm_is_catch_all(a: &MatchArm) -> bool {
     a.guard.is_none() && matches!(a.pat.kind, PatKind::Wildcard | PatKind::Ident(_))
 }
 
-/// Enum-coverage contribution of one (guard-less) pattern, for `match_is_provably_nonexhaustive`:
-/// a variant pattern covers its NAME (the path's last segment, `Color::Red` → `Red`), an int-literal
-/// / range pattern covers a numeric SPAN of discriminants (an enum matches by its discriminant), a
-/// wildcard/ident alternative covers everything, and or-patterns recurse.
-/// Returns `false` — "cannot reason, stay lenient" — for any other pattern kind (char/bool/tuple:
-/// ill-typed for an enum scrutinee or unmodeled here), so E0405 only fires on *certain* misses.
-fn collect_enum_coverage(
-    p: &Pattern,
-    names: &mut HashSet<Symbol>,
-    spans: &mut Vec<(i64, i64)>,
-    interner: &Interner,
-) -> bool {
-    match &p.kind {
-        PatKind::Path(path) | PatKind::Variant { path, .. } => {
-            if let Some(seg) = path.segments.last() {
-                names.insert(seg.sym);
-            }
-            true
-        }
-        PatKind::Int { .. } => match pat_int_value(p, interner) {
-            Some(v) => {
-                spans.push((v, v));
-                true
-            }
-            None => false,
-        },
-        PatKind::Range { lo, hi, inclusive } => {
-            let (Some(l), Some(h)) = (pat_int_value(lo, interner), pat_int_value(hi, interner))
-            else {
-                return false;
-            };
-            spans.push((l, if *inclusive { h } else { h.saturating_sub(1) }));
-            true
-        }
-        PatKind::Or(alts) => alts
-            .iter()
-            .all(|a| collect_enum_coverage(a, names, spans, interner)),
-        PatKind::Wildcard | PatKind::Ident(_) => {
-            spans.push((i64::MIN, i64::MAX));
-            true
-        }
-        _ => false,
-    }
-}
-
 /// The integer value of an int-literal pattern (with its folded-in sign), or `None`.
 fn pat_int_value(p: &Pattern, interner: &Interner) -> Option<i64> {
     match &p.kind {
@@ -4587,17 +4498,6 @@ fn pat_int_value(p: &Pattern, interner: &Interner) -> Option<i64> {
             parse_int_text(interner.resolve(*sym)).map(|v| if *neg { v.wrapping_neg() } else { v })
         }
         _ => None,
-    }
-}
-
-/// Record whether a (guard-less) pattern covers the `true` and/or `false` case, flattening
-/// or-patterns. Used by `match_is_provably_nonexhaustive` for `bool` coverage.
-fn collect_bool_cases(p: &Pattern, t: &mut bool, f: &mut bool) {
-    match &p.kind {
-        PatKind::Bool(true) => *t = true,
-        PatKind::Bool(false) => *f = true,
-        PatKind::Or(alts) => alts.iter().for_each(|a| collect_bool_cases(a, t, f)),
-        _ => {}
     }
 }
 

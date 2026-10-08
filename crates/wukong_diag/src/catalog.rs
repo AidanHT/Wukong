@@ -11,7 +11,7 @@
 //!   * `E03xx` — name resolution
 //!   * `E04xx` — type checking
 //!   * `E05xx` — shape checking (Wukong's headline analysis)
-//!   * `W00xx` — warnings (lints; `W0001`–`W0019` from `wukong_sema::lints`, `W003x` from the
+//!   * `W00xx` — warnings (lints; `W0001`–`W0020` from `wukong_sema::lints`, `W003x` from the
 //!     parser), each also named for `-A/-W/-D` and `@allow/@warn/@deny`
 //!   * `C0xxx` — codegen / lowering limitations
 //!
@@ -375,14 +375,19 @@ static CATALOG: &[Explanation] = &[
     entry!(
         "E0405",
         "non-exhaustive match",
-        "A `match` does not cover every possible value of the scrutinee, and no arm is an \
-         unconditional catch-all. This is rejected in every position, not just value position: a \
-         value match would produce an injected zero default when no arm matches — a silent wrong \
-         answer (or, for a tuple/struct result, invalid code) — while a statement or empty match \
-         falls through to `Unreachable`, which the interpreter traps but the native backend hits as \
-         an illegal instruction. Add a `_ => …` arm (or, for an `enum`, an arm for every remaining \
-         variant; for a `bool`, both `true` and `false`) so the match is total, as in Rust. Guarded \
-         arms (`if …`) do not count toward coverage because their guard may be false.",
+        "A `match` does not cover every possible value of the scrutinee. The diagnostic names \
+         values no arm covers — a *witness* pattern such as `Expr::Add(i32::MIN..=-1 | \
+         1..=i32::MAX, _)` or `(false, false)` — found by pattern usefulness, the analysis Rust \
+         uses: it sees through enum payload sub-patterns, tuples and integer and `char` ranges, so \
+         `Expr::Add(0, y)` covers only the `Add` values whose first field is 0, `(true, _)` and \
+         `(false, true)` leave `(false, false)` uncovered, and `0..=99 | 100..=255` on a `u8` is \
+         complete. This is rejected in every position, not just value position: a value match would \
+         produce an injected zero default when no arm matches — a silent wrong answer (or, for a \
+         tuple/struct result, invalid code) — while a statement or empty match falls through to \
+         `Unreachable`, which the interpreter traps but the native backend hits as an illegal \
+         instruction. Add an arm for the missing values or a `_ => …` arm, as in Rust. Guarded arms \
+         (`if …`) do not count toward coverage because their guard may be false. A `char` can hold \
+         any 32-bit value (an integer `as char` is unchecked), so a `char` match needs a `_` arm.",
         bad: "module ex.e0405\nenum Color { Red, Green, Blue }\nfn name(c: Color) -> i32 {\n    return match c {\n        Color::Red => 1,\n        Color::Green => 2,\n    };\n}\nfn main() -> i32 {\n    return name(Color::Blue);\n}\n",
         good: "module ex.e0405\nenum Color { Red, Green, Blue }\nfn name(c: Color) -> i32 {\n    return match c {\n        Color::Red => 1,\n        Color::Green => 2,\n        Color::Blue => 3,\n    };\n}\nfn main() -> i32 {\n    return name(Color::Blue);\n}\n"
     ),
@@ -580,6 +585,17 @@ static CATALOG: &[Explanation] = &[
          or has no argument at all, so it silences or promotes nothing. The arguments are lint names \
          (`unused_variables`), lint codes (`W0001`) or `warnings` (every lint). `wukongc --explain \
          W0001` and its neighbours describe each lint."
+    ),
+    entry!(
+        "W0020",
+        "unreachable pattern (`unreachable_patterns`)",
+        "A `match` arm can never be selected: every value its pattern matches is already matched by \
+         an earlier arm without a guard — `5 => …` after `0..=9 => …`, `(0, 0) => …` after \
+         `(_, _) => …`, or any arm after a `_` arm. Arms are tried in order, so the arm is dead, \
+         which usually means the arms are in the wrong order or an earlier pattern is broader than \
+         intended. A guarded arm covers nothing (its guard may be false), so it never makes a later \
+         arm unreachable. The verdict comes from the same pattern-usefulness analysis as E0405. \
+         Delete the arm, or move it before the arm that covers it."
     ),
     entry!(
         "W0030",

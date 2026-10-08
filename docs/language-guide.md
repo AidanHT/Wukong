@@ -365,13 +365,27 @@ A literal pattern must be **in range for the scrutinee's type**: `match n { 200 
 the scrutinee's width. The same check applies to both bounds of a range pattern.
 
 A `match` must be **exhaustive**, like Rust — and in **every** position, value *and* statement (an
-empty `match x {}` included): an `enum` needs every variant, a `bool` needs both cases, and any other
-scalar (an unbounded domain) needs a catch-all. A catch-all is a guard-less `_` **or** a guard-less
-identifier arm; an `enum` may also be covered by integer-literal/range patterns that match its
-declared discriminants. A provably-incomplete match is rejected at compile time (`E0405`); a guard
-(`if …`) never counts toward coverage. This closes a silent-wrong-answer hole — a non-exhaustive value
-match used to fall through to a zero default, and a statement/empty one to an `Unreachable` the two
-backends handled differently (`tests/fail/match_nonexhaustive.wk`).
+empty `match x {}` included). Exhaustiveness is decided by **pattern usefulness** (Maranget's
+algorithm, as in rustc), which looks *inside* patterns: an enum variant's payload sub-patterns, the
+fields of a tuple, and integer and `char` ranges split over the type's whole domain. So
+`Expr::Add(0, y)` covers only the `Add` values whose first field is 0, `(true, _)` plus
+`(false, true)` leaves `(false, false)` uncovered, and `0..=99 => …, 100..=255 => …` covers a `u8`
+with no `_` (`tests/run/match_u8_full_range.wk`). An `enum` may also be covered by integer-literal
+and range patterns that match its declared discriminants. A provably-incomplete match is rejected at
+compile time (`E0405`) with a **witness** — a pattern naming values no arm covers:
+
+```text
+error[E0405]: non-exhaustive `match`: pattern `Expr::Add(i32::MIN..=-1 | 1..=i32::MAX, _)` not covered
+```
+
+A guard (`if …`) never counts toward coverage, because it may be false. A `char` can hold any 32-bit
+value (an integer `as char` is unchecked), so a `char` match needs a `_` arm; floats, structs, arrays
+and pointers are covered only by a `_` or a binding. This closes a silent-wrong-answer hole — a
+non-exhaustive value match used to fall through to a zero default, and a statement/empty one to an
+`Unreachable` the two backends handled differently (`tests/fail/match_nonexhaustive.wk`,
+`match_payload_subpattern_nonexhaustive.wk`, `match_tuple_nonexhaustive.wk`). The same analysis
+reports an arm no value can reach — every value it matches is matched by an earlier unguarded arm —
+as the warning `W0020` (`unreachable_patterns`).
 
 ## Tuples and structs ✅
 
@@ -1664,6 +1678,7 @@ and a name:
 | `W0005` | `dead_code` | a function of the compiled file no entry point reaches (`main`, the `--grad-of` function under `--emit=grad`/`--train`/`--emit=obj --grad-of`, `pub`, `@export`/`@extern`); nothing under `--emit=obj`/`llvm-ir` or in a file with no `main` |
 | `W0006` | `unwritten_output` | a `mut` array/slice/tensor/tuple/struct parameter — an output buffer — that is never stored to, assigned, passed on or borrowed |
 | `W0007` | `unknown_lints` | an `@allow`/`@warn`/`@deny` argument that names no lint |
+| `W0020` | `unreachable_patterns` | a `match` arm no value can reach: every value its pattern matches is matched by an earlier unguarded arm (`5 => …` after `0..=9 => …`, anything after `_`) |
 | `W0030` | `missing_semicolon` | a statement without its `;` (see below) |
 | `W0031` | `ambiguous_continuation` | a `(` or `[`, or a `-` touching its operand, at the start of a line, continuing the expression above it |
 

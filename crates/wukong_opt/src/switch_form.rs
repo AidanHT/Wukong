@@ -29,11 +29,12 @@
 //!
 //! LLVM's SimplifyCFG deletes a branch into an `unreachable` block, because its front ends promise
 //! such a block is dead. Wukong's front end cannot promise that. Sema's exhaustiveness check
-//! (E0405) is deliberately lenient — it fires only on a *certain* miss — so a value `match` over a
-//! tuple, a `match` whose arms all carry guards, or one whose enum arms test a payload
-//! (`Opt::Some(1)`) is accepted with a fall-through that real inputs reach, and `lower_match` ends
-//! that fall-through in `unreachable`. The interpreter, which is the language specification, stops
-//! there with "execution reached `unreachable`", and native code traps. Treating the edge as dead
+//! (E0405, pattern usefulness) fires only on a *certain* miss and gives no verdict on a `match` it
+//! cannot reason about — a range bound that is not a literal, an integer pattern on a tagged union,
+//! a pattern of the wrong type — so such a `match` is accepted with a fall-through that real inputs
+//! may reach, and `lower_match` ends that fall-through in `unreachable`. The interpreter, which is
+//! the language specification, stops there with "execution reached `unreachable`", and native code
+//! traps. Treating the edge as dead
 //! would turn that loud stop into a silently wrong arm at `-O1` and above. So a chain whose last
 //! test falls into a trap keeps the trap as the `switch`'s default; a jump table makes that default
 //! free anyway.
