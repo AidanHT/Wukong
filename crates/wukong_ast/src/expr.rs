@@ -105,6 +105,23 @@ pub struct MatchArm {
     pub guard: Option<Expr>,
     pub body: Expr,
     pub span: Span,
+    /// Where the arm came from: the source, or the parser's desugaring of `if let` / `while let` /
+    /// `let … else` into a `match`.
+    pub origin: ArmOrigin,
+}
+
+/// Where a [`MatchArm`] came from. `if let P = e { A } else { B }` parses as
+/// `match e { P => A, _ => B }`, `while let P = e { A }` as `loop { match e { P => A, _ => break } }`,
+/// and `let P = e else { B };` as a `let` of the names `P` binds from `match e { P => names, _ => B }`;
+/// the `_` arm each of them adds is not the user's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArmOrigin {
+    /// Written in the source.
+    Source,
+    /// The fall-through `_` arm of an `if let` (its `else`, or nothing) or a `while let` (`break`).
+    LetFallthrough,
+    /// The `else` block of a `let … else`, which must diverge.
+    LetElse,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -319,6 +319,7 @@ parallel_reduce_minmax.wk: wukong_sreduce_f32_parallel wukong_sreduce_f32_parall
 parallel_region_alias.wk:
 parallel_region_decline.wk: wukong_velem_f32_parallel
 parallel_region_reassigned_local.wk: veckernel*2
+patterns_struct_binding_slice.wk:
 pointer.wk:
 pointer_null_condition.wk:
 pool2d_partial_window.wk:

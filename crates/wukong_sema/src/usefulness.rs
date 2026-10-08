@@ -20,8 +20,8 @@
 //! | `bool` | `false`, `true` |
 //! | integers and `char` | ranges over the type's whole domain, split at every bound a row of the column names (a `char` holds any 32-bit value, since an integer `as char` is unchecked) |
 //! | `enum` | one per discriminant; a payload variant's fields are sub-columns ([`VariantPayload::field_tys`]) |
-//! | tuple, `()` | the single constructor whose fields are the elements |
-//! | anything else — floats, structs, arrays, pointers, tensors, generics | none the analysis can name: only `_` or a binding covers it |
+//! | tuple, `()`, struct, array `[T; N]` (up to 32 fields) | the single constructor whose fields are the elements |
+//! | anything else — floats, slices, pointers, tensors, generics | none the analysis can name: only `_` or a binding covers it |
 //!
 //! The analysis is **total or silent**. A pattern it cannot place in its column's space — a pattern
 //! of the wrong type (sema reports that on its own), a non-literal range bound, an integer pattern
@@ -114,6 +114,34 @@ pub(crate) fn analyze(
     })
 }
 
+/// A value the single pattern `pat` does not match, for a value of type `ty` — the witness a `let`
+/// with a refutable pattern reports (E0442). `None` when `pat` matches every value, or when the
+/// analysis cannot reason about it.
+pub(crate) fn refutable(
+    defs: &DefMap,
+    interner: &Interner,
+    ty: &Ty,
+    pat: &Pattern,
+) -> Option<Witness> {
+    if matches!(ty, Ty::Unknown | Ty::Error) {
+        return None;
+    }
+    let mut cx = Cx {
+        defs,
+        interner,
+        budget: BUDGET,
+    };
+    let p = cx.lower(pat, ty)?;
+    let tys = [ty.clone()];
+    let w = cx.useful(&[vec![p]], &[DPat::Wild], &tys).ok()??;
+    let mut more = 0;
+    let pattern = match w.first() {
+        Some(head) => cx.render(head, ty, &mut more),
+        None => "_".to_string(),
+    };
+    Some(Witness { pattern, more })
+}
+
 /// A pattern deconstructed against its column's constructor space.
 #[derive(Clone, Debug)]
 enum DPat {
@@ -200,12 +228,22 @@ impl EnumSpace {
 enum ProductKind {
     Unit,
     Tuple,
+    /// A declared struct; [`Product::names`] holds its field names.
+    Struct(Symbol),
+    /// A fixed-size array, one field per element.
+    Array,
 }
 
 struct Product {
     kind: ProductKind,
     fields: Vec<Ty>,
+    /// The field names of a struct, in declaration order; empty otherwise.
+    names: Vec<Symbol>,
 }
+
+/// The most fields a struct or array column is split into; a wider one is opaque (only `_` or a
+/// binding covers it), which keeps the matrix narrow and the recursion shallow.
+const MAX_PRODUCT_FIELDS: usize = 32;
 
 /// The analysis was cut off by [`BUDGET`].
 struct Exhausted;
@@ -224,13 +262,29 @@ impl Cx<'_> {
             Ty::Unit => Space::Product(Product {
                 kind: ProductKind::Unit,
                 fields: Vec::new(),
+                names: Vec::new(),
             }),
             Ty::Tuple(ts) => Space::Product(Product {
                 kind: ProductKind::Tuple,
                 fields: ts.clone(),
+                names: Vec::new(),
             }),
+            Ty::Array { elem, len, .. } if *len as usize <= MAX_PRODUCT_FIELDS => {
+                Space::Product(Product {
+                    kind: ProductKind::Array,
+                    fields: vec![(**elem).clone(); *len as usize],
+                    names: Vec::new(),
+                })
+            }
             Ty::Named(n) => match self.defs.lookup(*n).map(|d| &d.kind) {
                 Some(DefKind::Enum(vs)) => enum_space(*n, vs),
+                Some(DefKind::Struct(fs)) if fs.len() <= MAX_PRODUCT_FIELDS => {
+                    Space::Product(Product {
+                        kind: ProductKind::Struct(*n),
+                        fields: fs.iter().map(|(_, t)| t.clone()).collect(),
+                        names: fs.iter().map(|(f, _)| *f).collect(),
+                    })
+                }
                 _ => Space::Opaque,
             },
             _ => Space::Opaque,
@@ -316,6 +370,61 @@ impl Cx<'_> {
                 ),
                 _ => return None,
             },
+            PatKind::Binding { sub, .. } => self.lower(sub, ty)?,
+            PatKind::Struct { path, fields, .. } => {
+                let Space::Product(Product {
+                    kind: ProductKind::Struct(name),
+                    fields: tys,
+                    names,
+                }) = self.space(ty)
+                else {
+                    return None;
+                };
+                if path.segments.last()?.sym != name
+                    || fields.iter().any(|fp| !names.contains(&fp.name))
+                {
+                    return None;
+                }
+                // A field the pattern does not name is unconstrained.
+                DPat::Product(
+                    names
+                        .iter()
+                        .zip(&tys)
+                        .map(|(n, t)| match fields.iter().find(|fp| fp.name == *n) {
+                            Some(fp) => self.lower(&fp.pat, t),
+                            None => Some(DPat::Wild),
+                        })
+                        .collect::<Option<Vec<_>>>()?,
+                )
+            }
+            PatKind::Slice {
+                prefix,
+                rest,
+                suffix,
+            } => {
+                let Space::Product(Product {
+                    kind: ProductKind::Array,
+                    fields: tys,
+                    ..
+                }) = self.space(ty)
+                else {
+                    return None;
+                };
+                let listed = prefix.len() + suffix.len();
+                if listed > tys.len() || (!*rest && listed != tys.len()) {
+                    return None;
+                }
+                let elem = tys.first()?;
+                let mut subs = Vec::with_capacity(tys.len());
+                for p in prefix {
+                    subs.push(self.lower(p, elem)?);
+                }
+                subs.resize(tys.len() - suffix.len(), DPat::Wild);
+                for p in suffix {
+                    subs.push(self.lower(p, elem)?);
+                }
+                DPat::Product(subs)
+            }
         })
     }
 
@@ -502,6 +611,24 @@ impl Cx<'_> {
                 ProductKind::Unit => "()".to_string(),
                 ProductKind::Tuple if subs.len() == 1 => format!("({},)", subs[0]),
                 ProductKind::Tuple => format!("({})", subs.join(", ")),
+                ProductKind::Array => format!("[{}]", subs.join(", ")),
+                ProductKind::Struct(name) => {
+                    let sname = self.interner.resolve(name);
+                    let named: Vec<String> = p
+                        .names
+                        .iter()
+                        .zip(&subs)
+                        .filter(|(_, s)| s.as_str() != "_")
+                        .map(|(n, s)| format!("{}: {s}", self.interner.resolve(*n)))
+                        .collect();
+                    if named.is_empty() {
+                        format!("{sname} {{ .. }}")
+                    } else if named.len() == p.names.len() {
+                        format!("{sname} {{ {} }}", named.join(", "))
+                    } else {
+                        format!("{sname} {{ {}, .. }}", named.join(", "))
+                    }
+                }
             },
             _ => "_".to_string(),
         }

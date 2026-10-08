@@ -394,6 +394,50 @@ an **identifier** binding (binds the scrutinee or field), and the wildcard `_`. 
 optional `if` guard, and `match` works in both value and statement position. See
 `tests/run/{match_expr,match_patterns,match_tuple}.wk`.
 
+```wukong
+struct Point { x: i32, y: i32 }
+
+fn describe(p: Point, n: i32, a: [i32; 4]) -> i32 {
+    let q = match p {
+        Point { x: 0, y: 0 } => 0,   // struct pattern: listed fields are tested…
+        Point { x: 0, .. } => 1,     // …unlisted ones are free (`..` says so)
+        Point { x, y } => x + y,     // shorthand binds `x` and `y`
+    };
+    let r = match n {
+        d @ 0..=9 => d,              // `name @ sub`: bind the whole value `sub` tested
+        _ => 10,
+    };
+    let s = match a {
+        [first, .., last] => first + last,   // array pattern on a `[T; N]`
+    };
+    return q + r + s;
+}
+```
+
+Three more pattern forms (✅): a **struct** pattern `Point { x: 0, y, .. }` on a value of that
+struct (an unlisted field is unconstrained), a **binding** `name @ sub` that binds the whole value
+`sub` matches (also nested: `(a @ 1..=5, b)`), and an **array** pattern `[a, b, .., z]` on a
+fixed-size array — without `..` it lists every element. All three also destructure in a `let`
+(`let Point { x, y } = p;`, `let [first, .., last] = a;`). An array pattern on a `[]T` slice is
+`E0401`: its length is a run-time value, so test `s.len()` and index instead.
+
+**`if let`, `while let` and `let … else`** (✅) are what they are in Rust, and the parser rewrites
+each into a `match`:
+
+```wukong
+if let Shape::Circle(r) = s { use(r); } else { other(); }   // match s { P => …, _ => … }
+while let 1..=100 = k { k = k - 7; }                         // loop { match k { P => …, _ => break } }
+let Shape::Circle(r) = s else { return 0; };                 // `r` is bound after this line
+```
+
+The `else` of a `let … else` must **diverge** — `return`, `break`, `continue`, or a `loop` with no
+exit — because the names its pattern binds do not exist on that path (`E0401` otherwise). A plain
+`let` pattern, in turn, must be **irrefutable**: `let Shape::Circle(r) = s;` would leave `r` unbound
+for every other shape, so it is `E0442`, with a witness naming a value it misses
+(`tests/run/patterns_struct_binding_slice.wk`, `tests/fail/let_refutable_pattern.wk`,
+`tests/fail/let_else_not_diverging.wk`). Not yet: a `rest @ ..` sub-array binding, a binding
+inside an or-pattern, `if let … && cond` chains, and destructuring in a `for` head.
+
 A literal pattern must be **in range for the scrutinee's type**: `match n { 200 => … }` against an
 `i8` is an `E0401` ("literal `200` is out of range for `i8` (-128..=127)"), not a value truncated to
 the scrutinee's width. The same check applies to both bounds of a range pattern.
@@ -413,8 +457,9 @@ error[E0405]: non-exhaustive `match`: pattern `Expr::Add(i32::MIN..=-1 | 1..=i32
 ```
 
 A guard (`if …`) never counts toward coverage, because it may be false. A `char` can hold any 32-bit
-value (an integer `as char` is unchecked), so a `char` match needs a `_` arm; floats, structs, arrays
-and pointers are covered only by a `_` or a binding. This closes a silent-wrong-answer hole — a
+value (an integer `as char` is unchecked), so a `char` match needs a `_` arm; struct and array
+patterns are checked field by field, and floats, slices and pointers are covered only by a `_` or a
+binding. This closes a silent-wrong-answer hole — a
 non-exhaustive value match used to fall through to a zero default, and a statement/empty one to an
 `Unreachable` the two backends handled differently (`tests/fail/match_nonexhaustive.wk`,
 `match_payload_subpattern_nonexhaustive.wk`, `match_tuple_nonexhaustive.wk`). The same analysis

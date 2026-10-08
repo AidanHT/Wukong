@@ -799,6 +799,21 @@ impl Rewriter<'_> {
                 self.pattern(lo);
                 self.pattern(hi);
             }
+            PatKind::Struct { path, fields, .. } => {
+                self.path(path);
+                for fp in fields {
+                    self.pattern(&mut fp.pat);
+                }
+            }
+            PatKind::Binding { name, sub } => {
+                self.bind(*name);
+                self.pattern(sub);
+            }
+            PatKind::Slice { prefix, suffix, .. } => {
+                for sub in prefix.iter_mut().chain(suffix.iter_mut()) {
+                    self.pattern(sub);
+                }
+            }
             PatKind::Wildcard
             | PatKind::Unit
             | PatKind::Int { .. }

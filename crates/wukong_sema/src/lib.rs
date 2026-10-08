@@ -34,6 +34,7 @@ mod infer;
 mod layout;
 mod methods;
 mod noalias;
+mod patterns;
 mod promote;
 mod shape;
 mod tensor;
@@ -2587,6 +2588,11 @@ impl<'a> Sema<'a> {
                 self.note_tensor_view(pat, &bound, init.as_ref());
                 self.bind_pattern(pat, &bound);
                 self.note_literal_binding(pat, ty.as_ref(), init.as_ref(), &bound);
+                // A `let` pattern must match every value (E0442; `let … else` is the refutable
+                // form, and the parser has already rewritten it).
+                if !matches!(pat.kind, PatKind::Ident(_) | PatKind::Wildcard) {
+                    self.check_irrefutable_let(pat, &bound);
+                }
                 if let Ty::Array {
                     shared: true,
                     elem,
@@ -3073,6 +3079,19 @@ impl<'a> Sema<'a> {
                 self.range_check_int_pattern(hi, ty);
             }
             PatKind::Char(_) | PatKind::Bool(_) | PatKind::Path(_) => {}
+            // `Point { x, .. }`, `n @ 1..=9`, `[a, .., z]` (`patterns.rs`).
+            PatKind::Struct { path, fields, .. } => {
+                self.check_struct_pattern(path, fields, ty, pat.span)
+            }
+            PatKind::Binding { name, sub } => {
+                self.bind(*name, ty.clone());
+                self.bind_pattern(sub, ty);
+            }
+            PatKind::Slice {
+                prefix,
+                rest,
+                suffix,
+            } => self.check_slice_pattern(prefix, *rest, suffix, ty, pat.span),
         }
     }
 
@@ -4267,6 +4286,9 @@ impl<'a> Sema<'a> {
                     self.check_merge_shapes(&result, &t, Some(&arm.body), arm.body.span);
                     result = join(result, t);
                 }
+                // The `else` of a `let … else` (which the parser made this match's `_` arm) must
+                // diverge (`patterns.rs`).
+                self.check_let_else_arms(arms);
                 // Exhaustiveness: a `match` that provably misses a value is rejected (E0405), like
                 // Rust. A *value* match would synthesize a typed-zero default in mir_build (a silent
                 // wrong answer, or invalid MIR for an aggregate); a *statement* / empty match still

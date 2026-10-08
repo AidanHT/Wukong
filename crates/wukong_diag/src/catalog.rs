@@ -484,6 +484,21 @@ static CATALOG: &[Explanation] = &[
         good: "module ex.e0441\nfn total(x: f64) -> f64 {\n    let mut s = 0.5;\n    s += x;\n    return s;\n}\nfn main() -> i32 {\n    return total(1.5) as i32;\n}\n"
     ),
     entry!(
+        "E0442",
+        "refutable pattern in `let`",
+        "The pattern of a plain `let` must match every value of its type, because the names it binds \
+         have to exist afterwards. `let Shape::Circle { r } = s;` leaves `r` unbound when `s` is \
+         any other shape, and `let (0, x) = t;` when `t.0` is not 0, so both are rejected; the \
+         diagnostic names a value the pattern misses, found by the same analysis as E0405. Use \
+         `let … else` to leave the enclosing function or loop when the value does not match — \
+         `let Shape::Circle { r } = s else { return 0.0; };` — or a `match`. Destructuring patterns \
+         that cannot fail are fine: a tuple, struct or array of names (`let (a, b) = t;`, \
+         `let Point { x, y } = p;`, `let [first, .., last] = a;`), and the single variant of a \
+         one-variant enum.",
+        bad: "module ex.e0442\nenum Shape { Circle(i32), Square(i32) }\nfn radius(s: Shape) -> i32 {\n    let Shape::Circle(r) = s;\n    return r;\n}\nfn main() -> i32 {\n    return radius(Shape::Circle(3));\n}\n",
+        good: "module ex.e0442\nenum Shape { Circle(i32), Square(i32) }\nfn radius(s: Shape) -> i32 {\n    let Shape::Circle(r) = s else {\n        return 0;\n    };\n    return r;\n}\nfn main() -> i32 {\n    return radius(Shape::Circle(3));\n}\n"
+    ),
+    entry!(
         "E0501",
         "rank, extent or arity mismatch",
         "Two tensors were required to have the same number of dimensions (rank) but did not. For \

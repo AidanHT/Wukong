@@ -593,6 +593,40 @@ impl AstPrinter<'_> {
                     }
                 });
             }
+            PatKind::Struct { path, fields, rest } => {
+                let dots = if *rest { " .." } else { "" };
+                self.line(format!("pat struct {}{dots}", self.path_str(path, "::")));
+                self.indented(|p| {
+                    for fp in fields {
+                        let nm = p.sym(fp.name);
+                        p.line(format!("field {nm}"));
+                        p.indented(|p| p.pattern(&fp.pat));
+                    }
+                });
+            }
+            PatKind::Binding { name, sub } => {
+                let nm = self.sym(*name);
+                self.line(format!("pat {nm} @"));
+                self.indented(|p| p.pattern(sub));
+            }
+            PatKind::Slice {
+                prefix,
+                rest,
+                suffix,
+            } => {
+                self.line("pat slice");
+                self.indented(|p| {
+                    for s in prefix {
+                        p.pattern(s);
+                    }
+                    if *rest {
+                        p.line("..");
+                    }
+                    for s in suffix {
+                        p.pattern(s);
+                    }
+                });
+            }
         }
     }
 

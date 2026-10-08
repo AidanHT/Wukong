@@ -22,6 +22,10 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `f32 += f64` used to accumulate in `f32`). **Literal inference**: an unannotated `let` initialized
   from bare literals takes its type from its first constraining use, so `let mut s = 0.0;
   s += x_f64[i];` accumulates in `f64`.
+- **Patterns**: struct patterns `Point { x: 0, y, .. }`, `name @ sub` bindings, array patterns
+  `[first, .., last]` on fixed-size arrays, and `if let` / `while let` / `let … else` (the `else`
+  must diverge), all checked by the exhaustiveness analysis; a refutable pattern in a plain `let` is
+  the new `E0442`.
 
 ### Optimizer memory passes: SROA, path DSE, loop deletion, guarded LICM, scalar promotion (`gap/opt-memory`)
 

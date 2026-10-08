@@ -1117,12 +1117,10 @@ impl<'a> FnLint<'a> {
         );
     }
 
-    /// `W0004`: an expression statement whose value is computed and discarded with no effect —
-    /// above all `out[i] == a[i] + b[i];`, a comparison where an assignment was meant.
     /// `unreachable_patterns`: an arm whose every value an earlier unguarded arm already matches.
     /// The verdict is sema's own exhaustiveness analysis, so a match it cannot reason about
-    /// reports nothing. An arm the parser synthesized (the `else` of an `if let`, whose pattern
-    /// carries `NodeId::DUMMY`) is never reported: the user wrote no arm there.
+    /// reports nothing. An arm the parser synthesized (the fall-through `_` of an `if let`,
+    /// `while let` or `let … else`) is never reported: the user wrote no arm there.
     fn unreachable_arms(&mut self, scrutinee: &Expr, arms: &[MatchArm]) {
         let sema = self.sema;
         let Some(ty) = sema.types.get(&scrutinee.id) else {
@@ -1133,7 +1131,7 @@ impl<'a> FnLint<'a> {
         };
         for i in report.unreachable {
             let arm = &arms[i];
-            if arm.pat.id == NodeId::DUMMY {
+            if arm.origin != ArmOrigin::Source {
                 continue;
             }
             self.diags.push(
@@ -1148,6 +1146,8 @@ impl<'a> FnLint<'a> {
         }
     }
 
+    /// `W0004`: an expression statement whose value is computed and discarded with no effect —
+    /// above all `out[i] == a[i] + b[i];`, a comparison where an assignment was meant.
     fn unused_result(&mut self, e: &Expr) {
         let (msg, help): (String, Option<&str>) = match &e.kind {
             ExprKind::Binary { op, lhs, .. } => {
@@ -1372,6 +1372,22 @@ fn pattern_names(p: &Pattern, out: &mut Vec<(Symbol, Span)>) {
                 }
             }
         },
+        PatKind::Struct { fields, .. } => {
+            for fp in fields {
+                pattern_names(&fp.pat, out);
+            }
+        }
+        PatKind::Binding { name, sub } => {
+            if !out.iter().any(|(s, _)| s == name) {
+                out.push((*name, p.span));
+            }
+            pattern_names(sub, out);
+        }
+        PatKind::Slice { prefix, suffix, .. } => {
+            for s in prefix.iter().chain(suffix) {
+                pattern_names(s, out);
+            }
+        }
         PatKind::Wildcard
         | PatKind::Unit
         | PatKind::Int { .. }

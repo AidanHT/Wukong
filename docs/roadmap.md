@@ -172,11 +172,17 @@ another architecture or OS is not supported. A native-backend failure is a catal
 - **`match`** in value and statement position: integer/bool literal, identifier-binding, and wildcard
   `_` patterns, **or-patterns** `1 | 2 | 3`, half-open `0..10` / inclusive `0..=10` **range** patterns,
   **enum-variant** patterns `Color::Red` (matched by discriminant), and **tuple** patterns `(0, _)`
-  (per-field tests + bindings, nesting and composition like `(0 | 1, y)`), each with an optional `if`
-  guard. The scrutinee is evaluated once and the whole `match` lowers to an if-else chain; at `-O2`
-  four or more equality tests on one integer scrutinee become one MIR `switch` (a Cranelift jump
-  table or search tree; the `gpu-native` backend declines it)
-  (`tests/run/{match_expr,match_patterns,match_tuple,match_dense_enum_switch}.wk`).
+  (per-field tests + bindings, nesting and composition like `(0 | 1, y)`), **struct** patterns
+  `Point { x: 0, y, .. }`, **`name @ sub`** bindings and **array** patterns `[first, .., last]` on a
+  fixed-size array, each with an optional `if` guard. `if let`, `while let` and `let … else` (whose
+  `else` must diverge) are rewritten by the parser into a `match`, and a plain `let` pattern must be
+  irrefutable (`E0442`). The scrutinee is evaluated once and the whole `match` lowers to an if-else
+  chain; at `-O2` four or more equality tests on one integer scrutinee become one MIR `switch` (a
+  Cranelift jump table or search tree; the `gpu-native` backend declines it)
+  (`tests/run/{match_expr,match_patterns,match_tuple,match_dense_enum_switch,patterns_struct_binding_slice}.wk`).
+  Not yet: an array pattern on a `[]T` slice (its length is a run-time value), a `rest @ ..`
+  sub-slice binding, a binding inside an or-pattern, `if let … && cond` chains, and destructuring
+  patterns in a `for` head.
 - **C-style enums** `enum Code { Ok = 10, Err }` — explicit or auto-incrementing discriminants; a
   variant *is* its integer discriminant, usable in `let`, `==`, `as i32`, and as a `match` pattern
   (`tests/run/enum_cstyle.wk`).
