@@ -2791,6 +2791,28 @@ impl<'a, 'k> Interp<'a, 'k> {
                     args[1].as_int() as i64,
                 ) as f64))
             }
+            // The double-precision transcendental library an `f64` `exp`/`log`/`sin`/… lowers to:
+            // the identical pure-Rust function the JIT binds and the AOT link resolves, called on
+            // the f64 the slot holds (no narrowing), so the oracle is the native result bit-for-bit.
+            "wukong_rt_math_f64" => {
+                if args.len() != 2 {
+                    return Err("wukong_rt_math_f64 expects two arguments".into());
+                }
+                Ok(Value::Float(wukong_runtime::wukong_rt_math_f64(
+                    args[0].as_float(),
+                    args[1].as_int() as i64,
+                )))
+            }
+            "wukong_rt_math2_f64" => {
+                if args.len() != 3 {
+                    return Err("wukong_rt_math2_f64 expects three arguments".into());
+                }
+                Ok(Value::Float(wukong_runtime::wukong_rt_math2_f64(
+                    args[0].as_float(),
+                    args[1].as_float(),
+                    args[2].as_int() as i64,
+                )))
+            }
             // `wukong_vmath2_f32(x, y, out, n, op)` — the two-input 256-bit kernel (pow/atan2/hypot)
             // an `out[i] = f(x[i], y[i])` loop lowers to. Marshal `n` f32 from x AND y, call the
             // *identical* runtime kernel the native backend calls, write the result back — so the

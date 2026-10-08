@@ -210,10 +210,21 @@ with the sign bit for signed integers and with zero for unsigned integers. These
 interpreter and native backend contracts, including optimized execution.
 
 Float-to-integer `as` casts truncate toward zero and saturate at the destination range; NaN
-becomes zero, and negative values cast to unsigned integers become zero. Basic `f64` arithmetic
-uses double precision, but the current transcendental lowering (`exp`, `log`, `sin`, `cos`,
-`erf`, `atan`, and functions built from them) computes through `f32`. An `f64` result from those
-functions does **not** provide double-precision transcendental accuracy.
+becomes zero, and negative values cast to unsigned integers become zero. `f64` is double
+precision throughout: arithmetic, and every transcendental on an `f64` operand — `exp`, `log`,
+`exp2`/`log2`/`exp10`/`log10`, `expm1`/`log1p`, `sin`/`cos`/`tan`, `asin`/`acos`/`atan`/`atan2`,
+`sinh`/`cosh`/`tanh`, `asinh`/`acosh`/`atanh`, `erf`, `cbrt`, `pow`, `hypot`, and the activations
+built on them — is one call into the runtime's pure-Rust double-precision library
+(`wukong_runtime::math64`: the fdlibm/musl algorithms, no platform libm, no FMA), so the
+interpreter, the native JIT and the AOT executable return the same bits on every host. The core
+(`exp`, `log`, the base-2/base-10 family, `expm1`, `log1p`, `pow`, `hypot`, `sin`/`cos`/`tan` on
+**every** finite argument via Payne–Hanek reduction, the inverse trig, `erf`, `cbrt`) is within
+**1 ULP** of the correctly rounded value; the hyperbolics `sinh`/`cosh`/`tanh`/`asinh`/`acosh`/
+`atanh` within 2 ULP; `exp10` within 3. The C23 special values hold (`exp(−∞) = +0`,
+`log(±0) = −∞`, `sin(±∞) = NaN`, `atan2`'s full quadrant table, `pow(x, ±0) = pow(1, y) = 1` even
+for NaN, odd functions return `−0` for `−0`, and every function is exactly `x` below its linear
+threshold, sign included). `tests/run/transcendental_f64.wk` prints twelve significant digits of
+each.
 
 ## Control flow ✅
 
@@ -759,10 +770,15 @@ requires fresh matched-peer measurements. `erf`, `sin` and `cos` are among those
 `sin`/`cos` loop and an exact erf-GELU loop compile to). What does *not* dispatch is a **composed or
 scalar** use — an intrinsic inside a larger expression, or a single call outside an elementwise `for` —
 which instead auto-vectorizes the inlined polynomial at 128-bit; `sqrt`/`rsqrt` also stay inline, being
-hardware instructions. A recognized standalone `tanh` loop uses the runtime's piecewise approximation.
-Scalar or composed `tanh` uses `1 - 2/(exp(2*x) + 1)`; these paths can differ in finite results and
-the sign of zero. Backend agreement for a fixed lowering path does not imply bitwise equality between
-dispatched and inlined spellings. Composed activations such as GELU retain the exp-based tanh formula.
+hardware instructions. `tanh` is **one function however it is spelled**: a dispatched `tanh` loop,
+a scalar `tanh(x)`, a composed `tanh(x) * s` and a `@generic` loop all compute the runtime's ≤1-ULP
+piecewise kernel bit-for-bit — the inlined form mirrors it op-for-op (the same FMA chain, the same
+NaN-to-clamp `min`, the same table lookup), including `−0 → −0` and `tanh(x) == x` for every
+|x| < 2⁻¹³ (`tests/run/tanh_spellings.wk`; `dispatched_tanh_equals_composed_tanh` pins every lane).
+The composed activations `gelu`, `mish`, `tanhshrink`, `tanh_backward` and `gelu_backward` keep the
+exp-composed `1 − 2/(exp(2x) + 1)` as their *internal* building block, because their dispatched
+kernels are built on it and each activation stays bit-identical to its kernel; that block is not
+the language's `tanh`. On `f64` every spelling is the double-precision runtime `tanh`.
 
 ## Memory and parallelism
 

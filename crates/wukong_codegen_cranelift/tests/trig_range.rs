@@ -369,12 +369,55 @@ fn scalar_trig_llvm_and_object_imports_are_typed() {
     }
 }
 
+/// The number of representable doubles between `a` and `b` (±0 count as the same point).
+fn ulp_diff64(a: f64, b: f64) -> u64 {
+    fn ordered(x: f64) -> i64 {
+        let bits = x.to_bits() as i64;
+        if bits < 0 {
+            i64::MIN - bits
+        } else {
+            bits
+        }
+    }
+    (ordered(a) - ordered(b)).unsigned_abs()
+}
+
+/// An `f64` trig call is the runtime's double-precision library on both backends — no demotion
+/// through the f32 polynomial, no `fptrunc` anywhere in the MIR — and the result is within 2 ULP
+/// of the host libm on every finite argument, including the ones that need Payne–Hanek
+/// reduction (`1e22`, `1e300`). Before this contract an `f64` `sin` was `(x as f32).sin() as
+/// f64`: seven significant digits on a sixteen-digit type.
 #[test]
-fn f64_source_keeps_existing_f32_trig_boundary() {
+fn f64_source_uses_the_double_precision_runtime() {
     let (program, mut interner) = lower(
         "fn entry(x: [f64; 1], mut out: [f64; 3]) {
         out[0] = sin(x[0]); out[1] = cos(x[0]); out[2] = tan(x[0]); }",
         false,
+    );
+    let mut codes = Vec::new();
+    for function in &program.funcs {
+        for inst in function.blocks.iter().flat_map(|block| &block.insts) {
+            match &inst.op {
+                Op::Call { func, args } if interner.resolve(*func) == "wukong_rt_math_f64" => {
+                    assert_eq!(args.len(), 2);
+                    assert_eq!(function.value_type(args[0]), &MirType::F64);
+                    assert_eq!(function.value_type(inst.result.unwrap()), &MirType::F64);
+                    codes.push(constant(function, args[1]).unwrap());
+                }
+                Op::Call { func, .. } if interner.resolve(*func) == "wukong_rt_trig_f32" => {
+                    panic!("an f64 trig call reached the f32 runtime");
+                }
+                Op::Cast(wukong_mir::CastKind::FpTrunc, _, _) => {
+                    panic!("an f64 trig call demoted its operand to f32");
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        codes,
+        vec![VM_SIN as i128, VM_COS as i128, VM_TAN as i128],
+        "one f64 runtime call per intrinsic, in source order"
     );
     let entry = interner.intern("entry");
     for level in [0, 2] {
@@ -386,10 +429,15 @@ fn f64_source_keeps_existing_f32_trig_boundary() {
         for x in [
             0.0f64,
             -0.0,
+            0.5,
+            -1.5,
             4096.0001,
             4_000_000_017.0,
             -4_000_000_017.0,
             f32::MAX as f64,
+            1e22,
+            1e300,
+            (1u64 << 60) as f64,
         ] {
             let mut input = [x];
             let mut interpreted = [0.0; 3];
@@ -402,17 +450,42 @@ fn f64_source_keeps_existing_f32_trig_boundary() {
             )
             .unwrap();
             unsafe { function(&x, native.as_mut_ptr()) };
-            // Every nonzero input here takes the full-range fallback. These are independent
-            // Rust libm values after the documented f32 demotion; tan divides after promotion.
-            let sine = (x as f32).sin() as f64;
-            let cosine = (x as f32).cos() as f64;
-            for (lane, expected) in [sine, cosine, sine / cosine].into_iter().enumerate() {
+            let expected = [
+                wukong_runtime::math64::sin(x),
+                wukong_runtime::math64::cos(x),
+                wukong_runtime::math64::tan(x),
+            ];
+            let host = [x.sin(), x.cos(), x.tan()];
+            for lane in 0..3 {
                 assert_eq!(
                     native[lane].to_bits(),
-                    expected.to_bits(),
-                    "f64 O{level} x={x} lane={lane}"
+                    expected[lane].to_bits(),
+                    "f64 O{level} x={x} lane={lane}: native != runtime library"
                 );
-                assert_eq!(native[lane].to_bits(), interpreted[lane].to_bits());
+                assert_eq!(
+                    native[lane].to_bits(),
+                    interpreted[lane].to_bits(),
+                    "f64 O{level} x={x} lane={lane}: native != interpreter"
+                );
+                // Two ≤1-ULP implementations (ours and the host libm) differ by at most 2 ULP.
+                assert!(
+                    ulp_diff64(native[lane], host[lane]) <= 2,
+                    "f64 O{level} x={x} lane={lane}: {} vs host {}",
+                    native[lane],
+                    host[lane]
+                );
+            }
+            if x == 0.0 {
+                assert_eq!(
+                    native[0].to_bits(),
+                    x.to_bits(),
+                    "sin keeps the sign of zero"
+                );
+                assert_eq!(
+                    native[2].to_bits(),
+                    x.to_bits(),
+                    "tan keeps the sign of zero"
+                );
             }
         }
     }

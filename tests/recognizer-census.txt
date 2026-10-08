@@ -305,11 +305,11 @@ rmsnorm_const_eps.wk: wukong_norm_f32
 rmsnorm_no_eps.wk: wukong_norm_f32
 rope.wk: wukong_rope_f32
 rope_bwd.wk: wukong_rope_bwd_f32
-rope_elem_f64.wk: wukong_rt_trig_f32 wukong_rt_trig_f32*2
+rope_elem_f64.wk: wukong_rt_math_f64 wukong_rt_math_f64*2
 rounding.wk:
 rowarg_elem_nonf32.wk:
 rowargmax.wk: wukong_rowargmax_i32 wukong_rowargmin_i32
-rowloss_elem_f64.wk:
+rowloss_elem_f64.wk: wukong_rt_math_f64 wukong_rt_math_f64*3
 saxpy.wk: wukong_velem_f32
 scaled_gemm.wk: wukong_sgemm_nt_alpha
 scaled_gemm_batched.wk: wukong_sgemm_nt_alpha
@@ -348,6 +348,7 @@ struct_field_kernel_base.wk: wukong_norm_affine_f32 wukong_sgemm_nt_epi
 struct_fn.wk:
 struct_nested.wk:
 struct_return.wk:
+tanh_spellings.wk: wukong_vmath_f32
 tanhshrink.wk: wukong_vmath_f32
 tensor_1d_kernels.wk: wukong_sreduce_f32_parallel wukong_velem_f32 wukong_vmath_f32
 tensor_add.wk: veckernel*1
@@ -358,6 +359,7 @@ tensor_param_surfaces.wk: wukong_sreduce_f32_parallel wukong_sreduce_f32_paralle
 tensor_whole_assign.wk:
 top_level_const.wk:
 transcendental.wk:
+transcendental_f64.wk: wukong_rt_math2_f64 wukong_rt_math2_f64*4 wukong_rt_math_f64 wukong_rt_math_f64*41
 transcendental_kernel.wk: wukong_vmath_f32
 transcendental_sweep.wk: wukong_vmath_f32 wukong_vmath_f32*3 wukong_vmath_f32_parallel wukong_vmath_f32_parallel*2
 transformer_block.wk: wukong_norm_f32 wukong_norm_f32*3 wukong_sgemm wukong_sgemm_nt wukong_sgemm_nt*3 wukong_velem_f32 wukong_velem_f32*2

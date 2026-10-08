@@ -60,7 +60,10 @@ cycles):
 wukong_span      Span, SourceMap (line index), string Interner / Symbol
 wukong_runtime   the AVX2/FMA microkernels the recognizers dispatch to (GEMM/GEMV, vmath,
                   reductions, norms, int8, bf16/f16) + the rayon-backed `wukong_parallel_for` that
-                  `@parallel` lowers to — a leaf: no workspace deps, and both the interpreter and
+                  `@parallel` lowers to + `math64`, the pure-Rust double-precision transcendental
+                  library (fdlibm/musl algorithms, ≤1 ULP core, Payne–Hanek trig reduction) that
+                  every `f64` `exp`/`log`/`sin`/`pow`/… lowers to as one `wukong_rt_math_f64` /
+                  `wukong_rt_math2_f64` call — a leaf: no workspace deps, and both the interpreter and
                   the native backend call into it. The bump `Arena` and the sequential
                   `parallel_for` are reference surface with no caller anywhere in the workspace
                   (the kernels use thread-local `Vec` scratch)

@@ -50,6 +50,9 @@ pub use vmath::{
     VM_SILU, VM_SIN, VM_SINH, VM_SOFTPLUS, VM_SOFTSIGN, VM_TAN, VM_TANH,
 };
 
+pub mod math64;
+pub use math64::{wukong_rt_math2_f64, wukong_rt_math_f64};
+
 mod velem;
 pub use velem::{
     wukong_velem_f32, wukong_velem_f32_parallel, wukong_vhorner_f32, VE_ID, VE_RELU, VE_RELU6,
