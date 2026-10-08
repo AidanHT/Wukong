@@ -1,0 +1,10 @@
+// A module's items are private unless declared `pub`: naming one from another file — here through
+// an `as` alias — is E0312, not a silent reach into the other module's namespace.
+// EXPECT-CODE: E0312
+module import_private
+
+import lib.privlib as p;
+
+fn main() -> i32 {
+    return p::open() + p::secret();
+}

@@ -25,6 +25,23 @@ All notable changes to Wukong are documented here. The format is loosely based o
   length that silently evaluated to 0. A fixed-size array parameter now rejects a tensor argument of
   another size (it had no unification arm).
 
+### Modules, `defer` and C FFI (gap/lang-modules — P15.22, P15.3)
+
+- **Per-file module namespaces.** Items are private unless `pub` (E0312); `import a.b as c` binds a
+  qualifier, `import a.b.{x, y}` selects, and a plain `import a.b` brings `pub` items in
+  unqualified plus the `b::` qualifier. Imports are no longer transitive; two modules may share a
+  private name; an ambiguous unqualified use of two plain imports is E0313. Qualified names work in
+  calls, struct literals, enum variants/patterns and types (`g::Vec2` / `g.Vec2`). *Breaking:* a
+  library item another file uses must now be `pub`, and a file must import what it names
+  (`examples/gpt2_config.wk` and the import fixtures were updated).
+- **`defer` executes** on every backend: every exit of its block, LIFO, values before defers.
+  `defer x += 1;` parses. Control flow out of a defer, or rebinding a name it uses while pending, is
+  E0314.
+- **`extern "C"` calls execute**: `Program::externs`, Cranelift imports bound to the host symbol,
+  the interpreter calling the same symbol for scalar signatures (pointer signatures and unresolvable
+  symbols are a C0001 before the run), LLVM `declare`s with `signext`/`zeroext`. A declaration type
+  with no C mapping is C0001.
+
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
 - **Gate added: every recognizer-dependent corpus program is held to its own generic lowering.**

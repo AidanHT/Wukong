@@ -221,6 +221,42 @@ static CATALOG: &[Explanation] = &[
          can rewrite."
     ),
     entry!(
+        "E0312",
+        "private item",
+        "An item of another module was named, but that module does not export it. Every file is a \
+         module with its own namespace, and its top-level items (`fn`, `struct`, `enum`, `const`, \
+         and the functions of an `extern` block) are private to it unless declared `pub`. A private \
+         item is reachable from its own file only: `import m.{x}` and the qualified `m::x` reject \
+         it, and a plain `import m;` simply does not bring it into scope. Declare the item `pub` in \
+         its module, or keep it private and call the public function that wraps it."
+    ),
+    entry!(
+        "E0313",
+        "ambiguous name",
+        "An unqualified name is brought into scope by two different plain imports (`import a;` and \
+         `import b;` both export an item with that name), or a module qualifier is bound by two \
+         imports whose last path segment is the same (`import x.util;` and `import y.util;` both \
+         bind `util`). Importing both is not an error; only the ambiguous USE is, so the compiler \
+         never silently picks one module's item. Qualify the use (`a::name`), import the intended \
+         item explicitly (`import a.{name};`, which takes precedence over plain imports), or give \
+         one import a distinct name with `as`. A definition in the file itself always shadows a \
+         plain import."
+    ),
+    entry!(
+        "E0314",
+        "invalid `defer`",
+        "`defer e;` runs `e` at every exit of the enclosing block — falling off its end, `return`, \
+         and `break`/`continue` out of it — in reverse order of registration, innermost block \
+         first; a returned or broken value is computed before the defers run. Two things would \
+         make that ill-defined and are rejected. (1) Control flow leaving the deferred \
+         expression: a `return`, or a `break`/`continue` aimed at a loop outside it, inside `e` \
+         (a loop entirely inside `e` may break out of itself). (2) Rebinding a name `e` uses while \
+         the defer is pending: `e` is resolved where the `defer` is written, but its copies are \
+         placed at the exits, where a newer `let x` (or a `for x` / match binding) would silently \
+         retarget it. Rename the new binding, or end the block holding the `defer` before \
+         rebinding."
+    ),
+    entry!(
         "E0401",
         "type mismatch",
         "A value's type does not match the type required by its context — for example a `let` with \

@@ -250,6 +250,7 @@ fn optimize_attributed(p: &mut wukong_mir::Program) -> Vec<PassWork> {
     let mut shell = wukong_mir::Program {
         funcs: Vec::with_capacity(1),
         statics: Vec::new(),
+        externs: Vec::new(),
         level: p.level,
     };
     let (changed, unroll) = counted(|| wukong_opt::unroll_program(p));

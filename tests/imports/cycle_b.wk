@@ -3,6 +3,6 @@ module cycle_b
 
 import cycle_a;
 
-fn from_b() -> i32 {
+pub fn from_b() -> i32 {
     return 2;
 }

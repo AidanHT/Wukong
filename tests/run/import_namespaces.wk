@@ -1,0 +1,50 @@
+// RUN: --run
+// EXPECT-OUT: -7
+// EXPECT-OUT: 20
+// EXPECT-OUT: 1001
+// EXPECT-OUT: 7
+// EXPECT-OUT: -5
+// EXPECT-OUT: 3
+// EXPECT-OUT: -9
+// EXPECT-EXIT: 0
+module import_namespaces
+
+// Per-module namespaces (P15.22). Three files each define a `helper` — the root's own, plus a
+// PRIVATE one in lib/geom.wk and another in lib/stats.wk — and lib/geom.wk and lib/stats.wk both
+// export a `norm1`. In the old single flat namespace every one of those was an E0300 collision;
+// now each module's calls resolve to its own items and the root reaches the libraries through an
+// `as` alias (`g::`, `st::`) or a selective import (`bump`).
+//
+// Expected values, by hand from the scalar semantics of the library bodies:
+//   g::norm1(v)        = helper(v) + abs_i(v.y) = v.x * SCALE + |-5| = -4 * 3 + 5 = -7
+//   st::norm1(2)       = 2 * 10                                      = 20
+//   bump(1)            = stats' helper(1) = 1 + 1000                 = 1001
+//   helper()           = the root's own helper                       = 7
+//   g::pick(v, Y)      = v.y                                         = -5
+//   g::SCALE           = 3
+//   sum(v)             = v.x + v.y = -4 + -5                         = -9
+
+import lib.geom as g;
+import lib.stats.{bump};
+import lib.stats as st;
+
+fn helper() -> i32 {
+    return 7;
+}
+
+// A module-qualified type in a signature: `g::Vec2` (the `g.Vec2` spelling is equivalent).
+fn sum(v: g::Vec2) -> i32 {
+    return v.x + v.y;
+}
+
+fn main() -> i32 {
+    let v = g::Vec2 { x: -4, y: -5 };
+    print(g::norm1(v));
+    print(st::norm1(2));
+    print(bump(1));
+    print(helper());
+    print(g::pick(v, g::Axis::Y));
+    print(g::SCALE);
+    print(sum(v));
+    return 0;
+}

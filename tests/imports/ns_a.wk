@@ -1,0 +1,24 @@
+// Loader unit-test fixture (crates/wukong_driver/src/loader.rs): a module with a public API and a
+// PRIVATE `helper` whose name ns_b.wk also defines privately — the two must not collide, and each
+// module's own call must resolve to its own helper.
+module ns_a
+
+pub fn a_val() -> i32 {
+    return helper() + 1;
+}
+
+fn helper() -> i32 {
+    return 10;
+}
+
+pub struct Pt {
+    x: i32,
+    y: i32,
+}
+
+pub enum Mode {
+    Fast,
+    Slow,
+}
+
+pub const SIZE: i64 = 4;

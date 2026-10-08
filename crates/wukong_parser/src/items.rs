@@ -92,7 +92,7 @@ impl Parser<'_> {
             T::Enum => ItemKind::Enum(self.parse_enum(is_pub)),
             T::Const => ItemKind::Const(self.parse_const(is_pub)),
             T::Import => ItemKind::Import(self.parse_import()),
-            T::Extern => ItemKind::Extern(self.parse_extern()),
+            T::Extern => ItemKind::Extern(self.parse_extern(is_pub)),
             _ => {
                 let sp = self.span();
                 self.error(
@@ -376,7 +376,9 @@ impl Parser<'_> {
         Import { path, alias, items }
     }
 
-    fn parse_extern(&mut self) -> ExternBlock {
+    /// `[pub] extern ["C"] { [pub] fn ...; ... }` or `[pub] extern ["C"] fn ...;`. A `pub` on the
+    /// block exports every declaration in it; a `pub` on one declaration exports just that one.
+    fn parse_extern(&mut self, is_pub: bool) -> ExternBlock {
         self.bump(); // extern
         let abi = if self.at(T::Str) {
             let s = self.intern_span(self.span());
@@ -388,15 +390,19 @@ impl Parser<'_> {
         let mut items = Vec::new();
         if self.eat(T::LBrace) {
             while !self.at(T::RBrace) && !self.at(T::Eof) {
+                let item_pub = self.at(T::Pub) && self.nth(1) == T::Fn;
+                if item_pub {
+                    self.bump(); // pub
+                }
                 if self.at(T::Fn) {
-                    items.push(self.parse_fn(false));
+                    items.push(self.parse_fn(is_pub || item_pub));
                 } else {
                     self.bump();
                 }
             }
             self.expect(T::RBrace);
         } else if self.at(T::Fn) {
-            items.push(self.parse_fn(false));
+            items.push(self.parse_fn(is_pub));
         }
         ExternBlock { abi, items }
     }

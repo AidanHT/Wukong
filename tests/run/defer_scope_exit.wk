@@ -1,0 +1,154 @@
+// RUN: --run
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 200
+// EXPECT-OUT: 100
+// EXPECT-OUT: 7
+// EXPECT-OUT: 300
+// EXPECT-OUT: 100
+// EXPECT-OUT: 8
+// EXPECT-OUT: 5
+// EXPECT-OUT: 11
+// EXPECT-OUT: 22
+// EXPECT-OUT: 42
+// EXPECT-OUT: 3
+// EXPECT-OUT: 200
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 10
+// EXPECT-EXIT: 0
+module defer_scope_exit
+
+// `defer` runs at EVERY exit of its block, in LIFO order, innermost block first (P15.22). It used
+// to be a hard C0001 at lowering. Every expected line is derived by hand from that rule:
+//
+//   order()            1, then the defers LIFO: 2, 3
+//   nested_blocks()    0; inner block exit: 1, 2; function exit: 3, 4
+//   early(true)        return 7 leaves both blocks: 200 (inner) then 100, then main prints 7
+//   early(false)       300, then return 8 leaves the outer block: 100, then 8
+//   value_before()     `return n` is evaluated BEFORE `defer n += 1` runs: 5
+//   tail_value()       tail n*2 = 22 is computed first, then the defer prints n = 11
+//   loops()            i=0: +0, +10 -> 10; i=1: continue, +10 -> 20; i=2: +2, +10 -> 32;
+//                      i=3: break, +10 -> 42
+//   find()             k: 0 -> 1 -> 2; at k == 2, `break k * 100` holds 200, the defer makes k 3:
+//                      prints 3, returns 200
+//   nested_return()    i=0: body exit prints 2; i=1: `return i` runs 2 then 1, returns 1
+//   scratch_sum(4)     the freed buffer is read BEFORE `defer free(buf)` runs: 1+2+3+4 = 10
+
+fn order() {
+    defer print(3);
+    defer print(2);
+    print(1);
+}
+
+fn nested_blocks() {
+    defer print(4);
+    if true {
+        defer print(2);
+        defer print(1);
+        print(0);
+    }
+    defer print(3);
+}
+
+fn early(flag: bool) -> i32 {
+    defer print(100);
+    if flag {
+        defer print(200);
+        return 7;
+    }
+    print(300);
+    return 8;
+}
+
+fn value_before() -> i32 {
+    let mut n = 5;
+    defer n += 1;
+    return n;
+}
+
+fn tail_value() -> i32 {
+    let mut n = 10;
+    defer print(n);
+    n = n + 1;
+    n * 2
+}
+
+fn loops() -> i32 {
+    let mut total = 0;
+    for i in 0..4 {
+        defer total += 10;
+        if i == 1 {
+            continue;
+        }
+        if i == 3 {
+            break;
+        }
+        total += i;
+    }
+    return total;
+}
+
+fn find() -> i32 {
+    let mut k = 0;
+    let r = loop {
+        defer k += 1;
+        if k == 2 {
+            break k * 100;
+        }
+    };
+    print(k);
+    return r;
+}
+
+fn nested_return() -> i32 {
+    defer print(1);
+    let mut i = 0;
+    while i < 10 {
+        defer print(2);
+        if i == 1 {
+            return i;
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+fn scratch_sum(n: i64) -> i32 {
+    let mut buf: []f32 = alloc_f32(n);
+    defer free(buf);
+    let mut i: i64 = 0i64;
+    while i < n {
+        buf[i] = (i + 1i64) as f32;
+        i = i + 1i64;
+    }
+    let mut s: f32 = 0.0;
+    let mut j: i64 = 0i64;
+    while j < n {
+        s = s + buf[j];
+        j = j + 1i64;
+    }
+    return s as i32;
+}
+
+fn main() -> i32 {
+    order();
+    nested_blocks();
+    print(early(true));
+    print(early(false));
+    print(value_before());
+    print(tail_value());
+    print(loops());
+    print(find());
+    print(nested_return());
+    print(scratch_sum(4i64));
+    return 0;
+}
