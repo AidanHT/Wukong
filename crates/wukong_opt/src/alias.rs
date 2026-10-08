@@ -367,6 +367,18 @@ impl AliasInfo {
             .filter(|o| *o != UNKNOWN_OFF)
     }
 
+    /// The base object `v` points into and its constant byte offset from that base's start, when
+    /// both are known. Two pointers with equal answers address the same byte — the must-alias
+    /// question `Dse` and `Licm` ask to match one location spelled by two different `gep`s. (Like
+    /// the rest of this analysis it measures offsets in native bytes, so it shares the assumption
+    /// that one object is not addressed with two different element strides.)
+    pub fn base_and_offset(&self, v: ValueId) -> Option<(Prov, i64)> {
+        match self.prov(v) {
+            Prov::Unknown => None,
+            p => self.offset_of(v).map(|o| (p, o)),
+        }
+    }
+
     /// Does the address of this `alloca` leave the set of uses we can see? A non-escaping slot is
     /// unreachable through any `Unknown` pointer and cannot be written by a callee. An id we hold no
     /// fact for answers "escaped" — the conservative direction.

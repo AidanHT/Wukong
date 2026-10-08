@@ -1,0 +1,127 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 19
+// EXPECT-OUT: 7
+// EXPECT-OUT: 7
+// EXPECT-OUT: 23
+// EXPECT-OUT: 39
+// EXPECT-OUT: 55
+// EXPECT-OUT: 124
+// EXPECT-OUT: 60
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1002
+// EXPECT-OUT: 2002
+// EXPECT-OUT: 56
+module tests.run.memory_opt_loops
+
+// Loops whose memory traffic the -O2 memory passes remove, each checked against the scalar
+// semantics on both the taken and the zero-trip path:
+//   accumulate   - `out[0]` read and written every iteration: kept in a register by `promote`,
+//                  under the first-iteration guard when `n` is a parameter (n = 0 must leave 7).
+//   blocked_rows - `acc[j]` with `j` fixed in a constant-trip inner loop: promoted with no guard.
+//   scale_sum    - `w[0]`/`w[1]` reloaded every iteration of a loop that writes nothing: hoisted by
+//                  `licm` behind the guard (n = 0 must return 0).
+//   pick         - a struct field written, then overwritten on both arms of an `if`: the first
+//                  store is dead along every path.
+//   scratch      - a scratch array whose reads CSE forwards, so its fill loop and its stores die
+//                  and `loop-delete` removes the emptied fill loop.
+//
+// Expected values (all exact in f32):
+//   accumulate: 5 + (0 + 1 + 4 + 9) = 19, and 7 untouched by zero trips
+//   blocked_rows: m[t] = t/4, row j sums 8j..8j+7 -> 16j + 7 = 7 23 39 55, total 124
+//   scale_sum: sum over q in 0..8 of 2q + 0.5 = 60, and 0 for zero trips
+//   pick: 10*100 + 2 = 1002 and 20*100 + 2 = 2002
+//   scratch: sum over q in 0..8 of 2q = 56
+
+struct Pair { lo: i64, hi: i64 }
+
+fn accumulate(mut out: [i64; 1], n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        out[0] = out[0] + i * i;
+        i = i + 1;
+    }
+}
+
+fn blocked_rows(m: [f32; 32]) -> f32 {
+    let mut acc: [f32; 4] = [0.0; 4];
+    let mut j: i64 = 0;
+    while j < 4 {
+        let mut k: i64 = 0;
+        while k < 8 {
+            acc[j] = acc[j] + m[8 * j + k];
+            k = k + 1;
+        }
+        j = j + 1;
+    }
+    print(acc[0]);
+    print(acc[1]);
+    print(acc[2]);
+    print(acc[3]);
+    return acc[0] + acc[1] + acc[2] + acc[3];
+}
+
+fn scale_sum(w: [f32; 2], v: [f32; 8], n: i64) -> f32 {
+    let mut s: f32 = 0.0;
+    let mut i: i64 = 0;
+    while i < n {
+        s = s + v[i] * w[0] + w[1];
+        i = i + 1;
+    }
+    return s;
+}
+
+fn pick(c: i64) -> i64 {
+    let mut p: Pair = Pair { lo: 1, hi: 2 };
+    if c > 0 {
+        p.lo = 10;
+    } else {
+        p.lo = 20;
+    }
+    return p.lo * 100 + p.hi;
+}
+
+fn scratch(x: [f32; 8]) -> f32 {
+    let mut t: [f32; 64] = [0.0; 64];
+    let mut s: f32 = 0.0;
+    let mut i: i64 = 0;
+    while i < 8 {
+        t[i] = x[i] * 2.0;
+        s = s + t[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() -> i32 {
+    let mut o: [i64; 1] = [5];
+    accumulate(o, 4);
+    print(o[0]);
+    let mut z: [i64; 1] = [7];
+    accumulate(z, 0);
+    print(z[0]);
+
+    let mut m: [f32; 32] = [0.0; 32];
+    let mut t: i64 = 0;
+    while t < 32 {
+        m[t] = (t as f32) * 0.25;
+        t = t + 1;
+    }
+    print(blocked_rows(m));
+
+    let w: [f32; 2] = [2.0, 0.5];
+    let mut v: [f32; 8] = [0.0; 8];
+    let mut q: i64 = 0;
+    while q < 8 {
+        v[q] = q as f32;
+        q = q + 1;
+    }
+    print(scale_sum(w, v, 8));
+    print(scale_sum(w, v, 0));
+
+    print(pick(1));
+    print(pick(-1));
+
+    print(scratch(v));
+    return 0;
+}

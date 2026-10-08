@@ -246,6 +246,7 @@ matmul_fn_declined_shape.wk:
 matmul_memacc.wk: wukong_sgemm wukong_sgemm_nt
 matmul_tn.wk: wukong_sgemm_tn wukong_sgemm_tn*2
 maxpool.wk: wukong_maxpool2d_f32
+memory_opt_loops.wk:
 mish.wk: wukong_vmath_f32
 mixed_sign_compare_highbit.wk:
 mixed_sign_compare_ok.wk:
@@ -336,6 +337,7 @@ softmax_fused.wk: wukong_norm_f32 wukong_norm_f32*2
 softplus.wk: wukong_vmath_f32
 softsign_logsigmoid.wk: wukong_vmath_f32
 sret_diverging_arms.wk:
+sroa_aggregate_locals.wk:
 string_literal.wk:
 string_return.wk:
 struct.wk:

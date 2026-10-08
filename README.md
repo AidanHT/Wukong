@@ -83,8 +83,9 @@ not duplicate them. In summary, Wukong:
   **register-blocked, cache-tiled, packed AVX2/FMA GEMM microkernel**. It also **auto-vectorizes**
   elementwise loops (incl. branchy ones via if-conversion) and **reductions** to SIMD, contracts
   `x + y*z` to a **fused multiply-add**, **fuses** adjacent elementwise loops, and
-  **auto-parallelizes** `@parallel` loops across cores. Underneath, an SSA optimizer (inlining, mem2reg,
-  const-fold, CSE, DSE, DCE, LICM, loop unrolling) runs at `-O1` and above. Op-graph fusion across
+  **auto-parallelizes** `@parallel` loops across cores. Underneath, an SSA optimizer (inlining, SROA,
+  mem2reg, const-fold, CSE, DSE, DCE, loop deletion, LICM, scalar promotion, loop unrolling) runs at
+  `-O1` and above. Op-graph fusion across
   tensor ops is still planned **as a CPU MIR pass**; on GPU, `wukong_codegen_gpu`'s fusion planner and
   `--backend=gpu-native` can compile an eligible whole program into a cooperative megakernel. These
   recognizers are invisible to the user — you still write the loop nest in `.wk`.
@@ -187,7 +188,8 @@ source.wk
 Wukong IR (MIR)         one block-parameter SSA IR; mir_build emits it scalar-and-low directly —
    │                    there is no second level (`--emit=mir-high` means MIR *before* the
    │                    optimizer, not a different IR level)
-   │  optimization passes (mem2reg → SSA, const-fold, CSE, DSE, DCE, LICM, simplify-cfg;
+   │  optimization passes (SROA + mem2reg → SSA, const-fold, CSE, DSE, DCE, loop deletion,
+   │                       LICM, scalar promotion, simplify-cfg;
    │                       inlining; partial loop unrolling (-O2, never reassociating); op-graph fusion across tensor ops is planned on the CPU path;
    │                       the GPU backend has it — see below)
    ▼

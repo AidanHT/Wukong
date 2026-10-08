@@ -1,0 +1,87 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 24
+// EXPECT-OUT: 28
+// EXPECT-OUT: 32
+// EXPECT-OUT: 36
+// EXPECT-OUT: 120
+// EXPECT-OUT: 11.5
+// EXPECT-OUT: 23
+// EXPECT-OUT: 55
+// EXPECT-OUT: 89
+// EXPECT-OUT: 1132
+module tests.run.sroa_aggregate_locals
+
+// Aggregate locals updated in hot loops: a register-blocked `[f32; 4]` accumulator, a struct whose
+// fields are read and conditionally rewritten every iteration, a tuple carried through a
+// self-referential assignment, and a `[]f32` view whose fat pointer is re-read at every subscript.
+// At -O2 scalar replacement splits each constant-indexed slot into scalar leaves and mem2reg
+// promotes them, so these loops carry their state in registers instead of through the stack; the
+// differential gates hold that to the -O0 answer on both backends.
+//
+// Every expected value comes from the scalar semantics, with x[k] = 0.5k - 4 for k in 0..32
+// (-4, -3.5, ..., 11.5), all exact in f32:
+//   acc[j]  = sum over i in 0..8 of x[4i + j] = 2*28 + 8*(0.5j - 4) = 24 + 4j  -> 24 28 32 36
+//   s.sum   = 0.5*496 - 4*32 = 120;  s.max = x[31] = 11.5;  s.count = #{k > 8} = 23
+//   t       = Fibonacci pair after 10 steps from (0, 1) = (55, 89)
+//   dot     = sum of x[k]^2 = 0.25*10416 - 4*496 + 16*32 = 1132
+
+struct Stats { sum: f32, max: f32, count: i32 }
+
+fn main() -> i32 {
+    let mut x: [f32; 32] = [0.0; 32];
+    let mut k: i64 = 0;
+    while k < 32 {
+        x[k] = (k as f32) * 0.5 - 4.0;
+        k = k + 1;
+    }
+
+    let mut acc: [f32; 4] = [0.0; 4];
+    let mut i: i64 = 0;
+    while i < 8 {
+        acc[0] = acc[0] + x[4 * i];
+        acc[1] = acc[1] + x[4 * i + 1];
+        acc[2] = acc[2] + x[4 * i + 2];
+        acc[3] = acc[3] + x[4 * i + 3];
+        i = i + 1;
+    }
+    print(acc[0]);
+    print(acc[1]);
+    print(acc[2]);
+    print(acc[3]);
+
+    let mut s: Stats = Stats { sum: 0.0, max: -100.0, count: 0 };
+    let mut j: i64 = 0;
+    while j < 32 {
+        s.sum = s.sum + x[j];
+        if x[j] > s.max {
+            s.max = x[j];
+        }
+        if x[j] > 0.0 {
+            s.count = s.count + 1;
+        }
+        j = j + 1;
+    }
+    print(s.sum);
+    print(s.max);
+    print(s.count);
+
+    let mut t: (i64, i64) = (0, 1);
+    let mut r: i32 = 0;
+    while r < 10 {
+        t = (t.1, t.0 + t.1);
+        r = r + 1;
+    }
+    print(t.0);
+    print(t.1);
+
+    let v: []f32 = x;
+    let mut dot: f32 = 0.0;
+    let mut m: i64 = 0;
+    while m < 32 {
+        dot = dot + v[m] * v[m];
+        m = m + 1;
+    }
+    print(dot);
+    return 0;
+}
