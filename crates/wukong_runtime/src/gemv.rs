@@ -195,6 +195,12 @@ unsafe fn gemv_rows(a: *const f32, x: *const f32, y: *mut f32, m: usize, n: usiz
 /// **Aliasing: all operands disjoint** — `y` overlaps neither `a` nor `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sgemv(a: *const f32, x: *const f32, y: *mut f32, m: i64, n: i64) {
+    // P14.5: a valid for m*n, x for n, y for m; y disjoint from a and x (documented all-disjoint).
+    crate::safety::debug_extent_2d(a, m, n);
+    crate::safety::debug_extent(x, n);
+    crate::safety::debug_extent(y, m);
+    crate::safety::debug_disjoint(y, m, a, m.saturating_mul(n));
+    crate::safety::debug_disjoint(y, m, x, n);
     if m <= 0 || n <= 0 {
         return;
     }

@@ -217,6 +217,11 @@ pub unsafe extern "C" fn wukong_bias_bcast_f32(
     cols: i64,
     op: i64,
 ) {
+    // P14.5: x/out valid for rows*cols, b for cols; `b` must not overlap `out` (out may be x in place).
+    crate::safety::debug_extent_2d(x, rows, cols);
+    crate::safety::debug_extent_2d(out, rows, cols);
+    crate::safety::debug_extent(b, cols);
+    crate::safety::debug_disjoint(out, rows.saturating_mul(cols), b, cols);
     if rows <= 0 || cols <= 0 {
         return;
     }

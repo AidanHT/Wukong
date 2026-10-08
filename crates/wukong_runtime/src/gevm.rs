@@ -156,6 +156,12 @@ pub unsafe extern "C" fn wukong_sgevm_f32(
     cols: i64,
     alpha: f32,
 ) {
+    // P14.5: w valid for rows, a for rows*cols, out for cols; out disjoint from w and a (documented).
+    crate::safety::debug_extent(w, rows);
+    crate::safety::debug_extent_2d(a, rows, cols);
+    crate::safety::debug_extent(out, cols);
+    crate::safety::debug_disjoint(out, cols, w, rows);
+    crate::safety::debug_disjoint(out, cols, a, rows.saturating_mul(cols));
     if rows <= 0 || cols <= 0 {
         return;
     }

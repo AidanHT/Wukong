@@ -468,6 +468,15 @@ pub unsafe extern "C" fn wukong_transpose_f32(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: src valid for rows*cols, dst for cols*rows, disjoint (documented all-disjoint).
+    crate::safety::debug_extent_2d(src, rows, cols);
+    crate::safety::debug_extent_2d(dst, rows, cols);
+    crate::safety::debug_disjoint(
+        dst,
+        rows.saturating_mul(cols),
+        src,
+        rows.saturating_mul(cols),
+    );
     if rows <= 0 || cols <= 0 {
         return;
     }

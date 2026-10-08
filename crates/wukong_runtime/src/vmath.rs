@@ -1042,6 +1042,9 @@ unsafe fn vmath_scalar(x: *const f32, out: *mut f32, n: usize, op: i64) {
 /// is not the elementwise source loop.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_vmath_f32(x: *const f32, out: *mut f32, n: i64, op: i64) {
+    // P14.5: both buffers valid for `n` f32 (in-place `out == x` is permitted, so no disjointness).
+    crate::safety::debug_extent(x, n);
+    crate::safety::debug_extent(out, n);
     if n <= 0 {
         return;
     }
@@ -1972,6 +1975,10 @@ pub unsafe extern "C" fn wukong_vmath2_f32(
     n: i64,
     op: i64,
 ) {
+    // P14.5: all three buffers valid for `n` f32 (in-place aliasing permitted, so no disjointness).
+    crate::safety::debug_extent(x, n);
+    crate::safety::debug_extent(y, n);
+    crate::safety::debug_extent(out, n);
     if n <= 0 {
         return;
     }
