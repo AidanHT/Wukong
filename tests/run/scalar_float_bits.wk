@@ -1,0 +1,190 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1065353216
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 4591870180066957722
+// EXPECT-OUT: 15872
+// EXPECT-OUT: 31743
+// EXPECT-OUT: 1
+// EXPECT-OUT: 49152
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 4290773283
+// EXPECT-OUT: 9221120237041090561
+// EXPECT-OUT: 32257
+// EXPECT-OUT: 32705
+// EXPECT-OUT: 16256
+// EXPECT-OUT: 1051369472
+// EXPECT-OUT: 864026624
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 101
+// EXPECT-OUT: 11
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 11
+// EXPECT-OUT: 3225419776
+// EXPECT-OUT: 4612811918334230528
+// EXPECT-OUT: 4290772992
+// EXPECT-OUT: 3
+// EXPECT-OUT: -5
+// EXPECT-OUT: 200
+// EXPECT-OUT: 1065353216
+// EXPECT-OUT: 2143289344
+// EXPECT-OUT: 679477248
+// EXPECT-OUT: 4138808057553485824
+// EXPECT-OUT: 1149239296
+// EXPECT-OUT: 768
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 4286578688
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 1
+// EXPECT-OUT: 9218868437227405312
+// EXPECT-OUT: 1
+// EXPECT-OUT: 9214364837600034816
+// EXPECT-OUT: 207672404131694752
+// EXPECT-OUT: 1
+// EXPECT-OUT: 768
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1056964608
+// EXPECT-OUT: 4
+// EXPECT-OUT: 1056964608
+// EXPECT-OUT: -148
+// EXPECT-OUT: 3208642560
+// EXPECT-OUT: 0
+// EXPECT-OUT: 4286578688
+// EXPECT-OUT: 0
+// EXPECT-OUT: 4604900092640523676
+// EXPECT-OUT: 997
+// EXPECT-OUT: 4602678819172646912
+// EXPECT-OUT: -1073
+// EXPECT-OUT: 14848
+// EXPECT-OUT: 0
+module tests.run.scalar_float_bits
+
+// Float bit access and classification, `clamp`, the explicit single-rounding `fma`, `ldexp` and
+// `frexp`, at every float width. Every result prints as an integer — a float through `bits`, a
+// bool through `as i32` — so each line is exact and independent of float formatting. Points that
+// matter: a signaling NaN built by `*_from_bits` comes back quiet with its payload (the
+// interpreter cannot hold a signaling f32, so the builtins define that boundary); `fma` rounds once
+// where the separate product would have cancelled to 0; `ldexp` rounds once, to even, into the
+// subnormals and to infinity (and an unsigned 64-bit count is a huge positive one); `frexp` scales
+// subnormals up first. Each expected value was derived from the IEEE-754 encodings with Python's
+// `struct`/`numpy` (`np.ldexp` and `math.frexp` for the reference results), never recorded from the
+// compiler.
+fn flags(x: f32) -> i32 {
+    return (isnan(x) as i32) * 1000 + (isinf(x) as i32) * 100 + (isfinite(x) as i32) * 10 +
+        (signbit(x) as i32);
+}
+
+fn main() -> i32 {
+    let one: f32 = 1.0;
+    let nz: f32 = -0.0;
+    let tenth: f64 = 0.1;
+    let h: f16 = 1.5;
+    let hmax: f16 = 65504.0;
+    let hsub: f16 = 0.000000059604645;
+    let bneg: bf16 = -2.0;
+    print(bits(one));
+    print(bits(nz));
+    print(bits(tenth));
+    print(bits(h));
+    print(bits(hmax));
+    print(bits(hsub)); // 2^-24, the least f16 subnormal
+    print(bits(bneg));
+
+    print(bits(f32_from_bits(0x7f800001))); // signaling: comes back 0x7fc00001
+    print(bits(f32_from_bits(0xffc00123))); // quiet: exact
+    print(bits(f64_from_bits(0x7ff0000000000001))); // signaling: 0x7ff8000000000001
+    print(bits(f16_from_bits(0x7c01))); // signaling: 0x7e01
+    print(bits(bf16_from_bits(0x7f81))); // signaling: 0x7fc1
+    print(bits(bf16_from_bits(0x3f80))); // 1.0
+    print(bits(f16_from_bits(0x3555) as f32)); // 0.333251953125
+    print(bits(f16_from_bits(0x0001) as f32)); // 2^-24
+    print(bits(f16_from_bits(0x8000) as f32)); // -0.0
+
+    // isnan isinf isfinite signbit, one digit each.
+    let nan: f32 = f32_from_bits(0x7fc00000);
+    let ninf: f32 = f32_from_bits(0xff800000);
+    print(flags(nan)); // 1000
+    print(flags(ninf)); // 0101
+    print(flags(nz)); // 0011
+    print(flags(one)); // 0010
+    let big: f64 = 1.7976931348623157e308;
+    print((isfinite(big) as i32) * 10 + (signbit(-big) as i32)); // 11
+    let hn: f16 = f16_from_bits(0xfc00);
+    print((isinf(hn) as i32) * 10 + (signbit(hn) as i32)); // 11
+
+    let three: f32 = 3.0;
+    let m25: f64 = -2.5;
+    print(bits(copysign(three, nz))); // -3.0
+    print(bits(copysign(m25, 1.0))); // 2.5
+    print(bits(copysign(nan, -1.0))); // the NaN, negative
+
+    let i5: i32 = 5;
+    let im7: i64 = -7;
+    let u250: u8 = 250;
+    let x15: f32 = 1.5;
+    print(clamp(i5, 0, 3));
+    print(clamp(im7, -5, 5));
+    print(clamp(u250, 10, 200));
+    print(bits(clamp(x15, 0.0, 1.0)));
+    print(bits(clamp(nan, 0.0, 1.0))); // a NaN passes through
+
+    // (1 + 2^-23)^2 - (1 + 2^-22) = 2^-46 exactly; rounding the product first would give 0.
+    let fa: f32 = f32_from_bits(0x3f800001);
+    let fc: f32 = f32_from_bits(0xbf800002);
+    print(bits(fma(fa, fa, fc))); // 2^-46
+    let da: f64 = f64_from_bits(0x3ff0000000000001);
+    let dc: f64 = f64_from_bits(0xbff0000000000002);
+    print(bits(fma(da, da, dc))); // 2^-104
+
+    print(bits(ldexp(one, 10))); // 1024
+    print(bits(ldexp(x15, -140))); // 768 * 2^-149, exact
+    print(bits(ldexp(one, -150))); // half the least subnormal: ties to even, 0
+    print(bits(ldexp(three, -150))); // 1.5 least subnormals: ties to even, 2
+    print(bits(ldexp(one, 128))); // +inf
+    let neg1: f32 = -1.0;
+    print(bits(ldexp(neg1, 300000))); // -inf
+    let umax: u64 = 18446744073709551615;
+    print(bits(ldexp(one, umax))); // +inf: a huge positive count
+    let d1: f64 = 1.0;
+    let d75: f64 = 0.75;
+    let d3: f64 = 3.0;
+    let dbig: f64 = 1e308;
+    print(bits(ldexp(d1, -1074))); // the least subnormal
+    print(bits(ldexp(d1, 1024))); // +inf
+    print(bits(ldexp(d75, -1074))); // rounds up to the least subnormal
+    print(bits(ldexp(f64_from_bits(1), 2097))); // 2^1023, through two prescales
+    print(bits(ldexp(dbig, -2000)));
+    print(bits(ldexp(d3, -1076))); // 0.75 of the least subnormal: rounds up
+    print(bits(ldexp(h, -15))); // an f16 subnormal, exact
+    print(bits(ldexp(h, -25))); // 0.75 of the least f16 subnormal: rounds up
+
+    let eight: f32 = 8.0;
+    let fr1 = frexp(eight);
+    print(bits(fr1.0));
+    print(fr1.1);
+    let fr2 = frexp(f32_from_bits(1)); // the least f32 subnormal: 0.5 * 2^-148
+    print(bits(fr2.0));
+    print(fr2.1);
+    let fr3 = frexp(-0.75);
+    print(bits(fr3.0));
+    print(fr3.1);
+    let fr4 = frexp(ninf); // (x, 0)
+    print(bits(fr4.0));
+    print(fr4.1);
+    let e300: f64 = 1e300;
+    let fr5 = frexp(e300);
+    print(bits(fr5.0));
+    print(fr5.1);
+    let fr6 = frexp(f64_from_bits(1)); // 0.5 * 2^-1073
+    print(bits(fr6.0));
+    print(fr6.1);
+    let hq: f16 = 0.75;
+    let fr7 = frexp(hq);
+    print(bits(fr7.0));
+    print(fr7.1);
+    return 0;
+}

@@ -1173,8 +1173,55 @@ float wukong_rt_trig_f32(float x, long long op) {
 // as constants). This uses the host libm, so unlike the rustc-driven link — which resolves the
 // symbols out of the runtime rlib and is therefore bit-identical to the oracle — a C-fallback exe
 // may differ from `--run` in the last ULP; the fallback already cannot print floats at all, so this
-// is not a new divergence class. Unknown op codes are the identity, matching the Rust entry.
+// is not a new divergence class. Unknown op codes are the identity, matching the Rust entry. The
+// library-only codes 100..=103 (`wukong_runtime::special`: erfc, erfinv, lgamma, digamma) map to C99
+// `erfc`/`lgamma` and to C ports of the runtime's `erfinv`/`digamma` algorithms on the host libm.
 const WUKONG_MATH64_C: &str = r#"
+static double wk_erfinv(double y) {
+    static const double p1[9] = {2.81022636e-08, 3.43273939e-07, -3.5233877e-06, -4.39150654e-06,
+        0.00021858087, -0.00125372503, -0.00417768164, 0.246640727, 1.50140941};
+    static const double p2[9] = {-0.000200214257, 0.000100950558, 0.00134934322, -0.00367342844,
+        0.00573950773, -0.0076224613, 0.00943887047, 1.00167406, 2.83297682};
+    if (y != y) return y;
+    double a = fabs(y);
+    if (a > 1.0) return NAN;
+    if (a == 1.0) return y > 0.0 ? INFINITY : -INFINITY;
+    if (a < 7.450580596923828e-09) return y * 0.886226925452758;
+    double w = -log((1.0 - a) * (1.0 + a));
+    const double* c = w < 5.0 ? p1 : p2;
+    double t = w < 5.0 ? w - 2.5 : sqrt(w) - 3.0;
+    double p = c[0];
+    for (int i = 1; i < 9; i++) p = c[i] + p * t;
+    double x = p * a;
+    if (a <= 0.5) {
+        for (int i = 0; i < 2; i++) {
+            double d = (erf(x) - a) / (1.1283791670955126 * exp(-x * x));
+            x -= d / (1.0 + x * d);
+        }
+    } else {
+        double q = 1.0 - a;
+        for (int i = 0; i < 4; i++) {
+            double e = erfc(x);
+            x += log(e / q) * e / (1.1283791670955126 * exp(-x * x));
+        }
+    }
+    return y < 0.0 ? -x : x;
+}
+static double wk_digamma(double x) {
+    if (x != x || x == INFINITY) return x;
+    if (x == -INFINITY) return NAN;
+    double r = 0.0;
+    if (x <= 0.0) {
+        if (x == floor(x)) return NAN;
+        r = -3.141592653589793 / tan(3.141592653589793 * (x - floor(x + 0.5)));
+        x = 1.0 - x;
+    }
+    while (x < 12.0) { r -= 1.0 / x; x += 1.0; }
+    double t = 1.0 / (x * x);
+    double s = 1.0 / 12.0 - t * (1.0 / 120.0 - t * (1.0 / 252.0 - t * (1.0 / 240.0
+        - t * (1.0 / 132.0 - t * (691.0 / 32760.0 - t * (1.0 / 12.0))))));
+    return r + (log(x) - 0.5 / x - s * t);
+}
 double wukong_rt_math_f64(double x, long long op) {
     switch (op) {
         case 0: return exp(x);
@@ -1199,6 +1246,10 @@ double wukong_rt_math_f64(double x, long long op) {
         case 33: return asin(x);
         case 34: return acos(x);
         case 35: return cbrt(x);
+        case 100: return erfc(x);
+        case 101: return wk_erfinv(x);
+        case 102: return lgamma(x);
+        case 103: return wk_digamma(x);
         default: return x;
     }
 }

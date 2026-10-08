@@ -1716,28 +1716,29 @@ fn differential_int_math_intrinsics() {
     }
 }
 
-/// `fmax`/`fmin` on integer *variables*. Like `sqrt`/`exp`/`pow`, they promote an int operand to
-/// `f32` (the float compare-and-select). Previously their lowering used a bare `lower_expr` (no
-/// coercion), so the float `Cmp(Fogt/Folt)` ran on an `i32` operand: MIR the verifier and Cranelift
-/// reject on native, while the interpreter computed an integer max and returned silently — a backend
-/// divergence on `fmax(int, int)`. Pins native==interp at every `-O`; the float forms are unchanged.
+/// `fmax`/`fmin` and their integer counterparts. An integer *variable* operand of `fmax`/`fmin` is
+/// now the compile error `E0445` (it used to be converted to `f32`, rounding integers above 2^24);
+/// the type-preserving `max`/`min` are the integer spelling, pinned here native==interp at every
+/// `-O`. An integer *literal* still converts — that coercion is what once ran a float `Cmp` on an
+/// `i32` operand (verifier-rejected MIR on native, a silent integer max in the interpreter) — and
+/// the float forms are unchanged.
 #[test]
 fn differential_fmax_fmin_int() {
     let cases = [
         (
-            "fn main() -> i32 { let a: i32 = 5; let b: i32 = 3; return fmax(a, b) as i32; }",
+            "fn main() -> i32 { let a: i32 = 5; let b: i32 = 3; return max(a, b); }",
             5,
         ),
         (
-            "fn main() -> i32 { let a: i32 = 5; let b: i32 = 3; return fmin(a, b) as i32; }",
+            "fn main() -> i32 { let a: i32 = 5; let b: i32 = 3; return min(a, b); }",
             3,
         ),
         (
-            "fn main() -> i32 { let a: i32 = -7; let b: i32 = 2; return fmax(a, b) as i32; }",
+            "fn main() -> i32 { let a: i32 = -7; let b: i32 = 2; return max(a, b); }",
             2,
         ),
         (
-            "fn main() -> i32 { let a: i32 = -7; let b: i32 = 2; return fmin(a, b) as i32; }",
+            "fn main() -> i32 { let a: i32 = -7; let b: i32 = 2; return min(a, b); }",
             -7,
         ),
         // float forms unchanged (the operands were already f32).
@@ -6657,4 +6658,113 @@ fn int_unary_matches_its_definition_on_every_width() {
     assert_eq!(oracle, (0, expected.clone().into_bytes()), "interpreter");
     let native = crate::jit_run(&program, main_name, &interner).unwrap();
     assert_eq!(native, (0, expected.into_bytes()), "native");
+}
+
+/// The FP8 builtins lower to plain integer MIR, so their only oracle is the runtime's reference
+/// codecs (`wukong_runtime::fp8`, written differently on purpose: decode by formula, encode by
+/// exact `f64` scaling and an explicit round-half-to-even). Native and the interpreter must both
+/// match it, at `-O0` and `-O2`, on all 256 codes of both formats, on every midpoint between
+/// neighbouring codes (and one `f32` ULP either side, and its negation), and on 4096 bit patterns
+/// spread over the whole `f32` range (signs, subnormals, infinities and NaNs included).
+#[test]
+fn fp8_builtins_match_the_runtime_reference() {
+    use wukong_runtime::fp8;
+    let src = "fn main() -> i32 { \
+        let mut i: i32 = 0; \
+        while i < 256 { \
+            let c: u8 = i as u8; \
+            print(bits(f8e4m3_to_f32(c))); \
+            print(bits(f8e5m2_to_f32(c))); \
+            i = i + 1; \
+        } \
+        let mut c: i32 = 0; \
+        while c < 126 { \
+            let lo: f32 = f8e4m3_to_f32(c as u8); \
+            let hi: f32 = f8e4m3_to_f32((c + 1) as u8); \
+            let mid: f32 = (lo + hi) / 2.0; \
+            print(f32_to_f8e4m3(mid)); \
+            print(f32_to_f8e4m3(f32_from_bits(bits(mid) - 1))); \
+            print(f32_to_f8e4m3(f32_from_bits(bits(mid) + 1))); \
+            print(f32_to_f8e4m3(-mid)); \
+            c = c + 1; \
+        } \
+        c = 0; \
+        while c < 123 { \
+            let lo: f32 = f8e5m2_to_f32(c as u8); \
+            let hi: f32 = f8e5m2_to_f32((c + 1) as u8); \
+            let mid: f32 = (lo + hi) / 2.0; \
+            print(f32_to_f8e5m2(mid)); \
+            print(f32_to_f8e5m2(f32_from_bits(bits(mid) - 1))); \
+            print(f32_to_f8e5m2(f32_from_bits(bits(mid) + 1))); \
+            print(f32_to_f8e5m2(-mid)); \
+            c = c + 1; \
+        } \
+        let mut k: u32 = 0; \
+        while k < 4096 { \
+            let x: f32 = f32_from_bits(k * 1048573); \
+            print(f32_to_f8e4m3(x)); \
+            print(f32_to_f8e5m2(x)); \
+            k = k + 1; \
+        } \
+        return 0; }";
+
+    let mut want = String::new();
+    for c in 0u8..=255 {
+        want.push_str(&format!("{}\n", fp8::f8e4m3_to_f32(c).to_bits()));
+        want.push_str(&format!("{}\n", fp8::f8e5m2_to_f32(c).to_bits()));
+    }
+    type Codec = (fn(u8) -> f32, fn(f32) -> u8, u8);
+    let codecs: [Codec; 2] = [
+        (fp8::f8e4m3_to_f32, fp8::f32_to_f8e4m3, 126),
+        (fp8::f8e5m2_to_f32, fp8::f32_to_f8e5m2, 123),
+    ];
+    for (dec, enc, top) in codecs {
+        for c in 0..top {
+            let mid = (dec(c) + dec(c + 1)) / 2.0;
+            for x in [
+                mid,
+                f32::from_bits(mid.to_bits() - 1),
+                f32::from_bits(mid.to_bits() + 1),
+                -mid,
+            ] {
+                want.push_str(&format!("{}\n", enc(x)));
+            }
+        }
+    }
+    for k in 0u32..4096 {
+        // `f32_from_bits` quiets a signaling NaN (the encoders map every NaN to the same code).
+        let b = k.wrapping_mul(1048573);
+        let quiet = (b & 0x7fc0_0000) == 0x7f80_0000 && (b & 0x003f_ffff) != 0;
+        let x = f32::from_bits(if quiet { b | 0x0040_0000 } else { b });
+        want.push_str(&format!("{}\n", fp8::f32_to_f8e4m3(x)));
+        want.push_str(&format!("{}\n", fp8::f32_to_f8e5m2(x)));
+    }
+
+    for opt in [0u8, 2] {
+        let oracle = interp(src, opt).expect("interp");
+        assert_eq!(oracle.0, 0, "interp exit at -O{opt}");
+        let got = String::from_utf8(oracle.1).unwrap();
+        assert!(
+            got == want,
+            "interp disagrees with the fp8 reference at -O{opt}: {}",
+            first_line_diff(&got, &want)
+        );
+        let native = jit(src, opt).expect("jit");
+        assert_eq!(native.0, 0, "native exit at -O{opt}");
+        let got = String::from_utf8(native.1).unwrap();
+        assert!(
+            got == want,
+            "native disagrees with the fp8 reference at -O{opt}: {}",
+            first_line_diff(&got, &want)
+        );
+    }
+}
+
+/// The first line where two outputs differ, for a long-output assertion message.
+fn first_line_diff(got: &str, want: &str) -> String {
+    let (g, w): (Vec<&str>, Vec<&str>) = (got.lines().collect(), want.lines().collect());
+    match g.iter().zip(&w).position(|(a, b)| a != b) {
+        Some(i) => format!("line {i}: got {}, want {}", g[i], w[i]),
+        None => format!("{} lines vs {} expected", g.len(), w.len()),
+    }
 }

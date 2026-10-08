@@ -15,7 +15,8 @@
 //! exact `f64` scaling and an explicit round-half-to-even, then a table lookup of the code.
 //!
 //! **Semantics** (those of `ml_dtypes` / PyTorch, with Transformer Engine's saturation for E4M3):
-//! * decoding is exact; a NaN decodes to the quiet `f32` NaN with the code's sign;
+//! * decoding is exact; an E4M3FN NaN decodes to the quiet `f32` NaN with the code's sign, an
+//!   E5M2 NaN as its `f16` would (the quiet bit set, the payload kept);
 //! * encoding rounds to nearest, ties to even, with subnormals;
 //! * `E4M3FN` has no infinity, so it **saturates**: a finite value beyond ±448 and ±∞ encode as
 //!   ±448 (`0x7E`/`0xFE`), and a NaN as `0x7F`/`0xFF`;
@@ -79,19 +80,20 @@ fn decode(b: u8, f: Format) -> Option<f64> {
     Some(sign * mag)
 }
 
-/// The quiet `f32` NaN carrying the sign of code `b`.
-fn nan_of(b: u8) -> f32 {
-    f32::from_bits((u32::from(b & 0x80) << 24) | 0x7fc0_0000)
+/// The quiet `f32` NaN carrying the sign of code `b` and the `payload` bits below the quiet bit.
+fn nan_of(b: u8, payload: u32) -> f32 {
+    f32::from_bits((u32::from(b & 0x80) << 24) | 0x7fc0_0000 | payload)
 }
 
 /// E4M3FN to `f32` (exact).
 pub fn f8e4m3_to_f32(b: u8) -> f32 {
-    decode(b, E4M3).map_or_else(|| nan_of(b), |v| v as f32)
+    decode(b, E4M3).map_or_else(|| nan_of(b, 0), |v| v as f32)
 }
 
-/// E5M2 to `f32` (exact).
+/// E5M2 to `f32` (exact). A NaN keeps its two mantissa bits as payload under the quiet bit,
+/// exactly as decoding the `f16` whose top byte the code is does (`f16` to `f32` widening).
 pub fn f8e5m2_to_f32(b: u8) -> f32 {
-    decode(b, E5M2).map_or_else(|| nan_of(b), |v| v as f32)
+    decode(b, E5M2).map_or_else(|| nan_of(b, u32::from(b & 3) << 21), |v| v as f32)
 }
 
 /// Encode `x` (any `f32`) by round-to-nearest-even of its exact value onto the format's grid.
@@ -178,19 +180,16 @@ mod tests {
     }
 
     /// All 256 E5M2 codes: E5M2 is the top byte of an IEEE `f16`, which is how `ml_dtypes` defines
-    /// it, so every code must decode to `f16::from_bits(code << 8)` (NaNs compared as NaNs).
+    /// it, so every code must decode to exactly `f16::from_bits(code << 8)` — NaN payloads too.
     #[test]
     fn e5m2_decode_exhaustive_matches_f16_top_byte() {
         for c in 0u8..=255 {
             let v = f8e5m2_to_f32(c);
             let h = half::f16::from_bits(u16::from(c) << 8).to_f32();
-            if h.is_nan() {
-                assert!(v.is_nan(), "code {c:#04x}");
-                assert_eq!(v.is_sign_negative(), c & 0x80 != 0, "code {c:#04x}");
-            } else {
-                assert_eq!(bits(v), bits(h), "code {c:#04x}");
-            }
+            assert_eq!(bits(v), bits(h), "code {c:#04x}");
         }
+        assert_eq!(bits(f8e5m2_to_f32(0x7d)), 0x7fe0_0000);
+        assert_eq!(bits(f8e5m2_to_f32(0xfe)), 0xffc0_0000);
         assert_eq!(f8e5m2_to_f32(0x3c), 1.0);
         assert_eq!(f8e5m2_to_f32(0x7b), 57344.0);
         assert_eq!(f8e5m2_to_f32(0x7c), f32::INFINITY);

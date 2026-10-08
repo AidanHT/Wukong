@@ -53,6 +53,10 @@ mod ucount;
 
 // The lowering of the ML builtins `wukong_sema::ml_builtins` types (see the module docs).
 mod ml_builtins;
+// The lowering of the scalar builtins `wukong_sema::scalar_builtins` types (`clamp`, `fma`, the
+// integer bit / saturating / overflow operations, float bits and classification, the special
+// functions, the FP8 conversions).
+mod scalar_builtins;
 
 use std::cell::{Cell, RefCell};
 
@@ -14731,6 +14735,7 @@ impl FnLowerer<'_> {
                         .map(|s| {
                             math_intrinsic(self.interner.resolve(s)).is_some()
                                 || self.is_pure_ml_builtin(s)
+                                || self.is_pure_scalar_builtin(s)
                         })
                         .unwrap_or(false);
                 if !pure_math {
@@ -22132,6 +22137,11 @@ impl FnLowerer<'_> {
                 }
                 // Fused attention `sdpa(...)` lowers to one runtime-kernel call (no S×S scores).
                 if let Some(v) = self.lower_attention(name, args) {
+                    return v;
+                }
+                // The scalar builtins (`scalar_builtins.rs`): `clamp`, `fma`, `popcount`, `bits`,
+                // `isnan`, `ldexp`, `erfc`, `f32_to_f8e4m3`, …
+                if let Some(v) = self.lower_scalar_builtin(name, args, e) {
                     return v;
                 }
                 // `min(a, b)` / `max(a, b)`, integer or float (`minmax.rs`).

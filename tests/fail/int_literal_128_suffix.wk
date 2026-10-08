@@ -1,0 +1,10 @@
+// EXPECT-CODE: E0401
+module tests.fail.int_literal_128_suffix
+
+// The lexer and the literal decoders accept the `u128`/`i128` suffixes, but Wukong has no 128-bit
+// integer type and the literal typer knew neither suffix: `5u128` was silently an unsuffixed `i32`
+// literal that adapted to whatever surrounded it. It is now rejected, naming the widest types.
+fn main() -> i32 {
+    let big: u64 = 5u128;
+    return big as i32;
+}

@@ -57,6 +57,11 @@ use wukong_types::{Dim, Layout, Scalar, Shape, Ty};
 // `wukong_mir_build` lowers exactly the set sema types.
 mod ml_builtins;
 pub use ml_builtins::{io_dtype, io_dtype_code, ml_builtin, ml_builtin_is_pure, MlBuiltin};
+// The scalar builtins (see `scalar_builtins.rs`), likewise shared with `wukong_mir_build`.
+mod scalar_builtins;
+pub use scalar_builtins::{
+    float_bits_type, scalar_builtin, scalar_builtin_arity, widened_int, Fp8, ScalarBuiltin,
+};
 
 /// The element scalar of a typed heap-allocation builtin (`alloc_f32` → `F32`), or `None` for any
 /// other name. The v1 heap surface is this per-scalar `alloc_<T>(n) -> []T` family plus `free(s)`
@@ -3535,7 +3540,21 @@ impl<'a> Sema<'a> {
                 // parse, and used to lower *silently to 0* (both backends agreed on the wrong value,
                 // so the differential gate was blind). Reject it instead of miscompiling.
                 let text = self.sym_str(*s).to_string();
-                if int_literal_well_formed(&text) {
+                // `u128`/`i128` lex and parse as integer suffixes, but Wukong has no 128-bit
+                // integer, and `int_lit_scalar` knew neither: `5u128` became an unsuffixed `i32`
+                // that adapted to whatever was around it. (No hex digit is `i`/`u`, so a literal
+                // ending in one of these is always suffixed.)
+                if text.ends_with("u128") || text.ends_with("i128") {
+                    self.error(
+                        e.span,
+                        "E0401",
+                        format!(
+                            "integer literal `{text}` has a 128-bit suffix, but Wukong has no \
+                             128-bit integer type; the widest are `i64` and `u64`"
+                        ),
+                    );
+                    Ty::Error
+                } else if int_literal_well_formed(&text) {
                     Ty::Scalar(int_lit_scalar(&text))
                 } else {
                     self.error(e.span, "E0401", format!("invalid integer literal `{text}`"));

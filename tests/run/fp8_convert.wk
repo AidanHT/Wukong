@@ -1,0 +1,135 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 989855744
+// EXPECT-OUT: 1012924416
+// EXPECT-OUT: 1015021568
+// EXPECT-OUT: 1065353216
+// EXPECT-OUT: 1066401792
+// EXPECT-OUT: 1138753536
+// EXPECT-OUT: 3286237184
+// EXPECT-OUT: 2143289344
+// EXPECT-OUT: 4290772992
+// EXPECT-OUT: 931135488
+// EXPECT-OUT: 947912704
+// EXPECT-OUT: 1065353216
+// EXPECT-OUT: 1197473792
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 4286578688
+// EXPECT-OUT: 2145386496
+// EXPECT-OUT: 2143289344
+// EXPECT-OUT: 4292870144
+// EXPECT-OUT: 56
+// EXPECT-OUT: 56
+// EXPECT-OUT: 58
+// EXPECT-OUT: 126
+// EXPECT-OUT: 126
+// EXPECT-OUT: 126
+// EXPECT-OUT: 254
+// EXPECT-OUT: 127
+// EXPECT-OUT: 255
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 128
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 119
+// EXPECT-OUT: 120
+// EXPECT-OUT: 60
+// EXPECT-OUT: 124
+// EXPECT-OUT: 123
+// EXPECT-OUT: 124
+// EXPECT-OUT: 126
+// EXPECT-OUT: 252
+// EXPECT-OUT: 0
+// EXPECT-OUT: 63
+// EXPECT-OUT: 64
+// EXPECT-OUT: 7
+module tests.run.fp8_convert
+
+// FP8 storage on `u8`: `f8e4m3_to_f32`/`f8e5m2_to_f32` decode an OCP E4M3FN / E5M2 code exactly,
+// and `f32_to_f8e4m3`/`f32_to_f8e5m2` encode with round-to-nearest-even — E4M3FN saturating to
+// ±448 (it has no infinity; its NaN is 0x7F), E5M2 overflowing to ±inf (its NaN is 0x7E). Decoded
+// values print as their f32 bits. The points: zeros and signs, the least and greatest subnormal,
+// the least normal, 1.0, the maxima, infinities and NaNs (an E5M2 NaN keeps its payload, as the
+// f16 it is the top byte of), and on the encode side every kind of tie — between two normals
+// (1.0625 -> 1.0, 1.1875 -> 1.25, 248 -> 256), at the subnormal/normal seam (7.5 * 2^-9 -> 2^-6),
+// at zero (2^-10 -> 0), and at the top (464 -> 448 saturated, 61440 -> inf). Every expected line
+// comes from a brute-force nearest-code search over the format's value table (ties to the even
+// code), written independently of the compiler; `fp8_builtins_match_the_runtime_reference` in
+// wukong_codegen_cranelift checks all 256 codes and every midpoint on both backends.
+fn main() -> i32 {
+    print(bits(f8e4m3_to_f32(0x00))); // +0
+    print(bits(f8e4m3_to_f32(0x80))); // -0
+    print(bits(f8e4m3_to_f32(0x01))); // 2^-9
+    print(bits(f8e4m3_to_f32(0x07))); // 7 * 2^-9
+    print(bits(f8e4m3_to_f32(0x08))); // 2^-6
+    print(bits(f8e4m3_to_f32(0x38))); // 1.0
+    print(bits(f8e4m3_to_f32(0x39))); // 1.125
+    print(bits(f8e4m3_to_f32(0x7e))); // 448
+    print(bits(f8e4m3_to_f32(0xfe))); // -448
+    print(bits(f8e4m3_to_f32(0x7f))); // NaN
+    print(bits(f8e4m3_to_f32(0xff))); // -NaN
+    print(bits(f8e5m2_to_f32(0x01))); // 2^-16
+    print(bits(f8e5m2_to_f32(0x04))); // 2^-14
+    print(bits(f8e5m2_to_f32(0x3c))); // 1.0
+    print(bits(f8e5m2_to_f32(0x7b))); // 57344
+    print(bits(f8e5m2_to_f32(0x7c))); // inf
+    print(bits(f8e5m2_to_f32(0xfc))); // -inf
+    print(bits(f8e5m2_to_f32(0x7d))); // NaN, payload 01
+    print(bits(f8e5m2_to_f32(0x7e))); // NaN, payload 10
+    print(bits(f8e5m2_to_f32(0xff))); // -NaN, payload 11
+
+    let v1: f32 = 1.0;
+    let v2: f32 = 1.0625;
+    let v3: f32 = 1.1875;
+    let v4: f32 = 464.0;
+    let v5: f32 = 1000.0;
+    let pinf: f32 = f32_from_bits(0x7f800000);
+    let ninf: f32 = f32_from_bits(0xff800000);
+    let qnan: f32 = f32_from_bits(0x7fc00000);
+    let nnan: f32 = f32_from_bits(0xffc00000);
+    let t10: f32 = f32_from_bits(0x3a800000); // 2^-10
+    let t15: f32 = f32_from_bits(0x3ac00000); // 1.5 * 2^-10
+    let nz: f32 = -0.0;
+    let s7: f32 = 0.013671875;
+    let s75: f32 = 0.0146484375;
+    let e240: f32 = 240.0;
+    let e248: f32 = 248.0;
+    print(f32_to_f8e4m3(v1));
+    print(f32_to_f8e4m3(v2));
+    print(f32_to_f8e4m3(v3));
+    print(f32_to_f8e4m3(v4));
+    print(f32_to_f8e4m3(v5));
+    print(f32_to_f8e4m3(pinf));
+    print(f32_to_f8e4m3(ninf));
+    print(f32_to_f8e4m3(qnan));
+    print(f32_to_f8e4m3(nnan));
+    print(f32_to_f8e4m3(t10));
+    print(f32_to_f8e4m3(t15));
+    print(f32_to_f8e4m3(nz));
+    print(f32_to_f8e4m3(s7));
+    print(f32_to_f8e4m3(s75));
+    print(f32_to_f8e4m3(e240));
+    print(f32_to_f8e4m3(e248));
+
+    let w2: f32 = 61440.0;
+    let w3: f32 = f32_from_bits(0x476fffff); // just below 61440
+    let w4: f32 = 1000000.0;
+    let w7: f32 = f32_from_bits(0x37000000); // 2^-17
+    let w8: f32 = 1.75;
+    let w9: f32 = 1.875;
+    let w10: f32 = 0.0001;
+    print(f32_to_f8e5m2(v1));
+    print(f32_to_f8e5m2(w2));
+    print(f32_to_f8e5m2(w3));
+    print(f32_to_f8e5m2(w4));
+    print(f32_to_f8e5m2(qnan));
+    print(f32_to_f8e5m2(ninf));
+    print(f32_to_f8e5m2(w7));
+    print(f32_to_f8e5m2(w8));
+    print(f32_to_f8e5m2(w9));
+    print(f32_to_f8e5m2(w10));
+    return 0;
+}
