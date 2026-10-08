@@ -301,6 +301,20 @@ impl Walker<'_> {
                     }
                 }
             },
+            PatKind::Struct { fields, .. } => {
+                for fp in fields {
+                    self.bind_pattern(&fp.pat, Binding::default());
+                }
+            }
+            PatKind::Binding { name, sub } => {
+                self.bind(*name, Binding::default());
+                self.bind_pattern(sub, Binding::default());
+            }
+            PatKind::Slice { prefix, suffix, .. } => {
+                for q in prefix.iter().chain(suffix) {
+                    self.bind_pattern(q, Binding::default());
+                }
+            }
             PatKind::Wildcard
             | PatKind::Unit
             | PatKind::Int { .. }

@@ -1,0 +1,50 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0.1
+// EXPECT-OUT: 0.30000000000000004
+// EXPECT-OUT: 0.6000000000000001
+// EXPECT-OUT: 1.3
+// EXPECT-OUT: 1.3
+// EXPECT-OUT-VALUES: 3000000000 6000000000 9000000000
+// EXPECT-OUT: 0.30000000000000004
+module tests.run.literal_infer_f64_accum
+
+// A `let` initialized from a bare literal takes the type of its first constraining use, as in
+// Rust. `let mut s = 0.0; s += x[i];` over `f64` data used to keep `s` an `f32` — the compound
+// assignment coerced each `x[i]` down to `f32` before adding — so every partial sum below came out
+// as an f32 (0.10000000149011612, 0.30000001192092896, 0.6000000238418579, 1.2999999523162842)
+// on both backends, and `return s` from `-> f64` did not compile. Now `s` is an `f64`.
+//
+// Expected values are the f64 partial sums of 0.1 + 0.2 + 0.3 + 0.7, each printed as Rust prints an
+// f64 (the shortest string that round-trips): 0.1, 0.30000000000000004, 0.6000000000000001, 1.3.
+//
+// The integer form: `let mut acc = 0; acc += big[i];` with `big: [i64; 3]` makes `acc` an `i64`
+// (3e9, 6e9, 9e9), where the `i32` accumulator wrapped. And an operand: `let c = 0.1; c * x0`
+// with `x0: f64` makes `c` the f64 0.1, so the product is 0.30000000000000004 (with the f32 0.1
+// it was 0.30000000447034836).
+
+fn total(x: [f64; 4]) -> f64 {
+    let mut s = 0.0;
+    for i in 0..4 {
+        s += x[i];
+        print(s);
+    }
+    return s;
+}
+
+fn main() -> i32 {
+    let x: [f64; 4] = [0.1, 0.2, 0.3, 0.7];
+    print(total(x));
+
+    let big: [i64; 3] = [3000000000, 3000000000, 3000000000];
+    let mut acc = 0;
+    for i in 0..3 {
+        acc += big[i];
+        print(acc);
+    }
+
+    let c = 0.1;
+    let x0: f64 = 3.0;
+    print(c * x0);
+    return 0;
+}

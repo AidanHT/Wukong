@@ -5,6 +5,28 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Type soundness and patterns (`gap2/type-soundness-and-patterns`)
+
+- **Match exhaustiveness by pattern usefulness** (Maranget's algorithm, as in rustc): `E0405` now
+  sees through enum payload sub-patterns, tuples and integer/`char` ranges, and names a witness
+  pattern (`Expr::Add(i32::MIN..=-1 | 1..=i32::MAX, _)`) no arm covers. `Expr::Add(0, y)` no longer
+  counts as covering all of `Add`, `match (p, q)` is checked, and a full `0..=255` on a `u8` is no
+  longer a false `E0405`. New warning `W0020` (`unreachable_patterns`) for an arm an earlier
+  unguarded arm already covers.
+- **Mixed-type arithmetic** promotes only losslessly and in either operand order; any other mix
+  (`i32` with `u32`, `i64` with `f32`, `f16` with `bf16`, `char` with an integer) is the new
+  `E0440`. `/` and `%` divide with the promoted type's signedness, so `u32 / i64` is a signed
+  divide (`7 / -2` was `0`), and a literal on the left of an equally wide typed operand takes that
+  operand's type (`1 + x` is `u32` for `x: u32`, as `x + 1` was).
+- **Compound assignment** follows the plain-assignment rule: `x op= v` must not narrow (`E0441`;
+  `f32 += f64` used to accumulate in `f32`). **Literal inference**: an unannotated `let` initialized
+  from bare literals takes its type from its first constraining use, so `let mut s = 0.0;
+  s += x_f64[i];` accumulates in `f64`.
+- **Patterns**: struct patterns `Point { x: 0, y, .. }`, `name @ sub` bindings, array patterns
+  `[first, .., last]` on fixed-size arrays, and `if let` / `while let` / `let … else` (the `else`
+  must diverge), all checked by the exhaustiveness analysis; a refutable pattern in a plain `let` is
+  the new `E0442`.
+
 ### Optimizer memory passes: SROA, path DSE, loop deletion, guarded LICM, scalar promotion (`gap/opt-memory`)
 
 - **SROA** (`-O2`, ahead of mem2reg): an array/struct/tuple local whose every access is at a constant

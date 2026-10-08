@@ -11,7 +11,7 @@
 //!   * `E03xx` — name resolution
 //!   * `E04xx` — type checking
 //!   * `E05xx` — shape checking (Wukong's headline analysis)
-//!   * `W00xx` — warnings (lints; `W0001`–`W0019` from `wukong_sema::lints`, `W003x` from the
+//!   * `W00xx` — warnings (lints; `W0001`–`W0020` from `wukong_sema::lints`, `W003x` from the
 //!     parser), each also named for `-A/-W/-D` and `@allow/@warn/@deny`
 //!   * `C0xxx` — codegen / lowering limitations
 //!
@@ -375,14 +375,19 @@ static CATALOG: &[Explanation] = &[
     entry!(
         "E0405",
         "non-exhaustive match",
-        "A `match` does not cover every possible value of the scrutinee, and no arm is an \
-         unconditional catch-all. This is rejected in every position, not just value position: a \
-         value match would produce an injected zero default when no arm matches — a silent wrong \
-         answer (or, for a tuple/struct result, invalid code) — while a statement or empty match \
-         falls through to `Unreachable`, which the interpreter traps but the native backend hits as \
-         an illegal instruction. Add a `_ => …` arm (or, for an `enum`, an arm for every remaining \
-         variant; for a `bool`, both `true` and `false`) so the match is total, as in Rust. Guarded \
-         arms (`if …`) do not count toward coverage because their guard may be false.",
+        "A `match` does not cover every possible value of the scrutinee. The diagnostic names \
+         values no arm covers — a *witness* pattern such as `Expr::Add(i32::MIN..=-1 | \
+         1..=i32::MAX, _)` or `(false, false)` — found by pattern usefulness, the analysis Rust \
+         uses: it sees through enum payload sub-patterns, tuples and integer and `char` ranges, so \
+         `Expr::Add(0, y)` covers only the `Add` values whose first field is 0, `(true, _)` and \
+         `(false, true)` leave `(false, false)` uncovered, and `0..=99 | 100..=255` on a `u8` is \
+         complete. This is rejected in every position, not just value position: a value match would \
+         produce an injected zero default when no arm matches — a silent wrong answer (or, for a \
+         tuple/struct result, invalid code) — while a statement or empty match falls through to \
+         `Unreachable`, which the interpreter traps but the native backend hits as an illegal \
+         instruction. Add an arm for the missing values or a `_ => …` arm, as in Rust. Guarded arms \
+         (`if …`) do not count toward coverage because their guard may be false. A `char` can hold \
+         any 32-bit value (an integer `as char` is unchecked), so a `char` match needs a `_` arm.",
         bad: "module ex.e0405\nenum Color { Red, Green, Blue }\nfn name(c: Color) -> i32 {\n    return match c {\n        Color::Red => 1,\n        Color::Green => 2,\n    };\n}\nfn main() -> i32 {\n    return name(Color::Blue);\n}\n",
         good: "module ex.e0405\nenum Color { Red, Green, Blue }\nfn name(c: Color) -> i32 {\n    return match c {\n        Color::Red => 1,\n        Color::Green => 2,\n        Color::Blue => 3,\n    };\n}\nfn main() -> i32 {\n    return name(Color::Blue);\n}\n"
     ),
@@ -438,6 +443,60 @@ static CATALOG: &[Explanation] = &[
          non-function parameter; and a function-typed parameter may be neither `mut` nor named \
          after a builtin (`gelu`, `print`, …), whose name the compiler reads as the builtin. Pass \
          the function directly at each call instead."
+    ),
+    entry!(
+        "E0440",
+        "mixed-type arithmetic with no lossless common type",
+        "An arithmetic or bitwise operator combines two values of different scalar types, and no \
+         type holds every value of both: `i32` with `u32` (or any signed with an unsigned type at \
+         least as wide), an integer with a float that cannot represent all of it exactly (`i32` \
+         with `f32`, `i64` with `f64`), `f16` with `bf16`, or `char` with any other type. Such an \
+         operation used to pick a type by width and then by operand ORDER, so `a / b` and `b / a` \
+         could compute in different types and `u32 / i64` divided UNSIGNED (`7 / -2 == 0`). \
+         Implicit promotion now only widens, and in either order: integers of one signedness to the \
+         wider one, an unsigned integer to a strictly wider signed one (`u32 + i64` is `i64`), \
+         `f16`/`bf16` to `f32` to `f64`, and an integer to a float that holds it exactly (8- and \
+         16-bit integers to `f32`, up to 32-bit integers to `f64`). A signed value known never to \
+         be negative — a `for` counter that starts at a non-negative literal and is never \
+         assigned, or a non-negative `const` — also converts to an unsigned type at least as wide, \
+         so `i * n` with `n: usize` stays legal. An unsuffixed literal adapts to the other operand \
+         and never needs a cast; `<<`/`>>` take any integer amount. Convert an operand with `as` \
+         to the type the result should have.",
+        bad: "module ex.e0440\nfn ratio(a: u32, b: i32) -> i32 {\n    return a / b;\n}\nfn main() -> i32 {\n    return ratio(7, -2);\n}\n",
+        good: "module ex.e0440\nfn ratio(a: u32, b: i32) -> i64 {\n    return (a as i64) / (b as i64);\n}\nfn main() -> i32 {\n    return ratio(7, -2) as i32;\n}\n"
+    ),
+    entry!(
+        "E0441",
+        "compound assignment would not fit back into its place",
+        "A compound assignment `x op= v` means `x = x op v`, so the value it stores is the result of \
+         `x op v`, and that must have `x`'s own type — the rule a plain assignment already follows. \
+         So `v` may be of `x`'s type, of a type that promotes into it losslessly (`i64 += i32`, \
+         `f64 += f32`, `i32 += u8`; see E0440), or an unsuffixed literal (which must fit an \
+         integer place). An operand that is wider (`f32 += f64`, `i32 += i64`), of the other kind \
+         (`i32 += f32`) or of an incomparable type (`i32 += u32`) is rejected: the compound form used \
+         to convert the operand down to the place first, so `s += x` with `s: f32` and `x: f64` \
+         silently accumulated in `f32`, and `acc += -1.0` on an integer `acc` changed nothing. Convert \
+         the operand with `as`, or give the place the wider type. A `let` initialized from a bare \
+         literal and not annotated — `let mut s = 0.0;` — takes its type from its first such use, \
+         so it becomes an `f64` accumulator here with no annotation. A shift (`<<=`, `>>=`) takes an \
+         amount of any integer type.",
+        bad: "module ex.e0441\nfn total(x: f64) -> f32 {\n    let mut s: f32 = 0.5;\n    s += x;\n    return s;\n}\nfn main() -> i32 {\n    return total(1.5) as i32;\n}\n",
+        good: "module ex.e0441\nfn total(x: f64) -> f64 {\n    let mut s = 0.5;\n    s += x;\n    return s;\n}\nfn main() -> i32 {\n    return total(1.5) as i32;\n}\n"
+    ),
+    entry!(
+        "E0442",
+        "refutable pattern in `let`",
+        "The pattern of a plain `let` must match every value of its type, because the names it binds \
+         have to exist afterwards. `let Shape::Circle { r } = s;` leaves `r` unbound when `s` is \
+         any other shape, and `let (0, x) = t;` when `t.0` is not 0, so both are rejected; the \
+         diagnostic names a value the pattern misses, found by the same analysis as E0405. Use \
+         `let … else` to leave the enclosing function or loop when the value does not match — \
+         `let Shape::Circle { r } = s else { return 0.0; };` — or a `match`. Destructuring patterns \
+         that cannot fail are fine: a tuple, struct or array of names (`let (a, b) = t;`, \
+         `let Point { x, y } = p;`, `let [first, .., last] = a;`), and the single variant of a \
+         one-variant enum.",
+        bad: "module ex.e0442\nenum Shape { Circle(i32), Square(i32) }\nfn radius(s: Shape) -> i32 {\n    let Shape::Circle(r) = s;\n    return r;\n}\nfn main() -> i32 {\n    return radius(Shape::Circle(3));\n}\n",
+        good: "module ex.e0442\nenum Shape { Circle(i32), Square(i32) }\nfn radius(s: Shape) -> i32 {\n    let Shape::Circle(r) = s else {\n        return 0;\n    };\n    return r;\n}\nfn main() -> i32 {\n    return radius(Shape::Circle(3));\n}\n"
     ),
     entry!(
         "E0501",
@@ -580,6 +639,17 @@ static CATALOG: &[Explanation] = &[
          or has no argument at all, so it silences or promotes nothing. The arguments are lint names \
          (`unused_variables`), lint codes (`W0001`) or `warnings` (every lint). `wukongc --explain \
          W0001` and its neighbours describe each lint."
+    ),
+    entry!(
+        "W0020",
+        "unreachable pattern (`unreachable_patterns`)",
+        "A `match` arm can never be selected: every value its pattern matches is already matched by \
+         an earlier arm without a guard — `5 => …` after `0..=9 => …`, `(0, 0) => …` after \
+         `(_, _) => …`, or any arm after a `_` arm. Arms are tried in order, so the arm is dead, \
+         which usually means the arms are in the wrong order or an earlier pattern is broader than \
+         intended. A guarded arm covers nothing (its guard may be false), so it never makes a later \
+         arm unreachable. The verdict comes from the same pattern-usefulness analysis as E0405. \
+         Delete the arm, or move it before the arm that covers it."
     ),
     entry!(
         "W0030",

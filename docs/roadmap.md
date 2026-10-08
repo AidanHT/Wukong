@@ -172,11 +172,17 @@ another architecture or OS is not supported. A native-backend failure is a catal
 - **`match`** in value and statement position: integer/bool literal, identifier-binding, and wildcard
   `_` patterns, **or-patterns** `1 | 2 | 3`, half-open `0..10` / inclusive `0..=10` **range** patterns,
   **enum-variant** patterns `Color::Red` (matched by discriminant), and **tuple** patterns `(0, _)`
-  (per-field tests + bindings, nesting and composition like `(0 | 1, y)`), each with an optional `if`
-  guard. The scrutinee is evaluated once and the whole `match` lowers to an if-else chain; at `-O2`
-  four or more equality tests on one integer scrutinee become one MIR `switch` (a Cranelift jump
-  table or search tree; the `gpu-native` backend declines it)
-  (`tests/run/{match_expr,match_patterns,match_tuple,match_dense_enum_switch}.wk`).
+  (per-field tests + bindings, nesting and composition like `(0 | 1, y)`), **struct** patterns
+  `Point { x: 0, y, .. }`, **`name @ sub`** bindings and **array** patterns `[first, .., last]` on a
+  fixed-size array, each with an optional `if` guard. `if let`, `while let` and `let … else` (whose
+  `else` must diverge) are rewritten by the parser into a `match`, and a plain `let` pattern must be
+  irrefutable (`E0442`). The scrutinee is evaluated once and the whole `match` lowers to an if-else
+  chain; at `-O2` four or more equality tests on one integer scrutinee become one MIR `switch` (a
+  Cranelift jump table or search tree; the `gpu-native` backend declines it)
+  (`tests/run/{match_expr,match_patterns,match_tuple,match_dense_enum_switch,patterns_struct_binding_slice}.wk`).
+  Not yet: an array pattern on a `[]T` slice (its length is a run-time value), a `rest @ ..`
+  sub-slice binding, a binding inside an or-pattern, `if let … && cond` chains, and destructuring
+  patterns in a `for` head.
 - **C-style enums** `enum Code { Ok = 10, Err }` — explicit or auto-incrementing discriminants; a
   variant *is* its integer discriminant, usable in `let`, `==`, `as i32`, and as a `match` pattern
   (`tests/run/enum_cstyle.wk`).
@@ -187,7 +193,8 @@ another architecture or OS is not supported. A native-backend failure is a catal
   exactly like a struct — no backend change; interp == native bit-for-bit and -O0 == -O3
   (`tests/run/enum_payload_{tuple,struct}.wk`). A payload-carrying variant is *not* castable to an
   integer, and an enum that holds itself by value (`Cons(i32, List)`) is rejected as infinitely sized
-  (E0402); a non-exhaustive `match` over the variants is E0405.
+  (E0402); a non-exhaustive `match` over the variants is E0405, judged through the payload
+  sub-patterns (`Add(0, y)` does not cover all of `Add`) with a witness pattern in the message.
 - **Slices `[]T`** — a fat-pointer view `{ data: *T @ 0, len: i64 @ 8 }` over existing array storage:
   length `s.len()`, indexed read/write `s[i]`, iteration `for x in s`, and passing to a function —
   either an already-materialized slice or a fixed-size array *unsized* to a slice parameter at the
@@ -647,7 +654,8 @@ another architecture or OS is not supported. A native-backend failure is a catal
   sema): `W0001 unused_variables`, `W0002 unused_mut`, `W0003 unreachable_code` (divergence judged
   exactly as the definite-return check judges it), `W0004 unused_result` (`out[i] == x;` written
   for `=`), `W0005 dead_code`, `W0006 unwritten_output` (a `mut` aggregate parameter never stored
-  to) and `W0007 unknown_lints`. Levels come from rustc-style `-A/-W/-D <lint>` (`-D warnings`) and
+  to), `W0007 unknown_lints` and `W0020 unreachable_patterns` (a `match` arm every value of which an
+  earlier unguarded arm already matches). Levels come from rustc-style `-A/-W/-D <lint>` (`-D warnings`) and
   `@allow/@warn/@deny(<lint>)` on a function, parameter or statement, innermost first. Warnings
   print after errors, so `tests/fail`'s first-diagnostic contract holds; `tests/warn/` pins each
   lint's exact output (`crates/wukongc/tests/warn.rs`). Not yet: `unused_imports` (waits for the
@@ -1306,6 +1314,20 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   wrong result — write `a < b && b < c` (`tests/fail/chained_comparison.wk`). Equality `==`/`!=`
   between a `bool` and a non-bool scalar is likewise rejected, so the `==`/`!=` chain `5 == 3 == 0` is
   caught too (`tests/fail/chained_equality.wk`).
+- **Mixed-type arithmetic** promotes only losslessly and order-independently (same-signedness
+  widening, unsigned to a strictly wider signed type, `f16`/`bf16` to `f32` to `f64`, an integer to a
+  float that holds it exactly, a never-negative `for` counter or `const` to an unsigned type); every
+  other mix is `E0440`, and `/`/`%` divide with the common type's signedness, so `u32 / i64` is a
+  signed divide (`tests/run/mixed_width_div_signedness.wk`). Not yet: `min`/`max`/`fmax`-style
+  intrinsics still pick their operands' common type by width (`wukong_sema::shape`), and `if`/`match`
+  arms of different scalar types still merge to the left arm's type on a width tie.
+- **Compound assignment** follows the plain assignment's rule (`E0441`: `f32 += f64`, `i32 += i64`
+  no longer narrow the operand silently), and **literal inference** types an unannotated
+  literal-initialized `let` from its first constraining use (`let mut s = 0.0; s += x_f64[i]`
+  accumulates in `f64`); its first constraining use — an assignment, a `return`, a call argument, an
+  operator — decides it, as in Rust. Not yet: method-call and struct-field positions do not
+  constrain such a binding, and a generic call's literal arguments still bind `T` first-come
+  (`add(x_f64, 1.0)` is `E0401`).
 - Tensor shape checking is **sound for both concrete and generic shapes**. A function's own generic
   dimension variables are **rigid** inside its body: when two shapes that both carry the function's
   generics are checked — its declared-vs-returned shape, an elementwise operator's operands, an

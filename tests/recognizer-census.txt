@@ -242,6 +242,7 @@ linear_residual_relu.wk: wukong_sgemm_nt_epi
 linear_residual_src.wk: veckernel*1 wukong_sgemm_nt wukong_sgemm_nt*2 wukong_velem_f32 wukong_velem_f32*2
 linear_silu.wk: wukong_sgemm_nt_epi
 linear_silu_store.wk: wukong_sgemm_nt_epi
+literal_infer_f64_accum.wk:
 log.wk:
 log_softmax.wk: wukong_norm_f32
 log_softmax_fused.wk: wukong_norm_f32
@@ -263,6 +264,7 @@ match_guard_truthy.wk:
 match_pattern_widths.wk:
 match_patterns.wk:
 match_tuple.wk:
+match_u8_full_range.wk:
 matmul_accum_f32.wk: wukong_sgemm
 matmul_bf16.wk:
 matmul_bf16_tn.wk: wukong_sgemm_bf16_tn
@@ -281,6 +283,7 @@ min_max_builtin.wk:
 mish.wk: wukong_vmath_f32
 mixed_sign_compare_highbit.wk:
 mixed_sign_compare_ok.wk:
+mixed_width_div_signedness.wk:
 mono_name_collision.wk:
 multi_head_attention.wk: wukong_sgemm wukong_sgemm_nt
 mut_param.wk:
@@ -316,6 +319,7 @@ parallel_reduce_minmax.wk: wukong_sreduce_f32_parallel wukong_sreduce_f32_parall
 parallel_region_alias.wk:
 parallel_region_decline.wk: wukong_velem_f32_parallel
 parallel_region_reassigned_local.wk: veckernel*2
+patterns_struct_binding_slice.wk:
 pointer.wk:
 pointer_null_condition.wk:
 pool2d_partial_window.wk:

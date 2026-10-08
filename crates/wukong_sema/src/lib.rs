@@ -30,11 +30,15 @@ mod attrs;
 pub use attrs::{parallel_grain, MAX_PARALLEL_GRAIN};
 mod builtins;
 mod dependency;
+mod infer;
 mod layout;
 mod methods;
 mod noalias;
+mod patterns;
+mod promote;
 mod shape;
 mod tensor;
+mod usefulness;
 
 pub use builtins::{
     builtin_dims, builtin_operand_dims, builtin_output, kernel_builtin, Activation, BuiltinCall,
@@ -410,6 +414,10 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         pending_dims: Vec::new(),
         call_dims: HashMap::default(),
         tensor_views: Vec::new(),
+        local_facts: Vec::new(),
+        infer_overrides: HashMap::default(),
+        infer_found: HashMap::default(),
+        infer_pinned: HashMap::default(),
         builtin_calls: HashMap::default(),
         methods: methods::MethodState::default(),
     };
@@ -510,6 +518,16 @@ struct Sema<'a> {
     /// E0304 rule (`tensor::note_tensor_view`). Reset with the other per-scope stacks in
     /// `push_scope`/`pop_scope`/`check_fn`/`check_const`.
     tensor_views: Vec<HashMap<Symbol, Symbol>>,
+    /// Per-scope map, kept 1:1 with `scopes`: what is known about a local beyond its type (see
+    /// [`LocalFact`]). Cleared for a name whenever it is re-bound in a scope, so a fact never outlives
+    /// the binding it describes.
+    local_facts: Vec<HashMap<Symbol, LocalFact>>,
+    /// Literal inference (`infer.rs`), per function, keyed by a literal-initialized `let`'s pattern
+    /// id: the type an earlier pass over the body decided for it; the types this pass decides that
+    /// change a binding's type; and the ones this pass decides at the default (pins).
+    infer_overrides: HashMap<NodeId, Ty>,
+    infer_found: HashMap<NodeId, Ty>,
+    infer_pinned: HashMap<NodeId, Ty>,
     /// The resolved named-kernel-builtin calls, published as [`SemaResult::builtin_calls`].
     builtin_calls: HashMap<NodeId, BuiltinCall>,
     /// Methods, traits and function-typed parameters (`methods.rs`).
@@ -528,6 +546,19 @@ struct LoopCtx {
     /// loop's inferred type is this (or unit if it stays `None`). Tensor/vector shapes are unified
     /// across breaks exactly like `if`/`match` arms.
     break_ty: Option<Ty>,
+}
+
+/// One entry of [`Sema::local_facts`]: something known about a local beyond its type.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LocalFact {
+    /// A `for` counter over a range that starts at a non-negative literal and steps up, never
+    /// assigned in the loop body: its value is never negative, so it converts losslessly to an
+    /// unsigned type at least as wide (`i * N` with a `usize` dimension `N`; `promote.rs`).
+    NonNegCounter,
+    /// A `let` with no annotation whose initializer is only unsuffixed literals (`let mut s = 0.0;`):
+    /// its type is still the literal's default, and the first use that needs another type of the
+    /// same kind fixes it (`infer.rs`). Carries the `let` pattern's id.
+    InferLit(NodeId),
 }
 
 impl<'a> Sema<'a> {
@@ -1020,7 +1051,7 @@ impl<'a> Sema<'a> {
     /// `struct S { x: i32, x: i32 }` produced no declaration-site error at all (only the literal
     /// `S { x: 1, x: 2 }` was rejected, so a struct never literal-constructed compiled clean),
     /// `enum E { A, A }` compiled and RAN, and `fn f<N, N>(..)` compiled and ran. A duplicate enum
-    /// variant makes `collect_enum_coverage` count one name for two discriminants, so it feeds the
+    /// variant names one of two discriminants ambiguously, so it confuses the
     /// match-exhaustiveness reasoning behind E0405; a duplicate field means the layout carries a
     /// field no expression can ever name; a duplicate generic makes the positional turbofish zip
     /// (`FnSig.generics` × `f::<2, 3>`) bind two different arguments to one name.
@@ -1653,6 +1684,8 @@ impl<'a> Sema<'a> {
         self.immutable_params.push(HashSet::default());
         self.tensor_views.clear();
         self.tensor_views.push(HashMap::default());
+        self.local_facts.clear();
+        self.local_facts.push(HashMap::default());
         self.param_tys.clear();
         let ann = self.lower_type(&c.ty);
         let vty = self.type_expr(&c.value);
@@ -1679,7 +1712,35 @@ impl<'a> Sema<'a> {
         self.record_const(c);
     }
 
+    /// Type-check one function body, with **literal inference**: a `let` initialized only from
+    /// unsuffixed literals (`let mut s = 0.0;`) has the `{float}`/`{integer}` type its first
+    /// constraining use decides (`infer.rs`). A pass records each such binding's decision; when one
+    /// changes a binding's type, the body is checked again with every decided binding typed as
+    /// decided and the superseded pass's diagnostics are dropped, until a pass changes nothing (each
+    /// re-check fixes at least one more binding, and there are finitely many).
     fn check_fn(&mut self, f: &FnDecl, body: &Block, item_attrs: &[Attr]) {
+        let mark = self.diags.len();
+        let mut passes = 0;
+        loop {
+            self.infer_found.clear();
+            self.infer_pinned.clear();
+            self.check_fn_pass(f, body, item_attrs);
+            passes += 1;
+            if self.infer_found.is_empty() || passes == infer::MAX_PASSES {
+                break;
+            }
+            let found = std::mem::take(&mut self.infer_found);
+            let pinned = std::mem::take(&mut self.infer_pinned);
+            self.infer_overrides.extend(found);
+            self.infer_overrides.extend(pinned);
+            self.diags.truncate(mark);
+        }
+        self.infer_overrides.clear();
+        self.infer_found.clear();
+        self.infer_pinned.clear();
+    }
+
+    fn check_fn_pass(&mut self, f: &FnDecl, body: &Block, item_attrs: &[Attr]) {
         self.parallel_fn = item_attrs
             .iter()
             .any(|a| self.interner.resolve(a.name.sym) == "parallel");
@@ -1695,6 +1756,8 @@ impl<'a> Sema<'a> {
         self.immutable_params.push(HashSet::default());
         self.tensor_views.clear();
         self.tensor_views.push(HashMap::default());
+        self.local_facts.clear();
+        self.local_facts.push(HashMap::default());
         self.param_tys.clear();
         // Two parameters may not share a name: the second would silently shadow the first in the
         // body scope (a `fn f(a: i32, a: i64)` ran, with `a` resolving to the second), which is a
@@ -1769,6 +1832,8 @@ impl<'a> Sema<'a> {
     /// tail form had no range check at all.
     fn check_return_shape(&mut self, val_ty: &Ty, val: &Expr, span: Span) {
         let ret = self.ret_ty.clone();
+        // A returned literal-initialized binding takes the declared return type (`infer.rs`).
+        self.constrain_literal_binding(val, None, &ret, false);
         // ADAPT FIRST, and adapt COMPLETELY. `literal_adapts` is asked twice further down as a
         // LENIENCY — once inline in the scalar-agreement check, once inside `aggregate_value_clash`
         // — and it is what makes `return 5` from `-> i64` and `fn g() -> [i8; 2] { return [127, 0]; }` legal
@@ -2326,6 +2391,7 @@ impl<'a> Sema<'a> {
         self.immutable_locals.push(HashSet::default());
         self.immutable_params.push(HashSet::default());
         self.tensor_views.push(HashMap::default());
+        self.local_facts.push(HashMap::default());
     }
 
     fn pop_scope(&mut self) {
@@ -2333,6 +2399,15 @@ impl<'a> Sema<'a> {
         self.immutable_locals.pop();
         self.immutable_params.pop();
         self.tensor_views.pop();
+        self.local_facts.pop();
+    }
+
+    /// The [`LocalFact`] of the binding `name` resolves to (innermost scope first), if any.
+    fn local_fact(&self, name: Symbol) -> Option<LocalFact> {
+        let i = (0..self.scopes.len())
+            .rev()
+            .find(|&i| self.scopes[i].contains_key(&name))?;
+        self.local_facts.get(i)?.get(&name).copied()
     }
 
     /// Whether `name` resolves (innermost scope first) to a local bound immutably. A `mut` binding,
@@ -2403,6 +2478,10 @@ impl<'a> Sema<'a> {
         if let Some(scope) = self.scopes.last_mut() {
             scope.insert(name, ty);
         }
+        // A new binding starts with no facts; the binder that knows one records it afterwards.
+        if let Some(facts) = self.local_facts.last_mut() {
+            facts.remove(&name);
+        }
     }
 
     fn lookup_local(&self, name: Symbol) -> Option<Ty> {
@@ -2467,6 +2546,8 @@ impl<'a> Sema<'a> {
                 let bound = match (&ann_ty, &init_ty) {
                     (Some(a), Some(i)) => {
                         let init_expr = init.as_ref().unwrap();
+                        // `let x: T = s` decides a literal-initialized `s` (`infer.rs`).
+                        self.constrain_literal_binding(init_expr, None, a, false);
                         if self.let_compatible(a, init_expr, i) {
                             // Re-stamp / range-check ONLY a genuinely adapting literal expression. An
                             // untyped literal adopts the annotation top to bottom (so `-1.5` re-stamps
@@ -2496,7 +2577,9 @@ impl<'a> Sema<'a> {
                         a.clone()
                     }
                     (Some(a), None) => a.clone(),
-                    (None, Some(i)) => i.clone(),
+                    // A literal-only initializer takes the type literal inference fixed for this
+                    // binding, if an earlier pass learned one (`infer.rs`).
+                    (None, Some(i)) => self.literal_let_type(pat, init.as_ref(), i),
                     (None, None) => Ty::Unknown,
                 };
                 let bound = self.checked_let_type(bound, s.span);
@@ -2504,6 +2587,12 @@ impl<'a> Sema<'a> {
                 // (`let a = a[0];`) still resolves its initializer to the parameter it reads.
                 self.note_tensor_view(pat, &bound, init.as_ref());
                 self.bind_pattern(pat, &bound);
+                self.note_literal_binding(pat, ty.as_ref(), init.as_ref(), &bound);
+                // A `let` pattern must match every value (E0442; `let … else` is the refutable
+                // form, and the parser has already rewritten it).
+                if !matches!(pat.kind, PatKind::Ident(_) | PatKind::Wildcard) {
+                    self.check_irrefutable_let(pat, &bound);
+                }
                 if let Ty::Array {
                     shared: true,
                     elem,
@@ -2549,6 +2638,17 @@ impl<'a> Sema<'a> {
             StmtKind::Assign { target, op, value } => {
                 let target_ty = self.type_expr(target);
                 let value_ty = self.type_expr(value);
+                // Either side may be a literal-initialized binding whose type this use fixes
+                // (`infer.rs`): `s = x` makes `s` an `x`, and so does `s += x` when `x` is wider.
+                // A shift amount is a count, not an operand of the promotion (as in the binary
+                // operator arm), so `k <<= n` constrains neither `k` nor `n`.
+                let widen_only = !matches!(op, AssignOp::Assign);
+                if !matches!(op, AssignOp::Shl | AssignOp::Shr) {
+                    if !self.is_literal_operand(value) {
+                        self.constrain_literal_binding(target, Some(value), &value_ty, widen_only);
+                    }
+                    self.constrain_literal_binding(value, Some(target), &target_ty, widen_only);
+                }
                 // A literal assigned to a place adapts to (and is range-checked against) the place's
                 // type, the same rule `let` and struct-init already apply — so `p = 9000000000` for
                 // an i32 place is a hard E0401 instead of a silent low-32-bit truncation both backends
@@ -2606,30 +2706,15 @@ impl<'a> Sema<'a> {
                             ),
                         );
                     }
-                    // The implied `a = a (op) b` produces a value of the binary operator's result
-                    // type. An integer place with a float operand yields a float that cannot
-                    // implicitly narrow back to the integer place — exactly what the plain `a = a + b`
-                    // scalar-agreement check above rejects. The compound path silently accepted it and
-                    // emitted a float->int conversion (a *negative* float even converted via `fptoui`
-                    // to 0, so `acc += -1.0` left `acc` unchanged) — a lossy value both backends
-                    // agreed on, but one the language forbids everywhere else. Reject with E0401.
+                    // The implied `a = a (op) b` must produce a value of the place's own type: the
+                    // plain-assignment rule (E0441, `promote.rs`). The compound path used to coerce
+                    // the operand to the place first, so `s += x` with `s: f32`, `x: f64` silently
+                    // accumulated in f32, and an integer place with a float operand converted the
+                    // float (a *negative* one via `fptoui` to 0, so `acc += -1.0` left `acc`
+                    // unchanged) — lossy values both backends agreed on.
                     if let (Ty::Scalar(ts), Ty::Scalar(vs)) = (&target_ty, &value_ty) {
-                        if ts.is_int() && vs.is_float() {
-                            self.error(
-                                target.span,
-                                "E0401",
-                                format!(
-                                    "compound assignment `{}` cannot apply a `{}` value to an `{}` \
-                                     place; the result would narrow to `{}` — convert explicitly \
-                                     with `as {}`",
-                                    op.glyph(),
-                                    vs.name(),
-                                    ts.name(),
-                                    ts.name(),
-                                    ts.name()
-                                ),
-                            );
-                        }
+                        let (ts, vs) = (*ts, *vs);
+                        self.check_compound_operand(*op, target, value, ts, vs);
                     }
                 }
                 // Reassigning an immutable binding requires `mut`, but it was never enforced. Two
@@ -2894,6 +2979,7 @@ impl<'a> Sema<'a> {
                 let elem = self.type_for_iter(iter);
                 self.push_scope();
                 self.bind_pattern(pat, &elem);
+                self.note_nonneg_counter(pat, iter, body);
                 if let ForIter::Expr(it) = iter {
                     self.note_tensor_view(pat, &elem, Some(it));
                 }
@@ -2997,6 +3083,19 @@ impl<'a> Sema<'a> {
                 self.range_check_int_pattern(hi, ty);
             }
             PatKind::Char(_) | PatKind::Bool(_) | PatKind::Path(_) => {}
+            // `Point { x, .. }`, `n @ 1..=9`, `[a, .., z]` (`patterns.rs`).
+            PatKind::Struct { path, fields, .. } => {
+                self.check_struct_pattern(path, fields, ty, pat.span)
+            }
+            PatKind::Binding { name, sub } => {
+                self.bind(*name, ty.clone());
+                self.bind_pattern(sub, ty);
+            }
+            PatKind::Slice {
+                prefix,
+                rest,
+                suffix,
+            } => self.check_slice_pattern(prefix, *rest, suffix, ty, pat.span),
         }
     }
 
@@ -3678,6 +3777,17 @@ impl<'a> Sema<'a> {
             ExprKind::Binary { op, lhs, rhs } => {
                 let l = self.type_expr(lhs);
                 let r = self.type_expr(rhs);
+                // An operand that is a literal-initialized binding takes the other operand's type
+                // when that is a wider one of its kind (`infer.rs`): `let c = 0.5; c * x_f64` makes
+                // `c` an `f64`. A shift amount and a logical operand constrain nothing.
+                if !matches!(op, BinOp::Shl | BinOp::Shr | BinOp::And | BinOp::Or) {
+                    if !self.is_literal_operand(rhs) {
+                        self.constrain_literal_binding(lhs, Some(&**rhs), &r, true);
+                    }
+                    if !self.is_literal_operand(lhs) {
+                        self.constrain_literal_binding(rhs, Some(&**lhs), &l, true);
+                    }
+                }
                 // Operand shapes must agree (tensor-tensor / vector-vector); a mismatch is a real
                 // error regardless of whether the operator yields a value or a bool.
                 self.check_binop_shapes(&l, &r, e.span);
@@ -3905,6 +4015,11 @@ impl<'a> Sema<'a> {
                             && self.is_generic_ty(&l)
                         {
                             l
+                        } else if let Some(t) = self.arith_promotion(*op, lhs, rhs, &l, &r, e.span)
+                        {
+                            // Two different scalars: the lossless common type, or E0440
+                            // (`promote.rs`).
+                            t
                         } else {
                             join(l, r)
                         }
@@ -4175,24 +4290,21 @@ impl<'a> Sema<'a> {
                     self.check_merge_shapes(&result, &t, Some(&arm.body), arm.body.span);
                     result = join(result, t);
                 }
-                // Exhaustiveness: a `match` with no catch-all that provably misses a case is rejected
-                // (E0405), like Rust. A *value* match would synthesize a typed-zero default in mir_build
-                // (a silent wrong answer, or invalid MIR for an aggregate); a *statement* / empty match
-                // still lowers a value-merge whose "no arm matched" fallthrough is `Unreachable`, which
-                // the interpreter traps (exit 1) but the native backend hits as an illegal instruction
-                // (a backend divergence) — so the check must NOT be gated on the result type being a
-                // value. Skip only an `Error` result (its arm already reported, avoid cascading); an
-                // unmodeled scrutinee stays lenient inside `match_is_provably_nonexhaustive`.
-                if !matches!(result, Ty::Error)
-                    && self.match_is_provably_nonexhaustive(&scrut_ty, arms)
-                {
-                    self.error(
-                        e.span,
-                        "E0405",
-                        "non-exhaustive `match`: no arm covers all possible values; add a `_` arm \
-                         (or cover every enum variant / both `bool` cases)"
-                            .to_string(),
-                    );
+                // The `else` of a `let … else` (which the parser made this match's `_` arm) must
+                // diverge (`patterns.rs`).
+                self.check_let_else_arms(arms);
+                // Exhaustiveness: a `match` that provably misses a value is rejected (E0405), like
+                // Rust. A *value* match would synthesize a typed-zero default in mir_build (a silent
+                // wrong answer, or invalid MIR for an aggregate); a *statement* / empty match still
+                // lowers a value-merge whose "no arm matched" fallthrough is `Unreachable`, which the
+                // interpreter traps (exit 1) but the native backend hits as an illegal instruction (a
+                // backend divergence) — so the check must NOT be gated on the result type being a
+                // value. Skip only an `Error` result (its arm already reported, avoid cascading). The
+                // verdict is pattern usefulness (`usefulness.rs`), which sees through payload
+                // sub-patterns, tuples and integer ranges and names a value no arm covers; a match it
+                // cannot reason about gets no verdict, so this fires only on a certain miss.
+                if !matches!(result, Ty::Error) {
+                    self.report_nonexhaustive(scrutinee, &scrut_ty, arms);
                 }
                 result
             }
@@ -4223,84 +4335,45 @@ impl<'a> Sema<'a> {
         }
     }
 
-    /// Whether `arms` provably fail to cover every value of `scrut_ty` (used by E0405). Conservative:
-    /// returns `true` only when incompleteness is *certain*, so a valid match is never rejected. A
-    /// guard-less `_`/identifier arm covers everything (checked first). Otherwise: an `enum` is
-    /// covered iff every variant appears in a guard-less variant arm; a `bool` iff both `true` and
-    /// `false` appear; any other scalar (`int`/`char`/`usize` — an effectively unbounded domain)
-    /// needs a catch-all. Unmodeled scrutinees (tuple/array/tensor/struct/pointer/unknown/…) stay
-    /// lenient (`false`), matching sema's overall leniency. Guarded arms never prove coverage.
-    fn match_is_provably_nonexhaustive(&self, scrut_ty: &Ty, arms: &[MatchArm]) -> bool {
-        if arms.iter().any(arm_is_catch_all) {
-            return false;
-        }
-        if arms.is_empty() {
-            // An empty `match x {}` covers nothing, so it is non-exhaustive for any modeled, inhabited
-            // scrutinee (Wukong has no uninhabited types). The `Ty::Scalar(_)` case below already
-            // catches an empty int/char match; this also catches an empty enum / `bool` match (whose
-            // coverage arms below would read "no cases seen" as lenient). Unmodeled scrutinees stay
-            // lenient, matching the rest of this function.
-            return match scrut_ty {
-                Ty::Named(n) => {
-                    matches!(
-                        self.defs.lookup(*n).map(|d| &d.kind),
-                        Some(DefKind::Enum(_))
-                    )
-                }
-                Ty::Scalar(_) => true,
-                _ => false,
-            };
-        }
-        match scrut_ty {
-            Ty::Named(n) => match self.defs.lookup(*n).map(|d| &d.kind) {
-                Some(DefKind::Enum(variants)) => {
-                    // Coverage per variant: a variant pattern covers its name; an int-literal /
-                    // range pattern covers the variants whose DISCRIMINANT it matches (an enum
-                    // value IS its discriminant at runtime, and `int as Enum` is rejected, so the
-                    // declared discriminants are the whole domain). Previously a match by raw
-                    // discriminant stayed lenient — `match e { 0 => .., 1 => .. }` on a
-                    // three-variant enum compiled, and the missed variant silently took
-                    // mir_build's zero default on BOTH backends (a gate-blind wrong answer). It
-                    // also falsely rejected a mixed exhaustive match (`E::A | 1 | 2`), whose int
-                    // arms contributed nothing. Any guard-less pattern the collector can't reason
-                    // about keeps the whole match lenient, so incompleteness stays *certain*.
-                    let mut covered = HashSet::default();
-                    let mut spans: Vec<(i64, i64)> = Vec::new();
-                    for a in arms {
-                        if a.guard.is_none()
-                            && !collect_enum_coverage(
-                                &a.pat,
-                                &mut covered,
-                                &mut spans,
-                                self.interner,
-                            )
-                        {
-                            return false;
-                        }
-                    }
-                    // All arms guarded (guards never prove coverage): lenient.
-                    if covered.is_empty() && spans.is_empty() {
-                        return false;
-                    }
-                    variants.iter().any(|v| {
-                        !covered.contains(&v.name)
-                            && !spans.iter().any(|(l, h)| *l <= v.disc && v.disc <= *h)
-                    })
-                }
-                _ => false, // a non-enum `Named` (struct / generic / forward ref): lenient
-            },
-            Ty::Scalar(Scalar::Bool) => {
-                let (mut t, mut f) = (false, false);
-                for a in arms {
-                    if a.guard.is_none() {
-                        collect_bool_cases(&a.pat, &mut t, &mut f);
-                    }
-                }
-                (t || f) && !(t && f) // uses bool patterns but misses one case
-            }
-            Ty::Scalar(_) => true, // int/char/usize/…: unbounded, and no catch-all reached here
-            _ => false,
-        }
+    /// Report E0405 when `arms` provably miss a value of `scrut_ty`, naming one (a *witness*): the
+    /// usefulness analysis (`usefulness.rs`) decides, and stays silent on a match it cannot reason
+    /// about. A guarded arm never counts toward coverage, because its guard may be false; an empty
+    /// match covers nothing (Wukong has no uninhabited types).
+    fn report_nonexhaustive(&mut self, scrutinee: &Expr, scrut_ty: &Ty, arms: &[MatchArm]) {
+        let Some(report) = usefulness::analyze(&self.defs, self.interner, scrut_ty, arms) else {
+            return;
+        };
+        let Some(w) = report.missing else {
+            return;
+        };
+        let more = if w.more == 0 {
+            String::new()
+        } else {
+            format!(" (and {} more)", w.more)
+        };
+        let msg = if arms.is_empty() {
+            format!(
+                "non-exhaustive `match`: it has no arms, so no value of type `{}` is covered",
+                scrut_ty.display(self.interner)
+            )
+        } else {
+            format!(
+                "non-exhaustive `match`: pattern `{}`{more} not covered",
+                w.pattern
+            )
+        };
+        self.diags.push(
+            Diagnostic::error(msg)
+                .with_code("E0405")
+                .primary(
+                    scrutinee.span,
+                    format!("pattern `{}` not covered", w.pattern),
+                )
+                .help(
+                    "add an arm for the missing values, or a `_ => ...` arm; a guarded arm \
+                     (`if ...`) does not count, because its guard may be false",
+                ),
+        );
     }
 }
 
@@ -4535,51 +4608,6 @@ fn arm_is_catch_all(a: &MatchArm) -> bool {
     a.guard.is_none() && matches!(a.pat.kind, PatKind::Wildcard | PatKind::Ident(_))
 }
 
-/// Enum-coverage contribution of one (guard-less) pattern, for `match_is_provably_nonexhaustive`:
-/// a variant pattern covers its NAME (the path's last segment, `Color::Red` → `Red`), an int-literal
-/// / range pattern covers a numeric SPAN of discriminants (an enum matches by its discriminant), a
-/// wildcard/ident alternative covers everything, and or-patterns recurse.
-/// Returns `false` — "cannot reason, stay lenient" — for any other pattern kind (char/bool/tuple:
-/// ill-typed for an enum scrutinee or unmodeled here), so E0405 only fires on *certain* misses.
-fn collect_enum_coverage(
-    p: &Pattern,
-    names: &mut HashSet<Symbol>,
-    spans: &mut Vec<(i64, i64)>,
-    interner: &Interner,
-) -> bool {
-    match &p.kind {
-        PatKind::Path(path) | PatKind::Variant { path, .. } => {
-            if let Some(seg) = path.segments.last() {
-                names.insert(seg.sym);
-            }
-            true
-        }
-        PatKind::Int { .. } => match pat_int_value(p, interner) {
-            Some(v) => {
-                spans.push((v, v));
-                true
-            }
-            None => false,
-        },
-        PatKind::Range { lo, hi, inclusive } => {
-            let (Some(l), Some(h)) = (pat_int_value(lo, interner), pat_int_value(hi, interner))
-            else {
-                return false;
-            };
-            spans.push((l, if *inclusive { h } else { h.saturating_sub(1) }));
-            true
-        }
-        PatKind::Or(alts) => alts
-            .iter()
-            .all(|a| collect_enum_coverage(a, names, spans, interner)),
-        PatKind::Wildcard | PatKind::Ident(_) => {
-            spans.push((i64::MIN, i64::MAX));
-            true
-        }
-        _ => false,
-    }
-}
-
 /// The integer value of an int-literal pattern (with its folded-in sign), or `None`.
 fn pat_int_value(p: &Pattern, interner: &Interner) -> Option<i64> {
     match &p.kind {
@@ -4587,17 +4615,6 @@ fn pat_int_value(p: &Pattern, interner: &Interner) -> Option<i64> {
             parse_int_text(interner.resolve(*sym)).map(|v| if *neg { v.wrapping_neg() } else { v })
         }
         _ => None,
-    }
-}
-
-/// Record whether a (guard-less) pattern covers the `true` and/or `false` case, flattening
-/// or-patterns. Used by `match_is_provably_nonexhaustive` for `bool` coverage.
-fn collect_bool_cases(p: &Pattern, t: &mut bool, f: &mut bool) {
-    match &p.kind {
-        PatKind::Bool(true) => *t = true,
-        PatKind::Bool(false) => *f = true,
-        PatKind::Or(alts) => alts.iter().for_each(|a| collect_bool_cases(a, t, f)),
-        _ => {}
     }
 }
 

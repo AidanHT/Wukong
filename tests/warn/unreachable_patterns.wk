@@ -1,0 +1,47 @@
+// EXPECT-WARN: W0020
+// EXPECT-WARN: W0020
+// EXPECT-WARN: W0020
+module tests.warn.unreachable_patterns
+
+// Three arms no value can reach: `5` after `0..=9`, the `_` after `true`/`false` have covered every
+// `bool`, and `(0, 0)` after `(_, 0)`. The guarded arm in `pick` covers nothing (its guard may be
+// false), so the `3` arm after it is reachable and draws no warning.
+fn digit(x: i32) -> i32 {
+    return match x {
+        0..=9 => 1,
+        5 => 2,
+        _ => 0,
+    };
+}
+
+fn flag(b: bool) -> i32 {
+    return match b {
+        true => 1,
+        false => 0,
+        _ => 2,
+    };
+}
+
+fn pair(a: i32, b: i32) -> i32 {
+    return match (a, b) {
+        (_, 0) => 1,
+        (0, 0) => 2,
+        _ => 3,
+    };
+}
+
+fn pick(x: i32) -> i32 {
+    return match x {
+        n if n > 2 => n,
+        3 => 30,
+        _ => 0,
+    };
+}
+
+fn main() -> i32 {
+    print(digit(5));
+    print(flag(true));
+    print(pair(0, 0));
+    print(pick(3));
+    return 0;
+}

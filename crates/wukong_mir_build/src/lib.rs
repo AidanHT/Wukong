@@ -4880,7 +4880,9 @@ impl FnLowerer<'_> {
                     self.bind_slice(*name, fptr, fmir, matches!(fty, Ty::Slice(_)))
                 }
                 ast::PatKind::Tuple(inner) => self.bind_tuple_pattern(fptr, fty, inner),
-                _ => {}
+                // A struct / variant / array / `@` sub-pattern binds through the match
+                // machinery; a literal or `_` binds nothing.
+                _ => self.bind_field_pattern(sub, fptr, fty),
             }
         }
     }
@@ -9905,6 +9907,31 @@ impl FnLowerer<'_> {
                             .map(|e| self.expr_ty(e))
                             .unwrap_or(Ty::Unknown);
                         self.bind_tuple_pattern(slot, &tty, subs);
+                    }
+                    // `let Point { x, y } = p;`, `let all @ (a, b) = t;`, `let [first, ..] = a;`:
+                    // sema proved the pattern irrefutable (E0442), so binding its names at their
+                    // places within the slot is the whole job — the match machinery does it. So
+                    // does `let W::Only(v) = w;`, the one variant of a one-variant enum (which sema
+                    // accepts); any other variant pattern stays unbound here rather than reading
+                    // another variant's payload bytes.
+                    ast::PatKind::Struct { .. }
+                    | ast::PatKind::Binding { .. }
+                    | ast::PatKind::Slice { .. }
+                    | ast::PatKind::Variant { .. }
+                        if match &pat.kind {
+                            ast::PatKind::Variant { path, .. } => self
+                                .enum_variants(path.segments[0].sym)
+                                .is_some_and(|vs| vs.len() == 1),
+                            _ => true,
+                        } =>
+                    {
+                        let lty = self.let_binding_ty(ty.as_ref(), init.as_ref());
+                        let at = if matches!(mty, MirType::Array(..)) {
+                            slot
+                        } else {
+                            self.builder.build(mty.clone(), Op::Load(slot, mty.clone()))
+                        };
+                        self.bind_match_ident(pat, at, &mty, &lty);
                     }
                     _ => {}
                 }
@@ -20971,8 +20998,105 @@ impl FnLowerer<'_> {
                 let vname = path.segments.last().unwrap().sym;
                 self.bind_variant_match(fields, scrut, enum_sym, vname);
             }
+            // `name @ sub`: the name binds the whole value, exactly as an identifier pattern would,
+            // and `sub` binds its own names.
+            ast::PatKind::Binding { name, sub } => {
+                let whole = Pattern {
+                    id: pat.id,
+                    kind: ast::PatKind::Ident(*name),
+                    span: pat.span,
+                };
+                self.bind_match_ident(&whole, scrut, scrut_mir, scrut_ty);
+                self.bind_match_ident(sub, scrut, scrut_mir, scrut_ty);
+            }
+            // A struct / array pattern binds each listed field's (element's) sub-pattern at that
+            // field's place within the buffer at `scrut`.
+            ast::PatKind::Struct { fields, .. } => {
+                for (fptr_off, fty, sub) in self.struct_pattern_fields(scrut_ty, fields) {
+                    let fptr = self.field_ptr(scrut, fptr_off);
+                    self.bind_field_pattern(sub, fptr, &fty);
+                }
+            }
+            ast::PatKind::Slice { prefix, suffix, .. } => {
+                for (index, ety, sub) in Self::slice_pattern_elems(scrut_ty, prefix, suffix) {
+                    let emir = self.mir_ty_of(&ety);
+                    let eptr = self.gep_elem(scrut, &emir, index);
+                    self.bind_field_pattern(sub, eptr, &ety);
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Bind the names of `sub`, a sub-pattern matched against the field (or element) whose
+    /// place is `fptr` and type `fty`: an aggregate field is matched at its address, a scalar one
+    /// by its loaded value — so an identifier binds a fresh copy of a scalar, as it does for a
+    /// tuple field. A sub-pattern that binds nothing emits nothing.
+    fn bind_field_pattern(&mut self, sub: &Pattern, fptr: ValueId, fty: &Ty) {
+        if !pattern_has_binding(sub) {
+            return;
+        }
+        let fmty = self.mir_ty_of(fty);
+        let at = if matches!(fmty, MirType::Array(..)) {
+            fptr
+        } else {
+            self.builder
+                .build(fmty.clone(), Op::Load(fptr, fmty.clone()))
+        };
+        self.bind_match_ident(sub, at, &fmty, fty);
+    }
+
+    /// The listed fields of a struct pattern over a value of struct type `ty`, each as
+    /// `(byte offset, field type, sub-pattern)`; a field sema rejected (or a non-struct type) is
+    /// dropped.
+    fn struct_pattern_fields<'p>(
+        &self,
+        ty: &Ty,
+        fields: &'p [ast::FieldPat],
+    ) -> Vec<(u64, Ty, &'p Pattern)> {
+        let Ty::Named(sym) = ty else {
+            return Vec::new();
+        };
+        let (Some(DefKind::Struct(decl)), Some(layout)) = (
+            self.sema.defs.lookup(*sym).map(|d| &d.kind),
+            self.struct_field_tys(*sym),
+        ) else {
+            return Vec::new();
+        };
+        fields
+            .iter()
+            .filter_map(|fp| {
+                let i = decl.iter().position(|(n, _)| *n == fp.name)?;
+                let (off, fty) = layout.get(i)?;
+                Some((*off, fty.clone(), &fp.pat))
+            })
+            .collect()
+    }
+
+    /// The listed elements of an array pattern over a value of type `[T; N]`, each as
+    /// `(element index, element type, sub-pattern)`: the prefix from index 0, the suffix ending at
+    /// `N - 1`. Empty for any other type (sema rejected the pattern).
+    fn slice_pattern_elems<'p>(
+        ty: &Ty,
+        prefix: &'p [Pattern],
+        suffix: &'p [Pattern],
+    ) -> Vec<(i128, Ty, &'p Pattern)> {
+        let Ty::Array { elem, len, .. } = ty else {
+            return Vec::new();
+        };
+        let n = i128::from(*len);
+        let first_suffix = n - suffix.len() as i128;
+        prefix
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i as i128, (**elem).clone(), p))
+            .chain(
+                suffix
+                    .iter()
+                    .enumerate()
+                    .map(|(j, p)| (first_suffix + j as i128, (**elem).clone(), p)),
+            )
+            .collect()
     }
 
     /// Bind the identifiers of a tuple pattern to their field places within the tuple buffer at base
@@ -21009,7 +21133,9 @@ impl FnLowerer<'_> {
                     }
                 }
                 ast::PatKind::Tuple(inner) => self.bind_tuple_match(inner, fptr, fty),
-                _ => {}
+                // A variant / struct / array / `@` sub-pattern binds through
+                // `bind_field_pattern`; a literal or `_` binds nothing.
+                _ => self.bind_field_pattern(sub, fptr, fty),
             }
         }
     }
@@ -21195,7 +21321,54 @@ impl FnLowerer<'_> {
                 }
                 acc
             }
+            // `name @ sub` tests exactly what `sub` tests.
+            ast::PatKind::Binding { sub, .. } => {
+                self.pattern_cond(sub, scrut, scrut_mir, scrut_ty, span)
+            }
+            // A struct / array pattern ANDs its listed fields' (elements') tests, each field taken
+            // at its place within the buffer at `scrut`.
+            ast::PatKind::Struct { fields, .. } => {
+                let mut acc: Option<ValueId> = None;
+                for (off, fty, sub) in self.struct_pattern_fields(scrut_ty, fields) {
+                    let fptr = self.field_ptr(scrut, off);
+                    if let Some(c) = self.field_pattern_cond(sub, fptr, &fty) {
+                        acc = Some(match acc {
+                            Some(a) => self.builder.build(MirType::I1, Op::Bin(BinOp::And, a, c)),
+                            None => c,
+                        });
+                    }
+                }
+                acc
+            }
+            ast::PatKind::Slice { prefix, suffix, .. } => {
+                let mut acc: Option<ValueId> = None;
+                for (index, ety, sub) in Self::slice_pattern_elems(scrut_ty, prefix, suffix) {
+                    let emir = self.mir_ty_of(&ety);
+                    let eptr = self.gep_elem(scrut, &emir, index);
+                    if let Some(c) = self.field_pattern_cond(sub, eptr, &ety) {
+                        acc = Some(match acc {
+                            Some(a) => self.builder.build(MirType::I1, Op::Bin(BinOp::And, a, c)),
+                            None => c,
+                        });
+                    }
+                }
+                acc
+            }
         }
+    }
+
+    /// The test of `sub` against the field (or element) at `fptr` of type `fty`: an aggregate
+    /// field, or a sub-pattern that inspects a buffer, is tested at its address; a scalar one on
+    /// its loaded value. `None` when `sub` is unconditional.
+    fn field_pattern_cond(&mut self, sub: &Pattern, fptr: ValueId, fty: &Ty) -> Option<ValueId> {
+        let fmty = self.mir_ty_of(fty);
+        let at = if Self::pattern_needs_ptr(sub) || matches!(fmty, MirType::Array(..)) {
+            fptr
+        } else {
+            self.builder
+                .build(fmty.clone(), Op::Load(fptr, fmty.clone()))
+        };
+        self.pattern_cond(sub, at, &fmty, fty, sub.span)
     }
 
     /// The integer value of an int- or char-literal range bound (`lo`/`hi`). A char decodes to its
@@ -21284,6 +21457,9 @@ impl FnLowerer<'_> {
             ast::PatKind::Tuple(_) => true,
             // A variant pattern tests against the enum buffer's *address*, not a loaded value.
             ast::PatKind::Variant { .. } => true,
+            // So do struct and array patterns; `name @ sub` needs what `sub` needs.
+            ast::PatKind::Struct { .. } | ast::PatKind::Slice { .. } => true,
+            ast::PatKind::Binding { sub, .. } => Self::pattern_needs_ptr(sub),
             ast::PatKind::Or(alts) => alts.iter().any(Self::pattern_needs_ptr),
             _ => false,
         }
@@ -21442,7 +21618,9 @@ impl FnLowerer<'_> {
                     let vn = path.segments.last().unwrap().sym;
                     self.bind_variant_match(fields, fptr, esym, vn);
                 }
-                _ => {}
+                // A struct / array / `@` sub-pattern binds through `bind_field_pattern`; a
+                // literal or `_` binds nothing.
+                _ => self.bind_field_pattern(sub, fptr, &fty),
             }
         }
     }
@@ -21625,7 +21803,17 @@ impl FnLowerer<'_> {
                 };
                 let l = self.coerce_to(l, &lty, &ty, self.signed(lhs));
                 let r = self.coerce_to(r, &rty, &ty, self.signed(rhs));
-                let bin = arith_binop(op, ty.is_float(), self.signed(lhs));
+                // `/` and `%` divide in the RESULT type, whose signedness sema settled (E0440 admits
+                // only promotions in which that type holds both operands): `u32 / i64` is a signed
+                // 64-bit divide. Reading the left operand's own signedness made it UNSIGNED, so
+                // `7 / -2` was 0 on both backends. A shift keeps its shiftee's signedness — the
+                // amount is a count, not an operand of the promotion.
+                let signed = if matches!(op, Div | Rem) {
+                    self.signed(e)
+                } else {
+                    self.signed(lhs)
+                };
+                let bin = arith_binop(op, ty.is_float(), signed);
                 let v = self.builder.build(ty.clone(), Op::Bin(bin, l, r));
                 // A bf16/f16-typed result must round to its grid at the value (see
                 // `round_half_result`) — not only in a store mem2reg may delete.
@@ -25062,6 +25250,30 @@ fn norm_window_rebinds(stmts: &[Stmt], sym: Symbol) -> bool {
         }
         _ => false,
     })
+}
+
+/// Whether `p` binds a name anywhere. Wildcard-free over `PatKind`, so a new pattern form is a
+/// compile error here rather than a silently dropped binding.
+fn pattern_has_binding(p: &ast::Pattern) -> bool {
+    match &p.kind {
+        ast::PatKind::Ident(_) | ast::PatKind::Binding { .. } => true,
+        ast::PatKind::Tuple(subs) | ast::PatKind::Or(subs) => subs.iter().any(pattern_has_binding),
+        ast::PatKind::Variant { fields, .. } => match fields {
+            VariantPat::Tuple(subs) => subs.iter().any(pattern_has_binding),
+            VariantPat::Struct(fps) => fps.iter().any(|fp| pattern_has_binding(&fp.pat)),
+        },
+        ast::PatKind::Struct { fields, .. } => fields.iter().any(|fp| pattern_has_binding(&fp.pat)),
+        ast::PatKind::Slice { prefix, suffix, .. } => {
+            prefix.iter().chain(suffix).any(pattern_has_binding)
+        }
+        ast::PatKind::Wildcard
+        | ast::PatKind::Unit
+        | ast::PatKind::Int { .. }
+        | ast::PatKind::Char(_)
+        | ast::PatKind::Bool(_)
+        | ast::PatKind::Path(_)
+        | ast::PatKind::Range { .. } => false,
+    }
 }
 
 /// Does the pattern `p` introduce the name `sym`? Conservative: any pattern shape this does not

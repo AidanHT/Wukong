@@ -1,0 +1,22 @@
+// EXPECT-CODE: E0401
+module tests.fail.let_else_not_diverging
+
+// The `else` of a `let … else` runs when the pattern does not match, so the names the pattern
+// binds (`r`) do not exist after it: the block must leave — `return`, `break`, `continue`, or a
+// `loop` with no exit. This one falls through.
+enum Shape {
+    Circle(i32),
+    Square(i32),
+}
+
+fn radius(s: Shape) -> i32 {
+    let Shape::Circle(r) = s else {
+        print(0);
+    };
+    return r;
+}
+
+fn main() -> i32 {
+    print(radius(Shape::Square(2)));
+    return 0;
+}

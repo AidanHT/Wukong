@@ -1381,6 +1381,11 @@ fn pattern_binds(p: &ast::Pattern) -> bool {
             ast::VariantPat::Struct(fs) => fs.iter().any(|f| pattern_binds(&f.pat)),
         },
         ast::PatKind::Range { lo, hi, .. } => pattern_binds(lo) || pattern_binds(hi),
+        ast::PatKind::Struct { fields, .. } => fields.iter().any(|f| pattern_binds(&f.pat)),
+        ast::PatKind::Binding { .. } => true,
+        ast::PatKind::Slice { prefix, suffix, .. } => {
+            prefix.iter().chain(suffix).any(pattern_binds)
+        }
         ast::PatKind::Wildcard
         | ast::PatKind::Unit
         | ast::PatKind::Int { .. }

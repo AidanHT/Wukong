@@ -789,6 +789,17 @@ impl Desugar<'_> {
                 self.refresh_pattern(lo);
                 self.refresh_pattern(hi);
             }
+            PatKind::Struct { fields, .. } => {
+                for fp in fields {
+                    self.refresh_pattern(&mut fp.pat);
+                }
+            }
+            PatKind::Binding { sub, .. } => self.refresh_pattern(sub),
+            PatKind::Slice { prefix, suffix, .. } => {
+                for sub in prefix.iter_mut().chain(suffix.iter_mut()) {
+                    self.refresh_pattern(sub);
+                }
+            }
             PatKind::Wildcard
             | PatKind::Ident(_)
             | PatKind::Unit
@@ -878,6 +889,20 @@ fn pattern_bindings(p: &Pattern, out: &mut Vec<Symbol>) {
                 }
             }
         },
+        PatKind::Struct { fields, .. } => {
+            for fp in fields {
+                pattern_bindings(&fp.pat, out);
+            }
+        }
+        PatKind::Binding { name, sub } => {
+            out.push(*name);
+            pattern_bindings(sub, out);
+        }
+        PatKind::Slice { prefix, suffix, .. } => {
+            for sub in prefix.iter().chain(suffix) {
+                pattern_bindings(sub, out);
+            }
+        }
         PatKind::Range { .. }
         | PatKind::Wildcard
         | PatKind::Unit

@@ -1426,6 +1426,11 @@ impl<'a> Parser<'a> {
             return self.finish_expr(start, ExprKind::TupleLit(Vec::new()));
         }
         self.bump(); // if
+        if self.at(T::Let) {
+            let out = self.parse_if_let(start);
+            self.depth = saved;
+            return out;
+        }
         let cond = Box::new(self.parse_cond());
         let then_branch = self.parse_block();
         let else_branch = if self.eat(T::Else) {
@@ -1449,6 +1454,81 @@ impl<'a> Parser<'a> {
         );
         self.depth = saved;
         out
+    }
+
+    /// `if let P = e { A } else { B }` (the `if` consumed, the cursor on `let`), parsed as the
+    /// `match e { P => { A }, _ => { B } }` it means. With no `else` the `_` arm does nothing and
+    /// the `then` block becomes a statement, so the whole expression is `()` like an `else`-less
+    /// `if`. An `else if …` chain becomes the `_` arm's body.
+    fn parse_if_let(&mut self, start: Span) -> Expr {
+        self.bump(); // let
+        let pat = self.parse_pattern();
+        self.expect(T::Eq);
+        let scrutinee = Box::new(self.parse_cond());
+        let then_block = self.parse_block();
+        let then_span = then_block.span;
+        let (then_body, else_body) = if self.eat(T::Else) {
+            let else_body = if self.at(T::If) {
+                self.parse_if()
+            } else {
+                let b = self.parse_block();
+                self.block_expr(b)
+            };
+            (self.block_expr(then_block), else_body)
+        } else {
+            // `if let P = e { A }` is `()`: discard `A`'s value as a statement.
+            let stmt = Stmt {
+                id: self.nid(),
+                attrs: Vec::new(),
+                kind: StmtKind::Expr(self.block_expr(then_block)),
+                span: then_span,
+            };
+            let body = Block {
+                id: self.nid(),
+                stmts: vec![stmt],
+                tail: None,
+                span: then_span,
+            };
+            let empty = Block {
+                id: self.nid(),
+                stmts: Vec::new(),
+                tail: None,
+                span: then_span,
+            };
+            (self.block_expr(body), self.block_expr(empty))
+        };
+        let else_span = else_body.span;
+        let arms = vec![
+            MatchArm {
+                span: pat.span.to(then_span),
+                pat,
+                guard: None,
+                body: then_body,
+                origin: ArmOrigin::Source,
+            },
+            MatchArm {
+                pat: Pattern {
+                    id: self.nid(),
+                    kind: PatKind::Wildcard,
+                    span: else_span,
+                },
+                guard: None,
+                body: else_body,
+                span: else_span,
+                origin: ArmOrigin::LetFallthrough,
+            },
+        ];
+        self.finish_expr(start, ExprKind::Match { scrutinee, arms })
+    }
+
+    /// A block as an expression, spanning the block.
+    fn block_expr(&mut self, b: Block) -> Expr {
+        let span = b.span;
+        Expr {
+            id: self.nid(),
+            kind: ExprKind::Block(b),
+            span,
+        }
     }
 
     fn parse_match(&mut self) -> Expr {
@@ -1488,6 +1568,7 @@ impl<'a> Parser<'a> {
                 guard,
                 body,
                 span: arm_start.to(self.prev_span()),
+                origin: ArmOrigin::Source,
             });
             self.eat(T::Comma);
             // Guarantee forward progress (mirrors `module()`): if the depth limit has tripped and
@@ -1729,6 +1810,20 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        if self.at(T::Else) {
+            if let Some(init) = init {
+                if let Some(t) = &ty {
+                    let span = t.span;
+                    self.error(
+                        span,
+                        "E0200",
+                        "a `let … else` takes no type annotation; annotate the value it matches \
+                         instead",
+                    );
+                }
+                return self.parse_let_else(pat, mutable, init);
+            }
+        }
         // The terminating `;` is the caller's (`parse_block`'s `end_stmt`).
         StmtKind::Let {
             pat,
@@ -1738,11 +1833,178 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `let P = e else { B };` (the cursor on `else`), parsed as what it means: a `let` of the
+    /// names `P` binds, initialized from `match e { P => (names), _ => { B } }`, whose `_` arm sema
+    /// requires to diverge. One name binds directly (`let x = match …`); none makes the whole
+    /// statement the `match` (`let Some(_) = e else { return; }`). The terminating `;` is the
+    /// caller's.
+    fn parse_let_else(&mut self, pat: Pattern, mutable: bool, init: Expr) -> StmtKind {
+        self.bump(); // else
+        let else_block = self.parse_block();
+        let else_span = else_block.span;
+        let else_body = self.block_expr(else_block);
+        let mut names: Vec<(Symbol, Span)> = Vec::new();
+        pattern_bindings(&pat, &mut names);
+        let name_expr = |p: &mut Self, (sym, span): (Symbol, Span)| Expr {
+            id: p.nid(),
+            kind: ExprKind::Path(Path {
+                segments: vec![Ident { sym, span }],
+                span,
+            }),
+            span,
+        };
+        let name_pat = |p: &mut Self, (sym, span): (Symbol, Span)| Pattern {
+            id: p.nid(),
+            kind: PatKind::Ident(sym),
+            span,
+        };
+        let pat_span = pat.span;
+        let (value, let_pat) = match names.as_slice() {
+            [] => {
+                let unit = Block {
+                    id: self.nid(),
+                    stmts: Vec::new(),
+                    tail: None,
+                    span: pat_span,
+                };
+                (self.block_expr(unit), None)
+            }
+            [one] => (name_expr(self, *one), Some(name_pat(self, *one))),
+            many => {
+                let many = many.to_vec();
+                let vals = many.iter().map(|n| name_expr(self, *n)).collect();
+                let pats = many.iter().map(|n| name_pat(self, *n)).collect();
+                let value = Expr {
+                    id: self.nid(),
+                    kind: ExprKind::TupleLit(vals),
+                    span: pat_span,
+                };
+                let let_pat = Pattern {
+                    id: self.nid(),
+                    kind: PatKind::Tuple(pats),
+                    span: pat_span,
+                };
+                (value, Some(let_pat))
+            }
+        };
+        let span = init.span.to(else_span);
+        let arms = vec![
+            MatchArm {
+                span: pat_span,
+                pat,
+                guard: None,
+                body: value,
+                origin: ArmOrigin::Source,
+            },
+            MatchArm {
+                pat: Pattern {
+                    id: self.nid(),
+                    kind: PatKind::Wildcard,
+                    span: else_span,
+                },
+                guard: None,
+                body: else_body,
+                span: else_span,
+                origin: ArmOrigin::LetElse,
+            },
+        ];
+        let m = Expr {
+            id: self.nid(),
+            kind: ExprKind::Match {
+                scrutinee: Box::new(init),
+                arms,
+            },
+            span,
+        };
+        match let_pat {
+            Some(pat) => StmtKind::Let {
+                pat,
+                mutable,
+                ty: None,
+                init: Some(m),
+            },
+            None => StmtKind::Expr(m),
+        }
+    }
+
     fn parse_while(&mut self, label: Option<Ident>) -> StmtKind {
+        let start = self.span();
         self.bump(); // while
+        if self.at(T::Let) {
+            return self.parse_while_let(label, start);
+        }
         let cond = self.parse_cond();
         let body = self.parse_block();
         StmtKind::While { label, cond, body }
+    }
+
+    /// `[label:] while let P = e { A }` (the cursor on `let`), parsed as the
+    /// `[label:] loop { match e { P => { A }, _ => { break; } } }` it means: `e` is evaluated afresh
+    /// on every iteration, a `continue` re-tests it, and a `break` (or the first non-match) leaves.
+    fn parse_while_let(&mut self, label: Option<Ident>, start: Span) -> StmtKind {
+        self.bump(); // let
+        let pat = self.parse_pattern();
+        self.expect(T::Eq);
+        let scrutinee = Box::new(self.parse_cond());
+        let body = self.parse_block();
+        let span = start.to(self.prev_span());
+        let body_span = body.span;
+        let body = self.block_expr(body);
+        let brk = Stmt {
+            id: self.nid(),
+            attrs: Vec::new(),
+            kind: StmtKind::Break(None, None),
+            span: start,
+        };
+        let exit = Block {
+            id: self.nid(),
+            stmts: vec![brk],
+            tail: None,
+            span: start,
+        };
+        let exit = self.block_expr(exit);
+        let arms = vec![
+            MatchArm {
+                span: pat.span.to(body_span),
+                pat,
+                guard: None,
+                body,
+                origin: ArmOrigin::Source,
+            },
+            MatchArm {
+                pat: Pattern {
+                    id: self.nid(),
+                    kind: PatKind::Wildcard,
+                    span: start,
+                },
+                guard: None,
+                body: exit,
+                span: start,
+                origin: ArmOrigin::LetFallthrough,
+            },
+        ];
+        let m = Expr {
+            id: self.nid(),
+            kind: ExprKind::Match { scrutinee, arms },
+            span,
+        };
+        let m = Stmt {
+            id: self.nid(),
+            attrs: Vec::new(),
+            kind: StmtKind::Expr(m),
+            span,
+        };
+        let body = Block {
+            id: self.nid(),
+            stmts: vec![m],
+            tail: None,
+            span,
+        };
+        StmtKind::Expr(Expr {
+            id: self.nid(),
+            kind: ExprKind::Loop { label, body },
+            span,
+        })
     }
 
     fn parse_for(&mut self, label: Option<Ident>) -> StmtKind {
@@ -1871,6 +2133,38 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The field list of a struct or struct-variant pattern, after its `{`: `f` (shorthand for
+    /// `f: f`), `f: sub`, comma-separated, optionally closed by `..`. Returns the fields and whether
+    /// a `..` was written. The `}` is the caller's.
+    fn parse_field_pats(&mut self) -> (Vec<FieldPat>, bool) {
+        let mut fps = Vec::new();
+        let mut rest = false;
+        while !self.at(T::RBrace) && !self.at(T::Eof) {
+            if self.eat(T::DotDot) {
+                rest = true;
+                break;
+            }
+            let fname = self.ident();
+            let pat = if self.eat(T::Colon) {
+                self.parse_pattern()
+            } else {
+                Pattern {
+                    id: self.nid(),
+                    kind: PatKind::Ident(fname.sym),
+                    span: fname.span,
+                }
+            };
+            fps.push(FieldPat {
+                name: fname.sym,
+                pat,
+            });
+            if !self.eat(T::Comma) {
+                break;
+            }
+        }
+        (fps, rest)
+    }
+
     fn parse_pattern_primary(&mut self) -> Pattern {
         let start = self.span();
         // Bound deeply nested tuple patterns (`((((…))))`), which recurse through here via the
@@ -1913,29 +2207,11 @@ impl<'a> Parser<'a> {
                             fields: VariantPat::Tuple(subs),
                         }
                     } else if self.at(T::LBrace) {
-                        // `Enum::Variant { f0, f1: sub, … }` — named (struct) payload sub-patterns.
+                        // `Enum::Variant { f0, f1: sub, .. }` — named (struct) payload sub-patterns.
                         // Bare `{ r }` is field shorthand binding `r`; `{ r: sub }` binds via `sub`.
+                        // An unlisted field is unconstrained, so a closing `..` changes nothing.
                         self.bump(); // {
-                        let mut fps = Vec::new();
-                        while !self.at(T::RBrace) && !self.at(T::Eof) {
-                            let fname = self.ident();
-                            let pat = if self.eat(T::Colon) {
-                                self.parse_pattern()
-                            } else {
-                                Pattern {
-                                    id: self.nid(),
-                                    kind: PatKind::Ident(fname.sym),
-                                    span: fname.span,
-                                }
-                            };
-                            fps.push(FieldPat {
-                                name: fname.sym,
-                                pat,
-                            });
-                            if !self.eat(T::Comma) {
-                                break;
-                            }
-                        }
+                        let (fps, _rest) = self.parse_field_pats();
                         self.expect(T::RBrace);
                         PatKind::Variant {
                             path,
@@ -1944,10 +2220,59 @@ impl<'a> Parser<'a> {
                     } else {
                         PatKind::Path(path)
                     }
+                } else if self.nth(1) == T::At {
+                    // `name @ sub` — bind the whole value and match it against `sub`.
+                    let name = self.intern_span(start);
+                    self.bump(); // name
+                    self.bump(); // @
+                    let sub = self.parse_pattern_range();
+                    PatKind::Binding {
+                        name,
+                        sub: Box::new(sub),
+                    }
+                } else if self.nth(1) == T::LBrace {
+                    // `Point { x, y: 0, .. }` — a struct pattern. `Name {` cannot begin anything
+                    // else in pattern position (a binding is followed by `=>`, `=`, `:`, `in`, `|`,
+                    // `@` or `if`). `Self` names the implementing type inside an `impl`.
+                    let name = self.ident();
+                    let path = Path {
+                        segments: vec![name],
+                        span: name.span,
+                    };
+                    self.bump(); // {
+                    let (fields, rest) = self.parse_field_pats();
+                    self.expect(T::RBrace);
+                    PatKind::Struct { path, fields, rest }
                 } else {
                     let sym = self.intern_span(start);
                     self.bump();
                     PatKind::Ident(sym)
+                }
+            }
+            // `[a, b, .., z]` — an array pattern: the first elements, optionally a `..` standing
+            // for the unconstrained middle, and the last elements.
+            T::LBracket => {
+                self.bump(); // [
+                let mut prefix = Vec::new();
+                let mut suffix = Vec::new();
+                let mut rest = false;
+                while !self.at(T::RBracket) && !self.at(T::Eof) {
+                    if !rest && self.eat(T::DotDot) {
+                        rest = true;
+                    } else if rest {
+                        suffix.push(self.parse_pattern());
+                    } else {
+                        prefix.push(self.parse_pattern());
+                    }
+                    if !self.eat(T::Comma) {
+                        break;
+                    }
+                }
+                self.expect(T::RBracket);
+                PatKind::Slice {
+                    prefix,
+                    rest,
+                    suffix,
                 }
             }
             T::LParen => {
@@ -2168,6 +2493,47 @@ fn parse_u64_literal(text: &str) -> Option<u64> {
         u64::from_str_radix(b, 2).ok()
     } else {
         body.parse::<u64>().ok()
+    }
+}
+
+/// The names `p` binds, each once, in the order they first appear (an or-pattern's alternatives
+/// bind the same names, so the first is read), with the span to cite each by.
+fn pattern_bindings(p: &Pattern, out: &mut Vec<(Symbol, Span)>) {
+    fn push(sym: Symbol, span: Span, out: &mut Vec<(Symbol, Span)>) {
+        if !out.iter().any(|(s, _)| *s == sym) {
+            out.push((sym, span));
+        }
+    }
+    match &p.kind {
+        PatKind::Ident(s) => push(*s, p.span, out),
+        PatKind::Binding { name, sub } => {
+            push(*name, p.span, out);
+            pattern_bindings(sub, out);
+        }
+        PatKind::Tuple(subs) => subs.iter().for_each(|s| pattern_bindings(s, out)),
+        PatKind::Or(alts) => {
+            if let Some(first) = alts.first() {
+                pattern_bindings(first, out);
+            }
+        }
+        PatKind::Variant { fields, .. } => match fields {
+            VariantPat::Tuple(subs) => subs.iter().for_each(|s| pattern_bindings(s, out)),
+            VariantPat::Struct(fps) => fps.iter().for_each(|fp| pattern_bindings(&fp.pat, out)),
+        },
+        PatKind::Struct { fields, .. } => {
+            fields.iter().for_each(|fp| pattern_bindings(&fp.pat, out))
+        }
+        PatKind::Slice { prefix, suffix, .. } => prefix
+            .iter()
+            .chain(suffix)
+            .for_each(|s| pattern_bindings(s, out)),
+        PatKind::Wildcard
+        | PatKind::Unit
+        | PatKind::Int { .. }
+        | PatKind::Char(_)
+        | PatKind::Bool(_)
+        | PatKind::Path(_)
+        | PatKind::Range { .. } => {}
     }
 }
 

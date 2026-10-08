@@ -93,6 +93,13 @@ pub const LINTS: &[Lint] = &[
         code: "W0007",
         default: LintLevel::Warn,
     },
+    // A `match` arm no value can reach, found by the pattern-usefulness analysis that also decides
+    // E0405 (`crate::usefulness`).
+    Lint {
+        name: "unreachable_patterns",
+        code: "W0020",
+        default: LintLevel::Warn,
+    },
     // The parser's statement-terminator lints (`wukong_parser::ParseOutput::lints`); `E0210` is
     // reserved for the day a missing `;` becomes an error.
     Lint {
@@ -920,6 +927,7 @@ impl<'a> FnLint<'a> {
             }
             ExprKind::Match { scrutinee, arms } => {
                 self.expr(scrutinee);
+                self.unreachable_arms(scrutinee, arms);
                 for arm in arms {
                     self.scopes.push(Vec::new());
                     self.bind_pattern(&arm.pat, BindKind::Arm, false);
@@ -1107,6 +1115,35 @@ impl<'a> FnLint<'a> {
                 .primary(span, format!("unreachable {what}"))
                 .secondary(after, "any code following this is never executed"),
         );
+    }
+
+    /// `unreachable_patterns`: an arm whose every value an earlier unguarded arm already matches.
+    /// The verdict is sema's own exhaustiveness analysis, so a match it cannot reason about
+    /// reports nothing. An arm the parser synthesized (the fall-through `_` of an `if let`,
+    /// `while let` or `let … else`) is never reported: the user wrote no arm there.
+    fn unreachable_arms(&mut self, scrutinee: &Expr, arms: &[MatchArm]) {
+        let sema = self.sema;
+        let Some(ty) = sema.types.get(&scrutinee.id) else {
+            return;
+        };
+        let Some(report) = crate::usefulness::analyze(&sema.defs, self.interner, ty, arms) else {
+            return;
+        };
+        for i in report.unreachable {
+            let arm = &arms[i];
+            if arm.origin != ArmOrigin::Source {
+                continue;
+            }
+            self.diags.push(
+                Diagnostic::warning("unreachable pattern")
+                    .with_code("W0020")
+                    .primary(
+                        arm.pat.span,
+                        "every value this matches is matched by an earlier arm",
+                    )
+                    .help("delete the arm, or move it before the arm that covers it"),
+            );
+        }
     }
 
     /// `W0004`: an expression statement whose value is computed and discarded with no effect —
@@ -1335,6 +1372,22 @@ fn pattern_names(p: &Pattern, out: &mut Vec<(Symbol, Span)>) {
                 }
             }
         },
+        PatKind::Struct { fields, .. } => {
+            for fp in fields {
+                pattern_names(&fp.pat, out);
+            }
+        }
+        PatKind::Binding { name, sub } => {
+            if !out.iter().any(|(s, _)| s == name) {
+                out.push((*name, p.span));
+            }
+            pattern_names(sub, out);
+        }
+        PatKind::Slice { prefix, suffix, .. } => {
+            for s in prefix.iter().chain(suffix) {
+                pattern_names(s, out);
+            }
+        }
         PatKind::Wildcard
         | PatKind::Unit
         | PatKind::Int { .. }

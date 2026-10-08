@@ -116,6 +116,29 @@ pub enum PatKind {
         path: Path,
         fields: VariantPat,
     },
+    /// A struct pattern `Point { x, y: 0, .. }`: matches a value of the declared struct `path`
+    /// when every listed field's sub-pattern matches. A field the pattern does not list is
+    /// unconstrained, which `..` (`rest`) may say explicitly. The shorthand `{ x }` binds field `x`
+    /// to `x`, exactly as in a struct-payload [`PatKind::Variant`].
+    Struct {
+        path: Path,
+        fields: Vec<FieldPat>,
+        rest: bool,
+    },
+    /// `name @ sub`: matches when `sub` does, and binds the whole value to `name` as well
+    /// (`n @ 1..=9`, `whole @ (a, b)`).
+    Binding {
+        name: Symbol,
+        sub: Box<Pattern>,
+    },
+    /// An array pattern `[a, b, .., z]` on a fixed-size array: `prefix` matches the first
+    /// elements and `suffix` the last ones. Without a `..` (`rest: false`, `suffix` empty) the
+    /// pattern lists every element; with one, the elements between are unconstrained.
+    Slice {
+        prefix: Vec<Pattern>,
+        rest: bool,
+        suffix: Vec<Pattern>,
+    },
 }
 
 /// The payload-destructuring part of a [`PatKind::Variant`].

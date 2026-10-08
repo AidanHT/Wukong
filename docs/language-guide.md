@@ -190,6 +190,19 @@ does not fit widens to the narrowest type that holds it — `i64`, and then `u64
 (`tests/run/int_literal_widen.wk`); a value past `u64` is malformed (`E0401`). Use a suffix
 (`9000000000i64`, `3000000000u32`) to pick a specific type.
 
+**Literal inference** (✅): a `let` with no annotation whose initializer is only unsuffixed literals
+(`let mut s = 0.0;`, `let k = 2;`) is an `{float}`/`{integer}` binding, like Rust's — its type is
+decided by its **first constraining use**, and only that one: an assignment `s = v`, a `return s`,
+a call argument `f(s)` or a `let x: T = s` makes it that type (same kind, any width); a compound
+assignment (`s += v`), an arithmetic operator or a comparison with a typed operand of the same kind
+makes it that type when it is at least as wide, and otherwise keeps the default. So
+`let mut s = 0.0; for i in 0..n { s += x[i]; }` over `f64` data accumulates in `f64`
+(`tests/run/literal_infer_f64_accum.wk`), and `let k = 3; x * k` with `x: u32` is a `u32` product.
+An integer literal never becomes a float, a narrower operand never narrows the binding (`let k = 2;
+k + x_u8` stays an `i32` sum), a later use never re-decides what an earlier one decided (in
+`let k = 2; g_i32(k); x_i64 * k` the call keeps `k` an `i32`), and a binding nothing constrains keeps
+the literal's default.
+
 A `let` binding may **destructure a tuple** — `let (a, b) = …`, nested `let ((m, n), o) = …`, or a
 wildcard `let (keep, _) = …`, including the result of a tuple-returning call
 (`tests/run/let_destructure.wk`). A top-level **`const` is usable as a value**: its initializer is
@@ -275,7 +288,28 @@ for the bitwise operators — `1 | 2 == 2` is `(1 | 2) == 2` here, not `1 | (2 =
 comparison** is rejected rather than silently mis-parsed: `a < b < c` would parse as `(a < b) < c`, so
 it is an `E0401` that names the fix (`a < b && b < c`); the equality form `a == b == c` is caught the
 same way whenever the third operand is not itself a `bool` (an all-`bool` chain still parses as
-`(a == b) == c`). Compound assignment (`+=`, `*=`, `<<=`, `>>=`, …) is supported.
+`(a == b) == c`). Compound assignment (`+=`, `*=`, `<<=`, `>>=`, …) is supported, under the plain
+assignment's rule: `x op= v` stores `x op v`, which must be of `x`'s own type, so `v` must be of that
+type, promote into it losslessly (`i64 += i32`, `f64 += f32`), or be an unsuffixed literal (which
+must fit an integer place); `f32 += f64`, `i32 += i64` and `i32 += f32` are `E0441` — they used to
+convert the operand down to the place and accumulate in the narrower type
+(`tests/fail/compound_assign_narrowing.wk`). A shift amount (`<<=`, `>>=`) may be any integer type.
+
+**Mixed-type arithmetic** (✅) promotes only where nothing is lost and the operand order cannot
+matter: two integers of one signedness compute in the wider (`i32 + i64` is `i64`); an unsigned
+integer and a *strictly wider* signed one compute in the signed type (`u32 + i64` is `i64`, so
+`u32 / i64` is a signed divide: `7 / -2 == -3`); `f16`/`bf16` widen to `f32` and `f32` to `f64`;
+an integer meets a float only when the float holds every value of it exactly (8- and 16-bit
+integers with `f32`, up to 32-bit integers with `f64`). A signed value known never to be negative —
+a `for` counter that starts at a non-negative literal and is never assigned, or a non-negative
+`const` — also converts to an unsigned type at least as wide, so `for i in 0..m { … i * n … }` with
+`n: usize` needs no cast. Every other mix — `i32` with `u32`, `i64` with `f32`, `f16` with `bf16`,
+`char` with an integer — is `E0440`; write the `as` that says which type you mean. An unsuffixed
+literal operand adapts to the other operand and never needs a cast (`x * 2`, `2.0 * x`), and with
+an equally wide typed operand it takes that operand's type on either side (`1 + x` is `u32` for
+`x: u32`). `/` and `%` divide with the signedness of that common type. A shift amount is a count
+and may be any integer type (`tests/run/mixed_width_div_signedness.wk`,
+`tests/fail/mixed_sign_arith.wk`, `tests/fail/int_float_arith.wk`).
 
 Integer arithmetic wraps at the declared width. Division and remainder by zero return zero;
 signed minimum divided by `-1` wraps to signed minimum, with remainder zero. Shift counts are
@@ -360,18 +394,77 @@ an **identifier** binding (binds the scrutinee or field), and the wildcard `_`. 
 optional `if` guard, and `match` works in both value and statement position. See
 `tests/run/{match_expr,match_patterns,match_tuple}.wk`.
 
+```wukong
+struct Point { x: i32, y: i32 }
+
+fn describe(p: Point, n: i32, a: [i32; 4]) -> i32 {
+    let q = match p {
+        Point { x: 0, y: 0 } => 0,   // struct pattern: listed fields are tested…
+        Point { x: 0, .. } => 1,     // …unlisted ones are free (`..` says so)
+        Point { x, y } => x + y,     // shorthand binds `x` and `y`
+    };
+    let r = match n {
+        d @ 0..=9 => d,              // `name @ sub`: bind the whole value `sub` tested
+        _ => 10,
+    };
+    let s = match a {
+        [first, .., last] => first + last,   // array pattern on a `[T; N]`
+    };
+    return q + r + s;
+}
+```
+
+Three more pattern forms (✅): a **struct** pattern `Point { x: 0, y, .. }` on a value of that
+struct (an unlisted field is unconstrained), a **binding** `name @ sub` that binds the whole value
+`sub` matches (also nested: `(a @ 1..=5, b)`), and an **array** pattern `[a, b, .., z]` on a
+fixed-size array — without `..` it lists every element. All three also destructure in a `let`
+(`let Point { x, y } = p;`, `let [first, .., last] = a;`). An array pattern on a `[]T` slice is
+`E0401`: its length is a run-time value, so test `s.len()` and index instead.
+
+**`if let`, `while let` and `let … else`** (✅) are what they are in Rust, and the parser rewrites
+each into a `match`:
+
+```wukong
+if let Shape::Circle(r) = s { use(r); } else { other(); }   // match s { P => …, _ => … }
+while let 1..=100 = k { k = k - 7; }                         // loop { match k { P => …, _ => break } }
+let Shape::Circle(r) = s else { return 0; };                 // `r` is bound after this line
+```
+
+The `else` of a `let … else` must **diverge** — `return`, `break`, `continue`, or a `loop` with no
+exit — because the names its pattern binds do not exist on that path (`E0401` otherwise). A plain
+`let` pattern, in turn, must be **irrefutable**: `let Shape::Circle(r) = s;` would leave `r` unbound
+for every other shape, so it is `E0442`, with a witness naming a value it misses
+(`tests/run/patterns_struct_binding_slice.wk`, `tests/fail/let_refutable_pattern.wk`,
+`tests/fail/let_else_not_diverging.wk`). Not yet: a `rest @ ..` sub-array binding, a binding
+inside an or-pattern, `if let … && cond` chains, and destructuring in a `for` head.
+
 A literal pattern must be **in range for the scrutinee's type**: `match n { 200 => … }` against an
 `i8` is an `E0401` ("literal `200` is out of range for `i8` (-128..=127)"), not a value truncated to
 the scrutinee's width. The same check applies to both bounds of a range pattern.
 
 A `match` must be **exhaustive**, like Rust — and in **every** position, value *and* statement (an
-empty `match x {}` included): an `enum` needs every variant, a `bool` needs both cases, and any other
-scalar (an unbounded domain) needs a catch-all. A catch-all is a guard-less `_` **or** a guard-less
-identifier arm; an `enum` may also be covered by integer-literal/range patterns that match its
-declared discriminants. A provably-incomplete match is rejected at compile time (`E0405`); a guard
-(`if …`) never counts toward coverage. This closes a silent-wrong-answer hole — a non-exhaustive value
-match used to fall through to a zero default, and a statement/empty one to an `Unreachable` the two
-backends handled differently (`tests/fail/match_nonexhaustive.wk`).
+empty `match x {}` included). Exhaustiveness is decided by **pattern usefulness** (Maranget's
+algorithm, as in rustc), which looks *inside* patterns: an enum variant's payload sub-patterns, the
+fields of a tuple, and integer and `char` ranges split over the type's whole domain. So
+`Expr::Add(0, y)` covers only the `Add` values whose first field is 0, `(true, _)` plus
+`(false, true)` leaves `(false, false)` uncovered, and `0..=99 => …, 100..=255 => …` covers a `u8`
+with no `_` (`tests/run/match_u8_full_range.wk`). An `enum` may also be covered by integer-literal
+and range patterns that match its declared discriminants. A provably-incomplete match is rejected at
+compile time (`E0405`) with a **witness** — a pattern naming values no arm covers:
+
+```text
+error[E0405]: non-exhaustive `match`: pattern `Expr::Add(i32::MIN..=-1 | 1..=i32::MAX, _)` not covered
+```
+
+A guard (`if …`) never counts toward coverage, because it may be false. A `char` can hold any 32-bit
+value (an integer `as char` is unchecked), so a `char` match needs a `_` arm; struct and array
+patterns are checked field by field, and floats, slices and pointers are covered only by a `_` or a
+binding. This closes a silent-wrong-answer hole — a
+non-exhaustive value match used to fall through to a zero default, and a statement/empty one to an
+`Unreachable` the two backends handled differently (`tests/fail/match_nonexhaustive.wk`,
+`match_payload_subpattern_nonexhaustive.wk`, `match_tuple_nonexhaustive.wk`). The same analysis
+reports an arm no value can reach — every value it matches is matched by an earlier unguarded arm —
+as the warning `W0020` (`unreachable_patterns`).
 
 ## Tuples and structs ✅
 
@@ -1664,6 +1757,7 @@ and a name:
 | `W0005` | `dead_code` | a function of the compiled file no entry point reaches (`main`, the `--grad-of` function under `--emit=grad`/`--train`/`--emit=obj --grad-of`, `pub`, `@export`/`@extern`); nothing under `--emit=obj`/`llvm-ir` or in a file with no `main` |
 | `W0006` | `unwritten_output` | a `mut` array/slice/tensor/tuple/struct parameter — an output buffer — that is never stored to, assigned, passed on or borrowed |
 | `W0007` | `unknown_lints` | an `@allow`/`@warn`/`@deny` argument that names no lint |
+| `W0020` | `unreachable_patterns` | a `match` arm no value can reach: every value its pattern matches is matched by an earlier unguarded arm (`5 => …` after `0..=9 => …`, anything after `_`) |
 | `W0030` | `missing_semicolon` | a statement without its `;` (see below) |
 | `W0031` | `ambiguous_continuation` | a `(` or `[`, or a `-` touching its operand, at the start of a line, continuing the expression above it |
 

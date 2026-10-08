@@ -1076,6 +1076,20 @@ fn scan_pattern(p: &Pattern, f: &mut RegionFacts) {
                 }
             }
         },
+        PatKind::Struct { fields, .. } => {
+            for fp in fields {
+                scan_pattern(&fp.pat, f);
+            }
+        }
+        PatKind::Binding { name, sub } => {
+            f.declared.insert(*name);
+            scan_pattern(sub, f);
+        }
+        PatKind::Slice { prefix, suffix, .. } => {
+            for s in prefix.iter().chain(suffix) {
+                scan_pattern(s, f);
+            }
+        }
         PatKind::Wildcard
         | PatKind::Unit
         | PatKind::Int { .. }
