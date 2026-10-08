@@ -77,6 +77,8 @@ unsafe fn cumprod_rows(x: *const f32, out: *mut f32, cols: usize, r0: usize, r1:
 ///
 /// # Safety
 /// `x` and `out` must each be valid for `rows * cols` f32; `out` may alias `x` (in-place-safe per row).
+/// **Aliasing: exactly in place, otherwise disjoint** — `out` may be EXACTLY `x`; a SHIFTED view of
+/// `x` is not the source scan.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_cumprod_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
     if rows <= 0 || cols <= 0 {
@@ -93,6 +95,8 @@ pub unsafe extern "C" fn wukong_cumprod_f32(x: *const f32, out: *mut f32, rows: 
 ///
 /// # Safety
 /// `x`, `out` valid for `rows * cols` f32; each row written by exactly one task (disjoint sub-slices).
+/// **Aliasing: exactly in place, otherwise disjoint** — `out` may be EXACTLY `x`; a SHIFTED view of
+/// `x` is not the source scan.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_cumprod_f32_parallel(
     x: *const f32,

@@ -37,6 +37,10 @@ mod backend;
 mod bool_vectors;
 pub use backend::CraneliftBackend;
 
+// `--target-cpu`: the ISA level native code is generated for (host detection by default).
+mod target;
+pub use target::TargetCpu;
+
 // P4: raw-AVX2 emitter for the general vectorizer's 256-bit path (Cranelift caps CLIF vectors at
 // 128-bit). Owned by this session; additive.
 mod avx2;
@@ -536,6 +540,47 @@ const PROMISED_WRITTEN_REGION: AliasRegion = AliasRegion::Heap;
 /// forwarded across every store in the function.
 const PROMISED_READONLY_REGION: AliasRegion = AliasRegion::Table;
 
+/// The phrase every oversized-layout failure carries ([`FnTranslator::size_of_or_err`]); the anchor
+/// [`classify_error`] keys [`NativeErrorKind::LayoutTooLarge`] on.
+const LAYOUT_TOO_LARGE: &str = "is too large to lay out";
+
+/// Message prefixes of the failures this backend raises *by design* for a well-typed program it
+/// does not lower (an external call with no ABI, an assertion inside a foreign callback, an entry
+/// point with parameters, a target CPU it cannot serve).
+const UNSUPPORTED_PREFIXES: &[&str] = &[
+    "unsupported ",
+    "native entry point",
+    "native buffer dispatcher",
+    "no entry function",
+    "raw JIT function pointers",
+];
+
+/// What a native-backend failure means to the user. Every Cranelift entry point reports failure as
+/// a `String`; this is how the driver turns one into a catalogued diagnostic (a stable code,
+/// `--error-format=json`, `--explain`) instead of printing it bare. The phrases it keys on are
+/// produced in this crate, next to this function, so the two cannot drift apart unnoticed (pinned
+/// by `error_tests`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NativeErrorKind {
+    /// An array, vector or aggregate whose byte size exceeds the backend's 32-bit layout (`C0002`).
+    LayoutTooLarge,
+    /// A construct the native backend declines by design (`C0001`).
+    Unsupported,
+    /// A failure inside the backend itself — an internal compiler error, not the user's program.
+    Internal,
+}
+
+/// Classify a failure returned by [`jit_compile`], [`jit_run`] or [`emit_object`].
+pub fn classify_error(message: &str) -> NativeErrorKind {
+    if message.contains(LAYOUT_TOO_LARGE) {
+        NativeErrorKind::LayoutTooLarge
+    } else if UNSUPPORTED_PREFIXES.iter().any(|p| message.starts_with(p)) {
+        NativeErrorKind::Unsupported
+    } else {
+        NativeErrorKind::Internal
+    }
+}
+
 /// The runtime function an intrinsic call lowers to.
 #[derive(Clone, Copy)]
 enum Intrinsic {
@@ -733,8 +778,10 @@ impl<'a> FnTranslator<'a> {
             None => {
                 if self.layout_err.is_none() {
                     self.layout_err = Some(format!(
-                        "type `{}` is too large to lay out: byte size exceeds 2^32 (4 GiB)",
-                        ty.display()
+                        "type `{}` in function `{}` {LAYOUT_TOO_LARGE}: its byte size exceeds \
+                         2^32 (4 GiB), the native backend's addressing limit",
+                        ty.display(),
+                        self.interner.resolve(self.func.name)
                     ));
                 }
                 1
@@ -2713,10 +2760,11 @@ fn default_verify() -> bool {
     }
 }
 
-/// Should `emit_object` compile the user functions concurrently? Each function is an independent
-/// compilation unit, so parallel isel + serial in-order definition is byte-identical to serial
-/// codegen (proven by the `serial_parallel_object_bytes_identical` test). Default on; the
-/// `WUKONG_PAR_CODEGEN=0` kill-switch forces serial.
+/// Should the backend compile the user functions concurrently — for `emit_object` and for both JIT
+/// entry points ([`jit_compile`], [`jit_module`])? Each function is an independent compilation
+/// unit, so parallel isel + serial in-order definition is byte-identical to serial codegen (proven
+/// for objects by `serial_parallel_object_bytes_identical`; the JIT twin in `backend_opt_tests`
+/// checks the two JIT paths agree). Default on; the `WUKONG_PAR_CODEGEN=0` kill-switch forces serial.
 fn default_parallel() -> bool {
     !matches!(
         std::env::var("WUKONG_PAR_CODEGEN").ok().as_deref(),
@@ -2724,17 +2772,80 @@ fn default_parallel() -> bool {
     )
 }
 
-fn make_isa(pic: bool) -> Result<std::sync::Arc<dyn cranelift_codegen::isa::TargetIsa>, String> {
-    make_isa_verify(pic, default_verify())
+/// How hard Cranelift works on the code it is handed — the backend half of the source `-O` level.
+///
+/// The mid-end (e-graph rewrites, GVN, alias analysis) is worth its compile time only on code the
+/// optimizer has already shaped. At `-O0` `wukong_opt` runs no passes, so Cranelift receives the
+/// largest, least-SSA input (every local an alloca with loads and stores) — and `-O0` is the CLI
+/// default, the configuration where compile latency matters most. Mapping it to Cranelift's
+/// `opt_level=none` is what `rustc_codegen_cranelift` does for debug builds. No Cranelift opt level
+/// reassociates, contracts or otherwise changes floating-point results, so the interpreter/native
+/// differential stays bit-exact at every level; only code speed differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BackendOpt {
+    /// The source optimization level (`-O0` .. `-O3`). `0` selects Cranelift `opt_level=none`;
+    /// anything higher selects `speed`.
+    pub level: u8,
 }
 
-fn make_isa_verify(
+impl BackendOpt {
+    /// The backend configuration for source optimization level `level`.
+    pub fn for_level(level: u8) -> Self {
+        BackendOpt { level }
+    }
+
+    /// The Cranelift `opt_level` flag value this configuration selects.
+    fn cranelift_opt_level(self) -> &'static str {
+        if self.level == 0 {
+            "none"
+        } else {
+            "speed"
+        }
+    }
+}
+
+impl Default for BackendOpt {
+    /// The optimizing configuration (`speed`): what every entry point without an explicit
+    /// [`BackendOpt`] — the benches, the harnesses, the library API — has always compiled with.
+    fn default() -> Self {
+        BackendOpt { level: 2 }
+    }
+}
+
+fn make_isa(pic: bool) -> Result<std::sync::Arc<dyn cranelift_codegen::isa::TargetIsa>, String> {
+    make_isa_for(pic, default_verify(), TargetCpu::Native)
+}
+
+/// The ISA for `target` with the optimizing backend configuration ([`BackendOpt::default`]).
+fn make_isa_for(
     pic: bool,
     verify: bool,
+    target: TargetCpu,
+) -> Result<std::sync::Arc<dyn cranelift_codegen::isa::TargetIsa>, String> {
+    make_isa_full(pic, verify, target, BackendOpt::default())
+}
+
+/// The host ISA ([`TargetCpu::Native`]) with an explicit backend configuration.
+fn make_isa_with(
+    pic: bool,
+    verify: bool,
+    backend: BackendOpt,
+) -> Result<std::sync::Arc<dyn cranelift_codegen::isa::TargetIsa>, String> {
+    make_isa_full(pic, verify, TargetCpu::Native, backend)
+}
+
+/// Both axes at once: the instruction-set level code is generated for (`--target-cpu`) and how
+/// hard Cranelift works on it (the source `-O` level). They are independent — a target level
+/// fixes the feature flags, the backend level only the mid-end — so every pair is valid.
+fn make_isa_full(
+    pic: bool,
+    verify: bool,
+    target: TargetCpu,
+    backend: BackendOpt,
 ) -> Result<std::sync::Arc<dyn cranelift_codegen::isa::TargetIsa>, String> {
     let mut flag_builder = settings::builder();
     flag_builder
-        .set("opt_level", "speed")
+        .set("opt_level", backend.cranelift_opt_level())
         .map_err(|e| e.to_string())?;
     // The IR verifier is a diagnostic-only pass (see `default_verify`); disabling it in release
     // trims compile time without changing a single emitted byte.
@@ -2756,7 +2867,7 @@ fn make_isa_verify(
     flag_builder
         .set("probestack_strategy", "inline")
         .map_err(|e| e.to_string())?;
-    let isa_builder = cranelift_native::builder().map_err(|e| e.to_string())?;
+    let isa_builder = target::isa_builder(target)?;
     isa_builder
         .finish(settings::Flags::new(flag_builder))
         .map_err(|e| e.to_string())
@@ -2773,40 +2884,71 @@ fn is_failure_intrinsic(func: Symbol, interner: &Interner) -> bool {
 /// function, or runs a parallel region whose body is one. A region body's failure comes back
 /// through the JIT's `rt_parallel_for` (the cancellation ABI, see there) to the caller of
 /// `wukong_parallel_for`; in a linked executable it exits the process where it happens.
+///
+/// One scan builds the reverse call graph and the seeds, then a worklist walks it, linear in
+/// instructions plus call edges. A direct call to a defined function is an edge; so is a parallel
+/// region whose body is a `func_addr g` (`g` failing makes the region's caller fail), while a body
+/// of any other provenance is assumed to fail ([`callback_can_fail`]) and seeds its caller. The
+/// sweep-to-fixpoint this replaces re-scanned every instruction per sweep and found one more
+/// call-chain level per sweep when callers precede their callees in source order (O(chain length x
+/// instructions)); both compute the same least fixpoint.
 fn asserting_functions(program: &Program, interner: &Interner) -> HashSet<Symbol> {
     let defined: HashSet<Symbol> = program.funcs.iter().map(|f| f.name).collect();
+    let mut callers: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
     let mut asserting = HashSet::new();
-    loop {
-        let mut changed = false;
-        for f in &program.funcs {
-            if asserting.contains(&f.name) {
+    let mut work = Vec::new();
+    for f in &program.funcs {
+        for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+            let Op::Call { func, args } = &inst.op else {
+                continue;
+            };
+            if defined.contains(func) {
+                callers.entry(*func).or_default().push(f.name);
                 continue;
             }
-            let can_fail = f.blocks.iter().flat_map(|b| &b.insts).any(|inst| {
-                let Op::Call { func, args } = &inst.op else {
-                    return false;
-                };
-                if asserting.contains(func) {
-                    return true;
+            let seed = if is_failure_intrinsic(*func, interner) {
+                true
+            } else if interner.resolve(*func) == RT_PARALLEL_FOR {
+                match args.get(1).map(|&body| callback_target(f, body)) {
+                    // A `func_addr g` body: `f` fails exactly when `g` does — an edge.
+                    Some(Some(g)) => {
+                        callers.entry(g).or_default().push(f.name);
+                        false
+                    }
+                    // A body of any other provenance is assumed to fail.
+                    Some(None) => callback_can_fail(f, args[1], &asserting),
+                    None => false,
                 }
-                if defined.contains(func) {
-                    return false;
-                }
-                is_failure_intrinsic(*func, interner)
-                    || (interner.resolve(*func) == RT_PARALLEL_FOR
-                        && args
-                            .get(1)
-                            .is_some_and(|&body| callback_can_fail(f, body, &asserting)))
-            });
-            if can_fail {
-                changed |= asserting.insert(f.name);
+            } else {
+                false
+            };
+            if seed && asserting.insert(f.name) {
+                work.push(f.name);
             }
         }
-        if !changed {
-            break;
+    }
+    while let Some(callee) = work.pop() {
+        for &caller in callers.get(&callee).map_or(&[][..], |v| &v[..]) {
+            if asserting.insert(caller) {
+                work.push(caller);
+            }
         }
     }
     asserting
+}
+
+/// The function a parallel region's `body` operand names when `f` defines it as `func_addr g`;
+/// `None` for a body of any other provenance.
+fn callback_target(f: &Function, body: ValueId) -> Option<Symbol> {
+    let def = f
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .find(|inst| inst.result == Some(body));
+    match def.map(|inst| &inst.op) {
+        Some(Op::FuncAddr(g)) => Some(*g),
+        _ => None,
+    }
 }
 
 /// Can the callback whose address `f` passes as `body` fail? A direct `func_addr g` can exactly
@@ -2830,8 +2972,7 @@ fn populate_module<M: Module>(
     interner: &Interner,
     parallel: bool,
 ) -> Result<HashMap<Symbol, FuncId>, String> {
-    let legalized = bool_vectors::legalize(program, interner)?;
-    let program = legalized.as_ref();
+    // Compact boolean-vector casts are legalized per function inside `build_function_clif`.
     let asserting = asserting_functions(program, interner);
     let ptr_ty = module.target_config().pointer_type();
     let call_conv = module.target_config().default_call_conv;
@@ -3954,6 +4095,10 @@ fn build_function_clif(
     clif: &mut cranelift_codegen::ir::Function,
     scratch: &mut TranslationScratch,
 ) -> Result<(), String> {
+    // A function with a float-to-`i1`-vector cast is scalarized here, on its own codegen worker;
+    // every other function is borrowed as is (see `bool_vectors::legalize`).
+    let legalized = bool_vectors::legalize(f, interner)?;
+    let f: &Function = &legalized;
     clif.signature = signature_of(f, ptr_ty, call_conv);
     let TranslationScratch {
         vmap,
@@ -4391,14 +4536,68 @@ fn run_on_big_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
 }
 
 /// JIT-compile `program`, returning a callable handle to `entry`. `entry` must name a function that
-/// takes **no parameters** — a parameterized entry is an `Err`, not a wrong call. Unlike
-/// `emit_object`, the JIT paths always populate the module serially (no `WUKONG_PAR_CODEGEN` effect).
+/// takes **no parameters** — a parameterized entry is an `Err`, not a wrong call. Functions compile
+/// concurrently, exactly as for `emit_object` (see [`default_parallel`]), with the optimizing
+/// backend configuration ([`BackendOpt::default`]).
 pub fn jit_compile(
     program: &Program,
     entry: Symbol,
     interner: &Interner,
 ) -> Result<JitProgram, String> {
-    jit_compile_entry(program, entry, interner, false)
+    jit_compile_with(program, entry, interner, BackendOpt::default())
+}
+
+/// As [`jit_compile`], generating code for `target` instead of the full host feature set — so the
+/// code an `--emit=obj --target-cpu=<level>` object would contain can be *run* on this machine. The
+/// host must implement every feature of the level (a JIT cannot run code its CPU faults on).
+pub fn jit_compile_for(
+    program: &Program,
+    entry: Symbol,
+    interner: &Interner,
+    target: TargetCpu,
+) -> Result<JitProgram, String> {
+    jit_compile_for_with(program, entry, interner, target, BackendOpt::default())
+}
+
+/// As [`jit_compile`], with an explicit backend configuration (the driver passes the source `-O`
+/// level, so `-O0` compiles with Cranelift `opt_level=none`).
+pub fn jit_compile_with(
+    program: &Program,
+    entry: Symbol,
+    interner: &Interner,
+    backend: BackendOpt,
+) -> Result<JitProgram, String> {
+    jit_compile_for_with(program, entry, interner, TargetCpu::Native, backend)
+}
+
+/// Both [`jit_compile_for`]'s instruction-set level and [`jit_compile_with`]'s backend
+/// configuration — what the driver uses for `--run --backend=native`, which honours both
+/// `--target-cpu` and `-O`.
+pub fn jit_compile_for_with(
+    program: &Program,
+    entry: Symbol,
+    interner: &Interner,
+    target: TargetCpu,
+    backend: BackendOpt,
+) -> Result<JitProgram, String> {
+    let missing = target::missing_on_host(target);
+    if !missing.is_empty() {
+        return Err(format!(
+            "unsupported target CPU `{}` for the JIT: this host lacks {}; use --emit=obj/exe to \
+             build for it",
+            target.name(),
+            missing.join(", ")
+        ));
+    }
+    jit_compile_entry(
+        program,
+        entry,
+        interner,
+        false,
+        target,
+        backend,
+        default_parallel(),
+    )
 }
 
 // The parameterized handle remains private inside JitBufferKernel: exposing it as JitProgram
@@ -4408,10 +4607,14 @@ fn jit_compile_entry(
     entry: Symbol,
     interner: &Interner,
     buffer_dispatch: bool,
+    target: TargetCpu,
+    backend: BackendOpt,
+    parallel: bool,
 ) -> Result<JitProgram, String> {
     use cranelift_jit::{JITBuilder, JITModule};
 
-    let isa = make_isa(false)?;
+    target::check_vec_kernels(program, interner, target)?;
+    let isa = make_isa_full(false, default_verify(), target, backend)?;
     let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
     builder.symbol(RT_PRINT_I64, rt_print_i64 as *const u8);
     builder.symbol(RT_PRINT_U64, rt_print_u64 as *const u8);
@@ -4942,7 +5145,7 @@ fn jit_compile_entry(
     bind_extern_symbols(&mut builder, program, interner)?;
     let mut module = JITModule::new(builder);
 
-    let ids = populate_module(&mut module, program, interner, false)?;
+    let ids = populate_module(&mut module, program, interner, parallel)?;
     module.finalize_definitions().map_err(|e| e.to_string())?;
 
     let entry_fn = program
@@ -4995,6 +5198,16 @@ pub fn jit_run_capturing(
         Ok(native) => native.run_capturing(),
         Err(e) => (Err(e), Vec::new()),
     }
+}
+
+/// As [`jit_run`], with an explicit backend configuration (see [`jit_compile_with`]).
+pub fn jit_run_with(
+    program: &Program,
+    entry: Symbol,
+    interner: &Interner,
+    backend: BackendOpt,
+) -> Result<(i64, Vec<u8>), String> {
+    jit_compile_with(program, entry, interner, backend)?.run()
 }
 
 /// A JIT-compiled module exposing raw pointers to any of its functions, for callers that know a
@@ -5564,7 +5777,7 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(RT_FMOD_F32, rt_fmod_f32 as *const u8);
     bind_extern_symbols(&mut builder, program, interner)?;
     let mut module = JITModule::new(builder);
-    let ids = populate_module(&mut module, program, interner, false)?;
+    let ids = populate_module(&mut module, program, interner, default_parallel())?;
     module.finalize_definitions().map_err(|e| e.to_string())?;
     Ok(JitModuleHandle {
         module: Some(module),
@@ -5618,6 +5831,45 @@ pub fn emit_object(program: &Program, interner: &Interner) -> Result<Vec<u8>, St
     emit_object_ex(program, interner, EmitOptions::production()).map(|(bytes, _)| bytes)
 }
 
+/// As [`emit_object`], for the instruction-set level `target` (`--target-cpu`) instead of the host's.
+/// A program carrying raw AVX2+FMA vector kernels is refused for a level below x86-64-v3 rather
+/// than embedding bytes that level cannot execute.
+pub fn emit_object_for(
+    program: &Program,
+    interner: &Interner,
+    target: TargetCpu,
+) -> Result<Vec<u8>, String> {
+    emit_object_for_with(program, interner, target, BackendOpt::default())
+}
+
+/// As [`emit_object`], with an explicit backend configuration (the driver passes the source `-O`
+/// level, so an `-O0` object compiles with Cranelift `opt_level=none`).
+pub fn emit_object_with(
+    program: &Program,
+    interner: &Interner,
+    backend: BackendOpt,
+) -> Result<Vec<u8>, String> {
+    emit_object_for_with(program, interner, TargetCpu::Native, backend)
+}
+
+/// Both [`emit_object_for`]'s instruction-set level and [`emit_object_with`]'s backend
+/// configuration — what `--emit=obj|exe` uses, honouring `--target-cpu` and `-O` together.
+pub fn emit_object_for_with(
+    program: &Program,
+    interner: &Interner,
+    target: TargetCpu,
+    backend: BackendOpt,
+) -> Result<Vec<u8>, String> {
+    emit_object_full(
+        program,
+        interner,
+        EmitOptions::production(),
+        target,
+        backend,
+    )
+    .map(|(bytes, _)| bytes)
+}
+
 /// As [`emit_object`], but also returns the codegen-vs-object-write [`ObjTimings`] split. The bytes
 /// are identical to `emit_object`; only measurement is added.
 pub fn emit_object_timed(
@@ -5627,16 +5879,60 @@ pub fn emit_object_timed(
     emit_object_ex(program, interner, EmitOptions::production())
 }
 
+/// As [`emit_object_timed`], with an explicit backend configuration — so the timed object is the
+/// one the requested `-O` level produces.
+pub fn emit_object_timed_with(
+    program: &Program,
+    interner: &Interner,
+    backend: BackendOpt,
+) -> Result<(Vec<u8>, ObjTimings), String> {
+    emit_object_timed_for_with(program, interner, TargetCpu::Native, backend)
+}
+
+/// As [`emit_object_timed_with`], for the instruction-set level `target` — what `wukongc
+/// --time-passes` uses, so the timed object is exactly the one `--target-cpu` and `-O` produce.
+pub fn emit_object_timed_for_with(
+    program: &Program,
+    interner: &Interner,
+    target: TargetCpu,
+    backend: BackendOpt,
+) -> Result<(Vec<u8>, ObjTimings), String> {
+    emit_object_full(
+        program,
+        interner,
+        EmitOptions::production(),
+        target,
+        backend,
+    )
+}
+
 fn emit_object_ex(
     program: &Program,
     interner: &Interner,
     opts: EmitOptions,
 ) -> Result<(Vec<u8>, ObjTimings), String> {
+    emit_object_full(
+        program,
+        interner,
+        opts,
+        TargetCpu::Native,
+        BackendOpt::default(),
+    )
+}
+
+fn emit_object_full(
+    program: &Program,
+    interner: &Interner,
+    opts: EmitOptions,
+    target: TargetCpu,
+    backend: BackendOpt,
+) -> Result<(Vec<u8>, ObjTimings), String> {
     use cranelift_object::{ObjectBuilder, ObjectModule};
     use std::time::Instant;
 
+    target::check_vec_kernels(program, interner, target)?;
     let t_cg = Instant::now();
-    let isa = make_isa_verify(true, opts.verify)?;
+    let isa = make_isa_full(true, opts.verify, target, backend)?;
     let builder = ObjectBuilder::new(isa, "wukong", cranelift_module::default_libcall_names())
         .map_err(|e| e.to_string())?;
     let mut module = ObjectModule::new(builder);
@@ -5664,10 +5960,19 @@ mod tests;
 mod assertion_tests;
 
 #[cfg(test)]
+mod error_tests;
+
+#[cfg(test)]
+mod target_tests;
+
+#[cfg(test)]
 mod fuzz;
 
 #[cfg(test)]
 mod fuzz_grammar;
+
+#[cfg(test)]
+mod backend_opt_tests;
 
 mod guarded_kernel;
 pub use guarded_kernel::{jit_compile_buffer_kernel, JitBufferKernel};

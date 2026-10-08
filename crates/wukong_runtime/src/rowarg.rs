@@ -206,6 +206,7 @@ unsafe fn rowarg_par(x: *const f32, out: *mut i32, rows: i64, cols: i64, is_max:
 ///
 /// # Safety
 /// `x` valid for `rows*cols` `f32`; `out` valid for `rows` `i32`; non-overlapping.
+/// **Aliasing: all operands disjoint** — the `i32` output does not overlap `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_rowargmax_i32(x: *const f32, out: *mut i32, rows: i64, cols: i64) {
     rowarg_serial(x, out, rows, cols, true);
@@ -215,6 +216,8 @@ pub unsafe extern "C" fn wukong_rowargmax_i32(x: *const f32, out: *mut i32, rows
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_rowargmax_i32`].
+/// **Aliasing:** that of [`wukong_rowargmax_i32`] — all operands disjoint: the `i32` output does
+/// not overlap `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_rowargmax_i32_parallel(
     x: *const f32,
@@ -230,6 +233,7 @@ pub unsafe extern "C" fn wukong_rowargmax_i32_parallel(
 ///
 /// # Safety
 /// `x` valid for `rows*cols` `f32`; `out` valid for `rows` `i32`; non-overlapping.
+/// **Aliasing: all operands disjoint** — the `i32` output does not overlap `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_rowargmin_i32(x: *const f32, out: *mut i32, rows: i64, cols: i64) {
     rowarg_serial(x, out, rows, cols, false);
@@ -239,6 +243,8 @@ pub unsafe extern "C" fn wukong_rowargmin_i32(x: *const f32, out: *mut i32, rows
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_rowargmin_i32`].
+/// **Aliasing:** that of [`wukong_rowargmin_i32`] — all operands disjoint: the `i32` output does
+/// not overlap `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_rowargmin_i32_parallel(
     x: *const f32,

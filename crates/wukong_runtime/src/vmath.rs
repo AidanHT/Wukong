@@ -1038,6 +1038,8 @@ unsafe fn vmath_scalar(x: *const f32, out: *mut f32, n: usize, op: i64) {
 ///
 /// # Safety
 /// `x` and `out` must each be valid for `n` `f32` elements.
+/// **Aliasing: exactly in place, otherwise disjoint** — `out` may be EXACTLY `x`; a SHIFTED overlap
+/// is not the elementwise source loop.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_vmath_f32(x: *const f32, out: *mut f32, n: i64, op: i64) {
     if n <= 0 {
@@ -1074,6 +1076,8 @@ const VMATH_PAR_MIN: usize = VMATH_CHUNK;
 ///
 /// # Safety
 /// `x` and `out` must each be valid for `n` `f32` elements.
+/// **Aliasing: exactly in place, otherwise disjoint** — `out` may be EXACTLY `x`; a SHIFTED overlap
+/// is not the elementwise source loop.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_vmath_f32_parallel(x: *const f32, out: *mut f32, n: i64, op: i64) {
     if n <= 0 {
@@ -1958,6 +1962,8 @@ unsafe fn vmath2_scalar(x: *const f32, y: *const f32, out: *mut f32, n: usize, o
 ///
 /// # Safety
 /// `x`, `y`, and `out` must each be valid for `n` `f32` elements.
+/// **Aliasing: exactly in place, otherwise disjoint** — `out` may be EXACTLY `x` or `y`; a
+/// SHIFTED overlap is not the elementwise source loop (the 8-lane body loads before it stores).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_vmath2_f32(
     x: *const f32,
@@ -2108,6 +2114,7 @@ where
 ///
 /// # Safety
 /// `x` must be valid for `n` `u16` (bf16 bits); `out` for `n` `f32`.
+/// **Aliasing: all operands disjoint** — the f32 `out` does not overlap the half-precision `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_vmath_bf16(x: *const u16, out: *mut f32, n: i64, op: i64) {
     if n <= 0 {
@@ -2203,6 +2210,7 @@ unsafe fn vmath_bf16_loop<F: Fn(std::arch::x86_64::__m256) -> std::arch::x86_64:
 ///
 /// # Safety
 /// `x` must be valid for `n` `u16` (f16 bits); `out` for `n` `f32`.
+/// **Aliasing: all operands disjoint** — the f32 `out` does not overlap the half-precision `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_vmath_f16(x: *const u16, out: *mut f32, n: i64, op: i64) {
     if n <= 0 {

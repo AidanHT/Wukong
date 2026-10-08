@@ -660,6 +660,8 @@ unsafe fn reduce_minmax_f16_avx(op: i64, x: &[u16]) -> f32 {
 ///
 /// # Safety
 /// `x` must point to `n` readable `u16`.
+/// **Aliasing: none constrained** — every operand is only read and the result is returned by
+/// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_reduce_bf16(x: *const u16, n: i64, op: i64) -> f32 {
     if n <= 0 {
@@ -679,6 +681,8 @@ pub unsafe extern "C" fn wukong_reduce_bf16(x: *const u16, n: i64, op: i64) -> f
 ///
 /// # Safety
 /// `x` must point to `n` readable `u16`.
+/// **Aliasing: none constrained** — every operand is only read and the result is returned by
+/// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_reduce_f16(x: *const u16, n: i64, op: i64) -> f32 {
     if n <= 0 {
@@ -698,6 +702,8 @@ pub unsafe extern "C" fn wukong_reduce_f16(x: *const u16, n: i64, op: i64) -> f3
 ///
 /// # Safety
 /// `x` must point to `n` readable `u16`.
+/// **Aliasing: none constrained** — every operand is only read and the result is returned by
+/// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sum_f16(x: *const u16, n: i64) -> f32 {
     if n <= 0 {
@@ -715,6 +721,8 @@ pub unsafe extern "C" fn wukong_sum_f16(x: *const u16, n: i64) -> f32 {
 ///
 /// # Safety
 /// `x` must point to `n` readable `u16`.
+/// **Aliasing: none constrained** — every operand is only read and the result is returned by
+/// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sum_bf16(x: *const u16, n: i64) -> f32 {
     if n <= 0 {
@@ -732,6 +740,8 @@ pub unsafe extern "C" fn wukong_sum_bf16(x: *const u16, n: i64) -> f32 {
 ///
 /// # Safety
 /// `x` and `y` must each point to `n` readable `u16`.
+/// **Aliasing: none constrained** — every operand is only read and the result is returned by
+/// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_dot_f16(x: *const u16, y: *const u16, n: i64) -> f32 {
     if n <= 0 {
@@ -750,6 +760,8 @@ pub unsafe extern "C" fn wukong_dot_f16(x: *const u16, y: *const u16, n: i64) ->
 ///
 /// # Safety
 /// `x` and `y` must each point to `n` readable `u16`.
+/// **Aliasing: none constrained** — every operand is only read and the result is returned by
+/// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_dot_bf16(x: *const u16, y: *const u16, n: i64) -> f32 {
     if n <= 0 {
@@ -853,6 +865,8 @@ fn par_half_dot(x: &[u16], y: &[u16], per_chunk: impl Fn(&[u16], &[u16]) -> f32 
 ///
 /// # Safety
 /// `x` must point to `n` readable `u16`.
+/// **Aliasing: none constrained** — every operand is only read and the result is returned by
+/// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sum_bf16_parallel(x: *const u16, n: i64) -> f32 {
     if n <= 0 {
@@ -871,6 +885,8 @@ pub unsafe extern "C" fn wukong_sum_bf16_parallel(x: *const u16, n: i64) -> f32 
 ///
 /// # Safety
 /// `x` must point to `n` readable `u16`.
+/// **Aliasing: none constrained** — every operand is only read and the result is returned by
+/// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sum_f16_parallel(x: *const u16, n: i64) -> f32 {
     if n <= 0 {
@@ -889,6 +905,8 @@ pub unsafe extern "C" fn wukong_sum_f16_parallel(x: *const u16, n: i64) -> f32 {
 ///
 /// # Safety
 /// `x` and `y` must each point to `n` readable `u16`.
+/// **Aliasing: none constrained** — every operand is only read and the result is returned by
+/// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_dot_bf16_parallel(x: *const u16, y: *const u16, n: i64) -> f32 {
     if n <= 0 {
@@ -908,6 +926,8 @@ pub unsafe extern "C" fn wukong_dot_bf16_parallel(x: *const u16, y: *const u16, 
 ///
 /// # Safety
 /// `x` and `y` must each point to `n` readable `u16`.
+/// **Aliasing: none constrained** — every operand is only read and the result is returned by
+/// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_dot_f16_parallel(x: *const u16, y: *const u16, n: i64) -> f32 {
     if n <= 0 {
@@ -929,6 +949,8 @@ pub unsafe extern "C" fn wukong_dot_f16_parallel(x: *const u16, y: *const u16, n
 ///
 /// # Safety
 /// `x` must point to `n` readable `u16`.
+/// **Aliasing: none constrained** — every operand is only read and the result is returned by
+/// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_reduce_bf16_parallel(x: *const u16, n: i64, op: i64) -> f32 {
     if n <= 0 {
@@ -957,6 +979,8 @@ pub unsafe extern "C" fn wukong_reduce_bf16_parallel(x: *const u16, n: i64, op: 
 ///
 /// # Safety
 /// `x` must point to `n` readable `u16`.
+/// **Aliasing: none constrained** — every operand is only read and the result is returned by
+/// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_reduce_f16_parallel(x: *const u16, n: i64, op: i64) -> f32 {
     if n <= 0 {
@@ -1052,6 +1076,8 @@ unsafe fn axpby_bf16_avx(x: &[u16], y: &[u16], out: &mut [f32], a: f32, b: f32) 
 ///
 /// # Safety
 /// `x`/`y` must point to `n` readable `u16`; `out` to `n` writable `f32`.
+/// **Aliasing: all operands disjoint** — the f32 `out` overlaps neither half-precision input (any
+/// overlap is a mixed-width pun the source loop does not perform).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_axpby_bf16(
     x: *const u16,
@@ -1106,6 +1132,8 @@ unsafe fn axpby_f16_avx(x: &[u16], y: &[u16], out: &mut [f32], a: f32, b: f32) {
 ///
 /// # Safety
 /// `x`/`y` must point to `n` readable `u16`; `out` to `n` writable `f32`.
+/// **Aliasing: all operands disjoint** — the f32 `out` overlaps neither half-precision input (any
+/// overlap is a mixed-width pun the source loop does not perform).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_axpby_f16(
     x: *const u16,
@@ -1442,6 +1470,8 @@ unsafe fn vmath_narrow_f16_loop<F: Fn(__m256) -> __m256>(
 ///
 /// # Safety
 /// `x`/`y` must point to `n` readable `u16`; `out` to `n` writable `u16`.
+/// **Aliasing: exactly in place, otherwise disjoint** — `out` may be EXACTLY `x` or `y`; the
+/// compiler dispatches no other overlap.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_axpby_bf16_out(
     x: *const u16,
@@ -1471,6 +1501,8 @@ pub unsafe extern "C" fn wukong_axpby_bf16_out(
 ///
 /// # Safety
 /// `x`/`y` must point to `n` readable `u16`; `out` to `n` writable `u16`.
+/// **Aliasing: exactly in place, otherwise disjoint** — `out` may be EXACTLY `x` or `y`; the
+/// compiler dispatches no other overlap.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_axpby_f16_out(
     x: *const u16,
@@ -1508,6 +1540,8 @@ pub unsafe extern "C" fn wukong_axpby_f16_out(
 ///
 /// # Safety
 /// `x` must point to `n` readable `u16` (bf16 bits); `out` to `n` writable `u16`.
+/// **Aliasing: exactly in place, otherwise disjoint** — `out` may be EXACTLY `x`; the compiler
+/// dispatches no other overlap.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_vmath_bf16_out(x: *const u16, out: *mut u16, n: i64, op: i64) {
     if n <= 0 {
@@ -1530,6 +1564,8 @@ pub unsafe extern "C" fn wukong_vmath_bf16_out(x: *const u16, out: *mut u16, n: 
 ///
 /// # Safety
 /// `x` must point to `n` readable `u16` (f16 bits); `out` to `n` writable `u16`.
+/// **Aliasing: exactly in place, otherwise disjoint** — `out` may be EXACTLY `x`; the compiler
+/// dispatches no other overlap.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_vmath_f16_out(x: *const u16, out: *mut u16, n: i64, op: i64) {
     if n <= 0 {

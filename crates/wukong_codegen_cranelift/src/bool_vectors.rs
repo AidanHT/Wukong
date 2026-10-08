@@ -6,7 +6,7 @@
 //! Function ABIs are unchanged: vector parameters/returns and vector-valued calls are declined.
 
 use std::borrow::Cow;
-use wukong_mir::{CastKind, CmpOp, Function, Inst, MirType, Op, Program, Terminator, ValueId};
+use wukong_mir::{CastKind, CmpOp, Function, Inst, MirType, Op, Terminator, ValueId};
 use wukong_span::Interner;
 
 fn needs_legalization(f: &Function) -> bool {
@@ -16,24 +16,25 @@ fn needs_legalization(f: &Function) -> bool {
     })
 }
 
+/// Legalize one function for codegen: borrowed unchanged unless it holds a float-to-`i1`-vector
+/// cast, in which case only this function is copied and scalarized. Called per function from
+/// `build_function_clif`, so the copy happens on that function's codegen worker and the rest of the
+/// program is never cloned. Scalarization leaves the signature, every call and every function
+/// address untouched, so module-level declarations and the assert analysis see the same program.
 pub(super) fn legalize<'a>(
-    program: &'a Program,
+    f: &'a Function,
     interner: &Interner,
-) -> Result<Cow<'a, Program>, String> {
-    if !program.funcs.iter().any(needs_legalization) {
-        return Ok(Cow::Borrowed(program));
+) -> Result<Cow<'a, Function>, String> {
+    if !needs_legalization(f) {
+        return Ok(Cow::Borrowed(f));
     }
-    let mut lowered = program.clone();
-    for f in &mut lowered.funcs {
-        if needs_legalization(f) {
-            scalarize(f).map_err(|why| {
-                format!(
-                    "unsupported compact boolean vector legalization in `{}`: {why}",
-                    interner.resolve(f.name)
-                )
-            })?;
-        }
-    }
+    let mut lowered = f.clone();
+    scalarize(&mut lowered).map_err(|why| {
+        format!(
+            "unsupported compact boolean vector legalization in `{}`: {why}",
+            interner.resolve(f.name)
+        )
+    })?;
     Ok(Cow::Owned(lowered))
 }
 
@@ -260,4 +261,65 @@ fn scalarize(f: &mut Function) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wukong_mir::Builder;
+
+    fn ret_zero(b: &mut Builder) {
+        let zero = b.build(MirType::I32, Op::ConstInt(0, MirType::I32));
+        b.ret(Some(zero));
+    }
+
+    /// Legalization is per function: a function without a compact boolean cast is borrowed (no
+    /// copy), only a function with one is copied and scalarized, and its input is left untouched.
+    #[test]
+    fn legalize_copies_only_the_function_that_needs_it() {
+        let mut interner = Interner::new();
+        let mut b = Builder::new(interner.intern("plain"), MirType::I32);
+        ret_zero(&mut b);
+        let plain = b.finish();
+        let out = legalize(&plain, &interner).unwrap();
+        assert!(matches!(out, Cow::Borrowed(g) if std::ptr::eq(g, &plain)));
+
+        let src = MirType::Vec(Box::new(MirType::F32), 4);
+        let dst = MirType::Vec(Box::new(MirType::I1), 4);
+        let mut b = Builder::new(interner.intern("casts"), MirType::I32);
+        let array = b.alloca(MirType::Array(Box::new(MirType::F32), 4));
+        let values = b.build(src.clone(), Op::Load(array, src.clone()));
+        let mask = b.build(dst.clone(), Op::Cast(CastKind::FpToSi, values, dst.clone()));
+        let lane = b.build(MirType::I1, Op::ExtractLane(mask, 2));
+        let wide = b.build(MirType::I32, Op::Cast(CastKind::ZExt, lane, MirType::I32));
+        b.ret(Some(wide));
+        let casts = b.finish();
+        let out = legalize(&casts, &interner).unwrap();
+        assert!(matches!(out, Cow::Owned(_)));
+        assert!(!needs_legalization(&out));
+        let vector_results = out
+            .blocks
+            .iter()
+            .flat_map(|blk| &blk.insts)
+            .filter(|i| i.result.iter().any(|r| out.value_type(*r).is_vector()))
+            .count();
+        assert_eq!(vector_results, 0, "every vector value became scalar lanes");
+        assert_eq!(out.params, casts.params);
+        assert_eq!(out.ret, casts.ret);
+        assert!(
+            needs_legalization(&casts),
+            "the input function is not modified"
+        );
+
+        // A legalization failure names its function.
+        let mut b = Builder::new(interner.intern("vec_abi"), MirType::I32);
+        let param = b.add_param(src);
+        b.build(dst.clone(), Op::Cast(CastKind::FpToUi, param, dst));
+        ret_zero(&mut b);
+        let err = legalize(&b.finish(), &interner).unwrap_err();
+        assert!(
+            err.contains("`vec_abi`") && err.contains("vector ABI"),
+            "{err}"
+        );
+    }
 }

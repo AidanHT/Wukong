@@ -1,177 +1,331 @@
 //! Tensor-tape VJPs: differentiating a straight-line sequence of recognized **kernel calls**.
 //!
-//! Wukong lowers tensor ops to runtime-kernel calls (`wukong_sgemm_nt` = `nn.Linear`,
-//! `wukong_sgemm` = plain matmul, `wukong_vmath_f32` = elementwise activation,
-//! `wukong_sreduce_f32` = reduction, `wukong_velem_f32` = streaming affine / Hadamard / quotient,
-//! `wukong_bias_bcast_f32` = broadcast bias add, `wukong_norm_f32` = row-wise softmax / LayerNorm /
-//! RMSNorm / log-softmax / L2-norm, `wukong_norm_affine_f32` = the same with a learned gamma/beta;
-//! each also in its `@parallel` spelling) — the interpreter runs the *same* kernels, so a
-//! forward MIR function can be a tape of these calls plus a final scalar loss. Where the scalar core
-//! ([`crate::Vjp`]) tracks an adjoint per SSA value, this module tracks an adjoint per **buffer**
-//! (memory), the PyTorch-style picture tensor ops need: each forward buffer has a gradient buffer,
-//! set by a consumer's VJP and read by the producer's. The backward emits *more kernel calls* (so the
-//! matmul gradients ride the same tuned GEMM) plus small synthesized loops for the transpose and the
-//! elementwise (Hadamard) combines that no single existing kernel covers.
+//! Wukong lowers tensor ops to runtime-kernel calls — the GEMM family (`wukong_sgemm*`, GEMV/GEVM),
+//! elementwise activations (`wukong_vmath_f32`, `wukong_vmath2_f32`), streaming affine / Hadamard /
+//! quotient maps (`wukong_velem_f32`), reductions (`wukong_sreduce_f32`), the row-wise norms
+//! (`wukong_norm_f32`, `wukong_norm_affine_f32`), the broadcast bias, transposes, column reductions,
+//! the classification losses and the transformer pieces (RoPE, embedding gather) — each also in its
+//! `@parallel` spelling. The interpreter runs the *same* kernels, so a forward MIR function can be a
+//! tape of these calls plus a final scalar loss. Where the scalar core ([`crate::Vjp`]) tracks an
+//! adjoint per SSA value, this module tracks an adjoint per **buffer** (memory), the PyTorch-style
+//! picture tensor ops need: each forward buffer has a gradient buffer, set by a consumer's VJP and
+//! read by the producer's.
+//!
+//! The backward emits **more tuned kernel calls**: the GEMM adjoints are the runtime's own
+//! transposed GEMM spellings (`wukong_sgemm_nt` / `wukong_sgemm_tn`), the norm backwards are the
+//! runtime's fused `wukong_{softmax,layernorm,rmsnorm}_bwd_f32`, the smooth activations ride the
+//! fused `wukong_vmath2_f32` backward codes, and the `@parallel` forward spelling selects the
+//! `@parallel` backward spelling. Small synthesized counted loops remain only where no kernel
+//! exists (an algebraic activation derivative, a sign mask, a per-row scale).
+//!
+//! # Gradient accumulation (fan-out)
+//!
+//! A forward buffer consumed by several ops (a residual connection, a weight shared by two matmuls,
+//! a loss reading a buffer twice) receives several gradient contributions. The first contribution
+//! is written straight into the gradient buffer; every later one is computed into a heap scratch
+//! and added (`Vjp::begin` / `Vjp::end`). The GEMM adjoints accumulate natively through `beta = 1`.
+//! Scratch comes from `wukong_rt_alloc` (zeroed, so no garbage ever reaches a kernel) and is
+//! released with `wukong_rt_free` before the gradient returns.
 //!
 //! Buffers are differentiated under the same single-block contract as the scalar core; the only new
-//! control flow is the counted loops this module synthesizes — one for an algebraic activation
-//! backward or a sign mask, a nested rows x cols pair for the norm backwards. (So the *emitted*
-//! gradient function is multi-block: it is not itself re-differentiable, which `grad` now says by
-//! name.) The plain-matmul adjoints synthesize no loop at all: they are the runtime's own
-//! transposed GEMM spellings (`wukong_sgemm_nt` / `wukong_sgemm_tn`).
+//! control flow is the counted loops this module synthesizes. (So the *emitted* gradient function is
+//! multi-block: it is not itself re-differentiable, which `grad` says by name; `crate::grad_dot`
+//! is the second-order entry point for the scalar subset.)
 
 use crate::Vjp;
+use std::collections::HashMap;
 use wukong_mir::{BinOp, BlockId, CastKind, CmpOp, MirType, Op, ValueId};
 use wukong_span::{Interner, Symbol};
 
 // --- runtime kernel op codes (mirrored from wukong_runtime; the interp dispatches the same) ------
-const VM_EXP: i64 = 0;
-const VM_LOG: i64 = 1;
-const VM_TANH: i64 = 2;
-const VM_SIGMOID: i64 = 3;
-const VM_RELU: i64 = 4;
-const VM_SILU: i64 = 5;
-const VM_GELU: i64 = 6;
-const VM_ELU: i64 = 7;
-const VM_LEAKYRELU: i64 = 8;
-const VM_SOFTPLUS: i64 = 9;
-const VM_SELU: i64 = 11;
-const VM_TANHSHRINK: i64 = 12;
-const VM_HARDSIGMOID: i64 = 13;
-const VM_HARDSWISH: i64 = 14;
-const VM_EXP2: i64 = 18;
-const VM_LOG2: i64 = 19;
-const VM_SINH: i64 = 20;
-const VM_ASINH: i64 = 22;
-const VM_ACOSH: i64 = 23;
-const VM_ATANH: i64 = 24;
-const VM_ATAN: i64 = 25;
-const VM_EXPM1: i64 = 26;
-const VM_LOG1P: i64 = 27;
-const VM_EXP10: i64 = 28;
-const VM_LOG10: i64 = 29;
-const VM_SOFTSIGN: i64 = 30;
-const VM_TAN: i64 = 32;
-const VM_ASIN: i64 = 33;
-const VM_ACOS: i64 = 34;
-const VM_CBRT: i64 = 35;
+// A renumber in the runtime silently changes which rule fires here, so every code is a copy of the
+// runtime's `pub const` of the same name.
+pub(crate) const VM_EXP: i64 = 0;
+pub(crate) const VM_LOG: i64 = 1;
+pub(crate) const VM_TANH: i64 = 2;
+pub(crate) const VM_SIGMOID: i64 = 3;
+pub(crate) const VM_RELU: i64 = 4;
+pub(crate) const VM_SILU: i64 = 5;
+pub(crate) const VM_GELU: i64 = 6;
+pub(crate) const VM_ELU: i64 = 7;
+pub(crate) const VM_LEAKYRELU: i64 = 8;
+pub(crate) const VM_SOFTPLUS: i64 = 9;
+pub(crate) const VM_MISH: i64 = 10;
+pub(crate) const VM_SELU: i64 = 11;
+pub(crate) const VM_TANHSHRINK: i64 = 12;
+pub(crate) const VM_HARDSIGMOID: i64 = 13;
+pub(crate) const VM_HARDSWISH: i64 = 14;
+pub(crate) const VM_SIN: i64 = 15;
+pub(crate) const VM_COS: i64 = 16;
+pub(crate) const VM_ERF: i64 = 17;
+pub(crate) const VM_EXP2: i64 = 18;
+pub(crate) const VM_LOG2: i64 = 19;
+pub(crate) const VM_SINH: i64 = 20;
+pub(crate) const VM_COSH: i64 = 21;
+pub(crate) const VM_ASINH: i64 = 22;
+pub(crate) const VM_ACOSH: i64 = 23;
+pub(crate) const VM_ATANH: i64 = 24;
+pub(crate) const VM_ATAN: i64 = 25;
+pub(crate) const VM_EXPM1: i64 = 26;
+pub(crate) const VM_LOG1P: i64 = 27;
+pub(crate) const VM_EXP10: i64 = 28;
+pub(crate) const VM_LOG10: i64 = 29;
+pub(crate) const VM_SOFTSIGN: i64 = 30;
+pub(crate) const VM_LOGSIGMOID: i64 = 31;
+pub(crate) const VM_TAN: i64 = 32;
+pub(crate) const VM_ASIN: i64 = 33;
+pub(crate) const VM_ACOS: i64 = 34;
+pub(crate) const VM_CBRT: i64 = 35;
 /// The leaky-ReLU negative slope baked into `wukong_runtime::vmath` (`LEAKY_ALPHA`). Mirrored, so a
 /// change there must be mirrored here or the backward stops matching the forward.
-const LEAKY_ALPHA: f64 = 0.01;
+pub(crate) const LEAKY_ALPHA: f64 = 0.01;
 /// SELU's `lambda`/`alpha` (`wukong_runtime::vmath::SELU_LAMBDA`/`SELU_ALPHA`), mirrored.
-const SELU_LAMBDA: f64 = 1.050_701;
-const SELU_ALPHA: f64 = 1.673_263_2;
+pub(crate) const SELU_LAMBDA: f64 = 1.050_701;
+pub(crate) const SELU_ALPHA: f64 = 1.673_263_2;
 /// `1/6`, the hard-sigmoid / hard-swish scale (`wukong_runtime::vmath::INV6`), mirrored.
-const INV6: f64 = 1.0 / 6.0;
-// `wukong_vmath2_f32(x, dy, dx, n, op)` *backward* op codes: the kernel fuses the upstream multiply
-// into a 256-bit activation derivative (`dx = dy · act'(x)`), so a whole activation-backward pass is
-// one call — and is bit-identical with the forward (it reuses the same sigmoid/tanh polynomials). The
-// smooth activations whose derivative is a *transcendental* (so no closed form in `x`/`y` alone) ride
-// this instead of the synthesized loop the algebraic ones (relu/sigmoid/tanh/exp) use.
-const VM2_SILU_BWD: i64 = 3;
-const VM2_GELU_BWD: i64 = 4;
-const VM2_ELU_BWD: i64 = 7;
-const VM2_SOFTPLUS_BWD: i64 = 8;
-const RED_DOT: i64 = 0;
-const RED_SSD: i64 = 1;
-const RED_SUM: i64 = 2;
-const RED_SUMSQ: i64 = 3;
-const RED_SUMABS: i64 = 9;
-const RED_ABSDIFF: i64 = 10;
-const NORM_SOFTMAX: i64 = 0;
-const NORM_LAYERNORM: i64 = 1;
-const NORM_RMSNORM: i64 = 2;
-const NORM_LOGSOFTMAX: i64 = 3;
-const NORM_L2NORM: i64 = 4;
+pub(crate) const INV6: f64 = 1.0 / 6.0;
+// `wukong_vmath2_f32(x, y, out, n, op)` op codes — a namespace separate from `VM_*`. The forward
+// two-input transcendentals and gates, and the fused activation *backward* codes
+// (`dx = dy · act'(x)` in one 256-bit pass, inputs `(x, dy)`).
+pub(crate) const VM2_POW: i64 = 0;
+pub(crate) const VM2_ATAN2: i64 = 1;
+pub(crate) const VM2_HYPOT: i64 = 2;
+pub(crate) const VM2_SILU_BWD: i64 = 3;
+pub(crate) const VM2_GELU_BWD: i64 = 4;
+pub(crate) const VM2_SIGMOID_BWD: i64 = 5;
+pub(crate) const VM2_TANH_BWD: i64 = 6;
+pub(crate) const VM2_ELU_BWD: i64 = 7;
+pub(crate) const VM2_SOFTPLUS_BWD: i64 = 8;
+pub(crate) const VM2_SILU_GATE: i64 = 9;
+pub(crate) const VM2_GELU_GATE: i64 = 10;
+pub(crate) const VM2_SIGMOID_GATE: i64 = 11;
+pub(crate) const RED_DOT: i64 = 0;
+pub(crate) const RED_SSD: i64 = 1;
+pub(crate) const RED_SUM: i64 = 2;
+pub(crate) const RED_SUMSQ: i64 = 3;
+pub(crate) const RED_MAX: i64 = 4;
+pub(crate) const RED_MIN: i64 = 5;
+pub(crate) const RED_MAXABS: i64 = 6;
+pub(crate) const RED_SUMABS: i64 = 9;
+pub(crate) const RED_ABSDIFF: i64 = 10;
+pub(crate) const NORM_SOFTMAX: i64 = 0;
+pub(crate) const NORM_LAYERNORM: i64 = 1;
+pub(crate) const NORM_RMSNORM: i64 = 2;
+pub(crate) const NORM_LOGSOFTMAX: i64 = 3;
+pub(crate) const NORM_L2NORM: i64 = 4;
 /// `wukong_bias_bcast_f32`'s "no fused activation" op code (`wukong_runtime::bias::BIAS_ACT_NONE`).
-/// Any other value selects a fused `VM_*` activation, which this rule does not model.
-const BIAS_ACT_NONE: i64 = -1;
+/// Any other value selects a fused `VM_*` activation.
+pub(crate) const BIAS_ACT_NONE: i64 = -1;
 /// velem activation: identity (`out = a*x + b*y + c`).
-const VE_ID: i64 = 0;
+pub(crate) const VE_ID: i64 = 0;
+/// velem activation: ReLU (`out = max(.., 0)`).
+pub(crate) const VE_RELU: i64 = 1;
+/// velem activation: ReLU6 (`out = min(max(.., 0), 6)`).
+pub(crate) const VE_RELU6: i64 = 2;
 /// OR'd into a velem op when `y` is read (`b` may be non-zero).
-const VE_USE_Y: i64 = 256;
-/// velem *compute mode*: the elementwise Hadamard product (`out = act(x · y)`). Mirrored from
-/// `wukong_runtime::velem`. It lives ABOVE the low activation byte, so a `op & 0xff` test does not
-/// see it — and it is **non-affine**, so the affine VJP below is not a rule for it.
-const VE_HADAMARD: i64 = 512;
+pub(crate) const VE_USE_Y: i64 = 256;
+/// velem *compute mode*: the elementwise Hadamard product (`out = act(x · y)`). It lives ABOVE the
+/// low activation byte, so a `op & 0xff` test does not see it — and it is **non-affine**.
+pub(crate) const VE_HADAMARD: i64 = 512;
 /// velem *compute mode*: the elementwise quotient (`out = act(x / y)`) — likewise non-affine.
-const VE_DIV: i64 = 1024;
+pub(crate) const VE_DIV: i64 = 1024;
+/// `wukong_sgemm_nt_epi`'s fused epilogue activations (`wukong_runtime::gemm::ACT_*`).
+pub(crate) const EPI_IDENTITY: i64 = 0;
+pub(crate) const EPI_RELU: i64 = 1;
+pub(crate) const EPI_GELU: i64 = 2;
+pub(crate) const EPI_SILU: i64 = 3;
 
-const F32: MirType = MirType::F32;
-const I64T: MirType = MirType::I64;
-const PTR: MirType = MirType::Ptr;
+pub(crate) const F32: MirType = MirType::F32;
+pub(crate) const I64T: MirType = MirType::I64;
+pub(crate) const PTR: MirType = MirType::Ptr;
+
+/// The largest recognized ABI (`wukong_sgemm_nt_epi`'s nine operands).
+const MAX_ARITY: usize = 9;
+
+/// A recognized forward kernel family. Each has one VJP rule; the serial and `@parallel` spellings
+/// of a family share it (the parallel kernels are bit-identical to the serial ones by contract).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Kernel {
+    Sreduce,
+    Sgemm,
+    SgemmNt,
+    SgemmTn,
+    SgemmNtAlpha,
+    SgemmNtEpi,
+    Sgemv,
+    SgemvAlpha,
+    Sgevm,
+    Vmath,
+    Vmath2,
+    Velem,
+    Norm,
+    NormAffine,
+    Bias,
+    Transpose,
+    ColSum,
+    ColMean,
+    ColSumSq,
+    Xent,
+    Logsumexp,
+    Entropy,
+    Kldiv,
+    Rope,
+    Embedding,
+}
+
+/// Every forward kernel symbol the tape differentiates: `(symbol, family, @parallel spelling)`.
+///
+/// This table is the single source of truth for `is_kernel`, the arity check and the dispatch, so a
+/// symbol cannot be recognized without also having an arity and a rule. The coupling test in
+/// `tests.rs` (`every_emitted_kernel_symbol_is_differentiable_or_declined_by_name`) scans every
+/// `"wukong_*"` symbol `wukong_mir_build` can emit and fails unless it is listed here, in
+/// `crate::coverage::NOT_DIFFERENTIABLE` with a reason, or handled by the scalar core.
+pub(crate) const FORWARD_KERNELS: &[(&str, Kernel, bool)] = &[
+    ("wukong_sreduce_f32", Kernel::Sreduce, false),
+    ("wukong_sreduce_f32_parallel", Kernel::Sreduce, true),
+    ("wukong_sgemm", Kernel::Sgemm, false),
+    ("wukong_sgemm_parallel", Kernel::Sgemm, true),
+    ("wukong_sgemm_nt", Kernel::SgemmNt, false),
+    ("wukong_sgemm_nt_parallel", Kernel::SgemmNt, true),
+    ("wukong_sgemm_tn", Kernel::SgemmTn, false),
+    ("wukong_sgemm_tn_parallel", Kernel::SgemmTn, true),
+    ("wukong_sgemm_nt_alpha", Kernel::SgemmNtAlpha, false),
+    ("wukong_sgemm_nt_alpha_parallel", Kernel::SgemmNtAlpha, true),
+    ("wukong_sgemm_nt_epi", Kernel::SgemmNtEpi, false),
+    ("wukong_sgemm_nt_epi_parallel", Kernel::SgemmNtEpi, true),
+    ("wukong_sgemv", Kernel::Sgemv, false),
+    ("wukong_sgemv_parallel", Kernel::Sgemv, true),
+    ("wukong_sgemv_alpha", Kernel::SgemvAlpha, false),
+    ("wukong_sgemv_alpha_parallel", Kernel::SgemvAlpha, true),
+    ("wukong_sgevm_f32", Kernel::Sgevm, false),
+    ("wukong_sgevm_f32_parallel", Kernel::Sgevm, true),
+    ("wukong_vmath_f32", Kernel::Vmath, false),
+    ("wukong_vmath_f32_parallel", Kernel::Vmath, true),
+    ("wukong_vmath2_f32", Kernel::Vmath2, false),
+    ("wukong_velem_f32", Kernel::Velem, false),
+    ("wukong_velem_f32_parallel", Kernel::Velem, true),
+    ("wukong_norm_f32", Kernel::Norm, false),
+    ("wukong_norm_f32_parallel", Kernel::Norm, true),
+    ("wukong_norm_affine_f32", Kernel::NormAffine, false),
+    ("wukong_norm_affine_f32_parallel", Kernel::NormAffine, true),
+    ("wukong_bias_bcast_f32", Kernel::Bias, false),
+    ("wukong_bias_bcast_f32_parallel", Kernel::Bias, true),
+    ("wukong_transpose_f32", Kernel::Transpose, false),
+    ("wukong_transpose_f32_parallel", Kernel::Transpose, true),
+    ("wukong_colsum_f32", Kernel::ColSum, false),
+    ("wukong_colsum_f32_parallel", Kernel::ColSum, true),
+    ("wukong_colmean_f32", Kernel::ColMean, false),
+    ("wukong_colmean_f32_parallel", Kernel::ColMean, true),
+    ("wukong_colsumsq_f32", Kernel::ColSumSq, false),
+    ("wukong_colsumsq_f32_parallel", Kernel::ColSumSq, true),
+    ("wukong_xent_fwd_f32", Kernel::Xent, false),
+    ("wukong_xent_fwd_f32_parallel", Kernel::Xent, true),
+    ("wukong_logsumexp_f32", Kernel::Logsumexp, false),
+    ("wukong_logsumexp_f32_parallel", Kernel::Logsumexp, true),
+    ("wukong_entropy_f32", Kernel::Entropy, false),
+    ("wukong_entropy_f32_parallel", Kernel::Entropy, true),
+    ("wukong_kldiv_f32", Kernel::Kldiv, false),
+    ("wukong_kldiv_f32_parallel", Kernel::Kldiv, true),
+    ("wukong_rope_f32", Kernel::Rope, false),
+    ("wukong_rope_f32_parallel", Kernel::Rope, true),
+    ("wukong_embedding_f32", Kernel::Embedding, false),
+    ("wukong_embedding_f32_parallel", Kernel::Embedding, true),
+];
+
+impl Kernel {
+    /// The C ABI's operand count — validated before any rule indexes `args[..]` raw, because
+    /// `is_kernel` matches by NAME and a `.wk` program may declare a kernel name in an `extern "C"`
+    /// block with any signature (an arity mismatch is a diagnostic, never an index panic).
+    pub(crate) fn arity(self) -> usize {
+        match self {
+            Kernel::Sreduce => 4,                                   // (x, y, n, op) -> f32
+            Kernel::Sgemm | Kernel::SgemmNt | Kernel::SgemmTn => 7, // (a, b, c, m, k, n, beta)
+            Kernel::SgemmNtAlpha => 8, // (a, b, c, m, k, n, beta, alpha)
+            Kernel::SgemmNtEpi => 9,   // (a, b, c, m, k, n, beta, bias, act)
+            Kernel::Sgemv => 5,        // (a, x, y, m, n)
+            Kernel::SgemvAlpha => 6,   // (a, x, y, m, n, alpha)
+            Kernel::Sgevm => 6,        // (w, a, out, rows, cols, alpha)
+            Kernel::Vmath => 4,        // (x, out, n, op)
+            Kernel::Vmath2 => 5,       // (x, y, out, n, op)
+            Kernel::Velem => 8,        // (x, y, out, n, a, b, c, op)
+            Kernel::Norm => 6,         // (x, out, rows, cols, eps_bits, op)
+            Kernel::NormAffine => 8,   // (x, out, gamma, beta, rows, cols, eps_bits, op)
+            Kernel::Bias => 6,         // (x, b, out, rows, cols, op)
+            Kernel::Transpose => 4,    // (src, dst, rows, cols)
+            Kernel::ColSum | Kernel::ColMean | Kernel::ColSumSq => 4, // (x, out, rows, cols)
+            Kernel::Xent => 5,         // (x, target, loss, rows, cols)
+            Kernel::Logsumexp | Kernel::Entropy => 4, // (x, out, rows, cols)
+            Kernel::Kldiv => 5,        // (p, q, out, rows, cols)
+            Kernel::Rope => 5,         // (x, inv_freq, out, rows, half)
+            Kernel::Embedding => 6,    // (out, weight, ids, t, h, v)
+        }
+    }
+
+    /// Which operand is the buffer the kernel WRITES — `None` for a reduction, whose result is a
+    /// scalar.
+    pub(crate) fn out_index(self) -> Option<usize> {
+        match self {
+            Kernel::Sreduce => None,
+            Kernel::Embedding => Some(0),
+            Kernel::Vmath
+            | Kernel::Norm
+            | Kernel::NormAffine
+            | Kernel::Transpose
+            | Kernel::ColSum
+            | Kernel::ColMean
+            | Kernel::ColSumSq
+            | Kernel::Logsumexp
+            | Kernel::Entropy => Some(1),
+            _ => Some(2),
+        }
+    }
+
+    /// Whether the family carries a GEMM `beta` operand (index 6): `beta != 0` reads the output.
+    fn has_beta(self) -> bool {
+        matches!(
+            self,
+            Kernel::Sgemm
+                | Kernel::SgemmNt
+                | Kernel::SgemmTn
+                | Kernel::SgemmNtAlpha
+                | Kernel::SgemmNtEpi
+        )
+    }
+}
+
+/// Pick the serial or the `@parallel` spelling of an emitted backward kernel, following the forward.
+pub(crate) fn pick(serial: Symbol, parallel: Symbol, par: bool) -> Symbol {
+    if par {
+        parallel
+    } else {
+        serial
+    }
+}
 
 /// Interned symbols for the kernels we recognize (forward) and emit (backward). Interning dedups,
 /// so these compare equal to the symbols a forward tape was built with.
 pub(crate) struct Syms {
-    /// The plain `C = A·B` GEMM. The tape both **emits** it (a matmul input adjoint) and now
-    /// **recognizes** it on the forward side — mir_build lowers an ordinary `matmul` (no transpose)
-    /// to this symbol, so without the forward arm a plain matmul took the generic
-    /// buffer-writing-call refusal while the `nn.Linear` spelling differentiated.
+    /// Forward recognition: symbol -> (family, `@parallel` spelling). Built from [`FORWARD_KERNELS`];
+    /// only ever looked up, never iterated, so its hash order cannot reach the emitted MIR.
+    forward: HashMap<Symbol, (Kernel, bool)>,
     pub sgemm: Symbol,
-    /// The `@parallel` plain GEMM — same `(a, b, c, m, k, n, beta)` ABI and identical (fixed
-    /// blocking) result, so it differentiates through the very same rule.
-    pub sgemm_parallel: Symbol,
-    /// `C = Aᵀ·B` (A stored `[k, m]`): the **weight-gradient** GEMM. Emit-only — it is exactly the
-    /// "transpose then multiply" the tape used to synthesize as a flat MIR loop with an `SDiv` and
-    /// an `SRem` per element plus an `m·n` scratch alloca. The kernel does the same transpose into
-    /// its own scratch and then runs the identical `A·B` microkernel, so the switch is bit-exact.
-    pub sgemm_tn: Symbol,
+    pub sgemm_par: Symbol,
     pub sgemm_nt: Symbol,
-    /// The `@parallel` NN GEMM — same `(a, b, c, m, k, n, beta)` ABI and bit-identical (fixed
-    /// chunking) result as the serial `sgemm_nt`, so it differentiates through the very same rule.
-    /// A matmul embedded in a `@parallel fn` lowers to *this* symbol (mir_build's `lower_for` passes
-    /// `parallel_fn`), while single-statement / non-parallel tapes use the serial one — accept both.
-    pub sgemm_nt_parallel: Symbol,
+    pub sgemm_nt_par: Symbol,
+    /// `C = Aᵀ·B` — the weight-gradient GEMM. It transposes `A` into its own scratch and runs the
+    /// identical `A·B` microkernel, so it replaced the flat MIR transpose loop (an `SDiv` and an
+    /// `SRem` per element plus an `m·n` scratch) the NT rule used to synthesize.
+    pub sgemm_tn: Symbol,
+    pub sgemm_tn_par: Symbol,
+    /// The fused-epilogue GEMM, emitted with the IDENTITY epilogue to recompute a pre-activation.
+    pub sgemm_nt_epi: Symbol,
+    pub sgemv_alpha: Symbol,
+    pub sgevm: Symbol,
     pub vmath: Symbol,
-    /// The `@parallel` elementwise activation — same `(x, out, n, op)` ABI and bit-identical
-    /// (elementwise, no cross-chunk combine) result as the serial `vmath`, so it differentiates
-    /// through the very same rule. An `out[i]=act(x[i])` loop inside a `@parallel fn` lowers to *this*
-    /// symbol (mir_build selects it when `parallel_fn`), while single-statement / non-parallel tapes use
-    /// the serial one — accept both. Without this the backward pass of every `@parallel`-fn activation
-    /// loop fails with an unrecognized-buffer-writing-call error.
-    pub vmath_parallel: Symbol,
-    pub sreduce: Symbol,
-    /// The `@parallel` reduction — same `(x, y, n, op)` ABI and identical (deterministic, fixed
-    /// chunking) result as the serial `sreduce`, so it differentiates through the very same rule.
-    /// A `.wk` reduction lowered from source produces *this* symbol (the recognizer emits the
-    /// parallel kernel), while the hand-built tape tests use the serial one — the tape accepts both.
-    pub sreduce_parallel: Symbol,
-    pub velem: Symbol,
-    /// The `@parallel` streaming map — same `(x, y, out, n, a, b, c, op)` ABI and bit-identical
-    /// (elementwise, no cross-chunk combine) result as the serial `velem`, so it differentiates
-    /// through the very same rule. A residual-add / saxpy inside a `@parallel fn` lowers to *this*
-    /// symbol (mir_build's `emit_velem_call` selects it when `parallel_fn`), while single-statement /
-    /// non-parallel tapes use the serial one — the tape accepts both. Without this the backward pass of
-    /// every `@parallel`-fn velem loop would fail with an unrecognized-buffer-writing-call error.
-    pub velem_parallel: Symbol,
-    /// The two-input transcendental kernel; the tape emits its `*_BWD` op codes for the smooth
-    /// activation backwards (`dx = dy · act'(x)` in one fused pass).
     pub vmath2: Symbol,
+    pub velem: Symbol,
+    pub sreduce: Symbol,
     pub norm: Symbol,
-    /// The `@parallel` row-wise norm — same `(x, out, rows, cols, eps_bits, op)` ABI and
-    /// bit-identical (each row is independent, no cross-row combine) result as the serial `norm`, so
-    /// it differentiates through the very same rule. `emit_norm` selects *this* symbol for every
-    /// batched LayerNorm/RMSNorm/softmax inside a `@parallel fn` — the shipped transformer shape —
-    /// while single-row / non-parallel tapes use the serial one; accept both. Without it the same
-    /// model is differentiable serially and not in parallel.
-    pub norm_parallel: Symbol,
-    /// `wukong_norm_affine_f32(x, out, gamma, beta, rows, cols, eps_bits, op)` — LayerNorm/RMSNorm
-    /// with a learned per-column scale (and optional shift). This is the **shipped transformer
-    /// norm**: `emit_norm` picks it the moment a `gamma` appears, so without a rule here the toy
-    /// spelling differentiated and the real one did not.
-    pub norm_affine: Symbol,
-    /// The `@parallel` affine norm — rows are independent, bit-identical to the serial kernel, same
-    /// rule (the `_parallel` mirror contract).
-    pub norm_affine_parallel: Symbol,
-    /// `wukong_bias_bcast_f32(x, b, out, rows, cols, op)` — the broadcast bias add. `y = x·Wᵀ + b`
-    /// is the single most common construct in ML; spelled with the bias the recognizer fires this
-    /// kernel, so the bias was load-bearing on whether the model could be trained at all.
-    pub bias: Symbol,
-    /// The `@parallel` broadcast bias add (rows independent, bit-identical, same rule).
-    pub bias_parallel: Symbol,
-    /// `wukong_colsum_f32(x, out, rows, cols)` — `out[j] = Σ_i x[i·cols + j]`. Emit-only: it is the
-    /// bias gradient (`db = colsum(dout)`) and the learned-`gamma`/`beta` gradients.
     pub colsum: Symbol,
     /// `wukong_rt_math_f64(x, op)` — the value-returning f64 transcendental library an `f64`
     /// `exp`/`log`/`sin`/… lowers to. **Not** a kernel (it writes no buffer): it is differentiated
@@ -181,121 +335,147 @@ pub(crate) struct Syms {
     pub math_f64: Symbol,
     /// `wukong_rt_math2_f64(a, b, op)` — the two-argument twin (`pow`/`atan2`/`hypot`); same rule.
     pub math2_f64: Symbol,
+    pub bias: Symbol,
+    pub softmax_bwd: Symbol,
+    pub softmax_bwd_par: Symbol,
+    pub layernorm_bwd: Symbol,
+    pub layernorm_bwd_par: Symbol,
+    pub rmsnorm_bwd: Symbol,
+    pub rmsnorm_bwd_par: Symbol,
+    pub transpose: Symbol,
+    pub transpose_par: Symbol,
+    pub xent_bwd: Symbol,
+    pub xent_bwd_par: Symbol,
+    pub rope_bwd: Symbol,
+    pub rope_bwd_par: Symbol,
+    pub scatter_add: Symbol,
+    pub scatter_add_par: Symbol,
+    /// Zeroed heap scratch (`wukong_rt_alloc(count, elem_size, elem_is_float) -> ptr`) and its
+    /// release. Gradient scratch lives on the heap, not in `alloca`s: a native backward must not
+    /// put megabytes of activations' gradients on the stack, and a zeroed buffer means no rule can
+    /// ever read uninitialized memory (a `0·NaN` garbage fill is NaN).
+    pub rt_alloc: Symbol,
+    pub rt_free: Symbol,
 }
 
 impl Syms {
     pub fn new(it: &mut Interner) -> Syms {
+        let forward = FORWARD_KERNELS
+            .iter()
+            .map(|&(name, kind, par)| (it.intern(name), (kind, par)))
+            .collect();
         Syms {
+            forward,
             sgemm: it.intern("wukong_sgemm"),
-            sgemm_parallel: it.intern("wukong_sgemm_parallel"),
-            sgemm_tn: it.intern("wukong_sgemm_tn"),
+            sgemm_par: it.intern("wukong_sgemm_parallel"),
             sgemm_nt: it.intern("wukong_sgemm_nt"),
-            sgemm_nt_parallel: it.intern("wukong_sgemm_nt_parallel"),
+            sgemm_nt_par: it.intern("wukong_sgemm_nt_parallel"),
+            sgemm_tn: it.intern("wukong_sgemm_tn"),
+            sgemm_tn_par: it.intern("wukong_sgemm_tn_parallel"),
+            sgemm_nt_epi: it.intern("wukong_sgemm_nt_epi"),
+            sgemv_alpha: it.intern("wukong_sgemv_alpha"),
+            sgevm: it.intern("wukong_sgevm_f32"),
             vmath: it.intern("wukong_vmath_f32"),
-            vmath_parallel: it.intern("wukong_vmath_f32_parallel"),
-            sreduce: it.intern("wukong_sreduce_f32"),
-            sreduce_parallel: it.intern("wukong_sreduce_f32_parallel"),
-            velem: it.intern("wukong_velem_f32"),
-            velem_parallel: it.intern("wukong_velem_f32_parallel"),
             vmath2: it.intern("wukong_vmath2_f32"),
+            velem: it.intern("wukong_velem_f32"),
+            sreduce: it.intern("wukong_sreduce_f32"),
             norm: it.intern("wukong_norm_f32"),
-            norm_parallel: it.intern("wukong_norm_f32_parallel"),
-            norm_affine: it.intern("wukong_norm_affine_f32"),
-            norm_affine_parallel: it.intern("wukong_norm_affine_f32_parallel"),
-            bias: it.intern("wukong_bias_bcast_f32"),
-            bias_parallel: it.intern("wukong_bias_bcast_f32_parallel"),
             colsum: it.intern("wukong_colsum_f32"),
             math_f64: it.intern("wukong_rt_math_f64"),
             math2_f64: it.intern("wukong_rt_math2_f64"),
+            bias: it.intern("wukong_bias_bcast_f32"),
+            softmax_bwd: it.intern("wukong_softmax_bwd_f32"),
+            softmax_bwd_par: it.intern("wukong_softmax_bwd_f32_parallel"),
+            layernorm_bwd: it.intern("wukong_layernorm_bwd_f32"),
+            layernorm_bwd_par: it.intern("wukong_layernorm_bwd_f32_parallel"),
+            rmsnorm_bwd: it.intern("wukong_rmsnorm_bwd_f32"),
+            rmsnorm_bwd_par: it.intern("wukong_rmsnorm_bwd_f32_parallel"),
+            transpose: it.intern("wukong_transpose_f32"),
+            transpose_par: it.intern("wukong_transpose_f32_parallel"),
+            xent_bwd: it.intern("wukong_xent_bwd_f32"),
+            xent_bwd_par: it.intern("wukong_xent_bwd_f32_parallel"),
+            rope_bwd: it.intern("wukong_rope_bwd_f32"),
+            rope_bwd_par: it.intern("wukong_rope_bwd_f32_parallel"),
+            scatter_add: it.intern("wukong_scatter_add_f32"),
+            scatter_add_par: it.intern("wukong_scatter_add_f32_parallel"),
+            rt_alloc: it.intern("wukong_rt_alloc"),
+            rt_free: it.intern("wukong_rt_free"),
         }
     }
-}
 
-/// Map a forward `vmath` activation op code to the `vmath2` *backward* op code that computes its
-/// `dx = dy·act'(x)` in one fused pass — or `None` for the algebraic activations (relu/sigmoid/tanh/
-/// exp) that the synthesized loop handles without a transcendental.
-fn vm2_bwd_code(fwd_op: i64) -> Option<i64> {
-    Some(match fwd_op {
-        VM_SILU => VM2_SILU_BWD,
-        VM_GELU => VM2_GELU_BWD,
-        VM_ELU => VM2_ELU_BWD,
-        VM_SOFTPLUS => VM2_SOFTPLUS_BWD,
-        _ => return None,
-    })
+    /// The recognized family (and spelling) of a forward call, if any.
+    pub(crate) fn kernel(&self, func: Symbol) -> Option<(Kernel, bool)> {
+        self.forward.get(&func).copied()
+    }
 }
 
 /// A synthesized counted loop, threaded between [`Vjp::open_loop`] and [`Vjp::close_loop`]. After
 /// `open_loop` the builder's current block IS the body, so the caller emits straight into it and
 /// `close_loop` appends the back-edge there.
-struct Loop {
+pub(crate) struct Loop {
     header: BlockId,
     exit: BlockId,
     /// The `i64` loop index, live in the body block.
-    idx: ValueId,
+    pub(crate) idx: ValueId,
+}
+
+/// Where one gradient contribution to a buffer is written: straight into its gradient buffer (the
+/// first contribution), or into a scratch that [`Vjp::end`] then adds into it (every later one).
+pub(crate) struct Contrib {
+    /// The buffer the rule writes its contribution into (overwriting).
+    pub(crate) write: ValueId,
+    /// `(gradient buffer, element count)` to accumulate `write` into, for a non-first contribution.
+    acc: Option<(ValueId, ValueId)>,
 }
 
 impl<'a> Vjp<'a> {
     /// Is `func` a tensor kernel this module differentiates?
     pub(crate) fn is_kernel(&self, func: Symbol) -> bool {
-        func == self.syms.sgemm
-            || func == self.syms.sgemm_parallel
-            || func == self.syms.sgemm_nt
-            || func == self.syms.sgemm_nt_parallel
-            || func == self.syms.vmath
-            || func == self.syms.vmath_parallel
-            || func == self.syms.sreduce
-            || func == self.syms.sreduce_parallel
-            || func == self.syms.velem
-            || func == self.syms.velem_parallel
-            || func == self.syms.norm
-            || func == self.syms.norm_parallel
-            || func == self.syms.norm_affine
-            || func == self.syms.norm_affine_parallel
-            || func == self.syms.bias
-            || func == self.syms.bias_parallel
-    }
-
-    /// Which operand of a recognized kernel's ABI is the buffer it **writes** — `None` for a
-    /// reduction, whose result is a scalar. Mirrors [`Vjp::kernel_arity`] and
-    /// [`Vjp::diff_kernel_call`] one-for-one; only [`Vjp::scan_kernel_outputs`] reads it.
-    fn kernel_out_index(&self, func: Symbol) -> Option<usize> {
-        if func == self.syms.sreduce || func == self.syms.sreduce_parallel {
-            None
-        } else if func == self.syms.vmath
-            || func == self.syms.vmath_parallel
-            || func == self.syms.norm
-            || func == self.syms.norm_parallel
-            || func == self.syms.norm_affine
-            || func == self.syms.norm_affine_parallel
-        {
-            Some(1) // vmath(x, OUT, ..) / norm(x, OUT, ..) / norm_affine(x, OUT, ..)
-        } else {
-            Some(2) // sgemm[_nt](a, b, C, ..) / velem(x, y, OUT, ..) / bias(x, b, OUT, ..)
-        }
+        self.syms.kernel(func).is_some()
     }
 
     /// Record every buffer a recognized kernel WRITES in the forward pass (canonicalized, so the
-    /// `gep(buf, 0)` and bare-alloca spellings key the same entry).
+    /// `gep(buf, 0)` and bare-alloca spellings key the same entry), with the writing call — and which
+    /// buffers more than one kernel writes, and which a non-constant float `store` writes.
     ///
-    /// `diff_load` needs this to tell two cases apart that look identical to it: a scalar read of a
-    /// **read-only input** whose gradient may legitimately be dropped (the target labels), and a
-    /// scalar read of a **kernel output**, where dropping the adjoint breaks the chain to that
-    /// kernel's own inputs and hands back an all-zero gradient with no diagnostic.
+    /// `grad_target` needs the writer to size a gradient for a non-differentiated PARAMETER a kernel
+    /// writes (a scalar read of a kernel output must reach the kernel's inputs, and a parameter
+    /// carries no element count of its own). `multi_written` and `store_written` drive the
+    /// write-after-write rule in [`Vjp::diff_kernel_call`].
     pub(crate) fn scan_kernel_outputs(&mut self) {
         let insts = &self.entry_block().insts;
-        let mut written = Vec::new();
+        let mut writes: HashMap<ValueId, usize> = HashMap::new();
+        let mut outs: Vec<(ValueId, Kernel, &'a [ValueId])> = Vec::new();
         for inst in insts {
+            if let Op::Store { ptr, value } = &inst.op {
+                if self.fwd.value_type(*value).is_float() && !self.is_const(*value) {
+                    let base = self.store_base(*ptr);
+                    self.store_written.insert(base);
+                }
+                continue;
+            }
             let Op::Call { func, args } = &inst.op else {
                 continue;
             };
-            if !self.is_kernel(*func) || self.kernel_arity(*func) != Some(args.len()) {
+            let Some((kind, _)) = self.syms.kernel(*func) else {
+                continue;
+            };
+            if kind.arity() != args.len() {
                 continue; // a mis-declared ABI: `diff_kernel_call` reports it with the arity error
             }
-            if let Some(i) = self.kernel_out_index(*func) {
-                written.push(self.canon(args[i]));
-            }
+            let Some(oi) = kind.out_index() else {
+                continue;
+            };
+            let out = self.canon(args[oi]);
+            *writes.entry(out).or_insert(0) += 1;
+            outs.push((out, kind, args.as_slice()));
         }
-        self.kernel_written.extend(written);
+        // Forward order, so the LAST writer of a buffer is the one recorded.
+        for (out, kind, args) in outs {
+            self.kernel_out.insert(out, (kind, args));
+        }
+        self.multi_written
+            .extend(writes.into_iter().filter(|&(_, c)| c > 1).map(|(b, _)| b));
     }
 
     /// Canonicalize a kernel buffer argument to the base buffer it addresses: peel a whole-buffer
@@ -304,7 +484,7 @@ impl<'a> Vjp<'a> {
     /// *different* buffer-adjoint entries and the gradient chain silently breaks between the ops. A
     /// non-zero-offset gep is a genuine sub-slice and is left alone. Dim/op-code operands are constants
     /// (not geps), so canonicalizing the whole argument list is a no-op for them.
-    fn canon(&self, mut v: ValueId) -> ValueId {
+    pub(crate) fn canon(&self, mut v: ValueId) -> ValueId {
         while let Some(Op::Gep { ptr, index, .. }) = self.def_op.get(&v) {
             if !self.is_const_zero(*index) {
                 break;
@@ -326,37 +506,6 @@ impl<'a> Vjp<'a> {
         }
     }
 
-    /// The argument count of each recognized kernel's ABI, matching the operand lists the VJP rules
-    /// below index. `is_kernel` recognizes a call by SYMBOL NAME alone, and a `.wk` program may
-    /// declare that name in an `extern "C"` block with any signature it likes — so the arity must be
-    /// checked before those rules index `args[..]` raw, or a mismatched declaration panics the
-    /// compiler with an index-out-of-bounds ICE instead of producing a diagnostic.
-    /// The arms mirror [`Vjp::diff_kernel_call`]'s dispatch chain one-for-one, so a new kernel arm
-    /// there is a visible hole here.
-    fn kernel_arity(&self, func: Symbol) -> Option<usize> {
-        if func == self.syms.sreduce || func == self.syms.sreduce_parallel {
-            Some(4) // (x, y, n, op)
-        } else if func == self.syms.sgemm_nt
-            || func == self.syms.sgemm_nt_parallel
-            || func == self.syms.sgemm
-            || func == self.syms.sgemm_parallel
-        {
-            Some(7) // (a, b, c, m, k, n, beta)
-        } else if func == self.syms.vmath || func == self.syms.vmath_parallel {
-            Some(4) // (x, out, n, op)
-        } else if func == self.syms.velem || func == self.syms.velem_parallel {
-            Some(8) // (x, y, out, n, a, b, c, op)
-        } else if func == self.syms.norm || func == self.syms.norm_parallel {
-            Some(6) // (x, out, rows, cols, eps_bits, op)
-        } else if func == self.syms.norm_affine || func == self.syms.norm_affine_parallel {
-            Some(8) // (x, out, gamma, beta, rows, cols, eps_bits, op)
-        } else if func == self.syms.bias || func == self.syms.bias_parallel {
-            Some(6) // (x, b, out, rows, cols, op)
-        } else {
-            None
-        }
-    }
-
     /// Differentiate one recognized kernel call. `args`/`result` are the forward (old) value ids.
     pub(crate) fn diff_kernel_call(
         &mut self,
@@ -364,9 +513,11 @@ impl<'a> Vjp<'a> {
         raw_args: &[ValueId],
         result: Option<ValueId>,
     ) -> Result<(), String> {
-        let want = self
-            .kernel_arity(func)
+        let (kind, par) = self
+            .syms
+            .kernel(func)
             .ok_or_else(|| "autodiff: kernel call has no VJP rule".to_string())?;
+        let want = kind.arity();
         if raw_args.len() != want {
             return Err(format!(
                 "autodiff: call to `{}` has {} argument(s), expected {} — not the recognized \
@@ -378,42 +529,167 @@ impl<'a> Vjp<'a> {
         }
         // Normalize every buffer operand to its base alloca/param so the buffer-adjoint bookkeeping
         // is keyed consistently regardless of which whole-buffer pointer form lowering chose. (The
-        // scalar `result` of a reduction is never a gep, so it needs no canonicalization.)
-        // The largest recognized ABI is velem's eight operands (see kernel_arity). Keep this
-        // short-lived normalization on the stack instead of allocating once per tape call.
-        let mut normalized = [ValueId(0); 8];
-        let args = &mut normalized[..want];
-        for (arg, &raw) in args.iter_mut().zip(raw_args) {
+        // scalar `result` of a reduction is never a gep, so it needs no canonicalization.) Kept on
+        // the stack rather than allocated once per tape call.
+        let mut normalized = [ValueId(0); MAX_ARITY];
+        for (arg, &raw) in normalized.iter_mut().zip(raw_args) {
             *arg = self.canon(raw);
         }
-        if func == self.syms.sreduce || func == self.syms.sreduce_parallel {
-            self.diff_sreduce(args, result)
-        } else if func == self.syms.sgemm_nt || func == self.syms.sgemm_nt_parallel {
-            self.diff_sgemm_nt(args)
-        } else if func == self.syms.sgemm || func == self.syms.sgemm_parallel {
-            self.diff_sgemm(args)
-        } else if func == self.syms.vmath || func == self.syms.vmath_parallel {
-            self.diff_vmath(args)
-        } else if func == self.syms.velem || func == self.syms.velem_parallel {
-            self.diff_velem(args)
-        } else if func == self.syms.norm || func == self.syms.norm_parallel {
-            self.diff_norm(args)
-        } else if func == self.syms.norm_affine || func == self.syms.norm_affine_parallel {
-            self.diff_norm_affine(args)
-        } else if func == self.syms.bias || func == self.syms.bias_parallel {
-            self.diff_bias(args)
-        } else {
-            Err("autodiff: kernel call has no VJP rule".to_string())
+        let args = &normalized[..want];
+        self.reject_live_sub_slice_output(func, kind, args)?;
+        match kind {
+            Kernel::Sreduce => self.diff_sreduce(args, result)?,
+            Kernel::Sgemm => self.diff_sgemm(args, par)?,
+            Kernel::SgemmNt => self.diff_sgemm_nt(args, par)?,
+            Kernel::SgemmTn => self.diff_sgemm_tn(args, par)?,
+            Kernel::SgemmNtAlpha => self.diff_sgemm_nt_alpha(args, par)?,
+            Kernel::SgemmNtEpi => self.diff_sgemm_nt_epi(args, par)?,
+            Kernel::Sgemv => self.diff_sgemv(args, None, par)?,
+            Kernel::SgemvAlpha => self.diff_sgemv(args, Some(args[5]), par)?,
+            Kernel::Sgevm => self.diff_sgevm(args, par)?,
+            Kernel::Vmath => self.diff_vmath(args)?,
+            Kernel::Vmath2 => self.diff_vmath2(args)?,
+            Kernel::Velem => self.diff_velem(args)?,
+            Kernel::Norm => self.diff_norm(args, par)?,
+            Kernel::NormAffine => self.diff_norm_affine(args, par)?,
+            Kernel::Bias => self.diff_bias(args)?,
+            Kernel::Transpose => self.diff_transpose(args, par)?,
+            Kernel::ColSum | Kernel::ColMean | Kernel::ColSumSq => {
+                self.diff_colreduce(kind, args)?
+            }
+            Kernel::Xent => self.diff_xent(args, par)?,
+            Kernel::Logsumexp => self.diff_logsumexp(args)?,
+            Kernel::Entropy => self.diff_entropy(args)?,
+            Kernel::Kldiv => self.diff_kldiv(args)?,
+            Kernel::Rope => self.diff_rope(args, par)?,
+            Kernel::Embedding => self.diff_embedding(args, par)?,
         }
+        self.kill_overwritten(kind, args);
+        Ok(())
+    }
+
+    /// A kernel whose output operand is a SUB-SLICE (`gep(buf, off)`, `off != 0`) of a buffer whose
+    /// gradient is live cannot be differentiated: the tape keys one gradient per whole buffer, so
+    /// every rule looks up `buf_adj[gep]`, finds nothing (a sub-slice never gets its own gradient)
+    /// and returns as if the output were unused — while a load of `buf[off + i]` (or a whole-buffer
+    /// consumer of `buf`) has put the real adjoint under `buf`. The kernel's inputs would come back
+    /// with a silently ZERO gradient at exit 0. Refuse, naming the kernel.
+    fn reject_live_sub_slice_output(
+        &self,
+        func: Symbol,
+        kind: Kernel,
+        args: &[ValueId],
+    ) -> Result<(), String> {
+        let Some(oi) = kind.out_index() else {
+            return Ok(());
+        };
+        let out = args[oi];
+        let base = self.store_base(out);
+        if base != out && self.buf_adj.contains_key(&base) {
+            return Err(format!(
+                "autodiff: `{}` writes a sub-slice (v{}) of buffer v{}, whose gradient is live; \
+                 the buffer tape keeps one gradient per whole buffer, so the kernel's output \
+                 adjoint cannot be routed to it — differentiate a whole-buffer spelling",
+                self.it.resolve(func),
+                out.0,
+                base.0
+            ));
+        }
+        Ok(())
+    }
+
+    /// The write-after-write rule. A kernel that OVERWRITES its output buffer without reading it
+    /// destroys the buffer's previous contents, so the adjoint of those contents is zero over the
+    /// region it wrote. When a second, earlier kernel also wrote that buffer, the earlier writer's
+    /// rule must see that zero — not the later writer's output adjoint, which used to flow straight
+    /// into it (a silently wrong gradient for `h = f(x); h = g(y)`). The same holds for an earlier
+    /// non-constant scalar store (`h[0] = x[0]; h = g(y)`): without the zero, `diff_store` would route
+    /// the kernel's output adjoint to `x[0]`, which the kernel overwrote. Only buffers with another
+    /// writer need it; a single writer has no earlier producer to mislead.
+    fn kill_overwritten(&mut self, kind: Kernel, args: &[ValueId]) {
+        let Some(oi) = kind.out_index() else {
+            return;
+        };
+        let out = args[oi];
+        let has_other_writer =
+            self.multi_written.contains(&out) || self.store_written.contains(&out);
+        if !has_other_writer || self.kernel_reads_output(kind, args) {
+            return;
+        }
+        let Some(g) = self.buf_adj.get(&out).copied() else {
+            return;
+        };
+        if let Some(n) = self.kernel_out_extent(kind, args) {
+            let z = self.cf32(0.0);
+            self.fill(g, n, z);
+        }
+    }
+
+    /// Whether a kernel call READS its own output buffer: it is also one of the input operands
+    /// (an in-place kernel), or a GEMM accumulates into it (`beta != 0`, or a beta that is not a
+    /// compile-time constant, conservatively).
+    fn kernel_reads_output(&self, kind: Kernel, args: &[ValueId]) -> bool {
+        let Some(oi) = kind.out_index() else {
+            return false;
+        };
+        let out = args[oi];
+        // A velem whose op reads no `y` (no USE_Y and neither non-affine compute mode) may name the
+        // output as the placeholder `y`; that operand is never read, so it is not an in-place read
+        // (treating it as one would skip the kill and hand an earlier writer this kernel's adjoint).
+        let y_unread = kind == Kernel::Velem
+            && matches!(
+                self.const_i64(args[7]),
+                Ok(op) if op & (VE_USE_Y | VE_HADAMARD | VE_DIV) == 0
+            );
+        if args
+            .iter()
+            .enumerate()
+            .any(|(i, &a)| i != oi && !(y_unread && i == 1) && a == out)
+        {
+            return true;
+        }
+        kind.has_beta() && !matches!(self.const_i64(args[6]), Ok(0))
+    }
+
+    /// The number of `f32` elements a kernel call writes, in the new value space (`None` for a
+    /// reduction). Used to size the gradient of a non-differentiated parameter a kernel writes, and
+    /// the region the write-after-write rule zeroes.
+    pub(crate) fn kernel_out_extent(&mut self, kind: Kernel, args: &[ValueId]) -> Option<ValueId> {
+        let n = match kind {
+            Kernel::Sreduce => return None,
+            Kernel::Sgemm
+            | Kernel::SgemmNt
+            | Kernel::SgemmTn
+            | Kernel::SgemmNtAlpha
+            | Kernel::SgemmNtEpi => self.dims_product(&[args[3], args[5]]),
+            Kernel::Sgemv | Kernel::SgemvAlpha => self.dim(args[3]),
+            Kernel::Sgevm => self.dim(args[4]),
+            Kernel::Vmath => self.dim(args[2]),
+            Kernel::Vmath2 | Kernel::Velem => self.dim(args[3]),
+            Kernel::Norm | Kernel::Transpose => self.dims_product(&[args[2], args[3]]),
+            Kernel::NormAffine => self.dims_product(&[args[4], args[5]]),
+            Kernel::Bias => self.dims_product(&[args[3], args[4]]),
+            Kernel::ColSum | Kernel::ColMean | Kernel::ColSumSq => self.dim(args[3]),
+            Kernel::Xent | Kernel::Kldiv => self.dim(args[3]),
+            Kernel::Logsumexp | Kernel::Entropy => self.dim(args[2]),
+            Kernel::Rope => {
+                let rh = self.dims_product(&[args[3], args[4]]);
+                let two = self.cint(2);
+                self.mul64(rh, two)
+            }
+            Kernel::Embedding => self.dims_product(&[args[3], args[4]]),
+        };
+        Some(n)
     }
 
     // --- reductions: scalar adjoint -> buffer adjoint ------------------------------------------
 
-    /// `loss = sreduce(x, y, n, op)` produces the scalar loss. Its adjoint `g = adj[loss]` flows back
-    /// into a *buffer* gradient. SUM: `dx = g` (broadcast). DOT (`sum x[i]y[i]`): `dx = g*y`,
-    /// `dy = g*x` — or, when both operands are the SAME buffer (the sum-of-squares loss), the single
-    /// `dx = 2g*x`. SSD (`sum (x-y)^2`): `dx = 2g(x-y)`, `dy = -2g(x-y)` — the MSE-loss backbone.
-    /// Every case is streaming-affine, so each gradient is a single velem call.
+    /// `loss = sreduce(x, y, n, op)` produces a scalar. Its adjoint `g = adj[loss]` flows back into a
+    /// *buffer* gradient. SUM: `dx = g` (broadcast). DOT (`Σ x·y`): `dx = g·y`, `dy = g·x` — or, when
+    /// both operands are the SAME buffer (the sum-of-squares loss), the single `dx = 2g·x`; SUMSQ is
+    /// that same rule. SSD (`Σ (x−y)²`): `dx = 2g(x−y)`, `dy = −2g(x−y)` — the MSE-loss backbone.
+    /// SUMABS / ABSDIFF: the `sgn` subgradient. MAX / MIN / MAXABS: `g` split evenly over the
+    /// elements that attain the extremum (the JAX / PyTorch tie convention).
     fn diff_sreduce(&mut self, args: &[ValueId], result: Option<ValueId>) -> Result<(), String> {
         let loss = result.ok_or("autodiff: sreduce call must produce the scalar loss")?;
         let g = match self.adj.get(&loss).copied() {
@@ -421,104 +697,142 @@ impl<'a> Vjp<'a> {
             None => return Ok(()), // loss unused downstream -> zero adjoint
         };
         let op = self.const_i64(args[3])?;
-        let n = self.remap_v(args[2]);
+        let n = self.dim(args[2]);
+        let (x, y) = (args[0], args[1]);
+        let xn = self.remap_v(x);
+        let yn = self.remap_v(y);
         match op {
             RED_SUM => {
-                let x = args[0];
-                if let Some(gx) = self.grad_target(x)? {
-                    self.single(x)?;
-                    self.fill_buf(gx, n, g);
+                if let Some(c) = self.begin(x, n)? {
+                    self.fill(c.write, n, g);
+                    self.end(c);
                 }
             }
+            // The self-dot `Σ x²` (and SUMSQ, whose kernel ignores `y`): one op with a repeated
+            // operand, `dx = 2g·x`. (`x`/`y` are canon-normalized, so pointer identity is the test.)
+            RED_SUMSQ => self.self_square_back(x, xn, g, n)?,
+            RED_DOT if x == y => self.self_square_back(x, xn, g, n)?,
             RED_DOT => {
-                // loss = sum(x[i] y[i]).  dx = g*y, dy = g*x.
-                let (x, y) = (args[0], args[1]);
-                let xn = self.remap_v(x);
-                let yn = self.remap_v(y);
-                // The **self**-dot `loss = sum(x[i]^2)` — the sum-of-squares loss / L2 regularizer,
-                // which lowers to `sreduce(x, x, n, RED_DOT)` with both operands the SAME buffer —
-                // is one op with a repeated operand, not two separate contributions: `dx = 2g*x`, a
-                // single velem scale. (`x`/`y` are canon-normalized above, so pointer identity is
-                // the right test.) Without this case the two-buffer path below calls `single(x)`
-                // twice and the second call always errors.
-                if x == y {
-                    if let Some(gx) = self.grad_target(x)? {
-                        self.single(x)?;
-                        let two = self.cf32(2.0);
-                        let g2 = self.fmul(g, two, &F32); // 2g
-                        self.velem_scale(gx, xn, g2, n);
-                    }
-                    return Ok(());
+                if let Some(c) = self.begin(x, n)? {
+                    self.velem_scale(c.write, yn, g, n);
+                    self.end(c);
                 }
-                if let Some(gx) = self.grad_target(x)? {
-                    self.single(x)?;
-                    self.velem_scale(gx, yn, g, n);
-                }
-                if let Some(gy) = self.grad_target(y)? {
-                    self.single(y)?;
-                    self.velem_scale(gy, xn, g, n);
+                if let Some(c) = self.begin(y, n)? {
+                    self.velem_scale(c.write, xn, g, n);
+                    self.end(c);
                 }
             }
             RED_SSD => {
-                let (x, y) = (args[0], args[1]);
-                let xn = self.remap_v(x);
-                let yn = self.remap_v(y);
                 let two = self.cf32(2.0);
                 let g2 = self.fmul(g, two, &F32); // 2g
                 let ng2 = self.neg(g2, &F32); // -2g
-                if let Some(gx) = self.grad_target(x)? {
-                    self.single(x)?;
+                if let Some(c) = self.begin(x, n)? {
                     // dx = 2g*x + (-2g)*y
-                    self.velem_affine(gx, xn, yn, g2, ng2, n);
+                    self.velem_affine(c.write, xn, yn, g2, ng2, n);
+                    self.end(c);
                 }
-                if let Some(gy) = self.grad_target(y)? {
-                    self.single(y)?;
+                if let Some(c) = self.begin(y, n)? {
                     // dy = -2g*x + 2g*y
-                    self.velem_affine(gy, xn, yn, ng2, g2, n);
+                    self.velem_affine(c.write, xn, yn, ng2, g2, n);
+                    self.end(c);
                 }
             }
             RED_SUMABS => {
-                // loss = g·Σ|x[i]|  (the L1 norm / regularizer)  ->  dx = g·sgn(x).
-                // `sgn(0) = 0` is the subgradient convention every framework uses (PyTorch's
-                // `abs_backward` is `grad * self.sgn()`), and it is the only choice that keeps the
-                // rule odd — picking +g or -g at the kink would make d/dx of Σ|x| disagree with the
-                // central difference on a row that straddles zero.
-                let x = args[0];
-                if let Some(gx) = self.grad_target(x)? {
-                    self.single(x)?;
-                    let xn = self.remap_v(x);
-                    self.sign_fill(gx, xn, None, g, n);
+                // loss = g·Σ|x[i]|  ->  dx = g·sgn(x), with `sgn(0) = 0` — the subgradient
+                // convention every framework uses (PyTorch's `abs_backward` is `grad * self.sgn()`).
+                if let Some(c) = self.begin(x, n)? {
+                    self.sign_fill(c.write, xn, None, g, n);
+                    self.end(c);
                 }
             }
             RED_ABSDIFF => {
-                // loss = g·Σ|x[i] - y[i]|  (mean-absolute-error / SAD)  ->  dx = g·sgn(x-y),
-                // dy = -g·sgn(x-y).
-                let (x, y) = (args[0], args[1]);
-                let xn = self.remap_v(x);
-                let yn = self.remap_v(y);
+                // loss = g·Σ|x[i] - y[i]|  (MAE / SAD)  ->  dx = g·sgn(x-y), dy = -g·sgn(x-y).
                 if x == y {
-                    // |x-x| is identically 0: the loss does not depend on x at all, and the two
-                    // contributions below would cancel. Nothing to accumulate.
+                    // |x-x| is identically 0: the loss does not depend on x at all.
                     return Ok(());
                 }
                 let ng = self.neg(g, &F32);
-                if let Some(gx) = self.grad_target(x)? {
-                    self.single(x)?;
-                    self.sign_fill(gx, xn, Some(yn), g, n);
+                if let Some(c) = self.begin(x, n)? {
+                    self.sign_fill(c.write, xn, Some(yn), g, n);
+                    self.end(c);
                 }
-                if let Some(gy) = self.grad_target(y)? {
-                    self.single(y)?;
-                    self.sign_fill(gy, xn, Some(yn), ng, n);
+                if let Some(c) = self.begin(y, n)? {
+                    self.sign_fill(c.write, xn, Some(yn), ng, n);
+                    self.end(c);
+                }
+            }
+            RED_MAX | RED_MIN | RED_MAXABS => {
+                if let Some(c) = self.begin(x, n)? {
+                    let m = self.remap_v(loss);
+                    self.extremum_back(op, c.write, xn, m, g, n);
+                    self.end(c);
                 }
             }
             other => {
                 return Err(format!(
                     "autodiff: no VJP for sreduce op {other} \
-                     (supported: SUM, DOT, SSD, SUMABS, ABSDIFF)"
+                     (supported: SUM, DOT, SSD, SUMSQ, MAX, MIN, MAXABS, SUMABS, ABSDIFF)"
                 ))
             }
         }
         Ok(())
+    }
+
+    /// `dx += 2g·x` — the gradient of `Σ x²`.
+    fn self_square_back(
+        &mut self,
+        x: ValueId,
+        xn: ValueId,
+        g: ValueId,
+        n: ValueId,
+    ) -> Result<(), String> {
+        if let Some(c) = self.begin(x, n)? {
+            let two = self.cf32(2.0);
+            let g2 = self.fmul(g, two, &F32);
+            self.velem_scale(c.write, xn, g2, n);
+            self.end(c);
+        }
+        Ok(())
+    }
+
+    /// The max / min / max-abs reduction backward: `dst[i] = g·s(x[i])·[key(x[i]) == m] / count`,
+    /// where `m` is the forward result, `key` is `x` (or `|x|` for MAXABS), `s` is 1 (or `sgn(x)` for
+    /// MAXABS) and `count` is the number of elements attaining `m` — the even split over ties that
+    /// `torch.amax` / `jnp.max` use. One mask loop, one `RED_SUMABS` count, one velem scale.
+    fn extremum_back(
+        &mut self,
+        op: i64,
+        dst: ValueId,
+        x: ValueId,
+        m: ValueId,
+        g: ValueId,
+        n: ValueId,
+    ) {
+        let zero = self.cf32(0.0);
+        let one = self.cf32(1.0);
+        let none = self.cf32(-1.0);
+        let lp = self.open_loop(n);
+        let i = lp.idx;
+        let xi = self.load_at(x, i);
+        let v = if op == RED_MAXABS {
+            let nx = self.neg(xi, &F32);
+            let isneg = self.b.build(MirType::I1, Op::Cmp(CmpOp::Folt, xi, zero));
+            let ax = self.b.build(F32, Op::Select(isneg, nx, xi));
+            let hit = self.b.build(MirType::I1, Op::Cmp(CmpOp::Foeq, ax, m));
+            let ispos = self.b.build(MirType::I1, Op::Cmp(CmpOp::Fogt, xi, zero));
+            let lo = self.b.build(F32, Op::Select(isneg, none, zero));
+            let sg = self.b.build(F32, Op::Select(ispos, one, lo));
+            self.b.build(F32, Op::Select(hit, sg, zero))
+        } else {
+            let hit = self.b.build(MirType::I1, Op::Cmp(CmpOp::Foeq, xi, m));
+            self.b.build(F32, Op::Select(hit, one, zero))
+        };
+        self.store_at(dst, i, v);
+        self.close_loop(lp);
+        // The number of attaining elements: Σ|mask| (MAXABS masks carry the sign).
+        let count = self.row_reduce_at(dst, dst, n, RED_SUMABS);
+        let scale = self.fdiv(g, count, &F32);
+        self.velem_scale(dst, dst, scale, n);
     }
 
     /// Emit `dst[i] = coef · sgn(a[i] - b[i])` (or `sgn(a[i])` when `b` is `None`) over `n`
@@ -552,152 +866,15 @@ impl<'a> Vjp<'a> {
         self.close_loop(lp);
     }
 
-    // --- nn.Linear (C = A . B^T) ---------------------------------------------------------------
-
-    /// `sgemm_nt(a, b, c, m, k, n, beta)` computes `C(m x n) = A(m x k) . B(n x k)^T`. With
-    /// `dC = buf_adj[c]`: `dA(m x k) = dC . B` (a plain `A.B` GEMM, no transpose) and
-    /// `dB(n x k) = dC^T . A` (transpose `dC` then `A.B`). Both ride `wukong_sgemm`, accumulating
-    /// into the target via `beta = 1` when it already holds a contribution.
-    ///
-    /// NOTE the `dB` transpose is deliberately still the synthesized flat loop, even though
-    /// [`Vjp::diff_sgemm`] below shows `wukong_sgemm_tn` does the identical job in one call with no
-    /// scratch and no `buf_count[c]` requirement: `wukong_driver`'s
-    /// `transformer_ffn_block_from_source` and `silu_and_gelu_backward_from_source` assert on the
-    /// exact `wukong_sgemm(` spelling this emits, and that file is outside this workstream's fence.
-    /// Switching it is a one-line change plus two assertion updates, and belongs in a commit that
-    /// can touch both.
-    fn diff_sgemm_nt(&mut self, args: &[ValueId]) -> Result<(), String> {
-        let (a, b, c) = (args[0], args[1], args[2]);
-        let dc = match self.buf_adj.get(&c).copied() {
-            Some(dc) => dc,
-            None => return Ok(()), // output gradient is zero
-        };
-        self.reject_inplace_matmul(a, b, c)?;
-        let m = self.remap_v(args[3]);
-        let k = self.remap_v(args[4]);
-        let n = self.remap_v(args[5]);
-        let (an, bn) = (self.remap_v(a), self.remap_v(b));
-
-        // dA(m x k) = dC(m x n) . B(n x k)   ->   sgemm(dC, B, dA, m'=m, k'=n, n'=k)
-        if let Some(da) = self.grad_target(a)? {
-            let beta = self.beta_for(a);
-            self.sgemm(dc, bn, da, m, n, k, beta);
-            self.contributed.insert(a);
-        }
-        // dB(n x k) = dC^T(n x m) . A(m x k)   ->   transpose dC, then sgemm(dCt, A, dB, n, m, k)
-        if let Some(db) = self.grad_target(b)? {
-            let count = *self
-                .buf_count
-                .get(&c)
-                .ok_or("autodiff: unknown size for matmul output buffer")?;
-            let dct = self.alloc_buf(count);
-            self.transpose(dc, dct, m, n);
-            let beta = self.beta_for(b);
-            self.sgemm(dct, an, db, n, m, k, beta);
-            self.contributed.insert(b);
-        }
-        Ok(())
-    }
-
-    // --- plain matmul (C = A . B) --------------------------------------------------------------
-
-    /// `sgemm(a, b, c, m, k, n, beta)` computes `C(m x n) = A(m x k) . B(k x n)`. With
-    /// `dC = buf_adj[c]`:
-    /// - `dA(m x k) = dC(m x n) . B(k x n)^T`  ->  `sgemm_nt(dC, B, dA, m'=m, k'=n, n'=k)`
-    ///   (B stored `[k, n]` is exactly the `n' x k'` operand `sgemm_nt` transposes);
-    /// - `dB(k x n) = A(m x k)^T . dC(m x n)`  ->  `sgemm_tn(A, dC, dB, m'=k, k'=m, n'=n)`.
-    ///
-    /// Both gradients are one tuned-kernel call with no scratch: the transposes the maths asks for
-    /// are exactly the two transposed GEMM spellings the runtime already ships.
-    fn diff_sgemm(&mut self, args: &[ValueId]) -> Result<(), String> {
-        let (a, b, c) = (args[0], args[1], args[2]);
-        let dc = match self.buf_adj.get(&c).copied() {
-            Some(dc) => dc,
-            None => return Ok(()), // output gradient is zero
-        };
-        self.reject_inplace_matmul(a, b, c)?;
-        let m = self.remap_v(args[3]);
-        let k = self.remap_v(args[4]);
-        let n = self.remap_v(args[5]);
-        let (an, bn) = (self.remap_v(a), self.remap_v(b));
-
-        if let Some(da) = self.grad_target(a)? {
-            let beta = self.beta_for(a);
-            self.sgemm_nt_call(dc, bn, da, m, n, k, beta);
-            self.contributed.insert(a);
-        }
-        if let Some(db) = self.grad_target(b)? {
-            let beta = self.beta_for(b);
-            self.sgemm_tn(an, dc, db, k, m, n, beta);
-            self.contributed.insert(b);
-        }
-        Ok(())
-    }
-
-    // --- broadcast bias (y = x + b, b shared across rows) --------------------------------------
-
-    /// `bias_bcast(x, b, out, rows, cols, op)` computes `out[i,j] = act(x[i,j] + b[j])`. For the
-    /// pure add (`op == BIAS_ACT_NONE`) the VJP is the textbook inner-product bias gradient (the
-    /// same `diff_bias = reduce over the batch axis` oneDNN's inner-product backward-weights
-    /// computes): `dx = dout` and `db[j] = Σ_i dout[i,j]`, one `wukong_colsum_f32` call.
-    ///
-    /// A *fused* activation is refused: the recognizer folds `relu(x + b)` into one call, and
-    /// differentiating that needs the masked derivative this rule does not carry. Refusing keeps a
-    /// performance fusion from silently producing the wrong gradient.
-    fn diff_bias(&mut self, args: &[ValueId]) -> Result<(), String> {
-        let (x, bvec, out) = (args[0], args[1], args[2]);
-        let op = self.const_i64(args[5])?;
-        if op != BIAS_ACT_NONE {
-            return Err(format!(
-                "autodiff: no VJP for `wukong_bias_bcast_f32` with the fused activation op {op}; \
-                 only the pure broadcast add (op {BIAS_ACT_NONE}) has a rule"
-            ));
-        }
-        let dout = match self.buf_adj.get(&out).copied() {
-            Some(d) => d,
-            None => return Ok(()),
-        };
-        let rows = self.remap_v(args[3]);
-        let cols = self.remap_v(args[4]);
-        let total = self.b.build(I64T, Op::Bin(BinOp::Mul, rows, cols));
-        // dx = dout (the add is the identity in x)
-        if let Some(dx) = self.grad_target(x)? {
-            self.single(x)?;
-            let one = self.cf32(1.0);
-            self.velem_scale(dx, dout, one, total);
-        }
-        // db[j] = Σ_i dout[i, j]
-        if let Some(db) = self.grad_target(bvec)? {
-            self.single(bvec)?;
-            self.colsum(dout, db, rows, cols);
-        }
-        Ok(())
-    }
-
     // --- elementwise activation (vmath) --------------------------------------------------------
 
-    /// `vmath(x, out, n, op)` computes `out = f(x)` elementwise. Backward `dx = dout (.) f'(x)`,
-    /// emitted as one synthesized loop. relu uses the input `x` (`x>0`); the smooth ops reuse the
-    /// forward *output* `out` (sigmoid' = y(1-y), tanh' = 1-y^2, exp' = y) so no recompute is needed.
+    /// `vmath(x, out, n, op)` computes `out = f(x)` elementwise. Backward `dx = dout (.) f'(x)` —
+    /// see [`Vjp::act_backward`] for the per-op routing (fused `vmath2` backward kernels, kernel
+    /// compositions, or a synthesized loop).
     ///
-    /// **An in-place activation is refused.** `wukong_vmath_f32` explicitly permits `out == x`
-    /// ("`x` and `out` may alias (the recognizer allows in-place activations)",
-    /// `wukong_runtime/src/vmath.rs`), so `x[i] = log(x[i])` is a legal forward. The buffer tape
-    /// cannot follow it: one forward buffer gets one gradient buffer, so `x` and `out` would have
-    /// to hold the input's adjoint and the output's at once. On top of that, every arm below that
-    /// loads the forward INPUT (log, leakyrelu, hardsigmoid, softsign, the inverse trigs, and the
-    /// fused `wukong_vmath2_f32` backward, which takes `x` as its first operand) would read `f(x)`.
-    ///
-    /// This refusal is a REWORDING, not a new gate, and the honest note matters: the aliased case
-    /// was already unreachable, because `buf_adj[out]` can only have been set by a consumer rule,
-    /// every one of which marks the buffer in `contributed` (or `diff_load` does), so `single(x)`
-    /// below already failed — with "receives multiple gradient contributions; accumulation is not
-    /// yet supported", which points at the wrong thing. Two reasons to state it here instead.
-    /// `single`'s message advertises itself as temporary: the day accumulation lands, the
-    /// coincidental guard evaporates and this becomes the silent wrong gradient it currently only
-    /// looks like. And a user who wrote an in-place activation should be told that, not sent
-    /// looking for a fan-out. (The out-of-place spelling of exactly this shape still
-    /// differentiates — see `kernel_output_read_by_scalar_load`.)
+    /// **An in-place activation is refused.** `wukong_vmath_f32` explicitly permits `out == x`, so
+    /// `x[i] = log(x[i])` is a legal forward. The buffer tape cannot follow it: one forward buffer gets
+    /// one gradient buffer, and every derivative that reads the forward INPUT would read `f(x)`.
     fn diff_vmath(&mut self, args: &[ValueId]) -> Result<(), String> {
         let (x, out) = (args[0], args[1]);
         let dout = match self.buf_adj.get(&out).copied() {
@@ -705,12 +882,6 @@ impl<'a> Vjp<'a> {
             None => return Ok(()),
         };
         let op = self.const_i64(args[3])?;
-        let n = self.remap_v(args[2]);
-        let dx = match self.grad_target(x)? {
-            Some(dx) => dx,
-            None => return Ok(()), // input not differentiated
-        };
-        // Before `single`, so the aliasing is what gets reported.
         if out == x {
             return Err(format!(
                 "autodiff: vmath VJP cannot differentiate an in-place activation (op {op}: \
@@ -720,130 +891,166 @@ impl<'a> Vjp<'a> {
                 out.0
             ));
         }
-        self.single(x)?;
+        let n = self.dim(args[2]);
         let xn = self.remap_v(x);
-        // The smooth activations whose derivative is a transcendental (silu folds a sigmoid, gelu a
-        // tanh, softplus a sigmoid, elu an exp) ride the fused two-input backward kernel
-        // `wukong_vmath2_f32(x, dy, dx, n, *_BWD)` — one pass, `dx = dy·act'(x)`, bit-identical with
-        // the forward. The algebraic ones (relu/sigmoid/tanh/exp) stay on the synthesized loop below.
-        if let Some(bwd) = vm2_bwd_code(op) {
-            self.vmath2_bwd(xn, dout, dx, n, bwd);
-            return Ok(());
+        let yn = self.remap_v(out);
+        if let Some(c) = self.begin(x, n)? {
+            self.act_backward(op, dout, xn, yn, c.write, n)?;
+            self.end(c);
         }
-        let yn = self.remap_v(out); // forward output buffer (for the smooth derivatives)
-        self.activation_backward(op, dout, xn, yn, dx, n)?;
         Ok(())
-    }
-
-    /// Emit `wukong_vmath2_f32(x, dy, dx, n, op)` — the fused activation backward `dx = dy·act'(x)`.
-    fn vmath2_bwd(&mut self, x: ValueId, dy: ValueId, dx: ValueId, n: ValueId, op: i64) {
-        let opv = self.cint(op);
-        let f = self.syms.vmath2;
-        self.b.build_void(Op::Call {
-            func: f,
-            args: vec![x, dy, dx, n, opv],
-        });
     }
 
     // --- streaming affine / residual (velem) ---------------------------------------------------
 
-    /// `velem(x, y, out, n, a, b, c, op)` computes `out = act(a*x + b*y + c)`. With the identity
-    /// activation it is linear, so the VJP is exact: `dx = a*dout`, `dy = b*dout` (each a velem
-    /// scale). This covers residual add (`a=b=1` -> `dx=dy=dout`) and scaling. Non-identity
-    /// activations (relu/relu6) are rejected for now (they need a masked loop like vmath), and so is
-    /// every *compute mode* above the activation byte ([`VE_HADAMARD`], [`VE_DIV`]) — those are not
-    /// the affine form this rule differentiates. The gate is a WHITELIST of the two op spellings the
-    /// affine rule is valid for, so a future high-bit mode fails closed rather than silently taking
-    /// the linear VJP.
+    /// `velem(x, y, out, n, a, b, c, op)` computes `out = act(mode(x, y))`, where the mode is the
+    /// affine `a*x + b*y + c`, the Hadamard product `x·y` or the quotient `x/y`, and `act` is the
+    /// identity, ReLU or ReLU6. A fused activation is differentiated through its OUTPUT (`relu(z) > 0`
+    /// exactly when `z > 0`, and `0 < relu6(z) < 6` exactly when `0 < z < 6`), so no pre-activation
+    /// is recomputed; the mode rule then runs on `dz`.
+    ///
+    /// The dispatch is a WHITELIST: the activation byte and the compute mode are split and each must
+    /// be one this rule implements, so an unknown future bit fails closed instead of quietly taking a
+    /// rule written for a different kernel (the affine VJP applied to a Hadamard product once
+    /// shipped as a silently wrong gradient).
     fn diff_velem(&mut self, args: &[ValueId]) -> Result<(), String> {
         let op = self.const_i64(args[7])?;
-        // The low byte selects a fused activation; the bits ABOVE `VE_USE_Y` select a *compute
-        // mode*. Split them and dispatch on the mode, so an unknown future high bit still fails
-        // closed instead of quietly taking a rule written for a different kernel.
         let act = op & 0xFF;
         let mode = op & !(0xFF | VE_USE_Y);
-        if act != VE_ID {
+        if !matches!(act, VE_ID | VE_RELU | VE_RELU6) {
             return Err(format!(
                 "autodiff: velem VJP has no rule for the fused activation in op {op} (low byte \
-                 {act}); only the identity activation ({VE_ID}) is differentiated"
+                 {act}); only identity ({VE_ID}), ReLU ({VE_RELU}) and ReLU6 ({VE_RELU6}) are \
+                 differentiated"
             ));
         }
-        match mode {
-            0 => self.diff_velem_affine(args, op),
-            VE_HADAMARD => self.diff_velem_hadamard(args),
-            VE_DIV => self.diff_velem_div(args),
-            other => Err(format!(
-                "autodiff: velem VJP has no rule for compute mode {other} (op {op})"
-            )),
+        if !matches!(mode, 0 | VE_HADAMARD | VE_DIV) {
+            return Err(format!(
+                "autodiff: velem VJP has no rule for compute mode {mode} (op {op})"
+            ));
         }
-    }
-
-    /// The affine form `out = a*x + b*y + c`: linear, so `dx = a*dout`, `dy = b*dout`.
-    fn diff_velem_affine(&mut self, args: &[ValueId], op: i64) -> Result<(), String> {
         let (x, y, out) = (args[0], args[1], args[2]);
         let dout = match self.buf_adj.get(&out).copied() {
             Some(d) => d,
             None => return Ok(()),
         };
-        let n = self.remap_v(args[3]);
+        let n = self.dim(args[3]);
+        let uses_y = mode != 0 || op & VE_USE_Y != 0;
+        let inplace = out == x || (uses_y && out == y);
+        let dz = if act == VE_ID {
+            dout
+        } else {
+            if inplace {
+                return Err(format!(
+                    "autodiff: velem VJP cannot differentiate an in-place map with a fused \
+                     activation (op {op}: output buffer v{} aliases an input)",
+                    out.0
+                ));
+            }
+            let s = self.scratch(n);
+            let outn = self.remap_v(out);
+            self.relu_mask_from_output(dout, outn, s, n, act == VE_RELU6);
+            s
+        };
+        match mode {
+            0 => self.diff_velem_affine(args, op, dz, n),
+            VE_HADAMARD => self.diff_velem_hadamard(args, dz, n),
+            _ => self.diff_velem_div(args, dz, n),
+        }
+    }
+
+    /// The affine form `out = a*x + b*y + c`: linear, so `dx = a*dz`, `dy = b*dz`.
+    ///
+    /// **In place** (`x[i] = x[i] + r[i]`, the residual spelling): the output buffer IS an input, so
+    /// its adjoint becomes — in place — the adjoint of the input it overwrote. The contribution to
+    /// the OTHER operand is taken first, while the buffer still holds the output adjoint.
+    fn diff_velem_affine(
+        &mut self,
+        args: &[ValueId],
+        op: i64,
+        dz: ValueId,
+        n: ValueId,
+    ) -> Result<(), String> {
+        let (x, y, out) = (args[0], args[1], args[2]);
         let (a, b) = (self.remap_v(args[4]), self.remap_v(args[5]));
         let uses_y = op & VE_USE_Y != 0;
-        // dx = a * dout
-        if let Some(dx) = self.grad_target(x)? {
-            self.single(x)?;
-            self.velem_scale(dx, dout, a, n);
+        let x_in = out == x;
+        let y_in = uses_y && out == y;
+        if x_in && y_in {
+            // out = (a + b)·out_old + c
+            let s = self.fadd(a, b, &F32);
+            self.velem_scale(dz, dz, s, n);
+            return Ok(());
         }
-        // dy = b * dout (only if y was actually read)
+        if x_in {
+            if uses_y {
+                if let Some(c) = self.begin(y, n)? {
+                    self.velem_scale(c.write, dz, b, n);
+                    self.end(c);
+                }
+            }
+            self.velem_scale(dz, dz, a, n);
+            return Ok(());
+        }
+        if y_in {
+            if let Some(c) = self.begin(x, n)? {
+                self.velem_scale(c.write, dz, a, n);
+                self.end(c);
+            }
+            self.velem_scale(dz, dz, b, n);
+            return Ok(());
+        }
+        if let Some(c) = self.begin(x, n)? {
+            self.velem_scale(c.write, dz, a, n);
+            self.end(c);
+        }
         if uses_y {
-            if let Some(dy) = self.grad_target(y)? {
-                self.single(y)?;
-                self.velem_scale(dy, dout, b, n);
+            if let Some(c) = self.begin(y, n)? {
+                self.velem_scale(c.write, dz, b, n);
+                self.end(c);
             }
         }
         Ok(())
     }
 
     /// The Hadamard product `out = x (.) y` — the gate in every SwiGLU/GeGLU MLP, every attention
-    /// mask and every dropout mask. Its VJP is the product rule, `dx = dout (.) y` and
-    /// `dy = dout (.) x`: **the forward kernel is its own backward**, one `VE_HADAMARD` call each,
-    /// no scratch. (`a`/`b`/`c` are ignored by the kernel in this mode — see
-    /// `wukong_runtime::velem::elem1` — so they carry no coefficient into the gradient.)
-    ///
-    /// `out = x (.) x` is one op with a repeated operand, not two contributions: `dx = 2·dout(.)x`.
-    fn diff_velem_hadamard(&mut self, args: &[ValueId]) -> Result<(), String> {
+    /// mask and every dropout mask. Its VJP is the product rule, `dx = dz (.) y` and
+    /// `dy = dz (.) x`: **the forward kernel is its own backward**, one `VE_HADAMARD` call each.
+    /// `out = x (.) x` is one op with a repeated operand: `dx = 2·dz(.)x`.
+    fn diff_velem_hadamard(
+        &mut self,
+        args: &[ValueId],
+        dz: ValueId,
+        n: ValueId,
+    ) -> Result<(), String> {
         let (x, y, out) = (args[0], args[1], args[2]);
         self.reject_inplace_velem(x, y, out, "Hadamard-product")?;
-        let dout = match self.buf_adj.get(&out).copied() {
-            Some(d) => d,
-            None => return Ok(()),
-        };
-        let n = self.remap_v(args[3]);
         let (xn, yn) = (self.remap_v(x), self.remap_v(y));
         if x == y {
-            if let Some(dx) = self.grad_target(x)? {
-                self.single(x)?;
-                self.velem_hadamard(dx, dout, xn, n);
+            if let Some(c) = self.begin(x, n)? {
+                self.velem_hadamard(c.write, dz, xn, n);
                 let two = self.cf32(2.0);
-                self.velem_scale(dx, dx, two, n);
+                self.velem_scale(c.write, c.write, two, n);
+                self.end(c);
             }
             return Ok(());
         }
-        if let Some(dx) = self.grad_target(x)? {
-            self.single(x)?;
-            self.velem_hadamard(dx, dout, yn, n);
+        if let Some(c) = self.begin(x, n)? {
+            self.velem_hadamard(c.write, dz, yn, n);
+            self.end(c);
         }
-        if let Some(dy) = self.grad_target(y)? {
-            self.single(y)?;
-            self.velem_hadamard(dy, dout, xn, n);
+        if let Some(c) = self.begin(y, n)? {
+            self.velem_hadamard(c.write, dz, xn, n);
+            self.end(c);
         }
         Ok(())
     }
 
-    /// The elementwise quotient `out = x / y`: `dx = dout / y` and `dy = -(dout (.) out) / y`
+    /// The elementwise quotient `out = x / y`: `dx = dz / y` and `dy = -(dz (.) out) / y`
     /// (writing `x/y²` as `out/y` keeps the second gradient to one squaring-free pass and reuses the
-    /// forward output the tape already has). `dy` needs one `n`-wide scratch, so it requires a
-    /// compile-time `n`; `dx` alone does not.
-    fn diff_velem_div(&mut self, args: &[ValueId]) -> Result<(), String> {
+    /// forward output the tape already has). With a fused ReLU/ReLU6 `out` differs from `x/y` only
+    /// where the mask already zeroed `dz`, so `dz (.) out` is still `dz (.) (x/y)`.
+    fn diff_velem_div(&mut self, args: &[ValueId], dz: ValueId, n: ValueId) -> Result<(), String> {
         let (x, y, out) = (args[0], args[1], args[2]);
         self.reject_inplace_velem(x, y, out, "elementwise-division")?;
         if x == y {
@@ -853,31 +1060,24 @@ impl<'a> Vjp<'a> {
                     .to_string(),
             );
         }
-        let dout = match self.buf_adj.get(&out).copied() {
-            Some(d) => d,
-            None => return Ok(()),
-        };
-        let n = self.remap_v(args[3]);
         let (yn, outn) = (self.remap_v(y), self.remap_v(out));
-        if let Some(dx) = self.grad_target(x)? {
-            self.single(x)?;
-            self.velem_div(dx, dout, yn, n);
+        if let Some(c) = self.begin(x, n)? {
+            self.velem_div(c.write, dz, yn, n);
+            self.end(c);
         }
-        if let Some(dy) = self.grad_target(y)? {
-            self.single(y)?;
-            let count = self.const_count(args[3], "velem")?;
-            let t = self.alloc_buf(count);
-            self.velem_hadamard(t, dout, outn, n); // t = dout . (x/y)
-            self.velem_div(dy, t, yn, n); //          dy = t / y = dout·x/y^2
+        if let Some(c) = self.begin(y, n)? {
+            self.velem_hadamard(c.write, dz, outn, n); // dz . (x/y)
+            self.velem_div(c.write, c.write, yn, n); //   dz·x/y^2
             let neg1 = self.cf32(-1.0);
-            self.velem_scale(dy, dy, neg1, n);
+            self.velem_scale(c.write, c.write, neg1, n);
+            self.end(c);
         }
         Ok(())
     }
 
     /// A `velem` whose output aliases an input destroys the forward value the Hadamard/quotient
-    /// VJPs read back (`x *= y` lowers to exactly that). There is no rule for it — refuse rather
-    /// than differentiate against a buffer whose contents the forward has already overwritten.
+    /// VJPs read back (`x *= y` lowers to exactly that). Refuse rather than differentiate against a
+    /// buffer whose contents the forward has already overwritten.
     fn reject_inplace_velem(
         &self,
         x: ValueId,
@@ -895,50 +1095,58 @@ impl<'a> Vjp<'a> {
         Ok(())
     }
 
-    /// Both matmul VJPs read the forward operands back (`dA` reads `B`, `dB` reads `A`), so a GEMM
-    /// whose output buffer aliases either input hands them a buffer the forward has already
-    /// overwritten.
-    ///
-    /// Unlike `vmath` and `norm`, this one is a LIVE silent wrong gradient, not a reworded
-    /// refusal: the matmul rules are the only ones that do not go through `single` — they route
-    /// through `beta_for`, which merely *observes* `contributed` to choose `beta` — so nothing on
-    /// the path fails. With `c == a` the emitted `dA` is `sgemm(dC, B, dA, .., beta = 1)` where
-    /// `dA` and `dC` are the same buffer: a GEMM accumulating into the operand it is reading. Exit
-    /// 0, garbage numbers. Refuse.
-    fn reject_inplace_matmul(&self, a: ValueId, b: ValueId, c: ValueId) -> Result<(), String> {
-        if c == a || c == b {
-            return Err(format!(
-                "autodiff: matmul VJP cannot differentiate an in-place GEMM (output buffer \
-                 v{} aliases an input); both adjoints read the un-overwritten forward operands",
-                c.0
-            ));
-        }
-        Ok(())
+    /// `dst[i] = (0 < out[i] (< 6)) ? dout[i] : 0` — the ReLU / ReLU6 backward read off the
+    /// activation OUTPUT (which is exactly as informative as the pre-activation for these two).
+    pub(crate) fn relu_mask_from_output(
+        &mut self,
+        dout: ValueId,
+        out: ValueId,
+        dst: ValueId,
+        n: ValueId,
+        six: bool,
+    ) {
+        let zero = self.cf32(0.0);
+        let six_c = self.cf32(6.0);
+        let lp = self.open_loop(n);
+        let i = lp.idx;
+        let o = self.load_at(out, i);
+        let d = self.load_at(dout, i);
+        let pos = self.b.build(MirType::I1, Op::Cmp(CmpOp::Fogt, o, zero));
+        let pass = if six {
+            let below = self.b.build(MirType::I1, Op::Cmp(CmpOp::Folt, o, six_c));
+            self.b.build(F32, Op::Select(below, d, zero))
+        } else {
+            d
+        };
+        let v = self.b.build(F32, Op::Select(pos, pass, zero));
+        self.store_at(dst, i, v);
+        self.close_loop(lp);
     }
 
-    // --- row-wise normalization (softmax) ------------------------------------------------------
+    // --- row-wise normalization ----------------------------------------------------------------
 
-    /// `norm(x, out, rows, cols, eps_bits, op)` row-normalizes `x` (softmax / LayerNorm / RMSNorm).
-    /// All three backward passes are per-row reductions (riding `sreduce`) plus an elementwise
-    /// combine, emitted as nested counted loops (rows x cols). LayerNorm/RMSNorm/L2-norm recompute
-    /// the row statistics from `x` (the forward kernel emits only `y`), so `x` must not be
-    /// overwritten in place by the forward norm — a requirement this doc comment used to state and
-    /// nothing enforced. It is now a refusal, worded like [`Vjp::diff_vmath`]'s and for the same
-    /// two reasons: the buffer tape has one gradient buffer per forward buffer, and `single`'s
-    /// pre-existing "multiple gradient contributions" message is both misleading here and
-    /// advertised as temporary.
-    fn diff_norm(&mut self, args: &[ValueId]) -> Result<(), String> {
+    /// `norm(x, out, rows, cols, eps_bits, op)` row-normalizes `x`. The backwards are the runtime's
+    /// own fused kernels — `wukong_softmax_bwd_f32` (`dx = y(.)(dy − Σy·dy)`, the same per-row dot +
+    /// elementwise tail the tape used to synthesize, bit for bit), `wukong_layernorm_bwd_f32` and
+    /// `wukong_rmsnorm_bwd_f32` (statistics recomputed from `x` with the forward's stable centered
+    /// variance) — in the `@parallel` spelling when the forward used it. They need no scratch and no
+    /// compile-time `cols`, so a symbolic-generic row width differentiates. Log-softmax
+    /// (`dx = dy − exp(y)·Σdy`) and L2 (`dx = (1/r)(dy − y·<dy, y>)`) have no runtime backward and
+    /// stay small synthesized row loops.
+    ///
+    /// **In place** (`x = softmax(x)`, the spelling the recognizer matches): softmax and log-softmax
+    /// read only `y` and `dy`, so the output adjoint is transformed into the input adjoint in place
+    /// (the runtime kernel permits `dx == dy`). LayerNorm / RMSNorm / L2-norm recompute the row
+    /// statistics from `x`, which an in-place forward has destroyed, so they refuse.
+    fn diff_norm(&mut self, args: &[ValueId], par: bool) -> Result<(), String> {
         let (x, out) = (args[0], args[1]);
         let op = self.const_i64(args[5])?;
         let dy = match self.buf_adj.get(&out).copied() {
             Some(d) => d,
             None => return Ok(()),
         };
-        let dx = match self.grad_target(x)? {
-            Some(dx) => dx,
-            None => return Ok(()),
-        };
-        if out == x {
+        let inplace = out == x;
+        if inplace && !matches!(op, NORM_SOFTMAX | NORM_LOGSOFTMAX) {
             return Err(format!(
                 "autodiff: norm VJP cannot differentiate an in-place norm (op {op}: the \
                  output buffer v{} aliases the input); one buffer cannot hold both the input \
@@ -947,93 +1155,86 @@ impl<'a> Vjp<'a> {
                 out.0
             ));
         }
-        self.single(x)?;
+        let rows = self.dim(args[2]);
+        let cols = self.dim(args[3]);
+        let total = self.mul64(rows, cols);
         let xn = self.remap_v(x);
         let y = self.remap_v(out); // the forward normalized output
-        let rows = self.remap_v(args[2]);
-        let cols = self.remap_v(args[3]);
         match op {
-            NORM_SOFTMAX => self.softmax_back(dy, dx, y, rows, cols),
-            NORM_LOGSOFTMAX => {
-                // `y = log softmax(x)`, so `softmax(x) = exp(y)`: dx = dy - exp(y)·Σ_j dy_j per
-                // row — the same form PyTorch's `_log_softmax_backward_data` uses
-                // (`grad - exp(output) * grad.sum(dim, keepdim=True)`). One `wukong_vmath_f32`
-                // EXP pass recovers the probabilities into a rows x cols scratch.
-                let count = self.const_count_2d(args[2], args[3])?;
-                self.logsoftmax_back(dy, dx, y, rows, cols, count);
-                Ok(())
+            NORM_SOFTMAX => {
+                let f = pick(self.syms.softmax_bwd, self.syms.softmax_bwd_par, par);
+                if inplace {
+                    self.emit(f, vec![y, dy, dy, rows, cols]);
+                } else if let Some(c) = self.begin(x, total)? {
+                    self.emit(f, vec![y, dy, c.write, rows, cols]);
+                    self.end(c);
+                }
             }
-            NORM_LAYERNORM | NORM_RMSNORM | NORM_L2NORM => {
-                // eps rides in as f32 bits in an i64; it is a compile-time constant here.
+            NORM_LOGSOFTMAX => {
+                // `y = log softmax(x)`, so `softmax(x) = exp(y)`: dx = dy - exp(y)·Σ_j dy_j per row
+                // — PyTorch's `_log_softmax_backward_data` form. One `wukong_vmath_f32` EXP pass
+                // recovers the probabilities into a heap scratch (the same `exp1` polynomial the
+                // forward used).
+                let p = self.scratch(total);
+                self.vmath_call(y, p, total, VM_EXP);
+                if inplace {
+                    self.logsoftmax_rows(dy, p, dy, rows, cols);
+                } else if let Some(c) = self.begin(x, total)? {
+                    self.logsoftmax_rows(dy, p, c.write, rows, cols);
+                    self.end(c);
+                }
+            }
+            NORM_LAYERNORM | NORM_RMSNORM => {
+                let eps_bits = self.dim(args[4]);
+                // No gamma: a `Ptr`-typed null, the spelling the kernel and the interpreter's
+                // marshalling both read as "scale 1".
+                let null = self.b.build(PTR, Op::ConstInt(0, PTR));
+                let f = if op == NORM_LAYERNORM {
+                    pick(self.syms.layernorm_bwd, self.syms.layernorm_bwd_par, par)
+                } else {
+                    pick(self.syms.rmsnorm_bwd, self.syms.rmsnorm_bwd_par, par)
+                };
+                if let Some(c) = self.begin(x, total)? {
+                    self.emit(f, vec![xn, dy, null, c.write, rows, cols, eps_bits]);
+                    self.end(c);
+                }
+            }
+            NORM_L2NORM => {
+                // eps rides in as f32 bits in an i64; the synthesized backward needs its value.
                 let eps_bits = self.const_i64(args[4])? as u32;
                 let eps = self.cf32(f32::from_bits(eps_bits) as f64);
-                match op {
-                    NORM_LAYERNORM => {
-                        // CAPABILITY NARROWING, deliberate and loud: the stable centered variance
-                        // needs a `cols`-wide scratch holding `mu`, and a MIR alloca takes a
-                        // compile-time element count. So a LayerNorm whose `cols` is a symbolic
-                        // generic dim (`f<M,N>`, where `cols` arrives as a hidden i64 PARAM) now
-                        // declines where the old cancelling `E[x^2] - mu^2` form — which needed no
-                        // scratch — differentiated. That form is the defect this branch fixed; a
-                        // named refusal is the correct trade against a silently NaN gradient.
-                        // Lifting it needs a loop-carried accumulator `open_loop` does not have.
-                        let cols_count = self.const_count(args[3], "norm").map_err(|_| {
-                            "autodiff: the LayerNorm backward needs a compile-time-constant \
-                             `cols` — it allocates a cols-wide scratch holding the row mean, \
-                             so the variance is the stable centered form the forward kernel \
-                             evaluated; a symbolic generic row width is not supported"
-                                .to_string()
-                        })?;
-                        self.layernorm_back(dy, dx, xn, y, rows, cols, eps, cols_count);
-                    }
-                    NORM_RMSNORM => {
-                        // RMSNorm divides the sum of squares by the row width...
-                        let nf = self.b.build(F32, Op::Cast(CastKind::SiToFp, cols, F32));
-                        self.scale_norm_back(dy, dx, xn, y, rows, cols, eps, nf);
-                    }
-                    // ...and L2 (unit-norm) does not: `r = sqrt(Σx² + eps)` instead of
-                    // `sqrt(Σx²/n + eps)`, so the identical backward runs with a divisor of 1.
-                    // dx = (1/r)(dy - y·<dy, y>), the `torch.nn.functional.normalize` gradient.
-                    _ => {
-                        let nf = self.cf32(1.0);
-                        self.scale_norm_back(dy, dx, xn, y, rows, cols, eps, nf);
-                    }
+                if let Some(c) = self.begin(x, total)? {
+                    // L2 (unit-norm) is RMSNorm's backward with the `1/n` divisor set to 1:
+                    // `r = sqrt(Σx² + eps)`, dx = (1/r)(dy - y·<dy, y>) — the
+                    // `torch.nn.functional.normalize` gradient.
+                    let nf = self.cf32(1.0);
+                    self.scale_norm_back(dy, c.write, xn, y, rows, cols, eps, nf);
+                    self.end(c);
                 }
-                Ok(())
             }
-            other => Err(format!(
-                "autodiff: no VJP for norm op {other} \
-                 (supported: SOFTMAX, LAYERNORM, RMSNORM, LOGSOFTMAX, L2NORM)"
-            )),
+            other => {
+                return Err(format!(
+                    "autodiff: no VJP for norm op {other} \
+                     (supported: SOFTMAX, LAYERNORM, RMSNORM, LOGSOFTMAX, L2NORM)"
+                ))
+            }
         }
+        Ok(())
     }
 
-    // --- row-wise normalization with a learned scale/shift (norm_affine) -----------------------
-
     /// `norm_affine(x, out, gamma, beta, rows, cols, eps_bits, op)` computes
-    /// `out[i,j] = xhat[i,j]·gamma[j] + beta[j]`, where `xhat` is the LayerNorm or RMSNorm of row
-    /// `i`. `gamma`/`beta` are `cols` long and shared across rows (the transformer layout); either
-    /// may be a null pointer (a `Ptr`-typed `ConstInt(0)`), meaning scale 1 / no shift.
+    /// `out[i,j] = xhat[i,j]·gamma[j] + beta[j]` (LayerNorm or RMSNorm `xhat`). `gamma`/`beta` are
+    /// `cols` long and shared across rows; either may be a null pointer (a `Ptr`-typed
+    /// `ConstInt(0)`), meaning scale 1 / no shift. The three gradients:
+    /// - `dbeta[j]  = Σ_i dy[i,j]`            — one `wukong_colsum_f32`;
+    /// - `dgamma[j] = Σ_i dy[i,j]·xhat[i,j]`  — `xhat` recomputed by the forward `wukong_norm_f32`,
+    ///   one Hadamard, one column sum;
+    /// - `dx` — the runtime's `wukong_{layernorm,rmsnorm}_bwd_f32`, which take `gamma` directly.
     ///
-    /// The backward is the standard three gradients:
-    /// - `dbeta[j] = Σ_i dy[i,j]`                      — one column reduction;
-    /// - `dgamma[j] = Σ_i dy[i,j]·xhat[i,j]`           — one column reduction of a scratch;
-    /// - `dx = normback(dxhat)` with `dxhat = dy·gamma` — the *unscaled* norm backward, run on the
-    ///   recomputed `xhat` (NOT on `out`, which carries gamma/beta and would need a division by
-    ///   gamma to invert).
-    ///
-    /// One synthesized `rows x cols` pass materializes `xhat`, `dy(.)xhat` and `dxhat`; the norm
-    /// backward then reuses [`Vjp::layernorm_back`] / [`Vjp::scale_norm_back`] unchanged, so the
-    /// affine variant inherits their stable centered variance automatically.
-    ///
-    /// KNOWN LIMIT, recorded rather than assumed away: those three scratches are `rows*cols`
-    /// allocas in ONE frame, plus a `cols` one — a 512x768 residual block is ~4.7 MB of stack.
-    /// The interpreter's slot-indexed memory absorbs that and `--train` is interpreter-only today,
-    /// so it costs nothing now; the moment the backward gets a native path it is a stack overflow,
-    /// and the fix (calling `wukong_layernorm_bwd_f32` / `wukong_rmsnorm_bwd_f32`, which take
-    /// gamma directly and need no scratch at all) is the remaining half of P4.10. Whoever lands
-    /// the native `--train` path owns this.
-    fn diff_norm_affine(&mut self, args: &[ValueId]) -> Result<(), String> {
+    /// The only scratch is the `rows·cols` `xhat`, on the heap and only when `dgamma` is wanted: the
+    /// three stack `alloca`s (~4.7 MB for a 512x768 block) the synthesized version needed were a
+    /// stack overflow waiting for the native `--train` path.
+    fn diff_norm_affine(&mut self, args: &[ValueId], par: bool) -> Result<(), String> {
         let (x, out, gamma, beta) = (args[0], args[1], args[2], args[3]);
         let op = self.const_i64(args[7])?;
         if op != NORM_LAYERNORM && op != NORM_RMSNORM {
@@ -1053,141 +1254,59 @@ impl<'a> Vjp<'a> {
             Some(d) => d,
             None => return Ok(()),
         };
-        let rows_count = self.const_count(args[4], "norm_affine")?;
-        let cols_count = self.const_count(args[5], "norm_affine")?;
-        let total_count = rows_count
-            .checked_mul(cols_count)
-            .ok_or("autodiff: norm_affine rows*cols overflows")?;
-        let eps_bits = self.const_i64(args[6])? as u32;
-        let eps = self.cf32(f32::from_bits(eps_bits) as f64);
-        let rows = self.remap_v(args[4]);
-        let cols = self.remap_v(args[5]);
+        let rows = self.dim(args[4]);
+        let cols = self.dim(args[5]);
+        let total = self.mul64(rows, cols);
+        let eps_bits = self.dim(args[6]);
         let xn = self.remap_v(x);
-        // A null gamma/beta lowers to a `Ptr`-typed `ConstInt(0)` (the same spelling the
-        // interpreter's marshalling keys on), so the absent-parameter case is a compile-time fact.
-        let gamma_null = self.is_null_ptr(gamma);
-        let beta_null = self.is_null_ptr(beta);
-
-        let xhat = self.alloc_buf(total_count);
-        let dxhat = self.alloc_buf(total_count);
-        let dyxh = self.alloc_buf(total_count);
-        let mubuf = self.alloc_buf(cols_count);
-        let nf = self.b.build(F32, Op::Cast(CastKind::SiToFp, cols, F32));
-        let one = self.cf32(1.0);
-        let gn = self.remap_v(gamma);
-
-        // Pass 1: recompute xhat, and materialize dy(.)xhat (for dgamma) and dy(.)gamma (= dxhat).
-        let outer = self.open_loop(rows);
-        let r = outer.idx;
-        let rc = self.b.build(I64T, Op::Bin(BinOp::Mul, r, cols));
-        let (mu, invv) = if op == NORM_LAYERNORM {
-            let m = self.row_mean(xn, rc, cols, nf);
-            let var = self.row_centered_var(xn, mubuf, rc, cols, nf, m);
-            let veps = self.fadd(var, eps, &F32);
-            let sigma = self.b.build(F32, Op::Sqrt(veps));
-            (Some(m), self.fdiv(one, sigma, &F32))
-        } else {
-            let sumsq = self.row_reduce(xn, xn, rc, cols, RED_SUMSQ);
-            let ms = self.fdiv(sumsq, nf, &F32);
-            let mseps = self.fadd(ms, eps, &F32);
-            let rr = self.b.build(F32, Op::Sqrt(mseps));
-            (None, self.fdiv(one, rr, &F32))
-        };
-        let inner = self.open_loop(cols);
-        let j = inner.idx;
-        let idx = self.b.build(I64T, Op::Bin(BinOp::Add, rc, j));
-        let xv = self.load_at(xn, idx);
-        let xc = match mu {
-            Some(m) => self.b.build(F32, Op::Bin(BinOp::FSub, xv, m)),
-            None => xv,
-        };
-        let xh = self.fmul(xc, invv, &F32);
-        self.store_at(xhat, idx, xh);
-        let dyv = self.load_at(dy, idx);
-        let gxh = self.fmul(dyv, xh, &F32);
-        self.store_at(dyxh, idx, gxh);
-        let gv = if gamma_null { one } else { self.load_at(gn, j) };
-        let dxh = self.fmul(dyv, gv, &F32);
-        self.store_at(dxhat, idx, dxh);
-        self.close_loop(inner);
-        self.close_loop(outer);
-
-        // Pass 2: the three gradients.
-        if !gamma_null {
-            if let Some(dg) = self.grad_target(gamma)? {
-                self.single(gamma)?;
-                self.colsum(dyxh, dg, rows, cols);
+        let gn = self.remap_v(gamma); // a replayed null stays null
+        if !self.is_null_ptr(beta) {
+            if let Some(c) = self.begin(beta, cols)? {
+                self.colsum(dy, c.write, rows, cols);
+                self.end(c);
             }
         }
-        if !beta_null {
-            if let Some(db) = self.grad_target(beta)? {
-                self.single(beta)?;
-                self.colsum(dy, db, rows, cols);
+        if !self.is_null_ptr(gamma) {
+            if let Some(c) = self.begin(gamma, cols)? {
+                let xh = self.scratch(total);
+                let opv = self.cint(op);
+                let f = self.syms.norm;
+                self.emit(f, vec![xn, xh, rows, cols, eps_bits, opv]);
+                self.velem_hadamard(xh, dy, xh, total);
+                self.colsum(xh, c.write, rows, cols);
+                self.end(c);
             }
         }
-        if let Some(dx) = self.grad_target(x)? {
-            self.single(x)?;
-            if op == NORM_LAYERNORM {
-                self.layernorm_back(dxhat, dx, xn, xhat, rows, cols, eps, cols_count);
+        if let Some(c) = self.begin(x, total)? {
+            let f = if op == NORM_LAYERNORM {
+                pick(self.syms.layernorm_bwd, self.syms.layernorm_bwd_par, par)
             } else {
-                self.scale_norm_back(dxhat, dx, xn, xhat, rows, cols, eps, nf);
-            }
+                pick(self.syms.rmsnorm_bwd, self.syms.rmsnorm_bwd_par, par)
+            };
+            self.emit(f, vec![xn, dy, gn, c.write, rows, cols, eps_bits]);
+            self.end(c);
         }
         Ok(())
     }
 
-    /// Whether `v` is a `Ptr`-typed null (`ConstInt(0)`) — how lowering spells an absent
-    /// `gamma`/`beta` operand.
-    fn is_null_ptr(&self, v: ValueId) -> bool {
+    /// Whether `v` is a `Ptr`-typed null (`ConstInt(0)`) — how lowering spells an absent operand.
+    pub(crate) fn is_null_ptr(&self, v: ValueId) -> bool {
         matches!(self.def_op.get(&v), Some(Op::ConstInt(0, _)))
     }
 
-    /// softmax: `dx = y (.) (dy - sum_j dy_j y_j)` per row.
-    fn softmax_back(
+    /// Log-softmax rows: `dst[r, j] = dy[r, j] - p[r, j]·Σ_k dy[r, k]` (`p = exp(y)`). `dst` may be
+    /// `dy` (the in-place forward): each row's sum is taken before any of the row is written.
+    fn logsoftmax_rows(
         &mut self,
         dy: ValueId,
-        dx: ValueId,
-        y: ValueId,
+        p: ValueId,
+        dst: ValueId,
         rows: ValueId,
         cols: ValueId,
-    ) -> Result<(), String> {
-        let outer = self.open_loop(rows);
-        let r = outer.idx;
-        let rc = self.b.build(I64T, Op::Bin(BinOp::Mul, r, cols));
-        let s = self.row_reduce(dy, y, rc, cols, RED_DOT); // sum_j dy_j y_j
-        let inner = self.open_loop(cols);
-        let j = inner.idx;
-        let idx = self.b.build(I64T, Op::Bin(BinOp::Add, rc, j));
-        let yv = self.load_at(y, idx);
-        let dyv = self.load_at(dy, idx);
-        let diff = self.b.build(F32, Op::Bin(BinOp::FSub, dyv, s));
-        let dxv = self.b.build(F32, Op::Bin(BinOp::FMul, yv, diff));
-        self.store_at(dx, idx, dxv);
-        self.close_loop(inner);
-        self.close_loop(outer);
-        Ok(())
-    }
-
-    /// log-softmax: `y = (x - m) - log Σ exp(x - m)`, so `exp(y)` IS the softmax. Backward per row:
-    /// `dx = dy - exp(y)·Σ_j dy_j`. One `wukong_vmath_f32` EXP pass over the whole `rows x cols`
-    /// output recovers the probabilities into `p` (there is no scalar `exp` op in MIR, and the
-    /// kernel is the same `exp1` polynomial the forward used), then the row loop combines.
-    #[allow(clippy::too_many_arguments)]
-    fn logsoftmax_back(
-        &mut self,
-        dy: ValueId,
-        dx: ValueId,
-        y: ValueId,
-        rows: ValueId,
-        cols: ValueId,
-        total_count: u32,
     ) {
-        let p = self.alloc_buf(total_count);
-        let total = self.b.build(I64T, Op::Bin(BinOp::Mul, rows, cols));
-        self.vmath_call(y, p, total, VM_EXP);
         let outer = self.open_loop(rows);
         let r = outer.idx;
-        let rc = self.b.build(I64T, Op::Bin(BinOp::Mul, r, cols));
+        let rc = self.mul64(r, cols);
         let s = self.row_reduce(dy, dy, rc, cols, RED_SUM); // Σ_j dy_j
         let inner = self.open_loop(cols);
         let j = inner.idx;
@@ -1196,103 +1315,14 @@ impl<'a> Vjp<'a> {
         let pv = self.load_at(p, idx);
         let ps = self.fmul(pv, s, &F32);
         let dxv = self.b.build(F32, Op::Bin(BinOp::FSub, dyv, ps));
-        self.store_at(dx, idx, dxv);
+        self.store_at(dst, idx, dxv);
         self.close_loop(inner);
         self.close_loop(outer);
     }
 
-    /// LayerNorm: with `mu = mean(x)`, `sigma = sqrt(var + eps)`, `y = (x - mu)/sigma`,
-    /// `dx = (1/sigma) (dy - mean(dy) - y * mean(dy (.) y))` per row.
-    ///
-    /// **The variance is the centered two-pass form, matching the forward kernel.** It used to be
-    /// recovered as `E[x^2] - mu^2` from a SUM and a SUMSQ, which is the textbook catastrophic
-    /// cancellation: in f32 its relative error grows like `eps·(mu/sigma)^2`, and once that error
-    /// exceeds `var + eps` the value goes negative and `Sqrt` yields NaN gradients with no
-    /// diagnostic. Residual-stream activations routinely have a large `mu/sigma`. The forward
-    /// (`wukong_runtime::norm::layernorm_row_scalar` -> `dev2_8_scalar(x, n, mean)`) and the
-    /// runtime's own backward kernel (`layernorm_bwd.rs`, "matching the forward variance
-    /// discipline") both compute the mean first and then `Σ(x - mu)^2`; so does this now, via a
-    /// `cols`-wide scratch filled with `mu` and one `RED_SSD` row reduction. Cost: one extra
-    /// `cols`-wide velem write per row, in exchange for the gradient being the gradient of the
-    /// function that was actually evaluated.
-    #[allow(clippy::too_many_arguments)]
-    fn layernorm_back(
-        &mut self,
-        dy: ValueId,
-        dx: ValueId,
-        x: ValueId,
-        y: ValueId,
-        rows: ValueId,
-        cols: ValueId,
-        eps: ValueId,
-        cols_count: u32,
-    ) {
-        let nf = self.b.build(F32, Op::Cast(CastKind::SiToFp, cols, F32));
-        let one = self.cf32(1.0);
-        let mubuf = self.alloc_buf(cols_count);
-        let outer = self.open_loop(rows);
-        let r = outer.idx;
-        let rc = self.b.build(I64T, Op::Bin(BinOp::Mul, r, cols));
-        let mu = self.row_mean(x, rc, cols, nf);
-        let var = self.row_centered_var(x, mubuf, rc, cols, nf, mu);
-        let veps = self.fadd(var, eps, &F32);
-        let sigma = self.b.build(F32, Op::Sqrt(veps));
-        let inv = self.fdiv(one, sigma, &F32);
-        let sum_dy = self.row_reduce(dy, dy, rc, cols, RED_SUM);
-        let dot_dyy = self.row_reduce(dy, y, rc, cols, RED_DOT);
-        let mean_dy = self.fdiv(sum_dy, nf, &F32);
-        let mean_dyy = self.fdiv(dot_dyy, nf, &F32);
-        let inner = self.open_loop(cols);
-        let j = inner.idx;
-        let idx = self.b.build(I64T, Op::Bin(BinOp::Add, rc, j));
-        let dyv = self.load_at(dy, idx);
-        let yv = self.load_at(y, idx);
-        let ymdyy = self.fmul(yv, mean_dyy, &F32);
-        let t1 = self.b.build(F32, Op::Bin(BinOp::FSub, dyv, mean_dy));
-        let t2 = self.b.build(F32, Op::Bin(BinOp::FSub, t1, ymdyy));
-        let dxv = self.fmul(inv, t2, &F32);
-        self.store_at(dx, idx, dxv);
-        self.close_loop(inner);
-        self.close_loop(outer);
-    }
-
-    /// The mean of the `cols`-wide row at offset `rc`: `Σ x / nf`.
-    fn row_mean(&mut self, x: ValueId, rc: ValueId, cols: ValueId, nf: ValueId) -> ValueId {
-        let sum_x = self.row_reduce(x, x, rc, cols, RED_SUM);
-        self.fdiv(sum_x, nf, &F32)
-    }
-
-    /// `Σ_j (x[rc + j] - mu)^2 / nf`, the **centered** row variance — the two-pass form (Chan,
-    /// Golub & LeVeque 1983) the forward kernel uses. `mubuf` is a `cols`-wide scratch: fill it with
-    /// `mu` (`velem` with `a = b = 0`, `c = mu`, reading the row so no uninitialized memory is
-    /// touched), then one `RED_SSD` reduction is exactly `Σ (x - mu)^2`.
-    #[allow(clippy::too_many_arguments)]
-    fn row_centered_var(
-        &mut self,
-        x: ValueId,
-        mubuf: ValueId,
-        rc: ValueId,
-        cols: ValueId,
-        nf: ValueId,
-        mu: ValueId,
-    ) -> ValueId {
-        let xp = self.gep(x, rc);
-        let z = self.cf32(0.0);
-        let op = self.cint(VE_ID);
-        let f = self.syms.velem;
-        self.b.build_void(Op::Call {
-            func: f,
-            args: vec![xp, xp, mubuf, cols, z, z, mu, op],
-        });
-        let ssd = self.row_reduce_at(xp, mubuf, cols, RED_SSD);
-        self.fdiv(ssd, nf, &F32)
-    }
-
-    /// RMSNorm (`nf = cols`) and L2-norm (`nf = 1`): with `r = sqrt(Σx^2/nf + eps)`, `y = x/r`,
-    /// `dx = (1/r) (dy - y * (<dy, y>/nf))` per row. The two norms differ only in that divisor —
-    /// RMSNorm normalizes by the root-*mean*-square, L2 by the root-*sum*-square — so one emitter
-    /// covers both. Both statistics are sums of squares, with no mean to cancel against, so this
-    /// form is already numerically stable.
+    /// L2-norm backward (`nf = 1`; the same emitter serves any root-of-scaled-sum-of-squares norm):
+    /// with `r = sqrt(Σx²/nf + eps)`, `y = x/r`, `dx = (1/r) (dy - y * (<dy, y>/nf))` per row. The
+    /// statistic is a sum of squares, with no mean to cancel against, so this form is stable.
     #[allow(clippy::too_many_arguments)]
     fn scale_norm_back(
         &mut self,
@@ -1308,7 +1338,7 @@ impl<'a> Vjp<'a> {
         let one = self.cf32(1.0);
         let outer = self.open_loop(rows);
         let r = outer.idx;
-        let rc = self.b.build(I64T, Op::Bin(BinOp::Mul, r, cols));
+        let rc = self.mul64(r, cols);
         let sumsq_x = self.row_reduce(x, x, rc, cols, RED_SUMSQ);
         let ms = self.fdiv(sumsq_x, nf, &F32);
         let mseps = self.fadd(ms, eps, &F32);
@@ -1331,7 +1361,7 @@ impl<'a> Vjp<'a> {
 
     /// A per-row reduction over the `cols`-wide slice at offset `rc`: `sreduce(&a[rc], &b[rc], cols,
     /// op)`. For SUM/SUMSQ `b` is ignored (pass `a`); for DOT it is the second operand.
-    fn row_reduce(
+    pub(crate) fn row_reduce(
         &mut self,
         a: ValueId,
         b: ValueId,
@@ -1344,9 +1374,14 @@ impl<'a> Vjp<'a> {
         self.row_reduce_at(ap, bp, cols, op)
     }
 
-    /// [`Vjp::row_reduce`] with the two operand pointers already formed — needed when one operand is
-    /// a whole `cols`-wide scratch (offset 0) rather than a row of a `rows x cols` matrix.
-    fn row_reduce_at(&mut self, ap: ValueId, bp: ValueId, cols: ValueId, op: i64) -> ValueId {
+    /// [`Vjp::row_reduce`] with the two operand pointers already formed.
+    pub(crate) fn row_reduce_at(
+        &mut self,
+        ap: ValueId,
+        bp: ValueId,
+        cols: ValueId,
+        op: i64,
+    ) -> ValueId {
         let opv = self.cint(op);
         let f = self.syms.sreduce;
         self.b.build(
@@ -1358,255 +1393,15 @@ impl<'a> Vjp<'a> {
         )
     }
 
-    // --- activation derivatives (the loop body for diff_vmath) ---------------------------------
-
-    fn activation_backward(
-        &mut self,
-        op: i64,
-        dout: ValueId,
-        x: ValueId,
-        y: ValueId,
-        dx: ValueId,
-        n: ValueId,
-    ) -> Result<(), String> {
-        let lp = self.open_loop(n);
-        let i = lp.idx;
-        let doi = self.load_at(dout, i);
-        // f'(x[i]) as a value `fp`.
-        let fp = match op {
-            VM_RELU => {
-                // (x[i] > 0) ? 1 : 0
-                let xi = self.load_at(x, i);
-                let zero = self.cf32(0.0);
-                let one = self.cf32(1.0);
-                let pos = self.b.build(MirType::I1, Op::Cmp(CmpOp::Fogt, xi, zero));
-                self.b.build(F32, Op::Select(pos, one, zero))
-            }
-            VM_SIGMOID => {
-                // y(1 - y)
-                let yi = self.load_at(y, i);
-                let one = self.cf32(1.0);
-                let omy = self.b.build(F32, Op::Bin(BinOp::FSub, one, yi));
-                self.b.build(F32, Op::Bin(BinOp::FMul, yi, omy))
-            }
-            VM_TANH => {
-                // 1 - y^2
-                let yi = self.load_at(y, i);
-                let one = self.cf32(1.0);
-                let y2 = self.b.build(F32, Op::Bin(BinOp::FMul, yi, yi));
-                self.b.build(F32, Op::Bin(BinOp::FSub, one, y2))
-            }
-            VM_EXP => self.load_at(y, i), // exp' = y
-            // --- the remaining ALGEBRAIC derivatives: each is a closed form in the input x or the
-            // forward output y, so it needs no new runtime kernel and no transcendental. (mish,
-            // erf, sin/cos, cosh and logsigmoid are deliberately absent: their derivatives need a
-            // transcendental the loop cannot evaluate, or a sign the output alone does not fix, so
-            // they keep the loud refusal below rather than a guessed rule.)
-            VM_LOG => {
-                // log' = 1/x
-                let xi = self.load_at(x, i);
-                let one = self.cf32(1.0);
-                self.fdiv(one, xi, &F32)
-            }
-            VM_LEAKYRELU => {
-                // leakyrelu' = x > 0 ? 1 : alpha   (the kernel's `x > 0.0` test, mirrored)
-                let xi = self.load_at(x, i);
-                let zero = self.cf32(0.0);
-                let one = self.cf32(1.0);
-                let al = self.cf32(LEAKY_ALPHA);
-                let pos = self.b.build(MirType::I1, Op::Cmp(CmpOp::Fogt, xi, zero));
-                self.b.build(F32, Op::Select(pos, one, al))
-            }
-            VM_SELU => {
-                // selu(x) = lambda·x for x > 0, else lambda·alpha·(e^x - 1). For x <= 0 the
-                // derivative lambda·alpha·e^x is exactly `y + lambda·alpha`, so no exp is needed.
-                let xi = self.load_at(x, i);
-                let yi = self.load_at(y, i);
-                let zero = self.cf32(0.0);
-                let lam = self.cf32(SELU_LAMBDA);
-                let la = self.cf32(SELU_LAMBDA * SELU_ALPHA);
-                let negb = self.fadd(yi, la, &F32);
-                let pos = self.b.build(MirType::I1, Op::Cmp(CmpOp::Fogt, xi, zero));
-                self.b.build(F32, Op::Select(pos, lam, negb))
-            }
-            VM_TANHSHRINK => {
-                // y = x - tanh(x), so tanh(x) = x - y and tanhshrink' = 1 - (1-tanh^2) = tanh^2.
-                let xi = self.load_at(x, i);
-                let yi = self.load_at(y, i);
-                let t = self.b.build(F32, Op::Bin(BinOp::FSub, xi, yi));
-                self.fmul(t, t, &F32)
-            }
-            VM_SOFTSIGN => {
-                // softsign' = 1/(1 + |x|)^2
-                let xi = self.load_at(x, i);
-                let zero = self.cf32(0.0);
-                let one = self.cf32(1.0);
-                let nx = self.neg(xi, &F32);
-                let pos = self.b.build(MirType::I1, Op::Cmp(CmpOp::Fogt, xi, zero));
-                let ax = self.b.build(F32, Op::Select(pos, xi, nx));
-                let d = self.fadd(one, ax, &F32);
-                let d2 = self.fmul(d, d, &F32);
-                self.fdiv(one, d2, &F32)
-            }
-            VM_HARDSIGMOID => {
-                // clamp(x+3, 0, 6)/6  ->  1/6 on (-3, 3), 0 outside.
-                let xi = self.load_at(x, i);
-                let zero = self.cf32(0.0);
-                let inv6 = self.cf32(INV6);
-                let three = self.cf32(3.0);
-                let nthree = self.cf32(-3.0);
-                let below = self.b.build(MirType::I1, Op::Cmp(CmpOp::Folt, xi, three));
-                let inb = self.b.build(F32, Op::Select(below, inv6, zero));
-                let above = self.b.build(MirType::I1, Op::Cmp(CmpOp::Fogt, xi, nthree));
-                self.b.build(F32, Op::Select(above, inb, zero))
-            }
-            VM_HARDSWISH => {
-                // x·hardsigmoid(x)  ->  0 below -3, 1 above 3, (2x + 3)/6 in between.
-                let xi = self.load_at(x, i);
-                let zero = self.cf32(0.0);
-                let one = self.cf32(1.0);
-                let two = self.cf32(2.0);
-                let three = self.cf32(3.0);
-                let nthree = self.cf32(-3.0);
-                let inv6 = self.cf32(INV6);
-                let t2x = self.fmul(two, xi, &F32);
-                let t = self.fadd(t2x, three, &F32);
-                let ramp = self.fmul(t, inv6, &F32);
-                let below = self.b.build(MirType::I1, Op::Cmp(CmpOp::Folt, xi, three));
-                let mid = self.b.build(F32, Op::Select(below, ramp, one));
-                let above = self.b.build(MirType::I1, Op::Cmp(CmpOp::Fogt, xi, nthree));
-                self.b.build(F32, Op::Select(above, mid, zero))
-            }
-            VM_EXP2 => {
-                // (2^x)' = 2^x·ln2 = y·ln2
-                let yi = self.load_at(y, i);
-                let c = self.cf32(std::f64::consts::LN_2);
-                self.fmul(yi, c, &F32)
-            }
-            VM_EXP10 => {
-                let yi = self.load_at(y, i);
-                let c = self.cf32(std::f64::consts::LN_10);
-                self.fmul(yi, c, &F32)
-            }
-            VM_LOG2 => {
-                // (log2 x)' = 1/(x·ln2)
-                let xi = self.load_at(x, i);
-                let one = self.cf32(1.0);
-                let c = self.cf32(std::f64::consts::LN_2);
-                let d = self.fmul(xi, c, &F32);
-                self.fdiv(one, d, &F32)
-            }
-            VM_LOG10 => {
-                let xi = self.load_at(x, i);
-                let one = self.cf32(1.0);
-                let c = self.cf32(std::f64::consts::LN_10);
-                let d = self.fmul(xi, c, &F32);
-                self.fdiv(one, d, &F32)
-            }
-            VM_EXPM1 => {
-                // (e^x - 1)' = e^x = y + 1
-                let yi = self.load_at(y, i);
-                let one = self.cf32(1.0);
-                self.fadd(yi, one, &F32)
-            }
-            VM_LOG1P => {
-                // (ln(1+x))' = 1/(1+x)
-                let xi = self.load_at(x, i);
-                let one = self.cf32(1.0);
-                let d = self.fadd(one, xi, &F32);
-                self.fdiv(one, d, &F32)
-            }
-            VM_ATAN => {
-                // atan' = 1/(1 + x^2)
-                let xi = self.load_at(x, i);
-                let one = self.cf32(1.0);
-                let x2 = self.fmul(xi, xi, &F32);
-                let d = self.fadd(one, x2, &F32);
-                self.fdiv(one, d, &F32)
-            }
-            VM_ATANH => {
-                // atanh' = 1/(1 - x^2)
-                let xi = self.load_at(x, i);
-                let one = self.cf32(1.0);
-                let x2 = self.fmul(xi, xi, &F32);
-                let d = self.b.build(F32, Op::Bin(BinOp::FSub, one, x2));
-                self.fdiv(one, d, &F32)
-            }
-            VM_TAN => {
-                // tan' = 1 + tan^2 = 1 + y^2
-                let yi = self.load_at(y, i);
-                let one = self.cf32(1.0);
-                let y2 = self.fmul(yi, yi, &F32);
-                self.fadd(one, y2, &F32)
-            }
-            VM_ASINH => {
-                // asinh' = 1/sqrt(1 + x^2)
-                let xi = self.load_at(x, i);
-                let one = self.cf32(1.0);
-                let x2 = self.fmul(xi, xi, &F32);
-                let d = self.fadd(one, x2, &F32);
-                let s = self.b.build(F32, Op::Sqrt(d));
-                self.fdiv(one, s, &F32)
-            }
-            VM_ACOSH => {
-                // acosh' = 1/sqrt(x^2 - 1)   (domain x > 1)
-                let xi = self.load_at(x, i);
-                let one = self.cf32(1.0);
-                let x2 = self.fmul(xi, xi, &F32);
-                let d = self.b.build(F32, Op::Bin(BinOp::FSub, x2, one));
-                let s = self.b.build(F32, Op::Sqrt(d));
-                self.fdiv(one, s, &F32)
-            }
-            VM_ASIN | VM_ACOS => {
-                // asin' = 1/sqrt(1 - x^2); acos' is its negation.
-                let xi = self.load_at(x, i);
-                let one = self.cf32(1.0);
-                let x2 = self.fmul(xi, xi, &F32);
-                let d = self.b.build(F32, Op::Bin(BinOp::FSub, one, x2));
-                let s = self.b.build(F32, Op::Sqrt(d));
-                let r = self.fdiv(one, s, &F32);
-                if op == VM_ACOS {
-                    self.neg(r, &F32)
-                } else {
-                    r
-                }
-            }
-            VM_SINH => {
-                // sinh' = cosh = sqrt(1 + sinh^2) = sqrt(1 + y^2)  (cosh is always positive)
-                let yi = self.load_at(y, i);
-                let one = self.cf32(1.0);
-                let y2 = self.fmul(yi, yi, &F32);
-                let d = self.fadd(one, y2, &F32);
-                self.b.build(F32, Op::Sqrt(d))
-            }
-            VM_CBRT => {
-                // (x^(1/3))' = 1/(3·x^(2/3)) = 1/(3 y^2)
-                let yi = self.load_at(y, i);
-                let one = self.cf32(1.0);
-                let three = self.cf32(3.0);
-                let y2 = self.fmul(yi, yi, &F32);
-                let d = self.fmul(three, y2, &F32);
-                self.fdiv(one, d, &F32)
-            }
-            other => {
-                return Err(format!(
-                    "autodiff: no VJP for vmath op {other} (its derivative needs a transcendental \
-                     no closed form in x or y provides)"
-                ))
-            }
-        };
-        // dx[i] = dout[i] * f'(x[i])
-        let v = self.b.build(F32, Op::Bin(BinOp::FMul, doi, fp));
-        self.store_at(dx, i, v);
-        self.close_loop(lp);
-        Ok(())
-    }
-
     // --- buffer-gradient bookkeeping -----------------------------------------------------------
 
-    /// The gradient buffer for forward buffer `buf`: an existing one, the appended grad param (for a
-    /// `wrt` input), a freshly-zeroed alloca (for an intermediate), or `None` for a non-`wrt` input
-    /// (whose gradient we do not compute). Intermediate buffers must have a known element count.
+    /// The gradient buffer for forward buffer `buf`, created on first use:
+    /// - an existing one;
+    /// - the appended, caller-zeroed gradient parameter, for a `wrt` input;
+    /// - for a parameter NOT in `wrt`: nothing (a read-only input such as the target labels) — unless
+    ///   a recognized kernel WRITES it, in which case its adjoint is what carries the chain to that
+    ///   kernel's own inputs, so it gets a zeroed heap scratch sized from the writer's extent;
+    /// - for an intermediate (`alloca`) buffer: a zeroed heap scratch of its element count.
     pub(crate) fn grad_target(&mut self, buf: ValueId) -> Result<Option<ValueId>, String> {
         if let Some(&g) = self.buf_adj.get(&buf) {
             return Ok(Some(g));
@@ -1616,192 +1411,129 @@ impl<'a> Vjp<'a> {
             return Ok(Some(gp));
         }
         if self.fwd.params.contains(&buf) {
-            return Ok(None); // a non-differentiated input (e.g. the target labels)
+            let Some((kind, args)) = self.kernel_out.get(&buf).copied() else {
+                return Ok(None); // a non-differentiated input (e.g. the target labels)
+            };
+            if self.multi_written.contains(&buf) {
+                return Err(format!(
+                    "autodiff: buffer v{} is written by more than one recognized kernel and is \
+                     not in the differentiated (`wrt`) set, so its gradient has no single extent \
+                     — add v{} to the wrt list",
+                    buf.0, buf.0
+                ));
+            }
+            let n = self
+                .kernel_out_extent(kind, args)
+                .ok_or("autodiff: internal: a recorded kernel output has no extent")?;
+            let g = self.scratch(n);
+            self.buf_adj.insert(buf, g);
+            return Ok(Some(g));
         }
         let count = *self
             .buf_count
             .get(&buf)
             .ok_or_else(|| format!("autodiff: unknown size for intermediate buffer v{}", buf.0))?;
-        let gb = self.alloc_buf(count);
+        let n = self.cint(i64::from(count));
+        let gb = self.scratch(n);
         self.buf_adj.insert(buf, gb);
         Ok(Some(gb))
     }
 
-    /// Assert `buf` receives only one gradient contribution (overwrite-correct). Multi-contribution
-    /// (a buffer consumed by several ops, e.g. a residual fan-out) needs accumulation, supported for
-    /// matmul via `beta` but not yet for the overwrite-style ops — a loud error, never a wrong grad.
-    fn single(&mut self, buf: ValueId) -> Result<(), String> {
-        if !self.contributed.insert(buf) {
-            return Err(format!(
-                "autodiff: buffer v{} receives multiple gradient contributions; accumulation is \
-                 not yet supported for this op",
-                buf.0
-            ));
+    /// Open one gradient contribution to `buf` (`n` elements). `None` when `buf` is not
+    /// differentiated. The first contribution writes straight into the gradient buffer; every later
+    /// one (fan-out: a residual connection, a weight two ops share, a buffer the loss also reads)
+    /// writes a scratch that [`Vjp::end`] adds in — so no rule ever clobbers an earlier
+    /// contribution, and none needs to know whether it is first.
+    pub(crate) fn begin(&mut self, buf: ValueId, n: ValueId) -> Result<Option<Contrib>, String> {
+        let Some(g) = self.grad_target(buf)? else {
+            return Ok(None);
+        };
+        if self.contributed.insert(buf) {
+            Ok(Some(Contrib {
+                write: g,
+                acc: None,
+            }))
+        } else {
+            let s = self.scratch(n);
+            Ok(Some(Contrib {
+                write: s,
+                acc: Some((g, n)),
+            }))
         }
-        Ok(())
+    }
+
+    /// Close a contribution opened by [`Vjp::begin`]: add the scratch into the gradient buffer
+    /// (`g = 1·g + 1·s`, one rounding per element) when it was not the first.
+    pub(crate) fn end(&mut self, c: Contrib) {
+        if let Some((g, n)) = c.acc {
+            let one = self.cf32(1.0);
+            self.velem_affine(g, g, c.write, one, one, n);
+        }
     }
 
     /// `beta` for a matmul gradient write: 0 (overwrite) on the first contribution to `buf`, 1
-    /// (accumulate) afterwards — so a buffer feeding two matmuls sums its gradients correctly.
-    fn beta_for(&mut self, buf: ValueId) -> ValueId {
+    /// (accumulate) afterwards — the GEMM's own accumulation, so no scratch is needed.
+    pub(crate) fn beta_for(&mut self, buf: ValueId) -> ValueId {
         let first = !self.contributed.contains(&buf);
         self.cint(if first { 0 } else { 1 })
     }
 
-    fn alloc_buf(&mut self, count: u32) -> ValueId {
-        self.b.alloca(MirType::Array(Box::new(F32), count))
+    /// A zeroed heap scratch of `n` f32 (`wukong_rt_alloc`), released before the gradient returns.
+    /// Never call this inside a synthesized loop body: the release at the exit must be dominated by
+    /// the allocation.
+    pub(crate) fn scratch(&mut self, n: ValueId) -> ValueId {
+        let four = self.cint(4);
+        let is_float = self.cint(1);
+        let f = self.syms.rt_alloc;
+        let p = self.b.build(
+            PTR,
+            Op::Call {
+                func: f,
+                args: vec![n, four, is_float],
+            },
+        );
+        self.scratch.push(p);
+        p
+    }
+
+    /// Release every heap scratch (`wukong_rt_free`), in allocation order. Called once, at the exit.
+    pub(crate) fn free_scratch(&mut self) {
+        let f = self.syms.rt_free;
+        for p in std::mem::take(&mut self.scratch) {
+            self.b.build_void(Op::Call {
+                func: f,
+                args: vec![p],
+            });
+        }
     }
 
     // --- emit helpers: kernel calls ------------------------------------------------------------
 
-    /// `wukong_sgemm(a, b, c, m, k, n, beta)`: `C(m x n) = A(m x k) . B(k x n) (+ beta C)`.
-    // One Rust parameter per C-ABI operand, deliberately: the signature IS the documentation of
-    // the runtime call it emits. Bundling into a struct would obscure the mirror.
-    #[allow(clippy::too_many_arguments)]
-    fn sgemm(
-        &mut self,
-        a: ValueId,
-        b: ValueId,
-        c: ValueId,
-        m: ValueId,
-        k: ValueId,
-        n: ValueId,
-        beta: ValueId,
-    ) {
-        let f = self.syms.sgemm;
-        self.b.build_void(Op::Call {
-            func: f,
-            args: vec![a, b, c, m, k, n, beta],
-        });
+    /// Emit a void call.
+    pub(crate) fn emit(&mut self, f: Symbol, args: Vec<ValueId>) {
+        self.b.build_void(Op::Call { func: f, args });
     }
 
-    /// Fill `dst[0..n]` with the scalar value `v`: `velem(dst, dst, dst, n, 0, 0, v, ID)`.
-    fn fill_buf(&mut self, dst: ValueId, n: ValueId, v: ValueId) {
+    /// Fill `dst[0..n]` with the scalar `v`. A synthesized store loop rather than a `velem` with
+    /// `a = 0`: that form computes `0·dst + v` and so turns any non-finite garbage it reads into NaN.
+    pub(crate) fn fill(&mut self, dst: ValueId, n: ValueId, v: ValueId) {
+        let lp = self.open_loop(n);
+        let i = lp.idx;
+        self.store_at(dst, i, v);
+        self.close_loop(lp);
+    }
+
+    /// `dst = coef * src` over `n` elements: `velem(src, src, dst, n, coef, 0, 0, ID)`. `dst` may be
+    /// `src` (the kernel permits in-place).
+    pub(crate) fn velem_scale(&mut self, dst: ValueId, src: ValueId, coef: ValueId, n: ValueId) {
         let z = self.cf32(0.0);
         let op = self.cint(VE_ID);
         let f = self.syms.velem;
-        self.b.build_void(Op::Call {
-            func: f,
-            args: vec![dst, dst, dst, n, z, z, v, op],
-        });
-    }
-
-    /// `dst = coef * src` over `n` elements: `velem(src, src, dst, n, coef, 0, 0, ID)`.
-    fn velem_scale(&mut self, dst: ValueId, src: ValueId, coef: ValueId, n: ValueId) {
-        let z = self.cf32(0.0);
-        let op = self.cint(VE_ID);
-        let f = self.syms.velem;
-        self.b.build_void(Op::Call {
-            func: f,
-            args: vec![src, src, dst, n, coef, z, z, op],
-        });
-    }
-
-    /// `wukong_sgemm_nt(a, b, c, m, k, n, beta)`: `C(m x n) = A(m x k) . B(n x k)^T (+ beta C)`.
-    #[allow(clippy::too_many_arguments)]
-    fn sgemm_nt_call(
-        &mut self,
-        a: ValueId,
-        b: ValueId,
-        c: ValueId,
-        m: ValueId,
-        k: ValueId,
-        n: ValueId,
-        beta: ValueId,
-    ) {
-        let f = self.syms.sgemm_nt;
-        self.b.build_void(Op::Call {
-            func: f,
-            args: vec![a, b, c, m, k, n, beta],
-        });
-    }
-
-    /// `wukong_sgemm_tn(a, b, c, m, k, n, beta)`: `C(m x n) = A(k x m)^T . B(k x n) (+ beta C)` —
-    /// the weight-gradient GEMM. It transposes `a` into its own scratch and runs the identical
-    /// `A.B` microkernel `sgemm` uses, so it is bit-for-bit the transpose-then-multiply pair it
-    /// replaces.
-    #[allow(clippy::too_many_arguments)]
-    fn sgemm_tn(
-        &mut self,
-        a: ValueId,
-        b: ValueId,
-        c: ValueId,
-        m: ValueId,
-        k: ValueId,
-        n: ValueId,
-        beta: ValueId,
-    ) {
-        let f = self.syms.sgemm_tn;
-        self.b.build_void(Op::Call {
-            func: f,
-            args: vec![a, b, c, m, k, n, beta],
-        });
-    }
-
-    /// `wukong_colsum_f32(x, out, rows, cols)`: `out[j] = Σ_i x[i*cols + j]` (overwrites `out`).
-    fn colsum(&mut self, x: ValueId, out: ValueId, rows: ValueId, cols: ValueId) {
-        let f = self.syms.colsum;
-        self.b.build_void(Op::Call {
-            func: f,
-            args: vec![x, out, rows, cols],
-        });
-    }
-
-    /// `wukong_vmath_f32(x, out, n, op)`: the elementwise activation kernel.
-    fn vmath_call(&mut self, x: ValueId, out: ValueId, n: ValueId, op: i64) {
-        let opv = self.cint(op);
-        let f = self.syms.vmath;
-        self.b.build_void(Op::Call {
-            func: f,
-            args: vec![x, out, n, opv],
-        });
-    }
-
-    /// `dst = u (.) v` over `n` elements: `velem(u, v, dst, n, 1, 1, 0, VE_HADAMARD)`. The kernel
-    /// ignores `a`/`b`/`c` in this compute mode, so they are only placeholders.
-    fn velem_hadamard(&mut self, dst: ValueId, u: ValueId, v: ValueId, n: ValueId) {
-        let one = self.cf32(1.0);
-        let z = self.cf32(0.0);
-        let op = self.cint(VE_HADAMARD);
-        let f = self.syms.velem;
-        self.b.build_void(Op::Call {
-            func: f,
-            args: vec![u, v, dst, n, one, one, z, op],
-        });
-    }
-
-    /// `dst = u / v` over `n` elements: `velem(u, v, dst, n, 1, 1, 0, VE_DIV)`.
-    fn velem_div(&mut self, dst: ValueId, u: ValueId, v: ValueId, n: ValueId) {
-        let one = self.cf32(1.0);
-        let z = self.cf32(0.0);
-        let op = self.cint(VE_DIV);
-        let f = self.syms.velem;
-        self.b.build_void(Op::Call {
-            func: f,
-            args: vec![u, v, dst, n, one, one, z, op],
-        });
-    }
-
-    /// A kernel dimension operand as a compile-time element count, for sizing a scratch buffer.
-    /// `what` names the kernel in the decline, since a non-constant dimension is the user's
-    /// problem to spell differently.
-    fn const_count(&self, v: ValueId, what: &str) -> Result<u32, String> {
-        let c = self.const_i64(v)?;
-        u32::try_from(c).map_err(|_| {
-            format!("autodiff: {what} dimension {c} is not a usable scratch-buffer size")
-        })
-    }
-
-    /// `rows * cols` as a compile-time element count.
-    fn const_count_2d(&self, rows: ValueId, cols: ValueId) -> Result<u32, String> {
-        let r = self.const_count(rows, "norm")?;
-        let c = self.const_count(cols, "norm")?;
-        r.checked_mul(c)
-            .ok_or_else(|| "autodiff: norm rows*cols overflows a scratch-buffer size".to_string())
+        self.emit(f, vec![src, src, dst, n, coef, z, z, op]);
     }
 
     /// `dst = a*x + b*y` over `n` elements: `velem(x, y, dst, n, a, b, 0, ID|USE_Y)`.
-    fn velem_affine(
+    pub(crate) fn velem_affine(
         &mut self,
         dst: ValueId,
         x: ValueId,
@@ -1813,32 +1545,83 @@ impl<'a> Vjp<'a> {
         let z = self.cf32(0.0);
         let op = self.cint(VE_ID | VE_USE_Y);
         let f = self.syms.velem;
-        self.b.build_void(Op::Call {
-            func: f,
-            args: vec![x, y, dst, n, a, b, z, op],
-        });
+        self.emit(f, vec![x, y, dst, n, a, b, z, op]);
+    }
+
+    /// `dst = a*x + c` over `n` elements (`y` unread): `velem(x, x, dst, n, a, 0, c, ID)`.
+    pub(crate) fn velem_axpc(&mut self, dst: ValueId, x: ValueId, a: f64, c: f64, n: ValueId) {
+        let av = self.cf32(a);
+        let z = self.cf32(0.0);
+        let cv = self.cf32(c);
+        let op = self.cint(VE_ID);
+        let f = self.syms.velem;
+        self.emit(f, vec![x, x, dst, n, av, z, cv, op]);
+    }
+
+    /// `dst = u (.) v` over `n` elements: `velem(u, v, dst, n, 1, 1, 0, VE_HADAMARD)`. The kernel
+    /// ignores `a`/`b`/`c` in this compute mode, so they are only placeholders.
+    pub(crate) fn velem_hadamard(&mut self, dst: ValueId, u: ValueId, v: ValueId, n: ValueId) {
+        let one = self.cf32(1.0);
+        let z = self.cf32(0.0);
+        let op = self.cint(VE_HADAMARD);
+        let f = self.syms.velem;
+        self.emit(f, vec![u, v, dst, n, one, one, z, op]);
+    }
+
+    /// `dst = u / v` over `n` elements: `velem(u, v, dst, n, 1, 1, 0, VE_DIV)`.
+    pub(crate) fn velem_div(&mut self, dst: ValueId, u: ValueId, v: ValueId, n: ValueId) {
+        let one = self.cf32(1.0);
+        let z = self.cf32(0.0);
+        let op = self.cint(VE_DIV);
+        let f = self.syms.velem;
+        self.emit(f, vec![u, v, dst, n, one, one, z, op]);
+    }
+
+    /// `wukong_vmath_f32(x, out, n, op)`: the elementwise activation kernel (`out` may be `x`).
+    pub(crate) fn vmath_call(&mut self, x: ValueId, out: ValueId, n: ValueId, op: i64) {
+        let opv = self.cint(op);
+        let f = self.syms.vmath;
+        self.emit(f, vec![x, out, n, opv]);
+    }
+
+    /// `wukong_vmath2_f32(x, y, out, n, op)`: the two-input kernel (a fused activation backward is
+    /// `(x, dy) -> dy·act'(x)`).
+    pub(crate) fn vmath2_call(
+        &mut self,
+        x: ValueId,
+        y: ValueId,
+        out: ValueId,
+        n: ValueId,
+        op: i64,
+    ) {
+        let opv = self.cint(op);
+        let f = self.syms.vmath2;
+        self.emit(f, vec![x, y, out, n, opv]);
+    }
+
+    /// `wukong_colsum_f32(x, out, rows, cols)`: `out[j] = Σ_i x[i*cols + j]` (overwrites `out`).
+    pub(crate) fn colsum(&mut self, x: ValueId, out: ValueId, rows: ValueId, cols: ValueId) {
+        let f = self.syms.colsum;
+        self.emit(f, vec![x, out, rows, cols]);
+    }
+
+    /// `dst[r, :] *= dvec[r]` for every row of a `rows x cols` buffer — the per-row scale a vector
+    /// adjoint (one value per row: a per-row loss, a log-sum-exp) puts on its row-wise backward.
+    pub(crate) fn row_scale(&mut self, dst: ValueId, dvec: ValueId, rows: ValueId, cols: ValueId) {
+        let lp = self.open_loop(rows);
+        let r = lp.idx;
+        let s = self.load_at(dvec, r);
+        let rc = self.mul64(r, cols);
+        let p = self.gep(dst, rc);
+        self.velem_scale(p, p, s, cols);
+        self.close_loop(lp);
     }
 
     // --- emit helpers: synthesized loops -------------------------------------------------------
 
-    /// Transpose `src (m x n)` into `dst (n x m)` with a single flat loop: for flat index `f`,
-    /// `row = f / n`, `col = f % n`, `dst[col*m + row] = src[f]`.
-    fn transpose(&mut self, src: ValueId, dst: ValueId, m: ValueId, n: ValueId) {
-        let total = self.b.build(I64T, Op::Bin(BinOp::Mul, m, n));
-        let lp = self.open_loop(total);
-        let f = lp.idx;
-        let row = self.b.build(I64T, Op::Bin(BinOp::SDiv, f, n));
-        let col = self.b.build(I64T, Op::Bin(BinOp::SRem, f, n));
-        let cm = self.b.build(I64T, Op::Bin(BinOp::Mul, col, m));
-        let didx = self.b.build(I64T, Op::Bin(BinOp::Add, cm, row));
-        let v = self.load_at(src, f);
-        self.store_at(dst, didx, v);
-        self.close_loop(lp);
-    }
-
     /// Open a counted loop `for idx in 0..n`. Emits the back-edge condition and switches the builder
-    /// to the (empty) body block, with `idx` available; pair with [`close_loop`].
-    fn open_loop(&mut self, n: ValueId) -> Loop {
+    /// to the (empty) body block, with `idx` available; pair with [`Vjp::close_loop`].
+    pub(crate) fn open_loop(&mut self, n: ValueId) -> Loop {
         let zero = self.cint(0);
         let header = self.b.new_block();
         let body = self.b.new_block();
@@ -1860,9 +1643,9 @@ impl<'a> Vjp<'a> {
         }
     }
 
-    /// Close the loop opened by [`open_loop`]: append `idx += 1; br header(idx+1)` and switch the
-    /// builder to the exit block. Assumes the body is straight-line (current block is the body).
-    fn close_loop(&mut self, lp: Loop) {
+    /// Close the loop opened by [`Vjp::open_loop`]: append `idx += 1; br header(idx+1)` and switch
+    /// the builder to the exit block. Assumes the body is straight-line (current block is the body).
+    pub(crate) fn close_loop(&mut self, lp: Loop) {
         let one = self.cint(1);
         let i1 = self.b.build(I64T, Op::Bin(BinOp::Add, lp.idx, one));
         self.b.br(lp.header, vec![i1]);
@@ -1872,7 +1655,7 @@ impl<'a> Vjp<'a> {
     // --- small helpers -------------------------------------------------------------------------
 
     /// `&base[idx]` as an `f32` element pointer.
-    fn gep(&mut self, base: ValueId, idx: ValueId) -> ValueId {
+    pub(crate) fn gep(&mut self, base: ValueId, idx: ValueId) -> ValueId {
         self.b.build(
             PTR,
             Op::Gep {
@@ -1884,38 +1667,51 @@ impl<'a> Vjp<'a> {
     }
 
     /// Load `base[idx]` as an `f32` (`gep` then `load`).
-    fn load_at(&mut self, base: ValueId, idx: ValueId) -> ValueId {
-        let p = self.b.build(
-            PTR,
-            Op::Gep {
-                ptr: base,
-                index: idx,
-                elem: F32,
-            },
-        );
+    pub(crate) fn load_at(&mut self, base: ValueId, idx: ValueId) -> ValueId {
+        let p = self.gep(base, idx);
         self.b.build(F32, Op::Load(p, F32))
     }
 
     /// Store `val` to `base[idx]` (`f32`).
-    fn store_at(&mut self, base: ValueId, idx: ValueId, val: ValueId) {
-        let p = self.b.build(
-            PTR,
-            Op::Gep {
-                ptr: base,
-                index: idx,
-                elem: F32,
-            },
-        );
+    pub(crate) fn store_at(&mut self, base: ValueId, idx: ValueId, val: ValueId) {
+        let p = self.gep(base, idx);
         self.b.build_void(Op::Store { ptr: p, value: val });
     }
 
     /// The new-function value for a forward (old) value.
-    fn remap_v(&self, v: ValueId) -> ValueId {
+    pub(crate) fn remap_v(&self, v: ValueId) -> ValueId {
         self.fwd_to_new[&v]
     }
 
-    /// Read a compile-time `i64` constant operand (a dim or op code). Errors if not a constant.
-    fn const_i64(&self, v: ValueId) -> Result<i64, String> {
+    /// A kernel dimension operand in the new value space, widened to `i64` if lowering passed a
+    /// narrower integer — every emitted kernel ABI and every synthesized loop bound is `i64`.
+    pub(crate) fn dim(&mut self, v: ValueId) -> ValueId {
+        let nv = self.remap_v(v);
+        let ty = self.b.value_type(nv).clone();
+        if ty != I64T && ty.is_int() {
+            self.b.build(I64T, Op::Cast(CastKind::SExt, nv, I64T))
+        } else {
+            nv
+        }
+    }
+
+    /// The product of several kernel dimensions, as an `i64` in the new value space.
+    pub(crate) fn dims_product(&mut self, dims: &[ValueId]) -> ValueId {
+        let mut acc = self.dim(dims[0]);
+        for &d in &dims[1..] {
+            let dv = self.dim(d);
+            acc = self.mul64(acc, dv);
+        }
+        acc
+    }
+
+    /// `a * b` in `i64`.
+    pub(crate) fn mul64(&mut self, a: ValueId, b: ValueId) -> ValueId {
+        self.b.build(I64T, Op::Bin(BinOp::Mul, a, b))
+    }
+
+    /// Read a compile-time `i64` constant operand (an op code). Errors if not a constant.
+    pub(crate) fn const_i64(&self, v: ValueId) -> Result<i64, String> {
         match self.def_op.get(&v) {
             Some(Op::ConstInt(c, _)) => Ok(*c as i64),
             _ => Err(format!(
@@ -1925,11 +1721,11 @@ impl<'a> Vjp<'a> {
         }
     }
 
-    fn cint(&mut self, x: i64) -> ValueId {
+    pub(crate) fn cint(&mut self, x: i64) -> ValueId {
         self.b.build(I64T, Op::ConstInt(x as i128, I64T))
     }
 
-    fn cf32(&mut self, x: f64) -> ValueId {
+    pub(crate) fn cf32(&mut self, x: f64) -> ValueId {
         self.b.build(F32, Op::ConstFloat(x, F32))
     }
 }

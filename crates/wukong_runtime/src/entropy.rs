@@ -131,6 +131,9 @@ unsafe fn entropy_row(p: *const f32, n: usize) -> f32 {
 ///
 /// # Safety
 /// `p` must be valid for `rows * cols` `f32`; `out` must be valid for `rows` `f32`.
+/// **Aliasing: all operands disjoint** — `out` must not overlap `p` (row `r`'s result is stored
+/// while later rows are still read). The compiler guarantees it for a recognized call
+/// (`wukong_mir_build`'s `kernel_guard.rs` versions the dispatch on a run-time overlap test).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_entropy_f32(p: *const f32, out: *mut f32, rows: i64, cols: i64) {
     if rows <= 0 || cols <= 0 {
@@ -149,7 +152,10 @@ pub unsafe extern "C" fn wukong_entropy_f32(p: *const f32, out: *mut f32, rows: 
 /// agrees with this `@parallel` path exactly.
 ///
 /// # Safety
-/// `p` must be valid for `rows * cols` `f32`; `out` must be valid for `rows` `f32`.
+/// `p` must be valid for `rows * cols` `f32`; `out` must be valid for `rows` `f32`, and must not
+/// overlap `p` (the aliasing contract of [`wukong_entropy_f32`]).
+/// **Aliasing:** that of [`wukong_entropy_f32`] — all operands disjoint: `out` does not overlap
+/// `p`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_entropy_f32_parallel(
     p: *const f32,

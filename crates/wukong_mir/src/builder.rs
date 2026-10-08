@@ -81,6 +81,13 @@ impl Builder {
         &self.blocks[b.0 as usize]
     }
 
+    /// How many blocks exist so far. Every block id below this has been created; the next
+    /// [`Builder::new_block`] returns exactly this id. Lets a caller observe what a stretch of
+    /// lowering emitted (the dispatch report in `wukong_mir_build`).
+    pub fn num_blocks(&self) -> usize {
+        self.blocks.len()
+    }
+
     pub fn new_block(&mut self) -> BlockId {
         let id = BlockId(self.blocks.len() as u32);
         self.blocks.push(BasicBlock {

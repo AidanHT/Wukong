@@ -369,6 +369,133 @@ All notable changes to Wukong are documented here. The format is loosely based o
   a call) is `W0031 ambiguous_continuation`. The parse itself is unchanged; `E0210` is reserved for
   promoting a missing `;` to an error.
 
+### Aliased recognized kernels run the source loop (gap/alias-recognizers)
+
+- **Fixed: an aliased call to a recognized kernel now means what the loop means, everywhere.** Every
+  multi-buffer recognizer emit site goes through one classifier (`alias::plan_kernel_alias`) and
+  versions an operand pair the compiler cannot separate on a run-time overlap test whose other arm
+  is the original loop or window (`kernel_guard.rs`); a library `fn mm(a, b, mut c)` keeps its kernel
+  for disjoint calls instead of losing it program-wide (`tests/run/alias_versioned_kernels.wk`).
+  Recognized reductions over an empty range keep their seed exactly. Each exported runtime kernel's
+  `# Safety` now states its aliasing class. The interpreter refuses a cross-element kernel call with
+  overlapping operands, answers a shifted elementwise overlap with the source loop's value, recycles
+  operand scratch, and range-checks every extent before reserving it.
+
+### Recognizer spelling coverage and dispatch control (`gap/recognizer-coverage`)
+
+- **Spellings that compute the same thing now dispatch the same kernel:** a value bound before use
+  (`let v = x[i]; o[i] = gelu(v);`), the tanh GELU written out in the kernel's own association, the
+  row-outer column reductions (`out[j] += x[i*N+j]` after a zero / row-0 seed), out-of-place softmax
+  and log-softmax (`wukong_norm_f32(x, o, …)`), hand-tiled matmuls (`for … step T` and `while` tile
+  loops), and elementwise loops over a `usize` counter or a symbolic tensor dim (behind a run-time
+  `end >= 0` test). Fixtures `tests/run/spelling_*.wk` print every lane.
+- **Blocked GEMMs as they are really written dispatch `wukong_sgemm`:** ragged tiles clamped with
+  `min` (`for i in i0..min(i0 + T, M)`), the counted tiles of `examples/matmul.wk` (`for it in
+  0..(M + T - 1) / T { let i0 = it * T; let i1 = min(i0 + T, M); … }`), runtime and symbolic extents
+  (full tiles over a runtime `M` behind a run-time `M % T == 0` test; counted tiles behind
+  `ceil(M/T)*T >= M`), tile widths spelled as function-local `const`s, and a tiled contraction around
+  a scalar accumulator seeded from `C` — which on its own (`let mut s = c[i, j]; for k { s += a*b; }
+  c[i, j] = s;`) is now recognized as `C += A·B` (`tests/run/spelling_tiled_gemm_ragged.wk`).
+- **`min(a, b)` / `max(a, b)` builtins** for integers (compared in the result type's signedness) and
+  floats (exactly `fmin`/`fmax`); a call used to be `C0001` (`tests/run/min_max_builtin.wk`).
+- **Every range-based recognizer over a `usize` counter:** behind the run-time `end >= 0` test the
+  loop is lowered again with its end proven to fit `i64`, so argmax/argmin and the low-precision
+  reductions and maps dispatch over a `usize` parameter or a symbolic `Tensor` dim exactly as over a
+  signed counter, not only the elementwise maps (`tests/run/spelling_usize_dims.wk`).
+- **`@generic` on a `for`/`while` loop** opts that loop (and everything in it) out of kernel
+  recognition; it was legal on a `fn` item only. No recognizer replaces code containing one: a
+  window is not formed over it, an enclosing loop is not matched as a whole nest (its other inner
+  loops still dispatch), and a function holding one is not intercepted whole. On any other
+  statement it stays `E0306`.
+- **`--remarks=dispatch`** prints a `note` at every statement (or function) replaced by a recognized
+  runtime kernel, naming the kernel symbol. The MIR is unchanged by it.
+
+### Autodiff over every recognized kernel (`gap/autodiff`)
+
+- **Autodiff (`gap/autodiff`):** every kernel `wukong_mir_build` emits now has a VJP or a named
+  refusal (enforced by a recognizer↔autodiff coupling test) — the whole f32 GEMM family incl. the
+  fused bias/activation epilogue, GEMV/GEVM, bias, transpose, column reductions, all 36 activations,
+  the `vmath2` family, cross-entropy, log-sum-exp, entropy, KL, RoPE and embedding; the backward
+  rides the tuned kernels (`*_bwd_f32` norms, `sgemm_tn`, fused `vmath2` backward codes, `@parallel`
+  spellings) with heap scratch and gradient accumulation; helper-function losses differentiate at
+  every `-O` level; `grad_dot`/`hvp` give Hessian-vector products; `--emit=obj --grad-of=<fn>`
+  exports `<fn>_grad`.
+
+### Toolchain backends: textual LLVM, native diagnostics, target CPU, AOT runtime and gate
+
+- **`--emit=llvm-ir` now implements the oracle's language and links against the AOT runtime.**
+  `f16`/`bf16` compute in `float` registers and round only at constants, casts, loads and stores
+  (the interpreter's model — the module used to round every intermediate to the half grid);
+  booleans are bytes in memory; `print`/`assert` lower to the `wukong_rt_*` ABI and runtime kernels
+  get the runtime's `i64` integer ABI (they used to be called with `i32` arguments the C ABI
+  leaves undefined in the upper half); the vectorizer's synthesized kernels are defined in the
+  module from their recipe instead of being undefined symbols; the module names its target
+  triple. Vector low-precision casts and low-precision FMA no longer decline.
+- **Native-backend failures are catalogued diagnostics.** A Cranelift failure under
+  `--run --backend=native`, `--emit=obj` or `--emit=exe` used to be a bare `error:` line that
+  `--error-format=json` never saw. It is now classified (`wukong_codegen_cranelift::classify_error`)
+  and rendered through the diagnostic renderer: an oversized layout is the new **`C0002`** (naming
+  the type and its function; fixture `tests/fail/native_layout_too_large.wk`, reached through the new
+  `// EMIT: <stage>` fail-fixture directive), a by-design decline is `C0001`, and anything else is an
+  internal-compiler-error diagnostic.
+- **`--target-cpu=<native|x86-64|x86-64-v2|x86-64-v3|x86-64-v4>`.** `--emit=obj|exe` used to bake in
+  every ISA feature of the compiling host plus raw AVX2+FMA loop kernels with no runtime dispatch,
+  so an executable built on an AVX2 machine faulted with `#UD` on older x86-64 CPUs and nothing
+  could ask for a portable baseline. The flag sets an exact Cranelift feature set per level
+  (`wukong_codegen_cranelift::TargetCpu`); below x86-64-v3 the driver builds the MIR without the
+  raw-AVX2 recipes and the backend refuses any that reach it. `--run --backend=native` honours it
+  too (refusing a level the host lacks), which is how the baseline code is tested on this machine.
+- **The `cc`-fallback AOT runtime prints exactly what `--run` prints.** It printed floats with
+  `printf("%g")` (six significant digits) and had no `wukong_rt_print_str`, so a host without the
+  rustc link path got an executable whose output differed from the oracle; the stopgap refused
+  every float-printing program. The generated C runtime now reproduces Rust's `Display` for `f64`
+  (shortest round-trip digits from correctly rounded `%e` plus `strtod`, laid out positionally,
+  with `inf`/`-inf`/`NaN`/`-0`) and defines `wukong_rt_print_str`, so the refusal is gone; the
+  fallback now says on stderr that it is being taken. Forced-`cc` tests compare the linked
+  executable with the interpreter on hand-derived float lines (and strings off Windows).
+- **The AOT gate covers the corpus, not four programs.** `crates/wukongc/tests/exe.rs` now also links
+  a deterministic slice of `tests/run` (every 8th fixture by default, the whole corpus with
+  `WUKONG_EXE_CORPUS=all`) in parallel and compares each executable with `--run`, skipping only
+  documented capability declines (a program the native backend cannot compile either; on the C
+  fallback, one that needs a `wukong_*` kernel) and failing if declines exceed 10% on the rustc
+  path. A second test reaches the C fallback the way a user does (a copied `wukongc` with no runtime
+  rlib beside it) and checks its float/integer output against `--run`. The new fixture
+  `tests/run/print_float_display.wk` pins how every float prints (shortest round-trip digits,
+  positional, `inf`/`NaN`/`-0`, f32/f16/bf16 widening) and joins the always-linked set.
+
+### Compile time: bounded lowering, a real `-O0` backend, self-reporting (`gap2/compile-time`)
+
+- **Fixed: `[agg; n]` evaluated its initializer once per element.** An array repeat whose element is
+  a struct, tuple, enum or nested array re-lowered the initializer for every slot, so `[make(); 3]`
+  called `make` three times on every backend and emitted `n` copies of its IR. It now evaluates once
+  and copies, like the scalar `[v; n]` (`tests/run/array_repeat_aggregate_once.wk`).
+- **Aggregate copies no longer unroll without bound in float-returning functions.** They were kept
+  straight-line in every `f32`/`f64` function for autodiff's single-block rule, so IR size grew with
+  array length. The unroll is now bounded (1 KiB per operation) and applies only when `--emit=grad`,
+  `--train` or `--emit=obj --grad-of` asks for a gradient (`LowerOptions::unroll_for_autodiff`).
+- **`-O0` native code is built at Cranelift `opt_level=none`.** The backend ran its full `speed`
+  mid-end at every level, including the default `-O0` whose MIR is all allocas; it now follows the
+  source level (`BackendOpt`). The JIT compiles functions in parallel like the object path
+  (`WUKONG_PAR_CODEGEN=0` serializes), and assert-capable functions are found with one worklist over
+  the reverse call graph instead of a sweep per call-chain level.
+- **`--run` and `--emit=exe` compile only what `main` reaches.** Functions no call or function address
+  reaches from `main` are dropped after lowering, so an imported library is no longer optimized and
+  compiled in full for one call. Sema still checks every item; `--emit=obj`, the MIR dumps, the
+  autodiff stages and `--backend=gpu-native` keep the whole program.
+- **Same-range loop fusion is planned in one pass.** A run of adjacent same-range loops no longer
+  clones and re-checks every candidate prefix at every statement position; only the chosen run is
+  cloned. The fused output is unchanged.
+- **Boolean-vector legalization is per function.** Native codegen no longer deep-copies the whole
+  program when one function holds a float-to-`i1`-vector cast; each such function is scalarized on
+  its own codegen worker.
+- **New: `--time-passes`, `--time-trace=<file>`, `--depfile=<file>`.** `--time-passes` prints a
+  per-stage table to stderr (read, lex, parse, imports, sema, lower, optimize with its per-pass
+  breakdown, codegen with its isel/object-write split, link, run) plus the heaviest MIR functions;
+  under `--error-format=json` it is one JSON line. `--time-trace` writes the same intervals as Chrome
+  trace-event JSON. `--depfile` writes a Make rule naming the root and every imported file, with an
+  empty rule per import (gcc `-MP`); its target is the `-o` artifact for `--emit=obj|exe`, otherwise
+  the depfile itself. None of the three changes stdout, the exit code or the emitted object.
+
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
 - **Gate added: every recognizer-dependent corpus program is held to its own generic lowering.**

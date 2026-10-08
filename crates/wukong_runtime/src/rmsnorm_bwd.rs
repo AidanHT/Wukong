@@ -322,6 +322,8 @@ unsafe fn rmsnorm_bwd_row(
 /// # Safety
 /// `x`, `dy`, `dx` valid for `rows*cols` f32; `gamma` null or valid for `cols` f32. `dx` must not
 /// overlap `x` (each row's `x` is read during the apply after the reductions).
+/// **Aliasing: exactly in place, otherwise disjoint** — `dx` may be EXACTLY `dy`; it overlaps
+/// neither `x` nor `gamma`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_rmsnorm_bwd_f32(
     x: *const f32,
@@ -351,6 +353,8 @@ pub unsafe extern "C" fn wukong_rmsnorm_bwd_f32(
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_rmsnorm_bwd_f32`].
+/// **Aliasing:** that of [`wukong_rmsnorm_bwd_f32`] — `dx` may be EXACTLY `dy`; it overlaps neither
+/// `x` nor `gamma`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_rmsnorm_bwd_f32_parallel(
     x: *const f32,

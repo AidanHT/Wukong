@@ -181,7 +181,7 @@ already did (`tests/run/binary_const_adapt.wk`); the folded value is still range
 `let v: i8 = 100 + 100` is rejected. A typed value must match its
 annotation exactly (see error `E0401`) — and for an aggregate that means the shape too: an array
 literal and an array **repeat** initializer must both supply exactly the annotated length, so
-`let a: [i32; 4] = [7; 2];` is `E0401`, not a slot silently filled out to 4. An unsuffixed literal
+`let a: [i32; 4] = [7; 2];` is `E0401`, not a slot silently filled out to 4. A repeat `[v; n]` evaluates `v` **once** and copies it into every slot, for an aggregate element too: `[make(); 3]` calls `make` once (`tests/run/array_repeat_aggregate_once.wk`). An unsuffixed literal
 that does not fit the type it adapts to
 is rejected (`E0401`, e.g. `let x: i8 = 200;`, or `s.x = 9000000000;` for an `i32` field), not
 silently wrapped. With **no** annotation an unsuffixed integer literal defaults to `i32`, but one that
@@ -404,7 +404,11 @@ pointer, zero-copy) and is **returned by value** through a hidden-pointer (sret)
 no aggregate ever rides in a register and the two backends agree (`tests/run/{struct_fn,struct_return}.wk`).
 Because a by-reference parameter aliases the caller's storage, mutating an aggregate parameter
 requires `mut` on it (see *Functions* above) — a non-`mut` aggregate parameter is effectively
-read-only, and a `mut` one is the in-place output buffer a kernel writes.
+read-only, and a `mut` one is the in-place output buffer a kernel writes. Passing one buffer to two
+parameters (`mm(x, y, x)`) is legal and means exactly what the function's loops say when they run
+over the shared storage; a loop the compiler replaces with a runtime kernel keeps that meaning — the
+kernel runs only when the operands do not overlap (or overlap exactly, where the kernel supports
+in-place operation), and the loop as written runs otherwise (`tests/run/alias_versioned_kernels.wk`).
 
 ## Methods and `impl` blocks ✅
 
@@ -686,8 +690,9 @@ parsed and discarded (🔵). `@tile` is consumed as loop
 strip-mining (see below), and when it cannot be applied it is **`E0309`**, not a silent drop. A
 *discarded* attribute on a statement or loop is dropped there too:
 `@parallel` must sit on the function, and the mid-function parallel region is derived from the enclosing function's
-attribute, not from one written on the loop. `@generic` and `@strict_fp` in that position are an
-error, not a silent drop.
+attribute, not from one written on the loop. `@generic` on a `for` or `while` loop is honored (next
+section); on any other statement it — and `@strict_fp`, read only from the `fn` — is an error,
+not a silent drop.
 
 ### `@generic` — “I meant this loop” ✅
 
@@ -714,11 +719,33 @@ GEMM and you want your own arithmetic order — the two orders are spelled out u
 computes** below, and `tests/run/lang_generic_gemm_fma_order.wk` pins the size at which they
 provably coincide.
 
-It must sit on the `fn`. `@generic` on a statement or a loop is **`E0306`** — the attribute is read
-from the function item, so accepting it there would promise a per-loop opt-out that does not exist
+It may also sit on a **loop**: `@generic` on a `for` or `while` statement suppresses recognition for
+that loop and every loop nested in it, while its siblings in the same function still dispatch:
+
+```wukong
+fn two(x: [f32; 64], mut o: [f32; 64], mut p: [f32; 64]) {
+    for i in 0..64 { o[i] = exp(x[i]); }   // wukong_vmath_f32
+    @generic
+    for i in 0..64 { p[i] = exp(x[i]); }   // stays a loop
+}
+```
+
+The rule is that no recognizer replaces code containing a `@generic` loop: a statement window that
+would include it (a GEMM + epilogue pair, a multi-pass norm) is not formed across it, a loop that
+encloses it is not matched as a whole nest (an outer `for i { for j { … @generic for k … } }`
+stays loops, while the enclosing loop's other inner loops still dispatch), and a function holding
+one is never claimed whole by a function-level interception (`tests/run/generic_loop_optout.wk`).
+Anywhere else — a `let`, a
+parameter, a non-`fn` item — `@generic` is **`E0306`**, because nothing reads it there
 (`tests/fail/generic_on_stmt.wk`). For a whole-program opt-out during measurement there is the
 `WUKONG_NO_RECOGNIZE` environment instrument, documented in `docs/internals.md`; it is not a CLI flag
 and not a user feature.
+
+To see what was dispatched, compile with **`--remarks=dispatch`**: every statement whose lowering
+became a recognized runtime kernel call gets one `note` on stderr naming the kernel symbol(s) — at the
+innermost such statement, never again at its enclosing loops — and a function replaced wholesale by a
+function-level interception is reported at its name. The remark is pure observation: the MIR, every
+artifact and the program's output are identical with and without it.
 
 `@parallel` **declines and lowers serially, with no diagnostic**, when the loop cannot be split into
 independent chunks: a labelled loop, a plain `break` out of the parallelized loop, a `return` out of
@@ -810,7 +837,32 @@ written as a bare module `const` are normalized back to the canonical `a[i*K + p
 recognition (`wukong_mir_build::canon`), so ordinary refactoring does not silently cost you the
 kernel. The same pass moves a `let mut acc = 0.0;` down to the loop that accumulates into it, so
 declaring an accumulator a statement or two early does not break the multi-statement windows that
-softmax / log-softmax / cross-entropy match. Nor does folding the follow-up work **into** a matmul
+softmax / log-softmax / cross-entropy match. Four more spellings that used to cost the kernel are
+recognized for what they compute: a value named before it is used (`let v = x[i]; o[i] = gelu(v);` —
+the elementwise kernels see the body with the binding inlined, when nothing between the `let`s and
+the one store can write memory, nothing after the store reads the binding, and the binding is not
+a float product that inlining would contract into an FMA); the cache-friendly
+**row-outer** column reduction (`out[j] = 0.0` or a `[0.0; N]` declaration, then `for i { for j {
+out[j] += x[i*N + j] } }`, likewise `+= x*x` and `fmax`/`fmin`/absmax seeded from row 0 — the same
+`wukong_col*` kernels as the column-outer nest, performing the same operations per column); an
+**out-of-place** softmax or log-softmax that keeps `x` and writes `o` (one `wukong_norm_f32(x, o, …)`);
+and a **hand-tiled** matmul, which is the untiled nest it enumerates and dispatches the GEMM kernel.
+The tile loops may be `for i0 in 0..M step T`, the `let mut i0 = 0; while i0 < M { …; i0 = i0 + T; }`
+pair, or the counted form `examples/matmul.wk` uses (`for it in 0..(M + T - 1) / T { let i0 = it *
+T; let i1 = min(i0 + T, M); … for i in i0..i1 { … } }`); a point loop spans a full tile (`i0..i0 + T`)
+or one clamped to the extent (`i0..min(i0 + T, M)`, so the tiles need not divide `M`); the extents may
+be runtime values (a symbolic `Tensor` dim, a parameter) and the tile width a literal or a `const`
+(a function-local `const` declared in the same block as the tiled loop counts too). Where the cover
+cannot be proved at compile time — full tiles over a runtime extent need `M % T == 0`, counted
+clamped tiles need `ceil(M/T)*T >= M` — it is tested at run time on entry, with the loops as written
+as the fallback. The contraction may be tiled as well, around `c[i, j] += a*b` or around a scalar
+accumulation seeded from `C` (`let mut s = c[i, j]; for k in k0..k1 { s += a[i, k] * b[k, j]; } c[i,
+j] = s;`), which on its own is `C += A·B`. A loop over a `usize` counter — a
+`usize` parameter, or the dimension `N` of a `Tensor[f32, N]` — dispatches whatever kernel the same
+loop over a signed counter would (an elementwise map, argmax/argmin, a low-precision dot, sum or
+map), or vectorizes, behind a run-time `end >= 0` test, since every kernel counts in signed `i64`; a
+plain float fold with no kernel (`s = s + x[i]`) over such a counter keeps its source-order fold.
+Nor does folding the follow-up work **into** a matmul
 store rather than writing it as its own loop: `c[i*N+j] = silu(bias[j] + s)` fuses to one
 `wukong_sgemm_nt_epi`, `c[i*N+j] = x[i*N+j] + s` (a residual from another array) and a second store
 `d[i*N+j] = d[i*N+j] * s` alongside `c[i*N+j] = s` (the SwiGLU up-projection) each lower to the same
@@ -1110,6 +1162,13 @@ Accuracy depends on the operation and input range; this suite has no uniform 1-U
   dispatch to the two-input 256-bit `wukong_vmath2_f32` kernel, and the inlined form is bit-identical
   to it.
 - `fmax(a, b)` / `fmin(a, b)`.
+- `min(a, b)` / `max(a, b)` — integer **or** float minimum/maximum (`a < b ? a : b`, `a > b ? a : b`).
+  On integers the compare uses the result type's signedness, so a `usize` compares unsigned (the
+  largest `u64` stays the largest, it is not `-1`); on floats they are exactly `fmin`/`fmax`. The result is
+  the operands' common type, as for `a + b`: the wider integer, or the float when either is one. This is
+  what a ragged loop tile is written with: `for i in i0..min(i0 + T, M)`
+  (`tests/run/min_max_builtin.wk`). They are not auto-vectorizer intrinsics yet, so a loop body that
+  calls them stays scalar — in a hot float loop write `fmin`/`fmax`.
 
 These intrinsics also accept **integer** operands: `abs`/`round`/`floor`/`ceil`/`trunc` are
 type-preserving on an integer (integer `abs` is `select(x < 0, −x, x)`; rounding an integer is the
@@ -1156,6 +1215,12 @@ The composed activations `gelu`, `mish`, `tanhshrink`, `tanh_backward` and `gelu
 exp-composed `1 − 2/(exp(2x) + 1)` as their *internal* building block, because their dispatched
 kernels are built on it and each activation stays bit-identical to its kernel; that block is not
 the language's `tanh`. On `f64` every spelling is the double-precision runtime `tanh`.
+The tanh-approximation GELU written out by hand dispatches to the same kernel as `gelu()` when it is
+written in the kernel's own association — `0.5 * v * (1.0 + tanh(0.7978845608 * (v + 0.044715 * (v *
+v * v))))`, either operand order for each single `*`/`+` — because that spelling's inline evaluation is
+the kernel's, operation for operation (the source's `v + c*x3` contracts to the kernel's one FMA).
+HuggingFace's literal `0.044715 * v * v * v` rounds the cubic term differently and stays inline, and
+so does the erf form, which is a different function from the tanh approximation.
 
 ## Floating-point semantics ✅
 
@@ -1649,9 +1714,17 @@ wukongc [OPTIONS] <input.wk>
                       gpu-lower = gpu-native; any other value is a usage error (exit 2)
 --emit=<stage>        tokens | ast | check | mir-high | mir (alias mir-low) | grad | llvm-ir | obj | exe
                       (default: exe)
+--target-cpu=<c>      native | x86-64 | x86-64-v2 | x86-64-v3 | x86-64-v4   (default: native)
+                      instruction-set level for native code (--emit=obj/exe, --backend=native).
+                      native = every feature of the compiling host; a named level is exact and
+                      host-independent. Below x86-64-v3 the raw-AVX2 loop kernels are not used
+                      (the loop keeps its result-identical 128-bit form), so the object runs on
+                      any CPU of that level. The JIT refuses a level its host lacks. Runtime
+                      kernels select AVX2/FMA at run time, so they are portable at every level.
                       grad = reverse-mode backward MIR of a loss fn (see --grad-of/--grad-wrt)
                       check = run lex/parse/imports/sema only (no lowering); the fast typo loop
---grad-of=<fn>        function to differentiate for --emit=grad / --train   (default: loss)
+--grad-of=<fn>        function to differentiate for --emit=grad / --train   (default: loss);
+                      with --emit=obj, also exports <fn>_grad in the object
 --grad-wrt=<i,..>     buffer-parameter indices to differentiate w.r.t. (default: every buffer
                       parameter of the loss fn; with --train, every one EXCEPT the last, which is
                       the scalar loss output). An index that is out of range, not a buffer
@@ -1671,6 +1744,15 @@ wukongc [OPTIONS] <input.wk>
                       <stem>.o for objects; executables get <stem>.exe on Windows and plain <stem>
                       on unix). Rejected with --run and with every other stage, which print their
                       artifact on stdout — redirect instead.
+--verify-each         verify MIR after every optimizer pass (also in release builds)
+--time-passes         print per-stage compile times to stderr when the compile ends, with the
+                      optimizer's per-pass and Cranelift's codegen/object-write splits and a MIR
+                      size summary (heaviest functions); one JSON line under --error-format=json
+--time-trace=<f>      write the same timings to <f> as Chrome trace-event JSON
+                      (chrome://tracing, Perfetto, speedscope)
+--depfile=<f>         write a Make-syntax dependency file (root + every import, plus an empty rule
+                      per import as gcc -MP does); target = the -o artifact for --emit=obj/exe,
+                      otherwise <f> itself. Rejected with --emit=tokens/ast (they stop before imports)
 --error-format=<f>    human | json   (default: human)
                       json spans carry byte/line end positions, plus suggestions, children,
                       a rendered field and "version":1 (the v0 severity/code/message prefix is
@@ -1683,6 +1765,8 @@ wukongc [OPTIONS] <input.wk>
 --explain [CODE]      print an extended explanation for an error code; no code lists every code
 --color=<when>        auto | always | never   (default: auto)
                       auto honours NO_COLOR, CLICOLOR_FORCE and TERM=dumb, and enables Windows VT
+--remarks=dispatch    print a note (stderr) at every statement — or function — the compiler replaced
+                      with a recognized runtime kernel call, naming the kernel; output is unchanged
 -h, --help            print the usage text and exit 0
 -V, --version         print the version and exit 0
 ```
@@ -1706,7 +1790,16 @@ backward MIR of a loss function, and `wukongc --train --train-opt=adamw model.wk
 fwd→bwd→optimizer training loop. Both flags force at least `-O1` no matter what level you pass — the
 autodiff transform consumes single-block SSA (mem2reg + simplify-cfg) — so `--emit=grad -O0` still
 prints optimized MIR. Generated backward MIR is also optimized with that minimum and verified
-before execution.
+before execution. A loss may call helper functions at any `-O` level: straight-line helpers are
+spliced into the loss before it is differentiated, and a helper that cannot be (multi-block or
+recursive) is named in the refusal. Every recognized tensor kernel either has a VJP — the whole
+f32 GEMM family including the fused bias/activation epilogue, all activations, the norms,
+cross-entropy, RoPE, the embedding gather — or declines by name with the reason
+(`docs/roadmap.md`, *Automatic differentiation*).
+
+**✅ AOT gradient:** `wukongc --emit=obj --grad-of=loss -o model.o model.wk` exports `loss_grad`
+next to `loss` (C ABI: the loss's parameters, then one caller-zeroed gradient buffer per
+`--grad-wrt` entry), for a host training loop to link. Without `--grad-of`, `--emit=obj` is unchanged.
 
 **✅ CPU training:** `--train` honors `--backend=interp` (the default) and `--backend=native`.
 Every loss parameter must be a concrete f32 array (including nested arrays) or a dense f32 tensor
@@ -1716,5 +1809,5 @@ AdamW accepts finite nonnegative `--train-weight-decay`, while SGD rejects nonze
 
 `--train --run` trains the selected loss without calling `main`. Combining `--train` with any
 explicit `--emit=<stage>` or `-o` is a usage error (exit 2). GPU training selectors are unsupported
-by this CPU trainer. AOT training remains unavailable, and no training speedup is established by
-the correctness checks.
+by this CPU trainer. An AOT training loop remains unavailable (the AOT *gradient* is above), and
+no training speedup is established by the correctness checks.

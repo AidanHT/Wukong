@@ -71,6 +71,13 @@ pub(crate) fn intrinsic_ret_ty(name: &str, args: &[Ty]) -> Option<Ty> {
     };
     match name {
         "abs" | "round" | "floor" | "ceil" | "trunc" => Some(preserve_ty),
+        // `min`/`max` work on integers as well as floats (`wukong_mir_build`'s `minmax.rs`), and
+        // their result is the operands' common type exactly as for `a + b`: the wider integer, or
+        // the float when either operand is one (`join`).
+        "min" | "max" => Some(match (args.first(), args.get(1)) {
+            (Some(a @ Ty::Scalar(_)), Some(b @ Ty::Scalar(_))) => crate::join(a.clone(), b.clone()),
+            _ => preserve_ty,
+        }),
         "sqrt" | "rsqrt" | "exp" | "log" | "pow" | "exp2" | "log2" | "exp10" | "log10"
         | "expm1" | "log1p" | "sinh" | "cosh" | "asinh" | "acosh" | "atanh" | "atan" | "tan"
         | "asin" | "acos" | "atan2" | "hypot" | "cbrt" | "erf" | "sin" | "cos" | "tanh"

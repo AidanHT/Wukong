@@ -99,6 +99,10 @@ use std::arch::x86_64::*;
 ///
 /// # Safety
 /// `q`, `k`, `v` must be valid for `s*d` `f32` reads each; `o` valid for `s*d` `f32` writes.
+/// `o` must not overlap `q`, `k` or `v` (the internal `attention_scalar` contract, stated on the
+/// exported entry the compiler calls: later output rows read all three while earlier ones are
+/// written). The interpreter refuses an overlapping call rather than answer it from copies.
+/// **Aliasing: all operands disjoint** — `o` overlaps none of `q`, `k`, `v`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_attention_f32(
     q: *const f32,

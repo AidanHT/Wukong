@@ -106,6 +106,8 @@ unsafe fn lrscan_rows(
 /// # Safety
 /// `a`, `b`, and `out` must each be valid for `rows * cols` f32; `out` may be distinct from or alias
 /// `a`/`b` (the scan is in-place-safe per row).
+/// **Aliasing: exactly in place, otherwise disjoint** — `out` may be EXACTLY `a` or `b`; a SHIFTED
+/// view of either is not the source recurrence.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_lrscan_f32(
     a: *const f32,
@@ -130,6 +132,8 @@ pub unsafe extern "C" fn wukong_lrscan_f32(
 /// # Safety
 /// `a`, `b`, and `out` must each be valid for `rows * cols` f32; each row is written by exactly one task
 /// (disjoint row sub-slices), and `out` may alias `a`/`b` in place per row.
+/// **Aliasing: exactly in place, otherwise disjoint** — `out` may be EXACTLY `a` or `b`; a SHIFTED
+/// view of either is not the source recurrence.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_lrscan_f32_parallel(
     a: *const f32,

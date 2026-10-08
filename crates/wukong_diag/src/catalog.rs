@@ -229,10 +229,12 @@ static CATALOG: &[Explanation] = &[
          `@strict_fp`, `@inline`, `@simd`, `@align`, `@export`. Anything else — most importantly a \
          typo of a real one, `@parellel` — used to be accepted and discarded, so the program \
          compiled with none of the requested behavior and no diagnostic. Placement: `@generic` (opt \
-         this function out of kernel recognition) and `@strict_fp` (source-order float evaluation) \
-         are read from the `fn` item, so each is rejected on a statement, a parameter, or a \
-         non-`fn` item rather than silently promising a per-loop opt-out; `@unchecked` (drop this \
-         function's slice bounds checks) is read from the `fn` item for the same reason. \
+         out of kernel recognition) is read from a `fn` item (the whole function) or a `for`/`while` \
+         loop (that loop and everything nested in it), so it is rejected on any other statement, a \
+         parameter, or a non-`fn` item rather than silently promising an opt-out nothing reads. \
+         `@strict_fp` (source-order float evaluation) and `@unchecked` (drop this function's slice \
+         bounds checks) are read from the `fn` item only, so each is rejected on a statement, a \
+         parameter, or a non-`fn` item rather than silently promising a per-loop opt-out. \
          `@noalias` describes one parameter's storage, so it is legal only on a parameter, takes no \
          arguments, and only on a parameter passed by pointer (an array, slice, tensor, pointer, \
          reference, tuple or struct) — on a scalar there is no storage to promise anything about. \
@@ -607,6 +609,16 @@ static CATALOG: &[Explanation] = &[
         "A construct parsed and type-checked but is not yet supported by MIR lowering or the \
          selected backend. The interpreter and LLVM backends grow coverage over time; check the \
          language guide for the currently supported subset."
+    ),
+    entry!(
+        "C0002",
+        "type too large for the native layout",
+        "The native (Cranelift) backend sizes stack slots and scales element offsets with 32-bit \
+         byte counts, so one array, vector or aggregate whose byte size exceeds 2^32 (4 GiB) cannot \
+         be laid out by `--backend=native`, `--emit=obj` or `--emit=exe`. The diagnostic names the \
+         type and the function that declares it. The interpreter has no byte layout and runs the \
+         program. Allocate the buffer on the heap (`alloc_f32(n)` and its siblings) or split it \
+         into arrays below 4 GiB."
     ),
 ];
 

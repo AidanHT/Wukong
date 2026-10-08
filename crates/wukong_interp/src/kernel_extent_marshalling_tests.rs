@@ -268,7 +268,7 @@ fn extents_preserve_empty_noops_exact_values_and_strict_float_inputs() {
 }
 
 #[test]
-fn extents_preserve_lowp_beta_bias_rounding_and_alias_snapshots() {
+fn extents_preserve_lowp_beta_bias_rounding_and_refuse_aliased_output() {
     let program = Program::new();
     let interner = Interner::new();
     let mut interp = interpreter(&program, &interner);
@@ -302,10 +302,13 @@ fn extents_preserve_lowp_beta_bias_rounding_and_alias_snapshots() {
             args[6] = I(1);
         }
         // Single-element exact expected conversion: bf16 rounds this halfway value to 1;
-        // f16 represents it exactly. No runtime-produced oracle or tolerance.
+        // f16 represents it exactly. No runtime-produced oracle or tolerance. `C` is disjoint from
+        // every input: an output overlapping `A` or the bias is outside the kernel's contract and is
+        // refused below, so this no longer doubles as a snapshot test (the bias may still share
+        // `A`'s slots, because both are only read).
         args[3..6].fill(I(1));
         args[6] = I(0);
-        args[2] = P(0);
+        args[2] = P(12);
         let epi = case.name.contains("_epi");
         for bias in [I(0), P(0)] {
             if epi {
@@ -326,8 +329,24 @@ fn extents_preserve_lowp_beta_bias_rounding_and_alias_snapshots() {
                 } else {
                     0.0
                 };
-            assert_eq!(interp.memory[0], F(expected), "{} bias {bias:?}", case.name);
+            assert_eq!(
+                interp.memory[12],
+                F(expected),
+                "{} bias {bias:?}",
+                case.name
+            );
         }
+        // The aliased spelling the snapshot used to answer — `C` over `A` (and, for the epilogue,
+        // over the bias) — is refused with memory untouched: neither the native kernel nor the
+        // source loop computes the copied value.
+        args[2] = P(0);
+        interp.memory = memory();
+        interp.memory[0] = F(1.00390625);
+        interp.memory[4] = I(2);
+        let before = interp.memory.clone();
+        let error = interp.intrinsic(&case.name, &args).unwrap_err();
+        assert!(error.contains("overlap"), "{}: {error}", case.name);
+        assert_eq!(interp.memory, before, "{} aliased output", case.name);
     }
 }
 
@@ -368,10 +387,11 @@ fn extents_dequant_integer_widths_aligned_i32_tail_and_optional_bias() {
         let name = format!("wukong_i8gemm_nt_deq{suffix}");
         for bias in [I(0), P(0)] {
             interp.memory = memory();
-            let args = [
+            // The output is disjoint from `A`; the bias may share `A`'s slots (both are reads).
+            let mut args = [
                 P(0),
                 P(4),
-                P(0),
+                P(12),
                 I(1),
                 I(2),
                 I(2),
@@ -381,8 +401,14 @@ fn extents_dequant_integer_widths_aligned_i32_tail_and_optional_bias() {
                 I(0),
             ];
             interp.intrinsic(&name, &args).unwrap();
+            // An output over `A` is outside the kernel's contract: refused, memory untouched.
+            let after = interp.memory.clone();
+            args[2] = P(0);
+            let error = interp.intrinsic(&name, &args).unwrap_err();
+            assert!(error.contains("overlap"), "{name}: {error}");
+            assert_eq!(interp.memory, after, "{name}");
             assert_eq!(
-                &interp.memory[..2],
+                &interp.memory[12..14],
                 if matches!(bias, P(_)) {
                     &[F(35.0), F(89.0)]
                 } else {

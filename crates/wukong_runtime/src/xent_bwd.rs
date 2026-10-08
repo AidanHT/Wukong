@@ -221,6 +221,8 @@ unsafe fn xent_bwd_row(x: *const f32, target: usize, dx: *mut f32, n: usize) {
 /// # Safety
 /// `x` valid for `rows*cols` f32; `dx` valid for `rows*cols` f32 (may alias `x`); `target` valid for
 /// `rows`. The label values are unconstrained — the kernel bounds them itself.
+/// **Aliasing: exactly in place, otherwise disjoint** — `dx` may be EXACTLY `x`; it does not
+/// overlap the `i32` targets.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_xent_bwd_f32(
     x: *const f32,
@@ -249,6 +251,8 @@ pub unsafe extern "C" fn wukong_xent_bwd_f32(
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_xent_bwd_f32`].
+/// **Aliasing:** that of [`wukong_xent_bwd_f32`] — `dx` may be EXACTLY `x`; it does not overlap the
+/// `i32` targets.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_xent_bwd_f32_parallel(
     x: *const f32,

@@ -16,15 +16,46 @@
 //! bridges the two: each non-entry block parameter becomes a `phi` whose incoming values are the
 //! arguments each predecessor passes on its edge to that block. At `-O0` the front-end emits no
 //! block parameters, so no phis are generated; after `mem2reg` they appear and are lowered here.
+//!
+//! ## The language the module implements is the oracle's
+//!
+//! The interpreter is the specification, and the module must mean what it means:
+//!
+//! * **`f16`/`bf16` values live in `float` registers.** The interpreter keeps a sub-`f32` value as
+//!   its `f32` rounding and snaps it to the half/bfloat grid only at the observation boundaries — a
+//!   constant, an `fpext`/`fptrunc`, a load and a store (`wukong_interp`'s "round at
+//!   store/cast/load" model, which Cranelift mirrors with `f32` registers). Emitting `fadd half`
+//!   would round every intermediate to the narrow grid and compute a different program, so a half
+//!   value is a `float` SSA value here and `half`/`bfloat` appear only as memory types and as the
+//!   target of the explicit grid rounding (`fptrunc` + `fpext`).
+//! * **`!=` on floats is unordered** (`fcmp une`), integer division/remainder by zero is 0 and
+//!   `INT_MIN / -1` wraps, and shift counts are masked to the width — each guarded explicitly, since
+//!   LLVM makes all three poison.
+//! * **Booleans occupy one byte in memory** with only the low bit significant, as in both executing
+//!   backends; an `i1` (or `<n x i1>`) load/store goes through `i8` storage, never LLVM's packed
+//!   vector-of-`i1` layout.
+//!
+//! ## The module links against the same runtime as `--emit=exe`
+//!
+//! `print`/`assert` are lowered exactly as the Cranelift object lowers them — to the
+//! `wukong_rt_print_{i64,u64,f64,str}` / `wukong_rt_assert` ABI with the same argument widening —
+//! and every `wukong_*` runtime kernel is called with its real C ABI (every integer argument
+//! widened to `i64`, a literal-zero optional pointer passed as `ptr null`). The general vectorizer's
+//! synthesized kernels, which the Cranelift backend installs as raw AVX2 bytes, are *defined* in the
+//! module from their backend-agnostic recipe (see [`vec_kernels`]). So the only external symbols a
+//! module references are the ones the AOT link already provides.
 
+use std::cell::Cell;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
 use wukong_backend::{Artifact, Backend};
 use wukong_mir::{
     BasicBlock, BinOp, CastKind, CmpOp, Function, MirType, Op, Program, Terminator, ValueId,
 };
 use wukong_span::{Interner, Symbol};
+
+mod vec_kernels;
 
 /// For each block, the incoming edges as `(predecessor block id, arguments passed)`. Used to build
 /// phi nodes for block parameters.
@@ -111,13 +142,55 @@ pub fn emit_llvm_ir(program: &Program, interner: &Interner) -> String {
     try_emit_llvm_ir(program, interner).expect("unsupported MIR in textual LLVM emission")
 }
 
-/// Emit an inspection module, declining constructs whose ABI cannot be inferred faithfully.
-/// External declarations describe MIR call sites; their implementations must still be linked.
+/// The target triple the module is tagged with: the compiling host's, which is also what the
+/// Cranelift object and the AOT runtime link are built for. No `target datalayout` is written —
+/// `llc`, `opt` and `clang` all install the target's own layout for a module that names a triple,
+/// and a hand-maintained layout string drifts with every LLVM release.
+fn host_triple() -> Option<&'static str> {
+    if cfg!(all(
+        target_arch = "x86_64",
+        target_os = "windows",
+        target_env = "msvc"
+    )) {
+        Some("x86_64-pc-windows-msvc")
+    } else if cfg!(all(
+        target_arch = "x86_64",
+        target_os = "windows",
+        target_env = "gnu"
+    )) {
+        Some("x86_64-pc-windows-gnu")
+    } else if cfg!(all(
+        target_arch = "x86_64",
+        target_os = "linux",
+        target_env = "gnu"
+    )) {
+        Some("x86_64-unknown-linux-gnu")
+    } else if cfg!(all(
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_env = "gnu"
+    )) {
+        Some("aarch64-unknown-linux-gnu")
+    } else if cfg!(all(target_arch = "x86_64", target_os = "macos")) {
+        Some("x86_64-apple-darwin")
+    } else if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+        Some("aarch64-apple-darwin")
+    } else {
+        None
+    }
+}
+
+/// Emit a module, declining only constructs whose meaning cannot be expressed faithfully. External
+/// declarations name exactly the runtime the AOT link provides (see the crate docs).
 pub fn try_emit_llvm_ir(program: &Program, interner: &Interner) -> Result<String, String> {
-    let overloads = print_overloads(program, interner);
-    let declarations = declarations(program, interner, &overloads)?;
+    let defined: HashSet<Symbol> = program.funcs.iter().map(|f| f.name).collect();
+    let declarations = declarations(program, interner, &defined)?;
     let mut out = String::new();
-    out.push_str("; Wukong -> LLVM IR\n\n");
+    out.push_str("; Wukong -> LLVM IR\n");
+    if let Some(triple) = host_triple() {
+        let _ = writeln!(out, "target triple = \"{triple}\"");
+    }
+    out.push('\n');
     for (name, (ret, args)) in &declarations {
         if program
             .funcs
@@ -150,7 +223,7 @@ pub fn try_emit_llvm_ir(program: &Program, interner: &Interner) -> Result<String
         out.push('\n');
     }
     for f in &program.funcs {
-        emit_function(&mut out, f, interner, &overloads, &declarations);
+        emit_function(&mut out, f, interner, &declarations, &defined);
         out.push('\n');
     }
     Ok(out)
@@ -158,60 +231,147 @@ pub fn try_emit_llvm_ir(program: &Program, interner: &Interner) -> Result<String
 
 type Signature = (String, Vec<String>);
 
-fn print_overloads(program: &Program, interner: &Interner) -> HashSet<Symbol> {
-    let mut seen: HashMap<Symbol, Vec<MirType>> = HashMap::new();
-    let mut overloaded = HashSet::new();
-    for f in &program.funcs {
-        for b in &f.blocks {
-            for inst in &b.insts {
-                if let Op::Call { func, args } = &inst.op {
-                    if matches!(interner.resolve(*func), "print" | "println")
-                        && !program.funcs.iter().any(|f| f.name == *func)
-                    {
-                        let types = args
-                            .iter()
-                            .map(|a| f.value_type(*a).clone())
-                            .collect::<Vec<_>>();
-                        if seen.get(func).is_some_and(|old| old != &types) {
-                            overloaded.insert(*func);
-                        }
-                        seen.insert(*func, types);
-                    }
-                }
-            }
-        }
-    }
-    overloaded
+// The runtime ABI the Cranelift object calls for the print/assert intrinsics (see
+// `wukong_codegen_cranelift::lower_call`). Linking a module against the `--emit=exe` runtime needs
+// the module to use exactly these symbols and argument widths.
+const RT_PRINT_I64: &str = "wukong_rt_print_i64";
+const RT_PRINT_U64: &str = "wukong_rt_print_u64";
+const RT_PRINT_F64: &str = "wukong_rt_print_f64";
+const RT_PRINT_STR: &str = "wukong_rt_print_str";
+const RT_ASSERT: &str = "wukong_rt_assert";
+
+/// A built-in the MIR calls by its source name and the runtime implements under another.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Intrinsic {
+    PrintInt,
+    PrintUint,
+    PrintFloat,
+    PrintStr,
+    Assert,
 }
 
-fn call_name(
+impl Intrinsic {
+    /// The same classification the Cranelift backend applies (`classify_intrinsic`).
+    fn classify(name: &str, first_is_float: bool) -> Option<Intrinsic> {
+        match name {
+            "print" | "println" => Some(if first_is_float {
+                Intrinsic::PrintFloat
+            } else {
+                Intrinsic::PrintInt
+            }),
+            "print_str" | "println_str" => Some(Intrinsic::PrintStr),
+            "print_u" | "println_u" => Some(Intrinsic::PrintUint),
+            "assert" => Some(Intrinsic::Assert),
+            _ => None,
+        }
+    }
+
+    fn symbol(self) -> &'static str {
+        match self {
+            Intrinsic::PrintInt => RT_PRINT_I64,
+            Intrinsic::PrintUint => RT_PRINT_U64,
+            Intrinsic::PrintFloat => RT_PRINT_F64,
+            Intrinsic::PrintStr => RT_PRINT_STR,
+            Intrinsic::Assert => RT_ASSERT,
+        }
+    }
+
+    fn param(self) -> &'static str {
+        match self {
+            Intrinsic::PrintInt | Intrinsic::PrintUint | Intrinsic::Assert => "i64",
+            Intrinsic::PrintFloat => "double",
+            Intrinsic::PrintStr => "ptr",
+        }
+    }
+}
+
+/// How a `Call` reaches its target.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Callee {
+    /// A function defined in this program: called with its own MIR signature.
+    Defined,
+    /// A print/assert built-in, routed to the runtime's `wukong_rt_*` ABI.
+    Intrinsic(Intrinsic),
+    /// A `wukong_*` runtime kernel: every integer argument widened to `i64`, as Cranelift does.
+    Runtime,
+    /// Any other external symbol: declared from the call's MIR types.
+    Foreign,
+}
+
+fn callee(
     f: &Function,
     func: Symbol,
     args: &[ValueId],
     interner: &Interner,
-    overloads: &HashSet<Symbol>,
-) -> String {
+    defined: &HashSet<Symbol>,
+) -> Callee {
+    if defined.contains(&func) {
+        return Callee::Defined;
+    }
     let name = interner.resolve(func);
-    if overloads.contains(&func) {
-        let suffix = args
-            .iter()
-            .map(|a| llvm_ty(f.value_type(*a)))
-            .collect::<Vec<_>>()
-            .join(".");
-        format!("__wukong_{name}.{suffix}")
+    let first_is_float = args.first().is_some_and(|a| f.value_type(*a).is_float());
+    if let Some(intrinsic) = Intrinsic::classify(name, first_is_float) {
+        Callee::Intrinsic(intrinsic)
+    } else if name.starts_with("wukong_") {
+        Callee::Runtime
     } else {
-        name.to_owned()
+        Callee::Foreign
     }
 }
 
-fn declarations(
+/// The register (SSA) type of a MIR value type: `f16`/`bf16` lanes compute in `f32` (see the crate
+/// docs), everything else is itself.
+fn reg_mir(t: &MirType) -> MirType {
+    match t {
+        MirType::F16 | MirType::BF16 => MirType::F32,
+        MirType::Vec(lane, n) if is_half(lane) => MirType::Vec(Box::new(MirType::F32), *n),
+        other => other.clone(),
+    }
+}
+
+fn reg_ty(t: &MirType) -> String {
+    llvm_ty(&reg_mir(t))
+}
+
+/// Whether `t`'s lanes are a 16-bit float (stored narrow, computed in `f32`).
+fn is_half(t: &MirType) -> bool {
+    matches!(t.lane_type(), MirType::F16 | MirType::BF16)
+}
+
+/// The in-memory type of `t`: booleans take a whole byte (as in the interpreter and Cranelift —
+/// LLVM would bit-pack a `<n x i1>`), everything else is its own LLVM type.
+fn mem_ty(t: &MirType) -> String {
+    match t {
+        MirType::I1 => "i8".into(),
+        MirType::Vec(lane, n) | MirType::Array(lane, n) if **lane == MirType::I1 => {
+            if matches!(t, MirType::Vec(..)) {
+                format!("<{n} x i8>")
+            } else {
+                format!("[{n} x i8]")
+            }
+        }
+        MirType::Array(e, n) => format!("[{n} x {}]", mem_ty(e)),
+        other => llvm_ty(other),
+    }
+}
+
+/// The type of a runtime-kernel argument slot: integers are widened to the runtime's `i64`.
+fn runtime_param_ty(t: &MirType) -> String {
+    if t.is_int() {
+        "i64".into()
+    } else {
+        reg_ty(t)
+    }
+}
+
+/// For each `(runtime symbol, argument position)`, whether every non-pointer argument passed there
+/// is a literal integer zero — the MIR spelling of an absent optional pointer (a null bias). Such a
+/// slot is declared `ptr` and the zero is passed as `ptr null`.
+fn nullable_pointer_slots(
     program: &Program,
     interner: &Interner,
-    overloads: &HashSet<Symbol>,
-) -> Result<BTreeMap<String, Signature>, String> {
-    let mut signatures: BTreeMap<String, Signature> = BTreeMap::new();
-    // Optional runtime pointers are sometimes represented as integer zero in MIR. Infer the
-    // pointer ABI only when every non-pointer use at that position is a literal zero.
+    defined: &HashSet<Symbol>,
+) -> HashMap<(String, usize), bool> {
     let mut nullable: HashMap<(String, usize), bool> = HashMap::new();
     for f in &program.funcs {
         let zeros: HashSet<ValueId> = f
@@ -221,151 +381,181 @@ fn declarations(
             .filter(|ins| matches!(ins.op, Op::ConstInt(0, _)))
             .filter_map(|ins| ins.result)
             .collect();
-        for b in &f.blocks {
-            for inst in &b.insts {
-                if let Op::Call { func, args } = &inst.op {
-                    let name = interner.resolve(*func);
-                    if name.starts_with("wukong_") {
-                        for (k, a) in args.iter().enumerate() {
-                            let valid = f.value_type(*a) == &MirType::Ptr
-                                || (f.value_type(*a).is_int() && zeros.contains(a));
-                            *nullable.entry((name.to_owned(), k)).or_insert(true) &= valid;
-                        }
-                    }
+        for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+            if let Op::Call { func, args } = &inst.op {
+                if callee(f, *func, args, interner, defined) != Callee::Runtime {
+                    continue;
+                }
+                let name = interner.resolve(*func);
+                for (k, a) in args.iter().enumerate() {
+                    let valid = f.value_type(*a) == &MirType::Ptr
+                        || (f.value_type(*a).is_int() && zeros.contains(a));
+                    *nullable.entry((name.to_owned(), k)).or_insert(true) &= valid;
                 }
             }
         }
     }
+    nullable
+}
+
+fn declarations(
+    program: &Program,
+    interner: &Interner,
+    defined: &HashSet<Symbol>,
+) -> Result<BTreeMap<String, Signature>, String> {
+    let mut signatures: BTreeMap<String, Signature> = BTreeMap::new();
+    let nullable = nullable_pointer_slots(program, interner, defined);
     for f in &program.funcs {
         signatures.insert(
             interner.resolve(f.name).to_owned(),
             (
-                llvm_ty(&f.ret),
-                f.params.iter().map(|v| llvm_ty(f.value_type(*v))).collect(),
+                reg_ty(&f.ret),
+                f.params.iter().map(|v| reg_ty(f.value_type(*v))).collect(),
             ),
         );
     }
-    let defined = signatures.clone();
+    let defined_signatures = signatures.clone();
+    let mut required: Vec<(String, Signature)> = Vec::new();
     for f in &program.funcs {
-        for b in &f.blocks {
-            for inst in &b.insts {
-                if let Op::Cast(_, value, to) = &inst.op {
-                    let from = f.value_type(*value);
-                    if from != to
-                        && to.is_vector()
-                        && matches!(to.lane_type(), MirType::F16 | MirType::BF16)
-                        && matches!(
-                            from.lane_type(),
-                            MirType::F16 | MirType::BF16 | MirType::F64
-                        )
-                    {
-                        return Err(
-                            "LLVM emission: vector low-precision casts require an f32 lane adapter"
-                                .into(),
-                        );
-                    }
-                }
-                let call = match &inst.op {
-                    Op::Call { func, args } => Some((
-                        call_name(f, *func, args, interner, overloads),
-                        (
-                            inst.result
-                                .map(|r| llvm_ty(f.value_type(r)))
-                                .unwrap_or_else(|| {
-                                    defined
-                                        .get(interner.resolve(*func))
-                                        .map(|s| s.0.clone())
-                                        .unwrap_or_else(|| "void".into())
-                                }),
-                            args.iter().map(|v| llvm_ty(f.value_type(*v))).collect(),
-                        ),
-                    )),
-                    Op::Sqrt(v) | Op::Round(_, v) => {
-                        let ty = f.value_type(*v);
-                        let name = math_intrinsic(&inst.op, ty)?;
-                        Some((name, (llvm_ty(ty), vec![llvm_ty(ty)])))
-                    }
-                    Op::Fma(a, _, _) => {
-                        let ty = f.value_type(*a);
-                        if !matches!(ty.lane_type(), MirType::F32 | MirType::F64) {
-                            return Err(
-                                "LLVM emission: low-precision FMA requires promoted f32 SSA values"
-                                    .into(),
-                            );
-                        }
-                        Some((
-                            math_intrinsic(&inst.op, ty)?,
-                            (llvm_ty(ty), vec![llvm_ty(ty); 3]),
-                        ))
-                    }
-                    Op::Cast(kind @ (CastKind::FpToSi | CastKind::FpToUi), v, to) => {
-                        let from = f.value_type(*v);
-                        let target = saturating_target(to);
-                        Some((
-                            saturating_cast_name(*kind, from, &target),
-                            (llvm_ty(&target), vec![llvm_ty(from)]),
-                        ))
-                    }
-                    Op::VecKernelCall { kernel, n, .. } => Some((
-                        format!("__wukong_veckernel_{}_{}", interner.resolve(f.name), kernel),
-                        (
-                            inst.result
-                                .map(|r| llvm_ty(f.value_type(r)))
-                                .unwrap_or_else(|| "void".into()),
-                            vec!["ptr".into(), "ptr".into(), llvm_ty(f.value_type(*n))],
-                        ),
-                    )),
-                    _ => None,
-                };
-                if let Some((name, sig)) = call {
-                    if let Some(previous) = signatures.get_mut(&name) {
-                        if !defined.contains_key(&name)
-                            && previous.0 == sig.0
-                            && previous.1.len() == sig.1.len()
-                        {
-                            let mut merged = previous.1.clone();
-                            for (k, (old, new)) in merged.iter_mut().zip(&sig.1).enumerate() {
-                                if old != new
-                                    && (old == "ptr" || new == "ptr")
-                                    && nullable.get(&(name.clone(), k)) == Some(&true)
-                                {
-                                    *old = "ptr".into();
-                                }
-                            }
-                            if merged
-                                .iter()
-                                .zip(&sig.1)
-                                .enumerate()
-                                .all(|(k, (old, new))| {
-                                    old == new
-                                        || (old == "ptr"
-                                            && nullable.get(&(name.clone(), k)) == Some(&true))
-                                })
+        for kernel in &f.vec_kernels {
+            vec_kernels::check(kernel)?;
+            let (fma, sqrt) = vec_kernels::intrinsics(kernel);
+            if fma {
+                required.push((
+                    "llvm.fma.f32".into(),
+                    ("float".into(), vec!["float".into(); 3]),
+                ));
+            }
+            if sqrt {
+                required.push((
+                    "llvm.sqrt.f32".into(),
+                    ("float".into(), vec!["float".into()]),
+                ));
+            }
+        }
+        for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+            let call: Option<(String, Signature)> = match &inst.op {
+                Op::Call { func, args } => {
+                    let name = interner.resolve(*func).to_owned();
+                    let ret = inst
+                        .result
+                        .map(|r| reg_ty(f.value_type(r)))
+                        .unwrap_or_else(|| "void".into());
+                    match callee(f, *func, args, interner, defined) {
+                        Callee::Defined => None,
+                        Callee::Intrinsic(intrinsic) => {
+                            if intrinsic != Intrinsic::Assert
+                                && args.first().is_some_and(|a| f.value_type(*a).is_vector())
                             {
-                                previous.1 = merged;
-                                continue;
+                                return Err(format!(
+                                    "LLVM emission: `{name}` of a vector value has no runtime ABI"
+                                ));
                             }
+                            Some((
+                                intrinsic.symbol().to_owned(),
+                                ("void".into(), vec![intrinsic.param().into()]),
+                            ))
                         }
-                        if previous != &sig {
-                            return Err(format!("LLVM emission: incompatible call signatures for `{name}`: {previous:?} and {sig:?}; an explicit ABI adapter is required"));
-                        }
-                    } else {
-                        signatures.insert(name, sig);
+                        Callee::Runtime => Some((
+                            name,
+                            (
+                                ret,
+                                args.iter()
+                                    .map(|a| runtime_param_ty(f.value_type(*a)))
+                                    .collect(),
+                            ),
+                        )),
+                        Callee::Foreign => Some((
+                            name,
+                            (ret, args.iter().map(|a| reg_ty(f.value_type(*a))).collect()),
+                        )),
                     }
                 }
+                Op::Sqrt(v) | Op::Round(_, v) => {
+                    let ty = reg_mir(f.value_type(*v));
+                    let name = math_intrinsic(&inst.op, &ty)?;
+                    Some((name, (llvm_ty(&ty), vec![llvm_ty(&ty)])))
+                }
+                Op::Fma(a, _, _) => {
+                    let ty = reg_mir(f.value_type(*a));
+                    Some((
+                        math_intrinsic(&inst.op, &ty)?,
+                        (llvm_ty(&ty), vec![llvm_ty(&ty); 3]),
+                    ))
+                }
+                Op::Cast(kind @ (CastKind::FpToSi | CastKind::FpToUi), v, to) => {
+                    let from = reg_mir(f.value_type(*v));
+                    let target = saturating_target(to);
+                    Some((
+                        saturating_cast_name(*kind, &from, &target),
+                        (llvm_ty(&target), vec![llvm_ty(&from)]),
+                    ))
+                }
+                Op::Cast(CastKind::Bitcast, v, to) if is_half(f.value_type(*v)) || is_half(to) => {
+                    return Err(
+                        "LLVM emission: a bitcast to or from f16/bf16 has no f32-register meaning"
+                            .into(),
+                    );
+                }
+                Op::VecKernelCall { kernel, .. } => {
+                    if f.vec_kernels.get(*kernel as usize).is_none() {
+                        return Err(format!(
+                            "LLVM emission: vector kernel #{kernel} of `{}` is not registered",
+                            interner.resolve(f.name)
+                        ));
+                    }
+                    None
+                }
+                _ => None,
+            };
+            if let Some(entry) = call {
+                required.push(entry);
             }
         }
     }
-    for f in &program.funcs {
-        for b in &f.blocks {
-            for inst in &b.insts {
-                if let Op::FuncAddr(sym) = inst.op {
-                    if !signatures.contains_key(interner.resolve(sym)) {
-                        return Err(format!(
-                            "LLVM emission: cannot infer signature of external function `{}`",
-                            interner.resolve(sym)
-                        ));
+    for (name, sig) in required {
+        if let Some(previous) = signatures.get_mut(&name) {
+            if !defined_signatures.contains_key(&name)
+                && previous.0 == sig.0
+                && previous.1.len() == sig.1.len()
+            {
+                let mut merged = previous.1.clone();
+                for (k, (old, new)) in merged.iter_mut().zip(&sig.1).enumerate() {
+                    if old != new
+                        && (old == "ptr" || new == "ptr")
+                        && nullable.get(&(name.clone(), k)) == Some(&true)
+                    {
+                        *old = "ptr".into();
                     }
+                }
+                if merged
+                    .iter()
+                    .zip(&sig.1)
+                    .enumerate()
+                    .all(|(k, (old, new))| {
+                        old == new
+                            || (old == "ptr" && nullable.get(&(name.clone(), k)) == Some(&true))
+                    })
+                {
+                    previous.1 = merged;
+                    continue;
+                }
+            }
+            if previous != &sig {
+                return Err(format!("LLVM emission: incompatible call signatures for `{name}`: {previous:?} and {sig:?}; an explicit ABI adapter is required"));
+            }
+        } else {
+            signatures.insert(name, sig);
+        }
+    }
+    for f in &program.funcs {
+        for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+            if let Op::FuncAddr(sym) = inst.op {
+                if !signatures.contains_key(interner.resolve(sym)) {
+                    return Err(format!(
+                        "LLVM emission: cannot infer signature of external function `{}`",
+                        interner.resolve(sym)
+                    ));
                 }
             }
         }
@@ -402,8 +592,6 @@ fn extern_abi(p: &wukong_mir::ExternParam, is_ret: bool) -> String {
 
 fn math_intrinsic(op: &Op, ty: &MirType) -> Result<String, String> {
     let suffix = match ty.lane_type() {
-        MirType::F16 => "f16",
-        MirType::BF16 => "bf16",
         MirType::F32 => "f32",
         MirType::F64 => "f64",
         _ => return Err(format!("LLVM emission: floating intrinsic on {ty:?}")),
@@ -459,8 +647,8 @@ fn emit_function(
     out: &mut String,
     f: &Function,
     interner: &Interner,
-    overloads: &HashSet<Symbol>,
     declarations: &BTreeMap<String, Signature>,
+    defined: &HashSet<Symbol>,
 ) {
     // Inline constants: map const-producing values to literal operand strings.
     let mut consts: HashMap<u32, String> = HashMap::new();
@@ -468,8 +656,8 @@ fn emit_function(
         for inst in &b.insts {
             if let Some(r) = inst.result {
                 match &inst.op {
-                    Op::ConstInt(v, _) => {
-                        consts.insert(r.0, v.to_string());
+                    Op::ConstInt(v, ty) => {
+                        consts.insert(r.0, int_const(*v, ty));
                     }
                     Op::ConstFloat(v, ty) => {
                         consts.insert(r.0, fmt_float(*v, ty));
@@ -493,13 +681,13 @@ fn emit_function(
             } else {
                 ""
             };
-            format!("{}{} %v{}", llvm_ty(f.value_type(*p)), attr, p.0)
+            format!("{}{} %v{}", reg_ty(f.value_type(*p)), attr, p.0)
         })
         .collect();
     let _ = writeln!(
         out,
         "define {} @{}({}) {{",
-        llvm_ty(&f.ret),
+        reg_ty(&f.ret),
         interner.resolve(f.name),
         params.join(", ")
     );
@@ -510,13 +698,20 @@ fn emit_function(
         interner,
         consts: &consts,
         edges: &edges,
-        overloads,
         declarations,
+        defined,
+        tmp: Cell::new(0),
     };
     for b in &f.blocks {
         e.emit_block(out, b);
     }
     out.push_str("}\n");
+
+    let name = interner.resolve(f.name);
+    for (k, kernel) in f.vec_kernels.iter().enumerate() {
+        out.push('\n');
+        vec_kernels::emit_definition(out, &vec_kernels::kernel_symbol(name, k as u32), kernel);
+    }
 }
 
 struct Emitter<'a> {
@@ -524,8 +719,10 @@ struct Emitter<'a> {
     interner: &'a Interner,
     consts: &'a HashMap<u32, String>,
     edges: &'a EdgeArgs,
-    overloads: &'a HashSet<Symbol>,
     declarations: &'a BTreeMap<String, Signature>,
+    defined: &'a HashSet<Symbol>,
+    /// Counter for the `%tN` temporaries an instruction needs besides its own result.
+    tmp: Cell<u32>,
 }
 
 impl Emitter<'_> {
@@ -536,8 +733,19 @@ impl Emitter<'_> {
         }
     }
 
+    /// The register type of value `v`.
     fn ty(&self, v: ValueId) -> String {
-        llvm_ty(self.f.value_type(v))
+        reg_ty(self.f.value_type(v))
+    }
+
+    fn mir(&self, v: ValueId) -> &MirType {
+        self.f.value_type(v)
+    }
+
+    fn fresh(&self) -> String {
+        let n = self.tmp.get();
+        self.tmp.set(n + 1);
+        format!("%t{n}")
     }
 
     fn emit_block(&self, out: &mut String, b: &BasicBlock) {
@@ -574,6 +782,71 @@ impl Emitter<'_> {
             }
             let _ = writeln!(out, "  %v{} = phi {ty} {}", param.0, entries.join(", "));
         }
+    }
+
+    /// A typed identity binding of `value` to `dst` (LLVM has no plain copy instruction).
+    fn bind(&self, out: &mut String, dst: &str, ty: &str, value: &str) {
+        let _ = writeln!(out, "  {dst} = select i1 true, {ty} {value}, {ty} {value}");
+    }
+
+    /// Widen an integer-like value to `i64` (`i1` always zero-extends; pointers become their
+    /// address), returning the operand spelling.
+    fn to_i64(&self, out: &mut String, v: ValueId, signed: bool) -> String {
+        let ty = self.mir(v).clone();
+        let operand = self.operand(v);
+        match ty {
+            MirType::I64 => operand,
+            MirType::Ptr => {
+                let t = self.fresh();
+                let _ = writeln!(out, "  {t} = ptrtoint ptr {operand} to i64");
+                t
+            }
+            MirType::I1 | MirType::I8 | MirType::I16 | MirType::I32 => {
+                let t = self.fresh();
+                let ext = if signed && ty != MirType::I1 {
+                    "sext"
+                } else {
+                    "zext"
+                };
+                let _ = writeln!(out, "  {t} = {ext} {} {operand} to i64", llvm_ty(&ty));
+                t
+            }
+            _ => operand,
+        }
+    }
+
+    /// A float register value as `double`, returning the operand spelling.
+    fn to_f64(&self, out: &mut String, v: ValueId) -> String {
+        let operand = self.operand(v);
+        if reg_mir(self.mir(v)) == MirType::F64 {
+            operand
+        } else {
+            let t = self.fresh();
+            let _ = writeln!(out, "  {t} = fpext float {operand} to double");
+            t
+        }
+    }
+
+    /// Round the `f32`-register value `value` (of register type `reg`) onto the grid of `grid`'s
+    /// half/bfloat lane and widen it back, returning the rounded register value.
+    fn round_to_grid(
+        &self,
+        out: &mut String,
+        value: &str,
+        reg: &MirType,
+        grid: &MirType,
+    ) -> String {
+        let lane = grid.lane_type().clone();
+        let narrow = match reg {
+            MirType::Vec(_, n) => MirType::Vec(Box::new(lane), *n),
+            _ => lane,
+        };
+        let (reg, narrow) = (llvm_ty(reg), llvm_ty(&narrow));
+        let t = self.fresh();
+        let w = self.fresh();
+        let _ = writeln!(out, "  {t} = fptrunc {reg} {value} to {narrow}");
+        let _ = writeln!(out, "  {w} = fpext {narrow} {t} to {reg}");
+        w
     }
 
     fn emit_inst(&self, out: &mut String, inst: &wukong_mir::Inst) {
@@ -623,7 +896,7 @@ impl Emitter<'_> {
                     self.operand(*r)
                 )
             }
-            Op::Alloca { ty, .. } => format!("{res}alloca {}", llvm_ty(ty)),
+            Op::Alloca { ty, .. } => format!("{res}alloca {}", mem_ty(ty)),
             Op::Cmp(op, l, r) => {
                 let opty = self.ty(*l);
                 let (instr, pred) = cmp_instr(*op);
@@ -631,17 +904,15 @@ impl Emitter<'_> {
                 if let MirType::Vec(lane, n) = self.f.value_type(result) {
                     if **lane != MirType::I1 {
                         let ty = self.ty(result);
-                        return {
-                            let _ = writeln!(
-                                out,
-                                "  %v{}.mask = {instr} {pred} {opty} {}, {}",
-                                result.0,
-                                self.operand(*l),
-                                self.operand(*r)
-                            );
-                            let _ =
-                                writeln!(out, "  {res}sext <{n} x i1> %v{}.mask to {ty}", result.0);
-                        };
+                        let _ = writeln!(
+                            out,
+                            "  %v{}.mask = {instr} {pred} {opty} {}, {}",
+                            result.0,
+                            self.operand(*l),
+                            self.operand(*r)
+                        );
+                        let _ = writeln!(out, "  {res}sext <{n} x i1> %v{}.mask to {ty}", result.0);
+                        return;
                     }
                 }
                 format!(
@@ -675,63 +946,8 @@ impl Emitter<'_> {
                 format!("{res}xor {ty} {}, {ones}", self.operand(*v))
             }
             Op::Cast(kind, v, to) => {
-                let from = self.ty(*v);
-                if matches!(kind, CastKind::FpToSi | CastKind::FpToUi) {
-                    let target = saturating_target(to);
-                    let name = saturating_cast_name(*kind, self.f.value_type(*v), &target);
-                    let target_ty = llvm_ty(&target);
-                    if &target == to {
-                        let _ = writeln!(
-                            out,
-                            "  {res}call {target_ty} @{name}({from} {})",
-                            self.operand(*v)
-                        );
-                    } else {
-                        let r = inst.result.unwrap().0;
-                        let _ = writeln!(
-                            out,
-                            "  %v{r}.sat = call {target_ty} @{name}({from} {})",
-                            self.operand(*v)
-                        );
-                        let _ =
-                            writeln!(out, "  {res}trunc {target_ty} %v{r}.sat to {}", llvm_ty(to));
-                    }
-                    return;
-                }
-                if self.f.value_type(*v) == to {
-                    // A typed identity SSA binding, including half/bfloat and opaque pointers.
-                    let value = self.operand(*v);
-                    let _ = writeln!(out, "  {res}select i1 true, {from} {value}, {from} {value}");
-                    return;
-                }
-                if matches!(to, MirType::F16 | MirType::BF16)
-                    && matches!(
-                        self.f.value_type(*v),
-                        MirType::F16 | MirType::BF16 | MirType::F64
-                    )
-                {
-                    // MIR lowp observations round through f32; half and bfloat also cannot be
-                    // converted with LLVM's same-width fptrunc/fpext.
-                    let r = inst.result.unwrap().0;
-                    let via = if self.f.value_type(*v) == &MirType::F64 {
-                        "fptrunc"
-                    } else {
-                        "fpext"
-                    };
-                    let _ = writeln!(
-                        out,
-                        "  %v{r}.wide = {via} {from} {} to float",
-                        self.operand(*v)
-                    );
-                    let _ = writeln!(out, "  {res}fptrunc float %v{r}.wide to {}", llvm_ty(to));
-                    return;
-                }
-                format!(
-                    "{res}{} {from} {} to {}",
-                    cast_name(*kind),
-                    self.operand(*v),
-                    llvm_ty(to)
-                )
+                self.emit_cast(out, inst.result.unwrap(), *kind, *v, to);
+                return;
             }
             Op::Select(c, a, b) => {
                 let ty = self.ty(inst.result.unwrap());
@@ -766,50 +982,73 @@ impl Emitter<'_> {
                     self.operand(*b)
                 )
             }
-            Op::Load(p, ty) => format!("{res}load {}, ptr {}", llvm_ty(ty), self.operand(*p)),
+            Op::Load(p, ty) => {
+                let r = inst.result.expect("a load has a result").0;
+                let ptr = self.operand(*p);
+                if is_half(ty) || ty.lane_type() == &MirType::I1 {
+                    // Narrow storage: load the stored bits, then widen to the register form (a
+                    // half/bfloat widens exactly; a boolean byte keeps only its low bit, as the
+                    // interpreter's load does).
+                    let mem = mem_ty(ty);
+                    let widen = if is_half(ty) { "fpext" } else { "trunc" };
+                    let _ = writeln!(out, "  %v{r}.mem = load {mem}, ptr {ptr}");
+                    format!("{res}{widen} {mem} %v{r}.mem to {}", reg_ty(ty))
+                } else {
+                    format!("{res}load {}, ptr {ptr}", llvm_ty(ty))
+                }
+            }
             Op::Store { ptr, value } => {
-                let ty = self.ty(*value);
-                format!(
-                    "store {ty} {}, ptr {}",
-                    self.operand(*value),
-                    self.operand(*ptr)
-                )
+                let vt = self.mir(*value);
+                let reg = self.ty(*value);
+                let v = self.operand(*value);
+                let p = self.operand(*ptr);
+                if is_half(vt) || vt.lane_type() == &MirType::I1 {
+                    // Round to the stored grid (or widen a boolean to its byte) and store narrow.
+                    let mem = mem_ty(vt);
+                    let narrow = if is_half(vt) { "fptrunc" } else { "zext" };
+                    let t = self.fresh();
+                    let _ = writeln!(out, "  {t} = {narrow} {reg} {v} to {mem}");
+                    format!("store {mem} {t}, ptr {p}")
+                } else {
+                    format!("store {reg} {v}, ptr {p}")
+                }
             }
             Op::Gep { ptr, index, elem } => {
                 let idxty = self.ty(*index);
                 format!(
                     "{res}getelementptr {}, ptr {}, {idxty} {}",
-                    llvm_ty(elem),
+                    mem_ty(elem),
                     self.operand(*ptr),
                     self.operand(*index)
                 )
             }
             Op::Call { func, args } => {
-                // A void call (e.g. the `print` intrinsic) has no result value to type.
+                match callee(self.f, *func, args, self.interner, self.defined) {
+                    Callee::Intrinsic(intrinsic) => {
+                        self.emit_intrinsic(out, intrinsic, args);
+                        return;
+                    }
+                    Callee::Runtime => {
+                        self.emit_runtime_call(out, &res, inst.result, *func, args);
+                        return;
+                    }
+                    Callee::Defined | Callee::Foreign => {}
+                }
+                let name = self.interner.resolve(*func);
+                // A discarded result of a defined function is still produced by the callee.
                 let ret_ty = match inst.result {
                     Some(r) => self.ty(r),
                     None => self
                         .declarations
-                        .get(self.interner.resolve(*func))
+                        .get(name)
                         .map(|s| s.0.clone())
                         .unwrap_or_else(|| "void".to_string()),
                 };
-                let name = call_name(self.f, *func, args, self.interner, self.overloads);
-                let signature = self.declarations.get(&name);
                 let argstr: Vec<String> = args
                     .iter()
-                    .enumerate()
-                    .map(|(k, a)| {
-                        if signature.is_some_and(|s| s.1[k] == "ptr")
-                            && self.f.value_type(*a).is_int()
-                        {
-                            "ptr null".into()
-                        } else {
-                            format!("{} {}", self.ty(*a), self.operand(*a))
-                        }
-                    })
+                    .map(|a| format!("{} {}", self.ty(*a), self.operand(*a)))
                     .collect();
-                format!("{res}call {ret_ty} @{}({})", name, argstr.join(", "))
+                format!("{res}call {ret_ty} @{name}({})", argstr.join(", "))
             }
             Op::FuncAddr(func) => {
                 // The address of a function as a `ptr` (an identity GEP keeps it valid IR).
@@ -828,8 +1067,7 @@ impl Emitter<'_> {
             }
             Op::Splat(v) => {
                 // Broadcast a scalar into every lane: insert at lane 0, then shuffle with an
-                // all-zero mask. (The native vectorizer is Cranelift-only, so this path is for
-                // completeness/round-tripping rather than the hot path.)
+                // all-zero mask.
                 let r = inst.result.unwrap();
                 let vty = self.ty(r);
                 let lane = self.ty(*v);
@@ -863,8 +1101,8 @@ impl Emitter<'_> {
             Op::Fma(a, b, c) => {
                 let r = inst.result.unwrap();
                 let ty = self.ty(r);
-                let name =
-                    math_intrinsic(&inst.op, self.f.value_type(r)).expect("validated FMA type");
+                let name = math_intrinsic(&inst.op, &reg_mir(self.f.value_type(r)))
+                    .expect("validated FMA type");
                 format!(
                     "{res}call {ty} @{name}({ty} {}, {ty} {}, {ty} {})",
                     self.operand(*a),
@@ -875,7 +1113,7 @@ impl Emitter<'_> {
             Op::Sqrt(a) | Op::Round(_, a) => {
                 let r = inst.result.unwrap();
                 let ty = self.ty(r);
-                let name = math_intrinsic(&inst.op, self.f.value_type(r))
+                let name = math_intrinsic(&inst.op, &reg_mir(self.f.value_type(r)))
                     .expect("intrinsic types checked before emission");
                 format!("{res}call {ty} @{name}({ty} {})", self.operand(*a))
             }
@@ -885,24 +1123,188 @@ impl Emitter<'_> {
                 scalars,
                 n,
             } => {
-                // The synthesized 256-bit AVX2 kernel, emitted as an external void call (like the
-                // recognized `wukong_*` runtime kernels above). This text-IR path is not the
-                // differential oracle and is not assembled here — the AVX2 body lives only in the
-                // Cranelift backend — so a well-formed, round-trippable call is the faithful form.
+                // The synthesized vector kernel, defined in this module from its recipe (see
+                // `vec_kernels`). The element count is zero-extended, as the Cranelift call does.
+                let count = self.to_i64(out, *n, false);
                 format!(
-                    "{res}call {} @__wukong_veckernel_{}_{kernel}(ptr {}, ptr {}, {} {})",
+                    "{res}call {} @{}(ptr {}, ptr {}, i64 {count})",
                     inst.result
                         .map(|r| self.ty(r))
                         .unwrap_or_else(|| "void".into()),
-                    self.interner.resolve(self.f.name),
+                    vec_kernels::kernel_symbol(self.interner.resolve(self.f.name), *kernel),
                     self.operand(*ptrs),
                     self.operand(*scalars),
-                    self.ty(*n),
-                    self.operand(*n),
                 )
             }
         };
         let _ = writeln!(out, "  {line}");
+    }
+
+    /// Lower a cast with the interpreter's semantics (`wukong_interp::apply_cast`): a widening from a
+    /// half/bfloat source first snaps the `f32` register onto the source grid, a narrowing to a
+    /// half/bfloat target rounds through `f32` onto the target grid, and int→float conversion
+    /// rounds once to the target's register precision.
+    fn emit_cast(
+        &self,
+        out: &mut String,
+        result: ValueId,
+        kind: CastKind,
+        v: ValueId,
+        to: &MirType,
+    ) {
+        let dst = format!("%v{}", result.0);
+        let from = self.mir(v).clone();
+        let src = self.operand(v);
+        let from_reg = reg_mir(&from);
+        let to_reg = reg_mir(to);
+        match kind {
+            CastKind::FpToSi | CastKind::FpToUi => {
+                let target = saturating_target(to);
+                let name = saturating_cast_name(kind, &from_reg, &target);
+                let target_ty = llvm_ty(&target);
+                let from_ty = llvm_ty(&from_reg);
+                if &target == to {
+                    let _ = writeln!(out, "  {dst} = call {target_ty} @{name}({from_ty} {src})");
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "  {dst}.sat = call {target_ty} @{name}({from_ty} {src})"
+                    );
+                    let _ = writeln!(
+                        out,
+                        "  {dst} = trunc {target_ty} {dst}.sat to {}",
+                        llvm_ty(to)
+                    );
+                }
+            }
+            CastKind::FpExt if is_half(&from) => {
+                let rounded = self.round_to_grid(out, &src, &from_reg, &from);
+                self.convert_float(out, &dst, &rounded, &from_reg, &to_reg);
+            }
+            CastKind::FpTrunc if is_half(to) => {
+                // `round_xx(v as f32)`: a double first rounds to f32, then onto the target grid.
+                let single = shape_f32(&from_reg);
+                let narrowed = if from_reg.lane_type() == &MirType::F64 {
+                    let t = self.fresh();
+                    let _ = writeln!(
+                        out,
+                        "  {t} = fptrunc {} {src} to {}",
+                        llvm_ty(&from_reg),
+                        llvm_ty(&single)
+                    );
+                    t
+                } else {
+                    src
+                };
+                let rounded = self.round_to_grid(out, &narrowed, &single, to);
+                self.bind(out, &dst, &llvm_ty(&single), &rounded);
+            }
+            _ if from_reg == to_reg => self.bind(out, &dst, &llvm_ty(&from_reg), &src),
+            _ => {
+                let _ = writeln!(
+                    out,
+                    "  {dst} = {} {} {src} to {}",
+                    cast_name(kind),
+                    llvm_ty(&from_reg),
+                    llvm_ty(&to_reg)
+                );
+            }
+        }
+    }
+
+    /// Move a float register value between `float` and `double` shapes (or bind it unchanged).
+    fn convert_float(
+        &self,
+        out: &mut String,
+        dst: &str,
+        value: &str,
+        from_reg: &MirType,
+        to_reg: &MirType,
+    ) {
+        if from_reg == to_reg {
+            self.bind(out, dst, &llvm_ty(from_reg), value);
+        } else {
+            let op = if to_reg.lane_type() == &MirType::F64 {
+                "fpext"
+            } else {
+                "fptrunc"
+            };
+            let _ = writeln!(
+                out,
+                "  {dst} = {op} {} {value} to {}",
+                llvm_ty(from_reg),
+                llvm_ty(to_reg)
+            );
+        }
+    }
+
+    /// `print`/`assert`, lowered to the runtime ABI exactly as the Cranelift object lowers them.
+    fn emit_intrinsic(&self, out: &mut String, intrinsic: Intrinsic, args: &[ValueId]) {
+        let arg = match intrinsic {
+            Intrinsic::Assert => {
+                // The runtime aborts on 0. A float is truthy when `!= 0.0` (unordered, so NaN
+                // passes, as in the interpreter); a vector is never truthy.
+                let ok = match args.first() {
+                    None => "0".to_string(),
+                    Some(&a) if self.mir(a).is_vector() => "0".to_string(),
+                    Some(&a) => {
+                        let ty = self.mir(a).clone();
+                        let v = self.operand(a);
+                        let rty = self.ty(a);
+                        let c = self.fresh();
+                        if ty.is_float() {
+                            let _ = writeln!(out, "  {c} = fcmp une {rty} {v}, 0.0");
+                        } else if ty == MirType::Ptr {
+                            let _ = writeln!(out, "  {c} = icmp ne ptr {v}, null");
+                        } else {
+                            let _ = writeln!(out, "  {c} = icmp ne {rty} {v}, 0");
+                        }
+                        let w = self.fresh();
+                        let _ = writeln!(out, "  {w} = zext i1 {c} to i64");
+                        w
+                    }
+                };
+                format!("i64 {ok}")
+            }
+            // An argument-less print lowers to nothing, as in the Cranelift backend.
+            _ => {
+                let Some(&a) = args.first() else { return };
+                match intrinsic {
+                    Intrinsic::PrintFloat => format!("double {}", self.to_f64(out, a)),
+                    Intrinsic::PrintStr => format!("ptr {}", self.operand(a)),
+                    _ => format!("i64 {}", self.to_i64(out, a, true)),
+                }
+            }
+        };
+        let _ = writeln!(out, "  call void @{}({arg})", intrinsic.symbol());
+    }
+
+    /// A `wukong_*` runtime kernel call with the C ABI the runtime exports: integer arguments
+    /// sign-extended to `i64` (booleans zero-extended), a literal-zero optional pointer as `ptr null`.
+    fn emit_runtime_call(
+        &self,
+        out: &mut String,
+        res: &str,
+        result: Option<ValueId>,
+        func: Symbol,
+        args: &[ValueId],
+    ) {
+        let name = self.interner.resolve(func);
+        let slots = self.declarations.get(name).map(|s| &s.1);
+        let mut argstr: Vec<String> = Vec::with_capacity(args.len());
+        for (k, a) in args.iter().enumerate() {
+            let slot = slots.and_then(|s| s.get(k)).map(String::as_str);
+            let ty = self.mir(*a);
+            argstr.push(if slot == Some("ptr") && ty.is_int() {
+                "ptr null".to_string()
+            } else if ty.is_int() {
+                format!("i64 {}", self.to_i64(out, *a, true))
+            } else {
+                format!("{} {}", self.ty(*a), self.operand(*a))
+            });
+        }
+        let ret = result.map(|r| self.ty(r)).unwrap_or_else(|| "void".into());
+        let _ = writeln!(out, "  {res}call {ret} @{name}({})", argstr.join(", "));
     }
 
     fn emit_integer_div(
@@ -1012,6 +1414,14 @@ impl Emitter<'_> {
     }
 }
 
+/// `float` with the vector shape of `t` (`<n x float>` for an `n`-lane vector).
+fn shape_f32(t: &MirType) -> MirType {
+    match t {
+        MirType::Vec(_, n) => MirType::Vec(Box::new(MirType::F32), *n),
+        _ => MirType::F32,
+    }
+}
+
 fn llvm_ty(t: &MirType) -> String {
     match t {
         MirType::I1 => "i1".into(),
@@ -1054,6 +1464,8 @@ fn bin_name(op: BinOp) -> &'static str {
     }
 }
 
+/// The LLVM predicate for each MIR comparison. `Fone` is the oracle's `!=` — **unordered**
+/// (`une`, true when either side is NaN) — not LLVM's ordered `one`.
 fn cmp_instr(op: CmpOp) -> (&'static str, &'static str) {
     use CmpOp::*;
     match op {
@@ -1094,9 +1506,6 @@ fn cast_name(kind: CastKind) -> &'static str {
     }
 }
 
-// LLVM's hexadecimal float spelling uses the bits of an exactly widened double for f32.
-// This handles tiny values, signed zero, infinities and NaNs without decimal representability
-// restrictions. Low-precision literals share the runtime's rounding contract.
 fn int_literal(ty: &MirType, value: i64) -> String {
     match ty {
         MirType::Vec(lane, n) => format!(
@@ -1107,14 +1516,36 @@ fn int_literal(ty: &MirType, value: i64) -> String {
     }
 }
 
+/// An integer constant spelled in its type's signed range (the interpreter masks every constant to
+/// its width; `i1` keeps only its low bit). A pointer constant is `null` or an `inttoptr`.
+fn int_const(v: i128, ty: &MirType) -> String {
+    let bits: u32 = match ty {
+        MirType::I1 => return (v & 1).to_string(),
+        MirType::I8 => 8,
+        MirType::I16 => 16,
+        MirType::I32 => 32,
+        MirType::I64 => 64,
+        MirType::Ptr if v == 0 => return "null".into(),
+        MirType::Ptr => return format!("inttoptr (i64 {} to ptr)", v as i64),
+        _ => return v.to_string(),
+    };
+    let shift = 128 - bits;
+    ((v << shift) >> shift).to_string()
+}
+
+/// A floating constant in LLVM's hexadecimal spelling (the bits of the exactly widened double), so
+/// tiny values, signed zero, infinities and NaNs need no decimal-representability argument. A
+/// half/bfloat constant is its grid-rounded value held in a `float` register — the interpreter's
+/// `ConstFloat` rounding, through the same runtime conversion.
 fn fmt_float(v: f64, ty: &MirType) -> String {
-    match ty {
-        MirType::F16 => format!("0xH{:04X}", wukong_runtime::f32_to_f16_bits(v as f32)),
-        MirType::BF16 => format!("0xR{:04X}", wukong_runtime::f32_to_bf16_bits(v as f32)),
-        MirType::F32 => format!("0x{:016X}", (v as f32 as f64).to_bits()),
-        MirType::F64 => format!("0x{:016X}", v.to_bits()),
+    let x = match ty {
+        MirType::F16 => wukong_runtime::round_f16(v as f32) as f64,
+        MirType::BF16 => wukong_runtime::round_bf16(v as f32) as f64,
+        MirType::F32 => v as f32 as f64,
+        MirType::F64 => v,
         _ => unreachable!("floating constant has non-floating type"),
-    }
+    };
+    format!("0x{:016X}", x.to_bits())
 }
 
 #[cfg(test)]
@@ -1162,10 +1593,63 @@ mod tests {
 
     #[test]
     fn emits_void_call_for_print_intrinsic() {
-        // A void call (no result) must emit `call void @print(...)`, not panic on a missing
-        // result type (regression for indexing value_types with a dummy id).
+        // A void call (no result) must not panic on a missing result type (regression for indexing
+        // value_types with a dummy id), and `print` reaches the runtime's i64 print ABI — the
+        // symbol the `--emit=exe` runtime defines — never an undefined `@print`.
         let out = ir("fn main() -> i32 { print(42); return 0; }");
-        assert!(out.contains("call void @print(i32 42)"), "{out}");
+        assert!(
+            out.contains("declare void @wukong_rt_print_i64(i64)"),
+            "{out}"
+        );
+        assert!(out.contains("call void @wukong_rt_print_i64(i64 "), "{out}");
+        assert!(!out.contains("@print("), "{out}");
+    }
+
+    fn corpus_fixture(name: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("tests")
+            .join("run")
+            .join(name);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    /// P15.4: the emitted module must implement the oracle's scalar contracts on the corpus
+    /// programs that pin them, at -O0 and -O2. `div_edge.wk` pins division/remainder by zero == 0
+    /// and `INT_MIN / -1` wrapping, `shift_width.wk` pins the masked shift count, and
+    /// `vectorized_edge_values.wk` returns 7777 from `if v != v` (unordered `!=`). The IR cannot be
+    /// executed here, so the guard instructions themselves are the assertion; an unguarded
+    /// `sdiv`/`shl` or an ordered `fcmp one` would be poison or the wrong answer under LLVM. At -O2
+    /// the optimizer folds the constant operands away (with the same oracle semantics), so the
+    /// guards are asserted on the -O0 form and the module-level properties at both levels.
+    #[test]
+    fn emitted_ir_matches_oracle_scalar_contracts() {
+        for opt in [0, 2] {
+            let div = ir_opt(&corpus_fixture("div_edge.wk"), opt);
+            let shift = ir_opt(&corpus_fixture("shift_width.wk"), opt);
+            let edge = ir_opt(&corpus_fixture("vectorized_edge_values.wk"), opt);
+            if opt == 0 {
+                assert!(div.contains(".zero = icmp eq"), "{div}");
+                assert!(div.contains(".safe = select"), "{div}");
+                assert!(div.contains(".wrapped = select"), "{div}");
+                assert!(shift.contains(".shift = and"), "{shift}");
+                assert!(edge.contains("fcmp une"), "{edge}");
+            }
+            for text in [&div, &shift, &edge] {
+                assert!(!text.contains("fcmp one"), "-O{opt}:\n{text}");
+                // Every external symbol is the AOT runtime's or an LLVM intrinsic: no module
+                // references a symbol the `--emit=exe` link cannot provide.
+                for line in text.lines().filter(|l| l.starts_with("declare ")) {
+                    let name = line.split('@').nth(1).unwrap_or("");
+                    assert!(
+                        name.starts_with("wukong_") || name.starts_with("llvm."),
+                        "-O{opt}: undefined non-runtime symbol: {line}"
+                    );
+                }
+                assert!(!text.contains("declare void @__wukong_veckernel"), "{text}");
+            }
+        }
     }
 
     #[test]

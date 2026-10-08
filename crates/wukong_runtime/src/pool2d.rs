@@ -475,6 +475,7 @@ unsafe fn pool2d_parallel(
 ///
 /// # Safety
 /// `x` valid for `channels*h*w`, `out` for `channels*oh*ow` f32, non-overlapping.
+/// **Aliasing: all operands disjoint** — `out` does not overlap `x`.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn wukong_maxpool2d_f32(
@@ -496,6 +497,8 @@ pub unsafe extern "C" fn wukong_maxpool2d_f32(
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_maxpool2d_f32`].
+/// **Aliasing:** that of [`wukong_maxpool2d_f32`] — all operands disjoint: `out` does not overlap
+/// `x`.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn wukong_maxpool2d_f32_parallel(
@@ -519,6 +522,7 @@ pub unsafe extern "C" fn wukong_maxpool2d_f32_parallel(
 ///
 /// # Safety
 /// `x` valid for `channels*h*w`, `out` for `channels*oh*ow` f32, non-overlapping.
+/// **Aliasing: all operands disjoint** — `out` does not overlap `x`.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn wukong_avgpool2d_f32(
@@ -540,6 +544,8 @@ pub unsafe extern "C" fn wukong_avgpool2d_f32(
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_avgpool2d_f32`].
+/// **Aliasing:** that of [`wukong_avgpool2d_f32`] — all operands disjoint: `out` does not overlap
+/// `x`.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn wukong_avgpool2d_f32_parallel(

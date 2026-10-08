@@ -266,6 +266,8 @@ unsafe fn cummm_parallel(x: *const f32, out: *mut f32, rows: usize, cols: usize,
 ///
 /// # Safety
 /// `x` and `out` must each be valid for `rows * cols` f32; they may be distinct or alias.
+/// **Aliasing: exactly in place, otherwise disjoint** — `out` may be EXACTLY `x` (each 8-lane block
+/// is loaded before it is stored); a SHIFTED view of `x` is not the source scan.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_cummax_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
     if rows <= 0 || cols <= 0 {
@@ -279,6 +281,8 @@ pub unsafe extern "C" fn wukong_cummax_f32(x: *const f32, out: *mut f32, rows: i
 ///
 /// # Safety
 /// `x` and `out` must each be valid for `rows * cols` f32; they may be distinct or alias.
+/// **Aliasing: exactly in place, otherwise disjoint** — `out` may be EXACTLY `x` (each 8-lane block
+/// is loaded before it is stored); a SHIFTED view of `x` is not the source scan.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_cummin_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
     if rows <= 0 || cols <= 0 {
@@ -296,6 +300,8 @@ pub unsafe extern "C" fn wukong_cummin_f32(x: *const f32, out: *mut f32, rows: i
 /// # Safety
 /// `x` and `out` must each be valid for `rows * cols` f32; non-overlapping rows (each row written by one
 /// task).
+/// **Aliasing: exactly in place, otherwise disjoint** — `out` may be EXACTLY `x` (each 8-lane block
+/// is loaded before it is stored); a SHIFTED view of `x` is not the source scan.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_cummax_f32_parallel(
     x: *const f32,
@@ -315,6 +321,8 @@ pub unsafe extern "C" fn wukong_cummax_f32_parallel(
 /// # Safety
 /// `x` and `out` must each be valid for `rows * cols` f32; non-overlapping rows (each row written by one
 /// task).
+/// **Aliasing: exactly in place, otherwise disjoint** — `out` may be EXACTLY `x` (each 8-lane block
+/// is loaded before it is stored); a SHIFTED view of `x` is not the source scan.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_cummin_f32_parallel(
     x: *const f32,

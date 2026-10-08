@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use wukong_diag::{Diagnostic, DiagnosticSink, Renderer};
 use wukong_span::{Interner, SourceMap};
 
+pub use wukong_codegen_cranelift::TargetCpu;
 pub use wukong_diag::{all_explanations, explain, Explanation};
 pub use wukong_sema::lints::{LintLevel, LintLevels, LINTS};
 
@@ -42,6 +43,12 @@ mod lang_bench;
 /// cycle-safe), resolves every name against its own file's module scope (`pub`, `as`, `{x, y}`),
 /// and splices the items into the root module under program-unique symbols.
 mod loader;
+
+/// Whole-program reachability pruning ahead of optimization (`--run`, `--emit=exe`).
+mod prune;
+
+/// `--time-passes` / `--time-trace` stage timing and `--depfile` dependency files.
+mod report;
 
 /// Which intermediate (or final) artifact the user asked to produce.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -122,6 +129,14 @@ pub struct Options {
     /// lint's default; `@allow/@warn/@deny` attributes in the source refine them per item. See
     /// `wukong_sema::lints`.
     pub lint_levels: LintLevels,
+    /// Print a per-stage compile-time breakdown — with per-optimizer-pass and codegen splits and a
+    /// MIR size summary — to stderr when the compile ends (`--time-passes`).
+    pub time_passes: bool,
+    /// Write the same timings as a Chrome trace-event JSON file (`--time-trace=<path>`).
+    pub time_trace: Option<PathBuf>,
+    /// Write a Make-syntax dependency file naming every source file the compile read, root and
+    /// imports (`--depfile=<path>`).
+    pub depfile: Option<PathBuf>,
     pub color: bool,
     pub error_format: ErrorFormat,
     /// Cap on how many error-severity diagnostics are printed before the rest are suppressed
@@ -132,6 +147,11 @@ pub struct Options {
     /// Which backend to run/emit with. `--run` defaults to the interpreter (the reference oracle);
     /// native object/exe emission always uses Cranelift.
     pub backend: BackendKind,
+    /// The instruction-set level native code is generated for (`--target-cpu`): `native` (the
+    /// host's full feature set, the default) or an x86-64 micro-architecture level. Governs
+    /// `--emit=obj|exe` and `--run --backend=native`; a level below x86-64-v3 also builds the MIR
+    /// without the raw-AVX2 vector recipes (see [`lower_options_for`]).
+    pub target_cpu: TargetCpu,
     /// Autodiff / training options (see [`GradOptions`]). Only consulted by `--emit=grad` and
     /// `--train`; inert for every other stage.
     pub grad: GradOptions,
@@ -139,6 +159,10 @@ pub struct Options {
     /// `--fp=fast`): `@strict_fp` on every function — no FMA contraction, no reassociated float
     /// reduction, no kernel recognizer. Threaded to [`wukong_mir_build::LowerOptions::strict_fp`].
     pub strict_fp: bool,
+    /// `--remarks=dispatch`: print a `note` at every statement (or function) the MIR builder
+    /// replaced with a recognized runtime kernel call, naming the kernel symbols. Pure observation —
+    /// the MIR, and therefore every artifact and run, is identical with it on or off.
+    pub remarks_dispatch: bool,
 }
 
 /// Options for the autodiff CLI surface: which loss function to differentiate, which of its buffer
@@ -200,12 +224,17 @@ impl Default for Options {
             opt_level: 0,
             verify_each: false,
             lint_levels: LintLevels::default(),
+            time_passes: false,
+            time_trace: None,
+            depfile: None,
             color: true,
             error_format: ErrorFormat::Human,
             error_limit: None,
             backend: BackendKind::Interp,
+            target_cpu: TargetCpu::Native,
             grad: GradOptions::default(),
             strict_fp: false,
+            remarks_dispatch: false,
         }
     }
 }
@@ -259,10 +288,21 @@ fn no_recognize() -> bool {
 /// The `WUKONG_P4_NO_256` kill-switch is untouched and still read inside `mir_build`; it remains the
 /// same-run A/B knob for measuring the 256-bit win on CPU, and the escape hatch if a recipe body is
 /// ever found miscompiled. This option is the *other* conjunct of the same gate.
+///
+/// The same conjunct carries `--target-cpu`: the recipes are AVX2+FMA machine code with no runtime
+/// dispatch, so a level below x86-64-v3 must not receive them — the program keeps the 128-bit CLIF
+/// strips, which are the documented result-identical form, and its object runs on that level.
 fn lower_options_for(opts: &Options) -> wukong_mir_build::LowerOptions {
     wukong_mir_build::LowerOptions {
+        // Only a gradient request (`--emit=grad`, `--train`, or the ahead-of-time export
+        // `--emit=obj --grad-of`) has an autodiff consumer for single-block float functions; every
+        // other compile gets the compact copy loops (see `LowerOptions::unroll_for_autodiff`).
+        unroll_for_autodiff: opts.emit == EmitStage::Grad
+            || opts.grad.train
+            || exports_gradient(opts),
         recognize: !no_recognize(),
-        vec_kernels: !matches!(opts.backend, BackendKind::GpuLower),
+        vec_kernels: !matches!(opts.backend, BackendKind::GpuLower)
+            && opts.target_cpu.allows_vec_kernels(),
         strict_fp: opts.strict_fp,
     }
 }
@@ -275,11 +315,14 @@ pub fn compile(opts: &Options) -> i32 {
     // so a taped program built without them meets buffer-writing loops it has no rule for. The
     // failure mode this prevents is the repo's standing rule for autodiff holes — a named refusal,
     // never a silently zero gradient.
-    if no_recognize() && (opts.grad.train || opts.emit == EmitStage::Grad) {
+    if no_recognize() && (opts.grad.train || opts.emit == EmitStage::Grad || exports_gradient(opts))
+    {
         let what = if opts.grad.train {
             "--train"
-        } else {
+        } else if opts.emit == EmitStage::Grad {
             "--emit=grad"
+        } else {
+            "--grad-of (with --emit=obj)"
         };
         eprintln!(
             "error: {what}: {NO_RECOGNIZE_ENV} is set, and autodiff is not supported with kernel \
@@ -305,6 +348,9 @@ pub fn compile(opts: &Options) -> i32 {
         return exit::COMPILE_ERROR;
     }
 
+    // Declared before every other local so it reports last, on every exit path (see `report`).
+    let mut timer = report::PassTimer::new(opts);
+    timer.begin("read");
     let src = match std::fs::read_to_string(&opts.input) {
         Ok(s) => s,
         Err(e) => {
@@ -322,6 +368,7 @@ pub fn compile(opts: &Options) -> i32 {
     let mut sink = DiagnosticSink::new();
 
     // --- Lexing ---
+    timer.begin("lex");
     let (tokens, lex_diags) = wukong_lexer::tokenize(sm.source(id), id);
     for d in lex_diags {
         sink.emit(d);
@@ -338,6 +385,7 @@ pub fn compile(opts: &Options) -> i32 {
     }
 
     // --- Parsing ---
+    timer.begin("parse");
     let mut interner = Interner::new();
     // The root file's parser lints (`W0030`/`W0031`) wait for the lint stage below, where every
     // lint's level is resolved together; imported files are parsed by the loader without them.
@@ -386,6 +434,7 @@ pub fn compile(opts: &Options) -> i32 {
     // one table of unique symbols. Lex/parse diagnostics from imported
     // files — and E0305 for an unresolvable import — land in the same sink and render with their
     // own file's path/line through the shared SourceMap.
+    timer.begin("imports");
     loader::load_imports(
         &mut module,
         &opts.input,
@@ -401,8 +450,17 @@ pub fn compile(opts: &Options) -> i32 {
         return exit::COMPILE_ERROR;
     }
     drop(sink);
+    // Every file the compile reads is in the SourceMap by now: the root and each import, once.
+    if let Some(depfile) = &opts.depfile {
+        let target = report::depfile_target(opts, depfile);
+        if let Err(e) = std::fs::write(depfile, report::depfile_contents(&target, &sm)) {
+            eprintln!("error: could not write `{}`: {e}", depfile.display());
+            return exit::IO_ERROR;
+        }
+    }
 
     // --- Semantic analysis (name resolution, type checking, shape checking) ---
+    timer.begin("sema");
     let (sema, sema_diags) = wukong_sema::check(&module, &interner);
     let sema_errors = emit_diags(&sema_diags, opts, &renderer, &sm);
     if sema_errors > 0 {
@@ -463,6 +521,7 @@ pub fn compile(opts: &Options) -> i32 {
     // Both switches that change *what the MIR contains* are values chosen by the pipeline, not
     // environment reads inside a recognizer; `lower_options_for` is where that choice lives and why
     // the requested backend is part of it.
+    timer.begin("lower");
     let lower_opts = lower_options_for(opts);
     // Runtime safety failures (an out-of-bounds slice index) report where they happened. The
     // location is rendered here, where the source map lives, and baked into `.rodata` by the
@@ -478,8 +537,18 @@ pub fn compile(opts: &Options) -> i32 {
         let loc = sm.span_location(span);
         format!("{}:{}:{}", sm.name(id), loc.line, loc.col)
     };
-    let (mut program, lower_diags) =
-        wukong_mir_build::lower_program_located(&module, &sema, &mut interner, lower_opts, &locate);
+    // `--remarks=dispatch` only adds `note` diagnostics; the Program is the same either way.
+    let (mut program, lower_diags) = if opts.remarks_dispatch {
+        wukong_mir_build::lower_program_reporting_dispatch_located(
+            &module,
+            &sema,
+            &mut interner,
+            lower_opts,
+            &locate,
+        )
+    } else {
+        wukong_mir_build::lower_program_located(&module, &sema, &mut interner, lower_opts, &locate)
+    };
     // MIR and train_lens own everything needed downstream. Release completed frontend
     // artifacts before optimization and codegen allocate their working sets.
     drop(module);
@@ -522,15 +591,32 @@ pub fn compile(opts: &Options) -> i32 {
         }
     };
 
+    // --- Reachability pruning ---
+    // A program with one known entry point compiles only what `main` can reach; an object file
+    // exports every function and the MIR dumps show the whole program, so both keep everything,
+    // as do the autodiff stages (their entry point is the loss function, not `main`).
+    // `--backend=gpu-native` also keeps everything: its whole-program PTX lowering declines a
+    // program on any unsupported function, and pruning would silently change which corpus programs
+    // the device suite attempts.
+    let single_entry = opts.run || opts.emit == EmitStage::Exe;
+    if single_entry && !opts.grad.train && opts.backend != BackendKind::GpuLower {
+        let main = interner.intern("main");
+        let pruned = prune::retain_reachable(&mut program, &[main]);
+        if pruned > 0 {
+            timer.note(|| format!("pruned {pruned} function(s) unreachable from `main`"));
+        }
+    }
+
     // --- Optimization ---
-    // The autodiff transform (`--emit=grad` / `--train`) consumes single-block SSA, so it forces at
-    // least `-O1` (mem2reg + simplify-cfg) regardless of the requested level. Every other path honors
-    // the requested level exactly.
-    let opt_level = if opts.emit == EmitStage::Grad || opts.grad.train {
+    // The autodiff transform (`--emit=grad` / `--train` / an exported gradient) consumes single-block
+    // SSA, so it forces at least `-O1` (mem2reg + simplify-cfg) regardless of the requested level.
+    // Every other path honors the requested level exactly.
+    let opt_level = if opts.emit == EmitStage::Grad || opts.grad.train || exports_gradient(opts) {
         opts.opt_level.max(1)
     } else {
         opts.opt_level
     };
+    timer.begin("optimize");
     if opts.verify_each {
         if let Err(failure) =
             wukong_opt::optimize_verified_preserving(&mut program, opt_level, &roots)
@@ -543,17 +629,32 @@ pub fn compile(opts: &Options) -> i32 {
             );
             return exit::COMPILE_ERROR;
         }
+    } else if timer.enabled() && roots.is_empty() {
+        // The timed optimizer runs the identical pipeline (byte-identical MIR) with a clock around
+        // each pass; with no extra roots it is exactly `optimize_preserving(.., &[])`.
+        let timings = wukong_opt::optimize_timed(&mut program, opt_level);
+        timer.optimizer_passes(&timings);
     } else {
         wukong_opt::optimize_preserving(&mut program, opt_level, &roots);
     }
+    timer.mir_summary(&program, &interner);
 
     // --- Autodiff CLI surface (additive; runs after optimization, before any backend) ---
     if opts.grad.train {
+        timer.begin("train");
         let lens = train_lens.expect("train_lens computed when --train is set");
         return run_train(&program, &mut interner, opts, &lens);
     }
     if opts.emit == EmitStage::Grad {
+        timer.begin("autodiff");
         return emit_grad(&program, &mut interner, opts);
+    }
+    if exports_gradient(opts) {
+        timer.begin("autodiff");
+        if let Err(e) = append_gradient(&mut program, &mut interner, opts) {
+            eprintln!("error: --emit=obj --grad-of: {e}");
+            return exit::COMPILE_ERROR;
+        }
     }
 
     // --- Run via the selected backend (interpreter by default, Cranelift JIT with --backend=native) ---
@@ -563,6 +664,7 @@ pub fn compile(opts: &Options) -> i32 {
         // the backend unchecked — and the native -O0 JIT codegens it into a SIGSEGV rather than the
         // clean ICE that `--emit=mir` and the optimizer already report. Verifying here makes a
         // lowering bug a diagnosable internal-compiler-error instead of a crash or miscompile.
+        timer.begin("verify");
         if verify_or_ice(&program) {
             return exit::COMPILE_ERROR;
         }
@@ -585,6 +687,11 @@ pub fn compile(opts: &Options) -> i32 {
             }
         }
         let main = interner.intern("main");
+        timer.begin(if opts.backend == BackendKind::Native {
+            "jit-compile"
+        } else {
+            "run"
+        });
         // The CPU paths report what the program printed *before* a runtime failure (a failed
         // `assert`, a slice index out of bounds) along with the failure, so `--run` shows the same
         // stdout a linked executable does — the output is printed, then `error: …`, exit 1.
@@ -594,8 +701,34 @@ pub fn compile(opts: &Options) -> i32 {
         };
         let (result, stdout) = match opts.backend {
             BackendKind::Interp => wukong_interp::run_capturing(&program, main, &interner),
+            // Compile and run are separate steps so a *compile* failure is rendered as a
+            // catalogued diagnostic (honouring `--error-format=json`), while a *run-time* failure
+            // (an assertion, a bounds check) keeps the `error: <message>` form below, after the
+            // output printed before it. The JIT honours both `--target-cpu` and the source `-O`
+            // level (`-O0` = Cranelift `opt_level=none`).
             BackendKind::Native => {
-                wukong_codegen_cranelift::jit_run_capturing(&program, main, &interner)
+                let backend = wukong_codegen_cranelift::BackendOpt::for_level(opt_level);
+                match wukong_codegen_cranelift::jit_compile_for_with(
+                    &program,
+                    main,
+                    &interner,
+                    opts.target_cpu,
+                    backend,
+                ) {
+                    Ok(compiled) => {
+                        timer.begin("run");
+                        compiled.run_capturing()
+                    }
+                    Err(message) => {
+                        emit_diag(
+                            &native_failure_diag(&message, &opts.input),
+                            opts.error_format,
+                            &renderer,
+                            &SourceMap::new(),
+                        );
+                        return exit::COMPILE_ERROR;
+                    }
+                }
             }
             BackendKind::Gpu => split(run_on_gpu(&program, main, &interner)),
             BackendKind::GpuLower => split(run_on_gpu_lower(&program, main, &interner)),
@@ -616,6 +749,7 @@ pub fn compile(opts: &Options) -> i32 {
     }
 
     if opts.emit == EmitStage::Mir {
+        timer.begin("emit-mir");
         // A verifier failure means we just printed an internal-compiler-error; never report success.
         return if emit_mir(&program, &interner) {
             exit::COMPILE_ERROR
@@ -631,6 +765,7 @@ pub fn compile(opts: &Options) -> i32 {
     // silently miscompiled artifact instead of a diagnosable ICE. (`--emit=mir`/`mir-high` are
     // deliberately *not* gated here: they verify inside `emit_mir` after dumping, so a broken program
     // still prints the MIR that shows why.)
+    timer.begin("verify");
     if matches!(
         opts.emit,
         EmitStage::LlvmIr | EmitStage::Obj | EmitStage::Exe
@@ -641,6 +776,7 @@ pub fn compile(opts: &Options) -> i32 {
 
     // --- LLVM backend ---
     if opts.emit == EmitStage::LlvmIr {
+        timer.begin("llvm-ir");
         return match wukong_codegen_llvm::try_emit_llvm_ir(&program, &interner) {
             Ok(ir) => {
                 print_artifact(&ir);
@@ -659,7 +795,7 @@ pub fn compile(opts: &Options) -> i32 {
         };
     }
     if matches!(opts.emit, EmitStage::Obj | EmitStage::Exe) {
-        return emit_native(&program, &interner, opts);
+        return emit_native(&program, &interner, opts, &mut timer);
     }
 
     exit::OK
@@ -730,57 +866,177 @@ fn run_on_gpu_lower(
 
 /// The C runtime linked into native executables by the **`cc` fallback** path: it backs the
 /// `print`/`assert`/`fmod` and heap intrinsics that the Cranelift object leaves as undefined imports.
-/// The JIT path binds those same symbols to Rust functions instead. It is deliberately *not* a full
-/// mirror: string printing and runtime kernels are not provided. Float printing is rejected by
-/// [`cc_float_print_requirement`] before linking because C's `%g` does not match Rust `Display`.
-/// The float symbol remains as a fatal guard for COFF objects that declare even unused imports;
-/// it must never print an approximation. [`WUKONG_RT_SHIM`] provides the full print implementation.
-const WUKONG_RT_C: &str = "#include <stdio.h>\n\
-#include <stdlib.h>\n\
-#include <stdint.h>\n\
-#include <math.h>\n\
-#ifdef _WIN32\n\
-#include <io.h>\n\
-#include <fcntl.h>\n\
-/* Keep stdout in binary mode so the MSVCRT does not translate the runtime's `\\n` into CRLF. The\n\
-   interpreter oracle (and the JIT) emit LF; without this the *linked exe* printed CRLF on Windows,\n\
-   so its stdout differed from every other backend. Runs before main via the constructor attribute. */\n\
-__attribute__((constructor)) static void wukong_rt_init(void) { _setmode(_fileno(stdout), _O_BINARY); }\n\
-#endif\n\
-void wukong_rt_print_i64(long long x) { printf(\"%lld\\n\", x); }\n\
-void wukong_rt_print_u64(unsigned long long x) { printf(\"%llu\\n\", x); }\n\
-void wukong_rt_print_f64(double x) {\n\
-    (void)x;\n\
-    fputs(\"error: floating-point printing requires the Rust runtime link; C fallback cannot preserve output\\n\", stderr);\n\
-    exit(2);\n\
-}\n\
-void wukong_rt_assert(long long c) { if (!c) { fprintf(stderr, \"assertion failed\\n\"); exit(1); } }\n\
-long long wukong_rt_assert_failed(void) { return 0; }\n\
-/* A failed slice bounds check. Mirrors `wukong_runtime::bounds_failure_message` byte for byte, and\n\
-   exits with the status `wukongc --run` reports for a runtime failure. */\n\
-void wukong_rt_bounds_fail(long long index, long long len, const char* site) {\n\
-    fflush(stdout);\n\
-    if (site && site[0]) fprintf(stderr, \"error: index out of bounds: the len is %lld but the index is %lld at %s\\n\", len, index, site);\n\
-    else fprintf(stderr, \"error: index out of bounds: the len is %lld but the index is %lld\\n\", len, index);\n\
-    exit(1);\n\
-}\n\
-double wukong_rt_fmod_f64(double a, double b) { return fmod(a, b); }\n\
-float wukong_rt_fmod_f32(float a, float b) { return fmodf(a, b); }\n\
-/* Heap builtins (alloc_<T>/free). calloc zero-initializes — the determinism contract. The block\n\
-   is over-allocated so the data pointer sits on a 64-byte boundary, the runtime's `HEAP_ALIGN`,\n\
-   with the block's own address stored just below it for free. An empty or overflowing request is\n\
-   null, as in the runtime. */\n\
-void* wukong_rt_alloc(long long count, long long elem_size, long long elem_is_float) {\n\
-    (void)elem_is_float;\n\
-    if (count <= 0 || elem_size <= 0) return 0;\n\
-    if ((unsigned long long)count > ((size_t)-1 - 128) / (unsigned long long)elem_size) return 0;\n\
-    char* raw = (char*)calloc(1, (size_t)count * (size_t)elem_size + 64 + sizeof(void*));\n\
-    if (!raw) return 0;\n\
-    char* data = (char*)(((uintptr_t)raw + sizeof(void*) + 63) & ~(uintptr_t)63);\n\
-    ((void**)data)[-1] = raw;\n\
-    return data;\n\
-}\n\
-void wukong_rt_free(void* p) { if (p) free(((void**)p)[-1]); }\n";
+/// The JIT path binds those same symbols to Rust functions, and the preferred rustc link to
+/// [`WUKONG_RT_SHIM`]; all three must print **byte-identical** output.
+///
+/// That includes floats. The oracle prints an `f64` with Rust's `Display`: the shortest decimal
+/// digit string that round-trips (the closest one when several do), written positionally — never in
+/// exponent form — with `inf`, `-inf`, `NaN` and `-0` spelled out. C has no such conversion
+/// (`%g` keeps six significant digits), so `wukong_rt_print_f64` derives it: for each precision `p`
+/// from 1 to 17 it takes the correctly rounded `p`-digit `%e` string and accepts it if `strtod`
+/// round-trips it to `x`, and otherwise tries the two adjacent `p`-digit decimals (a double at a
+/// power-of-two boundary has a lopsided rounding interval, so the nearest `p`-digit decimal can fall
+/// outside it while its neighbour lands inside). The first hit is the shortest round-tripping
+/// string, and among those the closest, which is exactly what Rust prints; the digits are then laid
+/// out positionally. `__USE_MINGW_ANSI_STDIO` selects MinGW's correctly rounded printf family; glibc,
+/// the UCRT and macOS libc are correctly rounded already.
+///
+/// The fallback still provides no `wukong_*` runtime kernels (a program that calls one fails to link,
+/// loudly), and on a Windows host the MinGW linker cannot consume an MSVC object's data relocations.
+///
+/// It also carries the slice bounds-failure report (`wukong_rt_bounds_fail`, byte-identical to
+/// `wukong_runtime::bounds_failure_message`) and the runtime's 64-byte heap alignment
+/// (`HEAP_ALIGN`), so a linked executable fails and aligns exactly as `--run` does.
+const WUKONG_RT_C: &str = r#"#define __USE_MINGW_ANSI_STDIO 1
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <math.h>
+#ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
+/* Keep stdout in binary mode so the MSVCRT does not translate the runtime's `\n` into CRLF. The
+   interpreter oracle (and the JIT) emit LF; without this the *linked exe* printed CRLF on Windows,
+   so its stdout differed from every other backend. Runs before main via the constructor attribute. */
+__attribute__((constructor)) static void wukong_rt_init(void) { _setmode(_fileno(stdout), _O_BINARY); }
+#endif
+void wukong_rt_print_i64(long long x) { printf("%lld\n", x); }
+void wukong_rt_print_u64(unsigned long long x) { printf("%llu\n", x); }
+/* Split a "d.ddde+XX" string into its digit characters and decimal exponent. */
+static int wk_parse_sci(const char *s, char *digits, int *n, int *dexp) {
+    int k = 0;
+    for (; *s && *s != 'e' && *s != 'E'; s++) {
+        if (*s >= '0' && *s <= '9') {
+            if (k >= 24) return 0;
+            digits[k++] = *s;
+        }
+    }
+    if (*s != 'e' && *s != 'E') return 0;
+    *dexp = atoi(s + 1);
+    *n = k;
+    return k > 0;
+}
+/* Does digits * 10^dexp (one digit before the point) parse back to exactly x? */
+static int wk_round_trips(const char *digits, int n, int dexp, double x) {
+    char buf[64];
+    int k = 0;
+    buf[k++] = digits[0];
+    if (n > 1) {
+        buf[k++] = '.';
+        memcpy(buf + k, digits + 1, (size_t)(n - 1));
+        k += n - 1;
+    }
+    snprintf(buf + k, sizeof buf - (size_t)k, "e%d", dexp);
+    return strtod(buf, NULL) == x;
+}
+/* Step digits * 10^dexp to the adjacent n-digit decimal above (up) or below it. */
+static void wk_step(char *d, int n, int *dexp, int up) {
+    int i = n - 1, j, is_pow10 = 1;
+    if (up) {
+        while (i >= 0 && d[i] == '9') { d[i] = '0'; i--; }
+        if (i < 0) { d[0] = '1'; *dexp += 1; } else { d[i]++; }
+        return;
+    }
+    if (d[0] != '1') is_pow10 = 0;
+    for (j = 1; j < n && is_pow10; j++) if (d[j] != '0') is_pow10 = 0;
+    if (is_pow10) {
+        /* 10^e steps down onto the finer grid of the decade below: 99..9 * 10^(e-1). */
+        for (j = 0; j < n; j++) d[j] = '9';
+        *dexp -= 1;
+        return;
+    }
+    while (d[i] == '0') { d[i] = '9'; i--; }
+    d[i]--;
+}
+/* Rust's `Display` for f64 (see the driver's WUKONG_RT_C docs). */
+void wukong_rt_print_f64(double x) {
+    char out[400];
+    char d[24], c[24];
+    int k = 0, n = 0, e = 0, ce, p, up, found = 0, point, z;
+    if (x != x) { fputs("NaN\n", stdout); return; }
+    if (signbit(x)) { out[k++] = '-'; x = -x; }
+    if (isinf(x)) {
+        memcpy(out + k, "inf", 3);
+        k += 3;
+    } else if (x == 0.0) {
+        out[k++] = '0';
+    } else {
+        for (p = 1; p <= 17 && !found; p++) {
+            char s[64];
+            snprintf(s, sizeof s, "%.*e", p - 1, x);
+            if (!wk_parse_sci(s, d, &n, &e)) continue;
+            if (wk_round_trips(d, n, e, x)) { found = 1; break; }
+            for (up = 1; up >= 0 && !found; up--) {
+                memcpy(c, d, (size_t)n);
+                ce = e;
+                wk_step(c, n, &ce, up);
+                if (wk_round_trips(c, n, ce, x)) { memcpy(d, c, (size_t)n); e = ce; found = 1; }
+            }
+        }
+        if (!found) {
+            /* Unreachable with a correctly rounded printf: 17 digits always round-trip. */
+            char s[64];
+            snprintf(s, sizeof s, "%.16e", x);
+            if (!wk_parse_sci(s, d, &n, &e)) { d[0] = '0'; n = 1; e = 0; }
+        }
+        while (n > 1 && d[n - 1] == '0') n--;
+        point = e + 1; /* the value is 0.d1d2...dn * 10^point */
+        if (point <= 0) {
+            out[k++] = '0';
+            out[k++] = '.';
+            for (z = 0; z < -point; z++) out[k++] = '0';
+            memcpy(out + k, d, (size_t)n);
+            k += n;
+        } else if (point >= n) {
+            memcpy(out + k, d, (size_t)n);
+            k += n;
+            for (z = 0; z < point - n; z++) out[k++] = '0';
+        } else {
+            memcpy(out + k, d, (size_t)point);
+            k += point;
+            out[k++] = '.';
+            memcpy(out + k, d + point, (size_t)(n - point));
+            k += n - point;
+        }
+    }
+    out[k++] = '\n';
+    fwrite(out, 1, (size_t)k, stdout);
+}
+/* A NUL-terminated string buffer plus a newline; a null pointer prints nothing (as the Rust shim). */
+void wukong_rt_print_str(const char *s) {
+    if (!s) return;
+    fputs(s, stdout);
+    fputc('\n', stdout);
+}
+void wukong_rt_assert(long long c) { if (!c) { fprintf(stderr, "assertion failed\n"); exit(1); } }
+long long wukong_rt_assert_failed(void) { return 0; }
+/* A failed slice bounds check. Mirrors `wukong_runtime::bounds_failure_message` byte for byte, and
+   exits with the status `wukongc --run` reports for a runtime failure. */
+void wukong_rt_bounds_fail(long long index, long long len, const char* site) {
+    fflush(stdout);
+    if (site && site[0]) fprintf(stderr, "error: index out of bounds: the len is %lld but the index is %lld at %s\n", len, index, site);
+    else fprintf(stderr, "error: index out of bounds: the len is %lld but the index is %lld\n", len, index);
+    exit(1);
+}
+double wukong_rt_fmod_f64(double a, double b) { return fmod(a, b); }
+float wukong_rt_fmod_f32(float a, float b) { return fmodf(a, b); }
+/* Heap builtins (alloc_<T>/free). calloc zero-initializes — the determinism contract. The block
+   is over-allocated so the data pointer sits on a 64-byte boundary, the runtime's `HEAP_ALIGN`,
+   with the block's own address stored just below it for free. An empty or overflowing request is
+   null, as in the runtime. */
+void* wukong_rt_alloc(long long count, long long elem_size, long long elem_is_float) {
+    (void)elem_is_float;
+    if (count <= 0 || elem_size <= 0) return 0;
+    if ((unsigned long long)count > ((size_t)-1 - 128) / (unsigned long long)elem_size) return 0;
+    char* raw = (char*)calloc(1, (size_t)count * (size_t)elem_size + 64 + sizeof(void*));
+    if (!raw) return 0;
+    char* data = (char*)(((uintptr_t)raw + sizeof(void*) + 63) & ~(uintptr_t)63);
+    ((void**)data)[-1] = raw;
+    return data;
+}
+void wukong_rt_free(void* p) { if (p) free(((void**)p)[-1]); }
+"#;
 
 /// The `cc` fallback's scratch allocator (`scratch_<T>` / `scratch_mark` / `scratch_release`), a C
 /// mirror of `wukong_runtime::scratch`: zeroed 64-byte-aligned bump allocations in chunks that never
@@ -1036,11 +1292,37 @@ fn object_path(
 /// back. If the `cc` fallback cannot even be spawned, the object is copied out of the scratch
 /// directory to `<stem>.o` so that it survives, and the driver reports whichever path is actually
 /// there - that copy is best effort - and exits [`exit::UNIMPLEMENTED`] (2).
-fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Options) -> i32 {
-    let obj = match wukong_codegen_cranelift::emit_object(program, interner) {
+fn emit_native(
+    program: &wukong_mir::Program,
+    interner: &Interner,
+    opts: &Options,
+    timer: &mut report::PassTimer,
+) -> i32 {
+    timer.begin("codegen");
+    let backend = wukong_codegen_cranelift::BackendOpt::for_level(opts.opt_level);
+    let emitted = if timer.enabled() {
+        wukong_codegen_cranelift::emit_object_timed_for_with(
+            program,
+            interner,
+            opts.target_cpu,
+            backend,
+        )
+        .map(|(bytes, split)| {
+            timer.object_split(&split);
+            bytes
+        })
+    } else {
+        wukong_codegen_cranelift::emit_object_for_with(program, interner, opts.target_cpu, backend)
+    };
+    let obj = match emitted {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("error: cranelift codegen failed: {e}");
+            emit_diag(
+                &native_failure_diag(&e, &opts.input),
+                opts.error_format,
+                &Renderer::new(opts.color),
+                &SourceMap::new(),
+            );
             return exit::COMPILE_ERROR;
         }
     };
@@ -1086,6 +1368,7 @@ fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Option
     // `cc` path below can neither (it crashes on the MSVC object's data relocations and can't consume
     // the Rust runtime staticlib). Output is bit-identical to `--run`. Falls back to `cc` only when
     // rustc or the runtime rlib is unavailable (a scalar, no-data, no-kernel program still links).
+    timer.begin("link");
     match rustc_link(scratch.as_ref(), &stem, &obj_path, &out) {
         LinkOutcome::Linked => {
             eprintln!("wrote {}", out.display());
@@ -1098,58 +1381,40 @@ fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Option
         LinkOutcome::Unavailable => { /* fall through to the C-runtime `cc` link */ }
     }
 
-    cc_link(
-        program,
-        interner,
-        opts,
-        scratch.as_ref(),
-        &stem,
-        &obj_path,
-        &out,
-    )
+    cc_link(opts, scratch.as_ref(), &stem, &obj_path, &out)
 }
 
-/// Identify float-print intrinsics in the emitted MIR, including calls in helper functions.
-/// Match Cranelift's call resolution: a program-defined function wins over an intrinsic with the
-/// same name. Check the actual first argument type, including f16/bf16's f32 promotion, rather than
-/// banning floating-point computation or guessing which constants C could print faithfully.
-fn cc_float_print_requirement(
-    program: &wukong_mir::Program,
-    interner: &Interner,
-) -> Option<String> {
-    for function in &program.funcs {
-        for block in &function.blocks {
-            for inst in &block.insts {
-                let wukong_mir::Op::Call { func, args } = &inst.op else {
-                    continue;
-                };
-                if !matches!(interner.resolve(*func), "print" | "println")
-                    || program.function(*func).is_some()
-                {
-                    continue;
-                }
-                if let Some(&arg) = args.first() {
-                    let ty = function.value_type(arg);
-                    if ty.is_float() {
-                        return Some(format!(
-                            "{}({}) in `{}`",
-                            interner.resolve(*func),
-                            ty.display(),
-                            interner.resolve(function.name)
-                        ));
-                    }
-                }
-            }
+/// A native-backend (Cranelift) failure as a diagnostic, so it reaches `--error-format=json` and
+/// `--explain` like every front-end error instead of escaping as a bare `error:` line. MIR carries no
+/// source spans, so the diagnostic names the program and — for a layout failure — the offending type
+/// and the function that declares it (the backend puts both in the message).
+fn native_failure_diag(message: &str, input: &Path) -> Diagnostic {
+    use wukong_codegen_cranelift::NativeErrorKind;
+    let program = format!(
+        "while compiling `{}` for the native backend",
+        input.display()
+    );
+    match wukong_codegen_cranelift::classify_error(message) {
+        NativeErrorKind::LayoutTooLarge => Diagnostic::error(message)
+            .with_code("C0002")
+            .note(program)
+            .help(
+                "allocate the buffer on the heap (`alloc_f32(n)` and its siblings) or split it; \
+                 `--run` (the interpreter) has no byte-layout limit",
+            ),
+        NativeErrorKind::Unsupported => Diagnostic::error(message).with_code("C0001").note(program),
+        NativeErrorKind::Internal => {
+            Diagnostic::bug(format!("native code generation failed: {message}")).note(program)
         }
     }
-    None
 }
 
-/// Called only after the preferred Rust link is unavailable. Keep the capability check inside
-/// this boundary so a forced C-path test exercises the same refusal as native executable emission.
+/// Called only after the preferred Rust link is unavailable: link the object against the generated
+/// C runtime ([`WUKONG_RT_C`]), whose printing is byte-identical to the oracle's (floats included),
+/// so the fallback produces the same output as `--run` for every program it can link. What it
+/// cannot provide — the `wukong_*` runtime kernels — is a link error, never a different answer; the
+/// note below says which link path is being taken so that error is legible.
 fn cc_link(
-    program: &wukong_mir::Program,
-    interner: &Interner,
     opts: &Options,
     scratch: Option<&ScratchDir>,
     stem: &str,
@@ -1157,15 +1422,6 @@ fn cc_link(
     out: &Path,
 ) -> i32 {
     use std::process::Command;
-
-    if let Some(requirement) = cc_float_print_requirement(program, interner) {
-        eprint_line(&format!(
-            "error: C fallback cannot preserve floating-point print output: {requirement}.\n\
-             help: restore rustc and a compatible wukong_runtime rlib beside wukongc (or in deps/), \
-             or use --run; --emit=obj remains available."
-        ));
-        return exit::UNIMPLEMENTED;
-    }
 
     // exe (fallback): emit the C runtime into the scratch dir and link it with the system C compiler.
     let rt_path = scratch_path(scratch, format!("{stem}_rt.c"));
@@ -1177,6 +1433,10 @@ fn cc_link(
         return exit::IO_ERROR;
     }
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    eprint_line(&format!(
+        "note: no usable `rustc` + `wukong_runtime` rlib beside wukongc; linking with `{cc}` and the \
+         C runtime, which has no `wukong_*` kernels (a program that calls one will not link)"
+    ));
     let status = Command::new(&cc)
         .args(cc_link_args(obj_path, &rt_path, out))
         .status();
@@ -1264,7 +1524,7 @@ enum LinkOutcome {
 /// The Rust link shim generated for the rustc-driven `--emit=exe` link. It provides the `wukong_rt_*`
 /// runtime the Cranelift object calls (formatting through Rust's stdout, so output is byte-identical
 /// to the interpreter/JIT oracle — raw LF on Windows, and floats via `Display` like the interp's
-/// `format!("{f}")`; the C fallback explicitly rejects float printing), and `extern crate
+/// `format!("{f}")`; the C fallback reproduces that formatting in C), and `extern crate
 /// wukong_runtime` pulls the AVX2 microkernels into the link so a recognized-kernel program resolves
 /// its `wukong_*` symbols. `#![no_main]` leaves the Cranelift object's own `main` as the CRT entry.
 const WUKONG_RT_SHIM: &str = r##"#![no_main]
@@ -1336,8 +1596,8 @@ pub extern "C" fn wukong_rt_fmod_f32(a: f32, b: f32) -> f32 {
 /// `wukong_runtime` a dependency rather than a selected member. A tree that has the uplifted copy
 /// has it as a *leftover* of some earlier `cargo build`, which is why this looked fine locally and
 /// broke on every clean checkout: CI runs `cargo test --workspace`, never `cargo build`, so the
-/// preferred link path degraded to the `cc` fallback with reduced capabilities: no
-/// `wukong_rt_print_str` or `wukong_*` kernels, and float printing now explicitly refused.
+/// preferred link path degraded to the `cc` fallback with reduced capabilities: no `wukong_*`
+/// kernels, so every recognized-kernel program failed to link.
 /// Searching `deps/` too makes the preferred path available whenever cargo
 /// built the runtime at all, however the compiler was built.
 ///
@@ -1759,7 +2019,7 @@ fn autodiff_roots(
     interner: &mut Interner,
     opts: &Options,
 ) -> Result<Vec<wukong_span::Symbol>, String> {
-    if opts.emit != EmitStage::Grad && !opts.grad.train {
+    if opts.emit != EmitStage::Grad && !opts.grad.train && !exports_gradient(opts) {
         return Ok(Vec::new());
     }
     let name = opts.grad.of.as_deref().unwrap_or("loss");
@@ -1768,6 +2028,34 @@ fn autodiff_roots(
         return Err(missing_grad_target(name));
     }
     Ok(vec![symbol])
+}
+
+/// Whether this invocation exports a gradient ahead of time: `--emit=obj` with an explicit
+/// `--grad-of=<fn>`.
+fn exports_gradient(opts: &Options) -> bool {
+    opts.emit == EmitStage::Obj && opts.grad.of.is_some() && !opts.grad.train
+}
+
+/// `--emit=obj --grad-of=<fn>`: the ahead-of-time gradient. Appends the generated `<fn>_grad` to the
+/// program so the object exports the backward next to the forward — C ABI: the loss's parameters,
+/// then one caller-zeroed gradient buffer per `--grad-wrt` entry, gradients accumulated into them —
+/// for a host training loop (or any C/C++/Rust caller) to link against, with no compiler at run
+/// time. The forward it differentiates is the call-flattened one (`wukong_autodiff::inline_calls`),
+/// so the exported backward calls no helper the object might not define.
+fn append_gradient(
+    program: &mut wukong_mir::Program,
+    interner: &mut Interner,
+    opts: &Options,
+) -> Result<(), String> {
+    let (_, gradfn) = build_grad(program, interner, opts)?;
+    if program.function(gradfn.name).is_some() {
+        return Err(format!(
+            "the program already defines `{}`; rename it or differentiate another function",
+            interner.resolve(gradfn.name)
+        ));
+    }
+    program.funcs.push(gradfn);
+    Ok(())
 }
 
 fn missing_grad_target(name: &str) -> String {
@@ -1790,7 +2078,12 @@ fn build_grad(
         .function(sym)
         .ok_or_else(|| missing_grad_target(&name))?;
     let wrt = grad_wrt(func, &opts.grad.wrt, opts.grad.train)?;
-    let gradfn = wukong_autodiff::grad(func, &wrt, interner)?;
+    // Splice straight-line helper functions into the loss first, so a loss written as composed
+    // functions differentiates at every -O level (not only where -O2's inliner happened to fire).
+    // The flattened forward is the one returned and run, so `--train` never calls a helper the
+    // training program does not contain.
+    let func = wukong_autodiff::inline_calls(program, func);
+    let gradfn = wukong_autodiff::grad(&func, &wrt, interner)?;
     // Autodiff synthesizes MIR after optimization, so its output needs a verifier boundary even
     // without --verify-each. Keep every callee definition available for signature checks before
     // this function can hand generated MIR to emission or training.
@@ -1826,7 +2119,7 @@ fn build_grad(
     // that complete context at the output boundary, even when per-pass verification is disabled.
     wukong_opt::verify_program_stage(&checked, "autodiff optimization")
         .map_err(|failure| failure.to_string())?;
-    Ok((func.clone(), gradfn))
+    Ok((func, gradfn))
 }
 
 /// The parameter indices to differentiate w.r.t.: the explicit `--grad-wrt` list (validated to be
@@ -2418,6 +2711,33 @@ mod lower_options_tests {
         );
     }
 
+    /// `--target-cpu` below x86-64-v3 must never receive the raw AVX2+FMA recipes: they are
+    /// installed into the object verbatim, with no runtime dispatch, and would `#UD` on exactly the
+    /// machines the level names.
+    #[test]
+    fn target_cpu_below_v3_clears_the_vec_kernel_recipes() {
+        for (target, allowed) in [
+            (TargetCpu::Native, true),
+            (TargetCpu::X86_64, false),
+            (TargetCpu::X86_64V2, false),
+            (TargetCpu::X86_64V3, true),
+            (TargetCpu::X86_64V4, true),
+        ] {
+            for backend in [BackendKind::Interp, BackendKind::Native] {
+                let opts = Options {
+                    backend,
+                    target_cpu: target,
+                    ..Options::default()
+                };
+                assert_eq!(
+                    lower_options_for(&opts).vec_kernels,
+                    allowed,
+                    "{target:?} / {backend:?}"
+                );
+            }
+        }
+    }
+
     /// The property the option exists for, asserted on real MIR rather than on the flag: an
     /// unrecognized `@generic` f32 elementwise loop - the shape `tests/run/lang_generic_copy.wk`
     /// pins - lowers with **no** `VecKernelCall` when the target is gpu-native.
@@ -2954,6 +3274,22 @@ mod grad_cli_tests {
 
     // --- Activation backward: a `matmul → act → sum` model, act backward riding wukong_vmath2_f32. ---
 
+    /// The number of GEMM adjoint calls in printed gradient MIR. The forward GEMMs here are all the
+    /// `nn.Linear` spelling (`wukong_sgemm_nt*`), so every plain `wukong_sgemm*` and weight-gradient
+    /// `wukong_sgemm_tn*` call — serial, or `@parallel` when the forward was — is an adjoint: `dX`
+    /// rides the NN GEMM, `dW` the TN GEMM (no synthesized transpose).
+    fn gemm_adjoints(mir: &str) -> usize {
+        [
+            "wukong_sgemm(",
+            "wukong_sgemm_parallel(",
+            "wukong_sgemm_tn(",
+            "wukong_sgemm_tn_parallel(",
+        ]
+        .iter()
+        .map(|name| mir.matches(name).count())
+        .sum()
+    }
+
     /// The printed MIR of `{loss, loss_grad}` for the given source, so a test can assert the emitted
     /// backward rides a particular runtime kernel (the recognized backward is otherwise gate-blind).
     fn grad_mir(src: &str, of: &str, wrt: &[usize]) -> String {
@@ -2996,8 +3332,8 @@ mod grad_cli_tests {
                 "{act}: backward does not ride wukong_vmath2_f32\n{mir}"
             );
             assert!(
-                mir.contains("wukong_sgemm("),
-                "{act}: matmul backward does not ride wukong_sgemm\n{mir}"
+                gemm_adjoints(&mir) > 0,
+                "{act}: matmul backward does not ride the tuned GEMM\n{mir}"
             );
             // Data kept modest so the activations stay in a well-conditioned range for the difference.
             let mut seed = 0xE1F5u64 ^ (act.as_bytes()[0] as u64);
@@ -3194,7 +3530,7 @@ mod grad_cli_tests {
             "silu backward missing\n{mir}"
         );
         assert_eq!(
-            mir.matches("wukong_sgemm(").count(),
+            gemm_adjoints(&mir),
             3,
             "expected 3 GEMM adjoints (dW2, dA, dW1)\n{mir}"
         );
@@ -3312,6 +3648,9 @@ mod assertion_link_tests;
 
 #[cfg(test)]
 mod generated_verify_tests;
+
+#[cfg(test)]
+mod grad_model_tests;
 
 #[cfg(test)]
 mod cc_print_tests;

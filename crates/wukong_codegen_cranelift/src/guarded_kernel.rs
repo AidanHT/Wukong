@@ -18,7 +18,15 @@ pub fn jit_compile_buffer_kernel(
         return Err(format!("invalid buffer dispatcher MIR: {errors:?}"));
     }
     Ok(JitBufferKernel {
-        program: jit_compile_entry(program, entry, interner, true)?,
+        program: jit_compile_entry(
+            program,
+            entry,
+            interner,
+            true,
+            TargetCpu::Native,
+            BackendOpt::default(),
+            default_parallel(),
+        )?,
     })
 }
 

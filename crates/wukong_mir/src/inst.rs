@@ -57,8 +57,13 @@ impl BinOp {
     }
 }
 
-/// A comparison predicate (integer signed/unsigned, or ordered float). The result of a scalar compare
-/// is `i1`; of a vector compare, a lane mask of the same width as the operands (`Vec(_, n)`).
+/// A comparison predicate (integer signed/unsigned, or float). The result of a scalar compare is
+/// `i1`; of a vector compare, a lane mask of the same width as the operands (`Vec(_, n)`).
+///
+/// The float predicates are **ordered** (false when either operand is NaN) except `Fone`, which is
+/// the source language's `!=` and is **unordered** — true when either operand is NaN, i.e. Rust's
+/// `f64::ne`, Cranelift's `FloatCC::NotEqual` and LLVM's `fcmp une`. The interpreter defines it that
+/// way and every backend must match (float truthiness `x != 0.0` depends on it: NaN is truthy).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CmpOp {
     Eq,

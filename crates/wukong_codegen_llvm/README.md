@@ -25,10 +25,16 @@ MIR (post-opt)
 - **`LlvmBackend`** — implements the `wukong_backend::Backend` seam, but the live dispatch path is
   `try_emit_llvm_ir`, not `Backend::compile`.
 
-External calls carry declarations inferred from their MIR signatures. Conflicting signatures for
-one symbol are rejected because a faithful ABI adapter is not yet implemented. Declarations do
-not supply runtime definitions: print shims and synthesized vector kernels still need external
-implementations before linking. The module leaves target selection to its LLVM consumer.
+The module implements the interpreter's semantics: `f16`/`bf16` values compute in `float`
+registers and round onto their grid only at constants, casts, loads and stores; booleans are bytes
+in memory; float `!=` is `fcmp une`; integer division and shifts carry the oracle's guards.
+
+`print`/`assert` lower to the `wukong_rt_*` ABI the Cranelift object calls, `wukong_*` kernels are
+called with the runtime's C ABI (integers widened to `i64`, a literal-zero optional pointer as
+`ptr null`), and the general vectorizer's kernels are **defined** in the module from their recipe
+(`src/vec_kernels.rs`), so a module references only symbols the `--emit=exe` runtime provides.
+Conflicting signatures for one foreign symbol are rejected because a faithful ABI adapter is not
+implemented. The module names the host `target triple` and leaves the datalayout to its consumer.
 
 Regression coverage includes exact float encodings, vector negation/complement, identity casts,
 math intrinsic results, duplicate-edge phis, integer shift/division guards, and external ABI
@@ -37,9 +43,8 @@ diagnostics. To export the narrow test modules for an independent LLVM verifier,
 `cargo test -p wukong_codegen_llvm --lib closeout_tests::`.
 
 Floating-to-integer conversions use LLVM's saturating intrinsics (NaN becomes zero and
-out-of-range values clamp), and f32/f64 FMA uses `llvm.fma` to require a single rounding.
-Low-precision FMA currently returns an unsupported diagnostic because its MIR f32 register
-semantics require promoted SSA values rather than immediate half/bfloat rounding.
+out-of-range values clamp), and FMA uses `llvm.fma` to require a single rounding — on `f32`
+registers for `f16`/`bf16` operands, exactly as the interpreter evaluates it.
 
 For independent scalar/vector conversion and exact-FMA execution checks, set
 `WUKONG_LLVM_SEMANTICS_OUTPUT` to a dedicated directory, run

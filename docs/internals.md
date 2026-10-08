@@ -119,7 +119,8 @@ source
   → sema         (wukong_sema::check)                  name res, types, SHAPE check
   → mir_build    (wukong_mir_build::lower_program)     -> MIR (scalar SSA; always MirLevel::Low)
   → opt          (wukong_opt::optimize)                fixpoint passes
-  → autodiff     (wukong_autodiff::grad)               --emit=grad / --train only; forces >= -O1
+  → autodiff     (wukong_autodiff::grad)               --emit=grad / --train / --emit=obj --grad-of;
+                                                        forces >= -O1
   → verify       (wukong_mir::verify, via wukong_driver::verify_or_ice)
                  gate on --run and on every AOT exit
   → backend      interpreter (--run) | Cranelift native (--backend=native / --emit=obj|exe)
@@ -145,7 +146,10 @@ prints its artifact on stdout except `--emit=obj` and `--emit=exe`, which write 
 Two combinations are usage errors rather than silently discarded work: `--run` with an explicit
 `--emit=<stage>` (the driver honours exactly one), and `-o` with `--run` or with any stage other than
 `obj`/`exe`. Diagnostics from every stage flow through a single `emit_diag` honoring
-`--error-format`.
+`--error-format` — including native-backend failures, which `wukong_codegen_cranelift::classify_error`
+maps to `C0002` (a layout above 4 GiB), `C0001` (a by-design decline) or an internal-compiler-error
+diagnostic. `--target-cpu` fixes the Cranelift ISA level for `--emit=obj|exe` and the native JIT and,
+below x86-64-v3, builds the MIR without the raw-AVX2 recipes (`LowerOptions::vec_kernels`).
 
 `--emit=check` returns after sema and the lints (lex, parse, imports, sema, lints; no MIR lowering),
 printing any lint warnings and exiting 0 when no error (or denied lint) was reported.
@@ -156,6 +160,21 @@ error (a bug in a pass), reported as prose and mapped to a non-zero exit, never 
 the ICE lines go to stderr first and a failure only changes the exit code — so a broken program still
 prints the MIR that shows why. `wukong_opt`'s per-pass verify-each is `#[cfg(debug_assertions)]`, so
 in a release compiler this gate is the only verification that runs.
+
+**Compile-time shape of a compile.** For `--run` and `--emit=exe` (one entry point, `main`) the driver
+drops every function `main` cannot reach through calls or `FuncAddr` after lowering
+(`wukong_driver::prune`); `--emit=obj` exports everything and the MIR dumps, autodiff stages and
+`--backend=gpu-native` keep the whole program. The native backend follows the source level:
+`-O0` builds the Cranelift ISA at `opt_level=none`, `-O1`+ at `speed` (`BackendOpt`), and both the JIT
+and the object path compile functions in parallel (`WUKONG_PAR_CODEGEN=0` serializes). Lowering
+keeps aggregate copies straight-line only when a gradient was requested
+(`LowerOptions::unroll_for_autodiff`), capped at 1 KiB per operation. `--time-passes` (stderr table,
+or one JSON line under `--error-format=json`) and `--time-trace=<f>` (Chrome trace JSON) report what a
+compile spent per stage, with the optimizer's per-pass breakdown (`optimize_timed`, byte-identical
+MIR), Cranelift's codegen/object-write split and the heaviest MIR functions (`wukong_driver::report`).
+The timer is inert unless asked for and reports from its `Drop`, so every exit path prints.
+`--depfile=<f>` writes a Make rule over the `SourceMap`'s files — exactly the root and each import
+the loader read — with gcc `-MP`-style empty rules for the imports.
 
 ## Diagnostics
 
@@ -659,7 +678,9 @@ lane type, so lane `k` always computes exactly what scalar iteration `base+k` wo
 family (`round`/`floor`/`ceil`/`trunc`) as one lane op, `fmax`/`fmin` as a lane compare + blend, and the
 transcendentals and activations (`exp`, `log`, `tanh`, `sigmoid`, `silu`, `gelu`, …) as their inline f32
 polynomial expanded per lane — only for an f32 lane, and only while the name does not resolve to a user
-`fn` (a user `fn gelu` wins and the loop stays scalar). `@parallel` per-thread chunks go through the
+`fn` (a user `fn gelu` wins and the loop stays scalar). The integer-or-float `min`/`max` builtins
+(`wukong_mir_build/src/minmax.rs`, a compare in the result's signedness + `select`) are deliberately
+not in that set yet, so a body calling them stays scalar. `@parallel` per-thread chunks go through the
 same vectorizer, so they run SIMD × cores.
 
 The vectorizer streams over every buffer form a kernel is written over: a `[T; N]` array, a
@@ -1051,8 +1072,14 @@ cargo run -q -p wukongc -- --emit=mir -O2 tests/run/tensor_matmul.wk       # no 
 Two rules about it:
 
 - **It is an instrument, not a user feature**, which is why it is an environment variable in the
-  style of `WUKONG_GPU_NO_MEGA` and not a CLI flag (nothing in `USAGE` mentions it). The supported,
-  per-function surface for "lower the loop I wrote" is the `@generic` attribute.
+  style of `WUKONG_GPU_NO_MEGA` and not a CLI flag (nothing in `USAGE` mentions it). The supported
+  surface for "lower the loop I wrote" is the `@generic` attribute, on a function or on a single
+  `for`/`while` loop (`wukong_mir_build::dispatch`).
+- **The per-site view is `--remarks=dispatch`** (`wukong_mir_build::lower_program_reporting_dispatch`):
+  a `note` at each statement `lower_block` lowered into a recognized `wukong_*` call (the innermost
+  one; an enclosing statement that only contains it is skipped), and at a function's name when a
+  whole-function interception replaced it. It observes the builder, never steers it, so the MIR is
+  byte-identical with it on or off.
 - **Autodiff refuses to run under it**, by name: `--train` and `--emit=grad` exit 1 as soon as the
   variable is set, because `wukong_autodiff`'s VJP rules are keyed on the recognized kernel calls. A
   named refusal, never a silently zero gradient.
@@ -1063,6 +1090,82 @@ second is vacuous), no `call wukong_` at all survives for `tensor_matmul.wk`, th
 the same bytes on both backends at `-O0` and `-O2`, and autodiff is refused. The 361 `tests/run`
 fixtures present when the switch landed were swept on/off for byte-identical stdout; that historical
 sweep does not establish recognition-on/off agreement for the current corpus.
+
+### Aliased buffers: the kernel only where the operands are disjoint
+
+Nothing in the language rejects `mm(x, y, x)`, and a recognized kernel equals the loop it replaces
+only when its operands do not overlap in a way the kernel cannot see: `wukong_sgemm` writes `C` in
+tiled order while it still reads `A`, an 8-lane row scan loads lanes before the source loop's
+stores would have changed them. An aliased call therefore means **what the source loop means**, and
+the compiler keeps the kernel only where the two agree. This is the blind spot that is worse than
+"gate-blind": on an aliased input the two backends need not run the same program at all (the
+interpreter used to answer from copies of the operands, native from the overlapping memory), and the
+interpreter's answer was the plausible one, so a differential failure would have blamed native.
+
+**Lowering.** Every multi-buffer recognizer asks one classifier,
+`wukong_mir_build::alias::plan_kernel_alias`, about the operand pairs its kernel's contract
+constrains. Two different symbols in a function the whole-program alias facts vouch for are
+`Disjoint` (dispatch); the same symbol is `MustAlias` (dispatch only under an exact-in-place
+contract, otherwise lower the loop); anything else is `MayAlias`, and `kernel_guard.rs` versions the
+dispatch at run time — `ptrtoint(base)` and `ptrtoint(gep(base, n))` range tests over every
+constrained operand pick the kernel when they are disjoint (or exactly in place where permitted) and
+the ORIGINAL source, recognition and `@parallel` off, otherwise. That is LLVM's `LoopVersioning`.
+The extent end is a `Gep`, so the interpreter (slot stride) and Cranelift (byte stride) reach the
+same verdict for in-bounds extents, which matters because a kernel and its loop are not always
+bit-identical; "exactly in place" is only ever admitted between operands of one element type, the
+one comparison two address units could disagree on.
+
+The versioning contexts cover every cascade: the per-loop recognizers (`emit_versioned_loop`, and
+`emit_nonempty_reduction` for the reductions, whose empty-extent arm lowers the same source), the
+256-bit elementwise kernel probes inside `try_vectorize_for` (vmath, vmath2, velem, vhorner, the int
+dequant — their overlapping arm is the loop with recognition off, which the generic vectorizer then
+lowers only with its own disjointness proof, or scalar), and the statement windows
+(`emit_versioned_stmts`: the fused norms, the copy-then-norm fold, the flat 1-D scans — their
+overlapping arm is the window's own statements). The whole-function GEMM and int8 interceptions
+(`lower_matmul_fn`, `lower_i8matmul_fn`) go through `emit_nonempty_reduction_loop` too, so they version the
+same way with the function's one loop on the overlapping arm. A recognizer reached with no context — a
+probe, an outlined `@parallel` chunk — declines on `MayAlias`, as every recognizer did before
+versioning. A coefficient an elementwise kernel HOISTS (`s[0]`, `*p` in `out[j] = s[0] * x[j]`) is a
+scalar the range test cannot see, so it is checked at compile time instead (`hoisted_reads_disjoint`):
+a read that may come from a buffer the kernel writes keeps the loop. An elementwise dispatch that becomes several full-range passes
+(one per statement of a fused body) is guarded over every operand of every pass, because loop
+fission is itself an alias-sensitive transformation.
+
+**Empty ranges.** A recognized reduction keeps what the source loop writes for a zero or negative
+extent: the storing reductions dispatch only on a positive reduction extent and lower the source
+otherwise (`emit_nonempty_reduction`), and the value-returning ones (`wukong_sreduce_f32_parallel`,
+the bf16/f16 dot/sum/reduce) select the SEED on an empty range (`keep_seed_when_empty`) — the kernel's
+identity combined into the seed is not the seed on every input (`-0.0 + 0.0` is `+0.0`;
+`fmax(NaN, -inf)` as the `Cmp(Fogt)+Select` fold is `-inf`). A `Select`, not a branch, so a
+straight-line loss stays straight-line for autodiff's tape.
+
+**Oracle.** The interpreter still marshals operands through copies, and `marshal::check_output`
+makes that unobservable rather than assumed: an arm reached with operands its kernel's contract
+forbids returns an error instead of a copied answer. Exact in-place operation, where permitted, is
+equal to out of place for a row-local or elementwise kernel. Three groups run against LIVE memory in
+source order instead, because their one meaning under any overlap is the source loop's: the
+embedding gather, the scatter-add, and — for a SHIFTED overlap — the elementwise maps (vmath, vmath2,
+velem, vhorner: `marshal::elementwise_live`, one element at a time). A call that reaches a kernel
+with operands the compiler's guard would have kept away (a direct call, an alias-analysis hole) is
+therefore either refused or answered with the source loop's value, never with a copy-in/copy-out
+value no backend computes. Operand scratch is recycled per thread (`marshal::f32_scratch` /
+`recycle_f32`), so a kernel inside a loop no longer allocates its operands on every iteration, and
+every extent is range-checked before any scratch is reserved.
+
+**The aliasing ABI**, one class per exported kernel (each entry's `# Safety` carries an
+`**Aliasing:**` line that says which):
+
+| Class | Families |
+|---|---|
+| All operands disjoint | GEMM (f32, fused epilogue, alpha, residual, bf16/f16, int8, int8+dequant), GEMV, GEVM, transpose, pool2d, column reductions, row/column arg-reductions, log-sum-exp, entropy, KL divergence, soft-label and hard-label cross-entropy forward, LayerNorm backward, attention, embedding, scatter-add, the int dequants, the half-input/f32-output maps (`vmath_{bf16,f16}`, `axpby_{bf16,f16}`) |
+| Exactly in place, otherwise disjoint | cumsum, cummax/cummin, cumprod, lrscan (`out` over an input), RoPE and its backward (`out` over `x`; the frequency table disjoint), softmax backward and RMSNorm backward (`dx` over `dy`; `y`/`x`/`gamma` disjoint), cross-entropy backward (`dx` over `x`), velem, vmath, vmath2, vhorner, log-softmax, the fused norms (`out` over `x`; `gamma`/`beta` disjoint), broadcast bias (`out` over `x`; the bias row disjoint), the half-output maps |
+| None constrained (read-only) | `sreduce`, `argreduce`, the bf16/f16 dot/sum/reduce |
+
+What remains open is stated in `docs/roadmap.md`: `alias.rs`'s documented holes can still hand a
+kernel overlapping storage where the interpreter refuses (cross-element) or answers with the source
+loop (elementwise); an outlined `@parallel` chunk has no versioning context and declines rather than
+versions; and the `@parallel` region outliner, the generic vectorizer's loop fusion (`try_fuse_run`)
+and the half-output runtime kernels' own shifted-overlap handling are outside this classifier.
 
 ## CPU training execution
 
@@ -1491,11 +1594,16 @@ measurement reports retain the corpus sizes used for those runs.
   compile-fail corpus. Stated limit: the seed mechanism only bites std `HashMap`/`HashSet`; the
   optimizer's FxHash maps have a fixed seed, so these gates say nothing about insertion-order dependence
   there.
-- **AOT executables** (`crates/wukongc/tests/exe.rs`): curated fixtures are linked with `--emit=exe` and
+- **AOT executables** (`crates/wukongc/tests/exe.rs`): curated fixtures (including
+  `print_float_display.wk`, which pins how every float prints) are linked with `--emit=exe` and
   their stdout/exit compared against `--run`, extending the differential gate to the linked exe (string
-  `.rodata` and the linked `wukong_runtime` kernels). The gate probes once which link path exists on the
-  box and may skip only when neither does; a failure of the compiler's own link is reported with its
-  captured stderr. **Run it under `--release` as well as the default profile** — the two profiles hand
+  `.rodata` and the linked `wukong_runtime` kernels). `exe_matches_run_on_a_corpus_slice` does the same
+  for every 8th corpus fixture in parallel (`WUKONG_EXE_CORPUS=all` for the whole corpus), skipping only
+  documented declines (the native JIT cannot compile it either; on the C fallback, it needs a
+  `wukong_*` kernel) and failing if they exceed 10% on the rustc path, and
+  `cc_fallback_discovered_from_the_cli_matches_run` reaches the C fallback through a copied `wukongc`
+  with no runtime rlib. The gate probes once which link path exists on the box and may skip only when
+  neither does; a failure of the compiler's own link is reported with its captured stderr. **Run it under `--release` as well as the default profile** — the two profiles hand
   the linker archives of different shapes (see the bitcode/LTO paragraph in *Native backend* above), so
   a green debug run says nothing about release; `cargo test -p wukongc --release --test exe` is the only
   gate that has ever exercised the release AOT link, and it is minutes of wall time because each fixture

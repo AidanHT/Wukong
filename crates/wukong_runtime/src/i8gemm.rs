@@ -542,6 +542,8 @@ unsafe fn i8_tile(
 ///
 /// # Safety
 /// `a` valid for `m*k` `u8`, `b` for `n*k` `i8`, `c` for `m*n` `i32`.
+/// **Aliasing: all operands disjoint** — the `i32` accumulator `c` must overlap neither int8
+/// operand (it is written in tiled order while both are still read).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_i8gemm_nt(
     a: *const u8,
@@ -573,6 +575,8 @@ pub unsafe extern "C" fn wukong_i8gemm_nt(
 ///
 /// # Safety
 /// Same as [`wukong_i8gemm_nt`].
+/// **Aliasing:** that of [`wukong_i8gemm_nt`] — all operands disjoint: `c` overlaps neither `a` nor
+/// `b`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_i8gemm_nt_parallel(
     a: *const u8,
@@ -683,6 +687,7 @@ unsafe fn dequant_row(
 /// `n` f32.
 /// When non-null, the `n`-element bias range must be disjoint from the `m*n`-element
 /// output range; rows may read bias while other output elements are written.
+/// **Aliasing: all operands disjoint** — `out` overlaps none of `a`, `b`, `scale_b`, `bias`.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn wukong_i8gemm_nt_deq(
@@ -802,6 +807,8 @@ unsafe fn deq_block(
 ///
 /// # Safety
 /// Same as [`wukong_i8gemm_nt_deq`].
+/// **Aliasing:** that of [`wukong_i8gemm_nt_deq`] — all operands disjoint: `out` overlaps none of
+/// `a`, `b`, `scale_b`, `bias`.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn wukong_i8gemm_nt_deq_parallel(

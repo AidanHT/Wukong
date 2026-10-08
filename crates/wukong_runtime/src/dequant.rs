@@ -270,6 +270,8 @@ unsafe fn dequant_avx2(q: *const u8, out: *mut f32, n: usize, scale: f32, op: i6
 ///
 /// # Safety
 /// `q` must be valid for `n` elements of the width `op` selects; `out` valid for `n` `f32`.
+/// **Aliasing: disjoint.** The integer input and the f32 output have different element widths, so
+/// no overlap between them is an in-place map; the output byte range must not overlap `q`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_dequant_f32(
     q: *const u8,
@@ -307,6 +309,8 @@ unsafe impl Sync for Addr {}
 ///
 /// # Safety
 /// Same as [`wukong_dequant_f32`].
+/// **Aliasing:** that of [`wukong_dequant_f32`] — all operands disjoint: `out` does not overlap
+/// `q`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_dequant_f32_parallel(
     q: *const u8,
@@ -480,6 +484,7 @@ unsafe fn perchan_row_avx2(
 /// `q`/`out` valid for `rows*cols` elements; `scale` for `cols` `f32`.
 /// The output byte range must not overlap either input. In particular, writing
 /// into `scale` would change later rows and race with parallel readers.
+/// **Aliasing: all operands disjoint** — `out` overlaps neither `q` nor `scale`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_dequant_perchan_f32(
     q: *const u8,
@@ -529,6 +534,8 @@ pub unsafe extern "C" fn wukong_dequant_perchan_f32(
 ///
 /// # Safety
 /// Same as [`wukong_dequant_perchan_f32`].
+/// **Aliasing:** that of [`wukong_dequant_perchan_f32`] — all operands disjoint: `out` overlaps
+/// neither `q` nor `scale`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_dequant_perchan_f32_parallel(
     q: *const u8,

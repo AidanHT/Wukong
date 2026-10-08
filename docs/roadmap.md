@@ -22,13 +22,20 @@ checked-but-not-executed, and what is planned — so expectations match reality.
 ## Works end to end (interpreter `--run`, **and native code** `--backend=native`)
 
 The MIR interpreter and **Cranelift native backend** execute the supported language subset.
-Corpus differential tests compare outputs across optimization levels. Unsupported constructs and
-C-link fallback output remain documented limitations. A runtime failure (a failed `assert`, a slice
-index out of bounds) stops the program at the same statement on every path — interpreter, JIT,
-linked executable, and inside a `@parallel` region (the earliest failing iteration is reported) —
-keeping the output printed before it, with exit status 1 (`tests/run/assert_fail_trailing_output.wk`).
+Corpus differential tests compare outputs across optimization levels. Unsupported constructs
+remain documented limitations; the C-link fallback prints exactly what `--run` prints (it lacks
+only the `wukong_*` kernels, a link error), and `exe.rs` compares a slice of the corpus's linked
+executables with `--run`. A runtime failure (a failed `assert`, a slice index out of bounds) stops
+the program at the same statement on every path — interpreter, JIT, linked executable, and inside
+a `@parallel` region (the earliest failing iteration is reported) — keeping the output printed
+before it, with exit status 1 (`tests/run/assert_fail_trailing_output.wk`).
 Cranelift provides JIT execution with `--run --backend=native` and object/exe output with
 `--emit=obj|exe`, with **no LLVM toolchain required**. See `BENCHMARKS.md` for cross-language numbers.
+`--target-cpu=<native|x86-64|x86-64-v2|x86-64-v3|x86-64-v4>` picks the instruction-set level of that
+native code (default `native`, the host's features); below x86-64-v3 the raw-AVX2 loop kernels are
+not used, so an object built on an AVX2 machine runs on a baseline x86-64 CPU. Cross-compilation to
+another architecture or OS is not supported. A native-backend failure is a catalogued diagnostic
+(`C0002` for a single layout above 4 GiB, `C0001` for a by-design decline) in both `--error-format`s.
 
 - **Multi-file modules with real namespaces**: `import a.b` loads `a/b.wk` (resolved against the
   *root* source file's directory); files load once each — an import cycle or diamond dedups by
@@ -504,6 +511,11 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   an integer (integer `abs` = `select(x<0, −x, x)`; rounding an integer is the identity), and `sqrt` /
   the transcendentals promote an integer operand to `f32` — so they no longer emit the float-op-on-int
   MIR that the native backend rejected and the interpreter ran lossily (`tests/run/int_math.wk`).
+- **`min(a, b)` / `max(a, b)`** (2026-10-08, `gap/recognizer-coverage`): integer (and float)
+  minimum/maximum, a compare in the result type's signedness plus a select, so a `usize` compares
+  unsigned; on floats they are `fmin`/`fmax`; the result is the operands' common type, as for `+`.
+  Before this a call was `C0001` — which made the ragged-tile spelling `for i in i0..min(i0 + T, M)`
+  (the one `examples/matmul.wk` uses) impossible to compile at all (`tests/run/min_max_builtin.wk`).
 - **Convolution via im2col + GEMM**: a conv written as an im2col gather followed by a matmul has its
   matmul recognized and dispatched to the tuned GEMM microkernel (the XLA/cuDNN lowering), so Wukong
   runs a 3×3 conv **~1.55× faster** than a hand-written direct convolution in C — and 1.12× *slower*
@@ -557,7 +569,7 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   `tile_never_applied.wk`, `tile_on_parallel_fn.wk`, `tile_on_recognized_kernel.wk`,
   `tile_second_on_stmt.wk`).   `@tile` is accepted only where something reads it — a `fn` item or the `for` statement it schedules
   — and is **`E0306`** on a `struct`, a parameter, a `let` or a `while`, the same placement code
-  `@generic` carries off a `fn` item (`tests/fail/tile_on_while.wk`).
+  `@generic` carries off a `fn` item or a loop (`tests/fail/tile_on_while.wk`).
 - **`shared [T; N]`** and **`sync_block()`**: shared address space on `alloca`; cooperative barrier
   inside `@parallel` only (`E0308` otherwise). Static shared size above 48 KiB is `E0307`. CPU:
   shared = stack `alloca`, barrier = no-op/fence. gpu-native: PTX `.shared` + `bar.sync` in
@@ -591,9 +603,13 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   four probe sites (whole-function interception, the per-loop `match_*` cascade, `lower_block`'s
   statement windows, the vectorizer's elementwise probes) fire inside it, so its loops compile as
   written — while auto-vectorization, loop fusion, FMA contraction, `@parallel` outlining and the
-  optimizer all still apply, as do the builtins you call by name. It is per function, not per module
+  optimizer all still apply, as do the builtins you call by name. It is per function or per loop (on a
+  `for`/`while` it covers that loop and everything nested in it, `tests/run/generic_loop_optout.wk`),
+  not per module
   (`tests/run/lang_generic_saxpy.wk`, `lang_generic_naive_gemm.wk` each hold the same body twice and
-  the MIR then holds exactly one kernel call), and it is `E0306` anywhere but a `fn` item. The
+  the MIR then holds exactly one kernel call), and it is `E0306` anywhere but a `fn` item or a loop.
+  `wukongc --remarks=dispatch` prints, at each statement a recognizer replaced, the kernel symbol it
+  became, so dispatch is no longer visible only through `--emit=mir | grep wukong_`. The
   whole-program equivalent, `WUKONG_NO_RECOGNIZE`, is a **measurement instrument** rather than a user
   feature (see `docs/internals.md`): recognizers are otherwise gate-blind, so this is the only way to
   compile and time the honest generic lowering of the same program. Autodiff refuses to run under the
@@ -666,6 +682,13 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   verify *after* dumping on purpose, so a broken program still prints the MIR that explains why).
   Across the run suite and kernels it removes ~42% of IR ops
   (~48–54% on the heavy transformer/GEMM kernels) and runs ~1.5–2.5x faster than `-O0`.
+- Compile-time self-reporting and build integration: `--time-passes` (per-stage table on stderr,
+  with per-optimizer-pass and Cranelift codegen/object-write splits and the heaviest MIR functions;
+  one JSON line under `--error-format=json`), `--time-trace=<f>` (Chrome trace-event JSON) and
+  `--depfile=<f>` (Make rule naming the root and every imported file). `--run`/`--emit=exe` compile
+  only what `main` reaches; `-O0` native code is built at Cranelift `opt_level=none`, and the JIT
+  compiles functions in parallel. Not yet: several artifacts from one `--emit=a,b` invocation (each
+  stage is still its own compile), per-function timing in the trace, or a parallel optimizer.
 
 ## GPU backend (NVIDIA, behind `--features gpu`) — RTX 4050 (`sm_89`) and H100 (`sm_90a`)
 
@@ -980,8 +1003,8 @@ Reverse-mode autodiff transforms MIR for a single-block forward function returni
 scalar loss. `--emit=grad` prints its forward and backward MIR; `--train` runs the forward, backward
 and optimizer on the selected **interpreter or native Cranelift JIT** backend. The native path
 compiles one owning dispatcher and reuses it for forward, backward and generated AdamW calls.
-Training requires concrete f32 arrays or dense tensors with checked byte extents. AOT training
-and generated-backward performance comparisons remain open. `--grad-of` selects
+Training requires concrete f32 arrays or dense tensors with checked byte extents. An AOT training
+loop and generated-backward performance comparisons remain open. `--grad-of` selects
 the loss and `--grad-wrt` its differentiated buffers. Autodiff requires at least `-O1` for SSA
 construction; `-O2`/`-O3` retain the selected loss while still inlining calls and optimizing its body.
 Generated gradients receive the existing optimizer with an O1 minimum, matching forward
@@ -990,28 +1013,61 @@ are unchanged by this second optimization stage. The driver verifies the whole p
 and after backward optimization and verifies the complete training program before execution.
 `--verify-each` additionally checks each optimization pass; gradient MIR emission also verifies its output.
 
-Eight kernel families have VJP rules, including their parallel spellings: `sgemm`, `sgemm_nt`,
-`bias` without a fused activation, `sreduce_f32` (SUM, DOT, SSD, SUMABS, ABSDIFF), `velem_f32`
-(affine, product and quotient), `vmath_f32` (30 of 36 activation codes), `norm_f32` (softmax,
-log-softmax, LayerNorm, RMSNorm and L2-norm), and `norm_affine_f32` (LayerNorm/RMSNorm with learned
-scale/bias). Norm scratch allocation has constant-shape requirements, and unsupported in-place
-cases are refused. Kernel-output scalar loads now seed their supported buffer adjoints or report
-an unrouteable gradient. LayerNorm backward computes centered variance.
+**Kernel coverage.** Every runtime symbol `wukong_mir_build` can emit has an explicit autodiff
+disposition, enforced by `every_emitted_kernel_symbol_is_differentiable_or_declined_by_name`: 49
+forward symbols (25 kernel families, serial and `@parallel`) have VJP rules, and the rest are
+listed with the reason a decline reports (index-valued arg-reductions, half-precision storage,
+quantized operands, scans, pooling, the fused attention kernel, the training-backward kernels
+themselves, I/O). The differentiable families: the whole f32 GEMM family — plain `A·B`, `nn.Linear`
+`A·Bᵀ`, the weight-gradient `Aᵀ·B`, the α-scaled attention-score GEMM and the fused
+`act(A·Bᵀ + bias)` epilogue (identity / ReLU / GELU / SiLU) — GEMV and GEVM (plain and α-scaled), the
+broadcast bias (pure add or any fused activation, in place or not), transpose, column sum / mean /
+sum-of-squares, `sreduce_f32` (SUM, DOT, SSD, SUMSQ, MAX, MIN, MAXABS — ties split evenly — SUMABS,
+ABSDIFF), `velem_f32` (affine, product and quotient, with identity / ReLU / ReLU6), all 36
+`vmath_f32` activation codes, the two-input `vmath2_f32` family (pow, atan2, hypot and the SwiGLU /
+GeGLU / GLU gates), `norm_f32` (softmax, log-softmax, LayerNorm, RMSNorm, L2-norm), `norm_affine_f32`,
+softmax cross-entropy, log-sum-exp, entropy, KL divergence, rotary position embedding (including a
+trainable frequency table) and the embedding gather.
+
+**The backward rides the tuned kernels.** The GEMM adjoints are the runtime's own transposed GEMM
+spellings (no synthesized transpose); softmax / LayerNorm / RMSNorm backward are the runtime's
+fused `wukong_{softmax,layernorm,rmsnorm}_bwd_f32` (so a symbolic-generic row width differentiates);
+sigmoid, tanh, SiLU, GELU, ELU and softplus ride the fused `wukong_vmath2_f32` backward codes;
+cross-entropy, RoPE and the embedding ride `wukong_xent_bwd_f32`, `wukong_rope_bwd_f32` and
+`wukong_scatter_add_f32`; and a `@parallel` forward selects the `@parallel` backward spelling.
+Gradient scratch is zeroed heap (`wukong_rt_alloc`, released before the gradient returns), so a
+native backward puts no activation-sized buffers on the stack.
+
+**Memory model.** Gradients accumulate across fan-out (a residual connection, a shared weight, a
+buffer the loss also reads as a scalar). The in-place spellings the recognizers emit differentiate:
+`x = softmax(x)` / log-softmax, `h += r`, `h = act(h + b)` with a pure add or ReLU. A float store
+into a buffer whose gradient is live is differentiated as a memory write, scalar reads of local
+arrays route to their gradients, and a kernel that overwrites a buffer another kernel (or a
+non-constant scalar store) wrote zeroes the earlier writer's adjoint instead of passing it the later
+one. In-place LayerNorm / RMSNorm /
+L2-norm, in-place activations and in-place products/quotients refuse by name.
 
 Float precision casts propagate adjoints, and integer-to-float casts terminate integer leaves;
-float-to-integer-to-float paths decline. User-function calls need to inline into the forward
-function: there is no general interprocedural VJP. Fused GEMM epilogues, GEMV/TN forward calls, six
-activation codes, six reduction codes, mid-function parallel regions and synthesized
-`VecKernelCall` recipes remain unsupported. Unsupported differentiable operations report a
-diagnostic. Second-order (grad-of-grad) differentiation is unsupported and reports that boundary
-explicitly.
+float-to-integer-to-float paths decline. **User-function calls differentiate at every `-O` level**:
+straight-line helpers are spliced into the loss before the reverse pass
+(`wukong_autodiff::inline_calls`); a multi-block or recursive helper on the gradient path refuses,
+naming the callee. Mid-function parallel regions and synthesized `VecKernelCall` recipes remain
+unsupported, and every unsupported differentiable operation reports a diagnostic. **Second order**
+is supported for scalar-path losses: `wukong_autodiff::grad_dot` emits the single-block directional
+derivative `<v, ∇L>` and `hvp` its gradient, the Hessian-vector product; second order through
+recognized tensor kernels, and differentiating the emitted void `*_grad` itself, decline by name.
+There is no CLI flag for second order yet.
 
-Matmul adjoints and four activation derivatives call runtime kernels. Norm backward and the NT
-weight-gradient transpose still use synthesized loops; sigmoid/tanh do not yet use their fused
-runtime backward kernels. `--train-opt=sgd|adamw` selects the optimizer;
+**Ahead of time.** `--emit=obj --grad-of=<fn>` exports `<fn>_grad` next to the forward in the
+object (C ABI: the loss's parameters, then one caller-zeroed gradient buffer per `--grad-wrt`
+entry), so a host training loop links the backward with no compiler at run time. An AOT
+*training loop* (`--train --emit=exe`) is still open. `--train-opt=sgd|adamw` selects the optimizer;
 `--train-weight-decay` accepts finite nonnegative AdamW decay (default zero) and rejects nonzero
-decay with SGD. Source-driven in-crate gradient tests and the real-CLI `training_options` test
-cover selected losses across O0–O3. Generated-autodiff performance benchmarks remain absent.
+decay with SGD. Source-driven gradient tests (helper functions at O0–O3, the fused linear-bias-ReLU
+layer, the cross-entropy head, a fanned-out reduction), the real-CLI `training_options` and
+`autodiff_cli` tests (the latter trains a GEMM + bias model on the interpreter and the native JIT and
+requires byte-identical trajectories at O0–O3) and the hand-derived `tests/run/autodiff_train_*.wk`
+trajectories cover the CLI. Generated-autodiff performance benchmarks remain absent.
 
 A loss whose buffers are **raw `*T` / `*mut T` parameters** now differentiates. It previously could
 not: the front end gives a pointer parameter an `alloca ptr` + `store`, so its base reached autodiff
@@ -1107,6 +1163,29 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   `topk_f32` has no VJP (autodiff refuses it rather than drop the gradient).
   None of these is measured yet.
 
+- **Recognizer spellings still outside the fold** (2026-10-06, `gap/recognizer-coverage`). The
+  hoisted-value, GELU-expansion, row-outer column-reduction, out-of-place softmax, hand-tiled GEMM and
+  `usize`-counter spellings now dispatch (`docs/language-guide.md`, Attributes), each only where the
+  kernel computes what the source computes. Declined on purpose, and therefore still the 128-bit
+  generic loop: HuggingFace's literal `0.044715 * v * v * v` GELU and the erf GELU (no kernel computes
+  them bit-for-bit — a new `vmath` opcode would); `out[j] = out[j] + x*x` (the source contracts it to
+  one FMA, the `colsumsq` kernel squares and adds — write `+=`); among tilings (2026-10-08: ragged
+  `min(i0 + T, M)` tails, counted `let i0 = it * T` tiles, runtime extents and tiled contractions now
+  dispatch), a counted tile whose point loop is a full `i0..i0 + T` (it names no extent), a tile width
+  that is not a literal or a `const` (a function-local `const` counts only when declared in the same
+  block as the tiled loop), a contraction tiled around a ZERO-seeded scalar (it overwrites `C` with
+  the last tile's partial sum — not a GEMM), and `examples/matmul.wk` itself, whose inner kernel is
+  written in explicit `f32x8` intrinsics that lowering does not handle yet; a value binding read by a
+  second store, and a float product bound to a
+  name (inlining it beside a `+` would contract it into an FMA the `let` rounded away); and a
+  plain float fold with no kernel over a `usize` counter (the generic vectorizer would reassociate a
+  sum that folds in source order today; argmax/argmin and the low-precision reduction kernels do
+  dispatch over a `usize` counter, behind the same run-time test as the maps). The value view and
+  the row-outer/out-of-place windows are flat
+  (one row); the batched forms keep their existing matchers. Per-site decline remarks ("this nest
+  matched GEMM but its operands are not provably disjoint") are not emitted yet: `--remarks=dispatch`
+  reports what fired, not why something did not.
+
 - **A view local read before it is assigned is undefined, and the language has no rule that says so.**
   *(Table measured 2026-08-23 on `lang/w2e-recognizer-gate`; sema still has no definite-assignment
   rule as of 2026-10-06, but the table has not been re-measured.)*
@@ -1188,9 +1267,24 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   a promised view parameter (`E0316`); an unprovable violation is undefined, as in C. Without the
   attribute nothing changes: distinct local allocations and call-site proofs remain the only
   disjointness facts.
-  This repair does not establish safe dispatch for every runtime recognizer. Remaining family
-  coverage and oracle-marshalling gaps are listed in the
-  [closeout checklist](sota-campaign-2026-09/CLOSEOUT-CHECKLIST.md).
+- **An aliased call to a recognized kernel means what the source loop means.** Every multi-buffer
+  recognizer emit site — GEMM in all its forms, GEMV/GEVM, transpose, pooling, the column/row/arg
+  reductions, the losses, the norm backwards, RoPE, the scans, embedding/scatter, the fused norms,
+  broadcast bias, the int dequants, the half-precision maps and the 256-bit elementwise kernels —
+  asks one classifier (`wukong_mir_build::alias::plan_kernel_alias`) and, for an operand pair the
+  compiler cannot separate, versions the dispatch on a run-time overlap test whose other arm is the
+  ORIGINAL source loop or window (`kernel_guard.rs`, LLVM's `LoopVersioning` shape). A library
+  routine `fn mm(a, b, mut c)` called both as `mm(x, y, x)` and `mm(x, y, z)` keeps its kernel for
+  the disjoint call and runs the nest for the aliased one (`tests/run/alias_versioned_kernels.wk`
+  prints every lane of both). Exact in-place operation is admitted only where the runtime entry
+  documents it, and each exported kernel's `# Safety` states its aliasing class. A recognized
+  reduction over an empty range keeps the seed exactly. The interpreter refuses a cross-element call
+  that reaches it with overlapping operands, and answers a shifted elementwise overlap with the
+  source loop's value, instead of computing either from copies.
+  **Open:** `alias.rs`'s documented limits (its `# Known limits`) can still hand a kernel overlapping
+  storage; an outlined `@parallel` chunk has no versioning context, so an alias-uncertain kernel there
+  declines instead of versioning; the generic vectorizer's loop fusion and the `@parallel` region
+  outliner keep their own disjointness proofs outside this classifier.
 - Array *length* in a type may be an integer literal or a top-level `const` (resolved through
   const-to-const chains; `tests/run/const_array_length.wk`). It may also be **arithmetic over those** —
   `[i32; 2 + 2]`, or a `const N: i32 = 2 + 2` used as a length — because sema's `eval_usize` and

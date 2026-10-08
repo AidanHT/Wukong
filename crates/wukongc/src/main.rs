@@ -13,11 +13,19 @@ USAGE:
 
 OPTIONS:
     --verify-each     Verify MIR after every optimizer pass (also in release builds)
+    --time-passes      Print per-stage compile times (with per-optimizer-pass and codegen
+                       splits and a MIR size summary) to stderr when the compile ends
+    --time-trace=<f>   Write the same timings to <f> as Chrome trace-event JSON
+                       (chrome://tracing, Perfetto, speedscope)
+    --depfile=<f>      Write a Make-syntax dependency file to <f> naming every source file
+                       read (the root and each import); its target is the -o artifact for
+                       --emit=obj/exe, otherwise <f> itself (not with --emit=tokens/ast)
     --emit=<stage>     Emit an intermediate artifact and stop. One of:
                        tokens, ast, check, mir-high, mir, grad, llvm-ir, obj, exe  (default: exe)
                        (grad = reverse-mode backward MIR of a loss fn; see --grad-of/--grad-wrt)
                        (check = run lex/parse/imports/sema only, report diagnostics, no lowering)
-    --grad-of=<fn>     Function to differentiate for --emit=grad / --train  (default: loss)
+    --grad-of=<fn>     Function to differentiate for --emit=grad / --train  (default: loss).
+                       With --emit=obj, the object also exports the gradient as <fn>_grad
     --grad-wrt=<i,..>  Comma-separated parameter indices to differentiate w.r.t. (default: all
                        buffer parameters of the loss function). For --train, these are the
                        trainable weights; other buffers are fixed data; the last param is the loss.
@@ -32,6 +40,11 @@ OPTIONS:
     --backend=<b>      Execution backend: interp, native, gpu, gpu-native  (default: interp)
                        (gpu/gpu-native require --features gpu and a CUDA device; gpu is the
                        recognizer offload, gpu-native lowers the whole program's MIR to PTX)
+    --target-cpu=<c>   Instruction-set level for native code (--emit=obj/exe, --backend=native):
+                       native, x86-64, x86-64-v2, x86-64-v3, x86-64-v4  (default: native = the
+                       host's features). Below x86-64-v3 the raw-AVX2 loop kernels are not used,
+                       so the object runs on any CPU of that level; the JIT refuses a level the
+                       host lacks.
     -o <path>          Write the artifact to <path>. Only --emit=obj and --emit=exe write a
                        file; every other stage prints its artifact on stdout.
     -O0|-O1|-O2|-O3    Optimization level (default: -O0)
@@ -43,6 +56,9 @@ OPTIONS:
     --threads=<n>      Worker threads for @parallel regions and _parallel kernels in this run
                        (1..=4096; default: every usable CPU). Sets WUKONG_NUM_THREADS for --run
                        and --train; a built executable reads WUKONG_NUM_THREADS at startup.
+    --remarks=dispatch Print a note at every loop (or function) the compiler replaced with a
+                       recognized runtime kernel call, naming the kernel symbol(s). The output is
+                       unchanged; `@generic` on a loop or fn opts it out of recognition.
     --color=<when>     Colorize diagnostics: auto, always, never  (default: auto)
                        auto honors NO_COLOR, CLICOLOR_FORCE and TERM=dumb, and enables Windows VT
     --error-format=<f> Diagnostic output format: human, json  (default: human)
@@ -310,6 +326,32 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             }
             "--run" => opts.run = true,
             "--verify-each" => opts.verify_each = true,
+            _ if arg.starts_with("--remarks=") => {
+                let kind = &arg["--remarks=".len()..];
+                match kind {
+                    "dispatch" => opts.remarks_dispatch = true,
+                    other => {
+                        return Err(format!(
+                            "unknown --remarks value `{other}` (expected dispatch)"
+                        ))
+                    }
+                }
+            }
+            "--time-passes" => opts.time_passes = true,
+            _ if arg.starts_with("--time-trace=") => {
+                let path = &arg["--time-trace=".len()..];
+                if path.is_empty() {
+                    return Err("`--time-trace=` requires a file path".into());
+                }
+                opts.time_trace = Some(PathBuf::from(path));
+            }
+            _ if arg.starts_with("--depfile=") => {
+                let path = &arg["--depfile=".len()..];
+                if path.is_empty() {
+                    return Err("`--depfile=` requires a file path".into());
+                }
+                opts.depfile = Some(PathBuf::from(path));
+            }
             _ if arg.starts_with("--backend=") => {
                 let b = &arg["--backend=".len()..];
                 opts.backend = match b {
@@ -324,6 +366,15 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                         ))
                     }
                 };
+            }
+            _ if arg.starts_with("--target-cpu=") => {
+                let cpu = &arg["--target-cpu=".len()..];
+                opts.target_cpu = wukong_driver::TargetCpu::parse(cpu).ok_or_else(|| {
+                    format!(
+                        "unknown --target-cpu value `{cpu}` (expected {})",
+                        wukong_driver::TargetCpu::NAMES.join(", ")
+                    )
+                })?;
             }
             "-O0" => opts.opt_level = 0,
             "-O1" => opts.opt_level = 1,
@@ -503,6 +554,16 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
         }
     }
 
+    // The dependency set is the import graph, and these two stages stop before imports are loaded:
+    // a depfile written there would silently omit every imported file.
+    if opts.depfile.is_some() && matches!(opts.emit, EmitStage::Tokens | EmitStage::Ast) {
+        return Err(
+            "`--depfile` needs the import graph, which `--emit=tokens` and `--emit=ast` stop \
+             before loading"
+                .to_string(),
+        );
+    }
+
     Ok(Some(opts))
 }
 
@@ -532,6 +593,39 @@ mod tests {
         for lint in wukong_driver::LINTS {
             assert!(USAGE.contains(lint.name), "USAGE must list {}", lint.name);
             assert!(USAGE.contains(lint.code), "USAGE must list {}", lint.code);
+        }
+    }
+
+    #[test]
+    fn compile_time_reporting_flags_parse() {
+        let parse = |extra: &[&str]| {
+            let mut args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+            args.push("input.wk".to_owned());
+            parse_args(&args)
+        };
+        let plain = parse(&[]).unwrap().unwrap();
+        assert!(!plain.time_passes && plain.time_trace.is_none() && plain.depfile.is_none());
+        let opts = parse(&[
+            "--run",
+            "--time-passes",
+            "--time-trace=t.json",
+            "--depfile=p.d",
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(opts.time_passes && opts.run);
+        assert_eq!(opts.time_trace, Some(PathBuf::from("t.json")));
+        assert_eq!(opts.depfile, Some(PathBuf::from("p.d")));
+        assert!(parse(&["--time-trace="]).is_err());
+        assert!(parse(&["--depfile="]).is_err());
+        for early in ["--emit=tokens", "--emit=ast"] {
+            assert!(parse(&[early, "--depfile=p.d"]).is_err(), "{early}");
+        }
+        assert!(parse(&["--emit=mir-high", "--depfile=p.d"])
+            .unwrap()
+            .is_some());
+        for flag in ["--time-passes", "--time-trace=<f>", "--depfile=<f>"] {
+            assert!(USAGE.contains(flag), "USAGE must document {flag}");
         }
     }
 
@@ -621,5 +715,50 @@ mod tests {
     fn explain_with_no_code_is_accepted() {
         // A bare `--explain` lists all codes and exits successfully (Ok(None)).
         assert!(parse_args(&["--explain".to_owned()]).unwrap().is_none());
+    }
+
+    /// `--remarks=dispatch` is opt-in, documented, and the only `--remarks` kind: an unknown kind
+    /// is a usage error rather than a flag that silently does nothing.
+    #[test]
+    fn remarks_dispatch_is_opt_in_and_closed() {
+        let on = parse_args(&["--remarks=dispatch", "--run", "input.wk"].map(str::to_owned))
+            .unwrap()
+            .unwrap();
+        assert!(on.remarks_dispatch);
+        assert!(
+            !parse_args(&["--run".to_owned(), "input.wk".to_owned()])
+                .unwrap()
+                .unwrap()
+                .remarks_dispatch
+        );
+        assert!(parse_args(&["--remarks=all", "input.wk"].map(str::to_owned)).is_err());
+        assert!(USAGE.contains("--remarks=dispatch"));
+    }
+
+    #[test]
+    fn target_cpu_flag_parses_every_level_and_rejects_others() {
+        assert_eq!(
+            parse_args(&["input.wk".to_owned()])
+                .unwrap()
+                .unwrap()
+                .target_cpu,
+            wukong_driver::TargetCpu::Native
+        );
+        for name in wukong_driver::TargetCpu::NAMES {
+            let args = [
+                format!("--target-cpu={name}"),
+                "--emit=obj".into(),
+                "in.wk".into(),
+            ];
+            let opts = parse_args(&args).unwrap().unwrap();
+            assert_eq!(opts.target_cpu.name(), *name);
+            assert!(USAGE.contains(name), "USAGE must list {name}");
+        }
+        let err =
+            parse_args(&["--target-cpu=pentium4".to_owned(), "in.wk".to_owned()]).unwrap_err();
+        assert!(
+            err.contains("pentium4") && err.contains("x86-64-v3"),
+            "{err}"
+        );
     }
 }

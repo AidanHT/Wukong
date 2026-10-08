@@ -1,0 +1,308 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -1
+// EXPECT-OUT: 4
+// EXPECT-OUT: -7
+// EXPECT-OUT: -6
+// EXPECT-OUT: -5
+// EXPECT-OUT: 0
+// EXPECT-OUT: -1
+// EXPECT-OUT: -2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: -5
+// EXPECT-OUT: -6
+// EXPECT-OUT: 9
+// EXPECT-OUT: 2
+// EXPECT-OUT: -1
+// EXPECT-OUT: -4
+// EXPECT-OUT: 5
+// EXPECT-OUT: -2
+// EXPECT-OUT: -1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 7
+// EXPECT-OUT: -3
+// EXPECT-OUT: -5
+// EXPECT-OUT: -3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 8
+// EXPECT-OUT: 0
+// EXPECT-OUT: -4
+// EXPECT-OUT: -1
+// EXPECT-OUT: 5
+// EXPECT-OUT: -5
+// EXPECT-OUT: -3
+// EXPECT-OUT: -1
+// EXPECT-OUT: 5
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: 7
+// EXPECT-OUT: 1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -3
+// EXPECT-OUT: 7
+// EXPECT-OUT: 1
+// EXPECT-OUT: -4
+// EXPECT-OUT: -1
+// EXPECT-OUT: 6
+// EXPECT-OUT: -3
+// EXPECT-OUT: -4
+// EXPECT-OUT: -1
+// EXPECT-OUT: 0
+// EXPECT-OUT: -3
+// EXPECT-OUT: -2
+// EXPECT-OUT: 7
+// EXPECT-OUT: 0
+// EXPECT-OUT: -3
+// EXPECT-OUT: -2
+// EXPECT-OUT: -8
+// EXPECT-OUT: -14
+// EXPECT-OUT: -20
+// EXPECT-OUT: -4
+// EXPECT-OUT: -6
+// EXPECT-OUT: -8
+// EXPECT-OUT: -10
+// EXPECT-OUT: -6
+// EXPECT-OUT: -4
+// EXPECT-OUT: -2
+// EXPECT-OUT: 0
+// EXPECT-OUT: -8
+// EXPECT-OUT: -2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 10
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -2
+// EXPECT-OUT: -8
+// EXPECT-OUT: -14
+// EXPECT-OUT: -20
+// EXPECT-OUT: -4
+// EXPECT-OUT: -6
+// EXPECT-OUT: -8
+// EXPECT-OUT: -10
+// EXPECT-OUT: -6
+// EXPECT-OUT: -4
+// EXPECT-OUT: -2
+// EXPECT-OUT: 0
+// EXPECT-OUT: -8
+// EXPECT-OUT: -2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 10
+// EXPECT-OUT: -10
+// EXPECT-OUT: 0
+// EXPECT-OUT: 10
+// EXPECT-OUT: 20
+// EXPECT-OUT: -12
+// EXPECT-OUT: 2
+// EXPECT-OUT: 16
+// EXPECT-OUT: 30
+// EXPECT-OUT: -14
+// EXPECT-OUT: 4
+// EXPECT-OUT: 22
+// EXPECT-OUT: 40
+// EXPECT-OUT: -16
+// EXPECT-OUT: 6
+// EXPECT-OUT: 28
+// EXPECT-OUT: 50
+// EXPECT-OUT: -8
+// EXPECT-OUT: -1
+// EXPECT-OUT: 6
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 17
+// EXPECT-OUT: 20
+// EXPECT-OUT: 23
+// EXPECT-OUT: 36
+// EXPECT-OUT: 35
+// EXPECT-OUT: 34
+// EXPECT-OUT: 33
+// EXPECT-OUT: 58
+// EXPECT-OUT: 53
+// EXPECT-OUT: 48
+// EXPECT-OUT: 43
+module tests.run.spelling_tiled_gemm_ragged
+
+// The tilings a blocked GEMM is really written with (P12.1): tiles that do NOT divide the extents,
+// clamped with `min`, over symbolic `Tensor` dims - `examples/matmul.wk`'s structure with a scalar
+// inner kernel - each the untiled nest it enumerates, and the `wukong_sgemm` kernel:
+//
+// * `mm_counted` - counted tiles (`for it in 0..ceil(M/MT) { let i0 = it*MT; let i1 = min(i0 + MT,
+//   M); ... }`), tile widths as function-local consts, ragged in all three dims (5x7 by 7x6 with
+//   4-wide tiles), the contraction tiled too, accumulating into C through a C-seeded scalar
+//   (`let mut s = c[i, j]; for k in k0..k1 { s += ... } c[i, j] = s;`). Dispatched behind a run-time
+//   `ceil(M/MT)*MT >= M` test, since the dims are runtime values.
+// * `mm_step_min` - stepped tiles over literal extents clamped with `min`: no run-time test needed.
+// * `mm_rows` - full tiles over a RUNTIME row count: the untiled nest only when `m % 4 == 0`, which
+//   is tested at run time. `m = 4` takes the kernel (rows 4..7 keep their -1 sentinel); `m = 6` does
+//   not divide, so the loop as written runs - and it computes rows 0..7 (two whole tiles), which a
+//   kernel over `0..6` would not. Every lane of both results is printed, so a missing test shows.
+// * `mm_acc` - the untiled C-seeded accumulation, `C += A*B` with a scalar running sum.
+//
+// All data are small integers, so every product and sum is exact in f32 under any order; the
+// expected values are the integer scalar semantics of each loop nest.
+
+fn mm_counted<M, N, K>(a: Tensor[f32, M, K], b: Tensor[f32, K, N], mut c: Tensor[f32, M, N]) {
+    const MT: usize = 4;
+    const NT: usize = 4;
+    const KT: usize = 4;
+
+    @parallel(grain = 1)
+    for it in 0..((M + MT - 1) / MT) {
+        let i0 = it * MT;
+        let i1 = min(i0 + MT, M);
+        for jt in 0..((N + NT - 1) / NT) {
+            let j0 = jt * NT;
+            let j1 = min(j0 + NT, N);
+            for kt in 0..((K + KT - 1) / KT) {
+                let k0 = kt * KT;
+                let k1 = min(k0 + KT, K);
+                for i in i0..i1 {
+                    for j in j0..j1 {
+                        let mut s = c[i, j];
+                        for k in k0..k1 {
+                            s += a[i, k] * b[k, j];
+                        }
+                        c[i, j] = s;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn mm_step_min(a: [f32; 35], b: [f32; 42], mut c: [f32; 30]) {
+    for i0 in 0..5 step 2 {
+        for j0 in 0..6 step 4 {
+            for i in i0..min(i0 + 2, 5) {
+                for j in j0..min(j0 + 4, 6) {
+                    let mut s: f32 = 0.0;
+                    for k in 0..7 {
+                        s = s + a[i * 7 + k] * b[k * 6 + j];
+                    }
+                    c[i * 6 + j] = s;
+                }
+            }
+        }
+    }
+}
+
+fn mm_rows(a: [f32; 32], b: [f32; 16], mut c: [f32; 32], m: i64) {
+    for i0 in 0..m step 4 {
+        for i in i0..i0 + 4 {
+            for j in 0..4 {
+                let mut s: f32 = 0.0;
+                for k in 0..4 {
+                    s = s + a[i * 4 + k] * b[k * 4 + j];
+                }
+                c[i * 4 + j] = s;
+            }
+        }
+    }
+}
+
+fn mm_acc(a: [f32; 16], b: [f32; 16], mut c: [f32; 16]) {
+    for i in 0..4 {
+        for j in 0..4 {
+            let mut s: f32 = c[i * 4 + j];
+            for k in 0..4 {
+                s = s + a[i * 4 + k] * b[k * 4 + j];
+            }
+            c[i * 4 + j] = s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    // A[i, k] = (i + 2k) % 5 - 2 (5x7), B[k, j] = (3k + j) % 4 - 1 (7x6), C0[i, j] = i - j.
+    let mut a: [f32; 35] = [0.0; 35];
+    let mut b: [f32; 42] = [0.0; 42];
+    let mut c1: [f32; 30] = [0.0; 30];
+    let mut c2: [f32; 30] = [0.0; 30];
+    for i in 0..5 {
+        for k in 0..7 {
+            a[i * 7 + k] = ((i + 2 * k) % 5 - 2) as f32;
+        }
+    }
+    for k in 0..7 {
+        for j in 0..6 {
+            b[k * 6 + j] = ((3 * k + j) % 4 - 1) as f32;
+        }
+    }
+    for i in 0..5 {
+        for j in 0..6 {
+            c1[i * 6 + j] = (i - j) as f32;
+            c2[i * 6 + j] = -100.0;
+        }
+    }
+    mm_counted::<5, 6, 7>(a, b, c1);
+    mm_step_min(a, b, c2);
+    for t in 0..30 {
+        print(c1[t] as i32);
+    }
+    for t in 0..30 {
+        print(c2[t] as i32);
+    }
+
+    // A2[i, k] = i - k (8x4), B2[k, j] = k + j - 2 (4x4); C starts at the -1 sentinel.
+    let mut a2: [f32; 32] = [0.0; 32];
+    let mut b2: [f32; 16] = [0.0; 16];
+    let mut r4: [f32; 32] = [0.0; 32];
+    let mut r6: [f32; 32] = [0.0; 32];
+    for i in 0..8 {
+        for k in 0..4 {
+            a2[i * 4 + k] = (i - k) as f32;
+            r4[i * 4 + k] = -1.0;
+            r6[i * 4 + k] = -1.0;
+        }
+    }
+    for k in 0..4 {
+        for j in 0..4 {
+            b2[k * 4 + j] = (k + j - 2) as f32;
+        }
+    }
+    mm_rows(a2, b2, r4, 4);
+    mm_rows(a2, b2, r6, 6);
+    for t in 0..32 {
+        print(r4[t] as i32);
+    }
+    for t in 0..32 {
+        print(r6[t] as i32);
+    }
+
+    // A3[i, k] = i + k - 3, B3[k, j] = 2k - j, C0[i, j] = 10i + j (4x4).
+    let mut a3: [f32; 16] = [0.0; 16];
+    let mut b3: [f32; 16] = [0.0; 16];
+    let mut c3: [f32; 16] = [0.0; 16];
+    for i in 0..4 {
+        for j in 0..4 {
+            a3[i * 4 + j] = (i + j - 3) as f32;
+            b3[i * 4 + j] = (2 * i - j) as f32;
+            c3[i * 4 + j] = (10 * i + j) as f32;
+        }
+    }
+    mm_acc(a3, b3, c3);
+    for t in 0..16 {
+        print(c3[t] as i32);
+    }
+    return 0;
+}

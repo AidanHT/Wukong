@@ -34,12 +34,15 @@ array.wk:
 array_assign_extent.wk:
 array_of_struct.wk:
 array_of_tuple.wk:
+array_repeat_aggregate_once.wk:
 assert.wk:
 assert_fail.wk:
 assert_fail_trailing_output.wk:
 atan.wk: wukong_vmath_f32
 atan2_hypot.wk: wukong_vmath2_f32
 attention.wk: wukong_norm_f32 wukong_sgemm wukong_sgemm_nt
+autodiff_train_helper.wk:
+autodiff_train_sumsq.wk: wukong_sreduce_f32_parallel
 avgpool.wk: wukong_avgpool2d_f32
 axpby_f16.wk: wukong_axpby_f16
 axpby_half_out.wk: wukong_axpby_bf16_out wukong_axpby_f16_out

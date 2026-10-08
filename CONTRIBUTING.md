@@ -205,7 +205,9 @@ two-block loop the fixpoint produces, and re-running it on its own output would 
 every sweep). If you write a pass like that, give it a way to recognize what it already did, and
 measure its compile-time cost — `cargo run --release -p wukong_bench -- compile-time` reports each
 stage's in-process share, and a whole-program pass that rebuilds a dominator tree per function will
-show up there immediately.
+show up there immediately. For one program, `wukongc --time-passes <file>` prints the same stage
+split plus the optimizer's per-pass breakdown for that compile (`--time-trace=<f>` writes it as
+Chrome trace JSON); it changes neither the output nor the emitted object.
 
 **Never trade exactness for speed in a pass.** Reassociating float arithmetic — the classic
 multiple-accumulator reduction unroll — computes a different number, which breaks both the
@@ -332,7 +334,8 @@ arm added without its tape counterpart breaks every `@parallel` backward, so run
 LANDMINE: kernel dispatch is **gate-blind**. The interpreter calls the same function, so a kernel
 bug is identical on both backends and the differential gate stays green — the in-crate
 scalar-twin/naive tests are the only real oracle. To confirm a program actually dispatches, grep the
-output of `wukongc --emit=mir -O2 prog.wk` for `wukong_`.
+output of `wukongc --emit=mir -O2 prog.wk` for `wukong_`, or compile with `--remarks=dispatch`,
+which prints a note naming the kernel at every statement a recognizer replaced.
 
 A new recognizer must also stay **switchable**, because that is what makes a claim about the language
 falsifiable. Recognizers are probed from four places in `wukong_mir_build`, and each one is already

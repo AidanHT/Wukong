@@ -484,6 +484,7 @@ unsafe fn layernorm_bwd_row(
 /// # Safety
 /// `x`, `dy`, `dx` valid for `rows*cols` f32; `gamma` null or valid for `cols` f32. `dx` must not
 /// overlap `x`/`dy` (each row reads `x`/`dy` during its apply).
+/// **Aliasing: all operands disjoint** — `dx` overlaps none of `x`, `dy`, `gamma`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_layernorm_bwd_f32(
     x: *const f32,
@@ -513,6 +514,8 @@ pub unsafe extern "C" fn wukong_layernorm_bwd_f32(
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_layernorm_bwd_f32`].
+/// **Aliasing:** that of [`wukong_layernorm_bwd_f32`] — all operands disjoint: `dx` overlaps none
+/// of `x`, `dy`, `gamma`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_layernorm_bwd_f32_parallel(
     x: *const f32,

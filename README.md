@@ -33,11 +33,13 @@ conv, and serving benchmarks in the tree are Rust launchers, not `.wk` programs.
 wukongc --run examples/saxpy_array.wk              # interpreter (default)
 wukongc --run --backend=native tests/run/tensor_matmul.wk
 wukongc --emit=mir -O2 tests/run/transcendental_kernel.wk   # inspect lowered MIR
+wukongc --emit=exe -O2 --target-cpu=x86-64 examples/fib.wk  # portable AOT executable
 ```
 
 `--run` defaults to the interpreter; add `--backend=native` for the Cranelift JIT. GPU backends
 require building with `--features gpu` and a CUDA device. See `wukongc --help` for `--emit`,
-`-O0`…`-O3`, `--grad-of` / `--train`, and the rest of the CLI.
+`-O0`…`-O3`, `--grad-of` / `--train`, and the rest of the CLI; `--time-passes` shows where a
+compile's time went, and `--depfile=<f>` writes a Make dependency rule over the imported files.
 
 ## Why Wukong
 
@@ -97,7 +99,8 @@ not duplicate them. In summary, Wukong:
   door beside the loop-nest recognizers (`tests/run/builtin_*.wk`).
 - **Zero hidden cost.** No GC, no implicit copies of large aggregates, no surprise allocations.
 - **Domain-aware optimization (implementation today).** The compiler **recognizes a matmul nest** (the
-  `ikj` accumulate and `ijk` dot-product forms, incl. `nn.Linear` `A·Bᵀ`) and may lower it to a tuned
+  `ikj` accumulate and `ijk` dot-product forms, incl. `nn.Linear` `A·Bᵀ`, written naively or
+  hand-tiled — ragged `min`-clamped tiles included) and may lower it to a tuned
   **register-blocked, cache-tiled, packed AVX2/FMA GEMM microkernel**. It also **auto-vectorizes**
   elementwise loops (incl. branchy ones via if-conversion) and **reductions** to SIMD, contracts
   `x + y*z` to a **fused multiply-add** (a documented, deterministic floating-point contract;
@@ -107,7 +110,9 @@ not duplicate them. In summary, Wukong:
   `-O1` and above. Op-graph fusion across
   tensor ops is still planned **as a CPU MIR pass**; on GPU, `wukong_codegen_gpu`'s fusion planner and
   `--backend=gpu-native` can compile an eligible whole program into a cooperative megakernel. These
-  recognizers are invisible to the user — you still write the loop nest in `.wk`.
+  recognizers are invisible to the user — you still write the loop nest in `.wk` — unless you ask:
+  `--remarks=dispatch` notes each loop that became a kernel call, and `@generic` on a `fn` or a loop
+  keeps it as written.
 - **Interop.** Calling C runs today: an `extern "C" { fn ldexp(x: f64, e: i32) -> f64; }` block
   is imported by the native backend (JIT-bound from the host process, or left to the linker for
   `--emit=exe`), and the interpreter calls the same host symbol for scalar signatures, so the two
@@ -256,8 +261,11 @@ contraction, loop fusion, and `@parallel` multicore execution over fixed-size-ar
 autodiff**
 (`wukong_autodiff`, driven from the CLI via `--emit=grad` / `--train`) emits the training backward
 pass and runs a fwd→bwd→optimizer (SGD/AdamW) loop on the interpreter or native Cranelift JIT.
-Training accepts concrete f32 arrays and dense tensors; AOT training and measured training speedups
-remain open. See the [training CLI contract](docs/language-guide.md#command-line-interface).
+Every recognized tensor kernel has a VJP (riding the runtime's tuned backward kernels) or a named
+refusal, losses may call helper functions, `--emit=obj --grad-of=<fn>` exports the gradient ahead
+of time, and scalar-path losses have Hessian-vector products. Training accepts concrete f32 arrays
+and dense tensors; an AOT training loop and measured training speedups remain open. See the
+[training CLI contract](docs/language-guide.md#command-line-interface).
 Tuples and structs (incl. nested struct-in-struct, **by-value parameters and `-> Struct` returns** via
 an sret ABI, nested tuple fields `t.0.1`, and whole-aggregate assignment), pointers/references
 (`&mut`/`*p`), and `loop`/`while`/`for` with `break`/`continue` (incl. **labeled loops** `'outer: …`

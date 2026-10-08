@@ -192,6 +192,7 @@ unsafe fn gemv_rows(a: *const f32, x: *const f32, y: *mut f32, m: usize, n: usiz
 ///
 /// # Safety
 /// `a` valid for `m*n` `f32`, `x` for `n`, `y` for `m`; `y` must not overlap `a` or `x`.
+/// **Aliasing: all operands disjoint** — `y` overlaps neither `a` nor `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sgemv(a: *const f32, x: *const f32, y: *mut f32, m: i64, n: i64) {
     if m <= 0 || n <= 0 {
@@ -211,6 +212,8 @@ pub unsafe extern "C" fn wukong_sgemv(a: *const f32, x: *const f32, y: *mut f32,
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_sgemv`].
+/// **Aliasing: all operands disjoint** — `y` must overlap neither `a` nor `x` (each row's dot is
+/// folded before its store, and a later row would read a replaced value).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sgemv_alpha(
     a: *const f32,
@@ -233,6 +236,8 @@ pub unsafe extern "C" fn wukong_sgemv_alpha(
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_sgemv`].
+/// **Aliasing:** that of [`wukong_sgemv_alpha`] — all operands disjoint: `y` overlaps neither `a`
+/// nor `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sgemv_alpha_parallel(
     a: *const f32,
@@ -292,6 +297,8 @@ pub unsafe extern "C" fn wukong_sgemv_alpha_parallel(
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_sgemv`].
+/// **Aliasing:** that of [`wukong_sgemv`] — all operands disjoint: `y` overlaps neither `a` nor
+/// `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sgemv_parallel(
     a: *const f32,

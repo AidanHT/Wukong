@@ -237,6 +237,8 @@ unsafe fn logsumexp_row(x: *const f32, out: *mut f32, n: usize) {
 ///
 /// # Safety
 /// `x` and `out` must each be valid for `rows * cols` `f32` elements.
+/// **Aliasing: exactly in place, otherwise disjoint** — `out` may be EXACTLY `x`, never a shifted
+/// view of it.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_logsoftmax_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
     if rows <= 0 || cols <= 0 {
@@ -257,6 +259,8 @@ pub unsafe extern "C" fn wukong_logsoftmax_f32(x: *const f32, out: *mut f32, row
 ///
 /// # Safety
 /// `x` and `out` must each be valid for `rows * cols` `f32` elements.
+/// **Aliasing:** that of [`wukong_logsoftmax_f32`] — `out` may be EXACTLY `x` (each row is
+/// read whole before it is written), never a shifted view of it.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_logsoftmax_f32_parallel(
     x: *const f32,
@@ -292,6 +296,9 @@ pub unsafe extern "C" fn wukong_logsoftmax_f32_parallel(
 ///
 /// # Safety
 /// `x` must be valid for `rows * cols` `f32`; `out` must be valid for `rows` `f32`.
+/// **Aliasing: all operands disjoint** — the `rows`-long `out` must not overlap `x` (row `r`'s
+/// result is stored while later rows are still read). The compiler versions a recognized call on
+/// a run-time overlap test (`wukong_mir_build`'s `kernel_guard.rs`).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_logsumexp_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
     if rows <= 0 || cols <= 0 {
@@ -310,6 +317,8 @@ pub unsafe extern "C" fn wukong_logsumexp_f32(x: *const f32, out: *mut f32, rows
 ///
 /// # Safety
 /// `x` must be valid for `rows * cols` `f32`; `out` must be valid for `rows` `f32`.
+/// **Aliasing:** that of [`wukong_logsumexp_f32`] — all operands disjoint: `out` does not overlap
+/// `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_logsumexp_f32_parallel(
     x: *const f32,

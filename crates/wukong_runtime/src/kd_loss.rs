@@ -215,6 +215,9 @@ unsafe fn kd_loss_row(x: *const f32, q: *const f32, n: usize) -> f32 {
 ///
 /// # Safety
 /// `x`, `q` valid for `rows*cols` f32; `out` valid for `rows`.
+/// **Aliasing: all operands disjoint** — `out` must overlap neither `x` nor `q` (the two inputs
+/// are only read and may share storage). The compiler guarantees it for a recognized call
+/// (`wukong_mir_build`'s `kernel_guard.rs`).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_kd_loss_f32(
     x: *const f32,
@@ -240,7 +243,9 @@ pub unsafe extern "C" fn wukong_kd_loss_f32(
 /// call agrees with this `@parallel` path exactly).
 ///
 /// # Safety
-/// Operand-size contract of [`wukong_kd_loss_f32`].
+/// Operand-size and aliasing contract of [`wukong_kd_loss_f32`].
+/// **Aliasing:** that of [`wukong_kd_loss_f32`] — all operands disjoint: `out` overlaps neither `x`
+/// nor `q`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_kd_loss_f32_parallel(
     x: *const f32,

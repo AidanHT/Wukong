@@ -368,6 +368,8 @@ unsafe fn reduce_chunk_avx2_mono<const OP: i64>(
 ///
 /// # Safety
 /// `x` and `y` must each be valid for `n` `f32` elements.
+/// **Aliasing: none constrained** — every operand is only read and the result is returned by
+/// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sreduce_f32(x: *const f32, y: *const f32, n: i64, op: i64) -> f32 {
     if n <= 0 {
@@ -393,6 +395,8 @@ pub unsafe extern "C" fn wukong_sreduce_f32(x: *const f32, y: *const f32, n: i64
 ///
 /// # Safety
 /// `x` and `y` must each be valid for `n` `f32` elements.
+/// **Aliasing: none constrained** — every operand is only read and the result is returned by
+/// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sreduce_f32_parallel(
     x: *const f32,
@@ -616,6 +620,8 @@ unsafe fn argreduce_chunk_avx2<const PRED: i32>(
 ///
 /// # Safety
 /// `x` valid for `n` `f32`.
+/// **Aliasing: none constrained** — every operand is only read and the result is returned by
+/// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_argreduce_f32(x: *const f32, n: i64, op: i64) -> i64 {
     if n <= 0 {
@@ -645,6 +651,8 @@ pub unsafe extern "C" fn wukong_argreduce_f32(x: *const f32, n: i64, op: i64) ->
 ///
 /// # Safety
 /// `x` valid for `n` `f32`.
+/// **Aliasing: none constrained** — every operand is only read and the result is returned by
+/// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_argreduce_f32_parallel(x: *const f32, n: i64, op: i64) -> i64 {
     if n <= 0 {

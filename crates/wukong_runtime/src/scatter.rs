@@ -145,6 +145,12 @@ unsafe fn scatter_rows(
 /// `grad_w` valid for `v*h` f32 (readable+writable), `grad_out` valid for `t*h` f32, `ids` valid for `t`
 /// `i32`, non-overlapping `grad_w`/`grad_out`, when all extents are positive. No pointer is accessed
 /// when any extent is non-positive, so null pointers are permitted in that case.
+///
+/// **Aliasing: `grad_w` disjoint from `grad_out` AND from `ids`**, for this serial entry as much as
+/// for the parallel one. The compiler relies on exactly this contract: `wukong_mir_build`
+/// dispatches a recognized scatter-add only when all three operands are disjoint (proved at compile
+/// time, or by a run-time range test in `kernel_guard.rs`) and lowers the source loop otherwise —
+/// it no longer routes an overlapping call to this serial form, so the form need not tolerate one.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_scatter_add_f32(
     grad_w: *mut f32,
@@ -172,7 +178,9 @@ pub unsafe extern "C" fn wukong_scatter_add_f32(
 /// `grad_w` must be pre-zeroed by the caller.
 ///
 /// # Safety
-/// Operand-size contract of [`wukong_scatter_add_f32`].
+/// Operand-size and aliasing contract of [`wukong_scatter_add_f32`].
+/// **Aliasing:** that of [`wukong_scatter_add_f32`] — `grad_w` overlaps neither `grad_out` nor
+/// `ids`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_scatter_add_f32_parallel(
     grad_w: *mut f32,
