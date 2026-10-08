@@ -14,14 +14,28 @@
 //! backend — the interpreter runs the same validation and returns the same status. An output that
 //! overlaps an input is handled by the entries themselves (value semantics), so no address test is
 //! emitted here.
+//!
+//! **The half-weight GEMV recognizer.** The loop nest a decode step writes by hand,
+//! `for j in 0..N { let s = 0.0; for p in 0..K { s = s + x[p] * (w[j*K + p] as f32) }; y[j] = s }`
+//! over a `bf16`/`f16` weight, dispatches to the same `wukong_sgemv_{bf16,f16}` entry
+//! ([`match_half_gemv`], [`FnLowerer::emit_half_gemv`]), behind the usual run-time alias guard and
+//! empty-contraction test. The kernel computes each output with the f32 GEMM's per-element order —
+//! for `K <= 384` exactly the nest's own FMA-contracted chain from `0.0`, beyond that K-blocked, the
+//! documented reassociation every reduction kernel carries. The quantized GEMVs have no recognizer:
+//! their per-call activation quantization is part of their definition, so no plain loop means them.
 
-use wukong_ast::Expr;
+use wukong_ast::{self as ast, Block, Expr, ExprKind, ForIter, Pattern, StmtKind};
 use wukong_mir::{CmpOp, MirType, Op, ValueId};
-use wukong_sema::{decode_builtin, DecodeBuiltin};
+use wukong_sema::{decode_builtin, DecodeBuiltin, SemaResult};
 use wukong_span::{Interner, Span, Symbol};
 use wukong_types::Scalar;
 
-use crate::FnLowerer;
+use crate::alias::OperandPair;
+use crate::kernel_guard::GuardOperand;
+use crate::{
+    as_dim, as_index1, as_int_lit, fusable_for, is_f32_expr, is_float_zero, match_row_col,
+    range_bounds, scalar_of, single_path, Dim, FnLowerer,
+};
 
 /// The runtime entries this module lowers to, interned once at the top of `lower_program` and
 /// carried on `GemmSyms` (`FnLowerer` holds only a shared `&Interner`).
@@ -166,6 +180,214 @@ impl FnLowerer<'_> {
         let y = self.ml_buffer(&args[2])?;
         Some(self.ml_call(func, vec![w.data, w.len, x.data, x.len, y.data, y.len]))
     }
+
+    /// Emit the `wukong_sgemv_{bf16,f16}[_parallel]` call for a recognized half-weight GEMV nest, or
+    /// decline (false) when an operand or extent is unbound here or the alias plan refuses, so the
+    /// caller lowers the nest itself. The weight, activation and output extents the nest implies
+    /// (`N·K`, `K`, `N`) are the call's lengths, so the entry's shape check passes for every
+    /// non-negative `N`; the output must be disjoint from both inputs (versioned at run time when the
+    /// compiler cannot tell).
+    pub(crate) fn emit_half_gemv(&mut self, nest: &HalfGemvNest, parallel: bool) -> bool {
+        let (Some(w), Some(x), Some(y)) = (
+            self.kernel_base_ptr(nest.w),
+            self.kernel_base_ptr(nest.x),
+            self.kernel_base_ptr(nest.y),
+        ) else {
+            return false;
+        };
+        let (Some(n), Some(k)) = (self.dim_value(nest.n), self.dim_value(nest.k)) else {
+            return false;
+        };
+        let w_elems = self.guard_extent(n, k);
+        let half = if nest.f16 {
+            MirType::F16
+        } else {
+            MirType::BF16
+        };
+        let ops = [
+            GuardOperand::new(nest.w, w, w_elems, half),
+            GuardOperand::new(nest.x, x, k, MirType::F32),
+            GuardOperand::new(nest.y, y, n, MirType::F32),
+        ];
+        if !self.open_kernel_guard(
+            &ops,
+            &[OperandPair::disjoint(0, 2), OperandPair::disjoint(1, 2)],
+        ) {
+            return false;
+        }
+        let s = self.gemm.decode;
+        let func = match (nest.f16, parallel) {
+            (false, false) => s.sgemv_bf16,
+            (false, true) => s.sgemv_bf16_par,
+            (true, false) => s.sgemv_f16,
+            (true, true) => s.sgemv_f16_par,
+        };
+        // A negative `N` (a loop that runs no row) is refused by the entry with nothing written —
+        // exactly what the nest does; the status is otherwise always 0, so it is not checked.
+        self.ml_call(func, vec![w, w_elems, x, k, y, n]);
+        true
+    }
+}
+
+/// A recognized half-weight GEMV nest `y[j] = Σ_p x[p]·(w[j·K + p] as f32)`: `w` a `bf16`/`f16`
+/// buffer `[N·K]` (row-major `[N, K]`), `x` an `f32` buffer `[K]`, `y` an `f32` buffer `[N]`.
+pub(crate) struct HalfGemvNest {
+    w: Symbol,
+    x: Symbol,
+    y: Symbol,
+    /// Rows: the outer bound.
+    n: Dim,
+    /// The contraction: the inner bound.
+    k: Dim,
+    /// `f16` weights (else `bf16`).
+    f16: bool,
+}
+
+impl HalfGemvNest {
+    /// The contraction extent, which the empty-contraction test keys on.
+    pub(crate) fn k(&self) -> Dim {
+        self.k
+    }
+}
+
+/// One factor order of the product: `x_e` is `x[p]` (an `f32` element indexed by the inner variable
+/// alone) and `w_e` is `w[row·K + p] as f32` over a `bf16`/`f16` buffer. Returns `(w, x, f16)`.
+#[allow(clippy::too_many_arguments)]
+fn half_gemv_operands(
+    x_e: &Expr,
+    w_e: &Expr,
+    row: Symbol,
+    p: Symbol,
+    k: Dim,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<(Symbol, Symbol, bool)> {
+    let (x_sym, x_idx) = as_index1(x_e)?;
+    if single_path(x_idx) != Some(p) || !is_f32_expr(x_e, sema) {
+        return None;
+    }
+    let ExprKind::Cast { expr: inner, .. } = &w_e.kind else {
+        return None;
+    };
+    if !is_f32_expr(w_e, sema) {
+        return None;
+    }
+    let f16 = match scalar_of(inner, sema)? {
+        Scalar::Bf16 => false,
+        Scalar::F16 => true,
+        _ => return None,
+    };
+    let (w_sym, w_idx) = as_index1(inner)?;
+    let (stride, col) = match_row_col(w_idx, row, interner)?;
+    if stride != k || col != p {
+        return None;
+    }
+    Some((w_sym, x_sym, f16))
+}
+
+/// Recognize the half-weight GEMV nest rooted at `for j in 0..N { let s = 0.0; for p in 0..K {
+/// s = s + x[p] * (w[j*K + p] as f32) }; y[j] = s }` — either factor order, `s += …` too, an `f32`
+/// accumulator and an `f32` output, a plain store (no scale). See [`HalfGemvNest`].
+pub(crate) fn match_half_gemv(
+    pat: &Pattern,
+    iter: &ForIter,
+    body: &Block,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<HalfGemvNest> {
+    let ast::PatKind::Ident(row) = &pat.kind else {
+        return None;
+    };
+    let row = *row;
+    let (start, end) = range_bounds(iter)?;
+    if as_int_lit(start, interner)? != 0 {
+        return None;
+    }
+    let n = as_dim(end, interner)?;
+    if body.tail.is_some() || body.stmts.len() != 3 {
+        return None;
+    }
+    let StmtKind::Let {
+        pat: sp,
+        init: Some(s0),
+        ..
+    } = &body.stmts[0].kind
+    else {
+        return None;
+    };
+    let ast::PatKind::Ident(s_sym) = &sp.kind else {
+        return None;
+    };
+    let s_sym = *s_sym;
+    if !is_float_zero(s0, interner) || !is_f32_expr(s0, sema) {
+        return None;
+    }
+    let (ppat, piter, pbody) = fusable_for(&body.stmts[1])?;
+    let ast::PatKind::Ident(p_sym) = &ppat.kind else {
+        return None;
+    };
+    let p_sym = *p_sym;
+    let (ps, pe) = range_bounds(piter)?;
+    if as_int_lit(ps, interner)? != 0 {
+        return None;
+    }
+    let k = as_dim(pe, interner)?;
+    if pbody.tail.is_some() || pbody.stmts.len() != 1 {
+        return None;
+    }
+    let StmtKind::Assign { target, op, value } = &pbody.stmts[0].kind else {
+        return None;
+    };
+    if single_path(target) != Some(s_sym) {
+        return None;
+    }
+    let prod = match op {
+        ast::AssignOp::Add => value,
+        ast::AssignOp::Assign => {
+            let ExprKind::Binary {
+                op: ast::BinOp::Add,
+                lhs,
+                rhs,
+            } = &value.kind
+            else {
+                return None;
+            };
+            if single_path(lhs) != Some(s_sym) {
+                return None;
+            }
+            rhs
+        }
+        _ => return None,
+    };
+    if !is_f32_expr(prod, sema) {
+        return None;
+    }
+    let ExprKind::Binary {
+        op: ast::BinOp::Mul,
+        lhs,
+        rhs,
+    } = &prod.kind
+    else {
+        return None;
+    };
+    let (w, x, f16) = half_gemv_operands(lhs, rhs, row, p_sym, k, sema, interner)
+        .or_else(|| half_gemv_operands(rhs, lhs, row, p_sym, k, sema, interner))?;
+    let StmtKind::Assign {
+        target: yt,
+        op: ast::AssignOp::Assign,
+        value: yv,
+    } = &body.stmts[2].kind
+    else {
+        return None;
+    };
+    if single_path(yv) != Some(s_sym) || !is_f32_expr(yt, sema) {
+        return None;
+    }
+    let (y, y_idx) = as_index1(yt)?;
+    if single_path(y_idx) != Some(row) || y == w || y == x {
+        return None;
+    }
+    Some(HalfGemvNest { w, x, y, n, k, f16 })
 }
 
 #[cfg(test)]
@@ -232,5 +454,31 @@ mod tests {
             text.contains("call wukong_gemv_q4_0_f32_parallel("),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_half_weight_gemv_nest_dispatches_to_the_half_gemv() {
+        let (text, diags) = mir("fn main() -> i32 { let w: [bf16; 12] = [0.5 as bf16; 12]; \
+             let h: [f16; 12] = [0.25 as f16; 12]; let x: [f32; 4] = [1.0; 4]; \
+             let mut y: [f32; 3] = [0.0; 3]; let mut z: [f32; 3] = [0.0; 3]; \
+             for j in 0..3 { let mut s: f32 = 0.0; \
+               for p in 0..4 { s = s + x[p] * (w[j * 4 + p] as f32); } y[j] = s; } \
+             for j in 0..3 { let mut s: f32 = 0.0; \
+               for p in 0..4 { s += (h[j * 4 + p] as f32) * x[p]; } z[j] = s; } \
+             return (y[0] + z[2]) as i32; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(text.matches("call wukong_sgemv_bf16(").count(), 1, "{text}");
+        assert_eq!(text.matches("call wukong_sgemv_f16(").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn a_half_gemv_with_a_scaled_store_is_left_to_the_loop() {
+        let (text, diags) = mir("fn main() -> i32 { let w: [bf16; 12] = [0.5 as bf16; 12]; \
+             let x: [f32; 4] = [1.0; 4]; let mut y: [f32; 3] = [0.0; 3]; \
+             for j in 0..3 { let mut s: f32 = 0.0; \
+               for p in 0..4 { s = s + x[p] * (w[j * 4 + p] as f32); } y[j] = s * 2.0; } \
+             return y[0] as i32; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(!text.contains("wukong_sgemv_bf16"), "{text}");
     }
 }

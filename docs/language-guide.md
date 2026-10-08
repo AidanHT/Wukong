@@ -1169,8 +1169,10 @@ array or a contiguous `Tensor[T, …]`. Each returns `()`.
 - **`gemv_bf16` / `gemv_f16`**: `y[j] = Σ_p x[p]·w[j·K + p]` with `N = len(y)`, `K = len(x)`, and `w`
   holding exactly `N·K` weights (the `nn.Linear` `[out, in]` layout). The weights are widened in
   registers, never copied to f32, and each output is computed exactly as the f32 `matmul_nt` row
-  would compute it on the widened weights (`tests/run/decode_gemv_half.wk`). A recognized
-  bf16/f16 `nn.Linear` with one to four rows takes the same path.
+  would compute it on the widened weights (`tests/run/decode_gemv_half.wk`). The loop nest
+  `for j in 0..N { let s = 0.0; for p in 0..K { s = s + x[p] * (w[j*K + p] as f32) }; y[j] = s }`
+  over a `bf16`/`f16` weight is recognized into the same kernel (`decode_gemv_half_loop.wk`), and a
+  recognized bf16/f16 `nn.Linear` with one to four rows takes the same path.
 - **Block quantization** uses llama.cpp's `Q8_0` and `Q4_0` layouts byte for byte: a row of `K`
   values is `ceil(K/32)` blocks of 32 (the last one zero-padded), each an `f16` scale `d` (little
   endian) followed by 32 signed bytes (`Q8_0`, 34 bytes per block, value `d·q`, `d = max|x| / 127`)

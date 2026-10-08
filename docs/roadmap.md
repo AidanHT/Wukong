@@ -452,7 +452,8 @@ another architecture or OS is not supported. A native-backend failure is a catal
   `skv` rows at a position offset, with grouped-query / multi-query heads and explicit row strides
   (`wukong_attention_kv_f32`; decoding one token at a time is bit-identical to a causal prefill), and
   `kv_append` grows the cache. `gemv_bf16` / `gemv_f16` multiply by half-precision weights without
-  ever materializing an f32 copy, and a recognized bf16/f16 `nn.Linear` with one to four rows now
+  ever materializing an f32 copy; the loop nest `y[j] = Σ x[p]·(w[j*K + p] as f32)` over a bf16/f16
+  weight is recognized into them, and a recognized bf16/f16 `nn.Linear` with one to four rows now
   takes the same streaming path (bit-identical to the old widen-then-GEMM result). `quantize_q8_0` /
   `quantize_q4_0` pack weights into llama.cpp's `Q8_0` / `Q4_0` blocks and `gemv_q8_0` / `gemv_q4_0`
   run the weight-only quantized GEMV (per-call `Q8_0` activation quantization, exact integer block
@@ -1165,8 +1166,10 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   contracted while `s = s + y*z` is, and there is no explicit `fma(a, b, c)` intrinsic yet, so a
   strict function cannot request a single-rounding multiply-add.
 
-- **Decode-builtin gaps.** A hand-written GEMV loop over `bf16`/`f16`/`u8` weights is not recognized
-  into the half / quantized GEMV kernels (call `gemv_bf16` / `gemv_q4_0` by name); the K-quant family
+- **Decode-builtin gaps.** Only the plain `y[j] = s` spelling of a half-weight GEMV loop is
+  recognized (a scaled store `y[j] = s * c` stays a loop), and a quantized GEMV has no loop spelling
+  at all — its per-call activation quantization is part of its definition, so call `gemv_q4_0` by
+  name; the K-quant family
   (`Q4_K`, `Q6_K`) and a quantized KV cache are not implemented; `sdpa_kv` has no padding mask or
   per-sequence batch dimension, takes the output's stride from the query's, and has no backward
   kernel (autodiff refuses it). The multi-token GPT-2 decode example over real weights is still to be

@@ -13791,6 +13791,17 @@ impl FnLowerer<'_> {
                     return;
                 }
             }
+            // The half-weight GEMV `y[j] = Σ_p x[p]·(w[j*K + p] as f32)` over a bf16/f16 `w` →
+            // `wukong_sgemv_{bf16,f16}` (`decode_builtins.rs`), the weight never widened to f32.
+            if let Some(nest) =
+                decode_builtins::match_half_gemv(pat, iter, body, self.sema, self.interner)
+            {
+                if self.emit_nonempty_reduction_loop(nest.k(), (label, pat, iter, body), |me| {
+                    me.emit_half_gemv(&nest, me.parallel_fn)
+                }) {
+                    return;
+                }
+            }
             // Vector·matrix `for j { let s=0; for i { s += w[i]*a[i*N+j] }; out[j] = s [* c] }` →
             // `wukong_sgevm_f32` (the `_parallel` one in a `@parallel` fn) — the KV-decode attention
             // read-out `out = scoresᵀ·V`. The j-outer source reads `a` column-strided (gcc/rustc leave it

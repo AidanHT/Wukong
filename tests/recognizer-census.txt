@@ -103,6 +103,7 @@ cumprod.wk: wukong_cumprod_f32
 cumsum.wk: wukong_cumsum_f32
 decode_attn.wk: wukong_norm_f32 wukong_sgemv_alpha wukong_sgevm_f32
 decode_gemv_half.wk: wukong_sgemv_bf16 wukong_sgemv_f16
+decode_gemv_half_loop.wk: wukong_sgemv_bf16 wukong_sgemv_f16
 decode_gemv_quant.wk: wukong_gemv_q4_0_f32 wukong_gemv_q8_0_f32 wukong_quantize_q4_0_f32 wukong_quantize_q8_0_f32
 decode_kv_attention.wk: wukong_attention_kv_f32 wukong_attention_kv_f32*2 wukong_kv_append_f32 wukong_kv_append_f32*2
 decode_shape_trap.wk: wukong_kv_append_f32 wukong_kv_append_f32*2
