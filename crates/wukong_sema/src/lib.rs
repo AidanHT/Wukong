@@ -4038,7 +4038,9 @@ impl<'a> Sema<'a> {
                 });
                 match field {
                     Some(fty) => fty,
-                    None if self.is_type_namespace(base) => Ty::Unknown,
+                    None if self.is_type_namespace(base) => {
+                        self.report_namespace_member(base, *name)
+                    }
                     None => self.report_missing_field(&t, *name),
                 }
             }

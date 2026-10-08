@@ -170,7 +170,7 @@ can apply.
 
 | code | what does not resolve |
 |---|---|
-| `E0301` | a value: `does_not_exist + 1` |
+| `E0301` | a value (`does_not_exist + 1`), or an enum variant (`Color::Gren` in a value, a call or a pattern) |
 | `E0320` | a called function — no `fn`, function-typed parameter or builtin has the name (`sqare(x)`: did you mean `square`?) |
 | `E0321` | a field: `p.z` on a struct without `z` (the struct's fields are listed), any field of an enum value or of a builtin type (`x.re` on an `f32`), a numbered field of a non-tuple (`x.0`) |
 | `E0322` | a method of a builtin type: an array, slice or tensor has `len()`, an array or tensor `dim(k)`, and nothing else; math functions are free functions — `sqrt(x)`, not `x.sqrt()` |

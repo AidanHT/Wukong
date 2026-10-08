@@ -312,6 +312,44 @@ impl Sema<'_> {
         )
     }
 
+    /// `base::name` in value position where `base` names a type rather than a value. The `Field` arm
+    /// has already resolved an enum's variants, so an enum here has no variant `name`: `E0301`, the
+    /// code the call form `E::V(..)` and the pattern form already report, with a suggestion. Any other
+    /// namespace (`f32::MAX`, `T::X`) stays the lenient unmodelled path. Returns the access's type.
+    pub(crate) fn report_namespace_member(&mut self, base: &Expr, name: Ident) -> Ty {
+        let ExprKind::Path(p) = &base.kind else {
+            return Ty::Unknown;
+        };
+        let ename = p.first().sym;
+        let variants: Vec<String> = match self.defs.lookup(ename).map(|d| &d.kind) {
+            Some(DefKind::Enum(vs)) => vs
+                .iter()
+                .map(|v| self.sym_str(v.name).to_string())
+                .collect(),
+            _ => return Ty::Unknown,
+        };
+        // A function of an `impl` block named without a call is not a variant either, but it is
+        // the method machinery's to report (`methods.rs`).
+        if self
+            .methods
+            .resolution
+            .table
+            .contains_key(&(ename, name.sym))
+        {
+            return Ty::Unknown;
+        }
+        let want = self.sym_str(name.sym).to_string();
+        let qual = format!("{}::{want}", self.sym_str(ename));
+        let mut d = Diagnostic::error(format!("no variant `{qual}`"))
+            .with_code("E0301")
+            .primary(name.span, "not a variant of this enum");
+        if let Some(c) = did_you_mean(&want, variants.iter().map(String::as_str)) {
+            d = d.suggest(name.span, "a variant with a similar name exists", c);
+        }
+        self.diags.push(d);
+        Ty::Error
+    }
+
     /// `E0321`: `.name` read from a value of type `base_ty` that has no field `name` — the struct
     /// lookup in the `Field` arm found nothing. Returns the access's type: `Unknown` where the base's
     /// fields are not known (`Unknown`, `Error`, a generic or an undeclared nominal type), `Error`
@@ -863,6 +901,24 @@ mod tests {
         assert!(codes("struct P { x: f32 } fn f(p: &P) -> f32 { return p.z; }").contains(&"E0321"));
         // As an assignment target.
         assert!(codes("struct P { x: f32 } fn f(mut p: P) { p.z = 1.0; }").contains(&"E0321"));
+    }
+
+    /// An unknown variant named as a VALUE is the same `E0301` the call and pattern forms report;
+    /// it used to type as `Unknown` and fail in lowering as `C0001`.
+    #[test]
+    fn an_unknown_variant_value_is_a_resolution_error() {
+        let d = only(
+            "enum Color { Red, Green } fn main() -> i32 { let c = Color::Gren; return 0; }",
+            "E0301",
+        );
+        assert_eq!(d.message, "no variant `Color::Gren`");
+        assert_eq!(replacement(&d), Some("Green"));
+        // A real variant, and an associated function's namespace, stay accepted.
+        let ds = diags(
+            "enum Color { Red, Green } impl Color { fn first() -> Color { return Color::Red; } } \
+             fn main() -> i32 { let c = Color::Green; let d = Color::first(); return 0; }",
+        );
+        assert!(ds.is_empty(), "{ds:?}");
     }
 
     #[test]

@@ -13,7 +13,8 @@ All notable changes to Wukong are documented here. The format is loosely based o
   resolution errors with a structured did-you-mean suggestion. Each used to type as a lenient
   `Unknown` and fail in lowering as the codegen limit `C0001`; an undeclared type name was silently
   lowered as an `i32` slot. Trait method signatures, bodiless functions and `sizeof` operands are
-  now checked for unknown type names too.
+  now checked for unknown type names too, and an unknown enum variant named as a value
+  (`Color::Gren`) is the `E0301` its call and pattern forms already were.
 - **One builtin callee registry** (`wukong_sema::is_builtin_callee` / `is_statement_builtin`, in
   `builtins.rs`) is shared by sema and `mir_build`; a single-name call that reaches lowering
   unresolved is an internal compiler error rather than `C0001`.
