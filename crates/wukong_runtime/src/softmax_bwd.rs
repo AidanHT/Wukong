@@ -102,9 +102,6 @@ pub unsafe extern "C" fn wukong_softmax_bwd_f32(
     }
 }
 
-/// Row count below which the parallel softmax-backward just runs serially.
-const SOFTMAX_BWD_PAR_MIN: usize = 8;
-
 /// Multi-threaded softmax backward: rows are mapped across cores, each computed by the identical
 /// per-row routine — so the result is **bit-identical to [`wukong_softmax_bwd_f32`]** (rows are
 /// independent, no cross-row combine).
@@ -123,7 +120,7 @@ pub unsafe extern "C" fn wukong_softmax_bwd_f32_parallel(
         return;
     }
     let (r, c) = (rows as usize, cols as usize);
-    if r < SOFTMAX_BWD_PAR_MIN {
+    if !crate::par::fork_rows(r, c, crate::par::W_ROWPASS) {
         wukong_softmax_bwd_f32(y, dy, dx, rows, cols);
         return;
     }
@@ -206,7 +203,8 @@ mod tests {
     /// the interpreter marshals the identical symbol the native backend calls, so interp==native
     /// proves nothing about the kernel's own arithmetic). `y` is a real per-row softmax distribution
     /// (positive, row-sums to 1) so the dot stays O(1) and well-conditioned. Shapes straddle the
-    /// 8-lane edge and the parallel row threshold (`SOFTMAX_BWD_PAR_MIN = 8`); both the serial and
+    /// 8-lane edge and the old 8-row gate (the test build forks every shape with >= 2 rows); both the
+    /// serial and
     /// the `_parallel` entry points are checked against the same f64 reference.
     #[test]
     fn matches_f64_reference() {

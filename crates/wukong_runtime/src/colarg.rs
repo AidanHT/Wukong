@@ -34,11 +34,6 @@
 //! stride `cols` — the strided arg-scan gcc/rustc leave **scalar** — the same gap the column
 //! value-reductions exploit.
 
-/// Column count below which the parallel entry just runs serially (the rayon fan-out only pays off
-/// once there are enough columns to spread across cores). Matches the small-input serial thresholds
-/// the other parallel column kernels use.
-const COLARG_PAR_MIN: usize = 256;
-
 /// Rows scanned per pass with the running best-value vectors held in **registers** (see
 /// [`colarg_avx2`]). Four keeps four independent `x` row streams in flight without exhausting the
 /// eight `bv` registers a [`COLARG_JB`]-wide tile needs.
@@ -335,7 +330,8 @@ unsafe fn colarg_serial(x: *const f32, out: *mut i32, rows: i64, cols: i64, is_m
 /// are split into disjoint contiguous stripes across cores (each core scans all rows for its column
 /// range). Every `out[j]` is written by exactly one thread, in the same i-ascending row order
 /// regardless of the split, so the result (including the lowest-index tie-break) is the same as serial
-/// — no cross-thread combine. Below [`COLARG_PAR_MIN`] columns it runs serial.
+/// — no cross-thread combine. Below the shared work gate (`par::fork_units`, rows x cols) it runs
+/// serial.
 ///
 /// # Safety
 /// `x` valid for `rows*cols` `f32`; `out` valid for `cols` `i32`; non-overlapping.
@@ -345,7 +341,8 @@ unsafe fn colarg_par(x: *const f32, out: *mut i32, rows: i64, cols: i64, is_max:
         return;
     }
     let (r, c) = (rows as usize, cols as usize);
-    if c < COLARG_PAR_MIN {
+    // Work gate on rows x cols (units = COLARG_JB-column stripes) + width-1 fast path; see `par`.
+    if !crate::par::fork_units(c.div_ceil(COLARG_JB), r.saturating_mul(c)) {
         colarg_range(x, out, r, c, 0, c, is_max);
         return;
     }
@@ -497,7 +494,7 @@ mod tests {
     /// The column arg-reductions (AVX2 serial and the multicore stripe split) must equal the naive
     /// strided scan **exactly** — same i-ascending per-column order, same strict compare, same
     /// lowest-row-index tie-break — so it is literal bit equality (an index, no arithmetic). Shapes
-    /// straddle the 8-column edge and the parallel column threshold (`COLARG_PAR_MIN = 256`).
+    /// straddle the 8-column edge and the parallel column threshold (the old 256-column gate).
     #[test]
     fn colarg_matches_naive_and_parallel() {
         for (rows, cols) in [
@@ -507,7 +504,7 @@ mod tests {
             (16, 5),
             (33, 9),
             (100, 16),
-            (500, 300), // > COLARG_PAR_MIN so the multicore stripes really run
+            (500, 300), // many stripes, so the multicore stripes really run
         ] {
             let x = fill(rows, cols);
             for is_max in [true, false] {
@@ -540,13 +537,13 @@ mod tests {
     ///  - a column whose max appears at rows 2 AND 5 must return 2 (not 5),
     ///  - the same for argmin with the min at rows 2 AND 5,
     ///  - an all-equal column must return 0.
-    ///    `cols = 300 > COLARG_PAR_MIN` so the parallel path's stripe split actually runs, and the planted
+    ///    `cols = 300` (several stripes) so the parallel path's stripe split runs, and the planted
     ///    columns sit at different lanes/stripes; `rows = 8` so the planted low row (2) must survive all the
     ///    blend updates across rows 3..7.
     #[test]
     fn duplicate_extrema_return_lowest_row_index() {
         let rows = 8usize;
-        let cols = 300usize; // > COLARG_PAR_MIN, spans many 8-column blocks + a tail (300 = 37*8 + 4)
+        let cols = 300usize; // several stripes: many 8-column blocks + a tail (300 = 37*8 + 4)
         let mut x = vec![0.0f32; rows * cols];
 
         // Column 0: all-equal → argmax and argmin both row 0.

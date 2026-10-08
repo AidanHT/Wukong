@@ -21,12 +21,60 @@
 //! written on a loop being the sharpest of those. Every other attribute's placement is unchecked
 //! in v1 — the ones that are discarded are discarded wherever they appear.
 //!
+//! Arguments are checked where an attribute consumes them. `@parallel` takes no argument or exactly
+//! `grain = <positive integer>` ([`parallel_grain`]): `wukong_mir_build` hands each worker at least
+//! `grain` consecutive iterations of the function's parallel loop. `@parallel(grain = 0)`,
+//! `@parallel(chunk = 4)` or `@parallel(4)` used to compile with the argument silently discarded.
+//!
 //! This walk is independent of name resolution and types (an attribute names no value), so
 //! [`check`] runs before the collection pass and reports every offending attribute in one go.
 
-use wukong_ast::{Attr, Block, Expr, ExprKind, ForIter, Item, ItemKind, Module, Stmt, StmtKind};
+use wukong_ast::{
+    Attr, AttrArg, AttrVal, Block, Expr, ExprKind, ForIter, Item, ItemKind, Module, Stmt, StmtKind,
+};
 use wukong_diag::Diagnostic;
-use wukong_span::Interner;
+use wukong_span::{Interner, Span};
+
+/// The largest `@parallel(grain = G)` accepted: 2^31 iterations per claimed chunk, so the compiler's
+/// `start·G` / `end·G` scaling stays far inside `i64` for any trip count the outliner accepts.
+pub const MAX_PARALLEL_GRAIN: u64 = 1 << 31;
+
+/// The grain a `@parallel` attribute requests: `Ok(1)` with no argument, `Ok(G)` for exactly one
+/// `grain = G` with `1 <= G <=` [`MAX_PARALLEL_GRAIN`], and `Err((span, reason))` for anything else
+/// — an unknown key, a positional argument, a repeated `grain`, a non-integer or out-of-range value.
+/// `attr` must be a `@parallel` attribute. Shared by this module's `E0306` check and by
+/// `wukong_mir_build`, which reads the grain off the function item.
+pub fn parallel_grain(attr: &Attr, interner: &Interner) -> Result<u64, (Span, &'static str)> {
+    let mut grain = None;
+    for arg in attr.args() {
+        let AttrArg::KeyValue { key, value } = arg else {
+            let span = match arg {
+                AttrArg::Word(_, s) | AttrArg::Int(_, s) | AttrArg::Str(_, s) => *s,
+                AttrArg::KeyValue { key, .. } => key.span,
+            };
+            return Err((span, "`@parallel` takes only `grain = <positive integer>`"));
+        };
+        if interner.resolve(key.sym) != "grain" {
+            return Err((
+                key.span,
+                "`@parallel` has no such argument; the only one is `grain`",
+            ));
+        }
+        if grain.is_some() {
+            return Err((key.span, "`grain` is given more than once"));
+        }
+        let AttrVal::Int(text) = value else {
+            return Err((key.span, "`grain` must be a positive integer literal"));
+        };
+        match interner.resolve(*text).parse::<u64>() {
+            Ok(g) if (1..=MAX_PARALLEL_GRAIN).contains(&g) => grain = Some(g),
+            Ok(0) => return Err((key.span, "`grain` must be at least 1")),
+            Ok(_) => return Err((key.span, "`grain` must be at most 2147483648")),
+            Err(_) => return Err((key.span, "`grain` must be a positive integer literal")),
+        }
+    }
+    Ok(grain.unwrap_or(1))
+}
 
 /// Every attribute name the v1 language accepts, in the order the diagnostic lists them: the ones
 /// that are (or are being) consumed first, then the four that are parsed and discarded.
@@ -114,6 +162,20 @@ fn check_item(item: &Item, interner: &Interner, diags: &mut Vec<Diagnostic>) {
 
 fn check_attr(a: &Attr, place: Place, interner: &Interner, diags: &mut Vec<Diagnostic>) {
     let name = interner.resolve(a.name.sym);
+    if name == "parallel" {
+        if let Err((span, why)) = parallel_grain(a, interner) {
+            diags.push(
+                Diagnostic::error(format!("invalid `@parallel` argument: {why}"))
+                    .with_code("E0306")
+                    .primary(span, "not a valid `@parallel` argument")
+                    .help(
+                        "write `@parallel` or `@parallel(grain = G)` with G a positive integer: \
+                         each worker then claims at least G consecutive iterations",
+                    ),
+            );
+        }
+        return;
+    }
     if !is_known(name) {
         diags.push(
             Diagnostic::error(format!("unknown attribute `@{name}`"))
@@ -305,6 +367,48 @@ mod tests {
             let src = format!("@{name}\nfn f() {{ let x: i32 = 1; }}");
             assert_eq!(codes(&src), Vec::<&str>::new(), "@{name} was rejected");
         }
+    }
+
+    /// P15.15: `@parallel`'s argument list is no longer parsed-and-discarded. `grain = G` with a
+    /// positive integer is the one accepted argument, on a function or a statement; every other
+    /// spelling — the verifier's `@parallel(grain = 99999, bogus_key = 7)` included — is `E0306`.
+    #[test]
+    fn parallel_accepts_only_a_positive_grain() {
+        for ok in [
+            "@parallel\nfn f() { let x: i32 = 1; }",
+            "@parallel(grain = 1)\nfn f() { let x: i32 = 1; }",
+            "@parallel(grain = 64)\nfn f() { let x: i32 = 1; }",
+            "@parallel(grain = 2147483648)\nfn f() { let x: i32 = 1; }",
+            "fn f() { @parallel(grain = 4) for i in 0..8 { let x: i32 = i; } }",
+        ] {
+            assert_eq!(codes(ok), Vec::<&str>::new(), "{ok}");
+        }
+        for bad in [
+            "@parallel(grain = 0)\nfn f() {}",
+            "@parallel(grain = 2147483649)\nfn f() {}",
+            "@parallel(chunk = 4)\nfn f() {}",
+            "@parallel(4)\nfn f() {}",
+            "@parallel(grain = fast)\nfn f() {}",
+            "@parallel(grain = 2, grain = 4)\nfn f() {}",
+            "@parallel(grain = 99999, bogus_key = 7)\nfn f() {}",
+            "fn f() { @parallel(grain = 0) for i in 0..8 { let x: i32 = i; } }",
+        ] {
+            assert_eq!(codes(bad), vec!["E0306"], "{bad}");
+        }
+    }
+
+    #[test]
+    fn parallel_grain_reads_the_value() {
+        let mut interner = Interner::new();
+        let src = "@parallel(grain = 12)\nfn f() {}\n@parallel\nfn g() {}";
+        let (module, pdiags) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let grains: Vec<u64> = module
+            .items
+            .iter()
+            .map(|it| parallel_grain(&it.attrs[0], &interner).unwrap())
+            .collect();
+        assert_eq!(grains, vec![12, 1]);
     }
 
     #[test]

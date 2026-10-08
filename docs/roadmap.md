@@ -466,6 +466,13 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   one more decline: a modelled body-local that is reassigned inside an inner loop, whose snapshot is
   not flow-sensitive. Verify with `wukongc --emit=mir -O2 f.wk` and look for a `_parallel` symbol or a
   `wukong$par$` region.
+  `@parallel(grain = G)` is consumed (each worker claims runs of at least `G` iterations; any other
+  `@parallel` argument is `E0306`), any number of regions per program is outlined (the old 32-region
+  pool is grown on demand), and the thread count is set with `--threads=<n>` / `WUKONG_NUM_THREADS`.
+  The runtime's `_parallel` kernels fork only when rows x columns x a per-element cost clears one
+  shared work threshold (`WUKONG_PAR_MIN_WORK`); the threshold is anchored to the existing
+  velem/vmath crossovers, **not yet measured per family**. There is still no user-written
+  cross-thread combine (no atomics, no `@reduce`): a loop-carried accumulator declines to serial.
 - **`@generic`** on a function turns the kernel recognizers **off for that function**: none of the
   four probe sites (whole-function interception, the per-loop `match_*` cascade, `lower_block`'s
   statement windows, the vectorizer's elementwise probes) fire inside it, so its loops compile as

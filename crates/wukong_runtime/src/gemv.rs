@@ -246,7 +246,8 @@ pub unsafe extern "C" fn wukong_sgemv_alpha_parallel(
         return;
     }
     let (mu, nu) = (m as usize, n as usize);
-    if mu < GEMV_PAR_MIN_ROWS {
+    // Work gate (rows x cols MACs, two-row tasks) + width-1 fast path; see `par::fork_units`.
+    if !crate::par::fork_units(mu.div_ceil(2), mu.saturating_mul(nu)) {
         wukong_sgemv_alpha(a, x, y, m, n, alpha);
         return;
     }
@@ -284,11 +285,6 @@ pub unsafe extern "C" fn wukong_sgemv_alpha_parallel(
     #[cfg(not(target_arch = "x86_64"))]
     wukong_sgemv_alpha(a, x, y, m, n, alpha);
 }
-
-/// Row count below which the parallel GEMV just runs serially (thread wake/sync would dominate a tiny
-/// matrix). GEMV is memory-bound, so the parallel win comes from spreading the row stream across cores
-/// to saturate aggregate DRAM bandwidth.
-const GEMV_PAR_MIN_ROWS: usize = 64;
 
 /// Multi-threaded GEMV: the independent rows are mapped across cores, each computed by the identical
 /// per-row routine — so the result is **bit-identical to [`wukong_sgemv`]** (no cross-row combine).
@@ -340,7 +336,8 @@ mod tests {
             (64, 64),
             (100, 257),
             (128, 512),
-            // Exceeds GEMV_PAR_MIN_ROWS so the multicore path really runs, with a non-multiple-of-32 N.
+            // >= 2 row pairs, so the multicore path really runs in the test build (par.rs), with a
+            // non-multiple-of-32 N.
             (300, 517),
         ] {
             let a = fill(1, m * n);
@@ -383,7 +380,7 @@ mod tests {
     /// element (**exact** equality — the kernel performs that identical single multiply on the
     /// store); `alpha == 1.0` must be **byte-identical** to the plain kernel (the multiply is
     /// skipped); and serial == parallel bit-for-bit (rows independent, same per-row routine).
-    /// Sizes straddle the 32/8-element unroll edges and `GEMV_PAR_MIN_ROWS`.
+    /// Sizes straddle the 32/8-element unroll edges and the old 64-row gate.
     #[test]
     fn sgemv_alpha_matches_scaled_plain_and_parallel() {
         for &(m, n) in &[

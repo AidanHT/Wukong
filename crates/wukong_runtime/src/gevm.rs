@@ -170,16 +170,13 @@ pub unsafe extern "C" fn wukong_sgevm_f32(
     );
 }
 
-/// Column count below which the parallel vector·matrix product just runs serially (thread wake/sync
-/// would dominate a small output).
-const GEVM_PAR_MIN: usize = 256;
-
 /// Multi-threaded `out[j] = alpha · Σ_i w[i]·a[i, j]`: the **output columns** are split into
 /// disjoint stripes across cores, each core folding its column range over **all** rows (the full
 /// i sweep, ascending) — never rows-across-cores, which would need per-thread partials and
 /// reassociate the sum. Each stripe writes a disjoint slice of `out` and every column folds in the
 /// same i-ascending order regardless of the split, so the result is **bit-identical to
-/// [`wukong_sgevm_f32`]** (no cross-stripe combine). Below [`GEVM_PAR_MIN`] columns it runs serial.
+/// [`wukong_sgevm_f32`]** (no cross-stripe combine). Below the shared work gate (`par::fork_units`,
+/// rows x cols) it runs serial.
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_sgevm_f32`].
@@ -196,7 +193,8 @@ pub unsafe extern "C" fn wukong_sgevm_f32_parallel(
         return;
     }
     let (r, c) = (rows as usize, cols as usize);
-    if c < GEVM_PAR_MIN {
+    // Work gate on rows x cols MACs (units = 8-column stripes) + width-1 fast path; see `par`.
+    if !crate::par::fork_units(c.div_ceil(8), r.saturating_mul(c)) {
         gevm_range(w, a, out, r, c, 0, c, alpha);
         return;
     }
@@ -311,7 +309,7 @@ mod tests {
     /// mul_add(w[i], a[i,j], ·)` from `0.0`, then one `* alpha` — **exactly** (`assert_eq!`, no
     /// tolerance): the kernel performs the identical per-element chain, so it is bit-for-bit its own
     /// scalar oracle. Serial and parallel must also be bit-identical (disjoint column stripes, full
-    /// i sweep each). Sizes straddle the 8-lane edge, the stripe boundary, and `GEVM_PAR_MIN`.
+    /// i sweep each). Sizes straddle the 8-lane edge, the stripe boundary, and the old 256-col gate.
     #[test]
     fn sgevm_matches_fma_reference_and_parallel() {
         for &(rows, cols) in &[
@@ -323,7 +321,7 @@ mod tests {
             (128, 64), // the KV-decode read-out shape (S=128, D=64)
             (9, 100),
             (16, 257),
-            (64, 300), // exceeds GEVM_PAR_MIN so the multicore path really runs
+            (64, 300), // many 8-column stripes, so the multicore path really runs
         ] {
             let w = fill(1, rows);
             let a = fill(2, rows * cols);

@@ -45,8 +45,6 @@
 //! helpers, so blocking changes no bit (and wrapping `i32` addition is order-immaterial anyway):
 //! `serial == parallel` with no cross-task combine, independent of thread count and grid.
 
-use rayon::prelude::*;
-
 /// Scalar reference: `sum_t (a[t] as i32) * (b[t] as i32)` over `k` elements, wrapping `i32`. Backs
 /// the AVX2 tail and the no-AVX2 fallback, and is the differential reference for the unit tests.
 ///
@@ -587,26 +585,47 @@ pub unsafe extern "C" fn wukong_i8gemm_nt_parallel(
     if m <= 0 || k <= 0 || n <= 0 {
         return;
     }
-    let (m, k, n) = (m as usize, k as usize, n as usize);
+    let (mu, ku, nu) = (m as usize, k as usize, n as usize);
+    // Work gate + width-1 fast path (`par::fork_units`, m*k*n int8 MACs): a small int8 GEMM no
+    // longer forks at all. The independent units are the grid's (row x 4-column) cells, not the rows:
+    // the 2D grid below splits a single-token (m = 1) decode GEMM across its columns, so gating on
+    // `m` alone would keep exactly that case serial. Integer math, cells independent: bit-identical.
+    if !crate::par::fork_units(i8_units(mu, nu), i8_work(mu, ku, nu)) {
+        return wukong_i8gemm_nt(a, b, c, m, k, n);
+    }
+    let (m, k, n) = (mu, ku, nu);
     // Raw pointers cross the rayon boundary as integers (same pattern as the parallel GEMM/reduce).
     let (au, bu, cu) = (a as usize, b as usize, c as usize);
     let tier = i8_tier();
-    // This fork can be the process's FIRST rayon touch, so it must provision the global pool first —
-    // [`crate::ensure_global_pool`]'s stated precondition. Forking bare builds rayon's default
-    // 2 MiB-stack registry, so the runtime's later 16 MiB `build_global` silently loses the race and
-    // outlined `@parallel` region bodies are left on undersized stacks. Idempotent (`Once`) and
-    // provisioning-only: the work split below never changes a bit.
-    crate::ensure_global_pool();
-    let (rb, cb) = i8_par_grid(m, n, k, rayon::current_num_threads());
+    // The (row block x column block) grid of `i8_par_grid`, sized for the pool that actually runs it
+    // (`wuk_pool_width`, which also provisions the 16 MiB-stack global pool before any fork), with
+    // the tasks claimed from the shared queue on the unified kernel pool (`par::claim_chunks`) so
+    // this kernel runs beside its neighbours instead of on the bare global registry. Every C element
+    // is the same full-`k` dot whatever the grid or the claim order: bit-identical.
+    let (rb, cb) = i8_par_grid(m, n, k, crate::wuk_pool_width());
     let (nrb, ncbs) = (m.div_ceil(rb), n.div_ceil(cb));
-    (0..nrb * ncbs).into_par_iter().for_each(|t| {
-        let (i0, j0) = ((t / ncbs) * rb, (t % ncbs) * cb);
-        let (mr, nc) = ((m - i0).min(rb), (n - j0).min(cb));
-        let (a, b, c) = (au as *const u8, bu as *const i8, cu as *mut i32);
-        // SAFETY: each task owns the disjoint C block [i0, i0+mr) × [j0, j0+nc); A and B are
-        // read-only and valid for the declared extents by contract; `tier` was detected above.
-        unsafe { i8_tile(tier, a, b, k, i0, mr, j0, nc, c.add(i0 * n + j0), n) };
+    crate::par::claim_chunks(nrb * ncbs, 1, true, |lo, hi| {
+        for t in lo..hi {
+            let (i0, j0) = ((t / ncbs) * rb, (t % ncbs) * cb);
+            let (mr, nc) = ((m - i0).min(rb), (n - j0).min(cb));
+            let (a, b, c) = (au as *const u8, bu as *const i8, cu as *mut i32);
+            // SAFETY: each task owns the disjoint C block [i0, i0+mr) x [j0, j0+nc); A and B are
+            // read-only and valid for the declared extents by contract; `tier` was detected above.
+            unsafe { i8_tile(tier, a, b, k, i0, mr, j0, nc, c.add(i0 * n + j0), n) };
+        }
     });
+}
+
+/// The int8 GEMM's weighted work for the shared fork gate: `m·k·n` MACs scaled down by
+/// [`crate::par::I8_MACS_PER_WORK`] (saturating). Scheduling-only.
+fn i8_work(m: usize, k: usize, n: usize) -> usize {
+    m.saturating_mul(k).saturating_mul(n) / crate::par::I8_MACS_PER_WORK
+}
+
+/// The int8 GEMM's independent units for the shared fork gate: the (row x 4-column) cells that
+/// [`i8_par_grid`]'s finest grid can hand to distinct workers. Scheduling-only.
+fn i8_units(m: usize, n: usize) -> usize {
+    m.saturating_mul(n.div_ceil(4))
 }
 
 /// Dequantize one i32 C row in place to `dst`: `dst[j] = act((src[j] as f32)·scale_a·scale_b[j]
@@ -800,7 +819,12 @@ pub unsafe extern "C" fn wukong_i8gemm_nt_deq_parallel(
     if m <= 0 || k <= 0 || n <= 0 {
         return;
     }
-    let (m, k, n) = (m as usize, k as usize, n as usize);
+    let (mu, ku, nu) = (m as usize, k as usize, n as usize);
+    // Work gate + width-1 fast path, as in `wukong_i8gemm_nt_parallel`.
+    if !crate::par::fork_units(i8_units(mu, nu), i8_work(mu, ku, nu)) {
+        return wukong_i8gemm_nt_deq(a, b, out, m, k, n, scale_a, scale_b, bias, act);
+    }
+    let (m, k, n) = (mu, ku, nu);
     let (au, bu, ou) = (a as usize, b as usize, out as usize);
     let d = DeqArgs {
         k,
@@ -811,33 +835,31 @@ pub unsafe extern "C" fn wukong_i8gemm_nt_deq_parallel(
         act,
     };
     let tier = i8_tier();
-    // This fork can be the process's FIRST rayon touch, so it must provision the global pool first —
-    // [`crate::ensure_global_pool`]'s stated precondition. Forking bare builds rayon's default
-    // 2 MiB-stack registry, so the runtime's later 16 MiB `build_global` silently loses the race and
-    // outlined `@parallel` region bodies are left on undersized stacks. Idempotent (`Once`) and
-    // provisioning-only: the work split below never changes a bit.
-    crate::ensure_global_pool();
-    let (rb, cb) = i8_par_grid(m, n, k, rayon::current_num_threads());
+    // Same grid, pool and claim queue as `wukong_i8gemm_nt_parallel`; each task runs `deq_block` on
+    // its disjoint block with its own i32 tile, dequantized by the identical `dequant_row`.
+    let (rb, cb) = i8_par_grid(m, n, k, crate::wuk_pool_width());
     let (nrb, ncbs) = (m.div_ceil(rb), n.div_ceil(cb));
-    (0..nrb * ncbs).into_par_iter().for_each(|t| {
-        let (i0, j0) = ((t / ncbs) * rb, (t % ncbs) * cb);
-        let (mr, nc) = ((m - i0).min(rb), (n - j0).min(cb));
-        // SAFETY: each task owns the disjoint output block [i0, i0+mr) × [j0, j0+nc) and its own
-        // i32 tile; operands are read-only and valid by contract; `tier` was detected above.
-        unsafe {
-            deq_block(
-                tier,
-                au as *const u8,
-                bu as *const i8,
-                ou as *mut f32,
-                d,
-                i0,
-                mr,
-                j0,
-                nc,
-                cb,
-            )
-        };
+    crate::par::claim_chunks(nrb * ncbs, 1, true, |lo, hi| {
+        for t in lo..hi {
+            let (i0, j0) = ((t / ncbs) * rb, (t % ncbs) * cb);
+            let (mr, nc) = ((m - i0).min(rb), (n - j0).min(cb));
+            // SAFETY: each task owns the disjoint output block [i0, i0+mr) x [j0, j0+nc) and its
+            // own i32 tile; operands are read-only and valid by contract; `tier` was detected above.
+            unsafe {
+                deq_block(
+                    tier,
+                    au as *const u8,
+                    bu as *const i8,
+                    ou as *mut f32,
+                    d,
+                    i0,
+                    mr,
+                    j0,
+                    nc,
+                    cb,
+                )
+            };
+        }
     });
 }
 

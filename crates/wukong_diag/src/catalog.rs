@@ -184,8 +184,11 @@ static CATALOG: &[Explanation] = &[
          accepted and discarded, so the program compiled with none of the requested behavior and no \
          diagnostic. Placement: `@generic` (opt this function out of kernel recognition) is read \
          from the `fn` item, so it is rejected on a statement, a parameter, or a non-`fn` item \
-         rather than silently promising a per-loop opt-out. The parsed-but-discarded attributes \
-         (`@inline`, `@simd`, `@align`, `@export`) stay legal wherever they parse."
+         rather than silently promising a per-loop opt-out. Arguments: `@parallel` takes nothing \
+         or exactly `grain = G` with `1 <= G <= 2^31` (each worker then claims runs of at least G \
+         iterations); an unknown key, a positional argument or an out-of-range grain is rejected \
+         instead of discarded. The parsed-but-discarded attributes (`@inline`, `@simd`, `@align`, \
+         `@export`) stay legal wherever they parse."
     ),
     entry!(
         "E0307",

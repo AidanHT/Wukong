@@ -35,7 +35,8 @@
 //! thread in ascending `ti`, so the result is **bit-identical to serial**, independent of thread count and
 //! scheduling. The cost is that every chunk re-scans the `T` ids (cheap integer compares); the payoff is a
 //! lock-free, run-to-run-stable gradient the differential gate can hold to the serial oracle. Below
-//! `SCATTER_PAR_MIN` output rows the split is not worth its overhead and the parallel entry runs serial.
+//! the shared work gate (`par::fork_units`: tokens x hidden) the split is not worth its overhead and the
+//! parallel entry runs serial.
 //!
 //! **Out-of-range guard.** A negative or `>= v` id names no weight row; like the gather's safe guard,
 //! such a token is simply **skipped** (it contributes nothing — there is no row to accumulate into),
@@ -135,10 +136,6 @@ unsafe fn scatter_rows(
     }
 }
 
-/// Output-row count (`V`) below which the parallel scatter just runs serially: the row-range split has to
-/// re-scan all `T` ids per chunk, so on a small weight-gradient table the serial kernel wins.
-const SCATTER_PAR_MIN: usize = 64;
-
 /// `grad_w[ids[t], :] += grad_out[t, :]` accumulated over a `[T, H]` gradient `grad_out`, length-`T` `i32`
 /// `ids`, and a `[V, H]` weight-gradient table `grad_w` — the embedding backward, single-threaded.
 /// `grad_w` must be **pre-zeroed by the caller** (this kernel only adds); colliding ids sum in ascending
@@ -170,7 +167,8 @@ pub unsafe extern "C" fn wukong_scatter_add_f32(
 /// only those landing in its range. Disjoint output rows make it lock-free and race-free; per-row
 /// ascending-`ti` folding makes it **bit-identical to [`wukong_scatter_add_f32`]** regardless of thread
 /// count or scheduling (the interpreter runs the serial form as the oracle, native `@parallel` runs this
-/// one, and the differential gate compares them). Below `SCATTER_PAR_MIN` rows it runs the serial path.
+/// one, and the differential gate compares them). Below the shared work gate (`par::fork_units`) it
+/// runs the serial path.
 /// `grad_w` must be pre-zeroed by the caller.
 ///
 /// # Safety
@@ -188,7 +186,9 @@ pub unsafe extern "C" fn wukong_scatter_add_f32_parallel(
         return;
     }
     let (t, h, v) = (t as usize, h as usize, v as usize);
-    if v < SCATTER_PAR_MIN {
+    // Units are output rows (each chunk owns a disjoint `grad_w` row range); the work is every
+    // token's `h`-wide row add.
+    if !crate::par::fork_units(v, t.saturating_mul(h)) {
         scatter_rows(grad_w, grad_out, ids, t, h, 0, v);
         return;
     }
@@ -267,8 +267,8 @@ mod tests {
             (4, 64, 3),
             (100, 70, 23),
             (1, 257, 2),
-            (300, 16, 80), // v >= SCATTER_PAR_MIN so the multicore path runs
-            (500, 17, 64), // v == SCATTER_PAR_MIN (boundary, multicore) with an H tail
+            (300, 16, 80), // many output rows, so the multicore path runs
+            (500, 17, 64), // the old 64-row boundary, with an H tail
             (260, 70, 96), // multicore + wide H with a tail; T >> V => heavy collisions
         ] {
             // Small integers (1..=9), varying by flat index so any mis-scatter — wrong row, wrong token,
@@ -306,13 +306,14 @@ mod tests {
 
     /// The determinism stress: every id pattern below — all tokens on one row (row 0, the last row, an
     /// interior row), two dense rows, an even spread, a pseudo-random spread, and a mix that also drops
-    /// out-of-range ids — runs through the **real multicore path** (V >= SCATTER_PAR_MIN) and must equal
+    /// out-of-range ids — runs through the **real multicore path** (V >= 2 output rows forks in the
+    /// test build) and must equal
     /// both the naive reference and the serial kernel bit-for-bit. The all-equal patterns are the worst
     /// case for the output-row split: every collision lands in one chunk, which must fold all `T` tokens
     /// in ascending `ti` exactly as serial does, while the other chunks scan the ids and add nothing.
     #[test]
     fn heavy_collisions_serial_equals_parallel() {
-        let (t, h, v) = (256usize, 24usize, 96usize); // v >= SCATTER_PAR_MIN => parallel path
+        let (t, h, v) = (256usize, 24usize, 96usize); // many output rows => parallel path
         let grad_out: Vec<f32> = (0..t * h).map(|i| ((i % 9) + 1) as f32).collect();
         let id_patterns: Vec<Vec<i32>> = vec![
             vec![0i32; t],                                       // all collide on row 0

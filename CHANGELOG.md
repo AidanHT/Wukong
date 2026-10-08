@@ -77,6 +77,25 @@ All notable changes to Wukong are documented here. The format is loosely based o
   (`vmath_every_op_returns_nan_for_nan`, `tests/run/hardsigmoid_nan.wk`). `softplus`'s scalar twin
   no longer spells its ReLU `f32::max`, and the exhaustive log sweep gained a pass over every
   positive subnormal.
+### Parallel dispatch: work gates, host topology, `@parallel(grain = G)`, `--threads`
+
+- **Every `_parallel` runtime kernel now forks on work, not on one extent.** One shared gate
+  (`wukong_runtime::par`) replaces ~22 single-dimension `*_PAR_MIN` constants: fork iff there are
+  >= 2 rows/stripes/channels, rows x cols x a per-element cost reaches `WUKONG_PAR_MIN_WORK`
+  (default 2^18 stream element-ops), and the pool has a second worker. A 7 x 50257 cross-entropy now
+  forks, an 8 x 2 one no longer does; the fused-norm, int8-GEMM and per-channel-dequant entries
+  gained the gate they lacked. Bits are unchanged (serial == parallel by construction).
+- **Shared claim-queue scheduler.** `wukong_parallel_for`, the int8 GEMM (claiming the cells of its
+  row block x column block grid) and per-channel dequant run through one atomic claim queue on the
+  unified pool; a one-worker pool or a one-granule range runs
+  the body once without forking, still on a 16 MiB worker stack (the width-1 inline-stack gap is closed).
+- **Host topology probe.** Usable logical/physical cores honour affinity masks and cgroup quotas (the
+  physical-core pool is now built under `taskset`); L1D/L2/L3 come from CPUID or sysfs, with
+  `WUKONG_CPU_PHYSICAL` / `WUKONG_CACHE_{L1D,L2,L3}_KB` overrides. The non-temporal-store threshold
+  defaults to 3/4 of the probed L3 (10 MiB fallback; `WUKONG_NT_MIN_BYTES` still overrides).
+- **`@parallel(grain = G)` is consumed** and every other `@parallel` argument is `E0306`; the
+  32-region outlining cap is gone; **`wukongc --threads=<n>`** (and `WUKONG_NUM_THREADS`) sets the
+  worker count.
 
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 

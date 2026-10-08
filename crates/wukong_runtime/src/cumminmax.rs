@@ -218,10 +218,6 @@ unsafe fn cummm_row(x: *const f32, out: *mut f32, base: usize, cols: usize, ext:
     cummm_row_scalar(x, out, base, cols, ext);
 }
 
-/// Row count below which the parallel scan just runs serially (per-row work is light; the rayon dispatch
-/// only pays off across many rows). Same threshold as the prefix-sum sibling.
-const CUMMINMAX_PAR_MIN: usize = 256;
-
 /// Serial driver over all rows for one extremum.
 ///
 /// # Safety
@@ -237,14 +233,14 @@ unsafe fn cummm_serial(x: *const f32, out: *mut f32, rows: usize, cols: usize, e
 /// Parallel driver over all rows for one extremum — **bit-identical** to [`cummm_serial`]. Rows are
 /// independent (each row's carry starts at the identity and never crosses rows), so the parallel path maps
 /// the *identical* per-row routine across cores with no cross-row combine: the result does not depend on
-/// thread count. Below `CUMMINMAX_PAR_MIN` rows it runs serial.
+/// thread count. Below the shared work gate (`par::fork_rows`, rows x cols) it runs serial.
 ///
 /// # Safety
 /// `x` and `out` must each be valid for `rows * cols` f32; non-overlapping rows (each row written by one
 /// task).
 #[inline]
 unsafe fn cummm_parallel(x: *const f32, out: *mut f32, rows: usize, cols: usize, ext: Ext) {
-    if rows < CUMMINMAX_PAR_MIN {
+    if !crate::par::fork_rows(rows, cols, crate::par::W_STREAM) {
         cummm_serial(x, out, rows, cols, ext);
         return;
     }
@@ -295,7 +291,7 @@ pub unsafe extern "C" fn wukong_cummin_f32(x: *const f32, out: *mut f32, rows: i
 /// independent (each row's carry starts at `-∞` and never crosses rows), so the parallel path maps the
 /// *identical* per-row routine across cores with no cross-row combine; the result does not depend on
 /// thread count and equals the serial kernel the interpreter marshals, bit-for-bit. Below
-/// `CUMMINMAX_PAR_MIN` rows it runs serial.
+/// the shared work gate (`par::fork_rows`) it runs serial.
 ///
 /// # Safety
 /// `x` and `out` must each be valid for `rows * cols` f32; non-overlapping rows (each row written by one
@@ -420,7 +416,7 @@ mod tests {
     /// threshold so the rayon path actually runs, for both cummax and cummin.
     #[test]
     fn serial_equals_parallel() {
-        let rows = CUMMINMAX_PAR_MIN + 137; // > threshold so the multicore path runs
+        let rows = 256 + 137; // many rows, so the multicore path runs
         for &cols in &[1usize, 8, 17, 64, 333] {
             let x = fill(rows * cols);
 
@@ -453,12 +449,12 @@ mod tests {
     /// existing serial-vs-parallel checks feed finite data, which cannot reach the new NaN branch at
     /// all — so the branch that decides between the tree and the scalar recurrence was only ever
     /// exercised single-threaded. The NaN position is staggered per row (`r % cols`), so across the
-    /// `> CUMMINMAX_PAR_MIN` rows rayon hands to its workers the guard fires at every block offset and
+    /// the many rows rayon hands to its workers the guard fires at every block offset and
     /// in the tail, and rows with no NaN take the tree — both sides of the branch, on every core.
     /// Bits, not `==`: NaN is never equal to itself.
     #[test]
     fn serial_equals_parallel_non_finite() {
-        let rows = CUMMINMAX_PAR_MIN + 137; // > threshold so the multicore path runs
+        let rows = 256 + 137; // many rows, so the multicore path runs
         for &cols in &[1usize, 8, 17, 64] {
             let mut x = fill(rows * cols);
             for r in 0..rows {

@@ -38,7 +38,8 @@
 //! - the **`_parallel` variant equals the serial one bit-for-bit** — rows are independent, so the
 //!   parallel entry just maps the identical per-row routine across rows (no cross-row combine, no
 //!   thread-count-dependent chunking), so the result does not depend on core count; below
-//!   `LOGSOFTMAX_PAR_MIN` rows it tail-calls the serial entry outright, same bits again.
+//!   the shared work gate (`par::fork_rows`: rows x cols x a transcendental weight) it tail-calls
+//!   the serial entry outright, same bits again.
 //!
 //! A non-positive `rows` or `cols` is a no-op at all four entries. Unlike `norm.rs`, these `_parallel`
 //! entries fork with a bare `into_par_iter()` on the **global** pool (after `ensure_global_pool()`)
@@ -224,10 +225,6 @@ unsafe fn logsumexp_row(x: *const f32, out: *mut f32, n: usize) {
 
 // --- C-ABI entry points ---------------------------------------------------------------------------
 
-/// Row count below which the parallel variants just run serially (rayon's per-row overhead isn't worth
-/// it for a handful of rows).
-const LOGSOFTMAX_PAR_MIN: usize = 8;
-
 /// Batched **log-softmax** over a `[rows, cols]` row-major matrix (serial): for each row,
 /// `out[r,i] = x[r,i] − m_r − log(Σ_i exp(x[r,i] − m_r))`. `x`/`out` may alias (in-place); each row's
 /// reductions read `x` before that row's `out` is written.
@@ -271,7 +268,7 @@ pub unsafe extern "C" fn wukong_logsoftmax_f32_parallel(
         return;
     }
     let (r, c) = (rows as usize, cols as usize);
-    if r < LOGSOFTMAX_PAR_MIN {
+    if !crate::par::fork_rows(r, c, crate::par::W_TRANSCENDENTAL) {
         wukong_logsoftmax_f32(x, out, rows, cols);
         return;
     }
@@ -324,7 +321,7 @@ pub unsafe extern "C" fn wukong_logsumexp_f32_parallel(
         return;
     }
     let (r, c) = (rows as usize, cols as usize);
-    if r < LOGSOFTMAX_PAR_MIN {
+    if !crate::par::fork_rows(r, c, crate::par::W_TRANSCENDENTAL) {
         wukong_logsumexp_f32(x, out, rows, cols);
         return;
     }
@@ -350,7 +347,7 @@ pub unsafe extern "C" fn wukong_logsumexp_f32_parallel(
 mod tests {
     use super::*;
 
-    const EPS_PAR: usize = LOGSOFTMAX_PAR_MIN;
+    const EPS_PAR: usize = 8; // the old row gate; the test build forks every shape with >= 2 rows
 
     // Deterministic, mildly varied input (no RNG — reproducible). `sin`/`cos` of the index, scaled and
     // shifted, so values span a useful range (incl. negatives) without being trivially uniform.

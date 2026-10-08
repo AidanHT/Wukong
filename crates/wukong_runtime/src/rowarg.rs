@@ -31,11 +31,6 @@
 
 use crate::reduce::arg_fold;
 
-/// Rows below which the parallel entry just runs serially (per-row work is cheap; the rayon
-/// fan-out only pays off once there are enough rows to spread). Matches the small-input serial
-/// thresholds the other parallel kernels use.
-const ROWARG_PAR_MIN: usize = 64;
-
 /// Scalar per-row argmax/argmin reference: a plain ascending scan with a **strict** value compare so
 /// the lowest index wins on a tie (`best=0; for j in 1..cols { if x[j] {>,<} x[best] { best=j } }`).
 /// This is the no-AVX2 fallback *and* the bit-exact oracle the AVX2 path must match lane-for-lane.
@@ -172,7 +167,7 @@ unsafe fn rowarg_serial(x: *const f32, out: *mut i32, rows: i64, cols: i64, is_m
 /// Parallel per-row arg-reduction — **bit-identical** to [`rowarg_serial`]. Rows are independent and
 /// each writes a disjoint `out[r]`, so mapping the per-row routine across cores reorders nothing: the
 /// per-row result (including the lowest-index tie-break) is the same regardless of the split. Below
-/// [`ROWARG_PAR_MIN`] rows it runs serial.
+/// the shared work gate (`par::fork_rows`, rows x cols) it runs serial.
 ///
 /// # Safety
 /// `x` valid for `rows*cols` `f32`; `out` valid for `rows` `i32`; non-overlapping.
@@ -182,7 +177,7 @@ unsafe fn rowarg_par(x: *const f32, out: *mut i32, rows: i64, cols: i64, is_max:
         return;
     }
     let (r, c) = (rows as usize, cols as usize);
-    if r < ROWARG_PAR_MIN {
+    if !crate::par::fork_rows(r, c, crate::par::W_STREAM) {
         rowarg_serial(x, out, rows, cols, is_max);
         return;
     }
@@ -326,8 +321,8 @@ mod tests {
     #[test]
     fn rowarg_matches_naive_and_parallel() {
         // Shapes straddle the 8-lane edge (1,7,8,16,33,100,1000 cols) and the parallel row threshold
-        // (1..40 rows; 40 < ROWARG_PAR_MIN so the small ones exercise the serial fallback, but we also
-        // assert serial == parallel for ALL of them).
+        // (1..40 rows; under the production work gate the small ones run the serial fallback, but
+        // we also assert serial == parallel for ALL of them).
         for (rows, cols) in [
             (1usize, 1usize),
             (3, 7),
@@ -420,12 +415,12 @@ mod tests {
 
     #[test]
     fn duplicate_extrema_across_lanes_and_parallel_threshold() {
-        // The same lowest-index guarantee, but with MANY rows (> ROWARG_PAR_MIN) so the rayon fan-out
-        // really runs, and a wide row so the duplicate max straddles distinct 8-lane *lanes* (index 3
+        // The same lowest-index guarantee, but with MANY rows (past the old 64-row gate) so the
+        // rayon fan-out really runs, and a wide row so the duplicate max straddles distinct 8-lane *lanes* (index 3
         // is lane 3 step 0; index 11 is lane 3 step 1 — same lane, so the lane keeps the lower; index
         // 4 is lane 4 — a different lane, exercising the horizontal collapse). The answer must still be
         // the single lowest index, identical serial and parallel.
-        let rows = 200usize; // > ROWARG_PAR_MIN
+        let rows = 200usize; // many rows
         let cols = 64usize;
         let mut x = vec![1.0f32; rows * cols];
         // Plant the max 7.0 at indices 3, 4, 11, 40 in every row → lowest is 3.
@@ -488,12 +483,7 @@ mod tests {
                     cases.push(row);
                 }
             }
-            for rows in [
-                1usize,
-                ROWARG_PAR_MIN - 1,
-                ROWARG_PAR_MIN,
-                ROWARG_PAR_MIN + 1,
-            ] {
+            for rows in [1usize, 63, 64, 65] {
                 let x: Vec<f32> = cases.iter().cycle().take(rows).flatten().copied().collect();
                 for is_max in [true, false] {
                     let want = naive(&x, rows, cols, is_max);

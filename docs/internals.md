@@ -893,13 +893,34 @@ AOT training and measured training performance remain separate gaps.
 
 The bias, dequantization, low-precision, vector-elementwise and vector-math kernels share
 `crates/wukong_runtime/src/nt_policy.rs`. Their existing saturated byte-traffic formulas
-select non-temporal stores at a default **10 MiB** threshold. This value is a historical
-default, not a detected cache size or a measured optimum for the current host.
+select non-temporal stores once the traffic reaches a threshold derived from the host: three
+quarters of one probed L3 instance, clamped to `[4 MiB, 64 MiB]` (glibc's `memcpy` rule for the
+same decision), with the historical **10 MiB** as the fallback when no L3 size can be probed. The
+cache size comes from `crates/wukong_runtime/src/topology.rs` (CPUID leaf 4 / `0x8000_001D`, Linux
+sysfs as the fallback; `WUKONG_CACHE_L3_KB` overrides it). The derivation is a rule, not a
+measured optimum for the current host.
 
 Set `WUKONG_NT_MIN_BYTES` before starting the process to override the threshold in bytes.
 It accepts a positive ASCII decimal integer that fits `usize`, including leading zeroes.
 Absent, non-Unicode, empty, signed, whitespace-containing, zero and overflowing values
-fall back to 10 MiB. The first use caches the value for the process lifetime.
+are ignored and the derived default applies. The first use caches the value for the process
+lifetime. Either way the choice is throughput-only: an NT store writes the same bits.
+
+### Parallel dispatch policy
+
+Every `_parallel` runtime entry asks `crates/wukong_runtime/src/par.rs` whether to fork: at least
+two independent units (rows, column stripes, channels), weighted work (rows x cols x a per-element
+cost: 1 stream, 4 row-normalization, 16 transcendental) of at least `WUKONG_PAR_MIN_WORK` (default
+2^18, not yet measured per family), and a pool with a second worker. Below that it tail-calls its
+serial twin, which is bit-identical by the crate's serial == parallel law. Under `cfg(test)` the
+threshold is zero, so the crate's own serial == parallel tests always fork; the compiler-level
+differential gates run the production default, so set `WUKONG_PAR_MIN_WORK=1` to push their small
+shapes through the multicore paths. `par::claim_chunks` is the shared atomic claim queue behind
+`wukong_parallel_for`, the int8 GEMM (whose claimed units are the cells of its `i8_par_grid`
+row block x column block grid, and whose fork gate counts (row x 4-column) cells rather than rows,
+so a single-token decode GEMM still forks) and per-channel dequant. `@parallel(grain = G)` is applied in
+`wukong_mir_build` (`par_grain.rs`): the call passes `ceil(n / G)` chunk indices and the outlined
+body maps its chunk span back to iterations, so the runtime ABI is unchanged.
 
 Tests that require streaming execution derive their sizes from the actual policy, retain
 existing numerical cases/tail residues, and count executed non-temporal stores. Their

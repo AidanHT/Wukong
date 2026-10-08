@@ -143,9 +143,6 @@ pub unsafe extern "C" fn wukong_kldiv_f32(
     }
 }
 
-/// Row count below which the parallel KL divergence just runs serially.
-const KLDIV_PAR_MIN: usize = 8;
-
 /// Multi-threaded KL divergence: rows are mapped across cores, each computed by the identical per-row
 /// routine — so the result is **bit-identical to [`wukong_kldiv_f32`]** (rows are independent, no
 /// cross-row combine, so thread count is irrelevant and the interpreter's serial call agrees with this
@@ -165,7 +162,7 @@ pub unsafe extern "C" fn wukong_kldiv_f32_parallel(
         return;
     }
     let (r, c) = (rows as usize, cols as usize);
-    if r < KLDIV_PAR_MIN {
+    if !crate::par::fork_rows(r, c, crate::par::W_TRANSCENDENTAL) {
         wukong_kldiv_f32(p, q, out, rows, cols);
         return;
     }

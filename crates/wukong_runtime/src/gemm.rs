@@ -233,8 +233,9 @@ fn select_nc(m: usize, k: usize, n: usize) -> usize {
 /// global resize) leaves the default pool — and the thread-count-derived striping of the reduction
 /// kernels that run on it — untouched. The GEMM result is independent of how panels are distributed
 /// (the per-(i,j) K-order is fixed), so this changes throughput only, never the bits: serial stays
-/// bit-identical to parallel. `None` (⇒ caller uses the default pool) when physical ≥ logical (no HT
-/// to avoid) or the pool can't be built.
+/// bit-identical to parallel. `None` (⇒ caller uses the default pool) when the usable physical
+/// cores are at least the global pool's width (no HT to avoid — see
+/// `topology::private_pool_width`) or the pool can't be built.
 /// Since 2026-07-10 this is the crate's UNIFIED kernel pool: `run_on_wuk_pool` (lib.rs) routes
 /// the `_parallel` norms/velem/reductions and `wukong_parallel_for` regions here too (default;
 /// `WUKONG_POOL_UNIFY=0` opts out), so a transformer forward stays on ONE warm pool instead of
@@ -249,10 +250,14 @@ pub(crate) fn gemm_pool() -> Option<&'static rayon::ThreadPool> {
             // registry if none exists, and it must come up with the runtime's required configuration
             // (16 MiB stacks, RAYON_NUM_THREADS honored) rather than rayon's bare defaults.
             crate::ensure_global_pool();
-            let physical = num_cpus::get_physical().max(1);
-            if physical >= rayon::current_num_threads() {
-                return None; // no HyperThreads to shed (or single pool already this small)
-            }
+            // Physical cores the process can actually use (affinity mask and cgroup quota
+            // applied), not the machine-wide `num_cpus::get_physical()`, which compared a whole
+            // machine's cores against a masked pool width and built nothing under `taskset`.
+            // `None`: no SMT siblings to shed, so the global pool is already one worker per core.
+            let physical = crate::topology::private_pool_width(
+                crate::topology::host_topology().physical_available,
+                rayon::current_num_threads(),
+            )?;
             let mut b = rayon::ThreadPoolBuilder::new()
                 .num_threads(physical)
                 .stack_size(16 * 1024 * 1024)

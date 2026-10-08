@@ -404,13 +404,10 @@ unsafe fn pool2d_serial(
     }
 }
 
-/// Channel count below which the parallel pooling just runs serially.
-const POOL_PAR_MIN: usize = 4;
-
 /// Multi-threaded pooling: the **channels** are mapped across cores (each channel's output plane is
 /// disjoint), every plane pooled by the identical per-channel routine — so the result is
-/// **bit-identical to [`pool2d_serial`]** (no cross-channel combine). Below `POOL_PAR_MIN` channels it
-/// runs serial.
+/// **bit-identical to [`pool2d_serial`]** (no cross-channel combine). Below the shared work gate
+/// (`par::fork_units`: channels x output elements x window) it runs serial.
 ///
 /// # Safety
 /// `x` valid for `channels*h*w`, `out` for `channels*oh*ow` f32, non-overlapping.
@@ -434,7 +431,9 @@ unsafe fn pool2d_parallel(
         return;
     }
     let c_n = channels as usize;
-    if c_n < POOL_PAR_MIN {
+    // Units are channels; the work is every output element's kh x kw window.
+    let window = (kh.max(1) as usize).saturating_mul(kw.max(1) as usize);
+    if !crate::par::fork_units(c_n, c_n.saturating_mul(oh * ow).saturating_mul(window)) {
         pool2d_serial(x, out, channels, h, w, kh, kw, sh, sw, kind);
         return;
     }
@@ -710,7 +709,7 @@ mod tests {
         let bits = |v: &[f32]| v.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
         for sw in [1usize, 2, 3] {
             for (kh, kw) in [(1usize, 1usize), (2, 2), (3, 3)] {
-                let (channels, h, w, sh) = (POOL_PAR_MIN, 5, 39, 1);
+                let (channels, h, w, sh) = (4, 5, 39, 1);
                 let (oh, ow) = ((h - kh) / sh + 1, (w - kw) / sw + 1);
                 // Every exceptional value appears as seed, later cell, and tail cell.
                 for phase in 0..values.len() {
@@ -799,7 +798,7 @@ mod tests {
     /// Max/avg pooling (AVX2 `sw==1` serial, the scalar `sw>1` path, and the multicore channel split)
     /// must equal the naive 4-deep nest **exactly** — same `(dy, dx)` window order — so it is literal
     /// bit equality. Configs straddle the 8-output-column edge, unit and non-unit strides, and the
-    /// `POOL_PAR_MIN` channel threshold; several have `oh`/`ow` that don't evenly divide the input.
+    /// old 4-channel threshold; several have `oh`/`ow` that don't evenly divide the input.
     #[test]
     fn pool2d_matches_naive_and_parallel() {
         // (channels, h, w, kh, kw, sh, sw)
@@ -809,7 +808,7 @@ mod tests {
             (2, 7, 7, 3, 3, 2, 2),   // 7 doesn't divide: oh=ow=3
             (4, 16, 16, 2, 2, 1, 1), // sw==1, wide -> AVX2 8-col band + tail
             (1, 5, 9, 2, 3, 1, 2),   // non-square window, mixed stride, ragged
-            (8, 10, 10, 3, 3, 3, 3), // > POOL_PAR_MIN channels, 10 doesn't divide by 3
+            (8, 10, 10, 3, 3, 3, 3), // several channels, 10 doesn't divide by 3
             (5, 1, 13, 1, 5, 1, 1),  // single input row, sw==1, AVX2 band crosses 8
             (2, 9, 9, 3, 3, 1, 1),   // sw==1 overlapping windows, ragged tail (ow=7)
             (6, 12, 1, 4, 1, 2, 1),  // single column, sw==1 but ow=1 -> all tail
