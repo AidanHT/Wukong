@@ -1,0 +1,66 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -3
+// EXPECT-OUT: 7
+// EXPECT-OUT: -3
+// EXPECT-OUT: 5
+// EXPECT-OUT: 9
+// EXPECT-OUT: 3
+// EXPECT-OUT: 18446744073709551615
+// EXPECT-OUT: -1
+// EXPECT-OUT: 1
+// EXPECT-OUT: -3
+// EXPECT-OUT: 5
+// EXPECT-OUT: 5
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 10
+// EXPECT-OUT: 12
+module tests.run.min_max_builtin
+
+// `min(a, b)` / `max(a, b)` on integers - the function every ragged loop tiling is written with
+// (`for i in i0..min(i0 + T, M)`) - used to be `error[C0001]: call is not yet supported by
+// codegen`. Integer operands compare in the result type's signedness (`u64::MAX` is the LARGEST
+// u64, not -1); float operands behave exactly as `fmin`/`fmax`; an integer against a float is
+// promoted to that float, as `fmin` promotes. Every expected value is the obvious minimum/maximum.
+
+fn clamp_count(n: usize) -> usize {
+    let mut c: usize = 0;
+    for i in 0..min(n, 4) {
+        c = c + 1;
+    }
+    return c;
+}
+
+fn main() -> i32 {
+    let a: i32 = -3;
+    let b: i32 = 7;
+    print(min(a, b));                 // -3
+    print(max(a, b));                 // 7
+    print(min(b, a));                 // -3 (either operand order)
+    let u: usize = 5;
+    let v: usize = 9;
+    print(min(u, v));                 // 5
+    print(max(u, v));                 // 9
+    let big: u64 = 18446744073709551615;
+    let three: u64 = 3;
+    print(min(big, three));           // 3: an unsigned compare
+    print(max(big, three));           // u64::MAX
+    let s: i64 = -1;
+    let t: i64 = 1;
+    print(min(s, t));                 // -1: a signed compare
+    print(max(s, t));                 // 1
+    let x: f32 = 2.5;
+    let y: f32 = -1.5;
+    print((min(x, y) * 2.0) as i32);  // -1.5 * 2 = -3
+    print((max(x, y) * 2.0) as i32);  // 2.5 * 2 = 5
+    let k: i32 = 3;
+    print((min(k, x) * 2.0) as i32);  // min(3.0, 2.5) = 2.5, * 2 = 5
+    print(clamp_count(2));            // a loop bound: min(2, 4) = 2 iterations
+    print(clamp_count(10));           // min(10, 4) = 4 iterations
+    let base: usize = 12;
+    let m: usize = 10;
+    print(min(base + 4, m));          // the ragged tile end: min(16, 10) = 10
+    print(max(base, m));              // 12
+    return 0;
+}

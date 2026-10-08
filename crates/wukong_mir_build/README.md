@@ -101,7 +101,14 @@ Both fold through `BinOp::fold_const_len`; operand bound clamp to `u32::MAX` is 
    `diff_kernel_call`) or `@parallel` backward breaks.
 6. **PTX is not here** — but every new kernel symbol must match `wukong_runtime` exactly.
 
-Submodules: `src/canon.rs` (AST canonicalization), `src/tindex.rs` (tensor index linearization).
+Submodules: `src/canon.rs` (AST canonicalization, plus the recognizer-only value-binding view),
+`src/tindex.rs` (tensor index linearization), and the recognizer spelling-coverage modules —
+`src/elementwise.rs` (value-binding view probes, the hand-written tanh GELU), `src/ucount.rs`
+(`usize` / symbolic-dim counters behind a run-time `end >= 0` test), `src/colacc.rs` (row-outer
+column reductions), `src/softmax_oop.rs` (out-of-place softmax / log-softmax), `src/detile.rs`
+(hand-tiled GEMM chains, including `min`-clamped and counted tiles behind run-time cover tests, and
+the `C`-seeded `C += A·B` form), `src/dispatch.rs` (per-loop `@generic`, `--remarks=dispatch`) —
+and `src/minmax.rs` (the integer/float `min`/`max` builtins).
 
 ## Testing
 

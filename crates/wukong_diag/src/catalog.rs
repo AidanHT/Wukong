@@ -182,9 +182,10 @@ static CATALOG: &[Explanation] = &[
          set is closed: `@parallel`, `@generic`, `@tile`, `@extern`, `@inline`, `@simd`, `@align`, \
          `@export`. Anything else — most importantly a typo of a real one, `@parellel` — used to be \
          accepted and discarded, so the program compiled with none of the requested behavior and no \
-         diagnostic. Placement: `@generic` (opt this function out of kernel recognition) is read \
-         from the `fn` item, so it is rejected on a statement, a parameter, or a non-`fn` item \
-         rather than silently promising a per-loop opt-out. The parsed-but-discarded attributes \
+         diagnostic. Placement: `@generic` (opt out of kernel recognition) is read from a `fn` item \
+         (the whole function) or a `for`/`while` loop (that loop and everything nested in it), so \
+         it is rejected on any other statement, a parameter, or a non-`fn` item rather than \
+         silently promising an opt-out nothing reads. The parsed-but-discarded attributes \
          (`@inline`, `@simd`, `@align`, `@export`) stay legal wherever they parse."
     ),
     entry!(

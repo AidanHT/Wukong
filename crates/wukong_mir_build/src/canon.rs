@@ -96,7 +96,7 @@ use wukong_ast::{
     VariantPat,
 };
 use wukong_sema::SemaResult;
-use wukong_span::{FxHashSet as HashSet, Symbol};
+use wukong_span::{FxHashSet as HashSet, Interner, Symbol};
 use wukong_types::Ty;
 
 /// Bound on the substitute-and-retry fixpoint. Every round that reports a change has deleted at
@@ -1279,5 +1279,190 @@ fn scan_defer_expr(e: &Expr, found: &mut bool) {
             }
         }
         _ => {}
+    }
+}
+
+// ---- the third rewrite: a recognizer-only view of a body's hoisted value bindings ---------------
+
+/// The loop body a kernel recognizer should see when the author named a loaded value before using
+/// it — `let v = x[i]; o[i] = gelu(v);` — or `None` when there is nothing to inline.
+///
+/// Binding the element to a local is the most common respelling in real code, and it is mandatory
+/// the moment the value is used twice (`o[i] = v * sigmoid(v)`); every optimizer performs the
+/// reverse anyway. But the elementwise recognizers match `f(x[j])` on the raw AST, and the module
+/// rewrite above deliberately never inlines a *float* binding (it would move a rounding step in
+/// general, and duplicate a load), so the hoisted spelling lost `wukong_vmath_f32` /
+/// `wukong_velem_f32` and fell back to the 128-bit generic vectorizer.
+///
+/// This is therefore NOT a module rewrite. It builds a *view* — a copy of the body with the leading
+/// `let`s substituted into the one statement that consumes them — which a caller hands to the
+/// kernel probes **only**. When no probe fires, the caller lowers the original body, so a program
+/// this cannot help compiles exactly as before; when one fires, the kernel replaces the whole loop
+/// and the view is what it computed. Soundness is about the view being the same loop:
+///
+/// * the body is a run of `let <ident> = <init>;` followed by ONE store `a[idx] = value` (any
+///   assignment operator) and then anything that does not mention a binding; no tail;
+/// * every initializer and the store are *pure* expressions — literals, single-name paths,
+///   arithmetic (no short-circuit `&&`/`||`), casts, `!`/unary minus, indexing, field projection
+///   and unshadowed math-intrinsic calls. No user call, no `&`, no deref, no block/`if`/`match`.
+///   So between a `let` and the store nothing can write memory or observe an effect, and
+///   re-evaluating an initializer at the store yields the value the binding held — independent of
+///   any aliasing between the arrays involved;
+/// * every binding is a scalar int/float, is read at least once (so no trap a dropped binding
+///   would have raised can disappear), is read only by later `let`s and the store's VALUE (never
+///   its target, never after it), and every read is typed exactly as its initializer, which is what
+///   rejects an annotation that would change the arithmetic width;
+/// * a FLOAT binding's initializer is not a product. A bound product is rounded at the `let`;
+///   inlined as an operand of a `+` it would be contracted into one fused multiply-add
+///   (`try_contract_fma`) — a different rounding, and a different kernel spelling. Every other
+///   initializer form is a complete rounding point in both positions (a load, a call result, a sum
+///   that is itself the addend of a contraction), so the inline evaluation is unchanged;
+/// * no name is bound twice in the run, and no binding shadows a name that its own or an earlier
+///   initializer reads. Together these mean no binding name can occur in any resolved
+///   initializer, so substituting the bindings one after another never captures an outer name by
+///   mistake: in `let a = x[i]; let x = a + 1.0; o[i] = a * x;` the outer array `x` inside `a`'s
+///   initializer would otherwise be rewritten into the second binding.
+///
+/// The view keeps every `NodeId`, so `sema.types` answers for it exactly as for the original.
+pub(crate) fn inline_value_lets(
+    body: &Block,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<Block> {
+    if body.tail.is_some() {
+        return None;
+    }
+    let n_lets = body
+        .stmts
+        .iter()
+        .take_while(|s| matches!(s.kind, StmtKind::Let { .. }))
+        .count();
+    if n_lets == 0 || n_lets >= body.stmts.len() {
+        return None;
+    }
+    let StmtKind::Assign { target, value, .. } = &body.stmts[n_lets].kind else {
+        return None;
+    };
+    if !matches!(target.kind, ExprKind::Index { .. })
+        || !value_is_pure(target, sema, interner)
+        || !value_is_pure(value, sema, interner)
+    {
+        return None;
+    }
+    let mut binds: Vec<(Symbol, Expr)> = Vec::with_capacity(n_lets);
+    for (k, s) in body.stmts[..n_lets].iter().enumerate() {
+        let StmtKind::Let {
+            pat: Pattern {
+                kind: PatKind::Ident(x),
+                ..
+            },
+            init: Some(init),
+            ..
+        } = &s.kind
+        else {
+            return None;
+        };
+        if !s.attrs.is_empty() || binds.iter().any(|(y, _)| y == x) {
+            return None;
+        }
+        // No shadowing of a name this or an earlier initializer reads (see the doc comment).
+        if body.stmts[..=k].iter().any(|t| crate::stmt_mentions(t, *x)) {
+            return None;
+        }
+        let init_ty = sema.types.get(&init.id)?;
+        let Ty::Scalar(sc) = init_ty else {
+            return None;
+        };
+        if !(sc.is_int() || sc.is_float()) || !value_is_pure(init, sema, interner) {
+            return None;
+        }
+        // A bound float product is rounded at the `let`; inlined it could become an FMA operand.
+        if sc.is_float()
+            && matches!(
+                init.kind,
+                ExprKind::Binary {
+                    op: wukong_ast::BinOp::Mul,
+                    ..
+                }
+            )
+        {
+            return None;
+        }
+        // Readers: the later `let`s of the run and the store's value, each at the initializer's type.
+        let mut uses = UseScan {
+            name: *x,
+            init_ty,
+            sema,
+            require_index: false,
+            count: 0,
+            ok: true,
+        };
+        for later in &body.stmts[k + 1..n_lets] {
+            uses.stmt(later, false);
+        }
+        uses.expr(value, false);
+        if !uses.ok || uses.count == 0 {
+            return None;
+        }
+        if crate::expr_mentions(target, *x)
+            || body.stmts[n_lets + 1..].iter().any(|t| stmt_touches(t, *x))
+        {
+            return None;
+        }
+        // Resolve the bindings this initializer reads, so the substituted text names none of them.
+        let mut init = init.clone();
+        for (y, e) in &binds {
+            subst_expr(&mut init, *y, e);
+        }
+        binds.push((*x, init));
+    }
+    let mut stmts: Vec<Stmt> = body.stmts[n_lets..].to_vec();
+    if let StmtKind::Assign { value, .. } = &mut stmts[0].kind {
+        for (x, e) in &binds {
+            subst_expr(value, *x, e);
+        }
+    }
+    Some(Block {
+        id: body.id,
+        stmts,
+        tail: None,
+        span: body.span,
+    })
+}
+
+/// The purity test of [`inline_value_lets`]: an expression whose evaluation writes nothing, calls
+/// nothing a user wrote, and branches nowhere — so evaluating it again, later, with no store in
+/// between, yields the same value.
+fn value_is_pure(e: &Expr, sema: &SemaResult, interner: &Interner) -> bool {
+    match &e.kind {
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Char(_) => true,
+        ExprKind::Path(p) => p.is_single(),
+        ExprKind::Unary { op, expr } => {
+            matches!(op, UnOp::Neg | UnOp::Not) && value_is_pure(expr, sema, interner)
+        }
+        ExprKind::Binary { op, lhs, rhs } => {
+            !matches!(op, wukong_ast::BinOp::And | wukong_ast::BinOp::Or)
+                && value_is_pure(lhs, sema, interner)
+                && value_is_pure(rhs, sema, interner)
+        }
+        ExprKind::Cast { expr, .. }
+        | ExprKind::Field { base: expr, .. }
+        | ExprKind::TupleField { base: expr, .. } => value_is_pure(expr, sema, interner),
+        ExprKind::Index { base, indices } => {
+            value_is_pure(base, sema, interner)
+                && indices.iter().all(|i| value_is_pure(i, sema, interner))
+        }
+        // A pure math builtin (`exp`, `gelu`, `fmax`, …) that no user `fn` shadows: the same
+        // precedence `lower_call` applies (`crate::intrinsic_callee`).
+        ExprKind::Call {
+            callee,
+            generic_args,
+            args,
+        } => {
+            generic_args.is_empty()
+                && crate::intrinsic_callee(callee, sema, interner).is_some()
+                && args.iter().all(|a| value_is_pure(a, sema, interner))
+        }
+        _ => false,
     }
 }

@@ -11,10 +11,11 @@
 //! also means a future attribute cannot be *used* before it is *implemented*.
 //!
 //! Placement is checked here too, but only where a misplaced attribute would be a silent lie.
-//! `@generic` (suppress the kernel recognizers for one function, see `wukong_mir_build`) is read
-//! from the **function item**, so accepting it on a statement would promise a per-loop opt-out that
-//! nothing implements. `@tile` is read from the function item (into a width queue) or from the
-//! `for` statement it sits on, and from nowhere else — so on a `struct`, a parameter, a `let` or a
+//! `@generic` (suppress the kernel recognizers, see `wukong_mir_build`'s `dispatch.rs`) is read from
+//! the **function item** — for the whole function — or from the **`for`/`while` loop** it sits on —
+//! for that loop and everything nested in it; on any other statement nothing reads it. `@tile` is
+//! read from the function item (into a width queue) or from the `for` statement it sits on, and
+//! from nowhere else — so on a `struct`, a parameter, a `let` or a
 //! `while` it used to be accepted and dropped, a schedule written on a loop being the sharpest of
 //! those. Every other attribute's placement is unchecked in v1 — the ones that are discarded are
 //! discarded wherever they appear.
@@ -32,8 +33,10 @@ pub const KNOWN_ATTRS: &[&str] = &[
     "parallel", "generic", "tile", "extern", "inline", "simd", "align", "export",
 ];
 
-/// Attributes that are read from a function item and therefore mean nothing anywhere else.
-const FN_ITEM_ONLY: &[&str] = &["generic"];
+/// Attributes read from a function item or from the loop statement (`for` or `while`) they sit on,
+/// and nowhere else. `@generic` turns kernel recognition off for the function, or for the loop and
+/// every loop nested in it.
+const FN_ITEM_OR_LOOP: &[&str] = &["generic"];
 
 /// Attributes read from a function item **or** from the `for` statement they sit on, and nowhere
 /// else. `@tile` is a loop schedule: `lower_program_with` reads it off the `fn` into a width queue
@@ -54,10 +57,11 @@ enum Place {
     Item,
     /// On a function parameter.
     Param,
-    /// On a `for` statement inside a body — the one statement `@tile` is read from.
+    /// On a `for` statement inside a body — where `@tile` and `@generic` are read.
     ForStmt,
-    /// On a `while` statement. Split out from [`Place::Stmt`] only so the diagnostic can say so:
-    /// `@tile(2) while …` is a schedule written on a loop, and reads as if it applied.
+    /// On a `while` statement — where `@generic` is read. Split out from [`Place::Stmt`] so the
+    /// diagnostic can say so: `@tile(2) while …` is a schedule written on a loop, and reads as if
+    /// it applied.
     WhileStmt,
     /// On any other statement inside a body (`@generic let x = …`).
     Stmt,
@@ -116,15 +120,19 @@ fn check_attr(a: &Attr, place: Place, interner: &Interner, diags: &mut Vec<Diagn
         );
         return;
     }
-    if place != Place::FnItem && FN_ITEM_ONLY.contains(&name) {
+    if !matches!(place, Place::FnItem | Place::ForStmt | Place::WhileStmt)
+        && FN_ITEM_OR_LOOP.contains(&name)
+    {
         diags.push(
             Diagnostic::error(format!(
                 "attribute `@{name}` is not valid on {}",
                 place.what()
             ))
             .with_code("E0306")
-            .primary(a.span, "only a `fn` item may carry this attribute")
-            .help(format!("move `@{name}` onto the enclosing `fn`")),
+            .primary(a.span, "nothing reads this attribute here")
+            .help(format!(
+                "write `@{name}` on a `for` or `while` loop, or on the enclosing `fn`"
+            )),
         );
         return;
     }
@@ -325,19 +333,39 @@ mod tests {
         );
     }
 
-    /// `@generic` is read off the function item, so it must be rejected — not ignored — anywhere a
-    /// reader would expect it to opt that construct out of kernel recognition.
+    /// `@generic` is read off a function item or off a loop, so anywhere else it must be rejected —
+    /// not ignored — since a reader would expect it to opt that construct out of kernel recognition.
     #[test]
-    fn generic_is_rejected_off_a_fn_item() {
+    fn generic_is_rejected_off_a_fn_item_or_loop() {
         assert_eq!(
-            codes("fn f() { @generic for i in 0..4 { let x: i32 = i; } }"),
+            codes("fn f() { @generic let x: i32 = 1; }"),
             vec!["E0306"],
-            "statement"
+            "let"
+        );
+        assert_eq!(
+            codes("fn f(@generic x: i32) {}"),
+            vec!["E0306"],
+            "parameter"
         );
         assert_eq!(
             codes("@generic\nstruct S { x: i32 }"),
             vec!["E0306"],
             "struct"
+        );
+    }
+
+    /// ...and accepted on the two loop forms, where `wukong_mir_build` reads it per loop.
+    #[test]
+    fn generic_is_accepted_on_a_for_and_a_while() {
+        assert_eq!(
+            codes("fn f(mut o: [i32; 4]) { @generic for i in 0..4 { o[i] = i; } }"),
+            Vec::<&str>::new(),
+            "for statement"
+        );
+        assert_eq!(
+            codes("fn f(mut o: [i32; 4]) { @generic while o[0] < 4 { o[0] = o[0] + 1; } }"),
+            Vec::<&str>::new(),
+            "while statement"
         );
     }
 

@@ -539,7 +539,9 @@ lane type, so lane `k` always computes exactly what scalar iteration `base+k` wo
 family (`round`/`floor`/`ceil`/`trunc`) as one lane op, `fmax`/`fmin` as a lane compare + blend, and the
 transcendentals and activations (`exp`, `log`, `tanh`, `sigmoid`, `silu`, `gelu`, …) as their inline f32
 polynomial expanded per lane — only for an f32 lane, and only while the name does not resolve to a user
-`fn` (a user `fn gelu` wins and the loop stays scalar). `@parallel` per-thread chunks go through the
+`fn` (a user `fn gelu` wins and the loop stays scalar). The integer-or-float `min`/`max` builtins
+(`wukong_mir_build/src/minmax.rs`, a compare in the result's signedness + `select`) are deliberately
+not in that set yet, so a body calling them stays scalar. `@parallel` per-thread chunks go through the
 same vectorizer, so they run SIMD × cores.
 
 Cranelift's CLIF vector ISA still caps at 128-bit — a 256-bit `f32x8` SSA value is rejected at
@@ -770,8 +772,14 @@ cargo run -q -p wukongc -- --emit=mir -O2 tests/run/tensor_matmul.wk       # no 
 Two rules about it:
 
 - **It is an instrument, not a user feature**, which is why it is an environment variable in the
-  style of `WUKONG_GPU_NO_MEGA` and not a CLI flag (nothing in `USAGE` mentions it). The supported,
-  per-function surface for "lower the loop I wrote" is the `@generic` attribute.
+  style of `WUKONG_GPU_NO_MEGA` and not a CLI flag (nothing in `USAGE` mentions it). The supported
+  surface for "lower the loop I wrote" is the `@generic` attribute, on a function or on a single
+  `for`/`while` loop (`wukong_mir_build::dispatch`).
+- **The per-site view is `--remarks=dispatch`** (`wukong_mir_build::lower_program_reporting_dispatch`):
+  a `note` at each statement `lower_block` lowered into a recognized `wukong_*` call (the innermost
+  one; an enclosing statement that only contains it is skipped), and at a function's name when a
+  whole-function interception replaced it. It observes the builder, never steers it, so the MIR is
+  byte-identical with it on or off.
 - **Autodiff refuses to run under it**, by name: `--train` and `--emit=grad` exit 1 as soon as the
   variable is set, because `wukong_autodiff`'s VJP rules are keyed on the recognized kernel calls. A
   named refusal, never a silently zero gradient.

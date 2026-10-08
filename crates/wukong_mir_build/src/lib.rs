@@ -28,9 +28,18 @@
 
 mod alias;
 mod canon;
+mod colacc;
+#[cfg(test)]
+mod coverage_tests;
+mod detile;
+mod dispatch;
+mod elementwise;
 mod kernel_guard;
+mod minmax;
+mod softmax_oop;
 mod tile;
 mod tindex;
+mod ucount;
 
 use std::cell::{Cell, RefCell};
 
@@ -911,7 +920,8 @@ pub struct LowerOptions {
     /// whether it fired at all. Turning it off is how a claim about the *language* ("this loop is
     /// fast because of how it was compiled, not because a pattern matcher swapped in a hand-written
     /// kernel") becomes measurable. `wukong_driver` sets it from `WUKONG_NO_RECOGNIZE`, and
-    /// `@generic` on a function turns it off for that function alone.
+    /// `@generic` on a function turns it off for that function alone (on a `for`/`while` loop, for
+    /// that loop alone — see `dispatch.rs`).
     pub recognize: bool,
 
     /// Build the 256-bit raw-AVX2 `Op::VecKernelCall` recipes (`true`, the default and the shipped
@@ -973,6 +983,30 @@ pub fn lower_program_with(
     interner: &mut Interner,
     opts: LowerOptions,
 ) -> (Program, Vec<Diagnostic>) {
+    lower_program_impl(module, sema, interner, opts, false)
+}
+
+/// [`lower_program_with`], plus one `note` diagnostic per recognized kernel dispatch: at each
+/// statement whose lowering became a `wukong_*` runtime kernel call (the innermost such statement),
+/// or at a function's name when a whole-function interception replaced it, naming the kernel
+/// symbols. This is `wukongc --remarks=dispatch`. The returned [`Program`] is identical to
+/// [`lower_program_with`]'s for the same input; only the diagnostics differ.
+pub fn lower_program_reporting_dispatch(
+    module: &Module,
+    sema: &SemaResult,
+    interner: &mut Interner,
+    opts: LowerOptions,
+) -> (Program, Vec<Diagnostic>) {
+    lower_program_impl(module, sema, interner, opts, true)
+}
+
+fn lower_program_impl(
+    module: &Module,
+    sema: &SemaResult,
+    interner: &mut Interner,
+    opts: LowerOptions,
+    report: bool,
+) -> (Program, Vec<Diagnostic>) {
     // Two AST normalizations run back to back, before anything looks at the tree, because every
     // kernel recognizer and the autovectorizer match a *syntactic* shape on the raw AST.
     //
@@ -1016,6 +1050,9 @@ pub fn lower_program_with(
         alias_free: false,
         // No versioning context until `emit_alias_versioned` opens one around a single emitter.
         guard: KernelGuard::Off,
+        report,
+        resume: false,
+        proven_end: None,
         mm: interner.intern("wukong_sgemm"),
         mm_par: interner.intern("wukong_sgemm_parallel"),
         print_str: interner.intern("print_str"),
@@ -1234,7 +1271,21 @@ pub fn lower_program_with(
             _ => None,
         })
         .collect();
+    // `--remarks=dispatch`: the function item lowered last, as (index of the first function it
+    // produced, diagnostic count before it, its name's span), flushed once the item is done. A
+    // whole-function interception lowers no statement, so it is reported here, at the name.
+    let mut pending_report: Option<(usize, usize, Span)> = None;
     for item in &module.items {
+        if let Some((from, diags_from, span)) = pending_report.take() {
+            dispatch::flush_function_dispatch(
+                &program.funcs,
+                from,
+                &mut diags,
+                diags_from,
+                span,
+                interner,
+            );
+        }
         if let ast::ItemKind::Fn(f) = &item.kind {
             if let Some(body) = &f.body {
                 // A type-generic function (`fn id<T>(x: T)`) is lowered once per concrete
@@ -1242,6 +1293,9 @@ pub fn lower_program_with(
                 // (`fn f<N>(a: Tensor[f32, N])`) are not type-generic and lower normally here.
                 if !mono.tg(f.name.sym).is_empty() {
                     continue;
+                }
+                if gemm.report {
+                    pending_report = Some((program.funcs.len(), diags.len(), f.name.span));
                 }
                 // `@generic` on this function is the user saying "I meant this loop": clear the
                 // recognition switch for this function alone, which is the same skip
@@ -1263,7 +1317,12 @@ pub fn lower_program_with(
                 // disabled, control falls through to the `@parallel` outliner and the plain
                 // `lower_fn` below, and the nest runs as written. `@parallel` outlining itself is
                 // NOT a recognizer — it is the user asking for threads — so it stays outside.
-                if gemm.recognize {
+                //
+                // A `@generic` LOOP anywhere in the body also keeps every arm here off: each one
+                // replaces a loop wholesale, and the statement-level cascade honors the attribute
+                // per loop (`dispatch.rs`), so the function's other loops still dispatch there.
+                let loop_opt_out = dispatch::body_has_generic_loop(body, interner);
+                if gemm.recognize && !loop_opt_out {
                     // Whole-function matmul: lower the entire nest to a single (optionally parallel)
                     // `wukong_sgemm` call — the tuned 256-bit AVX2/FMA microkernel. `emit_sgemm` declines
                     // shapes it has no kernel for (a fused bias or an α on a non-NT store, `Aᵀ·Bᵀ`), so the
@@ -1941,6 +2000,9 @@ pub fn lower_program_with(
                         let base = interner.resolve(f.name.sym).to_string();
                         let par_sym = interner.intern(&format!("{base}$par"));
                         let pfor_sym = interner.intern("wukong_parallel_for");
+                        // The outlined chunk body is the one loop's body: a `@generic` on that loop
+                        // opts the whole chunk out of recognition.
+                        let gemm = generic_gemm(gemm, loop_opt_out);
                         let (outlined, wrapper) = lower_parallel(
                             f, par_sym, pfor_sym, idx, hi, loop_body, sema, interner, gemm,
                             &mut diags,
@@ -1996,6 +2058,16 @@ pub fn lower_program_with(
             }
         }
     }
+    if let Some((from, diags_from, span)) = pending_report.take() {
+        dispatch::flush_function_dispatch(
+            &program.funcs,
+            from,
+            &mut diags,
+            diags_from,
+            span,
+            interner,
+        );
+    }
     // Emit one specialized copy of each type-generic function per concrete instantiation collected
     // above. Iterated in discovery order (a `Vec`) so the emitted MIR is deterministic across runs.
     let fn_decls: HashMap<Symbol, (&FnDecl, &Block)> = module
@@ -2044,8 +2116,8 @@ fn has_parallel_attr(item: &ast::Item, interner: &Interner) -> bool {
 }
 
 /// Does this item carry a `@generic` attribute — "lower the loops I wrote, do not recognize them"?
-/// `wukong_sema::attrs` has already rejected the attribute anywhere but a `fn` item, so this only
-/// ever fires where it means something.
+/// `wukong_sema::attrs` has already rejected the attribute anywhere but a `fn` item or a loop; this
+/// reads the item form (the loop form is `dispatch.rs`'s).
 fn has_generic_attr(item: &ast::Item, interner: &Interner) -> bool {
     item.attrs
         .iter()
@@ -2924,6 +2996,20 @@ struct GemmSyms {
     /// `kernel_guard.rs`). `Off` everywhere except inside `FnLowerer::emit_alias_versioned`, which
     /// sets it around exactly one emitter call, the way `recognize` is cleared around a fallback.
     guard: KernelGuard,
+    /// Report every recognized kernel dispatch as a `note` diagnostic (`--remarks=dispatch`,
+    /// [`lower_program_reporting_dispatch`]). Pure observation — see `dispatch.rs`. Rides here for
+    /// the same reason `recognize` does: this struct reaches every lowerer.
+    report: bool,
+    /// A pending hand-back of recognition: set (with `recognize` cleared) while a loop that encloses
+    /// a `@generic` loop runs its own probes, and consumed by the first block lowered for it — its
+    /// body — which turns `recognize` back on for the body's statements. See `dispatch.rs`
+    /// (`FnLowerer::with_loop_attrs`). Rides here so an outlined region of that loop inherits it.
+    resume: bool,
+    /// The end expression of the unsigned 64-bit range loop being lowered on the far side of its own
+    /// run-time `end >= 0` test (`ucount.rs`): [`FnLowerer::end_fits_signed_i64`] accepts exactly
+    /// that node there, so every range-based recognizer treats the loop as provably in the signed
+    /// domain. `None` everywhere else.
+    proven_end: Option<ast::NodeId>,
     mm: Symbol,
     mm_par: Symbol,
     /// Runtime print of a null-terminated string buffer (a `*u8` argument to `print`/`println`),
@@ -4956,9 +5042,12 @@ impl FnLowerer<'_> {
         // when the endpoint proves that this half cannot be visited.
         if !signed && self.signed(start) {
             let max_signed = (1u64 << (mir_byte_size(&ity) * 8 - 1)) - 1;
-            if !self
-                .const_usize_expr(end)
-                .is_some_and(|end| u64::from(end) <= max_signed)
+            // A 64-bit endpoint `ucount.rs` has tested `>= 0` at run time is at most `i64::MAX`.
+            let proven = ity == MirType::I64 && self.gemm.proven_end == Some(end.id);
+            if !proven
+                && !self
+                    .const_usize_expr(end)
+                    .is_some_and(|end| u64::from(end) <= max_signed)
             {
                 return false;
             }
@@ -4983,12 +5072,16 @@ impl FnLowerer<'_> {
     /// [`Self::const_runtime_u64_expr`] is the prover: literals, literal arithmetic with checked
     /// operators, and an unshadowed top-level `const`, each required to carry a matching concrete
     /// integer type. Anything it cannot fold — a symbolic tensor dim threaded in as a hidden `usize`
-    /// parameter, `s.len()`, a runtime `usize` — declines here and keeps the ordinary loop lowering.
-    /// Closing those needs a runtime `end >= 0` test on the dispatch, which is a different change:
-    /// this predicate is consulted before any MIR is built and cannot introduce a branch.
+    /// parameter, `s.len()`, a runtime `usize` — declines here, because this predicate is consulted
+    /// before any MIR is built and cannot introduce a branch. Those endpoints are taken instead by
+    /// `ucount.rs`, which emits a run-time `end >= 0` test, keeps the loop as written as the
+    /// fallback, and lowers the loop again on the other side with `GemmSyms::proven_end` naming this
+    /// very `end` node — the one place a run-time proof answers here.
     fn end_fits_signed_i64(&self, end: &Expr) -> bool {
-        self.const_runtime_u64_expr(end)
-            .is_some_and(|v| v <= i64::MAX as u64)
+        self.gemm.proven_end == Some(end.id)
+            || self
+                .const_runtime_u64_expr(end)
+                .is_some_and(|v| v <= i64::MAX as u64)
     }
 
     /// Convert through the scalar loop's common type before widening to the kernel ABI. This
@@ -5033,12 +5126,21 @@ impl FnLowerer<'_> {
     // ---- blocks & statements ----
 
     fn lower_block(&mut self, b: &Block) -> Option<ValueId> {
+        // The body of a loop that encloses a `@generic` loop gets recognition back for its own
+        // statements (`dispatch.rs`); `any_generic` gates the per-position window check below.
+        let resumed = self.resume_recognition();
+        let any_generic = dispatch::body_has_generic_loop(b, self.interner);
         self.push_scope();
         let mut i = 0;
+        // `--remarks=dispatch`: what the statement(s) starting at `i` emitted, reported once they
+        // are lowered — every exit from an iteration below comes back through the loop head.
+        let mut report: Option<dispatch::DispatchMark> = None;
         while i < b.stmts.len() {
+            self.flush_dispatch(report.take());
             if self.terminated {
                 break;
             }
+            report = self.dispatch_mark(b.stmts[i].span);
             // Keep both consumed statements in source order when the epilogue
             // rereads output as bias, even with recognition disabled. Declining
             // fusion alone would still allow an inner loop to be outlined.
@@ -5075,7 +5177,23 @@ impl FnLowerer<'_> {
             // `try_fuse_run` below is deliberately NOT in here: fusing adjacent same-range loops is
             // an optimization of the loops the user wrote (it emits vector MIR, not a `wukong_*`
             // call), which is exactly what the recognition-off baseline is supposed to include.
-            if self.gemm.recognize {
+            //
+            // A statement holding a `@generic` loop that a window could swallow keeps every window
+            // (and the fusion run, whose fused body is probed by the elementwise recognizers) off at
+            // this position; each statement then lowers on its own, under `with_loop_attrs`.
+            let generic_window =
+                any_generic && dispatch::window_has_generic(&b.stmts[i..], self.interner);
+            if self.gemm.recognize && !generic_window {
+                // A hand-tiled GEMM — tile loops (`for i0 in 0..M step T`, the `let mut i0 = 0;
+                // while i0 < M { …; i0 = i0 + T; }` pair, or the counted `for it in 0..NT { let i0 =
+                // it * T; … }`) around full or `min`-clamped point loops — is presented to the GEMM
+                // recognizer as the untiled nest it enumerates (behind a run-time cover test when the
+                // extents are not constants), so blocking a matmul no longer costs the kernel. One
+                // statement (a tile `for`) or two (the `while` pair). See `detile.rs`.
+                if let Some(n) = self.try_detiled_gemm(b, i) {
+                    i += n;
+                    continue;
+                }
                 // Epilogue fusion: a `nn.Linear` matmul immediately followed by its bias-add / ReLU loop
                 // folds into one GEMM call with the epilogue applied in the C writeback (no separate pass
                 // over C). Checked before the elementwise fusion below — they match disjoint shapes.
@@ -5106,8 +5224,10 @@ impl FnLowerer<'_> {
                 // log-softmax (6 stmts) is probed before softmax (7 stmts): they share the leading max
                 // pass but diverge at stmt[2] — softmax's is the `exp` rewrite loop, log-softmax's is
                 // `let s = 0` — so the two matchers are disjoint (each declines the other's window).
-                // softmax / log-softmax stay in-place only (`dst == arr`): their exp / shift pass rewrites
-                // the data buffer in place, so an out-of-place final write would be an unsound hybrid.
+                // These two matchers are in-place only (`dst == arr`): a window whose exp / shift pass
+                // rewrites `arr` but whose final pass writes elsewhere would be an unsound hybrid. The
+                // genuinely out-of-place window (`x` kept, every write into `o`) is proved separately
+                // by `try_fuse_out_of_place_norm` below (`softmax_oop.rs`).
                 // `for c in 0..N { out[c] = x[c]; }` + an in-place norm on `out` is the same
                 // computation as the out-of-place `out = norm(x)` the kernel already runs, so the
                 // seeding copy — a recognized `wukong_velem_f32` identity-affine pass over the whole
@@ -5136,6 +5256,14 @@ impl FnLowerer<'_> {
                         i += n;
                         continue;
                     }
+                }
+                // Out-of-place softmax / log-softmax (`o = softmax(x)`, `x` preserved) — the spelling
+                // every caller that still needs the logits must write — to the same kernel with
+                // distinct source and destination. Probed after the in-place forms, which it never
+                // matches (it requires a destination other than the max pass's array).
+                if let Some(n) = self.try_fuse_out_of_place_norm(b, i) {
+                    i += n;
+                    continue;
                 }
                 // LayerNorm / RMSNorm / L2-norm accept the out-of-place form `out = norm(x)` (`dst != arr`),
                 // the residual-stream transformer pattern, as well as the in-place form (`dst == arr`).
@@ -5172,6 +5300,14 @@ impl FnLowerer<'_> {
                         i += n;
                         continue;
                     }
+                }
+                // The ROW-outer column reduction — a seed of `out` (`out[j] = 0`, a zero `let`, or
+                // row 0) followed by `for i { for j { out[j] = fold(out[j], x[i*N+j]) } }` — the
+                // cache-friendly spelling of the nest `lower_for`'s `match_colsum` knows only
+                // column-outer. Same kernels, same per-column operation order. See `colacc.rs`.
+                if let Some(n) = self.try_fuse_rowouter_colreduce(b, i) {
+                    i += n;
+                    continue;
                 }
                 // Single-row / flat 1-D scans (inclusive prefix sum / product, first-order linear
                 // recurrence). The batched `for r`-wrapped forms dispatch via the for-statement path; the
@@ -5212,7 +5348,12 @@ impl FnLowerer<'_> {
               // Operator fusion: a run of adjacent same-range elementwise `for` loops whose *fused*
               // body the vectorizer accepts is lowered as one loop (CSE/DSE then forward any
               // intermediate array through registers, cutting its memory traffic).
-            match self.try_fuse_run(&b.stmts[i..]) {
+            let fused = if generic_window {
+                None
+            } else {
+                self.try_fuse_run(&b.stmts[i..])
+            };
+            match fused {
                 Some(n) => i += n,
                 None => {
                     self.lower_stmt(&b.stmts[i]);
@@ -5220,11 +5361,13 @@ impl FnLowerer<'_> {
                 }
             }
         }
+        self.flush_dispatch(report.take());
         let tail = match &b.tail {
             Some(e) if !self.terminated => Some(self.lower_expr(e)),
             _ => None,
         };
         self.pop_scope();
+        self.end_resumed_recognition(resumed);
         tail
     }
 
@@ -5241,10 +5384,17 @@ impl FnLowerer<'_> {
             _ => return None,
         };
         let (start0, end0) = range_bounds(iter0)?;
-        // Maximal run of for-loops over the identical (var, start, end).
+        // Maximal run of for-loops over the identical (var, start, end). The run ends at a
+        // `@generic` loop: the fused body is lowered with recognition on, so fusing one would hand
+        // its body to the elementwise recognizers. `lower_block` keeps fusion off only when such a
+        // loop is within `dispatch.rs`'s window horizon, and a run has no length bound.
+        if dispatch::has_generic(&stmts[0].attrs, self.interner) {
+            return None;
+        }
         let mut run = 1;
         while run < stmts.len() {
             match fusable_for(&stmts[run]) {
+                Some(_) if dispatch::has_generic(&stmts[run].attrs, self.interner) => break,
                 Some((p, it, _)) => {
                     let same = matches!(&p.kind, ast::PatKind::Ident(s) if *s == var)
                         && range_bounds(it).is_some_and(|(s, e)| {
@@ -9351,16 +9501,22 @@ impl FnLowerer<'_> {
                 }
                 self.terminated = true;
             }
+            // `@generic` on a loop turns recognition off for that loop and everything inside it; a
+            // loop that only encloses one keeps its own probes off (`dispatch.rs`).
             StmtKind::While {
                 cond, body, label, ..
-            } => self.lower_while(label.map(|l| l.sym), cond, body),
+            } => self.with_loop_attrs(&s.attrs, body, |me| {
+                me.lower_while(label.map(|l| l.sym), cond, body)
+            }),
             StmtKind::For {
                 pat,
                 iter,
                 body,
                 label,
                 ..
-            } => self.lower_for(label.map(|l| l.sym), pat, iter, body, &s.attrs),
+            } => self.with_loop_attrs(&s.attrs, body, |me| {
+                me.lower_for(label.map(|l| l.sym), pat, iter, body, &s.attrs)
+            }),
             StmtKind::Break(label, value) => {
                 if let Some((_, _, brk)) = self.find_loop(label.as_ref().map(|l| l.sym)) {
                     // A value loop's break target (its exit/merge block) carries a typed param;
@@ -13476,6 +13632,15 @@ impl FnLowerer<'_> {
         {
             return;
         }
+        // A `usize` / symbolic-tensor-dim counter: the kernels and the vector loop above both need
+        // the signed domain, so prove it (statically, or with a run-time `end >= 0` test and the
+        // loop as written as the fallback). See `ucount.rs`.
+        if !inclusive
+            && step.is_none()
+            && self.try_unsigned_range_fast_path(label, pat, iter, start, end, body)
+        {
+            return;
+        }
 
         // Mid-function independent-iteration loop in a `@parallel` fn (the transformer per-head
         // attention loop is the canonical shape) → outline it into a `wukong_parallel_for` region:
@@ -14731,6 +14896,13 @@ impl FnLowerer<'_> {
                 }
             }
         }
+        // The tanh-approximation GELU written out by hand (HF `gelu_new`'s formula) dispatches to
+        // the same `VMATH_GELU` the `gelu()` call does — but only in the one association that is
+        // the kernel's own arithmetic, so the substitution changes no bit. See
+        // `match_gelu_tanh_expansion` for what is accepted and what is (deliberately) not.
+        if let Some(x_sym) = self.match_gelu_tanh_expansion(value, j, batch) {
+            return Some((out_sym, x_sym, VMATH_GELU, MirType::F32));
+        }
         let ExprKind::Call { callee, args, .. } = &value.kind else {
             return None;
         };
@@ -14975,7 +15147,10 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        let Some(calls) = self.match_vmath_body(*jvar, inner, Some((*r, cols))) else {
+        let Some(calls) = self
+            .match_vmath_body(*jvar, inner, Some((*r, cols)))
+            .or_else(|| self.batched_vmath_on_value_view(*jvar, inner, (*r, cols)))
+        else {
             return false;
         };
         // Flat range `[0, R*C)`: each base GEPs from element 0, length `R*C`.
@@ -16398,6 +16573,12 @@ impl FnLowerer<'_> {
             if self.try_dequant_for(j, start, end, body) {
                 return true;
             }
+            // The same five probes over the body with its hoisted value bindings inlined
+            // (`let v = x[j]; o[j] = gelu(v);`), tried only once every probe declined the body as
+            // written — see `canon::inline_value_lets` for why the view is the same loop.
+            if self.try_elementwise_kernels_on_value_view(j, start, end, body) {
+                return true;
+            }
         } // ---- end of the recognizer-gated elementwise kernel probes ----------------------------
           // Pure analyses first (emit no MIR). A reduction (`s += elementwise`) has a body shape
           // disjoint from the elementwise *store* loops, so try it first. Reductions are vectorized
@@ -16636,6 +16817,10 @@ impl FnLowerer<'_> {
                 if self.emit_vhorner(s, e, out_base, x_base, &coeffs) {
                     return true;
                 }
+            }
+            // A chunk whose body names its loaded value first (`let v = x[j]; o[j] = gelu(v);`).
+            if self.try_ranged_kernels_on_value_view(j, start_val, end_val, ity, body) {
+                return true;
             }
         } // ---- end of the recognizer-gated per-chunk kernel probes ------------------------------
         let Some((lane, w)) = self.vectorizable(body, j) else {
@@ -20975,6 +21160,10 @@ impl FnLowerer<'_> {
                 if let Some(v) = self.lower_attention(name, args) {
                     return v;
                 }
+                // `min(a, b)` / `max(a, b)`, integer or float (`minmax.rs`).
+                if let Some(v) = self.lower_min_max(name, args, e) {
+                    return v;
+                }
                 // Math builtins (sqrt/rsqrt/exp/fmax/fmin) lower to primitive ops. User functions
                 // shadow them (handled just above), so this catches only the genuine builtins.
                 if let Some(v) = self.lower_math_intrinsic(name, args, e) {
@@ -25084,7 +25273,8 @@ fn ijk_scalar_either_order<'a>(
 
 /// Try every recognized matmul spelling, in order: the `ikj` accumulate form
 /// ([`match_matmul`]), the `ijk` dot-product form with a scalar accumulator ([`match_matmul_ijk`]),
-/// and the `ijk` form that accumulates straight into `c[i*N+j]` ([`match_matmul_ijk_memacc`]).
+/// the `ijk` form that accumulates straight into `c[i*N+j]` ([`match_matmul_ijk_memacc`]), and the
+/// scalar accumulator seeded from `c[i*N+j]` (`C += A·B`, `detile::match_matmul_ijk_cseed`).
 /// `ijk` accepts j-outer/i-inner (independent loop interchange) and a counting `while` k-loop.
 fn recognize_matmul<'a>(
     pat: &Pattern,
@@ -25096,6 +25286,7 @@ fn recognize_matmul<'a>(
     match_matmul(pat, iter, body, sema, interner)
         .or_else(|| match_matmul_ijk(pat, iter, body, sema, interner))
         .or_else(|| match_matmul_ijk_memacc(pat, iter, body, sema, interner))
+        .or_else(|| detile::match_matmul_ijk_cseed(pat, iter, body, sema, interner))
 }
 
 /// Source-only preflight for a recognized GEMM whose bias can overlap its output.
@@ -35077,14 +35268,14 @@ fn act(mut a: [f32; 4096], x: [f32; 4096]) {
             );
         }
 
-        /// The decline side of the same predicate, and its honest limit: a `usize` endpoint whose
-        /// value is NOT provable - here a runtime parameter - still keeps the ordinary loop
-        /// lowering, because an endpoint above `i64::MAX` would reach the kernel as a negative
-        /// count and every kernel entry treats that as "nothing to do" while the loop as written
-        /// iterates. Proving it needs a runtime test on the dispatch, which this predicate cannot
-        /// emit: it runs before any MIR is built.
+        /// The other half of the same story: a `usize` endpoint whose value is NOT provable - here
+        /// a runtime parameter - cannot be handed to the kernel unconditionally, because an
+        /// endpoint above `i64::MAX` would reach it as a negative count while the loop as written
+        /// iterates. `ucount.rs` therefore dispatches under a run-time `end >= 0` test (`cmp.sge`)
+        /// and keeps the loop as written as the fallback, so the kernel is reachable AND the
+        /// fallback is still there.
         #[test]
-        fn an_unprovable_usize_bound_still_declines() {
+        fn an_unprovable_usize_bound_dispatches_under_a_runtime_guard() {
             let src = "module m
 fn act(mut a: [f32; 4096], x: [f32; 4096], n: usize) {
     for i in 0..n { a[i] = gelu(x[i]); }
@@ -35093,10 +35284,25 @@ fn act(mut a: [f32; 4096], x: [f32; 4096], n: usize) {
             let (prog, diags, interner) = lower(src);
             assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
             assert!(
-                !prog_calls(&prog, &interner, "wukong_vmath_f32"),
-                "an unprovable unsigned 64-bit endpoint must not dispatch; got {:?}",
+                prog_calls(&prog, &interner, "wukong_vmath_f32"),
+                "an unprovable unsigned 64-bit endpoint must dispatch under a guard; got {:?}",
                 kernel_calls(&prog, &interner)
             );
+            let f = prog
+                .funcs
+                .iter()
+                .find(|f| interner.resolve(f.name) == "act")
+                .expect("act lowered");
+            let guarded = f.blocks.iter().any(|b| {
+                b.insts
+                    .iter()
+                    .any(|i| matches!(&i.op, Op::Cmp(CmpOp::Sge, ..)))
+            });
+            assert!(
+                guarded,
+                "the dispatch must sit behind the signed-domain test"
+            );
+            assert!(verify_function(f).is_empty(), "verify failed");
         }
     }
 }

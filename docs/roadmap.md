@@ -384,6 +384,11 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   an integer (integer `abs` = `select(x<0, −x, x)`; rounding an integer is the identity), and `sqrt` /
   the transcendentals promote an integer operand to `f32` — so they no longer emit the float-op-on-int
   MIR that the native backend rejected and the interpreter ran lossily (`tests/run/int_math.wk`).
+- **`min(a, b)` / `max(a, b)`** (2026-10-08, `gap/recognizer-coverage`): integer (and float)
+  minimum/maximum, a compare in the result type's signedness plus a select, so a `usize` compares
+  unsigned; on floats they are `fmin`/`fmax`; the result is the operands' common type, as for `+`.
+  Before this a call was `C0001` — which made the ragged-tile spelling `for i in i0..min(i0 + T, M)`
+  (the one `examples/matmul.wk` uses) impossible to compile at all (`tests/run/min_max_builtin.wk`).
 - **Convolution via im2col + GEMM**: a conv written as an im2col gather followed by a matmul has its
   matmul recognized and dispatched to the tuned GEMM microkernel (the XLA/cuDNN lowering), so Wukong
   runs a 3×3 conv **~1.55× faster** than a hand-written direct convolution in C — and 1.12× *slower*
@@ -437,7 +442,7 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   `tile_never_applied.wk`, `tile_on_parallel_fn.wk`, `tile_on_recognized_kernel.wk`,
   `tile_second_on_stmt.wk`).   `@tile` is accepted only where something reads it — a `fn` item or the `for` statement it schedules
   — and is **`E0306`** on a `struct`, a parameter, a `let` or a `while`, the same placement code
-  `@generic` carries off a `fn` item (`tests/fail/tile_on_while.wk`).
+  `@generic` carries off a `fn` item or a loop (`tests/fail/tile_on_while.wk`).
 - **`shared [T; N]`** and **`sync_block()`**: shared address space on `alloca`; cooperative barrier
   inside `@parallel` only (`E0308` otherwise). Static shared size above 48 KiB is `E0307`. CPU:
   shared = stack `alloca`, barrier = no-op/fence. gpu-native: PTX `.shared` + `bar.sync` in
@@ -464,9 +469,13 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   four probe sites (whole-function interception, the per-loop `match_*` cascade, `lower_block`'s
   statement windows, the vectorizer's elementwise probes) fire inside it, so its loops compile as
   written — while auto-vectorization, loop fusion, FMA contraction, `@parallel` outlining and the
-  optimizer all still apply, as do the builtins you call by name. It is per function, not per module
+  optimizer all still apply, as do the builtins you call by name. It is per function or per loop (on a
+  `for`/`while` it covers that loop and everything nested in it, `tests/run/generic_loop_optout.wk`),
+  not per module
   (`tests/run/lang_generic_saxpy.wk`, `lang_generic_naive_gemm.wk` each hold the same body twice and
-  the MIR then holds exactly one kernel call), and it is `E0306` anywhere but a `fn` item. The
+  the MIR then holds exactly one kernel call), and it is `E0306` anywhere but a `fn` item or a loop.
+  `wukongc --remarks=dispatch` prints, at each statement a recognizer replaced, the kernel symbol it
+  became, so dispatch is no longer visible only through `--emit=mir | grep wukong_`. The
   whole-program equivalent, `WUKONG_NO_RECOGNIZE`, is a **measurement instrument** rather than a user
   feature (see `docs/internals.md`): recognizers are otherwise gate-blind, so this is the only way to
   compile and time the honest generic lowering of the same program. Autodiff refuses to run under the
@@ -907,6 +916,29 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   reverse-mode autodiff already ships as the `wukong_autodiff` crate — both above).
 
 ## Known limitations / sharp edges
+
+- **Recognizer spellings still outside the fold** (2026-10-06, `gap/recognizer-coverage`). The
+  hoisted-value, GELU-expansion, row-outer column-reduction, out-of-place softmax, hand-tiled GEMM and
+  `usize`-counter spellings now dispatch (`docs/language-guide.md`, Attributes), each only where the
+  kernel computes what the source computes. Declined on purpose, and therefore still the 128-bit
+  generic loop: HuggingFace's literal `0.044715 * v * v * v` GELU and the erf GELU (no kernel computes
+  them bit-for-bit — a new `vmath` opcode would); `out[j] = out[j] + x*x` (the source contracts it to
+  one FMA, the `colsumsq` kernel squares and adds — write `+=`); among tilings (2026-10-08: ragged
+  `min(i0 + T, M)` tails, counted `let i0 = it * T` tiles, runtime extents and tiled contractions now
+  dispatch), a counted tile whose point loop is a full `i0..i0 + T` (it names no extent), a tile width
+  that is not a literal or a `const` (a function-local `const` counts only when declared in the same
+  block as the tiled loop), a contraction tiled around a ZERO-seeded scalar (it overwrites `C` with
+  the last tile's partial sum — not a GEMM), and `examples/matmul.wk` itself, whose inner kernel is
+  written in explicit `f32x8` intrinsics that lowering does not handle yet; a value binding read by a
+  second store, and a float product bound to a
+  name (inlining it beside a `+` would contract it into an FMA the `let` rounded away); and a
+  plain float fold with no kernel over a `usize` counter (the generic vectorizer would reassociate a
+  sum that folds in source order today; argmax/argmin and the low-precision reduction kernels do
+  dispatch over a `usize` counter, behind the same run-time test as the maps). The value view and
+  the row-outer/out-of-place windows are flat
+  (one row); the batched forms keep their existing matchers. Per-site decline remarks ("this nest
+  matched GEMM but its operands are not provably disjoint") are not emitted yet: `--remarks=dispatch`
+  reports what fired, not why something did not.
 
 - **A view local read before it is assigned is undefined, and the language has no rule that says so.**
   *(Table measured 2026-08-23 on `lang/w2e-recognizer-gate`; sema still has no definite-assignment

@@ -1,0 +1,154 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: -3
+// EXPECT-OUT: -15
+// EXPECT-OUT: -45
+// EXPECT-OUT: -100
+// EXPECT-OUT: -158
+// EXPECT-OUT: -154
+// EXPECT-OUT: 0
+// EXPECT-OUT: 345
+// EXPECT-OUT: 841
+// EXPECT-OUT: 1399
+// EXPECT-OUT: 1954
+// EXPECT-OUT: 2484
+// EXPECT-OUT: 2996
+// EXPECT-OUT: 3499
+// EXPECT-OUT: -71
+// EXPECT-OUT: -102
+// EXPECT-OUT: -142
+// EXPECT-OUT: -189
+// EXPECT-OUT: -238
+// EXPECT-OUT: -273
+// EXPECT-OUT: -268
+// EXPECT-OUT: -188
+// EXPECT-OUT: 0
+// EXPECT-OUT: 311
+// EXPECT-OUT: 731
+// EXPECT-OUT: 1226
+// EXPECT-OUT: 1761
+// EXPECT-OUT: 2310
+// EXPECT-OUT: 2857
+// EXPECT-OUT: 3397
+// EXPECT-OUT: -8
+// EXPECT-OUT: -6
+// EXPECT-OUT: -4
+// EXPECT-OUT: -2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 6
+// EXPECT-OUT: 8
+// EXPECT-OUT: 10
+// EXPECT-OUT: 12
+// EXPECT-OUT: 14
+// EXPECT-OUT: 16
+// EXPECT-OUT: 18
+// EXPECT-OUT: 20
+// EXPECT-OUT: 22
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+module tests.run.spelling_value_bindings
+
+// Two respellings that must keep the 256-bit elementwise kernels AND compute exactly what the
+// loops say (P12.7, P12.10):
+//
+//   * naming the loaded value first - `let v = x[i]; o[i] = gelu(v);` - the most common respelling
+//     in real code, mandatory once the value is used twice (`v * sigmoid(v)`);
+//   * the hand-expanded tanh GELU, in the association that IS the kernel's arithmetic
+//     (`0.5*v*(1 + tanh(C0*(v + C1*(v*v*v))))`; the source contracts `v + C1*x3` to one FMA,
+//     exactly the kernel's `GELU_C1.mul_add(x3, x)`).
+//
+// Values: x[i] = 0.5*i - 4 over 16 lanes. The first block is gelu(x)*1000 truncated toward zero,
+// the second silu(x) = x/(1+e^-x) *1000 truncated, both from the exact formulas in f64 (every lane
+// sits >= 0.05 away from an integer boundary, far beyond the kernels' f32 error); the third is
+// 2*x + y = 2*(0.5*i - 4) + i = 2*i - 8, exact. The last block is one flag per lane: 1 iff the
+// dispatched results equal, BIT FOR BIT, the same formulas evaluated by a `while` loop - which no
+// recognizer sees - including `gelu(v) == the expansion`, the premise of the GELU fold. A partially
+// correct kernel or a fold that changed a rounding prints a 0 in its own lane.
+
+fn gelu_hoisted(x: [f32; 16], mut o: [f32; 16]) {
+    for i in 0..16 {
+        let v: f32 = x[i];
+        o[i] = gelu(v);
+    }
+}
+
+fn gelu_expanded(x: [f32; 16], mut o: [f32; 16]) {
+    for i in 0..16 {
+        o[i] = 0.5 * x[i] * (1.0 + tanh(0.7978845608 * (x[i] + 0.044715 * (x[i] * x[i] * x[i]))));
+    }
+}
+
+fn swish_hoisted(x: [f32; 16], mut o: [f32; 16]) {
+    for i in 0..16 {
+        let v: f32 = x[i];
+        o[i] = v * sigmoid(v);
+    }
+}
+
+fn axpy_hoisted(x: [f32; 16], y: [f32; 16], mut o: [f32; 16]) {
+    for i in 0..16 {
+        let a: f32 = x[i];
+        let b: f32 = y[i];
+        o[i] = 2.0 * a + b;
+    }
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 16] = [0.0; 16];
+    let mut y: [f32; 16] = [0.0; 16];
+    for i in 0..16 {
+        x[i] = (i as f32) * 0.5 - 4.0;
+        y[i] = i as f32;
+    }
+    let mut g1: [f32; 16] = [0.0; 16];
+    let mut g2: [f32; 16] = [0.0; 16];
+    let mut sw: [f32; 16] = [0.0; 16];
+    let mut ax: [f32; 16] = [0.0; 16];
+    gelu_hoisted(x, g1);
+    gelu_expanded(x, g2);
+    swish_hoisted(x, sw);
+    axpy_hoisted(x, y, ax);
+
+    for i in 0..16 {
+        print((g2[i] * 1000.0) as i32);
+    }
+    for i in 0..16 {
+        print((sw[i] * 1000.0) as i32);
+    }
+    for i in 0..16 {
+        print(ax[i] as i32);
+    }
+
+    let mut k: i64 = 0;
+    while k < 16 {
+        let v: f32 = x[k];
+        let gref: f32 = gelu(v);
+        let eref: f32 = 0.5 * v * (1.0 + tanh(0.7978845608 * (v + 0.044715 * (v * v * v))));
+        let sref: f32 = v * sigmoid(v);
+        let mut ok: i32 = 0;
+        if g1[k] == gref && g2[k] == eref && gref == eref && sw[k] == sref {
+            ok = 1;
+        }
+        print(ok);
+        k = k + 1;
+    }
+    return 0;
+}

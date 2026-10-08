@@ -17,6 +17,35 @@ All notable changes to Wukong are documented here. The format is loosely based o
   overlapping operands, answers a shifted elementwise overlap with the source loop's value, recycles
   operand scratch, and range-checks every extent before reserving it.
 
+### Recognizer spelling coverage and dispatch control (`gap/recognizer-coverage`)
+
+- **Spellings that compute the same thing now dispatch the same kernel:** a value bound before use
+  (`let v = x[i]; o[i] = gelu(v);`), the tanh GELU written out in the kernel's own association, the
+  row-outer column reductions (`out[j] += x[i*N+j]` after a zero / row-0 seed), out-of-place softmax
+  and log-softmax (`wukong_norm_f32(x, o, …)`), hand-tiled matmuls (`for … step T` and `while` tile
+  loops), and elementwise loops over a `usize` counter or a symbolic tensor dim (behind a run-time
+  `end >= 0` test). Fixtures `tests/run/spelling_*.wk` print every lane.
+- **Blocked GEMMs as they are really written dispatch `wukong_sgemm`:** ragged tiles clamped with
+  `min` (`for i in i0..min(i0 + T, M)`), the counted tiles of `examples/matmul.wk` (`for it in
+  0..(M + T - 1) / T { let i0 = it * T; let i1 = min(i0 + T, M); … }`), runtime and symbolic extents
+  (full tiles over a runtime `M` behind a run-time `M % T == 0` test; counted tiles behind
+  `ceil(M/T)*T >= M`), tile widths spelled as function-local `const`s, and a tiled contraction around
+  a scalar accumulator seeded from `C` — which on its own (`let mut s = c[i, j]; for k { s += a*b; }
+  c[i, j] = s;`) is now recognized as `C += A·B` (`tests/run/spelling_tiled_gemm_ragged.wk`).
+- **`min(a, b)` / `max(a, b)` builtins** for integers (compared in the result type's signedness) and
+  floats (exactly `fmin`/`fmax`); a call used to be `C0001` (`tests/run/min_max_builtin.wk`).
+- **Every range-based recognizer over a `usize` counter:** behind the run-time `end >= 0` test the
+  loop is lowered again with its end proven to fit `i64`, so argmax/argmin and the low-precision
+  reductions and maps dispatch over a `usize` parameter or a symbolic `Tensor` dim exactly as over a
+  signed counter, not only the elementwise maps (`tests/run/spelling_usize_dims.wk`).
+- **`@generic` on a `for`/`while` loop** opts that loop (and everything in it) out of kernel
+  recognition; it was legal on a `fn` item only. No recognizer replaces code containing one: a
+  window is not formed over it, an enclosing loop is not matched as a whole nest (its other inner
+  loops still dispatch), and a function holding one is not intercepted whole. On any other
+  statement it stays `E0306`.
+- **`--remarks=dispatch`** prints a `note` at every statement (or function) replaced by a recognized
+  runtime kernel, naming the kernel symbol. The MIR is unchanged by it.
+
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
 - **Gate added: every recognizer-dependent corpus program is held to its own generic lowering.**

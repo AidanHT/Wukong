@@ -1,15 +1,16 @@
 // EXPECT-CODE: E0306
 module tests.fail.generic_on_stmt
 
-// `@generic` is read from the FUNCTION item (`wukong_mir_build::lower_program` clears the recognition
-// switch per function), so an attribute on the loop itself would be a promise nothing keeps: the
-// parser accepts statement attributes and discards them, so this nest would have been recognized as a
-// `wukong_velem_f32` call while its author believed they had opted out. Placement is E0306, with the
-// fix in the help text -- move it to the `fn`.
+// `@generic` is read from a FUNCTION item (recognition off for the whole function) or from a LOOP
+// (`for`/`while`: recognition off for that loop and everything nested in it) - see
+// `wukong_mir_build`'s `dispatch.rs`. On any other statement nothing reads it, and the parser
+// accepts statement attributes and would discard it, so this `let` would have been a promise nothing
+// keeps. Placement is E0306, with the fix in the help text - put it on a loop or on the `fn`.
 fn scale(x: [f32; 4], mut out: [f32; 4]) {
     @generic
+    let k: f32 = 2.0;
     for i in 0..4 {
-        out[i] = x[i] * 2.0;
+        out[i] = x[i] * k;
     }
 }
 

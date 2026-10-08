@@ -118,6 +118,10 @@ pub struct Options {
     /// Autodiff / training options (see [`GradOptions`]). Only consulted by `--emit=grad` and
     /// `--train`; inert for every other stage.
     pub grad: GradOptions,
+    /// `--remarks=dispatch`: print a `note` at every statement (or function) the MIR builder
+    /// replaced with a recognized runtime kernel call, naming the kernel symbols. Pure observation —
+    /// the MIR, and therefore every artifact and run, is identical with it on or off.
+    pub remarks_dispatch: bool,
 }
 
 /// Options for the autodiff CLI surface: which loss function to differentiate, which of its buffer
@@ -182,6 +186,7 @@ impl Default for Options {
             error_format: ErrorFormat::Human,
             backend: BackendKind::Interp,
             grad: GradOptions::default(),
+            remarks_dispatch: false,
         }
     }
 }
@@ -372,8 +377,17 @@ pub fn compile(opts: &Options) -> i32 {
     // environment reads inside a recognizer; `lower_options_for` is where that choice lives and why
     // the requested backend is part of it.
     let lower_opts = lower_options_for(opts);
-    let (mut program, lower_diags) =
-        wukong_mir_build::lower_program_with(&module, &sema, &mut interner, lower_opts);
+    // `--remarks=dispatch` only adds `note` diagnostics; the Program is the same either way.
+    let (mut program, lower_diags) = if opts.remarks_dispatch {
+        wukong_mir_build::lower_program_reporting_dispatch(
+            &module,
+            &sema,
+            &mut interner,
+            lower_opts,
+        )
+    } else {
+        wukong_mir_build::lower_program_with(&module, &sema, &mut interner, lower_opts)
+    };
     // MIR and train_lens own everything needed downstream. Release completed frontend
     // artifacts before optimization and codegen allocate their working sets.
     drop(module);
