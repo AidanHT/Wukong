@@ -292,7 +292,7 @@ impl FnLowerer<'_> {
             Ty::Tensor { shape, .. } => {
                 let data = self.lower_expr(e);
                 let mut dims = Vec::with_capacity(shape.0.len());
-                for d in shape.0 {
+                for d in &shape.0 {
                     dims.push(self.tensor_dim_value(d)?);
                 }
                 let mut len = self.ml_i64_const(1);

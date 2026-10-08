@@ -238,7 +238,9 @@ static CATALOG: &[Explanation] = &[
          reference, tuple or struct) — on a scalar there is no storage to promise anything about. \
          Arguments: `@parallel` takes nothing or exactly `grain = G` with `1 <= G <= 2^31` (each \
          worker then claims runs of at least G iterations); an unknown key, a positional argument \
-         or an out-of-range grain is rejected instead of discarded. The parsed-but-discarded \
+         or an out-of-range grain is rejected instead of discarded. The lint-level attributes \
+         `@allow`, `@warn` and `@deny` are known too and legal anywhere; their arguments are lint \
+         names, and an unknown one is the warning `W0007`, not this error. The parsed-but-discarded \
          attributes (`@inline`, `@simd`, `@align`, `@export`) stay legal wherever they parse."
     ),
     entry!(
