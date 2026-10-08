@@ -15,6 +15,8 @@ Crate root: re-exports every `wukong_*` kernel symbol, `bf16`/`f16` conversion h
 |---|---|
 | `gemm.rs` | `wukong_sgemm*` — f32/bf16/f16 NT/TN/EPI variants, serial + `_parallel`, private GEMM pool |
 | `gemv.rs` | `wukong_sgemv*` — matrix-vector |
+| `gemv_half.rs` | `wukong_sgemv_{bf16,f16}*` — half-weight GEMV, and the small-M route of the half GEMM |
+| `quant.rs` | `wukong_quantize_{q8_0,q4_0}_f32`, `wukong_gemv_{q8_0,q4_0}_f32*` — GGML block quantization |
 | `gevm.rs` | `wukong_sgevm_f32*` — vector-matrix |
 | `i8gemm.rs` | `wukong_i8gemm_nt*` — int8 matmul + dequant |
 | `transpose.rs` | `wukong_transpose_f32*` / `u16*` |
@@ -53,6 +55,7 @@ Crate root: re-exports every `wukong_*` kernel symbol, `bf16`/`f16` conversion h
 | file | kernels |
 |---|---|
 | `attention.rs` | `wukong_attention_f32` |
+| `attention_kv.rs` | `wukong_attention_kv_f32*` (KV-cache / GQA decode attention), `wukong_kv_append_f32` |
 | `embedding.rs` | `wukong_embedding_f32*` |
 | `rope.rs` | `wukong_rope_f32*` |
 | `rope_bwd.rs` | `wukong_rope_bwd_f32*` |

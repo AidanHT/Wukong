@@ -179,7 +179,7 @@ impl FnLowerer<'_> {
     /// Trap (through the `assert` intrinsic) unless every condition holds. `false` when a user
     /// function named `assert` shadows the intrinsic — the caller then reports a codegen limit
     /// rather than calling the user's function with a check it never asked for.
-    fn emit_builtin_checks(&mut self, checks: Vec<ValueId>) -> bool {
+    pub(crate) fn emit_builtin_checks(&mut self, checks: Vec<ValueId>) -> bool {
         if checks.is_empty() {
             return true;
         }

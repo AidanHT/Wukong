@@ -318,6 +318,8 @@ fn read_file_elements(
 
 // The interpreter twins of the ML builtins' runtime entries, beside the frozen decoder above.
 mod ml_io;
+// The interpreter twins of the decode builtins' entries (KV-cache attention, half / quantized GEMV).
+mod decode;
 
 // The interpreter twins of the text runtime entries (`printf`, `sprintf`, structural `print`) and
 // of the process interface (`arg`, `env`, `read_stdin_u8`, `exit`).
@@ -5058,11 +5060,12 @@ impl<'a, 'k> Interp<'a, 'k> {
                 marshal::recycle_f32(obuf);
                 Ok(Value::Unit)
             }
-            // The text and ML builtins' runtime entries live in `text_io.rs` and `ml_io.rs`;
-            // anything neither claims is an unknown callee.
+            // The text, ML and decode builtins' runtime entries live in `text_io.rs`, `ml_io.rs`
+            // and `decode.rs`; anything none of them claims is an unknown callee.
             other => self
                 .text_intrinsic(other, args)
                 .or_else(|| self.ml_intrinsic(other, args))
+                .or_else(|| self.decode_intrinsic(other, args))
                 .unwrap_or_else(|| Err(format!("call to unknown function or intrinsic `{other}`"))),
         }
     }

@@ -483,6 +483,18 @@ another architecture or OS is not supported. A native-backend failure is a catal
   pre-norm (Llama-style) transformer block all lower with their matmuls dispatched to the GEMM kernel
   and their softmax/GELU/RMSNorm vectorized — and run bit-identically on both backends (see
   `tests/run/{ffn_block,attention,multi_head_attention,causal_attention,conv_im2col,transformer_block,rmsnorm,log_softmax}.wk`).
+- **Autoregressive decode primitives (CPU)**: `sdpa_kv` attends `sq` query rows against a KV cache of
+  `skv` rows at a position offset, with grouped-query / multi-query heads and explicit row strides
+  (`wukong_attention_kv_f32`; decoding one token at a time is bit-identical to a causal prefill), and
+  `kv_append` grows the cache. `gemv_bf16` / `gemv_f16` multiply by half-precision weights without
+  ever materializing an f32 copy; the loop nest `y[j] = Σ x[p]·(w[j*K + p] as f32)` over a bf16/f16
+  weight is recognized into them, and a recognized bf16/f16 `nn.Linear` with one to four rows now
+  takes the same streaming path (bit-identical to the old widen-then-GEMM result). `quantize_q8_0` /
+  `quantize_q4_0` pack weights into llama.cpp's `Q8_0` / `Q4_0` blocks and `gemv_q8_0` / `gemv_q4_0`
+  run the weight-only quantized GEMV (per-call `Q8_0` activation quantization, exact integer block
+  dots). Every kernel validates its shape against its operands at run time (a bad geometry traps like
+  a failed `assert`) and has a bit-exact AVX2/portable twin pair (`tests/run/decode_*.wk`). Not
+  measured yet: no throughput claim is made for any of them.
 - **SIMD auto-vectorization**: straight-line elementwise loops (incl. branchy ones via
   if-conversion) lower to 128-bit vector ops, 4×-unrolled, with a scalar remainder — automatically,
   on the native backend (only a **half-open, unit-step** range vectorizes: an inclusive `a..=b` or a
@@ -1220,8 +1232,19 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   contracted while `s = s + y*z` is, and there is no explicit `fma(a, b, c)` intrinsic yet, so a
   strict function cannot request a single-rounding multiply-add.
 
+- **Decode-builtin gaps.** Only the plain `y[j] = s` spelling of a half-weight GEMV loop is
+  recognized (a scaled store `y[j] = s * c` stays a loop), and a quantized GEMV has no loop spelling
+  at all — its per-call activation quantization is part of its definition, so call `gemv_q4_0` by
+  name; the K-quant family
+  (`Q4_K`, `Q6_K`) and a quantized KV cache are not implemented; `sdpa_kv` has no padding mask or
+  per-sequence batch dimension, takes the output's stride from the query's, and has no backward
+  kernel (autodiff refuses it). A whole greedy decode loop runs as a gated toy model
+  (`tests/run/decode_tiny_lm.wk`: bf16 projections, a growing KV cache, GQA attention, a Q8_0 LM head,
+  six tokens checked against an f64 reference); the multi-token GPT-2 example over real weights is
+  still to be written. None of the decode kernels is measured yet.
 - **ML I/O and randomness gaps.** No memory-mapped load yet (`map_<T>`: every checkpoint load copies
-  once, straight into the destination), no GGUF reader and no quantized block types; `.npy` reads
+  once, straight into the destination) and no GGUF reader (the `Q8_0` / `Q4_0` block layouts exist as
+  the decode builtins' packers and GEMVs, and a raw block blob loads with `read_u8`); `.npy` reads
   little-endian arrays only.
   A fill loop `for i { out[i] = rand_f32(seed, base + i) }` is not recognized into `rand_fill_f32`,
   and the loop vectorizer declines it (mixed 32/64-bit widths), so the scalar builtins run one

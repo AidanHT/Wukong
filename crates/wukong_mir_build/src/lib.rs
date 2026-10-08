@@ -53,6 +53,8 @@ mod ucount;
 
 // The lowering of the ML builtins `wukong_sema::ml_builtins` types (see the module docs).
 mod ml_builtins;
+// The lowering of the decode builtins (`sdpa_kv`, `kv_append`, the half / quantized GEMVs).
+mod decode_builtins;
 
 // The printing builtins, routed by the printed value's source type (see the module docs).
 mod text;
@@ -1412,6 +1414,7 @@ fn lower_program_pooled(
         rt_scratch_release: interner.intern("wukong_rt_scratch_release"),
         ml: ml_builtins::MlSyms::new(interner),
         text: text::TextSyms::new(interner),
+        decode: decode_builtins::DecodeSyms::new(interner),
         rt_read_f32: interner.intern("wukong_rt_read_f32"),
         rt_read_i32: interner.intern("wukong_rt_read_i32"),
         rt_read_i64: interner.intern("wukong_rt_read_i64"),
@@ -3844,6 +3847,8 @@ struct GemmSyms {
     ml: ml_builtins::MlSyms,
     /// The symbols `text.rs` lowers the printing builtins to (`print_bool`, …).
     text: text::TextSyms,
+    /// The runtime entries `decode_builtins.rs` lowers the decode builtins to.
+    decode: decode_builtins::DecodeSyms,
     /// The 12 raw file-I/O runtime entry points (`wukong_rt_{read,write}_{f32,i32,i64,u8,f64,i8}`)
     /// backing the `read_<T>(path, buf)` / `write_<T>(path, buf)` builtins. Each takes `(path: *const
     /// u8, data: *T, len: i64)` and returns an `i64`: the element count on success, or -1 (open/create
@@ -13823,6 +13828,17 @@ impl FnLowerer<'_> {
                     return;
                 }
             }
+            // The half-weight GEMV `y[j] = Σ_p x[p]·(w[j*K + p] as f32)` over a bf16/f16 `w` →
+            // `wukong_sgemv_{bf16,f16}` (`decode_builtins.rs`), the weight never widened to f32.
+            if let Some(nest) =
+                decode_builtins::match_half_gemv(pat, iter, body, self.sema, self.interner)
+            {
+                if self.emit_nonempty_reduction_loop(nest.k(), (label, pat, iter, body), |me| {
+                    me.emit_half_gemv(&nest, me.parallel_fn)
+                }) {
+                    return;
+                }
+            }
             // Vector·matrix `for j { let s=0; for i { s += w[i]*a[i*N+j] }; out[j] = s [* c] }` →
             // `wukong_sgevm_f32` (the `_parallel` one in a `@parallel` fn) — the KV-decode attention
             // read-out `out = scoresᵀ·V`. The j-outer source reads `a` column-strided (gcc/rustc leave it
@@ -22322,6 +22338,10 @@ impl FnLowerer<'_> {
                 }
                 // The text builtins (`printf`, `sprintf`, `eprint`, `write_stdout`, …; `text.rs`).
                 if let Some(v) = self.lower_text_builtin(name, args, e.span) {
+                    return v;
+                }
+                // The decode builtins lower in `decode_builtins.rs`.
+                if let Some(v) = self.lower_decode_builtin(name, args, e.span) {
                     return v;
                 }
                 // The `now_ns()` timing intrinsic lowers to one zero-argument `wukong_now_ns() -> i64`

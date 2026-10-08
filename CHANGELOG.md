@@ -110,6 +110,19 @@ All notable changes to Wukong are documented here. The format is loosely based o
   textual LLVM and a scalarizing `gpu-native` lowering); `Op` now has 27 variants.
 - Still scalar: reverse (`step -1`) loops, gapped interleave groups, scatters, and AVX2 `vgather`
   (not used even where available). No performance claim is made; nothing here was measured.
+### Decode builtins: KV-cache attention, half-precision and Q8_0/Q4_0 GEMV (`gap2/ml-decode-and-quant-kernels`)
+
+- **`sdpa_kv`** — attention of `sq` query rows against a KV cache of `skv` rows at a position offset,
+  with grouped-query / multi-query heads and explicit row strides (`wukong_attention_kv_f32`), and
+  **`kv_append`** to grow the cache. One-token-at-a-time decode is bit-identical to a causal prefill.
+- **`gemv_bf16` / `gemv_f16`** — GEMV over half-precision weights widened in registers; a bf16/f16
+  `nn.Linear` with one to four rows now streams its weights the same way instead of widening the
+  whole matrix to f32 first (same bits as before).
+- **`quantize_q8_0` / `quantize_q4_0`, `gemv_q8_0` / `gemv_q4_0`** — llama.cpp-compatible block
+  quantization and the weight-only quantized GEMV (per-call `Q8_0` activation quantization, exact
+  integer block dots).
+- Shapes are checked at run time against the operands (a bad geometry traps like a failed `assert`);
+  every kernel has a bit-exact AVX2/portable twin pair; none is differentiable or measured yet.
 
 ### Optimizer memory passes: SROA, path DSE, loop deletion, guarded LICM, scalar promotion (`gap/opt-memory`)
 

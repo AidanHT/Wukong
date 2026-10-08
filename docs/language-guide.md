@@ -1351,6 +1351,65 @@ builtins add the overlap branch, which the single-block autodiff tape does not t
 every lane against hand-derived values; `tests/fail/builtin_dim_uninferable.wk`,
 `sdpa_operand_extent.wk`, `sdpa_operand_type.wk`.
 
+### Decode builtins ✅
+
+The kernels an autoregressive decode step is made of — attention over a KV cache, appending to the
+cache, and matrix-vector products over half-precision or block-quantized weights — are builtins too.
+Their shapes are *values* (lengths, head counts, strides), so each call is checked at run time
+against its operands' lengths before anything is read or written: a geometry that does not fit
+traps like a failed `assert` (exit 1, `assertion failed`) on every backend
+(`tests/run/decode_shape_trap.wk`). Operand kinds are checked at compile time with the usual codes:
+a wrong arity or a turbofish is `E0503`, a wrong operand kind or element type `E0401`, and writing
+the output through a non-`mut` aggregate parameter `E0304`. A buffer is a `[]T` slice, a `[T; N]`
+array or a contiguous `Tensor[T, …]`. Each returns `()`.
+
+| builtin | operands | runtime kernel |
+|---|---|---|
+| `sdpa_kv(q, k, v, out, sq, skv, d, q_pos0, n_heads, n_kv_heads, q_stride, kv_stride, scale, causal)` | `f32` buffers; integers; a float `scale`; an integer or `bool` `causal` | `wukong_attention_kv_f32` |
+| `kv_append(cache, row, pos, stride)` | `f32` buffers; integers | `wukong_kv_append_f32` |
+| `gemv_bf16(w, x, y)`, `gemv_f16(w, x, y)` | `bf16`/`f16` weight `[N·K]`; `f32` `x[K]`, `y[N]` | `wukong_sgemv_{bf16,f16}` |
+| `quantize_q8_0(x, q, k)`, `quantize_q4_0(x, q, k)` | `f32` rows of `k` values; `u8` blocks | `wukong_quantize_{q8_0,q4_0}_f32` |
+| `gemv_q8_0(w, x, y)`, `gemv_q4_0(w, x, y)` | `u8` blocks `W[N, K]`; `f32` `x[K]`, `y[N]` | `wukong_gemv_{q8_0,q4_0}_f32` |
+
+- **`sdpa_kv`** is attention of `sq` query rows against a cache of `skv` key/value rows: head `h` of
+  query row `i` is the `d` elements at `q[i·q_stride + h·d ..]` (and is written to the same place in
+  `out`); KV head `g` of key `j` is at `k[j·kv_stride + g·d ..]` (and `v`). Query head `h` reads KV
+  head `h / (n_heads / n_kv_heads)` — grouped-query attention, with `n_kv_heads == n_heads` the
+  ordinary multi-head form and `1` multi-query — so `n_kv_heads` must divide `n_heads`, and each
+  stride must hold its row of heads. Query row `i` sits at position `q_pos0 + i`; with `causal` it
+  sees keys `j <= q_pos0 + i`. A decode step is `sq = 1, q_pos0 = skv - 1`; a chunked prefill
+  against a cache is `q_pos0 = skv - sq`. Elements of `out` between heads (a stride wider than
+  `n_heads·d`) are left untouched. The softmax runs online in 64-key blocks on the runtime's own
+  `exp`, the same blocks for every query position, so decoding a sequence one token at a time
+  produces bit-for-bit the rows a causal prefill of the whole sequence produces
+  (`tests/run/decode_kv_attention.wk`).
+- **`kv_append(cache, row, pos, stride)`** copies `row` into `cache[pos·stride ..]` (`stride` at least
+  `len(row)`); appending token `t`'s keys is `kv_append(k_cache, k_row, t, kv_stride)`.
+- **`gemv_bf16` / `gemv_f16`**: `y[j] = Σ_p x[p]·w[j·K + p]` with `N = len(y)`, `K = len(x)`, and `w`
+  holding exactly `N·K` weights (the `nn.Linear` `[out, in]` layout). The weights are widened in
+  registers, never copied to f32, and each output is computed exactly as the f32 `matmul_nt` row
+  would compute it on the widened weights (`tests/run/decode_gemv_half.wk`). The loop nest
+  `for j in 0..N { let s = 0.0; for p in 0..K { s = s + x[p] * (w[j*K + p] as f32) }; y[j] = s }`
+  over a `bf16`/`f16` weight is recognized into the same kernel (`decode_gemv_half_loop.wk`), and a
+  recognized bf16/f16 `nn.Linear` with one to four rows takes the same path.
+- **Block quantization** uses llama.cpp's `Q8_0` and `Q4_0` layouts byte for byte: a row of `K`
+  values is `ceil(K/32)` blocks of 32 (the last one zero-padded), each an `f16` scale `d` (little
+  endian) followed by 32 signed bytes (`Q8_0`, 34 bytes per block, value `d·q`, `d = max|x| / 127`)
+  or 16 bytes of nibble pairs (`Q4_0`, 18 bytes, element `j` in the low nibble of byte `j` and element
+  `j + 16` in the high one, value `d·(nibble − 8)`, `d = x_max / −8` for the element of largest
+  magnitude). `quantize_q8_0(x, q, k)` packs the rows of `x` (`len(x)` a multiple of `k`) into `q`,
+  which must hold exactly their blocks. `gemv_q8_0` / `gemv_q4_0` compute `y = W·x` the way
+  llama.cpp's `ggml_vec_dot_q4_0_q8_0` does: `x` is quantized to `Q8_0` per call (its block scales
+  kept as exact `f32`), each block's integer dot is exact, and the row accumulates
+  `(d_w·d_x)·Σ w_q·x_q` in block order (`tests/run/decode_gemv_quant.wk`). The result is therefore a
+  quantized approximation of `W·x` — the activation's rounding is part of the definition.
+- Together they make a decode loop: `tests/run/decode_tiny_lm.wk` generates six tokens greedily with
+  bf16 projections, `kv_append` into growing caches, GQA `sdpa_kv` and a `Q8_0` LM head.
+- Every result is bit-identical on the interpreter and natively, and between each kernel's AVX2 path
+  and its portable twin. Inside a `@parallel` function the multicore twins run (bit-identical).
+  An output that overlaps an input is computed from the inputs as they were before the call.
+  None of these is differentiable: autodiff refuses a loss that calls one, naming the kernel.
+
 ### Math intrinsics ✅
 
 `f32` (scalar or in a loop), using hardware operations and polynomial approximations.

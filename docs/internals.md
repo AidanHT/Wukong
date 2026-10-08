@@ -139,7 +139,12 @@ runtime value; the functions such calls reach are excluded from the alias-free f
 **Kernel builtins**: `wukong_sema::builtins` shape-checks `matmul`/`softmax`/…/`sdpa` and records each
 call's resolved dimensions (`SemaResult::builtin_calls`); `wukong_mir_build::builtins` lowers it to one
 runtime kernel behind runtime extent checks (trapping through `assert`) and an output-overlap guard
-(scratch + copy-out), independent of `@generic`/recognition.
+(scratch + copy-out), independent of `@generic`/recognition. The **decode builtins** (`sdpa_kv`,
+`kv_append`, `gemv_bf16`/`gemv_f16`, `quantize_q{8,4}_0`, `gemv_q{8,4}_0`) are typed in
+`wukong_sema::decode_builtins` and lowered in `wukong_mir_build::decode_builtins` to one checked
+runtime call each (`wukong_runtime::{attention_kv, gemv_half, quant}`): their extents are values, so
+the entry validates them against the operand lengths and returns a status the lowering asserts is
+zero; the interpreter runs the same validation and calls the same serial entry.
 
 `wukong_driver::compile` orchestrates this and honors `--emit=<stage>` to stop early. Every stage
 prints its artifact on stdout except `--emit=obj` and `--emit=exe`, which write a file (`-o <path>`).

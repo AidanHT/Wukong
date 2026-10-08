@@ -1751,6 +1751,21 @@ pub(crate) fn ml_call_gradient(name: &str) -> Option<MlCallGradient> {
     match name {
         "wukong_rand_fill_f32" => Some(MlCallGradient::Constant),
         "wukong_topk_f32" => Some(MlCallGradient::Refuse),
+        // The decode builtins write their output buffer and return only a status, so the
+        // value-returning path would skip them and drop the gradient through that buffer: refuse.
+        "wukong_attention_kv_f32"
+        | "wukong_attention_kv_f32_parallel"
+        | "wukong_kv_append_f32"
+        | "wukong_sgemv_bf16"
+        | "wukong_sgemv_bf16_parallel"
+        | "wukong_sgemv_f16"
+        | "wukong_sgemv_f16_parallel"
+        | "wukong_quantize_q8_0_f32"
+        | "wukong_quantize_q4_0_f32"
+        | "wukong_gemv_q8_0_f32"
+        | "wukong_gemv_q8_0_f32_parallel"
+        | "wukong_gemv_q4_0_f32"
+        | "wukong_gemv_q4_0_f32_parallel" => Some(MlCallGradient::Refuse),
         _ => None,
     }
 }

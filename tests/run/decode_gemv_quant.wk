@@ -1,0 +1,142 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 60
+// EXPECT-OUT: 250
+// EXPECT-OUT: 127
+// EXPECT-OUT: -953
+// EXPECT-OUT: 731
+// EXPECT-OUT: -744
+// EXPECT-OUT: -659
+// EXPECT-OUT: -574
+// EXPECT-OUT: -333
+// EXPECT-OUT: -326
+// EXPECT-OUT: -46
+// EXPECT-OUT: -78
+// EXPECT-OUT: 0
+// EXPECT-OUT: 60
+// EXPECT-OUT: 65
+// EXPECT-OUT: 112
+// EXPECT-OUT: 167
+// EXPECT-OUT: 218
+// EXPECT-OUT: 29
+// EXPECT-OUT: 65
+// EXPECT-OUT: 116
+// EXPECT-OUT: 167
+// EXPECT-OUT: 218
+// EXPECT-OUT: 29
+// EXPECT-OUT: 65
+// EXPECT-OUT: 116
+// EXPECT-OUT: 167
+// EXPECT-OUT: 218
+// EXPECT-OUT: 29
+// EXPECT-OUT: 65
+// EXPECT-OUT: 0
+// EXPECT-OUT: 60
+// EXPECT-OUT: 135
+// EXPECT-OUT: 128
+// EXPECT-OUT: 141
+// EXPECT-OUT: 129
+// EXPECT-OUT: 132
+// EXPECT-OUT: 135
+// EXPECT-OUT: 138
+// EXPECT-OUT: 141
+// EXPECT-OUT: 136
+// EXPECT-OUT: 136
+// EXPECT-OUT: 136
+// EXPECT-OUT: 136
+// EXPECT-OUT: 136
+// EXPECT-OUT: 136
+// EXPECT-OUT: 136
+// EXPECT-OUT: 136
+// EXPECT-OUT: -1071
+// EXPECT-OUT: 800
+// EXPECT-OUT: 646
+// EXPECT-OUT: 552
+// EXPECT-OUT: 398
+// EXPECT-OUT: 229
+// EXPECT-OUT: 150
+// EXPECT-OUT: -19
+// EXPECT-OUT: -68
+module tests.run.decode_gemv_quant
+
+// The GGML block-quantized weight builtins: `quantize_q8_0` / `quantize_q4_0` pack f32 rows into
+// 32-element blocks (an f16 scale, then 32 signed bytes for Q8_0 or 16 nibble-pair bytes for Q4_0),
+// and `gemv_q8_0` / `gemv_q4_0` compute y = W.x from the packed weight, quantizing x per call to
+// Q8_0 and summing exact integer block dots. N = 9 rows is one 8-row vector group plus a scalar
+// row; K = 40 is one full block plus an 8-element block padded with zeros.
+//
+// The values are chosen so that every quantization step is exact, which makes the expected output
+// the exact integer product, derived by hand from the definitions:
+//   Q8_0 weight  w[j][e] = 127 at e = 1, 33, else ((7j + 3e) mod 13) - 6: each block's largest
+//                magnitude is 127, so its scale is 127/127 = 1 (f16 bits 0x3C00, bytes 0 and 60)
+//                and each quant is the value itself (row 0 begins 0 60 250 127: -6 is byte 250);
+//   Q4_0 weight  w[j][e] = -8 at e = 1, 33, else ((7j + 3e) mod 15) - 7: the element of largest
+//                magnitude is -8, so the scale is -8 / -8 = 1 and each nibble is value + 8, element
+//                e in the low nibble of byte e and element e + 16 in the high one; a padded element
+//                is the zero nibble 8 (so the padded half of row 0's second block is byte 136);
+//   activation   x[e] = 127 at e = 0, 32, else (e mod 9) - 4: scale 1, quants equal to x.
+// Printed: the first four bytes of Q8_0 row 0, the nine Q8_0 outputs, all 36 bytes of Q4_0 row 0,
+// the nine Q4_0 outputs. Dispatch: one call each of `wukong_quantize_q8_0_f32`,
+// `wukong_gemv_q8_0_f32`, `wukong_quantize_q4_0_f32` and `wukong_gemv_q4_0_f32`.
+
+fn main() -> i32 {
+    let mut w8: [f32; 360] = [0.0; 360];
+    let mut w4: [f32; 360] = [0.0; 360];
+    let mut j: i64 = 0;
+    while j < 9 {
+        let mut e: i64 = 0;
+        while e < 40 {
+            if e == 1 || e == 33 {
+                w8[j * 40 + e] = 127.0;
+                w4[j * 40 + e] = -8.0;
+            } else {
+                w8[j * 40 + e] = (((j * 7 + e * 3) % 13) - 6) as f32;
+                w4[j * 40 + e] = (((j * 7 + e * 3) % 15) - 7) as f32;
+            }
+            e = e + 1;
+        }
+        j = j + 1;
+    }
+    let mut x: [f32; 40] = [0.0; 40];
+    let mut i: i64 = 0;
+    while i < 40 {
+        if i == 0 || i == 32 {
+            x[i] = 127.0;
+        } else {
+            x[i] = ((i % 9) - 4) as f32;
+        }
+        i = i + 1;
+    }
+
+    let mut q8: [u8; 612] = [0; 612];
+    quantize_q8_0(w8, q8, 40);
+    let mut y8: [f32; 9] = [0.0; 9];
+    gemv_q8_0(q8, x, y8);
+    let mut b: i64 = 0;
+    while b < 4 {
+        print(q8[b]);
+        b = b + 1;
+    }
+    let mut r: i64 = 0;
+    while r < 9 {
+        print(y8[r]);
+        r = r + 1;
+    }
+
+    let mut q4: [u8; 324] = [0; 324];
+    quantize_q4_0(w4, q4, 40);
+    let mut y4: [f32; 9] = [0.0; 9];
+    gemv_q4_0(q4, x, y4);
+    b = 0;
+    while b < 36 {
+        print(q4[b]);
+        b = b + 1;
+    }
+    r = 0;
+    while r < 9 {
+        print(y4[r]);
+        r = r + 1;
+    }
+    return 0;
+}

@@ -1,0 +1,101 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 6
+// EXPECT-OUT: 3
+// EXPECT-OUT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 4
+// EXPECT-OUT: 1
+module tests.run.decode_tiny_lm
+
+// A whole autoregressive decode loop over the decode builtins: a toy one-layer model generates six
+// tokens greedily from the prompt [5, 2, 7], one position at a time, each step feeding its token
+// back. Per position p: the residual h = [one-hot token (8) | one-hot position (12)]; bf16 K/V/Q
+// projections by `gemv_bf16`; `kv_append` grows the K and V caches; `sdpa_kv` attends one query
+// (two query heads over one shared KV head, causal, q_pos0 = p) against the p + 1 cached rows; a
+// Q8_0-quantized LM head (`quantize_q8_0` once, `gemv_q8_0` per step) gives the logits; a strict
+// argmax picks the next token.
+//
+// The weights encode a rule: the key is the position one-hot, the value the token one-hot, query
+// head 0 aims 200 at the position two back and head 1 three back (a zero query - head 1 at p = 2 -
+// averages every visible key), and the LM head scores token c by 2 * head0[c - 1] + head1[c - 1].
+// So token p + 1 = token p - 2, plus one (mod 8): 5 2 7 -> 6 3 0 7 4 1. The expected ids were
+// computed by an independent f64 scalar reference of this model (projections, exp-softmax
+// attention, the Q8_0 round trip of the head and of each step's activation) and agree with the
+// rule; the margin is at least 2x, far beyond any rounding. A KV row appended at the wrong
+// position, a wrong causal offset, a query/head stride slip or a broken GQA mapping changes the
+// sequence. Dispatch: three `wukong_sgemv_bf16`, two `wukong_kv_append_f32`, one each of
+// `wukong_attention_kv_f32`, `wukong_quantize_q8_0_f32` and `wukong_gemv_q8_0_f32` call sites.
+
+fn main() -> i32 {
+    // Projections [out, in] over the 20-wide residual; every weight is 0, 1 or 200 (bf16-exact).
+    let mut wk: [bf16; 240] = [0.0 as bf16; 240];
+    let mut wv: [bf16; 240] = [0.0 as bf16; 240];
+    let mut wq: [bf16; 480] = [0.0 as bf16; 480];
+    let mut i: i64 = 0;
+    while i < 12 {
+        wk[i * 20 + 8 + i] = 1.0 as bf16;
+        if i < 8 {
+            wv[i * 20 + i] = 1.0 as bf16;
+        }
+        if i + 2 < 12 {
+            wq[i * 20 + 8 + i + 2] = 200.0 as bf16;
+        }
+        if i + 3 < 12 {
+            wq[(12 + i) * 20 + 8 + i + 3] = 200.0 as bf16;
+        }
+        i = i + 1;
+    }
+    // LM head [8, 24] over [head 0 output | head 1 output]: token c reads lane c - 1 (mod 8).
+    let mut wo: [f32; 192] = [0.0; 192];
+    let mut c: i64 = 0;
+    while c < 8 {
+        let src = (c + 7) % 8;
+        wo[c * 24 + src] = 2.0;
+        wo[c * 24 + 12 + src] = 1.0;
+        c = c + 1;
+    }
+    let mut woq: [u8; 272] = [0; 272];
+    quantize_q8_0(wo, woq, 24);
+
+    let mut kc: [f32; 144] = [0.0; 144];
+    let mut vc: [f32; 144] = [0.0; 144];
+    let mut toks: [i64; 12] = [5, 2, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut h: [f32; 20] = [0.0; 20];
+    let mut krow: [f32; 12] = [0.0; 12];
+    let mut vrow: [f32; 12] = [0.0; 12];
+    let mut q: [f32; 24] = [0.0; 24];
+    let mut att: [f32; 24] = [0.0; 24];
+    let mut logits: [f32; 8] = [0.0; 8];
+    let mut p: i64 = 0;
+    while p < 8 {
+        let mut e: i64 = 0;
+        while e < 20 {
+            h[e] = 0.0;
+            e = e + 1;
+        }
+        h[toks[p]] = 1.0;
+        h[8 + p] = 1.0;
+        gemv_bf16(wk, h, krow);
+        gemv_bf16(wv, h, vrow);
+        kv_append(kc, krow, p, 12);
+        kv_append(vc, vrow, p, 12);
+        if p >= 2 {
+            gemv_bf16(wq, h, q);
+            sdpa_kv(q, kc, vc, att, 1, p + 1, 12, p, 2, 1, 24, 12, 1.0, true);
+            gemv_q8_0(woq, att, logits);
+            let mut best: i64 = 0;
+            let mut cc: i64 = 1;
+            while cc < 8 {
+                if logits[cc] > logits[best] {
+                    best = cc;
+                }
+                cc = cc + 1;
+            }
+            print(best);
+            toks[p + 1] = best;
+        }
+        p = p + 1;
+    }
+    return 0;
+}

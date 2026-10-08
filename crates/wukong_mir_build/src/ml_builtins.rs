@@ -73,9 +73,9 @@ impl MlSyms {
 
 /// A lowered buffer operand: its data pointer, its `i64` element count, and — for a tensor — the
 /// `i64` value of each dimension.
-struct MlBuf {
-    data: ValueId,
-    len: ValueId,
+pub(crate) struct MlBuf {
+    pub(crate) data: ValueId,
+    pub(crate) len: ValueId,
     dims: Option<Vec<ValueId>>,
 }
 
@@ -237,17 +237,17 @@ impl FnLowerer<'_> {
     }
 
     /// An `i64`-returning runtime call.
-    fn ml_call(&mut self, func: Symbol, args: Vec<ValueId>) -> ValueId {
+    pub(crate) fn ml_call(&mut self, func: Symbol, args: Vec<ValueId>) -> ValueId {
         self.builder.build(MirType::I64, Op::Call { func, args })
     }
 
-    fn ml_i64_const(&mut self, v: i64) -> ValueId {
+    pub(crate) fn ml_i64_const(&mut self, v: i64) -> ValueId {
         self.builder
             .build(MirType::I64, Op::ConstInt(v as i128, MirType::I64))
     }
 
     /// An integer operand widened to `i64` by its own signedness — the bits `x as u64` has.
-    fn ml_i64_arg(&mut self, e: &Expr) -> ValueId {
+    pub(crate) fn ml_i64_arg(&mut self, e: &Expr) -> ValueId {
         let from = self.expr_mir(e);
         let signed = self.signed(e);
         let v = self.lower_expr(e);
@@ -255,7 +255,7 @@ impl FnLowerer<'_> {
     }
 
     /// A float operand converted to `f32`.
-    fn ml_f32_arg(&mut self, e: &Expr) -> ValueId {
+    pub(crate) fn ml_f32_arg(&mut self, e: &Expr) -> ValueId {
         let from = self.expr_mir(e);
         let signed = self.signed(e);
         let v = self.lower_expr(e);
@@ -264,7 +264,7 @@ impl FnLowerer<'_> {
 
     /// Lower a buffer operand (a slice, an array or a contiguous tensor) to its data pointer and
     /// element count. `None` for any other type, or a tensor dimension with no value in scope.
-    fn ml_buffer(&mut self, e: &Expr) -> Option<MlBuf> {
+    pub(crate) fn ml_buffer(&mut self, e: &Expr) -> Option<MlBuf> {
         match self.expr_ty(e) {
             Ty::Slice(_) => {
                 let sbuf = self.lower_expr(e);

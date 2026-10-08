@@ -270,7 +270,14 @@ impl Sema<'_> {
     /// An integer (`float == false`) or floating-point (`float == true`) scalar operand. An
     /// unsuffixed literal adapts to the ABI width (`i64` / `f32`), exactly as it would to a
     /// parameter of that type, so `read_f32_at(p, 4096, w)` needs no suffix.
-    fn ml_scalar_arg(&mut self, name: &str, arg: &Expr, ty: &mut Ty, float: bool, what: &str) {
+    pub(crate) fn ml_scalar_arg(
+        &mut self,
+        name: &str,
+        arg: &Expr,
+        ty: &mut Ty,
+        float: bool,
+        what: &str,
+    ) {
         let target = Ty::Scalar(if float { Scalar::F32 } else { Scalar::I64 });
         if self.literal_adapts(&target, arg) {
             self.retype_adapted_literal(arg, &target);
@@ -304,7 +311,7 @@ impl Sema<'_> {
     /// A buffer operand of element type `elem` (see the module docs for the accepted forms). When
     /// the builtin writes the buffer, a non-`mut` aggregate parameter is `E0304` — the same rule as
     /// `p[i] = …`, because the write lands in the caller's storage.
-    fn ml_buffer_arg(
+    pub(crate) fn ml_buffer_arg(
         &mut self,
         name: &str,
         arg: &Expr,
