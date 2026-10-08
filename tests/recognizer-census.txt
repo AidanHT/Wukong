@@ -43,6 +43,7 @@ attention.wk: wukong_norm_f32 wukong_sgemm wukong_sgemm_nt
 avgpool.wk: wukong_avgpool2d_f32
 axpby_f16.wk: wukong_axpby_f16
 axpby_half_out.wk: wukong_axpby_bf16_out wukong_axpby_f16_out
+band_mask_and.wk:
 batched_activation.wk: wukong_vmath_f32 wukong_vmath_f32*2
 batched_affine_rmsnorm.wk: wukong_norm_affine_f32
 batched_layernorm.wk: wukong_norm_f32
@@ -63,6 +64,7 @@ canon_decline.wk:
 cast_to_bool.wk:
 casts.wk:
 causal_attention.wk: veckernel*1 wukong_sgemm wukong_sgemm_nt
+causal_mask_split.wk:
 cbrt.wk: wukong_vmath_f32 wukong_vmath_f32*2
 char_literals.wk:
 char_match.wk:
@@ -132,6 +134,7 @@ for_step.wk:
 for_step_gemm.wk: veckernel*4
 frem.wk:
 fuse_if_relu.wk: wukong_velem_f32 wukong_velem_f32*3
+fused_helper_chain.wk:
 gate.wk: wukong_vmath2_f32 wukong_vmath2_f32*2
 gate_backward.wk: wukong_vmath2_f32 wukong_vmath2_f32*2
 gcd.wk:
@@ -229,6 +232,7 @@ loop_counter_wider_bound.wk:
 loop_i64_bound.wk:
 loop_unroll.wk: wukong_rt_alloc wukong_rt_free
 lrscan.wk: veckernel*1 wukong_lrscan_f32
+match_dense_enum_switch.wk:
 match_enum_mixed_coverage.wk:
 match_exhaustive_enum.wk:
 match_expr.wk:
@@ -355,6 +359,7 @@ struct_field_kernel_base.wk: wukong_norm_affine_f32 wukong_sgemm_nt_epi
 struct_fn.wk:
 struct_nested.wk:
 struct_return.wk:
+tail_recursion.wk:
 tanhshrink.wk: wukong_vmath_f32
 tensor_1d_kernels.wk: wukong_sreduce_f32_parallel wukong_velem_f32 wukong_vmath_f32
 tensor_add.wk: veckernel*1

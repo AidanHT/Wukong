@@ -246,6 +246,16 @@ fn scalarize(f: &mut Function) -> Result<(), String> {
                 *then_args = expand(then_args);
                 *else_args = expand(else_args);
             }
+            Terminator::Switch {
+                cases,
+                default_args,
+                ..
+            } => {
+                for c in cases.iter_mut() {
+                    c.args = expand(&c.args);
+                }
+                *default_args = expand(default_args);
+            }
             Terminator::Ret(_) | Terminator::Unreachable => {}
         }
     }

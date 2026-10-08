@@ -1,0 +1,181 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -1
+// EXPECT-OUT: 21
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 4
+// EXPECT-OUT: -1
+// EXPECT-OUT: 14
+// EXPECT-OUT: -1
+// EXPECT-OUT: 24
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 7
+// EXPECT-OUT: -1
+// EXPECT-OUT: 17
+// EXPECT-OUT: -1
+// EXPECT-OUT: 27
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 10
+// EXPECT-OUT: -1
+// EXPECT-OUT: 20
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 13
+// EXPECT-OUT: -1
+// EXPECT-OUT: 23
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 6
+// EXPECT-OUT: -1
+// EXPECT-OUT: 16
+// EXPECT-OUT: -1
+// EXPECT-OUT: 26
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 9
+// EXPECT-OUT: -1
+// EXPECT-OUT: 19
+// EXPECT-OUT: -1
+// EXPECT-OUT: 29
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 12
+// EXPECT-OUT: -1
+// EXPECT-OUT: 22
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 5
+// EXPECT-OUT: -1
+// EXPECT-OUT: 15
+// EXPECT-OUT: -1
+// EXPECT-OUT: 25
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 8
+// EXPECT-OUT: -1
+// EXPECT-OUT: 18
+// EXPECT-OUT: -1
+// EXPECT-OUT: 28
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 11
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+module tests.run.band_mask_and
+
+// A band-pass mask (`lo < a[i] && a[i] < hi`) and its complement test (`a[i] < 0 || a[i] > 40`)
+// inside counted loops. Each short-circuit lowers to a merge block whose parameter the `if` then
+// tests; at -O1 and above jump threading sends the short-circuit's constant edge straight to the
+// arm it decides, and branch folding speculates the second compare into the first block, so each
+// guard is one `cond_br` on an `and`/`or` (wukong_opt::branch_fold) and the loop body is a single
+// diamond. This fixture pins every lane on both sides of both bounds at every level and backend.
+//
+// Expected values by hand: a[i] = (37 i mod 64) - 16, a permutation of [-16, 47] (37 is odd).
+//   band[i]    = a[i] when 3 < a[i] < 30, else -1   (a = 3 at i = 23 and a = 30 at i = 22 are -1;
+//                                                    a = 4 at i = 4 and a = 29 at i = 41 pass)
+//   outside[i] = 1 when a[i] < 0 or a[i] > 40, else 2
+
+fn band(a: [i32; 64], mut out: [i32; 64], lo: i32, hi: i32) {
+    for i in 0..64 {
+        if a[i] > lo && a[i] < hi {
+            out[i] = a[i];
+        } else {
+            out[i] = 0 - 1;
+        }
+    }
+}
+
+fn outside(a: [i32; 64], mut out: [i32; 64], lo: i32, hi: i32) {
+    for i in 0..64 {
+        if a[i] < lo || a[i] > hi {
+            out[i] = 1;
+        } else {
+            out[i] = 2;
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut a: [i32; 64] = [0; 64];
+    for i in 0..64 {
+        a[i] = ((i as i32) * 37) % 64 - 16;
+    }
+    let mut b: [i32; 64] = [0; 64];
+    band(a, b, 3, 30);
+    for i in 0..64 {
+        print(b[i]);
+    }
+    let mut c: [i32; 64] = [0; 64];
+    outside(a, c, 0, 40);
+    for i in 0..64 {
+        print(c[i]);
+    }
+    return 0;
+}

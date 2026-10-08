@@ -737,6 +737,13 @@ fn retarget(t: &mut Terminator, map: impl Fn(BlockId) -> BlockId) {
             *then_blk = map(*then_blk);
             *else_blk = map(*else_blk);
         }
+        // Switches only form after every loop pass (`switch_form`), but the retarget is total.
+        Terminator::Switch { cases, default, .. } => {
+            for c in cases.iter_mut() {
+                c.target = map(c.target);
+            }
+            *default = map(*default);
+        }
         Terminator::Ret(_) | Terminator::Unreachable => {}
     }
 }

@@ -214,6 +214,23 @@ impl Builder {
         });
     }
 
+    /// End the current block in a [`Terminator::Switch`]. Case values must already be canonical
+    /// for the scrutinee's type ([`crate::switch_case_value`]); the verifier checks it.
+    pub fn switch(
+        &mut self,
+        scrutinee: ValueId,
+        cases: Vec<crate::SwitchCase>,
+        default: BlockId,
+        default_args: Vec<ValueId>,
+    ) {
+        self.set_term(Terminator::Switch {
+            scrutinee,
+            cases,
+            default,
+            default_args,
+        });
+    }
+
     /// Freeze the builder into a [`Function`]. `params` is taken from the entry block's parameter
     /// list, so a function built here always satisfies the verifier's `entry.params == f.params`
     /// rule — a hand-assembled `Function` must maintain that itself.

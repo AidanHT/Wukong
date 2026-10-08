@@ -3179,6 +3179,12 @@ impl<'a> FnEmit<'a> {
                 self.emit_edge(else_blk.0, else_args)?;
                 self.emit(&format!("bra BB{};", else_blk.0));
             }
+            // Formed by `wukong_opt`'s late switch formation; no PTX lowering yet.
+            Terminator::Switch { .. } => {
+                return Err(format!(
+                    "{UNSUPPORTED} multi-way `switch` terminator not lowered to PTX"
+                ))
+            }
             Terminator::Unreachable => self.emit("trap;"),
         }
         Ok(())

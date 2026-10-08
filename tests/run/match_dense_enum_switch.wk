@@ -1,0 +1,49 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 55
+// EXPECT-OUT: 18
+// EXPECT-OUT: 2
+// EXPECT-OUT: 6
+// EXPECT-OUT: 23
+// EXPECT-OUT: 4
+// EXPECT-OUT: 28
+// EXPECT-OUT: 30
+module tests.run.match_dense_enum_switch
+
+// An exhaustive value `match` over a dense six-variant enum, dispatched at run time: the scrutinee is
+// read from an array inside a loop, so nothing folds. `match` lowers to one `cmp.eq` test per arm,
+// chained through the else edges, ending in the `unreachable` fall-through. At -O2 the six tests
+// become a single six-case `switch` terminator whose default is that trap (wukong_opt::switch_form),
+// which the native backend lowers through cranelift_frontend::Switch (a jump table here, the
+// discriminants being dense). `wukong_opt`'s `dense_enum_match_forms_one_switch` asserts the switch
+// forms; this fixture pins that every variant still selects its own arm at every level and on both
+// backends.
+//
+// Expected values by hand, a = 3i + 5 and b = 11 - i:
+//   i=0 Mul  5 * 11 = 55     i=1 Add  8 + 10 = 18     i=2 Xor 11 ^ 9 = 2     i=3 Sub 14 - 8 = 6
+//   i=4 Or  17 | 7  = 23     i=5 And 20 & 6  = 4      i=6 Add 23 + 5 = 28    i=7 Xor 26 ^ 4 = 30
+
+enum Alu { Add, Sub, Mul, And, Or, Xor }
+
+fn apply(op: Alu, a: i32, b: i32) -> i32 {
+    return match op {
+        Alu::Add => a + b,
+        Alu::Sub => a - b,
+        Alu::Mul => a * b,
+        Alu::And => a & b,
+        Alu::Or => a | b,
+        Alu::Xor => a ^ b,
+    };
+}
+
+fn main() -> i32 {
+    let ops: [Alu; 8] = [Alu::Mul, Alu::Add, Alu::Xor, Alu::Sub, Alu::Or, Alu::And, Alu::Add, Alu::Xor];
+    let mut i: i64 = 0;
+    while i < 8 {
+        let a: i32 = (i as i32) * 3 + 5;
+        let b: i32 = 11 - (i as i32);
+        print(apply(ops[i], a, b));
+        i = i + 1;
+    }
+    return 0;
+}

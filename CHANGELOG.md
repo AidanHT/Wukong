@@ -108,6 +108,53 @@ All notable changes to Wukong are documented here. The format is loosely based o
   slice, tensor, vector or function-valued condition is now `E0401` rather than a verifier ICE.
   `tests/run/pointer_null_condition.wk`, `tests/fail/condition_aggregate.wk`.
 
+### CFG and loop transforms (`gap2/cfg-and-loop-transforms`)
+
+- **MIR `switch` terminator, formed from compare chains at `-O2`.** `Terminator::Switch` is a
+  multi-way branch on an `i8`..`i64` scrutinee with canonical (sign-extended), pairwise-distinct
+  case values, checked by the verifier and executed by the interpreter, Cranelift
+  (`cranelift_frontend::Switch`: jump table, bit tests or search tree) and the textual LLVM emitter;
+  `gpu-native` declines it. `wukong_opt::switch_form` turns a chain of four or more `cmp.eq`/`cmp.ne`
+  tests of one scrutinee into one `switch` once, after every loop transform, and `simplify-cfg`
+  folds a constant or degenerate `switch`. An `unreachable` fall-through is kept as the default:
+  sema's exhaustiveness check is lenient, so that block can be reached, and the interpreter stops
+  there (`tests/run/match_dense_enum_switch.wk`).
+- **Jump threading and branch folding in `simplify-cfg` (`-O1`+).** An edge that passes an `i1`
+  constant into an empty block branching on that parameter is retargeted to the successor the
+  constant decides (never past a loop header, never when the parameter is read elsewhere), and a
+  branch whose only-predecessor successor re-tests to one of its destinations becomes one branch on
+  `and`/`or` (`not` where needed), speculating at most four pure, non-trapping, non-memory
+  instructions. `a && b` / `a || b` guards are now one `cond_br`, so a loop guarded by one is a
+  single diamond the vectorizer can flatten (`wukong_opt::branch_fold`,
+  `tests/run/band_mask_and.wk`). Loads and divisions are never speculated.
+- **Tail-recursion elimination (`-O1`+).** A self-call whose result the block returns (directly or
+  through an empty return block) becomes a branch back to a loop header that carries the
+  parameters; `ret op(f(..), x)` with an integer `add`/`mul`/`and`/`or`/`xor` is rewritten with an
+  accumulator (exact: these are associative and commutative in wrapping arithmetic; float
+  operations are never reassociated). Functions with a remaining frame slot are left alone. At
+  `-O2` the inliner rewrites fully tail-recursive functions first, so they are no longer recursive
+  and become inlinable (`wukong_opt::tre`). A tail-recursive function that recursed past the
+  interpreter's call-depth limit at `-O0` now runs as a loop at `-O1`+.
+- **Loop unswitching and induction-variable range splitting (`-O2`, after LICM, before the
+  vectorizer).** A counted unit-step loop whose body branches on `iv <, <=, >, >= inv` (matching
+  the exit test's signedness) runs as two back-to-back loops split at the clamped first iteration
+  where the guard changes (`max(start, min(inv, end))`, or `inv < end ? max(start, inv + 1) : end`
+  so `inv + 1` never wraps), each with the guard decided; a branch on a loop-invariant `i1` is
+  decided once in the preheader between the loop and a copy. Both copies visit iterations in the
+  original order, so results are bit-identical; the causal mask `if j > i { .. }` becomes a loop
+  that never stores and one that always does. Innermost loops only, no calls or frame slots, at
+  most 128 instructions per loop and 4096 per function (`wukong_opt::unswitch`,
+  `tests/run/causal_mask_split.wk`). The bench's `compile-work` attribution replica mirrors the new
+  pipeline stages.
+- **MIR loop fusion (`-O2`, after loop canonicalization).** Two adjacent innermost two-block counted
+  loops with the same start, end, predicate and induction type merge into one when the second
+  reads nothing the first defines, the second's preheader is pure and reached only from the first,
+  and every cross-loop pair of accesses with a write is either the identical affine index on one
+  object (nonzero constant stride) or proved disjoint by the alias analysis. A widenable loop is
+  never fused with one the vectorizer would refuse, and widenable loops fuse only at one access
+  width. This is what fuses a helper-call chain after inlining, which the AST-level fusion in
+  `mir_build` cannot see (`wukong_opt::fuse`, `tests/run/fused_helper_chain.wk`).
+
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
 - **Gate added: every recognizer-dependent corpus program is held to its own generic lowering.**

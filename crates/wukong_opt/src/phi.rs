@@ -202,6 +202,18 @@ fn live_values(f: &Function) -> FxHashSet<u32> {
                 add_edge(then_blk.0, then_args, &mut incoming);
                 add_edge(else_blk.0, else_args, &mut incoming);
             }
+            Terminator::Switch {
+                scrutinee,
+                cases,
+                default,
+                default_args,
+            } => {
+                mark(*scrutinee, &mut live, &mut work);
+                for c in cases {
+                    add_edge(c.target.0, &c.args, &mut incoming);
+                }
+                add_edge(default.0, default_args, &mut incoming);
+            }
             Terminator::Ret(None) | Terminator::Unreachable => {}
         }
     }
@@ -216,10 +228,12 @@ fn live_values(f: &Function) -> FxHashSet<u32> {
     live
 }
 
-/// The argument(s) at position `k` on every edge from `term` to `target`, then-arm before else-arm.
-/// At most two exist, so they are returned inline rather than in a `Vec`.
-fn edge_args_to(term: &Terminator, target: u32, k: usize) -> impl Iterator<Item = ValueId> {
+/// The argument(s) at position `k` on every edge from `term` to `target`, then-arm before else-arm,
+/// or a `switch`'s cases in order before its default. A two-way terminator has at most two, so
+/// those are returned inline rather than in a `Vec`; a `switch`'s cases are borrowed in place.
+fn edge_args_to(term: &Terminator, target: u32, k: usize) -> impl Iterator<Item = ValueId> + '_ {
     let mut out = [None, None];
+    let mut cases: &[wukong_mir::SwitchCase] = &[];
     match term {
         Terminator::Br { target: t, args } if t.0 == target => {
             out[0] = args.get(k).copied();
@@ -238,9 +252,24 @@ fn edge_args_to(term: &Terminator, target: u32, k: usize) -> impl Iterator<Item 
                 out[1] = else_args.get(k).copied();
             }
         }
+        Terminator::Switch {
+            cases: arms,
+            default,
+            default_args,
+            ..
+        } => {
+            cases = arms.as_slice();
+            if default.0 == target {
+                out[1] = default_args.get(k).copied();
+            }
+        }
         _ => {}
     }
-    out.into_iter().flatten()
+    cases
+        .iter()
+        .filter(move |c| c.target.0 == target)
+        .filter_map(move |c| c.args.get(k).copied())
+        .chain(out.into_iter().flatten())
 }
 
 /// Replace every use of `from` with `to` across the function.
@@ -276,6 +305,21 @@ fn remove_param(f: &mut Function, blk: u32, k: usize) {
                 }
                 if else_blk.0 == blk && k < else_args.len() {
                     else_args.remove(k);
+                }
+            }
+            Terminator::Switch {
+                cases,
+                default,
+                default_args,
+                ..
+            } => {
+                for c in cases.iter_mut() {
+                    if c.target.0 == blk && k < c.args.len() {
+                        c.args.remove(k);
+                    }
+                }
+                if default.0 == blk && k < default_args.len() {
+                    default_args.remove(k);
                 }
             }
             _ => {}

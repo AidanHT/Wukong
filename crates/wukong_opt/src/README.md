@@ -17,13 +17,20 @@
 | `loop_canon.rs` | `LoopCanon` — canonical loop shape (preheader, latch, exit polarity) |
 | `loop_delete.rs` | `LoopDelete` — remove a provably finite loop with no observable effect |
 | `licm.rs` | `Licm` — hoist loop-invariant non-trapping ops into an existing preheader; loads by dereferenceability, header position, or guaranteed execution under a first-iteration guard |
+| `bce.rs` | `Bce` — slice bounds-check elimination: versions an innermost counted loop on a preheader guard so a check-free copy runs when every check is proved |
 | `promote.rs` | `Promote` — keep a loop-invariant location the loop reads and writes in a register (preheader load, exit stores) |
 | `vectorize.rs` | `Vectorize` — 128-bit SIMD widening with scalar epilogue; constant `i16`/`i32` left shifts use wrapping multiply |
 | `inline.rs` | `inline_program` — bottom-up call-graph SCC inlining with per-site growth budgets |
-| `unroll.rs` | `unroll_program` — partial loop unrolling at `-O2`+ |
+| `unroll.rs` | `unroll_program` — complete (small known trip count) or partial loop unrolling at `-O2`+ |
 | `alias.rs` | `AliasInfo`, `Prov` — provenance for load/store disambiguation, plus the `@noalias` parameter facts (`promised_storage`, `is_invariant_slice_header`, `promised_disjoint_bases`) |
+| `effects.rs` | `CallEffects`, `CallGraph` — interprocedural call-effect summaries (side-effect free, reads memory, always returns, speculatable) built callees-first for `cse`/`dce`/`licm` |
 | `loop_info.rs` | Natural-loop analysis (induction vars, trip counts, dependences) |
 | `fxhash.rs` | `FxHashMap`/`FxHashSet` — crate-internal fixed-seed hasher |
+| `branch_fold.rs` | jump threading of constant edge arguments and folding a branch into a predecessor with the same destination (`and`/`or`), both run inside `SimplifyCfg` |
+| `tre.rs` | `Tre` — tail-recursion elimination (plain and integer-accumulator), plus `pre_inline` so a fully tail-recursive function becomes inlinable |
+| `fuse.rs` | `LoopFuse` — fusion of adjacent innermost counted loops over the same range, with an affine/alias legality proof |
+| `unswitch.rs` | `LoopUnswitch` — induction-variable range splitting and non-trivial unswitching of innermost loops |
+| `switch_form.rs` | `FormSwitches` / `form_switches` — late `switch` formation from equality chains; constant/degenerate switch folding |
 
 ## Cross-cutting helpers in `lib.rs`
 

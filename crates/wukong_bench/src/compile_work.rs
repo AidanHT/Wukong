@@ -190,10 +190,11 @@ impl wukong_opt::Pass for Counted {
     }
 }
 
-/// Slot layout of the attribution table: the fourteen standard `-O2` passes in pipeline order, then
+/// Slot layout of the attribution table: the seventeen standard `-O2` passes in pipeline order, then
 /// the two whole-program stages, then the cleanup pipeline's five passes (kept separate because they
-/// run under a different driver instance and belong to the unrolling stage's cost).
-const STANDARD: usize = 14;
+/// run under a different driver instance and belong to the unrolling stage's cost), then the late
+/// `switch` formation.
+const STANDARD: usize = 17;
 const SLOT_INLINE: usize = STANDARD;
 const SLOT_UNROLL: usize = STANDARD + 1;
 const SLOT_CLEANUP: usize = STANDARD + 2;
@@ -205,7 +206,8 @@ const CLEANUP_NAMES: [&str; 5] = [
     "cleanup:cse",
     "cleanup:dce",
 ];
-const SLOTS: usize = SLOT_CLEANUP + CLEANUP_NAMES.len();
+const SLOT_SWITCHES: usize = SLOT_CLEANUP + CLEANUP_NAMES.len();
+const SLOTS: usize = SLOT_SWITCHES + 1;
 
 fn counted_pass(slot: usize, p: Box<dyn wukong_opt::Pass>) -> Box<dyn wukong_opt::Pass> {
     Box::new(Counted { inner: p, slot })
@@ -221,14 +223,17 @@ fn attributed_standard() -> wukong_opt::PassManager {
     pm.add(counted_pass(3, Box::new(SimplifyCfg)));
     pm.add(counted_pass(4, Box::new(SimplifyPhis)));
     pm.add(counted_pass(5, Box::new(Dce)));
-    pm.add(counted_pass(6, Box::new(Cse)));
-    pm.add(counted_pass(7, Box::new(Dse)));
-    pm.add(counted_pass(8, Box::new(LoopCanon)));
-    pm.add(counted_pass(9, Box::new(LoopDelete)));
-    pm.add(counted_pass(10, Box::new(Licm)));
-    pm.add(counted_pass(11, Box::new(Bce)));
-    pm.add(counted_pass(12, Box::new(Promote)));
-    pm.add(counted_pass(13, Box::new(Vectorize::default())));
+    pm.add(counted_pass(6, Box::new(Tre)));
+    pm.add(counted_pass(7, Box::new(Cse)));
+    pm.add(counted_pass(8, Box::new(Dse)));
+    pm.add(counted_pass(9, Box::new(LoopCanon)));
+    pm.add(counted_pass(10, Box::new(LoopDelete)));
+    pm.add(counted_pass(11, Box::new(LoopFuse)));
+    pm.add(counted_pass(12, Box::new(Licm)));
+    pm.add(counted_pass(13, Box::new(Bce)));
+    pm.add(counted_pass(14, Box::new(LoopUnswitch)));
+    pm.add(counted_pass(15, Box::new(Promote)));
+    pm.add(counted_pass(16, Box::new(Vectorize::default())));
     pm
 }
 
@@ -246,7 +251,8 @@ fn attributed_cleanup() -> wukong_opt::PassManager {
 }
 
 /// Run the `-O2` optimizer over `p` with per-pass attribution, mirroring [`wukong_opt::optimize`]
-/// stage for stage: inline → standard fixpoint → unroll → cleanup of the changed functions.
+/// stage for stage: inline → standard fixpoint → unroll → cleanup of the changed functions →
+/// switch formation.
 ///
 /// The cleanup goes through the same public `PassManager::run_subset` that `optimize` uses, so the
 /// changed functions are cleaned in the same order with the same call-effect summaries of the rest
@@ -262,8 +268,14 @@ fn optimize_attributed(p: &mut wukong_mir::Program) -> Vec<PassWork> {
     let cleanup = attributed_cleanup();
     let (changed, unroll) = counted(|| wukong_opt::unroll_program(p));
     cleanup.run_subset(p, &changed);
+    let (_, switches) = counted(|| wukong_opt::form_switches(p));
     PASS_ACC.with(|acc| {
         let mut acc = acc.borrow_mut();
+        acc[SLOT_SWITCHES] = PassWork {
+            name: "form-switches",
+            calls: 1,
+            work: switches,
+        };
         acc[SLOT_INLINE] = PassWork {
             name: "inline",
             calls: 1,

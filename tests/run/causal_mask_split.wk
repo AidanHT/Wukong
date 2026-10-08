@@ -1,0 +1,240 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 18
+// EXPECT-OUT: -1
+// EXPECT-OUT: 20
+// EXPECT-OUT: 21
+// EXPECT-OUT: 22
+// EXPECT-OUT: 23
+// EXPECT-OUT: 24
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: -2
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: 18
+// EXPECT-OUT: 19
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: -2
+// EXPECT-OUT: 24
+// EXPECT-OUT: 100
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 105
+// EXPECT-OUT: 106
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 110
+// EXPECT-OUT: 111
+// EXPECT-OUT: 112
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 115
+// EXPECT-OUT: 116
+// EXPECT-OUT: 117
+// EXPECT-OUT: 118
+// EXPECT-OUT: 19
+// EXPECT-OUT: 120
+// EXPECT-OUT: 121
+// EXPECT-OUT: 122
+// EXPECT-OUT: 123
+// EXPECT-OUT: 124
+// EXPECT-OUT: 7
+// EXPECT-OUT: 7
+// EXPECT-OUT: 7
+// EXPECT-OUT: 7
+// EXPECT-OUT: 7
+// EXPECT-OUT: 7
+// EXPECT-OUT: 7
+// EXPECT-OUT: 7
+// EXPECT-OUT: 7
+// EXPECT-OUT: 7
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 7
+// EXPECT-OUT: 7
+// EXPECT-OUT: 7
+// EXPECT-OUT: 7
+// EXPECT-OUT: 7
+// EXPECT-OUT: 7
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 9
+// EXPECT-OUT: 12
+// EXPECT-OUT: 15
+// EXPECT-OUT: 18
+// EXPECT-OUT: 21
+// EXPECT-OUT: 0
+// EXPECT-OUT: -1
+// EXPECT-OUT: -2
+// EXPECT-OUT: -3
+// EXPECT-OUT: -4
+// EXPECT-OUT: -5
+// EXPECT-OUT: -6
+// EXPECT-OUT: -7
+module tests.run.causal_mask_split
+
+// Guards on a loop's induction variable and on a loop-invariant flag, each storing in one arm only
+// (the shape the vectorizer refuses: "the two arms do not store the same number of times"). At -O2
+// `wukong_opt::unswitch` splits each counted `j` loop at the iteration where its guard changes -- a
+// copy with the guard decided one way runs first and hands its state to the original, decided the
+// other way -- and unswitches `flag_fill` on its invariant `on`. Every lane is pinned, including
+// invariants before, inside and past the range (`from_k` with k = -3, 4, 20).
+//
+// Expected values by hand, with every buffer initialized to its own index t (t = 5i + j):
+//   causal       t when j <= i, else -1        (the strictly upper triangle masked)
+//   lower_strict t when j >= i, else -2        (the strictly lower triangle masked)
+//   diag_band    t + 100 when j <= i, else t   (read-modify-write in one arm)
+//   from_k(k)    j when j < k, else 7          (k = -3: all 7; k = 4: 0 1 2 3 then 7s; k = 20: 0..9)
+//   flag_fill    3j when on, else -j
+
+fn causal(mut s: [i32; 25]) {
+    for i in 0..5 {
+        for j in 0..5 {
+            if j > i {
+                s[i * 5 + j] = 0 - 1;
+            }
+        }
+    }
+}
+
+fn lower_strict(mut s: [i32; 25]) {
+    for i in 0..5 {
+        for j in 0..5 {
+            if j < i {
+                s[i * 5 + j] = 0 - 2;
+            }
+        }
+    }
+}
+
+fn diag_band(mut s: [i32; 25]) {
+    for i in 0..5 {
+        for j in 0..5 {
+            if j <= i {
+                s[i * 5 + j] = s[i * 5 + j] + 100;
+            }
+        }
+    }
+}
+
+fn from_k(mut s: [i32; 10], k: i32) {
+    for j in 0..10 {
+        if j >= k {
+            s[j] = 7;
+        }
+    }
+}
+
+fn flag_fill(mut s: [i32; 8], on: bool) {
+    for j in 0..8 {
+        if on {
+            s[j] = j * 3;
+        } else {
+            s[j] = 0 - j;
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut a: [i32; 25] = [0; 25];
+    let mut b: [i32; 25] = [0; 25];
+    let mut c: [i32; 25] = [0; 25];
+    for t in 0..25 {
+        a[t] = t;
+        b[t] = t;
+        c[t] = t;
+    }
+    causal(a);
+    lower_strict(b);
+    diag_band(c);
+    for t in 0..25 {
+        print(a[t]);
+    }
+    for t in 0..25 {
+        print(b[t]);
+    }
+    for t in 0..25 {
+        print(c[t]);
+    }
+    let mut d: [i32; 10] = [0; 10];
+    let mut e: [i32; 10] = [0; 10];
+    let mut g: [i32; 10] = [0; 10];
+    for j in 0..10 {
+        d[j] = j;
+        e[j] = j;
+        g[j] = j;
+    }
+    from_k(d, 0 - 3);
+    from_k(e, 4);
+    from_k(g, 20);
+    for j in 0..10 {
+        print(d[j]);
+    }
+    for j in 0..10 {
+        print(e[j]);
+    }
+    for j in 0..10 {
+        print(g[j]);
+    }
+    let mut p: [i32; 8] = [0; 8];
+    let mut q: [i32; 8] = [0; 8];
+    flag_fill(p, true);
+    flag_fill(q, false);
+    for j in 0..8 {
+        print(p[j]);
+    }
+    for j in 0..8 {
+        print(q[j]);
+    }
+    return 0;
+}

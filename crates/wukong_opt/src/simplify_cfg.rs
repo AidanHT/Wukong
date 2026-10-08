@@ -1,10 +1,11 @@
 //! Control-flow-graph cleanup.
 //!
-//! Three cooperating transforms, run to a fixpoint with the rest of the pipeline:
+//! Three cooperating transforms, run to a fixpoint with the rest of the pipeline (with jump
+//! threading and branch folding from `branch_fold` run around the merge, see that module):
 //!  1. **Constant branch folding** — a `cond_br` whose condition is a known constant (after
 //!     const-folding upstream) becomes an unconditional `br` to the taken side, carrying that
 //!     side's block arguments. A `cond_br` whose two targets *and* arguments are identical also
-//!     collapses to a `br`.
+//!     collapses to a `br`, and so does a constant or degenerate `switch` (`switch_form`).
 //!  2. **Straight-line merging** — when a block ends in an unconditional `br` to a block whose
 //!     only predecessor it is, the two are fused into one. This collapses the forwarding chains
 //!     that branch folding and mem2reg leave behind and, by enlarging basic blocks, gives the
@@ -32,10 +33,16 @@ impl Pass for SimplifyCfg {
         // what lets the steady-state call, where nothing folds, merges or dies, read predecessors
         // and reachability from the cache instead of recomputing both from scratch.
         let mut changed = fold_constant_branches(f);
+        // A constant or degenerate `switch` (`switch_form`).
+        changed |= crate::switch_form::fold_switches(f);
         if changed {
             cache.invalidate(); // successor edges changed
         }
+        // Jump threading over constant edge arguments (`branch_fold`).
+        changed |= crate::branch_fold::thread_edges(f, cache);
         changed |= merge_straight_line(f, cache);
+        // One branch on `and`/`or` for a successor that re-tests to the same place (`branch_fold`).
+        changed |= crate::branch_fold::fold_branches(f, cache);
         // Pruning is a no-op when every block is reachable, and the cached reverse postorder
         // answers that without the reachability DFS `prune_unreachable` would run on every call.
         if !cache.all_reachable(f) {

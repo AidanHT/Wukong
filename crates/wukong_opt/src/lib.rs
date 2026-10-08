@@ -35,11 +35,20 @@
 //! body as soon as it is done: a callee whose calls have no side effect is then value-numbered,
 //! deleted when dead, and hoisted when invariant, like any instruction (the `effects` module).
 //!
+//! From `-O1` the fixpoint also runs **tre** ([`Tre`]): a function's tail calls to itself (and
+//! integer accumulator recursion such as `n * fact(n - 1)`) become a loop. At `-O2`, between
+//! `loop-canon` and `licm`, **fuse** ([`LoopFuse`]) merges two adjacent counted loops over the same
+//! range when no dependence crosses them; and between `bce` and `promote`, **unswitch**
+//! ([`LoopUnswitch`]) splits a counted loop at the iteration where a guard on its induction variable
+//! changes, or unswitches a branch on an invariant.
+//!
 //! At `-O2` and above, whole-program inlining ([`inline_program`]) runs once *before* the
 //! per-function pipeline, and loop unrolling ([`unroll_program`] — complete for a small known trip
 //! count, partial otherwise) runs once *after* it — a reduced pipeline is then re-run over the
 //! functions unrolling changed, so the duplicated bodies get the same simplify/cse/dce treatment as
-//! everything else. `-O3` adds nothing to any of it — see
+//! everything else. Last of all, [`FormSwitches`] turns each chain of equality tests on one
+//! scrutinee into a single `switch` terminator (once, after every loop transform — see
+//! `switch_form`). `-O3` adds nothing to any of it — see
 //! [`PassManager::standard`].
 
 pub mod alias;
@@ -68,6 +77,12 @@ mod unroll;
 mod vectorize;
 mod verify_each;
 
+mod branch_fold;
+mod fuse;
+mod switch_form;
+mod tre;
+mod unswitch;
+
 pub use verify_each::{verify_program_stage, VerificationFailure};
 
 pub use alias::{type_bytes, AliasInfo, Prov};
@@ -91,6 +106,11 @@ pub use simplify_cfg::SimplifyCfg;
 pub use sroa::Sroa;
 pub use unroll::unroll_program;
 pub use vectorize::Vectorize;
+
+pub use fuse::LoopFuse;
+pub use switch_form::{form_switches, FormSwitches};
+pub use tre::Tre;
+pub use unswitch::LoopUnswitch;
 
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -191,6 +211,8 @@ impl PassManager {
             pm.add(Box::new(SimplifyCfg));
             pm.add(Box::new(SimplifyPhis));
             pm.add(Box::new(Dce));
+            // A self-call in tail position becomes a branch back to the top (`tre`).
+            pm.add(Box::new(Tre));
         }
         if opt_level >= 2 {
             // CSE feeds Simplify/DCE more constants and dead values; the fixpoint loop reruns all.
@@ -202,14 +224,21 @@ impl PassManager {
             // A loop dse emptied still runs every trip; with a preheader now guaranteed, delete
             // whichever loops provably terminate without doing anything observable.
             pm.add(Box::new(LoopDelete));
+            // Fuse adjacent counted loops over the same range once they are canonical, before LICM
+            // fills the second loop's preheader with loads (`fuse`).
+            pm.add(Box::new(LoopFuse));
             // LICM hoists invariant work out of loops; rerunning the pipeline then cleans up and
             // can expose further invariants (e.g. across nested loops).
             pm.add(Box::new(Licm));
             // Slice bounds checks are extra loop exits, which no later loop transform accepts:
             // version each counted loop on one preheader guard so its proved checks disappear
             // (`bce.rs`). After LICM, so invariant addresses and lengths are already hoisted; before
-            // the vectorizer, so the check-free copy is what it sees.
+            // unswitching and the vectorizer, so the check-free, single-exit copy is what they see.
             pm.add(Box::new(Bce));
+            // With invariant conditions hoisted, decide a guard on the induction variable or on an
+            // invariant once, by splitting or unswitching the loop, so the vectorizer below sees
+            // branch-free bodies (`unswitch`).
+            pm.add(Box::new(LoopUnswitch));
             // With the invariant loads hoisted (and a slice loop versioned into a check-free copy
             // with a single exit), a location the loop still both reads and writes is a
             // memory-carried reduction: keep it in a register for the loop's duration.
@@ -421,6 +450,8 @@ pub fn optimize_preserving(program: &mut Program, opt_level: u8, roots: &[wukong
     if opt_level >= 2 {
         let changed = unroll_program(program);
         PassManager::unroll_cleanup().run_subset(program, &changed);
+        // Last, and outside the fixpoint: a multi-way branch must not reach the loop passes.
+        switch_form::form_switches(program);
     }
 }
 
@@ -449,6 +480,8 @@ pub fn optimize_verified_preserving(
         let changed = unroll_program(program);
         verify_program_stage(program, "unroll")?;
         PassManager::unroll_cleanup().run_subset_checked(program, &changed, true)?;
+        switch_form::form_switches(program);
+        verify_program_stage(program, "form-switches")?;
     }
     verify_program_stage(program, "optimization output")
 }
@@ -478,6 +511,8 @@ pub fn optimize_timed(program: &mut Program, opt_level: u8) -> Timings {
         let changed = unroll_program(program);
         PassManager::unroll_cleanup().run_subset(program, &changed);
         t.unroll = u0.elapsed();
+        // Counted in `total` only: one scan per function, and a cleanup only where one formed.
+        switch_form::form_switches(program);
     }
     t.total = start.elapsed();
     t
@@ -560,6 +595,20 @@ pub(crate) fn map_term_uses(t: &mut Terminator, mut f: impl FnMut(ValueId) -> Va
                 *a = f(*a);
             }
         }
+        Terminator::Switch {
+            scrutinee,
+            cases,
+            default_args,
+            ..
+        } => {
+            *scrutinee = f(*scrutinee);
+            for a in cases.iter_mut().flat_map(|c| c.args.iter_mut()) {
+                *a = f(*a);
+            }
+            for a in default_args {
+                *a = f(*a);
+            }
+        }
         Terminator::Ret(None) | Terminator::Unreachable => {}
     }
 }
@@ -628,6 +677,16 @@ pub(crate) fn each_term_use(t: &Terminator, f: &mut impl FnMut(ValueId)) {
             f(*cond);
             then_args.iter().for_each(|a| f(*a));
             else_args.iter().for_each(|a| f(*a));
+        }
+        Terminator::Switch {
+            scrutinee,
+            cases,
+            default_args,
+            ..
+        } => {
+            f(*scrutinee);
+            cases.iter().flat_map(|c| &c.args).for_each(|a| f(*a));
+            default_args.iter().for_each(|a| f(*a));
         }
         Terminator::Ret(None) | Terminator::Unreachable => {}
     }
@@ -1310,7 +1369,8 @@ mod tests {
     #[test]
     fn recursion_is_not_inlined() {
         // A recursive function is not a leaf, so it must survive -O2 with its self-call intact and
-        // still compute correctly.
+        // still compute correctly. Tail-recursion elimination turns the accumulating `fib(n-2)`
+        // into a loop iteration (`tre`), so exactly the non-tail `fib(n-1)` call remains.
         let src = "fn fib(n: i32) -> i32 { if n < 2 { return n; } return fib(n-1) + fib(n-2); } \
                    fn main() -> i32 { return fib(12); }";
         assert_eq!(run_main_opt(src, 2), 144);
@@ -1323,7 +1383,7 @@ mod tests {
             .flat_map(|b| &b.insts)
             .filter(|i| matches!(i.op, wukong_mir::Op::Call { .. }))
             .count();
-        assert!(calls >= 2, "recursive fib should keep its self-calls");
+        assert_eq!(calls, 1, "recursive fib should keep its non-tail self-call");
     }
 
     #[test]

@@ -640,22 +640,6 @@ fn align_shift(bytes: u32) -> u8 {
     shift
 }
 
-fn successors(t: &Terminator) -> [Option<u32>; 2] {
-    match t {
-        Terminator::Br { target, .. } => [Some(target.0), None],
-        Terminator::CondBr {
-            then_blk, else_blk, ..
-        } => {
-            if then_blk == else_blk {
-                [Some(then_blk.0), None]
-            } else {
-                [Some(then_blk.0), Some(else_blk.0)]
-            }
-        }
-        Terminator::Ret(_) | Terminator::Unreachable => [None, None],
-    }
-}
-
 // --- Per-function lowering ------------------------------------------------------------------
 
 /// Allocation capacity reused by serial lowering and by each parallel iterator state. All
@@ -802,8 +786,10 @@ impl<'a> FnTranslator<'a> {
         let mut stack = vec![(func.entry.0, 0usize)];
         visited[func.entry.0 as usize] = true;
         while let Some(&mut (b, ref mut i)) = stack.last_mut() {
-            let succs = successors(&func.blocks[b as usize].term);
-            if let Some(s) = succs.get(*i).copied().flatten() {
+            // Edge order (then before else, switch cases before the default); a target reached
+            // twice is skipped by `visited`, so the order matches a deduplicated successor list.
+            let succ = func.blocks[b as usize].term.edge_target(*i).map(|t| t.0);
+            if let Some(s) = succ {
                 *i += 1;
                 if !visited[s as usize] {
                     visited[s as usize] = true;
@@ -2373,6 +2359,56 @@ impl<'a> FnTranslator<'a> {
                 let tb = self.blocks[then_blk.0 as usize];
                 let eb = self.blocks[else_blk.0 as usize];
                 self.builder.ins().brif(c, tb, ta, eb, ea);
+            }
+            Terminator::Switch {
+                scrutinee,
+                cases,
+                default,
+                default_args,
+            } => {
+                // `cranelift_frontend::Switch` picks a jump table, bit tests or a search tree. It
+                // keys entries by the scrutinee's *unsigned* bit pattern, so each canonical
+                // (sign-extended) case value is masked to the type's width; distinct canonical
+                // values stay distinct. Its targets take no arguments, so an edge that passes
+                // some goes through a trampoline block that forwards them.
+                let x = self.val(*scrutinee);
+                let bits = self.dfg_ty(x).bits();
+                let mask = if bits >= 128 {
+                    u128::MAX
+                } else {
+                    (1u128 << bits) - 1
+                };
+                let mut forwards: Vec<(Block, u32, &[ValueId])> = Vec::new();
+                let mut switch = cranelift_frontend::Switch::new();
+                for c in cases {
+                    let dest = if c.args.is_empty() {
+                        self.blocks[c.target.0 as usize]
+                    } else {
+                        let tb = self.builder.create_block();
+                        forwards.push((tb, c.target.0, c.args.as_slice()));
+                        tb
+                    };
+                    switch.set_entry((c.value as u128) & mask, dest);
+                }
+                let otherwise = if default_args.is_empty() {
+                    self.blocks[default.0 as usize]
+                } else {
+                    let tb = self.builder.create_block();
+                    forwards.push((tb, default.0, default_args.as_slice()));
+                    tb
+                };
+                switch.emit(&mut self.builder, x, otherwise);
+                for (tb, target, args) in forwards {
+                    self.builder.switch_to_block(tb);
+                    self.branch_args.clear();
+                    self.branch_args.reserve(args.len());
+                    for &arg in args {
+                        let value = self.val(arg);
+                        self.branch_args.push(BlockArg::Value(value));
+                    }
+                    let cb = self.blocks[target as usize];
+                    self.builder.ins().jump(cb, &*self.branch_args);
+                }
             }
             Terminator::Unreachable => {
                 let tc = cranelift_codegen::ir::TrapCode::user(1).unwrap();

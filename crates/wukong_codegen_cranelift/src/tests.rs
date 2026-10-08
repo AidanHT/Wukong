@@ -6438,3 +6438,93 @@ fn backend_compile_ab() {
     }
     println!("(ver x = serial/verify: <1 verifier-off faster; par x = parallel/serial: <1 parallel faster)");
 }
+
+/// A `switch` whose edges pass block arguments, share targets and use negative and extreme case
+/// values on an `i8` scrutinee: the Cranelift lowering masks each canonical (sign-extended) case to
+/// the type's unsigned bit pattern and routes every argument-carrying edge through a trampoline.
+/// Expected values are read off the MIR by hand, and the interpreter (the oracle) must agree.
+#[test]
+fn switch_terminator_matches_the_oracle() {
+    use wukong_mir::{BinOp, Builder, CastKind, MirType, Op, Program, SwitchCase};
+    let mut interner = Interner::new();
+    let classify_name = interner.intern("classify");
+    let main_name = interner.intern("main");
+    let print = interner.intern("print");
+
+    // classify(x: i8) -> i64
+    //   switch x, bb4(x) [-1: bb1(10), 0: bb2, 5: bb1(50), 127: bb3, -128: bb2]
+    //   bb1(p) = p; bb2 = 200; bb3 = 300; bb4(q) = sext(q) + 1000
+    let mut b = Builder::new(classify_name, MirType::I64);
+    let x = b.add_param(MirType::I8);
+    let ten = b.build(MirType::I64, Op::ConstInt(10, MirType::I64));
+    let fifty = b.build(MirType::I64, Op::ConstInt(50, MirType::I64));
+    let bb1 = b.new_block();
+    let p = b.block_param(bb1, MirType::I64);
+    let bb2 = b.new_block();
+    let bb3 = b.new_block();
+    let bb4 = b.new_block();
+    let q = b.block_param(bb4, MirType::I8);
+    let case = |value: i128, target, args: Vec<wukong_mir::ValueId>| SwitchCase {
+        value,
+        target,
+        args,
+    };
+    b.switch(
+        x,
+        vec![
+            case(-1, bb1, vec![ten]),
+            case(0, bb2, vec![]),
+            case(5, bb1, vec![fifty]),
+            case(127, bb3, vec![]),
+            case(-128, bb2, vec![]),
+        ],
+        bb4,
+        vec![x],
+    );
+    b.switch_to(bb1);
+    b.ret(Some(p));
+    b.switch_to(bb2);
+    let r2 = b.build(MirType::I64, Op::ConstInt(200, MirType::I64));
+    b.ret(Some(r2));
+    b.switch_to(bb3);
+    let r3 = b.build(MirType::I64, Op::ConstInt(300, MirType::I64));
+    b.ret(Some(r3));
+    b.switch_to(bb4);
+    let wide = b.build(MirType::I64, Op::Cast(CastKind::SExt, q, MirType::I64));
+    let k = b.build(MirType::I64, Op::ConstInt(1000, MirType::I64));
+    let r4 = b.build(MirType::I64, Op::Bin(BinOp::Add, wide, k));
+    b.ret(Some(r4));
+    let classify = b.finish();
+
+    let inputs: [i128; 8] = [-1, 0, 5, 127, -128, 3, -2, 4];
+    let mut m = Builder::new(main_name, MirType::I32);
+    for v in inputs {
+        let arg = m.build(MirType::I8, Op::ConstInt(v, MirType::I8));
+        let r = m.build(
+            MirType::I64,
+            Op::Call {
+                func: classify_name,
+                args: vec![arg],
+            },
+        );
+        m.build_void(Op::Call {
+            func: print,
+            args: vec![r],
+        });
+    }
+    let zero = m.build(MirType::I32, Op::ConstInt(0, MirType::I32));
+    m.ret(Some(zero));
+
+    let mut program = Program::new();
+    program.funcs = vec![classify, m.finish()];
+    assert!(
+        wukong_mir::verify::verify_program(&program).is_empty(),
+        "{:?}",
+        wukong_mir::verify::verify_program(&program)
+    );
+    let expected = b"10\n200\n50\n300\n200\n1003\n998\n1004\n".to_vec();
+    let oracle = wukong_interp::run_with_output(&program, main_name, &interner).unwrap();
+    assert_eq!(oracle, (0, expected.clone()), "interpreter");
+    let native = crate::jit_run(&program, main_name, &interner).unwrap();
+    assert_eq!(native, (0, expected), "native");
+}

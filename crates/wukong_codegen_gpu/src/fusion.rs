@@ -242,6 +242,20 @@ pub fn mem_tainted(func: &Function) -> HashSet<u32> {
                     .or_default()
                     .push(else_args.clone());
             }
+            Terminator::Switch {
+                cases,
+                default,
+                default_args,
+                ..
+            } => {
+                for c in cases {
+                    incoming.entry(c.target.0).or_default().push(c.args.clone());
+                }
+                incoming
+                    .entry(default.0)
+                    .or_default()
+                    .push(default_args.clone());
+            }
             Terminator::Ret(_) | Terminator::Unreachable => {}
         }
     }
@@ -303,6 +317,7 @@ pub fn mem_tainted(func: &Function) -> HashSet<u32> {
 fn has_data_dependent_control_flow(func: &Function, tainted: &HashSet<u32>) -> bool {
     func.blocks.iter().any(|b| match &b.term {
         Terminator::CondBr { cond, .. } => tainted.contains(&cond.0),
+        Terminator::Switch { scrutinee, .. } => tainted.contains(&scrutinee.0),
         _ => false,
     })
 }

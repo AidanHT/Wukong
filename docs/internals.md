@@ -80,9 +80,10 @@ wukong_mir       MIR data, builder, pretty-printer, verifier, `VecKernel` (the 2
                   recipe). `MirLevel` lives here too but is inert — see Design bet 2.
 wukong_mir_build typed AST -> MIR (alloca-per-local lowering; SIMD loop auto-vectorization)
 wukong_opt       pass manager + analyses (cfg, dominators) + transforms (inlining, sroa,
-                  mem2reg, simplify, simplify-cfg, simplify-phis, dce, cse, dse,
-                  loop-delete, licm, bounds-check elimination, promote, loop unrolling) plus
-                  the `alias` provenance analysis every memory transform queries
+                  mem2reg, simplify, simplify-cfg, simplify-phis, dce, tre, cse, dse,
+                  loop-delete, fuse, licm, bounds-check elimination, unswitch, promote,
+                  loop unrolling, switch formation) plus the `alias` provenance analysis
+                  every memory transform queries
 wukong_autodiff  reverse-mode autodiff as a MIR->MIR transform (scalar + tensor-tape VJP
                   rules, fused AdamW; finite-difference-gated) — the training backward path (driven by --emit=grad / --train)
 wukong_backend   `Backend` trait + `Artifact`
@@ -174,7 +175,11 @@ greps for the literal substring `"code":"Ennnn"`, so key order and the absence o
 
 A `Function` owns a value arena (`ValueId -> MirType`), a list of `BasicBlock`s, and an entry block.
 Each block has typed parameters, a straight-line list of `Inst { result: Option<ValueId>, op: Op }`,
-and exactly one `Terminator` (`Ret`, `Br`, `CondBr`, `Unreachable`). `Op` has 24 variants: constants
+and exactly one `Terminator` (`Ret`, `Br`, `CondBr`, `Switch`, `Unreachable`). `Switch` is a multi-way
+branch on an `i8`..`i64` scrutinee whose case values are stored canonically (sign-extended from the
+type's width) and pairwise distinct; only `wukong_opt`'s late switch formation creates one, and the
+verifier, interpreter, Cranelift (`cranelift_frontend::Switch`), textual LLVM (`switch`) and every
+terminator visitor handle it (the `gpu-native` lowering declines it). `Op` has 24 variants: constants
 (`ConstInt`/`ConstFloat`), `Bin`/`Cmp`/`Cast`, the unary `Neg`/`Not`, `Select`, memory
 (`Alloca`/`Load`/`Store`/`Gep`), `Call`, `Barrier` (cooperative thread-block fence from
 `sync_block()`), the float/SIMD primitives
@@ -319,22 +324,26 @@ invalidated, and the call-effect table for the callees optimized so far. A cache
 
 | Pass            | Level | What it does |
 |-----------------|-------|--------------|
-| `inline_program`| -O2   | inline non-recursive callees **bottom-up over the call graph** (reverse topological order from Tarjan SCCs, so a helper chain collapses in one sweep), scored by a cost model rather than one blanket size cap, then drop callees left uncalled; runs before the function pipeline so the spliced code optimizes in context |
+| `inline_program`| -O2   | first rewrite every fully tail-recursive function into a loop (`tre::pre_inline`, on a mem2reg'd copy), then inline non-recursive callees **bottom-up over the call graph** (reverse topological order from Tarjan SCCs, so a helper chain collapses in one sweep), scored by a cost model rather than one blanket size cap, then drop callees left uncalled; runs before the function pipeline so the spliced code optimizes in context |
 | `Sroa`          | -O2   | scalar replacement of aggregates, ahead of `Mem2Reg`: split a local `Array` slot whose every access is a load/store through a constant-index `gep` chain into one scalar slot per accessed leaf. Each access carries its interpreter slot *and* native byte offset; one cell must be one byte range of one type, distinct cells disjoint, so the split preserves both memory models; a leaf whose fresh default differs from the byte it replaces needs a must-be-written proof |
 | `Mem2Reg`       | -O1   | promote scalar int/float **and pointer** `alloca` slots to block-parameter SSA via dominance-frontier phi placement and a dominator-tree rename (a pointer slot's read-before-write path gets the null `inttoptr 0` — see below) |
 | `Simplify`    | -O1   | constant folding + algebraic identities (`x+0`, `x*1`, `x*0`, `x^x`, `x&x`, `x\|x`, `x%1`) and integer self-comparison folding |
-| `SimplifyCfg` | -O1   | constant-branch folding, straight-line block merging, and unreachable-block pruning (with renumbering) |
+| `SimplifyCfg` | -O1   | constant-branch folding (including a constant or degenerate `switch`), jump threading of an `i1` constant edge argument through an empty test block (never past a loop header), straight-line block merging, folding a branch into a predecessor that reaches the same destination (one `cond_br` on `and`/`or`, speculating at most four pure non-trapping non-memory instructions — `src/branch_fold.rs`), and unreachable-block pruning (with renumbering) |
 | `SimplifyPhis`| -O1   | drop dead and trivial block parameters that mem2reg introduced |
 | `Dce`         | -O1   | remove pure instructions whose results are unused, dead allocas, and unused calls to callees summarized as side-effect free and always returning |
+| `Tre`         | -O1   | tail-recursion elimination: a self-call whose result is returned becomes a branch to a loop header carrying the parameters; integer `add`/`mul`/`and`/`or`/`xor` accumulator recursion (`n * f(n - 1)`) gets an accumulator parameter (never a float op); a function with a frame slot left is skipped (`src/tre.rs`) |
 | `Cse`         | -O2   | global value numbering: dominator-tree value numbering (a pure computation is reused by every block it dominates, via a scoped table); load forwarding keyed on `(address value, accessed type)` along single-predecessor edges and **through joins** (the intersection of the predecessors' exit states — a location every edge knows with different values becomes a lazily created block parameter); block-parameter numbering (trivial and duplicate parameters); a phi for an expression every arm of a join computed; and calls to side-effect-free callees numbered (read nothing) or forwarded like loads (read memory). `alias` decides which entries a store or opaque call invalidates. Loop headers start with an empty memory table |
 | `Dse`         | -O2   | dead-store elimination: a store overwritten at the same must-alias location (same base and constant offset, not just the same SSA value) before any read in its block, or on **every path** out of it for a stable location (a constant in-bounds offset of an entry-block slot, or of a parameter), or retired by the end of the function for a slot no callee can name; plus every store into a never-read private slot that is provably in bounds — a constant offset, or a loop induction variable over a constant range inside the slot in both memory models |
 | `LoopCanon`   | -O2   | canonicalize loop entry/latch structure before loop-invariant code motion |
 | `LoopDelete`  | -O2   | bypass a loop with a preheader, one exit edge and no side effect whose values nobody outside uses, when it provably terminates (a constant trip count whose induction variable never wraps, or a unit-step strict bound) — what removes an initialization loop `Dse` emptied |
+| `LoopFuse`    | -O2   | fuse two adjacent innermost two-block counted loops over the same range: the second's pure preheader moves ahead, its body joins the first's, and every cross-loop access pair with a write must be the identical affine index on one object or proved disjoint; never fuses a widenable loop with an unwidenable one (`src/fuse.rs`) |
 | `Licm`        | -O2   | hoist loop-invariant, side-effect-free, non-trapping ops to the loop preheader — including a **load** nothing in the body may write, when it is dereferenceable, sits in the header (which runs on every entry), or runs on every iteration of a single-exit loop, in which case it reads through `select(first_test, addr, dummy)` so a zero-trip entry reads a private dummy slot, and a call to a callee summarized as speculatable |
 | `Bce`         | -O2   | slice bounds-check elimination: version an innermost counted loop on a preheader guard (`start < end`, then per check `lo <=u hi && hi <u len` at the two ends of the index range, overflow-safe) so a check-free copy runs when every check is proved and the original, checked loop runs otherwise; a caller-owned slice header is read early only behind the guards of the checks that precede it (`bce.rs`) |
+| `LoopUnswitch`| -O2   | after LICM: split a counted unit-step loop whose body branches on `iv` against an invariant at the clamped iteration where the guard changes (two back-to-back loops, each with the guard decided), or unswitch a branch on an invariant `i1` into a preheader branch between the loop and a copy; innermost loops without calls or frame slots, size-capped (`src/unswitch.rs`) |
 | `Promote`     | -O2   | scalar promotion: a loop-invariant location the loop both reads and writes, with no other possibly aliasing access, is loaded once in the preheader, accessed through a fresh slot (which `Mem2Reg` turns into a loop-carried value next sweep) and stored back on every dedicated exit, with the same speculation rules as `Licm` and a store-safety rule (private slot, or a store that runs whenever the loop does) |
 | `Vectorize`   | -O2   | widen eligible canonical MIR loops after LICM, then feed the result through the normal fixpoint cleanup |
 | `unroll_program`| -O2 | unroll a counted two-block loop: **completely** when its exact trip count is at most 32 and the copies total at most 128 instructions; otherwise 4x (body up to 16 instructions) or 2x (up to 32), with a wrap-safe guard and a remainder that is a loop for an unknown trip count, nothing when the factor divides a known one, and straight-line copies for a known leftover; runs **after** the function pipeline, and the functions it changed get a reduced simplify + simplify-cfg + simplify-phis + cse + dce cleanup sweep |
+| `FormSwitches` | -O2 | once, after unrolling: turn a chain of four or more `cmp.eq`/`cmp.ne` tests of one integer scrutinee against constants into one `switch` terminator, hoisting the pure link compares into the head; a trapping (`unreachable`) fall-through stays the default, because sema's exhaustiveness check is lenient and that block can be reached (`src/switch_form.rs`) |
 
 `-O3` currently runs the same pass pipeline as `-O2`: there are no `-O3`-exclusive passes yet
 (`PassManager::standard` adds passes at `-O1` and `-O2` only).
