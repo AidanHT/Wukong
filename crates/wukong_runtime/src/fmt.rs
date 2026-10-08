@@ -158,8 +158,29 @@ pub fn write_stream(target: i64, bytes: &[u8]) {
     if target == TARGET_STDERR {
         let _ = std::io::stderr().lock().write_all(bytes);
     } else {
+        flush_stdout_at_exit();
         let _ = std::io::stdout().lock().write_all(bytes);
     }
+}
+
+/// Arrange for Rust's stdout to be flushed when the process exits. A linked executable's entry
+/// point is the generated object's C `main`, not Rust's, so nothing runs the standard library's
+/// exit-time flush when it returns, and Rust's stdout is line-buffered: a final `printf("done")` or
+/// `print_raw(x)` with no newline after it would be lost. The first stdout write registers a C
+/// `atexit` handler that flushes. (`wukong_rt_exit` flushes explicitly before it ends the process.)
+fn flush_stdout_at_exit() {
+    extern "C" fn flush() {
+        let _ = std::io::stdout().flush();
+    }
+    extern "C" {
+        fn atexit(callback: extern "C" fn()) -> std::ffi::c_int;
+    }
+    static REGISTER: std::sync::Once = std::sync::Once::new();
+    REGISTER.call_once(|| {
+        // SAFETY: `atexit` (C89) takes a plain function pointer with no arguments; `flush` has
+        // that ABI and cannot unwind. A failed registration only leaves the old behaviour.
+        let _ = unsafe { atexit(flush) };
+    });
 }
 
 /// Deliver formatted `bytes` to a sink — a stream of the running process, or the caller's buffer —
@@ -482,7 +503,12 @@ fn radix_style(style: u8) -> bool {
 /// width — only the low bits are read) or whose float value is `float`.
 pub fn elem_of(dt: i64, bits: i64, float: f64, style: u8) -> Elem {
     let width = match dt {
-        DT_F32 | DT_F16 | DT_BF16 => return Elem::F32(float as f32),
+        DT_F32 => return Elem::F32(float as f32),
+        // A half-precision element is read at its storage precision, as the interpreter's `Load`
+        // rounds it and a native buffer holds only the 16 rounded bits (a no-op on a value that is
+        // already rounded).
+        DT_F16 => return Elem::F32(crate::round_f16(float as f32)),
+        DT_BF16 => return Elem::F32(crate::round_bf16(float as f32)),
         DT_F64 => return Elem::F64(float),
         DT_BOOL => return Elem::Bool(bits & 0xFF != 0),
         DT_CHAR => return Elem::Char(bits & 0xFFFF_FFFF),
@@ -965,16 +991,18 @@ mod tests {
             ),
             "'x'"
         );
-        // Floats: `{:.3}`, `{:8.2}`, `{:+}`, `{:e}`, `{:?}` and the sign-aware `0` flag.
+        // Floats: `{:.3}`, `{:8.2}`, `{:+}`, `{:e}`, `{:?}` and the sign-aware `0` flag. (Not
+        // 3.14159: clippy's deny-by-default `approx_constant` rejects a truncated PI literal.) The
+        // f32 1.23456 is exactly 1.2345600128173828125, so three decimals round up to 1.235.
         assert_eq!(
             f32s(
-                3.14159,
+                1.23456,
                 Spec {
                     precision: Some(3),
                     ..d
                 }
             ),
-            "3.142"
+            "1.235"
         );
         assert_eq!(
             f64s(
