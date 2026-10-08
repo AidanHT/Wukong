@@ -194,7 +194,8 @@ fn file_reads_validate_actual_destination_and_preserve_decoding_and_clamps() {
             [I(i64::MIN.into()), I(i64::MAX.into())],
             8,
         ),
-        ("wukong_rt_read_u8", vec![0, 255], [I(0), I(255)], 1),
+        // A `u8` slot holds the byte sign-extended, the canonical integer slot value.
+        ("wukong_rt_read_u8", vec![0, 255], [I(0), I(-1)], 1),
         ("wukong_rt_read_i8", vec![128, 255], [I(-128), I(-1)], 1),
     ];
     for (name, mut bytes, expected, width) in cases {

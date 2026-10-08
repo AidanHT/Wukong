@@ -1,0 +1,11 @@
+// EXPECT-CODE: E0503
+module tests.fail.sample_categorical_arity
+
+// `sample_categorical(probs, u)` draws by inverse CDF at the uniform variate `u`; the variate is
+// what makes the draw a pure, reproducible function of its inputs, so leaving it out is an arity
+// error (E0503), not a hidden global generator.
+fn main() -> i32 {
+    let p: [f32; 3] = [0.25, 0.5, 0.25];
+    let k: i64 = sample_categorical(p);
+    return 0;
+}

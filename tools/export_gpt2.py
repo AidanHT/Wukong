@@ -15,6 +15,12 @@ Also writes the prompt token ids (int32) and the authoritative HF logits (f32), 
 `examples/gpt2_config.wk` const file (single source of truth for every offset) and
 `MANIFEST.md` alongside the blobs.
 
+The same tensors are written a second time as `gpt2_124m.safetensors` — by name ("wte", "h0.wq",
+...) and with their shapes — so a program can load one tensor with `st_read_f32(path, "h0.wq", w)`
+into a `Tensor[f32, 768, 768]` and have its shape checked at load time instead of slicing the flat
+blob at a generated offset. The self-check re-reads that file independently and compares every
+tensor against the flat blob.
+
 Output dir resolution (same order as tools/verify_gpt2.py, so the two never disagree):
 `$GPT2_DATA_DIR`, then `argv[1]`, then `<repo>/data/gpt2` — where `<repo>` is the checkout this
 script lives in. The `.wk` programs read the RELATIVE path `data/gpt2/...`, so on the default
@@ -27,8 +33,10 @@ and asserted against the HF logits (small max|Δ|, and argmax of the last positi
 " John"). Prints exactly:  EXPORTER SELF-CHECK PASS argmax=<n> maxdiff=<x>
 """
 
+import json
 import math
 import os
+import struct
 import sys
 
 import numpy as np
@@ -71,6 +79,7 @@ OUT_DIR = os.environ.get("GPT2_DATA_DIR") or (
 MANIFEST = os.path.join(OUT_DIR, "MANIFEST.md")
 
 WEIGHTS_BIN = os.path.join(OUT_DIR, "gpt2_124m_weights.bin")
+WEIGHTS_ST = os.path.join(OUT_DIR, "gpt2_124m.safetensors")
 TOKENS_BIN = os.path.join(OUT_DIR, "gpt2_tokens.bin")
 REF_LOGITS_BIN = os.path.join(OUT_DIR, "gpt2_ref_logits.bin")
 
@@ -259,6 +268,55 @@ def numpy_forward(blob, offs, ids):
 
 
 # ------------------------------------------------------------------------------------------
+# 3b. The named, shaped copy: safetensors.
+# ------------------------------------------------------------------------------------------
+def write_safetensors(path, parts):
+    """Write `parts` as a safetensors file: an 8-byte little-endian header length, a compact JSON
+    header mapping each name to {"dtype": "F32", "shape", "data_offsets"} (relative to the payload
+    start), padded with spaces to an 8-byte boundary as the reference writer pads it, then the
+    tensors back to back in `parts` order as little-endian f32. Returns the header length."""
+    header = {"__metadata__": {"format": "wukong", "source": "gpt2"}}
+    off = 0
+    for name, arr in parts:
+        n = arr.size * 4
+        header[name] = {
+            "dtype": "F32",
+            "shape": [int(d) for d in arr.shape],
+            "data_offsets": [off, off + n],
+        }
+        off += n
+    text = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    text += b" " * (-len(text) % 8)
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(text)))
+        f.write(text)
+        for _, arr in parts:
+            f.write(np.ascontiguousarray(arr, dtype="<f4").tobytes())
+    print(f"wrote {path}  ({len(parts)} named tensors, header {len(text)} bytes)", flush=True)
+    return len(text)
+
+
+def check_safetensors(path, parts, blob):
+    """Re-read the safetensors file with nothing but `json`/`struct` and require every tensor's
+    dtype, shape and bytes to equal the flat blob's at the running offset."""
+    with open(path, "rb") as f:
+        (hlen,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(hlen))
+        base = 8 + hlen
+        off = 0
+        for name, arr in parts:
+            meta = header[name]
+            assert meta["dtype"] == "F32", f"{name}: dtype {meta['dtype']}"
+            assert meta["shape"] == [int(d) for d in arr.shape], f"{name}: shape {meta['shape']}"
+            begin, end = meta["data_offsets"]
+            f.seek(base + begin)
+            got = np.frombuffer(f.read(end - begin), dtype="<f4")
+            assert np.array_equal(got, blob[off:off + arr.size]), f"{name}: payload differs"
+            off += arr.size
+    print(f"safetensors check OK ({len(parts)} tensors match the flat blob)", flush=True)
+
+
+# ------------------------------------------------------------------------------------------
 # 4. Emit gpt2_config.wk and MANIFEST.md.
 # ------------------------------------------------------------------------------------------
 def emit_config_wk(offs):
@@ -327,6 +385,8 @@ def emit_manifest(offs, parts):
     lines.append("|------|-------|-------|-------|")
     lines.append(f"| gpt2_124m_weights.bin | f32 LE | [{offs['TOTAL_WEIGHTS']}] (flat) "
                  f"| {offs['TOTAL_WEIGHTS'] * 4} |")
+    lines.append(f"| gpt2_124m.safetensors | F32 | every tensor below, by name and shape "
+                 f"| {offs['TOTAL_WEIGHTS'] * 4} + header |")
     lines.append(f"| gpt2_tokens.bin | i32 LE | [{SEQ}] | {SEQ * 4} |")
     lines.append(f"| gpt2_ref_logits.bin | f32 LE | [{SEQ}, {VOCAB}] | {SEQ * VOCAB * 4} |")
     lines.append("")
@@ -402,6 +462,7 @@ def main():
     assert blob.size == offs["TOTAL_WEIGHTS"]
     blob.astype("<f4").tofile(WEIGHTS_BIN)
     print(f"wrote {WEIGHTS_BIN}  ({blob.size} f32 = {blob.size * 4} bytes)", flush=True)
+    write_safetensors(WEIGHTS_ST, parts)
 
     # --- tokens ---
     ids = list(EXPECT_IDS)
@@ -436,6 +497,7 @@ def main():
     # Reload the blob from disk to prove the on-disk bytes are correct end-to-end.
     disk_blob = np.fromfile(WEIGHTS_BIN, dtype="<f4")
     assert disk_blob.size == offs["TOTAL_WEIGHTS"]
+    check_safetensors(WEIGHTS_ST, parts, disk_blob)
     np_logits = numpy_forward(disk_blob, offs, ids)
 
     maxdiff = float(np.max(np.abs(np_logits - hf_logits)))

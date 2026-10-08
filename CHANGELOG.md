@@ -97,6 +97,20 @@ All notable changes to Wukong are documented here. The format is loosely based o
   32-region outlining cap is gone; **`wukongc --threads=<n>`** (and `WUKONG_NUM_THREADS`) sets the
   worker count.
 
+### ML I/O and randomness
+
+- **Typed file I/O over every fixed-width dtype**: `read_<T>` / `write_<T>` / `read_<T>_at(path,
+  byte_off, buf)` for `f32 f64 f16 bf16 i8 i16 i32 i64 u8 u16 u32 u64`, `file_size(path)`, and
+  `alloc_i16/u16/u32/u64`; a buffer may be a slice, a `[T; N]` array or a contiguous `Tensor`. Native
+  reads land straight in the destination (no staging copy). Fixed: the interpreter decoded a read `u8`
+  zero-extended, so `read_u8` then `b == 200` printed 0 there and 1 natively.
+- **Checkpoint readers** `st_read_<T>` (safetensors) and `npy_read_<T>` (`.npy`) with load-time dtype,
+  rank, dims and count checks, and exact `bf16`/`f16` → `f32` widening.
+- **Counter-based RNG** `rand_u32` / `rand_f32` / `randn_f32(seed, ctr)` (Philox4x32-10, lowered to
+  integer MIR, checked against the Random123 known answers) and the `rand_fill_f32` kernel.
+- **Sampling kernels** `topk_f32`, `argsort_f32` / `argsort_desc_f32` and `sample_categorical`, each
+  defined by one total order (NaN largest, ties to the lower index).
+
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
 - **Gate added: every recognizer-dependent corpus program is held to its own generic lowering.**

@@ -239,13 +239,20 @@ fn read_file_elements(
                     let x = bytes[off] as i8;
                     Value::Int(x as i128)
                 }
-                // wukong_rt_read_u8
-                _ => Value::Int(bytes[off] as i128),
+                // wukong_rt_read_u8 — sign-extended like every integer slot: `exec` masks each
+                // integer result to its width sign-extended and a `Load` returns the slot verbatim,
+                // so the `u8` byte 0xC8 must be `Int(-56)`, exactly what a `200u8` constant or a
+                // `u8` store leaves. Zero-extended, `b == 200` and `b > 150` (unsigned) compared a
+                // different representation of the same byte: 0 here, 1 natively.
+                _ => Value::Int(bytes[off] as i8 as i128),
             };
         }
     }
     Ok(Value::Int(n as i128))
 }
+
+// The interpreter twins of the ML builtins' runtime entries, beside the frozen decoder above.
+mod ml_io;
 
 /// Pointers at or above this value encode a function index (`FUNC_TAG + idx`) rather than a memory
 /// address — how `Op::FuncAddr` is represented for `parallel_for` to call back. Real `alloca`
@@ -4603,7 +4610,11 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Ok(Value::Unit)
             }
-            other => Err(format!("call to unknown function or intrinsic `{other}`")),
+            // The ML builtins' runtime entries live in `ml_io.rs`; anything it does not claim is
+            // an unknown callee.
+            other => self
+                .ml_intrinsic(other, args)
+                .unwrap_or_else(|| Err(format!("call to unknown function or intrinsic `{other}`"))),
         }
     }
 }

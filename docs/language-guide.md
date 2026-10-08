@@ -941,7 +941,8 @@ comparison does — the recognized ReLU kernel computes exactly that.
 runtime length `n`, and `free(s)` releases it — the first runtime-sized buffers in the language
 (everything else is a fixed-size stack array). The v1 surface is the typed per-scalar family —
 `alloc_f32` / `alloc_f64` / `alloc_i32` / `alloc_i64` / `alloc_i8` / `alloc_u8` / `alloc_f16` /
-`alloc_bf16` — chosen over a generic `alloc<T>(n)` for a small, predictable surface typed in one
+`alloc_bf16` / `alloc_i16` / `alloc_u16` / `alloc_u32` / `alloc_u64` (every element type the typed file
+I/O below moves) — chosen over a generic `alloc<T>(n)` for a small, predictable surface typed in one
 place (a user-defined function of the same name shadows the builtin). The count may be any integer
 type; a **negative count yields an empty slice** (`len() == 0`). Contents are deterministically
 zero on both backends — calloc'd bytes on native, typed zero values in the interpreter — so a
@@ -999,7 +1000,8 @@ to hit a *captured fixed-size array* at an index carrying the loop variable as a
 (`hh*C + …`, or the tiled `t/C` / `t%C` pair); per-iteration scratch must be a `let` local inside the
 body. It declines — and the loop lowers serially — for a loop-carried accumulator (a write to a
 captured scalar), a non-affine or offset index, a local bound to a slice/pointer/reference (it might
-alias a capture), a call other than a pure math intrinsic (`print` would reorder output), a
+alias a capture), a call other than a pure math intrinsic or a counter-based RNG scalar (`rand_u32`,
+`rand_f32`, `randn_f32` — stateless, so chunking cannot change a lane; `print` would reorder output), a
 `match`/`loop` expression in the body, a `return`/`defer`, and a labelled or loop-level
 `break`/`continue`. There is no cap on the number of regions per program (the compiler used to keep
 every region past the 32nd serial, silently).
@@ -1015,8 +1017,8 @@ those choices is scheduling only: the output is bit-identical at every thread co
 
 ## File I/O ✅
 
-**Reading and writing typed blobs runs today** (✅): a small per-scalar family loads and stores raw
-binary buffers, so a program can pull weights or a dataset **off disk** instead of synthesizing them.
+**Reading and writing typed blobs runs today** (✅): a per-scalar family loads and stores raw binary
+buffers, so a program can pull weights or a dataset **off disk** instead of synthesizing them.
 
 ```wukong
 let mut w: []f32 = alloc_f32(768 * 768);       // zero-initialized, runtime-sized
@@ -1026,34 +1028,121 @@ if n < 0 { return 1; }                           // -1 = couldn't open, -2 = io 
 let written: i64 = write_f32("out.bin", w);      // flush w as raw little-endian f32
 ```
 
-The surface is `read_<T>(path: *u8, buf: []T) -> i64` and `write_<T>(path: *u8, buf: []T) -> i64`
-for **`T` in {`f32`, `f64`, `i32`, `i64`, `i8`, `u8`}** — the same typed, declared-in-one-place convention as the
-`alloc_<T>` family. The on-disk format is **headerless raw little-endian**: element `i` of `buf` is
-the `sizeof(T)` bytes at byte offset `i · sizeof(T)`, and nothing else — no shape, dtype tag, or
-length prefix (you carry those out of band, the way a `.bin` weight shard does).
+The surface is `read_<T>(path: *u8, buf) -> i64`, `write_<T>(path: *u8, buf) -> i64` and
+`read_<T>_at(path: *u8, byte_off, buf) -> i64` for **every fixed-width numeric `T`** — `f32`, `f64`,
+`f16`, `bf16`, `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, the same typed, declared-in-one-place
+convention as the `alloc_<T>` family — plus `file_size(path: *u8) -> i64` (the byte length, `-1` if
+the file can't be opened). The on-disk format is **headerless raw little-endian**: element `i` of
+`buf` is the `sizeof(T)` bytes at byte offset `i · sizeof(T)`, and nothing else — no shape, dtype tag,
+or length prefix (for files that carry those, see *Checkpoints* below).
+
+`buf` is a **`[]T` slice, a `[T; N]` array, or a contiguous `Tensor[T, …]`** whose every dimension is
+known at the call (a constant or a bound dimension variable; a `?` dimension is `E0401`), and its
+element type must be exactly `T` (a `[]i32` handed to `read_f32` is `E0401`, not a silent wrong
+stride). A builtin that writes `buf` through a non-`mut` slice, array or tensor **parameter** is
+`E0304`, exactly as `p[i] = …` through that parameter is.
 
 - **`read_<T>(path, buf)`** fills `buf` from the file and returns the **element count read** =
-  `min(buf.len(), file_bytes / sizeof(T))`, so a short file reads only what it has and a long one
+  `min(len(buf), file_bytes / sizeof(T))`, so a short file reads only what it has and a long one
   fills `buf` and stops. It returns **`-1`** if the file can't be opened and **`-2`** on an io
-  error; on either failure — and for the tail `buf[n..]` left over from a short read — the
-  destination slots are **untouched**, so a zero-initialized `alloc_<T>` buffer stays defined.
-  **Ordering is part of the contract**: the open is attempted *before* the count is computed, so an
-  unopenable path returns `-1` even for an empty `buf` — `read_f32("missing.bin", empty)` is `-1`, not
-  `0`. On an openable path an empty `buf` reads nothing and returns `0`. Both backends implement this
-  order.
-- **`write_<T>(path, buf)`** **creates or truncates** `path`, writes all `buf.len()` elements as
+  error. After `-1`, and for the tail `buf[n..]` left over from a short read, the destination slots
+  are **untouched**, so a zero-initialized `alloc_<T>` buffer stays defined; after a `-2` (a mid-read
+  device error) the first `n` slots are unspecified, because the native read lands straight in the
+  destination — there is no second, staging copy of the data. **Ordering is part of the contract**:
+  the open is attempted *before* the count is computed, so an unopenable path returns `-1` even for
+  an empty `buf` — `read_f32("missing.bin", empty)` is `-1`, not `0`. On an openable path an empty
+  `buf` reads nothing and returns `0`. Both backends implement this order.
+- **`read_<T>_at(path, byte_off, buf)`** is the same read starting `byte_off` bytes into the file,
+  so one tensor can be read out of a shard: `n = min(len(buf), (file_bytes - byte_off) / sizeof(T))`,
+  `0` at or past the end, **`-2`** for a negative offset. `byte_off` may be any integer type.
+- **`write_<T>(path, buf)`** **creates or truncates** `path`, writes all `len(buf)` elements as
   little-endian bytes, and returns the **count written** (**`-1`** if the file can't be created,
   **`-2`** on an io error).
 
 `path` is any NUL-terminated `*u8` — usually a string literal (the `.rodata` pointer described under
-*Literals*), but a `*u8` binding works too. Anything else is `E0401`, and a wrong arity is `E0503`;
-`buf` must be a `[]T` slice whose element type matches the name's dtype (a `[]i32` handed to `read_f32`
-is `E0401`, not a silent wrong stride). Both directions are implemented by the `wukong_runtime` layer
-on the native backend and mirrored **byte-for-byte** by the interpreter — the `-1`/`-2`/count return
-codes, the little-endian layout, and the `u8`-narrowing store are identical — so a read/write
-round-trip is **differentially
-tested to agree bit-for-bit** across the interpreter and the native Cranelift backend, exactly as the
-✅ maturity legend requires.
+*Literals*), but a `*u8` binding works too. Anything else is `E0401`, and a wrong arity is `E0503`.
+Both directions are implemented by the `wukong_runtime` layer on the native backend and mirrored by
+the interpreter on the same planning code — the return codes, the little-endian layout, the narrowing
+store, and the canonical value of every element read (a `u8`/`u16`/`u32` read from a file compares
+exactly like the same value stored by the program) — so a read/write round-trip is **differentially
+tested to agree bit-for-bit** across the interpreter and the native Cranelift backend.
+
+### Checkpoints: safetensors and `.npy` ✅
+
+`st_read_<T>(path: *u8, name: *u8, buf) -> i64` loads the tensor called `name` from a
+**safetensors** file, and `npy_read_<T>(path: *u8, buf) -> i64` the array of a NumPy **`.npy`** file
+(format versions 1–3), for the same twelve `T` and the same buffer forms. Each parses the file's
+header — a small, strict JSON or Python-literal parser in the runtime, no dependency — and checks the
+stored tensor against the destination **at load time**, the load-time half of shape safety:
+
+```wukong
+fn load_wte(path: *u8, mut wte: Tensor[f32, 50257, 768]) -> i64 {
+    return st_read_f32(path, "wte.weight", wte);   // -4 unless the file says [50257, 768]
+}
+```
+
+- the stored **dtype** must equal `T` — except that a `BF16`/`F16` (or `'<f2'`) payload **widens
+  exactly** into an `f32` destination, so an f32 program loads a half-precision checkpoint directly;
+- a shape-typed **`Tensor`** destination must match the stored **rank and every dimension**, not just
+  the element count (`[768, 50257]` is not `[50257, 768]`); an array or slice destination must hold
+  **exactly** the stored element count (a checkpoint load is an equality, not the raw reads' `min`);
+- a `fortran_order: True` `.npy` of rank ≥ 2 is refused: a row-major destination would receive its
+  transpose.
+
+The result is the element count, or a negative code: **`-1`** can't open, **`-2`** io error, **`-3`**
+dtype mismatch, **`-4`** shape or count mismatch, **`-5`** no tensor of that name (safetensors),
+**`-6`** malformed header (bad magic or JSON, a payload outside the file, a byte length that disagrees
+with dtype × shape, a duplicated name). On every negative code but `-2` the destination is untouched.
+Supported stored dtypes are `F32 F64 F16 BF16 I8 I16 I32 I64 U8 U16 U32 U64` (safetensors) and the
+little-endian `f2 f4 f8 i1 i2 i4 i8 u1 u2 u4 u8` descrs (`.npy`); `BOOL`, the fp8 formats, a
+big-endian array and a structured dtype parse and then report `-3`. A memory-mapped, zero-copy load
+(`map_<T>`) is not implemented yet: every load copies once, straight into the destination.
+
+## Random numbers and sampling ✅
+
+Wukong's random numbers are **counter-based** — Philox4x32-10, the generator of Random123, cuRAND and
+Triton's `tl.rand`: each value is a pure function of a `seed` and a `counter`, so there is no
+generator state to create, share or advance, and a stream is reproducible under any split — across
+`@parallel` chunks, across the interpreter and native code, across runs.
+
+```wukong
+for i in 0..n {
+    w[i] = randn_f32(seed, i) * 0.02;                  // element i is always the same number
+}
+let keep: bool = rand_f32(seed, step * n + i) >= p;    // a dropout mask is a counter, not a state
+```
+
+- **`rand_u32(seed, ctr) -> u32`** — word 0 of the Philox4x32-10 block with key `(seed lo, seed hi)`
+  and counter `(ctr lo, ctr hi, 0, 0)`; `rand_u32(0, 0)` is `0x6627e8d5`, Random123's published
+  known answer. `seed` and `ctr` may be any integer type (their 64 bits, as `x as u64` gives them).
+- **`rand_f32(seed, ctr) -> f32`** — the top 24 bits of that word times 2⁻²⁴: uniform on `[0, 1)`,
+  every value an exact multiple of 2⁻²⁴.
+- **`randn_f32(seed, ctr) -> f32`** — a standard normal sample by Box–Muller from words 0 and 1,
+  `sqrt(-2 ln u1) · cos(2π u2)` with `u1 ∈ (0, 1]`, computed in `f32` on the compiler's own `log` and
+  `cos`: bit-identical across backends, and close to (not bit-equal with) an `f64` reference.
+- **`rand_fill_f32(buf, seed, ctr0)`** — `buf[i] = rand_f32(seed, ctr0 + i)` for every element of a
+  `[]f32`, `[f32; N]` or contiguous `f32` tensor, as one runtime kernel.
+
+The scalar builtins lower to plain integer MIR (a 32×32→64 multiply, shifts, xors), so they need no
+runtime call and are accepted inside a `@parallel` region. To autodiff they are constants:
+`rand_fill_f32` contributes no gradient, like a constant store.
+
+**Sampling kernels** (✅), each defined by one total order so the result is unique whatever the
+algorithm or backend:
+
+- **`topk_f32(x, vals, idx) -> i64`** — the `k = min(len(x), len(vals), len(idx))` largest elements
+  of the `f32` buffer `x`, in descending order, into `vals` (values) and the `i64` buffer `idx`
+  (indices); returns `k`. **NaN ranks largest** and ties (including `-0.0` against `0.0`) go to the
+  **lower index** — `torch.topk`'s order. An output may alias `x`. It has no gradient rule yet, so
+  autodiff refuses it rather than drop the gradient.
+- **`argsort_f32(x, idx) -> i64`** / **`argsort_desc_f32(x, idx) -> i64`** — a **stable** argsort (ties
+  keep index order; NaN last ascending, first descending) of `x` into `idx`; a shorter `idx` receives
+  the prefix of the order. Returns `min(len(x), len(idx))`.
+- **`sample_categorical(probs, u) -> i64`** — one draw from the unnormalized weights `probs` by inverse
+  CDF at the float `u`: the first index whose running mass exceeds `u · total`, where only positive,
+  finite weights have mass; `u` is clamped to `[0, 1]`; `-1` when no weight has mass. With
+  `u = rand_f32(seed, step)` the draw is a pure function of `(probs, seed, step)`, so temperature,
+  top-k and top-p sampling are a few lines over these three kernels.
 
 ## Command-line interface
 
