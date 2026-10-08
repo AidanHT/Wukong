@@ -262,6 +262,12 @@ fn print_explanation(code: &str) -> Result<(), String> {
 /// Remove every `--threads=<n>` from `args` and return the last one's value: a positive decimal no
 /// larger than 4096 (the runtime's own bound on `WUKONG_NUM_THREADS`), else a usage error.
 fn take_threads(args: &mut Vec<String>) -> Result<Option<usize>, String> {
+    // Everything after `--` belongs to the program `--run` executes, verbatim: a `--threads=8`
+    // there is the program's argument, not the compiler's.
+    let program_args = match args.iter().position(|a| a == "--") {
+        Some(i) => args.split_off(i),
+        None => Vec::new(),
+    };
     let mut threads = None;
     let mut err = None;
     args.retain(|a| {
@@ -280,6 +286,7 @@ fn take_threads(args: &mut Vec<String>) -> Result<Option<usize>, String> {
         }
         false
     });
+    args.extend(program_args);
     match err {
         Some(e) => Err(e),
         None => Ok(threads),
@@ -723,6 +730,14 @@ mod tests {
         assert!(parse_args(&args).unwrap().unwrap().run);
         let mut none = ["input.wk"].map(str::to_owned).to_vec();
         assert_eq!(take_threads(&mut none), Ok(None));
+        // After `--` the argument is the program's, kept verbatim and in place.
+        let mut passed = ["--run", "--threads=2", "p.wk", "--", "--threads=8", "x"]
+            .map(str::to_owned)
+            .to_vec();
+        assert_eq!(take_threads(&mut passed), Ok(Some(2)));
+        assert_eq!(passed, ["--run", "p.wk", "--", "--threads=8", "x"]);
+        let o = parse_args(&passed).unwrap().unwrap();
+        assert_eq!(o.program_args, ["--threads=8", "x"]);
         for bad in [
             "--threads=0",
             "--threads=",
