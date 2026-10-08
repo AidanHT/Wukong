@@ -179,11 +179,12 @@ static CATALOG: &[Explanation] = &[
         "E0306",
         "unknown or misplaced attribute",
         "An `@attribute` is not one Wukong knows, or is not legal where it was written. The known \
-         set is closed: `@parallel`, `@generic`, `@tile`, `@extern`, `@inline`, `@simd`, `@align`, \
-         `@export`. Anything else — most importantly a typo of a real one, `@parellel` — used to be \
-         accepted and discarded, so the program compiled with none of the requested behavior and no \
-         diagnostic. Placement: `@generic` (opt this function out of kernel recognition) is read \
-         from the `fn` item, so it is rejected on a statement, a parameter, or a non-`fn` item \
+         set is closed: `@parallel`, `@generic`, `@tile`, `@extern`, `@strict_fp`, `@inline`, \
+         `@simd`, `@align`, `@export`. Anything else — most importantly a typo of a real one, \
+         `@parellel` — used to be accepted and discarded, so the program compiled with none of \
+         the requested behavior and no diagnostic. Placement: `@generic` (opt this function out \
+         of kernel recognition) and `@strict_fp` (source-order float evaluation) are read from \
+         the `fn` item, so each is rejected on a statement, a parameter, or a non-`fn` item \
          rather than silently promising a per-loop opt-out. Arguments: `@parallel` takes nothing \
          or exactly `grain = G` with `1 <= G <= 2^31` (each worker then claims runs of at least G \
          iterations); an unknown key, a positional argument or an out-of-range grain is rejected \
