@@ -30,6 +30,7 @@ mod attrs;
 pub use attrs::{parallel_grain, MAX_PARALLEL_GRAIN};
 mod builtins;
 mod dependency;
+mod infer;
 mod layout;
 mod methods;
 mod noalias;
@@ -413,6 +414,9 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         call_dims: HashMap::default(),
         tensor_views: Vec::new(),
         local_facts: Vec::new(),
+        infer_overrides: HashMap::default(),
+        infer_found: HashMap::default(),
+        infer_pinned: HashMap::default(),
         builtin_calls: HashMap::default(),
         methods: methods::MethodState::default(),
     };
@@ -517,6 +521,12 @@ struct Sema<'a> {
     /// [`LocalFact`]). Cleared for a name whenever it is re-bound in a scope, so a fact never outlives
     /// the binding it describes.
     local_facts: Vec<HashMap<Symbol, LocalFact>>,
+    /// Literal inference (`infer.rs`), per function, keyed by a literal-initialized `let`'s pattern
+    /// id: the type an earlier pass over the body decided for it; the types this pass decides that
+    /// change a binding's type; and the ones this pass decides at the default (pins).
+    infer_overrides: HashMap<NodeId, Ty>,
+    infer_found: HashMap<NodeId, Ty>,
+    infer_pinned: HashMap<NodeId, Ty>,
     /// The resolved named-kernel-builtin calls, published as [`SemaResult::builtin_calls`].
     builtin_calls: HashMap<NodeId, BuiltinCall>,
     /// Methods, traits and function-typed parameters (`methods.rs`).
@@ -544,6 +554,10 @@ enum LocalFact {
     /// assigned in the loop body: its value is never negative, so it converts losslessly to an
     /// unsigned type at least as wide (`i * N` with a `usize` dimension `N`; `promote.rs`).
     NonNegCounter,
+    /// A `let` with no annotation whose initializer is only unsuffixed literals (`let mut s = 0.0;`):
+    /// its type is still the literal's default, and the first use that needs another type of the
+    /// same kind fixes it (`infer.rs`). Carries the `let` pattern's id.
+    InferLit(NodeId),
 }
 
 impl<'a> Sema<'a> {
@@ -1697,7 +1711,35 @@ impl<'a> Sema<'a> {
         self.record_const(c);
     }
 
+    /// Type-check one function body, with **literal inference**: a `let` initialized only from
+    /// unsuffixed literals (`let mut s = 0.0;`) has the `{float}`/`{integer}` type its first
+    /// constraining use decides (`infer.rs`). A pass records each such binding's decision; when one
+    /// changes a binding's type, the body is checked again with every decided binding typed as
+    /// decided and the superseded pass's diagnostics are dropped, until a pass changes nothing (each
+    /// re-check fixes at least one more binding, and there are finitely many).
     fn check_fn(&mut self, f: &FnDecl, body: &Block, item_attrs: &[Attr]) {
+        let mark = self.diags.len();
+        let mut passes = 0;
+        loop {
+            self.infer_found.clear();
+            self.infer_pinned.clear();
+            self.check_fn_pass(f, body, item_attrs);
+            passes += 1;
+            if self.infer_found.is_empty() || passes == infer::MAX_PASSES {
+                break;
+            }
+            let found = std::mem::take(&mut self.infer_found);
+            let pinned = std::mem::take(&mut self.infer_pinned);
+            self.infer_overrides.extend(found);
+            self.infer_overrides.extend(pinned);
+            self.diags.truncate(mark);
+        }
+        self.infer_overrides.clear();
+        self.infer_found.clear();
+        self.infer_pinned.clear();
+    }
+
+    fn check_fn_pass(&mut self, f: &FnDecl, body: &Block, item_attrs: &[Attr]) {
         self.parallel_fn = item_attrs
             .iter()
             .any(|a| self.interner.resolve(a.name.sym) == "parallel");
@@ -1789,6 +1831,8 @@ impl<'a> Sema<'a> {
     /// tail form had no range check at all.
     fn check_return_shape(&mut self, val_ty: &Ty, val: &Expr, span: Span) {
         let ret = self.ret_ty.clone();
+        // A returned literal-initialized binding takes the declared return type (`infer.rs`).
+        self.constrain_literal_binding(val, None, &ret, false);
         // ADAPT FIRST, and adapt COMPLETELY. `literal_adapts` is asked twice further down as a
         // LENIENCY — once inline in the scalar-agreement check, once inside `aggregate_value_clash`
         // — and it is what makes `return 5` from `-> i64` and `fn g() -> [i8; 2] { return [127, 0]; }` legal
@@ -2501,6 +2545,8 @@ impl<'a> Sema<'a> {
                 let bound = match (&ann_ty, &init_ty) {
                     (Some(a), Some(i)) => {
                         let init_expr = init.as_ref().unwrap();
+                        // `let x: T = s` decides a literal-initialized `s` (`infer.rs`).
+                        self.constrain_literal_binding(init_expr, None, a, false);
                         if self.let_compatible(a, init_expr, i) {
                             // Re-stamp / range-check ONLY a genuinely adapting literal expression. An
                             // untyped literal adopts the annotation top to bottom (so `-1.5` re-stamps
@@ -2530,7 +2576,9 @@ impl<'a> Sema<'a> {
                         a.clone()
                     }
                     (Some(a), None) => a.clone(),
-                    (None, Some(i)) => i.clone(),
+                    // A literal-only initializer takes the type literal inference fixed for this
+                    // binding, if an earlier pass learned one (`infer.rs`).
+                    (None, Some(i)) => self.literal_let_type(pat, init.as_ref(), i),
                     (None, None) => Ty::Unknown,
                 };
                 let bound = self.checked_let_type(bound, s.span);
@@ -2538,6 +2586,7 @@ impl<'a> Sema<'a> {
                 // (`let a = a[0];`) still resolves its initializer to the parameter it reads.
                 self.note_tensor_view(pat, &bound, init.as_ref());
                 self.bind_pattern(pat, &bound);
+                self.note_literal_binding(pat, ty.as_ref(), init.as_ref(), &bound);
                 if let Ty::Array {
                     shared: true,
                     elem,
@@ -2583,6 +2632,13 @@ impl<'a> Sema<'a> {
             StmtKind::Assign { target, op, value } => {
                 let target_ty = self.type_expr(target);
                 let value_ty = self.type_expr(value);
+                // Either side may be a literal-initialized binding whose type this use fixes
+                // (`infer.rs`): `s = x` makes `s` an `x`, and so does `s += x` when `x` is wider.
+                let widen_only = !matches!(op, AssignOp::Assign);
+                if !self.is_literal_operand(value) {
+                    self.constrain_literal_binding(target, Some(value), &value_ty, widen_only);
+                }
+                self.constrain_literal_binding(value, Some(target), &target_ty, widen_only);
                 // A literal assigned to a place adapts to (and is range-checked against) the place's
                 // type, the same rule `let` and struct-init already apply — so `p = 9000000000` for
                 // an i32 place is a hard E0401 instead of a silent low-32-bit truncation both backends
@@ -2640,30 +2696,15 @@ impl<'a> Sema<'a> {
                             ),
                         );
                     }
-                    // The implied `a = a (op) b` produces a value of the binary operator's result
-                    // type. An integer place with a float operand yields a float that cannot
-                    // implicitly narrow back to the integer place — exactly what the plain `a = a + b`
-                    // scalar-agreement check above rejects. The compound path silently accepted it and
-                    // emitted a float->int conversion (a *negative* float even converted via `fptoui`
-                    // to 0, so `acc += -1.0` left `acc` unchanged) — a lossy value both backends
-                    // agreed on, but one the language forbids everywhere else. Reject with E0401.
+                    // The implied `a = a (op) b` must produce a value of the place's own type: the
+                    // plain-assignment rule (E0441, `promote.rs`). The compound path used to coerce
+                    // the operand to the place first, so `s += x` with `s: f32`, `x: f64` silently
+                    // accumulated in f32, and an integer place with a float operand converted the
+                    // float (a *negative* one via `fptoui` to 0, so `acc += -1.0` left `acc`
+                    // unchanged) — lossy values both backends agreed on.
                     if let (Ty::Scalar(ts), Ty::Scalar(vs)) = (&target_ty, &value_ty) {
-                        if ts.is_int() && vs.is_float() {
-                            self.error(
-                                target.span,
-                                "E0401",
-                                format!(
-                                    "compound assignment `{}` cannot apply a `{}` value to an `{}` \
-                                     place; the result would narrow to `{}` — convert explicitly \
-                                     with `as {}`",
-                                    op.glyph(),
-                                    vs.name(),
-                                    ts.name(),
-                                    ts.name(),
-                                    ts.name()
-                                ),
-                            );
-                        }
+                        let (ts, vs) = (*ts, *vs);
+                        self.check_compound_operand(*op, target, value, ts, vs);
                     }
                 }
                 // Reassigning an immutable binding requires `mut`, but it was never enforced. Two
@@ -3713,6 +3754,17 @@ impl<'a> Sema<'a> {
             ExprKind::Binary { op, lhs, rhs } => {
                 let l = self.type_expr(lhs);
                 let r = self.type_expr(rhs);
+                // An operand that is a literal-initialized binding takes the other operand's type
+                // when that is a wider one of its kind (`infer.rs`): `let c = 0.5; c * x_f64` makes
+                // `c` an `f64`. A shift amount and a logical operand constrain nothing.
+                if !matches!(op, BinOp::Shl | BinOp::Shr | BinOp::And | BinOp::Or) {
+                    if !self.is_literal_operand(rhs) {
+                        self.constrain_literal_binding(lhs, Some(&**rhs), &r, true);
+                    }
+                    if !self.is_literal_operand(lhs) {
+                        self.constrain_literal_binding(rhs, Some(&**lhs), &l, true);
+                    }
+                }
                 // Operand shapes must agree (tensor-tensor / vector-vector); a mismatch is a real
                 // error regardless of whether the operator yields a value or a bool.
                 self.check_binop_shapes(&l, &r, e.span);

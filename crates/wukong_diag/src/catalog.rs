@@ -466,6 +466,24 @@ static CATALOG: &[Explanation] = &[
         good: "module ex.e0440\nfn ratio(a: u32, b: i32) -> i64 {\n    return (a as i64) / (b as i64);\n}\nfn main() -> i32 {\n    return ratio(7, -2) as i32;\n}\n"
     ),
     entry!(
+        "E0441",
+        "compound assignment would not fit back into its place",
+        "A compound assignment `x op= v` means `x = x op v`, so the value it stores is the result of \
+         `x op v`, and that must have `x`'s own type — the rule a plain assignment already follows. \
+         So `v` may be of `x`'s type, of a type that promotes into it losslessly (`i64 += i32`, \
+         `f64 += f32`, `i32 += u8`; see E0440), or an unsuffixed literal (which must fit an \
+         integer place). An operand that is wider (`f32 += f64`, `i32 += i64`), of the other kind \
+         (`i32 += f32`) or of an incomparable type (`i32 += u32`) is rejected: the compound form used \
+         to convert the operand down to the place first, so `s += x` with `s: f32` and `x: f64` \
+         silently accumulated in `f32`, and `acc += -1.0` on an integer `acc` changed nothing. Convert \
+         the operand with `as`, or give the place the wider type. A `let` initialized from a bare \
+         literal and not annotated — `let mut s = 0.0;` — takes its type from its first such use, \
+         so it becomes an `f64` accumulator here with no annotation. A shift (`<<=`, `>>=`) takes an \
+         amount of any integer type.",
+        bad: "module ex.e0441\nfn total(x: f64) -> f32 {\n    let mut s: f32 = 0.5;\n    s += x;\n    return s;\n}\nfn main() -> i32 {\n    return total(1.5) as i32;\n}\n",
+        good: "module ex.e0441\nfn total(x: f64) -> f64 {\n    let mut s = 0.5;\n    s += x;\n    return s;\n}\nfn main() -> i32 {\n    return total(1.5) as i32;\n}\n"
+    ),
+    entry!(
         "E0501",
         "rank, extent or arity mismatch",
         "Two tensors were required to have the same number of dimensions (rank) but did not. For \

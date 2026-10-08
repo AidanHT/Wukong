@@ -18,6 +18,10 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `E0440`. `/` and `%` divide with the promoted type's signedness, so `u32 / i64` is a signed
   divide (`7 / -2` was `0`), and a literal on the left of an equally wide typed operand takes that
   operand's type (`1 + x` is `u32` for `x: u32`, as `x + 1` was).
+- **Compound assignment** follows the plain-assignment rule: `x op= v` must not narrow (`E0441`;
+  `f32 += f64` used to accumulate in `f32`). **Literal inference**: an unannotated `let` initialized
+  from bare literals takes its type from its first constraining use, so `let mut s = 0.0;
+  s += x_f64[i];` accumulates in `f64`.
 
 ### Optimizer memory passes: SROA, path DSE, loop deletion, guarded LICM, scalar promotion (`gap/opt-memory`)
 

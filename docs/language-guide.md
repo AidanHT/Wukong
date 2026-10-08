@@ -190,6 +190,19 @@ does not fit widens to the narrowest type that holds it — `i64`, and then `u64
 (`tests/run/int_literal_widen.wk`); a value past `u64` is malformed (`E0401`). Use a suffix
 (`9000000000i64`, `3000000000u32`) to pick a specific type.
 
+**Literal inference** (✅): a `let` with no annotation whose initializer is only unsuffixed literals
+(`let mut s = 0.0;`, `let k = 2;`) is an `{float}`/`{integer}` binding, like Rust's — its type is
+decided by its **first constraining use**, and only that one: an assignment `s = v`, a `return s`,
+a call argument `f(s)` or a `let x: T = s` makes it that type (same kind, any width); a compound
+assignment (`s += v`), an arithmetic operator or a comparison with a typed operand of the same kind
+makes it that type when it is at least as wide, and otherwise keeps the default. So
+`let mut s = 0.0; for i in 0..n { s += x[i]; }` over `f64` data accumulates in `f64`
+(`tests/run/literal_infer_f64_accum.wk`), and `let k = 3; x * k` with `x: u32` is a `u32` product.
+An integer literal never becomes a float, a narrower operand never narrows the binding (`let k = 2;
+k + x_u8` stays an `i32` sum), a later use never re-decides what an earlier one decided (in
+`let k = 2; g_i32(k); x_i64 * k` the call keeps `k` an `i32`), and a binding nothing constrains keeps
+the literal's default.
+
 A `let` binding may **destructure a tuple** — `let (a, b) = …`, nested `let ((m, n), o) = …`, or a
 wildcard `let (keep, _) = …`, including the result of a tuple-returning call
 (`tests/run/let_destructure.wk`). A top-level **`const` is usable as a value**: its initializer is
@@ -275,7 +288,12 @@ for the bitwise operators — `1 | 2 == 2` is `(1 | 2) == 2` here, not `1 | (2 =
 comparison** is rejected rather than silently mis-parsed: `a < b < c` would parse as `(a < b) < c`, so
 it is an `E0401` that names the fix (`a < b && b < c`); the equality form `a == b == c` is caught the
 same way whenever the third operand is not itself a `bool` (an all-`bool` chain still parses as
-`(a == b) == c`). Compound assignment (`+=`, `*=`, `<<=`, `>>=`, …) is supported.
+`(a == b) == c`). Compound assignment (`+=`, `*=`, `<<=`, `>>=`, …) is supported, under the plain
+assignment's rule: `x op= v` stores `x op v`, which must be of `x`'s own type, so `v` must be of that
+type, promote into it losslessly (`i64 += i32`, `f64 += f32`), or be an unsuffixed literal (which
+must fit an integer place); `f32 += f64`, `i32 += i64` and `i32 += f32` are `E0441` — they used to
+convert the operand down to the place and accumulate in the narrower type
+(`tests/fail/compound_assign_narrowing.wk`). A shift amount (`<<=`, `>>=`) may be any integer type.
 
 **Mixed-type arithmetic** (✅) promotes only where nothing is lost and the operand order cannot
 matter: two integers of one signedness compute in the wider (`i32 + i64` is `i64`); an unsigned

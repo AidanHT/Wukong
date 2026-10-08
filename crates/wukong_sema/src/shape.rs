@@ -200,6 +200,9 @@ impl Sema<'_> {
                         for (i, param) in sig.params.iter().enumerate() {
                             if matches!(param, Ty::Scalar(_)) {
                                 if let Some(arg) = args.get(i) {
+                                    // A literal-initialized binding passed here takes the
+                                    // parameter's type, if this is its first use (`infer.rs`).
+                                    self.constrain_literal_binding(arg, None, param, false);
                                     if self.literal_adapts(param, arg) {
                                         self.retype_adapted_literal(arg, param);
                                         self.range_check_int_literal(arg, param);

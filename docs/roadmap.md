@@ -1315,6 +1315,13 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   signed divide (`tests/run/mixed_width_div_signedness.wk`). Not yet: `min`/`max`/`fmax`-style
   intrinsics still pick their operands' common type by width (`wukong_sema::shape`), and `if`/`match`
   arms of different scalar types still merge to the left arm's type on a width tie.
+- **Compound assignment** follows the plain assignment's rule (`E0441`: `f32 += f64`, `i32 += i64`
+  no longer narrow the operand silently), and **literal inference** types an unannotated
+  literal-initialized `let` from its first constraining use (`let mut s = 0.0; s += x_f64[i]`
+  accumulates in `f64`); its first constraining use — an assignment, a `return`, a call argument, an
+  operator — decides it, as in Rust. Not yet: method-call and struct-field positions do not
+  constrain such a binding, and a generic call's literal arguments still bind `T` first-come
+  (`add(x_f64, 1.0)` is `E0401`).
 - Tensor shape checking is **sound for both concrete and generic shapes**. A function's own generic
   dimension variables are **rigid** inside its body: when two shapes that both carry the function's
   generics are checked — its declared-vs-returned shape, an elementwise operator's operands, an

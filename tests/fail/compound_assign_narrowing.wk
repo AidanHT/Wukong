@@ -1,0 +1,21 @@
+// EXPECT-CODE: E0441
+module tests.fail.compound_assign_narrowing
+
+// `s += x` means `s = s + x`, whose value is an `f64` here — which the plain assignment
+// `s = s + x` already refused to store into the `f32` place. The compound form coerced `x` down
+// to `f32` first and accumulated in `f32`, silently, on both backends. It is the plain rule now.
+// (An UNannotated `let mut s = 0.0;` would instead take `f64` from this use: see
+// tests/run/literal_infer_f64_accum.wk.)
+fn total(x: [f64; 4]) -> f32 {
+    let mut s: f32 = 0.0;
+    for i in 0..4 {
+        s += x[i];
+    }
+    return s;
+}
+
+fn main() -> i32 {
+    let x: [f64; 4] = [0.1, 0.2, 0.3, 0.7];
+    print(total(x) as f64);
+    return 0;
+}

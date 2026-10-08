@@ -27,7 +27,9 @@
 //! the typed operand, so `1 + x` and `x + 1` have one type. A shift amount is a count and takes no
 //! part, and `bool` operands keep their own rules.
 
-use wukong_ast::{BinOp, Block, Expr, ExprKind, ForIter, PatKind, Pattern, Stmt, StmtKind, UnOp};
+use wukong_ast::{
+    AssignOp, BinOp, Block, Expr, ExprKind, ForIter, PatKind, Pattern, Stmt, StmtKind, UnOp,
+};
 use wukong_diag::Diagnostic;
 use wukong_span::{Span, Symbol};
 use wukong_types::{Scalar, Ty};
@@ -82,6 +84,16 @@ pub(crate) fn promote(a: Scalar, b: Scalar, a_nonneg: bool, b_nonneg: bool) -> O
         (true, false) => exact_in(b, a).then_some(a),
         (false, true) => exact_in(a, b).then_some(b),
     }
+}
+
+/// Whether `a` and `b` are one type, possibly under the two names of a 64-bit alias pair.
+fn same_repr(a: Scalar, b: Scalar) -> bool {
+    use Scalar::*;
+    a == b
+        || matches!(
+            (a, b),
+            (Usize, U64) | (U64, Usize) | (Isize, I64) | (I64, Isize)
+        )
 }
 
 /// Whether float type `f` holds every value of integer type `i` exactly: its magnitude bits fit
@@ -188,9 +200,88 @@ impl Sema<'_> {
         Some(Ty::Error)
     }
 
+    /// The plain-assignment rule applied to a compound assignment `x op= v` on scalars (`E0441`):
+    /// the implied `x op v` must be of the place's own type. So `v` may be the place's type, a type
+    /// that promotes into it losslessly (`i64 += i32`, `f64 += f32`, `i32 += u8`), or an
+    /// unsuffixed literal (range-checked against an integer place, and never a float literal into
+    /// an integer place). A shift amount is a count of any integer type. A `bool` on either side is
+    /// left to the operator rules.
+    pub(crate) fn check_compound_operand(
+        &mut self,
+        op: AssignOp,
+        target: &Expr,
+        value: &Expr,
+        ts: Scalar,
+        vs: Scalar,
+    ) {
+        if ts == vs || ts == Scalar::Bool || vs == Scalar::Bool {
+            return;
+        }
+        let shift = matches!(op, AssignOp::Shl | AssignOp::Shr);
+        if self.is_literal_operand(value) {
+            if ts.is_int() && vs.is_float() {
+                self.report_compound(op, target, value, ts, vs, Some(vs));
+            } else if ts.is_int() && !shift {
+                self.range_check_int_literal(value, &Ty::Scalar(ts));
+            }
+            return;
+        }
+        if shift {
+            if !vs.is_int() {
+                self.report_compound(op, target, value, ts, vs, Some(vs));
+            }
+            return;
+        }
+        let implied = promote(
+            ts,
+            vs,
+            self.is_nonneg_operand(target),
+            self.is_nonneg_operand(value),
+        );
+        if implied.is_some_and(|t| same_repr(t, ts)) {
+            return;
+        }
+        self.report_compound(op, target, value, ts, vs, implied);
+    }
+
+    fn report_compound(
+        &mut self,
+        op: AssignOp,
+        target: &Expr,
+        value: &Expr,
+        ts: Scalar,
+        vs: Scalar,
+        implied: Option<Scalar>,
+    ) {
+        let (tn, vn) = (ts.name(), vs.name());
+        let bin = op.glyph().trim_end_matches('=');
+        let why = match implied {
+            Some(t) => format!(
+                "`{tn} {bin} {vn}` computes in `{}`, which does not fit back into the `{tn}` place",
+                t.name()
+            ),
+            None => format!("`{tn}` and `{vn}` have no lossless common type"),
+        };
+        self.diags.push(
+            Diagnostic::error(format!(
+                "compound assignment `{}` of a `{vn}` operand to a `{tn}` place: {why}",
+                op.glyph()
+            ))
+            .with_code("E0441")
+            .primary(value.span, format!("this is `{vn}`"))
+            .secondary(target.span, format!("this place is `{tn}`"))
+            .help(format!(
+                "convert the operand explicitly (`x {} (v as {tn})`), or give the place the wider \
+                 type; a `let` initialized from a literal (`let mut s = 0.0;`) takes it \
+                 automatically from its first such use",
+                op.glyph()
+            )),
+        );
+    }
+
     /// Whether `e` is an unsuffixed numeric literal — possibly negated, or arithmetic on such
     /// literals — whose type adapts to the other operand.
-    fn is_literal_operand(&self, e: &Expr) -> bool {
+    pub(crate) fn is_literal_operand(&self, e: &Expr) -> bool {
         match &e.kind {
             ExprKind::Int(s) => !has_int_suffix(self.sym_str(*s)),
             ExprKind::Float(s) => !has_float_suffix(self.sym_str(*s)),
