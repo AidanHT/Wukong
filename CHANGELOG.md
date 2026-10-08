@@ -31,6 +31,11 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `wukong_autodiff::written_params` reports from the tape's kernel table. Gates:
   `crates/wukongc/tests/training_data.rs` (hand-derived trajectories and saved weights, interp ==
   native), the driver's `training` unit tests, `wukong_autodiff` `tests/writes.rs`.
+- **A language model trains end to end:** `tests/run/train_tiny_lm.wk` is a two-layer char-level LM
+  (embedding gather, tanh hidden layer, output projection, softmax cross-entropy over every next
+  character) written as recognized loops; `crates/wukongc/tests/train_lm.rs` trains it with `--train`
+  on the interpreter and the native JIT at `-O0`/`-O2` and holds the trajectory to an f64 reference of
+  the same model (12.4066 -> 8.6545 over three SGD steps), byte-identical across all four runs.
 
 ### Optimizer memory passes: SROA, path DSE, loop deletion, guarded LICM, scalar promotion (`gap/opt-memory`)
 

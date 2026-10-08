@@ -30,6 +30,8 @@ cargo test -p wukongc --test run
 | `explain.rs` | `--explain` lists every code, prints each entry, and every catalogue `bad:`/`good:` example is compiled under `--emit=check` (bad yields exactly its code first, good checks clean) |
 | `gpt2_config.rs` | GPT-2 config fixture |
 | `tensor_parity.rs` | vector-kernel recipe parity (host-gated) |
+| `training_data.rs` | `--train-init` / `--train-data` / `--train-save` / `--train-clip` / `--train-warmup` / `--train-schedule` through the binary: hand-derived trajectories and saved weights, interp == native, and the file-shape refusals |
+| `train_lm.rs` | `tests/run/train_tiny_lm.wk` (embedding + tanh layer + projection + cross-entropy) trains on both backends at `-O0`/`-O2`, matching an f64 reference trajectory and decreasing strictly |
 
 ## GATE-BLIND recognizers
 

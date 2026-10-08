@@ -414,6 +414,7 @@ tensor_views.wk: wukong_velem_f32
 tensor_whole_assign.wk:
 top_level_const.wk:
 topk_sampling.wk: wukong_argsort_f32 wukong_argsort_f32*2 wukong_sample_categorical_f32 wukong_sample_categorical_f32*11 wukong_topk_f32
+train_tiny_lm.wk: wukong_embedding_f32_parallel wukong_sgemm_nt_parallel wukong_sgemm_nt_parallel*2 wukong_sreduce_f32_parallel wukong_vmath_f32_parallel wukong_xent_fwd_f32_parallel
 traits_static_dispatch.wk:
 transcendental.wk:
 transcendental_f64.wk: wukong_rt_math2_f64 wukong_rt_math2_f64*4 wukong_rt_math_f64 wukong_rt_math_f64*41
