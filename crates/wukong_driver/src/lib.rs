@@ -2246,15 +2246,21 @@ fn loss_param_lens(
         .collect()
 }
 
-/// A tiny deterministic LCG producing `f32` in ~`[-0.4, 0.4]` — seeds the `--train` buffers so a run
-/// is reproducible (honest: no hidden entropy) and a test can assert a specific loss trajectory.
+/// A tiny deterministic LCG producing `f32` uniform in `[-0.4, 0.4)` — seeds the `--train` buffers so
+/// a run is reproducible (honest: no hidden entropy) and a test can assert a specific loss trajectory.
+///
+/// The draw is the standard u64 -> f32 conversion: the TOP 24 bits of the state, scaled by `2^-24`
+/// (exact in f32), give `u` uniform in `[0, 1)`; `(u - 0.5)·0.8` is then symmetric about zero. (It
+/// used to keep 31 bits, `seed >> 33`, and divide by `u32::MAX`, so `u` never reached 0.5 and every
+/// value lay in `[-0.4, 0)`: an all-negative init that starts a ReLU net mostly dead.)
 fn train_rand(seed: &mut u64, n: usize) -> Vec<f32> {
     (0..n)
         .map(|_| {
             *seed = seed
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
-            (((*seed >> 33) as f32) / (u32::MAX as f32) - 0.5) * 0.8
+            let u = ((*seed >> 40) as f32) * (1.0 / 16_777_216.0);
+            (u - 0.5) * 0.8
         })
         .collect()
 }
@@ -3411,6 +3417,26 @@ mod grad_cli_tests {
         };
         let lens = loss_param_lens(&sema, &mut interner, &opts).expect("param sizes");
         assert_eq!(lens, vec![12, 8, 6, 1], "x[12], w[8], t[6], out[1]");
+    }
+
+    /// N80: the `--train` initializer covers its documented range symmetrically. It used to keep
+    /// 31 bits of the LCG state and divide by `u32::MAX`, so every value lay in `[-0.4, 0)`.
+    #[test]
+    fn train_init_is_uniform_and_symmetric_about_zero() {
+        let mut seed = GradOptions::default().train_seed;
+        let v = train_rand(&mut seed, 4096);
+        assert!(
+            v.iter().all(|x| (-0.4..0.4).contains(x)),
+            "out of [-0.4, 0.4)"
+        );
+        let negative = v.iter().filter(|&&x| x < 0.0).count();
+        assert!(
+            (1848..=2248).contains(&negative),
+            "{negative} of 4096 negative"
+        );
+        let mean = v.iter().map(|&x| f64::from(x)).sum::<f64>() / v.len() as f64;
+        assert!(mean.abs() < 0.02, "mean {mean}");
+        assert!(v.iter().any(|&x| x > 0.35) && v.iter().any(|&x| x < -0.35));
     }
 
     #[test]

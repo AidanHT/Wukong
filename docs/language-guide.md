@@ -1807,7 +1807,8 @@ next to `loss` (C ABI: the loss's parameters, then one caller-zeroed gradient bu
 **✅ CPU training:** `--train` honors `--backend=interp` (the default) and `--backend=native`.
 Every loss parameter must be a concrete f32 array (including nested arrays) or a dense f32 tensor
 (contiguous or column-major); slices, raw pointers, scalar parameters, other element types and unrepresentable byte extents are
-rejected. The last buffer must contain exactly one f32 for the scalar loss output. SGD and AdamW use deterministic initialization;
+rejected. The last buffer must contain exactly one f32 for the scalar loss output. SGD and AdamW use deterministic initialization
+(every buffer drawn uniformly from `[-0.4, 0.4)` by an LCG seeded with `--train-seed`);
 AdamW accepts finite nonnegative `--train-weight-decay`, while SGD rejects nonzero decay.
 
 `--train --run` trains the selected loss without calling `main`. Combining `--train` with any

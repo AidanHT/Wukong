@@ -1,11 +1,11 @@
-// RUN: --train --grad-wrt=0 --train-steps=3 --train-lr=0.25 --train-seed=98
+// RUN: --train --grad-wrt=0 --train-steps=3 --train-lr=0.25 --train-seed=47
 // EXPECT-EXIT: 0
 // EXPECT-OUT: train: 3 step(s), lr=0.25, optimizer=sgd
-// EXPECT-OUT: step    0: loss 0.231475
-// EXPECT-OUT: step    1: loss 0.057869
-// EXPECT-OUT: step    2: loss 0.014467
-// EXPECT-OUT: step    3: loss 0.003617
-// EXPECT-OUT: loss 0.231475 -> 0.003617  (64.00x reduction)
+// EXPECT-OUT: step    0: loss 0.175787
+// EXPECT-OUT: step    1: loss 0.043947
+// EXPECT-OUT: step    2: loss 0.010987
+// EXPECT-OUT: step    3: loss 0.002747
+// EXPECT-OUT: loss 0.175787 -> 0.002747  (64.00x reduction)
 module tests.run.autodiff_train_sumsq
 
 // `--train` end to end through a RECOGNIZED kernel: the sum-of-squares loss lowers to one
@@ -13,17 +13,17 @@ module tests.run.autodiff_train_sumsq
 // `dL/dw = 2·w` (one `wukong_velem_f32` scale). Every expected line is derived from scalar
 // semantics, not recorded from the compiler:
 //
-// * The 8 initial weights come from `--train`'s documented deterministic init with seed 98 — the
+// * The 8 initial weights come from `--train`'s documented deterministic init with seed 47 — the
 //   LCG `s = s·6364136223846793005 + 1442695040888963407` (wrapping u64), each weight
-//   `(((s >> 33) as f32) / (u32::MAX as f32) - 0.5) * 0.8` in f32 — computed independently in
-//   Python with f32 rounding after every operation: [-0.044696309, -0.37714013, -0.070856668,
-//   -0.15894380, -0.10312915, -0.14131148, -0.15521543, -0.047564317].
+//   `(((s >> 40) as f32) * 2^-24 - 0.5) * 0.8` in f32 (uniform in [-0.4, 0.4)) — computed
+//   independently in Python with f32 rounding after every operation: [-0.16541372, -0.18879457,
+//   0.1024149, 0.030907154, 0.19140601, 0.1795897, -0.083291344, 0.15972362].
 // * The loss is Σ w² in f32 with the kernel's fixed order (8 lane products `fma(w, w, 0)`, then the
-//   balanced combine ((0+1)+(2+3))+((4+5)+(6+7))): 0.23147498. All 8! summation orders print the
-//   same six decimals, and the seed was chosen so every printed value sits >= 30 ULPs from a
-//   six-decimal rounding boundary.
+//   balanced combine ((0+1)+(2+3))+((4+5)+(6+7))): 0.17578696. Every summation order lies within
+//   8 ULPs of the exact sum and prints the same six decimals, and the seed was chosen so every
+//   printed value sits >= 30 ULPs from a six-decimal rounding boundary.
 // * SGD with lr = 1/4 on gradient 2w gives w - w/2 = w/2 EXACTLY in f32, so each step divides the
-//   loss by exactly 4: 0.23147498 / 4^k for k = 0..3, and the reduction ratio is exactly 64.
+//   loss by exactly 4: 0.17578696 / 4^k for k = 0..3, and the reduction ratio is exactly 64.
 //
 // A wrong VJP (dropping the factor 2, a missing contribution, a zero gradient) changes every line
 // after step 0. `main` exercises the same loss for the differential gates, on exact values.

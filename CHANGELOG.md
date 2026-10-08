@@ -14,6 +14,12 @@ All notable changes to Wukong are documented here. The format is loosely based o
   tuned GEMMs and `wukong_softmax_bwd_f32`. Gated against an f64 closed form and the finite
   difference (`wukong_autodiff` `tests/attention.rs`), including self-attention over one buffer.
   The tape now differentiates 50 forward kernel symbols.
+- **Fix: the `--train` initializer was single-signed** (N80). It kept 31 bits of the LCG state
+  (`seed >> 33`) and divided by `u32::MAX`, so every seeded buffer lay in `[-0.4, 0)` — an all-negative
+  init that starts a ReLU net mostly dead. It now takes the top 24 bits scaled by `2^-24` (uniform
+  `[0, 1)`, exact in f32), then `(u - 0.5)·0.8`: uniform in `[-0.4, 0.4)`. The hand-derived
+  `tests/run/autodiff_train_*.wk` trajectories were re-derived from the corrected formula (new seeds
+  keep every printed value clear of a six-decimal rounding boundary).
 
 ### Optimizer memory passes: SROA, path DSE, loop deletion, guarded LICM, scalar promotion (`gap/opt-memory`)
 
