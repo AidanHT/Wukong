@@ -1799,7 +1799,9 @@ fn classify_carried(
 /// * their bases are provably different objects (two distinct `alloca`s);
 /// * their bases are the same object *and* their index expressions are identical, which puts them
 ///   at dependence distance 0 — the same element in the same iteration, which is a
-///   loop-*independent* dependence that widening preserves.
+///   loop-*independent* dependence that widening preserves;
+/// * their bases are the same object and the GCD test proves they never touch the same element at
+///   all ([`never_the_same_element`]: `x[2i]` beside `x[2i+1]`).
 ///
 /// A same-object pair at a **non-zero** distance is reported [`MemDep::Carried`] even when the
 /// distance is large enough to be harmless at a given width: the width is not known here, and
@@ -1860,7 +1862,7 @@ fn dependence(ctx: &LoopCtx<'_>, l: &NaturalLoop, accesses: &[MemAccess]) -> Dep
                     (AddrForm::Invariant(_), AddrForm::Invariant(_)) => true,
                     _ => false,
                 };
-                if !same_index {
+                if !same_index && !never_the_same_element(a, b) {
                     return carried("two accesses to one object at a non-zero distance");
                 }
                 continue;
@@ -1891,6 +1893,44 @@ fn dependence(ctx: &LoopCtx<'_>, l: &NaturalLoop, accesses: &[MemAccess]) -> Dep
             }
             MemDep::Carried => unreachable!(),
         },
+    }
+}
+
+/// Can two accesses to one object provably never touch the same element, in any pair of iterations?
+///
+/// The GCD test, in the one shape it is exact for: both indices are `k·iv + T + c` with the same
+/// constant stride `k`, the same invariant part `T` and the same element type, each access moving
+/// exactly one element. Then `k·i₁ + c₁ = k·i₂ + c₂` needs `k | (c₂ - c₁)`, so when `k` does not
+/// divide the difference of the constants there is no solution at all — `x[2i]` and `x[2i+1]`
+/// interleave and never meet. That is what lets a complex multiply's `o[2i] = re; o[2i+1] = im`
+/// (two stores to one object) reach the vectorizer's interleave groups instead of being reported
+/// as a carried dependence. Any other pair answers `false`, which keeps the blunt test's verdict.
+pub(crate) fn never_the_same_element(a: &MemAccess, b: &MemAccess) -> bool {
+    let (
+        AddrForm::Affine {
+            index: ia,
+            elem: ea,
+            ..
+        },
+        AddrForm::Affine {
+            index: ib,
+            elem: eb,
+            ..
+        },
+    ) = (&a.addr, &b.addr)
+    else {
+        return false;
+    };
+    if ea != eb || a.value_ty != *ea || b.value_ty != *eb || ia.terms != ib.terms {
+        return false;
+    }
+    match (ia.coeff, ib.coeff) {
+        (Coeff::Const(k), Coeff::Const(k2)) if k == k2 && k != 0 => ib
+            .konst
+            .checked_sub(ia.konst)
+            .and_then(|d| d.checked_rem(k))
+            .is_some_and(|r| r != 0),
+        _ => false,
     }
 }
 

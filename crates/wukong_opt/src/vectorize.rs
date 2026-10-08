@@ -334,6 +334,13 @@ enum Plan {
     VecLoad,
     /// A `Store` whose address is affine unit-stride: becomes one `Vec` store per part.
     VecStore,
+    /// A member of an interleaved load group (`x[k·i + r]`): the first member in program order
+    /// loads the group's whole window — `k` contiguous vectors per part — and splits every member
+    /// out with lane shuffles; each member then reads its own lanes.
+    GroupLoad { group: usize, offset: u32 },
+    /// A member of an interleaved store group: each member records its value, and the last one
+    /// interleaves all `k` with lane shuffles and stores the window contiguously.
+    GroupStore { group: usize, offset: u32 },
     /// A reduction's combining instruction. Not emitted inline — every accumulate is folded
     /// serially at the end of the vector body by [`emit_reduction_fold`].
     Reduce,
@@ -399,6 +406,8 @@ struct VecPlan {
     vector_ty: FxHashMap<u32, MirType>,
     /// Reductions to fold, in `NaturalLoop::reductions` order.
     reductions: Vec<RedPlan>,
+    /// The interleaved access groups [`Plan::GroupLoad`]/[`Plan::GroupStore`] index.
+    groups: Vec<InterleaveGroup>,
     /// Runtime pointer-range checks the vector loop is only legal under.
     guards: Vec<GuardPair>,
     /// Runtime checks that each loop-invariant data load's address lies outside each stored range
@@ -520,7 +529,33 @@ struct GuardBase {
     /// The element type every index in the group counts in. Per group, because one loop may read
     /// `i8` and write `f32`: a range measured in the wrong element size would test the wrong bytes.
     elem: MirType,
+    /// The constant per-iteration element stride every access in the group shares: `1` for a plain
+    /// stream, `k` for an interleaved access group.
+    stride: i64,
 }
+
+/// A complete **interleaved access group**: `k` accesses to one object at `k·i + c₀ + r`, one for
+/// every `r` in `0..k`, all loads or all stores, moving one `elem` each. Together they touch the
+/// `k·W` elements from `k·i + c₀` on contiguously — so a group is `k` ordinary vector accesses per
+/// part plus lane shuffles, LLVM's InterleavedAccess lowering. RoPE's `(x[2i], x[2i+1])` pairs, a
+/// complex multiply's real and imaginary parts and an RGB pixel's three channels are all one.
+///
+/// A group must be complete. A gap — only `x[2i]` read — would load elements the scalar loop never
+/// reads, and the last group's window can run past the end of the buffer.
+#[derive(Clone, Debug)]
+struct InterleaveGroup {
+    /// The stride, which is also the number of members.
+    k: u32,
+    /// The element type every member moves.
+    elem: MirType,
+}
+
+/// The widest interleave group this pass forms. A wider one costs `k - 1` shuffles per member per
+/// part; past four that is no longer a clear win over the scalar loop it replaces.
+const MAX_INTERLEAVE: i64 = 4;
+
+/// An access's position in its block, the key [`NaturalLoop::accesses`] entries are found by.
+type AccessKey = (u32, usize);
 
 // ---------------------------------------------------------------------------------------------
 // Legality
@@ -704,7 +739,9 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
     }
     let iv_value_use = classify_iv_uses(f, &lin, iv.value)
         .ok_or("the induction variable is used for something other than addressing")?;
-    access_shape_verdict(l)?;
+    let (groups, member) = interleave_groups(l)?;
+    access_shape_verdict(l, &member)?;
+    group_order_verdict(l, &lin, groups.len(), &member)?;
 
     // ---- per-instruction plan -----------------------------------------------------------------
     let ramp = IvRamp {
@@ -712,8 +749,8 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
         ty: iv_ty.clone(),
         value_use: iv_value_use,
     };
-    let (plans, vector_ty, reductions) =
-        plan_body(f, l, &lin, &ramp).ok_or("an instruction in the body cannot be widened")?;
+    let (plans, vector_ty, reductions) = plan_body(f, l, &lin, &ramp, &member)
+        .ok_or("an instruction in the body cannot be widened")?;
 
     // ---- width, from the narrowest lane the widened body holds --------------------------------
     // Every value that becomes a vector, every affine access (a uniform stored value is splatted to
@@ -781,6 +818,7 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
         plans,
         vector_ty,
         reductions,
+        groups,
         guards,
         point_guards,
         guard_allows_equal,
@@ -1266,16 +1304,20 @@ fn ramp_consumable(op: &Op) -> bool {
     )
 }
 
-/// Every affine access must move one element of a vectorizable lane type per iteration. The group
-/// width is no longer one access's lane count — [`plan_loop`] derives it from the narrowest lane of
-/// the whole widened body — so what is left to check here is the shape of each access on its own.
-fn access_shape_verdict(l: &NaturalLoop) -> Result<(), &'static str> {
+/// Every affine access must move one element of a vectorizable lane type per iteration, and step by
+/// one element — or be a member of a complete interleave group. The group width is no longer one
+/// access's lane count — [`plan_loop`] derives it from the narrowest lane of the whole widened body
+/// — so what is left to check here is the shape of each access on its own.
+fn access_shape_verdict(
+    l: &NaturalLoop,
+    member: &FxHashMap<AccessKey, (usize, u32)>,
+) -> Result<(), &'static str> {
     for a in &l.accesses {
         let AddrForm::Affine { elem, .. } = &a.addr else {
             continue;
         };
-        if a.addr.const_stride() != Some(1) {
-            return Err("an access is strided, which is a gather, not a vector load");
+        if a.addr.const_stride() != Some(1) && !member.contains_key(&(a.block.0, a.inst)) {
+            return Err("an access is strided outside a complete interleave group");
         }
         // The `gep`'s unit and the value transferred must be the same type, or `base + index`
         // does not step one transferred element per lane.
@@ -1284,6 +1326,167 @@ fn access_shape_verdict(l: &NaturalLoop) -> Result<(), &'static str> {
         }
         if lane_bytes(&a.value_ty).is_none() {
             return Err("an access moves a type with no vector lane form");
+        }
+    }
+    Ok(())
+}
+
+/// Collect the loop's interleave groups: the affine accesses with a constant stride `k` in
+/// `2..=MAX_INTERLEAVE`, grouped by object, invariant part, stride, element type and kind. Each
+/// group must cover every residue `0..k` exactly from its lowest constant (a load group may read one
+/// element twice; a store group may not write one twice), or the loop is declined. Returns the
+/// groups and, per member access, `(group, residue)`.
+///
+/// Any other strided access is left out here and declined by [`access_shape_verdict`] — including
+/// a negative stride, which is a reverse walk this pass does not form.
+#[allow(clippy::type_complexity)]
+fn interleave_groups(
+    l: &NaturalLoop,
+) -> Result<(Vec<InterleaveGroup>, FxHashMap<AccessKey, (usize, u32)>), &'static str> {
+    struct Building<'a> {
+        base: MemBase,
+        terms: &'a [(ValueId, i64)],
+        k: i64,
+        elem: &'a MirType,
+        kind: AccessKind,
+        members: Vec<(&'a MemAccess, i64)>,
+    }
+    let mut building: Vec<Building<'_>> = Vec::new();
+    for a in &l.accesses {
+        let AddrForm::Affine { base, index, elem } = &a.addr else {
+            continue;
+        };
+        let Some(k) = index.coeff.as_const() else {
+            continue;
+        };
+        if !(2..=MAX_INTERLEAVE).contains(&k) {
+            continue;
+        }
+        let found = building.iter_mut().find(|g| {
+            g.base.same_object(*base)
+                && g.terms == index.terms.as_slice()
+                && g.k == k
+                && g.elem == elem
+                && g.kind == a.kind
+        });
+        match found {
+            Some(g) => g.members.push((a, index.konst)),
+            None => building.push(Building {
+                base: *base,
+                terms: &index.terms,
+                k,
+                elem,
+                kind: a.kind,
+                members: vec![(a, index.konst)],
+            }),
+        }
+    }
+    let mut groups = Vec::with_capacity(building.len());
+    let mut member: FxHashMap<AccessKey, (usize, u32)> = FxHashMap::default();
+    for g in building {
+        let c0 = g
+            .members
+            .iter()
+            .map(|(_, c)| *c)
+            .min()
+            .expect("a group is built from at least one access");
+        let mut seen = vec![false; g.k as usize];
+        for (a, c) in &g.members {
+            let r = c - c0;
+            if r >= g.k {
+                return Err("an interleaved access group spans more than one stride");
+            }
+            if seen[r as usize] && g.kind == AccessKind::Store {
+                return Err("an interleaved store group writes one element twice");
+            }
+            seen[r as usize] = true;
+            member.insert((a.block.0, a.inst), (groups.len(), r as u32));
+        }
+        if seen.iter().any(|s| !s) {
+            return Err("an interleaved access group has a gap");
+        }
+        groups.push(InterleaveGroup {
+            k: g.k as u32,
+            elem: g.elem.clone(),
+        });
+    }
+    Ok((groups, member))
+}
+
+/// A group is emitted at ONE point: a load group at its first member in program order, a store
+/// group at its last. Every other member moves there — a load earlier, a store later — so the move
+/// must not carry it across an access to the same element, or the iteration would read a value
+/// before the store it read, or store under a later access's feet.
+///
+/// Only same-object pairs can conflict: accesses to different objects are already proved disjoint,
+/// or guarded disjoint at run time, by the dependence verdict this pass requires. A same-object pair
+/// is harmless when the GCD test proves the two never touch one element
+/// ([`crate::loop_info::never_the_same_element`]). The groups are also only formed in a straight-line
+/// body: an if-converted one would make the emission point conditional.
+fn group_order_verdict(
+    l: &NaturalLoop,
+    lin: &[LinInst],
+    groups: usize,
+    member: &FxHashMap<AccessKey, (usize, u32)>,
+) -> Result<(), &'static str> {
+    if groups == 0 {
+        return Ok(());
+    }
+    if lin.iter().any(|s| !matches!(s, LinInst::Real { .. })) {
+        return Err("an interleave group in an if-converted body");
+    }
+    let pos: FxHashMap<AccessKey, usize> = lin
+        .iter()
+        .enumerate()
+        .filter_map(|(at, s)| match s {
+            LinInst::Real { block, idx } => Some(((block.0, *idx), at)),
+            _ => None,
+        })
+        .collect();
+    let at_of = |a: &MemAccess| pos.get(&(a.block.0, a.inst)).copied();
+    let group_of = |a: &MemAccess| member.get(&(a.block.0, a.inst)).map(|m| m.0);
+    for gi in 0..groups {
+        let members: Vec<&MemAccess> = l
+            .accesses
+            .iter()
+            .filter(|a| group_of(*a) == Some(gi))
+            .collect();
+        let mut positions = Vec::with_capacity(members.len());
+        for a in &members {
+            positions.push(at_of(*a).ok_or("an interleave group member is not in the body")?);
+        }
+        let is_load = members[0].kind == AccessKind::Load;
+        let anchor = if is_load {
+            positions.iter().copied().min()
+        } else {
+            positions.iter().copied().max()
+        }
+        .expect("a group has members");
+        for (m, &p) in members.iter().zip(&positions) {
+            let (lo, hi) = if is_load { (anchor, p) } else { (p, anchor) };
+            for other in &l.accesses {
+                // A load moving earlier crosses only stores that could feed it; a store moving
+                // later crosses every access that could read or overwrite what it wrote.
+                if group_of(other) == Some(gi) || (is_load && other.kind != AccessKind::Store) {
+                    continue;
+                }
+                let Some(q) = at_of(other) else {
+                    continue;
+                };
+                if q <= lo || q >= hi {
+                    continue;
+                }
+                let same_object = match (m.addr.base(), other.addr.base()) {
+                    (Some(x), Some(y)) => x.same_object(y),
+                    _ => true,
+                };
+                if same_object && !crate::loop_info::never_the_same_element(m, other) {
+                    return Err(
+                        "an interleave group member would move across an access to its \
+                                element",
+                    );
+                }
+            }
         }
     }
     Ok(())
@@ -1302,6 +1505,7 @@ fn plan_body(
     l: &NaturalLoop,
     lin: &[LinInst],
     ramp: &IvRamp,
+    member: &FxHashMap<AccessKey, (usize, u32)>,
 ) -> Option<(Vec<Plan>, FxHashMap<u32, MirType>, Vec<RedPlan>)> {
     let access_at: FxHashMap<(u32, usize), &MemAccess> = l
         .accesses
@@ -1480,7 +1684,10 @@ fn plan_body(
                 Some(AddrForm::Affine { .. }) => {
                     lane_bytes(ty)?;
                     vector_ty.insert(inst.result?.0, ty.clone());
-                    Plan::VecLoad
+                    match member.get(&(block, i)) {
+                        Some(&(group, offset)) => Plan::GroupLoad { group, offset },
+                        None => Plan::VecLoad,
+                    }
                 }
                 // An invariant address yields the same value every iteration: keep it scalar and
                 // let a consumer splat it. This is how a `[]T` slice's data pointer is read — and
@@ -1497,7 +1704,10 @@ fn plan_body(
             Op::Store { ptr: _, value } => match access_at.get(&(block, i)).map(|a| &a.addr) {
                 Some(AddrForm::Affine { .. }) => {
                     lane_bytes(f.value_type(*value))?;
-                    Plan::VecStore
+                    match member.get(&(block, i)) {
+                        Some(&(group, offset)) => Plan::GroupStore { group, offset },
+                        None => Plan::VecStore,
+                    }
                 }
                 // Every lane would write the same address; only one wins, and which one is not the
                 // scalar loop's answer.
@@ -1778,9 +1988,11 @@ fn cast_route(kind: CastKind, from: &MirType, to: &MirType) -> Option<CastRoute>
 ///
 /// Splitting one base across two groups is only sound because two such groups can only ever both be
 /// **loads**: `loop_info::dependence` reports [`crate::loop_info::MemDep::Carried`] for any
-/// same-object pair whose index expressions differ when one of them writes, so such a loop never
-/// reaches here. That is a distant invariant, so it is also re-checked locally below rather than
-/// assumed — the check costs nothing and cannot fire on a loop the old code accepted.
+/// same-object pair whose index expressions differ when one of them writes — except a pair the GCD
+/// test proves never meets, and that pair shares its invariant part and stride and so lands in ONE
+/// group here (an interleaved `o[2i]`/`o[2i+1]` store pair) — so such a loop never reaches here.
+/// That is a distant invariant, so it is also re-checked locally below rather than assumed — the
+/// check costs nothing and cannot fire on a loop the old code accepted.
 ///
 /// Given that, the split is not merely safe but strictly *more precise* than grouping by base:
 /// each group's range is an exact cover of what that group touches (every member shares `terms` and
@@ -1818,20 +2030,21 @@ fn plan_guards(f: &Function, l: &NaturalLoop) -> Option<(Vec<GuardPair>, Vec<Poi
     // addend has to *be* that type. It usually is; the exception is a `sext`, which the affine
     // decomposition looks through (`Op::Cast(SExt, ..)`), leaving a narrower value behind.
     let iv_ty = l.primary()?.ty.clone();
-    // The unit-stride requirement is stated here rather than inherited from
-    // `access_shape_verdict`, which has already imposed it on every affine access: the range
-    // arithmetic below assumes it outright.
+    // The stride must be a positive constant the induction variable's type can hold: the range
+    // below is `stride·iv + invariants + k`, rebuilt in that type. (`access_shape_verdict` has
+    // already limited every affine access to a unit stride or a complete interleave group.)
     let usable_terms = |ix: &crate::loop_info::AffineExpr| {
-        ix.coeff.as_const() == Some(1)
+        matches!(ix.coeff.as_const(), Some(s) if s >= 1 && fits_in(&iv_ty, s))
             && ix.terms.iter().all(|(v, m)| {
                 !inside.contains(&v.0) && *f.value_type(*v) == iv_ty && fits_in(&iv_ty, *m)
             })
     };
 
-    // Group the affine accesses by `(base, invariant offset)`, tracking the constant offset window
-    // and whether any access in the group is a store. `usable` is per group rather than per access
-    // because `lo`/`hi` only bound the touched range for accesses that share the symbolic part —
-    // which, with the symbolic part in the key, every member of a group does.
+    // Group the affine accesses by `(base, invariant offset, stride)`, tracking the constant offset
+    // window and whether any access in the group is a store. `usable` is per group rather than per
+    // access because `lo`/`hi` only bound the touched range for accesses that share the symbolic
+    // part and the stride — which, with both in the key, every member of a group does. An
+    // interleave group's `k` members land in one guard group, `lo..=hi` spanning its residues.
     struct Group {
         g: GuardBase,
         stored: bool,
@@ -1844,10 +2057,10 @@ fn plan_guards(f: &Function, l: &NaturalLoop) -> Option<(Vec<GuardPair>, Vec<Poi
             continue;
         };
         let is_store = a.kind == AccessKind::Store;
-        match bases
-            .iter_mut()
-            .find(|gr| gr.g.base.same_object(*base) && gr.g.terms == index.terms)
-        {
+        let stride = index.coeff.as_const().unwrap_or(0);
+        match bases.iter_mut().find(|gr| {
+            gr.g.base.same_object(*base) && gr.g.terms == index.terms && gr.g.stride == stride
+        }) {
             Some(gr) => {
                 if gr.elem != *elem {
                     return None;
@@ -1865,6 +2078,7 @@ fn plan_guards(f: &Function, l: &NaturalLoop) -> Option<(Vec<GuardPair>, Vec<Poi
                     lo: index.konst,
                     hi: index.konst,
                     elem: elem.clone(),
+                    stride,
                 },
                 stored: is_store,
                 elem: elem.clone(),
@@ -2282,8 +2496,8 @@ fn emit_alias_checks(e: &mut Emit<'_>, p: &VecPlan, guard: BlockId) -> Option<Va
     acc
 }
 
-/// The half-open address range `[base + start + lo + Σt, base + end + hi + Σt)` this base touches,
-/// as two integers.
+/// The half-open address range `[base + s·start + lo + Σt, base + s·end + hi + Σt)` this base
+/// touches, as two integers (`s` the group's stride, `1` for a plain stream).
 ///
 /// `Σt` is the loop-invariant symbolic part of the index — the `r*C` of a row-wise `x[r*C + j]`. It
 /// is rebuilt here rather than read out of the loop body because the guard runs *before* the body,
@@ -2312,11 +2526,17 @@ fn range_of(
         },
     };
     let off = |e: &mut Emit<'_>, at: ValueId, k: i64| -> ValueId {
-        let mut idx = if k == 0 {
+        let scaled = if g.stride == 1 {
             at
         } else {
+            let s = e.int(guard, &p.iv_ty, g.stride);
+            e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Mul, at, s))
+        };
+        let mut idx = if k == 0 {
+            scaled
+        } else {
             let c = e.int(guard, &p.iv_ty, k);
-            e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Add, at, c))
+            e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Add, scaled, c))
         };
         for &(v, mult) in &g.terms {
             let addend = if mult == 1 {
@@ -2343,8 +2563,9 @@ fn range_of(
         )
     };
     // The induction variable runs over `[start, end)` and each access adds a constant in
-    // `[lo, hi]`, so the highest element index touched is `end - 1 + hi` and the half-open upper
-    // bound is `end + hi`.
+    // `[lo, hi]`, so the highest element index touched is `s·(end - 1) + hi` and `s·end + hi` is a
+    // half-open upper bound (exact for `s = 1`, a few elements generous for an interleave group,
+    // which can only reject more).
     let lo = off(e, start, g.lo);
     let hi = off(e, end, g.hi);
     (lo, hi)
@@ -2386,6 +2607,9 @@ fn emit_body(
     for (i, hp) in header_params.iter().enumerate() {
         map.insert(hp.0, Wide::Uniform(vh_params[i]));
     }
+    // `(group, residue)` -> that member's parts: filled for every member of a load group by its
+    // first member, and member by member for a store group until its last member stores them all.
+    let mut group_vals: FxHashMap<(usize, u32), Vec<ValueId>> = FxHashMap::default();
 
     // The lane ramp, when the body reads the induction variable as a value: `splat(i) + iota`, so
     // lane `k` holds `i + k` — the counter scalar iteration `i + k` would have had. The step is 1
@@ -2560,6 +2784,32 @@ fn emit_body(
                 for (k, value) in values.into_iter().enumerate() {
                     let at = part_ptr(e, vb, ptr, &lane, k);
                     e.push_void(vb, Op::Store { ptr: at, value });
+                }
+            }
+            Plan::GroupLoad { group, offset } => {
+                let Op::Load(ptr, _) = &inst.op else {
+                    unreachable!("GroupLoad plan on a non-load")
+                };
+                if !group_vals.contains_key(&(*group, *offset)) {
+                    let ptr = resolve_uniform(&map, *ptr);
+                    emit_group_load(e, vb, ptr, *offset, *group, p, &mut group_vals);
+                }
+                map.insert(
+                    inst.result.expect("load has a result").0,
+                    Wide::Vector(group_vals[&(*group, *offset)].clone()),
+                );
+            }
+            Plan::GroupStore { group, offset } => {
+                let Op::Store { ptr, value } = &inst.op else {
+                    unreachable!("GroupStore plan on a non-store")
+                };
+                let lane = e.f.value_type(*value).clone();
+                let values = to_vector(e, vb, &map, *value, &lane, p.w);
+                group_vals.insert((*group, *offset), values);
+                let k = p.groups[*group].k;
+                if (0..k).all(|r| group_vals.contains_key(&(*group, r))) {
+                    let ptr = resolve_uniform(&map, *ptr);
+                    emit_group_store(e, vb, ptr, *offset, *group, p, &group_vals);
                 }
             }
             Plan::Widen => {
@@ -2756,11 +3006,16 @@ fn red_binop(k: RedKind) -> BinOp {
 
 /// The address of part `k` of a widened access at `ptr`: `k` full vectors of `elem` further on.
 fn part_ptr(e: &mut Emit<'_>, vb: BlockId, ptr: ValueId, elem: &MirType, k: usize) -> ValueId {
-    if k == 0 {
+    let per_part = lanes_of(elem).expect("a widened access has a vector width");
+    elem_ptr(e, vb, ptr, elem, k as i64 * per_part as i64)
+}
+
+/// `ptr` moved by `delta` elements of `elem` (`ptr` itself for zero).
+fn elem_ptr(e: &mut Emit<'_>, vb: BlockId, ptr: ValueId, elem: &MirType, delta: i64) -> ValueId {
+    if delta == 0 {
         return ptr;
     }
-    let per_part = lanes_of(elem).expect("a widened access has a vector width");
-    let index = e.int(vb, &MirType::I64, k as i64 * per_part as i64);
+    let index = e.int(vb, &MirType::I64, delta);
     e.push(
         vb,
         MirType::Ptr,
@@ -2770,6 +3025,165 @@ fn part_ptr(e: &mut Emit<'_>, vb: BlockId, ptr: ValueId, elem: &MirType, k: usiz
             elem: elem.clone(),
         },
     )
+}
+
+/// Load an interleave group's whole window and split every member out of it.
+///
+/// `ptr` is the address the first member (residue `offset`) reads in iteration `i`, so the window
+/// starts `offset` elements earlier. Part `p` of the group covers iterations `p·L .. p·L + L` and
+/// so the `k·L` elements from `p·k·L` on: `k` contiguous vector loads. Lane `l` of member `r` is
+/// element `k·l + r` of that span — vector `(k·l + r) / L`, lane `(k·l + r) % L` — gathered with
+/// lane shuffles ([`gather_lanes`]). Every element loaded is one some member reads in some iteration
+/// of the group, so nothing outside what the scalar loop touches is read.
+fn emit_group_load(
+    e: &mut Emit<'_>,
+    vb: BlockId,
+    ptr: ValueId,
+    offset: u32,
+    gi: usize,
+    p: &VecPlan,
+    vals: &mut FxHashMap<(usize, u32), Vec<ValueId>>,
+) {
+    let g = &p.groups[gi];
+    let k = g.k as usize;
+    let l = lanes_of(&g.elem).expect("a group moves a vector lane type") as usize;
+    let vty = part_ty(&g.elem);
+    let window = elem_ptr(e, vb, ptr, &g.elem, -i64::from(offset));
+    for part in 0..parts_of(&g.elem, p.w) {
+        let mut vecs = Vec::with_capacity(k);
+        for m in 0..k {
+            let at = elem_ptr(e, vb, window, &g.elem, ((part * k + m) * l) as i64);
+            vecs.push(e.push(vb, vty.clone(), Op::Load(at, vty.clone())));
+        }
+        for r in 0..k {
+            let sources: Vec<(ValueId, u32)> = (0..l)
+                .map(|lane| {
+                    let el = k * lane + r;
+                    (vecs[el / l], (el % l) as u32)
+                })
+                .collect();
+            let v = gather_lanes(e, vb, &sources, &vty);
+            vals.entry((gi, r as u32)).or_default().push(v);
+        }
+    }
+}
+
+/// Interleave a store group's `k` member values and store the window contiguously.
+///
+/// The mirror of [`emit_group_load`]: output vector `m` of part `p` holds elements
+/// `p·k·L + m·L .. + L`, and element `m·L + t` of the part's span is lane `(m·L + t) / k` of member
+/// `(m·L + t) % k`. Exactly the elements the scalar loop writes are written, each once.
+fn emit_group_store(
+    e: &mut Emit<'_>,
+    vb: BlockId,
+    ptr: ValueId,
+    offset: u32,
+    gi: usize,
+    p: &VecPlan,
+    vals: &FxHashMap<(usize, u32), Vec<ValueId>>,
+) {
+    let g = &p.groups[gi];
+    let k = g.k as usize;
+    let l = lanes_of(&g.elem).expect("a group moves a vector lane type") as usize;
+    let vty = part_ty(&g.elem);
+    let window = elem_ptr(e, vb, ptr, &g.elem, -i64::from(offset));
+    for part in 0..parts_of(&g.elem, p.w) {
+        for m in 0..k {
+            let sources: Vec<(ValueId, u32)> = (0..l)
+                .map(|t| {
+                    let el = m * l + t;
+                    (vals[&(gi, (el % k) as u32)][part], (el / k) as u32)
+                })
+                .collect();
+            let v = gather_lanes(e, vb, &sources, &vty);
+            let at = elem_ptr(e, vb, window, &g.elem, ((part * k + m) * l) as i64);
+            e.push_void(vb, Op::Store { ptr: at, value: v });
+        }
+    }
+}
+
+/// A vector whose lane `j` is lane `sources[j].1` of vector `sources[j].0`, built from two-source
+/// `Op::Shuffle`s: the first two distinct sources fill their lanes in one shuffle, and each further
+/// source is merged into the running vector keeping every lane already filled. One source in
+/// identity order is returned as it is.
+fn gather_lanes(
+    e: &mut Emit<'_>,
+    vb: BlockId,
+    sources: &[(ValueId, u32)],
+    vty: &MirType,
+) -> ValueId {
+    let n = sources.len() as u32;
+    let mut order: Vec<ValueId> = Vec::new();
+    for (v, _) in sources {
+        if !order.contains(v) {
+            order.push(*v);
+        }
+    }
+    let first = order[0];
+    if order.len() == 1 {
+        if sources
+            .iter()
+            .enumerate()
+            .all(|(j, (_, lane))| *lane == j as u32)
+        {
+            return first;
+        }
+        let mask = sources.iter().map(|(_, lane)| *lane as u8).collect();
+        return e.push(
+            vb,
+            vty.clone(),
+            Op::Shuffle {
+                a: first,
+                b: first,
+                mask,
+            },
+        );
+    }
+    let second = order[1];
+    let mask = sources
+        .iter()
+        .map(|(v, lane)| {
+            if *v == first {
+                *lane as u8
+            } else if *v == second {
+                (n + lane) as u8
+            } else {
+                0
+            }
+        })
+        .collect();
+    let mut acc = e.push(
+        vb,
+        vty.clone(),
+        Op::Shuffle {
+            a: first,
+            b: second,
+            mask,
+        },
+    );
+    for &next in &order[2..] {
+        let mask = sources
+            .iter()
+            .enumerate()
+            .map(|(j, (v, lane))| {
+                if *v == next {
+                    (n + lane) as u8
+                } else {
+                    j as u8
+                }
+            })
+            .collect();
+        acc = e.push(
+            vb,
+            vty.clone(),
+            Op::Shuffle {
+                a: acc,
+                b: next,
+                mask,
+            },
+        );
+    }
+    acc
 }
 
 /// Rebuild one lane-wise operation over parts, every operand widened to the result's parts.
@@ -3923,13 +4337,149 @@ mod tests {
         );
     }
 
-    /// Stride 2 is a strided access, not a contiguous vector load.
+    /// A stride-2 access with no partner at `2i + 1` is an interleave group with a gap: widening it
+    /// would load (and here store) elements the scalar loop never touches, and the last group's
+    /// window can run past the end of the buffer. It stays scalar.
     #[test]
     fn a_non_unit_stride_is_declined() {
         let src = "fn k(x: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
                    while i < n { o[i * 2] = x[i * 2]; i = i + 1; } } \
                    fn main() -> i32 { return 0; }";
         assert!(!is_widened(src, "k"), "stride 2 must stay scalar");
+    }
+
+    // ---- interleave groups ---------------------------------------------------------------------
+
+    /// A complex multiply over interleaved `(re, im)` pairs: two complete stride-2 load groups and
+    /// one complete stride-2 store group. Each load group is two contiguous `<4 x f32>` loads split
+    /// by shuffles; the store group is two shuffles back and two contiguous stores. The two stores
+    /// to `o` are one object at two different indices — the GCD test proves `2i` and `2i+1` never
+    /// meet, which is what lets the loop through the dependence check at all.
+    #[test]
+    fn a_complex_multiply_widens_through_interleave_groups() {
+        let kernel = "fn k(a: []f32, b: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
+                      while i < n { let ar: f32 = a[2 * i]; let ai: f32 = a[2 * i + 1]; \
+                      let br: f32 = b[2 * i]; let bi: f32 = b[2 * i + 1]; \
+                      o[2 * i] = ar * br - ai * bi; o[2 * i + 1] = ar * bi + ai * br; \
+                      i = i + 1; } }";
+        let (program, mut interner) =
+            optimized(&format!("{kernel} fn main() -> i32 {{ return 0; }}"), 2);
+        let f = program.function(interner.intern("k")).expect("no fn k");
+        let shuffles = f
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .filter(|i| matches!(i.op, Op::Shuffle { .. }))
+            .count();
+        assert!(
+            shuffles >= 6,
+            "expected the de/interleave shuffles of three groups, got {shuffles}"
+        );
+        scalar_and_vector_agree(&format!(
+            "{kernel} \
+             fn main() -> i32 {{ let mut a: []f32 = alloc_f32(46); let mut b: []f32 = alloc_f32(46); \
+             let mut o: []f32 = alloc_f32(46); \
+             let mut j: i64 = 0; while j < 46 {{ a[j] = ((j % 7) as f32) - 3.0; \
+             b[j] = ((j % 5) as f32) + 1.0; o[j] = -99.0; j = j + 1; }} \
+             k(a, b, o, 23); \
+             j = 0; while j < 46 {{ print(o[j] as i32); j = j + 1; }} \
+             free(a); free(b); free(o); return 0; }}"
+        ));
+    }
+
+    /// RGB pixels to gray: a stride-3 `u8` load group (three `<16 x u8>` loads per group, each
+    /// channel gathered from all three by two shuffles) feeding `f32` arithmetic in four parts —
+    /// interleave groups and mixed widths together.
+    #[test]
+    fn an_rgb_to_gray_conversion_widens() {
+        let kernel = "fn k(rgb: []u8, mut g: []f32, n: i64) { let mut i: i64 = 0; \
+                      while i < n { g[i] = 0.25 * (rgb[3 * i] as f32) + 0.5 * (rgb[3 * i + 1] as f32) \
+                      + 0.25 * (rgb[3 * i + 2] as f32); i = i + 1; } }";
+        assert!(
+            is_widened(&format!("{kernel} fn main() -> i32 {{ return 0; }}"), "k"),
+            "the RGB group did not widen"
+        );
+        scalar_and_vector_agree(&format!(
+            "{kernel} \
+             fn main() -> i32 {{ let mut rgb: []u8 = alloc_u8(111); let mut g: []f32 = alloc_f32(37); \
+             let mut j: i64 = 0; while j < 111 {{ rgb[j] = ((j * 37 + 11) as u8); j = j + 1; }} \
+             k(rgb, g, 37); \
+             j = 0; while j < 37 {{ print((g[j] * 4.0) as i32); j = j + 1; }} \
+             free(rgb); free(g); return 0; }}"
+        ));
+    }
+
+    /// Interleaved RoPE in place: `x[2i]`, `x[2i+1]` read as one group and written back as another
+    /// on the SAME object, beside unit-stride `cos`/`sin` streams. Each iteration reads its pair
+    /// before writing it, and the load group is emitted at its first member, the store group at its
+    /// last, so nothing is reordered against an access to the same element.
+    #[test]
+    fn an_in_place_interleaved_rope_widens() {
+        let kernel = "fn k(mut x: []f32, c: []f32, s: []f32, n: i64) { let mut i: i64 = 0; \
+                      while i < n { let x0: f32 = x[2 * i]; let x1: f32 = x[2 * i + 1]; \
+                      x[2 * i] = x0 * c[i] - x1 * s[i]; x[2 * i + 1] = x0 * s[i] + x1 * c[i]; \
+                      i = i + 1; } }";
+        assert!(
+            is_widened(&format!("{kernel} fn main() -> i32 {{ return 0; }}"), "k"),
+            "the in-place RoPE did not widen"
+        );
+        scalar_and_vector_agree(&format!(
+            "{kernel} \
+             fn main() -> i32 {{ let mut x: []f32 = alloc_f32(42); let mut c: []f32 = alloc_f32(21); \
+             let mut s: []f32 = alloc_f32(21); \
+             let mut j: i64 = 0; while j < 42 {{ x[j] = ((j % 9) as f32) - 4.0; j = j + 1; }} \
+             j = 0; while j < 21 {{ c[j] = ((j % 3) as f32) - 1.0; s[j] = ((j % 4) as f32) - 2.0; \
+             j = j + 1; }} \
+             k(x, c, s, 21); \
+             j = 0; while j < 42 {{ print(x[j] as i32); j = j + 1; }} \
+             free(x); free(c); free(s); return 0; }}"
+        ));
+    }
+
+    /// A stride-4 group, summed: four `<4 x f32>` loads per group and three shuffles per member.
+    #[test]
+    fn a_stride_four_group_widens() {
+        let kernel = "fn k(x: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
+                      while i < n { o[i] = x[4 * i] + x[4 * i + 1] * 2.0 + x[4 * i + 2] * 3.0 \
+                      + x[4 * i + 3] * 4.0; i = i + 1; } }";
+        assert!(
+            is_widened(&format!("{kernel} fn main() -> i32 {{ return 0; }}"), "k"),
+            "the stride-4 group did not widen"
+        );
+        scalar_and_vector_agree(&format!(
+            "{kernel} \
+             fn main() -> i32 {{ let mut x: []f32 = alloc_f32(92); let mut o: []f32 = alloc_f32(23); \
+             let mut j: i64 = 0; while j < 92 {{ x[j] = ((j % 11) as f32) - 5.0; j = j + 1; }} \
+             k(x, o, 23); \
+             j = 0; while j < 23 {{ print(o[j] as i32); j = j + 1; }} \
+             free(x); free(o); return 0; }}"
+        ));
+    }
+
+    /// A load moved to its group's first member must not cross a store to its own element: here the
+    /// second read of `x[2i]` happens AFTER `x[2i]` is rewritten and must see the new value. Whether
+    /// the optimizer forwards that store (and the group forms) or the read survives (and
+    /// `group_order_verdict` declines the loop), `-O2` must print what `-O0` prints — compared
+    /// directly, since either outcome is legal and only the answer is pinned.
+    #[test]
+    fn a_group_member_reading_its_own_store_keeps_the_scalar_answer() {
+        let src = "fn k(mut x: []f32, n: i64) { let mut i: i64 = 0; \
+                   while i < n { let x0: f32 = x[2 * i]; let x1: f32 = x[2 * i + 1]; \
+                   x[2 * i] = x0 + x1; x[2 * i + 1] = x[2 * i] * x1; i = i + 1; } } \
+                   fn main() -> i32 { let mut x: []f32 = alloc_f32(42); \
+                   let mut j: i64 = 0; while j < 42 { x[j] = ((j % 5) as f32) - 2.0; j = j + 1; } \
+                   k(x, 21); \
+                   j = 0; while j < 42 { print(x[j] as i32); j = j + 1; } \
+                   free(x); return 0; }";
+        let mut outs = Vec::new();
+        for level in [0u8, 2u8] {
+            let (program, mut interner) = optimized(src, level);
+            let main = interner.intern("main");
+            let run = wukong_interp::run_with_output(&program, main, &interner)
+                .unwrap_or_else(|e| panic!("-O{level}: {e}"));
+            outs.push((run.0, String::from_utf8_lossy(&run.1).to_string()));
+        }
+        assert_eq!(outs[0], outs[1], "-O0 and -O2 disagree");
     }
 
     // ---- if-conversion -------------------------------------------------------------------------

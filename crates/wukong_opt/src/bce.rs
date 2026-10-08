@@ -31,19 +31,23 @@
 //! The loop must be top-tested with `iv < end` (signed, or unsigned for an unsigned counter) on a
 //! header parameter stepping by exactly +1 from a `start` the preheader passes in. It then runs
 //! `iv = start, start+1, …, end-1` (when `start < end`), and `iv + 1` never wraps because
-//! `iv < end`. An eliminated check's index must be `±iv + Σ invariant` in `i64` (a widening cast is
-//! allowed directly on a narrower counter, `sext` for a signed one and `zext` for an unsigned one),
-//! so evaluated at `iv = start` and `iv = end - 1` it gives the two ends `a`, `b` of a run of
-//! consecutive values modulo 2^64. With `lo, hi` = `(a, b)` for `+iv` and `(b, a)` for `-iv`:
+//! `iv < end`. An eliminated check's index must be `k·iv + Σ invariant` in `i64` with a literal
+//! `|k| <= 4` (a widening cast is allowed directly on a narrower counter, `sext` for a signed one and
+//! `zext` for an unsigned one), so evaluated at `iv = start` and `iv = end - 1` it gives the two ends
+//! `a`, `b` of a run of values `k` apart modulo 2^64. With `lo, hi` = `(a, b)` for `k > 0` and
+//! `(b, a)` for `k < 0`:
 //!
 //! ```text
 //!     guard = lo <=u hi  &&  hi <u len
 //! ```
 //!
-//! If the run does not wrap, every value lies in `[lo, hi] ⊂ [0, len)`. If it wraps (once — it has
-//! at most 2^64 - 1 elements) then `hi < lo` unsigned and the guard fails. `len < 2^63` always, so a
-//! negative index fails exactly as the check would. An index that does not move (`iv` absent) is the
-//! single compare `idx <u len`.
+//! If the run does not wrap, every value lies in `[lo, hi] ⊂ [0, len)`. If it wraps once, then
+//! `hi < lo` unsigned and the guard fails. A unit step spans at most 2^64 - 1 values, so it can wrap
+//! at most once; a step of `|k| >= 2` could wrap twice and land back above `lo`, so for a 64-bit
+//! counter the guard also requires fewer than 2^61 iterations (`|k|·trip < 2^63`) — a narrower
+//! counter is widened before it is scaled and never gets near. `len < 2^63` always, so a negative
+//! index fails exactly as the check would. An index that does not move (`iv` absent) is the single
+//! compare `idx <u len`.
 //!
 //! # Where `len` comes from, and when it may be read early
 //!
@@ -100,6 +104,11 @@ const MAX_LOOP_BLOCKS: usize = 64;
 const MAX_VERSIONS_PER_CALL: usize = 32;
 /// How deep an index expression is followed.
 const MAX_EXPR_DEPTH: u32 = 16;
+/// The largest per-iteration step `|k|` an eliminated check's index `k·iv + Σ invariant` may have:
+/// an interleaved access (`s[2i]`, `s[2i + 1]`, `s[3i + 2]`) steps by its group size. The guard's
+/// one-wrap argument (module docs) needs the index run to span fewer than 2^64 values, which a
+/// bounded step and a bounded trip guarantee together (see [`emit_guard`]).
+const MAX_SCALE: i64 = 4;
 
 impl Pass for Bce {
     fn name(&self) -> &'static str {
@@ -265,7 +274,7 @@ struct CheckPlan {
     /// Where the check's `cmp ult` is, to mark it in the original loop.
     cmp_at: (u32, u32),
     idx: IdxExpr,
-    /// The index's coefficient on the induction variable: -1, 0 or +1.
+    /// The index's coefficient on the induction variable, `|coeff| <= MAX_SCALE`.
     coeff: i64,
     len: LenSrc,
 }
@@ -339,7 +348,7 @@ impl Ctx<'_> {
             .is_some_and(|b| !self.in_loop.contains(&b))
     }
 
-    /// `v` as `coeff · iv + invariant` with `coeff ∈ {-1, 0, 1}`, or `None`.
+    /// `v` as `coeff · iv + invariant` with `|coeff| <= MAX_SCALE`, or `None`.
     fn affine(&self, v: ValueId, depth: u32) -> Option<(IdxExpr, i64)> {
         if v == self.iv {
             return Some((IdxExpr::Iv, 1));
@@ -361,10 +370,49 @@ impl Ctx<'_> {
                 } else {
                     ca.checked_sub(cb)?
                 };
-                if c.abs() > 1 {
+                if c.abs() > MAX_SCALE {
                     return None;
                 }
                 Some((IdxExpr::Bin(*op, Box::new(ea), Box::new(eb), ty), c))
+            }
+            // A scaled counter, `k·iv` with a literal `k`: an interleaved access's index.
+            Op::Bin(BinOp::Mul, a, b) => {
+                let (ea, ca) = self.affine(*a, depth + 1)?;
+                let (eb, cb) = self.affine(*b, depth + 1)?;
+                // The literal may be defined anywhere (LICM hoists constants out of the loop, where
+                // `affine` reads them as opaque invariants), so read it off its definition.
+                let literal = |v: ValueId| match self.defs.op(self.f, v) {
+                    Some(Op::ConstInt(k, _)) => i64::try_from(*k).ok(),
+                    _ => None,
+                };
+                let c = if let Some(k) = literal(*b) {
+                    ca.checked_mul(k)?
+                } else if let Some(k) = literal(*a) {
+                    cb.checked_mul(k)?
+                } else {
+                    return None;
+                };
+                if c.abs() > MAX_SCALE {
+                    return None;
+                }
+                Some((IdxExpr::Bin(BinOp::Mul, Box::new(ea), Box::new(eb), ty), c))
+            }
+            // `x << s` with a literal `s` is `x · 2^s` (the shift amount is masked to the width,
+            // and `s <= 2` is far inside it).
+            Op::Bin(BinOp::Shl, a, b) => {
+                let Some(Op::ConstInt(s, _)) = self.defs.op(self.f, *b) else {
+                    return None;
+                };
+                if !(0..=2).contains(s) {
+                    return None;
+                }
+                let (ea, ca) = self.affine(*a, depth + 1)?;
+                let (eb, _) = self.affine(*b, depth + 1)?;
+                let c = ca.checked_mul(1i64 << *s)?;
+                if c.abs() > MAX_SCALE {
+                    return None;
+                }
+                Some((IdxExpr::Bin(BinOp::Shl, Box::new(ea), Box::new(eb), ty), c))
             }
             // A widening cast keeps consecutive counter values consecutive only in the counter's own
             // signedness: `sext` of a signed counter, `zext` of an unsigned one, and only directly on
@@ -719,12 +767,28 @@ fn emit_guard(
     };
     let no_wrap = push_inst(out, types, MirType::I1, Op::Cmp(CmpOp::Ule, lo, hi));
     let in_range = push_inst(out, types, MirType::I1, Op::Cmp(CmpOp::Ult, hi, len));
-    push_inst(
+    let ok = push_inst(
         out,
         types,
         MirType::I1,
         Op::Bin(BinOp::And, no_wrap, in_range),
-    )
+    );
+    // A scaled index on a 64-bit counter: only a run of fewer than 2^64 values can be recognized as
+    // wrapped by `hi <u lo` (module docs), so bound the trip to fewer than 2^61 iterations, which
+    // times `|coeff| <= 4` stays below 2^63. `last - start` is the trip minus one, non-negative
+    // because the guard only runs when `start < end`, so the unsigned compare is exact.
+    if c.coeff.abs() > 1 && types[start.0 as usize] == MirType::I64 {
+        let span = push_inst(out, types, MirType::I64, Op::Bin(BinOp::Sub, last, start));
+        let cap = push_inst(
+            out,
+            types,
+            MirType::I64,
+            Op::ConstInt(1 << 61, MirType::I64),
+        );
+        let short = push_inst(out, types, MirType::I1, Op::Cmp(CmpOp::Ult, span, cap));
+        return push_inst(out, types, MirType::I1, Op::Bin(BinOp::And, ok, short));
+    }
+    ok
 }
 
 /// Point every successor edge of `t` through `map`.
@@ -1200,6 +1264,32 @@ mod tests {
             );
             assert_eq!(run(&oob, 2).2, o0, "{call}");
         }
+    }
+
+    /// An interleaved index, `s[2i]` and `s[2i + 1]`: the step is 2, which the guard proves just like
+    /// a unit step (the loop vectorizer's interleave groups need the check-free copy). One pair past
+    /// the end must still stop at the same index, with the same message, as `-O0`.
+    #[test]
+    fn a_scaled_index_is_proved_and_still_stops_where_it_did() {
+        // [1..=8] as pairs (1,2), (3,4), (5,6), (7,8), folded as t*100 + a*10 + b: 12345678.
+        let body = "fn pairs(s: []i32, n: i64) -> i32 { let mut t: i32 = 0; \
+                    for i in 0..n { t = t * 100 + s[2 * i] * 10 + s[2 * i + 1]; } return t; }";
+        let ok = format!(
+            "{body} fn main() -> i32 {{ let a: [i32; 8] = [1, 2, 3, 4, 5, 6, 7, 8]; \
+             return pairs(a, 4); }}"
+        );
+        assert_eq!(run(&ok, 2).2, Ok(12345678));
+        assert_versioned(&ok, 1);
+        let oob = format!(
+            "{body} fn main() -> i32 {{ let a: [i32; 8] = [1, 2, 3, 4, 5, 6, 7, 8]; \
+             return pairs(a, 5); }}"
+        );
+        let (_, _, o0) = run(&oob, 0);
+        assert_eq!(
+            o0,
+            Err("index out of bounds: the len is 8 but the index is 8".to_owned())
+        );
+        assert_eq!(run(&oob, 2).2, o0);
     }
 
     #[test]

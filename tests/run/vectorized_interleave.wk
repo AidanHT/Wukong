@@ -1,0 +1,435 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: -8
+// EXPECT-OUT: -3
+// EXPECT-OUT: -4
+// EXPECT-OUT: 3
+// EXPECT-OUT: 11
+// EXPECT-OUT: 15
+// EXPECT-OUT: 3
+// EXPECT-OUT: -3
+// EXPECT-OUT: -14
+// EXPECT-OUT: -2
+// EXPECT-OUT: 1
+// EXPECT-OUT: -6
+// EXPECT-OUT: 17
+// EXPECT-OUT: -13
+// EXPECT-OUT: -13
+// EXPECT-OUT: -2
+// EXPECT-OUT: -3
+// EXPECT-OUT: -6
+// EXPECT-OUT: 13
+// EXPECT-OUT: 9
+// EXPECT-OUT: 3
+// EXPECT-OUT: -2
+// EXPECT-OUT: -11
+// EXPECT-OUT: -1
+// EXPECT-OUT: 5
+// EXPECT-OUT: -5
+// EXPECT-OUT: 12
+// EXPECT-OUT: -2
+// EXPECT-OUT: -23
+// EXPECT-OUT: -1
+// EXPECT-OUT: -2
+// EXPECT-OUT: -5
+// EXPECT-OUT: 10
+// EXPECT-OUT: 18
+// EXPECT-OUT: -12
+// EXPECT-OUT: -1
+// EXPECT-OUT: -8
+// EXPECT-OUT: -5
+// EXPECT-OUT: 4
+// EXPECT-OUT: -4
+// EXPECT-OUT: 7
+// EXPECT-OUT: -1
+// EXPECT-OUT: -18
+// EXPECT-OUT: -5
+// EXPECT-OUT: -1
+// EXPECT-OUT: 192
+// EXPECT-OUT: 636
+// EXPECT-OUT: 312
+// EXPECT-OUT: 500
+// EXPECT-OUT: 688
+// EXPECT-OUT: 364
+// EXPECT-OUT: 808
+// EXPECT-OUT: 228
+// EXPECT-OUT: 672
+// EXPECT-OUT: 348
+// EXPECT-OUT: 536
+// EXPECT-OUT: 724
+// EXPECT-OUT: 400
+// EXPECT-OUT: 844
+// EXPECT-OUT: 264
+// EXPECT-OUT: 708
+// EXPECT-OUT: 384
+// EXPECT-OUT: 572
+// EXPECT-OUT: 760
+// EXPECT-OUT: 436
+// EXPECT-OUT: 624
+// EXPECT-OUT: 300
+// EXPECT-OUT: 744
+// EXPECT-OUT: 164
+// EXPECT-OUT: 608
+// EXPECT-OUT: 284
+// EXPECT-OUT: 472
+// EXPECT-OUT: 660
+// EXPECT-OUT: 336
+// EXPECT-OUT: 780
+// EXPECT-OUT: 200
+// EXPECT-OUT: 644
+// EXPECT-OUT: 320
+// EXPECT-OUT: 508
+// EXPECT-OUT: 696
+// EXPECT-OUT: 372
+// EXPECT-OUT: 816
+// EXPECT-OUT: -2
+// EXPECT-OUT: 11
+// EXPECT-OUT: -1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: -5
+// EXPECT-OUT: -1
+// EXPECT-OUT: -8
+// EXPECT-OUT: -8
+// EXPECT-OUT: -5
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: -2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 11
+// EXPECT-OUT: -2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 7
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: -1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: -7
+// EXPECT-OUT: -4
+// EXPECT-OUT: -4
+// EXPECT-OUT: -3
+// EXPECT-OUT: -2
+// EXPECT-OUT: 1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 4
+// EXPECT-OUT: -2
+// EXPECT-OUT: 7
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: -2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: -30
+// EXPECT-OUT: 10
+// EXPECT-OUT: 6
+// EXPECT-OUT: -20
+// EXPECT-OUT: 20
+// EXPECT-OUT: -17
+// EXPECT-OUT: -10
+// EXPECT-OUT: 30
+// EXPECT-OUT: -29
+// EXPECT-OUT: 0
+// EXPECT-OUT: 40
+// EXPECT-OUT: -30
+// EXPECT-OUT: 10
+// EXPECT-OUT: 6
+// EXPECT-OUT: -20
+// EXPECT-OUT: 20
+// EXPECT-OUT: -17
+// EXPECT-OUT: -10
+// EXPECT-OUT: 30
+// EXPECT-OUT: -29
+// EXPECT-OUT: 0
+// EXPECT-OUT: 40
+// EXPECT-OUT: -30
+// EXPECT-OUT: -9000
+// EXPECT-OUT: -8999
+// EXPECT-OUT: -18000
+// EXPECT-OUT: -8300
+// EXPECT-OUT: -8299
+// EXPECT-OUT: -16600
+// EXPECT-OUT: -7600
+// EXPECT-OUT: -7599
+// EXPECT-OUT: -15200
+// EXPECT-OUT: -6900
+// EXPECT-OUT: -6899
+// EXPECT-OUT: -13800
+// EXPECT-OUT: -6200
+// EXPECT-OUT: -6199
+// EXPECT-OUT: -12400
+// EXPECT-OUT: -5500
+// EXPECT-OUT: -5499
+// EXPECT-OUT: -11000
+// EXPECT-OUT: -4800
+// EXPECT-OUT: -4799
+// EXPECT-OUT: -9600
+// EXPECT-OUT: -4100
+// EXPECT-OUT: -4099
+// EXPECT-OUT: -8200
+// EXPECT-OUT: -3400
+// EXPECT-OUT: -3399
+// EXPECT-OUT: -6800
+// EXPECT-OUT: -2700
+// EXPECT-OUT: -2699
+// EXPECT-OUT: -5400
+// EXPECT-OUT: -2000
+// EXPECT-OUT: -1999
+// EXPECT-OUT: -4000
+// EXPECT-OUT: -1300
+// EXPECT-OUT: -1299
+// EXPECT-OUT: -2600
+// EXPECT-OUT: -600
+// EXPECT-OUT: -599
+// EXPECT-OUT: -1200
+// EXPECT-OUT: 100
+// EXPECT-OUT: 101
+// EXPECT-OUT: 200
+// EXPECT-OUT: 800
+// EXPECT-OUT: 801
+// EXPECT-OUT: 1600
+// EXPECT-OUT: 1500
+// EXPECT-OUT: 1501
+// EXPECT-OUT: 3000
+// EXPECT-OUT: 2200
+// EXPECT-OUT: 2201
+// EXPECT-OUT: 4400
+// EXPECT-OUT: 2900
+// EXPECT-OUT: 2901
+// EXPECT-OUT: 5800
+// EXPECT-OUT: 3600
+// EXPECT-OUT: 3601
+// EXPECT-OUT: 7200
+// EXPECT-OUT: 4300
+// EXPECT-OUT: 4301
+// EXPECT-OUT: 8600
+// EXPECT-OUT: 5000
+// EXPECT-OUT: 5001
+// EXPECT-OUT: 10000
+// EXPECT-OUT: 5700
+// EXPECT-OUT: 5701
+// EXPECT-OUT: 11400
+// EXPECT-OUT: 6400
+// EXPECT-OUT: 6401
+// EXPECT-OUT: 12800
+// EXPECT-OUT: 7100
+// EXPECT-OUT: 7101
+// EXPECT-OUT: 14200
+// EXPECT-OUT: 7800
+// EXPECT-OUT: 7801
+// EXPECT-OUT: 15600
+// EXPECT-OUT: 8500
+// EXPECT-OUT: 8501
+// EXPECT-OUT: 17000
+// EXPECT-OUT: 9200
+// EXPECT-OUT: 9201
+// EXPECT-OUT: 18400
+// EXPECT-OUT: 9900
+// EXPECT-OUT: 9901
+// EXPECT-OUT: 19800
+// EXPECT-OUT: 10600
+// EXPECT-OUT: 10601
+// EXPECT-OUT: 21200
+// EXPECT-OUT: 11300
+// EXPECT-OUT: 11301
+// EXPECT-OUT: 22600
+// EXPECT-OUT: 12000
+// EXPECT-OUT: 12001
+// EXPECT-OUT: 24000
+// EXPECT-OUT: 12700
+// EXPECT-OUT: 12701
+// EXPECT-OUT: 25400
+// EXPECT-OUT: 13400
+// EXPECT-OUT: 13401
+// EXPECT-OUT: 26800
+// EXPECT-OUT: 14100
+// EXPECT-OUT: 14101
+// EXPECT-OUT: 28200
+// EXPECT-OUT: 14800
+// EXPECT-OUT: 14801
+// EXPECT-OUT: 29600
+// EXPECT-OUT: 15500
+// EXPECT-OUT: 15501
+// EXPECT-OUT: 31000
+// EXPECT-OUT: 16200
+// EXPECT-OUT: 16201
+// EXPECT-OUT: 32400
+
+module tests.run.vectorized_interleave
+
+// Interleaved accesses -- `x[k*i + r]` for every residue r of a stride k -- which the general loop
+// vectorizer (`wukong_opt::vectorize`) now widens as interleave groups: k contiguous vector loads
+// per part, split per member with lane shuffles, and the mirror image for stores. Before, any
+// access whose stride was not 1 kept its whole loop scalar.
+//
+// The kernels: a complex multiply over (re, im) pairs (two stride-2 load groups, one stride-2 store
+// group -- the two stores to `o` are proved never to meet by the GCD test), RGB pixels to gray (a
+// stride-3 `u8` load group feeding `f32` math in parts), an IN-PLACE interleaved RoPE (a load group
+// and a store group on the same buffer), a stride-4 weighted sum, and a stride-3 `i16` store group.
+// The slices are bounds-checked as usual: the check-free copy the loop needs comes from
+// bounds-check elimination, which now proves `s[2i + 1]`-shaped indices too.
+//
+// Odd trip counts (23, 37, 21) leave a scalar epilogue after the vector part. Every element of
+// every output is printed, and every expectation was derived by hand from the scalar semantics of
+// the loop (all values are small integers, exact in f32, so no rounding question arises):
+//
+//   cmul     o[2i] = ar*br - ai*bi, o[2i+1] = ar*bi + ai*br, a = (j % 7) - 3, b = (j % 5) + 1.
+//   gray     4*g = r + 2*g + b over rgb = (37j + 11) mod 256.
+//   rope     x[2i], x[2i+1] <- (x0*c - x1*s, x0*s + x1*c), x = (j % 9) - 4, c = (j % 3) - 1,
+//            s = (j % 4) - 2, all 42 elements printed after the call.
+//   stride4  o = x0 + 2*x1 + 3*x2 + 4*x3 over x = (j % 11) - 5.
+//   expand   o[3i] = v, o[3i+1] = v + 1, o[3i+2] = 2*v at i16, v = 700i - 9000.
+//
+// Re-check that the loops really widen (interp and native agree whether or not they do):
+//     wukongc --emit=mir -O2 tests/run/vectorized_interleave.wk | grep shuffle
+
+fn cmul(a: []f32, b: []f32, mut o: []f32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        let ar: f32 = a[2 * i];
+        let ai: f32 = a[2 * i + 1];
+        let br: f32 = b[2 * i];
+        let bi: f32 = b[2 * i + 1];
+        o[2 * i] = ar * br - ai * bi;
+        o[2 * i + 1] = ar * bi + ai * br;
+        i = i + 1;
+    }
+}
+
+fn gray(rgb: []u8, mut g: []f32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        g[i] = 0.25 * (rgb[3 * i] as f32) + 0.5 * (rgb[3 * i + 1] as f32) + 0.25 * (rgb[3 * i + 2] as f32);
+        i = i + 1;
+    }
+}
+
+fn rope(mut x: []f32, c: []f32, s: []f32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        let x0: f32 = x[2 * i];
+        let x1: f32 = x[2 * i + 1];
+        x[2 * i] = x0 * c[i] - x1 * s[i];
+        x[2 * i + 1] = x0 * s[i] + x1 * c[i];
+        i = i + 1;
+    }
+}
+
+fn stride4(x: []f32, mut o: []f32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        o[i] = x[4 * i] + x[4 * i + 1] * 2.0 + x[4 * i + 2] * 3.0 + x[4 * i + 3] * 4.0;
+        i = i + 1;
+    }
+}
+
+fn expand(v: []i16, mut o: []i16, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        o[3 * i] = v[i];
+        o[3 * i + 1] = v[i] + (1 as i16);
+        o[3 * i + 2] = v[i] * (2 as i16);
+        i = i + 1;
+    }
+}
+
+fn main() -> i32 {
+    let mut a: []f32 = alloc_f32(46i64);
+    let mut b: []f32 = alloc_f32(46i64);
+    let mut o: []f32 = alloc_f32(46i64);
+    let mut j: i64 = 0;
+    while j < 46 {
+        a[j] = ((j % 7) as f32) - 3.0;
+        b[j] = ((j % 5) as f32) + 1.0;
+        o[j] = -99.0;
+        j = j + 1;
+    }
+    cmul(a, b, o, 23);
+    j = 0;
+    while j < 46 {
+        print(o[j] as i32);
+        j = j + 1;
+    }
+
+    let mut rgb: []u8 = alloc_u8(111i64);
+    let mut g: []f32 = alloc_f32(37i64);
+    j = 0;
+    while j < 111 {
+        rgb[j] = (j * 37 + 11) as u8;
+        j = j + 1;
+    }
+    gray(rgb, g, 37);
+    j = 0;
+    while j < 37 {
+        print((g[j] * 4.0) as i32);
+        j = j + 1;
+    }
+
+    let mut x: []f32 = alloc_f32(42i64);
+    let mut c: []f32 = alloc_f32(21i64);
+    let mut s: []f32 = alloc_f32(21i64);
+    j = 0;
+    while j < 42 {
+        x[j] = ((j % 9) as f32) - 4.0;
+        j = j + 1;
+    }
+    j = 0;
+    while j < 21 {
+        c[j] = ((j % 3) as f32) - 1.0;
+        s[j] = ((j % 4) as f32) - 2.0;
+        j = j + 1;
+    }
+    rope(x, c, s, 21);
+    j = 0;
+    while j < 42 {
+        print(x[j] as i32);
+        j = j + 1;
+    }
+
+    let mut x4: []f32 = alloc_f32(92i64);
+    let mut o4: []f32 = alloc_f32(23i64);
+    j = 0;
+    while j < 92 {
+        x4[j] = ((j % 11) as f32) - 5.0;
+        j = j + 1;
+    }
+    stride4(x4, o4, 23);
+    j = 0;
+    while j < 23 {
+        print(o4[j] as i32);
+        j = j + 1;
+    }
+
+    let mut v: []i16 = alloc_i16(37i64);
+    let mut e: []i16 = alloc_i16(111i64);
+    j = 0;
+    while j < 37 {
+        v[j] = (j * 700 - 9000) as i16;
+        j = j + 1;
+    }
+    expand(v, e, 37);
+    j = 0;
+    while j < 111 {
+        print(e[j] as i32);
+        j = j + 1;
+    }
+
+    free(a);
+    free(b);
+    free(o);
+    free(rgb);
+    free(g);
+    free(x);
+    free(c);
+    free(s);
+    free(x4);
+    free(o4);
+    free(v);
+    free(e);
+    return 0;
+}
