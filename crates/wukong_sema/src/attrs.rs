@@ -5,19 +5,21 @@
 //! discarded* — so `@parellel` (a typo of `@parallel`) compiled to a single-threaded program with no
 //! diagnostic at all, which is exactly the failure mode an attribute is supposed to prevent.
 //!
-//! The set below is closed on purpose. `parallel`, `generic`, `tile` and `extern` are the four the
-//! language intends to consume; `inline`, `simd`, `align` and `export` are parsed-and-discarded
-//! today and stay in the set so existing programs keep compiling. Anything else is an error, which
-//! also means a future attribute cannot be *used* before it is *implemented*.
+//! The set below is closed on purpose. `parallel`, `generic`, `tile`, `extern` and `strict_fp` are
+//! the ones the language intends to consume; `inline`, `simd`, `align` and `export` are
+//! parsed-and-discarded today and stay in the set so existing programs keep compiling. Anything
+//! else is an error, which also means a future attribute cannot be *used* before it is
+//! *implemented*.
 //!
 //! Placement is checked here too, but only where a misplaced attribute would be a silent lie.
-//! `@generic` (suppress the kernel recognizers for one function, see `wukong_mir_build`) is read
-//! from the **function item**, so accepting it on a statement would promise a per-loop opt-out that
-//! nothing implements. `@tile` is read from the function item (into a width queue) or from the
-//! `for` statement it sits on, and from nowhere else — so on a `struct`, a parameter, a `let` or a
-//! `while` it used to be accepted and dropped, a schedule written on a loop being the sharpest of
-//! those. Every other attribute's placement is unchecked in v1 — the ones that are discarded are
-//! discarded wherever they appear.
+//! `@generic` (suppress the kernel recognizers for one function, see `wukong_mir_build`) and
+//! `@strict_fp` (evaluate that function's float arithmetic in source order, no FMA contraction or
+//! reduction reassociation) are read from the **function item**, so accepting either on a statement
+//! would promise a per-loop opt-out that nothing implements. `@tile` is read from the function item
+//! (into a width queue) or from the `for` statement it sits on, and from nowhere else — so on a
+//! `struct`, a parameter, a `let` or a `while` it used to be accepted and dropped, a schedule
+//! written on a loop being the sharpest of those. Every other attribute's placement is unchecked
+//! in v1 — the ones that are discarded are discarded wherever they appear.
 //!
 //! This walk is independent of name resolution and types (an attribute names no value), so
 //! [`check`] runs before the collection pass and reports every offending attribute in one go.
@@ -26,14 +28,22 @@ use wukong_ast::{Attr, Block, Expr, ExprKind, ForIter, Item, ItemKind, Module, S
 use wukong_diag::Diagnostic;
 use wukong_span::Interner;
 
-/// Every attribute name the v1 language accepts, in the order the diagnostic lists them: the four
+/// Every attribute name the v1 language accepts, in the order the diagnostic lists them: the ones
 /// that are (or are being) consumed first, then the four that are parsed and discarded.
 pub const KNOWN_ATTRS: &[&str] = &[
-    "parallel", "generic", "tile", "extern", "inline", "simd", "align", "export",
+    "parallel",
+    "generic",
+    "tile",
+    "extern",
+    "strict_fp",
+    "inline",
+    "simd",
+    "align",
+    "export",
 ];
 
 /// Attributes that are read from a function item and therefore mean nothing anywhere else.
-const FN_ITEM_ONLY: &[&str] = &["generic"];
+const FN_ITEM_ONLY: &[&str] = &["generic", "strict_fp"];
 
 /// Attributes read from a function item **or** from the `for` statement they sit on, and nowhere
 /// else. `@tile` is a loop schedule: `lower_program_with` reads it off the `fn` into a width queue
@@ -338,6 +348,27 @@ mod tests {
             codes("@generic\nstruct S { x: i32 }"),
             vec!["E0306"],
             "struct"
+        );
+    }
+
+    /// `@strict_fp` is read off the function item too: on a loop it would read as "this loop is
+    /// strict" while the lowering never looks there, so it is rejected rather than ignored.
+    #[test]
+    fn strict_fp_is_rejected_off_a_fn_item() {
+        assert_eq!(
+            codes("fn f(mut o: [f32; 4]) { @strict_fp for i in 0..4 { o[i] = 1.0; } }"),
+            vec!["E0306"],
+            "for statement"
+        );
+        assert_eq!(
+            codes("fn f(@strict_fp x: f32) {}"),
+            vec!["E0306"],
+            "parameter"
+        );
+        assert_eq!(
+            codes("@strict_fp\nfn f(x: f32, y: f32, z: f32) -> f32 { return x + y * z; }"),
+            Vec::<&str>::new(),
+            "fn item"
         );
     }
 

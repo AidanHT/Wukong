@@ -461,6 +461,7 @@ runtime size is outside the defined contract, like any runtime index
 
 ```wukong
 @generic
+@strict_fp
 @inline
 @simd
 @tile(64, 64)
@@ -472,19 +473,20 @@ runtime size is outside the defined contract, like any runtime index
 
 Attribute *syntax* is parsed on functions, parameters and statements (a missing argument value is
 `E0207`), and the attribute **name is validated against a closed set** (✅): `@parallel`, `@generic`,
-`@tile`, `@extern`, `@inline`, `@simd`, `@align`, `@export`. Anything else — `@bogus(1, 2)`, and far
+`@tile`, `@extern`, `@strict_fp`, `@inline`, `@simd`, `@align`, `@export`. Anything else — `@bogus(1, 2)`, and far
 more usefully a typo of a real one such as `@parellel` — is **`E0306`**, where it used to be accepted
-and discarded in silence (`tests/fail/unknown_attr.wk`, `unknown_attr_typo.wk`). Three attributes have
+and discarded in silence (`tests/fail/unknown_attr.wk`, `unknown_attr_typo.wk`). Four attributes have
 a consumer on a **function**: **`@parallel`** (✅), which makes its loop execute across CPU cores,
-**`@generic`** (✅), which opts the function out of the kernel recognizers (below), and **`@tile`** (✅),
+**`@generic`** (✅), which opts the function out of the kernel recognizers (below), **`@strict_fp`**
+(✅), which evaluates the function's float arithmetic in source order (below), and **`@tile`** (✅),
 which strip-mines loops (below).
 Everything else in the list above — `@inline`, `@simd`, `@align`, `@extern`, `@export`, and
 `@parallel`'s own `grain = …` argument — is parsed and discarded (🔵). `@tile` is consumed as loop
 strip-mining (see below), and when it cannot be applied it is **`E0309`**, not a silent drop. A
 *discarded* attribute on a statement or loop is dropped there too:
 `@parallel` must sit on the function, and the mid-function parallel region is derived from the enclosing function's
-attribute, not from one written on the loop. `@generic` in that position is an error, not a silent
-drop.
+attribute, not from one written on the loop. `@generic` and `@strict_fp` in that position are an
+error, not a silent drop.
 
 ### `@generic` — “I meant this loop” ✅
 
@@ -500,7 +502,8 @@ fn saxpy(a: f32, x: [f32; 4], y: [f32; 4], mut out: [f32; 4]) {
 probes fire inside it, so its loops are compiled as written (auto-vectorized, but not replaced by a
 tuned `wukong_*` kernel). Everything that is *not* a recognizer still applies — auto-vectorization,
 loop fusion, FMA contraction, `@parallel` outlining, and the whole optimizer — and the builtins you
-call by name (`alloc_f32`, `read_f32`, `sdpa`, …) still lower to their runtime entry points.
+call by name (`alloc_f32`, `read_f32`, `sdpa`, …) still lower to their runtime entry points. To also
+turn off FMA contraction and reduction reassociation, use `@strict_fp` (which implies `@generic`).
 
 Two reasons to reach for it. First, honesty: a recognized kernel is invisible to every behavioral
 gate, so `@generic` is how you write the loop you want measured (`tests/run/lang_generic_saxpy.wk`,
@@ -523,6 +526,16 @@ it, or a mid-function region whose modelled body-local is reassigned inside an i
 result is always correct — the fallback is the ordinary scalar/vectorized loop — but the parallel
 speedup is silently absent, so check with `wukongc --emit=mir -O2 f.wk | grep wukong_parallel_for`.
 Fixtures: `tests/run/parallel_control_flow.wk`, `parallel_region_reassigned_local.wk`.
+
+"Correct" here means *a* correct evaluation of the program under the fast floating-point contract,
+not *the same bits*. An `f32` **reduction** has three possible summation orders depending on how it
+is compiled — the source's left-to-right fold (`@strict_fp`, or a loop no path vectorizes), the
+sequential vectorizer's lane-partitioned tree, and the `@parallel` reduction kernel's fixed
+8192-element chunks (see [Floating-point semantics](#floating-point-semantics-)) — and adding
+`@parallel`, removing it, or making the reduction loop decline (a `step`, an `..=` range, an `f64`
+accumulator) moves the loop between the last two, which changes low-order bits. Each order is
+deterministic on its own: independent of thread count, `-O` level, backend and host. Write
+`@strict_fp` when the bits must not depend on the spelling.
 
 Sequential vectorized **f32 reductions** that fit the wide arithmetic recipe use one logical
 eight-lane partition on both the 128-bit and 256-bit paths. The recipe's register pressure fixes
@@ -600,6 +613,47 @@ case rather than being an f32-only gate: a `bf16`/`f16` array read through the e
 (`tests/run/parallel_reduce_lowp.wk`), while the *uncast* spelling `s = s + x[k]` stays a scalar loop
 (`tests/run/parallel_reduce_elem_bf16.wk`); an `f64` reduction has no kernel and always declines.
 Explicit `@simd`-typed vector values are still under construction (🔵); `@tile` ships (next section).
+
+### `@strict_fp` — source-order floating point ✅
+
+```wukong
+@strict_fp
+fn residual(x: f32, w: f32, b: f32) -> f32 {
+    return x + w * b;            // a rounded multiply, then a rounded add: no FMA
+}
+```
+
+`@strict_fp` on a **function** evaluates that function's floating-point arithmetic exactly as
+written: left to right, one IEEE-754 rounding per `+ - * /`, no fused multiply-add, no reassociated
+reduction. Concretely, inside the function
+
+- **no FMA contraction**: `x + y*z` is `round(x + round(y*z))`, in scalar code, in a vectorized
+  loop body and in its scalar remainder alike;
+- **float reductions keep their sequential fold**: `s = s + x[i]` adds the elements in index order
+  (it may still run SIMD loads and multiplies, but the additions stay one chain). Integer reductions
+  are exact in any order and still vectorize, and so do elementwise loops, whose lane `k` performs
+  exactly the operations of scalar iteration `i + k`;
+- **no kernel recognizers** — `@strict_fp` implies `@generic`, because a recognized GEMM,
+  reduction or norm kernel brings its own blocking, accumulator tree and FMA use. `@parallel` still
+  outlines independent iterations; a reduction in a strict `@parallel` function runs serially.
+
+What it does not change: the definition of a math intrinsic (`exp`, `fmax`, …) or of a named kernel
+builtin (`sdpa`, …) — those are functions with their own documented algorithms, which may use FMA
+internally. A strict function always gets an intrinsic's *inlined* form; an elementwise loop that a
+fast function would have dispatched to `wukong_vmath_f32` therefore uses the inlined polynomial,
+which matches the kernel except where [Math intrinsics](#math-intrinsics-) says otherwise (the
+standalone `tanh` kernel is a different approximation). Strictness is
+a property of the function *body*: a fast function called from a strict one keeps its contractions,
+even after the optimizer inlines it, and vice versa (`tests/run/strict_fp.wk`). The optimizer itself
+never reassociates, contracts, or applies algebraic float identities in either mode, so the choice is
+fixed at lowering and is identical at every `-O` level and on both backends.
+
+`--fp=strict` applies the attribute to every function of the program (`tests/run/strict_fp_cli.wk`);
+it is refused with `--emit=grad`/`--train`, whose VJP rules need the recognized kernels. Like
+`@generic`, `@strict_fp` must sit on the `fn` — on a statement, loop or parameter it is **`E0306`**.
+Strict code gives up FMA throughput, reduction ILP and the tuned kernels; reach for it where the
+result must match a reference evaluated in source order (a C/NumPy port, a checksum, a numerical
+test), not as a default.
 
 ### `@tile` — loop strip-mining ✅
 
@@ -780,6 +834,99 @@ exp-composed `1 − 2/(exp(2x) + 1)` as their *internal* building block, because
 kernels are built on it and each activation stays bit-identical to its kernel; that block is not
 the language's `tanh`. On `f64` every spelling is the double-precision runtime `tanh`.
 
+## Floating-point semantics ✅
+
+Wukong's float model is IEEE-754 binary32/binary64, round-to-nearest-ties-to-even, in one of two
+modes. **fast** (the default, `--fp=fast`) licenses exactly two value-changing transformations —
+FMA contraction and reassociation of float reductions — plus the substitution of a recognized
+kernel, which brings its own documented order. **strict** (`@strict_fp` on a function,
+`--fp=strict` for the program; see [`@strict_fp`](#strict_fp--source-order-floating-point-)) licenses
+none of them. Everything else holds in both modes:
+
+- `+ - * /` and `sqrt` on `f32`/`f64` are correctly rounded IEEE operations. Subnormal inputs and
+  results are honoured (no flush-to-zero or denormals-are-zero mode is ever set), and NaN, ±∞ and
+  signed zero follow IEEE: nothing assumes finite math or ignores the sign of zero. The optimizer
+  applies **no algebraic float rewrite** (`x + 0.0`, `x * 0.0`, `x / c → x * (1/c)`, `x - x` are
+  left alone) and constant-folds each operation at its own precision.
+- `bf16`/`f16` arithmetic is carried out in `f32` and rounded to the half grid at every value.
+- Comparisons are IEEE-ordered: `==`, `<`, `<=`, `>`, `>=` are false when either side is NaN and
+  `!=` is true. `fmax(a, b)` is `a > b ? a : b` and `fmin(a, b)` is `a < b ? a : b` — the x86
+  `maxps`/`minps` rule, *not* IEEE `maxNum`: with a NaN in either operand, or a `+0`/`-0` tie, they
+  return `b`.
+- A float→int `as` cast saturates, and NaN converts to 0.
+- For a given mode, every backend (interpreter, native JIT, AOT objects) and every `-O` level
+  computes the same bits. The mode is decided once, during lowering; the optimizer never
+  contracts or reassociates, Cranelift lowers `fadd`/`fmul` as written, and the LLVM-IR emitter
+  writes plain `fadd`/`fmul` with no fast-math flags and an `Op::Fma` as the `llvm.fma` intrinsic.
+
+**FMA contraction (fast mode).** A binary `+` with a `*` operand becomes one fused multiply-add,
+rounded once (`tests/run/fp_contract_rules.wk` pins every clause):
+
+- `x + y*z` and `y*z + x` both become `fma(y, z, x)`. Parentheses are not significant, so
+  `x + (y*z)` contracts too; `x + a*b*c` fuses its top-level product, `fma(round(a*b), c, x)`.
+- When **both** operands are products the **left** one is fused: `a*b + c*d` is
+  `fma(a, b, round(c*d))`. Which product wins changes the result, so swapping the operands of such a
+  `+` is a numerical edit, not a refactor.
+- Never contracted: `x - y*z`; a product reached through a binding (`let p = y*z; x + p`); and a
+  compound `s += y*z` outside a vectorized float reduction, which rounds the product first (the
+  spelling `s = s + y*z` contracts).
+- A vectorized float reduction accumulates `s += x[i]*y[i]` (either spelling) with one FMA per
+  lane — part of the reduction tree below.
+- A vectorized loop body, its 256-bit recipe and its scalar remainder apply the identical rule, so
+  every lane of one loop agrees.
+
+This is the contract of Clang's `-ffp-contract=on` (fusion within one expression, never across
+statements). GCC's GNU-dialect default, `-ffp-contract=fast`, also fuses across statements; Wukong
+never does. `--fp=strict` / `@strict_fp` is `-ffp-contract=off`.
+
+**Reduction order (fast mode).** A float sum loop `s = s + e(i)` (or `s += e(i)`) is reassociated,
+into one of two fixed trees depending on how it is compiled:
+
+- **Sequential vectorized**: the vectorizer's lane-partitioned tree — `U` independent eight-lane
+  accumulators (`U` from the recipe's register pressure), combined in accumulator order, then lanes
+  0–7 folded in order, then the loop's initial value, then the scalar tail. The partition depends on
+  the expression only, never on the host ISA, the 2,048-element 256-bit threshold or
+  `WUKONG_P4_NO_256` (the `@parallel` paragraph under [Attributes](#attributes-) and
+  `docs/internals.md` give the full rule). Other float element types keep the portable 128-bit
+  partition.
+- **`@parallel` reduction kernel**: in a `@parallel` function a recognized `f32` reduction (dot
+  product, sum, squared distance, max/min/absmax — the shapes listed under
+  [Attributes](#attributes-)) calls
+  `wukong_sreduce_f32_parallel`. The array is cut into **fixed 8,192-element chunks**; within a
+  chunk, lane `j` of eight accumulates the elements `≡ j (mod 8)` (one FMA per element for the
+  product forms), the lanes combine as `((l0+l1)+(l2+l3))+((l4+l5)+(l6+l7))`, and the chunk
+  partials fold in ascending chunk order. `bf16`/`f16` reductions widen to `f32` and cut on the same
+  boundary. The result is the same on one core or sixteen, natively or in the interpreter.
+
+The two trees differ from each other and from the source's left-to-right fold, so adding or removing
+`@parallel` — or a reduction declining the kernel (a `step`, an `..=` range, an `f64` accumulator) —
+changes low-order bits; see the `@parallel` note under [Attributes](#attributes-). Max/min reductions
+use the same trees; their finite non-zero result is order-independent, but because `fmax`/`fmin`
+return `b` on a NaN or a `±0` tie, *which* NaN or which zero survives can depend on the order.
+
+*Why 8,192.* The chunk length is part of the numerical contract, not a cache-tuning knob. It is
+fixed — the same on every host — because the serial kernel, the parallel kernel and the interpreter
+must cut the array at the same boundaries to agree. A streaming reduction reads each element once,
+so a chunk's cache residency buys nothing; the length only sets how many independent tasks exist
+(128 at 2^20 elements) and how long the partial array is, and load balancing can be tuned by how
+many chunks one task claims without moving a bit. Changing 8,192 would change every recognized
+reduction's result, so like the vectorizer's partition it changes only with a compiler release.
+
+**Recognized kernels (fast mode).** A loop nest the compiler recognizes is replaced by a tuned
+runtime kernel that evaluates the same mathematical expression in its own documented order — a GEMM
+blocks and packs the `K` sum and accumulates with FMA, a fused softmax/norm kernel reduces each row
+with its own lane tree. The result is deterministic and identical across backends, thread counts and
+`-O` levels, but it is not the source's order; `@generic` keeps the loop (with contraction and the
+vectorizer's reduction tree), `@strict_fp` keeps the source order.
+
+**NaN in the math intrinsics.** Every math intrinsic returns a NaN for a NaN argument. *Which* NaN
+(sign and payload) is pinned only where the runtime documents it — its elementwise kernels return
+the input NaN, quieted, for `exp`, `log`, `tanh`, `atan`, `asinh`, `cbrt`, `silu`, `mish`, `sinh`,
+`cosh` and `hardsigmoid` (the per-op table heads `wukong_runtime/src/vmath.rs`). The exceptions are by
+definition: `fmax`/`fmin` (the `maxps` rule above), `pow(x, ±0) = pow(1, y) = 1`, `hypot(±∞, NaN) = +∞`,
+and a ReLU *written* as `if x > 0.0 { x } else { 0.0 }`, which maps NaN to `0` because the source
+comparison does — the recognized ReLU kernel computes exactly that.
+
 ## Memory and parallelism
 
 **Heap allocation runs today** (✅): `alloc_<T>(n)` returns a **zero-initialized** slice `[]T` of
@@ -918,6 +1065,9 @@ wukongc [OPTIONS] <input.wk>
 --train-seed=<n>      seed for the deterministic buffer initialization      (default: 0x5EED1234)
 --train-weight-decay=<f>  AdamW decoupled decay; finite, non-negative       (default: 0)
 -O0|-O1|-O2|-O3       optimization level (default: -O0; -O3 currently runs the -O2 pipeline)
+--fp=<mode>           fast | strict   (default: fast). strict = @strict_fp on every function: no
+                      FMA contraction, source-order float reductions, no kernel recognizers (see
+                      "Floating-point semantics"). Rejected with --emit=grad and --train (exit 1).
 -o <path>             write the artifact to <path> — only with --emit=obj or --emit=exe (default:
                       <stem>.o for objects; executables get <stem>.exe on Windows and plain <stem>
                       on unix). Rejected with --run and with every other stage, which print their

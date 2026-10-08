@@ -33,6 +33,27 @@
 //! one table only is a test failure, not a silent scalar fallback:
 //! `vmath_op_tables_cover_the_declared_code_space` pins the mirroring.
 //!
+//! CONTRACT — **NaN in, NaN out** (W16/FINDING-05, P9.7). Every one of the 36 ops returns a NaN for
+//! a NaN input, on the 8-lane path, the scalar tail and the no-AVX2 fallback alike, with the single
+//! exception that is the op's definition: `relu` is `x > 0 ? x : 0`, the `maxps` rule and the source
+//! spelling (`if x > 0.0 { x } else { 0.0 }`) the recognizer lowers here, so NaN → `+0` and
+//! `-0` → `+0`. Where the NaN's sign and payload are part of the contract, the op returns the input
+//! NaN with the quiet bit set (`x | 0x0040_0000`); elsewhere it is "some NaN", identical on every
+//! path of this crate but not otherwise promised. The per-op table — keep it in step with
+//! `vmath_every_op_returns_nan_for_nan`, which asserts it:
+//!
+//! | op | NaN input | other exceptional inputs |
+//! |---|---|---|
+//! | `exp` | quiet(x) | `+∞→+∞`, `−∞→+0`; finite `x > EXP_HI` saturates to `0x7F35_04A4`, very negative flushes to `+0` |
+//! | `log` | quiet(x) | `±0→−∞`, `+∞→+∞`, `x < 0 →` default NaN; positive subnormals are normalized (exact) |
+//! | `tanh`, `atan`, `asinh`, `cbrt` | quiet(x) | odd: `±0→±0` (copysign endings) |
+//! | `sin`, `cos` | quiet(x) | `±∞ →` default NaN; `sin(±0) = ±0` |
+//! | `silu`, `mish`, `sinh`, `cosh` | quiet(x) | — |
+//! | `hardsigmoid`, `hardswish` | quiet(x) | the clamp's bounds `0`/`1` for finite inputs only |
+//! | `relu` | `+0` | `−0 → +0` (by definition, above) |
+//! | `softplus`, `logsigmoid` | NaN | `softplus(+0)` and `softplus(−0)` are the same bits (≈ ln 2) |
+//! | every other op | NaN | per its doc comment (`expm1`, `log1p`, `atanh` endpoints, …) |
+//!
 //! The per-element op sequence mirrors the inlined MIR polynomials in `wukong_mir_build`
 //! (`emit_exp_f32` / `emit_log_f32`) — same Cephes constants, same FMA structure — so a dispatched
 //! `exp(x)` agrees with a composed/scalar `exp(x)`. The scalar tail and the no-AVX2 fallback use the
@@ -318,7 +339,9 @@ pub(crate) fn exp1(x: f32) -> f32 {
 
 /// `ln(x)` for `x > 0` (max 12 ULP where `ln(x) → 0` near x = 1, i.e. 6.924e-7 relative, exhaustive
 /// over every positive normal f32 and well inside the 5e-5 gate — see the table block above and
-/// `vmath_exp_log_exhaustive_ulp`):
+/// `vmath_exp_log_exhaustive_ulp`). The domain really is every `x > 0`: a positive subnormal is
+/// scaled by an exact 2^23 and `k` lowered by 23 before the reduction, and pass 4 of the same
+/// exhaustive test asserts the 1e-6 relative bar over all 8,388,607 of them (P9.24):
 /// the 8-bucket table reduction `ln(x) = k·ln2 + L[j] + poly(s)`, `s = fma(z, R[j], −1)`, with the
 /// degree-5 Taylor tail and the same hi/lo `ln2` split `exp` uses. Mirrors the AVX2 [`log8`] lanes
 /// op-for-op — the array index here IS the `vpermps` there (same 3 bits, same f32 constants), and
@@ -565,9 +588,16 @@ fn leakyrelu1(x: f32) -> f32 {
 /// `max(x,0) + ln(1 + e^{−|x|})` so the `exp` never overflows for large positive `x` (it saturates to
 /// `x`) and underflows cleanly to 0 for large negative `x`. Reuses [`exp1`]/[`log1`], so the AVX2
 /// [`softplus8`], the tail, and the composed scalar MIR agree.
+///
+/// The `max(x, 0)` is spelled `x > 0 ? x : 0` — `_mm256_max_ps(x, 0)` by definition, and the MIR's
+/// `Cmp(Fogt)` + `Select` — never `f32::max`, which Rust documents as returning *either* operand
+/// for `±0` (crate invariant #2). The sum is the same on every input today (the `ln` term is ≥ 0, so
+/// a `-0` there could only be absorbed), but a twin whose bits rest on an unspecified choice is not
+/// a twin. `vmath_relu_softplus_signed_zero_and_nan` pins `±0` and NaN on every path.
 #[inline]
 fn softplus1(x: f32) -> f32 {
-    x.max(0.0) + log1(1.0 + exp1(-x.abs()))
+    let relu = if x > 0.0 { x } else { 0.0 };
+    relu + log1(1.0 + exp1(-x.abs()))
 }
 
 /// `mish(x) = x · tanh(softplus(x))` — the smooth, self-gated activation (YOLOv4 / modern vision).
@@ -623,17 +653,26 @@ fn logsigmoid1(x: f32) -> f32 {
 
 /// `hardsigmoid(x) = clamp(x+3, 0, 6)/6` — the cheap piecewise-linear sigmoid of MobileNetV3 /
 /// EfficientNet. The clamp is written as the manual branches that match `_mm256_max_ps`/`_mm256_min_ps`
-/// (and the `Cmp+Select` MIR) bit-for-bit on NaN/±0 — `v>0`/`v<6` are false for NaN, so it returns the
-/// bound, exactly as the SSE max/min instructions do (the same trick `velem`'s relu6 uses).
+/// (and the `Cmp+Select` MIR) bit-for-bit on ±0.
+///
+/// **NaN in, NaN out** (P9.7, the PyTorch contract): the clamp's ordered compares are false on a
+/// NaN, so on its own it would turn a NaN into the bound `0` — a diverged activation silently
+/// becoming a plausible value. A NaN input therefore selects `y = x + 3` instead, which is the
+/// input NaN quieted (sign and payload kept), and `y·(1/6)` keeps it. The selection is a compare +
+/// select rather than a bit-twiddle so the composed MIR stays differentiable (`wukong_autodiff`
+/// has a VJP for `Select`, none for a bitcast); the clamp and its kink subgradients are unchanged.
 #[inline]
 fn hardsigmoid1(x: f32) -> f32 {
     let y = x + 3.0;
     let lo = if y > 0.0 { y } else { 0.0 };
     let hi = if lo < 6.0 { lo } else { 6.0 };
-    hi * INV6
+    let h = if x.is_nan() { y } else { hi };
+    h * INV6
 }
 
-/// `hardswish(x) = x · hardsigmoid(x)` — the MobileNetV3 self-gated activation.
+/// `hardswish(x) = x · hardsigmoid(x)` — the MobileNetV3 self-gated activation. On a NaN both
+/// factors are the input NaN quieted (see [`hardsigmoid1`]), so the product is that NaN whichever
+/// operand the multiply propagates.
 #[inline]
 fn hardswish1(x: f32) -> f32 {
     x * hardsigmoid1(x)
@@ -2562,7 +2601,10 @@ unsafe fn hardsigmoid8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m25
     // clamp(x+3, 0, 6)·(1/6) — max_ps/min_ps match hardsigmoid1's `v>0`/`v<6` branches bit-for-bit.
     let y = _mm256_add_ps(x, _mm256_set1_ps(3.0));
     let clamped = _mm256_min_ps(_mm256_max_ps(y, _mm256_setzero_ps()), _mm256_set1_ps(6.0));
-    _mm256_mul_ps(clamped, _mm256_set1_ps(INV6))
+    // NaN in, NaN out: an unordered lane takes `y` (the quieted input NaN), as hardsigmoid1 does.
+    let nan = _mm256_cmp_ps::<_CMP_UNORD_Q>(x, x);
+    let h = _mm256_blendv_ps(clamped, y, nan);
+    _mm256_mul_ps(h, _mm256_set1_ps(INV6))
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -3637,6 +3679,114 @@ mod tests {
         }
     }
 
+    /// The module header's NaN contract, asserted for EVERY op code: a NaN input — quiet or
+    /// signaling, either sign, default or custom payload — gives a NaN in every one of the eight
+    /// lane positions and in the scalar tail, except `relu`, whose definition maps it to `+0`. For
+    /// the ops whose header row says "quiet(x)" the exact bits are pinned too, on the scalar twin
+    /// and on every path. Before P9.7 `hardsigmoid` returned the clamp's bound `0` for a NaN, and
+    /// no test walked the whole code space to notice.
+    #[test]
+    fn vmath_every_op_returns_nan_for_nan() {
+        const EXACT: [i64; 14] = [
+            VM_EXP,
+            VM_LOG,
+            VM_TANH,
+            VM_ATAN,
+            VM_ASINH,
+            VM_CBRT,
+            VM_SIN,
+            VM_COS,
+            VM_SILU,
+            VM_MISH,
+            VM_SINH,
+            VM_COSH,
+            VM_HARDSIGMOID,
+            VM_HARDSWISH,
+        ];
+        for op in VM_EXP..=VM_CBRT {
+            for bits in [0x7fc0_0000u32, 0xffc0_1234, 0x7f80_0001, 0xff80_0001] {
+                let x = f32::from_bits(bits);
+                let twin = apply1(op, x);
+                if op == VM_RELU {
+                    assert_eq!(twin.to_bits(), 0, "relu(NaN {bits:#x}) is +0 by definition");
+                } else {
+                    assert!(twin.is_nan(), "op {op} lost NaN {bits:#x}: {twin}");
+                }
+                if EXACT.contains(&op) {
+                    assert_eq!(
+                        twin.to_bits(),
+                        bits | 0x0040_0000,
+                        "op {op}: NaN {bits:#x} must come back quieted with sign and payload"
+                    );
+                }
+                for at in 0..8 {
+                    let mut xs = [0.5f32; 17];
+                    xs[at] = x;
+                    xs[16] = x;
+                    let mut out = [0.0f32; 17];
+                    // SAFETY: both buffers hold 17 f32.
+                    unsafe { wukong_vmath_f32(xs.as_ptr(), out.as_mut_ptr(), 17, op) };
+                    for k in [at, 16] {
+                        if op == VM_RELU {
+                            assert_eq!(out[k].to_bits(), 0, "relu lane/tail {k}");
+                        } else {
+                            assert!(out[k].is_nan(), "op {op} lost NaN {bits:#x} at {k}");
+                        }
+                        if EXACT.contains(&op) || op == VM_RELU {
+                            assert_eq!(out[k].to_bits(), twin.to_bits(), "op {op} lane/tail {k}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// P9.22: the two ReLU-shaped spellings at the inputs where `f32::max` would be unspecified.
+    /// `relu` sends `+0`, `-0` and every NaN to `+0` (the `maxps` rule), and `softplus` gives the
+    /// same bits for `+0` and `-0` — on the eight-lane path, the scalar tail and the twin alike.
+    #[test]
+    fn vmath_relu_softplus_signed_zero_and_nan() {
+        let xs: [f32; 9] = [
+            0.0,
+            -0.0,
+            f32::NAN,
+            f32::from_bits(0xffc0_0001),
+            -1.5,
+            2.5,
+            -0.0,
+            0.0,
+            -0.0, // the scalar tail
+        ];
+        let mut relu = [9.0f32; 9];
+        let mut softplus = [9.0f32; 9];
+        // SAFETY: every buffer holds 9 f32.
+        unsafe {
+            wukong_vmath_f32(xs.as_ptr(), relu.as_mut_ptr(), 9, VM_RELU);
+            wukong_vmath_f32(xs.as_ptr(), softplus.as_mut_ptr(), 9, VM_SOFTPLUS);
+        }
+        let want_relu = [0.0f32, 0.0, 0.0, 0.0, 0.0, 2.5, 0.0, 0.0, 0.0];
+        for (k, &x) in xs.iter().enumerate() {
+            assert_eq!(relu[k].to_bits(), want_relu[k].to_bits(), "relu[{k}]");
+            assert_eq!(relu[k].to_bits(), apply1(VM_RELU, x).to_bits());
+            if x.is_nan() {
+                assert!(softplus[k].is_nan(), "softplus[{k}] lost the NaN");
+            } else {
+                assert_eq!(
+                    softplus[k].to_bits(),
+                    apply1(VM_SOFTPLUS, x).to_bits(),
+                    "softplus[{k}] lane/tail vs twin"
+                );
+            }
+        }
+        // ±0: one value, ≈ ln 2, regardless of the sign of the zero or the path.
+        let sp0 = apply1(VM_SOFTPLUS, 0.0);
+        assert_eq!(apply1(VM_SOFTPLUS, -0.0).to_bits(), sp0.to_bits());
+        for k in [0, 1, 6, 7, 8] {
+            assert_eq!(softplus[k].to_bits(), sp0.to_bits(), "softplus(±0) at {k}");
+        }
+        assert!((f64::from(sp0) - std::f64::consts::LN_2).abs() < 1e-6);
+    }
+
     /// Monotonicity across the 8-bucket boundaries: scan consecutive f32s (±256 ULPs) around every
     /// bucket edge — including the two k-transition edges where z wraps — and require ln to never
     /// decrease. The shipped tables measure zero violations (a table/poly mismatch at an edge would
@@ -4224,8 +4374,13 @@ mod tests {
     /// 2. **exp worst-case error**: every f32 in [−87, EXP_HI] — the whole clamp range above the
     ///    denormal-output band — against f64 `exp`, reported as max relative error *and* max ULP.
     /// 3. **log worst-case error**: every positive *normal* f32 (2.13e9 values) against f64 `ln`.
-    ///    This pass excludes subnormals; their separate sampled test is not exhaustive. The historical bar was quoted over
-    ///    [0.25, 4) only; this widens it and reports [0.25, 4) separately so the two are comparable.
+    ///    The historical bar was quoted over [0.25, 4) only; this widens it and reports [0.25, 4)
+    ///    separately so the two are comparable.
+    /// 4. **log over every positive subnormal** (8,388,607 values, P9.24): the kernel normalizes a
+    ///    subnormal by an exact 2^23 and subtracts 23 from `k`, so the contract's domain is all of
+    ///    `x > 0`, not just the normals; this pass holds the subnormal band to the same 1e-6
+    ///    relative bar and reports its ULP maximum. (`vmath_log_subnormal_accuracy_and_parity` is
+    ///    the sampled, always-run version of the same check.)
     ///
     /// Measured 2026-08-06 (this machine, `--release`, stride 1):
     /// ```text
@@ -4428,6 +4583,46 @@ mod tests {
         assert!(
             wulp <= LOG_ULP_BAR,
             "log max {wulp} ULP at {wat_u:?} exceeds {LOG_ULP_BAR}"
+        );
+
+        // --- pass 4: log worst case over every positive subnormal ---------------------------------
+        // 0x0000_0001 (2^-149) up to 0x007F_FFFF, the largest subnormal: one contiguous bit run.
+        // ln(x) lies in [-103.3, -87.3] here, far from zero, so the relative bar is the meaningful
+        // one; the ULP maximum is reported alongside it.
+        let t0 = std::time::Instant::now();
+        let (mut wrel, mut wulp, mut wat, mut wat_u) = (0.0f64, 0i64, 0.0f32, 0.0f32);
+        let mut swept: u64 = 0;
+        let (mut lo, hi) = (1u32, 0x007f_ffffu32);
+        while lo <= hi {
+            let take = (((hi - lo) / stride) as usize + 1).min(CH);
+            for (k, x) in xs.iter_mut().enumerate().take(take) {
+                *x = f32::from_bits(lo + (k as u32) * stride);
+            }
+            // SAFETY: avx2+fma detected above; both buffers hold at least `take` f32.
+            unsafe { wukong_vmath_f32(xs.as_ptr(), a.as_mut_ptr(), take as i64, VM_LOG) };
+            for k in 0..take {
+                let (rel, ulps) = acc(a[k], f64::from(xs[k]).ln());
+                if rel > wrel {
+                    (wrel, wat) = (rel, xs[k]);
+                }
+                if ulps > wulp {
+                    (wulp, wat_u) = (ulps, xs[k]);
+                }
+            }
+            swept += take as u64;
+            match lo.checked_add(take as u32 * stride) {
+                Some(next) => lo = next,
+                None => break,
+            }
+        }
+        eprintln!(
+            "exhaustive: log over every positive subnormal f32 — {swept} values, max rel \
+             {wrel:.3e} at {wat:?}, max {wulp} ULP at {wat_u:?} ({:.1}s, stride {stride})",
+            t0.elapsed().as_secs_f64()
+        );
+        assert!(
+            wrel < 1e-6,
+            "log subnormal max rel {wrel:.3e} at {wat:?} exceeds the 1e-6 bar"
         );
     }
 

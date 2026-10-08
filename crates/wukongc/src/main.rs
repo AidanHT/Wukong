@@ -34,6 +34,11 @@ OPTIONS:
     -o <path>          Write the artifact to <path>. Only --emit=obj and --emit=exe write a
                        file; every other stage prints its artifact on stdout.
     -O0|-O1|-O2|-O3    Optimization level (default: -O0)
+    --fp=<mode>        Floating-point mode: fast, strict  (default: fast)
+                       fast contracts `x + y*z` into one FMA, reassociates vectorized float
+                       reductions and dispatches recognized kernels; strict evaluates every
+                       function in source order with one rounding per operation (the
+                       program-wide form of the @strict_fp function attribute)
     --color=<when>     Colorize diagnostics: auto, always, never  (default: auto)
     --error-format=<f> Diagnostic output format: human, json  (default: human)
     --explain <CODE>   Print the extended explanation for an error code, then exit
@@ -141,6 +146,17 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             "-O1" => opts.opt_level = 1,
             "-O2" => opts.opt_level = 2,
             "-O3" => opts.opt_level = 3,
+            _ if arg.starts_with("--fp=") => {
+                opts.strict_fp = match &arg["--fp=".len()..] {
+                    "fast" => false,
+                    "strict" => true,
+                    other => {
+                        return Err(format!(
+                            "unknown --fp value `{other}` (expected fast or strict)"
+                        ))
+                    }
+                };
+            }
             "-o" => {
                 i += 1;
                 let path = args.get(i).ok_or("`-o` requires a path argument")?;
@@ -311,5 +327,22 @@ mod tests {
                 .verify_each
         );
         assert!(USAGE.contains("--verify-each"));
+    }
+
+    #[test]
+    fn fp_mode_flag_parses_and_defaults_to_fast() {
+        let parse = |flag: &str| parse_args(&[flag.to_owned(), "input.wk".to_owned()]);
+        assert!(parse("--fp=strict").unwrap().unwrap().strict_fp);
+        assert!(!parse("--fp=fast").unwrap().unwrap().strict_fp);
+        assert!(
+            !parse_args(&["input.wk".to_owned()])
+                .unwrap()
+                .unwrap()
+                .strict_fp,
+            "fast is the default"
+        );
+        let err = parse("--fp=precise").unwrap_err();
+        assert!(err.contains("--fp"), "{err}");
+        assert!(USAGE.contains("--fp=<mode>"));
     }
 }

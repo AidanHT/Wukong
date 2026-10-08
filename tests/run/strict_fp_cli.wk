@@ -1,0 +1,64 @@
+// RUN: --run --fp=strict
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 16777216
+module tests.run.strict_fp_cli
+
+// `--fp=strict` is `@strict_fp` on every function of the program: nothing below carries the
+// attribute, and every result is the twice-rounded one. Under the default `--fp=fast` the first
+// four lines print 1 (see `tests/run/fp_contract_rules.wk`); the differential and invariance
+// gates run this file without the flag, so they check the fast program, while `run_suite` honours
+// the `RUN:` line above and checks the strict one.
+//
+//   x = -(1 + 2^-11),  y = z = 1 + 2^-12      (exact in f32)
+//   round(y*z) = 1 + 2^-11 (a tie, rounded to even), so x + round(y*z) = 0; fused it is 2^-24.
+// Results print as (r * 2^24) as i32, an exact scale.
+
+fn addend(x: f32, y: f32, z: f32) -> f32 {
+    return x + y * z;
+}
+
+fn lanes(x: [f32; 9], y: [f32; 9], z: [f32; 9], mut o: [f32; 9]) {
+    for i in 0..9 {
+        o[i] = x[i] + y[i] * z[i];
+    }
+}
+
+// x[0] = 2^24, fifteen ones: sequentially every `2^24 + 1` ties back to 2^24 (even), so the
+// strict sum is exactly 16777216.
+fn sum(x: [f32; 16]) -> f32 {
+    let mut s: f32 = 0.0;
+    for i in 0..16 {
+        s = s + x[i];
+    }
+    return s;
+}
+
+fn main() -> i32 {
+    let x: f32 = -1.00048828125;
+    let y: f32 = 1.000244140625;
+    let z: f32 = 1.000244140625;
+    print((addend(x, y, z) * 16777216.0) as i32); // 0
+
+    let mut xs: [f32; 9] = [0.0; 9];
+    let mut ys: [f32; 9] = [0.0; 9];
+    let mut zs: [f32; 9] = [0.0; 9];
+    let mut o: [f32; 9] = [0.0; 9];
+    for c in 0..9 {
+        xs[c] = x;
+        ys[c] = y;
+        zs[c] = z;
+    }
+    lanes(xs, ys, zs, o);
+    print((o[0] * 16777216.0) as i32); // 0
+    print((o[7] * 16777216.0) as i32); // 0
+    print((o[8] * 16777216.0) as i32); // 0
+
+    let mut big: [f32; 16] = [1.0; 16];
+    big[0] = 16777216.0;
+    print(sum(big) as i32); // 16777216
+    return 0;
+}
