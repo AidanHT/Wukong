@@ -30,6 +30,7 @@ use wukong_ast::{Expr, ExprKind, FnDecl, ImplDecl, ItemKind, Module, NodeId, Typ
 use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet, Span, Symbol};
 use wukong_types::{Scalar, Ty};
 
+use crate::provenance::CallSite;
 use crate::{DefKind, FnSig, Sema};
 
 /// How one method call resolved, keyed in [`MethodResolution::calls`] by the call expression.
@@ -688,7 +689,8 @@ impl Sema<'_> {
             ret: *ret,
         };
         self.check_fn_value_args(&sig, args, arg_tys);
-        Some(self.check_fn_call(&sig, &[], arg_tys, span, callee.id))
+        let site = CallSite::new(None, None, args);
+        Some(self.check_fn_call(&sig, &[], arg_tys, span, callee.id, &site))
     }
 
     /// Adapt each unsuffixed numeric literal argument to its concrete scalar parameter, exactly as
@@ -942,7 +944,12 @@ impl Sema<'_> {
         };
         self.check_fn_value_args(&rest, args, arg_tys.get(offset..).unwrap_or(&[]));
         self.check_call_bounds(target, &sig, generic_args, &arg_tys, e.span);
-        self.check_fn_call(&sig, generic_args, &arg_tys, e.span, callee.id)
+        let receiver = match &callee.kind {
+            ExprKind::Field { base, .. } if offset == 1 => Some(base.span),
+            _ => None,
+        };
+        let site = CallSite::new(Some(target), receiver, args);
+        self.check_fn_call(&sig, generic_args, &arg_tys, e.span, callee.id, &site)
     }
 
     /// Type a call through the trait bounds of type parameter `g`: `x.m(..)` with `x: g`
@@ -1033,7 +1040,8 @@ impl Sema<'_> {
             params,
             ret,
         };
-        let out = self.check_fn_call(&sig, &[], &arg_tys, e.span, callee.id);
+        let site = CallSite::new(None, recv.map(|r| r.span), args);
+        let out = self.check_fn_call(&sig, &[], &arg_tys, e.span, callee.id, &site);
         self.methods.resolution.calls.insert(
             e.id,
             MethodCall {

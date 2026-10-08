@@ -563,6 +563,26 @@ mismatch, an index-count mismatch, an array-to-tensor decay, an element-type or 
 the message names the ranks, the shapes, or the layout instead. The same text reaches tooling
 verbatim as the `message` field of `--error-format=json`, alongside the unchanged `code`.
 
+**A call's shape error also says where the dimension came from.** The error points at the
+*argument* that disagrees, and its labels name what fixed the dimension and where the callee
+declares it:
+
+```
+error[E0502]: dimension mismatch on `K` (axis 0): expected 512, found 513
+  matmul(a, b);
+         -  ^ `K` (axis 0) is 513 in argument 2
+         |
+         `K` = 512 was fixed here, by axis 1 of argument 1
+  fn matmul<M, N, K>(a: Tensor[f32, M, K], b: Tensor[f32, K, N]) {}
+                                              ----------------- `K` is declared in parameter `b` of `matmul`
+```
+
+A dimension fixed by a turbofish is labelled `fixed here, by the turbofish`, and one fixed by
+another axis of the same argument is a note. A wrong argument count (`E0503`) names the callee —
+"function `add` takes 2 arguments but 3 were supplied", a method as `Type::method`, counting the
+arguments after the receiver — labels each extra argument and the callee's definition, and lists the
+parameters a short call left out.
+
 Run `wukongc --explain E0502` for a worked example. Dimensions may be integer literals, a declared
 symbolic generic name, the name of a top-level `const`, `?` for a run-time dimension, or **arithmetic
 on dimensions** (below). A `const` dim

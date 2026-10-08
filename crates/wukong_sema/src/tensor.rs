@@ -288,6 +288,7 @@ impl Sema<'_> {
             Some(q) => match Dim::from_poly(q) {
                 Ok(d) => {
                     dims.insert(g, d);
+                    self.note_dim_solved(g, eq.span);
                 }
                 Err(_) => self.error(
                     eq.span,

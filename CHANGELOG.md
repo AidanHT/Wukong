@@ -17,6 +17,11 @@ All notable changes to Wukong are documented here. The format is loosely based o
 - **One builtin callee registry** (`wukong_sema::is_builtin_callee` / `is_statement_builtin`, in
   `builtins.rs`) is shared by sema and `mir_build`; a single-name call that reaches lowering
   unresolved is an internal compiler error rather than `C0001`.
+- **Call-site provenance.** A shape conflict at a call (`E0502`) is reported at the conflicting
+  argument and labels the argument axis or turbofish that fixed the dimension and the callee's
+  parameter (Futhark-style "fixed here"); an arity error (`E0503`) names the callee (`Type::method`
+  for a method, counting after the receiver), labels its definition and each extra argument, and
+  lists the missing parameters. The headline messages are unchanged.
 
 ### Optimizer memory passes: SROA, path DSE, loop deletion, guarded LICM, scalar promotion (`gap/opt-memory`)
 

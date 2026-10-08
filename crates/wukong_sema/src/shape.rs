@@ -44,6 +44,7 @@ use wukong_ast::{Expr, ExprKind, NodeId, TypeExpr, TypeKind};
 use wukong_span::{Span, Symbol};
 use wukong_types::{Dim, Layout, Scalar, Shape, Ty};
 
+use crate::provenance::CallSite;
 use crate::tensor::PendingDimEq;
 use crate::{DefKind, FnSig, Sema};
 
@@ -218,7 +219,15 @@ impl Sema<'_> {
                         // Function-valued arguments and trait bounds (`methods.rs`).
                         self.check_fn_value_args(&sig, args, &arg_tys);
                         self.check_call_bounds(name, &sig, generic_args, &arg_tys, span);
-                        return self.check_fn_call(&sig, generic_args, &arg_tys, span, callee.id);
+                        let site = CallSite::new(Some(name), None, args);
+                        return self.check_fn_call(
+                            &sig,
+                            generic_args,
+                            &arg_tys,
+                            span,
+                            callee.id,
+                            &site,
+                        );
                     }
                 }
                 // A few math builtins are lowered directly by the backends, so their *result*
@@ -551,38 +560,27 @@ impl Sema<'_> {
         arg_tys: &[Ty],
         span: Span,
         call_id: NodeId,
+        site: &CallSite,
     ) -> Ty {
         if arg_tys.len() != sig.params.len() {
-            self.error(
-                span,
-                "E0503",
-                format!(
-                    "this function takes {} argument(s) but {} were supplied",
-                    sig.params.len(),
-                    arg_tys.len()
-                ),
-            );
+            // Names the callee, labels its definition and the extra / missing arguments.
+            self.report_call_arity(sig.params.len(), arg_tys.len(), span, site);
             return sig.ret.clone();
         }
 
         let mut dims: HashMap<Symbol, Dim> = HashMap::default();
         let mut tys: HashMap<Symbol, Ty> = HashMap::default();
 
+        if !generic_args.is_empty() && generic_args.len() != sig.generics.len() {
+            self.report_generic_arity(sig.generics.len(), generic_args.len(), span, site);
+            // Don't continue into the misaligned `zip` below, which would bind dims off-by-one
+            // and report a spurious secondary E0502.
+            return sig.ret.clone();
+        }
+        // Record where every dimension is bound from here on, so a conflict can name the argument
+        // or turbofish that fixed it (`provenance.rs`).
+        let outer_call = self.begin_call(site);
         if !generic_args.is_empty() {
-            if generic_args.len() != sig.generics.len() {
-                self.error(
-                    span,
-                    "E0503",
-                    format!(
-                        "this function takes {} generic argument(s) but {} were supplied",
-                        sig.generics.len(),
-                        generic_args.len()
-                    ),
-                );
-                // Don't continue into the misaligned `zip` below, which would bind dims off-by-one
-                // and report a spurious secondary E0502.
-                return sig.ret.clone();
-            }
             for (g, ga) in sig.generics.iter().zip(generic_args) {
                 match &ga.kind {
                     // Decode with the same radix/`_`/suffix-aware parser mir_build's
@@ -594,6 +592,7 @@ impl Sema<'_> {
                     TypeKind::Int(s) => {
                         let n = crate::parse_u64_text(self.sym_str(*s)).unwrap_or(0);
                         dims.insert(*g, Dim::Const(n));
+                        self.note_turbofish_dim(*g, ga.span);
                     }
                     TypeKind::Path(p) if p.is_single() => {
                         let nm = p.first().sym;
@@ -603,6 +602,7 @@ impl Sema<'_> {
                             }
                             None => {
                                 dims.insert(*g, Dim::Var(nm));
+                                self.note_turbofish_dim(*g, ga.span);
                             }
                         }
                     }
@@ -618,7 +618,10 @@ impl Sema<'_> {
         // walked: `unify_dim` queues its equation, and `solve_pending_dims` solves the queue once every
         // plain `N` has been bound, so the order the parameters are written in does not matter.
         let outer_pending = std::mem::take(&mut self.pending_dims);
-        for (param, arg) in sig.params.iter().zip(arg_tys) {
+        for (i, (param, arg)) in sig.params.iter().zip(arg_tys).enumerate() {
+            // A mismatch is reported at the argument, not the whole call.
+            let arg_span = site.arg_span(i).unwrap_or(span);
+            self.set_call_arg(Some((i, arg_span)));
             // Infer VALUE-TYPE generics (a `Ty::Named(g)` parameter position) from the concrete
             // argument type, so `id(c)` with `c: f32` binds `T := f32` and the whole call types as
             // `f32` — its result can then be cast/used at the concrete type, and `mir_build`
@@ -642,10 +645,12 @@ impl Sema<'_> {
             // from the argument shapes (`rigid == false`). `param` — the DECLARED type, before the
             // substitution that produced `p` — rides along so a mismatch can be reported against the
             // name the signature wrote (`K`), not just the extent it resolved to.
-            self.unify_decl(p, arg, Some(param), &mut dims, span, false);
+            self.unify_decl(p, arg, Some(param), &mut dims, arg_span, false);
         }
+        self.set_call_arg(None);
         let pending = std::mem::replace(&mut self.pending_dims, outer_pending);
         self.solve_pending_dims(&sig.generics, &mut dims, pending);
+        self.end_call(outer_call);
         // A derived extent of the RETURN type must still be an extent once this call's dims are
         // known (`-> Tensor[f32, N - 4]` called with `N = 2` has no result shape).
         self.check_derived_extents(&sig.ret, &dims, span);
@@ -1311,11 +1316,9 @@ impl Sema<'_> {
                     if !dims_equal(bound, ad) {
                         let (want, got) = (self.dim_str(bound), self.dim_str(ad));
                         let at = self.dim_site(site);
-                        self.error(
-                            span,
-                            "E0502",
-                            format!("dimension mismatch on {at}: expected {want}, found {got}"),
-                        );
+                        let msg =
+                            format!("dimension mismatch on {at}: expected {want}, found {got}");
+                        self.report_dim_conflict(span, msg, site, &want, &got);
                     }
                 }
                 None => {
@@ -1325,17 +1328,15 @@ impl Sema<'_> {
                     // `N` unbound so a concrete sibling binds it and subsequent ones are checked.
                     if !matches!(ad, Dim::Dynamic) {
                         dims.insert(*v, ad.clone());
+                        self.note_dim_bound(*v, site.axis);
                     }
                 }
             },
             Dim::Const(pc) => match ad {
                 Dim::Const(ac) if pc != ac => {
                     let at = self.dim_site(site);
-                    self.error(
-                        span,
-                        "E0502",
-                        format!("dimension mismatch on {at}: expected {pc}, found {ac}"),
-                    )
+                    let msg = format!("dimension mismatch on {at}: expected {pc}, found {ac}");
+                    self.report_dim_conflict(span, msg, site, &pc.to_string(), &ac.to_string());
                 }
                 // A caller's own universally-quantified dim cannot be ASSUMED equal to the callee's
                 // fixed size — that is a claim the checker cannot prove, and the very hole `rigid`
@@ -1347,15 +1348,13 @@ impl Sema<'_> {
                 Dim::Var(_) | Dim::Expr(_) => {
                     let name = self.dim_str(ad);
                     let at = self.dim_site(site);
-                    self.error(
-                        span,
-                        "E0502",
-                        format!(
-                            "dimension mismatch on {at}: expected {pc}, found the generic dimension \
-                             `{name}` (a universally-quantified dimension cannot be assumed equal \
-                             to {pc}; declare the parameter `?` if the size is a runtime value)"
-                        ),
+                    let msg = format!(
+                        "dimension mismatch on {at}: expected {pc}, found the generic dimension \
+                         `{name}` (a universally-quantified dimension cannot be assumed equal \
+                         to {pc}; declare the parameter `?` if the size is a runtime value)"
                     );
+                    let found = format!("`{name}`");
+                    self.report_dim_conflict(span, msg, site, &pc.to_string(), &found);
                 }
                 _ => {}
             },
@@ -1366,11 +1365,8 @@ impl Sema<'_> {
                 if !dims_equal(pd, ad) {
                     let (want, got) = (self.dim_str(pd), self.dim_str(ad));
                     let at = self.dim_site(site);
-                    self.error(
-                        span,
-                        "E0502",
-                        format!("dimension mismatch on {at}: expected {want}, found {got}"),
-                    );
+                    let msg = format!("dimension mismatch on {at}: expected {want}, found {got}");
+                    self.report_dim_conflict(span, msg, site, &want, &got);
                 }
             }
             Dim::Dynamic => {}

@@ -33,6 +33,7 @@ mod dependency;
 mod layout;
 mod methods;
 mod noalias;
+mod provenance;
 mod resolve;
 mod shape;
 mod tensor;
@@ -414,6 +415,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         builtin_calls: HashMap::default(),
         methods: methods::MethodState::default(),
         resolve: resolve::ResolveState::default(),
+        provenance: provenance::ProvenanceState::default(),
     };
     // Attribute legality (`attrs`): an attribute names no value and has no type, so this walk needs
     // nothing the collection pass builds and runs first — an unknown `@bogus` is reported even in a
@@ -518,6 +520,8 @@ struct Sema<'a> {
     methods: methods::MethodState,
     /// Name-resolution diagnostics state (`resolve.rs`).
     resolve: resolve::ResolveState,
+    /// Where each call's dimensions were bound, for its diagnostics (`provenance.rs`).
+    provenance: provenance::ProvenanceState,
 }
 
 /// One entry of [`Sema::loop_ctx`] — a loop currently being type-checked.
@@ -1016,6 +1020,7 @@ impl<'a> Sema<'a> {
 
     fn collect_fn(&mut self, f: &FnDecl) {
         self.check_unique_decl_names(&Self::generic_decl_names(&f.generics), "generic parameter");
+        self.record_fn_params(f);
         self.generics = generic_names(&f.generics);
         let params = f
             .params

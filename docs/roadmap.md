@@ -95,6 +95,10 @@ another architecture or OS is not supported. A native-backend failure is a catal
   (`wukong_sema::is_builtin_callee`) is read by `mir_build` too, so a single-name call that reaches
   lowering unresolved is an internal compiler error, not a codegen limit
   (`tests/fail/{unknown_fn_call,unknown_field,builtin_method_unknown,call_non_function,unknown_type_name,struct_literal_unknown}.wk`).
+- **Call-site shape errors carry provenance.** An `E0502` at a call is reported at the conflicting
+  argument, with labels naming the argument axis or turbofish that fixed the dimension and the
+  callee parameter that declares it; `E0503` names the callee and labels its definition and the
+  extra or missing arguments (pinned in JSON by `crates/wukongc/tests/fail.rs`).
 - Functions (including recursion and mutual recursion — the interpreter oracle runs on a
   512 MiB worker thread, so ordinary recursion does not overflow the host's small default stack), and
   direct calls. *Caveat:* the tree-walking interpreter's call frames are ~an order of magnitude larger
