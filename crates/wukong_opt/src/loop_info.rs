@@ -597,6 +597,11 @@ pub struct MemAccess {
     /// The type transferred (the `Load`'s result type / the stored value's type).
     pub value_ty: MirType,
     pub addr: AddrForm,
+    /// For a **load** whose address is [`AddrForm::Unknown`] only because its index does not
+    /// follow the induction variable — a gather, `lut[q[i]]` — the object it reads, when the
+    /// pointer is one `gep` off a known base. The dependence test accepts such a load when nothing
+    /// the loop stores can be that object. `None` for every other access.
+    pub gather_base: Option<MemBase>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1530,6 +1535,15 @@ impl<'a> LoopCtx<'a> {
         }
     }
 
+    /// The object a gathered address reads: `p` is one `gep` off a pointer [`Self::mem_base`]
+    /// recognizes, whatever its index.
+    fn gather_base(&self, p: ValueId) -> Option<MemBase> {
+        match self.op_of(p)? {
+            Op::Gep { ptr, .. } => self.mem_base(*ptr),
+            _ => None,
+        }
+    }
+
     /// Decompose the address `p` into `base + index · elem`.
     ///
     /// A chain of `gep`s over the *same* element type folds into one index (`gep(gep(b, j), k)` is
@@ -1595,6 +1609,10 @@ fn collect_accesses(
                 _ => continue,
             };
             let addr = ctx.addr_form(ptr, memo);
+            let gather_base = match (&addr, kind) {
+                (AddrForm::Unknown, AccessKind::Load) => ctx.gather_base(ptr),
+                _ => None,
+            };
             out.push(MemAccess {
                 block: b,
                 inst: i,
@@ -1602,6 +1620,7 @@ fn collect_accesses(
                 ptr,
                 value_ty,
                 addr,
+                gather_base,
             });
         }
     }
@@ -1823,16 +1842,53 @@ fn dependence(ctx: &LoopCtx<'_>, l: &NaturalLoop, accesses: &[MemAccess]) -> Dep
             }
         }
     }
-    if accesses.iter().any(|a| matches!(a.addr, AddrForm::Unknown)) {
-        return carried("an address the analysis could not decompose");
-    }
     let mut needs_runtime_check = false;
     let mut reloaded_base = false;
     // Built at most once, and only for a function with a `@noalias` parameter (`alias.rs`).
     let mut promised = crate::alias::PromisedBases::new(ctx.f);
+    // A gathered load (`lut[q[i]]`) reads some element of a known object at an index this analysis
+    // cannot follow, so no distance can be computed for it. It is independent of every store in
+    // the loop exactly when the store's object is provably a different one: two distinct slots, a
+    // `@noalias` promise, or the alias analysis's provenance (a local table whose address never
+    // escapes cannot be what a parameter points into). Any other unknown address — a store through
+    // one, or a pointer the analysis cannot trace to an object — may touch anything.
+    let mut alias: Option<crate::alias::AliasInfo> = None;
+    let handle = |m: MemBase| match m {
+        MemBase::Outer(v) => v,
+        MemBase::ReloadedOuter { value, .. } => value,
+    };
+    for a in accesses
+        .iter()
+        .filter(|a| matches!(a.addr, AddrForm::Unknown))
+    {
+        let Some(gb) = a.gather_base else {
+            return carried("an address the analysis could not decompose");
+        };
+        for s in accesses.iter().filter(|s| s.kind == AccessKind::Store) {
+            let Some(sb) = s.addr.base() else {
+                return carried("an address the analysis could not decompose");
+            };
+            let apart = !gb.same_object(sb)
+                && (distinct_allocas(ctx, gb, sb)
+                    || promised.disjoint(gb, sb)
+                    || !alias
+                        .get_or_insert_with(|| crate::alias::AliasInfo::analyze(ctx.f))
+                        .may_alias(handle(gb), handle(sb)));
+            if !apart {
+                return carried("a gathered load may read what the loop stores");
+            }
+        }
+        if matches!(gb, MemBase::ReloadedOuter { .. }) {
+            reloaded_base = true;
+        }
+    }
     for (i, a) in accesses.iter().enumerate() {
         for b in &accesses[i + 1..] {
             if a.kind == AccessKind::Load && b.kind == AccessKind::Load {
+                continue;
+            }
+            // A gather was settled against every store above.
+            if matches!(a.addr, AddrForm::Unknown) || matches!(b.addr, AddrForm::Unknown) {
                 continue;
             }
             let (Some(ba), Some(bb)) = (a.addr.base(), b.addr.base()) else {
@@ -3137,6 +3193,25 @@ mod tests {
         );
         assert_eq!(l.dep.memory, MemDep::Carried);
         assert!(!l.is_vectorizable_shape());
+    }
+
+    /// The same gather with the stored slice promised apart (`@noalias`). The gathered load still
+    /// has no distance, but it needs none: no store in the loop can reach the object it reads, so
+    /// the loop is not carried. The access keeps its `Unknown` address and records the object.
+    #[test]
+    fn a_gather_from_storage_no_store_can_reach_is_independent() {
+        let src = "fn k(idx: []i32, x: []f32, @noalias mut o: []f32, n: i64) { \
+                   for i in 0..n { o[i] = x[idx[i] as i64]; } } \
+                   fn main() -> i32 { return 0; }";
+        let (_, l) = kernel_loop(src, "k");
+        let gather = l
+            .accesses
+            .iter()
+            .find(|a| matches!(a.addr, AddrForm::Unknown))
+            .expect("the gathered load");
+        assert_eq!(gather.kind, AccessKind::Load);
+        assert!(gather.gather_base.is_some(), "no object for {gather:?}");
+        assert_ne!(l.dep.memory, MemDep::Carried, "{}", l.dep.reason);
     }
 
     // ---- stage 4: carried values -------------------------------------------------------------

@@ -450,6 +450,7 @@ vectorized_iv_as_value.wk: wukong_rt_alloc wukong_rt_alloc*5 wukong_rt_free wuko
 vectorized_lanes.wk:
 vectorized_loops.wk: wukong_rt_alloc wukong_rt_alloc*8 wukong_rt_free wukong_rt_free*8
 vectorized_mixed_widths.wk: wukong_rt_alloc wukong_rt_alloc*14 wukong_rt_free wukong_rt_free*14
+vectorized_replicate.wk: wukong_rt_alloc wukong_rt_alloc*9 wukong_rt_free wukong_rt_free*9
 vectorized_row_fused.wk:
 vectorized_split_base_guard.wk: veckernel*1 wukong_rt_alloc wukong_rt_alloc*3 wukong_rt_free wukong_rt_free*3
 vectorized_trip_edges.wk: wukong_rt_alloc wukong_rt_alloc*9 wukong_rt_free wukong_rt_free*9

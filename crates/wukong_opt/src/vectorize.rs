@@ -48,7 +48,10 @@
 //!
 //! Everything else is lane-wise and therefore trivially order-preserving: lane `k` of a widened
 //! group executes the identical operation sequence on the identical operands that scalar iteration
-//! `i + k` would have.
+//! `i + k` would have. A step with no lane-wise vector form — a gather, an integer divide, a shift
+//! by a per-lane amount, a conversion with no packed route — keeps that property by being
+//! **replicated** ([`plan_body`]): it runs once per lane, as the scalar instruction, on that lane's
+//! own operands, and its results are packed for the widened steps that read them.
 //!
 //! # If-conversion
 //!
@@ -287,6 +290,10 @@ enum Wide {
     /// The [`parts_of`] full-width vectors of one value, lowest iterations first: lane `k` of part
     /// `p` holds what scalar iteration `i + p·L + k` computed, `L` lanes per part.
     Vector(Vec<ValueId>),
+    /// A value computed lane by lane ([`Plan::Replicate`], [`Plan::LaneGep`]): `W` scalars, entry
+    /// `k` what scalar iteration `i + k` computed. Packed into vectors (`Op::InsertLane`) only
+    /// where a widened step reads it; a per-lane address is never packed.
+    Lanes(Vec<ValueId>),
 }
 
 /// How a lane conversion is spelled once the group's values are split into parts. Decided from the
@@ -330,6 +337,12 @@ enum Plan {
     Widen,
     /// A conversion, by the route [`cast_route`] chose.
     Cast(CastRoute),
+    /// Run the scalar op once per lane, on each lane's own operands (see [`plan_body`]).
+    Replicate,
+    /// A `gep` off a uniform base with a per-lane index: one address per lane.
+    LaneGep,
+    /// A load through per-lane addresses: one scalar load per lane, packed into parts.
+    Gather,
     /// A `Load` whose address is affine unit-stride: becomes one `Vec` load per part.
     VecLoad,
     /// A `Store` whose address is affine unit-stride: becomes one `Vec` store per part.
@@ -402,7 +415,7 @@ struct VecPlan {
     w: u32,
     /// One entry per element of `lin`, in order.
     plans: Vec<Plan>,
-    /// Values in `body` that become vectors, and their lane type.
+    /// Values in `body` that vary per lane — widened or replicated — and their lane type.
     vector_ty: FxHashMap<u32, MirType>,
     /// Reductions to fold, in `NaturalLoop::reductions` order.
     reductions: Vec<RedPlan>,
@@ -419,6 +432,9 @@ struct VecPlan {
     guard_allows_equal: bool,
     /// Where the body reads the induction variable as a **value** rather than as an address.
     ramp: IvRamp,
+    /// Is the lane-ramp vector needed? Not when every step reading the counter as a value is
+    /// replicated: those take `i + k` per lane instead.
+    ramp_vector: bool,
 }
 
 /// The induction variable's second, lane-varying face.
@@ -435,7 +451,10 @@ struct VecPlan {
 /// The two faces coexist. The *same* `v533` is a `gep` index (uniform) and a compare operand
 /// (ramp) in the same body, so the role is decided per instruction, not per value:
 /// [`classify_iv_uses`] records which steps of the flattened body read it as a value, and
-/// [`emit_body`] swaps the map entry for exactly those steps.
+/// [`emit_body`] swaps the map entry for exactly those steps. A value-reading step that is
+/// replicated ([`Plan::Replicate`]) takes `i + k` as `W` scalars instead, and when every value use
+/// is one of those no ramp vector is built at all ([`VecPlan::ramp_vector`]). The address face must
+/// never meet a lane-varying operand — [`plan_body`] declines a step where it would.
 ///
 /// Only the induction variable itself gets a ramp. A value *derived* from it (`i + 1`, `i * 2`,
 /// `sext i`) used as a value is still declined: its ramp would be the same arithmetic over
@@ -457,9 +476,6 @@ impl IvRamp {
     /// Does step `at` of the flattened body read `v` as a lane-varying value?
     fn reads_as_value(&self, at: usize, v: ValueId) -> bool {
         v == self.iv && self.value_use.contains(&at)
-    }
-    fn needed(&self) -> bool {
-        !self.value_use.is_empty()
     }
 }
 
@@ -749,13 +765,43 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
         ty: iv_ty.clone(),
         value_use: iv_value_use,
     };
-    let (plans, vector_ty, reductions) = plan_body(f, l, &lin, &ramp, &member)
+    let BodyPlan {
+        plans,
+        vector_ty,
+        reductions,
+        lane_vals,
+        packed,
+        ramp_vector,
+        replicated,
+    } = plan_body(f, l, &lin, &ramp, &member)
         .ok_or("an instruction in the body cannot be widened")?;
 
+    // ---- replication: only beside at least as much widened work ------------------------------
+    // A replicated step keeps all of its scalar work and adds a lane extract per operand and a
+    // lane insert to pack its result, so it only pays for itself next to arithmetic that really
+    // does run `W` lanes at once. Loads and stores are not counted as that arithmetic: a body that
+    // only moves data through one replicated step (`o[i] = x[i] as i64` from `f64`, or a bare
+    // `o[i] = lut[q[i]]`) would pay the packing for nothing, and stays scalar exactly as it did
+    // before replication. A heuristic, not a measurement — it errs toward the scalar loop.
+    let widened = plans
+        .iter()
+        .filter(|p| {
+            matches!(
+                p,
+                Plan::Widen | Plan::Cast(_) | Plan::MaskedStore | Plan::Merge
+            )
+        })
+        .count()
+        + reductions.iter().filter(|r| r.vector_acc).count();
+    if replicated > widened {
+        return Err("most of the body would run lane by lane");
+    }
+
     // ---- width, from the narrowest lane the widened body holds --------------------------------
-    // Every value that becomes a vector, every affine access (a uniform stored value is splatted to
-    // its own type), the lane ramp and every reduction. `W` covers one full vector of the narrowest;
-    // each wider value is split into parts, at most `MAX_PARTS` of them.
+    // Every value that becomes a vector (a replicated one only where it is packed), every affine
+    // access (a uniform stored value is splatted to its own type), the lane ramp and every
+    // reduction. `W` covers one full vector of the narrowest; each wider value is split into parts,
+    // at most `MAX_PARTS` of them.
     let mut narrowest = u32::MAX;
     let mut widest = 0;
     let affine_tys = l
@@ -763,9 +809,12 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
         .iter()
         .filter(|a| matches!(a.addr, AddrForm::Affine { .. }))
         .map(|a| &a.value_ty);
-    let ramp_ty = ramp.needed().then_some(&ramp.ty);
+    let ramp_ty = ramp_vector.then_some(&ramp.ty);
     for t in vector_ty
-        .values()
+        .iter()
+        .filter(|(v, _)| !lane_vals.contains(*v))
+        .map(|(_, t)| t)
+        .chain(packed.iter())
         .chain(affine_tys)
         .chain(ramp_ty)
         .chain(reductions.iter().map(|r| &r.ty))
@@ -823,6 +872,7 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
         point_guards,
         guard_allows_equal,
         ramp,
+        ramp_vector,
     })
 }
 
@@ -1285,11 +1335,11 @@ enum Role {
 /// May this operation read the induction variable as one lane-varying vector operand?
 ///
 /// The list is the ops [`plan_body`] knows how to widen, minus the ones whose operands are
-/// addresses. It is a filter, not a promise: `plan_body` still has to accept the widened form (an
-/// integer divide is refused there by [`bin_widenable`], a shift whose amount is the ramp because
-/// that amount varies per lane, and a cast with no exact vector form by [`cast_route`]), so anything
-/// this lets through and that cannot actually be widened comes back as a plain decline rather than
-/// bad MIR.
+/// addresses. It is a filter, not a promise: `plan_body` still decides how each one is done. An
+/// integer divide ([`bin_widenable`] refuses it), a shift whose amount is the ramp (that amount
+/// varies per lane) and a cast with no exact vector form ([`cast_route`]) are replicated lane by
+/// lane, reading `i + k` in lane `k` instead of the ramp vector — so anything this lets through
+/// that has no vector form is replicated or comes back as a plain decline, never as bad MIR.
 fn ramp_consumable(op: &Op) -> bool {
     matches!(
         op,
@@ -1492,21 +1542,61 @@ fn group_order_verdict(
     Ok(())
 }
 
-/// Decide, for every instruction of the body, whether it stays scalar or is widened — and check
-/// that every widened one *can* be. Returns `None` the moment one cannot.
+/// What [`plan_body`] decides for one loop body.
+struct BodyPlan {
+    /// One entry per element of `lin`, in order.
+    plans: Vec<Plan>,
+    /// Every lane-varying value and its lane type — widened vectors and replicated lane values
+    /// alike, so the dataflow treats both as varying.
+    vector_ty: FxHashMap<u32, MirType>,
+    reductions: Vec<RedPlan>,
+    /// The values computed lane by lane ([`Plan::Replicate`]) rather than as vectors. Their lane
+    /// type joins the group width only when something widened reads them (`packed`).
+    lane_vals: FxHashSet<u32>,
+    /// Lane types of replicated values a widened step reads, which are packed into vectors there.
+    packed: Vec<MirType>,
+    /// Does any widened (not replicated) step read the induction variable as a value? Only then is
+    /// the lane-ramp vector built.
+    ramp_vector: bool,
+    /// Steps that do real work lane by lane: every gather, and every replicated value something
+    /// other than an address reads. An index computed per lane only to feed per-lane addresses is
+    /// not counted — the scalar loop computes it too, and nothing packs it.
+    replicated: usize,
+}
+
+/// Decide, for every instruction of the body, whether it stays scalar, is widened or is replicated
+/// lane by lane — and check that every one *can* be. Returns `None` the moment one cannot.
 ///
 /// The decisions do not depend on the group width: whether a value is a vector, and which lane type
 /// it has, follows from the dataflow alone, so [`plan_loop`] picks the width from this result.
-// Plans, widened types, and reduction plans travel together to exactly one caller; the tuple is
-// the seam, not an abstraction worth naming.
-#[allow(clippy::type_complexity)]
+///
+/// **Replication** (LLVM VPlan's REPLICATE recipe) is how a body with a step that has no vector
+/// form still widens everything else. The step runs once per lane on the lane's own scalar
+/// operands — extracted from a vector, or taken per lane from another replicated value — and its
+/// results are packed back into vectors (`Op::InsertLane`) only where a widened step reads them.
+/// Three things are replicated:
+///
+/// * a **gather** — a `gep` whose index varies per lane becomes one address per lane
+///   ([`Plan::LaneGep`]), and the load through it one scalar load per lane ([`Plan::Gather`]).
+///   Every lane performs exactly the load scalar iteration `i + k` performs, so nothing is
+///   speculated (`linearize_region` keeps a gather out of an if-converted arm), and
+///   `loop_info::dependence` has already proved no store in the loop can reach the gathered object;
+/// * an integer **divide or remainder**, an `f32`/`f64` remainder and a **per-lane shift** — no
+///   packed form exists, and MIR's scalar forms never trap (`x / 0` is `0`);
+/// * a **cast with no vector route**, and any `Bin`/`Cast` whose only readers are `gep` indices: an
+///   index widened to `i64` only ever feeds per-lane addresses, so computing it per lane keeps an
+///   `i64` value out of the group width at no cost.
+///
+/// A scatter (a store through a per-lane address) is not replicated: it is declined, as is any
+/// use of a per-lane address other than a gather's load. Whether replicating is *worth* it is
+/// [`plan_loop`]'s call, from the `replicated` count this returns.
 fn plan_body(
     f: &Function,
     l: &NaturalLoop,
     lin: &[LinInst],
     ramp: &IvRamp,
     member: &FxHashMap<AccessKey, (usize, u32)>,
-) -> Option<(Vec<Plan>, FxHashMap<u32, MirType>, Vec<RedPlan>)> {
+) -> Option<BodyPlan> {
     let access_at: FxHashMap<(u32, usize), &MemAccess> = l
         .accesses
         .iter()
@@ -1573,10 +1663,64 @@ fn plan_body(
         })
         .collect();
 
-    // Forward dataflow over the flattened body: a value is a vector iff it is a widened load or has
-    // a vector operand. Loop-invariant values and the induction variable are uniform.
+    // Values read only as a `gep` index (every reader is the index operand of a `gep`): computing
+    // one of those per lane is free when the `gep` is a gather, and keeps it out of the width.
+    let mut index_only: FxHashMap<u32, bool> = FxHashMap::default();
+    for step in lin {
+        match step {
+            LinInst::Real { block, idx } => match &f.blocks[block.0 as usize].insts[*idx].op {
+                Op::Gep { ptr, index, .. } => {
+                    index_only.entry(index.0).or_insert(true);
+                    index_only.insert(ptr.0, false);
+                }
+                op => each_op_use(op, &mut |u| {
+                    index_only.insert(u.0, false);
+                }),
+            },
+            LinInst::MaskedStore {
+                ptr,
+                cond,
+                then_val,
+                else_val,
+                ..
+            } => {
+                for u in [*ptr, *cond, *then_val, *else_val] {
+                    index_only.insert(u.0, false);
+                }
+            }
+            LinInst::Merge {
+                cond,
+                then_arg,
+                else_arg,
+                ..
+            } => {
+                for u in [*cond, *then_arg, *else_arg] {
+                    index_only.insert(u.0, false);
+                }
+            }
+        }
+    }
+    for b in &l.blocks {
+        crate::each_term_use(&f.blocks[b.0 as usize].term, &mut |u| {
+            index_only.insert(u.0, false);
+        });
+    }
+    let only_indexes = |v: ValueId| index_only.get(&v.0).copied().unwrap_or(false);
+
+    // Forward dataflow over the flattened body: a value is lane-varying iff it is a widened load or
+    // has a lane-varying operand. Loop-invariant values and the induction variable are uniform.
     let mut vector_ty: FxHashMap<u32, MirType> = FxHashMap::default();
     let mut plans: Vec<Plan> = Vec::with_capacity(lin.len());
+    let mut lane_vals: FxHashSet<u32> = FxHashSet::default();
+    // Per-lane addresses (`Plan::LaneGep` results): readable only as a gather's address.
+    let mut lane_ptrs: FxHashSet<u32> = FxHashSet::default();
+    let mut packed: Vec<MirType> = Vec::new();
+    let mut ramp_vector = false;
+    let mut replicated = 0usize;
+    // The induction variable and every value the body computes from it while it is still uniform
+    // (`i * 2`, `gep(x, i)`) — see the check after the plan below.
+    let mut iv_addr: FxHashSet<u32> = FxHashSet::default();
+    iv_addr.insert(ramp.iv.0);
     let is_vec = |m: &FxHashMap<u32, MirType>, v: ValueId| m.contains_key(&v.0);
     // The lane type an operand contributes *at this step*, or `None` when it is uniform. The
     // induction variable is the one value whose answer depends on where it is read — uniform as an
@@ -1609,6 +1753,14 @@ fn plan_body(
                     if defined_in_loop.contains(&u.0) && !available.contains(&u.0) {
                         return None;
                     }
+                    if lane_ptrs.contains(&u.0) {
+                        return None;
+                    }
+                }
+                for u in [*then_val, *else_val] {
+                    if lane_vals.contains(&u.0) {
+                        packed.push(f.value_type(u).clone());
+                    }
                 }
                 let addr = access_at.get(&(at.0 .0, at.1)).map(|a| &a.addr);
                 if !matches!(addr, Some(AddrForm::Affine { .. })) {
@@ -1637,6 +1789,14 @@ fn plan_body(
                 for u in [*cond, *then_arg, *else_arg] {
                     if defined_in_loop.contains(&u.0) && !available.contains(&u.0) {
                         return None;
+                    }
+                    if lane_ptrs.contains(&u.0) {
+                        return None;
+                    }
+                }
+                for u in [*then_arg, *else_arg] {
+                    if lane_vals.contains(&u.0) {
+                        packed.push(f.value_type(u).clone());
                     }
                 }
                 let ty = f.value_type(*param).clone();
@@ -1674,12 +1834,25 @@ fn plan_body(
             available.insert(r.0);
         }
         let mut operand_is_vec = false;
+        let mut reads_lane_ptr = false;
         each_op_use(&inst.op, &mut |u| {
             if lane_at(&vector_ty, at, u).is_some() {
                 operand_is_vec = true;
             }
+            reads_lane_ptr |= lane_ptrs.contains(&u.0);
         });
+        // A per-lane address may only be the address of a gather: a store through one would be a
+        // scatter, and anything else would need the address as a value.
+        if reads_lane_ptr && !matches!(&inst.op, Op::Load(p, _) if lane_ptrs.contains(&p.0)) {
+            return None;
+        }
         let plan = match &inst.op {
+            Op::Load(p, ty) if lane_ptrs.contains(&p.0) => {
+                lane_bytes(ty)?;
+                vector_ty.insert(inst.result?.0, ty.clone());
+                replicated += 1;
+                Plan::Gather
+            }
             Op::Load(_, ty) => match access_at.get(&(block, i)).map(|a| &a.addr) {
                 Some(AddrForm::Affine { .. }) => {
                     lane_bytes(ty)?;
@@ -1713,24 +1886,33 @@ fn plan_body(
                 // scalar loop's answer.
                 _ => return None,
             },
-            // Address arithmetic stays scalar and must *be* scalar: a vector index is a gather.
-            Op::Gep { .. } => {
-                if operand_is_vec {
+            // Address arithmetic stays scalar, except a gather's: a `gep` off a uniform base whose
+            // index varies per lane becomes one address per lane.
+            Op::Gep { ptr, index, .. } => {
+                if !operand_is_vec {
+                    Plan::Scalar
+                } else if lane_at(&vector_ty, at, *ptr).is_none()
+                    && lane_at(&vector_ty, at, *index).is_some()
+                {
+                    lane_ptrs.insert(inst.result?.0);
+                    Plan::LaneGep
+                } else {
                     return None;
                 }
-                Plan::Scalar
             }
             Op::ConstInt(..) | Op::ConstFloat(..) => Plan::Scalar,
             Op::Bin(op, lhs, rhs) => {
                 if !operand_is_vec {
                     Plan::Scalar
                 } else {
-                    let ty = f.value_type(inst.result?).clone();
+                    let r = inst.result?;
+                    let ty = f.value_type(r).clone();
                     lane_bytes(&ty)?;
-                    let ok = match op {
+                    let widenable = match op {
                         // A shift by an amount that is the same in every lane keeps that amount
                         // scalar — `Op::Bin`'s vector-by-scalar shape, which is what every vector
-                        // ISA's shift takes. A per-lane amount (`x[i] << y[i]`) has no such form.
+                        // ISA's shift takes. A per-lane amount (`x[i] << y[i]`) has no such form
+                        // and is replicated.
                         BinOp::Shl | BinOp::LShr | BinOp::AShr => {
                             lane_at(&vector_ty, at, *lhs).is_some()
                                 && lane_at(&vector_ty, at, *rhs).is_none()
@@ -1739,11 +1921,16 @@ fn plan_body(
                         BinOp::Mul if ty == MirType::I8 => true,
                         _ => bin_widenable(*op, &ty),
                     };
-                    if !ok {
-                        return None;
+                    vector_ty.insert(r.0, ty);
+                    if !widenable || only_indexes(r) {
+                        lane_vals.insert(r.0);
+                        if !only_indexes(r) {
+                            replicated += 1;
+                        }
+                        Plan::Replicate
+                    } else {
+                        Plan::Widen
                     }
-                    vector_ty.insert(inst.result?.0, ty);
-                    Plan::Widen
                 }
             }
             Op::Cmp(..) => {
@@ -1821,15 +2008,73 @@ fn plan_body(
                         return None;
                     }
                     let from = lane_at(&vector_ty, at, *v)?;
-                    let route = cast_route(*kind, &from, to)?;
-                    vector_ty.insert(inst.result?.0, to.clone());
-                    Plan::Cast(route)
+                    lane_bytes(to)?;
+                    let r = inst.result?;
+                    vector_ty.insert(r.0, to.clone());
+                    match cast_route(*kind, &from, to) {
+                        Some(route) if !only_indexes(r) => Plan::Cast(route),
+                        // No vector form (an `f64 -> i64` conversion), or a value only addresses
+                        // read: one scalar cast per lane.
+                        _ if !matches!(kind, CastKind::IntToPtr | CastKind::PtrToInt) => {
+                            lane_vals.insert(r.0);
+                            if !only_indexes(r) {
+                                replicated += 1;
+                            }
+                            Plan::Replicate
+                        }
+                        _ => return None,
+                    }
                 }
             }
             // A call may do anything; an alloca inside the body would allocate per lane group; a
             // splat/veckernel means someone already vectorized this.
             _ => return None,
         };
+        // The induction variable's *address* face is one scalar for the whole group, and so is
+        // every value computed from it while it stays scalar (`i * 2`, `gep(x, i)`): exactly right
+        // where a widened access takes it as its base, wrong anywhere a lane needs its own
+        // iteration's value. `classify_iv_uses` keeps such values out of every value role, which
+        // leaves one way to mix one into a lane-varying step: an address that is itself gathered,
+        // `x[i + q[i]]` or a row `x[i][q[i]]`, where every lane would see the group's first `i`.
+        // Only the ramp (`i + k` in lane `k`; `lane_at` answers it) may meet a lane-varying
+        // operand.
+        if matches!(plan, Plan::Scalar) {
+            let mut derived = false;
+            each_op_use(&inst.op, &mut |u| derived |= iv_addr.contains(&u.0));
+            if derived {
+                if let Some(r) = inst.result {
+                    iv_addr.insert(r.0);
+                }
+            }
+        } else {
+            // A widened access's own address is the one place the scalar face is the right one.
+            let address = match &inst.op {
+                Op::Load(p, _) => Some(*p),
+                Op::Store { ptr, .. } => Some(*ptr),
+                _ => None,
+            };
+            let mut mixes = false;
+            each_op_use(&inst.op, &mut |u| {
+                mixes |= Some(u) != address
+                    && iv_addr.contains(&u.0)
+                    && lane_at(&vector_ty, at, u).is_none();
+            });
+            if mixes {
+                return None;
+            }
+        }
+        // A widened step reading a replicated value packs it into vectors, so its lane type joins
+        // the group width.
+        if !matches!(plan, Plan::Replicate | Plan::LaneGep | Plan::Gather) {
+            each_op_use(&inst.op, &mut |u| {
+                if lane_vals.contains(&u.0) {
+                    packed.push(f.value_type(u).clone());
+                }
+            });
+        }
+        if ramp.value_use.contains(&at) && !matches!(plan, Plan::Replicate) {
+            ramp_vector = true;
+        }
         plans.push(plan);
     }
 
@@ -1842,16 +2087,30 @@ fn plan_body(
                 if !is_vec(&vector_ty, a) {
                     return None;
                 }
+                if lane_vals.contains(&a.0) {
+                    packed.push(r.ty.clone());
+                }
             }
             (None, Some((x, y))) => {
                 if !is_vec(&vector_ty, x) || !is_vec(&vector_ty, y) {
                     return None;
                 }
+                if lane_vals.contains(&x.0) || lane_vals.contains(&y.0) {
+                    packed.push(r.ty.clone());
+                }
             }
             _ => return None,
         }
     }
-    Some((plans, vector_ty, reductions))
+    Some(BodyPlan {
+        plans,
+        vector_ty,
+        reductions,
+        lane_vals,
+        packed,
+        ramp_vector,
+        replicated,
+    })
 }
 
 /// May this binary operator be applied lane-wise, vector by vector, at this result type?
@@ -2623,7 +2882,9 @@ fn emit_body(
     // induction variable is a `gep` index (uniform) and a compare operand (ramp) in the same block,
     // and the plan says which role each step is.
     let iv_scalar = vh_params[p.iv_index];
-    let ramp: Option<Vec<ValueId>> = p.ramp.needed().then(|| {
+    // The counter's per-lane values `i + k`, built the first time a replicated step reads it.
+    let mut iv_lanes: Option<Vec<ValueId>> = None;
+    let ramp: Option<Vec<ValueId>> = p.ramp_vector.then(|| {
         let ty = p.ramp.ty.clone();
         let vt = part_ty(&ty);
         let per_part = lanes_of(&ty).expect("an integer induction variable has a vector width");
@@ -2785,6 +3046,55 @@ fn emit_body(
                     let at = part_ptr(e, vb, ptr, &lane, k);
                     e.push_void(vb, Op::Store { ptr: at, value });
                 }
+            }
+            Plan::Replicate | Plan::LaneGep => {
+                let r = inst.result.expect("a replicated op has a result");
+                let ty = e.f.value_type(r).clone();
+                // Each operand's `W` per-lane values: the counter's `i + k` where this step reads
+                // it as a value, otherwise extracted from a vector, a replicated value's own lanes,
+                // or a uniform value repeated.
+                let mut uses = Vec::new();
+                each_op_use(&inst.op, &mut |u| uses.push(u));
+                let mut table: FxHashMap<u32, Vec<ValueId>> = FxHashMap::default();
+                for u in uses {
+                    if table.contains_key(&u.0) {
+                        continue;
+                    }
+                    let lanes = if p.ramp.reads_as_value(i, u) {
+                        iv_lanes
+                            .get_or_insert_with(|| iv_lane_values(e, vb, iv_scalar, &p.iv_ty, p.w))
+                            .clone()
+                    } else {
+                        lane_values(e, vb, &map, u, p.w)
+                    };
+                    table.insert(u.0, lanes);
+                }
+                let out = (0..p.w as usize)
+                    .map(|k| {
+                        let mut op = inst.op.clone();
+                        crate::map_op_uses(&mut op, |u| table[&u.0][k]);
+                        e.push(vb, ty.clone(), op)
+                    })
+                    .collect();
+                map.insert(r.0, Wide::Lanes(out));
+            }
+            Plan::Gather => {
+                let Op::Load(ptr, ty) = &inst.op else {
+                    unreachable!("Gather plan on a non-load")
+                };
+                let addrs = match map.get(&ptr.0) {
+                    Some(Wide::Lanes(x)) => x.clone(),
+                    _ => unreachable!("plan_body proved a gather reads per-lane addresses"),
+                };
+                let lanes: Vec<ValueId> = addrs
+                    .into_iter()
+                    .map(|q| e.push(vb, ty.clone(), Op::Load(q, ty.clone())))
+                    .collect();
+                let parts = pack_lanes(e, vb, &lanes, ty);
+                map.insert(
+                    inst.result.expect("a load has a result").0,
+                    Wide::Vector(parts),
+                );
             }
             Plan::GroupLoad { group, offset } => {
                 let Op::Load(ptr, _) = &inst.op else {
@@ -2962,6 +3272,9 @@ fn extract_lanes(
     v: ValueId,
     lane: &MirType,
 ) -> Vec<ValueId> {
+    if let Some(Wide::Lanes(xs)) = map.get(&v.0) {
+        return xs.clone();
+    }
     let parts = resolve_vector(map, v);
     let per_part = lanes_of(lane).expect("a widened lane type has a vector width");
     let mut out = Vec::with_capacity(parts.len() * per_part as usize);
@@ -3203,7 +3516,7 @@ fn emit_widened(
         Op::Bin(b, x, y) => {
             let xs = to_vector(e, vb, map, *x, lane, w);
             if matches!(b, BinOp::Shl | BinOp::LShr | BinOp::AShr)
-                && !matches!(map.get(&y.0), Some(Wide::Vector(_)))
+                && matches!(map.get(&y.0), Some(Wide::Uniform(_)) | None)
             {
                 // The amount is the same in every lane: keep it scalar (`Op::Bin`'s
                 // vector-by-scalar shape), masked to the lane width by every backend exactly as
@@ -3478,7 +3791,7 @@ fn resolve_uniform(map: &FxHashMap<u32, Wide>, v: ValueId) -> ValueId {
         // A value the map does not hold is defined outside the loop and dominates the vector body
         // unchanged (the guard sits between the original preheader and the original header).
         None => v,
-        Some(Wide::Vector(_)) => {
+        Some(Wide::Vector(_) | Wide::Lanes(_)) => {
             unreachable!("plan_body proved this operand is uniform")
         }
     }
@@ -3502,11 +3815,83 @@ fn to_vector(
 ) -> Vec<ValueId> {
     let scalar = match map.get(&v.0) {
         Some(Wide::Vector(x)) => return x.clone(),
+        Some(Wide::Lanes(xs)) => {
+            let xs = xs.clone();
+            return pack_lanes(e, vb, &xs, lane);
+        }
         Some(Wide::Uniform(x)) => *x,
         None => v,
     };
     let splat = e.push(vb, part_ty(lane), Op::Splat(scalar));
     vec![splat; parts_of(lane, w)]
+}
+
+/// `W` scalar lane values packed into full-width vectors of `lane`: each part starts as a splat of
+/// its first lane and takes every further lane through `Op::InsertLane`.
+fn pack_lanes(e: &mut Emit<'_>, vb: BlockId, lanes: &[ValueId], lane: &MirType) -> Vec<ValueId> {
+    let per_part = lanes_of(lane).expect("a packed lane type has a vector width") as usize;
+    let vty = part_ty(lane);
+    lanes
+        .chunks(per_part)
+        .map(|chunk| {
+            let mut v = e.push(vb, vty.clone(), Op::Splat(chunk[0]));
+            for (k, &x) in chunk.iter().enumerate().skip(1) {
+                v = e.push(vb, vty.clone(), Op::InsertLane(v, x, k as u32));
+            }
+            v
+        })
+        .collect()
+}
+
+/// A value's `w` per-lane scalars, lowest iteration first: a replicated value's own lanes, a
+/// vector's lanes extracted part by part, or a uniform value repeated.
+fn lane_values(
+    e: &mut Emit<'_>,
+    vb: BlockId,
+    map: &FxHashMap<u32, Wide>,
+    v: ValueId,
+    w: u32,
+) -> Vec<ValueId> {
+    match map.get(&v.0) {
+        Some(Wide::Lanes(xs)) => xs.clone(),
+        Some(Wide::Vector(parts)) => {
+            let parts = parts.clone();
+            let mut out = Vec::with_capacity(w as usize);
+            for part in parts {
+                let (lane, n) = match e_ty(e, part) {
+                    MirType::Vec(l, n) => (*l, n),
+                    other => (other, 1),
+                };
+                for k in 0..n {
+                    out.push(e.push(vb, lane.clone(), Op::ExtractLane(part, k)));
+                }
+            }
+            out
+        }
+        Some(Wide::Uniform(x)) => vec![*x; w as usize],
+        None => vec![v; w as usize],
+    }
+}
+
+/// The induction variable's value in each lane of the group: `i + k`, wrapping exactly as the
+/// scalar loop's `i + 1` chain does.
+fn iv_lane_values(
+    e: &mut Emit<'_>,
+    vb: BlockId,
+    iv: ValueId,
+    ty: &MirType,
+    w: u32,
+) -> Vec<ValueId> {
+    (0..w)
+        .map(|k| {
+            if k == 0 {
+                iv
+            } else {
+                let off = e.int(vb, ty, i64::from(k));
+                e.push(vb, ty.clone(), Op::Bin(BinOp::Add, iv, off))
+            }
+        })
+        .collect()
 }
 
 /// Point every edge of `t` that goes to `from` at `to`, keeping its arguments.
@@ -3879,8 +4264,10 @@ mod tests {
     /// vector-by-scalar `Bin` shape — so a shift whose amount is the same in every lane widens at
     /// every integer width, `>>` as well as `<<`, by a literal or by a loop-invariant value. Each
     /// emitted shift keeps its amount scalar (asserted on the MIR). A per-lane amount (`x[i] <<
-    /// y[i]`) still stays scalar: handing Cranelift a vector amount is the CLIF type error that, in a
-    /// release build with the verifier off, crashed the compiler inside ISLE.
+    /// y[i]`) never becomes a vector shift — handing Cranelift a vector amount is the CLIF type
+    /// error that, in a release build with the verifier off, crashed the compiler inside ISLE. It
+    /// is replicated lane by lane instead, and a body with no other arithmetic, like this one, is
+    /// not worth that and stays scalar.
     #[test]
     fn a_uniform_shift_widens_at_every_width_and_a_per_lane_one_does_not() {
         for (ty, lit) in [
@@ -4216,7 +4603,11 @@ mod tests {
         assert!(!is_widened(src, "k"), "a prefix scan must stay scalar");
     }
 
-    /// A gathered index is not affine in the induction variable, so no lane offset is known.
+    /// A gathered index is not affine in the induction variable, so no lane offset is known — and
+    /// here that is not what keeps the loop scalar. `x` and `o` are two unpromised slices that may
+    /// be one buffer, so the gather may read what the loop stores (`loop_info::dependence` says
+    /// carried), and the checked `x[ix[i]]` keeps a bounds check no guard can cover. The gathers
+    /// that widen, lane by lane, are below.
     #[test]
     fn a_gathered_index_is_declined() {
         let src = "fn k(ix: []i32, x: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
@@ -4226,22 +4617,202 @@ mod tests {
     }
 
     /// The induction variable is uniform across a group only as an *address*. Used as a value it is
-    /// `i + k` in lane `k`, so the widened body reads it through the lane ramp `splat(i) + iota`.
-    /// An `i64` counter over `f32` data is now two `<2 x i64>` ramp parts — but this body converts
-    /// that counter to `f32`, and an integer-to-narrower-float conversion has no exact packed form
-    /// (`i64 -> f64 -> f32` rounds twice), so the loop is still declined rather than splatted.
+    /// `i + k` in lane `k`. Converting an `i64` counter to `f32` has no exact packed form (`i64 ->
+    /// f64 -> f32` rounds twice), so that one conversion is replicated: each lane converts its own
+    /// `i + k` with the scalar cast, and the multiply reading the packed result widens. No lane
+    /// ramp is built — the only step reading the counter as a value is the replicated one. The
+    /// counter starts just below 2^24, where `f32` stops holding every integer, so a lane given
+    /// the wrong `i + k`, or a conversion that rounded twice, changes what is printed.
     #[test]
-    fn a_counter_whose_lanes_do_not_match_the_data_width_is_declined() {
-        let src = "fn k(mut o: []f32, n: i64) { let mut i: i64 = 0; \
-                   while i < n { o[i] = (i as f32) * 0.25; i = i + 1; } } \
-                   fn main() -> i32 { return 0; }";
+    fn an_i64_counter_converted_to_f32_is_replicated_lane_by_lane() {
+        let kernel = "@unchecked fn k(mut o: []f32, lo: i64, hi: i64) { \
+                      let mut i: i64 = lo; \
+                      while i < hi { o[i - lo] = (i as f32) * 0.25; i = i + 1; } }";
+        let shape = format!("{kernel} fn main() -> i32 {{ return 0; }}");
+        let (program, mut interner) = optimized(&shape, 2);
+        let f = program.function(interner.intern("k")).expect("no fn k");
+        let ops: Vec<&Op> = f
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .map(|i| &i.op)
+            .collect();
         assert!(
-            !is_widened(src, "k"),
-            "an i64 counter over f32 data has no 4-lane ramp"
+            ops.iter().any(|op| matches!(op, Op::InsertLane(..))),
+            "the converted lanes were not packed: {ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(op, Op::Iota(_))),
+            "no widened step reads the counter, so no ramp should be built"
+        );
+        scalar_and_vector_agree(&format!(
+            "{kernel} fn main() -> i32 {{ let mut o: []f32 = alloc_f32(23); \
+             k(o, 16777211, 16777234); let mut j: i64 = 0; \
+             while j < 23 {{ print((o[j] * 4.0) as i64); j = j + 1; }} \
+             free(o); return 0; }}"
+        ));
+    }
+
+    /// The ops of one function at `-O2`, flattened.
+    fn ops_of(src: &str, func: &str) -> Vec<Op> {
+        let (program, mut interner) = optimized(src, 2);
+        let f = program
+            .function(interner.intern(func))
+            .unwrap_or_else(|| panic!("no fn {func}"));
+        f.blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .map(|i| i.op.clone())
+            .collect()
+    }
+
+    /// `lut[q[i]]` is a gather: its index is data, so no lane offset is known. Every lane can still
+    /// do its own scalar load (`Plan::LaneGep` + `Plan::Gather`), and the multiply and add around
+    /// it widen. `@noalias` is what lets the gather go: it promises the stored slice is not `lut`,
+    /// so `loop_info::dependence` can tell the gathered load apart from every store in the loop.
+    /// `@unchecked` drops the bounds check a data-dependent index would otherwise keep.
+    #[test]
+    fn a_gather_beside_widened_work_is_replicated_lane_by_lane() {
+        let src = "@unchecked fn k(@noalias mut o: []f32, lut: []f32, q: []i32, s: []f32, \
+                   n: i64) { let mut i: i64 = 0; \
+                   while i < n { o[i] = lut[q[i] as i64] * s[i] + 1.0; i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        let ops = ops_of(src, "k");
+        let inserts = ops
+            .iter()
+            .filter(|op| matches!(op, Op::InsertLane(..)))
+            .count();
+        assert!(
+            inserts >= 3,
+            "four gathered f32 lanes take three lane inserts, found {inserts}"
+        );
+        let f32x4 = MirType::Vec(Box::new(MirType::F32), 4);
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, Op::Load(_, t) if *t == f32x4)),
+            "s[i] was not loaded as a vector"
         );
     }
 
-    /// The same loop at matching lane widths: an `i32` counter over `f32` data widens, and the
+    /// The same loop without the promise: `lut` and `o` may be one buffer, so the gather may read
+    /// what an earlier lane stored, and the loop stays scalar.
+    #[test]
+    fn a_gather_from_a_slice_the_loop_may_store_is_declined() {
+        let src = "@unchecked fn k(mut o: []f32, lut: []f32, q: []i32, s: []f32, n: i64) { \
+                   let mut i: i64 = 0; \
+                   while i < n { o[i] = lut[q[i] as i64] * s[i] + 1.0; i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        assert!(
+            !is_widened(src, "k"),
+            "a possibly-aliased gather must stay scalar"
+        );
+    }
+
+    /// A local table nothing outside the function can name needs no promise: no pointer the loop
+    /// stores through can reach a stack slot whose address never escaped. The gather loop sits in
+    /// `main` itself so inlining cannot change what is compared, and it is the only loop there
+    /// that can widen (the fill loop carries `v`, the print loop calls), so a lane insert in
+    /// `main` is this loop. Every lane is printed, exactly (`lut * s + 1` is a multiple of 1/32).
+    #[test]
+    fn a_gather_from_a_local_table_agrees_with_the_scalar_loop() {
+        let src = "@unchecked fn main() -> i32 { \
+                   let lut: [f32; 8] = [0.5, -1.25, 2.0, 3.75, -4.5, 5.25, 6.0, -7.75]; \
+                   let mut q: []i32 = alloc_i32(37); let mut s: []f32 = alloc_f32(37); \
+                   let mut o: []f32 = alloc_f32(37); let mut j: i64 = 0; let mut v: f32 = -2.0; \
+                   while j < 37 { q[j] = ((j * 5) % 8) as i32; s[j] = v; v = v + 0.375; \
+                   j = j + 1; } \
+                   j = 0; while j < 37 { o[j] = lut[q[j] as i64] * s[j] + 1.0; j = j + 1; } \
+                   j = 0; while j < 37 { print((o[j] * 64.0) as i64); j = j + 1; } \
+                   free(q); free(s); free(o); return 0; }";
+        assert!(
+            ops_of(src, "main")
+                .iter()
+                .any(|op| matches!(op, Op::InsertLane(..))),
+            "the gather loop in main was not widened"
+        );
+        scalar_and_vector_agree(src);
+    }
+
+    /// The counter's *address* face is one scalar for the whole group. Mixed into a gathered index
+    /// (`x[i + q[i]]`), replicating the add would hand every lane the group's first `i`, so a
+    /// lane-varying step that reads an address computed from the counter is declined. Without the
+    /// check this loop widens — the gather is promised apart from the store — and lane `k` reads
+    /// `x[i + q[i + k]]` instead of `x[i + k + q[i + k]]`.
+    #[test]
+    fn a_counter_inside_a_gathered_index_is_declined() {
+        let src = "@unchecked fn k(@noalias mut o: []f32, x: []f32, q: []i32, n: i64) { \
+                   let mut i: i64 = 0; \
+                   while i < n { o[i] = x[i + (q[i] as i64)] * 2.0 + 1.0; i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        assert!(
+            !is_widened(src, "k"),
+            "a gathered index built from the counter must stay scalar"
+        );
+    }
+
+    /// Integer division and remainder, a per-lane shift amount and an `f64 -> i64` conversion have
+    /// no packed form on this target. Each runs once per lane on that lane's own operands, its
+    /// results are packed, and the arithmetic around it widens. No vector divide and no shift by a
+    /// vector amount may reach a backend (Cranelift has neither, and the second is the CLIF type
+    /// error that crashed ISLE). The inputs reach every edge the scalar forms define: a zero
+    /// divisor, `i32::MIN / -1`, negative shift amounts (masked to the lane width) and conversions
+    /// that saturate, then wrap on `+ 1`.
+    #[test]
+    fn steps_with_no_packed_form_are_replicated_and_agree_with_the_scalar_loop() {
+        let kernels = "@unchecked fn div(x: []i32, y: []i32, mut o: []i32, n: i64) { \
+                       let mut i: i64 = 0; \
+                       while i < n { o[i] = x[i] * 3 + x[i] / y[i] - x[i] % y[i]; i = i + 1; } } \
+                       @unchecked fn shl(x: []i32, y: []i32, mut o: []i32, n: i64) { \
+                       let mut i: i64 = 0; \
+                       while i < n { o[i] = ((x[i] << y[i]) + (x[i] >> y[i])) ^ x[i]; \
+                       i = i + 1; } } \
+                       @unchecked fn cvt(x: []f64, mut o: []i64, n: i64) { let mut i: i64 = 0; \
+                       while i < n { o[i] = (x[i] * 2.5) as i64 + 1; i = i + 1; } }";
+        let shape = format!("{kernels} fn main() -> i32 {{ return 0; }}");
+        let (program, mut interner) = optimized(&shape, 2);
+        for name in ["div", "shl", "cvt"] {
+            let f = program
+                .function(interner.intern(name))
+                .unwrap_or_else(|| panic!("no fn {name}"));
+            let mut packed = false;
+            for inst in f.blocks.iter().flat_map(|b| b.insts.iter()) {
+                match &inst.op {
+                    Op::InsertLane(..) => packed = true,
+                    Op::Bin(BinOp::SDiv | BinOp::UDiv | BinOp::SRem | BinOp::URem, a, _) => {
+                        assert!(!f.value_type(*a).is_vector(), "{name}: a vector divide")
+                    }
+                    Op::Bin(BinOp::Shl | BinOp::LShr | BinOp::AShr, _, b) => {
+                        assert!(
+                            !f.value_type(*b).is_vector(),
+                            "{name}: a shift by a vector amount"
+                        )
+                    }
+                    Op::Cast(CastKind::FpToSi, v, _) => assert!(
+                        !f.value_type(*v).is_vector(),
+                        "{name}: a vector f64 -> i64 conversion"
+                    ),
+                    _ => {}
+                }
+            }
+            assert!(packed, "{name}: no replicated result was packed");
+        }
+        scalar_and_vector_agree(&format!(
+            "{kernels} @unchecked fn main() -> i32 {{ let n: i64 = 29; \
+             let mut x: []i32 = alloc_i32(n); let mut y: []i32 = alloc_i32(n); \
+             let mut o: []i32 = alloc_i32(n); let mut d: []f64 = alloc_f64(n); \
+             let mut l: []i64 = alloc_i64(n); let mut j: i64 = 0; \
+             while j < n {{ x[j] = ((j * 977 + 13) % 2001 - 1000) as i32; \
+             y[j] = (j % 7 - 3) as i32; d[j] = ((j * 37 - 300) as f64) * 0.375; j = j + 1; }} \
+             x[2] = (0 - 2147483648) as i32; \
+             let big: f64 = 1000000000000.0 * 1000000000000.0; d[5] = big; d[6] = 0.0 - big; \
+             div(x, y, o, n); j = 0; while j < n {{ print(o[j]); j = j + 1; }} \
+             shl(x, y, o, n); j = 0; while j < n {{ print(o[j]); j = j + 1; }} \
+             cvt(d, l, n); j = 0; while j < n {{ print(l[j]); j = j + 1; }} \
+             free(x); free(y); free(o); free(d); free(l); return 0; }}"
+        ));
+    }
+
+    /// A counter at its data's lane width: an `i32` counter over `f32` data widens, and the
     /// ramp — not a splat — is what makes lane `k` see `i + k`.
     #[test]
     fn a_counter_read_as_a_value_is_widened_through_a_lane_ramp() {

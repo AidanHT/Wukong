@@ -1,0 +1,243 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -4
+// EXPECT-OUT: -97
+// EXPECT-OUT: -24
+// EXPECT-OUT: 101
+// EXPECT-OUT: 44
+// EXPECT-OUT: 13
+// EXPECT-OUT: 8
+// EXPECT-OUT: 23
+// EXPECT-OUT: 12
+// EXPECT-OUT: 71
+// EXPECT-OUT: 40
+// EXPECT-OUT: -147
+// EXPECT-OUT: -100
+// EXPECT-OUT: -27
+// EXPECT-OUT: 200
+// EXPECT-OUT: 143
+// EXPECT-OUT: 28
+// EXPECT-OUT: 239
+// EXPECT-OUT: 104
+// EXPECT-OUT: -2632
+// EXPECT-OUT: -25
+// EXPECT-OUT: 0
+// EXPECT-OUT: -171
+// EXPECT-OUT: 3680
+// EXPECT-OUT: -364
+// EXPECT-OUT: 2910
+// EXPECT-OUT: -402
+// EXPECT-OUT: 2065
+// EXPECT-OUT: -396
+// EXPECT-OUT: 2337
+// EXPECT-OUT: -980
+// EXPECT-OUT: 2562
+// EXPECT-OUT: -972
+// EXPECT-OUT: 1826
+// EXPECT-OUT: -847
+// EXPECT-OUT: 1276
+// EXPECT-OUT: -1158
+// EXPECT-OUT: 2364
+// EXPECT-OUT: 1610613722
+// EXPECT-OUT: -2147483639
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 73
+// EXPECT-OUT: 2916
+// EXPECT-OUT: 478
+// EXPECT-OUT: 6364
+// EXPECT-OUT: -536870762
+// EXPECT-OUT: -2147482822
+// EXPECT-OUT: 197
+// EXPECT-OUT: 1309
+// EXPECT-OUT: 656
+// EXPECT-OUT: 3835
+// EXPECT-OUT: 2151
+// EXPECT-OUT: -1610612051
+// EXPECT-OUT: -1073741486
+// EXPECT-OUT: 638
+// EXPECT-OUT: 642
+// EXPECT-OUT: 1930
+// EXPECT-OUT: -280
+// EXPECT-OUT: -245
+// EXPECT-OUT: -210
+// EXPECT-OUT: -176
+// EXPECT-OUT: -141
+// EXPECT-OUT: -9223372036854775808
+// EXPECT-OUT: -9223372036854775807
+// EXPECT-OUT: 1
+// EXPECT-OUT: -2
+// EXPECT-OUT: 31
+// EXPECT-OUT: 66
+// EXPECT-OUT: 101
+// EXPECT-OUT: 136
+// EXPECT-OUT: 170
+// EXPECT-OUT: 205
+// EXPECT-OUT: 240
+// EXPECT-OUT: 274
+// EXPECT-OUT: 309
+// EXPECT-OUT: 344
+// EXPECT-OUT: 16777209
+// EXPECT-OUT: 16777210
+// EXPECT-OUT: 16777211
+// EXPECT-OUT: 16777212
+// EXPECT-OUT: 16777213
+// EXPECT-OUT: 16777214
+// EXPECT-OUT: 16777214
+// EXPECT-OUT: 16777216
+// EXPECT-OUT: 16777218
+// EXPECT-OUT: 16777218
+// EXPECT-OUT: 16777218
+// EXPECT-OUT: 16777220
+// EXPECT-OUT: 16777222
+// EXPECT-OUT: 16777222
+// EXPECT-OUT: 16777222
+// EXPECT-OUT: 16777224
+// EXPECT-OUT: 16777226
+// EXPECT-OUT: 16777226
+// EXPECT-OUT: 16777226
+
+module tests.run.vectorized_replicate
+
+// Loop bodies with one step that has no packed form, which the general loop vectorizer
+// (`wukong_opt::vectorize`) now widens by REPLICATING that step: it runs once per lane on that
+// lane's own operands, and its results are packed into vectors (`insertlane`) for the arithmetic
+// around it, which widens as usual. Before, one such step kept the whole loop scalar.
+//
+//   lookup   o[i] = lut[q[i]] * s[i] + 1 -- a GATHER from a local table: one scalar load per
+//            lane at that lane's own index. No store in the loop can reach a stack slot whose
+//            address never escapes, so the gather needs no promise. lut = [0.5, -1.25, 2, 3.75,
+//            -4.5, 5.25, 6, -7.75], q = (5j) mod 8, s = j/2 - 3; printed as 8*o.
+//   divide   o = x*3 + x/y - x%y at i32 -- integer divide and remainder have no packed form. y
+//            cycles -3..3, so a zero divisor (0 for both, as the scalar forms define) and
+//            i32::MIN / -1 (x[2], wrapping) are both reached. x = ((977j + 13) mod 2001) - 1000.
+//   shift    o = ((x << y) + (x >> y)) ^ x -- a shift by a per-lane amount. Negative amounts are
+//            masked to the lane width (-3 shifts by 29), exactly as the scalar shift masks them.
+//   convert  o = (d * 2.5) as i64 + 1 -- `f64 -> i64` has no packed form on this target. d = 0.375
+//            * (37j - 300), except d[5] = 1e24 and d[6] = -1e24 (saturate, then `+ 1` wraps
+//            i64::MAX to i64::MIN) and d[7] = NaN (converts to 0).
+//   ramp     o[i - lo] = (i as f32) * 0.5 - 1 for i from lo = 2^24 - 5 -- an `i64` counter read as
+//            a value and converted to `f32`, which has no exact packed form either: each lane
+//            converts its own i + k. Past 2^24 `f32` holds only even integers (ties to even), so a
+//            lane given the wrong counter prints a visibly different number. Printed as 2*o.
+//
+// The trip count is 19 everywhere, so every loop runs whole groups and a scalar epilogue. Every
+// element of every output is printed, and every expectation was derived from the scalar semantics
+// of the loop at its own width, never recorded from compiler output.
+//
+// Re-check that the loops really widen (interp and native agree whether or not they do):
+//     wukongc --emit=mir -O2 tests/run/vectorized_replicate.wk | grep insertlane
+
+@unchecked
+fn lookup(q: []i32, s: []f32, mut o: []f32, n: i64) {
+    let lut: [f32; 8] = [0.5, -1.25, 2.0, 3.75, -4.5, 5.25, 6.0, -7.75];
+    let mut i: i64 = 0;
+    while i < n {
+        o[i] = lut[q[i] as i64] * s[i] + 1.0;
+        i = i + 1;
+    }
+}
+
+fn divide(x: []i32, y: []i32, mut o: []i32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        o[i] = x[i] * 3 + x[i] / y[i] - x[i] % y[i];
+        i = i + 1;
+    }
+}
+
+fn shift(x: []i32, y: []i32, mut o: []i32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        o[i] = ((x[i] << y[i]) + (x[i] >> y[i])) ^ x[i];
+        i = i + 1;
+    }
+}
+
+fn convert(d: []f64, mut o: []i64, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        o[i] = (d[i] * 2.5) as i64 + 1;
+        i = i + 1;
+    }
+}
+
+fn ramp(mut o: []f32, lo: i64, hi: i64) {
+    let mut i: i64 = lo;
+    while i < hi {
+        o[i - lo] = (i as f32) * 0.5 - 1.0;
+        i = i + 1;
+    }
+}
+
+fn main() -> i32 {
+    let n: i64 = 19;
+    let mut q: []i32 = alloc_i32(n);
+    let mut s: []f32 = alloc_f32(n);
+    let mut g: []f32 = alloc_f32(n);
+    let mut x: []i32 = alloc_i32(n);
+    let mut y: []i32 = alloc_i32(n);
+    let mut o: []i32 = alloc_i32(n);
+    let mut d: []f64 = alloc_f64(n);
+    let mut l: []i64 = alloc_i64(n);
+    let mut r: []f32 = alloc_f32(n);
+    let mut j: i64 = 0;
+    while j < n {
+        q[j] = ((j * 5) % 8) as i32;
+        s[j] = (j as f32) * 0.5 - 3.0;
+        x[j] = ((j * 977 + 13) % 2001 - 1000) as i32;
+        y[j] = (j % 7 - 3) as i32;
+        d[j] = ((j * 37 - 300) as f64) * 0.375;
+        j = j + 1;
+    }
+    x[2] = (0 - 2147483648) as i32;
+    let big: f64 = 1000000000000.0 * 1000000000000.0;
+    d[5] = big;
+    d[6] = 0.0 - big;
+    d[7] = (big - big) / (big - big);
+
+    lookup(q, s, g, n);
+    j = 0;
+    while j < n {
+        print((g[j] * 8.0) as i32);
+        j = j + 1;
+    }
+
+    divide(x, y, o, n);
+    j = 0;
+    while j < n {
+        print(o[j]);
+        j = j + 1;
+    }
+
+    shift(x, y, o, n);
+    j = 0;
+    while j < n {
+        print(o[j]);
+        j = j + 1;
+    }
+
+    convert(d, l, n);
+    j = 0;
+    while j < n {
+        print(l[j]);
+        j = j + 1;
+    }
+
+    ramp(r, 16777211, 16777230);
+    j = 0;
+    while j < n {
+        print((r[j] * 2.0) as i64);
+        j = j + 1;
+    }
+
+    free(q);
+    free(s);
+    free(g);
+    free(x);
+    free(y);
+    free(o);
+    free(d);
+    free(l);
+    free(r);
+    return 0;
+}
