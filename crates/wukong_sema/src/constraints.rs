@@ -6,9 +6,9 @@
 //! `where` bounds plus `const { assert!(..) }`, a dimension predicate is now checked:
 //!
 //! * **`where` predicates** — `where K % 16 == 0, M <= 4096` — compare *dimension expressions*:
-//!   integer literals, the function's generic dimensions and top-level `const`s, combined with
-//!   `+ - * / %` (truncating, in 128-bit integers) and joined with `&&` / `||`. Anything else is
-//!   `E0524`. Each is evaluated at every call whose dimensions it names are all compile-time
+//!   integer literals, the function's generic dimensions and top-level integer `const`s,
+//!   combined with `+ - * / %` (truncating, in 128-bit integers) and joined with `&&` / `||`.
+//!   Anything else is `E0524`. Each is evaluated at every call whose dimensions it names are all compile-time
 //!   constants, and a false one is `E0521` — "constraint `K % 16 == 0` of `tile` is not satisfied
 //!   (K = 24)" — at the call, with the predicate labelled. A predicate over no dimension is decided
 //!   once, at the declaration.
@@ -30,9 +30,9 @@ use wukong_ast::{
 };
 use wukong_diag::Diagnostic;
 use wukong_span::{FxHashMap as HashMap, Span, Symbol};
-use wukong_types::Dim;
+use wukong_types::{Dim, Scalar, Ty};
 
-use crate::Sema;
+use crate::{DefKind, Sema};
 
 /// One constraint of a function, checked at each of its calls.
 #[derive(Clone, Copy)]
@@ -143,10 +143,17 @@ impl<'a> Sema<'a> {
                 }
             }
             if let Some(body) = &f.body {
-                for s in &body.stmts {
-                    let StmtKind::Expr(e) = &s.kind else {
-                        continue;
-                    };
+                // A top-level expression statement, or the body's tail (`{ static_assert(N > 1) }`
+                // has no `;`, and is just as top-level).
+                let top = body
+                    .stmts
+                    .iter()
+                    .filter_map(|s| match &s.kind {
+                        StmtKind::Expr(e) => Some(e),
+                        _ => None,
+                    })
+                    .chain(body.tail.as_deref());
+                for e in top {
                     let Some((cond, msg)) = static_assert_args(e, self) else {
                         continue;
                     };
@@ -216,6 +223,17 @@ impl<'a> Sema<'a> {
         }
     }
 
+    /// Whether `sym` names a top-level integer `const`, the only kind a dimension expression may
+    /// read: `const_length` folds an integer initializer, and a float, `bool` or `char` `const`
+    /// would fold to 0 and decide the predicate on a value the source never wrote.
+    fn is_int_const(&self, sym: Symbol) -> bool {
+        self.consts.contains_key(&sym)
+            && matches!(
+                self.defs.lookup(sym).map(|d| &d.kind),
+                Some(DefKind::Const(Ty::Scalar(s))) if s.is_int() && *s != Scalar::Char
+            )
+    }
+
     /// Whether `e` is a constraint expression (see the module docs), reporting the first part that
     /// is not (`E0524`).
     fn valid_constraint(&mut self, e: &Expr, generics: &[Symbol], what: &str) -> bool {
@@ -223,8 +241,7 @@ impl<'a> Sema<'a> {
             ExprKind::Int(_) => true,
             ExprKind::Path(p) => {
                 p.is_single()
-                    && (generics.contains(&p.first().sym)
-                        || self.consts.contains_key(&p.first().sym))
+                    && (generics.contains(&p.first().sym) || self.is_int_const(p.first().sym))
             }
             ExprKind::Binary { op, lhs, rhs } => {
                 if !constraint_op(*op) {
@@ -273,7 +290,7 @@ impl<'a> Sema<'a> {
                         Some(Dim::Const(n)) => Some(Val::Int(*n as i128)),
                         _ => None,
                     }
-                } else if self.consts.contains_key(&sym) {
+                } else if self.is_int_const(sym) {
                     Some(Val::Int(self.const_length(sym, 0) as i128))
                 } else {
                     None
