@@ -430,7 +430,7 @@ mod tests {
         (M64_LGAMMA, 1.5, -0.12078223763524522, 4),
         (M64_LGAMMA, 1.75, -0.08440112102048555, 4),
         (M64_LGAMMA, 2.5, 0.2846828704729192, 4),
-        (M64_LGAMMA, 3.0, 0.6931471805599453, 4),
+        (M64_LGAMMA, 3.0, std::f64::consts::LN_2, 4), // lgamma(3) = ln 2
         (M64_LGAMMA, 7.5, 7.534364236758733, 4),
         (M64_LGAMMA, 8.0, 8.525161361065415, 4),
         (M64_LGAMMA, 10.0, 12.801827480081469, 4),
@@ -496,7 +496,7 @@ mod tests {
             (-2.75, -1.959055264977997),
         ] {
             let got = digamma(x);
-            let tol = 2e-15 * f64::max(1.0, want.abs());
+            let tol = 2e-15 * f64::max(1.0, f64::abs(want));
             assert!(
                 (got - want).abs() <= tol,
                 "digamma({x}) = {got:e}, expected {want:e}"

@@ -196,7 +196,7 @@ mod tests {
         assert_eq!(f8e5m2_to_f32(0x3c), 1.0);
         assert_eq!(f8e5m2_to_f32(0x7b), 57344.0);
         assert_eq!(f8e5m2_to_f32(0x7c), f32::INFINITY);
-        assert_eq!(f8e5m2_to_f32(0x01), 1.52587890625e-05); // 2^-16
+        assert_eq!(f8e5m2_to_f32(0x01), f32::powi(2.0, -16)); // 2^-16
     }
 
     /// Encoding every finite code's own value returns the code (signed zeros included).
@@ -252,6 +252,6 @@ mod tests {
         assert_eq!(f32_to_f8e5m2(1e6), 0x7c);
         assert_eq!(f32_to_f8e5m2(f32::NEG_INFINITY), 0xfc);
         assert_eq!(f32_to_f8e5m2(f32::NAN), 0x7e);
-        assert_eq!(f32_to_f8e5m2(7.62939453125e-06), 0x00); // 2^-17: tie between 0 and 2^-16
+        assert_eq!(f32_to_f8e5m2(f32::powi(2.0, -17)), 0x00); // 2^-17: tie between 0 and 2^-16
     }
 }
