@@ -25,7 +25,9 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `o[i] = if x > 0.0 { w[i] * x } else { 1.0 }` used to keep the loop scalar because only one arm
   stores or loads. Each lane now accesses its own element only where it took the arm (and a private
   scratch slot otherwise), so skipped elements are never rewritten and a buffer shorter than the
-  loop is never read past its end.
+  loop is never read past its end. An arm that alone subscripts a `[]T` parameter still keeps the
+  loop scalar unless the parameter is `@noalias` (the arm re-reads the slice's data pointer, which
+  is not speculated); arrays and local slices are unaffected.
 
 ### AOT executables and platform (`gap2/aot-and-platform`)
 
