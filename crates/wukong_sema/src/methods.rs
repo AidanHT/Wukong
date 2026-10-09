@@ -1001,8 +1001,10 @@ impl Sema<'_> {
             self.check_mut_receiver(r, method);
         }
         // `T::m(..)` with no receiver is resolved per instantiation from the argument types, so
-        // `T` must be the type of something the call's caller passes in.
-        if recv.is_none() && !self.generic_reaches_params(g) {
+        // `T` must be the type of something the call's caller passes in. That is a property of the
+        // generic signature, decided by the generic pass: an instance re-check (`inst_subst`
+        // non-empty) sees the parameters already substituted and must not re-ask it.
+        if recv.is_none() && self.inst_subst.is_empty() && !self.generic_reaches_params(g) {
             for a in args {
                 self.type_expr(a);
             }
