@@ -285,7 +285,8 @@ impl Coeff {
         }
     }
 
-    fn scale(self, k: i64) -> Option<Coeff> {
+    /// `k` times this coefficient, or `None` when the multiplier overflows.
+    pub(crate) fn scale(self, k: i64) -> Option<Coeff> {
         Some(match self {
             Coeff::Zero => Coeff::Zero,
             Coeff::Const(c) => Coeff::Const(c.checked_mul(k)?),
@@ -293,7 +294,8 @@ impl Coeff {
         })
     }
 
-    fn add(self, other: Coeff) -> Option<Coeff> {
+    /// The sum of two coefficients, or `None` when it is not representable (`n·i + 3·i`).
+    pub(crate) fn add(self, other: Coeff) -> Option<Coeff> {
         Some(match (self, other) {
             (Coeff::Zero, x) | (x, Coeff::Zero) => x,
             (Coeff::Const(a), Coeff::Const(b)) => Coeff::Const(a.checked_add(b)?),

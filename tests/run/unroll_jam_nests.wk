@@ -1,0 +1,213 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -48
+// EXPECT-OUT: -48
+// EXPECT-OUT: 16
+// EXPECT-OUT: 16
+// EXPECT-OUT: 8
+// EXPECT-OUT: 8
+// EXPECT-OUT: 88
+// EXPECT-OUT: 88
+// EXPECT-OUT: 48
+// EXPECT-OUT: 48
+// EXPECT-OUT: -16
+// EXPECT-OUT: -16
+// EXPECT-OUT: 64
+// EXPECT-OUT: 64
+// EXPECT-OUT: 32
+// EXPECT-OUT: 32
+// EXPECT-OUT: -32
+// EXPECT-OUT: -32
+// EXPECT-OUT: 40
+// EXPECT-OUT: 40
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: -64
+// EXPECT-OUT: -64
+// EXPECT-OUT: 64
+// EXPECT-OUT: 64
+// EXPECT-OUT: 8
+// EXPECT-OUT: 8
+// EXPECT-OUT: 88
+// EXPECT-OUT: 88
+// EXPECT-OUT: 60
+// EXPECT-OUT: 60
+// EXPECT-OUT: -16
+// EXPECT-OUT: -16
+// EXPECT-OUT: 64
+// EXPECT-OUT: 64
+// EXPECT-OUT: 32
+// EXPECT-OUT: 32
+// EXPECT-OUT: -40
+// EXPECT-OUT: -40
+// EXPECT-OUT: 80
+// EXPECT-OUT: 80
+// EXPECT-OUT: 24
+// EXPECT-OUT: 24
+// EXPECT-OUT: -64
+// EXPECT-OUT: -64
+// EXPECT-OUT: 16
+// EXPECT-OUT: 16
+// EXPECT-OUT: 8
+// EXPECT-OUT: 8
+// EXPECT-OUT: 88
+// EXPECT-OUT: 88
+// EXPECT-OUT: 60
+// EXPECT-OUT: 60
+// EXPECT-OUT: -16
+// EXPECT-OUT: -16
+// EXPECT-OUT: 576221
+// EXPECT-OUT: 6
+// EXPECT-OUT: 4
+// EXPECT-OUT: 9
+// EXPECT-OUT: 14
+// EXPECT-OUT: 12
+// EXPECT-OUT: 17
+// EXPECT-OUT: 13
+// EXPECT-OUT: 30
+// EXPECT-OUT: 40
+// EXPECT-OUT: 36
+// EXPECT-OUT: 53
+// EXPECT-OUT: 36
+// EXPECT-OUT: 89
+// EXPECT-OUT: 121
+// EXPECT-OUT: 111
+// EXPECT-OUT: 53
+// EXPECT-OUT: 36
+// EXPECT-OUT: 89
+// EXPECT-OUT: 121
+// EXPECT-OUT: 111
+// EXPECT-OUT: 49
+// EXPECT-OUT: 396
+// EXPECT-OUT: 430
+// EXPECT-OUT: 54
+// EXPECT-OUT: 899
+// EXPECT-OUT: 6
+// EXPECT-OUT: 59
+// EXPECT-OUT: 460
+// EXPECT-OUT: 721
+// EXPECT-OUT: 64
+// EXPECT-OUT: 71
+// EXPECT-OUT: 3
+// EXPECT-OUT: 52
+// EXPECT-OUT: 702
+// EXPECT-OUT: 424
+module tests.run.unroll_jam_nests
+
+// Unroll-and-jam (`wukong_opt::unroll_jam`): a two-deep nest whose inner loop carries a serial
+// chain runs four outer iterations side by side at -O2. Every value is printed, and every expected
+// value was derived by hand from the scalar loop (exact dyadic floats and small integers), never
+// read back from the compiler — a jam that reordered dependent rows would be self-consistent
+// across interp, native and every -O level, so these lines are what can see it.
+//
+// * `rows` — a row-major float recurrence over 7 rows (4 jammed + 3 in the remainder). Row `r`
+//   reads the first element of row `r + 1`. `rows(a, b, 7)` runs on two buffers; `rows(a, a, 7)`
+//   on one, where row `r + 1` overwrites what row `r` still has to read: that call must keep the
+//   original row order (here the in-place result equals the out-of-place one, so each element
+//   prints twice).
+// * `cols` — a time-major integer recurrence `x[t*5 + d]` over 5 columns, with a per-column result
+//   and a running total the jammed epilogues must fold in column order.
+// * `gscan` — a symbolic-shape tensor kernel whose row pitch is the runtime dimension `T`.
+
+fn rows(x: [f32; 29], mut o: [f32; 29], n: i64) {
+    let mut r: i64 = 0;
+    while r < n {
+        let mut h: f32 = 1.0;
+        let mut t: i64 = 0;
+        while t < 4 {
+            h = max(h, x[r * 4 + t + 1]) * 0.5 + x[r * 4 + t];
+            o[r * 4 + t] = h;
+            t = t + 1;
+        }
+        r = r + 1;
+    }
+}
+
+fn cols(x: [i64; 15], mut y: [i64; 15], mut last: [i64; 5]) -> i64 {
+    let mut total: i64 = 0;
+    let mut d: i64 = 0;
+    while d < 5 {
+        let mut h: i64 = d + 1;
+        let mut t: i64 = 0;
+        while t < 3 {
+            h = h * 3 - x[t * 5 + d];
+            y[t * 5 + d] = h;
+            t = t + 1;
+        }
+        last[d] = h;
+        total = total * 10 + h;
+        d = d + 1;
+    }
+    return total;
+}
+
+fn gscan<R, T>(x: Tensor[i64, R, T], mut o: Tensor[i64, R, T]) {
+    for r in 0..R {
+        let mut h: i64 = 7;
+        for t in 0..T {
+            h = (h * h + x[r, t]) % 1009;
+            o[r, t] = h;
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut a: [f32; 29] = [0.0; 29];
+    let mut b: [f32; 29] = [0.0; 29];
+    let mut i: i64 = 0;
+    while i < 29 {
+        a[i] = (((i * 7) % 11) - 5) as f32 * 0.25;
+        i = i + 1;
+    }
+    rows(a, b, 7);
+    rows(a, a, 7);
+    let mut j: i64 = 0;
+    while j < 28 {
+        print((b[j] * 64.0) as i32);
+        print((a[j] * 64.0) as i32);
+        j = j + 1;
+    }
+
+    let mut x: [i64; 15] = [0; 15];
+    let mut y: [i64; 15] = [0; 15];
+    let mut last: [i64; 5] = [0; 5];
+    i = 0;
+    while i < 15 {
+        x[i] = ((i * 5) % 7) - 3;
+        i = i + 1;
+    }
+    print(cols(x, y, last));
+    j = 0;
+    while j < 15 {
+        print(y[j]);
+        j = j + 1;
+    }
+    j = 0;
+    while j < 5 {
+        print(last[j]);
+        j = j + 1;
+    }
+
+    let mut g: [i64; 15] = [0; 15];
+    let mut go: [i64; 15] = [0; 15];
+    i = 0;
+    while i < 15 {
+        g[i] = (i * 13) % 17;
+        i = i + 1;
+    }
+    // Runtime dimensions (a loop, so nothing pins them at compile time before inlining).
+    let mut m = 0;
+    let mut k = 0;
+    while k < 5 {
+        m = m + 1;
+        k = k + 1;
+    }
+    let n = 3;
+    gscan::<m, n>(g, go);
+    j = 0;
+    while j < 15 {
+        print(go[j]);
+        j = j + 1;
+    }
+    return 0;
+}
