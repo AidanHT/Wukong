@@ -723,6 +723,44 @@ mod tests {
     }
 
     #[test]
+    fn type_alias_items() {
+        let out = parse("type Real = f32;\npub type Mat<M, N> = Tensor[Real, M, N];\n");
+        assert!(out.contains("type Real = f32"), "{out}");
+        assert!(out.contains("type Mat = Tensor[Real, M, N]"), "{out}");
+        assert!(out.contains("type-param M"), "{out}");
+    }
+
+    #[test]
+    fn type_arguments_parse_as_types_or_dimensions() {
+        let out = parse(
+            "fn f<N>(a: Mat<4, N * 2>, b: Buf<Buf<f32, 2>, 3>, c: Row<?>, d: Pair<(i32, i32)>) {}\n",
+        );
+        assert!(out.contains("param a: Mat<4, (N * 2)>"), "{out}");
+        // `>>` closes both lists.
+        assert!(out.contains("param b: Buf<Buf<f32, 2>, 3>"), "{out}");
+        assert!(out.contains("param c: Row<?>"), "{out}");
+        assert!(out.contains("param d: Pair<(i32, i32)>"), "{out}");
+        let out = parse("fn g() { let p = alloc::<Buf<f32, 4>>(2); }\n");
+        assert!(out.contains("Buf<f32, 4>"), "{out}");
+    }
+
+    /// After `as`, a bare `<` is still a comparison; type arguments there are spelled `::<..>`.
+    #[test]
+    fn cast_target_keeps_less_than_a_comparison() {
+        let out = parse("fn f(x: f32, n: i32) -> bool { return x as i32 < n; }\n");
+        assert!(out.contains("binary <"), "{out}");
+        let out = parse("fn f(x: f32) -> f32 { return x as A::<f32>; }\n");
+        assert!(out.contains("A<f32>"), "{out}");
+    }
+
+    /// `type` is contextual: outside item position it is an ordinary identifier.
+    #[test]
+    fn type_stays_an_identifier() {
+        let out = parse("fn f() -> i32 { let type = 3; return type; }\n");
+        assert!(out.contains("fn f"), "{out}");
+    }
+
+    #[test]
     fn module_and_fn() {
         let out = parse("module demo\nfn add(a: i32, b: i32) -> i32 { return a + b; }\n");
         assert!(out.starts_with("module demo\n"));

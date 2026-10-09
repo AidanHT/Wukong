@@ -922,3 +922,131 @@ fn parse_u64(text: &str) -> Option<u64> {
     };
     u64::from_str_radix(digits, radix).ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wukong_ast::Param;
+
+    /// Parse `src`, expand its aliases, and return the module, its printed form and the codes.
+    fn expand_module(src: &str) -> (Module, String, Vec<&'static str>) {
+        let mut interner = Interner::new();
+        let (mut module, pd) =
+            wukong_parser::parse_module(src, wukong_span::SourceId(0), &mut interner);
+        assert!(pd.is_empty(), "parse errors: {pd:?}");
+        let mut sink = DiagnosticSink::new();
+        let mut next = 1_000_000;
+        expand_type_aliases(&mut module, &mut interner, &mut sink, &mut next);
+        let codes = sink.diagnostics().iter().filter_map(|d| d.code).collect();
+        let printed = wukong_ast::print::print_module(&module, &interner);
+        (module, printed, codes)
+    }
+
+    fn expand(src: &str) -> (String, Vec<&'static str>) {
+        let (_, printed, codes) = expand_module(src);
+        (printed, codes)
+    }
+
+    fn params(m: &Module) -> Vec<&Param> {
+        m.items
+            .iter()
+            .filter_map(|i| match &i.kind {
+                ItemKind::Fn(f) => Some(f.params.iter()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    #[test]
+    fn scalar_and_generic_aliases_expand_everywhere() {
+        let (out, codes) = expand(
+            "type Real = f32;\n\
+             type Mat<M, N> = Tensor[Real, M, N];\n\
+             type Buf<T, N> = [T; N];\n\
+             struct S { w: Buf<Real, 3> }\n\
+             fn f<K>(a: Mat<K, K * 2>, x: Real) -> Buf<Mat<2, 3>, 4> {\n\
+                 let y: Mat<2, 3> = a;\n\
+                 let z = x as Real;\n\
+                 let h = alloc::<Real>(4);\n\
+             }\n",
+        );
+        assert!(codes.is_empty(), "{codes:?}");
+        assert!(
+            !out.lines().any(|l| l.starts_with("type ")),
+            "alias items survive: {out}"
+        );
+        assert!(out.contains("field w: [f32; 3]"), "{out}");
+        assert!(out.contains("param a: Tensor[f32, K, (K * 2)]"), "{out}");
+        assert!(out.contains("param x: f32"), "{out}");
+        assert!(out.contains("ret [Tensor[f32, 2, 3]; 4]"), "{out}");
+        assert!(!out.contains("Real"), "{out}");
+        assert!(!out.contains("Mat"), "{out}");
+    }
+
+    /// Two uses of one alias are two trees: no `NodeId` is shared, or sema's per-node tables
+    /// (an array length's type, for one) would collide.
+    #[test]
+    fn every_copy_has_fresh_node_ids() {
+        let (m, _, codes) =
+            expand_module("type B<N> = [f32; N * 2];\nfn f(a: B<2>, b: B<3>, c: B<2>) {}\n");
+        assert!(codes.is_empty(), "{codes:?}");
+        let mut ids = Vec::new();
+        for p in params(&m) {
+            ids.push(p.ty.id);
+            let TypeKind::Array { len, .. } = &p.ty.kind else {
+                panic!("not an array: {:?}", p.ty.kind);
+            };
+            ids.push(len.id);
+        }
+        let unique: FxHashSet<NodeId> = ids.iter().copied().collect();
+        assert_eq!(unique.len(), ids.len(), "{ids:?}");
+        assert!(ids.iter().all(|id| *id != NodeId::DUMMY));
+    }
+
+    #[test]
+    fn a_generic_parameter_shadows_an_alias() {
+        let (out, codes) =
+            expand("type T = i64;\nfn f<T>(x: T) -> T { return x; }\nfn g(y: T) {}\n");
+        assert!(codes.is_empty(), "{codes:?}");
+        assert!(out.contains("param x: T"), "{out}");
+        assert!(out.contains("param y: i64"), "{out}");
+    }
+
+    #[test]
+    fn alias_errors_carry_their_codes() {
+        assert_eq!(expand("type A = A;\nfn f() {}\n").1, vec!["E0326"]);
+        // One diagnostic per cycle, however many aliases it runs through or uses it has.
+        assert_eq!(
+            expand("type A = [B; 2];\ntype B = *C;\ntype C = A;\nfn f(x: A, y: C) {}\n").1,
+            vec!["E0326"]
+        );
+        assert_eq!(
+            expand("type M<N> = [f32; N];\nfn f(x: M) {}\n").1,
+            vec!["E0327"]
+        );
+        assert_eq!(
+            expand("type M<N> = [f32; N];\nfn f(x: M<1, 2>) {}\n").1,
+            vec!["E0327"]
+        );
+        assert_eq!(expand("type R = f32;\nfn f(x: R<2>) {}\n").1, vec!["E0327"]);
+        assert_eq!(
+            expand("type R = f32;\nfn f(x: f32<2>) {}\n").1,
+            vec!["E0327"]
+        );
+        assert_eq!(
+            expand("type P<T> = *T;\nfn f(x: P<N * 2>) {}\n").1,
+            vec!["E0327"]
+        );
+        assert_eq!(
+            expand("type V<N> = Tensor[f32, N];\nfn f(x: V<(i32, i32)>) {}\n").1,
+            vec!["E0327"]
+        );
+        assert_eq!(expand("type W = [Real; 8];\nfn f() {}\n").1, vec!["E0328"]);
+        assert_eq!(expand("type f32 = i64;\nfn f() {}\n").1, vec!["E0300"]);
+        assert_eq!(
+            expand("struct S { x: i32 }\ntype S = i32;\nfn f() {}\n").1,
+            vec!["E0300"]
+        );
+    }
+}

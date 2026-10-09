@@ -771,6 +771,25 @@ mod tests {
         diags(src).iter().filter_map(|d| d.code).collect()
     }
 
+    /// The driver expands and removes every alias before sema. A caller that skips that pass
+    /// (a direct `check`) gets an ignored alias item and the ordinary E0324 at each use, never a
+    /// silent `i32` slot.
+    #[test]
+    fn an_unexpanded_alias_is_unknown_to_sema() {
+        assert_eq!(
+            codes("type Real = f32;\nfn f(x: Real) -> f32 { return 1.0; }\n"),
+            vec!["E0324"]
+        );
+        assert_eq!(
+            codes("type Real = f32;\nfn f(x: f32) -> f32 { return x; }\n"),
+            Vec::<&str>::new()
+        );
+        assert!(
+            codes("type M<N> = [f32; N];\nfn f(x: M<2>) -> f32 { return 1.0; }\n")
+                .contains(&"E0324")
+        );
+    }
+
     /// The single diagnostic `src` reports, which must carry `code`.
     #[track_caller]
     fn only(src: &str, code: &str) -> Diagnostic {
