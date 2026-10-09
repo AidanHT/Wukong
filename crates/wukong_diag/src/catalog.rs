@@ -675,7 +675,7 @@ static CATALOG: &[Explanation] = &[
          interpreter's slot index and a native run's machine address disagree), so dereference it; \
          a data-carrying enum prints by matching on it; a slice of non-scalars, a reference inside \
          an aggregate, a SIMD vector or a function value prints element by element, lane by lane \
-         or not at all. (A whole tensor and `()` are `E0401` under `print`.)",
+         or not at all. (A whole tensor and `()` are `E0437` under `print`.)",
         bad: "module ex.e0448\nfn main() -> i32 {\n    let mut x: i32 = 5;\n    let p: *mut i32 = &mut x;\n    print(p);\n    return 0;\n}\n",
         good: "module ex.e0448\nfn main() -> i32 {\n    let mut x: i32 = 5;\n    let p: *mut i32 = &mut x;\n    print(*p);\n    return 0;\n}\n"
     ),

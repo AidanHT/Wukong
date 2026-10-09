@@ -2,7 +2,9 @@
 //! binary (N83 / N82): an embedding gather, a tanh hidden layer, an output projection and the softmax
 //! cross-entropy, differentiated through the tape's embedding, GEMM, tanh and cross-entropy rules.
 //!
-//! The corpus harness only checks that the fixture's `--train` run exits 0. This test checks what it
+//! The corpus harness runs only the fixture's `main` (the loss at zero weights, 6·ln 8); the training
+//! run is this test's alone, because `--train` prints six decimals and a loss near 12 has f32
+//! spacing ~9.5e-7, so an exact pin would encode the kernels' rounding. This test checks what it
 //! computes: the loss trajectory must match an f64 reference of the same model — the same seeded
 //! weights (`--train-seed=11`, uniform in [-0.4, 0.4)), the exact gradient, three SGD updates at
 //! lr = 1/2 — and decrease strictly, byte-identically on the interpreter and the native JIT at -O0

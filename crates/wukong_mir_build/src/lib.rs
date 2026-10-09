@@ -4656,7 +4656,7 @@ impl FnLowerer<'_> {
         } else if let MirType::Array(elem, n) = ty {
             if elem.is_int() || elem.is_float() {
                 let z = self.const_zero((**elem).clone());
-                if *n <= REPEAT_UNROLL_LIMIT {
+                if self.unroll_aggregate(*n as u64, Some(mir_byte_size(ty))) {
                     for i in 0..*n as i128 {
                         self.store_element(slot, elem, i, z);
                     }
@@ -7114,10 +7114,10 @@ impl FnLowerer<'_> {
 
     /// Emit one `wukong_embedding_f32[_parallel](out, weight, ids, T, H, V)` call for a recognized
     /// embedding-lookup nest. Bails (false) if an operand/dim is unbound. `parallel` selects the multicore
-    /// kernel (rows independent → bit-identical to serial). `V` is a large `i64` sentinel: the naive
-    /// source omits the bounds check, so passing a huge table height keeps the kernel's out-of-range→zero
-    /// clamp from ever firing on the in-range ids a well-typed program produces (both backends call the
-    /// identical kernel, so the differential gate holds regardless of the sentinel value).
+    /// kernel (rows independent → bit-identical to serial). `V` is the table's real height when
+    /// `weight` has a compile-time extent and `H` is a literal, else a large `i64` sentinel: either
+    /// way the kernel's out-of-range→zero clamp never fires on the in-range ids a well-typed program
+    /// produces (both backends call the identical kernel, so the differential gate holds regardless).
     ///
     /// **Aliasing.** `out` must be disjoint from `weight` AND from `ids` (an `i32` index buffer, so an
     /// overlap is a type pun as well as an ordering hazard) — for the serial kernel as much as the
@@ -7142,13 +7142,23 @@ impl FnLowerer<'_> {
         let (Some(t_rows), Some(h)) = (self.dim_value(nest.t_rows), self.dim_value(nest.h)) else {
             return false;
         };
-        // `V` sentinel — larger than any realistic vocabulary, so `0 <= id < V` always holds for valid
-        // ids (the only case a well-typed gather produces) and the clamp is a no-op, matching the naive
-        // unchecked read. `i64::MAX` would risk an `id as usize * h` overflow in the kernel's bounds math
-        // for pathological inputs; a still-astronomical 2^48 leaves ample headroom.
+        // `V`: the table's real height `w_total / H` when both are compile-time constants — every
+        // row whose `H` elements lie inside `weight`, so the clamp still never fires on an id the
+        // source could read in bounds. It has to be real because autodiff's embedding VJP hands this
+        // same `V` to `wukong_scatter_add_f32[_parallel]` as the height of the weight GRADIENT (the
+        // parallel kernel partitions those `V` rows; the interpreter validates `grad_w[0..V*H]`
+        // up front, so a sentinel there made every `--train` through an embedding fail on the
+        // interpreter while native passed). Otherwise a sentinel larger than any realistic
+        // vocabulary, so `0 <= id < V` always holds for valid ids and the clamp is a no-op, matching
+        // the naive unchecked read. `i64::MAX` would risk an `id as usize * h` overflow in the
+        // kernel's bounds math for pathological inputs; a still-astronomical 2^48 leaves headroom.
+        let height = match (nest.w_total, nest.h) {
+            (Some(total), Dim::Lit(cols)) if cols > 0 => (total / cols as u64) as i128,
+            _ => 1i128 << 48,
+        };
         let v = self
             .builder
-            .build(MirType::I64, Op::ConstInt(1i128 << 48, MirType::I64));
+            .build(MirType::I64, Op::ConstInt(height, MirType::I64));
         let out_elems = self.guard_extent(t_rows, h);
         let mut ops = vec![
             GuardOperand::new(nest.out, out, out_elems, MirType::F32),
@@ -20260,11 +20270,14 @@ impl FnLowerer<'_> {
                 }
                 // `[value; n]` evaluates `value` once and fills every slot with it. Small arrays
                 // unroll to straight-line stores; large ones lower to a fill loop so that, e.g.,
-                // `[0; 1_000_000]` does not generate a million instructions.
+                // `[0; 1_000_000]` does not generate a million instructions. A gradient candidate
+                // unrolls up to the autodiff byte bound ([`FnLowerer::unroll_aggregate`]), so a
+                // scratch `[0.0; 24]` in a loss does not make it multi-block.
                 let v0 = self.lower_expr(value);
                 let vty = self.expr_mir(value);
                 let v = self.coerce_to(v0, &vty, elem, self.signed(value));
-                if n <= REPEAT_UNROLL_LIMIT {
+                let bytes = mir_byte_size(elem).checked_mul(u64::from(n));
+                if self.unroll_aggregate(u64::from(n), bytes) {
                     for i in 0..n as i128 {
                         self.store_element(base, elem, i, v);
                     }
@@ -20852,6 +20865,20 @@ impl FnLowerer<'_> {
                     .builder
                     .alloca(MirType::Array(Box::new(MirType::I8), size));
                 self.lower_tuple_init(buf, &tty, items);
+                buf
+            }
+            // An array literal or repeat in value position — a call argument `f([1, 2, 3])`, which
+            // a fixed-array parameter (or an array pattern matched in the callee) receives by base
+            // pointer — materializes a fresh buffer of sema's array type and fills it through
+            // `init_field`, the same element-store path a `let` or an aggregate field takes (an
+            // aggregate element is deep-copied, an over/under-long literal is diagnosed). It used
+            // to reach the catch-all below: `C0001 expression is not yet supported`.
+            ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat { .. }
+                if matches!(self.expr_ty(e), Ty::Array { .. }) =>
+            {
+                let ty = self.expr_ty(e);
+                let buf = self.builder.alloca(self.mir_ty_of(&ty));
+                self.init_field(buf, &ty, e);
                 buf
             }
             ExprKind::Cast { expr, .. } => self.lower_cast(expr, e),

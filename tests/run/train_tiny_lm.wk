@@ -1,5 +1,6 @@
-// RUN: --train --grad-wrt=0,1,2 --train-steps=3 --train-lr=0.5 --train-seed=11
 // EXPECT-EXIT: 0
+// EXPECT-OUT: 12476
+// EXPECT-OUT: 12476
 module tests.run.train_tiny_lm
 
 // A two-layer character-level language model trained end to end by `--train` (N83 / N82): an
@@ -13,14 +14,19 @@ module tests.run.train_tiny_lm
 //   L  = Σ_t xent(lg[t], tgt[t])                wukong_xent_fwd_f32_parallel + wukong_sreduce_f32_parallel
 //
 // The sequence "abcabd" (ids 1 2 3 1 2 4) predicts its own next characters (2 3 1 2 4, then 0).
-// Every parameter is trained. The trajectory is not pinned here (a six-decimal loss near 12 sits
-// below the f32 resolution of the runtime's exp/tanh kernels); `crates/wukongc/tests/train_lm.rs`
-// runs this file on both backends and checks it against an f64 reference of the same model and the
-// same seeded weights: 12.406603, 11.984528, 10.952965, 8.654537 — a strict decrease.
+// Every parameter is trained. The `--train` trajectory is not pinned here: `--train` prints six
+// decimals, and a loss near 12 has f32 spacing ~9.5e-7, so the sixth decimal is not a property of
+// the model (the f64 reference's 12.4066026 sits 1.1e-7 from a rounding boundary, and a plain
+// f32 evaluation of the same steps already prints 8.654536 for the last one). Instead
+// `crates/wukongc/tests/train_lm.rs` trains this file (`--train --grad-wrt=0,1,2 --train-steps=3
+// --train-lr=0.5 --train-seed=11`) on both backends at -O0 and -O2 and checks it within 1e-3 of an
+// f64 reference of the same model and the same seeded weights: 12.406603, 11.984528, 10.952965,
+// 8.654537 — a strict decrease.
 //
-// `main` evaluates the loss at all-zero weights for the differential gates: every hidden unit is
+// This file's own run is `main`, which evaluates the loss at all-zero weights: every hidden unit is
 // tanh(0) = 0, every logit 0, so each position costs ln 8 and L = 6·ln 8 = 12.476649…; × 1000,
-// truncated, that is 12476 on every backend and level.
+// truncated, that is 12476 — both as the return value and as the `out[0]` it wrote — on every
+// backend and level (0.65 of a step from either truncation boundary, far above the kernels' error).
 
 @parallel
 fn loss(emb: [f32; 32], w1: [f32; 16], w2: [f32; 32], mut out: [f32; 1]) -> f32 {

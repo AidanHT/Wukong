@@ -44,6 +44,15 @@ struct Line {
     tag: char,
 }
 
+// A reference is a `&T` parameter; `&p` itself is a raw `*T`, which is an address and E0448.
+fn show_point(r: &Point) {
+    print(r);
+}
+
+fn show_f64(r: &f64) {
+    print(r);
+}
+
 fn main() -> i32 {
     let p = Point { x: 1, y: 2.5 };
     print(p);
@@ -78,10 +87,8 @@ fn main() -> i32 {
     print(flags);
     let cs: [char; 2] = ['a', '\u{E9}'];
     print(cs);
-    let r = &p;
-    print(r);
+    show_point(&p);
     let v: f64 = 0.1;
-    let rv = &v;
-    print(rv);
+    show_f64(&v);
     return 0;
 }

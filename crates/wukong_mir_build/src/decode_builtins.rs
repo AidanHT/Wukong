@@ -411,7 +411,7 @@ mod tests {
     #[test]
     fn each_builtin_is_one_checked_runtime_call() {
         let (text, diags) = mir(
-            "fn step(q: []f32, mut kc: []f32, mut vc: []f32, k: []f32, v: []f32, mut o: []f32, \
+            "fn decode_step(q: []f32, mut kc: []f32, mut vc: []f32, k: []f32, v: []f32, mut o: []f32, \
              t: i64) { \
              kv_append(kc, k, t, 16); kv_append(vc, v, t, 16); \
              sdpa_kv(q, kc, vc, o, 1, t + 1, 8, t, 4, 2, 32, 16, 0.25, true); } \

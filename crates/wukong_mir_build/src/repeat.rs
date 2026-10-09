@@ -181,4 +181,34 @@ mod tests {
             "an ordinary compile lowers the 16-element copy to a loop ({ordinary} blocks vs {candidate})"
         );
     }
+
+    /// A SCALAR fill — `[0.0; 24]` scratch and a no-initializer `[f32; 24]` — follows the same
+    /// policy: single-block for a gradient candidate (a loss with scratch buffers past
+    /// `REPEAT_UNROLL_LIMIT` was refused by `--train` as multi-block at every `-O` level), a fill
+    /// loop for an ordinary compile, and a loop past the byte bound either way.
+    #[test]
+    fn scalar_fills_unroll_only_for_autodiff_and_stay_bounded() {
+        let blocks = |src: &str, name: &str, unroll_for_autodiff: bool| {
+            let (program, interner) = lower(
+                src,
+                LowerOptions {
+                    unroll_for_autodiff,
+                    ..LowerOptions::default()
+                },
+            );
+            find_fn(&program, &interner, name).blocks.len()
+        };
+        for src in [
+            "fn scratch() -> f32 { let mut t: [f32; 24] = [0.0; 24]; t[3] = 1.5; return t[23]; }",
+            "fn scratch() -> f32 { let mut t: [f32; 24]; t[3] = 1.5; return t[23]; }",
+        ] {
+            assert_eq!(blocks(src, "scratch", true), 1, "{src}");
+            assert!(blocks(src, "scratch", false) > 1, "{src}");
+        }
+        let big = "fn big() -> f32 { let t: [f32; 4096] = [0.5; 4096]; return t[9]; }";
+        assert!(
+            blocks(big, "big", true) > 1,
+            "a 16 KiB fill must stay a loop"
+        );
+    }
 }

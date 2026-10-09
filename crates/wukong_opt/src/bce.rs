@@ -60,7 +60,15 @@
 //!   pointer-to-pointer cast only between identical pointees and rejects pointer-to-integer), and a
 //!   fat pointer's length is only ever written through a byte-addressed field `gep` or a byte copy,
 //!   so a floating-point store, or a store of a non-byte scalar through a `gep` whose element type is
-//!   that scalar (an element of a typed array), can never land on a slice header.
+//!   that scalar (an element of a typed array), can never land on a slice header. A *byte* store
+//!   is ambiguous at the MIR level — a data-carrying enum is copied byte by byte
+//!   (`emit_copy_bytes`) through the same `gep p, k : i8` a `[]i8` element uses, and an enum
+//!   payload can hold a slice header — so a byte store is exempt only when it is visibly a
+//!   **checked byte-slice element store** (`checked_byte_slice_store`): its base is a slice's data
+//!   pointer, its index is not a literal, and the loop checks that same index against that same
+//!   slice's length. The elements of a slice indexed with an `i8` stride are bytes, and byte
+//!   storage never holds a header; a byte copy is never checked against the slice it writes into
+//!   with its own byte index.
 //! * **Speculation** — reading the length early must not fault where the program would not have.
 //!   A length already in an SSA value, or in a stack slot of this function
 //!   ([`AliasInfo::is_dereferenceable`]), is free to read: it goes in `G0`. A length behind a
@@ -449,7 +457,70 @@ impl Ctx<'_> {
                 return elem == ty;
             }
         }
-        false
+        *ty == MirType::I8 && self.checked_byte_slice_store(ptr)
+    }
+
+    /// `v` with any `gep v, 0` peeled off: `field_ptr(sbuf, 0)` and `sbuf` name the same header.
+    fn strip_zero_gep(&self, mut v: ValueId) -> ValueId {
+        for _ in 0..MAX_EXPR_DEPTH {
+            match self.defs.op(self.f, v) {
+                Some(Op::Gep { ptr, index, .. })
+                    if matches!(self.defs.op(self.f, *index), Some(Op::ConstInt(0, _))) =>
+                {
+                    v = *ptr
+                }
+                _ => break,
+            }
+        }
+        v
+    }
+
+    /// Is the byte store through `ptr` the element store of a bounds-checked byte slice — `ptr =
+    /// gep (load ptr H), idx : i8` with a non-literal `idx`, and a loop check `idx <u len` whose
+    /// `len` is read from `H`'s length field? That is exactly how `mir_build` lowers `s[i] = v` for
+    /// a `[]i8`/`[]u8` (`bounds.rs`). A data-carrying enum's byte copy into `s[0]` can fold to the
+    /// same `gep` shape, but its byte index is a literal or the copy's own counter, never an index
+    /// checked against `H` — so it stays non-exempt, and alias analysis decides it.
+    fn checked_byte_slice_store(&self, ptr: ValueId) -> bool {
+        let Some(Op::Gep {
+            ptr: base,
+            index: idx,
+            elem: MirType::I8,
+        }) = self.defs.op(self.f, ptr)
+        else {
+            return false;
+        };
+        let idx = *idx;
+        if matches!(self.defs.op(self.f, idx), Some(Op::ConstInt(..))) {
+            return false;
+        }
+        let Some(Op::Load(data_addr, MirType::Ptr)) = self.defs.op(self.f, *base) else {
+            return false;
+        };
+        let hdr = self.strip_zero_gep(*data_addr);
+        // Is `len` the `i64` at `hdr + 8`?
+        let len_of_hdr = |len: ValueId| -> bool {
+            let Some(Op::Load(len_addr, MirType::I64)) = self.defs.op(self.f, len) else {
+                return false;
+            };
+            let Some(Op::Gep {
+                ptr: lb,
+                index: off,
+                elem: MirType::I8,
+            }) = self.defs.op(self.f, *len_addr)
+            else {
+                return false;
+            };
+            matches!(self.defs.op(self.f, *off), Some(Op::ConstInt(8, _)))
+                && self.strip_zero_gep(*lb) == hdr
+        };
+        self.blocks.iter().any(|b| {
+            self.f.block(*b).insts.iter().any(|inst| match &inst.op {
+                Op::Cmp(CmpOp::Ult, i, len) => *i == idx && len_of_hdr(*len),
+                Op::Cmp(CmpOp::Ugt, len, i) => *i == idx && len_of_hdr(*len),
+                _ => false,
+            })
+        })
     }
 
     /// Does nothing in the loop write the 8 bytes at `addr`?
@@ -1309,6 +1380,34 @@ mod tests {
             "a header written in the loop must not be speculated: {:?}",
             census(&p2)
         );
+    }
+
+    /// A byte store is not exempt from the header-stability check by its type alone (an enum byte
+    /// copy is a byte store too), but a checked `[]i8`/`[]u8` element store is: its loop is versioned
+    /// like any other, and an output shorter than the trip still stops at the same index with the
+    /// same message.
+    #[test]
+    fn a_checked_byte_slice_store_does_not_pin_the_headers() {
+        // In range: q[i] = s[i] * 3 + 1 over [1, 2, 3] = [4, 7, 10]; returned as 4 + 7 + 10 = 21.
+        let body = "fn f(s: []i32, mut q: []u8, n: i64) { for i in 0..n { \
+                    q[i] = (s[i] * 3 + 1) as u8; } }";
+        let ok = format!(
+            "{body} fn main() -> i32 {{ let a: [i32; 3] = [1, 2, 3]; \
+             let mut b: [u8; 3] = [0, 0, 0]; f(a, b, 3); \
+             return (b[0] as i32) + (b[1] as i32) + (b[2] as i32); }}"
+        );
+        assert_eq!(run(&ok, 0).2, Ok(21));
+        assert_versioned(&ok, 1);
+        let short = format!(
+            "{body} fn main() -> i32 {{ let a: [i32; 3] = [1, 2, 3]; \
+             let mut b: [u8; 2] = [0, 0]; f(a, b, 3); return 0; }}"
+        );
+        let (_, _, o0) = run(&short, 0);
+        assert_eq!(
+            o0,
+            Err("index out of bounds: the len is 2 but the index is 2".to_owned())
+        );
+        assert_eq!(run(&short, 2).2, o0);
     }
 
     #[test]

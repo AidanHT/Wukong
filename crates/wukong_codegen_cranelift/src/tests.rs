@@ -4239,16 +4239,20 @@ fn fma_contraction_is_bit_exact() {
     }
 }
 
-/// Operator fusion: two adjacent same-range elementwise loops (a linear map then ReLU) must fuse
-/// into one loop. Since fusion concatenates the exact statements, the two-loop form lowers to the
-/// *same* MIR as the hand-written single loop — an exact structural check — and stays correct.
+/// Operator fusion: two adjacent same-range elementwise loops must fuse into one loop. Since fusion
+/// concatenates the exact statements, the two-loop form lowers to the *same* MIR as the hand-written
+/// single loop — an exact structural check — and stays correct.
+///
+/// Neither member body is an elementwise kernel's shape (`x*x + 1` is no affine/binary `velem` form,
+/// and the guarded `t - x` select is no ReLU), so the kernel-preserving cut in `wukong_mir_build`'s
+/// `fuse.rs` leaves the fusion alone. The kernel-shaped pair — a linear map then a ReLU, each one
+/// `wukong_velem_f32` call alone, fused into a two-statement body that is no kernel's shape — must
+/// instead stay two loops and keep BOTH kernels.
 #[test]
 fn fusion_collapses_adjacent_loops() {
     let prelude = |n: usize| {
         format!(
-            "let mut x: [f32; {n}] = [0.0; {n}]; let mut t: [f32; {n}] = [0.0; {n}]; \
-             let mut o: [f32; {n}] = [0.0; {n}]; let mut i: i32 = 0; \
-             while i < {n} {{ x[i] = ((i - {n}/2) as f32); i += 1; }} "
+            "let mut x: [f32; {n}] = [0.0; {n}]; let mut t: [f32; {n}] = [0.0; {n}];              let mut o: [f32; {n}] = [0.0; {n}]; let mut i: i32 = 0;              while i < {n} {{ x[i] = ((i - {n}/2) as f32); i += 1; }} "
         )
     };
     let epilogue = |n: usize| {
@@ -4258,14 +4262,12 @@ fn fusion_collapses_adjacent_loops() {
     };
     let n = 100usize;
     let two = format!(
-        "fn main() -> i32 {{ {}for k in 0..{n} {{ t[k] = 2.0 * x[k] + 1.0; }} \
-         for k in 0..{n} {{ o[k] = if t[k] > 0.0 {{ t[k] }} else {{ 0.0 }}; }}{} }}",
+        "fn main() -> i32 {{ {}for k in 0..{n} {{ t[k] = x[k] * x[k] + 1.0; }}          for k in 0..{n} {{ o[k] = if t[k] > 2.0 {{ t[k] - x[k] }} else {{ 0.0 }}; }}{} }}",
         prelude(n),
         epilogue(n)
     );
     let one = format!(
-        "fn main() -> i32 {{ {}for k in 0..{n} {{ t[k] = 2.0 * x[k] + 1.0; \
-         o[k] = if t[k] > 0.0 {{ t[k] }} else {{ 0.0 }}; }}{} }}",
+        "fn main() -> i32 {{ {}for k in 0..{n} {{ t[k] = x[k] * x[k] + 1.0;          o[k] = if t[k] > 2.0 {{ t[k] - x[k] }} else {{ 0.0 }}; }}{} }}",
         prelude(n),
         epilogue(n)
     );
@@ -4278,6 +4280,24 @@ fn fusion_collapses_adjacent_loops() {
             .map(|b| b.insts.len() + 1)
             .sum()
     };
+    let calls_named = |src: &str, callee: &str| -> usize {
+        let (p, interner) = lowered(src, 3);
+        p.funcs
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+            .filter(|ins| {
+                matches!(&ins.op, wukong_mir::Op::Call { func, .. }
+                    if interner.resolve(*func) == callee)
+            })
+            .count()
+    };
+    // The non-kernel pair dispatches nothing, so fusion is free to collapse it.
+    assert_eq!(
+        calls_named(&two, "wukong_velem_f32"),
+        0,
+        "the non-kernel-shaped member loops must not dispatch a streaming kernel"
+    );
     // Fusion rewrites the two-loop form into the one-loop form before lowering ⇒ identical MIR.
     assert_eq!(
         count_ops(&two),
@@ -4285,12 +4305,35 @@ fn fusion_collapses_adjacent_loops() {
         "two adjacent loops should fuse to the same MIR as one combined loop"
     );
 
-    // sum of relu(2*(k-50)+1) over k in 0..100 = sum of the first 50 positive odd numbers = 2500.
+    // x = k - 50, t = x*x + 1, o = t - x where x*x > 1 (|x| >= 2), else 0. Over x in -50..=49:
+    // sum(x*x) = 83350, sum(1) = 100, sum(-x) = 50 ⇒ 83500, minus the x in {-1, 0, 1} terms
+    // (3 + 1 + 1) ⇒ 83495. Every partial sum is an integer below 2^24, so f32 is exact.
     let native = jit(&two, 3).expect("jit");
     assert_eq!(
         native,
         interp(&two, 3).expect("interp"),
         "fused native vs interp"
+    );
+    assert_eq!(native.0, 83495);
+
+    // The kernel-shaped pair: `t = 2x + 1` (affine `velem`) then `o = relu(t)` (ReLU `velem`). Fusing
+    // them would trade both 256-bit kernels for one generic loop, so they stay apart.
+    let kernel_two = format!(
+        "fn main() -> i32 {{ {}for k in 0..{n} {{ t[k] = 2.0 * x[k] + 1.0; }}          for k in 0..{n} {{ o[k] = if t[k] > 0.0 {{ t[k] }} else {{ 0.0 }}; }}{} }}",
+        prelude(n),
+        epilogue(n)
+    );
+    assert_eq!(
+        calls_named(&kernel_two, "wukong_velem_f32"),
+        2,
+        "fusion must keep both member loops' wukong_velem_f32 kernels"
+    );
+    // sum of relu(2*(k-50)+1) over k in 0..100 = sum of the first 50 positive odd numbers = 2500.
+    let native = jit(&kernel_two, 3).expect("jit");
+    assert_eq!(
+        native,
+        interp(&kernel_two, 3).expect("interp"),
+        "kernel-preserving native vs interp"
     );
     assert_eq!(native.0, 2500);
 }

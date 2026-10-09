@@ -1001,7 +1001,7 @@ mod tests {
             "trait T { fn m(self) -> flot; }",
             "const C: flot = 1;",
             "fn main() -> i32 { let x: i32 = 3; let y = x as flot; return 0; }",
-            "fn main() -> i32 { let n = sizeof(flot); return 0; }",
+            "fn main() -> i32 { let n = sizeof[flot]; return 0; }",
         ] {
             let n = codes(src).iter().filter(|c| **c == "E0324").count();
             assert_eq!(n, 1, "{src}: {:?}", diags(src));
@@ -1041,7 +1041,7 @@ mod tests {
             "enum Opt<T> { Some(T), None }",
             "trait Shape { fn area(self) -> f32; fn make() -> Self; }",
             "enum C { A, B } fn f(c: C) -> i32 { return 0; }",
-            "fn main() -> i32 { let n = sizeof(f32) + sizeof([i32; 4]); return 0; }",
+            "fn main() -> i32 { let n = sizeof[f32] + sizeof[[i32; 4]]; return 0; }",
         ] {
             let ds = diags(src);
             assert!(!ds.iter().any(|d| d.code == Some("E0324")), "{src}: {ds:?}");

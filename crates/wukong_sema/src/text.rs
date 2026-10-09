@@ -721,7 +721,7 @@ impl Sema<'_> {
                         Ty::Unknown | Ty::Error => {}
                         other => self.error(
                             args[0].span,
-                            "E0401",
+                            "E0437",
                             format!(
                                 "`{name}` expects a `*u8` path as its first argument, found a \
                                  value of type `{}`",
@@ -809,7 +809,7 @@ impl Sema<'_> {
                 Ty::Unknown | Ty::Error => {}
                 other => self.error(
                     args[0].span,
-                    "E0401",
+                    "E0437",
                     format!(
                         "`{name}` expects a `*u8` variable name, found a value of type `{}`",
                         other.display(self.interner)
@@ -839,7 +839,7 @@ impl Sema<'_> {
         if !ok {
             self.error(
                 arg.span,
-                "E0401",
+                "E0437",
                 format!(
                     "`{name}` expects a float {what}, found a value of type `{}`",
                     ty.display(self.interner)
@@ -925,7 +925,7 @@ impl Sema<'_> {
         if !ok {
             self.error(
                 arg.span,
-                "E0401",
+                "E0437",
                 format!(
                     "`{name}` expects a `[]u8` or `[u8; N]` buffer as argument {}, found a value \
                      of type `{}`",
@@ -972,7 +972,7 @@ impl Sema<'_> {
         if !ok {
             self.error(
                 arg.span,
-                "E0401",
+                "E0437",
                 format!(
                     "`{name}` expects an integer {what}, found a value of type `{}`",
                     ty.display(self.interner)
@@ -1097,13 +1097,17 @@ mod tests {
 
     #[test]
     fn print_accepts_scalars_strings_and_aggregates() {
+        // A reference is a `&T` parameter, the one place `&T` is a type of its own: `&x` has the
+        // raw-pointer type `*T` (see `unprintable_values_are_e0448`) and `let r: &T = &x` is
+        // E0401, so the referents print through `show`.
         let ok = "struct P { x: i32, y: f32 }\n\
+                  fn show(r: &P, v: &f64) { print(r); println(v); }\n\
                   fn main() -> i32 { \
                   let p = P { x: 1, y: 2.5 }; print(p); \
                   let a: [i32; 3] = [1, 2, 3]; println(a); \
                   let t = (1, 2.5); print(t); \
                   let s: []f32 = alloc_f32(2); print(s); \
-                  let r = &p; print(r); \
+                  let w: f64 = 0.1; show(&p, &w); \
                   print(\"hi\"); print('c'); print(true); \
                   print_raw(1); eprint(2.5); eprintln(\"x\"); \
                   return 0; }";
@@ -1114,6 +1118,9 @@ mod tests {
     fn unprintable_values_are_e0448() {
         let cases = [
             "fn main() -> i32 { let x: i32 = 1; let p: *i32 = 0 as *i32; print(p); return x; }",
+            // `&x` is a raw pointer (`*T`), not a reference: unannotated, it does not print.
+            "struct P { x: i32 } fn main() -> i32 { let p = P { x: 1 }; let r = &p; print(r); \
+             return 0; }",
             "enum E { A(i32), B } fn main() -> i32 { let e = E::B; print(e); return 0; }",
             "fn f(s: []*u8) { print(s); } fn main() -> i32 { return 0; }",
             "fn main() -> i32 { let x: i32 = 1; let p: *i32 = 0 as *i32; printf(\"{}\", p); \
@@ -1123,10 +1130,10 @@ mod tests {
             let got = errors(src);
             assert!(got.first() == Some(&"E0448"), "{src}: {got:?}");
         }
-        // `()` and a whole tensor keep their historical E0401 under print.
+        // `()` and a whole tensor are a builtin argument of the wrong kind (E0437) under print.
         assert_eq!(
             errors("fn main() -> i32 { let x = if true { 1 }; print(x); return 0; }"),
-            ["E0401"]
+            ["E0437"]
         );
     }
 
@@ -1176,7 +1183,7 @@ mod tests {
             ("fn main() -> i32 { printf(); return 0; }", "E0503"),
             (
                 "fn main() -> i32 { let b: [i32; 4] = [0; 4]; return sprintf(b, \"x\") as i32; }",
-                "E0401",
+                "E0437",
             ),
             (
                 "fn f(b: [u8; 4]) -> i64 { return sprintf(b, \"x\"); } \
@@ -1185,7 +1192,7 @@ mod tests {
             ),
             (
                 "fn main() -> i32 { let b: [u8; 4] = [0; 4]; return write_stdout(b, 1.5) as i32; }",
-                "E0401",
+                "E0437",
             ),
             (
                 "fn main() -> i32 { let b: [u8; 4] = [0; 4]; return write_text(b, 1) as i32; }",
@@ -1208,12 +1215,12 @@ mod tests {
         assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
         let cases = [
             ("fn main() -> i32 { return arg_count(1) as i32; }", "E0503"),
-            ("fn main() -> i32 { print(arg(1.5)); return 0; }", "E0401"),
+            ("fn main() -> i32 { print(arg(1.5)); return 0; }", "E0437"),
             (
                 "fn main() -> i32 { return arg_f32(1, true) as i32; }",
-                "E0401",
+                "E0437",
             ),
-            ("fn main() -> i32 { print(env(3)); return 0; }", "E0401"),
+            ("fn main() -> i32 { print(env(3)); return 0; }", "E0437"),
             ("fn main() -> i32 { exit(); return 0; }", "E0503"),
             (
                 "fn f(b: [u8; 4]) -> i64 { return read_stdin_u8(b); } \

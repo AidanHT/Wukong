@@ -9,7 +9,7 @@
 //! | `gemv_q8_0(w, x, y)` / `gemv_q4_0(w, x, y)` | `u8` blocks `w`; `f32` `x[K]`, `y[N]` | `wukong_gemv_{q8_0,q4_0}_f32` |
 //!
 //! Each is typed nominally here and returns `()`: a wrong arity or a turbofish is `E0503`, an
-//! operand of the wrong kind or element type `E0401`, and writing the output through a non-`mut`
+//! operand of the wrong kind or element type `E0437`, and writing the output through a non-`mut`
 //! aggregate parameter `E0304` — the same codes and the same buffer rules (`[]T`, `[T; N]`, or a
 //! contiguous `Tensor[T, …]` with known dimensions) as the ML builtins in `ml_builtins.rs`, whose
 //! operand checks these reuse. The *shapes* are values (lengths, head counts, strides), so they are
@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn well_formed_calls_type_clean() {
-        let ok = "fn step(q: []f32, k: []f32, v: []f32, mut o: []f32, t: i64) { \
+        let ok = "fn decode_step(q: []f32, k: []f32, v: []f32, mut o: []f32, t: i64) { \
                   sdpa_kv(q, k, v, o, 1, t + 1, 8, t, 4, 2, 32, 16, 0.25, true); \
                   sdpa_kv(q, k, v, o, 1, t + 1, 8, t, 4, 2, 32, 16, 1.0, 0); } \
                   fn grow(mut kc: [f32; 64], row: [f32; 16], t: i32) { kv_append(kc, row, t, 16); } \
@@ -247,12 +247,12 @@ mod tests {
             // The weight's element type is exact: f16 storage is not bf16.
             (
                 "fn f(w: []f16, x: []f32, mut y: []f32) { gemv_bf16(w, x, y); }",
-                "E0401",
+                "E0437",
             ),
             // Quantized blocks are bytes.
             (
                 "fn f(w: []i8, x: []f32, mut y: []f32) { gemv_q8_0(w, x, y); }",
-                "E0401",
+                "E0437",
             ),
             // The output is written: a non-`mut` aggregate parameter refuses it.
             (
@@ -263,17 +263,17 @@ mod tests {
             (
                 "fn f(q: []f32, mut o: []f32) { sdpa_kv(q, q, q, o, 1, 1, 8, 0, 1, 1, 8.0, 8, \
                  1.0, 0); }",
-                "E0401",
+                "E0437",
             ),
             (
                 "fn f(q: []f32, mut o: []f32, s: *u8) { sdpa_kv(q, q, q, o, 1, 1, 8, 0, 1, 1, 8, \
                  8, s, 0); }",
-                "E0401",
+                "E0437",
             ),
             // The row length of a packer.
             (
                 "fn f(x: []f32, mut q: []u8) { quantize_q4_0(x, q, 2.5); }",
-                "E0401",
+                "E0437",
             ),
         ];
         for &(src, code) in cases {

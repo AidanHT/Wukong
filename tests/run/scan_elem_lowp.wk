@@ -29,7 +29,7 @@
 module tests.run.scan_elem_lowp
 
 // The three loop-carried scan recognizers (cumsum / cumprod / lrscan) driven from a NON-f32 data
-// array. Each validated only the *store* element type, and sema implicitly widens `bf16`/`f16`/`i32`
+// array. Each validated only the *store* element type, and sema implicitly widened `bf16`/`f16`/`i32`
 // into an f32 accumulator, so `acc = acc + x[i]` over `[bf16; 8]` still dispatched
 // `wukong_cumsum_f32` — which reads the data as f32, i.e. 32 bytes out of a 16-byte buffer. On the
 // campaign base `--emit=mir -O2` showed `2 call wukong_cumsum_f32; 1 call wukong_cumprod_f32;
@@ -52,8 +52,10 @@ fn main() -> i32 {
     for i in 0..8 { acc = acc + xb[i]; o1[i] = acc; }
     for k in 0..8 { print((o1[k]) as i32); } // 1 2 3 4 5 6 7 8
 
-    // --- i32 data, f32 accumulator: same prefix sum over an integer buffer ----------------------
-    let xi: [i32; 8] = [1, 1, 1, 1, 1, 1, 1, 1];
+    // --- i16 data, f32 accumulator: same prefix sum over an integer buffer ----------------------
+    // (i32 on the campaign base; `f32 + i32` is now E0440, and i16 is the widest integer that
+    // still widens into f32 implicitly.)
+    let xi: [i16; 8] = [1, 1, 1, 1, 1, 1, 1, 1];
     let mut o2: [f32; 8] = [0.0; 8];
     let mut acc2: f32 = 0.0;
     for i in 0..8 { acc2 = acc2 + xi[i]; o2[i] = acc2; }
