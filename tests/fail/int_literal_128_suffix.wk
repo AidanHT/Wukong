@@ -1,4 +1,4 @@
-// EXPECT-CODE: E0401
+// EXPECT-CODE: E0431
 module tests.fail.int_literal_128_suffix
 
 // The lexer and the literal decoders accept the `u128`/`i128` suffixes, but Wukong has no 128-bit

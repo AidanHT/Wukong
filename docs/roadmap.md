@@ -1259,7 +1259,7 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   writes the explicit `fma(a, b, c)`, which is one rounding in every mode.
 
 - **Scalar-type gaps** (2026-10-08). There is no 128-bit integer (`u128`/`i128` literal suffixes
-  are `E0401`; Cranelift's x64 backend has no `i128` divide, so the type needs a runtime first), and
+  are `E0431`; Cranelift's x64 backend has no `i128` divide, so the type needs a runtime first), and
   FP8 is storage-only — E4M3FN/E5M2 codes in `u8` with conversion builtins, no `f8` scalar type that
   loads, stores and promotes by itself; packed `int4` and constructible SIMD values are not started.
   The bit-count builtins (`popcount`, `clz`, `ctz`, `bswap`) keep a loop scalar (the vectorizer does

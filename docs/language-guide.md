@@ -276,7 +276,7 @@ concatenation/indexing/length operators — a string is a NUL-terminated `*u8` i
 
 | Category    | Examples                                            | Status |
 |-------------|-----------------------------------------------------|--------|
-| Integers    | `i8 i16 i32 i64`, `u8 u16 u32 u64`, `usize isize` — no 128-bit type (a `u128`/`i128` literal suffix is `E0401`) | ✅     |
+| Integers    | `i8 i16 i32 i64`, `u8 u16 u32 u64`, `usize isize` — no 128-bit type (a `u128`/`i128` literal suffix is `E0431`) | ✅     |
 | Floats      | `f16 bf16 f32 f64`                                   | ✅ scalar |
 | FP8         | E4M3FN / E5M2 codes stored as `u8`, converted with the [scalar builtins](#scalar-builtins-) (`f8e4m3_to_f32`, `f32_to_f8e4m3`, …); no first-class `f8` type | 🟡 storage |
 | Boolean     | `bool`                                               | ✅     |

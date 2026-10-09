@@ -166,7 +166,7 @@ All notable changes to Wukong are documented here. The format is loosely based o
 - **Breaking:** `fmax`/`fmin` on an integer variable is now `E0445` (it rounded integers above 2^24
   through `f32`); use `max`/`min`. New codes `E0446` (wrong operand kind or bit width for an integer
   builtin) and `E0447` (mixed integer types where the type is the result). A `u128`/`i128` literal
-  suffix is `E0401` (there is no 128-bit type).
+  suffix is `E0431` (there is no 128-bit type).
 
 ### Optimizer memory passes: SROA, path DSE, loop deletion, guarded LICM, scalar promotion (`gap/opt-memory`)
 

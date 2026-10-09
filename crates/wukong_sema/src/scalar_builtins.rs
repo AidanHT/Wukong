@@ -862,7 +862,7 @@ mod tests {
         assert_clean("fn f(a: i8) -> i8 { return sat_add(a, 100); }");
         assert_eq!(
             errors("fn f(a: i8) -> i8 { return sat_add(a, 300); }"),
-            ["E0401"]
+            ["E0431"]
         );
     }
 

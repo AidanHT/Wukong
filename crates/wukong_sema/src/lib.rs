@@ -3693,11 +3693,11 @@ impl<'a> Sema<'a> {
                 // `u128`/`i128` lex and parse as integer suffixes, but Wukong has no 128-bit
                 // integer, and `int_lit_scalar` knew neither: `5u128` became an unsuffixed `i32`
                 // that adapted to whatever was around it. (No hex digit is `i`/`u`, so a literal
-                // ending in one of these is always suffixed.)
+                // ending in one of these is always suffixed.) A malformed literal, so `E0431`.
                 if text.ends_with("u128") || text.ends_with("i128") {
                     self.error(
                         e.span,
-                        "E0401",
+                        "E0431",
                         format!(
                             "integer literal `{text}` has a 128-bit suffix, but Wukong has no \
                              128-bit integer type; the widest are `i64` and `u64`"

@@ -530,13 +530,14 @@ static CATALOG: &[Explanation] = &[
         "E0431",
         "malformed or out-of-range literal",
         "A numeric literal that does not parse (`0z12`, an empty radix `0x`, a bad digit `0b2`, \
-         `1.5e`), or an integer literal whose value does not fit the type it is used at — the type \
-         an unsuffixed literal adapts to from an annotation, a parameter, a field, an assignment, a \
-         return type or a `match` scrutinee (`let x: i8 = 200`) — is rejected instead of wrapping \
-         silently. A constant expression of literals is checked by its folded value \
-         (`let v: i8 = 100 + 100`). An enum discriminant must be such a constant and fit the \
-         32-bit enum representation. Use a wider type, or convert with `as`, which wraps by \
-         definition.",
+         `1.5e`) or names a type Wukong does not have (a `u128`/`i128` suffix: the widest \
+         integers are `i64` and `u64`), or an integer literal whose value does not fit the type it \
+         is used at — the type an unsuffixed literal adapts to from an annotation, a parameter, \
+         a field, an assignment, a return type or a `match` scrutinee (`let x: i8 = 200`) — is \
+         rejected instead of wrapping silently. A constant expression of literals is checked by \
+         its folded value (`let v: i8 = 100 + 100`). An enum discriminant must be such a constant \
+         and fit the 32-bit enum representation. Use a wider type, or convert with `as`, which \
+         wraps by definition.",
         bad: "module ex.e0431\nfn main() -> i32 {\n    let x: i8 = 200;\n    return x as i32;\n}\n",
         good: "module ex.e0431\nfn main() -> i32 {\n    let x: i16 = 200;\n    return x as i32;\n}\n"
     ),
