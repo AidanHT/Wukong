@@ -202,13 +202,17 @@ fn disabled() -> bool {
 
 /// Unroll every function in `program`. Returns the indices of the functions that changed, so the
 /// caller can re-run the per-function pipeline on just those.
+///
+/// Each function is first offered to unroll-and-jam (`unroll_jam.rs`), which runs four rows
+/// of a nest whose inner loop carries a serial chain side by side; the jammed inner loop is then an
+/// ordinary counted loop this pass may still unroll. The two have separate switches
+/// (`WUKONG_NO_UNROLL_JAM`, `WUKONG_NO_UNROLL`), and a function either changed is cleaned up.
 pub fn unroll_program(program: &mut Program) -> Vec<usize> {
-    if disabled() {
-        return Vec::new();
-    }
     let mut changed = Vec::new();
     for (i, f) in program.funcs.iter_mut().enumerate() {
-        if unroll_function(f) {
+        let jammed = crate::unroll_jam::jam_function(f);
+        let unrolled = !disabled() && unroll_function(f);
+        if jammed || unrolled {
             changed.push(i);
         }
     }

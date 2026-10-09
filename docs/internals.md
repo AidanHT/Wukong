@@ -444,6 +444,7 @@ invalidated, and the call-effect table for the callees optimized so far. A cache
 | `Promote`     | -O2   | scalar promotion: a loop-invariant location the loop both reads and writes, with no other possibly aliasing access, is loaded once in the preheader, accessed through a fresh slot (which `Mem2Reg` turns into a loop-carried value next sweep) and stored back on every dedicated exit, with the same speculation rules as `Licm` and a store-safety rule (private slot, or a store that runs whenever the loop does) |
 | `Vectorize`   | -O2   | widen eligible canonical MIR loops after LICM, then feed the result through the normal fixpoint cleanup |
 | `unroll_program`| -O2 | unroll a counted two-block loop: **completely** when its exact trip count is at most 32 and the copies total at most 128 instructions; otherwise 4x (body up to 16 instructions) or 2x (up to 32), with a wrap-safe guard and a remainder that is a loop for an unknown trip count, nothing when the factor divides a known one, and straight-line copies for a known leftover; runs **after** the function pipeline, and the functions it changed get a reduced simplify + simplify-cfg + simplify-phis + cse + dce cleanup sweep |
+| `unroll_jam` | -O2 | inside `unroll_program`, ahead of the unroller: a canonical two-deep nest whose inner loop carries a recurrence or reduction runs **four outer iterations side by side** — four row prologues, one shared inner counter, four inner bodies per iteration, four epilogues in row order — with the untouched nest as the remainder; nothing is reassociated, so each row's values are bit-identical. Legal only when every stored object is split into per-row slabs (row-major `x[r*P + t]` with the window checked, the pitch possibly the inner loop's runtime bound, or time-major `x[t*D + d]` with every row below `D`), objects that may be one buffer are range-checked once in the preheader, and nothing calls, allocates or can trap (`src/unroll_jam.rs`; `WUKONG_NO_UNROLL_JAM=1` turns it off) |
 | `FormSwitches` | -O2 | once, after unrolling: turn a chain of four or more `cmp.eq`/`cmp.ne` tests of one integer scrutinee against constants into one `switch` terminator, hoisting the pure link compares into the head; a trapping (`unreachable`) fall-through stays the default, because sema's exhaustiveness check is lenient and that block can be reached (`src/switch_form.rs`) |
 
 `-O3` currently runs the same pass pipeline as `-O2`: there are no `-O3`-exclusive passes yet
@@ -487,6 +488,28 @@ NaN payload and a NaN-then-number sequence come out exactly as the scalar loop c
 branch that also records an index (an argmax) stays scalar. The runtime alias guard is budgeted at
 eight checks per loop (LLVM's default threshold); `WUKONG_VEC_TRACE=1` prints each widening with a
 per-group cost estimate (`cost=vector/scalar`), which is reported but not yet enforced.
+
+**Search loops** (`EarlyExit`): a loop whose body block leaves on one arm (`if a[i] > t { break }`)
+before falling into a straight-line latch widens as one body split at the test. The condition goes
+lane-wide and is folded over its lanes (parts combined, then a halving tree of lane shuffles, lane 0
+against zero); if any lane would leave, the group branches to the vector exit with its first
+iteration and starting values, and the original loop re-runs at most `W` iterations and leaves at
+exactly the iteration it always did. The rest of the group — its stores and accumulates — runs only
+when every lane continues. Nothing before the exit may store, gather or load an interleave window,
+and every contiguous load before it must provably read memory that exists for the whole trip: a
+stack array `[T; N]` with constant endpoints inside it, or a `[]T` slice searched up to its own
+length. A parameter buffer, whose extent MIR does not carry, keeps the search scalar.
+
+**Predicated arms**: if-conversion runs both arms for every lane, so an access only one arm makes
+cannot simply be widened. A store only one arm makes (`PredStore`) and a load no unconditional
+access covers (`PredLoad`) instead run per lane through `select(lane took the arm, own element,
+scratch)`, where the scratch is one private stack slot per element type in the entry block. No lane
+reads or writes an element the scalar loop leaves alone — unlike a read-modify-write blend, which
+could race with another thread writing the skipped elements or read past a shorter buffer. Stores
+in both arms must still pair into one masked store. Only affine element accesses are predicated: an
+arm that alone subscripts a `[]T` parameter also re-reads its data pointer there, an invariant load
+no other access covers, and the loop stays scalar unless LICM has hoisted that read (a local slice,
+or a `@noalias` one).
 
 **Unrolling never reassociates.** Splitting a float reduction across several accumulators would
 break the 4-cycle `addss` dependency chain, and it computes a different number — which breaks both

@@ -17,6 +17,29 @@ All notable changes to Wukong are documented here. The format is loosely based o
   hands a block to the next `alloc_*` that fits it (re-zeroed with that type's zero), so a decode
   loop that calls a layer per token or allocates and frees per step no longer grows the oracle's
   memory without bound (`tests/run/interp_memory_reuse.wk`).
+### Loop nests and search loops (`gap2/vec-control-2`)
+
+- **Nests whose inner loop carries a chain run four rows at once.** A two-deep nest whose inner loop
+  carries a recurrence (`h = a*h + x[r, t]`, an IIR filter, a running hash) or a reduction the
+  compiler may not reassociate (a strict-order float column sum) is unrolled and jammed at `-O2`:
+  four outer iterations run side by side as four independent chains, each computing exactly the
+  values the scalar loop computes, with the original nest as the remainder. It applies when every
+  stored array is split into per-row slabs (row-major `x[r*P + t]`, symbolic tensor shapes
+  included, or time-major `x[t*D + d]`), arrays that may alias are range-checked once before the
+  nest, and the nest neither calls, allocates nor divides by a value that could trap.
+  `WUKONG_NO_UNROLL_JAM=1` turns it off; the speed-up is not yet measured.
+- **Search loops vectorize.** A loop that leaves early (`if a[i] > t { break; }`) used to stay
+  scalar because it has two exits. The test now runs a whole group at a time; when any lane would
+  leave, the original loop re-runs that group and stops at exactly the iteration it always did.
+  It applies when every load before the exit provably stays inside its object — a local `[T; N]`
+  table, or a slice searched up to its own length.
+- **One-armed memory in an `if` no longer blocks vectorization.** `if v > 0.0 { o[i] = .. }` and
+  `o[i] = if x > 0.0 { w[i] * x } else { 1.0 }` used to keep the loop scalar because only one arm
+  stores or loads. Each lane now accesses its own element only where it took the arm (and a private
+  scratch slot otherwise), so skipped elements are never rewritten and a buffer shorter than the
+  loop is never read past its end. An arm that alone subscripts a `[]T` parameter still keeps the
+  loop scalar unless the parameter is `@noalias` (the arm re-reads the slice's data pointer, which
+  is not speculated); arrays and local slices are unaffected.
 
 ### AOT executables and platform (`gap2/aot-and-platform`)
 

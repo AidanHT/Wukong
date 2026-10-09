@@ -74,6 +74,7 @@ mod simplify;
 mod simplify_cfg;
 mod sroa;
 mod unroll;
+mod unroll_jam;
 mod vectorize;
 mod verify_each;
 

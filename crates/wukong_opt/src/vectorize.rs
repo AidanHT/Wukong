@@ -60,9 +60,11 @@
 //! straight line and turns the branch condition into a lane mask, so `if c { o[i] = f } else { o[i]
 //! = g }` becomes one `select` and one store. Both arms then run for every lane, which is only
 //! sound when running the arm a lane did not take is harmless; the two ways it would not be — an
-//! unpaired store (it writes memory the scalar loop leaves alone) and an unpaired load (it reads an
-//! address the scalar loop never touches, and Wukong does not bounds-check slice indexing) — are
-//! refused there.
+//! unpaired store (it would write memory the scalar loop leaves alone) and an unpaired load (it
+//! would read an address the scalar loop never touches, and Wukong does not bounds-check slice
+//! indexing) — are **predicated** instead: each lane accesses its own element where it took the
+//! arm and a private scratch slot where it did not ([`Plan::PredStore`], [`Plan::PredLoad`]), the
+//! branch-free form of a masked store and load.
 //!
 //! A merge that carries an accumulator across the back edge is a **guarded reduction**
 //! (`if c { s = s + x }`, `loop_info::Reduction::merge`): it is folded with the other reductions,
@@ -139,8 +141,8 @@ use wukong_mir::{
 
 use crate::fxhash::{FxHashMap, FxHashSet};
 use crate::loop_info::{
-    self, AccessKind, AddrForm, Carried, IvStep, LoopForest, MemAccess, MemBase, NaturalLoop,
-    RedKind, TripCount,
+    self, AccessKind, AddrForm, Carried, Coeff, IvStep, LoopForest, MemAccess, MemBase,
+    NaturalLoop, RedKind, TripCount,
 };
 use crate::{each_op_use, CfgAnalyses, Pass};
 
@@ -374,6 +376,12 @@ enum Plan {
     MaskedStore,
     /// An if-converted latch parameter: a lane-wise `select` between the two arms' arguments.
     Merge,
+    /// A load only one arm makes ([`LinInst::PredLoad`]): one scalar load per lane, from the lane's
+    /// own element where the lane took the arm and from a private scratch slot where it did not.
+    PredLoad,
+    /// A store only one arm makes ([`LinInst::PredStore`]): one scalar store per lane, to the lane's
+    /// own element where the lane took the arm and to the scratch slot where it did not.
+    PredStore,
 }
 
 /// One step of the loop body after **if-conversion**: the body's control flow is flattened into a
@@ -407,6 +415,25 @@ enum LinInst {
         cond: ValueId,
         then_arg: ValueId,
         else_arg: ValueId,
+    },
+    /// `blocks[block].insts[idx]`, a load only the arm taken when `cond == on_true` makes, at an
+    /// address no unconditional access covers. Predicated per lane rather than speculated: a lane
+    /// that did not take the arm reads a scratch slot, never the element ([`Plan::PredLoad`]).
+    PredLoad {
+        block: BlockId,
+        idx: usize,
+        cond: ValueId,
+        on_true: bool,
+    },
+    /// A store only the arm taken when `cond == on_true` makes (the other arm stores nothing): per
+    /// lane, the element is written only where the lane took the arm ([`Plan::PredStore`]).
+    PredStore {
+        ptr: ValueId,
+        value: ValueId,
+        cond: ValueId,
+        on_true: bool,
+        /// The store itself, for its `AddrForm`.
+        at: (BlockId, usize),
     },
 }
 
@@ -451,6 +478,33 @@ struct VecPlan {
     /// The cost model's estimate for one group, `(vector, scalar)` ([`estimate_cost`]). Reported
     /// by `WUKONG_VEC_TRACE`; not a gate.
     cost: (u64, u64),
+    /// A search loop's early exit, tested once per group ([`EarlyExit`]).
+    early: Option<EarlyExit>,
+}
+
+/// The early exit of a **search loop**: `while i < n { <test>; if !c { break } <rest>; i = i + 1 }`
+/// — one exit tested in the header, and one more from the body block that runs first.
+///
+/// A group cannot stop half way through, so it does not try to. The body up to the exit test is
+/// widened, the test goes lane-wide, and if *any* lane would leave, the vector loop hands the
+/// original loop the group's first iteration — the scalar loop then re-runs at most `W` iterations
+/// and leaves at exactly the iteration, with exactly the values, it always did (LLVM 19 / GCC 14
+/// early-break vectorization, resolved in the scalar epilogue). Only when every lane continues does
+/// the rest of the body run, so the group's stores and accumulates happen exactly when the scalar
+/// loop's would. Two things make running the test ahead of the scalar loop harmless, and
+/// [`plan_loop`] proves both: nothing before the exit stores, and every load before the exit reads
+/// memory that exists for the whole trip ([`speculation_safe`]) — lanes past the exiting one read
+/// elements the scalar loop never reaches.
+#[derive(Clone, Copy, Debug)]
+struct EarlyExit {
+    /// The branch condition of the exiting block.
+    cond: ValueId,
+    /// Does the loop keep going when `cond` is true? (`LoopCanon` makes it so, but the other
+    /// polarity costs nothing to support.)
+    continue_on_true: bool,
+    /// The index in [`VecPlan::lin`] of the first step after the test: the exiting block's steps
+    /// come first, the latch's after.
+    split: usize,
 }
 
 /// The induction variable's second, lane-varying face.
@@ -712,11 +766,14 @@ fn is_someones_epilogue(f: &Function, forest: &LoopForest, l: &NaturalLoop) -> b
 /// Returns the loop's preheader and its latch (the body block that carries the back edge).
 fn structural_verdict(f: &Function, l: &NaturalLoop) -> Result<(BlockId, BlockId), &'static str> {
     let preheader = l.preheader.ok_or("no preheader")?;
-    if l.latches.len() != 1 || !l.abnormal_exits.is_empty() || l.exits.len() != 1 {
-        return Err("not one latch / one exit / no abnormal exit");
+    if l.latches.len() != 1 || !l.abnormal_exits.is_empty() {
+        return Err("not one latch / no abnormal exit");
     }
-    let (exit_from, _) = l.exits[0];
-    if exit_from != l.header {
+    if l.exits.len() != 1 {
+        if early_exit_of(f, l).is_none() {
+            return Err("not one exit, nor a search loop's one early exit");
+        }
+    } else if l.exits[0].0 != l.header {
         return Err("exit is not tested in the header");
     }
     // The cheap half of `linearize_region`'s precondition: one straight-line body block, or a
@@ -761,7 +818,29 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
     let (preheader, body) = structural_verdict(f, l)?;
     // The body is either one straight-line block (which is then also the latch), or a diamond /
     // triangle that if-conversion flattens into one. Either way the latch carries the back edge.
-    let lin = linearize_region(f, l, body)?;
+    // A search loop's body is its exiting block followed by the latch, the test between them.
+    let (lin, early) = match early_exit_of(f, l) {
+        Some((exiting, cond, continue_on_true)) => {
+            let first = f.blocks[exiting.0 as usize].insts.len();
+            let lin: Vec<LinInst> = (0..first)
+                .map(|idx| LinInst::Real {
+                    block: exiting,
+                    idx,
+                })
+                .chain(
+                    (0..f.blocks[body.0 as usize].insts.len())
+                        .map(|idx| LinInst::Real { block: body, idx }),
+                )
+                .collect();
+            let early = EarlyExit {
+                cond,
+                continue_on_true,
+                split: first,
+            };
+            (lin, Some(early))
+        }
+        None => (linearize_region(f, l, body)?, None),
+    };
 
     // ---- induction variable and trip count ---------------------------------------------------
     iv_verdict(l)?;
@@ -858,6 +937,9 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
 
     // ---- trip count ---------------------------------------------------------------------------
     let trip = match &l.trip {
+        // A search loop has two exits, so the analysis reports no trip count; the header's test
+        // still bounds it, and the vector loop runs only whole groups below that bound.
+        _ if early.is_some() => early_trip(f, l, iv.value, iv.start, w)?,
         TripCount::Const(n) => {
             let groups = n / w as u64;
             if groups < MIN_TRIP_GROUPS {
@@ -887,7 +969,14 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
     if guards.len() + point_guards.len() > MAX_GUARD_PAIRS {
         return Err("more runtime alias checks than one loop entry amortizes");
     }
-    let cost = estimate_cost(f, &lin, &plans, &vector_ty, &reductions, body, w);
+    if let Some(x) = &early {
+        early_exit_verdict(f, l, &lin, &plans, x, iv.value, iv.start)?;
+    }
+    let mut cost = estimate_cost(f, &lin, &plans, &vector_ty, &reductions, body, w);
+    if early.is_some() {
+        // The lane test: a reduction over the mask's lanes, an extract and a branch.
+        cost.0 += 2 + 2 * u64::from(w.trailing_zeros());
+    }
 
     Ok(VecPlan {
         header: l.header,
@@ -908,6 +997,7 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
         ramp,
         ramp_vector,
         cost,
+        early,
     })
 }
 
@@ -965,6 +1055,13 @@ fn estimate_cost(
             }
             LinInst::MaskedStore { then_val, .. } => ty_of(*then_val),
             LinInst::Merge { param, .. } => ty_of(*param),
+            LinInst::PredLoad { block, idx, .. } => {
+                match f.blocks[block.0 as usize].insts[*idx].result {
+                    Some(r) => ty_of(r),
+                    None => MirType::I1,
+                }
+            }
+            LinInst::PredStore { value, .. } => ty_of(*value),
         }
     };
 
@@ -975,7 +1072,7 @@ fn estimate_cost(
     };
     let mut per_block: FxHashMap<u32, u64> = FxHashMap::default();
     for s in lin {
-        if let LinInst::Real { block, .. } = s {
+        if let LinInst::Real { block, .. } | LinInst::PredLoad { block, .. } = s {
             *per_block.entry(block.0).or_default() += 1;
         }
     }
@@ -1004,6 +1101,8 @@ fn estimate_cost(
                 2 * parts(&step_ty(s))
             }
             Plan::Replicate | Plan::LaneGep | Plan::Gather => 3 * w64,
+            // Per lane: the lane's condition bit, an address select and the scalar access.
+            Plan::PredLoad | Plan::PredStore => 4 * w64,
         };
     }
     for r in reductions {
@@ -1025,15 +1124,20 @@ fn estimate_cost(
 /// parameter, then the latch's own instructions.
 ///
 /// Executing an arm a lane did not take must be harmless, and the two ways it might not be are
-/// both refused here:
+/// handled here:
 ///
 /// * **A store with no counterpart.** If only the `then` arm writes `o[i]`, the flattened body
-///   would write it for every lane. Turning that into a read-modify-write (`store(p, select(m, v,
-///   load(p)))`) is possible but introduces a load *and* a write to memory the scalar loop never
-///   touches, so it is left out. A pair of stores to the same address becomes one masked store.
+///   must not write it for every lane. A read-modify-write (`store(p, select(m, v, load(p)))`)
+///   would read and rewrite memory the scalar loop never touches — a lost update against another
+///   thread writing those elements — so instead each lane stores on its own, to its element where
+///   it took the arm and to a private scratch slot where it did not ([`LinInst::PredStore`]): the
+///   branch-free form of a masked store. A pair of stores to the same address becomes one masked
+///   store; stores in both arms that do not pair are still refused.
 /// * **A load with no counterpart.** Wukong does not bounds-check slice indexing, so speculating
 ///   `w[i]` when only one arm reads it can read off the end of a buffer that is genuinely shorter
-///   than the loop's trip count. A load is speculated only when the *same* base and index is also
+///   than the loop's trip count. Such a load is predicated the same way — a lane that did not take
+///   the arm reads the scratch slot ([`LinInst::PredLoad`]) — and a load is speculated as a plain
+///   vector load only when the *same* base and index is also
 ///   read or written by the other arm or by the unconditional part of the body, which makes the
 ///   set of addresses the flattened body touches equal to the set one arm would have touched.
 ///
@@ -1131,6 +1235,9 @@ fn linearize_region(
         (AddrForm::Invariant(ba), AddrForm::Invariant(bb)) => ba.same_object(*bb),
         _ => false,
     };
+    // Loads no other access covers are predicated per lane; that needs the lane's own element,
+    // which an affine address gives and a gather's does not.
+    let mut predicated: FxHashSet<(u32, usize)> = FxHashSet::default();
     for (mine, theirs) in [(&t_acc, &e_acc), (&e_acc, &t_acc)] {
         for a in mine.iter().filter(|a| a.kind == AccessKind::Load) {
             let covered = theirs
@@ -1138,7 +1245,10 @@ fn linearize_region(
                 .chain(unconditional.iter())
                 .any(|b| same_place(a, b));
             if !covered {
-                return Err("an arm loads an address the other arm never touches");
+                if !matches!(a.addr, AddrForm::Affine { .. }) {
+                    return Err("an arm loads an address the other arm never touches");
+                }
+                predicated.insert((a.block.0, a.inst));
             }
         }
     }
@@ -1174,11 +1284,32 @@ fn linearize_region(
     };
     let t_stores = stores_of(t_blk);
     let e_stores = stores_of(e_blk);
-    if t_stores.len() != e_stores.len() {
+    let access_at = |b: BlockId, i: usize| l.accesses.iter().find(|a| a.block == b && a.inst == i);
+    let mut merged_stores: Vec<LinInst> = Vec::with_capacity(t_stores.len() + e_stores.len());
+    // Only one arm stores: each of its stores happens per lane, where the lane took the arm, in the
+    // arm's own order.
+    if t_stores.is_empty() || e_stores.is_empty() {
+        for (stores, on_true) in [(&t_stores, true), (&e_stores, false)] {
+            for &(b, i, ptr, value) in stores {
+                let Some(a) = access_at(b, i) else {
+                    return Err("a store in an arm has no analyzed address");
+                };
+                if !matches!(a.addr, AddrForm::Affine { .. }) {
+                    return Err("an arm stores to an address that does not step with the loop");
+                }
+                merged_stores.push(LinInst::PredStore {
+                    ptr,
+                    value,
+                    cond: *cond,
+                    on_true,
+                    at: (b, i),
+                });
+            }
+        }
+    } else if t_stores.len() != e_stores.len() {
         return Err("the two arms do not store the same number of times");
     }
-    let access_at = |b: BlockId, i: usize| l.accesses.iter().find(|a| a.block == b && a.inst == i);
-    let mut merged_stores: Vec<LinInst> = Vec::with_capacity(t_stores.len());
+    // (With one arm storing nothing, the zip below is empty.)
     for (ts, es) in t_stores.iter().zip(&e_stores) {
         let (Some(ta), Some(ea)) = (access_at(ts.0, ts.1), access_at(es.0, es.1)) else {
             return Err("a store in an arm has no analyzed address");
@@ -1216,7 +1347,16 @@ fn linearize_region(
             if matches!(inst.op, Op::Store { .. }) {
                 continue; // replaced by the merged store below
             }
-            lin.push(LinInst::Real { block: b, idx });
+            if predicated.contains(&(b.0, idx)) {
+                lin.push(LinInst::PredLoad {
+                    block: b,
+                    idx,
+                    cond: *cond,
+                    on_true: Some(b) == t_blk,
+                });
+            } else {
+                lin.push(LinInst::Real { block: b, idx });
+            }
         }
     }
     lin.extend(merged_stores);
@@ -1233,6 +1373,270 @@ fn linearize_region(
     }
     lin.extend(straight(latch));
     Ok(lin)
+}
+
+/// The search-loop shape [`EarlyExit`] widens, as `(exiting block, its condition, continue on
+/// true?)`: three blocks — the header, which tests the trip and enters the exiting block; the
+/// exiting block, which leaves the loop on one arm and falls into the latch on the other; and the
+/// straight-line latch.
+fn early_exit_of(f: &Function, l: &NaturalLoop) -> Option<(BlockId, ValueId, bool)> {
+    if l.exits.len() != 2 || l.blocks.len() != 3 || l.latches.len() != 1 {
+        return None;
+    }
+    let latch = l.latches[0];
+    if l.exits.iter().filter(|(b, _)| *b == l.header).count() != 1 {
+        return None;
+    }
+    let &(exiting, out) = l.exits.iter().find(|(b, _)| *b != l.header)?;
+    if exiting == latch {
+        return None;
+    }
+    // A dead-end exit — a failed bounds check's `call wukong_rt_bounds_fail; unreachable` in the
+    // slow copy `bce` keeps — is a cold path, not a search: widening it buys nothing and costs code
+    // and compile time on every versioned slice loop.
+    if matches!(f.blocks[out.0 as usize].term, Terminator::Unreachable) {
+        return None;
+    }
+    let inside: Vec<BlockId> = succs(&f.blocks[l.header.0 as usize].term)
+        .into_iter()
+        .filter(|b| l.blocks.contains(b))
+        .collect();
+    if inside.as_slice() != [exiting] {
+        return None;
+    }
+    let Terminator::CondBr {
+        cond,
+        then_blk,
+        then_args,
+        else_blk,
+        else_args,
+    } = &f.blocks[exiting.0 as usize].term
+    else {
+        return None;
+    };
+    let (continue_on_true, into_latch) = if *then_blk == latch && *else_blk == out {
+        (true, then_args)
+    } else if *else_blk == latch && *then_blk == out {
+        (false, else_args)
+    } else {
+        return None;
+    };
+    let latch_blk = &f.blocks[latch.0 as usize];
+    if !into_latch.is_empty() || !latch_blk.params.is_empty() {
+        return None;
+    }
+    if !matches!(&latch_blk.term, Terminator::Br { target, .. } if *target == l.header) {
+        return None;
+    }
+    Some((exiting, *cond, continue_on_true))
+}
+
+/// A compile-time integer constant, wherever it is defined.
+fn const_of(f: &Function, v: ValueId) -> Option<i128> {
+    match op_of(f, v)? {
+        Op::ConstInt(k, ty) if ty.is_int() => Some(*k),
+        _ => None,
+    }
+}
+
+/// A search loop's header test as `iv <pred> bound` while the loop runs, `pred` `Slt` or `Ult`.
+fn header_bound(
+    f: &Function,
+    l: &NaturalLoop,
+    iv: ValueId,
+) -> Result<(CmpOp, ValueId), &'static str> {
+    let Terminator::CondBr {
+        cond,
+        then_blk,
+        else_blk,
+        ..
+    } = &f.blocks[l.header.0 as usize].term
+    else {
+        return Err("the header does not test the trip");
+    };
+    if !l.blocks.contains(then_blk) || l.blocks.contains(else_blk) {
+        return Err("the header's test does not continue on true");
+    }
+    let Some(Op::Cmp(pred, a, b)) = op_of(f, *cond) else {
+        return Err("the header's test is not a compare");
+    };
+    let (pred, bound) = if *a == iv && *b != iv {
+        (*pred, *b)
+    } else if *b == iv && *a != iv {
+        let swapped = match pred {
+            CmpOp::Sgt => CmpOp::Slt,
+            CmpOp::Ugt => CmpOp::Ult,
+            _ => return Err("the header's test is not `iv < bound`"),
+        };
+        (swapped, *a)
+    } else {
+        return Err("the header's test does not read the induction variable");
+    };
+    if !matches!(pred, CmpOp::Slt | CmpOp::Ult) {
+        return Err("the header's test is not `iv < bound`");
+    }
+    Ok((pred, bound))
+}
+
+/// The trip of a search loop, from its header test. The analysis reports none — the loop has two
+/// exits — but the vector loop only needs the header's bound: it runs whole groups below it, and
+/// the early exit is resolved in the original loop. Constant endpoints give a constant count
+/// (rounded down to whole groups of `w`); otherwise the bound must be readable before the loop.
+fn early_trip(
+    f: &Function,
+    l: &NaturalLoop,
+    iv: ValueId,
+    start: Option<ValueId>,
+    w: u32,
+) -> Result<TripPlan, &'static str> {
+    let (pred, bound) = header_bound(f, l, iv)?;
+    if let (Some(s), Some(e)) = (start.and_then(|v| const_of(f, v)), const_of(f, bound)) {
+        if pred == CmpOp::Ult && (s < 0 || e < 0) {
+            return Err("an unsigned trip over a negative constant");
+        }
+        let groups = if e > s { (e - s) / i128::from(w) } else { 0 };
+        if groups < i128::from(MIN_TRIP_GROUPS) {
+            return Err("trip count is below one vector group");
+        }
+        return u64::try_from(groups * i128::from(w))
+            .map(TripPlan::Const)
+            .map_err(|_| "trip count does not fit");
+    }
+    if l.blocks.iter().any(|b| defined_in_block(f, *b, bound)) {
+        return Err("the search loop's bound is computed inside the loop");
+    }
+    Ok(TripPlan::Runtime { end: bound })
+}
+
+/// What has to hold before a search loop's test may run `W` iterations ahead of the scalar loop:
+/// the steps before the exit store nothing and read only memory that exists for the whole trip
+/// (contiguous loads proved by [`speculation_safe`]; a gather or an interleave window is refused),
+/// and the test itself is a value the vector body computes before the exit.
+fn early_exit_verdict(
+    f: &Function,
+    l: &NaturalLoop,
+    lin: &[LinInst],
+    plans: &[Plan],
+    x: &EarlyExit,
+    iv: ValueId,
+    start: Option<ValueId>,
+) -> Result<(), &'static str> {
+    let (_, end) = header_bound(f, l, iv)?;
+    let start = start.ok_or("the induction variable has no single start")?;
+    let mut defines_cond = false;
+    for (step, plan) in lin[..x.split].iter().zip(&plans[..x.split]) {
+        let LinInst::Real { block, idx } = step else {
+            return Err("a search loop's test is not straight-line code");
+        };
+        let inst = &f.blocks[block.0 as usize].insts[*idx];
+        defines_cond |= inst.result == Some(x.cond);
+        match plan {
+            Plan::VecStore | Plan::GroupStore { .. } | Plan::MaskedStore => {
+                return Err("a search loop stores before its exit")
+            }
+            Plan::Gather | Plan::LaneGep | Plan::GroupLoad { .. } => {
+                return Err("a search loop gathers before its exit")
+            }
+            Plan::Reduce if inst.result == Some(x.cond) => {
+                return Err("a search loop exits on its own accumulator")
+            }
+            _ => {}
+        }
+        if matches!(inst.op, Op::Store { .. }) {
+            return Err("a search loop stores before its exit");
+        }
+        if let Op::Load(..) = inst.op {
+            let Some(a) = l
+                .accesses
+                .iter()
+                .find(|a| a.block == *block && a.inst == *idx)
+            else {
+                return Err("a load before the exit has no analyzed address");
+            };
+            match &a.addr {
+                // The same address every iteration: the vector loop runs only when the trip covers
+                // a whole group, so the scalar loop reads it too.
+                AddrForm::Invariant(_) => {}
+                AddrForm::Affine { base, index, elem } => {
+                    if index.coeff != Coeff::Const(1)
+                        || !index.terms.is_empty()
+                        || !speculation_safe(f, *base, elem, index.konst, start, end)
+                    {
+                        return Err("a load before the exit may read past its object");
+                    }
+                }
+                AddrForm::Unknown => return Err("a load before the exit has no analyzed address"),
+            }
+        }
+    }
+    // A condition from outside the body is one answer for the whole group, which is fine; one
+    // defined in the latch would be read before it exists.
+    if !defines_cond && l.blocks.iter().any(|b| defined_in_block(f, *b, x.cond)) {
+        return Err("a search loop's test is not computed before its exit");
+    }
+    Ok(())
+}
+
+/// Is `v` a parameter or an instruction result of block `b`?
+fn defined_in_block(f: &Function, b: BlockId, v: ValueId) -> bool {
+    let blk = &f.blocks[b.0 as usize];
+    blk.params.contains(&v) || blk.insts.iter().any(|i| i.result == Some(v))
+}
+
+/// May the vector loop read `base[iv + c]` for every `iv` in `[start, end)`, although the scalar
+/// loop may leave before it reaches the end? Two proofs, both about the object rather than the
+/// loop:
+///
+/// * a **stack array** of this function, `[T; N]` with `T` the element read: the constant range
+///   `[start + c, end + c)` lies inside `[0, N)`;
+/// * a **`[]T` slice whose loop runs to its own length** — `end` is `load i64 (hdr + 8)`, the
+///   fat pointer's length field, and the data is re-read from the same `hdr` — with `c <= 0` and a
+///   constant `start + c >= 0`: every element below the length exists.
+///
+/// Anything else — a parameter pointer with no known extent, a symbolic offset — is refused: a
+/// group straddling the end of a shorter buffer could fault where the scalar loop stops in time.
+fn speculation_safe(
+    f: &Function,
+    base: MemBase,
+    elem: &MirType,
+    c: i64,
+    start: ValueId,
+    end: ValueId,
+) -> bool {
+    let c = i128::from(c);
+    match base {
+        MemBase::Outer(v) => {
+            let Some(Op::Alloca { ty, .. }) = op_of(f, v) else {
+                return false;
+            };
+            let n = match ty {
+                MirType::Array(e, n) if **e == *elem => i128::from(*n),
+                t if t == elem => 1,
+                _ => return false,
+            };
+            let (Some(s), Some(e)) = (const_of(f, start), const_of(f, end)) else {
+                return false;
+            };
+            s + c >= 0 && e + c <= n
+        }
+        MemBase::ReloadedOuter { addr, .. } => {
+            let Some(Op::Load(len_at, MirType::I64)) = op_of(f, end) else {
+                return false;
+            };
+            let Some(Op::Gep {
+                ptr,
+                index,
+                elem: MirType::I8,
+            }) = op_of(f, *len_at)
+            else {
+                return false;
+            };
+            *ptr == addr
+                && const_of(f, *index) == Some(8)
+                && c <= 0
+                && const_of(f, start).is_some_and(|s| s + c >= 0)
+        }
+    }
 }
 
 fn succs(t: &Terminator) -> Vec<BlockId> {
@@ -1361,7 +1765,15 @@ fn classify_iv_uses(f: &Function, lin: &[LinInst], iv: ValueId) -> Option<FxHash
         // latch parameter or two stored *values*, and a lane-varying stored value is rejected
         // separately. Check it rather than assume it.
         let inst = match step {
-            LinInst::Real { block, idx } => &f.blocks[block.0 as usize].insts[*idx],
+            LinInst::Real { block, idx } | LinInst::PredLoad { block, idx, .. } => {
+                &f.blocks[block.0 as usize].insts[*idx]
+            }
+            LinInst::PredStore { cond, value, .. } => {
+                if index.contains(&cond.0) || index.contains(&value.0) {
+                    return None;
+                }
+                continue;
+            }
             LinInst::MaskedStore {
                 cond,
                 then_val,
@@ -1888,6 +2300,21 @@ fn plan_body(
                     index_only.insert(u.0, false);
                 }
             }
+            LinInst::PredLoad {
+                block, idx, cond, ..
+            } => {
+                index_only.insert(cond.0, false);
+                each_op_use(&f.blocks[block.0 as usize].insts[*idx].op, &mut |u| {
+                    index_only.insert(u.0, false);
+                });
+            }
+            LinInst::PredStore {
+                ptr, value, cond, ..
+            } => {
+                for u in [*ptr, *value, *cond] {
+                    index_only.insert(u.0, false);
+                }
+            }
         }
     }
     for b in &l.blocks {
@@ -2017,6 +2444,76 @@ fn plan_body(
                 }
                 available.insert(param.0);
                 plans.push(Plan::Merge);
+                continue;
+            }
+            // A load only one arm makes: one scalar load per lane at the lane's own element
+            // (`ptr + k`) or the scratch slot, so the address must be the group's one scalar address
+            // and the condition a mask (or one answer for the group). Its lanes are packed wherever
+            // a widened step reads them, like any replicated value.
+            LinInst::PredLoad {
+                block, idx, cond, ..
+            } => {
+                let inst = &f.blocks[block.0 as usize].insts[*idx];
+                let Op::Load(ptr, ty) = &inst.op else {
+                    return None;
+                };
+                for u in [*ptr, *cond] {
+                    if (defined_in_loop.contains(&u.0) && !available.contains(&u.0))
+                        || lane_ptrs.contains(&u.0)
+                    {
+                        return None;
+                    }
+                }
+                if lane_at(&vector_ty, at, *ptr).is_some() || red_cmp.contains(&cond.0) {
+                    return None;
+                }
+                if !matches!(
+                    access_at.get(&(block.0, *idx)).map(|a| &a.addr),
+                    Some(AddrForm::Affine { .. })
+                ) {
+                    return None;
+                }
+                lane_bytes(ty)?;
+                let r = inst.result?;
+                vector_ty.insert(r.0, ty.clone());
+                lane_vals.insert(r.0);
+                available.insert(r.0);
+                replicated += 1;
+                plans.push(Plan::PredLoad);
+                continue;
+            }
+            // A store only one arm makes: per lane, to the lane's own element or the scratch slot.
+            // The stored value is read lane by lane, so it may be a vector, replicated lanes or one
+            // value for the group — but never the induction variable's scalar address face.
+            LinInst::PredStore {
+                ptr,
+                value,
+                cond,
+                at: store_at,
+                ..
+            } => {
+                for u in [*ptr, *value, *cond] {
+                    if (defined_in_loop.contains(&u.0) && !available.contains(&u.0))
+                        || lane_ptrs.contains(&u.0)
+                    {
+                        return None;
+                    }
+                }
+                if lane_at(&vector_ty, at, *ptr).is_some()
+                    || red_cmp.contains(&cond.0)
+                    || iv_addr.contains(&value.0)
+                {
+                    return None;
+                }
+                if !matches!(
+                    access_at.get(&(store_at.0 .0, store_at.1)).map(|a| &a.addr),
+                    Some(AddrForm::Affine { .. })
+                ) {
+                    return None;
+                }
+                lane_bytes(f.value_type(*value))?;
+                replicated += 1;
+                plans.push(Plan::PredStore);
                 continue;
             }
         };
@@ -2852,8 +3349,9 @@ fn apply(f: &mut Function, p: &VecPlan) {
     };
 
     // ---- vector body ---------------------------------------------------------------------------
-    let latch_args = emit_body(&mut e, p, vb, guard, &header_params, &vh_params);
-    e.f.blocks[vb.0 as usize].term = Terminator::Br {
+    // A search loop's body is two blocks: the test leaves for `vx` before the rest of the group.
+    let (latch_args, last) = emit_body(&mut e, p, vb, vx, guard, &header_params, &vh_params);
+    e.f.blocks[last.0 as usize].term = Terminator::Br {
         target: vh,
         args: latch_args,
     };
@@ -3076,14 +3574,20 @@ fn range_of(
 /// (the fat pointer is the parameter the loop indexes through, live for the whole call, and
 /// `emit_alias_checks` already reads it), but for an arbitrary invariant address it would be a
 /// read the scalar loop never performs when the trip count is zero.
+///
+/// A search loop ([`EarlyExit`]) is emitted in two blocks: the steps up to its exit test in `vb`,
+/// which ends in the lane test and leaves for `vx` when any lane would leave the loop, and the rest
+/// of the group in a block of its own. Returns the back edge's arguments and the block that carries
+/// them.
 fn emit_body(
     e: &mut Emit<'_>,
     p: &VecPlan,
-    vb: BlockId,
+    mut vb: BlockId,
+    vx: BlockId,
     guard: BlockId,
     header_params: &[ValueId],
     vh_params: &[ValueId],
-) -> Vec<ValueId> {
+) -> (Vec<ValueId>, BlockId) {
     let latch_term = e.f.blocks[p.body.0 as usize].term.clone();
 
     // scalar value -> its counterpart in the vector body.
@@ -3094,6 +3598,8 @@ fn emit_body(
     // `(group, residue)` -> that member's parts: filled for every member of a load group by its
     // first member, and member by member for a store group until its last member stores them all.
     let mut group_vals: FxHashMap<(usize, u32), Vec<ValueId>> = FxHashMap::default();
+    // The scratch slots predicated accesses aim their idle lanes at, one per element type.
+    let mut scratch: Vec<(MirType, ValueId)> = Vec::new();
 
     // The lane ramp, when the body reads the induction variable as a value: `splat(i) + iota`, so
     // lane `k` holds `i + k` — the counter scalar iteration `i + k` would have had. The step is 1
@@ -3129,6 +3635,9 @@ fn emit_body(
     });
 
     for (i, step) in p.lin.iter().enumerate() {
+        if p.early.is_some_and(|x| x.split == i) {
+            vb = emit_exit_test(e, p, vb, vx, &map);
+        }
         // Give the induction variable its lane-varying face for exactly the steps that read it as a
         // value, and its scalar one everywhere else, so the address arithmetic around them stays
         // scalar. Set at the top of every iteration rather than restored at the bottom: the body
@@ -3210,6 +3719,67 @@ fn emit_body(
                 }
                 continue;
             }
+            // A load one arm makes, lane by lane: each lane reads its own element if it took the
+            // arm and the scratch slot if it did not, so no lane touches memory the scalar loop
+            // leaves alone. The idle lanes' values are discarded by the arm's merge.
+            (
+                Plan::PredLoad,
+                LinInst::PredLoad {
+                    block,
+                    idx,
+                    cond,
+                    on_true,
+                },
+            ) => {
+                let inst = e.f.blocks[block.0 as usize].insts[*idx].clone();
+                let Op::Load(ptr, ty) = &inst.op else {
+                    unreachable!("a predicated load is a load")
+                };
+                let ptr = resolve_uniform(&map, *ptr);
+                let bits = mask_lane_bools(e, vb, &map, *cond, p.w);
+                let slot = scratch_slot(e, &mut scratch, ty);
+                let lanes = bits
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &bit)| {
+                        let own = elem_ptr(e, vb, ptr, ty, k as i64);
+                        let (a, b) = if *on_true { (own, slot) } else { (slot, own) };
+                        let at = e.push(vb, MirType::Ptr, Op::Select(bit, a, b));
+                        e.push(vb, ty.clone(), Op::Load(at, ty.clone()))
+                    })
+                    .collect();
+                map.insert(
+                    inst.result.expect("a load has a result").0,
+                    Wide::Lanes(lanes),
+                );
+                continue;
+            }
+            // A store one arm makes, lane by lane, in lane order: to the lane's own element where
+            // the lane took the arm, to the scratch slot where it did not — a masked store without
+            // a read-modify-write of the elements it skips.
+            (
+                Plan::PredStore,
+                LinInst::PredStore {
+                    ptr,
+                    value,
+                    cond,
+                    on_true,
+                    ..
+                },
+            ) => {
+                let lane_ty = e.f.value_type(*value).clone();
+                let ptr = resolve_uniform(&map, *ptr);
+                let vals = lane_values(e, vb, &map, *value, p.w);
+                let bits = mask_lane_bools(e, vb, &map, *cond, p.w);
+                let slot = scratch_slot(e, &mut scratch, &lane_ty);
+                for (k, (&v, &bit)) in vals.iter().zip(&bits).enumerate() {
+                    let own = elem_ptr(e, vb, ptr, &lane_ty, k as i64);
+                    let (a, b) = if *on_true { (own, slot) } else { (slot, own) };
+                    let at = e.push(vb, MirType::Ptr, Op::Select(bit, a, b));
+                    e.push_void(vb, Op::Store { ptr: at, value: v });
+                }
+                continue;
+            }
             _ => {}
         }
         let LinInst::Real { block, idx } = step else {
@@ -3218,7 +3788,9 @@ fn emit_body(
         let inst = e.f.blocks[block.0 as usize].insts[*idx].clone();
         let inst = &inst;
         match &p.plans[i] {
-            Plan::MaskedStore | Plan::Merge => unreachable!("handled above"),
+            Plan::MaskedStore | Plan::Merge | Plan::PredLoad | Plan::PredStore => {
+                unreachable!("handled above")
+            }
             Plan::Reduce => continue, // folded after the body, see below
             Plan::Scalar => {
                 let mut op = inst.op.clone();
@@ -3371,6 +3943,11 @@ fn emit_body(
         }
     }
 
+    // A search loop whose latch computes nothing but the step tests after every body step.
+    if p.early.is_some_and(|x| x.split == p.lin.len()) {
+        vb = emit_exit_test(e, p, vb, vx, &map);
+    }
+
     // Past the body the induction variable is scalar again: the reduction folds and the back-edge
     // arguments below both read it (or values it feeds) through `resolve_uniform`, and the
     // induction variable's own back-edge argument is the `+ W` step.
@@ -3471,7 +4048,124 @@ fn emit_body(
         }
     }
     out.extend(vacc_next);
-    out
+    // The scratch slots live in the entry block, allocated once per call. Inserted last: nothing
+    // after this point reads an instruction index.
+    let entry = e.f.entry;
+    for (ty, slot) in scratch.into_iter().rev() {
+        e.f.blocks[entry.0 as usize].insts.insert(
+            0,
+            Inst {
+                result: Some(slot),
+                op: Op::Alloca {
+                    ty,
+                    space: wukong_mir::AddrSpace::Local,
+                },
+            },
+        );
+    }
+    (out, vb)
+}
+
+/// The scratch slot a predicated access of `ty` aims its idle lanes at: one private stack slot per
+/// element type, whose address escapes nowhere but into those selects, so writing it is invisible
+/// and reading it reads a value the arm's merge discards.
+fn scratch_slot(e: &mut Emit<'_>, scratch: &mut Vec<(MirType, ValueId)>, ty: &MirType) -> ValueId {
+    if let Some(&(_, slot)) = scratch.iter().find(|(t, _)| t == ty) {
+        return slot;
+    }
+    let slot = e.value(MirType::Ptr);
+    scratch.push((ty.clone(), slot));
+    slot
+}
+
+/// End `vb` in a search loop's exit test and continue the group in a new block, returned.
+///
+/// The group leaves for `vx` — handing the original loop the group's first iteration and the values
+/// it started with, since nothing after the test has run — when any of its `W` lanes would leave the
+/// loop; the original loop then re-runs at most `W` iterations and stops at exactly the one it
+/// always stopped at. Otherwise every lane continues and so does the group.
+fn emit_exit_test(
+    e: &mut Emit<'_>,
+    p: &VecPlan,
+    vb: BlockId,
+    vx: BlockId,
+    map: &FxHashMap<u32, Wide>,
+) -> BlockId {
+    let x = p.early.expect("only a search loop has an exit test");
+    // Continuing on true, every lane must hold; continuing on false, no lane may.
+    let (fold, all_stay) = if x.continue_on_true {
+        (BinOp::And, true)
+    } else {
+        (BinOp::Or, false)
+    };
+    let verdict = fold_lanes(e, vb, map, x.cond, p.w, fold);
+    let rest = e.block(Vec::new(), Terminator::Unreachable);
+    let (then_blk, else_blk) = if all_stay { (rest, vx) } else { (vx, rest) };
+    e.f.blocks[vb.0 as usize].term = Terminator::CondBr {
+        cond: verdict,
+        then_blk,
+        then_args: Vec::new(),
+        else_blk,
+        else_args: Vec::new(),
+    };
+    rest
+}
+
+/// `fold` (`And` or `Or`) over every lane of the lane mask `c`, as one `i1`: the parts combined
+/// lane-wise, then a halving tree of lane shuffles, then lane 0 against zero — `log2` of the lane
+/// count steps instead of one extract per lane. A mask lane is all-ones natively and `1` in the
+/// interpreter, zero in both when false, so the bitwise fold and the `!= 0` test read the same truth
+/// on every backend. A condition that is uniform across the group is its own answer.
+fn fold_lanes(
+    e: &mut Emit<'_>,
+    vb: BlockId,
+    map: &FxHashMap<u32, Wide>,
+    c: ValueId,
+    w: u32,
+    fold: BinOp,
+) -> ValueId {
+    let parts = match map.get(&c.0) {
+        None => return c,
+        Some(Wide::Uniform(x)) => return *x,
+        Some(Wide::Lanes(_)) => {
+            let bits = mask_lane_bools(e, vb, map, c, w);
+            let mut acc = bits[0];
+            for &b in &bits[1..] {
+                acc = e.push(vb, MirType::I1, Op::Bin(fold, acc, b));
+            }
+            return acc;
+        }
+        Some(Wide::Vector(parts)) => parts.clone(),
+    };
+    let vt = e_ty(e, parts[0]);
+    let MirType::Vec(lane, n) = vt.clone() else {
+        unreachable!("a widened compare is a lane-mask vector")
+    };
+    let lane = *lane;
+    let mut acc = parts[0];
+    for &q in &parts[1..] {
+        acc = e.push(vb, vt.clone(), Op::Bin(fold, acc, q));
+    }
+    let mut width = n;
+    while width > 1 {
+        let half = width / 2;
+        // Lane `k` takes lane `half + k mod half`: the upper half folded onto the lower.
+        let mask: Vec<u8> = (0..n).map(|k| (half + k % half) as u8).collect();
+        let upper = e.push(
+            vb,
+            vt.clone(),
+            Op::Shuffle {
+                a: acc,
+                b: acc,
+                mask,
+            },
+        );
+        acc = e.push(vb, vt.clone(), Op::Bin(fold, acc, upper));
+        width = half;
+    }
+    let first = e.push(vb, lane.clone(), Op::ExtractLane(acc, 0));
+    let zero = e.int(vb, &lane, 0);
+    e.push(vb, MirType::I1, Op::Cmp(CmpOp::Ne, first, zero))
 }
 
 /// Fold `W` lane values into the accumulator **one at a time, in index order**.
@@ -5758,25 +6452,80 @@ mod tests {
         );
     }
 
-    /// Only one arm stores, so the flattened body would write `o[i]` for lanes the scalar loop
-    /// leaves untouched. A read-modify-write could express it; until then, decline.
+    /// Only one arm stores, so the flattened body must not write `o[i]` for lanes the scalar loop
+    /// leaves untouched: each lane stores on its own, to `o[i + k]` where it took the arm and to a
+    /// scratch slot where it did not. The sentinels the arm skips must survive.
+    ///
+    /// `o` is `@noalias` because only the arm subscripts it, so only the arm would re-read its data
+    /// pointer from the fat pointer: an invariant load no other access covers, which
+    /// `linearize_region` refuses to speculate. The promise makes the header dereferenceable, LICM
+    /// hoists that read out of the loop, and the arm is left with the element store this case is
+    /// about. (Inlined into `main`, the slice is a local and the same hoist needs no promise.)
     #[test]
-    fn an_unpaired_conditional_store_is_declined() {
-        let src = "fn k(x: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
-                   while i < n { if x[i] > 0.0 { o[i] = 1.0; } i = i + 1; } } \
-                   fn main() -> i32 { return 0; }";
-        assert!(!is_widened(src, "k"), "an unpaired store must stay scalar");
+    fn a_one_armed_store_is_predicated_and_skipped_elements_survive() {
+        let kernel = "@unchecked fn k(x: []f32, @noalias mut o: []f32, n: i64) { \
+                      let mut i: i64 = 0; \
+                      while i < n { let v: f32 = x[i]; \
+                      if v > 0.0 { o[i] = v * 2.0 + 1.0; } i = i + 1; } }";
+        let shape = format!("{kernel} fn main() -> i32 {{ return 0; }}");
+        assert!(
+            is_widened(&shape, "k"),
+            "a one-armed store was not predicated"
+        );
+        assert!(
+            ops_of(&shape, "k")
+                .iter()
+                .any(|op| matches!(op, Op::Alloca { .. })),
+            "a predicated store needs its scratch slot"
+        );
+        scalar_and_vector_agree(&format!(
+            "{kernel} fn main() -> i32 {{ let mut x: []f32 = alloc_f32(23); \
+             let mut o: []f32 = alloc_f32(23); let mut i: i64 = 0; \
+             while i < 23 {{ x[i] = (((i * 5) % 7) as f32) - 3.0; o[i] = -7.0; i = i + 1; }} \
+             k(x, o, 23); \
+             i = 0; while i < 23 {{ print(o[i] as i32); i = i + 1; }} \
+             free(o); free(x); return 0; }}"
+        ));
     }
 
-    /// Only one arm reads `w[i]`. Wukong does not bounds-check slice indexing, so speculating that
-    /// load can read off the end of a buffer shorter than the loop's trip count.
+    /// Only one arm reads `w[i]`, and `w` is shorter than the trip: the scalar loop reads it only
+    /// where `x[i] > 0`. Speculating the load would read past its end; predicating it reads the
+    /// scratch slot for every lane that did not take the arm. `w` is `@noalias` for the reason the
+    /// one-armed store's `o` is: only the arm reads it, data pointer included.
     #[test]
-    fn an_unpaired_conditional_load_is_declined() {
-        let src = "fn k(x: []f32, w: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
-                   while i < n { let xi: f32 = x[i]; \
-                   if xi > 0.0 { o[i] = w[i]; } else { o[i] = 1.0; } i = i + 1; } } \
+    fn an_arm_only_load_is_predicated_and_never_reads_past_its_buffer() {
+        let kernel = "@unchecked fn k(x: []f32, @noalias w: []f32, mut o: []f32, n: i64) { \
+                      let mut i: i64 = 0; \
+                      while i < n { let xi: f32 = x[i]; \
+                      if xi > 0.0 { o[i] = w[i] * xi; } else { o[i] = 1.0; } i = i + 1; } }";
+        let shape = format!("{kernel} fn main() -> i32 {{ return 0; }}");
+        assert!(
+            is_widened(&shape, "k"),
+            "an arm-only load was not predicated"
+        );
+        scalar_and_vector_agree(&format!(
+            "{kernel} fn main() -> i32 {{ let mut x: []f32 = alloc_f32(23); \
+             let mut w: []f32 = alloc_f32(10); let mut o: []f32 = alloc_f32(23); \
+             let mut i: i64 = 0; \
+             while i < 23 {{ x[i] = 9.5 - (i as f32); o[i] = 0.0; i = i + 1; }} \
+             i = 0; while i < 10 {{ w[i] = (i as f32) + 0.5; i = i + 1; }} \
+             k(x, w, o, 23); \
+             i = 0; while i < 23 {{ print((o[i] * 4.0) as i32); i = i + 1; }} \
+             free(o); free(w); free(x); return 0; }}"
+        ));
+    }
+
+    /// Both arms store, to different places: there is no one masked store to merge them into.
+    #[test]
+    fn stores_to_different_places_in_both_arms_are_declined() {
+        let src = "@unchecked fn k(x: []f32, mut o: []f32, mut p: []f32, n: i64) { \
+                   let mut i: i64 = 0; \
+                   while i < n { if x[i] > 0.0 { o[i] = 1.0; } else { p[i] = 2.0; } i = i + 1; } } \
                    fn main() -> i32 { return 0; }";
-        assert!(!is_widened(src, "k"), "an unpaired load must stay scalar");
+        assert!(
+            !is_widened(src, "k"),
+            "unpaired stores in both arms must stay scalar"
+        );
     }
 
     #[test]
@@ -6223,5 +6972,82 @@ mod tests {
             .collect();
         assert_eq!(printed, expected, "-O2 lost the scalar answer");
         scalar_and_vector_agree(src);
+    }
+
+    // ---- search loops (early exits) -----------------------------------------------------------
+
+    /// The first index of an 18-element local table whose element exceeds `t`. The table is a
+    /// stack array of this function, so every group may read it whole; 18 is not a multiple of
+    /// the group, so the last two positions are found by the scalar tail.
+    const TABLE_SEARCH: &str = "fn find(t: f32) -> i64 { \
+                                let mut a: [f32; 18] = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, \
+                                  4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5]; \
+                                let mut i: i64 = 0; \
+                                while i < 18 { if a[i] > t { break; } i = i + 1; } \
+                                return i; }";
+
+    #[test]
+    fn a_search_over_a_local_table_widens_and_stops_where_the_scalar_loop_does() {
+        let shape = format!("{TABLE_SEARCH} fn main() -> i32 {{ return 0; }}");
+        assert!(
+            is_widened(&shape, "find"),
+            "a search over a local table did not widen"
+        );
+        // Every position 0..18 and two thresholds no element exceeds.
+        scalar_and_vector_agree(&format!(
+            "{TABLE_SEARCH} fn main() -> i32 {{ let mut q: i64 = 0; \
+             while q < 20 {{ print(find((q as f32) * 0.5 - 0.25)); q = q + 1; }} \
+             return 0; }}"
+        ));
+    }
+
+    /// A search to a slice's own length (`n = x.len()`) may read every element below it; this one
+    /// is `@unchecked`, so the loop has no bounds-check exits of its own.
+    const SLICE_SEARCH: &str = "@unchecked fn first_neg(x: []i32) -> i64 { \
+                                let n = x.len(); let mut i: i64 = 0; \
+                                while i < n { if x[i] < 0 { break; } i = i + 1; } \
+                                return i; }";
+
+    #[test]
+    fn a_search_to_a_slices_own_length_widens_and_agrees() {
+        let shape = format!("{SLICE_SEARCH} fn main() -> i32 {{ return 0; }}");
+        assert!(
+            is_widened(&shape, "first_neg"),
+            "a search to the slice's own length did not widen"
+        );
+        // The negative element at every position 0..19, then nowhere.
+        scalar_and_vector_agree(&format!(
+            "{SLICE_SEARCH} fn main() -> i32 {{ let mut s: []i32 = alloc_i32(19); \
+             let mut j: i64 = 0; while j < 19 {{ s[j] = 1; j = j + 1; }} \
+             let mut q: i64 = 0; \
+             while q < 20 {{ if q < 19 {{ s[q] = -1; }} print(first_neg(s)); \
+                             if q < 19 {{ s[q] = 1; }} q = q + 1; }} \
+             free(s); return 0; }}"
+        ));
+    }
+
+    /// A parameter array has no extent the loop can see: a group straddling its end could read
+    /// past a shorter buffer where the scalar loop stops in time, so the search stays scalar.
+    #[test]
+    fn a_search_over_a_buffer_of_unknown_extent_is_declined() {
+        let src = "fn find(x: [f32; 64], t: f32, n: i64) -> i64 { let mut i: i64 = 0; \
+                   while i < n { if x[i] > t { break; } i = i + 1; } return i; } \
+                   fn main() -> i32 { return 0; }";
+        assert!(
+            !is_widened(src, "find"),
+            "a search over a buffer of unknown extent must not be widened"
+        );
+    }
+
+    /// The lane test and the exit: the widened body ends in a branch on the folded mask that
+    /// leaves for the original loop.
+    #[test]
+    fn a_widened_search_folds_its_mask_with_lane_shuffles() {
+        let shape = format!("{TABLE_SEARCH} fn main() -> i32 {{ return 0; }}");
+        let ops = ops_of(&shape, "find");
+        assert!(
+            ops.iter().any(|op| matches!(op, Op::Shuffle { .. })),
+            "the exit test did not fold the lane mask: {ops:?}"
+        );
     }
 }

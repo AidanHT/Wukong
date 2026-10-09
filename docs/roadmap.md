@@ -535,11 +535,25 @@ another architecture or OS is not supported. A native-backend failure is a catal
   arm, a constant addend such as a count included). Integer ones up to 32-bit lanes keep
   lane-parallel partials; float ones (and 64-bit min/max) fold lane by lane in index order with the
   loop's own compare/select, so NaN and `±0` behave exactly as in the scalar loop
-  (`tests/run/vectorized_{minmax,guarded}_reductions.wk` print every prefix answer). Still scalar:
-  argmax / find-index loops (a branch that also records the index), early-exit search loops,
-  `if`/`else if` chains and one-armed stores (no masked memory ops yet), and loop nests whose inner
-  loop carries a recurrence (no unroll-and-jam). A loop needing more than eight runtime alias checks
-  stays scalar.
+  (`tests/run/vectorized_{minmax,guarded}_reductions.wk` print every prefix answer). **Search
+  loops** with an early `break` widen too, when every load before the exit provably stays inside its
+  object (a local `[T; N]` table, or a slice searched to its own length): any lane leaving hands the
+  group back to the scalar loop, which stops at exactly the same iteration
+  (`tests/run/vectorized_search_loops.wk`). **One-armed memory** in an `if` is predicated per lane
+  instead of declining the loop: a store only one arm makes, and a load only one arm makes, touch
+  each lane's own element only where that lane took the arm and a private scratch slot otherwise
+  (`tests/run/vectorized_predicated_arms.wk`). Still scalar: argmax / find-index loops that record
+  the index in a branch, searches over a parameter buffer (no extent in MIR), `if`/`else if` chains,
+  stores to different places in both arms, and an arm that alone subscripts a `[]T` parameter
+  without `@noalias` (its data pointer is re-read inside the arm, an invariant load that is not
+  speculated; a local or `@noalias` slice has it hoisted out of the loop). The per-lane accesses are scalar under Cranelift
+  (no masked vector memory op is emitted yet). A loop needing more than
+  eight runtime alias checks stays scalar. A two-deep nest whose inner loop carries a recurrence or
+  a strict-order reduction (an EMA or IIR per row, a hash, a column sum) is **unrolled and jammed**
+  instead: four rows run side by side as four independent chains, each bit-identical to the scalar
+  loop, when the rows provably touch disjoint memory (`tests/run/unroll_jam_nests.wk`). Its speed-up
+  is not yet measured; deeper nests, triangular inner bounds and a nest whose inner loop the
+  bounds-check versioning split stay as written.
 - **FMA contraction**: a float `x + y*z` becomes one fused multiply-add (`Op::Fma`, a hardware
   `vfmadd`), on both the scalar and vector paths; the interpreter mirrors it with `mul_add`, so the
   two backends stay bit-identical.

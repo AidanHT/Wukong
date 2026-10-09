@@ -1,0 +1,122 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -7
+// EXPECT-OUT: 5
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: 7
+// EXPECT-OUT: 3
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: 5
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: 7
+// EXPECT-OUT: 3
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: 5
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: 7
+// EXPECT-OUT: 3
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: 5
+// EXPECT-OUT: 19
+// EXPECT-OUT: 51
+// EXPECT-OUT: 75
+// EXPECT-OUT: 91
+// EXPECT-OUT: 99
+// EXPECT-OUT: 99
+// EXPECT-OUT: 91
+// EXPECT-OUT: 75
+// EXPECT-OUT: 51
+// EXPECT-OUT: 19
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+module tests.run.vectorized_predicated_arms
+
+// If-conversion with one-armed memory (-O2): a store only one arm makes, and a load only one arm
+// makes, are predicated per lane — each lane touches its own element only where it took the arm and
+// a private scratch slot otherwise — instead of declining the loop. Every value is derived by hand
+// from the scalar loop. The skipped elements of `o` keep their sentinel `-7`, and `w` is shorter
+// than the trip: the scalar loop reads it only where `x[i] > 0`, so a speculated load would run off
+// its end.
+
+@unchecked
+fn one_armed_store(x: []f32, mut o: []f32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        let v: f32 = x[i];
+        if v > 0.0 {
+            o[i] = v * 2.0 + 1.0;
+        }
+        i = i + 1;
+    }
+}
+
+@unchecked
+fn arm_only_load(x: []f32, w: []f32, mut o: []f32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        let xi: f32 = x[i];
+        if xi > 0.0 {
+            o[i] = w[i] * xi;
+        } else {
+            o[i] = 1.0;
+        }
+        i = i + 1;
+    }
+}
+
+fn main() -> i32 {
+    let mut x: []f32 = alloc_f32(23);
+    let mut o: []f32 = alloc_f32(23);
+    let mut i: i64 = 0;
+    while i < 23 {
+        x[i] = (((i * 5) % 7) as f32) - 3.0;
+        o[i] = -7.0;
+        i = i + 1;
+    }
+    one_armed_store(x, o, 23);
+    i = 0;
+    while i < 23 {
+        print(o[i] as i32);
+        i = i + 1;
+    }
+
+    let mut w: []f32 = alloc_f32(10);
+    i = 0;
+    while i < 23 {
+        x[i] = 9.5 - (i as f32);
+        o[i] = 0.0;
+        i = i + 1;
+    }
+    i = 0;
+    while i < 10 {
+        w[i] = (i as f32) + 0.5;
+        i = i + 1;
+    }
+    arm_only_load(x, w, o, 23);
+    i = 0;
+    while i < 23 {
+        print((o[i] * 4.0) as i32);
+        i = i + 1;
+    }
+    free(w);
+    free(o);
+    free(x);
+    return 0;
+}

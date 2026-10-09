@@ -1,0 +1,104 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 18
+// EXPECT-OUT: 18
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 18
+// EXPECT-OUT: 19
+module tests.run.vectorized_search_loops
+
+// Early-exit (search) loops are widened at -O2: the group's test goes lane-wide, and when any lane
+// would leave, the original loop re-runs the group and stops at exactly the iteration it always
+// did. The expected index is derived from the scalar loop by hand: the first element above the
+// threshold (table: element i is i/2, threshold q/2 - 1/4, so the answer is q) and the first
+// negative element (slice: one -1 at position q). Every position of every group, the scalar tail
+// (the table has 18 elements, groups of 4) and the not-found case are asked.
+
+fn find(t: f32) -> i64 {
+    let mut a: [f32; 18] = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5,
+                            7.0, 7.5, 8.0, 8.5];
+    let mut i: i64 = 0;
+    while i < 18 {
+        if a[i] > t {
+            break;
+        }
+        i = i + 1;
+    }
+    return i;
+}
+
+// The loop runs to the slice's own length, so every element it may read exists.
+@unchecked
+fn first_neg(x: []i32) -> i64 {
+    let n = x.len();
+    let mut i: i64 = 0;
+    while i < n {
+        if x[i] < 0 {
+            break;
+        }
+        i = i + 1;
+    }
+    return i;
+}
+
+fn main() -> i32 {
+    let mut q: i64 = 0;
+    while q < 20 {
+        print(find((q as f32) * 0.5 - 0.25));
+        q = q + 1;
+    }
+    let mut s: []i32 = alloc_i32(19);
+    let mut j: i64 = 0;
+    while j < 19 {
+        s[j] = 1;
+        j = j + 1;
+    }
+    q = 0;
+    while q < 20 {
+        if q < 19 {
+            s[q] = -1;
+        }
+        print(first_neg(s));
+        if q < 19 {
+            s[q] = 1;
+        }
+        q = q + 1;
+    }
+    free(s);
+    return 0;
+}
