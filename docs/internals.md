@@ -642,12 +642,17 @@ Errors reclaim the frame's vectors. Nested vector handles are rejected at runtim
 their escape through scalar storage. This bounds SIMD retention by active frames and MIR size;
 it does not reclaim the separate scalar memory arena or establish SIMD throughput.
 
-A 100M-step guard bounds runaway loops *within one frame*, and because that counter is local to a
-single `exec` invocation, a separate call-depth counter bounds recursion: `MAX_CALL_DEPTH` is 300_000
-in release (the measured ceiling) and 40_000 in debug, and exceeding it returns the diagnostic
-"interpreter call-depth limit exceeded (likely unbounded recursion)". Every public entry point runs the
-walk on a scoped 512 MiB-stack worker thread, since a host stack overflow is uncatchable and would
-abort the oracle. SIMD lane/arena allocation and several other growth paths use `try_reserve` to
+Calls are **stackless**: `run_function` keeps an explicit frame stack (function, register file,
+block, instruction index, SIMD-arena watermark, step count), and `exec_frame` runs the top frame
+until it reaches an `Op::Call` of a Wukong function or a `wukong_parallel_for` body (run as one
+sequential call, whose result is `Unit`) or returns. A call pushes a frame and the loop continues; a
+return pops it and resumes the caller at its pending call. No Wukong call consumes host stack, so
+every public entry point runs on its caller's thread (the former per-run 512 MiB worker thread, its
+spawn+join, and the `AccelPtr` hand-off are gone), and an error unwinds every frame the run entered.
+A 100M-step guard bounds runaway loops *within one frame*; a call-depth counter bounds recursion:
+`MAX_CALL_DEPTH` is 300_000 in every build profile (overridable per run with
+`WUKONG_INTERP_MAX_DEPTH`), and exceeding it returns the diagnostic "interpreter call-depth limit
+exceeded (likely unbounded recursion)". SIMD lane/arena allocation and several other growth paths use `try_reserve` to
 report allocation errors. Some remaining paths still allocate infallibly; a diagnostic for every
 possible resource-exhaustion case is not established.
 

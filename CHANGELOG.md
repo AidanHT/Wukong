@@ -5,6 +5,15 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Execution at model scale (`gap2/execution-at-model-scale`)
+
+- **The interpreter is stackless.** A Wukong call (and a `wukong_parallel_for` body) pushes a frame
+  on an explicit heap stack instead of recursing on the host stack, so every run executes on its
+  caller's thread with no per-run 512 MiB worker thread, and the call-depth ceiling is one documented
+  number, 300,000 in every build profile (`WUKONG_INTERP_MAX_DEPTH` overrides it), replacing the
+  40,000-debug / 300,000-release constants bisected against the old worker stack. A debug `wukongc`
+  used to refuse `sum(123456)` that a release build ran.
+
 ### AOT executables and platform (`gap2/aot-and-platform`)
 
 - **The executable's exit code and stack match `--run`.** An object's C `main` is now synthesized:

@@ -3,9 +3,9 @@
 //! For each `.wk` program it can lower, it reports, comparing `-O0` against `-O3`:
 //!   * total MIR op count (instructions plus one terminator per block) and the reduction;
 //!   * interpreter wall-clock time per run (adaptively batched) and the resulting speedup. Each such
-//!     run includes one 512 MiB worker-thread spawn+join, because that is what `wukong_interp::run`
-//!     costs a caller; the report measures that floor and prints both the raw and the floor-net
-//!     speedup so the two are never confused.
+//!     run includes `wukong_interp::run`'s fixed per-call setup cost (it ran on a 512 MiB worker
+//!     thread until calls became stackless); the report measures that floor and prints both the raw
+//!     and the floor-net speedup so the two are never confused.
 //!
 //! Every program is also a correctness check: the `-O0` and `-O3` builds must both verify, must
 //! agree on **exit code and stdout**, and the Cranelift backend at `-O3` must agree with the
@@ -133,16 +133,15 @@ fn main() {
     let floor = interp_call_floor();
     match floor {
         Some(fl) => println!(
-            "interp-call floor {}: `wukong_interp::run` wraps EVERY call in a 512 MiB-stack worker\n\
-             thread (`with_big_stack`), so one thread spawn+join is inside every `interp O3` cell\n\
-             below and inside every `nat:intp` ratio. Measured here by timing the smallest possible\n\
-             Wukong program with this same instrument. A cell at or near the floor is reporting\n\
-             Windows thread creation, not interpretation.\n",
+            "interp-call floor {}: the fixed setup cost of one `wukong_interp::run` call, inside\n\
+             every `interp O3` cell below and inside every `nat:intp` ratio. Measured here by timing\n\
+             the smallest possible Wukong program with this same instrument. A cell at or near the\n\
+             floor is reporting run setup, not interpretation.\n",
             fmt_dur(fl)
         ),
         None => println!(
             "interp-call floor: NOT MEASURED — the probe program failed to lower. Every `interp O3`\n\
-             cell below still contains one 512 MiB worker-thread spawn+join, of unknown size here.\n"
+             cell below still contains the per-call setup cost, of unknown size here.\n"
         ),
     }
 
@@ -401,17 +400,17 @@ fn time_native(
 
 /// The fixed cost `wukong_interp::run` pays per call, before it interprets anything.
 ///
-/// `run` → `run_with_output` → `with_big_stack` (wukong_interp/src/lib.rs) spawns a 512 MiB-stack
-/// worker thread and joins it on **every** call, so the recursive tree-walker cannot overflow the
-/// host stack. [`time_run`] calls `run` inside its rep loop, so that spawn+join is charged to every
-/// rep — and for any program that interprets faster than one thread creation, the `interp O3` column
-/// and the `nat:intp` geomean are measuring Windows, not the interpreter.
+/// `run` used to spawn and join a 512 MiB-stack worker thread on **every** call (the tree-walker
+/// recursed on the host stack); calls are now stackless and run on the caller's thread, but a run
+/// still has setup (memory, register pool, output buffer). [`time_run`] calls `run` inside its rep
+/// loop, so that cost is charged to every rep — and for a program that interprets faster than it,
+/// the `interp O3` column and the `nat:intp` geomean are measuring setup, not the interpreter.
 ///
 /// This measures the floor instead of assuming it: lower the smallest Wukong program there is and
 /// time it with the *same* [`time_run`] instrument. Its interpretation is a handful of MIR ops, so
 /// what comes back is the per-call floor. It deliberately goes through the real `wukong_interp::run`
-/// rather than replicating `with_big_stack` here, so the number stays true if the interpreter ever
-/// changes how it obtains its stack. `None` if the probe program does not lower (never expected).
+/// rather than replicating its setup here, so the number stays true whenever that setup changes.
+/// `None` if the probe program does not lower (never expected).
 fn interp_call_floor() -> Option<Duration> {
     const SRC: &str = "module bench.floor\nfn main() -> i32 { return 0; }\n";
     let mut interner = Interner::new();
@@ -436,8 +435,8 @@ fn interp_call_floor() -> Option<Duration> {
 /// Time one full execution, adaptively batching until at least 50 ms has elapsed so even fast
 /// programs are measured stably. Returns the per-run duration.
 ///
-/// NOTE: every rep pays one 512 MiB worker-thread spawn+join inside `wukong_interp::run` — see
-/// [`interp_call_floor`], which measures it and which the report prints alongside this column.
+/// NOTE: every rep pays `wukong_interp::run`'s fixed per-call setup — see [`interp_call_floor`],
+/// which measures it and which the report prints alongside this column.
 fn time_run(p: &wukong_mir::Program, entry: wukong_span::Symbol, interner: &Interner) -> Duration {
     for _ in 0..2 {
         let _ = wukong_interp::run(p, entry, interner); // warm up
