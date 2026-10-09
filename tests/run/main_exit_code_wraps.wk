@@ -1,0 +1,15 @@
+// RUN: --run
+// EXPECT-EXIT: 44
+// EXPECT-OUT: 300
+module tests.run.main_exit_code_wraps
+
+// A process exit code is the low 8 bits of `main`'s value, on every backend and every OS. `--run`
+// reports `300 as u8` = 300 - 256 = 44. A linked executable used to export the user's `main` as the
+// C entry point unchanged, so Windows reported the full 300 while Linux and macOS truncated it to
+// 44. The synthesized C `main` now masks to 8 bits itself (`crates/wukongc/tests/exe.rs` runs this
+// program as an executable and compares it with `--run`).
+fn main() -> i32 {
+    let code: i32 = 300;
+    print(code);
+    return code;
+}

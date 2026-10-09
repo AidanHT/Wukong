@@ -1522,7 +1522,15 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   concurrent links on one stem raced on them; the working directory is used only if the temp directory
   cannot be created. The intermediate `{stem}.o` is still written beside the invocation. The rustc link
   passes `-C panic=abort` because the workspace release profile sets `panic = "abort"`, and a strategy
-  mismatch is a hard metadata error that rejects the link outright. `--emit=obj`
+  mismatch is a hard metadata error that rejects the link outright. **The executable's entry
+  matches `--run`**: the object's C `main` is synthesized, calls the program's `main` (now the
+  internal `_WK4main`) on a 512 MiB worker thread through `wukong_rt_run_main` (in both the Rust
+  shim and the C runtime), converts its result as the JIT does and keeps the low 8 bits, so a
+  `-> f32`, a void `main` and `return 300` exit as under `--run`, and 30000-deep recursion no longer
+  depends on the OS main-thread stack. In an `--emit=exe` object every user function is an internal,
+  mangled `_WK<len><name>` symbol, so a `.wk` `write`/`fmod`/`memcpy` cannot collide with or
+  interpose on the C library; an `--emit=obj` object keeps its other functions exported under their
+  source names (its C interface). `--emit=obj`
   writes the object unchanged. The differential oracle remains `--run`.
 - **A `mut` aggregate parameter aliases the caller's value — now opt-in.** Aggregate arguments
   (`struct`/array/tuple/tensor) are passed by pointer, the zero-copy tensor-kernel convention, so a

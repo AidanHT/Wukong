@@ -1,0 +1,21 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 450015000
+module tests.run.deep_recursion_exe
+
+// 30000 nested calls: depth_sum(30000) = 30000 * 30001 / 2 = 450015000. Both `--run` backends run the
+// program on a 512 MiB worker stack. A linked executable used to run it on the OS main-thread
+// stack (1 MiB by default on Windows), so the same program could overflow as an executable and
+// complete under `--run`. Its `main` now runs on a 512 MiB worker too
+// (`crates/wukongc/tests/exe.rs` compares the executable with `--run`).
+fn depth_sum(n: i32) -> i32 {
+    if n == 0 {
+        return 0;
+    }
+    return n + depth_sum(n - 1);
+}
+
+fn main() -> i32 {
+    print(depth_sum(30000));
+    return 0;
+}

@@ -148,6 +148,17 @@ fn exe_matches_run() {
         // `--run` must match on both counts (stdout before the failure, exit 1).
         "assert_fail_trailing_output.wk", // a failed `assert` in a callee, output on both sides
         "slice_bounds_oob.wk",            // `wukong_rt_bounds_fail` linked into the exe
+        // The entry contract: the synthesized C `main` masks the code to 8 bits (300 exits 44),
+        // converts a float result and returns 0 for a void `main`, exactly as `--run` does.
+        "main_exit_code_wraps.wk",
+        "main_returns_f32.wk",
+        "main_returns_void.wk",
+        // 30000 nested calls: the exe's `main` runs on the 512 MiB worker `--run` uses, not the
+        // OS main-thread stack (1 MiB on Windows).
+        "deep_recursion_exe.wk",
+        // User functions named `write`/`fmod`/`memcpy` are internal, mangled symbols in an
+        // executable, so they neither collide with nor interpose on the C library.
+        "libc_name_collision.wk",
     ];
 
     let path = probe_link_path();

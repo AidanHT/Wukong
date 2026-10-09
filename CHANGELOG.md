@@ -5,6 +5,19 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### AOT executables and platform (`gap2/aot-and-platform`)
+
+- **The executable's exit code and stack match `--run`.** An object's C `main` is now synthesized:
+  it runs the program's `main` on a 512 MiB worker thread (`wukong_rt_run_main`, in the Rust link
+  shim and the C fallback runtime) and returns the low 8 bits of its value, a float converted
+  toward zero and a void `main` as 0. A `-> f32` or void `main` used to exit with whatever was in
+  the return register, `return 300` exited 300 on Windows and 44 elsewhere, and deep recursion
+  overflowed the 1 MiB Windows main-thread stack in an exe while completing under `--run`.
+- **No more libc symbol collisions in executables.** `--emit=exe` objects make every user function
+  internal and mangled (`_WK<len><name>`), so a function named `write`, `fmod` or `memcpy` can no
+  longer collide with or interpose on the C library at link time. `--emit=obj` keeps non-entry
+  functions exported under their source names.
+
 ### Type soundness and patterns (`gap2/type-soundness-and-patterns`)
 
 - **Match exhaustiveness by pattern usefulness** (Maranget's algorithm, as in rustc): `E0405` now

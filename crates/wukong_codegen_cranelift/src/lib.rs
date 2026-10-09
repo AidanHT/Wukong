@@ -51,6 +51,11 @@ mod ml_rt;
 // The runtime entries of the text builtins (the per-type scalar printers), the same way.
 mod text_rt;
 
+// The AOT entry contract (a synthesized C `main` on a big-stack worker) and the object's symbol
+// policy (internal, mangled user functions in an executable).
+mod entry;
+pub use entry::ObjectKind;
+
 // --- The minimal runtime the generated code calls back into ---------------------------------
 //
 // `print`/`println`/`assert` lower to calls to these symbols. For the JIT they are real Rust
@@ -3220,6 +3225,7 @@ fn populate_module<M: Module>(
     program: &Program,
     interner: &Interner,
     parallel: bool,
+    mode: entry::SymbolMode,
 ) -> Result<HashMap<Symbol, FuncId>, String> {
     // Compact boolean-vector casts are legalized per function inside `build_function_clif`.
     let asserting = asserting_functions(program, interner);
@@ -4213,13 +4219,18 @@ fn populate_module<M: Module>(
     ml_rt::declare(module, ptr_ty, call_conv, &mut rt_ids)?;
     text_rt::declare(module, ptr_ty, call_conv, &mut rt_ids)?;
 
-    // Declare all user functions first so calls resolve regardless of definition order.
+    // Declare all user functions first so calls resolve regardless of definition order. An object
+    // names and links them per `mode` (see `entry`): internal and mangled in an executable, so a
+    // `.wk` function called `write` or `fmod` can neither collide with nor interpose on libc.
+    let entry_fn = entry::entry_function(program, interner, mode, ptr_ty, call_conv)?;
+    let entry_name = entry_fn.map(|f| f.name);
     let mut ids: HashMap<Symbol, FuncId> = HashMap::new();
     for f in &program.funcs {
         let sig = signature_of(f, ptr_ty, call_conv);
-        let name = interner.resolve(f.name);
+        let (name, linkage) =
+            entry::user_symbol(interner.resolve(f.name), mode, Some(f.name) == entry_name);
         let id = module
-            .declare_function(name, Linkage::Export, &sig)
+            .declare_function(&name, linkage, &sig)
             .map_err(|e| e.to_string())?;
         ids.insert(f.name, id);
     }
@@ -4317,6 +4328,9 @@ fn populate_module<M: Module>(
             &kernel_ids,
             &asserting,
         )?;
+    }
+    if let Some(main) = entry_name {
+        entry::define_entry(module, ids[&main], ptr_ty, call_conv)?;
     }
     for e in &program.externs {
         ids.remove(&e.name);
@@ -5421,7 +5435,13 @@ fn jit_compile_entry(
     bind_extern_symbols(&mut builder, program, interner)?;
     let mut module = JITModule::new(builder);
 
-    let ids = populate_module(&mut module, program, interner, parallel)?;
+    let ids = populate_module(
+        &mut module,
+        program,
+        interner,
+        parallel,
+        entry::SymbolMode::Jit,
+    )?;
     module.finalize_definitions().map_err(|e| e.to_string())?;
 
     let entry_fn = program
@@ -6056,7 +6076,13 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(RT_FMOD_F32, rt_fmod_f32 as *const u8);
     bind_extern_symbols(&mut builder, program, interner)?;
     let mut module = JITModule::new(builder);
-    let ids = populate_module(&mut module, program, interner, default_parallel())?;
+    let ids = populate_module(
+        &mut module,
+        program,
+        interner,
+        default_parallel(),
+        entry::SymbolMode::Jit,
+    )?;
     module.finalize_definitions().map_err(|e| e.to_string())?;
     Ok(JitModuleHandle {
         module: Some(module),
@@ -6139,12 +6165,27 @@ pub fn emit_object_for_with(
     target: TargetCpu,
     backend: BackendOpt,
 ) -> Result<Vec<u8>, String> {
+    emit_object_kind_for_with(program, interner, target, backend, ObjectKind::Library)
+}
+
+/// As [`emit_object_for_with`], for an object of `kind`. `--emit=exe` passes
+/// [`ObjectKind::Executable`]: every user function becomes an internal, mangled symbol, and the
+/// program's `main` runs behind a synthesized C `main` (see the `entry` module). Every object with
+/// a zero-parameter scalar `main` gets that C `main`, so it imports `wukong_rt_run_main`.
+pub fn emit_object_kind_for_with(
+    program: &Program,
+    interner: &Interner,
+    target: TargetCpu,
+    backend: BackendOpt,
+    kind: ObjectKind,
+) -> Result<Vec<u8>, String> {
     emit_object_full(
         program,
         interner,
         EmitOptions::production(),
         target,
         backend,
+        kind,
     )
     .map(|(bytes, _)| bytes)
 }
@@ -6176,12 +6217,24 @@ pub fn emit_object_timed_for_with(
     target: TargetCpu,
     backend: BackendOpt,
 ) -> Result<(Vec<u8>, ObjTimings), String> {
+    emit_object_kind_timed_for_with(program, interner, target, backend, ObjectKind::Library)
+}
+
+/// As [`emit_object_timed_for_with`], for an object of `kind` (see [`emit_object_kind_for_with`]).
+pub fn emit_object_kind_timed_for_with(
+    program: &Program,
+    interner: &Interner,
+    target: TargetCpu,
+    backend: BackendOpt,
+    kind: ObjectKind,
+) -> Result<(Vec<u8>, ObjTimings), String> {
     emit_object_full(
         program,
         interner,
         EmitOptions::production(),
         target,
         backend,
+        kind,
     )
 }
 
@@ -6196,6 +6249,7 @@ fn emit_object_ex(
         opts,
         TargetCpu::Native,
         BackendOpt::default(),
+        ObjectKind::Library,
     )
 }
 
@@ -6205,6 +6259,7 @@ fn emit_object_full(
     opts: EmitOptions,
     target: TargetCpu,
     backend: BackendOpt,
+    kind: ObjectKind,
 ) -> Result<(Vec<u8>, ObjTimings), String> {
     use cranelift_object::{ObjectBuilder, ObjectModule};
     use std::time::Instant;
@@ -6215,7 +6270,13 @@ fn emit_object_full(
     let builder = ObjectBuilder::new(isa, "wukong", cranelift_module::default_libcall_names())
         .map_err(|e| e.to_string())?;
     let mut module = ObjectModule::new(builder);
-    populate_module(&mut module, program, interner, opts.parallel)?;
+    populate_module(
+        &mut module,
+        program,
+        interner,
+        opts.parallel,
+        entry::SymbolMode::Object(kind),
+    )?;
     let codegen = t_cg.elapsed();
 
     let t_ow = Instant::now();

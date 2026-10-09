@@ -1,0 +1,11 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 5
+module tests.run.main_returns_void
+
+// A `main` with no return type exits 0. A linked executable used to return whatever `eax` held when
+// the user's `main` returned; its synthesized C `main` now returns 0 for a void entry
+// (`crates/wukongc/tests/exe.rs` compares the executable with `--run`).
+fn main() {
+    print(5);
+}

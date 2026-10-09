@@ -37,7 +37,11 @@ wukongc --run hello.wk       # prints 42 then 42; exits with main's return value
 
 A file conventionally begins with a `module` declaration; the header is **optional** and purely
 informational (see *Modules & imports*), so a single-file program may omit it. Execution starts at
-`fn main() -> i32`, and the integer it returns becomes the process exit code.
+`fn main() -> i32`, and the integer it returns becomes the process exit code. `main` takes no
+parameters and returns an integer, a float or nothing; the exit code is the **low 8 bits** of the
+value (a float converts toward zero first, saturating; no return type exits 0), so `return 300`
+exits 44 under `--run` and from a linked executable on every OS. The program runs on a 512 MiB
+stack in both `--run` backends and in an `--emit=exe` executable.
 
 ## Source text ✅
 
