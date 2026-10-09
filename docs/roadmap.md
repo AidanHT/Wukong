@@ -376,6 +376,12 @@ another architecture or OS is not supported. A native-backend failure is a catal
   recognizer that reads sema's generic-body types declines on an instance rather than firing (the
   instance lowers as ordinary loops). Generic structs (`Buf<T>`) are not
   monomorphized.
+- **Dimension constraints.** `where K % 16 == 0, M <= 4096` predicates and `static_assert(cond[,
+  "msg"])` are checked at every call whose dimensions are compile-time constants (`E0521`/`E0522`),
+  and `const` generic parameters must be `usize` (`E0523`) — `tests/run/where_constraints.wk`. Not
+  yet: a constraint is not propagated into a generic caller (a call with still-symbolic dimensions
+  is unchecked), and literal dimensions do not yet specialize an instance (`f$K512`), so trip
+  counts stay run-time values.
 - **Shape arithmetic, views, reshape and extents** run on both backends. A dimension may be computed
   from others (`Tensor[f32, S, 3*D]`, `H*HD`, `(L - K)/S + 1`) and is held in a canonical polynomial
   normal form, so `2*N` and `N + N` are one type, and a call solves a dimension that appears only

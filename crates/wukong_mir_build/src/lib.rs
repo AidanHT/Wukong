@@ -389,9 +389,9 @@ fn bind_generics(param_ty: &Ty, arg_ty: &Ty, tg: &[Symbol], subst: &mut HashMap<
             },
             Ty::Array { elem, .. },
         ) if tg.contains(g) => {
-            let mut leaf: &Ty = &**elem;
+            let mut leaf: &Ty = elem.as_ref();
             while let Ty::Array { elem, .. } = leaf {
-                leaf = &**elem;
+                leaf = elem.as_ref();
             }
             if let Ty::Scalar(s) = leaf {
                 subst.entry(*g).or_insert(Ty::Scalar(*s));
@@ -22417,6 +22417,10 @@ impl FnLowerer<'_> {
                 // shape-checked lowers straight to its runtime kernel (see `builtins.rs`).
                 if let Some(v) = self.lower_kernel_builtin(e, args) {
                     return v;
+                }
+                // `static_assert(..)` was decided by sema and lowers to nothing.
+                if self.interner.resolve(name) == "static_assert" {
+                    return self.const_zero(MirType::I32);
                 }
                 // The heap builtins `alloc_<T>(n)` / `free(s)` lower to the wukong_rt_alloc/free
                 // runtime calls plus slice fat-pointer construction.

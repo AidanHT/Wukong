@@ -643,6 +643,10 @@ impl Rewriter<'_> {
         if let Some(r) = &mut f.ret {
             self.ty(r);
         }
+        // A `where` predicate names the function's dimensions and module `const`s.
+        for w in &mut f.where_preds {
+            self.expr(w);
+        }
         if let Some(body) = &mut f.body {
             self.locals
                 .push(f.params.iter().map(|p| p.name.sym).collect());

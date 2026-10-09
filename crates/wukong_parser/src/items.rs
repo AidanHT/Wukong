@@ -317,9 +317,19 @@ impl Parser<'_> {
         };
         // `where T: Shape + Named, U: Other` — folded into the named generic parameter's bounds,
         // exactly as if it had been written `<T: Shape + Named>`. A clause naming no type
-        // parameter of this function is reported rather than dropped.
+        // parameter of this function is reported rather than dropped. Any other entry is a
+        // dimension predicate (`K % 16 == 0`, `M <= 4096`), kept for sema to check at each call; it
+        // is parsed with struct literals off, so the body's `{` ends it.
+        let mut where_preds = Vec::new();
         if self.eat(T::Where) {
-            while self.at(T::Ident) {
+            while !self.at(T::LBrace) && !self.at(T::Eq) && !self.at(T::Semi) && !self.at(T::Eof) {
+                if !(self.at(T::Ident) && self.nth(1) == T::Colon) {
+                    where_preds.push(self.parse_cond());
+                    if !self.eat(T::Comma) {
+                        break;
+                    }
+                    continue;
+                }
                 let gname = self.ident();
                 self.expect(T::Colon);
                 let bounds = self.parse_bounds();
@@ -367,6 +377,7 @@ impl Parser<'_> {
             generics,
             params,
             ret,
+            where_preds,
             body,
         }
     }

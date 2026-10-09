@@ -14,6 +14,11 @@ All notable changes to Wukong are documented here. The format is loosely based o
 - **Tensors may be generic over their element type.** `fn axpy<T, N>(a: T, x: Tensor[T, N], mut y:
   Tensor[T, N])` (was `E0302`) is compiled once per element type, and `alloc::<T>(n)` is the generic
   heap allocator (`E0325` for a non-scalar element).
+- **`where` dimension predicates and `static_assert` are enforced.** `where K % 16 == 0` was parsed
+  and silently dropped; predicates over a function's dimensions and `const`s are now checked at
+  each call (`E0521`), `static_assert(cond[, "msg"])` is checked at compile time (`E0522`), a
+  predicate that is not a compile-time dimension expression is `E0524`, and a `const` generic
+  parameter of a type other than `usize` (which was silently a `usize`) is `E0523`.
 
 ### Execution at model scale (`gap2/execution-at-model-scale`)
 

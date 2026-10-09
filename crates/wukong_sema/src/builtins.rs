@@ -591,6 +591,7 @@ const FIXED_BUILTINS: &[&str] = &[
     "assert",
     "free",
     "alloc",
+    "static_assert",
     "now_ns",
     "sync_block",
     "scratch_mark",
@@ -625,6 +626,7 @@ pub fn is_builtin_callee(name: &str) -> bool {
         || crate::scratch_alloc_elem(name).is_some()
         || name == "free"
         || name == "alloc"
+        || name == "static_assert"
         || crate::is_scratch_mark(name)
         || crate::is_scratch_release(name)
         || crate::ml_builtin(name).is_some()

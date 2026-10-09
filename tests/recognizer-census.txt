@@ -496,6 +496,7 @@ vmath_exp_every_lane.wk: wukong_vmath_f32
 vmath_f16.wk: wukong_vmath_f16 wukong_vmath_f16*3
 vmath_half_out.wk: wukong_vmath_bf16 wukong_vmath_bf16_out wukong_vmath_f16 wukong_vmath_f16_out
 vmath_parallel.wk: wukong_rt_alloc wukong_rt_alloc*2 wukong_rt_free wukong_rt_free*2 wukong_velem_f32_parallel wukong_vmath_f32_parallel
+where_constraints.wk:
 while_bound_mutated.wk: wukong_velem_f32
 while_bound_side_effect.wk:
 xent.wk: wukong_xent_fwd_f32

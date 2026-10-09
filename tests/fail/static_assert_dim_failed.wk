@@ -1,0 +1,14 @@
+// EXPECT-CODE: E0522
+module tests.fail.static_assert_dim_failed
+
+// A `static_assert` over a generic dimension is decided at each call: this one fixes N = 1.
+fn head2<N>(a: Tensor[f32, N]) -> f32 {
+    static_assert(N >= 2, "head2 reads two elements");
+    return a[0] + a[1];
+}
+
+fn main() -> i32 {
+    let a: [f32; 1] = [3.0];
+    print(head2(a));
+    return 0;
+}

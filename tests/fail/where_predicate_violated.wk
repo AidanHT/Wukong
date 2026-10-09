@@ -1,0 +1,18 @@
+// EXPECT-CODE: E0521
+module tests.fail.where_predicate_violated
+
+// `where` used to be parsed and dropped. The predicate is now checked at the call, which fixes
+// K = 24: 24 % 16 is 8, so the constraint is not satisfied.
+fn tile_sum<K>(a: Tensor[f32, K]) -> f32 where K % 16 == 0 {
+    let mut s: f32 = 0.0;
+    for i in 0..K {
+        s = s + a[i];
+    }
+    return s;
+}
+
+fn main() -> i32 {
+    let a: [f32; 24] = [1.0; 24];
+    print(tile_sum(a));
+    return 0;
+}

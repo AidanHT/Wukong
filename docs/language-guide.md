@@ -194,6 +194,31 @@ neither accepts a `Tensor[T, ..]` operand inside a generic body. `alloc::<T>(n)`
 allocator — a zeroed `[]T`, the same buffer `alloc_<T>(n)` returns, with `T` a scalar or a type
 parameter (anything else is `E0325`).
 
+### Dimension constraints: `where` and `static_assert` ✅
+
+A `where` clause may constrain a function's dimensions, alongside its trait bounds:
+
+```wukong
+const TILE: usize = 4;
+
+fn tile_sum<K>(a: Tensor[f32, K]) -> f32 where K % TILE == 0, K <= 4096 {
+    static_assert(K >= TILE, "need at least one tile");
+    ...
+}
+```
+
+A predicate compares expressions over integer literals, the function's generic dimensions and
+`const`s (`+ - * / %` in 128-bit integers, truncating), joined with `&&` / `||`; anything else —
+a local, a call such as `a.len()`, a cast — is `E0524`. Each predicate is evaluated at every call
+whose dimensions it names are compile-time constants, and a false one is `E0521` at the call:
+"constraint `K % 16 == 0` of `tile_sum` is not satisfied (K = 24)". `static_assert(cond)` /
+`static_assert(cond, "message")` is a statement that generates no code: over `const`s it is decided
+where it is written, and over the function's dimensions it is checked at each call like a `where`
+predicate (and must then be a top-level statement of the body); a false one is `E0522`. A call
+from a generic body whose dimensions are still symbolic is not checked there — the constraint is
+checked where the dimensions become known. A `const` generic parameter is a dimension and must be
+declared `usize` (`E0523`). `tests/run/where_constraints.wk`, `tests/fail/where_predicate_violated.wk`.
+
 ## Name resolution ✅
 
 Every name a program uses resolves, or the program is rejected with a resolution code — a typo is

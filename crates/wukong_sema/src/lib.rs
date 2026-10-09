@@ -29,6 +29,7 @@ pub mod lints;
 mod attrs;
 pub use attrs::{parallel_grain, MAX_PARALLEL_GRAIN};
 mod builtins;
+mod constraints;
 mod dependency;
 mod dtype;
 mod entry;
@@ -442,6 +443,8 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         provenance: provenance::ProvenanceState::default(),
         inst_subst: HashMap::default(),
         inst_calls: Vec::new(),
+        fn_preds: HashMap::default(),
+        assert_conds: HashSet::default(),
     };
     // Attribute legality (`attrs`): an attribute names no value and has no type, so this walk needs
     // nothing the collection pass builds and runs first — an unknown `@bogus` is reported even in a
@@ -464,6 +467,8 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         }
     }
     s.recheck_item_signatures(module);
+    // `where` predicates, dimension `static_assert`s and `const` parameter types (`constraints`).
+    s.collect_constraints(module);
     s.check_bodies(module);
     // Every concrete instantiation of a type-generic function, re-checked at its types
     // (`instantiate`). It restores the tables above, so it only adds diagnostics.
@@ -569,6 +574,10 @@ struct Sema<'a> {
     inst_subst: HashMap<Symbol, Ty>,
     /// The concrete instantiations calls have required so far (`instantiate.rs`).
     inst_calls: Vec<instantiate::InstCall>,
+    /// Each function's dimension constraints, checked at its calls (`constraints.rs`).
+    fn_preds: HashMap<Symbol, Vec<constraints::Pred<'a>>>,
+    /// The conditions of the top-level `static_assert`s that name a generic dimension.
+    assert_conds: HashSet<NodeId>,
 }
 
 /// One entry of [`Sema::loop_ctx`] — a loop currently being type-checked.

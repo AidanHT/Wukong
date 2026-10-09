@@ -62,6 +62,10 @@ pub struct FnDecl {
     pub generics: Vec<GenericParam>,
     pub params: Vec<Param>,
     pub ret: Option<TypeExpr>,
+    /// The dimension predicates of a `where` clause, in source order: `where K % 16 == 0, M <= 4096`.
+    /// Each is checked at every call that fixes the dimensions it names. (A trait bound in the same
+    /// clause, `where T: Shape`, is folded into that generic parameter's `bounds` instead.)
+    pub where_preds: Vec<Expr>,
     /// `None` for a declaration with no body: an `extern` fn, or any `fn` header the parser found
     /// followed by neither a `{…}` block nor `= expr;`. `Some` for both body forms — an `= expr;`
     /// body is a synthesized `Block` whose `tail` is that expression.

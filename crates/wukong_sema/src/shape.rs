@@ -339,6 +339,11 @@ impl Sema<'_> {
                     }
                     return Ty::Slice(Box::new(Ty::Scalar(elem)));
                 }
+                // `static_assert(cond[, "message"])`, decided at compile time (`constraints.rs`).
+                if let Some(ret) = self.type_static_assert(interner.resolve(name), args, span) {
+                    self.types.insert(callee.id, Ty::Unknown);
+                    return ret;
+                }
                 // `alloc::<T>(n)`, the generic heap allocator (`dtype.rs`).
                 if let Some(ret) = self.type_generic_alloc(
                     interner.resolve(name),
@@ -699,9 +704,11 @@ impl Sema<'_> {
             self.call_dims.insert(call_id, bound);
         }
         // A concrete instantiation of a type-generic callee is re-checked at its types
-        // (`instantiate.rs`).
+        // (`instantiate.rs`), and the callee's `where` predicates and dimension `static_assert`s
+        // are checked against this call's dimensions (`constraints.rs`).
         if let Some(callee) = site.callee() {
             self.note_instantiation(callee, sig, &tys, span);
+            self.check_call_constraints(callee, &sig.generics, &dims, span);
         }
 
         apply_subst(&sig.ret, &dims, &tys)
