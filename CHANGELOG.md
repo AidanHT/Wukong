@@ -5,6 +5,15 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Vectorizer: min/max and conditional reductions (`gap2/vec-control-and-nests`)
+
+- **Min/max reductions vectorize.** `m = max(m, x[i])`, `min`, `fmax`, `fmin` (a `select` over a
+  compare in MIR) used to be classified as recurrences, which declined the whole loop. Integer
+  min/max up to 32-bit lanes now keeps lane-parallel partials seeded with the identity; a float
+  min/max (and a 64-bit integer one) widens the body and folds the running extremum lane by lane in
+  index order, re-emitting the loop's own compare and select, so NaN and `±0` ties resolve exactly
+  as in the scalar loop.
+
 ### Type soundness and patterns (`gap2/type-soundness-and-patterns`)
 
 - **Match exhaustiveness by pattern usefulness** (Maranget's algorithm, as in rustc): `E0405` now

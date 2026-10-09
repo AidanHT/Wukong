@@ -706,6 +706,36 @@ pub struct Reduction {
     pub fma_factors: Option<(ValueId, ValueId)>,
     /// Copy of [`RedKind::reassociable`], so a consumer cannot forget to ask.
     pub reassociable: bool,
+    /// For a min/max reduction — the combine is a `select` over a compare — exactly how the scalar
+    /// loop spelled it. `None` for a binary or `fma` combine.
+    pub select: Option<SelectCombine>,
+}
+
+/// A min/max accumulate as the front end spells it: `c = cmp(pred, x, y); acc' = select(c, t, e)`,
+/// where `{x, y}` and `{t, e}` are both `{acc, addend}`. (`max(a, b)` is `select(a > b, a, b)`.)
+///
+/// A consumer that folds such a reduction serially must re-emit **this** compare and **this**
+/// select with the accumulator in the same positions: on a float tie or a NaN the result is
+/// whichever operand the `select` names second, so `max(acc, x)` and `max(x, acc)` are different
+/// reductions as far as which `±0` or NaN payload survives.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SelectCombine {
+    /// The compare's result. Its only reader in the loop is the combining `select`.
+    pub cmp: ValueId,
+    pub pred: CmpOp,
+    /// Is the accumulator the compare's left operand?
+    pub acc_left_in_cmp: bool,
+    /// Is the accumulator the `select`'s first (true) arm?
+    pub acc_is_then: bool,
+}
+
+/// What [`combine_kind`] found a combining instruction to be.
+struct Combine {
+    kind: RedKind,
+    /// The non-accumulator operand; `None` for an `fma` accumulate.
+    addend: Option<ValueId>,
+    fma_factors: Option<(ValueId, ValueId)>,
+    select: Option<SelectCombine>,
 }
 
 /// What a header block parameter carries across iterations.
@@ -1646,15 +1676,19 @@ fn collect_accesses(
 /// a `Recurrence`. This matters because a negated accumulate is how a loss is spelled:
 /// `lr = lr - alpha*q*(1-p)^2*log p` in a focal loss, `e = e - t[i]*log(y[i])` in a cross-entropy.
 /// Refusing it made the entire enclosing loop unvectorizable, transcendental and all.
-// The tuple return is three independent optional facts about one combining instruction; a named
-// struct for a single internal caller would add ceremony, not clarity.
-#[allow(clippy::type_complexity)]
-fn combine_kind(
-    ctx: &LoopCtx<'_>,
-    p: ValueId,
-    next: ValueId,
-) -> Option<(RedKind, Option<ValueId>, Option<(ValueId, ValueId)>)> {
+///
+/// **Min/max is included, spelled as a `select` over a compare** — the only way the front end spells
+/// it: `max(a, b)`, `fmax(a, b)` and `min`/`fmin` all lower to `select(cmp(pred, a, b), a, b)`
+/// (`mir_build::minmax`). See [`select_combine`].
+fn combine_kind(ctx: &LoopCtx<'_>, p: ValueId, next: ValueId) -> Option<Combine> {
+    let plain = |kind: RedKind, addend: ValueId| Combine {
+        kind,
+        addend: Some(addend),
+        fma_factors: None,
+        select: None,
+    };
     match ctx.op_of(next)? {
+        Op::Select(c, t, e) => select_combine(ctx, p, *c, *t, *e),
         Op::Bin(b, a, c) => {
             // `acc - x` only; `x - acc` is not an accumulate.
             if matches!(b, BinOp::Sub | BinOp::FSub) {
@@ -1666,7 +1700,7 @@ fn combine_kind(
                 } else {
                     RedKind::FSub
                 };
-                return Some((kind, Some(*c), None));
+                return Some(plain(kind, *c));
             }
             let other = if *a == p && *c != p {
                 *c
@@ -1685,17 +1719,107 @@ fn combine_kind(
                 BinOp::FMul => RedKind::FMul,
                 _ => return None,
             };
-            Some((kind, Some(other), None))
+            Some(plain(kind, other))
         }
         // `acc = fma(x, y, acc)` — the front end contracts `acc + x*y` into this, so it is the
         // shape a dot-product / weighted-sum reduction actually has after lowering. The addend is
         // the never-materialized product `x*y`; a consumer that widens the body has to produce
         // both factors and re-fuse them per lane, or it changes the rounding.
-        Op::Fma(x, y, c) if *c == p && *x != p && *y != p => {
-            Some((RedKind::FAdd, None, Some((*x, *y))))
-        }
+        Op::Fma(x, y, c) if *c == p && *x != p && *y != p => Some(Combine {
+            kind: RedKind::FAdd,
+            addend: None,
+            fma_factors: Some((*x, *y)),
+            select: None,
+        }),
         _ => None,
     }
+}
+
+/// `select(c, t, e)` with `c = cmp(pred, x, y)` as a min/max accumulate of `p`, or `None`.
+///
+/// The compare and the select must name the same two values — the accumulator and one other of the
+/// accumulator's own type — in either order:
+///
+/// * `select(x > y, x, y)` keeps the larger, `select(x < y, x, y)` the smaller;
+/// * `select(x > y, y, x)` keeps the smaller, `select(x < y, y, x)` the larger;
+///
+/// `>=`/`<=` pick the same side as `>`/`<` (they differ only on a tie, where the two candidates are
+/// equal integers — or, for floats, possibly `+0`/`-0`, which is why a float min/max is never
+/// reassociated: [`RedKind::reassociable`]). Signedness comes from the predicate. An equality
+/// compare, a compare of anything else, or a mixed-type pair is not a min/max.
+///
+/// The caller still has to prove the compare reads the accumulator for this select and nothing
+/// else (`classify_carried`): a compare that also steers a store or a second merge observes every
+/// partial maximum, which reordering would change.
+fn select_combine(
+    ctx: &LoopCtx<'_>,
+    p: ValueId,
+    c: ValueId,
+    t: ValueId,
+    e: ValueId,
+) -> Option<Combine> {
+    let Op::Cmp(pred, x, y) = ctx.op_of(c)? else {
+        return None;
+    };
+    let (x, y) = (*x, *y);
+    let other = if t == p && e != p {
+        e
+    } else if e == p && t != p {
+        t
+    } else {
+        return None;
+    };
+    let same_order = (x, y) == (t, e);
+    if !same_order && (x, y) != (e, t) {
+        return None;
+    }
+    let ty = ctx.f.value_type(p);
+    if ctx.f.value_type(other) != ty {
+        return None;
+    }
+    use CmpOp::*;
+    // Does the select keep the operand the compare called greater?
+    let greater = matches!(pred, Sgt | Sge | Ugt | Uge | Fogt | Foge);
+    let lesser = matches!(pred, Slt | Sle | Ult | Ule | Folt | Fole);
+    if !greater && !lesser {
+        return None;
+    }
+    let is_max = greater == same_order;
+    let kind = match pred {
+        Sgt | Sge | Slt | Sle if ty.is_int() && *ty != MirType::I1 => {
+            if is_max {
+                RedKind::SMax
+            } else {
+                RedKind::SMin
+            }
+        }
+        Ugt | Uge | Ult | Ule if ty.is_int() && *ty != MirType::I1 => {
+            if is_max {
+                RedKind::UMax
+            } else {
+                RedKind::UMin
+            }
+        }
+        Fogt | Foge | Folt | Fole if ty.is_float() => {
+            if is_max {
+                RedKind::FMax
+            } else {
+                RedKind::FMin
+            }
+        }
+        _ => return None,
+    };
+    Some(Combine {
+        kind,
+        addend: Some(other),
+        fma_factors: None,
+        select: Some(SelectCombine {
+            cmp: c,
+            pred: *pred,
+            acc_left_in_cmp: x == p,
+            acc_is_then: t == p,
+        }),
+    })
 }
 
 /// How many times `v` is read inside the loop (instruction operands and terminator arguments),
@@ -1787,19 +1911,31 @@ fn classify_carried(
         }
         let kind = next
             .and_then(|n| {
-                let (kind, addend, fma_factors) = combine_kind(ctx, p, n)?;
-                if uses_in_loop(ctx, l, p) != 1 {
+                let c = combine_kind(ctx, p, n)?;
+                // A min/max reads the accumulator twice — once in its compare, once in its select —
+                // and the compare must feed that select and nothing else.
+                let own_uses = match c.select {
+                    Some(s) => {
+                        if uses_in_loop(ctx, l, s.cmp) != 1 {
+                            return None; // the compare steers something besides the combine
+                        }
+                        2
+                    }
+                    None => 1,
+                };
+                if uses_in_loop(ctx, l, p) != own_uses {
                     return None; // an intermediate partial is observed somewhere else
                 }
                 reductions.push(Reduction {
                     param: p,
                     param_index: k,
                     start: entry_arg(f, l, k),
-                    kind,
+                    kind: c.kind,
                     combine: n,
-                    addend,
-                    fma_factors,
-                    reassociable: kind.reassociable(),
+                    addend: c.addend,
+                    fma_factors: c.fma_factors,
+                    reassociable: c.kind.reassociable(),
+                    select: c.select,
                 });
                 Some(Carried::Reduction(reductions.len() - 1))
             })
@@ -3305,6 +3441,54 @@ mod tests {
         let l = &l;
         assert!(l.reductions.is_empty(), "{:?}", l.carried);
         assert!(!l.is_vectorizable_shape());
+    }
+
+    /// `m = max(m, x[i])` lowers to `select(m > x[i], m, x[i])` (`mir_build::minmax`). That is a
+    /// min/max reduction, recorded with its compare and the accumulator's two positions so a serial
+    /// fold can re-emit it operand for operand — and a float one is never reassociable.
+    #[test]
+    fn a_select_spelled_float_max_is_a_reduction() {
+        let src = "fn k(x: []f64, n: i64) -> f64 { let mut m: f64 = 0.0; let mut i: i64 = 0; \
+                   while i < n { m = max(m, x[i]); i = i + 1; } return m; } \
+                   fn main() -> i32 { return 0; }";
+        let (_, l) = kernel_loop(src, "k");
+        assert_eq!(l.reductions.len(), 1, "{:?}", l.carried);
+        let r = &l.reductions[0];
+        assert_eq!(r.kind, RedKind::FMax);
+        assert!(!r.reassociable, "a float max keeps its order");
+        let s = r.select.expect("the select spelling is recorded");
+        assert_eq!(s.pred, CmpOp::Fogt);
+        assert!(s.acc_left_in_cmp && s.acc_is_then, "{s:?}");
+        assert!(l.is_vectorizable_shape());
+    }
+
+    /// The accumulator on the right: `min(x[i], m)` is `select(x[i] < m, x[i], m)`, a signed min
+    /// over `i32`, and integer min/max is associative.
+    #[test]
+    fn a_select_spelled_integer_min_is_a_reassociable_reduction() {
+        let src = "fn k(x: []i32, n: i64) -> i32 { let mut m: i32 = 0; let mut i: i64 = 0; \
+                   while i < n { m = min(x[i], m); i = i + 1; } return m; } \
+                   fn main() -> i32 { return 0; }";
+        let (_, l) = kernel_loop(src, "k");
+        assert_eq!(l.reductions.len(), 1, "{:?}", l.carried);
+        let r = &l.reductions[0];
+        assert_eq!(r.kind, RedKind::SMin);
+        assert!(r.reassociable);
+        let s = r.select.expect("the select spelling is recorded");
+        assert!(!s.acc_left_in_cmp && !s.acc_is_then, "{s:?}");
+    }
+
+    /// A running maximum whose partial is stored before each update (an exclusive max-scan) reads
+    /// the accumulator a third time: the partials are observed, so it is not a reduction.
+    #[test]
+    fn an_observed_running_max_is_not_a_reduction() {
+        let src = "fn k(x: []f32, mut o: []f32, n: i64) -> f32 { let mut m: f32 = 0.0; \
+                   let mut i: i64 = 0; \
+                   while i < n { o[i] = m; m = max(m, x[i]); i = i + 1; } return m; } \
+                   fn main() -> i32 { return 0; }";
+        let (_, l) = kernel_loop(src, "k");
+        assert!(l.reductions.is_empty(), "{:?}", l.carried);
+        assert!(l.carried.iter().any(|c| c.kind == Carried::Recurrence));
     }
 
     // ---- stage 4: dependence -----------------------------------------------------------------

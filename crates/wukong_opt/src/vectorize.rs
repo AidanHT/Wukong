@@ -496,10 +496,13 @@ struct RedPlan {
     addend: Option<(ValueId, bool)>,
     /// `Fma`: the two multiplicands, re-fused per lane so the rounding is unchanged.
     fma_factors: Option<(ValueId, ValueId)>,
+    /// A min/max: the compare-and-select the scalar loop accumulates with, re-emitted per lane (or
+    /// per part, for a vector accumulator) with the accumulator in the same two positions.
+    select: Option<loop_info::SelectCombine>,
     ty: MirType,
     /// May the partials be kept in `W` independent lanes and folded once, after the loop?
     ///
-    /// Only for an operator that really is associative — integer `add`/`mul`/bitwise. A float
+    /// Only for an operator that really is associative — integer `add`/`mul`/bitwise/min/max. A float
     /// `add` is not, and giving it lane-parallel partials would change the program's answer, so it
     /// keeps a scalar accumulator and folds `W` lanes into it inside the body every iteration.
     /// That is a `W`-long dependent chain per group either way, which is exactly what `gcc -O3`
@@ -1622,6 +1625,8 @@ fn plan_body(
 
     // The reductions, keyed by their combining instruction's result.
     let mut red_of: FxHashSet<u32> = FxHashSet::default();
+    // A min/max reduction's compare: part of the accumulate, folded with it, never widened alone.
+    let mut red_cmp: FxHashSet<u32> = FxHashSet::default();
     let mut reductions = Vec::new();
     for r in &l.reductions {
         let ty = f.value_type(r.param).clone();
@@ -1636,19 +1641,23 @@ fn plan_body(
             (a, left_is_acc)
         });
         red_of.insert(r.combine.0);
+        if let Some(s) = r.select {
+            red_cmp.insert(s.cmp.0);
+        }
         // Lane-parallel partials need the combine to exist *as a vector instruction*. It is the
         // same `Op::Bin` the elementwise path emits, so it is the same question `bin_widenable`
         // answers — an `i8` product has no packed form, and a reduction is not exempt from that.
         // Such a reduction still widens; it just takes the serial fold, whose combine is scalar.
         let vector_acc = r.reassociable
             && r.addend.is_some()
-            && red_identity(r.kind).is_some()
-            && bin_widenable(red_binop(r.kind), &ty);
+            && red_identity(r.kind, &ty).is_some()
+            && vector_combinable(r.kind, &ty);
         reductions.push(RedPlan {
             param_index: r.param_index,
             kind: r.kind,
             addend,
             fma_factors: r.fma_factors,
+            select: r.select,
             ty,
             vector_acc,
         });
@@ -1849,6 +1858,12 @@ fn plan_body(
                 continue; // deliberately NOT added to `available`
             }
             available.insert(r.0);
+            // A min/max's compare is re-emitted by the fold, beside its select — its only reader
+            // (`loop_info::classify_carried` counted). Available, so that select reads as defined.
+            if red_cmp.contains(&r.0) {
+                plans.push(Plan::Reduce);
+                continue;
+            }
         }
         let mut operand_is_vec = false;
         let mut reads_lane_ptr = false;
@@ -2584,7 +2599,7 @@ fn apply(f: &mut Function, p: &VecPlan) {
     let vec_end = e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Add, start, n_vec));
     let mut guard_args = guard_params.clone();
     for r in &vacc {
-        let id = red_identity(r.kind).expect("vector_acc implies an identity");
+        let id = red_identity(r.kind, &r.ty).expect("vector_acc implies an identity");
         let scalar = e.push(guard, r.ty.clone(), Op::ConstInt(id as i128, r.ty.clone()));
         let identity = e.push(guard, part_ty(&r.ty), Op::Splat(scalar));
         for _ in 0..parts_of(&r.ty, p.w) {
@@ -2618,23 +2633,23 @@ fn apply(f: &mut Function, p: &VecPlan) {
     // keeping `W` independent partials.
     //
     // The operator is associative and commutative (`vector_acc` admits integer `add`/`mul`/bitwise
-    // only), so the parts are first combined lane-wise into one vector and its lanes then folded
-    // into the scalar accumulator: any order gives the same integer, wraparound included.
+    // and integer min/max only), so the parts are first combined lane-wise into one vector and its
+    // lanes then folded into the scalar accumulator: any order gives the same integer, wraparound
+    // included — and a min/max of equal integers is that integer whichever side the select names.
     let mut exit_args = vh_params[..header_tys.len()].to_vec();
     let mut next_param = header_tys.len();
     for r in &vacc {
         let n = parts_of(&r.ty, p.w);
         let parts = vh_params[next_param..next_param + n].to_vec();
         next_param += n;
-        let op = red_binop(r.kind);
         let mut vec = parts[0];
         for &q in &parts[1..] {
-            vec = e.push(vx, part_ty(&r.ty), Op::Bin(op, vec, q));
+            vec = emit_combine(&mut e, vx, r, true, vec, q, &part_ty(&r.ty));
         }
         let mut acc = exit_args[r.param_index];
         for k in 0..lanes_of(&r.ty).expect("a widened reduction type") {
             let lane = e.push(vx, r.ty.clone(), Op::ExtractLane(vec, k));
-            acc = e.push(vx, r.ty.clone(), Op::Bin(op, acc, lane));
+            acc = emit_combine(&mut e, vx, r, true, acc, lane, &r.ty);
         }
         exit_args[r.param_index] = acc;
     }
@@ -3183,7 +3198,17 @@ fn emit_body(
             let cur = vh_params[first..first + n].to_vec();
             let (a, _) = r.addend.expect("vector_acc implies a binary combine");
             let addend = to_vector(e, vb, &map, a, &r.ty, p.w);
-            let next = emit_bin(e, vb, red_binop(r.kind), &cur, &addend, &r.ty);
+            let next: Vec<ValueId> = match r.select {
+                // An integer min/max: the compare and select, part by part.
+                Some(_) => {
+                    let pty = part_ty(&r.ty);
+                    cur.iter()
+                        .zip(&addend)
+                        .map(|(&acc, &x)| emit_combine(e, vb, r, true, acc, x, &pty))
+                        .collect()
+                }
+                None => emit_bin(e, vb, red_binop(r.kind), &cur, &addend, &r.ty),
+            };
             vacc_next.extend(next);
             continue;
         }
@@ -3244,6 +3269,11 @@ fn emit_body(
 /// An `fma` accumulate re-fuses its two factors per lane rather than multiplying and adding
 /// separately, because `fma(x, y, acc)` rounds once and `acc + x*y` rounds twice.
 ///
+/// A min/max (`m = max(m, x[i])`, `fmin`, ...) is the same argument with a compare and a select in
+/// place of the operator ([`emit_combine`]): a float max is not associative once NaN and `±0` ties
+/// are in play (`loop_info::RedKind::reassociable`), so the body's loads and arithmetic go `W` wide
+/// and the running maximum is updated lane by lane, in index order, exactly as the scalar loop did.
+///
 /// Lanes come out through [`Op::ExtractLane`], which is one shuffle (and free for lane 0). The
 /// first version of this pass spilled the vector to a stack slot and loaded the elements back,
 /// because MIR had no lane read; that cost a store-forwarding stall per group and left the
@@ -3259,14 +3289,8 @@ fn emit_reduction_fold(
     match (r.addend, r.fma_factors) {
         (Some((a, left_is_acc)), None) => {
             let lanes = extract_lanes(e, vb, map, a, &r.ty);
-            let op = red_binop(r.kind);
             for lane in lanes {
-                let (x, y) = if left_is_acc {
-                    (acc, lane)
-                } else {
-                    (lane, acc)
-                };
-                acc = e.push(vb, r.ty.clone(), Op::Bin(op, x, y));
+                acc = emit_combine(e, vb, r, left_is_acc, acc, lane, &r.ty);
             }
         }
         (None, Some((x, y))) => {
@@ -3303,16 +3327,77 @@ fn extract_lanes(
     out
 }
 
-/// The identity element of a reassociable reduction, as a raw integer constant: the value every
-/// lane of a vector accumulator starts at, so that folding the lanes afterwards reproduces the
-/// scalar answer exactly. `And` is all-ones, which sign-extends from `-1` at every integer width.
-fn red_identity(k: RedKind) -> Option<i64> {
+/// The identity element of a reassociable reduction over `ty`, as a raw integer constant: the value
+/// every lane of a vector accumulator starts at, so that folding the lanes afterwards reproduces the
+/// scalar answer exactly. `And` is all-ones, which sign-extends from `-1` at every integer width;
+/// so is an unsigned min's identity, the largest unsigned value. A signed max starts at the type's
+/// minimum and a signed min at its maximum, so neither can ever win against a real element.
+fn red_identity(k: RedKind, ty: &MirType) -> Option<i64> {
+    let bits = lane_bytes(ty)? * 8;
     Some(match k {
-        RedKind::Add | RedKind::Or | RedKind::Xor => 0,
+        RedKind::Add | RedKind::Or | RedKind::Xor | RedKind::UMax => 0,
         RedKind::Mul => 1,
-        RedKind::And => -1,
+        RedKind::And | RedKind::UMin => -1,
+        RedKind::SMax if ty.is_int() => i64::MIN >> (64 - bits),
+        RedKind::SMin if ty.is_int() => i64::MAX >> (64 - bits),
         _ => return None,
     })
+}
+
+/// Can a reassociable reduction keep lane-parallel partials — does its combine exist as a vector
+/// instruction at this lane type?
+///
+/// A binary combine asks [`bin_widenable`]. An integer min/max is a vector compare and a lane
+/// select, which every integer lane width has — but only up to 32-bit lanes here: a 64-bit
+/// unsigned compare has no SSE instruction at all (the backend synthesizes it), and the gain of two
+/// lanes does not justify the exposure. A 64-bit min/max keeps the serial fold, which is exact.
+fn vector_combinable(k: RedKind, ty: &MirType) -> bool {
+    match k {
+        RedKind::SMax | RedKind::SMin | RedKind::UMax | RedKind::UMin => {
+            ty.is_int() && lane_bytes(ty).is_some_and(|b| b <= 4)
+        }
+        RedKind::FMax | RedKind::FMin => false,
+        other => bin_widenable(red_binop(other), ty),
+    }
+}
+
+/// One accumulate `acc ⊕ x`, spelled exactly as the scalar loop spelled it.
+///
+/// A binary combine is `op(acc, x)`, or `op(x, acc)` when the accumulator was the right operand
+/// (`left_is_acc`). A min/max re-emits the loop's own compare and select with the accumulator in
+/// the positions [`loop_info::SelectCombine`] recorded — on a float tie or a NaN the select returns
+/// its second arm, so swapping the operands would change which `±0` or NaN payload survives. `ty` is
+/// the type of `acc` and `x`: the scalar lane type, or a part's vector type, whose compare then
+/// yields a lane mask at the same width.
+fn emit_combine(
+    e: &mut Emit<'_>,
+    b: BlockId,
+    r: &RedPlan,
+    left_is_acc: bool,
+    acc: ValueId,
+    x: ValueId,
+    ty: &MirType,
+) -> ValueId {
+    match r.select {
+        Some(s) => {
+            let (l, rhs) = if s.acc_left_in_cmp {
+                (acc, x)
+            } else {
+                (x, acc)
+            };
+            let mask_ty = match ty {
+                MirType::Vec(lane, n) => vec_of(&mask_lane(lane), *n),
+                _ => MirType::I1,
+            };
+            let c = e.push(b, mask_ty, Op::Cmp(s.pred, l, rhs));
+            let (t, f) = if s.acc_is_then { (acc, x) } else { (x, acc) };
+            e.push(b, ty.clone(), Op::Select(c, t, f))
+        }
+        None => {
+            let (l, rhs) = if left_is_acc { (acc, x) } else { (x, acc) };
+            e.push(b, ty.clone(), Op::Bin(red_binop(r.kind), l, rhs))
+        }
+    }
 }
 
 fn red_binop(k: RedKind) -> BinOp {
@@ -3328,8 +3413,8 @@ fn red_binop(k: RedKind) -> BinOp {
         // with the accumulator on the left exactly as the scalar loop had it.
         RedKind::Sub => BinOp::Sub,
         RedKind::FSub => BinOp::FSub,
-        // `plan_body` only ever records the operators above; min/max reductions are spelled with a
-        // `select` and are classified `Recurrence` by the analysis, so they never reach here.
+        // A min/max is a compare and a select, never a binary operator: every caller asks
+        // `RedPlan::select` first (`emit_combine`, `vector_combinable`), so it never reaches here.
         other => unreachable!("{} is not a binary-combine reduction", other.name()),
     }
 }
@@ -4599,6 +4684,126 @@ mod tests {
                    while i < n { o[i] = x[i]; i = i + 1; } } \
                    fn main() -> i32 { return 0; }";
         assert!(!is_widened(src, "k"), "bf16 must not be widened");
+    }
+
+    // ---- min/max reductions --------------------------------------------------------------------
+
+    /// Does `func` carry a vector-typed block parameter — a lane-parallel accumulator — at `-O2`?
+    fn has_vector_accumulator(src: &str, func: &str) -> bool {
+        let (program, mut interner) = optimized(src, 2);
+        let sym = interner.intern(func);
+        let f = program
+            .function(sym)
+            .unwrap_or_else(|| panic!("no fn {func}"));
+        f.blocks
+            .iter()
+            .any(|b| b.params.iter().any(|p| f.value_type(*p).is_vector()))
+    }
+
+    /// `m = max(m, x[i] * s)` used to be a `Recurrence` (the combine is a `select`, which the
+    /// reduction analysis did not read) and declined the whole loop. A float max may not be
+    /// reassociated — `max(max(1, NaN), 0)` is `0` but `max(1, max(NaN, 0))` is `1` — so the
+    /// product goes two lanes wide and the running maximum is folded lane by lane, in index order:
+    /// no vector accumulator. The differential feeds it a NaN mid-stream (which the next element
+    /// displaces, exactly as in the scalar loop) and `±0` ties (the select keeps its second arm).
+    #[test]
+    fn a_float_max_reduction_widens_and_folds_in_order() {
+        let kernel = "fn k(x: []f64, s: f64, n: i64) -> f64 { let mut m: f64 = -0.0; \
+                      let mut i: i64 = 0; \
+                      while i < n { m = max(m, x[i] * s); i = i + 1; } return m; }";
+        let shape = format!("{kernel} fn main() -> i32 {{ return 0; }}");
+        let vs = vector_values(&shape, "k");
+        assert!(
+            vs.contains(&(MirType::F64, 2)),
+            "an f64 max did not widen: {vs:?}"
+        );
+        assert!(
+            !has_vector_accumulator(&shape, "k"),
+            "a float max must fold serially, not in lane-parallel partials"
+        );
+        scalar_and_vector_agree(&format!(
+            "{kernel} fn main() -> i32 {{ let mut x: []f64 = alloc_f64(13); \
+             let mut j: i64 = 0; \
+             while j < 13 {{ x[j] = (((j * 5) % 13) as f64) - 6.0; j = j + 1; }} \
+             let mut n: i64 = 0; \
+             while n <= 13 {{ let m: f64 = k(x, 0.5, n); print((m * 4.0) as i64); n = n + 1; }} \
+             x[5] = 0.0 / 0.0; \
+             n = 0; \
+             while n <= 13 {{ let m: f64 = k(x, 1.0, n); \
+               if m != m {{ print(-77777); }} else {{ print((m * 4.0) as i64); }} n = n + 1; }} \
+             j = 0; while j < 13 {{ x[j] = 0.0; if j % 3 == 1 {{ x[j] = -0.0; }} j = j + 1; }} \
+             n = 0; \
+             while n <= 13 {{ let m: f64 = k(x, 1.0, n); \
+               if 1.0 / m > 0.0 {{ print(1); }} else {{ print(0); }} n = n + 1; }} \
+             free(x); return 0; }}"
+        ));
+    }
+
+    /// `min(x[i], m)` over `i32` — the accumulator on the right — is associative, so it keeps four
+    /// lane-parallel partial minima seeded with `i32::MAX` and folds them once, after the loop.
+    #[test]
+    fn an_integer_min_reduction_keeps_vector_accumulators() {
+        let kernel = "fn k(x: []i32, n: i64) -> i32 { let mut m: i32 = 2147483647; \
+                      let mut i: i64 = 0; \
+                      while i < n { m = min(x[i], m); i = i + 1; } return m; }";
+        let shape = format!("{kernel} fn main() -> i32 {{ return 0; }}");
+        assert!(
+            has_vector_accumulator(&shape, "k"),
+            "an i32 min must keep lane-parallel partials"
+        );
+        scalar_and_vector_agree(&format!(
+            "{kernel} fn main() -> i32 {{ let mut x: []i32 = alloc_i32(19); \
+             let mut j: i64 = 0; \
+             while j < 19 {{ x[j] = ((j as i32) * 1103515245 + 12345) % 1000; j = j + 1; }} \
+             let mut n: i64 = 0; \
+             while n <= 19 {{ print(k(x, n)); n = n + 1; }} \
+             free(x); return 0; }}"
+        ));
+    }
+
+    /// An unsigned byte max: sixteen lanes, seeded with `0`, compared unsigned — `200u8` is larger
+    /// than `100u8` although its `i8` bits are negative.
+    #[test]
+    fn an_unsigned_byte_max_compares_unsigned() {
+        let kernel = "fn k(x: []u8, n: i64) -> u8 { let mut m: u8 = 0; let mut i: i64 = 0; \
+                      while i < n { m = max(m, x[i]); i = i + 1; } return m; }";
+        let shape = format!("{kernel} fn main() -> i32 {{ return 0; }}");
+        let vs = vector_values(&shape, "k");
+        assert!(
+            vs.contains(&(MirType::I8, 16)),
+            "a u8 max did not widen: {vs:?}"
+        );
+        scalar_and_vector_agree(&format!(
+            "{kernel} fn main() -> i32 {{ let mut x: []u8 = alloc_u8(37); \
+             let mut j: i64 = 0; \
+             while j < 37 {{ x[j] = ((j * 37 + 11) % 251) as u8; j = j + 1; }} \
+             let mut n: i64 = 0; \
+             while n <= 37 {{ print(k(x, n) as i64); n = n + 1; }} \
+             free(x); return 0; }}"
+        ));
+    }
+
+    /// A 64-bit integer max widens its body but folds serially: the vector accumulator is limited
+    /// to 32-bit lanes (`vector_combinable`).
+    #[test]
+    fn an_i64_max_folds_serially_and_agrees() {
+        let kernel = "fn k(x: []i64, n: i64) -> i64 { let mut m: i64 = -5000000000; \
+                      let mut i: i64 = 0; \
+                      while i < n { m = max(m, x[i] * 3); i = i + 1; } return m; }";
+        let shape = format!("{kernel} fn main() -> i32 {{ return 0; }}");
+        assert!(is_widened(&shape, "k"), "an i64 max did not widen");
+        assert!(
+            !has_vector_accumulator(&shape, "k"),
+            "an i64 max must not keep a vector accumulator"
+        );
+        scalar_and_vector_agree(&format!(
+            "{kernel} fn main() -> i32 {{ let mut x: []i64 = alloc_i64(11); \
+             let mut j: i64 = 0; \
+             while j < 11 {{ x[j] = (j * 7919) % 23 - 2000000000; j = j + 1; }} \
+             let mut n: i64 = 0; \
+             while n <= 11 {{ print(k(x, n)); n = n + 1; }} \
+             free(x); return 0; }}"
+        ));
     }
 
     // ---- cases that must be declined -----------------------------------------------------------
