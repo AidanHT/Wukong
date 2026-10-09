@@ -687,6 +687,11 @@ impl Sema<'_> {
         if !bound.is_empty() {
             self.call_dims.insert(call_id, bound);
         }
+        // A concrete instantiation of a type-generic callee is re-checked at its types
+        // (`instantiate.rs`).
+        if let Some(callee) = site.callee() {
+            self.note_instantiation(callee, sig, &tys, span);
+        }
 
         apply_subst(&sig.ret, &dims, &tys)
     }

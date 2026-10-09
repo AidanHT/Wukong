@@ -1,0 +1,20 @@
+// EXPECT-CODE: E0433
+module tests.fail.generic_instantiation_bad_op
+
+// A generic body is type-checked once with `T` opaque, where `a + b` is fine. The call below
+// instantiates it at a struct, and `+` is not defined on a struct: the instantiation is checked
+// again at `T = Point` and the error points at `a + b`, with a secondary label on the call that
+// required it. Before, nothing re-checked an instantiation, and mir_build lowered `add$Point` as an
+// arithmetic op on two struct base pointers.
+struct Point { x: f32, y: f32 }
+
+fn add<T>(a: T, b: T) -> T {
+    return a + b;
+}
+
+fn main() -> i32 {
+    let p = Point { x: 1.0, y: 2.0 };
+    let q = add(p, p);
+    print(q.x);
+    return 0;
+}

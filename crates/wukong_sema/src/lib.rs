@@ -32,6 +32,7 @@ mod builtins;
 mod dependency;
 mod entry;
 mod infer;
+mod instantiate;
 mod layout;
 mod methods;
 mod noalias;
@@ -438,6 +439,8 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         methods: methods::MethodState::default(),
         resolve: resolve::ResolveState::default(),
         provenance: provenance::ProvenanceState::default(),
+        inst_subst: HashMap::default(),
+        inst_calls: Vec::new(),
     };
     // Attribute legality (`attrs`): an attribute names no value and has no type, so this walk needs
     // nothing the collection pass builds and runs first — an unknown `@bogus` is reported even in a
@@ -461,6 +464,9 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
     }
     s.recheck_item_signatures(module);
     s.check_bodies(module);
+    // Every concrete instantiation of a type-generic function, re-checked at its types
+    // (`instantiate`). It restores the tables above, so it only adds diagnostics.
+    s.check_instantiations(module);
     // The `@noalias` rules (`noalias`): they compare argument storage, so they read the types the
     // body pass just recorded.
     noalias::check(module, interner, &s.defs, &s.types, &mut s.diags);
@@ -556,6 +562,12 @@ struct Sema<'a> {
     resolve: resolve::ResolveState,
     /// Where each call's dimensions were bound, for its diagnostics (`provenance.rs`).
     provenance: provenance::ProvenanceState,
+    /// The instantiation being re-checked: each value-type generic of the function whose body is
+    /// being checked, mapped to its concrete type (`instantiate.rs`). Empty outside that pass;
+    /// `lower_type` reads a generic's name through it.
+    inst_subst: HashMap<Symbol, Ty>,
+    /// The concrete instantiations calls have required so far (`instantiate.rs`).
+    inst_calls: Vec<instantiate::InstCall>,
 }
 
 /// One entry of [`Sema::loop_ctx`] — a loop currently being type-checked.
@@ -1221,8 +1233,16 @@ impl<'a> Sema<'a> {
         let ty = match &t.kind {
             TypeKind::Path(p) => {
                 let name = p.segments.last().unwrap().sym;
-                let s = self.sym_str(name);
-                if let Some(sc) = Scalar::from_name(s) {
+                // Inside an instantiation being re-checked, a value-type generic is its concrete
+                // type (`instantiate.rs`).
+                let inst = if p.is_single() {
+                    self.inst_subst.get(&name).cloned()
+                } else {
+                    None
+                };
+                if let Some(t) = inst {
+                    t
+                } else if let Some(sc) = Scalar::from_name(self.sym_str(name)) {
                     Ty::Scalar(sc)
                 } else {
                     // A generic type variable or a (possibly later-defined) named type. Once every
