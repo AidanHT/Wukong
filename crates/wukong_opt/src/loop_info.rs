@@ -686,7 +686,8 @@ impl RedKind {
 }
 
 /// An accumulator carried across iterations: `acc = acc ⊕ x`, with `acc` used nowhere else inside
-/// the loop.
+/// the loop than its own accumulate (a min/max's compare and a guarded accumulate's pass-through
+/// edge included).
 #[derive(Clone, Debug)]
 pub struct Reduction {
     /// The header block parameter holding the accumulator.
@@ -696,7 +697,10 @@ pub struct Reduction {
     /// The initial value, from the entering edge.
     pub start: Option<ValueId>,
     pub kind: RedKind,
-    /// The result of the combining instruction — the value the latch passes back.
+    /// The result of the combining instruction — the value the latch passes back, except for a
+    /// guarded accumulate, where the latch passes back [`Self::merge`] and this is the update on
+    /// one arm. (For a branch-spelled min/max it is the join parameter, which is not an
+    /// instruction.)
     pub combine: ValueId,
     /// The non-accumulator operand of the combine. `None` for an `Fma` accumulate, where the
     /// addend is the (never-materialized) product in [`Self::fma_factors`].
