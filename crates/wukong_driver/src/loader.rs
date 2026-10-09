@@ -485,8 +485,6 @@ mod tests {
         assert!(paths.contains(&"ns_b.a_val".to_string()), "{paths:?}");
     }
 
-    /// A private item is unreachable from another file however it is named: by selection, by
-    /// qualified path, or by a glob (which simply does not bring it in).
     /// `import NS_A` for the file `ns_a.wk` is E0330 on every host: on a case-folding file system
     /// it used to load, and on a case-sensitive one it was E0305.
     #[test]
@@ -509,6 +507,8 @@ mod tests {
         assert_eq!(codes(&sink), vec!["E0330"], "{:?}", sink.diagnostics());
     }
 
+    /// A private item is unreachable from another file however it is named: by selection, by
+    /// qualified path, or by a glob (which simply does not bring it in).
     #[test]
     fn private_items_are_e0312() {
         let (_, sink, _, _) = load_src(
