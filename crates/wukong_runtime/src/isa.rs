@@ -25,7 +25,7 @@ pub const MAX_ISA_ENV: &str = "WUKONG_MAX_ISA";
 pub enum IsaLevel {
     /// Baseline only: every kernel takes its scalar twin.
     Scalar,
-    /// AVX, AVX2, FMA, F16C and PREFETCHW (x86-64-v3, Haswell and later).
+    /// AVX, AVX2, FMA and F16C (x86-64-v3, Haswell and later).
     Avx2,
     /// The AVX2 tier plus AVX-VNNI (the VEX-encoded int8 dot product, Alder Lake and later).
     Avx2Vnni,
@@ -102,10 +102,6 @@ probe!(
     f16c, "f16c", IsaLevel::Avx2
 );
 probe!(
-    /// PREFETCHW.
-    prfchw, "prfchw", IsaLevel::Avx2
-);
-probe!(
     /// AVX-VNNI (`vpdpbusd` on 256-bit registers).
     avxvnni, "avxvnni", IsaLevel::Avx2Vnni
 );
@@ -145,7 +141,7 @@ mod tests {
             assert!(!avx512f() || std::is_x86_feature_detected!("avx512f"));
         }
         if cap() == IsaLevel::Scalar {
-            assert!(!avx() && !avx2() && !fma() && !f16c() && !prfchw());
+            assert!(!avx() && !avx2() && !fma() && !f16c());
             assert!(!avxvnni() && !avx512f());
         }
         if cap() < IsaLevel::Avx512 {
