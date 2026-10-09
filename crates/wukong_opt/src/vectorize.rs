@@ -60,9 +60,11 @@
 //! straight line and turns the branch condition into a lane mask, so `if c { o[i] = f } else { o[i]
 //! = g }` becomes one `select` and one store. Both arms then run for every lane, which is only
 //! sound when running the arm a lane did not take is harmless; the two ways it would not be — an
-//! unpaired store (it writes memory the scalar loop leaves alone) and an unpaired load (it reads an
-//! address the scalar loop never touches, and Wukong does not bounds-check slice indexing) — are
-//! refused there.
+//! unpaired store (it would write memory the scalar loop leaves alone) and an unpaired load (it
+//! would read an address the scalar loop never touches, and Wukong does not bounds-check slice
+//! indexing) — are **predicated** instead: each lane accesses its own element where it took the
+//! arm and a private scratch slot where it did not ([`Plan::PredStore`], [`Plan::PredLoad`]), the
+//! branch-free form of a masked store and load.
 //!
 //! A merge that carries an accumulator across the back edge is a **guarded reduction**
 //! (`if c { s = s + x }`, `loop_info::Reduction::merge`): it is folded with the other reductions,
@@ -374,6 +376,12 @@ enum Plan {
     MaskedStore,
     /// An if-converted latch parameter: a lane-wise `select` between the two arms' arguments.
     Merge,
+    /// A load only one arm makes ([`LinInst::PredLoad`]): one scalar load per lane, from the lane's
+    /// own element where the lane took the arm and from a private scratch slot where it did not.
+    PredLoad,
+    /// A store only one arm makes ([`LinInst::PredStore`]): one scalar store per lane, to the lane's
+    /// own element where the lane took the arm and to the scratch slot where it did not.
+    PredStore,
 }
 
 /// One step of the loop body after **if-conversion**: the body's control flow is flattened into a
@@ -407,6 +415,25 @@ enum LinInst {
         cond: ValueId,
         then_arg: ValueId,
         else_arg: ValueId,
+    },
+    /// `blocks[block].insts[idx]`, a load only the arm taken when `cond == on_true` makes, at an
+    /// address no unconditional access covers. Predicated per lane rather than speculated: a lane
+    /// that did not take the arm reads a scratch slot, never the element ([`Plan::PredLoad`]).
+    PredLoad {
+        block: BlockId,
+        idx: usize,
+        cond: ValueId,
+        on_true: bool,
+    },
+    /// A store only the arm taken when `cond == on_true` makes (the other arm stores nothing): per
+    /// lane, the element is written only where the lane took the arm ([`Plan::PredStore`]).
+    PredStore {
+        ptr: ValueId,
+        value: ValueId,
+        cond: ValueId,
+        on_true: bool,
+        /// The store itself, for its `AddrForm`.
+        at: (BlockId, usize),
     },
 }
 
@@ -1028,6 +1055,13 @@ fn estimate_cost(
             }
             LinInst::MaskedStore { then_val, .. } => ty_of(*then_val),
             LinInst::Merge { param, .. } => ty_of(*param),
+            LinInst::PredLoad { block, idx, .. } => {
+                match f.blocks[block.0 as usize].insts[*idx].result {
+                    Some(r) => ty_of(r),
+                    None => MirType::I1,
+                }
+            }
+            LinInst::PredStore { value, .. } => ty_of(*value),
         }
     };
 
@@ -1038,7 +1072,7 @@ fn estimate_cost(
     };
     let mut per_block: FxHashMap<u32, u64> = FxHashMap::default();
     for s in lin {
-        if let LinInst::Real { block, .. } = s {
+        if let LinInst::Real { block, .. } | LinInst::PredLoad { block, .. } = s {
             *per_block.entry(block.0).or_default() += 1;
         }
     }
@@ -1067,6 +1101,8 @@ fn estimate_cost(
                 2 * parts(&step_ty(s))
             }
             Plan::Replicate | Plan::LaneGep | Plan::Gather => 3 * w64,
+            // Per lane: the lane's condition bit, an address select and the scalar access.
+            Plan::PredLoad | Plan::PredStore => 4 * w64,
         };
     }
     for r in reductions {
@@ -1088,15 +1124,20 @@ fn estimate_cost(
 /// parameter, then the latch's own instructions.
 ///
 /// Executing an arm a lane did not take must be harmless, and the two ways it might not be are
-/// both refused here:
+/// handled here:
 ///
 /// * **A store with no counterpart.** If only the `then` arm writes `o[i]`, the flattened body
-///   would write it for every lane. Turning that into a read-modify-write (`store(p, select(m, v,
-///   load(p)))`) is possible but introduces a load *and* a write to memory the scalar loop never
-///   touches, so it is left out. A pair of stores to the same address becomes one masked store.
+///   must not write it for every lane. A read-modify-write (`store(p, select(m, v, load(p)))`)
+///   would read and rewrite memory the scalar loop never touches — a lost update against another
+///   thread writing those elements — so instead each lane stores on its own, to its element where
+///   it took the arm and to a private scratch slot where it did not ([`LinInst::PredStore`]): the
+///   branch-free form of a masked store. A pair of stores to the same address becomes one masked
+///   store; stores in both arms that do not pair are still refused.
 /// * **A load with no counterpart.** Wukong does not bounds-check slice indexing, so speculating
 ///   `w[i]` when only one arm reads it can read off the end of a buffer that is genuinely shorter
-///   than the loop's trip count. A load is speculated only when the *same* base and index is also
+///   than the loop's trip count. Such a load is predicated the same way — a lane that did not take
+///   the arm reads the scratch slot ([`LinInst::PredLoad`]) — and a load is speculated as a plain
+///   vector load only when the *same* base and index is also
 ///   read or written by the other arm or by the unconditional part of the body, which makes the
 ///   set of addresses the flattened body touches equal to the set one arm would have touched.
 ///
@@ -1194,6 +1235,9 @@ fn linearize_region(
         (AddrForm::Invariant(ba), AddrForm::Invariant(bb)) => ba.same_object(*bb),
         _ => false,
     };
+    // Loads no other access covers are predicated per lane; that needs the lane's own element,
+    // which an affine address gives and a gather's does not.
+    let mut predicated: FxHashSet<(u32, usize)> = FxHashSet::default();
     for (mine, theirs) in [(&t_acc, &e_acc), (&e_acc, &t_acc)] {
         for a in mine.iter().filter(|a| a.kind == AccessKind::Load) {
             let covered = theirs
@@ -1201,7 +1245,10 @@ fn linearize_region(
                 .chain(unconditional.iter())
                 .any(|b| same_place(a, b));
             if !covered {
-                return Err("an arm loads an address the other arm never touches");
+                if !matches!(a.addr, AddrForm::Affine { .. }) {
+                    return Err("an arm loads an address the other arm never touches");
+                }
+                predicated.insert((a.block.0, a.inst));
             }
         }
     }
@@ -1237,11 +1284,32 @@ fn linearize_region(
     };
     let t_stores = stores_of(t_blk);
     let e_stores = stores_of(e_blk);
-    if t_stores.len() != e_stores.len() {
+    let access_at = |b: BlockId, i: usize| l.accesses.iter().find(|a| a.block == b && a.inst == i);
+    let mut merged_stores: Vec<LinInst> = Vec::with_capacity(t_stores.len() + e_stores.len());
+    // Only one arm stores: each of its stores happens per lane, where the lane took the arm, in the
+    // arm's own order.
+    if t_stores.is_empty() || e_stores.is_empty() {
+        for (stores, on_true) in [(&t_stores, true), (&e_stores, false)] {
+            for &(b, i, ptr, value) in stores {
+                let Some(a) = access_at(b, i) else {
+                    return Err("a store in an arm has no analyzed address");
+                };
+                if !matches!(a.addr, AddrForm::Affine { .. }) {
+                    return Err("an arm stores to an address that does not step with the loop");
+                }
+                merged_stores.push(LinInst::PredStore {
+                    ptr,
+                    value,
+                    cond: *cond,
+                    on_true,
+                    at: (b, i),
+                });
+            }
+        }
+    } else if t_stores.len() != e_stores.len() {
         return Err("the two arms do not store the same number of times");
     }
-    let access_at = |b: BlockId, i: usize| l.accesses.iter().find(|a| a.block == b && a.inst == i);
-    let mut merged_stores: Vec<LinInst> = Vec::with_capacity(t_stores.len());
+    // (With one arm storing nothing, the zip below is empty.)
     for (ts, es) in t_stores.iter().zip(&e_stores) {
         let (Some(ta), Some(ea)) = (access_at(ts.0, ts.1), access_at(es.0, es.1)) else {
             return Err("a store in an arm has no analyzed address");
@@ -1279,7 +1347,16 @@ fn linearize_region(
             if matches!(inst.op, Op::Store { .. }) {
                 continue; // replaced by the merged store below
             }
-            lin.push(LinInst::Real { block: b, idx });
+            if predicated.contains(&(b.0, idx)) {
+                lin.push(LinInst::PredLoad {
+                    block: b,
+                    idx,
+                    cond: *cond,
+                    on_true: Some(b) == t_blk,
+                });
+            } else {
+                lin.push(LinInst::Real { block: b, idx });
+            }
         }
     }
     lin.extend(merged_stores);
@@ -1682,7 +1759,15 @@ fn classify_iv_uses(f: &Function, lin: &[LinInst], iv: ValueId) -> Option<FxHash
         // latch parameter or two stored *values*, and a lane-varying stored value is rejected
         // separately. Check it rather than assume it.
         let inst = match step {
-            LinInst::Real { block, idx } => &f.blocks[block.0 as usize].insts[*idx],
+            LinInst::Real { block, idx } | LinInst::PredLoad { block, idx, .. } => {
+                &f.blocks[block.0 as usize].insts[*idx]
+            }
+            LinInst::PredStore { cond, value, .. } => {
+                if index.contains(&cond.0) || index.contains(&value.0) {
+                    return None;
+                }
+                continue;
+            }
             LinInst::MaskedStore {
                 cond,
                 then_val,
@@ -2209,6 +2294,21 @@ fn plan_body(
                     index_only.insert(u.0, false);
                 }
             }
+            LinInst::PredLoad {
+                block, idx, cond, ..
+            } => {
+                index_only.insert(cond.0, false);
+                each_op_use(&f.blocks[block.0 as usize].insts[*idx].op, &mut |u| {
+                    index_only.insert(u.0, false);
+                });
+            }
+            LinInst::PredStore {
+                ptr, value, cond, ..
+            } => {
+                for u in [*ptr, *value, *cond] {
+                    index_only.insert(u.0, false);
+                }
+            }
         }
     }
     for b in &l.blocks {
@@ -2338,6 +2438,76 @@ fn plan_body(
                 }
                 available.insert(param.0);
                 plans.push(Plan::Merge);
+                continue;
+            }
+            // A load only one arm makes: one scalar load per lane at the lane's own element
+            // (`ptr + k`) or the scratch slot, so the address must be the group's one scalar address
+            // and the condition a mask (or one answer for the group). Its lanes are packed wherever
+            // a widened step reads them, like any replicated value.
+            LinInst::PredLoad {
+                block, idx, cond, ..
+            } => {
+                let inst = &f.blocks[block.0 as usize].insts[*idx];
+                let Op::Load(ptr, ty) = &inst.op else {
+                    return None;
+                };
+                for u in [*ptr, *cond] {
+                    if (defined_in_loop.contains(&u.0) && !available.contains(&u.0))
+                        || lane_ptrs.contains(&u.0)
+                    {
+                        return None;
+                    }
+                }
+                if lane_at(&vector_ty, at, *ptr).is_some() || red_cmp.contains(&cond.0) {
+                    return None;
+                }
+                if !matches!(
+                    access_at.get(&(block.0, *idx)).map(|a| &a.addr),
+                    Some(AddrForm::Affine { .. })
+                ) {
+                    return None;
+                }
+                lane_bytes(ty)?;
+                let r = inst.result?;
+                vector_ty.insert(r.0, ty.clone());
+                lane_vals.insert(r.0);
+                available.insert(r.0);
+                replicated += 1;
+                plans.push(Plan::PredLoad);
+                continue;
+            }
+            // A store only one arm makes: per lane, to the lane's own element or the scratch slot.
+            // The stored value is read lane by lane, so it may be a vector, replicated lanes or one
+            // value for the group — but never the induction variable's scalar address face.
+            LinInst::PredStore {
+                ptr,
+                value,
+                cond,
+                at: store_at,
+                ..
+            } => {
+                for u in [*ptr, *value, *cond] {
+                    if (defined_in_loop.contains(&u.0) && !available.contains(&u.0))
+                        || lane_ptrs.contains(&u.0)
+                    {
+                        return None;
+                    }
+                }
+                if lane_at(&vector_ty, at, *ptr).is_some()
+                    || red_cmp.contains(&cond.0)
+                    || iv_addr.contains(&value.0)
+                {
+                    return None;
+                }
+                if !matches!(
+                    access_at.get(&(store_at.0 .0, store_at.1)).map(|a| &a.addr),
+                    Some(AddrForm::Affine { .. })
+                ) {
+                    return None;
+                }
+                lane_bytes(f.value_type(*value))?;
+                replicated += 1;
+                plans.push(Plan::PredStore);
                 continue;
             }
         };
@@ -3422,6 +3592,8 @@ fn emit_body(
     // `(group, residue)` -> that member's parts: filled for every member of a load group by its
     // first member, and member by member for a store group until its last member stores them all.
     let mut group_vals: FxHashMap<(usize, u32), Vec<ValueId>> = FxHashMap::default();
+    // The scratch slots predicated accesses aim their idle lanes at, one per element type.
+    let mut scratch: Vec<(MirType, ValueId)> = Vec::new();
 
     // The lane ramp, when the body reads the induction variable as a value: `splat(i) + iota`, so
     // lane `k` holds `i + k` — the counter scalar iteration `i + k` would have had. The step is 1
@@ -3541,6 +3713,67 @@ fn emit_body(
                 }
                 continue;
             }
+            // A load one arm makes, lane by lane: each lane reads its own element if it took the
+            // arm and the scratch slot if it did not, so no lane touches memory the scalar loop
+            // leaves alone. The idle lanes' values are discarded by the arm's merge.
+            (
+                Plan::PredLoad,
+                LinInst::PredLoad {
+                    block,
+                    idx,
+                    cond,
+                    on_true,
+                },
+            ) => {
+                let inst = e.f.blocks[block.0 as usize].insts[*idx].clone();
+                let Op::Load(ptr, ty) = &inst.op else {
+                    unreachable!("a predicated load is a load")
+                };
+                let ptr = resolve_uniform(&map, *ptr);
+                let bits = mask_lane_bools(e, vb, &map, *cond, p.w);
+                let slot = scratch_slot(e, &mut scratch, ty);
+                let lanes = bits
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &bit)| {
+                        let own = elem_ptr(e, vb, ptr, ty, k as i64);
+                        let (a, b) = if *on_true { (own, slot) } else { (slot, own) };
+                        let at = e.push(vb, MirType::Ptr, Op::Select(bit, a, b));
+                        e.push(vb, ty.clone(), Op::Load(at, ty.clone()))
+                    })
+                    .collect();
+                map.insert(
+                    inst.result.expect("a load has a result").0,
+                    Wide::Lanes(lanes),
+                );
+                continue;
+            }
+            // A store one arm makes, lane by lane, in lane order: to the lane's own element where
+            // the lane took the arm, to the scratch slot where it did not — a masked store without
+            // a read-modify-write of the elements it skips.
+            (
+                Plan::PredStore,
+                LinInst::PredStore {
+                    ptr,
+                    value,
+                    cond,
+                    on_true,
+                    ..
+                },
+            ) => {
+                let lane_ty = e.f.value_type(*value).clone();
+                let ptr = resolve_uniform(&map, *ptr);
+                let vals = lane_values(e, vb, &map, *value, p.w);
+                let bits = mask_lane_bools(e, vb, &map, *cond, p.w);
+                let slot = scratch_slot(e, &mut scratch, &lane_ty);
+                for (k, (&v, &bit)) in vals.iter().zip(&bits).enumerate() {
+                    let own = elem_ptr(e, vb, ptr, &lane_ty, k as i64);
+                    let (a, b) = if *on_true { (own, slot) } else { (slot, own) };
+                    let at = e.push(vb, MirType::Ptr, Op::Select(bit, a, b));
+                    e.push_void(vb, Op::Store { ptr: at, value: v });
+                }
+                continue;
+            }
             _ => {}
         }
         let LinInst::Real { block, idx } = step else {
@@ -3549,7 +3782,9 @@ fn emit_body(
         let inst = e.f.blocks[block.0 as usize].insts[*idx].clone();
         let inst = &inst;
         match &p.plans[i] {
-            Plan::MaskedStore | Plan::Merge => unreachable!("handled above"),
+            Plan::MaskedStore | Plan::Merge | Plan::PredLoad | Plan::PredStore => {
+                unreachable!("handled above")
+            }
             Plan::Reduce => continue, // folded after the body, see below
             Plan::Scalar => {
                 let mut op = inst.op.clone();
@@ -3807,7 +4042,34 @@ fn emit_body(
         }
     }
     out.extend(vacc_next);
+    // The scratch slots live in the entry block, allocated once per call. Inserted last: nothing
+    // after this point reads an instruction index.
+    let entry = e.f.entry;
+    for (ty, slot) in scratch.into_iter().rev() {
+        e.f.blocks[entry.0 as usize].insts.insert(
+            0,
+            Inst {
+                result: Some(slot),
+                op: Op::Alloca {
+                    ty,
+                    space: wukong_mir::AddrSpace::Local,
+                },
+            },
+        );
+    }
     (out, vb)
+}
+
+/// The scratch slot a predicated access of `ty` aims its idle lanes at: one private stack slot per
+/// element type, whose address escapes nowhere but into those selects, so writing it is invisible
+/// and reading it reads a value the arm's merge discards.
+fn scratch_slot(e: &mut Emit<'_>, scratch: &mut Vec<(MirType, ValueId)>, ty: &MirType) -> ValueId {
+    if let Some(&(_, slot)) = scratch.iter().find(|(t, _)| t == ty) {
+        return slot;
+    }
+    let slot = e.value(MirType::Ptr);
+    scratch.push((ty.clone(), slot));
+    slot
 }
 
 /// End `vb` in a search loop's exit test and continue the group in a new block, returned.
@@ -6184,25 +6446,72 @@ mod tests {
         );
     }
 
-    /// Only one arm stores, so the flattened body would write `o[i]` for lanes the scalar loop
-    /// leaves untouched. A read-modify-write could express it; until then, decline.
+    /// Only one arm stores, so the flattened body must not write `o[i]` for lanes the scalar loop
+    /// leaves untouched: each lane stores on its own, to `o[i + k]` where it took the arm and to a
+    /// scratch slot where it did not. The sentinels the arm skips must survive.
     #[test]
-    fn an_unpaired_conditional_store_is_declined() {
-        let src = "fn k(x: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
-                   while i < n { if x[i] > 0.0 { o[i] = 1.0; } i = i + 1; } } \
-                   fn main() -> i32 { return 0; }";
-        assert!(!is_widened(src, "k"), "an unpaired store must stay scalar");
+    fn a_one_armed_store_is_predicated_and_skipped_elements_survive() {
+        let kernel = "@unchecked fn k(x: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
+                      while i < n { let v: f32 = x[i]; \
+                      if v > 0.0 { o[i] = v * 2.0 + 1.0; } i = i + 1; } }";
+        let shape = format!("{kernel} fn main() -> i32 {{ return 0; }}");
+        assert!(
+            is_widened(&shape, "k"),
+            "a one-armed store was not predicated"
+        );
+        assert!(
+            ops_of(&shape, "k")
+                .iter()
+                .any(|op| matches!(op, Op::Alloca { .. })),
+            "a predicated store needs its scratch slot"
+        );
+        scalar_and_vector_agree(&format!(
+            "{kernel} fn main() -> i32 {{ let mut x: []f32 = alloc_f32(23); \
+             let mut o: []f32 = alloc_f32(23); let mut i: i64 = 0; \
+             while i < 23 {{ x[i] = (((i * 5) % 7) as f32) - 3.0; o[i] = -7.0; i = i + 1; }} \
+             k(x, o, 23); \
+             i = 0; while i < 23 {{ print(o[i] as i32); i = i + 1; }} \
+             free(o); free(x); return 0; }}"
+        ));
     }
 
-    /// Only one arm reads `w[i]`. Wukong does not bounds-check slice indexing, so speculating that
-    /// load can read off the end of a buffer shorter than the loop's trip count.
+    /// Only one arm reads `w[i]`, and `w` is shorter than the trip: the scalar loop reads it only
+    /// where `x[i] > 0`. Speculating the load would read past its end; predicating it reads the
+    /// scratch slot for every lane that did not take the arm.
     #[test]
-    fn an_unpaired_conditional_load_is_declined() {
-        let src = "fn k(x: []f32, w: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
-                   while i < n { let xi: f32 = x[i]; \
-                   if xi > 0.0 { o[i] = w[i]; } else { o[i] = 1.0; } i = i + 1; } } \
+    fn an_arm_only_load_is_predicated_and_never_reads_past_its_buffer() {
+        let kernel = "@unchecked fn k(x: []f32, w: []f32, mut o: []f32, n: i64) { \
+                      let mut i: i64 = 0; \
+                      while i < n { let xi: f32 = x[i]; \
+                      if xi > 0.0 { o[i] = w[i] * xi; } else { o[i] = 1.0; } i = i + 1; } }";
+        let shape = format!("{kernel} fn main() -> i32 {{ return 0; }}");
+        assert!(
+            is_widened(&shape, "k"),
+            "an arm-only load was not predicated"
+        );
+        scalar_and_vector_agree(&format!(
+            "{kernel} fn main() -> i32 {{ let mut x: []f32 = alloc_f32(23); \
+             let mut w: []f32 = alloc_f32(10); let mut o: []f32 = alloc_f32(23); \
+             let mut i: i64 = 0; \
+             while i < 23 {{ x[i] = 9.5 - (i as f32); o[i] = 0.0; i = i + 1; }} \
+             i = 0; while i < 10 {{ w[i] = (i as f32) + 0.5; i = i + 1; }} \
+             k(x, w, o, 23); \
+             i = 0; while i < 23 {{ print((o[i] * 4.0) as i32); i = i + 1; }} \
+             free(o); free(w); free(x); return 0; }}"
+        ));
+    }
+
+    /// Both arms store, to different places: there is no one masked store to merge them into.
+    #[test]
+    fn stores_to_different_places_in_both_arms_are_declined() {
+        let src = "@unchecked fn k(x: []f32, mut o: []f32, mut p: []f32, n: i64) { \
+                   let mut i: i64 = 0; \
+                   while i < n { if x[i] > 0.0 { o[i] = 1.0; } else { p[i] = 2.0; } i = i + 1; } } \
                    fn main() -> i32 { return 0; }";
-        assert!(!is_widened(src, "k"), "an unpaired load must stay scalar");
+        assert!(
+            !is_widened(src, "k"),
+            "unpaired stores in both arms must stay scalar"
+        );
     }
 
     #[test]
