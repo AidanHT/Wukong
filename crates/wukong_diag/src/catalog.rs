@@ -424,6 +424,67 @@ static CATALOG: &[Explanation] = &[
         good: "module ex.e0325\nfn main() -> i32 {\n    let b = alloc::<i32>(4);\n    let n = b.len();\n    free(b);\n    return n as i32;\n}\n"
     ),
     entry!(
+        "E0326",
+        "type alias refers to itself",
+        "A `type` alias is replaced by its definition wherever it is used, so an alias that names          itself, directly (`type L = *L;`) or through other aliases (`type A = [B; 2]; type B =          A;`), never finishes expanding. The diagnostic lists the cycle. A recursive data          structure needs a nominal type: declare a struct or enum and refer to it through a          pointer or slice.",
+        bad: "module ex.e0326
+type A = [B; 2];
+type B = A;
+fn main() -> i32 {
+    return 0;
+}
+",
+        good: "module ex.e0326
+type A = [B; 2];
+type B = f32;
+fn main() -> i32 {
+    let a: A = [1.0, 2.0];
+    return a[1] as i32;
+}
+"
+    ),
+    entry!(
+        "E0327",
+        "wrong number or kind of type alias arguments",
+        "A generic alias such as `type Mat<M, N> = Tensor[f32, M, N];` must be given exactly one          argument per parameter (`Mat<4, 8>`), and a type that is not a generic alias takes none          (`f32<2>` or `Point<f32>` is this error). Each argument must also fit where the alias          uses its parameter: a parameter used as a dimension or array length needs an integer, a          name or dimension arithmetic, not a type like `f32`, and a parameter used as a type          cannot be given `?` or `N*2`.",
+        bad: "module ex.e0327
+type Mat<M, N> = Tensor[f32, M, N];
+fn first(a: Mat<4>) -> f32 {
+    return a[0, 0];
+}
+fn main() -> i32 {
+    return 0;
+}
+",
+        good: "module ex.e0327
+type Mat<M, N> = Tensor[f32, M, N];
+fn first(a: Mat<4, 4>) -> f32 {
+    return a[0, 0];
+}
+fn main() -> i32 {
+    return 0;
+}
+"
+    ),
+    entry!(
+        "E0328",
+        "type alias names an unknown type",
+        "The definition of a `type` alias names something that is not a type: not a scalar          (`f32`, `i64`, `bool`, ...), not a struct or enum of the program, not another alias, and          not one of the alias's own parameters. It is reported at the definition even when the          alias is never used, since aliases are expanded before type checking. Check the spelling,          declare the missing parameter (`type Pair<T> = (T, T);`), or import the module that          defines the type.",
+        bad: "module ex.e0328
+type Pair = (T, T);
+fn main() -> i32 {
+    return 0;
+}
+",
+        good: "module ex.e0328
+type Pair<T> = (T, T);
+fn main() -> i32 {
+    let p: Pair<i32> = (1, 2);
+    return p.0 + p.1;
+}
+"
+    ),
+    entry!(
         "E0330",
         "import path differs from the file only in letter case",
         "An `import` names a file that exists, but only under a different capitalization: \

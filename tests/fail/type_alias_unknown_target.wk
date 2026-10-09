@@ -1,0 +1,10 @@
+// EXPECT-CODE: E0328
+module tests.fail.type_alias_unknown_target
+
+// The alias body names `Real`, which is neither a scalar, a struct or enum, another alias, nor a
+// parameter of the alias. It is reported at the definition although nothing uses `Weights`.
+type Weights = [Real; 8];
+
+fn main() -> i32 {
+    return 0;
+}

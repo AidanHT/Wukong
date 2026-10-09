@@ -1,0 +1,127 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0.5
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1.5
+// EXPECT-OUT: 2
+// EXPECT-OUT: 14
+// EXPECT-OUT: 32
+// EXPECT-OUT: 1
+// EXPECT-OUT: 10
+// EXPECT-OUT: 2
+// EXPECT-OUT: 20
+// EXPECT-OUT: 14
+// EXPECT-OUT: 3
+// EXPECT-OUT: 2
+// EXPECT-OUT: 12
+// EXPECT-OUT: 32.5
+// EXPECT-OUT: 21
+// EXPECT-OUT: 7
+// EXPECT-OUT: 1
+module tests.run.type_alias
+
+// `type` aliases (N19): a transparent name for a type, usable wherever a type is written. The
+// driver expands every use before sema, so a kernel over `Mat<M, N>` is exactly the kernel over
+// `Tensor[f32, M, N]`. Covered: a scalar alias, an alias of an alias inside an array, generic
+// aliases over dimensions (`Mat<M, N>`, `Row<N * 2>`) and over a value type plus a length
+// (`Buf<T, N>`, nested as `Buf<Buf<Real, 2>, 3>`), and uses in parameters, returns, `let`
+// annotations, struct fields, casts and `alloc::<Real>`. Every lane is printed; each expected
+// value is worked out in the comment beside it.
+
+type Real = f32;
+type Index = i64;
+type Vec4 = [Real; 4];
+type Mat<M, N> = Tensor[Real, M, N];
+type Row<N> = Tensor[Real, N];
+type Buf<T, N> = [T; N];
+type Twice<N> = [Index; N * 2];
+
+struct Particle {
+    pos: Buf<Real, 2>,
+    mass: Real,
+}
+
+fn scale(v: Vec4, s: Real) -> Vec4 {
+    let mut out: Vec4 = [0.0, 0.0, 0.0, 0.0];
+    for i in 0..4 {
+        out[i] = v[i] * s;
+    }
+    return out;
+}
+
+// y = A x over the aliased shapes; M and N are fixed by the turbofish.
+fn matvec<M, N>(a: Mat<M, N>, x: Row<N>, mut y: Row<M>) {
+    for i in 0..M {
+        let mut acc: Real = 0.0;
+        for j in 0..N {
+            acc = acc + a[i, j] * x[j];
+        }
+        y[i] = acc;
+    }
+}
+
+// A dimension-arithmetic argument: `out` has twice the extent of `a` and `b`.
+fn interleave<N>(a: Row<N>, b: Row<N>, mut out: Row<N * 2>) {
+    for i in 0..N {
+        out[2 * i] = a[i];
+        out[2 * i + 1] = b[i];
+    }
+}
+
+fn momentum(p: Particle) -> Real {
+    return p.mass * (p.pos[0] + p.pos[1]);
+}
+
+fn main() -> i32 {
+    let v: Vec4 = [1.0, 2.0, 3.0, 4.0];
+    let w = scale(v, 0.5);
+    for i in 0..4 {
+        print(w[i]); // 0.5, 1, 1.5, 2
+    }
+
+    let a: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // 2x3, row-major
+    let x: [f32; 3] = [1.0, 2.0, 3.0];
+    let mut y: [f32; 2] = [0.0, 0.0];
+    matvec::<2, 3>(a, x, y);
+    print(y[0]); // 1*1 + 2*2 + 3*3 = 14
+    print(y[1]); // 4*1 + 5*2 + 6*3 = 32
+
+    let ia: [f32; 2] = [1.0, 2.0];
+    let ib: [f32; 2] = [10.0, 20.0];
+    let mut io: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
+    interleave(ia, ib, io);
+    for i in 0..4 {
+        print(io[i]); // 1, 10, 2, 20
+    }
+
+    let p = Particle { pos: [3.0, 4.0], mass: 2.0 };
+    print(momentum(p)); // 2 * (3 + 4) = 14
+
+    let n: Index = 3;
+    let h = alloc::<Real>(n);
+    for i in 0..n {
+        h[i] = (i as Real) * 1.5;
+    }
+    print(h[2]); // 2 * 1.5 = 3
+    free(h);
+
+    let q: Buf<Buf<Real, 2>, 3> = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.5]];
+    for i in 0..3 {
+        print(q[i][0] * q[i][1]); // 1*2 = 2, 3*4 = 12, 5*6.5 = 32.5
+    }
+
+    let t: Twice<3> = [1, 2, 3, 4, 5, 6];
+    let mut s: Index = 0;
+    for i in 0..6 {
+        s = s + t[i];
+    }
+    print(s); // 1+2+3+4+5+6 = 21
+
+    let r = 7.9 as Real as Index;
+    print(r); // truncation toward zero: 7
+    // After a cast to an alias, `<` is still the comparison operator.
+    if 7.9 as Index < 8 {
+        print(1); // 7 < 8
+    }
+    return 0;
+}

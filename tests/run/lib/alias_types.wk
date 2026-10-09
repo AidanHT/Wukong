@@ -1,0 +1,17 @@
+// Imported by tests/run/type_alias_import.wk. A `pub type` crosses the module boundary like any
+// other item (renamed to `lib.alias_types.<name>` and resolved per file); `Hidden` is private, so
+// only this module's own signatures may name it.
+module lib.alias_types
+
+pub type Real64 = f64;
+pub type Pair<T> = (T, T);
+pub type Vec3 = [Real64; 3];
+type Hidden = i32;
+
+pub fn sum3(v: Vec3) -> Real64 {
+    return v[0] + v[1] + v[2];
+}
+
+pub fn twice(x: Hidden) -> Hidden {
+    return x * 2;
+}
