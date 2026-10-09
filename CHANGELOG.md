@@ -22,6 +22,14 @@ All notable changes to Wukong are documented here. The format is loosely based o
 - **Case-exact imports on every host** (`E0330`): `import Util` for a file `util.wk` used to
   compile on Windows and macOS and be `E0305` on Linux; each path component is now compared with
   the directory listing and the diagnostic names the on-disk spelling.
+- **`WUKONG_MAX_ISA`** (`scalar`, `avx2`, `avx2_vnni`, `avx512`) caps the instruction-set level
+  every runtime kernel dispatches to, through the new `wukong_runtime::isa` probes that replace
+  the ~250 scattered `is_x86_feature_detected!` calls; the compiler's raw-AVX2 loop kernels honor
+  it too. CI runs the corpus with `WUKONG_MAX_ISA=scalar`, so the scalar dispatch arms are
+  exercised from compiled programs.
+- **Platform support** is stated (README): Tier 1 x86-64 Windows/Linux, Tier 2 aarch64
+  macOS/Linux/Windows with new non-blocking CI lanes (`macos-14`, `ubuntu-24.04-arm`, an
+  `aarch64-pc-windows-msvc` check).
 
 ### Type soundness and patterns (`gap2/type-soundness-and-patterns`)
 
