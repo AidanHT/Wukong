@@ -13,6 +13,10 @@ All notable changes to Wukong are documented here. The format is loosely based o
   number, 300,000 in every build profile (`WUKONG_INTERP_MAX_DEPTH` overrides it), replacing the
   40,000-debug / 300,000-release constants bisected against the old worker stack. A debug `wukongc`
   used to refuse `sum(123456)` that a release build ran.
+- **The interpreter reuses its memory.** A returning call releases its local arrays, and `free`
+  hands a block to the next `alloc_*` that fits it (re-zeroed with that type's zero), so a decode
+  loop that calls a layer per token or allocates and frees per step no longer grows the oracle's
+  memory without bound (`tests/run/interp_memory_reuse.wk`).
 
 ### AOT executables and platform (`gap2/aot-and-platform`)
 

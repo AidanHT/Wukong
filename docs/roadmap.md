@@ -243,7 +243,8 @@ another architecture or OS is not supported. A native-backend failure is a catal
   to alloc'd memory and allocation identity sound at every `-O` level. Misuse is a compile error
   (non-integer count / freeing a non-slice E0437, arity E0503 — `tests/fail/heap_*.wk`);
   double-free, freeing a non-alloc slice, or use-after-free is **undefined on native** and
-  mark-and-forget (harmless, never a crash) in the interpreter. interp == native bit-for-bit and
+  ignored or harmless (never a crash) in the interpreter, which reuses freed blocks through a
+  size-bucketed free list and releases a frame's allocas when it returns. interp == native bit-for-bit and
   -O0 == -O3 (`tests/run/heap_{alloc,alloc_fn,zero_init,len}.wk`, `differential_heap_alloc`, and
   `heap_alloc.wk` in the linked-exe AOT gate — the rustc link resolves the two runtime symbols
   from the `wukong_runtime` rlib). Loops over alloc'd slices reach the **recognized-kernel** path:

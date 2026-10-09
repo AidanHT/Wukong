@@ -11,7 +11,7 @@
 //! microkernel the native backend links.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use wukong_backend::{Artifact, Backend};
 use wukong_mir::{
     BasicBlock, BinOp, BlockId, CastKind, CmpOp, Function, MirType, Op, Program, Terminator,
@@ -577,6 +577,7 @@ fn run_with_stdout(
         memory: null_reserved_memory(),
         stdout: Vec::new(),
         scratch_arena: ScratchSlots::default(),
+        slots: SlotReuse::default(),
         frames: Vec::new(),
         call_args: Vec::new(),
         scratch: Vec::with_capacity(8),
@@ -617,6 +618,7 @@ pub fn run_with_output_accel(
         memory: null_reserved_memory(),
         stdout: Vec::new(),
         scratch_arena: ScratchSlots::default(),
+        slots: SlotReuse::default(),
         frames: Vec::new(),
         call_args: Vec::new(),
         scratch: Vec::with_capacity(8),
@@ -723,6 +725,7 @@ fn run_kernel_f32_inner(
         memory: null_reserved_memory(),
         stdout: Vec::new(),
         scratch_arena: ScratchSlots::default(),
+        slots: SlotReuse::default(),
         frames: Vec::new(),
         call_args: Vec::new(),
         scratch: Vec::with_capacity(8),
@@ -789,6 +792,7 @@ pub fn run_kernel_f64(
         memory: null_reserved_memory(),
         stdout: Vec::new(),
         scratch_arena: ScratchSlots::default(),
+        slots: SlotReuse::default(),
         frames: Vec::new(),
         call_args: Vec::new(),
         scratch: Vec::with_capacity(8),
@@ -847,6 +851,7 @@ pub fn run_kernel_i8(
         memory: null_reserved_memory(),
         stdout: Vec::new(),
         scratch_arena: ScratchSlots::default(),
+        slots: SlotReuse::default(),
         frames: Vec::new(),
         call_args: Vec::new(),
         scratch: Vec::with_capacity(8),
@@ -897,6 +902,80 @@ struct ScratchSlots {
     free: Vec<Option<(usize, usize)>>,
 }
 
+/// How the run's slot memory ([`Interp::memory`]) is reused — the oracle's counterpart of native
+/// stack frames and of `free`. Without it every call's allocas and every freed heap block stayed
+/// in `memory` for the rest of the run, so a decode loop that calls a layer function per token, or
+/// allocates and frees per step, grew the oracle's memory without bound.
+///
+/// * **Frames.** An `Op::Alloca` pushes its slots at the end of `memory`. When a frame returns its
+///   allocas are dead — an aggregate returns through a caller-allocated sret buffer and an array
+///   parameter is the caller's storage, so only a dangling pointer (undefined natively) could still
+///   reach them — and `memory` is cut back to the frame's entry length, but never below
+///   `persist_floor`: the end of the last growth that was *not* an alloca (a heap or scratch
+///   allocation, a materialized string, a kernel-entry buffer), which must outlive the frame that
+///   made it. Such growth is detected rather than enumerated: between two alloca/release points
+///   `memory` only grows, so a length that differs from `stack_end` there is persistent growth. A
+///   frame that allocates heap memory after its own allocas keeps those allocas until an
+///   enclosing frame releases past them — conservative, never unsound. Re-pushed alloca slots get
+///   their typed defaults again, exactly as fresh ones do.
+/// * **`free`.** A `wukong_rt_alloc` block is recorded with its capacity; `free` moves it to a
+///   size-bucketed free list, and the next allocation that fits a freed block (the smallest
+///   capacity at least the request and at most twice it) takes it back, re-zeroed with the
+///   requested element type's zero — what native's calloc'd bytes decode to. A pointer that is not
+///   a live block (a double free, a stack or sub-slice, null) is ignored, as before; a use after
+///   free reads whatever the block holds now, undefined natively and outside the differential
+///   contract.
+#[derive(Default)]
+struct SlotReuse {
+    /// `memory.len()` as the last alloca or frame release left it.
+    stack_end: usize,
+    /// Slots below this survive every frame release.
+    persist_floor: usize,
+    /// Live `wukong_rt_alloc` blocks: base slot -> capacity in slots.
+    heap_live: HashMap<usize, usize>,
+    /// Freed blocks: capacity -> base slots, most recently freed last.
+    heap_free: BTreeMap<usize, Vec<usize>>,
+}
+
+impl SlotReuse {
+    /// Record any growth of `memory` (now `len` slots) since the last alloca or release as
+    /// persistent.
+    fn note_growth(&mut self, len: usize) {
+        if len != self.stack_end {
+            self.persist_floor = self.persist_floor.max(len);
+            self.stack_end = len;
+        }
+    }
+
+    /// The length `memory` (now `len` slots) is cut back to when a frame entered at `mark` returns.
+    fn release_to(&mut self, mark: usize, len: usize) -> usize {
+        self.note_growth(len);
+        let keep = mark.max(self.persist_floor).min(len);
+        self.stack_end = keep;
+        keep
+    }
+
+    /// Take a freed block that holds `count` slots without wasting more than half of itself.
+    fn take_free(&mut self, count: usize) -> Option<(usize, usize)> {
+        let (&cap, bases) = self.heap_free.range_mut(count..).next()?;
+        if cap > count.saturating_mul(2) {
+            return None;
+        }
+        let base = bases.pop()?;
+        if bases.is_empty() {
+            self.heap_free.remove(&cap);
+        }
+        Some((base, cap))
+    }
+
+    /// `free(base)`: a live block becomes reusable; anything else is ignored.
+    fn free(&mut self, base: usize) {
+        if let Some(cap) = self.heap_live.remove(&base) {
+            self.heap_free.entry(cap).or_default().push(base);
+        }
+    }
+}
+
 struct Interp<'a, 'k> {
     program: &'a Program,
     interner: &'a Interner,
@@ -904,6 +983,8 @@ struct Interp<'a, 'k> {
     stdout: Vec<u8>,
     /// The scratch allocations of this run (see [`ScratchSlots`]).
     scratch_arena: ScratchSlots,
+    /// Frame and `free` reuse of `memory` (see [`SlotReuse`]).
+    slots: SlotReuse,
     /// Recycled register files, one per active call depth. Pooling them keeps recursion and
     /// call-heavy code from allocating a fresh vector on every call.
     frames: Vec<Vec<Value>>,
@@ -978,6 +1059,8 @@ struct Frame<'a> {
     ip: usize,
     /// First [`Interp::vecs`] handle this frame owns (its suffix of the SIMD arena).
     vec_base: usize,
+    /// `memory.len()` at entry: the frame's allocas live at or above it (see [`SlotReuse`]).
+    mem_mark: usize,
     /// Blocks this frame has entered, for the per-frame 100M-step guard.
     steps: u64,
     /// The frame runs a `wukong_parallel_for` body, whose call yields `Unit` whatever it returns.
@@ -1148,12 +1231,14 @@ impl<'a, 'k> Interp<'a, 'k> {
         for (p, &a) in func.params.iter().zip(args) {
             regs[p.0 as usize] = a;
         }
+        self.slots.note_growth(self.memory.len());
         Ok(Frame {
             func,
             regs,
             block: func.entry,
             ip: 0,
             vec_base: self.vecs.len(),
+            mem_mark: self.memory.len(),
             steps: 0,
             unit_result,
         })
@@ -1166,7 +1251,10 @@ impl<'a, 'k> Interp<'a, 'k> {
         result: Result<Value, String>,
     ) -> Result<Value, String> {
         let Frame {
-            mut regs, vec_base, ..
+            mut regs,
+            vec_base,
+            mem_mark,
+            ..
         } = frame;
         // A callee may return either a borrowed caller handle or one of its own vectors. Move
         // the latter out before reclaiming the suffix, then promote exactly one owned result.
@@ -1186,6 +1274,9 @@ impl<'a, 'k> Interp<'a, 'k> {
         regs.clear();
         self.frames.push(regs);
         self.depth -= 1;
+        // The frame's allocas are dead: cut `memory` back (see `SlotReuse`).
+        let keep = self.slots.release_to(mem_mark, self.memory.len());
+        self.memory.truncate(keep);
         match returned_lanes {
             Some(lanes) => self.push_vec(lanes),
             None => result,
@@ -1564,11 +1655,14 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
             }
             Op::Alloca { ty, .. } => {
+                self.slots.note_growth(self.memory.len());
                 let idx = self.memory.len();
                 // Reserve every leaf slot of `ty` (recursing into nested arrays so an array of
                 // structs/tuples is fully sized, not one slot per element); the result points at the
-                // first. `gep` then computes `base + index * slot_count(elem)` into this run.
+                // first. `gep` then computes `base + index * slot_count(elem)` into this run. The
+                // frame that executed it releases the slots when it returns (`SlotReuse`).
                 push_defaults(ty, &mut self.memory);
+                self.slots.stack_end = self.memory.len();
                 Value::Ptr(idx)
             }
             // A vector load gathers `n` contiguous scalar slots (memory stays scalar); a scalar
@@ -2237,6 +2331,17 @@ impl<'a, 'k> Interp<'a, 'k> {
                 } else {
                     Value::Int(0)
                 };
+                // A freed block that fits comes back re-zeroed with this request's typed zero
+                // (`SlotReuse`), so an alloc/free-per-step loop runs in bounded memory.
+                if count > 0 {
+                    if let Some((base, cap)) = self.slots.take_free(count) {
+                        if let Some(block) = self.memory.get_mut(base..base + count) {
+                            block.fill(zero);
+                            self.slots.heap_live.insert(base, cap);
+                            return Ok(Value::Ptr(base));
+                        }
+                    }
+                }
                 let idx = self.memory.len();
                 // An explicit ceiling, because `try_reserve` alone is NOT a portable guard. It
                 // checks the RESERVE; the `resize` below is what COMMITS the pages. Windows does
@@ -2259,14 +2364,22 @@ impl<'a, 'k> Interp<'a, 'k> {
                     format!("interpreter heap exhausted allocating {count} element(s)")
                 })?;
                 self.memory.resize(idx + count, zero);
+                if count > 0 {
+                    self.slots.heap_live.insert(idx, count);
+                }
                 Ok(Value::Ptr(idx))
             }
-            // `wukong_rt_free(data)` — mark-and-forget: the interpreter's memory is a run-scoped
-            // arena that is never reclaimed, so free is a no-op here (native releases the real
-            // allocation). Double-free or freeing a non-alloc slice therefore never crashes the
-            // interpreter; a use-after-free still reads the old values here while being undefined
-            // on native — such programs are outside the differential contract (documented UB).
-            "wukong_rt_free" => Ok(Value::Unit),
+            // `wukong_rt_free(data)` — a live `wukong_rt_alloc` block joins the size-bucketed free
+            // list the next fitting allocation reuses (`SlotReuse`); native releases the real
+            // allocation. Double-free or freeing a non-alloc slice is ignored, so it never crashes
+            // the interpreter; a use-after-free reads whatever the block holds now while being
+            // undefined on native — such programs are outside the differential contract.
+            "wukong_rt_free" => {
+                if let Some(Value::Ptr(base)) = args.first() {
+                    self.slots.free(*base);
+                }
+                Ok(Value::Unit)
+            }
             // `wukong_rt_scratch_alloc(count, elem_size, elem_is_float) -> ptr` — `scratch_<T>(n)`
             // (the contract is in `wukong_runtime::scratch`). `count` typed-zero slots exactly like
             // `wukong_rt_alloc`, counted as one live scratch allocation — a zero-length one too, as
@@ -5988,6 +6101,7 @@ mod tests {
             memory: Vec::new(),
             stdout: Vec::new(),
             scratch_arena: ScratchSlots::default(),
+            slots: SlotReuse::default(),
             frames: Vec::new(),
             call_args: Vec::new(),
             scratch: Vec::new(),
@@ -6035,6 +6149,7 @@ mod tests {
             memory: Vec::new(),
             stdout: Vec::new(),
             scratch_arena: ScratchSlots::default(),
+            slots: SlotReuse::default(),
             frames: Vec::new(),
             call_args: Vec::new(),
             scratch: Vec::new(),
@@ -6149,6 +6264,7 @@ mod tests {
             memory: Vec::new(),
             stdout: Vec::new(),
             scratch_arena: ScratchSlots::default(),
+            slots: SlotReuse::default(),
             frames: Vec::new(),
             call_args: Vec::new(),
             scratch: Vec::new(),
@@ -6372,6 +6488,7 @@ mod tests {
                                     .collect(),
                                 stdout: Vec::new(),
                                 scratch_arena: ScratchSlots::default(),
+                                slots: SlotReuse::default(),
                                 frames: Vec::new(),
                                 call_args: Vec::new(),
                                 scratch: Vec::new(),
@@ -6843,3 +6960,6 @@ mod scalar_contract_tests;
 
 #[cfg(test)]
 mod runtime_surface_tests;
+
+#[cfg(test)]
+mod slot_reuse_tests;

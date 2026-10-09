@@ -1696,9 +1696,11 @@ into a fixed-size array is not yet checked. A recognized kernel (a loop the comp
 runtime kernel call) runs over the extent the loop names and is not checked against slice lengths.
 
 Freeing anything not returned by `alloc_*`, double-freeing, or touching a slice after `free` is
-**undefined behavior** on the native backend; the interpreter's mark-and-forget model (its
-run-scoped memory is never reclaimed) never crashes on it, but such programs are outside the
-differential contract. Allocation failure is the one place the two backends differ by construction. On
+**undefined behavior** on the native backend; the interpreter ignores a free of anything that
+is not a live `alloc_*` block and never crashes on it, but such programs are outside the
+differential contract. The interpreter reuses a freed block for the next allocation that fits
+it, re-zeroed, and releases a function's local arrays when it returns, so a long decode or
+training loop runs in bounded memory on both backends. Allocation failure is the one place the two backends differ by construction. On
 the native backend a failed (or zero-byte) allocation yields a slice whose data pointer is **null**,
 which must not be dereferenced. The interpreter does not mirror that: a null slice whose length still
 says `n` would only move the failure to the first element access, so it reports `interpreter heap

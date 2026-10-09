@@ -10,6 +10,7 @@ fn interpreter<'a>(program: &'a Program, interner: &'a Interner) -> Interp<'a, '
         memory: Vec::new(),
         stdout: Vec::new(),
         scratch_arena: ScratchSlots::default(),
+        slots: SlotReuse::default(),
         frames: Vec::new(),
         call_args: Vec::new(),
         scratch: Vec::new(),

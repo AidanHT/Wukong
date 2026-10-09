@@ -633,14 +633,19 @@ a field value occupies the slot at its starting byte offset. For example, an eig
 buffer consumes eight `Value` slots, while `[i64; 1]` consumes one. These slots are not packed host
 bytes. `alloca` initializes the MIR storage with typed zeros and returns its first slot index.
 `Gep` strides by `slot_count(elem)`, recursively counting array elements, including aggregate byte
-buffers. The scalar memory arena is run-scoped and never reclaimed; `free` is a no-op.
+buffers. The scalar memory arena is reused (`SlotReuse`): a returning frame cuts it back to its
+entry length, but never below the end of the last growth that was not an alloca (a heap or
+scratch block, a materialized string, a kernel-entry buffer), which is detected rather than
+enumerated; `free` moves a live `alloc_*` block to a size-bucketed free list, and the next
+allocation that fits it (at most twice the request) takes it back re-zeroed with its own typed
+zero. A pointer that is not a live block is ignored.
 
 SIMD vectors live in the `vecs` side arena, and vector stores scatter scalar lanes into memory.
 Each call owns a suffix of that arena. Block boundaries retain register-referenced vectors and
 remap their handles; returns preserve caller-owned handles or promote a newly created vector.
 Errors reclaim the frame's vectors. Nested vector handles are rejected at runtime, preventing
 their escape through scalar storage. This bounds SIMD retention by active frames and MIR size;
-it does not reclaim the separate scalar memory arena or establish SIMD throughput.
+it does not establish SIMD throughput.
 
 Calls are **stackless**: `run_function` keeps an explicit frame stack (function, register file,
 block, instruction index, SIMD-arena watermark, step count), and `exec_frame` runs the top frame
