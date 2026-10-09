@@ -33086,17 +33086,29 @@ mod tests {
 
     #[test]
     fn aggregate_layout_overflow_after_generic_substitution() {
+        // The overflow exists only once `T` is substituted. Sema's per-instance re-check (WS05)
+        // now reports it at the instantiation ("type layout is too large", with a "required by
+        // this instantiation" label); without that pass lowering reports it. Either way it must be
+        // a diagnosed E0401, never an ICE or a silently truncated layout.
         for source in [
             "fn make<T>(a: T) { let t: (T, i32); } fn f(a: [i64;4000000000]) { make(a); }",
             "fn make<T>(a: T) { let t: [[T;4000000000];4000000000]; } fn f(a: i64) { make(a); }",
         ] {
-            let (_, diags, _) = lower(source);
-            assert!(
+            let mut interner = Interner::new();
+            let (module, pdiags) = wukong_parser::parse_module(source, SourceId(0), &mut interner);
+            assert!(pdiags.is_empty(), "parse: {pdiags:?}");
+            let (sema, sdiags) = wukong_sema::check(&module, &interner);
+            let in_sema = sdiags
+                .iter()
+                .any(|d| d.code == Some("E0401") && d.message.contains("layout is too large"));
+            let in_lowering = !in_sema && {
+                assert!(sdiags.iter().all(|d| !d.is_error()), "sema: {sdiags:?}");
+                let (_, diags) = lower_program(&module, &sema, &mut interner);
                 diags
                     .iter()
-                    .any(|d| d.code == Some("E0401") && d.message.contains("aggregate layout")),
-                "{source}: {diags:?}"
-            );
+                    .any(|d| d.code == Some("E0401") && d.message.contains("aggregate layout"))
+            };
+            assert!(in_sema || in_lowering, "{source}: sema {sdiags:?}");
         }
         let (program, diags, _) =
             lower("fn make<T>(a: T) { let t: (T, i32); } fn f(a: [i64;0]) { make(a); }");
