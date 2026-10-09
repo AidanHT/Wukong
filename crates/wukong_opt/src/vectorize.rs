@@ -587,6 +587,11 @@ struct RedPlan {
     /// index)` partials — parts of `ty` for the value, then parts of the index type — and combined
     /// once on the way out by [`emit_arg_combine`].
     arg: Option<(usize, MirType)>,
+    /// A FindLastIV (`if c { last = i }`, [`RedKind::FindLast`]): per-lane partials holding the
+    /// last counter each lane recorded, started one below the vector loop's first counter so that
+    /// "never recorded" is distinguishable from every real one; [`emit_find_last_combine`] folds
+    /// them on the way out. Always with [`Self::vector_acc`] and a [`Self::guard`].
+    find_last: bool,
 }
 
 /// One pair of bases the vector loop is only legal over if they are equal or disjoint.
@@ -869,6 +874,12 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
         .filter_map(|r| r.arg)
         .filter(|a| a.index == iv.value)
         .map(|a| a.merge.0)
+        .chain(
+            l.reductions
+                .iter()
+                .filter(|r| r.kind == RedKind::FindLast && r.combine == iv.value)
+                .filter_map(|r| r.merge.map(|m| m.0)),
+        )
         .collect();
     let iv_value_use = classify_iv_uses(f, &lin, iv.value, &arg_merges)
         .ok_or("the induction variable is used for something other than addressing")?;
@@ -2214,7 +2225,10 @@ fn plan_body(
             );
             (a, left_is_acc)
         });
-        red_of.insert(r.combine.0);
+        // A FindLast's "combine" is the counter itself, which is not an instruction of the body.
+        if r.kind != RedKind::FindLast {
+            red_of.insert(r.combine.0);
+        }
         if let Some(s) = r.select {
             red_cmp.insert(s.cmp.0);
         }
@@ -2271,7 +2285,13 @@ fn plan_body(
                 Some((a.param_index, f.value_type(a.param).clone()))
             }
         };
+        // FindLastIV records this loop's own counter; any other induction variable stays scalar.
+        let find_last = r.kind == RedKind::FindLast;
+        if find_last && (r.combine != ramp.iv || guard.is_none()) {
+            return None;
+        }
         let vector_acc = arg.is_some()
+            || find_last
             || (r.reassociable
                 && r.addend.is_some()
                 && red_identity(r.kind, &ty).is_some()
@@ -2286,6 +2306,7 @@ fn plan_body(
             ty,
             vector_acc,
             arg,
+            find_last,
         });
     }
 
@@ -2849,6 +2870,8 @@ fn plan_body(
             }
         }
         match (r.addend, r.fma_factors) {
+            // A FindLast's addend is the counter, which it reads through the lane ramp.
+            _ if r.find_last => {}
             (Some((a, _)), None) => {
                 // Never the induction variable's address face, nor anything computed from it while
                 // it was uniform: those are one scalar for the group but differ per lane.
@@ -2875,7 +2898,7 @@ fn plan_body(
         }
     }
     // An argmax's index partials are updated from the counter's lane ramp.
-    let ramp_vector = ramp_vector || reductions.iter().any(|r| r.arg.is_some());
+    let ramp_vector = ramp_vector || reductions.iter().any(|r| r.arg.is_some() || r.find_last);
     Some(BodyPlan {
         plans,
         vector_ty,
@@ -3363,6 +3386,17 @@ fn apply(f: &mut Function, p: &VecPlan) {
             }
             continue;
         }
+        if r.find_last {
+            // One below the first counter: no lane can record it, since every recorded counter lies
+            // in `start .. start + n_vec` (wrapping arithmetic keeps that true at the type's ends).
+            let one = e.int(guard, &r.ty, 1);
+            let below = e.push(guard, r.ty.clone(), Op::Bin(BinOp::Sub, start, one));
+            let none = e.push(guard, part_ty(&r.ty), Op::Splat(below));
+            for _ in 0..parts_of(&r.ty, p.w) {
+                guard_args.push(none);
+            }
+            continue;
+        }
         let id = red_identity(r.kind, &r.ty).expect("vector_acc implies an identity");
         let scalar = e.push(guard, r.ty.clone(), Op::ConstInt(id as i128, r.ty.clone()));
         let identity = e.push(guard, part_ty(&r.ty), Op::Splat(scalar));
@@ -3413,6 +3447,12 @@ fn apply(f: &mut Function, p: &VecPlan) {
             let (m, at) = emit_arg_combine(&mut e, vx, r, ity, &parts, &at_parts, start);
             exit_args[r.param_index] = m;
             exit_args[*ai] = at;
+            continue;
+        }
+        if r.find_last {
+            let prior = exit_args[r.param_index];
+            exit_args[r.param_index] =
+                emit_find_last_combine(&mut e, vx, &r.ty, &parts, start, prior);
             continue;
         }
         let mut vec = parts[0];
@@ -4093,6 +4133,26 @@ fn emit_body(
             }
             continue;
         }
+        if r.find_last {
+            // Lane `k` keeps the counter of the last iteration in its sub-sequence whose condition
+            // held: the scalar merge, with the counter's lane ramp as the recorded value.
+            let n = parts_of(&r.ty, p.w);
+            let first = header_len + vacc_next.len();
+            let cur = vh_params[first..first + n].to_vec();
+            let (cond, on_true) = r.guard.expect("a FindLast is a guarded reduction");
+            let mask = mask_for(e, vb, &map, cond, &r.ty);
+            let ramp = ramp.as_ref().expect("a FindLast builds the lane ramp");
+            let pty = part_ty(&r.ty);
+            for k in 0..n {
+                let (a, b) = if on_true {
+                    (ramp[k], cur[k])
+                } else {
+                    (cur[k], ramp[k])
+                };
+                vacc_next.push(e.push(vb, pty.clone(), Op::Select(mask[k], a, b)));
+            }
+            continue;
+        }
         if r.vector_acc {
             let n = parts_of(&r.ty, p.w);
             let first = header_len + vacc_next.len();
@@ -4308,6 +4368,47 @@ fn emit_arg_combine(
         at = e.push(vx, ity.clone(), Op::Select(take, ak, at));
     }
     (m, at)
+}
+
+/// Combine a FindLastIV's per-lane partials into the scalar `last` — once, in the vector exit.
+///
+/// Every lane started at `start - 1` and records only counters of the vector loop's own
+/// iterations, `start .. start + n_vec`. Shifted by one more, `q = at - (start - 1)` (wrapping) is
+/// `0` for a lane that recorded nothing and `j + 1` for one whose last record was iteration
+/// `start + j` — so the unsigned maximum of `q` over the lanes is the latest iteration any lane
+/// recorded, exactly the scalar loop's last record. `q == 0` everywhere means nothing was
+/// recorded, and the scalar value from before the loop (`prior`) stands — which is also what the
+/// scalar loop holds. No compare ever sees the start value against a recorded counter.
+fn emit_find_last_combine(
+    e: &mut Emit<'_>,
+    vx: BlockId,
+    ty: &MirType,
+    parts: &[ValueId],
+    start: ValueId,
+    prior: ValueId,
+) -> ValueId {
+    let one = e.int(vx, ty, 1);
+    let below = e.push(vx, ty.clone(), Op::Bin(BinOp::Sub, start, one));
+    let per = lanes_of(ty).expect("a widened lane type");
+    let mut best: Option<ValueId> = None;
+    for &q in parts {
+        for k in 0..per {
+            let at = e.push(vx, ty.clone(), Op::ExtractLane(q, k));
+            let off = e.push(vx, ty.clone(), Op::Bin(BinOp::Sub, at, below));
+            best = Some(match best {
+                None => off,
+                Some(b) => {
+                    let later = e.push(vx, MirType::I1, Op::Cmp(CmpOp::Ugt, off, b));
+                    e.push(vx, ty.clone(), Op::Select(later, off, b))
+                }
+            });
+        }
+    }
+    let best = best.expect("at least one lane");
+    let zero = e.int(vx, ty, 0);
+    let found = e.push(vx, MirType::I1, Op::Cmp(CmpOp::Ne, best, zero));
+    let last = e.push(vx, ty.clone(), Op::Bin(BinOp::Add, below, best));
+    e.push(vx, ty.clone(), Op::Select(found, last, prior))
 }
 
 fn fold_lanes(
@@ -6093,6 +6194,38 @@ mod tests {
                if 1.0 / v < 0.0 {{ print(-1); }} else {{ print((v * 4.0) as i64); }} \
                n = n + 1; }} \
              free(x); free(o); return 0; }}"
+        ));
+    }
+
+    /// FindLastIV (`if c { last = i }`): per-lane "last counter" partials folded by iteration
+    /// order. A one-hot hit at every position of a 13-element buffer (every lane of every group,
+    /// and the epilogue), no hit, and a start value equal to a real index — on both arms.
+    #[test]
+    fn a_find_last_index_widens_and_agrees() {
+        let k = "@unchecked fn k(x: []f32, n: i64, init: i64) -> i64 { let mut last: i64 = init; \
+                 let mut i: i64 = 0; \
+                 while i < n { if x[i] > 0.5 { last = i; } i = i + 1; } return last; } \
+                 @unchecked fn e(x: []f32, n: i64) -> i64 { let mut last: i64 = -1; \
+                 let mut i: i64 = 0; \
+                 while i < n { if x[i] > 0.5 { } else { last = i; } i = i + 1; } return last; }";
+        let shape = format!("{k} fn main() -> i32 {{ return 0; }}");
+        assert!(
+            is_widened(&shape, "k"),
+            "a FindLast keeps per-lane partials"
+        );
+        assert!(has_vector_accumulator(&shape, "k"));
+        assert!(is_widened(&shape, "e"), "so does its else-arm spelling");
+        scalar_and_vector_agree(&format!(
+            "{k} fn main() -> i32 {{ let mut x: []f32 = alloc_f32(13); \
+             let mut p: i64 = 0; \
+             while p <= 13 {{ let mut j: i64 = 0; \
+               while j < 13 {{ x[j] = 0.0; j = j + 1; }} \
+               if p < 13 {{ x[p] = 1.0; }} \
+               let mut n: i64 = 0; \
+               while n <= 13 {{ print(k(x, n, -1)); print(k(x, n, 5)); print(e(x, n)); \
+                 n = n + 1; }} \
+               p = p + 1; }} \
+             free(x); return 0; }}"
         ));
     }
 

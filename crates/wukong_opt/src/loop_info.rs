@@ -631,6 +631,11 @@ pub enum RedKind {
     UMin,
     FMax,
     FMin,
+    /// **FindLastIV**: `if c { last = i }` — the counter of the last iteration whose condition held,
+    /// or the start value when none did. Always a guarded reduction ([`Reduction::merge`]), its
+    /// [`Reduction::combine`] and [`Reduction::addend`] both the induction variable it records.
+    /// Not reassociable: which lane wins is decided by iteration order, not by an operator.
+    FindLast,
 }
 
 impl RedKind {
@@ -663,6 +668,7 @@ impl RedKind {
                 | RedKind::FMin
                 | RedKind::Sub
                 | RedKind::FSub
+                | RedKind::FindLast
         )
     }
 
@@ -683,6 +689,7 @@ impl RedKind {
             RedKind::UMin => "umin",
             RedKind::FMax => "fmax",
             RedKind::FMin => "fmin",
+            RedKind::FindLast => "findlast",
         }
     }
 }
@@ -1984,7 +1991,61 @@ fn classify_carried(
             }
         }
     }
+    // FindLastIV: `if c { last = i }` — a parameter passed through on one arm and replaced by an
+    // induction variable on the other, read nowhere else, so no partial is ever observed. Tried
+    // after the pairs: an argmax's index alone has exactly this shape, but its branch also moves
+    // the maximum, and only the pair is a reduction.
+    for (k, c) in carried.iter_mut().enumerate() {
+        if c.kind != Carried::Recurrence {
+            continue;
+        }
+        if let Some(r) = latch_arg(f, l, k).and_then(|n| find_last_of(ctx, l, ivs, c.param, k, n)) {
+            reductions.push(r);
+            c.kind = Carried::Reduction(reductions.len() - 1);
+        }
+    }
     (carried, reductions)
+}
+
+/// FindLastIV: header parameter `p` (at `k`) whose latch value `next` merges a basic induction
+/// variable from one arm of a branch with `p` itself from the other. `p` is read only by that
+/// pass-through edge, so the branch condition cannot depend on it.
+fn find_last_of(
+    ctx: &LoopCtx<'_>,
+    l: &NaturalLoop,
+    ivs: &[InductionVar],
+    p: ValueId,
+    k: usize,
+    next: ValueId,
+) -> Option<Reduction> {
+    let f = ctx.f;
+    let bm = branch_merge(ctx, l, next)?;
+    let index = if bm.else_arg == p && bm.then_arg != p {
+        bm.then_arg
+    } else if bm.then_arg == p && bm.else_arg != p {
+        bm.else_arg
+    } else {
+        return None;
+    };
+    if !ivs.iter().any(|iv| iv.value == index) || f.value_type(index) != f.value_type(p) {
+        return None;
+    }
+    if uses_in_loop(ctx, l, p) != 1 || uses_in_loop(ctx, l, next) != 1 {
+        return None;
+    }
+    Some(Reduction {
+        param: p,
+        param_index: k,
+        start: entry_arg(f, l, k),
+        kind: RedKind::FindLast,
+        combine: index,
+        addend: Some(index),
+        fma_factors: None,
+        reassociable: false,
+        select: None,
+        merge: Some(next),
+        arg: None,
+    })
 }
 
 /// An argmax/argmin: `if x > m { m = x; at = i; }` — header parameter `m` (at `km`, passed back as
@@ -3794,6 +3855,31 @@ mod tests {
             Carried::Reduction(0)
         ));
         assert!(l.is_vectorizable_shape());
+    }
+
+    /// `if c { last = i }` is a FindLastIV: a guarded reduction whose recorded value is the
+    /// counter. Read anywhere else (here, stored every iteration) it observes a partial and stays
+    /// a recurrence.
+    #[test]
+    fn a_last_matching_index_is_a_find_last_reduction() {
+        let src = "@unchecked fn k(x: []f32, n: i64) -> i64 { let mut last: i64 = -1; \
+                   let mut i: i64 = 0; \
+                   while i < n { if x[i] > 0.5 { last = i; } i = i + 1; } return last; } \
+                   fn main() -> i32 { return 0; }";
+        let (_, l) = kernel_loop(src, "k");
+        assert_eq!(l.reductions.len(), 1, "{:?}", l.carried);
+        let r = &l.reductions[0];
+        assert_eq!(r.kind, RedKind::FindLast);
+        assert!(!r.reassociable);
+        assert_eq!(r.combine, l.primary().expect("a counter").value);
+        assert!(r.merge.is_some());
+        let observed = "@unchecked fn k(x: []f32, mut o: []i64, n: i64) -> i64 { \
+                        let mut last: i64 = -1; let mut i: i64 = 0; \
+                        while i < n { o[i] = last; if x[i] > 0.5 { last = i; } i = i + 1; } \
+                        return last; } \
+                        fn main() -> i32 { return 0; }";
+        let (_, l) = kernel_loop(observed, "k");
+        assert!(l.reductions.is_empty(), "{:?}", l.carried);
     }
 
     /// The same pair with the index ALSO read elsewhere (a store of the running index) observes a
