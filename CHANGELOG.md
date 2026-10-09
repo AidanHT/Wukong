@@ -5,6 +5,18 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Loop nests: unroll-and-jam (`gap2/vec-control-2`)
+
+- **Nests whose inner loop carries a chain run four rows at once.** A two-deep nest whose inner loop
+  carries a recurrence (`h = a*h + x[r, t]`, an IIR filter, a running hash) or a reduction the
+  compiler may not reassociate (a strict-order float column sum) is unrolled and jammed at `-O2`:
+  four outer iterations run side by side as four independent chains, each computing exactly the
+  values the scalar loop computes, with the original nest as the remainder. It applies when every
+  stored array is split into per-row slabs (row-major `x[r*P + t]`, symbolic tensor shapes
+  included, or time-major `x[t*D + d]`), arrays that may alias are range-checked once before the
+  nest, and the nest neither calls, allocates nor divides by a value that could trap.
+  `WUKONG_NO_UNROLL_JAM=1` turns it off; the speed-up is not yet measured.
+
 ### AOT executables and platform (`gap2/aot-and-platform`)
 
 - **The executable's exit code and stack match `--run`.** An object's C `main` is now synthesized:

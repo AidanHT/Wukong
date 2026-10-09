@@ -539,9 +539,13 @@ another architecture or OS is not supported. A native-backend failure is a catal
   loop's own compare/select, so NaN and `±0` behave exactly as in the scalar loop
   (`tests/run/vectorized_{minmax,guarded}_reductions.wk` print every prefix answer). Still scalar:
   argmax / find-index loops (a branch that also records the index), early-exit search loops,
-  `if`/`else if` chains and one-armed stores (no masked memory ops yet), and loop nests whose inner
-  loop carries a recurrence (no unroll-and-jam). A loop needing more than eight runtime alias checks
-  stays scalar.
+  `if`/`else if` chains and one-armed stores (no masked memory ops yet). A loop needing more than
+  eight runtime alias checks stays scalar. A two-deep nest whose inner loop carries a recurrence or
+  a strict-order reduction (an EMA or IIR per row, a hash, a column sum) is **unrolled and jammed**
+  instead: four rows run side by side as four independent chains, each bit-identical to the scalar
+  loop, when the rows provably touch disjoint memory (`tests/run/unroll_jam_nests.wk`). Its speed-up
+  is not yet measured; deeper nests, triangular inner bounds and a nest whose inner loop the
+  bounds-check versioning split stay as written.
 - **FMA contraction**: a float `x + y*z` becomes one fused multiply-add (`Op::Fma`, a hardware
   `vfmadd`), on both the scalar and vector paths; the interpreter mirrors it with `mul_add`, so the
   two backends stay bit-identical.
