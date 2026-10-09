@@ -669,7 +669,7 @@ pub unsafe extern "C" fn wukong_reduce_bf16(x: *const u16, n: i64, op: i64) -> f
     }
     let x = std::slice::from_raw_parts(x, n as usize);
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") {
+    if crate::isa::avx2() {
         return reduce_minmax_bf16_avx(op, x);
     }
     reduce_minmax_scalar(Half::Bf16, op, x)
@@ -690,7 +690,7 @@ pub unsafe extern "C" fn wukong_reduce_f16(x: *const u16, n: i64, op: i64) -> f3
     }
     let x = std::slice::from_raw_parts(x, n as usize);
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("f16c") && is_x86_feature_detected!("avx") {
+    if crate::isa::f16c() && crate::isa::avx() {
         return reduce_minmax_f16_avx(op, x);
     }
     reduce_minmax_scalar(Half::F16, op, x)
@@ -711,7 +711,7 @@ pub unsafe extern "C" fn wukong_sum_f16(x: *const u16, n: i64) -> f32 {
     }
     let x = std::slice::from_raw_parts(x, n as usize);
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("f16c") && is_x86_feature_detected!("avx") {
+    if crate::isa::f16c() && crate::isa::avx() {
         return sum_f16_avx(x);
     }
     sum_scalar_f16(x)
@@ -730,7 +730,7 @@ pub unsafe extern "C" fn wukong_sum_bf16(x: *const u16, n: i64) -> f32 {
     }
     let x = std::slice::from_raw_parts(x, n as usize);
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") {
+    if crate::isa::avx2() {
         return sum_bf16_avx(x);
     }
     sum_scalar_bf16(x)
@@ -750,7 +750,7 @@ pub unsafe extern "C" fn wukong_dot_f16(x: *const u16, y: *const u16, n: i64) ->
     let x = std::slice::from_raw_parts(x, n as usize);
     let y = std::slice::from_raw_parts(y, n as usize);
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("f16c") && is_x86_feature_detected!("fma") {
+    if crate::isa::f16c() && crate::isa::fma() {
         return dot_f16_avx(x, y);
     }
     dot_scalar_f16(x, y)
@@ -770,7 +770,7 @@ pub unsafe extern "C" fn wukong_dot_bf16(x: *const u16, y: *const u16, n: i64) -
     let x = std::slice::from_raw_parts(x, n as usize);
     let y = std::slice::from_raw_parts(y, n as usize);
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+    if crate::isa::avx2() && crate::isa::fma() {
         return dot_bf16_avx(x, y);
     }
     dot_scalar_bf16(x, y)
@@ -874,7 +874,7 @@ pub unsafe extern "C" fn wukong_sum_bf16_parallel(x: *const u16, n: i64) -> f32 
     }
     let x = std::slice::from_raw_parts(x, n as usize);
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") {
+    if crate::isa::avx2() {
         // SAFETY: feature detected once; borrowed chunks are read-only valid subslices.
         return par_half_reduce(x, 0.0, |chunk| sum_bf16_avx(chunk), |a, b| a + b);
     }
@@ -894,7 +894,7 @@ pub unsafe extern "C" fn wukong_sum_f16_parallel(x: *const u16, n: i64) -> f32 {
     }
     let x = std::slice::from_raw_parts(x, n as usize);
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("f16c") && is_x86_feature_detected!("avx") {
+    if crate::isa::f16c() && crate::isa::avx() {
         // SAFETY: features detected once; borrowed chunks are read-only valid subslices.
         return par_half_reduce(x, 0.0, |chunk| sum_f16_avx(chunk), |a, b| a + b);
     }
@@ -915,7 +915,7 @@ pub unsafe extern "C" fn wukong_dot_bf16_parallel(x: *const u16, y: *const u16, 
     let x = std::slice::from_raw_parts(x, n as usize);
     let y = std::slice::from_raw_parts(y, n as usize);
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+    if crate::isa::avx2() && crate::isa::fma() {
         // SAFETY: features detected once; x/y may overlap because both are read-only.
         return par_half_dot(x, y, |xc, yc| dot_bf16_avx(xc, yc));
     }
@@ -936,7 +936,7 @@ pub unsafe extern "C" fn wukong_dot_f16_parallel(x: *const u16, y: *const u16, n
     let x = std::slice::from_raw_parts(x, n as usize);
     let y = std::slice::from_raw_parts(y, n as usize);
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("f16c") && is_x86_feature_detected!("fma") {
+    if crate::isa::f16c() && crate::isa::fma() {
         // SAFETY: features detected once; x/y may overlap because both are read-only.
         return par_half_dot(x, y, |xc, yc| dot_f16_avx(xc, yc));
     }
@@ -958,7 +958,7 @@ pub unsafe extern "C" fn wukong_reduce_bf16_parallel(x: *const u16, n: i64, op: 
     }
     let x = std::slice::from_raw_parts(x, n as usize);
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") {
+    if crate::isa::avx2() {
         // Keep the same operand order within each kernel and in the ordered partial fold.
         return par_half_reduce(
             x,
@@ -988,7 +988,7 @@ pub unsafe extern "C" fn wukong_reduce_f16_parallel(x: *const u16, n: i64, op: i
     }
     let x = std::slice::from_raw_parts(x, n as usize);
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("f16c") && is_x86_feature_detected!("avx") {
+    if crate::isa::f16c() && crate::isa::avx() {
         // Keep the same operand order within each kernel and in the ordered partial fold.
         return par_half_reduce(
             x,
@@ -1098,7 +1098,7 @@ pub unsafe extern "C" fn wukong_axpby_bf16(
     let y = std::slice::from_raw_parts(y, n);
     let out = std::slice::from_raw_parts_mut(out, n);
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+    if crate::isa::avx2() && crate::isa::fma() {
         return axpby_bf16_avx(x, y, out, a, b);
     }
     axpby_bf16_scalar(Half::Bf16, x, y, out, a, b);
@@ -1154,10 +1154,7 @@ pub unsafe extern "C" fn wukong_axpby_f16(
     let y = std::slice::from_raw_parts(y, n);
     let out = std::slice::from_raw_parts_mut(out, n);
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("f16c")
-        && is_x86_feature_detected!("avx2")
-        && is_x86_feature_detected!("fma")
-    {
+    if crate::isa::f16c() && crate::isa::avx2() && crate::isa::fma() {
         return axpby_f16_avx(x, y, out, a, b);
     }
     axpby_bf16_scalar(Half::F16, x, y, out, a, b);
@@ -1489,7 +1486,7 @@ pub unsafe extern "C" fn wukong_axpby_bf16_out(
         return axpby_narrow_scalar(Half::Bf16, x, y, out, n, a, b);
     }
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+    if crate::isa::avx2() && crate::isa::fma() {
         return axpby_narrow_bf16_avx(x, y, out, n, a, b);
     }
     axpby_narrow_scalar(Half::Bf16, x, y, out, n, a, b);
@@ -1520,10 +1517,7 @@ pub unsafe extern "C" fn wukong_axpby_f16_out(
         return axpby_narrow_scalar(Half::F16, x, y, out, n, a, b);
     }
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("f16c")
-        && is_x86_feature_detected!("avx2")
-        && is_x86_feature_detected!("fma")
-    {
+    if crate::isa::f16c() && crate::isa::avx2() && crate::isa::fma() {
         return axpby_narrow_f16_avx(x, y, out, n, a, b);
     }
     axpby_narrow_scalar(Half::F16, x, y, out, n, a, b);
@@ -1552,7 +1546,7 @@ pub unsafe extern "C" fn wukong_vmath_bf16_out(x: *const u16, out: *mut u16, n: 
         return vmath_narrow_scalar(Half::Bf16, x, out, n, op);
     }
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+    if crate::isa::avx2() && crate::isa::fma() {
         return vmath_narrow_bf16_avx(x, out, n, op);
     }
     vmath_narrow_scalar(Half::Bf16, x, out, n, op);
@@ -1576,10 +1570,7 @@ pub unsafe extern "C" fn wukong_vmath_f16_out(x: *const u16, out: *mut u16, n: i
         return vmath_narrow_scalar(Half::F16, x, out, n, op);
     }
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("f16c")
-        && is_x86_feature_detected!("avx2")
-        && is_x86_feature_detected!("fma")
-    {
+    if crate::isa::f16c() && crate::isa::avx2() && crate::isa::fma() {
         return vmath_narrow_f16_avx(x, out, n, op);
     }
     vmath_narrow_scalar(Half::F16, x, out, n, op);
@@ -1621,10 +1612,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn nt_alignment_narrow_peel() {
-        if !(is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("fma")
-            && is_x86_feature_detected!("f16c"))
-        {
+        if !(crate::isa::avx2() && crate::isa::fma() && crate::isa::f16c()) {
             return;
         }
         let n = crate::nt_policy::test_min_bytes() / 6 + 35;
@@ -1991,7 +1979,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn narrow_simd_equals_scalar_shim() {
-        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("f16c") {
+        if !crate::isa::avx2() || !crate::isa::f16c() {
             return;
         }
         // A spread of tricky f32s: 0/±0, small/large, subnormal, ties, ±inf, NaN, negatives.

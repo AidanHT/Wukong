@@ -323,7 +323,7 @@ unsafe fn pool_channel(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
+        if crate::isa::avx2() {
             if sw == 1 {
                 pool_channel_avx2_sw1(xc, oc, w, oh, ow, kh, kw, sh, kind);
                 return;
@@ -764,7 +764,7 @@ mod tests {
                                 PoolKind::Max,
                             );
                             #[cfg(target_arch = "x86_64")]
-                            if is_x86_feature_detected!("avx2") && sw <= 2 {
+                            if crate::isa::avx2() && sw <= 2 {
                                 let f = if sw == 1 {
                                     pool_channel_avx2_sw1
                                 } else {
@@ -904,7 +904,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn pool2d_sw2_avx2_matches_scalar() {
-        if !is_x86_feature_detected!("avx2") {
+        if !crate::isa::avx2() {
             eprintln!("AVX2 not available; skipping pool2d_sw2_avx2_matches_scalar");
             return;
         }

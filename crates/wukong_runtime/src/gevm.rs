@@ -132,7 +132,7 @@ unsafe fn gevm_range(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if crate::isa::avx2() && crate::isa::fma() {
             gevm_avx2(w, a, out, rows, cols, j0, j1, alpha);
             return;
         }

@@ -205,7 +205,7 @@ unsafe fn xent_bwd_row_avx2(x: *const f32, target: usize, dx: *mut f32, n: usize
 unsafe fn xent_bwd_row(x: *const f32, target: usize, dx: *mut f32, n: usize) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if crate::isa::avx2() && crate::isa::fma() {
             return xent_bwd_row_avx2(x, target, dx, n);
         }
     }
@@ -316,7 +316,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn scalar_matches_avx2_bit_for_bit() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return;
         }
         // Sizes exercising the 8-lane body, non-multiple-of-8 tails, and rows shorter than 8.
@@ -545,7 +545,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn nan_logit_keeps_scalar_and_avx2_in_agreement() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return;
         }
         for &cols in &[9usize, 16, 17, 33, 64] {

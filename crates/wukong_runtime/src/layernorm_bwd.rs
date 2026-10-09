@@ -464,7 +464,7 @@ unsafe fn layernorm_bwd_row(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if crate::isa::avx2() && crate::isa::fma() {
             let (mean, rstd, s1c, s2c) = stats_row_avx2(x, dy, gamma, n, eps);
             apply_row_avx2(x, dy, gamma, dx, n, mean, rstd, s1c, s2c);
             return;
@@ -737,7 +737,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn scalar_matches_avx2_bit_for_bit() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return;
         }
         // Sizes exercising every seam the two blockings introduce: rows shorter than 8, a ragged
@@ -834,7 +834,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn scalar_matches_avx2_on_nan_and_signed_zero_rows() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return;
         }
         for &n in &[8usize, 33, 40, 64, 96, 100, 129] {

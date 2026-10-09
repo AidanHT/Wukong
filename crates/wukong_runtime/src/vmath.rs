@@ -1051,7 +1051,7 @@ pub unsafe extern "C" fn wukong_vmath_f32(x: *const f32, out: *mut f32, n: i64, 
     let n = n as usize;
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if crate::isa::avx2() && crate::isa::fma() {
             // SAFETY: features detected; buffers valid for n by the caller contract.
             unsafe { vmath_avx2(x, out, n, op, vmath_unroll6()) };
             return;
@@ -1985,7 +1985,7 @@ pub unsafe extern "C" fn wukong_vmath2_f32(
     let n = n as usize;
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if crate::isa::avx2() && crate::isa::fma() {
             // SAFETY: features detected; buffers valid for n by the caller contract.
             unsafe { vmath2_avx2(x, y, out, n, op) };
             return;
@@ -2133,7 +2133,7 @@ pub unsafe extern "C" fn wukong_vmath_bf16(x: *const u16, out: *mut f32, n: i64,
     }
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if crate::isa::avx2() && crate::isa::fma() {
             // SAFETY: features detected; buffers valid for n by the caller contract.
             unsafe { vmath_bf16_avx2(x, out, n, op) };
             return;
@@ -2229,10 +2229,7 @@ pub unsafe extern "C" fn wukong_vmath_f16(x: *const u16, out: *mut f32, n: i64, 
     }
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("f16c")
-            && is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("fma")
-        {
+        if crate::isa::f16c() && crate::isa::avx2() && crate::isa::fma() {
             // SAFETY: features detected; buffers valid for n by the caller contract.
             unsafe { vmath_f16_avx2(x, out, n, op) };
             return;
@@ -2977,7 +2974,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn nt_alignment_unary_and_binary_peels() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return;
         }
         let n = crate::nt_policy::test_min_bytes() / 8 + 35;
@@ -4325,7 +4322,7 @@ mod tests {
             "exhaustive sweep — rebuild with --release (cargo test -p wukong_runtime --release \
              vmath_tanh_exhaustive -- --ignored --nocapture)"
         );
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             eprintln!("no avx2+fma — the lane paths are unreachable, nothing to sweep");
             return;
         }
@@ -4458,7 +4455,7 @@ mod tests {
             "exhaustive sweep — rebuild with --release (cargo test -p wukong_runtime --release \
              vmath_exp_log_exhaustive -- --ignored --nocapture)"
         );
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             eprintln!("no avx2+fma — the lane paths are unreachable, nothing to sweep");
             return;
         }
@@ -5235,7 +5232,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn vmath_unroll6_body_matches_the_shipped_x4_body() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return; // no AVX2: neither body is reachable, and the scalar twin is gated elsewhere
         }
         for n in [1usize, 7, 8, 31, 32, 47, 48, 49, 55, 95, 96, 143, 1001] {
@@ -5466,7 +5463,7 @@ mod tests {
             "this is a throughput measurement, not a test — rebuild with --release \
              (cargo test -p wukong_runtime --release vmath_exp_log_vs_vml -- --ignored --nocapture)"
         );
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             eprintln!("no avx2+fma — nothing to measure");
             return;
         }
@@ -5851,7 +5848,7 @@ mod tests {
             !cfg!(debug_assertions),
             "this is a throughput measurement, not a test — rebuild with --release"
         );
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             eprintln!("no avx2+fma — nothing to measure");
             return;
         }
@@ -5973,7 +5970,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn vmath_monomorphized_dispatch_matches_the_function_pointer_path() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return; // no AVX2: neither spelling is reachable
         }
         // Every declared code, plus two off-table ones (the `vmath_scalar` fallthrough arm).
@@ -6086,7 +6083,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn vmath2_monomorphized_dispatch_matches_the_function_pointer_path() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return; // no AVX2: neither spelling is reachable
         }
         let ops: Vec<i64> = (0..=VM2_SIGMOID_GATE)
@@ -6227,7 +6224,7 @@ mod relu_zero_contract_tests {
                     expected
                 );
                 #[cfg(target_arch = "x86_64")]
-                if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                if crate::isa::avx2() && crate::isa::fma() {
                     for unroll6 in [false, true] {
                         out.fill(-99.0);
                         // SAFETY: `out` is refilled to n and the inputs are sized n (unroll variants).

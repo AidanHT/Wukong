@@ -286,7 +286,7 @@ pub unsafe extern "C" fn wukong_dequant_f32(
     let n = n as usize;
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
+        if crate::isa::avx2() {
             // SAFETY: feature detected; buffers valid for n by the caller contract.
             unsafe { dequant_avx2(q, out, n, scale, op) };
             return;
@@ -503,7 +503,7 @@ pub unsafe extern "C" fn wukong_dequant_perchan_f32(
     let in_bytes = if op & DQ_WIDTH_MASK == DQ_I32 { 4 } else { 1 };
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
+        if crate::isa::avx2() {
             let nt = use_nt(rows * cols, in_bytes);
             for i in 0..rows {
                 // SAFETY: row i in bounds; features detected.
@@ -560,7 +560,7 @@ pub unsafe extern "C" fn wukong_dequant_perchan_f32_parallel(
     let in_bytes = if op & DQ_WIDTH_MASK == DQ_I32 { 4 } else { 1 };
     let (qa, oa, sa) = (Addr(q as usize), Addr(out as usize), Addr(scale as usize));
     #[cfg(target_arch = "x86_64")]
-    let avx2 = is_x86_feature_detected!("avx2");
+    let avx2 = crate::isa::avx2();
     #[cfg(target_arch = "x86_64")]
     let nt = use_nt(rows * cols, in_bytes);
     let row = |i: usize| {
@@ -592,7 +592,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn nt_alignment_flat_and_row_peels() {
-        if !is_x86_feature_detected!("avx2") {
+        if !crate::isa::avx2() {
             return;
         }
         let n = crate::nt_policy::test_min_bytes() / 8 + 35;

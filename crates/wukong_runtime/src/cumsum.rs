@@ -134,7 +134,7 @@ unsafe fn cumsum_row_avx2(x: *const f32, out: *mut f32, base: usize, cols: usize
 unsafe fn cumsum_row(x: *const f32, out: *mut f32, base: usize, cols: usize) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
+        if crate::isa::avx2() {
             cumsum_row_avx2(x, out, base, cols);
             return;
         }
@@ -415,7 +415,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn avx2_matches_the_documented_block_recurrence_bit_for_bit() {
-        if !is_x86_feature_detected!("avx2") {
+        if !crate::isa::avx2() {
             return;
         }
         let model = |x: &[f32]| -> Vec<f32> {
@@ -485,7 +485,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn scalar_vs_avx2_lane_shift() {
-        if !is_x86_feature_detected!("avx2") {
+        if !crate::isa::avx2() {
             return;
         }
         use std::arch::x86_64::*;

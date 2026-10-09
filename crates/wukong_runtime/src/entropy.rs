@@ -117,7 +117,7 @@ unsafe fn entropy_row_avx2(p: *const f32, n: usize) -> f32 {
 unsafe fn entropy_row(p: *const f32, n: usize) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if crate::isa::avx2() && crate::isa::fma() {
             return entropy_row_avx2(p, n);
         }
     }
@@ -221,7 +221,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn scalar_matches_avx2_bit_for_bit() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return;
         }
         for &cols in &[1usize, 7, 8, 9, 16, 17, 33, 64, 100, 257, 1000] {

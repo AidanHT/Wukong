@@ -192,7 +192,7 @@ pub(crate) fn hcombine8(a: [f32; 8], op: i64) -> f32 {
 unsafe fn reduce_chunk(x: *const f32, y: *const f32, lo: usize, hi: usize, op: i64) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if crate::isa::avx2() && crate::isa::fma() {
             // SAFETY: features detected; range validity is the caller's contract.
             return unsafe { reduce_chunk_avx2(x, y, lo, hi, op) };
         }
@@ -476,7 +476,7 @@ unsafe fn argreduce_chunk(x: *const f32, lo: usize, hi: usize, is_max: bool) -> 
     {
         // The kernel tracks indices in i32 SIMD lanes; fall back to the scalar twin if a chunk index
         // could exceed i32 (it never does for realistic logit/vocab tensors — RCHUNK·nchunks ≤ n).
-        if is_x86_feature_detected!("avx2") && hi <= i32::MAX as usize {
+        if crate::isa::avx2() && hi <= i32::MAX as usize {
             use std::arch::x86_64::{_CMP_GT_OQ, _CMP_LT_OQ};
             // SAFETY: feature detected; range validity is the caller's contract.
             return if is_max {
@@ -794,7 +794,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn scalar_matches_avx2_bit_for_bit() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return;
         }
         // Every seam of the partition: below one 8-step, the 8-step remainder, the `RBLOCK` = 64
@@ -822,7 +822,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn scalar_matches_avx2_on_nan_and_signed_zero_chunks() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return;
         }
         for &n in &[64usize, 135, 200, 305, 1000] {
@@ -1000,7 +1000,7 @@ mod tests {
         // the DEGENERATE value sets the finite `fill()` data can never reach: a span made entirely of
         // the fold identity (∓∞), of NaN, or of a mix. An all-(-∞) span is a real input class (a
         // fully masked attention/logits row fed to a top-1).
-        if !is_x86_feature_detected!("avx2") {
+        if !crate::isa::avx2() {
             return;
         }
         use std::arch::x86_64::{_CMP_GT_OQ, _CMP_LT_OQ};

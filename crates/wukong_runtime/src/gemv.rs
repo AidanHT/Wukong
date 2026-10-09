@@ -158,7 +158,7 @@ unsafe fn gemv_row_scalar(a: *const f32, x: *const f32, n: usize) -> f32 {
 unsafe fn gemv_row(a: *const f32, x: *const f32, n: usize) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if crate::isa::avx2() && crate::isa::fma() {
             return gemv_row_avx2(a, x, n);
         }
     }
@@ -174,7 +174,7 @@ unsafe fn gemv_rows(a: *const f32, x: *const f32, y: *mut f32, m: usize, n: usiz
     let scale = |s| if alpha != 1.0 { s * alpha } else { s };
     let mut i = 0;
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+    if crate::isa::avx2() && crate::isa::fma() {
         while i + 2 <= m {
             let (s0, s1) = gemv_pair_avx2(a.add(i * n), x, n);
             *y.add(i) = scale(s0);

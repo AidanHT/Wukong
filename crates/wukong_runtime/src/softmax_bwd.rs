@@ -70,7 +70,7 @@ unsafe fn softmax_bwd_row(y: *const f32, dy: *const f32, dx: *mut f32, cols: usi
     let s = wukong_sreduce_f32(y, dy, cols as i64, RED_DOT);
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
+        if crate::isa::avx2() {
             apply_row_avx2(y, dy, dx, cols, s);
             return;
         }

@@ -38,7 +38,7 @@
 unsafe fn copy_row(out_row: *mut f32, weight_row: *const f32, h: usize) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
+        if crate::isa::avx2() {
             copy_row_avx2(out_row, weight_row, h);
             return;
         }
@@ -86,7 +86,7 @@ unsafe fn copy_row_scalar(out_row: *mut f32, weight_row: *const f32, h: usize) {
 unsafe fn zero_row(out_row: *mut f32, h: usize) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
+        if crate::isa::avx2() {
             use std::arch::x86_64::*;
             let z = _mm256_setzero_ps();
             let mut j = 0;

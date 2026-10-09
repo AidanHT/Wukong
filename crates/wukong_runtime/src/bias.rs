@@ -228,7 +228,7 @@ pub unsafe extern "C" fn wukong_bias_bcast_f32(
     let (rows, cols) = (rows as usize, cols as usize);
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if crate::isa::avx2() && crate::isa::fma() {
             // SAFETY: features detected; buffers valid for rows*cols / cols by the caller contract.
             unsafe { bias_avx2(x, b, out, rows, cols, op) };
             return;
@@ -307,7 +307,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn nt_alignment_row_peels() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return;
         }
         let cols = 101usize;
@@ -617,7 +617,7 @@ mod relu_zero_contract_tests {
                 );
             }
             #[cfg(target_arch = "x86_64")]
-            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            if crate::isa::avx2() && crate::isa::fma() {
                 out.fill(-99.0);
                 // SAFETY: AVX2 confirmed by the enclosing feature guard; the buffers are sized rows*cols.
                 unsafe {

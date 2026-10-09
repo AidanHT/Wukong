@@ -887,7 +887,7 @@ unsafe fn gemm_dispatch(
     let par = par && macs >= par_min_macs();
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if crate::isa::avx2() && crate::isa::fma() {
             // SAFETY: features just checked; dims validated by the caller contract.
             unsafe {
                 // Serial calls, including parallel entries below the work threshold, must not
@@ -1189,13 +1189,11 @@ unsafe fn widen_into_f32(src: *const u16, dst: *mut f32, n: usize, kind: HalfKin
     #[cfg(target_arch = "x86_64")]
     {
         match kind {
-            HalfKind::Bf16 if is_x86_feature_detected!("avx2") => {
+            HalfKind::Bf16 if crate::isa::avx2() => {
                 widen_bf16_into_avx2(src, dst, n);
                 return;
             }
-            HalfKind::F16
-                if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("f16c") =>
-            {
+            HalfKind::F16 if crate::isa::avx2() && crate::isa::f16c() => {
                 widen_f16_into_f16c(src, dst, n);
                 return;
             }
@@ -3758,7 +3756,7 @@ unsafe fn micro_6x16(
     // branch is dead code here (and the `&&` short-circuits to a single predicted-not-taken compare on
     // the AVX2 path, after the full-tile checks the AVX2 fast path already makes). On AVX-512 silicon
     // it takes over the hot tiles; the width win is a labelled projection, never measured here.
-    if epi.is_none() && mr == MR && nr == NR && is_x86_feature_detected!("avx512f") {
+    if epi.is_none() && mr == MR && nr == NR && crate::isa::avx512f() {
         micro_6x16_avx512(kc, ap, bp, c, ldc, beta);
         return;
     }
@@ -5126,7 +5124,7 @@ mod tests {
     #[ignore]
     fn sgemm_pool_ab() {
         use std::time::Instant;
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             println!("no avx2/fma — skipping");
             return;
         }
@@ -5192,9 +5190,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn micro_6x16_avx512_twin() {
-        let have = is_x86_feature_detected!("avx512f")
-            && is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("fma");
+        let have = crate::isa::avx512f() && crate::isa::avx2() && crate::isa::fma();
         if !have {
             println!("micro_6x16_avx512_twin: host lacks avx512f — compile-checked, run skipped");
             return;
@@ -5760,7 +5756,7 @@ mod tests {
     /// epilogue bug would apply the bias three times over.
     #[test]
     fn sgemm_persistent_region_matches_serial() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             println!("no avx2/fma — skipping");
             return;
         }
@@ -5902,7 +5898,7 @@ mod tests {
     /// activations, with k > KC.
     #[test]
     fn sgemm_2d_blocks_matches_serial() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             println!("no avx2/fma — skipping");
             return;
         }
@@ -6179,7 +6175,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn sgemm_2d_dyn_matches_serial() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             println!("no avx2/fma — skipping");
             return;
         }
@@ -6378,7 +6374,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn sgemm_2d_dyn_thread_sweep() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             println!("no avx2/fma — skipping");
             return;
         }
@@ -6480,7 +6476,7 @@ mod tests {
     /// through the shared path's phase-2 writeback.
     #[test]
     fn sgemm_2d_shared_matches_serial() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             println!("no avx2/fma — skipping");
             return;
         }
@@ -6967,7 +6963,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn relu_epilogue_vector_fold_matches_the_scalar_fold() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return; // no vector epilogue on this host; the scalar fold is the only one that runs
         }
         // (1) The law: over the one operand pair the GEMM uses (SRC2 = +0.0), MAXPS and
@@ -7151,7 +7147,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn sgemm_scalar_matches_avx2_bit_for_bit() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return; // nothing to compare against: this host runs `sgemm_scalar` for everything
         }
         for &(m, k, n) in &[
@@ -7539,7 +7535,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn pack_b_trans_panel_simd_matches_scalar_twin() {
-        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+        if !crate::isa::avx2() || !crate::isa::fma() {
             return;
         }
         /// The pre-vectorisation packer, verbatim.
@@ -7629,7 +7625,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn pack_a_panel_simd_matches_scalar_twin() {
-        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+        if !crate::isa::avx2() || !crate::isa::fma() {
             return;
         }
         /// The pre-vectorisation packer, verbatim.
@@ -7721,7 +7717,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn fused_b_pack_is_bit_identical_to_the_classic_pack() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return;
         }
         let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
@@ -7921,7 +7917,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn pack_a_transposed_matches_the_pack_of_the_transpose() {
-        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+        if !crate::isa::avx2() || !crate::isa::fma() {
             return;
         }
         let specials = [
@@ -7990,7 +7986,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn tn_direct_pack_matches_nn_on_the_transpose_in_every_schedule() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return;
         }
         let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
@@ -8140,7 +8136,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn gemm_phase_cost() {
         use std::time::Instant;
-        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+        if !crate::isa::avx2() || !crate::isa::fma() {
             return;
         }
         pin_worker_to_cpu(0);

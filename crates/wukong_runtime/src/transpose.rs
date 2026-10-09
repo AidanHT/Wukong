@@ -123,7 +123,7 @@ unsafe fn transpose_rows<T: Copy>(
 /// is a separate feature that Haswell (AVX2, no PRFCHW) does not have, so LLVM lowers it to
 /// **`prefetcht0`** and the release assembly of this function contains 22 `prefetcht0` and zero
 /// `prefetchw`. That is deliberate, not an oversight: emitting `prefetchw` would need its own
-/// `is_x86_feature_detected!("prfchw")` arm or it would be a `#UD` on Haswell, and the plain read
+/// `crate::isa::prfchw()` arm or it would be a `#UD` on Haswell, and the plain read
 /// hint measured within noise of the write hint on this part (worth 2-5%, not worth a second
 /// dispatch). The write intent is kept in the source so that a future `prfchw`-gated arm is a
 /// one-line change.
@@ -418,7 +418,7 @@ unsafe fn transpose_rows_u16(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
+        if crate::isa::avx2() {
             transpose_rows_u16_avx2(src, dst, rows, cols, i0, i1);
             return;
         }
@@ -443,7 +443,7 @@ unsafe fn transpose_rows_f32(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
+        if crate::isa::avx2() {
             transpose_rows_f32_avx2(src, dst, rows, cols, i0, i1);
             return;
         }
@@ -725,7 +725,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn avx2_u16_tile_moves_the_same_bits_as_the_scalar_block() {
-        if !is_x86_feature_detected!("avx2") {
+        if !crate::isa::avx2() {
             return;
         }
         for (r, c) in [
@@ -783,7 +783,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn avx2_tile_moves_the_same_bits_as_the_scalar_block() {
-        if !is_x86_feature_detected!("avx2") {
+        if !crate::isa::avx2() {
             return;
         }
         let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();

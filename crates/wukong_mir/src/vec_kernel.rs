@@ -914,15 +914,35 @@ impl VecKernel {
 /// LANDMINE: `std::is_x86_feature_detected!` only exists on x86/x86-64, so the other arm must be a
 /// plain `false` — do not "simplify" the two `cfg` blocks into one expression. The macro caches its
 /// CPUID probe, so calling this once per vectorizable loop is cheap.
+///
+/// `WUKONG_MAX_ISA` below `avx2` (the runtime's ISA cap, `wukong_runtime::isa`) turns the kernels
+/// off too, so a capped run takes the scalar path in the compiler's loops as well as in the
+/// runtime's dispatchers.
 pub fn host_supports_vec_kernels() -> bool {
     #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
     {
-        std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")
+        isa_cap_allows_avx2()
+            && std::is_x86_feature_detected!("avx2")
+            && std::is_x86_feature_detected!("fma")
     }
     #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
     {
         false
     }
+}
+
+/// Does `WUKONG_MAX_ISA` allow AVX2 code? Mirrors `wukong_runtime::isa::IsaLevel::parse` (this
+/// crate sits beside the runtime, not above it): only the spellings of the `scalar` tier forbid it,
+/// and an unset or unrecognized value is no cap. Read once per process.
+pub fn isa_cap_allows_avx2() -> bool {
+    static ALLOWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ALLOWS.get_or_init(|| match std::env::var("WUKONG_MAX_ISA") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "scalar" | "none" | "baseline"
+        ),
+        Err(_) => true,
+    })
 }
 
 /// Architectural YMM registers a kernel may use.
