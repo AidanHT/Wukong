@@ -153,9 +153,7 @@ fn exe_matches_run() {
         "main_exit_code_wraps.wk",
         "main_returns_f32.wk",
         "main_returns_void.wk",
-        // 30000 nested calls: the exe's `main` runs on the 512 MiB worker `--run` uses, not the
-        // OS main-thread stack (1 MiB on Windows).
-        "deep_recursion_exe.wk",
+        // (The 512 MiB entry stack is `exe_main_runs_on_the_big_stack`, below, not a corpus file.)
         // User functions named `write`/`fmod`/`memcpy` are internal, mangled symbols in an
         // executable, so they neither collide with nor interpose on the C library.
         "libc_name_collision.wk",
@@ -251,6 +249,61 @@ fn exe_matches_run() {
     }
 
     // Best effort: a lingering temp dir must never fail the test.
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// A `main` that recurses 30000 deep must finish as an executable exactly as under `--run`. Both
+/// `--run` backends run the program on a 512 MiB worker; an executable used to run the user's
+/// `main` on the OS main-thread stack (1 MiB on Windows, where a Win64 frame is at least 48 bytes,
+/// so 30000 frames overflow it). The synthesized C `main` now runs it on a 512 MiB worker through
+/// `wukong_rt_run_main`.
+///
+/// The program is written here rather than kept in `tests/run` on purpose: that corpus is also
+/// launched by the gpu-native device gate, where a 30000-deep device call stack faults, and a CUDA
+/// fault is sticky, so one such program would take every later program of that sweep with it.
+/// It needs only `wukong_rt_print_i64`, which both link runtimes provide, so a link failure on
+/// either path is a defect rather than a skip.
+#[test]
+fn exe_main_runs_on_the_big_stack() {
+    let link = probe_link_path();
+    if link == LinkPath::None {
+        eprintln!(
+            "exe_main_runs_on_the_big_stack: neither `rustc` + a `wukong_runtime` rlib nor a C \
+             compiler runs on this box - skipped"
+        );
+        return;
+    }
+    let tmp = std::env::temp_dir()
+        .join("wukong_exe_big_stack")
+        .join(std::process::id().to_string());
+    std::fs::create_dir_all(&tmp).expect("create big-stack scratch dir");
+    let src = tmp.join("deep_recursion").with_extension("wk");
+    // depth_sum(30000) = 30000 * 30001 / 2 = 450015000, which fits an i32.
+    std::fs::write(
+        &src,
+        "fn depth_sum(n: i32) -> i32 {
+    if n == 0 {
+        return 0;
+    }
+    return n + depth_sum(n - 1);
+}
+
+fn main() -> i32 {
+    print(depth_sum(30000));
+    return 0;
+}
+",
+    )
+    .unwrap();
+    let expected = (Some(0), "450015000\n".to_string());
+    assert_eq!(run_interp(&src), expected, "the `--run` oracle");
+    match build_and_run_exe(&tmp, &src, "deep_recursion") {
+        Ok(exe) => assert_eq!(exe, expected, "the linked executable ({link:?})"),
+        Err(stderr) => panic!(
+            "`--emit=exe` failed for a program that needs only the `wukong_rt_*` runtime \
+             ({link:?}):\n{stderr}"
+        ),
+    }
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
