@@ -21,6 +21,11 @@ All notable changes to Wukong are documented here. The format is loosely based o
   leave, the original loop re-runs that group and stops at exactly the iteration it always did.
   It applies when every load before the exit provably stays inside its object — a local `[T; N]`
   table, or a slice searched up to its own length.
+- **One-armed memory in an `if` no longer blocks vectorization.** `if v > 0.0 { o[i] = .. }` and
+  `o[i] = if x > 0.0 { w[i] * x } else { 1.0 }` used to keep the loop scalar because only one arm
+  stores or loads. Each lane now accesses its own element only where it took the arm (and a private
+  scratch slot otherwise), so skipped elements are never rewritten and a buffer shorter than the
+  loop is never read past its end.
 
 ### AOT executables and platform (`gap2/aot-and-platform`)
 

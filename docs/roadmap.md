@@ -541,9 +541,13 @@ another architecture or OS is not supported. A native-backend failure is a catal
   loops** with an early `break` widen too, when every load before the exit provably stays inside its
   object (a local `[T; N]` table, or a slice searched to its own length): any lane leaving hands the
   group back to the scalar loop, which stops at exactly the same iteration
-  (`tests/run/vectorized_search_loops.wk`). Still scalar: argmax / find-index loops that record the
-  index in a branch, searches over a parameter buffer (no extent in MIR), `if`/`else if` chains and
-  one-armed stores (no masked memory ops yet). A loop needing more than
+  (`tests/run/vectorized_search_loops.wk`). **One-armed memory** in an `if` is predicated per lane
+  instead of declining the loop: a store only one arm makes, and a load only one arm makes, touch
+  each lane's own element only where that lane took the arm and a private scratch slot otherwise
+  (`tests/run/vectorized_predicated_arms.wk`). Still scalar: argmax / find-index loops that record
+  the index in a branch, searches over a parameter buffer (no extent in MIR), `if`/`else if` chains,
+  and stores to different places in both arms. The per-lane accesses are scalar under Cranelift
+  (no masked vector memory op is emitted yet). A loop needing more than
   eight runtime alias checks stays scalar. A two-deep nest whose inner loop carries a recurrence or
   a strict-order reduction (an EMA or IIR per row, a hash, a column sum) is **unrolled and jammed**
   instead: four rows run side by side as four independent chains, each bit-identical to the scalar

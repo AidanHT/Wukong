@@ -500,6 +500,14 @@ and every contiguous load before it must provably read memory that exists for th
 stack array `[T; N]` with constant endpoints inside it, or a `[]T` slice searched up to its own
 length. A parameter buffer, whose extent MIR does not carry, keeps the search scalar.
 
+**Predicated arms**: if-conversion runs both arms for every lane, so an access only one arm makes
+cannot simply be widened. A store only one arm makes (`PredStore`) and a load no unconditional
+access covers (`PredLoad`) instead run per lane through `select(lane took the arm, own element,
+scratch)`, where the scratch is one private stack slot per element type in the entry block. No lane
+reads or writes an element the scalar loop leaves alone — unlike a read-modify-write blend, which
+could race with another thread writing the skipped elements or read past a shorter buffer. Stores
+in both arms must still pair into one masked store.
+
 **Unrolling never reassociates.** Splitting a float reduction across several accumulators would
 break the 4-cycle `addss` dependency chain, and it computes a different number — which breaks both
 the interp-vs-native bit-exactness gate and `-O0` ≡ `-O{1,2,3}`. So the unrolled body is the original
