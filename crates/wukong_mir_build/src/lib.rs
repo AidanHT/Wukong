@@ -242,11 +242,7 @@ fn collect_named_generics(ty: &Ty, generics: &[Symbol], out: &mut Vec<Symbol>) {
         // `Tensor[T, M, N]`: the element type parameter is a value-type generic (the dims are not).
         Ty::Tensor {
             elem_var: Some(g), ..
-        } => {
-            if generics.contains(g) && !out.contains(g) {
-                out.push(*g);
-            }
-        }
+        } if generics.contains(g) && !out.contains(g) => out.push(*g),
         _ => {}
     }
 }

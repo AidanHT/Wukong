@@ -90,11 +90,7 @@ fn collect_named(ty: &Ty, generics: &[Symbol], out: &mut Vec<Symbol>) {
         }
         Ty::Tensor {
             elem_var: Some(g), ..
-        } => {
-            if generics.contains(g) && !out.contains(g) {
-                out.push(*g);
-            }
-        }
+        } if generics.contains(g) && !out.contains(g) => out.push(*g),
         _ => {}
     }
 }
