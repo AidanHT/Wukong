@@ -30,6 +30,25 @@ All notable changes to Wukong are documented here. The format is loosely based o
 - **Platform support** is stated (README): Tier 1 x86-64 Windows/Linux, Tier 2 aarch64
   macOS/Linux/Windows with new non-blocking CI lanes (`macos-14`, `ubuntu-24.04-arm`, an
   `aarch64-pc-windows-msvc` check).
+### Vectorizer: min/max and conditional reductions (`gap2/vec-control-and-nests`)
+
+- **Min/max reductions vectorize.** `m = max(m, x[i])`, `min`, `fmax`, `fmin` (a `select` over a
+  compare in MIR) used to be classified as recurrences, which declined the whole loop. Integer
+  min/max up to 32-bit lanes now keeps lane-parallel partials seeded with the identity; a float
+  min/max (and a 64-bit integer one) widens the body and folds the running extremum lane by lane in
+  index order, re-emitting the loop's own compare and select, so NaN and `±0` ties resolve exactly
+  as in the scalar loop.
+- **Conditional reductions vectorize.** A guarded accumulate (`if c { s = s + x }`, on either arm,
+  including a constant addend such as a count) and a min/max written as a branch
+  (`if x[i] > m { m = x[i] }`) used to decline the loop as recurrences. The condition now goes
+  lane-wide and each lane keeps `c ? s ⊕ x : s` — blended per part for an integer accumulator,
+  selected per lane in the in-order float fold — with no identity element, so a running `-0.0` or a
+  NaN payload is never altered. An argmax-style branch that also records an index stays scalar.
+- **A runtime-check budget for the vectorizer.** A widened loop pays its pointer-range checks on
+  every entry and their number grows with the square of the stream count; a loop needing more than
+  eight (LLVM's default threshold) now stays scalar. `WUKONG_VEC_TRACE` reports a per-group cost
+  estimate (`cost=vector/scalar`) on every `WIDEN` line; it is not yet a gate, pending a same-run
+  A/B against `WUKONG_NO_VECTORIZE`.
 
 ### Type soundness and patterns (`gap2/type-soundness-and-patterns`)
 

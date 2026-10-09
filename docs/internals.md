@@ -470,6 +470,24 @@ honest: the induction variable's scalar *address* face may never meet a lane-var
 (`x[i + q[i]]` is declined, not replicated with the group's first `i`), and replication is taken only
 beside at least as much widened arithmetic. Scatters, reverse loops and gapped groups stay scalar.
 
+**Reductions** come from `loop_info::classify_carried`. Besides a binary or `fma` combine, two
+families are recognized. A **min/max** spelled as `select(cmp(pred, a, b), a, b)` (the lowering of
+`max`/`min`/`fmax`/`fmin`) or as a branch that only chooses between the accumulator and the value it
+was compared against (`if x > m { m = x }`) records its compare and the accumulator's positions
+(`SelectCombine`). A **guarded accumulate** (`if c { s = s + x }`, either arm, `Reduction::merge`)
+is a join parameter fed by the update from one arm and the untouched accumulator from the other.
+Both carry exact read counts so no partial is observed. In the vector loop, integer
+`add`/`mul`/bitwise reductions and integer min/max up to 32-bit lanes keep lane-parallel partials
+(seeded with the identity: `INT_MIN`/`INT_MAX`/`0`/all-ones for min/max), a guarded one blended per
+part with `select(mask, acc op x, acc)`; every float reduction and every 64-bit min/max folds `W`
+lanes into the scalar accumulator **in index order**, re-emitting the loop's own combine (its
+compare and select for a min/max), and a guarded one keeps `c_k ? acc op x_k : acc` per lane. No
+float is reassociated and no identity element is ever folded into a float, so a running `-0.0`, a
+NaN payload and a NaN-then-number sequence come out exactly as the scalar loop computes them. A
+branch that also records an index (an argmax) stays scalar. The runtime alias guard is budgeted at
+eight checks per loop (LLVM's default threshold); `WUKONG_VEC_TRACE=1` prints each widening with a
+per-group cost estimate (`cost=vector/scalar`), which is reported but not yet enforced.
+
 **Unrolling never reassociates.** Splitting a float reduction across several accumulators would
 break the 4-cycle `addss` dependency chain, and it computes a different number — which breaks both
 the interp-vs-native bit-exactness gate and `-O0` ≡ `-O{1,2,3}`. So the unrolled body is the original

@@ -532,6 +532,16 @@ another architecture or OS is not supported. A native-backend failure is a catal
   multiply goes through `i16`. A step with no vector form — a gather, an integer divide or
   remainder, a per-lane shift amount, `f64 -> i64` — is **replicated** lane by lane while the rest
   widens (`tests/run/vectorized_{mixed_widths,interleave,replicate}.wk` print every lane).
+  **Min/max and conditional reductions** widen too: `m = max(m, x[i])` / `min` / `fmax` / `fmin`,
+  a branch-spelled `if x[i] > m { m = x[i] }`, and a guarded accumulate `if c { s = s + x }` (either
+  arm, a constant addend such as a count included). Integer ones up to 32-bit lanes keep
+  lane-parallel partials; float ones (and 64-bit min/max) fold lane by lane in index order with the
+  loop's own compare/select, so NaN and `±0` behave exactly as in the scalar loop
+  (`tests/run/vectorized_{minmax,guarded}_reductions.wk` print every prefix answer). Still scalar:
+  argmax / find-index loops (a branch that also records the index), early-exit search loops,
+  `if`/`else if` chains and one-armed stores (no masked memory ops yet), and loop nests whose inner
+  loop carries a recurrence (no unroll-and-jam). A loop needing more than eight runtime alias checks
+  stays scalar.
 - **FMA contraction**: a float `x + y*z` becomes one fused multiply-add (`Op::Fma`, a hardware
   `vfmadd`), on both the scalar and vector paths; the interpreter mirrors it with `mul_add`, so the
   two backends stay bit-identical.

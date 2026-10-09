@@ -686,7 +686,8 @@ impl RedKind {
 }
 
 /// An accumulator carried across iterations: `acc = acc ⊕ x`, with `acc` used nowhere else inside
-/// the loop.
+/// the loop than its own accumulate (a min/max's compare and a guarded accumulate's pass-through
+/// edge included).
 #[derive(Clone, Debug)]
 pub struct Reduction {
     /// The header block parameter holding the accumulator.
@@ -696,7 +697,10 @@ pub struct Reduction {
     /// The initial value, from the entering edge.
     pub start: Option<ValueId>,
     pub kind: RedKind,
-    /// The result of the combining instruction — the value the latch passes back.
+    /// The result of the combining instruction — the value the latch passes back, except for a
+    /// guarded accumulate, where the latch passes back [`Self::merge`] and this is the update on
+    /// one arm. (For a branch-spelled min/max it is the join parameter, which is not an
+    /// instruction.)
     pub combine: ValueId,
     /// The non-accumulator operand of the combine. `None` for an `Fma` accumulate, where the
     /// addend is the (never-materialized) product in [`Self::fma_factors`].
@@ -706,6 +710,45 @@ pub struct Reduction {
     pub fma_factors: Option<(ValueId, ValueId)>,
     /// Copy of [`RedKind::reassociable`], so a consumer cannot forget to ask.
     pub reassociable: bool,
+    /// For a min/max reduction — the combine is a `select` over a compare — exactly how the scalar
+    /// loop spelled it. `None` for a binary or `fma` combine.
+    ///
+    /// A min/max written as a branch (`if x[i] > m { m = x[i] }`) is the same reduction: its
+    /// [`Self::combine`] is then the join's block parameter, and the compare is the branch's.
+    pub select: Option<SelectCombine>,
+    /// A **guarded** accumulate (`if c { s = s + x }`): the join parameter that merges the updated
+    /// accumulator from one arm with the untouched one from the other, which the latch passes back.
+    /// [`Self::combine`] is then the update itself, executed on its arm only. A consumer folds
+    /// `c ? acc ⊕ x : acc` per element — which needs no identity and is exact for every operator,
+    /// a float `+` on `-0.0` or a signalling NaN included.
+    pub merge: Option<ValueId>,
+}
+
+/// A min/max accumulate as the front end spells it: `c = cmp(pred, x, y); acc' = select(c, t, e)`,
+/// where `{x, y}` and `{t, e}` are both `{acc, addend}`. (`max(a, b)` is `select(a > b, a, b)`.)
+///
+/// A consumer that folds such a reduction serially must re-emit **this** compare and **this**
+/// select with the accumulator in the same positions: on a float tie or a NaN the result is
+/// whichever operand the `select` names second, so `max(acc, x)` and `max(x, acc)` are different
+/// reductions as far as which `±0` or NaN payload survives.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SelectCombine {
+    /// The compare's result. Its only reader in the loop is the combining `select`.
+    pub cmp: ValueId,
+    pub pred: CmpOp,
+    /// Is the accumulator the compare's left operand?
+    pub acc_left_in_cmp: bool,
+    /// Is the accumulator the `select`'s first (true) arm?
+    pub acc_is_then: bool,
+}
+
+/// What [`combine_kind`] found a combining instruction to be.
+struct Combine {
+    kind: RedKind,
+    /// The non-accumulator operand; `None` for an `fma` accumulate.
+    addend: Option<ValueId>,
+    fma_factors: Option<(ValueId, ValueId)>,
+    select: Option<SelectCombine>,
 }
 
 /// What a header block parameter carries across iterations.
@@ -718,8 +761,9 @@ pub enum Carried {
     /// The same value on every iteration (the latch passes the parameter straight back, or a copy
     /// cycle through inner-loop parameters resolves to it).
     Invariant,
-    /// A true recurrence (`h = a[i]*h + b[i]`), a conditionally-updated value, or anything else
-    /// this analysis does not recognize. Iterations cannot be reordered.
+    /// A true recurrence (`h = a[i]*h + b[i]`), a conditionally-updated value that is not a guarded
+    /// accumulate, or anything else this analysis does not recognize. Iterations cannot be
+    /// reordered.
     Recurrence,
 }
 
@@ -1646,15 +1690,19 @@ fn collect_accesses(
 /// a `Recurrence`. This matters because a negated accumulate is how a loss is spelled:
 /// `lr = lr - alpha*q*(1-p)^2*log p` in a focal loss, `e = e - t[i]*log(y[i])` in a cross-entropy.
 /// Refusing it made the entire enclosing loop unvectorizable, transcendental and all.
-// The tuple return is three independent optional facts about one combining instruction; a named
-// struct for a single internal caller would add ceremony, not clarity.
-#[allow(clippy::type_complexity)]
-fn combine_kind(
-    ctx: &LoopCtx<'_>,
-    p: ValueId,
-    next: ValueId,
-) -> Option<(RedKind, Option<ValueId>, Option<(ValueId, ValueId)>)> {
+///
+/// **Min/max is included, spelled as a `select` over a compare** — the only way the front end spells
+/// it: `max(a, b)`, `fmax(a, b)` and `min`/`fmin` all lower to `select(cmp(pred, a, b), a, b)`
+/// (`mir_build::minmax`). See [`select_combine`].
+fn combine_kind(ctx: &LoopCtx<'_>, p: ValueId, next: ValueId) -> Option<Combine> {
+    let plain = |kind: RedKind, addend: ValueId| Combine {
+        kind,
+        addend: Some(addend),
+        fma_factors: None,
+        select: None,
+    };
     match ctx.op_of(next)? {
+        Op::Select(c, t, e) => select_combine(ctx, p, *c, *t, *e),
         Op::Bin(b, a, c) => {
             // `acc - x` only; `x - acc` is not an accumulate.
             if matches!(b, BinOp::Sub | BinOp::FSub) {
@@ -1666,7 +1714,7 @@ fn combine_kind(
                 } else {
                     RedKind::FSub
                 };
-                return Some((kind, Some(*c), None));
+                return Some(plain(kind, *c));
             }
             let other = if *a == p && *c != p {
                 *c
@@ -1685,17 +1733,107 @@ fn combine_kind(
                 BinOp::FMul => RedKind::FMul,
                 _ => return None,
             };
-            Some((kind, Some(other), None))
+            Some(plain(kind, other))
         }
         // `acc = fma(x, y, acc)` — the front end contracts `acc + x*y` into this, so it is the
         // shape a dot-product / weighted-sum reduction actually has after lowering. The addend is
         // the never-materialized product `x*y`; a consumer that widens the body has to produce
         // both factors and re-fuse them per lane, or it changes the rounding.
-        Op::Fma(x, y, c) if *c == p && *x != p && *y != p => {
-            Some((RedKind::FAdd, None, Some((*x, *y))))
-        }
+        Op::Fma(x, y, c) if *c == p && *x != p && *y != p => Some(Combine {
+            kind: RedKind::FAdd,
+            addend: None,
+            fma_factors: Some((*x, *y)),
+            select: None,
+        }),
         _ => None,
     }
+}
+
+/// `select(c, t, e)` with `c = cmp(pred, x, y)` as a min/max accumulate of `p`, or `None`.
+///
+/// The compare and the select must name the same two values — the accumulator and one other of the
+/// accumulator's own type — in either order:
+///
+/// * `select(x > y, x, y)` keeps the larger, `select(x < y, x, y)` the smaller;
+/// * `select(x > y, y, x)` keeps the smaller, `select(x < y, y, x)` the larger;
+///
+/// `>=`/`<=` pick the same side as `>`/`<` (they differ only on a tie, where the two candidates are
+/// equal integers — or, for floats, possibly `+0`/`-0`, which is why a float min/max is never
+/// reassociated: [`RedKind::reassociable`]). Signedness comes from the predicate. An equality
+/// compare, a compare of anything else, or a mixed-type pair is not a min/max.
+///
+/// The caller still has to prove the compare reads the accumulator for this select and nothing
+/// else (`classify_carried`): a compare that also steers a store or a second merge observes every
+/// partial maximum, which reordering would change.
+fn select_combine(
+    ctx: &LoopCtx<'_>,
+    p: ValueId,
+    c: ValueId,
+    t: ValueId,
+    e: ValueId,
+) -> Option<Combine> {
+    let Op::Cmp(pred, x, y) = ctx.op_of(c)? else {
+        return None;
+    };
+    let (x, y) = (*x, *y);
+    let other = if t == p && e != p {
+        e
+    } else if e == p && t != p {
+        t
+    } else {
+        return None;
+    };
+    let same_order = (x, y) == (t, e);
+    if !same_order && (x, y) != (e, t) {
+        return None;
+    }
+    let ty = ctx.f.value_type(p);
+    if ctx.f.value_type(other) != ty {
+        return None;
+    }
+    use CmpOp::*;
+    // Does the select keep the operand the compare called greater?
+    let greater = matches!(pred, Sgt | Sge | Ugt | Uge | Fogt | Foge);
+    let lesser = matches!(pred, Slt | Sle | Ult | Ule | Folt | Fole);
+    if !greater && !lesser {
+        return None;
+    }
+    let is_max = greater == same_order;
+    let kind = match pred {
+        Sgt | Sge | Slt | Sle if ty.is_int() && *ty != MirType::I1 => {
+            if is_max {
+                RedKind::SMax
+            } else {
+                RedKind::SMin
+            }
+        }
+        Ugt | Uge | Ult | Ule if ty.is_int() && *ty != MirType::I1 => {
+            if is_max {
+                RedKind::UMax
+            } else {
+                RedKind::UMin
+            }
+        }
+        Fogt | Foge | Folt | Fole if ty.is_float() => {
+            if is_max {
+                RedKind::FMax
+            } else {
+                RedKind::FMin
+            }
+        }
+        _ => return None,
+    };
+    Some(Combine {
+        kind,
+        addend: Some(other),
+        fma_factors: None,
+        select: Some(SelectCombine {
+            cmp: c,
+            pred: *pred,
+            acc_left_in_cmp: x == p,
+            acc_is_then: t == p,
+        }),
+    })
 }
 
 /// How many times `v` is read inside the loop (instruction operands and terminator arguments),
@@ -1756,10 +1894,12 @@ fn uses_in_loop(ctx: &LoopCtx<'_>, l: &NaturalLoop, v: ValueId) -> usize {
 ///
 /// SSA does the hardest part for free. The combine's value is an argument of the latch's
 /// terminator, so the combine's block *dominates* the latch; and with a single latch and the only
-/// exit in the header, every iteration that enters the body reaches the latch. A conditionally
-/// updated accumulator (`if c { s = s + x }`) therefore cannot be mistaken for a reduction: its
-/// latch argument is a merge *parameter*, not a combining instruction, so it falls through to
-/// [`Carried::Recurrence`].
+/// exit in the header, every iteration that enters the body reaches the latch.
+///
+/// A conditionally updated accumulator reaches the latch as a merge *parameter*, not a combining
+/// instruction, and [`reduction_of`] takes it apart: `if c { s = s + x }` is a **guarded**
+/// accumulate ([`Reduction::merge`]) and `if x > m { m = x }` is a min/max whose select is the
+/// branch itself. Anything else conditional stays a [`Carried::Recurrence`].
 fn classify_carried(
     ctx: &LoopCtx<'_>,
     l: &NaturalLoop,
@@ -1785,28 +1925,186 @@ fn classify_carried(
             });
             continue;
         }
-        let kind = next
-            .and_then(|n| {
-                let (kind, addend, fma_factors) = combine_kind(ctx, p, n)?;
-                if uses_in_loop(ctx, l, p) != 1 {
-                    return None; // an intermediate partial is observed somewhere else
-                }
-                reductions.push(Reduction {
-                    param: p,
-                    param_index: k,
-                    start: entry_arg(f, l, k),
-                    kind,
-                    combine: n,
-                    addend,
-                    fma_factors,
-                    reassociable: kind.reassociable(),
-                });
-                Some(Carried::Reduction(reductions.len() - 1))
-            })
-            .unwrap_or(Carried::Recurrence);
+        let kind = match next.and_then(|n| reduction_of(ctx, l, p, k, n)) {
+            Some(r) => {
+                reductions.push(r);
+                Carried::Reduction(reductions.len() - 1)
+            }
+            None => Carried::Recurrence,
+        };
         carried.push(CarriedValue { param: p, kind });
     }
     (carried, reductions)
+}
+
+/// The reduction header parameter `p` (at position `k`) carries, given the value `next` the latch
+/// passes back for it — or `None` when it is not one.
+///
+/// Three shapes, each with an exact count of the loop's reads of `p`, so that no partial is
+/// observed by anything but the accumulate itself:
+///
+/// * **unconditional** — `next` is the combine `p ⊕ x` ([`combine_kind`]): read once, or twice for
+///   a min/max (its compare and its select);
+/// * **a branch that is a min/max** — `next` is the join parameter of `if x > p { p = x }`: the
+///   branch's compare and select are exactly a `select`-spelled min/max ([`select_combine`]), read
+///   by the compare and by the arm that passes `p` through. Only when the branch chooses `next`
+///   and nothing else ([`BranchMerge::private`]), since its compare reads every partial;
+/// * **guarded** — `next` merges `p ⊕ x` from one arm with `p` from the other: the combine's reads
+///   plus the pass-through. The merged value and the update must each be read once, by the edge
+///   that carries them, and the branch condition can then not depend on `p` at all.
+fn reduction_of(
+    ctx: &LoopCtx<'_>,
+    l: &NaturalLoop,
+    p: ValueId,
+    k: usize,
+    next: ValueId,
+) -> Option<Reduction> {
+    let f = ctx.f;
+    // How many times a combine reads `p`: once, or twice for a min/max — whose compare must then
+    // feed its select and nothing else.
+    let combine_reads = |c: &Combine| -> Option<usize> {
+        match c.select {
+            Some(s) => (uses_in_loop(ctx, l, s.cmp) == 1).then_some(2),
+            None => Some(1),
+        }
+    };
+    let make = |c: Combine, combine: ValueId, merge: Option<ValueId>| Reduction {
+        param: p,
+        param_index: k,
+        start: entry_arg(f, l, k),
+        kind: c.kind,
+        combine,
+        addend: c.addend,
+        fma_factors: c.fma_factors,
+        reassociable: c.kind.reassociable(),
+        select: c.select,
+        merge,
+    };
+    if let Some(c) = combine_kind(ctx, p, next) {
+        if uses_in_loop(ctx, l, p) != combine_reads(&c)? {
+            return None; // an intermediate partial is observed somewhere else
+        }
+        return Some(make(c, next, None));
+    }
+    let bm = branch_merge(ctx, l, next)?;
+    if uses_in_loop(ctx, l, next) != 1 {
+        return None; // the merged partial is read before the back edge
+    }
+    if bm.private {
+        if let Some(c) = select_combine(ctx, p, bm.cond, bm.then_arg, bm.else_arg) {
+            if uses_in_loop(ctx, l, bm.cond) == 1 && uses_in_loop(ctx, l, p) == 2 {
+                return Some(make(c, next, None));
+            }
+        }
+    }
+    let updated = if bm.else_arg == p && bm.then_arg != p {
+        bm.then_arg
+    } else if bm.then_arg == p && bm.else_arg != p {
+        bm.else_arg
+    } else {
+        return None;
+    };
+    let c = combine_kind(ctx, p, updated)?;
+    if uses_in_loop(ctx, l, updated) != 1 || uses_in_loop(ctx, l, p) != combine_reads(&c)? + 1 {
+        return None;
+    }
+    Some(make(c, updated, Some(next)))
+}
+
+/// A value a two-way branch in the loop body chooses: `m = cond ? then_arg : else_arg`.
+#[derive(Clone, Copy, Debug)]
+struct BranchMerge {
+    cond: ValueId,
+    then_arg: ValueId,
+    else_arg: ValueId,
+    /// Does the branch choose `m` and nothing else? Its arm blocks hold no instruction, and every
+    /// other parameter of the join receives the same value from both sides — so the branch has no
+    /// effect but `m`, and its condition is observed nowhere else.
+    private: bool,
+}
+
+/// `m` as a two-way merge: a parameter of a loop block other than the header, entered along
+/// exactly two edges that one `cond_br` in the loop splits — each edge either that branch's own
+/// (a triangle's short side) or the `br` of an arm block entered only from it. Any other shape —
+/// a third edge, a `switch`, an arm with parameters or a second entry — is `None`.
+fn branch_merge(ctx: &LoopCtx<'_>, l: &NaturalLoop, m: ValueId) -> Option<BranchMerge> {
+    let f = ctx.f;
+    let (join, k) = l.blocks.iter().filter(|b| **b != l.header).find_map(|&b| {
+        f.blocks[b.0 as usize]
+            .params
+            .iter()
+            .position(|&q| q == m)
+            .map(|k| (b, k))
+    })?;
+    let edges_into = |target: BlockId| -> Vec<(BlockId, Vec<ValueId>)> {
+        let mut out = Vec::new();
+        for blk in &f.blocks {
+            blk.term.for_each_edge(|t, args| {
+                if t == target {
+                    out.push((blk.id, args.to_vec()));
+                }
+            });
+        }
+        out
+    };
+    let into = edges_into(join);
+    if into.len() != 2 {
+        return None;
+    }
+    // Each edge as (the branch block, whether it is the branch's true side, the arm it crosses).
+    let side = |from: BlockId| -> Option<(BlockId, bool, Option<BlockId>)> {
+        match &f.blocks[from.0 as usize].term {
+            Terminator::CondBr {
+                then_blk, else_blk, ..
+            } if then_blk != else_blk => Some((from, *then_blk == join, None)),
+            Terminator::Br { .. } => {
+                if !f.blocks[from.0 as usize].params.is_empty() || !l.blocks.contains(&from) {
+                    return None;
+                }
+                let preds = edges_into(from);
+                let [(e, _)] = preds.as_slice() else {
+                    return None;
+                };
+                match &f.blocks[e.0 as usize].term {
+                    Terminator::CondBr {
+                        then_blk, else_blk, ..
+                    } if then_blk != else_blk => Some((*e, *then_blk == from, Some(from))),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    };
+    let (e0, true0, arm0) = side(into[0].0)?;
+    let (e1, true1, arm1) = side(into[1].0)?;
+    if e0 != e1 || true0 == true1 || !l.blocks.contains(&e0) {
+        return None;
+    }
+    let Terminator::CondBr { cond, .. } = &f.blocks[e0.0 as usize].term else {
+        return None;
+    };
+    let (then_edge, else_edge) = if true0 {
+        (&into[0].1, &into[1].1)
+    } else {
+        (&into[1].1, &into[0].1)
+    };
+    let then_arg = *then_edge.get(k)?;
+    let else_arg = *else_edge.get(k)?;
+    let private = [arm0, arm1]
+        .into_iter()
+        .flatten()
+        .all(|a| f.blocks[a.0 as usize].insts.is_empty())
+        && then_edge
+            .iter()
+            .zip(else_edge)
+            .enumerate()
+            .all(|(j, (a, b))| j == k || a == b);
+    Some(BranchMerge {
+        cond: *cond,
+        then_arg,
+        else_arg,
+        private,
+    })
 }
 
 /// The loop-carried memory-dependence verdict.
@@ -3295,16 +3593,105 @@ mod tests {
     }
 
     /// A conditionally-updated accumulator reaches the latch as a *merge parameter*, not as a
-    /// combining instruction, so SSA alone keeps it out of the reduction set.
+    /// combining instruction. `if c { s = s + x }` is a **guarded** reduction: the combine is the
+    /// arm's `s + x`, the merge the join parameter the latch passes back.
     #[test]
-    fn a_conditional_accumulate_is_not_a_reduction() {
-        let src = "fn k(x: []f32, n: i64) -> f32 { let mut s: f32 = 0.0; \
-                   for i in 0..n { if x[i] > 0.0 { s = s + x[i]; } } return s; } \
+    fn a_conditional_accumulate_is_a_guarded_reduction() {
+        let src = "@unchecked fn k(x: []f32, n: i64) -> f32 { let mut s: f32 = 0.0; \
+                   let mut i: i64 = 0; \
+                   while i < n { let v: f32 = x[i]; if v > 0.0 { s = s + v; } i = i + 1; } \
+                   return s; } \
                    fn main() -> i32 { return 0; }";
         let (_, l) = kernel_loop(src, "k");
-        let l = &l;
+        assert_eq!(l.reductions.len(), 1, "{:?}", l.carried);
+        let r = &l.reductions[0];
+        assert_eq!(r.kind, RedKind::FAdd);
+        assert!(r.merge.is_some(), "the update is guarded: {r:?}");
+        assert!(r.select.is_none());
+        assert!(l.is_vectorizable_shape());
+    }
+
+    /// `if v > m { m = v }` is a max written as a branch: the branch's own compare and the join it
+    /// feeds are exactly `select(v > m, v, m)`, and the branch does nothing else.
+    #[test]
+    fn a_branch_spelled_max_is_a_reduction() {
+        let src = "@unchecked fn k(x: []f32, n: i64) -> f32 { let mut m: f32 = 0.0; \
+                   let mut i: i64 = 0; \
+                   while i < n { let v: f32 = x[i]; if v > m { m = v; } i = i + 1; } \
+                   return m; } \
+                   fn main() -> i32 { return 0; }";
+        let (_, l) = kernel_loop(src, "k");
+        assert_eq!(l.reductions.len(), 1, "{:?}", l.carried);
+        let r = &l.reductions[0];
+        assert_eq!(r.kind, RedKind::FMax);
+        assert!(
+            r.merge.is_none(),
+            "the branch is the select, not a guard: {r:?}"
+        );
+        let s = r.select.expect("the branch's compare and merge");
+        assert!(!s.acc_left_in_cmp && !s.acc_is_then, "{s:?}");
+    }
+
+    /// The same branch steering a second value (`if v > m { m = v; at = i; }`, an argmax) observes
+    /// every partial maximum through its condition, so neither carried value is a reduction.
+    #[test]
+    fn a_branch_that_also_records_an_index_is_not_a_reduction() {
+        let src = "@unchecked fn k(x: []f32, n: i64) -> i64 { let mut m: f32 = 0.0; \
+                   let mut at: i64 = 0; let mut i: i64 = 0; \
+                   while i < n { let v: f32 = x[i]; if v > m { m = v; at = i; } i = i + 1; } \
+                   return at; } \
+                   fn main() -> i32 { return 0; }";
+        let (_, l) = kernel_loop(src, "k");
         assert!(l.reductions.is_empty(), "{:?}", l.carried);
         assert!(!l.is_vectorizable_shape());
+    }
+
+    /// `m = max(m, x[i])` lowers to `select(m > x[i], m, x[i])` (`mir_build::minmax`). That is a
+    /// min/max reduction, recorded with its compare and the accumulator's two positions so a serial
+    /// fold can re-emit it operand for operand — and a float one is never reassociable.
+    #[test]
+    fn a_select_spelled_float_max_is_a_reduction() {
+        let src = "fn k(x: []f64, n: i64) -> f64 { let mut m: f64 = 0.0; let mut i: i64 = 0; \
+                   while i < n { m = max(m, x[i]); i = i + 1; } return m; } \
+                   fn main() -> i32 { return 0; }";
+        let (_, l) = kernel_loop(src, "k");
+        assert_eq!(l.reductions.len(), 1, "{:?}", l.carried);
+        let r = &l.reductions[0];
+        assert_eq!(r.kind, RedKind::FMax);
+        assert!(!r.reassociable, "a float max keeps its order");
+        let s = r.select.expect("the select spelling is recorded");
+        assert_eq!(s.pred, CmpOp::Fogt);
+        assert!(s.acc_left_in_cmp && s.acc_is_then, "{s:?}");
+        assert!(l.is_vectorizable_shape());
+    }
+
+    /// The accumulator on the right: `min(x[i], m)` is `select(x[i] < m, x[i], m)`, a signed min
+    /// over `i32`, and integer min/max is associative.
+    #[test]
+    fn a_select_spelled_integer_min_is_a_reassociable_reduction() {
+        let src = "fn k(x: []i32, n: i64) -> i32 { let mut m: i32 = 0; let mut i: i64 = 0; \
+                   while i < n { m = min(x[i], m); i = i + 1; } return m; } \
+                   fn main() -> i32 { return 0; }";
+        let (_, l) = kernel_loop(src, "k");
+        assert_eq!(l.reductions.len(), 1, "{:?}", l.carried);
+        let r = &l.reductions[0];
+        assert_eq!(r.kind, RedKind::SMin);
+        assert!(r.reassociable);
+        let s = r.select.expect("the select spelling is recorded");
+        assert!(!s.acc_left_in_cmp && !s.acc_is_then, "{s:?}");
+    }
+
+    /// A running maximum whose partial is stored before each update (an exclusive max-scan) reads
+    /// the accumulator a third time: the partials are observed, so it is not a reduction.
+    #[test]
+    fn an_observed_running_max_is_not_a_reduction() {
+        let src = "fn k(x: []f32, mut o: []f32, n: i64) -> f32 { let mut m: f32 = 0.0; \
+                   let mut i: i64 = 0; \
+                   while i < n { o[i] = m; m = max(m, x[i]); i = i + 1; } return m; } \
+                   fn main() -> i32 { return 0; }";
+        let (_, l) = kernel_loop(src, "k");
+        assert!(l.reductions.is_empty(), "{:?}", l.carried);
+        assert!(l.carried.iter().any(|c| c.kind == Carried::Recurrence));
     }
 
     // ---- stage 4: dependence -----------------------------------------------------------------

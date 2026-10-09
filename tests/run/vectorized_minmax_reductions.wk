@@ -1,0 +1,359 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -4000
+// EXPECT-OUT: -12
+// EXPECT-OUT: -2
+// EXPECT-OUT: 8
+// EXPECT-OUT: 8
+// EXPECT-OUT: 8
+// EXPECT-OUT: 12
+// EXPECT-OUT: 12
+// EXPECT-OUT: 12
+// EXPECT-OUT: 12
+// EXPECT-OUT: 12
+// EXPECT-OUT: 12
+// EXPECT-OUT: 12
+// EXPECT-OUT: 12
+// EXPECT-OUT: -1000
+// EXPECT-OUT: -6
+// EXPECT-OUT: -1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: -77777
+// EXPECT-OUT: -2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 5
+// EXPECT-OUT: 5
+// EXPECT-OUT: 5
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2000
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: -3
+// EXPECT-OUT: -3
+// EXPECT-OUT: -3
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -11
+// EXPECT-OUT: -11
+// EXPECT-OUT: -11
+// EXPECT-OUT: -11
+// EXPECT-OUT: -11
+// EXPECT-OUT: -11
+// EXPECT-OUT: -2147483647
+// EXPECT-OUT: -1003
+// EXPECT-OUT: 204
+// EXPECT-OUT: 204
+// EXPECT-OUT: 617
+// EXPECT-OUT: 617
+// EXPECT-OUT: 617
+// EXPECT-OUT: 617
+// EXPECT-OUT: 617
+// EXPECT-OUT: 649
+// EXPECT-OUT: 649
+// EXPECT-OUT: 649
+// EXPECT-OUT: 649
+// EXPECT-OUT: 649
+// EXPECT-OUT: 681
+// EXPECT-OUT: 681
+// EXPECT-OUT: 681
+// EXPECT-OUT: 681
+// EXPECT-OUT: 681
+// EXPECT-OUT: 713
+// EXPECT-OUT: 32767
+// EXPECT-OUT: 300
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: -59
+// EXPECT-OUT: -59
+// EXPECT-OUT: -59
+// EXPECT-OUT: -119
+// EXPECT-OUT: -119
+// EXPECT-OUT: -119
+// EXPECT-OUT: -178
+// EXPECT-OUT: -178
+// EXPECT-OUT: -178
+// EXPECT-OUT: -237
+// EXPECT-OUT: -237
+// EXPECT-OUT: 0
+// EXPECT-OUT: 11
+// EXPECT-OUT: 241
+// EXPECT-OUT: 241
+// EXPECT-OUT: 241
+// EXPECT-OUT: 249
+// EXPECT-OUT: 249
+// EXPECT-OUT: 249
+// EXPECT-OUT: 249
+// EXPECT-OUT: 4294967295
+// EXPECT-OUT: 2000000007
+// EXPECT-OUT: 600000007
+// EXPECT-OUT: 600000007
+// EXPECT-OUT: 600000007
+// EXPECT-OUT: 280000007
+// EXPECT-OUT: 280000007
+// EXPECT-OUT: 280000007
+// EXPECT-OUT: 280000007
+// EXPECT-OUT: 280000007
+// EXPECT-OUT: 280000007
+// EXPECT-OUT: 280000007
+// EXPECT-OUT: 280000007
+// EXPECT-OUT: 280000007
+// EXPECT-OUT: -5000000000
+// EXPECT-OUT: -5000000000
+// EXPECT-OUT: -5000000000
+// EXPECT-OUT: 8999994069
+// EXPECT-OUT: 29999991219
+// EXPECT-OUT: 29999991219
+// EXPECT-OUT: 29999991219
+// EXPECT-OUT: 29999991219
+// EXPECT-OUT: 29999991219
+// EXPECT-OUT: 29999991219
+// EXPECT-OUT: 29999991219
+// EXPECT-OUT: 29999991219
+module tests.run.vectorized_minmax_reductions
+
+// Min/max reductions written with the builtins (`max`, `min`, `fmin`) reach the general loop
+// vectorizer as `select(cmp(pred, a, b), a, b)`. They used to be classified as recurrences, which
+// declined the whole loop; now the body is widened and the accumulate is one of two things:
+//
+// * an INTEGER min/max (up to 32-bit lanes) keeps lane-parallel partials seeded with the identity
+//   (INT_MIN/INT_MAX, 0 or all-ones for unsigned) and folds them once, after the loop;
+// * a FLOAT min/max, and a 64-bit integer one, is folded lane by lane in index order, re-emitting
+//   the loop's own compare and select - a float max is not associative once NaN and +-0 ties are
+//   in play, so this is the only exact widening.
+//
+// Every kernel is a counting `while` over a slice (the shape the front end leaves to the general
+// vectorizer) and is called for every prefix length (or every interesting one around a vector-group
+// boundary), so each answer exercises a different split between the vector loop and its scalar
+// epilogue. Every expected value comes from the scalar semantics: `max(a, b)` is `a > b ? a : b`
+// and `min(a, b)` is `a < b ? a : b`, the second operand winning a tie or a NaN.
+
+fn fmax_scaled(x: []f64, s: f64, n: i64) -> f64 {
+    let mut m: f64 = -1000.0;
+    let mut i: i64 = 0;
+    while i < n {
+        m = max(m, x[i] * s);
+        i = i + 1;
+    }
+    return m;
+}
+
+// The accumulator on the RIGHT: `fmin(v, m)` is `v < m ? v : m`.
+fn fmin_right(x: []f32, n: i64) -> f32 {
+    let mut m: f32 = 1000.0;
+    let mut i: i64 = 0;
+    while i < n {
+        m = fmin(x[i] + 0.5, m);
+        i = i + 1;
+    }
+    return m;
+}
+
+fn imax(x: []i32, n: i64) -> i32 {
+    let mut m: i32 = -2147483647;
+    let mut i: i64 = 0;
+    while i < n {
+        m = max(m, x[i] - 3);
+        i = i + 1;
+    }
+    return m;
+}
+
+fn imin16(x: []i16, n: i64) -> i16 {
+    let mut m: i16 = 32767;
+    let mut i: i64 = 0;
+    while i < n {
+        m = min(x[i], m);
+        i = i + 1;
+    }
+    return m;
+}
+
+fn umax8(x: []u8, n: i64) -> u8 {
+    let mut m: u8 = 0;
+    let mut i: i64 = 0;
+    while i < n {
+        m = max(m, x[i]);
+        i = i + 1;
+    }
+    return m;
+}
+
+fn umin32(x: []u32, n: i64) -> u32 {
+    let mut m: u32 = 4294967295;
+    let mut i: i64 = 0;
+    while i < n {
+        m = min(m, x[i]);
+        i = i + 1;
+    }
+    return m;
+}
+
+fn smax64(x: []i64, n: i64) -> i64 {
+    let mut m: i64 = -5000000000;
+    let mut i: i64 = 0;
+    while i < n {
+        m = max(m, x[i] * 3);
+        i = i + 1;
+    }
+    return m;
+}
+
+fn main() -> i32 {
+    // f64 max, two lanes: x[j] = (5j mod 13) - 6, scaled by 0.5, printed times 4.
+    let mut xd: []f64 = alloc_f64(13);
+    let mut j: i64 = 0;
+    while j < 13 {
+        xd[j] = (((j * 5) % 13) as f64) - 6.0;
+        j = j + 1;
+    }
+    let mut n: i64 = 0;
+    while n <= 13 {
+        print((fmax_scaled(xd, 0.5, n) * 4.0) as i64);
+        n = n + 1;
+    }
+    // A NaN at index 5: `max(m, NaN)` is NaN (the compare is false), and the next element displaces
+    // it (`max(NaN, x)` is x). A reassociated fold would answer 4 or keep the NaN.
+    xd[5] = 0.0 / 0.0;
+    n = 0;
+    while n <= 13 {
+        let m: f64 = fmax_scaled(xd, 1.0, n);
+        if m != m {
+            print(-77777);
+        } else {
+            print(m as i64);
+        }
+        n = n + 1;
+    }
+    // +0 and -0 ties: each tie keeps the newer element, so the sign of the answer is the sign of
+    // the last zero seen (1 for +0, 0 for -0; the empty prefix is -1000, printed 0).
+    j = 0;
+    while j < 13 {
+        xd[j] = 0.0;
+        if j % 3 == 1 {
+            xd[j] = -0.0;
+        }
+        j = j + 1;
+    }
+    n = 0;
+    while n <= 13 {
+        let m: f64 = fmax_scaled(xd, 1.0, n);
+        if 1.0 / m > 0.0 {
+            print(1);
+        } else {
+            print(0);
+        }
+        n = n + 1;
+    }
+    free(xd);
+
+    // f32 min with the accumulator on the right, four lanes: x[j] = (11j mod 17) - 0.375j.
+    let mut xf: []f32 = alloc_f32(23);
+    j = 0;
+    while j < 23 {
+        xf[j] = (((j * 11) % 17) as f32) - 0.375 * (j as f32);
+        j = j + 1;
+    }
+    n = 0;
+    while n <= 23 {
+        print((fmin_right(xf, n) * 2.0) as i32);
+        n = n + 1;
+    }
+    free(xf);
+
+    // i32 max, four lane-parallel partials.
+    let mut xi: []i32 = alloc_i32(19);
+    j = 0;
+    while j < 19 {
+        xi[j] = (((j * 2654435761) % 2001) - 1000) as i32;
+        j = j + 1;
+    }
+    n = 0;
+    while n <= 19 {
+        print(imax(xi, n));
+        n = n + 1;
+    }
+    free(xi);
+
+    // i16 min, eight lanes.
+    let mut xs: []i16 = alloc_i16(37);
+    j = 0;
+    while j < 37 {
+        xs[j] = (300 - ((j * 7919) % 601) / 2 - 7 * j) as i16;
+        j = j + 1;
+    }
+    let ns16: [i64; 16] = [0, 1, 7, 8, 9, 15, 16, 17, 23, 24, 25, 31, 32, 33, 36, 37];
+    for t in 0..16 {
+        print(imin16(xs, ns16[t]) as i64);
+    }
+    free(xs);
+
+    // u8 max, sixteen lanes, compared unsigned (values reach 249).
+    let mut xb: []u8 = alloc_u8(37);
+    j = 0;
+    while j < 37 {
+        xb[j] = ((j * 37 + 11) % 251) as u8;
+        j = j + 1;
+    }
+    let ns8: [i64; 9] = [0, 1, 15, 16, 17, 31, 32, 33, 37];
+    for t in 0..9 {
+        print(umax8(xb, ns8[t]) as i64);
+    }
+    free(xb);
+
+    // u32 min, compared unsigned: values on both sides of 2^31.
+    let mut xu: []u32 = alloc_u32(13);
+    j = 0;
+    while j < 13 {
+        xu[j] = (((j * 7919 + 50) % 97) * 40000000 + 7) as u32;
+        j = j + 1;
+    }
+    n = 0;
+    while n <= 13 {
+        print(umin32(xu, n) as i64);
+        n = n + 1;
+    }
+    free(xu);
+
+    // i64 max: the body widens, the fold stays serial.
+    let mut xl: []i64 = alloc_i64(11);
+    j = 0;
+    while j < 11 {
+        xl[j] = (((j * 7919) % 23) - 11) * 1000000007 - j * 999;
+        j = j + 1;
+    }
+    n = 0;
+    while n <= 11 {
+        print(smax64(xl, n));
+        n = n + 1;
+    }
+    free(xl);
+    return 0;
+}
