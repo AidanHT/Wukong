@@ -1391,6 +1391,12 @@ fn early_exit_of(f: &Function, l: &NaturalLoop) -> Option<(BlockId, ValueId, boo
     if exiting == latch {
         return None;
     }
+    // A dead-end exit — a failed bounds check's `call wukong_rt_bounds_fail; unreachable` in the
+    // slow copy `bce` keeps — is a cold path, not a search: widening it buys nothing and costs code
+    // and compile time on every versioned slice loop.
+    if matches!(f.blocks[out.0 as usize].term, Terminator::Unreachable) {
+        return None;
+    }
     let inside: Vec<BlockId> = succs(&f.blocks[l.header.0 as usize].term)
         .into_iter()
         .filter(|b| l.blocks.contains(b))
