@@ -4711,11 +4711,11 @@ impl JitProgram {
         let _guard = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clear();
         reset_failure();
-        // Run the JIT'd entry on a worker thread with a large stack, mirroring the interpreter's
-        // `with_big_stack`. The native code recurses on the host call stack (one machine frame per
-        // Wukong call), so a deeply recursive program would overflow the default ~8 MiB main-thread
-        // stack and *abort* the process — while the interpreter oracle, on its 512 MiB stack,
-        // completes. Without matching headroom the two backends diverge on deep recursion (a stack
+        // Run the JIT'd entry on a worker thread with a large stack. The native code recurses on
+        // the host call stack (one machine frame per Wukong call), so a deeply recursive program
+        // would overflow the default ~8 MiB main-thread stack and *abort* the process — while the
+        // interpreter oracle, whose calls never touch the host stack, completes. Without the
+        // headroom the two backends diverge on deep recursion (a stack
         // overflow vs a correct result), breaking the differential gate. Only the code pointer
         // (passed as a `usize`, since a raw pointer isn't `Send`) and the return type cross the
         // boundary; the `OUTPUT`/`ASSERT_FAILED` statics the JIT'd `rt_*` calls touch are global.
@@ -4816,8 +4816,8 @@ unsafe fn invoke_code(code: usize, ret: &MirType) -> i64 {
 }
 
 /// Run `f` on a worker thread with a large (512 MiB) stack, re-raising any panic on the caller so
-/// behavior is otherwise identical to a direct call. This gives JIT'd Wukong recursion the *same*
-/// headroom as the interpreter's `with_big_stack` worker — without it the native backend overflows
+/// behavior is otherwise identical to a direct call. This gives JIT'd Wukong recursion headroom
+/// comparable to the interpreter's stackless call frames — without it the native backend overflows
 /// the host's ~8 MiB default stack and aborts the process where the interpreter completes, a
 /// divergence the differential gate would otherwise miss (it only re-runs the interpreter across opt
 /// levels). `thread::scope` lets the worker borrow non-`'static` captures.

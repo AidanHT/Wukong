@@ -1041,10 +1041,10 @@ fn differential_array_of_aggregate() {
 
 /// Deep recursion: JIT'd native code recurses on the host call stack (one machine frame per Wukong
 /// call), so without a big-stack worker it overflows the default ~8 MiB stack and *aborts* the
-/// process, while the interpreter (on its 512 MiB stack) completes — a divergence the opt-invariance
-/// harness misses (it only re-runs the interpreter). Both backends now run on matching 512 MiB
-/// stacks, so a depth that overflows the default stack must agree. ~30k frames is well past the
-/// default stack but fast.
+/// process, while the interpreter (whose calls are stackless) completes — a divergence the
+/// opt-invariance harness misses (it only re-runs the interpreter). The native backend now runs on
+/// a 512 MiB stack, so a depth that overflows the default stack must agree. ~30k frames is well
+/// past the default stack but fast.
 #[test]
 fn differential_deep_recursion() {
     let src = "fn sum(n: i32) -> i32 { if n == 0 { return 0; } return n + sum(n - 1); } \

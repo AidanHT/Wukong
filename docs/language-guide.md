@@ -41,7 +41,8 @@ informational (see *Modules & imports*), so a single-file program may omit it. E
 parameters and returns an integer, a float or nothing; the exit code is the **low 8 bits** of the
 value (a float converts toward zero first, saturating; no return type exits 0), so `return 300`
 exits 44 under `--run` and from a linked executable on every OS. The program runs on a 512 MiB
-stack in both `--run` backends and in an `--emit=exe` executable.
+stack under `--run --backend=native` and in an `--emit=exe` executable; the interpreter's calls
+never use the host stack (its call-depth ceiling is 300,000 frames in every build).
 
 ## Source text ✅
 
@@ -1696,9 +1697,11 @@ into a fixed-size array is not yet checked. A recognized kernel (a loop the comp
 runtime kernel call) runs over the extent the loop names and is not checked against slice lengths.
 
 Freeing anything not returned by `alloc_*`, double-freeing, or touching a slice after `free` is
-**undefined behavior** on the native backend; the interpreter's mark-and-forget model (its
-run-scoped memory is never reclaimed) never crashes on it, but such programs are outside the
-differential contract. Allocation failure is the one place the two backends differ by construction. On
+**undefined behavior** on the native backend; the interpreter ignores a free of anything that
+is not a live `alloc_*` block and never crashes on it, but such programs are outside the
+differential contract. The interpreter reuses a freed block for the next allocation that fits
+it, re-zeroed, and releases a function's local arrays when it returns, so a long decode or
+training loop runs in bounded memory on both backends. Allocation failure is the one place the two backends differ by construction. On
 the native backend a failed (or zero-byte) allocation yields a slice whose data pointer is **null**,
 which must not be dereferenced. The interpreter does not mirror that: a null slice whose length still
 says `n` would only move the failure to the first element access, so it reports `interpreter heap

@@ -116,21 +116,18 @@ another architecture or OS is not supported. A native-backend failure is a catal
   return value, `E0435` misused enum payloads, `E0436` non-boolean conditions and `E0437` builtin
   arguments of the wrong kind. `E0401` keeps expected/found mismatches, invalid casts, a value `break`
   out of a statement loop and layout/length limits.
-- Functions (including recursion and mutual recursion — the interpreter oracle runs on a
-  512 MiB worker thread, so ordinary recursion does not overflow the host's small default stack), and
-  direct calls. *Caveat:* the tree-walking interpreter's call frames are ~an order of magnitude larger
-  than the native backend's machine frames, so it recurses less deeply than native. Its ceiling is an
-  explicit, measured cap rather than whatever the stack happens to allow: past `MAX_CALL_DEPTH` —
-  **300,000** nested Wukong calls in a release build — the largest value that rejects no depth measured
-  to complete on the 512 MiB worker — and **40,000** in a debug build, deliberately below that build's
-  measured ceiling but above the depth the `differential_deep_recursion` gate exercises, so the oracle
-  never refuses a depth that gate needs — the interpreter reports
+- Functions (including recursion and mutual recursion), and direct calls. The interpreter oracle is
+  **stackless**: a Wukong call pushes a frame on an explicit heap stack instead of recursing on the
+  host stack, so recursion depth does not depend on the host, the build profile or a worker-thread
+  reservation, and every run executes on its caller's thread. Its ceiling is an explicit,
+  documented cap: past **300,000** nested Wukong calls in every build (override with the
+  `WUKONG_INTERP_MAX_DEPTH` environment variable; it replaced the 40,000-debug / 300,000-release
+  constants that were bisected against a 512 MiB host stack) the interpreter reports
   `error: interpreter call-depth limit exceeded (likely unbounded recursion)` and exits 1. That is a
-  **diagnostic**, never an uncatchable process abort, so an unbounded recursion can no longer take the
-  differential oracle down with it. Recursion past the cap is still a **resource limit outside the
-  bit-for-bit differential contract** — the oracle *refuses* where the native backend still completes,
-  the same "outside the defined contract" status as an out-of-bounds access. Raising the cap past its
-  measured ceiling would reintroduce the abort; lowering it would reject working programs. At `-O1`
+  **diagnostic**, never an uncatchable process abort. Recursion past the cap is a **resource limit
+  outside the bit-for-bit differential contract** — the oracle *refuses* where the native backend
+  (on its 512 MiB `--run` worker stack) may still complete, the same "outside the defined contract" status
+  as an out-of-bounds access. At `-O1`
   and above tail-recursion elimination turns a self-call in tail position into a loop, so a
   tail-recursive function no longer consumes call depth there (an unbounded tail recursion then
   loops until the interpreter's step guard stops it instead of hitting the depth cap).
@@ -246,7 +243,8 @@ another architecture or OS is not supported. A native-backend failure is a catal
   to alloc'd memory and allocation identity sound at every `-O` level. Misuse is a compile error
   (non-integer count / freeing a non-slice E0437, arity E0503 — `tests/fail/heap_*.wk`);
   double-free, freeing a non-alloc slice, or use-after-free is **undefined on native** and
-  mark-and-forget (harmless, never a crash) in the interpreter. interp == native bit-for-bit and
+  ignored or harmless (never a crash) in the interpreter, which reuses freed blocks through a
+  size-bucketed free list and releases a frame's allocas when it returns. interp == native bit-for-bit and
   -O0 == -O3 (`tests/run/heap_{alloc,alloc_fn,zero_init,len}.wk`, `differential_heap_alloc`, and
   `heap_alloc.wk` in the linked-exe AOT gate — the rustc link resolves the two runtime symbols
   from the `wukong_runtime` rlib). Loops over alloc'd slices reach the **recognized-kernel** path:

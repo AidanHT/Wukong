@@ -693,8 +693,9 @@ pub extern "C" fn wukong_rt_alloc(count: i64, elem_size: i64, _elem_is_float: i6
 /// Release an allocation previously returned by [`wukong_rt_alloc`] (the Wukong `free(s)`
 /// builtin). Null — the zero-length or failed allocation — is a no-op. Passing any other pointer,
 /// double-freeing, or touching the slice after the free is **undefined behavior** on the native
-/// backend; the interpreter's mark-and-forget model (its run-scoped memory is never reclaimed)
-/// keeps such programs from crashing there, but they are outside the differential contract.
+/// backend; the interpreter ignores a free of anything that is not a live block (and reuses a
+/// freed block, re-zeroed, for the next allocation that fits it), so such programs never crash
+/// there, but they are outside the differential contract.
 // Non-`unsafe` deliberately (and the file-I/O entries below likewise): these are `#[no_mangle]`
 // C entries whose only Rust caller is the interpreter's marshalling layer, and their raw-pointer
 // contract lives in the `# Safety` docs. Converting the frozen family to `unsafe fn` is a

@@ -6,7 +6,7 @@ it is not the product.
 For each `.wk` program it can lower, reports `-O0` vs `-O3`:
 
 - total MIR op count and reduction
-- interpreter wall-clock per run (adaptively batched), including the 512 MiB worker-thread spawn cost
+- interpreter wall-clock per run (adaptively batched), including `wukong_interp::run`'s fixed setup cost
 
 Every program is also a correctness check: `-O0` and `-O3` must verify, agree on exit code and
 stdout, and Cranelift at `-O3` must agree with the interpreter at `-O3`. Failures print `*** FAILED`

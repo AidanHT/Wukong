@@ -41,18 +41,18 @@
 //! identically, being the same function, so it cannot bias `pipeline cost`; it is part of what
 //! retention measures, alongside the copies.
 //!
-//! **One asymmetry does bias `pipeline cost`, upward, against Wukong, and is measured rather than
-//! argued.** `wukong_interp::run_kernel_f32_accel` wraps every call in `with_big_stack`, which spawns
-//! and joins a fresh 512 MiB-stack thread; a real program pays that once per run, but arm B pays it
-//! once per measured iteration and arm A never does. The round times an empty thread of the same
-//! shape and prints it as `interp thread us`; since `pipeline cost` is a ratio, the subtraction is
-//! done in the RETENTION table's milliseconds rather than on the percentage.
+//! **No per-call thread biases `pipeline cost`.** `wukong_interp::run_kernel_f32_accel` used to
+//! wrap every call in a fresh 512 MiB-stack worker thread, which arm B paid once per measured
+//! iteration and arm A never did, so the round timed an empty thread of that shape
+//! (`interp thread us`) for the reader to net out. The interpreter's calls are now stackless and
+//! every entry point runs on its caller's thread, so the asymmetry, and the probe that measured
+//! it, are gone.
 //!
 //! From those, two published ratios and one attribution:
 //!
 //! - **`pipeline cost` = `e2e_ms` vs `launch_ms`** — both arms are the *same* Wukong function, so the
 //!   difference is the pipeline's own addition: one interpreter entry, the seam's dispatch, the
-//!   `copy_from_slice` into the user's buffer, and the thread above.
+//!   `copy_from_slice` into the user's buffer.
 //! - **`kernel_ms` vs `peer_ms`** — both device-resident, both with their cuBLAS/module handles
 //!   hoisted out of the timed region, i.e. the published table's own comparison re-measured in this
 //!   same round so the two share a denominator, a clock and a container.
@@ -355,39 +355,6 @@ mod tests {
         }
     }
 
-    /// **The cost `with_big_stack` adds to arm B and not to arm A**, measured rather than argued:
-    /// `wukong_interp::run_kernel_f32_accel` spawns and joins a fresh 512 MiB-stack thread per call
-    /// (`wukong_interp`'s `with_big_stack`), so this is the same shape with an empty body — same
-    /// `thread::scope`, same `stack_size`, same `spawn_scoped`/`join`.
-    ///
-    /// Returns the **minimum** across reps in microseconds, not the mean: the root `CLAUDE.md` allows
-    /// "best-of-N minima" and not averages, and the first spawn is cold, so a mean carries it into
-    /// every later reading. Never panics — a failed reservation yields `NAN`, which the caller prints
-    /// as `n/a`, because this is a diagnostic and must not redden a round that already completed.
-    fn interp_thread_overhead_us() -> f64 {
-        const STACK: usize = 512 * 1024 * 1024;
-        const REPS: usize = 32;
-        let mut best = f64::INFINITY;
-        for _ in 0..REPS {
-            let t0 = Instant::now();
-            let ok = std::thread::scope(|s| {
-                match std::thread::Builder::new()
-                    .name("wukong-interp-probe".into())
-                    .stack_size(STACK)
-                    .spawn_scoped(s, || {})
-                {
-                    Ok(h) => h.join().is_ok(),
-                    Err(_) => false,
-                }
-            });
-            if !ok {
-                return f64::NAN;
-            }
-            best = best.min(t0.elapsed().as_secs_f64() * 1e6);
-        }
-        best
-    }
-
     /// **THE END-TO-END ROUND.** See the module documentation for what each column means and why
     /// `e2e_ms` may not be quoted against the resident-buffer peer.
     ///
@@ -533,10 +500,6 @@ mod tests {
         }
 
         // --- 4. per shape: witness, correctness, then timing -----------------------------------
-        // Measured before the device work, which makes it a LOWER BOUND on what arm B pays mid-round:
-        // the per-shape host buffers (768 MiB at sq8192) do not exist yet, so the reservation is
-        // cheaper here than it will be later. The RETENTION block says so where the number is used.
-        let thread_us = interp_thread_overhead_us();
         let mut rows: Vec<(&GemmPoint, ShapeCosts, bi::BenchVerdict, bi::BenchVerdict)> =
             Vec::new();
         for p in WGMMA_BENCH_GRID {
@@ -784,8 +747,7 @@ mod tests {
              `pipeline cost` is what the INTERPRETER and the OFFLOAD SEAM add over calling the\n\
              launcher directly -- same function in both arms, and the compile is NOT in either of\n\
              them (it runs once per shape outside the twin; see the DIAGNOSTIC block). A tie means the\n\
-             route is free. Part of it is the interpreter's per-call thread; the RETENTION table below\n\
-             says how to net that out in ms.\n\
+             route is free.\n\
              `kernel/cuBLAS` is the resident-buffer pair: the campaign's own comparison, re-measured\n\
              here in the same round, same clock, same container, same iteration counts, and its\n\
              contender's timed region is `{}`.\n",
@@ -861,12 +823,7 @@ mod tests {
              `Published::contender`), never from a raw verdict field, so a row whose twin refused\n\
              shows the refusal rather than a number the gate would not have allowed. `retention`\n\
              itself is their QUOTIENT ACROSS TWO TWINS and therefore carries no floor of its own --\n\
-             its two operands were each gated, against different denominators.\n\
-             `e2e ms` includes one 512 MiB-stack thread spawn per call that a real program pays once\n\
-             per run and `launch ms` never pays. So the thread-free end-to-end cost is\n\
-             `e2e ms - interp thread us/1000`, and the SEAM's own addition is that minus `launch ms`.\n\
-             `interp thread us` is measured before the per-shape host buffers exist, so it is a lower\n\
-             bound on what arm B pays mid-round.\n"
+             its two operands were each gated, against different denominators.\n"
         );
         eprintln!(
             "  {:<15} {:>11} {:>11} {:>11} {:>11} {:>11}",
@@ -908,13 +865,7 @@ mod tests {
              out of its loop, AND it is the first cublasGemmEx at this shape in the process -- the peer\n\
              probe only ever built a handle -- so it also pays cuBLAS's lazy kernel load and heuristic\n\
              selection. It is here because the honest end-to-end peer does not yet exist; it is not an\n\
-             arm and must not be quoted as a ratio.\n\
-             `interp thread us` is the 512 MiB-stack thread `run_kernel_f32_accel` spawns per call,\n\
-             which arm B pays every iteration and a real program pays once per run.\n"
-        );
-        eprintln!(
-            "  interp thread us : {} (best of many; arm B pays it per call, a real run pays it once)",
-            ms(thread_us)
+             arm and must not be quoted as a ratio.\n"
         );
         eprintln!(
             "  {:<15} {:>12} {:>16}",

@@ -1,0 +1,86 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT-VALUES: 0 687 0 1317 0 1947
+// EXPECT-OUT-VALUES: 0 0 0 0 0 0
+// EXPECT-OUT-VALUES: 2.5 0 0 0 0 0.5
+// EXPECT-OUT-VALUES: 131054
+module tests.run.interp_memory_reuse
+
+// Memory reuse must be invisible: the interpreter now hands a freed heap block to the next
+// allocation that fits it and releases a frame's local arrays when the call returns, while native
+// gets fresh calloc'd memory and a fresh stack frame. Every value below is derived by hand from the
+// language rules (an allocation reads all-zero, a local array starts from its initializer):
+//
+// * `step(t)` allocates 6 i32s and folds them before writing (z = z*7 + h[i]): all-zero, so 0, even
+//   on the calls that reuse the block the previous call freed. It then fills h[i] = 10t + i and
+//   folds acc = acc*2 + h[i] = 32h0 + 16h1 + 8h2 + 4h3 + 2h4 + h5 = 63*10t + 57:
+//   t = 1, 2, 3 -> 687, 1317, 1947.
+// * A freed i32 block written with 99s is reused by an f32 allocation of the same length, which
+//   must read 0 in every lane; after f[0] = 2.5 and f[5] = 0.5 it prints 2.5 0 0 0 0 0.5.
+// * `local_sum(k)` sets a[k] = k + 1 in a fresh 16-lane local and folds s = s*2 + a[i], which is
+//   (k + 1) * 2^(15 - k). Summed over k = 0..15 (16 calls, each releasing its frame):
+//   1*32768 + 2*16384 + 3*8192 + 4*4096 + 5*2048 + 6*1024 + 7*512 + 8*256 + 9*128 + 10*64
+//   + 11*32 + 12*16 + 13*8 + 14*4 + 15*2 + 16*1 = 131054.
+//
+// Every loop is a recurrence or an integer store, so no kernel recognizer fires.
+
+fn step(t: i32) -> i32 {
+    let mut h: []i32 = alloc_i32(6);
+    let mut z: i32 = 0;
+    for i in 0..6 {
+        z = z * 7 + h[i];
+    }
+    print(z);
+    for i in 0..6 {
+        h[i] = t * 10 + (i as i32);
+    }
+    let mut acc: i32 = 0;
+    for i in 0..6 {
+        acc = acc * 2 + h[i];
+    }
+    free(h);
+    return acc;
+}
+
+fn local_sum(k: i32) -> i32 {
+    let mut a: [i32; 16] = [0; 16];
+    a[k] = k + 1;
+    let mut s: i32 = 0;
+    for i in 0..16 {
+        s = s * 2 + a[i];
+    }
+    return s;
+}
+
+fn main() -> i32 {
+    let mut t: i32 = 1;
+    while t < 4 {
+        print(step(t));
+        t = t + 1;
+    }
+
+    let mut q: []i32 = alloc_i32(6);
+    for i in 0..6 {
+        q[i] = 99;
+    }
+    free(q);
+    let mut f: []f32 = alloc_f32(6);
+    for i in 0..6 {
+        print(f[i]);
+    }
+    f[0] = 2.5;
+    f[5] = 0.5;
+    for i in 0..6 {
+        print(f[i]);
+    }
+    free(f);
+
+    let mut total: i32 = 0;
+    let mut k: i32 = 0;
+    while k < 16 {
+        total = total + local_sum(k);
+        k = k + 1;
+    }
+    print(total);
+    return 0;
+}
