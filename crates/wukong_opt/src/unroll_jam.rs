@@ -1170,7 +1170,8 @@ fn slab_region(g: &Group, idx: &Idx2, layout: Layout) -> Region {
 
 /// The element range an object only read occupies, when its accesses share one `α`, `β` and `S`
 /// with non-negative multipliers: evaluated at the first and the last row and inner iteration.
-/// A symbolic multiplier that is negative at run time inverts the range, which the guard rejects.
+/// A symbolic multiplier may still be negative at run time, which would leave accesses outside the
+/// range: the guard checks every one is non-negative ([`Em::nonnegative_multipliers`]).
 fn load_region(g: &Group, accs: &[Acc]) -> Option<Region> {
     let first = &accs[g.members[0]].idx;
     let (mut kmin, mut kmax) = (first.k, first.k);
@@ -1380,13 +1381,35 @@ impl Em<'_> {
             let h_first = self.push(MirType::I1, Op::Cmp(CmpOp::Ule, hh, gl));
             let apart = self.push(MirType::I1, Op::Bin(BinOp::Or, g_first, h_first));
             let ordered = self.push(MirType::I1, Op::Bin(BinOp::And, g_ok, h_ok));
-            let pair = self.push(MirType::I1, Op::Bin(BinOp::And, ordered, apart));
+            let mut pair = self.push(MirType::I1, Op::Bin(BinOp::And, ordered, apart));
+            for region in [g, h] {
+                pair = self.nonnegative_multipliers(region, pair);
+            }
             acc = Some(match acc {
                 None => pair,
                 Some(prev) => self.push(MirType::I1, Op::Bin(BinOp::And, prev, pair)),
             });
         }
         acc.expect("a guard has at least one pair")
+    }
+
+    /// `acc`, and every symbolic multiplier in `g`'s ends non-negative at run time. A range is
+    /// evaluated at the first and last row and inner iteration, which bounds every access only when
+    /// each multiplier is non-negative: a negative one mixed with a positive one (`x[r*s + t]`
+    /// with `s < 0`) can still leave `lo <= hi` while missing accesses on both sides, so the
+    /// `ordered` test alone does not catch it.
+    fn nonnegative_multipliers(&mut self, g: &Region, mut acc: ValueId) -> ValueId {
+        for &(c, _) in g.lo.parts.iter().chain(&g.hi.parts) {
+            let Coeff::Sym(v, m) = c else {
+                continue;
+            };
+            let w = self.wide(v, true);
+            let s = self.scaled(w, m);
+            let zero = self.int(&MirType::I64, 0);
+            let ok = self.push(MirType::I1, Op::Cmp(CmpOp::Sge, s, zero));
+            acc = self.push(MirType::I1, Op::Bin(BinOp::And, acc, ok));
+        }
+        acc
     }
 }
 
