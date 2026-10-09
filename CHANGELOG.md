@@ -11,6 +11,9 @@ All notable changes to Wukong are documented here. The format is loosely based o
   with `T` opaque, so `add(p, q)` on two structs compiled and lowered `a + b` on struct pointers;
   each concrete instantiation is now checked again, and an error points into the generic body with
   a "required by this instantiation of `add` with T = Point" label on the call.
+- **Literal arguments of a generic call adapt.** `add(x_i64, 1)` was `E0401` and `add(1, x_i64)`
+  bound `T = i32` from the literal; the non-literal arguments now bind first and an unsuffixed
+  literal takes their type, as it does for a concrete parameter.
 - **Tensors may be generic over their element type.** `fn axpy<T, N>(a: T, x: Tensor[T, N], mut y:
   Tensor[T, N])` (was `E0302`) is compiled once per element type, and `alloc::<T>(n)` is the generic
   heap allocator (`E0325` for a non-scalar element).

@@ -175,7 +175,9 @@ function is compiled once per distinct binding (`add$f32`, `add$i64`). The body 
 `T` opaque, and **every instantiation is checked again at its concrete types**: `add(p, q)` with
 `p, q: Point` is `E0433` at `a + b`, with a secondary label "required by this instantiation of `add`
 with T = Point" on the call (`tests/fail/generic_instantiation_bad_op.wk`). Instantiations reached
-through another generic are checked too (`tests/fail/generic_instantiation_transitive.wk`).
+through another generic are checked too (`tests/fail/generic_instantiation_transitive.wk`). An
+unsuffixed literal argument takes the type the call's other arguments bind its parameter to:
+`add(x_i64, 1)` and `add(1, x_i64)` are both `add$i64` (`tests/run/generic_literal_arg.wk`).
 
 A tensor's **element** may be a type parameter, so one kernel serves every dtype:
 

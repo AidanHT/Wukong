@@ -219,6 +219,9 @@ impl Sema<'_> {
                                 ret: Box::new(sig.ret.clone()),
                             },
                         );
+                        // A literal argument of a generic parameter takes the type the other
+                        // arguments bind it to (`instantiate.rs`).
+                        self.adapt_generic_literal_args(&sig, args, &mut arg_tys);
                         // Function-valued arguments and trait bounds (`methods.rs`).
                         self.check_fn_value_args(&sig, args, &arg_tys);
                         self.check_call_bounds(name, &sig, generic_args, &arg_tys, span);

@@ -27,10 +27,11 @@
 //! module whose body pass was clean, so an error in a generic body is reported once, not once per
 //! instance.
 
-use wukong_ast::{Attr, Block, FnDecl, ItemKind, Module};
+use wukong_ast::{Attr, Block, Expr, FnDecl, ItemKind, Module};
 use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet, Span, Symbol};
 use wukong_types::Ty;
 
+use crate::shape::infer_type_generics;
 use crate::{FnSig, Sema};
 
 /// The most distinct instantiations re-checked in one module. Real programs stay far below it; it
@@ -144,6 +145,42 @@ impl<'a> Sema<'a> {
             }
             Ty::Tensor { elem_var, .. } => elem_var.is_none(),
             _ => true,
+        }
+    }
+
+    /// Adapt an unsuffixed literal argument of a generic call to the type its generic parameter is
+    /// bound to by the call's other arguments, exactly as a literal adapts to a concrete scalar
+    /// parameter. Inference used to bind from the arguments in order, first binding winning, so
+    /// `add(x_i64, 1)` bound `T = i64` and then rejected the `i32` literal (E0401), and
+    /// `add(1, x_i64)` bound `T = i32` from the literal. The non-literal arguments now bind first;
+    /// a literal whose generic they leave unbound keeps its default type.
+    pub(crate) fn adapt_generic_literal_args(
+        &mut self,
+        sig: &FnSig,
+        args: &[Expr],
+        arg_tys: &mut [Ty],
+    ) {
+        if sig.generics.is_empty() {
+            return;
+        }
+        let mut tys: HashMap<Symbol, Ty> = HashMap::default();
+        for ((p, a), t) in sig.params.iter().zip(args).zip(arg_tys.iter()) {
+            if !self.is_adaptable_num_literal(a) {
+                infer_type_generics(p, t, &sig.generics, &mut tys);
+            }
+        }
+        for (i, (p, a)) in sig.params.iter().zip(args).enumerate() {
+            let Ty::Named(g) = p else {
+                continue;
+            };
+            let Some(bound) = tys.get(g).filter(|t| matches!(t, Ty::Scalar(_))).cloned() else {
+                continue;
+            };
+            if self.literal_adapts(&bound, a) {
+                self.retype_adapted_literal(a, &bound);
+                self.range_check_int_literal(a, &bound);
+                arg_tys[i] = bound;
+            }
         }
     }
 

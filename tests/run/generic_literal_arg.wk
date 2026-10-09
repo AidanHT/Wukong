@@ -1,0 +1,32 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 3000000001
+// EXPECT-OUT: 3000000001
+// EXPECT-OUT: 10
+// EXPECT-OUT: 255
+// EXPECT-OUT: -2999999999
+module tests.run.generic_literal_arg
+
+// An unsuffixed literal argument of a generic call takes the type the other arguments bind `T` to,
+// wherever it is written. Inference used to bind in argument order with the first binding winning:
+// `add(big, 1)` bound `T = i64` and then rejected the `i32` literal (E0401), and `add(1, big)` bound
+// `T = i32` from the literal. Every value below needs the wide or unsigned instance.
+fn add<T>(a: T, b: T) -> T {
+    return a + b;
+}
+
+fn scale<T>(x: T, k: T) -> T {
+    return x * k;
+}
+
+fn main() -> i32 {
+    let big: i64 = 3000000000;
+    print(add(big, 1)); // 3000000000 + 1
+    print(add(1, big)); // 1 + 3000000000
+    let h: f64 = 2.5;
+    print(scale(h, 4.0)); // 2.5 * 4
+    let u: u8 = 200;
+    print(add(u, 55)); // 200 + 55, a u8 add
+    print(add(-big, 1)); // -3000000000 + 1
+    return 0;
+}
