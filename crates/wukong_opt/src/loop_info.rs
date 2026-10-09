@@ -724,6 +724,33 @@ pub struct Reduction {
     /// `c ? acc ⊕ x : acc` per element — which needs no identity and is exact for every operator,
     /// a float `+` on `-0.0` or a signalling NaN included.
     pub merge: Option<ValueId>,
+    /// An **index-recording** min/max (`if x[i] > m { m = x[i]; at = i; }`, an argmax): the second
+    /// value the same branch updates. `None` for every other reduction. The branch's compare reads
+    /// every partial maximum, so this pair is only a reduction *as a pair* — see [`ArgIndex`].
+    pub arg: Option<ArgIndex>,
+}
+
+/// The index half of an argmax/argmin: a second header parameter that the min/max's own branch
+/// sets to an induction variable on the arm that takes the new value, and passes through on the
+/// arm that keeps the old one.
+///
+/// The pair is the reduction. Per iteration it is exactly `(m, at) = c ? (x, i) : (m, at)` with
+/// `c` the min/max's compare, so a consumer may keep it in per-lane `(value, index)` partials and
+/// combine those by value first and iteration order second — but only under rules the consumer
+/// has to prove for itself (a strict compare, the update on the `then` arm, an index that grows
+/// with the iteration). This records the shape, not that licence.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ArgIndex {
+    /// The header parameter holding the recorded index.
+    pub param: ValueId,
+    /// Its position in the header's parameter list.
+    pub param_index: usize,
+    /// The initial value, from the entering edge.
+    pub start: Option<ValueId>,
+    /// The join parameter the latch passes back for it.
+    pub merge: ValueId,
+    /// The value recorded on the updating arm: a basic induction variable of this loop.
+    pub index: ValueId,
 }
 
 /// A min/max accumulate as the front end spells it: `c = cmp(pred, x, y); acc' = select(c, t, e)`,
@@ -1936,7 +1963,98 @@ fn classify_carried(
         };
         carried.push(CarriedValue { param: p, kind });
     }
+    // Index-recording min/max pairs: two parameters the per-parameter test above left as
+    // recurrences, because one branch updates both and its compare reads every partial maximum.
+    for km in 0..carried.len() {
+        for ka in 0..carried.len() {
+            if km == ka
+                || carried[km].kind != Carried::Recurrence
+                || carried[ka].kind != Carried::Recurrence
+            {
+                continue;
+            }
+            let (Some(nm), Some(na)) = (latch_arg(f, l, km), latch_arg(f, l, ka)) else {
+                continue;
+            };
+            let (pm, pa) = (carried[km].param, carried[ka].param);
+            if let Some(r) = arg_reduction_of(ctx, l, ivs, (pm, km, nm), (pa, ka, na)) {
+                reductions.push(r);
+                carried[km].kind = Carried::Reduction(reductions.len() - 1);
+                carried[ka].kind = Carried::Reduction(reductions.len() - 1);
+            }
+        }
+    }
     (carried, reductions)
+}
+
+/// An argmax/argmin: `if x > m { m = x; at = i; }` — header parameter `m` (at `km`, passed back as
+/// `nm`) and `at` (at `ka`, passed back as `na`) merged by one branch that chooses those two values
+/// and nothing else, `m`'s side being exactly a branch-spelled min/max ([`select_combine`]) and
+/// `at`'s taking a basic induction variable on the arm where `m` takes `x`. Every read of `m`, of
+/// `at` and of the compare is accounted for, so no partial is observed but by the pair itself.
+fn arg_reduction_of(
+    ctx: &LoopCtx<'_>,
+    l: &NaturalLoop,
+    ivs: &[InductionVar],
+    (pm, km, nm): (ValueId, usize, ValueId),
+    (pa, ka, na): (ValueId, usize, ValueId),
+) -> Option<Reduction> {
+    let f = ctx.f;
+    let bm = branch_merge(ctx, l, nm)?;
+    let ba = branch_merge(ctx, l, na)?;
+    if bm.join != ba.join || bm.cond != ba.cond || !bm.arms_empty {
+        return None;
+    }
+    let only_these_two = bm
+        .then_edge
+        .iter()
+        .zip(&bm.else_edge)
+        .enumerate()
+        .all(|(j, (a, b))| j == bm.k || j == ba.k || a == b);
+    if !only_these_two {
+        return None;
+    }
+    let c = select_combine(ctx, pm, bm.cond, bm.then_arg, bm.else_arg)?;
+    let s = c.select?;
+    // The index is taken on the arm where `m` takes the new value, and kept on the other.
+    let (index, kept) = if s.acc_is_then {
+        (ba.else_arg, ba.then_arg)
+    } else {
+        (ba.then_arg, ba.else_arg)
+    };
+    if kept != pa || index == pa || !ivs.iter().any(|iv| iv.value == index) {
+        return None;
+    }
+    if f.value_type(pa) != f.value_type(index) {
+        return None;
+    }
+    if uses_in_loop(ctx, l, bm.cond) != 1
+        || uses_in_loop(ctx, l, pm) != 2
+        || uses_in_loop(ctx, l, pa) != 1
+        || uses_in_loop(ctx, l, nm) != 1
+        || uses_in_loop(ctx, l, na) != 1
+    {
+        return None;
+    }
+    Some(Reduction {
+        param: pm,
+        param_index: km,
+        start: entry_arg(f, l, km),
+        kind: c.kind,
+        combine: nm,
+        addend: c.addend,
+        fma_factors: None,
+        reassociable: false,
+        select: c.select,
+        merge: None,
+        arg: Some(ArgIndex {
+            param: pa,
+            param_index: ka,
+            start: entry_arg(f, l, ka),
+            merge: na,
+            index,
+        }),
+    })
 }
 
 /// The reduction header parameter `p` (at position `k`) carries, given the value `next` the latch
@@ -1981,6 +2099,7 @@ fn reduction_of(
         reassociable: c.kind.reassociable(),
         select: c.select,
         merge,
+        arg: None,
     };
     if let Some(c) = combine_kind(ctx, p, next) {
         if uses_in_loop(ctx, l, p) != combine_reads(&c)? {
@@ -2014,7 +2133,7 @@ fn reduction_of(
 }
 
 /// A value a two-way branch in the loop body chooses: `m = cond ? then_arg : else_arg`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct BranchMerge {
     cond: ValueId,
     then_arg: ValueId,
@@ -2023,6 +2142,14 @@ struct BranchMerge {
     /// other parameter of the join receives the same value from both sides — so the branch has no
     /// effect but `m`, and its condition is observed nowhere else.
     private: bool,
+    /// The join block, `m`'s position among its parameters, whether the arm blocks hold no
+    /// instruction, and the full argument lists of the `then` and `else` edges — what
+    /// [`arg_reduction_of`] needs to prove that a branch chooses exactly *two* values.
+    join: BlockId,
+    k: usize,
+    arms_empty: bool,
+    then_edge: Vec<ValueId>,
+    else_edge: Vec<ValueId>,
 }
 
 /// `m` as a two-way merge: a parameter of a loop block other than the header, entered along
@@ -2092,10 +2219,11 @@ fn branch_merge(ctx: &LoopCtx<'_>, l: &NaturalLoop, m: ValueId) -> Option<Branch
     };
     let then_arg = *then_edge.get(k)?;
     let else_arg = *else_edge.get(k)?;
-    let private = [arm0, arm1]
+    let arms_empty = [arm0, arm1]
         .into_iter()
         .flatten()
-        .all(|a| f.blocks[a.0 as usize].insts.is_empty())
+        .all(|a| f.blocks[a.0 as usize].insts.is_empty());
+    let private = arms_empty
         && then_edge
             .iter()
             .zip(else_edge)
@@ -2106,6 +2234,11 @@ fn branch_merge(ctx: &LoopCtx<'_>, l: &NaturalLoop, m: ValueId) -> Option<Branch
         then_arg,
         else_arg,
         private,
+        join,
+        k,
+        arms_empty,
+        then_edge: then_edge.clone(),
+        else_edge: else_edge.clone(),
     })
 }
 
@@ -3635,13 +3768,42 @@ mod tests {
     }
 
     /// The same branch steering a second value (`if v > m { m = v; at = i; }`, an argmax) observes
-    /// every partial maximum through its condition, so neither carried value is a reduction.
+    /// every partial maximum through its condition, so neither carried value is a reduction on its
+    /// own — but the pair is ONE: the max, with the index recorded as its [`ArgIndex`]. Both header
+    /// parameters point at that one reduction.
     #[test]
-    fn a_branch_that_also_records_an_index_is_not_a_reduction() {
+    fn a_branch_that_also_records_an_index_is_an_arg_reduction() {
         let src = "@unchecked fn k(x: []f32, n: i64) -> i64 { let mut m: f32 = 0.0; \
                    let mut at: i64 = 0; let mut i: i64 = 0; \
                    while i < n { let v: f32 = x[i]; if v > m { m = v; at = i; } i = i + 1; } \
                    return at; } \
+                   fn main() -> i32 { return 0; }";
+        let (_, l) = kernel_loop(src, "k");
+        assert_eq!(l.reductions.len(), 1, "{:?}", l.carried);
+        let r = &l.reductions[0];
+        assert_eq!(r.kind, RedKind::FMax);
+        let a = r.arg.expect("the index half of the argmax");
+        let iv = l.primary().expect("a counter");
+        assert_eq!(a.index, iv.value, "the recorded index is the counter");
+        assert!(matches!(
+            l.carried[a.param_index].kind,
+            Carried::Reduction(0)
+        ));
+        assert!(matches!(
+            l.carried[r.param_index].kind,
+            Carried::Reduction(0)
+        ));
+        assert!(l.is_vectorizable_shape());
+    }
+
+    /// The same pair with the index ALSO read elsewhere (a store of the running index) observes a
+    /// partial, so it stays a recurrence.
+    #[test]
+    fn an_argmax_whose_index_is_observed_is_not_a_reduction() {
+        let src = "@unchecked fn k(x: []f32, mut o: []i64, n: i64) -> i64 { let mut m: f32 = 0.0; \
+                   let mut at: i64 = 0; let mut i: i64 = 0; \
+                   while i < n { let v: f32 = x[i]; o[i] = at; if v > m { m = v; at = i; } \
+                   i = i + 1; } return at; } \
                    fn main() -> i32 { return 0; }";
         let (_, l) = kernel_loop(src, "k");
         assert!(l.reductions.is_empty(), "{:?}", l.carried);

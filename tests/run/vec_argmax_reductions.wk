@@ -1,0 +1,193 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: -1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 4
+// EXPECT-OUT: -1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -77777
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+module tests.run.vec_argmax_reductions
+
+// Index-recording min/max (argmax / argmin) over SLICES in `while` loops: the spellings the
+// rowarg/colarg recognizers do not claim, which the general vectorizer now widens with per-lane
+// `(value, index)` partials and an exit fold that breaks value ties by iteration order.
+//
+// Every expected line is derived by hand from the scalar loop's semantics — strict compare, so a
+// tie keeps the EARLIEST index; an ordered compare against NaN is false, so a NaN never updates and
+// a NaN start updates nothing; `-0.0 > +0.0` and `+0.0 > -0.0` are both false, so the first zero
+// seen is the one kept, sign included. Each kernel is printed at EVERY trip count 0..len, so the
+// split between the vector loop and the scalar epilogue moves through every position.
+//
+// amax over x = [3, 7, 1, 7, 9, 2, 9, 0, 9, 5, 4, 9, 8] from (x[0], 0), counting from 1. The 9s
+// sit at 4, 6, 8 and 11; at n = 13 the groups put 9@6 in lane 1, 9@11 in lane 2 and 9@4 in
+// lane 3, so the fold must prefer the LAST lane, whose index is earliest.
+@unchecked
+fn amax(x: []f32, n: i64) -> i64 {
+    let mut m: f32 = x[0];
+    let mut at: i64 = 0;
+    let mut i: i64 = 1;
+    while i < n {
+        if x[i] > m {
+            m = x[i];
+            at = i;
+        }
+        i = i + 1;
+    }
+    return at;
+}
+
+// argmin with the accumulator on the LEFT of the compare (`m > y[i]`), i32 values, i64 index:
+// y = [5, -2, 8, -2, -7, 3, -7, -7, 0, 1, -7, 6, -3, 2, -7, 9, 4], start (m0, -1).
+// From 1000: the -2 at 1 is not replaced by the -2 at 3, the -7 at 4 by no later -7.
+// From -100 or -7 nothing is strictly smaller: -1 (and the un-updated lanes tie only each other).
+@unchecked
+fn amin(y: []i32, n: i64, m0: i32) -> i64 {
+    let mut m: i32 = m0;
+    let mut at: i64 = -1;
+    let mut i: i64 = 0;
+    while i < n {
+        if m > y[i] {
+            m = y[i];
+            at = i;
+        }
+        i = i + 1;
+    }
+    return at;
+}
+
+// f64 argmax (two lanes) from (m0, -1), the final maximum written to out[0].
+@unchecked
+fn amaxd(z: []f64, n: i64, m0: f64, mut out: []f64) -> i64 {
+    let mut m: f64 = m0;
+    let mut at: i64 = -1;
+    let mut i: i64 = 0;
+    while i < n {
+        if z[i] > m {
+            m = z[i];
+            at = i;
+        }
+        i = i + 1;
+    }
+    out[0] = m;
+    return at;
+}
+
+// -1 for a negative zero (or any negative), 1 for a positive one, -77777 for NaN.
+fn sign_of(v: f64) -> i32 {
+    if v != v {
+        return -77777;
+    }
+    if 1.0 / v < 0.0 {
+        return -1;
+    }
+    return 1;
+}
+
+fn main() -> i32 {
+    let mut x: []f32 = alloc_f32(13);
+    x[0] = 3.0; x[1] = 7.0; x[2] = 1.0; x[3] = 7.0; x[4] = 9.0; x[5] = 2.0; x[6] = 9.0;
+    x[7] = 0.0; x[8] = 9.0; x[9] = 5.0; x[10] = 4.0; x[11] = 9.0; x[12] = 8.0;
+    // 0 0 1 1 1 4 4 4 4 4 4 4 4 4
+    let mut n: i64 = 0;
+    while n <= 13 { print(amax(x, n)); n = n + 1; }
+
+    let mut y: []i32 = alloc_i32(17);
+    y[0] = 5; y[1] = -2; y[2] = 8; y[3] = -2; y[4] = -7; y[5] = 3; y[6] = -7; y[7] = -7;
+    y[8] = 0; y[9] = 1; y[10] = -7; y[11] = 6; y[12] = -3; y[13] = 2; y[14] = -7; y[15] = 9;
+    y[16] = 4;
+    // -1 0 1 1 1 4 (x13)
+    n = 0;
+    while n <= 17 { print(amin(y, n, 1000)); n = n + 1; }
+    // -1 -1 4
+    print(amin(y, 17, -100));
+    print(amin(y, 17, -7));
+    print(amin(y, 17, -3));
+
+    // z = [-0, +0, NaN, -1, +0, NaN, -0, -5, +0]: from -1 the -0 at 0 wins, and the +0 at 1 (in
+    // the other lane) only ties it — so at = 0 and the maximum keeps its NEGATIVE sign.
+    let mut z: []f64 = alloc_f64(9);
+    let mut out: []f64 = alloc_f64(1);
+    let negz: f64 = 0.0 * -1.0;
+    let nan: f64 = 0.0 / 0.0;
+    z[0] = negz; z[1] = 0.0; z[2] = nan; z[3] = -1.0; z[4] = 0.0; z[5] = nan; z[6] = negz;
+    z[7] = -5.0; z[8] = 0.0;
+    // -1 0 0 0 0 0 0 0 0 0
+    n = 0;
+    while n <= 9 { print(amaxd(z, n, -1.0, out)); n = n + 1; }
+    // -1: the maximum is the negative zero.
+    print(sign_of(out[0]));
+    // A NaN start: nothing compares greater — -1, and the maximum stays NaN.
+    print(amaxd(z, 9, nan, out));
+    print(sign_of(out[0]));
+    // A -0 start: no zero is greater than it — -1, sign -1. A +0 start: -1, sign +1.
+    print(amaxd(z, 9, negz, out));
+    print(sign_of(out[0]));
+    print(amaxd(z, 9, 0.0, out));
+    print(sign_of(out[0]));
+
+    // w = [1, 4, 4, 2, NaN, 4, 3] from -1: lane 0 ends at 4@2, lane 1 at 4@1 — the later lane's
+    // index is earlier, so at = 1 at every n >= 2. -1 0 1 1 1 1 1 1, then the maximum, 4.
+    let mut w: []f64 = alloc_f64(7);
+    w[0] = 1.0; w[1] = 4.0; w[2] = 4.0; w[3] = 2.0; w[4] = nan; w[5] = 4.0; w[6] = 3.0;
+    n = 0;
+    while n <= 7 { print(amaxd(w, n, -1.0, out)); n = n + 1; }
+    print(out[0] as i64);
+
+    free(x); free(y); free(z); free(out); free(w);
+    return 0;
+}
