@@ -198,6 +198,7 @@ fn op_operands(op: &Op) -> Vec<ValueId> {
         | Op::Splat(a)
         | Op::Round(_, a)
         | Op::Widen { v: a, .. }
+        | Op::IntUnary(_, a)
         | Op::ExtractLane(a, _) => vec![*a],
         Op::Cast(_, a, _) => vec![*a],
         Op::Select(c, a, b) => vec![*c, *a, *b],

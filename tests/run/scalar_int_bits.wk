@@ -1,0 +1,106 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 4
+// EXPECT-OUT: 8
+// EXPECT-OUT: 2
+// EXPECT-OUT: 24
+// EXPECT-OUT: 1
+// EXPECT-OUT: 32
+// EXPECT-OUT: 64
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 32
+// EXPECT-OUT: 7
+// EXPECT-OUT: 0
+// EXPECT-OUT: 4
+// EXPECT-OUT: 8
+// EXPECT-OUT: 0
+// EXPECT-OUT: 31
+// EXPECT-OUT: 32
+// EXPECT-OUT: 0
+// EXPECT-OUT: 63
+// EXPECT-OUT: 240
+// EXPECT-OUT: 384
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4022250974
+// EXPECT-OUT: 128
+// EXPECT-OUT: 17279655951921914625
+// EXPECT-OUT: -1
+// EXPECT-OUT: 225
+// EXPECT-OUT: 60
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4260027374
+// EXPECT-OUT: 3940282109
+// EXPECT-OUT: 2541551405711093505
+// EXPECT-OUT: 17298946664678735070
+// EXPECT-OUT: 128
+// EXPECT-OUT: 32769
+module tests.run.scalar_int_bits
+
+// The integer bit builtins on every width and signedness, at their edges: `popcount`, `clz`, `ctz`
+// and `bswap` (one machine instruction each — `Op::IntUnary`; `bswap` of a byte is the byte) and
+// `rotl`/`rotr` (shifts by the amount modulo the width, so 36 rotates a u32 by 4 and -1 rotates a
+// byte by 7). Every result is the operand's own type: unsigned prints its magnitude. The expected
+// lines are the bit-pattern definitions evaluated independently (popcount = number of ones in the
+// type's width, clz/ctz of zero = the width, bswap = the bytes reversed, rotl by k = (x << k) |
+// (x >> (w - k)) over w bits), never recorded from the compiler.
+fn main() -> i32 {
+    let a8: u8 = 0xF0;
+    let b8: i8 = -1;
+    let c8: u8 = 1;
+    let a16: u16 = 0x8001;
+    let b16: i16 = 0x100;
+    let a32: u32 = 0xDEADBEEF;
+    let b32: i32 = -2147483647 - 1;
+    let z32: u32 = 0;
+    let a64: u64 = 0x0123456789ABCDEF;
+    let b64: i64 = -1;
+    let c64: u64 = 0x8000000000000000;
+
+    print(popcount(a8)); // 4
+    print(popcount(b8)); // 8
+    print(popcount(a16)); // 2
+    print(popcount(a32)); // 24
+    print(popcount(b32)); // 1
+    print(popcount(a64)); // 32
+    print(popcount(b64)); // 64
+    print(popcount(z32)); // 0
+
+    print(clz(a8)); // 0
+    print(clz(c8)); // 7
+    print(clz(a16)); // 0
+    print(clz(b16)); // 7
+    print(clz(z32)); // 32
+    print(clz(a64)); // 7
+    print(clz(b64)); // 0
+
+    print(ctz(a8)); // 4
+    print(ctz(b16)); // 8
+    print(ctz(a32)); // 0
+    print(ctz(b32)); // 31
+    print(ctz(z32)); // 32
+    print(ctz(a64)); // 0
+    print(ctz(c64)); // 63
+
+    print(bswap(a8)); // 240: one byte reversed is itself
+    print(bswap(a16)); // 0x0180
+    print(bswap(b16)); // 0x0001
+    print(bswap(a32)); // 0xEFBEADDE
+    print(bswap(b32)); // 0x00000080
+    print(bswap(a64)); // 0xEFCDAB8967452301
+    print(bswap(b64)); // -1
+
+    print(rotl(a8, 1)); // 0xE1
+    print(rotr(a8, 2)); // 0x3C
+    print(rotl(b32, 1)); // 0x00000001
+    print(rotr(a32, 4)); // 0xFDEADBEE
+    print(rotl(a32, 36)); // 36 mod 32 = 4: 0xEADBEEFD
+    print(rotl(a64, 8)); // 0x23456789ABCDEF01
+    print(rotr(a64, 68)); // 68 mod 64 = 4: 0xF0123456789ABCDE
+    print(rotl(c8, -1)); // -1 mod 8 = 7: 0x80
+    print(rotr(a16, 0)); // unchanged: 0x8001
+    return 0;
+}

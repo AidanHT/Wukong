@@ -573,6 +573,17 @@ another architecture or OS is not supported. A native-backend failure is a catal
   unsigned; on floats they are `fmin`/`fmax`; the result is the operands' common type, as for `+`.
   Before this a call was `C0001` — which made the ragged-tile spelling `for i in i0..min(i0 + T, M)`
   (the one `examples/matmul.wk` uses) impossible to compile at all (`tests/run/min_max_builtin.wk`).
+- **Scalar builtins** (2026-10-08, `gap2/scalar-intrinsics-and-types`): `clamp`; an explicit
+  single-rounding `fma`; `popcount`/`clz`/`ctz`/`bswap` (one machine instruction each — a new MIR op,
+  `Op::IntUnary`) and `rotl`/`rotr`; `sat_add`/`sat_sub`/`sat_cast::<T>`, `mulhi`, `widening_mul` and
+  `overflowing_*`; float bit access (`bits`, `*_from_bits`) and classification (`isnan`, `isinf`,
+  `isfinite`, `signbit`, `copysign`, `ldexp`, `frexp`); the special functions `erfc`, `erfinv`,
+  `lgamma` (double-precision runtime, ≤ 3 ULP; `lgamma` differentiates through a runtime `digamma`)
+  and `logaddexp`; and OCP FP8 conversion on `u8` storage (`f8e4m3_to_f32`, `f32_to_f8e4m3`, and the
+  E5M2 pair). All but the bit counts and the special functions are plain compare/select/shift MIR, so
+  they agree on every backend by construction. `fmax`/`fmin` on an integer variable is now `E0445`
+  (`max`/`min` keep the type); `E0446`/`E0447` reject a wrong operand kind or a mixed-type saturating
+  operation (`tests/run/scalar_*.wk`, `tests/run/fp8_convert.wk`).
 - **Convolution via im2col + GEMM**: a conv written as an im2col gather followed by a matmul has its
   matmul recognized and dispatched to the tuned GEMM microkernel (the XLA/cuDNN lowering), so Wukong
   runs a 3×3 conv **~1.55× faster** than a hand-written direct convolution in C — and 1.12× *slower*
@@ -1244,8 +1255,16 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   moves it between them, changing low-order bits with no diagnostic. Each tree is deterministic
   (independent of threads, `-O` level, backend and host). Use `@strict_fp` where bits must not
   depend on the spelling. Also by design: a compound `s += y*z` outside a vectorized reduction is not
-  contracted while `s = s + y*z` is, and there is no explicit `fma(a, b, c)` intrinsic yet, so a
-  strict function cannot request a single-rounding multiply-add.
+  contracted while `s = s + y*z` is; a strict function that wants a single-rounding multiply-add
+  writes the explicit `fma(a, b, c)`, which is one rounding in every mode.
+
+- **Scalar-type gaps** (2026-10-08). There is no 128-bit integer (`u128`/`i128` literal suffixes
+  are `E0431`; Cranelift's x64 backend has no `i128` divide, so the type needs a runtime first), and
+  FP8 is storage-only — E4M3FN/E5M2 codes in `u8` with conversion builtins, no `f8` scalar type that
+  loads, stores and promotes by itself; packed `int4` and constructible SIMD values are not started.
+  The bit-count builtins (`popcount`, `clz`, `ctz`, `bswap`) keep a loop scalar (the vectorizer does
+  not widen `Op::IntUnary`), `gpu-native` declines them, and `erfc`/`erfinv`/`lgamma` are one
+  scalar runtime call per element at every precision.
 
 - **Decode-builtin gaps.** Only the plain `y[j] = s` spelling of a half-weight GEMV loop is
   recognized (a scaled store `y[j] = s * c` stays a loop), and a quantized GEMV has no loop spelling

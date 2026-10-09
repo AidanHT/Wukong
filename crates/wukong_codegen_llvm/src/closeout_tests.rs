@@ -118,6 +118,36 @@ fn math_calls_have_declarations_and_result_bindings() {
 }
 
 #[test]
+fn integer_bit_ops_call_the_llvm_bit_intrinsics() {
+    let mut i = Interner::new();
+    let mut b = Builder::new(i.intern("bit_ops"), MirType::I32);
+    let p = b.add_param(MirType::I32);
+    let pop = b.build(MirType::I32, Op::IntUnary(IntUnOp::Popcnt, p));
+    let lz = b.build(MirType::I32, Op::IntUnary(IntUnOp::Clz, pop));
+    let tz = b.build(MirType::I32, Op::IntUnary(IntUnOp::Ctz, lz));
+    let sw = b.build(MirType::I32, Op::IntUnary(IntUnOp::Bswap, tz));
+    b.ret(Some(sw));
+    let text = module(b.finish(), &i);
+    for decl in [
+        "declare i32 @llvm.ctpop.i32(i32)",
+        "declare i32 @llvm.ctlz.i32(i32, i1)",
+        "declare i32 @llvm.cttz.i32(i32, i1)",
+        "declare i32 @llvm.bswap.i32(i32)",
+    ] {
+        assert!(text.contains(decl), "missing `{decl}`:\n{text}");
+    }
+    // `is_zero_poison` is false: a zero operand counts the full width, as the MIR op defines.
+    for call in [
+        "%v1 = call i32 @llvm.ctpop.i32(i32 %v0)",
+        "%v2 = call i32 @llvm.ctlz.i32(i32 %v1, i1 false)",
+        "%v3 = call i32 @llvm.cttz.i32(i32 %v2, i1 false)",
+        "%v4 = call i32 @llvm.bswap.i32(i32 %v3)",
+    ] {
+        assert!(text.contains(call), "missing `{call}`:\n{text}");
+    }
+}
+
+#[test]
 fn external_declarations_and_conflicting_abis() {
     let mut i = Interner::new();
     let print = i.intern("foreign_sink");

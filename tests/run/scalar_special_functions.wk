@@ -1,0 +1,92 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 479500122186
+// EXPECT-OUT: 2209049699858
+// EXPECT-OUT: 1842700792949
+// EXPECT-OUT: 1163087153676
+// EXPECT-OUT: 5042031898572
+// EXPECT-OUT: 3957813967618
+// EXPECT-OUT: -56243716497
+// EXPECT-OUT: 5905220423209
+// EXPECT-OUT: 2313261687518
+// EXPECT-OUT: 4795001
+// EXPECT-OUT: 4769362
+// EXPECT-OUT: 5723649
+// EXPECT-OUT: 23132
+// EXPECT-OUT: 4607182418800017408
+// EXPECT-OUT: 0
+// EXPECT-OUT: 4611686018427387904
+// EXPECT-OUT: 0
+// EXPECT-OUT: 9218868437227405312
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 9218868437227405312
+// EXPECT-OUT: 18442240474082181120
+// EXPECT-OUT: 9218868437227405312
+// EXPECT-OUT: 4604418534313441775
+module tests.run.scalar_special_functions
+
+// `erfc`, `erfinv`, `lgamma` and `logaddexp`. The first three are one call each of the f64
+// library (`wukong_rt_math_f64`, codes 100..102 — this fixture is also what pins the compiler's
+// copy of those codes to the runtime's); an f32 argument widens, evaluates in f64 and rounds once.
+// The scaled values are mpmath references (200 bits) scaled and truncated in f64, at points where
+// every result within 6 ULP of the reference truncates to the same integer, so they pin the
+// function without pinning its last bits; the f32 ones are the correctly rounded f32 (each true
+// value sits far from an f32 rounding midpoint). The last lines are exact: erfc(0) = 1,
+// erfc(+-inf) = 0 and 2, erfinv(0) = 0, erfinv(1) = inf, erfinv(2) is NaN, lgamma(1) = lgamma(2) =
+// 0, lgamma at a pole is +inf, logaddexp(-inf, -inf) = -inf, logaddexp(inf, 1) = inf and
+// logaddexp(0, 0) = ln 2 — all derived from the definitions, never recorded from the compiler.
+fn main() -> i32 {
+    let x05: f64 = 0.5;
+    let x3: f64 = 3.0;
+    let xm1: f64 = -1.0;
+    let y09: f64 = 0.9;
+    let ytail: f64 = 0.999999999999;
+    let g55: f64 = 5.5;
+    let gm25: f64 = -2.5;
+    let g1000: f64 = 1000.0;
+    let one64: f64 = 1.0;
+    let two64: f64 = 2.0;
+    // The scales are f64 bindings, so each is exactly its decimal value.
+    let e12: f64 = 1e12;
+    let e17: f64 = 1e17;
+    let e9: f64 = 1e9;
+    let e7: f64 = 1e7;
+    let e4: f64 = 1e4;
+    print((erfc(x05) * e12) as i64);
+    print((erfc(x3) * e17) as i64); // deep in the tail: relative accuracy
+    print((erfc(xm1) * e12) as i64);
+    print((erfinv(y09) * e12) as i64);
+    print((erfinv(ytail) * e12) as i64);
+    print((lgamma(g55) * e12) as i64);
+    print((lgamma(gm25) * e12) as i64); // through the reflection formula
+    print((lgamma(g1000) * e9) as i64); // Stirling's series
+    print((logaddexp(one64, two64) * e12) as i64);
+
+    let s05: f32 = 0.5;
+    print((erfc(s05) as f64 * e7) as i64);
+    print((erfinv(s05) as f64 * e7) as i64);
+    print((lgamma(s05) as f64 * e7) as i64);
+    let s1: f32 = 1.0;
+    let s2: f32 = 2.0;
+    print((logaddexp(s1, s2) as f64 * e4) as i64); // the f32 polynomials
+
+    let z64: f64 = 0.0;
+    let pinf: f64 = f64_from_bits(0x7ff0000000000000);
+    let ninf: f64 = f64_from_bits(0xfff0000000000000);
+    let m3: f64 = -3.0;
+    print(bits(erfc(z64)));
+    print(bits(erfc(pinf)));
+    print(bits(erfc(ninf)));
+    print(bits(erfinv(z64)));
+    print(bits(erfinv(one64)));
+    print(isnan(erfinv(two64)) as i32);
+    print(bits(lgamma(one64)));
+    print(bits(lgamma(two64)));
+    print(bits(lgamma(m3)));
+    print(bits(logaddexp(ninf, ninf)));
+    print(bits(logaddexp(pinf, one64)));
+    print(bits(logaddexp(z64, z64)));
+    return 0;
+}

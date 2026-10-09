@@ -1498,6 +1498,15 @@ impl<'a> FnEmit<'a> {
                 let d = self.reg(r);
                 self.round_into(&d, *mode, &x, &rty);
             }
+            // Integer bit counting / byte reversal (`popcount`, `clz`, `ctz`, `bswap`). PTX has
+            // `popc`/`clz`/`brev`/`prmt`, but no lowering is written yet, so decline: the program
+            // runs on the CPU path instead of receiving wrong PTX.
+            Op::IntUnary(op, _) => {
+                return Err(format!(
+                    "{UNSUPPORTED} integer `{}` not yet lowered to PTX",
+                    op.name()
+                ))
+            }
             // A `Splat` or `Iota` whose result is NOT a vector never reaches here from verified MIR
             // (`wukong_mir::verify` requires a vector result for both), and the vector case went to
             // `lower_vec_inst` above. Keep them as declines rather than `unreachable!`, but say what

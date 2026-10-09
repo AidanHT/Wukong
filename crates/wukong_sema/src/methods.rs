@@ -183,6 +183,7 @@ impl Sema<'_> {
         let nm = self.sym_str(p.name.sym);
         let builtin = crate::shape::intrinsic_ret_ty(nm, &[]).is_some()
             || crate::kernel_builtin(nm, 2).is_some()
+            || crate::scalar_builtin(nm).is_some()
             || crate::heap_alloc_elem(nm).is_some()
             || crate::file_io_elem(nm).is_some()
             || crate::text::text_builtin(nm).is_some()

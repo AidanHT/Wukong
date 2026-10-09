@@ -319,6 +319,14 @@ pub enum Op {
     /// round-to-nearest-ties-to-even that `nearest` emits — *not* `round`, which is ties-away), so the
     /// two stay bit-identical. Pure and side-effect-free.
     Round(RoundMode, ValueId),
+    /// A bit-counting or byte-reversing operation on one **scalar** integer (`i8`/`i16`/`i32`/
+    /// `i64`, never `i1` and never a vector); operand and result share that type, and the result
+    /// is [`IntUnOp::eval`] of the operand's bit pattern. Each is one machine instruction (Cranelift
+    /// `popcnt`/`clz`/`ctz`/`bswap`, which x64 lowers to `popcnt`/`lzcnt`/`tzcnt`/`bswap` or their
+    /// fallbacks); the interpreter calls [`IntUnOp::eval`], so the two agree by construction. The
+    /// source builtins `popcount`/`clz`/`ctz`/`bswap` lower here. Pure and side-effect-free; the
+    /// loop vectorizer does not widen it (a loop containing one stays scalar).
+    IntUnary(IntUnOp, ValueId),
     /// Call a synthesized 256-bit AVX2 vector kernel (P4) by index into [`crate::Function::vec_kernels`],
     /// over the vector part `[0, n)` of a loop the general vectorizer widened past Cranelift's 128-bit
     /// CLIF-vector ceiling. `ptrs` points at a stack array of the stream base pointers (each already
@@ -373,6 +381,61 @@ impl Half {
         match self {
             Half::Lo => 0,
             Half::Hi => n / 2,
+        }
+    }
+}
+
+/// The operation of an [`Op::IntUnary`]. Every one reads the operand as a bit pattern of the
+/// operand type's width, so signedness never matters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IntUnOp {
+    /// The number of one bits.
+    Popcnt,
+    /// The number of leading zero bits, counted down from the type's top bit — the full width for
+    /// zero (LLVM's `ctlz` with `is_zero_poison = false`).
+    Clz,
+    /// The number of trailing zero bits — the full width for zero.
+    Ctz,
+    /// The bytes in reverse order. Defined on `i16`/`i32`/`i64` only: Cranelift has no 8-bit
+    /// `bswap`, so the verifier rejects an `i8` one (the front end lowers `bswap` of a byte to the
+    /// byte itself).
+    Bswap,
+}
+
+impl IntUnOp {
+    pub fn name(self) -> &'static str {
+        match self {
+            IntUnOp::Popcnt => "popcnt",
+            IntUnOp::Clz => "clz",
+            IntUnOp::Ctz => "ctz",
+            IntUnOp::Bswap => "bswap",
+        }
+    }
+
+    /// The result of this operation on the low `bits` bits of `x` (`bits` one of 8, 16, 32, 64),
+    /// zero-extended to `u64`. The definition every backend implements: the interpreter calls it
+    /// directly, and it is what the hardware instruction computes.
+    pub fn eval(self, x: u64, bits: u32) -> u64 {
+        let bits = bits.clamp(8, 64);
+        let x = if bits == 64 {
+            x
+        } else {
+            x & ((1u64 << bits) - 1)
+        };
+        match self {
+            IntUnOp::Popcnt => u64::from(x.count_ones()),
+            // `x` fits in `bits` bits, so it has at least `64 - bits` leading zeros as a u64.
+            IntUnOp::Clz => u64::from(x.leading_zeros() - (64 - bits)),
+            IntUnOp::Ctz => {
+                if x == 0 {
+                    u64::from(bits)
+                } else {
+                    u64::from(x.trailing_zeros())
+                }
+            }
+            // The operand's bytes sit at the bottom of the u64; reversing all eight moves them to
+            // the top in reverse order, and the shift brings them back down.
+            IntUnOp::Bswap => x.swap_bytes() >> (64 - bits),
         }
     }
 }
@@ -608,5 +671,40 @@ impl Terminator {
                 f(default, default_args);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IntUnOp;
+
+    /// Hand-derived values: the definition the interpreter executes and the hardware computes.
+    #[test]
+    fn int_unary_eval_is_the_bit_pattern_definition() {
+        use IntUnOp::*;
+        // popcnt: only the operand's own width counts.
+        assert_eq!(Popcnt.eval(0xFF, 8), 8);
+        assert_eq!(Popcnt.eval(u64::MAX, 64), 64);
+        assert_eq!(Popcnt.eval(0x1_0000_0001, 32), 1);
+        assert_eq!(Popcnt.eval(0, 16), 0);
+        assert_eq!(Popcnt.eval(0x8000, 16), 1);
+        // clz counts down from the type's own top bit; zero is the full width.
+        assert_eq!(Clz.eval(1, 8), 7);
+        assert_eq!(Clz.eval(0x80, 8), 0);
+        assert_eq!(Clz.eval(0, 8), 8);
+        assert_eq!(Clz.eval(0x100, 8), 8);
+        assert_eq!(Clz.eval(0x1_0000, 32), 15);
+        assert_eq!(Clz.eval(1, 64), 63);
+        assert_eq!(Clz.eval(0, 64), 64);
+        // ctz; zero is the full width.
+        assert_eq!(Ctz.eval(0, 32), 32);
+        assert_eq!(Ctz.eval(8, 32), 3);
+        assert_eq!(Ctz.eval(0x8000_0000_0000_0000, 64), 63);
+        assert_eq!(Ctz.eval(0x100, 8), 8);
+        // bswap reverses the operand's own bytes.
+        assert_eq!(Bswap.eval(0x1234, 16), 0x3412);
+        assert_eq!(Bswap.eval(0x1234_5678, 32), 0x7856_3412);
+        assert_eq!(Bswap.eval(0x0102_0304_0506_0708, 64), 0x0807_0605_0403_0201);
+        assert_eq!(Bswap.eval(0xAB, 8), 0xAB);
     }
 }

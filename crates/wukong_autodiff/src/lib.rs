@@ -496,6 +496,16 @@ impl<'a> Vjp<'a> {
                     return Err("autodiff: f64 math operation must be a constant i64".into());
                 };
                 let op = *op as i64;
+                if op == 103 {
+                    // digamma (`M64_DIGAMMA`) is only ever emitted as the derivative of `lgamma`;
+                    // its own derivative, trigamma, is not in the library.
+                    return Err(
+                        "autodiff: no VJP rule for `digamma` (the derivative of `lgamma`): \
+                                trigamma is not in the double-precision library, so `lgamma` \
+                                differentiates once"
+                            .into(),
+                    );
+                }
                 let x = self.remap(args[0]);
                 let r = self.remap(old_r);
                 let derivative = self.math_f64_derivative(op, x, r);
@@ -680,6 +690,7 @@ impl<'a> Vjp<'a> {
                 Op::Cast(_, a, _)
                 | Op::Neg(a)
                 | Op::Not(a)
+                | Op::IntUnary(_, a)
                 | Op::Splat(a)
                 | Op::ExtractLane(a, _)
                 | Op::Widen { v: a, .. } => stack.push(*a),
@@ -1121,6 +1132,24 @@ impl<'a> Vjp<'a> {
                 let d = self.fmul(three, r2, &ty);
                 self.fdiv(one, d, &ty)
             }
+            // The library-only special functions (`wukong_runtime::special::M64_*`).
+            // erfc' = −(2/√π)·exp(−x²)
+            100 => {
+                let x2 = self.fmul(x, x, &ty);
+                let nx2 = self.neg(x2, &ty);
+                let e = self.math_f64_call(0, nx2);
+                let c = self.fconst(-std::f64::consts::FRAC_2_SQRT_PI, &ty);
+                self.fmul(c, e, &ty)
+            }
+            // erfinv' = (√π/2)·exp(erfinv(x)²), from the forward result.
+            101 => {
+                let r2 = self.fmul(r, r, &ty);
+                let e = self.math_f64_call(0, r2);
+                let c = self.fconst(0.886226925452758, &ty);
+                self.fmul(c, e, &ty)
+            }
+            // lgamma' = digamma, the library's code 103.
+            102 => self.math_f64_call(103, x),
             // The runtime returns `x` for any other code.
             _ => one,
         }
@@ -1226,6 +1255,7 @@ pub(crate) fn map_operands(op: &Op, mut f: impl FnMut(ValueId) -> ValueId) -> Op
         Op::Fma(a, b, c) => Op::Fma(f(*a), f(*b), f(*c)),
         Op::Sqrt(v) => Op::Sqrt(f(*v)),
         Op::Round(m, v) => Op::Round(*m, f(*v)),
+        Op::IntUnary(o, v) => Op::IntUnary(*o, f(*v)),
         Op::VecKernelCall {
             kernel,
             ptrs,
@@ -1269,6 +1299,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::Fma(..) => "fma",
         Op::Sqrt(..) => "sqrt",
         Op::Round(..) => "round",
+        Op::IntUnary(o, _) => o.name(),
         Op::VecKernelCall { .. } => "veckernel",
     }
 }

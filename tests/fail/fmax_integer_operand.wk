@@ -1,0 +1,15 @@
+// EXPECT-CODE: E0445
+module tests.fail.fmax_integer_operand
+
+// `fmax`/`fmin` compare floats. On integer operands they used to convert both to `f32` in silence,
+// so the larger of 16777217 and 3 came back as 16777216 — an i64 above 2^24 rounded on both
+// backends alike, invisible to every differential gate. An integer operand is now E0445, pointing
+// at the type-preserving `max`.
+fn larger(a: i64, b: i64) -> i64 {
+    return fmax(a, b) as i64;
+}
+
+fn main() -> i32 {
+    print(larger(16777217, 3));
+    return 0;
+}

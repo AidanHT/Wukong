@@ -725,6 +725,29 @@ impl<'a> Verifier<'a> {
                     }
                 }
             }
+            // A scalar integer of a real machine width: the backends lower each operation to one
+            // scalar instruction and the interpreter has no lane arm for it, so a vector or an `i1`
+            // here is malformed MIR. Cranelift has no 8-bit `bswap`.
+            Op::IntUnary(op, a) => {
+                let ok = self.use_val(*a);
+                if let Some(res) = self.result_ty(result) {
+                    if !matches!(
+                        res,
+                        MirType::I8 | MirType::I16 | MirType::I32 | MirType::I64
+                    ) {
+                        self.err(format!(
+                            "{} needs a scalar i8/i16/i32/i64, got {}",
+                            op.name(),
+                            res.display()
+                        ));
+                    } else if *op == crate::IntUnOp::Bswap && res == MirType::I8 {
+                        self.err("bswap is not defined on i8".to_string());
+                    }
+                    if ok {
+                        self.expect_ty(*a, &res, op.name());
+                    }
+                }
+            }
             Op::Splat(v) => {
                 if self.use_val(*v) {
                     if let (Some(vt), Some(res)) = (self.ty(*v).cloned(), self.result_ty(result)) {
@@ -1109,6 +1132,34 @@ mod tests {
             errors.iter().any(|e| e.contains("invalid bitcast")),
             "{errors:?}"
         );
+    }
+
+    fn int_unary_errors(op: crate::IntUnOp, ty: MirType) -> Vec<String> {
+        let mut i = Interner::new();
+        let mut b = Builder::new(i.intern("bits"), ty.clone());
+        let x = b.add_param(ty.clone());
+        let result = b.build(ty, Op::IntUnary(op, x));
+        b.ret(Some(result));
+        verify_function(&b.finish())
+    }
+
+    #[test]
+    fn int_unary_needs_a_scalar_machine_integer() {
+        use crate::IntUnOp::{Bswap, Clz, Ctz, Popcnt};
+        for ty in [MirType::I8, MirType::I16, MirType::I32, MirType::I64] {
+            for op in [Popcnt, Clz, Ctz] {
+                let errors = int_unary_errors(op, ty.clone());
+                assert!(errors.is_empty(), "{op:?} on {ty:?}: {errors:?}");
+            }
+        }
+        for ty in [MirType::I16, MirType::I32, MirType::I64] {
+            let errors = int_unary_errors(Bswap, ty.clone());
+            assert!(errors.is_empty(), "bswap on {ty:?}: {errors:?}");
+        }
+        assert!(!int_unary_errors(Bswap, MirType::I8).is_empty());
+        assert!(!int_unary_errors(Popcnt, MirType::I1).is_empty());
+        assert!(!int_unary_errors(Clz, MirType::F32).is_empty());
+        assert!(!int_unary_errors(Ctz, MirType::Vec(Box::new(MirType::I32), 4)).is_empty());
     }
 
     #[test]

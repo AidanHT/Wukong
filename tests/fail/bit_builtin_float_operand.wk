@@ -1,0 +1,13 @@
+// EXPECT-CODE: E0446
+module tests.fail.bit_builtin_float_operand
+
+// `popcount` counts the one bits of an integer. A float has no integer value to count — its bit
+// pattern is `bits(x)` — so a float operand is E0446 rather than a silent conversion to an integer
+// (1.5 would count the bits of 1).
+fn ones(x: f32) -> i32 {
+    return popcount(x);
+}
+
+fn main() -> i32 {
+    return ones(1.5);
+}

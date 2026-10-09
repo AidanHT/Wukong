@@ -442,12 +442,14 @@ fn dims_same(a: &Dim, b: &Dim) -> bool {
 //
 // Every name a call may spell for a builtin, across all of its families: the statement builtins
 // below, the scalar math intrinsics (`shape::intrinsic_ret_ty`), the named kernel builtins
-// ([`kernel_builtin`]), the heap and scratch allocators, the timing and barrier builtins, and the ML
-// I/O / RNG / sampling family ([`crate::ml_builtin`]). `type_call` types each family and then reports
-// any single-name callee that is none of them as a resolution error (`E0320`/`E0323`,
-// `resolve.rs`), so a name that reaches `wukong_mir_build::lower_call` unlowered is a compiler bug,
-// not a user's typo: `mir_build` asks [`is_builtin_callee`] to tell the two apart. A new builtin is
-// registered here and typed in `type_call` (or its family's module) in the same change.
+// ([`kernel_builtin`]), the heap and scratch allocators, the timing and barrier builtins, the ML
+// I/O / RNG / sampling family ([`crate::ml_builtin`]) and the scalar builtins
+// ([`crate::scalar_builtin`]: `clamp`, `popcount`, `bits`, `erfc`, …). `type_call` types each
+// family and then reports any single-name callee that is none of them as a resolution error
+// (`E0320`/`E0323`, `resolve.rs`), so a name that reaches `wukong_mir_build::lower_call` unlowered
+// is a compiler bug, not a user's typo: `mir_build` asks [`is_builtin_callee`] to tell the two
+// apart. A new builtin is registered here and typed in `type_call` (or its family's module) in the
+// same change.
 
 /// The statement-shaped builtins `print(x)`, `println(x)` and `assert(cond)`. `type_call` checks
 /// their arity and argument kind and leaves the call itself to `wukong_mir_build`, which lowers them
@@ -542,6 +544,46 @@ const KERNEL_BUILTINS: &[&str] = &[
     "gelu",
 ];
 
+/// The scalar builtins, exactly [`crate::scalar_builtin`]'s spellings (pinned by a unit test).
+const SCALAR_BUILTINS: &[&str] = &[
+    "clamp",
+    "fma",
+    "popcount",
+    "clz",
+    "ctz",
+    "bswap",
+    "rotl",
+    "rotr",
+    "sat_add",
+    "sat_sub",
+    "sat_cast",
+    "mulhi",
+    "widening_mul",
+    "overflowing_add",
+    "overflowing_sub",
+    "overflowing_mul",
+    "bits",
+    "f32_from_bits",
+    "f64_from_bits",
+    "f16_from_bits",
+    "bf16_from_bits",
+    "isnan",
+    "isinf",
+    "isfinite",
+    "signbit",
+    "copysign",
+    "ldexp",
+    "frexp",
+    "erfc",
+    "erfinv",
+    "lgamma",
+    "logaddexp",
+    "f8e4m3_to_f32",
+    "f8e5m2_to_f32",
+    "f32_to_f8e4m3",
+    "f32_to_f8e5m2",
+];
+
 /// The builtins with one fixed spelling that no other table lists.
 const FIXED_BUILTINS: &[&str] = &[
     "print",
@@ -584,6 +626,7 @@ pub fn is_builtin_callee(name: &str) -> bool {
         || crate::is_scratch_mark(name)
         || crate::is_scratch_release(name)
         || crate::ml_builtin(name).is_some()
+        || crate::scalar_builtin(name).is_some()
         || crate::is_now_ns(name)
         || crate::is_sync_block(name)
 }
@@ -594,6 +637,7 @@ pub fn builtin_callee_names() -> Vec<String> {
     let mut names: Vec<String> = MATH_INTRINSICS
         .iter()
         .chain(KERNEL_BUILTINS)
+        .chain(SCALAR_BUILTINS)
         .chain(FIXED_BUILTINS)
         .map(|s| s.to_string())
         .collect();
@@ -1684,6 +1728,12 @@ mod tests {
             assert!(
                 kernel_builtin(name, 2).is_some(),
                 "`{name}` is not a kernel"
+            );
+        }
+        for name in SCALAR_BUILTINS {
+            assert!(
+                crate::scalar_builtin(name).is_some(),
+                "`{name}` is not a scalar builtin"
             );
         }
         for name in ["print", "println", "assert"] {

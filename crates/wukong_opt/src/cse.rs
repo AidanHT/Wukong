@@ -398,6 +398,7 @@ enum Key {
     /// and the packing records the mask length besides, so two different masks never share a key.
     Shuffle(u32, u32, u128),
     InsertLane(u32, u32, u32),
+    IntUnary(u8, u32),
     /// A call to a callee that reads nothing the caller can see, by symbol and interned arguments:
     /// its result is a function of the argument values alone.
     PureCall(u32, u32),
@@ -961,6 +962,7 @@ impl Numbering<'_> {
             Op::Narrow { lo, hi, kind } => Key::Narrow(m(*lo), m(*hi), *kind as u8),
             Op::Shuffle { a, b, mask } => Key::Shuffle(m(*a), m(*b), pack_shuffle_mask(mask)?),
             Op::InsertLane(v, s, k) => Key::InsertLane(m(*v), m(*s), *k),
+            Op::IntUnary(op, a) => Key::IntUnary(*op as u8, m(*a)),
             Op::Load(..)
             | Op::Store { .. }
             | Op::Call { .. }

@@ -530,13 +530,14 @@ static CATALOG: &[Explanation] = &[
         "E0431",
         "malformed or out-of-range literal",
         "A numeric literal that does not parse (`0z12`, an empty radix `0x`, a bad digit `0b2`, \
-         `1.5e`), or an integer literal whose value does not fit the type it is used at — the type \
-         an unsuffixed literal adapts to from an annotation, a parameter, a field, an assignment, a \
-         return type or a `match` scrutinee (`let x: i8 = 200`) — is rejected instead of wrapping \
-         silently. A constant expression of literals is checked by its folded value \
-         (`let v: i8 = 100 + 100`). An enum discriminant must be such a constant and fit the \
-         32-bit enum representation. Use a wider type, or convert with `as`, which wraps by \
-         definition.",
+         `1.5e`) or names a type Wukong does not have (a `u128`/`i128` suffix: the widest \
+         integers are `i64` and `u64`), or an integer literal whose value does not fit the type it \
+         is used at — the type an unsuffixed literal adapts to from an annotation, a parameter, \
+         a field, an assignment, a return type or a `match` scrutinee (`let x: i8 = 200`) — is \
+         rejected instead of wrapping silently. A constant expression of literals is checked by \
+         its folded value (`let v: i8 = 100 + 100`). An enum discriminant must be such a constant \
+         and fit the 32-bit enum representation. Use a wider type, or convert with `as`, which \
+         wraps by definition.",
         bad: "module ex.e0431\nfn main() -> i32 {\n    let x: i8 = 200;\n    return x as i32;\n}\n",
         good: "module ex.e0431\nfn main() -> i32 {\n    let x: i16 = 200;\n    return x as i32;\n}\n"
     ),
@@ -662,6 +663,47 @@ static CATALOG: &[Explanation] = &[
          one-variant enum.",
         bad: "module ex.e0442\nenum Shape { Circle(i32), Square(i32) }\nfn radius(s: Shape) -> i32 {\n    let Shape::Circle(r) = s;\n    return r;\n}\nfn main() -> i32 {\n    return radius(Shape::Circle(3));\n}\n",
         good: "module ex.e0442\nenum Shape { Circle(i32), Square(i32) }\nfn radius(s: Shape) -> i32 {\n    let Shape::Circle(r) = s else {\n        return 0;\n    };\n    return r;\n}\nfn main() -> i32 {\n    return radius(Shape::Circle(3));\n}\n"
+    ),
+    entry!(
+        "E0445",
+        "integer operand of a floating-point builtin",
+        "A builtin that is defined on floating-point values was given an integer value (an \
+         integer *literal* is fine: it converts, as `sqrt(2)` does). The common case is \
+         `fmax`/`fmin`: on integers they used to convert both operands to `f32` without a word, \
+         so `fmax(a, b)` over two `i64` above 2^24 returned a rounded number. Use `max`/`min`, \
+         which keep the operands' integer type, or convert explicitly (`fmax(a as f64, b as \
+         f64)`) if a float result is really meant. The same applies to `fma`, `copysign`, \
+         `logaddexp`, `bits`, `isnan`, `isinf`, `isfinite`, `signbit`, `ldexp`'s value, `frexp`, \
+         `erfc`, `erfinv`, `lgamma` and `f32_to_f8e4m3`/`f32_to_f8e5m2`.",
+        bad: "module ex.e0445\nfn larger(a: i64, b: i64) -> i64 {\n    return fmax(a, b) as i64;\n}\nfn main() -> i32 {\n    return larger(16777217, 3) as i32;\n}\n",
+        good: "module ex.e0445\nfn larger(a: i64, b: i64) -> i64 {\n    return max(a, b);\n}\nfn main() -> i32 {\n    return larger(16777217, 3) as i32;\n}\n"
+    ),
+    entry!(
+        "E0446",
+        "operand is not an integer this builtin accepts",
+        "An integer builtin was given something it is not defined on. `popcount`, `clz`, `ctz`, \
+         `bswap`, `rotl`, `rotr`, `sat_add`, `sat_sub`, `mulhi`, `widening_mul` and the \
+         `overflowing_*` family operate on integers (any width and signedness, not `bool` or \
+         `char`) — take a float's bits first with `bits(x)`. A bit-pattern builtin needs exactly \
+         its width: `f32_from_bits` a 32-bit integer, `f64_from_bits` 64, `f16_from_bits` and \
+         `bf16_from_bits` 16, `f8e4m3_to_f32`/`f8e5m2_to_f32` 8 (an unsuffixed literal adapts). \
+         `sat_cast::<T>` converts to an integer type `T` only, and `ldexp`'s exponent must be an \
+         integer. `widening_mul` of two 64-bit operands has no result type — there are no 128-bit \
+         integers — so use `mulhi` for the high half and `*` for the low half.",
+        bad: "module ex.e0446\nfn ones(x: f32) -> i32 {\n    return popcount(x);\n}\nfn main() -> i32 {\n    return ones(1.5);\n}\n",
+        good: "module ex.e0446\nfn ones(x: f32) -> i32 {\n    return popcount(bits(x)) as i32;\n}\nfn main() -> i32 {\n    return ones(1.5);\n}\n"
+    ),
+    entry!(
+        "E0447",
+        "integer builtin operands of different types",
+        "`sat_add`, `sat_sub`, `mulhi`, `widening_mul` and `overflowing_add`/`_sub`/`_mul` compute \
+         at one integer type, and that type is the answer: `sat_add` of 100 and 100 is 127 at \
+         `i8` but 200 at `i32`. So two operands of different integer types are not silently \
+         widened, as `+` would widen them; convert one with `as` to the type you mean. An \
+         unsuffixed literal adapts to the other operand's type (`sat_add(x, 1)`), and is \
+         range-checked there.",
+        bad: "module ex.e0447\nfn brighten(p: u8, delta: i32) -> u8 {\n    return sat_add(p, delta);\n}\nfn main() -> i32 {\n    return brighten(200, 100) as i32;\n}\n",
+        good: "module ex.e0447\nfn brighten(p: u8, delta: u8) -> u8 {\n    return sat_add(p, delta);\n}\nfn main() -> i32 {\n    return brighten(200, 100) as i32;\n}\n"
     ),
     entry!(
         "E0448",
