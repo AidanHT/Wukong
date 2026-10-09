@@ -29,9 +29,12 @@ pub mod lints;
 mod attrs;
 pub use attrs::{parallel_grain, MAX_PARALLEL_GRAIN};
 mod builtins;
+mod constraints;
 mod dependency;
+mod dtype;
 mod entry;
 mod infer;
+mod instantiate;
 mod layout;
 mod methods;
 mod noalias;
@@ -438,6 +441,10 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         methods: methods::MethodState::default(),
         resolve: resolve::ResolveState::default(),
         provenance: provenance::ProvenanceState::default(),
+        inst_subst: HashMap::default(),
+        inst_calls: Vec::new(),
+        fn_preds: HashMap::default(),
+        assert_conds: HashSet::default(),
     };
     // Attribute legality (`attrs`): an attribute names no value and has no type, so this walk needs
     // nothing the collection pass builds and runs first — an unknown `@bogus` is reported even in a
@@ -460,7 +467,12 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         }
     }
     s.recheck_item_signatures(module);
+    // `where` predicates, dimension `static_assert`s and `const` parameter types (`constraints`).
+    s.collect_constraints(module);
     s.check_bodies(module);
+    // Every concrete instantiation of a type-generic function, re-checked at its types
+    // (`instantiate`). It restores the tables above, so it only adds diagnostics.
+    s.check_instantiations(module);
     // The `@noalias` rules (`noalias`): they compare argument storage, so they read the types the
     // body pass just recorded.
     noalias::check(module, interner, &s.defs, &s.types, &mut s.diags);
@@ -556,6 +568,16 @@ struct Sema<'a> {
     resolve: resolve::ResolveState,
     /// Where each call's dimensions were bound, for its diagnostics (`provenance.rs`).
     provenance: provenance::ProvenanceState,
+    /// The instantiation being re-checked: each value-type generic of the function whose body is
+    /// being checked, mapped to its concrete type (`instantiate.rs`). Empty outside that pass;
+    /// `lower_type` reads a generic's name through it.
+    inst_subst: HashMap<Symbol, Ty>,
+    /// The concrete instantiations calls have required so far (`instantiate.rs`).
+    inst_calls: Vec<instantiate::InstCall>,
+    /// Each function's dimension constraints, checked at its calls (`constraints.rs`).
+    fn_preds: HashMap<Symbol, Vec<constraints::Pred<'a>>>,
+    /// The conditions of the top-level `static_assert`s that name a generic dimension.
+    assert_conds: HashSet<NodeId>,
 }
 
 /// One entry of [`Sema::loop_ctx`] — a loop currently being type-checked.
@@ -1221,8 +1243,16 @@ impl<'a> Sema<'a> {
         let ty = match &t.kind {
             TypeKind::Path(p) => {
                 let name = p.segments.last().unwrap().sym;
-                let s = self.sym_str(name);
-                if let Some(sc) = Scalar::from_name(s) {
+                // Inside an instantiation being re-checked, a value-type generic is its concrete
+                // type (`instantiate.rs`).
+                let inst = if p.is_single() {
+                    self.inst_subst.get(&name).cloned()
+                } else {
+                    None
+                };
+                if let Some(t) = inst {
+                    t
+                } else if let Some(sc) = Scalar::from_name(self.sym_str(name)) {
                     Ty::Scalar(sc)
                 } else {
                     // A generic type variable or a (possibly later-defined) named type. Once every
@@ -1272,11 +1302,15 @@ impl<'a> Sema<'a> {
                 }
             },
             TypeKind::Tensor { elem, dims, layout } => {
-                let elem_ty = match self.lower_type(elem) {
-                    Ty::Scalar(s) => s,
+                // The element is a scalar, or a type parameter of the enclosing function — a
+                // dtype-generic tensor, `Tensor[T, M, N]`, which each instantiation makes concrete
+                // (`dtype.rs`). A struct, tuple or other aggregate element is still `E0302`.
+                let (elem_ty, elem_var) = match self.lower_type(elem) {
+                    Ty::Scalar(s) => (s, None),
+                    Ty::Named(n) if self.generics.contains(&n) => (Scalar::F32, Some(n)),
                     _ => {
                         self.error(t.span, "E0302", "a tensor element must be a scalar type");
-                        Scalar::F32
+                        (Scalar::F32, None)
                     }
                 };
                 // `lower_dim` now reports an undeclared dim name, so it needs `&mut self` — a plain
@@ -1296,6 +1330,7 @@ impl<'a> Sema<'a> {
                     elem: elem_ty,
                     shape,
                     layout,
+                    elem_var,
                 }
             }
             TypeKind::Fn { params, ret } => {
@@ -3086,15 +3121,17 @@ impl<'a> Sema<'a> {
                         elem,
                         shape,
                         layout,
+                        elem_var,
                     } => match shape.rank() {
                         0 => Ty::Unknown,
                         1 if matches!(layout, Layout::Contiguous | Layout::ColMajor) => {
-                            Ty::Scalar(elem)
+                            dtype::tensor_elem_ty(elem, elem_var)
                         }
                         _ if layout == Layout::Contiguous => Ty::Tensor {
                             elem,
                             shape: Shape(shape.0[1..].to_vec()),
                             layout: Layout::Contiguous,
+                            elem_var,
                         },
                         _ => Ty::Unknown,
                     },

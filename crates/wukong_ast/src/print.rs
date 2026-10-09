@@ -274,6 +274,10 @@ impl AstPrinter<'_> {
                     if let Some(ret) = &f.ret {
                         p.line(format!("ret {}", p.type_str(ret)));
                     }
+                    for w in &f.where_preds {
+                        p.line("where");
+                        p.indented(|q| q.expr(w));
+                    }
                     match &f.body {
                         Some(b) => p.block(b),
                         None => p.line("(no body)"),
@@ -908,6 +912,7 @@ mod tests {
                     span: Span::dummy(),
                 }],
                 ret: Some(named_ty(&mut i, "i32")),
+                where_preds: vec![],
                 body: None,
             }],
         });

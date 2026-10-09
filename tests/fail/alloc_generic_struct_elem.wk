@@ -1,0 +1,12 @@
+// EXPECT-CODE: E0325
+module tests.fail.alloc_generic_struct_elem
+
+// `alloc::<T>(n)` allocates a buffer of scalars: its element type must be a scalar or a type
+// parameter, and a struct is neither.
+struct Point { x: f32, y: f32 }
+
+fn main() -> i32 {
+    let b = alloc::<Point>(4);
+    free(b);
+    return 0;
+}

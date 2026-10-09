@@ -219,6 +219,9 @@ impl Sema<'_> {
                                 ret: Box::new(sig.ret.clone()),
                             },
                         );
+                        // A literal argument of a generic parameter takes the type the other
+                        // arguments bind it to (`instantiate.rs`).
+                        self.adapt_generic_literal_args(&sig, args, &mut arg_tys);
                         // Function-valued arguments and trait bounds (`methods.rs`).
                         self.check_fn_value_args(&sig, args, &arg_tys);
                         self.check_call_bounds(name, &sig, generic_args, &arg_tys, span);
@@ -338,6 +341,22 @@ impl Sema<'_> {
                         }
                     }
                     return Ty::Slice(Box::new(Ty::Scalar(elem)));
+                }
+                // `static_assert(cond[, "message"])`, decided at compile time (`constraints.rs`).
+                if let Some(ret) = self.type_static_assert(interner.resolve(name), args, span) {
+                    self.types.insert(callee.id, Ty::Unknown);
+                    return ret;
+                }
+                // `alloc::<T>(n)`, the generic heap allocator (`dtype.rs`).
+                if let Some(ret) = self.type_generic_alloc(
+                    interner.resolve(name),
+                    generic_args,
+                    args,
+                    &arg_tys,
+                    span,
+                ) {
+                    self.types.insert(callee.id, Ty::Unknown);
+                    return ret;
                 }
                 if self.sym_str(name) == "free" {
                     self.types.insert(callee.id, Ty::Unknown);
@@ -687,6 +706,13 @@ impl Sema<'_> {
         if !bound.is_empty() {
             self.call_dims.insert(call_id, bound);
         }
+        // A concrete instantiation of a type-generic callee is re-checked at its types
+        // (`instantiate.rs`), and the callee's `where` predicates and dimension `static_assert`s
+        // are checked against this call's dimensions (`constraints.rs`).
+        if let Some(callee) = site.callee() {
+            self.note_instantiation(callee, sig, &tys, span);
+            self.check_call_constraints(callee, &sig.generics, &dims, span);
+        }
 
         apply_subst(&sig.ret, &dims, &tys)
     }
@@ -727,11 +753,13 @@ impl Sema<'_> {
                     elem: pe,
                     shape: ps,
                     layout: pl,
+                    elem_var: pv,
                 },
                 Ty::Tensor {
                     elem: ae,
                     shape: as_,
                     layout: al,
+                    elem_var: av,
                 },
             ) => {
                 // The declared layout is part of the type: `tensor_strides` and
@@ -751,15 +779,20 @@ impl Sema<'_> {
                         ),
                     );
                 }
-                if pe != ae {
+                // A dtype-generic element (`Tensor[T, ..]`) is its parameter. At a call, one side
+                // still generic is a generic body's buffer meeting a concrete parameter (or the
+                // reverse): lenient here, and decided per instance (`instantiate.rs`). A body check
+                // (`rigid`) holds `T` to `T` only.
+                let one_generic = !rigid && pv.is_some() != av.is_some();
+                if !one_generic && !crate::dtype::tensor_elems_agree((*pe, *pv), (*ae, *av)) {
+                    let (want, found) = (
+                        self.tensor_elem_name(*pe, *pv),
+                        self.tensor_elem_name(*ae, *av),
+                    );
                     self.error(
                         span,
                         "E0502",
-                        format!(
-                            "tensor element type mismatch: expected `{}`, found `{}`",
-                            pe.name(),
-                            ae.name()
-                        ),
+                        format!("tensor element type mismatch: expected `{want}`, found `{found}`"),
                     );
                 }
                 if ps.rank() != as_.rank() {
@@ -802,6 +835,7 @@ impl Sema<'_> {
                     elem: pe,
                     shape,
                     layout: pl,
+                    elem_var: pv,
                 },
                 Ty::Array { elem: ae, len, .. },
             ) => {
@@ -816,7 +850,23 @@ impl Sema<'_> {
                         ),
                     );
                 }
-                if let Ty::Scalar(ae) = ae.as_ref() {
+                // A still-generic element parameter is bound from the array's scalar leaf by the
+                // call's inference, so it is still generic at a call only when the array holds no
+                // scalars (`[Point; 4]` for `Tensor[T, N]`): a tensor element must be a scalar.
+                if let (Some(g), false) = (pv, rigid) {
+                    if scalar_leaves(ae).is_none() {
+                        let (g, found) = (self.sym_str(*g).to_string(), ae.display(self.interner));
+                        self.error(
+                            span,
+                            "E0502",
+                            format!(
+                                "tensor element type mismatch: the element type `{g}` must be a \
+                                 scalar, found an array of `{found}`"
+                            ),
+                        );
+                    }
+                }
+                if let (Ty::Scalar(ae), None) = (ae.as_ref(), pv) {
                     if pe != ae {
                         self.error(
                             span,
@@ -976,6 +1026,7 @@ impl Sema<'_> {
                     elem: ae,
                     shape,
                     layout,
+                    elem_var: av,
                 },
             ) => {
                 if *layout != Layout::Contiguous {
@@ -997,7 +1048,8 @@ impl Sema<'_> {
                 let Some((leaf, pl)) = leaves else {
                     return;
                 };
-                if leaf != *ae {
+                // A generic body's dtype-generic tensor is checked per instance.
+                if av.is_none() && leaf != *ae {
                     self.error(
                         span,
                         "E0502",
@@ -1474,6 +1526,7 @@ impl Sema<'_> {
                 elem,
                 shape,
                 layout,
+                elem_var,
             } => {
                 if indices.len() > shape.rank() {
                     let dims = self.shape_str(&shape);
@@ -1518,10 +1571,17 @@ impl Sema<'_> {
                     // VIEW of the same buffer, not an element (`a[i]` on `Tensor[f32, M, N]` is a
                     // `Tensor[f32, N]`, the row). The leading indices were bounds-checked above.
                     if indices.len() < shape.rank() {
-                        return self.partial_index_type(elem, &shape, &layout, indices.len(), span);
+                        return self.partial_index_type(
+                            elem,
+                            elem_var,
+                            &shape,
+                            &layout,
+                            indices.len(),
+                            span,
+                        );
                     }
                 }
-                Ty::Scalar(elem)
+                crate::dtype::tensor_elem_ty(elem, elem_var)
             }
             Ty::Array { elem, len, .. } => {
                 // An array is rank 1, so it takes exactly one index. The module header promises
@@ -1683,6 +1743,13 @@ pub(crate) fn infer_type_generics(
             }
             infer_type_generics(pr, ar, generics, tys);
         }
+        // A dtype-generic tensor parameter binds its element parameter from the buffer argument.
+        (
+            Ty::Tensor {
+                elem_var: Some(g), ..
+            },
+            a,
+        ) => crate::dtype::bind_tensor_elem(*g, a, generics, tys),
         _ => {}
     }
 }
@@ -1698,7 +1765,9 @@ pub(crate) fn apply_subst(ty: &Ty, dims: &HashMap<Symbol, Dim>, tys: &HashMap<Sy
             elem,
             shape,
             layout,
+            elem_var,
         } => {
+            let (elem, elem_var) = crate::dtype::subst_tensor_elem(*elem, *elem_var, tys);
             let new = shape
                 .0
                 .iter()
@@ -1712,9 +1781,10 @@ pub(crate) fn apply_subst(ty: &Ty, dims: &HashMap<Symbol, Dim>, tys: &HashMap<Sy
                 })
                 .collect();
             Ty::Tensor {
-                elem: *elem,
+                elem,
                 shape: Shape(new),
                 layout: layout.clone(),
+                elem_var,
             }
         }
         Ty::Ptr { mutable, pointee } => Ty::Ptr {

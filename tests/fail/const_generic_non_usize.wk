@@ -1,0 +1,12 @@
+// EXPECT-CODE: E0523
+module tests.fail.const_generic_non_usize
+
+// A `const` generic parameter is a compile-time dimension, passed as a hidden `usize`; a `bool`
+// declaration used to be accepted and silently treated as a `usize`.
+fn pick<const FLAG: bool>(x: i32) -> i32 {
+    return x;
+}
+
+fn main() -> i32 {
+    return pick(0);
+}

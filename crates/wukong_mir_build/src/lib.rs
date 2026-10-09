@@ -174,6 +174,22 @@ fn subst_ty(ty: &Ty, subst: &HashMap<Symbol, Ty>) -> Ty {
             params: params.iter().map(|t| subst_ty(t, subst)).collect(),
             ret: Box::new(subst_ty(ret, subst)),
         },
+        // A dtype-generic tensor takes its instance's element (`Tensor[T, N]` at `T = bf16` is a
+        // `Tensor[bf16, N]`), so every lowering rule and recognizer sees a concrete element.
+        Ty::Tensor {
+            shape,
+            layout,
+            elem_var: Some(g),
+            ..
+        } => match subst.get(g) {
+            Some(Ty::Scalar(s)) => Ty::Tensor {
+                elem: *s,
+                shape: shape.clone(),
+                layout: layout.clone(),
+                elem_var: None,
+            },
+            _ => ty.clone(),
+        },
         _ => ty.clone(),
     }
 }
@@ -192,6 +208,9 @@ fn ty_has_generic(ty: &Ty, generics: &[Symbol]) -> bool {
         Ty::Fn { params, ret } => {
             params.iter().any(|t| ty_has_generic(t, generics)) || ty_has_generic(ret, generics)
         }
+        Ty::Tensor {
+            elem_var: Some(g), ..
+        } => generics.contains(g),
         _ => false,
     }
 }
@@ -219,6 +238,14 @@ fn collect_named_generics(ty: &Ty, generics: &[Symbol], out: &mut Vec<Symbol>) {
                 collect_named_generics(t, generics, out);
             }
             collect_named_generics(ret, generics, out);
+        }
+        // `Tensor[T, M, N]`: the element type parameter is a value-type generic (the dims are not).
+        Ty::Tensor {
+            elem_var: Some(g), ..
+        } => {
+            if generics.contains(g) && !out.contains(g) {
+                out.push(*g);
+            }
         }
         _ => {}
     }
@@ -339,6 +366,35 @@ fn bind_generics(param_ty: &Ty, arg_ty: &Ty, tg: &[Symbol], subst: &mut HashMap<
         (Ty::Tuple(ps), Ty::Tuple(as_)) => {
             for (p, a) in ps.iter().zip(as_) {
                 bind_generics(p, a, tg, subst);
+            }
+        }
+        // A dtype-generic tensor parameter binds its element parameter from a concrete tensor.
+        (
+            Ty::Tensor {
+                elem_var: Some(g), ..
+            },
+            Ty::Tensor {
+                elem,
+                elem_var: None,
+                ..
+            },
+        ) if tg.contains(g) => {
+            subst.entry(*g).or_insert(Ty::Scalar(*elem));
+        }
+        // ...or from the scalar leaf of a fixed-size array decaying to it (`[f32; 6]` for
+        // `Tensor[T, 2, 3]`), exactly as sema's `bind_tensor_elem` does.
+        (
+            Ty::Tensor {
+                elem_var: Some(g), ..
+            },
+            Ty::Array { elem, .. },
+        ) if tg.contains(g) => {
+            let mut leaf: &Ty = elem.as_ref();
+            while let Ty::Array { elem, .. } = leaf {
+                leaf = elem.as_ref();
+            }
+            if let Ty::Scalar(s) = leaf {
+                subst.entry(*g).or_insert(Ty::Scalar(*s));
             }
         }
         _ => {}
@@ -17818,6 +17874,7 @@ impl FnLowerer<'_> {
                 elem,
                 shape,
                 layout,
+                ..
             } => {
                 if !matches!(layout, wukong_types::Layout::Contiguous) || shape.0.is_empty() {
                     return None;
@@ -20430,6 +20487,7 @@ impl FnLowerer<'_> {
             elem,
             shape,
             layout,
+            ..
         } = self.expr_ty(base)
         else {
             return None;
@@ -20567,6 +20625,7 @@ impl FnLowerer<'_> {
             elem,
             shape,
             layout,
+            ..
         } = self.expr_ty(base)
         else {
             return None;
@@ -22359,9 +22418,13 @@ impl FnLowerer<'_> {
                 if let Some(v) = self.lower_kernel_builtin(e, args) {
                     return v;
                 }
+                // `static_assert(..)` was decided by sema and lowers to nothing.
+                if self.interner.resolve(name) == "static_assert" {
+                    return self.const_zero(MirType::I32);
+                }
                 // The heap builtins `alloc_<T>(n)` / `free(s)` lower to the wukong_rt_alloc/free
                 // runtime calls plus slice fat-pointer construction.
-                if let Some(v) = self.lower_heap_builtin(name, args) {
+                if let Some(v) = self.lower_heap_builtin(name, args, e) {
                     return v;
                 }
                 // The ML builtins lower in `ml_builtins.rs` (see its module docs).
@@ -22529,7 +22592,9 @@ impl FnLowerer<'_> {
     /// around `wukong_rt_scratch_alloc` (same ABI as `wukong_rt_alloc`), `scratch_mark()` is a
     /// `wukong_rt_scratch_mark() -> i64` call and `scratch_release(m)` a void
     /// `wukong_rt_scratch_release(m as i64)`. Opaque calls again, so nothing moves across them.
-    fn lower_heap_builtin(&mut self, name: Symbol, args: &[Expr]) -> Option<ValueId> {
+    ///
+    /// `alloc::<T>(n)` is `alloc_<T>(n)` for the element its (instance's) result type names.
+    fn lower_heap_builtin(&mut self, name: Symbol, args: &[Expr], e: &Expr) -> Option<ValueId> {
         let nm = self.interner.resolve(name);
         if is_scratch_mark(nm) {
             if !args.is_empty() {
@@ -22572,7 +22637,15 @@ impl FnLowerer<'_> {
             });
             return Some(self.const_zero(MirType::I32));
         }
-        let (elem, func) = match heap_alloc_elem(nm) {
+        // `alloc::<T>(n)`: sema types the call `[]T`, which a monomorphized instance substitutes.
+        let generic_elem = match self.expr_ty(e) {
+            Ty::Slice(inner) if nm == "alloc" => match *inner {
+                Ty::Scalar(s) => Some(s),
+                _ => None,
+            },
+            _ => None,
+        };
+        let (elem, func) = match generic_elem.or_else(|| heap_alloc_elem(nm)) {
             Some(elem) => (elem, self.gemm.rt_alloc),
             None => (scratch_alloc_elem(nm)?, self.gemm.rt_scratch_alloc),
         };
@@ -24875,6 +24948,7 @@ fn tensor_buffer_mir(ty: &Ty) -> Option<(MirType, u32)> {
         elem,
         shape,
         layout,
+        ..
     } = ty
     else {
         return None;

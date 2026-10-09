@@ -77,7 +77,13 @@ fn scalar_leaf(t: &Ty) -> Option<Scalar> {
         Ty::Scalar(s) => Some(*s),
         Ty::Array { elem, .. } | Ty::Slice(elem) => scalar_leaf(elem),
         Ty::Ptr { pointee, .. } | Ty::Ref { pointee, .. } => scalar_leaf(pointee),
-        Ty::Tensor { elem, .. } | Ty::Vector { elem, .. } => Some(*elem),
+        // A dtype-generic tensor's `elem` is a placeholder: it may share with anything.
+        Ty::Tensor {
+            elem,
+            elem_var: None,
+            ..
+        }
+        | Ty::Vector { elem, .. } => Some(*elem),
         _ => None,
     }
 }

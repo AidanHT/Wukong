@@ -352,10 +352,21 @@ impl Linearizer<'_> {
         let ExprKind::Index { base, indices } = &e.kind else {
             return None;
         };
-        let Some(Ty::Tensor { shape, elem, .. }) = self.types.get(&base.id) else {
+        let Some(Ty::Tensor {
+            shape,
+            elem,
+            elem_var,
+            ..
+        }) = self.types.get(&base.id)
+        else {
             return None;
         };
-        let (rank, elem) = (shape.0.len(), *elem);
+        // A dtype-generic element is its type parameter, which each instance substitutes.
+        let elem = match elem_var {
+            Some(v) => Ty::Named(*v),
+            None => Ty::Scalar(*elem),
+        };
+        let rank = shape.0.len();
         // The zero padding takes the type of the written indices (so a uniform index list stays
         // uniform and still flattens), defaulting to `i64`.
         let sc = indices
@@ -381,7 +392,7 @@ impl Linearizer<'_> {
             },
         };
         let id = self.fresh()?;
-        self.extra.insert(id, Ty::Scalar(elem));
+        self.extra.insert(id, elem);
         let inner = Expr {
             id,
             kind: inner_kind,

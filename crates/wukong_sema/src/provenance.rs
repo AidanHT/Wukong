@@ -78,6 +78,11 @@ impl CallSite {
     pub(crate) fn arg_span(&self, i: usize) -> Option<Span> {
         self.args.get(i).copied()
     }
+
+    /// The function called, when the call names a definition.
+    pub(crate) fn callee(&self) -> Option<Symbol> {
+        self.callee
+    }
 }
 
 /// The call `check_fn_call` is unifying.

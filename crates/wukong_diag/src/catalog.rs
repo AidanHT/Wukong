@@ -411,6 +411,19 @@ static CATALOG: &[Explanation] = &[
         good: "module ex.e0324\nfn main() -> i32 {\n    let x: f32 = 2.5;\n    return x as i32;\n}\n"
     ),
     entry!(
+        "E0325",
+        "invalid element type for `alloc::<T>`",
+        "The generic heap allocator `alloc::<T>(n)` returns a zeroed `[]T` of `n` elements, and \
+         takes exactly one element type: a scalar (`alloc::<f32>(n)`, the same buffer as \
+         `alloc_f32(n)`) or a type parameter of the enclosing function (`alloc::<T>(n)` inside \
+         `fn f<T, N>(x: Tensor[T, N])`, which each instantiation makes concrete). A missing \
+         element type, more than one, or a struct, tuple or array element is this error: a heap \
+         buffer holds scalars. Allocate one buffer per scalar field, or an array of the scalar \
+         and index it with a stride.",
+        bad: "module ex.e0325\nstruct Point { x: f32, y: f32 }\nfn main() -> i32 {\n    let b = alloc::<Point>(4);\n    free(b);\n    return 0;\n}\n",
+        good: "module ex.e0325\nfn main() -> i32 {\n    let b = alloc::<i32>(4);\n    let n = b.len();\n    free(b);\n    return n as i32;\n}\n"
+    ),
+    entry!(
         "E0330",
         "import path differs from the file only in letter case",
         "An `import` names a file that exists, but only under a different capitalization: \
@@ -862,6 +875,50 @@ static CATALOG: &[Explanation] = &[
          codegen limit `C0001`.",
         bad: "module ex.e0520\nfn total<M, N>(a: Tensor[f32, M, N]) -> f32 {\n    let mut s: f32 = 0.0;\n    for i in 0..M {\n        for j in 0..N {\n            s = s + a[i, j];\n        }\n    }\n    return s;\n}\nfn main() -> i32 {\n    let a: [f32; 12] = [1.0; 12];\n    return total(a) as i32;\n}\n",
         good: "module ex.e0520\nfn total<M, N>(a: Tensor[f32, M, N]) -> f32 {\n    let mut s: f32 = 0.0;\n    for i in 0..M {\n        for j in 0..N {\n            s = s + a[i, j];\n        }\n    }\n    return s;\n}\nfn main() -> i32 {\n    let a: [f32; 12] = [1.0; 12];\n    return total::<3, 4>(a) as i32;\n}\n"
+    ),
+    entry!(
+        "E0521",
+        "`where` constraint not satisfied",
+        "A function's `where` clause may constrain its dimensions: `where K % 16 == 0, M <= 4096` \
+         compares expressions over integer literals, the function's generic dimensions and \
+         `const`s (`+ - * / %`, joined with `&&` / `||`). Each predicate is evaluated at every call \
+         whose dimensions it names are compile-time constants, and this error means one is false \
+         for this call; the message shows the dimensions the call fixed (`K = 24`). Pass a buffer \
+         that satisfies the constraint, or pad it. A predicate that names no dimension and is \
+         false can never be satisfied and is reported at the declaration. A call from a generic \
+         body whose dimensions are still symbolic is not checked there: the constraint is checked \
+         where the dimensions become known.",
+        bad: "module ex.e0521\nfn first<K>(a: Tensor[f32, K]) -> f32 where K % 4 == 0 {\n    return a[0];\n}\nfn main() -> i32 {\n    let a: [f32; 6] = [1.0; 6];\n    return first(a) as i32;\n}\n",
+        good: "module ex.e0521\nfn first<K>(a: Tensor[f32, K]) -> f32 where K % 4 == 0 {\n    return a[0];\n}\nfn main() -> i32 {\n    let a: [f32; 8] = [1.0; 8];\n    return first(a) as i32;\n}\n"
+    ),
+    entry!(
+        "E0522",
+        "static assertion failed",
+        "`static_assert(cond)` (or `static_assert(cond, \"message\")`) is checked at compile time \
+         and generates no code. Its condition is a comparison over integer literals, `const`s \
+         and, inside a generic function, the function's dimensions. A condition over literals and \
+         `const`s is decided where it is written; one over the function's dimensions is decided at \
+         each call, exactly like a `where` predicate, and this error then names the dimensions the \
+         call fixed. The message, if any, is shown as a note."
+    ),
+    entry!(
+        "E0523",
+        "a `const` generic parameter must be `usize`",
+        "A `const` generic parameter (`fn f<const N: usize>`) is a compile-time dimension: it is \
+         bound by a turbofish or an argument's shape and passed as a hidden `usize`, and used as a \
+         value it is a `usize`. Any other declared type (`const FLAG: bool`, `const ACT: i32`) \
+         used to be accepted and silently treated as a `usize`; declare the parameter `usize`, or \
+         pass a flag or an activation code as an ordinary parameter."
+    ),
+    entry!(
+        "E0524",
+        "not a compile-time dimension expression",
+        "A `where` predicate, and a `static_assert` condition, must be evaluable at compile time: \
+         integer literals, the function's generic dimensions and `const`s, combined with \
+         `+ - * / %`, compared with `== != < <= > >=`, and joined with `&&` / `||`. A local \
+         variable, a parameter's value, a call (`a.len()`) or a cast is not. A `static_assert` \
+         that names the function's dimensions is checked at each call, so it must be a top-level \
+         statement of the function body, not nested in a block or a loop."
     ),
     // ---- Warnings (lints). Each has a name for `-A/-W/-D <name>` and `@allow/@warn/@deny(name)`;
     // `-D warnings` makes every warning an error. Lints run only on a program that checks clean.

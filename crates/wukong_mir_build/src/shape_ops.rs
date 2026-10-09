@@ -440,6 +440,7 @@ impl FnLowerer<'_> {
             elem,
             shape,
             layout,
+            ..
         } = self.expr_ty(e)
         else {
             return false;

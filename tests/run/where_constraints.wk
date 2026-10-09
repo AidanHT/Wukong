@@ -1,0 +1,30 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 36
+// EXPECT-OUT: 4
+// EXPECT-OUT: 8
+module tests.run.where_constraints
+
+// `where` predicates and `static_assert`s over a function's dimensions are checked at each call
+// (both calls below satisfy them: K = 8 and K = 4) and generate no code; a `static_assert` over
+// `const`s is decided where it is written.
+const TILE: usize = 4;
+
+fn tile_sum<K>(a: Tensor[f32, K]) -> f32 where K % TILE == 0, K <= 4096 {
+    static_assert(K >= TILE, "need at least one tile");
+    let mut s: f32 = 0.0;
+    for i in 0..K {
+        s = s + a[i];
+    }
+    return s;
+}
+
+fn main() -> i32 {
+    static_assert(TILE * 2 == 8);
+    let a: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+    print(tile_sum(a)); // 1+2+...+8 = 36
+    let b: [f32; 4] = [0.5, 0.5, 1.0, 2.0];
+    print(tile_sum(b)); // 0.5+0.5+1+2 = 4
+    print(TILE * 2); // 8
+    return 0;
+}

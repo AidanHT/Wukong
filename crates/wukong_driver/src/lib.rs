@@ -2447,6 +2447,7 @@ fn ty_elem_count(ty: &wukong_types::Ty) -> Option<usize> {
                 elem: Scalar::F32,
                 shape,
                 layout: Layout::Contiguous | Layout::ColMajor,
+                elem_var: None,
             } => shape.0.iter().try_fold(1u64, |acc, d| match d {
                 Dim::Const(n) => acc.checked_mul(*n),
                 _ => None,

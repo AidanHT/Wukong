@@ -168,6 +168,59 @@ function cannot be bound to a `let` or passed to a non-function parameter; the a
 function, not compute one; and a function-typed parameter is neither `mut` nor named after a builtin
 (`gelu`, `print`, …). A wrong signature is the ordinary `E0401` type mismatch. `tests/run/fn_params.wk`.
 
+### Generic functions and dtype-generic tensors ✅
+
+A type parameter (`fn add<T>(a: T, b: T) -> T`) is bound at each call from the arguments, and the
+function is compiled once per distinct binding (`add$f32`, `add$i64`). The body is type-checked with
+`T` opaque, and **every instantiation is checked again at its concrete types**: `add(p, q)` with
+`p, q: Point` is `E0433` at `a + b`, with a secondary label "required by this instantiation of `add`
+with T = Point" on the call (`tests/fail/generic_instantiation_bad_op.wk`). Instantiations reached
+through another generic are checked too (`tests/fail/generic_instantiation_transitive.wk`). An
+unsuffixed literal argument takes the type the call's other arguments bind its parameter to:
+`add(x_i64, 1)` and `add(1, x_i64)` are both `add$i64` (`tests/run/generic_literal_arg.wk`).
+
+A tensor's **element** may be a type parameter, so one kernel serves every dtype:
+
+```wukong
+fn axpy<T, N>(a: T, x: Tensor[T, N], mut y: Tensor[T, N]) {
+    for i in 0..N { y[i] = a * x[i] + y[i]; }
+}
+```
+
+`T` is bound from a tensor argument's element (or a decaying array's scalar element), indexing a
+`Tensor[T, ..]` yields a `T`, and each instance (`axpy$f32`, `axpy$bf16`) is lowered with the
+concrete element in every tensor type (`tests/run/dtype_generic_tensor.wk`). An array of structs fed to a
+`Tensor[T, ..]` parameter is `E0502` (a tensor element is a scalar). A named kernel builtin
+(`matmul`, `softmax`, …) takes `f32` buffers and a file-I/O builtin one fixed element type, so
+neither accepts a `Tensor[T, ..]` operand inside a generic body. `alloc::<T>(n)` is the generic heap
+allocator — a zeroed `[]T`, the same buffer `alloc_<T>(n)` returns, with `T` a scalar or a type
+parameter (anything else is `E0325`).
+
+### Dimension constraints: `where` and `static_assert` ✅
+
+A `where` clause may constrain a function's dimensions, alongside its trait bounds:
+
+```wukong
+const TILE: usize = 4;
+
+fn tile_sum<K>(a: Tensor[f32, K]) -> f32 where K % TILE == 0, K <= 4096 {
+    static_assert(K >= TILE, "need at least one tile");
+    ...
+}
+```
+
+A predicate compares expressions over integer literals, the function's generic dimensions and
+`const`s (`+ - * / %` in 128-bit integers, truncating), joined with `&&` / `||`; anything else —
+a local, a call such as `a.len()`, a cast — is `E0524`. Each predicate is evaluated at every call
+whose dimensions it names are compile-time constants, and a false one is `E0521` at the call:
+"constraint `K % 16 == 0` of `tile_sum` is not satisfied (K = 24)". `static_assert(cond)` /
+`static_assert(cond, "message")` is a statement that generates no code: over `const`s it is decided
+where it is written, and over the function's dimensions it is checked at each call like a `where`
+predicate (and must then be a top-level statement of the body); a false one is `E0522`. A call
+from a generic body whose dimensions are still symbolic is not checked there — the constraint is
+checked where the dimensions become known. A `const` generic parameter is a dimension and must be
+declared `usize` (`E0523`). `tests/run/where_constraints.wk`, `tests/fail/where_predicate_violated.wk`.
+
 ## Name resolution ✅
 
 Every name a program uses resolves, or the program is rejected with a resolution code — a typo is

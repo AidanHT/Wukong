@@ -5,6 +5,24 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Generics and dtypes (`gap2/generics-and-dtype`)
+
+- **Every instantiation of a generic function is type-checked.** A generic body was checked once
+  with `T` opaque, so `add(p, q)` on two structs compiled and lowered `a + b` on struct pointers;
+  each concrete instantiation is now checked again, and an error points into the generic body with
+  a "required by this instantiation of `add` with T = Point" label on the call.
+- **Literal arguments of a generic call adapt.** `add(x_i64, 1)` was `E0401` and `add(1, x_i64)`
+  bound `T = i32` from the literal; the non-literal arguments now bind first and an unsuffixed
+  literal takes their type, as it does for a concrete parameter.
+- **Tensors may be generic over their element type.** `fn axpy<T, N>(a: T, x: Tensor[T, N], mut y:
+  Tensor[T, N])` (was `E0302`) is compiled once per element type, and `alloc::<T>(n)` is the generic
+  heap allocator (`E0325` for a non-scalar element).
+- **`where` dimension predicates and `static_assert` are enforced.** `where K % 16 == 0` was parsed
+  and silently dropped; predicates over a function's dimensions and `const`s are now checked at
+  each call (`E0521`), `static_assert(cond[, "msg"])` is checked at compile time (`E0522`), a
+  predicate that is not a compile-time dimension expression is `E0524`, and a `const` generic
+  parameter of a type other than `usize` (which was silently a `usize`) is `E0523`.
+
 ### Execution at model scale (`gap2/execution-at-model-scale`)
 
 - **The interpreter is stackless.** A Wukong call (and a `wukong_parallel_for` body) pushes a frame

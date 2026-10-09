@@ -136,6 +136,17 @@ tables, checks trait conformance and bounds, and records every resolved call; `w
 analysis. A call through a trait bound resolves per monomorphized instance, and a function-typed
 parameter is a pseudo-generic (`$fn$<param>` bound to `Ty::Named(<fn>)`), specialized away with no
 runtime value; the functions such calls reach are excluded from the alias-free fact.
+**Generic instances**: sema types a generic body once with each type parameter opaque, then
+`wukong_sema::instantiate` re-checks every concrete `(function, substitution)` a call requires
+(transitively, at most 512 per module) with `lower_type` reading the parameters through the
+substitution; it restores every published table afterwards, so it only adds diagnostics, each
+labelled "required by this instantiation of `f` with T = …". A dtype-generic tensor is
+`Ty::Tensor { elem_var: Some(T), .. }` (its `elem` is then a placeholder): sema binds `T` from a
+tensor or array argument's scalar leaf (`dtype.rs`), and mir_build's monomorphizer substitutes the
+element into every tensor type (`subst_ty`), so `axpy$f32` lowers like the hand-written `f32`
+function; a recognizer that reads sema's raw generic-body types declines on an instance instead.
+`where` dimension predicates and dimension `static_assert`s are collected and checked against each
+call's bound dimensions by `wukong_sema::constraints`; `static_assert` lowers to nothing.
 **Kernel builtins**: `wukong_sema::builtins` shape-checks `matmul`/`softmax`/…/`sdpa` and records each
 call's resolved dimensions (`SemaResult::builtin_calls`); `wukong_mir_build::builtins` lowers it to one
 runtime kernel behind runtime extent checks (trapping through `assert`) and an output-overlap guard

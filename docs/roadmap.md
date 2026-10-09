@@ -367,6 +367,21 @@ another architecture or OS is not supported. A native-backend failure is a catal
   a `@parallel` symbolic-shape function (a matmul reaches the multicore `wukong_sgemm_parallel`; an
   elementwise nest runs correctly through the ordinary path, exactly as a constant-shape `@parallel`
   tensor function does).
+- **Dtype-generic tensors and per-instance checking.** `Tensor[T, M, N]` with `T` a type parameter
+  is monomorphized per element (`axpy$f32`, `axpy$bf16`), `alloc::<T>(n)` allocates a `[]T` per
+  instance, and every concrete instantiation of a generic function is type-checked again at its
+  types, an error carrying "required by this instantiation of `f` with T = …"
+  (`tests/run/dtype_generic_tensor.wk`, `tests/fail/generic_instantiation_bad_op.wk`). Sharp edges:
+  a named kernel builtin (`matmul`, …) does not accept a `Tensor[T, ..]` operand, and an in-body
+  recognizer that reads sema's generic-body types declines on an instance rather than firing (the
+  instance lowers as ordinary loops). Generic structs (`Buf<T>`) are not
+  monomorphized.
+- **Dimension constraints.** `where K % 16 == 0, M <= 4096` predicates and `static_assert(cond[,
+  "msg"])` are checked at every call whose dimensions are compile-time constants (`E0521`/`E0522`),
+  and `const` generic parameters must be `usize` (`E0523`) — `tests/run/where_constraints.wk`. Not
+  yet: a constraint is not propagated into a generic caller (a call with still-symbolic dimensions
+  is unchecked), and literal dimensions do not yet specialize an instance (`f$K512`), so trip
+  counts stay run-time values.
 - **Shape arithmetic, views, reshape and extents** run on both backends. A dimension may be computed
   from others (`Tensor[f32, S, 3*D]`, `H*HD`, `(L - K)/S + 1`) and is held in a canonical polynomial
   normal form, so `2*N` and `N + N` are one type, and a call solves a dimension that appears only

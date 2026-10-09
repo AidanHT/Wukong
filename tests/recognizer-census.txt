@@ -116,6 +116,7 @@ deref_aggregate_value.wk:
 deref_field_access.wk:
 div_edge.wk:
 diverging_arms_nonint_return.wk:
+dtype_generic_tensor.wk: wukong_rt_alloc wukong_rt_alloc*2 wukong_rt_free wukong_rt_free*2 wukong_velem_f32
 elementwise_slice.wk: wukong_axpby_bf16 wukong_axpby_bf16_out wukong_bias_bcast_f32 wukong_dequant_f32 wukong_dequant_perchan_f32 wukong_rt_alloc wukong_rt_alloc*19 wukong_rt_free wukong_rt_free*19 wukong_velem_f32 wukong_vhorner_f32 wukong_vmath_bf16_out
 elu.wk: wukong_vmath_f32
 elu_softplus_backward.wk: wukong_vmath2_f32 wukong_vmath2_f32*2
@@ -169,6 +170,7 @@ gemv_scaled.wk: wukong_sgemv_alpha wukong_sgemv_alpha*3
 gemv_slice.wk: wukong_rt_alloc wukong_rt_alloc*4 wukong_rt_free wukong_rt_free*4 wukong_sgemv wukong_sgemv_alpha
 generic_arith_literal.wk:
 generic_array_param.wk:
+generic_literal_arg.wk:
 generic_loop_optout.wk: veckernel*2 wukong_velem_f32
 generic_shape.wk: wukong_velem_f32
 generic_shape_matmul.wk: wukong_sgemm wukong_sgemm*2
@@ -495,6 +497,7 @@ vmath_exp_every_lane.wk: wukong_vmath_f32
 vmath_f16.wk: wukong_vmath_f16 wukong_vmath_f16*3
 vmath_half_out.wk: wukong_vmath_bf16 wukong_vmath_bf16_out wukong_vmath_f16 wukong_vmath_f16_out
 vmath_parallel.wk: wukong_rt_alloc wukong_rt_alloc*2 wukong_rt_free wukong_rt_free*2 wukong_velem_f32_parallel wukong_vmath_f32_parallel
+where_constraints.wk:
 while_bound_mutated.wk: wukong_velem_f32
 while_bound_side_effect.wk:
 xent.wk: wukong_xent_fwd_f32

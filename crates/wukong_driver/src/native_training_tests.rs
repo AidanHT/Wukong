@@ -134,6 +134,7 @@ fn semantic_f32_buffer_extents_are_checked_before_allocation() {
             elem: Scalar::F32,
             shape: Shape(vec![Dim::Const(2), Dim::Const(3)]),
             layout,
+            elem_var: None,
         };
         assert_eq!(ty_elem_count(&tensor), Some(6));
     }
@@ -158,21 +159,25 @@ fn semantic_f32_buffer_extents_are_checked_before_allocation() {
             elem: Scalar::F32,
             shape: Shape(vec![Dim::Dynamic]),
             layout: Layout::Contiguous,
+            elem_var: None,
         },
         Ty::Tensor {
             elem: Scalar::F64,
             shape: Shape(vec![Dim::Const(1)]),
             layout: Layout::Contiguous,
+            elem_var: None,
         },
         Ty::Tensor {
             elem: Scalar::F32,
             shape: Shape(vec![Dim::Const(u64::MAX), Dim::Const(2)]),
             layout: Layout::Contiguous,
+            elem_var: None,
         },
         Ty::Tensor {
             elem: Scalar::F32,
             shape: Shape(vec![Dim::Const(2)]),
             layout: Layout::Strided,
+            elem_var: None,
         },
     ] {
         assert_eq!(ty_elem_count(&ty), None, "{ty:?}");
