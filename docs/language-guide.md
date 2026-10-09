@@ -276,8 +276,9 @@ concatenation/indexing/length operators — a string is a NUL-terminated `*u8` i
 
 | Category    | Examples                                            | Status |
 |-------------|-----------------------------------------------------|--------|
-| Integers    | `i8 i16 i32 i64`, `u8 u16 u32 u64`, `usize isize`    | ✅     |
+| Integers    | `i8 i16 i32 i64`, `u8 u16 u32 u64`, `usize isize` — no 128-bit type (a `u128`/`i128` literal suffix is `E0401`) | ✅     |
 | Floats      | `f16 bf16 f32 f64`                                   | ✅ scalar |
+| FP8         | E4M3FN / E5M2 codes stored as `u8`, converted with the [scalar builtins](#scalar-builtins-) (`f8e4m3_to_f32`, `f32_to_f8e4m3`, …); no first-class `f8` type | 🟡 storage |
 | Boolean     | `bool`                                               | ✅     |
 | Pointers    | `*T`, `*mut T`, deref `*p`, address-of `&x`/`&mut x`; `&T`/`&mut T` accepted as a parameter type | ✅ |
 | Arrays      | fixed-size `[T; N]` (literal/repeat init, indexed load/store) | ✅ |
@@ -1439,7 +1440,8 @@ Accuracy depends on the operation and input range; this suite has no uniform 1-U
   an intrinsic). These are the training-gradient primitives; written as an elementwise `for` loop they
   dispatch to the two-input 256-bit `wukong_vmath2_f32` kernel, and the inlined form is bit-identical
   to it.
-- `fmax(a, b)` / `fmin(a, b)`.
+- `fmax(a, b)` / `fmin(a, b)` — on floats. An integer *variable* operand is **`E0445`**: these used
+  to convert both operands to `f32`, rounding integers above 2^24; write `max`/`min` for integers.
 - `min(a, b)` / `max(a, b)` — integer **or** float minimum/maximum (`a < b ? a : b`, `a > b ? a : b`).
   On integers the compare uses the result type's signedness, so a `usize` compares unsigned (the
   largest `u64` stays the largest, it is not `-1`); on floats they are exactly `fmin`/`fmax`. The result is
@@ -1454,7 +1456,8 @@ identity), while `sqrt` and the transcendentals promote an integer operand to `f
 (`tests/run/int_math.wk`). The **two-argument** intrinsics follow the promoting rule, not the
 preserving one: `fmax`/`fmin`, `pow`, `atan2`, `hypot` and the six `*_backward` intrinsics coerce
 *both* operands to the float result type, so `fmax(3, 5)` is the `f32` value `5.0`, not an integer max
-(`tests/run/activation_backward_int_args.wk`).
+(`tests/run/activation_backward_int_args.wk`). That conversion applies to integer *literals* only for
+`fmax`/`fmin`: an integer variable there is `E0445` (`tests/fail/fmax_integer_operand.wk`).
 
 In the f32 math core, `exp` and `log` preserve NaNs. `exp(+∞) = +∞` and `exp(−∞) = +0`; finite inputs
 above the polynomial's upper bound still saturate to its historical finite value (about
@@ -1499,6 +1502,50 @@ language's piecewise one, `gelu`'s is the exp-composed block, and the two differ
 ordinary inputs. It lowers as written (vectorized, with the inline `tanh`) and is never substituted by
 the GELU kernel (`tests/run/spelling_value_bindings.wk`); call `gelu()` for the kernel. The erf form
 is a different function again.
+
+### Scalar builtins ✅
+
+The operations a systems language gives its number types. All are pure (usable inside `@parallel`
+regions), all lower to MIR every backend runs identically, and a user function of the same name
+shadows any of them.
+
+| builtin | meaning | result |
+|---|---|---|
+| `clamp(x, lo, hi)` | `x < lo ? lo : (x > hi ? hi : x)`, integer or float; a NaN `x` passes through | common type, like `min`/`max`; literals adapt to the other operands |
+| `fma(a, b, c)` | `a·b + c` rounded **once**, regardless of `@strict_fp`/`--fp` (a half type computes in `f32`, then rounds) | the operands' float type |
+| `popcount(x)`, `clz(x)`, `ctz(x)` | one bits; leading / trailing zero bits — the width for zero | `x`'s integer type |
+| `bswap(x)` | the bytes reversed (a byte is itself) | `x`'s type |
+| `rotl(x, n)`, `rotr(x, n)` | rotate by `n` modulo the width (so `-1` rotates a byte by 7) | `x`'s type |
+| `sat_add(a, b)`, `sat_sub(a, b)` | `a ± b` clamped to the type's range | `T` |
+| `sat_cast::<T>(x)` | an integer clamped into the integer type `T`; a float converts as `as` does | `T` |
+| `mulhi(a, b)` | the high half of the double-width product (`floor(a·b / 2^w)`) | `T` |
+| `widening_mul(a, b)` | the exact product one width up (`i8`→`i16` … `u32`→`u64`; 64-bit operands are `E0446`) | `2T` |
+| `overflowing_add/_sub/_mul(a, b)` | the wrapped result and whether it overflowed | `(T, bool)` |
+| `bits(x)` | a float's IEEE bit pattern (`f32`→`u32`, `f64`→`u64`, `f16`/`bf16`→`u16`) | unsigned int |
+| `f32_from_bits(u)`, `f64_from_bits`, `f16_from_bits`, `bf16_from_bits` | the float with those bits (an integer of exactly that width) | the float |
+| `isnan(x)`, `isinf(x)`, `isfinite(x)`, `signbit(x)` | classification; `signbit(-0.0)` is true | `bool` |
+| `copysign(x, y)` | `x`'s magnitude with `y`'s sign bit (NaNs included) | float |
+| `ldexp(x, n)` | `x·2ⁿ` rounded once to nearest even, subnormals and overflow included | `x`'s type |
+| `frexp(x)` | `(m, e)` with `x = m·2ᵉ`, `0.5 ≤ \|m\| < 1`; `(x, 0)` for `±0`, `±∞`, NaN | `(F, i32)` |
+| `erfc(x)` | `1 − erf(x)` with full relative accuracy in the tail (≤ 3 ULP) | float |
+| `erfinv(x)` | the inverse of `erf` on `(−1, 1)` (≤ 3 ULP through `1 − 2⁻⁵³`); `±1 → ±∞` | float |
+| `lgamma(x)` | `ln\|Γ(x)\|` (≤ 2 ULP for `x > 0`); `+∞` at the poles | float |
+| `logaddexp(a, b)` | `ln(eᵃ + eᵇ)` without overflow; `a == b` gives `a + ln 2` | float |
+| `f8e4m3_to_f32(b)`, `f8e5m2_to_f32(b)` | decode an OCP FP8 code held in a `u8` (exact) | `f32` |
+| `f32_to_f8e4m3(x)`, `f32_to_f8e5m2(x)` | encode, round to nearest even; E4M3FN **saturates** at ±448 (NaN → `0x7F`), E5M2 overflows to ±∞ (NaN → `0x7E`) | `u8` |
+
+`erfc`, `erfinv` and `lgamma` evaluate in double precision (the runtime's `special.rs`): an `f32`
+argument widens, computes and rounds once. `logaddexp` uses the shared `exp`/`log1p` of its type.
+The **bit builtins never produce or report a signaling NaN**: `*_from_bits` of a signaling pattern
+returns it with the quiet bit set, other payload bits kept, and `bits` reports any NaN quiet (the
+interpreter holds an `f32` as an `f64`, which cannot carry a signaling `f32` NaN). FP8 values are
+stored as raw `u8` (`alloc_u8`, `read_u8`, …) — there is no first-class `f8` scalar type yet.
+
+Misuse has its own codes: an integer variable passed to a floating-point builtin (including
+`fmax`/`fmin`) is `E0445`; a non-integer to an integer builtin, or a bit pattern of the wrong width
+(`f32_from_bits(x_u16)`), is `E0446`; and two different integer types where the type is the answer
+(`sat_add(x_i8, y_i32)` — 127 or 200?) is `E0447`. Fixtures: `tests/run/scalar_int_bits.wk`,
+`scalar_int_arith.wk`, `scalar_float_bits.wk`, `scalar_special_functions.wk`, `fp8_convert.wk`.
 
 ## Floating-point semantics ✅
 

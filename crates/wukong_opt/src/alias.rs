@@ -828,6 +828,7 @@ impl AliasInfo {
             | Op::Fma(..)
             | Op::Sqrt(..)
             | Op::Round(..)
+            | Op::IntUnary(..)
             | Op::Barrier => false,
         }
     }

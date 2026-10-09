@@ -233,12 +233,35 @@ impl Sema<'_> {
                         );
                     }
                 }
+                // The scalar builtins (`scalar_builtins.rs`): `clamp`, `fma`, the integer bit,
+                // saturating and overflow operations, float bit access and classification, the
+                // special functions and the FP8 conversions — each fully typed, misuse rejected.
+                let interner = self.interner;
+                if let Some(ret) = self.type_scalar_builtin(
+                    interner.resolve(name),
+                    generic_args,
+                    args,
+                    &mut arg_tys,
+                    span,
+                ) {
+                    self.types.insert(callee.id, Ty::Unknown);
+                    return ret;
+                }
                 // A few math builtins are lowered directly by the backends, so their *result*
                 // type is real rather than `Unknown` — this lets `let e = exp(x)` infer `f32`
                 // and the lowerer pick the right result type. The callee path itself stays
                 // unmodeled (`Unknown`).
                 if let Some(ret) = intrinsic_ret_ty(self.sym_str(name), &arg_tys) {
                     self.types.insert(callee.id, Ty::Unknown);
+                    // `fmax`/`fmin` on an integer operand is `E0445` (use `max`/`min`).
+                    if self.reject_integer_float_minmax(
+                        interner.resolve(name),
+                        args,
+                        &arg_tys,
+                        span,
+                    ) {
+                        return Ty::Unknown;
+                    }
                     // A math intrinsic operates on a scalar (an integer is coerced to float, like
                     // `sqrt(2)`), a SIMD vector, or a tensor — never an aggregate, pointer, reference,
                     // unit, or function value. Such an argument used to slip through (the result is

@@ -81,6 +81,13 @@ Crate root: re-exports every `wukong_*` kernel symbol, `bf16`/`f16` conversion h
 | `pool2d.rs` | `wukong_{avg,max}pool2d_f32*` |
 | `scatter.rs` | `wukong_scatter_add_f32*` |
 
+## Scalar libraries (no SIMD kernels)
+
+| file | contents |
+|---|---|
+| `special.rs` | f64 `erfinv`, `lgamma`, `digamma` behind `wukong_rt_math_f64`'s `M64_*` codes (`erfc` is in `math64.rs`) |
+| `fp8.rs` | Reference OCP FP8 (E4M3FN, E5M2) decode/encode — the oracle the compiler's FP8 builtins are pinned to |
+
 ## Scheduling policy (no kernels)
 
 | file | contents |

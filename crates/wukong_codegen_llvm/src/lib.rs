@@ -51,7 +51,8 @@ use std::fmt::Write as _;
 
 use wukong_backend::{Artifact, Backend};
 use wukong_mir::{
-    BasicBlock, BinOp, CastKind, CmpOp, Function, MirType, Op, Program, Terminator, ValueId,
+    BasicBlock, BinOp, CastKind, CmpOp, Function, IntUnOp, MirType, Op, Program, Terminator,
+    ValueId,
 };
 use wukong_span::{Interner, Symbol};
 
@@ -503,6 +504,14 @@ fn declarations(
                         (llvm_ty(&ty), vec![llvm_ty(&ty); 3]),
                     ))
                 }
+                Op::IntUnary(op, v) => {
+                    let ty = llvm_ty(f.value_type(*v));
+                    let mut params = vec![ty.clone()];
+                    if matches!(op, IntUnOp::Clz | IntUnOp::Ctz) {
+                        params.push("i1".into());
+                    }
+                    Some((int_unary_intrinsic(*op, &ty), (ty, params)))
+                }
                 Op::Cast(kind @ (CastKind::FpToSi | CastKind::FpToUi), v, to) => {
                     let from = reg_mir(f.value_type(*v));
                     let target = saturating_target(to);
@@ -632,6 +641,19 @@ fn math_intrinsic(op: &Op, ty: &MirType) -> Result<String, String> {
         _ => unreachable!(),
     };
     Ok(format!("llvm.{name}.{suffix}"))
+}
+
+/// The LLVM intrinsic an [`Op::IntUnary`] on the integer type `ty` (`i8`..`i64`) calls.
+/// `ctlz`/`cttz` take a second `i1` operand, passed `false` so a zero input is defined (the full
+/// width), which is the MIR semantics.
+fn int_unary_intrinsic(op: IntUnOp, ty: &str) -> String {
+    let name = match op {
+        IntUnOp::Popcnt => "ctpop",
+        IntUnOp::Clz => "ctlz",
+        IntUnOp::Ctz => "cttz",
+        IntUnOp::Bswap => "bswap",
+    };
+    format!("llvm.{name}.{ty}")
 }
 
 fn intrinsic_type_suffix(ty: &MirType) -> String {
@@ -1269,6 +1291,18 @@ impl Emitter<'_> {
                 let name = math_intrinsic(&inst.op, &reg_mir(self.f.value_type(r)))
                     .expect("intrinsic types checked before emission");
                 format!("{res}call {ty} @{name}({ty} {})", self.operand(*a))
+            }
+            Op::IntUnary(op, a) => {
+                let ty = self.ty(*a);
+                let name = int_unary_intrinsic(*op, &ty);
+                if matches!(op, IntUnOp::Clz | IntUnOp::Ctz) {
+                    format!(
+                        "{res}call {ty} @{name}({ty} {}, i1 false)",
+                        self.operand(*a)
+                    )
+                } else {
+                    format!("{res}call {ty} @{name}({ty} {})", self.operand(*a))
+                }
             }
             Op::VecKernelCall {
                 kernel,

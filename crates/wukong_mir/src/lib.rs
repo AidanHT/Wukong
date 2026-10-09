@@ -18,7 +18,7 @@ pub mod verify;
 pub use builder::Builder;
 pub use inst::{
     narrow_result, switch_case_value, widen_result, AddrSpace, BinOp, CastKind, CmpOp, Half, Inst,
-    NarrowKind, Op, RoundMode, SwitchCase, Terminator,
+    IntUnOp, NarrowKind, Op, RoundMode, SwitchCase, Terminator,
 };
 pub use vec_kernel::{
     host_supports_vec_kernels, op_operands, op_produces_value, VecBin, VecCmp, VecKernel, VecLane,

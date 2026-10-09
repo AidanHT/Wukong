@@ -1,0 +1,163 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 127
+// EXPECT-OUT: -128
+// EXPECT-OUT: -128
+// EXPECT-OUT: 127
+// EXPECT-OUT: 255
+// EXPECT-OUT: 0
+// EXPECT-OUT: 80
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: 9223372036854775807
+// EXPECT-OUT: 18446744073709551615
+// EXPECT-OUT: 0
+// EXPECT-OUT: 127
+// EXPECT-OUT: -128
+// EXPECT-OUT: 0
+// EXPECT-OUT: 255
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 9223372036854775807
+// EXPECT-OUT: 65535
+// EXPECT-OUT: -128
+// EXPECT-OUT: 1234
+// EXPECT-OUT: 2793967723
+// EXPECT-OUT: -931322575
+// EXPECT-OUT: 18446744073709550384
+// EXPECT-OUT: -2
+// EXPECT-OUT: -1
+// EXPECT-OUT: 156
+// EXPECT-OUT: 16000000000000000000
+// EXPECT-OUT: 4611686018427387904
+// EXPECT-OUT: -16256
+// EXPECT-OUT: 65025
+// EXPECT-OUT: -1296
+// EXPECT-OUT: 1
+// EXPECT-OUT: 156
+// EXPECT-OUT: 1
+// EXPECT-OUT: -1616
+// EXPECT-OUT: 1
+// EXPECT-OUT: 15
+// EXPECT-OUT: 0
+// EXPECT-OUT: -9223372036854775808
+// EXPECT-OUT: 0
+// EXPECT-OUT: -9223372036854775808
+// EXPECT-OUT: 1
+// EXPECT-OUT: 24464
+// EXPECT-OUT: 1
+// EXPECT-OUT: 18446744073709551615
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+module tests.run.scalar_int_arith
+
+// Saturating, narrowing, high-half, widening and overflow-reporting integer arithmetic — the
+// requantization toolkit — at the edges of each type: `sat_add`/`sat_sub` clamp to the operand
+// type's range; `sat_cast::<T>` clamps an integer to T's range (a float converts as `as` does);
+// `mulhi` is the high half of the double-width product (floor of the product / 2^w, so signed
+// results round toward -inf; the 64-bit form goes through four 32x32 partial products);
+// `widening_mul` is the exact product one width up; `overflowing_*` returns the wrapped result and
+// whether it overflowed. Each expected line is the mathematical result clamped or wrapped to the
+// type, computed independently with unbounded integers — never recorded from the compiler.
+fn main() -> i32 {
+    let p: i8 = 100;
+    let q: i8 = -100;
+    let u: u8 = 200;
+    let v: u8 = 100;
+    print(sat_add(p, p)); // 127
+    print(sat_add(q, q)); // -128
+    print(sat_sub(q, p)); // -128
+    print(sat_sub(p, q)); // 127
+    print(sat_add(u, v)); // 255
+    print(sat_sub(v, u)); // 0
+    print(sat_add(p, -20)); // 80: the literal adapts to i8
+    let big: i32 = 2147483000;
+    let m32: i32 = -2147483000;
+    let l: i64 = 9223372036854775000;
+    let ul: u64 = 18446744073709551000;
+    let u1: u64 = 5;
+    print(sat_add(big, big)); // i32::MAX
+    print(sat_sub(m32, big)); // i32::MIN
+    print(sat_add(l, l)); // i64::MAX
+    print(sat_add(ul, ul)); // u64::MAX
+    print(sat_sub(u1, ul)); // 0
+
+    let x300: i32 = 300;
+    let xm300: i32 = -300;
+    let xm5: i32 = -5;
+    let ubig: u32 = 4000000000;
+    let m1: i64 = -1;
+    print(sat_cast::<i8>(x300)); // 127
+    print(sat_cast::<i8>(xm300)); // -128
+    print(sat_cast::<u8>(xm5)); // 0
+    print(sat_cast::<u8>(ubig)); // 255
+    print(sat_cast::<i32>(ubig)); // i32::MAX
+    print(sat_cast::<u32>(m1)); // 0
+    print(sat_cast::<u64>(m1)); // 0
+    print(sat_cast::<i64>(ul)); // i64::MAX
+    let f1: f32 = 1000000.0;
+    let f2: f32 = -10000000000.0;
+    let f3: f32 = 1234.9;
+    print(sat_cast::<u16>(f1)); // 65535
+    print(sat_cast::<i8>(f2)); // -128
+    print(sat_cast::<i16>(f3)); // 1234 (toward zero)
+
+    let ua: u32 = 4000000000;
+    let ub: u32 = 3000000000;
+    let sa: i32 = -2000000000;
+    let sb: i32 = 2000000000;
+    let n5: i64 = -5;
+    let s7: i64 = 7;
+    let b200: u8 = 200;
+    print(mulhi(ua, ub)); // 12e18 >> 32
+    print(mulhi(sa, sb)); // floor(-4e18 / 2^32)
+    print(mulhi(ul, ul)); // the high 64 bits of ul * ul
+    print(mulhi(l, -3)); // floor(-3l / 2^64)
+    print(mulhi(n5, s7)); // floor(-35 / 2^64) = -1
+    print(mulhi(b200, b200)); // 40000 >> 8
+
+    let w32: u32 = 4000000000;
+    let mn: i32 = -2147483647 - 1;
+    let i8a: i8 = -128;
+    let i8b: i8 = 127;
+    let u8a: u8 = 255;
+    print(widening_mul(w32, w32)); // 1.6e19, a u64
+    print(widening_mul(mn, mn)); // 2^62, an i64
+    print(widening_mul(i8a, i8b)); // an i16
+    print(widening_mul(u8a, u8a)); // a u16
+
+    let o1 = overflowing_add(big, big);
+    print(o1.0);
+    print(o1.1 as i32);
+    let o2 = overflowing_sub(v, u);
+    print(o2.0);
+    print(o2.1 as i32);
+    let o3 = overflowing_mul(l, 2);
+    print(o3.0);
+    print(o3.1 as i32);
+    let three: u64 = 3;
+    let o4 = overflowing_mul(three, 5);
+    print(o4.0);
+    print(o4.1 as i32);
+    let halfmin: i64 = -4611686018427387904;
+    let o5 = overflowing_mul(halfmin, 2); // exactly i64::MIN: no overflow
+    print(o5.0);
+    print(o5.1 as i32);
+    let lmin: i64 = -9223372036854775807 - 1;
+    let o6 = overflowing_mul(lmin, -1); // -i64::MIN overflows back to i64::MIN
+    print(o6.0);
+    print(o6.1 as i32);
+    let s300: i16 = 300;
+    let o7 = overflowing_mul(s300, s300);
+    print(o7.0);
+    print(o7.1 as i32);
+    let o8 = overflowing_add(ul, 615); // exactly u64::MAX
+    print(o8.0);
+    print(o8.1 as i32);
+    let o9 = overflowing_add(ul, 616);
+    print(o9.0);
+    print(o9.1 as i32);
+    return 0;
+}

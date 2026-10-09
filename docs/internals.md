@@ -269,13 +269,15 @@ and exactly one `Terminator` (`Ret`, `Br`, `CondBr`, `Switch`, `Unreachable`). `
 branch on an `i8`..`i64` scrutinee whose case values are stored canonically (sign-extended from the
 type's width) and pairwise distinct; only `wukong_opt`'s late switch formation creates one, and the
 verifier, interpreter, Cranelift (`cranelift_frontend::Switch`), textual LLVM (`switch`) and every
-terminator visitor handle it (the `gpu-native` lowering declines it). `Op` has 27 variants: constants
+terminator visitor handle it (the `gpu-native` lowering declines it). `Op` has 28 variants: constants
 (`ConstInt`/`ConstFloat`), `Bin`/`Cmp`/`Cast`, the unary `Neg`/`Not`, `Select`, memory
 (`Alloca`/`Load`/`Store`/`Gep`), `Call`, `Barrier` (cooperative thread-block fence from
 `sync_block()`), the float/SIMD primitives
 (`Splat`/`ExtractLane`/`Iota`/`Fma`/`Sqrt`/`Round`), the lane-moving SIMD ops
-(`Widen`/`Narrow`/`Shuffle`/`InsertLane`), the address-of ops (`FuncAddr`, `GlobalAddr`), and
-`VecKernelCall`. `Widen` converts one half of a vector's lanes to twice their width (`SExt`/`ZExt`
+(`Widen`/`Narrow`/`Shuffle`/`InsertLane`), `IntUnary` (`popcnt`/`clz`/`ctz`/`bswap` on a scalar
+`i8`..`i64`, semantics in `IntUnOp::eval`; no `i8` `bswap`, never widened by the vectorizer,
+declined by `gpu-native`), the address-of ops (`FuncAddr`, `GlobalAddr`), and `VecKernelCall`.
+`Widen` converts one half of a vector's lanes to twice their width (`SExt`/`ZExt`
 /`FpExt`) and `Narrow` joins two vectors into one of half the lane width (truncating, saturating
 signed or unsigned, or `f64 -> f32`) — the two ops that let one loop compute at several lane widths;
 `Shuffle` is a two-source constant lane permutation and `InsertLane` writes one lane. `Bin` has one

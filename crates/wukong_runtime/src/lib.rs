@@ -55,6 +55,10 @@ pub use vmath::{
 
 pub mod math64;
 pub use math64::{wukong_rt_math2_f64, wukong_rt_math_f64};
+// The special functions `wukong_rt_math_f64` dispatches by `M64_*` code (`erfinv`, `lgamma`, and
+// `digamma` for autodiff), and the FP8 reference conversions the compiler's lowering is pinned to.
+pub mod fp8;
+pub mod special;
 
 mod velem;
 pub use velem::{

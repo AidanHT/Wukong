@@ -6,25 +6,33 @@
 // EXPECT-OUT: -7
 // EXPECT-OUT: 5
 // EXPECT-OUT: 3
+// EXPECT-OUT: 5
+// EXPECT-OUT: 3
 module tests.run.fmax_int
 
-// fmax/fmin on integer variables promote the operand to f32 (the float compare-and-select), exactly
-// like sqrt/exp/pow. Before, their lowering left an integer operand at its int type and the float
-// compare ran on i32 — invalid MIR that crashed the native backend while the interpreter computed an
-// integer max: a backend divergence. Now both backends run the identical coerced float compare.
+// Integer max/min and the float fmax/fmin. `fmax`/`fmin` on an integer *variable* is the compile
+// error E0445 (it used to convert the operands to f32, which rounds integers above 2^24 — see
+// tests/fail/fmax_integer_operand.wk); the integer spelling is the type-preserving `max`/`min`.
+// An integer *literal* operand still converts to f32, exactly as `sqrt(2)` does: that coercion is
+// what once ran a float compare on an i32 operand — invalid MIR native rejected while the
+// interpreter computed an integer max, a backend divergence. Every value is the ordinary max/min
+// of the operands, derived by hand.
 fn main() -> i32 {
     let a: i32 = 5;
     let b: i32 = 3;
-    print(fmax(a, b) as i32); // 5
-    print(fmin(a, b) as i32); // 3
+    print(max(a, b)); // 5
+    print(min(a, b)); // 3
     let c: i32 = -7;
     let d: i32 = 2;
-    print(fmax(c, d) as i32); // 2
-    print(fmin(c, d) as i32); // -7
+    print(max(c, d)); // 2
+    print(min(c, d)); // -7
     // float operands are unchanged.
     let x: f32 = 5.0;
     let y: f32 = 3.0;
     print(fmax(x, y) as i32); // 5
     print(fmin(x, y) as i32); // 3
+    // integer literals convert to f32 (5.0 and 3.0).
+    print(fmax(5, 3) as i32); // 5
+    print(fmin(5, 3) as i32); // 3
     return 0;
 }
