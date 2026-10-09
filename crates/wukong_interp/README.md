@@ -18,7 +18,8 @@ real buffers — wider lanes or reassociated accumulation cannot make the oracle
 - `run_kernel_f32` / `run_kernel_f32_accel` / `run_kernel_f64` / `run_kernel_i8` — typed kernel-entry
   ABI for the full-buffer fuzzer and `wukong_autodiff`'s finite-difference gate.
 
-All entry points run on a scoped worker thread with a **512 MiB** reserved stack (`with_big_stack`).
+Calls are **stackless**: `run_function` keeps an explicit frame stack, so a Wukong call never
+recurses on the host stack and every entry point runs on its caller's thread (no worker thread).
 
 `Interpreter` implements `wukong_backend::Backend` (returns `Artifact::Executed`), but the driver
 calls `run_with_output` directly — see `wukong_backend`.
@@ -27,7 +28,10 @@ calls `run_with_output` directly — see `wukong_backend`.
 
 `memory: Vec<Value>` is flat — **one slot per scalar leaf**, not bytes. `Alloca` pushes typed zeros;
 `Value::Ptr(usize)` is a slot index; `Gep` computes `base + index * slot_count(elem)`. Memory is
-never freed (`wukong_rt_free` is a deliberate no-op).
+reused (`SlotReuse`): a returning frame cuts it back to its entry length, never below the end of
+the last non-alloca growth (heap/scratch block, static string, kernel-entry buffer), and
+`wukong_rt_free` puts a live `alloc_*` block on a size-bucketed free list that the next fitting
+allocation takes back re-zeroed.
 
 **Address 0 is the reserved null (`NULL_SLOT`).** Every public entry point starts its memory with
 one never-allocated sentinel slot (`NULL_SENTINEL`), so no `alloca`, heap block, static or
@@ -72,8 +76,8 @@ Changing these re-specifies the language:
   exempt from the integer mask (byte-wise aggregate copies).
 - Vector lanes truncate to lane width via `mask_lane`.
 - Non-positive kernel extent is a no-op (`dim!` macro), not an abort.
-- Resource limits report diagnostics: heap exhaustion, 100M-step guard, call-depth ceiling
-  (bisected against the 512 MiB stack reservation).
+- Resource limits report diagnostics: heap exhaustion, 100M-step guard (per frame), call-depth
+  ceiling (`MAX_CALL_DEPTH` = 300_000 in every build profile, `WUKONG_INTERP_MAX_DEPTH` overrides).
 - Scalar arithmetic matched to Cranelift: wrapping int ops; div/rem by zero → `0`; shift counts
   masked; `RoundMode::Nearest` is `round_ties_even`; bf16/f16 live as rounded `f32`.
 - `wukong_embedding_f32` gathers read live memory (no snapshot when `out` aliases `weight`).

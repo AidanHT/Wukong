@@ -960,9 +960,9 @@ struct ScratchSlots {
 ///   `persist_floor`: the end of the last growth that was *not* an alloca (a heap or scratch
 ///   allocation, a materialized string, a kernel-entry buffer), which must outlive the frame that
 ///   made it. Such growth is detected rather than enumerated: between two alloca/release points
-///   `memory` only grows, so a length that differs from `stack_end` there is persistent growth. A
-///   frame that allocates heap memory after its own allocas keeps those allocas until an
-///   enclosing frame releases past them — conservative, never unsound. Re-pushed alloca slots get
+///   `memory` only grows, so a length that differs from `stack_end` there is persistent growth. An
+///   alloca below such growth is never released, since no release goes below the floor —
+///   conservative, never unsound. Re-pushed alloca slots get
 ///   their typed defaults again, exactly as fresh ones do.
 /// * **`free`.** A `wukong_rt_alloc` block is recorded with its capacity; `free` moves it to a
 ///   size-bucketed free list, and the next allocation that fits a freed block (the smallest

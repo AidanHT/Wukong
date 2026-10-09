@@ -41,7 +41,8 @@ informational (see *Modules & imports*), so a single-file program may omit it. E
 parameters and returns an integer, a float or nothing; the exit code is the **low 8 bits** of the
 value (a float converts toward zero first, saturating; no return type exits 0), so `return 300`
 exits 44 under `--run` and from a linked executable on every OS. The program runs on a 512 MiB
-stack in both `--run` backends and in an `--emit=exe` executable.
+stack under `--run --backend=native` and in an `--emit=exe` executable; the interpreter's calls
+never use the host stack (its call-depth ceiling is 300,000 frames in every build).
 
 ## Source text ✅
 

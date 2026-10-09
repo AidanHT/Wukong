@@ -126,7 +126,7 @@ another architecture or OS is not supported. A native-backend failure is a catal
   `error: interpreter call-depth limit exceeded (likely unbounded recursion)` and exits 1. That is a
   **diagnostic**, never an uncatchable process abort. Recursion past the cap is a **resource limit
   outside the bit-for-bit differential contract** — the oracle *refuses* where the native backend
-  (on its 256 MiB `--run` thread) may still complete, the same "outside the defined contract" status
+  (on its 512 MiB `--run` worker stack) may still complete, the same "outside the defined contract" status
   as an out-of-bounds access. At `-O1`
   and above tail-recursion elimination turns a self-call in tail position into a loop, so a
   tail-recursive function no longer consumes call depth there (an unbounded tail recursion then

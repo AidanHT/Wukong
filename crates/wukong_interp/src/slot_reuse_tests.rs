@@ -94,7 +94,8 @@ fn the_free_list_fits_requests_and_ignores_foreign_and_double_frees() {
     heap_free(&mut it, a);
     heap_free(&mut it, a); // a double free: ignored, so `a` is handed out once below
     heap_free(&mut it, NULL_SLOT); // not a heap block: ignored
-                                   // 8 slots for 3 would waste more than half the block: a fresh block instead.
+
+    // 8 slots for 3 would waste more than half the block: a fresh block instead.
     let tiny = heap_alloc(&mut it, 3, true);
     assert_ne!(tiny, a);
     // 8 slots for 5 fits: `a` again, re-zeroed with the integer zero.
