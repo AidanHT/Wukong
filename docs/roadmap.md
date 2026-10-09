@@ -537,9 +537,13 @@ another architecture or OS is not supported. A native-backend failure is a catal
   arm, a constant addend such as a count included). Integer ones up to 32-bit lanes keep
   lane-parallel partials; float ones (and 64-bit min/max) fold lane by lane in index order with the
   loop's own compare/select, so NaN and `±0` behave exactly as in the scalar loop
-  (`tests/run/vectorized_{minmax,guarded}_reductions.wk` print every prefix answer). Still scalar:
-  argmax / find-index loops (a branch that also records the index), early-exit search loops,
-  `if`/`else if` chains and one-armed stores (no masked memory ops yet). A loop needing more than
+  (`tests/run/vectorized_{minmax,guarded}_reductions.wk` print every prefix answer). **Search
+  loops** with an early `break` widen too, when every load before the exit provably stays inside its
+  object (a local `[T; N]` table, or a slice searched to its own length): any lane leaving hands the
+  group back to the scalar loop, which stops at exactly the same iteration
+  (`tests/run/vectorized_search_loops.wk`). Still scalar: argmax / find-index loops that record the
+  index in a branch, searches over a parameter buffer (no extent in MIR), `if`/`else if` chains and
+  one-armed stores (no masked memory ops yet). A loop needing more than
   eight runtime alias checks stays scalar. A two-deep nest whose inner loop carries a recurrence or
   a strict-order reduction (an EMA or IIR per row, a hash, a column sum) is **unrolled and jammed**
   instead: four rows run side by side as four independent chains, each bit-identical to the scalar

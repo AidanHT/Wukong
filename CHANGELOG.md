@@ -5,7 +5,7 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
-### Loop nests: unroll-and-jam (`gap2/vec-control-2`)
+### Loop nests and search loops (`gap2/vec-control-2`)
 
 - **Nests whose inner loop carries a chain run four rows at once.** A two-deep nest whose inner loop
   carries a recurrence (`h = a*h + x[r, t]`, an IIR filter, a running hash) or a reduction the
@@ -16,6 +16,11 @@ All notable changes to Wukong are documented here. The format is loosely based o
   included, or time-major `x[t*D + d]`), arrays that may alias are range-checked once before the
   nest, and the nest neither calls, allocates nor divides by a value that could trap.
   `WUKONG_NO_UNROLL_JAM=1` turns it off; the speed-up is not yet measured.
+- **Search loops vectorize.** A loop that leaves early (`if a[i] > t { break; }`) used to stay
+  scalar because it has two exits. The test now runs a whole group at a time; when any lane would
+  leave, the original loop re-runs that group and stops at exactly the iteration it always did.
+  It applies when every load before the exit provably stays inside its object — a local `[T; N]`
+  table, or a slice searched up to its own length.
 
 ### AOT executables and platform (`gap2/aot-and-platform`)
 

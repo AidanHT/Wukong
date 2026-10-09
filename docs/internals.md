@@ -489,6 +489,17 @@ branch that also records an index (an argmax) stays scalar. The runtime alias gu
 eight checks per loop (LLVM's default threshold); `WUKONG_VEC_TRACE=1` prints each widening with a
 per-group cost estimate (`cost=vector/scalar`), which is reported but not yet enforced.
 
+**Search loops** (`EarlyExit`): a loop whose body block leaves on one arm (`if a[i] > t { break }`)
+before falling into a straight-line latch widens as one body split at the test. The condition goes
+lane-wide and is folded over its lanes (parts combined, then a halving tree of lane shuffles, lane 0
+against zero); if any lane would leave, the group branches to the vector exit with its first
+iteration and starting values, and the original loop re-runs at most `W` iterations and leaves at
+exactly the iteration it always did. The rest of the group — its stores and accumulates — runs only
+when every lane continues. Nothing before the exit may store, gather or load an interleave window,
+and every contiguous load before it must provably read memory that exists for the whole trip: a
+stack array `[T; N]` with constant endpoints inside it, or a `[]T` slice searched up to its own
+length. A parameter buffer, whose extent MIR does not carry, keeps the search scalar.
+
 **Unrolling never reassociates.** Splitting a float reduction across several accumulators would
 break the 4-cycle `addss` dependency chain, and it computes a different number — which breaks both
 the interp-vs-native bit-exactness gate and `-O0` ≡ `-O{1,2,3}`. So the unrolled body is the original
