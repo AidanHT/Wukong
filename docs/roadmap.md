@@ -546,7 +546,9 @@ another architecture or OS is not supported. A native-backend failure is a catal
   each lane's own element only where that lane took the arm and a private scratch slot otherwise
   (`tests/run/vectorized_predicated_arms.wk`). Still scalar: argmax / find-index loops that record
   the index in a branch, searches over a parameter buffer (no extent in MIR), `if`/`else if` chains,
-  and stores to different places in both arms. The per-lane accesses are scalar under Cranelift
+  stores to different places in both arms, and an arm that alone subscripts a `[]T` parameter
+  without `@noalias` (its data pointer is re-read inside the arm, an invariant load that is not
+  speculated; a local or `@noalias` slice has it hoisted out of the loop). The per-lane accesses are scalar under Cranelift
   (no masked vector memory op is emitted yet). A loop needing more than
   eight runtime alias checks stays scalar. A two-deep nest whose inner loop carries a recurrence or
   a strict-order reduction (an EMA or IIR per row, a hash, a column sum) is **unrolled and jammed**

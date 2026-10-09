@@ -6455,9 +6455,16 @@ mod tests {
     /// Only one arm stores, so the flattened body must not write `o[i]` for lanes the scalar loop
     /// leaves untouched: each lane stores on its own, to `o[i + k]` where it took the arm and to a
     /// scratch slot where it did not. The sentinels the arm skips must survive.
+    ///
+    /// `o` is `@noalias` because only the arm subscripts it, so only the arm would re-read its data
+    /// pointer from the fat pointer: an invariant load no other access covers, which
+    /// `linearize_region` refuses to speculate. The promise makes the header dereferenceable, LICM
+    /// hoists that read out of the loop, and the arm is left with the element store this case is
+    /// about. (Inlined into `main`, the slice is a local and the same hoist needs no promise.)
     #[test]
     fn a_one_armed_store_is_predicated_and_skipped_elements_survive() {
-        let kernel = "@unchecked fn k(x: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
+        let kernel = "@unchecked fn k(x: []f32, @noalias mut o: []f32, n: i64) { \
+                      let mut i: i64 = 0; \
                       while i < n { let v: f32 = x[i]; \
                       if v > 0.0 { o[i] = v * 2.0 + 1.0; } i = i + 1; } }";
         let shape = format!("{kernel} fn main() -> i32 {{ return 0; }}");
@@ -6483,10 +6490,11 @@ mod tests {
 
     /// Only one arm reads `w[i]`, and `w` is shorter than the trip: the scalar loop reads it only
     /// where `x[i] > 0`. Speculating the load would read past its end; predicating it reads the
-    /// scratch slot for every lane that did not take the arm.
+    /// scratch slot for every lane that did not take the arm. `w` is `@noalias` for the reason the
+    /// one-armed store's `o` is: only the arm reads it, data pointer included.
     #[test]
     fn an_arm_only_load_is_predicated_and_never_reads_past_its_buffer() {
-        let kernel = "@unchecked fn k(x: []f32, w: []f32, mut o: []f32, n: i64) { \
+        let kernel = "@unchecked fn k(x: []f32, @noalias w: []f32, mut o: []f32, n: i64) { \
                       let mut i: i64 = 0; \
                       while i < n { let xi: f32 = x[i]; \
                       if xi > 0.0 { o[i] = w[i] * xi; } else { o[i] = 1.0; } i = i + 1; } }";

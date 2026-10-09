@@ -506,7 +506,10 @@ access covers (`PredLoad`) instead run per lane through `select(lane took the ar
 scratch)`, where the scratch is one private stack slot per element type in the entry block. No lane
 reads or writes an element the scalar loop leaves alone — unlike a read-modify-write blend, which
 could race with another thread writing the skipped elements or read past a shorter buffer. Stores
-in both arms must still pair into one masked store.
+in both arms must still pair into one masked store. Only affine element accesses are predicated: an
+arm that alone subscripts a `[]T` parameter also re-reads its data pointer there, an invariant load
+no other access covers, and the loop stays scalar unless LICM has hoisted that read (a local slice,
+or a `@noalias` one).
 
 **Unrolling never reassociates.** Splitting a float reduction across several accumulators would
 break the 4-cycle `addss` dependency chain, and it computes a different number — which breaks both
