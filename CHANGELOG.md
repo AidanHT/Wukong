@@ -13,6 +13,12 @@ All notable changes to Wukong are documented here. The format is loosely based o
   min/max (and a 64-bit integer one) widens the body and folds the running extremum lane by lane in
   index order, re-emitting the loop's own compare and select, so NaN and `±0` ties resolve exactly
   as in the scalar loop.
+- **Conditional reductions vectorize.** A guarded accumulate (`if c { s = s + x }`, on either arm,
+  including a constant addend such as a count) and a min/max written as a branch
+  (`if x[i] > m { m = x[i] }`) used to decline the loop as recurrences. The condition now goes
+  lane-wide and each lane keeps `c ? s ⊕ x : s` — blended per part for an integer accumulator,
+  selected per lane in the in-order float fold — with no identity element, so a running `-0.0` or a
+  NaN payload is never altered. An argmax-style branch that also records an index stays scalar.
 
 ### Type soundness and patterns (`gap2/type-soundness-and-patterns`)
 

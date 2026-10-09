@@ -64,6 +64,13 @@
 //! address the scalar loop never touches, and Wukong does not bounds-check slice indexing) — are
 //! refused there.
 //!
+//! A merge that carries an accumulator across the back edge is a **guarded reduction**
+//! (`if c { s = s + x }`, `loop_info::Reduction::merge`): it is folded with the other reductions,
+//! each lane keeping `c ? s ⊕ x : s` — a lane-parallel integer accumulator blends per part, a serial
+//! float fold selects per lane, and neither needs an identity element. A branch that only chooses
+//! between the accumulator and a value it was compared against (`if x > m { m = x }`) is a min/max
+//! and folds as one.
+//!
 //! # Width
 //!
 //! Every vector is 128 bits — `<4 x f32>`, `<2 x f64>`, `<8 x i16>`, `<16 x i8>`. That is not a
@@ -354,8 +361,9 @@ enum Plan {
     /// A member of an interleaved store group: each member records its value, and the last one
     /// interleaves all `k` with lane shuffles and stores the window contiguously.
     GroupStore { group: usize, offset: u32 },
-    /// A reduction's combining instruction. Not emitted inline — every accumulate is folded
-    /// serially at the end of the vector body by [`emit_reduction_fold`].
+    /// Part of a reduction's accumulate — its combining instruction, a min/max's compare, or a
+    /// guarded accumulate's merge. Not emitted inline — every accumulate is folded at the end of the
+    /// vector body ([`emit_reduction_fold`], or a vector accumulator's per-part combine).
     Reduce,
     /// An if-converted store: one `store` of a lane-wise `select` between the two arms' values.
     MaskedStore,
@@ -499,6 +507,10 @@ struct RedPlan {
     /// A min/max: the compare-and-select the scalar loop accumulates with, re-emitted per lane (or
     /// per part, for a vector accumulator) with the accumulator in the same two positions.
     select: Option<loop_info::SelectCombine>,
+    /// A guarded accumulate (`if c { s = s + x }`): the if-converted condition — a lane mask — and
+    /// whether the update is the value taken when it is true. Each lane keeps its update only where
+    /// its own condition chose it: `c ? acc ⊕ x : acc`, exactly the scalar merge.
+    guard: Option<(ValueId, bool)>,
     ty: MirType,
     /// May the partials be kept in `W` independent lanes and folded once, after the loop?
     ///
@@ -1644,6 +1656,31 @@ fn plan_body(
         if let Some(s) = r.select {
             red_cmp.insert(s.cmp.0);
         }
+        // A guarded accumulate is folded where if-conversion merged it: find that merge, and the
+        // side of it the update arrives on. A merge outside the flattened body cannot be widened.
+        let guard = match r.merge {
+            None => None,
+            Some(m) => {
+                let (cond, then_arg, else_arg) = lin.iter().find_map(|s| match s {
+                    LinInst::Merge {
+                        param,
+                        cond,
+                        then_arg,
+                        else_arg,
+                    } if *param == m => Some((*cond, *then_arg, *else_arg)),
+                    _ => None,
+                })?;
+                let on_true = if then_arg == r.combine && else_arg == r.param {
+                    true
+                } else if else_arg == r.combine && then_arg == r.param {
+                    false
+                } else {
+                    return None;
+                };
+                red_of.insert(m.0);
+                Some((cond, on_true))
+            }
+        };
         // Lane-parallel partials need the combine to exist *as a vector instruction*. It is the
         // same `Op::Bin` the elementwise path emits, so it is the same question `bin_widenable`
         // answers — an `i8` product has no packed form, and a reduction is not exempt from that.
@@ -1658,6 +1695,7 @@ fn plan_body(
             addend,
             fma_factors: r.fma_factors,
             select: r.select,
+            guard,
             ty,
             vector_acc,
         });
@@ -1812,6 +1850,19 @@ fn plan_body(
                 then_arg,
                 else_arg,
             } => {
+                // A reduction's merge — the join of a guarded accumulate, or the branch a min/max is
+                // written as — is folded with its reduction, after the body. It is never
+                // `available`: nothing but the back edge reads it (`loop_info` counted).
+                if red_of.contains(&param.0) {
+                    plans.push(Plan::Reduce);
+                    continue;
+                }
+                // A min/max's compare is re-emitted by its fold and never widened, so it cannot
+                // steer anything else. (`loop_info` only takes a branch as a min/max when the branch
+                // chooses nothing else; this keeps the invariant local.)
+                if red_cmp.contains(&cond.0) {
+                    return None;
+                }
                 for u in [*cond, *then_arg, *else_arg] {
                     if defined_in_loop.contains(&u.0) && !available.contains(&u.0) {
                         return None;
@@ -2112,11 +2163,27 @@ fn plan_body(
 
     // Every reduction must actually be foldable: its inputs have to be vectors, or the "extract W
     // lanes and accumulate serially" step has nothing to extract.
+    //
+    // A guarded accumulate is the exception for its addend, which may be uniform — `count = count
+    // + 1` under `if x[i] > t` adds the same value in every lane that took the branch — as long as
+    // the vector body has it (defined outside the loop, or reproduced as a scalar). Its condition
+    // must be a real lane mask: a uniform `i1` cannot blend vectors.
     for r in &reductions {
         lane_bytes(&r.ty)?;
+        if let Some((cond, _)) = r.guard {
+            if !is_vec(&vector_ty, cond) {
+                return None;
+            }
+        }
         match (r.addend, r.fma_factors) {
             (Some((a, _)), None) => {
-                if !is_vec(&vector_ty, a) {
+                // Never the induction variable's address face, nor anything computed from it while
+                // it was uniform: those are one scalar for the group but differ per lane.
+                let uniform_ok = r.guard.is_some()
+                    && (!defined_in_loop.contains(&a.0) || available.contains(&a.0))
+                    && !red_cmp.contains(&a.0)
+                    && !iv_addr.contains(&a.0);
+                if !is_vec(&vector_ty, a) && !uniform_ok {
                     return None;
                 }
                 if lane_vals.contains(&a.0) {
@@ -2949,6 +3016,11 @@ fn emit_body(
             };
             map.insert(p.ramp.iv.0, face);
         }
+        // A reduction's combine, a min/max's compare and a guarded accumulate's merge are all
+        // folded after the body, below — whether the step is an instruction or a merge.
+        if matches!(p.plans[i], Plan::Reduce) {
+            continue;
+        }
         // The two synthesized steps of if-conversion. Both are lane-wise `select`s: one feeds a
         // single store that stands in for the two arms' stores, the other defines the latch
         // parameter the arms were merging into.
@@ -3209,11 +3281,30 @@ fn emit_body(
                 }
                 None => emit_bin(e, vb, red_binop(r.kind), &cur, &addend, &r.ty),
             };
+            // A guarded accumulate keeps each lane's update only where that lane's condition chose
+            // it: `select(mask, acc ⊕ x, acc)` per part, the scalar merge lane for lane.
+            let next = match r.guard {
+                None => next,
+                Some((cond, on_true)) => {
+                    let mask = mask_for(e, vb, &map, cond, &r.ty);
+                    let pty = part_ty(&r.ty);
+                    (0..next.len())
+                        .map(|k| {
+                            let (a, b) = if on_true {
+                                (next[k], cur[k])
+                            } else {
+                                (cur[k], next[k])
+                            };
+                            e.push(vb, pty.clone(), Op::Select(mask[k], a, b))
+                        })
+                        .collect()
+                }
+            };
             vacc_next.extend(next);
             continue;
         }
         let init = vh_params[r.param_index];
-        let out = emit_reduction_fold(e, vb, &map, r, init);
+        let out = emit_reduction_fold(e, vb, &map, r, init, p.w);
         acc_of.insert(r.param_index, out);
     }
 
@@ -3284,25 +3375,83 @@ fn emit_reduction_fold(
     map: &FxHashMap<u32, Wide>,
     r: &RedPlan,
     init: ValueId,
+    w: u32,
 ) -> ValueId {
+    // A guarded accumulate: lane `k`'s condition as an `i1`, and which arm of the merge the update
+    // arrives on. Lane `k` then becomes `c_k ? acc ⊕ x_k : acc` — the scalar merge itself, so no
+    // identity element is involved and nothing is rounded that the scalar loop did not round.
+    let keep = r
+        .guard
+        .map(|(cond, on_true)| (mask_lane_bools(e, vb, map, cond, w), on_true));
     let mut acc = init;
     match (r.addend, r.fma_factors) {
         (Some((a, left_is_acc)), None) => {
-            let lanes = extract_lanes(e, vb, map, a, &r.ty);
-            for lane in lanes {
-                acc = emit_combine(e, vb, r, left_is_acc, acc, lane, &r.ty);
+            // A guarded addend may be uniform (`count + 1`); `lane_values` repeats it per lane.
+            let lanes = if r.guard.is_some() {
+                lane_values(e, vb, map, a, w)
+            } else {
+                extract_lanes(e, vb, map, a, &r.ty)
+            };
+            for (k, lane) in lanes.into_iter().enumerate() {
+                let updated = emit_combine(e, vb, r, left_is_acc, acc, lane, &r.ty);
+                acc = keep_lane(e, vb, keep.as_ref(), k, updated, acc, &r.ty);
             }
         }
         (None, Some((x, y))) => {
             let xs = extract_lanes(e, vb, map, x, &r.ty);
             let ys = extract_lanes(e, vb, map, y, &r.ty);
-            for (xk, yk) in xs.into_iter().zip(ys) {
-                acc = e.push(vb, r.ty.clone(), Op::Fma(xk, yk, acc));
+            for (k, (xk, yk)) in xs.into_iter().zip(ys).enumerate() {
+                let updated = e.push(vb, r.ty.clone(), Op::Fma(xk, yk, acc));
+                acc = keep_lane(e, vb, keep.as_ref(), k, updated, acc, &r.ty);
             }
         }
         _ => unreachable!("plan_body rejected any other reduction shape"),
     }
     acc
+}
+
+/// Lane `k` of a guarded fold: `updated` where the lane's condition chose the update, `old` where
+/// it chose the untouched accumulator. Unguarded, simply `updated`.
+fn keep_lane(
+    e: &mut Emit<'_>,
+    vb: BlockId,
+    keep: Option<&(Vec<ValueId>, bool)>,
+    k: usize,
+    updated: ValueId,
+    old: ValueId,
+    ty: &MirType,
+) -> ValueId {
+    match keep {
+        None => updated,
+        Some((bits, on_true)) => {
+            let (a, b) = if *on_true {
+                (updated, old)
+            } else {
+                (old, updated)
+            };
+            e.push(vb, ty.clone(), Op::Select(bits[k], a, b))
+        }
+    }
+}
+
+/// Each lane of the lane mask `c` as an `i1`, lowest iteration first. A mask lane is all-ones
+/// natively and `1` in the interpreter, and zero in both when false, so `lane != 0` reads the same
+/// truth on every backend.
+fn mask_lane_bools(
+    e: &mut Emit<'_>,
+    vb: BlockId,
+    map: &FxHashMap<u32, Wide>,
+    c: ValueId,
+    w: u32,
+) -> Vec<ValueId> {
+    lane_values(e, vb, map, c, w)
+        .into_iter()
+        .map(|m| {
+            let ty = e_ty(e, m);
+            let zero = e.int(vb, &ty, 0);
+            e.push(vb, MirType::I1, Op::Cmp(CmpOp::Ne, m, zero))
+        })
+        .collect()
 }
 
 /// Every lane value of a widened value, lowest iteration first (part 0's lanes, then part 1's).
@@ -4804,6 +4953,115 @@ mod tests {
              while n <= 11 {{ print(k(x, n)); n = n + 1; }} \
              free(x); return 0; }}"
         ));
+    }
+
+    // ---- guarded reductions --------------------------------------------------------------------
+
+    /// `if x[i] > t { s = s + x[i]; }` reaches the latch as a merge parameter and used to be a
+    /// `Recurrence`. It is a guarded accumulate now: the compare goes four lanes wide and each lane
+    /// folds `c ? s + x : s` in index order — the scalar merge itself, so a `-0.0` element, a NaN
+    /// (whose compare is false) and the starting `-0.0` all come out as the scalar loop has them.
+    #[test]
+    fn a_guarded_float_sum_widens_and_agrees() {
+        let kernel = "@unchecked fn k(x: []f32, t: f32, n: i64) -> f32 { let mut s: f32 = -0.0; \
+                      let mut i: i64 = 0; \
+                      while i < n { if x[i] > t { s = s + x[i]; } i = i + 1; } return s; }";
+        let shape = format!("{kernel} fn main() -> i32 {{ return 0; }}");
+        let vs = vector_values(&shape, "k");
+        assert!(
+            vs.contains(&(MirType::F32, 4)),
+            "a guarded f32 sum did not widen: {vs:?}"
+        );
+        scalar_and_vector_agree(&format!(
+            "{kernel} fn main() -> i32 {{ let mut x: []f32 = alloc_f32(23); \
+             let mut j: i64 = 0; \
+             while j < 23 {{ x[j] = (((j * 7) % 11) as f32) * 0.375 - 1.5; j = j + 1; }} \
+             x[4] = -0.0; x[9] = 0.0 / 0.0; \
+             let mut n: i64 = 0; \
+             while n <= 23 {{ print((k(x, -0.5, n) * 64.0) as i64); \
+               let z: f32 = k(x, 100.0, n); if 1.0 / z > 0.0 {{ print(1); }} else {{ print(0); }} \
+               n = n + 1; }} \
+             free(x); return 0; }}"
+        ));
+    }
+
+    /// Two guarded accumulates on the two arms of one branch — `s` takes its update when the
+    /// condition holds, the counter `q` when it does not — and the counter's addend is a constant
+    /// every lane shares. The integer one keeps lane-parallel partials, blended per part.
+    #[test]
+    fn guarded_accumulates_on_both_arms_agree() {
+        let kernel = "@unchecked fn k(x: []f32, t: f32, n: i64) -> i32 { let mut s: f32 = 0.0; \
+                      let mut q: i32 = 0; let mut i: i64 = 0; \
+                      while i < n { let v: f32 = x[i]; \
+                        if v > t { s = s + v; } else { q = q + 1; } i = i + 1; } \
+                      return (s as i32) * 1000 + q; }";
+        let shape = format!("{kernel} fn main() -> i32 {{ return 0; }}");
+        assert!(
+            has_vector_accumulator(&shape, "k"),
+            "the guarded i32 counter must keep lane-parallel partials"
+        );
+        scalar_and_vector_agree(&format!(
+            "{kernel} fn main() -> i32 {{ let mut x: []f32 = alloc_f32(29); \
+             let mut j: i64 = 0; \
+             while j < 29 {{ x[j] = (((j * 5) % 13) as f32) - 6.0; j = j + 1; }} \
+             let mut n: i64 = 0; \
+             while n <= 29 {{ print(k(x, 0.5, n)); n = n + 1; }} \
+             free(x); return 0; }}"
+        ));
+    }
+
+    /// A max written as a branch, `if x[i] > m { m = x[i]; }`: the branch's compare and merge are
+    /// the select, folded in order over `f64`; the `i32` min is associative and keeps partials.
+    #[test]
+    fn branch_spelled_min_and_max_widen_and_agree() {
+        let fmax = "@unchecked fn k(x: []f64, n: i64) -> f64 { let mut m: f64 = -1000.0; \
+                    let mut i: i64 = 0; \
+                    while i < n { if x[i] > m { m = x[i]; } i = i + 1; } return m; }";
+        let shape = format!("{fmax} fn main() -> i32 {{ return 0; }}");
+        assert!(
+            is_widened(&shape, "k"),
+            "a branch-spelled f64 max did not widen"
+        );
+        assert!(!has_vector_accumulator(&shape, "k"));
+        scalar_and_vector_agree(&format!(
+            "{fmax} fn main() -> i32 {{ let mut x: []f64 = alloc_f64(13); \
+             let mut j: i64 = 0; \
+             while j < 13 {{ x[j] = (((j * 5) % 13) as f64) - 6.0; j = j + 1; }} \
+             x[6] = 0.0 / 0.0; \
+             let mut n: i64 = 0; \
+             while n <= 13 {{ let m: f64 = k(x, n); \
+               if m != m {{ print(-77777); }} else {{ print(m as i64); }} n = n + 1; }} \
+             free(x); return 0; }}"
+        ));
+        let imin = "@unchecked fn k(x: []i32, n: i64) -> i32 { let mut m: i32 = 1000000; \
+                    let mut i: i64 = 0; \
+                    while i < n { let v: i32 = x[i]; if v < m { m = v; } i = i + 1; } \
+                    return m; }";
+        let shape = format!("{imin} fn main() -> i32 {{ return 0; }}");
+        assert!(
+            has_vector_accumulator(&shape, "k"),
+            "a branch-spelled i32 min must keep lane-parallel partials"
+        );
+        scalar_and_vector_agree(&format!(
+            "{imin} fn main() -> i32 {{ let mut x: []i32 = alloc_i32(19); \
+             let mut j: i64 = 0; \
+             while j < 19 {{ x[j] = (((j * 7919) % 601) as i32) - 300 - (j as i32) * 9; \
+               j = j + 1; }} \
+             let mut n: i64 = 0; \
+             while n <= 19 {{ print(k(x, n)); n = n + 1; }} \
+             free(x); return 0; }}"
+        ));
+    }
+
+    /// The same branch also recording where the maximum was (`at = i`) is an argmax: the condition
+    /// reads every partial maximum, so the loop stays scalar.
+    #[test]
+    fn a_branch_that_records_an_index_is_declined() {
+        let src = "@unchecked fn k(x: []f32, n: i64) -> i64 { let mut m: f32 = 0.0; \
+                   let mut at: i64 = 0; let mut i: i64 = 0; \
+                   while i < n { if x[i] > m { m = x[i]; at = i; } i = i + 1; } return at; } \
+                   fn main() -> i32 { return 0; }";
+        assert!(!is_widened(src, "k"), "an argmax must stay scalar");
     }
 
     // ---- cases that must be declined -----------------------------------------------------------

@@ -1,0 +1,355 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 72
+// EXPECT-OUT: 48
+// EXPECT-OUT: 192
+// EXPECT-OUT: 192
+// EXPECT-OUT: 192
+// EXPECT-OUT: 312
+// EXPECT-OUT: 336
+// EXPECT-OUT: 336
+// EXPECT-OUT: 336
+// EXPECT-OUT: 336
+// EXPECT-OUT: 336
+// EXPECT-OUT: 408
+// EXPECT-OUT: 384
+// EXPECT-OUT: 528
+// EXPECT-OUT: 576
+// EXPECT-OUT: 576
+// EXPECT-OUT: 696
+// EXPECT-OUT: 720
+// EXPECT-OUT: 720
+// EXPECT-OUT: 816
+// EXPECT-OUT: 816
+// EXPECT-OUT: 816
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 32002
+// EXPECT-OUT: 32003
+// EXPECT-OUT: 40003
+// EXPECT-OUT: 88003
+// EXPECT-OUT: 88004
+// EXPECT-OUT: 112004
+// EXPECT-OUT: 112005
+// EXPECT-OUT: 112006
+// EXPECT-OUT: 152006
+// EXPECT-OUT: 152007
+// EXPECT-OUT: 168007
+// EXPECT-OUT: 168008
+// EXPECT-OUT: 168009
+// EXPECT-OUT: 200009
+// EXPECT-OUT: 200010
+// EXPECT-OUT: 208010
+// EXPECT-OUT: 256010
+// EXPECT-OUT: 256011
+// EXPECT-OUT: 280011
+// EXPECT-OUT: 280012
+// EXPECT-OUT: 280013
+// EXPECT-OUT: 320013
+// EXPECT-OUT: 320014
+// EXPECT-OUT: 336014
+// EXPECT-OUT: 336015
+// EXPECT-OUT: 336016
+// EXPECT-OUT: 368016
+// EXPECT-OUT: -1000
+// EXPECT-OUT: -6
+// EXPECT-OUT: -1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 32767
+// EXPECT-OUT: 300
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: -59
+// EXPECT-OUT: -59
+// EXPECT-OUT: -59
+// EXPECT-OUT: -119
+// EXPECT-OUT: -119
+// EXPECT-OUT: -119
+// EXPECT-OUT: -178
+// EXPECT-OUT: -178
+// EXPECT-OUT: -178
+// EXPECT-OUT: -237
+// EXPECT-OUT: -237
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1452
+// EXPECT-OUT: 1452
+// EXPECT-OUT: 1452
+// EXPECT-OUT: 2775
+// EXPECT-OUT: 2929
+// EXPECT-OUT: 3120
+// EXPECT-OUT: 3348
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: -6
+// EXPECT-OUT: -6
+// EXPECT-OUT: -6
+// EXPECT-OUT: -90
+// EXPECT-OUT: -90
+// EXPECT-OUT: -90
+// EXPECT-OUT: -3240
+// EXPECT-OUT: -3240
+// EXPECT-OUT: -3240
+// EXPECT-OUT: -184680
+// EXPECT-OUT: -184680
+// EXPECT-OUT: -184680
+// EXPECT-OUT: -14405040
+// EXPECT-OUT: -14405040
+// EXPECT-OUT: -14405040
+// EXPECT-OUT: -1426098960
+// EXPECT-OUT: -1426098960
+module tests.run.vectorized_guarded_reductions
+
+// Conditional reductions in the general loop vectorizer. An accumulator updated under a branch
+// reaches the loop latch as a merge of "updated" and "untouched", which the reduction analysis used
+// to call a recurrence - declining the whole loop. Two shapes are reductions now:
+//
+// * a GUARDED accumulate, `if c { s = s + x }` (or the update on the `else` arm): the condition
+//   goes lane-wide and each lane keeps `c ? s + x : s`. A float sum folds lane by lane in index
+//   order; an integer one keeps lane-parallel partials blended per part. Neither uses an identity
+//   element, so a running `-0.0` stays `-0.0` until a `+0.0` really is added;
+// * a min/max written as a branch, `if x > m { m = x }`, whose compare and merge ARE the select.
+//
+// Every kernel is a counting `while` over a slice and is called for every prefix length (or every
+// interesting one around a vector-group boundary). Every expected value comes from the scalar
+// semantics of the loop (IEEE single/double, wrapping two's-complement integers, a NaN compare is
+// false), never from compiler output.
+
+fn gsum(x: []f32, t: f32, n: i64) -> f32 {
+    let mut s: f32 = -0.0;
+    let mut i: i64 = 0;
+    while i < n {
+        let v: f32 = x[i];
+        if v > t {
+            s = s + v;
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+// `s` takes its update when the condition holds, the counter `q` when it does not.
+fn gboth(x: []f32, t: f32, n: i64) -> i64 {
+    let mut s: f32 = 0.0;
+    let mut q: i32 = 0;
+    let mut i: i64 = 0;
+    while i < n {
+        let v: f32 = x[i];
+        if v > t {
+            s = s + v;
+        } else {
+            q = q + 1;
+        }
+        i = i + 1;
+    }
+    return ((s * 8.0) as i64) * 1000 + (q as i64);
+}
+
+fn bmax(x: []f64, n: i64) -> f64 {
+    let mut m: f64 = -1000.0;
+    let mut i: i64 = 0;
+    while i < n {
+        let v: f64 = x[i];
+        if v > m {
+            m = v;
+        }
+        i = i + 1;
+    }
+    return m;
+}
+
+fn bmin16(x: []i16, n: i64) -> i16 {
+    let mut m: i16 = 32767;
+    let mut i: i64 = 0;
+    while i < n {
+        let v: i16 = x[i];
+        if v < m {
+            m = v;
+        }
+        i = i + 1;
+    }
+    return m;
+}
+
+// Bytes compared unsigned, summed into an i32: sixteen byte lanes, four i32 accumulator parts.
+fn gsum_u8(x: []u8, t: u8, n: i64) -> i32 {
+    let mut s: i32 = 0;
+    let mut i: i64 = 0;
+    while i < n {
+        let v: u8 = x[i];
+        if v > t {
+            s = s + (v as i32);
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+// A wrapping product of the multiples of three (the remainder truncates toward zero).
+fn gprod(x: []i32, n: i64) -> i32 {
+    let mut p: i32 = 1;
+    let mut i: i64 = 0;
+    while i < n {
+        let v: i32 = x[i];
+        if v % 3 == 0 {
+            p = p * v;
+        }
+        i = i + 1;
+    }
+    return p;
+}
+
+fn main() -> i32 {
+    // f32: x[j] = (7j mod 11) * 0.375 - 1.5, with x[4] = -0.0 (passes `> -0.5`, adds -0.0) and a
+    // NaN at 9 (its compare is false, so it is skipped). Printed times 64.
+    let mut xf: []f32 = alloc_f32(23);
+    let mut j: i64 = 0;
+    while j < 23 {
+        xf[j] = (((j * 7) % 11) as f32) * 0.375 - 1.5;
+        j = j + 1;
+    }
+    xf[4] = -0.0;
+    xf[9] = 0.0 / 0.0;
+    let mut n: i64 = 0;
+    while n <= 23 {
+        print((gsum(xf, -0.5, n) * 64.0) as i64);
+        n = n + 1;
+    }
+    free(xf);
+
+    // Signed zeros: -0, +0, -0, ... all pass `> -1`. The sum starts at -0.0 and stays -0.0 until
+    // the first +0.0 is added (n = 2), then stays +0.0. With `> 0.5` nothing is added: -0.0.
+    // Printed 1 for +0 and 0 for -0.
+    let mut xz: []f32 = alloc_f32(9);
+    j = 0;
+    while j < 9 {
+        xz[j] = 0.0;
+        if j % 2 == 0 {
+            xz[j] = -0.0;
+        }
+        j = j + 1;
+    }
+    n = 0;
+    while n <= 9 {
+        let z: f32 = gsum(xz, -1.0, n);
+        if 1.0 / z > 0.0 {
+            print(1);
+        } else {
+            print(0);
+        }
+        n = n + 1;
+    }
+    let ends: [i64; 3] = [0, 5, 9];
+    for t in 0..3 {
+        let z: f32 = gsum(xz, 0.5, ends[t]);
+        if 1.0 / z > 0.0 {
+            print(1);
+        } else {
+            print(0);
+        }
+    }
+    free(xz);
+
+    // Both arms: x[j] = (5j mod 13) - 6.
+    let mut xb: []f32 = alloc_f32(29);
+    j = 0;
+    while j < 29 {
+        xb[j] = (((j * 5) % 13) as f32) - 6.0;
+        j = j + 1;
+    }
+    n = 0;
+    while n <= 29 {
+        print(gboth(xb, 0.5, n));
+        n = n + 1;
+    }
+    free(xb);
+
+    // A branch-spelled f64 max; the NaN at 6 fails its compare and is skipped.
+    let mut xd: []f64 = alloc_f64(13);
+    j = 0;
+    while j < 13 {
+        xd[j] = (((j * 5) % 13) as f64) - 6.0;
+        j = j + 1;
+    }
+    xd[6] = 0.0 / 0.0;
+    n = 0;
+    while n <= 13 {
+        let m: f64 = bmax(xd, n);
+        if m != m {
+            print(-77777);
+        } else {
+            print(m as i64);
+        }
+        n = n + 1;
+    }
+    free(xd);
+
+    // A branch-spelled i16 min, eight lanes.
+    let mut xs: []i16 = alloc_i16(37);
+    j = 0;
+    while j < 37 {
+        xs[j] = (300 - ((j * 7919) % 601) / 2 - 7 * j) as i16;
+        j = j + 1;
+    }
+    let ns16: [i64; 16] = [0, 1, 7, 8, 9, 15, 16, 17, 23, 24, 25, 31, 32, 33, 36, 37];
+    for t in 0..16 {
+        print(bmin16(xs, ns16[t]) as i64);
+    }
+    free(xs);
+
+    // Unsigned bytes above 120 summed.
+    let mut xu: []u8 = alloc_u8(37);
+    j = 0;
+    while j < 37 {
+        xu[j] = ((j * 37 + 11) % 251) as u8;
+        j = j + 1;
+    }
+    let ns8: [i64; 9] = [0, 1, 15, 16, 17, 31, 32, 33, 37];
+    for t in 0..9 {
+        print(gsum_u8(xu, 120, ns8[t]));
+    }
+    free(xu);
+
+    // x[j] = 7j - 20.
+    let mut xi: []i32 = alloc_i32(19);
+    j = 0;
+    while j < 19 {
+        xi[j] = (j as i32) * 7 - 20;
+        j = j + 1;
+    }
+    n = 0;
+    while n <= 19 {
+        print(gprod(xi, n));
+        n = n + 1;
+    }
+    free(xi);
+    return 0;
+}
