@@ -199,6 +199,7 @@ int_literal_widen.wk:
 int_math.wk:
 int_min_literal.wk:
 int_vec_intrinsics.wk:
+interp_memory_reuse.wk: wukong_rt_alloc wukong_rt_alloc*3 wukong_rt_free wukong_rt_free*3
 io_missing_file.wk: wukong_rt_alloc wukong_rt_free wukong_rt_read_f32
 io_npy.wk: wukong_rt_alloc wukong_rt_alloc*5 wukong_rt_free wukong_rt_free*5 wukong_rt_npy_read wukong_rt_npy_read*9 wukong_rt_write_u8 wukong_rt_write_u8*4
 io_partial_read.wk: wukong_rt_alloc wukong_rt_alloc*2 wukong_rt_free wukong_rt_free*2 wukong_rt_read_i32 wukong_rt_write_i32
@@ -455,6 +456,7 @@ tuple.wk:
 turbofish_const_dim.wk:
 u64_literal.wk:
 uninit_zero.wk:
+unroll_jam_nests.wk:
 unsigned.wk:
 unsigned_print.wk:
 vec256_general.wk: veckernel*1 wukong_velem_f32 wukong_velem_f32*2
@@ -477,8 +479,10 @@ vectorized_lanes.wk:
 vectorized_loops.wk: wukong_rt_alloc wukong_rt_alloc*8 wukong_rt_free wukong_rt_free*8
 vectorized_minmax_reductions.wk: wukong_rt_alloc wukong_rt_alloc*7 wukong_rt_free wukong_rt_free*7
 vectorized_mixed_widths.wk: wukong_rt_alloc wukong_rt_alloc*14 wukong_rt_free wukong_rt_free*14
+vectorized_predicated_arms.wk: wukong_rt_alloc wukong_rt_alloc*3 wukong_rt_free wukong_rt_free*3
 vectorized_replicate.wk: wukong_rt_alloc wukong_rt_alloc*9 wukong_rt_free wukong_rt_free*9
 vectorized_row_fused.wk:
+vectorized_search_loops.wk: wukong_rt_alloc wukong_rt_free
 vectorized_split_base_guard.wk: veckernel*1 wukong_rt_alloc wukong_rt_alloc*3 wukong_rt_free wukong_rt_free*3
 vectorized_trip_edges.wk: wukong_rt_alloc wukong_rt_alloc*9 wukong_rt_free wukong_rt_free*9
 velem_modes_every_lane.wk: wukong_velem_f32 wukong_velem_f32*6
