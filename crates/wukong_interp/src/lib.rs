@@ -334,6 +334,52 @@ pub use wukong_runtime::process::set_program_args;
 /// memory never grows near it.
 const FUNC_TAG: usize = 1 << 60;
 
+/// What one callee name reaches.
+#[derive(Clone, Copy)]
+enum Callee {
+    /// The program's function at this index.
+    Func(usize),
+    /// The program's `extern "C"` declaration at this index.
+    Extern(usize),
+    /// Neither: a runtime intrinsic, dispatched by name.
+    Intrinsic,
+}
+
+/// Every callee name of a program resolved once, as a dense array indexed by `Symbol` id. A call
+/// used to hash its callee into a SipHash map and, on every miss — every intrinsic call, including
+/// the scalar transcendentals — scan the extern list linearly before falling through to the
+/// intrinsic name match; now it is one bounds-checked load (Wasm resolves `call` to an index at
+/// validation time for the same reason). Resolution order is unchanged: a function wins over an
+/// extern of the same name, and the first of duplicated names wins.
+struct CalleeTable(Vec<Callee>);
+
+impl CalleeTable {
+    fn new(program: &Program) -> Self {
+        let names = program.funcs.iter().map(|f| f.name);
+        let len = names
+            .chain(program.externs.iter().map(|e| e.name))
+            .map(|s| s.0 as usize + 1)
+            .max()
+            .unwrap_or(0);
+        let mut table = vec![Callee::Intrinsic; len];
+        // Lowest priority first, each list in reverse, so the earliest entry is written last.
+        for (index, ext) in program.externs.iter().enumerate().rev() {
+            table[ext.name.0 as usize] = Callee::Extern(index);
+        }
+        for (index, func) in program.funcs.iter().enumerate().rev() {
+            table[func.name.0 as usize] = Callee::Func(index);
+        }
+        CalleeTable(table)
+    }
+
+    fn get(&self, symbol: Symbol) -> Callee {
+        self.0
+            .get(symbol.0 as usize)
+            .copied()
+            .unwrap_or(Callee::Intrinsic)
+    }
+}
+
 fn symbol_indices(symbols: impl ExactSizeIterator<Item = Symbol>) -> HashMap<Symbol, usize> {
     let mut indices = HashMap::with_capacity(symbols.len());
     for (index, symbol) in symbols.enumerate() {
@@ -1011,8 +1057,9 @@ struct Interp<'a, 'k> {
     data_addrs: HashMap<Symbol, usize>,
     /// Build name indices only when calls/function addresses or static data need them. The
     /// program is immutably borrowed for this run, so indices cannot become stale. Retain the
-    /// first occurrence of duplicate names, matching the previous linear searches.
-    function_indices: Option<HashMap<Symbol, usize>>,
+    /// first occurrence of duplicate names, matching the previous linear searches. Callees resolve
+    /// through the dense [`CalleeTable`], one array index per call.
+    function_indices: Option<CalleeTable>,
     static_indices: Option<HashMap<Symbol, usize>>,
     /// Active Wukong call depth: the frames [`Interp::run_function`] holds, bounded by
     /// [`max_call_depth`]. The 100M-step guard counts the blocks of a *single* frame and can never
@@ -1155,11 +1202,19 @@ impl<'a, 'k> Interp<'a, 'k> {
         slot == NULL_SLOT && self.memory.first() == Some(&NULL_SENTINEL)
     }
 
-    fn function_index(&mut self, symbol: Symbol) -> Option<usize> {
+    /// What a call of `symbol` reaches, resolved once per run (see [`CalleeTable`]).
+    fn callee(&mut self, symbol: Symbol) -> Callee {
+        let program = self.program;
         self.function_indices
-            .get_or_insert_with(|| symbol_indices(self.program.funcs.iter().map(|f| f.name)))
-            .get(&symbol)
-            .copied()
+            .get_or_insert_with(|| CalleeTable::new(program))
+            .get(symbol)
+    }
+
+    fn function_index(&mut self, symbol: Symbol) -> Option<usize> {
+        match self.callee(symbol) {
+            Callee::Func(index) => Some(index),
+            Callee::Extern(_) | Callee::Intrinsic => None,
+        }
     }
 
     /// Run `func` on `args` to completion and return its result.
@@ -1405,36 +1460,37 @@ impl<'a, 'k> Interp<'a, 'k> {
         let mut argv = self.call_args.pop().unwrap_or_default();
         argv.extend(args.iter().map(|a| reg(regs, *a)));
         let program: &'a Program = self.program;
-        if let Some(index) = self.function_index(callee) {
-            return Ok(CallOutcome::Enter(&program.funcs[index], argv, false));
-        }
-        let result = if let Some(ext) = program.extern_fn(callee) {
-            call_extern(ext, &argv, self.interner)
-        } else {
-            let name = self.interner.resolve(callee);
-            if name == "wukong_parallel_for" {
-                match self.parallel_for_body(&argv) {
-                    Ok((body, body_args)) => {
-                        argv.clear();
-                        argv.extend(body_args);
-                        return Ok(CallOutcome::Enter(body, argv, true));
+        let result = match self.callee(callee) {
+            Callee::Func(index) => {
+                return Ok(CallOutcome::Enter(&program.funcs[index], argv, false));
+            }
+            Callee::Extern(index) => call_extern(&program.externs[index], &argv, self.interner),
+            Callee::Intrinsic => {
+                let name = self.interner.resolve(callee);
+                if name == "wukong_parallel_for" {
+                    match self.parallel_for_body(&argv) {
+                        Ok((body, body_args)) => {
+                            argv.clear();
+                            argv.extend(body_args);
+                            return Ok(CallOutcome::Enter(body, argv, true));
+                        }
+                        Err(e) => Err(e),
                     }
-                    Err(e) => Err(e),
-                }
-            } else {
-                // A float `print` picks its printer by the argument's MIR type, as native does
-                // (`classify_intrinsic`): an `f32` (or an `f16`/`bf16`, which lives in an `f32`)
-                // prints at its own precision. Every other print routes by name below.
-                let narrow_float = args.first().is_some_and(|a| {
-                    matches!(
-                        func.value_type(*a),
-                        MirType::F32 | MirType::F16 | MirType::BF16
-                    )
-                });
-                if narrow_float && matches!(name, "print" | "println") {
-                    self.print_f32(&argv)
                 } else {
-                    self.intrinsic(name, &argv)
+                    // A float `print` picks its printer by the argument's MIR type, as native does
+                    // (`classify_intrinsic`): an `f32` (or an `f16`/`bf16`, which lives in an `f32`)
+                    // prints at its own precision. Every other print routes by name below.
+                    let narrow_float = args.first().is_some_and(|a| {
+                        matches!(
+                            func.value_type(*a),
+                            MirType::F32 | MirType::F16 | MirType::BF16
+                        )
+                    });
+                    if narrow_float && matches!(name, "print" | "println") {
+                        self.print_f32(&argv)
+                    } else {
+                        self.intrinsic(name, &argv)
+                    }
                 }
             }
         };
