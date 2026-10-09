@@ -1,0 +1,11 @@
+// The file is `lib/privlib.wk`; the import spells it `PrivLib`. That opened on a case-insensitive
+// file system (Windows, macOS) and was E0305 on Linux, so the program compiled on one host and not
+// another. Resolution is now case-exact everywhere and names the on-disk spelling (E0330).
+// EXPECT-CODE: E0330
+module import_case_mismatch
+
+import lib.PrivLib;
+
+fn main() -> i32 {
+    return 0;
+}

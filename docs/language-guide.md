@@ -66,7 +66,9 @@ A module path is dotted, and `import` makes a program **multi-file**: `import a.
 the program — loads `a/b.wk`, resolved relative to the directory of the **root** source file passed
 to `wukongc`. Each file is loaded exactly once, by canonical path: an import **cycle** (`a` imports
 `b` imports `a`) or diamond is not an error. An import that resolves to no file is **E0305**
-(`wukongc --explain E0305`), and a diagnostic inside an imported file renders with that file's own
+(`wukongc --explain E0305`); resolution is **case-exact on every host**, so an import whose
+spelling matches the file only up to letter case (`import Util` for `util.wk`) is **E0330**
+even where the file system would have opened it. A diagnostic inside an imported file renders with that file's own
 path and line.
 
 **Every file is a module with its own namespace** ✅. Its top-level items (`fn`, `struct`, `enum`,

@@ -39,7 +39,9 @@ another architecture or OS is not supported. A native-backend failure is a catal
 
 - **Multi-file modules with real namespaces**: `import a.b` loads `a/b.wk` (resolved against the
   *root* source file's directory); files load once each — an import cycle or diamond dedups by
-  canonical path, never errors — and an unresolvable import is `E0305`. Every file is its own
+  canonical path, never errors — and an unresolvable import is `E0305`; resolution is case-exact
+  on every host (a case-only mismatch with the file on disk is `E0330`, not a host-dependent
+  success). Every file is its own
   module: items are private unless `pub` (`E0312` otherwise), imports are per file and not
   transitive, `import a.b;` brings `b`'s `pub` items in unqualified plus the `b::` qualifier,
   `import a.b as c;` binds only `c::`, and `import a.b.{x, y};` selects. Two modules may define the

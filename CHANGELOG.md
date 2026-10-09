@@ -17,6 +17,11 @@ All notable changes to Wukong are documented here. The format is loosely based o
   internal and mangled (`_WK<len><name>`), so a function named `write`, `fmod` or `memcpy` can no
   longer collide with or interpose on the C library at link time. `--emit=obj` keeps non-entry
   functions exported under their source names.
+- **`main`'s signature is checked** (`E0331`): no parameters, no generics, and a scalar or no
+  result. A parameterized `main` used to type-check and fail only at run time.
+- **Case-exact imports on every host** (`E0330`): `import Util` for a file `util.wk` used to
+  compile on Windows and macOS and be `E0305` on Linux; each path component is now compared with
+  the directory listing and the diagnostic names the on-disk spelling.
 
 ### Type soundness and patterns (`gap2/type-soundness-and-patterns`)
 

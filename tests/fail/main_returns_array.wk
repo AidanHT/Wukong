@@ -1,0 +1,10 @@
+// A process exit code comes from a scalar. An array result had no exit-code meaning: the
+// interpreter reported whatever its value slot read as an integer, and an executable could not be
+// linked. It is now rejected at the signature (E0331).
+// EXPECT-CODE: E0331
+module main_returns_array
+
+fn main() -> [i32; 2] {
+    let a: [i32; 2] = [1, 2];
+    return a;
+}
