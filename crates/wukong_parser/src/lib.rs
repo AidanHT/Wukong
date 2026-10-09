@@ -666,11 +666,17 @@ impl<'a> Parser<'a> {
         if self.at(T::ColonColon) && self.nth(1) == T::Lt {
             self.bump(); // ::
             let args = self.parse_type_args();
-            return TypeKind::Generic { path, args };
+            return TypeKind::Generic {
+                path: Box::new(path),
+                args,
+            };
         }
         if self.at(T::Lt) && !self.in_cast {
             let args = self.parse_type_args();
-            return TypeKind::Generic { path, args };
+            return TypeKind::Generic {
+                path: Box::new(path),
+                args,
+            };
         }
         TypeKind::Path(path)
     }

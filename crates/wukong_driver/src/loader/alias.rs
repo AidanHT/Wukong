@@ -521,7 +521,7 @@ impl Expander<'_> {
                     return;
                 }
                 // A name that is no type at all: report it as such, where it is.
-                let path = path.clone();
+                let path: Path = (**path).clone();
                 t.kind = TypeKind::Path(path.clone());
                 if self.in_alias {
                     self.unknown_target(&path, t.span);

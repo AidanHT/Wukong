@@ -58,7 +58,8 @@ pub enum TypeKind {
     /// spelling accepted as a cast target, where a bare `<` is a comparison). Only a generic type
     /// alias takes arguments; the driver's alias expansion replaces every node of this kind before
     /// sema.
-    Generic { path: Path, args: Vec<TypeArg> },
+    /// (`path` is boxed to keep `TypeExpr` no larger than its `Tensor` variant makes it.)
+    Generic { path: Box<Path>, args: Vec<TypeArg> },
 }
 
 /// One argument of a [`TypeKind::Generic`]: a type, or a dimension the parser could only read as
