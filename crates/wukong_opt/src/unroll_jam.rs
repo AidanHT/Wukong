@@ -163,9 +163,23 @@ pub(crate) fn jam_function(f: &mut Function) -> bool {
     changed
 }
 
-/// A cheap pre-filter: a nest needs at least six blocks and two conditional branches.
+/// A cheap pre-filter: a nest needs at least six blocks, two conditional branches, and an inner
+/// loop of exactly the two-block shape [`plan`] accepts — a header that conditionally enters a
+/// block whose only exit branches straight back. One linear scan with no CFG analysis, so a
+/// function without such a loop never pays for the dominator tree [`find_nest`] builds.
 fn may_hold_a_nest(f: &Function) -> bool {
+    let two_block_loop = f.blocks.iter().any(|hb| {
+        let Terminator::CondBr { then_blk, .. } = &hb.term else {
+            return false;
+        };
+        then_blk.0 != hb.id.0
+            && matches!(
+                &f.blocks[then_blk.0 as usize].term,
+                Terminator::Br { target, .. } if target.0 == hb.id.0
+            )
+    });
     f.blocks.len() >= 6
+        && two_block_loop
         && f.blocks
             .iter()
             .filter(|b| matches!(b.term, Terminator::CondBr { .. }))
