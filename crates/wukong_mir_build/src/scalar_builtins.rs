@@ -4,13 +4,15 @@
 //!
 //! **Plain MIR, by design.** Everything but four bit counts and three special functions is built
 //! from compares, selects, shifts, masks, `bitcast`s and adds — so it needs no backend support and
-//! the interpreter and every backend agree bit-for-bit by construction (the MIR loop vectorizer
-//! sees ordinary ops, but it does not widen a right shift, so a loop using a shift-based builtin —
-//! `rotl`/`rotr`, `mulhi`, the f16/bf16 and FP8 bit conversions — stays scalar).
-//! `popcount`/`clz`/`ctz`/`bswap` are one [`Op::IntUnary`] each
+//! the interpreter and every backend agree bit-for-bit by construction. The MIR loop vectorizer
+//! sees ordinary ops and treats them like any others — a shift by a loop-invariant amount (every
+//! constant shift here) widens as the vector-by-scalar shift, a per-lane amount runs lane by lane —
+//! so a loop using `rotl`/`rotr`, `mulhi` or the f16/bf16 and FP8 bit conversions is an ordinary
+//! vectorization candidate. `popcount`/`clz`/`ctz`/`bswap` are one [`Op::IntUnary`] each
 //! (one machine instruction; scalar only, so the vectorizer declines a loop containing one), and
 //! `erfc`/`erfinv`/`lgamma` are one call of the double-precision library (`wukong_rt_math_f64`
-//! with an `M64_*` code — every precision computes in `f64` and rounds once).
+//! with an `M64_*` code — every precision computes in `f64` and rounds once; a call, so a loop
+//! containing one stays scalar too).
 //!
 //! **Signaling NaNs.** The interpreter holds an `f32` as an `f64`, which cannot carry a signaling
 //! `f32` NaN (the widening quiets it), while native code can load one from memory. So the bit
