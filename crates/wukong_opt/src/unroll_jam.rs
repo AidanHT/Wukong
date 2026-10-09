@@ -75,6 +75,13 @@
 //!   layout `x[t*D + d]` with the outer loop over `d in 0..D`. Two rows differ by less than the
 //!   pitch, so they never meet. Every access is in the inner loop, at one common offset.
 //!
+//! A symbolic pitch is the bound of an exit test, and a `usize` counter — every `for i in 0..N`
+//! over a symbolic tensor dimension — compares unsigned (`t <u T`). That keeps the counter below
+//! `T` as an integer only while `T < 2^63`: a `T` negative as a signed `i64` lets the loop run past
+//! the sign bit, where `r*T + t` folds rows onto each other (`T = -1`: row `r+1` at `t+1` is row
+//! `r` at `t`). Such a pitch is checked non-negative in the preheader, and every row runs in the
+//! original nest when it is not.
+//!
 //! Loads of an object the nest never stores to need no layout. Two *different* objects may still be
 //! one buffer at run time (two tensor parameters the caller aliased), so every stored object and
 //! every other object the nest touches that is not provably distinct (two stack slots, or a
@@ -569,6 +576,9 @@ struct Nest {
     pts: Points,
     /// Pairs of objects whose ranges the preheader must find ordered and disjoint.
     pairs: Vec<(Region, Region)>,
+    /// Symbolic slab pitches bounding an unsigned exit test, which the preheader must find
+    /// non-negative as signed `i64`s ([`row_slab`], [`col_slab`]).
+    sign_checks: Vec<ValueId>,
 }
 
 /// One load or store of the nest.
@@ -597,6 +607,11 @@ enum Layout {
     /// `α = 1`, `β` is the pitch, every row in `[0, β)`.
     Col(Coeff),
 }
+
+/// A stored object's layout, and the symbolic pitch its proof needs non-negative as a signed `i64`
+/// at run time: the bound of an unsigned exit test, which keeps its counter below the pitch as an
+/// integer only when the pitch is below `2^63`.
+type Slab = (Layout, Option<ValueId>);
 
 /// What the slab checks know about the two loops.
 struct Ranges {
@@ -982,12 +997,16 @@ fn plan(f: &Function, lo: &NaturalLoop, li: &NaturalLoop) -> Option<Nest> {
         inner_trip: li.trip.as_const(),
     };
     let mut regions: Vec<Option<Region>> = vec![None; groups.len()];
+    let mut sign_checks: Vec<ValueId> = Vec::new();
     for (gi, g) in groups.iter().enumerate() {
         if !g.stored {
             continue;
         }
         let members: Vec<&Acc> = g.members.iter().map(|&i| &accs[i]).collect();
-        let layout = row_slab(&members, &rg).or_else(|| col_slab(&members, &rg))?;
+        let (layout, pitch) = row_slab(&members, &rg).or_else(|| col_slab(&members, &rg))?;
+        if let Some(v) = pitch.filter(|v| !sign_checks.contains(v)) {
+            sign_checks.push(v);
+        }
         regions[gi] = Some(slab_region(g, &members[0].idx, layout));
     }
 
@@ -1046,12 +1065,13 @@ fn plan(f: &Function, lo: &NaturalLoop, li: &NaturalLoop) -> Option<Nest> {
             t_signed: ipred == CmpOp::Slt,
         },
         pairs,
+        sign_checks,
     })
 }
 
 /// Row slabs: every access is `P·r + S + w` with one pitch `P` and one invariant part `S`, and the
 /// in-row offset `w = β·t + k` provably in `[0, P)`.
-fn row_slab(accs: &[&Acc], rg: &Ranges) -> Option<Layout> {
+fn row_slab(accs: &[&Acc], rg: &Ranges) -> Option<Slab> {
     let first = &accs[0].idx;
     if accs
         .iter()
@@ -1080,14 +1100,18 @@ fn row_slab(accs: &[&Acc], rg: &Ranges) -> Option<Layout> {
                     return None;
                 }
             }
-            Some(Layout::Row(first.r))
+            Some((Layout::Row(first.r), None))
         }
         // The pitch is the inner loop's own runtime bound: `x[r*T + t]` for `t in t0..T`. The
         // offset `t + k` stays in `[0, T)` when `k <= 0` and `t0 + k >= 0`, because the loop only
-        // runs while `t < T` (signed). A row-level access (`x[r*T]`) would need `T > 0`, which
-        // nothing proves, so the whole object must be inner.
+        // runs while `t < T`. A signed exit test says exactly that. An unsigned one — a `usize`
+        // counter, which is every `for t in 0..T` over a symbolic dimension — says it only when
+        // `T < 2^63`: then `t`, starting at `t0 >= 0` and stepping up from below `T`, never reaches
+        // the sign bit, so `t <u T` is `0 <= t < T`. The preheader checks that bound (`sign_checks`)
+        // and runs every row in the original nest when it fails. A row-level access (`x[r*T]`)
+        // would need `T > 0`, which nothing proves, so the whole object must be inner.
         Coeff::Sym(v, 1) => {
-            if rg.tend != v || !rg.t_signed {
+            if rg.tend != v {
                 return None;
             }
             let t0 = rg.t0?;
@@ -1099,7 +1123,7 @@ fn row_slab(accs: &[&Acc], rg: &Ranges) -> Option<Layout> {
                     return None;
                 }
             }
-            Some(Layout::Row(first.r))
+            Some((Layout::Row(first.r), (!rg.t_signed).then_some(v)))
         }
         _ => None,
     }
@@ -1107,7 +1131,7 @@ fn row_slab(accs: &[&Acc], rg: &Ranges) -> Option<Layout> {
 
 /// Column slabs: every access is the inner `r + B·t + S + k` with one pitch `B`, one `S` and one
 /// `k`, and every row `r` in `[0, B)` — so two rows differ by less than the pitch and never meet.
-fn col_slab(accs: &[&Acc], rg: &Ranges) -> Option<Layout> {
+fn col_slab(accs: &[&Acc], rg: &Ranges) -> Option<Slab> {
     let first = &accs[0].idx;
     if first.r != Coeff::Const(1) {
         return None;
@@ -1124,7 +1148,7 @@ fn col_slab(accs: &[&Acc], rg: &Ranges) -> Option<Layout> {
     if rg.r0? < 0 {
         return None;
     }
-    match first.t {
+    let pitch = match first.t {
         Coeff::Const(b) if b > 0 => {
             let n = rg.outer_trip?;
             if n > 0 {
@@ -1133,15 +1157,20 @@ fn col_slab(accs: &[&Acc], rg: &Ranges) -> Option<Layout> {
                     return None;
                 }
             }
+            None
         }
+        // The pitch is the outer loop's own runtime bound: rows start at `r0 >= 0` and run while
+        // `r < R`, so every row is in `[0, R)` — for an unsigned test only when `R < 2^63`, the
+        // bound [`row_slab`] needs of `T`, and checked the same way.
         Coeff::Sym(v, 1) => {
-            if rg.rend != v || !rg.r_signed {
+            if rg.rend != v {
                 return None;
             }
+            (!rg.r_signed).then_some(v)
         }
         _ => return None,
-    }
-    Some(Layout::Col(first.t))
+    };
+    Some((Layout::Col(first.t), pitch))
 }
 
 /// The element range a slab-laid-out object occupies over every row.
@@ -1427,8 +1456,9 @@ impl Em<'_> {
     }
 }
 
-/// `lim = R - (FACTOR-1)·s`, or the sentinel when that wraps or a runtime alias check fails —
-/// appended to the outer preheader.
+/// `lim = R - (FACTOR-1)·s`, or the sentinel when that wraps, a runtime alias check fails, or a
+/// pitch an unsigned exit test is bounded by is negative as a signed `i64` — appended to the outer
+/// preheader.
 fn emit_limit(f: &mut Function, n: &Nest) -> ValueId {
     let ty = n.r_ty.clone();
     let mut em = Em {
@@ -1447,6 +1477,12 @@ fn emit_limit(f: &mut Function, n: &Nest) -> ValueId {
     if !n.pairs.is_empty() {
         let apart = em.guard(n);
         lim = em.push(ty.clone(), Op::Select(apart, lim, sent));
+    }
+    for &v in &n.sign_checks {
+        let w = em.wide(v, true);
+        let zero = em.int(&MirType::I64, 0);
+        let fits = em.push(MirType::I1, Op::Cmp(CmpOp::Sge, w, zero));
+        lim = em.push(ty.clone(), Op::Select(fits, lim, sent));
     }
     let out = em.out;
     f.blocks[n.op.0 as usize].insts.extend(out);
@@ -1805,10 +1841,9 @@ mod tests {
     }
 
     /// A symbolic-shape tensor kernel: the row pitch is the hidden dimension `T`, the inner loop's
-    /// own bound, so each row is a slab of the runtime width.
-    #[test]
-    fn a_symbolic_pitch_tensor_nest_is_jammed() {
-        let src = "fn k<R, T>(x: Tensor[i64, R, T], mut o: Tensor[i64, R, T]) { \
+    /// own bound, so each row is a slab of the runtime width. `for t in 0..T` counts in `usize`,
+    /// so the inner exit test is unsigned (`t <u T`).
+    const SYMBOLIC_ROWS: &str = "fn k<R, T>(x: Tensor[i64, R, T], mut o: Tensor[i64, R, T]) { \
                      for r in 0..R { let mut h: i64 = 7; \
                        for t in 0..T { h = (h * h + x[r, t]) % 1009; o[r, t] = h; } } } \
                    fn main() -> i32 { \
@@ -1821,9 +1856,54 @@ mod tests {
                      k::<rows, cols>(x, o); \
                      let mut j: i64 = 0; while j < 15 { print(o[j]); j = j + 1; } \
                      return 0; }";
+
+    #[test]
+    fn a_symbolic_pitch_tensor_nest_is_jammed() {
+        assert!(
+            jams_and_agrees(SYMBOLIC_ROWS),
+            "the symbolic-pitch nest was not jammed"
+        );
+    }
+
+    /// `t <u T` bounds the in-row offset by `T` only when `T < 2^63`, so the plan must carry that
+    /// check to the preheader. No run can show it: a negative `T` makes the inner loop run ~2^64
+    /// times. So the plan itself is inspected.
+    #[test]
+    fn an_unsigned_symbolic_pitch_is_sign_checked() {
+        let (mut p, interner) = lower(SYMBOLIC_ROWS);
+        crate::PassManager::standard(2).run(&mut p);
+        let k = interner.get("k").expect("`k` is interned");
+        let f = p
+            .funcs
+            .iter()
+            .find(|f| f.name == k)
+            .expect("`k` is lowered");
+        let nest = find_nest(f, &FxHashSet::default()).expect("the nest is planned");
+        // `k`'s leading parameters are its hidden dimensions, `R` then `T`.
+        assert_eq!(nest.sign_checks, vec![f.params[1]]);
+    }
+
+    /// The time-major twin over symbolic dimensions: `x[t, d]` of a `Tensor[i64, T, D]` with the
+    /// outer loop over the columns is a column slab of pitch `D`, the outer loop's own unsigned
+    /// bound (`d <u D`).
+    #[test]
+    fn a_symbolic_pitch_time_major_nest_is_jammed() {
+        let src = "fn k<T, D>(x: Tensor[i64, T, D], mut y: Tensor[i64, T, D]) { \
+                     for d in 0..D { let mut h: i64 = 7; \
+                       for t in 0..T { h = (h * 3 + x[t, d]) % 1009; y[t, d] = h; } } } \
+                   fn main() -> i32 { \
+                     let mut x: [i64; 15] = [0; 15]; let mut y: [i64; 15] = [0; 15]; \
+                     let mut i: i64 = 0; \
+                     while i < 15 { x[i] = (i * 13) % 17; i = i + 1; } \
+                     let mut cols = 0; let mut n = 0; \
+                     while n < 5 { cols = cols + 1; n = n + 1; } \
+                     let steps = 3; \
+                     k::<steps, cols>(x, y); \
+                     let mut j: i64 = 0; while j < 15 { print(y[j]); j = j + 1; } \
+                     return 0; }";
         assert!(
             jams_and_agrees(src),
-            "the symbolic-pitch nest was not jammed"
+            "the symbolic time-major nest was not jammed"
         );
     }
 
