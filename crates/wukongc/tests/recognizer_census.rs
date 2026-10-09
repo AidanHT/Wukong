@@ -60,6 +60,8 @@ const COMPILER_ENV: &[&str] = &[
     "WUKONG_NO_IV_RAMP",
     "WUKONG_P4_NO_256",
     "WUKONG_VEC_TRACE",
+    // Below `avx2` it turns off the raw-AVX2 loop kernels (`veckernel*N` on Windows).
+    "WUKONG_MAX_ISA",
 ];
 
 /// Written into the census line of a fixture whose `--emit=mir -O2` did not exit 0. Distinct from

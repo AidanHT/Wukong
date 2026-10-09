@@ -434,10 +434,10 @@ enum I8Tier {
 fn i8_tier() -> I8Tier {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avxvnni") {
+        if crate::isa::avxvnni() {
             return I8Tier::Vnni;
         }
-        if is_x86_feature_detected!("avx2") {
+        if crate::isa::avx2() {
             return I8Tier::Avx2;
         }
     }
@@ -923,7 +923,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn scalar_matches_avx2_bit_for_bit() {
-        if !is_x86_feature_detected!("avx2") {
+        if !crate::isa::avx2() {
             return;
         }
         // Sizes straddling the 32/16-wide chunks and the scalar tail.
@@ -941,7 +941,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn dot4_matches_scalar_bit_for_bit() {
-        if !is_x86_feature_detected!("avx2") {
+        if !crate::isa::avx2() {
             return;
         }
         // The 4-wide blocked path must equal four independent scalar dots, at every K (incl. the
@@ -973,7 +973,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn dot4_vnni_matches_scalar_bit_for_bit() {
-        if !is_x86_feature_detected!("avxvnni") {
+        if !crate::isa::avxvnni() {
             return;
         }
         // The AVX-VNNI (vpdpbusd) 4-wide path must equal four scalar dots at every K, incl. the
@@ -1006,7 +1006,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn dot2x4_vnni_matches_scalar_bit_for_bit() {
-        if !is_x86_feature_detected!("avxvnni") {
+        if !crate::isa::avxvnni() {
             return;
         }
         // The 2×4 tile (two A-rows × four B-rows) must equal eight scalar dots at every K.
@@ -1411,7 +1411,7 @@ mod tests {
         // SAFETY: `a`/`b` hold k values; dot_i8_scalar reads k.
         let s = unsafe { dot_i8_scalar(a.as_ptr(), b.as_ptr(), k) };
         #[cfg(target_arch = "x86_64")]
-        if is_x86_feature_detected!("avx2") {
+        if crate::isa::avx2() {
             // SAFETY: AVX2 confirmed by the enclosing feature guard; `a`/`b` hold k values.
             let v = unsafe { dot_i8_avx2(a.as_ptr(), b.as_ptr(), k) };
             assert_eq!(s, v, "scalar != avx2 under overflow");

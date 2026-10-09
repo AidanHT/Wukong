@@ -499,7 +499,7 @@ unsafe fn colreduce_range(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
+        if crate::isa::avx2() {
             colreduce_avx2(x, out, rows, cols, j0, j1, kind);
             return;
         }
@@ -1082,7 +1082,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn scalar_matches_avx2_bit_for_bit() {
-        if !is_x86_feature_detected!("avx2") {
+        if !crate::isa::avx2() {
             return;
         }
         for &cols in &[
@@ -1148,7 +1148,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn finalize_avx2_matches_scalar_bit_for_bit() {
-        if !is_x86_feature_detected!("avx2") {
+        if !crate::isa::avx2() {
             return;
         }
         // Every case the finalize can meet and several it cannot, so the IEEE claim is tested at
@@ -1254,7 +1254,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn nan_signed_zero_and_ties_agree_between_paths() {
-        if !is_x86_feature_detected!("avx2") {
+        if !crate::isa::avx2() {
             return;
         }
         let nan = f32::NAN;

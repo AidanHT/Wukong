@@ -30,6 +30,7 @@ mod attrs;
 pub use attrs::{parallel_grain, MAX_PARALLEL_GRAIN};
 mod builtins;
 mod dependency;
+mod entry;
 mod infer;
 mod layout;
 mod methods;
@@ -463,6 +464,8 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
     // The `@noalias` rules (`noalias`): they compare argument storage, so they read the types the
     // body pass just recorded.
     noalias::check(module, interner, &s.defs, &s.types, &mut s.diags);
+    // The program entry's signature (`entry`, E0331): it reads the resolved signatures only.
+    entry::check(module, interner, &s.defs, &mut s.diags);
     let result = SemaResult {
         types: s.types,
         defs: s.defs,

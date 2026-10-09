@@ -230,10 +230,7 @@ mod tests {
             stdout.contains(&format!("{passed} passed; 0 failed")),
             "{stdout}{stderr}"
         );
-        if is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("fma")
-            && is_x86_feature_detected!("f16c")
-        {
+        if crate::isa::avx2() && crate::isa::fma() && crate::isa::f16c() {
             assert_eq!(
                 stderr.matches("checked stores").count(),
                 9,

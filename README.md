@@ -242,7 +242,8 @@ MIR
 ```
 
 The front-end, optimizer, the from-scratch **MIR interpreter**, *and* the **Cranelift native
-backend** build and test with plain `cargo test` on any machine — no LLVM, no toolchain. The native
+backend** build and test with plain `cargo test` — no LLVM, no toolchain — on the platforms in
+*Platform support* below. The native
 backend JIT-compiles in-process (and emits host objects) and is differentially tested against the
 interpreter on the covered programs. Both backends share `wukong_runtime` microkernels, so kernel
 correctness also requires independent references or recognition-on/off checks; aliasing and
@@ -257,6 +258,21 @@ reassociation, and a vectorized reduction computes the same canonical summation 
 (`docs/internals.md`, "The canonical reduction tree"). Everything still compiles and runs; only the
 widest lane is unavailable. The interpreter needs none of this. A **GPU backend** (NVIDIA, PTX via the driver JIT — no CUDA toolkit) is
 behind `--features gpu`, and LLVM is an optional *textual-IR* emitter exposed via `--emit=llvm-ir` (always built; no feature flag).
+
+## Platform support
+
+| Tier | Platform | What CI runs |
+|---|---|---|
+| 1 | x86-64 Windows (MSVC) and x86-64 Linux, AVX2 + FMA | every gate: fmt, clippy `-D warnings`, the workspace tests, the runtime's release bit-exactness tests, the AOT exe gate, the `-O0`/`-O3` bench gate, and the corpus again with `WUKONG_MAX_ISA=scalar` |
+| 2 | aarch64 macOS (Apple Silicon) and aarch64 Linux, scalar runtime | fmt, clippy, the workspace tests, the runtime release tests, the smoke runs and the AOT exe gate, non-blocking |
+| 2 | aarch64 Windows (MSVC) | `cargo check --workspace`, non-blocking |
+
+Tier 1 is gated: a red lane blocks a merge. Tier 2 is built and tested in CI but does not block,
+so a regression there is a reported gap. On every host without AVX2 + FMA (all of Tier 2) each
+runtime kernel takes its bit-exact scalar twin, and `WUKONG_MAX_ISA=scalar|avx2|avx2_vnni|avx512`
+caps the runtime's dispatch on an x86 host the same way (in the manner of oneDNN's
+`ONEDNN_MAX_CPU_ISA`), which is how the Tier 1 lanes exercise those scalar arms. The 256-bit
+vec-kernel emitter remains x86-64 Windows only, as described above.
 
 ## Status
 

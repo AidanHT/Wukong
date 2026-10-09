@@ -1,0 +1,14 @@
+// RUN: --run
+// EXPECT-EXIT: 42
+// EXPECT-OUT: 42.9
+module tests.run.main_returns_f32
+
+// A float `main` exits with its value converted toward zero: 42.9f32 is 42.900001525878906, which
+// truncates to 42. A linked executable used to leave the float in XMM0 and return whatever `eax`
+// held; its synthesized C `main` now applies the same saturating conversion as the JIT
+// (`crates/wukongc/tests/exe.rs` compares the executable with `--run`).
+fn main() -> f32 {
+    let x: f32 = 42.9;
+    print(x);
+    return x;
+}

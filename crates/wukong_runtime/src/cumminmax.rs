@@ -210,7 +210,7 @@ unsafe fn cummm_row_avx2(x: *const f32, out: *mut f32, base: usize, cols: usize,
 unsafe fn cummm_row(x: *const f32, out: *mut f32, base: usize, cols: usize, ext: Ext) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
+        if crate::isa::avx2() {
             cummm_row_avx2(x, out, base, cols, ext);
             return;
         }
@@ -613,7 +613,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn scan_known_values() {
-        if !is_x86_feature_detected!("avx2") {
+        if !crate::isa::avx2() {
             return;
         }
         // ascending ramp 1..=8

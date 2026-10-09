@@ -11,7 +11,7 @@ interchangeable ways to run the same program; they are not the product on their 
 ## Design bets
 
 1. **Interpreter-first, native code without LLVM.** The entire front-end, optimizer, and a
-   from-scratch MIR interpreter build and test with plain `cargo test` on any machine — no LLVM
+   from-scratch MIR interpreter build and test with plain `cargo test` on every platform in README *Platform support* — no LLVM
    required. Native code is produced by a **Cranelift** backend (`wukong_codegen_cranelift`): JIT
    for `--run --backend=native` and object/exe for `--emit`, again with no LLVM toolchain. (A textual
    LLVM IR backend also exists for `--emit=llvm-ir`.) The interpreter is the always-available

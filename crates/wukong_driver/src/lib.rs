@@ -1124,6 +1124,55 @@ void wukong_rt_bounds_fail(long long index, long long len, const char* site) {
 }
 double wukong_rt_fmod_f64(double a, double b) { return fmod(a, b); }
 float wukong_rt_fmod_f32(float a, float b) { return fmodf(a, b); }
+/* The synthesized C `main` calls this with the program's entry thunk, which returns the 8-bit exit
+   code. It runs the program on a 512 MiB worker thread, the stack `wukongc --run` gives both
+   backends, instead of the OS main-thread default (1 MiB on Windows). The Win32 entry points are
+   declared rather than taken from <windows.h>, whose macros would leak into this file. */
+struct wk_main_ctx { int (*entry)(void); int code; };
+#ifdef _WIN32
+extern void* __stdcall CreateThread(void*, size_t, unsigned long (__stdcall*)(void*), void*, unsigned long, unsigned long*);
+extern unsigned long __stdcall WaitForSingleObject(void*, unsigned long);
+extern int __stdcall CloseHandle(void*);
+static unsigned long __stdcall wk_main_thread(void* p) {
+    struct wk_main_ctx* c = (struct wk_main_ctx*)p;
+    c->code = c->entry();
+    return 0;
+}
+int wukong_rt_run_main(int (*entry)(void)) {
+    struct wk_main_ctx c;
+    c.entry = entry;
+    c.code = 0;
+    /* 0x00010000 is STACK_SIZE_PARAM_IS_A_RESERVATION: reserve, do not commit, 512 MiB. */
+    void* h = CreateThread(0, (size_t)512 << 20, wk_main_thread, &c, 0x00010000UL, 0);
+    if (!h) return entry();
+    WaitForSingleObject(h, 0xFFFFFFFFUL);
+    CloseHandle(h);
+    return c.code;
+}
+#else
+#include <pthread.h>
+static void* wk_main_thread(void* p) {
+    struct wk_main_ctx* c = (struct wk_main_ctx*)p;
+    c->code = c->entry();
+    return 0;
+}
+int wukong_rt_run_main(int (*entry)(void)) {
+    struct wk_main_ctx c;
+    pthread_attr_t attr;
+    pthread_t t;
+    c.entry = entry;
+    c.code = 0;
+    if (pthread_attr_init(&attr) != 0) return entry();
+    if (pthread_attr_setstacksize(&attr, (size_t)512 << 20) != 0
+        || pthread_create(&t, &attr, wk_main_thread, &c) != 0) {
+        pthread_attr_destroy(&attr);
+        return entry();
+    }
+    pthread_attr_destroy(&attr);
+    pthread_join(t, 0);
+    return c.code;
+}
+#endif
 /* Heap builtins (alloc_<T>/free). calloc zero-initializes — the determinism contract. The block
    is over-allocated so the data pointer sits on a 64-byte boundary, the runtime's `HEAP_ALIGN`,
    with the block's own address stored just below it for free. An empty or overflowing request is
@@ -1454,19 +1503,34 @@ fn emit_native(
 ) -> i32 {
     timer.begin("codegen");
     let backend = wukong_codegen_cranelift::BackendOpt::for_level(opts.opt_level);
+    // `--emit=obj` is a library object other code links against, so its functions keep their source
+    // names; `--emit=exe` internalizes and mangles every user function (no `.wk` function can
+    // collide with or interpose on libc at the link). Both get the synthesized C `main`.
+    let kind = if opts.emit == EmitStage::Obj {
+        wukong_codegen_cranelift::ObjectKind::Library
+    } else {
+        wukong_codegen_cranelift::ObjectKind::Executable
+    };
     let emitted = if timer.enabled() {
-        wukong_codegen_cranelift::emit_object_timed_for_with(
+        wukong_codegen_cranelift::emit_object_kind_timed_for_with(
             program,
             interner,
             opts.target_cpu,
             backend,
+            kind,
         )
         .map(|(bytes, split)| {
             timer.object_split(&split);
             bytes
         })
     } else {
-        wukong_codegen_cranelift::emit_object_for_with(program, interner, opts.target_cpu, backend)
+        wukong_codegen_cranelift::emit_object_kind_for_with(
+            program,
+            interner,
+            opts.target_cpu,
+            backend,
+            kind,
+        )
     };
     let obj = match emitted {
         Ok(b) => b,
@@ -1658,15 +1722,22 @@ fn cc_link(
 /// `libm.a`), so the Windows and macOS link lines are unaffected. Position matters: GNU `ld`
 /// resolves left to right, so a library must follow the objects that reference it.
 fn cc_link_args(obj_path: &Path, rt_path: &Path, out: &Path) -> Vec<std::ffi::OsString> {
-    vec![
+    let mut args: Vec<std::ffi::OsString> = vec![
         obj_path.into(),
         rt_path.into(),
         "-o".into(),
         out.into(),
         "-O2".into(),
         "-ffp-contract=off".into(),
-        "-lm".into(),
-    ]
+    ];
+    // `wukong_rt_run_main` runs the program on a pthread off Windows; glibc before 2.34 keeps
+    // pthreads out of libc, and `-pthread` is the portable spelling (a no-op where it is not).
+    // Windows uses `CreateThread`, which every MinGW link already has.
+    if !cfg!(windows) {
+        args.push("-pthread".into());
+    }
+    args.push("-lm".into());
+    args
 }
 
 /// The outcome of the [`rustc_link`] attempt (the preferred `--emit=exe` link path).
@@ -1753,6 +1824,19 @@ pub extern "C" fn wukong_rt_fmod_f64(a: f64, b: f64) -> f64 {
 #[no_mangle]
 pub extern "C" fn wukong_rt_fmod_f32(a: f32, b: f32) -> f32 {
     a % b
+}
+#[no_mangle]
+pub extern "C" fn wukong_rt_run_main(entry: extern "C" fn() -> i32) -> i32 {
+    // The program's `main` gets the 512 MiB stack `--run` gives both backends, not the OS
+    // main-thread default (1 MiB on Windows), so recursion depth does not depend on the artifact.
+    match std::thread::Builder::new()
+        .name("wukong-main".into())
+        .stack_size(512 << 20)
+        .spawn(move || entry())
+    {
+        Ok(worker) => worker.join().unwrap_or(101),
+        Err(_) => entry(),
+    }
 }
 "##;
 

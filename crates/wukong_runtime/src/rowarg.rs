@@ -141,7 +141,7 @@ unsafe fn rowarg_one(row: *const f32, cols: usize, is_max: bool) -> i32 {
         // index is off by one, so the exact-integer scalar twin takes over. Same guard shape
         // `colarg_range` uses for its row-axis index and `argreduce_chunk` (reduce.rs) for its i32
         // index lanes; one comparison per row.
-        if is_x86_feature_detected!("avx2") && cols < (1usize << 24) {
+        if crate::isa::avx2() && cols < (1usize << 24) {
             return rowarg_avx2(row, cols, is_max);
         }
     }
@@ -481,7 +481,7 @@ mod tests {
         // Where AVX2 is available, the vector path must equal the scalar twin EXACTLY for every row,
         // across widths spanning the 8-lane edge and tails — the per-row analogue of the argreduce
         // scalar==avx2 pin. (i32 indices → exact equality, no tolerance.)
-        if !is_x86_feature_detected!("avx2") {
+        if !crate::isa::avx2() {
             return;
         }
         for &cols in &[1usize, 7, 8, 9, 15, 16, 17, 31, 33, 64, 100, 1000] {
@@ -550,7 +550,7 @@ mod tests {
                     // SAFETY: `row` holds cols f32; rowarg_scalar reads cols.
                     assert_eq!(unsafe { rowarg_scalar(row.as_ptr(), cols, is_max) }, want);
                     #[cfg(target_arch = "x86_64")]
-                    if is_x86_feature_detected!("avx2") {
+                    if crate::isa::avx2() {
                         // SAFETY: AVX2 confirmed by the enclosing feature guard; `row` holds cols f32.
                         assert_eq!(unsafe { rowarg_avx2(row.as_ptr(), cols, is_max) }, want);
                     }

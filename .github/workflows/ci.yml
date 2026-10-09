@@ -153,6 +153,99 @@ jobs:
         # that lowers cleanly disagrees between -O0 and -O3, so this also guards optimizer soundness.
         run: cargo run -p wukong_bench --release --locked -- tests/run examples bench/kernels
 
+      # THE SCALAR DISPATCH ARMS, FROM COMPILED PROGRAMS. Every hosted runner has AVX2, so without a
+      # cap the scalar arm of every runtime dispatcher - what an ARM or pre-Haswell user runs - is
+      # reached only by the unit tests that call a twin directly, never through the dispatch
+      # decision a `.wk` program actually takes. `WUKONG_MAX_ISA=scalar` (`wukong_runtime::isa`, and
+      # `wukong_mir::host_supports_vec_kernels` for the compiler's raw-AVX2 loop kernels) turns every
+      # probe off, so the corpus differential and opt-invariance gates and the runtime's own tests
+      # run the whole program surface on the scalar arms.
+      - name: Test - scalar dispatch arms (WUKONG_MAX_ISA=scalar)
+        env:
+          WUKONG_MAX_ISA: scalar
+        run: |
+          cargo test -p wukong_runtime --locked --lib
+          cargo test -p wukongc --locked --test run
+
+  # TIER 2 PLATFORMS. The `test` job above is x86-64 only, so nothing built the 100+
+  # `cfg(target_arch)` guards in their non-x86 configuration, ran the Cranelift JIT or
+  # `emit_object` on aarch64, or linked an executable on macOS, while the README promised `cargo
+  # test` "on any machine". This job runs the `test` job's parts 1-5 (fmt, clippy, the workspace
+  # tests, the runtime's release bit-exactness tests, the smoke runs and the AOT exe gate) on Apple
+  # Silicon and on Linux aarch64, where every runtime kernel takes its scalar twin, plus a type
+  # check of the workspace for Windows on ARM. It is `continue-on-error` while these platforms are
+  # Tier 2 (README "Platform support"): a red lane is a reported gap, not a blocked merge. Promote a
+  # platform to Tier 1 by removing it from this job's `continue-on-error` once its lane is green.
+  platform-tier2:
+    name: tier-2 platform (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Test (release) - wukong_runtime bit-exactness
+        run: cargo test -p wukong_runtime --release --locked --lib
+
+      - name: Smoke-run examples
+        run: |
+          cargo run -p wukongc --locked -- --run examples/fib.wk
+          cargo run -p wukongc --locked -- --run examples/dot.wk
+          cargo run -p wukongc --locked -- --run examples/saxpy_array.wk
+
+      - name: Test (release) - wukongc AOT link (--emit=exe)
+        run: cargo test -p wukongc --release --locked --test exe
+
+  windows-arm-check:
+    name: tier-2 platform (aarch64-pc-windows-msvc, check only)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-aarch64-msvc-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check the workspace for Windows on ARM
+        run: cargo check --workspace --locked --target aarch64-pc-windows-msvc
+
   # `cargo test --workspace` above NEVER builds the `gpu` feature, so every line of
   # `crates/wukong_codegen_gpu` (and the `gpu`-gated arms of `wukong_driver`/`wukongc`) was invisible
   # to CI: the whole crate could fail to compile and the `test` job would still be green. This job

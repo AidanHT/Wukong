@@ -936,7 +936,7 @@ unsafe fn norm_affine_row(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if crate::isa::avx2() && crate::isa::fma() {
             match op {
                 NORM_LAYERNORM => return layernorm_affine_row_avx2(x, out, gamma, beta, n, eps),
                 NORM_RMSNORM => return rmsnorm_affine_row_avx2(x, out, gamma, beta, n, eps),
@@ -959,7 +959,7 @@ unsafe fn norm_affine_row(
 unsafe fn norm_row(x: *const f32, out: *mut f32, n: usize, eps: f32, op: i64) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if crate::isa::avx2() && crate::isa::fma() {
             match op {
                 NORM_SOFTMAX => return softmax_row_avx2(x, out, n),
                 NORM_LOGSOFTMAX => return logsoftmax_row_avx2(x, out, n),
@@ -1203,7 +1203,7 @@ mod tests {
                         "op={op} n={n} x={special}"
                     );
                     #[cfg(target_arch = "x86_64")]
-                    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                    if crate::isa::avx2() && crate::isa::fma() {
                         let mut lanes = vec![0.0; n];
                         // SAFETY: AVX2+FMA confirmed by the enclosing feature guard; `x`/`lanes` sized n.
                         unsafe {
@@ -1238,7 +1238,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn scalar_matches_avx2_bit_for_bit() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return;
         }
         // Sizes exercising the 8-lane body, a non-multiple-of-8 tail, and rows shorter than 8 —
@@ -1409,7 +1409,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn reduction_twins_agree_bit_for_bit_on_pathological_rows() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return;
         }
         // Means chosen so `x - mean` itself produces the hard cases: inf - inf = NaN, a NaN mean
@@ -1474,7 +1474,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn norm_rows_agree_bit_for_bit_on_pathological_rows() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return;
         }
         for (name, gen) in pathological() {
@@ -1537,7 +1537,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn rowmax_twins_agree_on_pathological_rows() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return;
         }
         let mut rows: Vec<(&str, fn(usize) -> f32)> = pathological();
@@ -1632,7 +1632,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn scalar_matches_avx2_on_nan_rows() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return;
         }
         for &n in &[16usize, 17, 24, 33, 100] {
@@ -1939,7 +1939,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn affine_scalar_matches_avx2_bit_for_bit() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return;
         }
         // Same boundary set as the plain twin: the affine kernels share its 8-accumulator

@@ -259,7 +259,7 @@ unsafe fn velem_span(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if crate::isa::avx2() && crate::isa::fma() {
             // SAFETY: features detected; buffers valid for n by the caller contract.
             unsafe { velem_avx2(x, y, out, n, a, b, c, op, nt) };
             return;
@@ -617,7 +617,7 @@ pub unsafe extern "C" fn wukong_vhorner_f32(
     let coeffs = unsafe { std::slice::from_raw_parts(coeffs, ncoeff as usize) };
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if crate::isa::avx2() && crate::isa::fma() {
             // SAFETY: features detected; buffers valid for n by the caller contract.
             unsafe { vhorner_avx2(x, out, n, coeffs) };
             return;
@@ -757,7 +757,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn nt_alignment_elementwise_and_horner_peels() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return;
         }
         let n = crate::nt_policy::test_min_bytes() / 8 + 35;

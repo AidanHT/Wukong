@@ -268,10 +268,7 @@ unsafe fn vector_groups(
     epi: Option<Epilogue>,
 ) -> usize {
     let (mut j, j_hi) = span;
-    if !(is_x86_feature_detected!("avx2")
-        && is_x86_feature_detected!("fma")
-        && is_x86_feature_detected!("f16c"))
-    {
+    if !(crate::isa::avx2() && crate::isa::fma() && crate::isa::f16c()) {
         return j;
     }
     while j + COLS <= j_hi {

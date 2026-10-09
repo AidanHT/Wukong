@@ -121,7 +121,7 @@ pub unsafe extern "C" fn wukong_attention_f32(
     let causal = causal != 0;
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if crate::isa::avx2() && crate::isa::fma() {
             // SAFETY: features just checked; dims validated by the caller contract.
             unsafe {
                 attention_avx2(q, k, v, o, s, d, scale, causal);
@@ -1509,7 +1509,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn attention_matches_legacy_kernel() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return;
         }
         for &(s, d) in SHAPES {
@@ -1575,7 +1575,7 @@ mod tests {
     fn softmax_row_scaled(row: &mut [f32], scale: f32) {
         #[cfg(target_arch = "x86_64")]
         {
-            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            if crate::isa::avx2() && crate::isa::fma() {
                 // SAFETY: features just checked; all accesses are inside `row`.
                 unsafe {
                     softmax_row_scaled_avx2(row, scale);
@@ -1866,7 +1866,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn same_kernel_materialized_control_matches_naive_and_fused() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return;
         }
         for &(s, d) in SHAPES {
@@ -2078,7 +2078,7 @@ mod tests {
         let avx = {
             #[cfg(target_arch = "x86_64")]
             {
-                is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
+                crate::isa::avx2() && crate::isa::fma()
             }
             #[cfg(not(target_arch = "x86_64"))]
             {

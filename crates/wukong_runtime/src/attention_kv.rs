@@ -511,7 +511,7 @@ unsafe fn attend_row_avx2(
 
 #[cfg(target_arch = "x86_64")]
 fn simd_available() -> bool {
-    is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
+    crate::isa::avx2() && crate::isa::fma()
 }
 
 #[cfg(not(target_arch = "x86_64"))]

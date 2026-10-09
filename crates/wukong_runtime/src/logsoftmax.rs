@@ -201,7 +201,7 @@ unsafe fn logsumexp_row_avx2(x: *const f32, out: *mut f32, n: usize) {
 unsafe fn logsoftmax_row(x: *const f32, out: *mut f32, n: usize) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if crate::isa::avx2() && crate::isa::fma() {
             return logsoftmax_row_avx2(x, out, n);
         }
     }
@@ -216,7 +216,7 @@ unsafe fn logsoftmax_row(x: *const f32, out: *mut f32, n: usize) {
 unsafe fn logsumexp_row(x: *const f32, out: *mut f32, n: usize) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if crate::isa::avx2() && crate::isa::fma() {
             return logsumexp_row_avx2(x, out, n);
         }
     }
@@ -371,7 +371,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn scalar_matches_avx2_bit_for_bit() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return;
         }
         for &n in &[
@@ -423,7 +423,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn scalar_matches_avx2_on_nan_rows() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return;
         }
         for &n in &[16usize, 17, 24, 33, 100] {

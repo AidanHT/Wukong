@@ -28,6 +28,9 @@
 //!   declarations repeated in several modules are merged.
 //! - An imported file's own `module` header is informational, exactly like the root's — it is not
 //!   required to match the import path (no error on mismatch).
+//! - Resolution is **case-exact on every host**: each component must match its directory entry
+//!   byte for byte, so `import Util` for a file `util.wk` is **E0330** (naming `util`) on Windows
+//!   and macOS too, not only where the file system would refuse it.
 //! - A missing/unreadable import file is **E0305** at the import site. Lex/parse diagnostics from
 //!   imported files carry that file's own [`wukong_span::SourceId`], so they render with the
 //!   right path/line/column through the shared [`SourceMap`].
@@ -35,6 +38,7 @@
 //! `NodeId` uniqueness across files is guaranteed by threading a watermark through
 //! [`wukong_parser::parse_module_tokens_from`] — see its doc comment.
 
+mod case;
 mod resolve;
 
 use std::collections::HashMap;
@@ -176,6 +180,39 @@ impl Loader<'_> {
             dotted.push_str(s);
         }
         file.set_extension("wk");
+
+        // Case-exact resolution, checked BEFORE the dedup lookup: on a case-folding file system the
+        // canonical key of `Util.wk` is that of `util.wk`, so a mis-cased import of an already
+        // loaded file would otherwise be accepted silently.
+        let mut components: Vec<String> = imp
+            .path
+            .segments
+            .iter()
+            .map(|seg| self.interner.resolve(seg.sym).to_string())
+            .collect();
+        if let Some(last) = components.last_mut() {
+            last.push_str(".wk");
+        }
+        if let Some(on_disk) = case::case_mismatch(&self.root_dir, &components) {
+            let mut spelled = on_disk.join(".");
+            spelled.truncate(spelled.len().saturating_sub(".wk".len()));
+            self.sink.emit(
+                Diagnostic::error(format!(
+                    "import `{dotted}` matches the file `{}` only up to letter case",
+                    on_disk.join("/")
+                ))
+                .with_code("E0330")
+                .primary(
+                    imp.path.span,
+                    "the case of this import does not match the file on disk",
+                )
+                .help(format!(
+                    "write `import {spelled}`: imports resolve case-sensitively on every host, \
+                     so this spelling would fail on a case-sensitive file system"
+                )),
+            );
+            return None;
+        }
 
         // Dedup / cycle break by canonical path identity — recorded BEFORE parsing the file, so
         // a cycle back through this file (or a second report for the same missing file) is a
@@ -446,6 +483,28 @@ mod tests {
         let paths = expr_paths(&module, &interner);
         assert!(paths.contains(&"ns_a.a_val".to_string()), "{paths:?}");
         assert!(paths.contains(&"ns_b.a_val".to_string()), "{paths:?}");
+    }
+
+    /// `import NS_A` for the file `ns_a.wk` is E0330 on every host: on a case-folding file system
+    /// it used to load, and on a case-sensitive one it was E0305.
+    #[test]
+    fn a_mis_cased_import_is_e0330_on_every_host() {
+        let (_, sink, _, files) = load_src(
+            "virtual_root.wk",
+            "import NS_A;\nfn main() -> i32 { return 0; }\n",
+        );
+        assert_eq!(codes(&sink), vec!["E0330"], "{:?}", sink.diagnostics());
+        assert_eq!(files, 1, "a mis-cased import must not load the file");
+        let message = &sink.diagnostics()[0].message;
+        assert!(message.contains("ns_a.wk"), "{message}");
+
+        // Also after the correctly spelled import loaded the file: the dedup key must not
+        // launder the second spelling.
+        let (_, sink, _, _) = load_src(
+            "virtual_root.wk",
+            "import ns_a;\nimport Ns_a;\nfn main() -> i32 { return a_val(); }\n",
+        );
+        assert_eq!(codes(&sink), vec!["E0330"], "{:?}", sink.diagnostics());
     }
 
     /// A private item is unreachable from another file however it is named: by selection, by

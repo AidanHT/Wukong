@@ -39,7 +39,9 @@ another architecture or OS is not supported. A native-backend failure is a catal
 
 - **Multi-file modules with real namespaces**: `import a.b` loads `a/b.wk` (resolved against the
   *root* source file's directory); files load once each — an import cycle or diamond dedups by
-  canonical path, never errors — and an unresolvable import is `E0305`. Every file is its own
+  canonical path, never errors — and an unresolvable import is `E0305`; resolution is case-exact
+  on every host (a case-only mismatch with the file on disk is `E0330`, not a host-dependent
+  success). Every file is its own
   module: items are private unless `pub` (`E0312` otherwise), imports are per file and not
   transitive, `import a.b;` brings `b`'s `pub` items in unqualified plus the `b::` qualifier,
   `import a.b as c;` binds only `c::`, and `import a.b.{x, y};` selects. Two modules may define the
@@ -1541,7 +1543,20 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   concurrent links on one stem raced on them; the working directory is used only if the temp directory
   cannot be created. The intermediate `{stem}.o` is still written beside the invocation. The rustc link
   passes `-C panic=abort` because the workspace release profile sets `panic = "abort"`, and a strategy
-  mismatch is a hard metadata error that rejects the link outright. `--emit=obj`
+  mismatch is a hard metadata error that rejects the link outright. **The executable's entry
+  matches `--run`**: the object's C `main` is synthesized, calls the program's `main` (now the
+  internal `_WK4main`) on a 512 MiB worker thread through `wukong_rt_run_main` (in both the Rust
+  shim and the C runtime), converts its result as the JIT does and keeps the low 8 bits, so a
+  `-> f32`, a void `main` and `return 300` exit as under `--run`, and 30000-deep recursion no longer
+  depends on the OS main-thread stack. In an `--emit=exe` object every user function is an internal,
+  mangled `_WK<len><name>` symbol, so a `.wk` `write`/`fmod`/`memcpy` cannot collide with or
+  interpose on the C library; an `--emit=obj` object keeps its other functions exported under their
+  source names (its C interface). **Platforms** (README *Platform support*): Tier 1 is x86-64
+  Windows/Linux with AVX2 + FMA, fully gated; Tier 2 is aarch64 macOS/Linux (built and tested in CI,
+  non-blocking, scalar runtime) and aarch64 Windows (`cargo check` only). `WUKONG_MAX_ISA`
+  (`wukong_runtime::isa`) caps the runtime's ISA dispatch, and a Tier 1 lane runs the corpus with
+  `WUKONG_MAX_ISA=scalar`. Not yet capped: the Cranelift ISA flags the JIT itself compiles with.
+  `--emit=obj`
   writes the object unchanged. The differential oracle remains `--run`.
 - **A `mut` aggregate parameter aliases the caller's value — now opt-in.** Aggregate arguments
   (`struct`/array/tuple/tensor) are passed by pointer, the zero-copy tensor-kernel convention, so a

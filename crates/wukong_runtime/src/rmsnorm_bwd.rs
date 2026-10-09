@@ -307,7 +307,7 @@ unsafe fn rmsnorm_bwd_row(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if crate::isa::avx2() && crate::isa::fma() {
             return rmsnorm_bwd_row_avx2(x, dy, gamma, dx, n, eps);
         }
     }
@@ -549,7 +549,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn scalar_matches_avx2_bit_for_bit() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return;
         }
         // Sizes exercising the 8-lane remainder, non-multiple-of-8 tails, rows shorter than 8, the
@@ -596,7 +596,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn scalar_matches_avx2_on_nan_and_signed_zero_rows() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return;
         }
         for &n in &[8usize, 33, 40, 64, 96, 100, 129] {

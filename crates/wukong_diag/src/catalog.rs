@@ -411,6 +411,30 @@ static CATALOG: &[Explanation] = &[
         good: "module ex.e0324\nfn main() -> i32 {\n    let x: f32 = 2.5;\n    return x as i32;\n}\n"
     ),
     entry!(
+        "E0330",
+        "import path differs from the file only in letter case",
+        "An `import` names a file that exists, but only under a different capitalization: \
+         `import Util` when the file is `util.wk`, or `import Lib.ops` for a directory `lib`. \
+         Imports resolve case-sensitively on every host. Opening the path would succeed on a \
+         case-insensitive file system (Windows, and macOS by default) and fail with E0305 on a \
+         case-sensitive one (Linux), so the same program used to compile on one machine and not on \
+         another. Each path component is compared byte for byte with the directory listing; the \
+         diagnostic names the on-disk spelling. Spell the import exactly as the file and its \
+         directories are named."
+    ),
+    entry!(
+        "E0331",
+        "invalid `main` signature",
+        "The program entry `fn main` is called by the runtime with no arguments, and its result \
+         becomes the process exit code, so it must take no parameters, have no generic parameters, \
+         and return a scalar (an integer, a float, `bool` or `char`) or nothing. The exit code is \
+         the low 8 bits of the value: a float is converted toward zero first, and a `main` with no \
+         return type exits 0. Read command-line arguments with `arg_count()` and `arg(i)`, and \
+         print or write an aggregate result rather than returning it.",
+        bad: "module ex.e0331\nfn main(n: i32) -> i32 {\n    return n;\n}\n",
+        good: "module ex.e0331\nfn main() -> i32 {\n    let n: i32 = 0;\n    return n;\n}\n"
+    ),
+    entry!(
         "E0401",
         "type mismatch",
         "A value's type does not match the type its context requires: a `let` annotation, an \

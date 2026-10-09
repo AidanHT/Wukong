@@ -125,7 +125,7 @@ unsafe fn rope_row_avx2(pos: f32, inv_freq: *const f32, x: *const f32, out: *mut
 unsafe fn rope_row(pos: f32, inv_freq: *const f32, x: *const f32, out: *mut f32, half: usize) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if crate::isa::avx2() && crate::isa::fma() {
             return rope_row_avx2(pos, inv_freq, x, out, half);
         }
     }
@@ -237,7 +237,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn scalar_matches_avx2_bit_for_bit() {
-        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
             return;
         }
         for &half in &[1usize, 4, 7, 8, 9, 16, 17, 31, 64, 100, 257] {

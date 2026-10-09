@@ -59,7 +59,7 @@
 unsafe fn add_row(grad_w_row: *mut f32, grad_out_row: *const f32, h: usize) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
+        if crate::isa::avx2() {
             add_row_avx2(grad_w_row, grad_out_row, h);
             return;
         }

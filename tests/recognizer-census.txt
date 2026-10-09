@@ -229,6 +229,7 @@ layernorm_bwd.wk: wukong_layernorm_bwd_f32
 layernorm_bwd_blocked_every_lane.wk: wukong_layernorm_bwd_f32 wukong_layernorm_bwd_f32*2
 leaky_relu.wk: wukong_vmath_f32
 let_destructure.wk:
+libc_name_collision.wk:
 linear_bf16.wk: wukong_sgemm_bf16_nt
 linear_bf16_ffn.wk: wukong_sgemm_bf16_nt_epi
 linear_bias_gelu.wk: wukong_sgemm_nt_epi
@@ -263,6 +264,9 @@ loop_counter_wider_bound.wk:
 loop_i64_bound.wk: veckernel*2
 loop_unroll.wk: wukong_rt_alloc wukong_rt_free
 lrscan.wk: wukong_lrscan_f32
+main_exit_code_wraps.wk:
+main_returns_f32.wk:
+main_returns_void.wk:
 match_dense_enum_switch.wk:
 match_enum_mixed_coverage.wk:
 match_exhaustive_enum.wk:

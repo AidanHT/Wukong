@@ -339,7 +339,7 @@ unsafe fn gemv_rows(
     let (mut r, hi) = span;
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("f16c") {
+        if crate::isa::avx2() && crate::isa::f16c() {
             while r + 8 <= hi {
                 rows8_avx2(
                     w.add(r * row_bytes),

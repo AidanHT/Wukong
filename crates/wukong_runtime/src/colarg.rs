@@ -303,7 +303,7 @@ unsafe fn colarg_range(
     }
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
+        if crate::isa::avx2() {
             colarg_avx2(x, out, rows, cols, j0, j1, is_max);
             return;
         }
@@ -686,7 +686,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn scalar_matches_avx2_bit_for_bit() {
-        if !is_x86_feature_detected!("avx2") {
+        if !crate::isa::avx2() {
             return;
         }
         // Widths and heights straddle every edge of the COLARG_RB x COLARG_JB tile as well as the
@@ -733,7 +733,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn early_out_branch_and_nan_signed_zero_match_the_scalar_twin() {
-        if !is_x86_feature_detected!("avx2") {
+        if !crate::isa::avx2() {
             return;
         }
         let (rows, cols) = (13usize, 137usize);

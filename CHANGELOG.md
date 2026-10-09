@@ -5,6 +5,32 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### AOT executables and platform (`gap2/aot-and-platform`)
+
+- **The executable's exit code and stack match `--run`.** An object's C `main` is now synthesized:
+  it runs the program's `main` on a 512 MiB worker thread (`wukong_rt_run_main`, in the Rust link
+  shim and the C fallback runtime) and returns the low 8 bits of its value, a float converted
+  toward zero and a void `main` as 0. A `-> f32` or void `main` used to exit with whatever was in
+  the return register, `return 300` exited 300 on Windows and 44 elsewhere, and deep recursion
+  overflowed the 1 MiB Windows main-thread stack in an exe while completing under `--run`.
+- **No more libc symbol collisions in executables.** `--emit=exe` objects make every user function
+  internal and mangled (`_WK<len><name>`), so a function named `write`, `fmod` or `memcpy` can no
+  longer collide with or interpose on the C library at link time. `--emit=obj` keeps non-entry
+  functions exported under their source names.
+- **`main`'s signature is checked** (`E0331`): no parameters, no generics, and a scalar or no
+  result. A parameterized `main` used to type-check and fail only at run time.
+- **Case-exact imports on every host** (`E0330`): `import Util` for a file `util.wk` used to
+  compile on Windows and macOS and be `E0305` on Linux; each path component is now compared with
+  the directory listing and the diagnostic names the on-disk spelling.
+- **`WUKONG_MAX_ISA`** (`scalar`, `avx2`, `avx2_vnni`, `avx512`) caps the instruction-set level
+  every runtime kernel dispatches to, through the new `wukong_runtime::isa` probes that replace
+  the ~250 scattered `is_x86_feature_detected!` calls; the compiler's raw-AVX2 loop kernels honor
+  it too. CI runs the corpus with `WUKONG_MAX_ISA=scalar`, so the scalar dispatch arms are
+  exercised from compiled programs.
+- **Platform support** is stated (README): Tier 1 x86-64 Windows/Linux, Tier 2 aarch64
+  macOS/Linux/Windows with new non-blocking CI lanes (`macos-14`, `ubuntu-24.04-arm`, an
+  `aarch64-pc-windows-msvc` check).
+
 ### Type soundness and patterns (`gap2/type-soundness-and-patterns`)
 
 - **Match exhaustiveness by pattern usefulness** (Maranget's algorithm, as in rustc): `E0405` now
