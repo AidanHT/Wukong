@@ -5,6 +5,14 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### CFG and loop transforms, remainder (`gap3/cfg-remainder`)
+
+- **Induction-variable range splitting past side exits (N31).** A loop with any exit besides its
+  header test -- the bounds-check trap of `s[i * n + j]` on a runtime-sized slice, a `break` -- was
+  never split, so the causal mask over a `[]f32` kept its per-iteration branch; each copy now takes
+  such an exit at the iteration the unsplit loop does, and a trap block's read of the failing index
+  becomes an edge argument (`tests/run/causal_mask_slice_split.wk`).
+
 ### Type aliases (`gap3/type-aliases`)
 
 - **`type` aliases (N19).** `type Real = f32;` and generic `type Mat<M, N> = Tensor[Real, M, N];`
