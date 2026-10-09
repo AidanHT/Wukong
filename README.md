@@ -92,7 +92,11 @@ not duplicate them. In summary, Wukong:
   functions; traits with bounds (`<T: Shape>`, `where`) and function-typed parameters
   (`f: fn(f32) -> f32`) are dispatched statically — every generic and higher-order function is
   specialized per instantiation, so no vtable or function pointer exists at run time
-  (`tests/run/{methods_impl,traits_static_dispatch,fn_params}.wk`).
+  (`tests/run/{methods_impl,traits_static_dispatch,fn_params}.wk`). Every concrete instantiation
+  is type-checked again at its types; a tensor may be generic over its element (`Tensor[T, N]`,
+  with `alloc::<T>(n)` as the generic heap allocator), one instance per dtype; and
+  `where K % 16 == 0` predicates and `static_assert` over a function's dimensions are checked at
+  each call (`tests/run/{dtype_generic_tensor,where_constraints}.wk`).
 - **Kernels callable by name.** `matmul`, `linear`, `softmax`, `layernorm`, `rmsnorm`, `transpose`, the
   buffer activations (`gelu(x, out)`, …), `sum`/`dot` and `sdpa` reach the tuned runtime kernels
   directly, with real shape signatures (`E0409` when a dimension cannot be inferred) — the explicit
