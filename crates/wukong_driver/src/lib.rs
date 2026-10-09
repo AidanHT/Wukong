@@ -500,6 +500,13 @@ pub fn compile(opts: &Options) -> i32 {
         &mut sink,
         &mut next_node,
     );
+    // --- Type aliases (`type Mat<M, N> = Tensor[f32, M, N];`; see `loader::alias`) ---
+    // Every use is replaced by the type it stands for and the alias items are removed, so sema,
+    // MIR lowering and autodiff never see an alias. It runs on the merged program, after the
+    // loader has given an imported alias and every reference to it one program-wide symbol.
+    if !sink.has_errors() {
+        loader::expand_type_aliases(&mut module, &mut interner, &mut sink, &mut next_node);
+    }
     let import_errors = emit_diags(sink.diagnostics(), opts, &renderer, &sm);
     if sink.has_errors() {
         let denied = render_lints(parse_lints, &module, &interner, opts, &renderer, &sm);

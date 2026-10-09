@@ -24,7 +24,7 @@
 
 use wukong_ast::{
     Block, Expr, ExprKind, FnDecl, ForIter, GenericParam, GenericParamKind, Ident, Item, ItemKind,
-    PatKind, Path, Pattern, Stmt, StmtKind, TypeExpr, TypeKind, VariantData, VariantPat,
+    PatKind, Path, Pattern, Stmt, StmtKind, TypeArg, TypeExpr, TypeKind, VariantData, VariantPat,
 };
 use wukong_diag::{Diagnostic, DiagnosticSink};
 use wukong_span::{FxHashMap, Interner, Span, Symbol};
@@ -137,6 +137,7 @@ fn decl_names(item: &Item) -> Vec<(Ident, bool, bool)> {
         ItemKind::Const(c) => vec![(c.name, c.is_pub, false)],
         ItemKind::Extern(blk) => blk.items.iter().map(|f| (f.name, f.is_pub, true)).collect(),
         ItemKind::Trait(t) => vec![(t.name, t.is_pub, false)],
+        ItemKind::TypeAlias(a) => vec![(a.name, a.is_pub, false)],
         // An `impl` block declares nothing of its own: each method is a separate top-level `Fn`
         // item (`Type.method`) the parser flattened out of it, exported like any other function.
         ItemKind::Import(_) | ItemKind::Impl(_) => Vec::new(),
@@ -193,6 +194,7 @@ fn rename_decls(item: &mut Item, table: &FxHashMap<Symbol, Export>) {
         ItemKind::Enum(e) => rename(&mut e.name),
         ItemKind::Const(c) => rename(&mut c.name),
         ItemKind::Trait(t) => rename(&mut t.name),
+        ItemKind::TypeAlias(a) => rename(&mut a.name),
         // The block's record of its flattened methods must name them by the same program-wide
         // symbol their `Fn` items are renamed to, or sema's method table points at nothing.
         ItemKind::Impl(imp) => {
@@ -618,6 +620,13 @@ impl Rewriter<'_> {
                     self.path(tr);
                 }
             }
+            // An alias's parameters shadow items in its body, exactly as a generic struct's do.
+            ItemKind::TypeAlias(a) => {
+                self.generics = a.generics.iter().map(generic_sym).collect();
+                self.generic_params(&mut a.generics);
+                self.ty(&mut a.ty);
+                self.generics.clear();
+            }
             ItemKind::Import(_) => {}
         }
     }
@@ -684,6 +693,15 @@ impl Rewriter<'_> {
                 }
                 if let Some(r) = ret {
                     self.ty(r);
+                }
+            }
+            TypeKind::Generic { path, args } => {
+                self.path(path);
+                for a in args {
+                    match a {
+                        TypeArg::Type(t) => self.ty(t),
+                        TypeArg::Dim(d) => self.dim(d),
+                    }
                 }
             }
         }

@@ -83,6 +83,12 @@ pub(crate) struct Parser<'a> {
     /// apart from `diags` so a caller that asserts a clean parse is not failed by a warning. Only
     /// [`parse_module_tokens_with_lints`] hands them out; the driver resolves their levels.
     pub(crate) lints: Vec<Diagnostic>,
+    /// Parsing the target type of an `as` cast, where a bare `<` after a type name is the
+    /// comparison `x as i32 < n`, never type arguments (those must be spelled `Name::<..>` there).
+    in_cast: bool,
+    /// A `>>` closed an inner type-argument list and the outer one's `>` with it: the outer list
+    /// has been closed already (`Box<Mat<2>>`).
+    split_gt: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -97,6 +103,8 @@ impl<'a> Parser<'a> {
             no_struct_lit: false,
             depth: 0,
             depth_exceeded: false,
+            in_cast: false,
+            split_gt: false,
             self_ty: None,
             delims: Vec::new(),
             expected: Vec::new(),
@@ -650,10 +658,21 @@ impl<'a> Parser<'a> {
             self.bump();
             segments.push(self.ident());
         }
-        TypeKind::Path(Path {
+        let path = Path {
             segments,
             span: start.to(self.prev_span()),
-        })
+        };
+        // `Name<args>` (not as a cast target, where `<` compares) or `Name::<args>` anywhere.
+        if self.at(T::ColonColon) && self.nth(1) == T::Lt {
+            self.bump(); // ::
+            let args = self.parse_type_args();
+            return TypeKind::Generic { path, args };
+        }
+        if self.at(T::Lt) && !self.in_cast {
+            let args = self.parse_type_args();
+            return TypeKind::Generic { path, args };
+        }
+        TypeKind::Path(path)
     }
 
     fn parse_dotted_path(&mut self) -> Path {
@@ -909,7 +928,9 @@ impl<'a> Parser<'a> {
                 break;
             }
             self.bump();
+            let in_cast = std::mem::replace(&mut self.in_cast, true);
             let ty = self.parse_type();
+            self.in_cast = in_cast;
             e = self.finish_expr(
                 e.span,
                 ExprKind::Cast {
@@ -1166,14 +1187,86 @@ impl<'a> Parser<'a> {
         self.bump(); // ::
         self.bump(); // <
         let mut args = Vec::new();
+        let in_cast = std::mem::replace(&mut self.in_cast, false);
         while !self.at(T::Gt) && !self.at(T::Eof) {
             args.push(self.parse_type());
-            if !self.eat(T::Comma) {
+            if self.split_gt || !self.eat(T::Comma) {
                 break;
             }
         }
-        self.expect(T::Gt);
+        self.in_cast = in_cast;
+        self.close_angle();
         args
+    }
+
+    /// Close a `<..>` list. A `>>` token closes this list and the enclosing one (`Box<Mat<2>>`):
+    /// it is consumed here and [`Parser::split_gt`] tells the enclosing list it is closed already.
+    fn close_angle(&mut self) {
+        if self.split_gt {
+            self.split_gt = false;
+        } else if self.at(T::Shr) {
+            self.bump();
+            self.split_gt = true;
+        } else {
+            self.expect(T::Gt);
+        }
+    }
+
+    /// `<A, B, ..>` after a type name (the opening `<` is the current token). Each argument is a
+    /// type, or a dimension when only a dimension can be meant: an integer, `?`, or arithmetic
+    /// (`N*2`, `(L - K)/S`). A bare name parses as a type; alias expansion reads it as either.
+    fn parse_type_args(&mut self) -> Vec<TypeArg> {
+        self.bump(); // <
+        let in_cast = std::mem::replace(&mut self.in_cast, false);
+        let mut args = Vec::new();
+        while !self.at(T::Gt) && !self.at(T::Shr) && !self.at(T::Eof) {
+            let dim_op =
+                |k: TokenKind| matches!(k, T::Plus | T::Minus | T::Star | T::Slash | T::Percent);
+            let is_dim = match self.kind() {
+                T::Int | T::Question => true,
+                T::Ident => dim_op(self.nth(1)),
+                T::LParen => self.paren_is_dim(),
+                _ => false,
+            };
+            if is_dim {
+                args.push(TypeArg::Dim(self.parse_dim()));
+            } else {
+                args.push(TypeArg::Type(self.parse_type()));
+            }
+            if self.split_gt || !self.eat(T::Comma) {
+                break;
+            }
+        }
+        self.in_cast = in_cast;
+        self.close_angle();
+        args
+    }
+
+    /// At a `(` inside type arguments: is it a parenthesized dimension (`(L - K)/S`, `(N + 1)`)
+    /// rather than a tuple or grouped type? True when an arithmetic operator follows the matching
+    /// `)` or the first name or integer inside it.
+    fn paren_is_dim(&self) -> bool {
+        let dim_op =
+            |k: TokenKind| matches!(k, T::Plus | T::Minus | T::Star | T::Slash | T::Percent);
+        if matches!(self.nth(1), T::Ident | T::Int) && dim_op(self.nth(2)) {
+            return true;
+        }
+        let mut depth = 0usize;
+        let mut n = 0usize;
+        loop {
+            match self.nth(n) {
+                T::LParen => depth += 1,
+                T::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return dim_op(self.nth(n + 1));
+                    }
+                }
+                T::Eof | T::Semi | T::LBrace | T::RBrace => return false,
+                _ => {}
+            }
+            n += 1;
+        }
     }
 
     fn parse_primary(&mut self) -> Expr {

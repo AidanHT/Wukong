@@ -54,6 +54,19 @@ pub enum TypeKind {
         params: Vec<TypeExpr>,
         ret: Option<Box<TypeExpr>>,
     },
+    /// A named type applied to arguments: `Mat<4, 8>`, `Pair<f32>` (or `Mat::<4, 8>`, the only
+    /// spelling accepted as a cast target, where a bare `<` is a comparison). Only a generic type
+    /// alias takes arguments; the driver's alias expansion replaces every node of this kind before
+    /// sema.
+    Generic { path: Path, args: Vec<TypeArg> },
+}
+
+/// One argument of a [`TypeKind::Generic`]: a type, or a dimension the parser could only read as
+/// one (`4`, `?`, `N*2`). A bare name (`M`) parses as a type and serves as either.
+#[derive(Clone, Debug)]
+pub enum TypeArg {
+    Type(TypeExpr),
+    Dim(Dim),
 }
 
 /// One dimension of a tensor type.

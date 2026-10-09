@@ -747,7 +747,9 @@ impl<'a> Sema<'a> {
                         self.collect_fn(f);
                     }
                 }
-                ItemKind::Import(_) => {}
+                // Every use of an alias was expanded by the driver, which removes the alias items
+                // (`wukong_driver::loader::alias`); one that reaches sema anyway names nothing.
+                ItemKind::Import(_) | ItemKind::TypeAlias(_) => {}
                 // Collected by `collect_methods` once every signature is final.
                 ItemKind::Trait(_) | ItemKind::Impl(_) => {}
             }
@@ -1263,6 +1265,15 @@ impl<'a> Sema<'a> {
                     }
                     Ty::Named(name)
                 }
+            }
+            // Type arguments are legal only on a type alias, and the driver expands every alias
+            // before sema. A direct caller that skipped expansion gets the name's own diagnosis.
+            TypeKind::Generic { path, .. } => {
+                let name = path.segments.last().unwrap().sym;
+                if self.checking_bodies {
+                    self.check_type_name(path, name, t.span);
+                }
+                Ty::Error
             }
             TypeKind::Int(_) => Ty::Error,
             TypeKind::Unit => Ty::Unit,

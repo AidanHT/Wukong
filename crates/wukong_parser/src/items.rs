@@ -125,6 +125,11 @@ impl Parser<'_> {
             T::Extern => ItemKind::Extern(self.parse_extern(is_pub)),
             T::Trait => ItemKind::Trait(self.parse_trait(is_pub)),
             T::Impl => return self.parse_impl(start, attrs),
+            // `type` is a contextual keyword: only `type Name` at item position starts an alias,
+            // so `type` stays usable as an ordinary identifier everywhere else.
+            T::Ident if self.at_word(0, "type") && self.nth(1) == T::Ident => {
+                ItemKind::TypeAlias(self.parse_type_alias(is_pub))
+            }
             _ => {
                 let sp = self.span();
                 self.error(
@@ -214,9 +219,30 @@ impl Parser<'_> {
 
     /// Is the token `n` ahead the identifier `self`?
     fn at_self_word(&self, n: usize) -> bool {
+        self.at_word(n, "self")
+    }
+
+    /// Is the token `n` ahead the identifier spelled `word`?
+    fn at_word(&self, n: usize, word: &str) -> bool {
         self.nth(n) == T::Ident && {
             let sp = self.tokens[self.pos + n].span;
-            &self.src[sp.lo as usize..sp.hi as usize] == "self"
+            &self.src[sp.lo as usize..sp.hi as usize] == word
+        }
+    }
+
+    /// `type Name<params>? = Type;` (the `;` is optional, as after a `const`).
+    fn parse_type_alias(&mut self, is_pub: bool) -> TypeAliasDecl {
+        self.bump(); // type
+        let name = self.ident();
+        let generics = self.parse_generics();
+        self.expect(T::Eq);
+        let ty = self.parse_type();
+        self.eat(T::Semi);
+        TypeAliasDecl {
+            name,
+            is_pub,
+            generics,
+            ty,
         }
     }
 

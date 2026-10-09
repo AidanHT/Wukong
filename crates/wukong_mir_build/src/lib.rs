@@ -4690,8 +4690,9 @@ impl FnLowerer<'_> {
                 _ => Ty::Error,
             },
             Unit => Ty::Unit,
-            // A function type is never a local's annotation (sema: E0411).
-            Int(_) | Fn { .. } => Ty::Error,
+            // A function type is never a local's annotation (sema: E0411), and an alias
+            // application is expanded by the driver before sema.
+            Int(_) | Fn { .. } | Generic { .. } => Ty::Error,
         }
     }
 

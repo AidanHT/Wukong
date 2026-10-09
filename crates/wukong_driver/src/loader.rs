@@ -38,8 +38,11 @@
 //! `NodeId` uniqueness across files is guaranteed by threading a watermark through
 //! [`wukong_parser::parse_module_tokens_from`] — see its doc comment.
 
+mod alias;
 mod case;
 mod resolve;
+
+pub(crate) use alias::expand_type_aliases;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

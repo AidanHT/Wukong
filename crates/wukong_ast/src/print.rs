@@ -136,6 +136,16 @@ impl AstPrinter<'_> {
                     None => format!("fn({})", parts.join(", ")),
                 }
             }
+            TypeKind::Generic { path, args } => {
+                let parts: Vec<_> = args
+                    .iter()
+                    .map(|a| match a {
+                        TypeArg::Type(t) => self.type_str(t),
+                        TypeArg::Dim(d) => self.dim_str(d),
+                    })
+                    .collect();
+                format!("{}<{}>", self.path_str(path, "::"), parts.join(", "))
+            }
         }
     }
 
@@ -313,6 +323,14 @@ impl AstPrinter<'_> {
                         ));
                     }
                 });
+            }
+            ItemKind::TypeAlias(a) => {
+                self.line(format!(
+                    "type {} = {}",
+                    self.sym(a.name.sym),
+                    self.type_str(&a.ty)
+                ));
+                self.indented(|p| p.generics(&a.generics));
             }
             ItemKind::Const(c) => {
                 self.line(format!(

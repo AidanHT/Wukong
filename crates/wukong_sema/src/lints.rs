@@ -234,7 +234,8 @@ pub fn run(
             | ItemKind::Import(_)
             | ItemKind::Extern(_)
             | ItemKind::Trait(_)
-            | ItemKind::Impl(_) => {}
+            | ItemKind::Impl(_)
+            | ItemKind::TypeAlias(_) => {}
         }
     }
     dead_code(module, interner, opts, &refs, &const_refs, &mut diags);
@@ -1026,6 +1027,15 @@ impl<'a> FnLint<'a> {
                     self.dim(d);
                 }
             }
+            // Expanded away by the driver before sema; only a direct caller can leave one.
+            TypeKind::Generic { args, .. } => {
+                for a in args {
+                    match a {
+                        TypeArg::Type(t) => self.type_expr(t),
+                        TypeArg::Dim(d) => self.dim(d),
+                    }
+                }
+            }
             TypeKind::Fn { params, ret } => {
                 for p in params {
                     self.type_expr(p);
@@ -1102,7 +1112,8 @@ impl<'a> FnLint<'a> {
             | TypeKind::Unit
             | TypeKind::Ref { .. }
             | TypeKind::Vector { .. }
-            | TypeKind::Fn { .. } => false,
+            | TypeKind::Fn { .. }
+            | TypeKind::Generic { .. } => false,
         }
     }
 

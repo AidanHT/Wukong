@@ -27,6 +27,20 @@ pub enum ItemKind {
     /// handles methods unchanged. This item records what sema needs to resolve `x.method(..)` /
     /// `Type::method(..)` and to check a trait implementation.
     Impl(ImplDecl),
+    /// `type Name = T;` / `type Mat<M, N> = Tensor[f32, M, N];` — a transparent name for a type.
+    /// The driver expands every use and removes these items before sema
+    /// (`wukong_driver::loader::alias`), so no later stage sees an alias.
+    TypeAlias(TypeAliasDecl),
+}
+
+/// A type alias. `generics` are the alias's parameters (a type, a dimension, or a `const N: T`);
+/// any trait bound written on one is ignored, since an alias is substituted, never instantiated.
+#[derive(Clone, Debug)]
+pub struct TypeAliasDecl {
+    pub name: Ident,
+    pub is_pub: bool,
+    pub generics: Vec<GenericParam>,
+    pub ty: TypeExpr,
 }
 
 /// A trait declaration. Each method is a signature-only [`FnDecl`]; a method that takes a receiver

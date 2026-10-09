@@ -814,6 +814,13 @@ impl Desugar<'_> {
         self.renumber(&mut t.id);
         match &mut t.kind {
             TypeKind::Path(_) | TypeKind::Int(_) | TypeKind::Unit => {}
+            TypeKind::Generic { args, .. } => {
+                for a in args {
+                    if let wukong_ast::TypeArg::Type(t) = a {
+                        self.refresh_ty(t);
+                    }
+                }
+            }
             TypeKind::Pointer { pointee, .. } | TypeKind::Ref { pointee, .. } => {
                 self.refresh_ty(pointee)
             }
