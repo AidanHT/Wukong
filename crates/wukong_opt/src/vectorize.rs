@@ -118,6 +118,11 @@
 //!     x1 WIDEN bb25 w=4 lin=12 guards=1 reds=0
 //! ```
 //!
+//! (Those lines predate two fields the line now ends with: `guards` counts point checks as well as
+//! pairs, and `cost=V/S` is the cost model's estimate for one group — vector operations against
+//! `W` scalar iterations, [`estimate_cost`]. The estimate is reported, not enforced; the one cost
+//! limit applied is [`MAX_GUARD_PAIRS`].)
+//!
 //! `bb19` is the loss's fused forward+backward pass, and it is the one the **lane ramp** unlocked:
 //! it reads its counter as a *value* (`if c == target`), which used to be a flat decline. See
 //! [`IvRamp`].
@@ -443,6 +448,9 @@ struct VecPlan {
     /// Is the lane-ramp vector needed? Not when every step reading the counter as a value is
     /// replicated: those take `i + k` per lane instead.
     ramp_vector: bool,
+    /// The cost model's estimate for one group, `(vector, scalar)` ([`estimate_cost`]). Reported
+    /// by `WUKONG_VEC_TRACE`; not a gate.
+    cost: (u64, u64),
 }
 
 /// The induction variable's second, lane-varying face.
@@ -646,12 +654,14 @@ fn pick(f: &Function, forest: &mut LoopForest, done: &FxHashSet<u32>) -> Option<
             Ok(p) => {
                 if trace {
                     eprintln!(
-                        "vectorize: WIDEN bb{} w={} lin={} guards={} reds={}",
+                        "vectorize: WIDEN bb{} w={} lin={} guards={} reds={} cost={}/{}",
                         p.header.0,
                         p.w,
                         p.lin.len(),
-                        p.guards.len(),
-                        p.reductions.len()
+                        p.guards.len() + p.point_guards.len(),
+                        p.reductions.len(),
+                        p.cost.0,
+                        p.cost.1
                     );
                 }
                 return Some(p);
@@ -870,6 +880,15 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
     let (guards, point_guards, guard_allows_equal) =
         plan_guards(f, l).ok_or("the runtime alias check cannot be expressed")?;
 
+    // ---- cost ---------------------------------------------------------------------------------
+    // The guard is evaluated on every entry to the loop — once per row of a row-wise inner loop —
+    // and grows with the square of the stream count, so it has a budget (LLVM's
+    // `-runtime-memory-check-threshold`). The rest of the model is an estimate, reported only.
+    if guards.len() + point_guards.len() > MAX_GUARD_PAIRS {
+        return Err("more runtime alias checks than one loop entry amortizes");
+    }
+    let cost = estimate_cost(f, &lin, &plans, &vector_ty, &reductions, body, w);
+
     Ok(VecPlan {
         header: l.header,
         body,
@@ -888,7 +907,114 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
         guard_allows_equal,
         ramp,
         ramp_vector,
+        cost,
     })
+}
+
+/// The most runtime pointer-range checks (pairs plus point checks) one widened loop may pay on
+/// entry — LLVM LoopVectorize's default `-runtime-memory-check-threshold`. Each check is a handful
+/// of address computations and two compares, and the count grows with the square of the number of
+/// streams; a loop entered once per row of a short row pays all of them every time.
+const MAX_GUARD_PAIRS: usize = 8;
+
+/// One pass through a loop's control: the counter step, the exit compare and the branch.
+const LOOP_OVERHEAD: u64 = 3;
+
+/// The cost model's estimate for one group of `w` iterations, as `(vector, scalar)`.
+///
+/// One unit per instruction, the default LLVM's TTI assigns the operations this pass emits: a
+/// widened step costs one per part, a replicated one a scalar operation plus a lane extract and a
+/// lane insert per lane, an interleave-group member a load or store and a shuffle per part, an
+/// if-converted store or merge a select (and a store) per part. A vector accumulator costs one per
+/// part; a serial fold an extract and a combine per lane, plus a lane test and a select when the
+/// accumulate is guarded. The scalar side is `w` passes through the original body, taking the
+/// longer arm of an if-converted branch, plus the loop overhead each.
+///
+/// It is **reported** (`WUKONG_VEC_TRACE`), not enforced: no table has been tuned against a
+/// same-run A/B with `WUKONG_NO_VECTORIZE`, and a model that declines loops on an untuned guess
+/// trades measured wins for an unmeasured hunch. [`MAX_GUARD_PAIRS`] is the one limit that needs no
+/// tuning to be right.
+fn estimate_cost(
+    f: &Function,
+    lin: &[LinInst],
+    plans: &[Plan],
+    vector_ty: &FxHashMap<u32, MirType>,
+    reductions: &[RedPlan],
+    latch: BlockId,
+    w: u32,
+) -> (u64, u64) {
+    let w64 = u64::from(w);
+    let parts = |t: &MirType| lanes_of(t).map_or(1, |l| u64::from((w / l).max(1)));
+    // The lane type a step produces (or stores): the widened type where the plan recorded one —
+    // a compare's mask, a merge's parameter — and the MIR type otherwise.
+    let ty_of = |v: ValueId| {
+        vector_ty
+            .get(&v.0)
+            .cloned()
+            .unwrap_or_else(|| f.value_type(v).clone())
+    };
+    let step_ty = |s: &LinInst| -> MirType {
+        match s {
+            LinInst::Real { block, idx } => {
+                let inst = &f.blocks[block.0 as usize].insts[*idx];
+                match (&inst.op, inst.result) {
+                    (Op::Store { value, .. }, _) => ty_of(*value),
+                    (_, Some(r)) => ty_of(r),
+                    (_, None) => MirType::I1,
+                }
+            }
+            LinInst::MaskedStore { then_val, .. } => ty_of(*then_val),
+            LinInst::Merge { param, .. } => ty_of(*param),
+        }
+    };
+
+    // Scalar: every real step once per iteration, except the shorter of two if-converted arms.
+    let entry = match lin.first() {
+        Some(LinInst::Real { block, .. }) => Some(block.0),
+        _ => None,
+    };
+    let mut per_block: FxHashMap<u32, u64> = FxHashMap::default();
+    for s in lin {
+        if let LinInst::Real { block, .. } = s {
+            *per_block.entry(block.0).or_default() += 1;
+        }
+    }
+    let arms: Vec<u64> = per_block
+        .iter()
+        .filter(|(b, _)| Some(**b) != entry && **b != latch.0)
+        .map(|(_, n)| *n)
+        .collect();
+    let skipped = if arms.len() == 2 {
+        arms.iter().copied().min().unwrap_or(0)
+    } else {
+        0
+    };
+    let total: u64 = per_block.values().sum();
+    let scalar = w64 * (total - skipped + LOOP_OVERHEAD);
+
+    let mut vector = LOOP_OVERHEAD;
+    for (s, plan) in lin.iter().zip(plans) {
+        vector += match plan {
+            Plan::Scalar => 1,
+            Plan::InvariantPtrLoad | Plan::Reduce => 0,
+            Plan::Widen | Plan::Cast(_) | Plan::VecLoad | Plan::VecStore | Plan::Merge => {
+                parts(&step_ty(s))
+            }
+            Plan::MaskedStore | Plan::GroupLoad { .. } | Plan::GroupStore { .. } => {
+                2 * parts(&step_ty(s))
+            }
+            Plan::Replicate | Plan::LaneGep | Plan::Gather => 3 * w64,
+        };
+    }
+    for r in reductions {
+        let guarded = u64::from(r.guard.is_some());
+        vector += if r.vector_acc {
+            parts(&r.ty) * (1 + guarded)
+        } else {
+            w64 * (2 + 2 * guarded)
+        };
+    }
+    (vector, scalar)
 }
 
 /// Flatten the loop body into one straight line, if-converting a conditional region.
@@ -5062,6 +5188,40 @@ mod tests {
                    while i < n { if x[i] > m { m = x[i]; at = i; } i = i + 1; } return at; } \
                    fn main() -> i32 { return 0; }";
         assert!(!is_widened(src, "k"), "an argmax must stay scalar");
+    }
+
+    // ---- cost model ----------------------------------------------------------------------------
+
+    /// The runtime alias check grows with the square of the stream count and is paid on every
+    /// entry, so it has a budget of eight checks. Eight unrelated input slices beside one output
+    /// slice need exactly eight (each input against the output) and still widen; a ninth input
+    /// makes it nine, and the same loop stays scalar.
+    #[test]
+    fn the_runtime_alias_check_budget_is_eight() {
+        let params = |k: usize| (0..k).map(|j| format!("x{j}: []f32, ")).collect::<String>();
+        let sum = |k: usize| {
+            (0..k)
+                .map(|j| format!("x{j}[i]"))
+                .collect::<Vec<_>>()
+                .join(" + ")
+        };
+        let kernel = |k: usize| {
+            format!(
+                "fn k({}mut o: []f32, n: i64) {{ let mut i: i64 = 0; \
+                 while i < n {{ o[i] = {}; i = i + 1; }} }} \
+                 fn main() -> i32 {{ return 0; }}",
+                params(k),
+                sum(k)
+            )
+        };
+        assert!(
+            is_widened(&kernel(8), "k"),
+            "eight alias checks are within the budget"
+        );
+        assert!(
+            !is_widened(&kernel(9), "k"),
+            "nine alias checks must not be paid on every entry"
+        );
     }
 
     // ---- cases that must be declined -----------------------------------------------------------

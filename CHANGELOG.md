@@ -19,6 +19,11 @@ All notable changes to Wukong are documented here. The format is loosely based o
   lane-wide and each lane keeps `c ? s ⊕ x : s` — blended per part for an integer accumulator,
   selected per lane in the in-order float fold — with no identity element, so a running `-0.0` or a
   NaN payload is never altered. An argmax-style branch that also records an index stays scalar.
+- **A runtime-check budget for the vectorizer.** A widened loop pays its pointer-range checks on
+  every entry and their number grows with the square of the stream count; a loop needing more than
+  eight (LLVM's default threshold) now stays scalar. `WUKONG_VEC_TRACE` reports a per-group cost
+  estimate (`cost=vector/scalar`) on every `WIDEN` line; it is not yet a gate, pending a same-run
+  A/B against `WUKONG_NO_VECTORIZE`.
 
 ### Type soundness and patterns (`gap2/type-soundness-and-patterns`)
 
