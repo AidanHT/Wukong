@@ -450,6 +450,7 @@ impl Sema<'_> {
     pub(crate) fn partial_index_type(
         &mut self,
         elem: Scalar,
+        elem_var: Option<Symbol>,
         shape: &Shape,
         layout: &Layout,
         indices: usize,
@@ -473,6 +474,7 @@ impl Sema<'_> {
             elem,
             shape: Shape(shape.0[indices..].to_vec()),
             layout: Layout::Contiguous,
+            elem_var,
         }
     }
 
@@ -563,6 +565,7 @@ impl Sema<'_> {
             elem: te,
             shape: ts,
             layout: tl,
+            elem_var: tv,
         } = to
         else {
             return false;
@@ -570,15 +573,21 @@ impl Sema<'_> {
         if from == to {
             return true;
         }
-        let (fe, fdims, src_contiguous): (Scalar, Vec<Dim>, bool) = match from {
+        let (fe, fv, fdims, src_contiguous): (Scalar, Option<Symbol>, Vec<Dim>, bool) = match from {
             Ty::Tensor {
                 elem,
                 shape,
                 layout,
-            } => (*elem, shape.0.clone(), *layout == Layout::Contiguous),
+                elem_var,
+            } => (
+                *elem,
+                *elem_var,
+                shape.0.clone(),
+                *layout == Layout::Contiguous,
+            ),
             // A fixed-size array is a row-major buffer of `len` elements.
             Ty::Array { elem, len, .. } => match elem.as_ref() {
-                Ty::Scalar(s) => (*s, vec![Dim::Const(*len)], true),
+                Ty::Scalar(s) => (*s, None, vec![Dim::Const(*len)], true),
                 _ => {
                     self.error(
                         span,
@@ -605,15 +614,17 @@ impl Sema<'_> {
             );
             return true;
         }
-        if fe != *te {
+        if !crate::dtype::tensor_elems_agree((fe, fv), (*te, *tv)) {
+            let (src_elem, dst_elem) = (
+                self.tensor_elem_name(fe, fv),
+                self.tensor_elem_name(*te, *tv),
+            );
             self.error(
                 span,
                 "E0502",
                 format!(
-                    "a reshape cannot convert elements: the source holds `{}` and the target \
-                     `{}`; convert elements in a loop",
-                    fe.name(),
-                    te.name()
+                    "a reshape cannot convert elements: the source holds `{src_elem}` and the \
+                     target `{dst_elem}`; convert elements in a loop"
                 ),
             );
             return true;
@@ -752,6 +763,7 @@ impl Sema<'_> {
                             elem: sc,
                             shape: Shape(vec![dim]),
                             layout: Layout::Contiguous,
+                            elem_var: None,
                         };
                     }
                 }

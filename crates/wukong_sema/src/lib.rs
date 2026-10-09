@@ -30,6 +30,7 @@ mod attrs;
 pub use attrs::{parallel_grain, MAX_PARALLEL_GRAIN};
 mod builtins;
 mod dependency;
+mod dtype;
 mod entry;
 mod infer;
 mod instantiate;
@@ -1292,11 +1293,15 @@ impl<'a> Sema<'a> {
                 }
             },
             TypeKind::Tensor { elem, dims, layout } => {
-                let elem_ty = match self.lower_type(elem) {
-                    Ty::Scalar(s) => s,
+                // The element is a scalar, or a type parameter of the enclosing function — a
+                // dtype-generic tensor, `Tensor[T, M, N]`, which each instantiation makes concrete
+                // (`dtype.rs`). A struct, tuple or other aggregate element is still `E0302`.
+                let (elem_ty, elem_var) = match self.lower_type(elem) {
+                    Ty::Scalar(s) => (s, None),
+                    Ty::Named(n) if self.generics.contains(&n) => (Scalar::F32, Some(n)),
                     _ => {
                         self.error(t.span, "E0302", "a tensor element must be a scalar type");
-                        Scalar::F32
+                        (Scalar::F32, None)
                     }
                 };
                 // `lower_dim` now reports an undeclared dim name, so it needs `&mut self` — a plain
@@ -1316,6 +1321,7 @@ impl<'a> Sema<'a> {
                     elem: elem_ty,
                     shape,
                     layout,
+                    elem_var,
                 }
             }
             TypeKind::Fn { params, ret } => {
@@ -3106,15 +3112,17 @@ impl<'a> Sema<'a> {
                         elem,
                         shape,
                         layout,
+                        elem_var,
                     } => match shape.rank() {
                         0 => Ty::Unknown,
                         1 if matches!(layout, Layout::Contiguous | Layout::ColMajor) => {
-                            Ty::Scalar(elem)
+                            dtype::tensor_elem_ty(elem, elem_var)
                         }
                         _ if layout == Layout::Contiguous => Ty::Tensor {
                             elem,
                             shape: Shape(shape.0[1..].to_vec()),
                             layout: Layout::Contiguous,
+                            elem_var,
                         },
                         _ => Ty::Unknown,
                     },

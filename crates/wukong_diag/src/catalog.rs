@@ -411,6 +411,19 @@ static CATALOG: &[Explanation] = &[
         good: "module ex.e0324\nfn main() -> i32 {\n    let x: f32 = 2.5;\n    return x as i32;\n}\n"
     ),
     entry!(
+        "E0325",
+        "invalid element type for `alloc::<T>`",
+        "The generic heap allocator `alloc::<T>(n)` returns a zeroed `[]T` of `n` elements, and \
+         takes exactly one element type: a scalar (`alloc::<f32>(n)`, the same buffer as \
+         `alloc_f32(n)`) or a type parameter of the enclosing function (`alloc::<T>(n)` inside \
+         `fn f<T, N>(x: Tensor[T, N])`, which each instantiation makes concrete). A missing \
+         element type, more than one, or a struct, tuple or array element is this error: a heap \
+         buffer holds scalars. Allocate one buffer per scalar field, or an array of the scalar \
+         and index it with a stride.",
+        bad: "module ex.e0325\nstruct Point { x: f32, y: f32 }\nfn main() -> i32 {\n    let b = alloc::<Point>(4);\n    free(b);\n    return 0;\n}\n",
+        good: "module ex.e0325\nfn main() -> i32 {\n    let b = alloc::<i32>(4);\n    let n = b.len();\n    free(b);\n    return n as i32;\n}\n"
+    ),
+    entry!(
         "E0330",
         "import path differs from the file only in letter case",
         "An `import` names a file that exists, but only under a different capitalization: \

@@ -5,6 +5,16 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Generics and dtypes (`gap2/generics-and-dtype`)
+
+- **Every instantiation of a generic function is type-checked.** A generic body was checked once
+  with `T` opaque, so `add(p, q)` on two structs compiled and lowered `a + b` on struct pointers;
+  each concrete instantiation is now checked again, and an error points into the generic body with
+  a "required by this instantiation of `add` with T = Point" label on the call.
+- **Tensors may be generic over their element type.** `fn axpy<T, N>(a: T, x: Tensor[T, N], mut y:
+  Tensor[T, N])` (was `E0302`) is compiled once per element type, and `alloc::<T>(n)` is the generic
+  heap allocator (`E0325` for a non-scalar element).
+
 ### Execution at model scale (`gap2/execution-at-model-scale`)
 
 - **The interpreter is stackless.** A Wukong call (and a `wukong_parallel_for` body) pushes a frame

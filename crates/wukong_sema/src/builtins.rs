@@ -590,6 +590,7 @@ const FIXED_BUILTINS: &[&str] = &[
     "println",
     "assert",
     "free",
+    "alloc",
     "now_ns",
     "sync_block",
     "scratch_mark",
@@ -623,6 +624,7 @@ pub fn is_builtin_callee(name: &str) -> bool {
         || crate::heap_alloc_elem(name).is_some()
         || crate::scratch_alloc_elem(name).is_some()
         || name == "free"
+        || name == "alloc"
         || crate::is_scratch_mark(name)
         || crate::is_scratch_release(name)
         || crate::ml_builtin(name).is_some()
@@ -880,16 +882,19 @@ impl Sema<'_> {
                 elem,
                 shape,
                 layout,
+                elem_var,
             } => {
                 let mut ok = true;
-                if *elem != Scalar::F32 {
+                // A dtype-generic element (`Tensor[T, ..]`) is not known to be `f32`, and the call
+                // is recorded once for the generic body, so it cannot take the `f32` kernel.
+                if *elem != Scalar::F32 || elem_var.is_some() {
+                    let found = self.tensor_elem_name(*elem, *elem_var);
                     self.error(
                         span,
                         "E0502",
                         format!(
                             "tensor element type mismatch: operand `{pname}` of `{builtin}` must \
-                             hold `f32`, found `{}`",
-                            elem.name()
+                             hold `f32`, found `{found}`"
                         ),
                     );
                     ok = false;

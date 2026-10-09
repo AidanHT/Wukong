@@ -1,0 +1,23 @@
+// EXPECT-CODE: E0502
+module tests.fail.dtype_generic_instance_elem
+
+// The generic body hands its `Tensor[T, N]` to a function that takes `f32` elements. That is
+// undecidable while `T` is opaque, so the generic pass lets it through; the instantiation at
+// `T = i32` is checked again and the call is an element-type mismatch, labelled with the call in
+// `main` that required the instance.
+fn scale_f32<N>(mut x: Tensor[f32, N]) {
+    for i in 0..N {
+        x[i] = x[i] * 2.0;
+    }
+}
+
+fn twice<T, N>(mut x: Tensor[T, N]) {
+    scale_f32(x);
+}
+
+fn main() -> i32 {
+    let mut a: [i32; 3] = [1, 2, 3];
+    twice(a);
+    print(a[0]);
+    return 0;
+}

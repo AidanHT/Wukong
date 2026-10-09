@@ -294,6 +294,13 @@ pub enum Ty {
         elem: Scalar,
         shape: Shape,
         layout: Layout,
+        /// A **dtype-generic** element: `Some(T)` for `Tensor[T, M, N]` where `T` is a type
+        /// parameter of the enclosing function. `elem` is then a placeholder that means nothing; a
+        /// substitution of `T` replaces the pair with the concrete element (and `None`), so every
+        /// type a backend lowers carries `None`. Keeping the scalar field a `Scalar` means only the
+        /// code that sees a generic body (the checker's opaque-`T` pass and the monomorphizer's
+        /// substitution) has to know this field exists.
+        elem_var: Option<Symbol>,
     },
     /// A named (struct/enum) type, identified by its interned name.
     Named(Symbol),
@@ -435,8 +442,16 @@ impl Ty {
                 format!("({})", parts.join(", "))
             }
             Ty::Vector { elem, lanes } => format!("{}x{}", elem.name(), lanes),
-            Ty::Tensor { elem, shape, .. } => {
-                let mut parts = vec![elem.name().to_string()];
+            Ty::Tensor {
+                elem,
+                shape,
+                elem_var,
+                ..
+            } => {
+                let mut parts = vec![match elem_var {
+                    Some(v) => interner.resolve(*v).to_string(),
+                    None => elem.name().to_string(),
+                }];
                 for d in &shape.0 {
                     parts.push(d.display(interner));
                 }
@@ -693,8 +708,18 @@ mod tests {
             elem: Scalar::F32,
             shape: Shape(vec![Dim::Var(m), Dim::Var(n)]),
             layout: Layout::Contiguous,
+            elem_var: None,
         };
         assert_eq!(t.display(&i), "Tensor[f32, M, N]");
+        // A dtype-generic element displays as its type parameter.
+        let tv = i.intern("T");
+        let g = Ty::Tensor {
+            elem: Scalar::F32,
+            shape: Shape(vec![Dim::Var(m)]),
+            layout: Layout::Contiguous,
+            elem_var: Some(tv),
+        };
+        assert_eq!(g.display(&i), "Tensor[T, M]");
     }
 
     fn v(s: Symbol) -> Dim {

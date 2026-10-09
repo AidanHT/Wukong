@@ -168,6 +168,32 @@ function cannot be bound to a `let` or passed to a non-function parameter; the a
 function, not compute one; and a function-typed parameter is neither `mut` nor named after a builtin
 (`gelu`, `print`, …). A wrong signature is the ordinary `E0401` type mismatch. `tests/run/fn_params.wk`.
 
+### Generic functions and dtype-generic tensors ✅
+
+A type parameter (`fn add<T>(a: T, b: T) -> T`) is bound at each call from the arguments, and the
+function is compiled once per distinct binding (`add$f32`, `add$i64`). The body is type-checked with
+`T` opaque, and **every instantiation is checked again at its concrete types**: `add(p, q)` with
+`p, q: Point` is `E0433` at `a + b`, with a secondary label "required by this instantiation of `add`
+with T = Point" on the call (`tests/fail/generic_instantiation_bad_op.wk`). Instantiations reached
+through another generic are checked too (`tests/fail/generic_instantiation_transitive.wk`).
+
+A tensor's **element** may be a type parameter, so one kernel serves every dtype:
+
+```wukong
+fn axpy<T, N>(a: T, x: Tensor[T, N], mut y: Tensor[T, N]) {
+    for i in 0..N { y[i] = a * x[i] + y[i]; }
+}
+```
+
+`T` is bound from a tensor argument's element (or a decaying array's scalar element), indexing a
+`Tensor[T, ..]` yields a `T`, and each instance (`axpy$f32`, `axpy$bf16`) is lowered with the
+concrete element in every tensor type (`tests/run/dtype_generic_tensor.wk`). An array of structs fed to a
+`Tensor[T, ..]` parameter is `E0502` (a tensor element is a scalar). A named kernel builtin
+(`matmul`, `softmax`, …) takes `f32` buffers and a file-I/O builtin one fixed element type, so
+neither accepts a `Tensor[T, ..]` operand inside a generic body. `alloc::<T>(n)` is the generic heap
+allocator — a zeroed `[]T`, the same buffer `alloc_<T>(n)` returns, with `T` a scalar or a type
+parameter (anything else is `E0325`).
+
 ## Name resolution ✅
 
 Every name a program uses resolves, or the program is rejected with a resolution code — a typo is

@@ -325,10 +325,12 @@ impl Sema<'_> {
         let ok = match ty {
             Ty::Slice(e) => **e == want,
             Ty::Array { elem: e, .. } => **e == want,
+            // A dtype-generic tensor (`elem_var: Some`) holds no fixed element: not this one.
             Ty::Tensor {
                 elem: e,
                 shape,
                 layout,
+                elem_var: None,
             } if *e == elem => {
                 if *layout != Layout::Contiguous {
                     self.error(

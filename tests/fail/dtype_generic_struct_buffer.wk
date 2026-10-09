@@ -1,0 +1,17 @@
+// EXPECT-CODE: E0502
+module tests.fail.dtype_generic_struct_buffer
+
+// A dtype-generic tensor parameter takes its element type from the argument, and a tensor element
+// must be a scalar: an array of structs binds nothing for `T`. Without this check the call would
+// be accepted with `T` unbound and reach lowering with no instance to call.
+struct Point { x: f32, y: f32 }
+
+fn count<T, N>(x: Tensor[T, N]) -> i64 {
+    return x.len();
+}
+
+fn main() -> i32 {
+    let ps: [Point; 2] = [Point { x: 1.0, y: 2.0 }, Point { x: 3.0, y: 4.0 }];
+    print(count(ps));
+    return 0;
+}

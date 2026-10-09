@@ -87,6 +87,13 @@ fn collect_named(ty: &Ty, generics: &[Symbol], out: &mut Vec<Symbol>) {
             }
             collect_named(ret, generics, out);
         }
+        Ty::Tensor {
+            elem_var: Some(g), ..
+        } => {
+            if generics.contains(g) && !out.contains(g) {
+                out.push(*g);
+            }
+        }
         _ => {}
     }
 }
@@ -135,6 +142,7 @@ impl<'a> Sema<'a> {
             Ty::Fn { params, ret } => {
                 params.iter().all(|p| self.is_concrete_ty(p)) && self.is_concrete_ty(ret)
             }
+            Ty::Tensor { elem_var, .. } => elem_var.is_none(),
             _ => true,
         }
     }
