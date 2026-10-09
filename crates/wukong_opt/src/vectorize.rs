@@ -582,6 +582,16 @@ struct RedPlan {
     /// That is a `W`-long dependent chain per group either way, which is exactly what `gcc -O3`
     /// emits without `-ffast-math`.
     vector_acc: bool,
+    /// An argmax/argmin (`if x > m { m = x; at = i; }`): the recorded index's header parameter
+    /// index and type. Always with [`Self::vector_acc`]: the pair is kept as per-lane `(value,
+    /// index)` partials — parts of `ty` for the value, then parts of the index type — and combined
+    /// once on the way out by [`emit_arg_combine`].
+    arg: Option<(usize, MirType)>,
+    /// A FindLastIV (`if c { last = i }`, [`RedKind::FindLast`]): per-lane partials holding the
+    /// last counter each lane recorded, started one below the vector loop's first counter so that
+    /// "never recorded" is distinguishable from every real one; [`emit_find_last_combine`] folds
+    /// them on the way out. Always with [`Self::vector_acc`] and a [`Self::guard`].
+    find_last: bool,
 }
 
 /// One pair of bases the vector loop is only legal over if they are equal or disjoint.
@@ -857,7 +867,21 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
     if !carried_values_are_handled(l, iv.param_index) {
         return Err("a carried value is neither the primary IV, a reduction nor invariant");
     }
-    let iv_value_use = classify_iv_uses(f, &lin, iv.value)
+    // An argmax's index merge records the counter itself; its fold reads the lane ramp directly.
+    let arg_merges: FxHashSet<u32> = l
+        .reductions
+        .iter()
+        .filter_map(|r| r.arg)
+        .filter(|a| a.index == iv.value)
+        .map(|a| a.merge.0)
+        .chain(
+            l.reductions
+                .iter()
+                .filter(|r| r.kind == RedKind::FindLast && r.combine == iv.value)
+                .filter_map(|r| r.merge.map(|m| m.0)),
+        )
+        .collect();
+    let iv_value_use = classify_iv_uses(f, &lin, iv.value, &arg_merges)
         .ok_or("the induction variable is used for something other than addressing")?;
     let (groups, member) = interleave_groups(l)?;
     access_shape_verdict(l, &member)?;
@@ -1107,7 +1131,10 @@ fn estimate_cost(
     }
     for r in reductions {
         let guarded = u64::from(r.guard.is_some());
-        vector += if r.vector_acc {
+        vector += if let Some((_, ity)) = &r.arg {
+            // A compare and a select per value part, a select per index part.
+            2 * parts(&r.ty) + parts(ity)
+        } else if r.vector_acc {
             parts(&r.ty) * (1 + guarded)
         } else {
             w64 * (2 + 2 * guarded)
@@ -1753,7 +1780,12 @@ fn carried_values_are_handled(l: &NaturalLoop, primary_param: usize) -> bool {
 /// is same-run and adjacent, so the two arms of "what did the ramp buy" have to be one binary. It
 /// is strictly a *narrowing* switch — a loop it turns off is one this pass declined before the ramp
 /// existed — so no program can compute a different answer under it.
-fn classify_iv_uses(f: &Function, lin: &[LinInst], iv: ValueId) -> Option<FxHashSet<usize>> {
+fn classify_iv_uses(
+    f: &Function,
+    lin: &[LinInst],
+    iv: ValueId,
+    arg_merges: &FxHashSet<u32>,
+) -> Option<FxHashSet<usize>> {
     let no_ramp = std::env::var_os("WUKONG_NO_IV_RAMP").is_some();
     let mut index: FxHashSet<u32> = FxHashSet::default();
     index.insert(iv.0);
@@ -1788,6 +1820,9 @@ fn classify_iv_uses(f: &Function, lin: &[LinInst], iv: ValueId) -> Option<FxHash
                 }
                 continue;
             }
+            // An argmax's index merge (`at = c ? i : at`) is folded with its reduction, which
+            // takes the counter's lane ramp itself ([`RedPlan::arg`]).
+            LinInst::Merge { param, .. } if arg_merges.contains(&param.0) => continue,
             LinInst::Merge {
                 cond,
                 then_arg,
@@ -2190,7 +2225,10 @@ fn plan_body(
             );
             (a, left_is_acc)
         });
-        red_of.insert(r.combine.0);
+        // A FindLast's "combine" is the counter itself, which is not an instruction of the body.
+        if r.kind != RedKind::FindLast {
+            red_of.insert(r.combine.0);
+        }
         if let Some(s) = r.select {
             red_cmp.insert(s.cmp.0);
         }
@@ -2223,10 +2261,41 @@ fn plan_body(
         // same `Op::Bin` the elementwise path emits, so it is the same question `bin_widenable`
         // answers — an `i8` product has no packed form, and a reduction is not exempt from that.
         // Such a reduction still widens; it just takes the serial fold, whose combine is scalar.
-        let vector_acc = r.reassociable
-            && r.addend.is_some()
-            && red_identity(r.kind, &ty).is_some()
-            && vector_combinable(r.kind, &ty);
+        // An argmax/argmin keeps per-lane `(value, index)` partials, which reproduce the scalar
+        // loop's answer only under three conditions ([`emit_arg_combine`] has the argument): the
+        // compare is strict, so a tie keeps the earlier element; the update is the `then` arm, so a
+        // NaN (every ordered compare false) never updates; and the index is this loop's counter,
+        // so a later iteration always records a later index. Anything else stays scalar.
+        let arg = match r.arg {
+            None => None,
+            Some(a) => {
+                let s = r.select?;
+                let strict = matches!(
+                    s.pred,
+                    CmpOp::Sgt | CmpOp::Slt | CmpOp::Ugt | CmpOp::Ult | CmpOp::Fogt | CmpOp::Folt
+                );
+                let value_ok = match &ty {
+                    MirType::F32 | MirType::F64 => true,
+                    t => t.is_int() && lane_bytes(t).is_some_and(|b| b <= 4),
+                };
+                if !strict || s.acc_is_then || a.index != ramp.iv || !value_ok {
+                    return None;
+                }
+                red_of.insert(a.merge.0);
+                Some((a.param_index, f.value_type(a.param).clone()))
+            }
+        };
+        // FindLastIV records this loop's own counter; any other induction variable stays scalar.
+        let find_last = r.kind == RedKind::FindLast;
+        if find_last && (r.combine != ramp.iv || guard.is_none()) {
+            return None;
+        }
+        let vector_acc = arg.is_some()
+            || find_last
+            || (r.reassociable
+                && r.addend.is_some()
+                && red_identity(r.kind, &ty).is_some()
+                && vector_combinable(r.kind, &ty));
         reductions.push(RedPlan {
             param_index: r.param_index,
             kind: r.kind,
@@ -2236,6 +2305,8 @@ fn plan_body(
             guard,
             ty,
             vector_acc,
+            arg,
+            find_last,
         });
     }
 
@@ -2799,6 +2870,8 @@ fn plan_body(
             }
         }
         match (r.addend, r.fma_factors) {
+            // A FindLast's addend is the counter, which it reads through the lane ramp.
+            _ if r.find_last => {}
             (Some((a, _)), None) => {
                 // Never the induction variable's address face, nor anything computed from it while
                 // it was uniform: those are one scalar for the group but differ per lane.
@@ -2824,6 +2897,8 @@ fn plan_body(
             _ => return None,
         }
     }
+    // An argmax's index partials are updated from the counter's lane ramp.
+    let ramp_vector = ramp_vector || reductions.iter().any(|r| r.arg.is_some() || r.find_last);
     Some(BodyPlan {
         plans,
         vector_ty,
@@ -3270,6 +3345,11 @@ fn apply(f: &mut Function, p: &VecPlan) {
         for _ in 0..parts_of(&r.ty, p.w) {
             vh_params.push(e.value(part_ty(&r.ty)));
         }
+        if let Some((_, ity)) = &r.arg {
+            for _ in 0..parts_of(ity, p.w) {
+                vh_params.push(e.value(part_ty(ity)));
+            }
+        }
     }
     let vh = e.block(vh_params.clone(), Terminator::Unreachable);
     let vb = e.block(Vec::new(), Terminator::Unreachable);
@@ -3289,6 +3369,34 @@ fn apply(f: &mut Function, p: &VecPlan) {
     let vec_end = e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Add, start, n_vec));
     let mut guard_args = guard_params.clone();
     for r in &vacc {
+        // An argmax's partials need no identity: every lane starts at the scalar loop's own
+        // `(m, at)`, which is exactly the state each lane's sub-sequence starts from.
+        if let Some((ai, ity)) = &r.arg {
+            let m0 = e.push(
+                guard,
+                part_ty(&r.ty),
+                Op::Splat(guard_params[r.param_index]),
+            );
+            for _ in 0..parts_of(&r.ty, p.w) {
+                guard_args.push(m0);
+            }
+            let a0 = e.push(guard, part_ty(ity), Op::Splat(guard_params[*ai]));
+            for _ in 0..parts_of(ity, p.w) {
+                guard_args.push(a0);
+            }
+            continue;
+        }
+        if r.find_last {
+            // One below the first counter: no lane can record it, since every recorded counter lies
+            // in `start .. start + n_vec` (wrapping arithmetic keeps that true at the type's ends).
+            let one = e.int(guard, &r.ty, 1);
+            let below = e.push(guard, r.ty.clone(), Op::Bin(BinOp::Sub, start, one));
+            let none = e.push(guard, part_ty(&r.ty), Op::Splat(below));
+            for _ in 0..parts_of(&r.ty, p.w) {
+                guard_args.push(none);
+            }
+            continue;
+        }
         let id = red_identity(r.kind, &r.ty).expect("vector_acc implies an identity");
         let scalar = e.push(guard, r.ty.clone(), Op::ConstInt(id as i128, r.ty.clone()));
         let identity = e.push(guard, part_ty(&r.ty), Op::Splat(scalar));
@@ -3332,6 +3440,21 @@ fn apply(f: &mut Function, p: &VecPlan) {
         let n = parts_of(&r.ty, p.w);
         let parts = vh_params[next_param..next_param + n].to_vec();
         next_param += n;
+        if let Some((ai, ity)) = &r.arg {
+            let na = parts_of(ity, p.w);
+            let at_parts = vh_params[next_param..next_param + na].to_vec();
+            next_param += na;
+            let (m, at) = emit_arg_combine(&mut e, vx, r, ity, &parts, &at_parts, start);
+            exit_args[r.param_index] = m;
+            exit_args[*ai] = at;
+            continue;
+        }
+        if r.find_last {
+            let prior = exit_args[r.param_index];
+            exit_args[r.param_index] =
+                emit_find_last_combine(&mut e, vx, &r.ty, &parts, start, prior);
+            continue;
+        }
         let mut vec = parts[0];
         for &q in &parts[1..] {
             vec = emit_combine(&mut e, vx, r, true, vec, q, &part_ty(&r.ty));
@@ -3967,6 +4090,69 @@ fn emit_body(
     let mut vacc_next: Vec<ValueId> = Vec::new();
     let header_len = header_params.len();
     for r in &p.reductions {
+        if let Some((_, ity)) = &r.arg {
+            // An argmax: per part, the loop's own compare with the partial maximum in the
+            // accumulator's position, a select of the value, and a select of the counter's lane
+            // ramp into the index partials under the same lane mask — lane `k` runs exactly the
+            // scalar loop's update over iterations `k, k + W, k + 2W, ..`.
+            let s = r.select.expect("an argmax is a min/max");
+            let n = parts_of(&r.ty, p.w);
+            let na = parts_of(ity, p.w);
+            let first = header_len + vacc_next.len();
+            let cur = vh_params[first..first + n].to_vec();
+            let cur_at = vh_params[first + n..first + n + na].to_vec();
+            let (a, _) = r.addend.expect("an argmax has a compared value");
+            let xs = to_vector(e, vb, &map, a, &r.ty, p.w);
+            let pty = part_ty(&r.ty);
+            let mty = vec_of(
+                &mask_lane(&r.ty),
+                lanes_of(&r.ty).expect("a widened reduction type"),
+            );
+            let mut masks = Vec::with_capacity(n);
+            for (&acc, &x) in cur.iter().zip(&xs) {
+                let (l, rhs) = if s.acc_left_in_cmp {
+                    (acc, x)
+                } else {
+                    (x, acc)
+                };
+                let c = e.push(vb, mty.clone(), Op::Cmp(s.pred, l, rhs));
+                masks.push(c);
+                vacc_next.push(e.push(vb, pty.clone(), Op::Select(c, x, acc)));
+            }
+            let mut mmap: FxHashMap<u32, Wide> = FxHashMap::default();
+            mmap.insert(s.cmp.0, Wide::Vector(masks));
+            let at_masks = mask_for(e, vb, &mmap, s.cmp, ity);
+            let ramp = ramp.as_ref().expect("an argmax builds the lane ramp");
+            let ity_part = part_ty(ity);
+            for k in 0..na {
+                vacc_next.push(e.push(
+                    vb,
+                    ity_part.clone(),
+                    Op::Select(at_masks[k], ramp[k], cur_at[k]),
+                ));
+            }
+            continue;
+        }
+        if r.find_last {
+            // Lane `k` keeps the counter of the last iteration in its sub-sequence whose condition
+            // held: the scalar merge, with the counter's lane ramp as the recorded value.
+            let n = parts_of(&r.ty, p.w);
+            let first = header_len + vacc_next.len();
+            let cur = vh_params[first..first + n].to_vec();
+            let (cond, on_true) = r.guard.expect("a FindLast is a guarded reduction");
+            let mask = mask_for(e, vb, &map, cond, &r.ty);
+            let ramp = ramp.as_ref().expect("a FindLast builds the lane ramp");
+            let pty = part_ty(&r.ty);
+            for k in 0..n {
+                let (a, b) = if on_true {
+                    (ramp[k], cur[k])
+                } else {
+                    (cur[k], ramp[k])
+                };
+                vacc_next.push(e.push(vb, pty.clone(), Op::Select(mask[k], a, b)));
+            }
+            continue;
+        }
         if r.vector_acc {
             let n = parts_of(&r.ty, p.w);
             let first = header_len + vacc_next.len();
@@ -4035,11 +4221,9 @@ fn emit_body(
             out.push(e.push(vb, p.iv_ty.clone(), Op::Bin(BinOp::Add, vh_params[k], step)));
         } else if let Some(&acc) = acc_of.get(&k) {
             out.push(acc);
-        } else if p
-            .reductions
-            .iter()
-            .any(|r| r.vector_acc && r.param_index == k)
-        {
+        } else if p.reductions.iter().any(|r| {
+            r.vector_acc && (r.param_index == k || r.arg.as_ref().is_some_and(|a| a.0 == k))
+        }) {
             // The scalar accumulator of a vector-accumulated reduction is carried unchanged; the
             // partials live in the extra parameters appended below.
             out.push(vh_params[k]);
@@ -4116,6 +4300,117 @@ fn emit_exit_test(
 /// count steps instead of one extract per lane. A mask lane is all-ones natively and `1` in the
 /// interpreter, zero in both when false, so the bitwise fold and the `!= 0` test read the same truth
 /// on every backend. A condition that is uniform across the group is its own answer.
+/// Combine an argmax's per-lane `(value, index)` partials into the scalar `(m, at)` — once, in the
+/// vector exit — so that the result is bit-identical to the scalar loop's.
+///
+/// Lane `k` ran the scalar update `c ? (x, i) : (m, at)` over iterations `k, k + W, ..` from the
+/// loop's own start `(m0, a0)`; `plan_body` admitted only a strict compare with the update on its
+/// `then` arm. The scalar answer is then the **first** iteration whose value is strictly better
+/// than every earlier one and not beaten later — the earliest member of the best class (`-0.0`
+/// and `+0.0` are one class: neither is `>` the other) — or `(m0, a0)` when nothing beat `m0`.
+/// Every ordered compare against a NaN is false, so a NaN element never updates anything, and a
+/// NaN `m0` updates nothing at all.
+///
+/// Each lane holds the earliest member of its own best class, so the answer is the lane whose
+/// value is best, ties going to the lane whose index is **earlier**. The fold walks the lanes and
+/// takes lane `k` over the running `(M, A)` when the loop's own compare says `m_k` beats `M`, or
+/// when the two are equal (`==`, so `±0` tie) and `a_k` came first. Three cases close the argument:
+///
+/// * a lane that never updated still holds `(m0, a0)` bit for bit, and every lane that did holds
+///   a value strictly better than `m0` — so an un-updated lane only ever ties with another
+///   un-updated lane, and both are the same pair; the index compare never decides between `a0`
+///   and a real index;
+/// * between updated lanes the indices are distinct counter values from this vector loop, which
+///   are ordered by iteration once taken relative to its first counter: `(a - start)` as unsigned
+///   is the iteration number, wrap-around included;
+/// * a NaN never compares equal or better, so a NaN `m0` (every lane un-updated) leaves lane 0's
+///   pair — `(m0, a0)` — exactly as the scalar loop does.
+///
+/// The scalar epilogue then continues from `(M, A)` over the iterations after the vector loop's.
+fn emit_arg_combine(
+    e: &mut Emit<'_>,
+    vx: BlockId,
+    r: &RedPlan,
+    ity: &MirType,
+    val_parts: &[ValueId],
+    at_parts: &[ValueId],
+    start: ValueId,
+) -> (ValueId, ValueId) {
+    let s = r.select.expect("an argmax is a min/max");
+    let lanes = |e: &mut Emit<'_>, parts: &[ValueId], ty: &MirType| -> Vec<ValueId> {
+        let per = lanes_of(ty).expect("a widened lane type");
+        let mut out = Vec::new();
+        for &q in parts {
+            for k in 0..per {
+                out.push(e.push(vx, ty.clone(), Op::ExtractLane(q, k)));
+            }
+        }
+        out
+    };
+    let ms = lanes(e, val_parts, &r.ty);
+    let ats = lanes(e, at_parts, ity);
+    let eq = if r.ty.is_float() {
+        CmpOp::Foeq
+    } else {
+        CmpOp::Eq
+    };
+    let (mut m, mut at) = (ms[0], ats[0]);
+    for (&mk, &ak) in ms.iter().zip(&ats).skip(1) {
+        let (l, rhs) = if s.acc_left_in_cmp { (m, mk) } else { (mk, m) };
+        let better = e.push(vx, MirType::I1, Op::Cmp(s.pred, l, rhs));
+        let same = e.push(vx, MirType::I1, Op::Cmp(eq, mk, m));
+        let ok = e.push(vx, ity.clone(), Op::Bin(BinOp::Sub, ak, start));
+        let oa = e.push(vx, ity.clone(), Op::Bin(BinOp::Sub, at, start));
+        let earlier = e.push(vx, MirType::I1, Op::Cmp(CmpOp::Ult, ok, oa));
+        let tie = e.push(vx, MirType::I1, Op::Bin(BinOp::And, same, earlier));
+        let take = e.push(vx, MirType::I1, Op::Bin(BinOp::Or, better, tie));
+        m = e.push(vx, r.ty.clone(), Op::Select(take, mk, m));
+        at = e.push(vx, ity.clone(), Op::Select(take, ak, at));
+    }
+    (m, at)
+}
+
+/// Combine a FindLastIV's per-lane partials into the scalar `last` — once, in the vector exit.
+///
+/// Every lane started at `start - 1` and records only counters of the vector loop's own
+/// iterations, `start .. start + n_vec`. Shifted by one more, `q = at - (start - 1)` (wrapping) is
+/// `0` for a lane that recorded nothing and `j + 1` for one whose last record was iteration
+/// `start + j` — so the unsigned maximum of `q` over the lanes is the latest iteration any lane
+/// recorded, exactly the scalar loop's last record. `q == 0` everywhere means nothing was
+/// recorded, and the scalar value from before the loop (`prior`) stands — which is also what the
+/// scalar loop holds. No compare ever sees the start value against a recorded counter.
+fn emit_find_last_combine(
+    e: &mut Emit<'_>,
+    vx: BlockId,
+    ty: &MirType,
+    parts: &[ValueId],
+    start: ValueId,
+    prior: ValueId,
+) -> ValueId {
+    let one = e.int(vx, ty, 1);
+    let below = e.push(vx, ty.clone(), Op::Bin(BinOp::Sub, start, one));
+    let per = lanes_of(ty).expect("a widened lane type");
+    let mut best: Option<ValueId> = None;
+    for &q in parts {
+        for k in 0..per {
+            let at = e.push(vx, ty.clone(), Op::ExtractLane(q, k));
+            let off = e.push(vx, ty.clone(), Op::Bin(BinOp::Sub, at, below));
+            best = Some(match best {
+                None => off,
+                Some(b) => {
+                    let later = e.push(vx, MirType::I1, Op::Cmp(CmpOp::Ugt, off, b));
+                    e.push(vx, ty.clone(), Op::Select(later, off, b))
+                }
+            });
+        }
+    }
+    let best = best.expect("at least one lane");
+    let zero = e.int(vx, ty, 0);
+    let found = e.push(vx, MirType::I1, Op::Cmp(CmpOp::Ne, best, zero));
+    let last = e.push(vx, ty.clone(), Op::Bin(BinOp::Add, below, best));
+    e.push(vx, ty.clone(), Op::Select(found, last, prior))
+}
+
 fn fold_lanes(
     e: &mut Emit<'_>,
     vb: BlockId,
@@ -5873,15 +6168,118 @@ mod tests {
         ));
     }
 
-    /// The same branch also recording where the maximum was (`at = i`) is an argmax: the condition
-    /// reads every partial maximum, so the loop stays scalar.
+    /// The same branch also recording where the maximum was (`at = i`) is an argmax: per-lane
+    /// `(value, index)` partials, folded on the way out by value and then by iteration order. The
+    /// data puts tied maxima in different lanes (the earliest in a LATER lane), a NaN, a `-0.0`
+    /// beside a `+0.0`, and every trip count `0..=13` so the vector/epilogue split moves through
+    /// every position; the index and the sign-tagged maximum must match the scalar loop exactly.
     #[test]
-    fn a_branch_that_records_an_index_is_declined() {
-        let src = "@unchecked fn k(x: []f32, n: i64) -> i64 { let mut m: f32 = 0.0; \
-                   let mut at: i64 = 0; let mut i: i64 = 0; \
-                   while i < n { if x[i] > m { m = x[i]; at = i; } i = i + 1; } return at; } \
-                   fn main() -> i32 { return 0; }";
-        assert!(!is_widened(src, "k"), "an argmax must stay scalar");
+    fn a_branch_that_records_an_index_widens_and_agrees() {
+        let k =
+            "@unchecked fn k(x: []f32, n: i64, mut o: []f32) -> i64 { let mut m: f32 = -100.0; \
+                 let mut at: i64 = -1; let mut i: i64 = 0; \
+                 while i < n { if x[i] > m { m = x[i]; at = i; } i = i + 1; } \
+                 o[0] = m; return at; }";
+        let shape = format!("{k} fn main() -> i32 {{ return 0; }}");
+        assert!(is_widened(&shape, "k"), "an argmax keeps per-lane partials");
+        assert!(has_vector_accumulator(&shape, "k"));
+        let data = "x[0] = -3.0; x[1] = 0.0 * -1.0; x[2] = 0.0; x[3] = 0.0 / 0.0; x[4] = 2.0; \
+                    x[5] = 7.0; x[6] = 5.0; x[7] = 7.0; x[8] = 7.0; x[9] = 1.0; x[10] = 0.0 / 0.0; \
+                    x[11] = 7.0; x[12] = 7.0;";
+        scalar_and_vector_agree(&format!(
+            "{k} fn main() -> i32 {{ let mut x: []f32 = alloc_f32(13); \
+             let mut o: []f32 = alloc_f32(1); {data} \
+             let mut n: i64 = 0; \
+             while n <= 13 {{ print(k(x, n, o)); let v: f32 = o[0]; \
+               if 1.0 / v < 0.0 {{ print(-1); }} else {{ print((v * 4.0) as i64); }} \
+               n = n + 1; }} \
+             free(x); free(o); return 0; }}"
+        ));
+    }
+
+    /// FindLastIV (`if c { last = i }`): per-lane "last counter" partials folded by iteration
+    /// order. A one-hot hit at every position of a 13-element buffer (every lane of every group,
+    /// and the epilogue), no hit, and a start value equal to a real index — on both arms.
+    #[test]
+    fn a_find_last_index_widens_and_agrees() {
+        let k = "@unchecked fn k(x: []f32, n: i64, init: i64) -> i64 { let mut last: i64 = init; \
+                 let mut i: i64 = 0; \
+                 while i < n { if x[i] > 0.5 { last = i; } i = i + 1; } return last; } \
+                 @unchecked fn e(x: []f32, n: i64) -> i64 { let mut last: i64 = -1; \
+                 let mut i: i64 = 0; \
+                 while i < n { if x[i] > 0.5 { } else { last = i; } i = i + 1; } return last; }";
+        let shape = format!("{k} fn main() -> i32 {{ return 0; }}");
+        assert!(
+            is_widened(&shape, "k"),
+            "a FindLast keeps per-lane partials"
+        );
+        assert!(has_vector_accumulator(&shape, "k"));
+        assert!(is_widened(&shape, "e"), "so does its else-arm spelling");
+        scalar_and_vector_agree(&format!(
+            "{k} fn main() -> i32 {{ let mut x: []f32 = alloc_f32(13); \
+             let mut p: i64 = 0; \
+             while p <= 13 {{ let mut j: i64 = 0; \
+               while j < 13 {{ x[j] = 0.0; j = j + 1; }} \
+               if p < 13 {{ x[p] = 1.0; }} \
+               let mut n: i64 = 0; \
+               while n <= 13 {{ print(k(x, n, -1)); print(k(x, n, 5)); print(e(x, n)); \
+                 n = n + 1; }} \
+               p = p + 1; }} \
+             free(x); return 0; }}"
+        ));
+    }
+
+    /// An argmin of `i32` with the accumulator on the LEFT of the compare (`m > y[i]`), from a
+    /// start nothing beats and from one everything beats: un-updated lanes tie only each other.
+    #[test]
+    fn an_integer_argmin_with_the_accumulator_left_agrees() {
+        let k = "@unchecked fn k(y: []i32, n: i64, m0: i32) -> i64 { let mut m: i32 = m0; \
+                 let mut at: i64 = -1; let mut i: i64 = 0; \
+                 while i < n { if m > y[i] { m = y[i]; at = i; } i = i + 1; } return at; }";
+        let shape = format!("{k} fn main() -> i32 {{ return 0; }}");
+        assert!(is_widened(&shape, "k"));
+        scalar_and_vector_agree(&format!(
+            "{k} fn main() -> i32 {{ let mut y: []i32 = alloc_i32(19); \
+             let mut j: i64 = 0; \
+             while j < 19 {{ y[j] = (((j * 7) % 5) as i32) - 2; j = j + 1; }} \
+             let mut n: i64 = 0; \
+             while n <= 19 {{ print(k(y, n, 1000)); print(k(y, n, -2)); print(k(y, n, 0)); \
+               n = n + 1; }} \
+             free(y); return 0; }}"
+        ));
+    }
+
+    /// The argmax spellings whose per-lane partials would NOT reproduce the scalar answer stay
+    /// scalar: a non-strict compare (`>=` keeps the LAST tie, and an un-updated lane's start index
+    /// could then be mistaken for a later one), the update on the `else` arm (`!(x <= m)` is true
+    /// for a NaN), and an index that is not the counter.
+    #[test]
+    fn argmax_spellings_the_partials_cannot_reproduce_are_declined() {
+        let nonstrict = "@unchecked fn k(x: []f32, n: i64) -> i64 { let mut m: f32 = 0.0; \
+                         let mut at: i64 = 0; let mut i: i64 = 0; \
+                         while i < n { if x[i] >= m { m = x[i]; at = i; } i = i + 1; } return at; } \
+                         fn main() -> i32 { return 0; }";
+        assert!(
+            !is_widened(nonstrict, "k"),
+            "a `>=` argmax must stay scalar"
+        );
+        let else_arm = "@unchecked fn k(x: []f32, n: i64) -> i64 { let mut m: f32 = 0.0; \
+                        let mut at: i64 = 0; let mut i: i64 = 0; \
+                        while i < n { if x[i] <= m { } else { m = x[i]; at = i; } i = i + 1; } \
+                        return at; } \
+                        fn main() -> i32 { return 0; }";
+        assert!(
+            !is_widened(else_arm, "k"),
+            "an else-arm argmax must stay scalar"
+        );
+        let not_iv = "@unchecked fn k(x: []f32, n: i64) -> i64 { let mut m: f32 = 0.0; \
+                      let mut at: i64 = 0; let mut i: i64 = 0; \
+                      while i < n { if x[i] > m { m = x[i]; at = n - i; } i = i + 1; } return at; } \
+                      fn main() -> i32 { return 0; }";
+        assert!(
+            !is_widened(not_iv, "k"),
+            "an index other than the counter must stay scalar"
+        );
     }
 
     // ---- cost model ----------------------------------------------------------------------------

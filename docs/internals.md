@@ -496,7 +496,16 @@ lanes into the scalar accumulator **in index order**, re-emitting the loop's own
 compare and select for a min/max), and a guarded one keeps `c_k ? acc op x_k : acc` per lane. No
 float is reassociated and no identity element is ever folded into a float, so a running `-0.0`, a
 NaN payload and a NaN-then-number sequence come out exactly as the scalar loop computes them. A
-branch that also records an index (an argmax) stays scalar. The runtime alias guard is budgeted at
+branch that also records the counter (`if x[i] > m { m = x[i]; at = i; }`, an argmax/argmin) is one
+reduction *as a pair* (`Reduction::arg`, an `ArgIndex`): with a strict compare, the update on the
+`then` arm and the counter as the index, each lane keeps its own `(value, index)` partial (the
+index selected from the lane ramp under the value compare's mask), and the vector exit folds the
+lanes by the loop's own compare first and iteration order second (`==` ties, so `±0` tie, broken by
+`(at - start)` unsigned) — the earliest member of the best class, NaN elements never updating, a NaN
+start updating nothing, exactly as the scalar loop (`emit_arg_combine`). `>=`, an `else`-arm update,
+a non-counter index and 64-bit values stay scalar. **FindLastIV** (`if c { last = i }`,
+`RedKind::FindLast`) keeps per-lane last counters seeded at `start - 1`; the exit takes the unsigned
+max of `at - (start - 1)`, where `0` means nothing was recorded (`emit_find_last_combine`). The runtime alias guard is budgeted at
 eight checks per loop (LLVM's default threshold); `WUKONG_VEC_TRACE=1` prints each widening with a
 per-group cost estimate (`cost=vector/scalar`), which is reported but not yet enforced.
 
