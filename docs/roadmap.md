@@ -565,8 +565,11 @@ another architecture or OS is not supported. A native-backend failure is a catal
   (`tests/run/vectorized_search_loops.wk`). **One-armed memory** in an `if` is predicated per lane
   instead of declining the loop: a store only one arm makes, and a load only one arm makes, touch
   each lane's own element only where that lane took the arm and a private scratch slot otherwise
-  (`tests/run/vectorized_predicated_arms.wk`). Still scalar: argmax / find-index loops that record
-  the index in a branch, searches over a parameter buffer (no extent in MIR), `if`/`else if` chains,
+  (`tests/run/vectorized_predicated_arms.wk`). **Argmax / argmin** (`if x[i] > m { m = x[i]; at = i;
+  }`, strict compare, ties keep the lowest index, NaN never updates) and **FindLastIV** (`if c { last
+  = i }`) widen with per-lane partials and an exit fold by iteration order, bit-exact with the scalar
+  loop (`tests/run/vec_argmax_reductions.wk`, `tests/run/vec_find_last.wk`); a `>=` argmax (last
+  tie), an `else`-arm update and 64-bit argmax values stay scalar. Still scalar: searches over a parameter buffer (no extent in MIR), `if`/`else if` chains,
   stores to different places in both arms, and an arm that alone subscripts a `[]T` parameter
   without `@noalias` (its data pointer is re-read inside the arm, an invariant load that is not
   speculated; a local or `@noalias` slice has it hoisted out of the loop). The per-lane accesses are scalar under Cranelift

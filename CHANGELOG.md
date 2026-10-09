@@ -5,6 +5,14 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Index-recording reductions (`gap3/vec-argmax`)
+
+- **Argmax/argmin and FindLastIV loops vectorize.** `if x[i] > m { m = x[i]; at = i; }` (and its
+  argmin, either compare orientation, f32/f64/i16/i32 values) and `if c { last = i }` were scalar
+  recurrences; they now keep per-lane `(value, index)` / last-counter partials whose exit fold
+  reproduces the scalar loop bit for bit — ties keep the lowest index, NaN never updates, the kept
+  zero's sign is the first one seen. `>=` (last tie), `else`-arm updates and 64-bit values stay scalar.
+
 ### Type aliases (`gap3/type-aliases`)
 
 - **`type` aliases (N19).** `type Real = f32;` and generic `type Mat<M, N> = Tensor[Real, M, N];`
