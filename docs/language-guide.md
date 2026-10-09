@@ -361,6 +361,43 @@ load or store through null is the interpreter diagnostic `null pointer dereferen
 A condition must be a boolean, a number (nonzero is true) or a pointer: an aggregate, slice, tensor
 view, SIMD vector or function value is `E0436`.
 
+### Type aliases ✅
+
+`type Name = T;` gives a type a name; a generic alias takes type, dimension or `const`
+parameters. An alias is **transparent**: every use is replaced by the type it stands for before
+type checking, so a function over `Mat<M, N>` is exactly the function over `Tensor[f32, M, N]` —
+same shape checking, same MIR, same kernel dispatch.
+
+```wukong
+type Real = f32;
+type Mat<M, N> = Tensor[Real, M, N];
+type Buf<T, N> = [T; N];
+
+fn matvec<M, N>(a: Mat<M, N>, x: Tensor[Real, N], mut y: Tensor[Real, M]) { … }
+fn interleave<N>(a: Tensor[Real, N], b: Tensor[Real, N], mut out: Tensor[Real, N * 2]) { … }
+
+let q: Buf<Buf<Real, 2>, 3> = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.5]];
+let h = alloc::<Real>(n);
+let r = x as Real;
+```
+
+- An alias may be used wherever a type is written: parameters, returns, `let` annotations, struct
+  and variant fields, casts, `alloc::<T>` and other turbofish arguments, and nested inside other
+  types (including other aliases). It does **not** name a struct literal, a pattern or an `impl`
+  block — write the struct's own name there.
+- Arguments go in `<..>`: a type, an integer, `?`, or dimension arithmetic (`Row<N * 2>`); a bare
+  name serves as either a type or a dimension. `>>` closes two lists. After `as`, a bare `<` is the
+  comparison (`x as i32 < n`), so a generic alias as a cast target is spelled `x as Mat::<2, 2>`.
+- `type` is a contextual keyword — only `type Name` at item position starts an alias, and `type`
+  stays an ordinary identifier elsewhere.
+- Aliases follow the module rules of every other item: `pub type` is importable (`import
+  lib.shapes;`, `import lib.shapes.{Mat}`, `shapes.Mat`), a private alias is `E0312` to an
+  importer, and a generic parameter of the enclosing function shadows an alias of the same name.
+- Errors: an alias that reaches itself (`type A = [B; 2]; type B = A;`) is `E0326`; a wrong number
+  or kind of arguments (`Mat<4>`, `f32<2>`, a type where the alias uses a dimension) is `E0327`; an
+  alias body naming no type is `E0328`, reported even if the alias is unused; an alias named like a
+  built-in scalar or an existing struct/enum is `E0300`.
+
 ## Operators ✅
 
 Arithmetic `+ - * / %`, comparison `== != < <= > >=`, bitwise `& | ^`, shifts `<< >>`, boolean

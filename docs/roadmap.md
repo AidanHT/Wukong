@@ -376,6 +376,14 @@ another architecture or OS is not supported. A native-backend failure is a catal
   recognizer that reads sema's generic-body types declines on an instance rather than firing (the
   instance lowers as ordinary loops). Generic structs (`Buf<T>`) are not
   monomorphized.
+- **Type aliases.** `type Real = f32;` and generic `type Mat<M, N> = Tensor[Real, M, N];` (type,
+  dimension and `const` parameters, dimension-arithmetic arguments like `Row<N * 2>`) work in every
+  type position and across imports (`pub type`). The driver expands each use right after import
+  loading (`wukong_driver::loader::alias`) and removes the alias items, so sema, MIR lowering and
+  autodiff see only expanded types; errors are `E0326` (cycle), `E0327` (argument count or kind),
+  `E0328` (unknown type in the body) — `tests/run/type_alias.wk`, `tests/run/type_alias_import.wk`.
+  Sharp edges: an alias names a type only, not a struct literal, pattern or `impl` target, and a
+  generic alias as a cast target must be written `x as Mat::<2, 2>`.
 - **Dimension constraints.** `where K % 16 == 0, M <= 4096` predicates and `static_assert(cond[,
   "msg"])` are checked at every call whose dimensions are compile-time constants (`E0521`/`E0522`),
   and `const` generic parameters must be `usize` (`E0523`) — `tests/run/where_constraints.wk`. Not

@@ -5,6 +5,13 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Type aliases (`gap3/type-aliases`)
+
+- **`type` aliases (N19).** `type Real = f32;` and generic `type Mat<M, N> = Tensor[Real, M, N];`
+  name a type anywhere one is written (params, returns, lets, fields, casts, `alloc::<T>`, nested,
+  and across imports via `pub type`); each use is expanded before sema, and a cycle, a wrong
+  argument count or kind, and an unknown type in an alias body are `E0326`, `E0327` and `E0328`.
+
 ### Generics and dtypes (`gap2/generics-and-dtype`)
 
 - **Every instantiation of a generic function is type-checked.** A generic body was checked once
