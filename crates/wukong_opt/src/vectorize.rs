@@ -139,8 +139,8 @@ use wukong_mir::{
 
 use crate::fxhash::{FxHashMap, FxHashSet};
 use crate::loop_info::{
-    self, AccessKind, AddrForm, Carried, IvStep, LoopForest, MemAccess, MemBase, NaturalLoop,
-    RedKind, TripCount,
+    self, AccessKind, AddrForm, Carried, Coeff, IvStep, LoopForest, MemAccess, MemBase,
+    NaturalLoop, RedKind, TripCount,
 };
 use crate::{each_op_use, CfgAnalyses, Pass};
 
@@ -451,6 +451,33 @@ struct VecPlan {
     /// The cost model's estimate for one group, `(vector, scalar)` ([`estimate_cost`]). Reported
     /// by `WUKONG_VEC_TRACE`; not a gate.
     cost: (u64, u64),
+    /// A search loop's early exit, tested once per group ([`EarlyExit`]).
+    early: Option<EarlyExit>,
+}
+
+/// The early exit of a **search loop**: `while i < n { <test>; if !c { break } <rest>; i = i + 1 }`
+/// — one exit tested in the header, and one more from the body block that runs first.
+///
+/// A group cannot stop half way through, so it does not try to. The body up to the exit test is
+/// widened, the test goes lane-wide, and if *any* lane would leave, the vector loop hands the
+/// original loop the group's first iteration — the scalar loop then re-runs at most `W` iterations
+/// and leaves at exactly the iteration, with exactly the values, it always did (LLVM 19 / GCC 14
+/// early-break vectorization, resolved in the scalar epilogue). Only when every lane continues does
+/// the rest of the body run, so the group's stores and accumulates happen exactly when the scalar
+/// loop's would. Two things make running the test ahead of the scalar loop harmless, and
+/// [`plan_loop`] proves both: nothing before the exit stores, and every load before the exit reads
+/// memory that exists for the whole trip ([`speculation_safe`]) — lanes past the exiting one read
+/// elements the scalar loop never reaches.
+#[derive(Clone, Copy, Debug)]
+struct EarlyExit {
+    /// The branch condition of the exiting block.
+    cond: ValueId,
+    /// Does the loop keep going when `cond` is true? (`LoopCanon` makes it so, but the other
+    /// polarity costs nothing to support.)
+    continue_on_true: bool,
+    /// The index in [`VecPlan::lin`] of the first step after the test: the exiting block's steps
+    /// come first, the latch's after.
+    split: usize,
 }
 
 /// The induction variable's second, lane-varying face.
@@ -712,11 +739,14 @@ fn is_someones_epilogue(f: &Function, forest: &LoopForest, l: &NaturalLoop) -> b
 /// Returns the loop's preheader and its latch (the body block that carries the back edge).
 fn structural_verdict(f: &Function, l: &NaturalLoop) -> Result<(BlockId, BlockId), &'static str> {
     let preheader = l.preheader.ok_or("no preheader")?;
-    if l.latches.len() != 1 || !l.abnormal_exits.is_empty() || l.exits.len() != 1 {
-        return Err("not one latch / one exit / no abnormal exit");
+    if l.latches.len() != 1 || !l.abnormal_exits.is_empty() {
+        return Err("not one latch / no abnormal exit");
     }
-    let (exit_from, _) = l.exits[0];
-    if exit_from != l.header {
+    if l.exits.len() != 1 {
+        if early_exit_of(f, l).is_none() {
+            return Err("not one exit, nor a search loop's one early exit");
+        }
+    } else if l.exits[0].0 != l.header {
         return Err("exit is not tested in the header");
     }
     // The cheap half of `linearize_region`'s precondition: one straight-line body block, or a
@@ -761,7 +791,29 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
     let (preheader, body) = structural_verdict(f, l)?;
     // The body is either one straight-line block (which is then also the latch), or a diamond /
     // triangle that if-conversion flattens into one. Either way the latch carries the back edge.
-    let lin = linearize_region(f, l, body)?;
+    // A search loop's body is its exiting block followed by the latch, the test between them.
+    let (lin, early) = match early_exit_of(f, l) {
+        Some((exiting, cond, continue_on_true)) => {
+            let first = f.blocks[exiting.0 as usize].insts.len();
+            let lin: Vec<LinInst> = (0..first)
+                .map(|idx| LinInst::Real {
+                    block: exiting,
+                    idx,
+                })
+                .chain(
+                    (0..f.blocks[body.0 as usize].insts.len())
+                        .map(|idx| LinInst::Real { block: body, idx }),
+                )
+                .collect();
+            let early = EarlyExit {
+                cond,
+                continue_on_true,
+                split: first,
+            };
+            (lin, Some(early))
+        }
+        None => (linearize_region(f, l, body)?, None),
+    };
 
     // ---- induction variable and trip count ---------------------------------------------------
     iv_verdict(l)?;
@@ -858,6 +910,9 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
 
     // ---- trip count ---------------------------------------------------------------------------
     let trip = match &l.trip {
+        // A search loop has two exits, so the analysis reports no trip count; the header's test
+        // still bounds it, and the vector loop runs only whole groups below that bound.
+        _ if early.is_some() => early_trip(f, l, iv.value, iv.start, w)?,
         TripCount::Const(n) => {
             let groups = n / w as u64;
             if groups < MIN_TRIP_GROUPS {
@@ -887,7 +942,14 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
     if guards.len() + point_guards.len() > MAX_GUARD_PAIRS {
         return Err("more runtime alias checks than one loop entry amortizes");
     }
-    let cost = estimate_cost(f, &lin, &plans, &vector_ty, &reductions, body, w);
+    if let Some(x) = &early {
+        early_exit_verdict(f, l, &lin, &plans, x, iv.value, iv.start)?;
+    }
+    let mut cost = estimate_cost(f, &lin, &plans, &vector_ty, &reductions, body, w);
+    if early.is_some() {
+        // The lane test: a reduction over the mask's lanes, an extract and a branch.
+        cost.0 += 2 + 2 * u64::from(w.trailing_zeros());
+    }
 
     Ok(VecPlan {
         header: l.header,
@@ -908,6 +970,7 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
         ramp,
         ramp_vector,
         cost,
+        early,
     })
 }
 
@@ -1233,6 +1296,264 @@ fn linearize_region(
     }
     lin.extend(straight(latch));
     Ok(lin)
+}
+
+/// The search-loop shape [`EarlyExit`] widens, as `(exiting block, its condition, continue on
+/// true?)`: three blocks — the header, which tests the trip and enters the exiting block; the
+/// exiting block, which leaves the loop on one arm and falls into the latch on the other; and the
+/// straight-line latch.
+fn early_exit_of(f: &Function, l: &NaturalLoop) -> Option<(BlockId, ValueId, bool)> {
+    if l.exits.len() != 2 || l.blocks.len() != 3 || l.latches.len() != 1 {
+        return None;
+    }
+    let latch = l.latches[0];
+    if l.exits.iter().filter(|(b, _)| *b == l.header).count() != 1 {
+        return None;
+    }
+    let &(exiting, out) = l.exits.iter().find(|(b, _)| *b != l.header)?;
+    if exiting == latch {
+        return None;
+    }
+    let inside: Vec<BlockId> = succs(&f.blocks[l.header.0 as usize].term)
+        .into_iter()
+        .filter(|b| l.blocks.contains(b))
+        .collect();
+    if inside.as_slice() != [exiting] {
+        return None;
+    }
+    let Terminator::CondBr {
+        cond,
+        then_blk,
+        then_args,
+        else_blk,
+        else_args,
+    } = &f.blocks[exiting.0 as usize].term
+    else {
+        return None;
+    };
+    let (continue_on_true, into_latch) = if *then_blk == latch && *else_blk == out {
+        (true, then_args)
+    } else if *else_blk == latch && *then_blk == out {
+        (false, else_args)
+    } else {
+        return None;
+    };
+    let latch_blk = &f.blocks[latch.0 as usize];
+    if !into_latch.is_empty() || !latch_blk.params.is_empty() {
+        return None;
+    }
+    if !matches!(&latch_blk.term, Terminator::Br { target, .. } if *target == l.header) {
+        return None;
+    }
+    Some((exiting, *cond, continue_on_true))
+}
+
+/// A compile-time integer constant, wherever it is defined.
+fn const_of(f: &Function, v: ValueId) -> Option<i128> {
+    match op_of(f, v)? {
+        Op::ConstInt(k, ty) if ty.is_int() => Some(*k),
+        _ => None,
+    }
+}
+
+/// A search loop's header test as `iv <pred> bound` while the loop runs, `pred` `Slt` or `Ult`.
+fn header_bound(
+    f: &Function,
+    l: &NaturalLoop,
+    iv: ValueId,
+) -> Result<(CmpOp, ValueId), &'static str> {
+    let Terminator::CondBr {
+        cond,
+        then_blk,
+        else_blk,
+        ..
+    } = &f.blocks[l.header.0 as usize].term
+    else {
+        return Err("the header does not test the trip");
+    };
+    if !l.blocks.contains(then_blk) || l.blocks.contains(else_blk) {
+        return Err("the header's test does not continue on true");
+    }
+    let Some(Op::Cmp(pred, a, b)) = op_of(f, *cond) else {
+        return Err("the header's test is not a compare");
+    };
+    let (pred, bound) = if *a == iv && *b != iv {
+        (*pred, *b)
+    } else if *b == iv && *a != iv {
+        let swapped = match pred {
+            CmpOp::Sgt => CmpOp::Slt,
+            CmpOp::Ugt => CmpOp::Ult,
+            _ => return Err("the header's test is not `iv < bound`"),
+        };
+        (swapped, *a)
+    } else {
+        return Err("the header's test does not read the induction variable");
+    };
+    if !matches!(pred, CmpOp::Slt | CmpOp::Ult) {
+        return Err("the header's test is not `iv < bound`");
+    }
+    Ok((pred, bound))
+}
+
+/// The trip of a search loop, from its header test. The analysis reports none — the loop has two
+/// exits — but the vector loop only needs the header's bound: it runs whole groups below it, and
+/// the early exit is resolved in the original loop. Constant endpoints give a constant count
+/// (rounded down to whole groups of `w`); otherwise the bound must be readable before the loop.
+fn early_trip(
+    f: &Function,
+    l: &NaturalLoop,
+    iv: ValueId,
+    start: Option<ValueId>,
+    w: u32,
+) -> Result<TripPlan, &'static str> {
+    let (pred, bound) = header_bound(f, l, iv)?;
+    if let (Some(s), Some(e)) = (start.and_then(|v| const_of(f, v)), const_of(f, bound)) {
+        if pred == CmpOp::Ult && (s < 0 || e < 0) {
+            return Err("an unsigned trip over a negative constant");
+        }
+        let groups = if e > s { (e - s) / i128::from(w) } else { 0 };
+        if groups < i128::from(MIN_TRIP_GROUPS) {
+            return Err("trip count is below one vector group");
+        }
+        return u64::try_from(groups * i128::from(w))
+            .map(TripPlan::Const)
+            .map_err(|_| "trip count does not fit");
+    }
+    if l.blocks.iter().any(|b| defined_in_block(f, *b, bound)) {
+        return Err("the search loop's bound is computed inside the loop");
+    }
+    Ok(TripPlan::Runtime { end: bound })
+}
+
+/// What has to hold before a search loop's test may run `W` iterations ahead of the scalar loop:
+/// the steps before the exit store nothing and read only memory that exists for the whole trip
+/// (contiguous loads proved by [`speculation_safe`]; a gather or an interleave window is refused),
+/// and the test itself is a value the vector body computes before the exit.
+fn early_exit_verdict(
+    f: &Function,
+    l: &NaturalLoop,
+    lin: &[LinInst],
+    plans: &[Plan],
+    x: &EarlyExit,
+    iv: ValueId,
+    start: Option<ValueId>,
+) -> Result<(), &'static str> {
+    let (_, end) = header_bound(f, l, iv)?;
+    let start = start.ok_or("the induction variable has no single start")?;
+    let mut defines_cond = false;
+    for (step, plan) in lin[..x.split].iter().zip(&plans[..x.split]) {
+        let LinInst::Real { block, idx } = step else {
+            return Err("a search loop's test is not straight-line code");
+        };
+        let inst = &f.blocks[block.0 as usize].insts[*idx];
+        defines_cond |= inst.result == Some(x.cond);
+        match plan {
+            Plan::VecStore | Plan::GroupStore { .. } | Plan::MaskedStore => {
+                return Err("a search loop stores before its exit")
+            }
+            Plan::Gather | Plan::LaneGep | Plan::GroupLoad { .. } => {
+                return Err("a search loop gathers before its exit")
+            }
+            Plan::Reduce if inst.result == Some(x.cond) => {
+                return Err("a search loop exits on its own accumulator")
+            }
+            _ => {}
+        }
+        if matches!(inst.op, Op::Store { .. }) {
+            return Err("a search loop stores before its exit");
+        }
+        if let Op::Load(..) = inst.op {
+            let Some(a) = l
+                .accesses
+                .iter()
+                .find(|a| a.block == *block && a.inst == *idx)
+            else {
+                return Err("a load before the exit has no analyzed address");
+            };
+            match &a.addr {
+                // The same address every iteration: the vector loop runs only when the trip covers
+                // a whole group, so the scalar loop reads it too.
+                AddrForm::Invariant(_) => {}
+                AddrForm::Affine { base, index, elem } => {
+                    if index.coeff != Coeff::Const(1)
+                        || !index.terms.is_empty()
+                        || !speculation_safe(f, *base, elem, index.konst, start, end)
+                    {
+                        return Err("a load before the exit may read past its object");
+                    }
+                }
+                AddrForm::Unknown => return Err("a load before the exit has no analyzed address"),
+            }
+        }
+    }
+    // A condition from outside the body is one answer for the whole group, which is fine; one
+    // defined in the latch would be read before it exists.
+    if !defines_cond && l.blocks.iter().any(|b| defined_in_block(f, *b, x.cond)) {
+        return Err("a search loop's test is not computed before its exit");
+    }
+    Ok(())
+}
+
+/// Is `v` a parameter or an instruction result of block `b`?
+fn defined_in_block(f: &Function, b: BlockId, v: ValueId) -> bool {
+    let blk = &f.blocks[b.0 as usize];
+    blk.params.contains(&v) || blk.insts.iter().any(|i| i.result == Some(v))
+}
+
+/// May the vector loop read `base[iv + c]` for every `iv` in `[start, end)`, although the scalar
+/// loop may leave before it reaches the end? Two proofs, both about the object rather than the
+/// loop:
+///
+/// * a **stack array** of this function, `[T; N]` with `T` the element read: the constant range
+///   `[start + c, end + c)` lies inside `[0, N)`;
+/// * a **`[]T` slice whose loop runs to its own length** — `end` is `load i64 (hdr + 8)`, the
+///   fat pointer's length field, and the data is re-read from the same `hdr` — with `c <= 0` and a
+///   constant `start + c >= 0`: every element below the length exists.
+///
+/// Anything else — a parameter pointer with no known extent, a symbolic offset — is refused: a
+/// group straddling the end of a shorter buffer could fault where the scalar loop stops in time.
+fn speculation_safe(
+    f: &Function,
+    base: MemBase,
+    elem: &MirType,
+    c: i64,
+    start: ValueId,
+    end: ValueId,
+) -> bool {
+    let c = i128::from(c);
+    match base {
+        MemBase::Outer(v) => {
+            let Some(Op::Alloca { ty, .. }) = op_of(f, v) else {
+                return false;
+            };
+            let n = match ty {
+                MirType::Array(e, n) if **e == *elem => i128::from(*n),
+                t if t == elem => 1,
+                _ => return false,
+            };
+            let (Some(s), Some(e)) = (const_of(f, start), const_of(f, end)) else {
+                return false;
+            };
+            s + c >= 0 && e + c <= n
+        }
+        MemBase::ReloadedOuter { addr, .. } => {
+            let Some(Op::Load(len_at, MirType::I64)) = op_of(f, end) else {
+                return false;
+            };
+            let Some(Op::Gep {
+                ptr,
+                index,
+                elem: MirType::I8,
+            }) = op_of(f, *len_at)
+            else {
+                return false;
+            };
+            *ptr == addr
+                && const_of(f, *index) == Some(8)
+                && c <= 0
+                && const_of(f, start).is_some_and(|s| s + c >= 0)
+        }
+    }
 }
 
 fn succs(t: &Terminator) -> Vec<BlockId> {
@@ -2852,8 +3173,9 @@ fn apply(f: &mut Function, p: &VecPlan) {
     };
 
     // ---- vector body ---------------------------------------------------------------------------
-    let latch_args = emit_body(&mut e, p, vb, guard, &header_params, &vh_params);
-    e.f.blocks[vb.0 as usize].term = Terminator::Br {
+    // A search loop's body is two blocks: the test leaves for `vx` before the rest of the group.
+    let (latch_args, last) = emit_body(&mut e, p, vb, vx, guard, &header_params, &vh_params);
+    e.f.blocks[last.0 as usize].term = Terminator::Br {
         target: vh,
         args: latch_args,
     };
@@ -3076,14 +3398,20 @@ fn range_of(
 /// (the fat pointer is the parameter the loop indexes through, live for the whole call, and
 /// `emit_alias_checks` already reads it), but for an arbitrary invariant address it would be a
 /// read the scalar loop never performs when the trip count is zero.
+///
+/// A search loop ([`EarlyExit`]) is emitted in two blocks: the steps up to its exit test in `vb`,
+/// which ends in the lane test and leaves for `vx` when any lane would leave the loop, and the rest
+/// of the group in a block of its own. Returns the back edge's arguments and the block that carries
+/// them.
 fn emit_body(
     e: &mut Emit<'_>,
     p: &VecPlan,
-    vb: BlockId,
+    mut vb: BlockId,
+    vx: BlockId,
     guard: BlockId,
     header_params: &[ValueId],
     vh_params: &[ValueId],
-) -> Vec<ValueId> {
+) -> (Vec<ValueId>, BlockId) {
     let latch_term = e.f.blocks[p.body.0 as usize].term.clone();
 
     // scalar value -> its counterpart in the vector body.
@@ -3129,6 +3457,9 @@ fn emit_body(
     });
 
     for (i, step) in p.lin.iter().enumerate() {
+        if p.early.is_some_and(|x| x.split == i) {
+            vb = emit_exit_test(e, p, vb, vx, &map);
+        }
         // Give the induction variable its lane-varying face for exactly the steps that read it as a
         // value, and its scalar one everywhere else, so the address arithmetic around them stays
         // scalar. Set at the top of every iteration rather than restored at the bottom: the body
@@ -3371,6 +3702,11 @@ fn emit_body(
         }
     }
 
+    // A search loop whose latch computes nothing but the step tests after every body step.
+    if p.early.is_some_and(|x| x.split == p.lin.len()) {
+        vb = emit_exit_test(e, p, vb, vx, &map);
+    }
+
     // Past the body the induction variable is scalar again: the reduction folds and the back-edge
     // arguments below both read it (or values it feeds) through `resolve_uniform`, and the
     // induction variable's own back-edge argument is the `+ W` step.
@@ -3471,7 +3807,97 @@ fn emit_body(
         }
     }
     out.extend(vacc_next);
-    out
+    (out, vb)
+}
+
+/// End `vb` in a search loop's exit test and continue the group in a new block, returned.
+///
+/// The group leaves for `vx` — handing the original loop the group's first iteration and the values
+/// it started with, since nothing after the test has run — when any of its `W` lanes would leave the
+/// loop; the original loop then re-runs at most `W` iterations and stops at exactly the one it
+/// always stopped at. Otherwise every lane continues and so does the group.
+fn emit_exit_test(
+    e: &mut Emit<'_>,
+    p: &VecPlan,
+    vb: BlockId,
+    vx: BlockId,
+    map: &FxHashMap<u32, Wide>,
+) -> BlockId {
+    let x = p.early.expect("only a search loop has an exit test");
+    // Continuing on true, every lane must hold; continuing on false, no lane may.
+    let (fold, all_stay) = if x.continue_on_true {
+        (BinOp::And, true)
+    } else {
+        (BinOp::Or, false)
+    };
+    let verdict = fold_lanes(e, vb, map, x.cond, p.w, fold);
+    let rest = e.block(Vec::new(), Terminator::Unreachable);
+    let (then_blk, else_blk) = if all_stay { (rest, vx) } else { (vx, rest) };
+    e.f.blocks[vb.0 as usize].term = Terminator::CondBr {
+        cond: verdict,
+        then_blk,
+        then_args: Vec::new(),
+        else_blk,
+        else_args: Vec::new(),
+    };
+    rest
+}
+
+/// `fold` (`And` or `Or`) over every lane of the lane mask `c`, as one `i1`: the parts combined
+/// lane-wise, then a halving tree of lane shuffles, then lane 0 against zero — `log2` of the lane
+/// count steps instead of one extract per lane. A mask lane is all-ones natively and `1` in the
+/// interpreter, zero in both when false, so the bitwise fold and the `!= 0` test read the same truth
+/// on every backend. A condition that is uniform across the group is its own answer.
+fn fold_lanes(
+    e: &mut Emit<'_>,
+    vb: BlockId,
+    map: &FxHashMap<u32, Wide>,
+    c: ValueId,
+    w: u32,
+    fold: BinOp,
+) -> ValueId {
+    let parts = match map.get(&c.0) {
+        None => return c,
+        Some(Wide::Uniform(x)) => return *x,
+        Some(Wide::Lanes(_)) => {
+            let bits = mask_lane_bools(e, vb, map, c, w);
+            let mut acc = bits[0];
+            for &b in &bits[1..] {
+                acc = e.push(vb, MirType::I1, Op::Bin(fold, acc, b));
+            }
+            return acc;
+        }
+        Some(Wide::Vector(parts)) => parts.clone(),
+    };
+    let vt = e_ty(e, parts[0]);
+    let MirType::Vec(lane, n) = vt.clone() else {
+        unreachable!("a widened compare is a lane-mask vector")
+    };
+    let lane = *lane;
+    let mut acc = parts[0];
+    for &q in &parts[1..] {
+        acc = e.push(vb, vt.clone(), Op::Bin(fold, acc, q));
+    }
+    let mut width = n;
+    while width > 1 {
+        let half = width / 2;
+        // Lane `k` takes lane `half + k mod half`: the upper half folded onto the lower.
+        let mask: Vec<u8> = (0..n).map(|k| (half + k % half) as u8).collect();
+        let upper = e.push(
+            vb,
+            vt.clone(),
+            Op::Shuffle {
+                a: acc,
+                b: acc,
+                mask,
+            },
+        );
+        acc = e.push(vb, vt.clone(), Op::Bin(fold, acc, upper));
+        width = half;
+    }
+    let first = e.push(vb, lane.clone(), Op::ExtractLane(acc, 0));
+    let zero = e.int(vb, &lane, 0);
+    e.push(vb, MirType::I1, Op::Cmp(CmpOp::Ne, first, zero))
 }
 
 /// Fold `W` lane values into the accumulator **one at a time, in index order**.
@@ -6223,5 +6649,82 @@ mod tests {
             .collect();
         assert_eq!(printed, expected, "-O2 lost the scalar answer");
         scalar_and_vector_agree(src);
+    }
+
+    // ---- search loops (early exits) -----------------------------------------------------------
+
+    /// The first index of an 18-element local table whose element exceeds `t`. The table is a
+    /// stack array of this function, so every group may read it whole; 18 is not a multiple of
+    /// the group, so the last two positions are found by the scalar tail.
+    const TABLE_SEARCH: &str = "fn find(t: f32) -> i64 { \
+                                let mut a: [f32; 18] = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, \
+                                  4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5]; \
+                                let mut i: i64 = 0; \
+                                while i < 18 { if a[i] > t { break; } i = i + 1; } \
+                                return i; }";
+
+    #[test]
+    fn a_search_over_a_local_table_widens_and_stops_where_the_scalar_loop_does() {
+        let shape = format!("{TABLE_SEARCH} fn main() -> i32 {{ return 0; }}");
+        assert!(
+            is_widened(&shape, "find"),
+            "a search over a local table did not widen"
+        );
+        // Every position 0..18 and two thresholds no element exceeds.
+        scalar_and_vector_agree(&format!(
+            "{TABLE_SEARCH} fn main() -> i32 {{ let mut q: i64 = 0; \
+             while q < 20 {{ print(find((q as f32) * 0.5 - 0.25)); q = q + 1; }} \
+             return 0; }}"
+        ));
+    }
+
+    /// A search to a slice's own length (`n = x.len()`) may read every element below it; this one
+    /// is `@unchecked`, so the loop has no bounds-check exits of its own.
+    const SLICE_SEARCH: &str = "@unchecked fn first_neg(x: []i32) -> i64 { \
+                                let n = x.len(); let mut i: i64 = 0; \
+                                while i < n { if x[i] < 0 { break; } i = i + 1; } \
+                                return i; }";
+
+    #[test]
+    fn a_search_to_a_slices_own_length_widens_and_agrees() {
+        let shape = format!("{SLICE_SEARCH} fn main() -> i32 {{ return 0; }}");
+        assert!(
+            is_widened(&shape, "first_neg"),
+            "a search to the slice's own length did not widen"
+        );
+        // The negative element at every position 0..19, then nowhere.
+        scalar_and_vector_agree(&format!(
+            "{SLICE_SEARCH} fn main() -> i32 {{ let mut s: []i32 = alloc_i32(19); \
+             let mut j: i64 = 0; while j < 19 {{ s[j] = 1; j = j + 1; }} \
+             let mut q: i64 = 0; \
+             while q < 20 {{ if q < 19 {{ s[q] = -1; }} print(first_neg(s)); \
+                             if q < 19 {{ s[q] = 1; }} q = q + 1; }} \
+             free(s); return 0; }}"
+        ));
+    }
+
+    /// A parameter array has no extent the loop can see: a group straddling its end could read
+    /// past a shorter buffer where the scalar loop stops in time, so the search stays scalar.
+    #[test]
+    fn a_search_over_a_buffer_of_unknown_extent_is_declined() {
+        let src = "fn find(x: [f32; 64], t: f32, n: i64) -> i64 { let mut i: i64 = 0; \
+                   while i < n { if x[i] > t { break; } i = i + 1; } return i; } \
+                   fn main() -> i32 { return 0; }";
+        assert!(
+            !is_widened(src, "find"),
+            "a search over a buffer of unknown extent must not be widened"
+        );
+    }
+
+    /// The lane test and the exit: the widened body ends in a branch on the folded mask that
+    /// leaves for the original loop.
+    #[test]
+    fn a_widened_search_folds_its_mask_with_lane_shuffles() {
+        let shape = format!("{TABLE_SEARCH} fn main() -> i32 {{ return 0; }}");
+        let ops = ops_of(&shape, "find");
+        assert!(
+            ops.iter().any(|op| matches!(op, Op::Shuffle { .. })),
+            "the exit test did not fold the lane mask: {ops:?}"
+        );
     }
 }
