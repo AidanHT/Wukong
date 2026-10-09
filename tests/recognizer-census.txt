@@ -74,6 +74,7 @@ canon_decline.wk:
 cast_to_bool.wk:
 casts.wk:
 causal_attention.wk: wukong_sgemm wukong_sgemm_nt
+causal_mask_slice_split.wk: wukong_rt_alloc wukong_rt_alloc*4
 causal_mask_split.wk:
 cbrt.wk: wukong_vmath_f32 wukong_vmath_f32*2
 char_literals.wk:

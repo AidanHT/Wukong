@@ -29,6 +29,13 @@
 //! every iteration a copy runs is one where its assumption is true. The causal mask
 //! `if j > i { s[i*n + j] = -inf }` becomes a loop that never stores and a loop that always does.
 //!
+//! The loop may also have side exits besides the header's test -- a bounds check's trap on a
+//! runtime-sized slice, a `break`, an early `return` -- since each copy reaches such an exit at the
+//! iteration the unsplit loop does, with the same state. The one hazard is a block after the loop
+//! that reads a loop value directly: leaving from the copy bypasses the original's definition. A
+//! read inside an exit block entered only from the loop (the trap block reading the failing index)
+//! is rerouted through a new block parameter; any other read blocks the split.
+//!
 //! # Unswitching (LLVM SimpleLoopUnswitch, non-trivial)
 //!
 //! A branch inside the loop on an `i1` defined outside it — after LICM, any condition that does not
@@ -130,6 +137,9 @@ struct SplitPlan {
     guard: ValueId,
     kind: GuardKind,
     inv: Avail,
+    /// Loop values the side-exit blocks read directly, to be passed as edge arguments instead
+    /// (see [`exit_routes`]).
+    routes: Vec<(u32, Vec<ValueId>)>,
 }
 
 struct UnswitchPlan {
@@ -317,10 +327,13 @@ fn plan_split(
         return None;
     }
     let preheader = l.preheader?;
-    // The only exit is the header's test `iv < end`, left on its false arm (loop-canon's polarity).
-    if l.exits.len() != 1 || l.exits[0].0 != l.header {
+    // The header's test `iv < end` exits on its false arm (loop-canon's polarity). Any other exit
+    // is a side exit -- a bounds check's trap, a `break`, an early `return` -- taken by the copy
+    // or the original at exactly the iteration the unsplit loop takes it, with the same state.
+    let mut header_exits = l.exits.iter().filter(|e| e.0 == l.header);
+    let (Some(&(_, header_exit)), None) = (header_exits.next(), header_exits.next()) else {
         return None;
-    }
+    };
     let Terminator::CondBr {
         cond,
         then_blk,
@@ -330,9 +343,18 @@ fn plan_split(
     else {
         return None;
     };
-    if *else_blk != l.exits[0].1 || !in_loop.contains(&then_blk.0) {
+    if *else_blk != header_exit || !in_loop.contains(&then_blk.0) {
         return None;
     }
+    // A side exit from the copy bypasses the original loop's definitions, so code after the loop
+    // may then read a loop value only through exit-edge arguments (the original header always
+    // runs last before the header exit, so that exit alone needs no such care). A bounds check's
+    // trap block reads the failing index directly; that read becomes an edge argument.
+    let routes = if l.exits.len() > 1 {
+        exit_routes(f, in_loop, defined)?
+    } else {
+        Vec::new()
+    };
     let Some(Op::Cmp(exit_pred, lhs, end)) = op_of(f, defs, *cond) else {
         return None;
     };
@@ -407,6 +429,7 @@ fn plan_split(
                 guard: v,
                 kind,
                 inv,
+                routes,
             });
         }
     }
@@ -452,24 +475,113 @@ fn plan_unswitch(
     let cond = cond?;
     // Both copies leave through the original exit edges, so nothing after the loop may read a
     // loop value except through those edges' arguments.
-    for (bi, b) in f.blocks.iter().enumerate() {
-        if in_loop.contains(&(bi as u32)) {
-            continue;
-        }
-        let mut leaks = false;
-        for inst in &b.insts {
-            each_op_use(&inst.op, &mut |v| leaks |= defined.contains(&v.0));
-        }
-        each_term_use(&b.term, &mut |v| leaks |= defined.contains(&v.0));
-        if leaks {
-            return None;
-        }
+    if reads_loop_values_after(f, in_loop, defined) {
+        return None;
     }
     Some(UnswitchPlan {
         blocks: l.blocks.clone(),
         header: l.header,
         preheader,
         cond,
+    })
+}
+
+/// Where code outside the loop reads loop values directly, other than through exit-edge arguments:
+/// `None` unless every such read sits in an exit block whose single incoming edge leaves the loop
+/// (a bounds check's trap block reading the failing index, say), in which case the values each
+/// such block reads, in first-use order. Such a read can be rerouted through a new parameter of
+/// that block ([`route_exit_values`]): the value dominates the block, so it dominates the end of its
+/// only predecessor.
+fn exit_routes(
+    f: &Function,
+    in_loop: &FxHashSet<u32>,
+    defined: &FxHashSet<u32>,
+) -> Option<Vec<(u32, Vec<ValueId>)>> {
+    let n = f.blocks.len();
+    let mut edges_in = vec![0usize; n];
+    let mut from_loop = vec![false; n];
+    for (bi, b) in f.blocks.iter().enumerate() {
+        b.term.for_each_edge(|t, _| {
+            if let Some(c) = edges_in.get_mut(t.0 as usize) {
+                *c += 1;
+            }
+            if in_loop.contains(&(bi as u32)) {
+                if let Some(fl) = from_loop.get_mut(t.0 as usize) {
+                    *fl = true;
+                }
+            }
+        });
+    }
+    let mut routes = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        if in_loop.contains(&(bi as u32)) {
+            continue;
+        }
+        let mut used: Vec<ValueId> = Vec::new();
+        let mut note = |v: ValueId| {
+            if defined.contains(&v.0) && !used.contains(&v) {
+                used.push(v);
+            }
+        };
+        for inst in &b.insts {
+            each_op_use(&inst.op, &mut note);
+        }
+        each_term_use(&b.term, &mut note);
+        if used.is_empty() {
+            continue;
+        }
+        if bi == 0 || edges_in[bi] != 1 || !from_loop[bi] {
+            return None;
+        }
+        routes.push((bi as u32, used));
+    }
+    Some(routes)
+}
+
+/// Give each exit block of `routes` one new parameter per loop value it reads, passed by its only
+/// incoming edge, and read the parameter instead.
+fn route_exit_values(f: &mut Function, routes: &[(u32, Vec<ValueId>)]) {
+    for (blk, vals) in routes {
+        let bi = *blk as usize;
+        let mut subst: FxHashMap<u32, ValueId> = FxHashMap::default();
+        for v in vals {
+            let ty = f.value_type(*v).clone();
+            let p = fresh(f, ty);
+            f.blocks[bi].params.push(p);
+            subst.insert(v.0, p);
+        }
+        let sub = |u: ValueId| subst.get(&u.0).copied().unwrap_or(u);
+        for inst in &mut f.blocks[bi].insts {
+            map_op_uses(&mut inst.op, sub);
+        }
+        map_term_uses(&mut f.blocks[bi].term, sub);
+        for b in &mut f.blocks {
+            b.term.for_each_edge_mut(|t, args| {
+                if t.0 == *blk {
+                    args.extend(vals.iter().copied());
+                }
+            });
+        }
+    }
+}
+
+/// Does any block outside the loop read a value the loop defines, other than through the
+/// arguments of an exit edge?
+fn reads_loop_values_after(
+    f: &Function,
+    in_loop: &FxHashSet<u32>,
+    defined: &FxHashSet<u32>,
+) -> bool {
+    f.blocks.iter().enumerate().any(|(bi, b)| {
+        if in_loop.contains(&(bi as u32)) {
+            return false;
+        }
+        let mut leaks = false;
+        for inst in &b.insts {
+            each_op_use(&inst.op, &mut |v| leaks |= defined.contains(&v.0));
+        }
+        each_term_use(&b.term, &mut |v| leaks |= defined.contains(&v.0));
+        leaks
     })
 }
 
@@ -619,6 +731,7 @@ fn materialize(f: &mut Function, out: &mut Vec<Inst>, a: Avail, ty: &MirType) ->
 }
 
 fn apply_split(f: &mut Function, p: SplitPlan) {
+    route_exit_values(f, &p.routes);
     let ph = p.preheader.0 as usize;
     let ity = f.value_type(p.iv).clone();
     let Terminator::Br { args, .. } = &f.blocks[ph].term else {
@@ -943,6 +1056,158 @@ mod tests {
         assert!(wukong_mir::verify::verify_function(&f).is_empty());
         assert_eq!(run3(&f, &mut it, &inputs), before);
         cleanup(&mut f);
+        assert_eq!(run3(&f, &mut it, &inputs), before);
+    }
+
+    /// How the side exit of [`side_exit_loop`] reads the induction variable.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Leak {
+        /// Only through the exit edge's arguments.
+        None,
+        /// Directly, in the exit block itself (as a bounds check's trap reads the index).
+        InExit,
+        /// Directly, in a block after the exit block.
+        Downstream,
+    }
+
+    /// `guarded_loop` with a side exit ahead of the guard -- the shape a bounds check's trap or a
+    /// `break` gives -- leaving with the accumulator once it passes 1000:
+    ///
+    /// ```text
+    ///   H(j, acc):  cond_br (j < end), B, X(acc)
+    ///   B:          cond_br (acc > 1000), E(acc), G
+    ///   G:          cond_br guard, T, L(acc)
+    ///   T:          br L(acc * 3 + j)
+    ///   L(p):       br H(j + 1, p)
+    ///   E(q):       ret q + 5             (InExit: ret q + 5 + j; Downstream: br D(q + 5))
+    ///   D(z):       ret z + j             (Downstream only)
+    ///   X(r):       ret r
+    /// ```
+    fn side_exit_loop(it: &mut Interner, pred: CmpOp, leak: Leak) -> Function {
+        let mut b = Builder::new(it.intern("f"), MirType::I32);
+        let start = b.add_param(MirType::I32);
+        let end = b.add_param(MirType::I32);
+        let inv = b.add_param(MirType::I32);
+        let seven = b.build(MirType::I32, Op::ConstInt(7, MirType::I32));
+        let lim = b.build(MirType::I32, Op::ConstInt(1000, MirType::I32));
+        let h = b.new_block();
+        let j = b.block_param(h, MirType::I32);
+        let acc = b.block_param(h, MirType::I32);
+        let body = b.new_block();
+        let guard_blk = b.new_block();
+        let then = b.new_block();
+        let latch = b.new_block();
+        let p = b.block_param(latch, MirType::I32);
+        let side = b.new_block();
+        let q = b.block_param(side, MirType::I32);
+        let exit_blk = b.new_block();
+        let r = b.block_param(exit_blk, MirType::I32);
+        b.br(h, vec![start, seven]);
+        b.switch_to(h);
+        let c = b.build(MirType::I1, Op::Cmp(CmpOp::Slt, j, end));
+        b.cond_br(c, body, vec![], exit_blk, vec![acc]);
+        b.switch_to(body);
+        let big = b.build(MirType::I1, Op::Cmp(CmpOp::Sgt, acc, lim));
+        b.cond_br(big, side, vec![acc], guard_blk, vec![]);
+        b.switch_to(guard_blk);
+        let g = b.build(MirType::I1, Op::Cmp(pred, j, inv));
+        b.cond_br(g, then, vec![], latch, vec![acc]);
+        b.switch_to(then);
+        let three = b.build(MirType::I32, Op::ConstInt(3, MirType::I32));
+        let m = b.build(MirType::I32, Op::Bin(BinOp::Mul, acc, three));
+        let s = b.build(MirType::I32, Op::Bin(BinOp::Add, m, j));
+        b.br(latch, vec![s]);
+        b.switch_to(latch);
+        let one = b.build(MirType::I32, Op::ConstInt(1, MirType::I32));
+        let j2 = b.build(MirType::I32, Op::Bin(BinOp::Add, j, one));
+        b.br(h, vec![j2, p]);
+        b.switch_to(side);
+        let five = b.build(MirType::I32, Op::ConstInt(5, MirType::I32));
+        let mut out = b.build(MirType::I32, Op::Bin(BinOp::Add, q, five));
+        match leak {
+            Leak::None => b.ret(Some(out)),
+            Leak::InExit => {
+                out = b.build(MirType::I32, Op::Bin(BinOp::Add, out, j));
+                b.ret(Some(out));
+            }
+            Leak::Downstream => {
+                let d = b.new_block();
+                let z = b.block_param(d, MirType::I32);
+                b.br(d, vec![out]);
+                b.switch_to(d);
+                let w = b.build(MirType::I32, Op::Bin(BinOp::Add, z, j));
+                b.ret(Some(w));
+            }
+        }
+        b.switch_to(exit_blk);
+        b.ret(Some(r));
+        b.finish()
+    }
+
+    /// A loop with a side exit still splits on its induction-variable guard: whichever copy runs
+    /// the iteration that leaves does so with the same state the unsplit loop had there. A side
+    /// exit block that reads the induction variable itself gets it as an edge argument instead.
+    #[test]
+    fn iv_range_split_with_a_side_exit_keeps_every_answer() {
+        use CmpOp::*;
+        for leak in [Leak::None, Leak::InExit] {
+            let mut inputs = grid(false);
+            // Long enough ranges that the accumulator passes 1000 inside either copy.
+            for &(s, e, i) in &[
+                (0, 12, 3),
+                (0, 12, 9),
+                (-3, 20, 0),
+                (-3, 20, 15),
+                (2, 30, 30),
+            ] {
+                inputs.push((s, e, i));
+            }
+            for pred in [Slt, Sle, Sgt, Sge] {
+                let mut it = Interner::new();
+                let mut f = side_exit_loop(&mut it, pred, leak);
+                let before = run3(&f, &mut it, &inputs);
+                // The side exit is reached in some of these runs, or the test would prove nothing.
+                let reached = before
+                    .split(|&c| c == b'\n')
+                    .filter_map(|l| std::str::from_utf8(l).ok()?.parse::<i64>().ok())
+                    .any(|v| v > 1000);
+                assert!(reached, "{pred:?}: no run took the side exit");
+                assert!(
+                    LoopUnswitch.run_function(&mut f, &mut CfgAnalyses::default()),
+                    "{pred:?}: the guard is splittable past a side exit"
+                );
+                assert!(wukong_mir::verify::verify_function(&f).is_empty());
+                assert_eq!(run3(&f, &mut it, &inputs), before, "{pred:?}");
+                cleanup(&mut f);
+                assert!(wukong_mir::verify::verify_function(&f).is_empty());
+                // No compare against `inv` survives in either copy (the preheader's split-point
+                // arithmetic is all selects).
+                let inv = f.blocks[0].params[2];
+                let guards = f
+                    .blocks
+                    .iter()
+                    .skip(1)
+                    .flat_map(|b| &b.insts)
+                    .filter(
+                        |i| matches!(i.op, Op::Cmp(p, x, y) if p == pred && (x == inv || y == inv)),
+                    )
+                    .count();
+                assert_eq!(guards, 0, "{}", wukong_mir::print::print_function(&f, &it));
+                assert_eq!(run3(&f, &mut it, &inputs), before, "{leak:?}/{pred:?}");
+            }
+        }
+    }
+
+    /// Code after a side exit that reads a loop value directly, beyond the exit block where an edge
+    /// argument could carry it, would read the original loop's definition after leaving from the
+    /// copy: no split.
+    #[test]
+    fn a_side_exit_reading_a_loop_value_downstream_blocks_the_split() {
+        let mut it = Interner::new();
+        let mut f = side_exit_loop(&mut it, CmpOp::Sgt, Leak::Downstream);
+        let inputs = [(0, 12, 3), (0, 12, 9), (-3, 4, 0)];
+        let before = run3(&f, &mut it, &inputs);
+        assert!(!LoopUnswitch.run_function(&mut f, &mut CfgAnalyses::default()));
         assert_eq!(run3(&f, &mut it, &inputs), before);
     }
 

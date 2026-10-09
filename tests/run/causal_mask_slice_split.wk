@@ -1,0 +1,114 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+// EXPECT-OUT: -1
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 30
+// EXPECT-OUT: 40
+// EXPECT-OUT: 5
+// EXPECT-OUT: 60
+// EXPECT-OUT: 70
+// EXPECT-OUT: 80
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 7
+// EXPECT-OUT: 7
+// EXPECT-OUT: -5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 7
+// EXPECT-OUT: 7
+
+module tests.run.causal_mask_slice_split
+
+// Induction-variable range splitting on loops that keep a SIDE EXIT: a bounds check's trap on a
+// runtime-sized `[]f32` slice, or a `break`. With the mask's buffer a slice and `n` a parameter,
+// `s[i * n + j]` keeps its bounds check, so the inner loop has two exits, and the split refused
+// every such loop -- the causal mask kept its per-iteration branch whenever the buffer was not a
+// fixed-size array the bounds-check eliminator could prove. Each copy now takes a side exit at
+// exactly the iteration the unsplit loop does, with the same state.
+//
+// Expected values are the scalar semantics of each loop over s[t] = t (t = i*n + j), every lane:
+//   upper (n = 4)     -1 where j > i, else t
+//   lower_rmw (n = 3) 10t where j <= i, else t
+//   from_k            7 at every j >= k up to the first negative element (break), else unchanged:
+//                     [0,1,2,3,4,-5,6,7] with k = 3 -> 0 1 2 7 7 -5 6 7 (stops at j = 5)
+//                     [0,1,2,3,4,5,6,7]  with k = 6 -> 0 1 2 3 4 5 7 7
+
+fn upper(mut s: []f32, n: i64) {
+    for i in 0..n {
+        for j in 0..n {
+            if j > i {
+                s[i * n + j] = -1.0;
+            }
+        }
+    }
+}
+
+fn lower_rmw(mut s: []f32, n: i64) {
+    for i in 0..n {
+        for j in 0..n {
+            if j <= i {
+                s[i * n + j] = s[i * n + j] * 10.0;
+            }
+        }
+    }
+}
+
+fn from_k(mut s: []f32, n: i64, k: i64) {
+    for j in 0..n {
+        if s[j] < 0.0 {
+            break;
+        }
+        if j >= k {
+            s[j] = 7.0;
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut a: []f32 = alloc_f32(16);
+    for t in 0..16 { a[t] = t as f32; }
+    upper(a, 4);
+    for t in 0..16 { print(a[t] as i32); }
+
+    let mut b: []f32 = alloc_f32(9);
+    for t in 0..9 { b[t] = t as f32; }
+    lower_rmw(b, 3);
+    for t in 0..9 { print(b[t] as i32); }
+
+    let mut c: []f32 = alloc_f32(8);
+    for t in 0..8 { c[t] = t as f32; }
+    c[5] = -5.0;
+    from_k(c, 8, 3);
+    for t in 0..8 { print(c[t] as i32); }
+
+    let mut d: []f32 = alloc_f32(8);
+    for t in 0..8 { d[t] = t as f32; }
+    from_k(d, 8, 6);
+    for t in 0..8 { print(d[t] as i32); }
+    return 0;
+}
