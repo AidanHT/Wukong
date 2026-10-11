@@ -1,0 +1,58 @@
+// EXPECT-CODE: C0001
+module tests.fail.lower_shadowed_type_param
+
+// A generic parameter that appears in no parameter or return type is never bound by a call, so
+// each body below lowers with it opaque. Sema accepts all three. A value of an unbound type
+// parameter has no size, and lowering refuses it as `C0001`. Here each parameter shadows an item
+// of the same name, and lowering used to size the value as that item:
+// * `shadows_an_enum<E>`: the C-style `enum E`'s `i32`. `y = 2.5` stored 2, and this printed `2`.
+// * `shadows_a_const<N>`: an `i32` slot (it printed `2`). It later hit a debug-build panic for "a
+//   non-type name".
+// * `shadows_a_struct<P>`: `struct P`'s buffer, which the MIR verifier rejected (an internal
+//   compiler error).
+// The enclosing function's generics now decide what is a type parameter, before the item registry.
+
+const N: usize = 4;
+
+enum E {
+    A,
+    B,
+}
+
+struct P {
+    a: i32,
+    b: i32,
+}
+
+fn shadows_an_enum<E>(n: i32) -> i32 {
+    let mut y: E;
+    y = 2.5;
+    println(y);
+    return n;
+}
+
+fn shadows_a_const<N>(n: i32) -> i32 {
+    let mut y: N;
+    y = 2.5;
+    println(y);
+    return n;
+}
+
+fn shadows_a_struct<P>(n: i32) -> i32 {
+    let mut y: P;
+    y = 2.5;
+    println(y);
+    return n;
+}
+
+fn main() -> i32 {
+    let p = P { a: 1, b: 2 };
+    println(p.a + p.b);
+    println(N);
+    let e = E::A;
+    match e {
+        E::A => println(1),
+        E::B => println(2),
+    }
+    return shadows_an_enum(0) + shadows_a_const(0) + shadows_a_struct(0);
+}

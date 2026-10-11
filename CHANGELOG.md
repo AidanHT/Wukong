@@ -15,6 +15,18 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `tests/fail/lower_unclassified_type.wk`) and a value of a type parameter that appears in no
   parameter or return type (`y = 2.5; println(y)` printed `2`). An array of structs no longer reaches
   the `@parallel` outliner or the loop vectorizer with an `i32` element type.
+- **A function value and a shadowing type parameter are codegen limits, not debug panics.** The
+  storage refusal took a debug-build panic, meant for types sema rejects, on four kinds of program
+  sema accepts. They now get `C0001` like the rest
+  (`tests/fail/lower_function_value.wk`, `tests/fail/lower_shadowed_type_param.wk`):
+  - a function name in an array or tuple literal (`let fs = [square, square];`);
+  - a bare `square;` statement;
+  - a type parameter that shadows a `const` or `fn` of the same name;
+  - a generic struct's own type parameter.
+
+  The enclosing function's generics now decide what counts as a type parameter, ahead of the item
+  registry. A parameter that shadows an enum (`fn g<E>`: `y = 2.5; println(y)` printed `2` on both
+  backends) or a struct (`fn g<P>`: a MIR verifier ICE) is refused instead of sized as the item.
 - **Type positions the checker let through.** An integer written as a type (`let x: 512 = 3;`) is
   `E0324` and a struct, enum or type parameter given arguments (`let p: P<2>`) is `E0327`; both typed
   as an error with no diagnostic and ran. An undeclared type's `E0324` is no longer lost when literal

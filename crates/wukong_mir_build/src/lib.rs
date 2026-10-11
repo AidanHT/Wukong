@@ -2788,6 +2788,7 @@ fn parallel_spec<'a>(
         slice_slots: HashSet::default(),
         sret: None,
         subst: HashMap::default(),
+        type_params: declared_generics(f),
         mono: None,
         par: None,
         tile_queue: vec![],
@@ -2857,6 +2858,7 @@ fn is_batched_norm_fn(
         slice_slots: HashSet::default(),
         sret: None,
         subst: HashMap::default(),
+        type_params: declared_generics(f),
         mono: None,
         par: None,
 
@@ -2913,6 +2915,7 @@ fn is_bias_bcast_fn(
         slice_slots: HashSet::default(),
         sret: None,
         subst: HashMap::default(),
+        type_params: declared_generics(f),
         mono: None,
         par: None,
 
@@ -2995,6 +2998,7 @@ fn lower_fn(
         slice_slots: HashSet::default(),
         sret: None,
         subst: subst.clone(),
+        type_params: declared_generics(f),
         mono: Some(mono),
         par,
         tile_queue,
@@ -3135,6 +3139,19 @@ fn ty_is_aggregate(ty: &Ty, sema: &SemaResult) -> bool {
     }
 }
 
+/// The names of every generic parameter `f` declares, type and `const` alike: what
+/// [`FnLowerer::type_params`] holds while `f`'s body is lowered.
+fn declared_generics(f: &FnDecl) -> Vec<Symbol> {
+    f.generics
+        .iter()
+        .map(|g| match &g.kind {
+            ast::GenericParamKind::Type(name) | ast::GenericParamKind::Const { name, .. } => {
+                name.sym
+            }
+        })
+        .collect()
+}
+
 /// The MIR type `f` returns a value of semantic type `ret` as, for a return that is not an
 /// aggregate (one of those is passed back through an sret pointer and the function returns
 /// `Void`; see `lower_fn`). Free-standing for the same reason as [`ty_is_aggregate`]: the builder,
@@ -3266,6 +3283,7 @@ fn lower_parallel(
             // An outlined `@parallel` loop body is an elementwise array kernel; it does not call user
             // generic functions, so no monomorphization context is needed.
             subst: HashMap::default(),
+            type_params: declared_generics(f),
             mono: None,
             par: None,
 
@@ -3360,6 +3378,7 @@ fn lower_parallel(
             // An outlined `@parallel` loop body is an elementwise array kernel; it does not call user
             // generic functions, so no monomorphization context is needed.
             subst: HashMap::default(),
+            type_params: declared_generics(f),
             mono: None,
             par: None,
 
@@ -4150,6 +4169,16 @@ const HELP_ANNOTATE: &str = "annotate the binding with its type, e.g. `let x: f3
 /// The `C0001` help for a value of a type parameter no call binds.
 const HELP_BIND_TYPE_PARAM: &str =
     "use the type parameter in a parameter or the return type, so that each call binds it";
+/// The `C0001` help for a value of a name that is neither a struct, an enum nor one of the
+/// enclosing function's type parameters: in a program that checks clean, a generic struct's own
+/// type parameter (`struct W<T> { a: T }`), which nothing binds.
+const HELP_UNBOUND_NAME: &str =
+    "only a function's type parameters are bound, by each call; generic structs and enums are \
+     not supported yet";
+/// The `C0001` help for a function used as a value (`[square, square]`, a bare `square;`). Sema
+/// rejects one bound to a local (`E0411`) but types it in other positions.
+const HELP_FN_VALUE: &str =
+    "a function can only be called, or passed to a parameter of function type";
 /// The `C0001` help for a type sema should have rejected (a release build's refusal).
 const HELP_UNREACHABLE_TYPE: &str =
     "the type checker accepted a type lowering cannot represent; this is a compiler bug";
@@ -4210,6 +4239,11 @@ struct FnLowerer<'a> {
     /// a `Ty::Named(generic)` is read (`expr_ty`/`mir_ty_of`), so the body lowers at the concrete
     /// width and signedness instead of the `I32` default.
     subst: HashMap<Symbol, Ty>,
+    /// Every generic parameter the enclosing function declares (`T` and `N` in `fn f<T, N>`). A
+    /// `Ty::Named` of one of these that `subst` does not bind is an opaque type parameter even when
+    /// a struct, enum, `const` or `fn` of the same name exists, so [`FnLowerer::named_storage`]
+    /// refuses it instead of sizing it as that item. Empty for a non-generic function.
+    type_params: Vec<Symbol>,
     /// Collected monomorphization instances (read-only), so a call to a type-generic function is
     /// redirected to the matching specialized copy (`id` -> `id$f32`). `None` for the recognizer
     /// probe lowerers, which never lower a user call.
@@ -4316,23 +4350,26 @@ impl FnLowerer<'_> {
         self.unrepresentable(what, span, HELP_UNREACHABLE_TYPE)
     }
 
-    /// [`Self::mir_ty_at`]'s refusal of `ty`: the user-reachable types are refused with a help that
-    /// says how to give the value a type; the rest are [`Self::unreachable_type`].
+    /// [`Self::mir_ty_at`]'s refusal of a value type with no machine representation. Every form a
+    /// program that checks clean can carry here is refused with a help that says what to write
+    /// instead; only `Ty::Error`, which the driver never lets past sema, is
+    /// [`Self::unreachable_type`]. (A named type is refused by [`Self::named_storage`].)
     fn refuse_ty(&self, ty: &Ty, span: Option<Span>) -> MirType {
         match ty {
+            // Sema leaves a value `Unknown` when it does not model it: a call it types leniently,
+            // or a use of a `let x;` with neither an annotation nor an initializer.
             Ty::Unknown => self.unrepresentable(
                 "a value whose type was never determined (`_`)".to_string(),
                 span,
                 HELP_ANNOTATE,
             ),
-            // No item declares the name: a type parameter (see `named_storage`).
-            Ty::Named(g) if self.sema.defs.lookup(*g).is_none() => self.unrepresentable(
-                format!(
-                    "a value of the unbound type parameter `{}`",
-                    self.interner.resolve(*g)
-                ),
+            // Sema rejects a function bound to a local, a field or an element type (`E0411`), but
+            // a function name inside an array or tuple literal, or alone as a statement, types
+            // as a function value and reaches lowering.
+            Ty::Fn { .. } => self.unrepresentable(
+                format!("a function value of type `{}`", ty.display(self.interner)),
                 span,
-                HELP_BIND_TYPE_PARAM,
+                HELP_FN_VALUE,
             ),
             _ => self.unreachable_type(
                 format!("a value of type `{}`", ty.display(self.interner)),
@@ -4719,13 +4756,7 @@ impl FnLowerer<'_> {
                 MirType::Vec(Box::new(MirType::from_scalar(*elem)), *lanes)
             }
             Ty::Unit => MirType::Void,
-            // A data-carrying enum is a discriminant + payload byte buffer (like a struct). A
-            // payload whose layout does not resolve is a layout error, not a 4-byte guess.
-            Ty::Named(sym) if self.enum_is_data_carrying(*sym) => {
-                let size = self.enum_layout(*sym).map(|(s, _, _)| s);
-                MirType::Array(Box::new(MirType::I8), self.byte_buffer_len(size))
-            }
-            Ty::Named(sym) => self.named_storage(*sym, ty, span),
+            Ty::Named(sym) => self.named_storage(*sym, span),
             Ty::Array { elem, len, .. } => {
                 self.array_storage(self.mir_ty_at(elem, span), *len as u32)
             }
@@ -4740,17 +4771,31 @@ impl FnLowerer<'_> {
             // or a use of a `let x;` that has neither an annotation nor an initializer. Its storage
             // cannot be sized — the `i32` it used to get made `let mut x; x = 2.75;` hold `2`.
             Ty::Unknown => self.refuse_ty(ty, span),
-            // A function value exists only as a function-typed parameter, which declares no MIR
-            // parameter (`methods::param_has_value`), and every other position is `E0411`. An
-            // `Error` type never survives sema: the driver stops on its diagnostic.
+            // A function value has no storage: as a function-typed parameter it declares no MIR
+            // parameter (`methods::param_has_value`), and anywhere else it is refused. An `Error`
+            // type never survives sema: the driver stops on its diagnostic.
             Ty::Fn { .. } | Ty::Error => self.refuse_ty(ty, span),
         }
     }
 
-    /// The storage of a `Ty::Named` that is not a data-carrying enum: a declared struct's byte
-    /// buffer, a C-style enum's `i32` discriminant — the one `Named` whose real representation is
-    /// `i32` — and nothing else.
-    fn named_storage(&self, sym: Symbol, ty: &Ty, span: Option<Span>) -> MirType {
+    /// The storage of a `Ty::Named` that `subst` does not bind: a declared struct's byte buffer, a
+    /// data-carrying enum's discriminant + payload byte buffer, a C-style enum's `i32`
+    /// discriminant — the one `Named` whose real representation is `i32` — and nothing else.
+    fn named_storage(&self, sym: Symbol, span: Option<Span>) -> MirType {
+        let name = self.interner.resolve(sym);
+        // One of the enclosing function's own generic parameters that no call binds: one that
+        // appears in no parameter or return type (`fn g<U>(n: i32) { let y: U; .. }`), so the body
+        // lowers with it opaque, and sema accepts the program. Checked before the item registry:
+        // the parameter shadows a struct, enum, `const` or `fn` of the same name, and sizing it as
+        // that item gave `enum E` / `fn g<E>` an `i32` slot (`y = 2.5` printed `2`) and `struct P`
+        // / `fn g<P>` a struct buffer the verifier rejected.
+        if self.type_params.contains(&sym) {
+            return self.unrepresentable(
+                format!("a value of the unbound type parameter `{name}`"),
+                span,
+                HELP_BIND_TYPE_PARAM,
+            );
+        }
         match self.sema.defs.lookup(sym).map(|d| &d.kind) {
             // A struct whose layout overflows or does not resolve is the same layout error an
             // oversized byte buffer is (`E0401` at `finish`), never a scalar slot.
@@ -4758,14 +4803,22 @@ impl FnLowerer<'_> {
                 Box::new(MirType::I8),
                 self.byte_buffer_len(self.struct_size(sym)),
             ),
+            // A payload whose layout does not resolve is a layout error, not a 4-byte guess.
+            Some(DefKind::Enum(_)) if self.enum_is_data_carrying(sym) => {
+                let size = self.enum_layout(sym).map(|(s, _, _)| s);
+                MirType::Array(Box::new(MirType::I8), self.byte_buffer_len(size))
+            }
             Some(DefKind::Enum(_)) => MirType::I32,
-            // A name that declares nothing is, in a program that checks clean (an undeclared type
-            // name is `E0324`), a type parameter the monomorphizer has no binding for: one that
-            // appears in no parameter or return type (`fn g<U>(n: i32) { let y: U; .. }`), so no
-            // call instantiates it and the body lowers with it opaque. Sema accepts the program.
-            None => self.refuse_ty(ty, span),
-            // A function, a `const` or an undeclared name used as a type is `E0324` in sema.
-            _ => self.refuse_ty(ty, span),
+            // Any other name, declared as nothing or as something that is not a type, is a type
+            // parameter lowering has no binding for: sema reports a non-type name written as a
+            // type (`E0324`) unless a generic parameter in scope shadows it. The enclosing
+            // function's were caught above, so this is a generic struct's own (`struct W<T> {
+            // a: T }`, reached through `w.a`), possibly shadowing a `const` or `fn` of its name.
+            _ => self.unrepresentable(
+                format!("a value of the type `{name}`, which is neither a struct nor an enum"),
+                span,
+                HELP_UNBOUND_NAME,
+            ),
         }
     }
 
@@ -15415,6 +15468,7 @@ impl FnLowerer<'_> {
                 slice_slots: HashSet::default(),
                 sret: None,
                 subst: self.subst.clone(),
+                type_params: self.type_params.clone(),
                 mono: self.mono,
                 par: None,
                 tile_queue: vec![],
@@ -29435,6 +29489,7 @@ fn lower_matmul_fn(
         slice_slots: HashSet::default(),
         sret: None,
         subst: HashMap::default(),
+        type_params: declared_generics(f),
         mono: None,
         par: None,
 
@@ -31163,6 +31218,7 @@ fn xent_bwd_fn(
         slice_slots: HashSet::default(),
         sret: None,
         subst: HashMap::default(),
+        type_params: declared_generics(f),
         mono: None,
         par: None,
 
@@ -31214,6 +31270,7 @@ fn xent_fn(
         slice_slots: HashSet::default(),
         sret: None,
         subst: HashMap::default(),
+        type_params: declared_generics(f),
         mono: None,
         par: None,
 
@@ -31273,6 +31330,7 @@ fn logsumexp_fn(
         slice_slots: HashSet::default(),
         sret: None,
         subst: HashMap::default(),
+        type_params: declared_generics(f),
         mono: None,
         par: None,
 
@@ -31420,6 +31478,7 @@ fn probe_single_for(
         slice_slots: HashSet::default(),
         sret: None,
         subst: HashMap::default(),
+        type_params: declared_generics(f),
         mono: None,
         par: None,
 
@@ -32454,6 +32513,7 @@ fn lower_i8matmul_fn(
         slice_slots: HashSet::default(),
         sret: None,
         subst: HashMap::default(),
+        type_params: declared_generics(f),
         mono: None,
         par: None,
 

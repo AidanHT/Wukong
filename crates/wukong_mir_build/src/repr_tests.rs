@@ -10,13 +10,16 @@
 //! behaviour, the refusal.
 
 use wukong_ast::{ItemKind, Module, Path, StmtKind, TypeExpr, TypeKind};
-use wukong_diag::Diagnostic;
+use wukong_diag::{Diagnostic, NoteKind};
 use wukong_mir::{MirType, Op, Program};
 use wukong_sema::SemaResult;
 use wukong_span::{Interner, SourceId, Span};
 use wukong_types::{Scalar, Ty};
 
-use crate::{lower_program, mir_ty, ret_mir_ty};
+use crate::{
+    lower_program, mir_ty, ret_mir_ty, HELP_ANNOTATE, HELP_BIND_TYPE_PARAM, HELP_FN_VALUE,
+    HELP_UNBOUND_NAME, HELP_UNREACHABLE_TYPE,
+};
 
 /// Parse and check `src`, which must check clean.
 fn checked(src: &str) -> (Module, SemaResult, Interner) {
@@ -307,29 +310,54 @@ fn an_annotation_sema_rejects_is_refused_if_it_reaches_lowering() {
     }
 }
 
+/// The help of the single error in `diags`.
+fn help_of(diags: &[Diagnostic]) -> &str {
+    let d = diags.iter().find(|d| d.is_error()).expect("an error");
+    d.notes
+        .iter()
+        .find_map(|(kind, text)| matches!(kind, NoteKind::Help).then_some(text.as_str()))
+        .unwrap_or_else(|| panic!("no help on {d:?}"))
+}
+
 /// The value types with no machine representation are refused where a value of one needs
-/// storage: retype `let v = 1.5;`'s initializer, after sema checked it, and lower.
+/// storage: retype `let v = 1.5;`'s initializer, after sema checked it, and lower. Each refusal a
+/// program that checks clean can reach says how to fix the program; only `Ty::Error`, which never
+/// survives sema, is the compiler-bug refusal (a debug-build panic outside these tests).
 #[test]
 fn a_value_type_with_no_representation_is_refused() {
     let src = "fn other() -> i32 { return 1; }\n\
                fn locals() -> i32 { let v = 1.5; return 0; }\n\
                fn main() -> i32 { return locals() + other(); }\n";
-    let cases: [(&str, fn(&mut Interner) -> Ty); 4] = [
+    let cases: [(&str, &str, fn(&mut Interner) -> Ty); 4] = [
         // Reachable: sema leaves a value it does not model `Unknown`.
-        ("a value whose type was never determined (`_`)", |_| {
-            Ty::Unknown
-        }),
+        (
+            "a value whose type was never determined (`_`)",
+            HELP_ANNOTATE,
+            |_| Ty::Unknown,
+        ),
+        // Reachable: a function name in an array or tuple literal, or alone as a statement, is
+        // typed as a function value (`[square, square]` is `[fn(f32) -> f32; 2]`).
+        (
+            "a function value of type `fn(f32) -> f32`",
+            HELP_FN_VALUE,
+            |_| Ty::Fn {
+                params: vec![Ty::Scalar(Scalar::F32)],
+                ret: Box::new(Ty::Scalar(Scalar::F32)),
+            },
+        ),
+        // Reachable: a name declared as something other than a type, shadowed by a type
+        // parameter that is not the enclosing function's (a generic struct's own `T`).
+        (
+            "a value of the type `other`, which is neither a struct nor an enum",
+            HELP_UNBOUND_NAME,
+            |i| Ty::Named(i.intern("other")),
+        ),
         // Unreachable: the driver stops on sema's error first.
-        ("a value of type `<error>`", |_| Ty::Error),
-        // Unreachable: a function is a value only as a function-typed parameter.
-        ("a value of type `fn(f32) -> f32`", |_| Ty::Fn {
-            params: vec![Ty::Scalar(Scalar::F32)],
-            ret: Box::new(Ty::Scalar(Scalar::F32)),
+        ("a value of type `<error>`", HELP_UNREACHABLE_TYPE, |_| {
+            Ty::Error
         }),
-        // Unreachable: a name declared as something other than a type (`E0324`).
-        ("a value of type `other`", |i| Ty::Named(i.intern("other"))),
     ];
-    for (what, ty) in cases {
+    for (what, help, ty) in cases {
         let (mut module, mut sema, mut interner) = checked(src);
         let (id, span) = {
             let lets = lets_mut(&mut module, &interner, "locals");
@@ -339,6 +367,72 @@ fn a_value_type_with_no_representation_is_refused() {
         sema.types.insert(id, ty(&mut interner));
         let (_, diags) = lower_program(&module, &sema, &mut interner);
         assert_one_refusal(&diags, what, Some(span));
+        assert_eq!(help_of(&diags), help, "{what}");
+    }
+}
+
+/// A type parameter no call binds is opaque even when a `const`, `fn`, enum or struct of the same
+/// name exists: the enclosing function's generics decide it, not the item registry. Sized from the
+/// registry, `fn g<E>` over a C-style `enum E` gave `y` an `i32` slot (`y = 2.5; println(y)`
+/// printed `2` on both backends), `fn g<P>` over a `struct P` gave it the struct's buffer (a MIR
+/// verifier ICE), and `fn g<N>` over a `const N` took the debug-build panic for a non-type name.
+#[test]
+fn a_type_parameter_that_shadows_an_item_is_refused_not_sized_as_the_item() {
+    let items = "const N: usize = 4;\n\
+                 fn h(x: i32) -> i32 { return x; }\n\
+                 enum E { A, B }\n\
+                 enum D { V(i64), W }\n\
+                 struct P { a: i32, b: i32 }\n";
+    for shadowed in ["N", "h", "E", "D", "P"] {
+        let src = format!(
+            "{items}\
+             fn g<{shadowed}>(n: i32) -> i32 {{\n\
+                 let _y: {shadowed};\n\
+                 return n;\n\
+             }}\n\
+             fn main() -> i32 {{ return g(0) + h(0); }}\n"
+        );
+        let (mut module, sema, mut interner) = checked(&src);
+        let span = lets_mut(&mut module, &interner, "g")[0]
+            .0
+            .as_ref()
+            .unwrap()
+            .span;
+        let (_, diags) = lower_program(&module, &sema, &mut interner);
+        assert_one_refusal(
+            &diags,
+            &format!("a value of the unbound type parameter `{shadowed}`"),
+            Some(span),
+        );
+        assert_eq!(help_of(&diags), HELP_BIND_TYPE_PARAM, "{shadowed}");
+    }
+}
+
+/// A function named as a value outside a call is refused as `C0001` where it is lowered, with no
+/// detour through the compiler-bug refusal: in an array literal (sema types it
+/// `[fn(f32) -> f32; 2]`) and alone as a statement. Both were the debug-build panic.
+#[test]
+fn a_function_value_outside_a_call_is_a_codegen_limit() {
+    for body in ["let _fs = [square, square];", "square;"] {
+        let src = format!(
+            "fn square(x: f32) -> f32 {{ return x * x; }}\n\
+             fn main() -> i32 {{ {body} return 0; }}\n"
+        );
+        let (module, sema, mut interner) = checked(&src);
+        let (_, diags) = lower_program(&module, &sema, &mut interner);
+        let errs = errors(&diags);
+        assert!(!errs.is_empty(), "{body}: lowered clean");
+        for (code, message) in &errs {
+            assert_eq!(*code, Some("C0001"), "{body}: {errs:?}");
+            assert!(!message.contains("<error>"), "{body}: {message}");
+        }
+        assert!(
+            diags.iter().all(|d| d
+                .notes
+                .iter()
+                .all(|(_, text)| text != HELP_UNREACHABLE_TYPE)),
+            "{body}: the compiler-bug refusal: {diags:?}"
+        );
     }
 }
 
