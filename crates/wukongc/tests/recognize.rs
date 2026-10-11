@@ -82,7 +82,7 @@ fn wukongc(args: &[&str], path: &Path, no_recognize: bool) -> (Option<i32>, Stri
 /// then inspects its mantissas instead of being restricted to data where neutrality is free. Keep
 /// each bound cited the way `corpus_lint.rs::DECLARED_TOLERANCES` requires of the run corpus.
 ///
-/// The entries print raw exp/log/sin/cos kernel lanes, where no f32 bit pattern is "the"
+/// The three entries print raw exp/log/sin/cos kernel lanes, where no f32 bit pattern is "the"
 /// answer: recognition swaps the kernel's polynomial (and its 8-wide reassociated row folds) for the
 /// generic lowering's own transcendentals, so the two columns legitimately differ in the last bits.
 /// Derivation of the bound: every printed lane of each fixture carries an `EXPECT-OUT-APPROX`
@@ -91,10 +91,13 @@ fn wukongc(args: &[&str], path: &Path, no_recognize: bool) -> (Option<i32>, Stri
 /// holds the recognized column to them, and the recognition-off column was measured against them
 /// when the fixtures landed (worst lane at 0.9% of its tolerance). Two values each within `t|ref|`
 /// of the reference differ by at most `2t/(1-t)` relative to either: 2.002e-3 at `t = 1e-3`,
-/// declared as 2.1e-3. Measured on/off differences at landing: 2.1e-7 (loss), 1.4e-7 (rope) —
-/// one to two f32 ULP.
-const REASSOCIATION_TOLERANCES: &[(&str, f64)] =
-    &[("cov4_par_loss.wk", 2.1e-3), ("cov4_par_rope.wk", 2.1e-3)];
+/// declared as 2.1e-3. Measured on/off differences at landing: 2.1e-7 (loss), 1.4e-7 (rope),
+/// 1.8e-7 (rowkernels_wide) — one to two f32 ULP.
+const REASSOCIATION_TOLERANCES: &[(&str, f64)] = &[
+    ("cov4_par_loss.wk", 2.1e-3),
+    ("cov4_par_rope.wk", 2.1e-3),
+    ("cov4_rowkernels_wide.wk", 2.1e-3),
+];
 
 /// The declared tolerance for a fixture, or `None` (bit-exact) when it has no entry.
 fn tolerance_for(name: &str) -> Option<f64> {
