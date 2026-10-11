@@ -5,6 +5,38 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Coverage corpus (`gap4/coverage-corpus`)
+
+- **Every emittable runtime kernel has a `tests/run` witness, and the census now fails without
+  one.** The 46 `_parallel` twins the corpus never emitted (column reductions, column/row arg,
+  scans, pooling, dequant, the f16 dot, the row losses, the int8 GEMM + dequant, the norms and
+  their backwards, RoPE, the half-precision and TN GEMMs, GEMV/GEVM, transpose) and the five
+  decode-builtin twins a `lib.rs`-only scan could not see each get a `tests/run/cov4_par_*.wk`
+  fixture: a `@parallel` function whose recognized arm emits the twin, every lane printed against
+  values derived from the loop's scalar semantics (exact by construction, or `EXPECT-OUT-APPROX`
+  against an independent f64 reference under a cited kernel bound). `recognize.rs` now scans every
+  `wukong_mir_build` source file and fails on an emittable symbol with no witness unless it is in
+  `NEVER_EMITTED_ALLOWLIST` with a reason (empty).
+- **A forced-parallel lane.** No corpus fixture was large enough to pass a `_parallel` kernel's
+  work gate, so every gate had only ever run their serial fallbacks. `parallel_lane.rs` reruns each
+  of the 43 programs that dispatch a `_parallel` kernel with `WUKONG_PAR_MIN_WORK=1`,
+  `WUKONG_GEMM_PAR_MIN_MACS=1`, `WUKONG_VELEM_PAR_MIN=1` and `WUKONG_PACK_PAR_MIN_KB=0`, and holds
+  it byte-identical to the default-gate native run and the interpreter. All 43 agree.
+- **Wide row kernels.** `tests/run/cov4_rowkernels_wide.wk` runs softmax backward, RoPE and the
+  cross-entropy forward/backward rows at 19 and 37 columns (across the 8-wide seam into a ragged
+  tail), every lane against an f64 reference.
+- **Runnable examples carry their expected output.** `examples.rs` requires an `EXPECT-EXIT` and an
+  `EXPECT-OUT*` header (the `tests/run` grammar, one shared parser) on every runnable example and
+  compares the output; "exit 0 with some output" was all it checked before.
+- **The full-buffer fuzzer gained a recognition-off arm.** Each kernel is also lowered with
+  recognition off and run on the interpreter; the recognized native output must match it bit for
+  bit (elementwise kernels) or within a derived bound (reductions, GEMMs, norms). It found two
+  recognizer-versus-source divergences, recorded with reproducers rather than tolerated silently:
+  `2.0 * x + y` with `x = y = -0.0` gives `+0` when it dispatches to `wukong_velem_f32` (the
+  kernel's `+0.0` affine constant), and the `x < 6 ? (x > 0 ? x : 0) : 6` spelling of ReLU6 gives
+  `0` instead of `6` for a NaN input when it dispatches to the max-first `VE_RELU6`. An affine
+  RMSNorm without a beta loses the sign of a `0 * negative gamma` lane the same way.
+
 ### Index-recording reductions (`gap3/vec-argmax`)
 
 - **Argmax/argmin and FindLastIV loops vectorize.** `if x[i] > m { m = x[i]; at = i; }` (and its
