@@ -163,10 +163,15 @@ Three things must land together, because two gates enforce the pairing:
 3. **A fixture or probe** — `tests/fail/<name>.wk` whose first line is `// EXPECT-CODE: E0210`,
    followed by a `module tests.fail.<name>` header, a comment saying *why* the construct is
    rejected, and the minimal program that trips it. `crates/wukongc/tests/fail.rs` compiles every
-   fixture with `--error-format=json --emit=mir` and asserts the process fails, that stderr contains
-   `"code":"E0210"`, and that `explain` knows the code. Lexer/parser codes that cannot live in a
-   well-formed file (unterminated string/comment) go in the inline `LEXER_PARSER_PROBES` table in
-   that same file instead.
+   fixture with `--error-format=json --emit=mir` and asserts the process fails, that the first
+   diagnostic is an error with code `E0210`, and that `explain` knows the code. It also pins the
+   rest of the error stream: `// EXPECT-COUNT: <n>` is the exact number of errors, and a trailing
+   `//~ E0210` (`//~^` for the line above) says an error with that code has its primary span on that
+   line — a fixture with any `//~` must annotate every error in its own file. Write the fixture,
+   run `WUKONG_BLESS=1 cargo test -p wukongc --test fail` (it writes the count and the annotations
+   from the real output, never `EXPECT-CODE`, and fails on purpose), review the diff, and rerun
+   without it. Lexer/parser codes that cannot live in a well-formed file (unterminated
+   string/comment) go in the inline `LEXER_PARSER_PROBES` table in that same file instead.
 
 `crates/wukong_diag/tests/catalog_coverage.rs` enforces the catalogue in **both** directions — a
 code some stage emits with no entry (`every_emitted_code_is_catalogued`) and an entry no stage emits
@@ -183,6 +188,9 @@ row in `LINTS` (`crates/wukong_sema/src/lints.rs`) — the name is what `-A/-W/-
 that must stay silent, `// FLAGS:` for extra arguments). `crates/wukongc/tests/warn.rs` compares the
 whole JSON diagnostic stream, so a fixture pins what a lint must NOT say as much as what it must. A
 lint must err toward silence: a finding the user cannot fix without an `@allow` is a lint bug.
+`corpus_is_warning_free` in the same file compiles every `tests/run` and `examples` program with
+the default levels, so **a new run fixture or example must be warning-free** (or carry an `@allow`
+with a one-line reason where the warned construct is the fixture's point).
 
 ## Adding an optimizer pass
 

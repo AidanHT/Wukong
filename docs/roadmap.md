@@ -785,13 +785,16 @@ another architecture or OS is not supported. A native-backend failure is a catal
   sema): `W0001 unused_variables`, `W0002 unused_mut`, `W0003 unreachable_code` (divergence judged
   exactly as the definite-return check judges it), `W0004 unused_result` (`out[i] == x;` written
   for `=`), `W0005 dead_code`, `W0006 unwritten_output` (a `mut` aggregate parameter never stored
-  to), `W0007 unknown_lints` and `W0020 unreachable_patterns` (a `match` arm every value of which an
-  earlier unguarded arm already matches). Levels come from rustc-style `-A/-W/-D <lint>` (`-D warnings`) and
+  to), `W0007 unknown_lints`, `W0008 unused_imports` (found by the import loader's module-scoped
+  resolution, in every file of the program) and `W0020 unreachable_patterns` (a `match` arm every
+  value of which an earlier unguarded arm already matches). Levels come from rustc-style `-A/-W/-D <lint>` (`-D warnings`) and
   `@allow/@warn/@deny(<lint>)` on a function, parameter or statement, innermost first. Warnings
   print after errors, so `tests/fail`'s first-diagnostic contract holds; `tests/warn/` pins each
-  lint's exact output (`crates/wukongc/tests/warn.rs`). Not yet: `unused_imports` (waits for the
-  module-scoped resolver), the corpus held to zero warnings (the census test is `#[ignore]`d until a
-  first full run blesses `tests/run` and `examples/`), and machine-applicable suggestions.
+  lint's exact output (`crates/wukongc/tests/warn.rs`), and `corpus_is_warning_free` holds every
+  `tests/run` and `examples/` program to zero warnings. Mechanical fixes travel as structured
+  suggestions with exact byte ranges (`W0030`'s `;`, `W0008`'s deletion, `E0304`'s `mut `, the
+  resolution codes' did-you-mean and `Type::f` / `()` edits). Not yet: a label on every caret —
+  sema's shared `Sema::error` helper still renders an empty one at about 260 sites.
 - **Statement terminators.** `;` stays optional where it always was, but leaving it out is now
   **`W0030 missing_semicolon`** (Rust's exemptions: after a block-like statement, and before the
   closing `}` for anything but a `let`), and a `(`/`[` — or a `-` touching its operand — at the

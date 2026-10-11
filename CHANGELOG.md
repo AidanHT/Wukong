@@ -5,6 +5,31 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Diagnostics (`gap4/diagnostics`)
+
+- **`unused_imports` (`W0008`, N3).** An `import` no name of its file resolves through — a glob or
+  `as` import none of whose names or qualifier is used, a second import of an already imported
+  module, or the unused names of a `{x, y}` selection — is a warning, in every file of the program,
+  judged by the import loader's own module-scoped resolution (a shadowing local does not use the
+  import; a method call keeps the import that loads its `impl`). It carries a machine-applicable
+  fix that deletes the import or rewrites the selection, honours `-A/-W/-D unused_imports` and an
+  `@allow` on the `import` itself, and is silent for `--emit=obj`/`llvm-ir`. The run corpus and the
+  examples are warning-free and `corpus_is_warning_free` is now a gate.
+- **Parser lints reach every file (N8).** An imported module's missing `;` (`W0030`) and line-leading
+  continuation (`W0031`) were dropped by the loader; they now report with that file's path and go
+  through the same levels. A `defer` statement needs its `;` like any simple statement (a deferred
+  block excepted).
+- **Fixes as data (N5).** `W0030` inserts the `;`, `E0304` inserts `mut ` at the binding (machine-
+  applicable for a rebind), an associated function called bare (`E0320`) suggests `Type::f`, a
+  method read like a field (`E0321`) suggests `()`, a field called like a method (`E0323`) suggests
+  deleting the argument list, and a struct literal of an enum (`E0324`) suggests `::Variant` — each
+  in `--error-format=json`'s `suggestions` with an exact byte range. Every caret in the resolution
+  and lint passes has a label.
+- **The compile-fail gate pins the whole error stream (N12).** `// EXPECT-COUNT: <n>` and trailing
+  `//~ <CODE>` (`//~^`/`//~v`) annotations pin how many errors a `tests/fail` fixture reports and the
+  line of each; `WUKONG_BLESS=1 cargo test -p wukongc --test fail` rewrites them from the real output
+  (never `EXPECT-CODE`) and fails on purpose for review. All 210 fixtures are annotated.
+
 ### Index-recording reductions (`gap3/vec-argmax`)
 
 - **Argmax/argmin and FindLastIV loops vectorize.** `if x[i] > m { m = x[i]; at = i; }` (and its
