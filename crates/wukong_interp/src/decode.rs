@@ -161,6 +161,14 @@ impl Interp<'_, '_> {
             Ok(None) => return Ok(status(KV_OK)),
             Err(code) => return Ok(status(code)),
         };
+        // The cache operand is the whole `[cache, cache + ncache)` the entry may write (the plan
+        // proved the row lies inside it), so it must lie inside ONE allocation before anything is
+        // copied. Checking only the destination row, against whichever allocation held it, let a
+        // cache whose stated length overran its allocation write a row into the next allocation.
+        let cache = ptr_arg(args, 0, name, "cache")?;
+        let ncache = usize::try_from(arg_i64(args, 1))
+            .map_err(|_| format!("{name}: cache extent overflow"))?;
+        kernel_values(arena!(self), 0, cache, 1, ncache, name)?;
         let row = marshal::read_f32(
             arena!(self),
             2,
@@ -168,7 +176,6 @@ impl Interp<'_, '_> {
             row_len as usize,
             name,
         )?;
-        let cache = ptr_arg(args, 0, name, "cache")?;
         let dst = cache
             .checked_add(off)
             .ok_or_else(|| format!("{name}: cache out of bounds"))?;

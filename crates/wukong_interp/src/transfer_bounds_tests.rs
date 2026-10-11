@@ -629,6 +629,70 @@ fn embedding_rows_are_bounded_by_the_weight_operand_allocation() {
     }
 }
 
+/// KV append: the cache operand is `[cache, cache + ncache)` — the extent the runtime entry is
+/// told it may write — and it must lie inside ONE allocation before the row is copied. A cache
+/// whose stated length overruns its allocation used to have only the destination row checked,
+/// against whichever allocation held it, so a row landing wholly in the neighbour was written there.
+#[test]
+fn kv_append_cache_must_stay_inside_its_allocation() {
+    let program = Program::new();
+    let interner = Interner::new();
+    let name = "wukong_kv_append_f32";
+    // cache [0, 4) = one 4-wide row; neighbour [4, 8); row [8, 12).
+    let mut memory = vec![Value::Unit; 12];
+    memory[4..8].fill(F(9.0));
+    memory[8..12].copy_from_slice(&[F(1.0), F(2.0), F(3.0), F(4.0)]);
+    let blocks = [(0, 4), (4, 4), (8, 4)];
+    // Exact fit: position 0 of a one-row cache.
+    let mut interp = tracked(&program, &interner, memory.clone(), &blocks);
+    assert_eq!(
+        interp
+            .intrinsic(name, &[P(0), I(4), P(8), I(4), I(0), I(4)])
+            .unwrap(),
+        I(0)
+    );
+    exact_values(
+        &interp.memory[..8],
+        &[
+            F(1.0),
+            F(2.0),
+            F(3.0),
+            F(4.0),
+            F(9.0),
+            F(9.0),
+            F(9.0),
+            F(9.0),
+        ],
+    );
+    // `ncache = 8` overstates the cache: position 1 lands wholly inside the neighbour. Refused
+    // with every slot untouched — and so is position 0, whose row alone would fit: the operand
+    // the entry may write is the whole stated cache.
+    for pos in [1, 0] {
+        let mut interp = tracked(&program, &interner, memory.clone(), &blocks);
+        assert_eq!(
+            interp
+                .intrinsic(name, &[P(0), I(8), P(8), I(4), I(pos), I(4)])
+                .unwrap_err(),
+            format!("{name}: operand 0 extends past its allocation")
+        );
+        exact_values(&interp.memory, &memory);
+    }
+    // The row one slot short of its allocation is refused by its own index.
+    let mut interp = tracked(
+        &program,
+        &interner,
+        memory.clone(),
+        &[(0, 4), (4, 4), (8, 3), (11, 1)],
+    );
+    assert_eq!(
+        interp
+            .intrinsic(name, &[P(0), I(4), P(8), I(4), I(0), I(4)])
+            .unwrap_err(),
+        format!("{name}: operand 2 extends past its allocation")
+    );
+    exact_values(&interp.memory, &memory);
+}
+
 /// A file read lands only inside the destination's allocation: a request that fits the arena but
 /// not the destination is refused before a byte is decoded; an exact fit reads.
 #[test]
