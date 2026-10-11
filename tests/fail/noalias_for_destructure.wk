@@ -1,0 +1,22 @@
+// EXPECT-CODE: E0316
+// EXPECT-COUNT: 1
+module tests.fail.noalias_for_destructure
+
+// A destructuring `for` head binds each aggregate part of an element BY POINTER into the iterated
+// array, exactly as `for x in grid` binds `x`: `row` below is `grid[i].0` itself, not a copy. So
+// `bump(row, grid)` hands the promised `out` and the unpromised `g` one buffer under two names, the
+// same broken promise as `for x in grid { bump(x.0, grid) }` and rejected the same way. Before the
+// check followed the pattern into the element, this compiled, and the interpreter's 7 (the store
+// through `out` seen by the read of `g`) was an answer the optimizer was entitled to change.
+fn bump(@noalias mut out: [i32; 2], g: [([i32; 2], i32); 2]) -> i32 {
+    out[0] = 7;
+    return g[0].0[0];
+}
+
+fn main() -> i32 {
+    let grid: [([i32; 2], i32); 2] = [([1, 2], 10), ([3, 4], 20)];
+    for (row, _) in grid {
+        print(bump(row, grid)); //~ E0316
+    }
+    return 0;
+}

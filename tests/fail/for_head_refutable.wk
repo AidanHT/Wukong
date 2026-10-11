@@ -1,0 +1,16 @@
+// EXPECT-CODE: E0442
+// EXPECT-COUNT: 1
+module tests.fail.for_head_refutable
+
+// A destructuring `for` head binds every element without testing it, so its pattern must match
+// every element. `(0, x)` would leave `x` meaningless for each pair whose first field is not 0.
+// Match inside the loop body instead: `for (k, x) in pairs { if k == 0 { ... } }`.
+fn main() -> i32 {
+    let pairs: [(i32, i32); 3] = [(0, 1), (2, 3), (0, 4)];
+    let mut t: i32 = 0;
+    for (0, x) in pairs { //~ E0442
+        t = t + x;
+    }
+    print(t);
+    return 0;
+}

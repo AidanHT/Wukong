@@ -23,6 +23,64 @@ All notable changes to Wukong are documented here. The format is loosely based o
   move the carets. `docs/internals.md` records the rule, and a new render test pins it next to the
   existing tab and wide-character tests.
 
+### Match fall-through, destructuring `for` heads and `if let` chains (`gap5/match-fallthrough-pattern-sugar`)
+
+- **A proven-exhaustive `match` takes its last arm untested (N29).** Sema now publishes the matches
+  pattern usefulness proved exhaustive (`SemaResult::exhaustive_matches`), over a concrete scrutinee
+  type whose all-zero value the analysis models, and `lower_match` lowers the last unguarded arm of
+  each with no compare and no `unreachable` trap. An exhaustive `bool` match is one branch, an
+  N-variant enum dispatch N − 1 tests (a six-variant enum now forms a five-case `switch` whose default
+  is the last arm), identically at every `-O` level and on every backend; no MIR op or optimizer fold
+  is involved. A match over a type whose zero value no arm models — an uninitialized
+  `let e: E;` of `enum E { A = 1, B = 2 }` is zero-filled — is not proven and keeps its tests and its
+  trap (`tests/run/match_exhaustive_fallthrough.wk`). The usefulness analysis and mir_build's
+  `pattern_cond` are now a mirror pair; `wukong_opt` runs every `u8` and `i8` value through compiled
+  matches against Rust's `match` to pin it.
+- **A match guard runs only after its pattern matched.** It was lowered in the pattern's test block
+  and ANDed with the test, so `match x { E::A(v) if noisy(v) => …, _ => … }` called `noisy` on an
+  `E::B`, reading `v` out of the wrong payload. The guard now has a block that only the pattern's
+  success edge reaches (`tests/run/match_guard_order.wk`). A guard is also checked like an `if`
+  condition: a `()`, aggregate or tensor guard is `E0436`.
+- **Destructuring `for` heads (N26).** `for (i, x) in pairs`, `for Point { x, y } in pts`,
+  `for [a, .., z] in rows`, nested tuples and `w @ (a, b)` over an array or a slice bind each element
+  as `let <pat> = a[i];` would; they were `C0001` ("for over a non-range iterator"). The head must be
+  irrefutable by its form: a literal, range, path, or-pattern or multi-variant enum variant inside it
+  is `E0442`, and a range `for` or any iterand other than an array or slice cannot destructure
+  (`E0401`) (`tests/run/for_destructure.wk`, `tests/fail/for_head_refutable.wk`,
+  `tests/fail/for_range_destructure.wk`). A function that destructures aggregate elements is
+  alias-tainted, so an aliasing-sensitive kernel in it conservatively declines.
+- **`@noalias` (`E0316`) sees through destructuring `for` heads and `match` arms.** An aggregate
+  part of a `for` element, the whole of `w @ (..)`, and an aggregate a `match` binds out of a place
+  scrutinee are all bound by pointer into the storage they came from, but the call-site check gave
+  every name such a pattern binds a fresh root. `for (row, _) in grid { k(row, grid) }` compiled —
+  the interpreter observed the store through the promised parameter, which the optimizer is entitled
+  to assume nothing else sees — though `for x in grid { k(x.0, grid) }` was `E0316`; so did
+  `match grid[0] { (row, _) => k(row, grid) }`, which predates this branch. Each name is now that
+  part's place, projected through the tuple, struct and payload fields that lead to it (two
+  different fields stay two buffers) (`tests/fail/noalias_for_destructure.wk`).
+- **A variant pattern must match a value of its enum (`E0401`).** `W::Only(v)` was never checked
+  against the value's type: `for W::Only(v) in ps` over a struct array bound `v` to each struct's
+  second field, over an `i32` array stopped the compiler with an internal MIR-verifier error, and
+  `match`/`let` were open the same way (`match x { W::A(v) => v, _ => 0 }` on another enum read its
+  payload with W's layout). It now follows the struct pattern's rule ("mismatched pattern: this
+  matches a `W`, but the value is `P`"; `tests/fail/for_head_variant_mismatch.wk`).
+- **`if let P = e && c1 && c2` and `while let P = e && c` (N26).** The `&&` chain becomes the guard of
+  the pattern's arm: the conditions run only after the pattern matched, left to right with
+  short-circuit, and see its bindings (`tests/run/if_let_chain.wk`). **Behaviour change:** the
+  scrutinee now stops before a top-level `&&`/`||`. `if let P = a || b` used to parse with `a || b` as
+  the scrutinee and is now `E0200` (write `(a || b)` for that scrutinee, or `&& (b || c)` to group a
+  condition; `tests/fail/if_let_chain_or.wk`). A `&&` that used to be part of the scrutinee is now a
+  guard, silently: `if let P = a && b` matches `P` against `a` alone and then requires `b`. That is
+  the old result only for a `true` pattern. A `false` or binding pattern now means something else —
+  `if let false = a && b` used to take its block when `a` and `b` are both false and no longer does,
+  and `if let v = a && b` no longer runs at all when `b` is false — so parenthesize `(a && b)` to
+  keep the old meaning. A second `let` in one chain is `E0200`. No `.wk` file in the repository used
+  either form. Each `&&` of the chain is charged to the parser's nesting budget, as a fold of any
+  other `&&` chain is, so a pathologically long one is `E0209` rather than a guard too deep for the
+  passes after the parser.
+- **A binding inside an or-pattern** (`E::A(v) | E::B(v) => v`) is refused once at the pattern
+  (`C0001`, "a binding inside an or-pattern") instead of at every use of the name.
+
 ### Type-lowering soundness (`gap4/sema-soundness`)
 
 - **No silent `i32` slots (N2).** MIR lowering classified any type it did not recognize as `i32`

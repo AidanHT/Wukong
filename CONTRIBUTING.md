@@ -279,6 +279,18 @@ diagnostic, never silence, which is why `@tile` on a loop form it cannot strip-m
 width that is not a positive integer literal, are both `E0309` (`tests/fail/tile_bad_form.wk`,
 `tile_zero_width.wk`, `tile_non_integer_width.wk`).
 
+LANDMINE: **pattern semantics live in two places that must agree.** `wukong_sema::usefulness`
+(exhaustiveness, `E0405`/`W0020`, and the proven-exhaustive verdict) and `wukong_mir_build`'s
+`pattern_cond` (the arm tests) each decide which values a pattern matches — how a literal is read at
+the scrutinee's width, which bound of a range is exclusive, what a `char` literal decodes to. Since a
+proven match takes its last arm **untested**, a value the two disagree on no longer traps: it silently
+takes that arm. Change one and you must change the other. `wukong_opt`'s
+`exhaustive_int_match_agrees_with_rust_on_every_value` runs every `u8`/`i8` value through both and
+against Rust's own `match`; the two `char`-literal decoders (`usefulness::char_value` and
+`decode_char_literal`) are **not** pinned by any test, so an escape-syntax change must touch both. A
+new way to forge a value the analysis does not model (the one today is the zero fill of
+`let e: E;`, handled by `zero_value_modeled`) needs the same treatment.
+
 ## Adding a MIR `Op`
 
 Prefer *not* to: `abs`, `exp`, `silu` and friends are built from existing primitives in

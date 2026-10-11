@@ -41,6 +41,8 @@ mod externs;
 #[cfg(test)]
 mod fp_contract_tests;
 mod kernel_guard;
+#[cfg(test)]
+mod match_tests;
 mod methods;
 mod minmax;
 mod noalias;
@@ -14592,11 +14594,13 @@ impl FnLowerer<'_> {
                 step,
             } => (start, end, *inclusive, step),
             _ => {
-                // `for <pat> in arr` over a fixed-size array desugars to the indexed range loop
-                // `for i in 0..N { let <pat> = arr[i]; <body> }` — a pure front-end rewrite reusing
-                // the existing Gep/Load/CFG, so the interpreter and native backend agree bit-for-bit
-                // with no backend change. Anything not a statically-sized array (a tensor, slice,
-                // dynamic length, or a non-`Ident`/`_` pattern) declines and stays unsupported.
+                // `for <pat> in arr` over a fixed-size array or a slice desugars to the indexed
+                // range loop `for i in 0..N { let <pat> = arr[i]; <body> }` — a pure front-end
+                // rewrite reusing the existing Gep/Load/CFG, so the interpreter and native backend
+                // agree bit-for-bit with no backend change. `<pat>` is a name, `_`, or a
+                // destructuring pattern sema proved irrefutable (`for (i, x) in pairs`). A tensor
+                // iterates its leading axis (`lower_for_tensor`); anything else (a literal head, an
+                // iterand of another type) declines and stays unsupported.
                 if let ForIter::Expr(e) = iter {
                     if self.lower_for_array(label, pat, e, body) {
                         return;
@@ -15613,15 +15617,21 @@ impl FnLowerer<'_> {
         true
     }
 
-    /// Desugar `for <pat> in <array>` — iterate the elements of a fixed-size array — into the same
-    /// CFG the indexed range loop `for i in 0..N { let <pat> = <array>[i]; <body> }` produces.
-    /// Returns `true` if it handled the loop. It fires only when the iterand's sema type is a
-    /// statically sized `[T; N]` and the pattern is an identifier (`for x in a`) or `_` wildcard
-    /// (`for _ in a`); anything else (a tensor, slice, dynamic length, or a destructuring pattern)
-    /// returns `false` so the caller emits the existing `unsupported` diagnostic. Pure desugaring:
-    /// the array base pointer + per-iteration `Gep`/`Load` are exactly what `for i in 0..N { let x
-    /// = a[i]; … }` already lowers to, so the interpreter and native backend agree bit-for-bit with
-    /// **no backend change** (and `-O0`==`-O3`, since recognition runs pre-opt like the rest).
+    /// Desugar `for <pat> in <array>` — iterate the elements of a fixed-size array or a slice —
+    /// into the same CFG the indexed range loop `for i in 0..N { let <pat> = <array>[i]; <body> }`
+    /// produces. Returns `true` if it handled the loop. It fires when the iterand's sema type is a
+    /// statically sized `[T; N]` or a `[]T` slice (a tensor goes to `lower_for_tensor`) and the
+    /// pattern is an identifier (`for x in a`), `_` (`for _ in a`), or an irrefutable destructuring
+    /// pattern — a tuple, struct, array, `name @ sub` or one-variant-enum variant pattern
+    /// (`for (i, x) in pairs`, `for Point { x, y } in pts`). Sema has proved the destructuring
+    /// pattern irrefutable by its form (E0442, `check_for_pattern`), so it is bound, never
+    /// tested: at the element's place, exactly as a match arm binds it (`bind_field_pattern`), so
+    /// a scalar part is copied into a fresh slot (mutating it does not write back) and an
+    /// aggregate part is bound by pointer. Anything else returns `false`, and the caller emits
+    /// the `unsupported` diagnostic. Pure desugaring: the base pointer + per-iteration `Gep`/`Load`
+    /// are exactly what `for i in 0..N { let x = a[i]; … }` already lowers to, so the interpreter
+    /// and native backend agree bit-for-bit with **no backend change** (and `-O0`==`-O3`, since
+    /// recognition runs pre-opt like the rest).
     fn lower_for_array(
         &mut self,
         label: Option<Symbol>,
@@ -15629,11 +15639,20 @@ impl FnLowerer<'_> {
         e: &Expr,
         body: &Block,
     ) -> bool {
-        // Only a bare identifier (`for x in a`) or wildcard (`for _ in a`) is supported; a
-        // destructuring / literal pattern declines to the `unsupported` fallback.
-        let bind_name = match &pat.kind {
-            ast::PatKind::Ident(name) => Some(*name),
-            ast::PatKind::Wildcard => None,
+        /// What the loop pattern binds per element.
+        enum ForBind<'p> {
+            None,
+            Name(Symbol),
+            Destructure(&'p Pattern),
+        }
+        let bind = match &pat.kind {
+            ast::PatKind::Ident(name) => ForBind::Name(*name),
+            ast::PatKind::Wildcard => ForBind::None,
+            ast::PatKind::Tuple(_)
+            | ast::PatKind::Struct { .. }
+            | ast::PatKind::Slice { .. }
+            | ast::PatKind::Binding { .. }
+            | ast::PatKind::Variant { .. } => ForBind::Destructure(pat),
             _ => return false,
         };
         // The iterand must be a fixed-size **array** or a **slice**; both desugar to the indexed range
@@ -15643,7 +15662,10 @@ impl FnLowerer<'_> {
             Ty::Array { elem, .. } => (*elem, false),
             Ty::Slice(elem) => (*elem, true),
             // A tensor iterates its leading axis — elements, or row views (`shape_ops`).
-            Ty::Tensor { .. } => return self.lower_for_tensor(label, pat, e, body),
+            // (A destructuring head over a tensor is sema's E0401.)
+            Ty::Tensor { .. } if !matches!(bind, ForBind::Destructure(_)) => {
+                return self.lower_for_tensor(label, pat, e, body)
+            }
             _ => return false,
         };
         let elem_mir = self.mir_ty_of(&elem);
@@ -15703,16 +15725,26 @@ impl FnLowerer<'_> {
         // *latch* (which performs `i += 1`), matching the range-`for` so `continue` advances.
         self.builder.switch_to(body_bb);
         self.terminated = false;
-        if let Some(name) = bind_name {
-            let i_cur = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
-            let elem_ptr = self.builder.build(
-                MirType::Ptr,
-                Op::Gep {
-                    ptr: base_ptr,
-                    index: i_cur,
-                    elem: elem_mir.clone(),
-                },
-            );
+        let elem_ptr = match bind {
+            ForBind::None => None,
+            ForBind::Name(_) | ForBind::Destructure(_) => {
+                let i_cur = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
+                Some(self.builder.build(
+                    MirType::Ptr,
+                    Op::Gep {
+                        ptr: base_ptr,
+                        index: i_cur,
+                        elem: elem_mir.clone(),
+                    },
+                ))
+            }
+        };
+        if let (ForBind::Destructure(p), Some(elem_ptr)) = (&bind, elem_ptr) {
+            // Bound at the element's place exactly as a match arm binds the same pattern: a
+            // scalar part copied into a fresh slot, an aggregate part by pointer.
+            self.bind_field_pattern(p, elem_ptr, &elem);
+        }
+        if let (ForBind::Name(name), Some(elem_ptr)) = (bind, elem_ptr) {
             if matches!(elem_mir, MirType::Array(..)) {
                 // An aggregate element (struct / tuple / array) binds **by pointer** — `x.field`
                 // / `x[k]` / `x.0` GEP off it — exactly as the `a[i]` aggregate read arm does.
@@ -21356,9 +21388,17 @@ impl FnLowerer<'_> {
     /// for equality; a wildcard/identifier always matches) and, if present, its guard, branching to
     /// the arm body or the next test. An `Ident` pattern binds the scrutinee value in the arm scope.
     /// When the `match` is used as a value, a merge-block parameter collects each arm body's result.
-    /// An unconditional catch-all arm (a bare `_`/identifier with no guard) ends the chain; if none is
-    /// present the structurally-emitted fallthrough is `Unreachable` (sema's E0405 rejects any
-    /// value-producing non-exhaustive match, so it is dynamically dead).
+    ///
+    /// An unconditional arm ends the chain: a bare `_`/identifier/`()` with no guard, or — in a
+    /// match sema PROVED exhaustive (`SemaResult::exhaustive_matches`) — the last unguarded arm,
+    /// whatever its pattern. In a proven match every value matches some unguarded arm, and a value
+    /// that reaches the last one has failed every arm before it, so that arm needs no test; arms
+    /// after it (guarded ones only) can never be selected. It binds its pattern exactly as a tested
+    /// arm would, and neither its compare nor the trap block is emitted, at every `-O` level and on
+    /// every backend alike. An exhaustive `bool` match is one branch, an N-variant enum dispatch
+    /// N - 1 tests. With no unconditional arm (an unproven match: a pattern usefulness cannot
+    /// place, a scrutinee type whose zero value no arm models, or a node `defer`/`tindex`
+    /// renumbered) the structurally-emitted fallthrough is `Unreachable`, which traps.
     fn lower_match(&mut self, scrutinee: &Expr, arms: &[ast::MatchArm], e: &Expr) -> ValueId {
         let result_ty = self.expr_mir(e);
         let produces_value = result_ty != MirType::Void;
@@ -21381,11 +21421,18 @@ impl FnLowerer<'_> {
         // every arm `return`s — `merge` is dead and is terminated `Unreachable` below.
         let mut handled_default = false;
         let mut merge_reachable = false;
-        for arm in arms {
-            let unconditional = matches!(
+        // The arm a proven-exhaustive match takes untested (see the doc comment).
+        let fallthrough = if self.sema.exhaustive_matches.contains(&e.id) {
+            arms.iter().rposition(|a| a.guard.is_none())
+        } else {
+            None
+        };
+        for (i, arm) in arms.iter().enumerate() {
+            let unconditional = (matches!(
                 &arm.pat.kind,
                 ast::PatKind::Wildcard | ast::PatKind::Ident(_) | ast::PatKind::Unit
-            ) && arm.guard.is_none();
+            ) && arm.guard.is_none())
+                || fallthrough == Some(i);
 
             if unconditional {
                 // Always matches: lower the body directly, then the remaining arms are unreachable.
@@ -21404,9 +21451,13 @@ impl FnLowerer<'_> {
             // scoped to this arm (popped after the body).
             self.push_scope();
             self.bind_match_ident(&arm.pat, scrut, &scrut_mir, &scrut_ty);
-            let cond =
-                self.match_arm_cond(&arm.pat, scrut, &scrut_mir, &scrut_ty, arm.guard.as_ref());
-            self.builder.cond_br(cond, body_bb, vec![], next_bb, vec![]);
+            self.emit_match_arm_test(
+                &arm.pat,
+                (scrut, &scrut_mir, &scrut_ty),
+                arm.guard.as_ref(),
+                body_bb,
+                next_bb,
+            );
 
             self.builder.switch_to(body_bb);
             self.terminated = false;
@@ -21417,16 +21468,16 @@ impl FnLowerer<'_> {
             self.terminated = false;
         }
 
-        // No arm matched. With an unconditional catch-all this block is never emitted; without one it
-        // is reached only when no arm's pattern fires. Sema's exhaustiveness check (E0405) rejects any
-        // *value-producing* non-exhaustive match before lowering, so for a value match this point is
-        // dynamically dead (an exhaustive enum/bool match with no `_` still emits this block
-        // structurally — every arm is a conditional test — but one arm always matches at runtime).
-        // Emit `Unreachable` rather than a zero default: a scalar zero was a silent wrong answer and
-        // an aggregate zero was invalid MIR (`const.i32 0` into an aggregate merge param → an ICE the
-        // verifier/`mem2reg` rejected). A unit/statement match has no value to merge and just falls
-        // through. (A genuinely value-producing match always has a value-producing arm that branches
-        // to `merge`, so the merge param never lacks a provider.)
+        // No arm matched. With an unconditional arm — a catch-all, or the untested last arm of a
+        // proven-exhaustive match — this block is never emitted; without one it is reached only when
+        // no arm's pattern fires. Sema's exhaustiveness check (E0405) rejects any non-exhaustive
+        // match it can reason about, and a match it cannot reason about gets no proof, so it keeps
+        // every test and lands here on a value its arms miss: a value match traps rather than invent
+        // an arm. Emit `Unreachable` rather than a zero default: a scalar zero was a silent wrong
+        // answer and an aggregate zero was invalid MIR (`const.i32 0` into an aggregate merge
+        // param → an ICE the verifier/`mem2reg` rejected). A unit/statement match has no value to
+        // merge and just falls through. (A genuinely value-producing match always has a
+        // value-producing arm that branches to `merge`, so the merge param never lacks a provider.)
         if !handled_default && !self.terminated {
             match merge_param {
                 Some(_) => self.builder.set_term(wukong_mir::Terminator::Unreachable),
@@ -21473,6 +21524,16 @@ impl FnLowerer<'_> {
         scrut_ty: &Ty,
     ) {
         match &pat.kind {
+            // A name bound inside an or-pattern would need one binding fed by whichever
+            // alternative matched; nothing lowers that yet. Refuse it at the pattern, and bind one
+            // alternative's names so the arm body does not cascade into a second error at each
+            // use (the program is rejected either way).
+            ast::PatKind::Or(alts) if alts.iter().any(pattern_has_binding) => {
+                self.unsupported(pat.span, "a binding inside an or-pattern");
+                if let Some(alt) = alts.iter().find(|a| pattern_has_binding(a)) {
+                    self.bind_match_ident(alt, scrut, scrut_mir, scrut_ty);
+                }
+            }
             ast::PatKind::Ident(name) => {
                 let is_slice = matches!(scrut_ty, Ty::Slice(_));
                 if matches!(scrut_mir, MirType::Array(..)) {
@@ -21636,33 +21697,44 @@ impl FnLowerer<'_> {
         }
     }
 
-    /// The i1 condition under which a match arm fires: the pattern test (a literal compares equal; a
-    /// wildcard/identifier is always true) conjoined with the optional guard. The guard is lowered in
-    /// the current (test) block, after any `Ident` binding, so it may reference the binding.
-    fn match_arm_cond(
+    /// End the current (test) block in the branch a match arm takes: to `body_bb` when `pat`
+    /// matches the scrutinee `(value, MIR type, sema type)` and its guard, if any, holds; to
+    /// `next_bb` otherwise. The bindings were made before this, so the guard may read them.
+    ///
+    /// The guard is lowered in a block of its own that only the pattern's success reaches, so it
+    /// runs only after the pattern matched — Rust's order, and the one `if let P = e && c` promises.
+    /// It used to be lowered in the test block and ANDed with the pattern test, so it ran for every
+    /// value that reached the arm: `match x { E::A(v) if noisy(v) => .., _ => .. }` called
+    /// `noisy` on an `E::B`, with `v` read out of the wrong variant's payload.
+    fn emit_match_arm_test(
         &mut self,
         pat: &Pattern,
-        scrut: ValueId,
-        scrut_mir: &MirType,
-        scrut_ty: &Ty,
+        (scrut, scrut_mir, scrut_ty): (ValueId, &MirType, &Ty),
         guard: Option<&Expr>,
-    ) -> ValueId {
+        body_bb: wukong_mir::BlockId,
+        next_bb: wukong_mir::BlockId,
+    ) {
         let pat_cond = self.pattern_cond(pat, scrut, scrut_mir, scrut_ty, pat.span);
+        let Some(g) = guard else {
+            let c = pat_cond.unwrap_or_else(|| {
+                self.builder
+                    .build(MirType::I1, Op::ConstInt(1, MirType::I1))
+            });
+            self.builder.cond_br(c, body_bb, vec![], next_bb, vec![]);
+            return;
+        };
+        if let Some(pc) = pat_cond {
+            let guard_bb = self.builder.new_block();
+            self.builder.cond_br(pc, guard_bb, vec![], next_bb, vec![]);
+            self.builder.switch_to(guard_bb);
+            self.terminated = false;
+        }
         // The guard is normalized to `i1` like every other boolean condition (`if`/`while`/`&&`):
         // a non-bool guard (`match k { x if x => .. }`) would otherwise feed its raw `i32` into the
-        // arm's `And` / `cond_br`, MIR the verifier and Cranelift reject (the `lower_bool_cond` fix
-        // covered if/while/short-circuit/assert but not the match-guard path).
-        match (pat_cond, guard) {
-            (Some(pc), Some(g)) => {
-                let gv = self.lower_bool_cond(g);
-                self.builder.build(MirType::I1, Op::Bin(BinOp::And, pc, gv))
-            }
-            (Some(pc), None) => pc,
-            (None, Some(g)) => self.lower_bool_cond(g),
-            (None, None) => self
-                .builder
-                .build(MirType::I1, Op::ConstInt(1, MirType::I1)),
-        }
+        // `cond_br`, MIR the verifier and Cranelift reject (the `lower_bool_cond` fix covered
+        // if/while/short-circuit/assert but not the match-guard path).
+        let gv = self.lower_bool_cond(g);
+        self.builder.cond_br(gv, body_bb, vec![], next_bb, vec![]);
     }
 
     /// The i1 condition under which `pat` matches the scrutinee. For a scalar pattern `scrut` is the

@@ -792,7 +792,11 @@ fn main() -> i32 {
          `let Shape::Circle { r } = s else { return 0.0; };` — or a `match`. Destructuring patterns \
          that cannot fail are fine: a tuple, struct or array of names (`let (a, b) = t;`, \
          `let Point { x, y } = p;`, `let [first, .., last] = a;`), and the single variant of a \
-         one-variant enum.",
+         one-variant enum. The same rule holds for the pattern of a destructuring `for` head \
+         (`for (i, x) in pairs`), which binds every element of an array or slice without testing \
+         it: there it is checked by form, so a literal, range, path, or-pattern or variant of a \
+         multi-variant enum anywhere inside (`for (0, x) in pairs`) is rejected even when it \
+         happens to cover every value. Match inside the loop body instead.",
         bad: "module ex.e0442\nenum Shape { Circle(i32), Square(i32) }\nfn radius(s: Shape) -> i32 {\n    let Shape::Circle(r) = s;\n    return r;\n}\nfn main() -> i32 {\n    return radius(Shape::Circle(3));\n}\n",
         good: "module ex.e0442\nenum Shape { Circle(i32), Square(i32) }\nfn radius(s: Shape) -> i32 {\n    let Shape::Circle(r) = s else {\n        return 0;\n    };\n    return r;\n}\nfn main() -> i32 {\n    return radius(Shape::Circle(3));\n}\n"
     ),

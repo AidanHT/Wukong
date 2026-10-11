@@ -1560,15 +1560,108 @@ impl<'a> Parser<'a> {
         out
     }
 
+    /// The scrutinee of `if let P = e` / `while let P = e`: an expression that stops before a
+    /// top-level `&&` or `||`, which continue the condition chain ([`Parser::parse_let_chain_guard`])
+    /// rather than the scrutinee. A trailing `{` opens the block, never a struct literal.
+    fn parse_let_scrutinee(&mut self) -> Expr {
+        let prev = std::mem::replace(&mut self.no_struct_lit, true);
+        let e = self.parse_expr_bp(binop_bp(BinOp::And) + 1);
+        self.no_struct_lit = prev;
+        e
+    }
+
+    /// The `&& c1 && c2 …` that may follow an `if let`/`while let` scrutinee, folded left into
+    /// one `&&` expression: the guard of the `match` arm the statement becomes, so the conditions
+    /// run only after the pattern matched, left to right with short-circuit, and see its bindings
+    /// (Rust's let chains, one `let` per chain). `None` when no `&&` follows. A second `let` in the
+    /// chain and a `||` after the condition are `E0200`; each is consumed to recover.
+    fn parse_let_chain_guard(&mut self) -> Option<Expr> {
+        let prev = std::mem::replace(&mut self.no_struct_lit, true);
+        let saved = self.depth;
+        let operand_bp = binop_bp(BinOp::And) + 1;
+        let mut guard: Option<Expr> = None;
+        while self.at(T::AmpAmp) {
+            // Each operand deepens the left-folded guard by one, exactly as a fold of the binop
+            // loop in `parse_expr_bp` does, so it is charged to the same budget: a long chain is
+            // E0209, not a tree too deep for the recursive walks after the parser.
+            self.depth += 1;
+            if self.depth > Self::MAX_DEPTH {
+                let sp = self.span();
+                self.too_deep(sp);
+                break;
+            }
+            self.bump(); // &&
+            if self.at(T::Let) {
+                let at = self.span();
+                self.chain_error(
+                    at,
+                    "only one `let` per `if let`/`while let` chain is supported; nest a second \
+                     `if let` in the block",
+                    "a second `let` in this condition",
+                );
+                self.bump(); // let
+                self.parse_pattern();
+                if self.eat(T::Eq) {
+                    self.parse_expr_bp(operand_bp);
+                }
+                continue;
+            }
+            let rhs = self.parse_expr_bp(operand_bp);
+            guard = Some(match guard {
+                None => rhs,
+                Some(lhs) => {
+                    let span = lhs.span.to(rhs.span);
+                    Expr {
+                        id: self.nid(),
+                        kind: ExprKind::Binary {
+                            op: BinOp::And,
+                            lhs: Box::new(lhs),
+                            rhs: Box::new(rhs),
+                        },
+                        span,
+                    }
+                }
+            });
+        }
+        if self.at(T::PipePipe) {
+            let at = self.span();
+            self.chain_error(
+                at,
+                "`||` cannot follow an `if let` condition; parenthesize: `&& (a || b)`",
+                "this `||` would apply to the whole condition, pattern included",
+            );
+            while self.eat(T::PipePipe) {
+                self.parse_expr_bp(binop_bp(BinOp::Or) + 1);
+            }
+        }
+        self.depth = saved;
+        self.no_struct_lit = prev;
+        guard
+    }
+
+    /// An `E0200` in an `if let`/`while let` condition chain, labelled at `span`.
+    fn chain_error(&mut self, span: Span, msg: &str, label: &str) {
+        if self.depth_exceeded {
+            return;
+        }
+        self.diags.push(
+            Diagnostic::error(msg.to_string())
+                .with_code("E0200")
+                .primary(span, label.to_string()),
+        );
+    }
+
     /// `if let P = e { A } else { B }` (the `if` consumed, the cursor on `let`), parsed as the
     /// `match e { P => { A }, _ => { B } }` it means. With no `else` the `_` arm does nothing and
     /// the `then` block becomes a statement, so the whole expression is `()` like an `else`-less
-    /// `if`. An `else if …` chain becomes the `_` arm's body.
+    /// `if`. An `else if …` chain becomes the `_` arm's body. `if let P = e && c1 && c2` puts the
+    /// conditions on the pattern's arm as its guard: `match e { P if c1 && c2 => { A }, _ => { B } }`.
     fn parse_if_let(&mut self, start: Span) -> Expr {
         self.bump(); // let
         let pat = self.parse_pattern();
         self.expect(T::Eq);
-        let scrutinee = Box::new(self.parse_cond());
+        let scrutinee = Box::new(self.parse_let_scrutinee());
+        let guard = self.parse_let_chain_guard();
         let then_block = self.parse_block();
         let then_span = then_block.span;
         let (then_body, else_body) = if self.eat(T::Else) {
@@ -1606,7 +1699,7 @@ impl<'a> Parser<'a> {
             MatchArm {
                 span: pat.span.to(then_span),
                 pat,
-                guard: None,
+                guard,
                 body: then_body,
                 origin: ArmOrigin::Source,
             },
@@ -2052,11 +2145,13 @@ impl<'a> Parser<'a> {
     /// `[label:] while let P = e { A }` (the cursor on `let`), parsed as the
     /// `[label:] loop { match e { P => { A }, _ => { break; } } }` it means: `e` is evaluated afresh
     /// on every iteration, a `continue` re-tests it, and a `break` (or the first non-match) leaves.
+    /// `while let P = e && c` guards the pattern's arm with `c`, as `if let` does.
     fn parse_while_let(&mut self, label: Option<Ident>, start: Span) -> StmtKind {
         self.bump(); // let
         let pat = self.parse_pattern();
         self.expect(T::Eq);
-        let scrutinee = Box::new(self.parse_cond());
+        let scrutinee = Box::new(self.parse_let_scrutinee());
+        let guard = self.parse_let_chain_guard();
         let body = self.parse_block();
         let span = start.to(self.prev_span());
         let body_span = body.span;
@@ -2078,7 +2173,7 @@ impl<'a> Parser<'a> {
             MatchArm {
                 span: pat.span.to(body_span),
                 pat,
-                guard: None,
+                guard,
                 body,
                 origin: ArmOrigin::Source,
             },
@@ -3426,6 +3521,136 @@ mod tests {
             "fn main() -> i32 {\n    let x: i32 = g(f\n        (2),\n        3\n        -1);\n    \
                       return x;\n}\n";
         assert_eq!(lint_codes(inside), (Vec::<&str>::new(), Vec::<&str>::new()));
+    }
+
+    /// `if let P = e { … }` as the expression it parses to: its scrutinee and the first arm's guard.
+    fn if_let_parts(src: &str) -> (Expr, Option<Expr>) {
+        let mut i = Interner::new();
+        let (e, d) = parse_expr_str(src, SourceId(0), &mut i);
+        assert!(d.is_empty(), "{src}: {d:?}");
+        let ExprKind::Match { scrutinee, arms } = e.kind else {
+            panic!("`if let` parses to a match: {src}")
+        };
+        (*scrutinee, arms[0].guard.clone())
+    }
+
+    /// The `&&` operands of a left-folded chain, in order.
+    fn and_operands(e: &Expr, out: &mut Vec<String>, i: &Interner) {
+        match &e.kind {
+            ExprKind::Binary {
+                op: BinOp::And,
+                lhs,
+                rhs,
+            } => {
+                and_operands(lhs, out, i);
+                out.push(print::print_expr(rhs, i));
+            }
+            _ => out.push(print::print_expr(e, i)),
+        }
+    }
+
+    #[test]
+    fn if_let_chains_become_the_arm_guard() {
+        let mut i = Interner::new();
+        let src = "if let E::A(x) = s && x > 2 && x < 9 && ok { 1 } else { 0 }";
+        let (e, d) = parse_expr_str(src, SourceId(0), &mut i);
+        assert!(d.is_empty(), "{d:?}");
+        let ExprKind::Match { scrutinee, arms } = &e.kind else {
+            panic!("`if let` parses to a match")
+        };
+        assert!(matches!(scrutinee.kind, ExprKind::Path(_)), "{scrutinee:?}");
+        let guard = arms[0]
+            .guard
+            .as_ref()
+            .expect("the chain is the first arm's guard");
+        // Folded left: `((x > 2) && (x < 9)) && ok`.
+        let ExprKind::Binary {
+            op: BinOp::And,
+            lhs,
+            ..
+        } = &guard.kind
+        else {
+            panic!("{guard:?}")
+        };
+        assert!(matches!(lhs.kind, ExprKind::Binary { op: BinOp::And, .. }));
+        let mut ops = Vec::new();
+        and_operands(guard, &mut ops, &i);
+        assert_eq!(ops.len(), 3, "{ops:?}");
+        assert!(arms[1].guard.is_none(), "the fall-through arm is unguarded");
+        // No chain, no guard.
+        assert!(if_let_parts("if let E::A(x) = s { x } else { 0 }")
+            .1
+            .is_none());
+    }
+
+    #[test]
+    fn an_if_let_scrutinee_stops_before_and_and_or() {
+        // `a == b` binds tighter than `&&`: it is the scrutinee, and `c` the guard.
+        let (scrutinee, guard) = if_let_parts("if let true = a == b && c { 1 } else { 0 }");
+        assert!(
+            matches!(scrutinee.kind, ExprKind::Binary { op: BinOp::Eq, .. }),
+            "{scrutinee:?}"
+        );
+        assert!(matches!(guard.map(|g| g.kind), Some(ExprKind::Path(_))));
+        // `while let` takes the same chain.
+        let mut i = Interner::new();
+        let (_m, d) = parse_module(
+            "fn f(n: i32) { let mut k = n; while let 1..=9 = k && k != 5 { k = k + 1; } }",
+            SourceId(0),
+            &mut i,
+        );
+        assert!(d.is_empty(), "{d:?}");
+    }
+
+    #[test]
+    fn or_and_second_let_in_an_if_let_chain_are_e0200() {
+        let codes = |src: &str| -> Vec<&'static str> {
+            let mut i = Interner::new();
+            let (_e, d) = parse_expr_str(src, SourceId(0), &mut i);
+            d.into_iter().filter_map(|d| d.code).collect()
+        };
+        assert_eq!(codes("if let x = a || b { 1 } else { 0 }"), vec!["E0200"]);
+        assert_eq!(
+            codes("if let x = a && c || b || d { 1 } else { 0 }"),
+            vec!["E0200"],
+            "one report, and the parse recovers"
+        );
+        assert_eq!(
+            codes("if let x = a && let y = b { 1 } else { 0 }"),
+            vec!["E0200"]
+        );
+    }
+
+    /// The `&&` chain after an `if let`/`while let` scrutinee is folded left in its own loop, so,
+    /// like the binop loop in `parse_expr_bp`, each fold must charge the depth budget: a 5000-long
+    /// chain parsed with no diagnostic into a 5000-deep guard that sema and lowering then recurse
+    /// over, instead of reporting E0209 as the same chain after an `if` does.
+    #[test]
+    fn a_long_let_chain_reports_e0209() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let has_e0209 =
+                    |diags: &[Diagnostic]| diags.iter().any(|d| d.code == Some("E0209"));
+                let n = 5000;
+                let chain = "&& c ".repeat(n);
+                let mut i = Interner::new();
+                let src = format!("if let x = e {chain}{{ 1 }} else {{ 0 }}");
+                let (_e, d) = parse_expr_str(&src, SourceId(0), &mut i);
+                assert!(has_e0209(&d), "long `if let` chain: {d:?}");
+                let src = format!("fn f() {{ while let x = e {chain}{{ break; }} }}");
+                let mut i = Interner::new();
+                let (_m, d) = parse_module(&src, SourceId(0), &mut i);
+                assert!(has_e0209(&d), "long `while let` chain: {d:?}");
+                // A realistic chain stays far under the limit.
+                let src = format!("if let x = e {}{{ 1 }} else {{ 0 }}", "&& c ".repeat(50));
+                let mut i = Interner::new();
+                let (_e, d) = parse_expr_str(&src, SourceId(0), &mut i);
+                assert!(d.is_empty(), "a 50-long chain parses cleanly: {d:?}");
+            })
+            .expect("spawn parser thread")
+            .join()
+            .expect("the parser must not overflow its stack on a long let chain");
     }
 
     /// The entry points other than `parse_module_tokens_with_lints` never report a lint.

@@ -1985,11 +1985,17 @@ fn differential_vectorized_inline_transcendental() {
     }
 }
 
-/// An EXHAUSTIVE `match` with no `_` catch-all (every enum variant / both bool cases). Each arm is a
-/// conditional discriminant test, so mir_build emits the "no arm matched" fallthrough block
-/// structurally — but it is dynamically dead and now terminates in `Unreachable` (was a zero default).
-/// Pins that the dead block stays well-typed at every opt level and both backends agree. Companion to
-/// the E0405 sema rejection of *non*-exhaustive value matches (a compile-fail, covered by tests/fail).
+/// An EXHAUSTIVE `match` with no `_` catch-all (every enum variant / both bool cases), on both
+/// lowerings of one. The first four are PROVEN by sema (`SemaResult::exhaustive_matches`: every
+/// zero-initialized value of the type is one the arms model), so mir_build tests every arm but the
+/// last, which it takes untested, and emits no "no arm matched" block at all. The last two are over
+/// `enum Code { Ok = 1, Err = 2 }`, which no arm covers at the zero a `let c: Code;` holds, so they
+/// are NOT proven: every arm keeps its discriminant test, and the fall-through block is emitted,
+/// dynamically dead, ending in `Unreachable`. Pins that both shapes agree across the backends at
+/// every opt level, the dead trap block staying well-typed (it is never reached here: a native trap
+/// would kill the test process; `tests/run/match_exhaustive_fallthrough.wk` and
+/// `wukong_mir_build`'s `match_tests` pin which matches keep it). Companion to the E0405 sema
+/// rejection of *non*-exhaustive value matches (a compile-fail, covered by tests/fail).
 #[test]
 fn differential_match_exhaustiveness() {
     let cases = [
@@ -2004,9 +2010,17 @@ fn differential_match_exhaustiveness() {
         // exhaustive bool, no `_`: pick(false) = 20.
         ("fn pick(b: bool) -> i32 { return match b { true => 10, false => 20 }; } \
           fn main() -> i32 { return pick(false); }", 20),
-        // an enum match folded into an arithmetic expression (the dead fallthrough is still emitted).
+        // an enum match folded into an arithmetic expression.
         ("enum Dir { N, S } fn dval(d: Dir) -> i32 { return match d { Dir::N => 1, Dir::S => -1 }; } \
           fn main() -> i32 { return dval(Dir::N) * 7 + dval(Dir::S); }", 6),
+        // NOT proven (no variant is 0): both arms tested, then the dead trapping fall-through.
+        // code(Err) = 20, code(Ok) = 10.
+        ("enum Code { Ok = 1, Err = 2 } \
+          fn code(c: Code) -> i32 { return match c { Code::Ok => 10, Code::Err => 20 }; } \
+          fn main() -> i32 { return code(Code::Err); }", 20),
+        ("enum Code { Ok = 1, Err = 2 } \
+          fn code(c: Code) -> i32 { return match c { Code::Ok => 10, Code::Err => 20 }; } \
+          fn main() -> i32 { return code(Code::Ok) * 3 + code(Code::Err); }", 50),
     ];
     for (src, want) in cases {
         for opt in [0u8, 1, 2, 3] {

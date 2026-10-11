@@ -1,0 +1,123 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 5
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 9
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 5
+// EXPECT-OUT: 1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: -1
+// EXPECT-OUT: 105
+// EXPECT-OUT: 0
+// EXPECT-OUT: 204
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+module tests.run.if_let_chain
+
+// `if let P = e && c1 && c2 { A } else { B }` means `match e { P if c1 && c2 => A, _ => B }`: the
+// conditions run only after `P` matched, left to right with short-circuit, and see `P`'s names.
+// `while let P = e && c` is the same inside its `loop { match … }`. Only one `let` per chain, and
+// no `||` after the condition (tests/fail/if_let_chain_or.wk).
+//
+// Expected values by hand:
+//   big:      Circle(5): 5 > 2 -> 5;  Circle(2): 2 > 2 fails -> 0;  Square(9): no match -> 0
+//   sq:       w > 1 && w < 10 && w != 5 -> w * w, else -1:
+//             Square(3) -> 9; Square(5), Square(12), Circle(3) -> -1 -1 -1
+//   noisy:    each condition prints its tag when it runs, then the result prints:
+//             Square(3): no match, no tag      -> -1
+//             Circle(5): tags 1, 2, then r     -> 1 2 5
+//             Circle(-3): tag 1 is false, 2 never runs -> 1 -1
+//             Circle(500): tag 1 true, tag 2 false     -> 1 2 -1
+//   classify: Circle(5) -> 105; Circle(1) -> 0 (and is not a Square); Square(4) -> 204;
+//             Square(2) -> 0; Dot -> 0
+//   while:    from 1, stop at the guard (k == 5): 1 2 3 4, then k = 5;
+//             from 7, stop at the pattern (k == 10): 7 8 9, then k = 10
+
+enum Shape { Circle(i32), Square(i32), Dot }
+
+fn big(s: Shape) -> i32 {
+    let v = if let Shape::Circle(r) = s && r > 2 { r } else { 0 };
+    return v;
+}
+
+fn sq(s: Shape) -> i32 {
+    let v = if let Shape::Square(w) = s && w > 1 && w < 10 && w != 5 { w * w } else { -1 };
+    return v;
+}
+
+fn tag(t: i32, v: bool) -> bool {
+    print(t);
+    return v;
+}
+
+fn noisy(s: Shape) {
+    if let Shape::Circle(r) = s && tag(1, r > 0) && tag(2, r < 100) {
+        print(r);
+    } else {
+        print(-1);
+    }
+}
+
+fn classify(s: Shape) -> i32 {
+    let v = if let Shape::Circle(r) = s && r > 2 {
+        100 + r
+    } else if let Shape::Square(w) = s && w > 2 {
+        200 + w
+    } else {
+        0
+    };
+    return v;
+}
+
+fn count_from(start: i32) {
+    let mut k = start;
+    while let 1..=9 = k && k != 5 {
+        print(k);
+        k = k + 1;
+    }
+    print(k);
+}
+
+fn main() -> i32 {
+    print(big(Shape::Circle(5)));
+    print(big(Shape::Circle(2)));
+    print(big(Shape::Square(9)));
+
+    print(sq(Shape::Square(3)));
+    print(sq(Shape::Square(5)));
+    print(sq(Shape::Square(12)));
+    print(sq(Shape::Circle(3)));
+
+    noisy(Shape::Square(3));
+    noisy(Shape::Circle(5));
+    noisy(Shape::Circle(-3));
+    noisy(Shape::Circle(500));
+
+    print(classify(Shape::Circle(5)));
+    print(classify(Shape::Circle(1)));
+    print(classify(Shape::Square(4)));
+    print(classify(Shape::Square(2)));
+    print(classify(Shape::Dot));
+
+    count_from(1);
+    count_from(7);
+    return 0;
+}

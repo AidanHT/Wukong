@@ -267,6 +267,11 @@ pub struct SemaResult {
     pub builtin_calls: HashMap<NodeId, BuiltinCall>,
     /// The `impl` method tables and every method call, as resolved (see `methods.rs`).
     pub methods: MethodResolution,
+    /// The `match` expressions, keyed by the `Match` expression's id, that pattern usefulness
+    /// (`usefulness.rs`) proved exhaustive over a concrete scrutinee type whose zero value it
+    /// models. `mir_build` lowers the last unguarded arm of each with no test at all: every value
+    /// that reaches that arm has failed every arm before it, so it must match this one.
+    pub exhaustive_matches: HashSet<NodeId>,
 }
 
 /// Collect the struct names a type contains *by value* — directly (`Ty::Named`) or nested inside an
@@ -448,6 +453,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         inst_calls: Vec::new(),
         fn_preds: HashMap::default(),
         assert_conds: HashSet::default(),
+        match_verdicts: HashMap::default(),
     };
     // Attribute legality (`attrs`): an attribute names no value and has no type, so this walk needs
     // nothing the collection pass builds and runs first — an unknown `@bogus` is reported even in a
@@ -492,6 +498,11 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         call_dims: s.call_dims,
         builtin_calls: s.builtin_calls,
         methods: s.methods.resolution,
+        exhaustive_matches: s
+            .match_verdicts
+            .into_iter()
+            .filter_map(|(id, ok)| ok.then_some(id))
+            .collect(),
     };
     (result, s.diags)
 }
@@ -634,6 +645,11 @@ struct Sema<'a> {
     fn_preds: HashMap<Symbol, Vec<constraints::Pred<'a>>>,
     /// The conditions of the top-level `static_assert`s that name a generic dimension.
     assert_conds: HashSet<NodeId>,
+    /// Each `match` expression's exhaustiveness verdict (`report_nonexhaustive`), published as
+    /// [`SemaResult::exhaustive_matches`]. The last write wins: literal inference re-checks a body
+    /// (`check_fn`) and only its final pass decides the types `mir_build` lowers with. An
+    /// instance re-check (`instantiate.rs`) records nothing.
+    match_verdicts: HashMap<NodeId, bool>,
 }
 
 /// One entry of [`Sema::loop_ctx`] — a loop currently being type-checked.
@@ -2874,7 +2890,7 @@ impl<'a> Sema<'a> {
                 // A `let` pattern must match every value (E0442; `let … else` is the refutable
                 // form, and the parser has already rewritten it).
                 if !matches!(pat.kind, PatKind::Ident(_) | PatKind::Wildcard) {
-                    self.check_irrefutable_let(pat, &bound);
+                    self.check_irrefutable(pat, &bound, patterns::PatSite::Let);
                 }
                 if let Ty::Array {
                     shared: true,
@@ -3284,6 +3300,10 @@ impl<'a> Sema<'a> {
                 let elem = self.type_for_iter(iter);
                 self.push_scope();
                 self.bind_pattern(pat, &elem);
+                // A destructuring head binds each element untested (`patterns.rs`).
+                if !matches!(pat.kind, PatKind::Ident(_) | PatKind::Wildcard) {
+                    self.check_for_pattern(pat, iter, &elem);
+                }
                 self.note_nonneg_counter(pat, iter, body);
                 if let ForIter::Expr(it) = iter {
                     self.note_tensor_view(pat, &elem, Some(it));
@@ -3376,7 +3396,9 @@ impl<'a> Sema<'a> {
             PatKind::Wildcard | PatKind::Unit => {}
             // A data-carrying enum-variant pattern: validate the variant + payload shape and bind the
             // inner fields to their declared types (so an arm body sees `x`/`y` typed).
-            PatKind::Variant { path, fields } => self.check_variant_pattern(path, fields, pat.span),
+            PatKind::Variant { path, fields } => {
+                self.check_variant_pattern(path, fields, ty, pat.span)
+            }
             // Literal / enum-variant / range patterns bind nothing — they test the scrutinee's value.
             // An integer literal pattern is materialized by mir_build as `ConstInt(v, <scrutinee
             // width>)` with no range check, so an out-of-range literal was TRUNCATED to that width and
@@ -3431,11 +3453,12 @@ impl<'a> Sema<'a> {
     }
 
     /// Type-check and bind a data-carrying enum-variant pattern `Enum::Variant(..)` / `Enum::Variant
-    /// { .. }`. Resolves the variant, rejects an unknown variant (E0301), a payload-kind mismatch or
-    /// a wrong tuple arity (E0435), and binds each payload sub-pattern to its declared field type.
+    /// { .. }` against a value of type `ty`. Resolves the variant, rejects an unknown variant
+    /// (E0301), a value that is not of the pattern's enum (E0401), a payload-kind mismatch or a
+    /// wrong tuple arity (E0435), and binds each payload sub-pattern to its declared field type.
     /// On any error it still binds the sub-patterns (to `Unknown`) so the arm body type-checks
     /// without cascading.
-    fn check_variant_pattern(&mut self, path: &Path, fields: &VariantPat, span: Span) {
+    fn check_variant_pattern(&mut self, path: &Path, fields: &VariantPat, ty: &Ty, span: Span) {
         let (Some(ename), Some(vname)) = (
             path.segments.first().map(|s| s.sym),
             path.segments.last().map(|s| s.sym),
@@ -3464,6 +3487,24 @@ impl<'a> Sema<'a> {
                 return;
             }
         };
+        // The pattern names its enum, which must be the value's type, as a struct pattern's struct
+        // must be (`check_struct_pattern`): `mir_build` reads the discriminant and payload with
+        // this enum's layout off whatever value it is handed — another type's fields, or a loaded
+        // scalar used as a base pointer (an ICE at MIR verification).
+        if !matches!(ty, Ty::Unknown | Ty::Error)
+            && *ty != Ty::Named(ename)
+            && !self.is_generic_ty(ty)
+        {
+            let en = self.sym_str(ename).to_string();
+            self.error(
+                span,
+                "E0401",
+                format!(
+                    "mismatched pattern: this matches a `{en}`, but the value is `{}`",
+                    ty.display(self.interner)
+                ),
+            );
+        }
         let qual = format!("{}::{}", self.sym_str(ename), self.sym_str(vname));
         match (fields, &payload) {
             (VariantPat::Tuple(subs), VariantPayload::Tuple(tys)) => {
@@ -4615,8 +4656,10 @@ impl<'a> Sema<'a> {
                     // the arm's guard and body; a literal/`_` pattern binds nothing.
                     self.push_scope();
                     self.bind_pattern(&arm.pat, &scrut_ty);
+                    // A guard is a condition like an `if`'s: a `()`, aggregate or tensor guard
+                    // is E0436 (an `if let P = e && c` chain puts `c` here).
                     if let Some(g) = &arm.guard {
-                        self.type_expr(g);
+                        self.check_condition(g);
                     }
                     let t = self.type_expr(&arm.body);
                     self.pop_scope();
@@ -4639,9 +4682,12 @@ impl<'a> Sema<'a> {
                 // value. Skip only an `Error` result (its arm already reported, avoid cascading). The
                 // verdict is pattern usefulness (`usefulness.rs`), which sees through payload
                 // sub-patterns, tuples and integer ranges and names a value no arm covers; a match it
-                // cannot reason about gets no verdict, so this fires only on a certain miss.
+                // cannot reason about gets no verdict, so this fires only on a certain miss. The
+                // same analysis records a positive verdict for `mir_build`'s untested last arm.
                 if !matches!(result, Ty::Error) {
-                    self.report_nonexhaustive(scrutinee, &scrut_ty, arms);
+                    self.report_nonexhaustive(e.id, scrutinee, &scrut_ty, arms);
+                } else if self.inst_subst.is_empty() {
+                    self.match_verdicts.insert(e.id, false);
                 }
                 result
             }
@@ -4680,8 +4726,28 @@ impl<'a> Sema<'a> {
     /// usefulness analysis (`usefulness.rs`) decides, and stays silent on a match it cannot reason
     /// about. A guarded arm never counts toward coverage, because its guard may be false; an empty
     /// match covers nothing (Wukong has no uninhabited types).
-    fn report_nonexhaustive(&mut self, scrutinee: &Expr, scrut_ty: &Ty, arms: &[MatchArm]) {
-        let Some(report) = usefulness::analyze(&self.defs, self.interner, scrut_ty, arms) else {
+    ///
+    /// It also records the match's positive verdict for `mir_build` ([`Sema::match_verdicts`]):
+    /// proven exhaustive, over a concrete scrutinee type whose zero value the analysis models
+    /// (`usefulness::zero_value_modeled`). An instance re-check records nothing, so it cannot
+    /// overwrite the verdict the body pass reached at the generic types; the body pass of a
+    /// function re-checked for literal inference overwrites its own earlier verdicts, because only
+    /// the final pass's types are the ones lowered.
+    fn report_nonexhaustive(
+        &mut self,
+        match_id: NodeId,
+        scrutinee: &Expr,
+        scrut_ty: &Ty,
+        arms: &[MatchArm],
+    ) {
+        let report = usefulness::analyze(&self.defs, self.interner, scrut_ty, arms);
+        if self.inst_subst.is_empty() {
+            let proven = report.as_ref().is_some_and(|r| r.missing.is_none())
+                && self.is_concrete_ty(scrut_ty)
+                && usefulness::zero_value_modeled(&self.defs, scrut_ty);
+            self.match_verdicts.insert(match_id, proven);
+        }
+        let Some(report) = report else {
             return;
         };
         let Some(w) = report.missing else {

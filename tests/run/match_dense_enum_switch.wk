@@ -11,13 +11,14 @@
 module tests.run.match_dense_enum_switch
 
 // An exhaustive value `match` over a dense six-variant enum, dispatched at run time: the scrutinee is
-// read from an array inside a loop, so nothing folds. `match` lowers to one `cmp.eq` test per arm,
-// chained through the else edges, ending in the `unreachable` fall-through. At -O2 the six tests
-// become a single six-case `switch` terminator whose default is that trap (wukong_opt::switch_form),
-// which the native backend lowers through cranelift_frontend::Switch (a jump table here, the
-// discriminants being dense). `wukong_opt`'s `dense_enum_match_forms_one_switch` asserts the switch
-// forms; this fixture pins that every variant still selects its own arm at every level and on both
-// backends.
+// read from an array inside a loop, so nothing folds. Sema proves the match exhaustive, so `match`
+// lowers to one `cmp.eq` test per arm EXCEPT the last, chained through the else edges, and the last
+// arm (`Xor`) is the final else edge itself, untested: there is no `unreachable` fall-through. At
+// -O2 the five tests become a single five-case `switch` terminator whose default is the `Xor` arm
+// (wukong_opt::switch_form), which the native backend lowers through cranelift_frontend::Switch (a
+// jump table here, the discriminants being dense). `wukong_opt`'s `dense_enum_match_forms_one_switch`
+// asserts the switch forms; this fixture pins that every variant still selects its own arm at every
+// level and on both backends.
 //
 // Expected values by hand, a = 3i + 5 and b = 11 - i:
 //   i=0 Mul  5 * 11 = 55     i=1 Add  8 + 10 = 18     i=2 Xor 11 ^ 9 = 2     i=3 Sub 14 - 8 = 6

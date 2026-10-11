@@ -127,7 +127,7 @@ impl<'a> Sema<'a> {
 
     /// Whether `t` names no generic type variable and nothing unknown: a type an instance can be
     /// checked at.
-    fn is_concrete_ty(&self, t: &Ty) -> bool {
+    pub(crate) fn is_concrete_ty(&self, t: &Ty) -> bool {
         match t {
             Ty::Named(n) => self.is_declared_named_ty(*n),
             Ty::Unknown | Ty::Error => false,

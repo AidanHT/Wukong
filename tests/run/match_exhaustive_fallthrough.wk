@@ -1,0 +1,184 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 10
+// EXPECT-OUT: 20
+// EXPECT-OUT: 30
+// EXPECT-OUT: 40
+// EXPECT-OUT: 50
+// EXPECT-OUT: 0
+// EXPECT-OUT: 27
+// EXPECT-OUT: 20
+// EXPECT-OUT: 0
+// EXPECT-OUT: 34
+// EXPECT-OUT: 3
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 200
+// EXPECT-OUT: 200
+// EXPECT-OUT: 300
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+module tests.run.match_exhaustive_fallthrough
+
+// A `match` sema PROVES exhaustive (pattern usefulness, over a type whose zero value it models)
+// lowers its last unguarded arm with no test: a value that reaches that arm has failed every arm
+// before it, so it must match this one. `--emit=mir -O0` shows `rank` with four `cmp.eq` and no
+// `unreachable`. `code_val`'s enum has no variant with discriminant 0, and an uninitialized
+// `let k: Code;` is zero-filled, so that match is NOT proven: it keeps both tests and its trap.
+// Every arm of every match is exercised below, the untested last arms included.
+//
+// Expected values by hand:
+//   rank:     Red..Black                       -> 10 20 30 40 50
+//   area:     Dot, Circle(3) = 3*3*3, Rect(4,5) = 4*5   -> 0 27 20
+//   msg:      Quit, Move { dx: 3, dy: 4 } = 3*10 + 4    -> 0 34
+//   both:     (t,t) (t,f) (f,t) (f,f)          -> 3 2 1 0
+//   band:     0 63 | 64 127 | 128 191 | 192 255 -> 1 1 2 2 3 3 4 4
+//   disc:     discriminants 0, 1, 2, 3, 4       -> 100 200 200 200 300
+//   sign:     i32::MIN, -5, 0, 7, i32::MAX      -> -1 -1 0 1 1
+//   zeroed:   `let c: Color;` is Red (0), the LAST arm -> 1
+//   code_val: Code::Ok (10), Code::Err (11)     -> 1 2
+
+enum Color { Red, Green, Blue, White, Black }
+
+fn rank(c: Color) -> i32 {
+    return match c {
+        Color::Red => 10,
+        Color::Green => 20,
+        Color::Blue => 30,
+        Color::White => 40,
+        Color::Black => 50,
+    };
+}
+
+// A data-carrying enum whose last arm binds its payload: untested, but bound.
+enum Shape { Dot, Circle(i32), Rect(i32, i32) }
+
+fn area(s: Shape) -> i32 {
+    return match s {
+        Shape::Dot => 0,
+        Shape::Circle(r) => 3 * r * r,
+        Shape::Rect(w, h) => w * h,
+    };
+}
+
+enum Msg { Quit, Move { dx: i32, dy: i32 } }
+
+fn msg(m: Msg) -> i32 {
+    return match m {
+        Msg::Quit => 0,
+        Msg::Move { dx, dy } => dx * 10 + dy,
+    };
+}
+
+fn both(p: bool, q: bool) -> i32 {
+    return match (p, q) {
+        (true, true) => 3,
+        (true, false) => 2,
+        (false, true) => 1,
+        (false, false) => 0,
+    };
+}
+
+// The whole `u8` domain in four ranges; the last range is the untested arm.
+fn band(x: u8) -> i32 {
+    return match x {
+        0..=63 => 1,
+        64..=127 => 2,
+        128..=191 => 3,
+        192..=255 => 4,
+    };
+}
+
+// A C-style enum matched by its raw discriminant.
+fn disc(c: Color) -> i32 {
+    return match c {
+        0 => 100,
+        1..=3 => 200,
+        4 => 300,
+    };
+}
+
+// A statement match whose every arm returns.
+fn sign(x: i32) -> i32 {
+    match x {
+        -2147483648..=-1 => {
+            return -1;
+        }
+        0 => {
+            return 0;
+        }
+        1..=2147483647 => {
+            return 1;
+        }
+    }
+    return 99;
+}
+
+// The zero value of `Color` is `Red`, which this match lists last.
+fn zeroed() -> i32 {
+    let c: Color;
+    return match c {
+        Color::Black => 5,
+        Color::White => 4,
+        Color::Blue => 3,
+        Color::Green => 2,
+        Color::Red => 1,
+    };
+}
+
+enum Code { Ok = 10, Err }
+
+fn code_val(k: Code) -> i32 {
+    return match k {
+        Code::Ok => 1,
+        Code::Err => 2,
+    };
+}
+
+fn main() -> i32 {
+    let colors: [Color; 5] = [Color::Red, Color::Green, Color::Blue, Color::White, Color::Black];
+    for c in colors {
+        print(rank(c));
+    }
+    print(area(Shape::Dot));
+    print(area(Shape::Circle(3)));
+    print(area(Shape::Rect(4, 5)));
+    print(msg(Msg::Quit));
+    print(msg(Msg::Move { dx: 3, dy: 4 }));
+    print(both(true, true));
+    print(both(true, false));
+    print(both(false, true));
+    print(both(false, false));
+    let xs: [u8; 8] = [0, 63, 64, 127, 128, 191, 192, 255];
+    for x in xs {
+        print(band(x));
+    }
+    for c in colors {
+        print(disc(c));
+    }
+    let ys: [i32; 5] = [-2147483648, -5, 0, 7, 2147483647];
+    for y in ys {
+        print(sign(y));
+    }
+    print(zeroed());
+    print(code_val(Code::Ok));
+    print(code_val(Code::Err));
+    return 0;
+}
