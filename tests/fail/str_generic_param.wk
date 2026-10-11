@@ -1,0 +1,16 @@
+// EXPECT-CODE: E0420
+module tests.fail.str_generic_param
+
+// `str` cannot bind a type parameter. Sema erases every `str` to the `[]u8` it is laid out as
+// before monomorphization, so an instance `id$str` could not tell its text from a byte slice (it
+// would print bytes, and compare and convert like a slice). Write the function for `str` itself.
+fn id<T>(x: T) -> T {
+    return x;
+}
+
+fn main() -> i32 {
+    let s: str = "abc";
+    let t = id(s);
+    println(t);
+    return 0;
+}

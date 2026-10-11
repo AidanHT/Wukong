@@ -23,7 +23,7 @@ use wukong_ast::{
 };
 use wukong_diag::{Diagnostic, DiagnosticSink};
 use wukong_span::{FxHashMap, FxHashSet, Interner, Span, Symbol};
-use wukong_types::Scalar;
+use wukong_types::is_builtin_type_name;
 
 /// One alias, its body expanded in place once [`Expander::resolve`] has visited it.
 struct Alias {
@@ -88,7 +88,8 @@ pub(crate) fn expand_type_aliases(
             );
             continue;
         }
-        if Scalar::from_name(&shown).is_some() {
+        // A scalar name or `str`: sema reads the name as the built-in type in every type position.
+        if is_builtin_type_name(&shown) {
             sink.emit(
                 Diagnostic::error(format!("a type alias cannot be named `{shown}`"))
                     .with_code("E0300")
@@ -198,7 +199,7 @@ impl Expander<'_> {
         self.generics.contains(&sym)
             || self.types.contains(&sym)
             || self.by_name.contains_key(&sym)
-            || Scalar::from_name(self.interner.resolve(sym)).is_some()
+            || is_builtin_type_name(self.interner.resolve(sym))
     }
 
     /// The alias a type path names here, if any.
@@ -1044,6 +1045,11 @@ mod tests {
         );
         assert_eq!(expand("type W = [Real; 8];\nfn f() {}\n").1, vec!["E0328"]);
         assert_eq!(expand("type f32 = i64;\nfn f() {}\n").1, vec!["E0300"]);
+        // `str` is a built-in type as well: it names no alias, and an alias may name it.
+        assert_eq!(expand("type str = i32;\nfn f() {}\n").1, vec!["E0300"]);
+        let (out, codes) = expand("type Name = str;\nfn f(n: Name) {}\n");
+        assert!(codes.is_empty(), "{codes:?}");
+        assert!(out.contains("n: str"), "{out}");
         assert_eq!(
             expand("struct S { x: i32 }\ntype S = i32;\nfn f() {}\n").1,
             vec!["E0300"]

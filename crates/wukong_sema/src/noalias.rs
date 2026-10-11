@@ -64,6 +64,7 @@ fn can_carry_promise(t: &Ty, defs: &DefMap) -> bool {
         Ty::Array { .. }
         | Ty::Tensor { .. }
         | Ty::Slice(_)
+        | Ty::Str
         | Ty::Ptr { .. }
         | Ty::Ref { .. }
         | Ty::Tuple(_) => true,
@@ -89,13 +90,13 @@ fn is_buffer(t: &Ty, defs: &DefMap) -> bool {
 fn assignment_rebinds(t: &Ty) -> bool {
     matches!(
         t,
-        Ty::Slice(_) | Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Tensor { .. }
+        Ty::Slice(_) | Ty::Str | Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Tensor { .. }
     )
 }
 
-/// Is a value of this type a view — a pointer to storage it does not own?
+/// Is a value of this type a view — a pointer to storage it does not own? A `str` is a `[]u8`.
 fn is_view_ty(t: &Ty) -> bool {
-    matches!(t, Ty::Slice(_) | Ty::Ptr { .. } | Ty::Ref { .. })
+    matches!(t, Ty::Slice(_) | Ty::Str | Ty::Ptr { .. } | Ty::Ref { .. })
 }
 
 /// One promised parameter, as a call site needs to see it.

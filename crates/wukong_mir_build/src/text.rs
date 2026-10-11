@@ -27,6 +27,11 @@
 //!   and names (`", "`, `"P { "`) travel as up to eight bytes packed into an `i64` constant
 //!   (`wukong_rt_fmt_lit`), so no data section is needed for them.
 //!
+//! * A **`str`** prints its text — `wukong_rt_fmt_str` over its data pointer and byte length, read
+//!   from the fat pointer — wherever a `*u8` string would print. Sema publishes a `str` as the
+//!   `[]u8` it is laid out as, so the type cannot say which slices are text: the arguments sema
+//!   recorded in `SemaResult::str_print_args` can, and they are routed here by their `NodeId`.
+//!
 //! **The process interface** (`arg_count`, `arg`, `arg_i64`, `arg_f32`, `env`, `read_stdin_u8`,
 //! `exit`) lowers to one call each of a `wukong_rt_*` entry of `wukong_runtime::process`, its
 //! integer operands widened to `i64` and its float operand to `f32`.
@@ -128,8 +133,18 @@ fn short_name(full: &str) -> &str {
 
 impl FnLowerer<'_> {
     /// `print(x)` / `println(x)` of a `bool` or a `char`: its own printer, the value zero-extended
-    /// to `i64`. `None` for any other argument, which keeps the generic print path.
+    /// to `i64`; and of a `str`: its text. `None` for any other argument, which keeps the generic
+    /// print path.
     pub(crate) fn lower_print_scalar(&mut self, newline: bool, arg: &Expr) -> Option<ValueId> {
+        if self.is_str_print_arg(arg) {
+            let mut sink = self.text_stream(false, arg.span);
+            let v = self.lower_expr(arg);
+            self.text_str(&mut sink, v, &FmtSpec::default());
+            if newline {
+                self.text_lit(&mut sink, b"\n");
+            }
+            return Some(self.const_zero(MirType::I32));
+        }
         let syms = self.gemm.text;
         let (plain, line) = match self.expr_ty(arg) {
             Ty::Scalar(Scalar::Bool) => (syms.print_bool, syms.println_bool),
@@ -205,7 +220,11 @@ impl FnLowerer<'_> {
                 if let Some(arg) = args.first() {
                     let ty = self.expr_ty(arg);
                     let v = self.lower_expr(arg);
-                    self.text_value(&mut sink, v, &ty, &FmtSpec::default());
+                    if self.is_str_print_arg(arg) {
+                        self.text_str(&mut sink, v, &FmtSpec::default());
+                    } else {
+                        self.text_value(&mut sink, v, &ty, &FmtSpec::default());
+                    }
                 }
                 if newline {
                     self.text_lit(&mut sink, b"\n");
@@ -381,7 +400,7 @@ impl FnLowerer<'_> {
     }
 
     /// A slice's data pointer and `i64` length, read from its fat pointer.
-    fn text_slice_parts(&mut self, s: ValueId) -> (ValueId, ValueId) {
+    pub(crate) fn text_slice_parts(&mut self, s: ValueId) -> (ValueId, ValueId) {
         let dp = self.field_ptr(s, SLICE_PTR_OFF);
         let data = self.builder.build(MirType::Ptr, Op::Load(dp, MirType::Ptr));
         let lp = self.field_ptr(s, SLICE_LEN_OFF);
@@ -409,12 +428,14 @@ impl FnLowerer<'_> {
         };
         let bytes = crate::decode_string_literal(self.interner.resolve(*sym));
         let pieces = st::parse_format(&bytes).ok()?;
-        // Every argument is evaluated, in order, before anything prints.
-        let mut vals: Vec<(ValueId, Ty)> = Vec::with_capacity(args.len());
+        // Every argument is evaluated, in order, before anything prints. A `str` argument is
+        // flagged here, while its node is at hand: its type alone reads as `[]u8`.
+        let mut vals: Vec<(ValueId, Ty, bool)> = Vec::with_capacity(args.len());
         for a in args {
             let t = self.expr_ty(a);
+            let is_str = self.is_str_print_arg(a);
             let v = self.lower_expr(a);
-            vals.push((v, t));
+            vals.push((v, t, is_str));
         }
         let base = self.lower_expr(fmt);
         let f = self.gemm.text.fmt_str;
@@ -436,12 +457,30 @@ impl FnLowerer<'_> {
                     self.text_call(sink, f, &[p, n, spec]);
                 }
                 FmtPiece::Arg(spec) => {
-                    let (v, t) = next.next()?;
-                    self.text_value(sink, *v, t, spec);
+                    let (v, t, is_str) = next.next()?;
+                    if *is_str {
+                        self.text_str(sink, *v, spec);
+                    } else {
+                        self.text_value(sink, *v, t, spec);
+                    }
                 }
             }
         }
         Some(())
+    }
+
+    /// Whether sema recorded the print or format argument `arg` as a `str`.
+    fn is_str_print_arg(&self, arg: &Expr) -> bool {
+        self.sema.str_print_args.contains(&arg.id)
+    }
+
+    /// The text of the `str` whose fat pointer is `v`, per `spec` — the `*u8` string's printer,
+    /// with the byte length from the fat pointer in place of the NUL scan.
+    fn text_str(&mut self, sink: &mut Sink, v: ValueId, spec: &FmtSpec) {
+        let (data, len) = self.text_slice_parts(v);
+        let sp = self.text_const(spec.pack(st::KIND_SIGNED));
+        let f = self.gemm.text.fmt_str;
+        self.text_call(sink, f, &[data, len, sp]);
     }
 
     /// Print the value `v` of semantic type `ty` per `spec`: a reference prints its referent, an

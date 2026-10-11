@@ -277,6 +277,11 @@ pub enum Ty {
         pointee: Box<Ty>,
     },
     Slice(Box<Ty>),
+    /// `str`: an immutable UTF-8 byte string, laid out exactly like a `[]u8` slice — a 16-byte fat
+    /// pointer `(data, byte length)`. It exists only inside `wukong_sema`, which enforces that its
+    /// bytes are never written; every type sema publishes has been passed through
+    /// [`Ty::erase_str`], so lowering, the optimizer and the backends see a plain `[]u8`.
+    Str,
     Array {
         elem: Box<Ty>,
         len: u64,
@@ -347,6 +352,8 @@ impl Ty {
             // aggregate (8-byte pointer + 8-byte length), even though the *pointee* is unsized. This
             // is what lets a slice be a struct/tuple field and be passed/returned by value.
             Ty::Slice(_) => Some(16),
+            // A `str` is a `[]u8` fat pointer.
+            Ty::Str => Some(16),
             Ty::Array { elem, len, .. } => elem.size_of()?.checked_mul(*len),
             Ty::Tuple(fields) => {
                 let mut size = 0u64;
@@ -375,7 +382,7 @@ impl Ty {
             // authorities disagree. Identity for every power-of-two lane count.
             Ty::Vector { elem, lanes } => Some((elem.size() * *lanes as u64).next_power_of_two()),
             // A slice's fat pointer is 8-byte aligned (its data pointer and length are both 8 bytes).
-            Ty::Slice(_) => Some(8),
+            Ty::Slice(_) | Ty::Str => Some(8),
             Ty::Array { elem, .. } => elem.align_of(),
             Ty::Tuple(fields) => fields
                 .iter()
@@ -429,6 +436,7 @@ impl Ty {
                 )
             }
             Ty::Slice(e) => format!("[]{}", e.display(interner)),
+            Ty::Str => "str".to_string(),
             Ty::Array { elem, len, shared } => {
                 let inner = format!("[{}; {}]", elem.display(interner), len);
                 if *shared {
@@ -466,6 +474,63 @@ impl Ty {
             Ty::Error => "<error>".to_string(),
         }
     }
+}
+
+impl Ty {
+    /// Whether `str` occurs anywhere in this type: itself, behind a pointer or reference, as a
+    /// slice/array element, a tuple field, or a function type's parameter or result. A nominal
+    /// type's fields are not looked into (a `Named` is a name here).
+    pub fn mentions_str(&self) -> bool {
+        match self {
+            Ty::Str => true,
+            Ty::Ptr { pointee, .. } | Ty::Ref { pointee, .. } | Ty::Slice(pointee) => {
+                pointee.mentions_str()
+            }
+            Ty::Array { elem, .. } => elem.mentions_str(),
+            Ty::Tuple(ts) => ts.iter().any(Ty::mentions_str),
+            Ty::Fn { params, ret } => params.iter().any(Ty::mentions_str) || ret.mentions_str(),
+            _ => false,
+        }
+    }
+
+    /// This type with every `str` replaced by the `[]u8` slice it is laid out as — recursing
+    /// through pointers, references, slices, arrays, tuples and function types. Sema applies it
+    /// to every type it publishes, so `str` never reaches lowering: the immutability rules are
+    /// sema's alone, and the representation is the slice machinery every backend already runs.
+    pub fn erase_str(&self) -> Ty {
+        if !self.mentions_str() {
+            return self.clone();
+        }
+        match self {
+            Ty::Str => Ty::Slice(Box::new(Ty::Scalar(Scalar::U8))),
+            Ty::Ptr { mutable, pointee } => Ty::Ptr {
+                mutable: *mutable,
+                pointee: Box::new(pointee.erase_str()),
+            },
+            Ty::Ref { mutable, pointee } => Ty::Ref {
+                mutable: *mutable,
+                pointee: Box::new(pointee.erase_str()),
+            },
+            Ty::Slice(e) => Ty::Slice(Box::new(e.erase_str())),
+            Ty::Array { elem, len, shared } => Ty::Array {
+                elem: Box::new(elem.erase_str()),
+                len: *len,
+                shared: *shared,
+            },
+            Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(Ty::erase_str).collect()),
+            Ty::Fn { params, ret } => Ty::Fn {
+                params: params.iter().map(Ty::erase_str).collect(),
+                ret: Box::new(ret.erase_str()),
+            },
+            other => other.clone(),
+        }
+    }
+}
+
+/// Whether `name` is a built-in type name: a scalar (`f32`, `u8`, …) or `str`. A program may not
+/// declare a struct, enum, trait, type alias or generic parameter with one of these names.
+pub fn is_builtin_type_name(name: &str) -> bool {
+    Scalar::from_name(name).is_some() || name == "str"
 }
 
 fn round_up(x: u64, align: u64) -> Option<u64> {
@@ -524,6 +589,58 @@ mod tests {
             Ty::Slice(Box::new(Ty::Scalar(Scalar::I32))).size_of(),
             Some(16)
         );
+    }
+
+    #[test]
+    fn str_is_a_u8_fat_pointer() {
+        let interner = Interner::new();
+        assert_eq!(Ty::Str.size_of(), Some(16));
+        assert_eq!(Ty::Str.align_of(), Some(8));
+        assert_eq!(Ty::Str.display(&interner), "str");
+        let u8_slice = Ty::Slice(Box::new(Ty::Scalar(Scalar::U8)));
+        assert_eq!(Ty::Str.erase_str(), u8_slice);
+        // A struct-like tuple holding a `str` keeps its fat-pointer layout through erasure.
+        let t = Ty::Tuple(vec![Ty::Scalar(Scalar::I8), Ty::Str]);
+        assert_eq!(t.size_of(), Some(24));
+        assert_eq!(t.erase_str().size_of(), Some(24));
+        // Erasure recurses through every structural position.
+        let nested = Ty::Fn {
+            params: vec![
+                Ty::Ptr {
+                    mutable: false,
+                    pointee: Box::new(Ty::Str),
+                },
+                Ty::Ref {
+                    mutable: true,
+                    pointee: Box::new(Ty::Slice(Box::new(Ty::Str))),
+                },
+                Ty::Array {
+                    elem: Box::new(Ty::Str),
+                    len: 3,
+                    shared: false,
+                },
+                Ty::Tuple(vec![Ty::Str, Ty::Scalar(Scalar::I32)]),
+            ],
+            ret: Box::new(Ty::Str),
+        };
+        assert!(nested.mentions_str());
+        let erased = nested.erase_str();
+        assert!(!erased.mentions_str());
+        assert_eq!(
+            erased.display(&interner),
+            "fn(*[]u8, &mut [][]u8, [[]u8; 3], ([]u8, i32)) -> []u8"
+        );
+        // A type without `str` is returned unchanged.
+        let plain = Ty::Array {
+            elem: Box::new(Ty::Scalar(Scalar::F32)),
+            len: 4,
+            shared: true,
+        };
+        assert!(!plain.mentions_str());
+        assert_eq!(plain.erase_str(), plain);
+        assert!(is_builtin_type_name("str"));
+        assert!(is_builtin_type_name("u8"));
+        assert!(!is_builtin_type_name("String"));
     }
 
     #[test]

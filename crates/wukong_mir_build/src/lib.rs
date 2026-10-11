@@ -49,6 +49,8 @@ mod par_grain;
 mod repr_tests;
 mod shape_ops;
 mod softmax_oop;
+// `str`: the literal fat pointer, `==`, and range indexing (see the module docs).
+mod strs;
 mod tile;
 mod tindex;
 mod ucount;
@@ -4529,6 +4531,7 @@ impl FnLowerer<'_> {
                 let sym = p.segments.last().unwrap().sym;
                 match self.subst.get(&sym) {
                     Some(concrete) => concrete.clone(),
+                    None if self.is_str_name(sym) => Self::str_ty(),
                     None => Ty::Named(sym),
                 }
             }
@@ -4851,8 +4854,9 @@ impl FnLowerer<'_> {
             Ty::Unknown => self.refuse_ty(ty, span),
             // A function value has no storage: as a function-typed parameter it declares no MIR
             // parameter (`methods::param_has_value`), and anywhere else it is refused. An `Error`
-            // type never survives sema: the driver stops on its diagnostic.
-            Ty::Fn { .. } | Ty::Error => self.refuse_ty(ty, span),
+            // type never survives sema: the driver stops on its diagnostic, and a `str` never
+            // leaves it (published as `[]u8`, `wukong_sema::strs`).
+            Ty::Fn { .. } | Ty::Error | Ty::Str => self.refuse_ty(ty, span),
         }
     }
 
@@ -4926,6 +4930,9 @@ impl FnLowerer<'_> {
                 let name = self.interner.resolve(sym);
                 if let Some(s) = wukong_types::Scalar::from_name(name) {
                     MirType::from_scalar(s)
+                } else if self.is_str_name(sym) {
+                    // A `str` is the 16-byte fat pointer of the `[]u8` it is published as.
+                    MirType::Array(Box::new(MirType::I8), SLICE_SIZE as u32)
                 } else {
                     // Every other name is a nominal type, sized exactly as a value of it is: a
                     // struct or a data-carrying enum is its byte buffer, a C-style enum its `i32`
@@ -4997,6 +5004,8 @@ impl FnLowerer<'_> {
                 }
                 if let Some(scalar) = wukong_types::Scalar::from_name(self.interner.resolve(sym)) {
                     Ty::Scalar(scalar)
+                } else if self.is_str_name(sym) {
+                    Self::str_ty()
                 } else {
                     Ty::Named(sym)
                 }
@@ -15378,6 +15387,7 @@ impl FnLowerer<'_> {
                 | Ty::Tensor { .. }
                 | Ty::Fn { .. }
                 | Ty::Unknown
+                | Ty::Str
                 | Ty::Error => return false,
             }
         }
@@ -21198,7 +21208,7 @@ impl FnLowerer<'_> {
                 // The lookup key is the decoded bytes plus the trailing NUL (how blobs are stored).
                 let mut key = decode_string_literal(self.interner.resolve(*s));
                 key.push(0);
-                if let Some(sym) = self.mono.and_then(|m| m.strings.get(&key)).copied() {
+                let data = if let Some(sym) = self.mono.and_then(|m| m.strings.get(&key)).copied() {
                     self.builder.build(MirType::Ptr, Op::GlobalAddr(sym))
                 } else {
                     // Fallback (a probe/kernel lowerer without the table, or a literal the collector
@@ -21221,7 +21231,9 @@ impl FnLowerer<'_> {
                         .build(MirType::I8, Op::ConstInt(0, MirType::I8));
                     self.store_element(base, &elem, bytes.len() as i128, nul);
                     base
-                }
+                };
+                // A literal sema adapted to `str` is a fat pointer over those bytes (`strs.rs`).
+                self.str_literal_value(e, data, key.len() as u64 - 1)
             }
             ExprKind::Path(p) if p.is_single() => {
                 if let Some((slot, ty)) = self.lookup(p.first().sym) {
@@ -22247,6 +22259,10 @@ impl FnLowerer<'_> {
     fn lower_binary(&mut self, op: ast::BinOp, lhs: &Expr, rhs: &Expr, e: &Expr) -> ValueId {
         use ast::BinOp::*;
         match op {
+            // Sema admits `==`/`!=` on a slice only for two `str`s, which compare by value.
+            Eq | Ne if matches!(self.expr_ty(lhs), Ty::Slice(_)) => {
+                self.lower_str_eq(lhs, rhs, op == Ne)
+            }
             Eq | Ne | Lt | Le | Gt | Ge => {
                 let l = self.lower_expr(lhs);
                 let r = self.lower_expr(rhs);
@@ -22700,6 +22716,10 @@ impl FnLowerer<'_> {
     ) -> ValueId {
         // A call through a function-typed parameter or a trait bound (`methods.rs`).
         if let Some(v) = self.lower_dispatched_call(callee, generic_args, args, e) {
+            return v;
+        }
+        // A range index `s[a..b]`, desugared by the parser (`strs.rs`).
+        if let Some(v) = self.lower_range_slice(callee, args, e) {
             return v;
         }
         // `Enum::Variant(args)` constructing a data-carrying tuple-payload variant: build its buffer
@@ -25462,7 +25482,8 @@ fn mir_ty(ty: &Ty) -> Option<MirType> {
         // A tuple with a field the structure cannot size has no answer here (it used to be a
         // 0-byte buffer).
         Ty::Tuple(_) => MirType::Array(Box::new(MirType::I8), u32::try_from(ty.size_of()?).ok()?),
-        Ty::Named(_) | Ty::Fn { .. } | Ty::Unknown | Ty::Error => return None,
+        // A `str` never leaves sema (it is published as `[]u8`).
+        Ty::Named(_) | Ty::Fn { .. } | Ty::Unknown | Ty::Error | Ty::Str => return None,
     })
 }
 

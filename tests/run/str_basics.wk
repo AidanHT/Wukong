@@ -1,0 +1,120 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: wukong
+// EXPECT-OUT: 6
+// EXPECT-OUT: 119
+// EXPECT-OUT: 117
+// EXPECT-OUT: 107
+// EXPECT-OUT: 111
+// EXPECT-OUT: 110
+// EXPECT-OUT: 103
+// EXPECT-OUT: uko
+// EXPECT-OUT: wu
+// EXPECT-OUT: ong
+// EXPECT-OUT: wukong
+// EXPECT-OUT: 3
+// EXPECT-OUT: true
+// EXPECT-OUT: false
+// EXPECT-OUT: false
+// EXPECT-OUT: false
+// EXPECT-OUT: true
+// EXPECT-OUT: hello
+// EXPECT-OUT: 104
+// EXPECT-OUT: yes
+// EXPECT-OUT: no
+// EXPECT-OUT: ada
+// EXPECT-OUT: 6
+// EXPECT-OUT: 3
+// EXPECT-OUT: [wukong|"uko"]
+// EXPECT-OUT: bye wukong
+// EXPECT-OUT: 0
+// EXPECT-OUT: 6
+module tests.run.str_basics
+
+/// `str` end to end: an immutable UTF-8 byte string, a 16-byte `(data, byte length)` fat pointer
+/// over a string literal's read-only bytes. Every expected line is derived from the language rules,
+/// not recorded from the compiler:
+/// * `s` is the six bytes of "wukong", so `s.len()` is 6 and `s[i]` reads the ASCII codes
+///   w=119, u=117, k=107, o=111, n=110, g=103 — every byte is printed, not a sum;
+/// * a range index is half-open: `s[1..4]` is bytes 1, 2, 3 ("uko"), `s[..2]` "wu", `s[3..]`
+///   "ong", `s[..]` all of "wukong", and the view `mid` is 3 bytes long;
+/// * `==` compares lengths, then bytes: "uk" differs from "uko" in length, "ukp" in its last
+///   byte, and the empty view `s[0..0]` equals the empty literal;
+/// * a `str` constant, a `str` returned by both `return` spellings, a `str` struct field and an
+///   array of three `str`s (1 + 2 + 3 = 6 bytes) all hold literals; "banana" has three 'a' (97);
+/// * `{}` prints a `str`'s text and `{:?}` quotes it;
+/// * the deferred `println(s)` runs when `farewell` returns, after `print_raw` wrote "bye " — a
+///   copy of the deferred print argument must still print as text;
+/// * the empty literal is 0 bytes, and "h\u{e9}llo" is 6: `\u{e9}` (é) is two UTF-8 bytes.
+
+const GREETING: str = "hello";
+
+struct User {
+    name: str,
+}
+
+fn first_byte(s: str) -> u8 {
+    return s[0];
+}
+
+fn pick(yes: bool) -> str {
+    if yes {
+        return "yes";
+    }
+    "no"
+}
+
+fn count_byte(s: str, target: u8) -> i64 {
+    let mut n: i64 = 0;
+    for b in s {
+        if b == target {
+            n = n + 1;
+        }
+    }
+    return n;
+}
+
+fn farewell(s: str) {
+    defer println(s);
+    print_raw("bye ");
+}
+
+fn main() -> i32 {
+    let s: str = "wukong";
+    println(s);
+    println(s.len());
+    for i in 0..s.len() {
+        println(s[i]);
+    }
+    let mid = s[1..4];
+    println(mid);
+    println(s[..2]);
+    println(s[3..]);
+    println(s[..]);
+    println(mid.len());
+    println(s == "wukong");
+    println(s != "wukong");
+    println(mid == "uk");
+    println(mid == "ukp");
+    println(s[0..0] == "");
+    println(GREETING);
+    println(first_byte(GREETING));
+    println(pick(true));
+    println(pick(false));
+    let u = User { name: "ada" };
+    println(u.name);
+    let words: [str; 3] = ["x", "yy", "zzz"];
+    let mut total: i64 = 0;
+    for w in words {
+        total = total + w.len();
+    }
+    println(total);
+    println(count_byte("banana", 97));
+    printf("[{}|{:?}]\n", s, mid);
+    farewell(s);
+    let empty: str = "";
+    println(empty.len());
+    let accented: str = "h\u{e9}llo";
+    println(accented.len());
+    return 0;
+}

@@ -530,6 +530,14 @@ impl Sema<'_> {
                     .into(),
             ),
             Ty::Array { elem, .. } => self.unprintable(elem, false),
+            // A `str` prints its text; inside an aggregate (or behind a reference) it would print
+            // as the `[]u8` it erases to, so that is refused until those print `str`s as text.
+            Ty::Str if top => None,
+            Ty::Str => Some(
+                "a `str` inside an aggregate or behind a reference does not print yet; print the \
+                 `str` itself (the field, or `*r`)"
+                    .into(),
+            ),
             Ty::Slice(elem) => match elem.as_ref() {
                 Ty::Scalar(_) => None,
                 _ => Some(
@@ -569,7 +577,7 @@ impl Sema<'_> {
             Ty::Scalar(Scalar::Bool) => Printed::Bool,
             Ty::Scalar(Scalar::Char) => Printed::Char,
             Ty::Scalar(_) => Printed::Int,
-            Ty::Ptr { .. } => Printed::Str,
+            Ty::Ptr { .. } | Ty::Str => Printed::Str,
             Ty::Ref { pointee, .. } => self.printed_class(pointee),
             Ty::Array { .. } | Ty::Slice(_) | Ty::Tuple(_) => Printed::Aggregate,
             Ty::Named(n) => match self.defs.lookup(*n).map(|d| &d.kind) {
@@ -584,6 +592,11 @@ impl Sema<'_> {
     /// Report `E0448` at `arg` when `ty` cannot be printed by `name`; `true` when it can.
     fn check_printable(&mut self, name: &str, arg: &Expr, ty: &Ty) -> bool {
         let Some(why) = self.unprintable(ty, true) else {
+            // A `str` is published as the `[]u8` it is laid out as; this set tells `mir_build`
+            // to print it as text (`strs.rs`).
+            if matches!(ty, Ty::Str) {
+                self.str_print_args.insert(arg.id);
+            }
             return true;
         };
         self.error(

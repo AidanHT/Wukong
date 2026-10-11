@@ -1,0 +1,37 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 9
+// EXPECT-OUT: 3
+// EXPECT-OUT: 2
+module tests.run.slice_range_index
+
+/// A range index works on any `[]T`, not only on `str`: `s[a..b]` is a view of elements a..b-1 of
+/// the same storage, as a `[]T`. Over the `[]i32` view of [1, 2, 3, 4, 5]:
+/// * `s[1..4]` holds 2, 3, 4 (every element printed), and passes as a `[]i32` argument whose sum
+///   is 2 + 3 + 4 = 9;
+/// * `s[2..]` is the 3 elements from index 2 to the end;
+/// * `(s[..2])[1]` indexes a view that starts at 0, so it is element 1 of `s`, the 2.
+
+fn add_all(v: []i32) -> i32 {
+    let mut t: i32 = 0;
+    for x in v {
+        t = t + x;
+    }
+    return t;
+}
+
+fn main() -> i32 {
+    let a: [i32; 5] = [1, 2, 3, 4, 5];
+    let s: []i32 = a;
+    let mid = s[1..4];
+    for x in mid {
+        println(x);
+    }
+    println(add_all(s[1..4]));
+    println(s[2..].len());
+    println((s[..2])[1]);
+    return 0;
+}

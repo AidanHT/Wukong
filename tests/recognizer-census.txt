@@ -432,6 +432,7 @@ slice_bounds_oob.wk:
 slice_destination_spellings.wk:
 slice_len_loop.wk: veckernel*2
 slice_param_kernel_base.wk: veckernel*1 wukong_sgemm_nt
+slice_range_index.wk:
 softmax.wk: wukong_norm_f32
 softmax_bwd.wk: wukong_softmax_bwd_f32
 softmax_divide.wk: wukong_norm_f32 wukong_norm_f32*2
@@ -447,6 +448,8 @@ spelling_usize_dims.wk: veckernel*1 wukong_sum_bf16 wukong_velem_f32 wukong_vele
 spelling_value_bindings.wk: wukong_velem_f32 wukong_vmath_f32 wukong_vmath_f32*2
 sret_diverging_arms.wk:
 sroa_aggregate_locals.wk:
+str_basics.wk: wukong_rt_fmt_lit wukong_rt_fmt_lit*10 wukong_rt_fmt_str wukong_rt_fmt_str*16
+str_slice_bounds.wk: wukong_rt_fmt_lit wukong_rt_fmt_str
 strict_fp.wk: veckernel*2
 strict_fp_cli.wk: veckernel*2
 string_literal.wk:

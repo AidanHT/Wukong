@@ -276,6 +276,7 @@ impl Sema<'_> {
             let ItemKind::Trait(t) = &item.kind else {
                 continue;
             };
+            self.reject_str_decl(t.name.sym, t.name.span, "trait");
             if self.methods.traits.contains_key(&t.name.sym)
                 || self.defs.lookup(t.name.sym).is_some()
             {
@@ -708,7 +709,7 @@ impl Sema<'_> {
         offset: usize,
     ) {
         for (i, a) in args.iter().enumerate() {
-            if let Some(param @ Ty::Scalar(_)) = params.get(i + offset) {
+            if let Some(param @ (Ty::Scalar(_) | Ty::Str)) = params.get(i + offset) {
                 self.constrain_literal_binding(a, None, param, false);
                 if self.literal_adapts(param, a) {
                     self.retype_adapted_literal(a, param);

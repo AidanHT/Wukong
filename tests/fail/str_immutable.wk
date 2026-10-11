@@ -1,0 +1,11 @@
+// EXPECT-CODE: E0304
+module tests.fail.str_immutable
+
+// A `str` views a string literal's read-only bytes (or a slice of them), so its bytes are never a
+// place: an element store, a compound one and `&mut s[i]` are all rejected. Re-pointing a `mut`
+// binding at another `str` is still allowed — that writes the binding, not the bytes.
+fn main() -> i32 {
+    let s: str = "abc";
+    s[0] = 65;
+    return 0;
+}

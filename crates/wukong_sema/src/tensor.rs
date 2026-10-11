@@ -685,12 +685,13 @@ impl Sema<'_> {
         let rank = match bty {
             Ty::Tensor { shape, .. } => shape.rank(),
             Ty::Array { .. } => 1,
-            Ty::Slice(_) if !is_dim && args.is_empty() => 1,
+            Ty::Slice(_) | Ty::Str if !is_dim && args.is_empty() => 1,
             _ => return None,
         };
         let what = match bty {
             Ty::Tensor { .. } => "tensor",
             Ty::Array { .. } => "array",
+            Ty::Str => "str",
             _ => "slice",
         };
         if is_dim {

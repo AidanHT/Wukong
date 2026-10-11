@@ -43,6 +43,8 @@ mod promote;
 mod provenance;
 mod resolve;
 mod shape;
+mod strs;
+pub use strs::{is_range_slice, RANGE_SLICE, RANGE_SLICE_FROM};
 mod tensor;
 #[cfg(test)]
 mod type_position_tests;
@@ -267,6 +269,10 @@ pub struct SemaResult {
     pub builtin_calls: HashMap<NodeId, BuiltinCall>,
     /// The `impl` method tables and every method call, as resolved (see `methods.rs`).
     pub methods: MethodResolution,
+    /// Every print or format argument whose type is `str` (`strs.rs`). A published `str` is erased
+    /// to the `[]u8` it is laid out as, so this set is the one place `mir_build` learns that such an
+    /// argument prints as text rather than as a list of bytes.
+    pub str_print_args: HashSet<NodeId>,
 }
 
 /// Collect the struct names a type contains *by value* — directly (`Ty::Named`) or nested inside an
@@ -448,6 +454,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         inst_calls: Vec::new(),
         fn_preds: HashMap::default(),
         assert_conds: HashSet::default(),
+        str_print_args: HashSet::default(),
     };
     // Attribute legality (`attrs`): an attribute names no value and has no type, so this walk needs
     // nothing the collection pass builds and runs first — an unknown `@bogus` is reported even in a
@@ -481,7 +488,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
     noalias::check(module, interner, &s.defs, &s.types, &mut s.diags);
     // The program entry's signature (`entry`, E0331): it reads the resolved signatures only.
     entry::check(module, interner, &s.defs, &mut s.diags);
-    let result = SemaResult {
+    let mut result = SemaResult {
         types: s.types,
         defs: s.defs,
         consts: s
@@ -492,7 +499,10 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         call_dims: s.call_dims,
         builtin_calls: s.builtin_calls,
         methods: s.methods.resolution,
+        str_print_args: s.str_print_args,
     };
+    // `str` does not leave sema: every published type is erased to its `[]u8` layout (`strs.rs`).
+    strs::erase_published(&mut result);
     (result, s.diags)
 }
 
@@ -634,6 +644,8 @@ struct Sema<'a> {
     fn_preds: HashMap<Symbol, Vec<constraints::Pred<'a>>>,
     /// The conditions of the top-level `static_assert`s that name a generic dimension.
     assert_conds: HashSet<NodeId>,
+    /// The print and format arguments of type `str`, published as [`SemaResult::str_print_args`].
+    str_print_args: HashSet<NodeId>,
 }
 
 /// One entry of [`Sema::loop_ctx`] — a loop currently being type-checked.
@@ -1200,6 +1212,9 @@ impl<'a> Sema<'a> {
     fn check_unique_decl_names(&mut self, names: &[(Symbol, Span)], what: &str) {
         let mut seen: HashMap<Symbol, Span> = HashMap::default();
         for &(sym, span) in names {
+            if what == "generic parameter" {
+                self.reject_str_decl(sym, span, what);
+            }
             if let Some(&first) = seen.get(&sym) {
                 let nm = self.sym_str(sym).to_string();
                 let mut d = Diagnostic::error(format!("duplicate {what} `{nm}`"))
@@ -1223,6 +1238,11 @@ impl<'a> Sema<'a> {
     }
 
     fn register(&mut self, name: Ident, kind: DefKind, span: Span) {
+        match &kind {
+            DefKind::Struct(_) => self.reject_str_decl(name.sym, name.span, "struct"),
+            DefKind::Enum(_) => self.reject_str_decl(name.sym, name.span, "enum"),
+            DefKind::Fn(_) | DefKind::Const(_) => {}
+        }
         // `wukong_` is the compiler's own runtime-kernel namespace (~150 symbols emitted by the GEMM
         // / vmath / norm / reduction / transpose / quant recognizers). A user function with one of
         // those names silently HIJACKED the dispatch: `fn wukong_norm_f32(…)` made a hand-written
@@ -1332,6 +1352,8 @@ impl<'a> Sema<'a> {
                     t
                 } else if let Some(sc) = Scalar::from_name(self.sym_str(name)) {
                     Ty::Scalar(sc)
+                } else if self.names_str(p) {
+                    Ty::Str
                 } else {
                     // A generic type variable or a (possibly later-defined) named type. Once every
                     // item is registered, a name that is neither is `E0324` (`resolve.rs`) — it used
@@ -2204,7 +2226,7 @@ impl<'a> Sema<'a> {
     /// enum equality is well-defined. Used to reject `==`/`!=` on values whose MIR is a base pointer.
     fn is_aggregate_ty(&self, t: &Ty) -> bool {
         match t {
-            Ty::Tuple(_) | Ty::Array { .. } | Ty::Slice(_) => true,
+            Ty::Tuple(_) | Ty::Array { .. } | Ty::Slice(_) | Ty::Str => true,
             Ty::Named(n) => {
                 matches!(
                     self.defs.lookup(*n).map(|d| &d.kind),
@@ -2297,6 +2319,10 @@ impl<'a> Sema<'a> {
         if place.is_unknown() || value.is_unknown() || place.is_error() || value.is_error() {
             return false;
         }
+        // `str` converts to and from nothing (`strs.rs`).
+        if let Some(clash) = self.str_type_clash(place, value) {
+            return clash;
+        }
         // A fixed extent/arity is known even when a leaf element is a generic type variable.
         // In particular [T; 0] cannot become [T; 1] while checking a generic function body.
         if fixed_aggregate_shape_clash(place, value) {
@@ -2378,6 +2404,7 @@ impl<'a> Sema<'a> {
     fn is_concrete_aggregate(&self, t: &Ty) -> bool {
         match t {
             Ty::Array { .. } | Ty::Tuple(_) | Ty::Slice(_) => self.is_concrete_layout(t),
+            Ty::Str => true,
             Ty::Named(n) => self.is_declared_named_ty(*n) && !self.generics.contains(n),
             _ => false,
         }
@@ -2390,7 +2417,7 @@ impl<'a> Sema<'a> {
     /// element type but a known zero-byte layout, so their extent must still agree.
     fn is_concrete_layout(&self, t: &Ty) -> bool {
         match t {
-            Ty::Unit | Ty::Scalar(_) | Ty::Vector { .. } => true,
+            Ty::Unit | Ty::Scalar(_) | Ty::Vector { .. } | Ty::Str => true,
             Ty::Ptr { pointee, .. } | Ty::Ref { pointee, .. } => self.is_concrete_layout(pointee),
             Ty::Slice(e) => self.is_concrete_layout(e),
             Ty::Array { elem, len, .. } => *len == 0 || self.is_concrete_layout(elem),
@@ -2431,7 +2458,12 @@ impl<'a> Sema<'a> {
         let pointerish = |t: &Ty| {
             matches!(
                 t,
-                Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Array { .. } | Ty::Tuple(_) | Ty::Slice(_)
+                Ty::Ptr { .. }
+                    | Ty::Ref { .. }
+                    | Ty::Array { .. }
+                    | Ty::Tuple(_)
+                    | Ty::Slice(_)
+                    | Ty::Str
             )
         };
         (scalarish(a) && pointerish(b)) || (pointerish(a) && scalarish(b))
@@ -2549,6 +2581,7 @@ impl<'a> Sema<'a> {
                         self.retype_adapted_literal(&f.value, fty);
                     }
                     self.range_check_int_literal(&f.value, fty);
+                    self.check_str_field_value(fty, &f.value);
                     // An array field's initializer must have the declared length. `Buf { data: [11,22] }`
                     // for `data: [i32; 4]` left the tail uninitialized (interp read 0, native read stack
                     // garbage — a backend divergence), and an over-long one silently dropped elements.
@@ -3007,6 +3040,8 @@ impl<'a> Sema<'a> {
                         self.check_compound_operand(*op, target, value, ts, vs);
                     }
                 }
+                // A byte of a `str` is never a place (`strs.rs`).
+                self.check_str_write(target);
                 // Reassigning an immutable binding requires `mut`, but it was never enforced. Two
                 // cases, both E0304:
                 //   • Direct rebind of a single name (`x = …`): rejected for a non-`mut` `let` AND a
@@ -3325,6 +3360,8 @@ impl<'a> Sema<'a> {
                 // — we don't newly reject other iterables here).
                 match self.type_expr(e) {
                     Ty::Array { elem, .. } | Ty::Slice(elem) => *elem,
+                    // A `str` iterates its bytes.
+                    Ty::Str => Ty::Scalar(Scalar::U8),
                     // A tensor iterates its leading axis: a rank-1 tensor yields its elements, a
                     // contiguous rank-2+ tensor yields the row VIEWS of the remaining axes (the same
                     // sub-tensor `t[i]` names).
@@ -3656,6 +3693,7 @@ impl<'a> Sema<'a> {
             self.retype_adapted_literal(arg, fty);
         }
         self.range_check_int_literal(arg, fty);
+        self.check_str_field_value(fty, arg);
         if let (Ty::Scalar(fs), Ty::Scalar(vs)) = (fty, &at) {
             if fs != vs && !self.literal_adapts(fty, arg) {
                 self.error(
@@ -3721,6 +3759,8 @@ impl<'a> Sema<'a> {
     fn literal_adapts(&self, ann: &Ty, init: &Expr) -> bool {
         match (&init.kind, ann) {
             (ExprKind::Int(s), Ty::Scalar(sc)) => sc.is_int() && !has_int_suffix(self.sym_str(*s)),
+            // A string literal is a `str` wherever one is expected (`strs.rs`).
+            (ExprKind::Str(_), Ty::Str) => true,
             (ExprKind::Float(s), Ty::Scalar(sc)) => {
                 sc.is_float() && !has_float_suffix(self.sym_str(*s))
             }
@@ -4037,10 +4077,13 @@ impl<'a> Sema<'a> {
                         mutable: false,
                         pointee: Box::new(t),
                     },
-                    UnOp::RefMut => Ty::Ptr {
-                        mutable: true,
-                        pointee: Box::new(t),
-                    },
+                    UnOp::RefMut => {
+                        self.check_str_write(expr);
+                        Ty::Ptr {
+                            mutable: true,
+                            pointee: Box::new(t),
+                        }
+                    }
                     // Unary `-`/`!` on an aggregate (struct/tuple/array), `()` (a void call's
                     // result), or a function value is meaningless and used to pass through unchanged,
                     // then mir_build emitted an arithmetic op on a base pointer / a dummy / a void
@@ -4103,6 +4146,7 @@ impl<'a> Sema<'a> {
             ExprKind::Binary { op, lhs, rhs } => {
                 let l = self.type_expr(lhs);
                 let r = self.type_expr(rhs);
+                let (l, r) = self.adapt_str_eq_literals(*op, lhs, rhs, l, r);
                 // An operand that is a literal-initialized binding takes the other operand's type
                 // when that is a wider one of its kind (`infer.rs`): `let c = 0.5; c * x_f64` makes
                 // `c` an `f64`. A shift amount and a logical operand constrain nothing.
@@ -4221,7 +4265,10 @@ impl<'a> Sema<'a> {
                     // An enum (a C-style integer discriminant) and a pointer compare fine, so only
                     // struct/tuple/array operands are rejected.
                     Eq | Ne => {
-                        if self.is_aggregate_ty(&l) || self.is_aggregate_ty(&r) {
+                        // Two `str`s compare by value (`strs.rs`), the one aggregate that does.
+                        if !self.check_str_eq(&l, &r, e.span)
+                            && (self.is_aggregate_ty(&l) || self.is_aggregate_ty(&r))
+                        {
                             self.error(
                                 e.span,
                                 "E0433",
