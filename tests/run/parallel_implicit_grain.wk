@@ -1,0 +1,66 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 6
+// EXPECT-OUT: 12
+// EXPECT-OUT: 16
+// EXPECT-OUT: 26
+// EXPECT-OUT: 38
+// EXPECT-OUT: 52
+// EXPECT-OUT: 64
+// EXPECT-OUT: 82
+// EXPECT-OUT: 102
+// EXPECT-OUT: 124
+// EXPECT-OUT: 144
+// EXPECT-OUT: 170
+// EXPECT-OUT: 12
+// EXPECT-OUT: 23
+// EXPECT-OUT: 30
+// EXPECT-OUT: 49
+// EXPECT-OUT: 72
+// EXPECT-OUT: 99
+// EXPECT-OUT: 122
+// EXPECT-OUT: 157
+// EXPECT-OUT: 196
+// EXPECT-OUT: 239
+// EXPECT-OUT: 278
+// EXPECT-OUT: 329
+module tests.run.parallel_implicit_grain
+
+// A `@parallel` loop with NO `grain` argument gets an implicit grain on the CPU backends (P12.21):
+// `max(1, ceil(2^14 / body_ops))` for a straight-line outlined body of `body_ops` MIR instructions,
+// so both loops below -- far shorter than one chunk of work -- become ONE-chunk calls that
+// `wukong_parallel_for` runs without forking, where they used to fork one claimable index per
+// iteration. Both outliner forms are here: `main`'s mid-function region (12 iterations) and
+// `scale`, a whole-function outline whose wrapper divides the runtime trip count by the grain.
+//
+// The grain changes scheduling only, so every lane is printed (never a sum) and must equal the
+// scalar semantics, computed by hand: with v = i + 2, a[i] = v*v + (v % 4), and b[i] = 2*a[i] - i.
+// Integers, so no f32 vector recipe claims a loop first and the comparison is exact.
+//
+// `wukongc --emit=mir -O2` shows the region call's trip-count operand as the constant 1 (12
+// iterations fit one chunk), where an explicit `@parallel(grain = 1)` would keep it at 12.
+
+@parallel
+fn scale(a: [i64; 12], mut out: [i64; 12]) {
+    for i in 0..12 {
+        out[i] = a[i] * 2 - (i as i64);
+    }
+}
+
+@parallel
+fn main() -> i32 {
+    let mut a: [i64; 12] = [0; 12];
+    let mut b: [i64; 12] = [0; 12];
+    for i in 0..12 {
+        let v = (i as i64) + 2;
+        a[i] = v * v + (v % 4);
+    }
+    scale(a, b);
+    for i in 0..12 {
+        print(a[i]);
+    }
+    for i in 0..12 {
+        print(b[i]);
+    }
+    return 0;
+}
