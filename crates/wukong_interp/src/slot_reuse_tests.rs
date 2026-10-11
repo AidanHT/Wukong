@@ -170,3 +170,85 @@ fn heap_growth_inside_a_frame_survives_its_release() {
     let mut it = interpreter(&program, &interner);
     assert_eq!(it.run_function(func, &[]).unwrap(), I(104071013));
 }
+
+fn scratch(interp: &mut Interp<'_, '_>, name: &str, args: &[Value]) -> Value {
+    interp.intrinsic(name, args).unwrap()
+}
+
+/// The live-allocation table kernel operands are checked against (`marshal::LiveBlocks`) follows
+/// the reuse above exactly: a heap block is live until `free` and comes back as a block of the
+/// size asked for, not of its capacity; a scratch region is live until `scratch_release` (an
+/// empty one never is); a double free and a foreign free change nothing.
+#[test]
+fn the_live_table_follows_alloc_free_and_scratch_release() {
+    let program = Program::new();
+    let interner = Interner::new();
+    let mut it = interpreter(&program, &interner);
+    it.slots = SlotReuse::tracked();
+    let a = heap_alloc(&mut it, 8, true);
+    let b = heap_alloc(&mut it, 2, false);
+    assert_eq!(it.slots.live.blocks(), [(a, a + 8), (b, b + 2)]);
+    heap_free(&mut it, a);
+    heap_free(&mut it, a);
+    heap_free(&mut it, NULL_SLOT);
+    assert_eq!(it.slots.live.blocks(), [(b, b + 2)]);
+    assert_eq!(
+        heap_alloc(&mut it, 5, false),
+        a,
+        "the freed block is reused"
+    );
+    assert_eq!(it.slots.live.blocks(), [(a, a + 5), (b, b + 2)]);
+    assert!(
+        it.slots.live.check("k", 0, a, 6).is_err(),
+        "not its capacity"
+    );
+
+    let mark = scratch(&mut it, "wukong_rt_scratch_mark", &[]);
+    let P(s) = scratch(&mut it, "wukong_rt_scratch_alloc", &[I(4), I(4), I(1)]) else {
+        panic!("scratch alloc")
+    };
+    let P(empty) = scratch(&mut it, "wukong_rt_scratch_alloc", &[I(0), I(4), I(1)]) else {
+        panic!("scratch alloc")
+    };
+    assert_eq!(it.slots.live.blocks(), [(a, a + 5), (b, b + 2), (s, s + 4)]);
+    assert!(it.slots.live.check("k", 0, empty, 1).is_err());
+    scratch(&mut it, "wukong_rt_scratch_release", &[mark]);
+    assert_eq!(it.slots.live.blocks(), [(a, a + 5), (b, b + 2)]);
+    // Reused at its depth as a block of the new request's size.
+    let again = scratch(&mut it, "wukong_rt_scratch_alloc", &[I(3), I(4), I(1)]);
+    assert_eq!(again, P(s));
+    assert_eq!(it.slots.live.blocks(), [(a, a + 5), (b, b + 2), (s, s + 3)]);
+}
+
+/// Every alloca is a live block until its frame's memory is released, and only then. `cell`
+/// returns `k` as in `a_returning_frame_releases_its_allocas` (the result is the sum of `i % 64`),
+/// and none of its 64 calls' 64-lane arrays survives in the table. What does survive is exactly
+/// what survives in memory: the heap block, and `main`'s own locals, which sit below that
+/// persistent growth and are therefore never cut (the conservative `SlotReuse` floor).
+#[test]
+fn a_returning_frame_drops_its_allocas_from_the_live_table() {
+    let mut interner = Interner::new();
+    let src = "fn cell(k: i32) -> i32 { let mut a: [i32; 64] = [0; 64]; a[k] = k; \
+               return a[k] + a[63 - k]; } \
+               fn main() -> i32 { let mut s: i32 = 0; let mut i: i32 = 0; \
+               while i < 64 { s = s + cell(i % 64); i = i + 1; } \
+               let h: []i32 = alloc_i32(3); return s; }";
+    let program = lower(src, &mut interner);
+    let main = interner.intern("main");
+    let func = program.function(main).unwrap();
+    let mut it = interpreter(&program, &interner);
+    it.slots = SlotReuse::tracked();
+    assert_eq!(it.run_function(func, &[]).unwrap(), I(2016));
+    let heap: Vec<usize> = it.slots.heap_live.keys().copied().collect();
+    assert_eq!(heap.len(), 1);
+    let blocks = it.slots.live.blocks();
+    assert_eq!(blocks.last(), Some(&(heap[0], heap[0] + 3)));
+    assert_eq!(blocks.last().unwrap().1, it.memory.len());
+    assert!(
+        blocks.iter().all(|&(start, end)| end - start != 64),
+        "a returned `cell` frame's array is still live: {blocks:?}"
+    );
+    assert!(blocks[..blocks.len() - 1]
+        .iter()
+        .all(|&(_, end)| end <= heap[0]));
+}

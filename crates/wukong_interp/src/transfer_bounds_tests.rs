@@ -477,3 +477,257 @@ fn embedding_checks_extents_and_selected_rows_without_snapshotting() {
         }
     }
 }
+
+/// A tracked interpreter (every public entry point's) over `memory`, each `(base, len)` of
+/// `blocks` registered as its own allocation.
+fn tracked<'a>(
+    program: &'a Program,
+    interner: &'a Interner,
+    memory: Vec<Value>,
+    blocks: &[(usize, usize)],
+) -> Interp<'a, 'a> {
+    let mut interp = interpreter(program, interner);
+    interp.memory = memory;
+    interp.slots = SlotReuse::tracked();
+    for &(base, len) in blocks {
+        interp.slots.live.insert(base, len);
+    }
+    interp
+}
+
+/// Transpose: exact-fit allocations run; a source or destination that fits the arena but runs
+/// one slot into the adjacent allocation is refused by argument index with memory untouched; an
+/// absurd extent is still the overflow diagnostic.
+#[test]
+fn transpose_operands_must_stay_inside_their_allocations() {
+    let program = Program::new();
+    let interner = Interner::new();
+    let input = [F(1.0), F(2.0), F(3.0), F(4.0), F(5.0), F(6.0)];
+    let mut memory = vec![Value::Unit; 12];
+    memory[..6].copy_from_slice(&input);
+    for name in [
+        "wukong_transpose_f32",
+        "wukong_transpose_f32_parallel",
+        "wukong_transpose_u16",
+        "wukong_transpose_u16_parallel",
+    ] {
+        let args = [P(0), P(6), I(2), I(3)];
+        let mut interp = tracked(&program, &interner, memory.clone(), &[(0, 6), (6, 6)]);
+        interp.intrinsic(name, &args).unwrap();
+        let expected = [input[0], input[3], input[1], input[4], input[2], input[5]];
+        exact_values(&interp.memory[6..12], &expected);
+        for (operand, blocks) in [
+            (0, [(0, 5), (5, 1), (6, 6)]),
+            (1, [(0, 6), (6, 5), (11, 1)]),
+        ] {
+            let mut interp = tracked(&program, &interner, memory.clone(), &blocks);
+            let error = interp.intrinsic(name, &args).unwrap_err();
+            assert_eq!(
+                error,
+                format!("{name}: operand {operand} extends past its allocation")
+            );
+            exact_values(&interp.memory, &memory);
+        }
+        let mut interp = tracked(&program, &interner, memory.clone(), &[(0, 6), (6, 6)]);
+        let error = interp
+            .intrinsic(name, &[P(0), P(6), I(i64::MAX.into()), I(4)])
+            .unwrap_err();
+        assert!(error.contains("extent overflow"), "{name}: {error}");
+        exact_values(&interp.memory, &memory);
+    }
+}
+
+/// Embedding: the selected weight row must lie inside the weight table's allocation — a row that
+/// runs into the next allocation is refused (earlier rows stay written, the live-gather rule);
+/// the ids and the output are checked whole, by argument index.
+#[test]
+fn embedding_rows_must_stay_inside_the_weight_allocation() {
+    let program = Program::new();
+    let interner = Interner::new();
+    for name in ["wukong_embedding_f32", "wukong_embedding_f32_parallel"] {
+        // out [0, 4) = 2 rows of h = 2; weight [4, 8) = 2 rows; ids [8, 10) = [1, 0].
+        let mut memory = vec![Value::Unit; 10];
+        memory[4..8].copy_from_slice(&[F(1.0), F(2.0), F(3.0), F(4.0)]);
+        memory[8..10].copy_from_slice(&[I(1), I(0)]);
+        let args = [P(0), P(4), P(8), I(2), I(2), I(2)];
+        let exact = [(0, 4), (4, 4), (8, 2)];
+        let mut interp = tracked(&program, &interner, memory.clone(), &exact);
+        interp.intrinsic(name, &args).unwrap();
+        exact_values(&interp.memory[..4], &[F(3.0), F(4.0), F(1.0), F(2.0)]);
+        // The weight table one slot short: row 1 (the first selected) crosses into its neighbour.
+        let mut interp = tracked(
+            &program,
+            &interner,
+            memory.clone(),
+            &[(0, 4), (4, 3), (7, 1), (8, 2)],
+        );
+        assert_eq!(
+            interp.intrinsic(name, &args).unwrap_err(),
+            format!("{name}: operand 1 extends past its allocation")
+        );
+        exact_values(&interp.memory, &memory);
+        // The output, or the ids, one slot short: refused before the first row is written.
+        for (operand, blocks) in [
+            (0, [(0, 3), (3, 1), (4, 4), (8, 2)]),
+            (2, [(0, 4), (4, 4), (8, 1), (9, 1)]),
+        ] {
+            let mut interp = tracked(&program, &interner, memory.clone(), &blocks);
+            assert_eq!(
+                interp.intrinsic(name, &args).unwrap_err(),
+                format!("{name}: operand {operand} extends past its allocation")
+            );
+            exact_values(&interp.memory, &memory);
+        }
+    }
+}
+
+/// Embedding: a selected row is bounded by the allocation of the `weight` OPERAND, not by whichever
+/// allocation happens to hold the row. For a runtime-sized table `mir_build` passes a sentinel
+/// height (`1 << 48`), so this per-row check is the only bound on `weight`: an id one row past the
+/// table selects a row lying wholly inside the NEXT allocation, which a "some live block" check
+/// accepted — the oracle then gathered the neighbour's values where native reads past the table.
+/// It is refused by argument index; earlier rows stay written (the live-gather rule).
+#[test]
+fn embedding_rows_are_bounded_by_the_weight_operand_allocation() {
+    let program = Program::new();
+    let interner = Interner::new();
+    let sentinel = I(1 << 48);
+    for name in ["wukong_embedding_f32", "wukong_embedding_f32_parallel"] {
+        // out [0, 4) = 2 rows of h = 2; weight [4, 8) = 2 rows; neighbour [8, 12); ids [12, 14).
+        let mut memory = vec![Value::Unit; 14];
+        memory[4..8].copy_from_slice(&[F(1.0), F(2.0), F(3.0), F(4.0)]);
+        memory[8..12].fill(F(9.0));
+        let blocks = [(0, 4), (4, 4), (8, 4), (12, 2)];
+        let args = [P(0), P(4), P(12), I(2), I(2), sentinel];
+        let with_ids = |ids: [i128; 2]| {
+            let mut memory = memory.clone();
+            memory[12..14].copy_from_slice(&ids.map(I));
+            memory
+        };
+        // In-table ids gather exactly.
+        let mut interp = tracked(&program, &interner, with_ids([1, 0]), &blocks);
+        interp.intrinsic(name, &args).unwrap();
+        exact_values(&interp.memory[..4], &[F(3.0), F(4.0), F(1.0), F(2.0)]);
+        // Id 2 selects [8, 10): inside the neighbour, outside `weight`. First row: nothing written.
+        let before = with_ids([2, 0]);
+        let mut interp = tracked(&program, &interner, before.clone(), &blocks);
+        assert_eq!(
+            interp.intrinsic(name, &args).unwrap_err(),
+            format!("{name}: operand 1 extends past its allocation")
+        );
+        exact_values(&interp.memory, &before);
+        // Second row: the first stays written, the neighbour's values never land in `out`.
+        let before = with_ids([0, 2]);
+        let mut interp = tracked(&program, &interner, before.clone(), &blocks);
+        assert_eq!(
+            interp.intrinsic(name, &args).unwrap_err(),
+            format!("{name}: operand 1 extends past its allocation")
+        );
+        let mut expected = before;
+        expected[..2].copy_from_slice(&[F(1.0), F(2.0)]);
+        exact_values(&interp.memory, &expected);
+    }
+}
+
+/// KV append: the cache operand is `[cache, cache + ncache)` — the extent the runtime entry is
+/// told it may write — and it must lie inside ONE allocation before the row is copied. A cache
+/// whose stated length overruns its allocation used to have only the destination row checked,
+/// against whichever allocation held it, so a row landing wholly in the neighbour was written there.
+#[test]
+fn kv_append_cache_must_stay_inside_its_allocation() {
+    let program = Program::new();
+    let interner = Interner::new();
+    let name = "wukong_kv_append_f32";
+    // cache [0, 4) = one 4-wide row; neighbour [4, 8); row [8, 12).
+    let mut memory = vec![Value::Unit; 12];
+    memory[4..8].fill(F(9.0));
+    memory[8..12].copy_from_slice(&[F(1.0), F(2.0), F(3.0), F(4.0)]);
+    let blocks = [(0, 4), (4, 4), (8, 4)];
+    // Exact fit: position 0 of a one-row cache.
+    let mut interp = tracked(&program, &interner, memory.clone(), &blocks);
+    assert_eq!(
+        interp
+            .intrinsic(name, &[P(0), I(4), P(8), I(4), I(0), I(4)])
+            .unwrap(),
+        I(0)
+    );
+    exact_values(
+        &interp.memory[..8],
+        &[
+            F(1.0),
+            F(2.0),
+            F(3.0),
+            F(4.0),
+            F(9.0),
+            F(9.0),
+            F(9.0),
+            F(9.0),
+        ],
+    );
+    // `ncache = 8` overstates the cache: position 1 lands wholly inside the neighbour. Refused
+    // with every slot untouched — and so is position 0, whose row alone would fit: the operand
+    // the entry may write is the whole stated cache.
+    for pos in [1, 0] {
+        let mut interp = tracked(&program, &interner, memory.clone(), &blocks);
+        assert_eq!(
+            interp
+                .intrinsic(name, &[P(0), I(8), P(8), I(4), I(pos), I(4)])
+                .unwrap_err(),
+            format!("{name}: operand 0 extends past its allocation")
+        );
+        exact_values(&interp.memory, &memory);
+    }
+    // The row one slot short of its allocation is refused by its own index.
+    let mut interp = tracked(
+        &program,
+        &interner,
+        memory.clone(),
+        &[(0, 4), (4, 4), (8, 3), (11, 1)],
+    );
+    assert_eq!(
+        interp
+            .intrinsic(name, &[P(0), I(4), P(8), I(4), I(0), I(4)])
+            .unwrap_err(),
+        format!("{name}: operand 2 extends past its allocation")
+    );
+    exact_values(&interp.memory, &memory);
+}
+
+/// A file read lands only inside the destination's allocation: a request that fits the arena but
+/// not the destination is refused before a byte is decoded; an exact fit reads.
+#[test]
+fn file_reads_stay_inside_the_destination_allocation() {
+    let program = Program::new();
+    let interner = Interner::new();
+    let fixture = Fixture::new(
+        &[1.5f32, -2.0, 4.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>(),
+    );
+    let path = fixture.arena();
+    let base = path.len();
+    let mut memory = path.clone();
+    memory.extend([I(99); 4]);
+    // The path string, then a 2-slot destination followed by a 2-slot neighbour.
+    let blocks = [(0, base), (base, 2), (base + 2, 2)];
+    let mut interp = tracked(&program, &interner, memory.clone(), &blocks);
+    assert_eq!(
+        interp
+            .intrinsic("wukong_rt_read_f32", &[P(0), P(base), I(2)])
+            .unwrap(),
+        I(2)
+    );
+    exact_values(
+        &interp.memory[base..base + 4],
+        &[F(1.5), F(-2.0), I(99), I(99)],
+    );
+    let mut interp = tracked(&program, &interner, memory.clone(), &blocks);
+    assert_eq!(
+        interp
+            .intrinsic("wukong_rt_read_f32", &[P(0), P(base), I(3)])
+            .unwrap_err(),
+        "wukong_rt_read_f32: operand 1 extends past its allocation"
+    );
+    exact_values(&interp.memory, &memory);
+}

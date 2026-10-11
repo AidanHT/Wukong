@@ -824,6 +824,28 @@ enumerated; `free` moves a live `alloc_*` block to a size-bucketed free list, an
 allocation that fits it (at most twice the request) takes it back re-zeroed with its own typed
 zero. A pointer that is not a live block is ignored.
 
+A recognized-kernel operand is bounded by its **allocation**, not by the arena. Because every
+allocation sits back to back in the one arena, an extent that ran off the end of one array into
+the next used to pass a range check against the arena and be read (or written) as the same buffer —
+a plausible answer where native reads past a real allocation. `SlotReuse` keeps a live-allocation
+table (`marshal::LiveBlocks`, sorted disjoint ranges): each `alloca` is one block however its
+aggregate nests, as is each `alloc_*` heap block (at the size requested, not the reused capacity),
+each scratch region, each materialized static or runtime string, and each kernel-entry buffer; a
+frame release, `free` and `scratch_release` drop theirs. Every marshalling helper (`kernel_values`,
+`read_f32`, `output_f32`, `write_back`, `check_output`, `elementwise_live`, …), the vector-kernel
+arm, and the file and text transfer arms require `[base, base + len)` to lie inside one live block
+before any scratch is reserved, and report `<kernel>: operand <k> extends past its allocation`
+(`k` the argument index) otherwise. An operand read in pieces at program-computed offsets, with no
+trustworthy whole extent (the embedding gather's weight rows — a runtime-sized table is passed a
+sentinel height), is bounded per piece by the allocation holding the operand's own pointer
+(`LiveBlocks::check_within`), not by whichever allocation holds the piece; the KV append's cache is
+checked whole (`[cache, cache + ncache)`) before its row is copied. An empty range is no access and
+is never checked — in particular a zero-trip vector-kernel call, whose stream bases
+`marshal_vec_kernel` still offsets to the range start (possibly past the arena's end), checks no
+stream, as the native kernel touches none. Every public entry point runs tracked; a unit test that
+builds an `Interp` by hand and assigns `memory` directly keeps an untracked table, bounded by the
+arena.
+
 SIMD vectors live in the `vecs` side arena, and vector stores scatter scalar lanes into memory.
 Each call owns a suffix of that arena. Block boundaries retain register-referenced vectors and
 remap their handles; returns preserve caller-owned handles or promote a newly created vector.
@@ -841,7 +863,12 @@ spawn+join, and the `AccelPtr` hand-off are gone), and an error unwinds every fr
 A 100M-step guard bounds runaway loops *within one frame*; a call-depth counter bounds recursion:
 `MAX_CALL_DEPTH` is 300_000 in every build profile (overridable per run with
 `WUKONG_INTERP_MAX_DEPTH`), and exceeding it returns the diagnostic "interpreter call-depth limit
-exceeded (likely unbounded recursion)". SIMD lane/arena allocation and several other growth paths use `try_reserve` to
+exceeded (likely unbounded recursion)". A callee symbol is resolved once per run (`CalleeTable`) to
+a function, an `extern "C"`, or a dense `Intrinsic` id from the single name table in
+`intrinsics.rs`, and every intrinsic call dispatches on that id; a name in none of them fails with
+"call to unknown function or intrinsic". Register files are pooled per depth and not refilled on
+entry — verified MIR writes a register before it reads it — and a returning frame resets only its
+vector-typed registers, so no stale SIMD handle reaches the next frame's arena compaction. SIMD lane/arena allocation and several other growth paths use `try_reserve` to
 report allocation errors. Some remaining paths still allocate infallibly; a diagnostic for every
 possible resource-exhaustion case is not established.
 

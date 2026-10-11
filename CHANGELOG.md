@@ -260,6 +260,28 @@ All notable changes to Wukong are documented here. The format is loosely based o
   search-loop speculation. The language guide (Extents), the roadmap's sharp edges and the code docs
   now say that the caller promises at least the declared extent. A shorter buffer is outside the
   defined contract, where `-O2` may read past it. No behavior changes.
+### Interpreter oracle (`gap4/interp-oracle`)
+
+- **Kernel operands are bounded by their allocation, not the arena (P1.18).** The interpreter's
+  slot memory holds every allocation back to back, and a recognized kernel's operand was checked
+  only against the whole arena, so an extent that ran off the end of one array into the next was
+  read (or written) as if it were the same buffer. A live-allocation table now covers every
+  `alloca` (an aggregate is one allocation), heap block, scratch region, static and kernel-entry
+  buffer, kept in step with frame release, `free` and `scratch_release`; every kernel and
+  transfer arm refuses such an operand with `<kernel>: operand <k> extends past its allocation`
+  before reserving any scratch. The vector-kernel arm's extents are checked arithmetic too.
+  An embedding weight row is bounded by the allocation holding `weight` itself (a runtime-sized
+  table gets a sentinel height, so a row wholly inside the next allocation used to be gathered),
+  and the KV append checks its whole cache before copying the row.
+- **A zero-trip vector loop no longer fails in the interpreter.** For an empty or sub-lane-group
+  range the 256-bit vector kernel is called with `n = 0` but stream bases offset to the range
+  start, which can lie past the end of the interpreter's arena (`for i in 100000..n` over an empty
+  slice). The interpreter reported "veckernel stream out of bounds" — the elementwise arm since its
+  new up-front stream check, the reduction arm before that — where native ran nothing and exited 0.
+  An empty stream range is now no access (`tests/run/vec_kernel_zero_trip.wk`).
+- **Intrinsic calls dispatch on an id resolved once per run (N58).** Every intrinsic name lives in
+  one table (`crates/wukong_interp/src/intrinsics.rs`); a call no longer walks a ~200-literal
+  string match, and a pooled register file is no longer refilled on every call.
 
 ### Index-recording reductions (`gap3/vec-argmax`)
 

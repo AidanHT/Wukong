@@ -267,7 +267,14 @@ fn vector_arena_error_cleanup_and_reuse() {
             .contains("unreachable"));
         assert_eq!(interp.vecs.len(), 1);
         assert_eq!(interp.depth, 0);
-        assert!(interp.frames.iter().all(Vec::is_empty));
+        // The failed frame's register file went back to the pool (one per depth reached), its
+        // scalars kept for the next call and its SIMD handles reset (`enter_frame`).
+        assert_eq!(interp.frames.len(), 1);
+        assert!(interp
+            .frames
+            .iter()
+            .flatten()
+            .all(|v| !matches!(v, Value::VecRef(_))));
         assert!(interp.scratch.is_empty());
         assert_eq!(
             interp.vec_lanes(caller_value, 4).unwrap(),
@@ -318,4 +325,80 @@ fn vector_arena_capacity_overflow_is_fallible_without_allocating() {
     // usize::MAX Values exceed Vec's representable allocation size on every target.
     let error = collect_lanes(std::iter::repeat_n(Value::Int(0), usize::MAX)).unwrap_err();
     assert!(error.contains("allocation failed"));
+}
+
+/// A recycled register file is not refilled on entry (`Interp::enter_frame`), so the SIMD handles
+/// a callee leaves in it must not reach the next function to take it: there a stale handle can
+/// sit in a register the new function has not written yet — here a SCALAR one — and the block
+/// boundary's compaction scans every register. `producer` leaves three handles in registers
+/// 1..=3; `consumer`, entered at the same depth, has one vector of its own at a compaction point
+/// where registers 2 and 3 (scalars, defined after it) are still unwritten. Reached with the stale
+/// handles, that compaction rejected them as out of range.
+#[test]
+fn recycled_register_files_carry_no_stale_vector_handles() {
+    let mut interner = Interner::new();
+    let producer_name = interner.intern("producer");
+    let consumer_name = interner.intern("consumer");
+    let mut producer = Builder::new(producer_name, MirType::I64);
+    let one = constant(&mut producer, 1);
+    let splat = producer.build(vector(), Op::Splat(one));
+    let ramp = producer.build(vector(), Op::Iota(vector()));
+    producer.build(vector(), Op::Bin(BinOp::Add, splat, ramp));
+    producer.ret(Some(one));
+    let mut consumer = Builder::new(consumer_name, MirType::I64);
+    let out = consumer.add_param(MirType::Ptr);
+    let own = consumer.build(vector(), Op::Iota(vector()));
+    let next = consumer.new_block();
+    consumer.br(next, vec![]);
+    consumer.switch_to(next);
+    let seven = constant(&mut consumer, 7);
+    let eight = constant(&mut consumer, 8);
+    consumer.build_void(Op::Store {
+        ptr: out,
+        value: own,
+    });
+    let sum = consumer.build(MirType::I64, Op::Bin(BinOp::Add, seven, eight));
+    consumer.ret(Some(sum));
+    let mut caller = Builder::new(interner.intern("caller"), MirType::I64);
+    let slot = caller.add_param(MirType::Ptr);
+    caller.build(
+        MirType::I64,
+        Op::Call {
+            func: producer_name,
+            args: vec![],
+        },
+    );
+    let result = caller.build(
+        MirType::I64,
+        Op::Call {
+            func: consumer_name,
+            args: vec![slot],
+        },
+    );
+    caller.ret(Some(result));
+    let program = verified(vec![producer.finish(), consumer.finish(), caller.finish()]);
+    // The premise: the consumer's still-unwritten registers are where the producer kept vectors.
+    let types = |f: usize, r: usize| program.funcs[f].value_types[r].clone();
+    for r in 1..=3 {
+        assert!(matches!(types(0, r), MirType::Vec(..)), "producer r{r}");
+    }
+    assert!(matches!(types(1, 1), MirType::Vec(..)));
+    assert_eq!((types(1, 2), types(1, 3)), (MirType::I64, MirType::I64));
+    let mut interp = interpreter(&program, &interner);
+    interp.memory = vec![Value::Unit; 4];
+    for _ in 0..3 {
+        assert_eq!(
+            interp
+                .run_function(&program.funcs[2], &[Value::Ptr(0)])
+                .unwrap(),
+            Value::Int(15)
+        );
+        assert_eq!(interp.memory, [0, 1, 2, 3].map(Value::Int));
+        assert!(interp.vecs.is_empty());
+        assert!(interp
+            .frames
+            .iter()
+            .flatten()
+            .all(|v| !matches!(v, Value::VecRef(_))));
+    }
 }

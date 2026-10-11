@@ -17,7 +17,7 @@ use wukong_runtime::fileio::DT_U8;
 use wukong_runtime::fmt::{self, Spec, TARGET_BUFFER, TARGET_STDERR};
 use wukong_runtime::process;
 
-use crate::{Interp, Value};
+use crate::{Interp, Intrinsic, Value};
 
 /// The integer operand at `i` as the native entry receives it (an `i64`).
 fn int(args: &[Value], i: usize) -> i64 {
@@ -32,52 +32,53 @@ fn float(args: &[Value], i: usize) -> f64 {
 }
 
 impl Interp<'_, '_> {
-    /// Dispatch a text runtime entry, or `None` when `name` is not one of them.
+    /// Dispatch a text runtime entry, or `None` when `id` is not one of them.
     pub(crate) fn text_intrinsic(
         &mut self,
-        name: &str,
+        id: Intrinsic,
         args: &[Value],
     ) -> Option<Result<Value, String>> {
+        use Intrinsic as I;
         let mut out = Vec::new();
-        Some(match name {
-            "wukong_rt_fmt_int" => {
+        Some(match id {
+            I::RtFmtInt => {
                 fmt::format_int(&mut out, int(args, 4), Spec::unpack(int(args, 5)));
                 self.text_emit(args, &out)
             }
-            "wukong_rt_fmt_f64" => {
+            I::RtFmtF64 => {
                 fmt::format_f64(&mut out, float(args, 4), Spec::unpack(int(args, 5)));
                 self.text_emit(args, &out)
             }
-            "wukong_rt_fmt_f32" => {
+            I::RtFmtF32 => {
                 // Exact: an `f32` operand's slot holds the `f64` image of an `f32`.
                 fmt::format_f32(&mut out, float(args, 4) as f32, Spec::unpack(int(args, 5)));
                 self.text_emit(args, &out)
             }
-            "wukong_rt_fmt_str" => self.text_fmt_str(args),
-            "wukong_rt_fmt_lit" => {
+            I::RtFmtStr => self.text_fmt_str(args),
+            I::RtFmtLit => {
                 let (bytes, n) = fmt::lit_operand(int(args, 4), int(args, 5));
                 self.text_emit(args, &bytes[..n])
             }
-            "wukong_rt_fmt_slice" => self.text_fmt_slice(args),
-            "wukong_rt_arg_count" => Ok(Value::Int(i128::from(process::arg_count()))),
-            "wukong_rt_arg" => {
+            I::RtFmtSlice => self.text_fmt_slice(args),
+            I::RtArgCount => Ok(Value::Int(i128::from(process::arg_count()))),
+            I::RtArg => {
                 let arg = process::arg_cstr(int(args, 0)).to_bytes();
                 Ok(self.text_alloc_str(arg))
             }
-            "wukong_rt_arg_i64" => {
+            I::RtArgI64 => {
                 let arg = process::arg_cstr(int(args, 0)).to_bytes();
                 let v = process::parse_i64_arg(arg, int(args, 1));
                 Ok(Value::Int(i128::from(v)))
             }
-            "wukong_rt_arg_f32" => {
+            I::RtArgF32 => {
                 let arg = process::arg_cstr(int(args, 0)).to_bytes();
                 let v = process::parse_f32_arg(arg, float(args, 1) as f32);
                 Ok(Value::Float(f64::from(v)))
             }
-            "wukong_rt_env" => self.text_env(args),
-            "wukong_rt_read_stdin" => self.text_read_stdin(args),
+            I::RtEnv => self.text_env(args),
+            I::RtReadStdin => self.text_read_stdin(args),
             // The run stops here; `run_capturing` / `run_streaming` report the code as its result.
-            "wukong_rt_exit" => Err(format!("{}{}", process::EXIT_SENTINEL, int(args, 0))),
+            I::RtExit => Err(format!("{}{}", process::EXIT_SENTINEL, int(args, 0))),
             _ => return None,
         })
     }
@@ -88,13 +89,14 @@ impl Interp<'_, '_> {
         self.memory
             .extend(bytes.iter().map(|&b| Value::Int(i128::from(b))));
         self.memory.push(Value::Int(0));
+        self.slots.live.insert(base, bytes.len() + 1);
         Value::Ptr(base)
     }
 
     /// `wukong_rt_env(name) -> *u8`.
     fn text_env(&mut self, args: &[Value]) -> Result<Value, String> {
         let name = match args.first() {
-            Some(Value::Ptr(p)) if !self.is_null(*p) => self.text_read_bytes(*p, -1)?,
+            Some(Value::Ptr(p)) if !self.is_null(*p) => self.text_read_bytes(0, *p, -1)?,
             _ => Vec::new(),
         };
         let value = process::env_cstr(&name).to_bytes();
@@ -115,6 +117,7 @@ impl Interp<'_, '_> {
         {
             return Err("read_stdin_u8: buffer out of bounds".into());
         }
+        self.slots.live.check("read_stdin_u8", 0, base, cap)?;
         let mut bytes = vec![0u8; cap];
         let n = process::read_stdin_into(&mut bytes);
         let got = usize::try_from(n).unwrap_or(0);
@@ -151,6 +154,8 @@ impl Interp<'_, '_> {
             {
                 return Err("text format: buffer out of bounds".into());
             }
+            // Through the NUL, inside the buffer's one allocation.
+            self.slots.live.check("text format", 1, base, nul + 1)?;
             for (k, &b) in bytes[..w.count].iter().enumerate() {
                 self.memory[base + w.start + k] = crate::ml_io::decode_elem(DT_U8, &[b]);
             }
@@ -159,12 +164,16 @@ impl Interp<'_, '_> {
         Ok(Value::Int(i128::from(w.end)))
     }
 
-    /// `n` bytes of the string at slot `base`, or up to its NUL when `n < 0`.
-    fn text_read_bytes(&self, base: usize, n: i64) -> Result<Vec<u8>, String> {
+    /// `n` bytes of the string at slot `base` (the call's operand `k`), or up to its NUL when
+    /// `n < 0`. An explicit length must stay inside the string's allocation.
+    fn text_read_bytes(&self, k: usize, base: usize, n: i64) -> Result<Vec<u8>, String> {
         let tail = self.memory.get(base..).unwrap_or(&[]);
         let len = match usize::try_from(n) {
             Ok(n) if n > tail.len() => return Err("text format: string out of bounds".into()),
-            Ok(n) => n,
+            Ok(n) => {
+                self.slots.live.check("text format", k, base, n)?;
+                n
+            }
             Err(_) => tail
                 .iter()
                 .position(|v| v.as_int() as u8 == 0)
@@ -176,7 +185,9 @@ impl Interp<'_, '_> {
     /// `wukong_rt_fmt_str(target, buf, cap, pos, s, n, spec)`.
     fn text_fmt_str(&mut self, args: &[Value]) -> Result<Value, String> {
         let bytes = match args.get(4) {
-            Some(Value::Ptr(p)) if !self.is_null(*p) => self.text_read_bytes(*p, int(args, 5))?,
+            Some(Value::Ptr(p)) if !self.is_null(*p) => {
+                self.text_read_bytes(4, *p, int(args, 5))?
+            }
             _ => Vec::new(),
         };
         let mut out = Vec::new();
@@ -203,6 +214,7 @@ impl Interp<'_, '_> {
         if end > self.memory.len() {
             return Err("text format: buffer out of bounds".into());
         }
+        self.slots.live.check("text format", 4, base, len)?;
         let slots = &self.memory[base..end];
         let mut out = Vec::new();
         fmt::format_seq(

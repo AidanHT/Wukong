@@ -419,3 +419,140 @@ fn extents_dequant_integer_widths_aligned_i32_tail_and_optional_bias() {
         }
     }
 }
+
+/// The same cases on a TRACKED interpreter (every public entry point's): each used operand range
+/// registered as its own allocation.
+fn tracked_case(interp: &mut Interp<'_, '_>, case: &Case, shrink: Option<usize>) {
+    interp.memory = memory();
+    interp.slots = SlotReuse::tracked();
+    for (i, &(arg, len)) in case.ranges.iter().enumerate() {
+        let P(base) = case.args[arg] else {
+            panic!("{}: argument {arg} is not a pointer", case.name)
+        };
+        if shrink == Some(i) {
+            // One slot short, with the last slot a separate (adjacent) allocation: the operand
+            // still fits the arena, but no longer its allocation.
+            interp.slots.live.insert(base, len - 1);
+            interp.slots.live.insert(base + len - 1, 1);
+        } else {
+            interp.slots.live.insert(base, len);
+        }
+    }
+}
+
+/// Exact fit: every operand exactly its allocation still runs, with the untracked answers.
+#[test]
+fn extents_exact_fit_allocations_still_run() {
+    let program = Program::new();
+    let interner = Interner::new();
+    let mut interp = interpreter(&program, &interner);
+    for case in cases() {
+        tracked_case(&mut interp, &case, None);
+        interp.intrinsic(&case.name, &case.args).unwrap();
+        assert_eq!(
+            &interp.memory[12..12 + case.expected.len()],
+            &case.expected,
+            "{}",
+            case.name
+        );
+    }
+}
+
+/// An operand that fits the ARENA but runs one slot into the adjacent allocation is refused —
+/// named by its argument index, before any scratch is reserved and with memory untouched — for
+/// every operand of every case, inputs and outputs alike.
+#[test]
+fn extents_reject_an_operand_overrunning_into_the_adjacent_allocation() {
+    let program = Program::new();
+    let interner = Interner::new();
+    let mut interp = interpreter(&program, &interner);
+    for case in cases() {
+        for (i, &(arg, _)) in case.ranges.iter().enumerate() {
+            tracked_case(&mut interp, &case, Some(i));
+            let before = interp.memory.clone();
+            let error = interp.intrinsic(&case.name, &case.args).unwrap_err();
+            assert_eq!(
+                error,
+                format!("{}: operand {arg} extends past its allocation", case.name),
+                "{} operand {arg}",
+                case.name
+            );
+            assert_eq!(interp.memory, before, "{} operand {arg}", case.name);
+        }
+    }
+}
+
+/// Absurd extents on a tracked interpreter are still the overflow / arena diagnostics (checked
+/// before the allocation is looked up), never a panic or an allocator abort.
+#[test]
+fn extents_absurd_products_stay_diagnostics_on_a_tracked_interpreter() {
+    let program = Program::new();
+    let interner = Interner::new();
+    let mut interp = interpreter(&program, &interner);
+    for case in cases() {
+        for &dim in &case.dims {
+            for huge in [i128::from(i64::MAX), i128::from(i64::MAX) / 2 + 1] {
+                let mut args = case.args.clone();
+                args[dim] = I(huge);
+                tracked_case(&mut interp, &case, None);
+                let before = interp.memory.clone();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    interp.intrinsic(&case.name, &args)
+                }));
+                let error = result
+                    .expect("extent must diagnose rather than panic")
+                    .unwrap_err();
+                assert!(
+                    error.contains("extent overflow")
+                        || error.contains("out of bounds")
+                        || error.contains("extends past its allocation"),
+                    "{} dim {dim}: {error}",
+                    case.name
+                );
+                assert_eq!(interp.memory, before, "{} dim {dim}", case.name);
+            }
+        }
+    }
+}
+
+/// End to end through a public entry point (which always tracks): `main` allocates `x: [f32; 4]`,
+/// a neighbouring `[f32; 4]`, and `out: [f32; 8]`, then calls `wukong_vmath_f32(x, out, n, exp)`.
+/// At `n = 4` every operand is its allocation and the run succeeds; at `n = 8` the read of `x`
+/// still fits the arena (it runs into the neighbour) but not `x`, and the run stops with the
+/// diagnostic instead of exponentiating the neighbour's slots.
+#[test]
+fn a_run_refuses_a_kernel_operand_that_runs_into_the_next_alloca() {
+    for (n, expected) in [
+        (4, Ok((0, Vec::new()))),
+        (
+            8,
+            Err("wukong_vmath_f32: operand 0 extends past its allocation".to_string()),
+        ),
+    ] {
+        let mut interner = Interner::new();
+        let main = interner.intern("main");
+        let vmath = interner.intern("wukong_vmath_f32");
+        let mut b = wukong_mir::Builder::new(main, MirType::I64);
+        let x = b.alloca(MirType::Array(Box::new(MirType::F32), 4));
+        b.alloca(MirType::Array(Box::new(MirType::F32), 4));
+        let out = b.alloca(MirType::Array(Box::new(MirType::F32), 8));
+        let len = b.build(MirType::I64, Op::ConstInt(n, MirType::I64));
+        let exp = b.build(
+            MirType::I64,
+            Op::ConstInt(wukong_runtime::VM_EXP.into(), MirType::I64),
+        );
+        b.build_void(Op::Call {
+            func: vmath,
+            args: vec![x, out, len, exp],
+        });
+        let zero = b.build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        b.ret(Some(zero));
+        let mut program = Program::new();
+        program.funcs.push(b.finish());
+        assert_eq!(
+            run_with_output(&program, main, &interner),
+            expected,
+            "n = {n}"
+        );
+    }
+}

@@ -762,3 +762,115 @@ fn fused_gemm_preserves_numeric_types_bias_and_unread_output() {
         }
     }
 }
+
+/// The vector-kernel arm on a TRACKED interpreter: the pointer table, the scalar table and every
+/// stream the recipe touches must each lie inside one allocation — a stream one slot into its
+/// neighbour is refused (named by stream index) before the first store — and an absurd element
+/// count is a diagnostic, not a truncated count or an abort. Exact fits run as before.
+#[test]
+fn vector_recipe_streams_stay_inside_their_allocations() {
+    let mut interner = Interner::new();
+    for reduction in [false, true] {
+        let program = vector_program(&mut interner, reduction);
+        let mut memory = vec![Value::Unit; 25];
+        memory[0] = P(4);
+        memory[1] = P(16);
+        memory[2] = F(3.0);
+        memory[4..12].fill(F(2.0));
+        let run = |blocks: &[(usize, usize)], n: Value| {
+            let mut interp = interpreter(&program, &interner);
+            interp.memory = memory.clone();
+            interp.slots = SlotReuse::tracked();
+            for &(base, len) in blocks {
+                interp.slots.live.insert(base, len);
+            }
+            let result = interp.run_function(&program.funcs[0], &[P(0), P(2), n]);
+            (result, interp.memory)
+        };
+        // ptrs [0, 2), scalars [2, 4), stream 0 [4, 12), stream 1 [16, 24).
+        let exact = [(0, 2), (2, 2), (4, 8), (16, 8)];
+        let (result, after) = run(&exact, I(8));
+        if reduction {
+            assert_eq!(result, Ok(F(48.0)));
+        } else {
+            assert_eq!(result, Ok(Value::Unit));
+            assert_eq!(&after[16..24], &[F(6.0); 8]);
+        }
+        let mut refusals = vec![
+            (
+                [(0, 1), (1, 1), (2, 2), (4, 8), (16, 8)].to_vec(),
+                "veckernel ptrs: operand 0 extends past its allocation",
+            ),
+            (
+                [(0, 2), (2, 2), (4, 7), (11, 1), (16, 8)].to_vec(),
+                "veckernel stream: operand 0 extends past its allocation",
+            ),
+        ];
+        if !reduction {
+            // The stored stream is checked whole before the first store, too.
+            refusals.push((
+                [(0, 2), (2, 2), (4, 8), (16, 7), (23, 1)].to_vec(),
+                "veckernel stream: operand 1 extends past its allocation",
+            ));
+        }
+        for (blocks, error) in refusals {
+            let (result, after) = run(&blocks, I(8));
+            assert_eq!(result, Err(error.to_string()), "{blocks:?}");
+            assert_eq!(after, memory, "{blocks:?}");
+        }
+        // Past the address space: no truncated count. At the top of it: no wrapped extent.
+        let (result, after) = run(&exact, I(i128::MAX));
+        assert_eq!(result, Err("veckernel element count overflow".to_string()));
+        assert_eq!(after, memory);
+        let (result, after) = run(&exact, I(usize::MAX as i128));
+        assert!(
+            result.as_ref().is_err_and(|e| e.contains("out of bounds")),
+            "{result:?}"
+        );
+        assert_eq!(after, memory);
+    }
+}
+
+/// A zero-trip vector call touches no stream, so it constrains no stream base. `marshal_vec_kernel`
+/// passes `n = 0` for a short or empty range but still offsets every base to the range START,
+/// which may lie past the end of the arena (`for i in 100000..n` over an empty slice allocated
+/// last); a reduction whose count is below one lane group reads nothing either. The native kernel
+/// does nothing there, so the oracle must answer the same — the reduction's identity, memory
+/// untouched — tracked or not, instead of reporting a stream "out of bounds" it never reads.
+#[test]
+fn zero_trip_vector_recipes_constrain_no_stream_base() {
+    let mut interner = Interner::new();
+    for reduction in [false, true] {
+        let program = vector_program(&mut interner, reduction);
+        // ptrs [0, 2) aim both streams far past the 4-slot arena; scalars [2, 4).
+        let mut memory = vec![Value::Unit; 4];
+        memory[0] = P(100_000);
+        memory[1] = P(200_000);
+        memory[2] = F(3.0);
+        // An elementwise call's count is the vector part only (a multiple of the lanes, or 0); a
+        // reduction folds whole lane groups, so 7 of 8 lanes is a zero-trip call too.
+        let counts: &[i128] = if reduction { &[0, 7] } else { &[0] };
+        let expected = if reduction { F(0.0) } else { Value::Unit };
+        for tracked in [false, true] {
+            for &n in counts {
+                let mut interp = interpreter(&program, &interner);
+                interp.memory = memory.clone();
+                if tracked {
+                    interp.slots = SlotReuse::tracked();
+                    interp.slots.live.insert(0, 2);
+                    interp.slots.live.insert(2, 2);
+                }
+                let result = interp.run_function(&program.funcs[0], &[P(0), P(2), I(n)]);
+                assert_eq!(
+                    result,
+                    Ok(expected),
+                    "reduction={reduction} tracked={tracked} n={n}"
+                );
+                assert_eq!(
+                    interp.memory, memory,
+                    "reduction={reduction} tracked={tracked} n={n}"
+                );
+            }
+        }
+    }
+}

@@ -26,7 +26,9 @@ use wukong_runtime::fileio::{
     DT_F64, DT_I16, DT_I32, DT_I8, DT_U16, DT_U32, DT_U8, IO_ERROR, IO_OPEN_FAILED,
 };
 
-use crate::{file_read_path, kernel_buffer, kernel_scratch, kernel_values, Interp, Value};
+use crate::{
+    file_read_path, kernel_buffer, kernel_scratch, kernel_values, Interp, Intrinsic, Value,
+};
 
 /// Decode one little-endian element of dtype `dt` from `b` (exactly `dtype_size(dt)` bytes) into the
 /// canonical slot value: floats as their exact `f64` image (half precision widened exactly), integers
@@ -101,36 +103,38 @@ fn count(n: i64) -> usize {
 }
 
 impl Interp<'_, '_> {
-    /// Dispatch an ML I/O or randomness runtime entry, or `None` when `name` is not one of them
+    /// Dispatch an ML I/O or randomness runtime entry, or `None` when `id` is not one of them
     /// (the caller then reports an unknown intrinsic).
     pub(crate) fn ml_intrinsic(
         &mut self,
-        name: &str,
+        id: Intrinsic,
         args: &[Value],
     ) -> Option<Result<Value, String>> {
-        Some(match name {
-            "wukong_rt_read_dt" => self.ml_read_dt(args),
-            "wukong_rt_write_dt" => self.ml_write_dt(args),
-            "wukong_rt_file_size" => self.ml_file_size(args),
-            "wukong_rt_st_read" => self.ml_container_read(args, true),
-            "wukong_rt_npy_read" => self.ml_container_read(args, false),
-            "wukong_rand_fill_f32" => self.ml_rand_fill(args),
-            "wukong_topk_f32" => self.ml_topk(args),
-            "wukong_argsort_f32" => self.ml_argsort(args),
-            "wukong_sample_categorical_f32" => self.ml_sample_categorical(args),
+        use Intrinsic as I;
+        Some(match id {
+            I::RtReadDt => self.ml_read_dt(args),
+            I::RtWriteDt => self.ml_write_dt(args),
+            I::RtFileSize => self.ml_file_size(args),
+            I::RtStRead => self.ml_container_read(args, true),
+            I::RtNpyRead => self.ml_container_read(args, false),
+            I::RandFillF32 => self.ml_rand_fill(args),
+            I::TopkF32 => self.ml_topk(args),
+            I::ArgsortF32 => self.ml_argsort(args),
+            I::SampleCategoricalF32 => self.ml_sample_categorical(args),
             _ => return None,
         })
     }
 
-    /// Validate that `n` slots from `base` lie inside the arena before anything is read or written.
-    fn ml_check_extent(&self, base: usize, n: usize, ctx: &str) -> Result<(), String> {
+    /// Validate that `n` slots from `base` — the call's operand `k` — lie inside the arena, and
+    /// inside one live allocation, before anything is read or written.
+    fn ml_check_extent(&self, k: usize, base: usize, n: usize, ctx: &str) -> Result<(), String> {
         let end = base
             .checked_add(n)
             .ok_or_else(|| format!("{ctx}: data out of bounds"))?;
         if end > self.memory.len() {
             return Err(format!("{ctx}: data out of bounds"));
         }
-        Ok(())
+        self.slots.live.check(ctx, k, base, n)
     }
 
     /// Read `n` elements of `dt` from `file`'s current position and decode them into
@@ -139,14 +143,14 @@ impl Interp<'_, '_> {
     fn ml_decode_into(
         &mut self,
         file: &mut std::fs::File,
-        base: usize,
+        (k, base): (usize, usize),
         n: usize,
         dt: i64,
         ctx: &str,
     ) -> Result<Option<()>, String> {
         use std::io::Read;
         let sz = dtype_size(dt).ok_or_else(|| format!("{ctx}: unknown dtype {dt}"))?;
-        self.ml_check_extent(base, n, ctx)?;
+        self.ml_check_extent(k, base, n, ctx)?;
         let byte_len = n
             .checked_mul(sz)
             .ok_or_else(|| format!("{ctx}: byte extent overflow"))?;
@@ -186,14 +190,16 @@ impl Interp<'_, '_> {
             return Ok(Value::Int(0));
         }
         let base = ptr_arg(args, 2, CTX, "data")?;
-        self.ml_check_extent(base, n, CTX)?;
+        self.ml_check_extent(2, base, n, CTX)?;
         if file.seek(SeekFrom::Start(off)).is_err() {
             return Ok(Value::Int(IO_ERROR as i128));
         }
-        Ok(match self.ml_decode_into(&mut file, base, n, dt, CTX)? {
-            Some(()) => Value::Int(n as i128),
-            None => Value::Int(IO_ERROR as i128),
-        })
+        Ok(
+            match self.ml_decode_into(&mut file, (2, base), n, dt, CTX)? {
+                Some(()) => Value::Int(n as i128),
+                None => Value::Int(IO_ERROR as i128),
+            },
+        )
     }
 
     /// `wukong_rt_write_dt(path, data, len, dtype) -> i64`. The source extent is validated before the
@@ -211,7 +217,7 @@ impl Interp<'_, '_> {
         let mut out = Vec::new();
         if n > 0 {
             let base = ptr_arg(args, 1, CTX, "data")?;
-            self.ml_check_extent(base, n, CTX)?;
+            self.ml_check_extent(1, base, n, CTX)?;
             let byte_len = n
                 .checked_mul(sz)
                 .ok_or_else(|| format!("{CTX}: byte extent overflow"))?;
@@ -262,7 +268,7 @@ impl Interp<'_, '_> {
             None
         } else {
             let base = ptr_arg(args, at + 4, ctx, "dims")?;
-            let vals = kernel_values(&self.memory, base, 1, count(rank), ctx)?;
+            let vals = kernel_values(arena!(self), at + 4, base, 1, count(rank), ctx)?;
             Some(vals.iter().map(|v| v.as_int() as i64).collect())
         };
         let container = match &name {
@@ -281,21 +287,27 @@ impl Interp<'_, '_> {
             return Ok(Value::Int(0));
         }
         let base = ptr_arg(args, at + 1, ctx, "data")?;
-        self.ml_check_extent(base, n, ctx)?;
+        self.ml_check_extent(at + 1, base, n, ctx)?;
         if file.seek(SeekFrom::Start(loc.data_off)).is_err() {
             return Ok(Value::Int(IO_ERROR as i128));
         }
         Ok(
-            match self.ml_decode_into(&mut file, base, n, loc.dtype, ctx)? {
+            match self.ml_decode_into(&mut file, (at + 1, base), n, loc.dtype, ctx)? {
                 Some(()) => Value::Int(n as i128),
                 None => Value::Int(IO_ERROR as i128),
             },
         )
     }
 
-    /// `n` `f32` slots from `base`, marshalled for a host kernel.
-    fn ml_f32_buffer(&self, base: usize, n: usize, ctx: &str) -> Result<Vec<f32>, String> {
-        let vals = kernel_values(&self.memory, base, 1, n, ctx)?;
+    /// `n` `f32` slots of operand `k` from `base`, marshalled for a host kernel.
+    fn ml_f32_buffer(
+        &self,
+        k: usize,
+        base: usize,
+        n: usize,
+        ctx: &str,
+    ) -> Result<Vec<f32>, String> {
+        let vals = kernel_values(arena!(self), k, base, 1, n, ctx)?;
         kernel_buffer(vals, ctx, |v| v.kernel_float(ctx).map(|f| f as f32))
     }
 
@@ -310,7 +322,7 @@ impl Interp<'_, '_> {
         let seed = arg_i64(args, 2) as u64;
         let ctr0 = arg_i64(args, 3) as u64;
         let base = ptr_arg(args, 0, CTX, "data")?;
-        self.ml_check_extent(base, n, CTX)?;
+        self.ml_check_extent(0, base, n, CTX)?;
         for (i, slot) in self.memory[base..base + n].iter_mut().enumerate() {
             let x = wukong_runtime::random::rand_f32(seed, ctr0.wrapping_add(i as u64));
             *slot = Value::Float(x as f64);
@@ -324,14 +336,14 @@ impl Interp<'_, '_> {
         const CTX: &str = "topk_f32";
         let n = count(arg_i64(args, 1));
         let k = n.min(count(arg_i64(args, 3))).min(count(arg_i64(args, 5)));
-        let xs = self.ml_f32_buffer(ptr_arg(args, 0, CTX, "x")?, n, CTX)?;
+        let xs = self.ml_f32_buffer(0, ptr_arg(args, 0, CTX, "x")?, n, CTX)?;
         if k == 0 {
             return Ok(Value::Int(0));
         }
         let vals_base = ptr_arg(args, 2, CTX, "vals")?;
         let idx_base = ptr_arg(args, 4, CTX, "idx")?;
-        self.ml_check_extent(vals_base, k, CTX)?;
-        self.ml_check_extent(idx_base, k, CTX)?;
+        self.ml_check_extent(2, vals_base, k, CTX)?;
+        self.ml_check_extent(4, idx_base, k, CTX)?;
         let mut vals = vec![0f32; k];
         let mut idx = vec![0i64; k];
         let got = wukong_runtime::topk::topk(&xs, &mut vals, &mut idx);
@@ -350,12 +362,12 @@ impl Interp<'_, '_> {
         let n = count(arg_i64(args, 1));
         let m = n.min(count(arg_i64(args, 3)));
         let descending = arg_i64(args, 4) != 0;
-        let xs = self.ml_f32_buffer(ptr_arg(args, 0, CTX, "x")?, n, CTX)?;
+        let xs = self.ml_f32_buffer(0, ptr_arg(args, 0, CTX, "x")?, n, CTX)?;
         if m == 0 {
             return Ok(Value::Int(0));
         }
         let idx_base = ptr_arg(args, 2, CTX, "idx")?;
-        self.ml_check_extent(idx_base, m, CTX)?;
+        self.ml_check_extent(2, idx_base, m, CTX)?;
         let mut idx = vec![0i64; m];
         let got = wukong_runtime::topk::argsort(&xs, &mut idx, descending);
         for (j, i) in idx.into_iter().enumerate() {
@@ -368,7 +380,7 @@ impl Interp<'_, '_> {
     fn ml_sample_categorical(&mut self, args: &[Value]) -> Result<Value, String> {
         const CTX: &str = "sample_categorical";
         let n = count(arg_i64(args, 1));
-        let p = self.ml_f32_buffer(ptr_arg(args, 0, CTX, "probs")?, n, CTX)?;
+        let p = self.ml_f32_buffer(0, ptr_arg(args, 0, CTX, "probs")?, n, CTX)?;
         let u = args.get(2).map(|v| v.as_float() as f32).unwrap_or(0.0);
         Ok(Value::Int(
             wukong_runtime::topk::sample_categorical(&p, u) as i128

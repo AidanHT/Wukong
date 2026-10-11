@@ -19,8 +19,33 @@ use wukong_mir::{
 };
 use wukong_span::{Interner, Symbol};
 
+/// The view a kernel helper validates an operand against ([`marshal::Arena`]): the interpreter's
+/// `memory` with its live allocations, each borrowed as a field so the interpreter's other fields
+/// (the accelerator, the scratch pool) stay usable while the view is alive.
+macro_rules! arena {
+    ($interp:expr) => {
+        $crate::marshal::Arena {
+            slots: &$interp.memory,
+            live: &$interp.slots.live,
+        }
+    };
+}
+
+/// [`arena!`] for a helper that writes ([`marshal::ArenaMut`]).
+macro_rules! arena_mut {
+    ($interp:expr) => {
+        $crate::marshal::ArenaMut {
+            slots: &mut $interp.memory,
+            live: &$interp.slots.live,
+        }
+    };
+}
+
 mod marshal;
-use marshal::Overlap;
+use marshal::{Arena, LiveBlocks, Overlap};
+// Every intrinsic name the interpreter implements, as a dense id (`Callee::Intrinsic`).
+mod intrinsics;
+use intrinsics::Intrinsic;
 
 /// A runtime value. Integers are stored width-agnostically in an `i128` and masked per result
 /// type; pointers are **slot** indices into flat memory, not host byte addresses. Scalar arrays
@@ -152,10 +177,13 @@ fn collect_lanes(values: impl ExactSizeIterator<Item = Value>) -> Result<Vec<Val
     Ok(lanes)
 }
 
-/// Validate a whole kernel operand before allocating scratch. Bounds describe the flat arena,
-/// not individual allocation provenance. Callers validate every used operand before marshalling.
+/// Validate a whole kernel operand — operand `k` of the call, `rows * cols` slots from `base` —
+/// before allocating scratch: the extent product is checked, the range must lie in the arena, and
+/// then inside ONE live allocation (`marshal::LiveBlocks`; an aggregate is one allocation).
+/// Callers validate every used operand before marshalling.
 fn kernel_values<'a>(
-    memory: &'a [Value],
+    arena: Arena<'a>,
+    k: usize,
     base: usize,
     rows: usize,
     cols: usize,
@@ -167,9 +195,12 @@ fn kernel_values<'a>(
     let end = base
         .checked_add(len)
         .ok_or_else(|| format!("{context}: operand out of bounds"))?;
-    memory
+    let values = arena
+        .slots
         .get(base..end)
-        .ok_or_else(|| format!("{context}: operand out of bounds"))
+        .ok_or_else(|| format!("{context}: operand out of bounds"))?;
+    arena.live.check(context, k, base, len)?;
+    Ok(values)
 }
 
 /// Reserve fallibly before any push/extend, including byte reconstruction and output-only buffers.
@@ -341,8 +372,10 @@ enum Callee {
     Func(usize),
     /// The program's `extern "C"` declaration at this index.
     Extern(usize),
-    /// Neither: a runtime intrinsic, dispatched by name.
-    Intrinsic,
+    /// A runtime intrinsic the interpreter implements (`intrinsics.rs`).
+    Intrinsic(Intrinsic),
+    /// None of the above: calling it is the "unknown function or intrinsic" error.
+    Unknown,
 }
 
 /// Every callee name of a program resolved once, as a dense array indexed by `Symbol` id. A call
@@ -350,8 +383,17 @@ enum Callee {
 /// the scalar transcendentals — scan the extern list linearly before falling through to the
 /// intrinsic name match; now it is one bounds-checked load (Wasm resolves `call` to an index at
 /// validation time for the same reason). Resolution order is unchanged: a function wins over an
-/// extern of the same name, and the first of duplicated names wins.
-struct CalleeTable(Vec<Callee>);
+/// extern of the same name, the first of duplicated names wins, and only a name that is neither
+/// is looked up in the intrinsic table — once, the first time the run calls it, after which the
+/// call dispatches on the cached [`Intrinsic`] id rather than on its name.
+///
+/// It also caches, per function, which registers hold SIMD vectors (see [`Interp::enter_frame`]).
+struct CalleeTable {
+    /// By `Symbol` id; `None` until the run first calls a name that is not a function or extern.
+    callees: Vec<Option<Callee>>,
+    /// By function index: the registers of a vector type, computed the first time it is entered.
+    vector_regs: Vec<Option<Box<[u32]>>>,
+}
 
 impl CalleeTable {
     fn new(program: &Program) -> Self {
@@ -361,22 +403,44 @@ impl CalleeTable {
             .map(|s| s.0 as usize + 1)
             .max()
             .unwrap_or(0);
-        let mut table = vec![Callee::Intrinsic; len];
+        let mut table = vec![None; len];
         // Lowest priority first, each list in reverse, so the earliest entry is written last.
         for (index, ext) in program.externs.iter().enumerate().rev() {
-            table[ext.name.0 as usize] = Callee::Extern(index);
+            table[ext.name.0 as usize] = Some(Callee::Extern(index));
         }
         for (index, func) in program.funcs.iter().enumerate().rev() {
-            table[func.name.0 as usize] = Callee::Func(index);
+            table[func.name.0 as usize] = Some(Callee::Func(index));
         }
-        CalleeTable(table)
+        CalleeTable {
+            callees: table,
+            vector_regs: vec![None; program.funcs.len()],
+        }
     }
 
-    fn get(&self, symbol: Symbol) -> Callee {
-        self.0
-            .get(symbol.0 as usize)
-            .copied()
-            .unwrap_or(Callee::Intrinsic)
+    /// What `symbol` reaches, resolving it through the intrinsic table on its first call (`name`
+    /// is consulted only then).
+    fn resolve<'n>(&mut self, symbol: Symbol, name: impl FnOnce() -> &'n str) -> Callee {
+        let index = symbol.0 as usize;
+        if let Some(Some(callee)) = self.callees.get(index) {
+            return *callee;
+        }
+        let callee = Intrinsic::from_name(name()).map_or(Callee::Unknown, Callee::Intrinsic);
+        if index >= self.callees.len() {
+            self.callees.resize(index + 1, None);
+        }
+        self.callees[index] = Some(callee);
+        callee
+    }
+
+    /// The vector-typed registers of `func`, the program's function at `index`.
+    fn vector_registers(&mut self, index: usize, func: &Function) -> &[u32] {
+        self.vector_regs[index].get_or_insert_with(|| {
+            (0u32..)
+                .zip(&func.value_types)
+                .filter(|(_, ty)| matches!(ty, MirType::Vec(..)))
+                .map(|(r, _)| r)
+                .collect()
+        })
     }
 }
 
@@ -623,7 +687,7 @@ fn run_with_stdout(
         memory: null_reserved_memory(),
         stdout: Vec::new(),
         scratch_arena: ScratchSlots::default(),
-        slots: SlotReuse::default(),
+        slots: SlotReuse::tracked(),
         frames: Vec::new(),
         call_args: Vec::new(),
         scratch: Vec::with_capacity(8),
@@ -664,7 +728,7 @@ pub fn run_with_output_accel(
         memory: null_reserved_memory(),
         stdout: Vec::new(),
         scratch_arena: ScratchSlots::default(),
-        slots: SlotReuse::default(),
+        slots: SlotReuse::tracked(),
         frames: Vec::new(),
         call_args: Vec::new(),
         scratch: Vec::with_capacity(8),
@@ -789,7 +853,7 @@ fn run_kernel_f32_inner(
         memory: null_reserved_memory(),
         stdout: Vec::new(),
         scratch_arena: ScratchSlots::default(),
-        slots: SlotReuse::default(),
+        slots: SlotReuse::tracked(),
         frames: Vec::new(),
         call_args: Vec::new(),
         scratch: Vec::with_capacity(8),
@@ -804,10 +868,11 @@ fn run_kernel_f32_inner(
     };
     // Lay each buffer out contiguously in flat memory and remember its base slot. Any `alloca`
     // the kernel performs internally grows memory *past* these regions, so it never clobbers
-    // them.
+    // them. Each buffer is its own allocation: a kernel operand may not run from one into the next.
     let mut bases = Vec::with_capacity(bufs.len());
     for buf in bufs.iter() {
         bases.push(interp.memory.len());
+        interp.slots.live.insert(interp.memory.len(), buf.len());
         interp
             .memory
             .extend(buf.iter().map(|&v| Value::Float(widen_buffer_f32(v))));
@@ -859,7 +924,7 @@ pub fn run_kernel_f64(
         memory: null_reserved_memory(),
         stdout: Vec::new(),
         scratch_arena: ScratchSlots::default(),
-        slots: SlotReuse::default(),
+        slots: SlotReuse::tracked(),
         frames: Vec::new(),
         call_args: Vec::new(),
         scratch: Vec::with_capacity(8),
@@ -875,6 +940,7 @@ pub fn run_kernel_f64(
     let mut bases = Vec::with_capacity(bufs.len());
     for buf in bufs.iter() {
         bases.push(interp.memory.len());
+        interp.slots.live.insert(interp.memory.len(), buf.len());
         interp.memory.extend(buf.iter().map(|&v| Value::Float(v)));
     }
     let args: Vec<Value> = bases.iter().map(|&b| Value::Ptr(b)).collect();
@@ -918,7 +984,7 @@ pub fn run_kernel_i8(
         memory: null_reserved_memory(),
         stdout: Vec::new(),
         scratch_arena: ScratchSlots::default(),
-        slots: SlotReuse::default(),
+        slots: SlotReuse::tracked(),
         frames: Vec::new(),
         call_args: Vec::new(),
         scratch: Vec::with_capacity(8),
@@ -945,6 +1011,10 @@ pub fn run_kernel_i8(
     interp
         .memory
         .extend(c.iter().map(|&v| Value::Int(v as i128)));
+    // Three allocations, one per buffer.
+    for (base, len) in [(a_base, a.len()), (b_base, b.len()), (c_base, c.len())] {
+        interp.slots.live.insert(base, len);
+    }
     let args = [Value::Ptr(a_base), Value::Ptr(b_base), Value::Ptr(c_base)];
     interp.run_function(func, &args)?;
     for (i, slot) in c.iter_mut().enumerate() {
@@ -963,8 +1033,9 @@ pub fn run_kernel_i8(
 /// released region becomes reusable by the next allocation made at its depth.
 #[derive(Default)]
 struct ScratchSlots {
-    /// One `(base slot, capacity in slots)` per live scratch allocation, oldest first.
-    live: Vec<(usize, usize)>,
+    /// One `(base slot, capacity in slots, length in slots)` per live scratch allocation, oldest
+    /// first. The length is what [`SlotReuse::live`] holds as the allocation.
+    live: Vec<(usize, usize, usize)>,
     /// `free[d]`: the region most recently released from depth `d`, if not yet reused.
     free: Vec<Option<(usize, usize)>>,
 }
@@ -1002,9 +1073,23 @@ struct SlotReuse {
     heap_live: HashMap<usize, usize>,
     /// Freed blocks: capacity -> base slots, most recently freed last.
     heap_free: BTreeMap<usize, Vec<usize>>,
+    /// Every live allocation — alloca, heap, scratch, static, kernel-entry buffer — that a kernel
+    /// operand must stay inside (`marshal::LiveBlocks`). Kept in step with the reuse above: a frame
+    /// release drops the released allocas, `free` the heap block, `scratch_release` the region.
+    live: LiveBlocks,
 }
 
 impl SlotReuse {
+    /// The reuse state of a run whose kernel operands are checked against their allocations —
+    /// every public entry point's. (`SlotReuse::default()`, untracked, is the hand-built unit-test
+    /// interpreter's, whose memory is assigned directly and has no allocations to record.)
+    fn tracked() -> Self {
+        SlotReuse {
+            live: LiveBlocks::tracking(),
+            ..SlotReuse::default()
+        }
+    }
+
     /// Record any growth of `memory` (now `len` slots) since the last alloca or release as
     /// persistent.
     fn note_growth(&mut self, len: usize) {
@@ -1019,6 +1104,7 @@ impl SlotReuse {
         self.note_growth(len);
         let keep = mark.max(self.persist_floor).min(len);
         self.stack_end = keep;
+        self.live.release_from(keep);
         keep
     }
 
@@ -1035,10 +1121,12 @@ impl SlotReuse {
         Some((base, cap))
     }
 
-    /// `free(base)`: a live block becomes reusable; anything else is ignored.
+    /// `free(base)`: a live block becomes reusable (and no longer a live allocation); anything
+    /// else is ignored.
     fn free(&mut self, base: usize) {
         if let Some(cap) = self.heap_live.remove(&base) {
             self.heap_free.entry(cap).or_default().push(base);
+            self.live.remove(base);
         }
     }
 }
@@ -1119,6 +1207,8 @@ fn max_call_depth() -> usize {
 /// One Wukong call on [`Interp::run_function`]'s explicit frame stack.
 struct Frame<'a> {
     func: &'a Function,
+    /// `func`'s index among the program's functions (`None` only for a test harness's function).
+    index: Option<usize>,
     /// The SSA register file, recycled through [`Interp::frames`].
     regs: Vec<Value>,
     /// The block executing and the index of its next instruction. While the frame is suspended
@@ -1136,17 +1226,18 @@ struct Frame<'a> {
 }
 
 /// Why [`Interp::exec_frame`] stopped running a frame.
-enum Flow<'a> {
-    /// It reached a call of a Wukong function (the arguments, and whether the call yields `Unit`).
-    Call(&'a Function, Vec<Value>, bool),
+enum Flow {
+    /// It reached a call of a Wukong function — the program's function at this index (the
+    /// arguments, and whether the call yields `Unit`).
+    Call(usize, Vec<Value>, bool),
     /// It returned this value.
     Ret(Value),
 }
 
 /// What one `Op::Call` resolved to.
-enum CallOutcome<'a> {
-    /// A Wukong function (or a `wukong_parallel_for` body) to push a frame for.
-    Enter(&'a Function, Vec<Value>, bool),
+enum CallOutcome {
+    /// A Wukong function (or a `wukong_parallel_for` body), by index, to push a frame for.
+    Enter(usize, Vec<Value>, bool),
     /// An extern or intrinsic that has already run, and its result.
     Done(Value),
 }
@@ -1223,18 +1314,24 @@ impl<'a, 'k> Interp<'a, 'k> {
         slot == NULL_SLOT && self.memory.first() == Some(&NULL_SENTINEL)
     }
 
-    /// What a call of `symbol` reaches, resolved once per run (see [`CalleeTable`]).
-    fn callee(&mut self, symbol: Symbol) -> Callee {
+    /// This run's callee table, built on first use (see [`CalleeTable`]).
+    fn callee_table(&mut self) -> &mut CalleeTable {
         let program = self.program;
         self.function_indices
             .get_or_insert_with(|| CalleeTable::new(program))
-            .get(symbol)
+    }
+
+    /// What a call of `symbol` reaches, resolved once per run (see [`CalleeTable`]).
+    fn callee(&mut self, symbol: Symbol) -> Callee {
+        let interner = self.interner;
+        self.callee_table()
+            .resolve(symbol, || interner.resolve(symbol))
     }
 
     fn function_index(&mut self, symbol: Symbol) -> Option<usize> {
         match self.callee(symbol) {
             Callee::Func(index) => Some(index),
-            Callee::Extern(_) | Callee::Intrinsic => None,
+            Callee::Extern(_) | Callee::Intrinsic(_) | Callee::Unknown => None,
         }
     }
 
@@ -1251,16 +1348,20 @@ impl<'a, 'k> Interp<'a, 'k> {
     /// would leave it (SIMD arena suffix, register pool, depth), so a reused `Interp` is clean.
     fn run_function(&mut self, func: &'a Function, args: &[Value]) -> Result<Value, String> {
         let limit = max_call_depth();
+        let program: &'a Program = self.program;
+        // Once per invocation: the entry function's index (calls carry their callee's).
+        let index = program.funcs.iter().position(|f| std::ptr::eq(f, func));
         let mut suspended: Vec<Frame<'a>> = Vec::new();
-        let mut frame = self.enter_frame(func, args, limit, false)?;
+        let mut frame = self.enter_frame(index, func, args, limit, false)?;
         loop {
             let flow = match self.exec_frame(&mut frame) {
                 Ok(flow) => flow,
                 Err(e) => return self.unwind(frame, &mut suspended, e),
             };
             match flow {
-                Flow::Call(callee, mut argv, unit_result) => {
-                    let entered = self.enter_frame(callee, &argv, limit, unit_result);
+                Flow::Call(index, mut argv, unit_result) => {
+                    let callee = &program.funcs[index];
+                    let entered = self.enter_frame(Some(index), callee, &argv, limit, unit_result);
                     argv.clear();
                     self.call_args.push(argv);
                     match entered {
@@ -1285,11 +1386,26 @@ impl<'a, 'k> Interp<'a, 'k> {
         }
     }
 
-    /// Push a frame for a call of `func`: check the depth ceiling, take a recycled register file
-    /// (or a fresh one) and size it for this function. Values start as `Unit`, the interpreter's
-    /// "undefined"; well-formed MIR writes before it reads.
+    /// Push a frame for a call of `func` (the program's function at `index`, when it is one):
+    /// check the depth ceiling, take a recycled register file (or a fresh one) and size it for
+    /// this function.
+    ///
+    /// **A recycled register file is not refilled.** Every call used to `clear` it and `resize` it
+    /// back with `Unit` — a write of every SSA register (32 bytes each) per call, however few the
+    /// callee touches. That fill is unobservable on verified MIR: the verifier requires every use
+    /// to be dominated by its definition (`wukong_mir::verify`, "not dominated by its definition"),
+    /// and the driver verifies before every backend entry, so no instruction reads a register this
+    /// frame has not written. The one reader that scans the WHOLE file is
+    /// [`Interp::compact_vectors`], which keeps every SIMD handle it finds alive — a stale handle
+    /// left by an earlier call would be kept, or rejected as out of range. So a pooled file never
+    /// holds one: handles only ever live in vector-typed registers (every op that yields one has a
+    /// vector result type), and [`Interp::leave_frame`] resets exactly those, from a per-function
+    /// list ([`CalleeTable::vector_registers`]) — none at all for a scalar function. Here the file
+    /// only grows (filling the new tail with `Unit`) or shrinks to this function's size. A
+    /// function that is not one of the program's (a test harness's) gets the old full fill.
     fn enter_frame(
         &mut self,
+        index: Option<usize>,
         func: &'a Function,
         args: &[Value],
         limit: usize,
@@ -1302,14 +1418,22 @@ impl<'a, 'k> Interp<'a, 'k> {
         }
         self.depth += 1;
         let mut regs = self.frames.pop().unwrap_or_default();
-        regs.clear();
-        regs.resize(func.value_types.len(), Value::Unit);
+        let size = func.value_types.len();
+        if index.is_none() {
+            regs.clear();
+        }
+        if regs.len() > size {
+            regs.truncate(size);
+        } else {
+            regs.resize(size, Value::Unit);
+        }
         for (p, &a) in func.params.iter().zip(args) {
             regs[p.0 as usize] = a;
         }
         self.slots.note_growth(self.memory.len());
         Ok(Frame {
             func,
+            index,
             regs,
             block: func.entry,
             ip: 0,
@@ -1327,6 +1451,8 @@ impl<'a, 'k> Interp<'a, 'k> {
         result: Result<Value, String>,
     ) -> Result<Value, String> {
         let Frame {
+            func,
+            index,
             mut regs,
             vec_base,
             mem_mark,
@@ -1347,7 +1473,16 @@ impl<'a, 'k> Interp<'a, 'k> {
         };
         self.vecs.truncate(vec_base);
         self.scratch.clear();
-        regs.clear();
+        // Pool the register file without its SIMD handles, and otherwise as it is (see
+        // `enter_frame`): only the vector-typed registers can hold one.
+        match index {
+            Some(index) => {
+                for &r in self.callee_table().vector_registers(index, func) {
+                    regs[r as usize] = Value::Unit;
+                }
+            }
+            None => regs.clear(),
+        }
         self.frames.push(regs);
         self.depth -= 1;
         // The frame's allocas are dead: cut `memory` back (see `SlotReuse`).
@@ -1385,7 +1520,7 @@ impl<'a, 'k> Interp<'a, 'k> {
 
     /// Run `frame` from its current block and instruction until it calls a Wukong function
     /// ([`Flow::Call`], with `frame.ip` left on the call) or returns ([`Flow::Ret`]).
-    fn exec_frame(&mut self, frame: &mut Frame<'a>) -> Result<Flow<'a>, String> {
+    fn exec_frame(&mut self, frame: &mut Frame<'a>) -> Result<Flow, String> {
         let func = frame.func;
         let mut remap = Vec::new();
         loop {
@@ -1477,18 +1612,21 @@ impl<'a, 'k> Interp<'a, 'k> {
         callee: Symbol,
         args: &[ValueId],
         regs: &[Value],
-    ) -> Result<CallOutcome<'a>, String> {
+    ) -> Result<CallOutcome, String> {
         let mut argv = self.call_args.pop().unwrap_or_default();
         argv.extend(args.iter().map(|a| reg(regs, *a)));
         let program: &'a Program = self.program;
         let result = match self.callee(callee) {
             Callee::Func(index) => {
-                return Ok(CallOutcome::Enter(&program.funcs[index], argv, false));
+                return Ok(CallOutcome::Enter(index, argv, false));
             }
             Callee::Extern(index) => call_extern(&program.externs[index], &argv, self.interner),
-            Callee::Intrinsic => {
-                let name = self.interner.resolve(callee);
-                if name == "wukong_parallel_for" {
+            Callee::Unknown => Err(format!(
+                "call to unknown function or intrinsic `{}`",
+                self.interner.resolve(callee)
+            )),
+            Callee::Intrinsic(id) => {
+                if id == Intrinsic::ParallelFor {
                     match self.parallel_for_body(&argv) {
                         Ok((body, body_args)) => {
                             argv.clear();
@@ -1507,10 +1645,10 @@ impl<'a, 'k> Interp<'a, 'k> {
                             MirType::F32 | MirType::F16 | MirType::BF16
                         )
                     });
-                    if narrow_float && matches!(name, "print" | "println") {
+                    if narrow_float && matches!(id, Intrinsic::Print | Intrinsic::Println) {
                         self.print_f32(&argv)
                     } else {
-                        self.intrinsic(name, &argv)
+                        self.call_intrinsic(id, &argv)
                     }
                 }
             }
@@ -1524,19 +1662,17 @@ impl<'a, 'k> Interp<'a, 'k> {
     /// interpreter runs `body(0, n, env)`, the whole index range sequentially in one call. Since
     /// parallel-for bodies have no cross-iteration dependencies this is exactly the result the
     /// multi-threaded native runtime produces (so the two stay differential-equal).
-    fn parallel_for_body(&self, args: &[Value]) -> Result<(&'a Function, [Value; 3]), String> {
+    fn parallel_for_body(&self, args: &[Value]) -> Result<(usize, [Value; 3]), String> {
         let n = args.first().copied().unwrap_or(Value::Unit).as_int();
         let body = match args.get(1).copied() {
             Some(Value::Ptr(p)) if p >= FUNC_TAG => p - FUNC_TAG,
             _ => return Err("parallel_for body is not a function address".into()),
         };
         let env = args.get(2).copied().unwrap_or(Value::Ptr(0));
-        let program: &'a Program = self.program;
-        let func = program
-            .funcs
-            .get(body)
-            .ok_or("parallel_for body index out of range")?;
-        Ok((func, [Value::Int(0), Value::Int(n), env]))
+        if body >= self.program.funcs.len() {
+            return Err("parallel_for body index out of range".into());
+        }
+        Ok((body, [Value::Int(0), Value::Int(n), env]))
     }
 
     /// Marshal one `Op::VecKernelCall` of a recipe whose lanes are `T` through slot memory: the
@@ -1544,6 +1680,13 @@ impl<'a, 'k> Interp<'a, 'k> {
     /// `stream_bases`/`scalars` are read from the two pointer tables, `count` is the vector part's
     /// element count. A reduction returns its horizontal fold (steps 1-5 of the canonical tree in
     /// `wukong_mir::vec_kernel`); an elementwise recipe writes its stores and returns `Unit`.
+    ///
+    /// Every extent is checked before anything is reserved or read: the two tables (every stream
+    /// pointer, and the scalars up to the last one the recipe reads), and each stream the recipe
+    /// loads or stores over the elements it touches (none, on a zero-trip call, so a base that
+    /// call never dereferences is never checked), must lie in the arena and inside ONE live
+    /// allocation (a diagnostic names a stream by its index as the operand). The table sizes and
+    /// the whole-lane-group length are checked arithmetic and fallible reservations.
     fn run_vec_kernel<T: KernelLaneValue>(
         &mut self,
         kern: &VecKernel,
@@ -1551,15 +1694,25 @@ impl<'a, 'k> Interp<'a, 'k> {
         scalars_base: usize,
         count: usize,
     ) -> Result<Value, String> {
+        let streams = kern.streams as usize;
+        let scalars = kern.scalars as usize;
         // Output-only streams need not contain initialized numeric values. Only recipe
         // loads read memory; scalar tails beyond count remain untouched and unchecked.
-        let mut read_streams = vec![false; kern.streams as usize];
-        let mut read_scalars = vec![false; kern.scalars as usize];
+        let mut read_streams = kernel_scratch(streams, "veckernel streams")?;
+        read_streams.resize(streams, false);
+        let mut stored_streams = read_streams.clone();
+        let mut read_scalars = kernel_scratch(scalars, "veckernel scalars")?;
+        read_scalars.resize(scalars, false);
         for (index, op) in kern.ops.iter().enumerate() {
             if let VecOp::Splat { scalar } = op {
                 *read_scalars
                     .get_mut(*scalar as usize)
                     .ok_or("veckernel scalar index out of bounds")? = true;
+            }
+            if let VecOp::Store { stream, .. } = op {
+                *stored_streams
+                    .get_mut(*stream as usize)
+                    .ok_or("veckernel store stream out of bounds")? = true;
             }
             if let VecOp::Load { stream } = op {
                 let reads = read_streams
@@ -1574,24 +1727,29 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
             }
         }
-        // Resolve the stream base slots and the invariant scalars once.
-        let mut stream_bases: Vec<usize> = Vec::with_capacity(kern.streams as usize);
-        for s in 0..kern.streams as usize {
-            stream_bases.push(ptr(*self
-                .memory
-                .get(ptrs_base + s)
-                .ok_or("veckernel ptrs out of bounds")?)?);
+        // Resolve the stream base slots and the invariant scalars once, each table validated
+        // whole first: every stream pointer is read, and the scalars up to the last one used.
+        let ptr_slots = kernel_values(arena!(self), 0, ptrs_base, streams, 1, "veckernel ptrs")?;
+        let mut stream_bases: Vec<usize> = kernel_scratch(streams, "veckernel ptrs")?;
+        for &slot in ptr_slots {
+            stream_bases.push(ptr(slot)?);
         }
-        let mut scalar_vals: Vec<T> = Vec::with_capacity(kern.scalars as usize);
+        let used_scalars = read_scalars
+            .iter()
+            .rposition(|&read| read)
+            .map_or(0, |k| k + 1);
+        let scalar_slots = kernel_values(
+            arena!(self),
+            0,
+            scalars_base,
+            used_scalars,
+            1,
+            "veckernel scalars",
+        )?;
+        let mut scalar_vals: Vec<T> = kernel_scratch(scalars, "veckernel scalars")?;
         for (k, &read) in read_scalars.iter().enumerate() {
             scalar_vals.push(if read {
-                T::read(
-                    *self
-                        .memory
-                        .get(scalars_base + k)
-                        .ok_or("veckernel scalars out of bounds")?,
-                    "veckernel scalar",
-                )?
+                T::read(scalar_slots[k], "veckernel scalar")?
             } else {
                 T::unused()
             });
@@ -1602,12 +1760,19 @@ impl<'a, 'k> Interp<'a, 'k> {
             // Reads only — no stores. Same reassociation `eval_reduction` pins for both backends,
             // so this equals the native kernel's return bit-for-bit.
             let lanes = kern.lane.lanes() as usize;
-            let vlen = count / lanes * lanes;
+            // Whole lane groups only: a partial group beyond `vlen` is the caller's scalar tail.
+            let vlen = count
+                .checked_div(lanes)
+                .and_then(|groups| groups.checked_mul(lanes))
+                .ok_or("veckernel reduction extent overflow")?;
             // Validate and convert every element the evaluator will read up front, so its
             // callbacks cannot fail; a partial lane group beyond `vlen` is never read.
-            let mut columns: Vec<Vec<T>> = Vec::with_capacity(stream_bases.len());
+            let mut columns: Vec<Vec<T>> = kernel_scratch(streams, "veckernel reduction")?;
             for (s, &b) in stream_bases.iter().enumerate() {
-                if read_streams[s] {
+                // A zero-trip fold (`vlen == 0`) reads no stream, so it constrains no base: the
+                // caller still offsets every base to the range start, which may lie past the end
+                // of the arena (see the elementwise branch).
+                if read_streams[s] && vlen > 0 {
                     let end = b
                         .checked_add(vlen)
                         .ok_or("veckernel reduction load out of bounds")?;
@@ -1615,7 +1780,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                         .memory
                         .get(b..end)
                         .ok_or("veckernel reduction load out of bounds")?;
-                    let mut column = Vec::with_capacity(vlen);
+                    self.slots.live.check("veckernel stream", s, b, vlen)?;
+                    let mut column = kernel_scratch(vlen, "veckernel reduction")?;
                     for value in values {
                         column.push(T::read(*value, "veckernel reduction")?);
                     }
@@ -1634,9 +1800,31 @@ impl<'a, 'k> Interp<'a, 'k> {
             // Elementwise: one `eval_lane` per element — snapshot this lane's stream inputs,
             // run the recipe, write its stores back. Load-before-store within a lane keeps
             // in-place streams exact; distinct lanes never alias (the vectorizer's no-alias
-            // precondition), so no hazard.
+            // precondition), so no hazard. Every stream the recipe loads or stores is checked
+            // over all `count` elements first, so a stream that would run past its allocation is
+            // refused before the first store.
+            //
+            // A zero-trip call touches nothing and so checks nothing: `marshal_vec_kernel` passes
+            // `n = 0` for a short or empty range but still offsets each base to the range START,
+            // which can lie past the end of the arena (`for i in 100000..n` over an empty slice).
+            // The native kernel does nothing there; refusing a base it never dereferences would
+            // be an interp/native divergence on a valid program.
+            if count == 0 {
+                return Ok(Value::Unit);
+            }
+            for (s, &b) in stream_bases.iter().enumerate() {
+                if read_streams[s] || stored_streams[s] {
+                    let end = b
+                        .checked_add(count)
+                        .ok_or("veckernel stream out of bounds")?;
+                    if end > self.memory.len() {
+                        return Err("veckernel stream out of bounds".into());
+                    }
+                    self.slots.live.check("veckernel stream", s, b, count)?;
+                }
+            }
             let mut stores: Vec<(u32, T)> = Vec::new();
-            let mut loads: Vec<T> = Vec::with_capacity(stream_bases.len());
+            let mut loads: Vec<T> = kernel_scratch(streams, "veckernel loads")?;
             let mut scratch = wukong_mir::vec_kernel::VecKernelScratch::<T>::default();
             for i in 0..count {
                 loads.clear();
@@ -1737,9 +1925,12 @@ impl<'a, 'k> Interp<'a, 'k> {
                 // Reserve every leaf slot of `ty` (recursing into nested arrays so an array of
                 // structs/tuples is fully sized, not one slot per element); the result points at the
                 // first. `gep` then computes `base + index * slot_count(elem)` into this run. The
-                // frame that executed it releases the slots when it returns (`SlotReuse`).
+                // frame that executed it releases the slots when it returns (`SlotReuse`). The whole
+                // alloca is ONE allocation, however its aggregate nests: a kernel operand may span
+                // its fields or elements, never run past its end.
                 push_defaults(ty, &mut self.memory);
                 self.slots.stack_end = self.memory.len();
+                self.slots.live.insert(idx, self.memory.len() - idx);
                 Value::Ptr(idx)
             }
             // A vector load gathers `n` contiguous scalar slots (memory stays scalar); a scalar
@@ -1848,7 +2039,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                     .ok_or("veckernel: unknown kernel index")?;
                 let ptrs_base = ptr(reg(regs, *ptrs))?;
                 let scalars_base = ptr(reg(regs, *scalars))?;
-                let count = reg(regs, *n).as_int().max(0) as usize;
+                // A count past the address space is no element count (not a truncated one).
+                let count = usize::try_from(reg(regs, *n).as_int().max(0))
+                    .map_err(|_| "veckernel element count overflow")?;
                 match kern.lane {
                     VecLane::F32 => {
                         self.run_vec_kernel::<f32>(kern, ptrs_base, scalars_base, count)?
@@ -1892,6 +2085,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                     let base = self.memory.len();
                     self.memory
                         .extend(bytes.iter().map(|&b| Value::Int(b as i128)));
+                    self.slots.live.insert(base, bytes.len());
                     self.data_addrs.insert(*sym, base);
                     Value::Ptr(base)
                 }
@@ -2283,9 +2477,24 @@ impl<'a, 'k> Interp<'a, 'k> {
         Ok(Value::Unit)
     }
 
+    /// Call the runtime intrinsic `name` by its callee name — the by-name entry the unit tests
+    /// drive arms through. A run resolves each callee once ([`CalleeTable`]) and dispatches on the
+    /// id; a name outside the intrinsic table fails exactly as an unresolved call does.
+    #[cfg(test)]
     fn intrinsic(&mut self, name: &str, args: &[Value]) -> Result<Value, String> {
-        match name {
-            "print" | "println" => {
+        match Intrinsic::from_name(name) {
+            Some(id) => self.call_intrinsic(id, args),
+            None => Err(format!("call to unknown function or intrinsic `{name}`")),
+        }
+    }
+
+    /// Run the intrinsic `id` on `args`. Each arm keeps `name` (the id's callee name) for its
+    /// diagnostics; the text, ML and decode builtins are dispatched by their own modules.
+    fn call_intrinsic(&mut self, id: Intrinsic, args: &[Value]) -> Result<Value, String> {
+        use Intrinsic as I;
+        let name = id.name();
+        match id {
+            I::Print | I::Println => {
                 let text = match args.first().copied().unwrap_or(Value::Unit) {
                     Value::Int(i) => format!("{i}\n"),
                     Value::Float(f) => format!("{f}\n"),
@@ -2300,7 +2509,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // here after zero-extending it to 64 bits): render the low 64 bits as `u64`, so a
             // high-bit-set value prints its magnitude. Native's `rt_print_u64` formats the identical
             // bits the same way, so the differential gate holds.
-            "print_u" | "println_u" => {
+            I::PrintU | I::PrintlnU => {
                 let text = match args.first().copied().unwrap_or(Value::Unit) {
                     Value::Int(i) => format!("{}\n", i as u64),
                     other => format!("{}\n", other.as_int() as u64),
@@ -2311,13 +2520,13 @@ impl<'a, 'k> Interp<'a, 'k> {
             // A `bool` / `char` argument to `print`/`println` (mir_build zero-extends it to 64 bits
             // and routes it here): `true`/`false`, or the character's glyph. Native's
             // `rt_print_bool`/`rt_print_char` render through the same `wukong_runtime::fmt`.
-            "print_bool" | "println_bool" => {
+            I::PrintBool | I::PrintlnBool => {
                 let v = args.first().map_or(0, |v| v.as_int() as i64);
                 let text = wukong_runtime::fmt::bool_line(v);
                 self.emit_stdout(text.as_bytes());
                 Ok(Value::Unit)
             }
-            "print_char" | "println_char" => {
+            I::PrintChar | I::PrintlnChar => {
                 let v = args.first().map_or(0, |v| v.as_int() as i64);
                 let text = wukong_runtime::fmt::char_line(v);
                 self.emit_stdout(text.as_bytes());
@@ -2327,7 +2536,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // walk `memory` from the base pointer, collecting bytes (each stored as a `Value::Int`
             // low byte) until the NUL terminator, then render as UTF-8. Native renders the identical
             // bytes via `rt_print_str`, so the differential gate holds.
-            "print_str" | "println_str" => {
+            I::PrintStr | I::PrintlnStr => {
                 // Native's `rt_print_str` returns without writing anything (not even the newline)
                 // for a null string. Slot 0 is the shared null now (`NULL_SLOT`), so mirror it.
                 if let Some(Value::Ptr(p)) = args.first().copied() {
@@ -2352,7 +2561,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                 self.emit_stdout(text.as_bytes());
                 Ok(Value::Unit)
             }
-            "assert" => {
+            I::Assert => {
                 let ok = match args.first().copied().unwrap_or(Value::Unit) {
                     Value::Int(i) => i != 0,
                     Value::Float(f) => f != 0.0,
@@ -2369,7 +2578,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `s[i]` (`index <u len` was false). `site` is the `.rodata` `file:line:col` string the
             // lowering attached. The message comes from the one formatter the JIT and the linked
             // executable also use, so all three paths report the same text and stop at this point.
-            "wukong_rt_bounds_fail" => {
+            I::RtBoundsFail => {
                 let index = args.first().map_or(0, |v| v.as_int()) as i64;
                 let len = args.get(1).map_or(0, |v| v.as_int()) as i64;
                 let site = match args.get(2).copied() {
@@ -2400,7 +2609,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // failed` message no caller can catch. One element costs one 32-byte `Value` slot here
             // against 4 bytes natively, so the interpreter reaches exhaustion ~8x earlier; that
             // difference is why this path is reachable at all.
-            "wukong_rt_alloc" => {
+            I::RtAlloc => {
                 let count = args.first().map(|v| v.as_int()).unwrap_or(0).max(0) as usize;
                 let is_float = args.get(2).map(|v| v.as_int()).unwrap_or(0) != 0;
                 let zero = if is_float {
@@ -2415,6 +2624,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                         if let Some(block) = self.memory.get_mut(base..base + count) {
                             block.fill(zero);
                             self.slots.heap_live.insert(base, cap);
+                            // The allocation is the `count` slots asked for, not the capacity.
+                            self.slots.live.insert(base, count);
                             return Ok(Value::Ptr(base));
                         }
                     }
@@ -2443,6 +2654,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                 self.memory.resize(idx + count, zero);
                 if count > 0 {
                     self.slots.heap_live.insert(idx, count);
+                    self.slots.live.insert(idx, count);
                 }
                 Ok(Value::Ptr(idx))
             }
@@ -2451,7 +2663,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // allocation. Double-free or freeing a non-alloc slice is ignored, so it never crashes
             // the interpreter; a use-after-free reads whatever the block holds now while being
             // undefined on native — such programs are outside the differential contract.
-            "wukong_rt_free" => {
+            I::RtFree => {
                 if let Some(Value::Ptr(base)) = args.first() {
                     self.slots.free(*base);
                 }
@@ -2464,7 +2676,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // handed out again when it is large enough, re-zeroed as native re-zeroes its reused
             // bytes, so a balanced `mark; scratch_…; release` loop reuses one region instead of
             // growing the run's memory every iteration.
-            "wukong_rt_scratch_alloc" => {
+            I::RtScratchAlloc => {
                 let count = args.first().map(|v| v.as_int()).unwrap_or(0).max(0) as usize;
                 let is_float = args.get(2).map(|v| v.as_int()).unwrap_or(0) != 0;
                 let zero = if is_float {
@@ -2498,16 +2710,17 @@ impl<'a, 'k> Interp<'a, 'k> {
                     }
                 };
                 self.memory[base..base + count].fill(zero);
-                self.scratch_arena.live.push((base, cap));
+                self.scratch_arena.live.push((base, cap, count));
+                self.slots.live.insert(base, count);
                 Ok(Value::Ptr(base))
             }
             // `wukong_rt_scratch_mark() -> i64` — `scratch_mark()`: the live scratch-allocation
             // count, the backend-independent value native's arena reports.
-            "wukong_rt_scratch_mark" => Ok(Value::Int(self.scratch_arena.live.len() as i128)),
+            I::RtScratchMark => Ok(Value::Int(self.scratch_arena.live.len() as i128)),
             // `wukong_rt_scratch_release(mark)` — `scratch_release(m)`: pop the allocations made
             // after `mark`, each becoming the reusable region of its depth. A negative mark
             // releases them all; a mark at or past the count releases nothing.
-            "wukong_rt_scratch_release" => {
+            I::RtScratchRelease => {
                 let mark = args.first().map(|v| v.as_int()).unwrap_or(0).max(0);
                 let mark = usize::try_from(mark).unwrap_or(usize::MAX);
                 let arena = &mut self.scratch_arena;
@@ -2517,7 +2730,11 @@ impl<'a, 'k> Interp<'a, 'k> {
                     if arena.free.len() <= depth {
                         arena.free.resize(depth + 1, None);
                     }
-                    arena.free[depth] = region;
+                    arena.free[depth] = region.map(|(base, cap, _)| (base, cap));
+                    // The region is no longer an allocation (an empty one never was).
+                    if let Some((base, _, 1..)) = region {
+                        self.slots.live.remove(base);
+                    }
                 }
                 Ok(Value::Unit)
             }
@@ -2527,7 +2744,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // conforming program observes only *differences* between two reads (never the raw stamp),
             // so its printed output stays interp==native — the value never reaches a differential
             // fixture's stdout.
-            "wukong_now_ns" => Ok(Value::Int(wukong_runtime::wukong_now_ns() as i128)),
+            I::NowNs => Ok(Value::Int(wukong_runtime::wukong_now_ns() as i128)),
             // `wukong_rt_read_{f32,i32,i64,u8,f64,i8}(path: *u8, data: *T, len: i64) -> i64` — the read
             // half of the file-I/O intrinsic family. The on-disk format is headerless: raw contiguous
             // little-endian elements (f32=4, i32=4, i64=8, u8=1, f64=8, i8=1 bytes; no magic, no length prefix).
@@ -2540,8 +2757,12 @@ impl<'a, 'k> Interp<'a, 'k> {
             // read error mid-way returns -2; success returns `n` (>= 0). The LE decode, the min(len,avail)
             // truncation, and the -1/-2/n codes are byte-identical to `wukong_runtime`, so the
             // interp==native differential gate holds.
-            "wukong_rt_read_f32" | "wukong_rt_read_i32" | "wukong_rt_read_i64"
-            | "wukong_rt_read_u8" | "wukong_rt_read_f64" | "wukong_rt_read_i8" => {
+            I::RtReadF32
+            | I::RtReadI32
+            | I::RtReadI64
+            | I::RtReadU8
+            | I::RtReadF64
+            | I::RtReadI8 => {
                 // `path` is a NUL-terminated `*u8`: walk `memory` collecting low bytes until NUL.
                 let path_base = match args.first().copied() {
                     Some(Value::Ptr(base)) => base,
@@ -2571,6 +2792,14 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let n = len.min(avail);
                 let n = usize::try_from(n.max(0))
                     .map_err(|_| "file-io read: element extent overflow")?;
+                if data_base
+                    .checked_add(n)
+                    .is_some_and(|end| end <= self.memory.len())
+                {
+                    // In the arena (`read_file_elements` reports it otherwise): inside ONE live
+                    // allocation too, before a byte is read.
+                    self.slots.live.check(name, 1, data_base, n)?;
+                }
                 read_file_elements(&mut self.memory, &mut file, data_base, n, elem, name)
             }
             // `wukong_rt_write_{f32,i32,i64,u8,f64,i8}(path: *u8, data: *T, len: i64) -> i64` — the write
@@ -2581,12 +2810,12 @@ impl<'a, 'k> Interp<'a, 'k> {
             // headerless buffer, then write it. A write error returns -2; success returns `len`. The
             // narrowing, the byte layout, and the -1/-2/len codes are byte-identical to
             // `wukong_runtime`, so the interp==native differential gate holds.
-            "wukong_rt_write_f32"
-            | "wukong_rt_write_i32"
-            | "wukong_rt_write_i64"
-            | "wukong_rt_write_u8"
-            | "wukong_rt_write_f64"
-            | "wukong_rt_write_i8" => {
+            I::RtWriteF32
+            | I::RtWriteI32
+            | I::RtWriteI64
+            | I::RtWriteU8
+            | I::RtWriteF64
+            | I::RtWriteI8 => {
                 use std::io::Write;
                 let path_base = match args.first().copied() {
                     Some(Value::Ptr(base)) => base,
@@ -2611,6 +2840,14 @@ impl<'a, 'k> Interp<'a, 'k> {
                 // Guard a non-positive len: nothing to serialize (the file is still created/truncated
                 // below, so a subsequent read observes an empty file — matching native).
                 let count = if len < 0 { 0 } else { len as usize };
+                // The elements serialized must be one allocation's, checked before the file is
+                // created (a range past the arena is still reported element by element below).
+                if data_base
+                    .checked_add(count)
+                    .is_some_and(|end| end <= self.memory.len())
+                {
+                    self.slots.live.check(name, 1, data_base, count)?;
+                }
                 let mut file = match std::fs::File::create(&path) {
                     Ok(f) => f,
                     Err(_) => return Ok(Value::Int(-1)),
@@ -2694,12 +2931,12 @@ impl<'a, 'k> Interp<'a, 'k> {
             //
             // Operand scratch is recycled per thread (`marshal::f32_scratch`/`recycle_f32`): a
             // kernel inside a loop no longer allocates its operands on every iteration.
-            "wukong_sgemm"
-            | "wukong_sgemm_parallel"
-            | "wukong_sgemm_nt"
-            | "wukong_sgemm_nt_parallel"
-            | "wukong_sgemm_tn"
-            | "wukong_sgemm_tn_parallel" => {
+            I::Sgemm
+            | I::SgemmParallel
+            | I::SgemmNt
+            | I::SgemmNtParallel
+            | I::SgemmTn
+            | I::SgemmTnParallel => {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let c = ptr(args[2])?;
@@ -2707,28 +2944,32 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let k = dim!(args[4]);
                 let n = dim!(args[5]);
                 let beta = args[6].as_int() as i64;
-                let matrix = |base: usize, rows: usize, cols: usize| -> Result<&[Value], String> {
+                let matrix = |op: usize, base: usize, rows: usize, cols: usize| {
                     let len = rows
                         .checked_mul(cols)
                         .ok_or("sgemm operand extent overflow")?;
                     let end = base.checked_add(len).ok_or("sgemm operand out of bounds")?;
-                    self.memory
+                    let values = self
+                        .memory
                         .get(base..end)
-                        .ok_or_else(|| "sgemm operand out of bounds".into())
+                        .ok_or("sgemm operand out of bounds")?;
+                    self.slots.live.check(name, op, base, len)?;
+                    Ok::<_, String>(values)
                 };
-                // Validate every product and arena range before any scratch allocation. These
-                // are arena bounds, not object provenance: a range spanning adjacent allocations
-                // is still indistinguishable in the current memory model.
-                let av = matrix(a, m, k)?;
-                let bv = matrix(b, k, n)?;
-                let cv = matrix(c, m, n)?;
+                // Validate every product, arena range and allocation before any scratch
+                // allocation: an operand that fits the arena but runs into the next allocation is
+                // refused, not multiplied.
+                let av = matrix(0, a, m, k)?;
+                let bv = matrix(1, b, k, n)?;
+                let cv = matrix(2, c, m, n)?;
                 // gemm.rs: `C` is written in tiled order while `A`/`B` are read — no overlap.
                 marshal::check_output(
+                    arena!(self),
                     name,
-                    (c, cv.len()),
+                    (2, c, cv.len()),
                     &[
-                        ((a, av.len()), Overlap::Forbidden),
-                        ((b, bv.len()), Overlap::Forbidden),
+                        ((0, a, av.len()), Overlap::Forbidden),
+                        ((1, b, bv.len()), Overlap::Forbidden),
                     ],
                 )?;
                 // Pooled scratch (`marshal::f32_scratch`): a GEMM inside a loop no longer allocates
@@ -2804,7 +3045,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         }
                     },
                 }
-                marshal::write_f32(&mut self.memory, c, &cbuf, name)?;
+                marshal::write_f32(arena_mut!(self), 2, c, &cbuf, name)?;
                 marshal::recycle_f32(abuf);
                 marshal::recycle_f32(bbuf);
                 marshal::recycle_f32(cbuf);
@@ -2814,22 +3055,23 @@ impl<'a, 'k> Interp<'a, 'k> {
             // The interpreter marshals the abstract memory into real f32 buffers and calls the *serial*
             // runtime kernel as the oracle (rows independent → the parallel form is bit-identical), so
             // the differential gate stays exact despite the kernel's 8-wide reassociated row dot.
-            "wukong_sgemv" | "wukong_sgemv_parallel" => {
+            I::Sgemv | I::SgemvParallel => {
                 let a = ptr(args[0])?;
                 let x = ptr(args[1])?;
                 let y = ptr(args[2])?;
                 let m = dim!(args[3]);
                 let n = dim!(args[4]);
-                let av = kernel_values(&self.memory, a, m, n, name)?;
-                let xv = kernel_values(&self.memory, x, 1, n, name)?;
-                let yv = kernel_values(&self.memory, y, 1, m, name)?;
+                let av = kernel_values(arena!(self), 0, a, m, n, name)?;
+                let xv = kernel_values(arena!(self), 1, x, 1, n, name)?;
+                let yv = kernel_values(arena!(self), 2, y, 1, m, name)?;
                 // gemv.rs: `y` must not overlap `a` or `x`.
                 marshal::check_output(
+                    arena!(self),
                     name,
-                    (y, m),
+                    (2, y, m),
                     &[
-                        ((a, av.len()), Overlap::Forbidden),
-                        ((x, n), Overlap::Forbidden),
+                        ((0, a, av.len()), Overlap::Forbidden),
+                        ((1, x, n), Overlap::Forbidden),
                     ],
                 )?;
                 let abuf = kernel_buffer(av, name, |v| Ok(v.kernel_float(name)? as f32))?;
@@ -2857,23 +3099,24 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `y[i] = alpha · Σ_j a[i,j]·x[j]` (the decode-attention score `(K·q)·(1/√d)`). Marshals
             // exactly like the plain GEMV and calls the *serial* runtime kernel (bit-identical to the
             // parallel one — rows independent), so the differential gate stays exact.
-            "wukong_sgemv_alpha" | "wukong_sgemv_alpha_parallel" => {
+            I::SgemvAlpha | I::SgemvAlphaParallel => {
                 let a = ptr(args[0])?;
                 let x = ptr(args[1])?;
                 let y = ptr(args[2])?;
                 let m = dim!(args[3]);
                 let n = dim!(args[4]);
                 let alpha = args[5].as_float() as f32;
-                let av = kernel_values(&self.memory, a, m, n, name)?;
-                let xv = kernel_values(&self.memory, x, 1, n, name)?;
-                let yv = kernel_values(&self.memory, y, 1, m, name)?;
+                let av = kernel_values(arena!(self), 0, a, m, n, name)?;
+                let xv = kernel_values(arena!(self), 1, x, 1, n, name)?;
+                let yv = kernel_values(arena!(self), 2, y, 1, m, name)?;
                 // gemv.rs: `y` must not overlap `a` or `x`.
                 marshal::check_output(
+                    arena!(self),
                     name,
-                    (y, m),
+                    (2, y, m),
                     &[
-                        ((a, av.len()), Overlap::Forbidden),
-                        ((x, n), Overlap::Forbidden),
+                        ((0, a, av.len()), Overlap::Forbidden),
+                        ((1, x, n), Overlap::Forbidden),
                     ],
                 )?;
                 let abuf = kernel_buffer(av, name, |v| Ok(v.kernel_float(name)? as f32))?;
@@ -2902,23 +3145,24 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `out[j] = alpha · Σ_i w[i]·a[i,j]` (the KV-decode attention read-out `out = scoresᵀ·V`).
             // Marshals w/a and calls the *serial* runtime kernel (bit-identical to the parallel one —
             // disjoint output-column stripes, each folding ascending i), so the gate stays exact.
-            "wukong_sgevm_f32" | "wukong_sgevm_f32_parallel" => {
+            I::SgevmF32 | I::SgevmF32Parallel => {
                 let w = ptr(args[0])?;
                 let a = ptr(args[1])?;
                 let out = ptr(args[2])?;
                 let rows = dim!(args[3]);
                 let cols = dim!(args[4]);
                 let alpha = args[5].as_float() as f32;
-                let av = kernel_values(&self.memory, a, rows, cols, name)?;
-                let xv = kernel_values(&self.memory, w, 1, rows, name)?;
-                let yv = kernel_values(&self.memory, out, 1, cols, name)?;
+                let av = kernel_values(arena!(self), 1, a, rows, cols, name)?;
+                let xv = kernel_values(arena!(self), 0, w, 1, rows, name)?;
+                let yv = kernel_values(arena!(self), 2, out, 1, cols, name)?;
                 // gevm.rs: `out` must not overlap `w` or `a`.
                 marshal::check_output(
+                    arena!(self),
                     name,
-                    (out, cols),
+                    (2, out, cols),
                     &[
-                        ((w, rows), Overlap::Forbidden),
-                        ((a, av.len()), Overlap::Forbidden),
+                        ((0, w, rows), Overlap::Forbidden),
+                        ((1, a, av.len()), Overlap::Forbidden),
                     ],
                 )?;
                 let abuf = kernel_buffer(av, name, |v| Ok(v.kernel_float(name)? as f32))?;
@@ -2949,23 +3193,24 @@ impl<'a, 'k> Interp<'a, 'k> {
             // regardless of how the abstract value was sign-extended) and writes the `i32` result,
             // calling the *serial* runtime kernel (bit-identical to the parallel one — rows are
             // independent), so the differential oracle stays exact. Integer math, so no rounding at all.
-            "wukong_i8gemm_nt" | "wukong_i8gemm_nt_parallel" => {
+            I::I8gemmNt | I::I8gemmNtParallel => {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let c = ptr(args[2])?;
                 let m = dim!(args[3]);
                 let k = dim!(args[4]);
                 let n = dim!(args[5]);
-                let av = kernel_values(&self.memory, a, m, k, name)?;
-                let bv = kernel_values(&self.memory, b, n, k, name)?;
-                let cv = kernel_values(&self.memory, c, m, n, name)?;
+                let av = kernel_values(arena!(self), 0, a, m, k, name)?;
+                let bv = kernel_values(arena!(self), 1, b, n, k, name)?;
+                let cv = kernel_values(arena!(self), 2, c, m, n, name)?;
                 // The `i32` accumulator is written while the int8 operands are read — no overlap.
                 marshal::check_output(
+                    arena!(self),
                     name,
-                    (c, cv.len()),
+                    (2, c, cv.len()),
                     &[
-                        ((a, av.len()), Overlap::Forbidden),
-                        ((b, bv.len()), Overlap::Forbidden),
+                        ((0, a, av.len()), Overlap::Forbidden),
+                        ((1, b, bv.len()), Overlap::Forbidden),
                     ],
                 )?;
                 let abuf = kernel_buffer(av, name, |v| Ok(v.as_int() as u8))?;
@@ -3000,7 +3245,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // pointer (same convention as the affine-norm gamma/beta and the epilogue GEMM bias). The
             // result is f32 (rounding under dequant/activation), written back to the `out` buffer. Both
             // names marshal through the *serial* runtime kernel (bit-identical — rows independent).
-            "wukong_i8gemm_nt_deq" | "wukong_i8gemm_nt_deq_parallel" => {
+            I::I8gemmNtDeq | I::I8gemmNtDeqParallel => {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let out = ptr(args[2])?;
@@ -3014,24 +3259,25 @@ impl<'a, 'k> Interp<'a, 'k> {
                     _ => None,
                 };
                 let act = args[9].as_int() as i64;
-                let av = kernel_values(&self.memory, a, m, k, name)?;
-                let bv = kernel_values(&self.memory, b, n, k, name)?;
-                let cv = kernel_values(&self.memory, out, m, n, name)?;
-                let sbv = kernel_values(&self.memory, scale_b_idx, 1, n, name)?;
+                let av = kernel_values(arena!(self), 0, a, m, k, name)?;
+                let bv = kernel_values(arena!(self), 1, b, n, k, name)?;
+                let cv = kernel_values(arena!(self), 2, out, m, n, name)?;
+                let sbv = kernel_values(arena!(self), 7, scale_b_idx, 1, n, name)?;
                 let biasv = bias_idx
-                    .map(|base| kernel_values(&self.memory, base, 1, n, name))
+                    .map(|base| kernel_values(arena!(self), 8, base, 1, n, name))
                     .transpose()?;
                 // The f32 output is written while the int8 operands, the per-channel scale and the
                 // bias are read — it must overlap none of them.
                 marshal::check_output(
+                    arena!(self),
                     name,
-                    (out, cv.len()),
+                    (2, out, cv.len()),
                     &[
-                        ((a, av.len()), Overlap::Forbidden),
-                        ((b, bv.len()), Overlap::Forbidden),
-                        ((scale_b_idx, n), Overlap::Forbidden),
+                        ((0, a, av.len()), Overlap::Forbidden),
+                        ((1, b, bv.len()), Overlap::Forbidden),
+                        ((7, scale_b_idx, n), Overlap::Forbidden),
                         (
-                            (bias_idx.unwrap_or(0), biasv.map_or(0, <[Value]>::len)),
+                            (8, bias_idx.unwrap_or(0), biasv.map_or(0, <[Value]>::len)),
                             Overlap::Forbidden,
                         ),
                     ],
@@ -3080,7 +3326,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // native backend passes, then marshals the f32 result back. Integer→f32 is exact, so this is
             // bit-for-bit; the *serial* runtime kernel backs both names (elementwise → parallel is
             // identical). `wukong_runtime::DQ_*` name the width codes.
-            "wukong_dequant_f32" | "wukong_dequant_f32_parallel" => {
+            I::DequantF32 | I::DequantF32Parallel => {
                 let q = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let n = dim!(args[2]);
@@ -3095,11 +3341,16 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let byte_len = n
                     .checked_mul(byte_width)
                     .ok_or("dequant byte extent overflow")?;
-                let qv = kernel_values(&self.memory, q, 1, n, name)?;
-                let ov = kernel_values(&self.memory, out, 1, n, name)?;
+                let qv = kernel_values(arena!(self), 0, q, 1, n, name)?;
+                let ov = kernel_values(arena!(self), 1, out, 1, n, name)?;
                 // An integer input and an f32 output are never the same array; any overlap is a
                 // type pun the source loop does not perform.
-                marshal::check_output(name, (out, n), &[((q, n), Overlap::Forbidden)])?;
+                marshal::check_output(
+                    arena!(self),
+                    name,
+                    (1, out, n),
+                    &[((0, q, n), Overlap::Forbidden)],
+                )?;
                 // DQ_I32 scalar/tail loads dereference *const i32 in the runtime. A Vec<u8>
                 // does not guarantee that alignment, so keep reconstructed words in typed storage.
                 let qwords = if width == wukong_runtime::DQ_I32 {
@@ -3149,7 +3400,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `scale[j]` (length `cols`). Marshals the integer input exactly like `wukong_dequant_f32`
             // (width-matched real bytes) plus the `cols`-long f32 scale vector; writes the f32 result
             // back. Rows are independent so the serial kernel backs both names.
-            "wukong_dequant_perchan_f32" | "wukong_dequant_perchan_f32_parallel" => {
+            I::DequantPerchanF32 | I::DequantPerchanF32Parallel => {
                 let q = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let rows = dim!(args[2]);
@@ -3168,17 +3419,18 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let byte_len = n
                     .checked_mul(byte_width)
                     .ok_or("dequant byte extent overflow")?;
-                let qv = kernel_values(&self.memory, q, 1, n, name)?;
-                let ov = kernel_values(&self.memory, out, 1, n, name)?;
-                let sv = kernel_values(&self.memory, scale_idx, 1, cols, name)?;
+                let qv = kernel_values(arena!(self), 0, q, 1, n, name)?;
+                let ov = kernel_values(arena!(self), 1, out, 1, n, name)?;
+                let sv = kernel_values(arena!(self), 4, scale_idx, 1, cols, name)?;
                 // The per-channel scale is re-read for every row, so the output must overlap neither
                 // it nor the integer input.
                 marshal::check_output(
+                    arena!(self),
                     name,
-                    (out, n),
+                    (1, out, n),
                     &[
-                        ((q, n), Overlap::Forbidden),
-                        ((scale_idx, cols), Overlap::Forbidden),
+                        ((0, q, n), Overlap::Forbidden),
+                        ((4, scale_idx, cols), Overlap::Forbidden),
                     ],
                 )?;
                 // DQ_I32 scalar/tail loads dereference *const i32 in the runtime. A Vec<u8>
@@ -3233,7 +3485,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `@parallel` variant is bit-identical to it (each C tile owned by one task, same per-(i,j)
             // accumulation order), so calling the serial form here keeps the two backends bit-for-bit
             // exact without spawning threads in the interpreter.
-            "wukong_sgemm_nt_epi" | "wukong_sgemm_nt_epi_parallel" => {
+            I::SgemmNtEpi | I::SgemmNtEpiParallel => {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let c = ptr(args[2])?;
@@ -3248,33 +3500,37 @@ impl<'a, 'k> Interp<'a, 'k> {
                     _ => None,
                 };
                 let act = args[8].as_int() as i64;
-                let matrix = |base: usize, rows: usize, cols: usize| -> Result<&[Value], String> {
+                let matrix = |op: usize, base: usize, rows: usize, cols: usize| {
                     let len = rows
                         .checked_mul(cols)
                         .ok_or("sgemm_epi operand extent overflow")?;
                     let end = base
                         .checked_add(len)
                         .ok_or("sgemm_epi operand out of bounds")?;
-                    self.memory
+                    let values = self
+                        .memory
                         .get(base..end)
-                        .ok_or_else(|| "sgemm_epi operand out of bounds".into())
+                        .ok_or("sgemm_epi operand out of bounds")?;
+                    self.slots.live.check(name, op, base, len)?;
+                    Ok::<_, String>(values)
                 };
-                // Check every arena range before allocating scratch, including unread beta-zero
-                // output. This validates arena bounds, not individual allocation provenance.
-                let av = matrix(a, m, k)?;
-                let bv = matrix(b, n, k)?;
-                let cv = matrix(c, m, n)?;
-                let biasv = bias_idx.map(|base| matrix(base, 1, n)).transpose()?;
+                // Check every arena range and allocation before allocating scratch, including the
+                // unread beta-zero output.
+                let av = matrix(0, a, m, k)?;
+                let bv = matrix(1, b, n, k)?;
+                let cv = matrix(2, c, m, n)?;
+                let biasv = bias_idx.map(|base| matrix(7, base, 1, n)).transpose()?;
                 // gemm.rs: `C` is written while `A`, `B` and the epilogue bias are read. (A
                 // `beta = 1` residual reads `C` itself, which is in place by construction.)
                 marshal::check_output(
+                    arena!(self),
                     name,
-                    (c, cv.len()),
+                    (2, c, cv.len()),
                     &[
-                        ((a, av.len()), Overlap::Forbidden),
-                        ((b, bv.len()), Overlap::Forbidden),
+                        ((0, a, av.len()), Overlap::Forbidden),
+                        ((1, b, bv.len()), Overlap::Forbidden),
                         (
-                            (bias_idx.unwrap_or(0), biasv.map_or(0, <[Value]>::len)),
+                            (7, bias_idx.unwrap_or(0), biasv.map_or(0, <[Value]>::len)),
                             Overlap::Forbidden,
                         ),
                     ],
@@ -3329,7 +3585,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         );
                     },
                 }
-                marshal::write_f32(&mut self.memory, c, &cbuf, name)?;
+                marshal::write_f32(arena_mut!(self), 2, c, &cbuf, name)?;
                 marshal::recycle_f32(abuf);
                 marshal::recycle_f32(bbuf);
                 marshal::recycle_f32(cbuf);
@@ -3341,7 +3597,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // interpreter marshals operands into real f32 buffers and calls the *serial* runtime kernel
             // as the oracle (the parallel form is bit-identical — each C tile owned by one task, same
             // per-(i,j) accumulation order). `alpha` rides an f32 slot, read as a scalar value.
-            "wukong_sgemm_nt_alpha" | "wukong_sgemm_nt_alpha_parallel" => {
+            I::SgemmNtAlpha | I::SgemmNtAlphaParallel => {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let c = ptr(args[2])?;
@@ -3350,29 +3606,33 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let n = dim!(args[5]);
                 let beta = args[6].as_int() as i64;
                 let alpha = args[7].as_float() as f32;
-                let matrix = |base: usize, rows: usize, cols: usize| -> Result<&[Value], String> {
+                let matrix = |op: usize, base: usize, rows: usize, cols: usize| {
                     let len = rows
                         .checked_mul(cols)
                         .ok_or("sgemm_alpha operand extent overflow")?;
                     let end = base
                         .checked_add(len)
                         .ok_or("sgemm_alpha operand out of bounds")?;
-                    self.memory
+                    let values = self
+                        .memory
                         .get(base..end)
-                        .ok_or_else(|| "sgemm_alpha operand out of bounds".into())
+                        .ok_or("sgemm_alpha operand out of bounds")?;
+                    self.slots.live.check(name, op, base, len)?;
+                    Ok::<_, String>(values)
                 };
-                // Check every arena range before allocating scratch, including unread beta-zero
-                // output. This validates arena bounds, not individual allocation provenance.
-                let av = matrix(a, m, k)?;
-                let bv = matrix(b, n, k)?;
-                let cv = matrix(c, m, n)?;
+                // Check every arena range and allocation before allocating scratch, including the
+                // unread beta-zero output.
+                let av = matrix(0, a, m, k)?;
+                let bv = matrix(1, b, n, k)?;
+                let cv = matrix(2, c, m, n)?;
                 // gemm.rs: `C` is written in tiled order while `A`/`B` are read — no overlap.
                 marshal::check_output(
+                    arena!(self),
                     name,
-                    (c, cv.len()),
+                    (2, c, cv.len()),
                     &[
-                        ((a, av.len()), Overlap::Forbidden),
-                        ((b, bv.len()), Overlap::Forbidden),
+                        ((0, a, av.len()), Overlap::Forbidden),
+                        ((1, b, bv.len()), Overlap::Forbidden),
                     ],
                 )?;
                 // Pooled scratch (`marshal::f32_scratch`): a GEMM inside a loop no longer allocates
@@ -3404,7 +3664,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         alpha,
                     );
                 }
-                marshal::write_f32(&mut self.memory, c, &cbuf, name)?;
+                marshal::write_f32(arena_mut!(self), 2, c, &cbuf, name)?;
                 marshal::recycle_f32(abuf);
                 marshal::recycle_f32(bbuf);
                 marshal::recycle_f32(cbuf);
@@ -3425,25 +3685,37 @@ impl<'a, 'k> Interp<'a, 'k> {
             // oracle still answers it the way the loop does — element by element on live memory
             // (`marshal::elementwise_live`) — so a native kernel that disagrees is the side the
             // differential gate names.
-            "wukong_vmath_f32" | "wukong_vmath_f32_parallel" => {
+            I::VmathF32 | I::VmathF32Parallel => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let n = dim!(args[2]);
                 let op = args[3].as_int() as i64;
                 if marshal::shifted_overlap((out, n), &[(x, n)]) {
-                    marshal::elementwise_live(&mut self.memory, &[x], out, n, name, |lane| {
-                        let mut o = 0.0f32;
-                        // SAFETY: one input and one output element — the kernel's contract at n = 1.
-                        unsafe { wukong_runtime::wukong_vmath_f32(&lane[0], &mut o, 1, op) };
-                        o
-                    })?;
+                    marshal::elementwise_live(
+                        arena_mut!(self),
+                        &[(0, x)],
+                        (1, out),
+                        n,
+                        name,
+                        |lane| {
+                            let mut o = 0.0f32;
+                            // SAFETY: one input and one output element — the kernel's contract at n = 1.
+                            unsafe { wukong_runtime::wukong_vmath_f32(&lane[0], &mut o, 1, op) };
+                            o
+                        },
+                    )?;
                     return Ok(Value::Unit);
                 }
                 // vmath.rs: "`x` and `out` may alias" — EXACTLY in place, which an elementwise map
                 // computes identically out of place.
-                marshal::check_output(name, (out, n), &[((x, n), Overlap::ExactOnly)])?;
-                let xbuf = marshal::read_f32(&self.memory, x, n, name)?;
-                let mut obuf = marshal::output_f32(&self.memory, out, n, name)?;
+                marshal::check_output(
+                    arena!(self),
+                    name,
+                    (1, out, n),
+                    &[((0, x, n), Overlap::ExactOnly)],
+                )?;
+                let xbuf = marshal::read_f32(arena!(self), 0, x, n, name)?;
+                let mut obuf = marshal::output_f32(arena!(self), 1, out, n, name)?;
                 // Offload the activation to the accelerator (GPU) when it claims this op; otherwise
                 // (or with no accelerator — the oracle) fall back to the identical CPU kernel.
                 let offloaded = self
@@ -3463,7 +3735,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         );
                     },
                 }
-                marshal::write_f32(&mut self.memory, out, &obuf, name)?;
+                marshal::write_f32(arena_mut!(self), 1, out, &obuf, name)?;
                 marshal::recycle_f32(xbuf);
                 marshal::recycle_f32(obuf);
                 Ok(Value::Unit)
@@ -3481,18 +3753,19 @@ impl<'a, 'k> Interp<'a, 'k> {
             // now versions an alias-uncertain transpose on a run-time overlap test whose overlapping
             // arm is the nest (`kernel_guard.rs` in wukong_mir_build), so this arm is reached only for
             // disjoint buffers, the copy is pure marshalling, and an overlapping call is refused.
-            "wukong_transpose_f32" | "wukong_transpose_f32_parallel" => {
+            I::TransposeF32 | I::TransposeF32Parallel => {
                 let src = ptr(args[0])?;
                 let dst = ptr(args[1])?;
                 let rows = dim!(args[2]);
                 let cols = dim!(args[3]);
-                let input = kernel_values(&self.memory, src, rows, cols, name)?;
-                let output = kernel_values(&self.memory, dst, rows, cols, name)?;
+                let input = kernel_values(arena!(self), 0, src, rows, cols, name)?;
+                let output = kernel_values(arena!(self), 1, dst, rows, cols, name)?;
                 // transpose.rs: `src`/`dst` non-overlapping.
                 marshal::check_output(
+                    arena!(self),
                     name,
-                    (dst, output.len()),
-                    &[((src, input.len()), Overlap::Forbidden)],
+                    (1, dst, output.len()),
+                    &[((0, src, input.len()), Overlap::Forbidden)],
                 )?;
                 let sbuf = kernel_buffer(input, name, |v| Ok(v.kernel_float(name)? as f32))?;
                 let mut dbuf = kernel_buffer(output, name, |_| Ok(0.0f32))?;
@@ -3520,10 +3793,10 @@ impl<'a, 'k> Interp<'a, 'k> {
             // fixed), size the output through the shared runtime shape helper. Invalid windows
             // and nonpositive dimensions write nothing. An `out` overlapping `x` is outside
             // pool2d.rs's contract and is refused rather than answered from a copy of `x`.
-            "wukong_maxpool2d_f32"
-            | "wukong_maxpool2d_f32_parallel"
-            | "wukong_avgpool2d_f32"
-            | "wukong_avgpool2d_f32_parallel" => {
+            I::Maxpool2dF32
+            | I::Maxpool2dF32Parallel
+            | I::Avgpool2dF32
+            | I::Avgpool2dF32Parallel => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 // Empty/invalid dimensions are no-ops, including zero channels. Check
@@ -3560,8 +3833,13 @@ impl<'a, 'k> Interp<'a, 'k> {
                 self.memory
                     .get(out..out_end)
                     .ok_or("pool2d output out of bounds")?;
-                // pool2d.rs: `x`/`out` non-overlapping.
-                marshal::check_output(name, (out, out_len), &[((x, n_in), Overlap::Forbidden)])?;
+                // pool2d.rs: `x`/`out` non-overlapping; each inside its own allocation.
+                marshal::check_output(
+                    arena!(self),
+                    name,
+                    (1, out, out_len),
+                    &[((0, x, n_in), Overlap::Forbidden)],
+                )?;
                 let mut xbuf = Vec::new();
                 xbuf.try_reserve_exact(n_in)
                     .map_err(|_| "pool2d scratch allocation failed")?;
@@ -3614,18 +3892,19 @@ impl<'a, 'k> Interp<'a, 'k> {
             // agnostic): the bf16/f16 elements are stored as their rounded `Value::Float`, which the
             // native u16 kernel's moved bits decode back to the same value — so interp == native without
             // any bf16-vs-f16 bit conversion. An overlapping `src`/`dst` is refused, as for the f32 entry.
-            "wukong_transpose_u16" | "wukong_transpose_u16_parallel" => {
+            I::TransposeU16 | I::TransposeU16Parallel => {
                 let src = ptr(args[0])?;
                 let dst = ptr(args[1])?;
                 let rows = dim!(args[2]);
                 let cols = dim!(args[3]);
-                let input = kernel_values(&self.memory, src, rows, cols, name)?;
-                kernel_values(&self.memory, dst, rows, cols, name)?;
+                let input = kernel_values(arena!(self), 0, src, rows, cols, name)?;
+                kernel_values(arena!(self), 1, dst, rows, cols, name)?;
                 // transpose.rs: `src`/`dst` non-overlapping (the same contract as the f32 entry).
                 marshal::check_output(
+                    arena!(self),
                     name,
-                    (dst, input.len()),
-                    &[((src, input.len()), Overlap::Forbidden)],
+                    (1, dst, input.len()),
+                    &[((0, src, input.len()), Overlap::Forbidden)],
                 )?;
                 let buf = kernel_buffer(input, name, |value| {
                     value.kernel_float(name)?;
@@ -3646,31 +3925,36 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `rows*cols` f32 from x, call the *serial* runtime kernel (bit-identical to the parallel
             // one — each column folded in the same i-order, disjoint stripes), write the `cols`-long
             // result to out.
-            "wukong_colsum_f32"
-            | "wukong_colsum_f32_parallel"
-            | "wukong_colmax_f32"
-            | "wukong_colmax_f32_parallel"
-            | "wukong_colmin_f32"
-            | "wukong_colmin_f32_parallel"
-            | "wukong_colmaxabs_f32"
-            | "wukong_colmaxabs_f32_parallel"
-            | "wukong_colmean_f32"
-            | "wukong_colmean_f32_parallel"
-            | "wukong_colsumsq_f32"
-            | "wukong_colsumsq_f32_parallel"
-            | "wukong_coll2_f32"
-            | "wukong_coll2_f32_parallel"
-            | "wukong_colrms_f32"
-            | "wukong_colrms_f32_parallel" => {
+            I::ColsumF32
+            | I::ColsumF32Parallel
+            | I::ColmaxF32
+            | I::ColmaxF32Parallel
+            | I::ColminF32
+            | I::ColminF32Parallel
+            | I::ColmaxabsF32
+            | I::ColmaxabsF32Parallel
+            | I::ColmeanF32
+            | I::ColmeanF32Parallel
+            | I::ColsumsqF32
+            | I::ColsumsqF32Parallel
+            | I::Coll2F32
+            | I::Coll2F32Parallel
+            | I::ColrmsF32
+            | I::ColrmsF32Parallel => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let rows = dim!(args[2]);
                 let cols = dim!(args[3]);
                 let n = marshal::span(rows, cols, name)?;
                 // colreduce.rs: `x`/`out` non-overlapping.
-                marshal::check_output(name, (out, cols), &[((x, n), Overlap::Forbidden)])?;
-                let xbuf = marshal::read_f32(&self.memory, x, n, name)?;
-                let mut obuf = marshal::output_f32(&self.memory, out, cols, name)?;
+                marshal::check_output(
+                    arena!(self),
+                    name,
+                    (1, out, cols),
+                    &[((0, x, n), Overlap::Forbidden)],
+                )?;
+                let xbuf = marshal::read_f32(arena!(self), 0, x, n, name)?;
+                let mut obuf = marshal::output_f32(arena!(self), 1, out, cols, name)?;
                 // The serial kernel matching the name (bit-identical to its `_parallel` twin).
                 let kernel: unsafe extern "C" fn(*const f32, *mut f32, i64, i64) =
                     if name.starts_with("wukong_colmaxabs") {
@@ -3694,13 +3978,13 @@ impl<'a, 'k> Interp<'a, 'k> {
                 unsafe {
                     kernel(xbuf.as_ptr(), obuf.as_mut_ptr(), rows as i64, cols as i64);
                 }
-                marshal::write_f32(&mut self.memory, out, &obuf, name)?;
+                marshal::write_f32(arena_mut!(self), 1, out, &obuf, name)?;
                 marshal::recycle_f32(xbuf);
                 marshal::recycle_f32(obuf);
                 Ok(Value::Unit)
             }
             // Scalar math ABI: shared full-range trig, including exceptional SIMD lanes.
-            "wukong_rt_trig_f32" => {
+            I::RtTrigF32 => {
                 if args.len() != 2 {
                     return Err("wukong_rt_trig_f32 expects two arguments".into());
                 }
@@ -3712,7 +3996,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // The double-precision transcendental library an `f64` `exp`/`log`/`sin`/… lowers to:
             // the identical pure-Rust function the JIT binds and the AOT link resolves, called on
             // the f64 the slot holds (no narrowing), so the oracle is the native result bit-for-bit.
-            "wukong_rt_math_f64" => {
+            I::RtMathF64 => {
                 if args.len() != 2 {
                     return Err("wukong_rt_math_f64 expects two arguments".into());
                 }
@@ -3721,7 +4005,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                     args[1].as_int() as i64,
                 )))
             }
-            "wukong_rt_math2_f64" => {
+            I::RtMath2F64 => {
                 if args.len() != 3 {
                     return Err("wukong_rt_math2_f64 expects three arguments".into());
                 }
@@ -3735,7 +4019,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // an `out[i] = f(x[i], y[i])` loop lowers to. Marshal `n` f32 from x AND y, call the
             // *identical* runtime kernel the native backend calls, write the result back — so the
             // differential oracle stays exact. Read both inputs before writing (in-place safe).
-            "wukong_vmath2_f32" => {
+            I::Vmath2F32 => {
                 let x = ptr(args[0])?;
                 let y = ptr(args[1])?;
                 let out = ptr(args[2])?;
@@ -3744,25 +4028,36 @@ impl<'a, 'k> Interp<'a, 'k> {
                 // A shifted overlap runs the source loop's order on live memory (see the
                 // `wukong_vmath_f32` arm); exact in place equals out of place and takes the copy.
                 if marshal::shifted_overlap((out, n), &[(x, n), (y, n)]) {
-                    marshal::elementwise_live(&mut self.memory, &[x, y], out, n, name, |lane| {
-                        let mut o = 0.0f32;
-                        // SAFETY: one element per operand — the kernel's contract at n = 1.
-                        unsafe {
-                            wukong_runtime::wukong_vmath2_f32(&lane[0], &lane[1], &mut o, 1, op)
-                        };
-                        o
-                    })?;
+                    marshal::elementwise_live(
+                        arena_mut!(self),
+                        &[(0, x), (1, y)],
+                        (2, out),
+                        n,
+                        name,
+                        |lane| {
+                            let mut o = 0.0f32;
+                            // SAFETY: one element per operand — the kernel's contract at n = 1.
+                            unsafe {
+                                wukong_runtime::wukong_vmath2_f32(&lane[0], &lane[1], &mut o, 1, op)
+                            };
+                            o
+                        },
+                    )?;
                     return Ok(Value::Unit);
                 }
                 // Elementwise: either input may be EXACTLY the output.
                 marshal::check_output(
+                    arena!(self),
                     name,
-                    (out, n),
-                    &[((x, n), Overlap::ExactOnly), ((y, n), Overlap::ExactOnly)],
+                    (2, out, n),
+                    &[
+                        ((0, x, n), Overlap::ExactOnly),
+                        ((1, y, n), Overlap::ExactOnly),
+                    ],
                 )?;
-                let xbuf = marshal::read_f32(&self.memory, x, n, name)?;
-                let ybuf = marshal::read_f32(&self.memory, y, n, name)?;
-                let mut obuf = marshal::output_f32(&self.memory, out, n, name)?;
+                let xbuf = marshal::read_f32(arena!(self), 0, x, n, name)?;
+                let ybuf = marshal::read_f32(arena!(self), 1, y, n, name)?;
+                let mut obuf = marshal::output_f32(arena!(self), 2, out, n, name)?;
                 // SAFETY: xbuf/ybuf/obuf are exactly n f32 long — the kernel's contract.
                 unsafe {
                     wukong_runtime::wukong_vmath2_f32(
@@ -3773,7 +4068,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         op,
                     );
                 }
-                marshal::write_f32(&mut self.memory, out, &obuf, name)?;
+                marshal::write_f32(arena_mut!(self), 2, out, &obuf, name)?;
                 marshal::recycle_f32(xbuf);
                 marshal::recycle_f32(ybuf);
                 marshal::recycle_f32(obuf);
@@ -3788,7 +4083,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `dx == y` this arm computes an out-of-place result and native computes something else,
             // so the recognizer declines that case at lowering (`provably_disjoint(nest.y, nest.dx)`)
             // and only the permitted aliasing reaches here.
-            "wukong_softmax_bwd_f32" | "wukong_softmax_bwd_f32_parallel" => {
+            I::SoftmaxBwdF32 | I::SoftmaxBwdF32Parallel => {
                 let y = ptr(args[0])?;
                 let dy = ptr(args[1])?;
                 let dx = ptr(args[2])?;
@@ -3797,13 +4092,17 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let n = marshal::span(rows, cols, name)?;
                 // softmax_bwd.rs: `dx` may be EXACTLY `dy`, and must not overlap `y` at all.
                 marshal::check_output(
+                    arena!(self),
                     name,
-                    (dx, n),
-                    &[((y, n), Overlap::Forbidden), ((dy, n), Overlap::ExactOnly)],
+                    (2, dx, n),
+                    &[
+                        ((0, y, n), Overlap::Forbidden),
+                        ((1, dy, n), Overlap::ExactOnly),
+                    ],
                 )?;
-                let ybuf = marshal::read_f32(&self.memory, y, n, name)?;
-                let dybuf = marshal::read_f32(&self.memory, dy, n, name)?;
-                let mut dxbuf = marshal::output_f32(&self.memory, dx, n, name)?;
+                let ybuf = marshal::read_f32(arena!(self), 0, y, n, name)?;
+                let dybuf = marshal::read_f32(arena!(self), 1, dy, n, name)?;
+                let mut dxbuf = marshal::output_f32(arena!(self), 2, dx, n, name)?;
                 // SAFETY: ybuf/dybuf/dxbuf are exactly rows*cols f32 — the kernel's contract.
                 unsafe {
                     wukong_runtime::wukong_softmax_bwd_f32(
@@ -3814,7 +4113,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         cols as i64,
                     );
                 }
-                marshal::write_f32(&mut self.memory, dx, &dxbuf, name)?;
+                marshal::write_f32(arena_mut!(self), 2, dx, &dxbuf, name)?;
                 marshal::recycle_f32(ybuf);
                 marshal::recycle_f32(dybuf);
                 marshal::recycle_f32(dxbuf);
@@ -3824,7 +4123,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // / selective scan (SSM/Mamba/EMA) `out[r,t] = a[r,t]·h_{t-1} + b[r,t]`, `h_{-1}=0` per row.
             // Marshal the `rows*cols` f32 gate `a` and input `b`, call the *serial* kernel (bit-identical
             // to the parallel one — rows independent, no cross-row combine), write the `rows*cols` result.
-            "wukong_lrscan_f32" | "wukong_lrscan_f32_parallel" => {
+            I::LrscanF32 | I::LrscanF32Parallel => {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let out = ptr(args[2])?;
@@ -3833,13 +4132,17 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let n = marshal::span(rows, cols, name)?;
                 // lrscan.rs: `out` may be EXACTLY `a` or `b` (in place per row), nothing else.
                 marshal::check_output(
+                    arena!(self),
                     name,
-                    (out, n),
-                    &[((a, n), Overlap::ExactOnly), ((b, n), Overlap::ExactOnly)],
+                    (2, out, n),
+                    &[
+                        ((0, a, n), Overlap::ExactOnly),
+                        ((1, b, n), Overlap::ExactOnly),
+                    ],
                 )?;
-                let abuf = marshal::read_f32(&self.memory, a, n, name)?;
-                let bbuf = marshal::read_f32(&self.memory, b, n, name)?;
-                let mut outbuf = marshal::output_f32(&self.memory, out, n, name)?;
+                let abuf = marshal::read_f32(arena!(self), 0, a, n, name)?;
+                let bbuf = marshal::read_f32(arena!(self), 1, b, n, name)?;
+                let mut outbuf = marshal::output_f32(arena!(self), 2, out, n, name)?;
                 // SAFETY: abuf/bbuf/outbuf are exactly rows*cols f32 — the kernel's contract.
                 unsafe {
                     wukong_runtime::wukong_lrscan_f32(
@@ -3850,7 +4153,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         cols as i64,
                     );
                 }
-                marshal::write_f32(&mut self.memory, out, &outbuf, name)?;
+                marshal::write_f32(arena_mut!(self), 2, out, &outbuf, name)?;
                 marshal::recycle_f32(abuf);
                 marshal::recycle_f32(bbuf);
                 marshal::recycle_f32(outbuf);
@@ -3871,10 +4174,10 @@ impl<'a, 'k> Interp<'a, 'k> {
             // LayerNorm backward shares the identical 7-arg ABI and marshalling; the kernel fn is
             // selected by name below. (Both serial/parallel names route through the serial kernel —
             // bit-identical, rows independent.)
-            "wukong_rmsnorm_bwd_f32"
-            | "wukong_rmsnorm_bwd_f32_parallel"
-            | "wukong_layernorm_bwd_f32"
-            | "wukong_layernorm_bwd_f32_parallel" => {
+            I::RmsnormBwdF32
+            | I::RmsnormBwdF32Parallel
+            | I::LayernormBwdF32
+            | I::LayernormBwdF32Parallel => {
                 let x = ptr(args[0])?;
                 let dy = ptr(args[1])?;
                 let gamma_idx = match args[2] {
@@ -3895,13 +4198,15 @@ impl<'a, 'k> Interp<'a, 'k> {
                     Overlap::ExactOnly
                 };
                 marshal::check_output(
+                    arena!(self),
                     name,
-                    (dx, n),
+                    (3, dx, n),
                     &[
-                        ((x, n), Overlap::Forbidden),
-                        ((dy, n), dy_rule),
+                        ((0, x, n), Overlap::Forbidden),
+                        ((1, dy, n), dy_rule),
                         (
                             (
+                                2,
                                 gamma_idx.unwrap_or(0),
                                 if gamma_idx.is_some() { cols } else { 0 },
                             ),
@@ -3909,10 +4214,10 @@ impl<'a, 'k> Interp<'a, 'k> {
                         ),
                     ],
                 )?;
-                let xbuf = marshal::read_f32(&self.memory, x, n, name)?;
-                let dybuf = marshal::read_f32(&self.memory, dy, n, name)?;
+                let xbuf = marshal::read_f32(arena!(self), 0, x, n, name)?;
+                let dybuf = marshal::read_f32(arena!(self), 1, dy, n, name)?;
                 let gbuf = match gamma_idx {
-                    Some(g) => marshal::read_f32(&self.memory, g, cols, name)?,
+                    Some(g) => marshal::read_f32(arena!(self), 2, g, cols, name)?,
                     None => Vec::new(),
                 };
                 let gptr = if gamma_idx.is_some() {
@@ -3920,7 +4225,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                 } else {
                     std::ptr::null()
                 };
-                let mut dxbuf = marshal::output_f32(&self.memory, dx, n, name)?;
+                let mut dxbuf = marshal::output_f32(arena!(self), 3, dx, n, name)?;
                 // SAFETY: xbuf/dybuf/dxbuf are exactly rows*cols f32; gamma (when present) is cols —
                 // the kernel's contract. The kernel fn is chosen by name (rmsnorm vs layernorm).
                 let kernel = if layernorm {
@@ -3939,7 +4244,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         eps_bits,
                     );
                 }
-                marshal::write_f32(&mut self.memory, dx, &dxbuf, name)?;
+                marshal::write_f32(arena_mut!(self), 3, dx, &dxbuf, name)?;
                 marshal::recycle_f32(xbuf);
                 marshal::recycle_f32(dybuf);
                 marshal::recycle_f32(gbuf);
@@ -3951,7 +4256,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // recognized batched nest lowers to. Marshal `rows*cols` f32 from x, the `rows` i32 labels
             // from target (each `Value::Int`'s value), call the *serial* kernel (bit-identical to the
             // parallel one — rows independent), write the `rows`-long loss vector.
-            "wukong_xent_fwd_f32" | "wukong_xent_fwd_f32_parallel" => {
+            I::XentFwdF32 | I::XentFwdF32Parallel => {
                 let x = ptr(args[0])?;
                 let target = ptr(args[1])?;
                 let loss = ptr(args[2])?;
@@ -3960,16 +4265,17 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let n = marshal::span(rows, cols, name)?;
                 // The per-row loss must not overlap the logits or the `i32` targets.
                 marshal::check_output(
+                    arena!(self),
                     name,
-                    (loss, rows),
+                    (2, loss, rows),
                     &[
-                        ((x, n), Overlap::Forbidden),
-                        ((target, rows), Overlap::Forbidden),
+                        ((0, x, n), Overlap::Forbidden),
+                        ((1, target, rows), Overlap::Forbidden),
                     ],
                 )?;
-                let xbuf = marshal::read_f32(&self.memory, x, n, name)?;
-                let tbuf = marshal::read_i32(&self.memory, target, rows, name)?;
-                let mut lbuf = marshal::output_f32(&self.memory, loss, rows, name)?;
+                let xbuf = marshal::read_f32(arena!(self), 0, x, n, name)?;
+                let tbuf = marshal::read_i32(arena!(self), 1, target, rows, name)?;
+                let mut lbuf = marshal::output_f32(arena!(self), 2, loss, rows, name)?;
                 // SAFETY: xbuf is rows*cols f32; tbuf/lbuf are rows long — the kernel's contract.
                 unsafe {
                     wukong_runtime::wukong_xent_fwd_f32(
@@ -3980,7 +4286,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         cols as i64,
                     );
                 }
-                marshal::write_f32(&mut self.memory, loss, &lbuf, name)?;
+                marshal::write_f32(arena_mut!(self), 2, loss, &lbuf, name)?;
                 marshal::recycle_f32(xbuf);
                 marshal::recycle_f32(lbuf);
                 Ok(Value::Unit)
@@ -3988,7 +4294,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `wukong_xent_bwd_f32[_parallel](x, target, dx, rows, cols)` — the softmax cross-entropy
             // backward (`dx = softmax(x) − onehot(target)`). Marshal `rows*cols` f32 from x and `rows`
             // i32 labels, call the *serial* kernel (bit-identical to parallel), write the `rows*cols` dx.
-            "wukong_xent_bwd_f32" | "wukong_xent_bwd_f32_parallel" => {
+            I::XentBwdF32 | I::XentBwdF32Parallel => {
                 let x = ptr(args[0])?;
                 let target = ptr(args[1])?;
                 let dx = ptr(args[2])?;
@@ -3997,16 +4303,17 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let n = marshal::span(rows, cols, name)?;
                 // xent_bwd.rs: `dx` may be EXACTLY `x`; the `i32` targets must not overlap it.
                 marshal::check_output(
+                    arena!(self),
                     name,
-                    (dx, n),
+                    (2, dx, n),
                     &[
-                        ((x, n), Overlap::ExactOnly),
-                        ((target, rows), Overlap::Forbidden),
+                        ((0, x, n), Overlap::ExactOnly),
+                        ((1, target, rows), Overlap::Forbidden),
                     ],
                 )?;
-                let xbuf = marshal::read_f32(&self.memory, x, n, name)?;
-                let tbuf = marshal::read_i32(&self.memory, target, rows, name)?;
-                let mut dxbuf = marshal::output_f32(&self.memory, dx, n, name)?;
+                let xbuf = marshal::read_f32(arena!(self), 0, x, n, name)?;
+                let tbuf = marshal::read_i32(arena!(self), 1, target, rows, name)?;
+                let mut dxbuf = marshal::output_f32(arena!(self), 2, dx, n, name)?;
                 // SAFETY: xbuf/dxbuf are rows*cols f32; tbuf is rows — the kernel's contract.
                 unsafe {
                     wukong_runtime::wukong_xent_bwd_f32(
@@ -4017,7 +4324,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         cols as i64,
                     );
                 }
-                marshal::write_f32(&mut self.memory, dx, &dxbuf, name)?;
+                marshal::write_f32(arena_mut!(self), 2, dx, &dxbuf, name)?;
                 marshal::recycle_f32(xbuf);
                 marshal::recycle_f32(dxbuf);
                 Ok(Value::Unit)
@@ -4026,7 +4333,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // position embedding a recognized RoPE nest lowers to. Marshal `rows*2*half` f32 from x and
             // `half` f32 from inv_freq, call the *serial* kernel (bit-identical to the parallel one —
             // rows independent), write `out` (reading x first, so in-place x==out is correct).
-            "wukong_rope_f32" | "wukong_rope_f32_parallel" => {
+            I::RopeF32 | I::RopeF32Parallel => {
                 let x = ptr(args[0])?;
                 let inv_freq = ptr(args[1])?;
                 let out = ptr(args[2])?;
@@ -4035,16 +4342,17 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let n = marshal::span(rows, marshal::span(2, half, name)?, name)?;
                 // rope.rs: `out` may be EXACTLY `x`; the frequency table must not overlap it.
                 marshal::check_output(
+                    arena!(self),
                     name,
-                    (out, n),
+                    (2, out, n),
                     &[
-                        ((x, n), Overlap::ExactOnly),
-                        ((inv_freq, half), Overlap::Forbidden),
+                        ((0, x, n), Overlap::ExactOnly),
+                        ((1, inv_freq, half), Overlap::Forbidden),
                     ],
                 )?;
-                let xbuf = marshal::read_f32(&self.memory, x, n, name)?;
-                let fbuf = marshal::read_f32(&self.memory, inv_freq, half, name)?;
-                let mut obuf = marshal::output_f32(&self.memory, out, n, name)?;
+                let xbuf = marshal::read_f32(arena!(self), 0, x, n, name)?;
+                let fbuf = marshal::read_f32(arena!(self), 1, inv_freq, half, name)?;
+                let mut obuf = marshal::output_f32(arena!(self), 2, out, n, name)?;
                 // SAFETY: xbuf/obuf are rows*2*half f32; fbuf is half — the kernel's contract.
                 unsafe {
                     wukong_runtime::wukong_rope_f32(
@@ -4055,7 +4363,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         half as i64,
                     );
                 }
-                marshal::write_f32(&mut self.memory, out, &obuf, name)?;
+                marshal::write_f32(arena_mut!(self), 2, out, &obuf, name)?;
                 marshal::recycle_f32(xbuf);
                 marshal::recycle_f32(fbuf);
                 marshal::recycle_f32(obuf);
@@ -4063,7 +4371,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             }
             // `wukong_rope_bwd_f32[_parallel](g, inv_freq, dx, rows, half)` — the RoPE backward (the
             // transpose/inverse rotation). Identical marshalling to the forward, only the kernel differs.
-            "wukong_rope_bwd_f32" | "wukong_rope_bwd_f32_parallel" => {
+            I::RopeBwdF32 | I::RopeBwdF32Parallel => {
                 let g = ptr(args[0])?;
                 let inv_freq = ptr(args[1])?;
                 let dx = ptr(args[2])?;
@@ -4072,16 +4380,17 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let n = marshal::span(rows, marshal::span(2, half, name)?, name)?;
                 // rope_bwd.rs: `dx` may be EXACTLY `g`; the frequency table must not overlap it.
                 marshal::check_output(
+                    arena!(self),
                     name,
-                    (dx, n),
+                    (2, dx, n),
                     &[
-                        ((g, n), Overlap::ExactOnly),
-                        ((inv_freq, half), Overlap::Forbidden),
+                        ((0, g, n), Overlap::ExactOnly),
+                        ((1, inv_freq, half), Overlap::Forbidden),
                     ],
                 )?;
-                let gbuf = marshal::read_f32(&self.memory, g, n, name)?;
-                let fbuf = marshal::read_f32(&self.memory, inv_freq, half, name)?;
-                let mut obuf = marshal::output_f32(&self.memory, dx, n, name)?;
+                let gbuf = marshal::read_f32(arena!(self), 0, g, n, name)?;
+                let fbuf = marshal::read_f32(arena!(self), 1, inv_freq, half, name)?;
+                let mut obuf = marshal::output_f32(arena!(self), 2, dx, n, name)?;
                 // SAFETY: gbuf/obuf are rows*2*half f32; fbuf is half — the kernel's contract.
                 unsafe {
                     wukong_runtime::wukong_rope_bwd_f32(
@@ -4092,7 +4401,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         half as i64,
                     );
                 }
-                marshal::write_f32(&mut self.memory, dx, &obuf, name)?;
+                marshal::write_f32(arena_mut!(self), 2, dx, &obuf, name)?;
                 marshal::recycle_f32(gbuf);
                 marshal::recycle_f32(fbuf);
                 marshal::recycle_f32(obuf);
@@ -4104,19 +4413,21 @@ impl<'a, 'k> Interp<'a, 'k> {
             // the `rows`-long out vector.
             // Log-sum-exp and row-entropy share the (x, out, rows, cols) shape — `rows*cols` f32 in,
             // a `rows`-long scalar out; the kernel fn is chosen by name.
-            "wukong_logsumexp_f32"
-            | "wukong_logsumexp_f32_parallel"
-            | "wukong_entropy_f32"
-            | "wukong_entropy_f32_parallel" => {
+            I::LogsumexpF32 | I::LogsumexpF32Parallel | I::EntropyF32 | I::EntropyF32Parallel => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let rows = dim!(args[2]);
                 let cols = dim!(args[3]);
                 let n = marshal::span(rows, cols, name)?;
                 // The `rows`-long result must not overlap the input it is folded from.
-                marshal::check_output(name, (out, rows), &[((x, n), Overlap::Forbidden)])?;
-                let xbuf = marshal::read_f32(&self.memory, x, n, name)?;
-                let mut obuf = marshal::output_f32(&self.memory, out, rows, name)?;
+                marshal::check_output(
+                    arena!(self),
+                    name,
+                    (1, out, rows),
+                    &[((0, x, n), Overlap::Forbidden)],
+                )?;
+                let xbuf = marshal::read_f32(arena!(self), 0, x, n, name)?;
+                let mut obuf = marshal::output_f32(arena!(self), 1, out, rows, name)?;
                 let kernel = if name.starts_with("wukong_entropy") {
                     wukong_runtime::wukong_entropy_f32
                 } else {
@@ -4126,7 +4437,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                 unsafe {
                     kernel(xbuf.as_ptr(), obuf.as_mut_ptr(), rows as i64, cols as i64);
                 }
-                marshal::write_f32(&mut self.memory, out, &obuf, name)?;
+                marshal::write_f32(arena_mut!(self), 1, out, &obuf, name)?;
                 marshal::recycle_f32(xbuf);
                 marshal::recycle_f32(obuf);
                 Ok(Value::Unit)
@@ -4138,14 +4449,14 @@ impl<'a, 'k> Interp<'a, 'k> {
             // two output-buffer families that write integers rather than floats — `wukong_i8gemm_nt`
             // and its `i32` accumulator is the other). row-arg writes `rows` indices,
             // col-arg writes `cols`; the kernel and the output length are selected by name.
-            "wukong_rowargmax_i32"
-            | "wukong_rowargmax_i32_parallel"
-            | "wukong_rowargmin_i32"
-            | "wukong_rowargmin_i32_parallel"
-            | "wukong_colargmax_i32"
-            | "wukong_colargmax_i32_parallel"
-            | "wukong_colargmin_i32"
-            | "wukong_colargmin_i32_parallel" => {
+            I::RowargmaxI32
+            | I::RowargmaxI32Parallel
+            | I::RowargminI32
+            | I::RowargminI32Parallel
+            | I::ColargmaxI32
+            | I::ColargmaxI32Parallel
+            | I::ColargminI32
+            | I::ColargminI32Parallel => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let rows = dim!(args[2]);
@@ -4156,9 +4467,14 @@ impl<'a, 'k> Interp<'a, 'k> {
                 // row-arg → one index per row; col-arg → one index per column.
                 let out_len = if is_col { cols } else { rows };
                 // rowarg.rs / colarg.rs: the `i32` index output must not overlap the f32 input.
-                marshal::check_output(name, (out, out_len), &[((x, n), Overlap::Forbidden)])?;
-                let xbuf = marshal::read_f32(&self.memory, x, n, name)?;
-                let mut obuf = marshal::output::<i32>(&self.memory, out, out_len, name)?;
+                marshal::check_output(
+                    arena!(self),
+                    name,
+                    (1, out, out_len),
+                    &[((0, x, n), Overlap::Forbidden)],
+                )?;
+                let xbuf = marshal::read_f32(arena!(self), 0, x, n, name)?;
+                let mut obuf = marshal::output::<i32>(arena!(self), 1, out, out_len, name)?;
                 let kernel = match (is_col, is_min) {
                     (false, false) => wukong_runtime::wukong_rowargmax_i32,
                     (false, true) => wukong_runtime::wukong_rowargmin_i32,
@@ -4169,7 +4485,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                 unsafe {
                     kernel(xbuf.as_ptr(), obuf.as_mut_ptr(), rows as i64, cols as i64);
                 }
-                marshal::write_back(&mut self.memory, out, &obuf, name, |v| {
+                marshal::write_back(arena_mut!(self), 1, out, &obuf, name, |v| {
                     Value::Int(v as i128)
                 })?;
                 marshal::recycle_f32(xbuf);
@@ -4182,14 +4498,14 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `x==out` is safe). cumsum's in-lane scan reassociates (both backends run the identical
             // kernel, so interp == native holds); cummax/cummin select a value, so they are bit-exact.
             // The kernel fn is chosen by name.
-            "wukong_cumsum_f32"
-            | "wukong_cumsum_f32_parallel"
-            | "wukong_cummax_f32"
-            | "wukong_cummax_f32_parallel"
-            | "wukong_cummin_f32"
-            | "wukong_cummin_f32_parallel"
-            | "wukong_cumprod_f32"
-            | "wukong_cumprod_f32_parallel" => {
+            I::CumsumF32
+            | I::CumsumF32Parallel
+            | I::CummaxF32
+            | I::CummaxF32Parallel
+            | I::CumminF32
+            | I::CumminF32Parallel
+            | I::CumprodF32
+            | I::CumprodF32Parallel => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let rows = dim!(args[2]);
@@ -4197,9 +4513,14 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let n = marshal::span(rows, cols, name)?;
                 // cumsum.rs / cumminmax.rs / cumprod.rs: `out` may be EXACTLY `x`; a shifted
                 // overlap is not in place (the row scan loads 8 lanes before storing them).
-                marshal::check_output(name, (out, n), &[((x, n), Overlap::ExactOnly)])?;
-                let xbuf = marshal::read_f32(&self.memory, x, n, name)?;
-                let mut obuf = marshal::output_f32(&self.memory, out, n, name)?;
+                marshal::check_output(
+                    arena!(self),
+                    name,
+                    (1, out, n),
+                    &[((0, x, n), Overlap::ExactOnly)],
+                )?;
+                let xbuf = marshal::read_f32(arena!(self), 0, x, n, name)?;
+                let mut obuf = marshal::output_f32(arena!(self), 1, out, n, name)?;
                 let kernel = if name.starts_with("wukong_cummax") {
                     wukong_runtime::wukong_cummax_f32
                 } else if name.starts_with("wukong_cummin") {
@@ -4213,17 +4534,14 @@ impl<'a, 'k> Interp<'a, 'k> {
                 unsafe {
                     kernel(xbuf.as_ptr(), obuf.as_mut_ptr(), rows as i64, cols as i64);
                 }
-                marshal::write_f32(&mut self.memory, out, &obuf, name)?;
+                marshal::write_f32(arena_mut!(self), 1, out, &obuf, name)?;
                 marshal::recycle_f32(xbuf);
                 marshal::recycle_f32(obuf);
                 Ok(Value::Unit)
             }
             // KL divergence and soft-label cross-entropy share the (a, b, out, rows, cols) shape — two
             // `rows*cols` f32 inputs, a `rows`-long scalar out; the kernel fn is chosen by name.
-            "wukong_kldiv_f32"
-            | "wukong_kldiv_f32_parallel"
-            | "wukong_kd_loss_f32"
-            | "wukong_kd_loss_f32_parallel" => {
+            I::KldivF32 | I::KldivF32Parallel | I::KdLossF32 | I::KdLossF32Parallel => {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let out = ptr(args[2])?;
@@ -4232,13 +4550,17 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let n = marshal::span(rows, cols, name)?;
                 // The per-row loss must not overlap either distribution it is folded from.
                 marshal::check_output(
+                    arena!(self),
                     name,
-                    (out, rows),
-                    &[((a, n), Overlap::Forbidden), ((b, n), Overlap::Forbidden)],
+                    (2, out, rows),
+                    &[
+                        ((0, a, n), Overlap::Forbidden),
+                        ((1, b, n), Overlap::Forbidden),
+                    ],
                 )?;
-                let abuf = marshal::read_f32(&self.memory, a, n, name)?;
-                let bbuf = marshal::read_f32(&self.memory, b, n, name)?;
-                let mut obuf = marshal::output_f32(&self.memory, out, rows, name)?;
+                let abuf = marshal::read_f32(arena!(self), 0, a, n, name)?;
+                let bbuf = marshal::read_f32(arena!(self), 1, b, n, name)?;
+                let mut obuf = marshal::output_f32(arena!(self), 2, out, rows, name)?;
                 let kernel = if name.starts_with("wukong_kd_loss") {
                     wukong_runtime::wukong_kd_loss_f32
                 } else {
@@ -4254,7 +4576,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         cols as i64,
                     );
                 }
-                marshal::write_f32(&mut self.memory, out, &obuf, name)?;
+                marshal::write_f32(arena_mut!(self), 2, out, &obuf, name)?;
                 marshal::recycle_f32(abuf);
                 marshal::recycle_f32(bbuf);
                 marshal::recycle_f32(obuf);
@@ -4265,20 +4587,25 @@ impl<'a, 'k> Interp<'a, 'k> {
             // bf16 input bits (as the bf16 reductions/axpby do — the stored value is already bf16-
             // rounded, so `f32_to_bf16_bits` is exact), call the *identical* runtime kernel the native
             // backend calls, write the f32 result back — so the differential oracle stays exact.
-            "wukong_vmath_bf16" => {
+            I::VmathBf16 => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let n = dim!(args[2]);
                 let op = args[3].as_int() as i64;
                 // A `[bf16]` input and an f32 output are never one array; any overlap is a pun.
-                marshal::check_output(name, (out, n), &[((x, n), Overlap::Forbidden)])?;
-                let input = kernel_values(&self.memory, x, n, 1, name)?;
+                marshal::check_output(
+                    arena!(self),
+                    name,
+                    (1, out, n),
+                    &[((0, x, n), Overlap::Forbidden)],
+                )?;
+                let input = kernel_values(arena!(self), 0, x, n, 1, name)?;
                 let xbuf = kernel_buffer(input, name, |v| {
                     Ok(wukong_runtime::f32_to_bf16_bits(
                         v.kernel_float(name)? as f32
                     ))
                 })?;
-                let mut obuf = marshal::output_f32(&self.memory, out, n, name)?;
+                let mut obuf = marshal::output_f32(arena!(self), 1, out, n, name)?;
                 // SAFETY: xbuf is n u16, obuf is n f32 — the kernel's contract.
                 unsafe {
                     wukong_runtime::wukong_vmath_bf16(
@@ -4288,24 +4615,29 @@ impl<'a, 'k> Interp<'a, 'k> {
                         op,
                     );
                 }
-                marshal::write_f32(&mut self.memory, out, &obuf, name)?;
+                marshal::write_f32(arena_mut!(self), 1, out, &obuf, name)?;
                 marshal::recycle_f32(obuf);
                 Ok(Value::Unit)
             }
             // `wukong_vmath_f16` — the F16C twin of `wukong_vmath_bf16`: reconstruct exact f16 bits
             // via `f32_to_f16_bits` and call the identical kernel, so interp == native.
-            "wukong_vmath_f16" => {
+            I::VmathF16 => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let n = dim!(args[2]);
                 let op = args[3].as_int() as i64;
                 // An `[f16]` input and an f32 output are never one array; any overlap is a pun.
-                marshal::check_output(name, (out, n), &[((x, n), Overlap::Forbidden)])?;
-                let input = kernel_values(&self.memory, x, n, 1, name)?;
+                marshal::check_output(
+                    arena!(self),
+                    name,
+                    (1, out, n),
+                    &[((0, x, n), Overlap::Forbidden)],
+                )?;
+                let input = kernel_values(arena!(self), 0, x, n, 1, name)?;
                 let xbuf = kernel_buffer(input, name, |v| {
                     Ok(wukong_runtime::f32_to_f16_bits(v.kernel_float(name)? as f32))
                 })?;
-                let mut obuf = marshal::output_f32(&self.memory, out, n, name)?;
+                let mut obuf = marshal::output_f32(arena!(self), 1, out, n, name)?;
                 // SAFETY: xbuf is n u16, obuf is n f32 — the kernel's contract.
                 unsafe {
                     wukong_runtime::wukong_vmath_f16(
@@ -4315,7 +4647,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         op,
                     );
                 }
-                marshal::write_f32(&mut self.memory, out, &obuf, name)?;
+                marshal::write_f32(arena_mut!(self), 1, out, &obuf, name)?;
                 marshal::recycle_f32(obuf);
                 Ok(Value::Unit)
             }
@@ -4324,15 +4656,20 @@ impl<'a, 'k> Interp<'a, 'k> {
             // in f32 and narrows the result back to the half width through the shared shim), then widen
             // the stored half bits back to the interpreter's f32 slot. Same reconstruct-exact-bits +
             // call-the-kernel discipline as the reduction/axpby-out arms, so interp == native bit-exact.
-            "wukong_vmath_bf16_out" | "wukong_vmath_f16_out" => {
+            I::VmathBf16Out | I::VmathF16Out => {
                 let is_f16 = name == "wukong_vmath_f16_out";
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let n = dim!(args[2]);
                 let op = args[3].as_int() as i64;
                 // Half in, half out, elementwise: EXACTLY in place is the same map.
-                marshal::check_output(name, (out, n), &[((x, n), Overlap::ExactOnly)])?;
-                let input = kernel_values(&self.memory, x, n, 1, name)?;
+                marshal::check_output(
+                    arena!(self),
+                    name,
+                    (1, out, n),
+                    &[((0, x, n), Overlap::ExactOnly)],
+                )?;
+                let input = kernel_values(arena!(self), 0, x, n, 1, name)?;
                 let xbuf = kernel_buffer(input, name, |v| {
                     let f = v.kernel_float(name)? as f32;
                     Ok(if is_f16 {
@@ -4341,7 +4678,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         wukong_runtime::f32_to_bf16_bits(f)
                     })
                 })?;
-                let mut obuf = marshal::output::<u16>(&self.memory, out, n, name)?;
+                let mut obuf = marshal::output::<u16>(arena!(self), 1, out, n, name)?;
                 // SAFETY: xbuf and obuf are each n u16 — the kernel's contract.
                 unsafe {
                     if is_f16 {
@@ -4360,7 +4697,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         );
                     }
                 }
-                marshal::write_back(&mut self.memory, out, &obuf, name, |obits| {
+                marshal::write_back(arena_mut!(self), 1, out, &obuf, name, |obits| {
                     let widened = if is_f16 {
                         wukong_runtime::f16_bits_to_f32(obits)
                     } else {
@@ -4379,7 +4716,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // bits). Reading all of x/y before writing out makes the in-place (x == out) case correct.
             // An unused y contributes no data: do not type-check or dereference its memory.
             // The scratch buffer still supplies valid storage to every runtime implementation.
-            "wukong_velem_f32" | "wukong_velem_f32_parallel" => {
+            I::VelemF32 | I::VelemF32Parallel => {
                 let x = ptr(args[0])?;
                 let y = ptr(args[1])?;
                 let out = ptr(args[2])?;
@@ -4394,38 +4731,48 @@ impl<'a, 'k> Interp<'a, 'k> {
                 // `wukong_vmath_f32` arm). An unread `y` is no operand and constrains nothing.
                 let y_len = if reads_y { n } else { 0 };
                 if marshal::shifted_overlap((out, n), &[(x, n), (y, y_len)]) {
-                    let both = [x, y];
+                    let both = [(0, x), (1, y)];
                     let inputs = if reads_y { &both[..] } else { &both[..1] };
-                    marshal::elementwise_live(&mut self.memory, inputs, out, n, name, |lane| {
-                        let yv = if reads_y { lane[1] } else { 0.0 };
-                        let mut o = 0.0f32;
-                        // SAFETY: one element per operand — the kernel's contract at n = 1 (`y` is
-                        // a valid one-element read whether or not `op` reads it).
-                        unsafe {
-                            wukong_runtime::wukong_velem_f32(&lane[0], &yv, &mut o, 1, a, b, c, op)
-                        };
-                        o
-                    })?;
+                    marshal::elementwise_live(
+                        arena_mut!(self),
+                        inputs,
+                        (2, out),
+                        n,
+                        name,
+                        |lane| {
+                            let yv = if reads_y { lane[1] } else { 0.0 };
+                            let mut o = 0.0f32;
+                            // SAFETY: one element per operand — the kernel's contract at n = 1 (`y` is
+                            // a valid one-element read whether or not `op` reads it).
+                            unsafe {
+                                wukong_runtime::wukong_velem_f32(
+                                    &lane[0], &yv, &mut o, 1, a, b, c, op,
+                                )
+                            };
+                            o
+                        },
+                    )?;
                     return Ok(Value::Unit);
                 }
                 // velem.rs: "`x`/`y`/`out` may alias" — EXACTLY, the elementwise map's in-place form.
                 marshal::check_output(
+                    arena!(self),
                     name,
-                    (out, n),
+                    (2, out, n),
                     &[
-                        ((x, n), Overlap::ExactOnly),
-                        ((y, y_len), Overlap::ExactOnly),
+                        ((0, x, n), Overlap::ExactOnly),
+                        ((1, y, y_len), Overlap::ExactOnly),
                     ],
                 )?;
-                let xbuf = marshal::read_f32(&self.memory, x, n, name)?;
+                let xbuf = marshal::read_f32(arena!(self), 0, x, n, name)?;
                 // An unused y contributes no data: do not type-check or dereference its memory. The
                 // zeroed scratch still supplies valid storage to every runtime implementation.
                 let ybuf = if reads_y {
-                    marshal::read_f32(&self.memory, y, n, name)?
+                    marshal::read_f32(arena!(self), 1, y, n, name)?
                 } else {
-                    marshal::output_f32(&self.memory, x, n, name)?
+                    marshal::output_f32(arena!(self), 0, x, n, name)?
                 };
-                let mut obuf = marshal::output_f32(&self.memory, out, n, name)?;
+                let mut obuf = marshal::output_f32(arena!(self), 2, out, n, name)?;
                 // SAFETY: xbuf/ybuf/obuf are exactly n f32 long — the kernel's contract.
                 unsafe {
                     wukong_runtime::wukong_velem_f32(
@@ -4439,7 +4786,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         op,
                     );
                 }
-                marshal::write_f32(&mut self.memory, out, &obuf, name)?;
+                marshal::write_f32(arena_mut!(self), 2, out, &obuf, name)?;
                 marshal::recycle_f32(xbuf);
                 marshal::recycle_f32(ybuf);
                 marshal::recycle_f32(obuf);
@@ -4452,7 +4799,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // bit-for-bit, rows independent), write the result back — so the differential oracle stays
             // exact for both the serial and `_parallel` names. Read all of x/b before writing out so an
             // in-place (x == out) case is correct.
-            "wukong_bias_bcast_f32" | "wukong_bias_bcast_f32_parallel" => {
+            I::BiasBcastF32 | I::BiasBcastF32Parallel => {
                 let x = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let out = ptr(args[2])?;
@@ -4462,16 +4809,17 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let n = marshal::span(rows, cols, name)?;
                 // bias.rs: `x`/`out` identical or disjoint; the bias row must not overlap `out`.
                 marshal::check_output(
+                    arena!(self),
                     name,
-                    (out, n),
+                    (2, out, n),
                     &[
-                        ((x, n), Overlap::ExactOnly),
-                        ((b, cols), Overlap::Forbidden),
+                        ((0, x, n), Overlap::ExactOnly),
+                        ((1, b, cols), Overlap::Forbidden),
                     ],
                 )?;
-                let xbuf = marshal::read_f32(&self.memory, x, n, name)?;
-                let bbuf = marshal::read_f32(&self.memory, b, cols, name)?;
-                let mut obuf = marshal::output_f32(&self.memory, out, n, name)?;
+                let xbuf = marshal::read_f32(arena!(self), 0, x, n, name)?;
+                let bbuf = marshal::read_f32(arena!(self), 1, b, cols, name)?;
+                let mut obuf = marshal::output_f32(arena!(self), 2, out, n, name)?;
                 // SAFETY: xbuf/obuf are n f32, bbuf is cols f32 — the kernel's contract.
                 unsafe {
                     wukong_runtime::wukong_bias_bcast_f32(
@@ -4483,7 +4831,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         op,
                     );
                 }
-                marshal::write_f32(&mut self.memory, out, &obuf, name)?;
+                marshal::write_f32(arena_mut!(self), 2, out, &obuf, name)?;
                 marshal::recycle_f32(xbuf);
                 marshal::recycle_f32(bbuf);
                 marshal::recycle_f32(obuf);
@@ -4493,7 +4841,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // a recognized `r = c0; r = r*x + c1; …; out[i] = r` loop lowers to. Marshal `n` f32 from x
             // and `ncoeff` f32 from coeffs, call the identical runtime kernel, write out — so the
             // differential oracle stays exact despite the wider lanes / non-temporal stores.
-            "wukong_vhorner_f32" => {
+            I::VhornerF32 => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let n = dim!(args[2]);
@@ -4502,30 +4850,42 @@ impl<'a, 'k> Interp<'a, 'k> {
                 // The coefficient table is read for every element, so an output over it changes what
                 // later elements compute: refused (the compiler builds the table itself, so only a
                 // hand-written call can get here).
-                marshal::check_output(name, (out, n), &[((coeffs, ncoeff), Overlap::Forbidden)])?;
-                let cbuf = marshal::read_f32(&self.memory, coeffs, ncoeff, name)?;
+                marshal::check_output(
+                    arena!(self),
+                    name,
+                    (1, out, n),
+                    &[((3, coeffs, ncoeff), Overlap::Forbidden)],
+                )?;
+                let cbuf = marshal::read_f32(arena!(self), 3, coeffs, ncoeff, name)?;
                 // Elementwise in `x`: a shifted overlap runs the source loop's order on live memory
                 // (see the `wukong_vmath_f32` arm); exact in place equals out of place.
                 if marshal::shifted_overlap((out, n), &[(x, n)]) {
-                    marshal::elementwise_live(&mut self.memory, &[x], out, n, name, |lane| {
-                        let mut o = 0.0f32;
-                        // SAFETY: one element in and out; cbuf is ncoeff f32 — the kernel's contract.
-                        unsafe {
-                            wukong_runtime::wukong_vhorner_f32(
-                                &lane[0],
-                                &mut o,
-                                1,
-                                cbuf.as_ptr(),
-                                ncoeff as i64,
-                            )
-                        };
-                        o
-                    })?;
+                    marshal::elementwise_live(
+                        arena_mut!(self),
+                        &[(0, x)],
+                        (1, out),
+                        n,
+                        name,
+                        |lane| {
+                            let mut o = 0.0f32;
+                            // SAFETY: one element in and out; cbuf is ncoeff f32 — the kernel's contract.
+                            unsafe {
+                                wukong_runtime::wukong_vhorner_f32(
+                                    &lane[0],
+                                    &mut o,
+                                    1,
+                                    cbuf.as_ptr(),
+                                    ncoeff as i64,
+                                )
+                            };
+                            o
+                        },
+                    )?;
                     marshal::recycle_f32(cbuf);
                     return Ok(Value::Unit);
                 }
-                let xbuf = marshal::read_f32(&self.memory, x, n, name)?;
-                let mut obuf = marshal::output_f32(&self.memory, out, n, name)?;
+                let xbuf = marshal::read_f32(arena!(self), 0, x, n, name)?;
+                let mut obuf = marshal::output_f32(arena!(self), 1, out, n, name)?;
                 // SAFETY: xbuf/obuf are n f32, cbuf is ncoeff f32 — the kernel's contract.
                 unsafe {
                     wukong_runtime::wukong_vhorner_f32(
@@ -4536,7 +4896,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         ncoeff as i64,
                     );
                 }
-                marshal::write_f32(&mut self.memory, out, &obuf, name)?;
+                marshal::write_f32(arena_mut!(self), 1, out, &obuf, name)?;
                 marshal::recycle_f32(xbuf);
                 marshal::recycle_f32(cbuf);
                 marshal::recycle_f32(obuf);
@@ -4547,7 +4907,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // and call the *serial* runtime kernel, which is bit-identical to the parallel one the
             // native backend runs — so the differential oracle stays exact. The unary sum passes
             // y == x (harmless redundant reads); the kernel ignores y for it.
-            "wukong_sreduce_f32" | "wukong_sreduce_f32_parallel" => {
+            I::SreduceF32 | I::SreduceF32Parallel => {
                 let x = ptr(args[0])?;
                 let y = ptr(args[1])?;
                 let n = args[2].as_int().max(0) as usize;
@@ -4557,11 +4917,11 @@ impl<'a, 'k> Interp<'a, 'k> {
                 // Both operands are only read, so no aliasing contract applies; the ranges are still
                 // validated before any scratch is reserved (a positive-but-absurd `n` is a
                 // diagnostic, not an allocator abort).
-                let xbuf = marshal::read_f32(&self.memory, x, n, name)?;
+                let xbuf = marshal::read_f32(arena!(self), 0, x, n, name)?;
                 let ybuf = if reads_y {
-                    marshal::read_f32(&self.memory, y, n, name)?
+                    marshal::read_f32(arena!(self), 1, y, n, name)?
                 } else {
-                    marshal::output_f32(&self.memory, x, n, name)?
+                    marshal::output_f32(arena!(self), 0, x, n, name)?
                 };
                 // Offload the reduction to the accelerator (GPU) when it covers this op; otherwise
                 // (or with no accelerator) call the serial CPU kernel.
@@ -4591,11 +4951,11 @@ impl<'a, 'k> Interp<'a, 'k> {
             // and call the *serial* kernel (bit-identical to the parallel one — fixed RCHUNK, ascending
             // index-order combine, lowest-index tie-break), returning the index. CPU-only (no
             // accelerator seam), so the differential oracle is unaffected.
-            "wukong_argreduce_f32" | "wukong_argreduce_f32_parallel" => {
+            I::ArgreduceF32 | I::ArgreduceF32Parallel => {
                 let x = ptr(args[0])?;
                 let n = args[1].as_int().max(0) as usize;
                 let op = args[2].as_int() as i64;
-                let xbuf = marshal::read_f32(&self.memory, x, n, name)?;
+                let xbuf = marshal::read_f32(arena!(self), 0, x, n, name)?;
                 // SAFETY: xbuf is exactly n f32 long — the kernel's contract.
                 let r =
                     unsafe { wukong_runtime::wukong_argreduce_f32(xbuf.as_ptr(), n as i64, op) };
@@ -4613,10 +4973,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // unlike the f32 reductions (whose serial form is itself chunked, so the interp calls it),
             // the bf16/f16 serial kernels reduce the *whole* array flat, which reassociates vs the
             // chunked parallel fold — so we call the deterministic parallel kernel native runs, exactly.
-            "wukong_dot_bf16"
-            | "wukong_sum_bf16"
-            | "wukong_dot_bf16_parallel"
-            | "wukong_sum_bf16_parallel" => {
+            I::DotBf16 | I::SumBf16 | I::DotBf16Parallel | I::SumBf16Parallel => {
                 let is_dot = name == "wukong_dot_bf16" || name == "wukong_dot_bf16_parallel";
                 let is_par = name.ends_with("_parallel");
                 let x = ptr(args[0])?;
@@ -4625,9 +4982,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                 } else {
                     (x, args[1].as_int().max(0) as usize)
                 };
-                let xbuf = marshal::read_half_bits(&self.memory, x, n, name, false)?;
+                let xbuf = marshal::read_half_bits(arena!(self), 0, x, n, name, false)?;
                 let ybuf = if is_dot {
-                    marshal::read_half_bits(&self.memory, y, n, name, false)?
+                    marshal::read_half_bits(arena!(self), 1, y, n, name, false)?
                 } else {
                     Vec::new()
                 };
@@ -4654,12 +5011,12 @@ impl<'a, 'k> Interp<'a, 'k> {
             // a `m = fmax/fmin(m, (x[k] as f32))` loop over `[bf16]` lowers to. Reconstruct the exact
             // bf16 bits (as the dot/sum path does), call the identical kernel — the widen is lossless
             // and max/min round nothing, so interp == native exactly.
-            "wukong_reduce_bf16" | "wukong_reduce_bf16_parallel" => {
+            I::ReduceBf16 | I::ReduceBf16Parallel => {
                 let is_par = name.ends_with("_parallel");
                 let x = ptr(args[0])?;
                 let n = args[1].as_int().max(0) as usize;
                 let op = args[2].as_int() as i64;
-                let xbuf = marshal::read_half_bits(&self.memory, x, n, name, false)?;
+                let xbuf = marshal::read_half_bits(arena!(self), 0, x, n, name, false)?;
                 // SAFETY: xbuf is exactly n u16 long — the kernel's contract.
                 let r = unsafe {
                     if is_par {
@@ -4674,10 +5031,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // marshaling as the bf16 reductions, but reconstruct the exact f16 bits via
             // `f32_to_f16_bits` (the stored value is already f16-rounded, so this is exact) and call
             // the F16C kernels. interp == native bit-for-bit (the widen is lossless, identical kernel).
-            "wukong_dot_f16"
-            | "wukong_sum_f16"
-            | "wukong_dot_f16_parallel"
-            | "wukong_sum_f16_parallel" => {
+            I::DotF16 | I::SumF16 | I::DotF16Parallel | I::SumF16Parallel => {
                 let is_dot = name == "wukong_dot_f16" || name == "wukong_dot_f16_parallel";
                 let is_par = name.ends_with("_parallel");
                 let x = ptr(args[0])?;
@@ -4686,9 +5040,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                 } else {
                     (x, args[1].as_int().max(0) as usize)
                 };
-                let xbuf = marshal::read_half_bits(&self.memory, x, n, name, true)?;
+                let xbuf = marshal::read_half_bits(arena!(self), 0, x, n, name, true)?;
                 let ybuf = if is_dot {
-                    marshal::read_half_bits(&self.memory, y, n, name, true)?
+                    marshal::read_half_bits(arena!(self), 1, y, n, name, true)?
                 } else {
                     Vec::new()
                 };
@@ -4712,12 +5066,12 @@ impl<'a, 'k> Interp<'a, 'k> {
                 };
                 Ok(Value::Float(r as f64))
             }
-            "wukong_reduce_f16" | "wukong_reduce_f16_parallel" => {
+            I::ReduceF16 | I::ReduceF16Parallel => {
                 let is_par = name.ends_with("_parallel");
                 let x = ptr(args[0])?;
                 let n = args[1].as_int().max(0) as usize;
                 let op = args[2].as_int() as i64;
-                let xbuf = marshal::read_half_bits(&self.memory, x, n, name, true)?;
+                let xbuf = marshal::read_half_bits(arena!(self), 0, x, n, name, true)?;
                 // SAFETY: xbuf is exactly n u16 long — the kernel's contract.
                 let r = unsafe {
                     if is_par {
@@ -4732,7 +5086,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `out[k] = a*(x[k] as f32) + b*(y[k] as f32)` map over `[bf16; _]` inputs (f32 output)
             // lowers to. Reconstruct the bf16 input bits exactly (as the reductions do), call the
             // identical kernel, write the f32 result back — so the differential gate stays exact.
-            "wukong_axpby_bf16" | "wukong_axpby_f16" => {
+            I::AxpbyBf16 | I::AxpbyF16 => {
                 let is_f16 = name == "wukong_axpby_f16";
                 let x = ptr(args[0])?;
                 let y = ptr(args[1])?;
@@ -4744,13 +5098,17 @@ impl<'a, 'k> Interp<'a, 'k> {
                 // slot memory cannot even represent faithfully (one slot per element against 2 and 4
                 // bytes natively), so it is refused rather than answered.
                 marshal::check_output(
+                    arena!(self),
                     name,
-                    (out, n),
-                    &[((x, n), Overlap::Forbidden), ((y, n), Overlap::Forbidden)],
+                    (2, out, n),
+                    &[
+                        ((0, x, n), Overlap::Forbidden),
+                        ((1, y, n), Overlap::Forbidden),
+                    ],
                 )?;
-                let xbuf = marshal::read_half_bits(&self.memory, x, n, name, is_f16)?;
-                let ybuf = marshal::read_half_bits(&self.memory, y, n, name, is_f16)?;
-                let mut obuf = marshal::output_f32(&self.memory, out, n, name)?;
+                let xbuf = marshal::read_half_bits(arena!(self), 0, x, n, name, is_f16)?;
+                let ybuf = marshal::read_half_bits(arena!(self), 1, y, n, name, is_f16)?;
+                let mut obuf = marshal::output_f32(arena!(self), 2, out, n, name)?;
                 // SAFETY: xbuf/ybuf are n u16, obuf is n f32 — the kernel's contract.
                 unsafe {
                     if is_f16 {
@@ -4773,7 +5131,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         );
                     }
                 }
-                marshal::write_f32(&mut self.memory, out, &obuf, name)?;
+                marshal::write_f32(arena_mut!(self), 2, out, &obuf, name)?;
                 marshal::recycle_f32(obuf);
                 Ok(Value::Unit)
             }
@@ -4784,7 +5142,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // of the widened bits) — bit-identical to the native backend's write-then-load. The
             // narrowing round lives in the shared shim (== the recognizer's `as bf16` store), so interp
             // == native and `-O0` == `-O2` (value-rounded).
-            "wukong_axpby_bf16_out" | "wukong_axpby_f16_out" => {
+            I::AxpbyBf16Out | I::AxpbyF16Out => {
                 let is_f16 = name == "wukong_axpby_f16_out";
                 let x = ptr(args[0])?;
                 let y = ptr(args[1])?;
@@ -4796,13 +5154,17 @@ impl<'a, 'k> Interp<'a, 'k> {
                 // runs a SHIFTED same-width overlap with live ascending reads; copied operands cannot
                 // model that, so it is refused here rather than answered with a snapshot value.
                 marshal::check_output(
+                    arena!(self),
                     name,
-                    (out, n),
-                    &[((x, n), Overlap::ExactOnly), ((y, n), Overlap::ExactOnly)],
+                    (2, out, n),
+                    &[
+                        ((0, x, n), Overlap::ExactOnly),
+                        ((1, y, n), Overlap::ExactOnly),
+                    ],
                 )?;
-                let xbuf = marshal::read_half_bits(&self.memory, x, n, name, is_f16)?;
-                let ybuf = marshal::read_half_bits(&self.memory, y, n, name, is_f16)?;
-                let mut obuf = marshal::output::<u16>(&self.memory, out, n, name)?;
+                let xbuf = marshal::read_half_bits(arena!(self), 0, x, n, name, is_f16)?;
+                let ybuf = marshal::read_half_bits(arena!(self), 1, y, n, name, is_f16)?;
+                let mut obuf = marshal::output::<u16>(arena!(self), 2, out, n, name)?;
                 // SAFETY: xbuf/ybuf/obuf are each n u16 — the kernel's contract.
                 unsafe {
                     if is_f16 {
@@ -4825,7 +5187,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         );
                     }
                 }
-                marshal::write_back(&mut self.memory, out, &obuf, name, |obits| {
+                marshal::write_back(arena_mut!(self), 2, out, &obuf, name, |obits| {
                     let widened = if is_f16 {
                         wukong_runtime::f16_bits_to_f32(obits)
                     } else {
@@ -4850,14 +5212,14 @@ impl<'a, 'k> Interp<'a, 'k> {
             // serial and `_parallel` names: the runtime pins serial == parallel == interpreter
             // bit-for-bit, and the interpreter is the oracle, so the differential gate stays exact
             // despite the kernel's wider/reassociated accumulation.
-            "wukong_sgemm_bf16_nt"
-            | "wukong_sgemm_bf16_nt_parallel"
-            | "wukong_sgemm_f16_nt"
-            | "wukong_sgemm_f16_nt_parallel"
-            | "wukong_sgemm_bf16_tn"
-            | "wukong_sgemm_bf16_tn_parallel"
-            | "wukong_sgemm_f16_tn"
-            | "wukong_sgemm_f16_tn_parallel" => {
+            I::SgemmBf16Nt
+            | I::SgemmBf16NtParallel
+            | I::SgemmF16Nt
+            | I::SgemmF16NtParallel
+            | I::SgemmBf16Tn
+            | I::SgemmBf16TnParallel
+            | I::SgemmF16Tn
+            | I::SgemmF16TnParallel => {
                 let is_f16 = name.contains("_f16");
                 let is_tn = name.contains("_tn");
                 let a = ptr(args[0])?;
@@ -4867,16 +5229,17 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let k = dim!(args[4]);
                 let n = dim!(args[5]);
                 let beta = args[6].as_int() as i64;
-                let av = kernel_values(&self.memory, a, m, k, name)?;
-                let bv = kernel_values(&self.memory, b, n, k, name)?;
-                let cv = kernel_values(&self.memory, c, m, n, name)?;
+                let av = kernel_values(arena!(self), 0, a, m, k, name)?;
+                let bv = kernel_values(arena!(self), 1, b, n, k, name)?;
+                let cv = kernel_values(arena!(self), 2, c, m, n, name)?;
                 // The f32 `C` is written in tiled order while the half `A`/`B` are read.
                 marshal::check_output(
+                    arena!(self),
                     name,
-                    (c, cv.len()),
+                    (2, c, cv.len()),
                     &[
-                        ((a, av.len()), Overlap::Forbidden),
-                        ((b, bv.len()), Overlap::Forbidden),
+                        ((0, a, av.len()), Overlap::Forbidden),
+                        ((1, b, bv.len()), Overlap::Forbidden),
                     ],
                 )?;
                 // Reconstruct the exact half bits after validating every operand range.
@@ -4934,10 +5297,10 @@ impl<'a, 'k> Interp<'a, 'k> {
             // the *serial* runtime kernel for both the serial and `_parallel` names (serial == parallel
             // == interpreter bit-for-bit — rows independent, identical per-(i,j) order), so the
             // differential gate stays exact despite the kernel's wider/reassociated accumulation.
-            "wukong_sgemm_bf16_nt_epi"
-            | "wukong_sgemm_bf16_nt_epi_parallel"
-            | "wukong_sgemm_f16_nt_epi"
-            | "wukong_sgemm_f16_nt_epi_parallel" => {
+            I::SgemmBf16NtEpi
+            | I::SgemmBf16NtEpiParallel
+            | I::SgemmF16NtEpi
+            | I::SgemmF16NtEpiParallel => {
                 let is_f16 = name.contains("_f16");
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
@@ -4953,21 +5316,22 @@ impl<'a, 'k> Interp<'a, 'k> {
                     _ => None,
                 };
                 let act = args[8].as_int() as i64;
-                let av = kernel_values(&self.memory, a, m, k, name)?;
-                let bv = kernel_values(&self.memory, b, n, k, name)?;
-                let cv = kernel_values(&self.memory, c, m, n, name)?;
+                let av = kernel_values(arena!(self), 0, a, m, k, name)?;
+                let bv = kernel_values(arena!(self), 1, b, n, k, name)?;
+                let cv = kernel_values(arena!(self), 2, c, m, n, name)?;
                 let biasv = bias_idx
-                    .map(|base| kernel_values(&self.memory, base, 1, n, name))
+                    .map(|base| kernel_values(arena!(self), 7, base, 1, n, name))
                     .transpose()?;
                 // The f32 `C` is written while the half operands and the epilogue bias are read.
                 marshal::check_output(
+                    arena!(self),
                     name,
-                    (c, cv.len()),
+                    (2, c, cv.len()),
                     &[
-                        ((a, av.len()), Overlap::Forbidden),
-                        ((b, bv.len()), Overlap::Forbidden),
+                        ((0, a, av.len()), Overlap::Forbidden),
+                        ((1, b, bv.len()), Overlap::Forbidden),
                         (
-                            (bias_idx.unwrap_or(0), biasv.map_or(0, <[Value]>::len)),
+                            (7, bias_idx.unwrap_or(0), biasv.map_or(0, <[Value]>::len)),
                             Overlap::Forbidden,
                         ),
                     ],
@@ -5041,7 +5405,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `rows*cols` f32 out of x, call the *serial* runtime kernel (bit-identical to the parallel
             // one the native backend runs, since rows are independent), write the result to out.
             // Reading all of x before writing out makes the in-place (x == out) case correct.
-            "wukong_norm_f32" | "wukong_norm_f32_parallel" => {
+            I::NormF32 | I::NormF32Parallel => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let rows = dim!(args[2]);
@@ -5052,9 +5416,14 @@ impl<'a, 'k> Interp<'a, 'k> {
                 // norm.rs: `x`/`out` may alias for in-place — EXACTLY; each row is read whole before
                 // it is written, so in place equals out of place. A shifted overlap would let one
                 // row's writes reach the next row's reads.
-                marshal::check_output(name, (out, n), &[((x, n), Overlap::ExactOnly)])?;
-                let xbuf = marshal::read_f32(&self.memory, x, n, name)?;
-                let mut obuf = marshal::output_f32(&self.memory, out, n, name)?;
+                marshal::check_output(
+                    arena!(self),
+                    name,
+                    (1, out, n),
+                    &[((0, x, n), Overlap::ExactOnly)],
+                )?;
+                let xbuf = marshal::read_f32(arena!(self), 0, x, n, name)?;
+                let mut obuf = marshal::output_f32(arena!(self), 1, out, n, name)?;
                 // Offload the fused norm to the accelerator (GPU) when present; else the CPU kernel.
                 // The runtime ABI carries eps as raw f32 bits; the GPU wrapper takes an f32, so widen.
                 let offloaded = self.accel.as_mut().and_then(|acc| {
@@ -5082,7 +5451,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         );
                     },
                 }
-                marshal::write_f32(&mut self.memory, out, &obuf, name)?;
+                marshal::write_f32(arena_mut!(self), 1, out, &obuf, name)?;
                 marshal::recycle_f32(xbuf);
                 marshal::recycle_f32(obuf);
                 Ok(Value::Unit)
@@ -5093,7 +5462,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // lowers to a `Ptr`-typed `ConstInt(0)` → a `Value::Int(0)` here (distinct from a real array's
             // `Value::Ptr`), so match the variant: pass a null pointer (kernel uses scale 1 / shift 0).
             // Both names marshal through the *serial* runtime kernel (bit-identical — rows independent).
-            "wukong_norm_affine_f32" | "wukong_norm_affine_f32_parallel" => {
+            I::NormAffineF32 | I::NormAffineF32Parallel => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let gamma_idx = match args[2] {
@@ -5112,24 +5481,26 @@ impl<'a, 'k> Interp<'a, 'k> {
                 // `x`/`out` may be EXACTLY in place, as for the plain norm. `gamma`/`beta` are re-read
                 // on every row's apply, so an `out` overlapping either would change what a later row
                 // reads: the kernel and the source loop see that, a copy here would not.
-                let affine =
-                    |idx: Option<usize>| (idx.unwrap_or(0), if idx.is_some() { cols } else { 0 });
+                let affine = |k: usize, idx: Option<usize>| {
+                    (k, idx.unwrap_or(0), if idx.is_some() { cols } else { 0 })
+                };
                 marshal::check_output(
+                    arena!(self),
                     name,
-                    (out, n),
+                    (1, out, n),
                     &[
-                        ((x, n), Overlap::ExactOnly),
-                        (affine(gamma_idx), Overlap::Forbidden),
-                        (affine(beta_idx), Overlap::Forbidden),
+                        ((0, x, n), Overlap::ExactOnly),
+                        (affine(2, gamma_idx), Overlap::Forbidden),
+                        (affine(3, beta_idx), Overlap::Forbidden),
                     ],
                 )?;
-                let xbuf = marshal::read_f32(&self.memory, x, n, name)?;
+                let xbuf = marshal::read_f32(arena!(self), 0, x, n, name)?;
                 let gbuf = match gamma_idx {
-                    Some(g) => marshal::read_f32(&self.memory, g, cols, name)?,
+                    Some(g) => marshal::read_f32(arena!(self), 2, g, cols, name)?,
                     None => Vec::new(),
                 };
                 let bbuf = match beta_idx {
-                    Some(bb) => marshal::read_f32(&self.memory, bb, cols, name)?,
+                    Some(bb) => marshal::read_f32(arena!(self), 3, bb, cols, name)?,
                     None => Vec::new(),
                 };
                 let gptr = if gamma_idx.is_some() {
@@ -5142,7 +5513,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                 } else {
                     std::ptr::null()
                 };
-                let mut obuf = marshal::output_f32(&self.memory, out, n, name)?;
+                let mut obuf = marshal::output_f32(arena!(self), 1, out, n, name)?;
                 // SAFETY: xbuf is rows*cols; gamma/beta (when present) are cols long — kernel contract.
                 unsafe {
                     wukong_runtime::wukong_norm_affine_f32(
@@ -5156,7 +5527,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         op,
                     );
                 }
-                marshal::write_f32(&mut self.memory, out, &obuf, name)?;
+                marshal::write_f32(arena_mut!(self), 1, out, &obuf, name)?;
                 marshal::recycle_f32(xbuf);
                 marshal::recycle_f32(gbuf);
                 marshal::recycle_f32(bbuf);
@@ -5179,7 +5550,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // Element-wise this is the identical gather (pure data movement — every output element is a
             // verbatim copy, so there is no reassociation to keep in sync with the runtime kernel), with
             // the runtime's own out-of-range rule preserved: an id outside `[0, v)` zeroes its row.
-            "wukong_embedding_f32" | "wukong_embedding_f32_parallel" => {
+            I::EmbeddingF32 | I::EmbeddingF32Parallel => {
                 let out = ptr(args[0])?;
                 let weight = ptr(args[1])?;
                 let ids = ptr(args[2])?;
@@ -5190,8 +5561,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 // an earlier output can change a later ID or weight in the live gather contract.
                 // Each selected row is bounds-checked before its first lane; earlier rows remain
                 // written on a later bounds error. Type errors retain earlier lanes too.
-                kernel_values(&self.memory, ids, 1, t, name)?;
-                kernel_values(&self.memory, out, t, h, name)?;
+                kernel_values(arena!(self), 2, ids, 1, t, name)?;
+                kernel_values(arena!(self), 0, out, t, h, name)?;
                 for r in 0..t {
                     let id = self
                         .memory
@@ -5205,7 +5576,17 @@ impl<'a, 'k> Interp<'a, 'k> {
                         let base = weight
                             .checked_add(offset)
                             .ok_or("embedding weight out of bounds")?;
-                        kernel_values(&self.memory, base, 1, h, "embedding weight")?;
+                        let end = base
+                            .checked_add(h)
+                            .ok_or("embedding weight out of bounds")?;
+                        if end > self.memory.len() {
+                            return Err("embedding weight: operand out of bounds".into());
+                        }
+                        // The row must lie inside the allocation holding `weight` ITSELF. `v` is
+                        // no bound here — a runtime-sized table is passed a sentinel height — so
+                        // a row checked only against "some allocation" could sit wholly inside the
+                        // next one and gather the neighbour's values.
+                        self.slots.live.check_within(name, 1, weight, base, h)?;
                         Some(base)
                     } else {
                         None
@@ -5260,7 +5641,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             //    NATIVE does — `ids` is an `[i32]` buffer and the kernel's parameter is
             //    `*const i32`, so a value outside i32 is reinterpreted, not skipped. A well-typed
             //    program cannot produce one; matching native costs one cast.
-            "wukong_scatter_add_f32" | "wukong_scatter_add_f32_parallel" => {
+            I::ScatterAddF32 | I::ScatterAddF32Parallel => {
                 let grad_w = ptr(args[0])?;
                 let grad_out = ptr(args[1])?;
                 let ids = ptr(args[2])?;
@@ -5282,6 +5663,18 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 if !in_arena(grad_w, v.checked_mul(h)) {
                     return Err("scatter_add grad_w out of bounds".into());
+                }
+                // ...and each inside ONE live allocation: a table shorter than `v` rows that runs
+                // into the next allocation is refused rather than accumulated into. (The products
+                // are known not to overflow here.)
+                for (k, base, len) in [
+                    (2, ids, Some(t)),
+                    (1, grad_out, t.checked_mul(h)),
+                    (0, grad_w, v.checked_mul(h)),
+                ] {
+                    self.slots
+                        .live
+                        .check(name, k, base, len.unwrap_or(usize::MAX))?;
                 }
                 for ti in 0..t {
                     let id = self
@@ -5314,7 +5707,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // q/k/v out of its abstract memory into real f32 buffers, calls the *identical* runtime
             // kernel the native backend calls, then writes the output back — so the online-softmax
             // reassociation stays bit-for-bit exact across the two backends.
-            "wukong_attention_f32" => {
+            I::AttentionF32 => {
                 let q = ptr(args[0])?;
                 let k = ptr(args[1])?;
                 let v = ptr(args[2])?;
@@ -5329,18 +5722,19 @@ impl<'a, 'k> Interp<'a, 'k> {
                 // with no source loop to fall back to, so an overlapping one is reported here
                 // rather than answered with a copied, de-aliased value.
                 marshal::check_output(
+                    arena!(self),
                     name,
-                    (out, len),
+                    (3, out, len),
                     &[
-                        ((q, len), Overlap::Forbidden),
-                        ((k, len), Overlap::Forbidden),
-                        ((v, len), Overlap::Forbidden),
+                        ((0, q, len), Overlap::Forbidden),
+                        ((1, k, len), Overlap::Forbidden),
+                        ((2, v, len), Overlap::Forbidden),
                     ],
                 )?;
-                let qbuf = marshal::read_f32(&self.memory, q, len, name)?;
-                let kbuf = marshal::read_f32(&self.memory, k, len, name)?;
-                let vbuf = marshal::read_f32(&self.memory, v, len, name)?;
-                let mut obuf = marshal::output_f32(&self.memory, out, len, name)?;
+                let qbuf = marshal::read_f32(arena!(self), 0, q, len, name)?;
+                let kbuf = marshal::read_f32(arena!(self), 1, k, len, name)?;
+                let vbuf = marshal::read_f32(arena!(self), 2, v, len, name)?;
+                let mut obuf = marshal::output_f32(arena!(self), 3, out, len, name)?;
                 // SAFETY: buffers are exactly s*d long — the kernel's operand contract.
                 unsafe {
                     wukong_runtime::wukong_attention_f32(
@@ -5354,7 +5748,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         causal,
                     );
                 }
-                marshal::write_f32(&mut self.memory, out, &obuf, name)?;
+                marshal::write_f32(arena_mut!(self), 3, out, &obuf, name)?;
                 marshal::recycle_f32(qbuf);
                 marshal::recycle_f32(kbuf);
                 marshal::recycle_f32(vbuf);
@@ -5367,7 +5761,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                 .text_intrinsic(other, args)
                 .or_else(|| self.ml_intrinsic(other, args))
                 .or_else(|| self.decode_intrinsic(other, args))
-                .unwrap_or_else(|| Err(format!("call to unknown function or intrinsic `{other}`"))),
+                .unwrap_or_else(|| Err(format!("call to unknown function or intrinsic `{name}`"))),
         }
     }
 }

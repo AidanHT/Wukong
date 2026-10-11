@@ -17,7 +17,7 @@ use wukong_runtime::attention_kv::{kv_append_plan, kv_attention_plan, KV_OK};
 use wukong_runtime::gemv_half::{gemv_half_plan, GEMV_OK};
 use wukong_runtime::quant::{gemv_q_plan, quantize_plan, QFormat, QUANT_OK};
 
-use crate::{kernel_buffer, kernel_values, marshal, Interp, Value};
+use crate::{kernel_buffer, kernel_values, marshal, Interp, Intrinsic, Value};
 
 /// An `i64` ABI argument as the native entry receives it (MIR passes these as `i64` values).
 fn arg_i64(args: &[Value], i: usize) -> i64 {
@@ -45,29 +45,24 @@ fn refused(ctx: &str, code: i64) -> String {
 }
 
 impl Interp<'_, '_> {
-    /// Dispatch a decode-builtin runtime entry, or `None` when `name` is not one of them.
+    /// Dispatch a decode-builtin runtime entry, or `None` when `id` is not one of them.
     pub(crate) fn decode_intrinsic(
         &mut self,
-        name: &str,
+        id: Intrinsic,
         args: &[Value],
     ) -> Option<Result<Value, String>> {
-        Some(match name {
-            "wukong_attention_kv_f32" | "wukong_attention_kv_f32_parallel" => {
-                self.dec_attention_kv(name, args)
+        use Intrinsic as I;
+        let name = id.name();
+        Some(match id {
+            I::AttentionKvF32 | I::AttentionKvF32Parallel => self.dec_attention_kv(name, args),
+            I::KvAppendF32 => self.dec_kv_append(name, args),
+            I::SgemvBf16 | I::SgemvBf16Parallel | I::SgemvF16 | I::SgemvF16Parallel => {
+                self.dec_sgemv_half(name, args)
             }
-            "wukong_kv_append_f32" => self.dec_kv_append(name, args),
-            "wukong_sgemv_bf16"
-            | "wukong_sgemv_bf16_parallel"
-            | "wukong_sgemv_f16"
-            | "wukong_sgemv_f16_parallel" => self.dec_sgemv_half(name, args),
-            "wukong_quantize_q8_0_f32" => self.dec_quantize(name, args, QFormat::Q8),
-            "wukong_quantize_q4_0_f32" => self.dec_quantize(name, args, QFormat::Q4),
-            "wukong_gemv_q8_0_f32" | "wukong_gemv_q8_0_f32_parallel" => {
-                self.dec_gemv_q(name, args, QFormat::Q8)
-            }
-            "wukong_gemv_q4_0_f32" | "wukong_gemv_q4_0_f32_parallel" => {
-                self.dec_gemv_q(name, args, QFormat::Q4)
-            }
+            I::QuantizeQ80F32 => self.dec_quantize(name, args, QFormat::Q8),
+            I::QuantizeQ40F32 => self.dec_quantize(name, args, QFormat::Q4),
+            I::GemvQ80F32 | I::GemvQ80F32Parallel => self.dec_gemv_q(name, args, QFormat::Q8),
+            I::GemvQ40F32 | I::GemvQ40F32Parallel => self.dec_gemv_q(name, args, QFormat::Q4),
             _ => return None,
         })
     }
@@ -93,7 +88,8 @@ impl Interp<'_, '_> {
         let scale = args.get(16).map(|v| v.as_float() as f32).unwrap_or(0.0);
         let causal = arg_i64(args, 17);
         let q = marshal::read_f32(
-            &self.memory,
+            arena!(self),
+            0,
             ptr_arg(args, 0, name, "q")?,
             plan.q_extent,
             name,
@@ -104,12 +100,12 @@ impl Interp<'_, '_> {
             let kb = ptr_arg(args, 2, name, "k")?;
             let vb = ptr_arg(args, 4, name, "v")?;
             (
-                marshal::read_f32(&self.memory, kb, plan.kv_extent, name)?,
-                marshal::read_f32(&self.memory, vb, plan.kv_extent, name)?,
+                marshal::read_f32(arena!(self), 2, kb, plan.kv_extent, name)?,
+                marshal::read_f32(arena!(self), 4, vb, plan.kv_extent, name)?,
             )
         };
         let o_base = ptr_arg(args, 6, name, "out")?;
-        let mut o = marshal::output_f32(&self.memory, o_base, plan.q_extent, name)?;
+        let mut o = marshal::output_f32(arena!(self), 6, o_base, plan.q_extent, name)?;
         // SAFETY: every host buffer holds exactly the extent the plan validated, and they are
         // disjoint.
         let code = unsafe {
@@ -141,7 +137,8 @@ impl Interp<'_, '_> {
         for i in 0..plan.sq {
             for h in 0..plan.n_heads {
                 let off = plan.q_off(i, h);
-                marshal::write_f32(&mut self.memory, o_base + off, &o[off..off + plan.d], name)?;
+                let head = &o[off..off + plan.d];
+                marshal::write_f32(arena_mut!(self), 6, o_base + off, head, name)?;
             }
         }
         marshal::recycle_f32(q);
@@ -164,17 +161,25 @@ impl Interp<'_, '_> {
             Ok(None) => return Ok(status(KV_OK)),
             Err(code) => return Ok(status(code)),
         };
+        // The cache operand is the whole `[cache, cache + ncache)` the entry may write (the plan
+        // proved the row lies inside it), so it must lie inside ONE allocation before anything is
+        // copied. Checking only the destination row, against whichever allocation held it, let a
+        // cache whose stated length overran its allocation write a row into the next allocation.
+        let cache = ptr_arg(args, 0, name, "cache")?;
+        let ncache = usize::try_from(arg_i64(args, 1))
+            .map_err(|_| format!("{name}: cache extent overflow"))?;
+        kernel_values(arena!(self), 0, cache, 1, ncache, name)?;
         let row = marshal::read_f32(
-            &self.memory,
+            arena!(self),
+            2,
             ptr_arg(args, 2, name, "row")?,
             row_len as usize,
             name,
         )?;
-        let cache = ptr_arg(args, 0, name, "cache")?;
         let dst = cache
             .checked_add(off)
             .ok_or_else(|| format!("{name}: cache out of bounds"))?;
-        marshal::write_f32(&mut self.memory, dst, &row, name)?;
+        marshal::write_f32(arena_mut!(self), 0, dst, &row, name)?;
         marshal::recycle_f32(row);
         Ok(status(KV_OK))
     }
@@ -195,12 +200,19 @@ impl Interp<'_, '_> {
             let wb = ptr_arg(args, 0, name, "weight")?;
             let xb = ptr_arg(args, 2, name, "x")?;
             (
-                marshal::read_half_bits(&self.memory, wb, n * k, name, is_f16)?,
-                marshal::read_f32(&self.memory, xb, k, name)?,
+                marshal::read_half_bits(
+                    arena!(self),
+                    0,
+                    wb,
+                    marshal::span(n, k, name)?,
+                    name,
+                    is_f16,
+                )?,
+                marshal::read_f32(arena!(self), 2, xb, k, name)?,
             )
         };
         let y_base = ptr_arg(args, 4, name, "y")?;
-        let mut y = marshal::output_f32(&self.memory, y_base, n, name)?;
+        let mut y = marshal::output_f32(arena!(self), 4, y_base, n, name)?;
         let (wl, xl, yl) = (w.len() as i64, x.len() as i64, y.len() as i64);
         // SAFETY: the host buffers hold exactly the validated extents and are disjoint.
         let code = unsafe {
@@ -220,7 +232,7 @@ impl Interp<'_, '_> {
         if code != GEMV_OK {
             return Err(refused(name, code));
         }
-        marshal::write_f32(&mut self.memory, y_base, &y, name)?;
+        marshal::write_f32(arena_mut!(self), 4, y_base, &y, name)?;
         marshal::recycle_f32(x);
         marshal::recycle_f32(y);
         Ok(status(GEMV_OK))
@@ -236,9 +248,11 @@ impl Interp<'_, '_> {
         if rows == 0 {
             return Ok(status(QUANT_OK));
         }
-        let x = marshal::read_f32(&self.memory, ptr_arg(args, 0, name, "x")?, rows * k, name)?;
+        let x_base = ptr_arg(args, 0, name, "x")?;
+        let x = marshal::read_f32(arena!(self), 0, x_base, marshal::span(rows, k, name)?, name)?;
         let q_base = ptr_arg(args, 2, name, "q")?;
-        let mut q: Vec<u8> = marshal::output(&self.memory, q_base, rows * fmt.row_bytes(k), name)?;
+        let q_len = marshal::span(rows, fmt.row_bytes(k), name)?;
+        let mut q: Vec<u8> = marshal::output(arena!(self), 2, q_base, q_len, name)?;
         let (xl, ql) = (x.len() as i64, q.len() as i64);
         // SAFETY: the host buffers hold exactly the validated extents and are disjoint.
         let code = unsafe {
@@ -262,7 +276,7 @@ impl Interp<'_, '_> {
         if code != QUANT_OK {
             return Err(refused(name, code));
         }
-        marshal::write_back(&mut self.memory, q_base, &q, name, |b| {
+        marshal::write_back(arena_mut!(self), 2, q_base, &q, name, |b| {
             Value::Int(i128::from(b as i8))
         })?;
         marshal::recycle_f32(x);
@@ -282,13 +296,13 @@ impl Interp<'_, '_> {
             (Vec::new(), Vec::new())
         } else {
             let wb = ptr_arg(args, 0, name, "weight")?;
-            let vals = kernel_values(&self.memory, wb, n * fmt.row_bytes(k), 1, name)?;
+            let vals = kernel_values(arena!(self), 0, wb, n, fmt.row_bytes(k), name)?;
             let w: Vec<u8> = kernel_buffer(vals, name, |v| v.kernel_int(name).map(|b| b as u8))?;
             let xb = ptr_arg(args, 2, name, "x")?;
-            (w, marshal::read_f32(&self.memory, xb, k, name)?)
+            (w, marshal::read_f32(arena!(self), 2, xb, k, name)?)
         };
         let y_base = ptr_arg(args, 4, name, "y")?;
-        let mut y = marshal::output_f32(&self.memory, y_base, n, name)?;
+        let mut y = marshal::output_f32(arena!(self), 4, y_base, n, name)?;
         let (wl, xl, yl) = (w.len() as i64, x.len() as i64, y.len() as i64);
         // SAFETY: the host buffers hold exactly the validated extents and are disjoint.
         let code = unsafe {
@@ -314,7 +328,7 @@ impl Interp<'_, '_> {
         if code != QUANT_OK {
             return Err(refused(name, code));
         }
-        marshal::write_f32(&mut self.memory, y_base, &y, name)?;
+        marshal::write_f32(arena_mut!(self), 4, y_base, &y, name)?;
         marshal::recycle_f32(x);
         marshal::recycle_f32(y);
         Ok(status(QUANT_OK))

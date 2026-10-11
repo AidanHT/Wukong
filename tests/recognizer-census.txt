@@ -504,6 +504,7 @@ vec_exp.wk:
 vec_find_last.wk: wukong_rt_alloc wukong_rt_alloc*2 wukong_rt_free wukong_rt_free*2
 vec_guarded_shifted_read.wk:
 vec_int_div.wk: veckernel*1
+vec_kernel_zero_trip.wk: veckernel*2 wukong_rt_alloc
 vec_math.wk: veckernel*1
 vec_neg.wk: veckernel*2
 vec_reduce_minmax.wk:
