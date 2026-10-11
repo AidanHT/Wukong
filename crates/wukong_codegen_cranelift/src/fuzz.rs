@@ -568,7 +568,8 @@ enum OffBound {
     /// `u = 2^-24`), `S` the sum of the terms' magnitudes; so they differ by at most `2 * gamma_n * S`.
     /// Declared per lane as `2 * (n + 1) * 2^-24 * S`, `S` computed in f64 from the inputs
     /// ([`fold_terms`]); the `+ 1` covers the accumulator's starting `+ 0.0` and an FMA-versus-mul
-    /// contraction difference. Non-finite lanes must match exactly (`same`).
+    /// contraction difference. Non-finite lanes and zero lanes must match exactly (`same`, sign of
+    /// zero included — [`off_tol_lane`]).
     Fold,
     /// A fused row normalization (softmax / LayerNorm / RMSNorm, plain and affine, single and
     /// batched): `|on - off| <= tol` absolute, twice the kernel's documented f64-reference bound on
@@ -577,6 +578,7 @@ enum OffBound {
     /// (`affine_matches_f64_reference`). Compared in the `Normal` regime only: those bounds are
     /// stated for unit-scale data, and under +-1e30 / inf / NaN inputs the kernel and the generic
     /// loop overflow their (differently ordered) mean / variance / exp sums at different points.
+    /// Non-finite and zero lanes are held to `same`, sign of zero included ([`off_tol_lane`]).
     Abs(f64),
 }
 
@@ -639,8 +641,45 @@ fn off_bound(name: &str) -> OffBound {
     }
 }
 
+/// One lane of a tolerance-class kernel ([`OffBound::Fold`] / [`OffBound::Abs`]): `Ok(|on - off|)`
+/// when the recognized value `on` stands within the absolute bound `tol` of the recognition-off
+/// value `off`, or `Err(why)`.
+///
+/// A tolerance licenses a difference in MAGNITUDE and nothing else, so two kinds of lane are held to
+/// [`same`] exactly whatever `tol` is. A non-finite lane carries no magnitude to bound. And a zero
+/// lane: `|(+0) - (-0)|` is `0`, inside every bound, so a bare `err <= tol` would accept exactly
+/// the sign-of-zero divergence `same` was tightened to refuse (an affine norm writeback that adds
+/// `+0.0` for an absent beta, a fold that drops its `+0.0` seed). Reassociation is not a source of
+/// one: a sum seeded with `+0.0` is `+0` whenever it is exactly zero, under any association (an
+/// exact cancellation of nonzero terms rounds to `+0` and `+0 + -0 = +0`, so no subtree holding the
+/// seed can be `-0`). The one IEEE route is a contracted product that underflows — `fma(a, b, +0)`
+/// rounds a negative `a*b` below `2^-150` to `-0` where `a*b + 0` gives `+0` — which needs a product
+/// of two of this fuzzer's inputs to vanish below the smallest subnormal; the seeded corpus does not
+/// generate one, and if a change ever made it, the lane belongs in [`KNOWN_OFF_DIVERGENCES`] with
+/// its reproducer like any other, not under a magnitude bound. The norm bounds (`Abs`) are stated
+/// for magnitudes.
+fn off_tol_lane(on: f32, off: f32, tol: f64) -> Result<f64, String> {
+    if same(on, off) {
+        return Ok(0.0);
+    }
+    if !(on.is_finite() && off.is_finite()) {
+        return Err("a non-finite lane must match exactly".to_string());
+    }
+    if on == 0.0 && off == 0.0 {
+        // Both zero and `same` failed: the bits differ, so the signs do.
+        return Err("the sign of zero differs, and no magnitude bound covers it".to_string());
+    }
+    let err = (on as f64 - off as f64).abs();
+    if err > tol {
+        return Err(format!("|diff| {err:e} exceeds {tol:e}"));
+    }
+    Ok(err)
+}
+
 /// Per output lane of a [`OffBound::Fold`] kernel: `(terms in the fold, sum of their magnitudes)`,
-/// in f64, from the f32 inputs. A lane no fold writes gets `(0, 0.0)` and is therefore held exact.
+/// in f64, from the f32 inputs. A lane no fold writes gets `(0, 0.0)`, so its bound is `0` and it is
+/// held exact: any magnitude difference exceeds `0`, and a zero lane is held to `same` (sign
+/// included) by [`off_tol_lane`] whatever the bound.
 fn fold_terms(name: &str, n: usize, x: &[f32], y: &[f32], len: usize) -> Vec<(usize, f64)> {
     let mut out = vec![(0usize, 0.0f64); len];
     let (xd, yd) = (|i: usize| x[i] as f64, |i: usize| y[i] as f64);
@@ -670,6 +709,34 @@ fn fold_terms(name: &str, n: usize, x: &[f32], y: &[f32], len: usize) -> Vec<(us
         _ => unreachable!("{name} is not a Fold kernel"),
     }
     out
+}
+
+/// The tolerance classes license a difference in MAGNITUDE, and nothing else: a lane outside its
+/// bound, a non-finite lane that differs, and a zero whose sign differs are all refused. The last is
+/// the case a bare `|on - off| <= tol` cannot see -- `|(+0) - (-0)|` is `0`, inside every bound --
+/// and it is exactly the sign-of-zero divergence [`same`] exists to refuse.
+#[test]
+fn off_tolerance_lanes_bound_magnitude_and_hold_the_sign_of_zero() {
+    // Equal values (and NaN against NaN, whose payloads no program can read) need no bound.
+    assert_eq!(off_tol_lane(1.5, 1.5, 0.0), Ok(0.0));
+    assert_eq!(off_tol_lane(f32::NAN, -f32::NAN, 0.0), Ok(0.0));
+    assert_eq!(off_tol_lane(0.0, 0.0, 0.0), Ok(0.0));
+    assert_eq!(off_tol_lane(-0.0, -0.0, 0.0), Ok(0.0));
+    // A magnitude difference is judged by the bound, on either side of it.
+    let one_ulp = f32::from_bits(1.0f32.to_bits() + 1);
+    assert!(off_tol_lane(1.0, one_ulp, 1e-6).is_ok());
+    assert!(off_tol_lane(1.0, 1.001, 1e-6).is_err());
+    // A zero against a tiny nonzero is still a magnitude question.
+    assert!(off_tol_lane(0.0, -1e-30, 1e-20).is_ok());
+    // A non-finite lane must match exactly, whatever the bound.
+    assert!(off_tol_lane(f32::INFINITY, f32::MAX, f64::INFINITY).is_err());
+    assert!(off_tol_lane(f32::NAN, 0.0, f64::INFINITY).is_err());
+    // The sign of zero is observable (`print(-0.0)` is `-0`, `1/-0` is `-inf`) and no bound covers
+    // it: `+0` against `-0` is refused at a zero bound, at a generous one, and in both orders.
+    assert!(off_tol_lane(0.0, -0.0, 0.0).is_err());
+    assert!(off_tol_lane(-0.0, 0.0, 0.0).is_err());
+    assert!(off_tol_lane(0.0, -0.0, 4e-3).is_err());
+    assert!(off_tol_lane(-0.0, 0.0, f64::INFINITY).is_err());
 }
 
 #[test]
@@ -847,28 +914,22 @@ fn fuzz_full_buffer_interp_vs_native() {
                                 for idx in 0..len {
                                     let (a, b) = (on[idx], og[idx]);
                                     entry.1 += 1;
-                                    if same(a, b) {
-                                        continue;
-                                    }
-                                    if !(a.is_finite() && b.is_finite()) {
-                                        off_failures.push(off_msg(
-                                            idx,
-                                            "a non-finite fold lane must match exactly",
-                                        ));
-                                        continue;
-                                    }
                                     let (cnt, mag) = terms[idx];
                                     let tol = 2.0 * (cnt as f64 + 1.0) * f64::powi(2.0, -24) * mag;
-                                    let err = (a as f64 - b as f64).abs();
-                                    if err > tol {
-                                        off_failures.push(off_msg(
-                                            idx,
-                                            &format!(
-                                                "|diff| {err:e} exceeds 2*gamma_n*S = {tol:e}"
-                                            ),
-                                        ));
-                                    } else if tol > 0.0 {
-                                        entry.0 = entry.0.max(err / tol);
+                                    match off_tol_lane(a, b, tol) {
+                                        Ok(err) if tol > 0.0 => entry.0 = entry.0.max(err / tol),
+                                        Ok(_) => {}
+                                        Err(why) => {
+                                            if let Some(d) = known_divergence(k.name, x[idx], a, b)
+                                            {
+                                                known_hits[d] += 1;
+                                            } else {
+                                                off_failures.push(off_msg(
+                                                    idx,
+                                                    &format!("{why} (bound 2*gamma_n*S)"),
+                                                ));
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -880,19 +941,20 @@ fn fuzz_full_buffer_interp_vs_native() {
                                     for idx in 0..len {
                                         let (a, b) = (on[idx], og[idx]);
                                         entry.1 += 1;
-                                        if same(a, b) {
-                                            continue;
-                                        }
-                                        let err = (a as f64 - b as f64).abs();
-                                        if !(a.is_finite() && b.is_finite() && err <= tol) {
-                                            off_failures.push(off_msg(
-                                                idx,
-                                                &format!(
-                                                    "|diff| {err:e} exceeds the declared {tol:e}"
-                                                ),
-                                            ));
-                                        } else {
-                                            entry.0 = entry.0.max(err / tol);
+                                        match off_tol_lane(a, b, tol) {
+                                            Ok(err) => entry.0 = entry.0.max(err / tol),
+                                            Err(why) => {
+                                                if let Some(d) =
+                                                    known_divergence(k.name, x[idx], a, b)
+                                                {
+                                                    known_hits[d] += 1;
+                                                } else {
+                                                    off_failures.push(off_msg(
+                                                        idx,
+                                                        &format!("{why} (declared absolute bound)"),
+                                                    ));
+                                                }
+                                            }
                                         }
                                     }
                                 }
