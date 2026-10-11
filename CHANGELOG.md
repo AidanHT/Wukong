@@ -11,10 +11,14 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `as` import none of whose names or qualifier is used, a second import of an already imported
   module, or the unused names of a `{x, y}` selection — is a warning, in every file of the program,
   judged by the import loader's own module-scoped resolution (a shadowing local does not use the
-  import; a method call keeps the import that loads its `impl`). It carries a machine-applicable
-  fix that deletes the import or rewrites the selection, honours `-A/-W/-D unused_imports` and an
-  `@allow` on the `import` itself, and is silent for `--emit=obj`/`llvm-ir`. The run corpus and the
-  examples are warning-free and `corpus_is_warning_free` is now a gate.
+  import). An `impl` is found without a name, and sema's method table and trait-bound check are
+  program-wide, so an import is also kept when the module it loads (directly or transitively)
+  holds an `impl` defining a method called in ANY file, or implementing a trait ANY generic
+  parameter is bounded by: deleting every reported import at once never changes what the program
+  means. It carries a machine-applicable fix that deletes the import or rewrites the selection,
+  honours `-A/-W/-D unused_imports` and an `@allow` on the `import` itself, and is silent for
+  `--emit=obj`/`llvm-ir`. The run corpus and the examples are warning-free and
+  `corpus_is_warning_free` is now a gate.
 - **Parser lints reach every file (N8).** An imported module's missing `;` (`W0030`) and line-leading
   continuation (`W0031`) were dropped by the loader; they now report with that file's path and go
   through the same levels. A `defer` statement needs its `;` like any simple statement (a deferred

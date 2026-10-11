@@ -1061,10 +1061,13 @@ fn main() -> i32 {
          selection, whose unused names are reported on their own when others are used. Imports \
          are judged per file, by the same module-scoped resolution that decides what every name \
          means: a local that shadows an imported name does not use the import, and of two imports \
-         of one module the second is the unused one. A method call keeps the import of a module \
-         whose `impl` defines that method, since deleting the import would delete the method. The \
-         warning carries a machine-applicable fix that deletes the import, or rewrites the \
-         selection to the names that are used. An object or IR artifact (`--emit=obj`, \
+         of one module the second is the unused one. An `impl` is found without a name — a \
+         method through its receiver's type, a trait bound through any `impl` in the program — \
+         so an import is also kept when the module it loads holds an `impl` that defines a method \
+         called in any file, or implements a trait any generic parameter is bounded by: deleting \
+         every reported import never changes what the program means. The warning carries a \
+         machine-applicable fix that deletes the import, or rewrites the selection to the names \
+         that are used. An object or IR artifact (`--emit=obj`, \
          `--emit=llvm-ir`) reports nothing: a library may import a module only for the functions \
          it exports. In the examples, `// file: <path>` starts another file of the program.",
         bad: "module ex.w0008\nimport geom;\n\nfn main() -> i32 {\n    return 0;\n}\n// file: geom.wk\nmodule geom\n\npub fn area(w: f32, h: f32) -> f32 {\n    return w * h;\n}\n",

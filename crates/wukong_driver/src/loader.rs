@@ -38,10 +38,13 @@
 //!   stage, where the levels (`-A/-W/-D`, `@allow` on an item of the imported file) are resolved.
 //! - An import nothing uses is **W0008** (`unused_imports`), in any file of the program: a glob or
 //!   `as` import none of whose names or qualifier resolves a reference, or the names of a `{x, y}`
-//!   selection that resolve none. The verdict is the resolution's own (see [`resolve`]), and a
-//!   method call whose `impl` lives in a module the import loads keeps it, so deleting a reported
-//!   import never changes what the program means. Each finding carries a machine-applicable
-//!   suggestion that deletes the import (or the unused names).
+//!   selection that resolve none. The verdict is the resolution's own (see [`resolve`]). An
+//!   `impl` is the one thing found without a name: sema's method table and trait-bound check are
+//!   program-wide, so an import is also kept when the module it loads (directly or through its
+//!   own imports) holds an `impl` that defines a method called in ANY file, or implements a trait
+//!   that ANY generic parameter is bounded by. Deleting a reported import — or every reported
+//!   import at once — therefore never changes what the program means. Each finding carries a
+//!   machine-applicable suggestion that deletes the import (or the unused names).
 //!
 //! `NodeId` uniqueness across files is guaranteed by threading a watermark through
 //! [`wukong_parser::parse_module_tokens_from`] — see its doc comment.
@@ -205,12 +208,14 @@ fn unused_imports(
             if decl.target.is_none() {
                 continue;
             }
-            let methods = uses.methods[f][k];
+            // The import loads an `impl` some file's call or bound needs: deleting it is unsafe
+            // even when no name resolves through it.
+            let impls = uses.impls[f][k];
             match decl.import.items.as_deref() {
                 Some(list) if !list.is_empty() => {
                     let used = &uses.names[f][k];
                     let unused: Vec<usize> = (0..list.len()).filter(|&i| !used[i]).collect();
-                    if unused.is_empty() || (unused.len() == list.len() && methods) {
+                    if unused.is_empty() || (unused.len() == list.len() && impls) {
                         continue;
                     }
                     if unused.len() == list.len() {
@@ -220,7 +225,7 @@ fn unused_imports(
                     }
                 }
                 _ => {
-                    if !uses.resolved[f][k] && !methods {
+                    if !uses.resolved[f][k] && !impls {
                         out.push(unused_whole_import(file, k, sm, interner));
                     }
                 }
@@ -1019,6 +1024,73 @@ mod tests {
             found(&l.unused, &l.sm),
             [(
                 "unused import: `ns_meth_ext`".to_string(),
+                "virtual_root.wk".to_string()
+            )]
+        );
+    }
+
+    /// Sema's method table is program-wide: an `impl` serves a call in ANY file, whichever file
+    /// loaded it. Here the root reaches `ns_meth_ext` through `ns_meth_prelude`, whose own
+    /// `import ns_meth_ext;` names nothing and calls nothing, yet deleting it would make the
+    /// root's `p.twice()` a missing method.
+    #[test]
+    fn an_import_whose_impl_another_file_calls_is_used() {
+        let l = load_all(
+            "virtual_root.wk",
+            "import ns_meth.{make};\nimport ns_meth_prelude;\n\
+             fn main() -> i32 { let p = make(); return p.twice(); }\n",
+        );
+        assert!(!l.sink.has_errors(), "{:?}", l.sink.diagnostics());
+        assert!(l.unused.is_empty(), "{:?}", l.unused);
+        // With no call anywhere, both the root's import of the prelude and the prelude's import
+        // of the `impl` are unused (deleting both keeps the program meaning the same).
+        let l = load_all(
+            "virtual_root.wk",
+            "import ns_meth.{make};\nimport ns_meth_prelude;\n\
+             fn main() -> i32 { let p = make(); return 0; }\n",
+        );
+        assert_eq!(
+            found(&l.unused, &l.sm),
+            [
+                (
+                    "unused import: `ns_meth_prelude`".to_string(),
+                    "virtual_root.wk".to_string()
+                ),
+                (
+                    "unused import: `ns_meth_ext`".to_string(),
+                    "ns_meth_prelude.wk".to_string()
+                )
+            ]
+        );
+    }
+
+    /// A trait `impl` satisfies a bound program-wide too: an import that only loads
+    /// `impl Shape for Sq` is used when some function bounds a parameter by `Shape`, although no
+    /// method of the trait is called (deleting it would make `d(sq())` an E0410).
+    #[test]
+    fn an_import_whose_trait_impl_satisfies_a_bound_is_used() {
+        for src in [
+            "import ns_shape;\nimport ns_shape_impl;\n\
+             fn d<T: Shape>(_x: T) -> i32 { return 1; }\n\
+             fn main() -> i32 { return d(sq()); }\n",
+            "import ns_shape as g;\nimport ns_shape_impl;\n\
+             fn d<T>(_x: T) -> i32 where T: g.Shape { return 1; }\n\
+             fn main() -> i32 { return d(g::sq()); }\n",
+        ] {
+            let l = load_all("virtual_root.wk", src);
+            assert!(!l.sink.has_errors(), "{src}: {:?}", l.sink.diagnostics());
+            assert!(l.unused.is_empty(), "{src}: {:?}", l.unused);
+        }
+        // No bound and no call: the import that only carries the trait `impl` is unused.
+        let l = load_all(
+            "virtual_root.wk",
+            "import ns_shape;\nimport ns_shape_impl;\n\
+             fn main() -> i32 { let _s = sq(); return 0; }\n",
+        );
+        assert_eq!(
+            found(&l.unused, &l.sm),
+            [(
+                "unused import: `ns_shape_impl`".to_string(),
                 "virtual_root.wk".to_string()
             )]
         );

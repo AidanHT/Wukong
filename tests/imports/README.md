@@ -1,6 +1,6 @@
 # `tests/imports/` — loader unit-test fixtures
 
-**14** flat `.wk` files for `crates/wukong_driver/src/loader.rs` unit tests (and one root that
+**17** flat `.wk` files for `crates/wukong_driver/src/loader.rs` unit tests (and one root that
 `crates/wukongc/tests/warn.rs` compiles):
 
 - `cycle_a.wk`, `cycle_b.wk` — an import cycle (each file loads once)
@@ -12,6 +12,10 @@
 - `ns_ext.wk` — repeats the root's `extern "C"` declaration (identical declarations merge)
 - `ns_meth.wk`, `ns_meth_ext.wk` — a type and, in another module, its `impl`: an import used only
   to call a method is not unused (W0008)
+- `ns_meth_prelude.wk` — a module that only imports `ns_meth_ext.wk`: its import is kept when ANY
+  file calls the method, since an `impl` is program-wide (W0008)
+- `ns_shape.wk`, `ns_shape_impl.wk` — a trait and type, and in another module `impl Shape for Sq`:
+  an import that only satisfies a `T: Shape` bound is not unused (W0008)
 - `lint_semi.wk`, `lint_semi_root.wk` — an imported module whose `let` misses its `;`: the W0030
   must carry the imported file's path; `warn.rs` compiles `lint_semi_root.wk` end to end
 

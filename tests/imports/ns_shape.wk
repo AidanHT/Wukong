@@ -1,0 +1,16 @@
+// Loader unit-test fixture: a trait and a type whose `impl Shape for Sq` lives in another module
+// (ns_shape_impl.wk). A generic bound `T: Shape` needs that impl loaded although no name or
+// method of it is written anywhere.
+module ns_shape
+
+pub trait Shape {
+    fn sides(self) -> i32;
+}
+
+pub struct Sq {
+    s: i32,
+}
+
+pub fn sq() -> Sq {
+    return Sq { s: 1 };
+}

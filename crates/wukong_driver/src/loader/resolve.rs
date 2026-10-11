@@ -97,10 +97,13 @@ pub(super) struct ImportUse {
     pub(super) resolved: Vec<Vec<bool>>,
     /// For a `{x, y}` selection, whether each selected name resolved a reference.
     pub(super) names: Vec<Vec<Vec<bool>>>,
-    /// A method call in the file names a method that an `impl` block in the imported module, or in
-    /// a module it loads in turn, defines. A method is found through its receiver's type, not
-    /// through the import, but dropping the import would drop the `impl` with it.
-    pub(super) methods: Vec<Vec<bool>>,
+    /// The imported module, or a module it loads in turn, holds an `impl` block the program
+    /// needs: one that defines a method some file calls, or implements a trait some generic
+    /// parameter is bounded by. Sema's method table and trait-bound check are program-wide — a
+    /// method is found through its receiver's type, never through an import, and in whichever
+    /// file's `impl` it lives — so the import is needed whatever file the call or the bound is
+    /// in: dropping it would drop the `impl` with it.
+    pub(super) impls: Vec<Vec<bool>>,
 }
 
 impl ImportUse {
@@ -116,7 +119,7 @@ impl ImportUse {
                         .collect()
                 })
                 .collect(),
-            methods: files.iter().map(|f| vec![false; f.imports.len()]).collect(),
+            impls: files.iter().map(|f| vec![false; f.imports.len()]).collect(),
         }
     }
 }
@@ -149,15 +152,14 @@ pub(super) fn resolve_program(
     let scopes: Vec<Scope> = (0..files.len())
         .map(|f| build_scope(f, files, &exports, interner, sink))
         .collect();
-    let provides = methods_through_imports(root_items, extra, files);
-
     let mut rw = Rewriter {
         scope: &scopes[0],
         files,
         exports: &exports,
         unmangled: &unmangled,
-        provides: &provides,
         uses: ImportUse::new(files),
+        called: FxHashSet::default(),
+        bounds: FxHashSet::default(),
         interner,
         sink,
         locals: Vec::new(),
@@ -171,50 +173,76 @@ pub(super) fn resolve_program(
         rename_decls(item, &exports[*file]);
         rw.item(item);
     }
-    let uses = rw.uses;
+    let Rewriter {
+        mut uses,
+        called,
+        bounds,
+        ..
+    } = rw;
+    uses.impls = impls_through_imports(root_items, extra, files, &called, &bounds);
 
     merge_extern_decls(root_items, extra, interner);
     uses
 }
 
-/// For each file and each of its imports, the method names an `impl` block defines in the imported
-/// module or in any module loaded through it (imports are followed transitively, cycles included).
-fn methods_through_imports(
+/// For each file and each of its imports, whether the imported module or any module loaded
+/// through it (imports are followed transitively, cycles included) holds an `impl` block the
+/// program needs: one defining a method named in `called`, or implementing a trait in `bounds`.
+/// Both sets are program-wide, and the trait names are the resolved (post-rewrite) symbols an
+/// `impl`'s trait path carries too. Over-approximating is the safe direction: a needed import
+/// reported unused would be a fix that breaks the build, an unneeded one kept is a missed lint.
+fn impls_through_imports(
     root_items: &[Item],
     extra: &[(usize, Item)],
     files: &[FileInfo],
-) -> Vec<Vec<FxHashSet<Symbol>>> {
-    let mut own: Vec<FxHashSet<Symbol>> = (0..files.len()).map(|_| FxHashSet::default()).collect();
+    called: &FxHashSet<Symbol>,
+    bounds: &FxHashSet<Symbol>,
+) -> Vec<Vec<bool>> {
+    let mut needed = vec![false; files.len()];
     let tagged = root_items
         .iter()
         .map(|item| (0usize, item))
         .chain(extra.iter().map(|(f, item)| (*f, item)));
     for (file, item) in tagged {
         if let ItemKind::Impl(imp) = &item.kind {
-            own[file].extend(imp.methods.iter().map(|m| m.name.sym));
+            let serves_a_call = imp.methods.iter().any(|m| called.contains(&m.name.sym));
+            let satisfies_a_bound = imp
+                .trait_ref
+                .as_ref()
+                .and_then(|t| t.segments.last())
+                .is_some_and(|t| bounds.contains(&t.sym));
+            needed[file] |= serves_a_call || satisfies_a_bound;
         }
     }
-    // The methods reachable from one file: its own and those of every file it loads.
-    let reach = |start: usize| -> FxHashSet<Symbol> {
+    // The root is loaded whatever any import says, so its own `impl`s never need one.
+    needed[0] = false;
+    // Whether file `importer`'s import of `start` loads a needed `impl`: one in `start` or in a
+    // file it loads, not counting `importer` itself (loaded already, by whatever loaded it).
+    // Skipping the importer is what keeps deleting every reported import at once safe: each edge
+    // of a shortest path from the root to a needed `impl` reaches it without re-entering its own
+    // importer, so none of them is reported.
+    let reaches = |importer: usize, start: usize| -> bool {
         let mut seen = vec![false; files.len()];
+        seen[importer] = true;
         let mut stack = vec![start];
-        let mut set = FxHashSet::default();
         while let Some(f) = stack.pop() {
             if std::mem::replace(&mut seen[f], true) {
                 continue;
             }
-            set.extend(own[f].iter().copied());
+            if needed[f] {
+                return true;
+            }
             stack.extend(files[f].imports.iter().filter_map(|d| d.target));
         }
-        set
+        false
     };
-    let closure: Vec<FxHashSet<Symbol>> = (0..files.len()).map(reach).collect();
     files
         .iter()
-        .map(|file| {
+        .enumerate()
+        .map(|(f, file)| {
             file.imports
                 .iter()
-                .map(|d| d.target.map(|t| closure[t].clone()).unwrap_or_default())
+                .map(|d| d.target.is_some_and(|t| reaches(f, t)))
                 .collect()
         })
         .collect()
@@ -526,10 +554,12 @@ struct Rewriter<'a> {
     files: &'a [FileInfo],
     exports: &'a [FxHashMap<Symbol, Export>],
     unmangled: &'a FxHashMap<Symbol, usize>,
-    /// Per file and import, the method names reachable through it ([`methods_through_imports`]).
-    provides: &'a [Vec<FxHashSet<Symbol>>],
     /// What each import was used for, so far.
     uses: ImportUse,
+    /// Every method name called anywhere in the program (`x.m(..)`, `T::m(..)`).
+    called: FxHashSet<Symbol>,
+    /// Every trait a generic parameter anywhere in the program is bounded by, as resolved.
+    bounds: FxHashSet<Symbol>,
     interner: &'a Interner,
     sink: &'a mut DiagnosticSink,
     /// Local bindings (parameters, `let`, `for` and pattern bindings), innermost scope last.
@@ -565,15 +595,11 @@ impl Rewriter<'_> {
         }
     }
 
-    /// A method named `m` is called in this file (`x.m(..)`, `T::m(..)`): every import through
-    /// which an `impl` defining a method of that name was loaded may be what provides it.
+    /// A method named `m` is called (`x.m(..)`, `T::m(..)`). Methods are program-wide, so every
+    /// import through which an `impl` defining a method of that name is loaded — in any file —
+    /// may be what provides it ([`impls_through_imports`]).
     fn method_called(&mut self, m: Symbol) {
-        let f = self.scope.file;
-        for (k, names) in self.provides[f].iter().enumerate() {
-            if names.contains(&m) {
-                self.uses.methods[f][k] = true;
-            }
-        }
+        self.called.insert(m);
     }
 
     fn ambiguous(&mut self, name: Ident, a: usize, b: usize, what: &str) {
@@ -778,6 +804,10 @@ impl Rewriter<'_> {
             // Trait bounds (`<T: Shape>`, `where T: Shape`) name traits, which are module items.
             for b in &mut g.bounds {
                 self.path(b);
+                // Satisfying the bound needs an `impl` of the trait somewhere in the program.
+                if let Some(t) = b.segments.last() {
+                    self.bounds.insert(t.sym);
+                }
             }
             if let GenericParamKind::Const { ty, .. } = &mut g.kind {
                 self.ty(ty);

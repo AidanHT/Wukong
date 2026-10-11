@@ -247,13 +247,17 @@ One lint is not found by `lints::run`: `W0008 unused_imports` needs to know whic
 came through, which only the import loader's module-scoped resolution knows — the merged program
 sema sees has one flat table of renamed symbols. `loader/resolve.rs` records, while it rewrites each
 file, the import every resolved name, qualifier and `{x, y}` selection went through (`ImportUse`),
-plus, per import, the method names the `impl` blocks of every module it loads define (a method is
-found through its receiver's type, but deleting the import deletes the method). `load_imports`
-returns a W0008 for every import nothing went through — in any file — with a machine-applicable
-deletion, and the driver adds them to the lint stage's findings unless the artifact is a library
-(`--emit=obj|llvm-ir`). Imported files' `import` items stay in the merged module (as the root's
-always did; nothing downstream reads them), which is what lets `apply_levels` honour an
-`@allow(unused_imports)` written on one.
+plus every method name called and every trait named as a bound anywhere in the program. An `impl`
+is found without a name, and sema's method table and trait-bound check are program-wide, so an
+import is also used when a module it loads (transitively, not counting its own importer, nor the
+always-loaded root) holds an `impl` defining a called method or implementing a bound trait
+(`impls_through_imports`) — whichever file the call or the bound is in. That keeps every edge of a
+shortest path from the root to a needed `impl`, so applying every W0008 fix at once is safe.
+`load_imports` returns a W0008 for every import nothing went through — in any file — with a
+machine-applicable deletion, and the driver adds them to the lint stage's findings unless the
+artifact is a library (`--emit=obj|llvm-ir`). Imported files' `import` items stay in the merged
+module (as the root's always did; nothing downstream reads them), which is what lets
+`apply_levels` honour an `@allow(unused_imports)` written on one.
 
 The parser contributes two lints of its own, `W0030` (a statement's missing `;`) and `W0031` (a
 line-leading `(`, `[` or touching `-` that continues the expression above), into a separate

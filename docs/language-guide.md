@@ -2120,11 +2120,14 @@ in `tests/run/` and `examples/` compiles warning-free (`corpus_is_warning_free`)
 
 **Unused imports.** `W0008` judges each file's imports with the same module-scoped resolution that
 decides what every name means: a local that shadows an imported name does not use the import, and
-of two imports of one module the second is the unused one. A method call keeps the import of a
-module whose `impl` defines that method (deleting the import would delete the method). It is
-reported in imported files too, and `@allow(unused_imports)` may be written on the `import` itself;
-`--emit=obj` and `--emit=llvm-ir` report none, since a library may import a module only for the
-functions it exports.
+of two imports of one module the second is the unused one. An `impl` is the one thing found
+without a name: a method is found through its receiver's type, and a trait bound is satisfied by an
+`impl` anywhere in the program. So an import is also kept when the module it loads (directly or
+through its own imports) holds an `impl` that defines a method called in any file, or implements a
+trait that any generic parameter is bounded by; deleting every reported import at once never
+changes what the program means. It is reported in imported files too, and
+`@allow(unused_imports)` may be written on the `import` itself; `--emit=obj` and `--emit=llvm-ir`
+report none, since a library may import a module only for the functions it exports.
 
 **Fixes as data.** Where the fix is mechanical a diagnostic carries it as a suggestion, rendered as
 a `help:` line and emitted in `--error-format=json`'s `suggestions` with an exact byte range and an

@@ -1,0 +1,6 @@
+// Loader unit-test fixture: a "prelude" that only loads ns_meth_ext.wk's `impl` for the files that
+// import it. Its own file calls no method, but an `impl` is program-wide: when ANY file calls
+// `twice`, this file's `import ns_meth_ext;` is what loads it, and it is not unused (W0008).
+module ns_meth_prelude
+
+import ns_meth_ext;
