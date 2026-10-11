@@ -45,6 +45,8 @@ mod methods;
 mod minmax;
 mod noalias;
 mod par_grain;
+#[cfg(test)]
+mod repr_tests;
 mod shape_ops;
 mod softmax_oop;
 mod tile;
@@ -2691,7 +2693,7 @@ fn parallel_spec<'a>(
     if param_tys.is_empty()
         || !param_tys
             .iter()
-            .all(|t| matches!(mir_ty(t), MirType::Array(..)))
+            .all(|t| matches!(mir_ty(t), Some(MirType::Array(..))))
     {
         return None;
     }
@@ -2742,8 +2744,8 @@ fn parallel_spec<'a>(
     if !start_scalar.is_int() || !end_scalar.is_int() {
         return None;
     }
-    let start_ty = mir_ty(&Ty::Scalar(*start_scalar));
-    let end_ty = mir_ty(&Ty::Scalar(*end_scalar));
+    let start_ty = MirType::from_scalar(*start_scalar);
+    let end_ty = MirType::from_scalar(*end_scalar);
     if mir_byte_size(&start_ty) > mir_byte_size(&end_ty) {
         return None;
     }
@@ -2772,6 +2774,7 @@ fn parallel_spec<'a>(
         preserve_aggregate_blocks: false,
         const_lengths: RefCell::default(),
         layout_error: Cell::new(false),
+        unrepresentable: RefCell::default(),
         sema,
         interner,
         diags: &mut proof_diags,
@@ -2794,7 +2797,8 @@ fn parallel_spec<'a>(
     for (p, ty) in f.params.iter().zip(&param_tys) {
         let base = proof.builder.add_param(MirType::Ptr);
         proof.param_arrays.push((base, ty.clone()));
-        proof.bind(p.name.sym, base, mir_ty(ty));
+        let slot_ty = proof.mir_ty_of(ty);
+        proof.bind(p.name.sym, base, slot_ty);
         noalias::record_param(&mut proof.builder, p, ty, base, interner);
     }
     // The mixed-radix proof needs a known iteration domain. An unknown bound conservatively
@@ -2839,6 +2843,7 @@ fn is_batched_norm_fn(
         preserve_aggregate_blocks: false,
         const_lengths: RefCell::default(),
         layout_error: Cell::new(false),
+        unrepresentable: RefCell::default(),
         sema,
         interner,
         diags: &mut diags,
@@ -2894,6 +2899,7 @@ fn is_bias_bcast_fn(
         preserve_aggregate_blocks: false,
         const_lengths: RefCell::default(),
         layout_error: Cell::new(false),
+        unrepresentable: RefCell::default(),
         sema,
         interner,
         diags: &mut diags,
@@ -2967,7 +2973,7 @@ fn lower_fn(
     let ret_mir = if ret_is_agg {
         MirType::Void
     } else {
-        mir_ty(&ret_ty)
+        ret_mir_ty(f, &ret_ty, sema, interner, diags)
     };
 
     let mut fl = FnLowerer {
@@ -2975,6 +2981,7 @@ fn lower_fn(
         preserve_aggregate_blocks: ret_mir.is_float() && gemm.unroll_for_autodiff,
         const_lengths: RefCell::default(),
         layout_error: Cell::new(false),
+        unrepresentable: RefCell::default(),
         sema,
         interner,
         diags,
@@ -3040,10 +3047,7 @@ fn lower_fn(
         // the "the value *is* the storage" branch below. As a `Ptr` the base pointer was copied into
         // an `alloca` and reloaded on **every** element access, which is why `Tensor[f32, M, N]` code
         // carried 3 extra loads per element over the `[f32; M*N]` spelling of the same buffer.
-        let mty = match tensor_buffer_mir(pty) {
-            Some((elem, n)) => MirType::Array(Box::new(elem), n), // = `param_slot_ty`, registry-aware
-            None => fl.mir_ty_of(pty),
-        };
+        let mty = fl.param_slot(pty);
         let is_slice = matches!(pty, Ty::Slice(_));
         if matches!(mty, MirType::Array(..)) {
             // The parameter value *is* the aggregate's base pointer; bind it directly so field/index
@@ -3131,6 +3135,43 @@ fn ty_is_aggregate(ty: &Ty, sema: &SemaResult) -> bool {
     }
 }
 
+/// The MIR type `f` returns a value of semantic type `ret` as, for a return that is not an
+/// aggregate (one of those is passed back through an sret pointer and the function returns
+/// `Void`; see `lower_fn`). Free-standing for the same reason as [`ty_is_aggregate`]: the builder,
+/// which needs it, does not exist yet. A C-style enum returns its `i32` discriminant. A return type
+/// with no machine representation (`Unknown`, a function type, `Error` — all refused upstream) is
+/// refused here as `C0001` instead of being returned as an `i32`; the placeholder never runs.
+fn ret_mir_ty(
+    f: &FnDecl,
+    ret: &Ty,
+    sema: &SemaResult,
+    interner: &Interner,
+    diags: &mut Vec<Diagnostic>,
+) -> MirType {
+    if let Some(t) = mir_ty(ret) {
+        return t;
+    }
+    if let Ty::Named(sym) = ret {
+        if matches!(
+            sema.defs.lookup(*sym).map(|d| &d.kind),
+            Some(DefKind::Enum(_))
+        ) && !enum_data_carrying(sema, *sym)
+        {
+            return MirType::I32;
+        }
+    }
+    let span = f.ret.as_ref().map_or(f.name.span, |t| t.span);
+    diags.push(
+        Diagnostic::error(format!(
+            "a return value of type `{}` is not yet supported by codegen",
+            ret.display(interner)
+        ))
+        .with_code("C0001")
+        .primary(span, "this return type has no machine representation"),
+    );
+    MirType::I32
+}
+
 /// Whether `sym` is a data-carrying (tagged-union) enum — free-fn form of
 /// [`FnLowerer::enum_is_data_carrying`], usable before the builder/lowerer exists (e.g. `lower_fn`'s
 /// sret-ABI decision keys on the return type via `ty_is_aggregate`).
@@ -3199,7 +3240,7 @@ fn lower_parallel(
             Ty::Unit,
         ),
     };
-    let ret_mir = mir_ty(&ret_ty);
+    let ret_mir = ret_mir_ty(f, &ret_ty, sema, interner, diags);
     let k = f.params.len();
 
     // ---- outlined body: par_sym(start, end, env) ----
@@ -3209,6 +3250,7 @@ fn lower_parallel(
             preserve_aggregate_blocks: false,
             const_lengths: RefCell::default(),
             layout_error: Cell::new(false),
+            unrepresentable: RefCell::default(),
             sema,
             interner,
             diags: &mut *diags,
@@ -3236,11 +3278,11 @@ fn lower_parallel(
         let env = fl.builder.add_param(MirType::Ptr);
         // Recover each array base pointer from env[k] and bind it to the parameter name.
         for (idx_k, (p, pty)) in f.params.iter().zip(&param_tys).enumerate() {
-            // `param_slot_ty`, not `mir_ty`: `base` here *is* the buffer's base pointer recovered
+            // `param_slot`, not `mir_ty_of`: `base` here *is* the buffer's base pointer recovered
             // from the env, and only an `Array(..)` binding makes a read of the name yield that
             // pointer. Bound as `Ptr`, a statically-shaped tensor param would instead `Load` through
             // it — reading the tensor's first 8 data bytes as an address.
-            let mty = param_slot_ty(pty);
+            let mty = fl.param_slot(pty);
             let kidx = fl
                 .builder
                 .build(MirType::I64, Op::ConstInt(idx_k as i128, MirType::I64));
@@ -3302,6 +3344,7 @@ fn lower_parallel(
             preserve_aggregate_blocks: ret_mir.is_float() && gemm.unroll_for_autodiff,
             const_lengths: RefCell::default(),
             layout_error: Cell::new(false),
+            unrepresentable: RefCell::default(),
             sema,
             interner,
             diags: &mut *diags,
@@ -3326,7 +3369,10 @@ fn lower_parallel(
         };
         let param_vals: Vec<ValueId> = param_tys
             .iter()
-            .map(|pty| fl.builder.add_param(param_abi_ty(pty)))
+            .map(|pty| {
+                let abi = fl.param_abi(pty);
+                fl.builder.add_param(abi)
+            })
             .collect();
         // One pointer per parameter, plus the trip-count slot's address when a grain applies.
         let env_len = k + usize::from(grain > 1);
@@ -4091,10 +4137,32 @@ const NORM_RMSNORM: i64 = 2; // out = x / sqrt(mean(x^2) + eps)
 const NORM_LOGSOFTMAX: i64 = 3; // out = (x - m) - log(sum(exp(x - m))) — stable log-softmax
 const NORM_L2NORM: i64 = 4; // out = x / sqrt(sum(x^2) + eps) — L2 / unit normalize (no mean divisor)
 
+/// A value [`FnLowerer`] needed storage for whose type has no MIR representation: what it is,
+/// where it was written (when known), and how to give it a type. Reported at `finish` as `C0001`.
+struct Unrepresentable {
+    what: String,
+    span: Option<Span>,
+    help: &'static str,
+}
+
+/// The `C0001` help for a value sema left untyped (`Ty::Unknown`).
+const HELP_ANNOTATE: &str = "annotate the binding with its type, e.g. `let x: f32;`";
+/// The `C0001` help for a value of a type parameter no call binds.
+const HELP_BIND_TYPE_PARAM: &str =
+    "use the type parameter in a parameter or the return type, so that each call binds it";
+/// The `C0001` help for a type sema should have rejected (a release build's refusal).
+const HELP_UNREACHABLE_TYPE: &str =
+    "the type checker accepted a type lowering cannot represent; this is a compiler bug";
+
 struct FnLowerer<'a> {
     builder: Builder,
     /// Layout failure discovered only after generic substitution; reported before publishing MIR.
     layout_error: Cell<bool>,
+    /// The first value this function needed storage for whose type has no MIR representation
+    /// (see [`FnLowerer::unrepresentable`]). Reported by [`FnLowerer::finish`] as `C0001`, so a
+    /// type no arm of `mir_ty_of` / `mir_ty_of_ann` classifies refuses the program instead of
+    /// getting a silently sized slot.
+    unrepresentable: RefCell<Option<Unrepresentable>>,
     /// Autodiff currently accepts only single-block functions returning a float scalar. Keep
     /// aggregate operations unrolled in every such function so introducing copy/zero loops does
     /// not remove an existing gradient candidate, including callers of the public grad API.
@@ -4197,7 +4265,80 @@ impl FnLowerer<'_> {
                 "instantiated aggregate layout is too large or unresolved: exceeds the 64-bit byte size or 32-bit byte-buffer representation"
             ).with_code("E0401"));
         }
+        // A value whose type has no MIR representation was given a placeholder slot; the program
+        // must not be published. One report names the type. When an error is already on record
+        // the build fails anyway, and the placeholder was usually asked for by the construct that
+        // error refused (`lower_call`'s zero for an unsupported call), so a second report about
+        // the same value would only be noise.
+        if let Some(u) = self.unrepresentable.take() {
+            if !self.diags.iter().any(Diagnostic::is_error) {
+                let d = Diagnostic::error(format!("{} is not yet supported by codegen", u.what))
+                    .with_code("C0001")
+                    .note(
+                        "lowering sizes every value's storage from its type, and this type has no \
+                         machine representation; it is refused rather than given an `i32` slot",
+                    )
+                    .help(u.help);
+                self.diags.push(match u.span {
+                    Some(span) => d.primary(span, "this value's storage cannot be sized"),
+                    None => d,
+                });
+            }
+        }
         self.builder.finish()
+    }
+
+    /// Record that a value (`what` describes it) needs storage but its type has no MIR
+    /// representation, and return a placeholder slot type. The function is refused at
+    /// [`Self::finish`] (`C0001`), so the placeholder never runs: it only keeps the builder total.
+    /// The first report wins; a later one that knows where the value was written supplies the span.
+    fn unrepresentable(&self, what: String, span: Option<Span>, help: &'static str) -> MirType {
+        let mut slot = self.unrepresentable.borrow_mut();
+        let replace = match &*slot {
+            None => true,
+            Some(old) => old.span.is_none() && span.is_some(),
+        };
+        if replace {
+            *slot = Some(Unrepresentable { what, span, help });
+        }
+        MirType::I32
+    }
+
+    /// [`Self::unrepresentable`] for a type sema rejects before lowering, so reaching it means an
+    /// upstream invariant broke: a debug build stops here. `mir_build`'s own unit tests drive these
+    /// arms on purpose (they cannot be reached from a program that checks clean), which is what the
+    /// `cfg!(test)` exemption is for; a release build refuses the program with `C0001`.
+    fn unreachable_type(&self, what: String, span: Option<Span>) -> MirType {
+        // A `debug_assert!` that `mir_build`'s own unit tests are exempt from.
+        if cfg!(debug_assertions) && !cfg!(test) {
+            panic!("sema let {what} reach MIR lowering");
+        }
+        self.unrepresentable(what, span, HELP_UNREACHABLE_TYPE)
+    }
+
+    /// [`Self::mir_ty_at`]'s refusal of `ty`: the user-reachable types are refused with a help that
+    /// says how to give the value a type; the rest are [`Self::unreachable_type`].
+    fn refuse_ty(&self, ty: &Ty, span: Option<Span>) -> MirType {
+        match ty {
+            Ty::Unknown => self.unrepresentable(
+                "a value whose type was never determined (`_`)".to_string(),
+                span,
+                HELP_ANNOTATE,
+            ),
+            // No item declares the name: a type parameter (see `named_storage`).
+            Ty::Named(g) if self.sema.defs.lookup(*g).is_none() => self.unrepresentable(
+                format!(
+                    "a value of the unbound type parameter `{}`",
+                    self.interner.resolve(*g)
+                ),
+                span,
+                HELP_BIND_TYPE_PARAM,
+            ),
+            _ => self.unreachable_type(
+                format!("a value of type `{}`", ty.display(self.interner)),
+                span,
+            ),
+        }
     }
 
     fn array_storage(&self, elem: MirType, len: u32) -> MirType {
@@ -4543,38 +4684,51 @@ impl FnLowerer<'_> {
                 }
             }
         }
-        self.mir_ty_of(&self.expr_ty(e))
+        self.mir_ty_at(&self.expr_ty(e), Some(e.span))
     }
 
     /// `mir_ty`, but resolves a named struct (`Ty::Named`) to its byte-buffer storage type using the
-    /// struct's field layout from sema (the free `mir_ty` has no def access and would fall back to
-    /// `I32`). A struct value, like a tuple, is a flat padded byte buffer addressed by field offset.
+    /// struct's field layout from sema (the free `mir_ty` has no def access and answers `None`).
+    /// A struct value, like a tuple, is a flat padded byte buffer addressed by field offset.
     /// Recurses through arrays and tuples so a *nested* struct (a struct field, or an element of an
-    /// array of structs) also resolves — `mir_ty` stops at the first `Named` and mis-sizes the rest.
+    /// array of structs) also resolves — `mir_ty` stops at the first `Named`.
+    ///
+    /// Every `Ty` form has an arm. A type with no machine representation is refused
+    /// ([`Self::unrepresentable`], `C0001`) — it used to share a `_ => I32` fallback that gave a
+    /// value of undetermined type, or of a type parameter no call binds, an `i32` slot.
     fn mir_ty_of(&self, ty: &Ty) -> MirType {
+        self.mir_ty_at(ty, None)
+    }
+
+    /// [`Self::mir_ty_of`] for a value written at `span`, which a refusal then points at.
+    fn mir_ty_at(&self, ty: &Ty, span: Option<Span>) -> MirType {
         // Resolve a monomorphized generic type parameter to its concrete instantiation first, so the
-        // param/return/local widths follow the instance's type instead of the `I32` default.
+        // param/return/local widths follow the instance's type.
         if !self.subst.is_empty() {
             if let Ty::Named(g) = ty {
                 if let Some(concrete) = self.subst.get(g) {
-                    return self.mir_ty_of(concrete);
+                    return self.mir_ty_at(concrete, span);
                 }
             }
         }
         match ty {
-            // A data-carrying enum is a discriminant + payload byte buffer (like a struct); a C-style
-            // (all-unit) enum falls through to `mir_ty` = its i32 discriminant scalar.
-            Ty::Named(sym) if self.enum_is_data_carrying(*sym) => {
-                let size = self.enum_layout(*sym).map(|(s, _, _)| s).unwrap_or(4);
-                MirType::Array(Box::new(MirType::I8), self.byte_buffer_len(Some(size)))
+            Ty::Scalar(s) => MirType::from_scalar(*s),
+            // A pointer, a reference and a tensor view are all one address.
+            Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Tensor { .. } => MirType::Ptr,
+            Ty::Vector { elem, lanes } => {
+                MirType::Vec(Box::new(MirType::from_scalar(*elem)), *lanes)
             }
-            Ty::Named(sym) => match self.struct_size(*sym) {
-                Some(size) => {
-                    MirType::Array(Box::new(MirType::I8), self.byte_buffer_len(Some(size)))
-                }
-                None => mir_ty(ty),
-            },
-            Ty::Array { elem, len, .. } => self.array_storage(self.mir_ty_of(elem), *len as u32),
+            Ty::Unit => MirType::Void,
+            // A data-carrying enum is a discriminant + payload byte buffer (like a struct). A
+            // payload whose layout does not resolve is a layout error, not a 4-byte guess.
+            Ty::Named(sym) if self.enum_is_data_carrying(*sym) => {
+                let size = self.enum_layout(*sym).map(|(s, _, _)| s);
+                MirType::Array(Box::new(MirType::I8), self.byte_buffer_len(size))
+            }
+            Ty::Named(sym) => self.named_storage(*sym, ty, span),
+            Ty::Array { elem, len, .. } => {
+                self.array_storage(self.mir_ty_at(elem, span), *len as u32)
+            }
             Ty::Tuple(_) => MirType::Array(
                 Box::new(MirType::I8),
                 self.byte_buffer_len(self.ty_size(ty)),
@@ -4582,7 +4736,36 @@ impl FnLowerer<'_> {
             // A slice is a fat-pointer aggregate `{ data: *T @ 0, len: i64 @ 8 }` — a 16-byte byte
             // buffer addressed by base pointer, like a 2-field struct.
             Ty::Slice(_) => MirType::Array(Box::new(MirType::I8), SLICE_SIZE as u32),
-            _ => mir_ty(ty),
+            // Sema leaves a value `Unknown` when it does not model it: a call it types leniently,
+            // or a use of a `let x;` that has neither an annotation nor an initializer. Its storage
+            // cannot be sized — the `i32` it used to get made `let mut x; x = 2.75;` hold `2`.
+            Ty::Unknown => self.refuse_ty(ty, span),
+            // A function value exists only as a function-typed parameter, which declares no MIR
+            // parameter (`methods::param_has_value`), and every other position is `E0411`. An
+            // `Error` type never survives sema: the driver stops on its diagnostic.
+            Ty::Fn { .. } | Ty::Error => self.refuse_ty(ty, span),
+        }
+    }
+
+    /// The storage of a `Ty::Named` that is not a data-carrying enum: a declared struct's byte
+    /// buffer, a C-style enum's `i32` discriminant — the one `Named` whose real representation is
+    /// `i32` — and nothing else.
+    fn named_storage(&self, sym: Symbol, ty: &Ty, span: Option<Span>) -> MirType {
+        match self.sema.defs.lookup(sym).map(|d| &d.kind) {
+            // A struct whose layout overflows or does not resolve is the same layout error an
+            // oversized byte buffer is (`E0401` at `finish`), never a scalar slot.
+            Some(DefKind::Struct(_)) => MirType::Array(
+                Box::new(MirType::I8),
+                self.byte_buffer_len(self.struct_size(sym)),
+            ),
+            Some(DefKind::Enum(_)) => MirType::I32,
+            // A name that declares nothing is, in a program that checks clean (an undeclared type
+            // name is `E0324`), a type parameter the monomorphizer has no binding for: one that
+            // appears in no parameter or return type (`fn g<U>(n: i32) { let y: U; .. }`), so no
+            // call instantiates it and the body lowers with it opaque. Sema accepts the program.
+            None => self.refuse_ty(ty, span),
+            // A function, a `const` or an undeclared name used as a type is `E0324` in sema.
+            _ => self.refuse_ty(ty, span),
         }
     }
 
@@ -4612,16 +4795,12 @@ impl FnLowerer<'_> {
                 let name = self.interner.resolve(sym);
                 if let Some(s) = wukong_types::Scalar::from_name(name) {
                     MirType::from_scalar(s)
-                } else if matches!(
-                    self.sema.defs.lookup(sym).map(|d| &d.kind),
-                    Some(DefKind::Struct(_))
-                ) || self.enum_is_data_carrying(sym)
-                {
-                    // A named struct or a data-carrying enum → its byte buffer (`mir_ty_of`). A C-style
-                    // enum falls to the `I32` default below (its value is the discriminant).
-                    self.mir_ty_of(&Ty::Named(sym))
                 } else {
-                    MirType::I32
+                    // Every other name is a nominal type, sized exactly as a value of it is: a
+                    // struct or a data-carrying enum is its byte buffer, a C-style enum its `i32`
+                    // discriminant, and a type parameter no call binds is refused (`C0001`) — the
+                    // `I32` this arm used to answer for any name it did not recognize.
+                    self.mir_ty_at(&Ty::Named(sym), Some(t.span))
                 }
             }
             Array { elem, len, .. } => match self.const_array_len_expr(len) {
@@ -4640,7 +4819,32 @@ impl FnLowerer<'_> {
             Pointer { .. } | Ref { .. } | Tensor { .. } => MirType::Ptr,
             Vector { elem, lanes } => MirType::Vec(Box::new(self.mir_ty_of_ann(elem)), *lanes),
             Unit => MirType::Void,
-            _ => MirType::I32,
+            // An integer is a dimension (`f::<512>`), never the type of a value: `E0324`.
+            Int(n) => self.unreachable_type(
+                format!(
+                    "a value of the dimension `{}` written as a type",
+                    self.interner.resolve(*n)
+                ),
+                Some(t.span),
+            ),
+            // A function type is only a parameter's type, and a parameter is not annotated
+            // through here; a local, field, element or return of one is `E0411`.
+            Fn { .. } => {
+                self.unreachable_type("a value of function type".to_string(), Some(t.span))
+            }
+            // Type arguments belong to a type alias, which the driver expands before sema; any
+            // other `Name<..>` is `E0327` there (`E0324` when the name is no type at all).
+            Generic { path, .. } => self.unreachable_type(
+                format!(
+                    "a value of the unexpanded generic type `{}<..>`",
+                    path.segments
+                        .iter()
+                        .map(|s| self.interner.resolve(s.sym))
+                        .collect::<Vec<_>>()
+                        .join("::")
+                ),
+                Some(t.span),
+            ),
         }
     }
 
@@ -4735,12 +4939,35 @@ impl FnLowerer<'_> {
     }
 
     /// The ABI type of a parameter of semantic type `ty`: an aggregate (array/tuple/struct, whose
-    /// `mir_ty_of` is an `Array` byte buffer) is passed by base **pointer**; a scalar by value. The
-    /// registry-aware companion to the free `param_abi_ty` (which mistypes a named struct as `I32`).
+    /// `mir_ty_of` is an `Array` byte buffer) is passed by base **pointer**; a scalar by value.
+    /// Registry-aware, so a struct parameter is a pointer and an array of structs strides by the
+    /// struct (the free `param_abi_ty` this replaced typed both from an `i32` guess).
     fn param_abi(&self, ty: &Ty) -> MirType {
         match self.mir_ty_of(ty) {
             MirType::Array(..) => MirType::Ptr,
             t => t,
+        }
+    }
+
+    /// The MIR type a parameter's **binding** carries — `mir_ty_of`, except that a
+    /// statically-shaped contiguous tensor binds as the buffer it is (`[T; d0·…·dn]`) rather than
+    /// an opaque `Ptr`. Only the `Array(..)` shape takes the "the value *is* the storage" branch at
+    /// every binding site, so this is what stops a tensor parameter being spilled to a stack slot
+    /// and reloaded per element. The **call ABI is unaffected** — [`Self::param_abi`] maps
+    /// `Array(..)` straight back to `Ptr`.
+    ///
+    /// A `[]T` slice's slot *is* its 16-byte fat-pointer buffer (`mir_ty_of`'s answer). A `Ptr`
+    /// slot would spill the incoming pointer into an `alloca ptr`; the single `Load` that reads it
+    /// back then yields the fat pointer's own ADDRESS, and `kernel_base_ptr` — which loads exactly
+    /// once — hands that to the kernel as the data base. The kernel reads the 16-byte header as
+    /// elements and the program prints zeros on both backends at every `-O` level (see LANDMINE 1
+    /// in this crate's CLAUDE.md). Scalar indexing is unaffected either way: `place_base_ptr`
+    /// recovers the fat-pointer address under both bindings, which is why the defect was visible
+    /// only through a recognized kernel.
+    fn param_slot(&self, ty: &Ty) -> MirType {
+        match tensor_buffer_mir(ty) {
+            Some((elem, n)) => MirType::Array(Box::new(elem), n),
+            None => self.mir_ty_of(ty),
         }
     }
 
@@ -9883,7 +10110,15 @@ impl FnLowerer<'_> {
                     // instantiation instead of the `I32` default (an ICE / -O0≠-O2 divergence).
                     (Some(t), _) => self.mir_ty_of_ann(t),
                     (None, Some(e)) => self.expr_mir(e),
-                    (None, None) => MirType::I32,
+                    // `let x;` with neither an annotation nor an initializer: sema gives the
+                    // binding no type (its first assignment does not decide one), so its storage
+                    // cannot be sized. It used to get an `i32` slot, and `let mut x; x = 2.75;`
+                    // printed `2` on both backends.
+                    (None, None) => self.unrepresentable(
+                        "a `let` with neither a type annotation nor an initializer".to_string(),
+                        Some(s.span),
+                        HELP_ANNOTATE,
+                    ),
                 };
                 let is_shared = ty
                     .as_ref()
@@ -15157,6 +15392,7 @@ impl FnLowerer<'_> {
                 preserve_aggregate_blocks: false,
                 const_lengths: RefCell::default(),
                 layout_error: Cell::new(false),
+                unrepresentable: RefCell::default(),
                 sema: self.sema,
                 interner: self.interner,
                 diags: &mut tmp_diags,
@@ -17860,7 +18096,9 @@ impl FnLowerer<'_> {
     /// parameter — and a `[]T` view `let` — as storage that may alias.
     fn array_elem(&self, base: &Expr) -> Option<MirType> {
         match self.expr_ty(base) {
-            Ty::Array { elem, .. } => Some(mir_ty(&elem)),
+            // An element the structure alone does not size (a struct, an enum) is not a stream
+            // element: `mir_ty` answers `None` and the loop is not vectorized.
+            Ty::Array { elem, .. } => mir_ty(&elem),
             // A contiguous tensor *is* an array of its element type — the same buffer with a shape
             // attached — so a loop over it is exactly as vectorizable as the `[T; N]` spelling
             // (`tindex` normalizes `a[i, j]` to the single-index form analysed here). A statically
@@ -17882,7 +18120,7 @@ impl FnLowerer<'_> {
             // A `[]T` slice: the data pointer is the fat pointer's first word.
             Ty::Slice(elem) => {
                 self.lookup(single_path(base)?)?;
-                Some(mir_ty(&elem))
+                mir_ty(&elem)
             }
             _ => None,
         }
@@ -20519,7 +20757,7 @@ impl FnLowerer<'_> {
                 strides[k] = strides[k + 1] * extents[k + 1];
             }
         }
-        Some((strides, mir_ty(&Ty::Scalar(elem))))
+        Some((strides, MirType::from_scalar(elem)))
     }
 
     /// Lower an index expression and widen it to `I64` before pointer arithmetic. MIR integer
@@ -20638,7 +20876,7 @@ impl FnLowerer<'_> {
         if rank == 0 || rank != indices.len() {
             return None;
         }
-        let elem_mir = mir_ty(&Ty::Scalar(elem));
+        let elem_mir = MirType::from_scalar(elem);
         let base_ptr = self.lower_expr(base);
         let mut strides: Vec<Option<ValueId>> = vec![None; rank];
         if matches!(layout, wukong_types::Layout::ColMajor) {
@@ -24967,37 +25205,6 @@ fn tensor_buffer_mir(ty: &Ty) -> Option<(MirType, u32)> {
     Some((MirType::from_scalar(*elem), n))
 }
 
-/// The MIR type a parameter's **binding** carries — `mir_ty`, except that a statically-shaped
-/// contiguous tensor binds as the buffer it is (`[T; d0·…·dn]`) rather than an opaque `Ptr`. Only
-/// the `Array(..)` shape takes the "the value *is* the storage" branch at every binding site, so
-/// this is what stops a tensor parameter being spilled to a stack slot and reloaded per element.
-/// The **call ABI is unaffected** — `param_abi_ty` maps `Array(..)` straight back to `Ptr`.
-fn param_slot_ty(ty: &Ty) -> MirType {
-    // A `[]T` slice's slot *is* its 16-byte fat-pointer buffer, exactly as the registry-aware
-    // `mir_ty_of` types it. `mir_ty` alone would say `Ptr`, which spills the incoming pointer into
-    // an `alloca ptr`; the single `Load` that reads it back then yields the fat pointer's own
-    // ADDRESS, and `kernel_base_ptr` — which loads exactly once — hands that to the kernel as the
-    // data base. The kernel reads the 16-byte header as elements and the program prints zeros on
-    // both backends at every `-O` level (see LANDMINE 1 in this crate's CLAUDE.md). Scalar
-    // indexing is unaffected either way: `place_base_ptr` recovers the fat-pointer address under
-    // both bindings, which is why the defect was visible only through a recognized kernel.
-    match tensor_buffer_mir(ty) {
-        Some((elem, n)) => MirType::Array(Box::new(elem), n),
-        None if matches!(ty, Ty::Slice(_)) => {
-            MirType::Array(Box::new(MirType::I8), SLICE_SIZE as u32)
-        }
-        None => mir_ty(ty),
-    }
-}
-
-/// The MIR type a parameter is passed as at the call boundary. Arrays decay to a base pointer.
-fn param_abi_ty(ty: &Ty) -> MirType {
-    match mir_ty(ty) {
-        MirType::Array(..) => MirType::Ptr,
-        t => t,
-    }
-}
-
 /// Round `x` up to the next multiple of `align` (a power of two) — field-offset padding, mirroring
 /// the private `round_up` in `wukong_types` (the registry-aware aggregate layout reimplements the
 /// same accumulation here because it must resolve named-struct field sizes the leaf crate can't).
@@ -25050,19 +25257,31 @@ fn mir_byte_align(t: &MirType) -> u64 {
     }
 }
 
-fn mir_ty(ty: &Ty) -> MirType {
-    match ty {
+/// The MIR type of `ty` from its structure alone — the registry-blind half of
+/// [`FnLowerer::mir_ty_of`], for the signature and predicate sites that have no lowerer.
+///
+/// `None` when the structure does not decide it: a `Ty::Named` (struct, enum or type parameter —
+/// only the registry knows which, and a C-style enum's `i32` is the registry's answer), an array
+/// or tuple whose layout depends on one or does not fit, and `Fn`/`Unknown`/`Error`, which have no
+/// machine representation at all. There is no `_ => I32` arm: it used to answer `i32` for every
+/// one of these, so a caller that sized storage from it got a silently wrong slot. A caller that
+/// sizes storage from `None` refuses; one that only asks a question hears "no".
+fn mir_ty(ty: &Ty) -> Option<MirType> {
+    Some(match ty {
         Ty::Scalar(s) => MirType::from_scalar(*s),
-        Ty::Array { elem, len, .. } => MirType::Array(Box::new(mir_ty(elem)), *len as u32),
+        Ty::Array { elem, len, .. } => {
+            MirType::Array(Box::new(mir_ty(elem)?), u32::try_from(*len).ok()?)
+        }
         Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Tensor { .. } | Ty::Slice(_) => MirType::Ptr,
         Ty::Vector { elem, lanes } => MirType::Vec(Box::new(MirType::from_scalar(*elem)), *lanes),
         Ty::Unit => MirType::Void,
-        // A tuple (and any other aggregate) is a flat byte buffer; its local *value* is the base
-        // pointer (like an array), and field access GEPs to a padded byte offset. `tuple_offsets`
-        // is the layout authority. Falls back to a 0-byte buffer for an unsized field (never read).
-        Ty::Tuple(_) => MirType::Array(Box::new(MirType::I8), ty.size_of().unwrap_or(0) as u32),
-        _ => MirType::I32,
-    }
+        // A tuple is a flat byte buffer; its local *value* is the base pointer (like an array),
+        // and field access GEPs to a padded byte offset (`tuple_offsets` is the layout authority).
+        // A tuple with a field the structure cannot size has no answer here (it used to be a
+        // 0-byte buffer).
+        Ty::Tuple(_) => MirType::Array(Box::new(MirType::I8), u32::try_from(ty.size_of()?).ok()?),
+        Ty::Named(_) | Ty::Fn { .. } | Ty::Unknown | Ty::Error => return None,
+    })
 }
 
 /// Is `t` an `f32` buffer — the only operand kind `wukong_attention_f32` can be handed? Returns the
@@ -26290,7 +26509,7 @@ fn is_float_zero(e: &Expr, interner: &Interner) -> bool {
 
 /// Is `e`'s sema type `f32`? (matmul lowering is f32-only — that's what `wukong_sgemm` computes.)
 fn is_f32_expr(e: &Expr, sema: &SemaResult) -> bool {
-    matches!(sema.types.get(&e.id), Some(t) if mir_ty(t) == MirType::F32)
+    matches!(sema.types.get(&e.id), Some(t) if mir_ty(t) == Some(MirType::F32))
 }
 
 /// `for col in 0..n { c[row*stride + col] = 0.0; }` (or the 2-index `c[row, col] = 0.0`) — the per-row
@@ -27607,7 +27826,7 @@ fn match_matmul_i8_nt(
         _ => return None,
     };
     // The product must be i32 (the casts widen to i32; the accumulation matches the kernel's i32).
-    if !matches!(sema.types.get(&prod.id), Some(t) if mir_ty(t) == MirType::I32) {
+    if !matches!(sema.types.get(&prod.id), Some(t) if mir_ty(t) == Some(MirType::I32)) {
         return None;
     }
     let ExprKind::Binary {
@@ -27816,7 +28035,7 @@ fn match_matmul_lowp(
         _ => return None,
     };
     // The product (hence the accumulator) must be f32 — the mixed-precision contract.
-    if !matches!(sema.types.get(&prod.id), Some(t) if mir_ty(t) == MirType::F32) {
+    if !matches!(sema.types.get(&prod.id), Some(t) if mir_ty(t) == Some(MirType::F32)) {
         return None;
     }
     let ExprKind::Binary {
@@ -29196,12 +29415,13 @@ fn lower_matmul_fn(
         Some(DefKind::Fn(sig)) => (sig.params.clone(), sig.ret.clone()),
         _ => (f.params.iter().map(|_| Ty::Unknown).collect(), Ty::Unit),
     };
-    let ret_mir = mir_ty(&ret_ty);
+    let ret_mir = ret_mir_ty(f, &ret_ty, sema, interner, diags);
     let mut fl = FnLowerer {
         builder: Builder::new(f.name.sym, ret_mir.clone()),
         preserve_aggregate_blocks: ret_mir.is_float() && gemm.unroll_for_autodiff,
         const_lengths: RefCell::default(),
         layout_error: Cell::new(false),
+        unrepresentable: RefCell::default(),
         sema,
         interner,
         diags,
@@ -29231,7 +29451,10 @@ fn lower_matmul_fn(
     fl.bind_dim_params(&param_tys);
     let param_vals: Vec<ValueId> = param_tys
         .iter()
-        .map(|pty| fl.builder.add_param(param_abi_ty(pty)))
+        .map(|pty| {
+            let abi = fl.param_abi(pty);
+            fl.builder.add_param(abi)
+        })
         .collect();
     for ((p, pty), val) in f.params.iter().zip(&param_tys).zip(param_vals) {
         // Mirrors `lower_fn`: this wrapper IS the function's MIR, so a `@noalias` promise must ride
@@ -29243,14 +29466,14 @@ fn lower_matmul_fn(
             fl.param_arrays.push((val, pty.clone()));
         }
         noalias::record_param(&mut fl.builder, p, pty, val, interner);
-        // `param_slot_ty`: a statically-shaped tensor param binds as its buffer, so it is not
+        // `param_slot`: a statically-shaped tensor param binds as its buffer, so it is not
         // spilled to a `ptr` slot the kernel wrapper never reads (dead alloca+store that survived
         // into every caller that inlined this wrapper). A `[]T` slice binds as its fat-pointer
         // buffer for the same reason, and must go through `bind_slice` so `kernel_base_ptr` knows
         // to load the data pointer out of it — this wrapper's whole body IS a kernel call, so
         // binding with plain `bind` handed `wukong_sgemm_nt` the fat pointer itself.
         let is_slice = matches!(pty, Ty::Slice(_));
-        let mty = param_slot_ty(pty);
+        let mty = fl.param_slot(pty);
         if matches!(mty, MirType::Array(..)) {
             fl.bind_slice(p.name.sym, val, mty, is_slice);
             // Mirrors `lower_fn`: a struct parameter's buffer fields are kernel operands too, and
@@ -30926,6 +31149,7 @@ fn xent_bwd_fn(
         preserve_aggregate_blocks: false,
         const_lengths: RefCell::default(),
         layout_error: Cell::new(false),
+        unrepresentable: RefCell::default(),
         sema,
         interner,
         diags: &mut diags,
@@ -30976,6 +31200,7 @@ fn xent_fn(
         preserve_aggregate_blocks: false,
         const_lengths: RefCell::default(),
         layout_error: Cell::new(false),
+        unrepresentable: RefCell::default(),
         sema,
         interner,
         diags: &mut diags,
@@ -31034,6 +31259,7 @@ fn logsumexp_fn(
         preserve_aggregate_blocks: false,
         const_lengths: RefCell::default(),
         layout_error: Cell::new(false),
+        unrepresentable: RefCell::default(),
         sema,
         interner,
         diags: &mut diags,
@@ -31180,6 +31406,7 @@ fn probe_single_for(
         preserve_aggregate_blocks: false,
         const_lengths: RefCell::default(),
         layout_error: Cell::new(false),
+        unrepresentable: RefCell::default(),
         sema,
         interner,
         diags: &mut diags,
@@ -32207,12 +32434,13 @@ fn lower_i8matmul_fn(
         Some(DefKind::Fn(sig)) => (sig.params.clone(), sig.ret.clone()),
         _ => (f.params.iter().map(|_| Ty::Unknown).collect(), Ty::Unit),
     };
-    let ret_mir = mir_ty(&ret_ty);
+    let ret_mir = ret_mir_ty(f, &ret_ty, sema, interner, diags);
     let mut fl = FnLowerer {
         builder: Builder::new(f.name.sym, ret_mir.clone()),
         preserve_aggregate_blocks: ret_mir.is_float() && gemm.unroll_for_autodiff,
         const_lengths: RefCell::default(),
         layout_error: Cell::new(false),
+        unrepresentable: RefCell::default(),
         sema,
         interner,
         diags,
@@ -32239,7 +32467,10 @@ fn lower_i8matmul_fn(
     fl.bind_dim_params(&param_tys);
     let param_vals: Vec<ValueId> = param_tys
         .iter()
-        .map(|pty| fl.builder.add_param(param_abi_ty(pty)))
+        .map(|pty| {
+            let abi = fl.param_abi(pty);
+            fl.builder.add_param(abi)
+        })
         .collect();
     for ((p, pty), val) in f.params.iter().zip(&param_tys).zip(param_vals) {
         // The int8 twin of `lower_matmul_fn`'s `@noalias` record — same reasoning.
@@ -32247,13 +32478,13 @@ fn lower_i8matmul_fn(
             fl.param_arrays.push((val, pty.clone()));
         }
         noalias::record_param(&mut fl.builder, p, pty, val, interner);
-        // `param_slot_ty`: a statically-shaped tensor param binds as its buffer, so it is not
+        // `param_slot`: a statically-shaped tensor param binds as its buffer, so it is not
         // spilled to a `ptr` slot the kernel wrapper never reads (dead alloca+store that survived
         // into every caller that inlined this wrapper). A `[]T` slice binds as its fat-pointer
         // buffer for the same reason, and must go through `bind_slice` so `kernel_base_ptr` knows
         // to load the data pointer out of it — the int8 twin of the `lower_matmul_fn` defect.
         let is_slice = matches!(pty, Ty::Slice(_));
-        let mty = param_slot_ty(pty);
+        let mty = fl.param_slot(pty);
         if matches!(mty, MirType::Array(..)) {
             fl.bind_slice(p.name.sym, val, mty, is_slice);
             // The int8 twin of the `lower_matmul_fn` record — same reasoning.
