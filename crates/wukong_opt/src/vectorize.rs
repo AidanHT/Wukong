@@ -2616,9 +2616,12 @@ fn defined_in_block(f: &Function, b: BlockId, v: ValueId) -> bool {
 /// * a **fixed-extent buffer parameter** — a `[T; N]` array or a statically-shaped tensor, whose
 ///   extent the front end records on the MIR parameter ([`wukong_mir::ParamExtent`], counted in
 ///   scalar leaves) — under the same constant-range test, when the element read is a scalar of the
-///   recorded width. The extent is a type fact: a call whose argument has a different length does
-///   not compile (`E0501`), and no view reinterprets a buffer, so the pointer really does address
-///   `N` leaves for the whole call;
+///   recorded width. The extent is the declared type's contract, and no view reinterprets a
+///   buffer, so the pointer addresses at least `N` leaves for the whole call. The front end checks
+///   the contract where the argument's extent is known (another constant length is `E0501`), but a
+///   `?` (run-time) extent binds a fixed one unchecked, and a shorter buffer bound that way is
+///   outside the defined contract (`docs/language-guide.md`, "Extents") — here `-O2` may read past
+///   it where `-O0` happened to stop in time;
 /// * a **`[]T` slice whose loop runs to its own length** — `end` is `load i64 (hdr + 8)`, the
 ///   fat pointer's length field, and the data is re-read from the same `hdr` — with `c <= 0` and a
 ///   constant `start + c >= 0`: every element below the length exists.

@@ -51,6 +51,12 @@ All notable changes to Wukong are documented here. The format is loosely based o
   run, through a `select` on `n_vec != 0` under a runtime trip, and a search loop declines it. The
   zero-trip loop still widens. Over `tests/run`, `examples` and `bench/kernels` no other loop changes
   its widening decision.
+- **Docs: a fixed parameter extent is a contract, not a checked fact.** `ParamAttrs::extent` and
+  `docs/internals.md` said that a call with another length is `E0501`. That holds for a constant
+  length, but a `?` argument binds a fixed extent with no check, so a short buffer reaches the
+  search-loop speculation. The language guide (Extents), the roadmap's sharp edges and the code docs
+  now say that the caller promises at least the declared extent. A shorter buffer is outside the
+  defined contract, where `-O2` may read past it. No behavior changes.
 
 ### Index-recording reductions (`gap3/vec-argmax`)
 

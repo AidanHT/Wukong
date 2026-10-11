@@ -560,8 +560,11 @@ stack array `[T; N]` with constant endpoints inside it, a `[T; N]` or static-sha
 **parameter** under the same constant-range test, or a `[]T` slice searched up to its own length. A
 fixed-extent buffer parameter carries its extent into MIR as `ParamAttrs::extent` (scalar-leaf count
 and leaf width — the unit both the slot-indexed interpreter and the byte-addressed native backend
-agree on); it is a type fact, not a promise, since a call with another length is `E0501` and no view
-reinterprets a buffer. A runtime bound, or any other pointer, keeps the search scalar.
+agree on). It is the declared type's contract, and no view reinterprets a buffer: another constant
+length is `E0501`, but a `?` (run-time) extent binds a fixed one unchecked, so a shorter buffer bound
+that way is outside the defined contract (the language guide's rule for every run-time size) — and
+there `-O2` may read up to `W - 1` elements past where `-O0` stopped. A runtime bound, or any other
+pointer, keeps the search scalar.
 
 **Predicated arms**: if-conversion runs both arms for every lane, so an access only one arm makes
 cannot simply be widened. A store only one arm makes (`PredStore`) and a load no unconditional

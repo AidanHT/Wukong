@@ -172,12 +172,16 @@ pub struct ParamAttrs {
     /// `0 as *T` is null.
     pub slice: bool,
     /// The parameter is a fixed-extent buffer — a `[T; N]` array (nested arrays included) or a
-    /// statically-shaped contiguous tensor of scalar `T` — so its value points at exactly
-    /// `elems` scalars of `elem_bytes` bytes each, live for the whole call. Unlike the two flags
-    /// above this is not a promise but a type fact: the front end rejects a call whose argument's
-    /// extent differs (`E0501`), and Wukong has no reinterpreting view. Recorded independently of
-    /// `@noalias`; `None` for every other parameter. The vectorizer reads it to run a search loop's
-    /// test ahead of the scalar loop over a parameter array (`wukong_opt::vectorize`).
+    /// statically-shaped contiguous tensor of scalar `T` — so its value points at (at least)
+    /// `elems` scalars of `elem_bytes` bytes each, live for the whole call. This is the contract of
+    /// the parameter's declared type, and it is checked only where the argument's extent is known:
+    /// an argument of another constant length is `E0501`, but a `?` (run-time) extent binds a
+    /// fixed one unchecked, so a shorter buffer bound that way is outside the defined contract —
+    /// the guide's rule for every run-time size (`docs/language-guide.md`, "Extents"). Wukong has
+    /// no reinterpreting view. Recorded independently of `@noalias`; `None` for every other
+    /// parameter. The vectorizer reads it to run a search loop's test ahead of the scalar loop over
+    /// a parameter array (`wukong_opt::vectorize`), reading up to `W - 1` elements past the
+    /// scalar loop's exit but never past `elems`.
     pub extent: Option<ParamExtent>,
 }
 

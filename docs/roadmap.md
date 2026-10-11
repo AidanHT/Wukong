@@ -1307,6 +1307,16 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
 
 ## Known limitations / sharp edges
 
+- **A `?` argument binds a fixed-extent parameter unchecked.** `fn find(x: [f32; 37])` called with a
+  `Tensor[f32, ?]` (or an array that decayed to one) compiles with no diagnostic and no run-time
+  length test, though the buffer may be shorter; only another constant length is `E0501`. A shorter
+  buffer is outside the defined contract, like every wrong run-time size, and the optimizer may read
+  up to the declared extent (`ParamAttrs::extent`: the vectorizer runs a search loop's test a group
+  ahead of the scalar loop over such a parameter). So a 10-element buffer searched by a `[f32; 37]`
+  function stops at its hit at `-O0` but reads past its end at `-O2` ("vector load out of bounds" in
+  the interpreter). A run-time length assertion where a `?` extent meets a fixed one would close the
+  gap. The extent is already in hand there, since a `?` axis travels as a hidden argument.
+
 - **Fast-mode float results depend on how a reduction is compiled.** Under the default `--fp=fast`
   an `f32` reduction is evaluated on one of three trees — the source fold (a loop nothing
   vectorizes), the sequential vectorizer's lane partition, or the `@parallel` kernel's fixed
