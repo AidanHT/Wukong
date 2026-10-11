@@ -33,8 +33,6 @@
 //! reference exactly (`assert_eq!` on the bits, not a tolerance). The interpreter marshals the serial
 //! form, so the differential oracle stays exact with no documented exception.
 
-use rayon::prelude::*;
-
 /// Scan one row in place along time: `h ← a[t]·h + b[t]; out[t] ← h` for `t = 0..cols`, with `h` starting
 /// at `0.0` and carried in a register. The tail helper (rows the 4-wide block doesn't cover) and the
 /// building block the interleaved scan reduces to.
@@ -116,6 +114,24 @@ pub unsafe extern "C" fn wukong_lrscan_f32(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(a, rows, cols);
+        crate::safety::debug_extent_2d(b, rows, cols);
+        crate::safety::debug_extent_2d(out, rows, cols);
+        crate::safety::debug_inplace_or_disjoint(
+            out,
+            rows.saturating_mul(cols),
+            a,
+            rows.saturating_mul(cols),
+        );
+        crate::safety::debug_inplace_or_disjoint(
+            out,
+            rows.saturating_mul(cols),
+            b,
+            rows.saturating_mul(cols),
+        );
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -142,6 +158,24 @@ pub unsafe extern "C" fn wukong_lrscan_f32_parallel(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(a, rows, cols);
+        crate::safety::debug_extent_2d(b, rows, cols);
+        crate::safety::debug_extent_2d(out, rows, cols);
+        crate::safety::debug_inplace_or_disjoint(
+            out,
+            rows.saturating_mul(cols),
+            a,
+            rows.saturating_mul(cols),
+        );
+        crate::safety::debug_inplace_or_disjoint(
+            out,
+            rows.saturating_mul(cols),
+            b,
+            rows.saturating_mul(cols),
+        );
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -163,7 +197,7 @@ pub unsafe extern "C" fn wukong_lrscan_f32_parallel(
     let nthreads = rayon::current_num_threads().max(1);
     let per = rows.div_ceil(nthreads).max(1);
     let nchunks = rows.div_ceil(per);
-    (0..nchunks).into_par_iter().for_each(|c| {
+    crate::par::for_each_unit(nchunks, |c| {
         let r0 = c * per;
         let r1 = (r0 + per).min(rows);
         // SAFETY: rows [r0, r1) are disjoint across chunks; pointers re-derived from captured addresses.

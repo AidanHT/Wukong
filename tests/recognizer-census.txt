@@ -349,6 +349,7 @@ parallel_divmod_tiling.wk: wukong_parallel_for wukong_sgemm_nt wukong_sgemm_nt*2
 parallel_grain.wk: wukong_parallel_for wukong_parallel_for*2
 parallel_head_loop.wk: wukong_parallel_for wukong_sgemm_nt wukong_sgemm_nt*2 wukong_velem_f32_parallel
 parallel_head_ragged.wk: wukong_parallel_for wukong_sgemm_nt wukong_sgemm_nt*2 wukong_velem_f32_parallel
+parallel_implicit_grain.wk: wukong_parallel_for wukong_parallel_for*2
 parallel_lowp.wk: wukong_axpby_f16 wukong_parallel_for wukong_parallel_for*2 wukong_vmath_bf16
 parallel_reduce.wk: wukong_sreduce_f32_parallel wukong_sreduce_f32_parallel*3
 parallel_reduce_elem_bf16.wk:

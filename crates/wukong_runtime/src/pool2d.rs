@@ -441,7 +441,6 @@ unsafe fn pool2d_parallel(
     let (khu, kwu, shu, swu) = (kh as usize, kw as usize, sh as usize, sw as usize);
     let in_plane = hh * ww;
     let out_plane = oh * ow;
-    use rayon::prelude::*;
     let (x_addr, out_addr) = (x as usize, out as usize);
     // This fork can be the process's FIRST rayon touch, so it must provision the global pool first —
     // [`crate::ensure_global_pool`]'s stated precondition. Forking bare builds rayon's default
@@ -449,7 +448,7 @@ unsafe fn pool2d_parallel(
     // outlined `@parallel` region bodies are left on undersized stacks. Idempotent (`Once`) and
     // provisioning-only: the work split below is unchanged, so serial == parallel stays bit-exact.
     crate::ensure_global_pool();
-    (0..c_n).into_par_iter().for_each(|c| {
+    crate::par::for_each_unit(c_n, |c| {
         // SAFETY: disjoint output plane per channel; pointers re-derived from the captured addresses.
         unsafe {
             pool_channel(
@@ -489,6 +488,20 @@ pub unsafe extern "C" fn wukong_maxpool2d_f32(
     sh: i64,
     sw: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && channels > 0 {
+        if let Some((oh, ow)) = pool2d_output_dims(h, w, kh, kw, sh, sw) {
+            let (in_n, out_n) = (h.saturating_mul(w), (oh as i64).saturating_mul(ow as i64));
+            crate::safety::debug_extent_2d(x, channels, in_n);
+            crate::safety::debug_extent_2d(out, channels, out_n);
+            crate::safety::debug_disjoint(
+                out,
+                channels.saturating_mul(out_n),
+                x,
+                channels.saturating_mul(in_n),
+            );
+        }
+    }
     pool2d_serial(x, out, channels, h, w, kh, kw, sh, sw, PoolKind::Max);
 }
 
@@ -512,6 +525,20 @@ pub unsafe extern "C" fn wukong_maxpool2d_f32_parallel(
     sh: i64,
     sw: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && channels > 0 {
+        if let Some((oh, ow)) = pool2d_output_dims(h, w, kh, kw, sh, sw) {
+            let (in_n, out_n) = (h.saturating_mul(w), (oh as i64).saturating_mul(ow as i64));
+            crate::safety::debug_extent_2d(x, channels, in_n);
+            crate::safety::debug_extent_2d(out, channels, out_n);
+            crate::safety::debug_disjoint(
+                out,
+                channels.saturating_mul(out_n),
+                x,
+                channels.saturating_mul(in_n),
+            );
+        }
+    }
     pool2d_parallel(x, out, channels, h, w, kh, kw, sh, sw, PoolKind::Max);
 }
 
@@ -536,6 +563,20 @@ pub unsafe extern "C" fn wukong_avgpool2d_f32(
     sh: i64,
     sw: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && channels > 0 {
+        if let Some((oh, ow)) = pool2d_output_dims(h, w, kh, kw, sh, sw) {
+            let (in_n, out_n) = (h.saturating_mul(w), (oh as i64).saturating_mul(ow as i64));
+            crate::safety::debug_extent_2d(x, channels, in_n);
+            crate::safety::debug_extent_2d(out, channels, out_n);
+            crate::safety::debug_disjoint(
+                out,
+                channels.saturating_mul(out_n),
+                x,
+                channels.saturating_mul(in_n),
+            );
+        }
+    }
     pool2d_serial(x, out, channels, h, w, kh, kw, sh, sw, PoolKind::Avg);
 }
 
@@ -559,6 +600,20 @@ pub unsafe extern "C" fn wukong_avgpool2d_f32_parallel(
     sh: i64,
     sw: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && channels > 0 {
+        if let Some((oh, ow)) = pool2d_output_dims(h, w, kh, kw, sh, sw) {
+            let (in_n, out_n) = (h.saturating_mul(w), (oh as i64).saturating_mul(ow as i64));
+            crate::safety::debug_extent_2d(x, channels, in_n);
+            crate::safety::debug_extent_2d(out, channels, out_n);
+            crate::safety::debug_disjoint(
+                out,
+                channels.saturating_mul(out_n),
+                x,
+                channels.saturating_mul(in_n),
+            );
+        }
+    }
     pool2d_parallel(x, out, channels, h, w, kh, kw, sh, sw, PoolKind::Avg);
 }
 

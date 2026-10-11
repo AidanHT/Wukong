@@ -27,8 +27,6 @@
 //! so the fused activation equals the unfused one exactly. Pinned by `simd_equals_scalar_twin` and
 //! `dequant_matches_rational_reference`.
 
-use rayon::prelude::*;
-
 // --- op codes (shared with the recognizer in wukong_mir_build) ------------------------------------
 // The low byte is the activation; a higher nibble selects the input element width. A recognized dequant
 // loop's element type and (optional) activation wrapper choose the code; the interpreter and the native
@@ -280,6 +278,11 @@ pub unsafe extern "C" fn wukong_dequant_f32(
     scale: f32,
     op: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    let qb = n.saturating_mul(if op & DQ_WIDTH_MASK == DQ_I32 { 4 } else { 1 });
+    crate::safety::debug_extent(q, qb);
+    crate::safety::debug_extent(out, n);
+    crate::safety::debug_disjoint(out, n, q, qb);
     if n <= 0 {
         return;
     }
@@ -321,6 +324,11 @@ pub unsafe extern "C" fn wukong_dequant_f32_parallel(
     scale: f32,
     op: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    let qb = n.saturating_mul(if op & DQ_WIDTH_MASK == DQ_I32 { 4 } else { 1 });
+    crate::safety::debug_extent(q, qb);
+    crate::safety::debug_extent(out, n);
+    crate::safety::debug_disjoint(out, n, q, qb);
     if n <= 0 {
         return;
     }
@@ -346,7 +354,7 @@ pub unsafe extern "C" fn wukong_dequant_f32_parallel(
     // (the NT prologue then peels ≤7 elements, disjointly from the previous chunk's tail).
     let chunk = n.div_ceil(workers);
     let chunk = chunk.div_ceil(8) * 8;
-    (0..workers).into_par_iter().for_each(|w| {
+    crate::par::for_each_unit(workers, |w| {
         let start = w * chunk;
         if start >= n {
             return;
@@ -496,6 +504,17 @@ pub unsafe extern "C" fn wukong_dequant_perchan_f32(
     scale: *const f32,
     op: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        let qb = rows
+            .saturating_mul(cols)
+            .saturating_mul(if op & DQ_WIDTH_MASK == DQ_I32 { 4 } else { 1 });
+        crate::safety::debug_extent(q, qb);
+        crate::safety::debug_extent_2d(out, rows, cols);
+        crate::safety::debug_extent(scale, cols);
+        crate::safety::debug_disjoint(out, rows.saturating_mul(cols), q, qb);
+        crate::safety::debug_disjoint(out, rows.saturating_mul(cols), scale, cols);
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -547,6 +566,17 @@ pub unsafe extern "C" fn wukong_dequant_perchan_f32_parallel(
     scale: *const f32,
     op: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        let qb = rows
+            .saturating_mul(cols)
+            .saturating_mul(if op & DQ_WIDTH_MASK == DQ_I32 { 4 } else { 1 });
+        crate::safety::debug_extent(q, qb);
+        crate::safety::debug_extent_2d(out, rows, cols);
+        crate::safety::debug_extent(scale, cols);
+        crate::safety::debug_disjoint(out, rows.saturating_mul(cols), q, qb);
+        crate::safety::debug_disjoint(out, rows.saturating_mul(cols), scale, cols);
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }

@@ -46,7 +46,6 @@
 #[cfg(target_arch = "x86_64")]
 use crate::vmath::exp8;
 use crate::vmath::{exp1, log1};
-use rayon::prelude::*;
 
 /// Fixed-order horizontal sum of 8 lane accumulators — a balanced tree, identical in the scalar twin
 /// and the AVX2 path (which stores its `__m256` to `[f32; 8]` and calls this), so both give the same
@@ -226,6 +225,14 @@ pub unsafe extern "C" fn wukong_kd_loss_f32(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent_2d(q, rows, cols);
+        crate::safety::debug_extent(out, rows);
+        crate::safety::debug_disjoint(out, rows, x, rows.saturating_mul(cols));
+        crate::safety::debug_disjoint(out, rows, q, rows.saturating_mul(cols));
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -254,6 +261,14 @@ pub unsafe extern "C" fn wukong_kd_loss_f32_parallel(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent_2d(q, rows, cols);
+        crate::safety::debug_extent(out, rows);
+        crate::safety::debug_disjoint(out, rows, x, rows.saturating_mul(cols));
+        crate::safety::debug_disjoint(out, rows, q, rows.saturating_mul(cols));
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -271,7 +286,7 @@ pub unsafe extern "C" fn wukong_kd_loss_f32_parallel(
     // outlined `@parallel` region bodies are left on undersized stacks. Idempotent (`Once`) and
     // provisioning-only: the work split below is unchanged, so serial == parallel stays bit-exact.
     crate::ensure_global_pool();
-    (0..r).into_par_iter().for_each(|row| {
+    crate::par::for_each_unit(r, |row| {
         let off = row * c;
         // SAFETY: disjoint row slices; pointers re-derived from the captured addresses.
         unsafe {

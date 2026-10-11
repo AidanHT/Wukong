@@ -338,6 +338,9 @@ fn lower_options_for(opts: &Options) -> wukong_mir_build::LowerOptions {
         vec_kernels: !matches!(opts.backend, BackendKind::GpuLower)
             && opts.target_cpu.allows_vec_kernels(),
         strict_fp: opts.strict_fp,
+        // P12.21: an implicit `@parallel` grain on every CPU-executing path; the PTX lowering keeps
+        // one index per iteration (one GPU thread each).
+        implicit_grain: !matches!(opts.backend, BackendKind::GpuLower),
     }
 }
 

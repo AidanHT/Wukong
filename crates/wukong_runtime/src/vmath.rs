@@ -1042,9 +1042,11 @@ unsafe fn vmath_scalar(x: *const f32, out: *mut f32, n: usize, op: i64) {
 /// is not the elementwise source loop.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_vmath_f32(x: *const f32, out: *mut f32, n: i64, op: i64) {
-    // P14.5: both buffers valid for `n` f32 (in-place `out == x` is permitted, so no disjointness).
+    // P14.5: both buffers valid for `n` f32; `out` is exactly `x` or disjoint from it -- the 8-lane
+    // body loads before it stores, so a shifted overlap is not the elementwise source loop.
     crate::safety::debug_extent(x, n);
     crate::safety::debug_extent(out, n);
+    crate::safety::debug_inplace_or_disjoint(out, n, x, n);
     if n <= 0 {
         return;
     }
@@ -1083,6 +1085,10 @@ const VMATH_PAR_MIN: usize = VMATH_CHUNK;
 /// is not the elementwise source loop.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_vmath_f32_parallel(x: *const f32, out: *mut f32, n: i64, op: i64) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent(x, n);
+    crate::safety::debug_extent(out, n);
+    crate::safety::debug_inplace_or_disjoint(out, n, x, n);
     if n <= 0 {
         return;
     }
@@ -1092,13 +1098,12 @@ pub unsafe extern "C" fn wukong_vmath_f32_parallel(x: *const f32, out: *mut f32,
         unsafe { wukong_vmath_f32(x, out, n as i64, op) };
         return;
     }
-    use rayon::prelude::*;
     let nchunks = n.div_ceil(VMATH_CHUNK);
     // Raw pointers cross the rayon closure as integers (the parallel-reduce/norm/velem pattern); each
     // chunk owns a disjoint output sub-slice. Fixed `VMATH_CHUNK` spans keep the bits pool-invariant.
     let (xa, oa) = (x as usize, out as usize);
     crate::run_on_wuk_pool(move || {
-        (0..nchunks).into_par_iter().for_each(|ck| {
+        crate::par::for_each_unit(nchunks, |ck| {
             let lo = ck * VMATH_CHUNK;
             let hi = ((ck + 1) * VMATH_CHUNK).min(n);
             // SAFETY: disjoint sub-span [lo, hi) ⊆ [0, n); x/out valid for n f32.
@@ -1975,10 +1980,13 @@ pub unsafe extern "C" fn wukong_vmath2_f32(
     n: i64,
     op: i64,
 ) {
-    // P14.5: all three buffers valid for `n` f32 (in-place aliasing permitted, so no disjointness).
+    // P14.5: all three buffers valid for `n` f32; `out` is exactly `x`/`y` or disjoint from each --
+    // the 8-lane body loads before it stores, so a shifted overlap is not the source loop.
     crate::safety::debug_extent(x, n);
     crate::safety::debug_extent(y, n);
     crate::safety::debug_extent(out, n);
+    crate::safety::debug_inplace_or_disjoint(out, n, x, n);
+    crate::safety::debug_inplace_or_disjoint(out, n, y, n);
     if n <= 0 {
         return;
     }
@@ -2124,6 +2132,11 @@ where
 /// **Aliasing: all operands disjoint** — the f32 `out` does not overlap the half-precision `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_vmath_bf16(x: *const u16, out: *mut f32, n: i64, op: i64) {
+    // P14.5: debug-build contract checks (the `# Safety` section above); no aliasing assert: the
+    // kernel detects a mixed-width overlap itself and defines it (`half_input_overlaps_f32_output`,
+    // pinned by `mixed_width_overlap_matches_live_byte_reference`), so an overlap is not UB here.
+    crate::safety::debug_extent(x, n);
+    crate::safety::debug_extent(out, n);
     if n <= 0 {
         return;
     }
@@ -2220,6 +2233,11 @@ unsafe fn vmath_bf16_loop<F: Fn(std::arch::x86_64::__m256) -> std::arch::x86_64:
 /// **Aliasing: all operands disjoint** — the f32 `out` does not overlap the half-precision `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_vmath_f16(x: *const u16, out: *mut f32, n: i64, op: i64) {
+    // P14.5: debug-build contract checks (the `# Safety` section above); no aliasing assert: the
+    // kernel detects a mixed-width overlap itself and defines it (`half_input_overlaps_f32_output`,
+    // pinned by `mixed_width_overlap_matches_live_byte_reference`), so an overlap is not UB here.
+    crate::safety::debug_extent(x, n);
+    crate::safety::debug_extent(out, n);
     if n <= 0 {
         return;
     }

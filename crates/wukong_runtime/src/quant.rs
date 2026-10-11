@@ -492,6 +492,9 @@ pub unsafe extern "C" fn wukong_quantize_q8_0_f32(
     q_len: i64,
     k: i64,
 ) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent(x, x_len);
+    crate::safety::debug_extent(q, q_len);
     quantize_entry(x, x_len, q, q_len, k, QFormat::Q8)
 }
 
@@ -508,6 +511,9 @@ pub unsafe extern "C" fn wukong_quantize_q4_0_f32(
     q_len: i64,
     k: i64,
 ) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent(x, x_len);
+    crate::safety::debug_extent(q, q_len);
     quantize_entry(x, x_len, q, q_len, k, QFormat::Q4)
 }
 
@@ -526,6 +532,11 @@ pub unsafe extern "C" fn wukong_gemv_q8_0_f32(
     y: *mut f32,
     y_len: i64,
 ) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above); operand lengths are
+    // explicit; an output overlapping an input is handled (value semantics).
+    crate::safety::debug_extent(w, w_len);
+    crate::safety::debug_extent(x, x_len);
+    crate::safety::debug_extent(y, y_len);
     gemv_q_entry(w, w_len, x, x_len, y, y_len, QFormat::Q8, false)
 }
 
@@ -542,6 +553,11 @@ pub unsafe extern "C" fn wukong_gemv_q8_0_f32_parallel(
     y: *mut f32,
     y_len: i64,
 ) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above); operand lengths are
+    // explicit; an output overlapping an input is handled (value semantics).
+    crate::safety::debug_extent(w, w_len);
+    crate::safety::debug_extent(x, x_len);
+    crate::safety::debug_extent(y, y_len);
     gemv_q_entry(w, w_len, x, x_len, y, y_len, QFormat::Q8, true)
 }
 
@@ -559,6 +575,11 @@ pub unsafe extern "C" fn wukong_gemv_q4_0_f32(
     y: *mut f32,
     y_len: i64,
 ) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above); operand lengths are
+    // explicit; an output overlapping an input is handled (value semantics).
+    crate::safety::debug_extent(w, w_len);
+    crate::safety::debug_extent(x, x_len);
+    crate::safety::debug_extent(y, y_len);
     gemv_q_entry(w, w_len, x, x_len, y, y_len, QFormat::Q4, false)
 }
 
@@ -575,6 +596,11 @@ pub unsafe extern "C" fn wukong_gemv_q4_0_f32_parallel(
     y: *mut f32,
     y_len: i64,
 ) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above); operand lengths are
+    // explicit; an output overlapping an input is handled (value semantics).
+    crate::safety::debug_extent(w, w_len);
+    crate::safety::debug_extent(x, x_len);
+    crate::safety::debug_extent(y, y_len);
     gemv_q_entry(w, w_len, x, x_len, y, y_len, QFormat::Q4, true)
 }
 

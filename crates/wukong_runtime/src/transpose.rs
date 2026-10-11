@@ -469,14 +469,16 @@ pub unsafe extern "C" fn wukong_transpose_f32(
     cols: i64,
 ) {
     // P14.5: src valid for rows*cols, dst for cols*rows, disjoint (documented all-disjoint).
-    crate::safety::debug_extent_2d(src, rows, cols);
-    crate::safety::debug_extent_2d(dst, rows, cols);
-    crate::safety::debug_disjoint(
-        dst,
-        rows.saturating_mul(cols),
-        src,
-        rows.saturating_mul(cols),
-    );
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(src, rows, cols);
+        crate::safety::debug_extent_2d(dst, rows, cols);
+        crate::safety::debug_disjoint(
+            dst,
+            rows.saturating_mul(cols),
+            src,
+            rows.saturating_mul(cols),
+        );
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -499,6 +501,17 @@ pub unsafe extern "C" fn wukong_transpose_f32_parallel(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(src, rows, cols);
+        crate::safety::debug_extent_2d(dst, rows, cols);
+        crate::safety::debug_disjoint(
+            dst,
+            rows.saturating_mul(cols),
+            src,
+            rows.saturating_mul(cols),
+        );
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -507,7 +520,6 @@ pub unsafe extern "C" fn wukong_transpose_f32_parallel(
         transpose_rows_f32(src, dst, r, c, 0, r);
         return;
     }
-    use rayon::prelude::*;
     // This fork can be the process's FIRST rayon touch, so it must provision the global pool first —
     // [`crate::ensure_global_pool`]'s stated precondition. Forking bare builds rayon's default
     // 2 MiB-stack registry, so the runtime's later 16 MiB `build_global` silently loses the race and
@@ -516,7 +528,7 @@ pub unsafe extern "C" fn wukong_transpose_f32_parallel(
     crate::ensure_global_pool();
     let nblocks = r.div_ceil(B);
     let (src_addr, dst_addr) = (src as usize, dst as usize);
-    (0..nblocks).into_par_iter().for_each(|blk| {
+    crate::par::for_each_unit(nblocks, |blk| {
         let i0 = blk * B;
         let i1 = (i0 + B).min(r);
         // SAFETY: disjoint dst-row range per block (dst[*, i] for i in [i0, i1)); pointers re-derived
@@ -541,6 +553,17 @@ pub unsafe extern "C" fn wukong_transpose_u16(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(src, rows, cols);
+        crate::safety::debug_extent_2d(dst, rows, cols);
+        crate::safety::debug_disjoint(
+            dst,
+            rows.saturating_mul(cols),
+            src,
+            rows.saturating_mul(cols),
+        );
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -564,6 +587,17 @@ pub unsafe extern "C" fn wukong_transpose_u16_parallel(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(src, rows, cols);
+        crate::safety::debug_extent_2d(dst, rows, cols);
+        crate::safety::debug_disjoint(
+            dst,
+            rows.saturating_mul(cols),
+            src,
+            rows.saturating_mul(cols),
+        );
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -572,12 +606,11 @@ pub unsafe extern "C" fn wukong_transpose_u16_parallel(
         transpose_rows_u16(src, dst, r, c, 0, r);
         return;
     }
-    use rayon::prelude::*;
     // Same first-rayon-touch precondition as the f32 entry: provision the global pool before forking.
     crate::ensure_global_pool();
     let nblocks = r.div_ceil(B);
     let (src_addr, dst_addr) = (src as usize, dst as usize);
-    (0..nblocks).into_par_iter().for_each(|blk| {
+    crate::par::for_each_unit(nblocks, |blk| {
         let i0 = blk * B;
         let i1 = (i0 + B).min(r);
         // SAFETY: disjoint dst-row range per block (dst[*, i] for i in [i0, i1)); pointers re-derived

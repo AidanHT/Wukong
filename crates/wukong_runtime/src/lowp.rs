@@ -66,8 +66,6 @@
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-use rayon::prelude::*;
-
 use crate::bf16_bits_to_f32;
 
 /// IEEE f16 (stored bits) → f32. Lossless, so it equals the F16C `vcvtph2ps` result exactly. Thin
@@ -664,6 +662,8 @@ unsafe fn reduce_minmax_f16_avx(op: i64, x: &[u16]) -> f32 {
 /// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_reduce_bf16(x: *const u16, n: i64, op: i64) -> f32 {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent(x, n);
     if n <= 0 {
         return crate::reduce::ident(op);
     }
@@ -685,6 +685,8 @@ pub unsafe extern "C" fn wukong_reduce_bf16(x: *const u16, n: i64, op: i64) -> f
 /// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_reduce_f16(x: *const u16, n: i64, op: i64) -> f32 {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent(x, n);
     if n <= 0 {
         return crate::reduce::ident(op);
     }
@@ -706,6 +708,8 @@ pub unsafe extern "C" fn wukong_reduce_f16(x: *const u16, n: i64, op: i64) -> f3
 /// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sum_f16(x: *const u16, n: i64) -> f32 {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent(x, n);
     if n <= 0 {
         return 0.0;
     }
@@ -725,6 +729,8 @@ pub unsafe extern "C" fn wukong_sum_f16(x: *const u16, n: i64) -> f32 {
 /// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sum_bf16(x: *const u16, n: i64) -> f32 {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent(x, n);
     if n <= 0 {
         return 0.0;
     }
@@ -744,6 +750,9 @@ pub unsafe extern "C" fn wukong_sum_bf16(x: *const u16, n: i64) -> f32 {
 /// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_dot_f16(x: *const u16, y: *const u16, n: i64) -> f32 {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent(x, n);
+    crate::safety::debug_extent(y, n);
     if n <= 0 {
         return 0.0;
     }
@@ -764,6 +773,9 @@ pub unsafe extern "C" fn wukong_dot_f16(x: *const u16, y: *const u16, n: i64) ->
 /// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_dot_bf16(x: *const u16, y: *const u16, n: i64) -> f32 {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent(x, n);
+    crate::safety::debug_extent(y, n);
     if n <= 0 {
         return 0.0;
     }
@@ -815,15 +827,14 @@ fn par_chunk_reduce(
     // `RCHUNK` decomposition and the ordered fold below are what fix the bits, so which pool runs the
     // map cannot change them. `per_chunk` is borrowed, not moved — `&P` is `Send` because `P: Sync`.
     let per_chunk = &per_chunk;
+    // `par::map_units`: partial `c` in slot `c` under either scheduler (`WUKONG_KERNEL_DYN`), so the
+    // index-order fold below is unchanged.
     let partials: Vec<f32> = crate::run_on_wuk_pool(move || {
-        (0..nchunks)
-            .into_par_iter()
-            .map(|c| {
-                let lo = c * crate::reduce::RCHUNK;
-                let hi = ((c + 1) * crate::reduce::RCHUNK).min(n);
-                per_chunk(lo, hi)
-            })
-            .collect()
+        crate::par::map_units(nchunks, |c| {
+            let lo = c * crate::reduce::RCHUNK;
+            let hi = ((c + 1) * crate::reduce::RCHUNK).min(n);
+            per_chunk(lo, hi)
+        })
     });
     let mut acc = ident;
     for p in partials {
@@ -869,6 +880,8 @@ fn par_half_dot(x: &[u16], y: &[u16], per_chunk: impl Fn(&[u16], &[u16]) -> f32 
 /// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sum_bf16_parallel(x: *const u16, n: i64) -> f32 {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent(x, n);
     if n <= 0 {
         return 0.0;
     }
@@ -889,6 +902,8 @@ pub unsafe extern "C" fn wukong_sum_bf16_parallel(x: *const u16, n: i64) -> f32 
 /// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sum_f16_parallel(x: *const u16, n: i64) -> f32 {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent(x, n);
     if n <= 0 {
         return 0.0;
     }
@@ -909,6 +924,9 @@ pub unsafe extern "C" fn wukong_sum_f16_parallel(x: *const u16, n: i64) -> f32 {
 /// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_dot_bf16_parallel(x: *const u16, y: *const u16, n: i64) -> f32 {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent(x, n);
+    crate::safety::debug_extent(y, n);
     if n <= 0 {
         return 0.0;
     }
@@ -930,6 +948,9 @@ pub unsafe extern "C" fn wukong_dot_bf16_parallel(x: *const u16, y: *const u16, 
 /// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_dot_f16_parallel(x: *const u16, y: *const u16, n: i64) -> f32 {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent(x, n);
+    crate::safety::debug_extent(y, n);
     if n <= 0 {
         return 0.0;
     }
@@ -953,6 +974,8 @@ pub unsafe extern "C" fn wukong_dot_f16_parallel(x: *const u16, y: *const u16, n
 /// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_reduce_bf16_parallel(x: *const u16, n: i64, op: i64) -> f32 {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent(x, n);
     if n <= 0 {
         return crate::reduce::ident(op);
     }
@@ -983,6 +1006,8 @@ pub unsafe extern "C" fn wukong_reduce_bf16_parallel(x: *const u16, n: i64, op: 
 /// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_reduce_f16_parallel(x: *const u16, n: i64, op: i64) -> f32 {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent(x, n);
     if n <= 0 {
         return crate::reduce::ident(op);
     }
@@ -1087,6 +1112,13 @@ pub unsafe extern "C" fn wukong_axpby_bf16(
     a: f32,
     b: f32,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above); no aliasing assert: the
+    // kernel detects a mixed-width overlap itself and defines it (`half_input_overlaps_f32_output`
+    // -> `axpby_widen_overlapping`, pinned by `mixed_width_overlap_matches_live_byte_reference`),
+    // so an overlap is not UB here.
+    crate::safety::debug_extent(x, n);
+    crate::safety::debug_extent(y, n);
+    crate::safety::debug_extent(out, n);
     if n <= 0 {
         return;
     }
@@ -1143,6 +1175,13 @@ pub unsafe extern "C" fn wukong_axpby_f16(
     a: f32,
     b: f32,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above); no aliasing assert: the
+    // kernel detects a mixed-width overlap itself and defines it (`half_input_overlaps_f32_output`
+    // -> `axpby_widen_overlapping`, pinned by `mixed_width_overlap_matches_live_byte_reference`),
+    // so an overlap is not UB here.
+    crate::safety::debug_extent(x, n);
+    crate::safety::debug_extent(y, n);
+    crate::safety::debug_extent(out, n);
     if n <= 0 {
         return;
     }
@@ -1478,6 +1517,12 @@ pub unsafe extern "C" fn wukong_axpby_bf16_out(
     a: f32,
     b: f32,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above); no aliasing assert: a
+    // shifted overlap is detected and defined in-kernel (`axpby_narrow_shifted_overlap`, pinned by
+    // `axpby_narrow_overlap_preserves_ascending_reads_and_writes`).
+    crate::safety::debug_extent(x, n);
+    crate::safety::debug_extent(y, n);
+    crate::safety::debug_extent(out, n);
     if n <= 0 {
         return;
     }
@@ -1509,6 +1554,12 @@ pub unsafe extern "C" fn wukong_axpby_f16_out(
     a: f32,
     b: f32,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above); no aliasing assert: a
+    // shifted overlap is detected and defined in-kernel (`axpby_narrow_shifted_overlap`, pinned by
+    // `axpby_narrow_overlap_preserves_ascending_reads_and_writes`).
+    crate::safety::debug_extent(x, n);
+    crate::safety::debug_extent(y, n);
+    crate::safety::debug_extent(out, n);
     if n <= 0 {
         return;
     }
@@ -1538,6 +1589,11 @@ pub unsafe extern "C" fn wukong_axpby_f16_out(
 /// dispatches no other overlap.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_vmath_bf16_out(x: *const u16, out: *mut u16, n: i64, op: i64) {
+    // P14.5: debug-build contract checks (the `# Safety` section above); no aliasing assert: a
+    // shifted overlap is detected and defined in-kernel (`axpby_narrow_shifted_overlap`, pinned by
+    // `vmath_narrow_overlap_preserves_ascending_reads_and_writes`).
+    crate::safety::debug_extent(x, n);
+    crate::safety::debug_extent(out, n);
     if n <= 0 {
         return;
     }
@@ -1562,6 +1618,11 @@ pub unsafe extern "C" fn wukong_vmath_bf16_out(x: *const u16, out: *mut u16, n: 
 /// dispatches no other overlap.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_vmath_f16_out(x: *const u16, out: *mut u16, n: i64, op: i64) {
+    // P14.5: debug-build contract checks (the `# Safety` section above); no aliasing assert: a
+    // shifted overlap is detected and defined in-kernel (`axpby_narrow_shifted_overlap`, pinned by
+    // `vmath_narrow_overlap_preserves_ascending_reads_and_writes`).
+    crate::safety::debug_extent(x, n);
+    crate::safety::debug_extent(out, n);
     if n <= 0 {
         return;
     }

@@ -42,16 +42,16 @@
 //!   the serial entry outright, same bits again.
 //!
 //! A non-positive `rows` or `cols` is a no-op at all four entries. Unlike `norm.rs`, these `_parallel`
-//! entries fork with a bare `into_par_iter()` on the **global** pool (after `ensure_global_pool()`)
-//! rather than through `run_on_wuk_pool`, so they are not part of the unified-pool routing — which is
-//! a scheduling difference only, by the row-independence above.
+//! entries fork through `par::for_each_unit`, i.e. on the caller's pool — the **global** pool for a
+//! top-level call — rather than through `run_on_wuk_pool`, so they are not part of the unified-pool
+//! routing (and take the claim queue under `WUKONG_KERNEL_DYN=1`) — a scheduling difference only, by
+//! the row-independence above.
 //! (Each reduction's lane reassociation is the documented reassociated-reduction exception: every
 //! backend runs this same kernel, so they agree.)
 
 #[cfg(target_arch = "x86_64")]
 use crate::vmath::exp8;
 use crate::vmath::{exp1, log1};
-use rayon::prelude::*;
 
 /// Fixed-order horizontal sum of 8 lane accumulators — a balanced tree, identical in the scalar twin
 /// and the AVX2 path (which stores its `__m256` to `[f32; 8]` and calls this), so both give the same
@@ -241,6 +241,17 @@ unsafe fn logsumexp_row(x: *const f32, out: *mut f32, n: usize) {
 /// view of it.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_logsoftmax_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent_2d(out, rows, cols);
+        crate::safety::debug_inplace_or_disjoint(
+            out,
+            rows.saturating_mul(cols),
+            x,
+            rows.saturating_mul(cols),
+        );
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -268,6 +279,17 @@ pub unsafe extern "C" fn wukong_logsoftmax_f32_parallel(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent_2d(out, rows, cols);
+        crate::safety::debug_inplace_or_disjoint(
+            out,
+            rows.saturating_mul(cols),
+            x,
+            rows.saturating_mul(cols),
+        );
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -284,7 +306,7 @@ pub unsafe extern "C" fn wukong_logsoftmax_f32_parallel(
     // Raw pointers cross the rayon boundary as integers (same pattern as the parallel norm/reduce);
     // each row is a disjoint sub-slice.
     let (xa, oa) = (x as usize, out as usize);
-    (0..r).into_par_iter().for_each(|row| {
+    crate::par::for_each_unit(r, |row| {
         let off = row * c;
         // SAFETY: disjoint row; pointers re-derived from the captured addresses, valid for rows*cols.
         unsafe { logsoftmax_row((xa as *const f32).add(off), (oa as *mut f32).add(off), c) };
@@ -301,6 +323,12 @@ pub unsafe extern "C" fn wukong_logsoftmax_f32_parallel(
 /// a run-time overlap test (`wukong_mir_build`'s `kernel_guard.rs`).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_logsumexp_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent(out, rows);
+        crate::safety::debug_disjoint(out, rows, x, rows.saturating_mul(cols));
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -326,6 +354,12 @@ pub unsafe extern "C" fn wukong_logsumexp_f32_parallel(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent(out, rows);
+        crate::safety::debug_disjoint(out, rows, x, rows.saturating_mul(cols));
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -340,7 +374,7 @@ pub unsafe extern "C" fn wukong_logsumexp_f32_parallel(
     // Pointers cross the rayon boundary as integers; each row reads a disjoint x-slice and writes one
     // disjoint out slot.
     let (xa, oa) = (x as usize, out as usize);
-    (0..r).into_par_iter().for_each(|row| {
+    crate::par::for_each_unit(r, |row| {
         // SAFETY: disjoint row data / out slot; pointers re-derived from the captured addresses.
         unsafe {
             logsumexp_row(

@@ -29,8 +29,6 @@
 //! rows are independent, the parallel path just maps the identical per-row routine across cores, so there
 //! is no cross-row combine and the result does not depend on thread count.
 
-use rayon::prelude::*;
-
 /// The two extremum folds this kernel supports, selecting the identity and the scalar/AVX2 fold pair.
 #[derive(Clone, Copy)]
 enum Ext {
@@ -255,7 +253,7 @@ unsafe fn cummm_parallel(x: *const f32, out: *mut f32, rows: usize, cols: usize,
     // Raw pointers cross the rayon boundary as integers (same pattern as the parallel GEMM/norm/cumsum);
     // each row is a disjoint sub-slice of out.
     let (xa, oa) = (x as usize, out as usize);
-    (0..rows).into_par_iter().for_each(|r| {
+    crate::par::for_each_unit(rows, |r| {
         // SAFETY: disjoint row r; pointers valid for rows*cols by contract.
         unsafe { cummm_row(xa as *const f32, oa as *mut f32, r * cols, cols, ext) };
     });
@@ -270,6 +268,17 @@ unsafe fn cummm_parallel(x: *const f32, out: *mut f32, rows: usize, cols: usize,
 /// is loaded before it is stored); a SHIFTED view of `x` is not the source scan.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_cummax_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent_2d(out, rows, cols);
+        crate::safety::debug_inplace_or_disjoint(
+            out,
+            rows.saturating_mul(cols),
+            x,
+            rows.saturating_mul(cols),
+        );
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -285,6 +294,17 @@ pub unsafe extern "C" fn wukong_cummax_f32(x: *const f32, out: *mut f32, rows: i
 /// is loaded before it is stored); a SHIFTED view of `x` is not the source scan.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_cummin_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent_2d(out, rows, cols);
+        crate::safety::debug_inplace_or_disjoint(
+            out,
+            rows.saturating_mul(cols),
+            x,
+            rows.saturating_mul(cols),
+        );
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -309,6 +329,17 @@ pub unsafe extern "C" fn wukong_cummax_f32_parallel(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent_2d(out, rows, cols);
+        crate::safety::debug_inplace_or_disjoint(
+            out,
+            rows.saturating_mul(cols),
+            x,
+            rows.saturating_mul(cols),
+        );
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -330,6 +361,17 @@ pub unsafe extern "C" fn wukong_cummin_f32_parallel(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent_2d(out, rows, cols);
+        crate::safety::debug_inplace_or_disjoint(
+            out,
+            rows.saturating_mul(cols),
+            x,
+            rows.saturating_mul(cols),
+        );
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }

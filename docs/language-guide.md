@@ -963,7 +963,11 @@ worth a claim of its own. `@parallel` accepts nothing else: an unknown key (`@pa
 positional argument, a repeated `grain`, or a grain outside `1..=2^31` is **`E0306`**
 (`tests/fail/parallel_bad_grain.wk`), where the whole argument list used to be silently discarded. The
 grain changes scheduling only, never results (`tests/run/parallel_grain.wk` prints every lane at grains
-that do not divide the trip count).
+that do not divide the trip count). Without a `grain`, the CPU backends pick one (✅): a loop whose
+body is straight-line code gets `G = ceil(2^14 / body size in MIR instructions)`, so a short loop is a
+single chunk that runs without a fork and a long one is claimed in chunks of at least that much work;
+a body with an inner loop or a call keeps one iteration per claim, and `--backend=gpu-native` always
+does (one GPU thread per iteration). Write `grain = 1` to opt a loop back into per-iteration claims.
 Everything else in the list above — `@inline`, `@simd`, `@align`, `@extern` and `@export` — is
 parsed and discarded (🔵). `@tile` is consumed as loop
 strip-mining (see below), and when it cannot be applied it is **`E0309`**, not a silent drop. A
@@ -1950,7 +1954,8 @@ every region past the 32nd serial, silently).
 CPUs the process may use (affinity mask and container quota respected) — or to `--threads=<n>` for a
 `wukongc --run`/`--train`, or `WUKONG_NUM_THREADS=<n>` for any process, including a built executable.
 On a machine whose cores carry SMT siblings the pool has one worker per *physical* core. A region whose
-trip count fits one grain runs once without a fork, and the runtime's multicore kernels
+trip count fits one grain -- the user's, or the implicit one above -- runs once without a fork, and
+the runtime's multicore kernels
 (`wukong_*_parallel`) split only when the work — rows × columns × a per-element cost — can repay the
 fork (`WUKONG_PAR_MIN_WORK` moves that threshold); below it they run their serial twin. Every one of
 those choices is scheduling only: the output is bit-identical at every thread count.

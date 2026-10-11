@@ -72,6 +72,97 @@ const MC: usize = 144;
 const KC: usize = 384;
 const NC: usize = 4080;
 
+/// The run-time row/column cache blocking of the five-loop GEMM (P13.4): the A-panel height `mc`
+/// and the B-panel width `nc`. [`MC`]/[`NC`] are the measured values on the reference part (the
+/// 2 MiB-L2 / 24 MiB-L3 Meteor Lake this crate was tuned on); [`gemm_blocking`] resolves the
+/// values a process actually uses -- `WUKONG_GEMM_MC` / `WUKONG_GEMM_NC` when set and valid, else
+/// the reference scaled to the probed L2/L3.
+///
+/// **Blocking-only, never numerics.** `mc` and `nc` choose which rows and columns of C are swept
+/// together; every C element is still accumulated over the same [`select_kc`] K-groups in
+/// ascending order through the same microkernel, so no `mc`/`nc` changes a result bit -- pinned by
+/// `mc_nc_blocking_never_changes_a_bit` (serial, every pack schedule, epilogue, transposes) and
+/// `legacy_parallel_nc_never_changes_a_bit`. That proof is what licenses deriving them from the
+/// host. [`KC`] and `reduce.rs`'s `RCHUNK` are the opposite case: numeric-contract constants that
+/// fix a summation order, so they are NOT host- or env-tunable (P13.9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Blocking {
+    /// A-panel height: a positive multiple of [`MR`].
+    mc: usize,
+    /// B-panel width: a positive multiple of [`NR`].
+    nc: usize,
+}
+
+impl Blocking {
+    /// The measured blocking, [`MC`] x [`NC`].
+    const REFERENCE: Blocking = Blocking { mc: MC, nc: NC };
+}
+
+/// The private L2 the reference [`MC`] was measured against (an `MC x KC` A panel is ~1/9 of it).
+const REF_L2_BYTES: usize = 2 << 20;
+/// The shared L3 the reference [`NC`] was measured against (a `KC x NC` B panel is ~1/4 of it).
+const REF_L3_BYTES: usize = 24 << 20;
+/// Largest `WUKONG_GEMM_MC`/`WUKONG_GEMM_NC` accepted: bounds the pack scratch an override can ask
+/// for (a 65536 x 384 f32 panel is 96 MiB).
+const MAX_BLOCK_OVERRIDE: usize = 1 << 16;
+
+/// Scale a reference block size by `have / reference_cache`, keeping the panel's measured share of
+/// that cache level, rounded down to a multiple of `unit` and clamped to `[reference/4,
+/// reference*4]` -- the derivation extrapolates a measurement, so it stays within 4x of it.
+fn scale_block(reference: usize, have: usize, reference_cache: usize, unit: usize) -> usize {
+    let scaled = (reference as u128 * have as u128 / reference_cache as u128) as usize;
+    let lo = (reference / 4 / unit).max(1) * unit;
+    let hi = reference * 4;
+    (scaled / unit * unit).clamp(lo, hi)
+}
+
+/// The host-derived default: `mc` scales with the probed L2, `nc` with the probed L3; an unknown
+/// level keeps the reference value. Identity on the reference part.
+fn derive_blocking(l2: Option<usize>, l3: Option<usize>) -> Blocking {
+    Blocking {
+        mc: l2
+            .filter(|&b| b > 0)
+            .map_or(MC, |b| scale_block(MC, b, REF_L2_BYTES, MR)),
+        nc: l3
+            .filter(|&b| b > 0)
+            .map_or(NC, |b| scale_block(NC, b, REF_L3_BYTES, NR)),
+    }
+}
+
+/// `WUKONG_GEMM_MC` / `WUKONG_GEMM_NC`: a plain ASCII decimal that is a positive multiple of `unit`
+/// ([`MR`] / [`NR`]) and at most [`MAX_BLOCK_OVERRIDE`]; anything else is ignored.
+fn parse_block_override(raw: Option<&str>, unit: usize) -> Option<usize> {
+    let s = raw?;
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse::<usize>()
+        .ok()
+        .filter(|&v| v >= unit && v.is_multiple_of(unit) && v <= MAX_BLOCK_OVERRIDE)
+}
+
+/// The process's GEMM blocking, resolved once: each of `WUKONG_GEMM_MC` / `WUKONG_GEMM_NC` when set
+/// and valid (see [`parse_block_override`]), else [`derive_blocking`] from the probed host caches.
+/// The crate's own unit-test build pins [`Blocking::REFERENCE`], so the shape tables written against
+/// `MC`/`NC` keep their meaning on any CI host; the bit-invariance tests drive other blockings
+/// explicitly.
+fn gemm_blocking() -> Blocking {
+    if cfg!(test) {
+        return Blocking::REFERENCE;
+    }
+    use std::sync::OnceLock;
+    static V: OnceLock<Blocking> = OnceLock::new();
+    *V.get_or_init(|| {
+        let t = crate::host_topology();
+        let derived = derive_blocking(t.l2_bytes, t.l3_bytes);
+        let var = |k: &str| std::env::var(k).ok();
+        Blocking {
+            mc: parse_block_override(var("WUKONG_GEMM_MC").as_deref(), MR).unwrap_or(derived.mc),
+            nc: parse_block_override(var("WUKONG_GEMM_NC").as_deref(), NR).unwrap_or(derived.nc),
+        }
+    })
+}
+
 /// Upper bound on `m` for the 2D block-parallel grid's **skinny-M** rule — one row of C blocks, see
 /// [`select_2d_block_shape`]. This is a *policy* boundary, not a cache size: it answers "is A short
 /// enough that one L2-resident A stripe should serve every column block", a question measured at
@@ -186,6 +277,12 @@ fn l2_bytes() -> usize {
     })
 }
 
+/// [`select_nc_with`] under the process blocking ([`gemm_blocking`]) -- the shape tables' spelling.
+#[cfg(test)]
+fn select_nc(m: usize, k: usize, n: usize) -> usize {
+    select_nc_with(m, k, n, gemm_blocking())
+}
+
 /// Column-block width (`nc`) for the SERIAL five-loop — [`NC`] except when the row loop has no
 /// reuse to sell.
 ///
@@ -207,22 +304,26 @@ fn l2_bytes() -> usize {
 ///
 /// Blocking-only: `nc` changes which C columns are computed together, never the per-`(i, j)` order
 /// of the K reduction, so every output bit is unchanged and serial stays bit-identical to parallel.
-fn select_nc(m: usize, k: usize, n: usize) -> usize {
-    if m > MC {
-        return NC;
+///
+/// Under an explicit [`Blocking`]: `blk.mc` decides the single-row-block regime and `blk.nc` is
+/// the classic width.
+fn select_nc_with(m: usize, k: usize, n: usize, blk: Blocking) -> usize {
+    let (mc_blk, nc_blk) = (blk.mc, blk.nc);
+    if m > mc_blk {
+        return nc_blk;
     }
-    let (mc, kc) = (m.min(MC), select_kc(k));
+    let (mc, kc) = (m.min(mc_blk), select_kc(k));
     let l2 = l2_bytes();
     let a_block = 4 * round_up(mc, MR) * kc;
     // Saturating: a pathological `WUKONG_GEMM_L2_BYTES` smaller than the A block alone must fall
     // back to one NR-wide panel, not wrap.
     let cap = l2.saturating_sub(a_block) / (4 * (kc + mc));
-    let cap = (cap & !(NR - 1)).clamp(NR, NC);
+    let cap = (cap & !(NR - 1)).clamp(NR, nc_blk);
     if n <= cap {
-        return NC; // one block either way; leave the classic path untouched
+        return nc_blk; // one block either way; leave the classic path untouched
     }
     let nblocks = n.div_ceil(cap);
-    round_up(n.div_ceil(nblocks), NR).clamp(NR, NC)
+    round_up(n.div_ceil(nblocks), NR).clamp(NR, nc_blk)
 }
 
 /// A private rayon pool for the parallel GEMM, sized to the machine's **physical** core count instead
@@ -714,6 +815,14 @@ pub unsafe extern "C" fn wukong_sgemm(
     n: i64,
     beta: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, k, n);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     gemm_dispatch(a, b, c, m, k, n, beta, false, false, false, None);
 }
 
@@ -736,6 +845,14 @@ pub unsafe extern "C" fn wukong_sgemm_nt(
     n: i64,
     beta: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     gemm_dispatch(a, b, c, m, k, n, beta, false, true, false, None);
 }
 
@@ -764,6 +881,16 @@ pub unsafe extern "C" fn wukong_sgemm_nt_epi(
     bias: *const f32,
     act: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_extent_opt(bias, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), bias, n);
+    }
     let epi = Epilogue {
         bias,
         act: act as u32,
@@ -804,6 +931,14 @@ pub unsafe extern "C" fn wukong_sgemm_nt_alpha(
     beta: i64,
     alpha: f32,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     let epi = Epilogue {
         bias: std::ptr::null(),
         act: ACT_IDENTITY,
@@ -835,6 +970,14 @@ pub unsafe extern "C" fn wukong_sgemm_nt_alpha_parallel(
     beta: i64,
     alpha: f32,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     let epi = Epilogue {
         bias: std::ptr::null(),
         act: ACT_IDENTITY,
@@ -992,6 +1135,14 @@ pub unsafe extern "C" fn wukong_sgemm_parallel(
     n: i64,
     beta: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, k, n);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     gemm_dispatch(a, b, c, m, k, n, beta, false, false, true, None);
 }
 
@@ -1013,6 +1164,14 @@ pub unsafe extern "C" fn wukong_sgemm_nt_parallel(
     n: i64,
     beta: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     gemm_dispatch(a, b, c, m, k, n, beta, false, true, true, None);
 }
 
@@ -1042,6 +1201,16 @@ pub unsafe extern "C" fn wukong_sgemm_nt_epi_parallel(
     bias: *const f32,
     act: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_extent_opt(bias, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), bias, n);
+    }
     let epi = Epilogue {
         bias,
         act: act as u32,
@@ -1082,6 +1251,14 @@ pub unsafe extern "C" fn wukong_sgemm_tn(
     n: i64,
     beta: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, k, m);
+        crate::safety::debug_extent_2d(b, k, n);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     gemm_dispatch(a, b, c, m, k, n, beta, true, false, false, None);
 }
 
@@ -1105,6 +1282,14 @@ pub unsafe extern "C" fn wukong_sgemm_tn_parallel(
     n: i64,
     beta: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, k, m);
+        crate::safety::debug_extent_2d(b, k, n);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     gemm_dispatch(a, b, c, m, k, n, beta, true, false, true, None);
 }
 
@@ -1311,6 +1496,14 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_nt(
     n: i64,
     beta: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     gemm_lowp_nt(a, b, c, m, k, n, beta, false, HalfKind::Bf16, None);
 }
 
@@ -1333,6 +1526,14 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_nt_parallel(
     n: i64,
     beta: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     gemm_lowp_nt(a, b, c, m, k, n, beta, true, HalfKind::Bf16, None);
 }
 
@@ -1354,6 +1555,14 @@ pub unsafe extern "C" fn wukong_sgemm_f16_nt(
     n: i64,
     beta: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     gemm_lowp_nt(a, b, c, m, k, n, beta, false, HalfKind::F16, None);
 }
 
@@ -1374,6 +1583,14 @@ pub unsafe extern "C" fn wukong_sgemm_f16_nt_parallel(
     n: i64,
     beta: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     gemm_lowp_nt(a, b, c, m, k, n, beta, true, HalfKind::F16, None);
 }
 
@@ -1430,6 +1647,16 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_nt_epi(
     bias: *const f32,
     act: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_extent_opt(bias, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), bias, n);
+    }
     gemm_lowp_nt_epi(a, b, c, m, k, n, beta, bias, act, false, HalfKind::Bf16);
 }
 
@@ -1452,6 +1679,16 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_nt_epi_parallel(
     bias: *const f32,
     act: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_extent_opt(bias, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), bias, n);
+    }
     gemm_lowp_nt_epi(a, b, c, m, k, n, beta, bias, act, true, HalfKind::Bf16);
 }
 
@@ -1476,6 +1713,16 @@ pub unsafe extern "C" fn wukong_sgemm_f16_nt_epi(
     bias: *const f32,
     act: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_extent_opt(bias, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), bias, n);
+    }
     gemm_lowp_nt_epi(a, b, c, m, k, n, beta, bias, act, false, HalfKind::F16);
 }
 
@@ -1498,6 +1745,16 @@ pub unsafe extern "C" fn wukong_sgemm_f16_nt_epi_parallel(
     bias: *const f32,
     act: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_extent_opt(bias, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), bias, n);
+    }
     gemm_lowp_nt_epi(a, b, c, m, k, n, beta, bias, act, true, HalfKind::F16);
 }
 
@@ -1560,6 +1817,14 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_tn(
     n: i64,
     beta: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, k, m);
+        crate::safety::debug_extent_2d(b, k, n);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     gemm_lowp_tn(a, b, c, m, k, n, beta, false, HalfKind::Bf16);
 }
 
@@ -1582,6 +1847,14 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_tn_parallel(
     n: i64,
     beta: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, k, m);
+        crate::safety::debug_extent_2d(b, k, n);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     gemm_lowp_tn(a, b, c, m, k, n, beta, true, HalfKind::Bf16);
 }
 
@@ -1603,6 +1876,14 @@ pub unsafe extern "C" fn wukong_sgemm_f16_tn(
     n: i64,
     beta: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, k, m);
+        crate::safety::debug_extent_2d(b, k, n);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     gemm_lowp_tn(a, b, c, m, k, n, beta, false, HalfKind::F16);
 }
 
@@ -1623,6 +1904,14 @@ pub unsafe extern "C" fn wukong_sgemm_f16_tn_parallel(
     n: i64,
     beta: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, k, m);
+        crate::safety::debug_extent_2d(b, k, n);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     gemm_lowp_tn(a, b, c, m, k, n, beta, true, HalfKind::F16);
 }
 
@@ -1647,6 +1936,27 @@ unsafe fn sgemm_avx2_parallel(
     bt: bool,
     epi: Option<Epilogue>,
 ) {
+    sgemm_avx2_parallel_nc(a, b, c, m, k, n, beta, at, bt, epi, gemm_blocking().nc);
+}
+
+/// [`sgemm_avx2_parallel`] with the column block `nc_blk` explicit (a multiple of [`NR`]), so its
+/// bit-invariance under any `nc` is testable regardless of the process env.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn sgemm_avx2_parallel_nc(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    m: usize,
+    k: usize,
+    n: usize,
+    beta: f32,
+    at: bool,
+    bt: bool,
+    epi: Option<Epilogue>,
+    nc_blk: usize,
+) {
     use rayon::prelude::*;
     // Pack scratch allocated ONCE and reused across every cache block, instead of a fresh
     // `vec![0.0; …]` (malloc + zero of ~2 MB) per K-block per call — pure overhead the old code paid
@@ -1654,12 +1964,12 @@ unsafe fn sgemm_avx2_parallel(
     // edge-padding zeros for every element it owns), so reuse needs no re-zeroing. Sized to the
     // largest block: full M rows × KC, and an NC-wide × KC B panel.
     let ap_cap = round_up(m, MR) * k.min(KC);
-    let bp_cap = round_up(n.min(NC), NR) * k.min(KC);
+    let bp_cap = round_up(n.min(nc_blk), NR) * k.min(KC);
     let mut ap = vec![0.0f32; ap_cap];
     let mut bp = vec![0.0f32; bp_cap];
     let mut jc = 0;
     while jc < n {
-        let nc = (n - jc).min(NC);
+        let nc = (n - jc).min(nc_blk);
         let mut pc = 0;
         while pc < k {
             let kc = (k - pc).min(select_kc(k));
@@ -1740,7 +2050,7 @@ unsafe fn sgemm_avx2_parallel(
             });
             pc += kc;
         }
-        jc += NC;
+        jc += nc_blk;
     }
 }
 
@@ -1763,6 +2073,8 @@ struct GemmRegion {
     /// In-region phase barrier, sized to the exact broadcast width (asserted before first use).
     barrier: std::sync::Barrier,
     nworkers: usize,
+    /// The column block every worker walks ([`Blocking::nc`]).
+    nc_blk: usize,
 }
 // SAFETY: shared across the broadcast workers by reference. Every mutable target is written by
 // exactly one worker per phase — packed panels and C row-panels are claimed via `fetch_add` (unique
@@ -1823,6 +2135,19 @@ unsafe impl Sync for GemmRegion {}
 /// [`gemm_dispatch`]).
 #[cfg(target_arch = "x86_64")]
 unsafe fn sgemm_persistent_region(pool: Option<&rayon::ThreadPool>, args: GemmArgs) {
+    sgemm_persistent_region_nc(pool, args, gemm_blocking().nc);
+}
+
+/// [`sgemm_persistent_region`] with the column block `nc_blk` explicit (a multiple of [`NR`]).
+///
+/// # Safety
+/// That of [`sgemm_persistent_region`].
+#[cfg(target_arch = "x86_64")]
+unsafe fn sgemm_persistent_region_nc(
+    pool: Option<&rayon::ThreadPool>,
+    args: GemmArgs,
+    nc_blk: usize,
+) {
     use std::sync::atomic::AtomicUsize;
     let (m, k, n) = (args.m, args.k, args.n);
     // Barrier width must equal broadcast width. `Some(pool)` broadcasts on the private pool (its
@@ -1834,12 +2159,12 @@ unsafe fn sgemm_persistent_region(pool: Option<&rayon::ThreadPool>, args: GemmAr
     // Pack scratch allocated once per call and reused across every block, exactly as the fork-join
     // shape does (each block's pack fully overwrites the region it owns, padding included).
     let ap_cap = round_up(m, MR) * k.min(KC);
-    let bp_cap = round_up(n.min(NC), NR) * k.min(KC);
+    let bp_cap = round_up(n.min(nc_blk), NR) * k.min(KC);
     let mut ap = vec![0.0f32; ap_cap];
     let mut bp = vec![0.0f32; bp_cap];
-    // The jc/pc schedule is a pure function of (m, k, n): every worker walks it identically, so
+    // The jc/pc schedule is a pure function of (m, k, n, nc): every worker walks it identically, so
     // the block count — and each block's fresh counter pair — is known up front.
-    let nblocks = n.div_ceil(NC) * k.div_ceil(select_kc(k));
+    let nblocks = n.div_ceil(nc_blk) * k.div_ceil(select_kc(k));
     let region = GemmRegion {
         args,
         ap: ap.as_mut_ptr(),
@@ -1849,6 +2174,7 @@ unsafe fn sgemm_persistent_region(pool: Option<&rayon::ThreadPool>, args: GemmAr
             .collect(),
         barrier: std::sync::Barrier::new(nworkers),
         nworkers,
+        nc_blk,
     };
     let worker = |ctx: rayon::BroadcastContext<'_>| {
         // A width mismatch must fail loudly, not hang the barrier. Both sides are per-call
@@ -1902,7 +2228,7 @@ unsafe fn gemm_region_worker(rg: &GemmRegion, widx: usize) {
     let mut block = 0usize;
     let mut jc = 0;
     while jc < n {
-        let nc = (n - jc).min(NC);
+        let nc = (n - jc).min(rg.nc_blk);
         let mut pc = 0;
         while pc < k {
             let kc = (k - pc).min(select_kc(k));
@@ -2000,7 +2326,7 @@ unsafe fn gemm_region_worker(rg: &GemmRegion, widx: usize) {
                 rg.barrier.wait();
             }
         }
-        jc += NC;
+        jc += rg.nc_blk;
     }
 }
 
@@ -2590,26 +2916,24 @@ unsafe fn sgemm_2d_blocks_dyn(
                 }
             } else {
                 let chunks_ref = &chunks;
-                (0..chunks_ref.len() * mpanels)
-                    .into_par_iter()
-                    .for_each(|u| {
-                        let (ci, ip) = (u / mpanels, u % mpanels);
-                        let (pc, kc, off) = chunks_ref[ci];
-                        // SAFETY: each (chunk, panel) granule owns a disjoint `MR·kc` destination
-                        // slice; A is read-only; buffer sized `a_rows·k` above.
-                        unsafe {
-                            let (a_blk, lda) = a_origin(a_addr as *const f32, m, k, at, 0, pc);
-                            pack_a_panel(
-                                a_blk,
-                                lda,
-                                at,
-                                m,
-                                kc,
-                                ip,
-                                (ap_shared_addr as *mut f32).add(off + ip * kc * MR),
-                            );
-                        }
-                    });
+                crate::par::for_each_unit(chunks_ref.len() * mpanels, |u| {
+                    let (ci, ip) = (u / mpanels, u % mpanels);
+                    let (pc, kc, off) = chunks_ref[ci];
+                    // SAFETY: each (chunk, panel) granule owns a disjoint `MR·kc` destination
+                    // slice; A is read-only; buffer sized `a_rows·k` above.
+                    unsafe {
+                        let (a_blk, lda) = a_origin(a_addr as *const f32, m, k, at, 0, pc);
+                        pack_a_panel(
+                            a_blk,
+                            lda,
+                            at,
+                            m,
+                            kc,
+                            ip,
+                            (ap_shared_addr as *mut f32).add(off + ip * kc * MR),
+                        );
+                    }
+                });
             }
         }
         // One claim-loop task per worker — plain fork-join tasks, NOT `broadcast`: the loop never
@@ -2974,11 +3298,25 @@ unsafe fn sgemm_avx2(
     bt: bool,
     epi: Option<Epilogue>,
 ) {
-    sgemm_avx2_impl(a, b, c, m, k, n, beta, at, bt, epi, gemm_fused_pack());
+    sgemm_avx2_impl(
+        a,
+        b,
+        c,
+        m,
+        k,
+        n,
+        beta,
+        at,
+        bt,
+        epi,
+        gemm_fused_pack(),
+        gemm_blocking(),
+    );
 }
 
-/// [`sgemm_avx2`] with the [`gemm_fused_pack`] choice explicit, so the bit-identity of the two B
-/// packing schedules is testable regardless of the process env.
+/// [`sgemm_avx2`] with the [`gemm_fused_pack`] choice and the [`Blocking`] explicit, so the
+/// bit-identity of the two B packing schedules and of every `mc`/`nc` is testable regardless of the
+/// process env.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 #[allow(clippy::too_many_arguments)]
@@ -2994,6 +3332,7 @@ unsafe fn sgemm_avx2_impl(
     bt: bool,
     epi: Option<Epilogue>,
     fused: bool,
+    blk: Blocking,
 ) {
     // Pack scratch, sized to the actual blocks needed (never larger than the cache-block caps).
     // Reused across calls via a per-thread buffer (see PACK_SCRATCH): the packers overwrite every
@@ -3001,15 +3340,15 @@ unsafe fn sgemm_avx2_impl(
     // per-call malloc+zero that was a measurable slice of small-GEMM time. Taken out here and put
     // back at the end; the body between is panic-free so the buffers are always returned.
     let kc_max = k.min(KC);
-    let mc_max = m.min(MC);
-    // Column-block width: NC except in the single-row-block regime, where the packed B panel has
-    // no ic-loop reuse and must stay in L2 (see `select_nc`).
-    let nc_step = select_nc(m, k, n);
+    let mc_max = m.min(blk.mc);
+    // Column-block width: `blk.nc` except in the single-row-block regime, where the packed B panel
+    // has no ic-loop reuse and must stay in L2 (see `select_nc`).
+    let nc_step = select_nc_with(m, k, n, blk);
     let nc_max = n.min(nc_step);
-    // One `ic` block (`m <= MC`): every packed B byte would be read by exactly one row sweep, so
+    // One `ic` block (`m <= mc`): every packed B byte would be read by exactly one row sweep, so
     // pack it one micropanel at a time instead (see `gemm_fused_pack`); the B scratch is then a
     // single `kc×NR` micropanel.
-    let fuse_b = fused && m <= MC;
+    let fuse_b = fused && m <= blk.mc;
     let ap_cap = round_up(mc_max, MR) * kc_max;
     let bp_cap = if fuse_b {
         NR * kc_max
@@ -3069,7 +3408,7 @@ unsafe fn sgemm_avx2_impl(
             pack_b_block(b, k, n, pc, jc, kc, nc, bt, bp.as_mut_ptr());
             let mut ic = 0;
             while ic < m {
-                let mc = (m - ic).min(MC);
+                let mc = (m - ic).min(blk.mc);
                 let (a_blk, lda) = a_origin(a, m, k, at, ic, pc);
                 pack_a(a_blk, lda, at, mc, kc, ap.as_mut_ptr());
                 macro_kernel(
@@ -3083,7 +3422,7 @@ unsafe fn sgemm_avx2_impl(
                     beta_eff,
                     block_epi,
                 );
-                ic += MC;
+                ic += blk.mc;
             }
             pc += kc;
         }
@@ -3528,7 +3867,6 @@ unsafe fn pack_ab_par(
     ap: *mut f32,
     bp: *mut f32,
 ) {
-    use rayon::prelude::*;
     let mpanels = mc.div_ceil(MR);
     let npanels = nc.div_ceil(NR);
     let total_bytes = (round_up(mc, MR) + round_up(nc, NR)) * kc * 4;
@@ -3553,7 +3891,7 @@ unsafe fn pack_ab_par(
         *V.get_or_init(|| std::env::var("WUKONG_PACK_SPLIT_REGIONS").is_ok_and(|v| v == "1"))
     }
     if split_regions() {
-        (0..mpanels).into_par_iter().for_each(|ip| {
+        crate::par::for_each_unit(mpanels, |ip| {
             // SAFETY: disjoint output panel per task; pointers re-derived per task.
             unsafe {
                 pack_a_panel(
@@ -3567,7 +3905,7 @@ unsafe fn pack_ab_par(
                 );
             }
         });
-        (0..npanels).into_par_iter().for_each(|jp| {
+        crate::par::for_each_unit(npanels, |jp| {
             let panel = (bp_addr as *mut f32).add(jp * kc * NR);
             // SAFETY: disjoint output panel per task; pointers re-derived per task.
             unsafe {
@@ -3580,7 +3918,7 @@ unsafe fn pack_ab_par(
         });
         return;
     }
-    (0..mpanels + npanels).into_par_iter().for_each(|t| {
+    crate::par::for_each_unit(mpanels + npanels, |t| {
         // SAFETY: every task writes a disjoint packed panel; pointers re-derived per task.
         unsafe {
             if t < mpanels {
@@ -7707,6 +8045,230 @@ mod tests {
         }
     }
 
+    /// P13.4's licence: the row/column cache blocking (`mc`, `nc`) never changes a result bit. The
+    /// serial five-loop is driven under the reference blocking and under blockings far from it --
+    /// one micro-panel tall / wide, ragged multiples, and the 4x-reference corner the host
+    /// derivation can reach -- through both B-pack schedules, both transposes, both `beta` rules and
+    /// a bias+ReLU epilogue, over shapes with several row blocks, several column blocks and several
+    /// K-blocks. Every output must match the reference bit-for-bit. Only after this holds may `mc`
+    /// and `nc` follow the host (`derive_blocking`) or the environment (`WUKONG_GEMM_MC`/`_NC`).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn mc_nc_blocking_never_changes_a_bit() {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
+            return;
+        }
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+        let blockings = [
+            Blocking { mc: MR, nc: NR },
+            Blocking {
+                mc: 2 * MR,
+                nc: 3 * NR,
+            },
+            Blocking {
+                mc: 7 * MR,
+                nc: 5 * NR,
+            },
+            Blocking {
+                mc: 4 * MC,
+                nc: 4 * NC,
+            },
+            Blocking {
+                mc: MC / 4,
+                nc: 64 * NR,
+            },
+        ];
+        for &(m, k, n) in &[
+            (1usize, 1usize, 1usize),
+            (13, 37, 70),
+            (61, 20, 500),
+            (2 * MR + 5, KC + 41, 3 * NR + 9), // two K-blocks
+            (150, 2 * KC + 9, 40),             // three K-blocks, m past MC
+        ] {
+            let a = fill(611, m * k);
+            let b = fill(612, k * n);
+            let bias = fill(613, n);
+            let c_init = fill(614, m * n);
+            for (at, bt, beta, with_epi) in [
+                (false, false, 0.0f32, false),
+                (true, true, 1.0f32, true),
+                (false, true, 0.0f32, true),
+            ] {
+                let epi = with_epi.then_some(Epilogue {
+                    bias: bias.as_ptr(),
+                    act: ACT_RELU,
+                    alpha: 1.0,
+                });
+                for fused in [false, true] {
+                    let run = |blk: Blocking| {
+                        let mut c = c_init.clone();
+                        // SAFETY: avx2+fma detected above; a is m*k, b k*n, c m*n, bias n.
+                        unsafe {
+                            sgemm_avx2_impl(
+                                a.as_ptr(),
+                                b.as_ptr(),
+                                c.as_mut_ptr(),
+                                m,
+                                k,
+                                n,
+                                beta,
+                                at,
+                                bt,
+                                epi,
+                                fused,
+                                blk,
+                            );
+                        }
+                        bits(&c)
+                    };
+                    let want = run(Blocking::REFERENCE);
+                    for blk in blockings {
+                        assert_eq!(
+                            run(blk),
+                            want,
+                            "blocking {blk:?} moved a bit (m{m} k{k} n{n} at{at} bt{bt} \
+                             beta{beta} epi{with_epi} fused{fused})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The two legacy parallel schedules walk `nc`-wide column blocks too (`WUKONG_GEMM_FORKJOIN=1`
+    /// and the persistent region): under a non-reference `nc` they must still equal the serial
+    /// reference bit-for-bit, epilogue included.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn legacy_parallel_nc_never_changes_a_bit() {
+        if !(crate::isa::avx2() && crate::isa::fma()) {
+            return;
+        }
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+        let (m, k, n) = (37usize, KC + 23, 7 * NR + 3);
+        let a = fill(621, m * k);
+        let b = fill(622, n * k);
+        let bias = fill(623, n);
+        let epi = Some(Epilogue {
+            bias: bias.as_ptr(),
+            act: ACT_RELU,
+            alpha: 1.0,
+        });
+        let mut want = vec![0.0f32; m * n];
+        // SAFETY: avx2+fma detected above; a is m*k, b n*k (bt), c m*n, bias n.
+        unsafe {
+            sgemm_avx2_impl(
+                a.as_ptr(),
+                b.as_ptr(),
+                want.as_mut_ptr(),
+                m,
+                k,
+                n,
+                0.0,
+                false,
+                true,
+                epi,
+                false,
+                Blocking::REFERENCE,
+            );
+        }
+        for nc in [NR, 3 * NR, 5 * NR, NC] {
+            let mut fj = vec![0.0f32; m * n];
+            let mut pr = vec![0.0f32; m * n];
+            // SAFETY: as above; both legacy kernels take the same operand contract.
+            unsafe {
+                sgemm_avx2_parallel_nc(
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    fj.as_mut_ptr(),
+                    m,
+                    k,
+                    n,
+                    0.0,
+                    false,
+                    true,
+                    epi,
+                    nc,
+                );
+                let args = GemmArgs {
+                    a: a.as_ptr(),
+                    b: b.as_ptr(),
+                    c: pr.as_mut_ptr(),
+                    m,
+                    k,
+                    n,
+                    beta: 0.0,
+                    at: false,
+                    bt: true,
+                    epi,
+                };
+                sgemm_persistent_region_nc(gemm_pool(), args, nc);
+            }
+            assert_eq!(bits(&fj), bits(&want), "fork-join nc={nc}");
+            assert_eq!(bits(&pr), bits(&want), "persistent region nc={nc}");
+        }
+    }
+
+    /// `WUKONG_GEMM_MC` / `WUKONG_GEMM_NC` accept only positive multiples of `MR` / `NR` (bounded),
+    /// and the host derivation is the identity on the reference part, scales with L2 (`mc`) and L3
+    /// (`nc`), stays on the `MR`/`NR` grid and within 4x of the measured values.
+    #[test]
+    fn blocking_overrides_and_host_derivation() {
+        assert_eq!(parse_block_override(Some("144"), MR), Some(144));
+        assert_eq!(parse_block_override(Some("6"), MR), Some(6));
+        assert_eq!(parse_block_override(Some("4080"), NR), Some(4080));
+        for bad in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("145"),
+            Some("-6"),
+            Some("+6"),
+            Some(" 6"),
+            Some("6k"),
+            Some("70000"),
+        ] {
+            assert_eq!(parse_block_override(bad, MR), None, "{bad:?}");
+        }
+        assert_eq!(
+            parse_block_override(Some("24"), NR),
+            None,
+            "24 is not a multiple of NR"
+        );
+        // Identity on the reference part, and on an unknown cache level.
+        assert_eq!(
+            derive_blocking(Some(REF_L2_BYTES), Some(REF_L3_BYTES)),
+            Blocking::REFERENCE
+        );
+        assert_eq!(derive_blocking(None, None), Blocking::REFERENCE);
+        assert_eq!(derive_blocking(Some(0), Some(0)), Blocking::REFERENCE);
+        // Half the caches, half the panels (rounded down to the NR grid); the 4x clamps.
+        assert_eq!(
+            derive_blocking(Some(1 << 20), Some(12 << 20)),
+            Blocking { mc: 72, nc: 2032 }
+        );
+        assert_eq!(
+            derive_blocking(Some(1 << 40), Some(1 << 40)),
+            Blocking {
+                mc: 4 * MC,
+                nc: 4 * NC
+            }
+        );
+        assert_eq!(
+            derive_blocking(Some(1), Some(1)),
+            Blocking { mc: 36, nc: 1008 }
+        );
+        for l2 in [256 << 10, 1 << 20, 1280 << 10, 2 << 20, 3 << 20, 8 << 20] {
+            for l3 in [4 << 20, 16 << 20, 24 << 20, 32 << 20, 96 << 20] {
+                let d = derive_blocking(Some(l2), Some(l3));
+                assert!(d.mc.is_multiple_of(MR) && d.mc >= MR, "{d:?}");
+                assert!(d.nc.is_multiple_of(NR) && d.nc >= NR, "{d:?}");
+            }
+        }
+        // The unit-test build pins the reference, so the shape tables above keep their meaning.
+        assert_eq!(gemm_blocking(), Blocking::REFERENCE);
+    }
+
     /// The fused micropanel-at-a-time B pack ([`macro_kernel_packb`], the default) must be
     /// **bit-identical** to the classic whole-panel pack, through every body that can take it: the
     /// serial kernel's single-row-block regime — both `bt` layouts, both `beta` rules, plain /
@@ -7772,6 +8334,7 @@ mod tests {
                                 bt,
                                 epi,
                                 true,
+                                Blocking::REFERENCE,
                             );
                             sgemm_avx2_impl(
                                 a.as_ptr(),
@@ -7785,6 +8348,7 @@ mod tests {
                                 bt,
                                 epi,
                                 false,
+                                Blocking::REFERENCE,
                             );
                         }
                         assert_eq!(
@@ -8017,6 +8581,7 @@ mod tests {
                         false,
                         None,
                         false,
+                        Blocking::REFERENCE,
                     );
                 }
                 let want = bits(&want);
@@ -8045,7 +8610,20 @@ mod tests {
                 for fused in [false, true] {
                     // SAFETY: `a`/`bp` sized for m,k,n; `c` is the m*n output check provides (serial).
                     check(&format!("serial fused{fused}"), &mut |c| unsafe {
-                        sgemm_avx2_impl(a, bp, c, m, k, n, beta, true, false, None, fused)
+                        sgemm_avx2_impl(
+                            a,
+                            bp,
+                            c,
+                            m,
+                            k,
+                            n,
+                            beta,
+                            true,
+                            false,
+                            None,
+                            fused,
+                            Blocking::REFERENCE,
+                        )
                     });
                 }
                 check("scalar twin", &mut |c| {

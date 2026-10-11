@@ -166,6 +166,11 @@ pub unsafe extern "C" fn wukong_topk_f32(
     idx: *mut i64,
     ni: i64,
 ) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent(x, n);
+    crate::safety::debug_extent(vals, nv);
+    crate::safety::debug_extent(idx, ni);
+    crate::safety::debug_disjoint(vals, nv, idx, ni);
     // SAFETY: forwarded from this function's contract; the copy ends the input borrow before the
     // outputs are created, so an overlapping output never coexists with it.
     // SAFETY: `x` points at n readable f32; the immediate `to_vec` copies them before any output slice exists, so a later output overlap cannot corrupt the read.
@@ -190,6 +195,9 @@ pub unsafe extern "C" fn wukong_argsort_f32(
     ni: i64,
     descending: i64,
 ) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent(x, n);
+    crate::safety::debug_extent(idx, ni);
     // SAFETY: forwarded from this function's contract (an `i64` output cannot overlap an `f32`
     // input in a well-typed program, but the copy keeps the entry sound even if it did).
     // SAFETY: `x` points at n readable f32, copied immediately; a later output overlap cannot corrupt the read.
@@ -205,6 +213,8 @@ pub unsafe extern "C" fn wukong_argsort_f32(
 /// `p` must address `n` readable `f32`s.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sample_categorical_f32(p: *const f32, n: i64, u: f32) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent(p, n);
     // SAFETY: forwarded from this function's contract.
     sample_categorical(unsafe { input(p, n) }, u)
 }

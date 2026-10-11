@@ -196,11 +196,13 @@ unsafe fn gemv_rows(a: *const f32, x: *const f32, y: *mut f32, m: usize, n: usiz
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sgemv(a: *const f32, x: *const f32, y: *mut f32, m: i64, n: i64) {
     // P14.5: a valid for m*n, x for n, y for m; y disjoint from a and x (documented all-disjoint).
-    crate::safety::debug_extent_2d(a, m, n);
-    crate::safety::debug_extent(x, n);
-    crate::safety::debug_extent(y, m);
-    crate::safety::debug_disjoint(y, m, a, m.saturating_mul(n));
-    crate::safety::debug_disjoint(y, m, x, n);
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, n);
+        crate::safety::debug_extent(x, n);
+        crate::safety::debug_extent(y, m);
+        crate::safety::debug_disjoint(y, m, a, m.saturating_mul(n));
+        crate::safety::debug_disjoint(y, m, x, n);
+    }
     if m <= 0 || n <= 0 {
         return;
     }
@@ -229,6 +231,14 @@ pub unsafe extern "C" fn wukong_sgemv_alpha(
     n: i64,
     alpha: f32,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, n);
+        crate::safety::debug_extent(x, n);
+        crate::safety::debug_extent(y, m);
+        crate::safety::debug_disjoint(y, m, a, m.saturating_mul(n));
+        crate::safety::debug_disjoint(y, m, x, n);
+    }
     if m <= 0 || n <= 0 {
         return;
     }
@@ -253,6 +263,14 @@ pub unsafe extern "C" fn wukong_sgemv_alpha_parallel(
     n: i64,
     alpha: f32,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, n);
+        crate::safety::debug_extent(x, n);
+        crate::safety::debug_extent(y, m);
+        crate::safety::debug_disjoint(y, m, a, m.saturating_mul(n));
+        crate::safety::debug_disjoint(y, m, x, n);
+    }
     if m <= 0 || n <= 0 {
         return;
     }
@@ -264,7 +282,6 @@ pub unsafe extern "C" fn wukong_sgemv_alpha_parallel(
     }
     #[cfg(target_arch = "x86_64")]
     {
-        use rayon::prelude::*;
         // A `@parallel` GEMV can be the process's FIRST rayon touch (a decode-step LM head runs
         // before any outlined region), so it must configure the global pool before forking — the
         // invariant `ensure_global_pool` states: whoever forks first decides the registry, and a
@@ -278,7 +295,7 @@ pub unsafe extern "C" fn wukong_sgemv_alpha_parallel(
             return;
         }
         let (a_addr, x_addr, y_addr) = (a as usize, x as usize, y as usize);
-        (0..mu.div_ceil(2)).into_par_iter().for_each(|pair| {
+        crate::par::for_each_unit(mu.div_ceil(2), |pair| {
             let i = pair * 2;
             // SAFETY: each task owns one disjoint pair of rows (or the final single row).
             unsafe {
@@ -313,6 +330,14 @@ pub unsafe extern "C" fn wukong_sgemv_parallel(
     m: i64,
     n: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, n);
+        crate::safety::debug_extent(x, n);
+        crate::safety::debug_extent(y, m);
+        crate::safety::debug_disjoint(y, m, a, m.saturating_mul(n));
+        crate::safety::debug_disjoint(y, m, x, n);
+    }
     wukong_sgemv_alpha_parallel(a, x, y, m, n, 1.0);
 }
 

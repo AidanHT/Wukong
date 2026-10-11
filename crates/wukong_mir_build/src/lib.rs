@@ -1105,6 +1105,17 @@ pub struct LowerOptions {
     /// evaluation in source order with one IEEE rounding per source operation, vectorized only
     /// lane-wise. See `strict_fp_gemm` and `docs/language-guide.md` "Floating-point semantics".
     pub strict_fp: bool,
+
+    /// Give a `@parallel` loop with no `grain` argument an implicit grain sized from its outlined
+    /// body (`par_grain::implicit_grain`, P12.21), so a tiny trip count becomes a one-chunk call
+    /// the runtime runs serially instead of a fork-join that costs more than the loop. `false`, the
+    /// default for library callers, keeps one claimable index per iteration -- what a PTX lowering
+    /// wants, since `--backend=gpu-native` maps one index to one thread. `wukong_driver` sets it
+    /// for every backend that executes on the CPU (`interp`, `native`, the `gpu` offload path whose
+    /// control flow runs in the interpreter, and the ahead-of-time object) and clears it for
+    /// `gpu-native`. Scheduling-only: iterations of an outlined loop are independent, so every grain
+    /// computes the same bits.
+    pub implicit_grain: bool,
 }
 
 impl Default for LowerOptions {
@@ -1114,6 +1125,7 @@ impl Default for LowerOptions {
             recognize: true,
             vec_kernels: true,
             strict_fp: false,
+            implicit_grain: false,
         }
     }
 }
@@ -1526,7 +1538,8 @@ fn lower_program_pooled(
         },
         next: 0,
         funcs: Vec::new(),
-        grain: 1,
+        grain: None,
+        implicit: opts.implicit_grain,
         exhausted: false,
     };
     let no_subst: HashMap<Symbol, Ty> = HashMap::default();
@@ -1593,8 +1606,9 @@ fn lower_program_pooled(
         if let ast::ItemKind::Fn(f) = &item.kind {
             if let Some(body) = &f.body {
                 // `@parallel(grain = G)`: every region this function outlines hands each worker
-                // runs of at least G iterations (see `par_grain`). 1 for every other function.
-                par_regions.grain = par_grain::item_grain(item, interner);
+                // runs of at least G iterations (see `par_grain`). `None` -- no user grain -- takes
+                // the implicit grain when `LowerOptions::implicit_grain` is set, else 1.
+                par_regions.grain = par_grain::user_grain(item, interner);
                 // A type-generic function (`fn id<T>(x: T)`) is lowered once per concrete
                 // instantiation, below — skip the generic template itself. Dimension-only generics
                 // (`fn f<N>(a: Tensor[f32, N])`) are not type-generic and lower normally here.
@@ -2329,6 +2343,7 @@ fn lower_program_pooled(
                             interner,
                             gemm,
                             par_regions.grain,
+                            par_regions.implicit,
                             &mut diags,
                         );
                         // Both halves are built with an empty tile queue (`lower_parallel`), so a
@@ -3250,9 +3265,11 @@ fn merge_repr_ty(result_ty: &MirType) -> MirType {
 ///   * the original `f.name(params…)` — a wrapper that packs the parameter pointers into a stack
 ///     `env`, then calls `wukong_parallel_for(hi, &par, env)`.
 ///
-/// With `@parallel(grain = G)`, `G > 1`, the wrapper passes `ceil(hi / G)` chunks instead and
-/// appends the address of a stack slot holding `hi` to `env`; the body loads it and maps its chunk
-/// span back to iterations (see `par_grain`). `hi` is evaluated once, in the wrapper, either way.
+/// With a grain `G > 1` -- the user's `@parallel(grain = G)`, or the implicit grain when
+/// `implicit_grain` is set and the user gave none (see `par_grain`) -- the wrapper passes
+/// `ceil(hi / G)` chunks instead and appends the address of a stack slot holding `hi` to `env`; the
+/// body loads it and maps its chunk span back to iterations. `hi` is evaluated once, in the
+/// wrapper, either way.
 #[allow(clippy::too_many_arguments)]
 fn lower_parallel(
     f: &FnDecl,
@@ -3264,7 +3281,8 @@ fn lower_parallel(
     sema: &SemaResult,
     interner: &Interner,
     gemm: GemmSyms,
-    grain: u64,
+    user_grain: Option<u64>,
+    implicit_grain: bool,
     diags: &mut Vec<Diagnostic>,
 ) -> (Function, Function) {
     let (param_tys, ret_ty) = match sema.defs.lookup(f.name.sym).map(|d| &d.kind) {
@@ -3277,8 +3295,8 @@ fn lower_parallel(
     let ret_mir = ret_mir_ty(f, &ret_ty, sema, interner, diags);
     let k = f.params.len();
 
-    // ---- outlined body: par_sym(start, end, env) ----
-    let outlined = {
+    // ---- outlined body: par_sym(start, end, env), at the grain `par_grain` settles on ----
+    let build_outlined = |grain: u64, diags: &mut Vec<Diagnostic>| -> Function {
         let mut fl = FnLowerer {
             builder: Builder::new(par_sym, MirType::Void),
             preserve_aggregate_blocks: false,
@@ -3287,7 +3305,7 @@ fn lower_parallel(
             unrepresentable: RefCell::default(),
             sema,
             interner,
-            diags: &mut *diags,
+            diags,
             scopes: vec![HashMap::default()],
             field_bases: vec![HashMap::default()],
             terminated: false,
@@ -3371,6 +3389,8 @@ fn lower_parallel(
         }
         fl.finish()
     };
+    let (outlined, grain) =
+        par_grain::outline_with_grain(user_grain, implicit_grain, diags, build_outlined);
 
     // ---- wrapper: f.name(params…) ----
     let wrapper = {
@@ -3504,8 +3524,11 @@ struct ParRegions {
     syms: Vec<Symbol>,
     next: usize,
     funcs: Vec<Function>,
-    /// The `@parallel(grain = G)` of the function currently being lowered (1 by default).
-    grain: u64,
+    /// The `@parallel(grain = G)` of the function currently being lowered; `None` when it names no
+    /// grain (then [`LowerOptions::implicit_grain`] decides, see `par_grain`).
+    grain: Option<u64>,
+    /// [`LowerOptions::implicit_grain`].
+    implicit: bool,
     /// Set when a region stayed serial because `syms` ran out — the signal for
     /// [`lower_program_with`] to redo the lowering with a larger pool.
     exhausted: bool,
@@ -15442,11 +15465,11 @@ impl FnLowerer<'_> {
     ) -> bool {
         // Reserve an outlined-body symbol from the pool. Pool exhausted -> stay serial in THIS
         // attempt and flag it; `lower_program_with` then redoes the lowering with a larger pool.
-        let (par_sym, pfor, grain) = match self.par.as_deref_mut() {
+        let (par_sym, pfor, user_grain, implicit) = match self.par.as_deref_mut() {
             Some(p) if p.next < p.syms.len() => {
                 let s = p.syms[p.next];
                 p.next += 1;
-                (s, p.pfor, p.grain)
+                (s, p.pfor, p.grain, p.implicit)
             }
             Some(p) => {
                 p.exhausted = true;
@@ -15454,8 +15477,6 @@ impl FnLowerer<'_> {
             }
             None => return false,
         };
-        // `@parallel(grain = G)`: the call passes ceil(n / G) chunk indices (see `par_grain`).
-        let chunks = par_grain::const_chunks(n, grain);
         // A captured array's bound ValueId IS its base pointer; a captured scalar's is its alloca
         // slot pointer. Both are pointer-shaped, so the env is a uniform pointer table. Scalars are
         // read-only inside the region (matcher-enforced), so sharing the slot is race-free.
@@ -15471,40 +15492,11 @@ impl FnLowerer<'_> {
             })
             .collect();
 
-        // ---- call site: env pack + wukong_parallel_for(N, &body, env) ----
-        let k = caps.len().max(1) as u32;
-        let env = self
-            .builder
-            .alloca(MirType::Array(Box::new(MirType::Ptr), k));
-        for (i, (_, vid, _, _)) in caps.iter().enumerate() {
-            let kidx = self
-                .builder
-                .build(MirType::I64, Op::ConstInt(i as i128, MirType::I64));
-            let slot = self.builder.build(
-                MirType::Ptr,
-                Op::Gep {
-                    ptr: env,
-                    index: kidx,
-                    elem: MirType::Ptr,
-                },
-            );
-            self.builder.build_void(Op::Store {
-                ptr: slot,
-                value: *vid,
-            });
-        }
-        let nv = self
-            .builder
-            .build(MirType::I64, Op::ConstInt(chunks as i128, MirType::I64));
-        let addr = self.builder.build(MirType::Ptr, Op::FuncAddr(par_sym));
-        self.builder.build_void(Op::Call {
-            func: pfor,
-            args: vec![nv, addr, env],
-        });
-
-        // ---- outlined body: par_sym(start: i64, end: i64, env: ptr) ----
+        // ---- outlined body: par_sym(start: i64, end: i64, env: ptr), at the grain `par_grain`
+        // settles on (the user's, else the implicit grain when enabled, else 1) ----
         let mut tmp_diags: Vec<Diagnostic> = Vec::new();
-        let outlined = {
+        let build_outlined = |grain: u64, diags: &mut Vec<Diagnostic>| -> Function {
+            let chunks = par_grain::const_chunks(n, grain);
             let mut fl = FnLowerer {
                 builder: Builder::new(par_sym, MirType::Void),
                 preserve_aggregate_blocks: false,
@@ -15513,7 +15505,7 @@ impl FnLowerer<'_> {
                 unrepresentable: RefCell::default(),
                 sema: self.sema,
                 interner: self.interner,
-                diags: &mut tmp_diags,
+                diags,
                 scopes: vec![HashMap::default()],
                 field_bases: vec![HashMap::default()],
                 terminated: false,
@@ -15576,6 +15568,42 @@ impl FnLowerer<'_> {
             }
             fl.finish()
         };
+        let (outlined, grain) =
+            par_grain::outline_with_grain(user_grain, implicit, &mut tmp_diags, build_outlined);
+        // The call passes ceil(n / G) chunk indices (see `par_grain`).
+        let chunks = par_grain::const_chunks(n, grain);
+
+        // ---- call site: env pack + wukong_parallel_for(N, &body, env) ----
+        let k = caps.len().max(1) as u32;
+        let env = self
+            .builder
+            .alloca(MirType::Array(Box::new(MirType::Ptr), k));
+        for (i, (_, vid, _, _)) in caps.iter().enumerate() {
+            let kidx = self
+                .builder
+                .build(MirType::I64, Op::ConstInt(i as i128, MirType::I64));
+            let slot = self.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: env,
+                    index: kidx,
+                    elem: MirType::Ptr,
+                },
+            );
+            self.builder.build_void(Op::Store {
+                ptr: slot,
+                value: *vid,
+            });
+        }
+        let nv = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(chunks as i128, MirType::I64));
+        let addr = self.builder.build(MirType::Ptr, Op::FuncAddr(par_sym));
+        self.builder.build_void(Op::Call {
+            func: pfor,
+            args: vec![nv, addr, env],
+        });
+
         self.diags.extend(tmp_diags);
         self.par
             .as_deref_mut()

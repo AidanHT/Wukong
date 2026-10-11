@@ -21,8 +21,6 @@
 //! so even the cross-language check is exact. Serial == parallel bit-for-bit (rows independent, no
 //! cross-row combine); the interpreter marshals the serial form, so the differential oracle is exact.
 
-use rayon::prelude::*;
-
 /// Inclusive prefix product of one row in place: `p ← p * x[i]; out[i] ← p` for `i = 0..cols`, with `p`
 /// starting at `1.0` (the multiplicative identity) carried in a register. The tail helper (rows the
 /// 4-wide block doesn't cover) and the building block the interleaved scan reduces to.
@@ -81,6 +79,17 @@ unsafe fn cumprod_rows(x: *const f32, out: *mut f32, cols: usize, r0: usize, r1:
 /// `x` is not the source scan.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_cumprod_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent_2d(out, rows, cols);
+        crate::safety::debug_inplace_or_disjoint(
+            out,
+            rows.saturating_mul(cols),
+            x,
+            rows.saturating_mul(cols),
+        );
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -104,6 +113,17 @@ pub unsafe extern "C" fn wukong_cumprod_f32_parallel(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent_2d(out, rows, cols);
+        crate::safety::debug_inplace_or_disjoint(
+            out,
+            rows.saturating_mul(cols),
+            x,
+            rows.saturating_mul(cols),
+        );
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -123,7 +143,7 @@ pub unsafe extern "C" fn wukong_cumprod_f32_parallel(
     let nthreads = rayon::current_num_threads().max(1);
     let per = rows.div_ceil(nthreads).max(1);
     let nchunks = rows.div_ceil(per);
-    (0..nchunks).into_par_iter().for_each(|c| {
+    crate::par::for_each_unit(nchunks, |c| {
         let r0 = c * per;
         let r1 = (r0 + per).min(rows);
         // SAFETY: rows [r0, r1) disjoint across chunks; pointers re-derived from captured addresses.

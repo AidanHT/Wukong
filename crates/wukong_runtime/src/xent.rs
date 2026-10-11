@@ -45,7 +45,6 @@
 #[cfg(target_arch = "x86_64")]
 use crate::vmath::exp8;
 use crate::vmath::{exp1, log1};
-use rayon::prelude::*;
 
 /// Fixed-order horizontal sum of 8 lane accumulators — a balanced tree, identical in the scalar twin
 /// and the AVX2 path (which stores its `__m256` to `[f32; 8]` and calls this), so both give the same
@@ -206,6 +205,14 @@ pub unsafe extern "C" fn wukong_xent_fwd_f32(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent(target, rows);
+        crate::safety::debug_extent(loss, rows);
+        crate::safety::debug_disjoint(loss, rows, x, rows.saturating_mul(cols));
+        crate::safety::debug_disjoint(loss, rows, target, rows);
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -236,6 +243,14 @@ pub unsafe extern "C" fn wukong_xent_fwd_f32_parallel(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent(target, rows);
+        crate::safety::debug_extent(loss, rows);
+        crate::safety::debug_disjoint(loss, rows, x, rows.saturating_mul(cols));
+        crate::safety::debug_disjoint(loss, rows, target, rows);
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -254,7 +269,7 @@ pub unsafe extern "C" fn wukong_xent_fwd_f32_parallel(
     // Raw pointers cross the rayon boundary as integers (the `target` i32 pointer and the `loss`
     // pointer cross as `usize` too); each row is a disjoint sub-slice, `target`/`loss` indexed by row.
     let (x_addr, t_addr, l_addr) = (x as usize, target as usize, loss as usize);
-    (0..r).into_par_iter().for_each(|row| {
+    crate::par::for_each_unit(r, |row| {
         // SAFETY: disjoint row slices; pointers re-derived from the captured addresses; the label is
         // bounded by `xent_row`'s own `target < c` check, exactly as in the serial entry.
         unsafe {

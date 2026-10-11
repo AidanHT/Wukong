@@ -675,6 +675,11 @@ pub unsafe extern "C" fn wukong_rt_fmt_int(
     x: i64,
     spec: i64,
 ) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above); a null buffer sink is the
+    // counting mode; a stream target ignores `buf`.
+    if target == TARGET_BUFFER {
+        crate::safety::debug_extent_opt(buf, cap);
+    }
     let mut s = Vec::new();
     format_int(&mut s, x, Spec::unpack(spec));
     // SAFETY: forwarded from this function's contract.
@@ -694,6 +699,11 @@ pub unsafe extern "C" fn wukong_rt_fmt_f64(
     x: f64,
     spec: i64,
 ) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above); a null buffer sink is the
+    // counting mode; a stream target ignores `buf`.
+    if target == TARGET_BUFFER {
+        crate::safety::debug_extent_opt(buf, cap);
+    }
     let mut s = Vec::new();
     format_f64(&mut s, x, Spec::unpack(spec));
     // SAFETY: forwarded from this function's contract.
@@ -713,6 +723,11 @@ pub unsafe extern "C" fn wukong_rt_fmt_f32(
     x: f32,
     spec: i64,
 ) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above); a null buffer sink is the
+    // counting mode; a stream target ignores `buf`.
+    if target == TARGET_BUFFER {
+        crate::safety::debug_extent_opt(buf, cap);
+    }
     let mut s = Vec::new();
     format_f32(&mut s, x, Spec::unpack(spec));
     // SAFETY: forwarded from this function's contract.
@@ -734,6 +749,12 @@ pub unsafe extern "C" fn wukong_rt_fmt_str(
     n: i64,
     spec: i64,
 ) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above); a null buffer sink is the
+    // counting mode; `n < 0` is a NUL-terminated `s` (no extent).
+    if target == TARGET_BUFFER {
+        crate::safety::debug_extent_opt(buf, cap);
+    }
+    crate::safety::debug_extent_opt(s, n);
     let mut out = Vec::new();
     // SAFETY: forwarded from this function's contract.
     format_str(&mut out, unsafe { str_operand(s, n) }, Spec::unpack(spec));
@@ -761,6 +782,11 @@ pub unsafe extern "C" fn wukong_rt_fmt_lit(
     packed: i64,
     n: i64,
 ) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above); a null buffer sink is the
+    // counting mode; a stream target ignores `buf`.
+    if target == TARGET_BUFFER {
+        crate::safety::debug_extent_opt(buf, cap);
+    }
     let (bytes, n) = lit_operand(packed, n);
     // SAFETY: forwarded from this function's contract.
     unsafe { emit(target, buf, cap, pos, &bytes[..n]) }
@@ -783,6 +809,14 @@ pub unsafe extern "C" fn wukong_rt_fmt_slice(
     dtype: i64,
     spec: i64,
 ) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above); a null buffer sink is the
+    // counting mode; a stream target ignores `buf`.
+    if target == TARGET_BUFFER {
+        crate::safety::debug_extent_opt(buf, cap);
+    }
+    if let Some(sz) = elem_size(dtype) {
+        crate::safety::debug_extent_bytes(data, len, sz);
+    }
     let spec = Spec::unpack(spec);
     let len = if data.is_null() || elem_size(dtype).is_none() {
         0
