@@ -53,6 +53,9 @@ All notable changes to Wukong are documented here. The format is loosely based o
   the scrutinee and is now `E0200` (parenthesize: `&& (a || b)`; `tests/fail/if_let_chain_or.wk`); a
   `&&` that used to be part of the scrutinee is now a guard, which gives the same result for a `bool`
   pattern. A second `let` in one chain is `E0200`. No `.wk` file in the repository used either form.
+  Each `&&` of the chain is charged to the parser's nesting budget, as a fold of any other `&&`
+  chain is, so a pathologically long one is `E0209` rather than a guard too deep for the passes
+  after the parser.
 - **A binding inside an or-pattern** (`E::A(v) | E::B(v) => v`) is refused once at the pattern
   (`C0001`, "a binding inside an or-pattern") instead of at every use of the name.
 

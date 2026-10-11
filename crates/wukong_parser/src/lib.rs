@@ -1577,9 +1577,20 @@ impl<'a> Parser<'a> {
     /// chain and a `||` after the condition are `E0200`; each is consumed to recover.
     fn parse_let_chain_guard(&mut self) -> Option<Expr> {
         let prev = std::mem::replace(&mut self.no_struct_lit, true);
+        let saved = self.depth;
         let operand_bp = binop_bp(BinOp::And) + 1;
         let mut guard: Option<Expr> = None;
-        while self.eat(T::AmpAmp) {
+        while self.at(T::AmpAmp) {
+            // Each operand deepens the left-folded guard by one, exactly as a fold of the binop
+            // loop in `parse_expr_bp` does, so it is charged to the same budget: a long chain is
+            // E0209, not a tree too deep for the recursive walks after the parser.
+            self.depth += 1;
+            if self.depth > Self::MAX_DEPTH {
+                let sp = self.span();
+                self.too_deep(sp);
+                break;
+            }
+            self.bump(); // &&
             if self.at(T::Let) {
                 let at = self.span();
                 self.chain_error(
@@ -1623,6 +1634,7 @@ impl<'a> Parser<'a> {
                 self.parse_expr_bp(binop_bp(BinOp::Or) + 1);
             }
         }
+        self.depth = saved;
         self.no_struct_lit = prev;
         guard
     }
@@ -3607,6 +3619,38 @@ mod tests {
             codes("if let x = a && let y = b { 1 } else { 0 }"),
             vec!["E0200"]
         );
+    }
+
+    /// The `&&` chain after an `if let`/`while let` scrutinee is folded left in its own loop, so,
+    /// like the binop loop in `parse_expr_bp`, each fold must charge the depth budget: a 5000-long
+    /// chain parsed with no diagnostic into a 5000-deep guard that sema and lowering then recurse
+    /// over, instead of reporting E0209 as the same chain after an `if` does.
+    #[test]
+    fn a_long_let_chain_reports_e0209() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let has_e0209 =
+                    |diags: &[Diagnostic]| diags.iter().any(|d| d.code == Some("E0209"));
+                let n = 5000;
+                let chain = "&& c ".repeat(n);
+                let mut i = Interner::new();
+                let src = format!("if let x = e {chain}{{ 1 }} else {{ 0 }}");
+                let (_e, d) = parse_expr_str(&src, SourceId(0), &mut i);
+                assert!(has_e0209(&d), "long `if let` chain: {d:?}");
+                let src = format!("fn f() {{ while let x = e {chain}{{ break; }} }}");
+                let mut i = Interner::new();
+                let (_m, d) = parse_module(&src, SourceId(0), &mut i);
+                assert!(has_e0209(&d), "long `while let` chain: {d:?}");
+                // A realistic chain stays far under the limit.
+                let src = format!("if let x = e {}{{ 1 }} else {{ 0 }}", "&& c ".repeat(50));
+                let mut i = Interner::new();
+                let (_e, d) = parse_expr_str(&src, SourceId(0), &mut i);
+                assert!(d.is_empty(), "a 50-long chain parses cleanly: {d:?}");
+            })
+            .expect("spawn parser thread")
+            .join()
+            .expect("the parser must not overflow its stack on a long let chain");
     }
 
     /// The entry points other than `parse_module_tokens_with_lints` never report a lint.
