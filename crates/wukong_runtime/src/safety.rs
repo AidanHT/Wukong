@@ -65,8 +65,13 @@ pub extern "C" fn wukong_rt_bounds_fail(index: i64, len: i64, site: *const u8) {
 // enforces that textually over every runtime module.
 //
 // The checks compile OUT of the release perf builds (each body is `if cfg!(debug_assertions)`) and
-// are a no-op for a zero or negative extent, which every entry treats as a legal no-op -- so they
-// never fail on an input a valid caller is allowed to pass. They cannot check a *memory bound*: a
+// are a no-op for a zero or negative extent, which every entry treats as a legal no-op. An entry
+// taking a SHAPE (`rows, cols`; GEMM's `m, k, n`) wraps its checks in
+// `if cfg!(debug_assertions) && <every dimension> > 0`, its own no-op condition negated, because a
+// derived extent is not enough: two negative dimensions multiply to a positive span (`-7 * -1`, and
+// `i64::MIN * -1` saturates to `i64::MAX`), and a one-dimension extent (`b: cols`) is positive while
+// the OTHER dimension is empty. So a call the entry treats as a no-op never asserts, whatever
+// pointers it carries (`tests::no_op_calls_never_assert`). They cannot check a *memory bound*: a
 // C-ABI entry carries no capacity, only the extent, so the facts expressible from
 // `(pointer, extent)` are that a nonempty buffer pointer is non-null and that the extent does not
 // overflow the `p.add(n)` the kernel performs, plus -- for entries whose `# Safety` contract
@@ -236,6 +241,225 @@ mod tests {
                 debug_extent_bytes(std::ptr::null(), 2, 8)
             });
         }
+    }
+
+    /// The checks' no-op guarantee, end to end: a call the ENTRY treats as a no-op -- some
+    /// dimension non-positive, so it returns before touching memory -- never asserts, whatever
+    /// pointers it carries. Every shape-taking entry is driven through every non-positive mix of
+    /// its dimensions with two operand layouts: all null, and all shifted views of one buffer. A
+    /// check that runs on such a call trips on one of them (a positive extent on null, or an
+    /// overlapping documented-disjoint / shifted in-place pair). The traps this pins: the product
+    /// of two negative dimensions is positive (`-7 * -1`, and `i64::MIN * -1` saturates to
+    /// `i64::MAX`), a one-dimension extent (`b: cols`) is positive when only the OTHER dimension
+    /// is empty, and the GEMM family is a no-op for `k <= 0` too. A violation aborts the test
+    /// binary (a panic cannot unwind out of an `extern "C"` entry). Release builds compile the
+    /// checks out, so there the sweep only proves the entries' early returns.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn no_op_calls_never_assert() {
+        // 4 is the one positive value: a tuple is a no-op exactly when some entry dimension is not.
+        const V: [i64; 5] = [4, 0, -1, -7, i64::MIN];
+        let mut buf = [0.0f32; 16];
+        let base = buf.as_mut_ptr();
+        let mut calls = 0usize;
+        for shifted in [false, true] {
+            // Operand `i`: null, or a view `i` elements into the one shared buffer.
+            let p = |i: usize| {
+                if shifted {
+                    base.wrapping_add(i)
+                } else {
+                    std::ptr::null_mut()
+                }
+            };
+            let (p0, p1, p2, p3, p4) = (p(0), p(1), p(2), p(3), p(4));
+            let (h0, h1) = (p0.cast::<u16>(), p1.cast::<u16>());
+            let i32p = |q: *mut f32| q.cast::<i32>();
+            for a in V {
+                for b in V {
+                    if a > 0 && b > 0 {
+                        continue;
+                    }
+                    calls += 1;
+                    // SAFETY: `a` or `b` is non-positive, a no-op dimension for every entry here,
+                    // so each returns before dereferencing an operand.
+                    unsafe {
+                        crate::wukong_attention_f32(p0, p1, p2, p3, a, b, 1.0, 0);
+                        crate::wukong_bias_bcast_f32(p0, p1, p2, a, b, 0);
+                        crate::wukong_bias_bcast_f32_parallel(p0, p1, p2, a, b, 0);
+                        crate::wukong_colargmax_i32(p0, i32p(p1), a, b);
+                        crate::wukong_colargmax_i32_parallel(p0, i32p(p1), a, b);
+                        crate::wukong_colargmin_i32(p0, i32p(p1), a, b);
+                        crate::wukong_colargmin_i32_parallel(p0, i32p(p1), a, b);
+                        crate::wukong_colsum_f32(p0, p1, a, b);
+                        crate::wukong_colsum_f32_parallel(p0, p1, a, b);
+                        crate::wukong_colmax_f32(p0, p1, a, b);
+                        crate::wukong_colmax_f32_parallel(p0, p1, a, b);
+                        crate::wukong_colmin_f32(p0, p1, a, b);
+                        crate::wukong_colmin_f32_parallel(p0, p1, a, b);
+                        crate::wukong_colmaxabs_f32(p0, p1, a, b);
+                        crate::wukong_colmaxabs_f32_parallel(p0, p1, a, b);
+                        crate::wukong_colmean_f32(p0, p1, a, b);
+                        crate::wukong_colmean_f32_parallel(p0, p1, a, b);
+                        crate::wukong_coll2_f32(p0, p1, a, b);
+                        crate::wukong_coll2_f32_parallel(p0, p1, a, b);
+                        crate::wukong_colrms_f32(p0, p1, a, b);
+                        crate::wukong_colrms_f32_parallel(p0, p1, a, b);
+                        crate::wukong_colsumsq_f32(p0, p1, a, b);
+                        crate::wukong_colsumsq_f32_parallel(p0, p1, a, b);
+                        crate::wukong_cummax_f32(p0, p1, a, b);
+                        crate::wukong_cummax_f32_parallel(p0, p1, a, b);
+                        crate::wukong_cummin_f32(p0, p1, a, b);
+                        crate::wukong_cummin_f32_parallel(p0, p1, a, b);
+                        crate::wukong_cumprod_f32(p0, p1, a, b);
+                        crate::wukong_cumprod_f32_parallel(p0, p1, a, b);
+                        crate::wukong_cumsum_f32(p0, p1, a, b);
+                        crate::wukong_cumsum_f32_parallel(p0, p1, a, b);
+                        crate::wukong_dequant_perchan_f32(p0.cast::<u8>(), p1, a, b, p2, 0);
+                        crate::wukong_dequant_perchan_f32_parallel(
+                            p0.cast::<u8>(),
+                            p1,
+                            a,
+                            b,
+                            p2,
+                            0,
+                        );
+                        crate::wukong_entropy_f32(p0, p1, a, b);
+                        crate::wukong_entropy_f32_parallel(p0, p1, a, b);
+                        crate::wukong_sgemv(p0, p1, p2, a, b);
+                        crate::wukong_sgemv_parallel(p0, p1, p2, a, b);
+                        crate::wukong_sgemv_alpha(p0, p1, p2, a, b, 1.0);
+                        crate::wukong_sgemv_alpha_parallel(p0, p1, p2, a, b, 1.0);
+                        crate::wukong_sgevm_f32(p0, p1, p2, a, b, 1.0);
+                        crate::wukong_sgevm_f32_parallel(p0, p1, p2, a, b, 1.0);
+                        crate::wukong_kd_loss_f32(p0, p1, p2, a, b);
+                        crate::wukong_kd_loss_f32_parallel(p0, p1, p2, a, b);
+                        crate::wukong_kldiv_f32(p0, p1, p2, a, b);
+                        crate::wukong_kldiv_f32_parallel(p0, p1, p2, a, b);
+                        crate::wukong_layernorm_bwd_f32(p0, p1, p2, p3, a, b, 0);
+                        crate::wukong_layernorm_bwd_f32_parallel(p0, p1, p2, p3, a, b, 0);
+                        crate::wukong_logsoftmax_f32(p0, p1, a, b);
+                        crate::wukong_logsoftmax_f32_parallel(p0, p1, a, b);
+                        crate::wukong_logsumexp_f32(p0, p1, a, b);
+                        crate::wukong_logsumexp_f32_parallel(p0, p1, a, b);
+                        crate::wukong_lrscan_f32(p0, p1, p2, a, b);
+                        crate::wukong_lrscan_f32_parallel(p0, p1, p2, a, b);
+                        crate::wukong_norm_f32(p0, p1, a, b, 0, 0);
+                        crate::wukong_norm_f32_parallel(p0, p1, a, b, 0, 0);
+                        crate::wukong_norm_affine_f32(p0, p1, p2, p3, a, b, 0, 0);
+                        crate::wukong_norm_affine_f32_parallel(p0, p1, p2, p3, a, b, 0, 0);
+                        crate::wukong_rmsnorm_bwd_f32(p0, p1, p2, p3, a, b, 0);
+                        crate::wukong_rmsnorm_bwd_f32_parallel(p0, p1, p2, p3, a, b, 0);
+                        crate::wukong_rope_f32(p0, p1, p2, a, b);
+                        crate::wukong_rope_f32_parallel(p0, p1, p2, a, b);
+                        crate::wukong_rope_bwd_f32(p0, p1, p2, a, b);
+                        crate::wukong_rope_bwd_f32_parallel(p0, p1, p2, a, b);
+                        crate::wukong_rowargmax_i32(p0, i32p(p1), a, b);
+                        crate::wukong_rowargmax_i32_parallel(p0, i32p(p1), a, b);
+                        crate::wukong_rowargmin_i32(p0, i32p(p1), a, b);
+                        crate::wukong_rowargmin_i32_parallel(p0, i32p(p1), a, b);
+                        crate::wukong_softmax_bwd_f32(p0, p1, p2, a, b);
+                        crate::wukong_softmax_bwd_f32_parallel(p0, p1, p2, a, b);
+                        crate::wukong_transpose_f32(p0, p1, a, b);
+                        crate::wukong_transpose_f32_parallel(p0, p1, a, b);
+                        crate::wukong_transpose_u16(h0, h1, a, b);
+                        crate::wukong_transpose_u16_parallel(h0, h1, a, b);
+                        crate::wukong_xent_fwd_f32(p0, i32p(p1), p2, a, b);
+                        crate::wukong_xent_fwd_f32_parallel(p0, i32p(p1), p2, a, b);
+                        crate::wukong_xent_bwd_f32(p0, i32p(p1), p2, a, b);
+                        crate::wukong_xent_bwd_f32_parallel(p0, i32p(p1), p2, a, b);
+                        // `(n, ncoeff)`: either non-positive is the no-op.
+                        crate::wukong_vhorner_f32(p0, p1, a, p2, b);
+                        // `(t, h)` with any `v`; and scatter's `(t, h, v)` below.
+                        for v in V {
+                            crate::wukong_embedding_f32(p0, p1, i32p(p2), a, b, v);
+                            crate::wukong_embedding_f32_parallel(p0, p1, i32p(p2), a, b, v);
+                        }
+                    }
+                    // `(m, k, n)`: the GEMM family returns when ANY of the three is non-positive,
+                    // `k` included.
+                    for c in V {
+                        // SAFETY: each `(m, k, n)` holds a non-positive `a` or `b`, a no-op
+                        // dimension for every entry here, so none dereferences an operand.
+                        unsafe {
+                            for (m, k, n) in [(a, b, c), (a, c, b), (c, a, b)] {
+                                crate::wukong_sgemm(p0, p1, p2, m, k, n, 0);
+                                crate::wukong_sgemm_parallel(p0, p1, p2, m, k, n, 0);
+                                crate::wukong_sgemm_nt(p0, p1, p2, m, k, n, 0);
+                                crate::wukong_sgemm_nt_parallel(p0, p1, p2, m, k, n, 0);
+                                crate::wukong_sgemm_nt_epi(p0, p1, p2, m, k, n, 0, p3, 0);
+                                crate::wukong_sgemm_nt_epi_parallel(p0, p1, p2, m, k, n, 0, p3, 0);
+                                crate::wukong_sgemm_nt_alpha(p0, p1, p2, m, k, n, 0, 1.0);
+                                crate::wukong_sgemm_nt_alpha_parallel(p0, p1, p2, m, k, n, 0, 1.0);
+                                crate::wukong_sgemm_tn(p0, p1, p2, m, k, n, 0);
+                                crate::wukong_sgemm_tn_parallel(p0, p1, p2, m, k, n, 0);
+                                crate::wukong_sgemm_bf16_nt(h0, h1, p2, m, k, n, 0);
+                                crate::wukong_sgemm_bf16_nt_parallel(h0, h1, p2, m, k, n, 0);
+                                crate::wukong_sgemm_f16_nt(h0, h1, p2, m, k, n, 0);
+                                crate::wukong_sgemm_f16_nt_parallel(h0, h1, p2, m, k, n, 0);
+                                crate::wukong_sgemm_bf16_nt_epi(h0, h1, p2, m, k, n, 0, p3, 0);
+                                crate::wukong_sgemm_bf16_nt_epi_parallel(
+                                    h0, h1, p2, m, k, n, 0, p3, 0,
+                                );
+                                crate::wukong_sgemm_f16_nt_epi(h0, h1, p2, m, k, n, 0, p3, 0);
+                                crate::wukong_sgemm_f16_nt_epi_parallel(
+                                    h0, h1, p2, m, k, n, 0, p3, 0,
+                                );
+                                crate::wukong_sgemm_bf16_tn(h0, h1, p2, m, k, n, 0);
+                                crate::wukong_sgemm_bf16_tn_parallel(h0, h1, p2, m, k, n, 0);
+                                crate::wukong_sgemm_f16_tn(h0, h1, p2, m, k, n, 0);
+                                crate::wukong_sgemm_f16_tn_parallel(h0, h1, p2, m, k, n, 0);
+                                let (u8p, i8p) = (p0.cast::<u8>(), p1.cast::<i8>());
+                                crate::wukong_i8gemm_nt(u8p, i8p, i32p(p2), m, k, n);
+                                crate::wukong_i8gemm_nt_parallel(u8p, i8p, i32p(p2), m, k, n);
+                                crate::wukong_i8gemm_nt_deq(u8p, i8p, p2, m, k, n, 1.0, p3, p4, 0);
+                                crate::wukong_i8gemm_nt_deq_parallel(
+                                    u8p, i8p, p2, m, k, n, 1.0, p3, p4, 0,
+                                );
+                                crate::wukong_scatter_add_f32(p0, p1, i32p(p2), m, k, n);
+                                crate::wukong_scatter_add_f32_parallel(p0, p1, i32p(p2), m, k, n);
+                            }
+                        }
+                    }
+                }
+            }
+            // Pooling: a no-op for `channels <= 0` or for a window that yields no output.
+            for ch in V {
+                for (h, w, kh, kw, sh, sw) in [
+                    (4, 4, 2, 2, 2, 2),
+                    (0, 4, 2, 2, 2, 2),
+                    (-7, -1, 2, 2, 2, 2),
+                    (4, 4, 5, 2, 2, 2),
+                    (4, 4, 2, 2, 0, -1),
+                    (i64::MIN, -1, -1, -1, 1, 1),
+                ] {
+                    if ch > 0 && crate::pool2d::pool2d_output_dims(h, w, kh, kw, sh, sw).is_some() {
+                        continue;
+                    }
+                    // SAFETY: no channels or no output window -- each entry returns untouched.
+                    unsafe {
+                        crate::wukong_maxpool2d_f32(p0, p1, ch, h, w, kh, kw, sh, sw);
+                        crate::wukong_maxpool2d_f32_parallel(p0, p1, ch, h, w, kh, kw, sh, sw);
+                        crate::wukong_avgpool2d_f32(p0, p1, ch, h, w, kh, kw, sh, sw);
+                        crate::wukong_avgpool2d_f32_parallel(p0, p1, ch, h, w, kh, kw, sh, sw);
+                    }
+                }
+            }
+            // One-extent entries: every helper is already a no-op for `n <= 0`.
+            for n in V.into_iter().filter(|&n| n <= 0) {
+                // SAFETY: `n <= 0` is a no-op for every entry here.
+                unsafe {
+                    crate::wukong_vmath_f32(p0, p1, n, 0);
+                    crate::wukong_vmath_f32_parallel(p0, p1, n, 0);
+                    crate::wukong_vmath2_f32(p0, p1, p2, n, 0);
+                    crate::wukong_velem_f32(p0, p1, p2, n, 1.0, 1.0, 0.0, -1);
+                    crate::wukong_velem_f32_parallel(p0, p1, p2, n, 1.0, 1.0, 0.0, -1);
+                    crate::wukong_dequant_f32(p0.cast::<u8>(), p1, n, 1.0, 0);
+                    crate::wukong_dequant_f32_parallel(p0.cast::<u8>(), p1, n, 1.0, 0);
+                    crate::wukong_rand_fill_f32(p0, n, 0, 0);
+                }
+            }
+        }
+        assert!(calls >= 2 * 24, "swept only {calls} two-dimension tuples");
     }
 
     #[test]

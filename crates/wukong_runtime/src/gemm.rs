@@ -816,7 +816,7 @@ pub unsafe extern "C" fn wukong_sgemm(
     beta: i64,
 ) {
     // P14.5: debug-build contract checks (the `# Safety` section above).
-    if cfg!(debug_assertions) && m > 0 && n > 0 {
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
         crate::safety::debug_extent_2d(a, m, k);
         crate::safety::debug_extent_2d(b, k, n);
         crate::safety::debug_extent_2d(c, m, n);
@@ -846,7 +846,7 @@ pub unsafe extern "C" fn wukong_sgemm_nt(
     beta: i64,
 ) {
     // P14.5: debug-build contract checks (the `# Safety` section above).
-    if cfg!(debug_assertions) && m > 0 && n > 0 {
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
         crate::safety::debug_extent_2d(a, m, k);
         crate::safety::debug_extent_2d(b, n, k);
         crate::safety::debug_extent_2d(c, m, n);
@@ -882,7 +882,7 @@ pub unsafe extern "C" fn wukong_sgemm_nt_epi(
     act: i64,
 ) {
     // P14.5: debug-build contract checks (the `# Safety` section above).
-    if cfg!(debug_assertions) && m > 0 && n > 0 {
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
         crate::safety::debug_extent_2d(a, m, k);
         crate::safety::debug_extent_2d(b, n, k);
         crate::safety::debug_extent_2d(c, m, n);
@@ -932,7 +932,7 @@ pub unsafe extern "C" fn wukong_sgemm_nt_alpha(
     alpha: f32,
 ) {
     // P14.5: debug-build contract checks (the `# Safety` section above).
-    if cfg!(debug_assertions) && m > 0 && n > 0 {
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
         crate::safety::debug_extent_2d(a, m, k);
         crate::safety::debug_extent_2d(b, n, k);
         crate::safety::debug_extent_2d(c, m, n);
@@ -971,7 +971,7 @@ pub unsafe extern "C" fn wukong_sgemm_nt_alpha_parallel(
     alpha: f32,
 ) {
     // P14.5: debug-build contract checks (the `# Safety` section above).
-    if cfg!(debug_assertions) && m > 0 && n > 0 {
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
         crate::safety::debug_extent_2d(a, m, k);
         crate::safety::debug_extent_2d(b, n, k);
         crate::safety::debug_extent_2d(c, m, n);
@@ -1136,7 +1136,7 @@ pub unsafe extern "C" fn wukong_sgemm_parallel(
     beta: i64,
 ) {
     // P14.5: debug-build contract checks (the `# Safety` section above).
-    if cfg!(debug_assertions) && m > 0 && n > 0 {
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
         crate::safety::debug_extent_2d(a, m, k);
         crate::safety::debug_extent_2d(b, k, n);
         crate::safety::debug_extent_2d(c, m, n);
@@ -1165,7 +1165,7 @@ pub unsafe extern "C" fn wukong_sgemm_nt_parallel(
     beta: i64,
 ) {
     // P14.5: debug-build contract checks (the `# Safety` section above).
-    if cfg!(debug_assertions) && m > 0 && n > 0 {
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
         crate::safety::debug_extent_2d(a, m, k);
         crate::safety::debug_extent_2d(b, n, k);
         crate::safety::debug_extent_2d(c, m, n);
@@ -1202,7 +1202,7 @@ pub unsafe extern "C" fn wukong_sgemm_nt_epi_parallel(
     act: i64,
 ) {
     // P14.5: debug-build contract checks (the `# Safety` section above).
-    if cfg!(debug_assertions) && m > 0 && n > 0 {
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
         crate::safety::debug_extent_2d(a, m, k);
         crate::safety::debug_extent_2d(b, n, k);
         crate::safety::debug_extent_2d(c, m, n);
@@ -1252,7 +1252,7 @@ pub unsafe extern "C" fn wukong_sgemm_tn(
     beta: i64,
 ) {
     // P14.5: debug-build contract checks (the `# Safety` section above).
-    if cfg!(debug_assertions) && m > 0 && n > 0 {
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
         crate::safety::debug_extent_2d(a, k, m);
         crate::safety::debug_extent_2d(b, k, n);
         crate::safety::debug_extent_2d(c, m, n);
@@ -1283,7 +1283,7 @@ pub unsafe extern "C" fn wukong_sgemm_tn_parallel(
     beta: i64,
 ) {
     // P14.5: debug-build contract checks (the `# Safety` section above).
-    if cfg!(debug_assertions) && m > 0 && n > 0 {
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
         crate::safety::debug_extent_2d(a, k, m);
         crate::safety::debug_extent_2d(b, k, n);
         crate::safety::debug_extent_2d(c, m, n);
@@ -1497,7 +1497,7 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_nt(
     beta: i64,
 ) {
     // P14.5: debug-build contract checks (the `# Safety` section above).
-    if cfg!(debug_assertions) && m > 0 && n > 0 {
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
         crate::safety::debug_extent_2d(a, m, k);
         crate::safety::debug_extent_2d(b, n, k);
         crate::safety::debug_extent_2d(c, m, n);
@@ -1527,7 +1527,7 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_nt_parallel(
     beta: i64,
 ) {
     // P14.5: debug-build contract checks (the `# Safety` section above).
-    if cfg!(debug_assertions) && m > 0 && n > 0 {
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
         crate::safety::debug_extent_2d(a, m, k);
         crate::safety::debug_extent_2d(b, n, k);
         crate::safety::debug_extent_2d(c, m, n);
@@ -1556,7 +1556,7 @@ pub unsafe extern "C" fn wukong_sgemm_f16_nt(
     beta: i64,
 ) {
     // P14.5: debug-build contract checks (the `# Safety` section above).
-    if cfg!(debug_assertions) && m > 0 && n > 0 {
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
         crate::safety::debug_extent_2d(a, m, k);
         crate::safety::debug_extent_2d(b, n, k);
         crate::safety::debug_extent_2d(c, m, n);
@@ -1584,7 +1584,7 @@ pub unsafe extern "C" fn wukong_sgemm_f16_nt_parallel(
     beta: i64,
 ) {
     // P14.5: debug-build contract checks (the `# Safety` section above).
-    if cfg!(debug_assertions) && m > 0 && n > 0 {
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
         crate::safety::debug_extent_2d(a, m, k);
         crate::safety::debug_extent_2d(b, n, k);
         crate::safety::debug_extent_2d(c, m, n);
@@ -1648,7 +1648,7 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_nt_epi(
     act: i64,
 ) {
     // P14.5: debug-build contract checks (the `# Safety` section above).
-    if cfg!(debug_assertions) && m > 0 && n > 0 {
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
         crate::safety::debug_extent_2d(a, m, k);
         crate::safety::debug_extent_2d(b, n, k);
         crate::safety::debug_extent_2d(c, m, n);
@@ -1680,7 +1680,7 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_nt_epi_parallel(
     act: i64,
 ) {
     // P14.5: debug-build contract checks (the `# Safety` section above).
-    if cfg!(debug_assertions) && m > 0 && n > 0 {
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
         crate::safety::debug_extent_2d(a, m, k);
         crate::safety::debug_extent_2d(b, n, k);
         crate::safety::debug_extent_2d(c, m, n);
@@ -1714,7 +1714,7 @@ pub unsafe extern "C" fn wukong_sgemm_f16_nt_epi(
     act: i64,
 ) {
     // P14.5: debug-build contract checks (the `# Safety` section above).
-    if cfg!(debug_assertions) && m > 0 && n > 0 {
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
         crate::safety::debug_extent_2d(a, m, k);
         crate::safety::debug_extent_2d(b, n, k);
         crate::safety::debug_extent_2d(c, m, n);
@@ -1746,7 +1746,7 @@ pub unsafe extern "C" fn wukong_sgemm_f16_nt_epi_parallel(
     act: i64,
 ) {
     // P14.5: debug-build contract checks (the `# Safety` section above).
-    if cfg!(debug_assertions) && m > 0 && n > 0 {
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
         crate::safety::debug_extent_2d(a, m, k);
         crate::safety::debug_extent_2d(b, n, k);
         crate::safety::debug_extent_2d(c, m, n);
@@ -1818,7 +1818,7 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_tn(
     beta: i64,
 ) {
     // P14.5: debug-build contract checks (the `# Safety` section above).
-    if cfg!(debug_assertions) && m > 0 && n > 0 {
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
         crate::safety::debug_extent_2d(a, k, m);
         crate::safety::debug_extent_2d(b, k, n);
         crate::safety::debug_extent_2d(c, m, n);
@@ -1848,7 +1848,7 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_tn_parallel(
     beta: i64,
 ) {
     // P14.5: debug-build contract checks (the `# Safety` section above).
-    if cfg!(debug_assertions) && m > 0 && n > 0 {
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
         crate::safety::debug_extent_2d(a, k, m);
         crate::safety::debug_extent_2d(b, k, n);
         crate::safety::debug_extent_2d(c, m, n);
@@ -1877,7 +1877,7 @@ pub unsafe extern "C" fn wukong_sgemm_f16_tn(
     beta: i64,
 ) {
     // P14.5: debug-build contract checks (the `# Safety` section above).
-    if cfg!(debug_assertions) && m > 0 && n > 0 {
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
         crate::safety::debug_extent_2d(a, k, m);
         crate::safety::debug_extent_2d(b, k, n);
         crate::safety::debug_extent_2d(c, m, n);
@@ -1905,7 +1905,7 @@ pub unsafe extern "C" fn wukong_sgemm_f16_tn_parallel(
     beta: i64,
 ) {
     // P14.5: debug-build contract checks (the `# Safety` section above).
-    if cfg!(debug_assertions) && m > 0 && n > 0 {
+    if cfg!(debug_assertions) && m > 0 && k > 0 && n > 0 {
         crate::safety::debug_extent_2d(a, k, m);
         crate::safety::debug_extent_2d(b, k, n);
         crate::safety::debug_extent_2d(c, m, n);

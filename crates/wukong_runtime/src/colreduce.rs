@@ -571,9 +571,11 @@ unsafe fn colreduce_parallel(x: *const f32, out: *mut f32, rows: i64, cols: i64,
 #[no_mangle]
 pub unsafe extern "C" fn wukong_colsum_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
     // P14.5: x valid for rows*cols, out for cols, out disjoint from x (documented all-disjoint).
-    crate::safety::debug_extent_2d(x, rows, cols);
-    crate::safety::debug_extent(out, cols);
-    crate::safety::debug_disjoint(out, cols, x, rows.saturating_mul(cols));
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent(out, cols);
+        crate::safety::debug_disjoint(out, cols, x, rows.saturating_mul(cols));
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }

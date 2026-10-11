@@ -624,11 +624,13 @@ pub unsafe extern "C" fn wukong_vhorner_f32(
     ncoeff: i64,
 ) {
     // P14.5: debug-build contract checks (the `# Safety` section above).
-    crate::safety::debug_extent(x, n);
-    crate::safety::debug_extent(out, n);
-    crate::safety::debug_extent(coeffs, ncoeff);
-    crate::safety::debug_inplace_or_disjoint(out, n, x, n);
-    crate::safety::debug_disjoint(out, n, coeffs, ncoeff);
+    if cfg!(debug_assertions) && n > 0 && ncoeff > 0 {
+        crate::safety::debug_extent(x, n);
+        crate::safety::debug_extent(out, n);
+        crate::safety::debug_extent(coeffs, ncoeff);
+        crate::safety::debug_inplace_or_disjoint(out, n, x, n);
+        crate::safety::debug_disjoint(out, n, coeffs, ncoeff);
+    }
     if n <= 0 || ncoeff <= 0 {
         return;
     }

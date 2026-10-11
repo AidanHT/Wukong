@@ -469,14 +469,16 @@ pub unsafe extern "C" fn wukong_transpose_f32(
     cols: i64,
 ) {
     // P14.5: src valid for rows*cols, dst for cols*rows, disjoint (documented all-disjoint).
-    crate::safety::debug_extent_2d(src, rows, cols);
-    crate::safety::debug_extent_2d(dst, rows, cols);
-    crate::safety::debug_disjoint(
-        dst,
-        rows.saturating_mul(cols),
-        src,
-        rows.saturating_mul(cols),
-    );
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(src, rows, cols);
+        crate::safety::debug_extent_2d(dst, rows, cols);
+        crate::safety::debug_disjoint(
+            dst,
+            rows.saturating_mul(cols),
+            src,
+            rows.saturating_mul(cols),
+        );
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -500,14 +502,16 @@ pub unsafe extern "C" fn wukong_transpose_f32_parallel(
     cols: i64,
 ) {
     // P14.5: debug-build contract checks (the `# Safety` section above).
-    crate::safety::debug_extent_2d(src, rows, cols);
-    crate::safety::debug_extent_2d(dst, rows, cols);
-    crate::safety::debug_disjoint(
-        dst,
-        rows.saturating_mul(cols),
-        src,
-        rows.saturating_mul(cols),
-    );
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(src, rows, cols);
+        crate::safety::debug_extent_2d(dst, rows, cols);
+        crate::safety::debug_disjoint(
+            dst,
+            rows.saturating_mul(cols),
+            src,
+            rows.saturating_mul(cols),
+        );
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -550,14 +554,16 @@ pub unsafe extern "C" fn wukong_transpose_u16(
     cols: i64,
 ) {
     // P14.5: debug-build contract checks (the `# Safety` section above).
-    crate::safety::debug_extent_2d(src, rows, cols);
-    crate::safety::debug_extent_2d(dst, rows, cols);
-    crate::safety::debug_disjoint(
-        dst,
-        rows.saturating_mul(cols),
-        src,
-        rows.saturating_mul(cols),
-    );
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(src, rows, cols);
+        crate::safety::debug_extent_2d(dst, rows, cols);
+        crate::safety::debug_disjoint(
+            dst,
+            rows.saturating_mul(cols),
+            src,
+            rows.saturating_mul(cols),
+        );
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -582,14 +588,16 @@ pub unsafe extern "C" fn wukong_transpose_u16_parallel(
     cols: i64,
 ) {
     // P14.5: debug-build contract checks (the `# Safety` section above).
-    crate::safety::debug_extent_2d(src, rows, cols);
-    crate::safety::debug_extent_2d(dst, rows, cols);
-    crate::safety::debug_disjoint(
-        dst,
-        rows.saturating_mul(cols),
-        src,
-        rows.saturating_mul(cols),
-    );
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(src, rows, cols);
+        crate::safety::debug_extent_2d(dst, rows, cols);
+        crate::safety::debug_disjoint(
+            dst,
+            rows.saturating_mul(cols),
+            src,
+            rows.saturating_mul(cols),
+        );
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
