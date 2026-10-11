@@ -28,16 +28,26 @@
 //! # What is deliberately *not* folded: edges into `unreachable`
 //!
 //! LLVM's SimplifyCFG deletes a branch into an `unreachable` block, because its front ends promise
-//! such a block is dead. Wukong's front end cannot promise that. Sema's exhaustiveness check
-//! (E0405, pattern usefulness) fires only on a *certain* miss and gives no verdict on a `match` it
-//! cannot reason about — a range bound that is not a literal, an integer pattern on a tagged union,
-//! a pattern of the wrong type — so such a `match` is accepted with a fall-through that real inputs
-//! may reach, and `lower_match` ends that fall-through in `unreachable`. The interpreter, which is
-//! the language specification, stops there with "execution reached `unreachable`", and native code
-//! traps. Treating the edge as dead
-//! would turn that loud stop into a silently wrong arm at `-O1` and above. So a chain whose last
-//! test falls into a trap keeps the trap as the `switch`'s default; a jump table makes that default
-//! free anyway.
+//! such a block is dead. This pass does not, because the promise is made earlier and once.
+//!
+//! A `match` sema PROVES exhaustive (pattern usefulness, over a concrete scrutinee type whose zero
+//! value the analysis models — `SemaResult::exhaustive_matches`) never produces a trap at all:
+//! `lower_match` lowers its last unguarded arm with no test, so its chain's final else-edge is
+//! that arm's body, which becomes the `switch`'s default here. That decision is made in the front
+//! end, identically at every `-O` level and on every backend, which is the point: folding the trap
+//! here instead would make `-O0` (which traps) and `-O2` (which picks an arm) disagree on any
+//! value outside sema's model.
+//!
+//! A match that is NOT proven keeps its trap. Sema's exhaustiveness check (E0405) fires only on a
+//! *certain* miss and gives no verdict on a `match` it cannot reason about — a range bound that is
+//! not a literal, an integer pattern on a tagged union, a pattern of the wrong type, or a
+//! scrutinee whose zero value (an uninitialized `let e: E;` of an enum with no discriminant 0) no
+//! arm models — so such a `match` is accepted with a fall-through that real inputs may reach, and
+//! `lower_match` ends that fall-through in `unreachable`. The interpreter, which is the language
+//! specification, stops there with "execution reached `unreachable`", and native code traps.
+//! Treating the edge as dead would turn that loud stop into a silently wrong arm at `-O1` and
+//! above. So a chain whose last test falls into a trap keeps the trap as the `switch`'s default; a
+//! jump table makes that default free anyway.
 
 use wukong_mir::{
     switch_case_value, BlockId, CmpOp, Function, Op, SwitchCase, Terminator, ValueId,
@@ -677,11 +687,8 @@ mod tests {
         }
     }
 
-    /// The fixture's six-variant `match` becomes exactly one six-case `switch` at `-O2` (its
-    /// fall-through stays the trap default), and every variant still selects its own arm.
-    #[test]
-    fn dense_enum_match_forms_one_switch() {
-        let src = include_str!("../../../tests/run/match_dense_enum_switch.wk");
+    /// Parse, check and lower a `.wk` source, each stage clean.
+    fn lower_src(src: &str) -> (Program, Interner) {
         let mut interner = Interner::new();
         let (module, parse) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
         assert!(parse.iter().all(|d| !d.is_error()), "{parse:?}");
@@ -689,6 +696,17 @@ mod tests {
         assert!(check.iter().all(|d| !d.is_error()), "{check:?}");
         let (program, lower) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
         assert!(lower.iter().all(|d| !d.is_error()), "{lower:?}");
+        (program, interner)
+    }
+
+    /// The fixture's six-variant `match` is proven exhaustive, so its last arm (`Xor`) is lowered
+    /// untested: five compares, which become exactly one five-case `switch` at `-O2` whose default
+    /// is the `Xor` arm, not a trap. No `unreachable` remains in `apply` at any level, and every
+    /// variant still selects its own arm.
+    #[test]
+    fn dense_enum_match_forms_one_switch() {
+        let src = include_str!("../../../tests/run/match_dense_enum_switch.wk");
+        let (program, mut interner) = lower_src(src);
         let expected = b"55\n18\n2\n6\n23\n4\n28\n30\n".to_vec();
         let main = interner.intern("main");
         for level in [0u8, 2] {
@@ -696,6 +714,16 @@ mod tests {
             crate::optimize(&mut optimized, level);
             let errs = wukong_mir::verify::verify_program(&optimized);
             assert!(errs.is_empty(), "O{level}: {errs:?}");
+            // `apply` (or, at `-O2`, `main`, which inlines it) holds no trap.
+            for f in &optimized.funcs {
+                assert!(
+                    !f.blocks
+                        .iter()
+                        .any(|b| matches!(b.term, Terminator::Unreachable)),
+                    "O{level}: a proven match leaves no trap\n{}",
+                    wukong_mir::print::print_function(f, &interner)
+                );
+            }
             let sw: Vec<(&Function, &Terminator)> = optimized
                 .funcs
                 .iter()
@@ -709,8 +737,13 @@ mod tests {
                 let (f, Terminator::Switch { cases, default, .. }) = sw[0] else {
                     unreachable!()
                 };
-                assert_eq!(cases.len(), 6, "one case per variant");
-                assert!(matches!(
+                // `Add`..`Or` are the cases (discriminants 0..=4); `Xor` is the default.
+                assert_eq!(
+                    cases.iter().map(|c| c.value).collect::<Vec<_>>(),
+                    vec![0, 1, 2, 3, 4],
+                    "one case per tested variant"
+                );
+                assert!(!matches!(
                     f.blocks[default.0 as usize].term,
                     Terminator::Unreachable
                 ));
@@ -719,6 +752,92 @@ mod tests {
                 wukong_interp::run_with_output(&optimized, main, &interner).unwrap();
             assert_eq!(exit, 0);
             assert_eq!(stdout, expected, "O{level}");
+        }
+    }
+
+    /// The mirror-pair oracle. Sema's usefulness analysis proves these matches exhaustive, so
+    /// `lower_match` takes each one's last arm untested; that is sound only if the analysis and
+    /// `pattern_cond` agree on which values every pattern matches. Every `u8` and `i8` value goes
+    /// through the compiled matches (interpreted at `-O0` and `-O2`) and through Rust's own `match`
+    /// over the same patterns, line by line.
+    #[test]
+    fn exhaustive_int_match_agrees_with_rust_on_every_value() {
+        let src = "
+            fn cls(x: u8) -> i32 {
+                return match x { 0 => 1, 1..=99 => 2, 100..=199 => 3, 200..=254 => 4, 255 => 5 };
+            }
+            fn cls_rev(x: u8) -> i32 {
+                return match x { 255 => 5, 200..=254 => 4, 0 => 1, 100..=199 => 3, 1..=99 => 2 };
+            }
+            fn cls8(x: i8) -> i32 {
+                return match x {
+                    -128 => 1, -127..=-1 => 2, 0 => 3, 1..=99 => 4, 100..127 => 5, 127 => 6
+                };
+            }
+            fn main() -> i32 {
+                let mut i: i32 = 0;
+                while i < 256 {
+                    print(cls(i as u8));
+                    print(cls_rev(i as u8));
+                    print(cls8((i - 128) as i8));
+                    i = i + 1;
+                }
+                return 0;
+            }";
+        let mut want = String::new();
+        for i in 0i32..256 {
+            let x = i as u8;
+            let a = match x {
+                0 => 1,
+                1..=99 => 2,
+                100..=199 => 3,
+                200..=254 => 4,
+                255 => 5,
+            };
+            let b = match x {
+                255 => 5,
+                200..=254 => 4,
+                0 => 1,
+                100..=199 => 3,
+                1..=99 => 2,
+            };
+            let y = (i - 128) as i8;
+            let c = match y {
+                -128 => 1,
+                -127..=-1 => 2,
+                0 => 3,
+                1..=99 => 4,
+                100..127 => 5,
+                127 => 6,
+            };
+            want.push_str(&format!("{a}\n{b}\n{c}\n"));
+        }
+        let (program, mut interner) = lower_src(src);
+        let main = interner.intern("main");
+        for f in ["cls", "cls_rev", "cls8"] {
+            let sym = interner.intern(f);
+            let func = program.funcs.iter().find(|g| g.name == sym).unwrap();
+            assert!(
+                !func
+                    .blocks
+                    .iter()
+                    .any(|b| matches!(b.term, Terminator::Unreachable)),
+                "`{f}` is proven exhaustive: its last arm is untested and no trap is emitted"
+            );
+        }
+        for level in [0u8, 2] {
+            let mut optimized = program.clone();
+            crate::optimize(&mut optimized, level);
+            let errs = wukong_mir::verify::verify_program(&optimized);
+            assert!(errs.is_empty(), "O{level}: {errs:?}");
+            let (exit, stdout) =
+                wukong_interp::run_with_output(&optimized, main, &interner).unwrap();
+            assert_eq!(exit, 0);
+            let got = String::from_utf8(stdout).unwrap();
+            for (n, (g, w)) in got.lines().zip(want.lines()).enumerate() {
+                assert_eq!(g, w, "O{level}: line {n} (input {})", n / 3);
+            }
+            assert_eq!(got.lines().count(), want.lines().count(), "O{level}");
         }
     }
 }

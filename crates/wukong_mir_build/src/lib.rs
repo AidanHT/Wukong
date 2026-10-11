@@ -41,6 +41,8 @@ mod externs;
 #[cfg(test)]
 mod fp_contract_tests;
 mod kernel_guard;
+#[cfg(test)]
+mod match_tests;
 mod methods;
 mod minmax;
 mod noalias;
@@ -21356,9 +21358,17 @@ impl FnLowerer<'_> {
     /// for equality; a wildcard/identifier always matches) and, if present, its guard, branching to
     /// the arm body or the next test. An `Ident` pattern binds the scrutinee value in the arm scope.
     /// When the `match` is used as a value, a merge-block parameter collects each arm body's result.
-    /// An unconditional catch-all arm (a bare `_`/identifier with no guard) ends the chain; if none is
-    /// present the structurally-emitted fallthrough is `Unreachable` (sema's E0405 rejects any
-    /// value-producing non-exhaustive match, so it is dynamically dead).
+    ///
+    /// An unconditional arm ends the chain: a bare `_`/identifier/`()` with no guard, or — in a
+    /// match sema PROVED exhaustive (`SemaResult::exhaustive_matches`) — the last unguarded arm,
+    /// whatever its pattern. In a proven match every value matches some unguarded arm, and a value
+    /// that reaches the last one has failed every arm before it, so that arm needs no test; arms
+    /// after it (guarded ones only) can never be selected. It binds its pattern exactly as a tested
+    /// arm would, and neither its compare nor the trap block is emitted, at every `-O` level and on
+    /// every backend alike. An exhaustive `bool` match is one branch, an N-variant enum dispatch
+    /// N - 1 tests. With no unconditional arm (an unproven match: a pattern usefulness cannot
+    /// place, a scrutinee type whose zero value no arm models, or a node `defer`/`tindex`
+    /// renumbered) the structurally-emitted fallthrough is `Unreachable`, which traps.
     fn lower_match(&mut self, scrutinee: &Expr, arms: &[ast::MatchArm], e: &Expr) -> ValueId {
         let result_ty = self.expr_mir(e);
         let produces_value = result_ty != MirType::Void;
@@ -21381,11 +21391,18 @@ impl FnLowerer<'_> {
         // every arm `return`s — `merge` is dead and is terminated `Unreachable` below.
         let mut handled_default = false;
         let mut merge_reachable = false;
-        for arm in arms {
-            let unconditional = matches!(
+        // The arm a proven-exhaustive match takes untested (see the doc comment).
+        let fallthrough = if self.sema.exhaustive_matches.contains(&e.id) {
+            arms.iter().rposition(|a| a.guard.is_none())
+        } else {
+            None
+        };
+        for (i, arm) in arms.iter().enumerate() {
+            let unconditional = (matches!(
                 &arm.pat.kind,
                 ast::PatKind::Wildcard | ast::PatKind::Ident(_) | ast::PatKind::Unit
-            ) && arm.guard.is_none();
+            ) && arm.guard.is_none())
+                || fallthrough == Some(i);
 
             if unconditional {
                 // Always matches: lower the body directly, then the remaining arms are unreachable.
@@ -21417,16 +21434,16 @@ impl FnLowerer<'_> {
             self.terminated = false;
         }
 
-        // No arm matched. With an unconditional catch-all this block is never emitted; without one it
-        // is reached only when no arm's pattern fires. Sema's exhaustiveness check (E0405) rejects any
-        // *value-producing* non-exhaustive match before lowering, so for a value match this point is
-        // dynamically dead (an exhaustive enum/bool match with no `_` still emits this block
-        // structurally — every arm is a conditional test — but one arm always matches at runtime).
-        // Emit `Unreachable` rather than a zero default: a scalar zero was a silent wrong answer and
-        // an aggregate zero was invalid MIR (`const.i32 0` into an aggregate merge param → an ICE the
-        // verifier/`mem2reg` rejected). A unit/statement match has no value to merge and just falls
-        // through. (A genuinely value-producing match always has a value-producing arm that branches
-        // to `merge`, so the merge param never lacks a provider.)
+        // No arm matched. With an unconditional arm — a catch-all, or the untested last arm of a
+        // proven-exhaustive match — this block is never emitted; without one it is reached only when
+        // no arm's pattern fires. Sema's exhaustiveness check (E0405) rejects any non-exhaustive
+        // match it can reason about, and a match it cannot reason about gets no proof, so it keeps
+        // every test and lands here on a value its arms miss: a value match traps rather than invent
+        // an arm. Emit `Unreachable` rather than a zero default: a scalar zero was a silent wrong
+        // answer and an aggregate zero was invalid MIR (`const.i32 0` into an aggregate merge
+        // param → an ICE the verifier/`mem2reg` rejected). A unit/statement match has no value to
+        // merge and just falls through. (A genuinely value-producing match always has a
+        // value-producing arm that branches to `merge`, so the merge param never lacks a provider.)
         if !handled_default && !self.terminated {
             match merge_param {
                 Some(_) => self.builder.set_term(wukong_mir::Terminator::Unreachable),
@@ -21473,6 +21490,16 @@ impl FnLowerer<'_> {
         scrut_ty: &Ty,
     ) {
         match &pat.kind {
+            // A name bound inside an or-pattern would need one binding fed by whichever
+            // alternative matched; nothing lowers that yet. Refuse it at the pattern, and bind one
+            // alternative's names so the arm body does not cascade into a second error at each
+            // use (the program is rejected either way).
+            ast::PatKind::Or(alts) if alts.iter().any(pattern_has_binding) => {
+                self.unsupported(pat.span, "a binding inside an or-pattern");
+                if let Some(alt) = alts.iter().find(|a| pattern_has_binding(a)) {
+                    self.bind_match_ident(alt, scrut, scrut_mir, scrut_ty);
+                }
+            }
             ast::PatKind::Ident(name) => {
                 let is_slice = matches!(scrut_ty, Ty::Slice(_));
                 if matches!(scrut_mir, MirType::Array(..)) {

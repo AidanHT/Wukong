@@ -31,6 +31,24 @@
 //! variant-name check this replaces kept too; that check, though, ignored payload sub-patterns,
 //! tuples and integer ranges, so a refutable `Expr::Add(0, y)` counted as covering all of `Add`,
 //! `match (a, b)` was never checked, and a full `0..=255` on a `u8` was rejected.
+//!
+//! A positive verdict is only as good as the values it models, and one way to build a value the
+//! analysis does not model survives sema: `let x: T;` without an initializer is zero-filled by
+//! mir_build (there is no definite-assignment check), so `enum E { A = 1, B = 2 }; let e: E;`
+//! holds discriminant 0, which no variant has. [`zero_value_modeled`] answers whether the all-zero
+//! bit pattern of a type is one of the values modeled here; a `match` counts as *proven* exhaustive
+//! (`SemaResult::exhaustive_matches`) only when it is. (`int as Enum` is E0401, and a forged
+//! pointer's pointee is accepted undefined behaviour, so zero-initialization is the one remaining
+//! way to forge such a value.)
+//!
+//! **Mirror pair.** A proven verdict now *removes a test*: mir_build lowers the last unguarded arm
+//! of a proven match with no compare at all. The semantics of [`DPat`] here — which values each
+//! pattern matches, how a literal is read at the scrutinee's width, what a `char` literal decodes
+//! to — must therefore equal mir_build's `pattern_cond`. Before, a disagreement could only miss or
+//! invent a diagnostic; now a value the two disagree on silently takes the last arm instead of
+//! trapping. `wukong_opt`'s `exhaustive_int_match_agrees_with_rust_on_every_value` pins the integer
+//! side on every `u8` and `i8` value; the two `char`-literal decoders (`char_value` here,
+//! `decode_char_literal` there) are the remaining unpinned half.
 
 use wukong_ast::{MatchArm, PatKind, Path, Pattern, VariantPat};
 use wukong_span::{Interner, Symbol};
@@ -140,6 +158,49 @@ pub(crate) fn refutable(
         None => "_".to_string(),
     };
     Some(Witness { pattern, more })
+}
+
+/// How deep [`zero_value_modeled`] follows nested types before it gives up (answering `false`).
+const ZERO_DEPTH: u32 = 64;
+
+/// Whether the all-zero bit pattern of `ty` — what mir_build gives an uninitialized `let x: T;` —
+/// is a value this analysis models (see the module docs). A column patterns cannot constrain
+/// (a float, pointer, slice, tensor, vector, function) holds any value harmlessly; a product is
+/// modeled when every field is; an enum when some variant has discriminant 0 and that variant's
+/// payload is modeled. An unknown or generic type is not.
+pub(crate) fn zero_value_modeled(defs: &DefMap, ty: &Ty) -> bool {
+    zero_modeled_at(defs, ty, 0)
+}
+
+fn zero_modeled_at(defs: &DefMap, ty: &Ty, depth: u32) -> bool {
+    if depth >= ZERO_DEPTH {
+        return false;
+    }
+    let next = depth + 1;
+    match ty {
+        Ty::Scalar(_)
+        | Ty::Unit
+        | Ty::Ptr { .. }
+        | Ty::Ref { .. }
+        | Ty::Slice(_)
+        | Ty::Tensor { .. }
+        | Ty::Vector { .. }
+        | Ty::Fn { .. } => true,
+        Ty::Tuple(ts) => ts.iter().all(|t| zero_modeled_at(defs, t, next)),
+        Ty::Array { elem, .. } => zero_modeled_at(defs, elem, next),
+        Ty::Named(n) => match defs.lookup(*n).map(|d| &d.kind) {
+            Some(DefKind::Struct(fs)) => fs.iter().all(|(_, t)| zero_modeled_at(defs, t, next)),
+            Some(DefKind::Enum(vs)) => vs.iter().any(|v| {
+                v.disc == 0
+                    && v.payload
+                        .field_tys()
+                        .iter()
+                        .all(|t| zero_modeled_at(defs, t, next))
+            }),
+            Some(DefKind::Fn(_) | DefKind::Const(_)) | None => false,
+        },
+        Ty::Unknown | Ty::Error => false,
+    }
 }
 
 /// A pattern deconstructed against its column's constructor space.
@@ -1080,6 +1141,118 @@ mod tests {
         .into_iter()
         .filter(|d| d.code == Some("W0020") && d.severity == Severity::Warning)
         .count()
+    }
+
+    /// How many `match`es of `src` (which must check clean) sema proves exhaustive.
+    fn proven(src: &str) -> usize {
+        let mut interner = Interner::new();
+        let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pd.is_empty(), "parse errors: {pd:?}");
+        let (sema, sd) = crate::check(&module, &interner);
+        assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
+        sema.exhaustive_matches.len()
+    }
+
+    #[test]
+    fn proven_exhaustive_matches_are_published() {
+        // Proven: an enum, a bool, a full integer domain, a catch-all.
+        assert_eq!(
+            proven(
+                "enum C { R, G, B } fn f(c: C) -> i32 { return match c { C::R => 1, C::G => 2, \
+                 C::B => 3 }; }"
+            ),
+            1
+        );
+        assert_eq!(
+            proven("fn f(b: bool) -> i32 { return match b { true => 1, false => 0 }; }"),
+            1
+        );
+        assert_eq!(
+            proven(
+                "fn f(x: u8) -> i32 { return match x { 0..=99 => 1, 100..=199 => 2, \
+                 200..=255 => 3 }; }"
+            ),
+            1
+        );
+        assert_eq!(
+            proven("fn f(x: i32) -> i32 { return match x { 0 => 1, _ => 2 }; }"),
+            1
+        );
+        // Literal inference re-checks this body (`k` is decided by its use as an `i64`); the
+        // final pass's verdict is the one published.
+        assert_eq!(
+            proven(
+                "fn f(x: u8) -> i64 { let k = 7; let y: i64 = k; return match x { 0..=127 => y, \
+                 128..=255 => 0 }; }"
+            ),
+            1
+        );
+        // Here the first pass types `k` as `i32`, over which `0..=255` is NOT exhaustive; the
+        // re-pass types it `u8`. Last write wins, so the verdict is the re-pass's (an AND of the
+        // two would lose it).
+        assert_eq!(
+            proven(
+                "fn f() -> i32 { let k = 7; let y: u8 = k; return match k { 0..=255 => 1 } + \
+                 (y as i32); }"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn unmodeled_zero_values_and_generic_scrutinees_are_not_proven() {
+        // `let e: E;` holds discriminant 0, which no variant has.
+        let e = "enum E { A = 1, B = 2 } ";
+        assert_eq!(
+            proven(&format!(
+                "{e}fn f(x: E) -> i32 {{ return match x {{ E::A => 1, E::B => 2 }}; }}"
+            )),
+            0
+        );
+        // Nor when a struct holds one.
+        assert_eq!(
+            proven(&format!(
+                "{e}struct S {{ e: E, k: i32 }} fn f(s: S) -> i32 {{ return match s {{ \
+                 S {{ e: E::A, .. }} => 1, S {{ e: E::B, .. }} => 2 }}; }}"
+            )),
+            0
+        );
+        // A scrutinee naming a type parameter is not concrete.
+        assert_eq!(
+            proven(
+                "fn f<T>(x: T, b: bool) -> i32 { return match (x, b) { (_, true) => 1, \
+                 (_, false) => 0 }; }"
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn zero_value_modeling() {
+        let src = "enum Z { A, B } enum N { A = 1, B } enum D { X(N), Y } enum P { Y, X(N) } \
+                   struct S { z: Z, n: N } fn main() -> i32 { return 0; }";
+        let mut interner = Interner::new();
+        let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pd.is_empty(), "parse errors: {pd:?}");
+        let (sema, _) = crate::check(&module, &interner);
+        let named = |n: &str| wukong_types::Ty::Named(interner.get(n).expect("interned"));
+        let m = |t: &wukong_types::Ty| super::zero_value_modeled(&sema.defs, t);
+        assert!(m(&named("Z")));
+        assert!(!m(&named("N")));
+        // `D`'s zero is `D::X` of a zero `N`; `P`'s zero is the unit `P::Y`.
+        assert!(!m(&named("D")));
+        assert!(m(&named("P")));
+        assert!(!m(&named("S")));
+        assert!(m(&wukong_types::Ty::Tuple(vec![
+            named("Z"),
+            wukong_types::Ty::Scalar(wukong_types::Scalar::F32)
+        ])));
+        assert!(!m(&wukong_types::Ty::Array {
+            elem: Box::new(named("N")),
+            len: 4,
+            shared: false
+        }));
+        assert!(!m(&wukong_types::Ty::Unknown));
     }
 
     #[test]
