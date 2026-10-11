@@ -26,7 +26,9 @@ use wukong_runtime::fileio::{
     DT_F64, DT_I16, DT_I32, DT_I8, DT_U16, DT_U32, DT_U8, IO_ERROR, IO_OPEN_FAILED,
 };
 
-use crate::{file_read_path, kernel_buffer, kernel_scratch, kernel_values, Interp, Value};
+use crate::{
+    file_read_path, kernel_buffer, kernel_scratch, kernel_values, Interp, Intrinsic, Value,
+};
 
 /// Decode one little-endian element of dtype `dt` from `b` (exactly `dtype_size(dt)` bytes) into the
 /// canonical slot value: floats as their exact `f64` image (half precision widened exactly), integers
@@ -101,23 +103,24 @@ fn count(n: i64) -> usize {
 }
 
 impl Interp<'_, '_> {
-    /// Dispatch an ML I/O or randomness runtime entry, or `None` when `name` is not one of them
+    /// Dispatch an ML I/O or randomness runtime entry, or `None` when `id` is not one of them
     /// (the caller then reports an unknown intrinsic).
     pub(crate) fn ml_intrinsic(
         &mut self,
-        name: &str,
+        id: Intrinsic,
         args: &[Value],
     ) -> Option<Result<Value, String>> {
-        Some(match name {
-            "wukong_rt_read_dt" => self.ml_read_dt(args),
-            "wukong_rt_write_dt" => self.ml_write_dt(args),
-            "wukong_rt_file_size" => self.ml_file_size(args),
-            "wukong_rt_st_read" => self.ml_container_read(args, true),
-            "wukong_rt_npy_read" => self.ml_container_read(args, false),
-            "wukong_rand_fill_f32" => self.ml_rand_fill(args),
-            "wukong_topk_f32" => self.ml_topk(args),
-            "wukong_argsort_f32" => self.ml_argsort(args),
-            "wukong_sample_categorical_f32" => self.ml_sample_categorical(args),
+        use Intrinsic as I;
+        Some(match id {
+            I::RtReadDt => self.ml_read_dt(args),
+            I::RtWriteDt => self.ml_write_dt(args),
+            I::RtFileSize => self.ml_file_size(args),
+            I::RtStRead => self.ml_container_read(args, true),
+            I::RtNpyRead => self.ml_container_read(args, false),
+            I::RandFillF32 => self.ml_rand_fill(args),
+            I::TopkF32 => self.ml_topk(args),
+            I::ArgsortF32 => self.ml_argsort(args),
+            I::SampleCategoricalF32 => self.ml_sample_categorical(args),
             _ => return None,
         })
     }

@@ -17,7 +17,7 @@ use wukong_runtime::attention_kv::{kv_append_plan, kv_attention_plan, KV_OK};
 use wukong_runtime::gemv_half::{gemv_half_plan, GEMV_OK};
 use wukong_runtime::quant::{gemv_q_plan, quantize_plan, QFormat, QUANT_OK};
 
-use crate::{kernel_buffer, kernel_values, marshal, Interp, Value};
+use crate::{kernel_buffer, kernel_values, marshal, Interp, Intrinsic, Value};
 
 /// An `i64` ABI argument as the native entry receives it (MIR passes these as `i64` values).
 fn arg_i64(args: &[Value], i: usize) -> i64 {
@@ -45,29 +45,24 @@ fn refused(ctx: &str, code: i64) -> String {
 }
 
 impl Interp<'_, '_> {
-    /// Dispatch a decode-builtin runtime entry, or `None` when `name` is not one of them.
+    /// Dispatch a decode-builtin runtime entry, or `None` when `id` is not one of them.
     pub(crate) fn decode_intrinsic(
         &mut self,
-        name: &str,
+        id: Intrinsic,
         args: &[Value],
     ) -> Option<Result<Value, String>> {
-        Some(match name {
-            "wukong_attention_kv_f32" | "wukong_attention_kv_f32_parallel" => {
-                self.dec_attention_kv(name, args)
+        use Intrinsic as I;
+        let name = id.name();
+        Some(match id {
+            I::AttentionKvF32 | I::AttentionKvF32Parallel => self.dec_attention_kv(name, args),
+            I::KvAppendF32 => self.dec_kv_append(name, args),
+            I::SgemvBf16 | I::SgemvBf16Parallel | I::SgemvF16 | I::SgemvF16Parallel => {
+                self.dec_sgemv_half(name, args)
             }
-            "wukong_kv_append_f32" => self.dec_kv_append(name, args),
-            "wukong_sgemv_bf16"
-            | "wukong_sgemv_bf16_parallel"
-            | "wukong_sgemv_f16"
-            | "wukong_sgemv_f16_parallel" => self.dec_sgemv_half(name, args),
-            "wukong_quantize_q8_0_f32" => self.dec_quantize(name, args, QFormat::Q8),
-            "wukong_quantize_q4_0_f32" => self.dec_quantize(name, args, QFormat::Q4),
-            "wukong_gemv_q8_0_f32" | "wukong_gemv_q8_0_f32_parallel" => {
-                self.dec_gemv_q(name, args, QFormat::Q8)
-            }
-            "wukong_gemv_q4_0_f32" | "wukong_gemv_q4_0_f32_parallel" => {
-                self.dec_gemv_q(name, args, QFormat::Q4)
-            }
+            I::QuantizeQ80F32 => self.dec_quantize(name, args, QFormat::Q8),
+            I::QuantizeQ40F32 => self.dec_quantize(name, args, QFormat::Q4),
+            I::GemvQ80F32 | I::GemvQ80F32Parallel => self.dec_gemv_q(name, args, QFormat::Q8),
+            I::GemvQ40F32 | I::GemvQ40F32Parallel => self.dec_gemv_q(name, args, QFormat::Q4),
             _ => return None,
         })
     }

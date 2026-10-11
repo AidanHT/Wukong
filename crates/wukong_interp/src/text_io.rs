@@ -17,7 +17,7 @@ use wukong_runtime::fileio::DT_U8;
 use wukong_runtime::fmt::{self, Spec, TARGET_BUFFER, TARGET_STDERR};
 use wukong_runtime::process;
 
-use crate::{Interp, Value};
+use crate::{Interp, Intrinsic, Value};
 
 /// The integer operand at `i` as the native entry receives it (an `i64`).
 fn int(args: &[Value], i: usize) -> i64 {
@@ -32,52 +32,53 @@ fn float(args: &[Value], i: usize) -> f64 {
 }
 
 impl Interp<'_, '_> {
-    /// Dispatch a text runtime entry, or `None` when `name` is not one of them.
+    /// Dispatch a text runtime entry, or `None` when `id` is not one of them.
     pub(crate) fn text_intrinsic(
         &mut self,
-        name: &str,
+        id: Intrinsic,
         args: &[Value],
     ) -> Option<Result<Value, String>> {
+        use Intrinsic as I;
         let mut out = Vec::new();
-        Some(match name {
-            "wukong_rt_fmt_int" => {
+        Some(match id {
+            I::RtFmtInt => {
                 fmt::format_int(&mut out, int(args, 4), Spec::unpack(int(args, 5)));
                 self.text_emit(args, &out)
             }
-            "wukong_rt_fmt_f64" => {
+            I::RtFmtF64 => {
                 fmt::format_f64(&mut out, float(args, 4), Spec::unpack(int(args, 5)));
                 self.text_emit(args, &out)
             }
-            "wukong_rt_fmt_f32" => {
+            I::RtFmtF32 => {
                 // Exact: an `f32` operand's slot holds the `f64` image of an `f32`.
                 fmt::format_f32(&mut out, float(args, 4) as f32, Spec::unpack(int(args, 5)));
                 self.text_emit(args, &out)
             }
-            "wukong_rt_fmt_str" => self.text_fmt_str(args),
-            "wukong_rt_fmt_lit" => {
+            I::RtFmtStr => self.text_fmt_str(args),
+            I::RtFmtLit => {
                 let (bytes, n) = fmt::lit_operand(int(args, 4), int(args, 5));
                 self.text_emit(args, &bytes[..n])
             }
-            "wukong_rt_fmt_slice" => self.text_fmt_slice(args),
-            "wukong_rt_arg_count" => Ok(Value::Int(i128::from(process::arg_count()))),
-            "wukong_rt_arg" => {
+            I::RtFmtSlice => self.text_fmt_slice(args),
+            I::RtArgCount => Ok(Value::Int(i128::from(process::arg_count()))),
+            I::RtArg => {
                 let arg = process::arg_cstr(int(args, 0)).to_bytes();
                 Ok(self.text_alloc_str(arg))
             }
-            "wukong_rt_arg_i64" => {
+            I::RtArgI64 => {
                 let arg = process::arg_cstr(int(args, 0)).to_bytes();
                 let v = process::parse_i64_arg(arg, int(args, 1));
                 Ok(Value::Int(i128::from(v)))
             }
-            "wukong_rt_arg_f32" => {
+            I::RtArgF32 => {
                 let arg = process::arg_cstr(int(args, 0)).to_bytes();
                 let v = process::parse_f32_arg(arg, float(args, 1) as f32);
                 Ok(Value::Float(f64::from(v)))
             }
-            "wukong_rt_env" => self.text_env(args),
-            "wukong_rt_read_stdin" => self.text_read_stdin(args),
+            I::RtEnv => self.text_env(args),
+            I::RtReadStdin => self.text_read_stdin(args),
             // The run stops here; `run_capturing` / `run_streaming` report the code as its result.
-            "wukong_rt_exit" => Err(format!("{}{}", process::EXIT_SENTINEL, int(args, 0))),
+            I::RtExit => Err(format!("{}{}", process::EXIT_SENTINEL, int(args, 0))),
             _ => return None,
         })
     }

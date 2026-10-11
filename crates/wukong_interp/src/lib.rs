@@ -21,6 +21,9 @@ use wukong_span::{Interner, Symbol};
 
 mod marshal;
 use marshal::Overlap;
+// Every intrinsic name the interpreter implements, as a dense id (`Callee::Intrinsic`).
+mod intrinsics;
+use intrinsics::Intrinsic;
 
 /// A runtime value. Integers are stored width-agnostically in an `i128` and masked per result
 /// type; pointers are **slot** indices into flat memory, not host byte addresses. Scalar arrays
@@ -341,8 +344,10 @@ enum Callee {
     Func(usize),
     /// The program's `extern "C"` declaration at this index.
     Extern(usize),
-    /// Neither: a runtime intrinsic, dispatched by name.
-    Intrinsic,
+    /// A runtime intrinsic the interpreter implements (`intrinsics.rs`).
+    Intrinsic(Intrinsic),
+    /// None of the above: calling it is the "unknown function or intrinsic" error.
+    Unknown,
 }
 
 /// Every callee name of a program resolved once, as a dense array indexed by `Symbol` id. A call
@@ -350,8 +355,17 @@ enum Callee {
 /// the scalar transcendentals — scan the extern list linearly before falling through to the
 /// intrinsic name match; now it is one bounds-checked load (Wasm resolves `call` to an index at
 /// validation time for the same reason). Resolution order is unchanged: a function wins over an
-/// extern of the same name, and the first of duplicated names wins.
-struct CalleeTable(Vec<Callee>);
+/// extern of the same name, the first of duplicated names wins, and only a name that is neither
+/// is looked up in the intrinsic table — once, the first time the run calls it, after which the
+/// call dispatches on the cached [`Intrinsic`] id rather than on its name.
+///
+/// It also caches, per function, which registers hold SIMD vectors (see [`Interp::enter_frame`]).
+struct CalleeTable {
+    /// By `Symbol` id; `None` until the run first calls a name that is not a function or extern.
+    callees: Vec<Option<Callee>>,
+    /// By function index: the registers of a vector type, computed the first time it is entered.
+    vector_regs: Vec<Option<Box<[u32]>>>,
+}
 
 impl CalleeTable {
     fn new(program: &Program) -> Self {
@@ -361,22 +375,44 @@ impl CalleeTable {
             .map(|s| s.0 as usize + 1)
             .max()
             .unwrap_or(0);
-        let mut table = vec![Callee::Intrinsic; len];
+        let mut table = vec![None; len];
         // Lowest priority first, each list in reverse, so the earliest entry is written last.
         for (index, ext) in program.externs.iter().enumerate().rev() {
-            table[ext.name.0 as usize] = Callee::Extern(index);
+            table[ext.name.0 as usize] = Some(Callee::Extern(index));
         }
         for (index, func) in program.funcs.iter().enumerate().rev() {
-            table[func.name.0 as usize] = Callee::Func(index);
+            table[func.name.0 as usize] = Some(Callee::Func(index));
         }
-        CalleeTable(table)
+        CalleeTable {
+            callees: table,
+            vector_regs: vec![None; program.funcs.len()],
+        }
     }
 
-    fn get(&self, symbol: Symbol) -> Callee {
-        self.0
-            .get(symbol.0 as usize)
-            .copied()
-            .unwrap_or(Callee::Intrinsic)
+    /// What `symbol` reaches, resolving it through the intrinsic table on its first call (`name`
+    /// is consulted only then).
+    fn resolve<'n>(&mut self, symbol: Symbol, name: impl FnOnce() -> &'n str) -> Callee {
+        let index = symbol.0 as usize;
+        if let Some(Some(callee)) = self.callees.get(index) {
+            return *callee;
+        }
+        let callee = Intrinsic::from_name(name()).map_or(Callee::Unknown, Callee::Intrinsic);
+        if index >= self.callees.len() {
+            self.callees.resize(index + 1, None);
+        }
+        self.callees[index] = Some(callee);
+        callee
+    }
+
+    /// The vector-typed registers of `func`, the program's function at `index`.
+    fn vector_registers(&mut self, index: usize, func: &Function) -> &[u32] {
+        self.vector_regs[index].get_or_insert_with(|| {
+            (0u32..)
+                .zip(&func.value_types)
+                .filter(|(_, ty)| matches!(ty, MirType::Vec(..)))
+                .map(|(r, _)| r)
+                .collect()
+        })
     }
 }
 
@@ -1098,6 +1134,8 @@ fn max_call_depth() -> usize {
 /// One Wukong call on [`Interp::run_function`]'s explicit frame stack.
 struct Frame<'a> {
     func: &'a Function,
+    /// `func`'s index among the program's functions (`None` only for a test harness's function).
+    index: Option<usize>,
     /// The SSA register file, recycled through [`Interp::frames`].
     regs: Vec<Value>,
     /// The block executing and the index of its next instruction. While the frame is suspended
@@ -1115,17 +1153,18 @@ struct Frame<'a> {
 }
 
 /// Why [`Interp::exec_frame`] stopped running a frame.
-enum Flow<'a> {
-    /// It reached a call of a Wukong function (the arguments, and whether the call yields `Unit`).
-    Call(&'a Function, Vec<Value>, bool),
+enum Flow {
+    /// It reached a call of a Wukong function — the program's function at this index (the
+    /// arguments, and whether the call yields `Unit`).
+    Call(usize, Vec<Value>, bool),
     /// It returned this value.
     Ret(Value),
 }
 
 /// What one `Op::Call` resolved to.
-enum CallOutcome<'a> {
-    /// A Wukong function (or a `wukong_parallel_for` body) to push a frame for.
-    Enter(&'a Function, Vec<Value>, bool),
+enum CallOutcome {
+    /// A Wukong function (or a `wukong_parallel_for` body), by index, to push a frame for.
+    Enter(usize, Vec<Value>, bool),
     /// An extern or intrinsic that has already run, and its result.
     Done(Value),
 }
@@ -1202,18 +1241,24 @@ impl<'a, 'k> Interp<'a, 'k> {
         slot == NULL_SLOT && self.memory.first() == Some(&NULL_SENTINEL)
     }
 
-    /// What a call of `symbol` reaches, resolved once per run (see [`CalleeTable`]).
-    fn callee(&mut self, symbol: Symbol) -> Callee {
+    /// This run's callee table, built on first use (see [`CalleeTable`]).
+    fn callee_table(&mut self) -> &mut CalleeTable {
         let program = self.program;
         self.function_indices
             .get_or_insert_with(|| CalleeTable::new(program))
-            .get(symbol)
+    }
+
+    /// What a call of `symbol` reaches, resolved once per run (see [`CalleeTable`]).
+    fn callee(&mut self, symbol: Symbol) -> Callee {
+        let interner = self.interner;
+        self.callee_table()
+            .resolve(symbol, || interner.resolve(symbol))
     }
 
     fn function_index(&mut self, symbol: Symbol) -> Option<usize> {
         match self.callee(symbol) {
             Callee::Func(index) => Some(index),
-            Callee::Extern(_) | Callee::Intrinsic => None,
+            Callee::Extern(_) | Callee::Intrinsic(_) | Callee::Unknown => None,
         }
     }
 
@@ -1230,16 +1275,20 @@ impl<'a, 'k> Interp<'a, 'k> {
     /// would leave it (SIMD arena suffix, register pool, depth), so a reused `Interp` is clean.
     fn run_function(&mut self, func: &'a Function, args: &[Value]) -> Result<Value, String> {
         let limit = max_call_depth();
+        let program: &'a Program = self.program;
+        // Once per invocation: the entry function's index (calls carry their callee's).
+        let index = program.funcs.iter().position(|f| std::ptr::eq(f, func));
         let mut suspended: Vec<Frame<'a>> = Vec::new();
-        let mut frame = self.enter_frame(func, args, limit, false)?;
+        let mut frame = self.enter_frame(index, func, args, limit, false)?;
         loop {
             let flow = match self.exec_frame(&mut frame) {
                 Ok(flow) => flow,
                 Err(e) => return self.unwind(frame, &mut suspended, e),
             };
             match flow {
-                Flow::Call(callee, mut argv, unit_result) => {
-                    let entered = self.enter_frame(callee, &argv, limit, unit_result);
+                Flow::Call(index, mut argv, unit_result) => {
+                    let callee = &program.funcs[index];
+                    let entered = self.enter_frame(Some(index), callee, &argv, limit, unit_result);
                     argv.clear();
                     self.call_args.push(argv);
                     match entered {
@@ -1264,11 +1313,26 @@ impl<'a, 'k> Interp<'a, 'k> {
         }
     }
 
-    /// Push a frame for a call of `func`: check the depth ceiling, take a recycled register file
-    /// (or a fresh one) and size it for this function. Values start as `Unit`, the interpreter's
-    /// "undefined"; well-formed MIR writes before it reads.
+    /// Push a frame for a call of `func` (the program's function at `index`, when it is one):
+    /// check the depth ceiling, take a recycled register file (or a fresh one) and size it for
+    /// this function.
+    ///
+    /// **A recycled register file is not refilled.** Every call used to `clear` it and `resize` it
+    /// back with `Unit` — a write of every SSA register (32 bytes each) per call, however few the
+    /// callee touches. That fill is unobservable on verified MIR: the verifier requires every use
+    /// to be dominated by its definition (`wukong_mir::verify`, "not dominated by its definition"),
+    /// and the driver verifies before every backend entry, so no instruction reads a register this
+    /// frame has not written. The one reader that scans the WHOLE file is
+    /// [`Interp::compact_vectors`], which keeps every SIMD handle it finds alive — a stale handle
+    /// left by an earlier call would be kept, or rejected as out of range. So a pooled file never
+    /// holds one: handles only ever live in vector-typed registers (every op that yields one has a
+    /// vector result type), and [`Interp::leave_frame`] resets exactly those, from a per-function
+    /// list ([`CalleeTable::vector_registers`]) — none at all for a scalar function. Here the file
+    /// only grows (filling the new tail with `Unit`) or shrinks to this function's size. A
+    /// function that is not one of the program's (a test harness's) gets the old full fill.
     fn enter_frame(
         &mut self,
+        index: Option<usize>,
         func: &'a Function,
         args: &[Value],
         limit: usize,
@@ -1281,14 +1345,22 @@ impl<'a, 'k> Interp<'a, 'k> {
         }
         self.depth += 1;
         let mut regs = self.frames.pop().unwrap_or_default();
-        regs.clear();
-        regs.resize(func.value_types.len(), Value::Unit);
+        let size = func.value_types.len();
+        if index.is_none() {
+            regs.clear();
+        }
+        if regs.len() > size {
+            regs.truncate(size);
+        } else {
+            regs.resize(size, Value::Unit);
+        }
         for (p, &a) in func.params.iter().zip(args) {
             regs[p.0 as usize] = a;
         }
         self.slots.note_growth(self.memory.len());
         Ok(Frame {
             func,
+            index,
             regs,
             block: func.entry,
             ip: 0,
@@ -1306,6 +1378,8 @@ impl<'a, 'k> Interp<'a, 'k> {
         result: Result<Value, String>,
     ) -> Result<Value, String> {
         let Frame {
+            func,
+            index,
             mut regs,
             vec_base,
             mem_mark,
@@ -1326,7 +1400,16 @@ impl<'a, 'k> Interp<'a, 'k> {
         };
         self.vecs.truncate(vec_base);
         self.scratch.clear();
-        regs.clear();
+        // Pool the register file without its SIMD handles, and otherwise as it is (see
+        // `enter_frame`): only the vector-typed registers can hold one.
+        match index {
+            Some(index) => {
+                for &r in self.callee_table().vector_registers(index, func) {
+                    regs[r as usize] = Value::Unit;
+                }
+            }
+            None => regs.clear(),
+        }
         self.frames.push(regs);
         self.depth -= 1;
         // The frame's allocas are dead: cut `memory` back (see `SlotReuse`).
@@ -1364,7 +1447,7 @@ impl<'a, 'k> Interp<'a, 'k> {
 
     /// Run `frame` from its current block and instruction until it calls a Wukong function
     /// ([`Flow::Call`], with `frame.ip` left on the call) or returns ([`Flow::Ret`]).
-    fn exec_frame(&mut self, frame: &mut Frame<'a>) -> Result<Flow<'a>, String> {
+    fn exec_frame(&mut self, frame: &mut Frame<'a>) -> Result<Flow, String> {
         let func = frame.func;
         let mut remap = Vec::new();
         loop {
@@ -1456,18 +1539,21 @@ impl<'a, 'k> Interp<'a, 'k> {
         callee: Symbol,
         args: &[ValueId],
         regs: &[Value],
-    ) -> Result<CallOutcome<'a>, String> {
+    ) -> Result<CallOutcome, String> {
         let mut argv = self.call_args.pop().unwrap_or_default();
         argv.extend(args.iter().map(|a| reg(regs, *a)));
         let program: &'a Program = self.program;
         let result = match self.callee(callee) {
             Callee::Func(index) => {
-                return Ok(CallOutcome::Enter(&program.funcs[index], argv, false));
+                return Ok(CallOutcome::Enter(index, argv, false));
             }
             Callee::Extern(index) => call_extern(&program.externs[index], &argv, self.interner),
-            Callee::Intrinsic => {
-                let name = self.interner.resolve(callee);
-                if name == "wukong_parallel_for" {
+            Callee::Unknown => Err(format!(
+                "call to unknown function or intrinsic `{}`",
+                self.interner.resolve(callee)
+            )),
+            Callee::Intrinsic(id) => {
+                if id == Intrinsic::ParallelFor {
                     match self.parallel_for_body(&argv) {
                         Ok((body, body_args)) => {
                             argv.clear();
@@ -1486,10 +1572,10 @@ impl<'a, 'k> Interp<'a, 'k> {
                             MirType::F32 | MirType::F16 | MirType::BF16
                         )
                     });
-                    if narrow_float && matches!(name, "print" | "println") {
+                    if narrow_float && matches!(id, Intrinsic::Print | Intrinsic::Println) {
                         self.print_f32(&argv)
                     } else {
-                        self.intrinsic(name, &argv)
+                        self.call_intrinsic(id, &argv)
                     }
                 }
             }
@@ -1503,19 +1589,17 @@ impl<'a, 'k> Interp<'a, 'k> {
     /// interpreter runs `body(0, n, env)`, the whole index range sequentially in one call. Since
     /// parallel-for bodies have no cross-iteration dependencies this is exactly the result the
     /// multi-threaded native runtime produces (so the two stay differential-equal).
-    fn parallel_for_body(&self, args: &[Value]) -> Result<(&'a Function, [Value; 3]), String> {
+    fn parallel_for_body(&self, args: &[Value]) -> Result<(usize, [Value; 3]), String> {
         let n = args.first().copied().unwrap_or(Value::Unit).as_int();
         let body = match args.get(1).copied() {
             Some(Value::Ptr(p)) if p >= FUNC_TAG => p - FUNC_TAG,
             _ => return Err("parallel_for body is not a function address".into()),
         };
         let env = args.get(2).copied().unwrap_or(Value::Ptr(0));
-        let program: &'a Program = self.program;
-        let func = program
-            .funcs
-            .get(body)
-            .ok_or("parallel_for body index out of range")?;
-        Ok((func, [Value::Int(0), Value::Int(n), env]))
+        if body >= self.program.funcs.len() {
+            return Err("parallel_for body index out of range".into());
+        }
+        Ok((body, [Value::Int(0), Value::Int(n), env]))
     }
 
     /// Marshal one `Op::VecKernelCall` of a recipe whose lanes are `T` through slot memory: the
@@ -2262,9 +2346,24 @@ impl<'a, 'k> Interp<'a, 'k> {
         Ok(Value::Unit)
     }
 
+    /// Call the runtime intrinsic `name` by its callee name — the by-name entry the unit tests
+    /// drive arms through. A run resolves each callee once ([`CalleeTable`]) and dispatches on the
+    /// id; a name outside the intrinsic table fails exactly as an unresolved call does.
+    #[cfg(test)]
     fn intrinsic(&mut self, name: &str, args: &[Value]) -> Result<Value, String> {
-        match name {
-            "print" | "println" => {
+        match Intrinsic::from_name(name) {
+            Some(id) => self.call_intrinsic(id, args),
+            None => Err(format!("call to unknown function or intrinsic `{name}`")),
+        }
+    }
+
+    /// Run the intrinsic `id` on `args`. Each arm keeps `name` (the id's callee name) for its
+    /// diagnostics; the text, ML and decode builtins are dispatched by their own modules.
+    fn call_intrinsic(&mut self, id: Intrinsic, args: &[Value]) -> Result<Value, String> {
+        use Intrinsic as I;
+        let name = id.name();
+        match id {
+            I::Print | I::Println => {
                 let text = match args.first().copied().unwrap_or(Value::Unit) {
                     Value::Int(i) => format!("{i}\n"),
                     Value::Float(f) => format!("{f}\n"),
@@ -2279,7 +2378,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // here after zero-extending it to 64 bits): render the low 64 bits as `u64`, so a
             // high-bit-set value prints its magnitude. Native's `rt_print_u64` formats the identical
             // bits the same way, so the differential gate holds.
-            "print_u" | "println_u" => {
+            I::PrintU | I::PrintlnU => {
                 let text = match args.first().copied().unwrap_or(Value::Unit) {
                     Value::Int(i) => format!("{}\n", i as u64),
                     other => format!("{}\n", other.as_int() as u64),
@@ -2290,13 +2389,13 @@ impl<'a, 'k> Interp<'a, 'k> {
             // A `bool` / `char` argument to `print`/`println` (mir_build zero-extends it to 64 bits
             // and routes it here): `true`/`false`, or the character's glyph. Native's
             // `rt_print_bool`/`rt_print_char` render through the same `wukong_runtime::fmt`.
-            "print_bool" | "println_bool" => {
+            I::PrintBool | I::PrintlnBool => {
                 let v = args.first().map_or(0, |v| v.as_int() as i64);
                 let text = wukong_runtime::fmt::bool_line(v);
                 self.emit_stdout(text.as_bytes());
                 Ok(Value::Unit)
             }
-            "print_char" | "println_char" => {
+            I::PrintChar | I::PrintlnChar => {
                 let v = args.first().map_or(0, |v| v.as_int() as i64);
                 let text = wukong_runtime::fmt::char_line(v);
                 self.emit_stdout(text.as_bytes());
@@ -2306,7 +2405,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // walk `memory` from the base pointer, collecting bytes (each stored as a `Value::Int`
             // low byte) until the NUL terminator, then render as UTF-8. Native renders the identical
             // bytes via `rt_print_str`, so the differential gate holds.
-            "print_str" | "println_str" => {
+            I::PrintStr | I::PrintlnStr => {
                 // Native's `rt_print_str` returns without writing anything (not even the newline)
                 // for a null string. Slot 0 is the shared null now (`NULL_SLOT`), so mirror it.
                 if let Some(Value::Ptr(p)) = args.first().copied() {
@@ -2331,7 +2430,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                 self.emit_stdout(text.as_bytes());
                 Ok(Value::Unit)
             }
-            "assert" => {
+            I::Assert => {
                 let ok = match args.first().copied().unwrap_or(Value::Unit) {
                     Value::Int(i) => i != 0,
                     Value::Float(f) => f != 0.0,
@@ -2348,7 +2447,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `s[i]` (`index <u len` was false). `site` is the `.rodata` `file:line:col` string the
             // lowering attached. The message comes from the one formatter the JIT and the linked
             // executable also use, so all three paths report the same text and stop at this point.
-            "wukong_rt_bounds_fail" => {
+            I::RtBoundsFail => {
                 let index = args.first().map_or(0, |v| v.as_int()) as i64;
                 let len = args.get(1).map_or(0, |v| v.as_int()) as i64;
                 let site = match args.get(2).copied() {
@@ -2379,7 +2478,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // failed` message no caller can catch. One element costs one 32-byte `Value` slot here
             // against 4 bytes natively, so the interpreter reaches exhaustion ~8x earlier; that
             // difference is why this path is reachable at all.
-            "wukong_rt_alloc" => {
+            I::RtAlloc => {
                 let count = args.first().map(|v| v.as_int()).unwrap_or(0).max(0) as usize;
                 let is_float = args.get(2).map(|v| v.as_int()).unwrap_or(0) != 0;
                 let zero = if is_float {
@@ -2430,7 +2529,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // allocation. Double-free or freeing a non-alloc slice is ignored, so it never crashes
             // the interpreter; a use-after-free reads whatever the block holds now while being
             // undefined on native — such programs are outside the differential contract.
-            "wukong_rt_free" => {
+            I::RtFree => {
                 if let Some(Value::Ptr(base)) = args.first() {
                     self.slots.free(*base);
                 }
@@ -2443,7 +2542,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // handed out again when it is large enough, re-zeroed as native re-zeroes its reused
             // bytes, so a balanced `mark; scratch_…; release` loop reuses one region instead of
             // growing the run's memory every iteration.
-            "wukong_rt_scratch_alloc" => {
+            I::RtScratchAlloc => {
                 let count = args.first().map(|v| v.as_int()).unwrap_or(0).max(0) as usize;
                 let is_float = args.get(2).map(|v| v.as_int()).unwrap_or(0) != 0;
                 let zero = if is_float {
@@ -2482,11 +2581,11 @@ impl<'a, 'k> Interp<'a, 'k> {
             }
             // `wukong_rt_scratch_mark() -> i64` — `scratch_mark()`: the live scratch-allocation
             // count, the backend-independent value native's arena reports.
-            "wukong_rt_scratch_mark" => Ok(Value::Int(self.scratch_arena.live.len() as i128)),
+            I::RtScratchMark => Ok(Value::Int(self.scratch_arena.live.len() as i128)),
             // `wukong_rt_scratch_release(mark)` — `scratch_release(m)`: pop the allocations made
             // after `mark`, each becoming the reusable region of its depth. A negative mark
             // releases them all; a mark at or past the count releases nothing.
-            "wukong_rt_scratch_release" => {
+            I::RtScratchRelease => {
                 let mark = args.first().map(|v| v.as_int()).unwrap_or(0).max(0);
                 let mark = usize::try_from(mark).unwrap_or(usize::MAX);
                 let arena = &mut self.scratch_arena;
@@ -2506,7 +2605,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // conforming program observes only *differences* between two reads (never the raw stamp),
             // so its printed output stays interp==native — the value never reaches a differential
             // fixture's stdout.
-            "wukong_now_ns" => Ok(Value::Int(wukong_runtime::wukong_now_ns() as i128)),
+            I::NowNs => Ok(Value::Int(wukong_runtime::wukong_now_ns() as i128)),
             // `wukong_rt_read_{f32,i32,i64,u8,f64,i8}(path: *u8, data: *T, len: i64) -> i64` — the read
             // half of the file-I/O intrinsic family. The on-disk format is headerless: raw contiguous
             // little-endian elements (f32=4, i32=4, i64=8, u8=1, f64=8, i8=1 bytes; no magic, no length prefix).
@@ -2519,8 +2618,12 @@ impl<'a, 'k> Interp<'a, 'k> {
             // read error mid-way returns -2; success returns `n` (>= 0). The LE decode, the min(len,avail)
             // truncation, and the -1/-2/n codes are byte-identical to `wukong_runtime`, so the
             // interp==native differential gate holds.
-            "wukong_rt_read_f32" | "wukong_rt_read_i32" | "wukong_rt_read_i64"
-            | "wukong_rt_read_u8" | "wukong_rt_read_f64" | "wukong_rt_read_i8" => {
+            I::RtReadF32
+            | I::RtReadI32
+            | I::RtReadI64
+            | I::RtReadU8
+            | I::RtReadF64
+            | I::RtReadI8 => {
                 // `path` is a NUL-terminated `*u8`: walk `memory` collecting low bytes until NUL.
                 let path_base = match args.first().copied() {
                     Some(Value::Ptr(base)) => base,
@@ -2560,12 +2663,12 @@ impl<'a, 'k> Interp<'a, 'k> {
             // headerless buffer, then write it. A write error returns -2; success returns `len`. The
             // narrowing, the byte layout, and the -1/-2/len codes are byte-identical to
             // `wukong_runtime`, so the interp==native differential gate holds.
-            "wukong_rt_write_f32"
-            | "wukong_rt_write_i32"
-            | "wukong_rt_write_i64"
-            | "wukong_rt_write_u8"
-            | "wukong_rt_write_f64"
-            | "wukong_rt_write_i8" => {
+            I::RtWriteF32
+            | I::RtWriteI32
+            | I::RtWriteI64
+            | I::RtWriteU8
+            | I::RtWriteF64
+            | I::RtWriteI8 => {
                 use std::io::Write;
                 let path_base = match args.first().copied() {
                     Some(Value::Ptr(base)) => base,
@@ -2673,12 +2776,12 @@ impl<'a, 'k> Interp<'a, 'k> {
             //
             // Operand scratch is recycled per thread (`marshal::f32_scratch`/`recycle_f32`): a
             // kernel inside a loop no longer allocates its operands on every iteration.
-            "wukong_sgemm"
-            | "wukong_sgemm_parallel"
-            | "wukong_sgemm_nt"
-            | "wukong_sgemm_nt_parallel"
-            | "wukong_sgemm_tn"
-            | "wukong_sgemm_tn_parallel" => {
+            I::Sgemm
+            | I::SgemmParallel
+            | I::SgemmNt
+            | I::SgemmNtParallel
+            | I::SgemmTn
+            | I::SgemmTnParallel => {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let c = ptr(args[2])?;
@@ -2793,7 +2896,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // The interpreter marshals the abstract memory into real f32 buffers and calls the *serial*
             // runtime kernel as the oracle (rows independent → the parallel form is bit-identical), so
             // the differential gate stays exact despite the kernel's 8-wide reassociated row dot.
-            "wukong_sgemv" | "wukong_sgemv_parallel" => {
+            I::Sgemv | I::SgemvParallel => {
                 let a = ptr(args[0])?;
                 let x = ptr(args[1])?;
                 let y = ptr(args[2])?;
@@ -2836,7 +2939,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `y[i] = alpha · Σ_j a[i,j]·x[j]` (the decode-attention score `(K·q)·(1/√d)`). Marshals
             // exactly like the plain GEMV and calls the *serial* runtime kernel (bit-identical to the
             // parallel one — rows independent), so the differential gate stays exact.
-            "wukong_sgemv_alpha" | "wukong_sgemv_alpha_parallel" => {
+            I::SgemvAlpha | I::SgemvAlphaParallel => {
                 let a = ptr(args[0])?;
                 let x = ptr(args[1])?;
                 let y = ptr(args[2])?;
@@ -2881,7 +2984,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `out[j] = alpha · Σ_i w[i]·a[i,j]` (the KV-decode attention read-out `out = scoresᵀ·V`).
             // Marshals w/a and calls the *serial* runtime kernel (bit-identical to the parallel one —
             // disjoint output-column stripes, each folding ascending i), so the gate stays exact.
-            "wukong_sgevm_f32" | "wukong_sgevm_f32_parallel" => {
+            I::SgevmF32 | I::SgevmF32Parallel => {
                 let w = ptr(args[0])?;
                 let a = ptr(args[1])?;
                 let out = ptr(args[2])?;
@@ -2928,7 +3031,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // regardless of how the abstract value was sign-extended) and writes the `i32` result,
             // calling the *serial* runtime kernel (bit-identical to the parallel one — rows are
             // independent), so the differential oracle stays exact. Integer math, so no rounding at all.
-            "wukong_i8gemm_nt" | "wukong_i8gemm_nt_parallel" => {
+            I::I8gemmNt | I::I8gemmNtParallel => {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let c = ptr(args[2])?;
@@ -2979,7 +3082,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // pointer (same convention as the affine-norm gamma/beta and the epilogue GEMM bias). The
             // result is f32 (rounding under dequant/activation), written back to the `out` buffer. Both
             // names marshal through the *serial* runtime kernel (bit-identical — rows independent).
-            "wukong_i8gemm_nt_deq" | "wukong_i8gemm_nt_deq_parallel" => {
+            I::I8gemmNtDeq | I::I8gemmNtDeqParallel => {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let out = ptr(args[2])?;
@@ -3059,7 +3162,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // native backend passes, then marshals the f32 result back. Integer→f32 is exact, so this is
             // bit-for-bit; the *serial* runtime kernel backs both names (elementwise → parallel is
             // identical). `wukong_runtime::DQ_*` name the width codes.
-            "wukong_dequant_f32" | "wukong_dequant_f32_parallel" => {
+            I::DequantF32 | I::DequantF32Parallel => {
                 let q = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let n = dim!(args[2]);
@@ -3128,7 +3231,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `scale[j]` (length `cols`). Marshals the integer input exactly like `wukong_dequant_f32`
             // (width-matched real bytes) plus the `cols`-long f32 scale vector; writes the f32 result
             // back. Rows are independent so the serial kernel backs both names.
-            "wukong_dequant_perchan_f32" | "wukong_dequant_perchan_f32_parallel" => {
+            I::DequantPerchanF32 | I::DequantPerchanF32Parallel => {
                 let q = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let rows = dim!(args[2]);
@@ -3212,7 +3315,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `@parallel` variant is bit-identical to it (each C tile owned by one task, same per-(i,j)
             // accumulation order), so calling the serial form here keeps the two backends bit-for-bit
             // exact without spawning threads in the interpreter.
-            "wukong_sgemm_nt_epi" | "wukong_sgemm_nt_epi_parallel" => {
+            I::SgemmNtEpi | I::SgemmNtEpiParallel => {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let c = ptr(args[2])?;
@@ -3320,7 +3423,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // interpreter marshals operands into real f32 buffers and calls the *serial* runtime kernel
             // as the oracle (the parallel form is bit-identical — each C tile owned by one task, same
             // per-(i,j) accumulation order). `alpha` rides an f32 slot, read as a scalar value.
-            "wukong_sgemm_nt_alpha" | "wukong_sgemm_nt_alpha_parallel" => {
+            I::SgemmNtAlpha | I::SgemmNtAlphaParallel => {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let c = ptr(args[2])?;
@@ -3404,7 +3507,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // oracle still answers it the way the loop does — element by element on live memory
             // (`marshal::elementwise_live`) — so a native kernel that disagrees is the side the
             // differential gate names.
-            "wukong_vmath_f32" | "wukong_vmath_f32_parallel" => {
+            I::VmathF32 | I::VmathF32Parallel => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let n = dim!(args[2]);
@@ -3460,7 +3563,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // now versions an alias-uncertain transpose on a run-time overlap test whose overlapping
             // arm is the nest (`kernel_guard.rs` in wukong_mir_build), so this arm is reached only for
             // disjoint buffers, the copy is pure marshalling, and an overlapping call is refused.
-            "wukong_transpose_f32" | "wukong_transpose_f32_parallel" => {
+            I::TransposeF32 | I::TransposeF32Parallel => {
                 let src = ptr(args[0])?;
                 let dst = ptr(args[1])?;
                 let rows = dim!(args[2]);
@@ -3499,10 +3602,10 @@ impl<'a, 'k> Interp<'a, 'k> {
             // fixed), size the output through the shared runtime shape helper. Invalid windows
             // and nonpositive dimensions write nothing. An `out` overlapping `x` is outside
             // pool2d.rs's contract and is refused rather than answered from a copy of `x`.
-            "wukong_maxpool2d_f32"
-            | "wukong_maxpool2d_f32_parallel"
-            | "wukong_avgpool2d_f32"
-            | "wukong_avgpool2d_f32_parallel" => {
+            I::Maxpool2dF32
+            | I::Maxpool2dF32Parallel
+            | I::Avgpool2dF32
+            | I::Avgpool2dF32Parallel => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 // Empty/invalid dimensions are no-ops, including zero channels. Check
@@ -3593,7 +3696,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // agnostic): the bf16/f16 elements are stored as their rounded `Value::Float`, which the
             // native u16 kernel's moved bits decode back to the same value — so interp == native without
             // any bf16-vs-f16 bit conversion. An overlapping `src`/`dst` is refused, as for the f32 entry.
-            "wukong_transpose_u16" | "wukong_transpose_u16_parallel" => {
+            I::TransposeU16 | I::TransposeU16Parallel => {
                 let src = ptr(args[0])?;
                 let dst = ptr(args[1])?;
                 let rows = dim!(args[2]);
@@ -3625,22 +3728,22 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `rows*cols` f32 from x, call the *serial* runtime kernel (bit-identical to the parallel
             // one — each column folded in the same i-order, disjoint stripes), write the `cols`-long
             // result to out.
-            "wukong_colsum_f32"
-            | "wukong_colsum_f32_parallel"
-            | "wukong_colmax_f32"
-            | "wukong_colmax_f32_parallel"
-            | "wukong_colmin_f32"
-            | "wukong_colmin_f32_parallel"
-            | "wukong_colmaxabs_f32"
-            | "wukong_colmaxabs_f32_parallel"
-            | "wukong_colmean_f32"
-            | "wukong_colmean_f32_parallel"
-            | "wukong_colsumsq_f32"
-            | "wukong_colsumsq_f32_parallel"
-            | "wukong_coll2_f32"
-            | "wukong_coll2_f32_parallel"
-            | "wukong_colrms_f32"
-            | "wukong_colrms_f32_parallel" => {
+            I::ColsumF32
+            | I::ColsumF32Parallel
+            | I::ColmaxF32
+            | I::ColmaxF32Parallel
+            | I::ColminF32
+            | I::ColminF32Parallel
+            | I::ColmaxabsF32
+            | I::ColmaxabsF32Parallel
+            | I::ColmeanF32
+            | I::ColmeanF32Parallel
+            | I::ColsumsqF32
+            | I::ColsumsqF32Parallel
+            | I::Coll2F32
+            | I::Coll2F32Parallel
+            | I::ColrmsF32
+            | I::ColrmsF32Parallel => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let rows = dim!(args[2]);
@@ -3679,7 +3782,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                 Ok(Value::Unit)
             }
             // Scalar math ABI: shared full-range trig, including exceptional SIMD lanes.
-            "wukong_rt_trig_f32" => {
+            I::RtTrigF32 => {
                 if args.len() != 2 {
                     return Err("wukong_rt_trig_f32 expects two arguments".into());
                 }
@@ -3691,7 +3794,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // The double-precision transcendental library an `f64` `exp`/`log`/`sin`/… lowers to:
             // the identical pure-Rust function the JIT binds and the AOT link resolves, called on
             // the f64 the slot holds (no narrowing), so the oracle is the native result bit-for-bit.
-            "wukong_rt_math_f64" => {
+            I::RtMathF64 => {
                 if args.len() != 2 {
                     return Err("wukong_rt_math_f64 expects two arguments".into());
                 }
@@ -3700,7 +3803,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                     args[1].as_int() as i64,
                 )))
             }
-            "wukong_rt_math2_f64" => {
+            I::RtMath2F64 => {
                 if args.len() != 3 {
                     return Err("wukong_rt_math2_f64 expects three arguments".into());
                 }
@@ -3714,7 +3817,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // an `out[i] = f(x[i], y[i])` loop lowers to. Marshal `n` f32 from x AND y, call the
             // *identical* runtime kernel the native backend calls, write the result back — so the
             // differential oracle stays exact. Read both inputs before writing (in-place safe).
-            "wukong_vmath2_f32" => {
+            I::Vmath2F32 => {
                 let x = ptr(args[0])?;
                 let y = ptr(args[1])?;
                 let out = ptr(args[2])?;
@@ -3767,7 +3870,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `dx == y` this arm computes an out-of-place result and native computes something else,
             // so the recognizer declines that case at lowering (`provably_disjoint(nest.y, nest.dx)`)
             // and only the permitted aliasing reaches here.
-            "wukong_softmax_bwd_f32" | "wukong_softmax_bwd_f32_parallel" => {
+            I::SoftmaxBwdF32 | I::SoftmaxBwdF32Parallel => {
                 let y = ptr(args[0])?;
                 let dy = ptr(args[1])?;
                 let dx = ptr(args[2])?;
@@ -3803,7 +3906,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // / selective scan (SSM/Mamba/EMA) `out[r,t] = a[r,t]·h_{t-1} + b[r,t]`, `h_{-1}=0` per row.
             // Marshal the `rows*cols` f32 gate `a` and input `b`, call the *serial* kernel (bit-identical
             // to the parallel one — rows independent, no cross-row combine), write the `rows*cols` result.
-            "wukong_lrscan_f32" | "wukong_lrscan_f32_parallel" => {
+            I::LrscanF32 | I::LrscanF32Parallel => {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let out = ptr(args[2])?;
@@ -3850,10 +3953,10 @@ impl<'a, 'k> Interp<'a, 'k> {
             // LayerNorm backward shares the identical 7-arg ABI and marshalling; the kernel fn is
             // selected by name below. (Both serial/parallel names route through the serial kernel —
             // bit-identical, rows independent.)
-            "wukong_rmsnorm_bwd_f32"
-            | "wukong_rmsnorm_bwd_f32_parallel"
-            | "wukong_layernorm_bwd_f32"
-            | "wukong_layernorm_bwd_f32_parallel" => {
+            I::RmsnormBwdF32
+            | I::RmsnormBwdF32Parallel
+            | I::LayernormBwdF32
+            | I::LayernormBwdF32Parallel => {
                 let x = ptr(args[0])?;
                 let dy = ptr(args[1])?;
                 let gamma_idx = match args[2] {
@@ -3930,7 +4033,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // recognized batched nest lowers to. Marshal `rows*cols` f32 from x, the `rows` i32 labels
             // from target (each `Value::Int`'s value), call the *serial* kernel (bit-identical to the
             // parallel one — rows independent), write the `rows`-long loss vector.
-            "wukong_xent_fwd_f32" | "wukong_xent_fwd_f32_parallel" => {
+            I::XentFwdF32 | I::XentFwdF32Parallel => {
                 let x = ptr(args[0])?;
                 let target = ptr(args[1])?;
                 let loss = ptr(args[2])?;
@@ -3967,7 +4070,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `wukong_xent_bwd_f32[_parallel](x, target, dx, rows, cols)` — the softmax cross-entropy
             // backward (`dx = softmax(x) − onehot(target)`). Marshal `rows*cols` f32 from x and `rows`
             // i32 labels, call the *serial* kernel (bit-identical to parallel), write the `rows*cols` dx.
-            "wukong_xent_bwd_f32" | "wukong_xent_bwd_f32_parallel" => {
+            I::XentBwdF32 | I::XentBwdF32Parallel => {
                 let x = ptr(args[0])?;
                 let target = ptr(args[1])?;
                 let dx = ptr(args[2])?;
@@ -4005,7 +4108,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // position embedding a recognized RoPE nest lowers to. Marshal `rows*2*half` f32 from x and
             // `half` f32 from inv_freq, call the *serial* kernel (bit-identical to the parallel one —
             // rows independent), write `out` (reading x first, so in-place x==out is correct).
-            "wukong_rope_f32" | "wukong_rope_f32_parallel" => {
+            I::RopeF32 | I::RopeF32Parallel => {
                 let x = ptr(args[0])?;
                 let inv_freq = ptr(args[1])?;
                 let out = ptr(args[2])?;
@@ -4042,7 +4145,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             }
             // `wukong_rope_bwd_f32[_parallel](g, inv_freq, dx, rows, half)` — the RoPE backward (the
             // transpose/inverse rotation). Identical marshalling to the forward, only the kernel differs.
-            "wukong_rope_bwd_f32" | "wukong_rope_bwd_f32_parallel" => {
+            I::RopeBwdF32 | I::RopeBwdF32Parallel => {
                 let g = ptr(args[0])?;
                 let inv_freq = ptr(args[1])?;
                 let dx = ptr(args[2])?;
@@ -4083,10 +4186,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // the `rows`-long out vector.
             // Log-sum-exp and row-entropy share the (x, out, rows, cols) shape — `rows*cols` f32 in,
             // a `rows`-long scalar out; the kernel fn is chosen by name.
-            "wukong_logsumexp_f32"
-            | "wukong_logsumexp_f32_parallel"
-            | "wukong_entropy_f32"
-            | "wukong_entropy_f32_parallel" => {
+            I::LogsumexpF32 | I::LogsumexpF32Parallel | I::EntropyF32 | I::EntropyF32Parallel => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let rows = dim!(args[2]);
@@ -4117,14 +4217,14 @@ impl<'a, 'k> Interp<'a, 'k> {
             // two output-buffer families that write integers rather than floats — `wukong_i8gemm_nt`
             // and its `i32` accumulator is the other). row-arg writes `rows` indices,
             // col-arg writes `cols`; the kernel and the output length are selected by name.
-            "wukong_rowargmax_i32"
-            | "wukong_rowargmax_i32_parallel"
-            | "wukong_rowargmin_i32"
-            | "wukong_rowargmin_i32_parallel"
-            | "wukong_colargmax_i32"
-            | "wukong_colargmax_i32_parallel"
-            | "wukong_colargmin_i32"
-            | "wukong_colargmin_i32_parallel" => {
+            I::RowargmaxI32
+            | I::RowargmaxI32Parallel
+            | I::RowargminI32
+            | I::RowargminI32Parallel
+            | I::ColargmaxI32
+            | I::ColargmaxI32Parallel
+            | I::ColargminI32
+            | I::ColargminI32Parallel => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let rows = dim!(args[2]);
@@ -4161,14 +4261,14 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `x==out` is safe). cumsum's in-lane scan reassociates (both backends run the identical
             // kernel, so interp == native holds); cummax/cummin select a value, so they are bit-exact.
             // The kernel fn is chosen by name.
-            "wukong_cumsum_f32"
-            | "wukong_cumsum_f32_parallel"
-            | "wukong_cummax_f32"
-            | "wukong_cummax_f32_parallel"
-            | "wukong_cummin_f32"
-            | "wukong_cummin_f32_parallel"
-            | "wukong_cumprod_f32"
-            | "wukong_cumprod_f32_parallel" => {
+            I::CumsumF32
+            | I::CumsumF32Parallel
+            | I::CummaxF32
+            | I::CummaxF32Parallel
+            | I::CumminF32
+            | I::CumminF32Parallel
+            | I::CumprodF32
+            | I::CumprodF32Parallel => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let rows = dim!(args[2]);
@@ -4199,10 +4299,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             }
             // KL divergence and soft-label cross-entropy share the (a, b, out, rows, cols) shape — two
             // `rows*cols` f32 inputs, a `rows`-long scalar out; the kernel fn is chosen by name.
-            "wukong_kldiv_f32"
-            | "wukong_kldiv_f32_parallel"
-            | "wukong_kd_loss_f32"
-            | "wukong_kd_loss_f32_parallel" => {
+            I::KldivF32 | I::KldivF32Parallel | I::KdLossF32 | I::KdLossF32Parallel => {
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let out = ptr(args[2])?;
@@ -4244,7 +4341,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // bf16 input bits (as the bf16 reductions/axpby do — the stored value is already bf16-
             // rounded, so `f32_to_bf16_bits` is exact), call the *identical* runtime kernel the native
             // backend calls, write the f32 result back — so the differential oracle stays exact.
-            "wukong_vmath_bf16" => {
+            I::VmathBf16 => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let n = dim!(args[2]);
@@ -4273,7 +4370,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             }
             // `wukong_vmath_f16` — the F16C twin of `wukong_vmath_bf16`: reconstruct exact f16 bits
             // via `f32_to_f16_bits` and call the identical kernel, so interp == native.
-            "wukong_vmath_f16" => {
+            I::VmathF16 => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let n = dim!(args[2]);
@@ -4303,7 +4400,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // in f32 and narrows the result back to the half width through the shared shim), then widen
             // the stored half bits back to the interpreter's f32 slot. Same reconstruct-exact-bits +
             // call-the-kernel discipline as the reduction/axpby-out arms, so interp == native bit-exact.
-            "wukong_vmath_bf16_out" | "wukong_vmath_f16_out" => {
+            I::VmathBf16Out | I::VmathF16Out => {
                 let is_f16 = name == "wukong_vmath_f16_out";
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
@@ -4358,7 +4455,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // bits). Reading all of x/y before writing out makes the in-place (x == out) case correct.
             // An unused y contributes no data: do not type-check or dereference its memory.
             // The scratch buffer still supplies valid storage to every runtime implementation.
-            "wukong_velem_f32" | "wukong_velem_f32_parallel" => {
+            I::VelemF32 | I::VelemF32Parallel => {
                 let x = ptr(args[0])?;
                 let y = ptr(args[1])?;
                 let out = ptr(args[2])?;
@@ -4431,7 +4528,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // bit-for-bit, rows independent), write the result back — so the differential oracle stays
             // exact for both the serial and `_parallel` names. Read all of x/b before writing out so an
             // in-place (x == out) case is correct.
-            "wukong_bias_bcast_f32" | "wukong_bias_bcast_f32_parallel" => {
+            I::BiasBcastF32 | I::BiasBcastF32Parallel => {
                 let x = ptr(args[0])?;
                 let b = ptr(args[1])?;
                 let out = ptr(args[2])?;
@@ -4472,7 +4569,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // a recognized `r = c0; r = r*x + c1; …; out[i] = r` loop lowers to. Marshal `n` f32 from x
             // and `ncoeff` f32 from coeffs, call the identical runtime kernel, write out — so the
             // differential oracle stays exact despite the wider lanes / non-temporal stores.
-            "wukong_vhorner_f32" => {
+            I::VhornerF32 => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let n = dim!(args[2]);
@@ -4526,7 +4623,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // and call the *serial* runtime kernel, which is bit-identical to the parallel one the
             // native backend runs — so the differential oracle stays exact. The unary sum passes
             // y == x (harmless redundant reads); the kernel ignores y for it.
-            "wukong_sreduce_f32" | "wukong_sreduce_f32_parallel" => {
+            I::SreduceF32 | I::SreduceF32Parallel => {
                 let x = ptr(args[0])?;
                 let y = ptr(args[1])?;
                 let n = args[2].as_int().max(0) as usize;
@@ -4570,7 +4667,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // and call the *serial* kernel (bit-identical to the parallel one — fixed RCHUNK, ascending
             // index-order combine, lowest-index tie-break), returning the index. CPU-only (no
             // accelerator seam), so the differential oracle is unaffected.
-            "wukong_argreduce_f32" | "wukong_argreduce_f32_parallel" => {
+            I::ArgreduceF32 | I::ArgreduceF32Parallel => {
                 let x = ptr(args[0])?;
                 let n = args[1].as_int().max(0) as usize;
                 let op = args[2].as_int() as i64;
@@ -4592,10 +4689,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // unlike the f32 reductions (whose serial form is itself chunked, so the interp calls it),
             // the bf16/f16 serial kernels reduce the *whole* array flat, which reassociates vs the
             // chunked parallel fold — so we call the deterministic parallel kernel native runs, exactly.
-            "wukong_dot_bf16"
-            | "wukong_sum_bf16"
-            | "wukong_dot_bf16_parallel"
-            | "wukong_sum_bf16_parallel" => {
+            I::DotBf16 | I::SumBf16 | I::DotBf16Parallel | I::SumBf16Parallel => {
                 let is_dot = name == "wukong_dot_bf16" || name == "wukong_dot_bf16_parallel";
                 let is_par = name.ends_with("_parallel");
                 let x = ptr(args[0])?;
@@ -4633,7 +4727,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // a `m = fmax/fmin(m, (x[k] as f32))` loop over `[bf16]` lowers to. Reconstruct the exact
             // bf16 bits (as the dot/sum path does), call the identical kernel — the widen is lossless
             // and max/min round nothing, so interp == native exactly.
-            "wukong_reduce_bf16" | "wukong_reduce_bf16_parallel" => {
+            I::ReduceBf16 | I::ReduceBf16Parallel => {
                 let is_par = name.ends_with("_parallel");
                 let x = ptr(args[0])?;
                 let n = args[1].as_int().max(0) as usize;
@@ -4653,10 +4747,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // marshaling as the bf16 reductions, but reconstruct the exact f16 bits via
             // `f32_to_f16_bits` (the stored value is already f16-rounded, so this is exact) and call
             // the F16C kernels. interp == native bit-for-bit (the widen is lossless, identical kernel).
-            "wukong_dot_f16"
-            | "wukong_sum_f16"
-            | "wukong_dot_f16_parallel"
-            | "wukong_sum_f16_parallel" => {
+            I::DotF16 | I::SumF16 | I::DotF16Parallel | I::SumF16Parallel => {
                 let is_dot = name == "wukong_dot_f16" || name == "wukong_dot_f16_parallel";
                 let is_par = name.ends_with("_parallel");
                 let x = ptr(args[0])?;
@@ -4691,7 +4782,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                 };
                 Ok(Value::Float(r as f64))
             }
-            "wukong_reduce_f16" | "wukong_reduce_f16_parallel" => {
+            I::ReduceF16 | I::ReduceF16Parallel => {
                 let is_par = name.ends_with("_parallel");
                 let x = ptr(args[0])?;
                 let n = args[1].as_int().max(0) as usize;
@@ -4711,7 +4802,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `out[k] = a*(x[k] as f32) + b*(y[k] as f32)` map over `[bf16; _]` inputs (f32 output)
             // lowers to. Reconstruct the bf16 input bits exactly (as the reductions do), call the
             // identical kernel, write the f32 result back — so the differential gate stays exact.
-            "wukong_axpby_bf16" | "wukong_axpby_f16" => {
+            I::AxpbyBf16 | I::AxpbyF16 => {
                 let is_f16 = name == "wukong_axpby_f16";
                 let x = ptr(args[0])?;
                 let y = ptr(args[1])?;
@@ -4763,7 +4854,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // of the widened bits) — bit-identical to the native backend's write-then-load. The
             // narrowing round lives in the shared shim (== the recognizer's `as bf16` store), so interp
             // == native and `-O0` == `-O2` (value-rounded).
-            "wukong_axpby_bf16_out" | "wukong_axpby_f16_out" => {
+            I::AxpbyBf16Out | I::AxpbyF16Out => {
                 let is_f16 = name == "wukong_axpby_f16_out";
                 let x = ptr(args[0])?;
                 let y = ptr(args[1])?;
@@ -4829,14 +4920,14 @@ impl<'a, 'k> Interp<'a, 'k> {
             // serial and `_parallel` names: the runtime pins serial == parallel == interpreter
             // bit-for-bit, and the interpreter is the oracle, so the differential gate stays exact
             // despite the kernel's wider/reassociated accumulation.
-            "wukong_sgemm_bf16_nt"
-            | "wukong_sgemm_bf16_nt_parallel"
-            | "wukong_sgemm_f16_nt"
-            | "wukong_sgemm_f16_nt_parallel"
-            | "wukong_sgemm_bf16_tn"
-            | "wukong_sgemm_bf16_tn_parallel"
-            | "wukong_sgemm_f16_tn"
-            | "wukong_sgemm_f16_tn_parallel" => {
+            I::SgemmBf16Nt
+            | I::SgemmBf16NtParallel
+            | I::SgemmF16Nt
+            | I::SgemmF16NtParallel
+            | I::SgemmBf16Tn
+            | I::SgemmBf16TnParallel
+            | I::SgemmF16Tn
+            | I::SgemmF16TnParallel => {
                 let is_f16 = name.contains("_f16");
                 let is_tn = name.contains("_tn");
                 let a = ptr(args[0])?;
@@ -4913,10 +5004,10 @@ impl<'a, 'k> Interp<'a, 'k> {
             // the *serial* runtime kernel for both the serial and `_parallel` names (serial == parallel
             // == interpreter bit-for-bit — rows independent, identical per-(i,j) order), so the
             // differential gate stays exact despite the kernel's wider/reassociated accumulation.
-            "wukong_sgemm_bf16_nt_epi"
-            | "wukong_sgemm_bf16_nt_epi_parallel"
-            | "wukong_sgemm_f16_nt_epi"
-            | "wukong_sgemm_f16_nt_epi_parallel" => {
+            I::SgemmBf16NtEpi
+            | I::SgemmBf16NtEpiParallel
+            | I::SgemmF16NtEpi
+            | I::SgemmF16NtEpiParallel => {
                 let is_f16 = name.contains("_f16");
                 let a = ptr(args[0])?;
                 let b = ptr(args[1])?;
@@ -5020,7 +5111,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `rows*cols` f32 out of x, call the *serial* runtime kernel (bit-identical to the parallel
             // one the native backend runs, since rows are independent), write the result to out.
             // Reading all of x before writing out makes the in-place (x == out) case correct.
-            "wukong_norm_f32" | "wukong_norm_f32_parallel" => {
+            I::NormF32 | I::NormF32Parallel => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let rows = dim!(args[2]);
@@ -5072,7 +5163,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // lowers to a `Ptr`-typed `ConstInt(0)` → a `Value::Int(0)` here (distinct from a real array's
             // `Value::Ptr`), so match the variant: pass a null pointer (kernel uses scale 1 / shift 0).
             // Both names marshal through the *serial* runtime kernel (bit-identical — rows independent).
-            "wukong_norm_affine_f32" | "wukong_norm_affine_f32_parallel" => {
+            I::NormAffineF32 | I::NormAffineF32Parallel => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
                 let gamma_idx = match args[2] {
@@ -5158,7 +5249,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // Element-wise this is the identical gather (pure data movement — every output element is a
             // verbatim copy, so there is no reassociation to keep in sync with the runtime kernel), with
             // the runtime's own out-of-range rule preserved: an id outside `[0, v)` zeroes its row.
-            "wukong_embedding_f32" | "wukong_embedding_f32_parallel" => {
+            I::EmbeddingF32 | I::EmbeddingF32Parallel => {
                 let out = ptr(args[0])?;
                 let weight = ptr(args[1])?;
                 let ids = ptr(args[2])?;
@@ -5239,7 +5330,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             //    NATIVE does — `ids` is an `[i32]` buffer and the kernel's parameter is
             //    `*const i32`, so a value outside i32 is reinterpreted, not skipped. A well-typed
             //    program cannot produce one; matching native costs one cast.
-            "wukong_scatter_add_f32" | "wukong_scatter_add_f32_parallel" => {
+            I::ScatterAddF32 | I::ScatterAddF32Parallel => {
                 let grad_w = ptr(args[0])?;
                 let grad_out = ptr(args[1])?;
                 let ids = ptr(args[2])?;
@@ -5293,7 +5384,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // q/k/v out of its abstract memory into real f32 buffers, calls the *identical* runtime
             // kernel the native backend calls, then writes the output back — so the online-softmax
             // reassociation stays bit-for-bit exact across the two backends.
-            "wukong_attention_f32" => {
+            I::AttentionF32 => {
                 let q = ptr(args[0])?;
                 let k = ptr(args[1])?;
                 let v = ptr(args[2])?;
@@ -5346,7 +5437,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                 .text_intrinsic(other, args)
                 .or_else(|| self.ml_intrinsic(other, args))
                 .or_else(|| self.decode_intrinsic(other, args))
-                .unwrap_or_else(|| Err(format!("call to unknown function or intrinsic `{other}`"))),
+                .unwrap_or_else(|| Err(format!("call to unknown function or intrinsic `{name}`"))),
         }
     }
 }
