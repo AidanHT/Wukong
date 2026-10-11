@@ -166,6 +166,24 @@ pub struct ParamAttrs {
     /// pointer at offset 0, `i64` length at offset 8), which is a live object for the whole call.
     /// A slice's elements never overlap its own fat pointer.
     pub slice: bool,
+    /// The parameter is a fixed-extent buffer — a `[T; N]` array (nested arrays included) or a
+    /// statically-shaped contiguous tensor of scalar `T` — so its value points at exactly
+    /// `elems` scalars of `elem_bytes` bytes each, live for the whole call. Unlike the two flags
+    /// above this is not a promise but a type fact: the front end rejects a call whose argument's
+    /// extent differs (`E0501`), and Wukong has no reinterpreting view. Recorded independently of
+    /// `@noalias`; `None` for every other parameter. The vectorizer reads it to run a search loop's
+    /// test ahead of the scalar loop over a parameter array (`wukong_opt::vectorize`).
+    pub extent: Option<ParamExtent>,
+}
+
+/// The fixed storage extent of a buffer parameter ([`ParamAttrs::extent`]): `elems` scalar leaves
+/// of `elem_bytes` bytes each. Counted in scalar leaves because that is the one unit both execution
+/// models agree on — the interpreter's memory is one slot per scalar leaf, the native backend's is
+/// `elem_bytes` bytes per leaf — so a range proved inside `[0, elems)` holds in both.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ParamExtent {
+    pub elems: u64,
+    pub elem_bytes: u32,
 }
 
 /// A function: a value arena (`ValueId -> MirType`), a list of blocks, and an entry.

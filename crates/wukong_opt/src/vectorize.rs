@@ -1631,11 +1631,17 @@ fn defined_in_block(f: &Function, b: BlockId, v: ValueId) -> bool {
 ///
 /// * a **stack array** of this function, `[T; N]` with `T` the element read: the constant range
 ///   `[start + c, end + c)` lies inside `[0, N)`;
+/// * a **fixed-extent buffer parameter** — a `[T; N]` array or a statically-shaped tensor, whose
+///   extent the front end records on the MIR parameter ([`wukong_mir::ParamExtent`], counted in
+///   scalar leaves) — under the same constant-range test, when the element read is a scalar of the
+///   recorded width. The extent is a type fact: a call whose argument has a different length does
+///   not compile (`E0501`), and no view reinterprets a buffer, so the pointer really does address
+///   `N` leaves for the whole call;
 /// * a **`[]T` slice whose loop runs to its own length** — `end` is `load i64 (hdr + 8)`, the
 ///   fat pointer's length field, and the data is re-read from the same `hdr` — with `c <= 0` and a
 ///   constant `start + c >= 0`: every element below the length exists.
 ///
-/// Anything else — a parameter pointer with no known extent, a symbolic offset — is refused: a
+/// Anything else — a pointer with no known extent, a symbolic offset or bound — is refused: a
 /// group straddling the end of a shorter buffer could fault where the scalar loop stops in time.
 fn speculation_safe(
     f: &Function,
@@ -1648,13 +1654,17 @@ fn speculation_safe(
     let c = i128::from(c);
     match base {
         MemBase::Outer(v) => {
-            let Some(Op::Alloca { ty, .. }) = op_of(f, v) else {
-                return false;
-            };
-            let n = match ty {
-                MirType::Array(e, n) if **e == *elem => i128::from(*n),
-                t if t == elem => 1,
-                _ => return false,
+            let n = match op_of(f, v) {
+                Some(Op::Alloca { ty, .. }) => match ty {
+                    MirType::Array(e, n) if **e == *elem => i128::from(*n),
+                    t if t == elem => 1,
+                    _ => return false,
+                },
+                Some(_) => return false,
+                None => match param_extent(f, v) {
+                    Some(x) if lane_bytes(elem) == Some(x.elem_bytes) => i128::from(x.elems),
+                    _ => return false,
+                },
             };
             let (Some(s), Some(e)) = (const_of(f, start), const_of(f, end)) else {
                 return false;
@@ -1679,6 +1689,12 @@ fn speculation_safe(
                 && const_of(f, start).is_some_and(|s| s + c >= 0)
         }
     }
+}
+
+/// The recorded storage extent of `v` when it is one of `f`'s own parameters.
+fn param_extent(f: &Function, v: ValueId) -> Option<wukong_mir::ParamExtent> {
+    let i = f.params.iter().position(|&p| p == v)?;
+    f.param_attr(i).extent
 }
 
 fn succs(t: &Terminator) -> Vec<BlockId> {
@@ -7568,6 +7584,49 @@ mod tests {
             !is_widened(src, "find"),
             "a search over a buffer of unknown extent must not be widened"
         );
+    }
+
+    /// A `[T; N]` or statically-shaped tensor parameter carries its extent into MIR, so a search
+    /// whose constant bound keeps every group load inside the parameter widens. The two functions
+    /// call each other so neither is inlined into `main` (where the buffer would be a local and the
+    /// stack-array proof would answer instead); the hit at 36 is found by the scalar tail.
+    #[test]
+    fn a_search_over_a_fixed_extent_parameter_widens_and_agrees() {
+        let k = "fn find(x: [f32; 37], t: f32, d: i64) -> i64 { \
+                   if d > 0 { return again(x, t, d - 1); } \
+                   let mut i: i64 = 0; while i < 37 { if x[i] > t { break; } i = i + 1; } \
+                   return i; } \
+                 fn again(x: [f32; 37], t: f32, d: i64) -> i64 { return find(x, t, d); } \
+                 fn tfind(x: Tensor[f32, 37], t: f32) -> i64 { \
+                   let mut i: i64 = 0; while i < 36 { if x[i + 1] > t { break; } i = i + 1; } \
+                   return i; }";
+        let shape = format!("{k} fn main() -> i32 {{ return 0; }}");
+        assert!(is_widened(&shape, "find"), "a [f32; 37] parameter search");
+        assert!(is_widened(&shape, "tfind"), "a Tensor[f32, 37] parameter search");
+        scalar_and_vector_agree(&format!(
+            "{k} fn main() -> i32 {{ let mut a: [f32; 37] = [0.0; 37]; let mut j: i64 = 0; \
+             while j < 37 {{ a[j] = j as f32; j = j + 1; }} \
+             let mut q: i64 = 0; \
+             while q < 38 {{ print(find(a, (q as f32) - 0.5, 1)); q = q + 1; }} \
+             return 0; }}"
+        ));
+    }
+
+    /// A bound past the parameter's extent — or an offset that carries the last group past it —
+    /// keeps the search scalar: lanes beyond the exiting one would read past the buffer.
+    #[test]
+    fn a_search_reaching_past_a_parameters_extent_is_declined() {
+        for (bound, off) in [(38, 0), (37, 1)] {
+            let src = format!(
+                "fn find(x: [f32; 37], t: f32) -> i64 {{ let mut i: i64 = 0; \
+                 while i < {bound} {{ if x[i + {off}] > t {{ break; }} i = i + 1; }} return i; }} \
+                 fn main() -> i32 {{ return 0; }}"
+            );
+            assert!(
+                !is_widened(&src, "find"),
+                "bound {bound} offset {off} reads past a [f32; 37]"
+            );
+        }
     }
 
     /// The lane test and the exit: the widened body ends in a branch on the folded mask that

@@ -53,6 +53,7 @@ pub(crate) fn record_param(
         ParamAttrs {
             noalias: true,
             slice: matches!(ty, Ty::Slice(_)),
+            extent: None,
         },
     );
 }
@@ -211,15 +212,22 @@ fn main() -> i32 { return 0; }
             k.param_attr(0),
             ParamAttrs {
                 noalias: true,
-                slice: true
+                slice: true,
+                extent: None,
             }
         );
         assert_eq!(k.param_attr(1), ParamAttrs::default());
+        // A fixed-size array parameter also records its extent — a type fact, not a promise, and
+        // recorded with or without the attribute (`FnLowerer::record_buffer_extent`).
         assert_eq!(
             k.param_attr(2),
             ParamAttrs {
                 noalias: true,
-                slice: false
+                slice: false,
+                extent: Some(wukong_mir::ParamExtent {
+                    elems: 4,
+                    elem_bytes: 4,
+                }),
             }
         );
         assert_eq!(k.param_attr(3), ParamAttrs::default());
