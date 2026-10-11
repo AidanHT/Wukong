@@ -10,8 +10,10 @@ All notable changes to Wukong are documented here. The format is loosely based o
 - **`--train --emit=exe` builds the training loop into an executable (P4.3).** The forward, its
   generated backward, the fused AdamW kernels and a kernel dispatcher are linked with a synthesized
   `main` that calls the runtime's new `wukong_rt_train_main` on a versioned `.rodata` spec blob;
-  `--emit=obj` writes the object, and `-o` alone selects the default `exe` stage. The loop moved
-  out of the driver into `wukong_runtime::train::run_training`, which `wukongc --train` now runs
+  `--emit=obj` writes the object (which links the same way: it needs the rlib's training loop and
+  wukongc's generated link shim, for `wukong_rt_run_main` and the print/assert entries, so it does
+  not link against `wukong_runtime` alone), and `-o` alone selects the default `exe` stage. The
+  loop moved out of the driver into `wukong_runtime::train::run_training`, which `wukongc --train` now runs
   in process over the same spec bytes, so the executable's stdout is byte-identical to `--train` on
   the interpreter and the native JIT by construction (`crates/wukongc/tests/train_exe.rs`: five
   models, `-O0`/`-O2`, SGD and AdamW with clip/warmup/cosine). `--train-init`, `--train-data` and

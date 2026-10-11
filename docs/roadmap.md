@@ -1218,7 +1218,8 @@ construction; `crates/wukongc/tests/train_exe.rs` links five models (one of them
 `-O0`/`-O2` under SGD and AdamW and compares (20 of 20 on the rustc path). `--emit=obj` writes the object instead. Sharp
 edges: the executable reads and writes no files (`--train-init`/`--train-data`/`--train-save` with an
 artifact are refused, exit 2), and it needs the rustc + `wukong_runtime` rlib link (the C fallback
-has no training loop; refused by name, exit 2). What a loss prints now reaches stdout in process as
+has no training loop; refused by name, exit 2) — an `--emit=obj` object too, which also imports
+`wukong_rt_run_main` and the print/assert entries of wukongc's generated link shim. What a loss prints now reaches stdout in process as
 well (it used to be captured and dropped), so the two agree there too. `--train-opt=sgd|adamw`
 selects the optimizer;
 `--train-weight-decay` accepts finite nonnegative AdamW decay (default zero) and rejects nonzero

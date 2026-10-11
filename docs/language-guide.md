@@ -2276,8 +2276,10 @@ the default `exe` stage). The equality holds by construction: the executable's `
 runtime's `wukong_rt_train_main` with the run's settings baked in, which runs the same loop and
 prints the same text the in-process run does (`crates/wukongc/tests/train_exe.rs` checks it on
 five models, at `-O0`/`-O2`, under SGD and AdamW). Linking it needs the rustc + `wukong_runtime`
-rlib path; the C fallback runtime has no training loop and is refused by name (exit 2). The
-executable reads and writes no files, so `--train-init`, `--train-data` and `--train-save` with an
+rlib path; the C fallback runtime has no training loop and is refused by name (exit 2). An
+`--emit=obj` object links the same way: besides the rlib's training loop it imports
+`wukong_rt_run_main` and the print/assert entries of wukongc's generated link shim, so it does not
+link against `wukong_runtime` alone. The executable reads and writes no files, so `--train-init`, `--train-data` and `--train-save` with an
 artifact are refused by name (exit 2) rather than dropped. Whatever the loss prints goes to stdout
 in both — once per update (the backward replays the forward) and once for the final forward, before
 the report. A loss that fails at run time (a failed `assert`, a bounds failure) stops both with exit

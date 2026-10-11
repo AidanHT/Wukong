@@ -469,3 +469,50 @@ fn train_failure_keeps_what_the_kernel_printed() {
     }
     let _ = std::fs::remove_dir_all(&scratch);
 }
+
+/// Without the rustc + runtime-rlib link (here: a copy of wukongc with no rlib beside it), a
+/// training executable cannot be built, and the refusal is by name (exit 2, nothing written). Its
+/// advice must be followable: an object from `--train --emit=obj` imports `wukong_rt_run_main` and
+/// the print/assert entries, which only wukongc's generated runtime shim defines, so "link the object
+/// against `wukong_runtime`" would end in an unresolved symbol.
+#[test]
+fn train_exe_without_the_rlib_link_is_refused_with_followable_advice() {
+    let scratch = std::env::temp_dir()
+        .join("wukong_train_exe_no_rlib")
+        .join(std::process::id().to_string());
+    let bin = scratch.join("bin");
+    std::fs::create_dir_all(&bin).expect("create the scratch directory");
+    let lone = bin.join(format!("wukongc{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(env!("CARGO_BIN_EXE_wukongc"), &lone).expect("copy wukongc");
+    assert!(
+        wukong_driver::runtime_rlib_in(&bin).is_none(),
+        "the copy must have no runtime rlib beside it"
+    );
+    let (source, args) = fixture_case("autodiff_train_sumsq.wk");
+    let exe = scratch.join(format!("refused{}", std::env::consts::EXE_SUFFIX));
+    let out = Command::new(&lone)
+        .current_dir(&scratch)
+        .args(&args)
+        .arg("--emit=exe")
+        .arg("-o")
+        .arg(&exe)
+        .arg(&source)
+        .env_remove(wukong_driver::NO_RECOGNIZE_ENV)
+        .output()
+        .expect("spawn the copied wukongc");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(out.stdout.is_empty() && !exe.exists(), "{stderr}");
+    for needle in [
+        "no usable `rustc` + rlib",
+        "run `wukongc --train` in process",
+        "wukong_rt_run_main",
+    ] {
+        assert!(stderr.contains(needle), "missing `{needle}`: {stderr}");
+    }
+    assert!(
+        !stderr.contains("link the object against"),
+        "unfollowable advice: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&scratch);
+}

@@ -1619,13 +1619,19 @@ fn emit_native(
         // A training executable's `main` calls `wukong_rt_train_main`, the runtime's training
         // loop, which the C fallback runtime does not reimplement (a second loop would be a second
         // thing to keep byte-identical). Say so instead of letting `cc` report an undefined symbol.
+        // The object alone is no way out: besides the rlib's `wukong_rt_train_main` it imports
+        // `wukong_rt_run_main` and the print/assert entries, which only the generated
+        // `WUKONG_RT_SHIM` (or the C runtime) defines, never the `wukong_runtime` rlib.
         LinkOutcome::Unavailable if opts.grad.train => {
             emit_driver_error(
                 opts,
                 "a `--train --emit=exe` executable links the training loop from the \
                  `wukong_runtime` rlib, and no usable `rustc` + rlib is beside wukongc (the `cc` \
-                 fallback runtime has no training loop); use `--train --emit=obj` and link the \
-                 object against `wukong_runtime`, or run `wukongc --train`",
+                 fallback runtime has no training loop); run `wukongc --train` in process, or \
+                 use a wukongc built by cargo with `rustc` on PATH (a `--train --emit=obj` \
+                 object needs that same link: the rlib's `wukong_rt_train_main` plus wukongc's \
+                 generated runtime shim, which defines `wukong_rt_run_main` and the print and \
+                 assert entries)",
             );
             return exit::UNIMPLEMENTED;
         }
