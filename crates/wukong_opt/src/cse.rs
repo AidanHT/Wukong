@@ -135,15 +135,18 @@ impl Pass for Cse {
         };
         cx.visit(f.entry.0);
         let Numbering {
-            rewrite,
+            mut rewrite,
             rewrites,
             pending,
             created,
+            types,
             ..
         } = cx;
         if rewrites == 0 {
             return false;
         }
+        // Every chain now points at its final value, so each use below is one table read.
+        compress(&mut rewrite);
 
         // Materialize the phis a computation asked for, in creation order: each becomes the next
         // value id (the ids the rewrites already name) and the last parameter of its join, and every
@@ -153,7 +156,7 @@ impl Pass for Cse {
             let phi = &pending[k as usize];
             let id = ValueId(f.value_types.len() as u32);
             debug_assert_eq!(phi.param, Some(id.0));
-            f.value_types.push(phi.ty.clone());
+            f.value_types.push(types.ty(phi.ty));
             f.blocks[phi.block as usize].params.push(id);
             for &(p, v) in &phi.incoming {
                 push_edge_arg(&mut f.blocks[p as usize].term, phi.block, ValueId(v));
@@ -162,13 +165,13 @@ impl Pass for Cse {
         for b in &mut f.blocks {
             for inst in &mut b.insts {
                 map_op_uses(&mut inst.op, |v| {
-                    let r = ValueId(resolve(&rewrite, v.0));
+                    let r = ValueId(target(&rewrite, v.0));
                     changed |= r != v;
                     r
                 });
             }
             map_term_uses(&mut b.term, |v| {
-                let r = ValueId(resolve(&rewrite, v.0));
+                let r = ValueId(target(&rewrite, v.0));
                 changed |= r != v;
                 r
             });
@@ -218,8 +221,10 @@ struct Numbering<'a> {
     /// Scoped like `vn`: an entry lives exactly as long as the join's subtree is being numbered.
     pre: FxHashMap<Key, u32>,
     /// value id -> the value it is replaced by (load forwards and CSE rewrites), dense over the
-    /// value arena with [`NO_REWRITE`] for "kept". A target is always a value that was already
-    /// visited and kept (or a phi), so it is final when recorded: every chain is one step long.
+    /// value arena with [`NO_REWRITE`] for "kept". A target is resolved to its own final value
+    /// when it is recorded ([`Numbering::set_rewrite`]), so every chain is one step long; the
+    /// table is compressed once more before it is applied ([`compress`]), which makes each use a
+    /// single read even if a later rewrite ever retargeted a recorded value.
     rewrite: Vec<u32>,
     rewrites: usize,
     /// Interned key types (see [`TyId`]).
@@ -253,7 +258,9 @@ type MemTable = FxHashMap<MemKey, Avail>;
 /// becomes a block parameter only if something at or below the join reads it.
 struct PendingPhi {
     block: u32,
-    ty: MirType,
+    /// The phi's type, interned ([`TyIds`]): comparing two is one word, and nothing boxed is cloned
+    /// until the phi is actually materialized.
+    ty: TyId,
     /// `(predecessor, the value on that edge)`, one per predecessor of `block`.
     incoming: Vec<(u32, u32)>,
     param: Option<u32>,
@@ -282,13 +289,36 @@ struct Scope {
 /// scalars — every type value numbering meets in practice — encode directly; anything nested
 /// deeper is interned per pass run. Equal types always map to equal ids and distinct types to
 /// distinct ids, so keys compare exactly as the `MirType`s they replace.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct TyId(u64);
 
 #[derive(Default)]
 struct TyIds {
     nested: FxHashMap<MirType, u64>,
+    /// The nested types by id, so an id can be turned back into its `MirType` ([`TyIds::ty`]).
+    rev: Vec<MirType>,
 }
+
+/// The scalar a [`scalar_code`] denotes.
+fn scalar_of(code: u64) -> MirType {
+    match code {
+        1 => MirType::I1,
+        2 => MirType::I8,
+        3 => MirType::I16,
+        4 => MirType::I32,
+        5 => MirType::I64,
+        6 => MirType::F16,
+        7 => MirType::BF16,
+        8 => MirType::F32,
+        9 => MirType::F64,
+        10 => MirType::Ptr,
+        _ => MirType::Void,
+    }
+}
+
+/// The form tag of a [`TyId`] (bits 62-63) and the payload below it.
+const TY_TAG_SHIFT: u32 = 62;
+const TY_PAYLOAD: u64 = (1 << TY_TAG_SHIFT) - 1;
 
 /// A scalar type's code; `None` for `Vec`/`Array`.
 fn scalar_code(ty: &MirType) -> Option<u64> {
@@ -333,7 +363,26 @@ impl TyIds {
         }
         let id = self.nested.len() as u64;
         self.nested.insert(ty.clone(), id);
+        self.rev.push(ty.clone());
         TyId((3 << 62) | id)
+    }
+
+    /// The type an id stands for -- the inverse of [`TyIds::id`].
+    fn ty(&self, id: TyId) -> MirType {
+        let payload = id.0 & TY_PAYLOAD;
+        match id.0 >> TY_TAG_SHIFT {
+            0 => scalar_of(payload),
+            tag @ (1 | 2) => {
+                let elem = Box::new(scalar_of(payload >> 32));
+                let n = (payload & 0xFFFF_FFFF) as u32;
+                if tag == 1 {
+                    MirType::Vec(elem, n)
+                } else {
+                    MirType::Array(elem, n)
+                }
+            }
+            _ => self.rev[payload as usize].clone(),
+        }
     }
 }
 
@@ -506,18 +555,25 @@ impl Numbering<'_> {
     }
 
     fn set_rewrite(&mut self, v: ValueId, to: u32) {
+        // Path compression on write: record the end of `to`'s own chain, never an intermediate.
+        let to = resolve(&self.rewrite, to);
+        if to == v.0 {
+            return;
+        }
         if let Some(slot) = self.rewrite.get_mut(v.0 as usize) {
             *slot = to;
             self.rewrites += 1;
         }
     }
 
-    fn mem_key(&mut self, addr: u32, ty: &MirType) -> MemKey {
-        MemKey::Loc {
+    fn mem_key(&mut self, addr: u32, ty: &MirType) -> (MemKey, TyId) {
+        let id = self.types.id(ty);
+        let key = MemKey::Loc {
             addr,
-            ty: self.types.id(ty),
+            ty: id,
             bytes: type_bytes(ty).unwrap_or(u32::MAX),
-        }
+        };
+        (key, id)
     }
 
     /// Intern a call's argument list, mapped through the rewrites so equal calls compare equal.
@@ -542,8 +598,10 @@ impl Numbering<'_> {
             self.set_rewrite(res, canon);
             return;
         }
-        match self.pre.get(&key).copied() {
-            Some(k) if self.pending[k as usize].ty == *res_ty => {
+        let pending = self.pre.get(&key).copied();
+        let res_ty = pending.map(|_| self.types.id(res_ty));
+        match pending {
+            Some(k) if Some(self.pending[k as usize].ty) == res_ty => {
                 let phi = self.materialize(k);
                 self.set_rewrite(res, phi);
             }
@@ -556,7 +614,7 @@ impl Numbering<'_> {
 
     /// Look `key` up in the memory table on behalf of the read `res` of type `ty`: forward a known
     /// value, or record `res` as the new one.
-    fn forward(&mut self, mem: &mut MemTable, key: MemKey, res: ValueId, ty: &MirType) {
+    fn forward(&mut self, mem: &mut MemTable, key: MemKey, res: ValueId, ty: TyId) {
         match mem.get(&key).copied() {
             Some(a) => match self.avail_value(a, ty) {
                 Some(v) => {
@@ -574,13 +632,16 @@ impl Numbering<'_> {
         }
     }
 
-    /// The type of a value, including a phi this run created.
-    fn ty_of(&self, v: u32) -> Option<&MirType> {
+    /// The (interned) type of a value, including a phi this run created.
+    fn ty_of(&mut self, v: u32) -> Option<TyId> {
         match v.checked_sub(self.base) {
-            None => self.f.value_types.get(v as usize),
+            None => {
+                let f = self.f;
+                Some(self.types.id(f.value_types.get(v as usize)?))
+            }
             Some(i) => {
                 let k = *self.created.get(i as usize)?;
-                Some(&self.pending[k as usize].ty)
+                Some(self.pending[k as usize].ty)
             }
         }
     }
@@ -597,10 +658,14 @@ impl Numbering<'_> {
         if self.pending.len() >= MAX_PENDING_PHIS || values.len() != preds.len() {
             return None;
         }
-        let ty = self.ty_of(*values.first()?)?.clone();
-        if (!allow_ptr && ty == MirType::Ptr) || values.iter().any(|&v| self.ty_of(v) != Some(&ty))
-        {
+        let ty = self.ty_of(*values.first()?)?;
+        if !allow_ptr && ty == self.types.id(&MirType::Ptr) {
             return None;
+        }
+        for &v in values {
+            if self.ty_of(v) != Some(ty) {
+                return None;
+            }
         }
         let k = self.pending.len() as u32;
         self.pending.push(PendingPhi {
@@ -624,10 +689,10 @@ impl Numbering<'_> {
     }
 
     /// The value a memory entry names for a read of type `ty`, materializing a pending phi.
-    fn avail_value(&mut self, a: Avail, ty: &MirType) -> Option<u32> {
+    fn avail_value(&mut self, a: Avail, ty: TyId) -> Option<u32> {
         match a {
             Avail::Value(v) => Some(v),
-            Avail::Phi(k) if self.pending[k as usize].ty == *ty => Some(self.materialize(k)),
+            Avail::Phi(k) if self.pending[k as usize].ty == ty => Some(self.materialize(k)),
             Avail::Phi(_) => None,
         }
     }
@@ -825,8 +890,8 @@ impl Numbering<'_> {
                     if !forwardable(ty) {
                         continue;
                     }
-                    let key = self.mem_key(p, ty);
-                    self.forward(&mut mem, key, res, ty);
+                    let (key, id) = self.mem_key(p, ty);
+                    self.forward(&mut mem, key, res, id);
                 }
                 Op::Store { ptr, value } => {
                     let p = self.resolve(*ptr);
@@ -844,7 +909,7 @@ impl Numbering<'_> {
                         MemKey::Call { .. } => private,
                     });
                     if forwardable(sty) && mem.len() < MAX_TRACKED_LOCATIONS {
-                        let key = self.mem_key(p, sty);
+                        let (key, _) = self.mem_key(p, sty);
                         mem.insert(key, Avail::Value(v));
                     }
                 }
@@ -862,7 +927,8 @@ impl Numbering<'_> {
                             func: func.0,
                             args: list,
                         };
-                        self.forward(&mut mem, key, res, res_ty);
+                        let id = self.types.id(res_ty);
+                        self.forward(&mut mem, key, res, id);
                     } else {
                         self.number(res, res_ty, Key::PureCall(func.0, list), added);
                     }
@@ -988,6 +1054,26 @@ fn pack_shuffle_mask(mask: &[u8]) -> Option<u128> {
         packed |= u128::from(m) << (6 * i);
     }
     Some(packed)
+}
+
+/// Path-compress the whole table in place: afterwards every entry names its final value directly
+/// (or [`NO_REWRITE`]), so [`target`] is a single read.
+fn compress(rewrite: &mut [u32]) {
+    for i in 0..rewrite.len() {
+        if rewrite[i] == NO_REWRITE {
+            continue;
+        }
+        let r = resolve(rewrite, i as u32);
+        rewrite[i] = if r == i as u32 { NO_REWRITE } else { r };
+    }
+}
+
+/// The value `v` is replaced by in a [`compress`]ed table.
+fn target(rewrite: &[u32], v: u32) -> u32 {
+    match rewrite.get(v as usize) {
+        Some(&n) if n != NO_REWRITE => n,
+        _ => v,
+    }
 }
 
 /// Follow the rewrite table to the final target. Targets are final when recorded (see
@@ -1258,6 +1344,61 @@ mod tests {
             reload_survives,
             "the reload after the scalar store must not be forwarded to the pre-store value"
         );
+    }
+
+    /// A pending phi carries an interned [`TyId`] and gets its `MirType` back only when it is
+    /// materialized: the id must invert exactly, for every form the encoding distinguishes -- the
+    /// direct scalar, vector-of-scalar and array-of-scalar codes and the interned nested types.
+    #[test]
+    fn type_ids_invert_exactly() {
+        let nested = |n| MirType::Array(Box::new(MirType::Array(Box::new(MirType::I8), 4)), n);
+        let types = [
+            MirType::I1,
+            MirType::I8,
+            MirType::I16,
+            MirType::I32,
+            MirType::I64,
+            MirType::F16,
+            MirType::BF16,
+            MirType::F32,
+            MirType::F64,
+            MirType::Ptr,
+            MirType::Void,
+            MirType::Vec(Box::new(MirType::F32), 4),
+            MirType::Vec(Box::new(MirType::I64), 2),
+            MirType::Array(Box::new(MirType::I8), 16),
+            MirType::Array(Box::new(MirType::F64), u32::MAX),
+            nested(2),
+            nested(3),
+            MirType::Vec(Box::new(MirType::Vec(Box::new(MirType::I1), 2)), 2),
+        ];
+        let mut ids = TyIds::default();
+        let got: Vec<TyId> = types.iter().map(|t| ids.id(t)).collect();
+        for (t, id) in types.iter().zip(&got) {
+            assert_eq!(&ids.ty(*id), t);
+            assert_eq!(ids.id(t), *id, "{t:?} interns to one id");
+        }
+        for i in 0..got.len() {
+            for j in 0..i {
+                assert_ne!(got[i], got[j], "{:?} vs {:?}", types[i], types[j]);
+            }
+        }
+    }
+
+    /// After compression every entry names the end of its chain, whatever order the chain was
+    /// recorded in, and a value that ends at itself is "kept".
+    #[test]
+    fn compression_points_every_chain_at_its_end() {
+        // 0 -> 1 -> 2 -> 3 (kept); 5 -> 4 -> 5 would be a cycle and must not hang; 6 kept.
+        let mut table = vec![1, 2, 3, NO_REWRITE, 5, 4, NO_REWRITE];
+        compress(&mut table);
+        assert_eq!(&table[..4], &[3, 3, 3, NO_REWRITE]);
+        assert_eq!(table[6], NO_REWRITE);
+        assert_eq!(target(&table, 0), 3);
+        assert_eq!(target(&table, 3), 3);
+        assert_eq!(target(&table, 6), 6);
+        // A value beyond the table (a phi this run created) is its own target.
+        assert_eq!(target(&table, 40), 40);
     }
 
     /// Keys carry folded type ids instead of `MirType`s. Equal types must still collide and

@@ -6,6 +6,9 @@
 //!    scalar slot per accessed leaf, for mem2reg to promote in the same sweep (`-O2`).
 //!  * **mem2reg** — promote scalar and pointer `alloca`/`load`/`store` to block-parameter SSA.
 //!  * **simplify** — constant folding and algebraic identities (`x+0`, `x*1`, `x*0`, ...).
+//!  * **jump-thread** — send an edge that already decides a block's branch (a constant argument,
+//!    or a dominating compare of the same values) straight to the decided successor, through a
+//!    private copy of the block (`-O2`).
 //!  * **simplify-cfg** — fold constant branches, merge straight-line blocks, prune dead blocks.
 //!  * **simplify-phis** — drop dead/trivial block parameters mem2reg introduced.
 //!  * **dce** — remove pure instructions whose results are never used, and unused allocas.
@@ -63,6 +66,7 @@ mod dse;
 mod effects;
 mod fxhash;
 mod inline;
+mod jump_thread;
 mod licm;
 mod loop_canon;
 mod loop_delete;
@@ -96,6 +100,7 @@ pub use cse::Cse;
 pub use dce::Dce;
 pub use dse::Dse;
 pub use inline::inline_program;
+pub use jump_thread::JumpThread;
 pub use licm::Licm;
 pub use loop_canon::LoopCanon;
 pub use loop_delete::LoopDelete;
@@ -209,6 +214,12 @@ impl PassManager {
             }
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(Simplify));
+            if opt_level >= 2 {
+                // An edge that already decides a block's branch skips it, through a private copy
+                // of the block (`jump_thread`); simplify-cfg then merges the copy into its
+                // predecessor and removes whatever the threading left without predecessors.
+                pm.add(Box::new(JumpThread));
+            }
             pm.add(Box::new(SimplifyCfg));
             pm.add(Box::new(SimplifyPhis));
             pm.add(Box::new(Dce));
