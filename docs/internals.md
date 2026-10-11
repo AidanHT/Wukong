@@ -694,8 +694,16 @@ frame release, `free` and `scratch_release` drop theirs. Every marshalling helpe
 `read_f32`, `output_f32`, `write_back`, `check_output`, `elementwise_live`, …), the vector-kernel
 arm, and the file and text transfer arms require `[base, base + len)` to lie inside one live block
 before any scratch is reserved, and report `<kernel>: operand <k> extends past its allocation`
-(`k` the argument index) otherwise. Every public entry point runs tracked; a unit test that builds
-an `Interp` by hand and assigns `memory` directly keeps an untracked table, bounded by the arena.
+(`k` the argument index) otherwise. An operand read in pieces at program-computed offsets, with no
+trustworthy whole extent (the embedding gather's weight rows — a runtime-sized table is passed a
+sentinel height), is bounded per piece by the allocation holding the operand's own pointer
+(`LiveBlocks::check_within`), not by whichever allocation holds the piece; the KV append's cache is
+checked whole (`[cache, cache + ncache)`) before its row is copied. An empty range is no access and
+is never checked — in particular a zero-trip vector-kernel call, whose stream bases
+`marshal_vec_kernel` still offsets to the range start (possibly past the arena's end), checks no
+stream, as the native kernel touches none. Every public entry point runs tracked; a unit test that
+builds an `Interp` by hand and assigns `memory` directly keeps an untracked table, bounded by the
+arena.
 
 SIMD vectors live in the `vecs` side arena, and vector stores scatter scalar lanes into memory.
 Each call owns a suffix of that arena. Block boundaries retain register-referenced vectors and

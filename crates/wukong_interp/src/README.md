@@ -26,7 +26,10 @@ Every recognized-kernel arm validates each operand before reserving scratch: the
 checked, the range must lie in the arena, and then inside ONE live allocation (`LiveBlocks`, kept by
 `SlotReuse` at alloca, heap alloc/free, scratch alloc/release, frame release, statics and
 kernel-entry buffers). A violation is `<kernel>: operand <k> extends past its allocation`, `k` the
-argument index. Helpers take an `arena!(self)` / `arena_mut!(self)` view so the interpreter's other
+argument index. A piece of an operand read at a program-computed offset with no whole extent to
+check (an embedding weight row) must lie in the allocation holding the operand's own pointer
+(`LiveBlocks::check_within`). An empty range is never checked: a zero-trip vector-kernel call
+touches no stream, so a stream base past the arena's end is not an error. Helpers take an `arena!(self)` / `arena_mut!(self)` view so the interpreter's other
 fields stay borrowable. A hand-built `Interp` (unit tests) keeps an untracked table, bounded by the
 arena. Optional pointer params (`bias`, `gamma`/`beta`) arrive as `Value::Int(0)` and are
 distinguished by variant; the `dim!` macro makes a non-positive extent a no-op.
