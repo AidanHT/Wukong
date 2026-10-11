@@ -792,9 +792,11 @@ another architecture or OS is not supported. A native-backend failure is a catal
   print after errors, so `tests/fail`'s first-diagnostic contract holds; `tests/warn/` pins each
   lint's exact output (`crates/wukongc/tests/warn.rs`), and `corpus_is_warning_free` holds every
   `tests/run` and `examples/` program to zero warnings. Mechanical fixes travel as structured
-  suggestions with exact byte ranges (`W0030`'s `;`, `W0008`'s deletion, `E0304`'s `mut `, the
-  resolution codes' did-you-mean and `Type::f` / `()` edits). Not yet: a label on every caret —
-  sema's shared `Sema::error` helper still renders an empty one at about 260 sites.
+  suggestions with exact byte ranges (`W0030`'s `;`, `W0008`'s deletion, `E0304`'s `mut ` for an
+  assignment to an immutable binding or parameter, the resolution codes' did-you-mean and
+  `Type::f` / `()` edits). Not yet: a label on every caret — sema's shared `Sema::error` helper
+  still renders an empty one at about 260 sites — and a fix for `E0304`'s other forms (a builtin
+  or `mut self` method writing through a non-`mut` parameter, a store through a tensor view).
 - **Statement terminators.** `;` stays optional where it always was, but leaving it out is now
   **`W0030 missing_semicolon`** (Rust's exemptions: after a block-like statement, and before the
   closing `}` for anything but a `let`), and a `(`/`[` — or a `-` touching its operand — at the

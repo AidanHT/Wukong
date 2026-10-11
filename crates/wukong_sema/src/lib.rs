@@ -493,6 +493,53 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
     (result, s.diags)
 }
 
+/// Where an immutably bound local was declared: the name in its `let`, and the zero-width position
+/// at which `mut ` makes the binding mutable ([`let_mut_position`]) — `None` where no such edit is
+/// provably valid source.
+#[derive(Clone, Copy)]
+struct LetDecl {
+    name: Span,
+    mut_at: Option<Span>,
+}
+
+/// Where `mut ` makes the immutable `let` statement `stmt`, binding the single name `pat`, mutable
+/// — or `None` when that edit is not provably valid source. Two other forms lower to the same
+/// `let`. A one-name `let P = e else { … }` binds its name INSIDE `P`, where no `mut` can go, so
+/// the edit goes before the whole pattern (`let mut E::A(v) = e else …`, which the parser
+/// accepts). A local `const N: T = v;` takes no `mut` at all. A `const` always has a type, and
+/// `const` plus the whitespace before the name is at least six bytes where `let` plus one is
+/// four, so a `let` is proven by a missing annotation, or by a name fewer than six bytes after the
+/// keyword's earliest start (the statement's start, or the end of its last attribute). Otherwise
+/// (`let` and its name on different lines, say) no fix is offered rather than a wrong one.
+fn let_mut_position(
+    stmt: &Stmt,
+    pat: &Pattern,
+    ty: Option<&TypeExpr>,
+    init: Option<&Expr>,
+) -> Option<Span> {
+    let at = |lo: u32| Some(Span::new(pat.span.source, lo, lo));
+    if let Some(Expr {
+        kind: ExprKind::Match { arms, .. },
+        ..
+    }) = init
+    {
+        if let (Some(first), Some(last)) = (arms.first(), arms.last()) {
+            if last.origin == ArmOrigin::LetElse {
+                return at(first.pat.span.lo);
+            }
+        }
+    }
+    if ty.is_none() {
+        return at(pat.span.lo);
+    }
+    let keyword_from = stmt.attrs.last().map_or(stmt.span.lo, |a| a.span.hi);
+    if pat.span.lo.saturating_sub(keyword_from) < 6 {
+        at(pat.span.lo)
+    } else {
+        None
+    }
+}
+
 struct Sema<'a> {
     interner: &'a Interner,
     defs: DefMap,
@@ -501,13 +548,13 @@ struct Sema<'a> {
     scopes: Vec<HashMap<Symbol, Ty>>,
     /// Per-scope set of locals bound *immutably* — a `let` without `mut` that has an initializer —
     /// kept 1:1 with `scopes`. Used to reject reassigning such a binding (`let x = 5; x = 10;`).
-    /// Each maps to its name's span in the `let`, where E0304's `mut ` fix is inserted.
-    immutable_locals: Vec<HashMap<Symbol, Span>>,
+    /// Each maps to where it was declared ([`LetDecl`]), for E0304's label and `mut ` fix.
+    immutable_locals: Vec<HashMap<Symbol, LetDecl>>,
     /// Per-scope set of *parameters* declared without `mut`, kept 1:1 with `scopes` (parameters live
     /// in the function's top scope). Stricter than `immutable_locals`: a non-`mut` parameter rejects
     /// both direct reassignment AND mutation through a projection (`p.f = …`, `p[i] = …`), because an
     /// aggregate parameter is passed by reference — the projection would mutate the *caller's* value.
-    /// Each maps to the parameter's name span, as for `immutable_locals`.
+    /// Each maps to the parameter's name span, where E0304's `mut ` fix is inserted.
     immutable_params: Vec<HashMap<Symbol, Span>>,
     /// Declared type of each parameter of the function currently being checked, by name. Queried only
     /// when the name resolves to an immutable parameter (so shadowing by an inner `let` can't confuse
@@ -2517,11 +2564,11 @@ impl<'a> Sema<'a> {
         self.local_facts.get(i)?.get(&name).copied()
     }
 
-    /// Whether `name` resolves (innermost scope first) to a local bound immutably, and if so the
-    /// name's span in its `let`. A `mut` binding, a deferred `let x;` (no initializer — its first
+    /// Whether `name` resolves (innermost scope first) to a local bound immutably, and if so where
+    /// its `let` declared it. A `mut` binding, a deferred `let x;` (no initializer — its first
     /// assignment is the initialization), a parameter, and a global are all *not* immutable here,
     /// so none of them are rejected.
-    fn immutable_local_decl(&self, name: Symbol) -> Option<Span> {
+    fn immutable_local_decl(&self, name: Symbol) -> Option<LetDecl> {
         for i in (0..self.scopes.len()).rev() {
             if self.scopes[i].contains_key(&name) {
                 return self.immutable_locals.get(i)?.get(&name).copied();
@@ -2548,15 +2595,18 @@ impl<'a> Sema<'a> {
         None
     }
 
-    /// E0304 with its fix: a machine-applicable `mut ` inserted before the binding's name at
-    /// `decl` (a parameter's or a `let`'s). `certain` is false where adding `mut` changes more
-    /// than the error (an aggregate parameter's caller then sees the store).
+    /// E0304 with its fix: `mut ` inserted at the zero-width `mut_at` (before a parameter's name,
+    /// or where [`let_mut_position`] proved the edit valid; no fix when it is `None`), with the
+    /// declaration `decl` labelled. `certain` is false where adding `mut` changes more than the
+    /// error (an aggregate parameter's caller then sees the store).
+    #[allow(clippy::too_many_arguments)]
     fn immutable_assignment(
         &mut self,
         at: Span,
         msg: String,
         label: &str,
         decl: Span,
+        mut_at: Option<Span>,
         what: &str,
         certain: bool,
     ) {
@@ -2565,18 +2615,19 @@ impl<'a> Sema<'a> {
         } else {
             Applicability::MaybeIncorrect
         };
-        self.diags.push(
-            Diagnostic::error(msg)
-                .with_code("E0304")
-                .primary(at, label)
-                .secondary(decl, format!("{what} declared here without `mut`"))
-                .suggest_with(
-                    Span::new(decl.source, decl.lo, decl.lo),
-                    format!("make the {what} mutable"),
-                    "mut ",
-                    applicability,
-                ),
-        );
+        let mut d = Diagnostic::error(msg)
+            .with_code("E0304")
+            .primary(at, label)
+            .secondary(decl, format!("{what} declared here without `mut`"));
+        if let Some(fix) = mut_at {
+            d = d.suggest_with(
+                fix,
+                format!("make the {what} mutable"),
+                "mut ",
+                applicability,
+            );
+        }
+        self.diags.push(d);
     }
 
     /// The root single-name of an assignment place, walking field/index projections but STOPPING at
@@ -2763,12 +2814,19 @@ impl<'a> Sema<'a> {
                 // initializer, whose first assignment is its initialization) is not tracked; a `mut`
                 // rebinding also clears a prior immutable mark in this scope (shadowing). Tuple /
                 // wildcard patterns stay lenient.
-                if let PatKind::Ident(s) = &pat.kind {
+                if let PatKind::Ident(name) = &pat.kind {
+                    let mut_at = let_mut_position(s, pat, ty.as_ref(), init.as_ref());
                     if let Some(set) = self.immutable_locals.last_mut() {
                         if !*mutable && init.is_some() {
-                            set.insert(*s, pat.span);
+                            set.insert(
+                                *name,
+                                LetDecl {
+                                    name: pat.span,
+                                    mut_at,
+                                },
+                            );
                         } else {
-                            set.remove(s);
+                            set.remove(name);
                         }
                     }
                 }
@@ -2878,6 +2936,7 @@ impl<'a> Sema<'a> {
                                 ),
                                 "cannot assign to an immutable parameter",
                                 decl,
+                                Some(Span::new(decl.source, decl.lo, decl.lo)),
                                 "parameter",
                                 true,
                             );
@@ -2890,7 +2949,8 @@ impl<'a> Sema<'a> {
                                      its `let` to allow reassignment"
                                 ),
                                 "cannot assign twice to an immutable binding",
-                                decl,
+                                decl.name,
+                                decl.mut_at,
                                 "binding",
                                 true,
                             );
@@ -2915,6 +2975,7 @@ impl<'a> Sema<'a> {
                                     ),
                                     "this store would mutate the caller's value",
                                     decl,
+                                    Some(Span::new(decl.source, decl.lo, decl.lo)),
                                     "parameter",
                                     false,
                                 );

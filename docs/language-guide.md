@@ -2132,11 +2132,14 @@ report none, since a library may import a module only for the functions it expor
 **Fixes as data.** Where the fix is mechanical a diagnostic carries it as a suggestion, rendered as
 a `help:` line and emitted in `--error-format=json`'s `suggestions` with an exact byte range and an
 applicability: `W0030` inserts the `;`, `W0008` deletes the import (or rewrites a selection to the
-names that are used), `E0304` inserts `mut ` before the binding's name (machine-applicable; maybe-
-incorrect when it would make an aggregate parameter's store reach the caller), and the resolution
-errors carry their did-you-mean and the edits their help text describes (`Type::f` for an
-associated function called bare, `()` for a method read like a field, the deleted argument list of
-a field called like a method).
+names that are used), an assignment to an immutable binding or parameter (`E0304`) inserts `mut `
+at its declaration (machine-applicable; maybe-incorrect when it would make an aggregate parameter's
+store reach the caller; before the whole pattern of a `let … else`, `let mut E::A(v) = e else …`;
+none for a local `const`), and the resolution errors carry their did-you-mean and the edits their
+help text describes (`Type::f` for an associated function called bare, `()` for a method read like
+a field, the deleted argument list of a field called like a method). `E0304`'s other forms — a
+builtin or a `mut self` method writing through a non-`mut` parameter, or a store through a tensor
+view of one — carry no fix yet.
 
 **Statements end with `;`.** It may be left out only after a block-like statement — `if`,
 `match`, `loop`, `while`, `for`, a `{ … }` block — and, for any statement but a `let`, right

@@ -1027,6 +1027,61 @@ mod tests {
         );
     }
 
+    /// `src` with the first suggestion of `d` applied.
+    fn applied(src: &str, d: &Diagnostic) -> String {
+        let s = d.suggestions.first().expect("a suggestion");
+        let (lo, hi) = (s.span.lo as usize, s.span.hi as usize);
+        format!("{}{}{}", &src[..lo], s.replacement, &src[hi..])
+    }
+
+    /// The `mut ` fix is offered only where it is valid source, and applying it fixes the build.
+    /// A local `const` lowers to the same immutable `let`, but `const mut N` does not parse, so
+    /// it gets no fix. A one-name `let … else` binds a name INSIDE its pattern, where `mut`
+    /// cannot go: the fix makes the whole `let` mutable (`let mut E::A(v) = e else …`), the
+    /// spelling the parser accepts.
+    #[test]
+    fn the_mut_fix_is_valid_source_for_every_let_form() {
+        use wukong_diag::Applicability::*;
+        let src = "fn main() -> i32 { const N: i32 = 3; N = 4; return N; }";
+        let d = only(src, "E0304");
+        assert!(d.suggestions.is_empty(), "{d:?}");
+        assert!(d.labels.iter().all(|l| !l.message.is_empty()), "{d:?}");
+        let src = "enum E { A(i32), B } \
+                   fn f(e: E) -> i32 { let E::A(v) = e else { return 0; }; v = v + 1; return v; } \
+                   fn main() -> i32 { return f(E::A(1)); }";
+        let d = only(src, "E0304");
+        let at = src.find("E::A(v) = e").unwrap() as u32;
+        let s = &d.suggestions[0];
+        assert_eq!((s.span.lo, s.span.hi), (at, at), "{d:?}");
+        assert_eq!(
+            (s.replacement.as_str(), s.applicability),
+            ("mut ", MachineApplicable)
+        );
+        assert_eq!(codes(&applied(src, &d)), Vec::<&str>::new());
+        // An identifier pattern under `let … else` is the same edit, at the name.
+        let src = "fn main() -> i32 { let v = 1 else { return 0; }; v = 2; return v; }";
+        let d = only(src, "E0304");
+        assert_eq!(codes(&applied(src, &d)), Vec::<&str>::new());
+        // Every spelling of a plain `let` keeps its machine-applicable fix: unannotated, annotated,
+        // and after a statement attribute.
+        for src in [
+            "fn main() -> i32 { let x = 5; x = 10; return x; }",
+            "fn main() -> i32 { let x: i32 = 5; x = 10; return x; }",
+            "fn main() -> i32 { let  x: i32 = 5; x = 10; return x; }",
+            "fn main() -> i32 { @allow(unused_variables) let x: i32 = 5; x = 10; return x; }",
+        ] {
+            let d = only(src, "E0304");
+            assert_eq!(d.suggestions[0].applicability, MachineApplicable, "{src}");
+            assert_eq!(codes(&applied(src, &d)), Vec::<&str>::new(), "{src}");
+        }
+        // A parameter's fix is valid source too.
+        let src = "fn f(n: i32) -> i32 { n = 2; return n; } fn main() -> i32 { return f(1); }";
+        assert_eq!(
+            codes(&applied(src, &only(src, "E0304"))),
+            Vec::<&str>::new()
+        );
+    }
+
     #[test]
     fn a_struct_field_called_like_a_method_is_expected_function() {
         let d = only(

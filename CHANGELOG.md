@@ -23,12 +23,16 @@ All notable changes to Wukong are documented here. The format is loosely based o
   continuation (`W0031`) were dropped by the loader; they now report with that file's path and go
   through the same levels. A `defer` statement needs its `;` like any simple statement (a deferred
   block excepted).
-- **Fixes as data (N5).** `W0030` inserts the `;`, `E0304` inserts `mut ` at the binding (machine-
-  applicable for a rebind), an associated function called bare (`E0320`) suggests `Type::f`, a
-  method read like a field (`E0321`) suggests `()`, a field called like a method (`E0323`) suggests
-  deleting the argument list, and a struct literal of an enum (`E0324`) suggests `::Variant` — each
-  in `--error-format=json`'s `suggestions` with an exact byte range. Every caret in the resolution
-  and lint passes has a label.
+- **Fixes as data (N5).** `W0030` inserts the `;`, an associated function called bare (`E0320`)
+  suggests `Type::f`, a method read like a field (`E0321`) suggests `()`, a field called like a
+  method (`E0323`) suggests deleting the argument list, and a struct literal of an enum (`E0324`)
+  suggests `::Variant` — each in `--error-format=json`'s `suggestions` with an exact byte range.
+  Every caret in the resolution and lint passes has a label.
+  - `E0304` (an assignment to an immutable binding or parameter, or a store through a non-`mut`
+    aggregate parameter) inserts `mut ` at the declaration: machine-applicable for a rebind, before
+    the whole pattern of a `let … else` (where `mut` parses), and absent for a local `const`, which
+    takes no `mut`. Its other forms — a builtin or `mut self` method writing through a non-`mut`
+    parameter, a store through a tensor view of one — carry no fix yet.
 - **The compile-fail gate pins the whole error stream (N12).** `// EXPECT-COUNT: <n>` and trailing
   `//~ <CODE>` (`//~^`/`//~v`) annotations pin how many errors a `tests/fail` fixture reports and the
   line of each; `WUKONG_BLESS=1 cargo test -p wukongc --test fail` rewrites them from the real output
