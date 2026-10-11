@@ -1662,7 +1662,8 @@ impl<'a, 'k> Interp<'a, 'k> {
     ///
     /// Every extent is checked before anything is reserved or read: the two tables (every stream
     /// pointer, and the scalars up to the last one the recipe reads), and each stream the recipe
-    /// loads or stores over the elements it touches, must lie in the arena and inside ONE live
+    /// loads or stores over the elements it touches (none, on a zero-trip call, so a base that
+    /// call never dereferences is never checked), must lie in the arena and inside ONE live
     /// allocation (a diagnostic names a stream by its index as the operand). The table sizes and
     /// the whole-lane-group length are checked arithmetic and fallible reservations.
     fn run_vec_kernel<T: KernelLaneValue>(
@@ -1747,7 +1748,10 @@ impl<'a, 'k> Interp<'a, 'k> {
             // callbacks cannot fail; a partial lane group beyond `vlen` is never read.
             let mut columns: Vec<Vec<T>> = kernel_scratch(streams, "veckernel reduction")?;
             for (s, &b) in stream_bases.iter().enumerate() {
-                if read_streams[s] {
+                // A zero-trip fold (`vlen == 0`) reads no stream, so it constrains no base: the
+                // caller still offsets every base to the range start, which may lie past the end
+                // of the arena (see the elementwise branch).
+                if read_streams[s] && vlen > 0 {
                     let end = b
                         .checked_add(vlen)
                         .ok_or("veckernel reduction load out of bounds")?;
@@ -1778,6 +1782,15 @@ impl<'a, 'k> Interp<'a, 'k> {
             // precondition), so no hazard. Every stream the recipe loads or stores is checked
             // over all `count` elements first, so a stream that would run past its allocation is
             // refused before the first store.
+            //
+            // A zero-trip call touches nothing and so checks nothing: `marshal_vec_kernel` passes
+            // `n = 0` for a short or empty range but still offsets each base to the range START,
+            // which can lie past the end of the arena (`for i in 100000..n` over an empty slice).
+            // The native kernel does nothing there; refusing a base it never dereferences would
+            // be an interp/native divergence on a valid program.
+            if count == 0 {
+                return Ok(Value::Unit);
+            }
             for (s, &b) in stream_bases.iter().enumerate() {
                 if read_streams[s] || stored_streams[s] {
                     let end = b

@@ -1,0 +1,70 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 6
+// EXPECT-OUT: 10
+// EXPECT-OUT: 10
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 6
+// EXPECT-OUT: 8
+// EXPECT-OUT: 10
+// EXPECT-OUT: 12
+// EXPECT-OUT: 14
+// EXPECT-OUT: 16
+// EXPECT-OUT: 18
+// EXPECT-OUT: 20
+// EXPECT-OUT: 22
+// EXPECT-OUT: 24
+// EXPECT-OUT: 26
+// EXPECT-OUT: 28
+// EXPECT-OUT: 30
+// EXPECT-OUT: 32
+// EXPECT-OUT: 272
+// EXPECT-OUT: 272
+module tests.run.vec_kernel_zero_trip
+
+// A zero-trip 256-bit vector-kernel call must touch nothing — not even check a stream base it never
+// dereferences. `marshal_vec_kernel` passes the kernel `n = 0` when the range `[start, n)` is empty
+// or shorter than one lane group, but still offsets every stream base to `&y[start]`; with a
+// runtime `start` far past the slice (here 100000) that base lies past the end of the
+// interpreter's whole arena. The interpreter used to refuse it ("veckernel stream out of bounds")
+// where the native kernel ran nothing and the program exited 0 — an interp/native divergence on a
+// valid program, in the elementwise arm and the reduction arm alike.
+//
+// `run(len, start)` fills y[i] = i + 1, doubles y[start..len) in place (elementwise), sums
+// y[start..len) (reduction), then prints every lane of y and then the sum. `main` prints the
+// returned sum again after every call but the second. Each line follows from the scalar loops:
+//   print(run(0, 100000)): y is empty, both loops empty                  -> 0, then 0
+//   run(3, 100000):        both loops empty, y stays 1 2 3                -> 1 2 3, 0
+//   print(run(3, 1)):      a 2-trip range (short of a lane group):
+//                          y = 1, 2*2, 3*2 = 1 4 6; sum 4 + 6 = 10       -> 1 4 6, 10, then 10
+//   print(run(16, 0)):     two whole 8-lane groups: y = 2, 4, .., 32;
+//                          sum 2 * (1 + .. + 16) = 2 * 136 = 272          -> 2 4 .. 32, 272, then 272
+// Every value is a small integer, exact in f32 whatever the reduction's association.
+
+fn run(len: i64, start: i64) -> i32 {
+    let mut y: []f32 = alloc_f32(len);
+    for i in 0..len { y[i] = ((i + 1i64) as f32); }
+    for i in start..len { y[i] = y[i] * 2.0; }
+    let mut s: f32 = 0.0;
+    for i in start..len { s = s + y[i]; }
+    for i in 0..len { print(y[i] as i32); }
+    print(s as i32);
+    return s as i32;
+}
+
+fn main() -> i32 {
+    print(run(0, 100000));
+    run(3, 100000);
+    print(run(3, 1));
+    print(run(16, 0));
+    return 0;
+}

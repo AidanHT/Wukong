@@ -830,3 +830,47 @@ fn vector_recipe_streams_stay_inside_their_allocations() {
         assert_eq!(after, memory);
     }
 }
+
+/// A zero-trip vector call touches no stream, so it constrains no stream base. `marshal_vec_kernel`
+/// passes `n = 0` for a short or empty range but still offsets every base to the range START,
+/// which may lie past the end of the arena (`for i in 100000..n` over an empty slice allocated
+/// last); a reduction whose count is below one lane group reads nothing either. The native kernel
+/// does nothing there, so the oracle must answer the same — the reduction's identity, memory
+/// untouched — tracked or not, instead of reporting a stream "out of bounds" it never reads.
+#[test]
+fn zero_trip_vector_recipes_constrain_no_stream_base() {
+    let mut interner = Interner::new();
+    for reduction in [false, true] {
+        let program = vector_program(&mut interner, reduction);
+        // ptrs [0, 2) aim both streams far past the 4-slot arena; scalars [2, 4).
+        let mut memory = vec![Value::Unit; 4];
+        memory[0] = P(100_000);
+        memory[1] = P(200_000);
+        memory[2] = F(3.0);
+        // An elementwise call's count is the vector part only (a multiple of the lanes, or 0); a
+        // reduction folds whole lane groups, so 7 of 8 lanes is a zero-trip call too.
+        let counts: &[i128] = if reduction { &[0, 7] } else { &[0] };
+        let expected = if reduction { F(0.0) } else { Value::Unit };
+        for tracked in [false, true] {
+            for &n in counts {
+                let mut interp = interpreter(&program, &interner);
+                interp.memory = memory.clone();
+                if tracked {
+                    interp.slots = SlotReuse::tracked();
+                    interp.slots.live.insert(0, 2);
+                    interp.slots.live.insert(2, 2);
+                }
+                let result = interp.run_function(&program.funcs[0], &[P(0), P(2), I(n)]);
+                assert_eq!(
+                    result,
+                    Ok(expected),
+                    "reduction={reduction} tracked={tracked} n={n}"
+                );
+                assert_eq!(
+                    interp.memory, memory,
+                    "reduction={reduction} tracked={tracked} n={n}"
+                );
+            }
+        }
+    }
+}
