@@ -27,6 +27,15 @@ All notable changes to Wukong are documented here. The format is loosely based o
   The enclosing function's generics now decide what counts as a type parameter, ahead of the item
   registry. A parameter that shadows an enum (`fn g<E>`: `y = 2.5; println(y)` printed `2` on both
   backends) or a struct (`fn g<P>`: a MIR verifier ICE) is refused instead of sized as the item.
+- **`x.len()` / `x.dim(k)` on a type parameter work in every position again.** Recording the
+  storage refusal from a type *query* refused `let k: i64 = x.len();` on `x: T` instantiated at an
+  array or tensor as `C0001`. On main that printed the extent, and the annotation already sized
+  the slot. A `let`, a `return` and an assignment now only classify a value's type
+  (`expr_mir_peek`), and an instance types such a call as the `i64` extent of what `T` is bound to.
+  `return x.len();`, which was a MIR verifier ICE on main (`zext` from a placeholder `i32` to
+  `i64`), and `let k = x.len();`, which was an `i32` slot holding an `i64`, now lower correctly too
+  (`tests/run/generic_receiver_extent.wk`). Arithmetic on an *unannotated* binding of one is
+  still `C0001`: annotate it.
 - **Type positions the checker let through.** An integer written as a type (`let x: 512 = 3;`) is
   `E0324` and a struct, enum or type parameter given arguments (`let p: P<2>`) is `E0327`; both typed
   as an error with no diagnostic and ran. An undeclared type's `E0324` is no longer lost when literal

@@ -4682,10 +4682,40 @@ impl FnLowerer<'_> {
         // In a monomorphized instance, resolve a generic type parameter to its concrete type so op
         // selection, coercion, and widths all see the real type. Substitution already returns an
         // owned type, so borrow its input instead of cloning the entire type tree twice.
-        self.sema
-            .types
-            .get(&e.id)
-            .map_or(Ty::Unknown, |raw| subst_ty(raw, &self.subst))
+        match self.sema.types.get(&e.id) {
+            Some(Ty::Unknown) | None => self.extent_method_ty(e).unwrap_or(Ty::Unknown),
+            Some(raw) => subst_ty(raw, &self.subst),
+        }
+    }
+
+    /// The type of `x.len()` / `x.dim(k)` that sema left `Unknown`: on a receiver of an unbounded
+    /// type parameter (`fn n<T>(x: T) { x.len() }`), whose methods sema cannot know until a call
+    /// binds `T`. Sema re-checks the body at each instantiation, where the call is the `i64`
+    /// extent of an array, tensor or slice (`tensor::type_extent_method`), but an instance lowers
+    /// from the template's type table, so this recovers that `i64` from the receiver's substituted
+    /// type: the receiver `lower_extent_method` and the slice-length load lower the call from.
+    /// Without it the call's value was an `i64` of type `Unknown`: an `i32` slot for
+    /// `let k = x.len();`, a bad `i32`->`i64` cast at `return x.len();` (an ICE), and once
+    /// unrepresentable types were refused, `C0001` for every use, `let k: i64 = x.len();` included.
+    /// `None` for anything else, which stays `Unknown`.
+    fn extent_method_ty(&self, e: &Expr) -> Option<Ty> {
+        let ExprKind::Call { callee, args, .. } = &e.kind else {
+            return None;
+        };
+        let ExprKind::Field { base, name } = &callee.kind else {
+            return None;
+        };
+        let is_dim = match self.interner.resolve(name.sym) {
+            "len" => false,
+            "dim" => true,
+            _ => return None,
+        };
+        let extent = match self.expr_ty(base) {
+            Ty::Array { .. } | Ty::Tensor { .. } => args.len() == usize::from(is_dim),
+            Ty::Slice(_) => !is_dim && args.is_empty(),
+            _ => false,
+        };
+        extent.then_some(Ty::Scalar(wukong_types::Scalar::I64))
     }
 
     /// Is `e`'s type a string (`*u8`)? Routes a `print`/`println` argument to the byte-rendering
@@ -4703,25 +4733,33 @@ impl FnLowerer<'_> {
         matches!(self.expr_ty(e), Ty::Scalar(sc) if sc.is_int() && !sc.is_signed())
     }
 
+    /// The MIR type of `e`'s value. A type with no representation is refused
+    /// ([`Self::unrepresentable`]), so this is for a caller that builds MIR from the answer: a
+    /// slot, an op, a coercion's target. A caller that only classifies `e` uses
+    /// [`Self::expr_mir_peek`]. (`s.len()` on a slice, and `x.len()` on a type parameter bound
+    /// to one, is `i64` through [`Self::expr_ty`]: the length load is `i64`, and the `i32` it
+    /// once defaulted to made `for i in 0..s.len()` compare an `i32` counter with an `i64` bound,
+    /// a verifier ICE. Guarded by tests/run/slice_len_loop.wk.)
     fn expr_mir(&self, e: &Expr) -> MirType {
-        // `s.len()` on a slice lowers to an i64 load from the fat pointer's offset 8 (see the call
-        // lowering), but sema is lenient about methods and types the call `Unknown`, which `mir_ty_of`
-        // defaults to `I32`. That disagreement made `for i in 0..s.len()` build an i32 counter and then
-        // emit `cmp.i32 i32, i64` against the i64 length — MIR the verifier rejects (an ICE on the
-        // canonical way to index-iterate a slice). Report i64 here so the loop-bound widening and every
-        // other consumer see the real type. Guarded by tests/run/slice_len_loop.wk.
-        if let ExprKind::Call { callee, args, .. } = &e.kind {
-            if args.is_empty() {
-                if let ExprKind::Field { base, name } = &callee.kind {
-                    if self.interner.resolve(name.sym) == "len"
-                        && matches!(self.expr_ty(base), Ty::Slice(_))
-                    {
-                        return MirType::I64;
-                    }
-                }
-            }
-        }
         self.mir_ty_at(&self.expr_ty(e), Some(e.span))
+    }
+
+    /// [`Self::expr_mir`] as a pure query: `e`'s MIR type, or `None` when its type has no machine
+    /// representation. It records no refusal, so a caller that only classifies a value (is it an
+    /// aggregate? what does it coerce from?) cannot refuse a function whose value lowers without
+    /// the answer, such as `let k: i64 = <untyped call>;`, whose slot the annotation sizes. Storage
+    /// sized from `e`'s type must come from `expr_mir`, which refuses. A layout error found on the
+    /// way is still reported, as it always was.
+    fn expr_mir_peek(&self, e: &Expr) -> Option<MirType> {
+        self.mir_ty_peek(&self.expr_ty(e))
+    }
+
+    /// [`Self::mir_ty_of`] as a pure query, as [`Self::expr_mir_peek`] is for an expression.
+    fn mir_ty_peek(&self, ty: &Ty) -> Option<MirType> {
+        let outer = self.unrepresentable.take();
+        let mir = self.mir_ty_of(ty);
+        let refused = self.unrepresentable.replace(outer).is_some();
+        (!refused).then_some(mir)
     }
 
     /// `mir_ty`, but resolves a named struct (`Ty::Named`) to its byte-buffer storage type using the
@@ -10116,8 +10154,10 @@ impl FnLowerer<'_> {
                     // would fall back to `I32` for a named struct / tuple type. Array literals/repeats
                     // are excluded so they keep their annotation-preferred path (which carries the
                     // explicit element type + length).
+                    // (A query: an initializer with no representation is not an aggregate, and is
+                    // refused below only when no annotation sizes the slot instead.)
                     (_, Some(e))
-                        if matches!(self.expr_mir(e), MirType::Array(..))
+                        if matches!(self.expr_mir_peek(e), Some(MirType::Array(..)))
                             && !matches!(
                                 &e.kind,
                                 ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat { .. }
@@ -10512,7 +10552,15 @@ impl FnLowerer<'_> {
         if matches!(to, MirType::Void) {
             return val;
         }
-        let from = self.expr_mir(e);
+        let from = match self.expr_mir_peek(e) {
+            Some(from) => from,
+            // A value whose sema type has no representation, but which lowered to a value of the
+            // return type already, needs no coercion, and `return` is no reason to refuse it. Any
+            // cast would need the signedness that type never gave (`signed` answers `false`), so
+            // anything else is refused as the untyped value it is.
+            None if *self.builder.value_type(val) == to => return val,
+            None => self.expr_mir(e),
+        };
         self.coerce_to(val, &from, &to, self.signed(e))
     }
 
@@ -18115,7 +18163,8 @@ impl FnLowerer<'_> {
     /// would corrupt — so those keep the pre-existing behaviour untouched.
     fn whole_buffer_assign_ty(&self, target: &Expr) -> Option<Ty> {
         let ty = self.expr_ty(target);
-        if matches!(self.mir_ty_of(&ty), MirType::Array(..)) {
+        // A query: a target with no representation is no buffer (its `let` refused its storage).
+        if matches!(self.mir_ty_peek(&ty), Some(MirType::Array(..))) {
             return Some(ty);
         }
         let (_, n) = tensor_buffer_mir(&ty)?;

@@ -1318,7 +1318,11 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   an operation on an *unbounded* opaque `T` (`x + x`) is checked only per instantiation, like a C++
   template — an uncalled body is not rejected for it. A type parameter that appears in no parameter or
   return type is bound by no call, not even by a turbofish; a value of it is refused at lowering
-  (`C0001`) where it used to get an `i32` slot.
+  (`C0001`) where it used to get an `i32` slot. The same holds when the parameter shadows a struct,
+  enum, `const` or `fn` of its name. `x.len()` / `x.dim(k)` on an unbounded `x: T` is typed only per
+  instance. The call itself lowers as the `i64` extent everywhere. A binding initialized from it
+  stays untyped, though, and arithmetic on it is `C0001` until the binding is annotated
+  (`let k: i64 = x.len();`).
 
 - **Scalar-type gaps** (2026-10-08). There is no 128-bit integer (`u128`/`i128` literal suffixes
   are `E0431`; Cranelift's x64 backend has no `i128` divide, so the type needs a runtime first), and

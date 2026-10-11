@@ -488,3 +488,94 @@ fn a_function_reports_one_refusal_at_its_first_unsized_value() {
     let (_, diags) = lower_program(&module, &sema, &mut interner);
     assert_one_refusal(&diags, "unbound type parameter `U`", Some(first));
 }
+
+/// The node id of function `name`'s first `return <expr>;` value.
+fn return_value_id(module: &Module, interner: &Interner, name: &str) -> wukong_ast::NodeId {
+    let body = module
+        .items
+        .iter()
+        .find_map(|it| match &it.kind {
+            ItemKind::Fn(f) if interner.resolve(f.name.sym) == name => f.body.as_ref(),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no function `{name}`"));
+    body.stmts
+        .iter()
+        .find_map(|s| match &s.kind {
+            StmtKind::Return(Some(e)) => Some(e.id),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("`{name}` has no `return <expr>;`"))
+}
+
+/// Asking a value's type only to classify it records no refusal. A `let` asks its initializer's
+/// type to see whether it is an aggregate, and `return` asks it to see what it coerces from; an
+/// untyped initializer under an annotation (the annotation sizes the slot) and an untyped return
+/// value already of the return type (no coercion) lower, and the function is not refused. Each
+/// was `C0001` "never determined" while the query recorded the refusal. An unannotated `let` of
+/// an untyped initializer still is (`a_value_type_with_no_representation_is_refused`): its slot
+/// is sized from that type.
+#[test]
+fn a_query_of_an_untyped_value_does_not_refuse_the_function() {
+    let src = "fn locals() -> i64 {\n\
+                   let j: i64 = 7;\n\
+                   let k: i64 = j;\n\
+                   return k;\n\
+               }\n\
+               fn main() -> i32 { println(locals()); return 0; }\n";
+    let (mut module, mut sema, mut interner) = checked(src);
+    let init = lets_mut(&mut module, &interner, "locals")[1]
+        .1
+        .as_ref()
+        .unwrap()
+        .id;
+    let ret = return_value_id(&module, &interner, "locals");
+    sema.types.insert(init, Ty::Unknown);
+    sema.types.insert(ret, Ty::Unknown);
+    let (prog, diags) = lower_program(&module, &sema, &mut interner);
+    assert!(errors(&diags).is_empty(), "{diags:?}");
+    assert_eq!(
+        allocas(&prog, &interner, "locals"),
+        vec![MirType::I64, MirType::I64]
+    );
+}
+
+/// `x.len()` / `x.dim(k)` on a value of an unbounded type parameter is typed `Unknown` by sema
+/// (it cannot know `T`'s methods), and an instance lowers from that type table. The instance types
+/// the call as the `i64` extent of the array, slice or tensor `T` is bound to, so an unannotated
+/// `let k = x.len();` gets an `i64` slot. It got an `i32` one, and then `C0001`.
+///
+/// Only the call is recovered: a binding initialized from it is still untyped in sema, so
+/// arithmetic on an unannotated one (`k + d`) is refused, and annotating the binding is the fix
+/// its help names. (It "worked" before only through the `i32` slot: an `i64` stored into four
+/// bytes, added as `i32`, zero-extended back.)
+#[test]
+fn an_extent_of_a_type_parameter_is_i64_in_each_instance() {
+    let instance_allocas = |body: &str| {
+        let src = format!(
+            "fn n<T>(x: T) -> i64 {{ {body} }}\n\
+             fn main() -> i32 {{\n\
+                 let a: [f32; 4] = [1.0, 2.0, 3.0, 4.0];\n\
+                 println(n(a));\n\
+                 return 0;\n\
+             }}\n"
+        );
+        let (module, sema, mut interner) = checked(&src);
+        let (prog, diags) = lower_program(&module, &sema, &mut interner);
+        let instance = prog
+            .funcs
+            .iter()
+            .find(|f| interner.resolve(f.name).starts_with("n$"))
+            .map(|f| interner.resolve(f.name).to_string())
+            .expect("an instance of `n`");
+        (allocas(&prog, &interner, &instance), diags)
+    };
+    let (slots, diags) = instance_allocas("let k = x.len(); let _d = x.dim(0); return k;");
+    assert!(errors(&diags).is_empty(), "{diags:?}");
+    assert_eq!(slots, vec![MirType::I64, MirType::I64]);
+    let (_, diags) = instance_allocas("let k = x.len(); let d = x.dim(0); return k + d;");
+    assert_one_refusal(&diags, "never determined", None);
+    assert_eq!(help_of(&diags), HELP_ANNOTATE);
+    let (_, diags) = instance_allocas("let k: i64 = x.len(); let d: i64 = x.dim(0); return k + d;");
+    assert!(errors(&diags).is_empty(), "{diags:?}");
+}

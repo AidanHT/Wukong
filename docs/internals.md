@@ -152,8 +152,16 @@ call's bound dimensions by `wukong_sema::constraints`; `static_assert` lowers to
 no `_ => I32` fallback: a C-style enum is the one `Ty::Named` whose representation is `i32`; the
 registry-blind free `mir_ty` answers `Option` (`None` for any `Named`, and for `Fn`/`Unknown`/`Error`).
 A type with no representation is recorded once per function (`FnLowerer::unrepresentable`) and
-refused at `finish` as `C0001` naming it. That is reachable from a `let x;` with neither annotation
-nor initializer, and from a type parameter no call binds. The enclosing function's own generics
+refused at `finish` as `C0001` naming it. Only a caller that builds MIR from the type records
+it: a slot, an op, a coercion target. A caller that only classifies a value asks
+`expr_mir_peek`/`mir_ty_peek`, which record nothing. Examples are a `let` asking whether its
+initializer is an aggregate, `return` asking what it coerces from, and an assignment asking whether
+its target is a buffer. So an untyped initializer under an annotation lowers. The refusal is
+reachable from a value sema leaves `Unknown` whose storage or op is sized from that type, such as a
+`let x;` with neither annotation nor initializer, or arithmetic on an unannotated binding of a
+leniently typed call. It is also reachable from a type parameter no call binds. `expr_ty` recovers
+`x.len()`/`x.dim(k)` on a type parameter as the `i64` extent of the array, slice or tensor the
+instance binds it to (sema types it `Unknown` in the template, which instances lower from). The enclosing function's own generics
 decide what counts as a type parameter (`FnLowerer::type_params`), ahead of the item registry, so a
 parameter that shadows a struct, enum, `const` or `fn` is refused rather than sized as that item.
 It is also reachable from a generic struct's own type parameter, and from a function value (a

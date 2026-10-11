@@ -242,7 +242,11 @@ Three things stay accepted without being modelled: the explicit-SIMD surface (`f
 `p.offset(i)`, `t.row_ptr(r)`, a vector's `store`/`fma`), which type-checks and is the codegen limit
 `C0001` until it lowers; a type used as a namespace (`f32::MAX`, `T::m()` on an unbounded generic);
 and a method of a generic receiver (`x.len()` on `x: T`), resolved per instantiation when the
-function is lowered.
+function is lowered. In each instance, `x.len()` and `x.dim(k)` are the `i64` extent of the array,
+slice or tensor that `T` is bound to, as an initializer, a `return` value, an argument or a loop
+bound (`tests/run/generic_receiver_extent.wk`). A binding initialized from one has no type until
+you annotate it, so to do arithmetic on it write `let k: i64 = x.len();`. Arithmetic on an
+unannotated one is the codegen limit `C0001`.
 
 ## Bindings ✅
 
