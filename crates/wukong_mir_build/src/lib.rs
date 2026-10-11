@@ -35494,6 +35494,61 @@ fn main() -> i32 {
         );
     }
 
+    /// A range index `s[a..b]` (the parser's `$slice(s, a, b)`) views its base's storage with no
+    /// copy, so it must resolve onto that base exactly as `let v: []f32 = s;` does, on both paths.
+    /// Classified as a borrowing CALL instead, it fell into `republish_of`'s `alloc_*` exemption:
+    /// `let va = s[..];` recorded no view and `va` became its own storage root, so two range views
+    /// of one buffer looked disjoint at a call site (`f(va, vc)`) and as operands in one body. The
+    /// bounds are not compared — the same conservative line element indices draw — and range
+    /// views of two different buffers stay disjoint.
+    #[test]
+    fn alias_analysis_roots_a_range_index_view_at_its_base() {
+        let call = "module m
+fn f(p: []f32, mut q: []f32) { q[0] = p[0]; }
+fn main() -> i32 {
+    let mut a: [f32; 4] = [0.0; 4];
+    let mut b: [f32; 4] = [0.0; 4];
+    let s: []f32 = a;
+    let t: []f32 = b;
+    let va = s[..];
+    let vq = OTHER;
+    f(va, vq);
+    return 0;
+}
+";
+        for other in ["s[1..]", "s[..2]", "s"] {
+            assert!(
+                !alias_free_of(&call.replace("OTHER", other), "f"),
+                "`s[..]` and `{other}` both view `a`, so f(va, vq) aliases"
+            );
+        }
+        assert!(
+            alias_free_of(&call.replace("OTHER", "t[1..3]"), "f"),
+            "range views of two different buffers are two buffers"
+        );
+
+        let body = "module m
+fn main() -> i32 {
+    let mut a: [f32; 4] = [1.0; 4];
+    let mut b: [f32; 4] = [2.0; 4];
+    let s: []f32 = a;
+    let t: []f32 = b;
+    let va = s[..];
+    let mut vc = OTHER;
+    vc[0] = va[0];
+    return 0;
+}
+";
+        assert!(
+            !alias_free_of(&body.replace("OTHER", "s[1..]"), "main"),
+            "`va` and `vc` are two operand names for `a`"
+        );
+        assert!(
+            alias_free_of(&body.replace("OTHER", "t[1..]"), "main"),
+            "`va` views `a` and `vc` views `b`"
+        );
+    }
+
     /// Two different fields of one struct are two different buffers. This is the spelling every
     /// transformer weight block uses (`mm(l.wq, l.wk, l.o)`), so a root-symbol-only analysis would
     /// have declined the whole model.

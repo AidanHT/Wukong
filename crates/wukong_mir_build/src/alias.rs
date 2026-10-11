@@ -50,11 +50,12 @@
 //! under `# Known limits` rather than left implied.
 //!
 //! For each call `f(e0, …, en)` the pass classifies each argument's [`Origin`] and asks whether two
-//! of them can be the same storage. A **place** (`x`, `x[i]`, `s.w`, `&x`) carries its root symbol
-//! and its projection chain, so `f(l.wq, l.wk)` — the ordinary transformer-weights spelling — stays
-//! provably disjoint while `f(x, x)` and `f(m, m[0])` do not. A **fresh** value (a struct/array/tuple
-//! literal, or a call returning an aggregate by the sret ABI, or `alloc_f32(n)`) is storage nobody
-//! else holds. Anything else is **unknown** and aliases conservatively.
+//! of them can be the same storage. A **place** (`x`, `x[i]`, `s.w`, `&x`, and the range index
+//! `s[a..b]`, which projects like `s[i]`) carries its root symbol and its projection chain, so
+//! `f(l.wq, l.wk)` — the ordinary transformer-weights spelling — stays provably disjoint while
+//! `f(x, x)` and `f(m, m[0])` do not. A **fresh** value (a struct/array/tuple literal, or a call
+//! returning an aggregate by the sret ABI, or `alloc_f32(n)`) is storage nobody else holds.
+//! Anything else is **unknown** and aliases conservatively.
 //!
 //! The result propagates transitively to a fixpoint: if `g`'s params `i`/`j` may alias and `g` calls
 //! `f(p_i, p_j)`, then `f`'s corresponding params may alias too. Recursion terminates because the
@@ -479,6 +480,16 @@ fn origin_of(e: &Expr, sema: &SemaResult) -> Origin {
         | ExprKind::ArrayRepeat { .. }
         | ExprKind::StructLit { .. }
         | ExprKind::TupleLit(_) => Origin::Fresh,
+        // A range index `s[a..b]` -- the parser's `$slice(s, a, b)` -- offsets its base's data
+        // pointer and copies nothing (`strs::lower_range_slice`), so it is a place IN its base,
+        // projected exactly like `s[i]` and just as index-value-blind. Reaching the call arm below
+        // instead, it was a borrowing call: `Unknown` here, and `Nothing` at every republishing
+        // site through the `alloc_*` exemption, so `let va = s[..];` recorded no view and two
+        // range views of one buffer were two storage roots -- `wukong_sgemm` ran with A == C and
+        // no overlap guard.
+        ExprKind::Call { callee, args, .. } if sema.is_range_slice_call(callee) => args
+            .first()
+            .map_or(Origin::Unknown, |base| project(e, base, Proj::Index, sema)),
         // A call's value is fresh unless the callee's return type is a *borrowing* one, in which
         // case it can be one of the callee's own arguments coming back out.
         ExprKind::Call { .. } => match sema.types.get(&e.id) {
@@ -522,15 +533,17 @@ fn project(whole: &Expr, base: &Expr, step: Proj, sema: &SemaResult) -> Origin {
 ///
 /// [`origin_of`] peels `Cast` and the three borrow/deref `Unary` operators BEFORE it classifies, so
 /// this peels the same three; peeling a different set would answer about a different expression
-/// than the one that was classified.
-fn origin_unknown_is_a_call(e: &Expr) -> bool {
+/// than the one that was classified. A range index is spelled as a call but classified as a
+/// PROJECTION of its base, so it is not a call here either: its `Unknown` is its base's, and taints
+/// exactly as `x[i]`'s does.
+fn origin_unknown_is_a_call(e: &Expr, sema: &SemaResult) -> bool {
     match &e.kind {
-        ExprKind::Call { .. } => true,
+        ExprKind::Call { callee, .. } => !sema.is_range_slice_call(callee),
         ExprKind::Cast { expr, .. }
         | ExprKind::Unary {
             op: ast::UnOp::Ref | ast::UnOp::RefMut | ast::UnOp::Deref,
             expr,
-        } => origin_unknown_is_a_call(expr),
+        } => origin_unknown_is_a_call(expr, sema),
         _ => false,
     }
 }
@@ -574,7 +587,7 @@ fn republish_of(e: &Expr, sema: &SemaResult) -> Republish {
     match origin_of(e, sema) {
         Origin::At(p) => Republish::At(p),
         Origin::Fresh => Republish::Nothing,
-        Origin::Unknown if origin_unknown_is_a_call(e) => Republish::Nothing,
+        Origin::Unknown if origin_unknown_is_a_call(e, sema) => Republish::Nothing,
         Origin::Unknown => Republish::Taint,
     }
 }

@@ -43,6 +43,13 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `*u8` value or a `[]u8` beside a `str`, two different structs — is `E0401`
   (`tests/run/str_array_elems.wk`, `tests/fail/str_array_ptr_elem.wk`,
   `tests/fail/str_array_slice_elem.wk`).
+- **A range view is a view to the kernel alias analysis.** `mir_build`'s whole-program alias
+  analysis classified `s[a..b]` as a call returning a slice, and a call is exempt from recording a
+  view (the exemption that keeps `alloc_f32(n)` dispatching), so after `let va = s[..];
+  let vc = s[..];` the two names were two storage roots and a recognized GEMM over them was emitted
+  with A == C and no overlap guard (the interpreter refused it; a release native runtime computes
+  the out-of-place product). A range index now projects its base like `s[i]` does, so the kernel is
+  guarded and the program prints what the nest computes (`tests/run/alias_range_views.wk`).
 
 ### Type-lowering soundness (`gap4/sema-soundness`)
 

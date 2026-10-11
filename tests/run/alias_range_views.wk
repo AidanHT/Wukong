@@ -1,0 +1,78 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 10
+// EXPECT-OUT: 14
+// EXPECT-OUT: 23
+// EXPECT-OUT: 32
+// EXPECT-OUT: 26
+// EXPECT-OUT: 30
+// EXPECT-OUT: 59
+// EXPECT-OUT: 68
+// EXPECT-OUT: 42
+// EXPECT-OUT: 46
+// EXPECT-OUT: 95
+// EXPECT-OUT: 104
+// EXPECT-OUT: 58
+// EXPECT-OUT: 62
+// EXPECT-OUT: 131
+// EXPECT-OUT: 140
+module tests.run.alias_range_views
+
+// A recognized GEMM whose A and C operands are two RANGE VIEWS of one buffer.
+//
+// A range index `s[a..b]` copies nothing: it offsets `s`'s data pointer, so `va` and `vc` below are
+// both `x`. The whole-program alias analysis (`wukong_mir_build/src/alias.rs`) classified the range
+// index as an ordinary call returning a slice, and a call is exempt from republishing (that is what
+// keeps `alloc_f32(n)` dispatching), so `let va = s[..];` recorded no view: `va` and `vc` were two
+// storage roots, `mm` looked alias free, and `wukong_sgemm` was emitted with A == C and no overlap
+// guard. The interpreter refused the call ("kernel operands 2 and 0 overlap"), a debug runtime
+// aborted natively, and a release runtime — whose overlap check is debug-only — computes the
+// OUT-OF-PLACE product instead of the nest's answer.
+//
+// The program means what the nest means. Expectations are the SCALAR NEST run by hand in place
+// (each `c[i*4+j]` store lands before the later reads of that row), e.g. row 0 of x = 1 2 3 4:
+//   c[0] = 1*1 + 2*0 + 3*3 + 4*0         = 10
+//   c[1] = 10*0 + 2*1 + 3*0 + 4*3        = 14
+//   c[2] = 10*2 + 14*0 + 3*1 + 4*0       = 23
+//   c[3] = 10*0 + 14*2 + 23*0 + 4*1      = 32
+// and likewise rows 1-3. Every lane is printed. All values are small integers, exact in f32, so FMA
+// contraction cannot move a result at any -O level.
+
+fn mm(a: []f32, b: []f32, mut c: []f32) {
+    for i in 0..4 {
+        for j in 0..4 {
+            let mut s: f32 = 0.0;
+            for k in 0..4 {
+                s = s + a[i * 4 + k] * b[k * 4 + j];
+            }
+            c[i * 4 + j] = s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 16] = [0.0; 16];
+    for i in 0..16 {
+        x[i] = (i + 1) as f32;
+    }
+    // b = [1 0 2 0; 0 1 0 2; 3 0 1 0; 0 3 0 1]
+    let mut y: [f32; 16] = [0.0; 16];
+    y[0] = 1.0;
+    y[2] = 2.0;
+    y[5] = 1.0;
+    y[7] = 2.0;
+    y[8] = 3.0;
+    y[10] = 1.0;
+    y[13] = 3.0;
+    y[15] = 1.0;
+
+    let s: []f32 = x;
+    let t: []f32 = y;
+    let va = s[..];
+    let vc = s[..];
+    mm(va, t, vc);
+    for i in 0..16 {
+        print(x[i] as i32);
+    }
+    return 0;
+}

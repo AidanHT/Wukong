@@ -273,6 +273,10 @@ pub struct SemaResult {
     /// to the `[]u8` it is laid out as, so this set is the one place `mir_build` learns that such an
     /// argument prints as text rather than as a list of bytes.
     pub str_print_args: HashSet<NodeId>,
+    /// The symbols of the two callees a range index desugars to, `$slice` and `$slice_from`
+    /// (`strs.rs`), each `None` when the program never spells that form. They let a pass that
+    /// holds no interner recognize a range index: see [`SemaResult::is_range_slice_call`].
+    pub range_slice_callees: [Option<Symbol>; 2],
 }
 
 /// Collect the struct names a type contains *by value* — directly (`Ty::Named`) or nested inside an
@@ -500,6 +504,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         builtin_calls: s.builtin_calls,
         methods: s.methods.resolution,
         str_print_args: s.str_print_args,
+        range_slice_callees: [interner.get(RANGE_SLICE), interner.get(RANGE_SLICE_FROM)],
     };
     // `str` does not leave sema: every published type is erased to its `[]u8` layout (`strs.rs`).
     strs::erase_published(&mut result);

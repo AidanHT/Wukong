@@ -46,6 +46,17 @@ pub fn is_range_slice(name: &str) -> bool {
     name == RANGE_SLICE || name == RANGE_SLICE_FROM
 }
 
+impl SemaResult {
+    /// Whether `callee` is the callee of a range index (`$slice` / `$slice_from`), for a pass that
+    /// holds no interner. A range index is a VIEW of its base's storage, not a call handing back
+    /// storage of unknown origin, and an analysis that roots buffers must say so
+    /// (`wukong_mir_build`'s `alias.rs`, like `noalias.rs`'s `view_target` here).
+    pub fn is_range_slice_call(&self, callee: &Expr) -> bool {
+        matches!(&callee.kind, ExprKind::Path(p)
+            if p.is_single() && self.range_slice_callees.contains(&Some(p.first().sym)))
+    }
+}
+
 /// Map every type in a published [`SemaResult`] through [`Ty::erase_str`]: the expression types
 /// and every definition's signature, constant type, struct fields and enum payloads.
 pub(crate) fn erase_published(r: &mut SemaResult) {

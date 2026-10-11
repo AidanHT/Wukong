@@ -166,8 +166,12 @@ index `s[a..b]` is parsed as the call `$slice(s, a, b)` (`$slice_from(s, a)` wit
 missing lower bound is a zero-width `0` literal at the dots) — a name no identifier can spell —
 typed for a `str` or any `[]T` base, and lowered to `{ data + a, b - a }` behind
 `bounds::emit_range_bounds_check` (`hi <= len`, then `lo <= hi`, unsigned; `ule`, which
-`wukong_opt::bce` deliberately does not key on). `@noalias` roots a range view at its base's
-storage, so `k(s[0..2], s[1..3])` is `E0316`.
+`wukong_opt::bce` deliberately does not key on). A range view is a place in its base, never a
+call's fresh result: `@noalias` roots it at its base's storage, so `k(s[0..2], s[1..3])` is
+`E0316`, and `mir_build`'s whole-program kernel alias analysis (`alias.rs::origin_of`) projects it
+like `s[i]`, so `let va = s[..]; let vc = s[..];` are two names for one buffer and a recognized
+kernel over both is guarded (`tests/run/alias_range_views.wk`). It recognizes the callee without an
+interner through `SemaResult::range_slice_callees` / `is_range_slice_call`.
 **Storage classification is total.** `wukong_mir_build` sizes every value's slot through
 `FnLowerer::mir_ty_of` (a `Ty`) and `mir_ty_of_ann` (an annotation), each with an arm per form and
 no `_ => I32` fallback: a C-style enum is the one `Ty::Named` whose representation is `i32`; the
