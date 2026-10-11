@@ -1,0 +1,153 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// sum, columns 0..39
+// EXPECT-OUT-VALUES: -12 -9 -6 -3 0 3 6 9 12 -12
+// EXPECT-OUT-VALUES: -9 -6 -3 0 3 6 9 12 -12 -9
+// EXPECT-OUT-VALUES: -6 -3 0 3 6 9 12 -12 -9 -6
+// EXPECT-OUT-VALUES: -3 0 3 6 9 12 -12 -9 -6 -3
+// max, columns 0..39
+// EXPECT-OUT-VALUES: -1 -1 -2 1 3 2 3 6 6 -4
+// EXPECT-OUT-VALUES: -1 1 0 1 4 4 3 6 -1 -2
+// EXPECT-OUT-VALUES: -1 2 2 1 4 6 5 -3 0 0
+// EXPECT-OUT-VALUES: -1 2 4 3 4 7 -2 -3 0 2
+// min, columns 0..39
+// EXPECT-OUT-VALUES: -7 -5 -2 -3 -3 0 1 0 2 -4
+// EXPECT-OUT-VALUES: -5 -5 -2 -1 -2 0 3 2 -7 -4
+// EXPECT-OUT-VALUES: -3 -4 -2 1 0 0 3 -5 -6 -4
+// EXPECT-OUT-VALUES: -1 -2 -2 1 2 1 -6 -3 -4 -4
+// maxabs, columns 0..39
+// EXPECT-OUT-VALUES: 7 5 2 3 3 2 3 6 6 4
+// EXPECT-OUT-VALUES: 5 5 2 1 4 4 3 6 7 4
+// EXPECT-OUT-VALUES: 3 4 2 1 4 6 5 5 6 4
+// EXPECT-OUT-VALUES: 1 2 4 3 4 7 6 3 4 4
+// mean, columns 0..39
+// EXPECT-OUT-VALUES: -4 -3 -2 -1 0 1 2 3 4 -4
+// EXPECT-OUT-VALUES: -3 -2 -1 0 1 2 3 4 -4 -3
+// EXPECT-OUT-VALUES: -2 -1 0 1 2 3 4 -4 -3 -2
+// EXPECT-OUT-VALUES: -1 0 1 2 3 4 -4 -3 -2 -1
+// sumsq, columns 0..39
+// EXPECT-OUT-VALUES: 66 35 12 11 18 5 14 45 56 48
+// EXPECT-OUT-VALUES: 35 30 5 2 21 20 27 56 66 29
+// EXPECT-OUT-VALUES: 14 21 8 3 20 45 50 50 45 20
+// EXPECT-OUT-VALUES: 3 8 21 14 29 66 56 27 20 21
+// l2, columns 0..39
+// EXPECT-OUT-VALUES: 2 3 3 4 5 5 6 6 7 7
+// EXPECT-OUT-VALUES: 8 9 9 9 9 10 10 11 11 11
+// EXPECT-OUT-VALUES: 12 12 13 13 13 14 14 15 15 15
+// EXPECT-OUT-VALUES: 15 15 16 17 17 17 17 18 18 18
+// rms, columns 0..39
+// EXPECT-OUT-VALUES: 3 5 6 7 9 9 9 10 11 11
+// EXPECT-OUT-VALUES: 11 12 13 13 14 15 15 15 15 15
+// EXPECT-OUT-VALUES: 17 17 17 17 18 18 18 19 19 19
+// EXPECT-OUT-VALUES: 19 20 21 21 21 21 21 22 22 22
+module tests.run.cov4_par_colreduce
+
+// P12.4: the eight `_parallel` column reductions. A `@parallel` function with more than one
+// statement is not outlined (`parallel_spec` wants exactly one loop), so it is lowered whole with
+// `parallel_fn` set and every `lower_for` arm below picks its `_parallel` twin:
+// wukong_col{sum,max,min,maxabs,mean,sumsq}_f32_parallel, wukong_coll2_f32_parallel and
+// wukong_colrms_f32_parallel. Proven with `--emit=mir -O2` (tests/recognizer-census.txt).
+//
+// Shape [3, 40]: the parallel kernels split columns into 32-wide stripes, so 40 columns are two
+// stripes (one full, one 8-wide) and the forced-parallel lane (parallel_lane.rs) really forks.
+//
+// Expected values come from the scalar semantics of each loop, by construction exact:
+//   * `x` column j is (a-b, a, a+b) with a = (j % 9) - 4 and b = ((j * 5) % 7) - 3, so
+//     sum = 3a, mean = a, max = a + |b|, min = a - |b|, maxabs = |a| + |b|, sumsq = 3a^2 + 2b^2;
+//   * `y` column j is a Pythagorean-quadruple leg triple (p, q, r) with p^2 + q^2 + r^2 = d^2
+//     (signed, rotated), so l2 = sqrt(sumsq) = d exactly;
+//   * `z` column j is a triple with p^2 + q^2 + r^2 = 3k^2, so rms = sqrt(sumsq / 3) = k exactly.
+// Every value is a small integer, so neither the kernels' 4-row blocking nor `vdivps`/`vsqrtps`
+// can round; the outputs are poisoned first so a dropped column prints its poison. EVERY lane is
+// printed (8 x 40), never a reduction of them.
+
+@parallel
+fn colred(x: [f32; 120], y: [f32; 120], z: [f32; 120], mut s: [f32; 40], mut mx: [f32; 40],
+          mut mn: [f32; 40], mut ma: [f32; 40], mut me: [f32; 40], mut sq: [f32; 40],
+          mut l2: [f32; 40], mut rm: [f32; 40]) {
+    for j in 0..40 {
+        let mut a: f32 = 0.0;
+        for i in 0..3 { a = a + x[i * 40 + j]; }
+        s[j] = a;
+    }
+    for j in 0..40 {
+        let mut a: f32 = x[j];
+        for i in 1..3 { a = fmax(a, x[i * 40 + j]); }
+        mx[j] = a;
+    }
+    for j in 0..40 {
+        let mut a: f32 = x[j];
+        for i in 1..3 { a = fmin(a, x[i * 40 + j]); }
+        mn[j] = a;
+    }
+    for j in 0..40 {
+        let mut a: f32 = abs(x[j]);
+        for i in 1..3 { a = fmax(a, abs(x[i * 40 + j])); }
+        ma[j] = a;
+    }
+    for j in 0..40 {
+        let mut a: f32 = 0.0;
+        for i in 0..3 { a = a + x[i * 40 + j]; }
+        me[j] = a / 3.0;
+    }
+    for j in 0..40 {
+        let mut a: f32 = 0.0;
+        for i in 0..3 { a = a + x[i * 40 + j] * x[i * 40 + j]; }
+        sq[j] = a;
+    }
+    for j in 0..40 {
+        let mut a: f32 = 0.0;
+        for i in 0..3 { a = a + y[i * 40 + j] * y[i * 40 + j]; }
+        l2[j] = sqrt(a);
+    }
+    for j in 0..40 {
+        let mut a: f32 = 0.0;
+        for i in 0..3 { a = a + z[i * 40 + j] * z[i * 40 + j]; }
+        rm[j] = sqrt(a / 3.0);
+    }
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 120] = [0.0; 120];
+    for j in 0..40 {
+        let a: f32 = ((j % 9) as f32) - 4.0;
+        let b: f32 = (((j * 5) % 7) as f32) - 3.0;
+        x[j] = a - b;
+        x[40 + j] = a;
+        x[80 + j] = a + b;
+    }
+    // Pythagorean-quadruple legs, one column per (p, q, r): p^2 + q^2 + r^2 is a perfect square.
+    let y: [f32; 120] = [
+        0.0, 0.0, 2.0, 0.0, 0.0, -4.0, 0.0, -4.0, 7.0, -2.0, 0.0, -9.0, 1.0, -6.0, 7.0, 0.0, 6.0, -11.0, 2.0, -6.0, 12.0, -4.0, 0.0, -12.0, 3.0, 0.0, 12.0, 0.0, 9.0, -14.0, 2.0, -10.0, 16.0, 0.0, 8.0, -12.0, 8.0, 0.0, 16.0, -6.0,
+        0.0, 3.0, -1.0, 0.0, 5.0, 0.0, 0.0, -4.0, 0.0, 3.0, -8.0, 0.0, 4.0, 6.0, -4.0, 0.0, 8.0, 0.0, -6.0, -7.0, 0.0, 8.0, -13.0, 0.0, 4.0, 14.0, -4.0, 0.0, 12.0, 2.0, -10.0, -10.0, 0.0, 0.0, -15.0, -1.0, 9.0, 18.0, -2.0, -12.0,
+        2.0, 0.0, 2.0, 4.0, 0.0, -3.0, -6.0, -2.0, 0.0, 6.0, 0.0, 0.0, -8.0, -3.0, -4.0, -10.0, 0.0, 0.0, 9.0, 6.0, 0.0, -8.0, 0.0, -5.0, 12.0, 0.0, 6.0, 15.0, 0.0, -5.0, -11.0, -5.0, 0.0, 17.0, 0.0, 12.0, -12.0, 0.0, -8.0, -12.0,
+    ];
+    // Triples with p^2 + q^2 + r^2 = 3k^2: the column rms is the integer k.
+    let z: [f32; 120] = [
+        1.0, 7.0, -2.0, -1.0, 11.0, 3.0, -5.0, -14.0, 1.0, 5.0, -13.0, -4.0, 5.0, 17.0, -10.0, -1.0, 21.0, 5.0, -5.0, -19.0, 5.0, 7.0, -25.0, -13.0, 2.0, 30.0, -14.0, -1.0, 23.0, 11.0, -13.0, -28.0, 19.0, 3.0, -35.0, -19.0, 13.0, 38.0, -14.0, -10.0,
+        1.0, 1.0, 10.0, 5.0, -1.0, -15.0, -7.0, -2.0, 19.0, 7.0, 5.0, 20.0, -11.0, -7.0, -22.0, -7.0, 3.0, 25.0, 11.0, 5.0, -29.0, -17.0, -11.0, -23.0, 22.0, 6.0, 26.0, 11.0, -5.0, -29.0, -17.0, -4.0, 31.0, 15.0, 7.0, 29.0, -23.0, -2.0, -34.0, -26.0,
+        5.0, 5.0, 2.0, 11.0, 11.0, 3.0, 13.0, 10.0, -1.0, -17.0, -13.0, -4.0, -19.0, -13.0, -2.0, -25.0, 15.0, 5.0, 23.0, 17.0, 1.0, 23.0, 11.0, 13.0, -22.0, -6.0, -10.0, -31.0, -23.0, -11.0, -25.0, -20.0, 1.0, 33.0, 7.0, 11.0, 25.0, 2.0, 10.0, 26.0,
+    ];
+    let mut s: [f32; 40] = [0.0; 40];
+    let mut mx: [f32; 40] = [0.0; 40];
+    let mut mn: [f32; 40] = [0.0; 40];
+    let mut ma: [f32; 40] = [0.0; 40];
+    let mut me: [f32; 40] = [0.0; 40];
+    let mut sq: [f32; 40] = [0.0; 40];
+    let mut l2: [f32; 40] = [0.0; 40];
+    let mut rm: [f32; 40] = [0.0; 40];
+    for j in 0..40 {
+        let p: f32 = -1000.0 - (j as f32);
+        s[j] = p; mx[j] = p; mn[j] = p; ma[j] = p; me[j] = p; sq[j] = p; l2[j] = p; rm[j] = p;
+    }
+    colred(x, y, z, s, mx, mn, ma, me, sq, l2, rm);
+    for j in 0..40 { print(s[j]); }
+    for j in 0..40 { print(mx[j]); }
+    for j in 0..40 { print(mn[j]); }
+    for j in 0..40 { print(ma[j]); }
+    for j in 0..40 { print(me[j]); }
+    for j in 0..40 { print(sq[j]); }
+    for j in 0..40 { print(l2[j]); }
+    for j in 0..40 { print(rm[j]); }
+    return 0;
+}

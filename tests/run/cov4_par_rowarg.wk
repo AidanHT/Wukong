@@ -1,0 +1,50 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// argmax column index, rows 0..3
+// EXPECT-OUT-VALUES: 5 1 10 6
+// argmin column index, rows 0..3
+// EXPECT-OUT-VALUES: 0 9 5 1
+module tests.run.cov4_par_rowarg
+
+// P12.4: wukong_rowargmax_i32_parallel and wukong_rowargmin_i32_parallel. Both nests sit in one
+// multi-statement `@parallel` function, which is lowered whole with `parallel_fn` set, so the
+// row-arg arm emits the `_parallel` twins (`--emit=mir -O2`, census).
+//
+// Shape [4, 19]: four rows so the forced-parallel lane forks over rows, and 19 columns so each row
+// crosses two 8-wide (value, index) blend blocks and ends in a ragged 3-column tail.
+//
+// x[r, j] = ((7r + 5j) % 13) - 6. Along a row, 5j mod 13 visits every residue, so each row holds the
+// values -6..6 with the first six repeated 13 columns later: whenever a row's extreme falls in
+// columns 0..5 it ties with column +13, and the strict compare of the scalar loop keeps the FIRST
+// (lower) column. Expected indices are exactly that scalar scan. EVERY lane is printed.
+
+@parallel
+fn rowarg(x: [f32; 76], mut amax: [i32; 4], mut amin: [i32; 4]) {
+    for r in 0..4 {
+        let mut bv: f32 = x[r * 19];
+        let mut bi: i32 = 0;
+        for j in 1..19 { if x[r * 19 + j] > bv { bv = x[r * 19 + j]; bi = j; } }
+        amax[r] = bi;
+    }
+    for r in 0..4 {
+        let mut bv: f32 = x[r * 19];
+        let mut bi: i32 = 0;
+        for j in 1..19 { if x[r * 19 + j] < bv { bv = x[r * 19 + j]; bi = j; } }
+        amin[r] = bi;
+    }
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 76] = [0.0; 76];
+    for r in 0..4 {
+        for j in 0..19 {
+            x[r * 19 + j] = (((r * 7 + j * 5) % 13) as f32) - 6.0;
+        }
+    }
+    let mut amax: [i32; 4] = [-1; 4];
+    let mut amin: [i32; 4] = [-1; 4];
+    rowarg(x, amax, amin);
+    for r in 0..4 { print(amax[r]); }
+    for r in 0..4 { print(amin[r]); }
+    return 0;
+}

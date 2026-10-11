@@ -1,0 +1,104 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// cumsum, rows 0..2 (19 lanes per row)
+// EXPECT-OUT-VALUES: -9 -11 -6 -13 -13 -6 -11 -9 0 -3 1 -7 -8 -2 -8 -7 1 -3 0
+// EXPECT-OUT-VALUES: 2 11 8 12 4 3 9 3 4 12 8 11 2 0 5 -2 -2 5 0
+// EXPECT-OUT-VALUES: -6 -5 3 -1 2 -7 -9 -4 -11 -11 -4 -9 -7 2 -1 3 -5 -6 0
+// cumprod, rows 0..2
+// EXPECT-OUT-VALUES: 2 -1 -2 -2 2 1 2 -1 -2 -2 2 1 2 -1 -2 -2 2 1 2
+// EXPECT-OUT-VALUES: 0.5 1 -0.5 -1 -1 1 0.5 1 -0.5 -1 -1 1 0.5 1 -0.5 -1 -1 1 0.5
+// EXPECT-OUT-VALUES: -1 -0.5 -1 0.5 1 1 -1 -0.5 -1 -0 -0 -0 0 0 0 -0 -0 -0 0
+// cummax, rows 0..2
+// EXPECT-OUT-VALUES: -3 0.5 4 4 4 4 4 4 4 7.5 7.5 7.5 7.5 7.5 7.5 7.5 11 11 11
+// EXPECT-OUT-VALUES: 2 2 2 2 2 5.5 5.5 5.5 5.5 5.5 5.5 5.5 9 9 9 9 9 9 9
+// EXPECT-OUT-VALUES: 0 3.5 3.5 3.5 3.5 3.5 3.5 3.5 7 7 7 7 7 7 7 10.5 10.5 10.5 10.5
+// cummin, rows 0..2
+// EXPECT-OUT-VALUES: -3 -3 -3 -3.5 -3.5 -3.5 -4 -6.5 -6.5 -6.5 -7 -7 -7 -7.5 -10 -10 -10 -10.5 -10.5
+// EXPECT-OUT-VALUES: -1 -3.5 -3.5 -3.5 -4 -4 -4 -4.5 -7 -7 -7 -7.5 -7.5 -7.5 -8 -10.5 -10.5 -10.5 -11
+// EXPECT-OUT-VALUES: 1 -1.5 -4 -4 -4 -4.5 -4.5 -4.5 -5 -7.5 -7.5 -7.5 -8 -8 -8 -8.5 -11 -11 -11
+// lrscan h = a*h + x, rows 0..2
+// EXPECT-OUT-VALUES: -9 7 8.5 -7 -7 14 2 2 11 -14 -3 -8 -9 15 1.5 1 9 -13 -3.5
+// EXPECT-OUT-VALUES: 2 10 -3 1 -9 -5.5 6 0 1 8.5 -4 -1 -8 -6 5 -2 2 8 -5
+// EXPECT-OUT-VALUES: -6 1 9 -13 -3.5 -9 -11 16 1 0 7 -12 -4 9 6 -2 -9 -1 5
+module tests.run.cov4_par_scan
+
+// P12.4: the five `_parallel` row scans -- wukong_cumsum_f32_parallel, wukong_cumprod_f32_parallel,
+// wukong_cummax_f32_parallel, wukong_cummin_f32_parallel and wukong_lrscan_f32_parallel. All five
+// nests sit in one multi-statement `@parallel` function (lowered whole with `parallel_fn` set, not
+// outlined), so each scan arm emits its `_parallel` twin (`--emit=mir -O2`, census).
+//
+// Shape [3, 19]: three rows so the forced-parallel lane forks over rows; 19 columns = two 8-lane
+// in-register scan blocks plus a ragged 3-lane tail, so the carry crosses two block seams.
+//
+// Inputs, and why every expected lane is exact:
+//   * x[r, i] = ((11r + 7i) % 19) - 9: integers in [-9, 9], so the prefix sums (which the kernel
+//     reassociates inside each 8-lane block) are small integers either way;
+//   * the cumprod factors are drawn from {2, 1/2, -1, 1, 2, -1/2} (row 2 has a 0 at column 9, which
+//     must zero every later prefix): every prefix is +-2^k or +-0, exact;
+//   * cummax runs over u[r, i] = i/2 + ((5r + 3i) % 7) - 3 and cummin over
+//     v[r, i] = -i/2 + ((2r + 5i) % 7) - 3: trending half-integers, so the running extreme keeps
+//     moving across both block seams instead of saturating in the first block;
+//   * the recurrence gate a[r, t] cycles {1, -1, 1/2, 0}: the 0 erases history every fourth step, so
+//     h = a*h + x stays a small dyadic value.
+// The expected lanes are the scalar loops evaluated in order (exact rationals, f32-checked).
+// Outputs are poisoned (-1000) first. EVERY lane is printed (5 x 57).
+
+@parallel
+fn scans(x: [f32; 57], f: [f32; 57], u: [f32; 57], v: [f32; 57], a: [f32; 57],
+         mut cs: [f32; 57], mut cp: [f32; 57], mut cx: [f32; 57], mut cn: [f32; 57],
+         mut lr: [f32; 57]) {
+    for r in 0..3 {
+        let mut acc: f32 = 0.0;
+        for i in 0..19 { acc = acc + x[r * 19 + i]; cs[r * 19 + i] = acc; }
+    }
+    for r in 0..3 {
+        let mut p: f32 = 1.0;
+        for i in 0..19 { p = p * f[r * 19 + i]; cp[r * 19 + i] = p; }
+    }
+    for r in 0..3 {
+        let mut m: f32 = u[r * 19];
+        for i in 0..19 { m = fmax(m, u[r * 19 + i]); cx[r * 19 + i] = m; }
+    }
+    for r in 0..3 {
+        let mut m: f32 = v[r * 19];
+        for i in 0..19 { m = fmin(m, v[r * 19 + i]); cn[r * 19 + i] = m; }
+    }
+    for r in 0..3 {
+        let mut h: f32 = 0.0;
+        for t in 0..19 { h = a[r * 19 + t] * h + x[r * 19 + t]; lr[r * 19 + t] = h; }
+    }
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 57] = [0.0; 57];
+    let mut u: [f32; 57] = [0.0; 57];
+    let mut v: [f32; 57] = [0.0; 57];
+    let mut a: [f32; 57] = [0.0; 57];
+    let gates: [f32; 4] = [1.0, -1.0, 0.5, 0.0];
+    for r in 0..3 {
+        for i in 0..19 {
+            x[r * 19 + i] = (((r * 11 + i * 7) % 19) as f32) - 9.0;
+            u[r * 19 + i] = (i as f32) * 0.5 + (((r * 5 + i * 3) % 7) as f32) - 3.0;
+            v[r * 19 + i] = (i as f32) * -0.5 + (((r * 2 + i * 5) % 7) as f32) - 3.0;
+            a[r * 19 + i] = gates[(r + i) % 4];
+        }
+    }
+    // cumprod factors: {2, 1/2, -1, 1, 2, -1/2}[(r + 5i) % 6], with a single 0 at row 2, column 9.
+    let f: [f32; 57] = [
+        2.0, -0.5, 2.0, 1.0, -1.0, 0.5, 2.0, -0.5, 2.0, 1.0, -1.0, 0.5, 2.0, -0.5, 2.0, 1.0, -1.0, 0.5, 2.0,
+        0.5, 2.0, -0.5, 2.0, 1.0, -1.0, 0.5, 2.0, -0.5, 2.0, 1.0, -1.0, 0.5, 2.0, -0.5, 2.0, 1.0, -1.0, 0.5,
+        -1.0, 0.5, 2.0, -0.5, 2.0, 1.0, -1.0, 0.5, 2.0, 0.0, 2.0, 1.0, -1.0, 0.5, 2.0, -0.5, 2.0, 1.0, -1.0,
+    ];
+    let mut cs: [f32; 57] = [-1000.0; 57];
+    let mut cp: [f32; 57] = [-1000.0; 57];
+    let mut cx: [f32; 57] = [-1000.0; 57];
+    let mut cn: [f32; 57] = [-1000.0; 57];
+    let mut lr: [f32; 57] = [-1000.0; 57];
+    scans(x, f, u, v, a, cs, cp, cx, cn, lr);
+    for k in 0..57 { print(cs[k]); }
+    for k in 0..57 { print(cp[k]); }
+    for k in 0..57 { print(cx[k]); }
+    for k in 0..57 { print(cn[k]); }
+    for k in 0..57 { print(lr[k]); }
+    return 0;
+}

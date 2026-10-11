@@ -1,0 +1,82 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// f32 dst [19, 3]: one source column (= dst row) per line
+// EXPECT-OUT-VALUES: -127 6 -116
+// EXPECT-OUT-VALUES: -120 13 -109
+// EXPECT-OUT-VALUES: -113 20 -102
+// EXPECT-OUT-VALUES: -106 27 -95
+// EXPECT-OUT-VALUES: -99 34 -88
+// EXPECT-OUT-VALUES: -92 41 -81
+// EXPECT-OUT-VALUES: -85 48 -74
+// EXPECT-OUT-VALUES: -78 55 -67
+// EXPECT-OUT-VALUES: -71 62 -60
+// EXPECT-OUT-VALUES: -64 69 -53
+// EXPECT-OUT-VALUES: -57 76 -46
+// EXPECT-OUT-VALUES: -50 83 -39
+// EXPECT-OUT-VALUES: -43 90 -32
+// EXPECT-OUT-VALUES: -36 97 -25
+// EXPECT-OUT-VALUES: -29 104 -18
+// EXPECT-OUT-VALUES: -22 111 -11
+// EXPECT-OUT-VALUES: -15 118 -4
+// EXPECT-OUT-VALUES: -8 125 3
+// EXPECT-OUT-VALUES: -1 -123 10
+// bf16 dst [19, 3] via the u16 bit-mover, one dst row per line
+// EXPECT-OUT-VALUES: -127 6 -116
+// EXPECT-OUT-VALUES: -120 13 -109
+// EXPECT-OUT-VALUES: -113 20 -102
+// EXPECT-OUT-VALUES: -106 27 -95
+// EXPECT-OUT-VALUES: -99 34 -88
+// EXPECT-OUT-VALUES: -92 41 -81
+// EXPECT-OUT-VALUES: -85 48 -74
+// EXPECT-OUT-VALUES: -78 55 -67
+// EXPECT-OUT-VALUES: -71 62 -60
+// EXPECT-OUT-VALUES: -64 69 -53
+// EXPECT-OUT-VALUES: -57 76 -46
+// EXPECT-OUT-VALUES: -50 83 -39
+// EXPECT-OUT-VALUES: -43 90 -32
+// EXPECT-OUT-VALUES: -36 97 -25
+// EXPECT-OUT-VALUES: -29 104 -18
+// EXPECT-OUT-VALUES: -22 111 -11
+// EXPECT-OUT-VALUES: -15 118 -4
+// EXPECT-OUT-VALUES: -8 125 3
+// EXPECT-OUT-VALUES: -1 -123 10
+module tests.run.cov4_par_transpose
+
+// P12.4: wukong_transpose_f32_parallel and wukong_transpose_u16_parallel (the bf16/f16 bit mover).
+// Both nests sit in one multi-statement `@parallel` function, lowered whole with `parallel_fn` set,
+// so the transpose arm emits the `_parallel` twins (`--emit=mir -O2`, census).
+//
+// This [3, 19] shape is below the kernels' fixed TRANSPOSE_PAR_MIN = 65536-element fork gate (not
+// env-tunable), so it pins the `_parallel` ENTRY's marshalling and its serial fallback, every lane;
+// cov4_par_transpose_wide.wk is the shape above the gate that really forks.
+//
+// src[t] = ((7t) % 255) - 127: integers exact in f32 and bf16, distinct over the 57 elements, so a
+// lane that lands in the wrong place prints the wrong number. dst[j*3 + i] = src[i*19 + j] is pure
+// data movement; the expected lanes are that permutation of the source values. The outputs are
+// poisoned first. EVERY lane is printed (57 + 57).
+
+@parallel
+fn tr(src: [f32; 57], hs: [bf16; 57], mut dst: [f32; 57], mut hd: [bf16; 57]) {
+    for i in 0..3 {
+        for j in 0..19 { dst[j * 3 + i] = src[i * 19 + j]; }
+    }
+    for i in 0..3 {
+        for j in 0..19 { hd[j * 3 + i] = hs[i * 19 + j]; }
+    }
+}
+
+fn main() -> i32 {
+    let mut src: [f32; 57] = [0.0; 57];
+    let mut hs: [bf16; 57] = [0.0 as bf16; 57];
+    for t in 0..57 {
+        let v: f32 = (((t * 7) % 255) as f32) - 127.0;
+        src[t] = v;
+        hs[t] = v as bf16;
+    }
+    let mut dst: [f32; 57] = [-1000.0; 57];
+    let mut hd: [bf16; 57] = [-1000.0 as bf16; 57];
+    tr(src, hs, dst, hd);
+    for x in 0..57 { print(dst[x]); }
+    for x in 0..57 { print(hd[x] as f32); }
+    return 0;
+}

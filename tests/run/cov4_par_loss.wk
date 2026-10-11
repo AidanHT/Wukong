@@ -1,0 +1,142 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// entropy -sum p ln p, rows 0..2
+// EXPECT-OUT-APPROX: -14.34847988 1e-5
+// EXPECT-OUT-APPROX: -16.02614293 1e-5
+// EXPECT-OUT-APPROX: -11.90414551 1e-5
+// KL sum p (ln p - ln q), rows 0..2
+// EXPECT-OUT-APPROX: 8.535189848 1e-5
+// EXPECT-OUT-APPROX: 13.01239342 1e-5
+// EXPECT-OUT-APPROX: 9.937317507 1e-5
+// soft-label CE sum q (lse - x), rows 0..2
+// EXPECT-OUT-APPROX: 38.44027594 1e-5
+// EXPECT-OUT-APPROX: 49.12398108 1e-5
+// EXPECT-OUT-APPROX: 43.52812301 1e-5
+// logsumexp, rows 0..2
+// EXPECT-OUT-APPROX: 5.352876853 1e-5
+// EXPECT-OUT-APPROX: 6.072514908 1e-5
+// EXPECT-OUT-APPROX: 6.396710387 1e-5
+// cross-entropy backward softmax(x) - onehot, [3, 10] row-major
+// EXPECT-OUT-APPROX: 0.0663212481 1e-3
+// EXPECT-OUT-APPROX: 0.09649684659 1e-3
+// EXPECT-OUT-APPROX: -0.8595979167 1e-4
+// EXPECT-OUT-APPROX: 0.08515816822 1e-3
+// EXPECT-OUT-APPROX: 0.1239044036 1e-4
+// EXPECT-OUT-APPROX: 0.07515181969 1e-3
+// EXPECT-OUT-APPROX: 0.1093452524 1e-4
+// EXPECT-OUT-APPROX: 0.0663212481 1e-3
+// EXPECT-OUT-APPROX: 0.09649684659 1e-3
+// EXPECT-OUT-APPROX: 0.1404020833 1e-4
+// EXPECT-OUT-APPROX: 0.1232657272 1e-4
+// EXPECT-OUT-APPROX: 0.07476444285 1e-3
+// EXPECT-OUT-APPROX: 0.1087816225 1e-4
+// EXPECT-OUT-APPROX: 0.06597938923 1e-3
+// EXPECT-OUT-APPROX: 0.09599944488 1e-3
+// EXPECT-OUT-APPROX: -0.8603216319 1e-4
+// EXPECT-OUT-APPROX: 0.08471921275 1e-3
+// EXPECT-OUT-APPROX: 0.1232657272 1e-4
+// EXPECT-OUT-APPROX: 0.07476444285 1e-3
+// EXPECT-OUT-APPROX: 0.1087816225 1e-4
+// EXPECT-OUT-APPROX: 0.09471275008 1e-3
+// EXPECT-OUT-APPROX: 0.1378062382 1e-4
+// EXPECT-OUT-APPROX: 0.08358370858 1e-3
+// EXPECT-OUT-APPROX: 0.1216135784 1e-4
+// EXPECT-OUT-APPROX: 0.07376236393 1e-3
+// EXPECT-OUT-APPROX: 0.1073236062 1e-4
+// EXPECT-OUT-APPROX: 0.06509505769 1e-3
+// EXPECT-OUT-APPROX: 0.09471275008 1e-3
+// EXPECT-OUT-APPROX: -0.8621937618 1e-4
+// EXPECT-OUT-APPROX: 0.08358370858 1e-3
+module tests.run.cov4_par_loss
+
+// P12.4: the five never-emitted `_parallel` row losses -- wukong_entropy_f32_parallel,
+// wukong_kldiv_f32_parallel, wukong_kd_loss_f32_parallel, wukong_logsumexp_f32_parallel and
+// wukong_xent_bwd_f32_parallel. All five nests sit in one multi-statement `@parallel` function,
+// lowered whole with `parallel_fn` set, so each arm emits its `_parallel` twin (`--emit=mir -O2`,
+// census). Three rows each, so the forced-parallel lane forks over rows; ten columns cross one 8-wide
+// block into a 2-column tail.
+//
+// These kernels evaluate exp/log, so no f32 bit pattern is "the" answer: every lane is
+// EXPECT-OUT-APPROX against an INDEPENDENT f64 reference of the same formula (computed by a scratch
+// script outside the repository from the exact f32 inputs below, never from compiler output). Each
+// lane's tolerance is the kernel's documented f64-reference bound, |got - ref| <= 1e-5 * max(|ref|, 1)
+// (entropy.rs, kldiv.rs, kd_loss.rs, xent_bwd.rs; logsoftmax.rs for logsumexp), converted to a
+// relative tolerance at that lane's magnitude and rounded up to a decade -- see DECLARED_TOLERANCES
+// in corpus_lint.rs. The data keeps every reduction lane at |ref| >= 1 (relative 1e-5) and every
+// probability lane at |ref| >= 0.01.
+//
+// Inputs (all short dyadics, exact in f32):
+//   p[r, i] = ((3r + 7i) % 13 + 2) / 4,  q[r, i] = ((5r + 2i) % 11 + 1) / 4,
+//   x[r, i] = ((7r + 3i) % 9) / 2 + 1,   xb[r, i] = ((5r + 3i) % 7) / 8,   target[r] = (3r + 2) % 10.
+// The outputs are poisoned first. EVERY lane is printed (4 x 3 + 30).
+
+@parallel
+fn losses(p: [f32; 30], q: [f32; 30], x: [f32; 30], xb: [f32; 30], target: [i32; 3],
+          mut ent: [f32; 3], mut kl: [f32; 3], mut kd: [f32; 3], mut lse: [f32; 3],
+          mut dx: [f32; 30]) {
+    for r in 0..3 {
+        let mut s: f32 = 0.0;
+        for i in 0..10 { s = s + p[r * 10 + i] * log(p[r * 10 + i]); }
+        ent[r] = -s;
+    }
+    for r in 0..3 {
+        let mut s: f32 = 0.0;
+        for i in 0..10 { s = s + p[r * 10 + i] * (log(p[r * 10 + i]) - log(q[r * 10 + i])); }
+        kl[r] = s;
+    }
+    for r in 0..3 {
+        let mut m: f32 = x[r * 10];
+        for i in 0..10 { m = fmax(m, x[r * 10 + i]); }
+        let mut z: f32 = 0.0;
+        for i in 0..10 { z = z + exp(x[r * 10 + i] - m); }
+        let l: f32 = m + log(z);
+        let mut s: f32 = 0.0;
+        for i in 0..10 { s = s + q[r * 10 + i] * (l - x[r * 10 + i]); }
+        kd[r] = s;
+    }
+    for r in 0..3 {
+        let mut m: f32 = x[r * 10];
+        for i in 0..10 { m = fmax(m, x[r * 10 + i]); }
+        let mut s: f32 = 0.0;
+        for i in 0..10 { s = s + exp(x[r * 10 + i] - m); }
+        lse[r] = m + log(s);
+    }
+    for r in 0..3 {
+        let mut m: f32 = xb[r * 10];
+        for i in 0..10 { m = fmax(m, xb[r * 10 + i]); }
+        let mut z: f32 = 0.0;
+        for i in 0..10 { z = z + exp(xb[r * 10 + i] - m); }
+        let invz: f32 = 1.0 / z;
+        for i in 0..10 { dx[r * 10 + i] = exp(xb[r * 10 + i] - m) * invz; }
+        dx[r * 10 + target[r]] = dx[r * 10 + target[r]] - 1.0;
+    }
+}
+
+fn main() -> i32 {
+    let mut p: [f32; 30] = [0.0; 30];
+    let mut q: [f32; 30] = [0.0; 30];
+    let mut x: [f32; 30] = [0.0; 30];
+    let mut xb: [f32; 30] = [0.0; 30];
+    for r in 0..3 {
+        for i in 0..10 {
+            p[r * 10 + i] = ((((r * 3 + i * 7) % 13) + 2) as f32) * 0.25;
+            q[r * 10 + i] = ((((r * 5 + i * 2) % 11) + 1) as f32) * 0.25;
+            x[r * 10 + i] = (((r * 7 + i * 3) % 9) as f32) * 0.5 + 1.0;
+            xb[r * 10 + i] = (((r * 5 + i * 3) % 7) as f32) * 0.125;
+        }
+    }
+    let mut target: [i32; 3] = [0; 3];
+    for r in 0..3 { target[r] = (r * 3 + 2) % 10; }
+    let mut ent: [f32; 3] = [-1000.0; 3];
+    let mut kl: [f32; 3] = [-1000.0; 3];
+    let mut kd: [f32; 3] = [-1000.0; 3];
+    let mut lse: [f32; 3] = [-1000.0; 3];
+    let mut dx: [f32; 30] = [-1000.0; 30];
+    losses(p, q, x, xb, target, ent, kl, kd, lse, dx);
+    for r in 0..3 { print(ent[r]); }
+    for r in 0..3 { print(kl[r]); }
+    for r in 0..3 { print(kd[r]); }
+    for r in 0..3 { print(lse[r]); }
+    for k in 0..30 { print(dx[k]); }
+    return 0;
+}

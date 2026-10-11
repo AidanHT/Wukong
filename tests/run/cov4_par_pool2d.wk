@@ -1,0 +1,74 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// max-pool out[c, oy, ox], row-major (c=0 oy=0 first)
+// EXPECT-OUT-VALUES: 0 6 7 1 7 8 2 8 6 3
+// EXPECT-OUT-VALUES: 7 8 5 8 0 6 7 1 7 8
+// EXPECT-OUT-VALUES: 7 8 2 8 6 3 6 7 4 7
+// EXPECT-OUT-VALUES: 0 6 7 1 7 8 2 8 6 3
+// avg-pool out[c, oy, ox], row-major
+// EXPECT-OUT-VALUES: -4 2 -0.5 -3 3 0.5 -2 4 -2.75 -1
+// EXPECT-OUT-VALUES: 1.75 -0.75 1 2.75 -4 2 -0.5 -3 3 0.5
+// EXPECT-OUT-VALUES: 3 0.5 -2 4 -2.75 -1 0.75 -1.75 0 1.75
+// EXPECT-OUT-VALUES: -4 2 -0.5 -3 3 0.5 -2 4 -2.75 -1
+module tests.run.cov4_par_pool2d
+
+// P12.4: wukong_maxpool2d_f32_parallel and wukong_avgpool2d_f32_parallel. Both pooling nests sit in
+// one multi-statement `@parallel` function (lowered whole with `parallel_fn` set), so the pool2d arm
+// emits the `_parallel` twins (`--emit=mir -O2`, census).
+//
+// Input [2 channels, 4, 20], 2x2 window, stride 2 -> output [2, 2, 10]: two channels so the
+// forced-parallel lane forks across channels, and ten output columns so the kernel's 8-column
+// window fold runs once and then a 2-column tail.
+//
+// x[c, y, x] = ((7c + 5y + 3x) % 17) - 8, all integers. max = the largest of the four window values;
+// avg = (sum of the four) / 4, a quarter-integer, exact in f32. Both come from the scalar loop's own
+// arithmetic. The outputs are poisoned (-1000) first. EVERY lane is printed.
+
+@parallel
+fn pools(x: [f32; 160], mut mo: [f32; 40], mut ao: [f32; 40]) {
+    for c in 0..2 {
+        for oy in 0..2 {
+            for ox in 0..10 {
+                let mut m = x[c * 4 * 20 + (oy * 2) * 20 + (ox * 2)];
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let v = x[c * 4 * 20 + (oy * 2 + dy) * 20 + (ox * 2 + dx)];
+                        m = fmax(m, v);
+                    }
+                }
+                mo[c * 2 * 10 + oy * 10 + ox] = m;
+            }
+        }
+    }
+    for c in 0..2 {
+        for oy in 0..2 {
+            for ox in 0..10 {
+                let mut s = 0.0;
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let v = x[c * 4 * 20 + (oy * 2 + dy) * 20 + (ox * 2 + dx)];
+                        s = s + v;
+                    }
+                }
+                ao[c * 2 * 10 + oy * 10 + ox] = s / 4.0;
+            }
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 160] = [0.0; 160];
+    for c in 0..2 {
+        for y in 0..4 {
+            for xx in 0..20 {
+                x[c * 80 + y * 20 + xx] = (((c * 7 + y * 5 + xx * 3) % 17) as f32) - 8.0;
+            }
+        }
+    }
+    let mut mo: [f32; 40] = [-1000.0; 40];
+    let mut ao: [f32; 40] = [-1000.0; 40];
+    pools(x, mo, ao);
+    for k in 0..40 { print(mo[k]); }
+    for k in 0..40 { print(ao[k]); }
+    return 0;
+}

@@ -1,0 +1,62 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// argmax row index, columns 0..69
+// EXPECT-OUT-VALUES: 0 3 1 2 0 0 3 1 2 0
+// EXPECT-OUT-VALUES: 0 3 1 2 0 0 3 1 2 0
+// EXPECT-OUT-VALUES: 0 3 1 2 0 0 3 1 2 0
+// EXPECT-OUT-VALUES: 0 3 1 2 0 0 3 1 2 0
+// EXPECT-OUT-VALUES: 0 3 1 2 0 0 3 1 2 0
+// EXPECT-OUT-VALUES: 0 3 1 2 0 0 3 1 2 0
+// EXPECT-OUT-VALUES: 0 3 1 2 0 0 3 1 2 0
+// argmin row index, columns 0..69
+// EXPECT-OUT-VALUES: 0 4 4 4 4 0 4 4 4 4
+// EXPECT-OUT-VALUES: 0 4 4 4 4 0 4 4 4 4
+// EXPECT-OUT-VALUES: 0 4 4 4 4 0 4 4 4 4
+// EXPECT-OUT-VALUES: 0 4 4 4 4 0 4 4 4 4
+// EXPECT-OUT-VALUES: 0 4 4 4 4 0 4 4 4 4
+// EXPECT-OUT-VALUES: 0 4 4 4 4 0 4 4 4 4
+// EXPECT-OUT-VALUES: 0 4 4 4 4 0 4 4 4 4
+module tests.run.cov4_par_colarg
+
+// P12.4: wukong_colargmax_i32_parallel and wukong_colargmin_i32_parallel. A multi-statement
+// `@parallel` function is lowered whole with `parallel_fn` set (not outlined), so the column-arg
+// arm in `lower_for` picks the `_parallel` twin for both nests (`--emit=mir -O2`, census).
+//
+// Shape [5, 70]: the parallel kernel splits columns into 64-wide tiles, so 70 columns are two tiles
+// (64 + a 6-column tail) and the forced-parallel lane (parallel_lane.rs) really forks.
+//
+// x[i, j] = ((i*j + j) % 5) - 2. Every expected index is the scalar loop's own answer: scan rows
+// 1..4 in order with a STRICT compare, so the lowest row wins every tie. Column j = 0 is all -2
+// (both answers 0), and every column with j % 5 == 0 is constant, a whole-column tie. The outputs
+// are poisoned with -1 first so a column the kernel skipped prints -1. EVERY lane is printed.
+
+@parallel
+fn colarg(x: [f32; 350], mut amax: [i32; 70], mut amin: [i32; 70]) {
+    for j in 0..70 {
+        let mut bv: f32 = x[j];
+        let mut bi: i32 = 0;
+        for i in 1..5 { if x[i * 70 + j] > bv { bv = x[i * 70 + j]; bi = i; } }
+        amax[j] = bi;
+    }
+    for j in 0..70 {
+        let mut bv: f32 = x[j];
+        let mut bi: i32 = 0;
+        for i in 1..5 { if x[i * 70 + j] < bv { bv = x[i * 70 + j]; bi = i; } }
+        amin[j] = bi;
+    }
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 350] = [0.0; 350];
+    for i in 0..5 {
+        for j in 0..70 {
+            x[i * 70 + j] = (((i * j + j) % 5) as f32) - 2.0;
+        }
+    }
+    let mut amax: [i32; 70] = [-1; 70];
+    let mut amin: [i32; 70] = [-1; 70];
+    colarg(x, amax, amin);
+    for j in 0..70 { print(amax[j]); }
+    for j in 0..70 { print(amin[j]); }
+    return 0;
+}

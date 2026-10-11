@@ -74,14 +74,27 @@ fn wukongc(args: &[&str], path: &Path, no_recognize: bool) -> (Option<i32>, Stri
 
 /// Per-fixture relative tolerance for the recognition on/off differential, each with the derivation
 /// of its bound. A fixture with no entry is held to **bit-exact** equality — the default, and what
-/// every current corpus fixture gets, so this table being empty is a no-op.
+/// every fixture whose kernel can be pointed at exactly-representable data gets.
 ///
 /// This is the extension point the instrument lacked. A fixture that prints raw reduction or GEMM
 /// lanes at a measurement size (above the kernel's vector step, where the reassociated and
 /// sequential orders genuinely diverge) is added here with its `c*sqrt(K)*eps` bound, and the gate
 /// then inspects its mantissas instead of being restricted to data where neutrality is free. Keep
 /// each bound cited the way `corpus_lint.rs::DECLARED_TOLERANCES` requires of the run corpus.
-const REASSOCIATION_TOLERANCES: &[(&str, f64)] = &[];
+///
+/// The entries print raw exp/log/sin/cos kernel lanes, where no f32 bit pattern is "the"
+/// answer: recognition swaps the kernel's polynomial (and its 8-wide reassociated row folds) for the
+/// generic lowering's own transcendentals, so the two columns legitimately differ in the last bits.
+/// Derivation of the bound: every printed lane of each fixture carries an `EXPECT-OUT-APPROX`
+/// tolerance `t <= 1e-3` against an independent f64 reference (each `t` cited in
+/// `corpus_lint.rs::DECLARED_TOLERANCES`), and both columns satisfy those same lines — `run.rs`
+/// holds the recognized column to them, and the recognition-off column was measured against them
+/// when the fixtures landed (worst lane at 0.9% of its tolerance). Two values each within `t|ref|`
+/// of the reference differ by at most `2t/(1-t)` relative to either: 2.002e-3 at `t = 1e-3`,
+/// declared as 2.1e-3. Measured on/off differences at landing: 2.1e-7 (loss), 1.4e-7 (rope) —
+/// one to two f32 ULP.
+const REASSOCIATION_TOLERANCES: &[(&str, f64)] =
+    &[("cov4_par_loss.wk", 2.1e-3), ("cov4_par_rope.wk", 2.1e-3)];
 
 /// The declared tolerance for a fixture, or `None` (bit-exact) when it has no entry.
 fn tolerance_for(name: &str) -> Option<f64> {
