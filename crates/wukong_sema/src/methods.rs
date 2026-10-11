@@ -696,7 +696,10 @@ impl Sema<'_> {
     }
 
     /// Adapt each unsuffixed numeric literal argument to its concrete scalar parameter, exactly as
-    /// `type_call` does for a resolved function (`params[i + offset]` is argument `i`'s parameter).
+    /// `type_call` does for a resolved function (`params[i + offset]` is argument `i`'s parameter;
+    /// the receiver, when there is one, is parameter 0 and never an argument here). A
+    /// literal-initialized binding passed as an argument takes the parameter's type if this is its
+    /// first use (`infer.rs`), as it does at a plain call: `let d = 0.1; p.add(d)` with `d: f64`.
     fn adapt_scalar_literals(
         &mut self,
         params: &[Ty],
@@ -706,6 +709,7 @@ impl Sema<'_> {
     ) {
         for (i, a) in args.iter().enumerate() {
             if let Some(param @ Ty::Scalar(_)) = params.get(i + offset) {
+                self.constrain_literal_binding(a, None, param, false);
                 if self.literal_adapts(param, a) {
                     self.retype_adapted_literal(a, param);
                     self.range_check_int_literal(a, param);

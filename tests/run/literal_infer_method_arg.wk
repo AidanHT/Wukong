@@ -1,0 +1,64 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0.1
+// EXPECT-OUT: 0.30000000000000004
+// EXPECT-OUT: 8589934592
+// EXPECT-OUT: 0.75
+module tests.run.literal_infer_method_arg
+
+// A `let` initialized from a bare literal takes the type of its first constraining use
+// (`infer.rs`), and an argument of a method call `x.m(a)` or an associated-function call
+// `Type::m(a)` is such a use, at the parameter's declared type — exactly as an argument of a
+// plain call `f(a)` already was. The receiver is never an argument. Method calls decided nothing
+// before, so each binding below kept its literal default (`f32`, `i32`) and every call was the
+// type mismatch E0401 (`expected `f64`, found `f32``).
+//
+// Expected values, from the scalar semantics of each binding at its decided type:
+// * `k = 0.1` decided `f64` by `Scale::of(k: f64)`: the field holds the f64 nearest 0.1, printed
+//   `0.1` (the f32 0.1 widened would print 0.10000000149011612).
+// * `v = 3.0` decided `f64` by `s.apply(v: f64)`: 0.1 * 3.0 in f64. The f64 0.1 is
+//   3602879701896397 / 2^55, so the exact product is 10808639105689191 / 2^55 =
+//   5404319552844595.5 / 2^54, a tie between two doubles; ties-to-even picks 5404319552844596 / 2^54,
+//   printed `0.30000000000000004`.
+// * `n = 65536 * 65536` decided `i64` by `s.twice(n: i64)`: 2^32 * 2 = 8589934592 (as an `i32` the
+//   product wraps to 0).
+// * `q = 0.5` decided `f64` by `half.plus(q)` on a second receiver: 0.25 + 0.5 = 0.75, exact.
+
+struct Scale {
+    k: f64,
+}
+
+impl Scale {
+    fn of(k: f64) -> Scale {
+        return Scale { k: k };
+    }
+
+    fn apply(self, v: f64) -> f64 {
+        return self.k * v;
+    }
+
+    fn twice(self, n: i64) -> i64 {
+        return n * 2;
+    }
+
+    fn plus(self, d: f64) -> f64 {
+        return self.k + d;
+    }
+}
+
+fn main() -> i32 {
+    let k = 0.1;
+    let s = Scale::of(k);
+    println(s.k);
+
+    let v = 3.0;
+    println(s.apply(v));
+
+    let n = 65536 * 65536;
+    println(s.twice(n));
+
+    let half = Scale { k: 0.25 };
+    let q = 0.5;
+    println(half.plus(q));
+    return 0;
+}

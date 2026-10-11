@@ -4366,6 +4366,8 @@ impl<'a> Sema<'a> {
                             // struct literal's (same `(name, ty)` shape) — arity, unknown/duplicate
                             // fields, per-field type adaptation, and completeness.
                             Some(VariantPayload::Struct(named)) => {
+                                // A field value is a use at its declared type (`infer.rs`).
+                                self.constrain_field_literal_bindings(&named, fields);
                                 self.check_struct_literal(&named, fields, rest.is_some(), e.span);
                             }
                             Some(_) => self.error(
@@ -4396,6 +4398,10 @@ impl<'a> Sema<'a> {
                         };
                         match decl {
                             Some(decl) => {
+                                // A literal-initialized binding given to a field takes the field's
+                                // type if this is its first use (`infer.rs`): `let x = 0.1;
+                                // S { v: x }` with `v: f64` makes `x` an f64, as `f(x)` does.
+                                self.constrain_field_literal_bindings(&decl, fields);
                                 self.check_struct_literal(&decl, fields, rest.is_some(), e.span);
                                 Ty::Named(n)
                             }

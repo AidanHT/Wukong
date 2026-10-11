@@ -1,0 +1,59 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0.1
+// EXPECT-OUT: 4294967296
+// EXPECT-OUT: 200
+// EXPECT-OUT: 0.2
+// EXPECT-OUT: 1.5
+// EXPECT-OUT: 0.25
+module tests.run.literal_infer_struct_field
+
+// A `let` initialized from a bare literal takes the type of its first constraining use
+// (`infer.rs`), and a struct-literal field is such a use, at the field's declared type — exactly
+// as a call argument is at its parameter's. The field positions decided nothing before, so each
+// binding below kept its literal default (`f32`, `i32`) and every field store was the type
+// mismatch E0401 (`field `w` has type `f64`, but a value of type `f32` is given`).
+//
+// Expected values, from the scalar semantics of each binding at its decided type:
+// * `x = 0.1` decided `f64` by `w: f64`: the f64 nearest 0.1, printed as the shortest string that
+//   round-trips, `0.1` (the f32 0.1 widened would print 0.10000000149011612).
+// * `big = 65536 * 65536` decided `i64` by `n: i64`: the folded product 2^32 = 4294967296 (as an
+//   `i32` the product wraps to 0).
+// * `small = 200` decided `u8` by `k: u8`: 200, in range.
+// * `x + x` once `x` is an f64: 0.1 + 0.1 doubles 0x3FB999999999999A exactly, which is the f64
+//   nearest 0.2, printed `0.2`.
+// * A struct-payload enum variant's fields decide the same way: `hw = 1.5` and `hh = 0.25` become
+//   `f64` (both exact in binary), printed `1.5` and `0.25`.
+// Every field is printed on its own line; nothing is reduced.
+
+struct Sample {
+    w: f64,
+    n: i64,
+    k: u8,
+}
+
+enum Shape {
+    Rect { w: f64, h: f64 },
+}
+
+fn main() -> i32 {
+    let x = 0.1;
+    let big = 65536 * 65536;
+    let small = 200;
+    let s = Sample { w: x, n: big, k: small };
+    println(s.w);
+    println(s.n);
+    println(s.k);
+    println(x + x);
+
+    let hw = 1.5;
+    let hh = 0.25;
+    let r = Shape::Rect { w: hw, h: hh };
+    match r {
+        Shape::Rect { w, h } => {
+            println(w);
+            println(h);
+        }
+    }
+    return 0;
+}

@@ -255,6 +255,8 @@ linear_residual_src.wk: veckernel*1 wukong_sgemm_nt wukong_sgemm_nt*2 wukong_vel
 linear_silu.wk: wukong_sgemm_nt_epi
 linear_silu_store.wk: wukong_sgemm_nt_epi
 literal_infer_f64_accum.wk:
+literal_infer_method_arg.wk:
+literal_infer_struct_field.wk:
 log.wk:
 log_softmax.wk: wukong_norm_f32
 log_softmax_fused.wk: wukong_norm_f32
