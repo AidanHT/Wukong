@@ -4,8 +4,16 @@ An **honest** cross-language benchmark. For each kernel the *same* computation i
 — Wukong (compiled to native code by the from-scratch backend, **no LLVM**), C (`gcc -O3
 -march=native`), and Rust (`rustc -C opt-level=3 -C target-cpu=native`) — and all are timed through one
 identical Rust harness over the same buffers. C and Rust are built to shared libraries and called via
-their C ABI; Wukong is JIT-compiled in-process. The harness cross-checks a result checksum across every
-language. Many paths print a mismatch warning but still print timing ratios; a ratio from a mismatching row is invalid. Read the full log, not only its timing table. **C++ (`g++ -O3 -march=native
+their C ABI; Wukong is JIT-compiled in-process. The harness compares Wukong's whole output buffer
+against its peers (element by element, not a checksum), and the numerics gate makes that a condition of
+publishing a ratio rather than a warning beside one: a section whose check failed prints `-> SUSPECT:
+ratio withheld` in place of each ratio, a section that would have printed a ratio before any check of
+Wukong's output had run prints `-> UNCHECKED: ratio withheld`, both are named in the end-of-run summary,
+and either one makes the process exit 4 (`XBENCH_NUMERICS=report` keeps exit 0 for exploratory runs and
+says so). A clean exit means every printed ratio followed at least one passing check in its own section;
+it does not mean every peer column was checked - a peer that disagrees with Wukong is dropped, not
+gated. Logs from before this gate (2026-10) carry no such guarantee: read their `!` lines, not only their
+tables. **C++ (`g++ -O3 -march=native
 -ffp-contract=fast`)** is timed on every kernel family: the identical numeric body through the other
 GCC front end, cross-checked bit-for-bit against the C column, with a "vs C++" ratio printed beside
 every "vs C" ratio.
