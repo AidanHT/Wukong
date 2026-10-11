@@ -1041,12 +1041,35 @@ impl<'a> Parser<'a> {
                     self.ambiguous_continuation("indexes the expression above");
                     let bracket = self.span();
                     self.bump();
+                    // A range index `base[a..b]` (or `[a..]`, `[..b]`, `[..]`) is a sub-slice, not an
+                    // element: it desugars to a call (`parse_range_index`).
+                    if self.at_range_dots() {
+                        lhs = self.parse_range_index(start, bracket, lhs, None);
+                        continue;
+                    }
                     let mut indices = Vec::new();
+                    let mut range_lo = None;
                     while !self.at(T::RBracket) && !self.at(T::Eof) {
-                        indices.push(self.parse_expr());
+                        let ix = self.parse_expr();
+                        if self.at_range_dots() {
+                            if indices.is_empty() {
+                                range_lo = Some(ix);
+                                break;
+                            }
+                            self.mixed_range_index();
+                            self.bump();
+                            if !self.at(T::RBracket) && !self.at(T::Comma) && !self.at(T::Eof) {
+                                let _ = self.parse_expr();
+                            }
+                        }
+                        indices.push(ix);
                         if !self.eat(T::Comma) {
                             break;
                         }
+                    }
+                    if range_lo.is_some() {
+                        lhs = self.parse_range_index(start, bracket, lhs, range_lo);
+                        continue;
                     }
                     // `a[]` is not a slice-of-everything or any other construct — it is a missing
                     // index. The loop above happily produced `Index { indices: [] }`, which sema's
@@ -2143,6 +2166,94 @@ impl<'a> Parser<'a> {
         Ident { sym, span }
     }
 
+    /// Is the cursor at `..` or `..=` — the dots of a range?
+    fn at_range_dots(&self) -> bool {
+        self.at(T::DotDot) || self.at(T::DotDotEq)
+    }
+
+    /// `E0202` at the cursor: a range index combined with other indices (`t[0, 1..2]`).
+    fn mixed_range_index(&mut self) {
+        let sp = self.span();
+        self.error(
+            sp,
+            "E0202",
+            "a range index must be the only index: write `a[i..j]`, not a range mixed with other \
+             indices",
+        );
+    }
+
+    /// The rest of a range index `base[lo..hi]`, from its dots to the closing `]` (`lo` was parsed
+    /// already, or is absent in `base[..hi]`). It desugars to a call of a compiler builtin whose
+    /// name no source identifier can spell: `$slice(base, lo, hi)`, or `$slice_from(base, lo)` when
+    /// `hi` is absent. A missing `lo` is the integer literal `0` with a zero-width span at the
+    /// dots, and the callee path carries the `[` token's span, so a formatter can print the range
+    /// back exactly as written. Sema types the call (a `str` or a `[]T` base gives the same type
+    /// back) and `mir_build` lowers it to a bounds-checked sub-slice. A range is half-open, so
+    /// `..=` is `E0202`, as is a range mixed with other indices.
+    fn parse_range_index(
+        &mut self,
+        start: Span,
+        bracket: Span,
+        base: Expr,
+        lo: Option<Expr>,
+    ) -> Expr {
+        let dots = self.span();
+        if self.at(T::DotDotEq) {
+            self.error(
+                dots,
+                "E0202",
+                "a range index is half-open, so `..=` is not supported here: write `a..b+1`",
+            );
+        }
+        self.bump();
+        let hi = if self.at(T::RBracket) || self.at(T::Comma) || self.at(T::Eof) {
+            None
+        } else {
+            Some(self.parse_expr())
+        };
+        if self.at(T::Comma) {
+            self.mixed_range_index();
+            while self.eat(T::Comma) {
+                if self.at(T::RBracket) || self.at(T::Eof) {
+                    break;
+                }
+                let _ = self.parse_expr();
+            }
+        }
+        self.expect(T::RBracket);
+        let lo = match lo {
+            Some(lo) => lo,
+            None => Expr {
+                id: self.nid(),
+                kind: ExprKind::Int(self.interner.intern("0")),
+                span: Span::new(dots.source, dots.lo, dots.lo),
+            },
+        };
+        let sym = self.interner.intern(if hi.is_some() {
+            "$slice"
+        } else {
+            "$slice_from"
+        });
+        let callee = Expr {
+            id: self.nid(),
+            kind: ExprKind::Path(Path {
+                segments: vec![Ident { sym, span: bracket }],
+                span: bracket,
+            }),
+            span: bracket,
+        };
+        let mut args = vec![base, lo];
+        args.extend(hi);
+        self.finish_expr(
+            start,
+            ExprKind::Call {
+                callee: Box::new(callee),
+                generic_args: Vec::new(),
+                args,
+            },
+        )
+    }
+
     fn parse_for_iter(&mut self) -> ForIter {
         let start = self.parse_expr();
         if self.at(T::DotDot) || self.at(T::DotDotEq) {
@@ -2873,6 +2984,87 @@ mod tests {
     fn multi_index() {
         let s = expr("a[i, k]");
         assert!(s.starts_with("index"));
+    }
+
+    /// Parse `src`: its expression and the codes of its diagnostics.
+    fn expr_codes(src: &str) -> (Expr, Interner, Vec<Option<&'static str>>) {
+        let mut i = Interner::new();
+        let (e, d) = parse_expr_str(src, SourceId(0), &mut i);
+        let codes = d.iter().map(|x| x.code).collect();
+        (e, i, codes)
+    }
+
+    /// The callee name and arguments of a desugared range index.
+    fn range_call(e: &Expr, i: &Interner) -> (String, Vec<Expr>) {
+        match &e.kind {
+            ExprKind::Call { callee, args, .. } => match &callee.kind {
+                ExprKind::Path(p) => (i.resolve(p.first().sym).to_string(), args.clone()),
+                other => panic!("callee is not a path: {other:?}"),
+            },
+            other => panic!("did not desugar to a call: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn range_index_desugars_to_slice_calls() {
+        // `s[a..b]` and `s[..b]` are `$slice(s, lo, hi)`; `s[a..]` and `s[..]` are
+        // `$slice_from(s, lo)`. A missing lower bound is the literal `0`, zero-width at the dots.
+        for (src, want, n) in [
+            ("s[1..4]", "$slice", 3),
+            ("s[2..]", "$slice_from", 2),
+            ("s[..3]", "$slice", 3),
+            ("s[..]", "$slice_from", 2),
+        ] {
+            let (e, i, codes) = expr_codes(src);
+            assert!(codes.is_empty(), "`{src}` must parse clean: {codes:?}");
+            let (name, args) = range_call(&e, &i);
+            assert_eq!((name.as_str(), args.len()), (want, n), "`{src}`");
+            assert!(matches!(args[1].kind, ExprKind::Int(_)), "`{src}`");
+            if src.starts_with("s[..") {
+                assert_eq!(
+                    (args[1].span.lo, args[1].span.hi),
+                    (2, 2),
+                    "the synthesized `0` of `{src}` sits zero-width at `..`"
+                );
+                assert_eq!(
+                    i.resolve(match args[1].kind {
+                        ExprKind::Int(s) => s,
+                        _ => unreachable!(),
+                    }),
+                    "0"
+                );
+            }
+        }
+        // The callee path spans the `[`; the call spans the whole range index; a bound is any
+        // expression.
+        let (e, i, codes) = expr_codes("abc[i+1..n]");
+        assert!(codes.is_empty(), "{codes:?}");
+        let ExprKind::Call { callee, .. } = &e.kind else {
+            panic!("not a call")
+        };
+        assert_eq!((callee.span.lo, callee.span.hi), (3, 4));
+        assert_eq!((e.span.lo, e.span.hi), (0, 11));
+        let (_, args) = range_call(&e, &i);
+        assert!(matches!(args[1].kind, ExprKind::Binary { .. }));
+        // A range index chains like any other postfix.
+        assert!(expr("s[1..][0]").starts_with("index"));
+        assert!(expr("(s[..2])[1]").starts_with("index"));
+    }
+
+    #[test]
+    fn range_index_errors() {
+        // A range mixed with other indices, and an inclusive range, are E0202.
+        for src in ["t[0, 1..2]", "t[1..2, 0]", "s[1..=2]"] {
+            let (_, _, codes) = expr_codes(src);
+            assert!(
+                codes.contains(&Some("E0202")),
+                "`{src}` must be an E0202: {codes:?}"
+            );
+        }
+        // `..=` recovers to the call it would have been.
+        let (e, i, _) = expr_codes("s[1..=2]");
+        let (name, args) = range_call(&e, &i);
+        assert_eq!((name.as_str(), args.len()), ("$slice", 3));
     }
 
     #[test]
