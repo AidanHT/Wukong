@@ -1059,7 +1059,10 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
         .expect("iv_verdict accepted a primary induction variable")];
     let iv_index = iv.param_index;
     let iv_ty = iv.ty.clone();
-    let dir = iv.step.as_const().expect("iv_verdict accepted a constant step");
+    let dir = iv
+        .step
+        .as_const()
+        .expect("iv_verdict accepted a constant step");
     // A countdown widens the plain shapes: contiguous accesses (reversed per part), if-conversion,
     // replication and the order-free and serial reductions. What reads "later" as "a larger
     // counter" — a search's header bound, an arm's bounds check, an argmax's or FindLastIV's
@@ -1071,7 +1074,10 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
         if !len_checks.is_empty() {
             return Err("a bounds check in a countdown's arm");
         }
-        if l.reductions.iter().any(|r| r.arg.is_some() || r.kind == RedKind::FindLast) {
+        if l.reductions
+            .iter()
+            .any(|r| r.arg.is_some() || r.kind == RedKind::FindLast)
+        {
             return Err("an index-recording reduction in a countdown");
         }
     }
@@ -1769,7 +1775,9 @@ impl TreeWalk<'_> {
             }
             match &inst.op {
                 Op::Store { ptr, value } if self.branched => {
-                    let here = self.access(b, idx).ok_or("a store in the body has no analyzed address")?;
+                    let here = self
+                        .access(b, idx)
+                        .ok_or("a store in the body has no analyzed address")?;
                     if !matches!(here.addr, AddrForm::Affine { .. }) {
                         return Err("an if-converted store does not step with the loop");
                     }
@@ -1887,9 +1895,9 @@ impl TreeWalk<'_> {
                     }
                     self.branched = true;
                     let side = |me: &mut Self,
-                                    blk: BlockId,
-                                    direct: &[ValueId],
-                                    pol: bool|
+                                blk: BlockId,
+                                direct: &[ValueId],
+                                pol: bool|
                      -> Result<Vec<ValueId>, &'static str> {
                         if blk == j {
                             return Ok(direct.to_vec());
@@ -2101,7 +2109,12 @@ fn linearize_tree(
             _ => return Err("the header does not enter the body through one block"),
         }
     };
-    let region: Vec<BlockId> = l.blocks.iter().copied().filter(|&b| b != l.header).collect();
+    let region: Vec<BlockId> = l
+        .blocks
+        .iter()
+        .copied()
+        .filter(|&b| b != l.header)
+        .collect();
 
     // ---- bounds checks and the region graph ---------------------------------------------------
     let mut asserts: FxHashMap<u32, (BlockId, LenCheck)> = FxHashMap::default();
@@ -2171,7 +2184,9 @@ fn linearize_tree(
         } else {
             let mut it = out.iter().map(|t| pdom[&t.0].clone());
             let first = it.next().expect("non-empty");
-            it.fold(first, |acc, s| acc.into_iter().filter(|x| s.contains(x)).collect())
+            it.fold(first, |acc, s| {
+                acc.into_iter().filter(|x| s.contains(x)).collect()
+            })
         };
         set.push(b.0);
         pdom.insert(b.0, set);
@@ -2260,8 +2275,7 @@ fn linearize_tree(
         let a = w
             .access(*block, *idx)
             .ok_or("a load in the body has no analyzed address")?;
-        let covered =
-            speculable_ptr_load(f, a) || unconditional.iter().any(|b| same_place(a, b));
+        let covered = speculable_ptr_load(f, a) || unconditional.iter().any(|b| same_place(a, b));
         if covered {
             *s = LinInst::Real {
                 block: *block,
@@ -2273,7 +2287,10 @@ fn linearize_tree(
     }
 
     // ---- the sunk stores, then the latch --------------------------------------------------------
-    let tree = simplify_tree(std::mem::replace(&mut w.tree, StoreTree::Keep), &mut Vec::new());
+    let tree = simplify_tree(
+        std::mem::replace(&mut w.tree, StoreTree::Keep),
+        &mut Vec::new(),
+    );
     if let Some((ptr, at)) = w.store_at {
         if tree != StoreTree::Keep {
             lin.push(LinInst::TreeStore { ptr, tree, at });
@@ -4649,12 +4666,18 @@ fn emit_alias_checks(e: &mut Emit<'_>, p: &VecPlan, guard: BlockId) -> Option<Va
     let (start, end) = match &p.trip {
         TripPlan::Const(n) if p.dir > 0 => {
             let k = e.int(guard, &p.iv_ty, *n as i64);
-            (start, e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Add, start, k)))
+            (
+                start,
+                e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Add, start, k)),
+            )
         }
         TripPlan::Const(n) => {
             let k = e.int(guard, &p.iv_ty, *n as i64 - 1);
             let lo = e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Sub, start, k));
-            (lo, e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Add, start, one)))
+            (
+                lo,
+                e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Add, start, one)),
+            )
         }
         TripPlan::Runtime { end, .. } => (start, *end),
         TripPlan::RuntimeDown { end, inclusive, .. } => {
@@ -4663,7 +4686,10 @@ fn emit_alias_checks(e: &mut Emit<'_>, p: &VecPlan, guard: BlockId) -> Option<Va
             } else {
                 e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Add, *end, one))
             };
-            (lo, e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Add, start, one)))
+            (
+                lo,
+                e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Add, start, one)),
+            )
         }
     };
 
@@ -8883,7 +8909,10 @@ mod tests {
                    return i; }";
         let shape = format!("{k} fn main() -> i32 {{ return 0; }}");
         assert!(is_widened(&shape, "find"), "a [f32; 37] parameter search");
-        assert!(is_widened(&shape, "tfind"), "a Tensor[f32, 37] parameter search");
+        assert!(
+            is_widened(&shape, "tfind"),
+            "a Tensor[f32, 37] parameter search"
+        );
         scalar_and_vector_agree(&format!(
             "{k} fn main() -> i32 {{ let mut a: [f32; 37] = [0.0; 37]; let mut j: i64 = 0; \
              while j < 37 {{ a[j] = j as f32; j = j + 1; }} \
@@ -8947,8 +8976,7 @@ mod tests {
         assert!(is_widened(&shape, "k"), "an else-if chain did not widen");
         let ops = ops_of(&shape, "k");
         assert!(
-            !ops.iter()
-                .any(|op| matches!(op, Op::Alloca { .. })),
+            !ops.iter().any(|op| matches!(op, Op::Alloca { .. })),
             "a complete chain needs no per-lane scratch: {ops:?}"
         );
         // Every trip 0..=29 (the counter is runtime after inlining), the buffer reset each time.
@@ -8969,7 +8997,10 @@ mod tests {
                    if v > 1.0 { o[i] = v * 2.0; } else if v > 0.0 { o[i] = v + 10.0; } \
                    i = i + 1; } }";
         let shape = format!("{k} fn main() -> i32 {{ return 0; }}");
-        assert!(is_widened(&shape, "k"), "a partial else-if chain did not widen");
+        assert!(
+            is_widened(&shape, "k"),
+            "a partial else-if chain did not widen"
+        );
         scalar_and_vector_agree(&format!(
             "{k} fn main() -> i32 {{ {CHAIN_DATA} k(x, o, 29); {} return 0; }}",
             print_o(29)
@@ -8985,7 +9016,10 @@ mod tests {
                      else { 0.0 - v }; \
                    o[i] = r; i = i + 1; } }";
         let shape = format!("{k} fn main() -> i32 {{ return 0; }}");
-        assert!(is_widened(&shape, "k"), "an else-if value chain did not widen");
+        assert!(
+            is_widened(&shape, "k"),
+            "an else-if value chain did not widen"
+        );
         scalar_and_vector_agree(&format!(
             "{k} fn main() -> i32 {{ {CHAIN_DATA} k(x, o, 27); {} return 0; }}",
             print_o(29)
@@ -9092,7 +9126,8 @@ mod tests {
         }
         let ops = ops_of(&shape, "down");
         assert!(
-            ops.iter().any(|op| matches!(op, Op::Shuffle { mask, .. } if mask == &vec![3, 2, 1, 0])),
+            ops.iter()
+                .any(|op| matches!(op, Op::Shuffle { mask, .. } if mask == &vec![3, 2, 1, 0])),
             "a countdown reverses its lanes: {ops:?}"
         );
         scalar_and_vector_agree(&format!(
@@ -9120,7 +9155,10 @@ mod tests {
                  while i > 0 { i = i - 1; o[i] = (q[i] as f32) * 0.5; } }";
         let shape = format!("{k} fn main() -> i32 {{ return 0; }}");
         let vs = vector_values(&shape, "k");
-        assert!(vs.contains(&(MirType::I8, 16)), "no 16-lane byte vector: {vs:?}");
+        assert!(
+            vs.contains(&(MirType::I8, 16)),
+            "no 16-lane byte vector: {vs:?}"
+        );
         scalar_and_vector_agree(&format!(
             "{k} fn main() -> i32 {{ let mut q: []u8 = alloc_u8(41); let mut o: []f32 = alloc_f32(41); \
              let mut j: i64 = 0; while j < 41 {{ q[j] = ((j * 37 + 11) % 251) as u8; j = j + 1; }} \
@@ -9248,8 +9286,14 @@ mod tests {
                    let mut i: u64 = s; while i < e { acc = acc + x[i]; i = i + 1; } \
                    return acc; }";
         let shape = format!("{k} fn main() -> i32 {{ return 0; }}");
-        assert!(is_widened(&shape, "k"), "the i32-counter reduction did not widen");
-        assert!(is_widened(&shape, "u"), "the u64-counter reduction did not widen");
+        assert!(
+            is_widened(&shape, "k"),
+            "the i32-counter reduction did not widen"
+        );
+        assert!(
+            is_widened(&shape, "u"),
+            "the u64-counter reduction did not widen"
+        );
         let src = format!(
             "{k} fn main() -> i32 {{ let mut x: []i32 = alloc_i32(16); \
              let mut j: i64 = 0; while j < 16 {{ x[j] = (j as i32) + 1; j = j + 1; }} \
