@@ -814,10 +814,13 @@ fn runtime_abi_table_is_the_runtime_source() {
         ("double".into(), v(&["double", "i64"]))
     );
     assert_eq!(sig("wukong_now_ns"), ("i64".into(), v(&[])));
-    let rendered = render_runtime_abi(&abi);
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime_abi.rs");
+    // Regenerating is a bless: write the table and stop. This binary was compiled from the OLD
+    // table, so checking it here would fail on exactly the run that regenerated it; the next build
+    // compiles the new file and the checks below hold it to the sources.
     if std::env::var_os("WUKONG_UPDATE_RUNTIME_ABI").is_some() {
-        std::fs::write(&path, &rendered).unwrap();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime_abi.rs");
+        std::fs::write(&path, render_runtime_abi(&abi)).unwrap();
+        return;
     }
     let table: CAbi = runtime_abi::RUNTIME_ABI
         .iter()

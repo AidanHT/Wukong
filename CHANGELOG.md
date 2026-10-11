@@ -27,6 +27,9 @@ All notable changes to Wukong are documented here. The format is loosely based o
   zero, `tools/verify_llvm_corpus.py` reports them, and `docs/llvm-setup.md` shows the exact fib module.
 - **`WUKONG_MAX_ISA` caps Cranelift's `native` flags (N46).** `scalar` is the x86-64 baseline,
   `avx2` at most x86-64-v3, `avx512` at most x86-64-v4; uncapped code is byte-identical.
+- **`WUKONG_UPDATE_RUNTIME_ABI=1` regenerates the LLVM runtime-ABI table in one run.** It writes
+  `src/runtime_abi.rs` and returns, rather than checking the table compiled into the running test
+  binary, which is the old one and failed the very run that regenerated it; the next run checks it.
 - **Stack slots of 32 bytes or more are 32-byte aligned (P11.7)** — by a run-time round-up, because
   Cranelift never realigns a frame whose base is only 16-byte aligned.
 
