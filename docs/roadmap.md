@@ -376,7 +376,10 @@ another architecture or OS is not supported. A native-backend failure is a catal
   `Tensor[T, ..]` operand, checked per instantiation: `T` bound to the builtin's element dispatches
   it (`mm$f32` reaches `wukong_sgemm`, `tests/run/dtype_generic_builtin.wk`), any other binding is
   `E0415` / `E0416`. Sharp edges: a `[]T` / `[T; N]` builtin operand is not deferred the same way
-  (still the plain mismatch), and an in-body recognizer that reads sema's generic-body types declines
+  (still the plain mismatch); the decode builtins (`sdpa_kv`, `gemv_bf16`, …) take no
+  `Tensor[T, ..]` operand (`E0437`); an instance past the re-check's 512-instance budget is not
+  re-checked, so a wrong element there is a `C0001` codegen refusal rather than `E0415`/`E0416`;
+  and an in-body recognizer that reads sema's generic-body types declines
   on an instance rather than firing (the instance lowers as ordinary loops). Generic structs
   (`Buf<T>`) are not monomorphized.
 - **Type aliases.** `type Real = f32;` and generic `type Mat<M, N> = Tensor[Real, M, N];` (type,

@@ -17,8 +17,9 @@
 //!   the hand-written `bf16` function.
 //!
 //! **Builtins with a fixed element.** A named kernel builtin (`matmul`, `softmax`, `sdpa`, …) takes
-//! only `f32` buffers, and a typed file-I/O builtin (`read_bf16`, `write_f32`, …) moves the one
-//! element type its name spells. A generic body cannot promise either, so a generic-element tensor
+//! only `f32` buffers, and a typed builtin of the ML I/O family (`read_bf16`, `write_f32`,
+//! `st_read_f32`, `topk_f32`, …) moves the one element type its name spells. A generic body cannot
+//! promise either, so a generic-element tensor
 //! operand is checked **per instantiation**, like every other `T`-dependent rule: the generic body
 //! pass accepts `Tensor[T, ..]` there (and records the call once — its dimensions never depend on
 //! `T`, so the one record serves every instance), and each concrete instantiation is re-checked
@@ -28,6 +29,13 @@
 //! is `E0415` (kernel builtin) or `E0416` (typed I/O builtin), reported at the operand with the
 //! instantiation that required it. A `[]T` slice or `[T; N]` array operand is still the plain
 //! element mismatch: only the dtype-generic tensor is a deferred element.
+//!
+//! The re-check covers a bounded number of instances (`instantiate.rs`'s `MAX_INSTANCES`) while
+//! mir_build lowers every one, so each deferring family also refuses, as a codegen limit (`C0001`),
+//! an operand whose substituted element is wrong: `builtin_operands_are_f32` for the kernel
+//! builtins, `MlBuiltin::buffer_elem` for the ML I/O family. The decode builtins (`sdpa_kv`,
+//! `gemv_bf16`, …) share the I/O family's operand check but have no such backstop, so they do not
+//! defer: a `Tensor[T, ..]` operand of one is `E0437` in the generic body.
 //!
 //! `alloc::<T>(n)` is the generic heap allocator: `T` is a scalar or a type parameter, the result
 //! is a zeroed `[]T` of `n` elements, and each instance lowers to the per-scalar `alloc_<T>` it
@@ -296,5 +304,31 @@ mod tests {
         let read = "fn load<T>(mut y: Tensor[T, 4]) -> i64 { return read_f32(\"t.bin\", y); } \
                     fn main() -> i32 { let mut y: [f32; 4] = [0.0; 4]; return load(y) as i32; }";
         assert!(check(read).1.is_empty());
+        // The rest of the ML family (`topk_f32`, …) follows the same rule.
+        let topk = |elem: &str| {
+            format!(
+                "fn top<T>(x: Tensor[T, 8], mut v: [f32; 2], mut i: [i64; 2]) -> i64 {{ \
+                 return topk_f32(x, v, i); }} \
+                 fn main() -> i32 {{ let x: [{elem}; 8] = [1.0; 8]; \
+                 let mut v: [f32; 2] = [0.0; 2]; let mut i: [i64; 2] = [0; 2]; \
+                 return top(x, v, i) as i32; }}"
+            )
+        };
+        assert!(check(&topk("f32")).1.is_empty());
+        assert_eq!(check(&topk("f64")).1, ["E0416"]);
+    }
+
+    /// The decode builtins share the ML family's operand check but not its lowering backstop for an
+    /// instance the re-check never reached (`MlBuiltin::buffer_elem`), so they do not defer: a
+    /// `Tensor[T, ..]` operand is the plain `E0437` of the generic body, even when every instance
+    /// would bind `T = f32`.
+    #[test]
+    fn a_decode_builtin_does_not_defer_a_dtype_generic_element() {
+        let (_, codes) = check(
+            "fn app<T>(mut c: Tensor[T, 8], r: Tensor[T, 4]) { kv_append(c, r, 0, 4); } \
+             fn main() -> i32 { let mut c: [f32; 8] = [0.0; 8]; let r: [f32; 4] = [1.0; 4]; \
+             app(c, r); return 0; }",
+        );
+        assert_eq!(codes, ["E0437", "E0437"]);
     }
 }

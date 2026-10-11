@@ -18,7 +18,10 @@ All notable changes to Wukong are documented here. The format is loosely based o
   4, 4], ..) { matmul(a, ..) }` was `E0502` in the generic body; it is now checked per
   instantiation, so `mm$f32` dispatches `wukong_sgemm` (`tests/run/dtype_generic_builtin.wk`), and
   an instance binding `T` to another element is the new `E0415` (kernel builtin) or `E0416` (typed
-  file-I/O builtin such as `write_f32`).
+  file-I/O builtin such as `write_f32`). Sema re-checks at most 512 instances, so both families'
+  lowerings also refuse (`C0001`) a wrong element in an instance past that budget instead of
+  handing the runtime a buffer of another type; the decode builtins (`sdpa_kv`, `gemv_bf16`, …),
+  which have no such backstop, keep refusing a `Tensor[T, ..]` operand (`E0437`).
 
 ### Index-recording reductions (`gap3/vec-argmax`)
 

@@ -159,9 +159,13 @@ fixed-array local's own `alloca`, or a fixed-array/static-tensor parameter bound
 and a parameter, or two parameters `alias::plan_kernel_alias` answers `Dispatch` for or a `@noalias`
 promise separates — gets no overlap test, so a fully static call is one bare `wukong_attention_f32`
 in a straight-line block that `wukong_autodiff` differentiates. A dtype-generic `Tensor[T, ..]`
-builtin operand is accepted in the generic body and re-checked per instance (`E0415` kernel /
-`E0416` typed I/O when `T` is not the builtin's element); mir_build declines (`C0001`) a non-`f32`
-operand that reaches lowering anyway. The **decode builtins** (`sdpa_kv`,
+operand of a kernel builtin or of the ML I/O family (`read_*`/`write_*`, `st_read_*`, `topk_f32`, …)
+is accepted in the generic body and re-checked per instance (`E0415` kernel / `E0416` I/O when `T`
+is not the builtin's element). That re-check stops at 512 instances while the monomorphizer lowers
+them all, so each family's lowering refuses (`C0001`) an operand whose substituted element is still
+wrong — `builtin_operands_are_f32` (kernel) and `MlBuiltin::buffer_elem` (I/O). The decode builtins
+have no such backstop and do not defer: a `Tensor[T, ..]` operand of one is `E0437` in the generic
+body. The **decode builtins** (`sdpa_kv`,
 `kv_append`, `gemv_bf16`/`gemv_f16`, `quantize_q{8,4}_0`, `gemv_q{8,4}_0`) are typed in
 `wukong_sema::decode_builtins` and lowered in `wukong_mir_build::decode_builtins` to one checked
 runtime call each (`wukong_runtime::{attention_kv, gemv_half, quant}`): their extents are values, so

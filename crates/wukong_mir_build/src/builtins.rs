@@ -1271,6 +1271,37 @@ mod tests {
         assert_eq!((attn, asserts, allocs), (1, 0, 0), "one bare call");
     }
 
+    /// N18's kernel half past sema's instance re-check budget: an `f64` instance of a dtype-generic
+    /// `matmul` / `sdpa` caller is never re-checked (no `E0415`), so the lowering's own element
+    /// test (`builtin_operands_are_f32`) is all that keeps an `f64` buffer from the `f32` kernel.
+    #[test]
+    fn an_unchecked_instance_never_reaches_a_kernel_builtin_at_the_wrong_element() {
+        use crate::ml_builtins::tests::{calls, check_and_lower, past_the_recheck_budget};
+        let decls = "fn mm<T>(a: Tensor[T, 2, 2], mut c: Tensor[T, 2, 2]) { matmul(a, a, c); }\n\
+                     fn at<T>(q: Tensor[T, 2, 2], mut o: Tensor[T, 2, 2]) { \
+                     sdpa(q, q, q, o, 2, 2, 0.5, 0); }";
+        let tail = |elem: &str| {
+            format!(
+                "    let a: [{elem}; 4] = [1.0; 4];\n    let mut c: [{elem}; 4] = [0.0; 4];\n    \
+                 mm(a, c);\n    at(a, c);\n    return 0;"
+            )
+        };
+        let (sema, lower, prog, it) =
+            check_and_lower(&past_the_recheck_budget(decls, &tail("f64")));
+        assert!(
+            sema.is_empty(),
+            "the premise: no re-check reached `mm`/`at` ({sema:?})"
+        );
+        assert_eq!(lower, ["C0001", "C0001"], "one refusal per call");
+        assert_eq!(calls(&prog, &it, "wukong_sgemm"), 0);
+        assert_eq!(calls(&prog, &it, "wukong_attention_f32"), 0);
+        // Control: at `T = f32` both calls lower.
+        let (sema, lower, prog, it) =
+            check_and_lower(&past_the_recheck_budget(decls, &tail("f32")));
+        assert!(sema.is_empty() && lower.is_empty(), "{sema:?} {lower:?}");
+        assert!(calls(&prog, &it, "wukong_attention_f32") >= 1);
+    }
+
     #[test]
     fn an_sdpa_dimension_outside_the_abi_is_a_codegen_limit() {
         let mut interner = Interner::new();

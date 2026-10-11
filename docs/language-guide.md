@@ -192,14 +192,15 @@ fn axpy<T, N>(a: T, x: Tensor[T, N], mut y: Tensor[T, N]) {
 concrete element in every tensor type (`tests/run/dtype_generic_tensor.wk`). An array of structs fed to a
 `Tensor[T, ..]` parameter is `E0502` (a tensor element is a scalar). A named kernel builtin
 (`matmul`, `softmax`, `sdpa`, …) takes `f32` buffers and a typed file-I/O builtin (`read_bf16`,
-`write_f32`, …) the one element type it names, so a `Tensor[T, ..]` operand of one is checked **per
+`write_f32`, `st_read_f32`, `topk_f32`, …) the one element type it names, so a `Tensor[T, ..]` operand of one is checked **per
 instantiation**: the generic body is accepted, an instance that binds `T` to the builtin's element
 reaches it exactly like the hand-written function (`fn mm<T>(a: Tensor[T, 4, 4], ..) { matmul(a, ..) }`
 instantiated at `f32` dispatches `wukong_sgemm`, `tests/run/dtype_generic_builtin.wk`), and any other
 binding is **`E0415`** (kernel builtin, `tests/fail/dtype_generic_builtin_elem.wk`) or **`E0416`**
 (typed I/O builtin, `tests/fail/dtype_generic_io_elem.wk`) at the operand, labelled with the call
 that required the instance. A `[]T` slice or `[T; N]` array operand of a builtin is still the plain
-element mismatch inside the generic body. `alloc::<T>(n)` is the generic heap
+element mismatch inside the generic body, and the decode builtins (`sdpa_kv`, `kv_append`,
+`gemv_bf16`, …) take no `Tensor[T, ..]` operand at all (`E0437`). `alloc::<T>(n)` is the generic heap
 allocator — a zeroed `[]T`, the same buffer `alloc_<T>(n)` returns, with `T` a scalar or a type
 parameter (anything else is `E0325`).
 

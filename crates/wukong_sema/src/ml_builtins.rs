@@ -165,6 +165,60 @@ enum Arg {
     Buf(Scalar, bool),
 }
 
+/// The argument list and result type of `b` — the one table both the type checker
+/// ([`Sema::type_ml_builtin`]) and the lowering's element backstop ([`MlBuiltin::buffer_elem`])
+/// read.
+fn signature(b: MlBuiltin) -> (Vec<Arg>, Ty) {
+    use Arg::{Buf, Float, Int, Str};
+    let i64_ty = Ty::Scalar(Scalar::I64);
+    let f32_ty = Ty::Scalar(Scalar::F32);
+    match b {
+        MlBuiltin::Read(t) | MlBuiltin::NpyRead(t) => (vec![Str("path"), Buf(t, true)], i64_ty),
+        MlBuiltin::Write(t) => (vec![Str("path"), Buf(t, false)], i64_ty),
+        MlBuiltin::ReadAt(t) => (vec![Str("path"), Int("byte offset"), Buf(t, true)], i64_ty),
+        MlBuiltin::FileSize => (vec![Str("path")], i64_ty),
+        MlBuiltin::StRead(t) => (vec![Str("path"), Str("tensor name"), Buf(t, true)], i64_ty),
+        MlBuiltin::RandU32 => (vec![Int("seed"), Int("counter")], Ty::Scalar(Scalar::U32)),
+        MlBuiltin::RandF32 | MlBuiltin::RandnF32 => (vec![Int("seed"), Int("counter")], f32_ty),
+        MlBuiltin::RandFill => (
+            vec![Buf(Scalar::F32, true), Int("seed"), Int("counter")],
+            Ty::Unit,
+        ),
+        MlBuiltin::TopK => (
+            vec![
+                Buf(Scalar::F32, false),
+                Buf(Scalar::F32, true),
+                Buf(Scalar::I64, true),
+            ],
+            i64_ty,
+        ),
+        MlBuiltin::Argsort { .. } => (
+            vec![Buf(Scalar::F32, false), Buf(Scalar::I64, true)],
+            i64_ty,
+        ),
+        MlBuiltin::SampleCategorical => (
+            vec![Buf(Scalar::F32, false), Float("uniform variate")],
+            i64_ty,
+        ),
+    }
+}
+
+impl MlBuiltin {
+    /// The element type argument `i` must hold when it is a buffer operand, else `None`.
+    ///
+    /// For the lowering's backstop (`wukong_mir_build::ml_builtins`): a dtype-generic
+    /// `Tensor[T, ..]` operand is accepted in the generic body and its element is checked per
+    /// instantiation (`E0416`), but `instantiate.rs` re-checks a bounded number of instances, while
+    /// the monomorphizer lowers all of them. An instance past that budget must not hand a buffer of
+    /// another element to the runtime, which reads the bytes as this type.
+    pub fn buffer_elem(self, i: usize) -> Option<Scalar> {
+        match signature(self).0.get(i)? {
+            Arg::Buf(t, _) => Some(*t),
+            _ => None,
+        }
+    }
+}
+
 /// The ordinal word for argument `i` in a diagnostic.
 fn ordinal(i: usize) -> &'static str {
     ["first", "second", "third", "fourth"]
@@ -186,37 +240,7 @@ impl Sema<'_> {
     ) -> Option<Ty> {
         use Arg::{Buf, Float, Int, Str};
         let b = ml_builtin(name)?;
-        let i64_ty = Ty::Scalar(Scalar::I64);
-        let f32_ty = Ty::Scalar(Scalar::F32);
-        let (sig, ret): (Vec<Arg>, Ty) = match b {
-            MlBuiltin::Read(t) | MlBuiltin::NpyRead(t) => (vec![Str("path"), Buf(t, true)], i64_ty),
-            MlBuiltin::Write(t) => (vec![Str("path"), Buf(t, false)], i64_ty),
-            MlBuiltin::ReadAt(t) => (vec![Str("path"), Int("byte offset"), Buf(t, true)], i64_ty),
-            MlBuiltin::FileSize => (vec![Str("path")], i64_ty),
-            MlBuiltin::StRead(t) => (vec![Str("path"), Str("tensor name"), Buf(t, true)], i64_ty),
-            MlBuiltin::RandU32 => (vec![Int("seed"), Int("counter")], Ty::Scalar(Scalar::U32)),
-            MlBuiltin::RandF32 | MlBuiltin::RandnF32 => (vec![Int("seed"), Int("counter")], f32_ty),
-            MlBuiltin::RandFill => (
-                vec![Buf(Scalar::F32, true), Int("seed"), Int("counter")],
-                Ty::Unit,
-            ),
-            MlBuiltin::TopK => (
-                vec![
-                    Buf(Scalar::F32, false),
-                    Buf(Scalar::F32, true),
-                    Buf(Scalar::I64, true),
-                ],
-                i64_ty,
-            ),
-            MlBuiltin::Argsort { .. } => (
-                vec![Buf(Scalar::F32, false), Buf(Scalar::I64, true)],
-                i64_ty,
-            ),
-            MlBuiltin::SampleCategorical => (
-                vec![Buf(Scalar::F32, false), Float("uniform variate")],
-                i64_ty,
-            ),
-        };
+        let (sig, ret) = signature(b);
         if args.len() != sig.len() {
             let want: Vec<String> = sig
                 .iter()
@@ -324,6 +348,11 @@ impl Sema<'_> {
     ) {
         let span = arg.span;
         let want = Ty::Scalar(elem);
+        // Only this family's own builtins defer a dtype-generic element: their lowering refuses an
+        // instance the re-check never reached (`MlBuiltin::buffer_elem`). The decode builtins
+        // (`decode_builtins.rs`) share this operand check but not that backstop, so for them a
+        // `Tensor[T, ..]` stays the plain `E0437` of the generic body.
+        let defers = ml_builtin(name).is_some();
         let ok = match ty {
             Ty::Slice(e) => **e == want,
             Ty::Array { elem: e, .. } => **e == want,
@@ -336,7 +365,7 @@ impl Sema<'_> {
                 shape,
                 layout,
                 elem_var,
-            } if elem_var.is_some() || *e == elem => {
+            } if (elem_var.is_some() && defers) || (elem_var.is_none() && *e == elem) => {
                 if *layout != Layout::Contiguous {
                     self.error(
                         span,
@@ -371,7 +400,7 @@ impl Sema<'_> {
                 elem: e,
                 elem_var: None,
                 ..
-            } if self.rechecking_instance() => {
+            } if defers && self.rechecking_instance() => {
                 self.error(
                     span,
                     "E0416",
