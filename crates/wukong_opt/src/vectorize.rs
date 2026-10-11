@@ -120,10 +120,11 @@
 //!     x1 WIDEN bb25 w=4 lin=12 guards=1 reds=0
 //! ```
 //!
-//! (Those lines predate two fields the line now ends with: `guards` counts point checks as well as
-//! pairs, and `cost=V/S` is the cost model's estimate for one group — vector operations against
-//! `W` scalar iterations, [`estimate_cost`]. The estimate is reported, not enforced; the one cost
-//! limit applied is [`MAX_GUARD_PAIRS`].)
+//! (Those lines predate two fields the line now ends with: `guards` counts point checks — and
+//! an arm's bounds checks — as well as pairs, and `cost=V/S` is the cost model's estimate for one
+//! group — vector operations against `W` scalar iterations, [`estimate_cost`]. A loop whose `V`
+//! exceeds its `S` is declined ([`cost_declines`]; `WUKONG_VEC_COST=0` turns that off), and the
+//! runtime alias guard has its own budget, [`MAX_GUARD_PAIRS`].)
 //!
 //! `bb19` is the loss's fused forward+backward pass, and it is the one the **lane ramp** unlocked:
 //! it reads its counter as a *value* (`if c == target`), which used to be a flat decline. See
@@ -585,7 +586,7 @@ struct VecPlan {
     /// replicated: those take `i + k` per lane instead.
     ramp_vector: bool,
     /// The cost model's estimate for one group, `(vector, scalar)` ([`estimate_cost`]). Reported
-    /// by `WUKONG_VEC_TRACE`; not a gate.
+    /// by `WUKONG_VEC_TRACE`; a plan only exists when `vector <= scalar` ([`cost_declines`]).
     cost: (u64, u64),
     /// A search loop's early exit, tested once per group ([`EarlyExit`]).
     early: Option<EarlyExit>,
@@ -1225,7 +1226,7 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
     // ---- cost ---------------------------------------------------------------------------------
     // The guard is evaluated on every entry to the loop — once per row of a row-wise inner loop —
     // and grows with the square of the stream count, so it has a budget (LLVM's
-    // `-runtime-memory-check-threshold`). The rest of the model is an estimate, reported only.
+    // `-runtime-memory-check-threshold`). The rest of the model is the per-group estimate below.
     if guards.len() + point_guards.len() > MAX_GUARD_PAIRS {
         return Err("more runtime alias checks than one loop entry amortizes");
     }
@@ -1246,6 +1247,9 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
     if early.is_some() {
         // The lane test: a reduction over the mask's lanes, an extract and a branch.
         cost.0 += 2 + 2 * u64::from(w.trailing_zeros());
+    }
+    if cost_declines(cost, cost_model_enforced()) {
+        return Err("the vector body costs more than its W scalar iterations");
     }
 
     Ok(VecPlan {
@@ -1279,6 +1283,18 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
 /// streams; a loop entered once per row of a short row pays all of them every time.
 const MAX_GUARD_PAIRS: usize = 8;
 
+/// Does the cost model decline a loop whose one group costs `(vector, scalar)`? When the vector
+/// body is estimated to cost more than the `W` scalar iterations it replaces — and the model is
+/// on (`WUKONG_VEC_COST=0` turns it off, for a same-run A/B of the rule itself).
+fn cost_declines((vector, scalar): (u64, u64), enforced: bool) -> bool {
+    enforced && vector > scalar
+}
+
+/// Is the cost model's threshold enforced? Everything but `WUKONG_VEC_COST=0` says yes.
+fn cost_model_enforced() -> bool {
+    std::env::var_os("WUKONG_VEC_COST").is_none_or(|v| v != "0")
+}
+
 /// One pass through a loop's control: the counter step, the exit compare and the branch.
 const LOOP_OVERHEAD: u64 = 3;
 
@@ -1292,10 +1308,13 @@ const LOOP_OVERHEAD: u64 = 3;
 /// accumulate is guarded. The scalar side is `w` passes through the original body, taking the
 /// longer arm of an if-converted branch, plus the loop overhead each.
 ///
-/// It is **reported** (`WUKONG_VEC_TRACE`), not enforced: no table has been tuned against a
-/// same-run A/B with `WUKONG_NO_VECTORIZE`, and a model that declines loops on an untuned guess
-/// trades measured wins for an unmeasured hunch. [`MAX_GUARD_PAIRS`] is the one limit that needs no
-/// tuning to be right.
+/// It is **enforced** at its one obvious threshold ([`cost_declines`]): a group whose vector
+/// operations outnumber the `W` scalar iterations it replaces is declined. That is the only cut
+/// the table can make without tuning — no weight here has been fitted to a same-run release A/B
+/// against `WUKONG_NO_VECTORIZE`, so the model never declines a loop it merely thinks is a small
+/// win, and a lower threshold is a later, measured change. Over `tests/run` the rule declined only
+/// bodies the nested if-converter had just started taking (a predicated per-lane store beside a
+/// replicated remainder); every loop widened before it still widens.
 #[allow(clippy::too_many_arguments)]
 fn estimate_cost(
     f: &Function,
@@ -7703,6 +7722,27 @@ mod tests {
         assert!(
             !is_widened(&kernel(9), "k"),
             "nine alias checks must not be paid on every entry"
+        );
+    }
+
+    /// The cost model declines a group whose vector body costs more than the `W` scalar iterations
+    /// it replaces, and nothing at or below that line; `WUKONG_VEC_COST=0` (here: `enforced =
+    /// false`) widens it anyway.
+    #[test]
+    fn the_cost_model_declines_only_a_group_dearer_than_its_scalar_iterations() {
+        assert!(cost_declines((29, 28), true));
+        assert!(!cost_declines((28, 28), true));
+        assert!(!cost_declines((3, 28), true));
+        assert!(!cost_declines((29, 28), false));
+        // Two `f64` lanes of `xd[j] = 0.0; if j % 3 == 1 { xd[j] = -0.0 }`: a remainder replicated
+        // per lane and a store predicated per lane, estimated at 28 operations a group against 24
+        // for the two scalar iterations. With `WUKONG_VEC_COST=0` it widens (`cost=28/24`).
+        let src = "fn main() -> i32 { let mut xd: []f64 = alloc_f64(13); let mut j: i64 = 0; \
+                   while j < 13 { xd[j] = 0.0; if j % 3 == 1 { xd[j] = -0.0; } j = j + 1; } \
+                   j = 0; while j < 13 { print(bits(xd[j])); j = j + 1; } return 0; }";
+        assert!(
+            !is_widened(src, "main"),
+            "a group dearer than its scalar iterations must stay scalar"
         );
     }
 
