@@ -248,7 +248,7 @@ fn the_output_comparator_is_strict_by_default_and_bounded_under_tolerance() {
 fn a_declared_tolerance_holds_the_generic_column_to_the_fixtures_own_lines() {
     // Two lanes mixing a 1e-5 and a 1e-3 contract, the way cov4_par_loss.wk does.
     let src = "// EXPECT-EXIT: 0\n// EXPECT-OUT-APPROX: -14.348 1e-5\n// EXPECT-OUT-APPROX: 0.4380 1e-3\n";
-    let d = common::parse_directives(src, "probe.wk").expect("probe directives parse");
+    let d = common::parse_directives(src, "in-memory probe").expect("probe directives parse");
     let on = "-14.348\n0.438\n";
     // A generic column within both lines (and within the on/off bound): accepted.
     assert!(judge_on_off(on, "-14.34801\n0.4381\n", Some((2.1e-3, &d))).is_ok());
