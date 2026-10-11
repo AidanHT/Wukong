@@ -170,9 +170,12 @@ below x86-64-v3, builds the MIR without the raw-AVX2 recipes (`LowerOptions::vec
 process): `scalar` gives the x86-64 baseline, `avx2`/`avx2_vnni` at most x86-64-v3, `avx512` at most
 x86-64-v4, and no cap is host detection itself, so uncapped code bytes are unchanged
 (`target::capped_native_flags`, applied in `make_isa_full`, which every JIT and object entry reaches).
-A cap only removes flags; an explicit `--target-cpu` level is exact and ignores it. So a
-`WUKONG_MAX_ISA=scalar` run has no AVX anywhere: not in the runtime's dispatch, not in the raw-AVX2
-loop kernels, and not in Cranelift's own code.
+A cap only removes flags; an explicit `--target-cpu` level is exact and ignores it. So in a
+`WUKONG_MAX_ISA=scalar` run no code Wukong generates or dispatches to uses AVX: not the runtime's
+dispatch, not the raw-AVX2 loop kernels, not Cranelift's own code. The C library is outside the cap
+and selects its own paths from the real CPU (glibc's IFUNC `memcpy`, and the `fmaf`/`floorf`/
+`nearbyintf` libcalls Cranelift emits for `fma` and rounding below FMA/SSE4.1), so the cap emulates
+a smaller machine for Wukong's code, not for the whole process.
 
 `--emit=check` returns after sema and the lints (lex, parse, imports, sema, lints; no MIR lowering),
 printing any lint warnings and exiting 0 when no error (or denied lint) was reported.

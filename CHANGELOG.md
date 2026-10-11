@@ -26,7 +26,10 @@ All notable changes to Wukong are documented here. The format is loosely based o
   from the new `wukong_codegen_llvm::DECLINED` table (`C0001`); `emit.rs` ratchets corpus declines at
   zero, `tools/verify_llvm_corpus.py` reports them, and `docs/llvm-setup.md` shows the exact fib module.
 - **`WUKONG_MAX_ISA` caps Cranelift's `native` flags (N46).** `scalar` is the x86-64 baseline,
-  `avx2` at most x86-64-v3, `avx512` at most x86-64-v4; uncapped code is byte-identical.
+  `avx2` at most x86-64-v3, `avx512` at most x86-64-v4; uncapped code is byte-identical. The JIT
+  and a default (`--target-cpu=native`) `--emit=obj|exe` are capped; an explicit `--target-cpu`
+  level is not. The cap covers the code Wukong generates or dispatches to, not the C library, which
+  picks its own paths (including the `fmaf`/`floorf` libcalls Cranelift makes below FMA/SSE4.1).
 - **`WUKONG_UPDATE_RUNTIME_ABI=1` regenerates the LLVM runtime-ABI table in one run.** It writes
   `src/runtime_abi.rs` and returns, rather than checking the table compiled into the running test
   binary, which is the old one and failed the very run that regenerated it; the next run checks it.

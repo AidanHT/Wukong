@@ -277,7 +277,10 @@ runtime kernel takes its bit-exact scalar twin, and `WUKONG_MAX_ISA=scalar|avx2|
 caps the runtime's dispatch on an x86 host the same way (in the manner of oneDNN's
 `ONEDNN_MAX_CPU_ISA`), which is how the Tier 1 lanes exercise those scalar arms. The cap also
 narrows the instruction set Cranelift generates for the default `native` target (`scalar` is the
-x86-64 baseline), so a capped run executes no instruction above it. The 256-bit
+x86-64 baseline), so no code Wukong generates or dispatches to (Cranelift's output, the raw-AVX2
+loop kernels, the runtime kernels) uses an extension above it. The C library is outside the cap:
+it picks its own paths from the real CPU, including for the `fmaf`/`floorf`/`nearbyintf` calls
+Cranelift makes for `fma` and rounding below FMA/SSE4.1. The 256-bit
 vec-kernel emitter remains x86-64 Windows only, as described above.
 
 ## Status
