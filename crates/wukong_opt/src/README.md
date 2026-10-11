@@ -9,10 +9,11 @@
 | `sroa.rs` | `Sroa` — split a constant-indexed aggregate slot into scalar leaf slots for mem2reg (`-O2`) |
 | `mem2reg.rs` | `Mem2Reg` — scalar alloca/load/store → block-parameter SSA |
 | `simplify.rs` | `Simplify` — constant folding + algebraic identities |
+| `jump_thread.rs` | `JumpThread` — thread an edge that decides a block's branch (constant argument, or a compare implied by a dominating compare of the same values) through a bounded copy of the block, with on-demand SSA repair (`-O2`, before `simplify-cfg`) |
 | `simplify_cfg.rs` | `SimplifyCfg` — constant-branch folding, straight-line merge, prune |
 | `phi.rs` | `SimplifyPhis` — drop dead/trivial block parameters and edge args |
 | `dce.rs` | `Dce` — dependency worklist removes complete dead instruction chains |
-| `cse.rs` | `Cse` — typed dominator-tree value numbering, integer commutation, load forwarding across single-predecessor edges |
+| `cse.rs` | `Cse` — typed dominator-tree value numbering, integer commutation, load forwarding across single-predecessor edges and through joins (pending phis carry interned type ids), block-parameter numbering; a path-compressed dense rewrite table |
 | `dse.rs` | `Dse` — dead-store elimination: must-alias overwrites in a block and on every path, end-of-lifetime stores, loop-bounded stores into unread slots |
 | `loop_canon.rs` | `LoopCanon` — canonical loop shape (preheader, latch, exit polarity) |
 | `loop_delete.rs` | `LoopDelete` — remove a provably finite loop with no observable effect |
@@ -28,8 +29,8 @@
 | `fxhash.rs` | `FxHashMap`/`FxHashSet` — crate-internal fixed-seed hasher |
 | `branch_fold.rs` | jump threading of constant edge arguments and folding a branch into a predecessor with the same destination (`and`/`or`), both run inside `SimplifyCfg` |
 | `tre.rs` | `Tre` — tail-recursion elimination (plain and integer-accumulator), plus `pre_inline` so a fully tail-recursive function becomes inlinable |
-| `fuse.rs` | `LoopFuse` — fusion of adjacent innermost counted loops over the same range, with an affine/alias legality proof |
-| `unswitch.rs` | `LoopUnswitch` — induction-variable range splitting and non-trivial unswitching of innermost loops |
+| `fuse.rs` | `LoopFuse` — fusion of adjacent innermost counted loops over the same range, with an affine/alias legality proof: non-negative read-behind distances, first-loop live-outs, bases compared in a common alias frame or proved disjoint |
+| `unswitch.rs` | `LoopUnswitch` — induction-variable range splitting (also on derived guards `ext(iv ± k) ⋈ n` proved wrap-free by a small range analysis) and non-trivial unswitching of innermost loops |
 | `switch_form.rs` | `FormSwitches` / `form_switches` — late `switch` formation from equality chains; constant/degenerate switch folding |
 
 ## Cross-cutting helpers in `lib.rs`

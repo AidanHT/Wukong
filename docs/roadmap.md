@@ -804,13 +804,18 @@ another architecture or OS is not supported. A native-backend failure is a catal
 - The optimizer (`-O0..-O3`), backed by CFG and dominator analyses: whole-program **inlining**
   bottom-up over the call graph (non-recursive callees before their callers, scored by a cost model),
   **mem2reg** (alloca → SSA), constant folding, algebraic simplification, CFG cleanup
-  with block merging, **jump threading** of constant short-circuit edges and **branch folding** into
+  with block merging, **jump threading** of constant short-circuit edges (and, at `-O2`, of any
+  edge that decides a block's branch -- a constant argument, or a compare implied by a dominating
+  compare of the same values -- through a bounded copy of the block) and **branch folding** into
   one `and`/`or` branch, **tail-recursion elimination** (plain and integer-accumulator, `-O1`+; a
   fully tail-recursive function becomes inlinable at `-O2`), a late **`switch` formation** from
   equality chains, dead/trivial block-parameter elimination, DCE, dominator-tree CSE with load
   forwarding, DSE, **loop-invariant code motion**, **MIR loop fusion** of adjacent same-range loops
-  after inlining (`-O2`), **loop unswitching** and **induction-variable
-  range splitting** of guarded loop bodies (`-O2`, also past a bounds-check trap or `break`), and **partial loop unrolling** (4×, with a
+  after inlining (`-O2`; also at a non-negative read-behind distance, with first-loop live-outs, and
+  over proved-disjoint parameter and `@noalias` slice bases), **loop unswitching** and
+  **induction-variable range splitting** of guarded loop bodies (`-O2`, also past a bounds-check
+  trap or `break`, and on guards derived from the counter -- `i + 1 < n`, the tile edge
+  `jo + j < n`, `(i as u64) < m` -- once they are proved not to wrap), and **partial loop unrolling** (4×, with a
   wrap-safe guard and a remainder loop; it never reassociates, so a float reduction keeps its exact
   serial accumulate — measured 28% on an integer reduction, 10% on an elementwise store loop, 4% on a
   float reduction). Guarded by an `-O0`-vs-`-O{1,2,3}` differential

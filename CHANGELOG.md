@@ -5,6 +5,30 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Optimizer loop transforms (`gap4/opt-loops`)
+
+- **Guards derived from the loop counter split (N30).** IV-range splitting took only `iv ⋈ inv`
+  with the exit test's signedness; the stencil `i + 1 < n`, the strip-mined tile edge `jo + j < n`
+  (`jo` the enclosing counter, split at `n - jo`), a counter widened to its bound's type and a
+  counter read with the other signedness (`(i as u64) < m`) kept their branch. They now split once a
+  range analysis proves `iv ± k` cannot wrap on any iteration the body runs -- an `i64` counter
+  against a `usize` bound only from a start proved non-negative -- and decline otherwise
+  (`tests/run/opt4_tile_edge_guard.wk`).
+- **Jump threading (N30).** A new `-O2` pass (`jump_thread`, before `simplify-cfg`) sends an edge
+  that already decides a block's branch -- a constant argument, or a compare implied by a dominating
+  compare of the same values -- straight to the decided successor through a copy of the block of
+  at most 8 instructions, repairing SSA for values read past it; loop headers are never copied or
+  targeted. Two `if`s on one condition now run one test (`tests/run/opt4_jump_thread.wk`).
+- **Loop fusion at a distance, with live-outs, over parameter bases (N31).** `fuse` accepted only
+  the identical index on one object; it now fuses when the second loop reads the first loop's store
+  `d > 0` iterations back (and declines a read ahead), passes the first loop's live-outs to the code
+  after the second, compares two bases of one object at their alias-analysis offset, and fuses over
+  `@noalias` parameters and slices, whose reloaded data pointers must be stable
+  (`tests/run/opt4_fuse_distance.wk`, `opt4_fuse_liveout.wk`).
+- **CSE's remaining hot structures (P10.14).** Pending phis carry interned type ids instead of
+  cloned `MirType`s, and the rewrite table is path-compressed; the `-O2` MIR is byte-identical over
+  the corpus. (CSE is about 1-2% of optimizer time; the in-process effect is at the noise floor.)
+
 ### Index-recording reductions (`gap3/vec-argmax`)
 
 - **Argmax/argmin and FindLastIV loops vectorize.** `if x[i] > m { m = x[i]; at = i; }` (and its
