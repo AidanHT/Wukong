@@ -299,8 +299,9 @@ refusal, losses may call helper functions, `--emit=obj --grad-of=<fn>` exports t
 of time, and scalar-path losses have Hessian-vector products. Training accepts concrete f32 arrays
 and dense tensors, loads weights and streams data batches from raw f32 files (`--train-init`,
 `--train-data`), writes the trained weights (`--train-save`), and clips and schedules the update
-(`--train-clip`, `--train-warmup`, `--train-schedule=cosine`); an AOT training loop and measured
-training speedups remain open. See the
+(`--train-clip`, `--train-warmup`, `--train-schedule=cosine`). `--train --emit=exe` builds the
+whole loop into an executable whose output is byte-identical to `--train` on both backends (the
+loop is one runtime function both call); measured training speedups remain open. See the
 [training CLI contract](docs/language-guide.md#command-line-interface).
 Tuples and structs (incl. nested struct-in-struct, **by-value parameters and `-> Struct` returns** via
 an sret ABI, nested tuple fields `t.0.1`, and whole-aggregate assignment), pointers/references

@@ -247,7 +247,10 @@ showcase program.
 Training changes need focused driver and real-CLI coverage: `native_training_tests` checks exact
 trajectories, final weights and fixed inputs on both CPU backends, while `native_training` checks
 backend selection and invalid buffer/artifact options, `training_data` the file, clip and schedule
-options through the binary, and `train_lm` a whole language model against an f64 reference. A loss
+options through the binary, `train_lm` a whole language model against an f64 reference, and
+`train_exe` that a `--train --emit=exe` executable prints `--train`'s output byte for byte. The loop
+itself is `wukong_runtime::train` (its unit tests pin the spec blob, the selectors and the order of
+operations); change it there, never in a second copy. A loss
 whose forward writes one of its parameters must keep its per-step semantics: the in-place loop
 restores exactly the buffers `wukong_autodiff::written_params` reports, so a new write channel
 there needs a `tests/writes.rs` case. Changes to the native buffer dispatcher

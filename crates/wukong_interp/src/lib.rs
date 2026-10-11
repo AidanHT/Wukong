@@ -702,7 +702,24 @@ pub fn run_kernel_f32(
     bufs: &mut [&mut [f32]],
     interner: &Interner,
 ) -> Result<(), String> {
-    run_kernel_f32_inner(program, entry, bufs, interner, None)
+    run_kernel_f32_inner(program, entry, bufs, interner, None, &mut Vec::new())
+}
+
+/// [`run_kernel_f32`], also returning the bytes the kernel printed — what a linked executable
+/// running the same kernel writes to its stdout — so the caller can forward them. `wukongc --train`
+/// does: a `--train --emit=exe` artifact's kernels print straight to stdout, and the in-process run
+/// must print the same bytes in the same order. Like [`run_capturing`], the bytes come back **also
+/// when the kernel stopped on a runtime failure** (a failed `assert`, a bounds failure): everything
+/// it printed before the failing statement, which the executable has already written.
+pub fn run_kernel_f32_with_output(
+    program: &Program,
+    entry: Symbol,
+    bufs: &mut [&mut [f32]],
+    interner: &Interner,
+) -> (Result<(), String>, Vec<u8>) {
+    let mut printed = Vec::new();
+    let result = run_kernel_f32_inner(program, entry, bufs, interner, None, &mut printed);
+    (result, printed)
 }
 
 /// Like [`run_kernel_f32`] but offloads recognized kernel calls to `accel` — the full-buffer
@@ -715,7 +732,7 @@ pub fn run_kernel_f32_accel(
     interner: &Interner,
     accel: &mut dyn Accelerator,
 ) -> Result<(), String> {
-    run_kernel_f32_inner(program, entry, bufs, interner, Some(accel))
+    run_kernel_f32_inner(program, entry, bufs, interner, Some(accel), &mut Vec::new())
 }
 
 // Host-buffer marshalling is a bit-preserving transfer, not floating-point arithmetic.
@@ -753,6 +770,7 @@ fn run_kernel_f32_inner(
     bufs: &mut [&mut [f32]],
     interner: &Interner,
     accel: Option<&mut dyn Accelerator>,
+    printed: &mut Vec<u8>,
 ) -> Result<(), String> {
     let func = program
         .function(entry)
@@ -795,7 +813,10 @@ fn run_kernel_f32_inner(
             .extend(buf.iter().map(|&v| Value::Float(widen_buffer_f32(v))));
     }
     let args: Vec<Value> = bases.iter().map(|&b| Value::Ptr(b)).collect();
-    interp.run_function(func, &args)?;
+    let ran = interp.run_function(func, &args);
+    // What the kernel printed, also when it stopped on a failure (see `run_kernel_f32_with_output`).
+    *printed = std::mem::take(&mut interp.stdout);
+    ran?;
     // Copy the final contents back out (captures both outputs and in-place mutation).
     for (buf, &base) in bufs.iter_mut().zip(bases.iter()) {
         for (i, slot) in buf.iter_mut().enumerate() {

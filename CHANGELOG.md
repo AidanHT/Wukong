@@ -128,6 +128,32 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `vmath_parallel.wk`, `RCHUNK` by `cov4_par_lowp_dot.wk` and `parallel_argmax.wk`), and
   `parallel_lane.rs` now fails if one leaves the corpus, stops dispatching the gated kernel, or no
   longer spells a size above the gate. `run.rs`'s fixture floor is raised to the 517 the corpus holds.
+### AOT training (`gap4/train-aot`)
+
+- **`--train --emit=exe` builds the training loop into an executable (P4.3).** The forward, its
+  generated backward, the fused AdamW kernels and a kernel dispatcher are linked with a synthesized
+  `main` that calls the runtime's new `wukong_rt_train_main` on a versioned `.rodata` spec blob;
+  `--emit=obj` writes the object (which links the same way: it needs the rlib's training loop and
+  wukongc's generated link shim, for `wukong_rt_run_main` and the print/assert entries, so it does
+  not link against `wukong_runtime` alone), and `-o` alone selects the default `exe` stage. The
+  loop moved out of the driver into `wukong_runtime::train::run_training`, which `wukongc --train` now runs
+  in process over the same spec bytes, so the executable's stdout is byte-identical to `--train` on
+  the interpreter and the native JIT by construction (`crates/wukongc/tests/train_exe.rs`: five
+  models, `-O0`/`-O2`, SGD and AdamW with clip/warmup/cosine). `--train-init`, `--train-data` and
+  `--train-save` with an artifact, and a link without the rustc + runtime rlib path, are refused by
+  name (exit 2). Every existing `--train` trajectory prints the same bytes. `--depfile` names the
+  training artifact (at `-o` or its default name) as its rule's target, as for any other
+  `--emit=obj|exe` build; an in-process `--train` still names the depfile itself.
+- **`--train` prints what the loss prints.** A `print` in a loss function was captured and dropped
+  on both backends; it now reaches stdout as each kernel call returns (once per update, since the
+  backward replays the forward, and once for the final forward), before the report — where the
+  training executable prints it too. A kernel that fails at run time (a failed `assert`) keeps
+  what it printed before the failure on every path: the in-process run writes those bytes before
+  its error, as the executable already has.
+- **A two-layer MLP trains in the corpus (P4.7).** `tests/run/autodiff_train_mlp.wk` (GEMM + bias +
+  ReLU, GEMM + bias, mean squared error; four trained tensors) pins three SGD steps derived in Python
+  under three f32 evaluation orders and f64, every printed value at least 131 ULPs from a rounding
+  boundary.
 
 ### Index-recording reductions (`gap3/vec-argmax`)
 

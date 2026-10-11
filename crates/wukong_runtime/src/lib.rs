@@ -243,6 +243,7 @@ pub mod process;
 /// Which instruction-set extensions the kernels may dispatch to: CPU detection capped by
 /// `WUKONG_MAX_ISA` (`scalar`, `avx2`, `avx2_vnni`, `avx512`), the one probe every dispatcher asks.
 pub mod isa;
+pub mod train;
 
 /// `bf16` (the "brain float": an `f32` truncated to its top 16 bits) round-to-nearest-even from an
 /// `f32`, returning the 16 stored bits. This is the single shared definition the interpreter, the

@@ -1,0 +1,93 @@
+// RUN: --train --grad-wrt=1,2,3,4 --train-steps=3 --train-lr=1 --train-seed=3
+// EXPECT-EXIT: 0
+// EXPECT-OUT: train: 3 step(s), lr=1, optimizer=sgd
+// EXPECT-OUT: step    0: loss 0.040400
+// EXPECT-OUT: step    1: loss 0.015873
+// EXPECT-OUT: step    2: loss 0.012052
+// EXPECT-OUT: step    3: loss 0.011376
+// EXPECT-OUT: loss 0.040400 -> 0.011376  (3.55x reduction)
+module tests.run.autodiff_train_mlp
+
+// `--train` of a two-layer MLP end to end (P4.7): a hidden `nn.Linear` + bias + ReLU, an output
+// `nn.Linear` + bias, and a mean-squared error, all written as the loops the recognizers turn into
+// kernels, with every weight and bias trained by SGD (`--grad-wrt=1,2,3,4`; `x` and `t` are fixed
+// data).
+//
+//   h = relu(x · W1ᵀ + b1)   [B=4, H=3]   wukong_sgemm_nt_epi_parallel (bias + ReLU epilogue)
+//   y = h · W2ᵀ + b2         [4, O=2]     wukong_sgemm_nt_epi_parallel (bias epilogue)
+//   L = (1/16) Σ (y - t)²                 wukong_sreduce_f32_parallel (sum of squared differences)
+//
+// The backward rides the tape's kernels: dy = (2/16)(y - t) (`wukong_velem_f32`), dW2 = dyᵀ·h and
+// dW1 = dpreᵀ·x on the weight-gradient GEMM (`wukong_sgemm_tn_parallel`), dh = dy·W2 on the NN GEMM,
+// db = the column sums (`wukong_colsum_f32`), and dpre = dh where h > 0, else 0.
+//
+// The trajectory is derived independently of the compiler, in Python, from scalar semantics:
+//
+// * Every buffer comes from `--train`'s documented deterministic init with seed 3, drawn in
+//   parameter order x[8], W1[6], b1[3], W2[6], b2[2], t[8], out[1] (the LCG and f32 formula in
+//   tests/run/autodiff_train_sumsq.wk). In f32: x = [-0.30943185, -0.1401402, 0.18754521,
+//   -0.12307382, 0.09527331, -0.09614835, 0.002868271, -0.012560749], W1 = [0.042872954,
+//   0.16173187, 0.37655362, 0.3015092, -0.19698353, 0.20522848], b1 = [0.3237354, 0.2834867,
+//   -0.20227161], W2 = [0.21361981, -0.046319295, 0.23104134, -0.21550393, -0.04752636,
+//   0.32712188], b2 = [-0.01108408, -0.24626966], t = [-0.033313513, -0.067031816, -0.16368528,
+//   0.19427171, -0.031917524, -0.18708067, 0.25148302, 0.11386857].
+// * The forward, the backward above and each SGD update (lr = 1: w - g, one rounding) are
+//   evaluated with f32 rounding after EVERY operation under three evaluation orders — FMA chains
+//   k-ascending, separate multiply and add k-ascending, and k-descending — and once in f64. All four
+//   print the lines above; the f32 orders' losses lie within 2 ULPs of the FMA order's, and every
+//   printed value (and the 2-decimal ratio 3.5513241) sits >= 131 ULPs from a rounding boundary.
+//   Loss in f32: 0.04039999, 0.015873235, 0.012052373, 0.011376036.
+// * Every hidden pre-activation, at all four forward passes, is at least 0.1175 away from zero, so
+//   the ReLU mask is a property of the model and not of rounding; 16 of those 48 values are
+//   negative, so the mask zeroes part of dh and a ReLU VJP that ignored it would change every line
+//   after step 0. So would a dropped bias gradient, a transposed weight gradient, or a missing
+//   factor of 2.
+//
+// `main` exercises the same loss for the differential gates, on exact values.
+
+@parallel
+fn loss(x: [f32; 8], w1: [f32; 6], b1: [f32; 3], w2: [f32; 6], b2: [f32; 2], t: [f32; 8],
+        mut out: [f32; 1]) -> f32 {
+    let mut h: [f32; 12] = [0.0; 12];
+    for i in 0..4 {
+        for j in 0..3 {
+            let mut s: f32 = 0.0;
+            for k in 0..2 { s = s + x[i * 2 + k] * w1[j * 2 + k]; }
+            h[i * 3 + j] = s;
+        }
+    }
+    for i in 0..4 { for j in 0..3 { h[i * 3 + j] = fmax(h[i * 3 + j] + b1[j], 0.0); } }
+    let mut y: [f32; 8] = [0.0; 8];
+    for i in 0..4 {
+        for o in 0..2 {
+            let mut s: f32 = 0.0;
+            for j in 0..3 { s = s + h[i * 3 + j] * w2[o * 3 + j]; }
+            y[i * 2 + o] = s;
+        }
+    }
+    for i in 0..4 { for o in 0..2 { y[i * 2 + o] = y[i * 2 + o] + b2[o]; } }
+    let mut l: f32 = 0.0;
+    for i in 0..8 { l = l + (y[i] - t[i]) * (y[i] - t[i]); }
+    l = l * 0.0625;
+    out[0] = l;
+    return l;
+}
+
+fn main() -> i32 {
+    // Dyadic values, so every product and sum below is exact in f32 under any order.
+    let x: [f32; 8] = [1.0, 0.5, -1.0, 2.0, 0.5, -0.5, 2.0, 1.0];
+    let w1: [f32; 6] = [0.5, -1.0, 1.0, 0.25, -0.5, 0.5];
+    let b1: [f32; 3] = [0.25, -0.5, 0.0];
+    let w2: [f32; 6] = [1.0, -0.5, 0.5, 0.5, 1.0, -1.0];
+    let b2: [f32; 2] = [0.5, -0.25];
+    // pre = x·W1ᵀ + b1 = [0.25, 0.625, -0.25 | -2.25, -1, 1.5 | 1, -0.125, -0.5 | 0.25, 1.75, -0.5],
+    // so h = [0.25, 0.625, 0 | 0, 0, 1.5 | 1, 0, 0 | 0.25, 1.75, 0] and
+    // y = h·W2ᵀ + b2 = [0.4375, 0.5 | 1.25, -1.75 | 1.5, 0.25 | -0.125, 1.625]. t = y - d for
+    // d = [1, -1, 0, 2, -0.5, 0, -1, 0]: Σ d² = 7.25, L = 7.25 / 16 = 0.453125, × 64 = 29.
+    let t: [f32; 8] = [-0.5625, 1.5, 1.25, -3.75, 2.0, 0.25, 0.875, 1.625];
+    let mut out: [f32; 1] = [0.0];
+    let l: f32 = loss(x, w1, b1, w2, b2, t, out);
+    print((l * 64.0) as i32);
+    print((out[0] * 64.0) as i32);
+    return 0;
+}

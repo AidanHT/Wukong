@@ -87,7 +87,9 @@ fn guarded_calls_own_code_reset_state_and_propagate_nested_assertions() {
         let before = data[0].to_bits();
         let pointers = [data.as_mut_ptr()];
         // SAFETY: dispatch reads one table slot, whose single writable f32 remains live.
-        let result = unsafe { kernel.run(&pointers, selector) };
+        let (result, printed) = unsafe { kernel.run(&pointers, selector) };
+        // The leaf prints its selector before it asserts: a failed call keeps that output too.
+        assert_eq!(printed, format!("{selector}\n").as_bytes());
         if selector == 0 {
             assert_eq!(result, Err("assertion failed".to_string()));
             assert_eq!(
@@ -96,7 +98,7 @@ fn guarded_calls_own_code_reset_state_and_propagate_nested_assertions() {
                 "writes must stop after the assertion"
             );
         } else {
-            assert_eq!(result.unwrap(), format!("{selector}\n").as_bytes());
+            assert_eq!(result, Ok(()));
             assert_eq!(data[0].to_bits(), 42.0f32.to_bits());
         }
     }

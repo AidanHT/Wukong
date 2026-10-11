@@ -185,6 +185,10 @@ pub struct GradOptions {
     pub wrt: Vec<usize>,
     /// Run a fwd→bwd→optimizer training loop instead of just emitting the backward (`--train`).
     pub train: bool,
+    /// `--train` with `--emit=exe|obj` (or `-o`): build that loop into the artifact `emit` names —
+    /// an executable that prints exactly the trajectory `--train` prints — instead of running it
+    /// now. Only consulted when `train` is set.
+    pub train_artifact: bool,
     /// Number of training steps (`--train-steps=N`).
     pub train_steps: usize,
     /// Learning rate for the training loop (`--train-lr=<f>`).
@@ -217,6 +221,7 @@ impl Default for GradOptions {
             of: None,
             wrt: Vec::new(),
             train: false,
+            train_artifact: false,
             train_steps: 100,
             train_lr: 0.01,
             train_weight_decay: 0.0,
@@ -705,8 +710,12 @@ pub fn compile(opts: &Options) -> i32 {
 
     // --- Autodiff CLI surface (additive; runs after optimization, before any backend) ---
     if opts.grad.train {
-        timer.begin("train");
         let lens = train_lens.expect("train_lens computed when --train is set");
+        if opts.grad.train_artifact {
+            timer.begin("autodiff");
+            return emit_train_artifact(&program, &mut interner, opts, &lens, &mut timer);
+        }
+        timer.begin("train");
         return run_train(&program, &mut interner, opts, &lens);
     }
     if opts.emit == EmitStage::Grad {
@@ -1607,6 +1616,25 @@ fn emit_native(
             emit_driver_error(opts, msg);
             return exit::COMPILE_ERROR;
         }
+        // A training executable's `main` calls `wukong_rt_train_main`, the runtime's training
+        // loop, which the C fallback runtime does not reimplement (a second loop would be a second
+        // thing to keep byte-identical). Say so instead of letting `cc` report an undefined symbol.
+        // The object alone is no way out: besides the rlib's `wukong_rt_train_main` it imports
+        // `wukong_rt_run_main` and the print/assert entries, which only the generated
+        // `WUKONG_RT_SHIM` (or the C runtime) defines, never the `wukong_runtime` rlib.
+        LinkOutcome::Unavailable if opts.grad.train => {
+            emit_driver_error(
+                opts,
+                "a `--train --emit=exe` executable links the training loop from the \
+                 `wukong_runtime` rlib, and no usable `rustc` + rlib is beside wukongc (the `cc` \
+                 fallback runtime has no training loop); run `wukongc --train` in process, or \
+                 use a wukongc built by cargo with `rustc` on PATH (a `--train --emit=obj` \
+                 object needs that same link: the rlib's `wukong_rt_train_main` plus wukongc's \
+                 generated runtime shim, which defines `wukong_rt_run_main` and the print and \
+                 assert entries)",
+            );
+            return exit::UNIMPLEMENTED;
+        }
         LinkOutcome::Unavailable => { /* fall through to the C-runtime `cc` link */ }
     }
 
@@ -2471,9 +2499,7 @@ fn ty_elem_count(ty: &wukong_types::Ty) -> Option<usize> {
 
 // Vec allocations and native pointer offsets must fit isize, not merely usize.
 fn valid_train_extent(count: usize) -> bool {
-    count
-        .checked_mul(std::mem::size_of::<f32>())
-        .is_some_and(|bytes| bytes <= isize::MAX as usize)
+    wukong_runtime::train::valid_extent(count)
 }
 
 /// Recover the element count of each parameter of the `--train` / `--grad-of` loss function from the
@@ -2507,24 +2533,28 @@ fn loss_param_lens(
         .collect()
 }
 
-/// A tiny deterministic LCG producing `f32` uniform in `[-0.4, 0.4)` — seeds the `--train` buffers so
-/// a run is reproducible (honest: no hidden entropy) and a test can assert a specific loss trajectory.
-///
-/// The draw is the standard u64 -> f32 conversion: the TOP 24 bits of the state, scaled by `2^-24`
-/// (exact in f32), give `u` uniform in `[0, 1)`; `(u - 0.5)·0.8` is then symmetric about zero. (It
-/// used to keep 31 bits, `seed >> 33`, and divide by `u32::MAX`, so `u` never reached 0.5 and every
-/// value lay in `[-0.4, 0)`: an all-negative init that starts a ReLU net mostly dead.)
-fn train_rand(seed: &mut u64, n: usize) -> Vec<f32> {
-    (0..n)
-        .map(|_| {
-            *seed = seed
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            let u = ((*seed >> 40) as f32) * (1.0 / 16_777_216.0);
-            (u - 0.5) * 0.8
-        })
-        .collect()
-}
+/// The `--train` initializer, `wukong_runtime::train::init_uniform` (the loop that draws from it
+/// lives there); the tests derive their expected trajectories from it.
+#[cfg(test)]
+use wukong_runtime::train::init_uniform as train_rand;
+
+// The AdamW hyperparameter buffer has two copies of its layout: `wukong_autodiff::optim::hp` builds
+// the kernel that reads it and `wukong_runtime::train::hp` fills it. A drift would hand every AdamW
+// step the wrong rate silently, so it is a build error.
+const _: () = {
+    use wukong_autodiff::optim::hp as kernel;
+    use wukong_runtime::train::hp as runtime;
+    assert!(
+        kernel::LR == runtime::LR
+            && kernel::BETA1 == runtime::BETA1
+            && kernel::BETA2 == runtime::BETA2
+            && kernel::EPS == runtime::EPS
+            && kernel::WD == runtime::WD
+            && kernel::BC1 == runtime::BC1
+            && kernel::BC2 == runtime::BC2
+            && kernel::LEN == runtime::LEN
+    );
+};
 
 /// `--train`: run a fwd→bwd→optimizer loop on the loss function and print the loss trajectory.
 ///
@@ -2537,58 +2567,22 @@ fn train_rand(seed: &mut u64, n: usize) -> Vec<f32> {
 /// kernel at the scheduled rate (`--train-warmup`, `--train-schedule`). The printed trajectory is the
 /// honest end-to-end signal — on a convex objective it strictly decreases — and `--train-save`
 /// writes the trained buffers out.
+///
+/// The loop and the printed text are `wukong_runtime::train`'s, the same functions a
+/// `--train --emit=exe` artifact runs ([`emit_train_artifact`]).
 fn run_train(
     program: &wukong_mir::Program,
     interner: &mut Interner,
     opts: &Options,
     lens: &[usize],
 ) -> i32 {
-    match train_loop_with_buffers(program, interner, opts, lens) {
-        Ok((traj, bufs)) => {
+    match train_in_process(program, interner, opts, lens) {
+        Ok((spec, run)) => {
             use std::io::Write;
-            let mut out = String::new();
-            let opt = match opts.grad.train_opt {
-                TrainOpt::Sgd => "sgd",
-                TrainOpt::AdamW => "adamw",
-            };
-            let decay = if opts.grad.train_weight_decay == 0.0 {
-                String::new()
-            } else {
-                format!(", weight_decay={}", opts.grad.train_weight_decay)
-            };
-            // The update policy, named only where it differs from the default (so a default run
-            // prints the header it always has).
-            let mut policy = String::new();
-            if let Some(clip) = opts.grad.train_clip {
-                policy.push_str(&format!(", clip={clip}"));
-            }
-            if opts.grad.train_warmup > 0 {
-                policy.push_str(&format!(", warmup={}", opts.grad.train_warmup));
-            }
-            if opts.grad.train_schedule == TrainSchedule::Cosine {
-                policy.push_str(", schedule=cosine");
-            }
-            out.push_str(&format!(
-                "train: {} step(s), lr={}, optimizer={opt}{decay}{policy}\n",
-                traj.len().saturating_sub(1),
-                opts.grad.train_lr
-            ));
-            for (i, l) in traj.iter().enumerate() {
-                out.push_str(&format!("step {i:>4}: loss {l:.6}\n"));
-            }
-            if let (Some(&first), Some(&last)) = (traj.first(), traj.last()) {
-                out.push_str(&format!(
-                    "loss {first:.6} -> {last:.6}  ({:.2}x reduction)\n",
-                    if last != 0.0 {
-                        first / last
-                    } else {
-                        f32::INFINITY
-                    }
-                ));
-            }
-            let _ = std::io::stdout().write_all(out.as_bytes());
+            let text = wukong_runtime::train::format_report(&spec, &run.trajectory);
+            let _ = std::io::stdout().write_all(text.as_bytes());
             for (i, path) in &opts.grad.train_save {
-                if let Err(e) = training::save_f32(path, &bufs[*i]) {
+                if let Err(e) = training::save_f32(path, &run.buffers[*i]) {
                     emit_driver_error(opts, format!("--train: {e}"));
                     return exit::IO_ERROR;
                 }
@@ -2606,7 +2600,7 @@ fn run_train(
 /// The testable core of `--train`: build the {forward, backward, optimizer} program, initialize the
 /// buffers, run the loop, and return the loss trajectory (`traj[i]` = loss after `i` updates, with a
 /// final entry after the last update — so `traj.len() == steps + 1`). `run_train` itself calls
-/// [`train_loop_with_buffers`], which also returns the final buffers for `--train-save`.
+/// [`train_in_process`], which also returns the final buffers for `--train-save`.
 #[cfg(test)]
 fn train_loop(
     program: &wukong_mir::Program,
@@ -2617,18 +2611,78 @@ fn train_loop(
     train_loop_with_buffers(program, interner, opts, lens).map(|(trajectory, _)| trajectory)
 }
 
+#[cfg(test)]
 fn train_loop_with_buffers(
     program: &wukong_mir::Program,
     interner: &mut Interner,
     opts: &Options,
     lens: &[usize],
 ) -> Result<(Vec<f32>, Vec<Vec<f32>>), String> {
-    use wukong_autodiff::optim::{self, hp};
-    use wukong_mir::Program;
+    train_in_process(program, interner, opts, lens).map(|(_, run)| (run.trajectory, run.buffers))
+}
 
+/// The spec and the result of an in-process training run.
+type TrainOutcome = (
+    wukong_runtime::train::TrainSpec,
+    wukong_runtime::train::TrainRun,
+);
+
+/// Run `--train` in this process, on the interpreter or the native JIT.
+fn train_in_process(
+    program: &wukong_mir::Program,
+    interner: &mut Interner,
+    opts: &Options,
+    lens: &[usize],
+) -> Result<TrainOutcome, String> {
     if !matches!(opts.backend, BackendKind::Interp | BackendKind::Native) {
         return Err("--train supports only --backend=interp or --backend=native".into());
     }
+    let wrt = check_training(program, interner, opts, lens)?;
+    let gopt = &opts.grad;
+    // Read the initial buffers and open the data before the (costly) build, so a wrong path or a
+    // file of the wrong size fails at once.
+    let mut inits = Vec::with_capacity(gopt.train_init.len());
+    for (i, path) in &gopt.train_init {
+        inits.push((*i, training::read_init(path, *i, lens[*i])?));
+    }
+    let mut streams = Vec::with_capacity(gopt.train_data.len());
+    for (i, path) in &gopt.train_data {
+        streams.push(training::DataStream::open(path, *i, lens[*i])?);
+    }
+
+    let TrainingBuild {
+        program: mut train_prog,
+        spec,
+        entries,
+    } = build_training(program, interner, opts, lens, wrt)?;
+    let executor =
+        training_native::TrainingExecutor::new(&mut train_prog, interner, opts.backend, entries)?;
+    // The run consumes the very bytes a `--train --emit=exe` artifact bakes into `.rodata`, so the
+    // two cannot disagree on a field of the spec.
+    let spec = wukong_runtime::train::TrainSpec::decode(&spec.encode())?;
+    let interner: &Interner = interner;
+    let mut load = |step: usize, bufs: &mut [Vec<f32>]| -> Result<(), String> {
+        for stream in &mut streams {
+            let i = stream.index;
+            stream.load(step, &mut bufs[i])?;
+        }
+        Ok(())
+    };
+    let mut dispatch = |selector: usize, bufs: &mut [Vec<f32>]| {
+        executor.run_selector(&train_prog, selector, bufs, interner)
+    };
+    let run = wukong_runtime::train::run_training_with(&spec, inits, &mut load, &mut dispatch)?;
+    Ok((spec, run))
+}
+
+/// The checks `--train` makes before it builds anything, in the order (and wording) the user has
+/// always seen them. Returns the trainable weights (`--grad-wrt`, or its `--train` default).
+fn check_training(
+    program: &wukong_mir::Program,
+    interner: &mut Interner,
+    opts: &Options,
+    lens: &[usize],
+) -> Result<Vec<usize>, String> {
     if lens.iter().any(|&n| !valid_train_extent(n)) {
         return Err("training buffer byte extent is not representable".into());
     }
@@ -2687,36 +2741,64 @@ fn train_loop_with_buffers(
     if gopt.train_clip.is_some_and(|c| !c.is_finite() || c <= 0.0) {
         return Err("--train-clip must be finite and positive".into());
     }
-    // Read the initial buffers and open the data before the (costly) build, so a wrong path or a
-    // file of the wrong size fails at once.
-    let mut inits = Vec::with_capacity(gopt.train_init.len());
-    for (i, path) in &gopt.train_init {
-        inits.push((*i, training::read_init(path, *i, lens[*i])?));
-    }
-    let mut streams = Vec::with_capacity(gopt.train_data.len());
-    for (i, path) in &gopt.train_data {
-        streams.push(training::DataStream::open(path, *i, lens[*i])?);
-    }
+    Ok(wrt)
+}
 
-    // Build {forward, backward} plus one fused AdamW kernel per distinct trainable-tensor size.
+/// What `--train` builds before it runs or emits anything.
+struct TrainingBuild {
+    /// The forward, its backward and one fused AdamW kernel per distinct trainable-tensor size.
+    program: wukong_mir::Program,
+    /// The run: buffer sizes, weights, restored buffers and the update policy.
+    spec: wukong_runtime::train::TrainSpec,
+    /// The kernels in `wukong_runtime::train` selector order, each with its buffer lengths.
+    entries: Vec<(wukong_span::Symbol, Vec<usize>)>,
+}
+
+/// Build the training program and its spec. The kernel list follows the runtime's selector ABI by
+/// construction: its lengths ARE `TrainSpec::kernel_buffers`, and its AdamW kernels are built for
+/// exactly `TrainSpec::adamw_sizes`, in that order.
+fn build_training(
+    program: &wukong_mir::Program,
+    interner: &mut Interner,
+    opts: &Options,
+    lens: &[usize],
+    wrt: Vec<usize>,
+) -> Result<TrainingBuild, String> {
+    use wukong_runtime::train::{Optimizer, TrainSpec};
+
     let (fwd, gradfn) = build_grad(program, interner, opts)?;
-    // The buffers the forward may write, beside the loss output (see the restore below).
+    // The buffers the forward may write, beside the loss output: restored after every gradient run.
     let written = wukong_autodiff::written_params(&fwd, interner);
-    let (fwd_name, gname) = (fwd.name, gradfn.name);
+    let loss_out = lens.len() - 1;
+    let gopt = &opts.grad;
+    let spec = TrainSpec {
+        lens: lens.to_vec(),
+        wrt,
+        restore: (0..lens.len())
+            .filter(|&i| i != loss_out && written.get(i).copied().unwrap_or(true))
+            .collect(),
+        steps: gopt.train_steps,
+        lr: gopt.train_lr,
+        optimizer: match gopt.train_opt {
+            TrainOpt::Sgd => Optimizer::Sgd,
+            TrainOpt::AdamW => Optimizer::AdamW,
+        },
+        seed: gopt.train_seed,
+        weight_decay: gopt.train_weight_decay,
+        clip: gopt.train_clip,
+        warmup: gopt.train_warmup,
+        schedule: gopt.train_schedule.runtime(),
+    };
+    spec.validate()?;
+    let mut names = vec![fwd.name, gradfn.name];
     let mut funcs = vec![fwd, gradfn];
-    let mut adamw: std::collections::HashMap<usize, wukong_span::Symbol> =
-        std::collections::HashMap::new();
-    if opts.grad.train_opt == TrainOpt::AdamW {
-        let mut sizes: Vec<usize> = wrt.iter().map(|&wi| lens[wi]).collect();
-        sizes.sort_unstable();
-        sizes.dedup();
-        for n in sizes {
-            let f = optim::build_adamw_step(interner, n);
-            adamw.insert(n, f.name);
-            funcs.push(f);
-        }
+    for n in spec.adamw_sizes() {
+        let f = wukong_autodiff::optim::build_adamw_step(interner, n);
+        names.push(f.name);
+        funcs.push(f);
     }
-    let mut train_prog = Program {
+    let entries = names.into_iter().zip(spec.kernel_buffers()).collect();
+    let train_prog = wukong_mir::Program {
         funcs,
         level: program.level,
         statics: program.statics.clone(),
@@ -2726,143 +2808,155 @@ fn train_loop_with_buffers(
     // unconditionally, before allocating buffers or entering the interpreter.
     wukong_opt::verify_program_stage(&train_prog, "training kernels")
         .map_err(|failure| failure.to_string())?;
+    Ok(TrainingBuild {
+        program: train_prog,
+        spec,
+        entries,
+    })
+}
 
-    let mut grad_lens = lens.to_vec();
-    grad_lens.extend(wrt.iter().map(|&wi| lens[wi]));
-    let mut entries = vec![(fwd_name, lens.to_vec()), (gname, grad_lens)];
-    let mut adamw_sizes: Vec<_> = adamw.keys().copied().collect();
-    adamw_sizes.sort_unstable();
-    for n in adamw_sizes {
-        entries.push((adamw[&n], vec![n, n, n, n, hp::LEN]));
-    }
-    let executor =
-        training_native::TrainingExecutor::new(&mut train_prog, interner, opts.backend, entries)?;
+/// The runtime entry a training artifact's `main` calls (`wukong_runtime::train`).
+const TRAIN_MAIN: &str = "wukong_rt_train_main";
 
-    // Deterministic buffer init (every buffer draws in order, so a `--train-init` file replacing one
-    // buffer leaves the others' values unchanged); the loss output is zeroed, moment state starts
-    // at zero.
-    let mut seed = opts.grad.train_seed;
-    let mut bufs: Vec<Vec<f32>> = lens.iter().map(|&n| train_rand(&mut seed, n)).collect();
-    bufs[loss_out] = vec![0.0; 1];
-    for (i, values) in inits {
-        bufs[i] = values;
-    }
-    // The gradient entry's buffers — the forward's, then one gradient per trainable weight — live
-    // for the whole run and are updated in place: no buffer is copied per step. A buffer the forward
-    // may write (other than the loss output) is snapshotted before each gradient run and put back
-    // after it, so every step sees its data, and the optimizer its weights, exactly as they were
-    // before the forward ran — the semantics of a fresh per-step copy, paid only for the buffers
-    // the forward writes (none, for a loss whose buffers only feed kernels).
-    bufs.extend(wrt.iter().map(|&wi| vec![0.0; lens[wi]]));
-    let restore: Vec<usize> = (0..nparams)
-        .filter(|&i| i != loss_out && written[i])
-        .collect();
-    let mut snapshot: Vec<Vec<f32>> = restore.iter().map(|&i| vec![0.0; lens[i]]).collect();
-    let mut mstate: Vec<Vec<f32>> = wrt.iter().map(|&wi| vec![0.0; lens[wi]]).collect();
-    let mut vstate: Vec<Vec<f32>> = wrt.iter().map(|&wi| vec![0.0; lens[wi]]).collect();
-    let mut hpbuf = vec![0.0f32; hp::LEN];
-
-    let steps = opts.grad.train_steps;
-    let (beta1, beta2, eps) = (0.9f64, 0.999f64, 1e-8f64);
-    // Grown amortized rather than pre-reserved: `--train-steps` is an unvalidated CLI integer, and
-    // reserving from it let `--train-steps=999999999999` abort inside the allocator ("memory
-    // allocation of 4000000000000 bytes failed", exit 127) before a single step ran — raw runtime
-    // text with no diagnostic. `usize::MAX` additionally wrapped `+ 1` to a zero reservation.
-    let mut traj = Vec::new();
-
-    let run = |prog: &Program, entry, bufs: &mut [Vec<f32>], it: &Interner| {
-        executor.run(prog, entry, bufs, it)
+/// `--train --emit=exe|obj`: build the training loop into an artifact instead of running it. The
+/// artifact holds the forward, its backward, the AdamW kernels and the kernel dispatcher a native
+/// `--train` run JIT-compiles, plus a synthesized `main` that calls the runtime's
+/// `wukong_rt_train_main` with the run's spec (a `.rodata` blob) and the dispatcher's address — so
+/// the executable runs `wukong_runtime::train::run_training` and prints
+/// `wukong_runtime::train::format_report`, exactly what `wukongc --train` does in process.
+///
+/// The artifact reads and writes no files, so `--train-init`, `--train-data` and `--train-save` are
+/// refused (exit 2) rather than silently dropped.
+fn emit_train_artifact(
+    program: &wukong_mir::Program,
+    interner: &mut Interner,
+    opts: &Options,
+    lens: &[usize],
+    timer: &mut report::PassTimer,
+) -> i32 {
+    let stage = if opts.emit == EmitStage::Obj {
+        "obj"
+    } else {
+        "exe"
     };
+    for (flag, given) in [
+        ("--train-init", !opts.grad.train_init.is_empty()),
+        ("--train-data", !opts.grad.train_data.is_empty()),
+        ("--train-save", !opts.grad.train_save.is_empty()),
+    ] {
+        if given {
+            emit_driver_error(
+                opts,
+                format!(
+                    "{flag} cannot be built into a `--train --emit={stage}` artifact: the \
+                     training executable reads and writes no files (run `wukongc --train` to use \
+                     {flag})"
+                ),
+            );
+            return exit::UNIMPLEMENTED;
+        }
+    }
+    let artifact = match build_train_artifact(program, interner, opts, lens) {
+        Ok(artifact) => artifact,
+        Err(e) => {
+            emit_driver_error(opts, format!("--train: {e}"));
+            return exit::COMPILE_ERROR;
+        }
+    };
+    // The same backend gate every other artifact gets (see `compile`), over the program that
+    // actually reaches Cranelift: the generated kernels, the dispatcher and the synthesized `main`.
+    timer.begin("verify");
+    if verify_or_ice(&artifact) {
+        return exit::COMPILE_ERROR;
+    }
+    // The training program is optimized at `-O1` at least (autodiff needs it), so it is code-
+    // generated at that floor too — the optimizing Cranelift configuration the `--train
+    // --backend=native` JIT compiles the same dispatcher with.
+    let mut aot = opts.clone();
+    aot.opt_level = opts.opt_level.max(1);
+    emit_native(&artifact, interner, &aot, timer)
+}
 
-    for step in 0..steps {
-        for stream in &mut streams {
-            let i = stream.index;
-            stream.load(step, &mut bufs[i])?;
-        }
-        for (saved, &i) in snapshot.iter_mut().zip(&restore) {
-            saved.copy_from_slice(&bufs[i]);
-        }
-        bufs[loss_out][0] = 0.0;
-        for g in &mut bufs[nparams..] {
-            g.fill(0.0);
-        }
-        // The gradient kernel replays the forward, so one call gives the current loss + the gradients.
-        run(&train_prog, gname, &mut bufs, interner)?;
-        traj.push(bufs[loss_out][0]);
-        for (saved, &i) in snapshot.iter().zip(&restore) {
-            bufs[i].copy_from_slice(saved);
-        }
+/// The program a training artifact is code-generated from: [`build_training`]'s kernels, the
+/// dispatcher, the spec blob and the synthesized `main`. Verified before it is returned.
+fn build_train_artifact(
+    program: &wukong_mir::Program,
+    interner: &mut Interner,
+    opts: &Options,
+    lens: &[usize],
+) -> Result<wukong_mir::Program, String> {
+    use wukong_mir::{Builder, ExternFn, ExternParam, MirType, Op, StaticData};
 
-        let (params, grads) = bufs.split_at_mut(nparams);
-        if let Some(max_norm) = opts.grad.train_clip {
-            training::clip_global_norm(grads, max_norm);
-        }
-        let lr = training::lr_at(
-            opts.grad.train_lr,
-            step,
-            steps,
-            opts.grad.train_warmup,
-            opts.grad.train_schedule,
-        );
-        match opts.grad.train_opt {
-            TrainOpt::Sgd => {
-                for (g, &wi) in grads.iter().zip(&wrt) {
-                    for (wv, &gv) in params[wi].iter_mut().zip(g) {
-                        *wv -= lr * gv;
-                    }
-                }
-            }
-            TrainOpt::AdamW => {
-                let t = (step + 1) as i32;
-                hpbuf.fill(0.0);
-                hpbuf[hp::LR] = lr;
-                hpbuf[hp::BETA1] = beta1 as f32;
-                hpbuf[hp::BETA2] = beta2 as f32;
-                hpbuf[hp::EPS] = eps as f32;
-                hpbuf[hp::WD] = weight_decay;
-                hpbuf[hp::BC1] = (1.0 - beta1.powi(t)) as f32;
-                hpbuf[hp::BC2] = (1.0 - beta2.powi(t)) as f32;
-                for (i, &wi) in wrt.iter().enumerate() {
-                    let aname = adamw[&lens[wi]];
-                    // The kernel's five buffers are moved in and back out — no copies.
-                    let mut ab = [
-                        std::mem::take(&mut params[wi]),
-                        std::mem::take(&mut grads[i]),
-                        std::mem::take(&mut mstate[i]),
-                        std::mem::take(&mut vstate[i]),
-                        std::mem::take(&mut hpbuf),
-                    ];
-                    let ran = run(&train_prog, aname, &mut ab[..], interner);
-                    let [w, g, m, v, h] = ab;
-                    params[wi] = w;
-                    grads[i] = g;
-                    mstate[i] = m;
-                    vstate[i] = v;
-                    hpbuf = h;
-                    ran?;
-                }
-            }
+    let wrt = check_training(program, interner, opts, lens)?;
+    let TrainingBuild {
+        program: mut artifact,
+        spec,
+        entries,
+    } = build_training(program, interner, opts, lens, wrt)?;
+    let dispatcher = training_native::add_dispatcher(&mut artifact, interner, &entries)?;
+    let main = interner.intern("main");
+    let entry = interner.intern(TRAIN_MAIN);
+    for taken in [main, entry] {
+        if artifact.function(taken).is_some() {
+            return Err(format!(
+                "the training program already defines `{}`, which a training artifact's entry \
+                 needs; rename the loss function",
+                interner.resolve(taken)
+            ));
         }
     }
-    // One final forward to report the loss after the last update (on the batch the next update
-    // would see).
-    for stream in &mut streams {
-        let i = stream.index;
-        stream.load(steps, &mut bufs[i])?;
+    // The spec blob, under the first free `__wukong_train_spec_<n>`.
+    let blob = spec.encode();
+    let mut suffix = 0;
+    let spec_name = loop {
+        let candidate = interner.intern(&format!("__wukong_train_spec_{suffix}"));
+        if artifact.function(candidate).is_none()
+            && !artifact.statics.iter().any(|s| s.name == candidate)
+        {
+            break candidate;
+        }
+        suffix += 1;
+    };
+    artifact.statics.push(StaticData {
+        name: spec_name,
+        bytes: blob.clone(),
+    });
+    // `int wukong_rt_train_main(const uint8_t *spec, int64_t len, void (*dispatch)(float **, u64))`.
+    let param = |ty: MirType, signed: bool| ExternParam { ty, signed };
+    let decl = ExternFn {
+        name: entry,
+        params: vec![
+            param(MirType::Ptr, false),
+            param(MirType::I64, true),
+            param(MirType::Ptr, false),
+        ],
+        ret: param(MirType::I32, true),
+    };
+    match artifact.extern_fn(entry) {
+        Some(existing) if *existing != decl => {
+            return Err(format!(
+                "the program declares `extern \"C\" fn {TRAIN_MAIN}` with another signature"
+            ))
+        }
+        Some(_) => {}
+        None => artifact.externs.push(decl),
     }
-    bufs[loss_out][0] = 0.0;
-    bufs.truncate(nparams);
-    for (saved, &i) in snapshot.iter_mut().zip(&restore) {
-        saved.copy_from_slice(&bufs[i]);
-    }
-    run(&train_prog, fwd_name, &mut bufs, interner)?;
-    traj.push(bufs[loss_out][0]);
-    // The returned buffers are what `--train-save` writes: the trained values, not whatever the
-    // reporting forward left in a buffer it writes (the same restore every training step does).
-    for (saved, &i) in snapshot.iter().zip(&restore) {
-        bufs[i].copy_from_slice(saved);
-    }
-    Ok((traj, bufs))
+    let mut b = Builder::new(main, MirType::I32);
+    let spec_ptr = b.build(MirType::Ptr, Op::GlobalAddr(spec_name));
+    let spec_len = b.build(MirType::I64, Op::ConstInt(blob.len() as i128, MirType::I64));
+    let dispatch = b.build(MirType::Ptr, Op::FuncAddr(dispatcher));
+    let code = b.build(
+        MirType::I32,
+        Op::Call {
+            func: entry,
+            args: vec![spec_ptr, spec_len, dispatch],
+        },
+    );
+    b.ret(Some(code));
+    artifact.funcs.push(b.finish());
+    wukong_opt::verify_program_stage(&artifact, "training artifact")
+        .map_err(|failure| failure.to_string())?;
+    Ok(artifact)
 }
 
 /// Print the MIR for `program`, running the verifier first. Any verifier failure is emitted as an
@@ -3784,26 +3878,6 @@ mod grad_cli_tests {
         };
         let lens = loss_param_lens(&sema, &mut interner, &opts).expect("param sizes");
         assert_eq!(lens, vec![12, 8, 6, 1], "x[12], w[8], t[6], out[1]");
-    }
-
-    /// N80: the `--train` initializer covers its documented range symmetrically. It used to keep
-    /// 31 bits of the LCG state and divide by `u32::MAX`, so every value lay in `[-0.4, 0)`.
-    #[test]
-    fn train_init_is_uniform_and_symmetric_about_zero() {
-        let mut seed = GradOptions::default().train_seed;
-        let v = train_rand(&mut seed, 4096);
-        assert!(
-            v.iter().all(|x| (-0.4..0.4).contains(x)),
-            "out of [-0.4, 0.4)"
-        );
-        let negative = v.iter().filter(|&&x| x < 0.0).count();
-        assert!(
-            (1848..=2248).contains(&negative),
-            "{negative} of 4096 negative"
-        );
-        let mean = v.iter().map(|&x| f64::from(x)).sum::<f64>() / v.len() as f64;
-        assert!(mean.abs() < 0.02, "mean {mean}");
-        assert!(v.iter().any(|&x| x > 0.35) && v.iter().any(|&x| x < -0.35));
     }
 
     #[test]

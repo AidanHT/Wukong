@@ -44,6 +44,7 @@ atan.wk: wukong_vmath_f32
 atan2_hypot.wk: wukong_vmath2_f32
 attention.wk: wukong_norm_f32 wukong_sgemm wukong_sgemm_nt
 autodiff_train_helper.wk:
+autodiff_train_mlp.wk: wukong_sgemm_nt_epi_parallel wukong_sgemm_nt_epi_parallel*2 wukong_sreduce_f32_parallel
 autodiff_train_sumsq.wk: wukong_sreduce_f32_parallel
 avgpool.wk: wukong_avgpool2d_f32
 axpby_f16.wk: wukong_axpby_f16

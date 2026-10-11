@@ -32,7 +32,9 @@ OPTIONS:
                        buffer parameters of the loss function). For --train, these are the
                        trainable weights; other buffers are fixed data; the last param is the loss.
     --train            Run a fwd->bwd->optimizer loop on the loss fn and print the loss trajectory
-                       (interp or native JIT; concrete f32 buffers; incompatible with --emit/-o)
+                       (interp or native JIT; concrete f32 buffers). With --emit=exe|obj (or -o),
+                       build the loop into an executable/object instead: it prints exactly the
+                       trajectory --train prints (not with --train-init/-data/-save)
     --train-steps=<n>  Number of training steps  (default: 100)
     --train-lr=<f>     Learning rate  (default: 0.01)
     --train-weight-decay=<f>  AdamW decoupled weight decay, finite and >= 0 (default: 0)
@@ -96,6 +98,7 @@ EXAMPLES:
     wukongc --emit=tokens examples/vadd.wk
     wukongc --run examples/gemm.wk
     wukongc --emit=grad --grad-of=loss model.wk
+    wukongc --train --train-opt=adamw --emit=exe -o train.exe model.wk
     wukongc --run model.wk -- data/weights.bin 64
     wukongc --run -e 'fn main() -> i32 { printf(\"{}\\n\", 6 * 7); return 0; }'
 ";
@@ -634,12 +637,18 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     // and `--run --emit=tokens|ast|mir-high|grad` prints the artifact and never runs. Reject the
     // combination rather than report success for work that was not done. (`emit_explicit` exists
     // precisely for this check; it used to be discarded at the end of `parse_args`.)
-    if opts.grad.train && (emit_explicit || opts.output.is_some()) {
-        return Err(
-            "`--train` cannot be combined with explicit `--emit=<stage>` or `-o`: \
-                    training executes immediately and emits no compiled artifact"
-                .into(),
-        );
+    // `--train` either runs now or, with `--emit=exe|obj` (or `-o`, whose default stage is `exe`),
+    // is built into an artifact that runs the same loop. No other stage is a training artifact.
+    if opts.grad.train {
+        if emit_explicit && !matches!(opts.emit, EmitStage::Obj | EmitStage::Exe) {
+            return Err(
+                "`--train` cannot be combined with `--emit=<stage>` other than `exe` or `obj`: \
+                 training executes immediately, or is built into an executable or object with \
+                 `--emit=exe` / `--emit=obj`"
+                    .into(),
+            );
+        }
+        opts.grad.train_artifact = emit_explicit || opts.output.is_some();
     }
     if opts.run && emit_explicit {
         return Err(
@@ -825,6 +834,40 @@ mod tests {
         ] {
             assert!(USAGE.contains(flag), "USAGE must document {flag}");
         }
+    }
+
+    /// `--train` runs at once unless an artifact is asked for: `--emit=exe|obj`, or `-o` (whose
+    /// stage is the default `exe`). Every other stage is refused, as are `--run` with a stage and
+    /// `-o` with `--run`.
+    #[test]
+    fn train_artifact_stages_parse() {
+        let parse = |a: &[&str]| parse_args(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let now = parse(&["--train", "m.wk"]).unwrap().unwrap();
+        assert!(now.grad.train && !now.grad.train_artifact);
+        for (args, stage) in [
+            (&["--train", "--emit=exe", "m.wk"][..], EmitStage::Exe),
+            (
+                &["--train", "--emit=obj", "-o", "m.o", "m.wk"][..],
+                EmitStage::Obj,
+            ),
+            (&["--train", "-o", "m.exe", "m.wk"][..], EmitStage::Exe),
+        ] {
+            let o = parse(args).unwrap().unwrap();
+            assert!(o.grad.train && o.grad.train_artifact, "{args:?}");
+            assert_eq!(o.emit, stage, "{args:?}");
+        }
+        for stage in [
+            "tokens", "ast", "check", "mir-high", "mir", "grad", "llvm-ir",
+        ] {
+            let err = parse(&["--train", &format!("--emit={stage}"), "m.wk"]).unwrap_err();
+            assert!(
+                err.contains("training executes immediately"),
+                "{stage}: {err}"
+            );
+        }
+        assert!(parse(&["--train", "--run", "--emit=exe", "m.wk"]).is_err());
+        assert!(parse(&["--train", "--run", "-o", "m.exe", "m.wk"]).is_err());
+        assert!(USAGE.contains("--emit=exe|obj"));
     }
 
     #[test]

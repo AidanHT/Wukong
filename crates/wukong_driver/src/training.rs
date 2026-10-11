@@ -1,6 +1,7 @@
-//! The `--train` loop's data plumbing and update policy (N82, stage 1): initial buffers and streamed
-//! batches read from files, trained buffers written back, the learning-rate schedule (linear
-//! warmup, then constant or cosine decay) and the global gradient-norm clip.
+//! The `--train` loop's data plumbing (N82, stage 1): initial buffers and streamed batches read
+//! from files, and trained buffers written back. The update policy itself — the learning-rate
+//! schedule (linear warmup, then constant or cosine decay) and the global gradient-norm clip — moved
+//! with the loop into `wukong_runtime::train`, which a `--train --emit=exe` artifact links too.
 //!
 //! Every file is the layout the language's own `read_f32`/`write_f32` builtins use — a headerless
 //! run of little-endian IEEE-754 binary32 values — so a `.wk` program, a `--train-save`
@@ -20,50 +21,14 @@ pub enum TrainSchedule {
     Cosine,
 }
 
-/// The learning rate of update `step` (0-based) of a `steps`-update run.
-///
-/// The first `warmup` updates ramp linearly to the base rate (`base·(step + 1)/warmup`, so the
-/// last warmup update uses the full rate); after that the schedule applies, the cosine one over the
-/// remaining `steps - warmup` updates. With no warmup and the constant schedule this is `base`
-/// itself, bit for bit — the default run is unchanged.
-pub(crate) fn lr_at(
-    base: f32,
-    step: usize,
-    steps: usize,
-    warmup: usize,
-    schedule: TrainSchedule,
-) -> f32 {
-    if step < warmup {
-        return (f64::from(base) * (step + 1) as f64 / warmup as f64) as f32;
-    }
-    match schedule {
-        TrainSchedule::Constant => base,
-        TrainSchedule::Cosine => {
-            let span = steps.saturating_sub(warmup).max(1);
-            let progress = (step - warmup) as f64 / span as f64;
-            (f64::from(base) * 0.5 * (1.0 + (std::f64::consts::PI * progress).cos())) as f32
+impl TrainSchedule {
+    /// The runtime's spelling of the schedule, which [`wukong_runtime::train::lr_at`] applies.
+    pub(crate) fn runtime(self) -> wukong_runtime::train::Schedule {
+        match self {
+            TrainSchedule::Constant => wukong_runtime::train::Schedule::Constant,
+            TrainSchedule::Cosine => wukong_runtime::train::Schedule::Cosine,
         }
     }
-}
-
-/// `torch.nn.utils.clip_grad_norm_`: the global L2 norm over every trainable gradient (accumulated
-/// in f64, so the norm itself carries no f32 summation-order error); when `max_norm / (norm + 1e-6)`
-/// is below one, every gradient is scaled by it. Returns the norm before clipping.
-pub(crate) fn clip_global_norm(grads: &mut [Vec<f32>], max_norm: f32) -> f64 {
-    let norm = grads
-        .iter()
-        .flatten()
-        .map(|&g| f64::from(g) * f64::from(g))
-        .sum::<f64>()
-        .sqrt();
-    let coef = f64::from(max_norm) / (norm + 1e-6);
-    if coef < 1.0 {
-        let c = coef as f32;
-        for g in grads.iter_mut().flatten() {
-            *g *= c;
-        }
-    }
-    norm
 }
 
 /// Decode little-endian f32 values from `bytes` (a multiple of 4 long) into `dst`.
@@ -210,54 +175,6 @@ pub(crate) fn validate(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn default_schedule_is_the_base_rate_bit_for_bit() {
-        for step in [0, 1, 7, 99] {
-            let lr = lr_at(0.013, step, 100, 0, TrainSchedule::Constant);
-            assert_eq!(lr.to_bits(), 0.013f32.to_bits());
-        }
-    }
-
-    /// Warmup `w = 4`: updates 0..3 use base·1/4 .. base·4/4, then the schedule. Cosine over the
-    /// remaining 8 updates: 1, (1 + cos(π/8))/2, ..., never zero on an update.
-    #[test]
-    fn warmup_then_cosine_follows_the_torch_schedule() {
-        let base = 0.5f32;
-        let got: Vec<f32> = (0..12)
-            .map(|s| lr_at(base, s, 12, 4, TrainSchedule::Cosine))
-            .collect();
-        assert_eq!(&got[..4], &[0.125f32, 0.25, 0.375, 0.5]);
-        for (k, &lr) in got[4..].iter().enumerate() {
-            let want = 0.5 * 0.5 * (1.0 + (std::f64::consts::PI * k as f64 / 8.0).cos());
-            assert!(
-                (f64::from(lr) - want).abs() < 1e-7,
-                "update {}: {lr}",
-                k + 4
-            );
-            assert!(lr > 0.0);
-        }
-        // A constant schedule after the same warmup holds the base rate.
-        assert_eq!(lr_at(base, 9, 12, 4, TrainSchedule::Constant), base);
-        // Cosine with nothing after the warmup still answers (no division by zero).
-        assert_eq!(lr_at(base, 4, 4, 4, TrainSchedule::Cosine), base);
-    }
-
-    /// `clip_grad_norm_`: [3, 4] has norm 5; clipped to 1 it becomes [0.6, 0.8] (up to the 1e-6
-    /// guard); a norm already under the bound is untouched, bit for bit.
-    #[test]
-    fn clip_scales_only_above_the_bound() {
-        let mut g = vec![vec![3.0f32], vec![4.0f32]];
-        let norm = clip_global_norm(&mut g, 1.0);
-        assert_eq!(norm, 5.0);
-        assert!(
-            (g[0][0] - 0.6).abs() < 1e-6 && (g[1][0] - 0.8).abs() < 1e-6,
-            "{g:?}"
-        );
-        let mut small = vec![vec![0.3f32, -0.4]];
-        clip_global_norm(&mut small, 1.0);
-        assert_eq!(small, vec![vec![0.3f32, -0.4]]);
-    }
 
     #[test]
     fn files_round_trip_and_batches_stream_in_order() {
