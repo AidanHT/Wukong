@@ -461,9 +461,9 @@ invalidated, and the call-effect table for the callees optimized so far. A cache
 `-O3` currently runs the same pass pipeline as `-O2`: there are no `-O3`-exclusive passes yet
 (`PassManager::standard` adds passes at `-O1` and `-O2` only).
 
-**The MIR loop vectorizer** (`src/vectorize.rs`) widens a canonical counted loop (unit step, one
-straight-line body or one if-converted diamond) into 128-bit vectors, keeping the original loop as
-the scalar epilogue. Its invariant is that lane `k` of a group executes exactly what scalar
+**The MIR loop vectorizer** (`src/vectorize.rs`) widens a canonical counted loop (a step of `+1`
+or `-1`; one straight-line body, one if-converted diamond, or a small nest of conditionals) into
+128-bit vectors, keeping the original loop as the scalar epilogue. Its invariant is that lane `k` of a group executes exactly what scalar
 iteration `i + k` would have, so interp and native stay bit-identical and `-O0` matches `-O2`. The
 group width is `W = 16 / narrowest lane bytes` over everything the body widens (LLVM
 LoopVectorize's rule); a wider value is up to four parts, and lane-count-changing casts are
@@ -480,7 +480,25 @@ is data the object it reads (`MemAccess::gather_base`) and accepts it only when 
 can reach that object (two slots, `@noalias`, or a non-escaping local). Two guards keep replication
 honest: the induction variable's scalar *address* face may never meet a lane-varying operand
 (`x[i + q[i]]` is declined, not replicated with the group's first `i`), and replication is taken only
-beside at least as much widened arithmetic. Scatters, reverse loops and gapped groups stay scalar.
+beside at least as much widened arithmetic. Scatters, gapped groups, strides above 4 and masked
+group accesses stay scalar.
+
+**Countdowns** (`VecPlan::dir`): `while i > 0 { i = i - 1; .. }` and `while i >= 0 { ..; i = i - 1
+}` widen with the group walking down. Lane `k` is still the group's `k`-th iteration (counter
+`i - k`), so every fold, merge and mask is unchanged; a contiguous access loads or stores the `W`
+elements ending at lane 0's element as one vector per part, reversed by a single-source `Shuffle`
+(bit-exact, nothing computed), the lane ramp is `splat(i) - iota`, and the trip is `start - end`
+(`+ 1` for `>=`, taken only below the type's maximum). The runtime alias guard turns the countdown's
+range around before building each window. Search loops, arm bounds checks, argmax/FindLastIV (whose
+folds read counter order as iteration order) and interleave groups stay with ascending loops, as
+does a negative stride on an ascending counter (`x[n - 1 - i]`). `WUKONG_NO_REVERSE_VEC=1` restores
+the decline.
+
+**Trip counts.** A runtime trip is `end - start` in the counter's own type, which wraps: an `i32`
+loop from `2147483600` to `-2147483600` runs no iteration but that difference is `96`. So the guard
+also tests `start < end` under the header's own signedness (`start > end` for a countdown) before
+reading the difference as a count — the vector loop runs no group whenever the scalar loop runs
+none, and every fold form then hands back its seed bit for bit (`tests/run/vec4_zero_trip_reductions.wk`).
 
 **Reductions** come from `loop_info::classify_carried`. Besides a binary or `fma` combine, two
 families are recognized. A **min/max** spelled as `select(cmp(pred, a, b), a, b)` (the lowering of
@@ -502,12 +520,20 @@ reduction *as a pair* (`Reduction::arg`, an `ArgIndex`): with a strict compare, 
 index selected from the lane ramp under the value compare's mask), and the vector exit folds the
 lanes by the loop's own compare first and iteration order second (`==` ties, so `±0` tie, broken by
 `(at - start)` unsigned) — the earliest member of the best class, NaN elements never updating, a NaN
-start updating nothing, exactly as the scalar loop (`emit_arg_combine`). `>=`, an `else`-arm update,
-a non-counter index and 64-bit values stay scalar. **FindLastIV** (`if c { last = i }`,
+start updating nothing, exactly as the scalar loop (`emit_arg_combine`). A non-strict `>=`/`<=`
+moves the index on a tie, so the scalar answer is the LAST member of the best class: its index lanes
+start at `start - 1` (an updated lane can now tie an un-updated one, and only the sentinel tells them
+apart), and the fold takes the strict form's better value or, on a tie, the larger
+`at - (start - 1)`, falling back to the loop's own index when no lane moved. An `else`-arm update, a
+non-counter index and 64-bit values stay scalar. **FindLastIV** (`if c { last = i }`,
 `RedKind::FindLast`) keeps per-lane last counters seeded at `start - 1`; the exit takes the unsigned
 max of `at - (start - 1)`, where `0` means nothing was recorded (`emit_find_last_combine`). The runtime alias guard is budgeted at
 eight checks per loop (LLVM's default threshold); `WUKONG_VEC_TRACE=1` prints each widening with a
-per-group cost estimate (`cost=vector/scalar`), which is reported but not yet enforced.
+per-group cost estimate (`cost=vector/scalar`, the scalar side counting `W` iterations of the
+longest path). It is **enforced at its one untuned threshold**: a loop whose vector group costs more
+than its `W` scalar iterations is declined (`cost_declines`; `WUKONG_VEC_COST=0` turns that off for a
+same-run A/B). Over `tests/run` that declined only two loops the nested if-converter had just started
+taking; a lower threshold needs a same-run release measurement first.
 
 **Search loops** (`EarlyExit`): a loop whose body block leaves on one arm (`if a[i] > t { break }`)
 before falling into a straight-line latch widens as one body split at the test. The condition goes
@@ -517,8 +543,12 @@ iteration and starting values, and the original loop re-runs at most `W` iterati
 exactly the iteration it always did. The rest of the group — its stores and accumulates — runs only
 when every lane continues. Nothing before the exit may store, gather or load an interleave window,
 and every contiguous load before it must provably read memory that exists for the whole trip: a
-stack array `[T; N]` with constant endpoints inside it, or a `[]T` slice searched up to its own
-length. A parameter buffer, whose extent MIR does not carry, keeps the search scalar.
+stack array `[T; N]` with constant endpoints inside it, a `[T; N]` or static-shape tensor
+**parameter** under the same constant-range test, or a `[]T` slice searched up to its own length. A
+fixed-extent buffer parameter carries its extent into MIR as `ParamAttrs::extent` (scalar-leaf count
+and leaf width — the unit both the slot-indexed interpreter and the byte-addressed native backend
+agree on); it is a type fact, not a promise, since a call with another length is `E0501` and no view
+reinterprets a buffer. A runtime bound, or any other pointer, keeps the search scalar.
 
 **Predicated arms**: if-conversion runs both arms for every lane, so an access only one arm makes
 cannot simply be widened. A store only one arm makes (`PredStore`) and a load no unconditional
@@ -526,10 +556,29 @@ access covers (`PredLoad`) instead run per lane through `select(lane took the ar
 scratch)`, where the scratch is one private stack slot per element type in the entry block. No lane
 reads or writes an element the scalar loop leaves alone — unlike a read-modify-write blend, which
 could race with another thread writing the skipped elements or read past a shorter buffer. Stores
-in both arms must still pair into one masked store. Only affine element accesses are predicated: an
-arm that alone subscripts a `[]T` parameter also re-reads its data pointer there, an invariant load
-no other access covers, and the loop stays scalar unless LICM has hoisted that read (a local slice,
-or a `@noalias` one).
+in both arms must still pair into one masked store. Only affine element accesses are predicated; an
+arm that alone subscripts a `[]T` re-reads its data pointer from the fat pointer there, and that one
+load — a parameter's or a local slot's own storage, live for the whole call — is speculated and
+hoisted into the guard (`speculable_ptr_load`).
+
+**Nested if-conversion** (`linearize_tree`, tried when the single-diamond flattener declines): the
+body is walked as a structured DAG — each conditional's two sides meet at its immediate
+post-dominator, entered by exactly those two edges — so every block runs under a conjunction of
+branch conditions (its path predicate) and every join's parameters are one `select` on the branch
+that split it. Stores after the first conditional are sunk to the region's end and must all name one
+address; what each lane's path leaves there is a `StoreTree` (the last store on the path, or
+nothing), so an `if / else if / else` chain storing on every path is one vector store of nested
+selects and a chain with no final `else` stores per lane to the element or the scratch slot. Arm
+loads are speculated when an access on every path covers them and predicated by their path
+predicate otherwise; no load may follow, on a path, a store it could read. A **bounds check inside
+an arm** — `cond_br (iv + k <u len), cont, dead end` — is read as a jump: its compare and length load
+leave the vector body, and the vector loop runs only when every index of its own iterations passes
+(`emit_len_checks`: `0 <= start + k`, `start + n_vec + k <= len`, no wrap), so a one-armed store over
+a checked `[]T` parameter widens and a buffer shorter than the trip runs the scalar loop, which
+checks and aborts where it always did. A check on the body's unconditional spine — the slow copy
+`bce` keeps — and any outer loop are still declined before the value analyses run. Nested guarded
+reductions, stores to two addresses in one nested region, and a bounds check whose index is not the
+counter plus a constant stay scalar.
 
 **Unrolling never reassociates.** Splitting a float reduction across several accumulators would
 break the 4-cycle `addss` dependency chain, and it computes a different number — which breaks both

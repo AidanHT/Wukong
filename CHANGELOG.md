@@ -5,6 +5,34 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Loop vectorizer: countdowns, nested if-conversion, parameter searches, cost model (`gap4/vectorizer`)
+
+- **A runtime trip that wraps runs no vector group (P1.16).** The vector loop's count was
+  `end - start` in the counter's type; an `i32` loop from `2147483600` to `-2147483600` runs no
+  iteration but that difference is `96`, and `-O2` read 24 groups past the buffer ("vector load out
+  of bounds" where `-O0` returned the seed). The guard now also requires `start < end` under the
+  header's signedness. The rest of the zero-trip audit needed no change: every fold form returns its
+  seed bit for bit below one group (`tests/run/vec4_zero_trip_reductions.wk`, `-0.0`/NaN/`+inf` and
+  `MIN`/`MAX`/`-1` seeds over f32, f64, i32 and i64).
+- **`>=`/`<=` argmax and argmin widen, the last tie winning.** Index lanes start one below the first
+  counter, and the exit fold takes the best value and, among equal ones, the latest index
+  (`tests/run/vec4_argmax_last_ties.wk`).
+- **Search loops over `[T; N]` and static-shape tensor parameters (N38).** Such a parameter now
+  records its extent in MIR (`ParamAttrs::extent`), so a search whose constant bound keeps every
+  group load inside it widens (`tests/run/vec4_search_param_extent.wk`).
+- **`else if` chains and checked one-armed stores (N39).** A small nest of conditionals is flattened
+  with path predicates: a chain storing on every path is one vector store of nested selects, one
+  with a path that stores nothing is predicated per lane, and a bounds check inside an arm (a
+  one-armed store over a plain `[]T` parameter) is dropped under a guard that every index of the
+  vector loop passes it (`tests/run/vec4_else_if_predication.wk`).
+- **Countdowns widen (N35).** `while i > 0 { i = i - 1; .. }` and `while i >= 0 { ..; i = i - 1 }`
+  load and store each part as one vector reversed by a shuffle, lane `k` still iteration `k`
+  (`tests/run/vec4_reverse_loops.wk`; `WUKONG_NO_REVERSE_VEC=1` restores the decline). Searches,
+  argmax/FindLastIV and interleave groups stay with ascending loops.
+- **The cost model is enforced (N43).** A loop whose estimated vector group costs more than its `W`
+  scalar iterations is declined (`WUKONG_VEC_COST=0` disables); over `tests/run` that declines two
+  loops the nested if-converter had just started taking, and no loop widened before stops widening.
+
 ### Index-recording reductions (`gap3/vec-argmax`)
 
 - **Argmax/argmin and FindLastIV loops vectorize.** `if x[i] > m { m = x[i]; at = i; }` (and its
