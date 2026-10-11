@@ -1,0 +1,183 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 296
+// EXPECT-OUT: 253
+// EXPECT-OUT: 254
+// EXPECT-OUT: 253
+// EXPECT-OUT: 254
+// EXPECT-OUT: 253
+// EXPECT-OUT: 253
+// EXPECT-OUT: 254
+// EXPECT-OUT: 253
+// EXPECT-OUT: 254
+// EXPECT-OUT: 253
+// EXPECT-OUT: 254
+// EXPECT-OUT: 252
+// EXPECT-OUT: 253
+// EXPECT-OUT: 254
+// EXPECT-OUT: 253
+// EXPECT-OUT: 49057
+// EXPECT-OUT: 49144
+// EXPECT-OUT: 49134
+// EXPECT-OUT: 49124
+// EXPECT-OUT: 113
+// EXPECT-OUT: 72
+// EXPECT-OUT: 71
+// EXPECT-OUT: 3165
+// EXPECT-OUT: 3039
+// EXPECT-OUT: 3042
+// EXPECT-OUT: 3042
+// EXPECT-OUT: 4
+// EXPECT-OUT: 255
+// EXPECT-OUT: 72
+// EXPECT-OUT: -7
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 4
+// EXPECT-OUT: -30
+// EXPECT-OUT: 1
+// EXPECT-OUT: -4
+// EXPECT-OUT: 123
+// EXPECT-OUT: 9
+// EXPECT-OUT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 0
+// EXPECT-OUT: -2
+module tests.run.atomic_add_histogram
+
+// `atomic_add(place, v)` is `place = place + v`, wrapping at the place's width, as one
+// indivisible read-modify-write. Integer addition mod 2^n commutes, so under `@parallel` every
+// iteration's add lands exactly once whatever the schedule, and the native run must print the
+// interpreter's serial answer bit for bit.
+//
+// All four `@parallel` loops are outlined to `wukong_parallel_for` (check with `--emit=mir -O2`:
+// `hist$par`, `weighted$par` and `wrap8$par` are whole-function bodies and `wukong$par$0` is the
+// region inside `scaled`; each holds an `atomic.add`). Expected values come from the scalar loops,
+// computed independently of the compiler: x[i] = (i*7 + 3) % 97 for i in 0..4096, then
+//   hist:     the count of i with x[i] & 15 == b, for b in 0..16;
+//   weighted: the sum of x[i] over i with i & 3 == k, for k in 0..4;
+//   wrap8:    the count of i with x[i] % 3 == k, mod 256 (u8 wraps): 1393, 1352, 1351;
+//   scaled:   3 times the count of i with x[i] & 3 == k, for k in 0..4.
+// The serial section covers every place form at its wrap point: u8 250+10 = 4, 0+255 = 255,
+// 128+200 = 72; i32 5-12 = -7 and MIN-1 = MAX; a u32 field 4294967290 + 10*1 = 4 and an i16 field
+// 10*(-3) = -30; a u16 tuple field 65535+2 = 1 and an i64 one 1-5 = -4; a pointee 100+23 = 123
+// and an i32 pointee bumped through a call 4+5 = 9; a heap slice 0, 7, 0; and a `[]T` parameter
+// element -2.
+
+@parallel
+fn hist(x: [i32; 4096], mut h: [i64; 16]) {
+    for i in 0..4096 {
+        atomic_add(h[x[i] & 15], 1);
+    }
+}
+
+@parallel
+fn weighted(x: [i32; 4096], mut s: [i64; 4]) {
+    for i in 0..4096 {
+        atomic_add(s[i & 3], x[i] as i64);
+    }
+}
+
+@parallel
+fn wrap8(x: [i32; 4096], mut b: [u8; 3]) {
+    for i in 0..4096 {
+        atomic_add(b[x[i] % 3], 1);
+    }
+}
+
+// A loop that is not the whole body is a parallel region of its own.
+@parallel
+fn scaled(x: [i32; 4096], mut q: [i64; 4]) {
+    let k: i64 = 3;
+    for i in 0..4096 {
+        atomic_add(q[x[i] & 3], k);
+    }
+}
+
+struct Tally {
+    hits: u32,
+    delta: i16,
+}
+
+fn bump(p: *mut i32, by: i32) {
+    atomic_add(*p, by);
+}
+
+fn take_two(mut s: []i64) {
+    atomic_add(s[1], -2);
+}
+
+fn main() -> i32 {
+    let mut x: [i32; 4096] = [0; 4096];
+    for i in 0..4096 {
+        x[i] = (i * 7 + 3) % 97;
+    }
+
+    let mut h: [i64; 16] = [0; 16];
+    hist(x, h);
+    for k in 0..16 {
+        print(h[k]);
+    }
+    let mut s: [i64; 4] = [0; 4];
+    weighted(x, s);
+    for k in 0..4 {
+        print(s[k]);
+    }
+    let mut b: [u8; 3] = [0; 3];
+    wrap8(x, b);
+    for k in 0..3 {
+        print(b[k]);
+    }
+    let mut q: [i64; 4] = [0; 4];
+    scaled(x, q);
+    for k in 0..4 {
+        print(q[k]);
+    }
+
+    let mut bytes: [u8; 3] = [250, 0, 128];
+    atomic_add(bytes[0], 10);
+    atomic_add(bytes[1], 255);
+    atomic_add(bytes[2], 200);
+    for k in 0..3 {
+        print(bytes[k]);
+    }
+
+    let mut v: [i32; 2] = [5, -2147483647 - 1];
+    atomic_add(v[0], -12);
+    atomic_add(v[1], -1);
+    print(v[0]);
+    print(v[1]);
+
+    let mut t = Tally { hits: 4294967290, delta: 0 };
+    for _k in 0..10 {
+        atomic_add(t.hits, 1);
+        atomic_add(t.delta, -3);
+    }
+    print(t.hits);
+    print(t.delta);
+
+    let mut pair: (i64, u16) = (1, 65535);
+    atomic_add(pair.1, 2);
+    atomic_add(pair.0, -5);
+    print(pair.1);
+    print(pair.0);
+
+    let mut cell: i64 = 100;
+    let p: *mut i64 = &mut cell;
+    atomic_add(*p, 23);
+    print(cell);
+    let mut small: i32 = 4;
+    bump(&mut small, 5);
+    print(small);
+
+    let heap = alloc_i32(3);
+    atomic_add(heap[1], 7);
+    for k in 0..3 {
+        print(heap[k]);
+    }
+    free(heap);
+
+    let mut pairs: [i64; 2] = [0, 0];
+    take_two(pairs);
+    print(pairs[1]);
+    return 0;
+}

@@ -65,6 +65,9 @@ mod scalar_builtins;
 // The printing builtins, routed by the printed value's source type (see the module docs).
 mod text;
 
+// The `atomic_add(place, v)` builtin (one `Op::AtomicAdd`; see the module docs).
+mod atomics;
+
 use std::cell::{Cell, RefCell};
 
 use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -14853,6 +14856,7 @@ impl FnLowerer<'_> {
             captures: Vec::new(),
             accesses: HashMap::default(),
             written: Vec::new(),
+            atomic: Vec::new(),
             env: Vec::new(),
             derived: HashMap::default(),
             depth: 0,
@@ -14861,6 +14865,32 @@ impl FnLowerer<'_> {
         self.scan_region_block(body, &mut sc);
         if !sc.ok {
             return None;
+        }
+        // An atomically updated array is safe to split across chunks only if no iteration
+        // observes it in between: no plain read or write of it, and none of any capture that may
+        // be the same buffer (the parameter storage-class rule below). A read of a counter other
+        // iterations are still adding to would see a schedule-dependent value; such a region
+        // stays serial.
+        for arr in &sc.atomic {
+            if sc.accesses.contains_key(arr) {
+                return None;
+            }
+            let (base, _) = self.lookup(*arr)?;
+            let aty = self.buffer_param_ty(*arr);
+            let shares = |c: Symbol| {
+                self.lookup(c).is_some_and(|(other, _)| other == base)
+                    || (aty.is_some_and(|a| {
+                        self.buffer_param_ty(c)
+                            .is_some_and(|t| noalias::could_share_storage(a, t))
+                    }) && !self.promised_disjoint(*arr, c))
+            };
+            if sc
+                .captures
+                .iter()
+                .any(|c| c != arr && shares(*c) && sc.accesses.contains_key(c))
+            {
+                return None;
+            }
         }
         for arr in &sc.written {
             let accs = sc.accesses.get(arr)?;
@@ -15182,6 +15212,47 @@ impl FnLowerer<'_> {
         }
     }
 
+    /// `atomic_add(place, value)` in a region body. The value and the place's index are ordinary
+    /// reads. The place must be one element of an array, as for a plain write: a body-local
+    /// array is private to the iteration, and a captured one is recorded in
+    /// [`RegionScan::atomic`] instead of as an access, because adds that commute need no
+    /// disjointness proof. Any other place (a field, a pointee, a multi-index tensor element)
+    /// declines the region.
+    fn scan_region_atomic<'e>(&self, place: &'e Expr, value: &'e Expr, sc: &mut RegionScan<'e>) {
+        self.scan_region_expr(value, sc);
+        let ExprKind::Index { base, indices } = &place.kind else {
+            sc.ok = false;
+            return;
+        };
+        for ix in indices {
+            self.scan_region_expr(ix, sc);
+        }
+        if !sc.ok {
+            return;
+        }
+        let Some(bsym) = single_path(base) else {
+            sc.ok = false;
+            return;
+        };
+        let owned_array = matches!(self.expr_ty(base), Ty::Array { .. })
+            && self.region_value_is_owned(&self.expr_ty(base));
+        if bsym != sc.hh && sc.is_local(bsym) {
+            sc.ok = owned_array;
+            return;
+        }
+        if self.lookup(bsym).is_none()
+            || !self.region_capture(bsym, sc)
+            || !owned_array
+            || indices.len() != 1
+        {
+            sc.ok = false;
+            return;
+        }
+        if !sc.atomic.contains(&bsym) {
+            sc.atomic.push(bsym);
+        }
+    }
+
     fn scan_region_expr<'e>(&self, e: &'e Expr, sc: &mut RegionScan<'e>) {
         if !sc.ok {
             return;
@@ -15221,6 +15292,22 @@ impl FnLowerer<'_> {
             // shares its name with a scalar intrinsic (`gelu(x, out)` vs `gelu(x)`) but writes a
             // whole buffer, so it is never pure here.
             ExprKind::Call { callee, args, .. } => {
+                // `atomic_add(arr[i], v)`: the one impure call a region admits (see
+                // `scan_region_atomic`). A user function or local of that name is an ordinary
+                // callee and declines below.
+                if let Some(sym) = single_path(callee) {
+                    if wukong_sema::is_atomic_add(self.interner.resolve(sym))
+                        && args.len() == 2
+                        && self.lookup(sym).is_none()
+                        && !matches!(
+                            self.sema.defs.lookup(sym).map(|d| &d.kind),
+                            Some(DefKind::Fn(_))
+                        )
+                    {
+                        self.scan_region_atomic(&args[0], &args[1], sc);
+                        return;
+                    }
+                }
                 // The RNG scalars (`rand_f32(seed, i)`, …) are pure too: counter-based, no state.
                 let pure_math = !self.sema.builtin_calls.contains_key(&e.id)
                     && single_path(callee)
@@ -22830,6 +22917,9 @@ impl FnLowerer<'_> {
                 if let Some(()) = self.lower_sync_block(self.interner.resolve(name), args) {
                     return self.const_zero(MirType::I32);
                 }
+                if let Some(()) = self.lower_atomic_add(self.interner.resolve(name), args) {
+                    return self.const_zero(MirType::I32);
+                }
                 // Fused attention `sdpa(...)` lowers to one runtime-kernel call (no S×S scores).
                 if let Some(v) = self.lower_attention(name, args) {
                     return v;
@@ -26304,6 +26394,11 @@ struct RegionScan<'a> {
     captures: Vec<Symbol>,
     accesses: HashMap<Symbol, Vec<RegionAccess<'a>>>,
     written: Vec<Symbol>,
+    /// Captured arrays an `atomic_add(arr[i], v)` in the body updates. They need no disjointness
+    /// proof -- every iteration's add lands exactly once, in any order, and integer addition
+    /// commutes -- but nothing else in the region may read or write them, through any name that
+    /// can share their storage (see [`FnLowerer::match_parallel_region`]).
+    atomic: Vec<Symbol>,
     env: Vec<(Symbol, Option<(i128, i128)>)>,
     /// Body-locals currently `let`-bound to an affine combination of the region var's div/mod
     /// digits (`let hh = t / T; let r0 = (t % T) * SROWS;`). Maintained flow- and scope-correctly
@@ -33932,6 +34027,58 @@ fn mm(a: [f32; 16], b: [f32; 16], mut c: [f32; 16]) {
                 assert!(wukong_mir::verify::verify_function(f).is_empty());
             }
         }
+    }
+
+    /// The parallel-region proof admits `atomic_add(arr[i], v)` on a captured array that nothing
+    /// else in the region reads or writes, through any name that can share its storage: the adds
+    /// commute, so chunking cannot change the result. Every other shape keeps the loop serial.
+    #[test]
+    fn parallel_region_admits_atomic_adds_to_otherwise_untouched_arrays() {
+        let outlines = |src: &str| {
+            let (prog, diags, interner) = lower(src);
+            assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+            for f in &prog.funcs {
+                let errs = wukong_mir::verify::verify_function(f);
+                assert!(errs.is_empty(), "{}: {errs:?}", interner.resolve(f.name));
+            }
+            prog_calls(&prog, &interner, "wukong_parallel_for")
+        };
+        // A histogram: `x` (i32) cannot share storage with `h` (i64).
+        assert!(outlines(
+            "@parallel fn hist(x: [i32; 64], mut h: [i64; 4]) { \
+                 for i in 0..64 { atomic_add(h[x[i] & 3], 1); } }"
+        ));
+        // A body-local array is private to its iteration.
+        assert!(outlines(
+            "@parallel fn f(x: [i32; 64], mut h: [i64; 4]) { \
+                 for i in 0..64 { let mut t: [i64; 2] = [0; 2]; atomic_add(t[1], 1); \
+                 atomic_add(h[x[i] & 3], t[1]); } }"
+        ));
+        // `x` and `h` have one element type, so the caller may pass one buffer as both: reading
+        // `x` while other iterations add to `h` is schedule-dependent. A `@noalias` promise
+        // separates them again.
+        assert!(!outlines(
+            "@parallel fn hist(x: [i64; 64], mut h: [i64; 4]) { \
+                 for i in 0..64 { atomic_add(h[x[i] & 3], 1); } }"
+        ));
+        assert!(outlines(
+            "@parallel fn hist(x: [i64; 64], @noalias mut h: [i64; 4]) { \
+                 for i in 0..64 { atomic_add(h[x[i] & 3], 1); } }"
+        ));
+        // The counters themselves read, or written plainly, in the region.
+        assert!(!outlines(
+            "@parallel fn f(x: [i32; 64], mut h: [i64; 4], mut o: [i32; 64]) { \
+                 for i in 0..64 { atomic_add(h[x[i] & 3], 1); o[i] = h[0] as i32; } }"
+        ));
+        assert!(!outlines(
+            "@parallel fn f(x: [i32; 64], mut h: [i64; 64]) { \
+                 for i in 0..64 { atomic_add(h[x[i] & 3], 1); h[i] = 0; } }"
+        ));
+        // A field or tuple-field place is not an array element: declined.
+        assert!(!outlines(
+            "@parallel fn f(x: [i32; 64], mut h: [(i64, i64); 4]) { \
+                 for i in 0..64 { atomic_add(h[x[i] & 3].0, 1); } }"
+        ));
     }
 
     #[test]

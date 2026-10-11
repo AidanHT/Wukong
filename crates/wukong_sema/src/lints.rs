@@ -900,12 +900,32 @@ impl<'a> FnLint<'a> {
                         }
                     }
                 }
+                // `atomic_add(place, v)` writes its first argument: visit it as an assignment
+                // target, or a `mut` buffer written only by atomics reads as never written
+                // (`unwritten_output`). Only the builtin -- a local or a user function of that
+                // name is an ordinary callee.
+                let atomic_place = match &callee.kind {
+                    ExprKind::Path(p) if p.is_single() => {
+                        let sym = p.first().sym;
+                        crate::is_atomic_add(self.interner.resolve(sym))
+                            && self.lookup(sym).is_none()
+                            && !matches!(
+                                self.sema.defs.lookup(sym).map(|d| &d.kind),
+                                Some(DefKind::Fn(_))
+                            )
+                    }
+                    _ => false,
+                };
                 self.expr(callee);
                 for g in generic_args {
                     self.type_expr(g);
                 }
-                for a in args {
-                    self.expr(a);
+                for (k, a) in args.iter().enumerate() {
+                    if k == 0 && atomic_place {
+                        self.place(a);
+                    } else {
+                        self.expr(a);
+                    }
                 }
             }
             ExprKind::Cast { expr, ty } => {
@@ -1678,6 +1698,24 @@ mod tests {
         // An unknown lint name is itself a warning.
         let src = "@allow(unused_varaibles)\nfn main() -> i32 { return 0; }";
         assert_eq!(codes(src), vec!["W0007"]);
+    }
+
+    /// `atomic_add(place, v)` writes its place: a `mut` buffer parameter updated only by atomics is
+    /// written (no `unwritten_output`), and a `mut` local array it targets is needed `mut` (no
+    /// `unused_mut`). The control without the atomic still warns.
+    #[test]
+    fn atomic_add_writes_its_place() {
+        let src = "fn count(x: [i32; 8], mut h: [i64; 4]) { \
+                       for i in 0..8 { atomic_add(h[x[i] & 3], 1); } } \
+                   fn main() -> i32 { let x: [i32; 8] = [1; 8]; let mut h: [i64; 4] = [0; 4]; \
+                       count(x, h); let mut c: [i32; 2] = [0; 2]; atomic_add(c[1], 2); \
+                       print(h[1]); print(c[1]); return 0; }";
+        assert_eq!(codes(src), Vec::<&str>::new());
+        let control = "fn count(x: [i32; 8], mut h: [i64; 4]) { \
+                           for i in 0..8 { print(h[x[i] & 3]); } } \
+                       fn main() -> i32 { let x: [i32; 8] = [1; 8]; \
+                           let mut h: [i64; 4] = [0; 4]; count(x, h); return 0; }";
+        assert!(codes(control).contains(&"W0006"), "{:?}", codes(control));
     }
 
     /// Every lint's code is catalogued: `--explain` must describe each one, and the name and the

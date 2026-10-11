@@ -22,6 +22,21 @@ All notable changes to Wukong are documented here. The format is loosely based o
   removed. A Cranelift stress test runs 2^16 adds into four counters, through `wukong_parallel_for`
   and from 8 OS threads at once, 10 rounds each; replacing the RMW with a load/add/store loses
   about two thirds of the updates there.
+- **`atomic_add(place, v)` (P15.15).** A statement builtin: `place = place + v`, wrapping at the
+  place's width, as one `Op::AtomicAdd`. `place` is an element (`b[i]`, `t[i, j]`, a slice
+  element, bounds-checked), a field (`s.f`, `t.0`) or a pointee (`*p`) of any integer type. A bare
+  name is `E0437`, a float/`bool`/`char` place `E0446`, a value of another integer type `E0447`, an
+  out-of-range literal `E0431`, wrong arity `E0503`, and a write through a non-`mut` aggregate
+  parameter `E0304`. The last uses `check_projection_write`, now shared with `=` and `op=`. The lints
+  read the first argument as a write, so a `mut` buffer updated only by atomics is not
+  `unwritten_output`. The `@parallel` region proof, shared by the whole-function outliner and
+  mid-function regions, now admits an atomic add to one element of a captured array that nothing
+  else in the loop reads or writes (nor any parameter that could be the same buffer). A histogram
+  is therefore really dispatched to `wukong_parallel_for`, and the native run prints the serial
+  answer bit for bit (`tests/run/atomic_add_histogram.wk`: three whole-function bodies, one
+  mid-function region and every place form at its wrap point; `tests/fail/atomic_add_float.wk`,
+  `tests/fail/atomic_add_not_place.wk`). Integer-only and without fetch-add by design;
+  `gpu-native` skips it as `UNSUPPORTED`.
 
 ### Type-lowering soundness (`gap4/sema-soundness`)
 

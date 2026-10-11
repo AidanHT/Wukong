@@ -385,7 +385,16 @@ the escape scan's fallback publishes the atomic's pointer, so its location is ne
 `@noalias`-promised, and every other access to it is untagged too); the LLVM text emits
 `atomicrmw add ... seq_cst`; `gpu-native` declines it. Every optimizer pass treats it as an opaque
 memory effect, exactly where it treats `VecKernelCall` as one (see `CONTRIBUTING.md`, "Adding a MIR
-`Op`"; `wukong_opt/src/atomic_tests.rs` pins the hazards). A
+`Op`"; `wukong_opt/src/atomic_tests.rs` pins the hazards). The source builtin
+`atomic_add(place, v)` is typed in `wukong_sema` (`type_atomic_add`: a place other than a bare
+name, an integer place type, a value of that type, `=`'s projection-write rule via
+`check_projection_write`) and lowered in `wukong_mir_build/src/atomics.rs` with the compound
+assignment's evaluation order (value, then the place's GEP and slice bounds check). The `@parallel`
+region proof (`match_parallel_region`, shared by the whole-function outliner and mid-function
+regions) admits it on one element of a captured fixed-size array: such an array needs no
+disjointness proof, because the adds commute, but no other access in the region may touch it or any
+captured parameter that can share its storage (`noalias::could_share_storage` without a
+`promised_disjoint` promise). Every other place declines the region. A
 string literal lowers to a read-only `.rodata` blob in `Program::statics` (a `StaticData { name,
 bytes }`) addressed by `Op::GlobalAddr`, so a returned or threaded `*u8` stays valid after its
 defining frame is gone. `Op::VecKernelCall` — a call into a synthesized 256-bit AVX2 kernel — is

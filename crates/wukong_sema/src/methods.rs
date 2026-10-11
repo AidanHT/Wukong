@@ -189,7 +189,7 @@ impl Sema<'_> {
             || crate::text::text_builtin(nm).is_some()
             || matches!(
                 nm,
-                "print" | "println" | "assert" | "free" | "now_ns" | "sync_block"
+                "print" | "println" | "assert" | "free" | "now_ns" | "sync_block" | "atomic_add"
             );
         if builtin {
             let nm = nm.to_string();

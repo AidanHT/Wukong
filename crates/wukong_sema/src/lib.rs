@@ -167,6 +167,15 @@ pub fn is_sync_block(name: &str) -> bool {
     name == "sync_block"
 }
 
+/// Whether `name` is the atomic integer add builtin, `atomic_add(place, v)`: a statement (type
+/// `()`) that adds `v` to the integer at `place` as one indivisible read-modify-write
+/// (`Op::AtomicAdd`). Shared by sema (which types it), the lints (which read its first argument as
+/// a place, not a value) and `mir_build` (which lowers it), so the three cannot drift. A
+/// user-defined `atomic_add` shadows it.
+pub fn is_atomic_add(name: &str) -> bool {
+    name == "atomic_add"
+}
+
 /// A resolved top-level definition.
 #[derive(Clone, Debug)]
 pub struct FnSig {
@@ -2737,6 +2746,44 @@ impl<'a> Sema<'a> {
         }
     }
 
+    /// E0304 for a write through a projection (`p.f`, `t.0`, `p[i]`, `t[i, j]`) of a non-`mut`
+    /// aggregate parameter, and the write-through-a-tensor-view diagnostic: the projection half of
+    /// `=`'s mutability rule, shared by every statement that writes a place (`x = v`, `x op= v` and
+    /// `atomic_add(place, v)`). A no-op for any other target: a bare name has its own rule, and a
+    /// dereference (`*p`, `(*p).f`) writes a pointee, not the parameter.
+    pub(crate) fn check_projection_write(&mut self, target: &Expr) {
+        if !matches!(
+            target.kind,
+            ExprKind::Field { .. } | ExprKind::TupleField { .. } | ExprKind::Index { .. }
+        ) {
+            return;
+        }
+        let Some(root) = self.assign_root_param(target) else {
+            return;
+        };
+        let decl = self
+            .immutable_param_decl(root)
+            .filter(|_| self.param_is_aggregate(root));
+        if let Some(decl) = decl {
+            let nm = self.sym_str(root).to_string();
+            self.immutable_assignment(
+                target.span,
+                format!(
+                    "cannot mutate `{nm}` through a non-`mut` parameter; an aggregate parameter is \
+                     passed by reference, so this would mutate the caller's value — add `mut` \
+                     to the parameter (`fn …(mut {nm}: …)`) to allow in-place mutation"
+                ),
+                "this store would mutate the caller's value",
+                decl,
+                Some(Span::new(decl.source, decl.lo, decl.lo)),
+                "parameter",
+                false,
+            );
+        } else if let Some(param) = self.tensor_view_root(root) {
+            self.report_write_through_view(target.span, root, param);
+        }
+    }
+
     /// Whether parameter `name`'s declared type is an aggregate passed BY REFERENCE (struct / tuple /
     /// array / tensor / vector — and a `[]T` slice, whose elements live in the caller's buffer) — the
     /// kinds whose through-projection mutation reaches the caller. Implemented as the complement of
@@ -3050,35 +3097,8 @@ impl<'a> Sema<'a> {
                             );
                         }
                     }
-                    ExprKind::Field { .. }
-                    | ExprKind::TupleField { .. }
-                    | ExprKind::Index { .. } => {
-                        if let Some(root) = self.assign_root_param(target) {
-                            let decl = self
-                                .immutable_param_decl(root)
-                                .filter(|_| self.param_is_aggregate(root));
-                            if let Some(decl) = decl {
-                                let nm = self.sym_str(root).to_string();
-                                self.immutable_assignment(
-                                    target.span,
-                                    format!(
-                                        "cannot mutate `{nm}` through a non-`mut` parameter; an \
-                                         aggregate parameter is passed by reference, so this would \
-                                         mutate the caller's value — add `mut` to the parameter \
-                                         (`fn …(mut {nm}: …)`) to allow in-place mutation"
-                                    ),
-                                    "this store would mutate the caller's value",
-                                    decl,
-                                    Some(Span::new(decl.source, decl.lo, decl.lo)),
-                                    "parameter",
-                                    false,
-                                );
-                            } else if let Some(param) = self.tensor_view_root(root) {
-                                self.report_write_through_view(target.span, root, param);
-                            }
-                        }
-                    }
-                    _ => {}
+                    // A projection (`p.f`, `t.0`, `p[i]`): the rule `atomic_add`'s place shares.
+                    _ => self.check_projection_write(target),
                 }
                 // Assigning a pointer/aggregate into a scalar place (or vice versa) reinterprets the
                 // bits — `x = p` for `x: i32`, `p: *i32` stores a truncated address, which the
@@ -5429,6 +5449,89 @@ mod tests {
         assert!(
             msgs.iter().any(|m| needles.iter().all(|n| m.contains(n))),
             "no {code} message contains {needles:?}; got {msgs:?} for {src:?}"
+        );
+    }
+
+    /// `atomic_add(place, v)`: a place other than a bare name, of an integer type, plus a value of
+    /// that type. Every misuse has its code; every place form is accepted.
+    #[test]
+    fn atomic_add_is_typed_as_an_integer_place_statement() {
+        let clean = |src: &str| {
+            let errs = errors(src);
+            assert!(errs.is_empty(), "{errs:?} for {src:?}");
+        };
+        // Every place form, every integer width and signedness, an adapting literal, and a
+        // non-literal of the place's own type.
+        clean(
+            "struct S { a: u8, b: i64 } \
+             fn f(mut h: [i64; 4], p: *mut u16, mut s: []i32, k: i64) { \
+                 atomic_add(h[1], k); atomic_add(*p, 7); atomic_add(s[0], -1); \
+                 let mut st = S { a: 1, b: 2 }; atomic_add(st.a, 255); atomic_add(st.b, k); \
+                 let mut t: (usize, i8) = (0, 0); atomic_add(t.0, 3); atomic_add(t.1, -128); \
+                 let mut m: [[u32; 2]; 2] = [[0; 2]; 2]; atomic_add(m[1][0], 4000000000); }",
+        );
+        // A literal-initialized binding takes the place's type at this use.
+        clean("fn f(mut h: [i64; 4]) { let d = 5; atomic_add(h[0], d); }");
+        // Arity.
+        assert_eq!(
+            errors("fn f(mut h: [i64; 4]) { atomic_add(h[0]); }"),
+            ["E0503"]
+        );
+        assert_eq!(
+            errors("fn f(mut h: [i64; 4]) { atomic_add(h[0], 1, 2); }"),
+            ["E0503"]
+        );
+        // Not a place: a bare name, a call result, a literal.
+        assert_eq!(
+            errors("fn f() { let mut n: i32 = 0; atomic_add(n, 1); }"),
+            ["E0437"]
+        );
+        assert_eq!(
+            errors("fn g() -> i32 { return 1; } fn f() { atomic_add(g(), 1); }"),
+            ["E0437"]
+        );
+        // Not an integer place: float, bool, char.
+        assert_eq!(
+            errors("fn f(mut h: [f32; 4]) { atomic_add(h[0], 1.0); }"),
+            ["E0446"]
+        );
+        assert_eq!(
+            errors("fn f(mut h: [bool; 4]) { atomic_add(h[0], true); }"),
+            ["E0446"]
+        );
+        assert_eq!(
+            errors("fn f(mut h: [char; 4]) { atomic_add(h[0], 'a'); }"),
+            ["E0446"]
+        );
+        // A value of another integer type, and a non-integer value.
+        assert_eq!(
+            errors("fn f(mut h: [i64; 4], k: i32) { atomic_add(h[0], k); }"),
+            ["E0447"]
+        );
+        assert_eq!(
+            errors("fn f(mut h: [i64; 4], x: f64) { atomic_add(h[0], x); }"),
+            ["E0446"]
+        );
+        // An out-of-range literal for the place's type.
+        assert_eq!(
+            errors("fn f(mut h: [u8; 4]) { atomic_add(h[0], 256); }"),
+            ["E0431"]
+        );
+        assert_eq!(
+            errors("fn f(mut h: [i8; 4]) { atomic_add(h[0], -129); }"),
+            ["E0431"]
+        );
+        // The write obeys `=`'s mutability rule: a non-`mut` aggregate parameter is the caller's.
+        assert_eq!(
+            errors("fn f(h: [i64; 4]) { atomic_add(h[0], 1); }"),
+            ["E0304"]
+        );
+        // ...while a pointee is not the parameter's own storage.
+        clean("fn f(p: *mut i64) { atomic_add(*p, 1); }");
+        // A user function named `atomic_add` shadows the builtin.
+        clean(
+            "fn atomic_add(a: i32, b: i32) -> i32 { return a + b; } \
+             fn f() -> i32 { let n: i32 = 1; return atomic_add(n, 2); }",
         );
     }
 

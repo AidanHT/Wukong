@@ -1880,6 +1880,47 @@ No garbage collector and no hidden allocations beyond what you `alloc_*` or `scr
 with `defer` (✅, below), and *named* allocator selection (`System`, `Pool` — 🔵) is still being
 wired to the surface.
 
+### Atomic integer add: `atomic_add` ✅
+
+`atomic_add(place, v)` adds `v` to the integer at `place` as one indivisible read-modify-write —
+`place = place + v`, wrapping at the place's width — and is a statement of type `()`. It is how
+iterations of a `@parallel` loop combine into one location (a histogram, a counter, a scatter
+count) without a data race:
+
+```wukong
+@parallel
+fn hist(x: [i32; 4096], mut h: [i64; 16]) {
+    for i in 0..4096 {
+        atomic_add(h[x[i] & 15], 1);
+    }
+}
+```
+
+- `place` is a place in memory other than a bare name: an element `b[i]` or `t[i, j]` (array, slice
+  or tensor), a field `s.f` or `t.0`, or a pointee `*p`. A bare local is private to the thread
+  running it, so `atomic_add(n, 1)` is **`E0437`** (write `n += 1`). The write obeys `=`'s rules: a
+  non-`mut` aggregate parameter is `E0304`, a slice index is bounds-checked.
+- The place's type is an integer of any width and signedness — `i8`..`i64`, `u8`..`u64`, `isize`,
+  `usize` — never `bool`, `char` or a float (**`E0446`**). Integer-only on purpose: integer addition
+  mod 2^n commutes, so every thread schedule leaves the same total, while a float sum depends on the
+  order of its adds.
+- `v` has the place's type. An unsuffixed literal adapts to it (out of range is `E0431`); a value of
+  another integer type is **`E0447`** (convert with `as`). Wrong arity is `E0503`.
+- Under `@parallel`, every iteration's add lands exactly once, so the native run prints the
+  interpreter's serial answer bit for bit. A loop whose only shared writes are atomic adds to a
+  captured fixed-size array is still outlined — whole-function or as a mid-function region — as
+  long as nothing else in the loop reads or writes that array, or any array parameter of the same
+  element type that the caller could pass as the same buffer (a `@noalias` promise rules that
+  out). Otherwise the loop runs serially, as for any write the proof cannot place.
+- Reading a location that other iterations are still adding to is a race, as for a plain store.
+  There is no fetch-add (the old value is not returned), no float atomic, and no other memory
+  order: every `atomic_add` is sequentially consistent.
+
+It is legal anywhere, not only under `@parallel`. On `--backend=gpu-native` it is not lowered
+(the program is skipped as `UNSUPPORTED`). A user function named `atomic_add` shadows the builtin
+(`tests/run/atomic_add_histogram.wk`; `tests/fail/atomic_add_float.wk`,
+`tests/fail/atomic_add_not_place.wk`).
+
 ### Scope-exit cleanup: `defer` ✅
 
 `defer <expr>;` runs `<expr>` when control leaves the enclosing block — however it leaves:
@@ -1941,8 +1982,9 @@ to hit a *captured fixed-size array* at an index carrying the loop variable as a
 (`hh*C + …`, or the tiled `t/C` / `t%C` pair); per-iteration scratch must be a `let` local inside the
 body. It declines — and the loop lowers serially — for a loop-carried accumulator (a write to a
 captured scalar), a non-affine or offset index, a local bound to a slice/pointer/reference (it might
-alias a capture), a call other than a pure math intrinsic or a counter-based RNG scalar (`rand_u32`,
-`rand_f32`, `randn_f32` — stateless, so chunking cannot change a lane; `print` would reorder output), a
+alias a capture), a call other than a pure math intrinsic, a counter-based RNG scalar (`rand_u32`,
+`rand_f32`, `randn_f32` — stateless, so chunking cannot change a lane; `print` would reorder output)
+or an `atomic_add` to a captured array element that nothing else in the loop touches (above), a
 `match`/`loop` expression in the body, a `return`/`defer`, and a labelled or loop-level
 `break`/`continue`. Two array **parameters** over the same element type may be one caller buffer
 whatever their declared lengths, so the proof covers the union of their accesses — unless a

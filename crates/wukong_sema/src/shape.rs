@@ -40,7 +40,7 @@
 
 use wukong_span::FxHashMap as HashMap;
 
-use wukong_ast::{Expr, ExprKind, NodeId, TypeExpr, TypeKind};
+use wukong_ast::{Expr, ExprKind, NodeId, TypeExpr, TypeKind, UnOp};
 use wukong_span::{Span, Symbol};
 use wukong_types::{Dim, Layout, Scalar, Shape, Ty};
 
@@ -171,6 +171,112 @@ fn layout_name(l: &Layout) -> String {
 }
 
 impl Sema<'_> {
+    /// Type `atomic_add(place, v)` (see [`crate::is_atomic_add`]). The first argument must be a
+    /// place in memory other than a bare name -- `b[i]`, `t[i, j]`, `s.f`, `t.0` or `*p` -- (`E0437`)
+    /// whose type is an integer scalar of any width and signedness, not `bool` or `char`
+    /// (`E0446`: a float sum depends on the order of the adds, so there is no atomic float add).
+    /// The value has the place's type: an unsuffixed literal adapts to it and is range-checked
+    /// (`E0431`), another integer type is `E0447`, a non-integer `E0446`. The write obeys the
+    /// projection half of `=`'s mutability rule (`E0304` through a non-`mut` aggregate parameter).
+    fn type_atomic_add(&mut self, args: &[Expr], arg_tys: &mut [Ty], span: Span) {
+        if args.len() != 2 {
+            self.error(
+                span,
+                "E0503",
+                format!(
+                    "`atomic_add` takes exactly 2 arguments (a place and the integer to add to \
+                     it), but {} were supplied",
+                    args.len()
+                ),
+            );
+            return;
+        }
+        let (place, value) = (&args[0], &args[1]);
+        let is_place = matches!(
+            place.kind,
+            ExprKind::Index { .. }
+                | ExprKind::Field { .. }
+                | ExprKind::TupleField { .. }
+                | ExprKind::Unary {
+                    op: UnOp::Deref,
+                    ..
+                }
+        );
+        if !is_place {
+            let what = if matches!(&place.kind, ExprKind::Path(p) if p.is_single()) {
+                "a bare name: a local is private to the thread running it, so there is nothing \
+                 to add atomically (use `+=`)"
+            } else {
+                "a value"
+            };
+            self.error(
+                place.span,
+                "E0437",
+                format!(
+                    "`atomic_add` expects a place in memory as its first argument -- an element \
+                     `b[i]`, a field `s.f` or `t.0`, or a pointee `*p` -- not {what}"
+                ),
+            );
+            return;
+        }
+        let elem = match &arg_tys[0] {
+            Ty::Scalar(s) if s.is_int() && *s != Scalar::Char => *s,
+            Ty::Unknown | Ty::Error => {
+                self.check_projection_write(place);
+                return;
+            }
+            other => {
+                let other = other.display(self.interner);
+                self.error(
+                    place.span,
+                    "E0446",
+                    format!(
+                        "`atomic_add` adds to an integer place, but this place has type \
+                         `{other}`; only integer addition is order-independent, so there is no \
+                         atomic add for a float, `bool` or `char`"
+                    ),
+                );
+                return;
+            }
+        };
+        let want = Ty::Scalar(elem);
+        // A literal-initialized binding passed as the value takes the place's type, if this is its
+        // first use (`infer.rs`), the way a call argument does.
+        self.constrain_literal_binding(value, None, &want, false);
+        if self.literal_adapts(&want, value) {
+            self.retype_adapted_literal(value, &want);
+            self.range_check_int_literal(value, &want);
+            arg_tys[1] = want.clone();
+        } else {
+            match &arg_tys[1] {
+                Ty::Scalar(v) if *v == elem => {}
+                Ty::Scalar(v) if v.is_int() && *v != Scalar::Char => {
+                    self.error(
+                        value.span,
+                        "E0447",
+                        format!(
+                            "`atomic_add` adds a value of the place's own type, `{}`, but this \
+                             value is `{}`; convert it with `as {}`",
+                            elem.name(),
+                            v.name(),
+                            elem.name()
+                        ),
+                    );
+                }
+                Ty::Unknown | Ty::Error => {}
+                other => {
+                    let other = other.display(self.interner);
+                    self.error(
+                        value.span,
+                        "E0446",
+                        format!("`atomic_add` adds an integer, but this value has type `{other}`"),
+                    );
+                }
+            }
+        }
+        self.check_projection_write(place);
+    }
+
     pub(crate) fn type_call(
         &mut self,
         callee: &Expr,
@@ -484,6 +590,13 @@ impl Sema<'_> {
                                 .to_string(),
                         );
                     }
+                    return Ty::Unit;
+                }
+                // `atomic_add(place, v)`: `place = place + v`, wrapping, as one indivisible
+                // read-modify-write. A statement of type `()`, legal anywhere.
+                if crate::is_atomic_add(self.sym_str(name)) {
+                    self.types.insert(callee.id, Ty::Unknown);
+                    self.type_atomic_add(args, &mut arg_tys, span);
                     return Ty::Unit;
                 }
                 // The text builtins (`printf`, `sprintf`, `print_raw`, `eprint`, `write_stdout`, …),
