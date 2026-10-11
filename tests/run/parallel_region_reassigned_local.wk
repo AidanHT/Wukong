@@ -31,7 +31,7 @@ fn digit_reassigned(mut out: [f32; 4096], src: [f32; 256]) {
         let q = t / 64;
         let mut r = t % 64;
         let mut acc: f32 = 0.0;
-        for z in 0..200 {
+        for _z in 0..200 {
             acc = acc + src[t] * 0.5;
         }
         for k in 0..2 {
@@ -47,7 +47,7 @@ fn loopvar_reassigned(mut out: [f32; 4096], src: [f32; 256]) {
     let dummy: i32 = 0;
     for t in 0..256 {
         let mut acc: f32 = 0.0;
-        for z in 0..200 {
+        for _z in 0..200 {
             acc = acc + src[t] * 0.5;
         }
         for k in 0..2 {

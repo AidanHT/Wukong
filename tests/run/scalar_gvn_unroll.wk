@@ -135,6 +135,8 @@ fn main() -> i32 {
     // Side-effect-free calls.
     let v: i64 = 6 + o64;
     let twice: i64 = heavy(v) + heavy(v);
+    // The dead pure call is what the optimizer must delete, so its binding stays unread.
+    @allow(unused_variables)
     let unused: i64 = heavy(v + 1);
     print(twice);
     let mut acc: i64 = 0;

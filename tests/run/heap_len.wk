@@ -20,7 +20,7 @@ fn main() -> i32 {
     let e: []f32 = alloc_f32(-8);
     print(e.len());     // 0 — a negative count clamps to an empty slice
     let mut hits: i32 = 0;
-    for x in e {
+    for _x in e {
         hits = hits + 1;
     }
     print(hits);        // 0 — iterating an empty slice runs zero times

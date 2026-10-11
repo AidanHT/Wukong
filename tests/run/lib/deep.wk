@@ -3,6 +3,8 @@
 // lands exactly once.
 module lib.deep
 
+// Nothing here uses `lib.mathlib`: the import exists to close the A<->B cycle the fixture tests.
+@allow(unused_imports)
 import lib.mathlib;
 
 pub fn seven() -> i32 {

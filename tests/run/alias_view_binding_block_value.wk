@@ -120,7 +120,7 @@ fn mm_match(b: []f32, mut c: []f32, flag: bool) {
     }
 }
 
-fn mm_block(b: []f32, mut c: []f32, flag: bool) {
+fn mm_block(b: []f32, mut c: []f32, _flag: bool) {
     let v: []f32 = { c };
     for i in 0..4 {
         for j in 0..4 {
@@ -133,7 +133,7 @@ fn mm_block(b: []f32, mut c: []f32, flag: bool) {
     }
 }
 
-fn mm_loop(b: []f32, mut c: []f32, flag: bool) {
+fn mm_loop(b: []f32, mut c: []f32, _flag: bool) {
     let v: []f32 = loop {
         break c;
     };

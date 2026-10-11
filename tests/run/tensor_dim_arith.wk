@@ -59,7 +59,7 @@ fn as_double<N>(a: Tensor[f32, 2*N]) -> Tensor[f32, N + N] {
 }
 
 // `N` is solved from the argument's length (`2*N = 8`) and is an ordinary value in the body.
-fn half_len<N>(a: Tensor[f32, 2*N]) -> i64 {
+fn half_len<N>(_a: Tensor[f32, 2*N]) -> i64 {
     return N as i64;
 }
 

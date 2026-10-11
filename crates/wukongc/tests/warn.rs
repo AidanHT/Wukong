@@ -163,16 +163,11 @@ fn directive_and_json_readers() {
     assert_eq!(severity_and_code("error: plain text"), None);
 }
 
-/// The corpus census: every `tests/run` and `examples` program is linted with the default levels,
-/// and any warning is listed. The run corpus is meant to be warning-free (or to carry an `@allow`
-/// saying why), so that a new warning in it is news.
-///
-/// `#[ignore]`d until the first full run blesses the corpus: the lints landed without a build in
-/// the loop (wave 2 of the gap close-out), so the corpus has not yet been brought to zero. Run it
-/// with `cargo test -p wukongc --test warn -- --ignored`, fix or `@allow` what it lists, and then
-/// drop the `#[ignore]` to make it a gate.
+/// The corpus gate: every `tests/run` and `examples` program is linted with the default levels,
+/// and any warning — in the program's own file or in a module it imports — is listed. The run
+/// corpus is warning-free (a construct that is a fixture's point carries an `@allow` saying why),
+/// so that a new warning in it is news. A new fixture must be warning-free too.
 #[test]
-#[ignore = "corpus not yet brought to zero warnings; run with --ignored to list them"]
 fn corpus_is_warning_free() {
     let mut programs = wk_files(&repo_dir("tests").join("run"));
     programs.extend(wk_files(&repo_dir("examples")));

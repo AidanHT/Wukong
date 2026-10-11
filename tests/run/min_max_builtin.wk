@@ -26,7 +26,7 @@ module tests.run.min_max_builtin
 
 fn clamp_count(n: usize) -> usize {
     let mut c: usize = 0;
-    for i in 0..min(n, 4) {
+    for _i in 0..min(n, 4) {
         c = c + 1;
     }
     return c;
