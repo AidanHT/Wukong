@@ -34,6 +34,18 @@
 //!   statically. A static "distinct names are distinct buffers" shortcut is deliberately NOT taken:
 //!   the whole-program alias facts (`alias.rs`) only account for names that are spelled as index
 //!   bases, and a builtin operand need not be one.
+//! * **`sdpa`'s static form.** The one exception, and it is not that shortcut: `sdpa` drops the
+//!   overlap test for an input only when both operands are names that can never denote anything but
+//!   their own storage ([`StorageRoot`]) — a fixed-array local (its own `alloca`; two different
+//!   allocas never overlap), or a fixed-array / static-tensor PARAMETER bound to the caller's storage
+//!   for the whole body (`noalias.rs`'s `param_is_its_storage`, the binding no assignment can
+//!   redirect, so the in-body view problem above cannot arise). Two such parameters are separated
+//!   only by the facts every recognizer already trusts, asked verbatim: `alias::plan_kernel_alias`
+//!   over the whole-program call-site bit, or a `@noalias` promise (`promised_disjoint`). Anything
+//!   else — a slice, a view, a projection, a may-alias pair — keeps the guard. With constant `s`/`d`
+//!   and statically sized operands the extent checks fold too, so such a call is ONE bare
+//!   `wukong_attention_f32` in a straight-line block, which is what lets `wukong_autodiff`
+//!   differentiate a loss calling `sdpa` (it accepts single-block functions only).
 //! * **Empty contractions.** The GEMM kernels return without writing anything when `K <= 0`, but
 //!   `A·B` over an empty contraction is the zero matrix (and `linear` is the broadcast bias), so a
 //!   `K` that is not a positive constant gets that fill on its `K == 0` path.
@@ -48,6 +60,7 @@ use wukong_sema::{
 use wukong_span::Symbol;
 use wukong_types::{Dim, Scalar, Ty};
 
+use crate::alias::{plan_kernel_alias, KernelAliasPlan, OperandPair};
 use crate::{
     DefKind, FnLowerer, EPI_ACT_IDENTITY, NORM_LAYERNORM, NORM_LOGSOFTMAX, NORM_RMSNORM,
     NORM_SOFTMAX, RED_DOT, RED_MAX, RED_MIN, RED_SUM, SLICE_LEN_OFF, VMATH_EXP, VMATH_GELU,
@@ -76,6 +89,22 @@ struct BufArg {
     /// The operand's name when it is spelled as a plain variable: the one case where an exact alias
     /// is decidable without a runtime test.
     sym: Option<Symbol>,
+    /// The operand's sema type (one `&`/`*` looked through) is a fixed-size array — the only form
+    /// whose base pointer can be the operand's own `alloca` ([`StorageRoot::Local`]).
+    fixed_array: bool,
+}
+
+/// Where a builtin operand's storage provably lives, for `sdpa`'s static disjointness proof. Only
+/// names that can never denote anything but this storage qualify; every other operand has none.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StorageRoot {
+    /// A fixed-size array local, by its own entry-block `alloca`. Two different allocas are two
+    /// different stack objects, and a parameter (bound before the frame's allocas exist) is
+    /// neither of them.
+    Local(ValueId),
+    /// A fixed-array or statically-shaped tensor parameter spelled by its name, which is bound to
+    /// the caller's storage for the whole body (`noalias.rs`'s `param_is_its_storage`).
+    Param(Symbol),
 }
 
 /// The number of `f32` scalars a (possibly nested) fixed `f32` array holds.
@@ -212,6 +241,18 @@ impl FnLowerer<'_> {
         }
         if let Err(what) = const_dims_fit(&call.dims, &operand_dims) {
             self.unsupported(e.span, what);
+            return Some(self.const_zero(MirType::I32));
+        }
+        let buffers = args
+            .iter()
+            .zip(&operand_dims)
+            .filter_map(|(a, d)| d.map(|_| a));
+        if !self.builtin_operands_are_f32(buffers) {
+            self.unsupported(
+                e.span,
+                "a kernel-builtin operand whose element is not `f32` (an instantiation the type \
+                 checker did not re-check)",
+            );
             return Some(self.const_zero(MirType::I32));
         }
 
@@ -535,6 +576,7 @@ impl FnLowerer<'_> {
                     slice_len: Some(len),
                     array_len: None,
                     sym,
+                    fixed_array: false,
                 }
             }
             Ty::Array { .. } => BufArg {
@@ -542,12 +584,14 @@ impl FnLowerer<'_> {
                 slice_len: None,
                 array_len: flat_f32_len(&ty),
                 sym,
+                fixed_array: true,
             },
             _ => BufArg {
                 ptr: v,
                 slice_len: None,
                 array_len: const_tensor_len(&ty),
                 sym,
+                fixed_array: false,
             },
         }
     }
@@ -785,6 +829,13 @@ impl FnLowerer<'_> {
     /// `0..=i32::MAX` and every operand whose length is known holds at least `s·d` elements (else
     /// the call traps like a failed `assert`); and an `out` overlapping `q`, `k` or `v` — which the
     /// kernel reads while it writes `out` — computes into scratch and copies out.
+    ///
+    /// The static form (see the module docs): a check whose outcome is a compile-time fact — a
+    /// constant `s`/`d` inside the range, a fixed extent of at least a constant `s·d` — is not
+    /// emitted, and an input [`Self::sdpa_storage_disjoint`] proves apart from `out` gets no overlap
+    /// test. When every check folds and all three inputs are proved apart, the call is one bare
+    /// `wukong_attention_f32` with no branch. A check that would fail statically is kept (it traps
+    /// at run time exactly as before), and so is every pair the proof cannot settle.
     fn lower_sdpa_builtin(&mut self, e: &Expr, args: &[Expr]) -> ValueId {
         if args.len() != 8 {
             self.unsupported(
@@ -793,11 +844,19 @@ impl FnLowerer<'_> {
             );
             return self.const_zero(MirType::I32);
         }
-        for a in &args[4..6] {
-            if self
-                .const_runtime_u64_expr(a)
-                .is_some_and(|v| v > i64::MAX as u64)
-            {
+        if !self.builtin_operands_are_f32(&args[..4]) {
+            self.unsupported(
+                e.span,
+                "an `sdpa` operand whose element is not `f32` (an instantiation the type checker \
+                 did not re-check)",
+            );
+            return self.const_zero(MirType::I32);
+        }
+        // Each dimension's value when it is a proven compile-time constant.
+        let mut consts: [Option<u64>; 2] = [None; 2];
+        for (c, a) in consts.iter_mut().zip(&args[4..6]) {
+            *c = self.const_runtime_u64_expr(a);
+            if c.is_some_and(|v| v > i64::MAX as u64) {
                 self.unsupported(
                     a.span,
                     "an `sdpa` dimension that does not fit the attention kernel's signed 64-bit ABI",
@@ -814,13 +873,28 @@ impl FnLowerer<'_> {
         let scale = self.lower_coerced(&args[6], &MirType::F32);
         let causal = self.lower_coerced(&args[7], &MirType::I64);
 
-        let s_ok = self.extent_in_range(s);
-        let d_ok = self.extent_in_range(d);
-        let mut checks = vec![s_ok, d_ok];
-        let need = self.builder.build(MirType::I64, Op::Bin(BinOp::Mul, s, d));
+        // A constant extent is in range at compile time or never; only the other kind is tested.
+        let in_range = |c: Option<u64>| c.filter(|&v| i128::from(v) <= MAX_RUNTIME_EXTENT);
+        let (s_const, d_const) = (in_range(consts[0]), in_range(consts[1]));
+        let mut checks = Vec::new();
+        if s_const.is_none() {
+            checks.push(self.extent_in_range(s));
+        }
+        if d_const.is_none() {
+            checks.push(self.extent_in_range(d));
+        }
+        // Both factors are at most `i32::MAX`, so the product cannot wrap.
+        let need_const = s_const.zip(d_const).map(|(a, b)| a * b);
+        let need = match need_const {
+            Some(n) => self.const_i64(i128::from(n)),
+            None => self.builder.build(MirType::I64, Op::Bin(BinOp::Mul, s, d)),
+        };
         for b in &bufs {
             let have = match (b.slice_len, b.array_len) {
                 (Some(len), _) => len,
+                // A fixed extent against a constant `s·d`: decided here. (Sema refuses a short one
+                // as `E0501`; should one ever reach here, its check stays and traps at run time.)
+                (None, Some(n)) if need_const.is_some_and(|need| n >= need) => continue,
                 (None, Some(n)) => self.const_i64(n as i128),
                 // A symbolic tensor: its extent is the caller's contract.
                 (None, None) => continue,
@@ -839,7 +913,14 @@ impl FnLowerer<'_> {
         }
 
         let (q, k, v, out) = (bufs[0].ptr, bufs[1].ptr, bufs[2].ptr, bufs[3].ptr);
-        let inputs = [(q, need, false), (k, need, false), (v, need, false)];
+        // An input proved apart from `out` needs no overlap test; with all three proved, there is
+        // no hazard at all and `dispatch_with_scratch` emits the bare call.
+        let mut inputs: Vec<(ValueId, ValueId, bool)> = Vec::with_capacity(3);
+        for b in &bufs[..3] {
+            if !self.sdpa_storage_disjoint(b, &bufs[3]) {
+                inputs.push((b.ptr, need, false));
+            }
+        }
         let hazard = self.overlap_hazard(out, need, &inputs);
         let attn = self.gemm.attn;
         self.dispatch_with_scratch(hazard, out, need, |this, tmp| {
@@ -850,11 +931,92 @@ impl FnLowerer<'_> {
             });
         })
     }
+
+    /// Are the two lowered operands provably different storage, at compile time? Only when both
+    /// have a [`StorageRoot`] and the roots are apart: two different allocas; an alloca and a
+    /// parameter; or two parameters the whole-program call-site fact (`alias::plan_kernel_alias`,
+    /// asked exactly as every recognizer emit site asks it) or a `@noalias` promise
+    /// (`promised_disjoint`) separates. Everything else — including the same root twice — is
+    /// `false`, and the caller keeps its run-time overlap test.
+    fn sdpa_storage_disjoint(&self, a: &BufArg, b: &BufArg) -> bool {
+        let (Some(ra), Some(rb)) = (self.storage_root(a), self.storage_root(b)) else {
+            return false;
+        };
+        match (ra, rb) {
+            (StorageRoot::Local(x), StorageRoot::Local(y)) => x != y,
+            (StorageRoot::Local(_), StorageRoot::Param(_))
+            | (StorageRoot::Param(_), StorageRoot::Local(_)) => true,
+            (StorageRoot::Param(x), StorageRoot::Param(y)) => {
+                plan_kernel_alias(
+                    self.gemm.alias_free,
+                    &[x, y],
+                    &[OperandPair::disjoint(0, 1)],
+                ) == KernelAliasPlan::Dispatch
+                    || self.promised_disjoint(x, y)
+            }
+        }
+    }
+
+    /// The [`StorageRoot`] of a lowered builtin operand, or `None` when it is anything but a name
+    /// that can only denote its own storage: a slice (its fat pointer can be re-pointed), a view or
+    /// projection (`a[i]`, `l.w`, a tensor local), a reference/pointer parameter, an outlined
+    /// `@parallel` capture, a symbolic-tensor parameter (bound through a slot, so its name does not
+    /// resolve to the parameter value).
+    fn storage_root(&self, b: &BufArg) -> Option<StorageRoot> {
+        if b.fixed_array && b.slice_len.is_none() && self.is_fixed_array_alloca(b.ptr) {
+            return Some(StorageRoot::Local(b.ptr));
+        }
+        let sym = b.sym?;
+        let (bound, _) = self.lookup(sym)?;
+        (bound == b.ptr && self.param_is_its_storage(b.ptr)).then_some(StorageRoot::Param(sym))
+    }
+
+    /// Is `v` the result of one of this function's own fixed-array `alloca`s (which `Builder`
+    /// always places in the entry block) — i.e. a stack object rather than a pointer into one?
+    fn is_fixed_array_alloca(&self, v: ValueId) -> bool {
+        if self.slice_slots.contains(&v) {
+            return false;
+        }
+        let entry = self.builder.entry();
+        self.builder.block(entry).insts.iter().any(|i| {
+            i.result == Some(v)
+                && matches!(
+                    &i.op,
+                    Op::Alloca {
+                        ty: MirType::Array(..),
+                        ..
+                    }
+                )
+        })
+    }
+
+    /// Does every buffer operand hold `f32` elements once this instance's types are substituted?
+    /// Sema guarantees it — a dtype-generic `Tensor[T, ..]` reaches a builtin only when its
+    /// instantiation binds `T = f32` (`E0415` otherwise) — so this is a backstop for an instance
+    /// sema did not re-check (`instantiate.rs` caps the instances it re-checks), never a second
+    /// rule: the runtime kernels read every operand as `f32`.
+    fn builtin_operands_are_f32<'e>(&self, args: impl IntoIterator<Item = &'e Expr>) -> bool {
+        args.into_iter().all(|a| {
+            let mut ty = self.expr_ty(a);
+            if let Ty::Ref { pointee, .. } | Ty::Ptr { pointee, .. } = ty {
+                ty = *pointee;
+            }
+            match &ty {
+                Ty::Tensor { elem, elem_var, .. } => *elem == Scalar::F32 && elem_var.is_none(),
+                Ty::Array { .. } => flat_f32_len(&ty).is_some(),
+                Ty::Slice(elem) => matches!(elem.as_ref(), Ty::Scalar(Scalar::F32)),
+                // Anything else is not a buffer sema would have accepted; `lower_builtin_buffer`
+                // treats it as before.
+                _ => true,
+            }
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::lower_program;
+    use wukong_mir::Op;
     use wukong_span::{Interner, SourceId};
 
     /// Lower `src` (which must type-check) and return its verified MIR text and the diagnostics.
@@ -930,6 +1092,109 @@ mod tests {
         );
         // s and d range checks, then `q` (three times) and `o` long enough for s*d.
         assert_eq!(text.matches("call assert(").count(), 6, "{text}");
+    }
+
+    /// `(blocks, attention calls, assert calls, scratch allocations)` of function `f` in `src`,
+    /// which must type-check and lower cleanly.
+    fn sdpa_shape(src: &str, f: &str) -> (usize, usize, usize, usize) {
+        let mut interner = Interner::new();
+        let (module, pdiags) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pdiags.is_empty(), "parse: {pdiags:?}");
+        let (sema, sdiags) = wukong_sema::check(&module, &interner);
+        assert!(sdiags.iter().all(|d| !d.is_error()), "sema: {sdiags:?}");
+        let (prog, diags) = lower_program(&module, &sema, &mut interner);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        let errors = wukong_mir::verify::verify_program(&prog);
+        assert!(errors.is_empty(), "invalid MIR: {errors:?}");
+        let fsym = interner.intern(f);
+        let func = prog
+            .funcs
+            .iter()
+            .find(|x| x.name == fsym)
+            .unwrap_or_else(|| panic!("no function `{f}`"));
+        let calls = |name: &str| {
+            func.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter(
+                    |i| matches!(&i.op, Op::Call { func, .. } if interner.resolve(*func) == name),
+                )
+                .count()
+        };
+        (
+            func.blocks.len(),
+            calls("wukong_attention_f32"),
+            calls("assert"),
+            calls("wukong_rt_alloc"),
+        )
+    }
+
+    /// N83: the signature `wukong_autodiff` is asked to differentiate — `@noalias` fixed-array
+    /// inputs, a fixed-array output, constant `s`/`d` — lowers its `sdpa` to ONE bare attention
+    /// call in a straight-line function: every extent check is a compile-time fact and every input
+    /// is proved apart from `out`, so there is nothing to test at run time and nothing to version.
+    /// (The full loss, reduction included, is differentiated from source in
+    /// `wukong_driver::grad_model_tests`.)
+    #[test]
+    fn a_static_sdpa_over_disjoint_parameters_is_one_bare_call() {
+        for causal in [0, 1] {
+            let src = format!(
+                "fn loss(@noalias q: [f32; 32], @noalias k: [f32; 32], @noalias v: [f32; 32], \
+                 mut o: [f32; 32], mut out: [f32; 1]) -> f32 {{ \
+                 sdpa(q, k, v, o, 4, 8, 0.35355339, {causal}); \
+                 out[0] = o[0]; return o[0]; }}"
+            );
+            assert_eq!(
+                sdpa_shape(&src, "loss"),
+                (1, 1, 0, 0),
+                "causal={causal}: one block, one bare call, no check, no scratch"
+            );
+        }
+    }
+
+    /// The `@noalias` half of the proof on its own: a call site binds `o` and `o2` to one array, so
+    /// the whole-program bit is `false` for `f` — and the promise on `q` still separates it from
+    /// `o`, exactly as `promised_disjoint` settles a recognizer's pair.
+    #[test]
+    fn a_noalias_promise_drops_the_sdpa_guard_the_call_site_bit_cannot() {
+        let promised = "fn f(@noalias q: [f32; 8], mut o: [f32; 8], mut o2: [f32; 8]) { \
+                        sdpa(q, q, q, o, 2, 4, 0.5, 0); o2[0] = 1.0; } \
+                        fn main() -> i32 { let a: [f32; 8] = [1.0; 8]; \
+                        let mut b: [f32; 8] = [0.0; 8]; f(a, b, b); return 0; }";
+        assert_eq!(sdpa_shape(promised, "f"), (1, 1, 0, 0));
+        // Without the promise the same call site leaves `q` and `o` may-alias: the guard stays
+        // (the direct call, the scratch call and its allocation), though the extents still fold.
+        let unpromised = promised.replace("@noalias ", "");
+        let (blocks, attn, asserts, allocs) = sdpa_shape(&unpromised, "f");
+        assert!(blocks > 1, "the guard branches");
+        assert_eq!((attn, asserts, allocs), (2, 0, 1));
+    }
+
+    /// Two different fixed-array locals are two different allocas: no run-time test.
+    #[test]
+    fn sdpa_over_distinct_local_arrays_is_one_bare_call() {
+        let src = "fn main() -> i32 { let q: [f32; 8] = [0.5; 8]; let k: [f32; 8] = [0.25; 8]; \
+                   let v: [f32; 8] = [1.0; 8]; let mut o: [f32; 8] = [0.0; 8]; \
+                   sdpa(q, k, v, o, 2, 4, 0.5, 1); return o[0] as i32; }";
+        assert_eq!(sdpa_shape(src, "main"), (1, 1, 0, 0));
+    }
+
+    /// Every pair the proof cannot settle keeps the guard: a call site that hands `q` and `o` one
+    /// array, a slice view of the output, the output itself as an input, and a slice parameter.
+    #[test]
+    fn a_may_alias_sdpa_keeps_the_guard() {
+        let aliased = "fn f(q: [f32; 8], mut o: [f32; 8]) { sdpa(q, q, q, o, 2, 4, 0.5, 0); } \
+                       fn main() -> i32 { let mut a: [f32; 8] = [1.0; 8]; f(a, a); return 0; }";
+        let view = "fn main() -> i32 { let mut a: [f32; 8] = [1.0; 8]; let s: []f32 = a; \
+                    sdpa(s, s, s, a, 2, 4, 0.5, 0); return a[0] as i32; }";
+        let same = "fn main() -> i32 { let mut a: [f32; 8] = [1.0; 8]; \
+                    sdpa(a, a, a, a, 2, 4, 0.5, 0); return a[0] as i32; }";
+        let slice = "fn f(q: []f32, mut o: [f32; 8]) { sdpa(q, q, q, o, 2, 4, 0.5, 0); }";
+        for (src, f) in [(aliased, "f"), (view, "main"), (same, "main"), (slice, "f")] {
+            let (blocks, attn, _, allocs) = sdpa_shape(src, f);
+            assert!(blocks > 1, "{src}: the guard branches");
+            assert_eq!((attn, allocs), (2, 1), "{src}");
+        }
     }
 
     #[test]
