@@ -46,11 +46,14 @@
 //!
 //! Threading never copies a loop header (that would enter the loop at a second block, making it
 //! irreducible) and never targets one (the new edge would be a second entry or a second latch,
-//! undoing `loop-canon`). Copies are made from blocks that are not headers, so a chain of threads
-//! along one path cannot go around a cycle, and the copy count per run and the function's size are
-//! capped besides. The pass runs at `-O2`, inside the fixpoint and just before `simplify-cfg`, which
-//! merges each copy into its predecessor and deletes a block threading left without predecessors;
-//! `loop-canon` re-runs in the same sweep.
+//! undoing `loop-canon`). The first rule also keeps the dominating facts sound: only a header has
+//! an incoming edge from a block it dominates (a back edge), and there a fact about the header's
+//! own compare is the previous iteration's, not the one the header is about to recompute. Copies
+//! are made from blocks that are not headers, so a chain of threads along one path cannot go
+//! around a cycle, and the copy count per run and the function's size are capped besides. The pass
+//! runs at `-O2`, inside the fixpoint and just before `simplify-cfg`, which merges each copy into
+//! its predecessor and deletes a block threading left without predecessors; `loop-canon` re-runs
+//! in the same sweep.
 
 use wukong_mir::{
     BasicBlock, BinOp, BlockId, CmpOp, Function, Inst, MirType, Op, Terminator, ValueId,
@@ -1127,18 +1130,61 @@ mod tests {
         }
     }
 
-    /// A loop header is never threaded, even when the entering edge decides its test.
+    /// Does the edge `pred -> m` decide `cond`, and to what? The question `find_thread` asks of every
+    /// edge, asked of one: a loop test below must be decided on its edge, or "not threaded" would
+    /// prove nothing about the loop rule.
+    fn decided_on_edge(
+        f: &Function,
+        pred: BlockId,
+        sel: EdgeSel,
+        m: BlockId,
+        cond: ValueId,
+    ) -> Option<bool> {
+        let mut cache = CfgAnalyses::default();
+        let (idom, preds) = cache.idoms_and_preds(f);
+        let defs = Defs::of(f);
+        EdgeEval::new(f, &defs, idom, preds, pred.0 as usize, sel, m.0 as usize).bool_of(cond, 0)
+    }
+
+    fn plan_of(f: &Function) -> Option<(usize, usize, bool)> {
+        let mut cache = CfgAnalyses::default();
+        let (idom, preds) = cache.idoms_and_preds(f);
+        find_thread(f, idom, preds).map(|t| (t.pred, t.m, t.taken))
+    }
+
+    /// A loop header is never copied, even when the edge entering the loop decides its test:
+    ///
+    /// ```text
+    ///   entry: big = x > 100; cond_br big, pre, out
+    ///   pre:   br H(0)
+    ///   H(i):  i1 = i + 1; c = i < 5; cond_br c, body, exit     -- `0 < 5` on the edge from pre
+    ///   body:  br H(i1)
+    ///   exit:  ret i + x
+    ///   out:   ret x
+    /// ```
+    ///
+    /// Threading `pre -> H` would enter the loop at `body` through a copy of `H`, a second entry
+    /// that makes the loop irreducible. (The back edge `body -> H` would look decided too: below
+    /// `H`'s true arm `c` is known true, but that is the previous iteration's `c`.) The entry's
+    /// branch is there so the function has the two conditional branches `run_function` requires
+    /// before it looks for a thread at all.
     #[test]
     fn a_loop_header_is_never_copied() {
         let mut it = Interner::new();
         let mut b = Builder::new(it.intern("f"), MirType::I32);
         let x = b.add_param(MirType::I32);
         let _y = b.add_param(MirType::I32);
-        let zero = b.build(MirType::I32, Op::ConstInt(0, MirType::I32));
+        let hundred = b.build(MirType::I32, Op::ConstInt(100, MirType::I32));
+        let big = b.build(MirType::I1, Op::Cmp(CmpOp::Sgt, x, hundred));
+        let pre = b.new_block();
         let header = b.new_block();
         let i = b.block_param(header, MirType::I32);
         let body = b.new_block();
         let exit = b.new_block();
+        let out = b.new_block();
+        b.cond_br(big, pre, vec![], out, vec![]);
+        b.switch_to(pre);
+        let zero = b.build(MirType::I32, Op::ConstInt(0, MirType::I32));
         b.br(header, vec![zero]);
         b.switch_to(header);
         let one = b.build(MirType::I32, Op::ConstInt(1, MirType::I32));
@@ -1151,9 +1197,85 @@ mod tests {
         b.switch_to(exit);
         let s = b.build(MirType::I32, Op::Bin(BinOp::Add, i, x));
         b.ret(Some(s));
+        b.switch_to(out);
+        b.ret(Some(x));
         let mut f = b.finish();
+        let inputs = [(200, 0), (101, 0), (100, 0), (4, 0), (-2, 0)];
+        // x > 100: the loop leaves i = 5, so x + 5; otherwise x.
+        let expected = b"205\n106\n100\n4\n-2\n".to_vec();
+        assert_eq!(run_xy(&f, &mut it, &inputs), expected);
+        assert_eq!(cond_brs(&f), 2);
+        assert_eq!(decided_on_edge(&f, pre, EdgeSel::Br, header, c), Some(true));
+        assert_eq!(plan_of(&f), None);
         assert!(!JumpThread.run_function(&mut f, &mut CfgAnalyses::default()));
-        assert_eq!(run_xy(&f, &mut it, &[(4, 0), (-2, 0)]), b"9\n3\n".to_vec());
+        assert_eq!(run_xy(&f, &mut it, &inputs), expected);
+    }
+
+    /// Nor is a loop header ever a thread's target, even when the edge into the block that enters
+    /// the loop decides that block's branch:
+    ///
+    /// ```text
+    ///   entry: c0 = y > 0; cond_br c0, A, B
+    ///   A:     br M(true)
+    ///   B:     br M(y < -5)
+    ///   M(p):  cond_br p, H(0), out                              -- `true` on the edge from A
+    ///   H(i):  c = i < x; cond_br c, body, exit
+    ///   body:  br H(i + 1)
+    ///   exit:  ret i
+    ///   out:   ret -1
+    /// ```
+    ///
+    /// Threading `A -> M` would give `H` a second entering edge (from the copy of `M`) beside `M`'s,
+    /// undoing `loop-canon`'s single preheader.
+    #[test]
+    fn a_loop_header_is_never_a_thread_target() {
+        let mut it = Interner::new();
+        let mut b = Builder::new(it.intern("f"), MirType::I32);
+        let x = b.add_param(MirType::I32);
+        let y = b.add_param(MirType::I32);
+        let zero = b.build(MirType::I32, Op::ConstInt(0, MirType::I32));
+        let c0 = b.build(MirType::I1, Op::Cmp(CmpOp::Sgt, y, zero));
+        let a_blk = b.new_block();
+        let b_blk = b.new_block();
+        let m = b.new_block();
+        let p = b.block_param(m, MirType::I1);
+        let header = b.new_block();
+        let i = b.block_param(header, MirType::I32);
+        let body = b.new_block();
+        let exit = b.new_block();
+        let out = b.new_block();
+        b.cond_br(c0, a_blk, vec![], b_blk, vec![]);
+        b.switch_to(a_blk);
+        let yes = b.build(MirType::I1, Op::ConstInt(1, MirType::I1));
+        b.br(m, vec![yes]);
+        b.switch_to(b_blk);
+        let minus5 = b.build(MirType::I32, Op::ConstInt(-5, MirType::I32));
+        let c1 = b.build(MirType::I1, Op::Cmp(CmpOp::Slt, y, minus5));
+        b.br(m, vec![c1]);
+        b.switch_to(m);
+        b.cond_br(p, header, vec![zero], out, vec![]);
+        b.switch_to(header);
+        let c = b.build(MirType::I1, Op::Cmp(CmpOp::Slt, i, x));
+        b.cond_br(c, body, vec![], exit, vec![]);
+        b.switch_to(body);
+        let one = b.build(MirType::I32, Op::ConstInt(1, MirType::I32));
+        let i1 = b.build(MirType::I32, Op::Bin(BinOp::Add, i, one));
+        b.br(header, vec![i1]);
+        b.switch_to(exit);
+        b.ret(Some(i));
+        b.switch_to(out);
+        let minus1 = b.build(MirType::I32, Op::ConstInt(-1, MirType::I32));
+        b.ret(Some(minus1));
+        let mut f = b.finish();
+        let inputs = [(3, 1), (-2, 1), (3, -6), (3, -5), (3, 0), (0, 7)];
+        // y > 0 or y < -5: the loop counts to max(x, 0); otherwise -1.
+        let expected = b"3\n0\n3\n-1\n-1\n0\n".to_vec();
+        assert_eq!(run_xy(&f, &mut it, &inputs), expected);
+        assert_eq!(cond_brs(&f), 3);
+        assert_eq!(decided_on_edge(&f, a_blk, EdgeSel::Br, m, p), Some(true));
+        assert_eq!(plan_of(&f), None);
+        assert!(!JumpThread.run_function(&mut f, &mut CfgAnalyses::default()));
+        assert_eq!(run_xy(&f, &mut it, &inputs), expected);
     }
 
     /// From source: a value guarded twice by the same condition runs one test at `-O2`, and every
