@@ -5,6 +5,20 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Interpreter oracle (`gap4/interp-oracle`)
+
+- **Kernel operands are bounded by their allocation, not the arena (P1.18).** The interpreter's
+  slot memory holds every allocation back to back, and a recognized kernel's operand was checked
+  only against the whole arena, so an extent that ran off the end of one array into the next was
+  read (or written) as if it were the same buffer. A live-allocation table now covers every
+  `alloca` (an aggregate is one allocation), heap block, scratch region, static and kernel-entry
+  buffer, kept in step with frame release, `free` and `scratch_release`; every kernel and
+  transfer arm refuses such an operand with `<kernel>: operand <k> extends past its allocation`
+  before reserving any scratch. The vector-kernel arm's extents are checked arithmetic too.
+- **Intrinsic calls dispatch on an id resolved once per run (N58).** Every intrinsic name lives in
+  one table (`crates/wukong_interp/src/intrinsics.rs`); a call no longer walks a ~200-literal
+  string match, and a pooled register file is no longer refilled on every call.
+
 ### Index-recording reductions (`gap3/vec-argmax`)
 
 - **Argmax/argmin and FindLastIV loops vectorize.** `if x[i] > m { m = x[i]; at = i; }` (and its

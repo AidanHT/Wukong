@@ -1,33 +1,36 @@
 # `wukong_interp` source layout
 
-The whole crate is `lib.rs` (~4.8k lines):
-
-| Section | Role |
+| File | Role |
 | --- | --- |
-| `Accelerator` trait | GPU offload hook seam (`sgemm_nt`, `vmath`, `norm`, `sreduce`, `sgemm_nt_epi`) |
-| `run` / `run_with_output` / `run_with_output_accel` | Public entry points |
-| `run_kernel_f32` / `run_kernel_f64` / `run_kernel_i8` | Typed kernel-entry ABI |
-| `Interpreter` | `Backend` impl (thin adapter over `run_with_output`) |
-| `Interp` | Per-run state: `run_function`, `exec_frame`, `eval`, `intrinsic` |
-| Semantic helpers | `mask`, `mask_lane`, `slot_count`, `push_defaults`, `int_bits`, `uval`, `int_to_float`, `apply_bin`, `apply_cmp`, `apply_cast`, `apply_fma`, `apply_sqrt`, `apply_round` |
-| `mod tests` | 19 unit/integration tests |
+| `lib.rs` | `Value`, the public run / kernel-entry functions, `Accelerator`, `CalleeTable`, `SlotReuse`, `Interp` (frame loop, `eval`, `call_intrinsic`), the semantic helpers, `mod tests` |
+| `intrinsics.rs` | The one intrinsic name table: `Intrinsic` ids with `name` / `from_name`, and its round-trip tests |
+| `marshal.rs` | Kernel-operand marshalling: `LiveBlocks` (the live-allocation table), the `Arena` views, checked extents, the overlap contract, `elementwise_live`, the f32 scratch pool |
+| `text_io.rs` / `ml_io.rs` / `decode.rs` | The text and process builtins, the ML I/O and sampling builtins, the decode builtins (KV-cache attention, half / quantized GEMV) |
+| `*_tests.rs` | Focused unit-test modules (marshalling, extents, transfers, aliasing contracts, parallel twins, scratch, slot reuse, the SIMD arena) |
 
-## `intrinsic`
+## Calls and intrinsics
 
-Every recognized-kernel symbol needs an arm here. Kernel arms call `wukong_runtime` serial symbols
-and also match `_parallel` spellings. The `dim!` macro guards non-positive extents. Optional pointer
-params (`bias`, `gamma`/`beta`) arrive as `Value::Int(0)` and are distinguished by variant.
+A callee symbol is resolved once per run by `CalleeTable`: to a Wukong function, an `extern "C"`
+declaration, a dense `Intrinsic` id (`intrinsics.rs` lists every name the interpreter implements,
+once), or `Unknown`. `call_intrinsic` matches on the id; the text, ML and decode modules dispatch
+the ids they own. Adding an intrinsic is one table line plus its arm. The by-name
+`Interp::intrinsic` exists for the unit tests only.
 
-## `run_function` / `exec_frame` / `eval`
+Calls are stackless (`run_function` keeps an explicit frame stack). Register files are pooled and
+not refilled on entry — verified MIR never reads a register before writing it — and a returning
+frame resets its vector-typed registers, so a pooled file never carries a SIMD handle.
 
-Tree-walk over MIR instructions, **stackless**: `run_function` keeps an explicit frame stack, and
-`exec_frame` runs the top frame until it calls a Wukong function (or a `wukong_parallel_for` body,
-run as one sequential call) or returns, so a Wukong call never recurses on the host stack and every
-entry point runs on its caller's thread. `canonical_result` masks integer results and rounds
-floats; vector ops use lane-wise arms. Step limit (100M blocks per frame) and the call-depth ceiling
-(`MAX_CALL_DEPTH` = 300_000 in every build profile, overridable with `WUKONG_INTERP_MAX_DEPTH`) are
-checked here.
+## Kernel operands
 
-`wukong_codegen_gpu` mirrors `apply_cast` and `int_bits` from this file; `fusion.rs` mirrors the
+Every recognized-kernel arm validates each operand before reserving scratch: the extent product is
+checked, the range must lie in the arena, and then inside ONE live allocation (`LiveBlocks`, kept by
+`SlotReuse` at alloca, heap alloc/free, scratch alloc/release, frame release, statics and
+kernel-entry buffers). A violation is `<kernel>: operand <k> extends past its allocation`, `k` the
+argument index. Helpers take an `arena!(self)` / `arena_mut!(self)` view so the interpreter's other
+fields stay borrowable. A hand-built `Interp` (unit tests) keeps an untracked table, bounded by the
+arena. Optional pointer params (`bias`, `gamma`/`beta`) arrive as `Value::Int(0)` and are
+distinguished by variant; the `dim!` macro makes a non-positive extent a no-op.
+
+`wukong_codegen_gpu` mirrors `apply_cast` and `int_bits` from `lib.rs`; `fusion.rs` mirrors the
 `Accelerator` recognizer list. Editing cast or width semantics here without mirroring there
 desynchronizes the GPU backend.
