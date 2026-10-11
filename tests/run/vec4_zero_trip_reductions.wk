@@ -1,0 +1,716 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: -1
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: -1
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: -1
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: -1
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: -1
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: -1
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: -1
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: -1
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2143289345
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: -1
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: -1
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: -1
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: -1
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: 2139095040
+// EXPECT-OUT: -5
+// EXPECT-OUT: -5
+// EXPECT-OUT: -5
+// EXPECT-OUT: -5
+// EXPECT-OUT: 9223372036854775808
+// EXPECT-OUT: 9223372036854775808
+// EXPECT-OUT: 9223372036854775808
+// EXPECT-OUT: -1
+// EXPECT-OUT: 9223372036854775808
+// EXPECT-OUT: 9223372036854775808
+// EXPECT-OUT: 9223372036854775808
+// EXPECT-OUT: 9223372036854775808
+// EXPECT-OUT: 9223372036854775808
+// EXPECT-OUT: -1
+// EXPECT-OUT: 9223372036854775808
+// EXPECT-OUT: 9223372036854775808
+// EXPECT-OUT: 9221120237041090561
+// EXPECT-OUT: 9221120237041090561
+// EXPECT-OUT: 9221120237041090561
+// EXPECT-OUT: -1
+// EXPECT-OUT: 9221120237041090561
+// EXPECT-OUT: 9221120237041090561
+// EXPECT-OUT: 9221120237041090561
+// EXPECT-OUT: 9221120237041090561
+// EXPECT-OUT: 9221120237041090561
+// EXPECT-OUT: -1
+// EXPECT-OUT: 9221120237041090561
+// EXPECT-OUT: 9221120237041090561
+// EXPECT-OUT: 9218868437227405312
+// EXPECT-OUT: 9218868437227405312
+// EXPECT-OUT: 9218868437227405312
+// EXPECT-OUT: -1
+// EXPECT-OUT: 9218868437227405312
+// EXPECT-OUT: 9218868437227405312
+// EXPECT-OUT: 9218868437227405312
+// EXPECT-OUT: 9218868437227405312
+// EXPECT-OUT: 9218868437227405312
+// EXPECT-OUT: -1
+// EXPECT-OUT: 9218868437227405312
+// EXPECT-OUT: 9218868437227405312
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -12147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -12147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -12147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -2147483648
+// EXPECT-OUT: -12147483648
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: -7852516353
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: -7852516353
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: -7852516353
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: 2147483647
+// EXPECT-OUT: -7852516353
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -10000000001
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -10000000001
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -10000000001
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -10000000001
+// EXPECT-OUT: -9223372036854775808
+// EXPECT-OUT: -9223372036854775808
+// EXPECT-OUT: -9223372036854775808
+// EXPECT-OUT: -9223372036854775808
+// EXPECT-OUT: -9223372036854775808
+// EXPECT-OUT: -9223372036854775808
+// EXPECT-OUT: 9223372036854775807
+// EXPECT-OUT: 9223372036854775807
+// EXPECT-OUT: 9223372036854775807
+// EXPECT-OUT: 9223372036854775807
+// EXPECT-OUT: 9223372036854775807
+// EXPECT-OUT: 9223372036854775807
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+module tests.run.vec4_zero_trip_reductions
+
+// Zero-trip and sub-group trips of every reduction-fold form the loop vectorizer (and the front
+// end's `for` reduction) emits: a trip count below one vector group runs NO vector iteration, so
+// whatever the vector path does on the way out — combining identity partials into the seed, an
+// argmax's (value, index) fold, a FindLastIV's sentinel fold — must hand back the scalar seed BIT
+// FOR BIT. The trip `n` is a function argument (0 .. W-1: 0..3 for 4-lane f32/i32, 0..1 for 2-lane
+// f64/i64), so nothing folds; the seeds are -0.0, a quiet NaN with a payload (0x7fc00001 /
+// 0x7ff8000000000001) and +inf for floats, and MIN, MAX and -1 for integers — a wrong identity
+// (0 for a max, +0.0 for a float sum) changes at least one of them.
+//
+// Every element is chosen so that the SCALAR fold also leaves the seed untouched (a -0.0 addend
+// keeps -0.0, 1.0 is a product's unit, `max(x, m)` keeps `m` on a tie and on a NaN `m`, ...), so
+// every expected line is the seed's bit pattern — derived from the scalar semantics, not recorded.
+// Float results print as `bits(..)`: f32 -0.0 = 2147483648, NaN = 2143289345, +inf = 2139095040;
+// f64 -0.0 = 9223372036854775808, NaN = 9221120237041090561, +inf = 9218868437227405312.
+
+@unchecked
+fn fsum(x: []f32, s: f32, n: i64) -> f32 {
+    let mut acc: f32 = s;
+    let mut i: i64 = 0;
+    while i < n { acc = acc + x[i]; i = i + 1; }
+    return acc;
+}
+
+@unchecked
+fn fsub(x: []f32, s: f32, n: i64) -> f32 {
+    let mut acc: f32 = s;
+    let mut i: i64 = 0;
+    while i < n { acc = acc - x[i]; i = i + 1; }
+    return acc;
+}
+
+@unchecked
+fn fprod(x: []f32, s: f32, n: i64) -> f32 {
+    let mut acc: f32 = s;
+    let mut i: i64 = 0;
+    while i < n { acc = acc * x[i]; i = i + 1; }
+    return acc;
+}
+
+@unchecked
+fn fdot(x: []f32, y: []f32, s: f32, n: i64) -> f32 {
+    let mut acc: f32 = s;
+    let mut i: i64 = 0;
+    while i < n { acc = acc + x[i] * y[i]; i = i + 1; }
+    return acc;
+}
+
+@unchecked
+fn fmaxr(x: []f32, s: f32, n: i64) -> f32 {
+    let mut m: f32 = s;
+    let mut i: i64 = 0;
+    while i < n { m = max(x[i], m); i = i + 1; }
+    return m;
+}
+
+@unchecked
+fn fminr(x: []f32, s: f32, n: i64) -> f32 {
+    let mut m: f32 = s;
+    let mut i: i64 = 0;
+    while i < n { m = min(x[i], m); i = i + 1; }
+    return m;
+}
+
+@unchecked
+fn fguard(x: []f32, s: f32, n: i64) -> f32 {
+    let mut acc: f32 = s;
+    let mut i: i64 = 0;
+    while i < n {
+        if x[i] > 100.0 { acc = acc + x[i]; }
+        i = i + 1;
+    }
+    return acc;
+}
+
+@unchecked
+fn fbranchmax(x: []f32, s: f32, n: i64) -> f32 {
+    let mut m: f32 = s;
+    let mut i: i64 = 0;
+    while i < n {
+        if x[i] > m { m = x[i]; }
+        i = i + 1;
+    }
+    return m;
+}
+
+// argmax: the index seed is -1 and the value seed comes back through out[0].
+@unchecked
+fn fargmax(x: []f32, s: f32, n: i64, mut out: []f32) -> i64 {
+    let mut m: f32 = s;
+    let mut at: i64 = -1;
+    let mut i: i64 = 0;
+    while i < n {
+        if x[i] > m { m = x[i]; at = i; }
+        i = i + 1;
+    }
+    out[0] = m;
+    return at;
+}
+
+// FindLastIV: no element exceeds 0.5, so the seed (-5) is the answer at every trip.
+@unchecked
+fn ffindlast(x: []f32, n: i64) -> i64 {
+    let mut last: i64 = -5;
+    let mut i: i64 = 0;
+    while i < n {
+        if x[i] > 0.5 { last = i; }
+        i = i + 1;
+    }
+    return last;
+}
+
+// The front end's own `for` reduction (the canonical-tree kernel / portable form): its seed
+// select must hold for a trip below one group as well.
+fn forsum(x: []f32, s: f32, n: i64) -> f32 {
+    let mut acc: f32 = s;
+    for i in 0..n { acc = acc + x[i]; }
+    return acc;
+}
+
+@unchecked
+fn dsum(x: []f64, s: f64, n: i64) -> f64 {
+    let mut acc: f64 = s;
+    let mut i: i64 = 0;
+    while i < n { acc = acc + x[i]; i = i + 1; }
+    return acc;
+}
+
+@unchecked
+fn dprod(x: []f64, s: f64, n: i64) -> f64 {
+    let mut acc: f64 = s;
+    let mut i: i64 = 0;
+    while i < n { acc = acc * x[i]; i = i + 1; }
+    return acc;
+}
+
+@unchecked
+fn dmaxr(x: []f64, s: f64, n: i64) -> f64 {
+    let mut m: f64 = s;
+    let mut i: i64 = 0;
+    while i < n { m = max(x[i], m); i = i + 1; }
+    return m;
+}
+
+@unchecked
+fn dargmax(x: []f64, s: f64, n: i64, mut out: []f64) -> i64 {
+    let mut m: f64 = s;
+    let mut at: i64 = -1;
+    let mut i: i64 = 0;
+    while i < n {
+        if x[i] > m { m = x[i]; at = i; }
+        i = i + 1;
+    }
+    out[0] = m;
+    return at;
+}
+
+fn dforsum(x: []f64, s: f64, n: i64) -> f64 {
+    let mut acc: f64 = s;
+    for i in 0..n { acc = acc + x[i]; }
+    return acc;
+}
+
+// i32: the lane-parallel accumulators (identity partials folded into the seed on the way out).
+@unchecked
+fn isum(x: []i32, s: i32, n: i64) -> i32 {
+    let mut acc: i32 = s;
+    let mut i: i64 = 0;
+    while i < n { acc = acc + x[i]; i = i + 1; }
+    return acc;
+}
+
+@unchecked
+fn iprod(x: []i32, s: i32, n: i64) -> i32 {
+    let mut acc: i32 = s;
+    let mut i: i64 = 0;
+    while i < n { acc = acc * x[i]; i = i + 1; }
+    return acc;
+}
+
+@unchecked
+fn iand(x: []i32, s: i32, n: i64) -> i32 {
+    let mut acc: i32 = s;
+    let mut i: i64 = 0;
+    while i < n { acc = acc & x[i]; i = i + 1; }
+    return acc;
+}
+
+@unchecked
+fn ior(x: []i32, s: i32, n: i64) -> i32 {
+    let mut acc: i32 = s;
+    let mut i: i64 = 0;
+    while i < n { acc = acc | x[i]; i = i + 1; }
+    return acc;
+}
+
+@unchecked
+fn ixor(x: []i32, s: i32, n: i64) -> i32 {
+    let mut acc: i32 = s;
+    let mut i: i64 = 0;
+    while i < n { acc = acc ^ x[i]; i = i + 1; }
+    return acc;
+}
+
+@unchecked
+fn imaxr(x: []i32, s: i32, n: i64) -> i32 {
+    let mut m: i32 = s;
+    let mut i: i64 = 0;
+    while i < n { m = max(x[i], m); i = i + 1; }
+    return m;
+}
+
+@unchecked
+fn iminr(x: []i32, s: i32, n: i64) -> i32 {
+    let mut m: i32 = s;
+    let mut i: i64 = 0;
+    while i < n { m = min(x[i], m); i = i + 1; }
+    return m;
+}
+
+@unchecked
+fn icount(x: []i32, s: i32, n: i64) -> i32 {
+    let mut acc: i32 = s;
+    let mut i: i64 = 0;
+    while i < n {
+        if x[i] > 5 { acc = acc + 1; }
+        i = i + 1;
+    }
+    return acc;
+}
+
+@unchecked
+fn iargmin(x: []i32, s: i32, n: i64) -> i64 {
+    let mut m: i32 = s;
+    let mut at: i64 = -1;
+    let mut i: i64 = 0;
+    while i < n {
+        if x[i] < m { m = x[i]; at = i; }
+        i = i + 1;
+    }
+    return at * 10000000000 + (m as i64);
+}
+
+// i64: two lanes; the max folds serially (no 64-bit vector min/max).
+@unchecked
+fn lsum(x: []i64, s: i64, n: i64) -> i64 {
+    let mut acc: i64 = s;
+    let mut i: i64 = 0;
+    while i < n { acc = acc + x[i]; i = i + 1; }
+    return acc;
+}
+
+@unchecked
+fn lxor(x: []i64, s: i64, n: i64) -> i64 {
+    let mut acc: i64 = s;
+    let mut i: i64 = 0;
+    while i < n { acc = acc ^ x[i]; i = i + 1; }
+    return acc;
+}
+
+@unchecked
+fn lmaxr(x: []i64, s: i64, n: i64) -> i64 {
+    let mut m: i64 = s;
+    let mut i: i64 = 0;
+    while i < n { m = max(x[i], m); i = i + 1; }
+    return m;
+}
+
+fn main() -> i32 {
+    // f32 data: -0.0 (sums, max, guarded sum, argmax), +0.0 (subtract), 1.0 (products, dot
+    // weights), +inf (min).
+    let mut zneg: []f32 = alloc_f32(8);
+    let mut zpos: []f32 = alloc_f32(8);
+    let mut ones: []f32 = alloc_f32(8);
+    let mut pinf: []f32 = alloc_f32(8);
+    let mut out: []f32 = alloc_f32(1);
+    let mut j: i64 = 0;
+    while j < 8 {
+        zneg[j] = f32_from_bits(0x80000000 as u32);
+        zpos[j] = 0.0;
+        ones[j] = 1.0;
+        pinf[j] = f32_from_bits(0x7f800000 as u32);
+        j = j + 1;
+    }
+    let mut seeds: []f32 = alloc_f32(3);
+    seeds[0] = f32_from_bits(0x80000000 as u32);
+    seeds[1] = f32_from_bits(0x7fc00001 as u32);
+    seeds[2] = f32_from_bits(0x7f800000 as u32);
+
+    let mut q: i64 = 0;
+    while q < 3 {
+        let s: f32 = seeds[q];
+        let mut n: i64 = 0;
+        while n < 4 {
+            print(bits(fsum(zneg, s, n)));
+            print(bits(fsub(zpos, s, n)));
+            print(bits(fprod(ones, s, n)));
+            print(bits(fdot(zneg, ones, s, n)));
+            print(bits(fmaxr(zneg, s, n)));
+            print(bits(fminr(pinf, s, n)));
+            print(bits(fguard(zneg, s, n)));
+            print(bits(fbranchmax(zneg, s, n)));
+            print(fargmax(zneg, s, n, out));
+            print(bits(out[0]));
+            print(bits(forsum(zneg, s, n)));
+            n = n + 1;
+        }
+        q = q + 1;
+    }
+    let mut n: i64 = 0;
+    while n < 4 {
+        print(ffindlast(zneg, n));
+        n = n + 1;
+    }
+
+    // f64: two lanes, so the sub-group trips are 0 and 1.
+    let mut dneg: []f64 = alloc_f64(4);
+    let mut dones: []f64 = alloc_f64(4);
+    let mut dout: []f64 = alloc_f64(1);
+    j = 0;
+    while j < 4 {
+        dneg[j] = f64_from_bits(0x8000000000000000 as u64);
+        dones[j] = 1.0;
+        j = j + 1;
+    }
+    let mut dseeds: []f64 = alloc_f64(3);
+    dseeds[0] = f64_from_bits(0x8000000000000000 as u64);
+    dseeds[1] = f64_from_bits(0x7ff8000000000001 as u64);
+    dseeds[2] = f64_from_bits(0x7ff0000000000000 as u64);
+    q = 0;
+    while q < 3 {
+        let s: f64 = dseeds[q];
+        n = 0;
+        while n < 2 {
+            print(bits(dsum(dneg, s, n)));
+            print(bits(dprod(dones, s, n)));
+            print(bits(dmaxr(dneg, s, n)));
+            print(dargmax(dneg, s, n, dout));
+            print(bits(dout[0]));
+            print(bits(dforsum(dneg, s, n)));
+            n = n + 1;
+        }
+        q = q + 1;
+    }
+
+    // i32: zeros (sum, or, xor, count), ones (product), all-ones (and), MIN (max), MAX (min).
+    let mut izero: []i32 = alloc_i32(8);
+    let mut ione: []i32 = alloc_i32(8);
+    let mut iall: []i32 = alloc_i32(8);
+    let mut imin: []i32 = alloc_i32(8);
+    let mut imax: []i32 = alloc_i32(8);
+    j = 0;
+    while j < 8 {
+        izero[j] = 0;
+        ione[j] = 1;
+        iall[j] = -1;
+        imin[j] = -2147483647 - 1;
+        imax[j] = 2147483647;
+        j = j + 1;
+    }
+    let mut iseeds: []i32 = alloc_i32(3);
+    iseeds[0] = -2147483647 - 1;
+    iseeds[1] = 2147483647;
+    iseeds[2] = -1;
+    q = 0;
+    while q < 3 {
+        let s: i32 = iseeds[q];
+        n = 0;
+        while n < 4 {
+            print(isum(izero, s, n));
+            print(iprod(ione, s, n));
+            print(iand(iall, s, n));
+            print(ior(izero, s, n));
+            print(ixor(izero, s, n));
+            print(imaxr(imin, s, n));
+            print(iminr(imax, s, n));
+            print(icount(izero, s, n));
+            print(iargmin(imax, s, n));
+            n = n + 1;
+        }
+        q = q + 1;
+    }
+
+    // i64: zeros (sum, xor), MIN (max).
+    let mut lzero: []i64 = alloc_i64(4);
+    let mut lmin: []i64 = alloc_i64(4);
+    j = 0;
+    while j < 4 {
+        lzero[j] = 0;
+        lmin[j] = -9223372036854775807 - 1;
+        j = j + 1;
+    }
+    let mut lseeds: []i64 = alloc_i64(3);
+    lseeds[0] = -9223372036854775807 - 1;
+    lseeds[1] = 9223372036854775807;
+    lseeds[2] = -1;
+    q = 0;
+    while q < 3 {
+        let s: i64 = lseeds[q];
+        n = 0;
+        while n < 2 {
+            print(lsum(lzero, s, n));
+            print(lxor(lzero, s, n));
+            print(lmaxr(lmin, s, n));
+            n = n + 1;
+        }
+        q = q + 1;
+    }
+
+    free(zneg); free(zpos); free(ones); free(pinf); free(out); free(seeds);
+    free(dneg); free(dones); free(dout); free(dseeds);
+    free(izero); free(ione); free(iall); free(imin); free(imax); free(iseeds);
+    free(lzero); free(lmin); free(lseeds);
+    return 0;
+}

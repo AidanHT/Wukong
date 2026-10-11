@@ -553,8 +553,10 @@ impl IvRamp {
 enum TripPlan {
     /// The loop runs a known number of times; `vec` is that count rounded down to a multiple of W.
     Const(u64),
-    /// `end - start`, rounded down to a multiple of W and clamped at 0.
-    Runtime { end: ValueId },
+    /// `end - start`, rounded down to a multiple of W, and zero unless `start < end` under the
+    /// header test's own signedness (`signed`) — see [`emit_trip`] for why the order test is not
+    /// implied by the subtraction.
+    Runtime { end: ValueId, signed: bool },
 }
 
 #[derive(Clone, Debug)]
@@ -975,8 +977,12 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
             step: 1,
             inclusive: false,
             end,
+            signed,
             ..
-        } => TripPlan::Runtime { end: *end },
+        } => TripPlan::Runtime {
+            end: *end,
+            signed: *signed,
+        },
         // An inclusive bound would need `end + 1`, which overflows at `end == MAX`; a non-unit step
         // is already excluded above.
         _ => return Err("trip count is not a unit-step half-open range"),
@@ -1532,7 +1538,10 @@ fn early_trip(
     if l.blocks.iter().any(|b| defined_in_block(f, *b, bound)) {
         return Err("the search loop's bound is computed inside the loop");
     }
-    Ok(TripPlan::Runtime { end: bound })
+    Ok(TripPlan::Runtime {
+        end: bound,
+        signed: pred == CmpOp::Slt,
+    })
 }
 
 /// What has to hold before a search loop's test may run `W` iterations ahead of the scalar loop:
@@ -3489,10 +3498,19 @@ fn apply(f: &mut Function, p: &VecPlan) {
 
 /// `n_vec`: the element count the vector loop owns — the trip count rounded down to a multiple of
 /// `W`, or zero when the loop does not run a full group.
+///
+/// A runtime count is `end - start` in the induction variable's own type, which **wraps**. The
+/// scalar loop runs zero times whenever `start < end` fails under the header test's signedness,
+/// but the difference alone does not say so: an `i32` loop from `2147483600` to `-2147483600` runs
+/// no iteration, and `end - start` wraps to `96`. Treated as a count, that sent 24 groups of loads
+/// off the end of the buffer (the interpreter stopped with "vector load out of bounds" at `-O2`
+/// where `-O0` returned the untouched seed). So the order is tested explicitly, with the same
+/// predicate the header uses; once `start < end` holds, the mathematical count is positive and a
+/// wrapped difference can only read as negative, which the `>= W` test already turns into zero.
 fn emit_trip(e: &mut Emit<'_>, p: &VecPlan, guard: BlockId, start: ValueId) -> ValueId {
     match &p.trip {
         TripPlan::Const(n) => e.int(guard, &p.iv_ty, *n as i64),
-        TripPlan::Runtime { end } => {
+        TripPlan::Runtime { end, signed } => {
             let count = e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Sub, *end, start));
             // `count & !(W-1)` rounds down for a non-negative count; the compare below is what
             // keeps a negative one (an already-finished loop) from producing a negative `n_vec`
@@ -3501,8 +3519,11 @@ fn emit_trip(e: &mut Emit<'_>, p: &VecPlan, guard: BlockId, start: ValueId) -> V
             let masked = e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::And, count, mask));
             let min = e.int(guard, &p.iv_ty, p.w as i64 * MIN_TRIP_GROUPS as i64);
             let big = e.push(guard, MirType::I1, Op::Cmp(CmpOp::Sge, count, min));
+            let lt = if *signed { CmpOp::Slt } else { CmpOp::Ult };
+            let runs = e.push(guard, MirType::I1, Op::Cmp(lt, start, *end));
+            let ok = e.push(guard, MirType::I1, Op::Bin(BinOp::And, runs, big));
             let zero = e.int(guard, &p.iv_ty, 0);
-            e.push(guard, p.iv_ty.clone(), Op::Select(big, masked, zero))
+            e.push(guard, p.iv_ty.clone(), Op::Select(ok, masked, zero))
         }
     }
 }
@@ -3528,7 +3549,7 @@ fn emit_alias_checks(e: &mut Emit<'_>, p: &VecPlan, guard: BlockId) -> Option<Va
             let k = e.int(guard, &p.iv_ty, *n as i64);
             e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Add, start, k))
         }
-        TripPlan::Runtime { end } => *end,
+        TripPlan::Runtime { end, .. } => *end,
     };
 
     let mut acc: Option<ValueId> = None;
@@ -7447,5 +7468,134 @@ mod tests {
             ops.iter().any(|op| matches!(op, Op::Shuffle { .. })),
             "the exit test did not fold the lane mask: {ops:?}"
         );
+    }
+
+    // ---- zero-trip and sub-group trips ---------------------------------------------------------
+
+    /// Run `src` at `-O2` in the interpreter and return its printed lines.
+    fn printed_at_o2(src: &str) -> Vec<String> {
+        let (program, mut interner) = optimized(src, 2);
+        let main = interner.intern("main");
+        let (code, bytes) = wukong_interp::run_with_output(&program, main, &interner)
+            .unwrap_or_else(|e| panic!("-O2: {e}"));
+        assert_eq!(code, 0);
+        String::from_utf8_lossy(&bytes)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .collect()
+    }
+
+    /// A trip below one vector group runs no vector iteration, so whatever the vector path does on
+    /// the way out — fold identity partials into the seed, combine an argmax's `(value, index)`
+    /// lanes, resolve a FindLastIV's sentinel — must hand back the scalar seed bit for bit. Each
+    /// form below widens; each is run at trips `0 .. W-1` from seeds a wrong identity would change
+    /// (`-0.0`, a payload NaN and `+inf`; `i32::MIN`, `i32::MAX` and `-1`) over data that also
+    /// leaves the seed alone in the scalar loop, so every expected line is the seed itself.
+    #[test]
+    fn every_fold_form_returns_its_seed_below_one_group() {
+        let kernels = "@unchecked fn fs(x: []f32, a: f32, n: i64) -> f32 { let mut acc: f32 = a; \
+                         let mut i: i64 = 0; while i < n { acc = acc + x[i]; i = i + 1; } return acc; } \
+                       @unchecked fn fm(x: []f32, a: f32, n: i64) -> f32 { let mut m: f32 = a; \
+                         let mut i: i64 = 0; while i < n { m = max(x[i], m); i = i + 1; } return m; } \
+                       @unchecked fn fa(x: []f32, a: f32, n: i64) -> i64 { let mut m: f32 = a; \
+                         let mut at: i64 = -1; let mut i: i64 = 0; \
+                         while i < n { if x[i] > m { m = x[i]; at = i; } i = i + 1; } \
+                         if bits(m) != bits(a) { return -99; } return at; } \
+                       @unchecked fn fl(x: []f32, n: i64) -> i64 { let mut last: i64 = -5; \
+                         let mut i: i64 = 0; while i < n { if x[i] > 0.5 { last = i; } i = i + 1; } \
+                         return last; } \
+                       @unchecked fn is(x: []i32, a: i32, n: i64) -> i32 { let mut acc: i32 = a; \
+                         let mut i: i64 = 0; while i < n { acc = acc + x[i]; i = i + 1; } return acc; } \
+                       @unchecked fn im(x: []i32, a: i32, n: i64) -> i32 { let mut m: i32 = a; \
+                         let mut i: i64 = 0; while i < n { m = max(x[i], m); i = i + 1; } return m; }";
+        let shape = format!("{kernels} fn main() -> i32 {{ return 0; }}");
+        for k in ["fs", "fm", "fa", "fl", "is", "im"] {
+            assert!(is_widened(&shape, k), "{k} did not widen");
+        }
+        let src = format!(
+            "{kernels} fn main() -> i32 {{ let mut z: []f32 = alloc_f32(4); \
+             let mut w: []i32 = alloc_i32(4); let mut lo: []i32 = alloc_i32(4); \
+             let mut fseed: []f32 = alloc_f32(3); let mut iseed: []i32 = alloc_i32(3); \
+             let mut j: i64 = 0; \
+             while j < 4 {{ z[j] = f32_from_bits(0x80000000 as u32); w[j] = 0; \
+               lo[j] = -2147483647 - 1; j = j + 1; }} \
+             fseed[0] = f32_from_bits(0x80000000 as u32); \
+             fseed[1] = f32_from_bits(0x7fc00001 as u32); \
+             fseed[2] = f32_from_bits(0x7f800000 as u32); \
+             iseed[0] = -2147483647 - 1; iseed[1] = 2147483647; iseed[2] = -1; \
+             let mut q: i64 = 0; \
+             while q < 3 {{ let mut n: i64 = 0; \
+               while n < 4 {{ print(bits(fs(z, fseed[q], n))); print(bits(fm(z, fseed[q], n))); \
+                 print(fa(z, fseed[q], n)); print(fl(z, n)); \
+                 print(is(w, iseed[q], n)); print(im(lo, iseed[q], n)); n = n + 1; }} \
+               q = q + 1; }} \
+             free(z); free(w); free(lo); free(fseed); free(iseed); return 0; }}"
+        );
+        let mut expected: Vec<String> = Vec::new();
+        for (fbits, ival) in [
+            (2147483648u32, i32::MIN),
+            (2143289345, i32::MAX),
+            (2139095040, -1),
+        ] {
+            for _ in 0..4 {
+                for v in [
+                    fbits.to_string(),
+                    fbits.to_string(),
+                    "-1".to_string(),
+                    "-5".to_string(),
+                    ival.to_string(),
+                    ival.to_string(),
+                ] {
+                    expected.push(v);
+                }
+            }
+        }
+        assert_eq!(printed_at_o2(&src), expected, "-O2 lost a seed");
+        scalar_and_vector_agree(&src);
+    }
+
+    /// A runtime trip is `end - start` in the counter's own type, and that wraps: an `i32` loop
+    /// from `2147483600` to `-2147483600` runs no iteration, but the difference is `96`. Read as a
+    /// count, it ran 24 groups of loads past the end of the buffer ("vector load out of bounds" in
+    /// the interpreter at `-O2`, the untouched seed at `-O0`). The same for an unsigned `u64`
+    /// counter from `2^64 - 16` up to `16`, whose difference is `32`. The guard now also requires
+    /// `start < end` under the header's own signedness.
+    #[test]
+    fn a_runtime_trip_whose_difference_wraps_runs_no_vector_group() {
+        let k = "@unchecked fn k(x: []i32, s: i32, e: i32) -> i32 { let mut acc: i32 = 0; \
+                   let mut i: i32 = s; while i < e { acc = acc + x[i]; i = i + 1; } \
+                   return acc * 1000 + i; } \
+                 @unchecked fn u(x: []i32, s: u64, e: u64) -> i32 { let mut acc: i32 = 0; \
+                   let mut i: u64 = s; while i < e { acc = acc + x[i]; i = i + 1; } \
+                   return acc; }";
+        let shape = format!("{k} fn main() -> i32 {{ return 0; }}");
+        assert!(is_widened(&shape, "k"), "the i32-counter reduction did not widen");
+        assert!(is_widened(&shape, "u"), "the u64-counter reduction did not widen");
+        let src = format!(
+            "{k} fn main() -> i32 {{ let mut x: []i32 = alloc_i32(16); \
+             let mut j: i64 = 0; while j < 16 {{ x[j] = (j as i32) + 1; j = j + 1; }} \
+             let mut lo: []i64 = alloc_i64(3); let mut hi: []i64 = alloc_i64(3); \
+             lo[0] = 2147483600; hi[0] = -2147483600; \
+             lo[1] = 3; hi[1] = 15; \
+             lo[2] = -16; hi[2] = 16; \
+             let mut q: i64 = 0; \
+             while q < 2 {{ print(k(x, lo[q] as i32, hi[q] as i32)); q = q + 1; }} \
+             q = 1; \
+             while q < 3 {{ print(u(x, lo[q] as u64, hi[q] as u64)); q = q + 1; }} \
+             free(x); free(lo); free(hi); return 0; }}"
+        );
+        // k(2147483600, -2147483600): no iteration, `acc = 0`, the counter stays at its start.
+        // k(3, 15) and u(3, 15): 4 + 5 + .. + 15 = 114 (the counter leaves at 15). u(2^64-16, 16):
+        // no iteration.
+        assert_eq!(
+            printed_at_o2(&src),
+            vec![
+                "2147483600".to_string(),
+                "114015".to_string(),
+                "114".to_string(),
+                "0".to_string()
+            ]
+        );
+        scalar_and_vector_agree(&src);
     }
 }
