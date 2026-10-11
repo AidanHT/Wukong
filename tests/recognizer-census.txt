@@ -341,6 +341,9 @@ pool2d_partial_window.wk:
 pow.wk:
 power.wk:
 prefix_sum.wk:
+premise_gemm_64.wk: wukong_sgemm
+premise_norm_wide.wk: wukong_norm_f32
+premise_reduce_4096.wk: veckernel*2 wukong_sreduce_f32 wukong_sreduce_f32*3 wukong_sreduce_f32_parallel wukong_sreduce_f32_parallel*3
 print_aggregate.wk: wukong_rt_alloc wukong_rt_alloc*3 wukong_rt_fmt_f32 wukong_rt_fmt_f32*7 wukong_rt_fmt_f64 wukong_rt_fmt_int wukong_rt_fmt_int*10 wukong_rt_fmt_lit wukong_rt_fmt_lit*70 wukong_rt_fmt_slice wukong_rt_fmt_slice*9 wukong_rt_fmt_str
 print_float_display.wk:
 print_scalar_types.wk:

@@ -8,8 +8,9 @@
 //! because a peer that fails to compile drops its column silently rather than failing the run.
 //!
 //! Exit codes: `0` every floor row evaluated and held; `1` a floor was violated, a program left
-//! the sweep, a bar peer failed to build, an oracle failed, or a row was not evaluable (wrong or
-//! unstable power state, no control); `2` the floor file itself is missing or malformed. A pass
+//! the sweep, a bar peer failed to build, an oracle failed, the recognition on/off premise check
+//! (`compare::premise_check`, P12.24) failed, or a row was not evaluable (wrong or unstable power
+//! state, no control); `2` the floor file itself is missing or malformed. A pass
 //! REQUIRES an evaluable run: this gate refuses to go green on battery or AC+charging, because a
 //! green that means "could not check" is how a sweep rots.
 //!
@@ -431,6 +432,9 @@ pub(crate) fn sota_check(cc: &str, cxx: &str, dir: &Path) -> i32 {
     );
     println!();
 
+    // The recognition on/off premise at measurement size (P12.24): the recognition-off rows below
+    // are read beside recognizer-on columns elsewhere, and that reading rests on this premise.
+    let premise_ok = crate::compare::premise_check();
     let mut sweep = crate::general::bench_general(cc, cxx, dir);
     println!();
     sweep.extend(crate::compare::bench_compare(cc, dir));
@@ -439,9 +443,16 @@ pub(crate) fn sota_check(cc: &str, cxx: &str, dir: &Path) -> i32 {
 
     println!();
     println!("sota-check verdicts:");
-    let (lines, failed) = evaluate(&floors, &sweep);
+    let (lines, mut failed) = evaluate(&floors, &sweep);
     for l in &lines {
         println!("{l}");
+    }
+    if !premise_ok {
+        println!(
+            "  FAIL  recognition on/off premise (tests/run/premise_*.wk): see the `! premise` lines \
+             above"
+        );
+        failed = true;
     }
     println!();
     if failed {

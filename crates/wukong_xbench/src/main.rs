@@ -714,8 +714,15 @@ fn main() {
     // (compare.rs); `sota-check` is part 11 of the verification gate (sota.rs) and is the one
     // subcommand here whose EXIT CODE is the product.
     if filter.as_deref() == Some("compare") {
+        // The recognition on/off premise at measurement size (P12.24) runs first: every
+        // recognizer-on vs recognition-off reading in this harness rests on it, and a failure
+        // turns the process exit into the numerics gate's code after the timed sweep is printed.
+        let premise_ok = compare::premise_check();
         let rows = compare::bench_compare(&cc, &dir);
         print_sota_scorecard(&rows);
+        if !premise_ok {
+            std::process::exit(numerics::NUMERICS_EXIT);
+        }
         return;
     }
     if filter.as_deref() == Some("sota-check") {

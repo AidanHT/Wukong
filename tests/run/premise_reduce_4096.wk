@@ -1,0 +1,107 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT-APPROX: 4103.998046875 6.11e-5
+// EXPECT-OUT-APPROX: 4092.0009765625 6.11e-5
+// EXPECT-OUT-APPROX: 4099.98861058522 6.11e-5
+// EXPECT-OUT-APPROX: 4103.998046875 6.11e-5
+// EXPECT-OUT-APPROX: 4099.98861058522 6.11e-5
+// EXPECT-OUT-APPROX: 4112.01691945456 6.11e-5
+// EXPECT-OUT-APPROX: 4103.998046875 6.11e-5
+// EXPECT-OUT-APPROX: 4099.98861058522 6.11e-5
+module tests.run.premise_reduce_4096
+
+// P12.24 - the instrument's correctness premise at a MEASUREMENT size. The recognition on/off
+// premise (`WUKONG_NO_RECOGNIZE` changes how a program is compiled, never what it computes beyond a
+// declared tolerance) used to be checked only on fixtures of N <= 16 that print exact integers, where
+// a reassociated sum cannot differ from a sequential one. Here every reduction runs over N = 4096
+// fractional f32 values - far above the kernels' 8-lane / 64-element block - and prints its result at
+// full precision (shortest round-trip f32), so a different summation order is VISIBLE in the output.
+// `wukong_xbench compare` runs this fixture with recognition ON and OFF on both backends and reports
+// how far the two answers actually moved; this file pins both to the scalar closed form.
+//
+// Lanes, in print order (dispatch at `--emit=mir -O2`, recognition on):
+//   1 sum(x)        builtin            -> wukong_sreduce_f32 (on AND off: a builtin, not a recognizer)
+//   2 sum(y)        builtin            -> wukong_sreduce_f32
+//   3 dot(x, y)     builtin            -> wukong_sreduce_f32
+//   4 par_sum       @parallel loop     -> wukong_sreduce_f32_parallel (off: the generic vectorizer)
+//   5 par_dot       @parallel loop     -> wukong_sreduce_f32_parallel (off: the generic vectorizer)
+//   6 par_sumsq     @parallel loop     -> wukong_sreduce_f32_parallel (off: the generic vectorizer)
+//   7 seq_sum       plain loop         -> the generic vectorizer's reduction (`veckernel`), both ways
+//   8 seq_dot       plain loop         -> the generic vectorizer's reduction (`veckernel`), both ways
+//
+// Inputs, all EXACT in f32 (dyadic, at most 21 fractional bits, magnitudes in (0.998, 1.004)):
+//   x[i] = 1 + i * 2^-20,  y[i] = 1 - i * 2^-21,  i = 0..4095.
+// With S1 = sum(i) = 4095*4096/2 = 8386560 and S2 = sum(i^2) = 4095*4096*8191/6 = 22898104320, the
+// expected values are exact rationals of the loops' real-number semantics:
+//   sum(x)   = 4096 + S1 * 2^-20                       = 4103.998046875
+//   sum(y)   = 4096 - S1 * 2^-21                       = 4092.0009765625
+//   dot(x,y) = 4096 + (2^-20 - 2^-21) S1 - 2^-41 S2   = 4099.98861058522
+//   sum(x^2) = 4096 + 2^-19 S1 + 2^-40 S2              = 4112.01691945456
+// (sum(x) and sum(y) are themselves representable in f32; the other two are not.)
+//
+// TOLERANCE 6.11e-5 = c*sqrt(K)*eps rounded up, with K = 4096, eps = 2^-23 and c = 8 - the in-tree
+// convention for a reassociated f32 reduction (`p4_reduction_f64_reference`,
+// crates/wukong_codegen_cranelift/src/tests.rs), i.e. 8 * 64 * 2^-23 = 2^-14 = 6.1035e-5. It is the
+// random-walk bound, not the worst case (gamma_4095 = 2.44e-4 for positive terms in any order), so
+// its margin was checked against the orders that exist in-tree, simulated in exact rational
+// arithmetic with f32 rounding at every step: the sequential scalar order is 3.6e-7 / 1.2e-7 /
+// 8.0e-8 / 4.1e-8 from the closed forms above (sum x / sum y / dot / sumsq) and the runtime
+// reduction's documented 8x8x64 partition (reduce.rs) is 0 / 0 / 3.9e-8 / 4.1e-8 - over 150x inside.
+// Those two orders disagree with each other on sum x, sum y and dot, and the recognition-off lowering
+// of lanes 4-6 is a third (the generic vectorizer's lane order) - at landing it moved one printed
+// lane by 9.7e-8 against the recognized kernel, which is the difference this file exists to bound.
+
+@parallel
+fn par_sum(x: [f32; 4096], mut o: [f32; 1]) {
+    let mut s: f32 = 0.0;
+    for k in 0..4096 { s = s + x[k]; }
+    o[0] = s;
+}
+
+@parallel
+fn par_dot(x: [f32; 4096], y: [f32; 4096], mut o: [f32; 1]) {
+    let mut s: f32 = 0.0;
+    for k in 0..4096 { s = s + x[k] * y[k]; }
+    o[0] = s;
+}
+
+@parallel
+fn par_sumsq(x: [f32; 4096], mut o: [f32; 1]) {
+    let mut s: f32 = 0.0;
+    for k in 0..4096 { s = s + x[k] * x[k]; }
+    o[0] = s;
+}
+
+fn seq_sum(x: [f32; 4096]) -> f32 {
+    let mut s: f32 = 0.0;
+    for k in 0..4096 { s = s + x[k]; }
+    return s;
+}
+
+fn seq_dot(x: [f32; 4096], y: [f32; 4096]) -> f32 {
+    let mut s: f32 = 0.0;
+    for k in 0..4096 { s = s + x[k] * y[k]; }
+    return s;
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 4096] = [0.0; 4096];
+    let mut y: [f32; 4096] = [0.0; 4096];
+    for i in 0..4096 {
+        x[i] = 1.0 + (i as f32) * 0.00000095367431640625; // 2^-20
+        y[i] = 1.0 - (i as f32) * 0.000000476837158203125; // 2^-21
+    }
+    print(sum(x));
+    print(sum(y));
+    print(dot(x, y));
+    let mut o: [f32; 1] = [0.0; 1];
+    par_sum(x, o);
+    print(o[0]);
+    par_dot(x, y, o);
+    print(o[0]);
+    par_sumsq(x, o);
+    print(o[0]);
+    print(seq_sum(x));
+    print(seq_dot(x, y));
+    return 0;
+}
