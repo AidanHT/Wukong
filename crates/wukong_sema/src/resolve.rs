@@ -24,7 +24,7 @@
 //! checked once against an opaque `T`, and each instantiation is lowered with the concrete type.
 
 use wukong_ast::{Expr, ExprKind, Ident, Path, TypeExpr, TypeKind};
-use wukong_diag::{did_you_mean, Diagnostic};
+use wukong_diag::{did_you_mean, Applicability, Diagnostic};
 use wukong_span::{FxHashSet as HashSet, Span, Symbol};
 use wukong_types::{Scalar, Ty};
 
@@ -206,8 +206,11 @@ impl Sema<'_> {
         if let Some(c) = did_you_mean(&nm, candidates.iter().map(String::as_str)) {
             d = d.suggest(span, "a function with a similar name exists", c);
         }
-        if let Some(h) = self.callee_elsewhere(&nm) {
+        if let Some((h, path)) = self.callee_elsewhere(&nm) {
             d = d.help(h);
+            if let Some(path) = path {
+                d = d.suggest(span, "call the associated function through its type", path);
+            }
         }
         self.diags.push(d);
         Ty::Error
@@ -262,8 +265,9 @@ impl Sema<'_> {
 
     /// A function named `nm` that exists but is not in scope under that name: a method or associated
     /// function of a type (`Vec2.norm`), or an item of a module this file does not import
-    /// (`lib.geom.norm`, the loader's spelling of `norm` in module `lib.geom`).
-    fn callee_elsewhere(&self, nm: &str) -> Option<String> {
+    /// (`lib.geom.norm`, the loader's spelling of `norm` in module `lib.geom`). Returns the help
+    /// text and, for a type's function, the path that names it (`Vec2::norm`).
+    fn callee_elsewhere(&self, nm: &str) -> Option<(String, Option<String>)> {
         let suffix = format!(".{nm}");
         let mut owners: Vec<&str> = self
             .defs
@@ -279,14 +283,20 @@ impl Sema<'_> {
             .get(owner)
             .is_some_and(|s| self.is_declared_named_ty(s));
         Some(if is_type {
-            format!(
-                "`{owner}` has a function named `{nm}`: call it as `{owner}::{nm}(..)`, or as a \
-                 method `value.{nm}(..)` when it takes `self`"
+            (
+                format!(
+                    "`{owner}` has a function named `{nm}`: call it as `{owner}::{nm}(..)`, or as \
+                     a method `value.{nm}(..)` when it takes `self`"
+                ),
+                Some(format!("{owner}::{nm}")),
             )
         } else {
-            format!(
-                "a function `{nm}` is defined in module `{owner}`, which this file does not \
-                 import: add `import {owner};` (the function must be declared `pub`)"
+            (
+                format!(
+                    "a function `{nm}` is defined in module `{owner}`, which this file does not \
+                     import: add `import {owner};` (the function must be declared `pub`)"
+                ),
+                None,
             )
         })
     }
@@ -397,9 +407,16 @@ impl Sema<'_> {
                         ))
                     };
                     if self.methods.resolution.table.contains_key(&(n, name.sym)) {
-                        d = d.help(format!(
-                            "`{field}` is a method of `{shown}`: call it, `.{field}(..)`"
-                        ));
+                        d = d
+                            .help(format!(
+                                "`{field}` is a method of `{shown}`: call it, `.{field}(..)`"
+                            ))
+                            .suggest_with(
+                                name.span.shrink_to_hi(),
+                                "call the method",
+                                "()",
+                                Applicability::HasPlaceholders,
+                            );
                     }
                 }
                 _ => {
@@ -422,7 +439,14 @@ impl Sema<'_> {
             (None, other) => {
                 let methods = builtin_methods_of(recv_of(other));
                 if methods.contains(&field.as_str()) {
-                    d = d.help(format!("`{field}` is a method: call it, `.{field}(..)`"));
+                    d = d
+                        .help(format!("`{field}` is a method: call it, `.{field}(..)`"))
+                        .suggest_with(
+                            name.span.shrink_to_hi(),
+                            "call the method",
+                            "()",
+                            Applicability::HasPlaceholders,
+                        );
                 } else {
                     d = d.note(format!(
                         "only a struct has named fields; `{shown}` is a builtin type"
@@ -488,6 +512,12 @@ impl Sema<'_> {
                     .help(format!(
                         "a variant with named fields is built as `{shown}::Variant {{ .. }}`"
                     ))
+                    .suggest_with(
+                        path.span.shrink_to_hi(),
+                        "name the variant",
+                        "::Variant",
+                        Applicability::HasPlaceholders,
+                    )
             }
             Some(_) => Diagnostic::error(format!("expected struct, found `{shown}`"))
                 .with_code("E0324")
@@ -563,6 +593,8 @@ impl Sema<'_> {
                     return Ty::Unknown;
                 };
                 let (ts, sn) = (fty.display(self.interner), self.sym_str(*n).to_string());
+                // The call's argument list, `(..)` after the field name, is what the fix deletes.
+                let parens = Span::new(name.span.source, name.span.hi, span.hi.max(name.span.hi));
                 self.diags.push(
                     Diagnostic::error(format!("expected function, found `{ts}`"))
                         .with_code("E0323")
@@ -573,7 +605,13 @@ impl Sema<'_> {
                         .help(format!(
                             "read the field without parentheses, `.{method}`; a struct has the \
                              methods its `impl {sn}` blocks define"
-                        )),
+                        ))
+                        .suggest_with(
+                            parens,
+                            "read the field instead of calling it",
+                            "",
+                            Applicability::MaybeIncorrect,
+                        ),
                 );
                 return Ty::Error;
             }
@@ -584,13 +622,13 @@ impl Sema<'_> {
             // `len` on a slice with arguments is the only lowered method `type_extent_method`
             // declines; anything else here is the unlowered SIMD surface, typed leniently.
             if method == "len" && !args.is_empty() {
-                self.error(
-                    span,
-                    "E0503",
-                    format!(
+                self.diags.push(
+                    Diagnostic::error(format!(
                         "`.len()` takes no arguments, but {} were supplied",
                         args.len()
-                    ),
+                    ))
+                    .with_code("E0503")
+                    .primary(span, "`len` takes no arguments"),
                 );
                 return Ty::Error;
             }
@@ -896,6 +934,97 @@ mod tests {
                    let mut acc: f32 = 0.0; acc = a[1]\n(2.0) * 2.0; return acc as i32; }";
         let d = only(src, "E0323");
         assert!(notes(&d).contains("end the previous one with `;`"), "{d:?}");
+    }
+
+    /// The source text a diagnostic's first suggestion replaces, its replacement and how sure the
+    /// compiler is of it. An insertion replaces the empty string.
+    fn edit(src: &str, d: &Diagnostic) -> (String, String, wukong_diag::Applicability) {
+        let s = d.suggestions.first().expect("a suggestion");
+        (
+            src[s.span.lo as usize..s.span.hi as usize].to_string(),
+            s.replacement.clone(),
+            s.applicability,
+        )
+    }
+
+    /// N5: the fixes that the help text describes travel as structured suggestions whose spans
+    /// are byte-exact, so an editor can apply them without re-parsing.
+    #[test]
+    fn resolution_fixes_are_structured_with_exact_spans() {
+        use wukong_diag::Applicability::*;
+        // E0323: a field called like a method; the fix deletes the argument list.
+        let src = "struct S { w: f32 } fn f(s: S) -> f32 { return s.w(); }";
+        let d = only(src, "E0323");
+        assert_eq!(
+            edit(src, &d),
+            ("()".to_string(), String::new(), MaybeIncorrect)
+        );
+        // E0321: a method read like a field; the fix inserts the call right after the name.
+        let src = "struct V { x: f32 } impl V { fn norm(self) -> f32 { return self.x; } } \
+                   fn f(v: V) -> f32 { return v.norm; }";
+        let d = first(src, "E0321");
+        let s = &d.suggestions[0];
+        let after = (src.find("v.norm;").unwrap() + "v.norm".len()) as u32;
+        assert_eq!((s.span.lo, s.span.hi), (after, after));
+        assert_eq!(
+            (s.replacement.as_str(), s.applicability),
+            ("()", HasPlaceholders)
+        );
+        // E0320: an associated function called bare; the fix names it through its type.
+        let src = "struct V { x: f32 } impl V { fn norm(self) -> f32 { return self.x; } } \
+                   fn main() -> i32 { let v = V { x: 2.0 }; return norm(v) as i32; }";
+        let d = only(src, "E0320");
+        let s = d
+            .suggestions
+            .iter()
+            .find(|s| s.replacement == "V::norm")
+            .unwrap_or_else(|| panic!("{d:?}"));
+        let at = src.find("norm(v)").unwrap() as u32;
+        assert_eq!((s.span.lo, s.span.hi), (at, at + 4));
+        // E0324: a struct literal of an enum; the fix inserts a variant placeholder.
+        let src = "enum E { A, B } fn main() -> i32 { let p = E { x: 1.0 }; return 0; }";
+        let d = only(src, "E0324");
+        let s = &d.suggestions[0];
+        let after = (src.find("E { x").unwrap() + 1) as u32;
+        assert_eq!((s.span.lo, s.span.hi), (after, after));
+        assert_eq!(
+            (s.replacement.as_str(), s.applicability),
+            ("::Variant", HasPlaceholders)
+        );
+        // E0503's caret has a label.
+        let d = only("fn f(s: []f32) -> i64 { return s.len(1); }", "E0503");
+        assert!(d.labels.iter().all(|l| !l.message.is_empty()), "{d:?}");
+    }
+
+    /// N5: E0304 inserts `mut ` before the binding's name — machine-applicable for a rebind,
+    /// maybe-incorrect where `mut` makes an aggregate parameter's store reach the caller.
+    #[test]
+    fn an_immutable_assignment_suggests_mut() {
+        use wukong_diag::Applicability::*;
+        let src = "fn main() -> i32 { let x: i32 = 5; x = 10; return x; }";
+        let d = only(src, "E0304");
+        let at = src.find("x: i32").unwrap() as u32;
+        let s = &d.suggestions[0];
+        assert_eq!((s.span.lo, s.span.hi), (at, at));
+        assert_eq!(
+            (s.replacement.as_str(), s.applicability),
+            ("mut ", MachineApplicable)
+        );
+        assert!(d.labels.iter().all(|l| !l.message.is_empty()), "{d:?}");
+        let src = "fn f(n: i32) -> i32 { n = 2; return n; } fn main() -> i32 { return f(1); }";
+        let d = only(src, "E0304");
+        let at = src.find("n: i32").unwrap() as u32;
+        assert_eq!(
+            (d.suggestions[0].span.lo, d.suggestions[0].applicability),
+            (at, MachineApplicable)
+        );
+        let src = "fn f(a: [f32; 2]) { a[0] = 1.0; }";
+        let d = only(src, "E0304");
+        let at = src.find("a: [f32").unwrap() as u32;
+        assert_eq!(
+            (d.suggestions[0].span.lo, d.suggestions[0].applicability),
+            (at, MaybeIncorrect)
+        );
     }
 
     #[test]
