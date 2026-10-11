@@ -39,10 +39,13 @@
 //!   their own storage ([`StorageRoot`]) — a fixed-array local (its own `alloca`; two different
 //!   allocas never overlap), or a fixed-array / static-tensor PARAMETER bound to the caller's storage
 //!   for the whole body (`noalias.rs`'s `param_is_its_storage`, the binding no assignment can
-//!   redirect, so the in-body view problem above cannot arise). Two such parameters are separated
-//!   only by the facts every recognizer already trusts, asked verbatim: `alias::plan_kernel_alias`
-//!   over the whole-program call-site bit, or a `@noalias` promise (`promised_disjoint`). Anything
-//!   else — a slice, a view, a projection, a may-alias pair — keeps the guard. With constant `s`/`d`
+//!   redirect, so the in-body view problem above cannot arise). Both roots are compared by VALUE,
+//!   never by spelling: a `match` arm binding over a fixed array binds the scrutinee's own pointer,
+//!   so one parameter can be spelled `m` and `x` in one call. Two DIFFERENT such parameters are
+//!   separated only by the facts every recognizer already trusts, asked verbatim:
+//!   `alias::plan_kernel_alias` over the whole-program call-site bit, or a `@noalias` promise
+//!   (`promised_disjoint`). Anything else — a slice, a view, a projection, a may-alias pair, one
+//!   storage under two names — keeps the guard. With constant `s`/`d`
 //!   and statically sized operands the extent checks fold too, so such a call is ONE bare
 //!   `wukong_attention_f32` in a straight-line block, which is what lets `wukong_autodiff`
 //!   differentiate a loss calling `sdpa` (it accepts single-block functions only).
@@ -102,9 +105,14 @@ enum StorageRoot {
     /// different stack objects, and a parameter (bound before the frame's allocas exist) is
     /// neither of them.
     Local(ValueId),
-    /// A fixed-array or statically-shaped tensor parameter spelled by its name, which is bound to
-    /// the caller's storage for the whole body (`noalias.rs`'s `param_is_its_storage`).
-    Param(Symbol),
+    /// A fixed-array or statically-shaped tensor parameter, bound to the caller's storage for the
+    /// whole body (`noalias.rs`'s `param_is_its_storage`): its entry VALUE, which is the identity,
+    /// and the name the operand was spelled with, which is only how the call-site and `@noalias`
+    /// facts are asked. A spelling is not an identity: a `match` arm binding over a fixed array
+    /// (`x`, `x @ _`) binds the scrutinee's base pointer itself, so `match m { x => .. }` names
+    /// parameter `m`'s storage twice, and `match k { o => .. }` gives `k`'s storage the name of
+    /// another parameter.
+    Param { value: ValueId, sym: Symbol },
 }
 
 /// The number of `f32` scalars a (possibly nested) fixed `f32` array holds.
@@ -934,25 +942,35 @@ impl FnLowerer<'_> {
 
     /// Are the two lowered operands provably different storage, at compile time? Only when both
     /// have a [`StorageRoot`] and the roots are apart: two different allocas; an alloca and a
-    /// parameter; or two parameters the whole-program call-site fact (`alias::plan_kernel_alias`,
-    /// asked exactly as every recognizer emit site asks it) or a `@noalias` promise
-    /// (`promised_disjoint`) separates. Everything else — including the same root twice — is
-    /// `false`, and the caller keeps its run-time overlap test.
+    /// parameter; or two DIFFERENT parameters (by value — one parameter under two names is one
+    /// root) that the whole-program call-site fact (`alias::plan_kernel_alias`, asked exactly as
+    /// every recognizer emit site asks it) or a `@noalias` promise (`promised_disjoint`) separates.
+    /// Everything else — including the same root twice — is `false`, and the caller keeps its
+    /// run-time overlap test.
     fn sdpa_storage_disjoint(&self, a: &BufArg, b: &BufArg) -> bool {
         let (Some(ra), Some(rb)) = (self.storage_root(a), self.storage_root(b)) else {
             return false;
         };
         match (ra, rb) {
             (StorageRoot::Local(x), StorageRoot::Local(y)) => x != y,
-            (StorageRoot::Local(_), StorageRoot::Param(_))
-            | (StorageRoot::Param(_), StorageRoot::Local(_)) => true,
-            (StorageRoot::Param(x), StorageRoot::Param(y)) => {
+            (StorageRoot::Local(_), StorageRoot::Param { .. })
+            | (StorageRoot::Param { .. }, StorageRoot::Local(_)) => true,
+            (
+                StorageRoot::Param { value: x, sym: sx },
+                StorageRoot::Param { value: y, sym: sy },
+            ) => {
+                // Both facts below speak about two different PARAMETERS. Asked with two different
+                // spellings of ONE parameter, the call-site bit answers "distinct symbols in an
+                // alias-free function" and would separate a buffer from itself.
+                if x == y {
+                    return false;
+                }
                 plan_kernel_alias(
                     self.gemm.alias_free,
-                    &[x, y],
+                    &[sx, sy],
                     &[OperandPair::disjoint(0, 1)],
                 ) == KernelAliasPlan::Dispatch
-                    || self.promised_disjoint(x, y)
+                    || self.promised_disjoint(sx, sy)
             }
         }
     }
@@ -968,7 +986,8 @@ impl FnLowerer<'_> {
         }
         let sym = b.sym?;
         let (bound, _) = self.lookup(sym)?;
-        (bound == b.ptr && self.param_is_its_storage(b.ptr)).then_some(StorageRoot::Param(sym))
+        (bound == b.ptr && self.param_is_its_storage(b.ptr))
+            .then_some(StorageRoot::Param { value: b.ptr, sym })
     }
 
     /// Is `v` the result of one of this function's own fixed-array `alloca`s (which `Builder`
@@ -1195,6 +1214,61 @@ mod tests {
             assert!(blocks > 1, "{src}: the guard branches");
             assert_eq!((attn, allocs), (2, 1), "{src}");
         }
+    }
+
+    /// A `match` binding over a fixed array is a second NAME for the scrutinee's storage: an
+    /// aggregate `Ident` (or `name @ sub`) binds the scrutinee's base pointer itself, with no copy.
+    /// Over a parameter that pointer IS the parameter value, so two different symbols resolve to one
+    /// storage-bound parameter — and `alias.rs` taints a `match` only when its scrutinee can hold a
+    /// borrowing leaf, so the whole-program bit stays `true`. The proof must compare the storage, not
+    /// the spelling: every one of these keeps the guard. (They once lowered to a bare
+    /// `wukong_attention_f32` with an input equal to `out` — `tests/run/sdpa_match_alias.wk` prints
+    /// the lanes that went wrong.)
+    #[test]
+    fn a_match_binding_of_the_output_parameter_keeps_the_sdpa_guard() {
+        let main1 = "fn main() -> i32 { let mut a: [f32; 8] = [1.0; 8]; f(a); return 0; }";
+        let ident = format!(
+            "fn f(mut m: [f32; 8]) {{ match m {{ x => {{ sdpa(x, x, x, m, 2, 4, 0.5, 0); }} }} }} \
+             {main1}"
+        );
+        let binding = format!(
+            "fn f(mut m: [f32; 8]) {{ match m {{ x @ _ => {{ sdpa(x, x, x, m, 2, 4, 0.5, 0); }} }} }} \
+             {main1}"
+        );
+        // A binding that SHADOWS another parameter's name: inside the arm `o` is `k`'s storage.
+        let shadow = "fn f(q: [f32; 8], mut k: [f32; 8], o: [f32; 8]) -> f32 { \
+                      match k { o => { sdpa(q, k, k, o, 2, 4, 0.5, 0); } } return o[0]; } \
+                      fn main() -> i32 { let q: [f32; 8] = [1.0; 8]; \
+                      let mut k: [f32; 8] = [0.5; 8]; let r: [f32; 8] = [0.0; 8]; \
+                      return f(q, k, r) as i32; }";
+        // The same over a local: the binding is the local's own alloca, compared by value already.
+        let local = "fn main() -> i32 { let mut a: [f32; 8] = [1.0; 8]; \
+                     match a { x => { sdpa(x, x, x, a, 2, 4, 0.5, 0); } } return a[0] as i32; }";
+        // An array pattern: element 0 of a nested-array parameter starts at the parameter's base.
+        let elem0 = "fn f(mut m: [[f32; 8]; 2]) { \
+                     match m { [r, _] => { sdpa(r, r, r, m, 2, 4, 0.5, 0); } } } \
+                     fn main() -> i32 { let mut a: [[f32; 8]; 2] = [[1.0; 8]; 2]; f(a); return 0; }";
+        // The `match` has blocks of its own, so the guard shows as its second (scratch) kernel call
+        // and the scratch allocation rather than as a block count.
+        for (src, f) in [
+            (&ident[..], "f"),
+            (&binding[..], "f"),
+            (shadow, "f"),
+            (elem0, "f"),
+            (local, "main"),
+        ] {
+            let (_, attn, _, allocs) = sdpa_shape(src, f);
+            assert_eq!((attn, allocs), (2, 1), "{src}: the guard must stay");
+        }
+        // Control: a binding of a DIFFERENT parameter is that parameter's storage, which the
+        // call-site bit separates from `o` exactly as it separates the parameter's own name — so
+        // comparing storage, not refusing every binding, is what the proof does.
+        let other = "fn f(q: [f32; 8], mut o: [f32; 8]) { \
+                     match q { x => { sdpa(x, x, x, o, 2, 4, 0.5, 0); } } } \
+                     fn main() -> i32 { let q: [f32; 8] = [1.0; 8]; \
+                     let mut o: [f32; 8] = [0.0; 8]; f(q, o); return 0; }";
+        let (_, attn, asserts, allocs) = sdpa_shape(other, "f");
+        assert_eq!((attn, asserts, allocs), (1, 0, 0), "one bare call");
     }
 
     #[test]
