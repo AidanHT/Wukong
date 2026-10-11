@@ -204,7 +204,7 @@ fn op_operands(op: &Op) -> Vec<ValueId> {
         Op::Select(c, a, b) => vec![*c, *a, *b],
         Op::Fma(a, b, c) => vec![*a, *b, *c],
         Op::Load(p, _) => vec![*p],
-        Op::Store { ptr, value } => vec![*ptr, *value],
+        Op::Store { ptr, value } | Op::AtomicAdd { ptr, value } => vec![*ptr, *value],
         Op::Gep { ptr, index, .. } => vec![*ptr, *index],
         Op::Call { args, .. } => args.clone(),
         // A CPU raw-AVX2 microkernel call reads its buffer, scalar, and length operands. `analyze`

@@ -193,6 +193,21 @@ pub enum Op {
         ptr: ValueId,
         value: ValueId,
     },
+    /// Atomically add `value` to the integer at `ptr` (`atomic_add(place, v)` in source): one
+    /// indivisible, sequentially consistent read-modify-write that wraps at the type's width. It
+    /// has **no result** — the old value is deliberately unobservable. Integer addition mod 2^n is
+    /// commutative and associative, so the final memory is the same under every interleaving of
+    /// concurrent adds, which is what lets `@parallel` code combine into one location and still
+    /// agree with the serial interpreter bit-for-bit. `value` is a scalar `i8`/`i16`/`i32`/`i64` —
+    /// never `i1`, a float or a vector; the verifier enforces that.
+    ///
+    /// Memory-effect rule: every pass that treats [`Op::VecKernelCall`] as an opaque memory effect
+    /// treats this op the same way (it reads *and* writes `ptr`, and must never be reordered across
+    /// another access to that location, hoisted, deleted or widened).
+    AtomicAdd {
+        ptr: ValueId,
+        value: ValueId,
+    },
     /// `ptr + index * sizeof(elem)`; result is a pointer.
     Gep {
         ptr: ValueId,

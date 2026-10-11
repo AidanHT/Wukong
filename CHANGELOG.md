@@ -5,6 +5,24 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Atomic add and aligned stack locals (`gap5/mir-ops`)
+
+- **`Op::AtomicAdd` in MIR (P15.15).** `atomic.add vV, vP` is one indivisible, sequentially
+  consistent integer read-modify-write that adds a scalar `i8`..`i64` to the location `vP` points
+  at, wrapping at its width, with no result: the old value is deliberately unobservable, because
+  integer addition mod 2^n commutes and the final memory is then the same under every interleaving.
+  The verifier rejects a result, an `i1`, a float, a vector and a non-pointer address; the
+  interpreter adds and masks; Cranelift emits `atomic_rmw add` with plain flags and no alias region;
+  the LLVM text emits `atomicrmw add ... seq_cst`; `gpu-native` declines it as `UNSUPPORTED`. Every
+  optimizer pass treats it as the opaque memory effect `VecKernelCall` is. One hazard was confirmed
+  while auditing: `effects.rs` would have summarized a callee whose only write is an atomic add as
+  pure, and `dce` would have deleted its unused calls. `wukong_opt/src/atomic_tests.rs` pins that and
+  four more (store-to-load forwarding past the atomic, loop deletion, LICM of a load the loop
+  atomically updates, and vectorizing a loop that holds one). Each test fails when the op's arm is
+  removed. A Cranelift stress test runs 2^16 adds into four counters, through `wukong_parallel_for`
+  and from 8 OS threads at once, 10 rounds each; replacing the RMW with a load/add/store loses
+  about two thirds of the updates there.
+
 ### Type-lowering soundness (`gap4/sema-soundness`)
 
 - **No silent `i32` slots (N2).** MIR lowering classified any type it did not recognize as `i32`

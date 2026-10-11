@@ -185,6 +185,12 @@ impl Builder {
         self.build_void(Op::Barrier);
     }
 
+    /// Atomically add the scalar integer `value` to the location `ptr` points at ([`Op::AtomicAdd`]).
+    /// No result.
+    pub fn atomic_add(&mut self, ptr: ValueId, value: ValueId) {
+        self.build_void(Op::AtomicAdd { ptr, value });
+    }
+
     pub fn set_term(&mut self, term: Terminator) {
         let cur = self.current;
         self.block_mut(cur).term = term;

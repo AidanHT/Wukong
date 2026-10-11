@@ -215,3 +215,29 @@ fn bf16_narrowing_modules() {
     );
     assert!(text.contains("select <4 x i1>"), "{text}");
 }
+
+/// `atomic.add` is one `seq_cst` `atomicrmw add` of the value's own width, its old value named and
+/// never read, at every integer width the verifier admits.
+#[test]
+fn atomic_add_is_one_seq_cst_atomicrmw() {
+    let mut i = Interner::new();
+    for (name, ty, llvm) in [
+        ("atomic_i8", MirType::I8, "i8"),
+        ("atomic_i16", MirType::I16, "i16"),
+        ("atomic_i32", MirType::I32, "i32"),
+        ("atomic_i64", MirType::I64, "i64"),
+    ] {
+        let mut b = Builder::new(i.intern(name), MirType::Void);
+        let p = b.add_param(MirType::Ptr);
+        let v = b.add_param(ty);
+        b.atomic_add(p, v);
+        b.ret(None);
+        let text = emit(b.finish(), &i);
+        let rmw: Vec<&str> = text.lines().filter(|l| l.contains("atomicrmw")).collect();
+        assert_eq!(
+            rmw,
+            [format!("  %t0 = atomicrmw add ptr %v0, {llvm} %v1 seq_cst").as_str()],
+            "{text}"
+        );
+    }
+}

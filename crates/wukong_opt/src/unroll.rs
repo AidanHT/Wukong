@@ -337,6 +337,7 @@ fn pure_header_op(op: &Op) -> bool {
             | Op::Store { .. }
             | Op::Call { .. }
             | Op::VecKernelCall { .. }
+            | Op::AtomicAdd { .. }
             | Op::Alloca {
                 space: wukong_mir::AddrSpace::Local,
                 ..
@@ -353,6 +354,7 @@ fn unrollable_body_op(op: &Op) -> bool {
         op,
         Op::Call { .. }
             | Op::VecKernelCall { .. }
+            | Op::AtomicAdd { .. }
             | Op::Alloca {
                 space: wukong_mir::AddrSpace::Local,
                 ..

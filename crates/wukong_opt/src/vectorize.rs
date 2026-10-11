@@ -1601,6 +1601,7 @@ fn linearize_region(
                 }
                 Op::Call { .. }
                 | Op::VecKernelCall { .. }
+                | Op::AtomicAdd { .. }
                 | Op::Alloca {
                     space: wukong_mir::AddrSpace::Local,
                     ..
@@ -1876,6 +1877,7 @@ impl TreeWalk<'_> {
                 }
                 Op::Call { .. }
                 | Op::VecKernelCall { .. }
+                | Op::AtomicAdd { .. }
                 | Op::Alloca {
                     space: wukong_mir::AddrSpace::Local,
                     ..
@@ -2709,6 +2711,7 @@ fn header_is_test_only(f: &Function, l: &NaturalLoop) -> bool {
                 | Op::Load(..)
                 | Op::Call { .. }
                 | Op::VecKernelCall { .. }
+                | Op::AtomicAdd { .. }
                 | Op::Alloca {
                     space: wukong_mir::AddrSpace::Local,
                     ..

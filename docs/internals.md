@@ -351,9 +351,11 @@ and exactly one `Terminator` (`Ret`, `Br`, `CondBr`, `Switch`, `Unreachable`). `
 branch on an `i8`..`i64` scrutinee whose case values are stored canonically (sign-extended from the
 type's width) and pairwise distinct; only `wukong_opt`'s late switch formation creates one, and the
 verifier, interpreter, Cranelift (`cranelift_frontend::Switch`), textual LLVM (`switch`) and every
-terminator visitor handle it (the `gpu-native` lowering declines it). `Op` has 28 variants: constants
+terminator visitor handle it (the `gpu-native` lowering declines it). `Op` has 29 variants: constants
 (`ConstInt`/`ConstFloat`), `Bin`/`Cmp`/`Cast`, the unary `Neg`/`Not`, `Select`, memory
-(`Alloca`/`Load`/`Store`/`Gep`), `Call`, `Barrier` (cooperative thread-block fence from
+(`Alloca`/`Load`/`Store`/`Gep`), `AtomicAdd` (`atomic.add vV, vP`: an indivisible, sequentially
+consistent integer read-modify-write from `atomic_add(place, v)`, wrapping at the value's width,
+with no result), `Call`, `Barrier` (cooperative thread-block fence from
 `sync_block()`), the float/SIMD primitives
 (`Splat`/`ExtractLane`/`Iota`/`Fma`/`Sqrt`/`Round`), the lane-moving SIMD ops
 (`Widen`/`Narrow`/`Shuffle`/`InsertLane`), `IntUnary` (`popcnt`/`clz`/`ctz`/`bswap` on a scalar
@@ -373,7 +375,17 @@ non-uniform vector *source*, since every other op is lane-wise and so any expres
 scalars is the same in every lane. The loop vectorizer needs it to widen a body that reads its
 induction variable as a value rather than as an address: lane `k` is scalar iteration `i + k`, so
 `if c == target` widens to `cmp.eq(splat(i) + iota, splat(target))`, a per-lane mask. Every op produces exactly one result
-except `Store` (never), `Call` (void callees such as `print`) and an elementwise `VecKernelCall`. A
+except `Store` and `AtomicAdd` (never), `Call` (void callees such as `print`) and an elementwise
+`VecKernelCall`. `AtomicAdd`'s value is a scalar `i8`..`i64` (never `i1`, a float or a vector — the
+verifier checks it), and its old value is deliberately unobservable: integer addition mod 2^n
+commutes, so the final memory is the same under every interleaving, which is what keeps `@parallel`
+code that combines into one location bit-identical between the serial interpreter and native. The
+interpreter adds and masks; Cranelift emits `atomic_rmw add` with plain flags (no alias region —
+the escape scan's fallback publishes the atomic's pointer, so its location is never private or
+`@noalias`-promised, and every other access to it is untagged too); the LLVM text emits
+`atomicrmw add ... seq_cst`; `gpu-native` declines it. Every optimizer pass treats it as an opaque
+memory effect, exactly where it treats `VecKernelCall` as one (see `CONTRIBUTING.md`, "Adding a MIR
+`Op`"; `wukong_opt/src/atomic_tests.rs` pins the hazards). A
 string literal lowers to a read-only `.rodata` blob in `Program::statics` (a `StaticData { name,
 bytes }`) addressed by `Op::GlobalAddr`, so a returned or threaded `*u8` stays valid after its
 defining frame is gone. `Op::VecKernelCall` — a call into a synthesized 256-bit AVX2 kernel — is

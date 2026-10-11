@@ -1224,6 +1224,10 @@ pub(crate) fn map_operands(op: &Op, mut f: impl FnMut(ValueId) -> ValueId) -> Op
             ptr: f(*ptr),
             value: f(*value),
         },
+        Op::AtomicAdd { ptr, value } => Op::AtomicAdd {
+            ptr: f(*ptr),
+            value: f(*value),
+        },
         Op::Gep { ptr, index, elem } => Op::Gep {
             ptr: f(*ptr),
             index: f(*index),
@@ -1285,6 +1289,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::Barrier => "barrier",
         Op::Load(..) => "load",
         Op::Store { .. } => "store",
+        Op::AtomicAdd { .. } => "atomic.add",
         Op::Gep { .. } => "gep",
         Op::Call { .. } => "call",
         Op::FuncAddr(..) => "func_addr",

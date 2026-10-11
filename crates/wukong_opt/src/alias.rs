@@ -803,6 +803,9 @@ impl AliasInfo {
     pub fn may_clobber(&self, ptr: ValueId, bytes: u32, op: &Op) -> bool {
         match op {
             Op::Store { ptr: q, value: _ } => self.may_alias_sized(ptr, bytes, *q, u32::MAX),
+            // An atomic RMW writes exactly its own location, like a store. (Its pointer is also
+            // marked escaped by the escape scan's fallback, which keeps its slot non-private.)
+            Op::AtomicAdd { ptr: q, value: _ } => self.may_alias_sized(ptr, bytes, *q, u32::MAX),
             Op::Call { .. } | Op::VecKernelCall { .. } => !self.is_call_proof(ptr),
             // Everything below provably writes no memory.
             Op::ConstInt(..)

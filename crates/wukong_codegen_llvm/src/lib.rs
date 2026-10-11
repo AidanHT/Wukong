@@ -1358,6 +1358,17 @@ impl Emitter<'_> {
                     format!("store {reg} {v}, ptr {p}{}", vector_align(vt))
                 }
             }
+            // `atomic_add(place, v)`: a sequentially consistent RMW whose old value is named (so
+            // the function's implicit value numbering stays untouched) and never read.
+            Op::AtomicAdd { ptr, value } => {
+                let old = self.fresh();
+                format!(
+                    "{old} = atomicrmw add ptr {}, {} {} seq_cst",
+                    self.operand(*ptr),
+                    self.ty(*value),
+                    self.operand(*value)
+                )
+            }
             Op::Gep { ptr, index, elem } => {
                 let idxty = self.ty(*index);
                 format!(

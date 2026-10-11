@@ -1380,6 +1380,11 @@ impl<'a> FnEmit<'a> {
                     "{UNSUPPORTED} `VecKernelCall` (CPU raw-AVX2 kernel) not lowered to PTX"
                 ))
             }
+            // `atomic_add` has no PTX lowering yet (`atom.global.add` would also need the
+            // address-window proof every state-space-qualified op needs); decline, never guess.
+            Op::AtomicAdd { .. } => {
+                return Err(format!("{UNSUPPORTED} `AtomicAdd` not lowered to PTX"))
+            }
             _ => {}
         }
         let r = inst
@@ -1561,7 +1566,11 @@ impl<'a> FnEmit<'a> {
                     "{UNSUPPORTED} `GlobalAddr` (static string data) not lowered to PTX"
                 ));
             }
-            Op::Store { .. } | Op::Call { .. } | Op::VecKernelCall { .. } | Op::Barrier => {
+            Op::Store { .. }
+            | Op::Call { .. }
+            | Op::VecKernelCall { .. }
+            | Op::Barrier
+            | Op::AtomicAdd { .. } => {
                 unreachable!("handled above")
             }
         }

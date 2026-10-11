@@ -228,7 +228,11 @@ fn escaping_values(f: &Function, defs: &Defs) -> Vec<Vec<ValueId>> {
 fn copyable(op: &Op) -> bool {
     !matches!(
         op,
-        Op::Call { .. } | Op::VecKernelCall { .. } | Op::Alloca { .. } | Op::Barrier
+        Op::Call { .. }
+            | Op::VecKernelCall { .. }
+            | Op::Alloca { .. }
+            | Op::Barrier
+            | Op::AtomicAdd { .. }
     )
 }
 

@@ -23,8 +23,8 @@ use std::sync::Mutex;
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
-    types, AbiParam, AliasRegion, Block, BlockArg, FuncRef, GlobalValue, InstBuilder, MemFlags,
-    Signature, StackSlotData, StackSlotKind, Type, Value,
+    types, AbiParam, AliasRegion, AtomicRmwOp, Block, BlockArg, FuncRef, GlobalValue, InstBuilder,
+    MemFlags, Signature, StackSlotData, StackSlotKind, Type, Value,
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -1156,6 +1156,20 @@ impl<'a> FnTranslator<'a> {
             }
             Op::Barrier => {
                 self.builder.ins().fence();
+                return;
+            }
+            // `atomic_add(place, v)`: one sequentially consistent `lock xadd`-class RMW whose old
+            // value is discarded. Plain `mem_flags()`, never `mem_flags_for`: the escape scan's
+            // fallback marks the atomic's pointer escaped, so its location is neither a private
+            // stack slot nor live `@noalias` storage, and every other access to it carries the
+            // same `None` alias region this does. Never `aligned` either (see `mem_flags`).
+            Op::AtomicAdd { ptr, value } => {
+                let addr = self.val(*ptr);
+                let v = self.val(*value);
+                let ty = self.dfg_ty(v);
+                self.builder
+                    .ins()
+                    .atomic_rmw(ty, mem_flags(), AtomicRmwOp::Add, addr, v);
                 return;
             }
             Op::Load(p, ty) => {

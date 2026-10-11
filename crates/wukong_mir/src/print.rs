@@ -110,6 +110,7 @@ fn fmt_op(op: &Op, interner: &Interner) -> String {
         Op::Barrier => "barrier".into(),
         Op::Load(p, ty) => format!("load {} {}", ty.display(), val(*p)),
         Op::Store { ptr, value } => format!("store {}, {}", val(*value), val(*ptr)),
+        Op::AtomicAdd { ptr, value } => format!("atomic.add {}, {}", val(*value), val(*ptr)),
         Op::Gep { ptr, index, elem } => {
             format!("gep {}, {} : {}", val(*ptr), val(*index), elem.display())
         }

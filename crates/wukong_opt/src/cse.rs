@@ -933,10 +933,12 @@ impl Numbering<'_> {
                         self.number(res, res_ty, Key::PureCall(func.0, list), added);
                     }
                 }
-                Op::Call { .. } | Op::VecKernelCall { .. } => {
+                Op::Call { .. } | Op::VecKernelCall { .. } | Op::AtomicAdd { .. } => {
                     // A call (or vector kernel) may store through any pointer it was given, or any
                     // pointer reachable from one — but never into a stack slot of *this* function
                     // whose address never escaped. What a read-only callee would read may change.
+                    // An atomic add writes its own (escaped) location, and other threads may write
+                    // it concurrently, so it is treated as opaque the same way.
                     let alias = self.alias;
                     mem.retain(|k, _| match *k {
                         MemKey::Loc { addr, .. } => alias.is_private_stack(ValueId(addr)),
@@ -1033,6 +1035,7 @@ impl Numbering<'_> {
             | Op::Store { .. }
             | Op::Call { .. }
             | Op::VecKernelCall { .. }
+            | Op::AtomicAdd { .. }
             | Op::Alloca { .. }
             | Op::Barrier => return None,
         })

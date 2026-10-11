@@ -185,9 +185,11 @@ fn shape_ok(f: &Function, l: &NaturalLoop) -> bool {
         for inst in &blk.insts {
             n += 1;
             let bad = match &inst.op {
-                Op::Alloca { .. } | Op::Call { .. } | Op::VecKernelCall { .. } | Op::Barrier => {
-                    true
-                }
+                Op::Alloca { .. }
+                | Op::Call { .. }
+                | Op::VecKernelCall { .. }
+                | Op::Barrier
+                | Op::AtomicAdd { .. } => true,
                 // A pointer stored into memory could move a slice base another access reloads.
                 Op::Store { value, .. } => *f.value_type(*value) == MirType::Ptr,
                 _ => false,
