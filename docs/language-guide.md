@@ -604,7 +604,9 @@ arm: the conditions run only after the pattern matched, left to right with short
 its bindings — Rust's let chains with one `let`. The scrutinee therefore stops before a top-level
 `&&` (`if let true = a == b && c` tests `a == b`, then `c`); a second `let` in the chain, or a `||`
 after the condition, is `E0200` (group it: `&& (a || b)`; `tests/run/if_let_chain.wk`,
-`tests/fail/if_let_chain_or.wk`).
+`tests/fail/if_let_chain_or.wk`). To match a whole `&&` or `||` expression, parenthesize it:
+`if let false = (a && b)` tests `a && b`, while `if let false = a && b` tests `a` and then
+requires `b` — the same result only for a `true` pattern.
 
 The `else` of a `let … else` must **diverge** — `return`, `break`, `continue`, or a `loop` with no
 exit — because the names its pattern binds do not exist on that path (`E0401` otherwise). A plain
