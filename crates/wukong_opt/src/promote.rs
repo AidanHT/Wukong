@@ -19,9 +19,13 @@
 //! to one address (the same SSA value, or the same base object at the same constant offset) — is
 //! promoted when:
 //!
-//! * the loop has a preheader, no `return` inside it, no barrier, and every exit block is
-//!   **dedicated** (all its predecessors are in the loop), so the exit store runs only on paths out
-//!   of the loop;
+//! * the loop has a preheader, no `return` inside it, and no barrier. The exit store must run only
+//!   on paths out of the loop, so it goes in each exit block that is **dedicated** (all its
+//!   predecessors are in the loop); an exit block other code also reaches gets a dedicated copy
+//!   first -- a new block on the loop's edges into it, forwarding their arguments (LLVM's
+//!   `formDedicatedExitBlocks`; `loop-canon` leaves exits alone, see its docs). Bounds-check
+//!   elimination is what makes this common: its checked and check-free versions of a loop share
+//!   one exit block, so neither version's exit is ever dedicated;
 //! * the location is written in the loop, every access to it moves one scalar type (an integer,
 //!   `f32` or `f64` — not a pointer, which mem2reg would not promote back, nor `bf16`/`f16`, which
 //!   round on their way through memory), and no other access in the loop may alias it, nor any call
@@ -48,7 +52,7 @@ use crate::fxhash::{FxHashMap, FxHashSet};
 use crate::licm::{fresh_value, Dummies, LoopMem, Spec};
 use crate::loop_info::{self, LoopId, NaturalLoop};
 
-use wukong_mir::{AddrSpace, Function, Inst, MirType, Op, ValueId};
+use wukong_mir::{AddrSpace, BlockId, Function, Inst, MirType, Op, ValueId};
 
 use crate::{cfg, CfgAnalyses, Pass};
 
@@ -93,16 +97,25 @@ impl Pass for Promote {
         let mut touched: Vec<LoopId> = Vec::new();
         let mut slots: Vec<Inst> = Vec::new();
         let mut dummies = Dummies::default();
+        let blocks_before = f.blocks.len();
         for id in forest.innermost_first() {
             if touched.iter().any(|&t| related(&forest, t, id)) {
                 continue;
             }
             let l = forest.get(id);
+            // A dedicated exit made for an earlier loop leaves `idom` and `preds` stale, but not
+            // wrong for this one: splitting an edge keeps every dominance relation between the
+            // blocks that were already there, and the loops visited after it are disjoint from it,
+            // so the only change they can see is a predecessor of a shared exit block moving from
+            // the earlier loop to its new block -- outside this loop either way.
             let Some(plan) = plan_loop(f, l, &alias, &shared, idom, preds) else {
                 continue;
             };
             rewrite(f, &plan, &mut slots, &mut dummies);
             touched.push(id);
+        }
+        if f.blocks.len() != blocks_before {
+            cache.invalidate();
         }
         if slots.is_empty() {
             return false;
@@ -150,7 +163,15 @@ struct Plan {
     first_test: Option<(wukong_mir::CmpOp, ValueId, ValueId)>,
     preheader: u32,
     /// Distinct exit blocks, ascending.
-    exits: Vec<u32>,
+    exits: Vec<Exit>,
+}
+
+/// One exit block of the loop.
+struct Exit {
+    block: u32,
+    /// The loop's blocks that branch to `block`, when blocks outside the loop branch there too: the
+    /// write-back then goes in a new block on just these edges.
+    shared_from: Option<Vec<u32>>,
 }
 
 /// A location key: must-alias addresses share one.
@@ -187,15 +208,29 @@ fn plan_loop(
         return None;
     }
     let body: FxHashSet<u32> = l.blocks.iter().map(|b| b.0).collect();
-    let mut exits: Vec<u32> = l.exits.iter().map(|&(_, to)| to.0).collect();
-    exits.sort_unstable();
-    exits.dedup();
-    if exits
-        .iter()
-        .any(|&e| preds[e as usize].iter().any(|p| !body.contains(p)))
-    {
-        return None; // an exit block also reached from outside the loop
-    }
+    let mut exit_blocks: Vec<u32> = l.exits.iter().map(|&(_, to)| to.0).collect();
+    exit_blocks.sort_unstable();
+    exit_blocks.dedup();
+    let exits: Vec<Exit> = exit_blocks
+        .into_iter()
+        .map(|e| {
+            let dedicated = preds[e as usize].iter().all(|p| body.contains(p));
+            let shared_from = (!dedicated).then(|| {
+                let mut from: Vec<u32> = l
+                    .exits
+                    .iter()
+                    .filter(|&&(_, to)| to.0 == e)
+                    .map(|&(inside, _)| inside.0)
+                    .collect();
+                from.dedup(); // `l.exits` is sorted
+                from
+            });
+            Exit {
+                block: e,
+                shared_from,
+            }
+        })
+        .collect();
     let mem = LoopMem::of(f, &body, None);
     if mem.has_barrier {
         return None;
@@ -389,7 +424,20 @@ fn rewrite(f: &mut Function, plan: &Plan, slots: &mut Vec<Inst>, dummies: &mut D
         tails.push((slot, loc.ty.clone(), store_addr));
     }
     f.blocks[plan.preheader as usize].insts.extend(pre);
-    for &e in &plan.exits {
+    for exit in &plan.exits {
+        let e = match &exit.shared_from {
+            None => exit.block,
+            Some(from) => {
+                // A new block on the loop's edges into the shared exit, taking each edge's
+                // arguments and passing them on: it runs exactly when the loop is left that way.
+                let to = BlockId(exit.block);
+                let dedicated = crate::loop_canon::forwarding_block(f, to);
+                for &b in from {
+                    crate::loop_canon::redirect(&mut f.blocks[b as usize].term, to, dedicated);
+                }
+                dedicated.0
+            }
+        };
         let mut head: Vec<Inst> = Vec::with_capacity(2 * tails.len());
         for (slot, ty, addr) in &tails {
             let v = fresh_value(f, ty.clone());
@@ -831,5 +879,354 @@ mod tests {
             .iter()
             .any(|i| matches!(i.op, Op::Load(p, _) if p == out)));
         assert_eq!(run(&main, &f, &it), 131_310);
+    }
+
+    /// Loads and stores through `ptr` in the given blocks.
+    fn traffic_through(f: &Function, ptr: ValueId, blocks: &[BlockId]) -> usize {
+        blocks
+            .iter()
+            .flat_map(|b| &f.blocks[b.0 as usize].insts)
+            .filter(|i| {
+                matches!(&i.op, Op::Load(p, _) if *p == ptr)
+                    || matches!(&i.op, Op::Store { ptr: q, .. } if *q == ptr)
+            })
+            .count()
+    }
+
+    /// The blocks promotion added: each must be a dedicated exit holding a write-back, forwarding
+    /// its parameters to `exit`, and reached only from `from`.
+    fn dedicated_exits(f: &Function, before: usize, exit: BlockId, from: &[BlockId]) -> usize {
+        let preds = cfg::predecessors(f);
+        for b in &f.blocks[before..] {
+            assert!(
+                matches!(&b.term, wukong_mir::Terminator::Br { target, args }
+                    if *target == exit && *args == b.params),
+                "a new block forwards its parameters to the shared exit"
+            );
+            assert!(b.insts.iter().any(|i| matches!(i.op, Op::Store { .. })));
+            let mut want: Vec<u32> = from.iter().map(|b| b.0).collect();
+            want.sort_unstable();
+            assert_eq!(preds[b.id.0 as usize], want);
+        }
+        f.blocks.len() - before
+    }
+
+    /// `fn f(out: *i64, n: i64) -> i64`, whose loop exit block is also where the function goes
+    /// when it skips the loop:
+    ///
+    /// ```text
+    ///   entry: x = [1, 2, 3, 4]; cond_br (n > 4), E(-1), pre
+    ///   pre:   br H(0)
+    ///   H(i):  cond_br (i < n), B, E(i)
+    ///   B:     out[0] = out[0] + x[i]; br H(i + 1)
+    ///   E(r):  ret r
+    /// ```
+    ///
+    /// `E` is not a dedicated exit, so the write-back cannot go there: it would store on the path
+    /// that skips the loop, a write the program never made. It goes in a new block on the exit
+    /// edge instead.
+    #[test]
+    fn a_shared_exit_block_gets_a_dedicated_copy_for_the_write_back() {
+        let mut it = Interner::new();
+        let fname = it.intern("f");
+        let mut b = Builder::new(fname, MirType::I64);
+        let out = b.add_param(MirType::Ptr);
+        let n = b.add_param(MirType::I64);
+        let x = b.alloca(MirType::Array(Box::new(MirType::I64), 4));
+        for k in 0..4 {
+            let kk = b.build(MirType::I64, Op::ConstInt(k, MirType::I64));
+            let p = b.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: x,
+                    index: kk,
+                    elem: MirType::I64,
+                },
+            );
+            let v = b.build(MirType::I64, Op::ConstInt(k + 1, MirType::I64));
+            b.build_void(Op::Store { ptr: p, value: v });
+        }
+        let four = b.build(MirType::I64, Op::ConstInt(4, MirType::I64));
+        let skip = b.build(MirType::I1, Op::Cmp(CmpOp::Sgt, n, four));
+        let minus1 = b.build(MirType::I64, Op::ConstInt(-1, MirType::I64));
+        let pre = b.new_block();
+        let header = b.new_block();
+        let i = b.block_param(header, MirType::I64);
+        let body = b.new_block();
+        let exit = b.new_block();
+        let r = b.block_param(exit, MirType::I64);
+        b.cond_br(skip, exit, vec![minus1], pre, vec![]);
+        b.switch_to(pre);
+        let zero = b.build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        b.br(header, vec![zero]);
+        b.switch_to(header);
+        let c = b.build(MirType::I1, Op::Cmp(CmpOp::Slt, i, n));
+        b.cond_br(c, body, vec![], exit, vec![i]);
+        b.switch_to(body);
+        let p = b.build(
+            MirType::Ptr,
+            Op::Gep {
+                ptr: x,
+                index: i,
+                elem: MirType::I64,
+            },
+        );
+        let v = b.build(MirType::I64, Op::Load(p, MirType::I64));
+        let old = b.build(MirType::I64, Op::Load(out, MirType::I64));
+        let new = b.build(MirType::I64, Op::Bin(BinOp::Add, old, v));
+        b.build_void(Op::Store {
+            ptr: out,
+            value: new,
+        });
+        let one = b.build(MirType::I64, Op::ConstInt(1, MirType::I64));
+        let next = b.build(MirType::I64, Op::Bin(BinOp::Add, i, one));
+        b.br(header, vec![next]);
+        b.switch_to(exit);
+        b.ret(Some(r));
+        let mut f = b.finish();
+
+        // `main`: a = 100, b = 5, c = 7; r1 = f(&a, 3), r2 = f(&b, 9), r3 = f(&c, 0);
+        // return a·10^7 + b·10^5 + c·10^3 + r1·100 + (r2 + 5)·10 + r3.
+        let mut m = Builder::new(it.intern("main"), MirType::I64);
+        let mut slots = Vec::new();
+        for init in [100, 5, 7] {
+            let s = m.alloca(MirType::I64);
+            let v = m.build(MirType::I64, Op::ConstInt(init, MirType::I64));
+            m.build_void(Op::Store { ptr: s, value: v });
+            slots.push(s);
+        }
+        let mut rs = Vec::new();
+        for (s, trip) in slots.iter().zip([3, 9, 0]) {
+            let t = m.build(MirType::I64, Op::ConstInt(trip, MirType::I64));
+            rs.push(m.build(
+                MirType::I64,
+                Op::Call {
+                    func: fname,
+                    args: vec![*s, t],
+                },
+            ));
+        }
+        let five = m.build(MirType::I64, Op::ConstInt(5, MirType::I64));
+        rs[1] = m.build(MirType::I64, Op::Bin(BinOp::Add, rs[1], five));
+        let mut terms = Vec::new();
+        for s in &slots {
+            terms.push(m.build(MirType::I64, Op::Load(*s, MirType::I64)));
+        }
+        terms.extend(rs);
+        let mut acc = m.build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        for (t, scale) in terms
+            .into_iter()
+            .zip([10_000_000, 100_000, 1_000, 100, 10, 1])
+        {
+            let k = m.build(MirType::I64, Op::ConstInt(scale, MirType::I64));
+            let w = m.build(MirType::I64, Op::Bin(BinOp::Mul, t, k));
+            acc = m.build(MirType::I64, Op::Bin(BinOp::Add, acc, w));
+        }
+        m.ret(Some(acc));
+        let main = m.finish();
+
+        // f(&a, 3): a = 100 + 1 + 2 + 3 = 106, returns 3. f(&b, 9): skips, b = 5, returns -1.
+        // f(&c, 0): zero trips, c = 7, returns 0.
+        let expected = 106 * 10_000_000 + 5 * 100_000 + 7 * 1_000 + 3 * 100 + 4 * 10;
+        assert_eq!(run(&main, &f, &it), expected);
+        let before = f.blocks.len();
+        let mut cache = CfgAnalyses::default();
+        assert!(
+            Promote.run_function(&mut f, &mut cache),
+            "{}",
+            wukong_mir::print::print_function(&f, &it)
+        );
+        let text = wukong_mir::print::print_function(&f, &it);
+        assert_eq!(traffic_through(&f, out, &[header, body]), 0, "{text}");
+        assert!(
+            !f.blocks[exit.0 as usize]
+                .insts
+                .iter()
+                .any(|i| matches!(i.op, Op::Store { .. })),
+            "the shared exit is also the skip path's: no write-back there\n{text}"
+        );
+        assert_eq!(dedicated_exits(&f, before, exit, &[header]), 1, "{text}");
+        assert_eq!(run(&main, &f, &it), expected);
+        assert!(Mem2Reg.run_function(&mut f, &mut cache));
+        assert_eq!(run(&main, &f, &it), expected);
+        assert!(!Promote.run_function(&mut f, &mut cache));
+    }
+
+    /// `fn g(n, lim) -> i64` doubling a private slot, with two exits (the header's test and a
+    /// `break` once the slot passes `lim`) into one block that the path around the loop reaches too:
+    ///
+    /// ```text
+    ///   entry: s = 1; cond_br (n < 0), E(n), pre
+    ///   pre:   br H(0)
+    ///   H(i):  cond_br (i < n), B, E(i)
+    ///   B:     s = s * 2; cond_br (s > lim), E(100), L
+    ///   L:     br H(i + 1)
+    ///   E(r):  ret s * 1000 + r
+    /// ```
+    ///
+    /// Both exiting edges go through one new block, which forwards each edge's argument.
+    #[test]
+    fn several_exit_edges_into_a_shared_block_share_one_dedicated_exit() {
+        let mut it = Interner::new();
+        let gname = it.intern("g");
+        let mut b = Builder::new(gname, MirType::I64);
+        let n = b.add_param(MirType::I64);
+        let lim = b.add_param(MirType::I64);
+        let s = b.alloca(MirType::I64);
+        let one = b.build(MirType::I64, Op::ConstInt(1, MirType::I64));
+        b.build_void(Op::Store { ptr: s, value: one });
+        let zero = b.build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        let neg = b.build(MirType::I1, Op::Cmp(CmpOp::Slt, n, zero));
+        let pre = b.new_block();
+        let header = b.new_block();
+        let i = b.block_param(header, MirType::I64);
+        let body = b.new_block();
+        let latch = b.new_block();
+        let exit = b.new_block();
+        let r = b.block_param(exit, MirType::I64);
+        b.cond_br(neg, exit, vec![n], pre, vec![]);
+        b.switch_to(pre);
+        b.br(header, vec![zero]);
+        b.switch_to(header);
+        let c = b.build(MirType::I1, Op::Cmp(CmpOp::Slt, i, n));
+        b.cond_br(c, body, vec![], exit, vec![i]);
+        b.switch_to(body);
+        let old = b.build(MirType::I64, Op::Load(s, MirType::I64));
+        let two = b.build(MirType::I64, Op::ConstInt(2, MirType::I64));
+        let new = b.build(MirType::I64, Op::Bin(BinOp::Mul, old, two));
+        b.build_void(Op::Store { ptr: s, value: new });
+        let big = b.build(MirType::I1, Op::Cmp(CmpOp::Sgt, new, lim));
+        let hundred = b.build(MirType::I64, Op::ConstInt(100, MirType::I64));
+        b.cond_br(big, exit, vec![hundred], latch, vec![]);
+        b.switch_to(latch);
+        let next = b.build(MirType::I64, Op::Bin(BinOp::Add, i, one));
+        b.br(header, vec![next]);
+        b.switch_to(exit);
+        let v = b.build(MirType::I64, Op::Load(s, MirType::I64));
+        let k = b.build(MirType::I64, Op::ConstInt(1000, MirType::I64));
+        let t = b.build(MirType::I64, Op::Bin(BinOp::Mul, v, k));
+        let u = b.build(MirType::I64, Op::Bin(BinOp::Add, t, r));
+        b.ret(Some(u));
+        let mut g = b.finish();
+
+        let call = |it: &mut Interner, n: i128, lim: i128| -> Function {
+            let mut m = Builder::new(it.intern("main"), MirType::I64);
+            let a = m.build(MirType::I64, Op::ConstInt(n, MirType::I64));
+            let l = m.build(MirType::I64, Op::ConstInt(lim, MirType::I64));
+            let r = m.build(
+                MirType::I64,
+                Op::Call {
+                    func: gname,
+                    args: vec![a, l],
+                },
+            );
+            m.ret(Some(r));
+            m.finish()
+        };
+        // g(-3, 50): skips, 1·1000 - 3. g(4, 50): s = 16 after four trips, 16_000 + 4.
+        // g(10, 50): s = 64 > 50 on the sixth trip, 64_000 + 100. g(0, 50): zero trips, 1000.
+        let cases = [
+            ((-3, 50), 997),
+            ((4, 50), 16_004),
+            ((10, 50), 64_100),
+            ((0, 50), 1_000),
+        ];
+        let mains: Vec<(Function, i64)> = cases
+            .iter()
+            .map(|&((n, lim), want)| (call(&mut it, n, lim), want))
+            .collect();
+        for (main, want) in &mains {
+            assert_eq!(run(main, &g, &it), *want);
+        }
+        let before = g.blocks.len();
+        let mut cache = CfgAnalyses::default();
+        assert!(
+            Promote.run_function(&mut g, &mut cache),
+            "{}",
+            wukong_mir::print::print_function(&g, &it)
+        );
+        let text = wukong_mir::print::print_function(&g, &it);
+        assert_eq!(traffic_through(&g, s, &[header, body, latch]), 0, "{text}");
+        assert_eq!(
+            dedicated_exits(&g, before, exit, &[header, body]),
+            1,
+            "{text}"
+        );
+        assert!(
+            !g.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| matches!(i.op, Op::Select(..))),
+            "a private slot needs no guard\n{text}"
+        );
+        for (main, want) in &mains {
+            assert_eq!(run(main, &g, &it), *want, "{text}");
+        }
+        assert!(Mem2Reg.run_function(&mut g, &mut cache));
+        for (main, want) in &mains {
+            assert_eq!(run(main, &g, &it), *want);
+        }
+        assert!(!Promote.run_function(&mut g, &mut cache));
+    }
+
+    /// From source: `out[0] += a[i]` over `@noalias` slices. Bounds-check elimination versions
+    /// the loop into a checked copy and a check-free copy that share one exit block, so the
+    /// check-free loop's exit is never dedicated -- the case the shared-exit split exists for. At
+    /// `-O2` no single-exit loop (the check-free copy, and whatever unrolling makes of it) loads
+    /// or stores memory other than `a`'s elements, and every level prints every lane of `out`.
+    #[test]
+    fn a_slice_reduction_is_carried_in_a_register_past_bce_versioning() {
+        let src = concat!(
+            "fn red(@noalias mut out: []f32, a: []f32, n: i64) { for i in 0..n { out[0] += a[i]; } }\n",
+            "fn main() -> i32 {\n",
+            "  let mut o: [f32; 3] = [0.5, 7.0, 9.0];\n",
+            "  let a: [f32; 6] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0];\n",
+            "  let so: []f32 = o; let sa: []f32 = a;\n",
+            "  red(so, sa, 6); print(o[0]); print(o[1]); print(o[2]);\n",
+            "  red(so, sa, 0); print(o[0]); print(o[1]); print(o[2]);\n",
+            "  red(so, sa, 3); print(o[0]); print(o[1]); print(o[2]);\n",
+            "  return 0;\n",
+            "}\n",
+        );
+        let mut interner = Interner::new();
+        let (module, parse) =
+            wukong_parser::parse_module(src, wukong_span::SourceId(0), &mut interner);
+        assert!(parse.iter().all(|d| !d.is_error()), "{parse:?}");
+        let (sema, check) = wukong_sema::check(&module, &interner);
+        assert!(check.iter().all(|d| !d.is_error()), "{check:?}");
+        let (program, lower) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        assert!(lower.iter().all(|d| !d.is_error()), "{lower:?}");
+        // 0.5 + 63 = 63.5, then unchanged by zero trips, then + 1 + 2 + 4 = 70.5.
+        let expected = "63.5\n7\n9\n63.5\n7\n9\n70.5\n7\n9\n";
+        let main = interner.intern("main");
+        for level in [0u8, 1, 2] {
+            let mut optimized = program.clone();
+            crate::optimize(&mut optimized, level);
+            let (exit, stdout) =
+                wukong_interp::run_with_output(&optimized, main, &interner).unwrap();
+            assert_eq!(exit, 0);
+            assert_eq!(String::from_utf8(stdout).unwrap(), expected, "O{level}");
+        }
+        let mut optimized = program.clone();
+        crate::PassManager::standard(2).run(&mut optimized);
+        let red = optimized.function(interner.intern("red")).unwrap();
+        let text = wukong_mir::print::print_function(red, &interner);
+        let forest = loop_info::analyze_function(red);
+        let mut single_exit = 0;
+        for id in forest.innermost_first() {
+            let l = forest.get(id);
+            if l.exits.len() != 1 {
+                continue; // the checked copy: its bounds checks are exits too
+            }
+            single_exit += 1;
+            let stores = l
+                .blocks
+                .iter()
+                .flat_map(|b| &red.blocks[b.0 as usize].insts)
+                .filter(|i| matches!(i.op, Op::Store { .. }))
+                .count();
+            assert_eq!(stores, 0, "loop at {:?} still stores\n{text}", l.header);
+        }
+        assert!(single_exit > 0, "no check-free loop\n{text}");
     }
 }

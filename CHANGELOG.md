@@ -25,6 +25,12 @@ All notable changes to Wukong are documented here. The format is loosely based o
   after the second, compares two bases of one object at their alias-analysis offset, and fuses over
   `@noalias` parameters and slices, whose reloaded data pointers must be stable
   (`tests/run/opt4_fuse_distance.wk`, `opt4_fuse_liveout.wk`).
+- **Scalar promotion past bounds-check versioning (P10.2).** `promote` stored a register-carried
+  location back only in an exit block that the loop alone reaches. Bounds-check elimination's
+  checked and check-free copies of a loop share one exit block, so `out[0] += a[i]` over `@noalias`
+  slices still loaded and stored `out[0]` on every iteration of the check-free copy. A shared exit
+  block now gets a new block on the loop's edges into it, which holds the store-back, and the sum
+  stays in a register (`tests/run/opt4_promote_slice.wk`).
 - **CSE's remaining hot structures (P10.14).** Pending phis carry interned type ids instead of
   cloned `MirType`s, and the rewrite table is path-compressed; the `-O2` MIR is byte-identical over
   the corpus. (CSE is about 1-2% of optimizer time; the in-process effect is at the noise floor.)

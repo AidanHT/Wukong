@@ -165,8 +165,9 @@ fn append_block(f: &mut Function, params: Vec<ValueId>, term: Terminator) -> Blo
 
 /// A fresh parameter list mirroring `block`'s parameters, and a forwarding block that passes them
 /// straight on to `block`. This is the shared body of both transforms: an empty block whose only
-/// job is to be the single predecessor of a header.
-fn forwarding_block(f: &mut Function, target: BlockId) -> BlockId {
+/// job is to be the single predecessor of a header. (`promote` uses it too, for the dedicated exit
+/// a write-back goes in when a loop's exit block is shared.)
+pub(crate) fn forwarding_block(f: &mut Function, target: BlockId) -> BlockId {
     let tys: Vec<MirType> = f.blocks[target.0 as usize]
         .params
         .iter()
@@ -184,7 +185,7 @@ fn forwarding_block(f: &mut Function, target: BlockId) -> BlockId {
 }
 
 /// Point every edge of `t` that goes to `from` at `to` instead, keeping the arguments.
-fn redirect(t: &mut Terminator, from: BlockId, to: BlockId) {
+pub(crate) fn redirect(t: &mut Terminator, from: BlockId, to: BlockId) {
     match t {
         Terminator::Br { target, .. } => {
             if *target == from {
