@@ -1,0 +1,15 @@
+// EXPECT-CODE: C0001
+module tests.fail.lower_unclassified_type
+
+// A `let` with neither a type annotation nor an initializer has no type: sema binds it as
+// undetermined (its first assignment does not decide one) and accepts the program. Lowering sized
+// every such value as an `i32` slot, so `x = 2.75` stored 2 and this printed `4` instead of `5.5`
+// on both backends. MIR lowering now sizes storage only from a type it can classify, and refuses
+// the rest (`C0001`, naming what it could not size) instead of guessing `i32`.
+
+fn main() -> i32 {
+    let mut x;
+    x = 2.75;
+    println(x * 2.0);
+    return 0;
+}

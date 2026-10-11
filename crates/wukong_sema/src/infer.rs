@@ -16,8 +16,10 @@
 //! kind never changes (an integer literal stays an integer). A use pairs the binding with a concrete
 //! scalar type `T`:
 //!
-//! * an assignment `s = v` / `v = s`, a `return s`, a call argument `f(s)`, or a `let x: T = s` —
-//!   the binding becomes `T` at any width (these positions demand exact agreement);
+//! * an assignment `s = v` / `v = s`, a `return s`, a call argument `f(s)` — also a method-call
+//!   argument `x.m(s)` / `T::m(s)` (never the receiver) and a call through a function-typed
+//!   parameter — a struct-literal field `S { f: s }`, or a `let x: T = s` — the binding becomes `T`
+//!   at any width (these positions demand exact agreement);
 //! * a compound assignment `s op= v` / `v op= s`, an arithmetic or comparison operator `s op v` /
 //!   `v op s` — the binding becomes `T` when `T` is at least as wide as its default, and otherwise
 //!   keeps the default: a narrower `T` promotes into it losslessly anyway, so `let k = 2; k + x_u8`
@@ -130,6 +132,22 @@ impl Sema<'_> {
             self.infer_found.insert(id, Ty::Scalar(want));
         } else {
             self.infer_pinned.insert(id, Ty::Scalar(cur));
+        }
+    }
+
+    /// A struct literal's field values are uses at their declared field types, exactly as call
+    /// arguments are at their parameters: `let x = 0.1; S { v: x }` with `v: f64` decides `x: f64`.
+    /// `decl` is the struct's (or struct-payload variant's) declared `(name, type)` list; a field
+    /// it does not declare is the literal's own error (`E0430`) and decides nothing.
+    pub(crate) fn constrain_field_literal_bindings(
+        &mut self,
+        decl: &[(wukong_span::Symbol, Ty)],
+        fields: &[wukong_ast::FieldInit],
+    ) {
+        for f in fields {
+            if let Some((_, fty)) = decl.iter().find(|(name, _)| *name == f.name.sym) {
+                self.constrain_literal_binding(&f.value, None, fty, false);
+            }
         }
     }
 
@@ -263,5 +281,76 @@ mod tests {
             first_let_init_ty("fn f(x: f64) -> f64 { let y = x; return y; }"),
             Ty::Scalar(Scalar::F64)
         );
+    }
+
+    #[test]
+    fn a_struct_field_decides_a_literal_binding() {
+        // An f64 field: the binding is the f64 0.1, not the f32 0.1 widened (it was E0401).
+        assert_eq!(
+            first_let_init_ty(
+                "struct S { v: f64 } \
+                 fn f() -> f64 { let x = 0.1; let s = S { v: x }; return s.v; }"
+            ),
+            Ty::Scalar(Scalar::F64)
+        );
+        // An i64 field fed a literal past i32::MAX: `65536 * 65536` folds to 2^32 at i64 (as the
+        // i32 default it wrapped to 0, and the field store was E0401).
+        let src = "struct S { n: i64 } \
+                   fn f() -> i64 { let big = 65536 * 65536; let s = S { n: big }; return s.n; }";
+        assert_eq!(first_let_init_ty(src), Ty::Scalar(Scalar::I64));
+        assert!(codes(src).is_empty(), "{:?}", codes(src));
+        // Any width, as at a parameter: a `u64` field makes the (i64-defaulted) 3000000000 a u64.
+        assert_eq!(
+            first_let_init_ty(
+                "struct S { n: u64 } \
+                 fn f() -> u64 { let big = 3000000000; let s = S { n: big }; return s.n; }"
+            ),
+            Ty::Scalar(Scalar::U64)
+        );
+        // A struct-payload enum variant's fields are uses at their declared types too.
+        assert_eq!(
+            first_let_init_ty(
+                "enum Sh { R { w: f64 } } \
+                 fn f() -> i32 { let w = 1.5; let r = Sh::R { w: w }; return 0; }"
+            ),
+            Ty::Scalar(Scalar::F64)
+        );
+        // The first use still decides: an f32 operand pins the binding before the field sees it,
+        // so the f64 field is the mismatch it always was.
+        let pinned = "struct S { v: f64 } \
+                      fn f(y: f32) -> f32 { let x = 0.5; let z = y + x; let s = S { v: x }; \
+                      return z; }";
+        assert!(codes(pinned).contains(&"E0401"), "{:?}", codes(pinned));
+    }
+
+    #[test]
+    fn a_method_argument_decides_a_literal_binding() {
+        const P: &str = "struct P { a: f64 } \
+                         impl P { fn add(self, d: f64) -> f64 { return self.a + d; } \
+                                  fn mk(d: f64) -> P { return P { a: d }; } }";
+        // `x.m(a)`: the argument is a use at the parameter's type (it was E0401).
+        let src = format!("{P} fn f(p: P) -> f64 {{ let d = 0.1; return p.add(d); }}");
+        assert_eq!(first_let_init_ty(&src), Ty::Scalar(Scalar::F64));
+        assert!(codes(&src).is_empty(), "{:?}", codes(&src));
+        // `Type::m(a)`: an associated function's argument too.
+        let src = format!("{P} fn f() -> f64 {{ let e = 0.2; let q = P::mk(e); return q.a; }}");
+        assert_eq!(first_let_init_ty(&src), Ty::Scalar(Scalar::F64));
+        // A trait method called through a bounded type parameter.
+        assert_eq!(
+            first_let_init_ty(
+                "trait Sc { fn sc(self, k: f64) -> f64; } \
+                 fn f<X: Sc>(x: X) -> f64 { let k = 2.0; return x.sc(k); }"
+            ),
+            Ty::Scalar(Scalar::F64)
+        );
+        // A call through a function-typed parameter.
+        assert_eq!(
+            first_let_init_ty("fn ap(g: fn(f64) -> f64) -> f64 { let v = 0.5; return g(v); }"),
+            Ty::Scalar(Scalar::F64)
+        );
+        // An i64 method parameter fed a product past i32::MAX.
+        let src = "struct P { a: f64 } impl P { fn tw(self, n: i64) -> i64 { return n * 2; } } \
+                   fn f(p: P) -> i64 { let n = 65536 * 65536; return p.tw(n); }";
+        assert_eq!(first_let_init_ty(src), Ty::Scalar(Scalar::I64));
     }
 }

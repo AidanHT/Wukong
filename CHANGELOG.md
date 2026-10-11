@@ -5,6 +5,57 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Type-lowering soundness (`gap4/sema-soundness`)
+
+- **No silent `i32` slots (N2).** MIR lowering classified any type it did not recognize as `i32`
+  (`_ => I32` in `mir_ty`/`mir_ty_of_ann`). Every form now has its own arm — a C-style enum is the one
+  named type whose representation is `i32` — and a value whose type has none is refused as `C0001`
+  naming it. Two programs that compiled and printed wrong numbers are now refused: `let mut x; x =
+  2.75;` (a `let` with neither annotation nor initializer; it printed `2`-based results,
+  `tests/fail/lower_unclassified_type.wk`) and a value of a type parameter that appears in no
+  parameter or return type (`y = 2.5; println(y)` printed `2`). An array of structs no longer reaches
+  the `@parallel` outliner or the loop vectorizer with an `i32` element type.
+- **A function value and a shadowing type parameter are codegen limits, not debug panics.** The
+  storage refusal took a debug-build panic, meant for types sema rejects, on four kinds of program
+  sema accepts. They now get `C0001` like the rest
+  (`tests/fail/lower_function_value.wk`, `tests/fail/lower_shadowed_type_param.wk`):
+  - a function name in an array or tuple literal (`let fs = [square, square];`);
+  - a bare `square;` statement;
+  - a type parameter that shadows a `const` or `fn` of the same name;
+  - a generic struct's own type parameter.
+
+  The enclosing function's generics now decide what counts as a type parameter, ahead of the item
+  registry. A parameter that shadows an enum (`fn g<E>`: `y = 2.5; println(y)` printed `2` on both
+  backends) or a struct (`fn g<P>`: a MIR verifier ICE) is refused instead of sized as the item.
+- **`x.len()` / `x.dim(k)` on a type parameter work in every position again.** Recording the
+  storage refusal from a type *query* refused `let k: i64 = x.len();` on `x: T` instantiated at an
+  array or tensor as `C0001`. On main that printed the extent, and the annotation already sized
+  the slot. A `let`, a `return` and an assignment now only classify a value's type
+  (`expr_mir_peek`), and an instance types such a call as the `i64` extent of what `T` is bound to.
+  `return x.len();`, which was a MIR verifier ICE on main (`zext` from a placeholder `i32` to
+  `i64`), and `let k = x.len();`, which was an `i32` slot holding an `i64`, now lower correctly too
+  (`tests/run/generic_receiver_extent.wk`). Arithmetic on an *unannotated* binding of one is
+  still `C0001`: annotate it.
+- **Type positions the checker let through.** An integer written as a type (`let x: 512 = 3;`) is
+  `E0324` and a struct, enum or type parameter given arguments (`let p: P<2>`) is `E0327`; both typed
+  as an error with no diagnostic and ran. An undeclared type's `E0324` is no longer lost when literal
+  inference re-checks the body (`let k = 7; let y: i64 = k; let mut x: Foo;` compiled). A
+  struct or enum that declares parameters is the exception: given arguments (`let y: W<f32>`), it
+  is reported as what it is, "generic struct `W` cannot be instantiated: generic structs and enums
+  are not supported yet". It is not reported as "`W` takes no type arguments", whose "write `W`
+  alone" only led to a struct with an unsized field. In a module that declares a type alias, the
+  alias expander still reports the older message first.
+- **Literal inference at struct fields and method arguments (N17).** A struct-literal field (also a
+  struct-payload variant's) and a method-call, associated-function, trait-bound or function-typed
+  parameter call argument now decide a literal-initialized binding, as a plain call argument does:
+  `let x = 0.1; S { w: x }` with `w: f64` stores the f64 0.1 (it was `E0401`)
+  (`tests/run/literal_infer_struct_field.wk`, `tests/run/literal_infer_method_arg.wk`).
+- **Generic bodies (N19/N20), verified.** A bounded generic body is checked against its bounds
+  whether or not it is called (`E0315`/`E0410`, `where` clauses included), each instantiation is
+  re-checked, and a `const` generic is `usize` by design (`E0523`); unit tests pin all three, and the
+  roadmap records the remaining sharp edges (unbounded `T` checked per instantiation, symbolic
+  dimensions as hidden `i64` arguments).
+
 ### Index-recording reductions (`gap3/vec-argmax`)
 
 - **Argmax/argmin and FindLastIV loops vectorize.** `if x[i] > m { m = x[i]; at = i; }` (and its

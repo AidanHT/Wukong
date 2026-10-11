@@ -1308,6 +1308,22 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   contracted while `s = s + y*z` is; a strict function that wants a single-rounding multiply-add
   writes the explicit `fma(a, b, c)`, which is one rounding in every mode.
 
+- **Generics sharp edges** (2026-10-11, `gap4/sema-soundness`). By design, a `const` generic
+  parameter is a compile-time *dimension*, so it is `usize` and nothing else (`E0523` for
+  `const N: i32`); and a symbolic dimension of a tensor signature (`fn f<M, N>(a: Tensor[f32, M,
+  N])`) is not specialized per call but passed as a hidden `i64` argument, so `M`/`N` and the trip
+  counts they bound are run-time values inside the body (literal dimensions do not yet produce an
+  `f$M4` instance). A bounded generic body is checked against its bounds even when nothing calls it
+  (`E0315` for a method its bounds lack, `E0410` for forwarding `T` to a bound it does not carry), but
+  an operation on an *unbounded* opaque `T` (`x + x`) is checked only per instantiation, like a C++
+  template — an uncalled body is not rejected for it. A type parameter that appears in no parameter or
+  return type is bound by no call, not even by a turbofish; a value of it is refused at lowering
+  (`C0001`) where it used to get an `i32` slot. The same holds when the parameter shadows a struct,
+  enum, `const` or `fn` of its name. `x.len()` / `x.dim(k)` on an unbounded `x: T` is typed only per
+  instance. The call itself lowers as the `i64` extent everywhere. A binding initialized from it
+  stays untyped, though, and arithmetic on it is `C0001` until the binding is annotated
+  (`let k: i64 = x.len();`).
+
 - **Scalar-type gaps** (2026-10-08). There is no 128-bit integer (`u128`/`i128` literal suffixes
   are `E0431`; Cranelift's x64 backend has no `i128` divide, so the type needs a runtime first), and
   FP8 is storage-only — E4M3FN/E5M2 codes in `u8` with conversion builtins, no `f8` scalar type that
@@ -1497,10 +1513,13 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
 - **Compound assignment** follows the plain assignment's rule (`E0441`: `f32 += f64`, `i32 += i64`
   no longer narrow the operand silently), and **literal inference** types an unannotated
   literal-initialized `let` from its first constraining use (`let mut s = 0.0; s += x_f64[i]`
-  accumulates in `f64`); its first constraining use — an assignment, a `return`, a call argument, an
-  operator — decides it, as in Rust. Not yet: method-call and struct-field positions do not
-  constrain such a binding, and a generic call's literal arguments still bind `T` first-come
-  (`add(x_f64, 1.0)` is `E0401`).
+  accumulates in `f64`); its first constraining use — an assignment, a `return`, a call argument
+  (a method-call or associated-function argument too), a struct-literal field, an operator —
+  decides it, as in Rust (`tests/run/literal_infer_struct_field.wk`,
+  `tests/run/literal_infer_method_arg.wk`). Not yet: a turbofish does not reach a literal argument
+  (`g::<f64>(2.5)` is `E0401`), and a `let x;` with neither an annotation nor an initializer is not
+  inferred from its first assignment — lowering refuses it (`C0001`) rather than give it an `i32`
+  slot.
 - Tensor shape checking is **sound for both concrete and generic shapes**. A function's own generic
   dimension variables are **rigid** inside its body: when two shapes that both carry the function's
   generics are checked — its declared-vs-returned shape, an elementwise operator's operands, an

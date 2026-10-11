@@ -257,3 +257,122 @@ impl<'a> Sema<'a> {
         self.inst_calls.clear();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! What a generic body is checked against, called or not (N19/N20). Each bounded generic body
+    //! is checked once at an opaque `T` against the bound tables of `methods.rs` — whether or not
+    //! anything instantiates it — and each concrete instantiation is checked again at its types.
+    //! Operations on an UNbounded opaque `T` (`x + x`) are checked only per instantiation, like a
+    //! C++ template: an uncalled body is not rejected for them (a roadmap sharp edge).
+
+    use wukong_diag::Diagnostic;
+    use wukong_span::{Interner, SourceId};
+
+    /// The diagnostics `src` checks to (warnings included).
+    fn check(src: &str) -> Vec<Diagnostic> {
+        let mut interner = Interner::new();
+        let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pd.is_empty(), "parse errors: {pd:?}");
+        crate::check(&module, &interner).1
+    }
+
+    /// The codes of the errors `src` checks to.
+    fn error_codes(src: &str) -> Vec<&'static str> {
+        check(src)
+            .into_iter()
+            .filter(|d| d.is_error())
+            .filter_map(|d| d.code)
+            .collect()
+    }
+
+    const SHAPE: &str = "trait Shape { fn area(self) -> f32; } \
+                         struct Sq { s: f32 } \
+                         impl Shape for Sq { fn area(self) -> f32 { return self.s * self.s; } }";
+
+    #[test]
+    fn an_uninstantiated_body_is_checked_against_its_bounds() {
+        // Never called, and still a method its bound does not provide is E0315.
+        assert_eq!(
+            error_codes(&format!(
+                "{SHAPE} fn f<T: Shape>(x: T) -> f32 {{ return x.nope(); }} \
+                 fn main() -> i32 {{ return 0; }}"
+            )),
+            vec!["E0315"]
+        );
+        // The same through a `where` clause: the clause is a bound, not parsed and dropped.
+        assert_eq!(
+            error_codes(&format!(
+                "{SHAPE} fn f<T>(x: T) -> f32 where T: Shape {{ return x.nope(); }} \
+                 fn main() -> i32 {{ return 0; }}"
+            )),
+            vec!["E0315"]
+        );
+        // A method some type defines, called on an unbounded parameter: the missing bound.
+        assert_eq!(
+            error_codes(&format!(
+                "{SHAPE} fn f<U>(x: U) -> f32 {{ return x.area(); }} \
+                 fn main() -> i32 {{ return 0; }}"
+            )),
+            vec!["E0315"]
+        );
+        // Forwarding an unbounded parameter to a bounded generic, never called: E0410.
+        assert_eq!(
+            error_codes(&format!(
+                "{SHAPE} fn g<T: Shape>(x: T) -> f32 {{ return x.area(); }} \
+                 fn h<U>(y: U) -> f32 {{ return g(y); }} \
+                 fn main() -> i32 {{ return 0; }}"
+            )),
+            vec!["E0410"]
+        );
+        // The bounded body that uses only its bound checks clean, called or not.
+        assert!(error_codes(&format!(
+            "{SHAPE} fn f<T: Shape>(x: T) -> f32 {{ return x.area(); }} \
+             fn main() -> i32 {{ return 0; }}"
+        ))
+        .is_empty());
+    }
+
+    #[test]
+    fn an_unbounded_operation_is_checked_per_instantiation() {
+        // Uncalled, `x + x` on an opaque `T` is accepted: nothing says what `T` is.
+        let body = "struct Pt { x: f32 } fn twice<T>(x: T) -> T { return x + x; }";
+        assert!(error_codes(&format!("{body} fn main() -> i32 {{ return 0; }}")).is_empty());
+        // Instantiated at a struct, the body is checked again at `T = Pt` and `+` is E0433 — at
+        // the generic body, labelled with the call that required it.
+        let called = format!(
+            "{body} fn main() -> i32 {{ let p = Pt {{ x: 1.0 }}; let q = twice(p); \
+             return q.x as i32; }}"
+        );
+        let diags = check(&called);
+        let d = diags
+            .iter()
+            .find(|d| d.code == Some("E0433"))
+            .unwrap_or_else(|| panic!("{diags:?}"));
+        assert!(
+            d.labels.iter().any(|l| l
+                .message
+                .contains("required by this instantiation of `twice`")),
+            "{d:?}"
+        );
+        // Instantiated at a number, it checks clean.
+        assert!(error_codes(&format!(
+            "{body} fn main() -> i32 {{ return twice(2) as i32; }}"
+        ))
+        .is_empty());
+    }
+
+    #[test]
+    fn a_const_generic_is_a_usize_dimension_by_design() {
+        // A `const` generic is a compile-time dimension, so it is `usize`; any other type is E0523.
+        assert_eq!(
+            error_codes("fn f<const N: i32>(x: [f32; N]) -> f32 { return x[0]; }"),
+            vec!["E0523"]
+        );
+        assert!(error_codes(
+            "fn f<const N: usize>(x: [f32; N]) -> f32 { return x[0]; } \
+             fn main() -> i32 { let a = [1.0, 2.0, 3.0]; return f(a) as i32; }"
+        )
+        .is_empty());
+    }
+}

@@ -147,6 +147,28 @@ element into every tensor type (`subst_ty`), so `axpy$f32` lowers like the hand-
 function; a recognizer that reads sema's raw generic-body types declines on an instance instead.
 `where` dimension predicates and dimension `static_assert`s are collected and checked against each
 call's bound dimensions by `wukong_sema::constraints`; `static_assert` lowers to nothing.
+**Storage classification is total.** `wukong_mir_build` sizes every value's slot through
+`FnLowerer::mir_ty_of` (a `Ty`) and `mir_ty_of_ann` (an annotation), each with an arm per form and
+no `_ => I32` fallback: a C-style enum is the one `Ty::Named` whose representation is `i32`; the
+registry-blind free `mir_ty` answers `Option` (`None` for any `Named`, and for `Fn`/`Unknown`/`Error`).
+A type with no representation is recorded once per function (`FnLowerer::unrepresentable`) and
+refused at `finish` as `C0001` naming it. Only a caller that builds MIR from the type records
+it: a slot, an op, a coercion target. A caller that only classifies a value asks
+`expr_mir_peek`/`mir_ty_peek`, which record nothing. Examples are a `let` asking whether its
+initializer is an aggregate, `return` asking what it coerces from, and an assignment asking whether
+its target is a buffer. So an untyped initializer under an annotation lowers. The refusal is
+reachable from a value sema leaves `Unknown` whose storage or op is sized from that type, such as a
+`let x;` with neither annotation nor initializer, or arithmetic on an unannotated binding of a
+leniently typed call. It is also reachable from a type parameter no call binds. `expr_ty` recovers
+`x.len()`/`x.dim(k)` on a type parameter as the `i64` extent of the array, slice or tensor the
+instance binds it to (sema types it `Unknown` in the template, which instances lower from). The enclosing function's own generics
+decide what counts as a type parameter (`FnLowerer::type_params`), ahead of the item registry, so a
+parameter that shadows a struct, enum, `const` or `fn` is refused rather than sized as that item.
+It is also reachable from a generic struct's own type parameter, and from a function value (a
+function name inside an array or tuple literal, or alone as a statement; sema rejects one only when
+it is bound to a local, field or element type, `E0411`). Only the forms the driver never lets past
+sema panic in a debug build instead: `Ty::Error`, and an integer, a function type or `Name<..>`
+written in a `let` annotation. `repr_tests.rs` drives every arm.
 **Kernel builtins**: `wukong_sema::builtins` shape-checks `matmul`/`softmax`/…/`sdpa` and records each
 call's resolved dimensions (`SemaResult::builtin_calls`); `wukong_mir_build::builtins` lowers it to one
 runtime kernel behind runtime extent checks (trapping through `assert`) and an output-overlap guard

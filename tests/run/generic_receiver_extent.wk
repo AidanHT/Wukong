@@ -1,0 +1,95 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 6
+// EXPECT-OUT: 5
+// EXPECT-OUT: 5
+// EXPECT-OUT: 5
+// EXPECT-OUT: 5
+// EXPECT-OUT: 10
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+module tests.run.generic_receiver_extent
+
+// `x.len()` and `x.dim(k)` on a value of an unbounded type parameter. Sema cannot know `T`'s
+// methods until a call binds it, so it types the call leniently (`Unknown`). It re-checks the body
+// at each instantiation, where the call is the `i64` extent of the array, slice or tensor `T` is
+// bound to. Lowering must recover that `i64` from the receiver's concrete type in every position:
+// * an annotated `let`. On the branch that classified every type, this was refused as C0001
+//   "a value whose type was never determined", because the `let` asked the initializer's type
+//   only to see whether it was an aggregate;
+// * an unannotated `let` (an `i32` slot holding an `i64` before that);
+// * `return` (a `zext` from a placeholder `i32` to `i64`, which the MIR verifier rejected);
+// * a `println` argument and a `for` bound.
+//
+// Expected values, from each receiver's extents:
+// * `a: [f32; 4]`. `len()` and `dim(0)` are 4, and the index sum over 0..4 is 0 + 1 + 2 + 3 = 6.
+// * `s: []i32` viewing `[i32; 5]`. `len()` is 5, and the index sum over 0..5 is
+//   0 + 1 + 2 + 3 + 4 = 10.
+// * `m = buf as Tensor[f32, 2, 3]`. `len()` is the extent of axis 0, 2, and `dim(1)` is 3.
+
+fn annotated<T>(x: T) -> i64 {
+    let k: i64 = x.len();
+    return k;
+}
+
+fn unannotated<T>(x: T) -> i64 {
+    let k = x.len();
+    return k;
+}
+
+fn returned<T>(x: T) -> i64 {
+    return x.len();
+}
+
+fn axis0<T>(x: T) -> i64 {
+    let k: i64 = x.dim(0);
+    return k;
+}
+
+fn axis1<T>(x: T) -> i64 {
+    let k = x.dim(1);
+    return k;
+}
+
+fn show<T>(x: T) {
+    println(x.len());
+}
+
+fn index_sum<T>(x: T) -> i64 {
+    let mut acc: i64 = 0;
+    for i in 0..x.len() {
+        acc = acc + i;
+    }
+    return acc;
+}
+
+fn main() -> i32 {
+    let a: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    println(annotated(a)); // 4
+    println(unannotated(a)); // 4
+    println(returned(a)); // 4
+    println(axis0(a)); // 4
+    show(a); // 4
+    println(index_sum(a)); // 0 + 1 + 2 + 3 = 6
+
+    let five: [i32; 5] = [1, 2, 3, 4, 5];
+    let s: []i32 = five;
+    println(annotated(s)); // 5
+    println(unannotated(s)); // 5
+    println(returned(s)); // 5
+    show(s); // 5
+    println(index_sum(s)); // 0 + 1 + 2 + 3 + 4 = 10
+
+    let buf: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let m = buf as Tensor[f32, 2, 3];
+    println(annotated(m)); // axis 0: 2
+    println(returned(m)); // 2
+    println(axis1(m)); // 3
+    return 0;
+}
