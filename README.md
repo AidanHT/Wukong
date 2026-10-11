@@ -275,7 +275,9 @@ Tier 1 is gated: a red lane blocks a merge. Tier 2 is built and tested in CI but
 so a regression there is a reported gap. On every host without AVX2 + FMA (all of Tier 2) each
 runtime kernel takes its bit-exact scalar twin, and `WUKONG_MAX_ISA=scalar|avx2|avx2_vnni|avx512`
 caps the runtime's dispatch on an x86 host the same way (in the manner of oneDNN's
-`ONEDNN_MAX_CPU_ISA`), which is how the Tier 1 lanes exercise those scalar arms. The 256-bit
+`ONEDNN_MAX_CPU_ISA`), which is how the Tier 1 lanes exercise those scalar arms. The cap also
+narrows the instruction set Cranelift generates for the default `native` target (`scalar` is the
+x86-64 baseline), so a capped run executes no instruction above it. The 256-bit
 vec-kernel emitter remains x86-64 Windows only, as described above.
 
 ## Status
@@ -341,7 +343,9 @@ cargo run -p wukong_xbench --release      # cross-language benchmark vs C/C++/Ru
 
 The native backend (Cranelift) is built in by default and needs no toolchain. The optional LLVM
 backend emits textual IR only (for an external `clang`/`llc`), exposed via `wukongc --emit=llvm-ir`
-— it is always built and needs no feature flag.
+— it is always built and needs no feature flag. The module names the host's triple and data layout
+and declares every runtime symbol with the signature `wukong_runtime` defines it with
+(`docs/llvm-setup.md`).
 
 The GPU backend is the only opt-in part of the tree, so `cargo test` neither compiles nor runs it:
 pair every run with `cargo check --features gpu --all-targets`. With `--features gpu` on a machine

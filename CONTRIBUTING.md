@@ -226,7 +226,10 @@ Prefer to land it end to end: parse → type/shape-check → lower → run via t
   interpreter** on stdout and exit code, and native optimization must be invariant too. The
   interpreter is the oracle; if the two disagree, the interpreter is right until proven otherwise.
 - It must also lower end to end: `crates/wukongc/tests/emit.rs` requires every `tests/run` program
-  to reach `--emit=mir-high`, `--emit=mir` and `--emit=llvm-ir` at both `-O0` and `-O2`.
+  to reach `--emit=mir-high`, `--emit=mir` and `--emit=llvm-ir` at both `-O0` and `-O2` (an LLVM
+  decline counts against a ratchet of zero). A new `#[no_mangle] extern "C"` runtime entry needs
+  `WUKONG_UPDATE_RUNTIME_ABI=1 cargo test -p wukong_codegen_llvm --lib runtime_abi_table` so the
+  LLVM emitter declares it with its real signature.
 - **A program whose point is that it is rejected goes in `tests/fail`**, with
   `// EXPECT-CODE: <code>` on line 1 — not in `tests/run`.
 

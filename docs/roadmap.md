@@ -1603,7 +1603,8 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   Windows/Linux with AVX2 + FMA, fully gated; Tier 2 is aarch64 macOS/Linux (built and tested in CI,
   non-blocking, scalar runtime) and aarch64 Windows (`cargo check` only). `WUKONG_MAX_ISA`
   (`wukong_runtime::isa`) caps the runtime's ISA dispatch, and a Tier 1 lane runs the corpus with
-  `WUKONG_MAX_ISA=scalar`. Not yet capped: the Cranelift ISA flags the JIT itself compiles with.
+  `WUKONG_MAX_ISA=scalar`. The cap also narrows the Cranelift ISA flags the JIT and a `native`
+  object compile with (`scalar` is the x86-64 baseline), so the scalar lane runs no AVX at all.
   `--emit=obj`
   writes the object unchanged. The differential oracle remains `--run`.
 - **A `mut` aggregate parameter aliases the caller's value — now opt-in.** Aggregate arguments

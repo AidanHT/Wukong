@@ -5,6 +5,31 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Backends: LLVM link ABI, ISA cap, 32-byte stack slots (`gap4/backends`)
+
+- **`--emit=llvm-ir` declares every runtime symbol with its real C signature (P11.3).** Declarations
+  came from call sites, so a pointer slot passed a literal-zero bias was `i64` in one module and
+  `ptr` in the next (`wukong_sgemm_nt_epi`, `wukong_norm_affine_f32`, the `wukong_rt_fmt_*` family).
+  They now come from a table generated from `wukong_runtime`'s `#[no_mangle] extern "C"` sources and
+  held equal to them by a test; a link-ABI law checks every declaration in the run corpus at `-O0`
+  and `-O2` against its definition and every symbol for one signature across define/declare/call.
+- **The vectorizer's f64/i32/i64 kernels are defined in their lane type.** They were spelled in
+  `float` — an f64 reduction was defined `float`, computed in single precision and called as
+  `double`, which LLVM's verifier accepts. Executing the corpus modules under MCJIT now matches the
+  interpreter, including `reduction_canonical_tree.wk` and `vec256_lane_types.wk`.
+- **Vector loads/stores promise one lane's alignment; stack slots carry the native alignment.** An
+  implicit `align 16` on `<4 x float>` at an element offset faulted (`movaps`) when a module ran.
+- **bf16 narrowing needs no `__truncsfbf2`.** It is the runtime's integer rounding spelled in IR
+  (bit-exact on NaN payloads), checked under MCJIT on 4000+ bit patterns; `fptrunc … to bfloat`
+  called a compiler-rt builtin that neither the Rust runtime link nor an MSVC link provides.
+- **The module names `target datalayout` beside `target triple`**, and every refusal carries a reason
+  from the new `wukong_codegen_llvm::DECLINED` table (`C0001`); `emit.rs` ratchets corpus declines at
+  zero, `tools/verify_llvm_corpus.py` reports them, and `docs/llvm-setup.md` shows the exact fib module.
+- **`WUKONG_MAX_ISA` caps Cranelift's `native` flags (N46).** `scalar` is the x86-64 baseline,
+  `avx2` at most x86-64-v3, `avx512` at most x86-64-v4; uncapped code is byte-identical.
+- **Stack slots of 32 bytes or more are 32-byte aligned (P11.7)** — by a run-time round-up, because
+  Cranelift never realigns a frame whose base is only 16-byte aligned.
+
 ### Index-recording reductions (`gap3/vec-argmax`)
 
 - **Argmax/argmin and FindLastIV loops vectorize.** `if x[i] > m { m = x[i]; at = i; }` (and its
