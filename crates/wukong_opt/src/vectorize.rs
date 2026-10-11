@@ -48,10 +48,13 @@
 //!
 //! Everything else is lane-wise and therefore trivially order-preserving: lane `k` of a widened
 //! group executes the identical operation sequence on the identical operands that scalar iteration
-//! `i + k` would have. A step with no lane-wise vector form — a gather, an integer divide, a shift
-//! by a per-lane amount, a conversion with no packed route — keeps that property by being
-//! **replicated** ([`plan_body`]): it runs once per lane, as the scalar instruction, on that lane's
-//! own operands, and its results are packed for the widened steps that read them.
+//! `i + k` would have. A step with no lane-wise vector form — a gather, a scatter, an integer
+//! divide, a shift by a per-lane amount, a conversion with no packed route — keeps that property by
+//! being **replicated** ([`plan_body`]): it runs once per lane, as the scalar instruction, on that
+//! lane's own operands, and its results are packed for the widened steps that read them. A scatter's
+//! `W` stores go out in lane order, which is iteration order, so of two lanes that write one element
+//! the later iteration lands last — the scalar loop's answer, given that nothing else in the loop
+//! touches the scattered object (`loop_info::dependence`).
 //!
 //! # If-conversion
 //!
@@ -358,6 +361,11 @@ enum Plan {
     LaneGep,
     /// A load through per-lane addresses: one scalar load per lane, packed into parts.
     Gather,
+    /// A store through per-lane addresses: one scalar store per lane, in lane order — which is
+    /// iteration order in both directions ([`VecPlan::dir`]), so of two lanes that write one element
+    /// the later iteration lands last, as in the scalar loop. Only planned when
+    /// `loop_info::dependence` proved nothing else in the loop touches the scattered object.
+    Scatter,
     /// A `Load` whose address is affine unit-stride: becomes one `Vec` load per part.
     VecLoad,
     /// A `Store` whose address is affine unit-stride: becomes one `Vec` store per part.
@@ -1133,9 +1141,10 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
     // A replicated step keeps all of its scalar work and adds a lane extract per operand and a
     // lane insert to pack its result, so it only pays for itself next to arithmetic that really
     // does run `W` lanes at once. Loads and stores are not counted as that arithmetic: a body that
-    // only moves data through one replicated step (`o[i] = x[i] as i64` from `f64`, or a bare
-    // `o[i] = lut[q[i]]`) would pay the packing for nothing, and stays scalar exactly as it did
-    // before replication. A heuristic, not a measurement — it errs toward the scalar loop.
+    // only moves data through one replicated step (`o[i] = x[i] as i64` from `f64`, a bare
+    // `o[i] = lut[q[i]]`, or a bare permutation `o[q[i]] = x[i]`) would pay the packing for nothing,
+    // and stays scalar exactly as it did before replication. A scatter counts like a gather. A
+    // heuristic, not a measurement — it errs toward the scalar loop.
     let widened = plans
         .iter()
         .filter(|p| {
@@ -1434,6 +1443,8 @@ fn estimate_cost(
                 2 * parts(&step_ty(s))
             }
             Plan::Replicate | Plan::LaneGep | Plan::Gather => 3 * w64,
+            // Per lane: an extract of the stored value and the scalar store.
+            Plan::Scatter => 2 * w64,
             // Per lane: the lane's condition bit, an address select and the scalar access.
             Plan::PredLoad | Plan::PredStore => 4 * w64,
             // A select per branch and a store, per part.
@@ -2555,7 +2566,7 @@ fn early_exit_verdict(
         let inst = &f.blocks[block.0 as usize].insts[*idx];
         defines_cond |= inst.result == Some(x.cond);
         match plan {
-            Plan::VecStore | Plan::GroupStore { .. } | Plan::MaskedStore => {
+            Plan::VecStore | Plan::GroupStore { .. } | Plan::MaskedStore | Plan::Scatter => {
                 return Err("a search loop stores before its exit")
             }
             Plan::Gather | Plan::LaneGep | Plan::GroupLoad { .. } => {
@@ -3221,9 +3232,14 @@ struct BodyPlan {
 ///   index widened to `i64` only ever feeds per-lane addresses, so computing it per lane keeps an
 ///   `i64` value out of the group width at no cost.
 ///
-/// A scatter (a store through a per-lane address) is not replicated: it is declined, as is any
-/// use of a per-lane address other than a gather's load. Whether replicating is *worth* it is
-/// [`plan_loop`]'s call, from the `replicated` count this returns.
+/// A **scatter** — a store through a per-lane address — is replicated too ([`Plan::Scatter`]): one
+/// scalar store per lane, in lane order. `loop_info::dependence` has proved that nothing else in
+/// the loop, load or store, can touch the scattered object, so the stores' order relative to the
+/// rest of the body is unobservable and their order among themselves is iteration order. A scatter
+/// whose stored value is itself a per-lane address is declined, as is any other use of one. A
+/// scatter inside an if-converted arm is declined too: the predicated store forms need an affine
+/// address. Whether replicating is *worth* it is [`plan_loop`]'s call, from the `replicated` count
+/// this returns.
 fn plan_body(
     f: &Function,
     l: &NaturalLoop,
@@ -3708,9 +3724,13 @@ fn plan_body(
             }
             reads_lane_ptr |= lane_ptrs.contains(&u.0);
         });
-        // A per-lane address may only be the address of a gather: a store through one would be a
-        // scatter, and anything else would need the address as a value.
-        if reads_lane_ptr && !matches!(&inst.op, Op::Load(p, _) if lane_ptrs.contains(&p.0)) {
+        // A per-lane address may only be the address of a gather or of a scatter: anything else —
+        // a scatter that stores the address itself included — would need the address as a value.
+        if reads_lane_ptr
+            && !matches!(&inst.op, Op::Load(p, _) if lane_ptrs.contains(&p.0))
+            && !matches!(&inst.op, Op::Store { ptr, value }
+                if lane_ptrs.contains(&ptr.0) && !lane_ptrs.contains(&value.0))
+        {
             return None;
         }
         let plan = match &inst.op {
@@ -3719,6 +3739,14 @@ fn plan_body(
                 vector_ty.insert(inst.result?.0, ty.clone());
                 replicated += 1;
                 Plan::Gather
+            }
+            // A scatter: one scalar store per lane, in lane order. The stored value is read lane by
+            // lane, so it may be a vector, replicated lanes, the counter's ramp or one value for
+            // the group.
+            Op::Store { ptr, value } if lane_ptrs.contains(&ptr.0) => {
+                lane_bytes(f.value_type(*value))?;
+                replicated += 1;
+                Plan::Scatter
             }
             Op::Load(_, ty) => match access_at.get(&(block, i)).map(|a| &a.addr) {
                 Some(AddrForm::Affine { .. }) => {
@@ -3931,15 +3959,19 @@ fn plan_body(
             }
         }
         // A widened step reading a replicated value packs it into vectors, so its lane type joins
-        // the group width.
-        if !matches!(plan, Plan::Replicate | Plan::LaneGep | Plan::Gather) {
+        // the group width. A scatter reads its value lane by lane and packs nothing.
+        if !matches!(
+            plan,
+            Plan::Replicate | Plan::LaneGep | Plan::Gather | Plan::Scatter
+        ) {
             each_op_use(&inst.op, &mut |u| {
                 if lane_vals.contains(&u.0) {
                     packed.push(f.value_type(u).clone());
                 }
             });
         }
-        if ramp.value_use.contains(&at) && !matches!(plan, Plan::Replicate) {
+        // A replicated step or a scatter takes the counter's `i + k` lane by lane, not the ramp.
+        if ramp.value_use.contains(&at) && !matches!(plan, Plan::Replicate | Plan::Scatter) {
             ramp_vector = true;
         }
         plans.push(plan);
@@ -5368,6 +5400,29 @@ fn emit_body(
                     inst.result.expect("a load has a result").0,
                     Wide::Vector(parts),
                 );
+            }
+            // One scalar store per lane, lane 0 first: lane `k` is iteration `i + dir·k`, so two
+            // lanes writing one element leave the later iteration's value, as the scalar loop does.
+            Plan::Scatter => {
+                let Op::Store { ptr, value } = &inst.op else {
+                    unreachable!("Scatter plan on a non-store")
+                };
+                let addrs = match map.get(&ptr.0) {
+                    Some(Wide::Lanes(x)) => x.clone(),
+                    _ => unreachable!("plan_body proved a scatter writes per-lane addresses"),
+                };
+                let vals = if p.ramp.reads_as_value(i, *value) {
+                    iv_lanes
+                        .get_or_insert_with(|| {
+                            iv_lane_values(e, vb, iv_scalar, &p.iv_ty, p.w, p.dir)
+                        })
+                        .clone()
+                } else {
+                    lane_values(e, vb, &map, *value, p.w)
+                };
+                for (q, v) in addrs.into_iter().zip(vals) {
+                    e.push_void(vb, Op::Store { ptr: q, value: v });
+                }
             }
             Plan::GroupLoad { group, offset } => {
                 let Op::Load(ptr, _) = &inst.op else {
@@ -8112,6 +8167,171 @@ mod tests {
             !is_widened(src, "k"),
             "a gathered index built from the counter must stay scalar"
         );
+    }
+
+    // ---- scatters ------------------------------------------------------------------------------
+
+    /// `o[q[i]] = x[i]*2 + 1` stores through a data-dependent index — a scatter. The arithmetic
+    /// widens, and the store runs once per lane, lane 0 first (`Plan::Scatter`): one lane extract
+    /// per lane after the first and four scalar `f32` stores in the vector body. `@noalias` is what
+    /// lets it go: nothing else the loop touches can be `o`.
+    #[test]
+    fn a_scatter_beside_widened_work_is_replicated_lane_by_lane() {
+        let src = "@unchecked fn k(@noalias mut o: []f32, x: []f32, q: []i32, n: i64) { \
+                   let mut i: i64 = 0; \
+                   while i < n { o[q[i] as i64] = x[i] * 2.0 + 1.0; i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        let (program, mut interner) = optimized(src, 2);
+        let f = program.function(interner.intern("k")).expect("no fn k");
+        let f32x4 = MirType::Vec(Box::new(MirType::F32), 4);
+        let ops: Vec<&Op> = f
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .map(|i| &i.op)
+            .collect();
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, Op::Load(_, t) if *t == f32x4)),
+            "x[i] was not loaded as a vector: {ops:?}"
+        );
+        let extracts = ops
+            .iter()
+            .filter(|op| matches!(op, Op::ExtractLane(..)))
+            .count();
+        assert!(
+            extracts >= 3,
+            "four scattered lanes, found {extracts} extracts"
+        );
+        let most_f32_stores = f
+            .blocks
+            .iter()
+            .map(|b| {
+                b.insts
+                    .iter()
+                    .filter(|i| {
+                        matches!(&i.op, Op::Store { value, .. }
+                            if *f.value_type(*value) == MirType::F32)
+                    })
+                    .count()
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(
+            most_f32_stores >= 4,
+            "the vector body stores each lane on its own: at most {most_f32_stores} in a block"
+        );
+    }
+
+    /// Duplicate indices are the whole risk of a scatter: two lanes of one group, or two groups,
+    /// writing one element. Lane-order stores leave the later iteration's value, exactly as the
+    /// scalar loop does. `q[j] = (j / 2) % 8` repeats every index twice inside each group of four
+    /// and again five groups later; the table is local to `main` (so nothing outside can name it
+    /// and no promise is needed), and every slot is printed.
+    #[test]
+    fn a_scatter_with_repeated_indices_keeps_the_last_writer() {
+        let src = "@unchecked fn main() -> i32 { \
+                   let mut t: [f32; 8] = [-9.0; 8]; \
+                   let mut q: []i32 = alloc_i32(37); let mut s: []f32 = alloc_f32(37); \
+                   let mut j: i64 = 0; let mut v: f32 = -2.0; \
+                   while j < 37 { q[j] = ((j / 2) % 8) as i32; s[j] = v; v = v + 0.375; \
+                   j = j + 1; } \
+                   j = 0; while j < 37 { t[q[j] as i64] = s[j] * 2.0 + 1.0; j = j + 1; } \
+                   j = 0; while j < 8 { print((t[j] * 8.0) as i64); j = j + 1; } \
+                   free(q); free(s); return 0; }";
+        assert!(
+            ops_of(src, "main")
+                .iter()
+                .any(|op| matches!(op, Op::ExtractLane(..))),
+            "the scatter loop in main was not widened"
+        );
+        scalar_and_vector_agree(src);
+    }
+
+    /// A histogram, `h[q[i]] += x[i]`: the gather reads what the scatter writes, so lanes of one
+    /// group may read a slot before an earlier lane's update lands. Spelled as a `while` so the
+    /// `scatter_add` recognizer does not take it first.
+    #[test]
+    fn a_histogram_scatter_is_declined() {
+        let src = "@unchecked fn k(@noalias mut h: []f32, x: []f32, q: []i32, n: i64) { \
+                   let mut i: i64 = 0; \
+                   while i < n { let b: i64 = q[i] as i64; h[b] = h[b] + x[i] * 2.0; i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        assert!(!is_widened(src, "k"), "a read-modify-write scatter widened");
+    }
+
+    /// A scatter beside an affine store to its own object: which one lands last on a shared
+    /// element depends on the iteration interleaving, which a vector group changes.
+    #[test]
+    fn a_scatter_beside_a_store_to_its_object_is_declined() {
+        let src = "@unchecked fn k(@noalias mut o: []f32, x: []f32, q: []i32, n: i64) { \
+                   let mut i: i64 = 0; \
+                   while i < n { o[q[i] as i64] = x[i] * 2.0 + 1.0; o[i] = x[i] * 0.5; \
+                   i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        assert!(
+            !is_widened(src, "k"),
+            "a scatter beside a store to its object widened"
+        );
+    }
+
+    /// Without the promise `o` may be `x` or `q`, so a lane's scatter may change what a later
+    /// lane reads.
+    #[test]
+    fn a_scatter_without_a_promise_is_declined() {
+        let src = "@unchecked fn k(mut o: []f32, x: []f32, q: []i32, n: i64) { \
+                   let mut i: i64 = 0; \
+                   while i < n { o[q[i] as i64] = x[i] * 2.0 + 1.0; i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        assert!(!is_widened(src, "k"), "an unpromised scatter widened");
+    }
+
+    /// A predicated scatter needs a per-lane address in the predicated store forms, which take an
+    /// affine one only. Residual: it stays scalar.
+    #[test]
+    fn a_scatter_in_an_arm_is_declined() {
+        let src = "@unchecked fn k(@noalias mut o: []f32, x: []f32, q: []i32, n: i64) { \
+                   let mut i: i64 = 0; \
+                   while i < n { let v: f32 = x[i]; \
+                   if v > 0.0 { o[q[i] as i64] = v * 2.0 + 1.0; } i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        assert!(
+            !is_widened(src, "k"),
+            "a scatter in an if-converted arm widened"
+        );
+    }
+
+    /// A countdown's lane `k` is iteration `i - k`, so lane order is still iteration order and the
+    /// last writer of a repeated index is still the scalar loop's. Kept out of line so the promise
+    /// survives into the compared program: `k` and `k2` call each other, which the inliner never
+    /// splices, and `k2` takes no slice from `k` — handing `o` to a call would let its storage
+    /// escape and void the promise's facts. Every slot of `o` is printed at each trip `0..=19`,
+    /// which moves the vector/epilogue split through every position.
+    #[test]
+    fn a_countdown_scatter_agrees() {
+        let k = "@unchecked fn k(@noalias mut o: []f32, x: []f32, q: []i32, n: i64, d: i64) { \
+                   if d > 0 { k2(d - 1); return; } \
+                   let mut i: i64 = n; \
+                   while i > 0 { i = i - 1; o[q[i] as i64] = x[i] * 2.0 + 1.0; } } \
+                 fn k2(d: i64) { let mut e: []f32 = alloc_f32(1); let mut w: []f32 = alloc_f32(1); \
+                   let mut z: []i32 = alloc_i32(1); k(e, w, z, 0, d); free(e); free(w); free(z); }";
+        let shape = format!("{k} fn main() -> i32 {{ return 0; }}");
+        assert!(
+            is_widened(&shape, "k"),
+            "the countdown scatter did not widen"
+        );
+        scalar_and_vector_agree(&format!(
+            "{k} fn main() -> i32 {{ let mut x: []f32 = alloc_f32(19); \
+             let mut q: []i32 = alloc_i32(19); let mut o: []f32 = alloc_f32(6); \
+             let mut j: i64 = 0; \
+             while j < 19 {{ x[j] = ((j * 5) % 7) as f32 - 2.5; q[j] = ((j * j) % 6) as i32; \
+               j = j + 1; }} \
+             let mut n: i64 = 0; \
+             while n <= 19 {{ j = 0; while j < 6 {{ o[j] = -7.0; j = j + 1; }} \
+               k(o, x, q, n, 0); j = 0; while j < 6 {{ print((o[j] * 4.0) as i32); j = j + 1; }} \
+               n = n + 1; }} \
+             free(x); free(q); free(o); return 0; }}"
+        ));
     }
 
     /// Integer division and remainder, a per-lane shift amount and an `f64 -> i64` conversion have

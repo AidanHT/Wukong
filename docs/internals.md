@@ -552,8 +552,19 @@ is data the object it reads (`MemAccess::gather_base`) and accepts it only when 
 can reach that object (two slots, `@noalias`, or a non-escaping local). Two guards keep replication
 honest: the induction variable's scalar *address* face may never meet a lane-varying operand
 (`x[i + q[i]]` is declined, not replicated with the group's first `i`), and replication is taken only
-beside at least as much widened arithmetic. Scatters, gapped groups, strides above 4 and masked
-group accesses stay scalar.
+beside at least as much widened arithmetic. A **scatter** — a store `o[q[i]] = v` through a
+per-lane address — is replicated the same way (`Plan::Scatter`): `W` scalar stores, emitted in lane
+order, which is iteration order in both directions, so of two lanes (or groups) that write one
+element the later iteration lands last, exactly as in the scalar loop. It is legal only when **no
+other access in the loop** — load or store, affine, invariant, gathered or scattered — can touch the
+scattered object (`loop_info::dependence` records the object in `MemAccess::gather_base` and tests
+every other access's object against it with the gather's apart test), because then nothing in the
+loop can observe the order. A read-modify-write histogram (`h[q[i]] += x`, which the `scatter_add`
+recognizer covers), two scatters into one object, a scatter beside any other access of its own
+object, an object the analysis cannot prove apart, a scatter inside an if-converted arm and a
+checked scatter (its bounds check is not on the counter) stay scalar
+(`tests/run/vec5_scatter.wk`). Gapped groups, strides above 4 and masked group accesses stay scalar
+too.
 
 **Countdowns** (`VecPlan::dir`): `while i > 0 { i = i - 1; .. }` and `while i >= 0 { ..; i = i - 1
 }` widen with the group walking down. Lane `k` is still the group's `k`-th iteration (counter

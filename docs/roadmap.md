@@ -584,9 +584,18 @@ another architecture or OS is not supported. A native-backend failure is a catal
   **Countdowns** (`while i > 0 { i = i - 1; .. }`, `while i >= 0 { ..; i = i - 1 }`) widen with
   each part loaded and stored as one vector reversed by a shuffle (`tests/run/vec4_reverse_loops.wk`).
   A runtime trip whose `end - start` wraps runs no vector group, and every fold returns its seed
-  bit for bit below one group (`tests/run/vec4_zero_trip_reductions.wk`). Still scalar: an
+  bit for bit below one group (`tests/run/vec4_zero_trip_reductions.wk`). A **scatter**
+  (`o[q[i]] = v`: a permutation or unpermute, an `index_put`, an embedding-row write, a sparse-to-dense
+  fill) widens everything around it and stores lane by lane in iteration order, so the last writer
+  of a repeated index is the scalar loop's, when nothing else in the loop can touch the scattered
+  object — a `@noalias` destination or a local table (`tests/run/vec5_scatter.wk`). Still scalar: an
   `else`-arm argmax update and 64-bit argmax values, stores to different places in one nested
-  region, nested guarded reductions, and in a countdown a search, an argmax or an interleave group.
+  region, nested guarded reductions, and in a countdown a search, an argmax or an interleave group;
+  and among scatters a read-modify-write histogram (the `scatter_add` recognizer's), two scatters
+  into one object, a scatter beside any other access of its own object, a **predicated** scatter
+  (one inside an `if` arm), a **checked** scatter (its bounds check is on data, not the counter), and
+  an unpromised destination the analysis cannot prove apart. There is no hardware gather or scatter:
+  each lane is a scalar access (AVX2's `vgatherdps` is not emitted, and AVX2 has no scatter).
   The per-lane accesses are scalar under Cranelift (no masked vector memory op is emitted yet). A
   loop needing more than eight runtime alias checks stays scalar, and so does one whose estimated
   vector group costs more than its `W` scalar iterations (`WUKONG_VEC_COST=0` lifts that). A two-deep nest whose inner loop carries a recurrence or

@@ -5,6 +5,23 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Vectorizer: replicated scatters (`gap5/vectorizer-scatter-slp`)
+
+- **A store through a data-dependent index no longer keeps its loop scalar (N37, scatter half).**
+  `o[q[i]] = x[i] * 2.0 + 1.0` used to decline the whole loop (`loop_info::dependence` read the
+  store's unknown address as "may touch anything"). The scattered store now records its object
+  (`MemAccess::gather_base`), and when no other access in the loop — load or store, affine,
+  invariant, gathered or scattered — can touch that object, the loop widens around it and the store
+  runs once per lane (`Plan::Scatter`), in lane order. Lane order is iteration order in both
+  directions, so of two iterations writing one element the later one lands last, exactly as in the
+  scalar loop. The `x`/`q` loads and the arithmetic go 4-wide; the four stores stay scalar. A
+  histogram (`h[q[i]] += x`), two scatters into one object, a scatter beside another access of its
+  object, an unpromised destination, a scatter in an `if` arm and a checked scatter stay scalar
+  (`tests/run/vec5_scatter.wk`: f32, i32 and f64 destinations behind `@noalias` and a local table,
+  indices repeated inside one group and across groups, every slot printed). No MIR op and no
+  backend changed; over `tests/run` and `examples` the `-O2` MIR of every existing program is
+  unchanged.
+
 ### Type-lowering soundness (`gap4/sema-soundness`)
 
 - **No silent `i32` slots (N2).** MIR lowering classified any type it did not recognize as `i32`
