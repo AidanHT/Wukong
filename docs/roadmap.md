@@ -1373,12 +1373,14 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
 
 - **`str` is the first slice of a string type, not all of one.** An unannotated `let s = "x"` is
   still the NUL-terminated `*u8` (a literal becomes a `str` only where a `str` is expected, and an
-  `if`/`match` whose arms are all literals is typed from its arms, as with numbers). There are no
-  conversions between `str`, `[]u8` and `*u8`, no concatenation or formatting into a `str`, no
-  character (UTF-8) decoding, no ordering (`<` is `E0433`) and no `str` pattern in a `match`. A
-  `str` cannot bind a type parameter (`E0420`: it is erased to `[]u8` before monomorphization), and
-  a `str` inside a printed aggregate is `E0448`. A failing range START is reported in the index
-  wording with the range end as the length (`s[4..2]` says "the len is 2 but the index is 4").
+  `if`/`match` whose arms are all literals is typed from its arms, as with numbers: an annotated
+  `let` does not reach into the arms, so the first arm must be a `str` for the later literal arms
+  to adapt). There are no conversions between `str`, `[]u8` and `*u8`, no concatenation or
+  formatting into a `str`, no character (UTF-8) decoding, no ordering (`<` is `E0433`) and no `str`
+  pattern in a `match`. A `str` cannot bind a type parameter (`E0420`: it is erased to `[]u8`
+  before monomorphization), and a `str` inside a printed aggregate is `E0448`. A failing range
+  START is reported in the index wording with the range end as the length (`s[4..2]` says "the len
+  is 2 but the index is 4").
 
 - **A `?` argument binds a fixed-extent parameter unchecked.** `fn find(x: [f32; 37])` called with a
   `Tensor[f32, ?]` (or an array that decayed to one) compiles with no diagnostic and no run-time

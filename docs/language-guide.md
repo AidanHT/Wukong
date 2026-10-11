@@ -425,7 +425,10 @@ printf("[{}|{:?}]\n", s, s[..2]);   // [wukong|"wu"]
   `tests/run/str_array_elems.wk`): every element of an array literal has the one element type, so
   a `*u8` value or a `[]u8` beside a `str` is `E0401`. Unannotated, a literal is still the
   NUL-terminated `*u8` (`let p = "x";`). As with numbers, an `if`/`match` whose arms are all
-  literals takes its type from those arms (`*u8`): annotate it, or `return` each literal.
+  literals takes its type from those arms (`*u8`), and annotating the `let` does not change that
+  (`let s: str = if c { "a" } else { "b" };` is `E0401`). Make the FIRST arm a `str` and the later
+  literal arms adapt to it (`let yes: str = "yes";` then `if c { yes } else { "no" }`), or `return`
+  each literal from a function that returns `str`.
 - **Bytes.** `s.len()` is the byte length, an `i64`. `s[i]` is a `u8`, bounds-checked exactly like
   a slice element (the same `index out of bounds` failure, exit 1). `for b in s` yields each byte.
   The bytes are UTF-8 (`"h\u{e9}llo"` is 6 bytes long), and nothing decodes characters yet.
