@@ -159,6 +159,56 @@ fn the_untested_arm_still_binds_its_payload() {
 }
 
 #[test]
+fn a_guard_runs_only_after_its_pattern_matched() {
+    // The guard's call sits in a block of its own, reached only from the pattern test's
+    // success edge — never in the test block itself, where it would run for every value.
+    let src = format!(
+        "enum E {{ A(i32), B(i32) }}
+         fn noisy(t: i32) -> bool {{ print(t); return t > 0; }}
+         fn f(x: E) -> i32 {{ return match x {{ E::A(v) if noisy(v) => 1, _ => 0 }}; }}
+         {MAIN}"
+    );
+    let (prog, interner) = lowered(&src);
+    let f = funcs(&prog, &interner, "f")[0];
+    let noisy = interner.get("noisy").expect("interned");
+    let calls_noisy = |b: &wukong_mir::BasicBlock| {
+        b.insts
+            .iter()
+            .any(|i| matches!(&i.op, Op::Call { func, .. } if *func == noisy))
+    };
+    let guard_blocks: Vec<usize> = (0..f.blocks.len())
+        .filter(|&i| calls_noisy(&f.blocks[i]))
+        .collect();
+    assert_eq!(guard_blocks.len(), 1, "one guard call");
+    let gb = guard_blocks[0];
+    assert!(
+        !f.blocks[gb]
+            .insts
+            .iter()
+            .any(|i| matches!(i.op, Op::Cmp(CmpOp::Eq, ..))),
+        "the guard is not lowered in the pattern's test block"
+    );
+    // Exactly one block branches into it: the pattern test, on its success edge.
+    let preds: Vec<&Terminator> = f
+        .blocks
+        .iter()
+        .map(|b| &b.term)
+        .filter(|t| match t {
+            Terminator::CondBr {
+                then_blk, else_blk, ..
+            } => then_blk.0 as usize == gb || else_blk.0 as usize == gb,
+            Terminator::Br { target, .. } => target.0 as usize == gb,
+            _ => false,
+        })
+        .collect();
+    assert_eq!(preds.len(), 1, "{preds:?}");
+    assert!(
+        matches!(preds[0], Terminator::CondBr { then_blk, .. } if then_blk.0 as usize == gb),
+        "reached on the test's success edge"
+    );
+}
+
+#[test]
 fn a_literal_inference_re_pass_keeps_the_final_verdict() {
     // `k`'s type is decided by a later use, so the body is checked twice; the verdict the second
     // pass reaches is the one published.

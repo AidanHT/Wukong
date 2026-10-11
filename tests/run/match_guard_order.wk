@@ -1,0 +1,59 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: -2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 105
+// EXPECT-OUT: 2
+// EXPECT-OUT: -100
+// EXPECT-OUT: 0
+// EXPECT-OUT: 40
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+module tests.run.match_guard_order
+
+// A match guard runs only after its arm's pattern matched, as in Rust. It used to be evaluated in
+// the pattern's test block and ANDed with the test, so it ran for every value that reached the
+// arm: `f(E::B(5))` called `noisy(5)` through the `E::A(v)` arm, with `v` read out of `B`'s payload.
+// `noisy` prints its argument, so the output is the exact sequence of guards that ran.
+//
+// Expected by hand (a guard's print, then the result):
+//   f(A(3)):    arm 1 matches, guard noisy(3) true            -> 3 1
+//   f(A(-2)):   arm 1 matches, guard false; arm 2 is not B    -> -2 0
+//   f(B(5)):    arm 1 is not A (no guard); arm 2 noisy(105)   -> 105 2
+//   f(B(-200)): arm 2 matches, guard noisy(-100) false        -> -100 0
+//   g(4):       1..=9 matches, guard noisy(40) true           -> 40 1
+//   g(12):      the range fails, so the guard never runs      -> 0
+
+enum E { A(i32), B(i32) }
+
+fn noisy(t: i32) -> bool {
+    print(t);
+    return t > 0;
+}
+
+fn f(x: E) -> i32 {
+    return match x {
+        E::A(v) if noisy(v) => 1,
+        E::B(w) if noisy(100 + w) => 2,
+        _ => 0,
+    };
+}
+
+fn g(k: i32) -> i32 {
+    return match k {
+        1..=9 if noisy(k * 10) => 1,
+        _ => 0,
+    };
+}
+
+fn main() -> i32 {
+    print(f(E::A(3)));
+    print(f(E::A(-2)));
+    print(f(E::B(5)));
+    print(f(E::B(-200)));
+    print(g(4));
+    print(g(12));
+    return 0;
+}

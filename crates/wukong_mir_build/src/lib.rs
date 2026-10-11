@@ -21451,9 +21451,13 @@ impl FnLowerer<'_> {
             // scoped to this arm (popped after the body).
             self.push_scope();
             self.bind_match_ident(&arm.pat, scrut, &scrut_mir, &scrut_ty);
-            let cond =
-                self.match_arm_cond(&arm.pat, scrut, &scrut_mir, &scrut_ty, arm.guard.as_ref());
-            self.builder.cond_br(cond, body_bb, vec![], next_bb, vec![]);
+            self.emit_match_arm_test(
+                &arm.pat,
+                (scrut, &scrut_mir, &scrut_ty),
+                arm.guard.as_ref(),
+                body_bb,
+                next_bb,
+            );
 
             self.builder.switch_to(body_bb);
             self.terminated = false;
@@ -21693,33 +21697,44 @@ impl FnLowerer<'_> {
         }
     }
 
-    /// The i1 condition under which a match arm fires: the pattern test (a literal compares equal; a
-    /// wildcard/identifier is always true) conjoined with the optional guard. The guard is lowered in
-    /// the current (test) block, after any `Ident` binding, so it may reference the binding.
-    fn match_arm_cond(
+    /// End the current (test) block in the branch a match arm takes: to `body_bb` when `pat`
+    /// matches the scrutinee `(value, MIR type, sema type)` and its guard, if any, holds; to
+    /// `next_bb` otherwise. The bindings were made before this, so the guard may read them.
+    ///
+    /// The guard is lowered in a block of its own that only the pattern's success reaches, so it
+    /// runs only after the pattern matched — Rust's order, and the one `if let P = e && c` promises.
+    /// It used to be lowered in the test block and ANDed with the pattern test, so it ran for every
+    /// value that reached the arm: `match x { E::A(v) if noisy(v) => .., _ => .. }` called
+    /// `noisy` on an `E::B`, with `v` read out of the wrong variant's payload.
+    fn emit_match_arm_test(
         &mut self,
         pat: &Pattern,
-        scrut: ValueId,
-        scrut_mir: &MirType,
-        scrut_ty: &Ty,
+        (scrut, scrut_mir, scrut_ty): (ValueId, &MirType, &Ty),
         guard: Option<&Expr>,
-    ) -> ValueId {
+        body_bb: wukong_mir::BlockId,
+        next_bb: wukong_mir::BlockId,
+    ) {
         let pat_cond = self.pattern_cond(pat, scrut, scrut_mir, scrut_ty, pat.span);
+        let Some(g) = guard else {
+            let c = pat_cond.unwrap_or_else(|| {
+                self.builder
+                    .build(MirType::I1, Op::ConstInt(1, MirType::I1))
+            });
+            self.builder.cond_br(c, body_bb, vec![], next_bb, vec![]);
+            return;
+        };
+        if let Some(pc) = pat_cond {
+            let guard_bb = self.builder.new_block();
+            self.builder.cond_br(pc, guard_bb, vec![], next_bb, vec![]);
+            self.builder.switch_to(guard_bb);
+            self.terminated = false;
+        }
         // The guard is normalized to `i1` like every other boolean condition (`if`/`while`/`&&`):
         // a non-bool guard (`match k { x if x => .. }`) would otherwise feed its raw `i32` into the
-        // arm's `And` / `cond_br`, MIR the verifier and Cranelift reject (the `lower_bool_cond` fix
-        // covered if/while/short-circuit/assert but not the match-guard path).
-        match (pat_cond, guard) {
-            (Some(pc), Some(g)) => {
-                let gv = self.lower_bool_cond(g);
-                self.builder.build(MirType::I1, Op::Bin(BinOp::And, pc, gv))
-            }
-            (Some(pc), None) => pc,
-            (None, Some(g)) => self.lower_bool_cond(g),
-            (None, None) => self
-                .builder
-                .build(MirType::I1, Op::ConstInt(1, MirType::I1)),
-        }
+        // `cond_br`, MIR the verifier and Cranelift reject (the `lower_bool_cond` fix covered
+        // if/while/short-circuit/assert but not the match-guard path).
+        let gv = self.lower_bool_cond(g);
+        self.builder.cond_br(gv, body_bb, vec![], next_bb, vec![]);
     }
 
     /// The i1 condition under which `pat` matches the scrutinee. For a scalar pattern `scrut` is the

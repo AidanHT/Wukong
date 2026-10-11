@@ -300,6 +300,7 @@ match_enum_mixed_coverage.wk:
 match_exhaustive_enum.wk:
 match_exhaustive_fallthrough.wk:
 match_expr.wk:
+match_guard_order.wk:
 match_guard_truthy.wk:
 match_pattern_widths.wk:
 match_patterns.wk:
