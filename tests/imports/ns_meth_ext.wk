@@ -1,0 +1,11 @@
+// Loader unit-test fixture: an `impl` for ns_meth's `P`. Importing this module only to call
+// `p.twice()` is a use of the import (W0008 must not fire), although no name resolves through it.
+module ns_meth_ext
+
+import ns_meth;
+
+impl P {
+    pub fn twice(self) -> i32 {
+        return self.v * 2;
+    }
+}

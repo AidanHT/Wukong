@@ -1,0 +1,7 @@
+// Imported by tests/warn/unused_imports.wk. Not a fixture: warn.rs scans tests/warn with a
+// non-recursive read_dir, so this file is only compiled through the root that imports it.
+module lib.shapes
+
+pub fn area(w: f32, h: f32) -> f32 {
+    return w * h;
+}

@@ -1,0 +1,12 @@
+// Loader unit-test fixture: a type and a constructor whose METHOD lives in another module
+// (ns_meth_ext.wk). A file that calls the method needs that module loaded although no name it
+// writes resolves through it: the method is found through the receiver's type.
+module ns_meth
+
+pub struct P {
+    v: i32,
+}
+
+pub fn make() -> P {
+    return P { v: 21 };
+}

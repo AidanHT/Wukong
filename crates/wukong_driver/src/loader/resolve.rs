@@ -18,6 +18,11 @@
 //!    `q` is a module qualifier of the file and not a local, a generic or an item;
 //! 4. merges identical `extern` declarations repeated across modules.
 //!
+//! The rewrite also records which `import` every resolved name went through ([`ImportUse`]), so the
+//! loader can report an import nothing uses (`W0008`, `unused_imports`): the resolution here is the
+//! program's real one, shadowing included, so an import it never consulted is one the program does
+//! not need.
+//!
 //! Everything downstream (sema, MIR, backends) still sees one flat table of unique symbols, which
 //! is why no other crate changes. A name this pass leaves alone that sema cannot resolve is sema's
 //! ordinary E0301 — e.g. an item of a module the file does not import, which is renamed away.
@@ -27,7 +32,7 @@ use wukong_ast::{
     PatKind, Path, Pattern, Stmt, StmtKind, TypeArg, TypeExpr, TypeKind, VariantData, VariantPat,
 };
 use wukong_diag::{Diagnostic, DiagnosticSink};
-use wukong_span::{FxHashMap, Interner, Span, Symbol};
+use wukong_span::{FxHashMap, FxHashSet, Interner, Span, Symbol};
 
 use super::FileInfo;
 
@@ -50,22 +55,30 @@ enum Origin {
     Glob,
 }
 
+/// The `import` that made a name visible in a file: its index among the file's imports, and for a
+/// `{x, y}` selection the index of the selected name.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Via {
+    import: usize,
+    name: Option<usize>,
+}
+
 #[derive(Clone, Copy)]
 enum Binding {
     Item {
         sym: Symbol,
         origin: Origin,
+        /// `None` for the file's own items.
+        via: Option<Via>,
     },
     /// Two glob imports (of files `a` and `b`) bring different items under one name.
-    Ambiguous {
-        a: usize,
-        b: usize,
-    },
+    Ambiguous { a: usize, b: usize },
 }
 
 #[derive(Clone, Copy)]
 enum Qualifier {
-    Module(usize),
+    /// The module `file`, bound by the file's import number `import`.
+    Module { file: usize, import: usize },
     /// Two plain `import x.m;` / `import y.m;` both bind the implicit qualifier `m`.
     Ambiguous(usize, usize),
 }
@@ -77,16 +90,47 @@ struct Scope {
     modules: FxHashMap<Symbol, Qualifier>,
 }
 
+/// What each file's imports were used for, recorded while the program is rewritten. Indexed
+/// `[file][import]`, in the order of [`FileInfo::imports`].
+pub(super) struct ImportUse {
+    /// A name or a module qualifier resolved through the whole import (a glob or an `as` alias).
+    pub(super) resolved: Vec<Vec<bool>>,
+    /// For a `{x, y}` selection, whether each selected name resolved a reference.
+    pub(super) names: Vec<Vec<Vec<bool>>>,
+    /// A method call in the file names a method that an `impl` block in the imported module, or in
+    /// a module it loads in turn, defines. A method is found through its receiver's type, not
+    /// through the import, but dropping the import would drop the `impl` with it.
+    pub(super) methods: Vec<Vec<bool>>,
+}
+
+impl ImportUse {
+    fn new(files: &[FileInfo]) -> ImportUse {
+        ImportUse {
+            resolved: files.iter().map(|f| vec![false; f.imports.len()]).collect(),
+            names: files
+                .iter()
+                .map(|f| {
+                    f.imports
+                        .iter()
+                        .map(|d| vec![false; d.import.items.as_ref().map_or(0, Vec::len)])
+                        .collect()
+                })
+                .collect(),
+            methods: files.iter().map(|f| vec![false; f.imports.len()]).collect(),
+        }
+    }
+}
+
 /// Resolve the whole program in place. `root_items` are the root file's items (file 0, which keep
 /// their position at the front of the merged module); `extra` holds every imported item tagged
-/// with its file index, in DFS order.
+/// with its file index, in DFS order. Returns what each import was used for.
 pub(super) fn resolve_program(
     root_items: &mut [Item],
     extra: &mut [(usize, Item)],
     files: &[FileInfo],
     interner: &mut Interner,
     sink: &mut DiagnosticSink,
-) {
+) -> ImportUse {
     let exports = build_exports(root_items, extra, files, interner);
     let interner: &Interner = interner;
 
@@ -105,12 +149,15 @@ pub(super) fn resolve_program(
     let scopes: Vec<Scope> = (0..files.len())
         .map(|f| build_scope(f, files, &exports, interner, sink))
         .collect();
+    let provides = methods_through_imports(root_items, extra, files);
 
     let mut rw = Rewriter {
         scope: &scopes[0],
         files,
         exports: &exports,
         unmangled: &unmangled,
+        provides: &provides,
+        uses: ImportUse::new(files),
         interner,
         sink,
         locals: Vec::new(),
@@ -124,8 +171,53 @@ pub(super) fn resolve_program(
         rename_decls(item, &exports[*file]);
         rw.item(item);
     }
+    let uses = rw.uses;
 
     merge_extern_decls(root_items, extra, interner);
+    uses
+}
+
+/// For each file and each of its imports, the method names an `impl` block defines in the imported
+/// module or in any module loaded through it (imports are followed transitively, cycles included).
+fn methods_through_imports(
+    root_items: &[Item],
+    extra: &[(usize, Item)],
+    files: &[FileInfo],
+) -> Vec<Vec<FxHashSet<Symbol>>> {
+    let mut own: Vec<FxHashSet<Symbol>> = (0..files.len()).map(|_| FxHashSet::default()).collect();
+    let tagged = root_items
+        .iter()
+        .map(|item| (0usize, item))
+        .chain(extra.iter().map(|(f, item)| (*f, item)));
+    for (file, item) in tagged {
+        if let ItemKind::Impl(imp) = &item.kind {
+            own[file].extend(imp.methods.iter().map(|m| m.name.sym));
+        }
+    }
+    // The methods reachable from one file: its own and those of every file it loads.
+    let reach = |start: usize| -> FxHashSet<Symbol> {
+        let mut seen = vec![false; files.len()];
+        let mut stack = vec![start];
+        let mut set = FxHashSet::default();
+        while let Some(f) = stack.pop() {
+            if std::mem::replace(&mut seen[f], true) {
+                continue;
+            }
+            set.extend(own[f].iter().copied());
+            stack.extend(files[f].imports.iter().filter_map(|d| d.target));
+        }
+        set
+    };
+    let closure: Vec<FxHashSet<Symbol>> = (0..files.len()).map(reach).collect();
+    files
+        .iter()
+        .map(|file| {
+            file.imports
+                .iter()
+                .map(|d| d.target.map(|t| closure[t].clone()).unwrap_or_default())
+                .collect()
+        })
+        .collect()
 }
 
 /// The top-level names an item declares: `(name, is_pub, is_extern)`.
@@ -263,20 +355,23 @@ fn build_scope(
             Binding::Item {
                 sym: e.sym,
                 origin: Origin::Local,
+                via: None,
             },
         );
     }
     let mut modules: FxHashMap<Symbol, Qualifier> = FxHashMap::default();
-    let mut globs: Vec<usize> = Vec::new();
+    // Each glob-imported file once, with the first import that names it.
+    let mut globs: Vec<(usize, usize)> = Vec::new();
     let mut aliases: Vec<Ident> = Vec::new();
 
-    for (imp, target) in &files[f].imports {
-        let Some(t) = *target else { continue };
+    for (k, decl) in files[f].imports.iter().enumerate() {
+        let imp = &decl.import;
+        let Some(t) = decl.target else { continue };
         if let Some(list) = &imp.items {
-            select_items(f, t, list, files, exports, interner, sink, &mut values);
+            select_items(f, t, k, list, files, exports, interner, sink, &mut values);
         } else if let Some(alias) = imp.alias {
             match modules.get(&alias.sym) {
-                Some(Qualifier::Module(m)) if *m == t => {}
+                Some(Qualifier::Module { file, .. }) if *file == t => {}
                 Some(_) => sink.emit(
                     Diagnostic::error(format!(
                         "the module name `{}` is bound more than once",
@@ -287,7 +382,7 @@ fn build_scope(
                     .help("choose a different `as` name for one of the imports"),
                 ),
                 None => {
-                    modules.insert(alias.sym, Qualifier::Module(t));
+                    modules.insert(alias.sym, Qualifier::Module { file: t, import: k });
                 }
             }
             aliases.push(alias);
@@ -297,20 +392,20 @@ fn build_scope(
             };
             match modules.get(&last.sym).copied() {
                 None => {
-                    modules.insert(last.sym, Qualifier::Module(t));
+                    modules.insert(last.sym, Qualifier::Module { file: t, import: k });
                 }
-                Some(Qualifier::Module(m)) if m != t => {
+                Some(Qualifier::Module { file: m, .. }) if m != t => {
                     modules.insert(last.sym, Qualifier::Ambiguous(m, t));
                 }
                 Some(_) => {}
             }
-            if !globs.contains(&t) {
-                globs.push(t);
+            if !globs.iter().any(|&(g, _)| g == t) {
+                globs.push((t, k));
             }
         }
     }
 
-    for &t in &globs {
+    for &(t, k) in &globs {
         for (&name, e) in &exports[t] {
             if !(e.is_pub || t == f) {
                 continue;
@@ -322,12 +417,17 @@ fn build_scope(
                         Binding::Item {
                             sym: e.sym,
                             origin: Origin::Glob,
+                            via: Some(Via {
+                                import: k,
+                                name: None,
+                            }),
                         },
                     );
                 }
                 Some(Binding::Item {
                     sym,
                     origin: Origin::Glob,
+                    ..
                 }) if sym != e.sym => {
                     let a = exports
                         .iter()
@@ -362,11 +462,13 @@ fn build_scope(
     }
 }
 
-/// `import <t>.{x, y}` in file `f`: bind each selected item, which must exist and be `pub`.
+/// `import <t>.{x, y}` (the file's import number `k`) in file `f`: bind each selected item, which
+/// must exist and be `pub`.
 #[allow(clippy::too_many_arguments)]
 fn select_items(
     f: usize,
     t: usize,
+    k: usize,
     list: &[Ident],
     files: &[FileInfo],
     exports: &[FxHashMap<Symbol, Export>],
@@ -374,7 +476,7 @@ fn select_items(
     sink: &mut DiagnosticSink,
     values: &mut FxHashMap<Symbol, Binding>,
 ) {
-    for x in list {
+    for (i, x) in list.iter().enumerate() {
         let Some(e) = exports[t].get(&x.sym).copied() else {
             sink.emit(missing_item(files, interner, *x, t));
             continue;
@@ -384,7 +486,7 @@ fn select_items(
             continue;
         }
         match values.get(&x.sym).copied() {
-            Some(Binding::Item { sym, origin }) if sym != e.sym => {
+            Some(Binding::Item { sym, origin, .. }) if sym != e.sym => {
                 let what = if origin == Origin::Local {
                     "defined in this module"
                 } else {
@@ -407,6 +509,10 @@ fn select_items(
                     Binding::Item {
                         sym: e.sym,
                         origin: Origin::Explicit,
+                        via: Some(Via {
+                            import: k,
+                            name: Some(i),
+                        }),
                     },
                 );
             }
@@ -420,6 +526,10 @@ struct Rewriter<'a> {
     files: &'a [FileInfo],
     exports: &'a [FxHashMap<Symbol, Export>],
     unmangled: &'a FxHashMap<Symbol, usize>,
+    /// Per file and import, the method names reachable through it ([`methods_through_imports`]).
+    provides: &'a [Vec<FxHashSet<Symbol>>],
+    /// What each import was used for, so far.
+    uses: ImportUse,
     interner: &'a Interner,
     sink: &'a mut DiagnosticSink,
     /// Local bindings (parameters, `let`, `for` and pattern bindings), innermost scope last.
@@ -443,6 +553,26 @@ impl Rewriter<'_> {
     fn bind(&mut self, s: Symbol) {
         if let Some(scope) = self.locals.last_mut() {
             scope.push(s);
+        }
+    }
+
+    /// Record that a name of this file resolved through the import `via`.
+    fn used(&mut self, via: Via) {
+        let f = self.scope.file;
+        match via.name {
+            Some(n) => self.uses.names[f][via.import][n] = true,
+            None => self.uses.resolved[f][via.import] = true,
+        }
+    }
+
+    /// A method named `m` is called in this file (`x.m(..)`, `T::m(..)`): every import through
+    /// which an `impl` defining a method of that name was loaded may be what provides it.
+    fn method_called(&mut self, m: Symbol) {
+        let f = self.scope.file;
+        for (k, names) in self.provides[f].iter().enumerate() {
+            if names.contains(&m) {
+                self.uses.methods[f][k] = true;
+            }
         }
     }
 
@@ -470,7 +600,12 @@ impl Rewriter<'_> {
             return None;
         }
         match self.scope.values.get(&id.sym).copied() {
-            Some(Binding::Item { sym, .. }) => (sym != id.sym).then_some(sym),
+            Some(Binding::Item { sym, via, .. }) => {
+                if let Some(v) = via {
+                    self.used(v);
+                }
+                (sym != id.sym).then_some(sym)
+            }
             Some(Binding::Ambiguous { a, b }) => {
                 self.ambiguous(id, a, b, "name");
                 None
@@ -509,7 +644,10 @@ impl Rewriter<'_> {
             return None;
         }
         let m = match *self.scope.modules.get(&q.sym)? {
-            Qualifier::Module(m) => m,
+            Qualifier::Module { file, import } => {
+                self.used(Via { import, name: None });
+                file
+            }
             Qualifier::Ambiguous(a, b) => {
                 self.ambiguous(q, a, b, "module name");
                 return Some(None);
@@ -533,6 +671,10 @@ impl Rewriter<'_> {
         let Some(&head) = p.segments.first() else {
             return;
         };
+        // `Type::method` names a method the way `x.method(..)` does.
+        if let [_, .., last] = p.segments.as_slice() {
+            self.method_called(last.sym);
+        }
         if p.segments.len() == 1 || self.shadowed(head.sym) {
             if let Some(sym) = self.unqualified(head) {
                 p.segments[0].sym = sym;
@@ -887,6 +1029,9 @@ impl Rewriter<'_> {
                 generic_args,
                 args,
             } => {
+                if let ExprKind::Field { name, .. } = &callee.kind {
+                    self.method_called(name.sym);
+                }
                 self.expr(callee);
                 for t in generic_args {
                     self.ty(t);

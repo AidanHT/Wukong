@@ -1,0 +1,9 @@
+// warn.rs fixture (crates/wukongc/tests/warn.rs): a clean root whose import, lint_semi.wk, misses
+// a `;`. The only diagnostic of the build is that W0030, carrying lint_semi.wk's path.
+module lint_semi_root
+
+import lint_semi;
+
+fn main() -> i32 {
+    return semi_val();
+}
