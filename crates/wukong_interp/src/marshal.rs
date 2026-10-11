@@ -145,6 +145,29 @@ impl LiveBlocks {
             _ => Err(format!("{name}: operand {k} extends past its allocation")),
         }
     }
+
+    /// [`LiveBlocks::check`] for a PIECE of operand `k` — an embedding row, read at an offset the
+    /// program computes — whose operand has no trustworthy whole extent to check up front: the
+    /// range `[base, base + len)` must lie inside the live allocation holding `anchor`, the
+    /// operand's own pointer, not merely inside SOME allocation. Otherwise a piece that lands
+    /// wholly inside the next allocation passes and the oracle answers the neighbour's values.
+    /// Empty ranges and untracked tables are as in [`LiveBlocks::check`].
+    pub(crate) fn check_within(
+        &self,
+        name: &str,
+        k: usize,
+        anchor: usize,
+        base: usize,
+        len: usize,
+    ) -> Result<(), String> {
+        if !self.tracked || len == 0 {
+            return Ok(());
+        }
+        match (self.holding(anchor), base.checked_add(len)) {
+            (Some((start, end)), Some(last)) if start <= base && last <= end => Ok(()),
+            _ => Err(format!("{name}: operand {k} extends past its allocation")),
+        }
+    }
 }
 
 /// The slot arena with its live allocations: what every helper below validates an operand

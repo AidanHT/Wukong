@@ -563,7 +563,7 @@ fn embedding_rows_must_stay_inside_the_weight_allocation() {
         );
         assert_eq!(
             interp.intrinsic(name, &args).unwrap_err(),
-            "embedding weight: operand 1 extends past its allocation"
+            format!("{name}: operand 1 extends past its allocation")
         );
         exact_values(&interp.memory, &memory);
         // The output, or the ids, one slot short: refused before the first row is written.
@@ -578,6 +578,54 @@ fn embedding_rows_must_stay_inside_the_weight_allocation() {
             );
             exact_values(&interp.memory, &memory);
         }
+    }
+}
+
+/// Embedding: a selected row is bounded by the allocation of the `weight` OPERAND, not by whichever
+/// allocation happens to hold the row. For a runtime-sized table `mir_build` passes a sentinel
+/// height (`1 << 48`), so this per-row check is the only bound on `weight`: an id one row past the
+/// table selects a row lying wholly inside the NEXT allocation, which a "some live block" check
+/// accepted — the oracle then gathered the neighbour's values where native reads past the table.
+/// It is refused by argument index; earlier rows stay written (the live-gather rule).
+#[test]
+fn embedding_rows_are_bounded_by_the_weight_operand_allocation() {
+    let program = Program::new();
+    let interner = Interner::new();
+    let sentinel = I(1 << 48);
+    for name in ["wukong_embedding_f32", "wukong_embedding_f32_parallel"] {
+        // out [0, 4) = 2 rows of h = 2; weight [4, 8) = 2 rows; neighbour [8, 12); ids [12, 14).
+        let mut memory = vec![Value::Unit; 14];
+        memory[4..8].copy_from_slice(&[F(1.0), F(2.0), F(3.0), F(4.0)]);
+        memory[8..12].fill(F(9.0));
+        let blocks = [(0, 4), (4, 4), (8, 4), (12, 2)];
+        let args = [P(0), P(4), P(12), I(2), I(2), sentinel];
+        let with_ids = |ids: [i128; 2]| {
+            let mut memory = memory.clone();
+            memory[12..14].copy_from_slice(&ids.map(I));
+            memory
+        };
+        // In-table ids gather exactly.
+        let mut interp = tracked(&program, &interner, with_ids([1, 0]), &blocks);
+        interp.intrinsic(name, &args).unwrap();
+        exact_values(&interp.memory[..4], &[F(3.0), F(4.0), F(1.0), F(2.0)]);
+        // Id 2 selects [8, 10): inside the neighbour, outside `weight`. First row: nothing written.
+        let before = with_ids([2, 0]);
+        let mut interp = tracked(&program, &interner, before.clone(), &blocks);
+        assert_eq!(
+            interp.intrinsic(name, &args).unwrap_err(),
+            format!("{name}: operand 1 extends past its allocation")
+        );
+        exact_values(&interp.memory, &before);
+        // Second row: the first stays written, the neighbour's values never land in `out`.
+        let before = with_ids([0, 2]);
+        let mut interp = tracked(&program, &interner, before.clone(), &blocks);
+        assert_eq!(
+            interp.intrinsic(name, &args).unwrap_err(),
+            format!("{name}: operand 1 extends past its allocation")
+        );
+        let mut expected = before;
+        expected[..2].copy_from_slice(&[F(1.0), F(2.0)]);
+        exact_values(&interp.memory, &expected);
     }
 }
 

@@ -5555,7 +5555,17 @@ impl<'a, 'k> Interp<'a, 'k> {
                         let base = weight
                             .checked_add(offset)
                             .ok_or("embedding weight out of bounds")?;
-                        kernel_values(arena!(self), 1, base, 1, h, "embedding weight")?;
+                        let end = base
+                            .checked_add(h)
+                            .ok_or("embedding weight out of bounds")?;
+                        if end > self.memory.len() {
+                            return Err("embedding weight: operand out of bounds".into());
+                        }
+                        // The row must lie inside the allocation holding `weight` ITSELF. `v` is
+                        // no bound here — a runtime-sized table is passed a sentinel height — so
+                        // a row checked only against "some allocation" could sit wholly inside the
+                        // next one and gather the neighbour's values.
+                        self.slots.live.check_within(name, 1, weight, base, h)?;
                         Some(base)
                     } else {
                         None
