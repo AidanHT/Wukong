@@ -16,7 +16,9 @@
 //!    parameter's argument and any other buffer argument rooted in the same storage: `k(a, a)`,
 //!    `k(a, s)` after `let s: []f32 = a`, `k(p.w, p)`, `k(m[0], m[1])`. Disjoint fields of one
 //!    struct (`k(p.w, p.b)`) stay legal. Element indices are not compared, so two elements of one
-//!    array count as one root — the same conservative line Rust's borrow checker draws.
+//!    array count as one root — the same conservative line Rust's borrow checker draws. A name a
+//!    `for` element or a `match` scrutinee place binds to an aggregate (`for (row, _) in grid`,
+//!    `match g[0] { (row, _) => … }`) is bound by pointer into that place, so it is rooted there.
 //! 2. **Rebinding.** A `@noalias` parameter whose value is a view (`[]T`, `*T`, `&T`, a tensor)
 //!    cannot be reassigned as a whole: `s = t` would point the promised name at storage the promise
 //!    never covered. Writing through it (`s[i] = …`) is the point of the attribute and stays legal; a
@@ -40,7 +42,7 @@ use wukong_diag::Diagnostic;
 use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet, Interner, Symbol};
 use wukong_types::Ty;
 
-use crate::{DefKind, DefMap};
+use crate::{DefKind, DefMap, VariantPayload};
 
 /// The attribute's name, without the `@`.
 pub const NOALIAS_ATTR: &str = "noalias";
@@ -231,6 +233,36 @@ fn overlaps(a: &Root, b: &Root) -> bool {
     }
 }
 
+/// The place `root.<proj>`. Through a view the projection lands inside the pointee, which is then
+/// named as a whole (as [`Walker::project`] does for an expression).
+fn project_root(root: &Root, proj: Proj) -> Option<Root> {
+    Some(match root {
+        Root::Storage(b, path) => {
+            let mut path = path.clone();
+            path.push(proj);
+            Root::Storage(*b, path)
+        }
+        target @ Root::Target(..) => target.clone(),
+    })
+}
+
+/// A name bound to a value that lives at the place `root`: the place itself when `wukong_mir_build`
+/// binds the value by pointer — an array, tuple, struct or enum (a C-style enum is copied, but
+/// counting it is only conservative), or a type this pass does not know — and a fresh binding when
+/// it copies it (a scalar, or a view, whose target [`Walker::view_target`] names by the binding).
+fn place_binding(ty: Option<&Ty>, root: Root) -> Binding {
+    let by_pointer = ty.is_none_or(|t| {
+        matches!(
+            t,
+            Ty::Array { .. } | Ty::Tuple(_) | Ty::Named(_) | Ty::Unknown | Ty::Error
+        )
+    });
+    Binding {
+        view_of: None,
+        storage_of: by_pointer.then_some(root),
+    }
+}
+
 /// What this pass knows about one binding (a parameter, a `let`, a `for` or `match` binding).
 #[derive(Clone, Default)]
 struct Binding {
@@ -278,7 +310,9 @@ impl Walker<'_> {
     }
 
     /// Bind every name `p` introduces. Only a plain identifier pattern can carry what its
-    /// initializer is known to be; every name a destructuring pattern binds starts fresh.
+    /// initializer is known to be; every name a destructuring pattern binds starts fresh — right
+    /// for a `let`, which copies its initializer, but not for a value matched in place
+    /// ([`Walker::bind_place_pattern`]).
     fn bind_pattern(&mut self, p: &Pattern, b: Binding) {
         match &p.kind {
             PatKind::Ident(s) => {
@@ -313,6 +347,121 @@ impl Walker<'_> {
             PatKind::Slice { prefix, suffix, .. } => {
                 for q in prefix.iter().chain(suffix) {
                     self.bind_pattern(q, Binding::default());
+                }
+            }
+            PatKind::Wildcard
+            | PatKind::Unit
+            | PatKind::Int { .. }
+            | PatKind::Char(_)
+            | PatKind::Bool(_)
+            | PatKind::Path(_)
+            | PatKind::Range { .. } => {}
+        }
+    }
+
+    /// Bind every name `p` introduces when the value it matches is the place `root`, of type `ty`:
+    /// a `for` element over an array or slice, or a `match` scrutinee that names a place.
+    /// `wukong_mir_build` binds such a value by pointer and every aggregate part of it by pointer
+    /// too (`bind_match_ident` / `bind_field_pattern`), so a name bound to an aggregate part — the
+    /// whole of `name @ sub` included — is that part's place inside `root`, projected through the
+    /// tuple, struct and payload fields that lead to it. A scalar or view part is a fresh copy and
+    /// starts fresh, and an array-pattern element stands for its whole array, as an indexed element
+    /// does. Without a root, this is [`Walker::bind_pattern`].
+    fn bind_place_pattern(&mut self, p: &Pattern, ty: Option<&Ty>, root: Option<Root>) {
+        let Some(root) = root else {
+            return self.bind_pattern(p, Binding::default());
+        };
+        let defs = self.defs;
+        match &p.kind {
+            PatKind::Ident(s) => {
+                self.bind(*s, place_binding(ty, root));
+            }
+            PatKind::Binding { name, sub } => {
+                self.bind(*name, place_binding(ty, root.clone()));
+                self.bind_place_pattern(sub, ty, Some(root));
+            }
+            PatKind::Tuple(ps) => {
+                let tys = match ty {
+                    Some(Ty::Tuple(tys)) => Some(tys),
+                    _ => None,
+                };
+                for (i, q) in ps.iter().enumerate() {
+                    let t = tys.and_then(|tys| tys.get(i));
+                    self.bind_place_pattern(q, t, project_root(&root, Proj::Tuple(i as u32)));
+                }
+            }
+            PatKind::Struct { fields, .. } => {
+                let decl = match ty {
+                    Some(Ty::Named(n)) => match defs.lookup(*n).map(|d| &d.kind) {
+                        Some(DefKind::Struct(decl)) => Some(decl),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                for fp in fields {
+                    let t = decl
+                        .and_then(|d| d.iter().find(|(f, _)| *f == fp.name))
+                        .map(|(_, t)| t);
+                    self.bind_place_pattern(&fp.pat, t, project_root(&root, Proj::Field(fp.name)));
+                }
+            }
+            // The payload fields of one variant are disjoint places, named like a tuple's or a
+            // struct's (no expression reaches into a payload, so the names cannot collide with
+            // one). Two arms' variants share storage, but never a scope.
+            PatKind::Variant { path, fields } => {
+                let payload = path
+                    .segments
+                    .first()
+                    .zip(path.segments.last())
+                    .and_then(|(e, v)| match defs.lookup(e.sym).map(|d| &d.kind) {
+                        Some(DefKind::Enum(vs)) => {
+                            vs.iter().find(|x| x.name == v.sym).map(|x| &x.payload)
+                        }
+                        _ => None,
+                    });
+                match fields {
+                    VariantPat::Tuple(ps) => {
+                        for (i, q) in ps.iter().enumerate() {
+                            let t = match payload {
+                                Some(VariantPayload::Tuple(tys)) => tys.get(i),
+                                _ => None,
+                            };
+                            self.bind_place_pattern(
+                                q,
+                                t,
+                                project_root(&root, Proj::Tuple(i as u32)),
+                            );
+                        }
+                    }
+                    VariantPat::Struct(fps) => {
+                        for fp in fps {
+                            let t = match payload {
+                                Some(VariantPayload::Struct(named)) => {
+                                    named.iter().find(|(n, _)| *n == fp.name).map(|(_, t)| t)
+                                }
+                                _ => None,
+                            };
+                            self.bind_place_pattern(
+                                &fp.pat,
+                                t,
+                                project_root(&root, Proj::Field(fp.name)),
+                            );
+                        }
+                    }
+                }
+            }
+            PatKind::Slice { prefix, suffix, .. } => {
+                let elem = match ty {
+                    Some(Ty::Array { elem, .. }) => Some(&**elem),
+                    _ => None,
+                };
+                for q in prefix.iter().chain(suffix) {
+                    self.bind_place_pattern(q, elem, Some(root.clone()));
+                }
+            }
+            PatKind::Or(ps) => {
+                for q in ps {
+                    self.bind_place_pattern(q, ty, Some(root.clone()));
                 }
             }
             PatKind::Wildcard
@@ -407,7 +556,7 @@ impl Walker<'_> {
                         for e in end.iter().chain(step.iter()) {
                             self.expr(e);
                         }
-                        Binding::default()
+                        None
                     }
                     ForIter::Expr(e) => {
                         self.expr(e);
@@ -415,26 +564,26 @@ impl Walker<'_> {
                     }
                 };
                 self.scopes.push(HashMap::default());
-                self.bind_pattern(pat, element);
+                match element {
+                    Some((elem, root)) => self.bind_place_pattern(pat, Some(&elem), root),
+                    None => self.bind_pattern(pat, Binding::default()),
+                }
                 self.block(body);
                 self.scopes.pop();
             }
         }
     }
 
-    /// What a `for x in e` binding is. An element of aggregate type is bound by pointer into the
-    /// iterated buffer, so it is a place inside that storage; a scalar (or view) element is a copy.
-    fn for_element(&self, e: &Expr) -> Binding {
-        let elem = match self.ty(e) {
-            Some(Ty::Array { elem, .. }) | Some(Ty::Slice(elem)) => elem,
-            _ => return Binding::default(),
-        };
-        if !matches!(**elem, Ty::Array { .. } | Ty::Tuple(_) | Ty::Named(_)) {
-            return Binding::default();
-        }
-        Binding {
-            view_of: None,
-            storage_of: self.root_of(e),
+    /// The element type of `for … in e` over an array or slice, and the storage the elements live
+    /// in. An element of aggregate type — and, under a destructuring head, each aggregate part of
+    /// one — is bound by pointer into the iterated buffer, so it is a place inside that storage
+    /// ([`Walker::bind_place_pattern`]); a scalar (or view) element is a copy.
+    fn for_element(&self, e: &Expr) -> Option<(Ty, Option<Root>)> {
+        match self.ty(e) {
+            Some(Ty::Array { elem, .. }) | Some(Ty::Slice(elem)) => {
+                Some(((**elem).clone(), self.root_of(e)))
+            }
+            _ => None,
         }
     }
 
@@ -542,9 +691,18 @@ impl Walker<'_> {
             }
             ExprKind::Match { scrutinee, arms } => {
                 self.expr(scrutinee);
+                // A scrutinee that names a place is matched in place: its aggregate parts are
+                // bound by pointer into it (`bind_place_pattern`). A view scrutinee is the view
+                // value itself, which an arm binds as a copy.
+                let ty = self.ty(scrutinee).cloned();
+                let root = if ty.as_ref().is_some_and(is_view_ty) {
+                    None
+                } else {
+                    self.root_of(scrutinee)
+                };
                 for arm in arms {
                     self.scopes.push(HashMap::default());
-                    self.bind_pattern(&arm.pat, Binding::default());
+                    self.bind_place_pattern(&arm.pat, ty.as_ref(), root.clone());
                     if let Some(g) = &arm.guard {
                         self.expr(g);
                     }
@@ -835,6 +993,107 @@ fn kp(@noalias mut o: [f32; 4], q: P) { o[0] = q.a[0]; }
         );
         // A view of a different buffer is a different buffer.
         assert_eq!(in_main("let s: []f32 = b; ks(s, a);"), Vec::<&str>::new());
+    }
+
+    const GRID: &str = "
+fn k(@noalias mut o: [f32; 4], x: [f32; 4]) { o[0] = x[0]; }
+fn kg(@noalias mut o: [f32; 4], g: [([f32; 4], f32); 2]) { o[0] = g[0].1; }
+fn kt(@noalias mut o: ([f32; 4], f32), g: [([f32; 4], f32); 2]) { o.1 = g[0].1; }
+struct Q { w: [f32; 4], v: [f32; 4] }
+fn kq(@noalias mut o: [f32; 4], qs: [Q; 2]) { o[0] = qs[0].v[0]; }
+enum One { Pair([f32; 4], [f32; 4]) }
+fn ko(@noalias mut o: [f32; 4], os: [One; 2]) { o[0] = 0.0; }
+";
+
+    fn in_grid(body: &str) -> Vec<&'static str> {
+        codes(&format!(
+            "{GRID}\nfn main() -> i32 {{\n\
+             let mut grid: [([f32; 4], f32); 2] = [([0.0; 4], 1.0), ([1.0; 4], 2.0)];\n\
+             let mut qs: [Q; 2] = [Q {{ w: [0.0; 4], v: [1.0; 4] }}, Q {{ w: [2.0; 4], v: [3.0; 4] }}];\n\
+             let mut os: [One; 2] = [One::Pair([0.0; 4], [1.0; 4]), One::Pair([2.0; 4], [3.0; 4])];\n\
+             let mut b: [f32; 4] = [1.0; 4];\n\
+             {body}\n\
+             return 0;\n}}"
+        ))
+    }
+
+    /// `wukong_mir_build` binds every aggregate part of a destructured `for` element — and the
+    /// whole of `w @ (..)` — by pointer into the iterated buffer, exactly as it binds a named
+    /// aggregate element. Each such name is that part's place inside the iterand, so passing it
+    /// with the iterand is the same overlap `for x in grid { kg(x.0, grid) }` reports.
+    #[test]
+    fn a_destructured_for_part_is_a_place_in_the_iterand() {
+        assert_eq!(
+            in_grid("for x in grid { kg(x.0, grid); }"),
+            vec!["E0316"],
+            "named element (the form that was already checked)"
+        );
+        assert_eq!(
+            in_grid("for (row, _) in grid { kg(row, grid); }"),
+            vec!["E0316"],
+            "tuple part"
+        );
+        assert_eq!(
+            in_grid("for w @ (_, _) in grid { kt(w, grid); }"),
+            vec!["E0316"],
+            "`name @ sub` whole"
+        );
+        assert_eq!(
+            in_grid("for Q { w, .. } in qs { kq(w, qs); }"),
+            vec!["E0316"],
+            "struct field"
+        );
+        assert_eq!(
+            in_grid("for One::Pair(x, _) in os { ko(x, os); }"),
+            vec!["E0316"],
+            "one-variant payload"
+        );
+        assert_eq!(
+            in_grid("let s: []([f32; 4], f32) = grid; for (row, _) in s { kg(row, grid); }"),
+            vec!["E0316"],
+            "a part of a slice element is a place in the viewed buffer"
+        );
+        assert_eq!(
+            in_grid("for Q { w, v } in qs { k(w, v); k(v, w); }"),
+            Vec::<&str>::new(),
+            "two fields of one element are two buffers"
+        );
+        assert_eq!(
+            in_grid("for One::Pair(x, y) in os { k(x, y); }"),
+            Vec::<&str>::new(),
+            "two payload fields of one element are two buffers"
+        );
+        assert_eq!(
+            in_grid("for (row, _) in grid { k(row, b); }"),
+            Vec::<&str>::new(),
+            "a different buffer"
+        );
+    }
+
+    /// A `match` on an aggregate place binds its aggregate parts by pointer into that place too
+    /// (`if let` and `while let` are `match`es).
+    #[test]
+    fn a_match_binding_is_a_place_in_the_scrutinee() {
+        assert_eq!(
+            in_grid("match grid[0] { (row, _) => kg(row, grid) }"),
+            vec!["E0316"],
+            "tuple part of an element"
+        );
+        assert_eq!(
+            in_grid("match grid[1] { e => kg(e.0, grid) }"),
+            vec!["E0316"],
+            "a named scrutinee"
+        );
+        assert_eq!(
+            in_grid("if let One::Pair(x, _) = os[0] { ko(x, os); }"),
+            vec!["E0316"],
+            "an `if let` payload"
+        );
+        assert_eq!(
+            in_grid("match grid[0] { (row, _) => k(row, b) }"),
+            Vec::<&str>::new(),
+            "a different buffer"
+        );
     }
 
     #[test]

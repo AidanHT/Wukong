@@ -789,7 +789,9 @@ other use publishes it.
 ordinary parameter nothing rejects `f(a, a)`, so the analysis returns "may alias" and
 `tests/run/alias_slice_params.wk` pins the behaviour that depends on it. The language decision that
 closes the gap is the `@noalias` parameter attribute (C's `restrict`): `wukong_sema::noalias` rejects
-the call sites and re-pointings that provably break it (`E0316`), `wukong_mir_build` records it as
+the call sites and re-pointings that provably break it (`E0316`; a name a `for` head or a `match` arm
+binds to an aggregate part is rooted at the place `wukong_mir_build` binds it into,
+`bind_place_pattern`), `wukong_mir_build` records it as
 `wukong_mir::ParamAttrs` on the MIR parameter (printed `noalias`), and `AliasInfo` then answers
 "disjoint" for a promised parameter against every other parameter, gives a promised slice's elements
 their own provenance (`Prov::ParamData`, demoted if the fat pointer is ever written or published), and

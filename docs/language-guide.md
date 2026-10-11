@@ -1324,7 +1324,11 @@ with another buffer argument rooted in the same storage is rejected: `axpy(v, v,
 (`tests/fail/noalias_aliased_call.wk`), a view of the same array (`let s: []f32 = v; axpy(s, v, 2.0)`,
 `tests/fail/noalias_aliased_view.wk`), a field together with its struct (`k(p.w, p)`), or two elements
 of one array (`k(m[0], m[1])` — element indices are not compared, the same conservative line Rust's
-borrow checker draws). Two different fields of one struct, `k(p.w, p.b)`, are fine. And a promised
+borrow checker draws). Two different fields of one struct, `k(p.w, p.b)`, are fine. A `for` element
+or a `match` scrutinee of aggregate type is bound by pointer into the storage it came from, and so is
+each aggregate part a destructuring pattern binds out of it: inside `for (row, _) in grid`,
+`k(row, grid)` is rejected exactly as `k(grid[0].0, grid)` is (`tests/fail/noalias_for_destructure.wk`;
+`match grid[0] { (row, _) => k(row, grid) }` likewise). And a promised
 parameter of view type (`[]T`, `*T`, `&T`, a tensor) cannot be re-pointed as a whole (`y = other`,
 `tests/fail/noalias_reassigned_slice.wk`); writing *through* it is the point, and a fixed array
 parameter is assigned by copy, so reassigning one is fine.

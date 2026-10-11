@@ -31,6 +31,15 @@ All notable changes to Wukong are documented here. The format is loosely based o
   (`E0401`) (`tests/run/for_destructure.wk`, `tests/fail/for_head_refutable.wk`,
   `tests/fail/for_range_destructure.wk`). A function that destructures aggregate elements is
   alias-tainted, so an aliasing-sensitive kernel in it conservatively declines.
+- **`@noalias` (`E0316`) sees through destructuring `for` heads and `match` arms.** An aggregate
+  part of a `for` element, the whole of `w @ (..)`, and an aggregate a `match` binds out of a place
+  scrutinee are all bound by pointer into the storage they came from, but the call-site check gave
+  every name such a pattern binds a fresh root. `for (row, _) in grid { k(row, grid) }` compiled —
+  the interpreter observed the store through the promised parameter, which the optimizer is entitled
+  to assume nothing else sees — though `for x in grid { k(x.0, grid) }` was `E0316`; so did
+  `match grid[0] { (row, _) => k(row, grid) }`, which predates this branch. Each name is now that
+  part's place, projected through the tuple, struct and payload fields that lead to it (two
+  different fields stay two buffers) (`tests/fail/noalias_for_destructure.wk`).
 - **`if let P = e && c1 && c2` and `while let P = e && c` (N26).** The `&&` chain becomes the guard of
   the pattern's arm: the conditions run only after the pattern matched, left to right with
   short-circuit, and see its bindings (`tests/run/if_let_chain.wk`). **Behaviour change:** the
