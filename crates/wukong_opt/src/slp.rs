@@ -974,7 +974,7 @@ mod tests {
                  while j < 8 {{ o[j] = (j as f32) + 1.0; j = j + 1; }} k(o, 2, 1, 2.0); \
                  j = 0; while j < 8 {{ print(o[j]); j = j + 1; }} return 0; }}"
             ),
-            false,
+            &[],
         );
     }
 
@@ -1055,20 +1055,28 @@ mod tests {
         );
     }
 
-    /// `-O0` (no SLP) and `-O2` (packed) must print the same bytes. `with_vectors` asserts that
-    /// something is vector-typed at `-O2`, so a positive case cannot pass by packing nothing.
-    fn scalar_and_slp_agree(src: &str, with_vectors: bool) {
+    /// `-O0` (no SLP) and `-O2` (packed) must print the same bytes. Each function named in
+    /// `packed` must hold a vector-typed store at `-O2`, so a positive case cannot pass by packing
+    /// nothing. The check is per kernel, not program-wide: the loop vectorizer widens `main`'s
+    /// init loops on its own, so "something somewhere is a vector" holds even when SLP is off.
+    fn scalar_and_slp_agree(src: &str, packed: &[&str]) {
         let mut outs = Vec::new();
         for level in [0u8, 2u8] {
             let (program, mut interner) = optimized(src, level);
-            if level == 2 && with_vectors {
-                assert!(
-                    program
-                        .funcs
-                        .iter()
-                        .any(|f| f.value_types.iter().any(|t| t.is_vector())),
-                    "vacuous differential: nothing is vector-typed at -O2"
-                );
+            if level == 2 {
+                for name in packed {
+                    let f = program
+                        .function(interner.intern(name))
+                        .unwrap_or_else(|| panic!("no fn {name} at -O2"));
+                    let vector_store = f.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+                        matches!(i.op, Op::Store { value, .. }
+                            if f.value_type(value).is_vector())
+                    });
+                    assert!(
+                        vector_store,
+                        "vacuous differential: `{name}` has no vector store at -O2"
+                    );
+                }
             }
             let main = interner.intern("main");
             let (code, bytes) = wukong_interp::run_with_output(&program, main, &interner)
@@ -1119,6 +1127,6 @@ mod tests {
              j = 0; while j < 8 {{ print(co[j]); j = j + 1; }} \
              return 0; }}"
         );
-        scalar_and_slp_agree(&src, true);
+        scalar_and_slp_agree(&src, &["fm", "im", "dm", "cp"]);
     }
 }
