@@ -178,7 +178,8 @@ impl Sema<'_> {
         args: &[Expr],
         span: Span,
     ) -> Ty {
-        let mut arg_tys: Vec<Ty> = args.iter().map(|a| self.type_expr(a)).collect();
+        // A closure argument is checked against its function-typed parameter (`closures.rs`).
+        let mut arg_tys: Vec<Ty> = self.type_call_args(callee, args);
 
         if let ExprKind::Path(p) = &callee.kind {
             if p.is_single() {

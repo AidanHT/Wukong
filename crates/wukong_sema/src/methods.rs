@@ -19,9 +19,10 @@
 //!   type's method table. A trait method has no default body (`E0410`).
 //! * **Function-typed parameters.** `fn apply(f: fn(f32) -> f32, x: f32)` — the only place a
 //!   function type may appear (`E0411` elsewhere). Every call must pass a named non-generic
-//!   function (or forward the caller's own function parameter); `mir_build` specializes the callee
-//!   per bound function (`apply$square`), so a call through `f` is a direct call with no function
-//!   pointer at run time and nothing a kernel recognizer cannot see.
+//!   function, a closure literal (`closures.rs`), or forward the caller's own function parameter;
+//!   `mir_build` specializes the callee per bound function (`apply$square`, `apply$main$closure$0`),
+//!   so a call through `f` is a direct call with no function pointer at run time and nothing a
+//!   kernel recognizer cannot see.
 //!
 //! What is recorded here — the method tables and every resolved method call — is published in
 //! [`crate::SemaResult::methods`].
@@ -140,7 +141,7 @@ fn subst_self(t: &Ty, self_sym: Symbol, to: &Ty) -> Ty {
 }
 
 /// Does `t` mention the type name `g` anywhere (by value, behind a pointer, or in an element)?
-fn mentions(t: &Ty, g: Symbol) -> bool {
+pub(crate) fn mentions(t: &Ty, g: Symbol) -> bool {
     match t {
         Ty::Named(n) => *n == g,
         Ty::Ptr { pointee, .. } | Ty::Ref { pointee, .. } | Ty::Slice(pointee) => {
@@ -616,20 +617,24 @@ impl Sema<'_> {
                         ExprKind::Path(p) if p.is_single() => Some(p.first().sym),
                         _ => None,
                     };
-                    let known = named.is_some_and(|n| match self.lookup_local(n) {
-                        Some(t) => matches!(t, Ty::Fn { .. }),
-                        None => matches!(
-                            self.defs.lookup(n).map(|d| &d.kind),
-                            Some(DefKind::Fn(s)) if s.generics.is_empty()
-                        ),
-                    });
+                    // A closure literal is known too: `mir_build` lifts it to a function
+                    // (`closures.rs`), and its type is compared below like a named function's.
+                    let closure = matches!(a.kind, ExprKind::Closure { .. });
+                    let known = closure
+                        || named.is_some_and(|n| match self.lookup_local(n) {
+                            Some(t) => matches!(t, Ty::Fn { .. }),
+                            None => matches!(
+                                self.defs.lookup(n).map(|d| &d.kind),
+                                Some(DefKind::Fn(s)) if s.generics.is_empty()
+                            ),
+                        });
                     if !known {
                         self.error(
                             a.span,
                             "E0411",
                             "a function-typed parameter must be given the name of a non-generic \
-                             function (or the caller's own function-typed parameter), known at \
-                             compile time",
+                             function, a closure literal, or the caller's own function-typed \
+                             parameter, known at compile time",
                         );
                         continue;
                     }
@@ -670,6 +675,8 @@ impl Sema<'_> {
         let Some(Ty::Fn { params, ret }) = self.lookup_local(name) else {
             return None;
         };
+        // Inside a closure, the enclosing function's function-typed parameter cannot be captured.
+        self.note_local_use(name, callee.span);
         self.types.insert(
             callee.id,
             Ty::Fn {
@@ -763,6 +770,8 @@ impl Sema<'_> {
                     return Some(ret);
                 }
                 if self.generics.contains(&tsym) && self.may_be_bound_method(tsym, method) {
+                    // `T::m(..)` inside a closure names the enclosing generic (`closures.rs`).
+                    self.note_generic_use(tsym, base.span);
                     self.types.insert(base.id, Ty::Unknown);
                     return Some(self.type_bound_call(e, callee, tsym, method, None, args));
                 }

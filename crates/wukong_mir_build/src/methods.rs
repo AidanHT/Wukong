@@ -624,6 +624,14 @@ impl FnLowerer<'_> {
             span,
         };
         let args = full.as_deref().unwrap_or(args);
+        // A call through a parameter bound to a closure with captures passes the environment this
+        // instance received for that parameter first: the lifted function's leading parameters
+        // (`closures.rs`).
+        if let (ExprKind::Path(p), Some(lift)) = (&callee.kind, self.closure_env(target)) {
+            let mut with_env = self.env_arg_exprs(p.first().sym, lift, span);
+            with_env.extend(args.iter().cloned());
+            return Some(self.lower_call(&path, generic_args, &with_env, e));
+        }
         Some(self.lower_call(&path, generic_args, args, e))
     }
 }

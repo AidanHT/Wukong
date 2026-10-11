@@ -168,6 +168,49 @@ function cannot be bound to a `let` or passed to a non-function parameter; the a
 function, not compute one; and a function-typed parameter is neither `mut` nor named after a builtin
 (`gelu`, `print`, …). A wrong signature is the ordinary `E0401` type mismatch. `tests/run/fn_params.wk`.
 
+### Closures ✅
+
+A **closure literal** — `|x| x * k`, `|| 0`, `|a, b: i32| a + b`, or the block form
+`|x: f32| -> f32 { … }` — may be passed wherever a function-typed parameter expects a function:
+
+```wukong
+fn apply(f: fn(f32) -> f32, x: f32) -> f32 { return f(x); }
+
+fn main() -> i32 {
+    let scale = 2.5;
+    print(apply(|x| x * scale, 4.0));                                  // 10
+    print(apply(|x| -> f32 { if x < 0.0 { return -x; } x }, -4.0));    // 4
+    return 0;
+}
+```
+
+- **Where.** Only as a direct argument of a plain call `g(..)` to a function whose parameter at that
+  position has a function type. Closures are **non-escaping**: one cannot be bound to a `let`,
+  returned, stored in a field or element, used as an operand, passed to a method call, or written in
+  a `const` initializer, a `where` predicate or a `static_assert` (`E0411`).
+- **Parameters and return type.** Each parameter is a name with an optional `: Type` (no patterns,
+  no `mut`). An unannotated parameter takes the type the function-typed parameter declares for it;
+  when that names a generic parameter of the callee (`fn fold3<T>(f: fn(T, T) -> T, ..)`) nothing has
+  fixed it yet, and it must be annotated (`E0419`). The return type is the annotation, else the
+  declared one, else the body's type. With `->` the body must be a block. The closure's type must
+  equal the parameter's once the call binds the callee's generics (`E0401`).
+- **Captures.** Every enclosing local the body reads is captured **by value**, copied when the call
+  evaluates that argument (left to right with the other arguments). A scalar (including `bool` and
+  `char`), a C-style enum, a raw pointer or a reference can be captured. An array, slice, tuple,
+  struct, data-carrying enum, tensor or vector, the enclosing function's function-typed parameter, and
+  anything naming one of its generic parameters cannot (`E0418`): capture a pointer instead
+  (`let pa = &a;`, then `(*pa)[i]`), and bind a generic dimension to a local first (`let n = N;`). A
+  capture is read-only — assigning it or taking `&mut` of it is `E0304` — but writing *through* a
+  captured pointer updates the caller's data (`let pt = &mut total;` … `*pt = *pt + x`).
+- **Control flow.** `return` returns from the closure; `break`/`continue` cannot cross it (`E0303`).
+  Closures nest, and a name an inner closure captures is captured by every closure around it.
+
+It costs nothing at run time: the closure is lifted to a function whose leading parameters are its
+captures, and the callee is specialized per closure exactly as per named function
+(`apply$main$closure$0`), so a call through `f` is a direct call with the captures as ordinary scalar
+arguments — no function pointer, no heap environment, and inlined like any call at `-O2`.
+`tests/run/closures.wk`.
+
 ### Generic functions and dtype-generic tensors ✅
 
 A type parameter (`fn add<T>(a: T, b: T) -> T`) is bound at each call from the arguments, and the

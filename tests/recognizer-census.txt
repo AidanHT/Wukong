@@ -81,6 +81,7 @@ cbrt.wk: wukong_vmath_f32 wukong_vmath_f32*2
 char_literals.wk:
 char_match.wk:
 char_type.wk:
+closures.wk:
 colargmax.wk: wukong_colargmax_i32 wukong_colargmin_i32
 coll2.wk: wukong_coll2_f32
 colmax.wk: wukong_colmax_f32

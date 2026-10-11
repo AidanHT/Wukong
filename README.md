@@ -90,10 +90,11 @@ not duplicate them. In summary, Wukong:
   constant-shape tensors, and the extents handed to recognized runtime kernels, are not yet checked.
   A pointer used as a condition (`if p`) is a null test.
 - **Abstraction without indirection.** `impl` blocks give structs and enums methods and associated
-  functions; traits with bounds (`<T: Shape>`, `where`) and function-typed parameters
-  (`f: fn(f32) -> f32`) are dispatched statically — every generic and higher-order function is
-  specialized per instantiation, so no vtable or function pointer exists at run time
-  (`tests/run/{methods_impl,traits_static_dispatch,fn_params}.wk`). Every concrete instantiation
+  functions; traits with bounds (`<T: Shape>`, `where`), function-typed parameters
+  (`f: fn(f32) -> f32`) and non-escaping closures (`apply(|x| x * scale, v)`, captures copied by
+  value) are dispatched statically — every generic and higher-order function is specialized per
+  instantiation (and per closure), so no vtable or function pointer exists at run time
+  (`tests/run/{methods_impl,traits_static_dispatch,fn_params,closures}.wk`). Every concrete instantiation
   is type-checked again at its types; a tensor may be generic over its element (`Tensor[T, N]`,
   with `alloc::<T>(n)` as the generic heap allocator), one instance per dtype, and its `T = f32`
   instance reaches the kernel builtins (`E0415`/`E0416` for any other binding); and

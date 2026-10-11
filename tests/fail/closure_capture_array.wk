@@ -1,0 +1,19 @@
+// EXPECT-CODE: E0418
+// EXPECT-COUNT: 1
+module tests.fail.closure_capture_array
+
+// A closure captures every enclosing local its body reads, by value: the value is copied into a
+// parameter of the function the closure is lifted to. Only a value that fits one such parameter
+// (a scalar, a C-style enum, a pointer or a reference) can be copied, so reading the array `w`
+// inside the closure is rejected where it is read. Capturing a pointer to it (`let pw = &w;`, then
+// `(*pw)[1]`) is the fix. tests/run/closures.wk is the positive control.
+
+fn apply(f: fn(f32) -> f32, x: f32) -> f32 {
+    return f(x);
+}
+
+fn main() -> i32 {
+    let w: [f32; 2] = [2.0, 3.0];
+    print(apply(|x| x * w[1], 2.0)); //~ E0418
+    return 0;
+}

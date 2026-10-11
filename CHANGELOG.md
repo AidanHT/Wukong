@@ -5,6 +5,30 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Closures (`gap5/closures`, N27)
+
+- **Added: non-escaping closure literals.** `|x| x * k`, `|| 0`, `|a, b: i32| a + b` and the block
+  form `|x: f32| -> f32 { .. }` may be passed directly to a function-typed parameter of a plain
+  call (`apply(|x| x * scale, 4.0)`). An unannotated parameter takes the parameter's declared type;
+  every enclosing local the body reads is captured by value, copied when the call evaluates the
+  argument; `return` returns from the closure, and `break`/`continue` cannot cross it. Before this,
+  `|` in prefix position was `E0202` ("expected an expression"), so every map, predicate or reduction
+  needing a run-time scalar had to be a separate named function plus a threaded parameter.
+- **Zero-cost lowering.** `wukong_mir_build` lifts each literal, before any other rewrite, to a
+  top-level function `<fn>$closure$<k>` whose leading parameters are its captures, and the callee is
+  specialized per closure (`apply$main$closure$0`) with one hidden parameter per capture at the
+  function-typed parameter's position. A call through the parameter is a direct call: no function
+  pointer, no heap environment and no new MIR construct, so the interpreter, Cranelift, the LLVM
+  emitter and the GPU lowering are unchanged, and `-O2` inlines it like any call
+  (`tests/run/closures.wk`, interp == native at every `-O`).
+- **Diagnostics.** `E0418` (new) for a capture that cannot be copied into a scalar parameter (an
+  array, slice, tuple, struct, data enum, tensor or vector, the enclosing function's function-typed
+  parameter, anything naming an enclosing generic): capture a pointer instead. `E0419` (new) for a
+  parameter, or a `return`-using body's return type, that only a callee generic would fix: annotate
+  it. `E0411` for a closure anywhere but a call argument (a `let`, a `return`, a method-call
+  argument, a `const`), and `E0304` for assigning a capture or taking `&mut` of it. A deferred call
+  with a closure argument counts the closure's captures as names it reads (`E0314` on rebinding one).
+
 ### Type-lowering soundness (`gap4/sema-soundness`)
 
 - **No silent `i32` slots (N2).** MIR lowering classified any type it did not recognize as `i32`
