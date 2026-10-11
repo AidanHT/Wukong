@@ -1203,9 +1203,17 @@ Two rules about it:
 `crates/wukongc/tests/recognize.rs` gates all of this: one witness fixture per cascade head (its
 kernel is dispatched by default and gone with the variable set — the first half matters, or the
 second is vacuous), no `call wukong_` at all survives for `tensor_matmul.wk`, the program still prints
-the same bytes on both backends at `-O0` and `-O2`, and autodiff is refused. The 361 `tests/run`
-fixtures present when the switch landed were swept on/off for byte-identical stdout; that historical
-sweep does not establish recognition-on/off agreement for the current corpus.
+the same bytes on both backends at `-O0` and `-O2`, and autodiff is refused. Corpus-wide,
+`every_recognizer_dependent_program_agrees_with_its_generic_lowering` takes every `tests/run`
+program whose MIR loses a `wukong_*` call with the variable set (a count floored by
+`the_recognizer_dependent_corpus_holds_its_floor`) and runs it with recognition on and off at `-O2`
+on the interpreter, `-O2` on native and `-O0` on the interpreter: same exit code, and stdout
+byte-identical unless the fixture is listed in `REASSOCIATION_TOLERANCES` with a derived relative
+bound. A listed fixture's recognition-off stdout must then also satisfy the fixture's own
+`EXPECT-OUT*` lines (`judge_on_off`), so the flat on/off bound — sized for its loosest line — never
+loosens a tighter lane's contract on the one column no other gate executes. (The 361 fixtures
+present when the switch landed were also swept on/off by hand; that sweep is history, this test is
+the gate.)
 
 ### Aliased buffers: the kernel only where the operands are disjoint
 
@@ -1711,7 +1719,8 @@ measurement reports retain the corpus sizes used for those runs.
   each kernel again with `LowerOptions { recognize: false, .. }`, runs it on the interpreter, and holds
   the recognized native output to that second opinion (bit-exact for the elementwise kernels, within a
   derived `2*gamma_n*S` bound for the reductions and GEMMs, within twice the documented f64 bound for
-  the norms; the lane classes where a kernel is known to disagree with its source loop are listed with
+  the norms — a bound on magnitude only: a non-finite lane and a zero lane are held to their exact
+  bits, sign of zero included, in every class; the lane classes where a kernel is known to disagree with its source loop are listed with
   reproducers in `KNOWN_OFF_DIVERGENCES` and fail the run once they stop reproducing) — and a **grammar** fuzzer (`fuzz_grammar`)
   that generates random well-typed programs through the real pipeline and asserts interpreter == native
   and -O0 == -O2 == -O3 on (exit, stdout). Both use a seeded PRNG, so a failure reproduces exactly from

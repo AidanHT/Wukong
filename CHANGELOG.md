@@ -35,7 +35,19 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `2.0 * x + y` with `x = y = -0.0` gives `+0` when it dispatches to `wukong_velem_f32` (the
   kernel's `+0.0` affine constant), and the `x < 6 ? (x > 0 ? x : 0) : 6` spelling of ReLU6 gives
   `0` instead of `6` for a NaN input when it dispatches to the max-first `VE_RELU6`. An affine
-  RMSNorm without a beta loses the sign of a `0 * negative gamma` lane the same way.
+  RMSNorm without a beta loses the sign of a `0 * negative gamma` lane the same way. The
+  tolerance classes bound magnitude only: a `+0` against a `-0` (whose difference, `0`, sits
+  inside every bound) and a non-finite lane must match exactly in every class.
+- **The tolerance fixtures' recognition-off column is held to their own lines.** The three
+  fixtures with a declared on/off bound in `recognize.rs` (`cov4_par_loss.wk`, `cov4_par_rope.wk`,
+  `cov4_rowkernels_wide.wk`) had their generic lowering checked only against that flat bound,
+  sized for the loosest line; the corpus sweep now also requires the recognition-off stdout to
+  satisfy each fixture's own `EXPECT-OUT*` lines, and fails on a tolerance entry it never reaches.
+- **Fixed gates have pinned witnesses.** The fork gates no environment knob opens are crossed by
+  named programs (`TRANSPOSE_PAR_MIN` by `cov4_par_transpose_wide.wk`, `VMATH_PAR_MIN` by
+  `vmath_parallel.wk`, `RCHUNK` by `cov4_par_lowp_dot.wk` and `parallel_argmax.wk`), and
+  `parallel_lane.rs` now fails if one leaves the corpus, stops dispatching the gated kernel, or no
+  longer spells a size above the gate. `run.rs`'s fixture floor is raised to the 517 the corpus holds.
 
 ### Index-recording reductions (`gap3/vec-argmax`)
 
