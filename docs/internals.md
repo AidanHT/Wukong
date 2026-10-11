@@ -148,7 +148,9 @@ first mention, the fused-window recognizers prove the scalars a kernel hides are
 window (`block_mentions`), and `defer` refuses to rebind a name a pending call reads — all from what
 the tree mentions. With a bare `L` in the tree a capture was invisible to all three, the `let` it
 read was deleted, moved or hidden, and the copy resolved to an outer binding of the same name
-(`tests/run/closure_hidden_reads.wk`). The **environment ABI**: an instance whose function-typed
+(`tests/run/closure_hidden_reads.wk`). The lifted item inherits the enclosing function's
+`@strict_fp`, `@generic` and `@unchecked`, which lowering keys by item: the closure body is that
+function's code (`tests/run/closure_strict_fp.wk`). The **environment ABI**: an instance whose function-typed
 parameter `f` is bound to a closure with captures declares one hidden MIR parameter per capture at
 `f`'s position and binds them as `$env$f$<j>`; `lower_call` passes, at a function-typed argument's
 position, the capture values — the value's captures, lowered at the literal's own site, or

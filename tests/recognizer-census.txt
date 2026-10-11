@@ -82,6 +82,7 @@ char_literals.wk:
 char_match.wk:
 char_type.wk:
 closure_hidden_reads.wk:
+closure_strict_fp.wk:
 closures.wk:
 colargmax.wk: wukong_colargmax_i32 wukong_colargmin_i32
 coll2.wk: wukong_coll2_f32

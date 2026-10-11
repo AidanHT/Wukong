@@ -37,6 +37,12 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `103` instead of `102`, identically on every backend and at every `-O`. With no outer binding it
   failed to lower (`C0001`). A closure with captures now lowers to the value `(L, captures..)`, so
   every pass sees each captured read where the copy is taken (`tests/run/closure_hidden_reads.wk`).
+- **Fixed before merge: a closure body ignored its function's `@strict_fp`, `@generic` and
+  `@unchecked`.** Lowering keys the three by item, and the lifted item had no attributes, so
+  `@strict_fp fn g(a: f32, b: f32) -> f32 { return apply(|x| x * a + b, 3.0); }` contracted the
+  closure's `x * a + b` to one `Fma` and `g(0.1, -0.3)` printed `-0.000000007450581` instead of the
+  separately rounded `0`; a `@generic` function's closure was recognized. The lifted item now carries
+  those three attributes (not `@parallel` or `@tile`) (`tests/run/closure_strict_fp.wk`).
 
 ### Type-lowering soundness (`gap4/sema-soundness`)
 

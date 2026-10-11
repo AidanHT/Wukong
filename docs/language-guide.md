@@ -204,6 +204,9 @@ fn main() -> i32 {
   captured pointer updates the caller's data (`let pt = &mut total;` … `*pt = *pt + x`).
 - **Control flow.** `return` returns from the closure; `break`/`continue` cannot cross it (`E0303`).
   Closures nest, and a name an inner closure captures is captured by every closure around it.
+- **Attributes.** A closure body is code of the function it is written in, so that function's
+  `@strict_fp` (no contraction: `|x| x * a + b` is a rounded multiply and a rounded add), `@generic`
+  and `@unchecked` apply to it as well (`tests/run/closure_strict_fp.wk`).
 
 It costs nothing at run time: the closure is lifted to a function whose leading parameters are its
 captures, and the callee is specialized per closure exactly as per named function

@@ -1,0 +1,33 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+module tests.run.closure_strict_fp
+
+// A closure body written inside a `@strict_fp` function is that function's code, so it is
+// lowered strictly too: `x * a + b` is a rounded multiply and a rounded add, never one fused
+// multiply-add. Expectations by hand, in f32 with a = 0.1 and b = -0.3:
+//   3 * 0.1 = 0.30000000447 rounds to 0.30000001192, the same f32 as 0.3, so adding -0.3 gives 0.
+//   (A fused multiply-add rounds once: 0.30000000447 - 0.30000001192 = -7.45e-9, not 0.)
+// The function's own spelling of the same expression is the reference, and agrees.
+
+fn apply(f: fn(f32) -> f32, x: f32) -> f32 {
+    return f(x);
+}
+
+@strict_fp
+fn through_closure(a: f32, b: f32) -> f32 {
+    return apply(|x| x * a + b, 3.0);
+}
+
+@strict_fp
+fn direct(a: f32, b: f32) -> f32 {
+    let x = 3.0;
+    return x * a + b;
+}
+
+fn main() -> i32 {
+    print(through_closure(0.1, -0.3));
+    print(direct(0.1, -0.3));
+    return 0;
+}

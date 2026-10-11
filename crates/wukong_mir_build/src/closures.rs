@@ -46,12 +46,17 @@
 //! each carries its own. There is no function pointer and no new MIR construct, so the interpreter,
 //! both native backends and the GPU lowering see only direct calls of ordinary functions.
 //!
+//! The lifted function inherits the enclosing function's `@strict_fp`, `@generic` and `@unchecked`.
+//! Its body is that function's code, written inside it, and each of the three is a promise about all
+//! of that code: lowering keys them by item, so without the copy a closure body in a `@strict_fp`
+//! function was contracted to an `Fma`, and one in a `@generic` function was recognized.
+//!
 //! A module with no closure is returned as `None` and cloned not at all, so closure-free programs
 //! lower byte-identically.
 
 use wukong_ast::{
-    Block, Expr, ExprKind, FnDecl, ForIter, Ident, Item, ItemKind, Module, NodeId, Param, Path,
-    Stmt, StmtKind, TypeExpr, TypeKind,
+    Attr, Block, Expr, ExprKind, FnDecl, ForIter, Ident, Item, ItemKind, Module, NodeId, Param,
+    Path, Stmt, StmtKind, TypeExpr, TypeKind,
 };
 use wukong_mir::{MirType, Op, ValueId};
 use wukong_sema::{Def, DefKind, FnSig, SemaResult};
@@ -72,6 +77,11 @@ pub(crate) struct ClosureLift {
     /// hidden parameters an instance bound to it declares.
     pub(crate) env_tys: Vec<Ty>,
 }
+
+/// The attributes a lifted closure takes over from the function it is written in: the ones that
+/// govern how that function's own code is lowered. `@parallel` and `@tile` shape the enclosing
+/// function's loops and are not inherited.
+const INHERITED_ATTRS: &[&str] = &["strict_fp", "generic", "unchecked"];
 
 /// The function a value passed to a function-typed parameter names: the first element of a
 /// closure value `(L, captures..)`, or the expression itself (a function's name, a forwarded
@@ -111,16 +121,23 @@ pub(crate) fn lift_module(
         failed: false,
         prefix: String::new(),
         counter: 0,
+        attrs: Vec::new(),
         types: Vec::new(),
         defs: Vec::new(),
         items: Vec::new(),
         table: ClosureTable::default(),
     };
     for item in &mut out.items {
-        if let ItemKind::Fn(f) = &mut item.kind {
+        let Item { attrs, kind, .. } = item;
+        if let ItemKind::Fn(f) = kind {
             if let Some(body) = &mut f.body {
                 l.prefix = l.interner.resolve(f.name.sym).to_string();
                 l.counter = 0;
+                l.attrs = attrs
+                    .iter()
+                    .filter(|a| INHERITED_ATTRS.contains(&l.interner.resolve(a.name.sym)))
+                    .cloned()
+                    .collect();
                 l.block(body);
             }
         }
@@ -181,6 +198,8 @@ struct Lifter<'a> {
     prefix: String,
     /// Closures lifted from the current top-level function so far.
     counter: usize,
+    /// The current top-level function's [`INHERITED_ATTRS`], which every closure in it carries.
+    attrs: Vec<Attr>,
     /// Types of the nodes this pass creates.
     types: Vec<(NodeId, Ty)>,
     defs: Vec<Def>,
@@ -435,7 +454,7 @@ impl Lifter<'_> {
         let item_id = self.fresh();
         self.items.push(Item {
             id: item_id,
-            attrs: Vec::new(),
+            attrs: self.attrs.clone(),
             kind: ItemKind::Fn(FnDecl {
                 // The literal's span is the function's declaration span (source locations and
                 // diagnostics point at the closure).
@@ -779,6 +798,59 @@ mod tests {
             body(&funcs, "main").contains("wukong_cumsum_f32"),
             "{funcs:?}"
         );
+    }
+
+    /// A closure body is code of the function it is written in, and lowering keys `@strict_fp`,
+    /// `@generic` and `@unchecked` by item: the lifted item carries them, and nothing else.
+    #[test]
+    fn a_lifted_closure_inherits_its_functions_lowering_attributes() {
+        use wukong_ast::ItemKind;
+        let mut interner = Interner::new();
+        let src = "fn apply(f: fn(f32) -> f32, x: f32) -> f32 { return f(x); } \
+                   @strict_fp @generic @unchecked @parallel \
+                   fn g(a: f32) -> f32 { return apply(|x| x * a, 1.0); } \
+                   fn h(a: f32) -> f32 { return apply(|x| x + a, 1.0); } \
+                   fn main() -> i32 { return (g(1.0) + h(1.0)) as i32; }";
+        let (module, pdiags) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pdiags.is_empty(), "parse: {pdiags:?}");
+        let (sema, sdiags) = wukong_sema::check(&module, &interner);
+        assert!(sdiags.iter().all(|d| !d.is_error()), "sema: {sdiags:?}");
+        let (out, _, _) = super::lift_module(&module, &sema, &mut interner).expect("closures");
+        let attrs_of = |name: &str| -> Vec<String> {
+            out.items
+                .iter()
+                .find(|it| {
+                    matches!(&it.kind, ItemKind::Fn(f) if interner.resolve(f.name.sym) == name)
+                })
+                .unwrap_or_else(|| panic!("no item `{name}`"))
+                .attrs
+                .iter()
+                .map(|a| interner.resolve(a.name.sym).to_string())
+                .collect()
+        };
+        assert_eq!(
+            attrs_of("g$closure$0"),
+            vec!["strict_fp", "generic", "unchecked"]
+        );
+        assert!(attrs_of("h$closure$0").is_empty());
+    }
+
+    /// The `@strict_fp` promise for a closure body: `x * a + b` is a rounded multiply and a rounded
+    /// add, never one `Fma`, exactly as it is in the function's own body.
+    #[test]
+    fn a_closure_in_a_strict_fp_function_is_not_contracted() {
+        let src = |attr: &str| {
+            format!(
+                "fn apply(f: fn(f32) -> f32, x: f32) -> f32 {{ return f(x); }} \
+                 {attr} fn g(a: f32, b: f32) -> f32 {{ return apply(|x| x * a + b, 3.0); }} \
+                 fn main() -> i32 {{ print(g(0.1, -0.3)); return 0; }}"
+            )
+        };
+        let funcs = lower(&src("@strict_fp"));
+        assert!(!body(&funcs, "g$closure$0").contains("fma"), "{funcs:?}");
+        // The control: without the attribute the same body contracts.
+        let funcs = lower(&src(""));
+        assert!(body(&funcs, "g$closure$0").contains("fma"), "{funcs:?}");
     }
 
     #[test]
