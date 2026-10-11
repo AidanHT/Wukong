@@ -5,8 +5,8 @@ file. Wukong is the language; user `.wk` programs compile to MIR elsewhere — t
 **shape** of "a thing that executes or emits a `wukong_mir::Program`" so no consumer grows its own
 bespoke entry signature.
 
-There is no logic here and no `Backend` implementation. Implementations live in the codegen and
-interp crates.
+There is no logic here and no production `Backend` implementation. Implementations live in the
+codegen and interp crates.
 
 Dependencies: `wukong_mir` (`Program`) and `wukong_span` (`Symbol`, `Interner`). Nothing else, ever —
 every backend crate depends on this one.
@@ -43,12 +43,19 @@ pub enum Artifact {
 Each `compile` is a thin adapter over the crate's real free function. Put the work in a plain `pub fn`
 and let the trait impl be three lines.
 
-## LANDMINE — declared seam, not live dispatch
+## LANDMINE — declared seam, not live dispatch (and that is intentional)
 
 **Nothing in the workspace calls `Backend::compile`.** `wukong_driver::compile` matches on its own
 `BackendKind` (`Interp | Native | Gpu | GpuLower`) and calls concrete functions directly —
 `wukong_interp::run_with_output`, `wukong_codegen_cranelift::jit_run`, `run_on_gpu`,
 `run_on_gpu_lower` — with `--emit=llvm-ir`/`obj`/`exe` handled in their own arms.
+
+This is a decision, not an oversight waiting to be wired up. The driver needs per-backend arguments
+the trait does not carry (the `gpu` offload accelerator, the `--emit=exe` link step, the object path,
+`verify_or_ice` before each entry), and routing it through `&dyn Backend` would add an indirection
+without removing any of that. The trait's job is narrower: to fix the *shape* of "a thing that runs or
+emits a `Program`" so the four adapters cannot drift into four signatures, and so a test can hold the
+two `Executed` producers to one comparison.
 
 - `BackendKind::Gpu` (`--backend=gpu`, the offloading interpreter) has **no** `Backend` impl.
 - Adding an `Artifact` variant or trait method does not reach the CLI. A new target needs a
@@ -66,12 +73,27 @@ and let the trait impl be three lines.
 
 ## Testing
 
-No tests in this crate (two type definitions). Covered transitively:
+The crate's own contract tests are `src/lib.rs` `mod tests` (P7.25), five of them:
+
+| test | the contract it pins |
+| --- | --- |
+| `compile_receives_the_program_entry_and_interner_it_was_given` | `compile` forwards `program`, `entry` and `interner` unchanged |
+| `executing_backend_carries_exit_code_and_stdout` | an executing backend returns `Executed` with both fields intact |
+| `emitting_backend_yields_emitted_not_executed` | an emitting backend returns `Emitted`, never `Executed` |
+| `backend_is_object_safe_and_name_dispatches` | the trait is object-safe and `name` dispatches through `&dyn Backend` |
+| `a_declined_compile_is_a_string_error` | a declined compile is a plain `String` error (the `UNSUPPORTED` path) |
+
+They run against a recording test double, **not** against the four production adapters, and they
+cannot: `wukong_interp`, `wukong_codegen_cranelift`, `wukong_codegen_llvm` and `wukong_codegen_gpu`
+all depend on this crate, so naming any of their types here would be a dependency cycle. The real
+adapters are exercised where they live (`LlvmBackend.compile` by
+`crates/wukong_codegen_llvm/src/closeout_tests.rs`), and the two `Executed` producers' agreement is the
+corpus differential `native_matches_interpreter`, which calls the crates' free functions directly:
 
 ```sh
-cargo check -p wukong_backend
-cargo test -p wukongc --test run
-cargo check --features gpu --all-targets
+cargo test -p wukong_backend                 # the five contract tests
+cargo test -p wukongc --test run             # interp vs native, bit for bit, over tests/run
+cargo check --features gpu --all-targets     # GpuLowerBackend still type-checks
 ```
 
 See [`src/README.md`](src/README.md).
