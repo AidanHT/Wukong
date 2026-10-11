@@ -1286,10 +1286,33 @@ and the half-output runtime kernels' own shifted-overlap handling are outside th
 ## CPU training execution
 
 `--train` validates concrete dense f32 buffer types and checked byte extents before allocating
-training storage. The interpreter remains the default; `--backend=native` builds one verified
-`(Ptr, I64) -> Void` dispatcher for forward, backward and the distinct AdamW sizes. Its owning
-`JitBufferKernel` retains executable memory across steps. Each call rebuilds the pointer table
-from exclusively borrowed buffers, since optimizer updates can replace their allocations.
+training storage. **The loop is one function, `wukong_runtime::train::run_training`**: the seeded
+init, the snapshot/restore, the clip, the schedule, SGD and the AdamW hyperparameter buffer, driven
+by a `TrainSpec` (buffer sizes, weights, restored buffers, steps, rate, optimizer, seed, decay,
+clip, warmup, schedule), with every kernel reached through a selector — 0 the forward, 1 the
+backward, `2 + k` the AdamW kernel for the `k`-th distinct weight size (`TrainSpec::kernel_buffers`
+lists each selector's buffers, and the driver builds its kernel list from it). `format_report`
+renders the printed text. The driver (`build_training` in `wukong_driver/src/lib.rs`) builds the
+forward, backward and AdamW kernels and the spec; in process it encodes the spec, decodes those
+bytes and runs the loop through `training_native::TrainingExecutor`. The interpreter remains the
+default; `--backend=native` appends one verified `(Ptr, I64) -> Void` dispatcher
+(`training_native::add_dispatcher`) and JIT-compiles it once. Its owning `JitBufferKernel` retains
+executable memory across steps. Each call rebuilds the pointer table from exclusively borrowed
+buffers, since optimizer updates can replace their allocations. What a kernel prints is forwarded
+to stdout as each call returns.
+
+**`--train --emit=exe|obj`** (`emit_train_artifact`) builds the same kernels and the same
+dispatcher into the artifact, plus the spec as a `.rodata` static (`TrainSpec::encode`: a
+`WKTRAIN\0` magic, a `u32` layout version, then every field little-endian) and a synthesized MIR
+`main` — `global_addr` of the blob, its length, `func_addr` of the dispatcher, `call
+wukong_rt_train_main` (an `extern "C"` import) — verified by `verify_or_ice` and code-generated at
+the training program's `-O1` floor through the ordinary `emit_native`. The runtime entry decodes the
+blob (a damaged one is `error: --train: invalid training spec`, exit 1), runs `run_training` with a
+dispatch that calls the compiled dispatcher, and prints `format_report`; so the executable's stdout
+is the in-process run's by construction. Only the rustc link provides the entry: on the C fallback
+the driver refuses by name (exit 2). The AdamW hyperparameter layout exists twice
+(`wukong_autodiff::optim::hp` builds the kernel, `wukong_runtime::train::hp` fills the buffer); a
+`const` assertion in the driver makes a drift a build error.
 
 The loop keeps one buffer vector for the whole run — the forward's buffers followed by one gradient
 per trainable weight — and updates it in place: the AdamW kernel's five operands are moved in and
@@ -1300,15 +1323,16 @@ operand, any call the tape does not recognize, any escape — and snapshots and 
 around each gradient run (the loss output is reset instead). The training-file plumbing lives in
 `wukong_driver/src/training.rs`: `--train-init` reads a whole buffer, `--train-data` seeks to batch
 `step mod batches` and decodes it into the live buffer through one reused byte buffer, and
-`--train-save` writes after the run, all raw little-endian f32. The same module holds the learning-rate
-schedule (`lr_at`: linear warmup, then constant or `CosineAnnealingLR`) and the global-norm clip
-(`clip_global_norm`, the norm accumulated in f64).
+`--train-save` writes after the run, all raw little-endian f32; `run_training_with` takes the
+initial buffers and a per-update `load` hook for them. The learning-rate schedule (`lr_at`: linear
+warmup, then constant or `CosineAnnealingLR`) and the global-norm clip (`clip_global_norm`, the norm
+accumulated in f64) live with the loop in `wukong_runtime::train`.
 
 Native calls share the JIT run lock, output capture, assertion state and scoped large-stack worker.
 The public buffer-kernel invocation is unsafe: callers must establish storage type, extent,
 alignment, aliasing and lifetime; validating MIR and the dispatcher signature alone cannot do so.
-The trainer supplies these obligations for its f32 buffers. General helper-call differentiation,
-AOT training and measured training performance remain separate gaps.
+The trainer supplies these obligations for its f32 buffers. General helper-call differentiation
+and measured training performance remain separate gaps.
 
 ## CPU streaming-store policy
 

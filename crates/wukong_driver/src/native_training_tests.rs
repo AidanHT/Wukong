@@ -381,3 +381,72 @@ fn native_training_hp_layout_matches_the_adamw_kernel() {
         assert_eq!(k, r, "hp::{field}");
     }
 }
+
+/// `--train --emit=exe|obj` builds one program: the forward, the backward, one AdamW kernel per
+/// distinct weight size, the dispatcher a native run JIT-compiles, the spec blob, and a `main`
+/// that hands both to `wukong_rt_train_main`. It must pass the whole-program verifier (the gate
+/// before every backend), and its blob must decode to the spec the in-process run executes.
+#[test]
+fn native_training_artifact_program_is_verified_and_carries_the_spec() {
+    let mut it = Interner::new();
+    let program = square_loss(&mut it);
+    for (optimizer, decay) in [(TrainOpt::Sgd, 0.0), (TrainOpt::AdamW, 0.125)] {
+        for level in [0, 2] {
+            let mut opts = Options {
+                opt_level: level,
+                emit: EmitStage::Exe,
+                ..Options::default()
+            };
+            opts.grad = GradOptions {
+                train: true,
+                train_artifact: true,
+                wrt: vec![0],
+                train_steps: 5,
+                train_lr: 0.125,
+                train_seed: 9,
+                train_opt: optimizer,
+                train_weight_decay: decay,
+                train_clip: Some(2.0),
+                ..GradOptions::default()
+            };
+            let artifact = build_train_artifact(&program, &mut it, &opts, &[1, 1, 1]).unwrap();
+            assert!(wukong_mir::verify::verify_program(&artifact).is_empty());
+            let main = artifact
+                .function(it.intern("main"))
+                .expect("synthesized main");
+            assert!(main.params.is_empty() && main.ret == MirType::I32);
+            let ops: Vec<_> = main.blocks.iter().flat_map(|b| &b.insts).collect();
+            let entry = it.intern(TRAIN_MAIN);
+            assert!(ops
+                .iter()
+                .any(|i| matches!(i.op, Op::Call { func, .. } if func == entry)));
+            let dispatcher = ops
+                .iter()
+                .find_map(|i| match i.op {
+                    Op::FuncAddr(f) => Some(f),
+                    _ => None,
+                })
+                .expect("the dispatcher's address");
+            assert_eq!(artifact.function(dispatcher).unwrap().params.len(), 2);
+            assert!(artifact.extern_fn(entry).is_some());
+            let blob = ops
+                .iter()
+                .find_map(|i| match i.op {
+                    Op::GlobalAddr(s) => artifact.statics.iter().find(|d| d.name == s),
+                    _ => None,
+                })
+                .expect("the spec blob");
+            let spec = wukong_runtime::train::TrainSpec::decode(&blob.bytes).unwrap();
+            assert_eq!(spec.lens, vec![1, 1, 1]);
+            assert_eq!((spec.wrt.clone(), spec.steps, spec.seed), (vec![0], 5, 9));
+            assert_eq!(spec.clip, Some(2.0));
+            assert_eq!(spec.weight_decay, decay);
+            let adamw = artifact
+                .funcs
+                .iter()
+                .filter(|f| it.resolve(f.name).starts_with("adamw_step_"))
+                .count();
+            assert_eq!(adamw, usize::from(optimizer == TrainOpt::AdamW));
+        }
+    }
+}

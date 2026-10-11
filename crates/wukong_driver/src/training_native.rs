@@ -1,9 +1,10 @@
-//! Training execution selected once, with one owning JIT handle for all native steps, and the
-//! kernel dispatcher a native `--train` run calls.
+//! Training execution selected once, with one owning JIT handle for all native steps — and the
+//! kernel dispatcher that both a native `--train` run and a `--train --emit=exe|obj` artifact call.
 //!
 //! The loop itself is `wukong_runtime::train::run_training`; it reaches every kernel through a
-//! selector (`wukong_runtime::train`'s ABI). [`TrainingExecutor::run_selector`] answers it on the
-//! interpreter or through the JIT-compiled dispatcher, which [`add_dispatcher`] generates.
+//! selector (`wukong_runtime::train`'s ABI). In process, [`TrainingExecutor::run_selector`] answers
+//! it on the interpreter or through the JIT-compiled dispatcher; in an artifact the runtime calls the
+//! object's compiled copy of the same dispatcher, which [`add_dispatcher`] generates for both.
 use super::{BackendKind, Interner};
 use wukong_mir::{Builder, CmpOp, MirType, Op, Program};
 use wukong_span::Symbol;
@@ -137,14 +138,14 @@ impl TrainingExecutor {
     }
 
     /// Run the kernel `selector` names (its index in `entries`) over `buffers`, which must have
-    /// exactly that kernel's declared lengths.
-    pub(super) fn run_selector(
+    /// exactly that kernel's declared lengths, and return what it printed.
+    pub(super) fn run_selector_output(
         &self,
         program: &Program,
         selector: usize,
         buffers: &mut [Vec<f32>],
         interner: &Interner,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<u8>, String> {
         let (entry, lens) = self
             .entries
             .get(selector)
@@ -161,15 +162,32 @@ impl TrainingExecutor {
                 // has the validated argument count/lengths. Each Vec owns disjoint writable
                 // storage and remains exclusively borrowed until the worker joins. These kernels
                 // do not retain pointers. The owning kernel handle lives across every call.
-                unsafe {
-                    kernel.run(&pointers, selector as u64)?;
-                }
-                Ok(())
+                unsafe { kernel.run(&pointers, selector as u64) }
             }
             None => {
                 let mut views: Vec<_> = buffers.iter_mut().map(|v| v.as_mut_slice()).collect();
-                wukong_interp::run_kernel_f32(program, *entry, &mut views, interner)
+                wukong_interp::run_kernel_f32_with_output(program, *entry, &mut views, interner)
             }
         }
+    }
+
+    /// [`TrainingExecutor::run_selector_output`], with what the kernel printed written to stdout
+    /// at once — exactly what the same kernel prints, at the same point of the run, inside a
+    /// `--train --emit=exe` executable (whose kernels write to stdout directly).
+    pub(super) fn run_selector(
+        &self,
+        program: &Program,
+        selector: usize,
+        buffers: &mut [Vec<f32>],
+        interner: &Interner,
+    ) -> Result<(), String> {
+        let printed = self.run_selector_output(program, selector, buffers, interner)?;
+        if !printed.is_empty() {
+            use std::io::Write;
+            let mut out = std::io::stdout().lock();
+            let _ = out.write_all(&printed);
+            let _ = out.flush();
+        }
+        Ok(())
     }
 }

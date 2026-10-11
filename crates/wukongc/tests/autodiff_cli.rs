@@ -9,6 +9,9 @@
 //!   for byte at every level — the only differential the synthesized backward has — and to descend;
 //! * `--emit=obj --grad-of` exports the gradient as a linkable symbol.
 //!
+//! The training loop ahead of time (`--train --emit=exe`, byte-identical to `--train` on both
+//! backends, this file's GEMM + bias model among its cases) is `train_exe.rs`.
+//!
 //! Gradient VALUES are gated in-crate (finite difference + closed forms in `wukong_autodiff` and
 //! `wukong_driver::grad_model_tests`) and by the hand-derived `tests/run/autodiff_train_*.wk`
 //! trajectories; this file pins the CLI contract.

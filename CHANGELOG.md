@@ -5,6 +5,27 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### AOT training (`gap4/train-aot`)
+
+- **`--train --emit=exe` builds the training loop into an executable (P4.3).** The forward, its
+  generated backward, the fused AdamW kernels and a kernel dispatcher are linked with a synthesized
+  `main` that calls the runtime's new `wukong_rt_train_main` on a versioned `.rodata` spec blob;
+  `--emit=obj` writes the object, and `-o` alone selects the default `exe` stage. The loop moved
+  out of the driver into `wukong_runtime::train::run_training`, which `wukongc --train` now runs
+  in process over the same spec bytes, so the executable's stdout is byte-identical to `--train` on
+  the interpreter and the native JIT by construction (`crates/wukongc/tests/train_exe.rs`: five
+  models, `-O0`/`-O2`, SGD and AdamW with clip/warmup/cosine). `--train-init`, `--train-data` and
+  `--train-save` with an artifact, and a link without the rustc + runtime rlib path, are refused by
+  name (exit 2). Every existing `--train` trajectory prints the same bytes.
+- **`--train` prints what the loss prints.** A `print` in a loss function was captured and dropped
+  on both backends; it now reaches stdout as each kernel call returns (once per update, since the
+  backward replays the forward, and once for the final forward), before the report — where the
+  training executable prints it too.
+- **A two-layer MLP trains in the corpus (P4.7).** `tests/run/autodiff_train_mlp.wk` (GEMM + bias +
+  ReLU, GEMM + bias, mean squared error; four trained tensors) pins three SGD steps derived in Python
+  under three f32 evaluation orders and f64, every printed value at least 131 ULPs from a rounding
+  boundary.
+
 ### Index-recording reductions (`gap3/vec-argmax`)
 
 - **Argmax/argmin and FindLastIV loops vectorize.** `if x[i] > m { m = x[i]; at = i; }` (and its

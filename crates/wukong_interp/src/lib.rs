@@ -702,6 +702,19 @@ pub fn run_kernel_f32(
     bufs: &mut [&mut [f32]],
     interner: &Interner,
 ) -> Result<(), String> {
+    run_kernel_f32_inner(program, entry, bufs, interner, None).map(drop)
+}
+
+/// [`run_kernel_f32`], also returning the bytes the kernel printed — what a linked executable
+/// running the same kernel writes to its stdout — so the caller can forward them. `wukongc --train`
+/// does: a `--train --emit=exe` artifact's kernels print straight to stdout, and the in-process run
+/// must print the same bytes in the same order.
+pub fn run_kernel_f32_with_output(
+    program: &Program,
+    entry: Symbol,
+    bufs: &mut [&mut [f32]],
+    interner: &Interner,
+) -> Result<Vec<u8>, String> {
     run_kernel_f32_inner(program, entry, bufs, interner, None)
 }
 
@@ -715,7 +728,7 @@ pub fn run_kernel_f32_accel(
     interner: &Interner,
     accel: &mut dyn Accelerator,
 ) -> Result<(), String> {
-    run_kernel_f32_inner(program, entry, bufs, interner, Some(accel))
+    run_kernel_f32_inner(program, entry, bufs, interner, Some(accel)).map(drop)
 }
 
 // Host-buffer marshalling is a bit-preserving transfer, not floating-point arithmetic.
@@ -753,7 +766,7 @@ fn run_kernel_f32_inner(
     bufs: &mut [&mut [f32]],
     interner: &Interner,
     accel: Option<&mut dyn Accelerator>,
-) -> Result<(), String> {
+) -> Result<Vec<u8>, String> {
     let func = program
         .function(entry)
         .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
@@ -806,7 +819,7 @@ fn run_kernel_f32_inner(
             };
         }
     }
-    Ok(())
+    Ok(interp.stdout)
 }
 
 /// Run an f64-buffer kernel over caller-provided buffers — the double-precision twin of

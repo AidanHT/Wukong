@@ -185,6 +185,10 @@ pub struct GradOptions {
     pub wrt: Vec<usize>,
     /// Run a fwd→bwd→optimizer training loop instead of just emitting the backward (`--train`).
     pub train: bool,
+    /// `--train` with `--emit=exe|obj` (or `-o`): build that loop into the artifact `emit` names —
+    /// an executable that prints exactly the trajectory `--train` prints — instead of running it
+    /// now. Only consulted when `train` is set.
+    pub train_artifact: bool,
     /// Number of training steps (`--train-steps=N`).
     pub train_steps: usize,
     /// Learning rate for the training loop (`--train-lr=<f>`).
@@ -217,6 +221,7 @@ impl Default for GradOptions {
             of: None,
             wrt: Vec::new(),
             train: false,
+            train_artifact: false,
             train_steps: 100,
             train_lr: 0.01,
             train_weight_decay: 0.0,
@@ -705,8 +710,12 @@ pub fn compile(opts: &Options) -> i32 {
 
     // --- Autodiff CLI surface (additive; runs after optimization, before any backend) ---
     if opts.grad.train {
-        timer.begin("train");
         let lens = train_lens.expect("train_lens computed when --train is set");
+        if opts.grad.train_artifact {
+            timer.begin("autodiff");
+            return emit_train_artifact(&program, &mut interner, opts, &lens, &mut timer);
+        }
+        timer.begin("train");
         return run_train(&program, &mut interner, opts, &lens);
     }
     if opts.emit == EmitStage::Grad {
@@ -1606,6 +1615,19 @@ fn emit_native(
         LinkOutcome::Failed(msg) => {
             emit_driver_error(opts, msg);
             return exit::COMPILE_ERROR;
+        }
+        // A training executable's `main` calls `wukong_rt_train_main`, the runtime's training
+        // loop, which the C fallback runtime does not reimplement (a second loop would be a second
+        // thing to keep byte-identical). Say so instead of letting `cc` report an undefined symbol.
+        LinkOutcome::Unavailable if opts.grad.train => {
+            emit_driver_error(
+                opts,
+                "a `--train --emit=exe` executable links the training loop from the \
+                 `wukong_runtime` rlib, and no usable `rustc` + rlib is beside wukongc (the `cc` \
+                 fallback runtime has no training loop); use `--train --emit=obj` and link the \
+                 object against `wukong_runtime`, or run `wukongc --train`",
+            );
+            return exit::UNIMPLEMENTED;
         }
         LinkOutcome::Unavailable => { /* fall through to the C-runtime `cc` link */ }
     }
@@ -2540,7 +2562,8 @@ const _: () = {
 /// honest end-to-end signal — on a convex objective it strictly decreases — and `--train-save`
 /// writes the trained buffers out.
 ///
-/// The loop and the printed text are `wukong_runtime::train`'s.
+/// The loop and the printed text are `wukong_runtime::train`'s, the same functions a
+/// `--train --emit=exe` artifact runs ([`emit_train_artifact`]).
 fn run_train(
     program: &wukong_mir::Program,
     interner: &mut Interner,
@@ -2628,8 +2651,8 @@ fn train_in_process(
     } = build_training(program, interner, opts, lens, wrt)?;
     let executor =
         training_native::TrainingExecutor::new(&mut train_prog, interner, opts.backend, entries)?;
-    // The run consumes the spec's encoded bytes — the form an ahead-of-time artifact would carry —
-    // so an in-process run and such an artifact cannot disagree on a field.
+    // The run consumes the very bytes a `--train --emit=exe` artifact bakes into `.rodata`, so the
+    // two cannot disagree on a field of the spec.
     let spec = wukong_runtime::train::TrainSpec::decode(&spec.encode())?;
     let interner: &Interner = interner;
     let mut load = |step: usize, bufs: &mut [Vec<f32>]| -> Result<(), String> {
@@ -2784,6 +2807,150 @@ fn build_training(
         spec,
         entries,
     })
+}
+
+/// The runtime entry a training artifact's `main` calls (`wukong_runtime::train`).
+const TRAIN_MAIN: &str = "wukong_rt_train_main";
+
+/// `--train --emit=exe|obj`: build the training loop into an artifact instead of running it. The
+/// artifact holds the forward, its backward, the AdamW kernels and the kernel dispatcher a native
+/// `--train` run JIT-compiles, plus a synthesized `main` that calls the runtime's
+/// `wukong_rt_train_main` with the run's spec (a `.rodata` blob) and the dispatcher's address — so
+/// the executable runs `wukong_runtime::train::run_training` and prints
+/// `wukong_runtime::train::format_report`, exactly what `wukongc --train` does in process.
+///
+/// The artifact reads and writes no files, so `--train-init`, `--train-data` and `--train-save` are
+/// refused (exit 2) rather than silently dropped.
+fn emit_train_artifact(
+    program: &wukong_mir::Program,
+    interner: &mut Interner,
+    opts: &Options,
+    lens: &[usize],
+    timer: &mut report::PassTimer,
+) -> i32 {
+    let stage = if opts.emit == EmitStage::Obj {
+        "obj"
+    } else {
+        "exe"
+    };
+    for (flag, given) in [
+        ("--train-init", !opts.grad.train_init.is_empty()),
+        ("--train-data", !opts.grad.train_data.is_empty()),
+        ("--train-save", !opts.grad.train_save.is_empty()),
+    ] {
+        if given {
+            emit_driver_error(
+                opts,
+                format!(
+                    "{flag} cannot be built into a `--train --emit={stage}` artifact: the \
+                     training executable reads and writes no files (run `wukongc --train` to use \
+                     {flag})"
+                ),
+            );
+            return exit::UNIMPLEMENTED;
+        }
+    }
+    let artifact = match build_train_artifact(program, interner, opts, lens) {
+        Ok(artifact) => artifact,
+        Err(e) => {
+            emit_driver_error(opts, format!("--train: {e}"));
+            return exit::COMPILE_ERROR;
+        }
+    };
+    // The same backend gate every other artifact gets (see `compile`), over the program that
+    // actually reaches Cranelift: the generated kernels, the dispatcher and the synthesized `main`.
+    timer.begin("verify");
+    if verify_or_ice(&artifact) {
+        return exit::COMPILE_ERROR;
+    }
+    // The training program is optimized at `-O1` at least (autodiff needs it), so it is code-
+    // generated at that floor too — the optimizing Cranelift configuration the `--train
+    // --backend=native` JIT compiles the same dispatcher with.
+    let mut aot = opts.clone();
+    aot.opt_level = opts.opt_level.max(1);
+    emit_native(&artifact, interner, &aot, timer)
+}
+
+/// The program a training artifact is code-generated from: [`build_training`]'s kernels, the
+/// dispatcher, the spec blob and the synthesized `main`. Verified before it is returned.
+fn build_train_artifact(
+    program: &wukong_mir::Program,
+    interner: &mut Interner,
+    opts: &Options,
+    lens: &[usize],
+) -> Result<wukong_mir::Program, String> {
+    use wukong_mir::{Builder, ExternFn, ExternParam, MirType, Op, StaticData};
+
+    let wrt = check_training(program, interner, opts, lens)?;
+    let TrainingBuild {
+        program: mut artifact,
+        spec,
+        entries,
+    } = build_training(program, interner, opts, lens, wrt)?;
+    let dispatcher = training_native::add_dispatcher(&mut artifact, interner, &entries)?;
+    let main = interner.intern("main");
+    let entry = interner.intern(TRAIN_MAIN);
+    for taken in [main, entry] {
+        if artifact.function(taken).is_some() {
+            return Err(format!(
+                "the training program already defines `{}`, which a training artifact's entry \
+                 needs; rename the loss function",
+                interner.resolve(taken)
+            ));
+        }
+    }
+    // The spec blob, under the first free `__wukong_train_spec_<n>`.
+    let blob = spec.encode();
+    let mut suffix = 0;
+    let spec_name = loop {
+        let candidate = interner.intern(&format!("__wukong_train_spec_{suffix}"));
+        if artifact.function(candidate).is_none()
+            && !artifact.statics.iter().any(|s| s.name == candidate)
+        {
+            break candidate;
+        }
+        suffix += 1;
+    };
+    artifact.statics.push(StaticData {
+        name: spec_name,
+        bytes: blob.clone(),
+    });
+    // `int wukong_rt_train_main(const uint8_t *spec, int64_t len, void (*dispatch)(float **, u64))`.
+    let param = |ty: MirType, signed: bool| ExternParam { ty, signed };
+    let decl = ExternFn {
+        name: entry,
+        params: vec![
+            param(MirType::Ptr, false),
+            param(MirType::I64, true),
+            param(MirType::Ptr, false),
+        ],
+        ret: param(MirType::I32, true),
+    };
+    match artifact.extern_fn(entry) {
+        Some(existing) if *existing != decl => {
+            return Err(format!(
+                "the program declares `extern \"C\" fn {TRAIN_MAIN}` with another signature"
+            ))
+        }
+        Some(_) => {}
+        None => artifact.externs.push(decl),
+    }
+    let mut b = Builder::new(main, MirType::I32);
+    let spec_ptr = b.build(MirType::Ptr, Op::GlobalAddr(spec_name));
+    let spec_len = b.build(MirType::I64, Op::ConstInt(blob.len() as i128, MirType::I64));
+    let dispatch = b.build(MirType::Ptr, Op::FuncAddr(dispatcher));
+    let code = b.build(
+        MirType::I32,
+        Op::Call {
+            func: entry,
+            args: vec![spec_ptr, spec_len, dispatch],
+        },
+    );
+    b.ret(Some(code));
+    artifact.funcs.push(b.finish());
+    wukong_opt::verify_program_stage(&artifact, "training artifact")
+        .map_err(|failure| failure.to_string())?;
+    Ok(artifact)
 }
 
 /// Print the MIR for `program`, running the verifier first. Any verifier failure is emitted as an

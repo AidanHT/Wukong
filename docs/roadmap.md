@@ -1142,8 +1142,9 @@ Reverse-mode autodiff transforms MIR for a single-block forward function returni
 scalar loss. `--emit=grad` prints its forward and backward MIR; `--train` runs the forward, backward
 and optimizer on the selected **interpreter or native Cranelift JIT** backend. The native path
 compiles one owning dispatcher and reuses it for forward, backward and generated AdamW calls.
-Training requires concrete f32 arrays or dense tensors with checked byte extents. An AOT training
-loop and generated-backward performance comparisons remain open. `--grad-of` selects
+Training requires concrete f32 arrays or dense tensors with checked byte extents. The loop itself
+is `wukong_runtime::train::run_training`, which `--train --emit=exe|obj` also bakes into an artifact
+(below). Generated-backward performance comparisons remain open. `--grad-of` selects
 the loss and `--grad-wrt` its differentiated buffers. Autodiff requires at least `-O1` for SSA
 construction; `-O2`/`-O3` retain the selected loss while still inlining calls and optimizing its body.
 Generated gradients receive the existing optimizer with an O1 minimum, matching forward
@@ -1206,8 +1207,20 @@ There is no CLI flag for second order yet.
 
 **Ahead of time.** `--emit=obj --grad-of=<fn>` exports `<fn>_grad` next to the forward in the
 object (C ABI: the loss's parameters, then one caller-zeroed gradient buffer per `--grad-wrt`
-entry), so a host training loop links the backward with no compiler at run time. An AOT
-*training loop* (`--train --emit=exe`) is still open. `--train-opt=sgd|adamw` selects the optimizer;
+entry), so a host training loop links the backward with no compiler at run time. **The training
+loop itself is AOT too:** `--train --emit=exe` links the forward, the backward, the fused AdamW
+kernels and a kernel dispatcher into an executable whose synthesized `main` calls the runtime's
+`wukong_rt_train_main` with a versioned `.rodata` spec blob (buffer sizes, weights, restored
+buffers, steps, rate, optimizer, seed, decay, clip, warmup, schedule) and the dispatcher's address.
+`wukongc --train` runs the very same `run_training` in process over the very same spec bytes, so
+the executable's stdout is byte-identical to it on the interpreter and the native JIT by
+construction; `crates/wukongc/tests/train_exe.rs` links five models (one of them printing from the loss) at
+`-O0`/`-O2` under SGD and AdamW and compares (20 of 20 on the rustc path). `--emit=obj` writes the object instead. Sharp
+edges: the executable reads and writes no files (`--train-init`/`--train-data`/`--train-save` with an
+artifact are refused, exit 2), and it needs the rustc + `wukong_runtime` rlib link (the C fallback
+has no training loop; refused by name, exit 2). What a loss prints now reaches stdout in process as
+well (it used to be captured and dropped), so the two agree there too. `--train-opt=sgd|adamw`
+selects the optimizer;
 `--train-weight-decay` accepts finite nonnegative AdamW decay (default zero) and rejects nonzero
 decay with SGD. **`--train` trains on data:** `--train-init=<i>=<path>` loads a buffer,
 `--train-data=<i>=<path>` streams a fixed input one batch per update (batch `s mod batches`, read from
@@ -1221,7 +1234,9 @@ before). Training remains a CLI loop — an in-language `grad_of` is a declared 
 layer, the cross-entropy head, a fanned-out reduction), the real-CLI `training_options` and
 `autodiff_cli` tests (the latter trains a GEMM + bias model on the interpreter and the native JIT and
 requires byte-identical trajectories at O0–O3) and the hand-derived `tests/run/autodiff_train_*.wk`
-trajectories cover the CLI. Generated-autodiff performance benchmarks remain absent.
+trajectories cover the CLI — among them `autodiff_train_mlp.wk`, a two-layer MLP (GEMM + bias +
+ReLU, GEMM + bias, mean squared error) whose three SGD steps were derived in Python under several
+f32 evaluation orders, every printed value at least 131 ULPs from a rounding boundary. Generated-autodiff performance benchmarks remain absent.
 
 A loss whose buffers are **raw `*T` / `*mut T` parameters** now differentiates. It previously could
 not: the front end gives a pointer parameter an `alloca ptr` + `store`, so its base reached autodiff

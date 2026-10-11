@@ -23,7 +23,8 @@ them, so the combination is rejected rather than silently discarding half the wo
 
 For a loss function with concrete f32 buffers, `--train --backend=native --train-opt=adamw`
 selects the CPU JIT trainer; `--backend=interp` selects the interpreter. Training prints a loss
-trajectory and rejects explicit `--emit` or `-o`. `--train-init=<i>=<path>`,
+trajectory; `--train --emit=exe -o train.exe` builds the loop into an executable that prints the
+same trajectory byte for byte (any other explicit `--emit` is rejected). `--train-init=<i>=<path>`,
 `--train-data=<i>=<path>` and `--train-save=<i>=<path>` load, stream and write buffers as raw
 little-endian f32 (the `read_f32`/`write_f32` layout); `--train-clip`, `--train-warmup` and
 `--train-schedule=cosine` set the update policy. See the

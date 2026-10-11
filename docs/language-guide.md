@@ -2162,7 +2162,9 @@ wukongc [OPTIONS] -e <source>    the program is the <source> argument itself
                       the scalar loss output). An index that is out of range, not a buffer
                       (pointer) parameter, or repeated is an error.
 --train               run a fwd→bwd→optimizer loop and print the loss trajectory
-                      interp or native JIT; concrete f32 buffers; incompatible with --emit/-o
+                      interp or native JIT; concrete f32 buffers. With --emit=exe|obj (or -o),
+                      build the loop into an executable/object that prints exactly that
+                      trajectory instead (not with --train-init/--train-data/--train-save)
 --train-steps=<n>     training steps                                       (default: 100)
 --train-lr=<f>        learning rate                                        (default: 0.01)
 --train-opt=<o>       sgd | adamw                                          (default: sgd)
@@ -2266,7 +2268,20 @@ names each of these when it differs from the default. Buffers are updated in pla
 runs on the live buffers, and only a buffer the forward itself writes is snapshotted and restored
 around it, so each step still sees its data and weights exactly as before the forward ran.
 
+**✅ AOT training loop:** `wukongc --train <flags> --emit=exe -o train.exe model.wk` builds the
+whole loop into an executable — the forward, its generated backward, the fused AdamW kernels and
+the loop that drives them — whose stdout is byte-identical to `wukongc --train <flags> model.wk` on
+the interpreter and on `--backend=native` (`--emit=obj` writes the object instead; `-o` alone means
+the default `exe` stage). The equality holds by construction: the executable's `main` calls the
+runtime's `wukong_rt_train_main` with the run's settings baked in, which runs the same loop and
+prints the same text the in-process run does (`crates/wukongc/tests/train_exe.rs` checks it on
+five models, at `-O0`/`-O2`, under SGD and AdamW). Linking it needs the rustc + `wukong_runtime`
+rlib path; the C fallback runtime has no training loop and is refused by name (exit 2). The
+executable reads and writes no files, so `--train-init`, `--train-data` and `--train-save` with an
+artifact are refused by name (exit 2) rather than dropped. Whatever the loss prints goes to stdout
+in both — once per update (the backward replays the forward) and once for the final forward, before
+the report.
+
 `--train --run` trains the selected loss without calling `main`. Combining `--train` with any
-explicit `--emit=<stage>` or `-o` is a usage error (exit 2). GPU training selectors are unsupported
-by this CPU trainer. An AOT training loop remains unavailable (the AOT *gradient* is above), and
-no training speedup is established by the correctness checks.
+other explicit `--emit=<stage>` is a usage error (exit 2). GPU training selectors are unsupported
+by this CPU trainer, and no training speedup is established by the correctness checks.
