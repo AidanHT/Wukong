@@ -15,7 +15,10 @@ import llvmlite.binding as llvm
 
 root = Path(sys.argv[1])
 paths = sorted(root.glob("*.ll"))
-assert len(paths) == 44, f"expected exactly 44 semantic regression modules, got {len(paths)}"
+# The 46 modules executed below are the saturating-conversion, FMA and bf16-narrowing regressions;
+# every other exported module (e.g. `lowp_fma`, which pins only its text) is parsed and verified.
+executed = [p for p in paths if p.stem.startswith(("sat_", "fma_", "bf16_"))]
+assert len(executed) == 46, f"expected exactly 46 executed regression modules, got {len(executed)}"
 llvm.initialize()
 llvm.initialize_native_target()
 llvm.initialize_native_asmprinter()
@@ -157,5 +160,42 @@ for source, ft in float_types.items():
             assert same_float(actual, case[3], source), (source, "vector", case, actual)
             fma_checks += 1
 
-print(f"LLVM {llvm.llvm_version_info}: {len(paths)} modules verified; "
-      f"{cast_checks} saturating conversion and {fma_checks} exact FMA JIT checks passed")
+
+
+def bf16_reference(bits):
+    """`wukong_runtime::f32_to_bf16_bits`, transcribed."""
+    if bits & 0x7FFFFFFF > 0x7F800000:
+        return ((bits >> 16) | 0x0040) & 0xFFFF
+    return ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16) & 0xFFFF
+
+
+bf16_samples = [
+    0x00000000, 0x80000000, 0x00000001, 0x807FFFFF, 0x3F800000, 0x3F808000, 0x3F818000,
+    0x3F808001, 0x3F807FFF, 0x7F7FFFFF, 0x7F7F8000, 0x7F7F7FFF, 0xFF7FFFFF, 0x7F800000,
+    0xFF800000, 0x7F800001, 0x7FBFFFFF, 0x7FC00000, 0xFFC12345, 0x7F80FFFF, 0xFF800001,
+    0x0000FFFF, 0x00008000, 0x00018000, 0x3DCCCCCD, 0xBDCCCCCD,
+]
+state = 0x9E3779B9
+for _ in range(4000):
+    state = (state * 6364136223846793005 + 1442695040888963407) & (2**64 - 1)
+    bf16_samples.append(state >> 32)
+bf16_checks = 0
+scalar = ctypes.CFUNCTYPE(ctypes.c_uint16, ctypes.c_void_p)(engine.get_function_address("bf16_bits"))
+vector = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p)(
+    engine.get_function_address("bf16_vec_bits")
+)
+for start in range(0, len(bf16_samples), 4):
+    lanes = (bf16_samples[start:start + 4] + [0] * 4)[:4]
+    ib, iv = aligned_array(ctypes.c_uint32, lanes)
+    ob, ov = aligned_array(ctypes.c_uint16, [0] * 4)
+    vector(iv, ov)
+    for k, x in enumerate(lanes):
+        cell = (ctypes.c_uint32 * 1)(x)
+        want = bf16_reference(x)
+        assert scalar(cell) == want, ("bf16_bits", hex(x), hex(scalar(cell)), hex(want))
+        assert ov[k] == want, ("bf16_vec_bits", hex(x), hex(ov[k]), hex(want))
+        bf16_checks += 2
+
+print(f"LLVM {llvm.llvm_version_info}: {len(paths)} modules verified ({len(executed)} executed); "
+      f"{cast_checks} saturating conversion, {fma_checks} exact FMA and {bf16_checks} bf16 "
+      "narrowing JIT checks passed")

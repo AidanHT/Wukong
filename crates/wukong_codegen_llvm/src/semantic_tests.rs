@@ -158,3 +158,60 @@ fn lowp_fma_computes_on_f32_registers() {
         assert!(!text.contains("half") && !text.contains("bfloat"), "{text}");
     }
 }
+
+/// bf16 narrowing is the runtime's integer rounding, spelled in IR (`narrow_half`), so a module
+/// needs no `__truncsfbf2`. `verify_semantics.py` runs both modules on every f32 bit pattern it
+/// samples (ties, carries into the exponent, infinities, signalling and quiet NaN payloads) and
+/// compares the stored bits with `wukong_runtime::f32_to_bf16_bits` transcribed. Inputs are read
+/// from memory so a NaN payload reaches the module bit-exact.
+#[test]
+fn bf16_narrowing_modules() {
+    let mut i = Interner::new();
+    // bf16_bits(src: *f32) -> i16: the stored bits of `(*src) as bf16`.
+    let mut b = Builder::new(i.intern("bf16_bits"), MirType::I16);
+    let src = b.add_param(MirType::Ptr);
+    let x = b.build(MirType::F32, Op::Load(src, MirType::F32));
+    let h = b.build(MirType::BF16, Op::Cast(CastKind::FpTrunc, x, MirType::BF16));
+    let slot = b.alloca(MirType::BF16);
+    b.build_void(Op::Store {
+        ptr: slot,
+        value: h,
+    });
+    let bits = b.build(MirType::I16, Op::Load(slot, MirType::I16));
+    b.ret(Some(bits));
+    let text = emit(b.finish(), &i);
+    assert!(text.contains("bitcast float %v1 to i32"), "{text}");
+    assert!(
+        !text
+            .lines()
+            .any(|l| l.contains("fptrunc") && l.contains("bfloat")),
+        "{text}"
+    );
+
+    // bf16_vec_bits(src: *[f32; 4], dst: *[i16; 4]): the same, four lanes at once.
+    let vf = MirType::Vec(Box::new(MirType::F32), 4);
+    let vh = MirType::Vec(Box::new(MirType::BF16), 4);
+    let vi = MirType::Vec(Box::new(MirType::I16), 4);
+    let mut b = Builder::new(i.intern("bf16_vec_bits"), MirType::Void);
+    let src = b.add_param(MirType::Ptr);
+    let dst = b.add_param(MirType::Ptr);
+    let x = b.build(vf.clone(), Op::Load(src, vf));
+    let h = b.build(vh.clone(), Op::Cast(CastKind::FpTrunc, x, vh.clone()));
+    let slot = b.alloca(vh);
+    b.build_void(Op::Store {
+        ptr: slot,
+        value: h,
+    });
+    let bits = b.build(vi.clone(), Op::Load(slot, vi));
+    b.build_void(Op::Store {
+        ptr: dst,
+        value: bits,
+    });
+    b.ret(None);
+    let text = emit(b.finish(), &i);
+    assert!(
+        text.contains("bitcast <4 x float> %v2 to <4 x i32>"),
+        "{text}"
+    );
+    assert!(text.contains("select <4 x i1>"), "{text}");
+}

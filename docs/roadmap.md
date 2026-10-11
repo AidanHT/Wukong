@@ -1622,9 +1622,12 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   Windows/Linux with AVX2 + FMA, fully gated; Tier 2 is aarch64 macOS/Linux (built and tested in CI,
   non-blocking, scalar runtime) and aarch64 Windows (`cargo check` only). `WUKONG_MAX_ISA`
   (`wukong_runtime::isa`) caps the runtime's ISA dispatch, and a Tier 1 lane runs the corpus with
-  `WUKONG_MAX_ISA=scalar`. Not yet capped: the Cranelift ISA flags the JIT itself compiles with.
-  `--emit=obj`
-  writes the object unchanged. The differential oracle remains `--run`.
+  `WUKONG_MAX_ISA=scalar`. The cap also narrows the Cranelift ISA flags the JIT and a `native`
+  object compile with (`scalar` is the x86-64 baseline), so with `--target-cpu=native` (the
+  default) `--emit=obj` is capped as well, while an explicit `--target-cpu` level ignores the cap.
+  On the scalar lane no code Wukong generates or dispatches to uses AVX; the C library still picks
+  its own paths (including the `fmaf`/`floorf` libcalls Cranelift makes below FMA/SSE4.1). The
+  differential oracle remains `--run`.
 - **A `mut` aggregate parameter aliases the caller's value — now opt-in.** Aggregate arguments
   (`struct`/array/tuple/tensor) are passed by pointer, the zero-copy tensor-kernel convention, so a
   callee that mutates one writes back into the caller's storage (copying every large buffer by value

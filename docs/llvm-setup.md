@@ -62,28 +62,46 @@ The module implements the interpreter's language, not LLVM's defaults:
   zero produce 0 and `INT_MIN / -1` wraps; shift counts are masked to the operand width — each is
   an explicit guard, because LLVM makes all three poison;
 - `f16`/`bf16` values are computed in `float` registers and rounded onto the half/bfloat grid only
-  at constants, `fpext`/`fptrunc`, loads and stores (the interpreter's round-at-store/cast/load
-  model) — so `half`/`bfloat` appear only as memory types;
+  at constants, casts, loads and stores (the interpreter's round-at-store/cast/load model) — so
+  `half`/`bfloat` appear only as memory types. An `f16` rounds with `fptrunc`; a `bf16` rounds with
+  the runtime's own integer arithmetic (`wukong_runtime::f32_to_bf16_bits`, NaN payloads included),
+  because LLVM's `fptrunc … to bfloat` is a call to `__truncsfbf2`, which neither the Rust runtime
+  link nor an MSVC link provides;
 - booleans occupy a byte in memory (`i8` storage, low bit significant), never LLVM's bit-packed
   `<n x i1>`;
+- a vector load or store promises only its lane's alignment (`align 4` for `<4 x float>`), because
+  the vectorizer accesses vectors at every element offset, and a stack slot has the native
+  backend's alignment (its size rounded to a power of two, at most 16 bytes, 32 from 32 bytes up);
 - float literals are spelled in LLVM's exact hexadecimal form, so infinities, NaNs, tiny values and
   decimals that are inexact in `float` are all valid IR.
 
-It names the host `target triple` (the layout is left to the consuming tool, which installs the
-target's own `datalayout`). Every external symbol it references is one the `--emit=exe` link already
-provides: `print`/`println`/`assert` lower to the same
-`wukong_rt_print_{i64,u64,f64,f32,bool,char,str}` / `wukong_rt_assert` ABI the Cranelift object
-calls (with the same argument widening; an `f32`, `f16` or `bf16` prints through
-`wukong_rt_print_f32` at `f32` precision), the formatting and process builtins call the
-`wukong_rt_fmt_*` / `wukong_rt_arg*` / `wukong_rt_env` / `wukong_rt_read_stdin` / `wukong_rt_exit`
-entries of `wukong_runtime` like any other runtime call, recognized
-kernels are called through the `wukong_runtime` C ABI (every integer argument widened to `i64`, an
-absent optional pointer passed as `ptr null`), and the general vectorizer's synthesized kernels — raw
-AVX2 bytes inside the Cranelift backend — are **defined in the module** from their backend-agnostic
-recipe, with the interpreter's exact element order and reduction reassociation. A construct that
-cannot be expressed faithfully (a `print` of a vector value, a bitcast to or from `f16`/`bf16`, two
-incompatible signatures for one external symbol) is refused with `C0001` and exit 2 rather than
-emitted wrong.
+It names the host's `target datalayout` and `target triple` (x86-64 Windows: `e-m:w-…` /
+`x86_64-pc-windows-msvc`; x86-64 Linux: `e-m:e-…` / `x86_64-unknown-linux-gnu`). The layout is the
+string LLVM 15–17 compute for the triple; LLVM 18 and later upgrade it on read to their own (they
+add `i128:128`), so the same module is exact for the LLVM 15 behind CI's `llvmlite` verifier and for
+the LLVM 19 `clang` installed below. Every external symbol it references is one the `--emit=exe`
+link already provides, **declared with the one signature it is defined with** — the link-ABI law,
+checked over the whole run corpus by `wukong_codegen_llvm`'s tests against the runtime's Rust
+sources:
+
+- `print`/`println`/`assert` lower to the same `wukong_rt_print_{i64,u64,f64,f32,bool,char,str}` /
+  `wukong_rt_assert` ABI the Cranelift object calls (with the same argument widening; an `f32`,
+  `f16` or `bf16` prints through `wukong_rt_print_f32` at `f32` precision);
+- every `wukong_*` runtime entry — recognized kernels, and the `wukong_rt_fmt_*` / `wukong_rt_arg*`
+  / `wukong_rt_env` / `wukong_rt_read_stdin` / `wukong_rt_exit` builtins — is declared from its
+  `#[no_mangle] extern "C"` definition in `wukong_runtime` (a generated table, never inferred from a
+  call site), and each argument is converted to its slot exactly as the Cranelift call converts it:
+  integers widened to `i64`, an absent optional pointer passed as `ptr null`;
+- the general vectorizer's synthesized kernels — raw AVX2 bytes inside the Cranelift backend — are
+  **defined in the module** from their backend-agnostic recipe in their own lane type (`f32`,
+  `f64`, `i32` or `i64`), with the interpreter's exact element order and reduction reassociation.
+
+A construct that cannot be expressed faithfully is refused with `C0001` and exit 2 rather than
+emitted wrong, and the message names its reason: `wukong_codegen_llvm::DECLINED` lists every one (a
+`print` of a vector value, a bitcast to or from `f16`/`bf16`, two incompatible signatures for one
+undeclared external symbol, an untyped external function address, a call no runtime definition can
+take, and two MIR invariant violations). No run-corpus program or example is refused; `emit.rs`
+holds that count at a ratchet of zero.
 
 ## Why textual IR (and not inkwell in-process)
 
@@ -113,10 +131,56 @@ wukongc --emit=llvm-ir -O2 examples/fib.wk > fib.ll   # textual IR
 clang -c -O2 fib.ll -o fib.o                            # compile with your LLVM tools
 ```
 
-`fib.o` then links exactly like the object `--emit=obj` writes: its only external symbols are the
-`wukong_rt_*` print/assert shims and the `wukong_*` runtime kernels, which the `--emit=exe` link
-supplies (the rustc-driven shim plus the `wukong_runtime` rlib, or the C runtime for a kernel-free
-program).
+`fib.ll` is this module (as printed on x86-64 Windows; `crates/wukongc/tests/emit.rs` fails if it
+drifts from what the compiler emits). At `-O2` the second recursive call has become the loop through
+`%bb3`, and `print` is the runtime's `i64` printer:
+
+<!-- emitted: wukongc --emit=llvm-ir -O2 examples/fib.wk -->
+```llvm
+; Wukong -> LLVM IR
+target datalayout = "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
+target triple = "x86_64-pc-windows-msvc"
+
+declare void @wukong_rt_print_i64(i64)
+
+define i32 @fib(i32 %v0) {
+bb0:
+  br label %bb3
+bb1:
+  %v19 = add i32 %v16, %v15
+  ret i32 %v19
+bb2:
+  %v8 = sub i32 %v15, 1
+  %v9 = call i32 @fib(i32 %v8)
+  %v12 = sub i32 %v15, 2
+  %v18 = add i32 %v16, %v9
+  br label %bb3
+bb3:
+  %v15 = phi i32 [ %v0, %bb0 ], [ %v12, %bb2 ]
+  %v16 = phi i32 [ 0, %bb0 ], [ %v18, %bb2 ]
+  %v4 = icmp sge i32 %v15, 2
+  br i1 %v4, label %bb2, label %bb1
+}
+
+define i32 @main() {
+bb0:
+  %v1 = call i32 @fib(i32 10)
+  %t0 = sext i32 %v1 to i64
+  call void @wukong_rt_print_i64(i64 %t0)
+  ret i32 0
+}
+```
+
+`fib.o` then links exactly like the object `--emit=obj` writes: its only external symbol is the
+`wukong_rt_print_i64` shim (a program with recognized kernels also references `wukong_*` runtime
+entries), which the `--emit=exe` link supplies (the rustc-driven shim plus the `wukong_runtime`
+rlib, or the C runtime for a kernel-free program).
+
+Beyond the module's own `declare`s, LLVM's code generator itself calls the C library for an
+intrinsic the target CPU has no instruction for: at the baseline x86-64 level `llvm.roundeven`,
+`llvm.floor`/`ceil`, `llvm.fma` and `half` conversions become calls to `roundevenf`, `floorf`/`ceilf`,
+`fmaf` and `__truncsfhf2`/`__extendhfsf2`. Compile with `-march=x86-64-v3` (or at least
+`-msse4.1 -mfma -mf16c`) to get instructions instead — the MSVC C runtime has no `roundevenf`.
 
 If you later want the in-process inkwell path, standardize on
 `inkwell = { version = "0.9", features = ["llvm19-1"] }` (note: LLVM 18+ use the `-1` feature

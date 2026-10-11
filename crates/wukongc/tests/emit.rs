@@ -1,9 +1,11 @@
 //! Smoke tests for every `--emit` stage.
 //!
 //! Front-end stages (`tokens`, `ast`) must succeed for every example and run-suite program. The
-//! lowering/codegen stages (`mir-high`, `mir`, `llvm-ir`) must succeed for the run-suite programs,
-//! which are all known to lower end to end. This guards the pretty-printers, the MIR verifier
-//! (which runs under `--emit=mir`), and the textual LLVM-IR emitter against regressions.
+//! lowering stages (`mir-high`, `mir`) must succeed for the run-suite programs, which are all known
+//! to lower end to end. This guards the pretty-printers and the MIR verifier (which runs under
+//! `--emit=mir`). The textual LLVM-IR emitter may refuse a construct it cannot express faithfully
+//! (`C0001`, exit 2, one of `wukong_codegen_llvm::DECLINED`), and how many corpus programs it
+//! refuses is a ratchet: [`LLVM_DECLINE_RATCHET`].
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -60,9 +62,24 @@ fn frontend_stages_succeed_for_all_sources() {
     }
 }
 
+/// The most `(program, -O level)` pairs of the run corpus and the examples that `--emit=llvm-ir`
+/// may refuse. It is a ratchet: lowering a refused construct lowers it, and raising it needs a
+/// `DECLINED` row that says why the construct has no faithful LLVM spelling. At 0, every program
+/// that compiles at all also emits a module.
+const LLVM_DECLINE_RATCHET: usize = 0;
+
+/// Did `--emit=llvm-ir` refuse (the backend's checked decline), as opposed to fail?
+fn llvm_declined(stderr: &str) -> bool {
+    stderr.contains("C0001") && stderr.contains("LLVM emission [")
+}
+
 #[test]
+// The ratchet compare stays a `<=` even while its bound is 0: raising the bound must not require
+// rewriting the check.
+#[allow(clippy::absurd_extreme_comparisons)]
 fn lowering_stages_succeed_for_run_suite() {
     let dir = repo_root().join("tests").join("run");
+    let mut declined: Vec<String> = Vec::new();
     // Exercise both unoptimized and fully optimized output: -O2 turns on mem2reg/LICM, so the MIR
     // verifier (run under --emit=mir) and the phi-emitting LLVM-IR backend are checked on the
     // optimized, block-parameter form too — not just the alloca-based -O0 form.
@@ -71,6 +88,10 @@ fn lowering_stages_succeed_for_run_suite() {
             for stage in ["mir-high", "mir", "llvm-ir"] {
                 let (ok, stdout, stderr) = emit_opt(f, stage, opt);
                 let name = f.file_name().unwrap().to_string_lossy();
+                if stage == "llvm-ir" && !ok && llvm_declined(&stderr) {
+                    declined.push(format!("{name} -O{opt}: {}", stderr.trim()));
+                    continue;
+                }
                 assert!(ok, "{name}: --emit={stage} -O{opt} failed:\n{stderr}");
                 assert!(
                     !stdout.trim().is_empty(),
@@ -83,5 +104,92 @@ fn lowering_stages_succeed_for_run_suite() {
                 );
             }
         }
+    }
+    // The examples too, wherever the front end lowers them (a few use surface the native lowering
+    // does not support yet; those fail with exit 1 before the LLVM stage and are not declines).
+    for f in &wk_files(&repo_root().join("examples")) {
+        let (ok, _, stderr) = emit_opt(f, "llvm-ir", 2);
+        if !ok && llvm_declined(&stderr) {
+            let name = f.file_name().unwrap().to_string_lossy();
+            declined.push(format!("{name} -O2: {}", stderr.trim()));
+        }
+    }
+    assert!(
+        declined.len() <= LLVM_DECLINE_RATCHET,
+        "{} --emit=llvm-ir refusals exceed the ratchet of {LLVM_DECLINE_RATCHET}:\n{}",
+        declined.len(),
+        declined.join("\n")
+    );
+}
+
+/// `docs/llvm-setup.md` shows the module `--emit=llvm-ir -O2 examples/fib.wk` prints, for readers
+/// to compile by hand; it must be exactly what the compiler emits. The `target` lines name the
+/// host, so they are compared only for shape.
+#[test]
+fn llvm_setup_doc_shows_the_emitted_fib_module() {
+    let doc = std::fs::read_to_string(repo_root().join("docs").join("llvm-setup.md")).unwrap();
+    let marker = "<!-- emitted: wukongc --emit=llvm-ir -O2 examples/fib.wk -->";
+    let start = doc
+        .find(marker)
+        .expect("the fib module block in docs/llvm-setup.md");
+    let block = doc[start + marker.len()..].trim_start();
+    let block = block.strip_prefix("```llvm").expect("an llvm fence");
+    let block = &block[..block.find("```").expect("a closing fence")];
+    let fib = repo_root().join("examples").join("fib.wk");
+    let (ok, emitted, stderr) = emit_opt(&fib, "llvm-ir", 2);
+    assert!(ok, "{stderr}");
+    let body = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|l| !l.starts_with("target ") && !l.trim().is_empty())
+            .map(|l| l.trim_end().to_string())
+            .collect()
+    };
+    assert_eq!(
+        body(block),
+        body(&emitted),
+        "docs/llvm-setup.md's fib module is stale; paste the current output"
+    );
+    // The doc shows the module an x86-64 Windows host prints: layout, then triple.
+    assert!(
+        block.contains("\ntarget datalayout = \"e-m:w-")
+            && block.contains("\ntarget triple = \"x86_64-pc-windows-msvc\""),
+        "{block}"
+    );
+    // The emitted module names THIS host, whatever it is; the exact lines per host are pinned by
+    // `wukong_codegen_llvm`'s `module_names_the_host_target`. An aarch64 host prints its own triple
+    // and no layout, so only the shape is host-independent: the `target` lines come first, the
+    // layout (if any) before the triple, and the triple's architecture is the host's.
+    let target: Vec<&str> = emitted
+        .lines()
+        .skip(1)
+        .take_while(|l| l.starts_with("target "))
+        .collect();
+    let layout = target
+        .iter()
+        .position(|l| l.starts_with("target datalayout = \""));
+    let triple = target
+        .iter()
+        .position(|l| l.starts_with("target triple = \""));
+    assert_eq!(
+        emitted.matches("\ntarget ").count(),
+        target.len(),
+        "{emitted}"
+    );
+    if let (Some(layout), Some(triple)) = (layout, triple) {
+        assert!(layout < triple, "{emitted}");
+    }
+    if let Some(triple) = triple {
+        let arch = format!("target triple = \"{}-", std::env::consts::ARCH);
+        assert!(target[triple].starts_with(&arch), "{emitted}");
+    }
+    // The Tier 1 hosts (x86-64 Windows MSVC, x86-64 Linux GNU) carry both lines.
+    if cfg!(all(
+        target_arch = "x86_64",
+        any(
+            all(target_os = "windows", target_env = "msvc"),
+            all(target_os = "linux", target_env = "gnu")
+        )
+    )) {
+        assert!(layout.is_some() && triple.is_some(), "{emitted}");
     }
 }

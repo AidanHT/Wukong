@@ -1,8 +1,14 @@
 """Verify emitted LLVM modules with llvm-as or the installed llvmlite verifier.
 
-Usage: python tools/verify_llvm_corpus.py --compiler target/debug/wukongc.exe
+Usage: python tools/verify_llvm_corpus.py --compiler target/debug/wukongc.exe --report out.json
 Requires llvm-as on PATH (or --llvm-as), or llvmlite. Missing tooling is an error.
-This checks IR structure, not executable semantics or runtime ABI compatibility.
+This checks IR structure, not executable semantics; the runtime ABI of every declaration is the
+link-ABI law in wukong_codegen_llvm's closeout tests.
+
+A module the compiler *declines* to emit (C0001, exit 2, an `LLVM emission [<reason>]` message
+from wukong_codegen_llvm::DECLINED) is counted separately from a verifier failure: the report's
+`declined` total is held to --max-declines (default 0, the ratchet crates/wukongc/tests/emit.rs
+also pins), while any failure fails the run.
 """
 
 import argparse
@@ -21,6 +27,7 @@ def main():
     parser.add_argument("--llvm-as")
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--report", type=Path, required=True)
+    parser.add_argument("--max-declines", type=int, default=0)
     args = parser.parse_args()
     compiler = args.compiler.resolve(strict=True)
     assembler = args.llvm_as or shutil.which("llvm-as")
@@ -67,6 +74,12 @@ def main():
                     [str(compiler), "--emit=llvm-ir", f"-O{opt}", str(fixture.resolve())],
                     cwd=args.root, env=env, capture_output=True, text=True, timeout=60,
                 )
+                if result.returncode == 2 and "LLVM emission [" in result.stderr:
+                    row["declined"] = True
+                    row["error"] = result.stderr.strip()
+                    print(f"DECLINED {fixture.name} -O{opt}: {row['error']}", file=sys.stderr)
+                    rows.append(row)
+                    continue
                 if result.returncode:
                     raise ValueError(f"compiler exit {result.returncode}: {result.stderr.strip()}")
                 if not result.stdout.strip():
@@ -82,13 +95,18 @@ def main():
         "compiler_sha256": hashlib.sha256(compiler.read_bytes()).hexdigest(),
         "verifier": verifier,
         "passed": sum(row["passed"] for row in rows),
-        "failed": sum(not row["passed"] for row in rows),
+        "failed": sum(not row["passed"] and not row.get("declined") for row in rows),
+        "declined": sum(bool(row.get("declined")) for row in rows),
+        "max_declines": args.max_declines,
         "rows": rows,
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    print(f"LLVM verification: {report['passed']} passed, {report['failed']} failed ({verifier})")
-    return 1 if report["failed"] else 0
+    print(
+        f"LLVM verification: {report['passed']} passed, {report['failed']} failed, "
+        f"{report['declined']} declined (ratchet {args.max_declines}) ({verifier})"
+    )
+    return 1 if report["failed"] or report["declined"] > args.max_declines else 0
 
 
 if __name__ == "__main__":

@@ -780,17 +780,44 @@ fn float_cc(op: CmpOp) -> FloatCC {
     }
 }
 
+/// The slot size from which a stack slot's base is 32-byte aligned: one YMM register. Below it the
+/// cap stays 16 bytes (the stack pointer's own alignment, so it costs nothing).
+const WIDE_SLOT_BYTES: u32 = 32;
+
+/// The run-time slack a wide slot is over-allocated by (see [`wide_slot_bytes`]).
+const WIDE_SLOT_SLACK: u32 = WIDE_SLOT_BYTES - 16;
+
 fn align_shift(bytes: u32) -> u8 {
-    // Align stack slots to their (rounded-up power-of-two) size, capped at 16 bytes. This is the
-    // slot BASE only — an interior address such as `base + 4` is not 16-byte aligned, which is why
-    // [`mem_flags`] must never set Cranelift's `aligned` bit.
+    // Align stack slots to their (rounded-up power-of-two) size, capped at 16 bytes — or at 32 for
+    // a slot of 32 bytes or more, so a 256-bit access to a local array never splits a cache line
+    // at its base. This is the slot BASE only — an interior address such as `base + 4` is not
+    // aligned, which is why [`mem_flags`] must never set Cranelift's `aligned` bit.
+    let cap = if bytes >= WIDE_SLOT_BYTES {
+        WIDE_SLOT_BYTES
+    } else {
+        16
+    };
     let mut a = 1u32;
     let mut shift = 0u8;
-    while a < bytes && a < 16 {
+    while a < bytes && a < cap {
         a <<= 1;
         shift += 1;
     }
     shift
+}
+
+/// The bytes a wide (`>= WIDE_SLOT_BYTES`) stack slot actually reserves.
+///
+/// Cranelift 0.124 lays slots out at their requested alignment *relative to the stack pointer*,
+/// which the x64 ABI aligns to 16 bytes only, and it never realigns a frame (`machinst/abi.rs`
+/// rounds slot offsets; the prologue never `and`s `rsp`). So a 32-byte request alone gives a
+/// 32-byte-aligned address only when the caller's stack happened to be — every other call depth
+/// it is 16 mod 32. The slot therefore reserves 16 bytes of slack, and the lowering rounds its
+/// address up to the next 32-byte boundary at run time (`(base + 16) & !31`, which stays inside the
+/// slot because the base is always 16-aligned). Saturating: an absurd size fails Cranelift's own
+/// frame limit instead of wrapping.
+fn wide_slot_bytes(bytes: u32) -> u32 {
+    bytes.saturating_add(WIDE_SLOT_SLACK)
 }
 
 // --- Per-function lowering ------------------------------------------------------------------
@@ -1103,12 +1130,29 @@ impl<'a> FnTranslator<'a> {
             }
             Op::Alloca { ty, .. } => {
                 let bytes = self.size_of_or_err(ty).max(1);
-                let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
-                    StackSlotKind::ExplicitSlot,
-                    bytes,
-                    align_shift(bytes),
-                ));
-                self.builder.ins().stack_addr(self.ptr_ty, slot, 0)
+                if bytes >= WIDE_SLOT_BYTES {
+                    // A 32-byte-aligned base needs a run-time round-up: see `wide_slot_bytes`.
+                    let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        wide_slot_bytes(bytes),
+                        align_shift(bytes),
+                    ));
+                    let base = self.builder.ins().stack_addr(self.ptr_ty, slot, 0);
+                    let bumped = self
+                        .builder
+                        .ins()
+                        .iadd_imm(base, i64::from(WIDE_SLOT_SLACK));
+                    self.builder
+                        .ins()
+                        .band_imm(bumped, -i64::from(WIDE_SLOT_BYTES))
+                } else {
+                    let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        bytes,
+                        align_shift(bytes),
+                    ));
+                    self.builder.ins().stack_addr(self.ptr_ty, slot, 0)
+                }
             }
             Op::Barrier => {
                 self.builder.ins().fence();
@@ -3130,7 +3174,9 @@ fn make_isa_full(
     flag_builder
         .set("probestack_strategy", "inline")
         .map_err(|e| e.to_string())?;
-    let isa_builder = target::isa_builder(target)?;
+    // `WUKONG_MAX_ISA` narrows `native` (read once per process by `wukong_runtime::isa::cap`), so
+    // every JIT and object entry point that targets the host inherits the cap from this one place.
+    let isa_builder = target::isa_builder(target, wukong_runtime::isa::cap())?;
     isa_builder
         .finish(settings::Flags::new(flag_builder))
         .map_err(|e| e.to_string())
@@ -6331,3 +6377,175 @@ mod backend_opt_tests;
 
 mod guarded_kernel;
 pub use guarded_kernel::{jit_compile_buffer_kernel, JitBufferKernel};
+
+/// P11.7: a stack slot of 32 bytes or more has a 32-byte-aligned base at every call depth, so a
+/// 256-bit access at its base never splits a cache line. The address is observable only in MIR
+/// (the language has no pointer-to-integer cast), so the probes are built by hand.
+#[cfg(test)]
+mod stack_slot_alignment_tests {
+    use super::*;
+    use wukong_mir::Builder;
+
+    /// `probe(d) -> i64`: allocate a wide slot of type `wide` and a 16-byte one, recurse `d` deep,
+    /// and sum one packed word per frame — bits 32.. the wide base's misalignment (`addr & 31`),
+    /// bits 16.. whether the small slot sat at 16 mod 32 (it is never realigned, so it reports the
+    /// stack pointer's parity), bits 0.. one per call. Two callers with different frame sizes run it
+    /// too, so the frames land at both parities whatever this function's own frame size is.
+    fn probe_program(wide: MirType) -> (Program, Interner, Symbol) {
+        let mut i = Interner::new();
+        let probe = i.intern("probe");
+        let print = i.intern("print");
+        let main = i.intern("main");
+        let mut program = Program::new();
+
+        let mut b = Builder::new(probe, MirType::I64);
+        let d = b.add_param(MirType::I64);
+        let wide_slot = b.alloca(wide);
+        let small_slot = b.alloca(MirType::Array(Box::new(MirType::I64), 2));
+        let c = |b: &mut Builder, v: i128| b.build(MirType::I64, Op::ConstInt(v, MirType::I64));
+        let zero = c(&mut b, 0);
+        b.build_void(Op::Store {
+            ptr: small_slot,
+            value: zero,
+        });
+        let wide_addr = b.build(
+            MirType::I64,
+            Op::Cast(CastKind::PtrToInt, wide_slot, MirType::I64),
+        );
+        let small_addr = b.build(
+            MirType::I64,
+            Op::Cast(CastKind::PtrToInt, small_slot, MirType::I64),
+        );
+        let m31 = c(&mut b, 31);
+        let m16 = c(&mut b, 16);
+        let mis = b.build(MirType::I64, Op::Bin(BinOp::And, wide_addr, m31));
+        let par = b.build(MirType::I64, Op::Bin(BinOp::And, small_addr, m16));
+        let s32 = c(&mut b, 32);
+        let s12 = c(&mut b, 12);
+        let mis_field = b.build(MirType::I64, Op::Bin(BinOp::Shl, mis, s32));
+        let par_field = b.build(MirType::I64, Op::Bin(BinOp::Shl, par, s12));
+        let one = c(&mut b, 1);
+        let word = b.build(MirType::I64, Op::Bin(BinOp::Or, mis_field, par_field));
+        let word = b.build(MirType::I64, Op::Bin(BinOp::Or, word, one));
+        let more = b.build(MirType::I1, Op::Cmp(CmpOp::Sgt, d, zero));
+        let deeper = b.new_block();
+        let leaf = b.new_block();
+        b.cond_br(more, deeper, vec![], leaf, vec![]);
+        b.switch_to(deeper);
+        let d1 = b.build(MirType::I64, Op::Bin(BinOp::Sub, d, one));
+        let rest = b.build(
+            MirType::I64,
+            Op::Call {
+                func: probe,
+                args: vec![d1],
+            },
+        );
+        let sum = b.build(MirType::I64, Op::Bin(BinOp::Add, rest, word));
+        b.ret(Some(sum));
+        b.switch_to(leaf);
+        b.ret(Some(word));
+        program.funcs.push(b.finish());
+
+        // Two pass-through callers whose own frames differ by 16 bytes (an 8- and a 24-byte slot).
+        let mut pads = Vec::new();
+        for (name, pad) in [("pad_a", 1u32), ("pad_b", 3)] {
+            let sym = i.intern(name);
+            let mut b = Builder::new(sym, MirType::I64);
+            let d = b.add_param(MirType::I64);
+            let slot = b.alloca(MirType::Array(Box::new(MirType::I64), pad));
+            b.build_void(Op::Store {
+                ptr: slot,
+                value: d,
+            });
+            let r = b.build(
+                MirType::I64,
+                Op::Call {
+                    func: probe,
+                    args: vec![d],
+                },
+            );
+            b.ret(Some(r));
+            program.funcs.push(b.finish());
+            pads.push(sym);
+        }
+
+        let mut b = Builder::new(main, MirType::I32);
+        let depth = b.build(MirType::I64, Op::ConstInt(6, MirType::I64));
+        let mut total = b.build(
+            MirType::I64,
+            Op::Call {
+                func: probe,
+                args: vec![depth],
+            },
+        );
+        for pad in pads {
+            let r = b.build(
+                MirType::I64,
+                Op::Call {
+                    func: pad,
+                    args: vec![depth],
+                },
+            );
+            total = b.build(MirType::I64, Op::Bin(BinOp::Add, total, r));
+        }
+        b.build_void(Op::Call {
+            func: print,
+            args: vec![total],
+        });
+        let ok = b.build(MirType::I32, Op::ConstInt(0, MirType::I32));
+        b.ret(Some(ok));
+        program.funcs.push(b.finish());
+        assert!(wukong_mir::verify::verify_program(&program).is_empty());
+        (program, i, main)
+    }
+
+    /// Run the probe natively and return (summed wide misalignment, frames at 16 mod 32, calls).
+    fn probe(wide: MirType) -> (i64, i64, i64) {
+        let (program, interner, main) = probe_program(wide);
+        let (code, out) = jit_run(&program, main, &interner).expect("jit");
+        assert_eq!(code, 0);
+        let total: i64 = String::from_utf8(out).unwrap().trim().parse().unwrap();
+        (total >> 32, (total >> 16) & 0xffff, total & 0xffff)
+    }
+
+    fn assert_aligned_at_both_parities(wide: MirType) {
+        let (misaligned, odd_frames, calls) = probe(wide.clone());
+        // 7 frames from `main`'s direct call plus 7 under each of the two pads.
+        assert_eq!(calls, 21, "{wide:?}");
+        // Not vacuous: the frames really sat at both 32-byte parities, so a merely 16-aligned base
+        // would have been misaligned in some of them.
+        assert!(
+            odd_frames > 0 && odd_frames < calls,
+            "{wide:?}: every frame had one parity ({odd_frames}/{calls}), so the probe proves nothing"
+        );
+        assert_eq!(
+            misaligned, 0,
+            "{wide:?}: a wide slot base was not 32-byte aligned"
+        );
+    }
+
+    #[test]
+    fn stack_slot_alignment_f32x8_local_is_32_byte_aligned() {
+        assert_aligned_at_both_parities(MirType::Array(Box::new(MirType::F32), 8));
+    }
+
+    #[test]
+    fn stack_slot_alignment_f64x16_local_is_32_byte_aligned() {
+        assert_aligned_at_both_parities(MirType::Array(Box::new(MirType::F64), 16));
+    }
+
+    /// The cap is per size class, and no access is ever *promised* aligned: interior addresses
+    /// (`base + 4`) are not, and Cranelift may fault on a broken `aligned` promise.
+    #[test]
+    fn stack_slot_alignment_caps_and_never_promises_aligned_access() {
+        assert_eq!(align_shift(1), 0);
+        assert_eq!(align_shift(8), 3);
+        assert_eq!(align_shift(16), 4);
+        assert_eq!(align_shift(24), 4, "below 32 bytes the cap stays 16");
+        assert_eq!(align_shift(32), 5);
+        assert_eq!(align_shift(128), 5, "the cap is 32 bytes");
+        assert_eq!(wide_slot_bytes(32), 48);
+        assert_eq!(wide_slot_bytes(u32::MAX), u32::MAX);
+        assert!(!mem_flags().aligned());
+    }
+}

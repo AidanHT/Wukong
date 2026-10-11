@@ -187,7 +187,17 @@ Two combinations are usage errors rather than silently discarded work: `--run` w
 `--error-format` — including native-backend failures, which `wukong_codegen_cranelift::classify_error`
 maps to `C0002` (a layout above 4 GiB), `C0001` (a by-design decline) or an internal-compiler-error
 diagnostic. `--target-cpu` fixes the Cranelift ISA level for `--emit=obj|exe` and the native JIT and,
-below x86-64-v3, builds the MIR without the raw-AVX2 recipes (`LowerOptions::vec_kernels`).
+below x86-64-v3, builds the MIR without the raw-AVX2 recipes (`LowerOptions::vec_kernels`). The default
+`native` level is the host's flags narrowed by `WUKONG_MAX_ISA` (`wukong_runtime::isa`, read once per
+process): `scalar` gives the x86-64 baseline, `avx2`/`avx2_vnni` at most x86-64-v3, `avx512` at most
+x86-64-v4, and no cap is host detection itself, so uncapped code bytes are unchanged
+(`target::capped_native_flags`, applied in `make_isa_full`, which every JIT and object entry reaches).
+A cap only removes flags; an explicit `--target-cpu` level is exact and ignores it. So in a
+`WUKONG_MAX_ISA=scalar` run no code Wukong generates or dispatches to uses AVX: not the runtime's
+dispatch, not the raw-AVX2 loop kernels, not Cranelift's own code. The C library is outside the cap
+and selects its own paths from the real CPU (glibc's IFUNC `memcpy`, and the `fmaf`/`floorf`/
+`nearbyintf` libcalls Cranelift emits for `fma` and rounding below FMA/SSE4.1), so the cap emulates
+a smaller machine for Wukong's code, not for the whole process.
 
 `--emit=check` returns after sema and the lints (lex, parse, imports, sema, lints; no MIR lowering),
 printing any lint warnings and exiting 0 when no error (or denied lint) was reported.
@@ -860,8 +870,13 @@ a cacheable store pays on a stream larger than the caches is the largest lever o
 loop; the choice is made inside the kernel at run time and only picks which store instruction writes
 the identical values (`WUKONG_P4_NO_NT=1` assembles only the cacheable form). There is deliberately no
 software prefetch: the hardware prefetchers already track unit-stride streams, and `gcc -O3` emits none
-either. Stack-slot alignment stays at 16: Cranelift aligns a slot's *offset* within a frame whose base
-is only 16-byte aligned, so a 32-byte request would not be honoured. A literal trip shorter than one
+either. A stack slot of 32 bytes or more has a 32-byte-aligned base (`align_shift` caps at 32 there,
+16 below), so the base of a local array never splits a cache line under a 256-bit access. A request
+alone would not do it: Cranelift aligns a slot's *offset* within a frame whose base is only 16-byte
+aligned and never realigns the stack, so such a slot reserves 16 bytes of slack and its address is
+rounded up at run time (`(base + 16) & !31`); `stack_slot_alignment_*` probe both stack parities and
+fail without the round-up. Interior addresses stay unaligned, so `mem_flags` still never sets
+`aligned`. A literal trip shorter than one
 register group keeps the inlined strips (the kernel could only be called with `n = 0`); a runtime
 trip always takes the kernel. `Op::VecKernelCall.kernel` is an index into the *owning* function's
 `vec_kernels` recipe table, not a `ValueId`, so a MIR pass that moves instructions between functions
@@ -963,6 +978,43 @@ fast-math flags. That is also why the mode survives inlining in both directions 
 separately rounded ops and a fast body's `Fma`s are already fixed in MIR when the inliner moves them.
 The driver refuses `--fp=strict` with `--emit=grad`/`--train`/`--emit=obj --grad-of` for the reason it refuses
 `WUKONG_NO_RECOGNIZE`: the VJP rules are keyed on recognized kernels.
+
+## Textual LLVM IR (`wukong_codegen_llvm`)
+
+`--emit=llvm-ir` prints a module that means what the interpreter means: unordered float `!=`, the
+guarded division/shift contracts, `f16`/`bf16` in `float` registers rounded at the same boundaries,
+booleans as bytes in memory. CI executes only regression modules (`verify_semantics.py`,
+`verify_math_specials.py`, under `llvmlite`), so what the corpus's modules promise is checked
+structurally:
+
+- **Target.** It names the host `target datalayout` and `target triple` (`host_target`): the LLVM
+  15–17 x86-64 layout strings, which LLVM 18+ upgrade on read, so one text serves CI's LLVM 15
+  `llvmlite` and a current `clang`.
+- **Link ABI.** Every `wukong_*` runtime symbol is declared from its `#[no_mangle] extern "C"`
+  definition — `src/runtime_abi.rs`, generated from `wukong_runtime`'s sources and checked equal to
+  them by `runtime_abi_table_is_the_runtime_source` (`WUKONG_UPDATE_RUNTIME_ABI=1` regenerates it) —
+  and each call converts its arguments to the declared slots as the Cranelift call does (integers
+  sign-extended to `i64`, a literal zero to `ptr null`, a narrower result truncated after). Inferring a
+  declaration from call sites made a pointer slot `i64` in any module whose calls all passed a null
+  bias. `link_abi_law_holds_on_the_run_corpus` lowers every run fixture at `-O0` and `-O2` and requires
+  each `wukong_*` declaration to equal its definition (print/assert against the `--emit=exe` link
+  shim) and every symbol to have one signature across its `define`, `declare` and calls. With opaque
+  pointers LLVM's verifier checks neither: the general vectorizer's f64/i32/i64 recipes were defined in
+  `float` and called as `double`/`i64`, and the corpus verified clean.
+- **Alignment.** A vector load or store carries `align <lane bytes>` — LLVM otherwise assumes the whole
+  vector's alignment, and the vectorizer accesses `<4 x float>` at every element offset, so executing
+  a module faulted in `movaps` — and a stack slot carries the native backend's alignment, which is
+  what makes an `[N x i8]` aggregate's naturally aligned field loads true.
+- **bf16 narrowing** is `wukong_runtime::f32_to_bf16_bits` spelled in integer IR (`narrow_half`), as
+  the native backend spells it in CLIF: `fptrunc … to bfloat` is a `__truncsfbf2` libcall no link
+  this project performs provides. `semantic_tests::bf16_narrowing_modules` exports a scalar and a
+  vector module that `verify_semantics.py` executes against the transcribed reference on 4000+ bit
+  patterns (ties, exponent carries, infinities, signalling and quiet NaN payloads).
+- **Declines.** A construct with no faithful spelling is refused with `C0001` and a tagged message
+  (`LLVM emission [<tag>]: …`); `DECLINED` lists every tag with its reason and
+  `every_decline_is_catalogued` triggers each one. Nothing in the run corpus or the examples declines;
+  `crates/wukongc/tests/emit.rs` holds that count at a ratchet of zero, and
+  `tools/verify_llvm_corpus.py` reports declines separately from verifier failures.
 
 ## Spelling canonicalization before recognition
 

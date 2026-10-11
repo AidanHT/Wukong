@@ -39,11 +39,18 @@
 //!
 //! `print`/`assert` are lowered exactly as the Cranelift object lowers them — to the
 //! `wukong_rt_print_{i64,u64,f64,str}` / `wukong_rt_assert` ABI with the same argument widening —
-//! and every `wukong_*` runtime kernel is called with its real C ABI (every integer argument
-//! widened to `i64`, a literal-zero optional pointer passed as `ptr null`). The general vectorizer's
-//! synthesized kernels, which the Cranelift backend installs as raw AVX2 bytes, are *defined* in the
-//! module from their backend-agnostic recipe (see [`vec_kernels`]). So the only external symbols a
-//! module references are the ones the AOT link already provides.
+//! and every `wukong_*` runtime kernel is declared with the C signature `wukong_runtime` *defines*
+//! it with (the generated `runtime_abi` table, kept equal to the runtime's `#[no_mangle] extern
+//! "C"` sources by a test), each argument converted to its slot the way the Cranelift call converts
+//! it (integers widened to `i64`, a literal-zero optional pointer passed as `ptr null`). The general
+//! vectorizer's synthesized kernels, which the Cranelift backend installs as raw AVX2 bytes, are
+//! *defined* in the module from their backend-agnostic recipe, in all four lane types (see
+//! [`vec_kernels`]). So the only external symbols a module references are the ones the AOT link
+//! already provides, each with the one signature it is defined with — the link-ABI law
+//! `closeout_tests` checks over the whole run corpus.
+//!
+//! The module names the host's `target triple` and `target datalayout` (see `host_target`), and
+//! what it cannot express faithfully it refuses with a tagged reason from [`DECLINED`].
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -56,7 +63,62 @@ use wukong_mir::{
 };
 use wukong_span::{Interner, Symbol};
 
+mod runtime_abi;
 mod vec_kernels;
+
+// The tag each refusal's message carries (`LLVM emission [<tag>]: …`), one per [`DECLINED`] row.
+const DECLINE_VECTOR_PRINT: &str = "vector-print";
+const DECLINE_HALF_BITCAST: &str = "half-bitcast";
+const DECLINE_SIGNATURES: &str = "incompatible-signatures";
+const DECLINE_FUNC_ADDR: &str = "untyped-function-address";
+const DECLINE_RUNTIME_ABI: &str = "runtime-abi";
+const DECLINE_VEC_KERNEL: &str = "vector-kernel";
+const DECLINE_MATH_TYPE: &str = "non-float-math";
+
+/// Every construct [`try_emit_llvm_ir`] refuses — `C0001`, exit 2 — with why no faithful LLVM
+/// spelling exists. Every refusal message starts `LLVM emission [<tag>]:` with one of these tags,
+/// and `closeout_tests::every_decline_is_catalogued` triggers each row and checks both directions.
+///
+/// What is *not* here is the point: half/bfloat narrowing and widening (`fptrunc`/`fpext`), every
+/// lane operation (`insertelement`/`extractelement`/`shufflevector`, splats, widen/narrow), the
+/// general vectorizer's kernels in all four lane types and every `wukong_runtime` call are lowered.
+pub const DECLINED: &[(&str, &str)] = &[
+    (
+        DECLINE_VECTOR_PRINT,
+        "a print of a vector value: the runtime's print ABI takes one scalar, the native backend \
+         has no vector print, and the language cannot spell one (explicit SIMD types do not lower)",
+    ),
+    (
+        DECLINE_HALF_BITCAST,
+        "a bitcast to or from f16/bf16: the oracle defines no such reinterpretation (a half value \
+         lives in an f32 register, and mir_build spells its bits through an f32 bitcast instead), \
+         so any IR would invent a meaning",
+    ),
+    (
+        DECLINE_SIGNATURES,
+        "two different call signatures for one external symbol the program does not declare: one \
+         `declare` cannot type both, and an LLVM call through a mismatched type is undefined",
+    ),
+    (
+        DECLINE_FUNC_ADDR,
+        "the address of an external function no call site or `extern \"C\"` declaration types: \
+         there is no signature to declare it with",
+    ),
+    (
+        DECLINE_RUNTIME_ABI,
+        "a call that cannot be adapted to its `wukong_runtime` C definition (arity, a float of the \
+         other width, a vector argument, or a result the definition does not return)",
+    ),
+    (
+        DECLINE_VEC_KERNEL,
+        "a vector kernel recipe that fails `VecKernel::validate`, is not registered, or whose call \
+         disagrees with its result type: a MIR invariant violation, not a missing lowering",
+    ),
+    (
+        DECLINE_MATH_TYPE,
+        "sqrt/round/fma on a non-float type: a MIR invariant violation the verifier also rejects",
+    ),
+];
 
 /// For each block, the incoming edges as `(predecessor block id, arguments passed)`. Used to build
 /// phi nodes for block parameters.
@@ -143,39 +205,56 @@ pub fn emit_llvm_ir(program: &Program, interner: &Interner) -> String {
     try_emit_llvm_ir(program, interner).expect("unsupported MIR in textual LLVM emission")
 }
 
-/// The target triple the module is tagged with: the compiling host's, which is also what the
-/// Cranelift object and the AOT runtime link are built for. No `target datalayout` is written —
-/// `llc`, `opt` and `clang` all install the target's own layout for a module that names a triple,
-/// and a hand-maintained layout string drifts with every LLVM release.
-fn host_triple() -> Option<&'static str> {
+/// The x86-64 data layout of a COFF (Windows) target: `m:w` is its symbol mangling.
+const DATALAYOUT_X86_64_COFF: &str =
+    "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128";
+/// The x86-64 data layout of an ELF (Linux) target.
+const DATALAYOUT_X86_64_ELF: &str =
+    "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128";
+/// The x86-64 data layout of a Mach-O (macOS) target.
+const DATALAYOUT_X86_64_MACHO: &str =
+    "e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128";
+
+/// The `target triple` and `target datalayout` the module is tagged with: the compiling host's,
+/// which is also what the Cranelift object and the AOT runtime link are built for. An aarch64 host
+/// keeps its triple but no layout (the consuming tool installs the target's own), as before the
+/// layout was written; an unknown host gets neither line.
+///
+/// The layouts are the strings LLVM 15-17 compute for each triple (LLVM 15 is what CI's `llvmlite`
+/// verifier runs). LLVM 18 added `-i128:128` to x86-64; its IR reader upgrades an older x86-64
+/// layout string in place (`UpgradeDataLayoutString`), so the same text is exact for LLVM 15 and
+/// for the LLVM 19 `clang` that `docs/llvm-setup.md` installs, where a layout already carrying
+/// `i128:128` would be one an LLVM 15 backend rejects as foreign. Pinned per host by
+/// `module_names_the_host_target`.
+fn host_target() -> Option<(&'static str, Option<&'static str>)> {
     if cfg!(all(
         target_arch = "x86_64",
         target_os = "windows",
         target_env = "msvc"
     )) {
-        Some("x86_64-pc-windows-msvc")
+        Some(("x86_64-pc-windows-msvc", Some(DATALAYOUT_X86_64_COFF)))
     } else if cfg!(all(
         target_arch = "x86_64",
         target_os = "windows",
         target_env = "gnu"
     )) {
-        Some("x86_64-pc-windows-gnu")
+        Some(("x86_64-pc-windows-gnu", Some(DATALAYOUT_X86_64_COFF)))
     } else if cfg!(all(
         target_arch = "x86_64",
         target_os = "linux",
         target_env = "gnu"
     )) {
-        Some("x86_64-unknown-linux-gnu")
+        Some(("x86_64-unknown-linux-gnu", Some(DATALAYOUT_X86_64_ELF)))
     } else if cfg!(all(
         target_arch = "aarch64",
         target_os = "linux",
         target_env = "gnu"
     )) {
-        Some("aarch64-unknown-linux-gnu")
+        Some(("aarch64-unknown-linux-gnu", None))
     } else if cfg!(all(target_arch = "x86_64", target_os = "macos")) {
-        Some("x86_64-apple-darwin")
+        Some(("x86_64-apple-darwin", Some(DATALAYOUT_X86_64_MACHO)))
     } else if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
-        Some("aarch64-apple-darwin")
+        Some(("aarch64-apple-darwin", None))
     } else {
         None
     }
@@ -188,7 +267,10 @@ pub fn try_emit_llvm_ir(program: &Program, interner: &Interner) -> Result<String
     let declarations = declarations(program, interner, &defined)?;
     let mut out = String::new();
     out.push_str("; Wukong -> LLVM IR\n");
-    if let Some(triple) = host_triple() {
+    if let Some((triple, layout)) = host_target() {
+        if let Some(layout) = layout {
+            let _ = writeln!(out, "target datalayout = \"{layout}\"");
+        }
         let _ = writeln!(out, "target triple = \"{triple}\"");
     }
     out.push('\n');
@@ -376,6 +458,41 @@ fn mem_ty(t: &MirType) -> String {
     }
 }
 
+/// The bytes one value of `t` occupies in memory (a boolean is a byte), as the native backend lays
+/// it out.
+fn mem_size(t: &MirType) -> u64 {
+    match t {
+        MirType::I1 | MirType::I8 => 1,
+        MirType::I16 | MirType::F16 | MirType::BF16 => 2,
+        MirType::I32 | MirType::F32 => 4,
+        MirType::I64 | MirType::F64 | MirType::Ptr => 8,
+        MirType::Vec(e, n) | MirType::Array(e, n) => mem_size(e).saturating_mul(u64::from(*n)),
+        MirType::Void => 0,
+    }
+}
+
+/// A stack slot's alignment: its size rounded up to a power of two, capped at 16 bytes, or at 32
+/// for a slot of 32 bytes or more — exactly the native backend's `align_shift`. An aggregate lives
+/// in an `[N x i8]` buffer, whose LLVM default alignment is 1; without this its 8-byte fields
+/// would be loaded with an alignment the slot never promised.
+fn alloca_align(t: &MirType) -> u64 {
+    let size = mem_size(t).max(1);
+    let cap = if size >= 32 { 32 } else { 16 };
+    size.next_power_of_two().min(cap)
+}
+
+/// The explicit alignment of a vector load or store: one lane. LLVM assumes a vector's own
+/// (whole-register) alignment otherwise, but the vectorizer reads and writes vectors at any element
+/// offset of an array (`base + 4*i`), so an implicit `align 16` would be a false promise — and a
+/// `movaps` that faults on the first odd iteration. A scalar access keeps its natural (default)
+/// alignment, which every Wukong layout honours.
+fn vector_align(t: &MirType) -> String {
+    match t {
+        MirType::Vec(lane, _) => format!(", align {}", mem_size(lane)),
+        _ => String::new(),
+    }
+}
+
 /// The type of a runtime-kernel argument slot: integers are widened to the runtime's `i64`.
 fn runtime_param_ty(t: &MirType) -> String {
     if t.is_int() {
@@ -440,18 +557,8 @@ fn declarations(
     for f in &program.funcs {
         for kernel in &f.vec_kernels {
             vec_kernels::check(kernel)?;
-            let (fma, sqrt) = vec_kernels::intrinsics(kernel);
-            if fma {
-                required.push((
-                    "llvm.fma.f32".into(),
-                    ("float".into(), vec!["float".into(); 3]),
-                ));
-            }
-            if sqrt {
-                required.push((
-                    "llvm.sqrt.f32".into(),
-                    ("float".into(), vec!["float".into()]),
-                ));
+            for (name, ty, arity) in vec_kernels::intrinsics(kernel) {
+                required.push((name, (ty.into(), vec![ty.into(); arity])));
             }
         }
         for inst in f.blocks.iter().flat_map(|b| &b.insts) {
@@ -469,7 +576,7 @@ fn declarations(
                                 && args.first().is_some_and(|a| f.value_type(*a).is_vector())
                             {
                                 return Err(format!(
-                                    "LLVM emission: `{name}` of a vector value has no runtime ABI"
+                                    "LLVM emission [{DECLINE_VECTOR_PRINT}]: `{name}` of a vector value has no runtime ABI"
                                 ));
                             }
                             Some((
@@ -477,15 +584,38 @@ fn declarations(
                                 ("void".into(), vec![intrinsic.param().into()]),
                             ))
                         }
-                        Callee::Runtime => Some((
-                            name,
-                            (
-                                ret,
-                                args.iter()
-                                    .map(|a| runtime_param_ty(f.value_type(*a)))
-                                    .collect(),
-                            ),
-                        )),
+                        // A symbol `wukong_runtime` defines is declared with its definition's C
+                        // signature — never one inferred from a call site, which typed a slot from
+                        // whatever one program happened to pass (a literal-zero bias made a pointer
+                        // slot `i64` in one module and `ptr` in the next).
+                        Callee::Runtime => match runtime_abi(&name) {
+                            Some((def_ret, def_params)) => {
+                                check_runtime_call(
+                                    f,
+                                    &name,
+                                    def_ret,
+                                    def_params,
+                                    args,
+                                    inst.result,
+                                )?;
+                                Some((
+                                    name,
+                                    (
+                                        def_ret.to_owned(),
+                                        def_params.iter().map(|p| (*p).to_owned()).collect(),
+                                    ),
+                                ))
+                            }
+                            None => Some((
+                                name,
+                                (
+                                    ret,
+                                    args.iter()
+                                        .map(|a| runtime_param_ty(f.value_type(*a)))
+                                        .collect(),
+                                ),
+                            )),
+                        },
                         Callee::Foreign => Some((
                             name,
                             (ret, args.iter().map(|a| reg_ty(f.value_type(*a))).collect()),
@@ -521,15 +651,26 @@ fn declarations(
                     ))
                 }
                 Op::Cast(CastKind::Bitcast, v, to) if is_half(f.value_type(*v)) || is_half(to) => {
-                    return Err(
-                        "LLVM emission: a bitcast to or from f16/bf16 has no f32-register meaning"
-                            .into(),
-                    );
+                    return Err(format!(
+                        "LLVM emission [{DECLINE_HALF_BITCAST}]: a bitcast to or from f16/bf16 \
+                         has no f32-register meaning"
+                    ));
                 }
                 Op::VecKernelCall { kernel, .. } => {
-                    if f.vec_kernels.get(*kernel as usize).is_none() {
+                    let Some(recipe) = f.vec_kernels.get(*kernel as usize) else {
                         return Err(format!(
-                            "LLVM emission: vector kernel #{kernel} of `{}` is not registered",
+                            "LLVM emission [{DECLINE_VEC_KERNEL}]: vector kernel #{kernel} of `{}` is not registered",
+                            interner.resolve(f.name)
+                        ));
+                    };
+                    // The call and the in-module definition must agree on the result: nothing for an
+                    // elementwise recipe, one lane value for a reduction.
+                    let expected = recipe.reduce.map(|_| recipe.lane.mir_type());
+                    let got = inst.result.map(|r| f.value_type(r).clone());
+                    if got.is_some() && got != expected {
+                        return Err(format!(
+                            "LLVM emission [{DECLINE_VEC_KERNEL}]: vector kernel #{kernel} of `{}` returns {expected:?}, \
+                             but its call expects {got:?}",
                             interner.resolve(f.name)
                         ));
                     }
@@ -571,7 +712,7 @@ fn declarations(
                 }
             }
             if previous != &sig {
-                return Err(format!("LLVM emission: incompatible call signatures for `{name}`: {previous:?} and {sig:?}; an explicit ABI adapter is required"));
+                return Err(format!("LLVM emission [{DECLINE_SIGNATURES}]: incompatible call signatures for `{name}`: {previous:?} and {sig:?}; an explicit ABI adapter is required"));
             }
         } else {
             signatures.insert(name, sig);
@@ -582,7 +723,7 @@ fn declarations(
             if let Op::FuncAddr(sym) = inst.op {
                 if !signatures.contains_key(interner.resolve(sym)) {
                     return Err(format!(
-                        "LLVM emission: cannot infer signature of external function `{}`",
+                        "LLVM emission [{DECLINE_FUNC_ADDR}]: cannot infer signature of external function `{}`",
                         interner.resolve(sym)
                     ));
                 }
@@ -604,6 +745,81 @@ fn declarations(
     Ok(signatures)
 }
 
+/// The C signature `(result, parameters)` `wukong_runtime` defines `name` with, in LLVM types — the
+/// generated [`runtime_abi::RUNTIME_ABI`] table, which `runtime_abi_table_is_the_runtime_source`
+/// keeps equal to the runtime's `#[no_mangle] extern "C"` definitions.
+fn runtime_abi(name: &str) -> Option<(&'static str, &'static [&'static str])> {
+    let table = runtime_abi::RUNTIME_ABI;
+    table
+        .binary_search_by(|(symbol, ..)| (*symbol).cmp(name))
+        .ok()
+        .map(|i| (table[i].1, table[i].2))
+}
+
+/// The LLVM integer types a runtime slot or result can have.
+fn is_int_slot(ty: &str) -> bool {
+    matches!(ty, "i1" | "i8" | "i16" | "i32" | "i64")
+}
+
+/// The bit width of an LLVM integer type spelled `iN`.
+fn int_bits(ty: &str) -> u32 {
+    ty.strip_prefix('i')
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(64)
+}
+
+/// The type in a declared slot or result, without its `signext`/`zeroext`/`noalias` attribute.
+fn abi_base(slot: &str) -> &str {
+    slot.split_whitespace()
+        .find(|t| !matches!(*t, "signext" | "zeroext" | "noalias"))
+        .unwrap_or(slot)
+}
+
+/// Can this call be adapted to `name`'s runtime definition `def_ret (def_params)`? An integer or
+/// pointer argument converts to the definition's integer or pointer slot exactly as the Cranelift
+/// call converts it (sign-extended, a pointer as its address); a float must already have the slot's
+/// width, and a used result must be one the definition returns. Anything else is a call no
+/// faithful IR exists for, refused as [`DECLINE_RUNTIME_ABI`].
+fn check_runtime_call(
+    f: &Function,
+    name: &str,
+    def_ret: &str,
+    def_params: &[&str],
+    args: &[ValueId],
+    result: Option<ValueId>,
+) -> Result<(), String> {
+    let decline = |why: String| {
+        Err(format!(
+            "LLVM emission [{DECLINE_RUNTIME_ABI}]: `{name}` is defined as `{def_ret} ({})` by \
+             wukong_runtime, but {why}",
+            def_params.join(", ")
+        ))
+    };
+    let fits = |slot: &str, t: &MirType| {
+        if is_int_slot(slot) || slot == "ptr" {
+            t.is_int() || *t == MirType::Ptr
+        } else {
+            matches!(slot, "float" | "double") && !t.is_vector() && reg_ty(t) == slot
+        }
+    };
+    if args.len() != def_params.len() {
+        return decline(format!("the call passes {} arguments", args.len()));
+    }
+    for (k, (a, slot)) in args.iter().zip(def_params).enumerate() {
+        let t = f.value_type(*a);
+        if !fits(slot, t) {
+            return decline(format!("argument {k} is `{}`", reg_ty(t)));
+        }
+    }
+    if let Some(r) = result {
+        let t = f.value_type(r);
+        if def_ret == "void" || !fits(def_ret, t) {
+            return decline(format!("the call expects a `{}` result", reg_ty(t)));
+        }
+    }
+    Ok(())
+}
+
 /// One `extern "C"` parameter or result as an LLVM type, with the `signext`/`zeroext` attribute a
 /// sub-32-bit integer needs under the C ABI (written after a parameter type, before a result type).
 fn extern_abi(p: &wukong_mir::ExternParam, is_ret: bool) -> String {
@@ -623,7 +839,11 @@ fn math_intrinsic(op: &Op, ty: &MirType) -> Result<String, String> {
     let suffix = match ty.lane_type() {
         MirType::F32 => "f32",
         MirType::F64 => "f64",
-        _ => return Err(format!("LLVM emission: floating intrinsic on {ty:?}")),
+        _ => {
+            return Err(format!(
+                "LLVM emission [{DECLINE_MATH_TYPE}]: floating intrinsic on {ty:?}"
+            ))
+        }
     };
     let suffix = match ty {
         MirType::Vec(_, n) => format!("v{n}{suffix}"),
@@ -879,16 +1099,58 @@ impl Emitter<'_> {
         grid: &MirType,
     ) -> String {
         let lane = grid.lane_type().clone();
-        let narrow = match reg {
-            MirType::Vec(_, n) => MirType::Vec(Box::new(lane), *n),
-            _ => lane,
-        };
-        let (reg, narrow) = (llvm_ty(reg), llvm_ty(&narrow));
-        let t = self.fresh();
+        let narrow = llvm_ty(&match reg {
+            MirType::Vec(_, n) => MirType::Vec(Box::new(lane.clone()), *n),
+            _ => lane.clone(),
+        });
+        let t = self.narrow_half(out, value, reg, &lane);
         let w = self.fresh();
-        let _ = writeln!(out, "  {t} = fptrunc {reg} {value} to {narrow}");
-        let _ = writeln!(out, "  {w} = fpext {narrow} {t} to {reg}");
+        let _ = writeln!(out, "  {w} = fpext {narrow} {t} to {}", llvm_ty(reg));
         w
+    }
+
+    /// Narrow the `f32`-register value `value` (register type `reg`: `float` or `<n x float>`) to
+    /// `lane` (`F16` or `BF16`), returning the `half`/`bfloat` operand.
+    ///
+    /// An `f16` is LLVM's own `fptrunc` (round to nearest even: F16C's `vcvtps2ph`, or the
+    /// `__truncsfhf2` builtin Rust's `compiler_builtins` provides to the AOT link). A `bf16` is the
+    /// runtime's own integer rounding, `wukong_runtime::f32_to_bf16_bits` — add `0x7fff` plus the
+    /// surviving low bit and keep the top half, or keep a NaN's top half with the quiet bit forced —
+    /// which is also what the native backend emits. LLVM's `fptrunc … to bfloat` is a call to
+    /// `__truncsfbf2` instead, a symbol neither the Rust runtime link nor an MSVC link provides.
+    fn narrow_half(&self, out: &mut String, value: &str, reg: &MirType, lane: &MirType) -> String {
+        let shape = |l: MirType| match reg {
+            MirType::Vec(_, n) => MirType::Vec(Box::new(l), *n),
+            _ => l,
+        };
+        let (reg_t, narrow_t) = (llvm_ty(reg), llvm_ty(&shape(lane.clone())));
+        let t = self.fresh();
+        if *lane != MirType::BF16 {
+            let _ = writeln!(out, "  {t} = fptrunc {reg_t} {value} to {narrow_t}");
+            return t;
+        }
+        let word = shape(MirType::I32);
+        let (w, h, c) = (
+            llvm_ty(&word),
+            llvm_ty(&shape(MirType::I16)),
+            llvm_ty(&shape(MirType::I1)),
+        );
+        let k = |v: i64| int_literal(&word, v);
+        let _ = writeln!(out, "  {t}.bits = bitcast {reg_t} {value} to {w}");
+        let _ = writeln!(out, "  {t}.nan = fcmp uno {reg_t} {value}, {value}");
+        let _ = writeln!(out, "  {t}.top = lshr {w} {t}.bits, {}", k(16));
+        let _ = writeln!(out, "  {t}.lsb = and {w} {t}.top, {}", k(1));
+        let _ = writeln!(out, "  {t}.bias = add {w} {t}.lsb, {}", k(0x7fff));
+        let _ = writeln!(out, "  {t}.sum = add {w} {t}.bits, {t}.bias");
+        let _ = writeln!(out, "  {t}.rne = lshr {w} {t}.sum, {}", k(16));
+        let _ = writeln!(out, "  {t}.qnan = or {w} {t}.top, {}", k(0x40));
+        let _ = writeln!(
+            out,
+            "  {t}.pick = select {c} {t}.nan, {w} {t}.qnan, {w} {t}.rne"
+        );
+        let _ = writeln!(out, "  {t}.half = trunc {w} {t}.pick to {h}");
+        let _ = writeln!(out, "  {t} = bitcast {h} {t}.half to {narrow_t}");
+        t
     }
 
     fn emit_inst(&self, out: &mut String, inst: &wukong_mir::Inst) {
@@ -967,7 +1229,11 @@ impl Emitter<'_> {
                     self.operand(*r)
                 )
             }
-            Op::Alloca { ty, .. } => format!("{res}alloca {}", mem_ty(ty)),
+            // The native backend's slot alignment (see `alloca_align`): it is what makes a
+            // byte-buffer aggregate's naturally aligned fields actually aligned.
+            Op::Alloca { ty, .. } => {
+                format!("{res}alloca {}, align {}", mem_ty(ty), alloca_align(ty))
+            }
             Op::Cmp(op, l, r) => {
                 let opty = self.ty(*l);
                 let (instr, pred) = cmp_instr(*op);
@@ -1062,10 +1328,14 @@ impl Emitter<'_> {
                     // interpreter's load does).
                     let mem = mem_ty(ty);
                     let widen = if is_half(ty) { "fpext" } else { "trunc" };
-                    let _ = writeln!(out, "  %v{r}.mem = load {mem}, ptr {ptr}");
+                    let _ = writeln!(
+                        out,
+                        "  %v{r}.mem = load {mem}, ptr {ptr}{}",
+                        vector_align(ty)
+                    );
                     format!("{res}{widen} {mem} %v{r}.mem to {}", reg_ty(ty))
                 } else {
-                    format!("{res}load {}, ptr {ptr}", llvm_ty(ty))
+                    format!("{res}load {}, ptr {ptr}{}", llvm_ty(ty), vector_align(ty))
                 }
             }
             Op::Store { ptr, value } => {
@@ -1076,12 +1346,16 @@ impl Emitter<'_> {
                 if is_half(vt) || vt.lane_type() == &MirType::I1 {
                     // Round to the stored grid (or widen a boolean to its byte) and store narrow.
                     let mem = mem_ty(vt);
-                    let narrow = if is_half(vt) { "fptrunc" } else { "zext" };
-                    let t = self.fresh();
-                    let _ = writeln!(out, "  {t} = {narrow} {reg} {v} to {mem}");
-                    format!("store {mem} {t}, ptr {p}")
+                    let t = if is_half(vt) {
+                        self.narrow_half(out, &v, &reg_mir(vt), vt.lane_type())
+                    } else {
+                        let t = self.fresh();
+                        let _ = writeln!(out, "  {t} = zext {reg} {v} to {mem}");
+                        t
+                    };
+                    format!("store {mem} {t}, ptr {p}{}", vector_align(vt))
                 } else {
-                    format!("store {reg} {v}, ptr {p}")
+                    format!("store {reg} {v}, ptr {p}{}", vector_align(vt))
                 }
             }
             Op::Gep { ptr, index, elem } => {
@@ -1312,12 +1586,15 @@ impl Emitter<'_> {
             } => {
                 // The synthesized vector kernel, defined in this module from its recipe (see
                 // `vec_kernels`). The element count is zero-extended, as the Cranelift call does.
+                // The call carries the definition's own result type (the lane type of a reduction,
+                // checked against the MIR result in `declarations`), even when the value is unused.
                 let count = self.to_i64(out, *n, false);
+                let recipe = &self.f.vec_kernels[*kernel as usize];
                 format!(
                     "{res}call {} @{}(ptr {}, ptr {}, i64 {count})",
-                    inst.result
-                        .map(|r| self.ty(r))
-                        .unwrap_or_else(|| "void".into()),
+                    recipe
+                        .reduce
+                        .map_or("void", |_| vec_kernels::lane_ty(recipe.lane)),
                     vec_kernels::kernel_symbol(self.interner.resolve(self.f.name), *kernel),
                     self.operand(*ptrs),
                     self.operand(*scalars),
@@ -1473,8 +1750,11 @@ impl Emitter<'_> {
         let _ = writeln!(out, "  call void @{}({arg})", intrinsic.symbol());
     }
 
-    /// A `wukong_*` runtime kernel call with the C ABI the runtime exports: integer arguments
-    /// sign-extended to `i64` (booleans zero-extended), a literal-zero optional pointer as `ptr null`.
+    /// A `wukong_*` runtime kernel call with the C ABI the runtime exports, converting each argument
+    /// to its declared slot as the Cranelift call does: integers sign-extended (booleans
+    /// zero-extended) to an integer slot, a literal zero passed to a pointer slot as `ptr null` and
+    /// any other integer there as its `inttoptr`, a pointer to an integer slot as its address. The
+    /// call always carries the declaration's result type; a narrower MIR result is converted after.
     fn emit_runtime_call(
         &self,
         out: &mut String,
@@ -1484,21 +1764,87 @@ impl Emitter<'_> {
         args: &[ValueId],
     ) {
         let name = self.interner.resolve(func);
-        let slots = self.declarations.get(name).map(|s| &s.1);
+        let declared = self.declarations.get(name);
+        let slots = declared.map(|s| &s.1);
         let mut argstr: Vec<String> = Vec::with_capacity(args.len());
         for (k, a) in args.iter().enumerate() {
-            let slot = slots.and_then(|s| s.get(k)).map(String::as_str);
+            let slot = slots.and_then(|s| s.get(k)).map(|s| abi_base(s));
             let ty = self.mir(*a);
-            argstr.push(if slot == Some("ptr") && ty.is_int() {
-                "ptr null".to_string()
-            } else if ty.is_int() {
-                format!("i64 {}", self.to_i64(out, *a, true))
-            } else {
-                format!("{} {}", self.ty(*a), self.operand(*a))
+            argstr.push(match slot {
+                Some("ptr") if ty.is_int() => {
+                    if self.consts.get(&a.0).is_some_and(|c| c == "0") {
+                        "ptr null".to_string()
+                    } else {
+                        let wide = self.to_i64(out, *a, true);
+                        let t = self.fresh();
+                        let _ = writeln!(out, "  {t} = inttoptr i64 {wide} to ptr");
+                        format!("ptr {t}")
+                    }
+                }
+                Some(int) if is_int_slot(int) && (ty.is_int() || *ty == MirType::Ptr) => {
+                    format!("{int} {}", self.int_to(out, *a, int))
+                }
+                _ if ty.is_int() => format!("i64 {}", self.to_i64(out, *a, true)),
+                _ => format!("{} {}", self.ty(*a), self.operand(*a)),
             });
         }
-        let ret = result.map(|r| self.ty(r)).unwrap_or_else(|| "void".into());
-        let _ = writeln!(out, "  {res}call {ret} @{name}({})", argstr.join(", "));
+        let args = argstr.join(", ");
+        let Some(r) = result else {
+            let ret = declared.map_or("void", |s| abi_base(&s.0));
+            let _ = writeln!(out, "  call {ret} @{name}({args})");
+            return;
+        };
+        let want = self.ty(r);
+        let ret = declared.map_or(want.as_str(), |s| abi_base(&s.0));
+        if ret == want {
+            let _ = writeln!(out, "  {res}call {ret} @{name}({args})");
+            return;
+        }
+        // The definition returns a different integer/pointer width than the MIR result (checked in
+        // `check_runtime_call`): take its value, then narrow, widen or reinterpret it.
+        let _ = writeln!(out, "  %v{}.ret = call {ret} @{name}({args})", r.0);
+        let conv = if ret == "ptr" {
+            "ptrtoint"
+        } else if want == "ptr" {
+            "inttoptr"
+        } else if int_bits(ret) > int_bits(&want) {
+            "trunc"
+        } else {
+            "sext"
+        };
+        let _ = writeln!(out, "  {res}{conv} {ret} %v{}.ret to {want}", r.0);
+    }
+
+    /// An integer or pointer value converted to the integer type `int` (`i1`..`i64`): sign-extended
+    /// (a boolean zero-extended) or truncated, a pointer through its address. Returns the operand.
+    fn int_to(&self, out: &mut String, v: ValueId, int: &str) -> String {
+        let ty = self.mir(v).clone();
+        let from = match &ty {
+            MirType::Ptr => {
+                let wide = self.to_i64(out, v, true);
+                if int == "i64" {
+                    return wide;
+                }
+                let t = self.fresh();
+                let _ = writeln!(out, "  {t} = trunc i64 {wide} to {int}");
+                return t;
+            }
+            other => llvm_ty(other),
+        };
+        let (have, want) = (int_bits(&from), int_bits(int));
+        if have == want {
+            return self.operand(v);
+        }
+        let op = if have > want {
+            "trunc"
+        } else if ty == MirType::I1 {
+            "zext"
+        } else {
+            "sext"
+        };
+        let t = self.fresh();
+        let _ = writeln!(out, "  {t} = {op} {from} {} to {int}", self.operand(v));
+        t
     }
 
     fn emit_integer_div(

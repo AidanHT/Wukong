@@ -123,12 +123,65 @@ impl TargetCpu {
     }
 }
 
-/// The ISA builder for `target`: host detection for `native`, otherwise exactly the level's flags.
-pub(crate) fn isa_builder(target: TargetCpu) -> Result<cranelift_codegen::isa::Builder, String> {
+/// The x64 settings [`TargetCpu::Native`] generates code with under a `WUKONG_MAX_ISA` cap
+/// (`wukong_runtime::isa::MAX_ISA_ENV`), given the settings the host reports, or `None` for no cap.
+///
+/// `None` means host detection exactly as before the cap existed (`cranelift_native::builder`), so
+/// an uncapped build emits byte-identical code. A cap keeps only the host flags its level allows:
+/// `scalar` the x86-64 baseline (no optional flag), `avx2` (and `avx2_vnni`, which adds nothing
+/// Cranelift uses) x86-64-v3, `avx512` x86-64-v4. Like the runtime's probes, a cap can only take an
+/// extension away — it never enables one the host lacks, which would be a `#UD`. This is the third
+/// reader of the cap, beside the runtime's dispatchers and the raw-AVX2 loop kernels
+/// (`wukong_mir::host_supports_vec_kernels`): without it a capped run still JIT-compiled every CLIF
+/// loop with VEX/AVX2/FMA encodings, so the "scalar lane" executed AVX instructions.
+pub(crate) fn capped_native_flags(
+    host: &[&'static str],
+    cap: wukong_runtime::isa::IsaLevel,
+) -> Option<Vec<&'static str>> {
+    use wukong_runtime::isa::IsaLevel;
+    let allowed: &[&str] = match cap {
+        IsaLevel::Native => return None,
+        IsaLevel::Scalar => &[],
+        IsaLevel::Avx2 | IsaLevel::Avx2Vnni => V3,
+        IsaLevel::Avx512 => V4,
+    };
+    Some(
+        host.iter()
+            .copied()
+            .filter(|flag| allowed.contains(flag))
+            .collect(),
+    )
+}
+
+/// The capped level flags this host reports (x86-64-v4 is the superset of every level's flags, so
+/// this is everything a cap can keep).
+fn host_level_flags() -> Vec<&'static str> {
+    V4.iter().copied().filter(|flag| host_has(flag)).collect()
+}
+
+/// The ISA builder for `target`: host detection for `native` (narrowed by `cap`, see
+/// [`capped_native_flags`]), otherwise exactly the level's flags. An explicit level is a request
+/// for an exact, host-independent feature set (an AOT target), so the cap does not touch it.
+pub(crate) fn isa_builder(
+    target: TargetCpu,
+    cap: wukong_runtime::isa::IsaLevel,
+) -> Result<cranelift_codegen::isa::Builder, String> {
     use cranelift_codegen::settings::Configurable;
 
-    let Some(flags) = target.x86_flags() else {
-        return cranelift_native::builder().map_err(|e| e.to_string());
+    let capped;
+    let flags: &[&str] = match target.x86_flags() {
+        Some(flags) => flags,
+        None => match capped_native_flags(&host_level_flags(), cap) {
+            None => return cranelift_native::builder().map_err(|e| e.to_string()),
+            // Off x86-64 the cap has nothing to narrow: host detection stands.
+            Some(_) if !cfg!(target_arch = "x86_64") => {
+                return cranelift_native::builder().map_err(|e| e.to_string());
+            }
+            Some(flags) => {
+                capped = flags;
+                &capped
+            }
+        },
     };
     if !cfg!(target_arch = "x86_64") {
         return Err(format!(
@@ -205,5 +258,100 @@ pub(crate) fn check_vec_kernels(
             interner.resolve(f.name)
         )),
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! N46: `WUKONG_MAX_ISA` narrows the `native` target's Cranelift flags. The mapping is a pure
+    //! function of (host flags, cap), so it is tested with explicit caps and synthetic hosts; the
+    //! ISA built from a cap is then read back to show the flags reach Cranelift.
+    use super::*;
+    use cranelift_codegen::settings::{self, Configurable};
+    use wukong_runtime::isa::IsaLevel;
+
+    /// The value of the boolean x64 setting `name` in a finished ISA.
+    fn isa_flag(isa: &dyn cranelift_codegen::isa::TargetIsa, name: &str) -> bool {
+        isa.isa_flags()
+            .iter()
+            .find(|v| v.name == name)
+            .and_then(|v| v.as_bool())
+            .unwrap_or_else(|| panic!("no boolean x64 setting `{name}`"))
+    }
+
+    fn finish(
+        builder: cranelift_codegen::isa::Builder,
+    ) -> std::sync::Arc<dyn cranelift_codegen::isa::TargetIsa> {
+        let mut flags = settings::builder();
+        flags.set("opt_level", "speed").unwrap();
+        builder.finish(settings::Flags::new(flags)).unwrap()
+    }
+
+    #[test]
+    fn target_cap_scalar_is_the_baseline_on_every_host() {
+        // A host that reports every level flag still gets none of them under `scalar`.
+        assert_eq!(capped_native_flags(V4, IsaLevel::Scalar), Some(vec![]));
+        if !cfg!(target_arch = "x86_64") {
+            return;
+        }
+        let isa = finish(isa_builder(TargetCpu::Native, IsaLevel::Scalar).unwrap());
+        for flag in ["has_avx", "has_avx2", "has_fma", "has_sse41", "has_avx512f"] {
+            assert!(!isa_flag(&*isa, flag), "scalar cap left `{flag}` on");
+        }
+    }
+
+    #[test]
+    fn target_cap_avx2_never_enables_avx512() {
+        let capped = capped_native_flags(V4, IsaLevel::Avx2).unwrap();
+        assert_eq!(
+            capped,
+            V3.to_vec(),
+            "avx2 on an AVX-512 host is exactly x86-64-v3"
+        );
+        assert_eq!(capped_native_flags(V4, IsaLevel::Avx2Vnni).unwrap(), V3);
+        assert!(capped.iter().all(|f| !f.starts_with("has_avx512")));
+        assert_eq!(capped_native_flags(V4, IsaLevel::Avx512).unwrap(), V4);
+        if !cfg!(target_arch = "x86_64") {
+            return;
+        }
+        let isa = finish(isa_builder(TargetCpu::Native, IsaLevel::Avx2).unwrap());
+        for flag in ["has_avx512f", "has_avx512dq", "has_avx512vl"] {
+            assert!(!isa_flag(&*isa, flag), "avx2 cap left `{flag}` on");
+        }
+        // Below the cap, the host's own answer stands.
+        for flag in ["has_avx", "has_avx2", "has_fma"] {
+            assert_eq!(isa_flag(&*isa, flag), host_has(flag), "{flag}");
+        }
+    }
+
+    /// A cap only ever removes: it never claims an extension the host does not report.
+    #[test]
+    fn target_cap_never_exceeds_the_host() {
+        let host = ["has_sse3", "has_ssse3", "has_popcnt"];
+        for cap in [IsaLevel::Avx2, IsaLevel::Avx2Vnni, IsaLevel::Avx512] {
+            assert_eq!(capped_native_flags(&host, cap).unwrap(), host, "{cap:?}");
+        }
+        assert_eq!(capped_native_flags(&[], IsaLevel::Avx512), Some(vec![]));
+    }
+
+    /// No cap is host detection itself, untouched — the guarantee that an uncapped build's code
+    /// bytes did not change (`determinism.rs` pins the bytes across processes).
+    #[test]
+    fn target_without_a_cap_is_todays_host_detection() {
+        assert_eq!(capped_native_flags(V4, IsaLevel::Native), None);
+        let uncapped = finish(isa_builder(TargetCpu::Native, IsaLevel::Native).unwrap());
+        let host = finish(cranelift_native::builder().unwrap());
+        let render = |isa: &dyn cranelift_codegen::isa::TargetIsa| {
+            isa.isa_flags()
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(render(&*uncapped), render(&*host));
+        // An explicit level ignores the cap: it is an exact AOT feature set.
+        if cfg!(target_arch = "x86_64") {
+            let v3 = finish(isa_builder(TargetCpu::X86_64V3, IsaLevel::Scalar).unwrap());
+            assert!(isa_flag(&*v3, "has_avx2") && isa_flag(&*v3, "has_fma"));
+        }
     }
 }
