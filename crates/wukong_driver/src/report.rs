@@ -301,7 +301,9 @@ impl Drop for PassTimer {
 
 /// What the compile was asked to do, for the report header.
 fn mode_name(opts: &Options) -> String {
-    if opts.grad.train {
+    if opts.grad.train && opts.grad.train_artifact {
+        format!("--train --emit={:?}", opts.emit).to_lowercase()
+    } else if opts.grad.train {
         "--train".to_string()
     } else if opts.run {
         format!("--run, backend {:?}", opts.backend).to_lowercase()
@@ -326,7 +328,8 @@ fn json_escape(s: &str) -> String {
 }
 
 /// The file a `--depfile` rule names as its target: the artifact this compile writes (`--emit=obj`
-/// or `--emit=exe`, at `-o` or its default name), or — for a mode that writes no artifact — the
+/// or `--emit=exe`, at `-o` or its default name — a `--train --emit=obj|exe` training artifact
+/// included), or — for a mode that writes no artifact (`--run`, an in-process `--train`) — the
 /// dependency file itself, so a build system still reruns the command when an input changes.
 pub(crate) fn depfile_target(opts: &Options, depfile: &Path) -> PathBuf {
     let stem = opts
@@ -334,7 +337,7 @@ pub(crate) fn depfile_target(opts: &Options, depfile: &Path) -> PathBuf {
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "out".to_string());
-    if opts.run || opts.grad.train {
+    if opts.run || (opts.grad.train && !opts.grad.train_artifact) {
         return depfile.to_path_buf();
     }
     match opts.emit {
@@ -423,6 +426,24 @@ mod tests {
         opts.emit = EmitStage::Exe;
         opts.run = true;
         assert_eq!(depfile_target(&opts, dep), dep);
+        // `--train` runs in process and writes no artifact; `--train --emit=exe|obj` (or `-o`)
+        // builds one, and that artifact is the rule's target, at `-o` or its default name.
+        opts.run = false;
+        opts.grad.train = true;
+        assert_eq!(depfile_target(&opts, dep), dep);
+        opts.grad.train_artifact = true;
+        assert_eq!(
+            depfile_target(&opts, dep),
+            PathBuf::from(format!("prog{}", std::env::consts::EXE_SUFFIX))
+        );
+        opts.output = Some(PathBuf::from("build/train.exe"));
+        assert_eq!(depfile_target(&opts, dep), PathBuf::from("build/train.exe"));
+        opts.emit = EmitStage::Obj;
+        opts.output = None;
+        assert_eq!(depfile_target(&opts, dep), PathBuf::from("prog.o"));
+        assert_eq!(mode_name(&opts), "--train --emit=obj");
+        opts.grad.train_artifact = false;
+        assert_eq!(mode_name(&opts), "--train");
     }
 
     #[test]

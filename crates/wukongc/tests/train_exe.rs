@@ -374,3 +374,36 @@ fn train_exe_refuses_file_options_by_name() {
     }
     let _ = std::fs::remove_dir_all(&scratch);
 }
+
+/// `--depfile` names the training artifact as its rule's target, exactly as for any other
+/// `--emit=obj|exe` build — a Make rule naming the depfile would never rebuild the artifact when an
+/// input changes, and ninja (`deps = gcc`) rejects a depfile that does not mention its output. An
+/// in-process `--train` writes no artifact, so its rule names the depfile itself, as `--run` does.
+#[test]
+fn train_artifact_depfile_names_the_artifact() {
+    let scratch = std::env::temp_dir()
+        .join("wukong_train_exe_depfile")
+        .join(std::process::id().to_string());
+    std::fs::create_dir_all(&scratch).expect("create the scratch directory");
+    let (source, args) = fixture_case("autodiff_train_sumsq.wk");
+    let rule = |extra: &[&str], depfile: &str| {
+        let flag = format!("--depfile={depfile}");
+        let mut all: Vec<&str> = extra.to_vec();
+        all.push(&flag);
+        let out = wukongc(&scratch, &args, &all, &source);
+        assert!(
+            out.status.success(),
+            "{extra:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::read_to_string(scratch.join(depfile)).expect("read the depfile")
+    };
+    // `--emit=obj` writes only the object (no link), so this needs no toolchain.
+    let named = rule(&["--emit=obj", "-o", "train.o"], "named.d");
+    assert!(named.starts_with("train.o:"), "{named}");
+    let default = rule(&["--emit=obj"], "default.d");
+    assert!(default.starts_with("autodiff_train_sumsq.o:"), "{default}");
+    let in_process = rule(&[], "run.d");
+    assert!(in_process.starts_with("run.d:"), "{in_process}");
+    let _ = std::fs::remove_dir_all(&scratch);
+}

@@ -16,7 +16,9 @@ All notable changes to Wukong are documented here. The format is loosely based o
   the interpreter and the native JIT by construction (`crates/wukongc/tests/train_exe.rs`: five
   models, `-O0`/`-O2`, SGD and AdamW with clip/warmup/cosine). `--train-init`, `--train-data` and
   `--train-save` with an artifact, and a link without the rustc + runtime rlib path, are refused by
-  name (exit 2). Every existing `--train` trajectory prints the same bytes.
+  name (exit 2). Every existing `--train` trajectory prints the same bytes. `--depfile` names the
+  training artifact (at `-o` or its default name) as its rule's target, as for any other
+  `--emit=obj|exe` build; an in-process `--train` still names the depfile itself.
 - **`--train` prints what the loss prints.** A `print` in a loss function was captured and dropped
   on both backends; it now reaches stdout as each kernel call returns (once per update, since the
   backward replays the forward, and once for the final forward), before the report — where the
