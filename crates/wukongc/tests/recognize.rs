@@ -600,10 +600,11 @@ fn every_recognizer_dependent_program_agrees_with_its_generic_lowering() {
 /// both counts turns that from invisible into a failure with a name.
 #[test]
 fn the_recognizer_dependent_corpus_holds_its_floor() {
-    /// Corpus programs whose MIR loses a `wukong_*` call when the instrument is set. Measured.
-    const PROGRAM_FLOOR: usize = 184;
-    /// Distinct kernels those programs reach between them.
-    const KERNEL_FLOOR: usize = 91;
+    /// Corpus programs whose MIR loses a `wukong_*` call when the instrument is set. Measured: 184
+    /// when this floor was introduced, 241 (of 517) when the `cov4_*` coverage fixtures landed.
+    const PROGRAM_FLOOR: usize = 241;
+    /// Distinct kernels those programs reach between them. Measured: 91, then 141 with `cov4_*`.
+    const KERNEL_FLOOR: usize = 141;
 
     let census = corpus_census();
     let programs = census
@@ -637,19 +638,20 @@ fn the_recognizer_dependent_corpus_holds_its_floor() {
 // The emittable-vs-emitted census (P12.4).
 //
 // `wukong_mir_build` interns a large set of `wukong_*` runtime symbols it CAN lower a nest to. Only
-// some of them fire anywhere in `tests/run`; the rest are live emit sites with no corpus witness —
-// and the campaign's audit found the uncovered set is dominated by the `_parallel` twins, whose only
+// some of them fired anywhere in `tests/run`; the rest were live emit sites with no corpus witness —
+// and the campaign's audit found the uncovered set was dominated by the `_parallel` twins, whose only
 // difference from their covered serial form is chunking and pool routing (so a `_parallel` kernel can
 // be wrong in a way its serial twin is not, with nothing to catch it). A `_parallel` kernel is also
 // the arm the autodiff mirror rule is weakest on.
 //
-// This is the EXPLICIT CENSUS the campaign asked for in place of one fixture per family (adding those
-// fixtures is the corpus's job, and needs hand-derived every-lane values). It records membership so
-// the blind spot is written down rather than implicit, and floors the two surfaces so a catastrophic
-// loss of emit sites or corpus coverage fails by name. It deliberately makes NO assertion about the
-// composition of the never-emitted set: this harness scans only `tests/run`, while the audit measured
-// `tests/run` + `examples` + `bench/kernels`, so a serial symbol covered only by an example would
-// appear uncovered here — a scope artefact, not a regression. The breakdown is printed for the reader.
+// Until wave 4 this census only RECORDED the never-emitted set (46 `_parallel` twins when it was
+// last printed, every one of them uncovered). The `tests/run/cov4_par_*.wk` fixtures now give each
+// of those symbols — and the five decode-builtin twins the old single-file scan could not see — a
+// `@parallel` program that emits it and prints every lane against hand-derived values, so the census
+// is now a GATE: an emittable symbol that no `tests/run` program emits fails here by name, unless it
+// is listed in `NEVER_EMITTED_ALLOWLIST` with the reason it cannot be witnessed. Scope: `tests/run`
+// only, deliberately. A kernel exercised only by `examples/` or `bench/kernels` has no hand-derived
+// every-lane expectation behind it, which is exactly the coverage this gate exists to demand.
 // -------------------------------------------------------------------------------------------------
 
 /// Runtime symbols that are not recognized kernels: the timer and the generic `@parallel` outliner,
@@ -659,44 +661,66 @@ fn is_support(sym: &str) -> bool {
     sym.starts_with("wukong_rt_") || sym == "wukong_now_ns" || sym == "wukong_parallel_for"
 }
 
-/// Every `wukong_*` symbol `wukong_mir_build` interns, extracted textually from its source (the same
-/// discipline as `runtime_surface_tests.rs` and the diagnostic-catalogue scan: the intern sites are
-/// string literals, so a textual pass is faithful and needs no compile).
+/// Emittable kernels the `tests/run` corpus is allowed NOT to emit, each with the reason it cannot be
+/// witnessed by a fixture. Empty: every emittable symbol has a witness. An entry is a written-down
+/// exception, not a to-do list — it must name why no program can reach the symbol (a target the
+/// test host lacks, a builtin with no surface spelling yet), and the gate below fails on an entry
+/// that has gone stale (the symbol is no longer emittable, or a fixture now emits it).
+const NEVER_EMITTED_ALLOWLIST: &[(&str, &str)] = &[];
+
+/// Every `wukong_*` symbol `wukong_mir_build` interns, extracted textually from every source file of
+/// the crate (the same discipline as `runtime_surface_tests.rs` and the diagnostic-catalogue scan: the
+/// intern sites are string literals, so a textual pass is faithful and needs no compile). It used to
+/// read `lib.rs` alone, which silently dropped the decode builtins' intern table
+/// (`decode_builtins.rs`, five `_parallel` twins among them) from the emittable surface.
 fn emittable_runtime_symbols() -> BTreeSet<String> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("wukong_mir_build")
-        .join("src")
-        .join("lib.rs");
-    let src = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        .join("src");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+        .collect();
+    files.sort();
+    assert!(
+        files.iter().any(|p| p.ends_with("lib.rs")),
+        "the emittable scan no longer finds wukong_mir_build/src/lib.rs in {}",
+        dir.display()
+    );
     const NEEDLE: &str = ".intern(\"wukong_";
     let mut out = BTreeSet::new();
-    let mut rest = src.as_str();
-    while let Some(i) = rest.find(NEEDLE) {
-        // Position at the start of the symbol name (`wukong_...`), inside the string literal.
-        let sym_start = i + ".intern(\"".len();
-        let tail = &rest[sym_start..];
-        // The literal ends at the closing quote.
-        let end = tail.find('"').unwrap_or(tail.len());
-        let sym = &tail[..end];
-        if !is_support(sym) {
-            out.insert(sym.to_string());
+    for path in &files {
+        let src = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let mut rest = src.as_str();
+        while let Some(i) = rest.find(NEEDLE) {
+            // Position at the start of the symbol name (`wukong_...`), inside the string literal.
+            let sym_start = i + ".intern(\"".len();
+            let tail = &rest[sym_start..];
+            // The literal ends at the closing quote.
+            let end = tail.find('"').unwrap_or(tail.len());
+            let sym = &tail[..end];
+            if !is_support(sym) {
+                out.insert(sym.to_string());
+            }
+            rest = &tail[end..];
         }
-        rest = &tail[end..];
     }
     out
 }
 
-/// Record the emittable / emitted / never-emitted split, floor the two surfaces, and print the
-/// never-emitted set partitioned into `_parallel` twins and everything else.
+/// The emittable / emitted split: floor both surfaces, and FAIL when an emittable kernel has no
+/// `tests/run` witness and no allowlisted reason. The never-emitted set is printed either way.
 #[test]
 fn the_emittable_runtime_surface_census_is_recorded_and_floored() {
-    /// `wukong_mir_build` still interns a large kernel surface. A drop below this means a whole
-    /// family of emit sites was deleted. Measured well above this; floored with headroom.
-    const EMITTABLE_FLOOR: usize = 120;
-    /// Distinct kernels the `tests/run` corpus actually emits. Mirrors `KERNEL_FLOOR`.
-    const EMITTED_FLOOR: usize = 85;
+    /// `wukong_mir_build` still interns a large kernel surface. Measured: 158 when the whole-crate
+    /// scan landed. A drop below this means a family of emit sites was deleted — a reviewed change.
+    const EMITTABLE_FLOOR: usize = 158;
+    /// Distinct kernels the `tests/run` corpus actually emits. Measured: 158 (every emittable
+    /// symbol) when the `cov4_*` fixtures landed.
+    const EMITTED_FLOOR: usize = 158;
 
     let emittable = emittable_runtime_symbols();
     let emitted: BTreeSet<String> = corpus_census()
@@ -705,32 +729,76 @@ fn the_emittable_runtime_surface_census_is_recorded_and_floored() {
         .filter(|s| !is_support(s))
         .collect();
 
+    // The emittable floor goes first: it is the vacuity guard for everything below (a scan that
+    // stopped matching would make the never-emitted set empty and the gate pass on nothing).
     assert!(
         emittable.len() >= EMITTABLE_FLOOR,
         "wukong_mir_build now interns only {} runtime kernel symbols (floor {EMITTABLE_FLOOR}) — a \
          family of emit sites was removed",
         emittable.len()
     );
-    assert!(
-        emitted.len() >= EMITTED_FLOOR,
-        "the tests/run corpus now emits only {} distinct runtime kernels (floor {EMITTED_FLOOR})",
-        emitted.len()
-    );
 
     let never: Vec<&String> = emittable.difference(&emitted).collect();
     let (parallel, serial): (Vec<&&String>, Vec<&&String>) =
         never.iter().partition(|s| s.ends_with("_parallel"));
-
     eprintln!(
         "emittable-vs-emitted census: {} emittable kernels, {} emitted by tests/run, {} never \
-         emitted here ({} _parallel twins, {} serial — serial entries are mostly scope artefacts, \
-         covered by examples/ or bench/kernels which this harness does not scan)",
+         emitted here ({} _parallel twins, {} serial), {} allowlisted",
         emittable.len(),
         emitted.len(),
         never.len(),
         parallel.len(),
         serial.len(),
+        NEVER_EMITTED_ALLOWLIST.len(),
     );
     eprintln!("  never-emitted _parallel twins: {parallel:?}");
     eprintln!("  never-emitted serial: {serial:?}");
+
+    let mut problems = Vec::new();
+    for (sym, why) in NEVER_EMITTED_ALLOWLIST {
+        if why.trim().len() < 20 {
+            problems.push(format!(
+                "allowlist entry {sym} has no real reason ({why:?}); say why no fixture can emit it"
+            ));
+        }
+        if !emittable.contains(*sym) {
+            problems.push(format!(
+                "allowlist entry {sym} is no longer interned by wukong_mir_build — delete the entry"
+            ));
+        } else if emitted.contains(*sym) {
+            let by: Vec<&str> = corpus_census()
+                .iter()
+                .filter(|c| c.on.contains(*sym))
+                .map(|c| c.name.as_str())
+                .collect();
+            problems.push(format!(
+                "allowlist entry {sym} is now emitted by {by:?} — delete the entry so the witness \
+                 is held to it"
+            ));
+        }
+    }
+    for sym in &never {
+        if !NEVER_EMITTED_ALLOWLIST.iter().any(|(s, _)| s == sym) {
+            problems.push(format!(
+                "{sym} is emittable (interned by wukong_mir_build) but no tests/run program emits \
+                 it at --emit=mir -O2"
+            ));
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "the emittable runtime surface has {} uncovered or stale entr(ies):\n  {}\n\nEvery kernel the \
+         compiler can emit needs a tests/run witness that prints every lane against hand-derived \
+         values (a `_parallel` twin: a `@parallel` function whose recognized arm emits it, as in \
+         tests/run/cov4_par_*.wk). Add one, or, if no program can reach the symbol, list it in \
+         NEVER_EMITTED_ALLOWLIST with the reason.",
+        problems.len(),
+        problems.join("\n  ")
+    );
+    // After the named gate, so a lost witness is reported by symbol rather than as a bare count.
+    assert!(
+        emitted.len() >= EMITTED_FLOOR,
+        "the tests/run corpus now emits only {} distinct runtime kernels (floor {EMITTED_FLOOR})",
+        emitted.len()
+    );
 }
