@@ -1,0 +1,19 @@
+// EXPECT-CODE: E0401
+// EXPECT-COUNT: 1
+module tests.fail.for_head_variant_mismatch
+
+// A variant pattern names its enum, and the value it matches must be of that enum. `W::Only(v)` is
+// irrefutable for a `W`, so it is a legal `for` head over a `[W; N]` -- but `ps` holds `P`s. The
+// pattern was never checked against the element type: the loop compiled and bound `v` with W's
+// layout over each `P`, printing its `b` field (2, then 4). Over an `[i32; N]` the same head lowered
+// a field access off a loaded integer and stopped the compiler with an internal error.
+enum W { Only(i32) }
+struct P { a: i32, b: i32 }
+
+fn main() -> i32 {
+    let ps: [P; 2] = [P { a: 1, b: 2 }, P { a: 3, b: 4 }];
+    for W::Only(v) in ps { //~ E0401
+        print(v);
+    }
+    return 0;
+}

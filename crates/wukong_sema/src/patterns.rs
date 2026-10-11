@@ -662,4 +662,42 @@ mod tests {
             "E0401",
         );
     }
+
+    /// A variant pattern names its enum, which must be the value's type, wherever it appears. It
+    /// used to be checked against nothing: `for W::Only(v) in ps` over a struct array read the
+    /// struct's second field as the payload, and over an `i32` array lowered a GEP off a loaded
+    /// integer (an ICE at MIR verification); `match` and `let` were open the same way.
+    #[test]
+    fn a_variant_pattern_must_match_the_values_enum() {
+        const W: &str = "enum W { Only(i32) } struct P { a: i32, b: i32 } \
+                         enum V { One(i32), Two } ";
+        let mismatched = |src: &str| {
+            let d = check(&format!("{W}{src}"));
+            assert!(
+                d.iter().any(|d| d.code == Some("E0401")
+                    && d.message.contains("this matches a `W`, but the value is")),
+                "{src}: {d:?}"
+            );
+        };
+        mismatched(
+            "fn f(ps: [P; 2]) -> i32 { let mut t = 0; for W::Only(v) in ps { t = t + v; } \
+             return t; }",
+        );
+        mismatched(
+            "fn f(xs: [i32; 3]) -> i32 { let mut t = 0; for W::Only(v) in xs { t = t + v; } \
+             return t; }",
+        );
+        mismatched("fn f(p: P) -> i32 { let W::Only(v) = p; return v; }");
+        mismatched("fn f(p: P) -> i32 { return match p { W::Only(v) => v }; }");
+        mismatched("fn f(x: V) -> i32 { return match x { W::Only(v) => v, _ => 9 }; }");
+        mismatched("fn f(t: (V, i32)) -> i32 { return match t { (W::Only(v), _) => v, _ => 0 }; }");
+        // The value's own enum, a generic and an unknown type stay accepted.
+        assert_clean(&format!(
+            "{W}fn f(x: V) -> i32 {{ return match x {{ V::One(v) => v, V::Two => 0 }}; }}"
+        ));
+        assert_clean(&format!(
+            "{W}fn f(ws: []W) -> i32 {{ let mut t = 0; for W::Only(v) in ws {{ t = t + v; }} \
+             return t; }}"
+        ));
+    }
 }

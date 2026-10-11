@@ -3396,7 +3396,9 @@ impl<'a> Sema<'a> {
             PatKind::Wildcard | PatKind::Unit => {}
             // A data-carrying enum-variant pattern: validate the variant + payload shape and bind the
             // inner fields to their declared types (so an arm body sees `x`/`y` typed).
-            PatKind::Variant { path, fields } => self.check_variant_pattern(path, fields, pat.span),
+            PatKind::Variant { path, fields } => {
+                self.check_variant_pattern(path, fields, ty, pat.span)
+            }
             // Literal / enum-variant / range patterns bind nothing — they test the scrutinee's value.
             // An integer literal pattern is materialized by mir_build as `ConstInt(v, <scrutinee
             // width>)` with no range check, so an out-of-range literal was TRUNCATED to that width and
@@ -3451,11 +3453,12 @@ impl<'a> Sema<'a> {
     }
 
     /// Type-check and bind a data-carrying enum-variant pattern `Enum::Variant(..)` / `Enum::Variant
-    /// { .. }`. Resolves the variant, rejects an unknown variant (E0301), a payload-kind mismatch or
-    /// a wrong tuple arity (E0435), and binds each payload sub-pattern to its declared field type.
+    /// { .. }` against a value of type `ty`. Resolves the variant, rejects an unknown variant
+    /// (E0301), a value that is not of the pattern's enum (E0401), a payload-kind mismatch or a
+    /// wrong tuple arity (E0435), and binds each payload sub-pattern to its declared field type.
     /// On any error it still binds the sub-patterns (to `Unknown`) so the arm body type-checks
     /// without cascading.
-    fn check_variant_pattern(&mut self, path: &Path, fields: &VariantPat, span: Span) {
+    fn check_variant_pattern(&mut self, path: &Path, fields: &VariantPat, ty: &Ty, span: Span) {
         let (Some(ename), Some(vname)) = (
             path.segments.first().map(|s| s.sym),
             path.segments.last().map(|s| s.sym),
@@ -3484,6 +3487,24 @@ impl<'a> Sema<'a> {
                 return;
             }
         };
+        // The pattern names its enum, which must be the value's type, as a struct pattern's struct
+        // must be (`check_struct_pattern`): `mir_build` reads the discriminant and payload with
+        // this enum's layout off whatever value it is handed — another type's fields, or a loaded
+        // scalar used as a base pointer (an ICE at MIR verification).
+        if !matches!(ty, Ty::Unknown | Ty::Error)
+            && *ty != Ty::Named(ename)
+            && !self.is_generic_ty(ty)
+        {
+            let en = self.sym_str(ename).to_string();
+            self.error(
+                span,
+                "E0401",
+                format!(
+                    "mismatched pattern: this matches a `{en}`, but the value is `{}`",
+                    ty.display(self.interner)
+                ),
+            );
+        }
         let qual = format!("{}::{}", self.sym_str(ename), self.sym_str(vname));
         match (fields, &payload) {
             (VariantPat::Tuple(subs), VariantPayload::Tuple(tys)) => {

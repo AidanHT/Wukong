@@ -40,6 +40,12 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `match grid[0] { (row, _) => k(row, grid) }`, which predates this branch. Each name is now that
   part's place, projected through the tuple, struct and payload fields that lead to it (two
   different fields stay two buffers) (`tests/fail/noalias_for_destructure.wk`).
+- **A variant pattern must match a value of its enum (`E0401`).** `W::Only(v)` was never checked
+  against the value's type: `for W::Only(v) in ps` over a struct array bound `v` to each struct's
+  second field, over an `i32` array stopped the compiler with an internal MIR-verifier error, and
+  `match`/`let` were open the same way (`match x { W::A(v) => v, _ => 0 }` on another enum read its
+  payload with W's layout). It now follows the struct pattern's rule ("mismatched pattern: this
+  matches a `W`, but the value is `P`"; `tests/fail/for_head_variant_mismatch.wk`).
 - **`if let P = e && c1 && c2` and `while let P = e && c` (N26).** The `&&` chain becomes the guard of
   the pattern's arm: the conditions run only after the pattern matched, left to right with
   short-circuit, and see its bindings (`tests/run/if_let_chain.wk`). **Behaviour change:** the

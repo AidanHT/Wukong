@@ -583,7 +583,10 @@ struct (an unlisted field is unconstrained), a **binding** `name @ sub` that bin
 `sub` matches (also nested: `(a @ 1..=5, b)`), and an **array** pattern `[a, b, .., z]` on a
 fixed-size array — without `..` it lists every element. All three also destructure in a `let`
 (`let Point { x, y } = p;`, `let [first, .., last] = a;`). An array pattern on a `[]T` slice is
-`E0401`: its length is a run-time value, so test `s.len()` and index instead.
+`E0401`: its length is a run-time value, so test `s.len()` and index instead. A struct pattern names
+its struct and a data-carrying variant pattern (`Shape::Circle(r)`) its enum, and the value matched
+must be of that type — `E0401` otherwise, in a `match`, a `let` and a `for` head alike
+(`tests/fail/for_head_variant_mismatch.wk`).
 
 **`if let`, `while let` and `let … else`** (✅) are what they are in Rust, and the parser rewrites
 each into a `match`:
