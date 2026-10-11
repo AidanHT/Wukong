@@ -14,7 +14,9 @@
 //! (`Contiguous`) `Tensor[T, …]` view whose every dimension is known at the call — a constant or a
 //! bound dimension variable, never `?`. The element type must be exactly the builtin's `T`: a
 //! `[]i32` handed to `read_f32` would read the wrong stride and decode the wrong type. A container
-//! read into a *tensor* also checks the file's shape against the tensor's dims at load time.
+//! read into a *tensor* also checks the file's shape against the tensor's dims at load time. A
+//! dtype-generic `Tensor[T, …]` is checked per instantiation (`dtype.rs`): an instance binding `T`
+//! to the builtin's element reaches it like the concrete function, any other binding is `E0416`.
 //!
 //! **Integers.** Byte offsets, seeds and counters accept any integer type (the value's bits, as
 //! `x as u64` would give them); an unsuffixed literal adapts to `i64`.
@@ -325,13 +327,16 @@ impl Sema<'_> {
         let ok = match ty {
             Ty::Slice(e) => **e == want,
             Ty::Array { elem: e, .. } => **e == want,
-            // A dtype-generic tensor (`elem_var: Some`) holds no fixed element: not this one.
+            // A dtype-generic tensor (`elem_var: Some`) is checked per instantiation (`dtype.rs`):
+            // the generic body accepts it here, and each concrete instance is re-checked with `T`
+            // substituted — `T` bound to this builtin's element reaches it, any other is `E0416`
+            // (the arm below).
             Ty::Tensor {
                 elem: e,
                 shape,
                 layout,
-                elem_var: None,
-            } if *e == elem => {
+                elem_var,
+            } if elem_var.is_some() || *e == elem => {
                 if *layout != Layout::Contiguous {
                     self.error(
                         span,
@@ -359,6 +364,28 @@ impl Sema<'_> {
                     return;
                 }
                 true
+            }
+            // While a concrete instantiation is re-checked, a tensor of another element was a
+            // deferred `Tensor[T, ..]` the substitution made concrete (`dtype.rs`).
+            Ty::Tensor {
+                elem: e,
+                elem_var: None,
+                ..
+            } if self.rechecking_instance() => {
+                self.error(
+                    span,
+                    "E0416",
+                    format!(
+                        "`{name}` moves `{}` elements, but in this instantiation its {} argument \
+                         holds `{}` (a dtype-generic `Tensor[T, ..]` reaches `{name}` only when \
+                         `T = {}`)",
+                        elem.name(),
+                        ordinal(i),
+                        e.name(),
+                        elem.name()
+                    ),
+                );
+                return;
             }
             Ty::Unknown | Ty::Error => true,
             _ => false,

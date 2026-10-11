@@ -5,6 +5,21 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Autodiff through `sdpa`, dtype-generic builtins (`gap4/autodiff-builtins`)
+
+- **A loss calling `sdpa` differentiates and trains (N83).** `sdpa` always lowered behind run-time
+  extent checks and an output-overlap branch, so such a loss was multi-block and `--emit=grad` /
+  `--train` refused it although the fused attention VJP existed. With constant `s`/`d`,
+  fixed-array operands and every input provably apart from `out` (distinct locals, or parameters the
+  call-site alias fact or a `@noalias` promise separates) the call is now one bare
+  `wukong_attention_f32`; a slice, a view or a may-alias pair keeps the guard
+  (`tests/run/sdpa_loss_train.wk`, `crates/wukongc/tests/autodiff_attention.rs`).
+- **Dtype-generic tensors reach the kernel and typed I/O builtins (N18).** `fn mm<T>(a: Tensor[T,
+  4, 4], ..) { matmul(a, ..) }` was `E0502` in the generic body; it is now checked per
+  instantiation, so `mm$f32` dispatches `wukong_sgemm` (`tests/run/dtype_generic_builtin.wk`), and
+  an instance binding `T` to another element is the new `E0415` (kernel builtin) or `E0416` (typed
+  file-I/O builtin such as `write_f32`).
+
 ### Index-recording reductions (`gap3/vec-argmax`)
 
 - **Argmax/argmin and FindLastIV loops vectorize.** `if x[i] > m { m = x[i]; at = i; }` (and its

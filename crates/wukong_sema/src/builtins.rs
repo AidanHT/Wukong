@@ -35,6 +35,11 @@
 //! extent is only known at run time (a slice, or an array against a runtime dimension) is checked
 //! at run time by the lowering, which traps exactly like a failed `assert`.
 //!
+//! **A dtype-generic operand** (`fn mm<T>(a: Tensor[T, 4, 4], ..) { matmul(a, ..) }`) is checked per
+//! instantiation (`dtype.rs`): the generic body's call is shape-checked and recorded once, an
+//! instance that binds `T = f32` dispatches the kernel exactly like the concrete function, and any
+//! other binding is `E0415` at the operand, labelled with the instantiation that required it.
+//!
 //! The one-argument activations (`gelu(x)`) stay the scalar math intrinsics; only the two-argument
 //! buffer form is the kernel builtin. A user function, or a local binding, of the same name shadows
 //! any builtin.
@@ -869,8 +874,37 @@ impl Sema<'_> {
         }
     }
 
+    /// A buffer operand of `builtin` holds `found` rather than `f32`. In the generic body pass (and
+    /// in concrete code) that is the element mismatch `E0502`, worded by `plain`. While a concrete
+    /// instantiation is re-checked it is `E0415`: that pass runs only after a clean generic pass,
+    /// which accepted the operand, so its element came from the substitution — a dtype-generic
+    /// `Tensor[T, ..]` this instance binds to something other than `f32` (`dtype.rs`).
+    fn report_builtin_elem(
+        &mut self,
+        span: Span,
+        builtin: &str,
+        pname: &str,
+        found: &str,
+        plain: String,
+    ) {
+        if self.rechecking_instance() {
+            self.error(
+                span,
+                "E0415",
+                format!(
+                    "kernel builtin `{builtin}` requires `f32` elements, but in this instantiation \
+                     operand `{pname}` holds `{found}` (a dtype-generic `Tensor[T, ..]` reaches a \
+                     kernel builtin only when `T = f32`)"
+                ),
+            );
+        } else {
+            self.error(span, "E0502", plain);
+        }
+    }
+
     /// Classify buffer argument `arg_ty` of `builtin` (parameter `pname`), reporting a non-`f32`
-    /// element (`E0502`), a non-contiguous tensor (`E0502`) or a non-buffer (`E0437`).
+    /// element (`E0502`, or `E0415` for a dtype-generic tensor's instantiation), a non-contiguous
+    /// tensor (`E0502`) or a non-buffer (`E0437`).
     fn classify_builtin_operand(
         &mut self,
         arg_ty: &Ty,
@@ -887,19 +921,21 @@ impl Sema<'_> {
                 elem_var,
             } => {
                 let mut ok = true;
-                // A dtype-generic element (`Tensor[T, ..]`) is not known to be `f32`, and the call
-                // is recorded once for the generic body, so it cannot take the `f32` kernel.
-                if *elem != Scalar::F32 || elem_var.is_some() {
-                    let found = self.tensor_elem_name(*elem, *elem_var);
-                    self.error(
-                        span,
-                        "E0502",
-                        format!(
-                            "tensor element type mismatch: operand `{pname}` of `{builtin}` must \
-                             hold `f32`, found `{found}`"
-                        ),
+                // A dtype-generic element (`Tensor[T, ..]`) is checked per instantiation
+                // (`dtype.rs`): the generic body's call is recorded once — its dimensions never
+                // depend on `T` — and each concrete instance is re-checked with `T` substituted,
+                // where `T = f32` reaches the kernel and any other element is `E0415`.
+                if elem_var.is_none() && *elem != Scalar::F32 {
+                    let found = elem.name().to_string();
+                    let plain = format!(
+                        "tensor element type mismatch: operand `{pname}` of `{builtin}` must hold \
+                         `f32`, found `{found}`"
                     );
-                    ok = false;
+                    self.report_builtin_elem(span, builtin, pname, &found, plain);
+                    // An instance's operand still carries its (already checked) shape: keep it, so
+                    // the one real error is not followed by an `E0409` for every dimension the
+                    // operand would have fixed. The call is not recorded either way.
+                    ok = self.rechecking_instance();
                 }
                 if *layout != Layout::Contiguous {
                     self.error(
@@ -923,15 +959,12 @@ impl Sema<'_> {
                 None => {
                     let leaf = array_leaf(arg_ty);
                     if !matches!(leaf, Ty::Unknown | Ty::Error) {
-                        self.error(
-                            span,
-                            "E0502",
-                            format!(
-                                "element type mismatch: operand `{pname}` of `{builtin}` must hold \
-                                 `f32`, found an array of `{}`",
-                                leaf.display(self.interner)
-                            ),
+                        let found = leaf.display(self.interner);
+                        let plain = format!(
+                            "element type mismatch: operand `{pname}` of `{builtin}` must hold \
+                             `f32`, found an array of `{found}`"
                         );
+                        self.report_builtin_elem(span, builtin, pname, &found, plain);
                     }
                     Operand::Skip
                 }
@@ -940,15 +973,12 @@ impl Sema<'_> {
                 Ty::Scalar(Scalar::F32) => Operand::Slice,
                 Ty::Unknown | Ty::Error => Operand::Skip,
                 other => {
-                    self.error(
-                        span,
-                        "E0502",
-                        format!(
-                            "element type mismatch: operand `{pname}` of `{builtin}` must hold \
-                             `f32`, found a slice of `{}`",
-                            other.display(self.interner)
-                        ),
+                    let found = other.display(self.interner);
+                    let plain = format!(
+                        "element type mismatch: operand `{pname}` of `{builtin}` must hold \
+                         `f32`, found a slice of `{found}`"
                     );
+                    self.report_builtin_elem(span, builtin, pname, &found, plain);
                     Operand::Skip
                 }
             },

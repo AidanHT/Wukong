@@ -1,0 +1,19 @@
+// EXPECT-CODE: E0415
+module tests.fail.dtype_generic_builtin_elem
+
+// N18: a dtype-generic tensor reaches a named kernel builtin only when its instantiation binds the
+// element to `f32`. The generic body is accepted (its `matmul` shape-checks over `Tensor[T, 2, 2]`),
+// and instantiating `mm` at `T = bf16` is the error — at the operand, labelled with the call that
+// required the instance — instead of handing bf16 buffers to the f32 `wukong_sgemm` kernel. The same
+// function instantiated at `f32` dispatches the kernel (`tests/run/dtype_generic_builtin.wk`).
+fn mm<T>(a: Tensor[T, 2, 2], b: Tensor[T, 2, 2], mut c: Tensor[T, 2, 2]) {
+    matmul(a, b, c);
+}
+
+fn main() -> i32 {
+    let a: [bf16; 4] = [1.0; 4];
+    let b: [bf16; 4] = [2.0; 4];
+    let mut c: [bf16; 4] = [0.0; 4];
+    mm(a, b, c);
+    return c[0] as i32;
+}

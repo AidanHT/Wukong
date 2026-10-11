@@ -144,13 +144,24 @@ labelled "required by this instantiation of `f` with T = …". A dtype-generic t
 `Ty::Tensor { elem_var: Some(T), .. }` (its `elem` is then a placeholder): sema binds `T` from a
 tensor or array argument's scalar leaf (`dtype.rs`), and mir_build's monomorphizer substitutes the
 element into every tensor type (`subst_ty`), so `axpy$f32` lowers like the hand-written `f32`
-function; a recognizer that reads sema's raw generic-body types declines on an instance instead.
+function; a recognizer that reads sema's raw generic-body types declines on an instance instead. A
+fixed-element builtin (kernel or typed I/O) accepts a `Tensor[T, ..]` operand in the generic pass
+and the instance re-check reports a wrong binding (`Sema::rechecking_instance`, `E0415`/`E0416`).
 `where` dimension predicates and dimension `static_assert`s are collected and checked against each
 call's bound dimensions by `wukong_sema::constraints`; `static_assert` lowers to nothing.
 **Kernel builtins**: `wukong_sema::builtins` shape-checks `matmul`/`softmax`/…/`sdpa` and records each
 call's resolved dimensions (`SemaResult::builtin_calls`); `wukong_mir_build::builtins` lowers it to one
 runtime kernel behind runtime extent checks (trapping through `assert`) and an output-overlap guard
-(scratch + copy-out), independent of `@generic`/recognition. The **decode builtins** (`sdpa_kv`,
+(scratch + copy-out), independent of `@generic`/recognition. `sdpa` alone has a **static form**: a
+check whose outcome is a compile-time fact is not emitted, and an input whose `StorageRoot` (a
+fixed-array local's own `alloca`, or a fixed-array/static-tensor parameter bound to its storage —
+`noalias.rs`'s `param_is_its_storage`) is proved apart from `out`'s — different allocas, an alloca
+and a parameter, or two parameters `alias::plan_kernel_alias` answers `Dispatch` for or a `@noalias`
+promise separates — gets no overlap test, so a fully static call is one bare `wukong_attention_f32`
+in a straight-line block that `wukong_autodiff` differentiates. A dtype-generic `Tensor[T, ..]`
+builtin operand is accepted in the generic body and re-checked per instance (`E0415` kernel /
+`E0416` typed I/O when `T` is not the builtin's element); mir_build declines (`C0001`) a non-`f32`
+operand that reaches lowering anyway. The **decode builtins** (`sdpa_kv`,
 `kv_append`, `gemv_bf16`/`gemv_f16`, `quantize_q{8,4}_0`, `gemv_q{8,4}_0`) are typed in
 `wukong_sema::decode_builtins` and lowered in `wukong_mir_build::decode_builtins` to one checked
 runtime call each (`wukong_runtime::{attention_kv, gemv_half, quant}`): their extents are values, so
