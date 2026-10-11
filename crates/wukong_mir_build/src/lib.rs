@@ -14670,9 +14670,10 @@ impl FnLowerer<'_> {
         // GEMM / norm / scan / … loop keeps its multicore kernel) and after the elementwise
         // vectorizer (an elementwise loop keeps its existing serial-SIMD / `velem_parallel`
         // lowering) — so only compound loops that would otherwise run as a serial chain go wide.
-        // Legality is a conservative structural proof (`match_parallel_region`): every write that
-        // escapes an iteration must land in a per-iteration-disjoint slice of a captured array
-        // (an index carrying the loop var as a mixed-radix digit); anything unprovable declines
+        // Legality is a conservative structural proof (`match_parallel_region`): every plain write
+        // that escapes an iteration must land in a per-iteration-disjoint slice of a captured array
+        // (an index carrying the loop var as a mixed-radix digit), and every `atomic_add` must
+        // target a captured array nothing else in the loop touches; anything unprovable declines
         // and lowers serially below — bit-for-bit the prior behavior.
         if self.parallel_fn
             && !inclusive
@@ -14772,9 +14773,10 @@ impl FnLowerer<'_> {
     // Soundness (the differential gates G1/G2/G4 rest on this):
     //  * Per-iteration scratch is *body-local* (`let` inside the loop body) and therefore private by
     //    construction — one alloca per task frame, never shared.
-    //  * Every write that escapes an iteration must hit a captured fixed-size array at an index
-    //    carrying the loop var as a **mixed-radix digit**: with N the trip count, the index must
-    //    decompose as `hh*C + Σ outer + Σ inner`, where every `outer` term has a stride that is a
+    //  * Every plain write that escapes an iteration (atomic adds are the exception, below) must
+    //    hit a captured fixed-size array at an index carrying the loop var as a **mixed-radix
+    //    digit**: with N the trip count, the index must decompose as
+    //    `hh*C + Σ outer + Σ inner`, where every `outer` term has a stride that is a
     //    multiple of `C·N` (so it vanishes mod `C·N` for ANY integer factor value) and the `inner`
     //    terms' maxima (inner `for` vars with literal `[lo, hi)` ranges, plus non-negative
     //    constants) sum below `C`. Then `index mod C·N ∈ [hh·C, hh·C + C)` recovers `hh`, so two
@@ -14796,15 +14798,24 @@ impl FnLowerer<'_> {
     //    per-access snapshot so rebinding/assignment can never mislabel a value, and `(a+b)*k`
     //    distributes before classification. A non-constant divisor, a missing / negative / equal
     //    coefficient pair, mixed direct-`t`-and-digit indices, and any unprovable extent decline.
+    //  * **Atomic adds** need no digit (`scan_region_atomic`). `atomic_add(arr[i], v)` on one
+    //    element of a captured fixed-size array may hit any element from any iteration, because
+    //    integer adds commute and each lands exactly once. The array is recorded in
+    //    `RegionScan::atomic`, not as a write. The region then declines if that array, or any
+    //    capture that may share its storage (the parameter rule below), has any other access in
+    //    the loop. A read there would see a schedule-dependent count. A field, pointee or
+    //    multi-index place declines.
     //  * Anything the proof cannot cover declines (`match_parallel_region` returns `None`) and the
     //    loop lowers serially exactly as before: captured-scalar writes (loop-carried reductions),
     //    non-affine / offset indices, `break`/`continue` targeting the region loop, `return`,
-    //    calls other than pure math intrinsics (`print` would reorder output), slices / tensors /
-    //    pointers (may alias), `match` / `loop` expressions, shadowing of classification vars.
+    //    calls other than pure math intrinsics and `atomic_add` (`print` would reorder output),
+    //    slices / tensors / pointers (may alias), `match` / `loop` expressions, shadowing of
+    //    classification vars.
     //  * Inside the outlined body `parallel_fn` is false, so each iteration dispatches the SERIAL
     //    kernels — the identical per-iteration op sequence the non-`@parallel` spelling runs; only
-    //    cross-iteration scheduling differs, and iterations never overlap writes, so serial ==
-    //    parallel bit-for-bit and the interpreter (sequential `[0, N)`) == native (chunks).
+    //    cross-iteration scheduling differs. Iterations never overlap plain writes, and overlapping
+    //    atomic adds commute, so serial == parallel bit-for-bit and the interpreter (sequential
+    //    `[0, N)`) == native (chunks).
     //  * Captured array storage must be a fresh alloca or a scalar-element array parameter.
     //    Names with the same MIR base, and parameters over the same element scalar that the caller
     //    could alias (whatever their declared lengths), are proved as ONE buffer over the union of
@@ -14852,10 +14863,12 @@ impl FnLowerer<'_> {
     }
 
     /// The pure legality analysis: walk the loop body, collecting captures (enclosing-scope
-    /// bindings) and every access to a captured array, then prove all writes (and all reads of
-    /// written arrays) per-iteration disjoint via the mixed-radix digit argument — the single
+    /// bindings) and every access to a captured array, then prove all plain writes (and all reads
+    /// of written arrays) per-iteration disjoint via the mixed-radix digit argument — the single
     /// direct `hh*C` digit, or the tiled two-digit `(hh/C)·qc + (hh%C)·rc` form (see the section
-    /// comment above). Conservative: any construct the walk does not explicitly model declines.
+    /// comment above). Arrays updated by `atomic_add` skip that proof and instead must have no
+    /// other access through any name that can share their storage. Conservative: any construct the
+    /// walk does not explicitly model declines.
     /// Returns the captures in first-appearance order (the deterministic env layout) on success.
     fn match_parallel_region(&self, hh: Symbol, n: i128, body: &Block) -> Option<Vec<Symbol>> {
         let mut sc = RegionScan {
@@ -34086,6 +34099,58 @@ fn mm(a: [f32; 16], b: [f32; 16], mut c: [f32; 16]) {
         assert!(!outlines(
             "@parallel fn f(x: [i32; 64], mut h: [(i64, i64); 4]) { \
                  for i in 0..64 { atomic_add(h[x[i] & 3].0, 1); } }"
+        ));
+    }
+
+    /// A `@parallel` loop that is not the whole function body goes through the mid-function region
+    /// path (`try_emit_parallel_region`), which runs the same `match_parallel_region` proof. An
+    /// atomic add to an otherwise untouched captured array outlines into `wukong$par$<n>`, and the
+    /// alias check declines the region when the loop reads a parameter that could be that buffer,
+    /// or reads the counters themselves.
+    #[test]
+    fn parallel_mid_function_region_admits_atomic_adds_under_the_same_proof() {
+        let region = |src: &str| {
+            let (prog, diags, interner) = lower(src);
+            assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+            for f in &prog.funcs {
+                let errs = wukong_mir::verify::verify_function(f);
+                assert!(errs.is_empty(), "{}: {errs:?}", interner.resolve(f.name));
+            }
+            let Some(body) = prog
+                .funcs
+                .iter()
+                .find(|f| interner.resolve(f.name).starts_with("wukong$par$"))
+            else {
+                return false;
+            };
+            let atomics = body
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter(|i| matches!(i.op, Op::AtomicAdd { .. }))
+                .count();
+            assert_eq!(atomics, 1, "the region body holds the atomic add");
+            prog_calls(&prog, &interner, "wukong_parallel_for")
+        };
+        // The leading `let` makes the loop the second statement, so the whole-function outliner
+        // declines and the region path runs.
+        assert!(region(
+            "@parallel fn scaled(x: [i32; 64], mut h: [i64; 4]) { let k: i64 = 3; \
+                 for i in 0..64 { atomic_add(h[x[i] & 3], k); } }"
+        ));
+        // `x` could be the caller's `h`: reading it while other chunks add to `h` is a race.
+        assert!(!region(
+            "@parallel fn scaled(x: [i64; 64], mut h: [i64; 4]) { let k: i64 = 3; \
+                 for i in 0..64 { atomic_add(h[x[i] & 3], k); } }"
+        ));
+        assert!(region(
+            "@parallel fn scaled(x: [i64; 64], @noalias mut h: [i64; 4]) { let k: i64 = 3; \
+                 for i in 0..64 { atomic_add(h[x[i] & 3], k); } }"
+        ));
+        // A plain read of the counters inside the region.
+        assert!(!region(
+            "@parallel fn f(x: [i32; 64], mut h: [i64; 4], mut o: [i32; 64]) { let k: i64 = 3; \
+                 for i in 0..64 { atomic_add(h[x[i] & 3], k); o[i] = h[0] as i32; } }"
         ));
     }
 

@@ -10,10 +10,21 @@
 //! then the place's address — its GEP and, for a `[]T` slice, the bounds check — exactly as
 //! `b[i] += v` would compute them.
 //!
-//! Parallelism: the whole-function `@parallel` outliner needs nothing (every iteration's add lands
-//! exactly once, in any order, so the result is the serial one bit-for-bit). The mid-function
-//! region scanner (`scan_region_expr`) declines every impure call, this one included, so a
-//! `@parallel for` region inside a larger function that contains an `atomic_add` stays serial.
+//! Parallelism: this is the one impure call the `@parallel` region proof admits, and an atomic
+//! loop does get outlined. `match_parallel_region` is shared by the whole-function outliner
+//! (`parallel_spec`) and by mid-function regions (`try_emit_parallel_region`). Its
+//! `scan_region_expr` hands `atomic_add(arr[i], v)` to `scan_region_atomic`. That reads `v` and the
+//! index as ordinary expressions. When `arr` is a captured fixed-size array, it records `arr` in
+//! `RegionScan::atomic` instead of as a write, so the add needs no per-iteration disjointness
+//! proof: integer adds commute, every iteration's add lands exactly once in any order, and the
+//! result is the serial one bit for bit. A body-local array is private to its iteration.
+//!
+//! The region still declines (and the loop lowers serially) if the atomically updated array, or
+//! any capture that may share its storage, has any other read or write in the loop: such a read
+//! would see a schedule-dependent count. A shared-storage capture is one with the same MIR base,
+//! or a parameter over the same element scalar with no `@noalias` promise between the two. A
+//! field, pointee or multi-index place declines too, and so does a user function or local named
+//! `atomic_add` (an ordinary callee). `tests/run/atomic_add_histogram.wk` exercises both paths.
 
 use wukong_ast::Expr;
 
