@@ -360,3 +360,24 @@ fn native_adamw_dispatches_multiple_sizes_after_vec_replacements() {
         assert_eq!(bits(&buffers[2]), bits(&fixed));
     }
 }
+
+/// The AdamW hyperparameter layout has two copies — the kernel builder's (`wukong_autodiff`) and
+/// the loop's (`wukong_runtime::train`) — and they must agree index for index. (A `const` assertion
+/// beside `run_train` makes a drift a build error; this names each field when one fails.)
+#[test]
+fn native_training_hp_layout_matches_the_adamw_kernel() {
+    use wukong_autodiff::optim::hp as kernel;
+    use wukong_runtime::train::hp as runtime;
+    for (field, k, r) in [
+        ("LR", kernel::LR, runtime::LR),
+        ("BETA1", kernel::BETA1, runtime::BETA1),
+        ("BETA2", kernel::BETA2, runtime::BETA2),
+        ("EPS", kernel::EPS, runtime::EPS),
+        ("WD", kernel::WD, runtime::WD),
+        ("BC1", kernel::BC1, runtime::BC1),
+        ("BC2", kernel::BC2, runtime::BC2),
+        ("LEN", kernel::LEN, runtime::LEN),
+    ] {
+        assert_eq!(k, r, "hp::{field}");
+    }
+}
