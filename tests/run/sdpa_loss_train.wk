@@ -1,0 +1,137 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT-APPROX: 1.125 5e-4
+// EXPECT-OUT-APPROX: 1.5 5e-4
+// EXPECT-OUT-APPROX: 1 5e-4
+// EXPECT-OUT-APPROX: 1.375 5e-4
+// EXPECT-OUT-APPROX: 1.75 5e-4
+// EXPECT-OUT-APPROX: 1.25 5e-4
+// EXPECT-OUT-APPROX: 1.625 5e-4
+// EXPECT-OUT-APPROX: 1.125 5e-4
+// EXPECT-OUT-APPROX: 1.335176085 5e-4
+// EXPECT-OUT-APPROX: 1.219765221 5e-4
+// EXPECT-OUT-APPROX: 1.210176085 5e-4
+// EXPECT-OUT-APPROX: 1.585176085 5e-4
+// EXPECT-OUT-APPROX: 1.469765221 5e-4
+// EXPECT-OUT-APPROX: 1.460176085 5e-4
+// EXPECT-OUT-APPROX: 1.344765221 5e-4
+// EXPECT-OUT-APPROX: 1.335176085 5e-4
+// EXPECT-OUT-APPROX: 1.173130084 5e-4
+// EXPECT-OUT-APPROX: 1.322771106 5e-4
+// EXPECT-OUT-APPROX: 1.38729643 5e-4
+// EXPECT-OUT-APPROX: 1.423130084 5e-4
+// EXPECT-OUT-APPROX: 1.572771106 5e-4
+// EXPECT-OUT-APPROX: 1.298130084 5e-4
+// EXPECT-OUT-APPROX: 1.447771106 5e-4
+// EXPECT-OUT-APPROX: 1.173130084 5e-4
+// EXPECT-OUT-APPROX: 1.266867815 5e-4
+// EXPECT-OUT-APPROX: 1.380611086 5e-4
+// EXPECT-OUT-APPROX: 1.340070463 5e-4
+// EXPECT-OUT-APPROX: 1.516867815 5e-4
+// EXPECT-OUT-APPROX: 1.426857503 5e-4
+// EXPECT-OUT-APPROX: 1.391867815 5e-4
+// EXPECT-OUT-APPROX: 1.301857503 5e-4
+// EXPECT-OUT-APPROX: 1.266867815 5e-4
+// EXPECT-OUT-APPROX: 59.65634188 5e-4
+// EXPECT-OUT-APPROX: 1.246465788 5e-4
+// EXPECT-OUT-APPROX: 1.445386064 5e-4
+// EXPECT-OUT-APPROX: 1.323622594 5e-4
+// EXPECT-OUT-APPROX: 1.496465788 5e-4
+// EXPECT-OUT-APPROX: 1.433296988 5e-4
+// EXPECT-OUT-APPROX: 1.371465788 5e-4
+// EXPECT-OUT-APPROX: 1.308296988 5e-4
+// EXPECT-OUT-APPROX: 1.246465788 5e-4
+// EXPECT-OUT-APPROX: 1.257127687 5e-4
+// EXPECT-OUT-APPROX: 1.400904235 5e-4
+// EXPECT-OUT-APPROX: 1.363351139 5e-4
+// EXPECT-OUT-APPROX: 1.507127687 5e-4
+// EXPECT-OUT-APPROX: 1.419680783 5e-4
+// EXPECT-OUT-APPROX: 1.382127687 5e-4
+// EXPECT-OUT-APPROX: 1.294680783 5e-4
+// EXPECT-OUT-APPROX: 1.257127687 5e-4
+// EXPECT-OUT-APPROX: 1.21959368 5e-4
+// EXPECT-OUT-APPROX: 1.421104683 5e-4
+// EXPECT-OUT-APPROX: 1.355695456 5e-4
+// EXPECT-OUT-APPROX: 1.46959368 5e-4
+// EXPECT-OUT-APPROX: 1.46970941 5e-4
+// EXPECT-OUT-APPROX: 1.34459368 5e-4
+// EXPECT-OUT-APPROX: 1.34470941 5e-4
+// EXPECT-OUT-APPROX: 1.21959368 5e-4
+// EXPECT-OUT-APPROX: 1.266867815 5e-4
+// EXPECT-OUT-APPROX: 1.380611086 5e-4
+// EXPECT-OUT-APPROX: 1.340070463 5e-4
+// EXPECT-OUT-APPROX: 1.516867815 5e-4
+// EXPECT-OUT-APPROX: 1.426857503 5e-4
+// EXPECT-OUT-APPROX: 1.391867815 5e-4
+// EXPECT-OUT-APPROX: 1.301857503 5e-4
+// EXPECT-OUT-APPROX: 1.266867815 5e-4
+// EXPECT-OUT-APPROX: 59.3390991 5e-4
+module tests.run.sdpa_loss_train
+
+// N83: the attention loss `wukong_autodiff` differentiates (`--emit=grad` / `--train`, gated in
+// `crates/wukongc/tests/autodiff_attention.rs`), run forward and checked lane by lane.
+//
+// `loss` has constant `s = 4`, `d = 8`, fixed-array operands and `@noalias` inputs, so its `sdpa`
+// lowers to ONE bare `wukong_attention_f32` call — no extent check, no overlap test, no scratch
+// copy (`wukong_mir_build::builtins`, the static form). This fixture pins that the static form
+// computes the same attention the guarded form did, on both backends at every `-O` level: every
+// lane of `o` (32 per call) and the loss `Σ o²` are printed, for the causal and the full head.
+//
+// Inputs (exact dyadic f32 values, the same formulas the expectation script evaluates):
+//   q[i] = ((7i) mod 9)/8 - 1/2,  k[i] = ((5i + 3) mod 11)/8 - 5/8,  v[i] = ((3i + 1) mod 7)/8 + 1
+// with scale = f32(0.35355339) ≈ 1/√8. The expected values are the attention DEFINITION evaluated
+// in f64 — scores q_i·k_j materialized, a max-subtracted softmax over the keys row i sees (0..=i
+// under the causal mask), then the weighted sum of V's rows — not the kernel's output. Under the
+// causal mask row 0 sees only key 0, whose weight is exactly 1, so its lanes are v's row 0 exactly
+// (1.125, 1.5, 1, ...); row 3 sees every key either way, so it agrees between the two heads.
+//
+// Tolerance 5e-4 relative (declared in `corpus_lint.rs`): the kernel is held to
+// `1e-4 + 1e-4·|want|` against the materialized reference (`wukong_runtime/src/attention.rs`), and
+// every v is in [1, 1.75], so every output lane is a convex combination with |o| >= 1 and that band
+// is at most 2e-4 relative (plus ~2e-6 for the f32 reference's own rounding). The loss is a sum of
+// 32 positive squares, which at most doubles a relative error (4.1e-4 with the 32-term f32 sum).
+@parallel
+fn loss(@noalias q: [f32; 32], @noalias k: [f32; 32], @noalias v: [f32; 32], mut o: [f32; 32],
+        mut out: [f32; 1]) -> f32 {
+    sdpa(q, k, v, o, 4, 8, 0.35355339, 1);
+    let mut l: f32 = 0.0;
+    for i in 0..32 { l = l + o[i] * o[i]; }
+    out[0] = l;
+    return l;
+}
+
+@parallel
+fn loss_full(@noalias q: [f32; 32], @noalias k: [f32; 32], @noalias v: [f32; 32],
+             mut o: [f32; 32], mut out: [f32; 1]) -> f32 {
+    sdpa(q, k, v, o, 4, 8, 0.35355339, 0);
+    let mut l: f32 = 0.0;
+    for i in 0..32 { l = l + o[i] * o[i]; }
+    out[0] = l;
+    return l;
+}
+
+fn main() -> i32 {
+    let mut q: [f32; 32] = [0.0; 32];
+    let mut k: [f32; 32] = [0.0; 32];
+    let mut v: [f32; 32] = [0.0; 32];
+    for i in 0..32 {
+        q[i] = (((i * 7) % 9) as f32) / 8.0 - 0.5;
+        k[i] = (((i * 5 + 3) % 11) as f32) / 8.0 - 0.625;
+        v[i] = (((i * 3 + 1) % 7) as f32) / 8.0 + 1.0;
+    }
+    let mut o: [f32; 32] = [0.0; 32];
+    let mut out: [f32; 1] = [0.0; 1];
+    let l: f32 = loss(q, k, v, o, out);
+    for i in 0..32 { print(o[i]); }
+    print(out[0]);
+
+    let mut o2: [f32; 32] = [0.0; 32];
+    let mut out2: [f32; 1] = [0.0; 1];
+    let l2: f32 = loss_full(q, k, v, o2, out2);
+    for i in 0..32 { print(o2[i]); }
+    print(out2[0]);
+    if l != out[0] || l2 != out2[0] {
+        return 1;
+    }
+    return 0;
+}

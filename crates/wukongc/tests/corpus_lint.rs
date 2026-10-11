@@ -43,13 +43,25 @@ use std::path::{Path, PathBuf};
 /// tolerance it likes, and the corpus will refuse it until its provenance is written down here.
 /// The token is matched **as text**, so `2e-7` and `0.0000002` are different entries and a silent
 /// re-spelling cannot slip a different number past review.
-const DECLARED_TOLERANCES: &[(&str, &str)] = &[(
-    "1.625e-7",
-    "wukong_runtime/src/vmath.rs:124 and :261 — the exp kernel's maximum relative error against \
-     f64 `exp`, measured EXHAUSTIVELY over every f32 in [-87, 88.37626] by \
-     `vmath_exp_log_exhaustive_ulp` (1.625e-7, about 1.4 ULP; max 2 ULP). It is the kernel's own \
-     published contract, not a number chosen to make a fixture pass.",
-)];
+const DECLARED_TOLERANCES: &[(&str, &str)] = &[
+    (
+        "1.625e-7",
+        "wukong_runtime/src/vmath.rs:124 and :261 — the exp kernel's maximum relative error against \
+         f64 `exp`, measured EXHAUSTIVELY over every f32 in [-87, 88.37626] by \
+         `vmath_exp_log_exhaustive_ulp` (1.625e-7, about 1.4 ULP; max 2 ULP). It is the kernel's \
+         own published contract, not a number chosen to make a fixture pass.",
+    ),
+    (
+        "5e-4",
+        "wukong_runtime/src/attention.rs `# Numeric contract` and every correctness test there — \
+         the fused attention kernel is held to `1e-4 + 1e-4·|want|` against the materialized \
+         reference. `sdpa_loss_train.wk` makes every output lane a convex combination of V rows in \
+         [1, 1.75], so |o| >= 1 and that band is at most 2e-4 relative (plus ~2e-6 for the f32 \
+         reference's own rounding against f64); its printed loss is a sum of 32 positive squares, \
+         which at most doubles a relative error (4.1e-4 with the 32-term f32 sum). 5e-4 is that \
+         bound rounded up, derived from the kernel's contract rather than its output.",
+    ),
+];
 
 /// `.wk`-adjacent extensions that must never appear in a corpus directory. Each gate collects
 /// fixtures with `extension == \"wk\"`, so `foo.wk.bak` is silently not a fixture: renaming is the

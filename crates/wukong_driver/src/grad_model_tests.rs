@@ -292,3 +292,108 @@ fn object_emission_exports_the_gradient() {
     };
     assert!(!exports_gradient(&plain));
 }
+
+/// The `sdpa` loss of N83, written as source: three `@noalias` `[s, d]` inputs, the attention
+/// output and the loss sink. `L = Σ_i o_i²` with `o = sdpa(q, k, v)` — every output lane carries a
+/// nonzero upstream adjoint `2·o_i`, so a dropped or misrouted adjoint fails somewhere. `CAUSAL` is
+/// replaced by the flag under test.
+const SDPA_LOSS: &str = "@parallel\n\
+    fn loss(@noalias q: [f32; 32], @noalias k: [f32; 32], @noalias v: [f32; 32], \
+    mut o: [f32; 32], mut out: [f32; 1]) -> f32 {\n\
+    sdpa(q, k, v, o, 4, 8, 0.35355339, CAUSAL);\n\
+    let mut l: f32 = 0.0;\n\
+    for i in 0..32 { l = l + o[i] * o[i]; }\n\
+    out[0] = l;\n\
+    return l;\n\
+    }";
+
+/// `Σ_i o_i²` with `o = softmax(scale·Q·Kᵀ [causal])·V`, every operand `[s, d]` row-major, in f64:
+/// the scores are materialized, the softmax is max-subtracted, and query `i` sees keys `0..=i`
+/// under the causal mask — the attention definition, independent of the kernel's online recurrence.
+fn sdpa_loss_f64(
+    q: &[f64],
+    k: &[f64],
+    v: &[f64],
+    s: usize,
+    d: usize,
+    scale: f64,
+    causal: bool,
+) -> f64 {
+    let mut loss = 0.0;
+    for i in 0..s {
+        let keys = if causal { i + 1 } else { s };
+        let scores: Vec<f64> = (0..keys)
+            .map(|j| scale * (0..d).map(|t| q[i * d + t] * k[j * d + t]).sum::<f64>())
+            .collect();
+        let mx = scores.iter().fold(f64::NEG_INFINITY, |m, &x| m.max(x));
+        let e: Vec<f64> = scores.iter().map(|&x| (x - mx).exp()).collect();
+        let z: f64 = e.iter().sum();
+        for t in 0..d {
+            let o: f64 = (0..keys).map(|j| e[j] / z * v[j * d + t]).sum();
+            loss += o * o;
+        }
+    }
+    loss
+}
+
+/// N83: a loss calling the `sdpa` builtin differentiates from source. The lowering's static form
+/// (constant `s`/`d`, fixed-array operands, every input proved apart from `o`) is one bare
+/// `wukong_attention_f32` in a straight-line function, which is what `build_grad` accepts; the
+/// guarded form used to be refused as "`loss` has 16 blocks". `dQ`, `dK` and `dV` are checked at
+/// every element against the f64 CENTRAL FINITE DIFFERENCE of [`sdpa_loss_f64`] — the source's
+/// loss re-evaluated in f64 at the same f32 inputs, so the difference is free of the f32 forward's
+/// rounding (step `h = 1e-4`: truncation `O(h²)`, cancellation `~1e-16/h`, both far below the band).
+///
+/// The band is DECLARED, not fitted: `3e-3 + 3e-3·|ref|`, the closed-form band
+/// `wukong_autodiff`'s `tape_gate` holds every buffer-tape VJP to against an f64 reference — the
+/// band the in-crate attention VJP (`tests/attention.rs`) already meets on hand-built MIR. The
+/// analytic side runs the f32 recompute (`sgemm_nt_alpha`, softmax, the four adjoint GEMMs), which
+/// is what that band budgets for.
+#[test]
+fn sdpa_loss_from_source_matches_f64_finite_differences() {
+    let (s, d) = (4usize, 8usize);
+    let n = s * d;
+    let scale_f32: f32 = 0.353_553_39;
+    let scale = scale_f32 as f64;
+    // Exact dyadic values in [-11/16, 11/16], different for each operand.
+    let fill = |seed: usize| -> Vec<f32> {
+        (0..n)
+            .map(|i| ((i * 37 + seed * 11) % 23) as f32 / 16.0 - 11.0 / 16.0)
+            .collect()
+    };
+    for causal in [0u8, 1] {
+        let src = SDPA_LOSS.replace("CAUSAL", &causal.to_string());
+        for level in [1u8, 2] {
+            let (program, mut it) = compile_at(&src, level, "loss");
+            let (prog, _f, g) = grad_program(&program, &mut it, "loss", &[0, 1, 2]);
+            let inputs = vec![fill(1), fill(2), fill(3), vec![0.0; n], vec![0.0]];
+            let grads = analytic(&prog, g, &inputs, &[0, 1, 2], &it);
+            assert!(
+                grads.iter().flatten().any(|x| x.abs() > 1e-2),
+                "causal={causal} -O{level}: the gradient is trivially zero"
+            );
+            let wide: Vec<Vec<f64>> = inputs[..3]
+                .iter()
+                .map(|b| b.iter().map(|&x| x as f64).collect())
+                .collect();
+            let h = 1e-4;
+            for (gi, grad) in grads.iter().enumerate() {
+                for j in 0..n {
+                    let at = |delta: f64| {
+                        let mut ops = wide.clone();
+                        ops[gi][j] += delta;
+                        sdpa_loss_f64(&ops[0], &ops[1], &ops[2], s, d, scale, causal == 1)
+                    };
+                    let fd = (at(h) - at(-h)) / (2.0 * h);
+                    let a = grad[j] as f64;
+                    assert!(
+                        (a - fd).abs() <= 3e-3 + 3e-3 * fd.abs(),
+                        "causal={causal} -O{level} d{}[{j}]: analytic {a} vs f64 central \
+                         difference {fd}",
+                        ["q", "k", "v"][gi]
+                    );
+                }
+            }
+        }
+    }
+}
