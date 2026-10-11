@@ -1,0 +1,310 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -15
+// EXPECT-OUT: -12
+// EXPECT-OUT: -3
+// EXPECT-OUT: 12
+// EXPECT-OUT: 33
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -15
+// EXPECT-OUT: -12
+// EXPECT-OUT: -3
+// EXPECT-OUT: 12
+// EXPECT-OUT: 33
+// EXPECT-OUT: 60
+// EXPECT-OUT: 93
+// EXPECT-OUT: 132
+// EXPECT-OUT: 169
+// EXPECT-OUT: 220
+// EXPECT-OUT: 277
+// EXPECT-OUT: 340
+// EXPECT-OUT: 409
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -15
+// EXPECT-OUT: -12
+// EXPECT-OUT: -3
+// EXPECT-OUT: 12
+// EXPECT-OUT: 33
+// EXPECT-OUT: 60
+// EXPECT-OUT: 93
+// EXPECT-OUT: 132
+// EXPECT-OUT: 169
+// EXPECT-OUT: 220
+// EXPECT-OUT: 277
+// EXPECT-OUT: 340
+// EXPECT-OUT: 409
+// EXPECT-OUT: 484
+// EXPECT-OUT: 565
+// EXPECT-OUT: 652
+// EXPECT-OUT: 737
+// EXPECT-OUT: 836
+// EXPECT-OUT: 941
+// EXPECT-OUT: 1052
+// EXPECT-OUT: 1169
+// EXPECT-OUT: 1292
+// EXPECT-OUT: 1421
+// EXPECT-OUT: 1556
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 14
+// EXPECT-OUT: 21
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 14
+// EXPECT-OUT: 21
+// EXPECT-OUT: 28
+// EXPECT-OUT: 35
+// EXPECT-OUT: 42
+// EXPECT-OUT: 49
+// EXPECT-OUT: 56
+// EXPECT-OUT: 63
+// EXPECT-OUT: 70
+// EXPECT-OUT: 77
+module tests.run.opt4_tile_edge_guard
+
+// Guards on quantities DERIVED from a loop's counter, which `wukong_opt::unswitch` splits at -O2
+// once it has proved the derived quantity cannot wrap (so the guard is monotone):
+//
+//   tile_edge   `jo + j < n` -- the edge of a strip-mined loop, `jo` the enclosing counter (0, 8,
+//               16), so the inner `j` loop splits at `n - jo` and its main copy has no test
+//   stencil     `i + 1 < n` -- the unit addend, which the exit test itself keeps from wrapping
+//   below       `(i as u64) < m` -- a signed counter read unsigned against a usize bound, split
+//               only because the counter starts at 0 (proved non-negative)
+//
+// Every lane is printed for bounds before, inside and past the range, including negative ones.
+// Expected values from the scalar loops (a[k] = k*k - 5, b[k] = 3k + 2):
+//   tile_edge(n)  lane k: a[k]*3 - 8*(k/8) when k < n, else -1     (n = -3, 0, 5, 13, 30)
+//   stencil(n)    lane i < 15: b[i+1] - b[i] = 3 when i + 1 < n, else -1; lane 15 stays -1
+//                                                                  (n = -1, 1, 7, 16)
+//   below(m)      lane i: 7i when i < m, else -1                   (m = 0, 4, 100)
+
+fn tile_edge(mut out: [i32; 24], a: [i32; 24], n: i64) {
+    for jo in 0..24 step 8 {
+        for j in 0..8 {
+            if jo + j < n {
+                out[jo + j] = a[jo + j] * 3 - jo;
+            }
+        }
+    }
+}
+
+fn stencil(mut out: [i32; 16], b: [i32; 16], n: i64) {
+    for i in 0..15 {
+        if i + 1 < n {
+            out[i] = b[i + 1] - b[i];
+        }
+    }
+}
+
+fn below(mut out: [i32; 12], m: u64) {
+    for i in 0..12 {
+        if (i as u64) < m {
+            out[i] = i * 7;
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut a: [i32; 24] = [0; 24];
+    for k in 0..24 {
+        a[k] = k * k - 5;
+    }
+    let ns: [i64; 5] = [0 - 3, 0, 5, 13, 30];
+    for t in 0..5 {
+        let mut out: [i32; 24] = [0; 24];
+        for k in 0..24 {
+            out[k] = 0 - 1;
+        }
+        tile_edge(out, a, ns[t]);
+        for k in 0..24 {
+            print(out[k]);
+        }
+    }
+    let mut b: [i32; 16] = [0; 16];
+    for k in 0..16 {
+        b[k] = k * 3 + 2;
+    }
+    let sn: [i64; 4] = [0 - 1, 1, 7, 16];
+    for t in 0..4 {
+        let mut out: [i32; 16] = [0; 16];
+        for k in 0..16 {
+            out[k] = 0 - 1;
+        }
+        stencil(out, b, sn[t]);
+        for k in 0..16 {
+            print(out[k]);
+        }
+    }
+    let ms: [u64; 3] = [0, 4, 100];
+    for t in 0..3 {
+        let mut out: [i32; 12] = [0; 12];
+        for k in 0..12 {
+            out[k] = 0 - 1;
+        }
+        below(out, ms[t]);
+        for k in 0..12 {
+            print(out[k]);
+        }
+    }
+    return 0;
+}

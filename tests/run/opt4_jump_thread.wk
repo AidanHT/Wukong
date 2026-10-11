@@ -1,0 +1,203 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -5
+// EXPECT-OUT: 11
+// EXPECT-OUT: -5
+// EXPECT-OUT: 11
+// EXPECT-OUT: -5
+// EXPECT-OUT: 11
+// EXPECT-OUT: -5
+// EXPECT-OUT: 11
+// EXPECT-OUT: -5
+// EXPECT-OUT: 11
+// EXPECT-OUT: 0
+// EXPECT-OUT: 121
+// EXPECT-OUT: -3
+// EXPECT-OUT: 11
+// EXPECT-OUT: -3
+// EXPECT-OUT: 11
+// EXPECT-OUT: -3
+// EXPECT-OUT: 11
+// EXPECT-OUT: -3
+// EXPECT-OUT: 11
+// EXPECT-OUT: -3
+// EXPECT-OUT: 120
+// EXPECT-OUT: 0
+// EXPECT-OUT: 121
+// EXPECT-OUT: -1
+// EXPECT-OUT: 11
+// EXPECT-OUT: -1
+// EXPECT-OUT: 11
+// EXPECT-OUT: -1
+// EXPECT-OUT: 11
+// EXPECT-OUT: -6
+// EXPECT-OUT: 120
+// EXPECT-OUT: -3
+// EXPECT-OUT: 120
+// EXPECT-OUT: 0
+// EXPECT-OUT: 121
+// EXPECT-OUT: 1
+// EXPECT-OUT: 11
+// EXPECT-OUT: 1
+// EXPECT-OUT: 11
+// EXPECT-OUT: -9
+// EXPECT-OUT: 120
+// EXPECT-OUT: -6
+// EXPECT-OUT: 120
+// EXPECT-OUT: -3
+// EXPECT-OUT: 120
+// EXPECT-OUT: 0
+// EXPECT-OUT: 121
+// EXPECT-OUT: 3
+// EXPECT-OUT: 11
+// EXPECT-OUT: -12
+// EXPECT-OUT: 120
+// EXPECT-OUT: -9
+// EXPECT-OUT: 120
+// EXPECT-OUT: -6
+// EXPECT-OUT: 120
+// EXPECT-OUT: -3
+// EXPECT-OUT: 120
+// EXPECT-OUT: 0
+// EXPECT-OUT: 121
+// EXPECT-OUT: -15
+// EXPECT-OUT: 120
+// EXPECT-OUT: -12
+// EXPECT-OUT: 120
+// EXPECT-OUT: -9
+// EXPECT-OUT: 120
+// EXPECT-OUT: -6
+// EXPECT-OUT: 120
+// EXPECT-OUT: -3
+// EXPECT-OUT: 120
+// EXPECT-OUT: 8
+// EXPECT-OUT: 7
+// EXPECT-OUT: 6
+// EXPECT-OUT: 5
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 4
+// EXPECT-OUT: 3
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: -1
+// EXPECT-OUT: -2
+// EXPECT-OUT: -1
+// EXPECT-OUT: -2
+// EXPECT-OUT: -3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: -4
+// EXPECT-OUT: -5
+// EXPECT-OUT: -6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 80
+// EXPECT-OUT: 15
+// EXPECT-OUT: -24
+// EXPECT-OUT: -20
+// EXPECT-OUT: 17
+module tests.run.opt4_jump_thread
+
+// Branches an incoming edge already decides, which `wukong_opt::jump_thread` routes straight to the
+// decided successor at -O2 through a private copy of the deciding block:
+//
+//   twice      two diamonds on the same `x < n`: the second test sits in the join of the first, and
+//              both edges into it decide it (the join's `a` is read past it: SSA repair)
+//   implied    `x <= n` and `x >= n` below a branch on `x < n`: `x <= n` is decided on the true
+//              edge only, `x >= n` on both
+//   both       `c = x > 0 && y > 0; z = 3x + y; if c ..` -- the short-circuit's merge block also
+//              computes `z`, so the constant `false` its short edge passes is threaded through a
+//              copy of that work, not just an empty block
+//   in_loop    the same compare twice inside a loop body (a header is never threaded)
+//
+// Every result is printed over a grid that crosses each boundary. Expected values from the scalar
+// code:
+//   twice(x, n)    = x < n ? 2x + 1 : 3(n - x)                        x in -3..4, n in -2..3
+//   implied(x, n)  = (x < n ? 10 : 20) + (x <= n ? 1 : 0) + (x >= n ? 100 : 0)
+//   both(x, y)     = (x > 0 && y > 0) ? 3x + y : -(3x + y)
+//   in_loop(t)     = sum over i of (a[i] < t ? a[i] : -t), a[i] = (7i mod 11) - 4, t in -5..8 step 3
+
+fn twice(x: i32, n: i32) -> i32 {
+    let mut a = 0;
+    let mut b = 0;
+    if x < n {
+        a = x * 2;
+    } else {
+        a = n - x;
+    }
+    if x < n {
+        b = a + 1;
+    } else {
+        b = a * 3;
+    }
+    return b;
+}
+
+fn implied(x: i32, n: i32) -> i32 {
+    let mut r = 0;
+    if x < n {
+        r = 10;
+    } else {
+        r = 20;
+    }
+    if x <= n {
+        r = r + 1;
+    }
+    if x >= n {
+        r = r + 100;
+    }
+    return r;
+}
+
+fn both(x: i32, y: i32) -> i32 {
+    let c = x > 0 && y > 0;
+    let z = x * 3 + y;
+    if c {
+        return z;
+    }
+    return 0 - z;
+}
+
+fn in_loop(a: [i32; 16], t: i32) -> i32 {
+    let mut s = 0;
+    for i in 0..16 {
+        let mut w = 0;
+        if a[i] < t {
+            w = a[i];
+        } else {
+            w = t;
+        }
+        if a[i] < t {
+            s = s + w;
+        } else {
+            s = s - w;
+        }
+    }
+    return s;
+}
+
+fn main() -> i32 {
+    for x in 0 - 3..4 {
+        for n in 0 - 2..3 {
+            print(twice(x, n));
+            print(implied(x, n));
+        }
+    }
+    for x in 0 - 2..3 {
+        for y in 0 - 2..3 {
+            print(both(x, y));
+        }
+    }
+    let mut a: [i32; 16] = [0; 16];
+    for i in 0..16 {
+        a[i] = (i * 7) % 11 - 4;
+    }
+    for t in 0 - 5..8 step 3 {
+        print(in_loop(a, t));
+    }
+    return 0;
+}

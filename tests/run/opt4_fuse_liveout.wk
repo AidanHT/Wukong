@@ -1,0 +1,226 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 4414
+// EXPECT-OUT: -13
+// EXPECT-OUT: -12
+// EXPECT-OUT: -10
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 104592
+// EXPECT-OUT: -13
+// EXPECT-OUT: -12
+// EXPECT-OUT: -10
+// EXPECT-OUT: -7
+// EXPECT-OUT: -4
+// EXPECT-OUT: 0
+// EXPECT-OUT: 5
+// EXPECT-OUT: 10
+// EXPECT-OUT: 16
+// EXPECT-OUT: 22
+// EXPECT-OUT: 30
+// EXPECT-OUT: 38
+// EXPECT-OUT: 46
+// EXPECT-OUT: 56
+// EXPECT-OUT: 66
+// EXPECT-OUT: 76
+// EXPECT-OUT: -1000000
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 1550
+// EXPECT-OUT: -20
+// EXPECT-OUT: -20
+// EXPECT-OUT: -20
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -46
+// EXPECT-OUT: -45
+// EXPECT-OUT: -42
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 34175
+// EXPECT-OUT: -20
+// EXPECT-OUT: -20
+// EXPECT-OUT: -20
+// EXPECT-OUT: -18
+// EXPECT-OUT: -16
+// EXPECT-OUT: -12
+// EXPECT-OUT: -8
+// EXPECT-OUT: -3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 11
+// EXPECT-OUT: 20
+// EXPECT-OUT: 29
+// EXPECT-OUT: 40
+// EXPECT-OUT: 51
+// EXPECT-OUT: 64
+// EXPECT-OUT: 77
+// EXPECT-OUT: -46
+// EXPECT-OUT: -45
+// EXPECT-OUT: -42
+// EXPECT-OUT: -37
+// EXPECT-OUT: -29
+// EXPECT-OUT: -19
+// EXPECT-OUT: -6
+// EXPECT-OUT: 8
+// EXPECT-OUT: 25
+// EXPECT-OUT: 44
+// EXPECT-OUT: 66
+// EXPECT-OUT: 90
+// EXPECT-OUT: 117
+// EXPECT-OUT: 146
+// EXPECT-OUT: 177
+// EXPECT-OUT: 210
+module tests.run.opt4_fuse_liveout
+
+// Adjacent loops that `wukong_opt::fuse` merges at -O2 although the first one produces a value
+// read only after the second (a LIVE-OUT): the fused header still holds the first loop's final
+// value when the fused loop exits. `sum_scale` keeps its loops on stack-backed arrays; `slices`
+// runs them over three slice parameters, two of them `@noalias` (`@unchecked` drops the bounds
+// checks, so each loop is one block) -- the alias analysis proves the slices' elements disjoint, the
+// condition for fusing loops over parameter storage. (The divisions keep the front end's
+// elementwise vectorizer away, so the optimizer sees the loops.)
+//
+// a[k] = k*k - 40, src = a; buffers start at -1; `/` truncates toward zero. For n = 0, 3, 16:
+//   sum_scale  s = sum over i < n of (a[i]*a[i] - i);   b[j] = a[j]/3 + j (j < n)
+//              prints s, then the 16 lanes of b
+//   slices     m = max over i < n of (src[i]*src[i] - 50), starting from -1000000;
+//              tmp[i] = src[i]/2 - i;  out[j] = tmp[j]/3 + src[j]   (i, j < n)
+//              prints m, then the 16 lanes of tmp and of out
+
+fn sum_scale(a: [i32; 16], mut b: [i32; 16], n: i32) -> i32 {
+    let mut s = 0;
+    for i in 0..n {
+        s = s + a[i] * a[i] - i;
+    }
+    for j in 0..n {
+        b[j] = a[j] / 3 + j;
+    }
+    return s;
+}
+
+@unchecked
+fn slices(@noalias mut tmp: []i32, @noalias mut out: []i32, src: []i32, n: i64) -> i32 {
+    let mut m = 0 - 1000000;
+    for i in 0..n {
+        tmp[i] = src[i] / 2 - (i as i32);
+        m = max(m, src[i] * src[i] - 50);
+    }
+    for j in 0..n {
+        out[j] = tmp[j] / 3 + src[j];
+    }
+    return m;
+}
+
+fn main() -> i32 {
+    let mut a: [i32; 16] = [0; 16];
+    for k in 0..16 {
+        a[k] = k * k - 40;
+    }
+    let ns: [i32; 3] = [0, 3, 16];
+    for q in 0..3 {
+        let mut b: [i32; 16] = [0; 16];
+        for k in 0..16 {
+            b[k] = 0 - 1;
+        }
+        print(sum_scale(a, b, ns[q]));
+        for k in 0..16 {
+            print(b[k]);
+        }
+    }
+    for q in 0..3 {
+        let mut tmp: [i32; 16] = [0; 16];
+        let mut out: [i32; 16] = [0; 16];
+        for k in 0..16 {
+            tmp[k] = 0 - 1;
+            out[k] = 0 - 1;
+        }
+        print(slices(tmp, out, a, ns[q] as i64));
+        for k in 0..16 {
+            print(tmp[k]);
+        }
+        for k in 0..16 {
+            print(out[k]);
+        }
+    }
+    return 0;
+}
