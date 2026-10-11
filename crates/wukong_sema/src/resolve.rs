@@ -266,8 +266,46 @@ impl Sema<'_> {
     /// A function named `nm` that exists but is not in scope under that name: a method or associated
     /// function of a type (`Vec2.norm`), or an item of a module this file does not import
     /// (`lib.geom.norm`, the loader's spelling of `norm` in module `lib.geom`). Returns the help
-    /// text and, for a type's function, the path that names it (`Vec2::norm`).
+    /// text and, for a root type's function, the path that names it (`Vec2::norm`).
+    ///
+    /// A type's functions are found through the method table, which keys each by the type's
+    /// program-wide symbol whichever module holds the `impl`. An imported module's type carries
+    /// the loader's `<module>.<Type>` symbol (`lib.geom.Pt`), which no source can write: the help
+    /// names it `Pt`, and no edit is offered, since whether the calling file can write `Pt::norm`
+    /// (a glob import), must qualify it (`geom::Pt::norm`) or cannot name it at all depends on its
+    /// imports, which sema does not see.
     fn callee_elsewhere(&self, nm: &str) -> Option<(String, Option<String>)> {
+        let method = self.interner.get(nm);
+        let mut types: Vec<&str> = self
+            .methods
+            .resolution
+            .table
+            .keys()
+            .filter(|(_, m)| Some(*m) == method)
+            .map(|(t, _)| self.sym_str(*t))
+            .collect();
+        types.sort_unstable();
+        if let Some(&ty) = types.first() {
+            return Some(match ty.rsplit_once('.') {
+                None => (
+                    format!(
+                        "`{ty}` has a function named `{nm}`: call it as `{ty}::{nm}(..)`, or as a \
+                         method `value.{nm}(..)` when it takes `self`"
+                    ),
+                    Some(format!("{ty}::{nm}")),
+                ),
+                Some((module, short)) => (
+                    format!(
+                        "`{short}` (declared in module `{module}`) has a function named `{nm}`: \
+                         call it through the type, `{short}::{nm}(..)` with `{short}` in \
+                         scope, or as a method `value.{nm}(..)` when it takes `self`"
+                    ),
+                    None,
+                ),
+            });
+        }
+        // Otherwise a function of a module this file does not import: `<module>.nm`. A declared
+        // type's `Type.nm` is the method table's business above, never a module's.
         let suffix = format!(".{nm}");
         let mut owners: Vec<&str> = self
             .defs
@@ -275,30 +313,22 @@ impl Sema<'_> {
             .iter()
             .filter(|d| matches!(d.kind, DefKind::Fn(_)))
             .filter_map(|d| self.sym_str(d.name).strip_suffix(suffix.as_str()))
+            .filter(|owner| {
+                !self
+                    .interner
+                    .get(owner)
+                    .is_some_and(|s| self.is_declared_named_ty(s))
+            })
             .collect();
         owners.sort_unstable();
         let owner = *owners.first()?;
-        let is_type = self
-            .interner
-            .get(owner)
-            .is_some_and(|s| self.is_declared_named_ty(s));
-        Some(if is_type {
-            (
-                format!(
-                    "`{owner}` has a function named `{nm}`: call it as `{owner}::{nm}(..)`, or as \
-                     a method `value.{nm}(..)` when it takes `self`"
-                ),
-                Some(format!("{owner}::{nm}")),
-            )
-        } else {
-            (
-                format!(
-                    "a function `{nm}` is defined in module `{owner}`, which this file does not \
-                     import: add `import {owner};` (the function must be declared `pub`)"
-                ),
-                None,
-            )
-        })
+        Some((
+            format!(
+                "a function `{nm}` is defined in module `{owner}`, which this file does not \
+                 import: add `import {owner};` (the function must be declared `pub`)"
+            ),
+            None,
+        ))
     }
 
     /// Whether `base` (the left of `base::name` / `base.name`) names a TYPE used as a namespace — a

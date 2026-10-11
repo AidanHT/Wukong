@@ -33,6 +33,9 @@ All notable changes to Wukong are documented here. The format is loosely based o
     the whole pattern of a `let … else` (where `mut` parses), and absent for a local `const`, which
     takes no `mut`. Its other forms — a builtin or `mut self` method writing through a non-`mut`
     parameter, a store through a tensor view of one — carry no fix yet.
+  - `E0320`'s `Type::f` is offered for a type declared in the root file only. For an imported
+    module's type the help names the type as declared (`Pt`, never the loader's `lib.geom.Pt`) and
+    no edit is offered, since how the calling file may spell the type depends on its imports.
 - **The compile-fail gate pins the whole error stream (N12).** `// EXPECT-COUNT: <n>` and trailing
   `//~ <CODE>` (`//~^`/`//~v`) annotations pin how many errors a `tests/fail` fixture reports and the
   line of each; `WUKONG_BLESS=1 cargo test -p wukongc --test fail` rewrites them from the real output

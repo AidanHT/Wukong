@@ -2139,7 +2139,9 @@ none for a local `const`), and the resolution errors carry their did-you-mean an
 help text describes (`Type::f` for an associated function called bare, `()` for a method read like
 a field, the deleted argument list of a field called like a method). `E0304`'s other forms — a
 builtin or a `mut self` method writing through a non-`mut` parameter, or a store through a tensor
-view of one — carry no fix yet.
+view of one — carry no fix yet. `Type::f` is offered only for a type declared in the root file: an
+imported module's type is named in the help as its module declares it (`Pt`), with no edit, since
+how the calling file may spell it depends on that file's imports.
 
 **Statements end with `;`.** It may be left out only after a block-like statement — `if`,
 `match`, `loop`, `while`, `for`, a `{ … }` block — and, for any statement but a `let`, right

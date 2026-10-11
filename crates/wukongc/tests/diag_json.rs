@@ -138,3 +138,24 @@ fn e0321_carries_a_did_you_mean_replacement_of_the_name() {
     assert_eq!(replacement, "x", "{line}");
     assert_eq!(applicability, "maybe-incorrect", "{line}");
 }
+
+/// N5: an associated function of an IMPORTED type, called bare, is E0320 whose help names the
+/// type as its module declares it, `Pt`. The loader gives the type the program-wide symbol
+/// `lib.geom_assoc.Pt`, which no source can write, so the help must never show it and no edit
+/// may be offered: whether this file may write `Pt::norm` depends on its imports, which sema
+/// does not see.
+#[test]
+fn e0320_for_an_imported_type_never_names_the_loader_symbol() {
+    let line = first_json_line("import_assoc_fn_bare.wk");
+    assert!(
+        line.starts_with("{\"severity\":\"error\",\"code\":\"E0320\""),
+        "{line}"
+    );
+    assert!(!line.contains("lib.geom_assoc.Pt"), "{line}");
+    assert!(line.contains("\"suggestions\":[]"), "{line}");
+    assert!(
+        line.contains("`Pt` (declared in module `lib.geom_assoc`) has a function named `norm`"),
+        "{line}"
+    );
+    assert!(line.contains("`Pt::norm(..)`"), "{line}");
+}
