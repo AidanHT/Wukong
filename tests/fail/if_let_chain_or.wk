@@ -1,0 +1,16 @@
+// EXPECT-CODE: E0200
+// EXPECT-COUNT: 1
+module tests.fail.if_let_chain_or
+
+// An `if let` condition chains further conditions with `&&` only: `if let P = e && c` runs `c`
+// after `P` matched, with `P`'s names in scope. A `||` would make the block reachable without a
+// match, where those names do not exist, so it is rejected; group the alternatives instead:
+// `if let 1..=9 = k && (ok || k == 0)`.
+fn main() -> i32 {
+    let k: i32 = 3;
+    let ok: bool = true;
+    if let 1..=9 = k || ok { //~ E0200
+        print(k);
+    }
+    return 0;
+}

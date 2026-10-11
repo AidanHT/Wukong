@@ -215,6 +215,7 @@ heap_zero_init.wk: wukong_rt_alloc wukong_rt_alloc*9 wukong_rt_free wukong_rt_fr
 i8_linear.wk: wukong_i8gemm_nt
 i8_linear_dequant.wk: wukong_i8gemm_nt_deq
 i8_linear_parallel.wk: wukong_i8gemm_nt_parallel
+if_let_chain.wk:
 if_match_tensor_value.wk:
 if_match_value.wk:
 ihyp.wk: wukong_vmath_f32
