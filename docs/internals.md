@@ -197,6 +197,25 @@ runtime call each (`wukong_runtime::{attention_kv, gemv_half, quant}`): their ex
 the entry validates them against the operand lengths and returns a status the lowering asserts is
 zero; the interpreter runs the same validation and calls the same serial entry.
 
+**Match lowering and the exhaustiveness verdict.** `lower_match` lowers a `match` to an if-else chain
+of arm tests (`pattern_cond`); an arm's guard is lowered in a block only the pattern's success edge
+reaches, so it runs only after the pattern matched. Sema's pattern-usefulness analysis
+(`wukong_sema::usefulness`) decides E0405 and W0020, and it also publishes a positive verdict,
+`SemaResult::exhaustive_matches`: the `Match` ids it proved exhaustive over a concrete scrutinee type
+whose all-zero value it models (`zero_value_modeled` — mir_build zero-fills `let e: E;`, so an enum
+with no discriminant 0 would otherwise hold a value no arm models). It is recorded last-write-wins
+across literal-inference re-passes and never from an instance re-check. For a proven match
+`lower_match` takes the last unguarded arm untested — it binds the pattern, emits no compare and no
+`unreachable` fall-through — so the semantics are the same at every `-O` level and on every backend,
+with no MIR op or optimizer fold involved. That makes the analysis and `pattern_cond` a **mirror
+pair**: they must agree on which values each pattern matches, or a value they disagree on silently
+takes the last arm. `wukong_opt`'s `exhaustive_int_match_agrees_with_rust_on_every_value` pins the
+integer side on every `u8`/`i8` value; the two `char`-literal decoders are not pinned. An unproven
+match keeps every test and its trapping fall-through. The parser desugars `if let P = e && c` /
+`while let P = e && c` into that `match` with `c` as the first arm's guard, and `lower_for_array`
+binds a destructuring `for` head at each element's place through the same `bind_field_pattern` a
+match arm uses (sema requires the head irrefutable by form, so it is never tested).
+
 `wukong_driver::compile` orchestrates this and honors `--emit=<stage>` to stop early. Every stage
 prints its artifact on stdout except `--emit=obj` and `--emit=exe`, which write a file (`-o <path>`).
 Two combinations are usage errors rather than silently discarded work: `--run` with an explicit
@@ -528,7 +547,7 @@ invalidated, and the call-effect table for the callees optimized so far. A cache
 | `Vectorize`   | -O2   | widen eligible canonical MIR loops after LICM, then feed the result through the normal fixpoint cleanup |
 | `unroll_program`| -O2 | unroll a counted two-block loop: **completely** when its exact trip count is at most 32 and the copies total at most 128 instructions; otherwise 4x (body up to 16 instructions) or 2x (up to 32), with a wrap-safe guard and a remainder that is a loop for an unknown trip count, nothing when the factor divides a known one, and straight-line copies for a known leftover; runs **after** the function pipeline, and the functions it changed get a reduced simplify + simplify-cfg + simplify-phis + cse + dce cleanup sweep |
 | `unroll_jam` | -O2 | inside `unroll_program`, ahead of the unroller: a canonical two-deep nest whose inner loop carries a recurrence or reduction runs **four outer iterations side by side** — four row prologues, one shared inner counter, four inner bodies per iteration, four epilogues in row order — with the untouched nest as the remainder; nothing is reassociated, so each row's values are bit-identical. Legal only when every stored object is split into per-row slabs (row-major `x[r*P + t]` with the window checked, the pitch possibly the inner loop's runtime bound, or time-major `x[t*D + d]` with every row below `D`), objects that may be one buffer are range-checked once in the preheader, and nothing calls, allocates or can trap (`src/unroll_jam.rs`; `WUKONG_NO_UNROLL_JAM=1` turns it off) |
-| `FormSwitches` | -O2 | once, after unrolling: turn a chain of four or more `cmp.eq`/`cmp.ne` tests of one integer scrutinee against constants into one `switch` terminator, hoisting the pure link compares into the head; a trapping (`unreachable`) fall-through stays the default, because sema's exhaustiveness check is lenient and that block can be reached (`src/switch_form.rs`) |
+| `FormSwitches` | -O2 | once, after unrolling: turn a chain of four or more `cmp.eq`/`cmp.ne` tests of one integer scrutinee against constants into one `switch` terminator, hoisting the pure link compares into the head. A match sema proved exhaustive reaches it with no trap at all (`lower_match` took its last arm untested, so that arm's body is the default); an unproven match's trapping (`unreachable`) fall-through stays the default, never folded, because that block can be reached and folding it here would make `-O0` and `-O2` disagree (`src/switch_form.rs`) |
 
 `-O3` currently runs the same pass pipeline as `-O2`: there are no `-O3`-exclusive passes yet
 (`PassManager::standard` adds passes at `-O1` and `-O2` only).

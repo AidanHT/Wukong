@@ -489,6 +489,7 @@ for i in 0..n { ... }
 for i in 0..n step 2 { ... }   // strided range; empty if lo >= hi
 for i in 0..=n { ... }          // inclusive range
 for x in arr { ... }            // iterate an array, slice, or alloc_* buffer by element
+for (i, x) in pairs { ... }     // ✅ destructure each element of an array or slice
 loop { ... }                    // ✅ infinite loop; exit with `break`
 break; continue;                // ✅ innermost loop
 'outer: for i in 0..n {         // ✅ a loop label
@@ -501,6 +502,18 @@ Blocks are expressions: the trailing expression of a block (no semicolon) is its
 `break`/`continue` with no enclosing loop is a compile error (`E0303`). A `for` iterates either a
 range (`..` or `..=`, with an optional `step`) or any iterable value — a fixed-size array, a slice, or
 a heap buffer — binding each element.
+
+**Destructuring `for` heads** (✅): over an array or a slice, the loop pattern may destructure each
+element — `for (i, x) in pairs`, `for Point { x, y } in pts`, `for [a, .., z] in rows`,
+`for ((a, b), c) in nest`, `for w @ (a, _) in ts`. Each element binds exactly as
+`let <pat> = a[i];` would: a scalar part is a fresh copy (assigning to it never writes back), an
+aggregate part is bound in place. The pattern is never tested, so it must be irrefutable by its
+form — names, `_`, tuples, structs (with or without `..`), array patterns, `name @ sub` and the
+variant of a one-variant enum. A literal, range, path, or-pattern or multi-variant enum variant
+anywhere inside is `E0442` (`for (0, x) in pairs`; match inside the body instead), and a range
+`for` or any iterand other than an array or slice cannot destructure (`E0401`)
+(`tests/run/for_destructure.wk`, `tests/fail/for_head_refutable.wk`,
+`tests/fail/for_range_destructure.wk`).
 
 A **loop label** `'name:` on a `loop`/`while`/`for` lets a nested `break 'name` / `continue 'name`
 target that named outer loop instead of the innermost one — the lexer tells a label `'outer` from a
@@ -530,7 +543,12 @@ fn classify(n: i32) -> i32 {
 
 `match` evaluates its scrutinee once and lowers to an if-else chain over the arms (at `-O2`, a run
 of four or more equality tests on one integer scrutinee becomes a single `switch`, which the native
-backend emits as a jump table or a search tree; the semantics are the chain's). Patterns are
+backend emits as a jump table or a search tree; the semantics are the chain's). A guard runs only
+after its arm's pattern matched, so it may call functions with effects and read the arm's bindings
+(`tests/run/match_guard_order.wk`). A match the compiler **proves exhaustive** takes its last
+unguarded arm without testing it: a value that failed every arm before it can only match that one.
+An exhaustive `bool` match is one branch and an N-variant enum dispatch N − 1 tests, identically at
+every `-O` level and on every backend (`tests/run/match_exhaustive_fallthrough.wk`). Patterns are
 integer/bool **literals**, **or-patterns** `A | B | C`, half-open `lo..hi` / inclusive `lo..=hi`
 **ranges** whose bounds are integer or char **literals** (a `const` bound such as `0..N` parses but
 does not lower — it reports `C0001` at the pattern; inline the literal), **enum-variant** patterns
@@ -574,7 +592,16 @@ each into a `match`:
 if let Shape::Circle(r) = s { use(r); } else { other(); }   // match s { P => …, _ => … }
 while let 1..=100 = k { k = k - 7; }                         // loop { match k { P => …, _ => break } }
 let Shape::Circle(r) = s else { return 0; };                 // `r` is bound after this line
+if let Shape::Circle(r) = s && r > 2 && r < 9 { use(r); }    // match s { P if r > 2 && r < 9 => …, _ => … }
+while let 1..=9 = k && k != 5 { k = k + 1; }                 // the guard joins the loop's arm
 ```
+
+An **`&&` chain** after an `if let` / `while let` scrutinee (✅) becomes the guard of the pattern's
+arm: the conditions run only after the pattern matched, left to right with short-circuit, and see
+its bindings — Rust's let chains with one `let`. The scrutinee therefore stops before a top-level
+`&&` (`if let true = a == b && c` tests `a == b`, then `c`); a second `let` in the chain, or a `||`
+after the condition, is `E0200` (group it: `&& (a || b)`; `tests/run/if_let_chain.wk`,
+`tests/fail/if_let_chain_or.wk`).
 
 The `else` of a `let … else` must **diverge** — `return`, `break`, `continue`, or a `loop` with no
 exit — because the names its pattern binds do not exist on that path (`E0401` otherwise). A plain
@@ -582,7 +609,8 @@ exit — because the names its pattern binds do not exist on that path (`E0401` 
 for every other shape, so it is `E0442`, with a witness naming a value it misses
 (`tests/run/patterns_struct_binding_slice.wk`, `tests/fail/let_refutable_pattern.wk`,
 `tests/fail/let_else_not_diverging.wk`). Not yet: a `rest @ ..` sub-array binding, a binding
-inside an or-pattern, `if let … && cond` chains, and destructuring in a `for` head.
+inside an or-pattern (`C0001` at the pattern), an array pattern on a `[]T` slice, and more than one
+`let` in an `if let` chain.
 
 A literal pattern must be **in range for the scrutinee's type**: `match n { 200 => … }` against an
 `i8` is an `E0431` ("literal `200` is out of range for `i8` (-128..=127)"), not a value truncated to
@@ -611,6 +639,12 @@ non-exhaustive value match used to fall through to a zero default, and a stateme
 `match_payload_subpattern_nonexhaustive.wk`, `match_tuple_nonexhaustive.wk`). The same analysis
 reports an arm no value can reach — every value it matches is matched by an earlier unguarded arm —
 as the warning `W0020` (`unreachable_patterns`).
+
+The proof that lets the last arm go untested covers only values the analysis models. One value
+escapes it: a `let e: E;` with no initializer is zero-filled, so an `enum E { A = 1, B = 2 }` local
+holds discriminant 0, which no variant has. A match over a type whose all-zero value is not one the
+analysis models (such an enum, or a struct or tuple holding one) is therefore not *proven*: it keeps
+every test, and the forged value takes no arm (a value `match` traps there, as before).
 
 ## Tuples and structs ✅
 

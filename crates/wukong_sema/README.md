@@ -25,7 +25,10 @@ parse → wukong_sema::check → wukong_mir_build::lower_program → opt → bac
 ```
 
 `wukong_driver::compile` refuses `mir_build` if any returned diagnostic `is_error()`. `SemaResult`
-(`types`, `defs`, `consts`) is the contract `mir_build` reads.
+(`types`, `defs`, `consts`) is the contract `mir_build` reads. Its `exhaustive_matches` lists the
+`match` expressions pattern usefulness (`src/usefulness.rs`) proved exhaustive over a concrete type
+whose zero value it models; `mir_build` takes each one's last unguarded arm untested, so the
+analysis and `mir_build`'s `pattern_cond` must agree on what every pattern matches.
 
 **Lints** (`src/lints.rs`, the compiler's warnings `W0001`–`W0007`) are a separate pass, not part
 of `check`: the driver calls `lints::run(module, &SemaResult, …)` only after a clean `check`, then
