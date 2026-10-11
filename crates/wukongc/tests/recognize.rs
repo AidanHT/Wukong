@@ -22,6 +22,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
+#[path = "common/mod.rs"]
+mod common;
+
 fn fixture(name: &str) -> PathBuf {
     // CARGO_MANIFEST_DIR = crates/wukongc; the corpus lives at <repo>/tests/run.
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -88,11 +91,14 @@ fn wukongc(args: &[&str], path: &Path, no_recognize: bool) -> (Option<i32>, Stri
 /// Derivation of the bound: every printed lane of each fixture carries an `EXPECT-OUT-APPROX`
 /// tolerance `t <= 1e-3` against an independent f64 reference (each `t` cited in
 /// `corpus_lint.rs::DECLARED_TOLERANCES`), and both columns satisfy those same lines — `run.rs`
-/// holds the recognized column to them, and the recognition-off column was measured against them
-/// when the fixtures landed (worst lane at 0.9% of its tolerance). Two values each within `t|ref|`
-/// of the reference differ by at most `2t/(1-t)` relative to either: 2.002e-3 at `t = 1e-3`,
-/// declared as 2.1e-3. Measured on/off differences at landing: 2.1e-7 (loss), 1.4e-7 (rope),
-/// 1.8e-7 (rowkernels_wide) — one to two f32 ULP.
+/// holds the recognized column to them, and [`judge_on_off`] holds the recognition-off column to
+/// them on every axis of the corpus sweep (at landing the worst generic lane sat at 0.9% of its
+/// tolerance). Two values each within `t|ref|` of the reference differ by at most `2t/(1-t)`
+/// relative to either: 2.002e-3 at `t = 1e-3`, declared as 2.1e-3. That flat bound is the
+/// LOOSEST line's; a lane whose own line is `1e-5` is held to `1e-5` by the per-line check, not by
+/// it. Measured on/off differences at landing: 2.1e-7 (loss), 1.4e-7 (rope), 1.8e-7
+/// (rowkernels_wide) — one to two f32 ULP. Every entry must name a fixture the sweep reaches, and
+/// the sweep fails on one it never compared.
 const REASSOCIATION_TOLERANCES: &[(&str, f64)] = &[
     ("cov4_par_loss.wk", 2.1e-3),
     ("cov4_par_rope.wk", 2.1e-3),
@@ -105,6 +111,50 @@ fn tolerance_for(name: &str) -> Option<f64> {
         .iter()
         .find(|(n, _)| *n == name)
         .map(|(_, t)| *t)
+}
+
+/// A fixture's declared on/off tolerance together with its own parsed directives, or `None` when it
+/// has no entry (bit-exact). The directives are what [`judge_on_off`] holds the generic column to.
+fn declared_for(path: &Path, name: &str) -> Option<(f64, common::Directives)> {
+    let tol = tolerance_for(name)?;
+    let src = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let d = common::parse_directives(&src, name).unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        !d.out.is_empty(),
+        "{name} declares a REASSOCIATION_TOLERANCES entry but no EXPECT-OUT* line, so the \
+         recognition-off column would be held to nothing but the flat on/off bound"
+    );
+    Some((tol, d))
+}
+
+/// The whole recognition on/off verdict for one program/config pair.
+///
+/// Without a declared tolerance this is [`compare_outputs`], bit-exact. With one, the recognized
+/// (`on`) and generic (`off`) stdout must agree within it, AND the generic stdout must satisfy the
+/// fixture's own `EXPECT-OUT*` lines (`common::check_stdout`, the comparator `run.rs` holds the
+/// recognized column to).
+///
+/// The second half is the premise [`REASSOCIATION_TOLERANCES`] is derived from — "both columns
+/// satisfy those same lines" — made into an assertion. Nothing else executes the recognition-off
+/// column of a corpus program, and the flat on/off bound is sized for the fixture's loosest line
+/// (`t = 1e-3`), so without it the generic lowering of a lane whose own line demands `1e-5` could
+/// drift ~200x past that contract and stay green.
+fn judge_on_off(
+    on: &str,
+    off: &str,
+    declared: Option<(f64, &common::Directives)>,
+) -> Result<(), String> {
+    compare_outputs(on, off, declared.map(|(t, _)| t))?;
+    if let Some((_, d)) = declared {
+        common::check_stdout(off, d).map_err(|e| {
+            format!(
+                "the recognition-off column misses the fixture's own EXPECT-OUT* lines (the \
+                 premise its REASSOCIATION_TOLERANCES entry is derived from): {e}"
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// `|a - e| <= rel * |e|`, with the three cases the plain formula gets wrong — a NaN never matches,
@@ -188,6 +238,31 @@ fn the_output_comparator_is_strict_by_default_and_bounded_under_tolerance() {
     // A non-numeric mismatch and a line-count change are failures regardless of tolerance.
     assert!(compare_outputs("hello\n", "world\n", Some(1e-3)).is_err());
     assert!(compare_outputs("1\n2\n", "1\n", Some(1e-3)).is_err());
+}
+
+/// A declared on/off tolerance must not become the only thing holding the generic lowering. The
+/// flat bound is sized for a fixture's LOOSEST line, so on its own it lets a tightly-specified lane
+/// drift far past that lane's own `EXPECT-OUT-APPROX` contract with recognition off; the verdict
+/// therefore also holds the generic column to the fixture's own lines.
+#[test]
+fn a_declared_tolerance_holds_the_generic_column_to_the_fixtures_own_lines() {
+    // Two lanes mixing a 1e-5 and a 1e-3 contract, the way cov4_par_loss.wk does.
+    let src = "// EXPECT-EXIT: 0\n// EXPECT-OUT-APPROX: -14.348 1e-5\n// EXPECT-OUT-APPROX: 0.4380 1e-3\n";
+    let d = common::parse_directives(src, "probe.wk").expect("probe directives parse");
+    let on = "-14.348\n0.438\n";
+    // A generic column within both lines (and within the on/off bound): accepted.
+    assert!(judge_on_off(on, "-14.34801\n0.4381\n", Some((2.1e-3, &d))).is_ok());
+    // A generic column 4.9e-4 relative off on the 1e-5 lane: inside the flat 2.1e-3 on/off bound...
+    let drifted = "-14.355\n0.438\n";
+    assert!(compare_outputs(on, drifted, Some(2.1e-3)).is_ok());
+    // ...but ~50x outside that lane's own contract, which is what the verdict refuses.
+    assert!(judge_on_off(on, drifted, Some((2.1e-3, &d))).is_err());
+    // A generic column that meets its lines is still held to the on/off bound against the
+    // recognized one (here the recognized lane is 9% off).
+    assert!(judge_on_off("-14.348\n0.4\n", on, Some((2.1e-3, &d))).is_err());
+    // No declared tolerance: bit-exact, sign of zero included, and no directives are consulted.
+    assert!(judge_on_off("1\n2\n", "1\n2\n", None).is_ok());
+    assert!(judge_on_off("-0\n", "0\n", None).is_err());
 }
 
 /// The MIR of a matmul nest contains the tuned GEMM dispatch — the baseline the instrument is
@@ -293,6 +368,7 @@ fn no_recognize_keeps_the_program_correct_on_both_backends() {
         "parallel_dependence.wk",
     ] {
         let p = fixture(name);
+        let declared = declared_for(&p, name);
         for opt in ["-O0", "-O2"] {
             for backend in ["--backend=interp", "--backend=native"] {
                 let on = wukongc(&["--run", opt, backend], &p, false);
@@ -303,7 +379,8 @@ fn no_recognize_keeps_the_program_correct_on_both_backends() {
                 // tolerance-aware comparator so a fixture that prints a reassociating kernel's raw
                 // lanes can declare its `c*sqrt(K)*eps` bound in REASSOCIATION_TOLERANCES instead of
                 // being restricted to data where neutrality is free. With no entry it is bit-exact.
-                if let Err(why) = compare_outputs(&on.1, &off.1, tolerance_for(name)) {
+                let declared = declared.as_ref().map(|(t, d)| (*t, d));
+                if let Err(why) = judge_on_off(&on.1, &off.1, declared) {
                     panic!(
                         "{name} {opt} {backend}: recognition off changed the observable output\n{why}\n\
                          stderr(off): {}",
@@ -542,6 +619,9 @@ const NATIVE_AXIS_WITHHELD: &[(&str, &str)] = &[];
 fn every_recognizer_dependent_program_agrees_with_its_generic_lowering() {
     let mut mismatches = Vec::new();
     let mut checked = 0usize;
+    // The tolerance fixtures this sweep actually reached. An entry it never reaches (the program
+    // left the corpus, or stopped depending on a recognizer) is a stale exception, not a check.
+    let mut tolerance_checked: BTreeSet<&str> = BTreeSet::new();
     for (name, _) in NATIVE_AXIS_WITHHELD {
         assert!(
             corpus_census().iter().any(|c| &c.name == name),
@@ -555,6 +635,10 @@ fn every_recognizer_dependent_program_agrees_with_its_generic_lowering() {
             continue;
         }
         checked += 1;
+        let declared = declared_for(&c.path, &c.name);
+        if declared.is_some() {
+            tolerance_checked.insert(c.name.as_str());
+        }
         for (opt, backend) in [("-O2", "interp"), ("-O2", "native"), ("-O0", "interp")] {
             if backend == "native" && NATIVE_AXIS_WITHHELD.iter().any(|(n, _)| *n == c.name) {
                 continue;
@@ -572,7 +656,9 @@ fn every_recognizer_dependent_program_agrees_with_its_generic_lowering() {
                     "{} @ {opt} {backend} (recognizes {dependent:?}): exit {:?} (on) vs {:?} (off)",
                     c.name, on.0, off.0
                 ));
-            } else if let Err(why) = compare_outputs(&on.1, &off.1, tolerance_for(&c.name)) {
+            } else if let Err(why) =
+                judge_on_off(&on.1, &off.1, declared.as_ref().map(|(t, d)| (*t, d)))
+            {
                 mismatches.push(format!(
                     "{} @ {opt} {backend} (recognizes {dependent:?}):\n    {why}",
                     c.name
@@ -586,7 +672,21 @@ fn every_recognizer_dependent_program_agrees_with_its_generic_lowering() {
         mismatches.len(),
         mismatches.join("\n")
     );
-    eprintln!("checked {checked} recognizer-dependent program(s)");
+    let stale: Vec<&str> = REASSOCIATION_TOLERANCES
+        .iter()
+        .map(|(n, _)| *n)
+        .filter(|n| !tolerance_checked.contains(n))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "REASSOCIATION_TOLERANCES names {stale:?}, which this sweep never compared (not in the \
+         corpus, or no longer recognizer-dependent) — re-justify or delete the entry"
+    );
+    eprintln!(
+        "checked {checked} recognizer-dependent program(s); {} under a declared tolerance, each \
+         recognition-off column also held to the fixture's own EXPECT-OUT* lines",
+        tolerance_checked.len()
+    );
     for (name, why) in NATIVE_AXIS_WITHHELD {
         eprintln!("  native axis withheld for {name}: {why}");
     }
