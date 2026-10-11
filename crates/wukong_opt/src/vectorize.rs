@@ -382,6 +382,12 @@ enum Plan {
     /// A store only one arm makes ([`LinInst::PredStore`]): one scalar store per lane, to the lane's
     /// own element where the lane took the arm and to the scratch slot where it did not.
     PredStore,
+    /// The stores of a nested if-converted region, every path storing ([`LinInst::TreeStore`]):
+    /// one vector store per part of a tree of lane-wise `select`s.
+    TreeStore,
+    /// The same with a path that stores nothing: per lane, the tree's value to the lane's own
+    /// element where the lane's path stores and to the scratch slot where it does not.
+    TreePredStore,
 }
 
 /// One step of the loop body after **if-conversion**: the body's control flow is flattened into a
@@ -416,14 +422,25 @@ enum LinInst {
         then_arg: ValueId,
         else_arg: ValueId,
     },
-    /// `blocks[block].insts[idx]`, a load only the arm taken when `cond == on_true` makes, at an
-    /// address no unconditional access covers. Predicated per lane rather than speculated: a lane
-    /// that did not take the arm reads a scratch slot, never the element ([`Plan::PredLoad`]).
+    /// `blocks[block].insts[idx]`, a load only the path where every `(cond, polarity)` of `pred`
+    /// holds makes, at an address no unconditional access covers — one literal for an arm of a
+    /// diamond, one per enclosing branch for a nested arm. Predicated per lane rather than
+    /// speculated: a lane whose path does not reach it reads a scratch slot, never the element
+    /// ([`Plan::PredLoad`]).
     PredLoad {
         block: BlockId,
         idx: usize,
-        cond: ValueId,
-        on_true: bool,
+        pred: Vec<(ValueId, bool)>,
+    },
+    /// Every store an if-converted *nested* region makes ([`linearize_tree`]), all to one address:
+    /// what each lane's path leaves in it, as a tree over the region's branch conditions. Sunk to
+    /// the end of the region like the diamond's merged stores ([`Plan::TreeStore`],
+    /// [`Plan::TreePredStore`]).
+    TreeStore {
+        ptr: ValueId,
+        tree: StoreTree,
+        /// The first of the stores, for its `AddrForm`.
+        at: (BlockId, usize),
     },
     /// A store only the arm taken when `cond == on_true` makes (the other arm stores nothing): per
     /// lane, the element is written only where the lane took the arm ([`Plan::PredStore`]).
@@ -435,6 +452,92 @@ enum LinInst {
         /// The store itself, for its `AddrForm`.
         at: (BlockId, usize),
     },
+}
+
+/// What an if-converted region leaves in one memory location, per lane: the value of the last store
+/// on the lane's path, or nothing. Built by [`linearize_tree`] from the region's branches, so every
+/// `cond` is a branch condition of the loop body and selecting by it reproduces the path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum StoreTree {
+    /// No store on this path: the location keeps what it held.
+    Keep,
+    /// This path's last store writes this value.
+    Val(ValueId),
+    /// `cond ? then : els`.
+    Node {
+        cond: ValueId,
+        then: Box<StoreTree>,
+        els: Box<StoreTree>,
+    },
+}
+
+impl StoreTree {
+    fn node(cond: ValueId, then: StoreTree, els: StoreTree) -> StoreTree {
+        if then == StoreTree::Keep && els == StoreTree::Keep {
+            return StoreTree::Keep;
+        }
+        StoreTree::Node {
+            cond,
+            then: Box::new(then),
+            els: Box::new(els),
+        }
+    }
+
+    /// `self`, then `later` on the same path: `later`'s store wins wherever it stores.
+    fn followed_by(self, later: StoreTree) -> StoreTree {
+        match later {
+            StoreTree::Keep => self,
+            StoreTree::Val(v) => StoreTree::Val(v),
+            StoreTree::Node { cond, then, els } => StoreTree::node(
+                cond,
+                self.clone().followed_by(*then),
+                self.followed_by(*els),
+            ),
+        }
+    }
+
+    /// Does every path store?
+    fn complete(&self) -> bool {
+        match self {
+            StoreTree::Keep => false,
+            StoreTree::Val(_) => true,
+            StoreTree::Node { then, els, .. } => then.complete() && els.complete(),
+        }
+    }
+
+    /// Every condition, then every stored value, in tree order.
+    fn operands(&self, conds: &mut Vec<ValueId>, vals: &mut Vec<ValueId>) {
+        match self {
+            StoreTree::Keep => {}
+            StoreTree::Val(v) => vals.push(*v),
+            StoreTree::Node { cond, then, els } => {
+                conds.push(*cond);
+                then.operands(conds, vals);
+                els.operands(conds, vals);
+            }
+        }
+    }
+}
+
+/// A slice bounds check inside an if-converted arm (`if c { o[i] = v }` over a checked `[]T`):
+/// `iv + off <u len` or the program aborts. The vector loop drops the check and runs only when
+/// every index of its own iterations passes it ([`emit_len_checks`]), so no lane of it can be the
+/// one that would have aborted; otherwise `n_vec = 0` and the scalar loop checks, and aborts, at
+/// exactly the iteration it always did.
+#[derive(Clone, Copy, Debug)]
+struct LenCheck {
+    off: i64,
+    len: LenSrc,
+}
+
+/// Where a [`LenCheck`]'s length comes from, both readable in the guard block.
+#[derive(Clone, Copy, Debug)]
+enum LenSrc {
+    /// A value defined outside the loop.
+    Value(ValueId),
+    /// `load i64 at`, `at` defined outside the loop — a fat pointer's length field re-read in the
+    /// arm.
+    Load(ValueId),
 }
 
 /// Everything [`apply`] needs, decided before any mutation.
@@ -480,6 +583,8 @@ struct VecPlan {
     cost: (u64, u64),
     /// A search loop's early exit, tested once per group ([`EarlyExit`]).
     early: Option<EarlyExit>,
+    /// Bounds checks inside if-converted arms, discharged once in the guard ([`LenCheck`]).
+    len_checks: Vec<LenCheck>,
 }
 
 /// The early exit of a **search loop**: `while i < n { <test>; if !c { break } <rest>; i = i + 1 }`
@@ -730,7 +835,7 @@ fn pick(f: &Function, forest: &mut LoopForest, done: &FxHashSet<u32>) -> Option<
                         p.header.0,
                         p.w,
                         p.lin.len(),
-                        p.guards.len() + p.point_guards.len(),
+                        p.guards.len() + p.point_guards.len() + p.len_checks.len(),
                         p.reductions.len(),
                         p.cost.0,
                         p.cost.1
@@ -788,21 +893,71 @@ fn structural_verdict(f: &Function, l: &NaturalLoop) -> Result<(BlockId, BlockId
         return Err("not one latch / no abnormal exit");
     }
     if l.exits.len() != 1 {
-        if early_exit_of(f, l).is_none() {
+        if early_exit_of(f, l).is_none() && !only_dead_end_exits(f, l) {
             return Err("not one exit, nor a search loop's one early exit");
         }
     } else if l.exits[0].0 != l.header {
         return Err("exit is not tested in the header");
     }
-    // The cheap half of `linearize_region`'s precondition: one straight-line body block, or a
-    // diamond / triangle. Anything larger is not a shape if-conversion can flatten.
-    if l.blocks.len() > 5 {
-        return Err("body has more blocks than one diamond");
+    // The cheap half of the if-converters' precondition: a straight-line body, a diamond, or a
+    // small nest of them ([`linearize_tree`]). A loop holding another loop is none of those, and
+    // anything larger is not worth flattening.
+    if !l.children.is_empty() {
+        return Err("an outer loop");
+    }
+    if l.blocks.len() > MAX_REGION_BLOCKS {
+        return Err("body has more blocks than an if-converted region holds");
     }
     if !header_is_test_only(f, l) {
         return Err("the header computes more than the exit test");
     }
     Ok((preheader, l.latches[0]))
+}
+
+/// The most blocks a loop may have for [`linearize_tree`] to flatten it, header included: an
+/// `if / else if / else` chain of three stores, each behind a slice bounds check, is eleven.
+const MAX_REGION_BLOCKS: usize = 12;
+
+/// Does the loop leave only through its header test and dead ends — blocks outside the loop that
+/// end in `unreachable`, which is how a failed bounds check stops the program? Such a loop has one
+/// real exit; whether each dead end can be proved unreachable for the vector loop's iterations is
+/// [`linearize_tree`]'s question ([`LenCheck`]).
+///
+/// A dead end leaving from the body's unconditional spine — the blocks every iteration runs, from
+/// the body's first block through jumps and passed checks up to the first real branch — is refused
+/// here, before any value analysis: that check runs on every iteration, which is the shape of the
+/// slow copy `bce` keeps of a versioned slice loop, a cold path that widening would only make
+/// bigger (see [`early_exit_of`]). Only a check inside an arm is [`linearize_tree`]'s to discharge.
+fn only_dead_end_exits(f: &Function, l: &NaturalLoop) -> bool {
+    let dead =
+        |b: BlockId| !l.blocks.contains(&b) && matches!(f.block(b).term, Terminator::Unreachable);
+    let inside: Vec<BlockId> = succs(&f.block(l.header).term)
+        .into_iter()
+        .filter(|b| l.blocks.contains(b))
+        .collect();
+    let [entry] = inside.as_slice() else {
+        return false;
+    };
+    let mut spine = vec![*entry];
+    let mut cur = *entry;
+    while spine.len() <= l.blocks.len() {
+        let next = match &f.block(cur).term {
+            Terminator::Br { target, .. } if *target != l.header => *target,
+            Terminator::CondBr {
+                then_blk, else_blk, ..
+            } if dead(*else_blk) => *then_blk,
+            Terminator::CondBr {
+                then_blk, else_blk, ..
+            } if dead(*then_blk) => *else_blk,
+            _ => break,
+        };
+        spine.push(next);
+        cur = next;
+    }
+    l.exits.iter().filter(|(b, _)| *b == l.header).count() == 1
+        && l.exits
+            .iter()
+            .all(|&(b, out)| b == l.header || (!spine.contains(&b) && dead(out)))
 }
 
 /// Is this a unit-stride counted loop over an integer induction variable?
@@ -835,8 +990,16 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
     // ---- structure -------------------------------------------------------------------------
     let (preheader, body) = structural_verdict(f, l)?;
     // The body is either one straight-line block (which is then also the latch), or a diamond /
-    // triangle that if-conversion flattens into one. Either way the latch carries the back edge.
-    // A search loop's body is its exiting block followed by the latch, the test between them.
+    // triangle that if-conversion flattens into one, or a nest of them ([`linearize_tree`]).
+    // Either way the latch carries the back edge. A search loop's body is its exiting block
+    // followed by the latch, the test between them.
+    iv_verdict(l)?;
+    let iv_value = l.ivs[l
+        .primary_iv
+        .expect("iv_verdict accepted a primary induction variable")]
+    .value;
+    let mut len_checks: Vec<LenCheck> = Vec::new();
+    let mut scalar_path: Option<u64> = None;
     let (lin, early) = match early_exit_of(f, l) {
         Some((exiting, cond, continue_on_true)) => {
             let first = f.blocks[exiting.0 as usize].insts.len();
@@ -857,11 +1020,20 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
             };
             (lin, Some(early))
         }
-        None => (linearize_region(f, l, body)?, None),
+        // The single diamond first, exactly as before; a nest, a chain of `else if`s or an arm
+        // holding a bounds check falls through to the general region flattener.
+        None => match linearize_region(f, l, body) {
+            Ok(lin) if l.exits.len() == 1 => (lin, None),
+            _ => {
+                let t = linearize_tree(f, l, body, iv_value)?;
+                len_checks = t.len_checks;
+                scalar_path = Some(t.scalar_path);
+                (t.lin, None)
+            }
+        },
     };
 
     // ---- induction variable and trip count ---------------------------------------------------
-    iv_verdict(l)?;
     let iv = &l.ivs[l
         .primary_iv
         .expect("iv_verdict accepted a primary induction variable")];
@@ -924,7 +1096,7 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
         .filter(|p| {
             matches!(
                 p,
-                Plan::Widen | Plan::Cast(_) | Plan::MaskedStore | Plan::Merge
+                Plan::Widen | Plan::Cast(_) | Plan::MaskedStore | Plan::Merge | Plan::TreeStore
             )
         })
         .count()
@@ -970,8 +1142,9 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
     // ---- trip count ---------------------------------------------------------------------------
     let trip = match &l.trip {
         // A search loop has two exits, so the analysis reports no trip count; the header's test
-        // still bounds it, and the vector loop runs only whole groups below that bound.
-        _ if early.is_some() => early_trip(f, l, iv.value, iv.start, w)?,
+        // still bounds it, and the vector loop runs only whole groups below that bound. The same
+        // for a loop whose other exits are bounds checks' dead ends.
+        _ if early.is_some() || l.exits.len() != 1 => early_trip(f, l, iv.value, iv.start, w)?,
         TripCount::Const(n) => {
             let groups = n / w as u64;
             if groups < MIN_TRIP_GROUPS {
@@ -1008,7 +1181,7 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
     if let Some(x) = &early {
         early_exit_verdict(f, l, &lin, &plans, x, iv.value, iv.start)?;
     }
-    let mut cost = estimate_cost(f, &lin, &plans, &vector_ty, &reductions, body, w);
+    let mut cost = estimate_cost(f, &lin, &plans, &vector_ty, &reductions, body, w, scalar_path);
     if early.is_some() {
         // The lane test: a reduction over the mask's lanes, an extract and a branch.
         cost.0 += 2 + 2 * u64::from(w.trailing_zeros());
@@ -1034,6 +1207,7 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
         ramp_vector,
         cost,
         early,
+        len_checks,
     })
 }
 
@@ -1060,6 +1234,7 @@ const LOOP_OVERHEAD: u64 = 3;
 /// same-run A/B with `WUKONG_NO_VECTORIZE`, and a model that declines loops on an untuned guess
 /// trades measured wins for an unmeasured hunch. [`MAX_GUARD_PAIRS`] is the one limit that needs no
 /// tuning to be right.
+#[allow(clippy::too_many_arguments)]
 fn estimate_cost(
     f: &Function,
     lin: &[LinInst],
@@ -1068,6 +1243,7 @@ fn estimate_cost(
     reductions: &[RedPlan],
     latch: BlockId,
     w: u32,
+    scalar_path: Option<u64>,
 ) -> (u64, u64) {
     let w64 = u64::from(w);
     let parts = |t: &MirType| lanes_of(t).map_or(1, |l| u64::from((w / l).max(1)));
@@ -1098,10 +1274,27 @@ fn estimate_cost(
                 }
             }
             LinInst::PredStore { value, .. } => ty_of(*value),
+            LinInst::TreeStore { tree, .. } => {
+                let (mut conds, mut vals) = (Vec::new(), Vec::new());
+                tree.operands(&mut conds, &mut vals);
+                vals.first().map_or(MirType::I1, |v| ty_of(*v))
+            }
+        }
+    };
+    // A store tree's selects: one per branch it spans.
+    let tree_nodes = |s: &LinInst| -> u64 {
+        match s {
+            LinInst::TreeStore { tree, .. } => {
+                let (mut conds, mut vals) = (Vec::new(), Vec::new());
+                tree.operands(&mut conds, &mut vals);
+                conds.len() as u64
+            }
+            _ => 0,
         }
     };
 
-    // Scalar: every real step once per iteration, except the shorter of two if-converted arms.
+    // Scalar: every real step once per iteration, except the shorter of two if-converted arms —
+    // or, for a nested region, the instructions on its longest path ([`linearize_tree`]).
     let entry = match lin.first() {
         Some(LinInst::Real { block, .. }) => Some(block.0),
         _ => None,
@@ -1123,7 +1316,7 @@ fn estimate_cost(
         0
     };
     let total: u64 = per_block.values().sum();
-    let scalar = w64 * (total - skipped + LOOP_OVERHEAD);
+    let scalar = w64 * (scalar_path.unwrap_or(total - skipped) + LOOP_OVERHEAD);
 
     let mut vector = LOOP_OVERHEAD;
     for (s, plan) in lin.iter().zip(plans) {
@@ -1139,6 +1332,10 @@ fn estimate_cost(
             Plan::Replicate | Plan::LaneGep | Plan::Gather => 3 * w64,
             // Per lane: the lane's condition bit, an address select and the scalar access.
             Plan::PredLoad | Plan::PredStore => 4 * w64,
+            // A select per branch and a store, per part.
+            Plan::TreeStore => (tree_nodes(s) + 1) * parts(&step_ty(s)),
+            // Per lane: a select per branch for the bit and the value, then a predicated store.
+            Plan::TreePredStore => (2 * tree_nodes(s) + 4) * w64,
         };
     }
     for r in reductions {
@@ -1279,10 +1476,11 @@ fn linearize_region(
     let mut predicated: FxHashSet<(u32, usize)> = FxHashSet::default();
     for (mine, theirs) in [(&t_acc, &e_acc), (&e_acc, &t_acc)] {
         for a in mine.iter().filter(|a| a.kind == AccessKind::Load) {
-            let covered = theirs
-                .iter()
-                .chain(unconditional.iter())
-                .any(|b| same_place(a, b));
+            let covered = speculable_ptr_load(f, a)
+                || theirs
+                    .iter()
+                    .chain(unconditional.iter())
+                    .any(|b| same_place(a, b));
             if !covered {
                 if !matches!(a.addr, AddrForm::Affine { .. }) {
                     return Err("an arm loads an address the other arm never touches");
@@ -1390,8 +1588,7 @@ fn linearize_region(
                 lin.push(LinInst::PredLoad {
                     block: b,
                     idx,
-                    cond: *cond,
-                    on_true: Some(b) == t_blk,
+                    pred: vec![(*cond, Some(b) == t_blk)],
                 });
             } else {
                 lin.push(LinInst::Real { block: b, idx });
@@ -1412,6 +1609,633 @@ fn linearize_region(
     }
     lin.extend(straight(latch));
     Ok(lin)
+}
+
+/// May an if-converted arm's load run for every lane although only some lanes take the arm? A
+/// `[]T`'s data pointer, re-read from its fat pointer inside the arm that subscripts it, can: the
+/// fat pointer is a parameter's own storage, or a stack slot of this function, live for the whole
+/// call either way, and the vector body reads it once, in the guard ([`Plan::InvariantPtrLoad`]) —
+/// exactly what already happens to the same read outside an arm. Only a pointer-typed load at a
+/// parameter's or a local slot's own address qualifies.
+fn speculable_ptr_load(f: &Function, a: &MemAccess) -> bool {
+    let AddrForm::Invariant(MemBase::Outer(p)) = a.addr else {
+        return false;
+    };
+    a.kind == AccessKind::Load
+        && a.value_ty == MirType::Ptr
+        && (f.params.contains(&p)
+            || matches!(
+                op_of(f, p),
+                Some(Op::Alloca {
+                    space: wukong_mir::AddrSpace::Local,
+                    ..
+                })
+            ))
+}
+
+/// What [`linearize_tree`] hands back.
+struct TreeRegion {
+    lin: Vec<LinInst>,
+    len_checks: Vec<LenCheck>,
+    /// Instructions on the body's longest path, for the cost model's scalar side.
+    scalar_path: u64,
+}
+
+/// How a walk of one structured piece of the region ended ([`TreeWalk::walk`]).
+enum WalkEnd {
+    /// By a plain branch into its stop block, passing these arguments.
+    Args(Vec<ValueId>),
+    /// By a conditional whose join is the stop block itself, whose parameters it already merged.
+    Joined,
+}
+
+/// The state of one [`linearize_tree`] run.
+struct TreeWalk<'a> {
+    f: &'a Function,
+    l: &'a NaturalLoop,
+    /// Each block's successors inside the region, a bounds check's dead end left out.
+    succ: FxHashMap<u32, Vec<BlockId>>,
+    /// How many region edges enter each block.
+    preds: FxHashMap<u32, usize>,
+    /// The immediate post-dominator of every region block but the latch.
+    ipdom: FxHashMap<u32, BlockId>,
+    /// Blocks ending in a recognized bounds check: where they continue, and the check.
+    asserts: FxHashMap<u32, (BlockId, LenCheck)>,
+    /// Instructions a recognized bounds check consumes (its compare, its length load).
+    skip: FxHashSet<(u32, usize)>,
+    lin: Vec<LinInst>,
+    len_checks: Vec<LenCheck>,
+    /// The path predicate each visited block runs under.
+    pred_of: FxHashMap<u32, Vec<(ValueId, bool)>>,
+    /// Has the walk passed the region's first conditional? Stores before it stay in place.
+    branched: bool,
+    tree: StoreTree,
+    /// The first sunk store: its pointer and position (every sunk store must name its address).
+    store_at: Option<(ValueId, (BlockId, usize))>,
+    sunk_stores: Vec<(BlockId, usize)>,
+    loads: Vec<(BlockId, usize)>,
+}
+
+impl TreeWalk<'_> {
+    /// Emit `b`'s instructions under the path predicate `pred`.
+    fn visit(&mut self, b: BlockId, pred: &[(ValueId, bool)]) -> Result<(), &'static str> {
+        let f = self.f;
+        self.pred_of.insert(b.0, pred.to_vec());
+        for (idx, inst) in f.blocks[b.0 as usize].insts.iter().enumerate() {
+            if self.skip.contains(&(b.0, idx)) {
+                continue;
+            }
+            match &inst.op {
+                Op::Store { ptr, value } if self.branched => {
+                    let here = self.access(b, idx).ok_or("a store in the body has no analyzed address")?;
+                    if !matches!(here.addr, AddrForm::Affine { .. }) {
+                        return Err("an if-converted store does not step with the loop");
+                    }
+                    match self.store_at {
+                        None => self.store_at = Some((*ptr, (b, idx))),
+                        Some((_, (fb, fi))) => {
+                            let first = self.access(fb, fi).expect("recorded from an access");
+                            if !same_place(first, here) {
+                                return Err("an if-converted region stores to more than one place");
+                            }
+                        }
+                    }
+                    // On this path the location now holds `value`; elsewhere it is unchanged.
+                    let mut on_path = StoreTree::Val(*value);
+                    for &(c, pol) in pred.iter().rev() {
+                        on_path = if pol {
+                            StoreTree::node(c, on_path, StoreTree::Keep)
+                        } else {
+                            StoreTree::node(c, StoreTree::Keep, on_path)
+                        };
+                    }
+                    let tree = std::mem::replace(&mut self.tree, StoreTree::Keep);
+                    self.tree = tree.followed_by(on_path);
+                    self.sunk_stores.push((b, idx));
+                }
+                Op::Load(..) if !pred.is_empty() => {
+                    // Resolved once every block's predicate is known: a load some unconditional
+                    // access covers runs for every lane, any other is predicated per lane.
+                    self.loads.push((b, idx));
+                    self.lin.push(LinInst::PredLoad {
+                        block: b,
+                        idx,
+                        pred: pred.to_vec(),
+                    });
+                }
+                Op::Bin(BinOp::SDiv | BinOp::UDiv | BinOp::SRem | BinOp::URem, ..)
+                    if !pred.is_empty() =>
+                {
+                    return Err("an arm divides, which may fault on a lane that would not run it")
+                }
+                Op::Call { .. }
+                | Op::VecKernelCall { .. }
+                | Op::Alloca {
+                    space: wukong_mir::AddrSpace::Local,
+                    ..
+                } if !pred.is_empty() => {
+                    return Err("an arm has an effect that cannot be predicated")
+                }
+                op => {
+                    if matches!(op, Op::Load(..)) {
+                        self.loads.push((b, idx));
+                    }
+                    self.lin.push(LinInst::Real { block: b, idx });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn access(&self, b: BlockId, idx: usize) -> Option<&MemAccess> {
+        self.l
+            .accesses
+            .iter()
+            .find(|a| a.block == b && a.inst == idx)
+    }
+
+    /// Walk the structured piece from `b` until it branches into `stop`.
+    fn walk(
+        &mut self,
+        mut b: BlockId,
+        stop: BlockId,
+        pred: &[(ValueId, bool)],
+    ) -> Result<WalkEnd, &'static str> {
+        let f = self.f;
+        loop {
+            self.visit(b, pred)?;
+            if let Some(&(cont, chk)) = self.asserts.get(&b.0) {
+                // A bounds check only an arm makes is discharged once, in the guard; the same
+                // check on every iteration is the shape of `bce`'s cold slow copy.
+                if pred.is_empty() {
+                    return Err("a bounds check outside an if-converted arm");
+                }
+                self.len_checks.push(chk);
+                if cont == stop {
+                    return Ok(WalkEnd::Args(Vec::new()));
+                }
+                if self.preds.get(&cont.0) != Some(&1) {
+                    return Err("an unstructured join in the body");
+                }
+                b = cont;
+                continue;
+            }
+            match &f.blocks[b.0 as usize].term {
+                Terminator::Br { target, args } => {
+                    if *target == stop {
+                        return Ok(WalkEnd::Args(args.clone()));
+                    }
+                    if self.preds.get(&target.0) != Some(&1)
+                        || !f.blocks[target.0 as usize].params.is_empty()
+                    {
+                        return Err("an unstructured join in the body");
+                    }
+                    b = *target;
+                }
+                Terminator::CondBr {
+                    cond,
+                    then_blk,
+                    then_args,
+                    else_blk,
+                    else_args,
+                } => {
+                    let j = *self.ipdom.get(&b.0).ok_or("a branch with no join")?;
+                    if self.preds.get(&j.0) != Some(&2) || then_blk == else_blk {
+                        return Err("a join of more than two paths");
+                    }
+                    self.branched = true;
+                    let side = |me: &mut Self,
+                                    blk: BlockId,
+                                    direct: &[ValueId],
+                                    pol: bool|
+                     -> Result<Vec<ValueId>, &'static str> {
+                        if blk == j {
+                            return Ok(direct.to_vec());
+                        }
+                        if !direct.is_empty() {
+                            return Err("an arm block takes parameters");
+                        }
+                        let mut inner = pred.to_vec();
+                        inner.push((*cond, pol));
+                        match me.walk(blk, j, &inner)? {
+                            WalkEnd::Args(a) => Ok(a),
+                            WalkEnd::Joined => Err("a join of more than two paths"),
+                        }
+                    };
+                    let t_args = side(self, *then_blk, then_args, true)?;
+                    let e_args = side(self, *else_blk, else_args, false)?;
+                    let params = &f.blocks[j.0 as usize].params;
+                    if t_args.len() != params.len() || e_args.len() != params.len() {
+                        return Err("an arm passes the wrong number of arguments to its join");
+                    }
+                    for (k, &param) in params.iter().enumerate() {
+                        self.lin.push(LinInst::Merge {
+                            param,
+                            cond: *cond,
+                            then_arg: t_args[k],
+                            else_arg: e_args[k],
+                        });
+                    }
+                    if j == stop {
+                        return Ok(WalkEnd::Joined);
+                    }
+                    b = j;
+                }
+                _ => return Err("the body ends a block in neither a branch nor a jump"),
+            }
+        }
+    }
+}
+
+/// Two affine accesses at the same address — base, index and element type — or two loads of the
+/// same invariant location.
+fn same_place(a: &MemAccess, b: &MemAccess) -> bool {
+    match (&a.addr, &b.addr) {
+        (
+            AddrForm::Affine {
+                base: ba,
+                index: ia,
+                elem: ea,
+            },
+            AddrForm::Affine {
+                base: bb,
+                index: ib,
+                elem: eb,
+            },
+        ) => ba.same_object(*bb) && ia == ib && ea == eb,
+        (AddrForm::Invariant(ba), AddrForm::Invariant(bb)) => ba.same_object(*bb),
+        _ => false,
+    }
+}
+
+/// `v` as `iv + off`: the induction variable itself, or it plus or minus a constant.
+fn iv_offset(f: &Function, v: ValueId, iv: ValueId) -> Option<i64> {
+    if v == iv {
+        return Some(0);
+    }
+    let k = |x: ValueId| const_of(f, x).and_then(|k| i64::try_from(k).ok());
+    match op_of(f, v)? {
+        Op::Bin(BinOp::Add, a, b) if *a == iv => k(*b),
+        Op::Bin(BinOp::Add, a, b) if *b == iv => k(*a),
+        Op::Bin(BinOp::Sub, a, b) if *a == iv => k(*b)?.checked_neg(),
+        _ => None,
+    }
+}
+
+/// How many times the loop's instructions and terminators read `v`.
+fn reads_in_loop(f: &Function, l: &NaturalLoop, v: ValueId) -> usize {
+    let mut n = 0;
+    for &b in &l.blocks {
+        let blk = &f.blocks[b.0 as usize];
+        for inst in &blk.insts {
+            each_op_use(&inst.op, &mut |u| n += usize::from(u == v));
+        }
+        crate::each_term_use(&blk.term, &mut |u| n += usize::from(u == v));
+    }
+    n
+}
+
+/// A slice bounds check ending block `b`: `cond_br (idx <u len), cont, dead`, `dead` a block
+/// outside the loop that ends in `unreachable` (the failed check's call and trap), `idx` the
+/// induction variable plus a constant, `len` an `i64` readable before the loop. Returns where the
+/// block continues, the check, and the instructions only the check reads (its compare, and a
+/// length load from an address outside the loop), which the vector body drops.
+#[allow(clippy::type_complexity)]
+fn bounds_check_of(
+    f: &Function,
+    l: &NaturalLoop,
+    b: BlockId,
+    iv: ValueId,
+) -> Option<(BlockId, LenCheck, Vec<(u32, usize)>)> {
+    let Terminator::CondBr {
+        cond,
+        then_blk,
+        then_args,
+        else_blk,
+        else_args,
+    } = &f.blocks[b.0 as usize].term
+    else {
+        return None;
+    };
+    let dead = |x: BlockId| {
+        !l.blocks.contains(&x) && matches!(f.blocks[x.0 as usize].term, Terminator::Unreachable)
+    };
+    let (cont, on_true, args) = if dead(*else_blk) && l.blocks.contains(then_blk) {
+        (*then_blk, true, then_args)
+    } else if dead(*then_blk) && l.blocks.contains(else_blk) {
+        (*else_blk, false, else_args)
+    } else {
+        return None;
+    };
+    if !args.is_empty() || !f.blocks[cont.0 as usize].params.is_empty() || cont == l.header {
+        return None;
+    }
+    let Some(Op::Cmp(p, a, c)) = op_of(f, *cond) else {
+        return None;
+    };
+    let (idx, len) = match (p, on_true) {
+        (CmpOp::Ult, true) | (CmpOp::Uge, false) => (*a, *c),
+        (CmpOp::Ugt, true) | (CmpOp::Ule, false) => (*c, *a),
+        _ => return None,
+    };
+    if *f.value_type(idx) != MirType::I64 || *f.value_type(len) != MirType::I64 {
+        return None;
+    }
+    let off = iv_offset(f, idx, iv)?;
+    let in_loop = |v: ValueId| l.blocks.iter().any(|&bb| defined_in_block(f, bb, v));
+    let position = |v: ValueId| {
+        l.blocks.iter().find_map(|&bb| {
+            f.blocks[bb.0 as usize]
+                .insts
+                .iter()
+                .position(|i| i.result == Some(v))
+                .map(|i| (bb.0, i))
+        })
+    };
+    let mut skip = Vec::new();
+    let len = if !in_loop(len) {
+        LenSrc::Value(len)
+    } else {
+        let Some(Op::Load(at, MirType::I64)) = op_of(f, len) else {
+            return None;
+        };
+        if in_loop(*at) {
+            return None;
+        }
+        if reads_in_loop(f, l, len) == 1 {
+            skip.extend(position(len));
+        }
+        LenSrc::Load(*at)
+    };
+    if reads_in_loop(f, l, *cond) == 1 {
+        skip.extend(position(*cond));
+    }
+    Some((cont, LenCheck { off, len }, skip))
+}
+
+/// Flatten a loop body that is a small **nest** of conditionals — an `if / else if / else`
+/// chain, a diamond inside an arm, two diamonds in a row — into one straight line, and see through
+/// the bounds checks a checked `[]T` store or load puts inside an arm. [`linearize_region`] keeps
+/// the single diamond it always handled; this takes what it declines.
+///
+/// The region is the loop's blocks minus the header, a DAG from the header's one successor to the
+/// latch. A bounds check whose failure leaves for a dead end ([`bounds_check_of`]) is read as a
+/// plain jump to its passing side, its check recorded for the guard ([`LenCheck`]) — but only
+/// inside an arm: a check on every iteration is `bce`'s cold slow copy. The walk is **structured**:
+/// every conditional's two sides meet again at its immediate post-dominator, which no third path
+/// enters, and every other block is entered by one edge. So each block runs under a conjunction of
+/// branch conditions, its *path predicate*, and each join's parameters are one `select` on the
+/// branch that split it ([`LinInst::Merge`], nested merges composing).
+///
+/// Memory follows the diamond's rules, generalized to paths:
+///
+/// * **Stores** after the first conditional are sunk to the end of the region and must all name
+///   one address. What each lane's path leaves there is a [`StoreTree`] over the branch
+///   conditions — the last store on the path, or nothing — built store by store in program order
+///   and simplified by the conditions already decided on each path. A tree every path stores
+///   through is one vector store of nested selects (`else if` chains); otherwise each lane stores
+///   to its own element or to a scratch slot ([`Plan::TreePredStore`]). Stores before the first
+///   conditional stay in place, ahead of everything the region sinks.
+/// * **Loads** in an arm are speculated when an access on every path (the unconditional blocks,
+///   the latch) touches the same place, or when they re-read a slice parameter's data pointer
+///   ([`speculable_ptr_load`]); any other affine load is predicated by its path predicate
+///   ([`LinInst::PredLoad`]); anything else declines.
+/// * **Order**: sinking a store moves it past every later instruction, so no load may sit on a
+///   path after a store it could read — in the same block after it, or in a block reachable from
+///   it. Division and calls stay out of arms, as in a diamond.
+fn linearize_tree(
+    f: &Function,
+    l: &NaturalLoop,
+    latch: BlockId,
+    iv: ValueId,
+) -> Result<TreeRegion, &'static str> {
+    let entry = {
+        let inside: Vec<BlockId> = succs(&f.blocks[l.header.0 as usize].term)
+            .into_iter()
+            .filter(|b| l.blocks.contains(b))
+            .collect();
+        match inside.as_slice() {
+            [b] if *b != latch => *b,
+            _ => return Err("the header does not enter the body through one block"),
+        }
+    };
+    let region: Vec<BlockId> = l.blocks.iter().copied().filter(|&b| b != l.header).collect();
+
+    // ---- bounds checks and the region graph ---------------------------------------------------
+    let mut asserts: FxHashMap<u32, (BlockId, LenCheck)> = FxHashMap::default();
+    let mut skip: FxHashSet<(u32, usize)> = FxHashSet::default();
+    for &b in &region {
+        if let Some((cont, chk, sk)) = bounds_check_of(f, l, b, iv) {
+            asserts.insert(b.0, (cont, chk));
+            skip.extend(sk);
+        }
+    }
+    let mut succ: FxHashMap<u32, Vec<BlockId>> = FxHashMap::default();
+    let mut preds: FxHashMap<u32, usize> = FxHashMap::default();
+    for &b in &region {
+        let out: Vec<BlockId> = if let Some(&(cont, _)) = asserts.get(&b.0) {
+            vec![cont]
+        } else if b == latch {
+            Vec::new()
+        } else {
+            let s = succs(&f.blocks[b.0 as usize].term);
+            if s.is_empty() || s.iter().any(|t| !region.contains(t)) {
+                return Err("a block of the body leaves the loop");
+            }
+            s
+        };
+        for t in &out {
+            *preds.entry(t.0).or_default() += 1;
+        }
+        succ.insert(b.0, out);
+    }
+
+    // ---- post-dominators, over the region's DAG -----------------------------------------------
+    let mut order: Vec<BlockId> = Vec::new(); // postorder: every successor before its block
+    let mut seen: FxHashSet<u32> = FxHashSet::default();
+    let mut stack: Vec<(BlockId, usize)> = vec![(entry, 0)];
+    seen.insert(entry.0);
+    while let Some((b, k)) = stack.pop() {
+        let out = &succ[&b.0];
+        if k < out.len() {
+            stack.push((b, k + 1));
+            let t = out[k];
+            if seen.insert(t.0) {
+                stack.push((t, 0));
+            }
+        } else {
+            order.push(b);
+        }
+    }
+    if order.len() != region.len() || !seen.contains(&latch.0) {
+        return Err("a block of the body is not on a path to the latch");
+    }
+    let rank: FxHashMap<u32, usize> = order.iter().enumerate().map(|(i, b)| (b.0, i)).collect();
+    // A back edge inside the region would make a successor rank above its block.
+    if order
+        .iter()
+        .any(|b| succ[&b.0].iter().any(|t| rank[&t.0] >= rank[&b.0]))
+    {
+        return Err("the body has a cycle besides the loop's own");
+    }
+    let mut pdom: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for &b in &order {
+        let out = &succ[&b.0];
+        let mut set: Vec<u32> = if out.is_empty() {
+            if b != latch {
+                return Err("a block of the body is not on a path to the latch");
+            }
+            Vec::new()
+        } else {
+            let mut it = out.iter().map(|t| pdom[&t.0].clone());
+            let first = it.next().expect("non-empty");
+            it.fold(first, |acc, s| acc.into_iter().filter(|x| s.contains(x)).collect())
+        };
+        set.push(b.0);
+        pdom.insert(b.0, set);
+    }
+    let mut ipdom: FxHashMap<u32, BlockId> = FxHashMap::default();
+    for &b in &order {
+        // The closest strict post-dominator is the one with the most post-dominators of its own.
+        if let Some(&x) = pdom[&b.0]
+            .iter()
+            .filter(|&&x| x != b.0)
+            .max_by_key(|&&x| pdom[&x].len())
+        {
+            ipdom.insert(b.0, BlockId(x));
+        }
+    }
+
+    // ---- the walk -----------------------------------------------------------------------------
+    let mut w = TreeWalk {
+        f,
+        l,
+        succ,
+        preds,
+        ipdom,
+        asserts,
+        skip,
+        lin: Vec::new(),
+        len_checks: Vec::new(),
+        pred_of: FxHashMap::default(),
+        branched: false,
+        tree: StoreTree::Keep,
+        store_at: None,
+        sunk_stores: Vec::new(),
+        loads: Vec::new(),
+    };
+    match w.walk(entry, latch, &[])? {
+        WalkEnd::Joined => {}
+        WalkEnd::Args(a) if a.is_empty() && f.blocks[latch.0 as usize].params.is_empty() => {}
+        WalkEnd::Args(_) => return Err("the latch is entered by one edge with arguments"),
+    }
+    if !w.branched {
+        return Err("the body has no conditional to flatten");
+    }
+
+    // ---- order: no load after a store it could read ----------------------------------------
+    let reaches = |from: BlockId, to: BlockId| -> bool {
+        let mut todo = vec![from];
+        let mut seen: FxHashSet<u32> = FxHashSet::default();
+        while let Some(b) = todo.pop() {
+            for &t in &w.succ[&b.0] {
+                if t == to {
+                    return true;
+                }
+                if seen.insert(t.0) {
+                    todo.push(t);
+                }
+            }
+        }
+        false
+    };
+    for &(sb, si) in &w.sunk_stores {
+        for &(lb, li) in &w.loads {
+            if (lb == sb && li > si) || (lb != sb && reaches(sb, lb)) {
+                return Err("an if-converted region reads memory after writing it");
+            }
+        }
+    }
+
+    // ---- loads: speculate the covered ones, predicate the rest ----------------------------------
+    let uncond_blocks: FxHashSet<u32> = w
+        .pred_of
+        .iter()
+        .filter(|(_, p)| p.is_empty())
+        .map(|(b, _)| *b)
+        .chain(std::iter::once(latch.0))
+        .collect();
+    let unconditional: Vec<&MemAccess> = l
+        .accesses
+        .iter()
+        .filter(|a| uncond_blocks.contains(&a.block.0))
+        .collect();
+    let mut lin = std::mem::take(&mut w.lin);
+    for s in lin.iter_mut() {
+        let LinInst::PredLoad { block, idx, .. } = s else {
+            continue;
+        };
+        let a = w
+            .access(*block, *idx)
+            .ok_or("a load in the body has no analyzed address")?;
+        let covered =
+            speculable_ptr_load(f, a) || unconditional.iter().any(|b| same_place(a, b));
+        if covered {
+            *s = LinInst::Real {
+                block: *block,
+                idx: *idx,
+            };
+        } else if !matches!(a.addr, AddrForm::Affine { .. }) {
+            return Err("an arm loads an address no access on every path covers");
+        }
+    }
+
+    // ---- the sunk stores, then the latch --------------------------------------------------------
+    let tree = simplify_tree(std::mem::replace(&mut w.tree, StoreTree::Keep), &mut Vec::new());
+    if let Some((ptr, at)) = w.store_at {
+        if tree != StoreTree::Keep {
+            lin.push(LinInst::TreeStore { ptr, tree, at });
+        }
+    }
+    lin.extend(
+        (0..f.blocks[latch.0 as usize].insts.len()).map(|idx| LinInst::Real { block: latch, idx }),
+    );
+
+    // ---- the scalar side of the cost model: the longest path ----------------------------------
+    let mut longest: FxHashMap<u32, u64> = FxHashMap::default();
+    for &b in &order {
+        let own = f.blocks[b.0 as usize].insts.len() as u64;
+        let tail = w.succ[&b.0]
+            .iter()
+            .map(|t| longest[&t.0])
+            .max()
+            .unwrap_or(0);
+        longest.insert(b.0, own + tail);
+    }
+    Ok(TreeRegion {
+        lin,
+        len_checks: w.len_checks,
+        scalar_path: longest[&entry.0],
+    })
+}
+
+/// Drop every test of a condition the path to it has already decided.
+fn simplify_tree(t: StoreTree, known: &mut Vec<(ValueId, bool)>) -> StoreTree {
+    match t {
+        StoreTree::Node { cond, then, els } => {
+            if let Some(&(_, v)) = known.iter().find(|(c, _)| *c == cond) {
+                return simplify_tree(if v { *then } else { *els }, known);
+            }
+            known.push((cond, true));
+            let t2 = simplify_tree(*then, known);
+            known.pop();
+            known.push((cond, false));
+            let e2 = simplify_tree(*els, known);
+            known.pop();
+            StoreTree::node(cond, t2, e2)
+        }
+        leaf => leaf,
+    }
 }
 
 /// The search-loop shape [`EarlyExit`] widens, as `(exiting block, its condition, continue on
@@ -1828,8 +2652,20 @@ fn classify_iv_uses(
         // latch parameter or two stored *values*, and a lane-varying stored value is rejected
         // separately. Check it rather than assume it.
         let inst = match step {
-            LinInst::Real { block, idx } | LinInst::PredLoad { block, idx, .. } => {
+            LinInst::Real { block, idx } => &f.blocks[block.0 as usize].insts[*idx],
+            LinInst::PredLoad { block, idx, pred } => {
+                if pred.iter().any(|(c, _)| index.contains(&c.0)) {
+                    return None;
+                }
                 &f.blocks[block.0 as usize].insts[*idx]
+            }
+            LinInst::TreeStore { tree, .. } => {
+                let (mut conds, mut vals) = (Vec::new(), Vec::new());
+                tree.operands(&mut conds, &mut vals);
+                if conds.iter().chain(&vals).any(|v| index.contains(&v.0)) {
+                    return None;
+                }
+                continue;
             }
             LinInst::PredStore { cond, value, .. } => {
                 if index.contains(&cond.0) || index.contains(&value.0) {
@@ -2406,10 +3242,10 @@ fn plan_body(
                     index_only.insert(u.0, false);
                 }
             }
-            LinInst::PredLoad {
-                block, idx, cond, ..
-            } => {
-                index_only.insert(cond.0, false);
+            LinInst::PredLoad { block, idx, pred } => {
+                for (c, _) in pred {
+                    index_only.insert(c.0, false);
+                }
                 each_op_use(&f.blocks[block.0 as usize].insts[*idx].op, &mut |u| {
                     index_only.insert(u.0, false);
                 });
@@ -2418,6 +3254,13 @@ fn plan_body(
                 ptr, value, cond, ..
             } => {
                 for u in [*ptr, *value, *cond] {
+                    index_only.insert(u.0, false);
+                }
+            }
+            LinInst::TreeStore { ptr, tree, .. } => {
+                let (mut conds, mut vals) = (Vec::new(), Vec::new());
+                tree.operands(&mut conds, &mut vals);
+                for u in std::iter::once(ptr).chain(&conds).chain(&vals) {
                     index_only.insert(u.0, false);
                 }
             }
@@ -2556,21 +3399,21 @@ fn plan_body(
             // (`ptr + k`) or the scratch slot, so the address must be the group's one scalar address
             // and the condition a mask (or one answer for the group). Its lanes are packed wherever
             // a widened step reads them, like any replicated value.
-            LinInst::PredLoad {
-                block, idx, cond, ..
-            } => {
+            LinInst::PredLoad { block, idx, pred } => {
                 let inst = &f.blocks[block.0 as usize].insts[*idx];
                 let Op::Load(ptr, ty) = &inst.op else {
                     return None;
                 };
-                for u in [*ptr, *cond] {
+                for u in std::iter::once(*ptr).chain(pred.iter().map(|(c, _)| *c)) {
                     if (defined_in_loop.contains(&u.0) && !available.contains(&u.0))
                         || lane_ptrs.contains(&u.0)
                     {
                         return None;
                     }
                 }
-                if lane_at(&vector_ty, at, *ptr).is_some() || red_cmp.contains(&cond.0) {
+                if lane_at(&vector_ty, at, *ptr).is_some()
+                    || pred.iter().any(|(c, _)| red_cmp.contains(&c.0))
+                {
                     return None;
                 }
                 if !matches!(
@@ -2620,6 +3463,56 @@ fn plan_body(
                 lane_bytes(f.value_type(*value))?;
                 replicated += 1;
                 plans.push(Plan::PredStore);
+                continue;
+            }
+            // A nested region's stores, one address: a vector store of nested selects when every
+            // path stores (each condition must then be a real lane mask, since a uniform `i1`
+            // cannot blend vectors), a per-lane predicated store otherwise.
+            LinInst::TreeStore {
+                ptr,
+                tree,
+                at: store_at,
+            } => {
+                let (mut conds, mut vals) = (Vec::new(), Vec::new());
+                tree.operands(&mut conds, &mut vals);
+                for &u in std::iter::once(ptr).chain(&conds).chain(&vals) {
+                    if (defined_in_loop.contains(&u.0) && !available.contains(&u.0))
+                        || lane_ptrs.contains(&u.0)
+                    {
+                        return None;
+                    }
+                }
+                if lane_at(&vector_ty, at, *ptr).is_some()
+                    || conds.iter().any(|c| red_cmp.contains(&c.0))
+                    || vals.iter().any(|v| iv_addr.contains(&v.0))
+                {
+                    return None;
+                }
+                if !matches!(
+                    access_at.get(&(store_at.0 .0, store_at.1)).map(|a| &a.addr),
+                    Some(AddrForm::Affine { .. })
+                ) {
+                    return None;
+                }
+                let vt = f.value_type(*vals.first()?).clone();
+                if vals.iter().any(|v| *f.value_type(*v) != vt) {
+                    return None;
+                }
+                lane_bytes(&vt)?;
+                if tree.complete() {
+                    if !conds.iter().all(|c| is_vec(&vector_ty, *c)) {
+                        return None;
+                    }
+                    for v in &vals {
+                        if lane_vals.contains(&v.0) {
+                            packed.push(vt.clone());
+                        }
+                    }
+                    plans.push(Plan::TreeStore);
+                } else {
+                    replicated += 1;
+                    plans.push(Plan::TreePredStore);
+                }
                 continue;
             }
         };
@@ -3394,6 +4287,10 @@ fn apply(f: &mut Function, p: &VecPlan) {
     let start = guard_params[p.iv_index];
     let n_vec = emit_trip(&mut e, p, guard, start);
     let ok = emit_alias_checks(&mut e, p, guard);
+    let ok = match (ok, emit_len_checks(&mut e, p, guard, start, n_vec)) {
+        (Some(a), Some(b)) => Some(e.push(guard, MirType::I1, Op::Bin(BinOp::And, a, b))),
+        (a, b) => a.or(b),
+    };
     let n_vec = match ok {
         Some(cond) => {
             let zero = e.int(guard, &p.iv_ty, 0);
@@ -3561,6 +4458,51 @@ fn emit_trip(e: &mut Emit<'_>, p: &VecPlan, guard: BlockId, start: ValueId) -> V
             e.push(guard, p.iv_ty.clone(), Op::Select(ok, masked, zero))
         }
     }
+}
+
+/// The conjunction of the arms' bounds checks over the vector loop's own iterations, or `None`
+/// when there are none ([`LenCheck`]).
+///
+/// The vector loop runs `iv` over `[start, start + n_vec)`, so a check `iv + off <u len` holds on
+/// every one of its iterations exactly when `0 <= start + off` and `start + n_vec + off <= len`
+/// (signed, both sides `i64`; a length is never negative). The third test, `start + off <= start
+/// + n_vec + off`, refuses the one way that reasoning could break — the upper end wrapping — and
+/// costs one compare. The length is read here, once per entry: from the value the arm compared
+/// against, or re-loaded from the same address outside the loop. Re-reading it is the scalar
+/// loop's own answer only if no store in the loop can change it, which `plan_guards` already
+/// proves at run time for an invariant `i64` load the loop also performs.
+fn emit_len_checks(
+    e: &mut Emit<'_>,
+    p: &VecPlan,
+    guard: BlockId,
+    start: ValueId,
+    n_vec: ValueId,
+) -> Option<ValueId> {
+    if p.len_checks.is_empty() {
+        return None;
+    }
+    let vec_end = e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Add, start, n_vec));
+    let zero = e.int(guard, &p.iv_ty, 0);
+    let mut acc: Option<ValueId> = None;
+    for chk in &p.len_checks {
+        let len = match chk.len {
+            LenSrc::Value(v) => v,
+            LenSrc::Load(at) => e.push(guard, MirType::I64, Op::Load(at, MirType::I64)),
+        };
+        let k = e.int(guard, &p.iv_ty, chk.off);
+        let lo = e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Add, start, k));
+        let hi = e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Add, vec_end, k));
+        let from_zero = e.push(guard, MirType::I1, Op::Cmp(CmpOp::Sge, lo, zero));
+        let ordered = e.push(guard, MirType::I1, Op::Cmp(CmpOp::Sge, hi, lo));
+        let within = e.push(guard, MirType::I1, Op::Cmp(CmpOp::Sle, hi, len));
+        let a = e.push(guard, MirType::I1, Op::Bin(BinOp::And, from_zero, ordered));
+        let ok = e.push(guard, MirType::I1, Op::Bin(BinOp::And, a, within));
+        acc = Some(match acc {
+            None => ok,
+            Some(prev) => e.push(guard, MirType::I1, Op::Bin(BinOp::And, prev, ok)),
+        });
+    }
+    acc
 }
 
 /// The conjunction of every pair check, or `None` when no pair needed one.
@@ -3901,29 +4843,20 @@ fn emit_body(
             // A load one arm makes, lane by lane: each lane reads its own element if it took the
             // arm and the scratch slot if it did not, so no lane touches memory the scalar loop
             // leaves alone. The idle lanes' values are discarded by the arm's merge.
-            (
-                Plan::PredLoad,
-                LinInst::PredLoad {
-                    block,
-                    idx,
-                    cond,
-                    on_true,
-                },
-            ) => {
+            (Plan::PredLoad, LinInst::PredLoad { block, idx, pred }) => {
                 let inst = e.f.blocks[block.0 as usize].insts[*idx].clone();
                 let Op::Load(ptr, ty) = &inst.op else {
                     unreachable!("a predicated load is a load")
                 };
                 let ptr = resolve_uniform(&map, *ptr);
-                let bits = mask_lane_bools(e, vb, &map, *cond, p.w);
+                let bits = pred_lane_bools(e, vb, &map, pred, p.w);
                 let slot = scratch_slot(e, &mut scratch, ty);
                 let lanes = bits
                     .iter()
                     .enumerate()
                     .map(|(k, &bit)| {
                         let own = elem_ptr(e, vb, ptr, ty, k as i64);
-                        let (a, b) = if *on_true { (own, slot) } else { (slot, own) };
-                        let at = e.push(vb, MirType::Ptr, Op::Select(bit, a, b));
+                        let at = e.push(vb, MirType::Ptr, Op::Select(bit, own, slot));
                         e.push(vb, ty.clone(), Op::Load(at, ty.clone()))
                     })
                     .collect();
@@ -3959,6 +4892,32 @@ fn emit_body(
                 }
                 continue;
             }
+            // Every path of a nested region stores: one vector store per part of the select tree.
+            (Plan::TreeStore, LinInst::TreeStore { ptr, tree, .. }) => {
+                let lane = tree_lane_ty(e, tree);
+                let ptr = resolve_uniform(&map, *ptr);
+                let parts = tree_vector(e, vb, &map, tree, &lane, p.w);
+                for (k, value) in parts.into_iter().enumerate() {
+                    let at = part_ptr(e, vb, ptr, &lane, k);
+                    e.push_void(vb, Op::Store { ptr: at, value });
+                }
+                continue;
+            }
+            // Some path stores nothing: per lane, in lane order, the tree's value to the lane's own
+            // element where its path stores and to the scratch slot where it does not.
+            (Plan::TreePredStore, LinInst::TreeStore { ptr, tree, .. }) => {
+                let lane = tree_lane_ty(e, tree);
+                let ptr = resolve_uniform(&map, *ptr);
+                let slot = scratch_slot(e, &mut scratch, &lane);
+                let (bits, vals) = tree_lanes(e, vb, &map, tree, p.w);
+                let vals = vals.expect("a store tree with a store has a value");
+                for (k, (&v, &bit)) in vals.iter().zip(&bits).enumerate() {
+                    let own = elem_ptr(e, vb, ptr, &lane, k as i64);
+                    let at = e.push(vb, MirType::Ptr, Op::Select(bit, own, slot));
+                    e.push_void(vb, Op::Store { ptr: at, value: v });
+                }
+                continue;
+            }
             _ => {}
         }
         let LinInst::Real { block, idx } = step else {
@@ -3967,7 +4926,12 @@ fn emit_body(
         let inst = e.f.blocks[block.0 as usize].insts[*idx].clone();
         let inst = &inst;
         match &p.plans[i] {
-            Plan::MaskedStore | Plan::Merge | Plan::PredLoad | Plan::PredStore => {
+            Plan::MaskedStore
+            | Plan::Merge
+            | Plan::PredLoad
+            | Plan::PredStore
+            | Plan::TreeStore
+            | Plan::TreePredStore => {
                 unreachable!("handled above")
             }
             Plan::Reduce => continue, // folded after the body, see below
@@ -4304,6 +5268,114 @@ fn emit_body(
         );
     }
     (out, vb)
+}
+
+/// Each lane's truth of the path predicate `pred` (every `(cond, polarity)` holds), as an `i1`
+/// per lane, lowest iteration first. One literal is the lane mask's own bits; a nested arm's is
+/// their conjunction, a negated literal read through a `select` rather than a bitwise not (a mask
+/// lane is `1` in the interpreter and all-ones natively, and only `select` reads both alike).
+fn pred_lane_bools(
+    e: &mut Emit<'_>,
+    vb: BlockId,
+    map: &FxHashMap<u32, Wide>,
+    pred: &[(ValueId, bool)],
+    w: u32,
+) -> Vec<ValueId> {
+    let t = e.push(vb, MirType::I1, Op::ConstInt(1, MirType::I1));
+    let fa = e.push(vb, MirType::I1, Op::ConstInt(0, MirType::I1));
+    let mut acc: Option<Vec<ValueId>> = None;
+    for &(c, pol) in pred {
+        let bits = mask_lane_bools(e, vb, map, c, w);
+        let bits: Vec<ValueId> = if pol {
+            bits
+        } else {
+            bits.into_iter()
+                .map(|b| e.push(vb, MirType::I1, Op::Select(b, fa, t)))
+                .collect()
+        };
+        acc = Some(match acc {
+            None => bits,
+            Some(prev) => prev
+                .into_iter()
+                .zip(bits)
+                .map(|(a, b)| e.push(vb, MirType::I1, Op::Bin(BinOp::And, a, b)))
+                .collect(),
+        });
+    }
+    acc.unwrap_or_else(|| vec![t; w as usize])
+}
+
+/// The type a store tree stores: its first value's.
+fn tree_lane_ty(e: &Emit<'_>, tree: &StoreTree) -> MirType {
+    let (mut conds, mut vals) = (Vec::new(), Vec::new());
+    tree.operands(&mut conds, &mut vals);
+    e_ty(e, vals[0])
+}
+
+/// A complete store tree as parts: each node a lane-wise `select` of its two subtrees under its
+/// condition's mask, re-expressed at the stored lane's width.
+fn tree_vector(
+    e: &mut Emit<'_>,
+    vb: BlockId,
+    map: &FxHashMap<u32, Wide>,
+    tree: &StoreTree,
+    lane: &MirType,
+    w: u32,
+) -> Vec<ValueId> {
+    match tree {
+        StoreTree::Val(v) => to_vector(e, vb, map, *v, lane, w),
+        StoreTree::Node { cond, then, els } => {
+            let mask = mask_for(e, vb, map, *cond, lane);
+            let a = tree_vector(e, vb, map, then, lane, w);
+            let b = tree_vector(e, vb, map, els, lane, w);
+            (0..a.len())
+                .map(|k| e.push(vb, part_ty(lane), Op::Select(mask[k], a[k], b[k])))
+                .collect()
+        }
+        StoreTree::Keep => unreachable!("a complete store tree has no Keep leaf"),
+    }
+}
+
+/// A store tree lane by lane: whether lane `k`'s path stores (an `i1`), and the value it stores.
+/// Where a node has one storing side, that side's value stands for both, since a lane on the other
+/// side stores nothing and its value is never written.
+fn tree_lanes(
+    e: &mut Emit<'_>,
+    vb: BlockId,
+    map: &FxHashMap<u32, Wide>,
+    tree: &StoreTree,
+    w: u32,
+) -> (Vec<ValueId>, Option<Vec<ValueId>>) {
+    match tree {
+        StoreTree::Keep => {
+            let fa = e.push(vb, MirType::I1, Op::ConstInt(0, MirType::I1));
+            (vec![fa; w as usize], None)
+        }
+        StoreTree::Val(v) => {
+            let t = e.push(vb, MirType::I1, Op::ConstInt(1, MirType::I1));
+            (vec![t; w as usize], Some(lane_values(e, vb, map, *v, w)))
+        }
+        StoreTree::Node { cond, then, els } => {
+            let c = mask_lane_bools(e, vb, map, *cond, w);
+            let (tb, tv) = tree_lanes(e, vb, map, then, w);
+            let (eb, ev) = tree_lanes(e, vb, map, els, w);
+            let bits = (0..w as usize)
+                .map(|k| e.push(vb, MirType::I1, Op::Select(c[k], tb[k], eb[k])))
+                .collect();
+            let vals = match (tv, ev) {
+                (Some(a), Some(b)) => Some(
+                    (0..w as usize)
+                        .map(|k| {
+                            let ty = e_ty(e, a[k]);
+                            e.push(vb, ty, Op::Select(c[k], a[k], b[k]))
+                        })
+                        .collect(),
+                ),
+                (a, b) => a.or(b),
+            };
+            (bits, vals)
+        }
+    }
 }
 
 /// The scratch slot a predicated access of `ty` aims its idle lanes at: one private stack slot per
@@ -7639,6 +8711,151 @@ mod tests {
             ops.iter().any(|op| matches!(op, Op::Shuffle { .. })),
             "the exit test did not fold the lane mask: {ops:?}"
         );
+    }
+
+    // ---- nested if-conversion -------------------------------------------------------------------
+
+    /// The data for the region tests: 29 values cycling through every arm of a three-way chain,
+    /// a NaN included (no ordered compare holds for it).
+    const CHAIN_DATA: &str = "let mut x: []f32 = alloc_f32(29); let mut o: []f32 = alloc_f32(29); \
+                              let mut j: i64 = 0; \
+                              while j < 29 { x[j] = (((j * 7) % 9) as f32) * 0.5 - 1.75; \
+                                o[j] = -7.0; j = j + 1; } \
+                              x[11] = 0.0 / 0.0;";
+
+    fn print_o(n: usize) -> String {
+        format!("let mut q: i64 = 0; while q < {n} {{ print((o[q] * 8.0) as i32); q = q + 1; }}")
+    }
+
+    /// `if / else if / else`, every arm storing `o[i]`: one vector store of two nested selects.
+    #[test]
+    fn an_else_if_chain_of_stores_widens_into_nested_selects() {
+        let k = "@unchecked fn k(x: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
+                 while i < n { let v: f32 = x[i]; \
+                   if v > 1.0 { o[i] = v * 2.0; } else if v > 0.0 { o[i] = v + 10.0; } \
+                   else { o[i] = 0.0 - v; } i = i + 1; } }";
+        let shape = format!("{k} fn main() -> i32 {{ return 0; }}");
+        assert!(is_widened(&shape, "k"), "an else-if chain did not widen");
+        let ops = ops_of(&shape, "k");
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op, Op::Alloca { .. })),
+            "a complete chain needs no per-lane scratch: {ops:?}"
+        );
+        // Every trip 0..=29 (the counter is runtime after inlining), the buffer reset each time.
+        scalar_and_vector_agree(&format!(
+            "{k} fn main() -> i32 {{ {CHAIN_DATA} let mut n: i64 = 0; \
+             while n <= 29 {{ j = 0; while j < 29 {{ o[j] = -7.0; j = j + 1; }} k(x, o, n); {} \
+               n = n + 1; }} return 0; }}",
+            print_o(29)
+        ));
+    }
+
+    /// The same chain with no final `else`: lanes whose path stores nothing keep the old element,
+    /// so the store goes lane by lane to the element or to the scratch slot.
+    #[test]
+    fn an_else_if_chain_without_an_else_predicates_its_store() {
+        let k = "@unchecked fn k(x: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
+                 while i < n { let v: f32 = x[i]; \
+                   if v > 1.0 { o[i] = v * 2.0; } else if v > 0.0 { o[i] = v + 10.0; } \
+                   i = i + 1; } }";
+        let shape = format!("{k} fn main() -> i32 {{ return 0; }}");
+        assert!(is_widened(&shape, "k"), "a partial else-if chain did not widen");
+        scalar_and_vector_agree(&format!(
+            "{k} fn main() -> i32 {{ {CHAIN_DATA} k(x, o, 29); {} return 0; }}",
+            print_o(29)
+        ));
+    }
+
+    /// A value chosen by an `else if` chain and stored once: nested merges at two joins.
+    #[test]
+    fn an_else_if_value_chain_merges_at_each_join() {
+        let k = "@unchecked fn k(x: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
+                 while i < n { let v: f32 = x[i]; \
+                   let r: f32 = if v > 1.0 { v * 2.0 } else if v > 0.0 { v + 10.0 } \
+                     else { 0.0 - v }; \
+                   o[i] = r; i = i + 1; } }";
+        let shape = format!("{k} fn main() -> i32 {{ return 0; }}");
+        assert!(is_widened(&shape, "k"), "an else-if value chain did not widen");
+        scalar_and_vector_agree(&format!(
+            "{k} fn main() -> i32 {{ {CHAIN_DATA} k(x, o, 27); {} return 0; }}",
+            print_o(29)
+        ));
+    }
+
+    /// A store only one arm makes, over CHECKED `[]T` parameters: the arm re-reads `o`'s data
+    /// pointer and checks `i < o.len()` before it stores. The vector loop drops the check under a
+    /// guard that every index of its own iterations passes it, and a buffer shorter than the trip
+    /// — whose short tail the arm never reaches — runs the scalar loop instead, with the same
+    /// answer.
+    #[test]
+    fn a_checked_one_armed_store_over_a_slice_parameter_widens_under_a_length_guard() {
+        let k = "fn k(x: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
+                 while i < n { let v: f32 = x[i]; if v > 0.0 { o[i] = v * 2.0 + 1.0; } \
+                   i = i + 1; } }";
+        let shape = format!("{k} fn main() -> i32 {{ return 0; }}");
+        assert!(
+            is_widened(&shape, "k"),
+            "a checked one-armed store did not widen"
+        );
+        scalar_and_vector_agree(&format!(
+            "{k} fn main() -> i32 {{ {CHAIN_DATA} k(x, o, 29); {} \
+             let mut s: []f32 = alloc_f32(9); let mut z: []f32 = alloc_f32(29); \
+             j = 0; while j < 29 {{ z[j] = -1.0; if j == 3 || j == 8 {{ z[j] = 2.5; }} \
+               j = j + 1; }} \
+             j = 0; while j < 9 {{ s[j] = 0.0; j = j + 1; }} \
+             k(z, s, 29); j = 0; while j < 9 {{ print((s[j] * 2.0) as i32); j = j + 1; }} \
+             return 0; }}",
+            print_o(29)
+        ));
+    }
+
+    /// The `@unchecked` spelling over plain slice parameters: the arm still re-reads `o`'s data
+    /// pointer, a load no access on every path covers. That read is the parameter's own fat
+    /// pointer, so it is speculated (and hoisted into the guard) rather than refused.
+    #[test]
+    fn an_arm_rereading_a_slice_parameters_data_pointer_widens() {
+        let k = "@unchecked fn k(x: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
+                 while i < n { let v: f32 = x[i]; if v > 0.0 { o[i] = v * 2.0 + 1.0; } \
+                   i = i + 1; } }";
+        let shape = format!("{k} fn main() -> i32 {{ return 0; }}");
+        assert!(is_widened(&shape, "k"), "a plain-slice one-armed store");
+    }
+
+    /// A diamond inside one arm of another, the outer `else` storing nothing: three paths, two of
+    /// them storing, and an arm-only load (`w[i]`) under a two-literal path predicate.
+    #[test]
+    fn a_diamond_nested_in_an_arm_widens_and_agrees() {
+        let k = "@unchecked fn k(x: []f32, w: []f32, mut o: []f32, n: i64) { \
+                 let mut i: i64 = 0; \
+                 while i < n { let v: f32 = x[i]; \
+                   if v > 0.0 { if v > 1.5 { o[i] = w[i] * v; } else { o[i] = v; } } \
+                   i = i + 1; } }";
+        let shape = format!("{k} fn main() -> i32 {{ return 0; }}");
+        assert!(is_widened(&shape, "k"), "a nested diamond did not widen");
+        scalar_and_vector_agree(&format!(
+            "{k} fn main() -> i32 {{ {CHAIN_DATA} let mut w: []f32 = alloc_f32(29); \
+             j = 0; while j < 29 {{ w[j] = (j as f32) * 0.25; j = j + 1; }} \
+             k(x, w, o, 29); {} return 0; }}",
+            print_o(29)
+        ));
+    }
+
+    /// What the region flattener still refuses: stores to two different places, and a load on a
+    /// path after a store it could read (sinking the store would move it past the load).
+    #[test]
+    fn nested_regions_it_cannot_order_are_declined() {
+        let two = "@unchecked fn k(x: []f32, mut o: []f32, mut p: []f32, n: i64) { \
+                   let mut i: i64 = 0; while i < n { let v: f32 = x[i]; \
+                   if v > 1.0 { o[i] = v; } else if v > 0.0 { p[i] = v; } else { o[i] = 1.0; } \
+                   i = i + 1; } } fn main() -> i32 { return 0; }";
+        assert!(!is_widened(two, "k"), "stores to two places");
+        let reread = "@unchecked fn k(x: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
+                      while i < n { let v: f32 = x[i]; \
+                      if v > 1.0 { o[i] = v; if v > 2.0 { o[i] = o[i] + 1.0; } } \
+                      else if v > 0.0 { o[i] = 3.0; } i = i + 1; } } \
+                      fn main() -> i32 { return 0; }";
+        assert!(!is_widened(reread, "k"), "a load after a store on one path");
     }
 
     // ---- zero-trip and sub-group trips ---------------------------------------------------------
