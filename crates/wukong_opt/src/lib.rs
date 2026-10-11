@@ -49,7 +49,10 @@
 //! per-function pipeline, and loop unrolling ([`unroll_program`] — complete for a small known trip
 //! count, partial otherwise) runs once *after* it — a reduced pipeline is then re-run over the
 //! functions unrolling changed, so the duplicated bodies get the same simplify/cse/dce treatment as
-//! everything else. Last of all, [`FormSwitches`] turns each chain of equality tests on one
+//! everything else. Then straight-line **SLP** ([`slp_program`]) packs `W` isomorphic stores to
+//! consecutive elements of one object — a complete unroll's copies, a hand-written `vec4` — into
+//! one 128-bit vector store, and the same reduced pipeline cleans the functions it packed. Last of
+//! all, [`FormSwitches`] turns each chain of equality tests on one
 //! scrutinee into a single `switch` terminator (once, after every loop transform — see
 //! `switch_form`). `-O3` adds nothing to any of it — see
 //! [`PassManager::standard`].
@@ -76,6 +79,7 @@ mod phi;
 mod promote;
 mod simplify;
 mod simplify_cfg;
+mod slp;
 mod sroa;
 mod unroll;
 mod unroll_jam;
@@ -109,6 +113,7 @@ pub use phi::SimplifyPhis;
 pub use promote::Promote;
 pub use simplify::Simplify;
 pub use simplify_cfg::SimplifyCfg;
+pub use slp::slp_program;
 pub use sroa::Sroa;
 pub use unroll::unroll_program;
 pub use vectorize::Vectorize;
@@ -151,6 +156,9 @@ pub struct Timings {
     /// index within [`PassManager::standard`], and the cleanup pipeline numbers its passes
     /// differently.
     pub unroll: Duration,
+    /// Straight-line SLP time (runs at `-O2`+, after unrolling): the pass plus the cleanup sweep
+    /// over the functions it packed, bucketed together for the same reason as [`Timings::unroll`].
+    pub slp: Duration,
     /// Total time inside `optimize` (inlining + every pass + fixpoint bookkeeping).
     pub total: Duration,
     /// The largest per-function fixpoint iteration count observed across the program.
@@ -462,6 +470,10 @@ pub fn optimize_preserving(program: &mut Program, opt_level: u8, roots: &[wukong
     if opt_level >= 2 {
         let changed = unroll_program(program);
         PassManager::unroll_cleanup().run_subset(program, &changed);
+        // Straight-line SLP, after unrolling so a complete unroll's copies are visible with their
+        // counters folded; the packed functions get the same cleanup (`slp`).
+        let packed = slp::slp_program(program);
+        PassManager::unroll_cleanup().run_subset(program, &packed);
         // Last, and outside the fixpoint: a multi-way branch must not reach the loop passes.
         switch_form::form_switches(program);
     }
@@ -492,6 +504,9 @@ pub fn optimize_verified_preserving(
         let changed = unroll_program(program);
         verify_program_stage(program, "unroll")?;
         PassManager::unroll_cleanup().run_subset_checked(program, &changed, true)?;
+        let packed = slp::slp_program(program);
+        verify_program_stage(program, "slp")?;
+        PassManager::unroll_cleanup().run_subset_checked(program, &packed, true)?;
         switch_form::form_switches(program);
         verify_program_stage(program, "form-switches")?;
     }
@@ -523,6 +538,11 @@ pub fn optimize_timed(program: &mut Program, opt_level: u8) -> Timings {
         let changed = unroll_program(program);
         PassManager::unroll_cleanup().run_subset(program, &changed);
         t.unroll = u0.elapsed();
+        // The SLP bucket, likewise, is the stage and its cleanup.
+        let s0 = Instant::now();
+        let packed = slp::slp_program(program);
+        PassManager::unroll_cleanup().run_subset(program, &packed);
+        t.slp = s0.elapsed();
         // Counted in `total` only: one scan per function, and a cleanup only where one formed.
         switch_form::form_switches(program);
     }

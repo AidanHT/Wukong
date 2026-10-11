@@ -4066,7 +4066,7 @@ fn plan_body(
 /// float four, sqrt, and the five reassociable reductions — compiles through `--emit=obj -O2`
 /// with a **debug** `wukongc` (so the CLIF verifier runs) for every other pair, `imul.i64x2`
 /// included. Re-run it against a debug binary before adding an operator here.
-fn bin_widenable(op: BinOp, ty: &MirType) -> bool {
+pub(crate) fn bin_widenable(op: BinOp, ty: &MirType) -> bool {
     let lane = ty.lane_type();
     match op {
         BinOp::SDiv | BinOp::UDiv | BinOp::SRem | BinOp::URem | BinOp::FRem => false,

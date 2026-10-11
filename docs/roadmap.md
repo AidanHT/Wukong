@@ -604,6 +604,19 @@ another architecture or OS is not supported. A native-backend failure is a catal
   loop, when the rows provably touch disjoint memory (`tests/run/unroll_jam_nests.wk`). Its speed-up
   is not yet measured; deeper nests, triangular inner bounds and a nest whose inner loop the
   bounds-check versioning split stay as written.
+- **Straight-line SLP** (`wukong_opt::slp`, `-O2`, after unrolling): `W` stores in one block to
+  consecutive elements of one object whose values are one lane-wise operation tree pack into one
+  128-bit vector store — `f32x4`, `i32x4`, `f64x2`, `i64x2` — over vector loads, splats and lane
+  builds: the register tile a complete unroll leaves, hand-written `vec4`/quaternion/complex-pair
+  code, small fixed-array kernels (`tests/run/vec5_slp_bundles.wk`). Bit-exact by construction
+  (lane-wise ops only, no reassociation, no operand swap). Still scalar: **alternate opcodes**
+  (`+ - + -` in one bundle, LLVM's alt-shuffle), **`i8`/`i16` lanes** and `bf16`/`f16`, **`select`,
+  compare and cast nodes** (a mask is not a value across backends, and a cast changes the lane
+  count), a bundle whose lanes are not in one block or whose stores are not contiguous, a chunk
+  shorter than one full vector, a store moved past a possibly-aliased access, a call that can name
+  the stored or loaded storage, or a barrier. Reductions and horizontal ops are not formed, and the
+  cost model is untuned: no speed claim without a same-run release A/B against `WUKONG_NO_SLP`. The
+  vector accesses it emits on frame slots reach `gpu-native` too, which only the device suite checks.
 - **FMA contraction**: a float `x + y*z` becomes one fused multiply-add (`Op::Fma`, a hardware
   `vfmadd`), on both the scalar and vector paths; the interpreter mirrors it with `mul_add`, so the
   two backends stay bit-identical.

@@ -481,7 +481,7 @@ the operand's defining line for its type.
 `wukong_opt::optimize` first runs a whole-program **inliner** (`-O2`), then `PassManager` runs a
 list of function-level `Pass`es to a per-function fixpoint (capped at 100 sweeps), then a
 whole-program **loop unroller** (`-O2`) with a reduced cleanup sweep over just the functions it
-changed. Functions are optimized **callees first** (call-graph SCCs in Tarjan order), and each SCC is
+changed, then straight-line **SLP** (`-O2`) with the same sweep over the functions it packed. Functions are optimized **callees first** (call-graph SCCs in Tarjan order), and each SCC is
 summarized as soon as it is done (`src/effects.rs`), so a caller's passes know which of its calls
 have no side effect. The fixpoint uses
 per-pass **clean-tracking**: a pass is a deterministic function of the MIR, so one that reported "no
@@ -528,6 +528,7 @@ invalidated, and the call-effect table for the callees optimized so far. A cache
 | `Vectorize`   | -O2   | widen eligible canonical MIR loops after LICM, then feed the result through the normal fixpoint cleanup |
 | `unroll_program`| -O2 | unroll a counted two-block loop: **completely** when its exact trip count is at most 32 and the copies total at most 128 instructions; otherwise 4x (body up to 16 instructions) or 2x (up to 32), with a wrap-safe guard and a remainder that is a loop for an unknown trip count, nothing when the factor divides a known one, and straight-line copies for a known leftover; runs **after** the function pipeline, and the functions it changed get a reduced simplify + simplify-cfg + simplify-phis + cse + dce cleanup sweep |
 | `unroll_jam` | -O2 | inside `unroll_program`, ahead of the unroller: a canonical two-deep nest whose inner loop carries a recurrence or reduction runs **four outer iterations side by side** — four row prologues, one shared inner counter, four inner bodies per iteration, four epilogues in row order — with the untouched nest as the remainder; nothing is reassociated, so each row's values are bit-identical. Legal only when every stored object is split into per-row slabs (row-major `x[r*P + t]` with the window checked, the pitch possibly the inner loop's runtime bound, or time-major `x[t*D + d]` with every row below `D`), objects that may be one buffer are range-checked once in the preheader, and nothing calls, allocates or can trap (`src/unroll_jam.rs`; `WUKONG_NO_UNROLL_JAM=1` turns it off) |
+| `slp_program` | -O2 | once, after unrolling and its cleanup: pack `W = 16 / bytes(T)` stores in one block to consecutive elements of one object (`f32`/`f64`/`i32`/`i64`), whose values are one lane-wise operation tree, into one 128-bit vector store; the packed functions get the unrolling cleanup sweep (`src/slp.rs`; see **Straight-line SLP** below) |
 | `FormSwitches` | -O2 | once, after unrolling: turn a chain of four or more `cmp.eq`/`cmp.ne` tests of one integer scrutinee against constants into one `switch` terminator, hoisting the pure link compares into the head; a trapping (`unreachable`) fall-through stays the default, because sema's exhaustiveness check is lenient and that block can be reached (`src/switch_form.rs`) |
 
 `-O3` currently runs the same pass pipeline as `-O2`: there are no `-O3`-exclusive passes yet
@@ -706,6 +707,40 @@ short loop by its iterations — the header keeps its instructions as iteration 
 copy feeds the next header copy, a final header copy produces the exit values — and gives a partially
 unrolled loop no remainder loop at all: none when the factor divides the count, straight-line copies
 for the leftover otherwise.
+
+**Straight-line SLP** (`src/slp.rs`, `slp_program`) is the compiler's first vectorizer of code
+that is not a loop: `W` stores in one block to consecutive elements of one object become one
+`Vec(T, W)` store of one vector computation (store-seeded, as LLVM's SLP vectorizer is). It runs
+after the unroller, so a complete unroll's copies — `for k in 0..8 step 2`, which the loop
+vectorizer declines for its step — are visible with their counters folded, and it catches
+hand-written `vec4`/quaternion/complex-pair code and small fixed-array kernels. Seeds are a block's
+stores of `f32`/`f64`/`i32`/`i64`, grouped by `(base, i64 symbolic index, element type)` with a
+constant offset each (`gep b, c`, `gep b, x + c`, `x - c`, `x`; an `i32` `x + c` is refused because
+it can wrap), runs of consecutive offsets cut into chunks of `W = 16 / bytes(T)`. The tree is built
+from the stored values in lane order: a **VECTOR** node is `W` distinct single-use results of the
+block with one lane-wise shape (a `Bin` the loop vectorizer widens at `T` — no shift, no division —
+an `fma`/`sqrt`/`round` of floats, a `not` of integers, a `neg`), children by operand position and
+commutative operands **never swapped** (a float swap would change which NaN survives); a **LOAD**
+node is `W` loads of consecutive elements (extra readers keep their scalar load); a **SPLAT** is
+one value or one constant; anything else is a **BUILD** (a splat and `W - 1` lane inserts). The
+untuned cost model packs a tree with a VECTOR or LOAD node whose vector side (the store, one per
+VECTOR/LOAD/SPLAT node, `W` per BUILD) is strictly below its scalar side (the `W` stores, `W` per
+VECTOR node, each single-use LOAD lane). Everything is emitted just before the chunk's last store
+and the `W` scalar stores are deleted, so stores and LOAD loads move *down*; the soundness argument
+is one crossing rule, checked with `AliasInfo::may_alias_sized` on exact widths: every unmoved store
+a moved access passes, and every unmoved load a moved store passes, must be disjoint from it; a call
+in between declines unless the moved access is call-proof; a barrier declines; and a chunk store
+that preceded a LOAD lane must be disjoint from it, because the one vector load now runs before the
+one vector store. Blocks go in index order, seeds by their first store, the function is rescanned
+after every pack (64 packs at most; functions above 6000 instructions are skipped).
+`WUKONG_NO_SLP` (presence) turns it off — read inside `slp_program`, so `optimize`, the verified and
+timed paths and the `wukong_bench compile-work` replica all honour it — and `WUKONG_SLP_TRACE=1`
+prints `slp: PACK bb<N> ty=<T> w=<W> nodes=<n> cost=<V>/<S>` or `slp: declined bb<N>: <reason>`
+per decision. It adds no MIR op and changed no backend; over `tests/run` and `examples` it packs
+`tensor_dim_arith.wk` and `type_alias.wk` and costs 0.2% of optimizer time (debug `--time-passes`,
+summed in process). Its vector loads and stores sit **outside loops, frame slots included**, which
+`gpu-native` takes through its generic scalar-lane path — only the on-device suite (gate part 10)
+proves that (`tests/run/vec5_slp_bundles.wk`).
 
 **Call effects** (`src/effects.rs`). A user function is summarized only when calling it has no side
 effect: every store targets its own frame, every call is to a summarized callee or its own SCC (the

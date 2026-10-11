@@ -192,8 +192,8 @@ impl wukong_opt::Pass for Counted {
 
 /// Slot layout of the attribution table: the eighteen standard `-O2` passes in pipeline order, then
 /// the two whole-program stages, then the cleanup pipeline's five passes (kept separate because they
-/// run under a different driver instance and belong to the unrolling stage's cost), then the late
-/// `switch` formation.
+/// run under a different driver instance and belong to the unrolling and SLP stages' cost — one set
+/// of slots serves both cleanup sweeps), then straight-line SLP, then the late `switch` formation.
 const STANDARD: usize = 18;
 const SLOT_INLINE: usize = STANDARD;
 const SLOT_UNROLL: usize = STANDARD + 1;
@@ -206,7 +206,8 @@ const CLEANUP_NAMES: [&str; 5] = [
     "cleanup:cse",
     "cleanup:dce",
 ];
-const SLOT_SWITCHES: usize = SLOT_CLEANUP + CLEANUP_NAMES.len();
+const SLOT_SLP: usize = SLOT_CLEANUP + CLEANUP_NAMES.len();
+const SLOT_SWITCHES: usize = SLOT_SLP + 1;
 const SLOTS: usize = SLOT_SWITCHES + 1;
 
 fn counted_pass(slot: usize, p: Box<dyn wukong_opt::Pass>) -> Box<dyn wukong_opt::Pass> {
@@ -253,7 +254,7 @@ fn attributed_cleanup() -> wukong_opt::PassManager {
 
 /// Run the `-O2` optimizer over `p` with per-pass attribution, mirroring [`wukong_opt::optimize`]
 /// stage for stage: inline → standard fixpoint → unroll → cleanup of the changed functions →
-/// switch formation.
+/// straight-line SLP → cleanup of the packed functions → switch formation.
 ///
 /// The cleanup goes through the same public `PassManager::run_subset` that `optimize` uses, so the
 /// changed functions are cleaned in the same order with the same call-effect summaries of the rest
@@ -269,6 +270,8 @@ fn optimize_attributed(p: &mut wukong_mir::Program) -> Vec<PassWork> {
     let cleanup = attributed_cleanup();
     let (changed, unroll) = counted(|| wukong_opt::unroll_program(p));
     cleanup.run_subset(p, &changed);
+    let (packed, slp) = counted(|| wukong_opt::slp_program(p));
+    cleanup.run_subset(p, &packed);
     let (_, switches) = counted(|| wukong_opt::form_switches(p));
     PASS_ACC.with(|acc| {
         let mut acc = acc.borrow_mut();
@@ -286,6 +289,11 @@ fn optimize_attributed(p: &mut wukong_mir::Program) -> Vec<PassWork> {
             name: "unroll",
             calls: 1,
             work: unroll,
+        };
+        acc[SLOT_SLP] = PassWork {
+            name: "slp",
+            calls: 1,
+            work: slp,
         };
         for (k, name) in CLEANUP_NAMES.iter().enumerate() {
             acc[SLOT_CLEANUP + k].name = *name;

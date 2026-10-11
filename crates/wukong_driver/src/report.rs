@@ -135,6 +135,9 @@ impl PassTimer {
         if !t.unroll.is_zero() {
             parts.push(("unroll".to_string(), t.unroll, None));
         }
+        if !t.slp.is_zero() {
+            parts.push(("slp".to_string(), t.slp, None));
+        }
         self.breakdown(parts);
         self.notes.push(format!(
             "optimizer: at most {} fixpoint sweep(s) in any function",

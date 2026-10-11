@@ -24,7 +24,7 @@ The only level tests are `>= 1` and `>= 2`, so **`-O3` is byte-identical to `-O2
 | --- | --- |
 | `-O0` | nothing |
 | `-O1` | per-function fixpoint pipeline (below) |
-| `-O2` | `inline_program` first, then the pipeline, then `unroll_program` with a reduced cleanup sweep |
+| `-O2` | `inline_program` first, then the pipeline, then `unroll_program` and straight-line `slp_program`, each with a reduced cleanup sweep over the functions it changed |
 | `-O3` | same as `-O2` |
 
 `wukong_driver` forces `opt_level.max(1)` for `--emit=grad` and `--train` because
@@ -66,6 +66,13 @@ load-bearing.
   loops and constant arguments, with absolute growth, relative growth and splice-count limits.
 - `unroll_program` — runs *after* the pipeline; changed functions get a reduced cleanup pass
   (`simplify` → `cse` → `dce`), folding the synthesized constant-bound guard as well as the body.
+- `slp_program` — runs *after* unrolling (so a complete unroll's copies are visible with their
+  counters folded) and before switch formation: `W` stores to consecutive elements of one object
+  whose values share one lane-wise operation tree become one 128-bit vector store over vector
+  loads, splats and lane builds. It moves the chunk's stores and loads down to its last store, so
+  every access they pass must be proved disjoint (`AliasInfo::may_alias_sized`), a call must find
+  them call-proof, and a barrier declines. Packed functions get the same reduced cleanup.
+  `WUKONG_NO_SLP` turns it off; `WUKONG_SLP_TRACE=1` prints each decision.
 
 `cse`, `dse`, and `licm` consult `alias` — provenance analysis answering whether a store through `q`
 can be seen by a load through `p`. The Cranelift backend uses it too.
