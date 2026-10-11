@@ -1,0 +1,58 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT-VALUES: 2 3 -10 5 -10 1 5 2 3 -11 10 -11 6 2 5 1
+// EXPECT-OUT-VALUES: 16 16
+// EXPECT-OUT-VALUES: 2 3 -10 5 -10 1 5 2 3 -11 10 -11 6 2 5 1
+module tests.run.dtype_generic_builtin
+
+// N18: a dtype-generic tensor reaches the f32 kernel builtins when its instantiation binds the
+// element to `f32`. `mm<T>` is written once over `Tensor[T, 4, 4]`; the generic body's `matmul`
+// is shape-checked and recorded once, and the `T = f32` instance `mm$f32` dispatches the tuned GEMM
+// exactly like a hand-written `f32` function:
+//   cargo run -q -p wukongc -- --emit=mir -O2 tests/run/dtype_generic_builtin.wk | grep wukong_sgemm
+// (An instance at any other element is E0415 — `tests/fail/dtype_generic_builtin_elem.wk`.) The
+// typed file-I/O builtins follow the same rule: `save<T>` / `load<T>` reach `write_f32` /
+// `read_f32` from their `T = f32` instances (any other binding is E0416).
+//
+// Inputs are small integers, so every product and sum is exact in f32 and the expected lanes are
+// the scalar definition of the row-major product, derived by hand:
+//   a[i] = (i mod 5) - 2        -> rows [-2 -1 0 1] [2 -2 -1 0] [1 2 -2 -1] [0 1 2 -2]
+//   b[i] = (3i mod 7) - 3       -> rows [-3 0 3 -1] [2 -2 1 -3] [0 3 -1 2] [-2 1 -3 0]
+//   c[r][j] = sum_k a[r][k] * b[k][j], e.g. c[0][0] = 6 - 2 + 0 - 2 = 2, c[0][1] = 0 + 2 + 0 + 1 = 3.
+// Every lane of `c` is printed, then the element counts the two I/O calls moved, then every lane
+// of the buffer read back.
+fn mm<T>(a: Tensor[T, 4, 4], b: Tensor[T, 4, 4], mut c: Tensor[T, 4, 4]) {
+    matmul(a, b, c);
+}
+
+fn save<T>(x: Tensor[T, 4, 4]) -> i64 {
+    return write_f32("io_test_dtype_generic_f32.bin", x);
+}
+
+fn load<T>(mut y: Tensor[T, 4, 4]) -> i64 {
+    return read_f32("io_test_dtype_generic_f32.bin", y);
+}
+
+fn main() -> i32 {
+    let mut a: [f32; 16] = [0.0; 16];
+    let mut b: [f32; 16] = [0.0; 16];
+    for i in 0..16 {
+        a[i] = ((i % 5) - 2) as f32;
+        b[i] = (((3 * i) % 7) - 3) as f32;
+    }
+    let mut c: [f32; 16] = [0.0; 16];
+    mm(a, b, c);
+    for i in 0..16 {
+        print(c[i]);
+    }
+
+    let wrote: i64 = save(c);
+    let mut d: [f32; 16] = [0.0; 16];
+    let read: i64 = load(d);
+    print(wrote);
+    print(read);
+    for i in 0..16 {
+        print(d[i]);
+    }
+    return 0;
+}

@@ -614,6 +614,36 @@ fn main() -> i32 {
          the function directly at each call instead."
     ),
     entry!(
+        "E0415",
+        "kernel builtin requires `f32` elements",
+        "The named kernel builtins (`matmul`, `linear`, `softmax`, `layernorm`, the two-argument \
+         activations, `sum`/`dot`, `sdpa`, …) call `f32` runtime kernels, so every buffer operand \
+         must hold `f32`. A dtype-generic `Tensor[T, ..]` operand is accepted in the generic body \
+         and checked per instantiation: an instance that binds `T = f32` dispatches the kernel \
+         exactly like the hand-written `f32` function, and an instance that binds any other \
+         element type (`f64`, `bf16`, an integer) is this error, reported at the operand with the \
+         call that required the instantiation. Instantiate the function at `f32` (convert the \
+         data first), or write the operation as a loop over `T`, which works for every element \
+         type.",
+        bad: "module ex.e0415\nfn mm<T>(a: Tensor[T, 2, 2], b: Tensor[T, 2, 2], mut c: Tensor[T, 2, 2]) {\n    matmul(a, b, c);\n}\nfn main() -> i32 {\n    let a: [f64; 4] = [1.0; 4];\n    let b: [f64; 4] = [1.0; 4];\n    let mut c: [f64; 4] = [0.0; 4];\n    mm(a, b, c);\n    return c[0] as i32;\n}\n",
+        good: "module ex.e0415\nfn mm<T>(a: Tensor[T, 2, 2], b: Tensor[T, 2, 2], mut c: Tensor[T, 2, 2]) {\n    matmul(a, b, c);\n}\nfn main() -> i32 {\n    let a: [f32; 4] = [1.0; 4];\n    let b: [f32; 4] = [1.0; 4];\n    let mut c: [f32; 4] = [0.0; 4];\n    mm(a, b, c);\n    return c[0] as i32;\n}\n"
+    ),
+    entry!(
+        "E0416",
+        "typed I/O builtin requires the element type it names",
+        "A typed builtin of the ML I/O family moves exactly the element type it is named for — \
+         `read_bf16` and `write_bf16` move `bf16`, `st_read_f32` and `topk_f32` move `f32` — \
+         because the bytes on disk (or the kernel's stride) are that type's. A dtype-generic \
+         `Tensor[T, ..]` operand is accepted in the generic body and checked per instantiation: an \
+         instance that binds `T` to the builtin's element reaches it exactly like the concrete \
+         function, and an instance that binds any other element type is this error, reported at \
+         the operand with the call that required the instantiation. Call the builtin spelled for \
+         the instantiated element (`write_f64` for `T = f64`), or instantiate the function at the \
+         builtin's element.",
+        bad: "module ex.e0416\nfn save<T>(x: Tensor[T, 4]) -> i64 {\n    return write_f32(\"e0416.bin\", x);\n}\nfn main() -> i32 {\n    let x: [f64; 4] = [1.0; 4];\n    return save(x) as i32;\n}\n",
+        good: "module ex.e0416\nfn save<T>(x: Tensor[T, 4]) -> i64 {\n    return write_f32(\"e0416.bin\", x);\n}\nfn main() -> i32 {\n    let x: [f32; 4] = [1.0; 4];\n    return save(x) as i32;\n}\n"
+    ),
+    entry!(
         "E0430",
         "struct literal field error",
         "A struct literal (and a struct-payload enum variant, `E::V { .. }`) initializes every field \

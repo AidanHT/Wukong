@@ -144,7 +144,9 @@ labelled "required by this instantiation of `f` with T = …". A dtype-generic t
 `Ty::Tensor { elem_var: Some(T), .. }` (its `elem` is then a placeholder): sema binds `T` from a
 tensor or array argument's scalar leaf (`dtype.rs`), and mir_build's monomorphizer substitutes the
 element into every tensor type (`subst_ty`), so `axpy$f32` lowers like the hand-written `f32`
-function; a recognizer that reads sema's raw generic-body types declines on an instance instead.
+function; a recognizer that reads sema's raw generic-body types declines on an instance instead. A
+fixed-element builtin (kernel or typed I/O) accepts a `Tensor[T, ..]` operand in the generic pass
+and the instance re-check reports a wrong binding (`Sema::rechecking_instance`, `E0415`/`E0416`).
 `where` dimension predicates and dimension `static_assert`s are collected and checked against each
 call's bound dimensions by `wukong_sema::constraints`; `static_assert` lowers to nothing.
 **Storage classification is total.** `wukong_mir_build` sizes every value's slot through
@@ -172,7 +174,23 @@ written in a `let` annotation. `repr_tests.rs` drives every arm.
 **Kernel builtins**: `wukong_sema::builtins` shape-checks `matmul`/`softmax`/…/`sdpa` and records each
 call's resolved dimensions (`SemaResult::builtin_calls`); `wukong_mir_build::builtins` lowers it to one
 runtime kernel behind runtime extent checks (trapping through `assert`) and an output-overlap guard
-(scratch + copy-out), independent of `@generic`/recognition. The **decode builtins** (`sdpa_kv`,
+(scratch + copy-out), independent of `@generic`/recognition. `sdpa` alone has a **static form**: a
+check whose outcome is a compile-time fact is not emitted, and an input whose `StorageRoot` (a
+fixed-array local's own `alloca`, or a fixed-array/static-tensor parameter bound to its storage —
+`noalias.rs`'s `param_is_its_storage`; roots compare by VALUE, since a `match` binding gives one
+parameter a second name) is proved apart from `out`'s — different allocas, an alloca and a
+parameter, or two different parameters `alias::plan_kernel_alias` answers `Dispatch` for or a
+`@noalias` promise separates — gets no overlap test. With all three inputs proved apart the call
+is one bare `wukong_attention_f32` in a straight-line block that `wukong_autodiff` differentiates;
+the checks a runtime `s`/`d` or extent still needs are `assert` calls in that block, which the tape
+treats as effects. A dtype-generic `Tensor[T, ..]`
+operand of a kernel builtin or of the ML I/O family (`read_*`/`write_*`, `st_read_*`, `topk_f32`, …)
+is accepted in the generic body and re-checked per instance (`E0415` kernel / `E0416` I/O when `T`
+is not the builtin's element). That re-check stops at 512 instances while the monomorphizer lowers
+them all, so each family's lowering refuses (`C0001`) an operand whose substituted element is still
+wrong — `builtin_operands_are_f32` (kernel) and `MlBuiltin::buffer_elem` (I/O). The decode builtins
+have no such backstop and do not defer: a `Tensor[T, ..]` operand of one is `E0437` in the generic
+body. The **decode builtins** (`sdpa_kv`,
 `kv_append`, `gemv_bf16`/`gemv_f16`, `quantize_q{8,4}_0`, `gemv_q{8,4}_0`) are typed in
 `wukong_sema::decode_builtins` and lowered in `wukong_mir_build::decode_builtins` to one checked
 runtime call each (`wukong_runtime::{attention_kv, gemv_half, quant}`): their extents are values, so

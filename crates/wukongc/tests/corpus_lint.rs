@@ -81,6 +81,16 @@ const DECLARED_TOLERANCES: &[(&str, &str)] = &[
          corpus, RoPE outputs between 0.38 and 1 and cross-entropy-backward probabilities down to \
          0.01 (cov4_par_loss.wk, cov4_par_rope.wk, cov4_rowkernels_wide.wk).",
     ),
+    (
+        "5e-4",
+        "wukong_runtime/src/attention.rs `# Numeric contract` and every correctness test there — \
+         the fused attention kernel is held to `1e-4 + 1e-4·|want|` against the materialized \
+         reference. `sdpa_loss_train.wk` makes every output lane a convex combination of V rows in \
+         [1, 1.75], so |o| >= 1 and that band is at most 2e-4 relative (plus ~2e-6 for the f32 \
+         reference's own rounding against f64); its printed loss is a sum of 32 positive squares, \
+         which at most doubles a relative error (4.1e-4 with the 32-term f32 sum). 5e-4 is that \
+         bound rounded up, derived from the kernel's contract rather than its output.",
+    ),
 ];
 
 /// `.wk`-adjacent extensions that must never appear in a corpus directory. Each gate collects

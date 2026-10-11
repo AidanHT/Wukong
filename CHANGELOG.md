@@ -154,6 +154,25 @@ All notable changes to Wukong are documented here. The format is loosely based o
   ReLU, GEMM + bias, mean squared error; four trained tensors) pins three SGD steps derived in Python
   under three f32 evaluation orders and f64, every printed value at least 131 ULPs from a rounding
   boundary.
+### Autodiff through `sdpa`, dtype-generic builtins (`gap4/autodiff-builtins`)
+
+- **A loss calling `sdpa` differentiates and trains (N83).** `sdpa` always lowered behind run-time
+  extent checks and an output-overlap branch, so such a loss was multi-block and `--emit=grad` /
+  `--train` refused it although the fused attention VJP existed. With fixed-array operands and
+  every input provably apart from `out` (distinct locals, or different parameters the call-site
+  alias fact or a `@noalias` promise separates) the call is now one bare `wukong_attention_f32` in
+  a straight-line block; a runtime `s`/`d` keeps only its checks, as straight-line `assert`s, and
+  still differentiates. A slice, a view, a may-alias pair or one array under two names (a `match`
+  binding of the output parameter) keeps the guard (`tests/run/sdpa_loss_train.wk`,
+  `tests/run/sdpa_match_alias.wk`, `crates/wukongc/tests/autodiff_attention.rs`).
+- **Dtype-generic tensors reach the kernel and typed I/O builtins (N18).** `fn mm<T>(a: Tensor[T,
+  4, 4], ..) { matmul(a, ..) }` was `E0502` in the generic body; it is now checked per
+  instantiation, so `mm$f32` dispatches `wukong_sgemm` (`tests/run/dtype_generic_builtin.wk`), and
+  an instance binding `T` to another element is the new `E0415` (kernel builtin) or `E0416` (typed
+  file-I/O builtin such as `write_f32`). Sema re-checks at most 512 instances, so both families'
+  lowerings also refuse (`C0001`) a wrong element in an instance past that budget instead of
+  handing the runtime a buffer of another type; the decode builtins (`sdpa_kv`, `gemv_bf16`, …),
+  which have no such backstop, keep refusing a `Tensor[T, ..]` operand (`E0437`).
 
 ### Index-recording reductions (`gap3/vec-argmax`)
 

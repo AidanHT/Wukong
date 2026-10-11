@@ -11,6 +11,12 @@
 //! check the file's shape against them; a flat destination passes rank `-1`. Every call site of one
 //! entry therefore has the same MIR signature, which the textual-LLVM backend relies on.
 //!
+//! **Elements.** A buffer operand holds exactly the element the builtin moves
+//! (`wukong_sema::MlBuiltin::buffer_elem`). Sema checks it, deferring a dtype-generic
+//! `Tensor[T, ..]` operand to each instantiation (`E0416`); an instance its bounded re-check never
+//! reached is refused here as a codegen limit (`C0001`) rather than handing the runtime a buffer of
+//! another element.
+//!
 //! The six original `read_<T>` / `write_<T>` element types keep their frozen per-type symbols
 //! (`wukong_rt_read_f32`, …), so their MIR is unchanged; every other element type and every
 //! offset read goes through the dtype-coded `wukong_rt_read_dt` / `wukong_rt_write_dt`.
@@ -97,6 +103,21 @@ impl FnLowerer<'_> {
         let interner = self.interner;
         let b = ml_builtin(interner.resolve(name))?;
         let syms = self.gemm.ml;
+        if let Some(bad) = (0..args.len()).find(|&i| {
+            b.buffer_elem(i)
+                .is_some_and(|t| !self.ml_operand_holds(&args[i], t))
+        }) {
+            self.unsupported(
+                args[bad].span,
+                "an ML-builtin buffer operand whose element is not the one the builtin moves (an \
+                 instantiation the type checker did not re-check)",
+            );
+            // The placeholder has the builtin's result type.
+            return Some(match b {
+                MlBuiltin::RandFill => self.const_zero(MirType::I32),
+                _ => self.ml_i64_const(0),
+            });
+        }
         match b {
             MlBuiltin::Read(t) | MlBuiltin::Write(t) => {
                 if args.len() != 2 {
@@ -260,6 +281,21 @@ impl FnLowerer<'_> {
         let signed = self.signed(e);
         let v = self.lower_expr(e);
         self.coerce_to(v, &from, &MirType::F32, signed)
+    }
+
+    /// Does buffer operand `e` hold `want` elements once this instance's types are substituted?
+    /// Sema guarantees it — a dtype-generic `Tensor[T, ..]` reaches one of these builtins only from
+    /// an instantiation binding `T = want` (`E0416` otherwise) — so this is the backstop for an
+    /// instance sema did not re-check (`instantiate.rs` re-checks a bounded number), never a second
+    /// rule: the runtime reads the buffer's bytes as `want`. The kernel builtins' twin is
+    /// `builtins.rs`'s `builtin_operands_are_f32`.
+    fn ml_operand_holds(&self, e: &Expr, want: Scalar) -> bool {
+        match self.expr_ty(e) {
+            Ty::Tensor { elem, elem_var, .. } => elem == want && elem_var.is_none(),
+            Ty::Array { elem, .. } | Ty::Slice(elem) => *elem == Ty::Scalar(want),
+            // Not a buffer sema would have accepted; `ml_buffer` declines it as before.
+            _ => true,
+        }
     }
 
     /// Lower a buffer operand (a slice, an array or a contiguous tensor) to its data pointer and
@@ -466,5 +502,94 @@ impl FnLowerer<'_> {
             .build(f32t.clone(), Op::Bin(BinOp::FMul, u2, tau));
         let cos = self.emit_trig(angle, &f32t, true);
         self.builder.build(f32t, Op::Bin(BinOp::FMul, r, cos))
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use crate::lower_program;
+    use wukong_mir::{Op, Program};
+    use wukong_span::{Interner, SourceId};
+
+    /// A module whose `main` first requires 512 distinct instantiations of a trivial generic — the
+    /// whole budget `wukong_sema::instantiate` re-checks (`MAX_INSTANCES`) — and then runs `tail`.
+    /// Every instantiation `tail` requires is lowered (mir_build's monomorphizer has no budget) but
+    /// never re-checked by sema, which is exactly the instance a lowering backstop exists for.
+    pub(crate) fn past_the_recheck_budget(decls: &str, tail: &str) -> String {
+        let mut src =
+            format!("fn id<T>(x: T) -> i32 {{ return 0; }}\n{decls}\nfn main() -> i32 {{\n");
+        for n in 1..=512 {
+            src.push_str(&format!(
+                "    let a{n}: [f32; {n}] = [0.0; {n}];\n    id(a{n});\n"
+            ));
+        }
+        src.push_str(tail);
+        src.push_str("\n}\n");
+        src
+    }
+
+    /// Check and lower `src`: sema's error codes, lowering's error codes, and the program.
+    pub(crate) fn check_and_lower(
+        src: &str,
+    ) -> (Vec<&'static str>, Vec<&'static str>, Program, Interner) {
+        let mut interner = Interner::new();
+        let (module, pdiags) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pdiags.is_empty(), "parse: {pdiags:?}");
+        let (sema, sdiags) = wukong_sema::check(&module, &interner);
+        let codes = |d: &[wukong_diag::Diagnostic]| -> Vec<&'static str> {
+            d.iter()
+                .filter(|d| d.is_error())
+                .filter_map(|d| d.code)
+                .collect()
+        };
+        let sema_codes = codes(&sdiags);
+        let (prog, ldiags) = lower_program(&module, &sema, &mut interner);
+        (sema_codes, codes(&ldiags), prog, interner)
+    }
+
+    pub(crate) fn calls(prog: &Program, interner: &Interner, callee: &str) -> usize {
+        prog.funcs
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.insts.iter())
+            .filter(|i| matches!(&i.op, Op::Call { func, .. } if interner.resolve(*func) == callee))
+            .count()
+    }
+
+    /// N18's typed-I/O half defers a `Tensor[T, ..]` operand's element to sema's per-instance
+    /// re-check (`E0416`), and that re-check stops after a budget of instances. Past it, an
+    /// instance binding `T = f64` reached `write_f32` unchecked and lowered to
+    /// `wukong_rt_write_f32(path, <f64 buffer>, 4)` — the f64 bytes written as f32 natively, four
+    /// f64 slots read by the interpreter. The lowering must refuse it as a codegen limit (`C0001`)
+    /// rather than emit the call, as the kernel builtins already do.
+    #[test]
+    fn an_unchecked_instance_never_reaches_a_typed_io_builtin_at_the_wrong_element() {
+        let decls = "fn save<T>(x: Tensor[T, 4]) -> i64 { return write_f32(\"o.bin\", x); }\n\
+                     fn load<T>(mut y: Tensor[T, 4]) -> i64 { return read_f32(\"o.bin\", y); }";
+        let tail = "    let x: [f64; 4] = [1.0; 4];\n    let mut y: [f64; 4] = [0.0; 4];\n    \
+                    return (save(x) + load(y)) as i32;";
+        let (sema, lower, prog, it) = check_and_lower(&past_the_recheck_budget(decls, tail));
+        assert!(
+            sema.is_empty(),
+            "the premise: sema's re-check budget is spent before `save`/`load` ({sema:?})"
+        );
+        assert_eq!(
+            lower,
+            ["C0001", "C0001"],
+            "one refusal per wrong-element operand"
+        );
+        assert_eq!(calls(&prog, &it, "wukong_rt_write_f32"), 0);
+        assert_eq!(calls(&prog, &it, "wukong_rt_read_f32"), 0);
+    }
+
+    /// Control: the same budget-spent module at `T = f32` lowers cleanly to the runtime calls.
+    #[test]
+    fn an_unchecked_instance_at_the_builtins_element_still_lowers() {
+        let decls = "fn save<T>(x: Tensor[T, 4]) -> i64 { return write_f32(\"o.bin\", x); }";
+        let tail = "    let x: [f32; 4] = [1.0; 4];\n    return save(x) as i32;";
+        let (sema, lower, prog, it) = check_and_lower(&past_the_recheck_budget(decls, tail));
+        assert!(sema.is_empty(), "{sema:?}");
+        assert!(lower.is_empty(), "{lower:?}");
+        assert_eq!(calls(&prog, &it, "wukong_rt_write_f32"), 1);
     }
 }

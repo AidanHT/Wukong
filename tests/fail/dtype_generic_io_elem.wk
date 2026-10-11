@@ -1,0 +1,15 @@
+// EXPECT-CODE: E0416
+module tests.fail.dtype_generic_io_elem
+
+// N18, the typed file-I/O half: `write_f32` moves `f32` bytes, so a dtype-generic tensor reaches it
+// only from an instantiation that binds `T = f32`. Instantiating `save` at `T = f64` is the error,
+// at the operand and labelled with the call that required the instance, rather than writing the
+// f64 buffer's bytes as if they were f32 (or refusing the generic body outright, as before).
+fn save<T>(x: Tensor[T, 4]) -> i64 {
+    return write_f32("io_test_dtype_generic_elem.bin", x);
+}
+
+fn main() -> i32 {
+    let x: [f64; 4] = [1.0, 2.0, 3.0, 4.0];
+    return save(x) as i32;
+}

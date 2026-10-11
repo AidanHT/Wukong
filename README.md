@@ -94,13 +94,16 @@ not duplicate them. In summary, Wukong:
   specialized per instantiation, so no vtable or function pointer exists at run time
   (`tests/run/{methods_impl,traits_static_dispatch,fn_params}.wk`). Every concrete instantiation
   is type-checked again at its types; a tensor may be generic over its element (`Tensor[T, N]`,
-  with `alloc::<T>(n)` as the generic heap allocator), one instance per dtype; and
+  with `alloc::<T>(n)` as the generic heap allocator), one instance per dtype, and its `T = f32`
+  instance reaches the kernel builtins (`E0415`/`E0416` for any other binding); and
   `where K % 16 == 0` predicates and `static_assert` over a function's dimensions are checked at
   each call (`tests/run/{dtype_generic_tensor,where_constraints}.wk`).
 - **Kernels callable by name.** `matmul`, `linear`, `softmax`, `layernorm`, `rmsnorm`, `transpose`, the
   buffer activations (`gelu(x, out)`, …), `sum`/`dot` and `sdpa` reach the tuned runtime kernels
   directly, with real shape signatures (`E0409` when a dimension cannot be inferred) — the explicit
-  door beside the loop-nest recognizers (`tests/run/builtin_*.wk`). The decode builtins `sdpa_kv`
+  door beside the loop-nest recognizers (`tests/run/builtin_*.wk`). A statically safe `sdpa` is one
+  bare kernel call, so a loss calling it differentiates and trains (`tests/run/sdpa_loss_train.wk`).
+  The decode builtins `sdpa_kv`
   (KV-cache / grouped-query attention), `kv_append`, `gemv_bf16`/`gemv_f16` and the llama.cpp
   `Q8_0`/`Q4_0` packers and GEMVs check their geometry against their operands at run time
   (`tests/run/decode_*.wk`).

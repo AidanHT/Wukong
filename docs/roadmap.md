@@ -371,11 +371,17 @@ another architecture or OS is not supported. A native-backend failure is a catal
   is monomorphized per element (`axpy$f32`, `axpy$bf16`), `alloc::<T>(n)` allocates a `[]T` per
   instance, and every concrete instantiation of a generic function is type-checked again at its
   types, an error carrying "required by this instantiation of `f` with T = …"
-  (`tests/run/dtype_generic_tensor.wk`, `tests/fail/generic_instantiation_bad_op.wk`). Sharp edges:
-  a named kernel builtin (`matmul`, …) does not accept a `Tensor[T, ..]` operand, and an in-body
-  recognizer that reads sema's generic-body types declines on an instance rather than firing (the
-  instance lowers as ordinary loops). Generic structs (`Buf<T>`) are not
-  monomorphized.
+  (`tests/run/dtype_generic_tensor.wk`, `tests/fail/generic_instantiation_bad_op.wk`). A named
+  kernel builtin (`matmul`, `sdpa`, …) or a typed file-I/O builtin (`write_f32`, …) takes a
+  `Tensor[T, ..]` operand, checked per instantiation: `T` bound to the builtin's element dispatches
+  it (`mm$f32` reaches `wukong_sgemm`, `tests/run/dtype_generic_builtin.wk`), any other binding is
+  `E0415` / `E0416`. Sharp edges: a `[]T` / `[T; N]` builtin operand is not deferred the same way
+  (still the plain mismatch); the decode builtins (`sdpa_kv`, `gemv_bf16`, …) take no
+  `Tensor[T, ..]` operand (`E0437`); an instance past the re-check's 512-instance budget is not
+  re-checked, so a wrong element there is a `C0001` codegen refusal rather than `E0415`/`E0416`;
+  and an in-body recognizer that reads sema's generic-body types declines
+  on an instance rather than firing (the instance lowers as ordinary loops). Generic structs
+  (`Buf<T>`) are not monomorphized.
 - **Type aliases.** `type Real = f32;` and generic `type Mat<M, N> = Tensor[Real, M, N];` (type,
   dimension and `const` parameters, dimension-arithmetic arguments like `Row<N * 2>`) work in every
   type position and across imports (`pub type`). The driver expands each use right after import
@@ -1171,10 +1177,22 @@ trainable frequency table), the embedding gather and the fused scaled-dot-produc
 (`wukong_attention_f32`, causal or not — its backward is the FlashAttention recompute: the weights
 are rebuilt with the α-scaled score GEMM and the row softmax, then `dV = Pᵀ·dO`, `dS =
 softmax_bwd(P, dO·Vᵀ)·scale`, `dQ = dS·K`, `dK = dSᵀ·Q`, all on the tuned GEMM and
-`wukong_softmax_bwd_f32` kernels). A source `sdpa(...)` call, like every named kernel builtin that
-writes an output buffer other than its own input, still lowers behind a run-time output-overlap
-dispatch (a branch), so a loss that makes such a call is not single-block and is refused by the
-straight-line contract; spell the layer with the recognized loops to train it from source.
+`wukong_softmax_bwd_f32` kernels). A source `sdpa(...)` call differentiates from source when every
+input is proved apart from the output — each of `q`, `k`, `v` and `out` a fixed-array local or a
+fixed-array / static-tensor parameter, and each input pair with `out` two different locals, a local
+and a parameter, or two different parameters the call-site alias fact or a `@noalias` promise
+separates. The lowering then emits no overlap test and the call is one bare `wukong_attention_f32`
+in a straight-line block; `--emit=grad` / `--train` run through this VJP
+(`tests/run/sdpa_loss_train.wk`, `crates/wukongc/tests/autodiff_attention.rs`, gated against the
+f64 central finite difference in `wukong_driver`'s `grad_model_tests`). `s` and `d` may be runtime
+values: their range checks and the operands' extent checks are then straight-line `assert` calls,
+which do not block differentiation (`sdpa_loss_with_runtime_dims_matches_f64_finite_differences`);
+constant `s`/`d` with static extents only removes those `assert`s. Any other `sdpa` — a slice
+operand, a view, a may-alias pair, one storage under two names (`match m { x => sdpa(x, x, x, m,
+..) }`) — and every other named kernel builtin that writes an output buffer other than its own
+input still lowers behind a run-time output-overlap dispatch (a branch), so a loss that makes such
+a call is not single-block and is refused by the straight-line contract; spell the layer with the
+recognized loops to train it from source.
 
 **The backward rides the tuned kernels.** The GEMM adjoints are the runtime's own transposed GEMM
 spellings (no synthesized transpose); softmax / LayerNorm / RMSNorm backward are the runtime's

@@ -136,6 +136,7 @@ deref_aggregate_value.wk:
 deref_field_access.wk:
 div_edge.wk:
 diverging_arms_nonint_return.wk:
+dtype_generic_builtin.wk: wukong_rt_alloc wukong_rt_free wukong_rt_read_f32 wukong_rt_write_f32 wukong_sgemm wukong_sgemm*2
 dtype_generic_tensor.wk: veckernel*3 wukong_rt_alloc wukong_rt_alloc*2 wukong_rt_free wukong_rt_free*2 wukong_velem_f32 wukong_velem_f32*2
 elementwise_slice.wk: wukong_axpby_bf16 wukong_axpby_bf16_out wukong_bias_bcast_f32 wukong_dequant_f32 wukong_dequant_perchan_f32 wukong_rt_alloc wukong_rt_alloc*19 wukong_rt_free wukong_rt_free*19 wukong_velem_f32 wukong_vhorner_f32 wukong_vmath_bf16_out
 elu.wk: wukong_vmath_f32
@@ -404,8 +405,10 @@ scan_1d.wk: wukong_cumprod_f32 wukong_cumsum_f32 wukong_lrscan_f32
 scan_elem_lowp.wk:
 scan_slice.wk: veckernel*1 wukong_argreduce_f32 wukong_colargmax_i32 wukong_colsum_f32 wukong_cummax_f32 wukong_cummin_f32 wukong_cumprod_f32 wukong_cumsum_f32 wukong_lrscan_f32 wukong_rowargmax_i32 wukong_rt_alloc wukong_rt_alloc*14 wukong_rt_free wukong_rt_free*14 wukong_sgevm_f32 wukong_transpose_f32
 scatter_add.wk: wukong_scatter_add_f32
-sdpa.wk: wukong_attention_f32 wukong_attention_f32*4 wukong_rt_alloc wukong_rt_alloc*2 wukong_rt_free wukong_rt_free*2
-sdpa_blocks.wk: wukong_attention_f32 wukong_attention_f32*4 wukong_rt_alloc wukong_rt_alloc*2 wukong_rt_free wukong_rt_free*2
+sdpa.wk: wukong_attention_f32 wukong_attention_f32*2
+sdpa_blocks.wk: wukong_attention_f32 wukong_attention_f32*2
+sdpa_loss_train.wk: wukong_attention_f32 wukong_attention_f32*2 wukong_sreduce_f32_parallel wukong_sreduce_f32_parallel*2
+sdpa_match_alias.wk: wukong_attention_f32 wukong_attention_f32*6 wukong_rt_alloc wukong_rt_alloc*3 wukong_rt_free wukong_rt_free*3
 selective_scan_state.wk: veckernel*5
 selu.wk: wukong_vmath_f32
 selu_parallel.wk: wukong_parallel_for wukong_vmath_f32

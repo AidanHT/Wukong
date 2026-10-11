@@ -116,8 +116,9 @@ impl FnLowerer<'_> {
     /// Is `v` an entry parameter bound to its storage itself — a fixed-size array or a
     /// statically-shaped tensor, whose binding no assignment anywhere can redirect? (A name only
     /// resolves to the parameter VALUE when lowering bound it directly; a parameter copied into a
-    /// slot resolves to the slot and never gets here.)
-    fn param_is_its_storage(&self, v: ValueId) -> bool {
+    /// slot resolves to the slot and never gets here.) Also the `sdpa` builtin's static
+    /// disjointness proof (`builtins.rs`), which needs the same "this name IS that storage" fact.
+    pub(crate) fn param_is_its_storage(&self, v: ValueId) -> bool {
         self.param_arrays
             .iter()
             .find(|(p, _)| *p == v)

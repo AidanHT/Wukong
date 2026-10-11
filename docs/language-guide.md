@@ -191,8 +191,16 @@ fn axpy<T, N>(a: T, x: Tensor[T, N], mut y: Tensor[T, N]) {
 `Tensor[T, ..]` yields a `T`, and each instance (`axpy$f32`, `axpy$bf16`) is lowered with the
 concrete element in every tensor type (`tests/run/dtype_generic_tensor.wk`). An array of structs fed to a
 `Tensor[T, ..]` parameter is `E0502` (a tensor element is a scalar). A named kernel builtin
-(`matmul`, `softmax`, …) takes `f32` buffers and a file-I/O builtin one fixed element type, so
-neither accepts a `Tensor[T, ..]` operand inside a generic body. `alloc::<T>(n)` is the generic heap
+(`matmul`, `softmax`, `sdpa`, …) takes `f32` buffers and a typed file-I/O builtin (`read_bf16`,
+`write_f32`, `st_read_f32`, `topk_f32`, …) the one element type it names, so a `Tensor[T, ..]` operand of one is checked **per
+instantiation**: the generic body is accepted, an instance that binds `T` to the builtin's element
+reaches it exactly like the hand-written function (`fn mm<T>(a: Tensor[T, 4, 4], ..) { matmul(a, ..) }`
+instantiated at `f32` dispatches `wukong_sgemm`, `tests/run/dtype_generic_builtin.wk`), and any other
+binding is **`E0415`** (kernel builtin, `tests/fail/dtype_generic_builtin_elem.wk`) or **`E0416`**
+(typed I/O builtin, `tests/fail/dtype_generic_io_elem.wk`) at the operand, labelled with the call
+that required the instance. A `[]T` slice or `[T; N]` array operand of a builtin is still the plain
+element mismatch inside the generic body, and the decode builtins (`sdpa_kv`, `kv_append`,
+`gemv_bf16`, …) take no `Tensor[T, ..]` operand at all (`E0437`). `alloc::<T>(n)` is the generic heap
 allocator — a zeroed `[]T`, the same buffer `alloc_<T>(n)` returns, with `T` a scalar or a type
 parameter (anything else is `E0325`).
 
@@ -1460,6 +1468,14 @@ What the lowering guarantees on top of the kernel call:
   overlaps one: the call compares address ranges at run time and, on overlap, computes into scratch
   and copies the result out (`matmul::<2, 2, 2>(p, q, p)` is `p·q`). An elementwise or row-wise
   builtin spelled in place with one name (`softmax(x, x)`) runs in place with no test.
+- **`sdpa`'s static form.** An input whose storage is provably apart from `out` — two different
+  fixed-array locals, a local and a fixed-array parameter, or two different fixed-array parameters
+  that no call site binds to one array or that a `@noalias` promise separates — needs no overlap
+  test. When all three inputs are proved apart there is no branch: the call is one bare
+  `wukong_attention_f32`, preceded only by the extent checks that are not compile-time facts, as
+  straight-line `assert`s (with constant `s`/`d` and statically sized operands there are none). A
+  slice, a view, a may-alias pair or one array under two names (`match m { x => sdpa(x, x, x, m,
+  ..) }`, `tests/run/sdpa_match_alias.wk`) keeps the guard.
 - **Empty contractions.** `matmul` with `K = 0` is the zero matrix and `linear` the broadcast bias,
   although the GEMM kernels themselves write nothing for `K = 0`.
 - Inside a `@parallel` function each call uses the kernel's multicore twin, which is bit-identical.
@@ -1468,7 +1484,9 @@ What the lowering guarantees on top of the kernel call:
 
 `sum` and `dot` lower to the same single `wukong_sreduce_f32` call the reduction recognizer emits,
 which the autodiff tape already differentiates; `amax`/`amin` have no VJP, and the buffer-writing
-builtins add the overlap branch, which the single-block autodiff tape does not take yet. Fixtures: `tests/run/builtin_matmul.wk`, `builtin_norms.wk`, `builtin_activations.wk`,
+builtins add the overlap branch, which the single-block autodiff tape does not take yet — except a
+static `sdpa` (above), which is branch-free and differentiates through the fused attention VJP
+(`tests/run/sdpa_loss_train.wk`, `crates/wukongc/tests/autodiff_attention.rs`). Fixtures: `tests/run/builtin_matmul.wk`, `builtin_norms.wk`, `builtin_activations.wk`,
 `builtin_reductions.wk`, `sdpa_blocks.wk` (two query blocks, D = 9, both mask modes), each printing
 every lane against hand-derived values; `tests/fail/builtin_dim_uninferable.wk`,
 `sdpa_operand_extent.wk`, `sdpa_operand_type.wk`.
@@ -2262,9 +2280,13 @@ recursive) is named in the refusal. Every recognized tensor kernel either has a 
 f32 GEMM family including the fused bias/activation epilogue, all activations, the norms,
 cross-entropy, RoPE, the embedding gather, the fused attention kernel — or declines by name with
 the reason (`docs/roadmap.md`, *Automatic differentiation*). A named kernel builtin that writes an
-output buffer other than its own input (`matmul(a, b, c)`, `softmax(x, y)`, `sdpa(...)`) lowers
-behind a run-time output-overlap dispatch — a branch — so a loss that calls one is not single-block
-and is refused; write that layer as the recognized loops to train it.
+output buffer other than its own input (`matmul(a, b, c)`, `softmax(x, y)`) lowers behind a
+run-time output-overlap dispatch — a branch — so a loss that calls one is not single-block and is
+refused; write that layer as the recognized loops to train it. `sdpa` is the exception when its
+static form applies — fixed-array operands with every input proved apart from `out` (for example
+`@noalias` parameters): it is one bare kernel call, and a loss calling it differentiates and trains
+through the fused attention VJP (`tests/run/sdpa_loss_train.wk`). `s` and `d` need not be
+constants: their checks are straight-line `assert`s, which the tape passes through.
 
 **✅ AOT gradient:** `wukongc --emit=obj --grad-of=loss -o model.o model.wk` exports `loss_grad`
 next to `loss` (C ABI: the loss's parameters, then one caller-zeroed gradient buffer per
