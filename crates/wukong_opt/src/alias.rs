@@ -1216,14 +1216,17 @@ mod tests {
     const NOALIAS: ParamAttrs = ParamAttrs {
         noalias: true,
         slice: false,
+        extent: None,
     };
     const NOALIAS_SLICE: ParamAttrs = ParamAttrs {
         noalias: true,
         slice: true,
+        extent: None,
     };
     const PLAIN_SLICE: ParamAttrs = ParamAttrs {
         noalias: false,
         slice: true,
+        extent: None,
     };
 
     /// A pointer parameter carrying `attrs`.

@@ -566,21 +566,30 @@ another architecture or OS is not supported. A native-backend failure is a catal
   loop's own compare/select, so NaN and `±0` behave exactly as in the scalar loop
   (`tests/run/vectorized_{minmax,guarded}_reductions.wk` print every prefix answer). **Search
   loops** with an early `break` widen too, when every load before the exit provably stays inside its
-  object (a local `[T; N]` table, or a slice searched to its own length): any lane leaving hands the
-  group back to the scalar loop, which stops at exactly the same iteration
-  (`tests/run/vectorized_search_loops.wk`). **One-armed memory** in an `if` is predicated per lane
+  object (a local `[T; N]` table, a `[T; N]` or static-shape tensor parameter under a constant bound,
+  or a slice searched to its own length): any lane leaving hands the group back to the scalar loop,
+  which stops at exactly the same iteration (`tests/run/vectorized_search_loops.wk`,
+  `tests/run/vec4_search_param_extent.wk`). **One-armed memory** in an `if` is predicated per lane
   instead of declining the loop: a store only one arm makes, and a load only one arm makes, touch
   each lane's own element only where that lane took the arm and a private scratch slot otherwise
   (`tests/run/vectorized_predicated_arms.wk`). **Argmax / argmin** (`if x[i] > m { m = x[i]; at = i;
   }`, strict compare, ties keep the lowest index, NaN never updates) and **FindLastIV** (`if c { last
   = i }`) widen with per-lane partials and an exit fold by iteration order, bit-exact with the scalar
-  loop (`tests/run/vec_argmax_reductions.wk`, `tests/run/vec_find_last.wk`); a `>=` argmax (last
-  tie), an `else`-arm update and 64-bit argmax values stay scalar. Still scalar: searches over a parameter buffer (no extent in MIR), `if`/`else if` chains,
-  stores to different places in both arms, and an arm that alone subscripts a `[]T` parameter
-  without `@noalias` (its data pointer is re-read inside the arm, an invariant load that is not
-  speculated; a local or `@noalias` slice has it hoisted out of the loop). The per-lane accesses are scalar under Cranelift
-  (no masked vector memory op is emitted yet). A loop needing more than
-  eight runtime alias checks stays scalar. A two-deep nest whose inner loop carries a recurrence or
+  loop (`tests/run/vec_argmax_reductions.wk`, `tests/run/vec_find_last.wk`); a `>=` argmax keeps
+  the LAST tie (`tests/run/vec4_argmax_last_ties.wk`). **`if / else if` chains** and small nests of
+  conditionals are flattened with path predicates — a chain storing on every path is one vector store
+  of nested selects, one with a path that stores nothing is predicated per lane — and a **bounds
+  check inside an arm** (a one-armed store over a checked `[]T` parameter) is discharged once, by a
+  guard that every index of the vector loop passes it (`tests/run/vec4_else_if_predication.wk`).
+  **Countdowns** (`while i > 0 { i = i - 1; .. }`, `while i >= 0 { ..; i = i - 1 }`) widen with
+  each part loaded and stored as one vector reversed by a shuffle (`tests/run/vec4_reverse_loops.wk`).
+  A runtime trip whose `end - start` wraps runs no vector group, and every fold returns its seed
+  bit for bit below one group (`tests/run/vec4_zero_trip_reductions.wk`). Still scalar: an
+  `else`-arm argmax update and 64-bit argmax values, stores to different places in one nested
+  region, nested guarded reductions, and in a countdown a search, an argmax or an interleave group.
+  The per-lane accesses are scalar under Cranelift (no masked vector memory op is emitted yet). A
+  loop needing more than eight runtime alias checks stays scalar, and so does one whose estimated
+  vector group costs more than its `W` scalar iterations (`WUKONG_VEC_COST=0` lifts that). A two-deep nest whose inner loop carries a recurrence or
   a strict-order reduction (an EMA or IIR per row, a hash, a column sum) is **unrolled and jammed**
   instead: four rows run side by side as four independent chains, each bit-identical to the scalar
   loop, when the rows provably touch disjoint memory (`tests/run/unroll_jam_nests.wk`). Its speed-up
@@ -1337,6 +1346,16 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
 
 ## Known limitations / sharp edges
 
+- **A `?` argument binds a fixed-extent parameter unchecked.** `fn find(x: [f32; 37])` called with a
+  `Tensor[f32, ?]` (or an array that decayed to one) compiles with no diagnostic and no run-time
+  length test, though the buffer may be shorter; only another constant length is `E0501`. A shorter
+  buffer is outside the defined contract, like every wrong run-time size, and the optimizer may read
+  up to the declared extent (`ParamAttrs::extent`: the vectorizer runs a search loop's test a group
+  ahead of the scalar loop over such a parameter). So a 10-element buffer searched by a `[f32; 37]`
+  function stops at its hit at `-O0` but reads past its end at `-O2` ("vector load out of bounds" in
+  the interpreter). A run-time length assertion where a `?` extent meets a fixed one would close the
+  gap. The extent is already in hand there, since a `?` axis travels as a hidden argument.
+
 - **Fast-mode float results depend on how a reduction is compiled.** Under the default `--fp=fast`
   an `f32` reduction is evaluated on one of three trees — the source fold (a loop nothing
   vectorizes), the sequential vectorizer's lane partition, or the `@parallel` kernel's fixed
@@ -1495,9 +1514,10 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   a promised view parameter (`E0316`); an unprovable violation is undefined, as in C. Without the
   attribute nothing changes: distinct local allocations and call-site proofs remain the only
   disjointness facts.
-- **What the general MIR loop vectorizer still leaves scalar** (`wukong_opt::vectorize`): a reverse
-  (`i = i - 1`) or non-unit-step loop; a strided access outside a *complete* interleave group (a
-  gap, or a stride above 4); a scatter (a store through a data-dependent index); and a gather whose
+- **What the general MIR loop vectorizer still leaves scalar** (`wukong_opt::vectorize`): a loop
+  stepping by anything but `+1` or `-1`, and a negative stride on an ascending counter
+  (`x[n - 1 - i]`); a strided access outside a *complete* interleave group (a gap, or a stride above
+  4), or any interleave group in a countdown; a scatter (a store through a data-dependent index); and a gather whose
   index is bounds-checked (a checked slice keeps a data-dependent check no guard can cover — the
   gather widens from an array, or under `@unchecked`) or whose object a store in the loop may reach
   (two unpromised slices may be one buffer). Replication is a heuristic, not a measurement: a body

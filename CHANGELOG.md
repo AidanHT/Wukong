@@ -208,6 +208,58 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `//~ <CODE>` (`//~^`/`//~v`) annotations pin how many errors a `tests/fail` fixture reports and the
   line of each; `WUKONG_BLESS=1 cargo test -p wukongc --test fail` rewrites them from the real output
   (never `EXPECT-CODE`) and fails on purpose for review. All 210 fixtures are annotated.
+### Loop vectorizer: countdowns, nested if-conversion, parameter searches, cost model (`gap4/vectorizer`)
+
+- **A runtime trip that wraps runs no vector group (P1.16).** The vector loop's count was
+  `end - start` in the counter's type; an `i32` loop from `2147483600` to `-2147483600` runs no
+  iteration but that difference is `96`, and `-O2` read 24 groups past the buffer ("vector load out
+  of bounds" where `-O0` returned the seed). The guard now also requires `start < end` under the
+  header's signedness. The rest of the zero-trip audit needed no change: every fold form returns its
+  seed bit for bit below one group (`tests/run/vec4_zero_trip_reductions.wk`, `-0.0`/NaN/`+inf` and
+  `MIN`/`MAX`/`-1` seeds over f32, f64, i32 and i64).
+- **`>=`/`<=` argmax and argmin widen, the last tie winning.** Index lanes start one below the first
+  counter, and the exit fold takes the best value and, among equal ones, the latest index
+  (`tests/run/vec4_argmax_last_ties.wk`).
+- **Search loops over `[T; N]` and static-shape tensor parameters (N38).** Such a parameter now
+  records its extent in MIR (`ParamAttrs::extent`), so a search whose constant bound keeps every
+  group load inside it widens (`tests/run/vec4_search_param_extent.wk`).
+- **`else if` chains and checked one-armed stores (N39).** A small nest of conditionals is flattened
+  with path predicates: a chain storing on every path is one vector store of nested selects, one
+  with a path that stores nothing is predicated per lane, and a bounds check inside an arm (a
+  one-armed store over a plain `[]T` parameter) is dropped under a guard that every index of the
+  vector loop passes it (`tests/run/vec4_else_if_predication.wk`).
+- **Countdowns widen (N35).** `while i > 0 { i = i - 1; .. }` and `while i >= 0 { ..; i = i - 1 }`
+  load and store each part as one vector reversed by a shuffle, lane `k` still iteration `k`
+  (`tests/run/vec4_reverse_loops.wk`; `WUKONG_NO_REVERSE_VEC=1` restores the decline). Searches,
+  argmax/FindLastIV and interleave groups stay with ascending loops.
+- **The cost model is enforced (N43).** A loop whose estimated vector group costs more than its `W`
+  scalar iterations is declined (`WUKONG_VEC_COST=0` disables); over `tests/run` that declines two
+  loops the nested if-converter had just started taking, and no loop widened before stops widening.
+- **An arm's read through a raw pointer is no longer speculated.** If-conversion read a `[]T` fat
+  pointer that only one arm touches once for the whole group, in the guard — and accepted any
+  parameter as that fat pointer's owner. `(*p).w[i] = v` in an arm reads the data pointer at `p`
+  itself, and `k(x, 0 as *mut Layer, 16)` with no lane taking the arm returned at `-O0` but stopped
+  with "null pointer dereference" at `-O2` (native: SIGSEGV); a checked arm's length re-read did the
+  same. Only a fat pointer that is live for the whole call is speculated now: a `[]T` parameter's
+  (`ParamAttrs::slice`, which `mir_build` now records on every slice parameter as a fact of its
+  type, not only beside `@noalias` — alias analysis still reads it only there) or a stack slot's
+  (`tests/run/vec4_speculation_raw_pointer.wk`).
+- **The guard reads a raw pointer only when a vector group will run.** The guard runs on every loop
+  entry and re-read every slice's fat pointer there, for its alias checks and to hoist the data
+  pointer. Through a raw pointer that read can be null where the scalar loop never makes it:
+  `k(x, 0 as *mut Layer, 0)` over `(*p).w[i] = x[i]` (a zero trip), and a search that leaves on its
+  first iteration before storing through `p`, returned at `-O0` and stopped with "null pointer
+  dereference" at `-O2` (native: SIGSEGV). Now a read that cannot fault (a slice parameter's or a
+  stack slot's fat pointer) is still made freely. Any other read is made only when a group will
+  run, through a `select` on `n_vec != 0` under a runtime trip, and a search loop declines it. The
+  zero-trip loop still widens. Over `tests/run`, `examples` and `bench/kernels` no other loop changes
+  its widening decision.
+- **Docs: a fixed parameter extent is a contract, not a checked fact.** `ParamAttrs::extent` and
+  `docs/internals.md` said that a call with another length is `E0501`. That holds for a constant
+  length, but a `?` argument binds a fixed extent with no check, so a short buffer reaches the
+  search-loop speculation. The language guide (Extents), the roadmap's sharp edges and the code docs
+  now say that the caller promises at least the declared extent. A shorter buffer is outside the
+  defined contract, where `-O2` may read past it. No behavior changes.
 
 ### Index-recording reductions (`gap3/vec-argmax`)
 

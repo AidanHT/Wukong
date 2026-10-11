@@ -870,6 +870,14 @@ the run-time extent then binds); an immutable view of the parameter keeps the ex
 it keeps. A `?` extent that is not known at a call (a `?` tensor *returned* by a call, say) is a clean
 `C0001` there, never a guessed value (`tests/run/tensor_extent.wk`).
 
+In the other direction a `?` argument binds a **fixed** extent unchecked. Passing a `Tensor[f32, ?]`
+(or an array that decayed to one) where the callee declares `[f32; 37]` or `Tensor[f32, 37]`
+compiles with no diagnostic and no run-time length test; only another *constant* length is `E0501`.
+The caller promises that the buffer holds at least the declared extent, and a shorter one is
+outside the defined contract, like any wrong run-time size. The optimizer may read anywhere inside
+the declared extent: over such a parameter the vectorizer runs a search loop's test a group ahead of
+the scalar loop, so `-O2` can read past a short buffer that `-O0` happened to stop inside.
+
 **Layout.** A tensor type may carry a physical-layout suffix, which must come last inside the
 brackets: `Tensor[f32, M, N, .contiguous]` (the default, row-major), `.col_major`, `.strided`, or
 `.tiled(64, 64)`. An unrecognized layout name is `E0204`. The layout is part of the type — sema unifies

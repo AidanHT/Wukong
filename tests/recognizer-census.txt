@@ -493,6 +493,12 @@ vec256_general.wk: veckernel*1 wukong_velem_f32 wukong_velem_f32*2
 vec256_lane_types.wk: veckernel*2
 vec256_runtime_streams.wk: veckernel*3 wukong_rt_alloc wukong_rt_alloc*6 wukong_rt_free wukong_rt_free*6
 vec256_while.wk: veckernel*1 wukong_velem_f32 wukong_velem_f32*2
+vec4_argmax_last_ties.wk: wukong_rt_alloc wukong_rt_alloc*7 wukong_rt_free wukong_rt_free*7
+vec4_else_if_predication.wk: wukong_rt_alloc wukong_rt_alloc*5 wukong_rt_free wukong_rt_free*5
+vec4_reverse_loops.wk: wukong_rt_alloc wukong_rt_alloc*7 wukong_rt_free wukong_rt_free*7
+vec4_search_param_extent.wk:
+vec4_speculation_raw_pointer.wk: wukong_rt_alloc wukong_rt_alloc*2
+vec4_zero_trip_reductions.wk: veckernel*2 wukong_rt_alloc wukong_rt_alloc*19 wukong_rt_free wukong_rt_free*19
 vec_argmax_reductions.wk: wukong_rt_alloc wukong_rt_alloc*5 wukong_rt_free wukong_rt_free*5
 vec_exp.wk:
 vec_find_last.wk: wukong_rt_alloc wukong_rt_alloc*2 wukong_rt_free wukong_rt_free*2

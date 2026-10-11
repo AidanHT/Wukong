@@ -1,0 +1,219 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 18
+// EXPECT-OUT: 19
+// EXPECT-OUT: 20
+// EXPECT-OUT: 21
+// EXPECT-OUT: 22
+// EXPECT-OUT: 23
+// EXPECT-OUT: 24
+// EXPECT-OUT: 25
+// EXPECT-OUT: 26
+// EXPECT-OUT: 27
+// EXPECT-OUT: 28
+// EXPECT-OUT: 29
+// EXPECT-OUT: 30
+// EXPECT-OUT: 31
+// EXPECT-OUT: 32
+// EXPECT-OUT: 33
+// EXPECT-OUT: 34
+// EXPECT-OUT: 35
+// EXPECT-OUT: 36
+// EXPECT-OUT: 37
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 18
+// EXPECT-OUT: 19
+// EXPECT-OUT: 20
+// EXPECT-OUT: 21
+// EXPECT-OUT: 22
+// EXPECT-OUT: 23
+// EXPECT-OUT: 24
+// EXPECT-OUT: 25
+// EXPECT-OUT: 26
+// EXPECT-OUT: 27
+// EXPECT-OUT: 28
+// EXPECT-OUT: 29
+// EXPECT-OUT: 30
+// EXPECT-OUT: 31
+// EXPECT-OUT: 32
+// EXPECT-OUT: 33
+// EXPECT-OUT: 34
+// EXPECT-OUT: 35
+// EXPECT-OUT: 36
+// EXPECT-OUT: 37
+// EXPECT-OUT: 36
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 18
+// EXPECT-OUT: 19
+// EXPECT-OUT: 20
+// EXPECT-OUT: 21
+// EXPECT-OUT: 22
+// EXPECT-OUT: 23
+// EXPECT-OUT: 24
+// EXPECT-OUT: 25
+// EXPECT-OUT: 26
+// EXPECT-OUT: 27
+// EXPECT-OUT: 28
+// EXPECT-OUT: 29
+// EXPECT-OUT: 30
+// EXPECT-OUT: 31
+// EXPECT-OUT: 32
+// EXPECT-OUT: 33
+// EXPECT-OUT: 34
+// EXPECT-OUT: 35
+// EXPECT-OUT: 36
+module tests.run.vec4_search_param_extent
+
+// Early-exit search loops over array and tensor PARAMETERS (-O2). A search's exit test runs a
+// whole group ahead of the scalar loop, so lanes past the exiting one load elements the scalar loop
+// never reaches — sound only when every speculated load lies inside the object. A `[T; N]` or
+// statically-shaped tensor parameter now carries its extent into MIR (`ParamAttrs::extent`), and
+// a constant trip bound that keeps every group load inside `[0, N)` lets the loop widen.
+//
+// Each search is kept OUT of line (the two functions call each other, so the inliner never
+// splices them into `main`, where the array would be a local and take the stack-array proof
+// instead). 37 = 9 groups of 4 plus 1, so position 36 is found by the scalar tail after nine
+// all-clear groups. Every expected line is the scalar answer, derived by hand: x[k] = k, so the
+// first element above t = k - 0.5 is at k, and a threshold no element exceeds returns the bound.
+
+fn find(x: [f32; 37], t: f32, d: i64) -> i64 {
+    if d > 0 {
+        return find_again(x, t, d - 1);
+    }
+    let mut i: i64 = 0;
+    while i < 37 {
+        if x[i] > t {
+            break;
+        }
+        i = i + 1;
+    }
+    return i;
+}
+
+fn find_again(x: [f32; 37], t: f32, d: i64) -> i64 {
+    return find(x, t, d);
+}
+
+// The same over a statically-shaped tensor parameter.
+fn tfind(x: Tensor[f32, 37], t: f32, d: i64) -> i64 {
+    if d > 0 {
+        return tfind_again(x, t, d - 1);
+    }
+    let mut i: i64 = 0;
+    while i < 37 {
+        if x[i] > t {
+            break;
+        }
+        i = i + 1;
+    }
+    return i;
+}
+
+fn tfind_again(x: Tensor[f32, 37], t: f32, d: i64) -> i64 {
+    return tfind(x, t, d);
+}
+
+// One element ahead: `x[i + 1]` for i in 0..36 reads 1..36, still inside the 37.
+fn find_next(x: [i32; 37], key: i32, d: i64) -> i64 {
+    if d > 0 {
+        return find_next_again(x, key, d - 1);
+    }
+    let mut i: i64 = 0;
+    while i < 36 {
+        if x[i + 1] == key {
+            break;
+        }
+        i = i + 1;
+    }
+    return i;
+}
+
+fn find_next_again(x: [i32; 37], key: i32, d: i64) -> i64 {
+    return find_next(x, key, d);
+}
+
+fn main() -> i32 {
+    let mut a: [f32; 37] = [0.0; 37];
+    let mut b: [i32; 37] = [0; 37];
+    let mut k: i64 = 0;
+    while k < 37 {
+        a[k] = k as f32;
+        b[k] = (k as i32) * 3;
+        k = k + 1;
+    }
+    // Thresholds -0.5, 0.5, .., 36.5: the first element above each is at 0, 1, .., 36, then none
+    // (37). The last hit (36) is in the ragged tail after the vector loop's nine groups.
+    let mut q: i64 = 0;
+    while q < 38 {
+        print(find(a, (q as f32) - 0.5, 1));
+        q = q + 1;
+    }
+    q = 0;
+    while q < 38 {
+        print(tfind(a, (q as f32) - 0.5, 0));
+        q = q + 1;
+    }
+    // key = 3k is first seen at x[i + 1] for i = k - 1 (k in 1..=36), so 0, 1, .., 35; key 0 sits
+    // only at x[0], which `x[i + 1]` never reads, so the search runs off its bound: 36. key 7 is
+    // nowhere: 36.
+    print(find_next(b, 0, 1));
+    q = 1;
+    while q < 37 {
+        print(find_next(b, (q as i32) * 3, 0));
+        q = q + 1;
+    }
+    print(find_next(b, 7, 0));
+    return 0;
+}

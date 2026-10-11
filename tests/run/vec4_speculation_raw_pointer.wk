@@ -1,0 +1,271 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 100
+// EXPECT-OUT: 101
+// EXPECT-OUT: 102
+// EXPECT-OUT: 0
+// EXPECT-OUT: -1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: -4
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: -7
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: -10
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: -13
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: -16
+// EXPECT-OUT: -1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: -4
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: -7
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: -10
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: -13
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: -16
+// EXPECT-OUT: -1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: -4
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: -7
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: -10
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: -13
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: -16
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: -3
+// EXPECT-OUT: -4
+// EXPECT-OUT: -5
+// EXPECT-OUT: -6
+// EXPECT-OUT: -7
+// EXPECT-OUT: -8
+// EXPECT-OUT: -9
+// EXPECT-OUT: -10
+// EXPECT-OUT: -11
+// EXPECT-OUT: -12
+// EXPECT-OUT: -13
+// EXPECT-OUT: -14
+// EXPECT-OUT: -15
+// EXPECT-OUT: -16
+module tests.run.vec4_speculation_raw_pointer
+
+// What the vectorizer may read that the scalar loop never does. An if-converted arm runs for every
+// lane, so a load only the arm makes is either predicated per lane or *speculated* - read once for
+// the whole group, in the guard - and the guard itself runs on every loop entry, a zero trip
+// included, re-reading the fat pointer of each slice the loop indexes. A read like that is sound
+// only for an address that cannot fault however the loop runs. A `[]T` parameter's fat pointer
+// qualifies (the caller's live 16-byte object; `ParamAttrs::slice`, recorded on every slice
+// parameter). A RAW pointer does not: `(*p).w[i]` reads the data pointer at `p` itself, and `p` may
+// be `0 as *mut Layer` whenever the scalar loop never reaches the access. Each case below once
+// stopped `-O2` with "null pointer dereference" (native: SIGSEGV) where `-O0` returned:
+//
+// * an arm no lane takes (`arm_raw`), and its checked spelling's length re-read (`arm_checked`):
+//   the arm now declines;
+// * a zero trip (`zero_raw`): the guard now reads `p` only when a vector group will run, and the
+//   loop still widens;
+// * a search that leaves on its first iteration, before its store through `p` (`search_raw`): a
+//   search's guard re-reads only a fat pointer that cannot fault, so this one declines.
+//
+// Every kernel stays OUT of line (each calls itself through a twin, so the inliner never splices it
+// into `main`, where `p` would be a constant and not a parameter). Expected values are the scalar
+// semantics, by hand. The null calls return (markers 100, 101, 102, and the search's index 0).
+// Then x[j] = (j mod 3) - 0.5 and each kernel starts from w[j] = -(j + 1). An arm stores 2x + 1
+// where x > 0: lanes with j mod 3 = 1 hold 2, lanes with j mod 3 = 2 hold 4, and lanes with
+// j mod 3 = 0 (x = -0.5) keep -(j + 1) - for the raw-pointer arm (declined), its checked spelling
+// (declined) and the same arm over a `[]f32` parameter (widened). `zero_raw` stores 2x + 1 on every
+// lane: 0, 2, 4 repeating. `search_raw` with t = 1.0 stores lanes 0 and 1 (0 and 2), leaves at
+// x[2] = 1.5 and returns 2, and lanes 2..15 keep -(j + 1). Every lane of every case is printed.
+
+struct Layer { w: []f32, }
+
+@unchecked
+fn arm_raw(x: []f32, p: *mut Layer, n: i64, d: i64) {
+    if d > 0 {
+        arm_raw_again(x, p, n, d - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        if x[i] > 0.0 {
+            (*p).w[i] = x[i] * 2.0 + 1.0;
+        }
+        i = i + 1;
+    }
+}
+
+fn arm_raw_again(x: []f32, p: *mut Layer, n: i64, d: i64) {
+    arm_raw(x, p, n, d);
+}
+
+fn arm_checked(x: []f32, p: *mut Layer, n: i64, d: i64) {
+    if d > 0 {
+        arm_checked_again(x, p, n, d - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        if x[i] > 0.0 {
+            (*p).w[i] = x[i] * 2.0 + 1.0;
+        }
+        i = i + 1;
+    }
+}
+
+fn arm_checked_again(x: []f32, p: *mut Layer, n: i64, d: i64) {
+    arm_checked(x, p, n, d);
+}
+
+@unchecked
+fn arm_slice(x: []f32, mut o: []f32, n: i64, d: i64) {
+    if d > 0 {
+        arm_slice_again(x, o, n, d - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        if x[i] > 0.0 {
+            o[i] = x[i] * 2.0 + 1.0;
+        }
+        i = i + 1;
+    }
+}
+
+fn arm_slice_again(x: []f32, mut o: []f32, n: i64, d: i64) {
+    arm_slice(x, o, n, d);
+}
+
+@unchecked
+fn zero_raw(x: []f32, p: *mut Layer, n: i64, d: i64) {
+    if d > 0 {
+        zero_raw_again(x, p, n, d - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        (*p).w[i] = x[i] * 2.0 + 1.0;
+        i = i + 1;
+    }
+}
+
+fn zero_raw_again(x: []f32, p: *mut Layer, n: i64, d: i64) {
+    zero_raw(x, p, n, d);
+}
+
+@unchecked
+fn search_raw(x: []f32, p: *mut Layer, t: f32, d: i64) -> i64 {
+    if d > 0 {
+        return search_raw_again(x, p, t, d - 1);
+    }
+    let n: i64 = x.len();
+    let mut i: i64 = 0;
+    while i < n {
+        if x[i] > t {
+            break;
+        }
+        let v: f32 = x[i] * 2.0 + 1.0;
+        (*p).w[i] = v;
+        i = i + 1;
+    }
+    return i;
+}
+
+fn search_raw_again(x: []f32, p: *mut Layer, t: f32, d: i64) -> i64 {
+    return search_raw(x, p, t, d);
+}
+
+fn reset(mut w: []f32) {
+    let mut j: i64 = 0;
+    while j < 16 {
+        w[j] = 0.0 - ((j + 1) as f32);
+        j = j + 1;
+    }
+}
+
+fn show(w: []f32) {
+    let mut j: i64 = 0;
+    while j < 16 {
+        print(w[j] as i32);
+        j = j + 1;
+    }
+}
+
+fn main() -> i32 {
+    let mut x: []f32 = alloc_f32(16);
+    let mut j: i64 = 0;
+    while j < 16 {
+        x[j] = 0.0 - 1.0;
+        j = j + 1;
+    }
+    // The scalar loop never touches `p` in any of these calls: null is fine.
+    arm_raw(x, 0 as *mut Layer, 16, 1);
+    print(100);
+    arm_checked(x, 0 as *mut Layer, 16, 1);
+    print(101);
+    zero_raw(x, 0 as *mut Layer, 0, 1);
+    print(102);
+    // x[0] = -1 > -5: the search leaves before its first store.
+    print(search_raw(x, 0 as *mut Layer, 0.0 - 5.0, 1));
+
+    j = 0;
+    while j < 16 {
+        x[j] = ((j % 3) as f32) - 0.5;
+        j = j + 1;
+    }
+    let mut w: []f32 = alloc_f32(16);
+    let mut l: Layer = Layer { w: w };
+    let lp: *mut Layer = &mut l;
+    reset(w);
+    arm_raw(x, lp, 16, 1);
+    show(w);
+    reset(w);
+    arm_checked(x, lp, 16, 1);
+    show(w);
+    reset(w);
+    arm_slice(x, w, 16, 1);
+    show(w);
+    reset(w);
+    zero_raw(x, lp, 16, 1);
+    show(w);
+    reset(w);
+    print(search_raw(x, lp, 1.0, 1));
+    show(w);
+    return 0;
+}

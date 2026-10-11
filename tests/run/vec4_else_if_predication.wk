@@ -1,0 +1,406 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 14
+// EXPECT-OUT: 28
+// EXPECT-OUT: 86
+// EXPECT-OUT: 2
+// EXPECT-OUT: 10
+// EXPECT-OUT: 36
+// EXPECT-OUT: 20
+// EXPECT-OUT: 82
+// EXPECT-OUT: 6
+// EXPECT-OUT: 14
+// EXPECT-OUT: 28
+// EXPECT-OUT: -99999
+// EXPECT-OUT: 2
+// EXPECT-OUT: 10
+// EXPECT-OUT: 36
+// EXPECT-OUT: 20
+// EXPECT-OUT: 82
+// EXPECT-OUT: 6
+// EXPECT-OUT: 14
+// EXPECT-OUT: 28
+// EXPECT-OUT: 86
+// EXPECT-OUT: 2
+// EXPECT-OUT: 10
+// EXPECT-OUT: 36
+// EXPECT-OUT: 20
+// EXPECT-OUT: 82
+// EXPECT-OUT: 6
+// EXPECT-OUT: 14
+// EXPECT-OUT: 28
+// EXPECT-OUT: 14
+// EXPECT-OUT: 28
+// EXPECT-OUT: 86
+// EXPECT-OUT: 2
+// EXPECT-OUT: 10
+// EXPECT-OUT: 36
+// EXPECT-OUT: 20
+// EXPECT-OUT: 82
+// EXPECT-OUT: 6
+// EXPECT-OUT: 14
+// EXPECT-OUT: 28
+// EXPECT-OUT: -99999
+// EXPECT-OUT: 2
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: 28
+// EXPECT-OUT: 86
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: 36
+// EXPECT-OUT: 20
+// EXPECT-OUT: 82
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: 28
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: 36
+// EXPECT-OUT: 20
+// EXPECT-OUT: 82
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: 28
+// EXPECT-OUT: 86
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: 36
+// EXPECT-OUT: 20
+// EXPECT-OUT: 82
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: 28
+// EXPECT-OUT: 4
+// EXPECT-OUT: 28
+// EXPECT-OUT: 86
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 36
+// EXPECT-OUT: 20
+// EXPECT-OUT: 82
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 28
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 36
+// EXPECT-OUT: 20
+// EXPECT-OUT: 82
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 28
+// EXPECT-OUT: 86
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 36
+// EXPECT-OUT: 20
+// EXPECT-OUT: 82
+// EXPECT-OUT: 4
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: 22
+// EXPECT-OUT: 10
+// EXPECT-OUT: 2
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: 35
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: 63
+// EXPECT-OUT: 10
+// EXPECT-OUT: 2
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: 66
+// EXPECT-OUT: 6
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: 103
+// EXPECT-OUT: 10
+// EXPECT-OUT: 2
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: 98
+// EXPECT-OUT: -56
+// EXPECT-OUT: 36
+// EXPECT-OUT: 20
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: 44
+// EXPECT-OUT: 28
+// EXPECT-OUT: 12
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: 36
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: 44
+// EXPECT-OUT: 28
+// EXPECT-OUT: 12
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: 36
+// EXPECT-OUT: 20
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: 44
+// EXPECT-OUT: 28
+// EXPECT-OUT: 12
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: 36
+// EXPECT-OUT: -56
+// EXPECT-OUT: 28
+// EXPECT-OUT: 86
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: 36
+// EXPECT-OUT: 20
+// EXPECT-OUT: 82
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: 28
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: 36
+// EXPECT-OUT: 20
+// EXPECT-OUT: 82
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: 28
+// EXPECT-OUT: 86
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: 36
+// EXPECT-OUT: 20
+// EXPECT-OUT: 82
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: 28
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: 48
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: -56
+// EXPECT-OUT: 48
+module tests.run.vec4_else_if_predication
+
+// Nested if-conversion (-O2): `if / else if / else` chains of stores, a chain with no final
+// `else`, a value chosen by a chain, a diamond inside an arm, and one-armed stores over CHECKED
+// `[]T` parameters, whose arm re-reads the slice's data pointer and checks `i < o.len()` before it
+// stores. The general vectorizer flattens each into one straight line: a chain that stores on
+// every path becomes one vector store of nested selects; a path that stores nothing makes each lane
+// store to its own element or to a scratch slot; the bounds check is dropped from the vector loop
+// under a guard that every index of the vector loop's own iterations passes it — a buffer shorter
+// than the trip simply runs the scalar loop.
+//
+// x[j] = ((7j mod 9) / 2) - 1.75 cycles through every arm (period 9: -1.75 1.75 0.75 -0.25 -1.25
+// 2.25 1.25 0.25 -0.75), and x[11] is NaN, for which no ordered compare holds. Every expected line
+// is derived from the scalar loop: o[q] * 8 as an integer, -99999 for a NaN, and the -7 sentinel
+// (-56) wherever no path stored.
+
+@unchecked
+fn chain3(x: []f32, mut o: []f32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        let v: f32 = x[i];
+        if v > 1.0 {
+            o[i] = v * 2.0;
+        } else if v > 0.0 {
+            o[i] = v + 10.0;
+        } else {
+            o[i] = 0.0 - v;
+        }
+        i = i + 1;
+    }
+}
+
+@unchecked
+fn chain2(x: []f32, mut o: []f32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        let v: f32 = x[i];
+        if v > 1.0 {
+            o[i] = v * 2.0;
+        } else if v > 0.0 {
+            o[i] = v + 10.0;
+        }
+        i = i + 1;
+    }
+}
+
+@unchecked
+fn chain_val(x: []f32, mut o: []f32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        let v: f32 = x[i];
+        let r: f32 = if v > 1.0 { v * 2.0 } else if v > 0.0 { v + 10.0 } else { 0.5 };
+        o[i] = r;
+        i = i + 1;
+    }
+}
+
+@unchecked
+fn nested(x: []f32, w: []f32, mut o: []f32, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        let v: f32 = x[i];
+        if v > 0.0 {
+            if v > 1.5 {
+                o[i] = w[i] * v;
+            } else {
+                o[i] = v;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// Checked slices, kept out of line (the pair calls each other, so neither is inlined): the arm
+// re-reads `o`'s data pointer and bounds-checks `i` against `o.len()`.
+fn guarded(x: []f32, mut o: []f32, n: i64, d: i64) {
+    if d > 0 {
+        guarded_again(x, o, n, d - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        let v: f32 = x[i];
+        if v > 0.0 {
+            o[i] = v * 2.0 + 1.0;
+        }
+        i = i + 1;
+    }
+}
+
+fn guarded_again(x: []f32, mut o: []f32, n: i64, d: i64) {
+    guarded(x, o, n, d);
+}
+
+fn chain_checked(x: []f32, mut o: []f32, n: i64, d: i64) {
+    if d > 0 {
+        chain_checked_again(x, o, n, d - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        let v: f32 = x[i];
+        if v > 1.0 {
+            o[i] = v * 2.0;
+        } else if v > 0.0 {
+            o[i] = v + 10.0;
+        }
+        i = i + 1;
+    }
+}
+
+fn chain_checked_again(x: []f32, mut o: []f32, n: i64, d: i64) {
+    chain_checked(x, o, n, d);
+}
+
+fn reset(mut o: []f32) {
+    let mut j: i64 = 0;
+    while j < o.len() {
+        o[j] = -7.0;
+        j = j + 1;
+    }
+}
+
+fn show(o: []f32) {
+    let mut q: i64 = 0;
+    while q < o.len() {
+        let v: f32 = o[q];
+        if v != v {
+            print(-99999);
+        } else {
+            print((v * 8.0) as i32);
+        }
+        q = q + 1;
+    }
+}
+
+fn main() -> i32 {
+    let mut x: []f32 = alloc_f32(29);
+    let mut w: []f32 = alloc_f32(29);
+    let mut o: []f32 = alloc_f32(29);
+    let mut j: i64 = 0;
+    while j < 29 {
+        x[j] = (((j * 7) % 9) as f32) * 0.5 - 1.75;
+        w[j] = (j as f32) * 0.25;
+        j = j + 1;
+    }
+    x[11] = 0.0 / 0.0;
+
+    reset(o);
+    chain3(x, o, 29);
+    show(o);
+    reset(o);
+    chain3(x, o, 13);
+    show(o);
+    reset(o);
+    chain2(x, o, 29);
+    show(o);
+    reset(o);
+    chain_val(x, o, 27);
+    show(o);
+    reset(o);
+    nested(x, w, o, 29);
+    show(o);
+    reset(o);
+    guarded(x, o, 29, 1);
+    show(o);
+    reset(o);
+    chain_checked(x, o, 29, 0);
+    show(o);
+
+    // A destination shorter than the trip: the arm only fires at 3 and 8, both inside it, so the
+    // scalar loop never fails its check — and the vector loop's guard sends it there.
+    let mut z: []f32 = alloc_f32(29);
+    let mut s: []f32 = alloc_f32(9);
+    j = 0;
+    while j < 29 {
+        z[j] = -1.0;
+        j = j + 1;
+    }
+    z[3] = 2.5;
+    z[8] = 2.5;
+    reset(s);
+    guarded(z, s, 29, 0);
+    show(s);
+
+    free(x);
+    free(w);
+    free(o);
+    free(z);
+    free(s);
+    return 0;
+}

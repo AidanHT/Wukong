@@ -3045,6 +3045,23 @@ fn lower_fn(
         }
         // A `@noalias` promise rides on the MIR parameter (`noalias.rs`).
         noalias::record_param(&mut fl.builder, p, pty, val, interner);
+        // So do two facts of the parameter's type, recorded with or without the promise: a `[]T`
+        // points at its caller's live fat pointer (`ParamAttrs::slice`), and a fixed-extent buffer
+        // has its declared size (`ParamAttrs::extent` — the declared type's contract, which a `?`
+        // argument binds unchecked). The vectorizer's speculation reads both; alias analysis reads
+        // `slice` only alongside `@noalias`.
+        let by_pointer = matches!(fl.builder.value_type(val), MirType::Ptr);
+        let slice = by_pointer && matches!(pty, Ty::Slice(_));
+        let extent = buffer_param_extent(pty).filter(|_| by_pointer);
+        if slice || extent.is_some() {
+            if let Some(mut attrs) = fl.builder.param_attrs_of(val) {
+                attrs.slice |= slice;
+                if extent.is_some() {
+                    attrs.extent = extent;
+                }
+                fl.builder.set_param_attrs(val, attrs);
+            }
+        }
         // A statically-shaped contiguous tensor param binds as the buffer it *is* — `[T; d0·…·dn]` —
         // not as an opaque `Ptr`. Both spellings arrive as the same base pointer (`param_abi` maps
         // `Array(..)` back to `Ptr`, so the ABI is byte-identical), but only the `Array` form takes
@@ -25317,6 +25334,40 @@ fn round_up(x: u64, align: u64) -> Option<u64> {
     } else {
         x.div_ceil(align).checked_mul(align)
     }
+}
+
+/// The fixed storage extent a buffer parameter of source type `ty` points at
+/// ([`wukong_mir::ParamExtent`]): a `[T; N]` array over a scalar `T` (nested arrays multiply out),
+/// or a statically-shaped contiguous tensor ([`tensor_buffer_mir`]). `None` for anything else — a
+/// slice, an aggregate element, a symbolic extent — and for an empty buffer, which no access can
+/// be proved inside.
+fn buffer_param_extent(ty: &Ty) -> Option<wukong_mir::ParamExtent> {
+    let (leaf, elems) = match tensor_buffer_mir(ty) {
+        Some((elem, n)) => (elem, u64::from(n)),
+        // At least one array level: a bare scalar parameter is passed by value, not by pointer.
+        None if matches!(ty, Ty::Array { .. }) => {
+            let mut elems: u64 = 1;
+            let mut t = ty;
+            loop {
+                match t {
+                    Ty::Array { elem, len, .. } => {
+                        elems = elems.checked_mul(*len)?;
+                        t = elem;
+                    }
+                    Ty::Scalar(s) => break (MirType::from_scalar(*s), elems),
+                    _ => return None,
+                }
+            }
+        }
+        None => return None,
+    };
+    if elems == 0 || !(leaf.is_int() || leaf.is_float()) {
+        return None;
+    }
+    Some(wukong_mir::ParamExtent {
+        elems,
+        elem_bytes: u32::try_from(checked_mir_byte_size(&leaf)?).ok()?,
+    })
 }
 
 /// Byte size of an already-lowered MIR type (scalars by width, arrays/vectors as count × element).
