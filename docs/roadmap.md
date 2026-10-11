@@ -316,8 +316,19 @@ another architecture or OS is not supported. A native-backend failure is a catal
   threaded `*u8` no longer dangles** — the pointer stays valid after the callee's frame is gone, and
   the interpreter and native backend agree (`tests/run/string_return.wk`). `print`/`println` of a
   `*u8` (a literal or a `let`-bound string) renders the bytes, not the pointer value
-  (`tests/run/string_literal.wk`). No string *type* beyond `*u8` yet — no concatenation/indexing/
-  length (🟡).
+  (`tests/run/string_literal.wk`).
+- **`str`**: an immutable UTF-8 byte string, laid out as a `[]u8` fat pointer `(data, byte
+  length)`. A string literal adapts to `str` wherever a numeric literal adapts to its annotation
+  (and as an `==` operand or a range-index base); `s.len()`, bounds-checked `s[i] -> u8`,
+  `for b in s`, `==`/`!=` (length, then bytes), and printing the text (`{:?}` quotes it) all run.
+  A `str` can be a parameter, a return value, a `const`, a struct field or an array element
+  (`tests/run/str_basics.wk`). Its bytes are never written (`s[i] = b` and `&mut s[i]` are `E0304`)
+  and it converts to and from nothing (`E0401`). Sema erases `str` to `[]u8` when it publishes its
+  types, so lowering, the optimizer and every backend run the existing slice machinery; the new
+  lowerings are the byte-compare loop for `==` and the sub-slice.
+- **Range indexing** `s[a..b]` / `s[a..]` / `s[..b]` / `s[..]` on a `str` or any `[]T`: a view of
+  the half-open range, no copy, checked `a <= b <= len` at run time with the slice index failure
+  (`tests/run/slice_range_index.wk`, `tests/run/str_slice_bounds.wk`).
 - **Pointers & references**: `&x`/`&mut x` take an address, `*p` loads/stores through it, and a
   pointer parameter threads through calls — address-taken locals correctly stay in memory under the
   optimizer (`tests/run/pointer.wk`). `as` casts bind looser than `*`/unary, tighter than binary
@@ -777,8 +788,9 @@ another architecture or OS is not supported. A native-backend failure is a catal
 - **Formatted output**: `printf` / `eprintf` / `sprintf` with a compile-time-checked format string
   (Rust's `format!` spec grammar; `E0449` malformed, `E0450` argument mismatch), `print_raw`,
   `eprint` / `eprintln`, and the raw byte writers `write_stdout` / `write_stderr` / `write_text`
-  (`tests/run/printf_format.wk`). 🟡 The `cc` fallback link has no formatting runtime, and there is
-  still no string *type* beyond `*u8` (a `sprintf` buffer is a `[u8; N]`).
+  (`tests/run/printf_format.wk`). A `str` argument prints its text. 🟡 The `cc` fallback link has no
+  formatting runtime, and a `sprintf` buffer is still a `[u8; N]` (nothing builds a `str` at run
+  time).
 - **Process interface**: `arg_count` / `arg` / `arg_i64` / `arg_f32` (program arguments after
   `wukongc --run prog.wk -- …`, or a linked executable's own `argv`), `env`, `read_stdin_u8` and
   `exit(code)` (which returns through every caller on the JIT, like a failed `assert`).
@@ -1358,6 +1370,15 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   reverse-mode autodiff already ships as the `wukong_autodiff` crate — both above).
 
 ## Known limitations / sharp edges
+
+- **`str` is the first slice of a string type, not all of one.** An unannotated `let s = "x"` is
+  still the NUL-terminated `*u8` (a literal becomes a `str` only where a `str` is expected, and an
+  `if`/`match` whose arms are all literals is typed from its arms, as with numbers). There are no
+  conversions between `str`, `[]u8` and `*u8`, no concatenation or formatting into a `str`, no
+  character (UTF-8) decoding, no ordering (`<` is `E0433`) and no `str` pattern in a `match`. A
+  `str` cannot bind a type parameter (`E0420`: it is erased to `[]u8` before monomorphization), and
+  a `str` inside a printed aggregate is `E0448`. A failing range START is reported in the index
+  wording with the range end as the length (`s[4..2]` says "the len is 2 but the index is 4").
 
 - **A `?` argument binds a fixed-extent parameter unchecked.** `fn find(x: [f32; 37])` called with a
   `Tensor[f32, ?]` (or an array that decayed to one) compiles with no diagnostic and no run-time

@@ -5,6 +5,34 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### `str`: an immutable UTF-8 byte string (`gap5/str-type`, N28)
+
+- **A text type.** `str` is a 16-byte `(data, byte length)` fat pointer — the layout of a `[]u8`
+  slice — over a string literal's read-only bytes. Before it, `let s: str = "x";` was `E0324
+  cannot find type str`, and text was a NUL-terminated `*u8` plus a hand-carried length. A string
+  literal now adapts to `str` wherever a numeric literal adapts to its annotation (`let`, `const`,
+  call and method arguments, both `return` spellings, struct fields, assignments, array and tuple
+  elements), as an `==`/`!=` operand against a `str`, and as a range-index base; unannotated it is
+  still `*u8`. `s.len()` is the byte length; `s[i]` is a bounds-checked `u8`; `for b in s` yields
+  the bytes; `==`/`!=` compare length then bytes; `print`/`println`/`print_raw`/`eprint`/`eprintln`
+  and every `printf` placeholder print the text (`{:?}` quotes it). A `str` is a valid parameter,
+  return value, `const`, struct field and array element (`tests/run/str_basics.wk`).
+- **Immutable by type.** A `str`'s bytes are never a place: `s[i] = b`, `s[i] += b` and `&mut s[i]`
+  are `E0304` (`tests/fail/str_immutable.wk`). It converts to and from nothing — not `[]u8`, not
+  `*u8`, not by `as` (`E0401`) — so a `str` only ever views a literal or a slice of one. `<`,
+  arithmetic and `==` against a non-`str` are `E0433`; a `str` inside a printed aggregate is
+  `E0448`.
+- **Range indexing on any slice.** `s[a..b]`, `s[a..]`, `s[..b]` and `s[..]` work on a `str` (giving
+  a `str`) and on every `[]T` (giving a `[]T`): a view of the half-open range with no copy, checked
+  `a <= b <= len` at run time with the slice index failure message
+  (`tests/run/slice_range_index.wk`, `tests/run/str_slice_bounds.wk`). `..=` and a range mixed
+  with other indices are `E0202`; slicing an array is `E0437`; a non-integer bound is `E0446`.
+- **New code `E0420`**: `str` cannot bind a type parameter (`tests/fail/str_generic_param.wk`). Sema
+  erases every `str` to `[]u8` when it publishes its types, before monomorphization, so lowering,
+  the optimizer and all four backends run the existing slice machinery; `SemaResult::str_print_args`
+  tells printing which arguments are text. A struct, enum, trait, type alias or generic parameter
+  named `str` is `E0300`.
+
 ### Type-lowering soundness (`gap4/sema-soundness`)
 
 - **No silent `i32` slots (N2).** MIR lowering classified any type it did not recognize as `i32`
