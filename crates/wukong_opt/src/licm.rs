@@ -135,6 +135,7 @@ impl Dummies {
             op: Op::Alloca {
                 ty: ty.clone(),
                 space: AddrSpace::Local,
+                align: 0,
             },
         });
         self.by_ty.insert(ty.clone(), v);

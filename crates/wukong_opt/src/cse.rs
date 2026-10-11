@@ -883,6 +883,7 @@ impl Numbering<'_> {
                 Op::Alloca {
                     ty: _,
                     space: wukong_mir::AddrSpace::Local,
+                    ..
                 } => {}
                 Op::Load(ptr, ty) => {
                     let p = self.resolve(*ptr);
@@ -1244,6 +1245,7 @@ mod tests {
                         op: Op::Alloca {
                             ty: MirType::Array(Box::new(MirType::F32), 4),
                             space: wukong_mir::AddrSpace::Local,
+                            align: 0,
                         },
                     },
                     // v1 = load <4 x f32> v0   (the vectorizer's lane load)
@@ -1297,6 +1299,7 @@ mod tests {
                         op: Op::Alloca {
                             ty: MirType::Array(Box::new(MirType::F32), 4),
                             space: wukong_mir::AddrSpace::Local,
+                            align: 0,
                         },
                     },
                     // v1 = load <4 x f32> v0

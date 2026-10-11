@@ -1756,6 +1756,7 @@ fn never_faults(f: &Function, addr: ValueId, bytes: u64) -> bool {
             Some(Op::Alloca {
                 ty,
                 space: wukong_mir::AddrSpace::Local,
+                ..
             }) => match slot_bytes(ty) {
                 Some(n) => n,
                 None => return false,
@@ -4748,6 +4749,7 @@ impl GuardReads {
                     op: Op::Alloca {
                         ty: MirType::Ptr,
                         space: wukong_mir::AddrSpace::Local,
+                        align: 0,
                     },
                 },
             );
@@ -5594,6 +5596,7 @@ fn emit_body(
                 op: Op::Alloca {
                     ty,
                     space: wukong_mir::AddrSpace::Local,
+                    align: 0,
                 },
             },
         );

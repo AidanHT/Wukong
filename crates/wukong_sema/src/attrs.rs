@@ -6,10 +6,11 @@
 //! diagnostic at all, which is exactly the failure mode an attribute is supposed to prevent.
 //!
 //! The set below is closed on purpose. `parallel`, `generic`, `tile`, `extern`, `noalias`,
-//! `unchecked` and `strict_fp` are the ones the language consumes (`@unchecked` removes the slice
-//! bounds checks from one function — the explicit opt-out of the safe default, read by
-//! `wukong_mir_build`); `inline`, `simd`, `align` and `export` are parsed-and-discarded today and
-//! stay in the set so existing programs keep compiling. Anything else is an error, which also means
+//! `unchecked`, `strict_fp` and `align` are the ones the language consumes (`@unchecked` removes the
+//! slice bounds checks from one function — the explicit opt-out of the safe default, read by
+//! `wukong_mir_build`; `@align(N)` raises the alignment of one `let`'s stack slot); `inline`,
+//! `simd` and `export` are parsed-and-discarded today and stay in the set so existing programs keep
+//! compiling. Anything else is an error, which also means
 //! a future attribute cannot be *used* before it is *implemented*.
 //!
 //! Placement is checked here too, but only where a misplaced attribute would be a silent lie.
@@ -23,13 +24,15 @@
 //! `for` statement it sits on, and from nowhere else — so on a `struct`, a parameter, a `let` or a
 //! `while` it used to be accepted and dropped, a schedule written on a loop being the sharpest of
 //! those. `@noalias` is a promise about one parameter's storage (see `crate::noalias`), so it is
-//! legal on a parameter and nowhere else, and takes no arguments. Every other attribute's placement
-//! is unchecked in v1 — the ones that are discarded are discarded wherever they appear.
+//! legal on a parameter and nowhere else, and takes no arguments. `@align(N)` is read from a `let`
+//! statement only ([`align_value`]): anywhere else nothing would honour it. Every other attribute's
+//! placement is unchecked in v1 — the ones that are discarded are discarded wherever they appear.
 //!
 //! Arguments are checked where an attribute consumes them. `@parallel` takes no argument or exactly
 //! `grain = <positive integer>` ([`parallel_grain`]): `wukong_mir_build` hands each worker at least
 //! `grain` consecutive iterations of the function's parallel loop. `@parallel(grain = 0)`,
 //! `@parallel(chunk = 4)` or `@parallel(4)` used to compile with the argument silently discarded.
+//! `@align` takes exactly one power of two in `1..=4096`.
 //!
 //! This walk is independent of name resolution and types (an attribute names no value), so
 //! [`check`] runs before the collection pass and reports every offending attribute in one go.
@@ -81,6 +84,42 @@ pub fn parallel_grain(attr: &Attr, interner: &Interner) -> Result<u64, (Span, &'
     Ok(grain.unwrap_or(1))
 }
 
+/// The largest `@align(N)` accepted: one 4 KiB page (`wukong_mir::MAX_ALLOCA_ALIGN`).
+pub const MAX_ALIGN: u32 = 4096;
+
+/// The alignment an `@align(N)` attribute requests: `Ok(N)` for exactly one positional integer that
+/// is a power of two in `1..=`[`MAX_ALIGN`], and `Err((span, reason))` for anything else — no
+/// argument, several, a key or word, a non-power-of-two (`@align(48)`) or an out-of-range value.
+/// `attr` must be an `@align` attribute. Shared by this module's `E0306` check and by
+/// `wukong_mir_build`, which reads it off the `let` statement it sits on.
+pub fn align_value(attr: &Attr, interner: &Interner) -> Result<u32, (Span, &'static str)> {
+    let [arg] = attr.args() else {
+        return Err((
+            attr.span,
+            "`@align` takes exactly one argument, a power of two in bytes",
+        ));
+    };
+    let AttrArg::Int(text, span) = arg else {
+        let span = match arg {
+            AttrArg::Word(_, s) | AttrArg::Int(_, s) | AttrArg::Str(_, s) => *s,
+            AttrArg::KeyValue { key, .. } => key.span,
+        };
+        return Err((
+            span,
+            "`@align` takes one integer literal: the alignment in bytes",
+        ));
+    };
+    match interner.resolve(*text).replace('_', "").parse::<u64>() {
+        Ok(n) if n == 0 || !n.is_power_of_two() => Err((
+            *span,
+            "the alignment must be a power of two (1, 2, 4, …, 4096)",
+        )),
+        Ok(n) if n > u64::from(MAX_ALIGN) => Err((*span, "the alignment must be at most 4096")),
+        Ok(n) => Ok(n as u32),
+        Err(_) => Err((*span, "the alignment must be an integer literal")),
+    }
+}
+
 /// Every attribute name the v1 language accepts, in the order the diagnostic lists them: the ones
 /// that are (or are being) consumed first, then the four that are parsed and discarded.
 pub const KNOWN_ATTRS: &[&str] = &[
@@ -116,6 +155,11 @@ const FN_ITEM_OR_FOR: &[&str] = &["tile"];
 /// parameter's storage promise; `wukong_mir_build` reads it off the parameter it is written on.
 const PARAM_ONLY: &[&str] = &[crate::noalias::NOALIAS_ATTR];
 
+/// Attributes read from a `let` statement and nowhere else. `@align(N)` is the binding's stack-slot
+/// alignment; `wukong_mir_build` reads it where it allocates the slot. (Whether the binding owns
+/// storage the attribute can align is a type question, checked in `Sema::type_stmt`.)
+const LET_ONLY: &[&str] = &["align"];
+
 /// Is `name` (the bare attribute name, without the `@`) part of the v1 known set? The lint-level
 /// attributes (`@allow`, `@warn`, `@deny`) are known too, wherever they are written; their
 /// arguments are checked by `crate::lints` (an unknown lint name is `W0007`).
@@ -138,6 +182,8 @@ enum Place {
     /// diagnostic can say so: `@tile(2) while …` is a schedule written on a loop, and reads as if
     /// it applied.
     WhileStmt,
+    /// On a `let` statement — where `@align` is read.
+    LetStmt,
     /// On any other statement inside a body (`@generic let x = …`).
     Stmt,
 }
@@ -150,6 +196,7 @@ impl Place {
             Place::Param => "a parameter",
             Place::ForStmt | Place::Stmt => "a statement",
             Place::WhileStmt => "a `while` loop",
+            Place::LetStmt => "a `let`",
         }
     }
 }
@@ -237,6 +284,32 @@ fn check_attr(a: &Attr, place: Place, interner: &Interner, diags: &mut Vec<Diagn
         );
         return;
     }
+    if LET_ONLY.contains(&name) {
+        if place != Place::LetStmt {
+            diags.push(
+                Diagnostic::error(format!(
+                    "attribute `@{name}` is not valid on {}",
+                    place.what()
+                ))
+                .with_code("E0306")
+                .primary(a.span, "nothing reads this attribute here")
+                .help(format!(
+                    "write `@{name}(N)` on the `let` whose array, tuple or struct slot it aligns: \
+                     `@{name}(64) let mut buf: [f32; 16] = [0.0; 16];`"
+                )),
+            );
+        } else if let Err((span, why)) = align_value(a, interner) {
+            diags.push(
+                Diagnostic::error(format!("invalid `@{name}` argument: {why}"))
+                    .with_code("E0306")
+                    .primary(span, "not a valid alignment")
+                    .help(format!(
+                        "write `@{name}(N)` with N a power of two from 1 to {MAX_ALIGN}"
+                    )),
+            );
+        }
+        return;
+    }
     if PARAM_ONLY.contains(&name) {
         if place != Place::Param {
             diags.push(
@@ -290,6 +363,7 @@ fn check_stmt(s: &Stmt, interner: &Interner, diags: &mut Vec<Diagnostic>) {
     let place = match &s.kind {
         StmtKind::For { .. } => Place::ForStmt,
         StmtKind::While { .. } => Place::WhileStmt,
+        StmtKind::Let { .. } => Place::LetStmt,
         _ => Place::Stmt,
     };
     for a in &s.attrs {
@@ -423,7 +497,10 @@ mod tests {
 
     #[test]
     fn every_known_attribute_is_accepted_on_a_fn() {
-        for name in KNOWN_ATTRS.iter().filter(|n| !PARAM_ONLY.contains(*n)) {
+        for name in KNOWN_ATTRS
+            .iter()
+            .filter(|n| !PARAM_ONLY.contains(*n) && !LET_ONLY.contains(*n))
+        {
             let src = format!("@{name}\nfn f() {{ let x: i32 = 1; }}");
             assert_eq!(codes(&src), Vec::<&str>::new(), "@{name} was rejected");
         }
@@ -663,9 +740,52 @@ fn f(mut o: [i32; 4]) { for i in 0..4 { o[i] = i; } }"
     #[test]
     fn discarded_attributes_stay_legal_anywhere() {
         assert_eq!(
-            codes("fn f() { @simd @align(32) for i in 0..4 { let x: i32 = i; } }"),
+            codes("fn f() { @simd @inline for i in 0..4 { let x: i32 = i; } }"),
             Vec::<&str>::new()
         );
+        assert_eq!(
+            codes("@export(\"k\")\nfn f(@simd x: i32) { @inline let y: i32 = x; }"),
+            Vec::<&str>::new()
+        );
+    }
+
+    /// `@align(N)` is read off a `let` only, and takes exactly one power of two up to a page.
+    #[test]
+    fn align_is_a_let_attribute_with_one_power_of_two() {
+        for n in [1, 2, 8, 16, 32, 64, 4096] {
+            let src = format!("fn f() {{ @align({n}) let a: [f32; 4] = [0.0; 4]; }}");
+            assert_eq!(codes(&src), Vec::<&str>::new(), "@align({n})");
+        }
+        for bad in [
+            "@align(48)",
+            "@align(0)",
+            "@align(8192)",
+            "@align",
+            "@align(a)",
+        ] {
+            let src = format!("fn f() {{ {bad} let a: [f32; 4] = [0.0; 4]; }}");
+            assert_eq!(codes(&src), vec!["E0306"], "{bad}");
+        }
+        assert_eq!(
+            codes("fn f() { @align(16, 32) let a: [f32; 4] = [0.0; 4]; }"),
+            vec!["E0306"],
+            "two arguments"
+        );
+        for (src, what) in [
+            ("@align(32)\nfn f() {}", "fn item"),
+            ("fn f(@align(32) x: [f32; 4]) {}", "parameter"),
+            (
+                "fn f() { @align(32) for i in 0..4 { let x: i32 = i; } }",
+                "for",
+            ),
+            (
+                "fn f(mut o: [i32; 4]) { @align(32) o[0] = 1; }",
+                "assignment",
+            ),
+            ("@align(32)\nstruct S { x: i32 }", "struct"),
+        ] {
+            assert_eq!(codes(src), vec!["E0306"], "{what}");
+        }
     }
 
     /// The lint-level attributes are legal on an item, a parameter and a statement — the three

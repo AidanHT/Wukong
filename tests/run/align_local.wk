@@ -1,0 +1,86 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0.5
+// EXPECT-OUT: 2.5
+// EXPECT-OUT: 4.5
+// EXPECT-OUT: 6.5
+// EXPECT-OUT: 8.5
+// EXPECT-OUT: 10.5
+// EXPECT-OUT: 12.5
+// EXPECT-OUT: 14.5
+// EXPECT-OUT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 8
+// EXPECT-OUT: 15
+// EXPECT-OUT: 24
+// EXPECT-OUT: 7
+// EXPECT-OUT: 1.25
+// EXPECT-OUT: 250
+// EXPECT-OUT: -3
+// EXPECT-OUT: 0.75
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 3
+// EXPECT-OUT: 126
+module tests.run.align_local
+
+// `@align(N)` on a `let` raises the alignment of that binding's own stack slot to N bytes (a power
+// of two up to 4096); it never changes a value. Every lane is printed, so the interpreter, the
+// native backend and every -O level must agree on the contents of aligned slots of each owning
+// kind: arrays (written through a `mut` parameter and in place), a struct, a tuple, a page-aligned
+// byte array, and an aligned slot in every frame of a recursion. Expected values, by hand:
+//   v[i] = i*2 + 0.5;  w[i] = (i+1)^2 - 1;  big = [1, 1+3, 3];
+//   depth_sum(d) = 6d + depth_sum(d-1), depth_sum(0) = 0, so depth_sum(6) = 6 * 21 = 126.
+// `--emit=mir` shows the slots as `alloca [8 x f32] align 64`, `alloca [5 x i64] align 32`, ...
+struct Pair {
+    a: i32,
+    b: f64,
+}
+
+fn fill(mut v: [f32; 8], k: f32) {
+    for i in 0..8 {
+        v[i] = (i as f32) * k + 0.5;
+    }
+}
+
+fn depth_sum(d: i32) -> i32 {
+    @align(64) let buf: [i32; 3] = [d, d * 2, d * 3];
+    if d == 0 {
+        return buf[0] + buf[1] + buf[2];
+    }
+    return buf[0] + buf[1] + buf[2] + depth_sum(d - 1);
+}
+
+fn main() -> i32 {
+    @align(64) let mut v: [f32; 8] = [0.0; 8];
+    fill(v, 2.0);
+    for i in 0..8 {
+        print(v[i]);
+    }
+
+    @align(32) let mut w: [i64; 5] = [1, 2, 3, 4, 5];
+    for i in 0..5 {
+        w[i] = w[i] * w[i] - 1;
+    }
+    for i in 0..5 {
+        print(w[i]);
+    }
+
+    @align(128) let p = Pair { a: 7, b: 1.25 };
+    print(p.a);
+    print(p.b);
+
+    @align(16) let t: (u8, i16, f32) = (250, -3, 0.75);
+    print(t.0);
+    print(t.1);
+    print(t.2);
+
+    @align(4096) let mut big: [u8; 3] = [1, 2, 3];
+    big[1] = big[0] + big[2];
+    for i in 0..3 {
+        print(big[i]);
+    }
+
+    print(depth_sum(6));
+    return 0;
+}

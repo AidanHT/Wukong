@@ -77,7 +77,8 @@ not duplicate them. In summary, Wukong:
   an unsupported loop form, a width that is not a positive integer literal — is `E0309` rather than a
   silent drop, while `@parallel(grain = G)` sets the per-worker iteration run (any other `@parallel`
   argument is `E0306`; without it the CPU backends size a grain from a straight-line loop body, so a
-  short loop runs as one chunk with no fork), while `@simd`/`@align`/`@extern`/`@export` parse and are inert — layout is
+  short loop runs as one chunk with no fork), `@align(N)` on a `let` aligns that local's stack slot,
+  while `@simd`/`@extern`/`@export` parse and are inert — layout is
   enforced across call boundaries; the default row-major (contiguous) layout and `.col_major` both
   lower multi-dimensional indexing (`.col_major` is byte-identical to `a[i + j*M]`); `.strided` /
   `.tiled(…)` still reject indexing (`C0001`). Runtime-sized memory is `alloc_<T>`/`free` (64-byte

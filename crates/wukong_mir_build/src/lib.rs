@@ -10259,12 +10259,20 @@ impl FnLowerer<'_> {
                 let is_shared = ty
                     .as_ref()
                     .is_some_and(|t| matches!(t.kind, ast::TypeKind::Array { shared: true, .. }));
-                let slot = if is_shared {
-                    self.builder
-                        .alloca_in(mty.clone(), wukong_mir::AddrSpace::Shared)
+                // `@align(N)` raises the slot's alignment. Sema checked the argument and that the
+                // binding owns this slot (an array, tuple or struct); `0` is natural alignment.
+                let align = s
+                    .attrs
+                    .iter()
+                    .find(|a| self.interner.resolve(a.name.sym) == "align")
+                    .and_then(|a| wukong_sema::align_value(a, self.interner).ok())
+                    .unwrap_or(0);
+                let space = if is_shared {
+                    wukong_mir::AddrSpace::Shared
                 } else {
-                    self.builder.alloca(mty.clone())
+                    wukong_mir::AddrSpace::Local
                 };
+                let slot = self.builder.alloca_aligned(mty.clone(), space, align);
                 if let Some(e) = init {
                     // A slice binding coerces its initializer to the fat-pointer buffer (an array
                     // source becomes `{ base, len }`; a slice source is copied) — checked first so a
@@ -34636,6 +34644,7 @@ fn eqc(x: [f32; 64], mut out: [f32; 64]) {
                     Op::Alloca {
                         ty: MirType::Array(_, 3),
                         space: wukong_mir::AddrSpace::Local,
+                        ..
                     }
                 )
             }),
@@ -34682,7 +34691,8 @@ fn eqc(x: [f32; 64], mut out: [f32; 64]) {
                 &i.op,
                 Op::Alloca {
                     ty: MirType::Ptr,
-                    space: wukong_mir::AddrSpace::Local
+                    space: wukong_mir::AddrSpace::Local,
+                    ..
                 }
             )),
             "a statically-shaped tensor param must bind directly, not through a reloaded ptr slot"
@@ -34713,6 +34723,7 @@ fn eqc(x: [f32; 64], mut out: [f32; 64]) {
                     Op::Alloca {
                         ty: MirType::Array(..),
                         space: wukong_mir::AddrSpace::Local,
+                        ..
                     }
                 )
             }),

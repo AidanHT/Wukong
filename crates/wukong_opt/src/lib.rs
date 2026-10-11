@@ -1074,7 +1074,8 @@ mod tests {
                     i.op,
                     Op::Alloca {
                         ty: _,
-                        space: wukong_mir::AddrSpace::Local
+                        space: wukong_mir::AddrSpace::Local,
+                        ..
                     }
                 )
             })
@@ -1605,6 +1606,7 @@ mod tests {
                 Op::Alloca {
                     ty: MirType::Ptr,
                     space: wukong_mir::AddrSpace::Local,
+                    ..
                 } => slots += 1,
                 Op::Load(_, MirType::Ptr) => reloads += 1,
                 _ => {}

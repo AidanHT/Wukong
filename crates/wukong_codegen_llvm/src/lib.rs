@@ -1230,9 +1230,11 @@ impl Emitter<'_> {
                 )
             }
             // The native backend's slot alignment (see `alloca_align`): it is what makes a
-            // byte-buffer aggregate's naturally aligned fields actually aligned.
-            Op::Alloca { ty, .. } => {
-                format!("{res}alloca {}, align {}", mem_ty(ty), alloca_align(ty))
+            // byte-buffer aggregate's naturally aligned fields actually aligned. An `@align(N)`
+            // local only ever raises it.
+            Op::Alloca { ty, align, .. } => {
+                let align = alloca_align(ty).max(u64::from(*align));
+                format!("{res}alloca {}, align {align}", mem_ty(ty))
             }
             Op::Cmp(op, l, r) => {
                 let opty = self.ty(*l);

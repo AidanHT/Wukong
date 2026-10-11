@@ -190,6 +190,7 @@ fn plan(f: &Function) -> (Vec<Split>, FxHashMap<u32, Derived>) {
                 Op::Alloca {
                     ty: ty @ MirType::Array(..),
                     space: AddrSpace::Local,
+                    ..
                 },
             ) = (inst.result, &inst.op)
             {
@@ -520,6 +521,7 @@ fn apply(f: &mut Function, splits: &[Split], derived: &FxHashMap<u32, Derived>) 
                 op: Op::Alloca {
                     ty: ty.clone(),
                     space: AddrSpace::Local,
+                    align: 0,
                 },
             });
         }

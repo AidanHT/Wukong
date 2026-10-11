@@ -1,0 +1,11 @@
+// EXPECT-CODE: E0306
+// EXPECT-COUNT: 1
+module tests.fail.align_bad_arg
+
+// `@align(N)` takes one power of two from 1 to 4096. A stack slot can only be aligned to a power of
+// two, so `@align(48)` used to be parsed and silently discarded; now that the attribute is honoured
+// it is rejected rather than rounded to some alignment the program never asked for.
+fn main() -> i32 {
+    @align(48) let buf: [f32; 12] = [0.0; 12]; //~ E0306
+    return buf[0] as i32;
+}

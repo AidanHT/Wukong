@@ -21,7 +21,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::{BinOp, CastKind, Function, MirType, Op, Program, Terminator, ValueId};
+use crate::{
+    BinOp, CastKind, Function, MirType, Op, Program, Terminator, ValueId, MAX_ALLOCA_ALIGN,
+};
 use wukong_span::Symbol;
 
 /// Declared signatures (parameter types, return type) of the functions defined in a program, so a
@@ -558,7 +560,15 @@ impl<'a> Verifier<'a> {
                     self.expect_ty(*c, &MirType::I1, "select condition");
                 }
             }
-            Op::Alloca { .. } => self.check_result_is(result, &MirType::Ptr),
+            Op::Alloca { align, .. } => {
+                // `0` is natural alignment; anything else is a power of two up to a page.
+                if *align != 0 && (!align.is_power_of_two() || *align > MAX_ALLOCA_ALIGN) {
+                    self.err(format!(
+                        "alloca alignment {align} is not 0 or a power of two in 1..={MAX_ALLOCA_ALIGN}"
+                    ));
+                }
+                self.check_result_is(result, &MirType::Ptr)
+            }
             Op::Barrier => {
                 if result.is_some() {
                     self.err("barrier must not produce a value");
@@ -1236,6 +1246,31 @@ mod tests {
             atomic_add_errors(MirType::I64, MirType::I64, false),
             "atomic.add pointer",
         );
+    }
+
+    /// An `alloca`'s explicit alignment is `0` (natural) or a power of two up to a page.
+    #[test]
+    fn alloca_alignment_is_zero_or_a_power_of_two_up_to_a_page() {
+        let errors = |align: u32| {
+            let mut i = Interner::new();
+            let mut b = Builder::new(i.intern("slot"), MirType::Void);
+            b.alloca_aligned(
+                MirType::Array(Box::new(MirType::F32), 4),
+                crate::AddrSpace::Local,
+                align,
+            );
+            b.ret(None);
+            verify_function(&b.finish())
+        };
+        for ok in [0, 1, 2, 16, 64, 4096] {
+            assert!(errors(ok).is_empty(), "align {ok}: {:?}", errors(ok));
+        }
+        for bad in [3, 48, 8192, u32::MAX] {
+            assert!(
+                errors(bad).iter().any(|e| e.contains("alloca alignment")),
+                "align {bad} was accepted"
+            );
+        }
     }
 
     #[test]

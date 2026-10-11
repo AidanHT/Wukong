@@ -401,7 +401,14 @@ defining frame is gone. `Op::VecKernelCall` — a call into a synthesized 256-bi
 covered under the vectorizer below.
 
 The front-end lowers in **clang style**: one `alloca` per local, with `load`/`store` on every use.
-`Op::Alloca` carries an `AddrSpace` (`Local` or `Shared`); `shared [T; N]` lowers to
+`Op::Alloca` carries an `align` (bytes; `0` = natural, which every compiler-made slot uses and
+which prints nothing, so dumps are unchanged; otherwise a power of two up to
+`MAX_ALLOCA_ALIGN = 4096`, checked by the verifier, from `@align(N)` on a `let` of an owned
+aggregate). It only ever raises the alignment: Cranelift reserves `bytes + want - 16` and rounds
+the base up at run time when the wanted alignment exceeds the stack pointer's 16 (the same scheme
+32-byte slots always used), the LLVM text emits `align max(natural, N)`, the interpreter ignores it
+and `gpu-native` declines anything above 8. `Op::Alloca` also carries an `AddrSpace` (`Local` or
+`Shared`); `shared [T; N]` lowers to
 `AddrSpace::Shared`. `sync_block()` lowers to `Op::Barrier`. On CPU backends shared is an ordinary
 stack slot and `Barrier` is a no-op (interpreter) or compiler fence (Cranelift). On gpu-native,
 `lower.rs` maps shared allocas to PTX `.shared __user_smem[]` and `Barrier` to `bar.sync 0` — no

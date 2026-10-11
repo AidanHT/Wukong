@@ -1172,6 +1172,7 @@ mod tests {
             Op::Alloca {
                 ty: blob(16),
                 space: AddrSpace::Local,
+                align: 0,
             },
         );
         b.br(use_blk, vec![]);

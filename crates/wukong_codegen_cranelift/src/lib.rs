@@ -784,8 +784,9 @@ fn float_cc(op: CmpOp) -> FloatCC {
 /// cap stays 16 bytes (the stack pointer's own alignment, so it costs nothing).
 const WIDE_SLOT_BYTES: u32 = 32;
 
-/// The run-time slack a wide slot is over-allocated by (see [`wide_slot_bytes`]).
-const WIDE_SLOT_SLACK: u32 = WIDE_SLOT_BYTES - 16;
+/// The alignment the x64 ABI keeps the stack pointer at, and so the most a slot's frame offset
+/// alone can guarantee (see [`over_aligned_slot_bytes`]).
+const FRAME_ALIGN: u32 = 16;
 
 fn align_shift(bytes: u32) -> u8 {
     // Align stack slots to their (rounded-up power-of-two) size, capped at 16 bytes — or at 32 for
@@ -806,18 +807,19 @@ fn align_shift(bytes: u32) -> u8 {
     shift
 }
 
-/// The bytes a wide (`>= WIDE_SLOT_BYTES`) stack slot actually reserves.
+/// The bytes a stack slot of `bytes` bytes reserves when its base must be `want`-aligned with
+/// `want > FRAME_ALIGN`: a wide slot (`>= WIDE_SLOT_BYTES`, `want = 32`) or an `@align(N)` local.
 ///
 /// Cranelift 0.124 lays slots out at their requested alignment *relative to the stack pointer*,
 /// which the x64 ABI aligns to 16 bytes only, and it never realigns a frame (`machinst/abi.rs`
 /// rounds slot offsets; the prologue never `and`s `rsp`). So a 32-byte request alone gives a
 /// 32-byte-aligned address only when the caller's stack happened to be — every other call depth
-/// it is 16 mod 32. The slot therefore reserves 16 bytes of slack, and the lowering rounds its
-/// address up to the next 32-byte boundary at run time (`(base + 16) & !31`, which stays inside the
-/// slot because the base is always 16-aligned). Saturating: an absurd size fails Cranelift's own
-/// frame limit instead of wrapping.
-fn wide_slot_bytes(bytes: u32) -> u32 {
-    bytes.saturating_add(WIDE_SLOT_SLACK)
+/// it is 16 mod 32. The slot therefore reserves `want - 16` bytes of slack, and the lowering rounds
+/// its address up to the next `want` boundary at run time (`(base + want - 16) & -want`, which
+/// stays inside the slot because the base is always 16-aligned). Saturating: an absurd size fails
+/// Cranelift's own frame limit instead of wrapping.
+fn over_aligned_slot_bytes(bytes: u32, want: u32) -> u32 {
+    bytes.saturating_add(want - FRAME_ALIGN)
 }
 
 // --- Per-function lowering ------------------------------------------------------------------
@@ -1128,28 +1130,28 @@ impl<'a> FnTranslator<'a> {
                     self.builder.ins().select(cc, av, bv)
                 }
             }
-            Op::Alloca { ty, .. } => {
+            Op::Alloca { ty, align, .. } => {
                 let bytes = self.size_of_or_err(ty).max(1);
-                if bytes >= WIDE_SLOT_BYTES {
-                    // A 32-byte-aligned base needs a run-time round-up: see `wide_slot_bytes`.
+                let natural = align_shift(bytes);
+                // `align` (from `@align(N)`) only ever raises the slot's alignment; `0` is natural.
+                let want = (1u32 << natural).max(*align);
+                if want > FRAME_ALIGN {
+                    // Past the stack pointer's own alignment the base needs a run-time round-up:
+                    // see `over_aligned_slot_bytes`.
+                    let slack = want - FRAME_ALIGN;
                     let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot,
-                        wide_slot_bytes(bytes),
-                        align_shift(bytes),
+                        over_aligned_slot_bytes(bytes, want),
+                        natural.max(FRAME_ALIGN.trailing_zeros() as u8),
                     ));
                     let base = self.builder.ins().stack_addr(self.ptr_ty, slot, 0);
-                    let bumped = self
-                        .builder
-                        .ins()
-                        .iadd_imm(base, i64::from(WIDE_SLOT_SLACK));
-                    self.builder
-                        .ins()
-                        .band_imm(bumped, -i64::from(WIDE_SLOT_BYTES))
+                    let bumped = self.builder.ins().iadd_imm(base, i64::from(slack));
+                    self.builder.ins().band_imm(bumped, -i64::from(want))
                 } else {
                     let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot,
                         bytes,
-                        align_shift(bytes),
+                        want.trailing_zeros() as u8,
                     ));
                     self.builder.ins().stack_addr(self.ptr_ty, slot, 0)
                 }
@@ -6558,8 +6560,9 @@ mod stack_slot_alignment_tests {
         assert_eq!(align_shift(24), 4, "below 32 bytes the cap stays 16");
         assert_eq!(align_shift(32), 5);
         assert_eq!(align_shift(128), 5, "the cap is 32 bytes");
-        assert_eq!(wide_slot_bytes(32), 48);
-        assert_eq!(wide_slot_bytes(u32::MAX), u32::MAX);
+        assert_eq!(over_aligned_slot_bytes(32, WIDE_SLOT_BYTES), 48);
+        assert_eq!(over_aligned_slot_bytes(24, 64), 72);
+        assert_eq!(over_aligned_slot_bytes(u32::MAX, WIDE_SLOT_BYTES), u32::MAX);
         assert!(!mem_flags().aligned());
     }
 }

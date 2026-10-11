@@ -150,6 +150,10 @@ impl CastKind {
     }
 }
 
+/// The largest explicit [`Op::Alloca`] alignment, in bytes: one 4 KiB page. `@align(N)` accepts
+/// exactly the powers of two up to it.
+pub const MAX_ALLOCA_ALIGN: u32 = 4096;
+
 /// Where an [`Op::Alloca`] slot lives. CPU backends treat [`AddrSpace::Shared`] as ordinary local
 /// storage; the GPU backend maps it to PTX `.shared`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -179,10 +183,15 @@ pub enum Op {
     Not(ValueId),
     Cast(CastKind, ValueId, MirType),
     Select(ValueId, ValueId, ValueId),
-    /// A stack slot; result is a pointer.
+    /// A stack slot; result is a pointer. `align` is the minimum alignment in bytes the slot's
+    /// address must have: `0` means the type's natural alignment (every compiler-made slot), and
+    /// otherwise it is a power of two in `1..=4096` (the verifier checks it) that can only ever
+    /// raise the alignment, never lower it. It comes from `@align(N)` on a `let` of an owned
+    /// aggregate.
     Alloca {
         ty: MirType,
         space: AddrSpace,
+        align: u32,
     },
     /// A cooperative thread-block barrier (`sync_block()` in source). No result; a no-op on CPU.
     Barrier,

@@ -275,6 +275,7 @@ impl<'a> Vjp<'a> {
                 if let Op::Alloca {
                     ty: MirType::Array(elem, count),
                     space: wukong_mir::AddrSpace::Local,
+                    ..
                 } = &inst.op
                 {
                     if **elem == MirType::F32 {

@@ -27,7 +27,7 @@
 pub mod lints;
 
 mod attrs;
-pub use attrs::{parallel_grain, MAX_PARALLEL_GRAIN};
+pub use attrs::{align_value, parallel_grain, MAX_ALIGN, MAX_PARALLEL_GRAIN};
 mod builtins;
 mod constraints;
 mod dependency;
@@ -2746,6 +2746,48 @@ impl<'a> Sema<'a> {
         }
     }
 
+    /// `@align(N)` on a `let` (its argument and placement are `attrs.rs`'s) aligns the binding's
+    /// own stack slot, so the binding must be one name whose type owns its storage: an array, a
+    /// tuple or a struct. A scalar lives in a register, a pointer, reference or `[]T` slice names
+    /// someone else's storage, and a tensor local is a view of a buffer it does not own; on any of
+    /// them the attribute would be a promise nothing keeps, so it is `E0306`. (Heap and scratch
+    /// memory is already 64-byte aligned.)
+    fn check_let_align(&mut self, s: &Stmt, pat: &Pattern, bound: &Ty) {
+        let Some(attr) = s.attrs.iter().find(|a| self.sym_str(a.name.sym) == "align") else {
+            return;
+        };
+        let owns_storage = match bound {
+            Ty::Array { .. } | Ty::Tuple(_) => true,
+            Ty::Named(n) => matches!(
+                self.defs.lookup(*n).map(|d| &d.kind),
+                Some(DefKind::Struct(_))
+            ),
+            Ty::Unknown | Ty::Error => return,
+            _ => false,
+        };
+        let single_name = matches!(pat.kind, PatKind::Ident(_));
+        if owns_storage && single_name {
+            return;
+        }
+        let what = if !single_name {
+            "a destructuring pattern, which binds several names and no slot of its own".to_string()
+        } else {
+            format!("a binding of type `{}`", bound.display(self.interner))
+        };
+        self.diags.push(
+            Diagnostic::error(format!(
+                "`@align` aligns a `let`'s own stack slot, but this is {what}"
+            ))
+            .with_code("E0306")
+            .primary(attr.span, "nothing here has a slot to align")
+            .help(
+                "put `@align(N)` on a `let` of an array, tuple or struct; a scalar lives in a \
+                 register, a slice, pointer or tensor local names storage it does not own, and \
+                 heap and scratch buffers are already 64-byte aligned",
+            ),
+        );
+    }
+
     /// E0304 for a write through a projection (`p.f`, `t.0`, `p[i]`, `t[i, j]`) of a non-`mut`
     /// aggregate parameter, and the write-through-a-tensor-view diagnostic: the projection half of
     /// `=`'s mutability rule, shared by every statement that writes a place (`x = v`, `x op= v` and
@@ -2913,6 +2955,7 @@ impl<'a> Sema<'a> {
                     (None, None) => Ty::Unknown,
                 };
                 let bound = self.checked_let_type(bound, s.span);
+                self.check_let_align(s, pat, &bound);
                 // What the binding views is read BEFORE the name is bound, so a shadowing view
                 // (`let a = a[0];`) still resolves its initializer to the parameter it reads.
                 self.note_tensor_view(pat, &bound, init.as_ref());
@@ -5450,6 +5493,31 @@ mod tests {
             msgs.iter().any(|m| needles.iter().all(|n| m.contains(n))),
             "no {code} message contains {needles:?}; got {msgs:?} for {src:?}"
         );
+    }
+
+    /// `@align(N)` aligns a `let`'s own stack slot, so the binding must be one name of a type that
+    /// owns its storage. (Argument and placement errors are `attrs.rs`'s; they are E0306 too.)
+    #[test]
+    fn align_needs_a_let_that_owns_its_storage() {
+        for ok in [
+            "fn f() { @align(64) let a: [f32; 4] = [0.0; 4]; }",
+            "fn f() { @align(4096) let a: [[u8; 2]; 2] = [[0; 2]; 2]; }",
+            "fn f() { @align(16) let t: (i32, f64) = (1, 2.0); }",
+            "struct S { x: i32 } fn f() { @align(32) let s = S { x: 1 }; }",
+        ] {
+            let errs = errors(ok);
+            assert!(errs.is_empty(), "{errs:?} for {ok:?}");
+        }
+        for bad in [
+            "fn f() { @align(32) let x: i32 = 1; }",
+            "fn f(p: *mut f32) { @align(32) let q: *mut f32 = p; }",
+            "fn f(s: []f32) { @align(32) let t: []f32 = s; }",
+            "fn f(x: Tensor[f32, 4]) { @align(32) let v = x; }",
+            "fn f() { @align(32) let (a, b) = (1, 2); }",
+            "enum E { A, B } fn f() { @align(32) let e = E::A; }",
+        ] {
+            assert_eq!(errors(bad), ["E0306"], "{bad}");
+        }
     }
 
     /// `atomic_add(place, v)`: a place other than a bare name, of an integer type, plus a value of

@@ -37,6 +37,20 @@ All notable changes to Wukong are documented here. The format is loosely based o
   mid-function region and every place form at its wrap point; `tests/fail/atomic_add_float.wk`,
   `tests/fail/atomic_add_not_place.wk`). Integer-only and without fetch-add by design;
   `gpu-native` skips it as `UNSUPPORTED`.
+- **`@align(N)` on a `let` is honoured (P15.21's residual).** It used to be parsed and silently
+  discarded everywhere. Now it aligns that binding's stack slot to `N` bytes, a power of two up to
+  4096, via a new `align` field on `Op::Alloca`. `0` means natural alignment, every compiler-made
+  slot uses it, and it prints nothing, so existing MIR dumps are byte-identical. Cranelift
+  generalizes the 32-byte wide-slot scheme: it reserves `bytes + N - 16` and rounds the base up at
+  run time, and it emits the same CLIF as before for every slot without the attribute. A JIT probe
+  (`wukong_codegen_cranelift/tests/alloca_align.rs`) checks `align 64` and `align 32` bases in
+  every frame of a recursion at several stack parities. The LLVM text emits
+  `align max(natural, N)`, the interpreter ignores the field, and `gpu-native` declines `N > 8`. The
+  attribute is legal only on a `let` of one name of an array, tuple or struct. On a `fn`, a
+  parameter, a loop, another statement, a scalar, slice, pointer or tensor binding, or with an
+  argument that is not a power of two up to 4096, it is `E0306` (`tests/fail/align_bad_arg.wk`,
+  `tests/fail/align_misplaced.wk`). Every lane of `tests/run/align_local.wk` matches across
+  backends and `-O` levels.
 
 ### Type-lowering soundness (`gap4/sema-soundness`)
 

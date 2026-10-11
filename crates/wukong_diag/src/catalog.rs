@@ -242,12 +242,17 @@ static CATALOG: &[Explanation] = &[
          `@noalias` describes one parameter's storage, so it is legal only on a parameter, takes no \
          arguments, and only on a parameter passed by pointer (an array, slice, tensor, pointer, \
          reference, tuple or struct) — on a scalar there is no storage to promise anything about. \
-         Arguments: `@parallel` takes nothing or exactly `grain = G` with `1 <= G <= 2^31` (each \
-         worker then claims runs of at least G iterations); an unknown key, a positional argument \
-         or an out-of-range grain is rejected instead of discarded. The lint-level attributes \
-         `@allow`, `@warn` and `@deny` are known too and legal anywhere; their arguments are lint \
-         names, and an unknown one is the warning `W0007`, not this error. The parsed-but-discarded \
-         attributes (`@inline`, `@simd`, `@align`, `@export`) stay legal wherever they parse."
+         `@align(N)` aligns one `let`'s stack slot, so it is legal only on a `let` that binds one \
+         name of an array, tuple or struct type (a scalar has no slot; a slice, pointer or tensor \
+         local names storage it does not own) and rejected on a `fn`, a parameter, a loop or any \
+         other statement. Arguments: `@parallel` takes nothing or exactly `grain = G` with \
+         `1 <= G <= 2^31` (each worker then claims runs of at least G iterations); an unknown key, \
+         a positional argument or an out-of-range grain is rejected instead of discarded. `@align` \
+         takes exactly one power of two from 1 to 4096 (`@align(48)` is rejected). The lint-level \
+         attributes `@allow`, `@warn` and `@deny` are known too and legal anywhere; their arguments \
+         are lint names, and an unknown one is the warning `W0007`, not this error. The \
+         parsed-but-discarded attributes (`@inline`, `@simd`, `@export`) stay legal wherever they \
+         parse."
     ),
     entry!(
         "E0307",

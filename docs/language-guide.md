@@ -938,7 +938,6 @@ runtime size is outside the defined contract, like any runtime index
 @simd
 @tile(64, 64)
 @parallel(grain = 1)
-@align(32)
 @extern("C")
 @export("wukong_saxpy")
 fn k(@noalias mut out: []f32, x: []f32) { … }
@@ -955,7 +954,8 @@ the kernel recognizers (below), **`@strict_fp`** (✅), which evaluates the func
 arithmetic in source order (below), **`@tile`** (✅), which strip-mines loops (below), and
 **`@unchecked`** (✅), which removes the function's slice bounds checks (see *Memory and
 parallelism*; on anything but a `fn` item it is `E0306`). One has a consumer on a **parameter**:
-**`@noalias`** (✅), a promise about the storage the parameter points into (below).
+**`@noalias`** (✅), a promise about the storage the parameter points into (below). One has a
+consumer on a **`let`**: **`@align(N)`** (✅), which aligns that binding's stack slot (below).
 `@parallel(grain = G)` (✅) is consumed too: each worker claims runs of at least `G` consecutive
 iterations of the function's parallel loop (whole-function or mid-function region), the knob an
 OpenMP `schedule(dynamic, G)` or a TBB grain size gives — useful when one iteration is too cheap to be
@@ -968,7 +968,7 @@ body is straight-line code gets `G = ceil(2^14 / body size in MIR instructions)`
 single chunk that runs without a fork and a long one is claimed in chunks of at least that much work;
 a body with an inner loop or a call keeps one iteration per claim, and `--backend=gpu-native` always
 does (one GPU thread per iteration). Write `grain = 1` to opt a loop back into per-iteration claims.
-Everything else in the list above — `@inline`, `@simd`, `@align`, `@extern` and `@export` — is
+Everything else in the list above — `@inline`, `@simd`, `@extern` and `@export` — is
 parsed and discarded (🔵). `@tile` is consumed as loop
 strip-mining (see below), and when it cannot be applied it is **`E0309`**, not a silent drop. A
 *discarded* attribute on a statement or loop is dropped there too:
@@ -1249,6 +1249,36 @@ attribute-placement code `@generic` off a `fn` item carries, and for the same re
 `while` is the one worth calling out: a `while` has no induction variable and no range, so there is
 nothing to strip-mine, and the attribute used to sit there reading exactly as if it applied
 (`tests/fail/tile_on_while.wk`).
+
+### `@align(N)` — an aligned stack local ✅
+
+```wukong
+@align(64) let mut tile: [f32; 64] = [0.0; 64];   // base address is a multiple of 64
+```
+
+`@align(N)` on a `let` makes that binding's stack slot start at a multiple of `N` bytes, for a
+local scratch array that 256-bit or non-temporal accesses should not split across cache lines.
+`N` is one power of two from 1 to 4096; it only ever raises the alignment the slot would have had
+(a slot of 32 bytes or more is already 32-aligned, a smaller one aligned to its size up to 16) and
+never changes a value. Every lane of an aligned local reads and writes exactly as it would without
+the attribute, on every backend and at every `-O` level (`tests/run/align_local.wk`), and the
+native base address is a multiple of `N` in every frame, however deep the recursion
+(`wukong_codegen_cranelift/tests/alloca_align.rs`). `--emit=mir` prints the slot as
+`alloca [64 x f32] align 64`.
+
+Where it is legal (all other cases are **`E0306`**):
+
+- on a `let` only — on a `fn`, a parameter, a loop or any other statement nothing would honour it
+  (`tests/fail/align_misplaced.wk`);
+- with exactly one power-of-two argument up to 4096 — `@align(48)`, `@align(0)` and a bare `@align`
+  are rejected (`tests/fail/align_bad_arg.wk`);
+- on a binding of one name whose type **owns** its storage: an array, a tuple or a struct. A scalar
+  lives in a register, a `[]T` slice, pointer or reference names storage it does not own, and a
+  tensor local is a view of someone else's buffer. Heap and scratch buffers (`alloc_<T>`,
+  `scratch_<T>`) are already 64-byte aligned.
+
+The textual-LLVM path emits `alloca …, align N`; `--backend=gpu-native` lays frame slots out at 8
+bytes and declines an `@align` above 8 as `UNSUPPORTED` rather than break the promise.
 
 ### `@noalias` — a parameter's storage promise ✅
 

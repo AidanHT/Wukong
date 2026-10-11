@@ -364,6 +364,7 @@ fn rewrite(f: &mut Function, plan: &Plan, slots: &mut Vec<Inst>, dummies: &mut D
             op: Op::Alloca {
                 ty: loc.ty.clone(),
                 space: AddrSpace::Local,
+                align: 0,
             },
         });
         let guarded_addr = if loc.guard_load || loc.guard_store {
