@@ -416,6 +416,57 @@ fn report_relaxed_ratio(
     }
 }
 
+/// An optional oneMKL entry point a section needs: its name, and whether the loaded library
+/// resolved it.
+type MklSymbol<'a> = (&'a str, fn(&MklApi) -> bool);
+
+/// Why a section's oneMKL columns cannot run on this host, or `None` when they can.
+///
+/// `symbol` names an entry point beyond the `cblas_sgemm_64` that [`mkl`] requires to load at all,
+/// with a predicate saying whether the loaded library resolved it (`cblas_sgemv_64` and
+/// `MKL_Somatcopy` are optional, like the VML ops). A missing library peer prints this reason
+/// instead of a bare `n/a`, so a log without a library column says WHY it has none (P6.2).
+fn mkl_absent_reason(symbol: Option<MklSymbol>) -> Option<String> {
+    match mkl() {
+        None => Some(
+            "oneMKL not found (Windows only; set WUKONG_MKL_DLL=<path to mkl_rt.dll>)".to_string(),
+        ),
+        Some(api) => match symbol {
+            Some((name, resolved)) if !resolved(api) => {
+                Some(format!("{} does not export `{name}`", api.path.display()))
+            }
+            _ => None,
+        },
+    }
+}
+
+/// The oneMKL standings of a section whose `MKL(1c)` / `MKL(all)` columns were already held to a
+/// numerics bar by the caller (a dropped column arrives as `None` and prints nothing), or the
+/// reason the columns are absent. Single-core Wukong is read against `MKL(1c)` and `@parallel`
+/// against `MKL(all)` - never across threading. `routine` names the MKL entry point timed.
+fn report_library_columns(
+    routine: &str,
+    absent: Option<String>,
+    wuk: &Option<Measure>,
+    wk_par: &Option<Measure>,
+    mkl_1c: &Option<Measure>,
+    mkl_all: &Option<Measure>,
+) {
+    if let Some(why) = absent {
+        println!(
+            "  . MKL(1c)/MKL(all) columns n/a: {why} - no library-grade standing in this section"
+        );
+        return;
+    }
+    report_relaxed_ratio(&format!("oneMKL(1 thread) {routine}"), wuk, &None, mkl_1c);
+    report_relaxed_ratio(
+        &format!("oneMKL(all threads) {routine}"),
+        &None,
+        wk_par,
+        mkl_all,
+    );
+}
+
 /// Print Wukong's standing vs the **C++ (g++)** column produced by [`build_c_cpp`]. Same shape as
 /// [`report_relaxed_ratio`] — which is a general peer-standing printer despite its name — but with
 /// its own entry point so the C++ label is spelled one way across ~40 benches, and so a reader can
@@ -2006,6 +2057,17 @@ fn bench_matmul_tn(cc: &str, dir: &Path, roof: f64) {
         }
         report_cpp_ratio(&wuk, &wk_par, &cm_cpp);
         report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
+        // The library bar (P6.2): `cblas_sgemm_64` with `transa = CblasTrans`, held to the relaxed
+        // 1e-2 bar above. Printed as standings so the TN lead can be read against the state of the
+        // art and not only against idiomatic C - or, with no MKL on this host, says why not.
+        report_library_columns(
+            "cblas_sgemm_64 (TransA)",
+            mkl_absent_reason(None),
+            &wuk,
+            &wk_par,
+            &mkl_1c,
+            &mkl_all,
+        );
         println!();
     }
 }
@@ -2226,6 +2288,15 @@ fn bench_gemv(cc: &str, dir: &Path) {
         }
         report_cpp_ratio(&wuk, &wk_par, &cm_cpp);
         report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
+        // The library bar (P6.2): `cblas_sgemv_64`, held to the relaxed 1e-2 bar above.
+        report_library_columns(
+            "cblas_sgemv_64",
+            mkl_absent_reason(Some(("cblas_sgemv_64", |api| api.sgemv.is_some()))),
+            &wuk,
+            &wk_par,
+            &mkl_1c,
+            &mkl_all,
+        );
         println!();
     }
 }
@@ -3332,6 +3403,15 @@ fn bench_transpose(cc: &str, dir: &Path) {
         }
         report_cpp_ratio(&wuk, &wk_par, &cm_cpp);
         report_relaxed_ratio("C(omp) [-fopenmp, all cores]", &wuk, &wk_par, &comp);
+        // The library bar (P6.2): `MKL_Somatcopy`, held to BIT equality by `mkl_transpose_exact`.
+        report_library_columns(
+            "MKL_Somatcopy",
+            mkl_absent_reason(Some(("MKL_Somatcopy", |api| api.somatcopy.is_some()))),
+            &wuk,
+            &wk_par,
+            &mkl_1c,
+            &mkl_all,
+        );
         println!();
     }
     transpose_regime_summary(&alias_1c, &gen_1c, &alias_par, &gen_par);
@@ -13859,6 +13939,32 @@ mod tests {
                 &la[3..],
                 "{name}: the two modes must name the same op"
             );
+        }
+    }
+
+    /// The MKL library arms (P6.2) say why they are absent instead of printing a bare `n/a`.
+    #[test]
+    fn a_missing_mkl_arm_has_a_printed_reason() {
+        // On a host with no MKL (every non-Windows host, and this one without conda) the base
+        // probe and every optional symbol report the same reason.
+        if mkl().is_none() {
+            let base = mkl_absent_reason(None).expect("no MKL must give a reason");
+            assert!(base.contains("WUKONG_MKL_DLL"), "{base}");
+            assert_eq!(
+                mkl_absent_reason(Some(("cblas_sgemv_64", |api| api.sgemv.is_some()))),
+                Some(base)
+            );
+        } else {
+            // With MKL loaded, the base GEMM symbol is present by construction (`mkl()` requires
+            // it), and an optional symbol reports absence only if it really did not resolve.
+            assert_eq!(mkl_absent_reason(None), None);
+            let api = mkl().unwrap();
+            assert_eq!(
+                mkl_absent_reason(Some(("MKL_Somatcopy", |api| api.somatcopy.is_some()))).is_none(),
+                api.somatcopy.is_some()
+            );
+            assert!(mkl_absent_reason(Some(("not-a-symbol", |_| false)))
+                .is_some_and(|why| why.contains("does not export `not-a-symbol`")));
         }
     }
 }
