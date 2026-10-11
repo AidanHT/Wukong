@@ -5,6 +5,31 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Type-lowering soundness (`gap4/sema-soundness`)
+
+- **No silent `i32` slots (N2).** MIR lowering classified any type it did not recognize as `i32`
+  (`_ => I32` in `mir_ty`/`mir_ty_of_ann`). Every form now has its own arm — a C-style enum is the one
+  named type whose representation is `i32` — and a value whose type has none is refused as `C0001`
+  naming it. Two programs that compiled and printed wrong numbers are now refused: `let mut x; x =
+  2.75;` (a `let` with neither annotation nor initializer; it printed `2`-based results,
+  `tests/fail/lower_unclassified_type.wk`) and a value of a type parameter that appears in no
+  parameter or return type (`y = 2.5; println(y)` printed `2`). An array of structs no longer reaches
+  the `@parallel` outliner or the loop vectorizer with an `i32` element type.
+- **Type positions the checker let through.** An integer written as a type (`let x: 512 = 3;`) is
+  `E0324` and a struct, enum or type parameter given arguments (`let p: P<2>`) is `E0327`; both typed
+  as an error with no diagnostic and ran. An undeclared type's `E0324` is no longer lost when literal
+  inference re-checks the body (`let k = 7; let y: i64 = k; let mut x: Foo;` compiled).
+- **Literal inference at struct fields and method arguments (N17).** A struct-literal field (also a
+  struct-payload variant's) and a method-call, associated-function, trait-bound or function-typed
+  parameter call argument now decide a literal-initialized binding, as a plain call argument does:
+  `let x = 0.1; S { w: x }` with `w: f64` stores the f64 0.1 (it was `E0401`)
+  (`tests/run/literal_infer_struct_field.wk`, `tests/run/literal_infer_method_arg.wk`).
+- **Generic bodies (N19/N20), verified.** A bounded generic body is checked against its bounds
+  whether or not it is called (`E0315`/`E0410`, `where` clauses included), each instantiation is
+  re-checked, and a `const` generic is `usize` by design (`E0523`); unit tests pin all three, and the
+  roadmap records the remaining sharp edges (unbounded `T` checked per instantiation, symbolic
+  dimensions as hidden `i64` arguments).
+
 ### Index-recording reductions (`gap3/vec-argmax`)
 
 - **Argmax/argmin and FindLastIV loops vectorize.** `if x[i] > m { m = x[i]; at = i; }` (and its

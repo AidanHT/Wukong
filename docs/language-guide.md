@@ -276,7 +276,11 @@ does not fit widens to the narrowest type that holds it — `i64`, and then `u64
 **Literal inference** (✅): a `let` with no annotation whose initializer is only unsuffixed literals
 (`let mut s = 0.0;`, `let k = 2;`) is an `{float}`/`{integer}` binding, like Rust's — its type is
 decided by its **first constraining use**, and only that one: an assignment `s = v`, a `return s`,
-a call argument `f(s)` or a `let x: T = s` makes it that type (same kind, any width); a compound
+a call argument `f(s)` — also a method-call argument `p.m(s)` / `Type::m(s)` (never the receiver)
+and a call through a function-typed parameter — a struct-literal field `S { f: s }` (or a
+struct-payload variant's field), or a `let x: T = s` makes it that type (same kind, any width), so
+`let x = 0.1; S { w: x }` with `w: f64` stores the f64 0.1 (`tests/run/literal_infer_struct_field.wk`,
+`tests/run/literal_infer_method_arg.wk`; these positions were `E0401` before); a compound
 assignment (`s += v`), an arithmetic operator or a comparison with a typed operand of the same kind
 makes it that type when it is at least as wide, and otherwise keeps the default. So
 `let mut s = 0.0; for i in 0..n { s += x[i]; }` over `f64` data accumulates in `f64`
@@ -285,6 +289,15 @@ An integer literal never becomes a float, a narrower operand never narrows the b
 k + x_u8` stays an `i32` sum), a later use never re-decides what an earlier one decided (in
 `let k = 2; g_i32(k); x_i64 * k` the call keeps `k` an `i32`), and a binding nothing constrains keeps
 the literal's default.
+
+A `let` with **neither an annotation nor an initializer** (`let mut x; x = 2.75;`) is not inferred
+from its first assignment yet: the program type-checks, and lowering refuses it (`C0001`,
+`tests/fail/lower_unclassified_type.wk`) — annotate it, `let mut x: f32;`. It used to get a silent
+`i32` slot, so that program printed `2`-based results. More generally, lowering sizes a value's
+storage only from a type it can classify; one it cannot (a value the type checker left undetermined,
+or a type parameter no call binds — see Traits) is refused as `C0001`, never given a guessed `i32`
+slot. An integer written where a type belongs (`let x: 512 = 3;`) is `E0324`, and a struct, enum or
+type parameter given type arguments (`let p: P<2>`) is `E0327`; both used to check clean.
 
 A `let` binding may **destructure a tuple** — `let (a, b) = …`, nested `let ((m, n), o) = …`, or a
 wildcard `let (keep, _) = …`, including the result of a tuple-returning call
@@ -677,7 +690,14 @@ traits (`<T: Shape + Named>`, or a `where` clause) may call their methods on its
 and their associated functions on itself (`T::unit()`, when `T` is the type of a parameter). Dispatch
 is **static, by monomorphization**: each call instantiates `total` at a concrete type and the
 instance calls that type's `impl` directly — no vtable, no indirect call — so a call at a type with
-no `impl Shape` is rejected at the call (`E0410`). Not supported yet: generic traits or trait
+no `impl Shape` is rejected at the call (`E0410`). A bounded generic body is checked against its
+bounds whether or not anything calls it: a method its bounds do not provide is `E0315`, and passing
+its parameter on to a generic that needs a bound it lacks is `E0410`. Operations on an **unbounded**
+`T` (`x + x`) are checked per instantiation, as a C++ template's are: an uncalled body is not
+rejected for them, and a call that instantiates one at a type without the operation is an error in
+the body labelled "required by this instantiation". A type parameter that appears in no parameter
+or return type cannot be bound by a call (a turbofish does not bind it either), so a value of it in
+the body is refused when lowered (`C0001`). Not supported yet: generic traits or trait
 methods, default methods, two traits on one type that define the same method name (both are the
 function `Type.method`), and generic structs/enums (`Buf<T>`). `tests/run/traits_static_dispatch.wk`.
 

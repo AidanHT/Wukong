@@ -147,6 +147,15 @@ element into every tensor type (`subst_ty`), so `axpy$f32` lowers like the hand-
 function; a recognizer that reads sema's raw generic-body types declines on an instance instead.
 `where` dimension predicates and dimension `static_assert`s are collected and checked against each
 call's bound dimensions by `wukong_sema::constraints`; `static_assert` lowers to nothing.
+**Storage classification is total.** `wukong_mir_build` sizes every value's slot through
+`FnLowerer::mir_ty_of` (a `Ty`) and `mir_ty_of_ann` (an annotation), each with an arm per form and
+no `_ => I32` fallback: a C-style enum is the one `Ty::Named` whose representation is `i32`; the
+registry-blind free `mir_ty` answers `Option` (`None` for any `Named`, and for `Fn`/`Unknown`/`Error`).
+A type with no representation is recorded once per function (`FnLowerer::unrepresentable`) and
+refused at `finish` as `C0001` naming it — reachable today from a `let x;` with neither annotation
+nor initializer and from a type parameter no call binds; the forms sema rejects first
+(`Ty::Error`/`Fn`, an integer or `Name<..>` written as a type) panic in a debug build instead.
+`repr_tests.rs` drives every arm.
 **Kernel builtins**: `wukong_sema::builtins` shape-checks `matmul`/`softmax`/…/`sdpa` and records each
 call's resolved dimensions (`SemaResult::builtin_calls`); `wukong_mir_build::builtins` lowers it to one
 runtime kernel behind runtime extent checks (trapping through `assert`) and an output-overlap guard
