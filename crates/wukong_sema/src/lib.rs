@@ -44,6 +44,8 @@ mod provenance;
 mod resolve;
 mod shape;
 mod tensor;
+#[cfg(test)]
+mod type_position_tests;
 mod usefulness;
 
 pub use builtins::{
@@ -1237,6 +1239,20 @@ impl<'a> Sema<'a> {
         }
     }
 
+    /// Report a diagnostic about a type expression unless the same code is already on record at
+    /// the same place: a pass can lower one type expression twice (a cast inside a method
+    /// receiver is typed by the method lookup and again by the call fallthrough).
+    fn report_type_once(&mut self, d: Diagnostic) {
+        let span = d.primary_span();
+        if !self
+            .diags
+            .iter()
+            .any(|old| old.code == d.code && old.primary_span() == span)
+        {
+            self.diags.push(d);
+        }
+    }
+
     fn lower_type(&mut self, t: &TypeExpr) -> Ty {
         // Only the outermost type of a parameter may be a function type: taking the flag here
         // means every nested lowering (an element, a pointee, a function type's own parameters)
@@ -1272,10 +1288,40 @@ impl<'a> Sema<'a> {
                 let name = path.segments.last().unwrap().sym;
                 if self.checking_bodies {
                     self.check_type_name(path, name, t.span);
+                    // A name that IS a type (a struct, an enum, a type parameter) given arguments
+                    // gets no diagnosis there, and `Ty::Error` let `let p: P<2> = ..` check clean
+                    // (the alias expander reports this only in a module that declares aliases).
+                    if self.generics.contains(&name) || self.is_declared_named_ty(name) {
+                        let nm = self.sym_str(name).to_string();
+                        self.report_type_once(
+                            Diagnostic::error(format!("type `{nm}` takes no type arguments"))
+                                .with_code("E0327")
+                                .primary(t.span, "only a generic type alias takes arguments")
+                                .help(format!("write `{nm}` alone")),
+                        );
+                    }
                 }
                 Ty::Error
             }
-            TypeKind::Int(_) => Ty::Error,
+            // An integer is a dimension (`f::<512>`, `Tensor[f32, 512]`), never a type. Typed as
+            // `Ty::Error` with no diagnostic, `let x: 512 = 3;` checked clean and lowering gave
+            // `x` an `i32` slot.
+            TypeKind::Int(n) => {
+                if self.checking_bodies {
+                    let n = self.sym_str(*n).to_string();
+                    self.report_type_once(
+                        Diagnostic::error(format!("expected a type, found the integer `{n}`"))
+                            .with_code("E0324")
+                            .primary(t.span, "an integer is a dimension, not a type")
+                            .note(
+                                "a type is a scalar (`f32`, `i64`, …), `Tensor[..]`, `vec[..]`, a \
+                                 struct or enum declared in this program, or a generic parameter \
+                                 of the enclosing item",
+                            ),
+                    );
+                }
+                Ty::Error
+            }
             TypeKind::Unit => Ty::Unit,
             TypeKind::Pointer { mutable, pointee } => Ty::Ptr {
                 mutable: *mutable,
@@ -1826,6 +1872,13 @@ impl<'a> Sema<'a> {
     fn check_fn(&mut self, f: &FnDecl, body: &Block, item_attrs: &[Attr]) {
         let mark = self.diags.len();
         let mut passes = 0;
+        // An unknown type name (`E0324`) is reported once per type expression: `resolve.rs` keeps
+        // the record across passes, so a re-check does not report it again. Its report is carried
+        // out of the superseded pass rather than dropped with it — dropping it accepted the
+        // program, the undeclared type lowered as an `i32` slot, whenever literal inference
+        // re-checked the body (`let k = 7; let y: i64 = k; let mut x: Foo; x = 2.5;` printed `2`).
+        // What it reports does not depend on what inference decided.
+        let mut carried: Vec<Diagnostic> = Vec::new();
         loop {
             self.infer_found.clear();
             self.infer_pinned.clear();
@@ -1838,8 +1891,17 @@ impl<'a> Sema<'a> {
             let pinned = std::mem::take(&mut self.infer_pinned);
             self.infer_overrides.extend(found);
             self.infer_overrides.extend(pinned);
-            self.diags.truncate(mark);
+            for d in self.diags.split_off(mark) {
+                if d.code == Some("E0324") && !carried.iter().any(|c| same_report(c, &d)) {
+                    carried.push(d);
+                }
+            }
         }
+        // The carried reports lead this body's diagnostics, unless the final pass made the same
+        // report itself: an unknown type is reported as its annotation is lowered, ahead of any
+        // mismatch that type then causes (`let x: Foo = 3` is `E0324` first, then `E0401`).
+        carried.retain(|d| !self.diags[mark..].iter().any(|x| same_report(x, d)));
+        self.diags.splice(mark..mark, carried);
         self.infer_overrides.clear();
         self.infer_found.clear();
         self.infer_pinned.clear();
@@ -4543,6 +4605,11 @@ fn levenshtein(a: &str, b: &str) -> usize {
 /// directly where declaration order matters (e.g. binding a turbofish `f::<2, 3>` by position).
 fn generic_names(gs: &[GenericParam]) -> HashSet<Symbol> {
     gs.iter().map(generic_param_sym).collect()
+}
+
+/// Whether two diagnostics are the same report: one code, one message, one primary place.
+fn same_report(a: &Diagnostic, b: &Diagnostic) -> bool {
+    a.code == b.code && a.message == b.message && a.primary_span() == b.primary_span()
 }
 
 /// Pick a "more concrete" type when joining two (used for arithmetic results and if/match arms).
