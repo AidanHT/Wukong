@@ -3,8 +3,21 @@
 //! An atomic add has no result, reads *and* writes its location, and may race other threads' adds
 //! to it. Every pass that walks memory must therefore treat it the way it treats
 //! [`Op::VecKernelCall`] — an opaque effect — and never as the "no result, nothing to see" op its
-//! shape suggests. Each test below is a program whose -O0 answer (the interpreter on unoptimized
-//! MIR) differs from what a pass that missed the op would compute, run at -O0, -O1 and -O2.
+//! shape suggests. Five tests below run a program at -O0, -O1 and -O2 whose -O0 answer (the
+//! interpreter on unoptimized MIR) differs from what a pass that missed the op would compute;
+//! `an_atomic_add_publishes_its_location` checks the escape scan's verdicts directly.
+//!
+//! What each test can see, measured by removing one `AtomicAdd` arm at a time:
+//! - `effects` fails `an_atomics_only_callee_is_not_summarized_pure`;
+//! - `cse` fails `a_load_is_not_forwarded_past_an_atomic_add` and the callee test;
+//! - `licm` fails `a_load_of_an_atomically_updated_location_stays_in_the_loop`;
+//! - `has_side_effects` fails `a_loop_of_atomic_adds_survives_loop_deletion`;
+//! - `loop_info::dependence` fails `a_loop_with_an_atomic_add_is_not_vectorized`.
+//!
+//! The escape scan names no `AtomicAdd` arm: its fallback marks every operand of an op it does not
+//! model escaped, and the alias test pins that (an arm that skipped the op would fail it). The
+//! three `vectorize.rs` arms are defense in depth behind `loop_info` and the planner's catch-all,
+//! and no test sees one of them alone.
 
 use wukong_mir::{
     BinOp, BlockId, Builder, CmpOp, Function, MirType, Op, ParamAttrs, Program, ValueId,
@@ -12,6 +25,7 @@ use wukong_mir::{
 use wukong_span::{Interner, Symbol};
 
 use crate::alias::AliasInfo;
+use crate::loop_info::MemDep;
 
 /// Run `program` from `entry` at -O0, -O1 and -O2 (each from a fresh clone, verified), and return
 /// the three results.
@@ -312,6 +326,14 @@ fn an_atomic_add_publishes_its_location() {
 /// widened group would add once for `n` iterations' worth of adds, or race. Plain
 /// `a[i] = a[i] + 1` widens (the control); with an atomic counter beside it the loop stays scalar
 /// and the counter equals the trip count.
+///
+/// Two independent layers keep it scalar, and this test pins each one. `loop_info::dependence`
+/// names the op and calls the loop's memory `Carried`, so the first assertion fails when that arm
+/// is removed. The vectorizer's per-instruction planner (`plan_body`) also ends in
+/// `_ => return None`, and the end-to-end check catches the planner admitting the op only when the
+/// `dependence` arm is gone too: then `-O2` runs one atomic per four-lane group and the counter
+/// reads 16. The three `vectorize.rs` arms (a predicated arm in `linearize_region` and the tree
+/// walk, and `header_is_test_only`) sit behind both layers, so no test can see one of them alone.
 #[test]
 fn a_loop_with_an_atomic_add_is_not_vectorized() {
     fn kernel(it: &mut Interner, name: &str, with_atomic: bool) -> Function {
@@ -352,7 +374,21 @@ fn a_loop_with_an_atomic_add_is_not_vectorized() {
     let counted = kernel(&mut it, "counted", true);
     let counted_name = counted.name;
 
-    // main = { a = [0; 64]; cnt = 0; counted(a, &cnt, 64); return cnt * 1000 + a[0] + a[63] }
+    // The first layer: the atomic makes the loop's memory dependence carried, so no loop pass may
+    // reorder its iterations. The control's same-element `a[i] = a[i] + 1` is not carried.
+    let verdict = |f: &Function| {
+        let forest = crate::loop_info::analyze_function(f);
+        assert_eq!(forest.loops.len(), 1);
+        forest.loops[0].dep.memory
+    };
+    assert_ne!(verdict(&plain), MemDep::Carried, "control");
+    assert_eq!(
+        verdict(&counted),
+        MemDep::Carried,
+        "loop_info::dependence must not see past an atomic add"
+    );
+
+    // main ={ a = [0; 64]; cnt = 0; counted(a, &cnt, 64); return cnt * 1000 + a[0] + a[63] }
     let main_name = it.intern("main");
     let mut m = Builder::new(main_name, MirType::I64);
     let a = m.alloca(MirType::Array(Box::new(MirType::I32), 64));

@@ -18,8 +18,12 @@ All notable changes to Wukong are documented here. The format is loosely based o
   while auditing: `effects.rs` would have summarized a callee whose only write is an atomic add as
   pure, and `dce` would have deleted its unused calls. `wukong_opt/src/atomic_tests.rs` pins that and
   four more (store-to-load forwarding past the atomic, loop deletion, LICM of a load the loop
-  atomically updates, and vectorizing a loop that holds one). Each test fails when the op's arm is
-  removed. A Cranelift stress test runs 2^16 adds into four counters, through `wukong_parallel_for`
+  atomically updates, and vectorizing a loop that holds one), plus the escape scan publishing the
+  atomic's location. Removing one arm at a time, the `effects`, `cse`, `licm`, `has_side_effects`
+  and `loop_info::dependence` arms each fail a test. The escape scan has no arm of its own: its
+  fallback marks the operands escaped, and that is what the sixth test pins. The three
+  `vectorize.rs` arms sit behind `loop_info`'s verdict and the planner's `_ => return None`, so no
+  test can see one of them alone. A Cranelift stress test runs 2^16 adds into four counters, through `wukong_parallel_for`
   and from 8 OS threads at once, 10 rounds each; replacing the RMW with a load/add/store loses
   about two thirds of the updates there.
 - **`atomic_add(place, v)` (P15.15).** A statement builtin: `place = place + v`, wrapping at the
