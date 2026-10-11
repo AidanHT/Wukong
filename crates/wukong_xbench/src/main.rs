@@ -9480,9 +9480,6 @@ fn time_ns(mut run: impl FnMut()) -> f64 {
     }
 }
 
-/// Print where Wukong's single-core GEMM stands: vs the tuned library (the SOTA-parity check) and
-/// as a % of the measured AVX2-FMA roofline (clock-invariant — the honest figure on this box, whose
-/// absolute GFLOP/s swings with the power/thermal state).
 /// Cross-check Wukong's single-core GEMM buffer against the in-process tuned `matrixmultiply`
 /// column at the suite's like-for-like 1e-3 bar. Both reassociate the K-dot (KC-blocked), so the
 /// bar is the one the naive-C check uses. Called BEFORE [`report_gemm_standing`], which prints a
@@ -9497,6 +9494,9 @@ fn gemm_vs_tuned_check(wuk: &Option<Measure>, tuned: &Measure) {
     }
 }
 
+/// Print where Wukong's single-core GEMM stands: vs the tuned library (the SOTA-parity check) and
+/// as a % of the measured AVX2-FMA roofline (clock-invariant — the honest figure on this box, whose
+/// absolute GFLOP/s swings with the power/thermal state).
 fn report_gemm_standing(wuk: &Option<Measure>, tuned: &Measure, roof: f64, flops: f64) {
     if let Some(m) = wuk {
         let wk_g = flops / m.ns_per_call;
