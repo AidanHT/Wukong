@@ -81,8 +81,9 @@ OPTIONS:
                        every lint, so `-D warnings` fails the build on any warning. A lint is
                        named or coded: unused_variables (W0001), unused_mut (W0002),
                        unreachable_code (W0003), unused_result (W0004), dead_code (W0005),
-                       unwritten_output (W0006), unknown_lints (W0007), unreachable_patterns
-                       (W0020), missing_semicolon (W0030), ambiguous_continuation (W0031).
+                       unwritten_output (W0006), unknown_lints (W0007), unused_imports (W0008),
+                       unreachable_patterns (W0020), missing_semicolon (W0030),
+                       ambiguous_continuation (W0031).
                        Repeatable; `-Dwarnings` also works. In source: @allow(<lint>),
                        @warn(..), @deny(..)
     --error-limit=<n>  Print at most n errors before suppressing the rest (0 = unlimited; default)
