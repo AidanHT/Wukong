@@ -29,7 +29,11 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `tests/run/premise_reduce_4096.wk`, `premise_norm_wide.wk` (768-wide RMSNorm) and
   `premise_gemm_64.wk` print every lane at full precision against exact closed forms within a
   declared `c*sqrt(K)*eps` bound, and `wukong_xbench compare` / `sota-check` first run each with
-  recognizers on and off on both backends; the tolerances are cited in `corpus_lint.rs`.
+  recognizers on and off on both backends; the tolerances are cited in `corpus_lint.rs`. They also
+  join `recognize.rs`'s corpus sweep, which holds every recognizer-dependent program's on/off output
+  byte for byte: the three get declared `2t/(1-t)` entries in its `REASSOCIATION_TOLERANCES`
+  (re-derived from each fixture's own APPROX bound by a test), since the 4096-term `@parallel`
+  sum of squares legitimately prints `4112.017` recognized and `4112.0166` lowered as written.
 - **`cargo clippy --workspace --all-targets` denies warnings locally (P13.15).** Every crate now opts
   in to the workspace `-D warnings` lint table (`wukong_runtime` keeps its own), so a plain local
   clippy fails on a rustc or Clippy warning without `RUSTFLAGS`, as CI does.

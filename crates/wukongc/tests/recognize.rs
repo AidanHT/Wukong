@@ -74,14 +74,77 @@ fn wukongc(args: &[&str], path: &Path, no_recognize: bool) -> (Option<i32>, Stri
 
 /// Per-fixture relative tolerance for the recognition on/off differential, each with the derivation
 /// of its bound. A fixture with no entry is held to **bit-exact** equality — the default, and what
-/// every current corpus fixture gets, so this table being empty is a no-op.
+/// every other corpus fixture gets.
 ///
 /// This is the extension point the instrument lacked. A fixture that prints raw reduction or GEMM
 /// lanes at a measurement size (above the kernel's vector step, where the reassociated and
 /// sequential orders genuinely diverge) is added here with its `c*sqrt(K)*eps` bound, and the gate
 /// then inspects its mantissas instead of being restricted to data where neutrality is free. Keep
 /// each bound cited the way `corpus_lint.rs::DECLARED_TOLERANCES` requires of the run corpus.
-const REASSOCIATION_TOLERANCES: &[(&str, f64)] = &[];
+///
+/// THE DERIVATION every entry uses, re-derived from the fixture by the test after this table: the
+/// fixture pins each printed lane to an exact closed form `e` within its own `EXPECT-OUT-APPROX`
+/// relative bound `t` (cited in `corpus_lint.rs::DECLARED_TOLERANCES`). With
+/// recognition on and off both inside that bound, `|on - off| <= 2t|e|` and `|off| >= (1-t)|e|`, so
+/// relative to the generic lowering (the comparator's reference) they differ by at most
+/// `2t/(1-t)`, rounded UP to three significant figures here. It is the same bound
+/// `wukong_xbench compare`'s premise check applies to the same three fixtures.
+const REASSOCIATION_TOLERANCES: &[(&str, f64)] = &[
+    // P12.24. t = 6.11e-5 (c*sqrt(K)*eps at K = 4096): 2t/(1-t) = 1.2221e-4. The @parallel
+    // sum-of-squares lane is a recognized 8x8x64 fold with recognition on and the generic
+    // vectorizer's order with it off; at landing they printed 4112.017 vs 4112.0166 (9.7e-8).
+    ("premise_reduce_4096.wk", 1.23e-4),
+    // P12.24. t = 2.65e-5 (c*sqrt(K)*eps at K = 768): 2t/(1-t) = 5.3001e-5. wukong_norm_f32's
+    // 8-accumulator sum of squares and `ss * (1/768)` mean vs the loop's order and single divide;
+    // bit-identical at landing, which nothing guarantees.
+    ("premise_norm_wide.wk", 5.31e-5),
+    // P12.24. t = 7.63e-6 (c*sqrt(K)*eps at K = 64): 2t/(1-t) = 1.5260e-5. wukong_sgemm's KC = 384
+    // block holds the whole K = 64 contraction today, so both lowerings agree to the bit; a kernel
+    // that split K would move last bits within this bound.
+    ("premise_gemm_64.wk", 1.53e-5),
+];
+
+/// Every on/off tolerance is DERIVED from its fixture's own `EXPECT-OUT-APPROX` bound, never
+/// chosen: the entry must be at least `2t/(1-t)` for the largest `t` the fixture declares (or two
+/// lanes each legitimately inside that bound could fail the differential), and at most 1% above it
+/// (a looser number would be a tolerance invented to make a fixture pass). A fixture that loses its
+/// APPROX lines, or an entry whose fixture is gone, fails here by name.
+#[test]
+fn every_reassociation_tolerance_is_derived_from_its_fixtures_own_bound() {
+    assert!(
+        !REASSOCIATION_TOLERANCES.is_empty(),
+        "the premise fixtures' entries are missing - the corpus sweep would hold them bit-exact"
+    );
+    for (name, declared) in REASSOCIATION_TOLERANCES {
+        let path = fixture(name);
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{name}: declared a tolerance but cannot be read: {e}"));
+        let t = src
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("// EXPECT-OUT-APPROX:"))
+            .map(|rest| {
+                let rel = rest.split_whitespace().nth(1).unwrap_or_else(|| {
+                    panic!("{name}: EXPECT-OUT-APPROX line without a tolerance: {rest:?}")
+                });
+                rel.parse::<f64>()
+                    .unwrap_or_else(|e| panic!("{name}: unparsable tolerance {rel:?}: {e}"))
+            })
+            .fold(0.0f64, f64::max);
+        assert!(
+            t > 0.0,
+            "{name} has an on/off tolerance but declares no EXPECT-OUT-APPROX bound to derive it from"
+        );
+        let derived = 2.0 * t / (1.0 - t);
+        assert!(
+            *declared >= derived,
+            "{name}: declared {declared:e} is below 2t/(1-t) = {derived:e} (t = {t:e})"
+        );
+        assert!(
+            *declared <= derived * 1.01,
+            "{name}: declared {declared:e} is more than 1% above 2t/(1-t) = {derived:e} (t = {t:e})"
+        );
+    }
+}
 
 /// The declared tolerance for a fixture, or `None` (bit-exact) when it has no entry.
 fn tolerance_for(name: &str) -> Option<f64> {

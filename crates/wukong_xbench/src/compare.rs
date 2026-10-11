@@ -409,12 +409,17 @@ fn bench_fixture(fx: &Fixture, cc: &str, dir: &Path) -> SotaRow {
 // =================================================================================================
 //
 // Everything this harness reads off a recognizer-on column rests on one premise: recognition changes
-// HOW a program is compiled, never WHAT it computes beyond a declared tolerance. The only gate on that
-// premise (`crates/wukongc/tests/recognize.rs`) runs fixtures of N <= 16 that print exact integers,
-// where a reassociated reduction cannot differ from a sequential one - so it says nothing about the
-// sizes this harness times. The three `tests/run/premise_*.wk` fixtures run a 4096-term reduction, a
-// 768-wide RMSNorm row and a 64x64x64 GEMM over fractional data and print every lane at full
-// precision against exact closed forms with a cited `c*sqrt(K)*eps` bound. This check compiles each
+// HOW a program is compiled, never WHAT it computes beyond a declared tolerance. The cargo-test gate
+// on that premise (`crates/wukongc/tests/recognize.rs`, the corpus sweep) holds every
+// recognizer-dependent `tests/run` program's recognition-off output to its recognition-on output -
+// byte for byte unless the fixture declares a tolerance in its `REASSOCIATION_TOLERANCES`. Byte
+// identity is attainable there only because the corpus is built on exactly representable data, where
+// a reassociated reduction cannot differ from a sequential one - so on its own that sweep says
+// nothing about fractional data at the sizes this harness times. The three `tests/run/premise_*.wk`
+// fixtures run a 4096-term reduction, a 768-wide RMSNorm row and a 64x64x64 GEMM over fractional
+// data and print every lane at full precision against exact closed forms with a cited
+// `c*sqrt(K)*eps` bound; they are in that sweep too, under the same `2t/(1-t)` on/off bound this
+// check applies (declared in `REASSOCIATION_TOLERANCES`). This check compiles each
 // one twice - recognizers on and off - runs both on the interpreter (the oracle) and natively, and
 // requires: every run inside every one of the fixture's own `EXPECT-OUT-APPROX` lines; interpreter
 // and native bit-identical within each lowering; and on vs off within `2t/(1-t)` lane by lane (two

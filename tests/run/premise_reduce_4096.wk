@@ -12,12 +12,15 @@ module tests.run.premise_reduce_4096
 
 // P12.24 - the instrument's correctness premise at a MEASUREMENT size. The recognition on/off
 // premise (`WUKONG_NO_RECOGNIZE` changes how a program is compiled, never what it computes beyond a
-// declared tolerance) used to be checked only on fixtures of N <= 16 that print exact integers, where
-// a reassociated sum cannot differ from a sequential one. Here every reduction runs over N = 4096
-// fractional f32 values - far above the kernels' 8-lane / 64-element block - and prints its result at
-// full precision (shortest round-trip f32), so a different summation order is VISIBLE in the output.
-// `wukong_xbench compare` runs this fixture with recognition ON and OFF on both backends and reports
-// how far the two answers actually moved; this file pins both to the scalar closed form.
+// declared tolerance) is held byte for byte over every recognizer-dependent corpus program by
+// recognize.rs's corpus sweep - attainable only because the corpus is built on exactly
+// representable data, where a reassociated sum cannot differ from a sequential one. Here every
+// reduction runs over N = 4096 fractional f32 values - far above the kernels' 8-lane / 64-element
+// block - and prints its result at full precision (shortest round-trip f32), so a different
+// summation order is VISIBLE in the output. That sweep holds this file's on/off lanes within
+// 2t/(1-t) instead (its REASSOCIATION_TOLERANCES entry), and `wukong_xbench compare` runs it with
+// recognition ON and OFF on both backends and reports how far the two answers actually moved; this
+// file pins both to the scalar closed form.
 //
 // Lanes, in print order (dispatch at `--emit=mir -O2`, recognition on):
 //   1 sum(x)        builtin            -> wukong_sreduce_f32 (on AND off: a builtin, not a recognizer)
