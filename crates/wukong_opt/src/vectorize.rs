@@ -589,6 +589,12 @@ struct RedPlan {
     /// index)` partials — parts of `ty` for the value, then parts of the index type — and combined
     /// once on the way out by [`emit_arg_combine`].
     arg: Option<(usize, MirType)>,
+    /// The argmax's compare is non-strict (`>=`/`<=`), so a tie moves the index forward and the
+    /// LAST maximal element wins. Its index partials start at the vector loop's first counter minus
+    /// one — "never updated" — rather than at the scalar loop's own index, because with a non-strict
+    /// compare an updated lane can tie an un-updated one, and only the sentinel tells them apart
+    /// ([`emit_arg_combine`]).
+    arg_last: bool,
     /// A FindLastIV (`if c { last = i }`, [`RedKind::FindLast`]): per-lane partials holding the
     /// last counter each lane recorded, started one below the vector loop's first counter so that
     /// "never recorded" is distinguishable from every real one; [`emit_find_last_combine`] folds
@@ -2271,23 +2277,26 @@ fn plan_body(
         // answers — an `i8` product has no packed form, and a reduction is not exempt from that.
         // Such a reduction still widens; it just takes the serial fold, whose combine is scalar.
         // An argmax/argmin keeps per-lane `(value, index)` partials, which reproduce the scalar
-        // loop's answer only under three conditions ([`emit_arg_combine`] has the argument): the
-        // compare is strict, so a tie keeps the earlier element; the update is the `then` arm, so a
-        // NaN (every ordered compare false) never updates; and the index is this loop's counter,
-        // so a later iteration always records a later index. Anything else stays scalar.
+        // loop's answer only under two conditions ([`emit_arg_combine`] has the argument): the
+        // update is the `then` arm, so a NaN (every ordered compare false) never updates; and the
+        // index is this loop's counter, so a later iteration always records a later index. A strict
+        // compare keeps the EARLIEST of tied elements and a non-strict one the LAST
+        // ([`RedPlan::arg_last`]); the combine breaks value ties the same way. Anything else stays
+        // scalar.
+        let mut arg_last = false;
         let arg = match r.arg {
             None => None,
             Some(a) => {
                 let s = r.select?;
-                let strict = matches!(
+                arg_last = matches!(
                     s.pred,
-                    CmpOp::Sgt | CmpOp::Slt | CmpOp::Ugt | CmpOp::Ult | CmpOp::Fogt | CmpOp::Folt
+                    CmpOp::Sge | CmpOp::Sle | CmpOp::Uge | CmpOp::Ule | CmpOp::Foge | CmpOp::Fole
                 );
                 let value_ok = match &ty {
                     MirType::F32 | MirType::F64 => true,
                     t => t.is_int() && lane_bytes(t).is_some_and(|b| b <= 4),
                 };
-                if !strict || s.acc_is_then || a.index != ramp.iv || !value_ok {
+                if s.acc_is_then || a.index != ramp.iv || !value_ok {
                     return None;
                 }
                 red_of.insert(a.merge.0);
@@ -2315,6 +2324,7 @@ fn plan_body(
             ty,
             vector_acc,
             arg,
+            arg_last,
             find_last,
         });
     }
@@ -3379,7 +3389,9 @@ fn apply(f: &mut Function, p: &VecPlan) {
     let mut guard_args = guard_params.clone();
     for r in &vacc {
         // An argmax's partials need no identity: every lane starts at the scalar loop's own
-        // `(m, at)`, which is exactly the state each lane's sub-sequence starts from.
+        // `(m, at)`, which is exactly the state each lane's sub-sequence starts from. A last-tie
+        // argmax starts its index lanes one below the first counter instead, so that a lane which
+        // never updated is told apart from one that tied `m` ([`emit_arg_combine`]).
         if let Some((ai, ity)) = &r.arg {
             let m0 = e.push(
                 guard,
@@ -3389,7 +3401,13 @@ fn apply(f: &mut Function, p: &VecPlan) {
             for _ in 0..parts_of(&r.ty, p.w) {
                 guard_args.push(m0);
             }
-            let a0 = e.push(guard, part_ty(ity), Op::Splat(guard_params[*ai]));
+            let first = if r.arg_last {
+                let one = e.int(guard, ity, 1);
+                e.push(guard, ity.clone(), Op::Bin(BinOp::Sub, start, one))
+            } else {
+                guard_params[*ai]
+            };
+            let a0 = e.push(guard, part_ty(ity), Op::Splat(first));
             for _ in 0..parts_of(ity, p.w) {
                 guard_args.push(a0);
             }
@@ -3453,7 +3471,8 @@ fn apply(f: &mut Function, p: &VecPlan) {
             let na = parts_of(ity, p.w);
             let at_parts = vh_params[next_param..next_param + na].to_vec();
             next_param += na;
-            let (m, at) = emit_arg_combine(&mut e, vx, r, ity, &parts, &at_parts, start);
+            let prior = exit_args[*ai];
+            let (m, at) = emit_arg_combine(&mut e, vx, r, ity, &parts, &at_parts, start, prior);
             exit_args[r.param_index] = m;
             exit_args[*ai] = at;
             continue;
@@ -4316,19 +4335,15 @@ fn emit_exit_test(
     rest
 }
 
-/// `fold` (`And` or `Or`) over every lane of the lane mask `c`, as one `i1`: the parts combined
-/// lane-wise, then a halving tree of lane shuffles, then lane 0 against zero — `log2` of the lane
-/// count steps instead of one extract per lane. A mask lane is all-ones natively and `1` in the
-/// interpreter, zero in both when false, so the bitwise fold and the `!= 0` test read the same truth
-/// on every backend. A condition that is uniform across the group is its own answer.
 /// Combine an argmax's per-lane `(value, index)` partials into the scalar `(m, at)` — once, in the
 /// vector exit — so that the result is bit-identical to the scalar loop's.
 ///
 /// Lane `k` ran the scalar update `c ? (x, i) : (m, at)` over iterations `k, k + W, ..` from the
-/// loop's own start `(m0, a0)`; `plan_body` admitted only a strict compare with the update on its
-/// `then` arm. The scalar answer is then the **first** iteration whose value is strictly better
-/// than every earlier one and not beaten later — the earliest member of the best class (`-0.0`
-/// and `+0.0` are one class: neither is `>` the other) — or `(m0, a0)` when nothing beat `m0`.
+/// loop's own start `(m0, a0)`; `plan_body` admitted only an update on the compare's `then` arm.
+/// With a strict compare the scalar answer is then the **first** iteration whose value is
+/// strictly better than every earlier one and not beaten later — the earliest member of the best
+/// class (`-0.0` and `+0.0` are one class: neither is `>` the other) — or `(m0, a0)` when nothing
+/// beat `m0`.
 /// Every ordered compare against a NaN is false, so a NaN element never updates anything, and a
 /// NaN `m0` updates nothing at all.
 ///
@@ -4348,6 +4363,22 @@ fn emit_exit_test(
 ///   pair — `(m0, a0)` — exactly as the scalar loop does.
 ///
 /// The scalar epilogue then continues from `(M, A)` over the iterations after the vector loop's.
+///
+/// # The last-tie form (`>=` / `<=`, [`RedPlan::arg_last`])
+///
+/// A non-strict compare moves the index on a tie, so the scalar answer is the **last** element of
+/// the best class — or `(m0, a0)` when no element reached `m0`. Each lane holds the last member of
+/// its own best class, so the answer is the lane whose value is best, ties going to the lane whose
+/// index is **later**. What changes is the un-updated lane: an updated lane may now hold a value
+/// *equal* to `m0` (it reached `m0` and moved), so the index alone has to say which lanes updated.
+/// Every index lane therefore starts at `start - 1`, and the fold compares `q = at - (start - 1)`
+/// (wrapping), which is `0` exactly for a lane that never updated and `j + 1` for one whose last
+/// update was iteration `start + j`. The fold takes lane `k` over the running `(M, Q)` when the
+/// compare's strict form says `m_k` beats `M`, or when the two are equal and `q_k > Q` (unsigned).
+/// An un-updated lane (`q = 0`) never displaces anything it ties, and a NaN still compares neither
+/// better nor equal, so a NaN `m0` again leaves lane 0's `(m0, 0)`. `Q = 0` at the end means no
+/// lane updated, and the index is the scalar loop's own `prior`; the value is lane 0's `m0`.
+#[allow(clippy::too_many_arguments)]
 fn emit_arg_combine(
     e: &mut Emit<'_>,
     vx: BlockId,
@@ -4356,6 +4387,7 @@ fn emit_arg_combine(
     val_parts: &[ValueId],
     at_parts: &[ValueId],
     start: ValueId,
+    prior: ValueId,
 ) -> (ValueId, ValueId) {
     let s = r.select.expect("an argmax is a min/max");
     let lanes = |e: &mut Emit<'_>, parts: &[ValueId], ty: &MirType| -> Vec<ValueId> {
@@ -4375,6 +4407,31 @@ fn emit_arg_combine(
     } else {
         CmpOp::Eq
     };
+    if r.arg_last {
+        let strict = strict_cmp(s.pred);
+        let one = e.int(vx, ity, 1);
+        let below = e.push(vx, ity.clone(), Op::Bin(BinOp::Sub, start, one));
+        let qs: Vec<ValueId> = ats
+            .iter()
+            .map(|&a| e.push(vx, ity.clone(), Op::Bin(BinOp::Sub, a, below)))
+            .collect();
+        let (mut m, mut q) = (ms[0], qs[0]);
+        for (&mk, &qk) in ms.iter().zip(&qs).skip(1) {
+            let (l, rhs) = if s.acc_left_in_cmp { (m, mk) } else { (mk, m) };
+            let better = e.push(vx, MirType::I1, Op::Cmp(strict, l, rhs));
+            let same = e.push(vx, MirType::I1, Op::Cmp(eq, mk, m));
+            let later = e.push(vx, MirType::I1, Op::Cmp(CmpOp::Ugt, qk, q));
+            let tie = e.push(vx, MirType::I1, Op::Bin(BinOp::And, same, later));
+            let take = e.push(vx, MirType::I1, Op::Bin(BinOp::Or, better, tie));
+            m = e.push(vx, r.ty.clone(), Op::Select(take, mk, m));
+            q = e.push(vx, ity.clone(), Op::Select(take, qk, q));
+        }
+        let zero = e.int(vx, ity, 0);
+        let found = e.push(vx, MirType::I1, Op::Cmp(CmpOp::Ne, q, zero));
+        let last = e.push(vx, ity.clone(), Op::Bin(BinOp::Add, below, q));
+        let at = e.push(vx, ity.clone(), Op::Select(found, last, prior));
+        return (m, at);
+    }
     let (mut m, mut at) = (ms[0], ats[0]);
     for (&mk, &ak) in ms.iter().zip(&ats).skip(1) {
         let (l, rhs) = if s.acc_left_in_cmp { (m, mk) } else { (mk, m) };
@@ -4432,6 +4489,11 @@ fn emit_find_last_combine(
     e.push(vx, ty.clone(), Op::Select(found, last, prior))
 }
 
+/// `fold` (`And` or `Or`) over every lane of the lane mask `c`, as one `i1`: the parts combined
+/// lane-wise, then a halving tree of lane shuffles, then lane 0 against zero — `log2` of the lane
+/// count steps instead of one extract per lane. A mask lane is all-ones natively and `1` in the
+/// interpreter, zero in both when false, so the bitwise fold and the `!= 0` test read the same truth
+/// on every backend. A condition that is uniform across the group is its own answer.
 fn fold_lanes(
     e: &mut Emit<'_>,
     vb: BlockId,
@@ -4682,6 +4744,21 @@ fn emit_combine(
             let (l, rhs) = if left_is_acc { (acc, x) } else { (x, acc) };
             e.push(b, ty.clone(), Op::Bin(red_binop(r.kind), l, rhs))
         }
+    }
+}
+
+/// The strict form of an ordering predicate (`>=` to `>`, `<=` to `<`); a strict one is itself.
+/// For floats `a >= b` and `a > b || a == b` agree on every input, NaN included (both false), so
+/// "strictly better or equal" is exactly the loop's own test.
+fn strict_cmp(p: CmpOp) -> CmpOp {
+    match p {
+        CmpOp::Sge => CmpOp::Sgt,
+        CmpOp::Sle => CmpOp::Slt,
+        CmpOp::Uge => CmpOp::Ugt,
+        CmpOp::Ule => CmpOp::Ult,
+        CmpOp::Foge => CmpOp::Fogt,
+        CmpOp::Fole => CmpOp::Folt,
+        other => other,
     }
 }
 
@@ -6270,20 +6347,55 @@ mod tests {
         ));
     }
 
+    /// A non-strict argmax (`x[i] >= m`) keeps the LAST of tied maxima, and an argmin written with
+    /// the accumulator on the left (`m >= y[i]`) the last of tied minima. Their index partials start
+    /// below the first counter so a lane that tied `m0` (and so moved) is told apart from one that
+    /// never updated. Repeated maxima land in different lanes at every trip `0..=len`, ties with the
+    /// start value, `±0` (one class: `-0 >= +0` and `+0 >= -0`), a NaN element and a NaN start.
+    #[test]
+    fn a_non_strict_argmax_keeps_the_last_tie_and_agrees() {
+        let k = "@unchecked fn k(x: []f32, n: i64, m0: f32, mut o: []f32) -> i64 { \
+                   let mut m: f32 = m0; let mut at: i64 = -1; let mut i: i64 = 0; \
+                   while i < n { if x[i] >= m { m = x[i]; at = i; } i = i + 1; } \
+                   o[0] = m; return at; } \
+                 @unchecked fn j(y: []i32, n: i64, m0: i32) -> i64 { let mut m: i32 = m0; \
+                   let mut at: i64 = -1; let mut i: i64 = 0; \
+                   while i < n { if m >= y[i] { m = y[i]; at = i; } i = i + 1; } return at; }";
+        let shape = format!("{k} fn main() -> i32 {{ return 0; }}");
+        assert!(is_widened(&shape, "k"), "a `>=` argmax did not widen");
+        assert!(has_vector_accumulator(&shape, "k"));
+        assert!(is_widened(&shape, "j"), "a `<=` argmin did not widen");
+        scalar_and_vector_agree(&format!(
+            "{k} fn main() -> i32 {{ let mut x: []f32 = alloc_f32(13); \
+             let mut o: []f32 = alloc_f32(1); \
+             x[0] = -3.0; x[1] = 7.0; x[2] = 1.0; x[3] = 7.0; x[4] = 9.0; x[5] = 2.0; x[6] = 9.0; \
+             x[7] = 0.0; x[8] = 9.0; x[9] = 5.0; x[10] = 4.0; x[11] = 9.0; x[12] = 8.0; \
+             let mut n: i64 = 0; \
+             while n <= 13 {{ print(k(x, n, -100.0, o)); print(k(x, n, 9.0, o)); \
+               print(k(x, n, 10.0, o)); n = n + 1; }} \
+             let negz: f32 = 0.0 * -1.0; let nan: f32 = 0.0 / 0.0; \
+             x[0] = negz; x[1] = 0.0; x[2] = nan; x[3] = -1.0; x[4] = 0.0; x[5] = nan; \
+             x[6] = negz; x[7] = -5.0; x[8] = 0.0; x[9] = negz; x[10] = -9.0; \
+             n = 0; \
+             while n <= 11 {{ print(k(x, n, -1.0, o)); print(bits(o[0])); \
+               print(k(x, n, negz, o)); print(bits(o[0])); \
+               print(k(x, n, nan, o)); print(bits(o[0])); n = n + 1; }} \
+             let mut y: []i32 = alloc_i32(17); \
+             y[0] = 5; y[1] = -2; y[2] = 8; y[3] = -2; y[4] = -7; y[5] = 3; y[6] = -7; y[7] = -7; \
+             y[8] = 0; y[9] = 1; y[10] = -7; y[11] = 6; y[12] = -3; y[13] = 2; y[14] = -7; \
+             y[15] = 9; y[16] = 4; \
+             n = 0; \
+             while n <= 17 {{ print(j(y, n, 1000)); print(j(y, n, -7)); print(j(y, n, -100)); \
+               n = n + 1; }} \
+             free(x); free(o); free(y); return 0; }}"
+        ));
+    }
+
     /// The argmax spellings whose per-lane partials would NOT reproduce the scalar answer stay
-    /// scalar: a non-strict compare (`>=` keeps the LAST tie, and an un-updated lane's start index
-    /// could then be mistaken for a later one), the update on the `else` arm (`!(x <= m)` is true
-    /// for a NaN), and an index that is not the counter.
+    /// scalar: the update on the `else` arm (`!(x <= m)` is true for a NaN), and an index that is
+    /// not the counter.
     #[test]
     fn argmax_spellings_the_partials_cannot_reproduce_are_declined() {
-        let nonstrict = "@unchecked fn k(x: []f32, n: i64) -> i64 { let mut m: f32 = 0.0; \
-                         let mut at: i64 = 0; let mut i: i64 = 0; \
-                         while i < n { if x[i] >= m { m = x[i]; at = i; } i = i + 1; } return at; } \
-                         fn main() -> i32 { return 0; }";
-        assert!(
-            !is_widened(nonstrict, "k"),
-            "a `>=` argmax must stay scalar"
-        );
         let else_arm = "@unchecked fn k(x: []f32, n: i64) -> i64 { let mut m: f32 = 0.0; \
                         let mut at: i64 = 0; let mut i: i64 = 0; \
                         while i < n { if x[i] <= m { } else { m = x[i]; at = i; } i = i + 1; } \
