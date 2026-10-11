@@ -74,14 +74,23 @@ fn wukongc(args: &[&str], path: &Path, no_recognize: bool) -> (Option<i32>, Stri
 
 /// Per-fixture relative tolerance for the recognition on/off differential, each with the derivation
 /// of its bound. A fixture with no entry is held to **bit-exact** equality — the default, and what
-/// every current corpus fixture gets, so this table being empty is a no-op.
+/// every corpus fixture not listed here gets.
 ///
 /// This is the extension point the instrument lacked. A fixture that prints raw reduction or GEMM
 /// lanes at a measurement size (above the kernel's vector step, where the reassociated and
 /// sequential orders genuinely diverge) is added here with its `c*sqrt(K)*eps` bound, and the gate
 /// then inspects its mantissas instead of being restricted to data where neutrality is free. Keep
 /// each bound cited the way `corpus_lint.rs::DECLARED_TOLERANCES` requires of the run corpus.
-const REASSOCIATION_TOLERANCES: &[(&str, f64)] = &[];
+const REASSOCIATION_TOLERANCES: &[(&str, f64)] = &[
+    // The loss `Σ o_i²` over 32 positive f32 terms: recognized, it is one `wukong_sreduce_f32`
+    // dot (8-lane FMA partials, then a fixed tree); unrecognized, the sequential source loop. Any
+    // summation order of n positive terms is within γ_{n-1}·Σx of the exact sum (Higham, Accuracy
+    // and Stability of Numerical Algorithms, §4.2), and each side rounds each product at most once
+    // more, so the two orders differ by at most (2·31 + 2)·2^-24 ≈ 3.81e-6 of the sum — 4e-6
+    // rounded up. Every `o` lane the fixture prints is the same attention call on both sides and
+    // stays byte-exact; only its two loss lines are compared under this bound.
+    ("sdpa_loss_train.wk", 4e-6),
+];
 
 /// The declared tolerance for a fixture, or `None` (bit-exact) when it has no entry.
 fn tolerance_for(name: &str) -> Option<f64> {
