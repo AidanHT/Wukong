@@ -736,7 +736,12 @@ after every pack (64 packs at most; functions above 6000 instructions are skippe
 `WUKONG_NO_SLP` (presence) turns it off — read inside `slp_program`, so `optimize`, the verified and
 timed paths and the `wukong_bench compile-work` replica all honour it — and `WUKONG_SLP_TRACE=1`
 prints `slp: PACK bb<N> ty=<T> w=<W> nodes=<n> cost=<V>/<S>` or `slp: declined bb<N>: <reason>`
-per decision. It adds no MIR op and changed no backend; over `tests/run` and `examples` it packs
+per decision. A gradient compile (`--emit=grad`, `--train`, `--emit=obj --grad-of`) optimizes the
+forward it hands to autodiff without it: the driver passes `OptimizeOptions::AUTODIFF_INPUT` to
+`optimize_preserving_with` / `optimize_verified_preserving_with`, because `wukong_autodiff`
+differentiates one scalar at a time and has no VJP rule for a vector load or store — a packed store
+into a buffer whose gradient is live is a hard error there. The generated backward, which nothing
+differentiates, is packed as usual. It adds no MIR op and changed no backend; over `tests/run` and `examples` it packs
 `tensor_dim_arith.wk` and `type_alias.wk` and costs 0.2% of optimizer time (debug `--time-passes`,
 summed in process). Its vector loads and stores sit **outside loops, frame slots included**, which
 `gpu-native` takes through its generic scalar-lane path — only the on-device suite (gate part 10)

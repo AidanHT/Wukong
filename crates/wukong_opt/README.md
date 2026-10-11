@@ -72,7 +72,9 @@ load-bearing.
   loads, splats and lane builds. It moves the chunk's stores and loads down to its last store, so
   every access they pass must be proved disjoint (`AliasInfo::may_alias_sized`), a call must find
   them call-proof, and a barrier declines. Packed functions get the same reduced cleanup.
-  `WUKONG_NO_SLP` turns it off; `WUKONG_SLP_TRACE=1` prints each decision.
+  `WUKONG_NO_SLP` turns it off; `WUKONG_SLP_TRACE=1` prints each decision. A program autodiff will
+  differentiate is optimized with `OptimizeOptions::AUTODIFF_INPUT` (`optimize_preserving_with` /
+  `optimize_verified_preserving_with`), which skips it: autodiff has no VJP rule for a vector store.
 
 `cse`, `dse`, and `licm` consult `alias` — provenance analysis answering whether a store through `q`
 can be seen by a load through `p`. The Cranelift backend uses it too.

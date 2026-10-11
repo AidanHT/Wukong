@@ -617,6 +617,9 @@ another architecture or OS is not supported. A native-backend failure is a catal
   the stored or loaded storage, or a barrier. Reductions and horizontal ops are not formed, and the
   cost model is untuned: no speed claim without a same-run release A/B against `WUKONG_NO_SLP`. The
   vector accesses it emits on frame slots reach `gpu-native` too, which only the device suite checks.
+  A gradient compile does not run it on the forward it differentiates: autodiff has no lane-wise
+  VJP rules for vector loads, stores and arithmetic, so the whole program of an `--emit=grad`,
+  `--train` or `--emit=obj --grad-of` compile stays unpacked (its generated backward is packed).
 - **FMA contraction**: a float `x + y*z` becomes one fused multiply-add (`Op::Fma`, a hardware
   `vfmadd`), on both the scalar and vector paths; the interpreter mirrors it with `mul_add`, so the
   two backends stay bit-identical.

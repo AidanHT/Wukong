@@ -16,6 +16,13 @@
 //! does ([`crate::PassManager::unroll_cleanup`]), whose `dce` removes the scalar computations the
 //! packed tree replaced. `-O0` and `-O1` never run it, and `-O3` is `-O2`.
 //!
+//! A gradient compile (`--emit=grad`, `--train`, `--emit=obj --grad-of`) does not run it on the
+//! forward: `wukong_autodiff` differentiates the optimized single-block loss one scalar at a time
+//! and has no VJP rule for a vector load or store, so a packed store into a buffer whose gradient
+//! is live is a hard error there. The driver asks for
+//! [`crate::OptimizeOptions::AUTODIFF_INPUT`]; the generated backward, which nothing
+//! differentiates, is packed as usual.
+//!
 //! # The algorithm
 //!
 //! Deterministic throughout: blocks in index order, and within a block the seeds sorted by their
@@ -881,6 +888,40 @@ mod tests {
                 .any(|op| matches!(op, Op::Fma(x, ..) if types[x.0 as usize] == f32x4)),
             "{ops:?}"
         );
+    }
+
+    /// A program autodiff will differentiate is optimized with
+    /// [`crate::OptimizeOptions::AUTODIFF_INPUT`]: the same bundle stays four scalar stores, which
+    /// `wukong_autodiff` can route, while the full pipeline packs it.
+    #[test]
+    fn the_autodiff_input_pipeline_does_not_pack() {
+        let src = "fn axpy4(@noalias mut o: [f32; 4], a: [f32; 4], b: [f32; 4], s: f32) {                    o[0] = a[0] * s + b[0]; o[1] = a[1] * s + b[1];                    o[2] = a[2] * s + b[2]; o[3] = a[3] * s + b[3]; }                    fn main() -> i32 { return 0; }";
+        for (options, packs) in [
+            (crate::OptimizeOptions::FULL, true),
+            (crate::OptimizeOptions::AUTODIFF_INPUT, false),
+        ] {
+            let (mut program, mut interner) = lower(src);
+            let root = interner.intern("axpy4");
+            crate::optimize_preserving_with(&mut program, 2, &[root], options);
+            let f = program.function(root).expect("axpy4 is preserved");
+            let ops: Vec<Op> = f
+                .blocks
+                .iter()
+                .flat_map(|b| b.insts.iter())
+                .map(|i| i.op.clone())
+                .collect();
+            let f32x4 = vec_ty(MirType::F32, 4);
+            assert_eq!(
+                stores_of(&ops, &f.value_types, &f32x4),
+                usize::from(packs),
+                "{options:?}: {ops:?}"
+            );
+            assert_eq!(
+                stores_of(&ops, &f.value_types, &MirType::F32),
+                if packs { 0 } else { 4 },
+                "{options:?}: {ops:?}"
+            );
+        }
     }
 
     /// The other two widths: an `i32` quad (`<4 x i32>` add of a load and a multiply) and an `f64`
