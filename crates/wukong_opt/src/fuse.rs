@@ -22,18 +22,29 @@
 //!   one latch, one exit, no early return) with no call, `alloca`, vector-kernel call, barrier or
 //!   vector value, and they run the **same** iterations: equal start and end (the same value, or
 //!   equal constants), the same predicate and induction-variable type.
-//! * The first loop exits straight into the second's preheader, which nothing else reaches, which
-//!   carries no state, and whose instructions are pure and cannot trap or read memory — they move
-//!   ahead of the first loop.
-//! * The second loop reads nothing the first loop defines: a value of the first loop is only right
-//!   once that loop has finished.
+//! * The first loop exits straight into the second's preheader, which nothing else reaches and
+//!   whose instructions are pure and cannot trap or read memory — they move ahead of the first
+//!   loop. Parameters of that preheader are the first loop's **live-outs**, passed by its exit edge;
+//!   after fusion the code that read them reads what the edge passed (values of the fused header,
+//!   which hold the first loop's final state when the loop exits). A live-out read straight from
+//!   the first header needs nothing at all.
+//! * The second loop (and its preheader) reads nothing the first loop defines, live-outs included:
+//!   a value of the first loop is only right once that loop has finished.
 //! * **Memory.** Fusion runs iteration `i` of the second loop before iterations `i + 1..` of the
-//!   first, so every pair of accesses where one writes must touch a location at the same iteration
-//!   or never. Two accesses to one object must use the identical affine index with a nonzero
-//!   constant stride (distance 0 — within a fused iteration the first loop's access still comes
-//!   first, as it did); accesses to different objects must be proved disjoint by [`AliasInfo`]. An
-//!   unanalyzable address, a loop-invariant address that is written, or two possibly-aliased bases
-//!   decline. A store of a pointer declines (it could move a reloaded slice base).
+//!   first, so every pair of accesses where one writes must keep its order: the first loop's
+//!   access first. Two accesses to one object — the same base, or two bases the alias analysis
+//!   places at a whole number of elements apart (`t` and `gep t, 2`) — need the same nonzero
+//!   constant stride `c` and invariant part; they touch one element when `j - i = (ka - kb) / c`,
+//!   and the fused loop keeps their order exactly when that **distance** is not negative (or `c`
+//!   does not divide `ka - kb`: no common element). Reading what the first loop stored `d`
+//!   iterations back (`t[j - d]` after `t[i]`) fuses; reading ahead (`t[j + d]`) does not. A nonzero
+//!   distance needs element-sized accesses so that two never partially overlap. Accesses to
+//!   different objects must be proved disjoint by [`AliasInfo`] — distinct stack slots, a
+//!   `@noalias` parameter against any other, a `@noalias` slice's elements (reloaded from a header
+//!   nothing writes) — and a base reloaded inside the loop must be stable: no store of either loop
+//!   may write the slot it is reloaded from. An unanalyzable address, a loop-invariant address that
+//!   is written, or two possibly-aliased bases decline. A store of a pointer declines (it could
+//!   move a reloaded slice base).
 //! * **Profit.** A loop the vectorizer can widen is never fused with one it cannot, and two
 //!   widenable loops fuse only when every access has one width — so fusion never costs a loop its
 //!   vectorization.
@@ -45,10 +56,11 @@
 
 use wukong_mir::{BinOp, BlockId, CastKind, CmpOp, Function, MirType, Op, Terminator, ValueId};
 
-use crate::alias::{type_bytes, AliasInfo};
+use crate::alias::{type_bytes, AliasInfo, Prov};
 use crate::fxhash::{FxHashMap, FxHashSet};
 use crate::loop_info::{
-    self, AccessKind, AddrForm, Coeff, IvStep, LoopForest, MemAccess, MemBase, NaturalLoop, Stages,
+    self, AccessKind, AddrForm, AffineExpr, Coeff, IvStep, LoopForest, MemAccess, MemBase,
+    NaturalLoop, Stages,
 };
 use crate::{cfg, each_op_use, each_term_use, map_op_uses, map_term_uses, CfgAnalyses, Pass};
 
@@ -252,9 +264,93 @@ fn values_defined_in(f: &Function, blocks: &[BlockId]) -> FxHashSet<u32> {
     s
 }
 
+/// The pointer an access base denotes: the outer pointer itself, or the value of the in-loop
+/// reload (whose provenance the alias analysis knows: a `@noalias` slice's elements).
+fn base_ptr(base: MemBase) -> ValueId {
+    match base {
+        MemBase::Outer(v) => v,
+        MemBase::ReloadedOuter { value, .. } => value,
+    }
+}
+
+/// When `ba` and `bb` are two different values pointing into one object -- `t` and `gep t, 2`,
+/// both known to the alias analysis with constant byte offsets -- how many `elem`s `bb` lies past
+/// `ba`. `None` when that is not known or not a whole number of elements.
+fn element_shift(alias: &AliasInfo, ba: MemBase, bb: MemBase, elem: &MirType) -> Option<i64> {
+    let (pa, oa) = alias.base_and_offset(base_ptr(ba))?;
+    let (pb, ob) = alias.base_and_offset(base_ptr(bb))?;
+    if pa != pb || pa == Prov::Unknown {
+        return None;
+    }
+    let size = i64::from(type_bytes(elem)?);
+    let diff = ob.checked_sub(oa)?;
+    (size > 0 && diff % size == 0).then(|| diff / size)
+}
+
+/// Are two accesses' objects provably disjoint? A `false` from [`AliasInfo::may_alias`] on two
+/// base pointers is a statement about the objects, at every offset. A reloaded base must also be
+/// *stable*: nothing either loop stores may write the slot it is reloaded from, or fusion could
+/// interleave such a store with reloads that used to run after it.
+fn disjoint(alias: &AliasInfo, ba: MemBase, bb: MemBase, stores: &[(ValueId, u32)]) -> bool {
+    if alias.may_alias(base_ptr(ba), base_ptr(bb)) {
+        return false;
+    }
+    [ba, bb].iter().all(|b| match b {
+        MemBase::Outer(_) => true,
+        MemBase::ReloadedOuter { addr, .. } => stores
+            .iter()
+            .all(|&(p, bytes)| !alias.may_alias_sized(p, bytes, *addr, 8)),
+    })
+}
+
+/// Same-object affine accesses `a` (first loop, iteration `i`) and `b` (second loop, iteration
+/// `j`), `b`'s index shifted by `shift` elements into `a`'s frame: may fusion reorder them?
+///
+/// With the identical stride `c` and invariant part, they touch one element exactly when
+/// `c·i + ka = c·j + kb`, i.e. `j - i = (ka - kb) / c`. The fused loop runs `a`'s iteration `i`
+/// before `b`'s iteration `j` exactly when `i <= j` (within one iteration the first body still runs
+/// first), so the pair keeps its order -- `a` before `b`, as in the unfused program -- when that
+/// distance is `>= 0`, and touches no common element when `c` does not divide `ka - kb`. Reading
+/// the store `d` iterations back (`t[j - d]` after `t[i]`) is distance `d`; reading ahead
+/// (`t[j + d]`) is `-d` and must stay unfused. A nonzero distance needs element-sized accesses (so
+/// two of them never partially overlap); distance 0 is the same element at the same iteration.
+fn ordered(
+    ia: &AffineExpr,
+    ib: &AffineExpr,
+    shift: i64,
+    a: &MemAccess,
+    b: &MemAccess,
+    elem: &MirType,
+) -> bool {
+    if ia.coeff != ib.coeff || ia.terms != ib.terms || a.value_ty != b.value_ty {
+        return false;
+    }
+    let Coeff::Const(c) = ia.coeff else {
+        return false;
+    };
+    if c == 0 {
+        return false;
+    }
+    let Some(delta) = ib
+        .konst
+        .checked_add(shift)
+        .and_then(|kb| ia.konst.checked_sub(kb))
+    else {
+        return false;
+    };
+    if delta == 0 {
+        return true;
+    }
+    if type_bytes(&a.value_ty) != type_bytes(elem) {
+        return false;
+    }
+    delta % c != 0 || delta / c > 0
+}
+
 /// Can the accesses `a` (first loop) and `b` (second loop), at least one a store, be reordered as
-/// fusion reorders them (see the module docs)?
-fn pair_ok(alias: &AliasInfo, a: &MemAccess, b: &MemAccess) -> bool {
+/// fusion reorders them (see the module docs)? `stores` lists every store of both loops (pointer,
+/// width), for the stability of reloaded bases.
+fn pair_ok(alias: &AliasInfo, a: &MemAccess, b: &MemAccess, stores: &[(ValueId, u32)]) -> bool {
     match (&a.addr, &b.addr) {
         (AddrForm::Unknown, _) | (_, AddrForm::Unknown) => false,
         (
@@ -268,23 +364,29 @@ fn pair_ok(alias: &AliasInfo, a: &MemAccess, b: &MemAccess) -> bool {
                 index: ib,
                 elem: eb,
             },
-        ) if ba.same_object(*bb) => {
-            ia == ib
-                && ea == eb
-                && a.value_ty == b.value_ty
-                && matches!(ia.coeff, Coeff::Const(c) if c != 0)
+        ) => {
+            // One object -- the same base, or two bases at a known element distance -- compares
+            // indices; two objects must be proved apart.
+            let shift = if ba.same_object(*bb) {
+                Some(0)
+            } else if ea == eb {
+                element_shift(alias, *ba, *bb, ea)
+            } else {
+                None
+            };
+            match shift {
+                Some(sh) if ea == eb => ordered(ia, ib, sh, a, b, ea),
+                _ => disjoint(alias, *ba, *bb, stores),
+            }
         }
         _ => {
             let (Some(ba), Some(bb)) = (a.addr.base(), b.addr.base()) else {
                 return false;
             };
             if ba.same_object(bb) {
-                return false; // one object, but not the identical moving index
+                return false; // one object, but not a moving index on both sides
             }
-            match (ba, bb) {
-                (MemBase::Outer(p), MemBase::Outer(q)) => !alias.may_alias(p, q),
-                _ => false,
-            }
+            disjoint(alias, ba, bb, stores)
         }
     }
 }
@@ -305,13 +407,11 @@ fn find_pair(f: &Function, forest: &mut LoopForest, preds: &[Vec<u32>]) -> Optio
         if i2 == i1 || !shape_ok(f, &forest.loops[i2]) {
             continue;
         }
-        // The second preheader is reached only by the first loop's exit, carries no state, and
-        // computes nothing that could not run before the first loop.
+        // The second preheader is reached only by the first loop's exit and computes nothing
+        // that could not run before the first loop. Its parameters, if any, are the first loop's
+        // live-outs (`plan_pair` checks that only the code after the second loop reads them).
         let p2 = f.block(ph2);
-        if preds[ph2.0 as usize] != [h1.0]
-            || !p2.params.is_empty()
-            || !p2.insts.iter().all(|i| movable(&i.op))
-        {
+        if preds[ph2.0 as usize] != [h1.0] || !p2.insts.iter().all(|i| movable(&i.op)) {
             continue;
         }
         loop_info::analyze_one(f, forest, i1, Stages::Memory);
@@ -367,25 +467,36 @@ fn plan_pair(
     }
     // Nothing the first loop defines is read before it finishes in the original: not by the
     // second preheader, not by the second loop.
+    // The second preheader's parameters are the first loop's live-outs, passed by its exit edge:
+    // equally unfinished until the first loop is done.
+    let live_outs = &f.block(ph2).params;
+    let first = |v: ValueId| defined1.contains(&v.0) || live_outs.contains(&v);
     let mut reads_first = false;
     for b in std::iter::once(&ph2).chain(&l2.blocks) {
         let blk = f.block(*b);
         for inst in &blk.insts {
-            each_op_use(&inst.op, &mut |v| reads_first |= defined1.contains(&v.0));
+            each_op_use(&inst.op, &mut |v| reads_first |= first(v));
         }
-        each_term_use(&blk.term, &mut |v| reads_first |= defined1.contains(&v.0));
+        each_term_use(&blk.term, &mut |v| reads_first |= first(v));
     }
     if reads_first {
         return None;
     }
     // Memory.
     let alias = AliasInfo::analyze(f);
+    let stores: Vec<(ValueId, u32)> = l1
+        .accesses
+        .iter()
+        .chain(&l2.accesses)
+        .filter(|x| x.kind == AccessKind::Store)
+        .map(|x| (x.ptr, type_bytes(&x.value_ty).unwrap_or(u32::MAX)))
+        .collect();
     for a in &l1.accesses {
         for b in &l2.accesses {
             if a.kind == AccessKind::Load && b.kind == AccessKind::Load {
                 continue;
             }
-            if !pair_ok(&alias, a, b) {
+            if !pair_ok(&alias, a, b, &stores) {
                 return None;
             }
         }
@@ -402,10 +513,13 @@ fn plan_pair(
         return None;
     }
     if w1 {
+        // A loop-invariant access -- a slice's data pointer reloaded from its header -- is hoisted
+        // or splatted, never widened, so it does not take part in the width.
         let mut widths = l1
             .accesses
             .iter()
             .chain(&l2.accesses)
+            .filter(|a| !matches!(a.addr, AddrForm::Invariant(_)))
             .map(|a| type_bytes(&a.value_ty));
         let first = widths.next().flatten();
         if first.is_none() || !widths.all(|w| w == first) {
@@ -467,6 +581,15 @@ fn apply(f: &mut Function, p: Plan) {
         _ => unreachable!("a preheader ends in an unconditional branch"),
     }
 
+    // The first loop's live-outs, which its exit edge passed to the second preheader's parameters,
+    // are read after the fused loop straight from what that edge passed: values of the fused
+    // header (or from before it), which hold the first loop's final state when the loop exits.
+    if let Terminator::CondBr { else_args, .. } = &f.blocks[p.h1].term {
+        for (q, a) in f.blocks[p.ph2].params.iter().zip(else_args) {
+            map.insert(q.0, *a);
+        }
+    }
+
     // The fused loop leaves where the second one did, with the second one's exit arguments.
     let Terminator::CondBr {
         else_blk: x2,
@@ -508,7 +631,8 @@ fn apply(f: &mut Function, p: Plan) {
         args: back,
     };
 
-    // Every read of the second header's parameters now reads the fused header's.
+    // Every read of the second header's parameters now reads the fused header's, and every read of
+    // a live-out the second preheader received reads what the first loop's exit passed for it.
     let rename = |v: ValueId| map.get(&v.0).copied().unwrap_or(v);
     for b in &mut f.blocks {
         for inst in &mut b.insts {
@@ -781,5 +905,424 @@ mod tests {
             Op::Cast(CastKind::FpToSi, v, MirType::I32),
         ];
         assert!(!effectful.iter().any(movable));
+    }
+
+    // ---- distances, live-outs and parameter bases ----
+
+    /// How a [`two_loops`] function reaches its two buffers.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Bufs {
+        /// Two local stack buffers.
+        Local,
+        /// Two pointer parameters, the first `@noalias` or not.
+        Params { noalias: bool },
+        /// One local buffer, read through a second base `gep t, 2` (a different SSA value for the
+        /// same object, two elements in).
+        Offset,
+    }
+
+    /// The shape of a [`two_loops`] function.
+    #[derive(Clone, Copy, Debug)]
+    struct Two {
+        start: i128,
+        /// The first loop stores `t[stride * i + store_off]`.
+        stride: i128,
+        store_off: i128,
+        /// The second loop loads `t[stride * j + load_off]` (through the `Offset` base when asked).
+        load_off: i128,
+        /// The first loop also counts `acc += i`, read after the second loop.
+        live_out: LiveOut,
+        bufs: Bufs,
+    }
+
+    /// How the first loop's count `acc` reaches the code after the second loop.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum LiveOut {
+        /// There is no count.
+        No,
+        /// Read straight from the first header's parameter.
+        Direct,
+        /// Passed by the first loop's exit edge to a parameter of the second preheader.
+        ThroughPreheader,
+    }
+
+    const BUF: u32 = 48;
+
+    /// `f(n[, t, o])`: two loops over `start..n`.
+    ///
+    /// ```text
+    ///   L1: for i: t[stride*i + store_off] = 3*i + 1;    (acc += i when live_out)
+    ///   L2: for j: h = h * 31 + (t[stride*j + load_off] + j);  o[j] = h
+    ///   ret h + 1000 * acc
+    /// ```
+    ///
+    /// `t` starts as `100 + k` in every slot, so a load that runs before the store it should see
+    /// returns a different value, and the order-dependent hash `h` exposes any such change.
+    fn two_loops(it: &mut Interner, s: Two) -> Function {
+        let mut b = Builder::new(it.intern("f"), MirType::I32);
+        let n = b.add_param(MirType::I32);
+        let (t, o) = match s.bufs {
+            Bufs::Params { noalias } => {
+                let t = b.add_param(MirType::Ptr);
+                let o = b.add_param(MirType::Ptr);
+                b.set_param_attrs(
+                    t,
+                    wukong_mir::ParamAttrs {
+                        noalias,
+                        slice: false,
+                    },
+                );
+                (t, o)
+            }
+            Bufs::Local | Bufs::Offset => (
+                b.alloca(MirType::Array(Box::new(MirType::I32), BUF)),
+                b.alloca(MirType::Array(Box::new(MirType::I32), BUF)),
+            ),
+        };
+        let konst = |b: &mut Builder, c: i128| b.build(MirType::I32, Op::ConstInt(c, MirType::I32));
+        if !matches!(s.bufs, Bufs::Params { .. }) {
+            for k in 0..BUF as i128 {
+                let idx = konst(&mut b, k);
+                let p = b.build(
+                    MirType::Ptr,
+                    Op::Gep {
+                        ptr: t,
+                        index: idx,
+                        elem: MirType::I32,
+                    },
+                );
+                let v = konst(&mut b, 100 + k);
+                b.build_void(Op::Store { ptr: p, value: v });
+            }
+        }
+        // The second loop's base: `t` itself, or `t + 2` elements for `Offset`.
+        let t2 = if s.bufs == Bufs::Offset {
+            let two = konst(&mut b, 2);
+            b.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: t,
+                    index: two,
+                    elem: MirType::I32,
+                },
+            )
+        } else {
+            t
+        };
+        let start = konst(&mut b, s.start);
+        let zero = konst(&mut b, 0);
+        let h1 = b.new_block();
+        let i = b.block_param(h1, MirType::I32);
+        let acc = b.block_param(h1, MirType::I32);
+        let l1 = b.new_block();
+        let p2 = b.new_block();
+        let carried = b.block_param(p2, MirType::I32);
+        let h2 = b.new_block();
+        let j = b.block_param(h2, MirType::I32);
+        let h = b.block_param(h2, MirType::I32);
+        let l2 = b.new_block();
+        let x = b.new_block();
+        let r = b.block_param(x, MirType::I32);
+        b.br(h1, vec![start, zero]);
+
+        b.switch_to(h1);
+        let c1 = b.build(MirType::I1, Op::Cmp(CmpOp::Slt, i, n));
+        b.cond_br(c1, l1, vec![], p2, vec![acc]);
+        b.switch_to(l1);
+        let stride = konst(&mut b, s.stride);
+        let si = b.build(MirType::I32, Op::Bin(BinOp::Mul, i, stride));
+        let soff = konst(&mut b, s.store_off);
+        let sidx = b.build(MirType::I32, Op::Bin(BinOp::Add, si, soff));
+        let pt = b.build(
+            MirType::Ptr,
+            Op::Gep {
+                ptr: t,
+                index: sidx,
+                elem: MirType::I32,
+            },
+        );
+        let three = konst(&mut b, 3);
+        let i3 = b.build(MirType::I32, Op::Bin(BinOp::Mul, i, three));
+        let one = konst(&mut b, 1);
+        let val = b.build(MirType::I32, Op::Bin(BinOp::Add, i3, one));
+        b.build_void(Op::Store {
+            ptr: pt,
+            value: val,
+        });
+        let acc2 = if s.live_out != LiveOut::No {
+            b.build(MirType::I32, Op::Bin(BinOp::Add, acc, i))
+        } else {
+            acc
+        };
+        let i2 = b.build(MirType::I32, Op::Bin(BinOp::Add, i, one));
+        b.br(h1, vec![i2, acc2]);
+
+        b.switch_to(p2);
+        let start2 = konst(&mut b, s.start);
+        let zero2 = konst(&mut b, 0);
+        b.br(h2, vec![start2, zero2]);
+        b.switch_to(h2);
+        let c2 = b.build(MirType::I1, Op::Cmp(CmpOp::Slt, j, n));
+        b.cond_br(c2, l2, vec![], x, vec![h]);
+        b.switch_to(l2);
+        let stride2 = konst(&mut b, s.stride);
+        let sj = b.build(MirType::I32, Op::Bin(BinOp::Mul, j, stride2));
+        let loff = konst(&mut b, s.load_off);
+        let lidx = b.build(MirType::I32, Op::Bin(BinOp::Add, sj, loff));
+        let qt = b.build(
+            MirType::Ptr,
+            Op::Gep {
+                ptr: t2,
+                index: lidx,
+                elem: MirType::I32,
+            },
+        );
+        let w = b.build(MirType::I32, Op::Load(qt, MirType::I32));
+        let wj = b.build(MirType::I32, Op::Bin(BinOp::Add, w, j));
+        let k31 = konst(&mut b, 31);
+        let h31 = b.build(MirType::I32, Op::Bin(BinOp::Mul, h, k31));
+        let hn = b.build(MirType::I32, Op::Bin(BinOp::Add, h31, wj));
+        let qo = b.build(
+            MirType::Ptr,
+            Op::Gep {
+                ptr: o,
+                index: j,
+                elem: MirType::I32,
+            },
+        );
+        b.build_void(Op::Store { ptr: qo, value: hn });
+        let one2 = konst(&mut b, 1);
+        let j2 = b.build(MirType::I32, Op::Bin(BinOp::Add, j, one2));
+        b.br(h2, vec![j2, hn]);
+        b.switch_to(x);
+        let thousand = konst(&mut b, 1000);
+        let count = if s.live_out == LiveOut::ThroughPreheader {
+            carried
+        } else {
+            acc
+        };
+        let a1000 = b.build(MirType::I32, Op::Bin(BinOp::Mul, count, thousand));
+        let out = b.build(MirType::I32, Op::Bin(BinOp::Add, r, a1000));
+        b.ret(Some(out));
+        b.finish()
+    }
+
+    /// Run `f(n[, t, o])` for each `n`, with fresh 48-element buffers `t[k] = 100 + k` per call
+    /// when `f` takes them; `alias` passes the same buffer twice.
+    fn run_two(f: &Function, it: &mut Interner, ns: &[i128], params: bool, alias: bool) -> Vec<u8> {
+        let mut m = Builder::new(it.intern("main"), MirType::I32);
+        for &n in ns {
+            let nv = m.build(MirType::I32, Op::ConstInt(n, MirType::I32));
+            let mut args = vec![nv];
+            if params {
+                let t = m.alloca(MirType::Array(Box::new(MirType::I32), BUF));
+                let o = m.alloca(MirType::Array(Box::new(MirType::I32), BUF));
+                for k in 0..BUF as i128 {
+                    let idx = m.build(MirType::I32, Op::ConstInt(k, MirType::I32));
+                    for (buf, base) in [(t, 100), (o, 500)] {
+                        let p = m.build(
+                            MirType::Ptr,
+                            Op::Gep {
+                                ptr: buf,
+                                index: idx,
+                                elem: MirType::I32,
+                            },
+                        );
+                        let v = m.build(MirType::I32, Op::ConstInt(base + k, MirType::I32));
+                        m.build_void(Op::Store { ptr: p, value: v });
+                    }
+                }
+                args.push(t);
+                args.push(if alias { t } else { o });
+            }
+            let r = m.build(MirType::I32, Op::Call { func: f.name, args });
+            m.build_void(Op::Call {
+                func: it.intern("print"),
+                args: vec![r],
+            });
+        }
+        let z = m.build(MirType::I32, Op::ConstInt(0, MirType::I32));
+        m.ret(Some(z));
+        let mut p = Program::new();
+        p.funcs = vec![f.clone(), m.finish()];
+        let errs = wukong_mir::verify::verify_program(&p);
+        assert!(errs.is_empty(), "{errs:?}");
+        let main = it.intern("main");
+        let (code, out) = wukong_interp::run_with_output(&p, main, it).unwrap();
+        assert_eq!(code, 0);
+        out
+    }
+
+    /// Fuse `f` if the pass will, check the MIR, and compare every answer with the unfused run.
+    fn fuse_and_compare(s: Two, ns: &[i128]) -> bool {
+        let mut it = Interner::new();
+        let mut f = two_loops(&mut it, s);
+        let params = matches!(s.bufs, Bufs::Params { .. });
+        let before = run_two(&f, &mut it, ns, params, false);
+        assert_eq!(loop_count(&f), 2);
+        let fused = LoopFuse.run_function(&mut f, &mut CfgAnalyses::default());
+        assert!(wukong_mir::verify::verify_function(&f).is_empty(), "{s:?}");
+        assert_eq!(
+            loop_count(&f),
+            if fused { 1 } else { 2 },
+            "{s:?}\n{}",
+            wukong_mir::print::print_function(&f, &it)
+        );
+        assert_eq!(run_two(&f, &mut it, ns, params, false), before, "{s:?}");
+        fused
+    }
+
+    const NS: [i128; 6] = [0, 1, 2, 5, 9, 16];
+
+    fn local(start: i128, stride: i128, store_off: i128, load_off: i128) -> Two {
+        Two {
+            start,
+            stride,
+            store_off,
+            load_off,
+            live_out: LiveOut::No,
+            bufs: Bufs::Local,
+        }
+    }
+
+    /// The second loop reads what the first wrote `d` iterations *earlier* (`t[j - d]` after
+    /// `t[i]`): in the fused loop that store has already run, so they fuse for every `d > 0`, at
+    /// unit and non-unit strides. Reading `d` iterations *later* (`t[j + d]`) must not fuse.
+    #[test]
+    fn a_read_behind_the_writer_fuses_at_any_distance() {
+        for d in [1, 2, 5] {
+            assert!(fuse_and_compare(local(5, 1, 0, -d), &NS), "t[j - {d}]");
+            assert!(
+                fuse_and_compare(local(5, 1, 0, 0), &NS),
+                "distance 0 still fuses"
+            );
+            assert!(!fuse_and_compare(local(0, 1, 0, d), &NS), "t[j + {d}]");
+        }
+        // Stride 2: `t[2j - 2]` is the element written one iteration earlier; `t[2j + 1]` is never
+        // an element the first loop writes; `t[2j + 2]` is written one iteration later.
+        assert!(fuse_and_compare(local(1, 2, 0, -2), &NS));
+        assert!(fuse_and_compare(local(0, 2, 0, 1), &NS));
+        assert!(!fuse_and_compare(local(0, 2, 0, 2), &NS));
+    }
+
+    /// A value the first loop carries out, read after the second loop -- straight from the first
+    /// header, or through a parameter of the second preheader that the first loop's exit edge
+    /// fills -- reads the first loop's final value from the fused header.
+    #[test]
+    fn a_live_out_of_the_first_loop_read_after_the_second_fuses() {
+        for live_out in [LiveOut::Direct, LiveOut::ThroughPreheader] {
+            let s = Two {
+                live_out,
+                ..local(0, 1, 0, 0)
+            };
+            assert!(fuse_and_compare(s, &NS), "{live_out:?}");
+        }
+    }
+
+    /// Two different bases of one object two elements apart (`t` and `t + 2`): reading
+    /// `(t + 2)[j - 3]` is `t[j - 1]`, one iteration behind the writer, and fuses; `(t + 2)[j]` is
+    /// `t[j + 2]`, ahead of it, and must not.
+    #[test]
+    fn two_bases_of_one_object_are_compared_at_their_offset() {
+        let base = |load_off| Two {
+            bufs: Bufs::Offset,
+            ..local(3, 1, 0, load_off)
+        };
+        assert!(fuse_and_compare(base(-3), &NS));
+        assert!(!fuse_and_compare(base(0), &NS));
+    }
+
+    /// Pointer parameters fuse when one is `@noalias` (the alias analysis proves the buffers
+    /// disjoint) and not otherwise: the caller may pass the same buffer twice. With the promise
+    /// broken by such a call, the unfused function is what defines the answer.
+    #[test]
+    fn parameter_bases_fuse_only_when_proved_disjoint() {
+        let s = |noalias| Two {
+            bufs: Bufs::Params { noalias },
+            ..local(0, 1, 0, 0)
+        };
+        assert!(fuse_and_compare(s(true), &NS));
+        assert!(!fuse_and_compare(s(false), &NS));
+        // Without the promise an aliasing call is legal, and the unfused loops agree with it.
+        let mut it = Interner::new();
+        let f = two_loops(&mut it, s(false));
+        let before = run_two(&f, &mut it, &NS, true, true);
+        let mut g = f.clone();
+        assert!(!LoopFuse.run_function(&mut g, &mut CfgAnalyses::default()));
+        assert_eq!(run_two(&g, &mut it, &NS, true, true), before);
+    }
+
+    /// From source, the shapes of the `opt4_fuse_*` fixtures reach the pass as two adjacent
+    /// canonical loops, and it fuses exactly the legal ones: a read one iteration behind the writer
+    /// (unit stride and stride 2), a first-loop live-out read after the second loop, and `@noalias`
+    /// slices (whose data pointers are reloaded in the loop); not a read ahead of the writer, and
+    /// not slices without the promise, which the caller may alias. (The array parameters written
+    /// here are `@noalias` too: unpromised, the caller could pass one array twice. The fixtures
+    /// call them on distinct local arrays, which inlining turns into distinct stack slots.)
+    #[test]
+    fn source_shapes_fuse_exactly_when_legal() {
+        let src = concat!(
+            "fn dist1(a: [i32; 32], @noalias mut t: [i32; 64], @noalias mut o: [i32; 32], n: i32) { ",
+            "for i in 1..n { t[i] = a[i] / 3 + 7; } ",
+            "for j in 1..n { o[j] = t[j - 1] / 2 - t[j]; } }\n",
+            "fn stride2(a: [i32; 32], @noalias mut t: [i32; 64], @noalias mut o: [i32; 32], n: i32) { ",
+            "for i in 1..n { t[i * 2] = a[i] / 3; } ",
+            "for j in 1..n { o[j] = t[j * 2 - 2] / 2 + j; } }\n",
+            "fn ahead(a: [i32; 32], @noalias mut t: [i32; 64], @noalias mut o: [i32; 32], n: i32) { ",
+            "for i in 0..n { t[i] = a[i] / 5; } ",
+            "for j in 0..n { o[j] = t[j + 1] / 2; } }\n",
+            "fn sum_scale(a: [i32; 16], @noalias mut b: [i32; 16], n: i32) -> i32 { let mut s = 0; ",
+            "for i in 0..n { s = s + a[i] * a[i] - i; } ",
+            "for j in 0..n { b[j] = a[j] / 3 + j; } return s; }\n",
+            "@unchecked\nfn slices(@noalias mut tmp: []i32, @noalias mut out: []i32, src: []i32, ",
+            "n: i64) { for i in 0..n { tmp[i] = src[i] / 2 - (i as i32); } ",
+            "for j in 0..n { out[j] = tmp[j] / 3 + src[j]; } }\n",
+            "@unchecked\nfn aliased(mut tmp: []i32, mut out: []i32, src: []i32, n: i64) { ",
+            "for i in 0..n { tmp[i] = src[i] / 2 - (i as i32); } ",
+            "for j in 0..n { out[j] = tmp[j] / 3 + src[j]; } }\n",
+            "fn main() -> i32 { return 0; }\n",
+        );
+        let mut interner = Interner::new();
+        let (module, parse) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(parse.iter().all(|d| !d.is_error()), "{parse:?}");
+        let (sema, check) = wukong_sema::check(&module, &interner);
+        assert!(check.iter().all(|d| !d.is_error()), "{check:?}");
+        let (mut program, lower) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        assert!(lower.iter().all(|d| !d.is_error()), "{lower:?}");
+        // What the -O2 fixpoint has done by the time it reaches `fuse`.
+        let mut pm = crate::PassManager::new();
+        pm.add(Box::new(crate::Mem2Reg));
+        pm.add(Box::new(crate::Simplify));
+        pm.add(Box::new(SimplifyCfg));
+        pm.add(Box::new(crate::SimplifyPhis));
+        pm.add(Box::new(Dce));
+        pm.add(Box::new(crate::Cse));
+        pm.add(Box::new(crate::LoopCanon));
+        pm.run(&mut program);
+        for (name, legal) in [
+            ("dist1", true),
+            ("stride2", true),
+            ("ahead", false),
+            ("sum_scale", true),
+            ("slices", true),
+            ("aliased", false),
+        ] {
+            let sym = interner.intern(name);
+            let f = program
+                .funcs
+                .iter_mut()
+                .find(|f| f.name == sym)
+                .expect("defined above");
+            assert_eq!(loop_count(f), 2, "{name}");
+            let fused = LoopFuse.run_function(f, &mut CfgAnalyses::default());
+            assert_eq!(
+                fused,
+                legal,
+                "{name}\n{}",
+                wukong_mir::print::print_function(f, &interner)
+            );
+            assert!(wukong_mir::verify::verify_function(f).is_empty(), "{name}");
+            assert_eq!(loop_count(f), if legal { 1 } else { 2 }, "{name}");
+        }
     }
 }
