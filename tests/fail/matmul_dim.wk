@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0502
+// EXPECT-COUNT: 1
 module tests.fail.matmul_dim
 
 /// The shared inner dimension K disagrees (512 vs 513): a compile-time shape error, not a runtime
@@ -8,6 +9,6 @@ fn matmul<M, N, K>(a: Tensor[f32, M, K], b: Tensor[f32, K, N]) {}
 fn main() -> i32 {
     let a: Tensor[f32, 512, 512];
     let b: Tensor[f32, 513, 512];
-    matmul(a, b);
+    matmul(a, b); //~ E0502
     return 0;
 }

@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0105
+// EXPECT-COUNT: 1
 module tests.fail.confusable_minus
 
 /// A minus sign pasted from a paper (U+2212 MINUS SIGN) looks like `-` but is not ASCII. The
@@ -7,5 +8,5 @@ module tests.fail.confusable_minus
 fn main() -> i32 {
     let a: i32 = 5;
     let b: i32 = 3;
-    return a − b;
+    return a − b; //~ E0105
 }

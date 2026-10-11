@@ -1,11 +1,12 @@
 // EXPECT-CODE: E0306
+// EXPECT-COUNT: 1
 module tests.fail.parallel_bad_grain
 
 // `@parallel`'s argument list used to be parsed and discarded, so a misspelled or invented key —
 // here `chunk` where the language spells it `grain` — compiled with no diagnostic while its author
 // believed the schedule was set. `@parallel` takes nothing or exactly `grain = <positive integer>`
 // (consumed: each worker claims runs of at least that many iterations); anything else is E0306.
-@parallel(chunk = 4)
+@parallel(chunk = 4) //~ E0306
 fn scale(x: [f32; 4], mut out: [f32; 4]) {
     for i in 0..4 {
         out[i] = x[i] * 2.0;

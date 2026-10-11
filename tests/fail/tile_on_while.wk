@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0306
+// EXPECT-COUNT: 1
 module tests.fail.tile_on_while
 
 // `@tile` is read off a function item (into a width queue) or off the `for` statement it sits on,
@@ -14,7 +15,7 @@ module tests.fail.tile_on_while
 @generic
 fn f(mut out: [i32; 8]) {
     let mut k: i32 = 0;
-    @tile(2)
+    @tile(2) //~ E0306
     while k < 8 {
         out[k] = k;
         k = k + 1;

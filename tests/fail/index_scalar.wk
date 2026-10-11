@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0433
+// EXPECT-COUNT: 1
 module tests.fail.index_scalar
 
 // Indexing a scalar with `[..]` is a type error. It used to type-check through a lenient fallthrough,
@@ -7,6 +8,6 @@ module tests.fail.index_scalar
 // slices, and pointers are indexable.
 fn main() -> i32 {
     let x: i32 = 5;
-    let y: i32 = x[0];
+    let y: i32 = x[0]; //~ E0433
     return y;
 }

@@ -2,9 +2,10 @@
 // file system (Windows, macOS) and was E0305 on Linux, so the program compiled on one host and not
 // another. Resolution is now case-exact everywhere and names the on-disk spelling (E0330).
 // EXPECT-CODE: E0330
+// EXPECT-COUNT: 1
 module import_case_mismatch
 
-import lib.PrivLib;
+import lib.PrivLib; //~ E0330
 
 fn main() -> i32 {
     return 0;

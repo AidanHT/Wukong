@@ -2,10 +2,11 @@
 // Wukong fat pointer — is refused at the declaration (C0001), instead of being called with a
 // layout the C side cannot read. Pass a pointer (`*f32`) and a length instead.
 // EXPECT-CODE: C0001
+// EXPECT-COUNT: 1
 module extern_non_c_abi
 
 extern "C" {
-    fn consume(xs: []f32) -> i32;
+    fn consume(xs: []f32) -> i32; //~ C0001
 }
 
 fn main() -> i32 {

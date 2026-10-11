@@ -1,11 +1,12 @@
 // EXPECT-CODE: E0433
+// EXPECT-COUNT: 1
 module tests.fail.generic_instantiation_transitive
 
 // The bad operation is two generic calls deep: `outer` is instantiated at `T = (i32, i32)` by
 // `main`, and its body instantiates `neg` at the same tuple type. Unary `-` is not defined on a
 // tuple, and only the re-check of `neg`'s instance (reached through `outer`'s) can see it.
 fn neg<U>(x: U) -> U {
-    return -x;
+    return -x; //~ E0433
 }
 
 fn outer<T>(x: T) -> T {

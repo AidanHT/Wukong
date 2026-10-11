@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0411
+// EXPECT-COUNT: 1
 module tests.fail.fn_value_binding
 
 // A function may be passed to a parameter of function type — the callee is then specialized for
@@ -11,7 +12,7 @@ fn square(x: f32) -> f32 {
 }
 
 fn main() -> i32 {
-    let g = square;
+    let g = square; //~ E0411
     print(g(3.0));
     return 0;
 }

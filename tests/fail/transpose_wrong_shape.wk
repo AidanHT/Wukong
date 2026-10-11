@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0502
+// EXPECT-COUNT: 2
 module tests.fail.transpose_wrong_shape
 
 /// The safety mutant for `tests/compare/tiled_transpose/` (master plan §7.1, T4): the output buffer
@@ -20,6 +21,6 @@ fn transpose<M, N>(a: Tensor[f32, M, N], b: Tensor[f32, N, M]) {}
 fn main() -> i32 {
     let a: Tensor[f32, 8, 4];
     let b: Tensor[f32, 8, 4];
-    transpose::<8, 4>(a, b);
+    transpose::<8, 4>(a, b); //~ E0502 E0502
     return 0;
 }

@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0309
+// EXPECT-COUNT: 1
 module tests.fail.tile_on_recognized_kernel
 
 // A whole-function recognizer interception replaces the nest with one `wukong_sgemm` call and builds
@@ -8,7 +9,7 @@ module tests.fail.tile_on_recognized_kernel
 // kernel brings its own blocking anyway — so say so, and name the escape hatch.
 
 @tile(64)
-fn mm(a: [f32; 64], b: [f32; 64], mut c: [f32; 64]) {
+fn mm(a: [f32; 64], b: [f32; 64], mut c: [f32; 64]) { //~ E0309
     for i in 0..8 {
         for j in 0..8 {
             let mut s: f32 = 0.0;

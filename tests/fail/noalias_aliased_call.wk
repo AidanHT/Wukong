@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0316
+// EXPECT-COUNT: 1
 module tests.fail.noalias_aliased_call
 
 // `@noalias` on `out` promises that nothing else the call can reach overlaps it, and the optimizer
@@ -14,6 +15,6 @@ fn scale(@noalias mut out: [f32; 4], x: [f32; 4]) {
 
 fn main() -> i32 {
     let mut a: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
-    scale(a, a);
+    scale(a, a); //~ E0316
     return 0;
 }

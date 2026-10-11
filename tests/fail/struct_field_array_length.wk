@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0401
+// EXPECT-COUNT: 1
 module tests.fail.struct_field_array_length
 
 // A struct array field's initializer must match the declared length. `Buf { data: [11, 22] }` for
@@ -7,6 +8,6 @@ module tests.fail.struct_field_array_length
 // and tuple initializers, struct fields were not length-checked. Must be E0401.
 struct Buf { data: [i32; 4] }
 fn main() -> i32 {
-    let b: Buf = Buf { data: [11, 22] };
+    let b: Buf = Buf { data: [11, 22] }; //~ E0401
     return b.data[0];
 }

@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0405
+// EXPECT-COUNT: 1
 module tests.fail.enum_payload_nonexhaustive
 
 // A payload `match` is still exhaustiveness-checked: a variant pattern covers its variant, so a match
@@ -9,7 +10,7 @@ enum Op { Add(i32, i32), Neg(i32), Nop }
 
 fn main() -> i32 {
     let a = Op::Nop;
-    let r = match a {
+    let r = match a { //~ E0405
         Op::Add(x, y) => x + y,
         Op::Neg(n) => n,
     };

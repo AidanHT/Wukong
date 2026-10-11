@@ -1,9 +1,10 @@
 // EXPECT-CODE: E0524
+// EXPECT-COUNT: 1
 module tests.fail.where_predicate_not_dim
 
 // A `where` predicate is evaluated at compile time, so it may name only literals, the function's
 // generic dimensions and `const`s: a call on a parameter's value is not one.
-fn first<N>(a: Tensor[f32, N]) -> f32 where N > a.len() {
+fn first<N>(a: Tensor[f32, N]) -> f32 where N > a.len() { //~ E0524
     return a[0];
 }
 

@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0431
+// EXPECT-COUNT: 1
 module tests.fail.binary_const_overflow
 
 // A constant binary expression that adapts to a narrow type still range-checks its FOLDED value:
@@ -6,6 +7,6 @@ module tests.fail.binary_const_overflow
 // silently wrapping to -56. (Before binary-const adaptation this was already an i32-vs-i8 mismatch;
 // now it is the more precise out-of-range diagnostic, E0431.)
 fn main() -> i32 {
-    let v: i8 = 100 + 100;
+    let v: i8 = 100 + 100; //~ E0431
     return v as i32;
 }

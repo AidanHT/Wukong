@@ -1,11 +1,12 @@
 // A deferred expression runs while its block is being left, so it cannot itself leave: a
 // `return` (or a `break`/`continue` aimed at a loop outside it) inside a `defer` is E0314.
 // EXPECT-CODE: E0314
+// EXPECT-COUNT: 1
 module defer_escape
 
 fn main() -> i32 {
     defer {
-        return 1;
+        return 1; //~ E0314
     };
     return 0;
 }

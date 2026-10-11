@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0437
+// EXPECT-COUNT: 1
 module tests.fail.st_read_name_not_string
 
 // `st_read_<T>(path, name, buf)` looks a tensor up by name, so its second argument must be a `*u8`
@@ -6,6 +7,6 @@ module tests.fail.st_read_name_not_string
 // address.
 fn main() -> i32 {
     let mut w: [f32; 4] = [0.0; 4];
-    let n: i64 = st_read_f32("io_test_st.bin", 7, w);
+    let n: i64 = st_read_f32("io_test_st.bin", 7, w); //~ E0437
     return 0;
 }

@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0503
+// EXPECT-COUNT: 1
 module tests.fail.assert_arity
 
 // `assert(cond)` takes exactly one argument. With no argument it used to fall through to a malformed
@@ -6,6 +7,6 @@ module tests.fail.assert_arity
 // native backend treated it as a no-op (exit 0) — a silent backend divergence. The arity is now
 // pinned, failing compilation before either backend runs.
 fn main() -> i32 {
-    assert();
+    assert(); //~ E0503
     return 0;
 }

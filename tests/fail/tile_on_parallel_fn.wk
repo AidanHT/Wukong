@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0309
+// EXPECT-COUNT: 1
 module tests.fail.tile_on_parallel_fn
 
 // The whole-function `@parallel` outliner builds BOTH halves — the outlined body and the wrapper —
@@ -14,7 +15,7 @@ module tests.fail.tile_on_parallel_fn
 @generic
 @parallel
 @tile(64)
-fn f(x: [f32; 4096], mut out: [f32; 4096]) {
+fn f(x: [f32; 4096], mut out: [f32; 4096]) { //~ E0309
     for i in 0..4096 {
         out[i] = x[i] * 2.0;
     }

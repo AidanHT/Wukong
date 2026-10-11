@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0321
+// EXPECT-COUNT: 1
 module tests.fail.unknown_field
 
 // `p.z` on a struct with only `x` and `y`. The access used to type as `Unknown` and fail in lowering
@@ -8,5 +9,5 @@ struct Point { x: f32, y: f32 }
 
 fn main() -> i32 {
     let p = Point { x: 1.0, y: 2.0 };
-    return p.z as i32;
+    return p.z as i32; //~ E0321
 }

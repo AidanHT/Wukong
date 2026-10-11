@@ -1,9 +1,10 @@
 // EXPECT-CODE: E0437
+// EXPECT-COUNT: 1
 module tests.fail.heap_free_bad_arg
 
 // `free(s)` releases a slice returned by an `alloc_*` builtin; freeing a scalar is a type error.
 
 fn main() -> i32 {
-    free(5);
+    free(5); //~ E0437
     return 0;
 }

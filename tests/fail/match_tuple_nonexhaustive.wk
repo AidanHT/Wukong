@@ -1,10 +1,11 @@
 // EXPECT-CODE: E0405
+// EXPECT-COUNT: 1
 module tests.fail.match_tuple_nonexhaustive
 
 // A tuple scrutinee was never checked for exhaustiveness: `(true, _)` and `(false, true)` leave
 // `(false, false)` uncovered, and `pick(false, false)` fell through to the match's `unreachable`.
 fn pick(p: bool, q: bool) -> i32 {
-    return match (p, q) {
+    return match (p, q) { //~ E0405
         (true, _) => 1,
         (false, true) => 2,
     };

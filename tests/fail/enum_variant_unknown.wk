@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0301
+// EXPECT-COUNT: 1
 module tests.fail.enum_variant_unknown
 
 // Constructing a variant that the enum does not declare is a name-resolution error — never a silent
@@ -6,6 +7,6 @@ module tests.fail.enum_variant_unknown
 enum Op { Add(i32, i32), Nop }
 
 fn main() -> i32 {
-    let a = Op::Sub(1, 2);
+    let a = Op::Sub(1, 2); //~ E0301
     return 0;
 }

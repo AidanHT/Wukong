@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0401
+// EXPECT-COUNT: 1
 module tests.fail.int_to_enum_cast
 
 // Casting an integer TO an enum (`99 as E`) is rejected. The `as` operator on enums is meant for the
@@ -15,7 +16,7 @@ fn f(e: E) -> i32 {
 }
 
 fn main() -> i32 {
-    let bogus: E = 99 as E;   // E0401: cannot cast `i32` to the enum `E`
+    let bogus: E = 99 as E;   // E0401: cannot cast `i32` to the enum `E` //~ E0401
     print(f(bogus));
     return 0;
 }

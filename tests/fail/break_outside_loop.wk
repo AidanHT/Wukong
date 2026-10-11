@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0303
+// EXPECT-COUNT: 1
 module tests.fail.break_outside_loop
 
 /// `break` (and `continue`) outside of any enclosing loop is a hard error. Without this check the
@@ -7,6 +8,6 @@ module tests.fail.break_outside_loop
 /// differential gate honest and matches the behavior of a robust compiler (cf. Rust's E0268).
 fn main() -> i32 {
     print(1);
-    break;
+    break; //~ E0303
     return 0;
 }

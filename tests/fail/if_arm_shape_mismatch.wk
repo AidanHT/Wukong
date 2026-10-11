@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0502
+// EXPECT-COUNT: 1
 module tests.fail.if_arm_shape_mismatch
 
 // The two arms of an `if` used as a value merge into ONE tensor, so their shapes must agree — the same
@@ -8,7 +9,7 @@ module tests.fail.if_arm_shape_mismatch
 // a [1024]-vs-[2] mismatch even turned a statically-valid index into a runtime OOB. Unifying the arms
 // catches it at compile time.
 fn pick(cond: bool, a: Tensor[f32, 2, 2], b: Tensor[f32, 2, 4]) -> f32 {
-    let c = if cond { a } else { b }; // [2,2] vs [2,4] — dimension mismatch
+    let c = if cond { a } else { b }; // [2,2] vs [2,4] — dimension mismatch //~ E0502
     return c[0, 0];
 }
 

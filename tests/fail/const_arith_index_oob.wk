@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0501
+// EXPECT-COUNT: 1
 module tests.fail.const_arith_index_oob
 
 // A constant-*arithmetic* index must satisfy the same compile-time bounds check as a literal one.
@@ -8,6 +9,6 @@ module tests.fail.const_arith_index_oob
 // native reads past the buffer: a divergence). The evaluator now folds constant integer arithmetic.
 fn main() -> i32 {
     let xs: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
-    let v: f32 = xs[2 + 3];
+    let v: f32 = xs[2 + 3]; //~ E0501
     return v as i32;
 }

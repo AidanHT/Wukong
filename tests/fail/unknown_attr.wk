@@ -1,11 +1,12 @@
 // EXPECT-CODE: E0306
+// EXPECT-COUNT: 1
 module tests.fail.unknown_attr
 
 // An attribute the language does not know was SILENTLY ACCEPTED and discarded, so `@bogus` — and,
 // far worse, a typo of a real attribute (`tests/fail/unknown_attr_typo.wk`) — compiled to a program
 // with none of the requested behavior. The v1 known set is closed: `parallel`, `generic`, `tile`,
 // `extern`, `inline`, `simd`, `align`, `export`. Everything else is E0306.
-@bogus
+@bogus //~ E0306
 fn main() -> i32 {
     return 0;
 }

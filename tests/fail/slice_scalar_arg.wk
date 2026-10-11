@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0401
+// EXPECT-COUNT: 1
 module tests.fail.slice_scalar_arg
 
 // A slice parameter `[]T` is a fat-pointer aggregate, not a scalar. Passing a bare integer where a
@@ -10,5 +11,5 @@ fn head(s: []i32) -> i32 {
 }
 
 fn main() -> i32 {
-    return head(5);
+    return head(5); //~ E0401
 }

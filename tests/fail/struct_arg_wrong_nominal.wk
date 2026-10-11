@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0401
+// EXPECT-COUNT: 1
 module tests.fail.struct_arg_wrong_nominal
 
 // `unify_decl` had a `(Tensor, Named)` arm but no `(Named, Named)` one, so two declared nominal
@@ -22,6 +23,6 @@ fn f(v: B) -> f32 {
 
 fn main() -> i32 {
     let a: A = A { x: 5 };
-    println(f(a) as i32);
+    println(f(a) as i32); //~ E0401
     return 0;
 }

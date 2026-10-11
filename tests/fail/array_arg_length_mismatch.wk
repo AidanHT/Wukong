@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0501
+// EXPECT-COUNT: 1
 module tests.fail.array_arg_length_mismatch
 
 // `unify_decl` had no `(Array, Array)` arm at all, so an array argument for an array parameter fell
@@ -13,6 +14,6 @@ fn f(a: [i32; 8]) -> i32 {
 
 fn main() -> i32 {
     let x: [i32; 2] = [1, 2];
-    println(f(x));
+    println(f(x)); //~ E0501
     return 0;
 }

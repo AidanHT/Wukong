@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0440
+// EXPECT-COUNT: 1
 module tests.fail.mixed_sign_arith
 
 // `u32` and `i32` have no lossless common type: each holds values the other cannot. The operator
@@ -6,7 +7,7 @@ module tests.fail.mixed_sign_arith
 // `a / b` was an unsigned 32-bit divide (7 / 4294967294 == 0) while `b / a` was a signed one. Both
 // backends agreed, so nothing but this check can see it. Convert explicitly instead.
 fn ratio(a: u32, b: i32) -> i32 {
-    return a / b;
+    return a / b; //~ E0440
 }
 
 fn main() -> i32 {

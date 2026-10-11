@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0316
+// EXPECT-COUNT: 1
 module tests.fail.noalias_aliased_view
 
 // A view does not hide its storage. `view` is an immutable `[]f32` taken of `buf` itself (the one
@@ -14,6 +15,6 @@ fn axpy(@noalias mut y: []f32, x: []f32, a: f32) {
 fn main() -> i32 {
     let mut buf: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
     let view: []f32 = buf;
-    axpy(view, buf, 2.0);
+    axpy(view, buf, 2.0); //~ E0316
     return 0;
 }

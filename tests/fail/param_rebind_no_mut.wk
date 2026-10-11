@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0304
+// EXPECT-COUNT: 1
 module tests.fail.param_rebind_no_mut
 
 // A parameter is immutable by default, like a `let` without `mut`: it may be read but not
@@ -6,7 +7,7 @@ module tests.fail.param_rebind_no_mut
 // a scalar, mutates a private copy that does not leak to the caller). This mirrors the `let`
 // reassignment rule in tests/fail/assign_immutable.wk.
 fn f(x: i32) -> i32 {
-    x = 5; // reassigning an immutable parameter
+    x = 5; // reassigning an immutable parameter //~ E0304
     return x;
 }
 

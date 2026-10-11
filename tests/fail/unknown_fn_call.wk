@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0320
+// EXPECT-COUNT: 1
 module tests.fail.unknown_fn_call
 
 // A call to a function that does not exist — here a one-letter typo of `square`. Sema used to type
@@ -11,5 +12,5 @@ fn square(x: f32) -> f32 {
 }
 
 fn main() -> i32 {
-    return sqare(3.0) as i32;
+    return sqare(3.0) as i32; //~ E0320
 }

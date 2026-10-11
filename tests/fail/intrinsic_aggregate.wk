@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0437
+// EXPECT-COUNT: 1
 module tests.fail.intrinsic_aggregate
 
 // A math intrinsic (sqrt/exp/log/sin/abs/...) operates on a scalar, vector, or tensor — never an
@@ -13,6 +14,6 @@ struct P {
 
 fn main() -> i32 {
     let p = P { x: 4.0, y: 9.0 };
-    let r: f32 = sqrt(p);
+    let r: f32 = sqrt(p); //~ E0437
     return r as i32;
 }

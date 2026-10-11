@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0306
+// EXPECT-COUNT: 1
 module tests.fail.unchecked_on_stmt
 
 // `@unchecked` (the slice bounds-check opt-out) is read from the FUNCTION item: `wukong_mir_build`
@@ -9,7 +10,7 @@ module tests.fail.unchecked_on_stmt
 // the `fn`.
 fn sum(s: []i32) -> i32 {
     let mut t: i32 = 0;
-    @unchecked
+    @unchecked //~ E0306
     for i in 0..s.len() {
         t = t + s[i];
     }

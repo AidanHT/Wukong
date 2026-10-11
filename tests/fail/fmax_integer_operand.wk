@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0445
+// EXPECT-COUNT: 1
 module tests.fail.fmax_integer_operand
 
 // `fmax`/`fmin` compare floats. On integer operands they used to convert both to `f32` in silence,
@@ -6,7 +7,7 @@ module tests.fail.fmax_integer_operand
 // backends alike, invisible to every differential gate. An integer operand is now E0445, pointing
 // at the type-preserving `max`.
 fn larger(a: i64, b: i64) -> i64 {
-    return fmax(a, b) as i64;
+    return fmax(a, b) as i64; //~ E0445
 }
 
 fn main() -> i32 {

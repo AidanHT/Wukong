@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0401
+// EXPECT-COUNT: 1
 module tests.fail.slice_elem_mismatch
 
 // The array→slice unsizing coercion requires the element types to match: a `[i32; N]` array is a
@@ -6,6 +7,6 @@ module tests.fail.slice_elem_mismatch
 // would read the wrong bytes — the backends disagree), so it is rejected at the `let`.
 fn main() -> i32 {
     let arr: [i32; 3] = [1, 2, 3];
-    let s: []i64 = arr;
+    let s: []i64 = arr; //~ E0401
     return 0;
 }

@@ -1,11 +1,12 @@
 // EXPECT-CODE: E0447
+// EXPECT-COUNT: 1
 module tests.fail.saturating_mixed_types
 
 // A saturating add saturates at its operand type, so the type is the answer: 200 + 100 is 255 at
 // `u8` and 300 at `i32`. Two operands of different integer types are therefore E0447, not widened
 // to the larger as `+` would widen them.
 fn brighten(p: u8, delta: i32) -> u8 {
-    return sat_add(p, delta);
+    return sat_add(p, delta); //~ E0447
 }
 
 fn main() -> i32 {

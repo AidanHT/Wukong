@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0304
+// EXPECT-COUNT: 1
 module tests.fail.param_field_mutation_no_mut
 
 // An aggregate parameter is passed BY REFERENCE (its base pointer), so mutating it through a
@@ -11,7 +12,7 @@ struct S {
 }
 
 fn poke(p: S) {
-    p.a = 9; // mutating a non-`mut` aggregate parameter through a field projection
+    p.a = 9; // mutating a non-`mut` aggregate parameter through a field projection //~ E0304
 }
 
 fn main() -> i32 {

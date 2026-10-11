@@ -1,4 +1,5 @@
 // EXPECT-CODE: C0002
+// EXPECT-COUNT: 1
 // EMIT: obj
 module tests.fail.native_layout_too_large
 

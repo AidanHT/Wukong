@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0433
+// EXPECT-COUNT: 1
 module tests.fail.void_arith
 
 // Arithmetic on the result of a void (no-return-type) function is undefined: `nothing()` yields `()`,
@@ -8,5 +9,5 @@ module tests.fail.void_arith
 fn nothing() {}
 
 fn main() -> i32 {
-    return nothing() * 2;
+    return nothing() * 2; //~ E0433
 }

@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0448
+// EXPECT-COUNT: 1
 module tests.fail.print_raw_pointer
 
 // A raw pointer has no printed form: it is an address, and the interpreter (a slot index) and a
@@ -7,6 +8,6 @@ module tests.fail.print_raw_pointer
 fn main() -> i32 {
     let mut x: i32 = 5;
     let p: *mut i32 = &mut x;
-    print(p);
+    print(p); //~ E0448
     return 0;
 }

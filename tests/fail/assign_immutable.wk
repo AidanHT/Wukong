@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0304
+// EXPECT-COUNT: 1
 module tests.fail.assign_immutable
 
 // A binding introduced with `let` (without `mut`) cannot be reassigned. The language documents that
@@ -7,6 +8,6 @@ module tests.fail.assign_immutable
 // element, a struct field, a pointee) is still permitted — only rebinding the name is rejected.
 fn main() -> i32 {
     let x: i32 = 5;
-    x = 10; // reassigning an immutable binding
+    x = 10; // reassigning an immutable binding //~ E0304
     return x;
 }

@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0316
+// EXPECT-COUNT: 1
 module tests.fail.noalias_reassigned_slice
 
 // A `@noalias` slice parameter names one buffer for the whole call: the optimizer reads its data
@@ -7,7 +8,7 @@ module tests.fail.noalias_reassigned_slice
 // names after the promise was made, so a promised view parameter cannot be reassigned. Writing
 // THROUGH it (`out[0] = 1.0`) is the point of the attribute and stays legal.
 fn fill(@noalias mut out: []f32, other: []f32) {
-    out = other;
+    out = other; //~ E0316
     out[0] = 1.0;
 }
 

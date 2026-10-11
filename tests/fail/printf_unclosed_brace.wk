@@ -1,10 +1,11 @@
 // EXPECT-CODE: E0449
+// EXPECT-COUNT: 1
 module tests.fail.printf_unclosed_brace
 
 // A format string is parsed when the program is compiled: an unclosed `{` (write `{{` for a
 // literal brace) is a malformed format string.
 fn main() -> i32 {
     let total: i32 = 3;
-    printf("total {\n", total);
+    printf("total {\n", total); //~ E0449
     return 0;
 }

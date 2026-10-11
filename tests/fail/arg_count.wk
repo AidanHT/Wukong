@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0503
+// EXPECT-COUNT: 1
 module tests.fail.arg_count
 
 /// Calling a function with the wrong number of arguments is a compile error.
@@ -7,5 +8,5 @@ fn add(a: i32, b: i32) -> i32 {
 }
 
 fn main() -> i32 {
-    return add(1, 2, 3);
+    return add(1, 2, 3); //~ E0503
 }

@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0501
+// EXPECT-COUNT: 1
 module tests.fail.rank
 
 /// Passing a rank-3 tensor where a rank-2 tensor is expected is a rank mismatch. There is no single
@@ -12,6 +13,6 @@ fn use2d<M, N>(a: Tensor[f32, M, N]) {}
 
 fn main() -> i32 {
     let a: Tensor[f32, 4, 4, 4];
-    use2d(a);
+    use2d(a); //~ E0501
     return 0;
 }
