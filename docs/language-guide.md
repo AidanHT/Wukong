@@ -190,8 +190,9 @@ fn main() -> i32 {
   a `const` initializer, a `where` predicate or a `static_assert` (`E0411`).
 - **Parameters and return type.** Each parameter is a name with an optional `: Type` (no patterns,
   no `mut`). An unannotated parameter takes the type the function-typed parameter declares for it;
-  when that names a generic parameter of the callee (`fn fold3<T>(f: fn(T, T) -> T, ..)`) nothing has
-  fixed it yet, and it must be annotated (`E0419`). The return type is the annotation, else the
+  when that names a generic parameter of the callee (`fn fold3<T>(f: fn(T, T) -> T, ..)`), even as a
+  tensor's element type or dimension (`fn(Tensor[T, N]) -> f32`), nothing has fixed it yet, and it
+  must be annotated (`E0419`). The return type is the annotation, else the
   declared one, else the body's type. With `->` the body must be a block. The closure's type must
   equal the parameter's once the call binds the callee's generics (`E0401`).
 - **Captures.** Every enclosing local the body reads is captured **by value**, copied when the call

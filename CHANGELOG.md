@@ -50,6 +50,11 @@ All notable changes to Wukong are documented here. The format is loosely based o
   0.5)` with `n = 3` over four elements printed `10.5` instead of `6.5`. Such a local is now a
   capture, and an enclosing generic named in a closure's turbofish is `E0418` like any other use of
   one (`tests/run/closure_turbofish_capture.wk`).
+- **Fixed before merge: `E0419` missed a callee generic inside a tensor type.** The check that an
+  unannotated parameter's expected type names no callee generic did not look at a tensor's element
+  type or dimensions, so `first(|t| .., xs)` against `fn(Tensor[T, 4]) -> f32` or
+  `fn(Tensor[f32, N]) -> f32` gave the closure parameter the callee's own `T` or `N`, which then
+  leaked into the lifted function's non-generic signature. It is `E0419` now.
 
 ### Type-lowering soundness (`gap4/sema-soundness`)
 

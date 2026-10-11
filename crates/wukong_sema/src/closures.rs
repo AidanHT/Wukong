@@ -133,11 +133,9 @@ impl Sema<'_> {
             Ty::Fn { params, ret } => (params, Some(ret)),
             _ => (&[], None),
         };
-        let generic_free = |t: &Ty| {
-            !callee_generics
-                .iter()
-                .any(|g| crate::methods::mentions(t, *g))
-        };
+        // At any depth, a tensor's element type and dimensions included: the callee's own `T` or
+        // `N` in a parameter type means nothing outside the callee.
+        let generic_free = |t: &Ty| !names_generic(t, &|g| callee_generics.contains(&g));
 
         self.closure_ctx.push(ClosureCtx {
             base: self.scopes.len(),
@@ -575,29 +573,34 @@ impl Sema<'_> {
     /// Does `t` name a generic parameter of the enclosing function — as a type, a tensor element
     /// or a tensor dimension?
     fn mentions_enclosing_generic(&self, t: &Ty) -> bool {
-        match t {
-            Ty::Named(n) => self.generics.contains(n),
-            Ty::Ptr { pointee, .. } | Ty::Ref { pointee, .. } | Ty::Slice(pointee) => {
-                self.mentions_enclosing_generic(pointee)
-            }
-            Ty::Array { elem, .. } => self.mentions_enclosing_generic(elem),
-            Ty::Tuple(ts) => ts.iter().any(|x| self.mentions_enclosing_generic(x)),
-            Ty::Fn { params, ret } => {
-                params.iter().any(|x| self.mentions_enclosing_generic(x))
-                    || self.mentions_enclosing_generic(ret)
-            }
-            Ty::Tensor {
-                shape, elem_var, ..
-            } => {
-                elem_var.is_some_and(|g| self.generics.contains(&g))
-                    || shape.0.iter().any(|d| match d {
-                        Dim::Var(v) => self.generics.contains(v),
-                        Dim::Expr(p) => p.vars().iter().any(|v| self.generics.contains(v)),
-                        Dim::Const(_) | Dim::Dynamic => false,
-                    })
-            }
-            _ => false,
+        names_generic(t, &|g| self.generics.contains(&g))
+    }
+}
+
+/// Does `t` name a generic `is_generic` accepts — as a type, a tensor's element type or one of its
+/// dimensions, at any depth? Exhaustive over `Ty`, so a new type form must decide here.
+fn names_generic(t: &Ty, is_generic: &dyn Fn(Symbol) -> bool) -> bool {
+    match t {
+        Ty::Named(n) => is_generic(*n),
+        Ty::Ptr { pointee, .. } | Ty::Ref { pointee, .. } | Ty::Slice(pointee) => {
+            names_generic(pointee, is_generic)
         }
+        Ty::Array { elem, .. } => names_generic(elem, is_generic),
+        Ty::Tuple(ts) => ts.iter().any(|x| names_generic(x, is_generic)),
+        Ty::Fn { params, ret } => {
+            params.iter().any(|x| names_generic(x, is_generic)) || names_generic(ret, is_generic)
+        }
+        Ty::Tensor {
+            shape, elem_var, ..
+        } => {
+            elem_var.is_some_and(is_generic)
+                || shape.0.iter().any(|d| match d {
+                    Dim::Var(v) => is_generic(*v),
+                    Dim::Expr(p) => p.vars().iter().any(|v| is_generic(*v)),
+                    Dim::Const(_) | Dim::Dynamic => false,
+                })
+        }
+        Ty::Scalar(_) | Ty::Unit | Ty::Vector { .. } | Ty::Unknown | Ty::Error => false,
     }
 }
 
@@ -814,6 +817,41 @@ mod tests {
         };
         assert_eq!(error_codes(&g("M")), vec!["E0418"]);
         assert_eq!(error_codes(&g("m")), Vec::<&str>::new());
+    }
+
+    /// A callee generic hidden in a tensor parameter type — its element type or a dimension —
+    /// leaves the closure parameter as open as a bare `T` does: `E0419`, not the callee's own `T`
+    /// or `N` leaking into the closure's type.
+    #[test]
+    fn a_callee_generic_inside_a_tensor_parameter_is_e0419() {
+        for callee in [
+            "fn first<T>(f: fn(Tensor[T, 4]) -> f32, t: Tensor[T, 4]) -> f32 { return f(t); }",
+            "fn first<N>(f: fn(Tensor[f32, N]) -> f32, t: Tensor[f32, N]) -> f32 { return f(t); }",
+        ] {
+            assert_eq!(
+                error_codes(&format!(
+                    "{callee} fn main() -> i32 {{ let xs: [f32; 4] = [1.0, 2.0, 3.0, 4.0]; \
+                     return first(|t| t[0], xs) as i32; }}"
+                )),
+                vec!["E0419"],
+                "{callee}"
+            );
+        }
+        // Annotated, the closure is no longer open: it is checked exactly like a named function of
+        // the same type passed there (whatever that call's verdict is), never `E0419`.
+        let first = "fn first<N>(f: fn(Tensor[f32, N]) -> f32, t: Tensor[f32, N]) -> f32 { \
+                     return f(t); } ";
+        let annotated = error_codes(&format!(
+            "{first} fn main() -> i32 {{ let xs: [f32; 4] = [1.0, 2.0, 3.0, 4.0]; \
+             return first(|t: Tensor[f32, 4]| t[0], xs) as i32; }}"
+        ));
+        let named = error_codes(&format!(
+            "{first} fn head(t: Tensor[f32, 4]) -> f32 {{ return t[0]; }} \
+             fn main() -> i32 {{ let xs: [f32; 4] = [1.0, 2.0, 3.0, 4.0]; \
+             return first(head, xs) as i32; }}"
+        ));
+        assert!(!annotated.contains(&"E0419"), "{annotated:?}");
+        assert_eq!(annotated, named);
     }
 
     #[test]
