@@ -1,0 +1,11 @@
+// EXPECT-CODE: E0300
+module tests.fail.import_str_alias
+
+// A type alias may not be named after a built-in type (`str` or a scalar) -- in an IMPORTED module
+// too. The alias arrives renamed `lib.str_alias.str`, which compared whole is no built-in name, so
+// `bump` compiled with `str` meaning `i32` and `sa::bump(41)` returned 42.
+import lib.str_alias as sa;
+
+fn main() -> i32 {
+    return sa::bump(41);
+}

@@ -1,0 +1,11 @@
+// Imported by tests/fail/import_str_struct.wk. Declares a struct named `str`, the built-in type. The
+// loader renames it `lib.str_struct.str`; sema must still see the name this module wrote (E0300).
+module lib.str_struct
+
+pub struct str {
+    x: i32,
+}
+
+pub fn get(s: str) -> i32 {
+    return s.x;
+}

@@ -1,0 +1,10 @@
+// Imported by tests/fail/import_str_alias.wk. A type alias named `str`, the built-in type. The
+// loader renames it `lib.str_alias.str`; alias expansion must still see the name this module wrote
+// (E0300), or every `str` in this module silently means `i32`.
+module lib.str_alias
+
+type str = i32;
+
+pub fn bump(s: str) -> i32 {
+    return s + 1;
+}

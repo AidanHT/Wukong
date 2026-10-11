@@ -99,8 +99,14 @@ impl Sema<'_> {
     /// `E0300`: a struct, enum, trait or generic parameter may not be named `str`, the built-in
     /// type — the name is how every type position, including `mir_build`'s annotation readers,
     /// recognizes it.
+    ///
+    /// The comparison is on the name the program WROTE: the loader renames an imported module's
+    /// items to `<import.path>.<name>` before sema runs (`wukong_driver::loader::resolve`, a
+    /// spelling no source identifier can produce), so a `struct str` in `lib/m.wk` arrives as
+    /// `lib.m.str`, and compared whole it slipped through and made `str` mean the struct in that
+    /// module and through a bare `import lib.m;`.
     pub(crate) fn reject_str_decl(&mut self, name: Symbol, span: Span, what: &str) {
-        if self.sym_str(name) != "str" {
+        if self.sym_str(name).rsplit('.').next() != Some("str") {
             return;
         }
         self.diags.push(
@@ -375,6 +381,7 @@ impl Sema<'_> {
 
 #[cfg(test)]
 mod tests {
+    use wukong_ast::ItemKind;
     use wukong_span::{Interner, SourceId};
     use wukong_types::Ty;
 
@@ -620,6 +627,42 @@ fn main() -> i32 {
             "fn f<str>(x: i32) -> i32 { return x; } fn main() -> i32 { return 0; }",
             "E0300",
         );
+    }
+
+    /// An imported module's items reach sema renamed `<import.path>.<name>` by the loader
+    /// (`wukong_driver::loader::resolve`), so the reservation must compare the name the program
+    /// WROTE: a `struct str` in `lib/m.wk` arrives as `lib.m.str`, and inside that module (or
+    /// through a bare import) a type written `str` then silently meant the struct.
+    #[test]
+    fn str_is_reserved_in_an_imported_module_too() {
+        for (src, mangled, reserved) in [
+            ("struct str { x: i32 }", "lib.m.str", true),
+            ("enum str { A }", "lib.m.str", true),
+            ("trait str { fn f(self) -> i32; }", "lib.m.str", true),
+            ("struct S { x: i32 }", "lib.m.strs", false),
+            ("struct S { x: i32 }", "lib.str.S", false),
+        ] {
+            let mut interner = Interner::new();
+            let src = format!("{src} fn main() -> i32 {{ return 0; }}");
+            let (mut module, pd) = wukong_parser::parse_module(&src, SourceId(0), &mut interner);
+            assert!(pd.is_empty(), "parse errors: {pd:?}");
+            let sym = interner.intern(mangled);
+            for item in &mut module.items {
+                match &mut item.kind {
+                    ItemKind::Struct(d) => d.name.sym = sym,
+                    ItemKind::Enum(d) => d.name.sym = sym,
+                    ItemKind::Trait(d) => d.name.sym = sym,
+                    _ => {}
+                }
+            }
+            let (_, diags) = crate::check(&module, &interner);
+            let codes: Vec<_> = diags.iter().filter_map(|d| d.code).collect();
+            assert_eq!(
+                codes.contains(&"E0300"),
+                reserved,
+                "{mangled} from `{src}`: {codes:?}"
+            );
+        }
     }
 
     /// Whether any published type of `src` (which must check clean) still mentions `*u8`. In these

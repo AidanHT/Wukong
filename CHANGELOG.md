@@ -50,6 +50,13 @@ All notable changes to Wukong are documented here. The format is loosely based o
   with A == C and no overlap guard (the interpreter refused it; a release native runtime computes
   the out-of-place product). A range index now projects its base like `s[i]` does, so the kernel is
   guarded and the program prints what the nest computes (`tests/run/alias_range_views.wk`).
+- **`str` stays reserved in an imported module.** The loader renames an imported module's items to
+  `<import.path>.<name>` before sema and alias expansion run, and both compared the renamed symbol
+  whole, so a `struct str` (or `enum`/`trait`) or a `type str = i32;` in `lib/m.wk` compiled as
+  `lib.m.str`: inside that module, and through a bare `import lib.m;`, `str` silently meant the
+  imported type. Both now check the name the module wrote, which also reserves the scalar names
+  for an imported alias (`type f32 = i64;`), as for the root file (`E0300`,
+  `tests/fail/import_str_struct.wk`, `tests/fail/import_str_alias.wk`).
 
 ### Type-lowering soundness (`gap4/sema-soundness`)
 

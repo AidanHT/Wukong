@@ -446,7 +446,7 @@ printf("[{}|{:?}]\n", s, s[..2]);   // [wukong|"wu"]
   (`E0401`). There is no concatenation yet.
 - **Not generic.** A `str` cannot bind a type parameter (`id(s)` with `fn id<T>(x: T) -> T` is
   `E0420`, `tests/fail/str_generic_param.wk`); write the function for `str` itself. A struct, enum,
-  trait, type alias or generic parameter named `str` is `E0300`.
+  trait, type alias or generic parameter named `str` is `E0300`, in an imported module too.
 
 ### Type aliases ✅
 

@@ -1,0 +1,13 @@
+// EXPECT-CODE: E0300
+module tests.fail.import_str_struct
+
+// `str` is a built-in type, so no module may declare a type of that name -- an IMPORTED one
+// included. The loader renames an imported module's items `<import.path>.<name>` before sema runs,
+// and the reservation compared the renamed `lib.str_struct.str` whole: it compiled, and through
+// this bare import the `str` below meant the imported struct, not the built-in string.
+import lib.str_struct;
+
+fn main() -> i32 {
+    let v: str = str { x: 7 };
+    return get(v);
+}
