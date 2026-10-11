@@ -265,6 +265,12 @@ impl Walker<'_> {
         self.ty(e).is_some_and(is_view_ty)
     }
 
+    /// Is `callee` a range-index builtin (`$slice` / `$slice_from`, `crate::strs`)?
+    fn is_range_slice_call(&self, callee: &Expr) -> bool {
+        matches!(&callee.kind, ExprKind::Path(p)
+            if p.is_single() && crate::is_range_slice(self.interner.resolve(p.first().sym)))
+    }
+
     fn lookup(&self, s: Symbol) -> Option<u32> {
         self.scopes.iter().rev().find_map(|sc| sc.get(&s).copied())
     }
@@ -707,6 +713,12 @@ impl Walker<'_> {
                 expr,
             } => self.place_storage(expr),
             ExprKind::Cast { expr, .. } if self.is_view(expr) => self.view_target(expr),
+            // A range index `s[a..b]` (`$slice(s, a, b)`) views what its base views. The bounds
+            // are not compared, so `k(s[0..2], s[2..4])` counts as overlapping too: the same
+            // conservative line element indices draw.
+            ExprKind::Call { callee, args, .. } if self.is_range_slice_call(callee) => {
+                self.root_of(args.first()?)
+            }
             ExprKind::Binary {
                 op: AstBinOp::Add | AstBinOp::Sub,
                 lhs,
@@ -787,6 +799,22 @@ fn kp(@noalias mut o: [f32; 4], q: P) { o[0] = q.a[0]; }
         assert_eq!(in_main("kv(a, a[0]);"), Vec::<&str>::new());
         // No promise, no rule: the ordinary aliasing call stays legal.
         assert_eq!(in_main("u(a, a);"), Vec::<&str>::new());
+    }
+
+    /// A range index `s[a..b]` views its base's storage, so two ranges of one buffer share it: the
+    /// bounds are not compared, the same conservative line element indices draw.
+    #[test]
+    fn range_views_of_one_buffer_are_e0316() {
+        let one = "let s: []f32 = a;";
+        assert_eq!(
+            in_main(&format!("{one} ks(s[0..2], s[2..4]);")),
+            vec!["E0316"]
+        );
+        assert_eq!(in_main(&format!("{one} ks(s[..], a);")), vec!["E0316"]);
+        assert_eq!(
+            in_main(&format!("{one} let t: []f32 = b; ks(s[0..2], t[1..3]);")),
+            Vec::<&str>::new()
+        );
     }
 
     #[test]
