@@ -1238,6 +1238,22 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
     }
     if let Some(x) = &early {
         early_exit_verdict(f, l, &lin, &plans, x, iv.value, iv.start)?;
+        // A search loop may leave on its first iteration, before it reaches the access an alias
+        // check is about, so the guard may re-read only a fat pointer that cannot fault
+        // ([`GuardReads`]).
+        let unproven = |b: MemBase| match b {
+            MemBase::ReloadedOuter { addr, .. } => !never_faults(f, addr, 8),
+            MemBase::Outer(_) => false,
+        };
+        if guards
+            .iter()
+            .any(|g| unproven(g.a.base) || unproven(g.b.base))
+            || point_guards
+                .iter()
+                .any(|g| unproven(g.at) || unproven(g.store.base))
+        {
+            return Err("a search loop's alias check would read a pointer it may never reach");
+        }
     }
     let mut cost = estimate_cost(
         f,
@@ -4429,7 +4445,8 @@ fn apply(f: &mut Function, p: &VecPlan) {
     // ---- guard: how many elements does the vector loop own? ------------------------------------
     let start = guard_params[p.iv_index];
     let n_vec = emit_trip(&mut e, p, guard, start);
-    let ok = emit_alias_checks(&mut e, p, guard);
+    let mut reads = GuardReads::new(p, n_vec);
+    let ok = emit_alias_checks(&mut e, p, guard, &mut reads);
     let ok = match (ok, emit_len_checks(&mut e, p, guard, start, n_vec)) {
         (Some(a), Some(b)) => Some(e.push(guard, MirType::I1, Op::Bin(BinOp::And, a, b))),
         (a, b) => a.or(b),
@@ -4559,7 +4576,17 @@ fn apply(f: &mut Function, p: &VecPlan) {
 
     // ---- vector body ---------------------------------------------------------------------------
     // A search loop's body is two blocks: the test leaves for `vx` before the rest of the group.
-    let (latch_args, last) = emit_body(&mut e, p, vb, vx, guard, &header_params, &vh_params);
+    let (latch_args, last) = emit_body(
+        &mut e,
+        p,
+        vb,
+        vx,
+        guard,
+        &mut reads,
+        &header_params,
+        &vh_params,
+    );
+    reads.finish(&mut e);
     e.f.blocks[last.0 as usize].term = Terminator::Br {
         target: vh,
         args: latch_args,
@@ -4642,6 +4669,86 @@ fn emit_trip(e: &mut Emit<'_>, p: &VecPlan, guard: BlockId, start: ValueId) -> V
     }
 }
 
+/// How the guard reads a pointer out of memory: an alias check's data pointer
+/// ([`range_of`], the point checks) or a hoisted [`Plan::InvariantPtrLoad`].
+///
+/// The guard runs on every entry to the loop, including one that runs no vector group — a zero
+/// trip among them. A read of a fat pointer [`never_faults`] proves live costs nothing there. Any
+/// other pointer the guard re-reads — a `[]T` field reached through a raw `*T` parameter, say — is
+/// read by every iteration of the loop: an arm reads only proven fat pointers
+/// ([`speculable_ptr_load`], [`bounds_check_of`]), and a search loop, which may leave before
+/// reaching a read, neither hoists nor guards an unproven one ([`plan_loop`], [`emit_body`]). So
+/// the scalar loop performs that read as soon as it runs once, and the guard may perform it
+/// exactly when a group would run: always under a constant trip (at least one group), and under a
+/// runtime trip through `select(n_vec != 0, addr, slot)` — `slot` a private stack slot standing in
+/// when no group runs, whose contents then reach nothing but a `select` that discards them. Before
+/// this, `k(x, 0 as *mut Layer, 0)` over `(*p).w[i] = x[i]` returned at `-O0` and stopped with
+/// "null pointer dereference" at `-O2` (native: SIGSEGV).
+struct GuardReads {
+    /// `n_vec` from the trip alone (before any runtime check), for a runtime trip; `None` for a
+    /// constant one.
+    trip: Option<(ValueId, MirType)>,
+    /// `trip != 0`, built on first use.
+    live: Option<ValueId>,
+    /// The stand-in slot, allocated in the entry block by [`GuardReads::finish`] once used.
+    slot: Option<ValueId>,
+}
+
+impl GuardReads {
+    fn new(p: &VecPlan, n_vec: ValueId) -> Self {
+        let trip = match p.trip {
+            TripPlan::Const(_) => None,
+            TripPlan::Runtime { .. } | TripPlan::RuntimeDown { .. } => {
+                Some((n_vec, p.iv_ty.clone()))
+            }
+        };
+        GuardReads {
+            trip,
+            live: None,
+            slot: None,
+        }
+    }
+
+    /// `load ptr addr`, in `guard`, read only when the guard may read it.
+    fn load_ptr(&mut self, e: &mut Emit<'_>, guard: BlockId, addr: ValueId) -> ValueId {
+        let at = match &self.trip {
+            Some((n_vec, ty)) if !never_faults(e.f, addr, 8) => {
+                let live = match self.live {
+                    Some(v) => v,
+                    None => {
+                        let zero = e.int(guard, ty, 0);
+                        let v = e.push(guard, MirType::I1, Op::Cmp(CmpOp::Ne, *n_vec, zero));
+                        self.live = Some(v);
+                        v
+                    }
+                };
+                let slot = *self.slot.get_or_insert_with(|| e.value(MirType::Ptr));
+                e.push(guard, MirType::Ptr, Op::Select(live, addr, slot))
+            }
+            _ => addr,
+        };
+        e.push(guard, MirType::Ptr, Op::Load(at, MirType::Ptr))
+    }
+
+    /// Allocate the stand-in slot, if a read used one, in the entry block — inserted last, like
+    /// [`emit_body`]'s scratch slots, since nothing after this reads an instruction index.
+    fn finish(self, e: &mut Emit<'_>) {
+        if let Some(slot) = self.slot {
+            let entry = e.f.entry;
+            e.f.blocks[entry.0 as usize].insts.insert(
+                0,
+                Inst {
+                    result: Some(slot),
+                    op: Op::Alloca {
+                        ty: MirType::Ptr,
+                        space: wukong_mir::AddrSpace::Local,
+                    },
+                },
+            );
+        }
+    }
+}
+
 /// The conjunction of the arms' bounds checks over the vector loop's own iterations, or `None`
 /// when there are none ([`LenCheck`]).
 ///
@@ -4696,7 +4803,12 @@ fn emit_len_checks(
 /// addresses), and the `gep`s that build the range endpoints scale by the same element unit in
 /// each. This is an ordering question about two live objects, never a null test — the repo's
 /// "interpreter address 0 is a valid address" landmine does not apply.
-fn emit_alias_checks(e: &mut Emit<'_>, p: &VecPlan, guard: BlockId) -> Option<ValueId> {
+fn emit_alias_checks(
+    e: &mut Emit<'_>,
+    p: &VecPlan,
+    guard: BlockId,
+    reads: &mut GuardReads,
+) -> Option<ValueId> {
     if p.guards.is_empty() && p.point_guards.is_empty() {
         return None;
     }
@@ -4739,8 +4851,8 @@ fn emit_alias_checks(e: &mut Emit<'_>, p: &VecPlan, guard: BlockId) -> Option<Va
     let mut acc: Option<ValueId> = None;
     let mut ptr_cache: FxHashMap<u32, ValueId> = FxHashMap::default();
     for g in &p.guards {
-        let (alo, ahi) = range_of(e, p, guard, &g.a, start, end, &mut ptr_cache);
-        let (blo, bhi) = range_of(e, p, guard, &g.b, start, end, &mut ptr_cache);
+        let (alo, ahi) = range_of(e, p, guard, reads, &g.a, start, end, &mut ptr_cache);
+        let (blo, bhi) = range_of(e, p, guard, reads, &g.b, start, end, &mut ptr_cache);
         // a_end <= b_start
         let a_before = e.push(guard, MirType::I1, Op::Cmp(CmpOp::Ule, ahi, blo));
         let b_before = e.push(guard, MirType::I1, Op::Cmp(CmpOp::Ule, bhi, alo));
@@ -4759,13 +4871,13 @@ fn emit_alias_checks(e: &mut Emit<'_>, p: &VecPlan, guard: BlockId) -> Option<Va
     // what "one past" is. It must lie entirely before or entirely after the stored range; equality
     // is never acceptable here (see [`PointGuard`]).
     for g in &p.point_guards {
-        let (slo, shi) = range_of(e, p, guard, &g.store, start, end, &mut ptr_cache);
+        let (slo, shi) = range_of(e, p, guard, reads, &g.store, start, end, &mut ptr_cache);
         let at = match g.at {
             MemBase::Outer(v) => v,
             MemBase::ReloadedOuter { addr, .. } => match ptr_cache.get(&addr.0) {
                 Some(&v) => v,
                 None => {
-                    let v = e.push(guard, MirType::Ptr, Op::Load(addr, MirType::Ptr));
+                    let v = reads.load_ptr(e, guard, addr);
                     ptr_cache.insert(addr.0, v);
                     v
                 }
@@ -4814,10 +4926,12 @@ fn emit_alias_checks(e: &mut Emit<'_>, p: &VecPlan, guard: BlockId) -> Option<Va
 /// and [`plan_guards`] has already proved every value it names is defined outside the loop, is
 /// typed like the induction variable, and has a multiplier that fits that type — so it may simply
 /// be re-added.
+#[allow(clippy::too_many_arguments)]
 fn range_of(
     e: &mut Emit<'_>,
     p: &VecPlan,
     guard: BlockId,
+    reads: &mut GuardReads,
     g: &GuardBase,
     start: ValueId,
     end: ValueId,
@@ -4829,7 +4943,7 @@ fn range_of(
         MemBase::ReloadedOuter { addr, .. } => match cache.get(&addr.0) {
             Some(&v) => v,
             None => {
-                let v = e.push(guard, MirType::Ptr, Op::Load(addr, MirType::Ptr));
+                let v = reads.load_ptr(e, guard, addr);
                 cache.insert(handle.0, v);
                 v
             }
@@ -4901,18 +5015,22 @@ fn range_of(
 /// runs zero iterations, so hoisting speculates the load; for a slice's fat pointer that is free
 /// (the fat pointer is the parameter the loop indexes through, live for the whole call, and
 /// `emit_alias_checks` already reads it), but for an arbitrary invariant address it would be a
-/// read the scalar loop never performs when the trip count is zero.
+/// read the scalar loop never performs when the trip count is zero. Even a pointer-typed read is
+/// free only through a fat pointer that cannot fault: any other one is taken through
+/// [`GuardReads`], which performs it only when a group will run.
 ///
 /// A search loop ([`EarlyExit`]) is emitted in two blocks: the steps up to its exit test in `vb`,
 /// which ends in the lane test and leaves for `vx` when any lane would leave the loop, and the rest
 /// of the group in a block of its own. Returns the back edge's arguments and the block that carries
 /// them.
+#[allow(clippy::too_many_arguments)]
 fn emit_body(
     e: &mut Emit<'_>,
     p: &VecPlan,
     mut vb: BlockId,
     vx: BlockId,
     guard: BlockId,
+    reads: &mut GuardReads,
     header_params: &[ValueId],
     vh_params: &[ValueId],
 ) -> (Vec<ValueId>, BlockId) {
@@ -5156,10 +5274,18 @@ fn emit_body(
                 // Hoist only if the address itself is available where the guard runs. A value the
                 // map does not hold is defined outside the loop, so it dominates the preheader and
                 // therefore the guard; anything else (a pointer carried in a header parameter) has
-                // its counterpart in the vector *header*, which the guard does not dominate.
-                let at = if map.contains_key(&ptr.0) { vb } else { guard };
-                let ptr = resolve_uniform(&map, *ptr);
-                let nv = e.push(at, ty.clone(), Op::Load(ptr, ty.clone()));
+                // its counterpart in the vector *header*, which the guard does not dominate. And
+                // only if the guard may read it ([`GuardReads`]): a search loop can leave before
+                // it reaches the load, so there only a fat pointer that cannot fault is hoisted,
+                // and any other read stays where the group reaches it.
+                let in_place =
+                    map.contains_key(&ptr.0) || (p.early.is_some() && !never_faults(e.f, *ptr, 8));
+                let nv = if in_place {
+                    let ptr = resolve_uniform(&map, *ptr);
+                    e.push(vb, ty.clone(), Op::Load(ptr, ty.clone()))
+                } else {
+                    reads.load_ptr(e, guard, *ptr)
+                };
                 map.insert(
                     inst.result.expect("a load has a result").0,
                     Wide::Uniform(nv),
@@ -9400,5 +9526,84 @@ mod tests {
             ]
         );
         scalar_and_vector_agree(&src);
+    }
+
+    /// The guard runs on every entry, a zero trip included, and re-reads the fat pointer of every
+    /// slice the loop indexes. Through a raw pointer that read is `(*p).w`'s data pointer at `p`
+    /// itself, and the scalar loop over `(*p).w[i] = x[i]` with `n = 0` never makes it — so
+    /// `k(x, 0 as *mut Layer, 0)` returned at `-O0` and stopped with "null pointer dereference" at
+    /// `-O2` (native: SIGSEGV). The read now happens only when a vector group will run
+    /// ([`GuardReads`]), and the loop still widens. `k` calls itself through `k2`, so it stays out
+    /// of line with `p` a parameter.
+    #[test]
+    fn a_zero_trip_reads_no_pointer_the_scalar_loop_never_reads() {
+        let k = "struct Layer { w: []f32, } \
+                 @unchecked fn k(x: []f32, p: *mut Layer, n: i64, d: i64) { \
+                   if d > 0 { k2(x, p, n, d - 1); return; } let mut i: i64 = 0; \
+                   while i < n { (*p).w[i] = x[i] * 2.0; i = i + 1; } } \
+                 fn k2(x: []f32, p: *mut Layer, n: i64, d: i64) { k(x, p, n, d); }";
+        let shape = format!("{k} fn main() -> i32 {{ return 0; }}");
+        assert!(
+            is_widened(&shape, "k"),
+            "the loop through a raw pointer no longer widens"
+        );
+        let src = format!(
+            "{k} fn main() -> i32 {{ let mut x: []f32 = alloc_f32(11); \
+             let mut wa: []f32 = alloc_f32(11); let mut j: i64 = 0; \
+             while j < 11 {{ x[j] = (j as f32) + 0.5; wa[j] = -1.0; j = j + 1; }} \
+             k(x, 0 as *mut Layer, 0, 1); print(7); \
+             let mut l: Layer = Layer {{ w: wa }}; let lp: *mut Layer = &mut l; \
+             k(x, lp, 11, 1); \
+             j = 0; while j < 11 {{ print(wa[j] as i32); j = j + 1; }} \
+             free(x); free(wa); return 0; }}"
+        );
+        // The null call returns; then lane j holds (j + 0.5) * 2 = 2j + 1, all 11 of them (two
+        // groups and a scalar tail of three).
+        let mut expected = vec!["7".to_string()];
+        expected.extend((0..11).map(|j| (2 * j + 1).to_string()));
+        assert_eq!(printed_at_o2(&src), expected);
+        scalar_and_vector_agree(&src);
+    }
+
+    /// A search loop may leave on its first iteration, before it reaches the store an alias check
+    /// is about, so its guard may not re-read a raw pointer's fat pointer even when a group would
+    /// run: `s(x, 0 as *mut Layer, ..)` whose first element already passes the test never touches
+    /// `p`. Such a search declines; the same search storing through a `[]f32` parameter widens.
+    /// (Each runs to its slice's length read once before the loop, the bound a search over a
+    /// `[]T` parameter needs.)
+    #[test]
+    fn a_search_loop_guard_reads_only_a_fat_pointer_that_cannot_fault() {
+        let k = "struct Layer { w: []f32, } \
+                 @unchecked fn s(x: []f32, p: *mut Layer, t: f32, d: i64) -> i64 { \
+                   if d > 0 { return s2(x, p, t, d - 1); } let n: i64 = x.len(); \
+                   let mut i: i64 = 0; \
+                   while i < n { if x[i] > t { break; }; (*p).w[i] = x[i]; i = i + 1; } \
+                   return i; } \
+                 fn s2(x: []f32, p: *mut Layer, t: f32, d: i64) -> i64 { return s(x, p, t, d); } \
+                 @unchecked fn o(x: []f32, mut w: []f32, t: f32, d: i64) -> i64 { \
+                   if d > 0 { return o2(x, w, t, d - 1); } let n: i64 = x.len(); \
+                   let mut i: i64 = 0; \
+                   while i < n { if x[i] > t { break; } w[i] = x[i]; i = i + 1; } \
+                   return i; } \
+                 fn o2(x: []f32, mut w: []f32, t: f32, d: i64) -> i64 { return o(x, w, t, d); }";
+        let shape = format!("{k} fn main() -> i32 {{ return 0; }}");
+        assert!(
+            !is_widened(&shape, "s"),
+            "a search loop's guard re-reads a raw pointer"
+        );
+        assert!(
+            is_widened(&shape, "o"),
+            "the same search over a slice parameter no longer widens"
+        );
+        scalar_and_vector_agree(&format!(
+            "{k} fn main() -> i32 {{ let mut x: []f32 = alloc_f32(16); \
+             let mut wa: []f32 = alloc_f32(16); let mut j: i64 = 0; \
+             while j < 16 {{ x[j] = j as f32; wa[j] = -1.0; j = j + 1; }} \
+             print(s(x, 0 as *mut Layer, -5.0, 1)); \
+             let mut l: Layer = Layer {{ w: wa }}; let lp: *mut Layer = &mut l; \
+             print(s(x, lp, 9.5, 1)); print(o(x, wa, 12.5, 1)); \
+             j = 0; while j < 16 {{ print(wa[j] as i32); j = j + 1; }} \
+             free(x); free(wa); return 0; }}"
+        ));
     }
 }

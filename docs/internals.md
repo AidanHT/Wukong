@@ -500,6 +500,19 @@ also tests `start < end` under the header's own signedness (`start > end` for a 
 reading the difference as a count — the vector loop runs no group whenever the scalar loop runs
 none, and every fold form then hands back its seed bit for bit (`tests/run/vec4_zero_trip_reductions.wk`).
 
+**What the guard may read.** The guard runs on every entry, a zero trip included, and re-reads the
+fat pointer of each slice the loop indexes (for an alias check's range, and to hoist the data
+pointer the body reloads). A fat pointer that cannot fault is read there freely: a `[]T`
+parameter's or a stack slot's (`never_faults`). Any other one — a slice field reached through a raw
+`p: *mut Layer` — is read by every iteration of the loop (an arm may not speculate it), so the
+scalar loop reads it once it runs at all, and the guard reads it only when a group will run:
+directly under a constant trip, through `select(n_vec != 0, addr, slot)` under a runtime one, a
+private stack slot standing in when no group runs (`GuardReads`). A search loop may leave before
+it reaches such a read, so its guard re-reads only a fat pointer that cannot fault, and a hoisted
+data pointer it may not reach stays where the group reaches it. Before this, `k(x, 0 as *mut
+Layer, 0)` over `(*p).w[i] = x[i]` returned at `-O0` and stopped with "null pointer dereference"
+at `-O2` (`tests/run/vec4_speculation_raw_pointer.wk`).
+
 **Reductions** come from `loop_info::classify_carried`. Besides a binary or `fma` combine, two
 families are recognized. A **min/max** spelled as `select(cmp(pred, a, b), a, b)` (the lowering of
 `max`/`min`/`fmax`/`fmin`) or as a branch that only chooses between the accumulator and the value it

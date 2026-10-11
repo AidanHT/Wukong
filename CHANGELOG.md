@@ -41,6 +41,16 @@ All notable changes to Wukong are documented here. The format is loosely based o
   (`ParamAttrs::slice`, which `mir_build` now records on every slice parameter as a fact of its
   type, not only beside `@noalias` — alias analysis still reads it only there) or a stack slot's
   (`tests/run/vec4_speculation_raw_pointer.wk`).
+- **The guard reads a raw pointer only when a vector group will run.** The guard runs on every loop
+  entry and re-read every slice's fat pointer there, for its alias checks and to hoist the data
+  pointer. Through a raw pointer that read can be null where the scalar loop never makes it:
+  `k(x, 0 as *mut Layer, 0)` over `(*p).w[i] = x[i]` (a zero trip), and a search that leaves on its
+  first iteration before storing through `p`, returned at `-O0` and stopped with "null pointer
+  dereference" at `-O2` (native: SIGSEGV). Now a read that cannot fault (a slice parameter's or a
+  stack slot's fat pointer) is still made freely. Any other read is made only when a group will
+  run, through a `select` on `n_vec != 0` under a runtime trip, and a search loop declines it. The
+  zero-trip loop still widens. Over `tests/run`, `examples` and `bench/kernels` no other loop changes
+  its widening decision.
 
 ### Index-recording reductions (`gap3/vec-argmax`)
 
