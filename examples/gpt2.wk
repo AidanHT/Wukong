@@ -1,3 +1,9 @@
+// EXPECT-EXIT: 0
+// round(out[k] * 10000) for k = 0, 64, 256, 511. Derived from an independent float64 evaluation of
+// this block's formulas on these inputs (-0.11131, 0.10987, 0.06775, -0.02640), not from compiler
+// output; the closest value lies 0.043 of a printed unit from a rounding boundary, far above the
+// f32 evaluation error (~0.001 of a unit).
+// EXPECT-OUT-VALUES: -1113 1099 677 -264
 module examples.gpt2
 
 // =====================================================================================

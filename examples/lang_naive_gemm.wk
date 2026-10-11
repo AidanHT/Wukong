@@ -1,3 +1,5 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT-VALUES: 4 5 10 11
 module examples.lang_naive_gemm
 
 // Few-shot idiom: row-major C[2,2] = A[2,3] * B[3,2] in natural ikj order.

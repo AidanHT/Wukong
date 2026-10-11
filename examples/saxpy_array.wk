@@ -1,3 +1,5 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT-VALUES: 12 24 36 48
 module examples.saxpy_array
 
 /// SAXPY over fixed-size arrays: out = a*x + y, computed elementwise.

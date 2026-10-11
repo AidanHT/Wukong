@@ -14,9 +14,31 @@
 //!
 //! Every example therefore carries a declared [`Class`] saying what running it must produce, and
 //! anything not listed defaults to [`Class::Runs`]: a new example must execute, or be declared.
+//!
+//! ## What a `Runs` example must also say
+//!
+//! "Exit 0 and non-empty stdout" was the whole `Runs` contract, and it is the vacuous one: an example
+//! whose kernel started printing the wrong number exited 0, printed a line, and both agreement checks
+//! passed because the interpreter oracle and native printed the same wrong number. So a `Runs`
+//! example now carries its expectations IN THE FILE, in the `tests/run` directive grammar, parsed by
+//! the one shared reader (`common/mod.rs`) rather than a second copy that could drift:
+//!
+//! ```text
+//! // EXPECT-EXIT: 0
+//! // EXPECT-OUT-VALUES: 4 5 10 11
+//! ```
+//!
+//! An `EXPECT-EXIT` and at least one `EXPECT-OUT*` directive are mandatory for every `Runs` example
+//! and their absence fails the suite by name. The values are derived from the program's own scalar
+//! semantics (by hand for the small examples; from an independent float64 evaluation, with the margin
+//! to the nearest rounding boundary stated in the header, for the transformer blocks) — never pasted
+//! from compiler output.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+#[path = "common/mod.rs"]
+mod common;
 
 fn examples_dir() -> PathBuf {
     // CARGO_MANIFEST_DIR = crates/wukongc; the examples live at <repo>/examples.
@@ -42,7 +64,8 @@ fn collect_examples() -> Vec<PathBuf> {
 /// slide from `Runs` into any of the others is a regression, and the agreement checks cannot see it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Class {
-    /// Executes: exit 0 and non-empty stdout.
+    /// Executes, and produces exactly what its in-file `EXPECT-EXIT` / `EXPECT-OUT*` directives say
+    /// (see the module docs; [`runs_contract`] refuses a `Runs` example that declares neither).
     Runs,
     /// A construct codegen does not lower yet: exit 1 with `error[C0001]`.
     NotLowered,
@@ -95,6 +118,58 @@ fn observable(r: &(Option<i32>, String, String)) -> (Option<i32>, String) {
     (r.0, r.1.clone())
 }
 
+/// The in-file contract of a `Runs` example: its directives parse under the shared grammar, pin an
+/// exit code, and say something about stdout. `Err` names what is missing.
+fn runs_contract(src: &str, name: &str) -> Result<common::Directives, String> {
+    let d = common::parse_directives(src, name)?;
+    let mut missing = Vec::new();
+    if d.exit.is_none() {
+        missing.push("`// EXPECT-EXIT:`");
+    }
+    if !d.constrains_stdout() {
+        missing.push("an `// EXPECT-OUT:` / `// EXPECT-OUT-VALUES:` / `// EXPECT-OUT-APPROX:` / `// EXPECT-OUT-NONE`");
+    }
+    if !missing.is_empty() {
+        return Err(format!(
+            "{name}: declared Class::Runs but carries no {}. A Runs example without in-file \
+             expectations is held only to `exit 0, some output`, which a wrong answer satisfies on \
+             both backends at once; add header directives with values derived from the program's \
+             scalar semantics.",
+            missing.join(" and no ")
+        ));
+    }
+    Ok(d)
+}
+
+/// The contract itself is mutation-checked: a `Runs` source missing either half, or carrying a
+/// misspelled directive, is refused; a complete one is accepted and its comparator rejects a wrong
+/// answer. Without this, a regression in `runs_contract` would let every example go vacuous again.
+#[test]
+fn a_runs_example_without_in_file_expectations_is_refused() {
+    let body = "module m\nfn main() -> i32 { print(1); return 0; }\n";
+    for (src, why) in [
+        (body.to_string(), "no directives at all"),
+        (format!("// EXPECT-EXIT: 0\n{body}"), "no stdout directive"),
+        (format!("// EXPECT-OUT: 1\n{body}"), "no exit directive"),
+        (
+            format!("// EXPECT-EXIT: 0\n// EXPECT-OUT-VALUE: 1\n{body}"),
+            "a misspelled directive",
+        ),
+    ] {
+        assert!(
+            runs_contract(&src, "probe.wk").is_err(),
+            "runs_contract accepted a source with {why}"
+        );
+    }
+    let ok = runs_contract(
+        &format!("// EXPECT-EXIT: 0\n// EXPECT-OUT: 1\n{body}"),
+        "ok.wk",
+    )
+    .expect("a complete header must be accepted");
+    assert!(common::check_stdout("1\n", &ok).is_ok());
+    assert!(common::check_stdout("2\n", &ok).is_err());
+}
+
 /// Every example must produce what its class says it produces. Without this, the two agreement
 /// tests below pass for an example that stopped executing entirely.
 #[test]
@@ -105,15 +180,27 @@ fn examples_do_what_their_class_says() {
     for p in &collect_examples() {
         let name = p.file_name().unwrap().to_string_lossy().into_owned();
         let class = class_of(&name);
+        let src = std::fs::read_to_string(p).unwrap();
         let (exit, stdout, stderr) = run_backend(p, "-O2", Some("native"));
         match class {
             Class::Runs => {
                 counts[0] += 1;
-                if exit != Some(0) || stdout.trim().is_empty() {
+                let d = match runs_contract(&src, &name) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        failures.push(e);
+                        continue;
+                    }
+                };
+                if exit != d.exit {
                     failures.push(format!(
-                        "{name}: declared Runs but exited {exit:?} with stdout {:?}\n--- stderr ---\n{stderr}",
+                        "{name}: EXPECT-EXIT {:?}, but it exited {exit:?} with stdout {:?}\n\
+                         --- stderr ---\n{stderr}",
+                        d.exit,
                         stdout.trim()
                     ));
+                } else if let Err(report) = common::check_stdout(&stdout, &d) {
+                    failures.push(format!("{name}: {report}\n--- stderr ---\n{stderr}"));
                 }
             }
             Class::NotLowered => {

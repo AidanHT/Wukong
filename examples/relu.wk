@@ -1,3 +1,5 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT-VALUES: 0 5 0 0 8 0
 module examples.relu
 
 /// ReLU activation over a fixed-size array: out[i] = max(0, x[i]).

@@ -1,3 +1,5 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 120
 module examples.dot
 
 /// Dot product of two length-8 vectors over fixed-size arrays.

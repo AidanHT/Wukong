@@ -1,3 +1,10 @@
+// EXPECT-EXIT: 0
+// argmax of the last row, then round(lastrow[v] * 10000) for v = 0, 1, 16, 31. Derived from an
+// independent float64 evaluation of this model's formulas on these synthetic weights (argmax 15
+// beats runner-up 11 by 0.433; -1.43523, -0.31379, -0.35879, 0.95213), not from compiler output;
+// the closest value lies 0.17 of a printed unit from a rounding boundary. The same model as
+// gpt2_infer_small.wk, so the shared lanes (argmax, logits[7, 0], logits[7, 31]) must agree.
+// EXPECT-OUT-VALUES: 15 -14352 -3138 -3588 9521
 module examples.gpt2_forward_bench_small
 
 // ===================================================================================================

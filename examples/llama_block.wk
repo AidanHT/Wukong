@@ -1,3 +1,9 @@
+// EXPECT-EXIT: 0
+// round(out[k] * 10000) for k = 0, 64, 256, 511. Derived from an independent float64 evaluation of
+// this block's formulas on these inputs (-0.12270, 0.12043, 0.05929, -0.04045), not from compiler
+// output; the closest value lies 0.026 of a printed unit from a rounding boundary, far above the
+// f32 evaluation error (~0.001 of a unit).
+// EXPECT-OUT-VALUES: -1227 1204 593 -404
 module examples.llama_block
 
 // =====================================================================================
