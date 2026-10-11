@@ -5,6 +5,24 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Diagnostics: multi-line spans (`gap5/diag-multiline-spans`)
+
+- **Multi-line spans are drawn whole, with rustc-style connectors (N6).** The human renderer used to
+  cut a multi-line label at the end of its first line, so a `let … else` block (`E0401`), a function
+  body that can fall off its end (`E0434`) or a recursive struct (`E0402`) showed a caret run that
+  stopped mid-construct. The first such label (the primary one when it is multi-line) now opens
+  with `/`, or with a `___^` start marker when code precedes it. Its later lines carry `|`, and a
+  `|___^ message` end marker points at its last character. A label longer than 6 lines keeps its
+  first two and last two lines around a `...` line. A label ends at the character *before* `hi`, so
+  a span that includes its line's newline ends on that line. Other labels keep their own frames,
+  and a second multi-line label is still cut. A diagnostic without a multi-line label renders
+  byte-for-byte as before. The JSON span positions (`line`, `col`, `line_end`, `col_end`, `byte_*`)
+  do not change; only `rendered` carries the new form.
+- **The printed column stays the char column, by decision.** The `-->`/`:::` column is the 1-based
+  char column and equals JSON `col` (the editor/LSP jump contract). Tabs and wide characters only
+  move the carets. `docs/internals.md` records the rule, and a new render test pins it next to the
+  existing tab and wide-character tests.
+
 ### Type-lowering soundness (`gap4/sema-soundness`)
 
 - **No silent `i32` slots (N2).** MIR lowering classified any type it did not recognize as `i32`

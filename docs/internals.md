@@ -326,9 +326,50 @@ call; on any earlier failure it renders them after the errors (`render_lints`).
 The terminal renderer is rustc-style (carets, gutters, `--> file:line:col`). Two rendering rules are
 contractual: a caret run is as wide as the span's *rendered* width, never the column difference, and
 both the echoed source line and the caret padding expand tabs at a fixed `TAB_WIDTH = 4` — so carets
-land under the construct in tab-indented source. Columns past the end of a line count one each, and a
-multi-line span underlines only its first line. Reported line/col are unaffected, so the JSON output
-does not change; if you touch `TAB_WIDTH`, `rendered_width` or `expand_tabs`, touch all three.
+land under the construct in tab-indented source. East-Asian wide characters count two columns, and
+columns past the end of a line count one each. If you touch `TAB_WIDTH`, `rendered_width` or
+`expand_tabs`, touch all three.
+
+A multi-line span is drawn whole, with rustc-style connectors. A label ends at its *last* character,
+the one before `hi`, so a span whose `hi` is column 1 of the next line ends on the line before. A
+label is multi-line when that character is on a later line than its first. At most one label per
+diagnostic gets connectors: the primary label if it is multi-line, else the first multi-line label
+in position order. Such a diagnostic gives every echoed line and underline a 2-column margin after
+`| `. The connector label's first line is marked `/` when only whitespace precedes the span.
+Otherwise a start-marker line of `_` runs to a `^` (`-` for a secondary label) under its first
+character. Its later lines carry `|`, and an end-marker line `|___^ message` points at its last
+character:
+
+```text
+ 9 |   fn pick(n: i32) -> i32 {
+   |  ________________________^
+10 | |     if n > 0 {
+11 | |         return 1;
+12 | |     }
+13 | | }
+   | |_^
+
+ 9 | / struct List {
+10 | |     head: i32,
+11 | |     tail: List,
+12 | | }
+   | |_^
+```
+
+A label longer than 6 lines prints its first two and last two lines around one `...` gutter line,
+and the gutter is then at least 3 wide. The gutter also widens to fit the label's last line. Other
+labels keep their own frames at their sorted positions and are not interleaved into the connector
+frame (rustc interleaves them). Any other multi-line label is cut at the end of its first line,
+underlined to one column past it. A diagnostic with no multi-line label renders exactly as it did
+before connectors existed. Only the human form, and JSON's `rendered` copy of it, changes: the JSON
+span positions never depend on the renderer.
+
+The printed `-->`/`:::` column is the 1-based *char* column, the same number as JSON `col`. That is
+the editor/LSP jump contract, and it is kept by decision (N6): display width (tabs, wide characters)
+only places carets, underscores and marks. The tests `tab_indented_line_aligns_with_its_caret`,
+`caret_aligns_under_a_wide_character` and `header_column_is_the_char_column_json_reports` in
+`render.rs` pin it. A display-width header column would be a separate change to both `render.rs` and
+`json.rs`.
 
 `--error-format=json` emits one JSON object per line (JSON Lines) for tooling: `severity`, an optional
 `code`, `message`, a `spans` array of `{file, line, col, primary, label, line_end, col_end,
