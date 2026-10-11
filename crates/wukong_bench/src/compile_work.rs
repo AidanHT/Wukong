@@ -190,11 +190,11 @@ impl wukong_opt::Pass for Counted {
     }
 }
 
-/// Slot layout of the attribution table: the seventeen standard `-O2` passes in pipeline order, then
+/// Slot layout of the attribution table: the eighteen standard `-O2` passes in pipeline order, then
 /// the two whole-program stages, then the cleanup pipeline's five passes (kept separate because they
 /// run under a different driver instance and belong to the unrolling stage's cost), then the late
 /// `switch` formation.
-const STANDARD: usize = 17;
+const STANDARD: usize = 18;
 const SLOT_INLINE: usize = STANDARD;
 const SLOT_UNROLL: usize = STANDARD + 1;
 const SLOT_CLEANUP: usize = STANDARD + 2;
@@ -220,20 +220,21 @@ fn attributed_standard() -> wukong_opt::PassManager {
     pm.add(counted_pass(0, Box::new(Sroa)));
     pm.add(counted_pass(1, Box::new(Mem2Reg)));
     pm.add(counted_pass(2, Box::new(Simplify)));
-    pm.add(counted_pass(3, Box::new(SimplifyCfg)));
-    pm.add(counted_pass(4, Box::new(SimplifyPhis)));
-    pm.add(counted_pass(5, Box::new(Dce)));
-    pm.add(counted_pass(6, Box::new(Tre)));
-    pm.add(counted_pass(7, Box::new(Cse)));
-    pm.add(counted_pass(8, Box::new(Dse)));
-    pm.add(counted_pass(9, Box::new(LoopCanon)));
-    pm.add(counted_pass(10, Box::new(LoopDelete)));
-    pm.add(counted_pass(11, Box::new(LoopFuse)));
-    pm.add(counted_pass(12, Box::new(Licm)));
-    pm.add(counted_pass(13, Box::new(Bce)));
-    pm.add(counted_pass(14, Box::new(LoopUnswitch)));
-    pm.add(counted_pass(15, Box::new(Promote)));
-    pm.add(counted_pass(16, Box::new(Vectorize::default())));
+    pm.add(counted_pass(3, Box::new(JumpThread)));
+    pm.add(counted_pass(4, Box::new(SimplifyCfg)));
+    pm.add(counted_pass(5, Box::new(SimplifyPhis)));
+    pm.add(counted_pass(6, Box::new(Dce)));
+    pm.add(counted_pass(7, Box::new(Tre)));
+    pm.add(counted_pass(8, Box::new(Cse)));
+    pm.add(counted_pass(9, Box::new(Dse)));
+    pm.add(counted_pass(10, Box::new(LoopCanon)));
+    pm.add(counted_pass(11, Box::new(LoopDelete)));
+    pm.add(counted_pass(12, Box::new(LoopFuse)));
+    pm.add(counted_pass(13, Box::new(Licm)));
+    pm.add(counted_pass(14, Box::new(Bce)));
+    pm.add(counted_pass(15, Box::new(LoopUnswitch)));
+    pm.add(counted_pass(16, Box::new(Promote)));
+    pm.add(counted_pass(17, Box::new(Vectorize::default())));
     pm
 }
 
