@@ -639,6 +639,10 @@ impl Sema<'_> {
                                 let d = if is_const {
                                     Dim::Const(self.const_length(nm, 0))
                                 } else {
+                                    // A local named here is READ for the dimension's value, so in
+                                    // a closure it is a capture (and an enclosing generic is
+                                    // `E0418`), exactly as in an expression (`closures.rs`).
+                                    self.note_value_use(nm, ga.span);
                                     Dim::Var(nm)
                                 };
                                 dims.insert(*g, d);

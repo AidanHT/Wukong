@@ -765,6 +765,57 @@ mod tests {
         );
     }
 
+    /// A local named in a turbofish is read for the dimension's value, so in a closure it is a
+    /// capture. Missed, the lifted function had no binding of the name and the dimension quietly
+    /// came from the argument's shape instead (`sumn::<n>` over 4 elements summed all 4).
+    #[test]
+    fn a_turbofish_local_is_a_capture() {
+        let sumn = "fn sumn<N>(a: [f32; N]) -> f32 { let mut s = 0.0; \
+                    for i in 0..N { s = s + a[i]; } return s; } ";
+        let mut got = infos(&format!(
+            "{APPLY}{sumn} fn main() -> i32 {{ let xs: [f32; 4] = [1.0, 2.0, 3.0, 4.0]; \
+             let px = &xs; let n = 3; return apply(|x| x + sumn::<n>(*px), 0.0) as i32; }}"
+        ))[0]
+            .0
+            .clone();
+        got.sort();
+        assert_eq!(got, vec!["n", "px"]);
+        // A kernel builtin's dimension turbofish reads its local the same way.
+        let mut got = infos(&format!(
+            "{APPLY} fn main() -> i32 {{ let xs: [f32; 4] = [1.0, 2.0, 3.0, 4.0]; \
+             let px = &xs; let m = 3; return apply(|x| x + sum::<m>(*px), 0.0) as i32; }}"
+        ))[0]
+            .0
+            .clone();
+        got.sort();
+        assert_eq!(got, vec!["m", "px"]);
+    }
+
+    /// An enclosing generic named in a turbofish inside a closure is `E0418`, as anywhere else in
+    /// the closure (the lifted function has no generics).
+    #[test]
+    fn an_enclosing_generic_in_a_turbofish_is_e0418() {
+        let dimv = "fn dimv<N>() -> f32 { return N as f32; } ";
+        assert_eq!(
+            error_codes(&format!(
+                "{APPLY}{dimv} fn g<M>(a: [f32; M]) -> f32 {{ \
+                 return apply(|x| x + dimv::<M>(), a[0]); }} \
+                 fn main() -> i32 {{ let a: [f32; 2] = [1.0, 2.0]; return g(a) as i32; }}"
+            )),
+            vec!["E0418"]
+        );
+        // A kernel builtin's turbofish too, and binding the generic to a local is the fix.
+        let g = |dim: &str| {
+            format!(
+                "{APPLY} fn g<M>(a: [f32; M]) -> f32 {{ let b: [f32; 2] = [1.0, 2.0]; let m = M; \
+                 let pb = &b; return apply(|x| x + sum::<{dim}>(*pb), a[0] + (m as f32)); }} \
+                 fn main() -> i32 {{ let a: [f32; 2] = [1.0, 2.0]; return g(a) as i32; }}"
+            )
+        };
+        assert_eq!(error_codes(&g("M")), vec!["E0418"]);
+        assert_eq!(error_codes(&g("m")), Vec::<&str>::new());
+    }
+
     #[test]
     fn a_parameter_typed_by_a_callee_generic_is_e0419() {
         let fold3 =

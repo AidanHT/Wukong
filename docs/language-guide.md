@@ -195,7 +195,8 @@ fn main() -> i32 {
   declared one, else the body's type. With `->` the body must be a block. The closure's type must
   equal the parameter's once the call binds the callee's generics (`E0401`).
 - **Captures.** Every enclosing local the body reads is captured **by value**, copied when the call
-  evaluates that argument (left to right with the other arguments). A scalar (including `bool` and
+  evaluates that argument (left to right with the other arguments); a local named as a dimension in a
+  turbofish (`sumn::<n>(..)`, `sum::<n>(..)`) is read too, and captured the same way. A scalar (including `bool` and
   `char`), a C-style enum, a raw pointer or a reference can be captured. An array, slice, tuple,
   struct, data-carrying enum, tensor or vector, the enclosing function's function-typed parameter, and
   anything naming one of its generic parameters cannot (`E0418`): capture a pointer instead

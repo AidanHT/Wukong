@@ -782,9 +782,13 @@ impl Sema<'_> {
             TypeKind::Path(p) if p.is_single() => {
                 let nm = p.first().sym;
                 if self.generics.contains(&nm) {
+                    // In a closure: `E0418`, as for any use of an enclosing generic.
+                    self.note_generic_use(nm, ga.span);
                     return Some((Dim::Var(nm), false));
                 }
                 if let Some(t) = self.lookup_local(nm) {
+                    // A read of the local: in a closure, a capture (`closures.rs`).
+                    self.note_local_use(nm, ga.span);
                     return match t {
                         Ty::Scalar(s) if s.is_int() => Some((Dim::Var(nm), !s.is_signed())),
                         Ty::Unknown | Ty::Error => None,

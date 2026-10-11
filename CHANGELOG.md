@@ -43,6 +43,13 @@ All notable changes to Wukong are documented here. The format is loosely based o
   closure's `x * a + b` to one `Fma` and `g(0.1, -0.3)` printed `-0.000000007450581` instead of the
   separately rounded `0`; a `@generic` function's closure was recognized. The lifted item now carries
   those three attributes (not `@parallel` or `@tile`) (`tests/run/closure_strict_fp.wk`).
+- **Fixed before merge: a turbofish local inside a closure was not captured.** `sumn::<n>(..)` and a
+  builtin's `sum::<n>(..)` read the local `n` through the type checker's dimension binding, not
+  through an expression, so the closure neither captured it nor rejected it. The lifted function had
+  no `n`, and the dimension silently came from the argument's shape: `apply(|x| x + sumn::<n>(*px),
+  0.5)` with `n = 3` over four elements printed `10.5` instead of `6.5`. Such a local is now a
+  capture, and an enclosing generic named in a closure's turbofish is `E0418` like any other use of
+  one (`tests/run/closure_turbofish_capture.wk`).
 
 ### Type-lowering soundness (`gap4/sema-soundness`)
 
