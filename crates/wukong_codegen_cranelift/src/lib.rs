@@ -3130,7 +3130,9 @@ fn make_isa_full(
     flag_builder
         .set("probestack_strategy", "inline")
         .map_err(|e| e.to_string())?;
-    let isa_builder = target::isa_builder(target)?;
+    // `WUKONG_MAX_ISA` narrows `native` (read once per process by `wukong_runtime::isa::cap`), so
+    // every JIT and object entry point that targets the host inherits the cap from this one place.
+    let isa_builder = target::isa_builder(target, wukong_runtime::isa::cap())?;
     isa_builder
         .finish(settings::Flags::new(flag_builder))
         .map_err(|e| e.to_string())
