@@ -176,6 +176,7 @@ pub extern "C" fn wukong_rt_arg_f32(i: i64, default: f32) -> f32 {
 /// `name` must be null or a NUL-terminated string.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_rt_env(name: *const u8) -> *const u8 {
+    // SAFETY-EXEMPT: `name` is null or a NUL-terminated string -- it carries no extent to check.
     // SAFETY: forwarded from this function's contract (`str_operand` reads to the NUL).
     let name = unsafe { crate::fmt::str_operand(name, -1) };
     env_cstr(name).as_ptr() as *const u8
@@ -187,6 +188,8 @@ pub unsafe extern "C" fn wukong_rt_env(name: *const u8) -> *const u8 {
 /// When `cap > 0`, `buf` must be valid for writes of `cap` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_rt_read_stdin(buf: *mut u8, cap: i64) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent(buf, cap);
     let cap = usize::try_from(cap).unwrap_or(0);
     if buf.is_null() || cap == 0 {
         return 0;

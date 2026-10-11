@@ -135,6 +135,14 @@ pub unsafe extern "C" fn wukong_kldiv_f32(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(p, rows, cols);
+        crate::safety::debug_extent_2d(q, rows, cols);
+        crate::safety::debug_extent(out, rows);
+        crate::safety::debug_disjoint(out, rows, p, rows.saturating_mul(cols));
+        crate::safety::debug_disjoint(out, rows, q, rows.saturating_mul(cols));
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -162,6 +170,14 @@ pub unsafe extern "C" fn wukong_kldiv_f32_parallel(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(p, rows, cols);
+        crate::safety::debug_extent_2d(q, rows, cols);
+        crate::safety::debug_extent(out, rows);
+        crate::safety::debug_disjoint(out, rows, p, rows.saturating_mul(cols));
+        crate::safety::debug_disjoint(out, rows, q, rows.saturating_mul(cols));
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }

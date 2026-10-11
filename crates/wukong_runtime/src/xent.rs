@@ -205,6 +205,14 @@ pub unsafe extern "C" fn wukong_xent_fwd_f32(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent(target, rows);
+        crate::safety::debug_extent(loss, rows);
+        crate::safety::debug_disjoint(loss, rows, x, rows.saturating_mul(cols));
+        crate::safety::debug_disjoint(loss, rows, target, rows);
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -235,6 +243,14 @@ pub unsafe extern "C" fn wukong_xent_fwd_f32_parallel(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent(target, rows);
+        crate::safety::debug_extent(loss, rows);
+        crate::safety::debug_disjoint(loss, rows, x, rows.saturating_mul(cols));
+        crate::safety::debug_disjoint(loss, rows, target, rows);
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }

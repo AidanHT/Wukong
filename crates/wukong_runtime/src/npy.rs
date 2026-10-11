@@ -326,6 +326,12 @@ pub unsafe extern "C" fn wukong_rt_npy_read(
     dims: *const i64,
     rank: i64,
 ) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above); `path` is a NUL-terminated
+    // string (no extent to check).
+    if let Some(sz) = crate::fileio::dtype_size(dtype) {
+        crate::safety::debug_extent_bytes(data, len, sz);
+    }
+    crate::safety::debug_extent(dims, rank);
     // SAFETY: every pointer is forwarded under this function's own contract.
     unsafe {
         fileio::read_container_native(

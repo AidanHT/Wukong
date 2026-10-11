@@ -114,6 +114,22 @@ pub unsafe extern "C" fn wukong_lrscan_f32(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent_2d(a, rows, cols);
+    crate::safety::debug_extent_2d(b, rows, cols);
+    crate::safety::debug_extent_2d(out, rows, cols);
+    crate::safety::debug_inplace_or_disjoint(
+        out,
+        rows.saturating_mul(cols),
+        a,
+        rows.saturating_mul(cols),
+    );
+    crate::safety::debug_inplace_or_disjoint(
+        out,
+        rows.saturating_mul(cols),
+        b,
+        rows.saturating_mul(cols),
+    );
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -140,6 +156,22 @@ pub unsafe extern "C" fn wukong_lrscan_f32_parallel(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent_2d(a, rows, cols);
+    crate::safety::debug_extent_2d(b, rows, cols);
+    crate::safety::debug_extent_2d(out, rows, cols);
+    crate::safety::debug_inplace_or_disjoint(
+        out,
+        rows.saturating_mul(cols),
+        a,
+        rows.saturating_mul(cols),
+    );
+    crate::safety::debug_inplace_or_disjoint(
+        out,
+        rows.saturating_mul(cols),
+        b,
+        rows.saturating_mul(cols),
+    );
     if rows <= 0 || cols <= 0 {
         return;
     }

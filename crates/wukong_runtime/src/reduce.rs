@@ -370,6 +370,9 @@ unsafe fn reduce_chunk_avx2_mono<const OP: i64>(
 /// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sreduce_f32(x: *const f32, y: *const f32, n: i64, op: i64) -> f32 {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent(x, n);
+    crate::safety::debug_extent(y, n);
     if n <= 0 {
         return ident(op);
     }
@@ -402,6 +405,9 @@ pub unsafe extern "C" fn wukong_sreduce_f32_parallel(
     n: i64,
     op: i64,
 ) -> f32 {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent(x, n);
+    crate::safety::debug_extent(y, n);
     if n <= 0 {
         return ident(op);
     }
@@ -624,6 +630,8 @@ unsafe fn argreduce_chunk_avx2<const PRED: i32>(
 /// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_argreduce_f32(x: *const f32, n: i64, op: i64) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent(x, n);
     if n <= 0 {
         return -1;
     }
@@ -655,6 +663,8 @@ pub unsafe extern "C" fn wukong_argreduce_f32(x: *const f32, n: i64, op: i64) ->
 /// value, so the inputs may share storage freely.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_argreduce_f32_parallel(x: *const f32, n: i64, op: i64) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent(x, n);
     if n <= 0 {
         return -1;
     }

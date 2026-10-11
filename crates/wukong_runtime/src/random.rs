@@ -86,6 +86,8 @@ pub fn rand_f32(seed: u64, ctr: u64) -> f32 {
 /// `out` must address `n` writable `f32`s (it is not touched when `n <= 0`).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_rand_fill_f32(out: *mut f32, n: i64, seed: i64, ctr0: i64) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent(out, n);
     if n <= 0 {
         return;
     }

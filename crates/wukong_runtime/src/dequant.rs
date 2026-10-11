@@ -278,6 +278,11 @@ pub unsafe extern "C" fn wukong_dequant_f32(
     scale: f32,
     op: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    let qb = n.saturating_mul(if op & DQ_WIDTH_MASK == DQ_I32 { 4 } else { 1 });
+    crate::safety::debug_extent(q, qb);
+    crate::safety::debug_extent(out, n);
+    crate::safety::debug_disjoint(out, n, q, qb);
     if n <= 0 {
         return;
     }
@@ -319,6 +324,11 @@ pub unsafe extern "C" fn wukong_dequant_f32_parallel(
     scale: f32,
     op: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    let qb = n.saturating_mul(if op & DQ_WIDTH_MASK == DQ_I32 { 4 } else { 1 });
+    crate::safety::debug_extent(q, qb);
+    crate::safety::debug_extent(out, n);
+    crate::safety::debug_disjoint(out, n, q, qb);
     if n <= 0 {
         return;
     }
@@ -494,6 +504,17 @@ pub unsafe extern "C" fn wukong_dequant_perchan_f32(
     scale: *const f32,
     op: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        let qb = rows
+            .saturating_mul(cols)
+            .saturating_mul(if op & DQ_WIDTH_MASK == DQ_I32 { 4 } else { 1 });
+        crate::safety::debug_extent(q, qb);
+        crate::safety::debug_extent_2d(out, rows, cols);
+        crate::safety::debug_extent(scale, cols);
+        crate::safety::debug_disjoint(out, rows.saturating_mul(cols), q, qb);
+        crate::safety::debug_disjoint(out, rows.saturating_mul(cols), scale, cols);
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -545,6 +566,17 @@ pub unsafe extern "C" fn wukong_dequant_perchan_f32_parallel(
     scale: *const f32,
     op: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        let qb = rows
+            .saturating_mul(cols)
+            .saturating_mul(if op & DQ_WIDTH_MASK == DQ_I32 { 4 } else { 1 });
+        crate::safety::debug_extent(q, qb);
+        crate::safety::debug_extent_2d(out, rows, cols);
+        crate::safety::debug_extent(scale, cols);
+        crate::safety::debug_disjoint(out, rows.saturating_mul(cols), q, qb);
+        crate::safety::debug_disjoint(out, rows.saturating_mul(cols), scale, cols);
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }

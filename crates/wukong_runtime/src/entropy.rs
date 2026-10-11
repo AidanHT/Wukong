@@ -135,6 +135,12 @@ unsafe fn entropy_row(p: *const f32, n: usize) -> f32 {
 /// (`wukong_mir_build`'s `kernel_guard.rs` versions the dispatch on a run-time overlap test).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_entropy_f32(p: *const f32, out: *mut f32, rows: i64, cols: i64) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(p, rows, cols);
+        crate::safety::debug_extent(out, rows);
+        crate::safety::debug_disjoint(out, rows, p, rows.saturating_mul(cols));
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -162,6 +168,12 @@ pub unsafe extern "C" fn wukong_entropy_f32_parallel(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(p, rows, cols);
+        crate::safety::debug_extent(out, rows);
+        crate::safety::debug_disjoint(out, rows, p, rows.saturating_mul(cols));
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }

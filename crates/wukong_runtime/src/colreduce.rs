@@ -600,6 +600,12 @@ pub unsafe extern "C" fn wukong_colsum_f32_parallel(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent(out, cols);
+        crate::safety::debug_disjoint(out, cols, x, rows.saturating_mul(cols));
+    }
     colreduce_parallel(x, out, rows, cols, ColKind::Sum);
 }
 
@@ -611,6 +617,12 @@ pub unsafe extern "C" fn wukong_colsum_f32_parallel(
 /// **Aliasing: all operands disjoint** — `out` does not overlap `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_colmax_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent(out, cols);
+        crate::safety::debug_disjoint(out, cols, x, rows.saturating_mul(cols));
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -637,6 +649,12 @@ pub unsafe extern "C" fn wukong_colmax_f32_parallel(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent(out, cols);
+        crate::safety::debug_disjoint(out, cols, x, rows.saturating_mul(cols));
+    }
     colreduce_parallel(x, out, rows, cols, ColKind::Max);
 }
 
@@ -648,6 +666,12 @@ pub unsafe extern "C" fn wukong_colmax_f32_parallel(
 /// **Aliasing: all operands disjoint** — `out` does not overlap `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_colmin_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent(out, cols);
+        crate::safety::debug_disjoint(out, cols, x, rows.saturating_mul(cols));
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -674,6 +698,12 @@ pub unsafe extern "C" fn wukong_colmin_f32_parallel(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent(out, cols);
+        crate::safety::debug_disjoint(out, cols, x, rows.saturating_mul(cols));
+    }
     colreduce_parallel(x, out, rows, cols, ColKind::Min);
 }
 
@@ -685,6 +715,12 @@ pub unsafe extern "C" fn wukong_colmin_f32_parallel(
 /// **Aliasing: all operands disjoint** — `out` does not overlap `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_colmaxabs_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent(out, cols);
+        crate::safety::debug_disjoint(out, cols, x, rows.saturating_mul(cols));
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -712,6 +748,12 @@ pub unsafe extern "C" fn wukong_colmaxabs_f32_parallel(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent(out, cols);
+        crate::safety::debug_disjoint(out, cols, x, rows.saturating_mul(cols));
+    }
     colreduce_parallel(x, out, rows, cols, ColKind::MaxAbs);
 }
 
@@ -724,6 +766,12 @@ pub unsafe extern "C" fn wukong_colmaxabs_f32_parallel(
 /// **Aliasing: all operands disjoint** — `out` does not overlap `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_colmean_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent(out, cols);
+        crate::safety::debug_disjoint(out, cols, x, rows.saturating_mul(cols));
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -751,6 +799,12 @@ pub unsafe extern "C" fn wukong_colmean_f32_parallel(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent(out, cols);
+        crate::safety::debug_disjoint(out, cols, x, rows.saturating_mul(cols));
+    }
     colreduce_parallel(x, out, rows, cols, ColKind::Mean);
 }
 
@@ -763,6 +817,12 @@ pub unsafe extern "C" fn wukong_colmean_f32_parallel(
 /// **Aliasing: all operands disjoint** — `out` does not overlap `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_coll2_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent(out, cols);
+        crate::safety::debug_disjoint(out, cols, x, rows.saturating_mul(cols));
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -789,6 +849,12 @@ pub unsafe extern "C" fn wukong_coll2_f32_parallel(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent(out, cols);
+        crate::safety::debug_disjoint(out, cols, x, rows.saturating_mul(cols));
+    }
     colreduce_parallel(x, out, rows, cols, ColKind::L2);
 }
 
@@ -801,6 +867,12 @@ pub unsafe extern "C" fn wukong_coll2_f32_parallel(
 /// **Aliasing: all operands disjoint** — `out` does not overlap `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_colrms_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent(out, cols);
+        crate::safety::debug_disjoint(out, cols, x, rows.saturating_mul(cols));
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -827,6 +899,12 @@ pub unsafe extern "C" fn wukong_colrms_f32_parallel(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent(out, cols);
+        crate::safety::debug_disjoint(out, cols, x, rows.saturating_mul(cols));
+    }
     colreduce_parallel(x, out, rows, cols, ColKind::Rms);
 }
 
@@ -839,6 +917,12 @@ pub unsafe extern "C" fn wukong_colrms_f32_parallel(
 /// **Aliasing: all operands disjoint** — `out` does not overlap `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_colsumsq_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent(out, cols);
+        crate::safety::debug_disjoint(out, cols, x, rows.saturating_mul(cols));
+    }
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -866,6 +950,12 @@ pub unsafe extern "C" fn wukong_colsumsq_f32_parallel(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent(out, cols);
+        crate::safety::debug_disjoint(out, cols, x, rows.saturating_mul(cols));
+    }
     colreduce_parallel(x, out, rows, cols, ColKind::SumSq);
 }
 

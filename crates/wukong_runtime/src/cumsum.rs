@@ -149,6 +149,15 @@ unsafe fn cumsum_row(x: *const f32, out: *mut f32, base: usize, cols: usize) {
 /// is loaded before it is stored); a SHIFTED view of `x` is not the source scan.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_cumsum_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent_2d(x, rows, cols);
+    crate::safety::debug_extent_2d(out, rows, cols);
+    crate::safety::debug_inplace_or_disjoint(
+        out,
+        rows.saturating_mul(cols),
+        x,
+        rows.saturating_mul(cols),
+    );
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -177,6 +186,15 @@ pub unsafe extern "C" fn wukong_cumsum_f32_parallel(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent_2d(x, rows, cols);
+    crate::safety::debug_extent_2d(out, rows, cols);
+    crate::safety::debug_inplace_or_disjoint(
+        out,
+        rows.saturating_mul(cols),
+        x,
+        rows.saturating_mul(cols),
+    );
     if rows <= 0 || cols <= 0 {
         return;
     }

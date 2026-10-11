@@ -553,6 +553,14 @@ pub unsafe extern "C" fn wukong_i8gemm_nt(
     k: i64,
     n: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     if m <= 0 || k <= 0 || n <= 0 {
         return;
     }
@@ -586,6 +594,14 @@ pub unsafe extern "C" fn wukong_i8gemm_nt_parallel(
     k: i64,
     n: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     if m <= 0 || k <= 0 || n <= 0 {
         return;
     }
@@ -702,6 +718,18 @@ pub unsafe extern "C" fn wukong_i8gemm_nt_deq(
     bias: *const f32,
     act: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(out, m, n);
+        crate::safety::debug_extent(scale_b, n);
+        crate::safety::debug_extent_opt(bias, n);
+        crate::safety::debug_disjoint(out, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(out, m.saturating_mul(n), b, k.saturating_mul(n));
+        crate::safety::debug_disjoint(out, m.saturating_mul(n), scale_b, n);
+        crate::safety::debug_disjoint(out, m.saturating_mul(n), bias, n);
+    }
     if m <= 0 || k <= 0 || n <= 0 {
         return;
     }
@@ -825,6 +853,18 @@ pub unsafe extern "C" fn wukong_i8gemm_nt_deq_parallel(
     bias: *const f32,
     act: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(out, m, n);
+        crate::safety::debug_extent(scale_b, n);
+        crate::safety::debug_extent_opt(bias, n);
+        crate::safety::debug_disjoint(out, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(out, m.saturating_mul(n), b, k.saturating_mul(n));
+        crate::safety::debug_disjoint(out, m.saturating_mul(n), scale_b, n);
+        crate::safety::debug_disjoint(out, m.saturating_mul(n), bias, n);
+    }
     if m <= 0 || k <= 0 || n <= 0 {
         return;
     }

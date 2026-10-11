@@ -389,6 +389,11 @@ pub unsafe extern "C" fn wukong_rt_read_dt(
     len: i64,
     dtype: i64,
 ) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above); `path` is a NUL-terminated
+    // string (no extent to check).
+    if let Some(sz) = dtype_size(dtype) {
+        crate::safety::debug_extent_bytes(data, len, sz);
+    }
     // SAFETY: forwarded from this function's contract.
     let Some(path) = (unsafe { crate::rt_path(path) }) else {
         return IO_OPEN_FAILED;
@@ -436,6 +441,11 @@ pub unsafe extern "C" fn wukong_rt_write_dt(
     len: i64,
     dtype: i64,
 ) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above); `path` is a NUL-terminated
+    // string (no extent to check).
+    if let Some(sz) = dtype_size(dtype) {
+        crate::safety::debug_extent_bytes(data, len, sz);
+    }
     // SAFETY: forwarded from this function's contract.
     let Some(path) = (unsafe { crate::rt_path(path) }) else {
         return IO_OPEN_FAILED;
@@ -469,6 +479,7 @@ pub unsafe extern "C" fn wukong_rt_write_dt(
 /// `path` must be null or a NUL-terminated byte string.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_rt_file_size(path: *const u8) -> i64 {
+    // SAFETY-EXEMPT: `path` is null or a NUL-terminated string -- it carries no extent to check.
     // SAFETY: forwarded from this function's contract.
     let Some(path) = (unsafe { crate::rt_path(path) }) else {
         return IO_OPEN_FAILED;

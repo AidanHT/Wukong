@@ -714,6 +714,14 @@ pub unsafe extern "C" fn wukong_sgemm(
     n: i64,
     beta: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, k, n);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     gemm_dispatch(a, b, c, m, k, n, beta, false, false, false, None);
 }
 
@@ -736,6 +744,14 @@ pub unsafe extern "C" fn wukong_sgemm_nt(
     n: i64,
     beta: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     gemm_dispatch(a, b, c, m, k, n, beta, false, true, false, None);
 }
 
@@ -764,6 +780,16 @@ pub unsafe extern "C" fn wukong_sgemm_nt_epi(
     bias: *const f32,
     act: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_extent_opt(bias, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), bias, n);
+    }
     let epi = Epilogue {
         bias,
         act: act as u32,
@@ -804,6 +830,14 @@ pub unsafe extern "C" fn wukong_sgemm_nt_alpha(
     beta: i64,
     alpha: f32,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     let epi = Epilogue {
         bias: std::ptr::null(),
         act: ACT_IDENTITY,
@@ -835,6 +869,14 @@ pub unsafe extern "C" fn wukong_sgemm_nt_alpha_parallel(
     beta: i64,
     alpha: f32,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     let epi = Epilogue {
         bias: std::ptr::null(),
         act: ACT_IDENTITY,
@@ -992,6 +1034,14 @@ pub unsafe extern "C" fn wukong_sgemm_parallel(
     n: i64,
     beta: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, k, n);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     gemm_dispatch(a, b, c, m, k, n, beta, false, false, true, None);
 }
 
@@ -1013,6 +1063,14 @@ pub unsafe extern "C" fn wukong_sgemm_nt_parallel(
     n: i64,
     beta: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     gemm_dispatch(a, b, c, m, k, n, beta, false, true, true, None);
 }
 
@@ -1042,6 +1100,16 @@ pub unsafe extern "C" fn wukong_sgemm_nt_epi_parallel(
     bias: *const f32,
     act: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_extent_opt(bias, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), bias, n);
+    }
     let epi = Epilogue {
         bias,
         act: act as u32,
@@ -1082,6 +1150,14 @@ pub unsafe extern "C" fn wukong_sgemm_tn(
     n: i64,
     beta: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, k, m);
+        crate::safety::debug_extent_2d(b, k, n);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     gemm_dispatch(a, b, c, m, k, n, beta, true, false, false, None);
 }
 
@@ -1105,6 +1181,14 @@ pub unsafe extern "C" fn wukong_sgemm_tn_parallel(
     n: i64,
     beta: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, k, m);
+        crate::safety::debug_extent_2d(b, k, n);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     gemm_dispatch(a, b, c, m, k, n, beta, true, false, true, None);
 }
 
@@ -1311,6 +1395,14 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_nt(
     n: i64,
     beta: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     gemm_lowp_nt(a, b, c, m, k, n, beta, false, HalfKind::Bf16, None);
 }
 
@@ -1333,6 +1425,14 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_nt_parallel(
     n: i64,
     beta: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     gemm_lowp_nt(a, b, c, m, k, n, beta, true, HalfKind::Bf16, None);
 }
 
@@ -1354,6 +1454,14 @@ pub unsafe extern "C" fn wukong_sgemm_f16_nt(
     n: i64,
     beta: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     gemm_lowp_nt(a, b, c, m, k, n, beta, false, HalfKind::F16, None);
 }
 
@@ -1374,6 +1482,14 @@ pub unsafe extern "C" fn wukong_sgemm_f16_nt_parallel(
     n: i64,
     beta: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     gemm_lowp_nt(a, b, c, m, k, n, beta, true, HalfKind::F16, None);
 }
 
@@ -1430,6 +1546,16 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_nt_epi(
     bias: *const f32,
     act: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_extent_opt(bias, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), bias, n);
+    }
     gemm_lowp_nt_epi(a, b, c, m, k, n, beta, bias, act, false, HalfKind::Bf16);
 }
 
@@ -1452,6 +1578,16 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_nt_epi_parallel(
     bias: *const f32,
     act: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_extent_opt(bias, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), bias, n);
+    }
     gemm_lowp_nt_epi(a, b, c, m, k, n, beta, bias, act, true, HalfKind::Bf16);
 }
 
@@ -1476,6 +1612,16 @@ pub unsafe extern "C" fn wukong_sgemm_f16_nt_epi(
     bias: *const f32,
     act: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_extent_opt(bias, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), bias, n);
+    }
     gemm_lowp_nt_epi(a, b, c, m, k, n, beta, bias, act, false, HalfKind::F16);
 }
 
@@ -1498,6 +1644,16 @@ pub unsafe extern "C" fn wukong_sgemm_f16_nt_epi_parallel(
     bias: *const f32,
     act: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, m, k);
+        crate::safety::debug_extent_2d(b, n, k);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_extent_opt(bias, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), bias, n);
+    }
     gemm_lowp_nt_epi(a, b, c, m, k, n, beta, bias, act, true, HalfKind::F16);
 }
 
@@ -1560,6 +1716,14 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_tn(
     n: i64,
     beta: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, k, m);
+        crate::safety::debug_extent_2d(b, k, n);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     gemm_lowp_tn(a, b, c, m, k, n, beta, false, HalfKind::Bf16);
 }
 
@@ -1582,6 +1746,14 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_tn_parallel(
     n: i64,
     beta: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, k, m);
+        crate::safety::debug_extent_2d(b, k, n);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     gemm_lowp_tn(a, b, c, m, k, n, beta, true, HalfKind::Bf16);
 }
 
@@ -1603,6 +1775,14 @@ pub unsafe extern "C" fn wukong_sgemm_f16_tn(
     n: i64,
     beta: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, k, m);
+        crate::safety::debug_extent_2d(b, k, n);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     gemm_lowp_tn(a, b, c, m, k, n, beta, false, HalfKind::F16);
 }
 
@@ -1623,6 +1803,14 @@ pub unsafe extern "C" fn wukong_sgemm_f16_tn_parallel(
     n: i64,
     beta: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && m > 0 && n > 0 {
+        crate::safety::debug_extent_2d(a, k, m);
+        crate::safety::debug_extent_2d(b, k, n);
+        crate::safety::debug_extent_2d(c, m, n);
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), a, m.saturating_mul(k));
+        crate::safety::debug_disjoint(c, m.saturating_mul(n), b, k.saturating_mul(n));
+    }
     gemm_lowp_tn(a, b, c, m, k, n, beta, true, HalfKind::F16);
 }
 

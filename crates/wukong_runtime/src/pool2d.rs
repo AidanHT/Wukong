@@ -488,6 +488,20 @@ pub unsafe extern "C" fn wukong_maxpool2d_f32(
     sh: i64,
     sw: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && channels > 0 {
+        if let Some((oh, ow)) = pool2d_output_dims(h, w, kh, kw, sh, sw) {
+            let (in_n, out_n) = (h.saturating_mul(w), (oh as i64).saturating_mul(ow as i64));
+            crate::safety::debug_extent_2d(x, channels, in_n);
+            crate::safety::debug_extent_2d(out, channels, out_n);
+            crate::safety::debug_disjoint(
+                out,
+                channels.saturating_mul(out_n),
+                x,
+                channels.saturating_mul(in_n),
+            );
+        }
+    }
     pool2d_serial(x, out, channels, h, w, kh, kw, sh, sw, PoolKind::Max);
 }
 
@@ -511,6 +525,20 @@ pub unsafe extern "C" fn wukong_maxpool2d_f32_parallel(
     sh: i64,
     sw: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && channels > 0 {
+        if let Some((oh, ow)) = pool2d_output_dims(h, w, kh, kw, sh, sw) {
+            let (in_n, out_n) = (h.saturating_mul(w), (oh as i64).saturating_mul(ow as i64));
+            crate::safety::debug_extent_2d(x, channels, in_n);
+            crate::safety::debug_extent_2d(out, channels, out_n);
+            crate::safety::debug_disjoint(
+                out,
+                channels.saturating_mul(out_n),
+                x,
+                channels.saturating_mul(in_n),
+            );
+        }
+    }
     pool2d_parallel(x, out, channels, h, w, kh, kw, sh, sw, PoolKind::Max);
 }
 
@@ -535,6 +563,20 @@ pub unsafe extern "C" fn wukong_avgpool2d_f32(
     sh: i64,
     sw: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && channels > 0 {
+        if let Some((oh, ow)) = pool2d_output_dims(h, w, kh, kw, sh, sw) {
+            let (in_n, out_n) = (h.saturating_mul(w), (oh as i64).saturating_mul(ow as i64));
+            crate::safety::debug_extent_2d(x, channels, in_n);
+            crate::safety::debug_extent_2d(out, channels, out_n);
+            crate::safety::debug_disjoint(
+                out,
+                channels.saturating_mul(out_n),
+                x,
+                channels.saturating_mul(in_n),
+            );
+        }
+    }
     pool2d_serial(x, out, channels, h, w, kh, kw, sh, sw, PoolKind::Avg);
 }
 
@@ -558,6 +600,20 @@ pub unsafe extern "C" fn wukong_avgpool2d_f32_parallel(
     sh: i64,
     sw: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && channels > 0 {
+        if let Some((oh, ow)) = pool2d_output_dims(h, w, kh, kw, sh, sw) {
+            let (in_n, out_n) = (h.saturating_mul(w), (oh as i64).saturating_mul(ow as i64));
+            crate::safety::debug_extent_2d(x, channels, in_n);
+            crate::safety::debug_extent_2d(out, channels, out_n);
+            crate::safety::debug_disjoint(
+                out,
+                channels.saturating_mul(out_n),
+                x,
+                channels.saturating_mul(in_n),
+            );
+        }
+    }
     pool2d_parallel(x, out, channels, h, w, kh, kw, sh, sw, PoolKind::Avg);
 }
 

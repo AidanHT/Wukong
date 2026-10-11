@@ -396,6 +396,12 @@ unsafe fn colarg_par(x: *const f32, out: *mut i32, rows: i64, cols: i64, is_max:
 /// **Aliasing: all operands disjoint** — the `i32` output does not overlap `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_colargmax_i32(x: *const f32, out: *mut i32, rows: i64, cols: i64) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent(out, cols);
+        crate::safety::debug_disjoint(out, cols, x, rows.saturating_mul(cols));
+    }
     colarg_serial(x, out, rows, cols, true);
 }
 
@@ -412,6 +418,12 @@ pub unsafe extern "C" fn wukong_colargmax_i32_parallel(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent(out, cols);
+        crate::safety::debug_disjoint(out, cols, x, rows.saturating_mul(cols));
+    }
     colarg_par(x, out, rows, cols, true);
 }
 
@@ -424,6 +436,12 @@ pub unsafe extern "C" fn wukong_colargmax_i32_parallel(
 /// **Aliasing: all operands disjoint** — the `i32` output does not overlap `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_colargmin_i32(x: *const f32, out: *mut i32, rows: i64, cols: i64) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent(out, cols);
+        crate::safety::debug_disjoint(out, cols, x, rows.saturating_mul(cols));
+    }
     colarg_serial(x, out, rows, cols, false);
 }
 
@@ -440,6 +458,12 @@ pub unsafe extern "C" fn wukong_colargmin_i32_parallel(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && rows > 0 && cols > 0 {
+        crate::safety::debug_extent_2d(x, rows, cols);
+        crate::safety::debug_extent(out, cols);
+        crate::safety::debug_disjoint(out, cols, x, rows.saturating_mul(cols));
+    }
     colarg_par(x, out, rows, cols, false);
 }
 

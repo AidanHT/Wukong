@@ -710,6 +710,12 @@ pub unsafe extern "C" fn wukong_attention_kv_f32(
     scale: f32,
     causal: i64,
 ) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above); operand lengths are
+    // explicit; an `o` overlapping an input is handled (value semantics).
+    crate::safety::debug_extent(q, q_len);
+    crate::safety::debug_extent(k, k_len);
+    crate::safety::debug_extent(v, v_len);
+    crate::safety::debug_extent(o, o_len);
     let geo = [sq, skv, d, q_pos0, n_heads, n_kv_heads, q_stride, kv_stride];
     attention_kv_entry(
         q,
@@ -753,6 +759,12 @@ pub unsafe extern "C" fn wukong_attention_kv_f32_parallel(
     scale: f32,
     causal: i64,
 ) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above); operand lengths are
+    // explicit; an `o` overlapping an input is handled (value semantics).
+    crate::safety::debug_extent(q, q_len);
+    crate::safety::debug_extent(k, k_len);
+    crate::safety::debug_extent(v, v_len);
+    crate::safety::debug_extent(o, o_len);
     let geo = [sq, skv, d, q_pos0, n_heads, n_kv_heads, q_stride, kv_stride];
     attention_kv_entry(
         q,
@@ -812,6 +824,9 @@ pub unsafe extern "C" fn wukong_kv_append_f32(
     pos: i64,
     stride: i64,
 ) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent(cache, cache_len);
+    crate::safety::debug_extent(row, row_len);
     match kv_append_plan(cache_len, row_len, pos, stride) {
         Err(code) => code,
         Ok(None) => KV_OK,

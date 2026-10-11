@@ -114,6 +114,16 @@ pub unsafe extern "C" fn wukong_attention_f32(
     scale: f32,
     causal: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && s > 0 && d > 0 {
+        crate::safety::debug_extent_2d(q, s, d);
+        crate::safety::debug_extent_2d(k, s, d);
+        crate::safety::debug_extent_2d(v, s, d);
+        crate::safety::debug_extent_2d(o, s, d);
+        crate::safety::debug_disjoint(o, s.saturating_mul(d), q, s.saturating_mul(d));
+        crate::safety::debug_disjoint(o, s.saturating_mul(d), k, s.saturating_mul(d));
+        crate::safety::debug_disjoint(o, s.saturating_mul(d), v, s.saturating_mul(d));
+    }
     if s <= 0 || d <= 0 {
         return;
     }

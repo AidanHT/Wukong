@@ -470,6 +470,11 @@ pub unsafe extern "C" fn wukong_sgemv_bf16(
     y: *mut f32,
     y_len: i64,
 ) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above); operand lengths are
+    // explicit; an overlapping `y` is handled (value semantics).
+    crate::safety::debug_extent(w, w_len);
+    crate::safety::debug_extent(x, x_len);
+    crate::safety::debug_extent(y, y_len);
     sgemv_half_entry(w, w_len, x, x_len, y, y_len, HalfKind::Bf16, false)
 }
 
@@ -486,6 +491,11 @@ pub unsafe extern "C" fn wukong_sgemv_bf16_parallel(
     y: *mut f32,
     y_len: i64,
 ) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above); operand lengths are
+    // explicit; an overlapping `y` is handled (value semantics).
+    crate::safety::debug_extent(w, w_len);
+    crate::safety::debug_extent(x, x_len);
+    crate::safety::debug_extent(y, y_len);
     sgemv_half_entry(w, w_len, x, x_len, y, y_len, HalfKind::Bf16, true)
 }
 
@@ -503,6 +513,11 @@ pub unsafe extern "C" fn wukong_sgemv_f16(
     y: *mut f32,
     y_len: i64,
 ) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above); operand lengths are
+    // explicit; an overlapping `y` is handled (value semantics).
+    crate::safety::debug_extent(w, w_len);
+    crate::safety::debug_extent(x, x_len);
+    crate::safety::debug_extent(y, y_len);
     sgemv_half_entry(w, w_len, x, x_len, y, y_len, HalfKind::F16, false)
 }
 
@@ -519,6 +534,11 @@ pub unsafe extern "C" fn wukong_sgemv_f16_parallel(
     y: *mut f32,
     y_len: i64,
 ) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above); operand lengths are
+    // explicit; an overlapping `y` is handled (value semantics).
+    crate::safety::debug_extent(w, w_len);
+    crate::safety::debug_extent(x, x_len);
+    crate::safety::debug_extent(y, y_len);
     sgemv_half_entry(w, w_len, x, x_len, y, y_len, HalfKind::F16, true)
 }
 

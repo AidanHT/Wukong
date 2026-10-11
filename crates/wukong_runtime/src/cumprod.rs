@@ -79,6 +79,15 @@ unsafe fn cumprod_rows(x: *const f32, out: *mut f32, cols: usize, r0: usize, r1:
 /// `x` is not the source scan.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_cumprod_f32(x: *const f32, out: *mut f32, rows: i64, cols: i64) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent_2d(x, rows, cols);
+    crate::safety::debug_extent_2d(out, rows, cols);
+    crate::safety::debug_inplace_or_disjoint(
+        out,
+        rows.saturating_mul(cols),
+        x,
+        rows.saturating_mul(cols),
+    );
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -102,6 +111,15 @@ pub unsafe extern "C" fn wukong_cumprod_f32_parallel(
     rows: i64,
     cols: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent_2d(x, rows, cols);
+    crate::safety::debug_extent_2d(out, rows, cols);
+    crate::safety::debug_inplace_or_disjoint(
+        out,
+        rows.saturating_mul(cols),
+        x,
+        rows.saturating_mul(cols),
+    );
     if rows <= 0 || cols <= 0 {
         return;
     }

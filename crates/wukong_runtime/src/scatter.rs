@@ -160,6 +160,14 @@ pub unsafe extern "C" fn wukong_scatter_add_f32(
     h: i64,
     v: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && t > 0 && h > 0 && v > 0 {
+        crate::safety::debug_extent_2d(grad_w, v, h);
+        crate::safety::debug_extent_2d(grad_out, t, h);
+        crate::safety::debug_extent(ids, t);
+        crate::safety::debug_disjoint(grad_w, v.saturating_mul(h), grad_out, t.saturating_mul(h));
+        crate::safety::debug_disjoint(grad_w, v.saturating_mul(h), ids, t);
+    }
     if t <= 0 || h <= 0 || v <= 0 {
         return;
     }
@@ -190,6 +198,14 @@ pub unsafe extern "C" fn wukong_scatter_add_f32_parallel(
     h: i64,
     v: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && t > 0 && h > 0 && v > 0 {
+        crate::safety::debug_extent_2d(grad_w, v, h);
+        crate::safety::debug_extent_2d(grad_out, t, h);
+        crate::safety::debug_extent(ids, t);
+        crate::safety::debug_disjoint(grad_w, v.saturating_mul(h), grad_out, t.saturating_mul(h));
+        crate::safety::debug_disjoint(grad_w, v.saturating_mul(h), ids, t);
+    }
     if t <= 0 || h <= 0 || v <= 0 {
         return;
     }

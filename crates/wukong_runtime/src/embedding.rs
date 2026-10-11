@@ -166,6 +166,14 @@ pub unsafe extern "C" fn wukong_embedding_f32(
     h: i64,
     v: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && t > 0 && h > 0 {
+        crate::safety::debug_extent_2d(out, t, h);
+        crate::safety::debug_extent_2d(weight, v, h);
+        crate::safety::debug_extent(ids, t);
+        crate::safety::debug_disjoint(out, t.saturating_mul(h), weight, v.saturating_mul(h));
+        crate::safety::debug_disjoint(out, t.saturating_mul(h), ids, t);
+    }
     if t <= 0 || h <= 0 {
         return;
     }
@@ -199,6 +207,14 @@ pub unsafe extern "C" fn wukong_embedding_f32_parallel(
     h: i64,
     v: i64,
 ) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    if cfg!(debug_assertions) && t > 0 && h > 0 {
+        crate::safety::debug_extent_2d(out, t, h);
+        crate::safety::debug_extent_2d(weight, v, h);
+        crate::safety::debug_extent(ids, t);
+        crate::safety::debug_disjoint(out, t.saturating_mul(h), weight, v.saturating_mul(h));
+        crate::safety::debug_disjoint(out, t.saturating_mul(h), ids, t);
+    }
     if t <= 0 || h <= 0 {
         return;
     }

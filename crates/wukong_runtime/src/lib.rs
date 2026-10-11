@@ -622,6 +622,8 @@ pub unsafe extern "C" fn wukong_parallel_for(
     body: extern "C" fn(i64, i64, *const u8),
     env: *const u8,
 ) {
+    // SAFETY-EXEMPT: `env` is the outlined body's opaque capture table, read only by `body` -- it
+    // has no extent or element type the runtime could check.
     if n <= 0 {
         return;
     }
@@ -703,6 +705,7 @@ pub extern "C" fn wukong_rt_alloc(count: i64, elem_size: i64, _elem_is_float: i6
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[no_mangle]
 pub extern "C" fn wukong_rt_free(data: *mut u8) {
+    // SAFETY-EXEMPT: `data` is null or a `wukong_rt_alloc` pointer -- a handle, not an extent.
     if data.is_null() {
         return;
     }

@@ -1083,6 +1083,10 @@ const VMATH_PAR_MIN: usize = VMATH_CHUNK;
 /// is not the elementwise source loop.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_vmath_f32_parallel(x: *const f32, out: *mut f32, n: i64, op: i64) {
+    // P14.5: debug-build contract checks (the `# Safety` section above).
+    crate::safety::debug_extent(x, n);
+    crate::safety::debug_extent(out, n);
+    crate::safety::debug_inplace_or_disjoint(out, n, x, n);
     if n <= 0 {
         return;
     }
@@ -2123,6 +2127,11 @@ where
 /// **Aliasing: all operands disjoint** — the f32 `out` does not overlap the half-precision `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_vmath_bf16(x: *const u16, out: *mut f32, n: i64, op: i64) {
+    // P14.5: debug-build contract checks (the `# Safety` section above); no aliasing assert: the
+    // kernel detects a mixed-width overlap itself and defines it (`half_input_overlaps_f32_output`,
+    // pinned by `mixed_width_overlap_matches_live_byte_reference`), so an overlap is not UB here.
+    crate::safety::debug_extent(x, n);
+    crate::safety::debug_extent(out, n);
     if n <= 0 {
         return;
     }
@@ -2219,6 +2228,11 @@ unsafe fn vmath_bf16_loop<F: Fn(std::arch::x86_64::__m256) -> std::arch::x86_64:
 /// **Aliasing: all operands disjoint** — the f32 `out` does not overlap the half-precision `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_vmath_f16(x: *const u16, out: *mut f32, n: i64, op: i64) {
+    // P14.5: debug-build contract checks (the `# Safety` section above); no aliasing assert: the
+    // kernel detects a mixed-width overlap itself and defines it (`half_input_overlaps_f32_output`,
+    // pinned by `mixed_width_overlap_matches_live_byte_reference`), so an overlap is not UB here.
+    crate::safety::debug_extent(x, n);
+    crate::safety::debug_extent(out, n);
     if n <= 0 {
         return;
     }
