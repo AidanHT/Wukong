@@ -88,6 +88,20 @@ fn loss(w: [f32; 2], mut out: [f32; 1]) -> f32 {
 fn main() -> i32 { return 0; }
 ";
 
+/// A loss that prints and then fails an assertion, on its very first call (every seeded weight is
+/// far below 1). The executable has written the `7` before the assertion stops it; the in-process
+/// run must print it too, before its error, on both backends.
+const FAILING: &str = "\
+fn loss(w: [f32; 1], mut out: [f32; 1]) -> f32 {
+    print(7);
+    assert(w[0] > 1.0);
+    let l: f32 = w[0] * w[0];
+    out[0] = l;
+    return l;
+}
+fn main() -> i32 { return 0; }
+";
+
 /// One training configuration: a source file and the `--train` flags it runs with.
 struct Case {
     name: String,
@@ -405,5 +419,53 @@ fn train_artifact_depfile_names_the_artifact() {
     assert!(default.starts_with("autodiff_train_sumsq.o:"), "{default}");
     let in_process = rule(&[], "run.d");
     assert!(in_process.starts_with("run.d:"), "{in_process}");
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// A kernel that fails at run time keeps what it printed before the failure, on every path: the
+/// training executable has written it to stdout as it happened, and `wukongc --train` (interp and
+/// native) forwards the failing call's output before it reports the error. Exit code 1 and the
+/// assertion message on all three.
+#[test]
+fn train_failure_keeps_what_the_kernel_printed() {
+    let scratch = std::env::temp_dir()
+        .join("wukong_train_exe_failure")
+        .join(std::process::id().to_string());
+    std::fs::create_dir_all(&scratch).expect("create the scratch directory");
+    let source = scratch.join("failing.wk");
+    std::fs::write(&source, FAILING).expect("write the failing loss");
+    let args: Vec<String> = ["--train", "--train-steps=2", "--train-seed=3"]
+        .map(String::from)
+        .to_vec();
+    let expect_failure = |what: &str, o: &Output| {
+        let stderr = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.status.code(), Some(1), "{what}: {stderr}");
+        assert!(stderr.contains("assertion failed"), "{what}: {stderr}");
+        assert_eq!(
+            String::from_utf8_lossy(&o.stdout),
+            "7\n",
+            "{what}: stdout before the failure"
+        );
+    };
+    expect_failure("--train (interp)", &wukongc(&scratch, &args, &[], &source));
+    expect_failure(
+        "--train (native)",
+        &wukongc(&scratch, &args, &["--backend=native"], &source),
+    );
+    if probe_link_path() == LinkPath::Rustc {
+        let exe = scratch.join(format!("failing{}", std::env::consts::EXE_SUFFIX));
+        let exe_arg = exe.to_string_lossy().into_owned();
+        let built = wukongc(&scratch, &args, &["--emit=exe", "-o", &exe_arg], &source);
+        assert!(
+            built.status.success(),
+            "{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let ran = Command::new(&exe)
+            .current_dir(&scratch)
+            .output()
+            .expect("run the training executable");
+        expect_failure("the training executable", &ran);
+    }
     let _ = std::fs::remove_dir_all(&scratch);
 }

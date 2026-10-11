@@ -1299,7 +1299,9 @@ default; `--backend=native` appends one verified `(Ptr, I64) -> Void` dispatcher
 (`training_native::add_dispatcher`) and JIT-compiles it once. Its owning `JitBufferKernel` retains
 executable memory across steps. Each call rebuilds the pointer table from exclusively borrowed
 buffers, since optimizer updates can replace their allocations. What a kernel prints is forwarded
-to stdout as each call returns.
+to stdout as each call returns — also when the call fails at run time: `run_kernel_f32_with_output`
+and `JitBufferKernel::run` return the captured bytes beside the error, so the bytes the executable
+has already written before a failed `assert` are printed before `--train` reports it.
 
 **`--train --emit=exe|obj`** (`emit_train_artifact`) builds the same kernels and the same
 dispatcher into the artifact, plus the spec as a `.rodata` static (`TrainSpec::encode`: a

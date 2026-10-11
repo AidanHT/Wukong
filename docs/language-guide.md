@@ -2280,7 +2280,8 @@ rlib path; the C fallback runtime has no training loop and is refused by name (e
 executable reads and writes no files, so `--train-init`, `--train-data` and `--train-save` with an
 artifact are refused by name (exit 2) rather than dropped. Whatever the loss prints goes to stdout
 in both — once per update (the backward replays the forward) and once for the final forward, before
-the report.
+the report. A loss that fails at run time (a failed `assert`, a bounds failure) stops both with exit
+1, and what it printed before the failing statement reaches stdout in both, ahead of the error.
 
 `--train --run` trains the selected loss without calling `main`. Combining `--train` with any
 other explicit `--emit=<stage>` is a usage error (exit 2). GPU training selectors are unsupported

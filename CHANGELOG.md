@@ -22,7 +22,9 @@ All notable changes to Wukong are documented here. The format is loosely based o
 - **`--train` prints what the loss prints.** A `print` in a loss function was captured and dropped
   on both backends; it now reaches stdout as each kernel call returns (once per update, since the
   backward replays the forward, and once for the final forward), before the report — where the
-  training executable prints it too.
+  training executable prints it too. A kernel that fails at run time (a failed `assert`) keeps
+  what it printed before the failure on every path: the in-process run writes those bytes before
+  its error, as the executable already has.
 - **A two-layer MLP trains in the corpus (P4.7).** `tests/run/autodiff_train_mlp.wk` (GEMM + bias +
   ReLU, GEMM + bias, mean squared error; four trained tensors) pins three SGD steps derived in Python
   under three f32 evaluation orders and f64, every printed value at least 131 ULPs from a rounding

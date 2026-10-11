@@ -138,20 +138,24 @@ impl TrainingExecutor {
     }
 
     /// Run the kernel `selector` names (its index in `entries`) over `buffers`, which must have
-    /// exactly that kernel's declared lengths, and return what it printed.
+    /// exactly that kernel's declared lengths, and return its outcome together with what it
+    /// printed — also when it failed at run time (a failed `assert`, a bounds failure), when that
+    /// is everything it printed before the failing statement.
     pub(super) fn run_selector_output(
         &self,
         program: &Program,
         selector: usize,
         buffers: &mut [Vec<f32>],
         interner: &Interner,
-    ) -> Result<Vec<u8>, String> {
-        let (entry, lens) = self
-            .entries
-            .get(selector)
-            .ok_or("unknown training kernel")?;
+    ) -> (Result<(), String>, Vec<u8>) {
+        let Some((entry, lens)) = self.entries.get(selector) else {
+            return (Err("unknown training kernel".into()), Vec::new());
+        };
         if buffers.len() != lens.len() || buffers.iter().zip(lens).any(|(b, &n)| b.len() != n) {
-            return Err("training buffer lengths do not match the kernel signature".into());
+            return (
+                Err("training buffer lengths do not match the kernel signature".into()),
+                Vec::new(),
+            );
         }
         match &self.kernel {
             Some(kernel) => {
@@ -173,7 +177,9 @@ impl TrainingExecutor {
 
     /// [`TrainingExecutor::run_selector_output`], with what the kernel printed written to stdout
     /// at once — exactly what the same kernel prints, at the same point of the run, inside a
-    /// `--train --emit=exe` executable (whose kernels write to stdout directly).
+    /// `--train --emit=exe` executable (whose kernels write to stdout directly). A kernel that
+    /// fails still has its output written first, then the failure is returned: the executable has
+    /// printed those bytes before the failure stopped it.
     pub(super) fn run_selector(
         &self,
         program: &Program,
@@ -181,13 +187,13 @@ impl TrainingExecutor {
         buffers: &mut [Vec<f32>],
         interner: &Interner,
     ) -> Result<(), String> {
-        let printed = self.run_selector_output(program, selector, buffers, interner)?;
+        let (result, printed) = self.run_selector_output(program, selector, buffers, interner);
         if !printed.is_empty() {
             use std::io::Write;
             let mut out = std::io::stdout().lock();
             let _ = out.write_all(&printed);
             let _ = out.flush();
         }
-        Ok(())
+        result
     }
 }

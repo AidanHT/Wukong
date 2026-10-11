@@ -31,8 +31,10 @@ pub fn jit_compile_buffer_kernel(
 }
 
 impl JitBufferKernel {
-    /// Invoke the dispatcher, capturing output and reporting assertion failure. Calls use the
-    /// same serialized runtime state and 512 MiB worker stack as [`JitProgram::run`].
+    /// Invoke the dispatcher, returning its outcome (`Err` on a failed assertion or bounds check)
+    /// **together with the stdout it captured** — also on a failure, when that is everything the
+    /// call printed before the failing statement, as [`JitProgram::run_capturing`] returns it.
+    /// Calls use the same serialized runtime state and 512 MiB worker stack as [`JitProgram::run`].
     ///
     /// # Safety
     /// `entry` must select a valid dispatcher branch. The table must contain every pointer that
@@ -42,7 +44,7 @@ impl JitBufferKernel {
     /// Neither table nor buffers may be retained by the compiled code after it returns. The
     /// worker joins before this method returns, so the table, buffers and this handle must remain
     /// valid until then. Signature validation alone does not prove these memory requirements.
-    pub unsafe fn run(&self, buffers: &[*mut f32], entry: u64) -> Result<Vec<u8>, String> {
+    pub unsafe fn run(&self, buffers: &[*mut f32], entry: u64) -> (Result<(), String>, Vec<u8>) {
         let _guard = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clear();
         reset_failure();
@@ -54,10 +56,8 @@ impl JitBufferKernel {
             let call: extern "C" fn(*const *mut f32, u64) = std::mem::transmute(code);
             call(table as *const *mut f32, entry);
         });
-        if let Some(failure) = take_failure() {
-            return Err(failure);
-        }
-        Ok(OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clone())
+        let out = OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        (take_failure().map_or(Ok(()), Err), out)
     }
 }
 

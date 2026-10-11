@@ -1,5 +1,5 @@
 use super::*;
-use wukong_mir::{BinOp, Builder, MirType, Op, Program};
+use wukong_mir::{BinOp, Builder, CmpOp, MirType, Op, Program};
 use wukong_types::{Dim, Layout, Scalar, Shape, Ty};
 
 fn square_loss(it: &mut Interner) -> Program {
@@ -229,6 +229,59 @@ fn native_dispatcher_is_generated_and_checks_buffer_lengths() {
         .run(&program, entry, &mut buffers, &it)
         .unwrap_err()
         .contains("buffer lengths"));
+}
+
+/// `loss(w)`: print `7`, then assert `w[0] > 1`.
+fn printing_then_asserting(it: &mut Interner) -> Program {
+    let mut b = Builder::new(it.intern("loss"), MirType::Void);
+    let weights = b.add_param(MirType::Ptr);
+    let seven = b.build(MirType::I64, Op::ConstInt(7, MirType::I64));
+    b.build_void(Op::Call {
+        func: it.intern("print"),
+        args: vec![seven],
+    });
+    let w = b.build(MirType::F32, Op::Load(weights, MirType::F32));
+    let one = b.build(MirType::F32, Op::ConstFloat(1.0, MirType::F32));
+    let above = b.build(MirType::I1, Op::Cmp(CmpOp::Fogt, w, one));
+    b.build_void(Op::Call {
+        func: it.intern("assert"),
+        args: vec![above],
+    });
+    b.ret(None);
+    let mut program = Program::new();
+    program.funcs.push(b.finish());
+    program
+}
+
+/// A kernel that fails at run time still hands back what it printed before the failing statement,
+/// on both backends — what a training executable has already written to stdout when the same
+/// failure stops it — so `--train` can print it before it reports the error.
+#[test]
+fn failing_kernel_keeps_what_it_printed_on_both_backends() {
+    for backend in [BackendKind::Interp, BackendKind::Native] {
+        let mut it = Interner::new();
+        let mut program = printing_then_asserting(&mut it);
+        let entry = program.funcs[0].name;
+        let executor = training_native::TrainingExecutor::new(
+            &mut program,
+            &mut it,
+            backend,
+            vec![(entry, vec![1])],
+        )
+        .unwrap();
+        let mut passing = vec![vec![2.0]];
+        assert_eq!(
+            executor.run_selector_output(&program, 0, &mut passing, &it),
+            (Ok(()), b"7\n".to_vec()),
+            "{backend:?}"
+        );
+        let mut failing = vec![vec![0.5]];
+        assert_eq!(
+            executor.run_selector_output(&program, 0, &mut failing, &it),
+            (Err("assertion failed".to_string()), b"7\n".to_vec()),
+            "{backend:?}"
+        );
+    }
 }
 
 #[test]
