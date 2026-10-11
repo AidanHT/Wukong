@@ -609,6 +609,8 @@ pub unsafe extern "C" fn wukong_rt_train_main(
     spec_len: i64,
     dispatch: TrainDispatchFn,
 ) -> i32 {
+    // SAFETY-EXEMPT: `spec` is the artifact's own read-only `.rodata` spec blob -- bytes that
+    // `TrainSpec::decode` validates, not a kernel operand with an extent or aliasing contract.
     let bytes: Option<&[u8]> = match usize::try_from(spec_len) {
         Ok(0) => Some(&[]),
         // SAFETY: the caller passes the address and length of the baked `.rodata` blob.

@@ -970,6 +970,7 @@ mod tests {
                     wukong_mir::ParamAttrs {
                         noalias,
                         slice: false,
+                        extent: None,
                     },
                 );
                 (t, o)

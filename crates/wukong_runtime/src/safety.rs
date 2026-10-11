@@ -541,6 +541,7 @@ mod entry_law {
         ("special.rs", include_str!("special.rs")),
         ("topk.rs", include_str!("topk.rs")),
         ("topology.rs", include_str!("topology.rs")),
+        ("train.rs", include_str!("train.rs")),
         ("transpose.rs", include_str!("transpose.rs")),
         ("velem.rs", include_str!("velem.rs")),
         ("vmath.rs", include_str!("vmath.rs")),
