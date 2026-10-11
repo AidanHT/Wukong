@@ -861,7 +861,11 @@ fn main() {
         // proving no `wukong_*` kernel survived. A divergence between the two lowerings of ONE
         // source is a compiler defect, not a timing: print it loudly and withhold the ratio.
         if let (Some(g), Some(census)) = (&wukgen, &wkgen_census) {
-            let checked = match &wukong {
+            // `agrees` is "no divergence was found", NOT "a check ran": with the recognizer-on
+            // column missing nothing compared the wk(gen) buffer with anything, so the row still
+            // prints (the ledger withholds its standing as UNCHECKED) but pools nothing - the
+            // geomean gate below is `section_may_pool`, which refuses an UNCHECKED section.
+            let agrees = match &wukong {
                 Some(m) => {
                     checked!();
                     let (rel, at) = max_rel_err(&m.out, &g.out);
@@ -887,10 +891,12 @@ fn main() {
                 }
                 None => true,
             };
-            // A section the numerics gate has marked SUSPECT contributes to no geomean: its ratios
-            // were withheld on their own lines, and pooling them into a headline would publish
-            // exactly what the gate refused to.
-            if checked && !numerics::section_suspect() {
+            // A section whose standings the numerics gate withholds - SUSPECT (a check failed) or
+            // UNCHECKED (none ran) - contributes to no geomean: its ratios were withheld on their
+            // own lines, and pooling them into a headline would publish exactly what the gate
+            // refused to. Read BEFORE the line is built, which is where the ratios are pooled.
+            let may_pool = numerics::section_may_pool();
+            if agrees && !numerics::section_suspect() {
                 let dir = |r: f64| -> (f64, &'static str) {
                     if r >= 1.0 {
                         (r, "faster")
@@ -911,10 +917,12 @@ fn main() {
                     if inside(v) {
                         line.push_str(" [INSIDE FLOOR]");
                     }
-                    if is_par {
-                        gen_par_ratios_c.push(r);
-                    } else {
-                        gen_ratios_c.push(r);
+                    if may_pool {
+                        if is_par {
+                            gen_par_ratios_c.push(r);
+                        } else {
+                            gen_ratios_c.push(r);
+                        }
                     }
                 }
                 if let Some(m) = &wukong {
@@ -928,16 +936,17 @@ fn main() {
                     line.push_str(&format!("; row floor {f:.2}x"));
                 }
                 // A ratio line like any other `->` standing: withheld if this row's section already
-                // reported a numerical mismatch.
+                // reported a numerical mismatch, or ran no check at all.
                 standing!("{line}");
                 println!("     wk(gen) dispatch: {census}");
             }
         }
-        let suspect = numerics::section_suspect();
-        if suspect {
+        if numerics::section_suspect() {
             suspect_rows.push(k.name);
         }
-        if let (false, Some(m), Some(c)) = (suspect, &wukong, &c) {
+        // The same gate as every standing: SUSPECT and UNCHECKED rows pool nothing.
+        let may_pool = numerics::section_may_pool();
+        if let (true, Some(m), Some(c)) = (may_pool, &wukong, &c) {
             let r = c.ns_per_call / m.ns_per_call; // >1 => Wukong faster
             if is_par {
                 par_ratios_c.push(r);
@@ -947,7 +956,7 @@ fn main() {
             }
             compile_ratios_c.push(c.compile.as_secs_f64() / m.compile.as_secs_f64());
         }
-        if let (false, Some(m), Some(cpp)) = (suspect, &wukong, &cpp) {
+        if let (true, Some(m), Some(cpp)) = (may_pool, &wukong, &cpp) {
             let r = cpp.ns_per_call / m.ns_per_call; // >1 => Wukong faster
             if is_par {
                 par_ratios_cpp.push(r);
@@ -3388,8 +3397,9 @@ fn bench_transpose(cc: &str, dir: &Path) {
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
             );
-            // A SUSPECT section's ratio was withheld above; it must not reach the regime geomean.
-            if !numerics::section_suspect() {
+            // A SUSPECT or UNCHECKED section's ratio was withheld above; it must not reach the
+            // regime geomean.
+            if numerics::section_may_pool() {
                 if aliasing {
                     alias_1c.push(r)
                 } else {
@@ -3400,7 +3410,9 @@ fn bench_transpose(cc: &str, dir: &Path) {
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r = c2.ns_per_call / mp.ns_per_call;
             par_standing("idiomatic single-threaded C", r);
-            if !numerics::section_suspect() {
+            // With no single-core column nothing was checked in this section (both checks above
+            // compare `wuk`), so the standing was withheld as UNCHECKED and must not pool either.
+            if numerics::section_may_pool() {
                 if aliasing {
                     alias_par.push(r)
                 } else {

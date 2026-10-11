@@ -232,10 +232,24 @@ impl Ledger {
         )]
     }
 
-    /// Whether the open scope has reported a numerical mismatch. Summaries consult this so a
-    /// SUSPECT row is never pooled into a geomean whose own line would carry no warning.
+    /// Whether the open scope has reported a numerical mismatch. The cell tables consult this so a
+    /// row after an earlier row's mismatch prints SUSPECT in its cells too.
     pub(crate) fn is_suspect(&self) -> bool {
         self.suspect
+    }
+
+    /// Whether no numerics check has run in the open scope yet - the state in which a
+    /// [`standing!`] is withheld as UNCHECKED.
+    pub(crate) fn is_unchecked(&self) -> bool {
+        self.checks == 0
+    }
+
+    /// Whether a ratio computed in the open scope may be pooled into a geomean: exactly when a
+    /// [`standing!`] printed now would print its ratio, i.e. the scope is neither SUSPECT nor
+    /// UNCHECKED. A summary geomean is a standing too, so pooling a ratio whose own `->` line was
+    /// withheld would publish in the headline what the gate refused on the row.
+    pub(crate) fn may_pool(&self) -> bool {
+        !self.suspect && !self.is_unchecked()
     }
 
     #[cfg(test)]
@@ -383,6 +397,12 @@ pub(crate) fn record_twin_floor(floor: f64) {
 /// Whether the open section has reported a numerical mismatch (see [`Ledger::is_suspect`]).
 pub(crate) fn section_suspect() -> bool {
     with_ledger(|l| l.is_suspect())
+}
+
+/// Whether a ratio computed in the open section may enter a geomean (see [`Ledger::may_pool`]).
+/// Every summary pool is gated on this, never on [`section_suspect`] alone.
+pub(crate) fn section_may_pool() -> bool {
+    with_ledger(|l| l.may_pool())
 }
 
 /// Print the end-of-run summary and return the exit code the run should end with.
@@ -795,5 +815,47 @@ mod tests {
             lines.iter().any(|s| s.contains("UNCHECKED === y ===")),
             "{lines:?}"
         );
+    }
+
+    /// A summary geomean is a standing too, so the pool gate must be EXACTLY the standing gate.
+    /// The defect: the pools consulted `is_suspect()` alone, so a ratio withheld as UNCHECKED on its
+    /// own `->` line (the recognizer-on column missing, so nothing compared the wk(gen) or
+    /// `@parallel` buffer with anything) was still pushed into the wk(gen) and transpose-regime
+    /// geomeans and printed there as a clean number.
+    #[test]
+    fn a_ratio_may_be_pooled_exactly_when_its_standing_would_print() {
+        let line = "  -> Wukong single-core is 1.20x faster than idiomatic C";
+        // (checks before the standing, a mismatch before it)
+        for (checks, mismatch) in [(0, false), (1, false), (3, false), (0, true), (2, true)] {
+            let mut l = Ledger::new();
+            l.begin("=== transpose 1000x1000 ===");
+            for _ in 0..checks {
+                l.check();
+            }
+            if mismatch {
+                l.mismatch("  ! transpose output mismatch vs C");
+            }
+            let pool = l.may_pool();
+            let printed = l.standing(line);
+            let withheld = printed[0].contains("ratio withheld");
+            assert_eq!(
+                pool, !withheld,
+                "checks={checks} mismatch={mismatch}: may_pool={pool} but the standing printed \
+                 {printed:?}"
+            );
+        }
+        // The old gate admitted the UNCHECKED state; the new one does not.
+        let mut l = Ledger::new();
+        l.begin("=== wk(gen) row ===");
+        assert!(l.is_unchecked() && !l.is_suspect());
+        assert!(
+            !l.may_pool(),
+            "an UNCHECKED section is not SUSPECT, yet it must not pool"
+        );
+        l.check();
+        assert!(!l.is_unchecked() && l.may_pool());
+        // A new heading reopens the UNCHECKED state.
+        l.begin("=== next ===");
+        assert!(!l.may_pool());
     }
 }

@@ -34,6 +34,11 @@ All notable changes to Wukong are documented here. The format is loosely based o
   byte for byte: the three get declared `2t/(1-t)` entries in its `REASSOCIATION_TOLERANCES`
   (re-derived from each fixture's own APPROX bound by a test), since the 4096-term `@parallel`
   sum of squares legitimately prints `4112.017` recognized and `4112.0166` lowered as written.
+- **xbench geomeans pool only ratios a standing would print.** A ratio withheld as UNCHECKED on its
+  own row was still pooled: a missing recognizer-on column left the `wk(gen)` buffer compared with
+  nothing, and a missing single-core transpose column left the `@parallel` one compared with
+  nothing, yet both ratios reached the recognition-off and transpose-regime geomeans. Every pool is
+  now gated on `numerics::section_may_pool` (neither SUSPECT nor UNCHECKED).
 - **`cargo clippy --workspace --all-targets` denies warnings locally (P13.15).** Every crate now opts
   in to the workspace `-D warnings` lint table (`wukong_runtime` keeps its own), so a plain local
   clippy fails on a rustc or Clippy warning without `RUSTFLAGS`, as CI does.
