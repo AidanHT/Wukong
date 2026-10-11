@@ -89,13 +89,14 @@ impl Interp<'_, '_> {
         self.memory
             .extend(bytes.iter().map(|&b| Value::Int(i128::from(b))));
         self.memory.push(Value::Int(0));
+        self.slots.live.insert(base, bytes.len() + 1);
         Value::Ptr(base)
     }
 
     /// `wukong_rt_env(name) -> *u8`.
     fn text_env(&mut self, args: &[Value]) -> Result<Value, String> {
         let name = match args.first() {
-            Some(Value::Ptr(p)) if !self.is_null(*p) => self.text_read_bytes(*p, -1)?,
+            Some(Value::Ptr(p)) if !self.is_null(*p) => self.text_read_bytes(0, *p, -1)?,
             _ => Vec::new(),
         };
         let value = process::env_cstr(&name).to_bytes();
@@ -116,6 +117,7 @@ impl Interp<'_, '_> {
         {
             return Err("read_stdin_u8: buffer out of bounds".into());
         }
+        self.slots.live.check("read_stdin_u8", 0, base, cap)?;
         let mut bytes = vec![0u8; cap];
         let n = process::read_stdin_into(&mut bytes);
         let got = usize::try_from(n).unwrap_or(0);
@@ -152,6 +154,8 @@ impl Interp<'_, '_> {
             {
                 return Err("text format: buffer out of bounds".into());
             }
+            // Through the NUL, inside the buffer's one allocation.
+            self.slots.live.check("text format", 1, base, nul + 1)?;
             for (k, &b) in bytes[..w.count].iter().enumerate() {
                 self.memory[base + w.start + k] = crate::ml_io::decode_elem(DT_U8, &[b]);
             }
@@ -160,12 +164,16 @@ impl Interp<'_, '_> {
         Ok(Value::Int(i128::from(w.end)))
     }
 
-    /// `n` bytes of the string at slot `base`, or up to its NUL when `n < 0`.
-    fn text_read_bytes(&self, base: usize, n: i64) -> Result<Vec<u8>, String> {
+    /// `n` bytes of the string at slot `base` (the call's operand `k`), or up to its NUL when
+    /// `n < 0`. An explicit length must stay inside the string's allocation.
+    fn text_read_bytes(&self, k: usize, base: usize, n: i64) -> Result<Vec<u8>, String> {
         let tail = self.memory.get(base..).unwrap_or(&[]);
         let len = match usize::try_from(n) {
             Ok(n) if n > tail.len() => return Err("text format: string out of bounds".into()),
-            Ok(n) => n,
+            Ok(n) => {
+                self.slots.live.check("text format", k, base, n)?;
+                n
+            }
             Err(_) => tail
                 .iter()
                 .position(|v| v.as_int() as u8 == 0)
@@ -177,7 +185,9 @@ impl Interp<'_, '_> {
     /// `wukong_rt_fmt_str(target, buf, cap, pos, s, n, spec)`.
     fn text_fmt_str(&mut self, args: &[Value]) -> Result<Value, String> {
         let bytes = match args.get(4) {
-            Some(Value::Ptr(p)) if !self.is_null(*p) => self.text_read_bytes(*p, int(args, 5))?,
+            Some(Value::Ptr(p)) if !self.is_null(*p) => {
+                self.text_read_bytes(4, *p, int(args, 5))?
+            }
             _ => Vec::new(),
         };
         let mut out = Vec::new();
@@ -204,6 +214,7 @@ impl Interp<'_, '_> {
         if end > self.memory.len() {
             return Err("text format: buffer out of bounds".into());
         }
+        self.slots.live.check("text format", 4, base, len)?;
         let slots = &self.memory[base..end];
         let mut out = Vec::new();
         fmt::format_seq(
