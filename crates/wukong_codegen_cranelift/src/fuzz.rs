@@ -14,6 +14,13 @@
 //! Both backends execute the same lowered MIR and marshal through the same runtime microkernels, so
 //! bit-exactness is the correct (strongest) bar — not a tolerance. A divergence is a real miscompile.
 //!
+//! That same fact makes the interp-vs-native comparison blind to a WRONG kernel: where a kernel is
+//! recognized, both sides call one runtime function. So `fuzz_full_buffer_interp_vs_native` also
+//! lowers every kernel with recognition OFF (`LowerOptions { recognize: false, .. }`, the loop as the
+//! user wrote it) and holds the recognized native output to that second opinion lane by lane: bit-exact
+//! for the kernels documented bit-exact with their source loop, within a declared, derived bound for
+//! the reassociating ones (`OffBound`). The split is printed.
+//!
 //! The file also carries `vmath_kernels_match_f64_reference`, which is deliberately *not* a
 //! differential test: it checks the transcendental vmath kernels against an f64 reference under a
 //! per-op relative-error bound, since interp-vs-native cannot catch a kernel that both backends
@@ -543,6 +550,128 @@ fn kernels() -> Vec<Kernel> {
 
 type K3 = unsafe extern "C" fn(*const f32, *const f32, *mut f32);
 
+/// How a kernel's RECOGNIZED native output must relate to the same source lowered with recognition
+/// OFF and run on the interpreter (the language's own definition of the loop).
+#[derive(Clone, Copy, Debug)]
+enum OffBound {
+    /// Bit-identical (`same`) in every regime: the kernel is documented bit-exact with its source
+    /// loop. The elementwise `vmath`/`velem`/`vhorner` kernels mirror the generic lowering's own
+    /// inline polynomials and FMA contraction (`emit_exp`/`emit_gelu`/... in `wukong_mir_build`,
+    /// whose doc says the inlined form "is bit-identical to the kernel"), and data movement
+    /// (transpose, copy) and every kernel that does not dispatch are bit-exact by construction. The
+    /// two IEEE-corner lane classes where that documentation is wrong today are recorded, with
+    /// reproducers, in [`KNOWN_OFF_DIVERGENCES`].
+    Exact,
+    /// A reassociating fold (the reduction and GEMM kernels: 8-wide partial sums, KC blocking). Two
+    /// summation orders of the same terms each lie within `gamma_n * S` of the exact sum (Higham,
+    /// *Accuracy and Stability of Numerical Algorithms*, 2nd ed., eq. 3.5, `gamma_n = n*u/(1-n*u)`,
+    /// `u = 2^-24`), `S` the sum of the terms' magnitudes; so they differ by at most `2 * gamma_n * S`.
+    /// Declared per lane as `2 * (n + 1) * 2^-24 * S`, `S` computed in f64 from the inputs
+    /// ([`fold_terms`]); the `+ 1` covers the accumulator's starting `+ 0.0` and an FMA-versus-mul
+    /// contraction difference. Non-finite lanes must match exactly (`same`).
+    Fold,
+    /// A fused row normalization (softmax / LayerNorm / RMSNorm, plain and affine, single and
+    /// batched): `|on - off| <= tol` absolute, twice the kernel's documented f64-reference bound on
+    /// unit-scale rows — softmax `< 1e-5` (`wukong_runtime/src/norm.rs` `matches_f64_reference`),
+    /// LayerNorm / RMSNorm `< 1e-3` (the same test), affine `< 2e-3`
+    /// (`affine_matches_f64_reference`). Compared in the `Normal` regime only: those bounds are
+    /// stated for unit-scale data, and under +-1e30 / inf / NaN inputs the kernel and the generic
+    /// loop overflow their (differently ordered) mean / variance / exp sums at different points.
+    Abs(f64),
+}
+
+/// A lane class where a recognized kernel is KNOWN to disagree with its own source loop — an open
+/// recognizer defect, recorded with its reproducer so it cannot hide. This is not a tolerance: the
+/// lane must match `matches` EXACTLY (input, recognized output, recognition-off output), every other
+/// lane of the kernel is still held bit-exact, and the run fails if an entry stops reproducing (so a
+/// fix deletes the entry and the lane goes back under the bit-exact bar, the way recognize.rs's
+/// `NATIVE_AXIS_WITHHELD` works).
+struct KnownDivergence {
+    kernel: &'static str,
+    /// `(x[idx], recognized native out[idx], recognition-off interp out[idx])` -> is this the defect?
+    matches: fn(f32, f32, f32) -> bool,
+    defect: &'static str,
+}
+
+fn saxpy_loses_negative_zero(_x: f32, on: f32, off: f32) -> bool {
+    on.to_bits() == 0 && off.to_bits() == 0x8000_0000
+}
+
+fn relu6_nan_clamps_to_zero(x: f32, on: f32, off: f32) -> bool {
+    x.is_nan() && on.to_bits() == 0 && off == 6.0
+}
+
+const KNOWN_OFF_DIVERGENCES: &[KnownDivergence] = &[
+    KnownDivergence {
+        kernel: "saxpy",
+        matches: saxpy_loses_negative_zero,
+        defect: "`out[i] = 2.0 * x[i] + y[i]` with x = y = -0.0 prints -0 as written \
+                 (WUKONG_NO_RECOGNIZE=1) but 0 when recognized: wukong_velem_f32 evaluates \
+                 `a.mul_add(x, b.mul_add(y, c))` with the affine constant c = +0.0, and a +0 addend \
+                 absorbs the -0 (wukong_runtime/src/velem.rs `elem1` and `velem_avx2`)",
+    },
+    KnownDivergence {
+        kernel: "relu6",
+        matches: relu6_nan_clamps_to_zero,
+        defect: "`out[i] = if x[i] < 6.0 { if x[i] > 0.0 { x[i] } else { 0.0 } } else { 6.0 }` with \
+                 x = NaN prints 6 as written (the `< 6` test is false) but 0 when recognized: the \
+                 recognizer maps this min-outer spelling to wukong_velem_f32's VE_RELU6, which clamps \
+                 max-first (`v > 0 ? v : 0`, then `< 6`), and the two orders differ only on NaN",
+    },
+];
+
+/// The known divergence for `kernel`, if this lane is one.
+fn known_divergence(kernel: &str, x: f32, on: f32, off: f32) -> Option<usize> {
+    KNOWN_OFF_DIVERGENCES
+        .iter()
+        .position(|d| d.kernel == kernel && (d.matches)(x, on, off))
+}
+
+/// The recognition-off bound for each fuzzer kernel (see [`OffBound`]). Anything not listed is held
+/// bit-exact.
+fn off_bound(name: &str) -> OffBound {
+    match name {
+        "dot" | "ssd" | "matmul" | "linear" | "tensor_matmul" => OffBound::Fold,
+        "softmax" | "softmax_batched" => OffBound::Abs(2e-5),
+        "layernorm" | "rmsnorm" | "rmsnorm_batched" | "layernorm_batched" => OffBound::Abs(2e-3),
+        "rmsnorm_affine" | "layernorm_affine" | "rmsnorm_affine_batched" => OffBound::Abs(4e-3),
+        _ => OffBound::Exact,
+    }
+}
+
+/// Per output lane of a [`OffBound::Fold`] kernel: `(terms in the fold, sum of their magnitudes)`,
+/// in f64, from the f32 inputs. A lane no fold writes gets `(0, 0.0)` and is therefore held exact.
+fn fold_terms(name: &str, n: usize, x: &[f32], y: &[f32], len: usize) -> Vec<(usize, f64)> {
+    let mut out = vec![(0usize, 0.0f64); len];
+    let (xd, yd) = (|i: usize| x[i] as f64, |i: usize| y[i] as f64);
+    match name {
+        "dot" => out[0] = (n, (0..n).map(|i| (xd(i) * yd(i)).abs()).sum()),
+        "ssd" => {
+            out[0] = (n, (0..n).map(|i| (xd(i) - yd(i)) * (xd(i) - yd(i))).sum());
+        }
+        // out[i, j] = sum_k x[i, k] * y[k, j]   (the ikj matmul and the Tensor[f32, n, n] matmul)
+        "matmul" | "tensor_matmul" => {
+            for i in 0..n {
+                for j in 0..n {
+                    let s = (0..n).map(|k| (xd(i * n + k) * yd(k * n + j)).abs()).sum();
+                    out[i * n + j] = (n, s);
+                }
+            }
+        }
+        // out[i, j] = sum_k x[i, k] * y[j, k]   (nn.Linear, C = A * B^T)
+        "linear" => {
+            for i in 0..n {
+                for j in 0..n {
+                    let s = (0..n).map(|k| (xd(i * n + k) * yd(j * n + k)).abs()).sum();
+                    out[i * n + j] = (n, s);
+                }
+            }
+        }
+        _ => unreachable!("{name} is not a Fold kernel"),
+    }
+    out
+}
+
 #[test]
 fn fuzz_full_buffer_interp_vs_native() {
     // Sizes chosen to straddle the vectorizer's 4×128-bit unroll group and single-vector/scalar
@@ -565,6 +694,21 @@ fn fuzz_full_buffer_interp_vs_native() {
     let mut all_names: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
     let mut dispatching_names: std::collections::BTreeSet<&'static str> =
         std::collections::BTreeSet::new();
+
+    // P15.11, the recognition-OFF arm. The interp-vs-native comparison above is blind to a wrong
+    // kernel: for a dispatching kernel both sides call the SAME runtime function. So every kernel is
+    // also lowered with `LowerOptions { recognize: false, .. }` — the loop exactly as written, no
+    // `wukong_*` substitution — and run on the interpreter, and the recognized NATIVE output is held
+    // lane by lane to that second opinion under the kernel's `OffBound`. This is the fuzzer-scale
+    // twin of recognize.rs's corpus-wide on/off differential.
+    let mut off_exact: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
+    // Per tolerance-class kernel: the worst observed |on - off| / declared bound, and the lanes
+    // compared.
+    let mut off_tol: std::collections::BTreeMap<&'static str, (f64, u64)> =
+        std::collections::BTreeMap::new();
+    let mut off_skipped = 0u64;
+    let mut off_failures: Vec<String> = Vec::new();
+    let mut known_hits = vec![0u64; KNOWN_OFF_DIVERGENCES.len()];
 
     for k in kernels() {
         all_names.insert(k.name);
@@ -600,6 +744,33 @@ fn fuzz_full_buffer_interp_vs_native() {
                 let ptr = handle.func_ptr(kbench).expect("func_ptr kbench");
                 let native: K3 = unsafe { std::mem::transmute(ptr) };
 
+                // The same source, recognition OFF, at the same opt level.
+                let (mut generic, gd) = wukong_mir_build::lower_program_with(
+                    &module,
+                    &sema,
+                    &mut interner,
+                    wukong_mir_build::LowerOptions {
+                        recognize: false,
+                        ..Default::default()
+                    },
+                );
+                assert!(
+                    gd.iter().all(|d| !d.is_error()),
+                    "{}: lower (recognition off) {gd:?}",
+                    k.name
+                );
+                wukong_opt::optimize(&mut generic, opt);
+                let generic_mir = wukong_mir::print::print_program(&generic, &interner);
+                assert!(
+                    !generic_mir
+                        .match_indices("call wukong_")
+                        .any(|(i, _)| !generic_mir[i..].starts_with("call wukong_rt_")),
+                    "{} n={n} opt={opt}: recognition OFF still dispatched a runtime kernel, so the \
+                     off arm would compare the kernel with itself",
+                    k.name
+                );
+                let bound = off_bound(k.name);
+
                 for &regime in k.regimes {
                     for _ in 0..4 {
                         let x: Vec<f32> = (0..len).map(|_| gen(&mut rng, regime)).collect();
@@ -629,6 +800,103 @@ fn fuzz_full_buffer_interp_vs_native() {
                                 on[idx],
                                 on[idx].to_bits(),
                             );
+                        }
+
+                        // Recognition OFF on the interpreter, over its own copies of the inputs.
+                        let (mut xg, mut yg, mut og) = (x.clone(), y.clone(), vec![0f32; len]);
+                        wukong_interp::run_kernel_f32(
+                            &generic,
+                            kbench,
+                            &mut [&mut xg, &mut yg, &mut og],
+                            &interner,
+                        )
+                        .expect("interp kernel (recognition off)");
+                        let off_msg = |idx: usize, why: &str| {
+                            format!(
+                                "{} n={n} opt={opt} out[{idx}]: recognized native={} (0x{:08x}) vs \
+                                 recognition-off interp={} (0x{:08x}) — {why}",
+                                k.name,
+                                on[idx],
+                                on[idx].to_bits(),
+                                og[idx],
+                                og[idx].to_bits(),
+                            )
+                        };
+                        match bound {
+                            OffBound::Exact => {
+                                for idx in 0..len {
+                                    if same(on[idx], og[idx]) {
+                                        continue;
+                                    }
+                                    if let Some(d) =
+                                        known_divergence(k.name, x[idx], on[idx], og[idx])
+                                    {
+                                        known_hits[d] += 1;
+                                    } else {
+                                        off_failures.push(off_msg(
+                                            idx,
+                                            "documented bit-exact with its source loop",
+                                        ));
+                                    }
+                                }
+                                off_exact.insert(k.name);
+                            }
+                            OffBound::Fold => {
+                                let terms = fold_terms(k.name, n, &x, &y, len);
+                                let entry = off_tol.entry(k.name).or_insert((0.0, 0));
+                                for idx in 0..len {
+                                    let (a, b) = (on[idx], og[idx]);
+                                    entry.1 += 1;
+                                    if same(a, b) {
+                                        continue;
+                                    }
+                                    if !(a.is_finite() && b.is_finite()) {
+                                        off_failures.push(off_msg(
+                                            idx,
+                                            "a non-finite fold lane must match exactly",
+                                        ));
+                                        continue;
+                                    }
+                                    let (cnt, mag) = terms[idx];
+                                    let tol = 2.0 * (cnt as f64 + 1.0) * f64::powi(2.0, -24) * mag;
+                                    let err = (a as f64 - b as f64).abs();
+                                    if err > tol {
+                                        off_failures.push(off_msg(
+                                            idx,
+                                            &format!(
+                                                "|diff| {err:e} exceeds 2*gamma_n*S = {tol:e}"
+                                            ),
+                                        ));
+                                    } else if tol > 0.0 {
+                                        entry.0 = entry.0.max(err / tol);
+                                    }
+                                }
+                            }
+                            OffBound::Abs(tol) => {
+                                let entry = off_tol.entry(k.name).or_insert((0.0, 0));
+                                if !matches!(regime, Regime::Normal) {
+                                    off_skipped += len as u64;
+                                } else {
+                                    for idx in 0..len {
+                                        let (a, b) = (on[idx], og[idx]);
+                                        entry.1 += 1;
+                                        if same(a, b) {
+                                            continue;
+                                        }
+                                        let err = (a as f64 - b as f64).abs();
+                                        if !(a.is_finite() && b.is_finite() && err <= tol) {
+                                            off_failures.push(off_msg(
+                                                idx,
+                                                &format!(
+                                                    "|diff| {err:e} exceeds the declared {tol:e}"
+                                                ),
+                                            ));
+                                        } else {
+                                            entry.0 = entry.0.max(err / tol);
+                                        }
+                                    }
+                                }
+                            }
                         }
                         runs += 1;
                     }
@@ -663,6 +931,72 @@ fn fuzz_full_buffer_interp_vs_native() {
         dispatching > 0,
         "no fuzzer kernel dispatches a recognized wukong_* call — the recognizer base-pointer/extent \
          coverage this fuzzer is relied on for is gone"
+    );
+
+    // The recognition-off split. Only a DISPATCHING kernel is a real second opinion (a kernel that
+    // never dispatches lowers to the same loop either way), so report the dispatching ones by class.
+    let exact_dispatching: Vec<&str> = off_exact
+        .iter()
+        .filter(|n| dispatching_names.contains(*n))
+        .copied()
+        .collect();
+    let tol_report: Vec<String> = off_tol
+        .iter()
+        .map(|(name, (worst, lanes))| {
+            format!(
+                "{name} ({:?}: {lanes} lanes, worst {:.3}% of the bound)",
+                off_bound(name),
+                worst * 100.0
+            )
+        })
+        .collect();
+    eprintln!(
+        "recognition-off arm: {} dispatching kernel(s) bit-exact against their source loop {:?}; {} \
+         within a declared reassociation bound: {}; {off_skipped} norm lane(s) outside the Normal \
+         regime not compared",
+        exact_dispatching.len(),
+        exact_dispatching,
+        off_tol.len(),
+        tol_report.join(", ")
+    );
+    for (d, hits) in KNOWN_OFF_DIVERGENCES.iter().zip(&known_hits) {
+        eprintln!(
+            "  KNOWN recognizer != source divergence, {hits} lane(s) in {}: {}",
+            d.kernel, d.defect
+        );
+    }
+    let stale: Vec<&str> = KNOWN_OFF_DIVERGENCES
+        .iter()
+        .zip(&known_hits)
+        .filter(|(_, hits)| **hits == 0)
+        .map(|(d, _)| d.kernel)
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "KNOWN_OFF_DIVERGENCES entries for {stale:?} no longer reproduce — the defect looks fixed: \
+         delete the entry so those lanes are held bit-exact again"
+    );
+    assert!(
+        off_failures.is_empty(),
+        "recognition changed {} lane(s) beyond their declared bound; first 40:
+{}",
+        off_failures.len(),
+        off_failures
+            .iter()
+            .take(40)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(
+                "
+"
+            )
+    );
+    assert!(
+        !exact_dispatching.is_empty() && !off_tol.is_empty(),
+        "the recognition-off arm lost one of its two classes (bit-exact dispatching kernels: {}, \
+         tolerance kernels: {}) — it is no longer checking what it claims to",
+        exact_dispatching.len(),
+        off_tol.len()
     );
 }
 
