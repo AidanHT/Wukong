@@ -812,7 +812,8 @@ another architecture or OS is not supported. A native-backend failure is a catal
   equality chains, dead/trivial block-parameter elimination, DCE, dominator-tree CSE with load
   forwarding, DSE, **loop-invariant code motion**, **MIR loop fusion** of adjacent same-range loops
   after inlining (`-O2`; also at a non-negative read-behind distance, with first-loop live-outs, and
-  over proved-disjoint parameter and `@noalias` slice bases), **loop unswitching** and
+  over proved-disjoint parameter and `@noalias` slice bases; innermost two-block loops only, so a
+  body that still branches never fuses), **loop unswitching** and
   **induction-variable range splitting** of guarded loop bodies (`-O2`, also past a bounds-check
   trap or `break`, and on guards derived from the counter -- `i + 1 < n`, the tile edge
   `jo + j < n`, `(i as u64) < m` -- once they are proved not to wrap), and **partial loop unrolling** (4×, with a

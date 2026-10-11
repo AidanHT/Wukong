@@ -24,7 +24,8 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `d > 0` iterations back (and declines a read ahead), passes the first loop's live-outs to the code
   after the second, compares two bases of one object at their alias-analysis offset, and fuses over
   `@noalias` parameters and slices, whose reloaded data pointers must be stable
-  (`tests/run/opt4_fuse_distance.wk`, `opt4_fuse_liveout.wk`).
+  (`tests/run/opt4_fuse_distance.wk`, `opt4_fuse_liveout.wk`). Both loops must still be innermost
+  two-block loops: a body that still branches when fusion runs (more than two blocks) never fuses.
 - **Scalar promotion past bounds-check versioning (P10.2).** `promote` stored a register-carried
   location back only in an exit block that the loop alone reaches. Bounds-check elimination's
   checked and check-free copies of a loop share one exit block, so `out[0] += a[i]` over `@noalias`
