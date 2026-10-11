@@ -4598,13 +4598,9 @@ impl<'a> Sema<'a> {
                 }
             }
             ExprKind::ArrayLit(items) => {
-                let mut elem = Ty::Unknown;
-                for it in items {
-                    let t = self.type_expr(it);
-                    if elem.is_unknown() {
-                        elem = t;
-                    }
-                }
+                let tys: Vec<Ty> = items.iter().map(|it| self.type_expr(it)).collect();
+                // Every element is held at the ONE element type (`strs.rs`).
+                let elem = self.unify_array_lit_elems(items, &tys);
                 Ty::Array {
                     elem: Box::new(elem),
                     len: items.len() as u64,

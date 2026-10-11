@@ -1,0 +1,12 @@
+// EXPECT-CODE: E0401
+module tests.fail.str_array_ptr_elem
+
+// Every element of an array literal has the one element type. A string LITERAL beside a `str`
+// adapts to `str`, but a `*u8` VALUE does not: `str` converts to and from nothing. Accepted, this
+// stored an 8-byte pointer into a 16-byte `str` slot and left its length unwritten.
+fn main() -> i32 {
+    let s: str = "x";
+    let p = "y";
+    let a = [s, p];
+    return a[0].len() as i32;
+}

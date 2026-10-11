@@ -204,6 +204,69 @@ impl Sema<'_> {
         );
     }
 
+    /// The element type of the array literal `items`, whose elements typed as `tys`, with every
+    /// element checked against it.
+    ///
+    /// `mir_build` stores each element at its OWN type (`lower_array_init` -> `init_field`) into a
+    /// slot sized by the array's, so an element whose type is not the element type is a layout lie
+    /// rather than a conversion. The element type used to be the first element's, with the rest
+    /// never compared, and a `str` made that observable: `[s, "y"]` was a `[str; 2]` whose `"y"`
+    /// stayed `*u8`, stored as one 8-byte pointer into a 16-byte slot whose length nobody wrote
+    /// (stack garbage on native, an uninitialized slot on the interpreter); `["x", s]` stored the
+    /// ADDRESS of `s`'s fat pointer as a C string; and `[b, s]`, `b: []u8`, handed a writable view
+    /// of a string literal's deduplicated `.rodata` bytes to `v[1][0] = 65`.
+    ///
+    /// The element type is the first element type every element holds — as is, or as an adapting
+    /// literal (`literal_adapts`), so a string literal becomes a `str` on either side of one, and
+    /// `[3, 4]` beside an `[i8; 2]` is an `[i8; 2]`. An adapted element is re-stamped (and
+    /// range-checked) at that type; any other element that clashes with it is `E0401`. "Clashes"
+    /// is `aggregate_type_clash`, the place-versus-value relation `return` and `=` use with the
+    /// array's element type as the place: it covers `str` against anything else and two concrete
+    /// aggregates of different layouts, and leaves scalars, tensors, generics and `Unknown` to the
+    /// rules that already apply to them.
+    pub(crate) fn unify_array_lit_elems(&mut self, items: &[Expr], tys: &[Ty]) -> Ty {
+        let holds = |this: &Self, elem: &Ty| {
+            items
+                .iter()
+                .zip(tys)
+                .all(|(it, t)| !this.aggregate_type_clash(elem, t) || this.literal_adapts(elem, it))
+        };
+        let first = tys
+            .iter()
+            .find(|t| !t.is_unknown())
+            .cloned()
+            .unwrap_or(Ty::Unknown);
+        let elem = if holds(self, &first) {
+            first
+        } else {
+            tys.iter()
+                .find(|t| !t.is_unknown() && holds(self, t))
+                .cloned()
+                .unwrap_or(first)
+        };
+        for (it, t) in items.iter().zip(tys) {
+            if !self.aggregate_type_clash(&elem, t) {
+                continue;
+            }
+            if self.literal_adapts(&elem, it) {
+                self.retype_adapted_literal(it, &elem);
+                self.range_check_int_literal(it, &elem);
+                continue;
+            }
+            let (want, found) = (elem.display(self.interner), t.display(self.interner));
+            self.error(
+                it.span,
+                "E0401",
+                format!(
+                    "type mismatch: this array element is a `{found}`, but the array's elements are \
+                     `{want}` (every element of an array literal has the one element type; `str` \
+                     converts to and from nothing, and a string literal adapts to `str`)"
+                ),
+            );
+        }
+        elem
+    }
+
     /// `E0420`: a type parameter bound to a type that mentions `str`. `str` is erased to its
     /// `[]u8` representation before monomorphization, so an instance could not tell its text from
     /// a byte slice. The binding is replaced by `Ty::Error` so nothing cascades from the call.
@@ -545,6 +608,76 @@ fn main() -> i32 {
         rejects(
             "fn f<str>(x: i32) -> i32 { return x; } fn main() -> i32 { return 0; }",
             "E0300",
+        );
+    }
+
+    /// Whether any published type of `src` (which must check clean) still mentions `*u8`. In these
+    /// programs every `*u8` would be a string literal that never became a `str`.
+    #[track_caller]
+    fn literal_left_as_ptr(src: &str) -> bool {
+        let (res, codes, interner) = check(src);
+        assert!(codes.is_empty(), "unexpected {codes:?} for {src}");
+        res.types
+            .values()
+            .any(|t| t.display(&interner).contains("*u8"))
+    }
+
+    /// An array literal holds every element at ONE element type, and `mir_build` stores each
+    /// element at its own (`lower_array_init` -> `init_field`). A string literal beside a `str`
+    /// must therefore become a `str` wherever it sits in the literal, and anything else that is
+    /// not the element type is `E0401`, never a 16-byte slot holding an 8-byte pointer.
+    #[test]
+    fn array_literal_elements_share_one_type() {
+        let s = "let s: str = \"x\";";
+        for body in [
+            "let a = [s, \"y\"]; return a[1].len() as i32;",
+            "let a = [\"y\", s]; return a[0].len() as i32;",
+            "let a: [str; 2] = [s, \"y\"]; return a[1].len() as i32;",
+            "let a = [[s], [\"y\"]]; return a[1][0].len() as i32;",
+        ] {
+            let src = format!("fn main() -> i32 {{ {s} {body} }}");
+            assert!(
+                !literal_left_as_ptr(&src),
+                "a literal stayed `*u8` in {src}"
+            );
+        }
+        assert!(!literal_left_as_ptr(&format!(
+            "fn f(w: [str; 2]) -> i64 {{ return w[1].len(); }} \
+             fn main() -> i32 {{ {s} return f([s, \"y\"]) as i32; }}"
+        )));
+        for (body, why) in [
+            ("let p = \"y\"; let a = [s, p];", "a `*u8` value"),
+            ("let p = \"y\"; let a = [p, s];", "a `*u8` value first"),
+            ("let a = [s, 1];", "an integer"),
+            (
+                "let mut buf: [u8; 3] = [1, 2, 3]; let b: []u8 = buf; let a = [b, s];",
+                "a `[]u8` view, which would make the literal's bytes writable",
+            ),
+            (
+                "let mut buf: [u8; 3] = [1, 2, 3]; let b: []u8 = buf; let a = [s, b];",
+                "a `[]u8` view second",
+            ),
+        ] {
+            let src = format!("fn main() -> i32 {{ {s} {body} return 0; }}");
+            let (_, codes, _) = check(&src);
+            assert_eq!(codes, vec!["E0401"], "{why}: {src}");
+        }
+        // The rule is the aggregate one, not only `str`'s: two different structs cannot share a
+        // slot, and an adapting numeric literal takes an established element width.
+        rejects(
+            "struct A { x: i32 } struct B { y: f32 } \
+             fn main() -> i32 { let a = A { x: 1 }; let b = B { y: 2.0 }; let v = [a, b]; return 0; }",
+            "E0401",
+        );
+        let (res, codes, interner) = check(
+            "fn main() -> i32 { let n: [i8; 2] = [1, 2]; let v = [n, [3, 4]]; return v[1][0] as i32; }",
+        );
+        assert!(codes.is_empty(), "{codes:?}");
+        assert!(
+            res.types
+                .values()
+                .all(|t| !t.display(&interner).contains("i32; 2")),
+            "the `[3, 4]` element must take the `[i8; 2]` element type"
         );
     }
 

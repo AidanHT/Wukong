@@ -32,6 +32,17 @@ All notable changes to Wukong are documented here. The format is loosely based o
   the optimizer and all four backends run the existing slice machinery; `SemaResult::str_print_args`
   tells printing which arguments are text. A struct, enum, trait, type alias or generic parameter
   named `str` is `E0300`.
+- **An array literal has one element type.** Its element type was the first element's, the other
+  elements were never compared with it, and lowering stored each one at its own type. With `str`
+  that was a silent wrong answer: `[s, "y"]` stored `"y"` as an 8-byte `*u8` in a 16-byte `str`
+  slot and never wrote its length (garbage natively, an uninitialized slot on the interpreter),
+  `["x", s]` read `s`'s fat pointer as a C string (a different garbage byte on each backend), and
+  `[b, s]` with `b: []u8` handed out a writable view of a literal's read-only bytes. A string
+  literal now becomes a `str` beside one on either side, an adapting literal takes the established
+  element type (`[n, [3, 4]]` with `n: [i8; 2]`), and an element that is not the element type — a
+  `*u8` value or a `[]u8` beside a `str`, two different structs — is `E0401`
+  (`tests/run/str_array_elems.wk`, `tests/fail/str_array_ptr_elem.wk`,
+  `tests/fail/str_array_slice_elem.wk`).
 
 ### Type-lowering soundness (`gap4/sema-soundness`)
 

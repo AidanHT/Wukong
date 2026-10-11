@@ -420,9 +420,12 @@ printf("[{}|{:?}]\n", s, s[..2]);   // [wukong|"wu"]
 - **Literals.** A string literal is a `str` wherever the context expects one: exactly where a
   numeric literal adapts to its annotation (a `let`/`const` annotation, a call or method argument,
   a `return` of either spelling, a struct field, an assignment, an array or tuple element), as an
-  `==`/`!=` operand against a `str`, and as the base of a range index. Unannotated, a literal is
-  still the NUL-terminated `*u8` (`let p = "x";`). As with numbers, an `if`/`match` whose arms are
-  all literals takes its type from those arms (`*u8`): annotate it, or `return` each literal.
+  `==`/`!=` operand against a `str`, and as the base of a range index. In an array literal it
+  becomes a `str` beside one on either side (`[s, "y"]` and `["x", s]` are both `[str; 2]`,
+  `tests/run/str_array_elems.wk`): every element of an array literal has the one element type, so
+  a `*u8` value or a `[]u8` beside a `str` is `E0401`. Unannotated, a literal is still the
+  NUL-terminated `*u8` (`let p = "x";`). As with numbers, an `if`/`match` whose arms are all
+  literals takes its type from those arms (`*u8`): annotate it, or `return` each literal.
 - **Bytes.** `s.len()` is the byte length, an `i64`. `s[i]` is a `u8`, bounds-checked exactly like
   a slice element (the same `index out of bounds` failure, exit 1). `for b in s` yields each byte.
   The bytes are UTF-8 (`"h\u{e9}llo"` is 6 bytes long), and nothing decodes characters yet.
