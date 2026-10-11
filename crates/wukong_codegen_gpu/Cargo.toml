@@ -6,6 +6,11 @@ license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+# Opt in to the workspace lint policy (`-D warnings`; see the workspace `Cargo.toml`), so a warning
+# here fails a plain local `cargo build` / `cargo clippy`, not only CI's `RUSTFLAGS`.
+[lints]
+workspace = true
+
 # The GPU backend: Wukong emits PTX text and driver-JIT-loads it via `cudarc`
 # (`cuModuleLoadData` — the NVIDIA driver's built-in PTX→SASS JIT needs no `nvcc`/`ptxas`).
 # All GPU code is behind the `gpu` feature so the toolchain-free CPU core (`cargo test`) never

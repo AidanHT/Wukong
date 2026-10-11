@@ -25,13 +25,15 @@ Wukong is built incrementally, one small, tested change at a time.
 
 ```sh
 cargo fmt --all
-RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets
 cargo test --workspace
 cargo check --features gpu --all-targets
 ```
 
-CI sets `RUSTFLAGS: -D warnings` for the whole job, so a lint is an error there; without it your
-local clippy is strictly weaker than the gate.
+Every crate's manifest opts in to the workspace lint policy (`[lints] workspace = true`, or its own
+table in `wukong_runtime`), so `-D warnings` - rustc's warnings and Clippy's alike - applies to a plain
+local `cargo clippy` exactly as it does in CI, which also keeps its `RUSTFLAGS: -D warnings`. A new
+crate must add the same two lines to its `Cargo.toml`, or it is warn-only locally.
 
 That last line is not optional. All GPU code is behind `--features gpu`, so `cargo test --workspace`
 compiles only the two deliberately un-gated modules of `wukong_codegen_gpu` (`paged_kv`,

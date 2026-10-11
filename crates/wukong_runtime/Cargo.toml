@@ -32,8 +32,9 @@ warnings = "deny"
 [lints.clippy]
 # P14.4 — every `unsafe {}` block in this crate now carries a `// SAFETY:` justification. This lint
 # (restriction group, allow-by-default) requires one on each block and so holds that line for every
-# future block. It is `warn` here and is escalated to a hard error by the workspace's
-# `RUSTFLAGS: -D warnings` during the CI Clippy step. `unsafe_op_in_unsafe_fn` is deliberately NOT
+# future block. It is `warn` here and is escalated to a hard error by this manifest's own
+# `warnings = "deny"` above - `warnings` covers Clippy's lints under clippy-driver too, which the
+# workspace `Cargo.toml` records as measured (P13.15) - and by CI's `RUSTFLAGS: -D warnings`. `unsafe_op_in_unsafe_fn` is deliberately NOT
 # enabled: on edition 2021 it would require wrapping the body of every `unsafe fn` in an explicit
 # `unsafe {}` block (a code change, not a comment), which is out of scope for this safety-doc pass.
 undocumented_unsafe_blocks = "warn"

@@ -49,12 +49,26 @@ wukong_autodiff = { path = "crates/wukong_autodiff" }
 # `rustc` through cargo all agree without an environment variable, and the gate lanes stop splitting
 # cargo's fingerprint three ways over three different `RUSTFLAGS` values.
 #
-# SCOPE, so nobody reads this as more than it is: a `[workspace.lints]` table is a TEMPLATE. It binds
-# only the crates that opt in with `[lints] workspace = true`, and at the time of writing exactly one
-# does - `crates/wukong_driver`. The other twenty manifests are unchanged and still rely on CI's
-# `RUSTFLAGS`, which is therefore NOT removed from `ci.yml`. It could only be removed once every
-# manifest has opted in, and even then `RUSTFLAGS: -D warnings` covers clippy's own lints during a
-# clippy run while `[lints.rust]` does not - they are not interchangeable.
+# SCOPE (P13.15, 2026-10-11): a `[workspace.lints]` table is a TEMPLATE that binds only the crates
+# that opt in, and EVERY manifest under `crates/` now does. Twenty use `[lints] workspace = true`;
+# `crates/wukong_runtime` keeps its own table instead (`warnings = "deny"` plus Clippy's
+# `undocumented_unsafe_blocks`), because a crate cannot combine `workspace = true` with a lint of its
+# own. A new crate must add the same two lines - nothing enforces it but review.
+#
+# What this does and does not cover, measured rather than assumed. With `RUSTFLAGS` unset,
+# `cargo clippy --workspace --all-targets` now exits non-zero on a rustc warning (an unused variable
+# injected into `wukong_bench` failed it: "`-D unused-variables` implied by `-D warnings`"; the same
+# injection with that crate's `[lints]` removed exited 0 with a warning) AND on a Clippy warning
+# (`-D clippy::type-complexity` implied by `-D warnings`): `warnings` is the group of everything that
+# would warn, so under clippy-driver it includes Clippy's own lints. An earlier note here said the
+# opposite; it was not true. `ci.yml` keeps its workflow-level `RUSTFLAGS: -D warnings` anyway, as
+# the backstop for a crate that forgets to opt in.
+#
+# No `[workspace.lints.clippy]` table: the only Clippy policy in the tree is the runtime's
+# `undocumented_unsafe_blocks`, and it is not compatible workspace-wide. By a `// SAFETY:` count,
+# `wukong_codegen_cranelift` (98 unsafe blocks, 18 notes), `wukong_codegen_gpu` (432 / 32) and
+# `wukong_xbench` (76 / 31) would fail it under `-D warnings` - enabling it is a documentation pass
+# per crate first, not a manifest change.
 [workspace.lints.rust]
 warnings = "deny"
 
