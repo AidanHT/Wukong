@@ -1,7 +1,8 @@
 //! Whole-pipeline stage profiling and in-process-vs-spawn characterization.
 //!
-//! Two modes live here, both aimed at the "compile-time floor" question — how close is code→object
-//! to the irreducible work, and what does the process-spawn path cost on top of the in-process API.
+//! Four modes live here. The first two are aimed at the "compile-time floor" question — how close is
+//! code→object to the irreducible work, and what does the process-spawn path cost on top of the
+//! in-process API. The last two (P6.10) time whole processes: a cold start, and a thread sweep.
 //!
 //! * `compile-profile` — a per-STAGE wall-time breakdown of the full pipeline (lex, parse, sema,
 //!   mir_build, optimize, and the Cranelift codegen+object-emit backend) measured in-process,
@@ -29,9 +30,22 @@
 //!   status is checked, because a child that fails emits no object and its wall time is not a
 //!   compile measurement.
 //!
+//! * `cold-start` - fresh-process compile plus first run of a fixed program (`COLD_START_SRC`, or
+//!   a `.wk` path given on the command line): `--runs=N` children of `wukongc --run -O2`, each a
+//!   cold start of compile + JIT + runtime initialization + the first execution, reported as
+//!   min / median / p95 / max and the very first child on its own. Every child's exit status and
+//!   stdout are checked.
+//!
+//! * `scaling` - one workload (a recognized `@parallel` 512^3 GEMM repeated `--reps` times, or a
+//!   `.wk` path) in fresh processes at `WUKONG_NUM_THREADS` = 1, 2, 4, .., all (`--max-threads`),
+//!   reporting per thread count the min / median wall, the speedup over one thread and the
+//!   per-thread efficiency. The answer must be identical at every thread count.
+//!
 //! ```text
 //! cargo run -p wukong_bench --release -- compile-profile tests/run examples bench/kernels
 //! cargo run -p wukong_bench --release -- spawn-overhead   tests/run examples bench/kernels
+//! cargo run -p wukong_bench --release -- cold-start --runs=20
+//! cargo run -p wukong_bench --release -- scaling --runs=3
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -708,5 +722,535 @@ fn trunc(s: &str, w: usize) -> String {
     } else {
         let cut: String = s.chars().take(w.saturating_sub(1)).collect();
         format!("{cut}…")
+    }
+}
+
+// ===================================================================================================
+// cold-start and scaling (P6.10)
+// ===================================================================================================
+//
+// Both modes time FRESH PROCESSES of the real compiler binary, because both quantities are
+// properties of a process, not of a call: a cold start is compile + JIT + runtime initialization +
+// the first execution, all of which a warm in-process loop amortizes away, and the runtime reads its
+// thread count (`WUKONG_NUM_THREADS`) exactly once per process. Every child's exit status and stdout
+// are checked - a child that failed timed an error path, and a sweep whose answer changed with the
+// thread count measured two different computations.
+//
+// The two report lines are a contract with `docs/sota-campaign-2026-09/analyze-sota-measure.py`
+// (`COLD_START_LINE` / `SCALING_LINE`, pinned by its `--self-test`); `cold_start_line` and
+// `scaling_line` are the only producers, and the unit tests below pin their spelling:
+//
+//   cold-start: program=<name> backend=<b> opt=O2 runs=<n> min_ms=<f> median_ms=<f> p95_ms=<f> max_ms=<f> first_ms=<f>
+//   scaling: workload=<name> threads=<n> runs=<k> min_ms=<f> median_ms=<f> speedup=<f> efficiency=<f>
+
+/// The fixed cold-start program: a recognized `@parallel` 128x128x128 GEMM (so the first run also
+/// pays the runtime's thread-pool start and the kernel's first call) followed by a reduction and a
+/// print. Every GEMM lane is a small exact integer and the checksum reduction has a fixed
+/// partition, so every run prints the same line.
+const COLD_START_SRC: &str = "module bench.cold_start
+
+@parallel
+fn mm(a: [f32; 16384], b: [f32; 16384], mut c: [f32; 16384]) {
+    for i in 0..128 {
+        for j in 0..128 {
+            let mut s: f32 = 0.0;
+            for k in 0..128 {
+                s = s + a[i * 128 + k] * b[k * 128 + j];
+            }
+            c[i * 128 + j] = s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut a: [f32; 16384] = [0.0; 16384];
+    let mut b: [f32; 16384] = [0.0; 16384];
+    let mut c: [f32; 16384] = [0.0; 16384];
+    for t in 0..16384 {
+        a[t] = (t % 7) as f32;
+        b[t] = (t % 5) as f32;
+    }
+    mm(a, b, c);
+    print(sum(c));
+    return 0;
+}
+";
+
+/// The scaling workload: `reps` calls of a recognized `@parallel` 512x512x512 GEMM
+/// (`wukong_sgemm_parallel`, which runs on the pool `WUKONG_NUM_THREADS` sizes), then a checksum.
+/// Every lane is a small exact integer and the checksum reduction's partition is fixed, so the
+/// printed line cannot depend on the thread count unless something is wrong - which is checked.
+fn scaling_src(reps: usize) -> String {
+    format!(
+        "module bench.scaling
+
+@parallel
+fn mm(a: [f32; 262144], b: [f32; 262144], mut c: [f32; 262144]) {{
+    for i in 0..512 {{
+        for j in 0..512 {{
+            let mut s: f32 = 0.0;
+            for k in 0..512 {{
+                s = s + a[i * 512 + k] * b[k * 512 + j];
+            }}
+            c[i * 512 + j] = s;
+        }}
+    }}
+}}
+
+fn main() -> i32 {{
+    let mut a: [f32; 262144] = [0.0; 262144];
+    let mut b: [f32; 262144] = [0.0; 262144];
+    let mut c: [f32; 262144] = [0.0; 262144];
+    for t in 0..262144 {{
+        a[t] = (t % 7) as f32;
+        b[t] = (t % 5) as f32;
+    }}
+    for _r in 0..{reps} {{
+        mm(a, b, c);
+    }}
+    print(sum(c));
+    return 0;
+}}
+"
+    )
+}
+
+/// Parsed `--key=value` options of the two process-level modes.
+#[derive(Debug, PartialEq)]
+struct ProcessOpts {
+    runs: usize,
+    backend: String,
+    wukongc: Option<PathBuf>,
+    program: Option<PathBuf>,
+    max_threads: Option<usize>,
+    reps: usize,
+}
+
+fn parse_process_opts(args: &[String], default_runs: usize) -> Result<ProcessOpts, String> {
+    let mut o = ProcessOpts {
+        runs: default_runs,
+        backend: "native".into(),
+        wukongc: None,
+        program: None,
+        max_threads: None,
+        reps: 200,
+    };
+    let positive = |k: &str, v: &str| -> Result<usize, String> {
+        v.parse::<usize>()
+            .ok()
+            .filter(|&n| n > 0)
+            .ok_or_else(|| format!("{k} needs a positive integer, got {v:?}"))
+    };
+    for a in args {
+        if let Some(v) = a.strip_prefix("--runs=") {
+            o.runs = positive("--runs", v)?;
+        } else if let Some(v) = a.strip_prefix("--backend=") {
+            if v != "native" && v != "interp" {
+                return Err(format!("--backend must be native or interp, got {v:?}"));
+            }
+            o.backend = v.into();
+        } else if let Some(v) = a.strip_prefix("--wukongc=") {
+            o.wukongc = Some(PathBuf::from(v));
+        } else if let Some(v) = a.strip_prefix("--max-threads=") {
+            o.max_threads = Some(positive("--max-threads", v)?);
+        } else if let Some(v) = a.strip_prefix("--reps=") {
+            o.reps = positive("--reps", v)?;
+        } else if a.starts_with("--") {
+            return Err(format!("unknown option {a:?}"));
+        } else if o.program.is_none() {
+            o.program = Some(PathBuf::from(a));
+        } else {
+            return Err(format!("more than one program given ({a:?})"));
+        }
+    }
+    Ok(o)
+}
+
+/// Min / median / p95 / max of a non-empty sample set, in the samples' unit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Spread {
+    min: f64,
+    median: f64,
+    p95: f64,
+    max: f64,
+}
+
+/// `p95` is the nearest-rank percentile (`ceil(0.95 n)`-th smallest), so it is always an observed
+/// sample and never an interpolation between two; with fewer than 20 runs it is the maximum.
+fn spread(samples: &[f64]) -> Option<Spread> {
+    if samples.is_empty() || samples.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let mut s = samples.to_vec();
+    s.sort_by(|a, b| a.total_cmp(b));
+    let n = s.len();
+    let median = if n % 2 == 1 {
+        s[n / 2]
+    } else {
+        (s[n / 2 - 1] + s[n / 2]) / 2.0
+    };
+    let rank = ((0.95 * n as f64).ceil() as usize).clamp(1, n);
+    Some(Spread {
+        min: s[0],
+        median,
+        p95: s[rank - 1],
+        max: s[n - 1],
+    })
+}
+
+/// The thread counts a sweep visits: 1, 2, 4, ... and then `max` itself if it is not a power of
+/// two, so "all" is always measured.
+fn thread_sweep(max: usize) -> Vec<usize> {
+    let max = max.max(1);
+    let mut v = Vec::new();
+    let mut t = 1usize;
+    while t < max {
+        v.push(t);
+        t *= 2;
+    }
+    v.push(max);
+    v
+}
+
+/// The cold-start report line (see the module comment for the contract).
+fn cold_start_line(program: &str, backend: &str, runs: usize, s: Spread, first_ms: f64) -> String {
+    format!(
+        "cold-start: program={program} backend={backend} opt=O2 runs={runs} min_ms={:.3} \
+         median_ms={:.3} p95_ms={:.3} max_ms={:.3} first_ms={first_ms:.3}",
+        s.min, s.median, s.p95, s.max
+    )
+}
+
+/// One scaling report line. `speedup` is the 1-thread median over this count's median, and
+/// `efficiency` is that speedup per thread.
+fn scaling_line(
+    workload: &str,
+    threads: usize,
+    runs: usize,
+    s: Spread,
+    one_thread_median: f64,
+) -> String {
+    let speedup = one_thread_median / s.median;
+    format!(
+        "scaling: workload={workload} threads={threads} runs={runs} min_ms={:.3} median_ms={:.3} \
+         speedup={speedup:.3} efficiency={:.3}",
+        s.min,
+        s.median,
+        speedup / threads as f64
+    )
+}
+
+/// One fresh `wukongc --run` child: its wall time in ms and its stdout, or why it is not a sample.
+fn spawn_run(
+    mc: &Path,
+    workdir: &Path,
+    file: &str,
+    backend: &str,
+    threads: Option<usize>,
+) -> Result<(f64, String), String> {
+    let mut cmd = Command::new(mc);
+    cmd.current_dir(workdir)
+        .args(["--run", &format!("--backend={backend}"), "-O2", file])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(t) = threads {
+        cmd.env("WUKONG_NUM_THREADS", t.to_string());
+    } else {
+        cmd.env_remove("WUKONG_NUM_THREADS");
+    }
+    let t0 = Instant::now();
+    let out = cmd
+        .output()
+        .map_err(|e| format!("cannot spawn {}: {e}", mc.display()))?;
+    let ms = t0.elapsed().as_secs_f64() * 1e3;
+    if !out.status.success() {
+        return Err(format!(
+            "child exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok((ms, String::from_utf8_lossy(&out.stdout).into_owned()))
+}
+
+/// Resolve the compiler binary and the program to time; `fixed` is the built-in source used when
+/// no `.wk` path is given. Returns (wukongc, workdir, file name in workdir, program label).
+fn stage_program(
+    mode: &str,
+    o: &ProcessOpts,
+    fixed: &str,
+    fixed_name: &str,
+) -> Result<(PathBuf, PathBuf, String, String), String> {
+    let mc = o.wukongc.clone().unwrap_or_else(default_wukongc);
+    // Absolute, because the child runs with `current_dir(workdir)` and a relative program path is
+    // resolved differently across platforms once the working directory changes.
+    let mc = std::path::absolute(&mc).unwrap_or(mc);
+    if !mc.exists() {
+        return Err(format!(
+            "wukongc not found at {} - build it (cargo build --release -p wukongc) or pass \
+             --wukongc=<path>",
+            mc.display()
+        ));
+    }
+    let workdir = std::env::temp_dir().join(format!("wukong_{}", mode.replace('-', "_")));
+    std::fs::create_dir_all(&workdir).map_err(|e| format!("{}: {e}", workdir.display()))?;
+    let (src, label) = match &o.program {
+        Some(p) => (
+            std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?,
+            short(p).trim_end_matches(".wk").to_string(),
+        ),
+        None => (fixed.to_string(), fixed_name.to_string()),
+    };
+    let file = format!("{label}.wk");
+    std::fs::write(workdir.join(&file), src).map_err(|e| format!("{file}: {e}"))?;
+    Ok((mc, workdir, file, label))
+}
+
+/// `cold-start [--runs=N] [--backend=native|interp] [--wukongc=PATH] [program.wk]`. Returns the
+/// process exit code: 0 measured, 1 a child failed or printed something different, 2 usage.
+pub fn cold_start_report(args: &[String]) -> i32 {
+    let o = match parse_process_opts(args, 10) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("cold-start: {e}");
+            return 2;
+        }
+    };
+    let (mc, workdir, file, label) =
+        match stage_program("cold-start", &o, COLD_START_SRC, "cold_start_gemm128") {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("cold-start: {e}");
+                return 2;
+            }
+        };
+    println!(
+        "cold-start: {} fresh `wukongc --run --backend={} -O2` processes of `{label}` \
+         (wukongc: {})\n  each = process start + compile + JIT + runtime init + the first run; \
+         wall time per child, ms",
+        o.runs,
+        o.backend,
+        mc.display()
+    );
+    let mut samples = Vec::with_capacity(o.runs);
+    let mut first_out: Option<String> = None;
+    for run in 0..o.runs {
+        match spawn_run(&mc, &workdir, &file, &o.backend, None) {
+            Ok((ms, out)) => {
+                match &first_out {
+                    None => first_out = Some(out),
+                    Some(f) if *f != out => {
+                        eprintln!(
+                            "cold-start: run {run} printed {out:?}, run 0 printed {f:?} - not the \
+                             same computation, nothing to report"
+                        );
+                        return 1;
+                    }
+                    Some(_) => {}
+                }
+                println!("cold-start sample: run={run} ms={ms:.3}");
+                samples.push(ms);
+            }
+            Err(e) => {
+                eprintln!("cold-start: run {run}: {e} - a failed child is not a sample");
+                return 1;
+            }
+        }
+    }
+    let Some(s) = spread(&samples) else {
+        eprintln!("cold-start: no samples");
+        return 1;
+    };
+    println!(
+        "{}",
+        cold_start_line(&label, &o.backend, samples.len(), s, samples[0])
+    );
+    println!(
+        "  run 0 (first_ms) is the only one with a cold compiler image and page cache; min/median/\n  \
+         p95 are over all runs. A lone figure is not a measurement on this host - compare arms by \
+         ratio."
+    );
+    0
+}
+
+/// `scaling [--runs=N] [--max-threads=N] [--reps=N] [--wukongc=PATH] [workload.wk]`: the same
+/// workload in fresh processes at `WUKONG_NUM_THREADS` = 1, 2, 4, .., all. Exit codes as for
+/// [`cold_start_report`].
+pub fn scaling_report(args: &[String]) -> i32 {
+    let o = match parse_process_opts(args, 3) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("scaling: {e}");
+            return 2;
+        }
+    };
+    let fixed = scaling_src(o.reps);
+    let name = format!("scaling_gemm512x{}", o.reps);
+    let (mc, workdir, file, label) = match stage_program("scaling", &o, &fixed, &name) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("scaling: {e}");
+            return 2;
+        }
+    };
+    let all = o.max_threads.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    });
+    let sweep = thread_sweep(all);
+    println!(
+        "scaling: workload={label} backend={} sweep={} ({} fresh process(es) per count; \
+         wukongc: {})\n  wall time per child includes the serial compile + start-up, so the \
+         efficiency below is a whole-process (Amdahl) figure, not the parallel region's",
+        o.backend,
+        sweep
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        o.runs,
+        mc.display()
+    );
+    let mut reference: Option<String> = None;
+    let mut one_thread_median = None;
+    for &t in &sweep {
+        let mut samples = Vec::with_capacity(o.runs);
+        for run in 0..o.runs {
+            match spawn_run(&mc, &workdir, &file, &o.backend, Some(t)) {
+                Ok((ms, out)) => {
+                    match &reference {
+                        None => reference = Some(out),
+                        Some(r) if *r != out => {
+                            eprintln!(
+                                "scaling: threads={t} run {run} printed {out:?}, threads=1 printed \
+                                 {r:?} - the answer depends on the thread count; nothing to report"
+                            );
+                            return 1;
+                        }
+                        Some(_) => {}
+                    }
+                    samples.push(ms);
+                }
+                Err(e) => {
+                    eprintln!("scaling: threads={t} run {run}: {e}");
+                    return 1;
+                }
+            }
+        }
+        let Some(s) = spread(&samples) else {
+            eprintln!("scaling: threads={t}: no samples");
+            return 1;
+        };
+        let base = *one_thread_median.get_or_insert(s.median);
+        println!("{}", scaling_line(&label, t, samples.len(), s, base));
+    }
+    0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn spread_uses_nearest_rank_p95_and_the_true_median() {
+        let s = spread(&[5.0, 1.0, 3.0, 2.0, 4.0]).unwrap();
+        assert_eq!(
+            s,
+            Spread {
+                min: 1.0,
+                median: 3.0,
+                p95: 5.0,
+                max: 5.0
+            }
+        );
+        // Even count: the median is the midpoint; with 20 samples p95 is the 19th smallest.
+        let twenty: Vec<f64> = (1..=20).map(f64::from).collect();
+        let s = spread(&twenty).unwrap();
+        assert_eq!(s.median, 10.5);
+        assert_eq!(s.p95, 19.0);
+        assert_eq!(s.max, 20.0);
+        assert!(spread(&[]).is_none());
+        assert!(spread(&[1.0, f64::NAN]).is_none());
+    }
+
+    #[test]
+    fn the_thread_sweep_doubles_and_always_ends_at_all() {
+        assert_eq!(thread_sweep(1), vec![1]);
+        assert_eq!(thread_sweep(8), vec![1, 2, 4, 8]);
+        assert_eq!(thread_sweep(22), vec![1, 2, 4, 8, 16, 22]);
+        assert_eq!(thread_sweep(0), vec![1]);
+    }
+
+    /// The two report lines are parsed by `analyze-sota-measure.py` (`COLD_START_LINE`,
+    /// `SCALING_LINE`, and its `--self-test` embeds these exact spellings). Changing a field here
+    /// without changing the analyser breaks that contract, so the spelling is pinned.
+    #[test]
+    fn the_report_lines_keep_the_analyser_contract() {
+        let s = Spread {
+            min: 10.0,
+            median: 12.5,
+            p95: 20.25,
+            max: 21.0,
+        };
+        assert_eq!(
+            cold_start_line("cold_start_gemm128", "native", 10, s, 21.0),
+            "cold-start: program=cold_start_gemm128 backend=native opt=O2 runs=10 min_ms=10.000 \
+             median_ms=12.500 p95_ms=20.250 max_ms=21.000 first_ms=21.000"
+        );
+        let s4 = Spread {
+            min: 30.0,
+            median: 31.25,
+            p95: 33.0,
+            max: 33.0,
+        };
+        assert_eq!(
+            scaling_line("scaling_gemm512x200", 4, 3, s4, 100.0),
+            "scaling: workload=scaling_gemm512x200 threads=4 runs=3 min_ms=30.000 median_ms=31.250 \
+             speedup=3.200 efficiency=0.800"
+        );
+    }
+
+    #[test]
+    fn process_options_parse_and_refuse_what_they_do_not_know() {
+        let o = parse_process_opts(&args(&["--runs=5", "--backend=interp", "x.wk"]), 10).unwrap();
+        assert_eq!(o.runs, 5);
+        assert_eq!(o.backend, "interp");
+        assert_eq!(o.program, Some(PathBuf::from("x.wk")));
+        let o = parse_process_opts(&args(&["--max-threads=6", "--reps=7"]), 3).unwrap();
+        assert_eq!((o.runs, o.max_threads, o.reps), (3, Some(6), 7));
+        assert!(parse_process_opts(&args(&["--runs=0"]), 3).is_err());
+        assert!(parse_process_opts(&args(&["--backend=gpu"]), 3).is_err());
+        assert!(parse_process_opts(&args(&["--bogus"]), 3).is_err());
+        assert!(parse_process_opts(&args(&["a.wk", "b.wk"]), 3).is_err());
+    }
+
+    /// The two built-in programs must stay valid Wukong and keep the parallel GEMM kernel the
+    /// modes exist to exercise - checked in-process, so a language change that breaks them fails
+    /// here rather than in a measured round.
+    #[test]
+    fn the_fixed_programs_compile_and_dispatch_the_parallel_gemm() {
+        for (name, src) in [
+            ("cold_start", COLD_START_SRC.to_string()),
+            ("scaling", scaling_src(2)),
+        ] {
+            let mut interner = Interner::new();
+            let (module, pd) = wukong_parser::parse_module(&src, SourceId(0), &mut interner);
+            assert!(!pd.iter().any(|d| d.is_error()), "{name}: {pd:?}");
+            let (sema, sd) = wukong_sema::check(&module, &interner);
+            assert!(!sd.iter().any(|d| d.is_error()), "{name}: {sd:?}");
+            let (mut p, ld) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+            assert!(!ld.iter().any(|d| d.is_error()), "{name}: {ld:?}");
+            wukong_opt::optimize(&mut p, LEVEL);
+            let mir = wukong_mir::print::print_program(&p, &interner);
+            assert!(
+                mir.contains("call wukong_sgemm_parallel("),
+                "{name}: the parallel GEMM kernel no longer dispatches:\n{mir}"
+            );
+        }
     }
 }
