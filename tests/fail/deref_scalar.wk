@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0433
+// EXPECT-COUNT: 1
 module tests.fail.deref_scalar
 
 // `*x` requires a pointer or reference operand. Dereferencing a scalar used to fall through sema's
@@ -7,6 +8,6 @@ module tests.fail.deref_scalar
 // Take a reference first (`&x`) if you mean to round-trip through a pointer.
 fn main() -> i32 {
     let x: i32 = 5;
-    let y: i32 = *x;
+    let y: i32 = *x; //~ E0433
     return y;
 }

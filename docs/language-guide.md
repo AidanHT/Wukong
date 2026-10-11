@@ -2130,6 +2130,7 @@ and a name:
 | `W0005` | `dead_code` | a function of the compiled file no entry point reaches (`main`, the `--grad-of` function under `--emit=grad`/`--train`/`--emit=obj --grad-of`, `pub`, `@export`/`@extern`); nothing under `--emit=obj`/`llvm-ir` or in a file with no `main` |
 | `W0006` | `unwritten_output` | a `mut` array/slice/tensor/tuple/struct parameter — an output buffer — that is never stored to, assigned, passed on or borrowed |
 | `W0007` | `unknown_lints` | an `@allow`/`@warn`/`@deny` argument that names no lint |
+| `W0008` | `unused_imports` | an `import` no name of its file resolves through: a glob or `as` import none of whose names or qualifier is used, a second import of an already imported module, or the unused names of a `{x, y}` selection (see below) |
 | `W0020` | `unreachable_patterns` | a `match` arm no value can reach: every value its pattern matches is matched by an earlier unguarded arm (`5 => …` after `0..=9 => …`, anything after `_`) |
 | `W0030` | `missing_semicolon` | a statement without its `;` (see below) |
 | `W0031` | `ambiguous_continuation` | a `(` or `[`, or a `-` touching its operand, at the start of a line, continuing the expression above it |
@@ -2154,14 +2155,41 @@ fn main() -> i32 {
 The innermost attribute wins over an outer one and over the command line; `-D warnings` applies to
 every lint still at warning level, so it does not resurrect an allowed one. Warnings are printed
 after any error. The lints that need types run only on a program that checks clean; the parser's
-two (`W0030`, `W0031`) are reported for the compiled file even when a later stage fails, since a
-line that silently continued the one above is often why it failed. The fixtures in `tests/warn/`
-pin each lint's exact output.
+two (`W0030`, `W0031`) are reported for every file of the program — an imported module's carry its
+own path — even when a later stage fails, since a line that silently continued the one above is
+often why it failed. The fixtures in `tests/warn/` pin each lint's exact output, and every program
+in `tests/run/` and `examples/` compiles warning-free (`corpus_is_warning_free`).
+
+**Unused imports.** `W0008` judges each file's imports with the same module-scoped resolution that
+decides what every name means: a local that shadows an imported name does not use the import, and
+of two imports of one module the second is the unused one. An `impl` is the one thing found
+without a name: a method is found through its receiver's type, and a trait bound is satisfied by an
+`impl` anywhere in the program. So an import is also kept when the module it loads (directly or
+through its own imports) holds an `impl` that defines a method called in any file, or implements a
+trait that any generic parameter is bounded by; deleting every reported import at once never
+changes what the program means. It is reported in imported files too, and
+`@allow(unused_imports)` may be written on the `import` itself; `--emit=obj` and `--emit=llvm-ir`
+report none, since a library may import a module only for the functions it exports.
+
+**Fixes as data.** Where the fix is mechanical a diagnostic carries it as a suggestion, rendered as
+a `help:` line and emitted in `--error-format=json`'s `suggestions` with an exact byte range and an
+applicability: `W0030` inserts the `;`, `W0008` deletes the import (or rewrites a selection to the
+names that are used), an assignment to an immutable binding or parameter (`E0304`) inserts `mut `
+at its declaration (machine-applicable; maybe-incorrect when it would make an aggregate parameter's
+store reach the caller; before the whole pattern of a `let … else`, `let mut E::A(v) = e else …`;
+none for a local `const`), and the resolution errors carry their did-you-mean and the edits their
+help text describes (`Type::f` for an associated function called bare, `()` for a method read like
+a field, the deleted argument list of a field called like a method). `E0304`'s other forms — a
+builtin or a `mut self` method writing through a non-`mut` parameter, or a store through a tensor
+view of one — carry no fix yet. `Type::f` is offered only for a type declared in the root file: an
+imported module's type is named in the help as its module declares it (`Pt`), with no edit, since
+how the calling file may spell it depends on that file's imports.
 
 **Statements end with `;`.** It may be left out only after a block-like statement — `if`,
 `match`, `loop`, `while`, `for`, a `{ … }` block — and, for any statement but a `let`, right
 before the `}` that closes the block (Rust's rule). Leaving it out elsewhere still parses the same
-(`W0030` is a warning, not yet an error), but it is what makes the next hazard possible: a `(`
+(`W0030` is a warning, not yet an error; a `defer` statement needs its `;` too, unless it defers a
+block), but it is what makes the next hazard possible: a `(`
 or `[` that starts a line is a call or an index of the expression on the line above, and so is a
 `-` that starts a line and touches its operand (`-1`). `acc = a[i]` followed by `(b + c)` on the
 next line is `acc = a[i](b + c)`; `W0031` reports it. A `- y` with a space is the ordinary way to

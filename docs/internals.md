@@ -290,13 +290,34 @@ definite-return rule for divergence (a `match` diverges only with a catch-all ar
 always delete what it reports. `dead_code` roots come from the driver (`lint_options_for`: `main`,
 the autodiff root, everything under `--emit=obj|llvm-ir`). Lint codes are catalogued like errors;
 `catalog_coverage.rs` scans `"Wnnnn"` literals too, and a `tests/warn` fixture (the whole stream,
-in order, is compared by `warn.rs`) exercises each one.
+in order, is compared by `warn.rs`) exercises each one. `warn.rs`'s `corpus_is_warning_free` holds
+every `tests/run` and `examples` program (and every module they import) to zero warnings.
+
+One lint is not found by `lints::run`: `W0008 unused_imports` needs to know which `import` a name
+came through, which only the import loader's module-scoped resolution knows — the merged program
+sema sees has one flat table of renamed symbols. `loader/resolve.rs` records, while it rewrites each
+file, the import every resolved name, qualifier and `{x, y}` selection went through (`ImportUse`),
+plus every method name called and every trait named as a bound anywhere in the program. An `impl`
+is found without a name, and sema's method table and trait-bound check are program-wide, so an
+import is also used when a module it loads (transitively, not counting its own importer, nor the
+always-loaded root) holds an `impl` defining a called method or implementing a bound trait
+(`impls_through_imports`) — whichever file the call or the bound is in. That keeps every edge of a
+shortest path from the root to a needed `impl`, so applying every W0008 fix at once is safe.
+`load_imports` returns a W0008 for every import nothing went through — in any file — with a
+machine-applicable deletion, and the driver adds them to the lint stage's findings unless the
+artifact is a library (`--emit=obj|llvm-ir`). Imported files' `import` items stay in the merged
+module (as the root's always did; nothing downstream reads them), which is what lets
+`apply_levels` honour an `@allow(unused_imports)` written on one.
 
 The parser contributes two lints of its own, `W0030` (a statement's missing `;`) and `W0031` (a
 line-leading `(`, `[` or touching `-` that continues the expression above), into a separate
 `Parser::lints` list. Only `parse_module_tokens_with_lints` returns it (as `ParseOutput::lints`);
 every other entry point drops it, so the many callers that assert a parse produced no diagnostic
-are untouched by a warning. `W0030` stays quiet for a statement that pushed an error or contains a
+are untouched by a warning. The driver parses the root with it and the import loader parses every
+imported file with it too, appending that file's lints (each span keeps its file's `SourceId`) to
+the root's, so all of them reach the same level resolution. Every simple statement arm of
+`parse_block` — `defer` included — ends through `end_stmt`, and `W0030` carries a
+machine-applicable `;` insertion. `W0030` stays quiet for a statement that pushed an error or contains a
 lexer `Error` token (its `;` is not what is missing); `W0031` fires only when the innermost open
 delimiter is a `{`, i.e. where a statement could have begun. The driver keeps the root file's
 parser lints until the lint stage and resolves them with the sema lints in one `apply_levels`
@@ -1818,7 +1839,12 @@ measurement reports retain the corpus sizes used for those runs.
   belongs in `tests/fail` instead.
 - **Compile-fail** (`tests/fail/*.wk`, driven by `crates/wukongc/tests/fail.rs`): each
   program must be *rejected*, and with the exact stable code its `// EXPECT-CODE:` directive names; the
-  harness drives the real binary with `--error-format=json --emit=mir`. Eleven lexer/parser codes that
+  harness drives the real binary with `--error-format=json --emit=mir`. Beyond the first error, in
+  the style of rustc's UI tests, `// EXPECT-COUNT: <n>` pins the exact number of errors and a
+  trailing `//~ <CODE>` (`//~^`/`//~v` for the line above/below) pins an error's primary line;
+  a fixture with any `//~` must annotate every error in its own file. Every fixture is annotated,
+  and `WUKONG_BLESS=1 cargo test -p wukongc --test fail` rewrites the counts and annotations (never
+  `EXPECT-CODE`) from the compiler's output, then fails on purpose so the diff is reviewed. Eleven lexer/parser codes that
   no committed `.wk` file can hold cleanly (unterminated string, unterminated block comment, …) are
   probed from inline sources in the same file. Three coverage invariants are gated: every code any crate
   emits must have a catalogue entry, every catalogued entry must have an emitter

@@ -2,9 +2,10 @@
 // interpreter reported whatever its value slot read as an integer, and an executable could not be
 // linked. It is now rejected at the signature (E0331).
 // EXPECT-CODE: E0331
+// EXPECT-COUNT: 1
 module main_returns_array
 
-fn main() -> [i32; 2] {
+fn main() -> [i32; 2] { //~ E0331
     let a: [i32; 2] = [1, 2];
     return a;
 }

@@ -30,7 +30,7 @@ const K: i64 = 3;
 fn f1(a: [i64; 16]) -> i64 {
     let mut t: i64 = 0;
     let mut acc: i64 = 0;
-    for i in 0..3 {
+    for _i in 0..3 {
         let ib = t * 4;
         t = t + 1;
         acc = acc + a[ib];

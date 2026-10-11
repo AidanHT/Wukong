@@ -449,13 +449,13 @@ pub fn compile(opts: &Options) -> i32 {
     // --- Parsing ---
     timer.begin("parse");
     let mut interner = Interner::new();
-    // The root file's parser lints (`W0030`/`W0031`) wait for the lint stage below, where every
-    // lint's level is resolved together; imported files are parsed by the loader without them.
+    // The parser lints (`W0030`/`W0031`) wait for the lint stage below, where every lint's level
+    // is resolved together; the loader appends each imported file's to the root file's.
     let wukong_parser::ParseOutput {
         mut module,
         diags: parse_diags,
         mut next_node,
-        lints: parse_lints,
+        lints: mut parse_lints,
     } = wukong_parser::parse_module_tokens_with_lints(&tokens, sm.source(id), &mut interner, 0);
     // The AST owns its data; keep root tokens out of the import/sema/backend memory peak.
     drop(tokens);
@@ -497,13 +497,15 @@ pub fn compile(opts: &Options) -> i32 {
     // files — and E0305 for an unresolvable import — land in the same sink and render with their
     // own file's path/line through the shared SourceMap.
     timer.begin("imports");
-    loader::load_imports(
+    // `unused_imports` (`W0008`) findings wait for the lint stage too.
+    let unused_imports = loader::load_imports(
         &mut module,
         &opts.input,
         &mut sm,
         &mut interner,
         &mut sink,
         &mut next_node,
+        &mut parse_lints,
     );
     // --- Type aliases (`type Mat<M, N> = Tensor[f32, M, N];`; see `loader::alias`) ---
     // Every use is replaced by the type it stands for and the alias items are removed, so sema,
@@ -546,12 +548,18 @@ pub fn compile(opts: &Options) -> i32 {
     // resolved now, while the AST is alive, and a denied lint stops the build here as an error.
     // Warnings are held back and printed after lowering's diagnostics, so a failed build always
     // leads with an error — the contract `tests/fail` pins on the first diagnostic.
+    let lint_options = lint_options_for(opts);
     let mut found = parse_lints;
+    // An artifact a host links (`--emit=obj`/`llvm-ir`) may import a module only for the functions
+    // it exports, which no name in the program uses.
+    if !lint_options.library {
+        found.extend(unused_imports);
+    }
     found.extend(wukong_sema::lints::run(
         &module,
         &sema,
         &interner,
-        &lint_options_for(opts),
+        &lint_options,
     ));
     let lint_diags = wukong_sema::lints::apply_levels(found, &module, &interner, &opts.lint_levels);
     if lint_diags.iter().any(Diagnostic::is_error) {

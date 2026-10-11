@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0436
+// EXPECT-COUNT: 1
 module tests.fail.condition_aggregate
 
 // A slice (like any aggregate, tensor view, SIMD vector or function value) has no truth value. A
@@ -8,7 +9,7 @@ module tests.fail.condition_aggregate
 fn main() -> i32 {
     let a: [i32; 2] = [1, 2];
     let s: []i32 = a;
-    if s {
+    if s { //~ E0436
         return 1;
     }
     return 0;

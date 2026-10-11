@@ -163,16 +163,11 @@ fn directive_and_json_readers() {
     assert_eq!(severity_and_code("error: plain text"), None);
 }
 
-/// The corpus census: every `tests/run` and `examples` program is linted with the default levels,
-/// and any warning is listed. The run corpus is meant to be warning-free (or to carry an `@allow`
-/// saying why), so that a new warning in it is news.
-///
-/// `#[ignore]`d until the first full run blesses the corpus: the lints landed without a build in
-/// the loop (wave 2 of the gap close-out), so the corpus has not yet been brought to zero. Run it
-/// with `cargo test -p wukongc --test warn -- --ignored`, fix or `@allow` what it lists, and then
-/// drop the `#[ignore]` to make it a gate.
+/// The corpus gate: every `tests/run` and `examples` program is linted with the default levels,
+/// and any warning — in the program's own file or in a module it imports — is listed. The run
+/// corpus is warning-free (a construct that is a fixture's point carries an `@allow` saying why),
+/// so that a new warning in it is news. A new fixture must be warning-free too.
 #[test]
-#[ignore = "corpus not yet brought to zero warnings; run with --ignored to list them"]
 fn corpus_is_warning_free() {
     let mut programs = wk_files(&repo_dir("tests").join("run"));
     programs.extend(wk_files(&repo_dir("examples")));
@@ -191,5 +186,54 @@ fn corpus_is_warning_free() {
         "{} warning(s) in the run corpus and the examples:\n{}",
         found.len(),
         found.join("\n")
+    );
+}
+
+/// The `"file"` and `"line"` of the first span of one JSON diagnostic line, unescaped.
+fn first_span_file_and_line(line: &str) -> Option<(String, u32)> {
+    let rest = &line[line.find("\"spans\":[{\"file\":\"")? + "\"spans\":[{\"file\":\"".len()..];
+    let mut file = String::new();
+    let mut chars = rest.chars();
+    loop {
+        match chars.next()? {
+            '\\' => file.push(chars.next()?),
+            '"' => break,
+            c => file.push(c),
+        }
+    }
+    let rest = chars.as_str().strip_prefix(",\"line\":")?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    Some((file, digits.parse().ok()?))
+}
+
+/// N8: an imported file is parsed with the statement lints, and its `W0030` reaches the build
+/// with that file's own path and line — at the root's lint stage, so the root's command-line
+/// levels apply to it. (`tests/imports/lint_semi_root.wk` is clean; `lint_semi.wk` line 7 misses
+/// its `;`.)
+#[test]
+fn an_imported_files_parser_lint_carries_its_own_path() {
+    let root = repo_dir("tests").join("imports").join("lint_semi_root.wk");
+    let (code, stderr) = compile(&root, &[]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert_eq!(lines.len(), 1, "exactly one diagnostic:\n{stderr}");
+    assert_eq!(
+        severity_and_code(lines[0]),
+        Some(("warning".to_string(), "W0030".to_string())),
+        "{stderr}"
+    );
+    let (file, line) = first_span_file_and_line(lines[0]).expect("a span");
+    assert!(
+        file.ends_with("lint_semi.wk") && !file.ends_with("lint_semi_root.wk"),
+        "the W0030 must name the imported file: {file}"
+    );
+    assert_eq!(line, 7, "{stderr}");
+    // Denied on the command line, the imported file's lint fails the build like the root's.
+    let (code, stderr) = compile(&root, &["-D".to_string(), "missing_semicolon".to_string()]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert_eq!(
+        stderr.lines().next().and_then(severity_and_code),
+        Some(("error".to_string(), "W0030".to_string())),
+        "{stderr}"
     );
 }

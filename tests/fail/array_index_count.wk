@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0501
+// EXPECT-COUNT: 1
 module tests.fail.array_index_count
 
 // shape.rs's module header states "a wrong index count is E0501", but only the tensor arm enforced
@@ -10,5 +11,5 @@ module tests.fail.array_index_count
 // and that names nothing they wrote.
 fn main() -> i32 {
     let a: [i32; 4] = [10, 20, 30, 40];
-    return a[1, 2];
+    return a[1, 2]; //~ E0501
 }

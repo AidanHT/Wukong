@@ -11,8 +11,9 @@
 //!   * `E03xx` — name resolution
 //!   * `E04xx` — type checking
 //!   * `E05xx` — shape checking (Wukong's headline analysis)
-//!   * `W00xx` — warnings (lints; `W0001`–`W0020` from `wukong_sema::lints`, `W003x` from the
-//!     parser), each also named for `-A/-W/-D` and `@allow/@warn/@deny`
+//!   * `W00xx` — warnings (lints; `W0001`–`W0020` from `wukong_sema::lints` — `W0008` found by the
+//!     driver's import loader — and `W003x` from the parser), each also named for `-A/-W/-D` and
+//!     `@allow/@warn/@deny`
 //!   * `C0xxx` — codegen / lowering limitations
 //!
 //! Codes are stable: never renumber one, and never reuse a retired number for a new rule. Retired:
@@ -25,12 +26,15 @@ pub struct Explanation {
     pub code: &'static str,
     pub title: &'static str,
     pub body: &'static str,
-    /// A complete, erroneous `.wk` program whose *first* diagnostic is exactly `code`. Compiled by
+    /// A complete, erroneous `.wk` program whose *first* diagnostic is exactly `code` — an error
+    /// that fails the build, or for a `W` code a warning on a build that succeeds. Compiled by
     /// `crates/wukongc/tests/explain.rs` (via `--emit=check`), so a catalogue example can never
-    /// silently drift away from the rule it documents. `None` where no example has been written yet.
+    /// silently drift away from the rule it documents. A line `// file: <path>` starts another
+    /// file of the program at that path relative to the first one (an import example needs two).
+    /// `None` where no example has been written yet.
     pub bad: Option<&'static str>,
     /// The corrected counterpart of [`bad`](Self::bad): the same program, fixed, which must compile
-    /// clean under `--emit=check`.
+    /// under `--emit=check` — for a `W` code with no diagnostic at all.
     pub good: Option<&'static str>,
 }
 
@@ -1077,6 +1081,27 @@ fn main() -> i32 {
          or has no argument at all, so it silences or promotes nothing. The arguments are lint names \
          (`unused_variables`), lint codes (`W0001`) or `warnings` (every lint). `wukongc --explain \
          W0001` and its neighbours describe each lint."
+    ),
+    entry!(
+        "W0008",
+        "unused import (`unused_imports`)",
+        "An `import` brings nothing the file uses into scope: no name written in the file resolves \
+         through it — not an item of a glob import (`import a.b;`), not its qualifier (`b::f`), \
+         not an `as` alias (`import a.b as c;` then `c::f`), and not a name of a `{x, y}` \
+         selection, whose unused names are reported on their own when others are used. Imports \
+         are judged per file, by the same module-scoped resolution that decides what every name \
+         means: a local that shadows an imported name does not use the import, and of two imports \
+         of one module the second is the unused one. An `impl` is found without a name — a \
+         method through its receiver's type, a trait bound through any `impl` in the program — \
+         so an import is also kept when the module it loads holds an `impl` that defines a method \
+         called in any file, or implements a trait any generic parameter is bounded by: deleting \
+         every reported import never changes what the program means. The warning carries a \
+         machine-applicable fix that deletes the import, or rewrites the selection to the names \
+         that are used. An object or IR artifact (`--emit=obj`, \
+         `--emit=llvm-ir`) reports nothing: a library may import a module only for the functions \
+         it exports. In the examples, `// file: <path>` starts another file of the program.",
+        bad: "module ex.w0008\nimport geom;\n\nfn main() -> i32 {\n    return 0;\n}\n// file: geom.wk\nmodule geom\n\npub fn area(w: f32, h: f32) -> f32 {\n    return w * h;\n}\n",
+        good: "module ex.w0008\nimport geom;\n\nfn main() -> i32 {\n    return area(2.0, 3.0) as i32;\n}\n// file: geom.wk\nmodule geom\n\npub fn area(w: f32, h: f32) -> f32 {\n    return w * h;\n}\n"
     ),
     entry!(
         "W0020",

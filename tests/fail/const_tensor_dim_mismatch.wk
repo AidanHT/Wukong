@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0502
+// EXPECT-COUNT: 1
 module tests.fail.const_tensor_dim_mismatch
 
 // A `const`-sized tensor parameter is a fixed dimension: passing a differently-sized tensor is a
@@ -13,7 +14,7 @@ fn take(a: Tensor[f32, D]) -> f32 {
 }
 
 fn feed(y: Tensor[f32, 5]) -> f32 {
-    return take(y);
+    return take(y); //~ E0502
 }
 
 fn main() -> i32 {

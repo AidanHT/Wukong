@@ -1,11 +1,12 @@
 // Two glob imports both export `pick`. Importing both is fine; USING `pick` unqualified is
 // ambiguous (E0313) — the compiler must not silently choose one module's function.
 // EXPECT-CODE: E0313
+// EXPECT-COUNT: 1
 module import_ambiguous
 
 import lib.amb_a;
 import lib.amb_b;
 
 fn main() -> i32 {
-    return pick();
+    return pick(); //~ E0313
 }

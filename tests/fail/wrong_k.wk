@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0502
+// EXPECT-COUNT: 1
 module tests.fail.wrong_k
 
 /// The master-plan §7.1 mutant: `matmul::<512, 512, 512>` pins the shared inner dimension `K` at
@@ -20,6 +21,6 @@ fn main() -> i32 {
     let a: Tensor[f32, 512, 512];
     let b: Tensor[f32, 513, 512];
     let c: Tensor[f32, 512, 512];
-    matmul::<512, 512, 512>(a, b, c);
+    matmul::<512, 512, 512>(a, b, c); //~ E0502
     return 0;
 }

@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0435
+// EXPECT-COUNT: 1
 module tests.fail.enum_payload_arity
 
 // A tuple-payload variant must be constructed with exactly its declared number of fields. `Add` has
@@ -6,6 +7,6 @@ module tests.fail.enum_payload_arity
 enum Op { Add(i32, i32), Nop }
 
 fn main() -> i32 {
-    let a = Op::Add(1);
+    let a = Op::Add(1); //~ E0435
     return 0;
 }

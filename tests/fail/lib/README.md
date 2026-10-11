@@ -8,5 +8,7 @@ Support modules for compile-fail import tests:
 - `privlib.wk` — a private `secret` named through an alias by `fail/import_private.wk` (E0312).
 - `amb_a.wk`, `amb_b.wk` — both export `pick`, used unqualified by `fail/import_ambiguous.wk`
   (E0313).
+- `geom_assoc.wk` — a type `Pt` with an associated `norm`, called bare by
+  `fail/import_assoc_fn_bare.wk` (E0320, whose help must say `Pt`, not `lib.geom_assoc.Pt`).
 
 **Not counted as fixtures.** Non-recursive `read_dir` on `tests/fail/` never enters `lib/`.

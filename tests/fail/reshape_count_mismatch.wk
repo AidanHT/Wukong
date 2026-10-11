@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0506
+// EXPECT-COUNT: 1
 module tests.fail.reshape_count_mismatch
 
 // Splitting [S, D] activations into H heads as `[S, H, D/H]` silently drops `D % H` elements per
@@ -6,7 +7,7 @@ module tests.fail.reshape_count_mismatch
 // PROVABLY unchanged; `S*D` and `S*H*(D/H)` are not equal in normal form (floor division loses the
 // remainder), so the reshape is rejected rather than assumed. Spell the model width as `H*HD`.
 fn heads<S, D, H>(x: Tensor[f32, S, D]) -> f32 {
-    let h = x as Tensor[f32, S, H, D / H];
+    let h = x as Tensor[f32, S, H, D / H]; //~ E0506
     return h[0, 0, 0];
 }
 

@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0401
+// EXPECT-COUNT: 1
 module tests.fail.slice_returned_as_array
 
 // `compatible` encodes the language's ONE implicit aggregate coercion — a fixed-size `[T; N]`
@@ -10,7 +11,7 @@ module tests.fail.slice_returned_as_array
 // caller then reads the 16-byte fat-pointer header as four f32 elements — BOTH backends print 0, a
 // value the source never wrote, so no differential gate can see it.
 fn head4(s: []f32) -> [f32; 4] {
-    return s;
+    return s; //~ E0401
 }
 
 fn main() -> i32 {

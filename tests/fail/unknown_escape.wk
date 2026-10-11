@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0432
+// EXPECT-COUNT: 1
 module tests.fail.unknown_escape
 
 // mir_build's `decode_escape` ends `Some(c) => c as u32`, so any escape outside
@@ -6,6 +7,6 @@ module tests.fail.unknown_escape
 // only delimits) nor sema validated it: `println("A\dB")` printed `AdB`. Both backends agree on the
 // wrong string, so every differential gate is blind to it. C and Rust both reject an unknown escape.
 fn main() -> i32 {
-    println("A\dB");
+    println("A\dB"); //~ E0432
     return 0;
 }

@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0437
+// EXPECT-COUNT: 1
 module tests.fail.io_tensor_dynamic_dim
 
 // A typed read moves exactly as many elements as its destination holds, so the destination's
@@ -7,7 +8,7 @@ module tests.fail.io_tensor_dynamic_dim
 // size the dimension. A fixed array, a slice, or a tensor whose dims are constants or bound
 // dimension variables are all accepted.
 fn load(mut t: Tensor[f32, ?]) -> i64 {
-    return read_f32("io_test_dyn.bin", t);
+    return read_f32("io_test_dyn.bin", t); //~ E0437
 }
 
 fn main() -> i32 {

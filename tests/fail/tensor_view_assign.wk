@@ -1,11 +1,12 @@
 // EXPECT-CODE: E0507
+// EXPECT-COUNT: 1
 module tests.fail.tensor_view_assign
 
 // `dst[i]` on a rank-2 tensor is a VIEW of row `i` — part of `dst`'s buffer — not an element, and a
 // view is not a place a value can be stored into: replacing a whole row would have to copy, which
 // assignment never does. Copy the row element by element with a full index list.
 fn copy_row(mut dst: Tensor[f32, 4, 3], src: Tensor[f32, 4, 3], i: i64) {
-    dst[i] = src[i];
+    dst[i] = src[i]; //~ E0507
 }
 
 fn main() -> i32 {

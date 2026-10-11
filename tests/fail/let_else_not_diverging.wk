@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0401
+// EXPECT-COUNT: 1
 module tests.fail.let_else_not_diverging
 
 // The `else` of a `let … else` runs when the pattern does not match, so the names the pattern
@@ -10,7 +11,7 @@ enum Shape {
 }
 
 fn radius(s: Shape) -> i32 {
-    let Shape::Circle(r) = s else {
+    let Shape::Circle(r) = s else { //~ E0401
         print(0);
     };
     return r;

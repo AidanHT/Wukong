@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0433
+// EXPECT-COUNT: 1
 module tests.fail.pointer_arith
 
 // Pointer arithmetic (`p + 1`) is not supported. Sema used to accept it, then mir_build emitted an
@@ -8,6 +9,6 @@ module tests.fail.pointer_arith
 fn main() -> i32 {
     let mut x: i32 = 5;
     let p: *i32 = &x;
-    let q: *i32 = p + 1;
+    let q: *i32 = p + 1; //~ E0433
     return 0;
 }

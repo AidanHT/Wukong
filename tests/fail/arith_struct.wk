@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0433
+// EXPECT-COUNT: 1
 module tests.fail.arith_struct
 
 // Arithmetic (and every other binary operator besides the already-rejected `==`/`!=`) on an
@@ -14,6 +15,6 @@ struct V2 {
 fn main() -> i32 {
     let a = V2 { x: 1.0, y: 2.0 };
     let b = V2 { x: 3.0, y: 4.0 };
-    let c = a + b;
+    let c = a + b; //~ E0433
     return c.x as i32;
 }

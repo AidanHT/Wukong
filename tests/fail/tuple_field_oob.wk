@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0501
+// EXPECT-COUNT: 1
 module tests.fail.tuple_field_oob
 
 // An out-of-range tuple field index is a static error, exactly like an out-of-bounds array/tensor
@@ -8,6 +9,6 @@ module tests.fail.tuple_field_oob
 // just out of range. sema now range-checks the index against the known tuple arity → E0501.
 fn main() -> i32 {
     let t = (10, 20, 30);
-    print(t.9);
+    print(t.9); //~ E0501
     return 0;
 }

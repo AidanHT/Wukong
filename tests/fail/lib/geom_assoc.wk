@@ -1,0 +1,18 @@
+// Imported by tests/fail/import_assoc_fn_bare.wk: a type with an associated function. Its
+// program-wide symbol is the loader's `lib.geom_assoc.Pt`, which no source can write, so a
+// diagnostic about it must name it `Pt`.
+module lib.geom_assoc
+
+pub struct Pt {
+    x: f32,
+}
+
+pub fn origin() -> Pt {
+    return Pt { x: 3.0 };
+}
+
+impl Pt {
+    pub fn norm(self) -> f32 {
+        return self.x;
+    }
+}

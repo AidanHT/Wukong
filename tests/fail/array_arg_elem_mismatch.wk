@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0401
+// EXPECT-COUNT: 1
 module tests.fail.array_arg_elem_mismatch
 
 // The element half of the same missing `(Array, Array)` arm: a `[i32; 4]` satisfied a `[f32; 4]`,
@@ -12,6 +13,6 @@ fn f(a: [f32; 4]) -> f32 {
 
 fn main() -> i32 {
     let x: [i32; 4] = [1, 2, 3, 4];
-    println(f(x) as i32);
+    println(f(x) as i32); //~ E0401
     return 0;
 }

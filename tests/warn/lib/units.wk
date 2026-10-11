@@ -1,0 +1,14 @@
+// Imported by tests/warn/unused_imports.wk (see lib/shapes.wk).
+module lib.units
+
+pub fn scale(x: f32) -> f32 {
+    return x * 0.5;
+}
+
+pub fn meters(x: f32) -> f32 {
+    return x;
+}
+
+pub fn feet(x: f32) -> f32 {
+    return x * 0.3048;
+}

@@ -1,11 +1,12 @@
 // EXPECT-CODE: E0327
+// EXPECT-COUNT: 1
 module tests.fail.type_alias_arity
 
 // `Mat` has two parameters and is given one: the missing dimension is an error at the use, not a
 // silently-`?` extent.
 type Mat<M, N> = Tensor[f32, M, N];
 
-fn trace(a: Mat<3>) -> f32 {
+fn trace(a: Mat<3>) -> f32 { //~ E0327
     return a[0, 0] + a[1, 1] + a[2, 2];
 }
 

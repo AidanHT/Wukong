@@ -3,6 +3,7 @@
 // (fail.rs additionally asserts the JSON span names lib/badlib.wk — see
 // `imported_file_diagnostics_carry_their_own_path`.)
 // EXPECT-CODE: E0401
+// EXPECT-COUNT: 1
 module import_type_error
 
 import lib.badlib;

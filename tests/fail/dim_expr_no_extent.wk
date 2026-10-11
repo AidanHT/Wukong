@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0505
+// EXPECT-COUNT: 1
 module tests.fail.dim_expr_no_extent
 
 // A tensor dimension may be arithmetic on dimensions (`3*D`, `H*HD`, `(L - K)/S + 1`), but it must
@@ -7,7 +8,7 @@ module tests.fail.dim_expr_no_extent
 // one (either would size and bounds-check a buffer the source never described).
 const W: usize = 2;
 
-fn first(a: Tensor[f32, 2*W - 5]) -> f32 {
+fn first(a: Tensor[f32, 2*W - 5]) -> f32 { //~ E0505
     return 0.0;
 }
 

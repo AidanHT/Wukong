@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0501
+// EXPECT-COUNT: 1
 module tests.fail.shape_arg_kind
 
 // A scalar cannot satisfy a tensor parameter — a kind confusion the shape engine now rejects
@@ -7,6 +8,6 @@ fn sink(a: Tensor[f32, 4, 4]) {}
 
 fn main() -> i32 {
     let x: f32 = 1.0;
-    sink(x);
+    sink(x); //~ E0501
     return 0;
 }

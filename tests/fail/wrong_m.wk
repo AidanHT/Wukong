@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0502
+// EXPECT-COUNT: 1
 module tests.fail.wrong_m
 
 /// The sibling of `wrong_k.wk` on the OUTER dimension, and without a turbofish: `a` binds
@@ -16,6 +17,6 @@ fn main() -> i32 {
     let a: Tensor[f32, 512, 512];
     let b: Tensor[f32, 512, 256];
     let c: Tensor[f32, 513, 256];
-    matmul(a, b, c);
+    matmul(a, b, c); //~ E0502
     return 0;
 }

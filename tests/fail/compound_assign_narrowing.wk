@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0441
+// EXPECT-COUNT: 1
 module tests.fail.compound_assign_narrowing
 
 // `s += x` means `s = s + x`, whose value is an `f64` here — which the plain assignment
@@ -9,7 +10,7 @@ module tests.fail.compound_assign_narrowing
 fn total(x: [f64; 4]) -> f32 {
     let mut s: f32 = 0.0;
     for i in 0..4 {
-        s += x[i];
+        s += x[i]; //~ E0441
     }
     return s;
 }

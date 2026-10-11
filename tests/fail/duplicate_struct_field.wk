@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0300
+// EXPECT-COUNT: 1
 module tests.fail.duplicate_struct_field
 
 // Duplicate parameter names were already E0300, but the same discipline was never applied to a
@@ -7,7 +8,7 @@ module tests.fail.duplicate_struct_field
 // compiled clean, carrying a field no expression can ever name.
 struct S {
     x: i32,
-    x: i32,
+    x: i32, //~ E0300
 }
 
 fn main() -> i32 {

@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0501
+// EXPECT-COUNT: 1
 module tests.fail.const_tensor_dim_index_oob
 
 // A `const` used as a tensor *dimension* is a fixed size, so an index past it is a compile-time
@@ -10,7 +11,7 @@ module tests.fail.const_tensor_dim_index_oob
 const D: usize = 3;
 
 fn read(a: Tensor[f32, D]) -> f32 {
-    return a[7];
+    return a[7]; //~ E0501
 }
 
 fn main() -> i32 {

@@ -2,9 +2,10 @@
 // ordinary duplicate-name error (E0300). (A plain glob `import m;` would instead be shadowed by the
 // local item, and two modules' same-named items no longer collide at all.)
 // EXPECT-CODE: E0300
+// EXPECT-COUNT: 1
 module import_duplicate
 
-import lib.dup.{clash};
+import lib.dup.{clash}; //~ E0300
 
 fn clash() -> i32 {
     return 1;

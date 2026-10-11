@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0502
+// EXPECT-COUNT: 2
 module tests.fail.generic_return_shape_lie
 
 // A generic function's own dimension variables are RIGID inside its body: it must not declare a
@@ -10,7 +11,7 @@ module tests.fail.generic_return_shape_lie
 // bounds: the interpreter traps while the native backend reads past the buffer — a backend
 // divergence on a program that should never have compiled. The shape lie is rejected here (E0502).
 fn grow<M, N>(a: Tensor[f32, M, N]) -> Tensor[f32, N, 5] {
-    return a;
+    return a; //~ E0502 E0502
 }
 
 fn main() -> i32 {

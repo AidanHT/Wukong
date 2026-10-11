@@ -3,6 +3,8 @@
 // are only ever compiled through the root that imports them.
 module lib.mathlib
 
+// Nothing here uses `lib.deep`: the import exists to close the A<->B cycle the fixture tests.
+@allow(unused_imports)
 import lib.deep;
 
 pub struct Point {

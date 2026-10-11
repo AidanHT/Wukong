@@ -35,6 +35,8 @@ fn main() -> i32 {
 
     let sa: []f32 = wa;
     let sb: []f32 = wb;
+    // `l` exists to be shadowed: the block below must read its own `l`, never this one.
+    @allow(unused_variables)
     let l: Layer = Layer { w: sa };
     let mut other: Layer = Layer { w: sb };
 

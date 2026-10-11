@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0501
+// EXPECT-COUNT: 1
 module tests.fail.tuple_arg_arity_mismatch
 
 // The third missing arm: no `(Tuple, Tuple)` in `unify_decl`, so a 2-tuple satisfied a 3-tuple
@@ -12,6 +13,6 @@ fn f(t: (i32, i32, i32)) -> i32 {
 
 fn main() -> i32 {
     let p: (i32, i32) = (1, 2);
-    println(f(p));
+    println(f(p)); //~ E0501
     return 0;
 }

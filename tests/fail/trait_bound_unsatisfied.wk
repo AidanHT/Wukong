@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0410
+// EXPECT-COUNT: 1
 module tests.fail.trait_bound_unsatisfied
 
 // A generic function bounded by a trait may only be instantiated at a type that implements it:
@@ -31,6 +32,6 @@ fn double_area<T: Shape>(x: T) -> f32 {
 
 fn main() -> i32 {
     let c = Circle { r: 1.0 };
-    print(double_area(c));
+    print(double_area(c)); //~ E0410
     return 0;
 }

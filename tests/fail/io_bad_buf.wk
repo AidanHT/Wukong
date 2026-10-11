@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0437
+// EXPECT-COUNT: 1
 module tests.fail.io_bad_buf
 
 // The buffer argument's slice element type must match the intrinsic's dtype: `read_f32` reads into a
@@ -6,6 +7,6 @@ module tests.fail.io_bad_buf
 // the bytes as the wrong type (the backends would disagree), so it is rejected at the call (E0437).
 fn main() -> i32 {
     let s: []i32 = alloc_i32(4);
-    let n: i64 = read_f32("io_test_bad_buf.bin", s);
+    let n: i64 = read_f32("io_test_bad_buf.bin", s); //~ E0437
     return 0;
 }

@@ -8,7 +8,7 @@
 //! `parse_module*` entry points re-exported below.
 
 use wukong_ast::*;
-use wukong_diag::Diagnostic;
+use wukong_diag::{Applicability, Diagnostic};
 use wukong_lexer::{Token, TokenKind};
 use wukong_span::{Interner, SourceId, Span, Symbol};
 
@@ -318,17 +318,22 @@ impl<'a> Parser<'a> {
         {
             return;
         }
+        let at = self.prev_span().shrink_to_hi();
         let mut d = Diagnostic::warning(format!("missing `;` after {what}"))
             .with_code("W0030")
-            .primary(self.prev_span().shrink_to_hi(), "expected `;` here");
+            .primary(at, "expected `;` here");
         if !self.on_new_line() {
             d = d.secondary(self.span(), "the next statement starts on the same line");
         }
-        self.lints.push(d.help(
-            "end the statement with `;`. It may be left out only after a block-like statement \
-             (`if`, `match`, `loop`, `while`, `for`, `{ … }`) and, for any statement but a `let`, \
-             before the `}` that closes the block",
-        ));
+        // The parse is the same with the `;`, so inserting it changes nothing but the warning.
+        self.lints.push(
+            d.help(
+                "end the statement with `;`. It may be left out only after a block-like statement \
+                 (`if`, `match`, `loop`, `while`, `for`, `{ … }`) and, for any statement but a \
+                 `let`, before the `}` that closes the block",
+            )
+            .suggest_with(at, "add the `;`", ";", Applicability::MachineApplicable),
+        );
     }
 
     /// `W0031`: the current token — a `(` or `[` about to be parsed as a call or index of the
@@ -1786,6 +1791,9 @@ impl<'a> Parser<'a> {
                 T::Defer => {
                     self.bump();
                     let target = self.parse_expr();
+                    // `defer { … }` (any block-like deferred expression) ends its own statement,
+                    // as a block-like expression statement does; every other `defer` needs its `;`.
+                    let block_like = is_block_like(&target) && cur_assign_op(self.kind()).is_none();
                     // `defer x += 1;` defers an assignment statement: wrap it in a block so the
                     // deferred thing is still one expression (`defer { x += 1; }`).
                     let e = if let Some(op) = cur_assign_op(self.kind()) {
@@ -1807,7 +1815,11 @@ impl<'a> Parser<'a> {
                     } else {
                         target
                     };
-                    self.eat(T::Semi);
+                    if block_like {
+                        self.eat(T::Semi);
+                    } else {
+                        self.end_stmt(before, mark, "a `defer` statement", true);
+                    }
                     stmts.push(self.mk_stmt(attrs, StmtKind::Defer(e), stmt_start));
                 }
                 T::While => {
@@ -3334,6 +3346,42 @@ mod tests {
             lint_codes("fn f() { let y: i32 = 2 let z: i32 = 3; }").1,
             vec!["W0030"]
         );
+    }
+
+    /// N8: a `defer` statement ends with `;` like the other simple statements — it used to eat an
+    /// optional `;` and report nothing — while a deferred block ends its own statement.
+    #[test]
+    fn defer_statement_is_checked_for_its_semicolon() {
+        let src = "fn main() -> i32 {\n    defer print(1)\n    defer x += 1\n    defer { print(2); }\n    \
+                   defer print(3);\n    return 0;\n}\n";
+        let (errors, lints) = lint_codes(src);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            lints,
+            vec!["W0030", "W0030"],
+            "`defer print(1)`, `defer x += 1`"
+        );
+        // Before the closing `}` a `defer` (not a `let`) may leave its `;` out.
+        assert_eq!(
+            lint_codes("fn f() { defer print(1) }"),
+            (Vec::<&str>::new(), Vec::<&str>::new())
+        );
+    }
+
+    /// `W0030` carries the fix: a machine-applicable `;` inserted where the lint points.
+    #[test]
+    fn missing_semicolon_suggests_the_semicolon() {
+        let src = "fn main() -> i32 {\n    let a: i32 = 3\n    return a;\n}\n";
+        let mut i = Interner::new();
+        let (tokens, _) = wukong_lexer::tokenize(src, SourceId(0));
+        let out = parse_module_tokens_with_lints(&tokens, src, &mut i, 0);
+        let d = &out.lints[0];
+        assert_eq!(d.suggestions.len(), 1, "{d:?}");
+        let s = &d.suggestions[0];
+        assert_eq!(s.replacement, ";");
+        assert_eq!(s.applicability, Applicability::MachineApplicable);
+        let after_three = (src.find("3\n").unwrap() + 1) as u32;
+        assert_eq!((s.span.lo, s.span.hi), (after_three, after_three));
     }
 
     /// A statement that is already broken — a parse error inside it, or a character the lexer

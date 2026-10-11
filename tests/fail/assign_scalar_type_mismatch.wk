@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0401
+// EXPECT-COUNT: 1
 module tests.fail.assign_scalar_type_mismatch
 
 // Assigning a NON-literal value of a different scalar type to a scalar place silently
@@ -9,6 +10,6 @@ module tests.fail.assign_scalar_type_mismatch
 fn main() -> i32 {
     let mut y: i32 = 0;
     let x: f32 = 2.5;
-    y = x;
+    y = x; //~ E0401
     return y;
 }

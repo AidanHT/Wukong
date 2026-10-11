@@ -1,10 +1,11 @@
 // EXPECT-CODE: E0326
+// EXPECT-COUNT: 1
 module tests.fail.type_alias_cycle
 
 // An alias is replaced by its definition, so one that reaches itself through another alias never
 // finishes expanding: `Grid` -> `Cell` -> `Grid`. The cycle is reported at the alias it closes on,
 // even though neither alias is used.
-type Grid = [Cell; 4];
+type Grid = [Cell; 4]; //~ E0326
 type Cell = *Grid;
 
 fn main() -> i32 {

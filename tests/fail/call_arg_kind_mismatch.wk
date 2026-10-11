@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0401
+// EXPECT-COUNT: 1
 module tests.fail.call_arg_kind_mismatch
 
 // Passing a pointer where a scalar parameter is expected (or an array/tuple, or vice versa) is a
@@ -12,5 +13,5 @@ fn takes_scalar(n: i32) -> i32 {
 
 fn main() -> i32 {
     let a: i32 = 5;
-    return takes_scalar(&a); // `&a` is `*i32`, but the parameter is a scalar `i32`
+    return takes_scalar(&a); // `&a` is `*i32`, but the parameter is a scalar `i32` //~ E0401
 }

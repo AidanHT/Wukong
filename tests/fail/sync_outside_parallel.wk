@@ -1,8 +1,9 @@
 // EXPECT-CODE: E0308
+// EXPECT-COUNT: 1
 module tests.fail.sync_outside_parallel
 
 fn f() {
-    sync_block();
+    sync_block(); //~ E0308
 }
 
 fn main() -> i32 {

@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0434
+// EXPECT-COUNT: 1
 module tests.fail.return_missing_value
 
 // A bare `return;` in a function whose signature promises a value is a type error, not a silent
@@ -6,7 +7,7 @@ module tests.fail.return_missing_value
 // interpreter would return a zero — a backend divergence. (A `-> ()` / return-less function may
 // `return;` freely.)
 fn f() -> i32 {
-    return;
+    return; //~ E0434
 }
 
 fn main() -> i32 {

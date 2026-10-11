@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0406
+// EXPECT-COUNT: 1
 module tests.fail.array_len_not_constant
 
 // A fixed-size array's length must be readable by the compile-time folder. `4 as usize` is not:
@@ -9,7 +10,7 @@ module tests.fail.array_len_not_constant
 // native backend printed 7 after writing through a garbage stack address. An accepted program on
 // which the two Executed backends disagree, and a memory-safety violation on native.
 fn main() -> i32 {
-    let mut a: [i32; 4 as usize];
+    let mut a: [i32; 4 as usize]; //~ E0406
     let mut i: i64 = 0;
     while i < 4 {
         a[i] = 7;

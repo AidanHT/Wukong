@@ -1,11 +1,12 @@
 // EXPECT-CODE: E0306
+// EXPECT-COUNT: 1
 module tests.fail.unknown_attr_typo
 
 // The case that motivates E0306: a MISSPELLED real attribute. `@parellel` used to be discarded in
 // silence, so this function compiled single-threaded while its author believed the loop was
 // multi-threaded — the attribute's whole purpose defeated, with nothing on stderr to notice. A
 // wrong-but-plausible name must be as loud as an invented one (`tests/fail/unknown_attr.wk`).
-@parellel
+@parellel //~ E0306
 fn scale(x: [f32; 4], mut out: [f32; 4]) {
     for i in 0..4 {
         out[i] = x[i] * 2.0;

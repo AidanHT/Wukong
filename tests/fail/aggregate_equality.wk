@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0433
+// EXPECT-COUNT: 1
 module tests.fail.aggregate_equality
 
 // `==`/`!=` on a struct (or tuple/array) is rejected: an aggregate value is a base pointer, so the
@@ -10,7 +11,7 @@ struct P { x: i32, y: i32 }
 fn main() -> i32 {
     let a = P { x: 1, y: 2 };
     let b = P { x: 1, y: 2 };
-    if a == b {
+    if a == b { //~ E0433
         return 1;
     }
     return 0;

@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0441
+// EXPECT-COUNT: 1
 module tests.fail.compound_assign_float_to_int
 
 // A compound assignment `a += b` means `a = a (op) b`. With an integer place and a float operand,
@@ -11,6 +12,6 @@ module tests.fail.compound_assign_float_to_int
 fn main() -> i32 {
     let mut acc: i32 = 100;
     let d: f32 = -1.5;
-    acc += d; // E0441: convert explicitly with `as i32`
+    acc += d; // E0441: convert explicitly with `as i32` //~ E0441
     return acc;
 }

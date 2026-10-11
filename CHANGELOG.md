@@ -173,6 +173,41 @@ All notable changes to Wukong are documented here. The format is loosely based o
   lowerings also refuse (`C0001`) a wrong element in an instance past that budget instead of
   handing the runtime a buffer of another type; the decode builtins (`sdpa_kv`, `gemv_bf16`, …),
   which have no such backstop, keep refusing a `Tensor[T, ..]` operand (`E0437`).
+### Diagnostics (`gap4/diagnostics`)
+
+- **`unused_imports` (`W0008`, N3).** An `import` no name of its file resolves through — a glob or
+  `as` import none of whose names or qualifier is used, a second import of an already imported
+  module, or the unused names of a `{x, y}` selection — is a warning, in every file of the program,
+  judged by the import loader's own module-scoped resolution (a shadowing local does not use the
+  import). An `impl` is found without a name, and sema's method table and trait-bound check are
+  program-wide, so an import is also kept when the module it loads (directly or transitively)
+  holds an `impl` defining a method called in ANY file, or implementing a trait ANY generic
+  parameter is bounded by: deleting every reported import at once never changes what the program
+  means. It carries a machine-applicable fix that deletes the import or rewrites the selection,
+  honours `-A/-W/-D unused_imports` and an `@allow` on the `import` itself, and is silent for
+  `--emit=obj`/`llvm-ir`. The run corpus and the examples are warning-free and
+  `corpus_is_warning_free` is now a gate.
+- **Parser lints reach every file (N8).** An imported module's missing `;` (`W0030`) and line-leading
+  continuation (`W0031`) were dropped by the loader; they now report with that file's path and go
+  through the same levels. A `defer` statement needs its `;` like any simple statement (a deferred
+  block excepted).
+- **Fixes as data (N5).** `W0030` inserts the `;`, an associated function called bare (`E0320`)
+  suggests `Type::f`, a method read like a field (`E0321`) suggests `()`, a field called like a
+  method (`E0323`) suggests deleting the argument list, and a struct literal of an enum (`E0324`)
+  suggests `::Variant` — each in `--error-format=json`'s `suggestions` with an exact byte range.
+  Every caret in the resolution and lint passes has a label.
+  - `E0304` (an assignment to an immutable binding or parameter, or a store through a non-`mut`
+    aggregate parameter) inserts `mut ` at the declaration: machine-applicable for a rebind, before
+    the whole pattern of a `let … else` (where `mut` parses), and absent for a local `const`, which
+    takes no `mut`. Its other forms — a builtin or `mut self` method writing through a non-`mut`
+    parameter, a store through a tensor view of one — carry no fix yet.
+  - `E0320`'s `Type::f` is offered for a type declared in the root file only. For an imported
+    module's type the help names the type as declared (`Pt`, never the loader's `lib.geom.Pt`) and
+    no edit is offered, since how the calling file may spell the type depends on its imports.
+- **The compile-fail gate pins the whole error stream (N12).** `// EXPECT-COUNT: <n>` and trailing
+  `//~ <CODE>` (`//~^`/`//~v`) annotations pin how many errors a `tests/fail` fixture reports and the
+  line of each; `WUKONG_BLESS=1 cargo test -p wukongc --test fail` rewrites them from the real output
+  (never `EXPECT-CODE`) and fails on purpose for review. All 210 fixtures are annotated.
 
 ### Index-recording reductions (`gap3/vec-argmax`)
 

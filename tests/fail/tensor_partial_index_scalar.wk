@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0433
+// EXPECT-COUNT: 1
 module tests.fail.tensor_partial_index_scalar
 
 // One index short of the rank is a VIEW of the remaining axes, not an element: `a[i]` on a [3, 3]
@@ -7,7 +8,7 @@ module tests.fail.tensor_partial_index_scalar
 fn trace(a: Tensor[f32, 3, 3]) -> f32 {
     let mut s: f32 = 0.0;
     for i in 0..3 {
-        s = s + a[i];
+        s = s + a[i]; //~ E0433
     }
     return s;
 }

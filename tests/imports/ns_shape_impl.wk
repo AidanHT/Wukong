@@ -1,0 +1,12 @@
+// Loader unit-test fixture: ns_shape.wk's `impl Shape for Sq`. Importing this module only so a
+// call satisfies a `T: Shape` bound is a use of the import (W0008 must not fire); deleting it
+// would make the bound unsatisfied (E0410).
+module ns_shape_impl
+
+import ns_shape;
+
+impl Shape for Sq {
+    pub fn sides(self) -> i32 {
+        return 4;
+    }
+}

@@ -1,9 +1,10 @@
 // EXPECT-CODE: E0324
+// EXPECT-COUNT: 1
 module tests.fail.unknown_type_name
 
 // `flot` names no type. An undeclared type name used to be accepted as a nominal type, which lowering
 // sizes as a 32-bit integer slot; it is a resolution error now.
-fn half(x: flot) -> f32 {
+fn half(x: flot) -> f32 { //~ E0324
     return x * 0.5;
 }
 

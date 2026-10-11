@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0306
+// EXPECT-COUNT: 1
 module tests.fail.generic_on_stmt
 
 // `@generic` is read from a FUNCTION item (recognition off for the whole function) or from a LOOP
@@ -7,7 +8,7 @@ module tests.fail.generic_on_stmt
 // accepts statement attributes and would discard it, so this `let` would have been a promise nothing
 // keeps. Placement is E0306, with the fix in the help text - put it on a loop or on the `fn`.
 fn scale(x: [f32; 4], mut out: [f32; 4]) {
-    @generic
+    @generic //~ E0306
     let k: f32 = 2.0;
     for i in 0..4 {
         out[i] = x[i] * k;

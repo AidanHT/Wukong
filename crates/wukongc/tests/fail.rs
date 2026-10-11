@@ -12,7 +12,25 @@
 //! twenty-nine catalogued diagnostics — the lexer/parser codes that malformed and hostile input
 //! actually hits — had no fixture at all, so renumbering or deleting one of them left the whole
 //! suite green.
+//!
+//! The first error's code is only the start of what a fixture can pin. Two more directives, in the
+//! style of rustc's UI tests, pin the WHOLE error stream, so a fixture that grows a cascade of
+//! follow-on errors, or whose error moves to another line, fails:
+//!
+//! | Directive | Meaning |
+//! |---|---|
+//! | `// EXPECT-CODE: <code>` | the first diagnostic is an error with this code (required) |
+//! | `// EXPECT-COUNT: <n>` | the build reports exactly `n` errors, in any file |
+//! | `… //~ <code> [<code> …]` | an error with each code has its primary span on THIS line |
+//! | `… //~^ <code>` / `//~v <code>` | … on the line above / below (one line per `^` or `v`) |
+//!
+//! Once a fixture carries any `//~`, the errors whose primary span is in the fixture's own file
+//! must be exactly its annotations (an error in an imported file is counted, never annotated).
+//! `WUKONG_BLESS=1 cargo test -p wukongc --test fail` rewrites every fixture's `EXPECT-COUNT` and
+//! `//~` annotations from the compiler's actual output — never its `EXPECT-CODE`, which is the
+//! contract a human chose — and then fails on purpose, so the diff is reviewed before it is kept.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -81,6 +99,289 @@ fn first_error_code(stderr: &str) -> Option<&str> {
     (rest.starts_with(",\"message\":") && line.ends_with('}')).then_some(code)
 }
 
+/// One error the compiler reported: its code (empty for a code-less error) and the file and
+/// 1-based line of its primary span.
+#[derive(Clone, Debug, PartialEq)]
+struct Reported {
+    code: String,
+    at: Option<(String, usize)>,
+}
+
+/// Every error (`error` or `bug` severity) in a `--error-format=json` stream, in order. Lines that
+/// are not JSON diagnostics, and warnings, are skipped.
+fn reported_errors(stderr: &str) -> Vec<Reported> {
+    stderr
+        .lines()
+        .filter_map(|l| {
+            let rest = l.strip_prefix("{\"severity\":\"")?;
+            let (severity, rest) = rest.split_once('"')?;
+            if severity != "error" && severity != "bug" {
+                return None;
+            }
+            let code = rest
+                .strip_prefix(",\"code\":\"")
+                .and_then(|r| r.split_once('"'))
+                .map_or(String::new(), |(c, _)| c.to_string());
+            Some(Reported {
+                code,
+                at: primary_location(l),
+            })
+        })
+        .collect()
+}
+
+/// The JSON string starting right after its opening quote, unescaped, and the text after its
+/// closing quote.
+fn json_string(s: &str) -> Option<(String, &str)> {
+    let mut out = String::new();
+    let mut chars = s.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '"' => return Some((out, &s[i + 1..])),
+            '\\' => match chars.next()?.1 {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                'r' => out.push('\r'),
+                other => out.push(other),
+            },
+            c => out.push(c),
+        }
+    }
+    None
+}
+
+/// A leading run of digits and the text after it.
+fn number(s: &str) -> Option<(usize, &str)> {
+    let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    Some((s[..end].parse().ok()?, &s[end..]))
+}
+
+/// The file and line of the first PRIMARY label of one JSON diagnostic, read through the
+/// renderer's pinned span key order (`{"file":…,"line":…,"col":…,"primary":…`).
+fn primary_location(line: &str) -> Option<(String, usize)> {
+    let start = line.find("\"spans\":[")? + "\"spans\":[".len();
+    let end = start + line[start..].find("],\"notes\":")?;
+    let mut rest = &line[start..end];
+    while let Some(i) = rest.find("{\"file\":\"") {
+        let (file, after) = json_string(&rest[i + "{\"file\":\"".len()..])?;
+        let (line_no, after) = number(after.strip_prefix(",\"line\":")?)?;
+        let (_, after) = number(after.strip_prefix(",\"col\":")?)?;
+        let after = after.strip_prefix(",\"primary\":")?;
+        if after.starts_with("true") {
+            return Some((file, line_no));
+        }
+        rest = after;
+    }
+    None
+}
+
+/// A fixture's `// EXPECT-COUNT:` and `//~` directives.
+#[derive(Debug, Default, PartialEq)]
+struct Annotations {
+    count: Option<usize>,
+    /// `(1-based line, code)` per annotated error, sorted.
+    errors: Vec<(usize, String)>,
+}
+
+/// Whether `s` is spelled like a diagnostic code: a capital letter and four digits.
+fn is_code(s: &str) -> bool {
+    s.len() == 5
+        && s.as_bytes()[0].is_ascii_uppercase()
+        && s[1..].bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The `//~` annotation of one line: the line offset its `^`/`v` marks give and its codes.
+fn line_annotation(line: &str) -> Option<(i64, Vec<String>)> {
+    let at = line.find("//~")?;
+    let mut rest = &line[at + "//~".len()..];
+    let mut offset = 0i64;
+    loop {
+        if let Some(r) = rest.strip_prefix('^') {
+            offset -= 1;
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix('v') {
+            offset += 1;
+            rest = r;
+        } else {
+            break;
+        }
+    }
+    let codes = rest
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    Some((offset, codes))
+}
+
+/// Read a fixture's annotations. A malformed one (no code, or a word that is not a code, or a
+/// `^` above the first line) is a broken fixture, not an annotation to ignore.
+fn annotations(name: &str, src: &str) -> Annotations {
+    let mut a = Annotations::default();
+    for (i, line) in src.lines().enumerate() {
+        if let Some(n) = line.trim_start().strip_prefix("// EXPECT-COUNT:") {
+            let n = n
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("{name}:{}: `// EXPECT-COUNT:` needs a number", i + 1));
+            assert!(
+                a.count.replace(n).is_none(),
+                "{name}: more than one `// EXPECT-COUNT:`"
+            );
+        }
+        let Some((offset, codes)) = line_annotation(line) else {
+            continue;
+        };
+        assert!(
+            !codes.is_empty() && codes.iter().all(|c| is_code(c)),
+            "{name}:{}: a `//~` annotation names diagnostic codes, got {line:?}",
+            i + 1
+        );
+        let target = i as i64 + 1 + offset;
+        assert!(target >= 1, "{name}:{}: `//~^` points above line 1", i + 1);
+        a.errors
+            .extend(codes.into_iter().map(|c| (target as usize, c)));
+    }
+    a.errors.sort();
+    a
+}
+
+/// `(line, code)` of each error whose primary span is in `file`, sorted.
+fn errors_in(errors: &[Reported], file: &str) -> Vec<(usize, String)> {
+    let mut v: Vec<(usize, String)> = errors
+        .iter()
+        .filter_map(|e| match &e.at {
+            Some((f, line)) if f == file => Some((*line, e.code.clone())),
+            _ => None,
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// `src` with its `// EXPECT-COUNT:` and `//~` annotations rewritten to describe `errors`, the
+/// actual errors of compiling it as `file`. Every other byte is kept, the line terminator style
+/// included; the count goes right after the `// EXPECT-CODE:` line when there was none. An
+/// error on the line after the last one (end of file) is annotated `//~v` on the last line.
+fn blessed(src: &str, errors: &[Reported], file: &str) -> String {
+    let nl = if src.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut lines: Vec<String> = src
+        .lines()
+        .map(|l| match l.find("//~") {
+            Some(i) => l[..i].trim_end().to_string(),
+            None => l.to_string(),
+        })
+        .collect();
+    let mut by_line: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    for (line, code) in errors_in(errors, file) {
+        by_line.entry(line).or_default().push(code);
+    }
+    for (line, codes) in by_line {
+        let (idx, mark) = if line >= 1 && line <= lines.len() {
+            (line - 1, "//~")
+        } else if line == lines.len() + 1 && !lines.is_empty() {
+            (lines.len() - 1, "//~v")
+        } else {
+            panic!("{file}: an error on line {line} is outside the file");
+        };
+        let l = &mut lines[idx];
+        let sep = if l.trim().is_empty() { "" } else { " " };
+        *l = format!("{l}{sep}{mark} {}", codes.join(" "));
+    }
+    let count = format!("// EXPECT-COUNT: {}", errors.len());
+    match lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("// EXPECT-COUNT:"))
+    {
+        Some(i) => lines[i] = count,
+        None => {
+            let i = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("// EXPECT-CODE:"))
+                .unwrap_or_else(|| panic!("{file}: no `// EXPECT-CODE:` line"));
+            lines.insert(i + 1, count);
+        }
+    }
+    let mut out = lines.join(nl);
+    if src.ends_with('\n') {
+        out.push_str(nl);
+    }
+    out
+}
+
+#[test]
+fn annotations_are_read_and_blessed_symmetrically() {
+    let src =
+        "// EXPECT-CODE: E0401\nfn f() {\n    x; //~ E0401 E0502\n    y;\n    //~^ E0301\n}\n";
+    let a = annotations("t.wk", src);
+    assert_eq!(a.count, None);
+    assert_eq!(
+        a.errors,
+        vec![
+            (3, "E0401".to_string()),
+            (3, "E0502".to_string()),
+            (4, "E0301".to_string())
+        ]
+    );
+    // Blessing from errors on lines 3 and 7 (end of file) rewrites the old annotations, inserts
+    // the count after `EXPECT-CODE`, and reading the result back gives the same errors.
+    let errs = vec![
+        Reported {
+            code: "E0401".into(),
+            at: Some(("t.wk".into(), 3)),
+        },
+        Reported {
+            code: "E0503".into(),
+            at: Some(("lib/other.wk".into(), 1)),
+        },
+        Reported {
+            code: "E0200".into(),
+            at: Some(("t.wk".into(), 7)),
+        },
+    ];
+    let b = blessed(src, &errs, "t.wk");
+    assert_eq!(
+        b,
+        "// EXPECT-CODE: E0401\n// EXPECT-COUNT: 3\nfn f() {\n    x; //~ E0401\n    y;\n\n} //~v E0200\n"
+    );
+    let back = annotations("t.wk", &b);
+    assert_eq!(back.count, Some(3));
+    // Inserting the count line moved every error down one line, annotation included.
+    assert_eq!(
+        back.errors,
+        vec![(4, "E0401".to_string()), (8, "E0200".to_string())]
+    );
+    // Blessing is idempotent and keeps CRLF line ends.
+    let shifted: Vec<Reported> = vec![
+        Reported {
+            code: "E0401".into(),
+            at: Some(("t.wk".into(), 4)),
+        },
+        errs[1].clone(),
+        Reported {
+            code: "E0200".into(),
+            at: Some(("t.wk".into(), 8)),
+        },
+    ];
+    assert_eq!(blessed(&b, &shifted, "t.wk"), b);
+    let crlf = blessed(&src.replace('\n', "\r\n"), &errs, "t.wk");
+    assert_eq!(crlf, b.replace('\n', "\r\n"));
+}
+
+#[test]
+fn json_errors_are_read_with_their_primary_line() {
+    let line = r#"{"severity":"error","code":"E0502","message":"m","spans":[{"file":"C:\\a\\b.wk","line":3,"col":1,"primary":false,"label":"x } y","line_end":3,"col_end":2,"byte_start":0,"byte_end":1},{"file":"C:\\a\\b.wk","line":9,"col":4,"primary":true,"label":"","line_end":9,"col_end":5,"byte_start":7,"byte_end":8}],"notes":[],"suggestions":[{"message":"s","replacement":"r","applicability":"maybe-incorrect","span":{"file":"C:\\a\\b.wk","line":1,"col":1,"line_end":1,"col_end":1,"byte_start":0,"byte_end":0}}],"version":1}"#;
+    let warning = r#"{"severity":"warning","code":"W0001","message":"m","spans":[],"notes":[]}"#;
+    let got = reported_errors(&format!("{warning}\n{line}\nnot json\n"));
+    assert_eq!(
+        got,
+        vec![Reported {
+            code: "E0502".into(),
+            at: Some(("C:\\a\\b.wk".into(), 9))
+        }]
+    );
+}
+
 #[test]
 fn compile_fail_code_check_rejects_secondary_only_matches() {
     let wanted = r#"{"severity":"error","code":"E0502","message":"dimension mismatch","spans":[],"notes":[]}"#;
@@ -131,6 +432,8 @@ fn compile_fail_suite() {
     programs.sort();
     assert!(!programs.is_empty(), "no fixtures in {}", dir.display());
 
+    let bless = std::env::var_os("WUKONG_BLESS").is_some_and(|v| v == "1");
+    let mut blessed_files: Vec<String> = Vec::new();
     for p in &programs {
         let src = std::fs::read_to_string(p).unwrap();
         let want = expected_code(&src);
@@ -149,7 +452,49 @@ fn compile_fail_suite() {
             "{name}: EXPECT-CODE {want} is not in the diagnostic catalogue \
              (crates/wukong_diag/src/catalog.rs), so `wukongc --explain {want}` returns nothing"
         );
+
+        let errors = reported_errors(&stderr);
+        let file = p.display().to_string();
+        if bless {
+            let new = blessed(&src, &errors, &file);
+            if new != src {
+                std::fs::write(p, new).expect("write the blessed fixture");
+                blessed_files.push(name.into_owned());
+            }
+            continue;
+        }
+        let a = annotations(&name, &src);
+        if let Some(n) = a.count {
+            assert_eq!(
+                errors.len(),
+                n,
+                "{name}: `// EXPECT-COUNT: {n}`, but the build reported {} error(s) \
+                 (rerun with WUKONG_BLESS=1 to rewrite the annotations, then review the diff):\n\
+                 {stderr}",
+                errors.len()
+            );
+        }
+        if !a.errors.is_empty() {
+            let got = errors_in(&errors, &file);
+            let missing: Vec<_> = a.errors.iter().filter(|e| !got.contains(e)).collect();
+            let unexpected: Vec<_> = got.iter().filter(|e| !a.errors.contains(e)).collect();
+            assert!(
+                got == a.errors,
+                "{name}: the errors do not match the `//~` annotations — annotated but not \
+                 reported (line, code): {missing:?}; reported but not annotated: {unexpected:?} \
+                 (rerun with WUKONG_BLESS=1 to rewrite the annotations, then review the diff):\n\
+                 {stderr}"
+            );
+        }
     }
+    assert!(
+        !bless,
+        "WUKONG_BLESS=1: rewrote the EXPECT-COUNT and `//~` annotations of {} fixture(s){}{}. \
+         This run fails on purpose: review `git diff tests/fail`, then rerun without WUKONG_BLESS.",
+        blessed_files.len(),
+        if blessed_files.is_empty() { "" } else { ": " },
+        blessed_files.join(", ")
+    );
     eprintln!("checked {} compile-fail fixture(s)", programs.len());
 }
 

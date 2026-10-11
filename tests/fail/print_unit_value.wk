@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0437
+// EXPECT-COUNT: 1
 module tests.fail.print_unit_value
 
 // An `if` with no `else` (and a `match` with statement arms) has type `()` — the value of the
@@ -9,6 +10,6 @@ module tests.fail.print_unit_value
 // rejects a `()` argument (E0437), the same way `()` is already rejected as an arithmetic operand.
 fn main() -> i32 {
     let x = if true { 1 }; // `x: ()` — the `1` is discarded (no else)
-    print(x); // E0437: cannot print a `()` value
+    print(x); // E0437: cannot print a `()` value //~ E0437
     return 0;
 }

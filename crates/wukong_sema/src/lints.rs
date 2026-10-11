@@ -17,7 +17,8 @@
 //!   warning level), then the innermost `@allow(..)`/`@warn(..)`/`@deny(..)` attribute whose item,
 //!   parameter or statement contains the warning — and drops it, keeps it, or promotes it to an
 //!   error. It applies to any diagnostic with a lint code, so the parser's statement-terminator
-//!   lints go through the same levels.
+//!   lints (of every file of the program) and the import loader's `unused_imports` go through the
+//!   same levels.
 //!
 //! Name resolution here is the lint pass's own, mirroring sema's scoping (a block, a `for` and a
 //! `match` arm each open a scope; a `let`'s initializer is resolved before its pattern binds), so it
@@ -91,6 +92,13 @@ pub const LINTS: &[Lint] = &[
     Lint {
         name: "unknown_lints",
         code: "W0007",
+        default: LintLevel::Warn,
+    },
+    // An `import` no name of its file resolves through. Found by the driver's import loader, whose
+    // module-scoped resolution is the only one that knows which import a name came through.
+    Lint {
+        name: "unused_imports",
+        code: "W0008",
         default: LintLevel::Warn,
     },
     // A `match` arm no value can reach, found by the pattern-usefulness analysis that also decides

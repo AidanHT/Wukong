@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0520
+// EXPECT-COUNT: 1
 module tests.fail.dim_uninferable
 
 // A rank-2 symbolic tensor parameter fed a flat 12-element array: the array fixes only the element
@@ -18,5 +19,5 @@ fn total<M, N>(a: Tensor[f32, M, N]) -> f32 {
 
 fn main() -> i32 {
     let a: [f32; 12] = [1.0; 12];
-    return total(a) as i32;
+    return total(a) as i32; //~ E0520
 }

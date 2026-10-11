@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0501
+// EXPECT-COUNT: 1
 module tests.fail.tensor_decay_nonconst_size
 
 // The array→tensor decay size check must fire even when a tensor dimension is symbolic or dynamic,
@@ -14,6 +15,6 @@ fn g(a: Tensor[f32, ?, 4]) -> f32 {
 
 fn main() -> i32 {
     let xs: [f32; 6] = [10.0, 11.0, 12.0, 13.0, 14.0, 15.0];
-    print(g(xs) as i32);
+    print(g(xs) as i32); //~ E0501
     return 0;
 }

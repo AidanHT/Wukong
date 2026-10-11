@@ -11,7 +11,7 @@ module tests.run.generic_shape_mixed
 // monomorphization target and the dim value — so the two features do not interfere. Runs at two
 // different sizes (N=4 and N=3), bit-identical interp == native, -O0 == -O{1,2,3}.
 fn copy<T, N>(x: Tensor[f32, N], tag: T, mut out: Tensor[f32, N]) {
-    let t = tag; // thread the type generic structurally (no arithmetic on `T`)
+    let _t = tag; // thread the type generic structurally (no arithmetic on `T`)
     for i in 0..N {
         out[i] = x[i] * 2.0;
     }

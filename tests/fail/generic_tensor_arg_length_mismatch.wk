@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0501
+// EXPECT-COUNT: 1
 module tests.fail.generic_tensor_arg_length_mismatch
 
 // A rank-1 generic tensor parameter binds its symbolic dim from a decaying array argument's length,
@@ -17,6 +18,6 @@ fn f<N>(a: Tensor[f32, N], b: Tensor[f32, N]) -> f32 {
 fn main() -> i32 {
     let a: [f32; 8] = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
     let b: [f32; 4] = [2.0, 2.0, 2.0, 2.0];
-    print(f(a, b) as i32);
+    print(f(a, b) as i32); //~ E0501
     return 0;
 }

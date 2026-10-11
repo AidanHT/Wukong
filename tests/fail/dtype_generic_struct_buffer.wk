@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0502
+// EXPECT-COUNT: 1
 module tests.fail.dtype_generic_struct_buffer
 
 // A dtype-generic tensor parameter takes its element type from the argument, and a tensor element
@@ -12,6 +13,6 @@ fn count<T, N>(x: Tensor[T, N]) -> i64 {
 
 fn main() -> i32 {
     let ps: [Point; 2] = [Point { x: 1.0, y: 2.0 }, Point { x: 3.0, y: 4.0 }];
-    print(count(ps));
+    print(count(ps)); //~ E0502
     return 0;
 }

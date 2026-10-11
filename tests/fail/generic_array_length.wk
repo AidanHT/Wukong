@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0406
+// EXPECT-COUNT: 1
 module tests.fail.generic_array_length
 
 // A generic length is the shape of a PARAMETER (`fn f<N>(a: [f32; N])` is the shape-generic buffer
@@ -7,7 +8,7 @@ module tests.fail.generic_array_length
 // 0 here while mir_build lowered a bare pointer slot — the two-crate desync of
 // `array_len_not_constant.wk`. It is reported instead.
 fn scratch<N>(a: [f32; N]) -> f32 {
-    let mut tmp: [f32; N];
+    let mut tmp: [f32; N]; //~ E0406
     tmp[0] = a[0];
     return tmp[0];
 }

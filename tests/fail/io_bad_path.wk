@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0437
+// EXPECT-COUNT: 1
 module tests.fail.io_bad_path
 
 // The file-I/O builtins take a NUL-terminated `*u8` path as their first argument (a string literal
@@ -7,6 +8,6 @@ module tests.fail.io_bad_path
 // (E0437), never a silent misread.
 fn main() -> i32 {
     let s: []f32 = alloc_f32(4);
-    let n: i64 = read_f32(5, s);
+    let n: i64 = read_f32(5, s); //~ E0437
     return 0;
 }

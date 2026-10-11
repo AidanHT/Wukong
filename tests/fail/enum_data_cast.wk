@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0401
+// EXPECT-COUNT: 1
 module tests.fail.enum_data_cast
 
 // A data-carrying (tagged-union) enum value is a byte buffer, not an integer discriminant, so casting
@@ -8,5 +9,5 @@ enum Op { Add(i32, i32), Nop }
 
 fn main() -> i32 {
     let a = Op::Add(1, 2);
-    return a as i32;
+    return a as i32; //~ E0401
 }

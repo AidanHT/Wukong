@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0409
+// EXPECT-COUNT: 3
 module tests.fail.builtin_dim_uninferable
 
 // A named kernel builtin is shape-checked like a generic function, so each of its dimensions must
@@ -12,7 +13,7 @@ fn main() -> i32 {
     let a: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
     let b: [f32; 12] = [1.0; 12];
     let mut c: [f32; 8] = [0.0; 8];
-    matmul(a, b, c);
+    matmul(a, b, c); //~ E0409 E0409 E0409
     print(c[0]);
     return 0;
 }

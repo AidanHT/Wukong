@@ -14,14 +14,14 @@ module tests.run.for_range_unsigned_bound
 fn main() -> i32 {
     let small: u32 = 5;
     let mut a = 0;
-    for i in 0..small {
+    for _i in 0..small {
         a = a + 1;
     }
     print(a); // 5 iterations
 
     let big: u32 = 3000000000;
     let mut b = 0;
-    for i in 0..big {
+    for _i in 0..big {
         b = b + 1;
         if b > 2 {
             break;
@@ -31,7 +31,7 @@ fn main() -> i32 {
 
     let big64: u64 = 18000000000000000000;
     let mut d = 0;
-    for i in 0..big64 {
+    for _i in 0..big64 {
         d = d + 1;
         if d > 2 {
             break;

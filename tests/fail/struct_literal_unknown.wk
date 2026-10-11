@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0324
+// EXPECT-COUNT: 1
 module tests.fail.struct_literal_unknown
 
 // A struct literal of a name no struct has (`Pointt`). The literal used to type as `Unknown` and
@@ -7,6 +8,6 @@ module tests.fail.struct_literal_unknown
 struct Point { x: f32, y: f32 }
 
 fn main() -> i32 {
-    let p = Pointt { x: 1.0, y: 2.0 };
+    let p = Pointt { x: 1.0, y: 2.0 }; //~ E0324
     return 0;
 }

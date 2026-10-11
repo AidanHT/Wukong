@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0433
+// EXPECT-COUNT: 1
 module tests.fail.chained_equality
 
 // `a == 3 == 0` parses left-associatively as `(a == 3) == 0`. The inner `(a == 3)` is a bool, so the
@@ -8,7 +9,7 @@ module tests.fail.chained_equality
 // caught by tests/fail/chained_comparison.wk).
 fn main() -> i32 {
     let a = 5;
-    if a == 3 == 0 {
+    if a == 3 == 0 { //~ E0433
         return 111;
     }
     return 222;

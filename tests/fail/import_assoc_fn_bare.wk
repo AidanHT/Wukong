@@ -1,0 +1,16 @@
+// EXPECT-CODE: E0320
+// EXPECT-COUNT: 1
+module tests.fail.import_assoc_fn_bare
+
+// An associated function of an IMPORTED type, called bare. The help names the type as its module
+// declares it (`Pt`, from `lib.geom_assoc`), never by the loader's program-wide symbol
+// `lib.geom_assoc.Pt`, and the diagnostic carries no structured edit: whether this file can write
+// `Pt::norm` depends on how it imports the type, which sema does not see.
+// (diag_json.rs `e0320_for_an_imported_type_never_names_the_loader_symbol` pins this.)
+
+import lib.geom_assoc;
+
+fn main() -> i32 {
+    let p = origin();
+    return norm(p) as i32; //~ E0320
+}

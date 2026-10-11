@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0405
+// EXPECT-COUNT: 1
 module tests.fail.match_nonexhaustive
 
 // A `match` used in value position must be exhaustive. This one omits `Color::Blue` and has no `_`
@@ -10,7 +11,7 @@ module tests.fail.match_nonexhaustive
 enum Color { Red, Green, Blue }
 
 fn name(c: Color) -> i32 {
-    return match c {
+    return match c { //~ E0405
         Color::Red => 1,
         Color::Green => 2,
     };

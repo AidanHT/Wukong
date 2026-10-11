@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0309
+// EXPECT-COUNT: 1
 module tests.fail.tile_second_on_stmt
 
 // `tile_requested` and `take_tile_size` both `return`ed inside their loop over the statement's
@@ -13,7 +14,7 @@ module tests.fail.tile_second_on_stmt
 @generic
 fn f(mut out: [i32; 100]) {
     @tile(4)
-    @tile(0)
+    @tile(0) //~ E0309
     for i in 0..100 {
         out[i] = i;
     }

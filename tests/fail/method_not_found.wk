@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0315
+// EXPECT-COUNT: 1
 module tests.fail.method_not_found
 
 // A method call on a struct that has no such method. Before `impl` blocks existed, `v.nrom()` typed
@@ -19,6 +20,6 @@ impl Vec2 {
 
 fn main() -> i32 {
     let v = Vec2 { x: 3.0, y: 4.0 };
-    print(v.nrom2());
+    print(v.nrom2()); //~ E0315
     return 0;
 }

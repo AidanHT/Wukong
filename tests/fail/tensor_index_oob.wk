@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0501
+// EXPECT-COUNT: 2
 module tests.fail.tensor_index_oob
 
 // A constant index past a static tensor dimension is caught at compile time — the same headline
@@ -16,7 +17,7 @@ module tests.fail.tensor_index_oob
 //
 // The first is pinned by `shape_diagnostics_name_the_dim_in_json` in `crates/wukongc/tests/fail.rs`.
 fn read(a: Tensor[f32, 2, 2]) -> f32 {
-    return a[5, 5];
+    return a[5, 5]; //~ E0501 E0501
 }
 
 fn main() -> i32 {

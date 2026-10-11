@@ -1,0 +1,24 @@
+// EXPECT-WARN: W0008
+// EXPECT-WARN: W0008
+// EXPECT-WARN: W0008
+module tests.warn.unused_imports
+
+// An `import` nothing in this file resolves through is W0008 (`unused_imports`). Used here: a glob
+// import through one of its names (`area`), an `as` alias through its qualifier (`u::scale`) and a
+// selected name (`meters`). Reported: the second import of `lib.shapes` (the first one does the
+// work), the alias `never` that nothing names, and the selected `feet`. An `@allow` on the import
+// item itself silences it.
+import lib.shapes;
+import lib.shapes;
+import lib.units as u;
+import lib.units as never;
+import lib.units.{meters, feet};
+@allow(unused_imports)
+import lib.shapes as kept;
+
+fn main() -> i32 {
+    let a: f32 = area(2.0, 3.0);
+    let m: f32 = u::scale(a) + meters(1.0);
+    print(m);
+    return 0;
+}

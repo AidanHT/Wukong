@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0401
+// EXPECT-COUNT: 1
 module tests.fail.assign_kind_mismatch
 
 // Assigning a pointer into a scalar place reinterprets the bits: `x = &a` for `x: i32` stores a
@@ -7,6 +8,6 @@ module tests.fail.assign_kind_mismatch
 fn main() -> i32 {
     let a: i32 = 7;
     let mut x: i32 = 0;
-    x = &a; // `&a` is `*i32`, but `x` is a scalar `i32`
+    x = &a; // `&a` is `*i32`, but `x` is a scalar `i32` //~ E0401
     return x;
 }

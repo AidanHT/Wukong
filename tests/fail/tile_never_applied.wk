@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0309
+// EXPECT-COUNT: 1
 module tests.fail.tile_never_applied
 
 // A function-item `@tile(BM, BN, …)` is a queue consumed by loops in source order, and a width left
@@ -9,7 +10,7 @@ module tests.fail.tile_never_applied
 
 @generic
 @tile(64, 32)
-fn f(mut out: [i32; 100]) {
+fn f(mut out: [i32; 100]) { //~ E0309
     for i in 0..100 {
         out[i] = i;
     }

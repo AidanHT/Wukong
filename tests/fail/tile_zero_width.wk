@@ -1,10 +1,11 @@
 // EXPECT-CODE: E0309
+// EXPECT-COUNT: 1
 module tests.fail.tile_zero_width
 
 // A tile of zero iterations is not a tiling. `@tile(0)` was dropped by the argument reader, so this
 // compiled and ran with no tiling and no diagnostic at all.
 @generic
-@tile(0)
+@tile(0) //~ E0309
 fn f(mut out: [i32; 8]) {
     for i in 0..8 {
         out[i] = i;

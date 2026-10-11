@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0442
+// EXPECT-COUNT: 1
 module tests.fail.let_refutable_pattern
 
 // A plain `let` pattern must match every value: for a `Shape::Square`, `r` would not exist. The
@@ -10,7 +11,7 @@ enum Shape {
 }
 
 fn radius(s: Shape) -> i32 {
-    let Shape::Circle(r) = s;
+    let Shape::Circle(r) = s; //~ E0442
     return r;
 }
 

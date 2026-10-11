@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0405
+// EXPECT-COUNT: 1
 module tests.fail.match_payload_subpattern_nonexhaustive
 
 // Every variant has an arm, but the `Add` arm only matches when the first field is 0: the values
@@ -12,7 +13,7 @@ enum Expr {
 }
 
 fn eval(e: Expr) -> i32 {
-    return match e {
+    return match e { //~ E0405
         Expr::Num(n) => n,
         Expr::Add(0, y) => y,
         Expr::Nil => 0,

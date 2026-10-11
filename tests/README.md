@@ -50,7 +50,14 @@ module tests.fail.array_index_oob
 ```
 
 - `// EXPECT-CODE: <code>` — **required**; exactly **one** per file; the first match wins.
-- Harness drives `--error-format=json --emit=mir` and asserts stderr contains `"code":"<code>"`.
+- `// EXPECT-COUNT: <n>` — the build reports exactly `n` errors (error or bug severity, any file).
+- `… //~ <code> [<code> …]` at the end of a line — an error with each code has its primary span on
+  that line (`//~^` / `//~v`: the line above / below, one line per mark). Once a fixture has any,
+  the errors in its own file must be exactly its annotations; an imported file's are only counted.
+- Harness drives `--error-format=json --emit=mir` and asserts the first diagnostic is an error with
+  `<code>`. `WUKONG_BLESS=1 cargo test -p wukongc --test fail` rewrites every fixture's count and
+  `//~` annotations from the real output (never `EXPECT-CODE`) and fails on purpose: review the
+  diff, then rerun without it. Every fixture is annotated.
 - Never renumber or recycle a code. `E0001` is retired.
 
 ## Fixture format — `warn/`
@@ -75,8 +82,10 @@ module tests.warn.deny_warnings_flag
 `crates/wukongc/tests/fail.rs` — `compile_fail_suite`, `lexer_and_parser_diagnostics_are_reachable`,
 `every_catalogued_code_is_exercised`, `imported_file_diagnostics_carry_their_own_path`.
 
-`crates/wukongc/tests/warn.rs` — `warn_suite` over `warn/`; `corpus_is_warning_free` (lints
-`run/` and `examples/`) is `#[ignore]`d until the corpus is brought to zero warnings.
+`crates/wukongc/tests/warn.rs` — `warn_suite` over `warn/`; `corpus_is_warning_free` lints every
+`run/` and `examples/` program (and the modules they import): the corpus is warning-free, so a new
+fixture must be too; `an_imported_files_parser_lint_carries_its_own_path` compiles
+`imports/lint_semi_root.wk`.
 
 `crates/wukongc/tests/determinism.rs` — fresh-process byte identity for MIR, object, and diagnostic
 emission.

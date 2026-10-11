@@ -28,7 +28,7 @@ fn main() -> i32 {
     print(B);                       // 65  (A + 1)
 
     let mut c: i32 = 0;
-    for i in 0..LIM { c += 1; }     // const as a loop bound
+    for _i in 0..LIM { c += 1; }    // const as a loop bound
     print(c);                       // 5
     return 0;
 }

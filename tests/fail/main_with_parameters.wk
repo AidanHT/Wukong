@@ -2,8 +2,9 @@
 // type-check and then fail only at run time (the JIT refused the entry, the interpreter ran with a
 // missing argument); it is now rejected where it is written (E0331).
 // EXPECT-CODE: E0331
+// EXPECT-COUNT: 1
 module main_with_parameters
 
-fn main(steps: i32) -> i32 {
+fn main(steps: i32) -> i32 { //~ E0331
     return steps;
 }

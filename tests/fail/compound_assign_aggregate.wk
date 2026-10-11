@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0433
+// EXPECT-COUNT: 1
 module tests.fail.compound_assign_aggregate
 
 // A compound assignment `a += b` means `a = a + b`. That implied `+` is undefined on an aggregate:
@@ -9,6 +10,6 @@ module tests.fail.compound_assign_aggregate
 fn main() -> i32 {
     let mut a: [i32; 2] = [1, 2];
     let b: [i32; 2] = [3, 4];
-    a += b;
+    a += b; //~ E0433
     return a[0];
 }

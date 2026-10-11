@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0436
+// EXPECT-COUNT: 1
 module tests.fail.void_condition
 
 // A branch condition cannot be `()` (the result of a void-returning call): it lowered to a `cond_br`
@@ -8,7 +9,7 @@ module tests.fail.void_condition
 fn nothing() {}
 
 fn main() -> i32 {
-    if nothing() {
+    if nothing() { //~ E0436
         return 1;
     }
     return 0;

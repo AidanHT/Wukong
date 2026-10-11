@@ -1,0 +1,9 @@
+// Loader unit-test and warn.rs fixture: an imported module whose `let` misses its `;` (W0030).
+// The lint must be reported for THIS file, with its own path and line (line 7), at the root
+// file's lint stage. lint_semi_root.wk is the root that warn.rs compiles.
+module lint_semi
+
+pub fn semi_val() -> i32 {
+    let x: i32 = 4
+    return x * 2;
+}

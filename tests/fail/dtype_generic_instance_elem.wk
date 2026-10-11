@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0502
+// EXPECT-COUNT: 1
 module tests.fail.dtype_generic_instance_elem
 
 // The generic body hands its `Tensor[T, N]` to a function that takes `f32` elements. That is
@@ -12,7 +13,7 @@ fn scale_f32<N>(mut x: Tensor[f32, N]) {
 }
 
 fn twice<T, N>(mut x: Tensor[T, N]) {
-    scale_f32(x);
+    scale_f32(x); //~ E0502
 }
 
 fn main() -> i32 {

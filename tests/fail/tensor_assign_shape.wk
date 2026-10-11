@@ -1,4 +1,5 @@
 // EXPECT-CODE: E0502
+// EXPECT-COUNT: 1
 module tests.fail.tensor_assign_shape
 
 // A whole-tensor assignment must agree in shape. Assignment was the one shape-bearing context with
@@ -7,7 +8,7 @@ module tests.fail.tensor_assign_shape
 // buffer past the place's length — a hole in the headline compile-time shape guarantee.
 fn f(a: Tensor[f32, 4], b: Tensor[f32, 8]) -> f32 {
     let mut x: Tensor[f32, 4] = a;
-    x = b;
+    x = b; //~ E0502
     return x[0];
 }
 
