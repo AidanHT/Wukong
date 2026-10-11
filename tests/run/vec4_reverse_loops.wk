@@ -1,0 +1,512 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -16
+// EXPECT-OUT: 24
+// EXPECT-OUT: 8
+// EXPECT-OUT: 800000000
+// EXPECT-OUT: 32
+// EXPECT-OUT: 16
+// EXPECT-OUT: 0
+// EXPECT-OUT: -16
+// EXPECT-OUT: 24
+// EXPECT-OUT: 8
+// EXPECT-OUT: -8
+// EXPECT-OUT: 32
+// EXPECT-OUT: 16
+// EXPECT-OUT: 0
+// EXPECT-OUT: -16
+// EXPECT-OUT: 24
+// EXPECT-OUT: 8
+// EXPECT-OUT: -800000000
+// EXPECT-OUT: 32
+// EXPECT-OUT: 16
+// EXPECT-OUT: 0
+// EXPECT-OUT: -16
+// EXPECT-OUT: 24
+// EXPECT-OUT: -10
+// EXPECT-OUT: 6
+// EXPECT-OUT: -6
+// EXPECT-OUT: 400000000
+// EXPECT-OUT: -2
+// EXPECT-OUT: -14
+// EXPECT-OUT: -26
+// EXPECT-OUT: -38
+// EXPECT-OUT: -22
+// EXPECT-OUT: -34
+// EXPECT-OUT: -46
+// EXPECT-OUT: -30
+// EXPECT-OUT: -42
+// EXPECT-OUT: -54
+// EXPECT-OUT: -66
+// EXPECT-OUT: -50
+// EXPECT-OUT: -62
+// EXPECT-OUT: -400000064
+// EXPECT-OUT: -58
+// EXPECT-OUT: -70
+// EXPECT-OUT: -82
+// EXPECT-OUT: -94
+// EXPECT-OUT: -78
+// EXPECT-OUT: -4
+// EXPECT-OUT: 10
+// EXPECT-OUT: 2
+// EXPECT-OUT: 400000000
+// EXPECT-OUT: 14
+// EXPECT-OUT: 6
+// EXPECT-OUT: -4
+// EXPECT-OUT: -4
+// EXPECT-OUT: 10
+// EXPECT-OUT: 2
+// EXPECT-OUT: -4
+// EXPECT-OUT: 14
+// EXPECT-OUT: 6
+// EXPECT-OUT: -4
+// EXPECT-OUT: -4
+// EXPECT-OUT: 10
+// EXPECT-OUT: 2
+// EXPECT-OUT: -4
+// EXPECT-OUT: 14
+// EXPECT-OUT: 6
+// EXPECT-OUT: -4
+// EXPECT-OUT: -4
+// EXPECT-OUT: 10
+// EXPECT-OUT: -28
+// EXPECT-OUT: 11
+// EXPECT-OUT: 3
+// EXPECT-OUT: 400000000
+// EXPECT-OUT: 15
+// EXPECT-OUT: 7
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: 11
+// EXPECT-OUT: 3
+// EXPECT-OUT: -28
+// EXPECT-OUT: 15
+// EXPECT-OUT: 7
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: 11
+// EXPECT-OUT: 3
+// EXPECT-OUT: -28
+// EXPECT-OUT: 15
+// EXPECT-OUT: 7
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: 11
+// EXPECT-OUT: -16
+// EXPECT-OUT: 24
+// EXPECT-OUT: 8
+// EXPECT-OUT: 800000000
+// EXPECT-OUT: 32
+// EXPECT-OUT: 16
+// EXPECT-OUT: 0
+// EXPECT-OUT: -16
+// EXPECT-OUT: 24
+// EXPECT-OUT: 8
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -10
+// EXPECT-OUT: 6
+// EXPECT-OUT: -6
+// EXPECT-OUT: 400000000
+// EXPECT-OUT: -2
+// EXPECT-OUT: -14
+// EXPECT-OUT: -26
+// EXPECT-OUT: -38
+// EXPECT-OUT: -22
+// EXPECT-OUT: -34
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -4
+// EXPECT-OUT: 10
+// EXPECT-OUT: 2
+// EXPECT-OUT: 400000000
+// EXPECT-OUT: 14
+// EXPECT-OUT: 6
+// EXPECT-OUT: -4
+// EXPECT-OUT: -4
+// EXPECT-OUT: 10
+// EXPECT-OUT: 2
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: 11
+// EXPECT-OUT: 3
+// EXPECT-OUT: 400000000
+// EXPECT-OUT: 15
+// EXPECT-OUT: 7
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: 11
+// EXPECT-OUT: 3
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 3223322624
+// EXPECT-OUT: 7
+// EXPECT-OUT: 0
+// EXPECT-OUT: 16
+// EXPECT-OUT: 1056964608
+// EXPECT-OUT: 34
+// EXPECT-OUT: 1287568416
+// EXPECT-OUT: 61
+// EXPECT-OUT: 1287568416
+// EXPECT-OUT: 64
+// EXPECT-OUT: 1287568417
+// EXPECT-OUT: 76
+// EXPECT-OUT: 1287568417
+// EXPECT-OUT: 97
+// EXPECT-OUT: 1287568416
+// EXPECT-OUT: 127
+// EXPECT-OUT: 1287568417
+// EXPECT-OUT: 133
+// EXPECT-OUT: 1287568417
+// EXPECT-OUT: 148
+// EXPECT-OUT: 1287568416
+// EXPECT-OUT: 172
+// EXPECT-OUT: 1287568417
+// EXPECT-OUT: 172
+// EXPECT-OUT: 1287568417
+// EXPECT-OUT: 181
+// EXPECT-OUT: 1287568417
+// EXPECT-OUT: 199
+// EXPECT-OUT: 1287568417
+// EXPECT-OUT: 226
+// EXPECT-OUT: 1287568417
+// EXPECT-OUT: 229
+// EXPECT-OUT: 1287568417
+// EXPECT-OUT: 241
+// EXPECT-OUT: 1056964608
+// EXPECT-OUT: 262
+// EXPECT-OUT: 1056964608
+// EXPECT-OUT: 292
+// EXPECT-OUT: 1091043328
+// EXPECT-OUT: 298
+// EXPECT-OUT: 1091043328
+// EXPECT-OUT: 313
+// EXPECT-OUT: 1056964608
+// EXPECT-OUT: 337
+// EXPECT-OUT: 1091043328
+// EXPECT-OUT: 337
+// EXPECT-OUT: 22
+// EXPECT-OUT: 96
+// EXPECT-OUT: 170
+// EXPECT-OUT: 244
+// EXPECT-OUT: 318
+// EXPECT-OUT: 392
+// EXPECT-OUT: 466
+// EXPECT-OUT: 38
+// EXPECT-OUT: 112
+// EXPECT-OUT: 186
+// EXPECT-OUT: 260
+// EXPECT-OUT: 334
+// EXPECT-OUT: 408
+// EXPECT-OUT: 482
+// EXPECT-OUT: 54
+// EXPECT-OUT: 128
+// EXPECT-OUT: 202
+// EXPECT-OUT: 276
+// EXPECT-OUT: 350
+// EXPECT-OUT: 424
+// EXPECT-OUT: 498
+// EXPECT-OUT: 70
+// EXPECT-OUT: 144
+// EXPECT-OUT: 218
+// EXPECT-OUT: 292
+// EXPECT-OUT: 366
+// EXPECT-OUT: 440
+// EXPECT-OUT: 12
+// EXPECT-OUT: 86
+// EXPECT-OUT: 160
+// EXPECT-OUT: 234
+// EXPECT-OUT: 308
+// EXPECT-OUT: 382
+// EXPECT-OUT: 456
+// EXPECT-OUT: 28
+// EXPECT-OUT: 102
+// EXPECT-OUT: 176
+// EXPECT-OUT: 250
+// EXPECT-OUT: 324
+// EXPECT-OUT: 398
+// EXPECT-OUT: 472
+// EXPECT-OUT: 22
+// EXPECT-OUT: 96
+// EXPECT-OUT: 170
+// EXPECT-OUT: 244
+// EXPECT-OUT: 318
+// EXPECT-OUT: 392
+// EXPECT-OUT: 466
+// EXPECT-OUT: 38
+// EXPECT-OUT: 112
+// EXPECT-OUT: 186
+// EXPECT-OUT: 260
+// EXPECT-OUT: 334
+// EXPECT-OUT: 408
+// EXPECT-OUT: 482
+// EXPECT-OUT: 54
+// EXPECT-OUT: 128
+// EXPECT-OUT: 202
+// EXPECT-OUT: 276
+// EXPECT-OUT: 350
+// EXPECT-OUT: 424
+// EXPECT-OUT: 498
+// EXPECT-OUT: 70
+// EXPECT-OUT: 144
+// EXPECT-OUT: 218
+// EXPECT-OUT: 292
+// EXPECT-OUT: 366
+// EXPECT-OUT: 440
+// EXPECT-OUT: 12
+// EXPECT-OUT: 86
+// EXPECT-OUT: 160
+// EXPECT-OUT: 234
+// EXPECT-OUT: 308
+// EXPECT-OUT: 382
+// EXPECT-OUT: 456
+// EXPECT-OUT: 28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -28
+// EXPECT-OUT: -9
+// EXPECT-OUT: -6
+// EXPECT-OUT: -3
+// EXPECT-OUT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 9
+// EXPECT-OUT: 12
+// EXPECT-OUT: 15
+module tests.run.vec4_reverse_loops
+
+// Countdowns (-O2): `while i > 0 { i = i - 1; .. }` and `while i >= 0 { ..; i = i - 1 }`. The
+// general vectorizer walks the group DOWN: lane k of a group is still the group's k-th iteration
+// (counter i - k), so each contiguous access is one vector load or store of the W elements ending
+// at lane 0's element, its lanes reversed by a shuffle. Elementwise bodies, the counter read as a
+// value, if-converted and one-armed stores, an order-sensitive f32 sum (folded lane by lane in the
+// loop's own descending order), an integer sum, bytes widened to four f32 parts, and f64.
+//
+// Every expected line is derived from the scalar loop. x[j] = (5j mod 7) - 2.5 with x[3] = 1e8
+// and x[17] = -1e8, so a sum taken in any other order rounds differently; y[j] = 3j mod 11;
+// q[j] = (37j + 11) mod 251.
+
+@unchecked
+fn down(x: []f32, mut o: []f32, n: i64) {
+    let mut i: i64 = n;
+    while i > 0 {
+        i = i - 1;
+        o[i] = x[i] * 2.0 + 1.0;
+    }
+}
+
+@unchecked
+fn down_ge(x: []f32, mut o: []f32, n: i64) {
+    let mut i: i64 = n - 1;
+    while i >= 0 {
+        o[i] = x[i] - (i as f32);
+        i = i - 1;
+    }
+}
+
+@unchecked
+fn sel(x: []f32, mut o: []f32, n: i64) {
+    let mut i: i64 = n;
+    while i > 0 {
+        i = i - 1;
+        if x[i] > 0.0 {
+            o[i] = x[i];
+        } else {
+            o[i] = -1.0;
+        }
+    }
+}
+
+@unchecked
+fn pos_only(x: []f32, mut o: []f32, n: i64) {
+    let mut i: i64 = n;
+    while i > 0 {
+        i = i - 1;
+        if x[i] > 0.0 {
+            o[i] = x[i] + 0.25;
+        }
+    }
+}
+
+@unchecked
+fn dsum(x: []f32, n: i64) -> f32 {
+    let mut s: f32 = 0.0;
+    let mut i: i64 = n;
+    while i > 0 {
+        i = i - 1;
+        s = s + x[i];
+    }
+    return s;
+}
+
+@unchecked
+fn isum(y: []i32, n: i64) -> i32 {
+    let mut s: i32 = 7;
+    let mut i: i64 = n;
+    while i > 0 {
+        i = i - 1;
+        s = s + y[i] * 3;
+    }
+    return s;
+}
+
+@unchecked
+fn bytes(q: []u8, mut o: []f32, n: i64) {
+    let mut i: i64 = n;
+    while i > 0 {
+        i = i - 1;
+        o[i] = (q[i] as f32) * 0.5;
+    }
+}
+
+@unchecked
+fn halve(d: []f64, mut e: []f64, n: i64) {
+    let mut i: i64 = n - 1;
+    while i >= 0 {
+        e[i] = d[i] * 0.5 - 1.0;
+        i = i - 1;
+    }
+}
+
+fn reset(mut o: []f32) {
+    let mut j: i64 = 0;
+    while j < o.len() {
+        o[j] = -7.0;
+        j = j + 1;
+    }
+}
+
+fn show(o: []f32) {
+    let mut j: i64 = 0;
+    while j < o.len() {
+        print((o[j] * 4.0) as i64);
+        j = j + 1;
+    }
+}
+
+fn main() -> i32 {
+    let mut x: []f32 = alloc_f32(23);
+    let mut y: []i32 = alloc_i32(23);
+    let mut o: []f32 = alloc_f32(23);
+    let mut j: i64 = 0;
+    while j < 23 {
+        x[j] = (((j * 5) % 7) as f32) - 2.5;
+        y[j] = ((j * 3) % 11) as i32;
+        j = j + 1;
+    }
+    x[3] = 100000000.0;
+    x[17] = -100000000.0;
+
+    // Every lane at the full trip and at a partial one (lanes from n up keep the -7 sentinel).
+    let mut n: i64 = 23;
+    while n >= 10 {
+        reset(o);
+        down(x, o, n);
+        show(o);
+        reset(o);
+        down_ge(x, o, n);
+        show(o);
+        reset(o);
+        sel(x, o, n);
+        show(o);
+        reset(o);
+        pos_only(x, o, n);
+        show(o);
+        n = n - 13;
+    }
+    // The reductions at every trip 0..=23.
+    n = 0;
+    while n <= 23 {
+        print(bits(dsum(x, n)));
+        print(isum(y, n));
+        n = n + 1;
+    }
+
+    let mut q: []u8 = alloc_u8(41);
+    let mut b: []f32 = alloc_f32(41);
+    j = 0;
+    while j < 41 {
+        q[j] = ((j * 37 + 11) % 251) as u8;
+        j = j + 1;
+    }
+    reset(b);
+    bytes(q, b, 41);
+    show(b);
+    reset(b);
+    bytes(q, b, 35);
+    show(b);
+
+    let mut d: []f64 = alloc_f64(9);
+    let mut e: []f64 = alloc_f64(9);
+    j = 0;
+    while j < 9 {
+        d[j] = (j as f64) * 3.0 - 7.0;
+        e[j] = 99.0;
+        j = j + 1;
+    }
+    halve(d, e, 9);
+    j = 0;
+    while j < 9 {
+        print((e[j] * 2.0) as i64);
+        j = j + 1;
+    }
+
+    free(x);
+    free(y);
+    free(o);
+    free(q);
+    free(b);
+    free(d);
+    free(e);
+    return 0;
+}

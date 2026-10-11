@@ -552,6 +552,12 @@ struct VecPlan {
     /// Header parameter index of the primary induction variable.
     iv_index: usize,
     iv_ty: MirType,
+    /// The induction variable's step, `1` or `-1`. Lane `k` of a group is always the group's
+    /// `k`-th iteration — counter `i + dir·k` — so in a countdown the lanes run DOWN through
+    /// memory: a contiguous access loads the `W` elements ending at lane 0's and reverses them
+    /// with one shuffle per part ([`reverse_lanes`]), and every fold, merge and predicated access
+    /// sees lanes in iteration order exactly as in an ascending loop.
+    dir: i64,
     /// How to advance the trip: either a compile-time vector count, or `end` for `end - start`.
     trip: TripPlan,
     /// The group width: scalar iterations per vector iteration, `16 / narrowest lane bytes`.
@@ -618,7 +624,8 @@ struct EarlyExit {
 /// does is address memory and a vector load at `base + i` covers `i .. i+W-1` on its own. A body
 /// that reads it as a *value* — `if c == target`, `(i as f32)`, `o[i] = i` — needs the opposite:
 /// lane `k` must see `i + k`, the counter scalar iteration `i + k` would have had. That vector is
-/// `splat(i) + iota` (the step is 1, enforced by [`iv_verdict`]), and `iota` is exactly why
+/// `splat(i) + iota` (the step is 1 — or, in a countdown, `-1`, and the ramp `splat(i) - iota` —
+/// both enforced by [`iv_verdict`]), and `iota` is exactly why
 /// [`wukong_mir::Op::Iota`] exists — no expression over splatted scalars is lane-varying. When the
 /// counter is wider than the group's narrowest lane the ramp is split into parts like any other
 /// value, part `p` being `splat(i + p·L) + iota`.
@@ -662,6 +669,13 @@ enum TripPlan {
     /// header test's own signedness (`signed`) — see [`emit_trip`] for why the order test is not
     /// implied by the subtraction.
     Runtime { end: ValueId, signed: bool },
+    /// A countdown's `start - end` (`+ 1` when `inclusive`, the header test being `iv >= end`),
+    /// rounded down to a multiple of W, and zero unless the loop runs at all.
+    RuntimeDown {
+        end: ValueId,
+        signed: bool,
+        inclusive: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -966,10 +980,15 @@ fn only_dead_end_exits(f: &Function, l: &NaturalLoop) -> bool {
 /// and it is the largest single reason the corpus declines (a step that is not 1 accounts for more
 /// declines over `tests/run` than any other check). `plan_loop` repeats it, so this can only
 /// decline loops `plan_loop` would have declined.
+///
+/// A step of `-1` — a countdown, `while i > 0 { i = i - 1; .. }` or `while i >= 0 { ..; i = i - 1 }`
+/// — is accepted too: the group then walks down, lane `k` still being the group's `k`-th iteration
+/// ([`VecPlan::dir`]). `WUKONG_NO_REVERSE_VEC=1` restores the decline.
 fn iv_verdict(l: &NaturalLoop) -> Result<(), &'static str> {
     let idx = l.primary_iv.ok_or("no primary induction variable")?;
     let iv = &l.ivs[idx];
-    if iv.step != IvStep::Const(1) {
+    let reverse_ok = std::env::var_os("WUKONG_NO_REVERSE_VEC").is_none();
+    if iv.step != IvStep::Const(1) && !(reverse_ok && iv.step == IvStep::Const(-1)) {
         return Err("induction step is not 1");
     }
     if !iv.ty.is_int() || iv.ty == MirType::I1 {
@@ -1039,6 +1058,22 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
         .expect("iv_verdict accepted a primary induction variable")];
     let iv_index = iv.param_index;
     let iv_ty = iv.ty.clone();
+    let dir = iv.step.as_const().expect("iv_verdict accepted a constant step");
+    // A countdown widens the plain shapes: contiguous accesses (reversed per part), if-conversion,
+    // replication and the order-free and serial reductions. What reads "later" as "a larger
+    // counter" — a search's header bound, an arm's bounds check, an argmax's or FindLastIV's
+    // iteration order — and the interleave windows stay with ascending loops.
+    if dir == -1 {
+        if early.is_some() {
+            return Err("a countdown search loop");
+        }
+        if !len_checks.is_empty() {
+            return Err("a bounds check in a countdown's arm");
+        }
+        if l.reductions.iter().any(|r| r.arg.is_some() || r.kind == RedKind::FindLast) {
+            return Err("an index-recording reduction in a countdown");
+        }
+    }
 
     // ---- dependence ---------------------------------------------------------------------------
     if !l.is_vectorizable_shape() {
@@ -1064,6 +1099,9 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
     let iv_value_use = classify_iv_uses(f, &lin, iv.value, &arg_merges)
         .ok_or("the induction variable is used for something other than addressing")?;
     let (groups, member) = interleave_groups(l)?;
+    if dir == -1 && !groups.is_empty() {
+        return Err("an interleave group in a countdown");
+    }
     access_shape_verdict(l, &member)?;
     group_order_verdict(l, &lin, groups.len(), &member)?;
 
@@ -1162,8 +1200,21 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
             end: *end,
             signed: *signed,
         },
-        // An inclusive bound would need `end + 1`, which overflows at `end == MAX`; a non-unit step
-        // is already excluded above.
+        // A countdown's inclusive bound (`i >= 0`) is fine: [`emit_trip`] adds the one only when
+        // the difference is below the type's maximum.
+        TripCount::Affine {
+            step: -1,
+            inclusive,
+            end,
+            signed,
+            ..
+        } => TripPlan::RuntimeDown {
+            end: *end,
+            signed: *signed,
+            inclusive: *inclusive,
+        },
+        // An ascending inclusive bound would need `end + 1`, which overflows at `end == MAX`; any
+        // other step is already excluded above.
         _ => return Err("trip count is not a unit-step half-open range"),
     };
 
@@ -1181,7 +1232,17 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
     if let Some(x) = &early {
         early_exit_verdict(f, l, &lin, &plans, x, iv.value, iv.start)?;
     }
-    let mut cost = estimate_cost(f, &lin, &plans, &vector_ty, &reductions, body, w, scalar_path);
+    let mut cost = estimate_cost(
+        f,
+        &lin,
+        &plans,
+        &vector_ty,
+        &reductions,
+        body,
+        w,
+        scalar_path,
+        dir,
+    );
     if early.is_some() {
         // The lane test: a reduction over the mask's lanes, an extract and a branch.
         cost.0 += 2 + 2 * u64::from(w.trailing_zeros());
@@ -1194,6 +1255,7 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
         preheader,
         iv_index,
         iv_ty,
+        dir,
         trip,
         w,
         plans,
@@ -1244,6 +1306,7 @@ fn estimate_cost(
     latch: BlockId,
     w: u32,
     scalar_path: Option<u64>,
+    dir: i64,
 ) -> (u64, u64) {
     let w64 = u64::from(w);
     let parts = |t: &MirType| lanes_of(t).map_or(1, |l| u64::from((w / l).max(1)));
@@ -1323,9 +1386,9 @@ fn estimate_cost(
         vector += match plan {
             Plan::Scalar => 1,
             Plan::InvariantPtrLoad | Plan::Reduce => 0,
-            Plan::Widen | Plan::Cast(_) | Plan::VecLoad | Plan::VecStore | Plan::Merge => {
-                parts(&step_ty(s))
-            }
+            Plan::Widen | Plan::Cast(_) | Plan::Merge => parts(&step_ty(s)),
+            // A countdown reverses each part of a contiguous access with one shuffle.
+            Plan::VecLoad | Plan::VecStore => parts(&step_ty(s)) * if dir < 0 { 2 } else { 1 },
             Plan::MaskedStore | Plan::GroupLoad { .. } | Plan::GroupStore { .. } => {
                 2 * parts(&step_ty(s))
             }
@@ -2843,7 +2906,8 @@ fn access_shape_verdict(
 /// groups and, per member access, `(group, residue)`.
 ///
 /// Any other strided access is left out here and declined by [`access_shape_verdict`] — including
-/// a negative stride, which is a reverse walk this pass does not form.
+/// a negative stride on an ascending counter (`x[n - 1 - i]`). A countdown's `x[i]` has stride
+/// `+1` against its own counter and is widened ([`VecPlan::dir`]); its groups are not formed.
 #[allow(clippy::type_complexity)]
 fn interleave_groups(
     l: &NaturalLoop,
@@ -4298,7 +4362,9 @@ fn apply(f: &mut Function, p: &VecPlan) {
         }
         None => n_vec,
     };
-    let vec_end = e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Add, start, n_vec));
+    // A countdown's vector loop runs the counter down to `start - n_vec`.
+    let toward = if p.dir > 0 { BinOp::Add } else { BinOp::Sub };
+    let vec_end = e.push(guard, p.iv_ty.clone(), Op::Bin(toward, start, n_vec));
     let mut guard_args = guard_params.clone();
     for r in &vacc {
         // An argmax's partials need no identity: every lane starts at the scalar loop's own
@@ -4457,6 +4523,43 @@ fn emit_trip(e: &mut Emit<'_>, p: &VecPlan, guard: BlockId, start: ValueId) -> V
             let zero = e.int(guard, &p.iv_ty, 0);
             e.push(guard, p.iv_ty.clone(), Op::Select(ok, masked, zero))
         }
+        // A countdown runs `start - end` iterations (one more when the test is `iv >= end`). The
+        // same order test comes first — the loop runs at all only if `start > end` (`>=`) under
+        // the header's signedness — and the inclusive `+ 1` is taken only below the type's
+        // maximum, where it cannot wrap; a larger count reads as negative and runs no group.
+        TripPlan::RuntimeDown {
+            end,
+            signed,
+            inclusive,
+        } => {
+            let diff = e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Sub, start, *end));
+            let gt = match (signed, inclusive) {
+                (true, false) => CmpOp::Sgt,
+                (true, true) => CmpOp::Sge,
+                (false, false) => CmpOp::Ugt,
+                (false, true) => CmpOp::Uge,
+            };
+            let runs = e.push(guard, MirType::I1, Op::Cmp(gt, start, *end));
+            let (count, fits) = if *inclusive {
+                let one = e.int(guard, &p.iv_ty, 1);
+                let count = e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Add, diff, one));
+                // `diff + 1 > diff` fails exactly at the signed maximum.
+                let fits = e.push(guard, MirType::I1, Op::Cmp(CmpOp::Sgt, count, diff));
+                (count, Some(fits))
+            } else {
+                (diff, None)
+            };
+            let mask = e.int(guard, &p.iv_ty, !((p.w as i64) - 1));
+            let masked = e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::And, count, mask));
+            let min = e.int(guard, &p.iv_ty, p.w as i64 * MIN_TRIP_GROUPS as i64);
+            let big = e.push(guard, MirType::I1, Op::Cmp(CmpOp::Sge, count, min));
+            let mut ok = e.push(guard, MirType::I1, Op::Bin(BinOp::And, runs, big));
+            if let Some(fits) = fits {
+                ok = e.push(guard, MirType::I1, Op::Bin(BinOp::And, ok, fits));
+            }
+            let zero = e.int(guard, &p.iv_ty, 0);
+            e.push(guard, p.iv_ty.clone(), Op::Select(ok, masked, zero))
+        }
     }
 }
 
@@ -4521,12 +4624,28 @@ fn emit_alias_checks(e: &mut Emit<'_>, p: &VecPlan, guard: BlockId) -> Option<Va
     // The vector part spans `[start, start + n_vec)`; conservatively use the whole loop, whose
     // endpoints are already in hand, since a range that is too large only rejects more.
     let start = e.f.blocks[guard.0 as usize].params[p.iv_index];
-    let end = match &p.trip {
-        TripPlan::Const(n) => {
+    // The counters the loop runs through, as a half-open `[start, end)` in ascending order — a
+    // countdown's `(end, start]` (or `[end, start]`) turned around.
+    let one = e.int(guard, &p.iv_ty, 1);
+    let (start, end) = match &p.trip {
+        TripPlan::Const(n) if p.dir > 0 => {
             let k = e.int(guard, &p.iv_ty, *n as i64);
-            e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Add, start, k))
+            (start, e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Add, start, k)))
         }
-        TripPlan::Runtime { end, .. } => *end,
+        TripPlan::Const(n) => {
+            let k = e.int(guard, &p.iv_ty, *n as i64 - 1);
+            let lo = e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Sub, start, k));
+            (lo, e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Add, start, one)))
+        }
+        TripPlan::Runtime { end, .. } => (start, *end),
+        TripPlan::RuntimeDown { end, inclusive, .. } => {
+            let lo = if *inclusive {
+                *end
+            } else {
+                e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Add, *end, one))
+            };
+            (lo, e.push(guard, p.iv_ty.clone(), Op::Bin(BinOp::Add, start, one)))
+        }
     };
 
     let mut acc: Option<ValueId> = None;
@@ -4724,7 +4843,8 @@ fn emit_body(
 
     // The lane ramp, when the body reads the induction variable as a value: `splat(i) + iota`, so
     // lane `k` holds `i + k` — the counter scalar iteration `i + k` would have had. The step is 1
-    // (`iv_verdict`), and MIR `Add` wraps exactly as the scalar `i + 1` chain does, so the two agree
+    // (`iv_verdict`; a countdown's `-1` subtracts the same ramp, lane `k` holding `i - k`), and MIR
+    // `Add` wraps exactly as the scalar `i + 1` chain does, so the two agree
     // even across an integer overflow. The `iota` is a constant with no operands, so LICM lifts it
     // into the guard and only the `splat` and the `add` remain per group. A counter wider than the
     // group's narrowest lane is split into parts like any other value: part `p` is
@@ -4743,14 +4863,16 @@ fn emit_body(
         let iota = e.push(vb, vt.clone(), Op::Iota(vt.clone()));
         (0..parts_of(&ty, p.w))
             .map(|k| {
+                // A countdown's lane `k` holds `i - k`: the same ramp, subtracted.
+                let toward = if p.dir > 0 { BinOp::Add } else { BinOp::Sub };
                 let first = if k == 0 {
                     iv_scalar
                 } else {
                     let off = e.int(vb, &ty, (k as u32 * per_part) as i64);
-                    e.push(vb, ty.clone(), Op::Bin(BinOp::Add, iv_scalar, off))
+                    e.push(vb, ty.clone(), Op::Bin(toward, iv_scalar, off))
                 };
                 let base = e.push(vb, vt.clone(), Op::Splat(first));
-                e.push(vb, vt.clone(), Op::Bin(BinOp::Add, base, iota))
+                e.push(vb, vt.clone(), Op::Bin(toward, base, iota))
             })
             .collect()
     });
@@ -4798,14 +4920,7 @@ fn emit_body(
                 let ptr = resolve_uniform(&map, *ptr);
                 for (k, ((m, x), y)) in mask.iter().zip(&a).zip(&b).enumerate() {
                     let blended = e.push(vb, part_ty(&lane), Op::Select(*m, *x, *y));
-                    let at = part_ptr(e, vb, ptr, &lane, k);
-                    e.push_void(
-                        vb,
-                        Op::Store {
-                            ptr: at,
-                            value: blended,
-                        },
-                    );
+                    store_part(e, vb, ptr, &lane, k, blended, p.dir);
                 }
                 continue;
             }
@@ -4855,7 +4970,7 @@ fn emit_body(
                     .iter()
                     .enumerate()
                     .map(|(k, &bit)| {
-                        let own = elem_ptr(e, vb, ptr, ty, k as i64);
+                        let own = elem_ptr(e, vb, ptr, ty, p.dir * k as i64);
                         let at = e.push(vb, MirType::Ptr, Op::Select(bit, own, slot));
                         e.push(vb, ty.clone(), Op::Load(at, ty.clone()))
                     })
@@ -4885,7 +5000,7 @@ fn emit_body(
                 let bits = mask_lane_bools(e, vb, &map, *cond, p.w);
                 let slot = scratch_slot(e, &mut scratch, &lane_ty);
                 for (k, (&v, &bit)) in vals.iter().zip(&bits).enumerate() {
-                    let own = elem_ptr(e, vb, ptr, &lane_ty, k as i64);
+                    let own = elem_ptr(e, vb, ptr, &lane_ty, p.dir * k as i64);
                     let (a, b) = if *on_true { (own, slot) } else { (slot, own) };
                     let at = e.push(vb, MirType::Ptr, Op::Select(bit, a, b));
                     e.push_void(vb, Op::Store { ptr: at, value: v });
@@ -4898,8 +5013,7 @@ fn emit_body(
                 let ptr = resolve_uniform(&map, *ptr);
                 let parts = tree_vector(e, vb, &map, tree, &lane, p.w);
                 for (k, value) in parts.into_iter().enumerate() {
-                    let at = part_ptr(e, vb, ptr, &lane, k);
-                    e.push_void(vb, Op::Store { ptr: at, value });
+                    store_part(e, vb, ptr, &lane, k, value, p.dir);
                 }
                 continue;
             }
@@ -4912,7 +5026,7 @@ fn emit_body(
                 let (bits, vals) = tree_lanes(e, vb, &map, tree, p.w);
                 let vals = vals.expect("a store tree with a store has a value");
                 for (k, (&v, &bit)) in vals.iter().zip(&bits).enumerate() {
-                    let own = elem_ptr(e, vb, ptr, &lane, k as i64);
+                    let own = elem_ptr(e, vb, ptr, &lane, p.dir * k as i64);
                     let at = e.push(vb, MirType::Ptr, Op::Select(bit, own, slot));
                     e.push_void(vb, Op::Store { ptr: at, value: v });
                 }
@@ -4968,12 +5082,8 @@ fn emit_body(
                     unreachable!("VecLoad plan on a non-load")
                 };
                 let ptr = resolve_uniform(&map, *ptr);
-                let vty = part_ty(ty);
                 let parts = (0..parts_of(ty, p.w))
-                    .map(|k| {
-                        let at = part_ptr(e, vb, ptr, ty, k);
-                        e.push(vb, vty.clone(), Op::Load(at, vty.clone()))
-                    })
+                    .map(|k| load_part(e, vb, ptr, ty, k, p.dir))
                     .collect();
                 map.insert(
                     inst.result.expect("load has a result").0,
@@ -4988,8 +5098,7 @@ fn emit_body(
                 let ptr = resolve_uniform(&map, *ptr);
                 let values = to_vector(e, vb, &map, *value, &lane, p.w);
                 for (k, value) in values.into_iter().enumerate() {
-                    let at = part_ptr(e, vb, ptr, &lane, k);
-                    e.push_void(vb, Op::Store { ptr: at, value });
+                    store_part(e, vb, ptr, &lane, k, value, p.dir);
                 }
             }
             Plan::Replicate | Plan::LaneGep => {
@@ -5007,7 +5116,9 @@ fn emit_body(
                     }
                     let lanes = if p.ramp.reads_as_value(i, u) {
                         iv_lanes
-                            .get_or_insert_with(|| iv_lane_values(e, vb, iv_scalar, &p.iv_ty, p.w))
+                            .get_or_insert_with(|| {
+                                iv_lane_values(e, vb, iv_scalar, &p.iv_ty, p.w, p.dir)
+                            })
                             .clone()
                     } else {
                         lane_values(e, vb, &map, u, p.w)
@@ -5237,7 +5348,7 @@ fn emit_body(
     let mut out = Vec::with_capacity(latch_args.len());
     for (k, a) in latch_args.iter().enumerate() {
         if k == p.iv_index {
-            let step = e.int(vb, &p.iv_ty, p.w as i64);
+            let step = e.int(vb, &p.iv_ty, p.dir * p.w as i64);
             out.push(e.push(vb, p.iv_ty.clone(), Op::Bin(BinOp::Add, vh_params[k], step)));
         } else if let Some(&acc) = acc_of.get(&k) {
             out.push(acc);
@@ -5875,6 +5986,62 @@ fn part_ptr(e: &mut Emit<'_>, vb: BlockId, ptr: ValueId, elem: &MirType, k: usiz
     elem_ptr(e, vb, ptr, elem, k as i64 * per_part as i64)
 }
 
+/// Part `k` of a contiguous access whose lane 0 is at `ptr`, loaded with its lanes in iteration
+/// order. Ascending, that is the `L` elements from `k·L` on; in a countdown it is the `L` elements
+/// ENDING `k·L` below `ptr`, loaded as one vector and reversed ([`reverse_lanes`]), so lane `j`
+/// holds element `ptr - (k·L + j)` — iteration `k·L + j`'s.
+fn load_part(
+    e: &mut Emit<'_>,
+    vb: BlockId,
+    ptr: ValueId,
+    elem: &MirType,
+    k: usize,
+    dir: i64,
+) -> ValueId {
+    let vty = part_ty(elem);
+    if dir > 0 {
+        let at = part_ptr(e, vb, ptr, elem, k);
+        return e.push(vb, vty.clone(), Op::Load(at, vty));
+    }
+    let per_part = i64::from(lanes_of(elem).expect("a widened access has a vector width"));
+    let at = elem_ptr(e, vb, ptr, elem, -(k as i64 * per_part + per_part - 1));
+    let v = e.push(vb, vty.clone(), Op::Load(at, vty));
+    reverse_lanes(e, vb, v)
+}
+
+/// The store mirror of [`load_part`]: `value`'s lanes are in iteration order, so a countdown
+/// reverses them and stores the part where its last lane's element begins.
+fn store_part(
+    e: &mut Emit<'_>,
+    vb: BlockId,
+    ptr: ValueId,
+    elem: &MirType,
+    k: usize,
+    value: ValueId,
+    dir: i64,
+) {
+    let (at, value) = if dir > 0 {
+        (part_ptr(e, vb, ptr, elem, k), value)
+    } else {
+        let per_part = i64::from(lanes_of(elem).expect("a widened access has a vector width"));
+        let at = elem_ptr(e, vb, ptr, elem, -(k as i64 * per_part + per_part - 1));
+        (at, reverse_lanes(e, vb, value))
+    };
+    e.push_void(vb, Op::Store { ptr: at, value });
+}
+
+/// `v` with its lanes in the opposite order: one single-source shuffle. Lane `j` of the result is
+/// lane `n - 1 - j` of `v`, bit for bit, so nothing is computed — a float lane's NaN payload and
+/// sign survive.
+fn reverse_lanes(e: &mut Emit<'_>, vb: BlockId, v: ValueId) -> ValueId {
+    let vty = e_ty(e, v);
+    let MirType::Vec(_, n) = vty else {
+        unreachable!("a widened part is a vector")
+    };
+    let mask: Vec<u8> = (0..n).rev().map(|j| j as u8).collect();
+    e.push(vb, vty, Op::Shuffle { a: v, b: v, mask })
+}
+
 /// `ptr` moved by `delta` elements of `elem` (`ptr` itself for zero).
 fn elem_ptr(e: &mut Emit<'_>, vb: BlockId, ptr: ValueId, elem: &MirType, delta: i64) -> ValueId {
     if delta == 0 {
@@ -6437,14 +6604,16 @@ fn iv_lane_values(
     iv: ValueId,
     ty: &MirType,
     w: u32,
+    dir: i64,
 ) -> Vec<ValueId> {
+    let toward = if dir > 0 { BinOp::Add } else { BinOp::Sub };
     (0..w)
         .map(|k| {
             if k == 0 {
                 iv
             } else {
                 let off = e.int(vb, ty, i64::from(k));
-                e.push(vb, ty.clone(), Op::Bin(BinOp::Add, iv, off))
+                e.push(vb, ty.clone(), Op::Bin(toward, iv, off))
             }
         })
         .collect()
@@ -8856,6 +9025,88 @@ mod tests {
                       else if v > 0.0 { o[i] = 3.0; } i = i + 1; } } \
                       fn main() -> i32 { return 0; }";
         assert!(!is_widened(reread, "k"), "a load after a store on one path");
+    }
+
+    // ---- countdowns ------------------------------------------------------------------------------
+
+    /// `while i > 0 { i = i - 1; .. }` and `while i >= 0 { ..; i = i - 1 }`: the group walks down,
+    /// each contiguous access one load or store of the `W` elements ending at lane 0's, reversed
+    /// with a shuffle so lane `k` is still iteration `k`. An `f32` sum keeps its serial fold in
+    /// that (descending) order — the data makes any other order round differently — and every
+    /// trip `0..=23` moves the vector/epilogue split through every position.
+    #[test]
+    fn a_countdown_widens_with_reversed_lanes_and_agrees() {
+        let k = "@unchecked fn down(x: []f32, mut o: []f32, n: i64) { let mut i: i64 = n; \
+                   while i > 0 { i = i - 1; o[i] = x[i] * 2.0 + 1.0; } } \
+                 @unchecked fn down_ge(x: []f32, mut o: []f32, n: i64) { let mut i: i64 = n - 1; \
+                   while i >= 0 { o[i] = x[i] - (i as f32); i = i - 1; } } \
+                 @unchecked fn dsum(x: []f32, n: i64) -> f32 { let mut s: f32 = 0.0; \
+                   let mut i: i64 = n; while i > 0 { i = i - 1; s = s + x[i]; } return s; } \
+                 @unchecked fn isum(y: []i32, n: i64) -> i32 { let mut s: i32 = 7; \
+                   let mut i: i64 = n; while i > 0 { i = i - 1; s = s + y[i] * 3; } return s; } \
+                 @unchecked fn sel(x: []f32, mut o: []f32, n: i64) { let mut i: i64 = n; \
+                   while i > 0 { i = i - 1; if x[i] > 0.0 { o[i] = x[i]; } else { o[i] = -1.0; } } }";
+        let shape = format!("{k} fn main() -> i32 {{ return 0; }}");
+        for f in ["down", "down_ge", "dsum", "isum", "sel"] {
+            assert!(is_widened(&shape, f), "countdown {f} did not widen");
+        }
+        let ops = ops_of(&shape, "down");
+        assert!(
+            ops.iter().any(|op| matches!(op, Op::Shuffle { mask, .. } if mask == &vec![3, 2, 1, 0])),
+            "a countdown reverses its lanes: {ops:?}"
+        );
+        scalar_and_vector_agree(&format!(
+            "{k} fn main() -> i32 {{ let mut x: []f32 = alloc_f32(23); \
+             let mut y: []i32 = alloc_i32(23); let mut o: []f32 = alloc_f32(23); \
+             let mut j: i64 = 0; \
+             while j < 23 {{ x[j] = (((j * 5) % 7) as f32) - 2.5; y[j] = ((j * 3) % 11) as i32; \
+               j = j + 1; }} \
+             x[3] = 100000000.0; x[17] = -100000000.0; \
+             let mut n: i64 = 0; \
+             while n <= 23 {{ j = 0; while j < 23 {{ o[j] = -7.0; j = j + 1; }} \
+               down(x, o, n); j = 0; while j < 23 {{ print((o[j] * 4.0) as i32); j = j + 1; }} \
+               down_ge(x, o, n); j = 0; while j < 23 {{ print((o[j] * 4.0) as i32); j = j + 1; }} \
+               sel(x, o, n); j = 0; while j < 23 {{ print((o[j] * 4.0) as i32); j = j + 1; }} \
+               print(bits(dsum(x, n))); print(isum(y, n)); n = n + 1; }} \
+             return 0; }}"
+        ));
+    }
+
+    /// A countdown over bytes widened to floats: sixteen lanes, four `f32` parts, so the parts
+    /// themselves must come out in descending order too.
+    #[test]
+    fn a_countdown_over_mixed_widths_orders_its_parts() {
+        let k = "@unchecked fn k(q: []u8, mut o: []f32, n: i64) { let mut i: i64 = n; \
+                 while i > 0 { i = i - 1; o[i] = (q[i] as f32) * 0.5; } }";
+        let shape = format!("{k} fn main() -> i32 {{ return 0; }}");
+        let vs = vector_values(&shape, "k");
+        assert!(vs.contains(&(MirType::I8, 16)), "no 16-lane byte vector: {vs:?}");
+        scalar_and_vector_agree(&format!(
+            "{k} fn main() -> i32 {{ let mut q: []u8 = alloc_u8(41); let mut o: []f32 = alloc_f32(41); \
+             let mut j: i64 = 0; while j < 41 {{ q[j] = ((j * 37 + 11) % 251) as u8; j = j + 1; }} \
+             let mut n: i64 = 30; \
+             while n <= 41 {{ k(q, o, n); j = 0; \
+               while j < 41 {{ print((o[j] * 2.0) as i32); j = j + 1; }} n = n + 1; }} \
+             return 0; }}"
+        ));
+    }
+
+    /// What a countdown keeps scalar: a search, an argmax (its fold reads iteration order as
+    /// counter order), and `WUKONG_NO_REVERSE_VEC` is not set here, so the plain body widens.
+    #[test]
+    fn countdown_shapes_that_read_counter_order_are_declined() {
+        let search = "fn find(t: f32) -> i64 { \
+                      let mut a: [f32; 18] = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, \
+                        4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5]; \
+                      let mut i: i64 = 17; \
+                      while i >= 0 { if a[i] < t { break; } i = i - 1; } return i; } \
+                      fn main() -> i32 { return 0; }";
+        assert!(!is_widened(search, "find"), "a countdown search");
+        let argmax = "@unchecked fn k(x: []f32, n: i64) -> i64 { let mut m: f32 = -100.0; \
+                      let mut at: i64 = -1; let mut i: i64 = n; \
+                      while i > 0 { i = i - 1; if x[i] > m { m = x[i]; at = i; } } return at; } \
+                      fn main() -> i32 { return 0; }";
+        assert!(!is_widened(argmax, "k"), "a countdown argmax");
     }
 
     // ---- zero-trip and sub-group trips ---------------------------------------------------------
