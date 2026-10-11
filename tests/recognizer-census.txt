@@ -169,6 +169,7 @@ fmax_int.wk:
 fn_params.wk:
 for_array.wk:
 for_continue.wk:
+for_destructure.wk:
 for_each_array_of_slices.wk: wukong_rt_alloc wukong_rt_alloc*3 wukong_velem_f32
 for_range_unsigned_bound.wk:
 for_step.wk:

@@ -13,15 +13,21 @@
 //!   way out — since the names the pattern binds do not exist on that path.
 //! * A plain `let` pattern must be irrefutable (`E0442`, Rust's E0005): `let Shape::Circle { r } =
 //!   s;` would leave `r` unbound for every other shape. The witness names a value it misses.
+//! * A destructuring `for` head (`for (i, x) in pairs`, `for Point { x, y } in pts`) binds each
+//!   element as `let <pat> = a[i];` would, over an array or slice only (`E0401` for a range or any
+//!   other iterand), and is never tested, so it must be irrefutable by its form (`E0442`).
 
 use wukong_ast::{
-    ArmOrigin, Block, Expr, ExprKind, FieldPat, MatchArm, Path, Pattern, Stmt, StmtKind,
+    ArmOrigin, Block, Expr, ExprKind, FieldPat, ForIter, MatchArm, PatKind, Path, Pattern, Stmt,
+    StmtKind, VariantPat,
 };
 use wukong_diag::Diagnostic;
 use wukong_span::Span;
 use wukong_types::Ty;
 
-use crate::{arm_is_catch_all, block_contains_break, usefulness, DefKind, Sema};
+use crate::{
+    arm_is_catch_all, block_contains_break, usefulness, DefKind, DefMap, Sema, VariantPayload,
+};
 
 impl Sema<'_> {
     /// Type-check and bind a struct pattern `path { fields }` against a value of type `ty`.
@@ -157,10 +163,12 @@ impl Sema<'_> {
         }
     }
 
-    /// `E0442` when the pattern of a plain `let` does not match every value of `ty`.
-    pub(crate) fn check_irrefutable_let(&mut self, pat: &Pattern, ty: &Ty) {
+    /// `E0442` when the pattern of a plain `let` or a `for` head does not match every value of
+    /// `ty`, naming a value it misses. Whether it reported: the analysis is silent on a pattern it
+    /// cannot place, which a `for` head ([`Sema::check_for_pattern`]) must still reject.
+    pub(crate) fn check_irrefutable(&mut self, pat: &Pattern, ty: &Ty, site: PatSite) -> bool {
         let Some(w) = usefulness::refutable(&self.defs, self.interner, ty, pat) else {
-            return;
+            return false;
         };
         let more = if w.more == 0 {
             String::new()
@@ -169,16 +177,239 @@ impl Sema<'_> {
         };
         self.diags.push(
             Diagnostic::error(format!(
-                "refutable pattern in `let`: `{}`{more} not covered",
+                "refutable pattern in {}: `{}`{more} not covered",
+                site.what(),
                 w.pattern
             ))
             .with_code("E0442")
             .primary(pat.span, format!("pattern `{}` not covered", w.pattern))
-            .help(
-                "a `let` pattern must match every value; use `let … else { … }` to leave on the \
-                 others, or a `match`",
-            ),
+            .help(site.help()),
         );
+        true
+    }
+
+    /// The destructuring pattern of `for <pat> in <iter>` (anything but a name or `_`), whose
+    /// element type is `elem`. It binds as `let <pat> = a[i];` would, at each element's place,
+    /// and it is never tested, so it must be irrefutable by its FORM: built only from names, `_`,
+    /// tuples, structs, array patterns, `name @ sub` and the variant of a one-variant enum. A
+    /// literal, range, path, or-pattern or multi-variant enum variant anywhere inside is `E0442`,
+    /// even where the analysis would prove it total (`0..=255` on a `u8`) or cannot place it
+    /// (`(0, x)` on an `(f32, i32)`): a rule by form leaves nothing for lowering to test.
+    pub(crate) fn check_for_pattern(&mut self, pat: &Pattern, iter: &ForIter, elem: &Ty) {
+        let it = match iter {
+            ForIter::Range { .. } => {
+                self.diags.push(
+                    Diagnostic::error(
+                        "a range `for` binds one integer and cannot be destructured".to_string(),
+                    )
+                    .with_code("E0401")
+                    .primary(pat.span, "a range yields a single integer")
+                    .help("bind a name (`for i in 0..n`) and index with it"),
+                );
+                return;
+            }
+            ForIter::Expr(it) => it,
+        };
+        match self.types.get(&it.id) {
+            Some(Ty::Array { .. } | Ty::Slice(_) | Ty::Unknown | Ty::Error) | None => {}
+            Some(other) => {
+                let shown = other.display(self.interner);
+                self.diags.push(
+                    Diagnostic::error(format!(
+                        "only a `for` over an array or slice can destructure its element; this \
+                         iterates a `{shown}`"
+                    ))
+                    .with_code("E0401")
+                    .primary(pat.span, "this pattern destructures each element")
+                    .help("bind a name (`for x in …`) and destructure it in the loop body"),
+                );
+                return;
+            }
+        }
+        if !self.check_pattern_shape(pat, elem) {
+            return;
+        }
+        let Some(r) = refutable_form(pat, &self.defs) else {
+            return;
+        };
+        if !self.check_irrefutable(pat, elem, PatSite::ForHead) {
+            self.diags.push(
+                Diagnostic::error(
+                    "refutable pattern in `for` head: this pattern tests each element",
+                )
+                .with_code("E0442")
+                .primary(
+                    r.span,
+                    "a literal, range, path, or-pattern or enum variant tests the element",
+                )
+                .help(PatSite::ForHead.help()),
+            );
+        }
+    }
+
+    /// `E0401` for a tuple pattern against a value that is not a tuple of its arity, anywhere
+    /// inside `pat` matched against `ty` (struct, variant and array sub-patterns reach their field
+    /// types; the other mismatches have their own reports in [`Sema::bind_pattern`]). Whether the
+    /// pattern is well-shaped.
+    fn check_pattern_shape(&mut self, pat: &Pattern, ty: &Ty) -> bool {
+        match &pat.kind {
+            PatKind::Tuple(subs) => match ty {
+                Ty::Tuple(tys) if tys.len() == subs.len() => {
+                    let tys = tys.clone();
+                    let mut ok = true;
+                    for (p, t) in subs.iter().zip(&tys) {
+                        ok &= self.check_pattern_shape(p, t);
+                    }
+                    ok
+                }
+                Ty::Unknown | Ty::Error => true,
+                other => {
+                    let shown = other.display(self.interner);
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "mismatched pattern: a tuple pattern cannot match `{shown}`"
+                        ))
+                        .with_code("E0401")
+                        .primary(
+                            pat.span,
+                            format!("this tuple pattern has {} element(s)", subs.len()),
+                        ),
+                    );
+                    false
+                }
+            },
+            PatKind::Binding { sub, .. } => self.check_pattern_shape(sub, ty),
+            PatKind::Slice { prefix, suffix, .. } => {
+                let Ty::Array { elem, .. } = ty else {
+                    return true;
+                };
+                let elem = (**elem).clone();
+                let mut ok = true;
+                for p in prefix.iter().chain(suffix) {
+                    ok &= self.check_pattern_shape(p, &elem);
+                }
+                ok
+            }
+            PatKind::Struct { fields, .. } => {
+                let Ty::Named(n) = ty else {
+                    return true;
+                };
+                let Some(DefKind::Struct(decl)) = self.defs.lookup(*n).map(|d| &d.kind) else {
+                    return true;
+                };
+                let decl = decl.clone();
+                let mut ok = true;
+                for fp in fields {
+                    if let Some((_, t)) = decl.iter().find(|(f, _)| *f == fp.name) {
+                        ok &= self.check_pattern_shape(&fp.pat, t);
+                    }
+                }
+                ok
+            }
+            PatKind::Variant { path, fields } => {
+                let Some(payload) = variant_payload(path, &self.defs) else {
+                    return true;
+                };
+                let mut ok = true;
+                match (fields, payload) {
+                    (VariantPat::Tuple(subs), VariantPayload::Tuple(tys)) => {
+                        for (p, t) in subs.iter().zip(&tys) {
+                            ok &= self.check_pattern_shape(p, t);
+                        }
+                    }
+                    (VariantPat::Struct(fps), VariantPayload::Struct(named)) => {
+                        for fp in fps {
+                            if let Some((_, t)) = named.iter().find(|(n, _)| *n == fp.name) {
+                                ok &= self.check_pattern_shape(&fp.pat, t);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                ok
+            }
+            _ => true,
+        }
+    }
+}
+
+/// Where an irrefutable pattern is required, for E0442's wording.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PatSite {
+    /// A plain `let` (`let … else` is the refutable form).
+    Let,
+    /// The pattern of `for <pat> in <array or slice>`.
+    ForHead,
+}
+
+impl PatSite {
+    fn what(self) -> &'static str {
+        match self {
+            PatSite::Let => "`let`",
+            PatSite::ForHead => "`for` head",
+        }
+    }
+
+    fn help(self) -> &'static str {
+        match self {
+            PatSite::Let => {
+                "a `let` pattern must match every value; use `let … else { … }` to leave on the \
+                 others, or a `match`"
+            }
+            PatSite::ForHead => {
+                "a `for` pattern must match every element; match inside the loop body instead"
+            }
+        }
+    }
+}
+
+/// The payload of the variant `Enum::Variant` names, when it resolves.
+fn variant_payload(path: &Path, defs: &DefMap) -> Option<VariantPayload> {
+    let (Some(ename), Some(vname)) = (path.segments.first(), path.segments.last()) else {
+        return None;
+    };
+    match defs.lookup(ename.sym).map(|d| &d.kind) {
+        Some(DefKind::Enum(vs)) => vs
+            .iter()
+            .find(|v| v.name == vname.sym)
+            .map(|v| v.payload.clone()),
+        _ => None,
+    }
+}
+
+/// The first sub-pattern of `pat` that makes it refutable by its FORM (see
+/// [`Sema::check_for_pattern`]): a literal, range, path or or-pattern, or the variant of an enum
+/// with more than one variant (or of a name that is not a declared enum).
+fn refutable_form<'p>(pat: &'p Pattern, defs: &DefMap) -> Option<&'p Pattern> {
+    match &pat.kind {
+        PatKind::Wildcard | PatKind::Ident(_) | PatKind::Unit => None,
+        PatKind::Int { .. }
+        | PatKind::Char(_)
+        | PatKind::Bool(_)
+        | PatKind::Range { .. }
+        | PatKind::Path(_)
+        | PatKind::Or(_) => Some(pat),
+        PatKind::Tuple(subs) => subs.iter().find_map(|p| refutable_form(p, defs)),
+        PatKind::Binding { sub, .. } => refutable_form(sub, defs),
+        PatKind::Struct { fields, .. } => {
+            fields.iter().find_map(|fp| refutable_form(&fp.pat, defs))
+        }
+        PatKind::Slice { prefix, suffix, .. } => prefix
+            .iter()
+            .chain(suffix)
+            .find_map(|p| refutable_form(p, defs)),
+        PatKind::Variant { path, fields } => {
+            let one_variant = path.segments.first().is_some_and(|e| {
+                matches!(defs.lookup(e.sym).map(|d| &d.kind), Some(DefKind::Enum(vs)) if vs.len() == 1)
+            });
+            if !one_variant {
+                return Some(pat);
+            }
+            match fields {
+                VariantPat::Tuple(subs) => subs.iter().find_map(|p| refutable_form(p, defs)),
+                VariantPat::Struct(fps) => fps.iter().find_map(|fp| refutable_form(&fp.pat, defs)),
+            }
+        }
     }
 }
 
@@ -357,6 +588,77 @@ mod tests {
                 "{SHAPE}fn f(s: Shape) -> i32 {{ let Shape::Circle(r) = s else {{ print(0); }}; \
                  return r; }}"
             ),
+            "E0401",
+        );
+    }
+
+    #[test]
+    fn destructuring_for_heads() {
+        // Tuples, structs, arrays, `@`, nesting and a one-variant enum, over arrays and slices.
+        assert_clean(
+            "fn f(ps: [(i32, f32); 2]) -> f32 { let mut t = 0.0; for (i, x) in ps { \
+             t = t + x * (i as f32); } return t; }",
+        );
+        assert_clean(&format!(
+            "{POINT}fn f(ps: []Point) -> i32 {{ let mut t = 0; for Point {{ x, y }} in ps {{ \
+             t = t + x - y; }} return t; }}"
+        ));
+        assert_clean(&format!(
+            "{POINT}fn f(ps: [Point; 2]) -> i32 {{ let mut t = 0; for Point {{ x, .. }} in ps {{ \
+             t = t + x; }} return t; }}"
+        ));
+        assert_clean(
+            "fn f(rs: [[i32; 3]; 2]) -> i32 { let mut t = 0; for [a, .., z] in rs { \
+             t = t + a * z; } return t; }",
+        );
+        assert_clean(
+            "fn f(ts: [((i32, i32), i32); 2]) -> i32 { let mut t = 0; for ((a, b), c) in ts { \
+             t = t + a + b + c; } return t; }",
+        );
+        assert_clean(
+            "fn f(ts: [(i32, i32); 2]) -> i32 { let mut t = 0; for w @ (a, _) in ts { \
+             t = t + a + w.1; } return t; }",
+        );
+        assert_clean(
+            "enum W { Only(i32) } fn f(ws: [W; 2]) -> i32 { let mut t = 0; \
+             for W::Only(v) in ws { t = t + v; } return t; }",
+        );
+    }
+
+    #[test]
+    fn refutable_or_misplaced_for_heads() {
+        // A literal tests the element, whatever the analysis can say about it.
+        assert_code(
+            "fn f(ps: [(i32, i32); 2]) -> i32 { let mut t = 0; for (0, x) in ps { t = t + x; } \
+             return t; }",
+            "E0442",
+        );
+        assert_code(
+            "fn f(ps: [(f32, i32); 2]) -> i32 { let mut t = 0; for (_, 1..=9) in ps { t = t + 1; } \
+             return t; }",
+            "E0442",
+        );
+        assert_code(
+            &format!(
+                "{SHAPE}fn f(ss: [Shape; 2]) -> i32 {{ let mut t = 0; \
+                 for Shape::Circle(r) in ss {{ t = t + r; }} return t; }}"
+            ),
+            "E0442",
+        );
+        // A range binds one integer; a tensor or any non-array iterand is not destructured.
+        assert_code(
+            "fn f() -> i32 { let mut t = 0; for (a, b) in 0..4 { t = t + a + b; } return t; }",
+            "E0401",
+        );
+        // A tuple pattern of the wrong arity, or over a non-tuple element.
+        assert_code(
+            "fn f(ps: [(i32, i32); 2]) -> i32 { let mut t = 0; for (a, b, c) in ps { \
+             t = t + a + b + c; } return t; }",
+            "E0401",
+        );
+        assert_code(
+            "fn f(ps: [i32; 2]) -> i32 { let mut t = 0; for (a, b) in ps { t = t + a + b; } \
+             return t; }",
             "E0401",
         );
     }

@@ -2890,7 +2890,7 @@ impl<'a> Sema<'a> {
                 // A `let` pattern must match every value (E0442; `let … else` is the refutable
                 // form, and the parser has already rewritten it).
                 if !matches!(pat.kind, PatKind::Ident(_) | PatKind::Wildcard) {
-                    self.check_irrefutable_let(pat, &bound);
+                    self.check_irrefutable(pat, &bound, patterns::PatSite::Let);
                 }
                 if let Ty::Array {
                     shared: true,
@@ -3300,6 +3300,10 @@ impl<'a> Sema<'a> {
                 let elem = self.type_for_iter(iter);
                 self.push_scope();
                 self.bind_pattern(pat, &elem);
+                // A destructuring head binds each element untested (`patterns.rs`).
+                if !matches!(pat.kind, PatKind::Ident(_) | PatKind::Wildcard) {
+                    self.check_for_pattern(pat, iter, &elem);
+                }
                 self.note_nonneg_counter(pat, iter, body);
                 if let ForIter::Expr(it) = iter {
                     self.note_tensor_view(pat, &elem, Some(it));

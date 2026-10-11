@@ -1,0 +1,14 @@
+// EXPECT-CODE: E0401
+// EXPECT-COUNT: 1
+module tests.fail.for_range_destructure
+
+// A range `for` binds one integer per iteration; there is nothing to destructure. Only a `for`
+// over an array or a slice can destructure its element (`for (a, b) in pairs`).
+fn main() -> i32 {
+    let mut t: i32 = 0;
+    for (a, b) in 0..4 { //~ E0401
+        t = t + a + b;
+    }
+    print(t);
+    return 0;
+}

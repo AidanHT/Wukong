@@ -14594,11 +14594,13 @@ impl FnLowerer<'_> {
                 step,
             } => (start, end, *inclusive, step),
             _ => {
-                // `for <pat> in arr` over a fixed-size array desugars to the indexed range loop
-                // `for i in 0..N { let <pat> = arr[i]; <body> }` — a pure front-end rewrite reusing
-                // the existing Gep/Load/CFG, so the interpreter and native backend agree bit-for-bit
-                // with no backend change. Anything not a statically-sized array (a tensor, slice,
-                // dynamic length, or a non-`Ident`/`_` pattern) declines and stays unsupported.
+                // `for <pat> in arr` over a fixed-size array or a slice desugars to the indexed
+                // range loop `for i in 0..N { let <pat> = arr[i]; <body> }` — a pure front-end
+                // rewrite reusing the existing Gep/Load/CFG, so the interpreter and native backend
+                // agree bit-for-bit with no backend change. `<pat>` is a name, `_`, or a
+                // destructuring pattern sema proved irrefutable (`for (i, x) in pairs`). A tensor
+                // iterates its leading axis (`lower_for_tensor`); anything else (a literal head, an
+                // iterand of another type) declines and stays unsupported.
                 if let ForIter::Expr(e) = iter {
                     if self.lower_for_array(label, pat, e, body) {
                         return;
@@ -15615,15 +15617,21 @@ impl FnLowerer<'_> {
         true
     }
 
-    /// Desugar `for <pat> in <array>` — iterate the elements of a fixed-size array — into the same
-    /// CFG the indexed range loop `for i in 0..N { let <pat> = <array>[i]; <body> }` produces.
-    /// Returns `true` if it handled the loop. It fires only when the iterand's sema type is a
-    /// statically sized `[T; N]` and the pattern is an identifier (`for x in a`) or `_` wildcard
-    /// (`for _ in a`); anything else (a tensor, slice, dynamic length, or a destructuring pattern)
-    /// returns `false` so the caller emits the existing `unsupported` diagnostic. Pure desugaring:
-    /// the array base pointer + per-iteration `Gep`/`Load` are exactly what `for i in 0..N { let x
-    /// = a[i]; … }` already lowers to, so the interpreter and native backend agree bit-for-bit with
-    /// **no backend change** (and `-O0`==`-O3`, since recognition runs pre-opt like the rest).
+    /// Desugar `for <pat> in <array>` — iterate the elements of a fixed-size array or a slice —
+    /// into the same CFG the indexed range loop `for i in 0..N { let <pat> = <array>[i]; <body> }`
+    /// produces. Returns `true` if it handled the loop. It fires when the iterand's sema type is a
+    /// statically sized `[T; N]` or a `[]T` slice (a tensor goes to `lower_for_tensor`) and the
+    /// pattern is an identifier (`for x in a`), `_` (`for _ in a`), or an irrefutable destructuring
+    /// pattern — a tuple, struct, array, `name @ sub` or one-variant-enum variant pattern
+    /// (`for (i, x) in pairs`, `for Point { x, y } in pts`). Sema has proved the destructuring
+    /// pattern irrefutable by its form (E0442, `check_for_pattern`), so it is bound, never
+    /// tested: at the element's place, exactly as a match arm binds it (`bind_field_pattern`), so
+    /// a scalar part is copied into a fresh slot (mutating it does not write back) and an
+    /// aggregate part is bound by pointer. Anything else returns `false`, and the caller emits
+    /// the `unsupported` diagnostic. Pure desugaring: the base pointer + per-iteration `Gep`/`Load`
+    /// are exactly what `for i in 0..N { let x = a[i]; … }` already lowers to, so the interpreter
+    /// and native backend agree bit-for-bit with **no backend change** (and `-O0`==`-O3`, since
+    /// recognition runs pre-opt like the rest).
     fn lower_for_array(
         &mut self,
         label: Option<Symbol>,
@@ -15631,11 +15639,20 @@ impl FnLowerer<'_> {
         e: &Expr,
         body: &Block,
     ) -> bool {
-        // Only a bare identifier (`for x in a`) or wildcard (`for _ in a`) is supported; a
-        // destructuring / literal pattern declines to the `unsupported` fallback.
-        let bind_name = match &pat.kind {
-            ast::PatKind::Ident(name) => Some(*name),
-            ast::PatKind::Wildcard => None,
+        /// What the loop pattern binds per element.
+        enum ForBind<'p> {
+            None,
+            Name(Symbol),
+            Destructure(&'p Pattern),
+        }
+        let bind = match &pat.kind {
+            ast::PatKind::Ident(name) => ForBind::Name(*name),
+            ast::PatKind::Wildcard => ForBind::None,
+            ast::PatKind::Tuple(_)
+            | ast::PatKind::Struct { .. }
+            | ast::PatKind::Slice { .. }
+            | ast::PatKind::Binding { .. }
+            | ast::PatKind::Variant { .. } => ForBind::Destructure(pat),
             _ => return false,
         };
         // The iterand must be a fixed-size **array** or a **slice**; both desugar to the indexed range
@@ -15645,7 +15662,10 @@ impl FnLowerer<'_> {
             Ty::Array { elem, .. } => (*elem, false),
             Ty::Slice(elem) => (*elem, true),
             // A tensor iterates its leading axis — elements, or row views (`shape_ops`).
-            Ty::Tensor { .. } => return self.lower_for_tensor(label, pat, e, body),
+            // (A destructuring head over a tensor is sema's E0401.)
+            Ty::Tensor { .. } if !matches!(bind, ForBind::Destructure(_)) => {
+                return self.lower_for_tensor(label, pat, e, body)
+            }
             _ => return false,
         };
         let elem_mir = self.mir_ty_of(&elem);
@@ -15705,16 +15725,26 @@ impl FnLowerer<'_> {
         // *latch* (which performs `i += 1`), matching the range-`for` so `continue` advances.
         self.builder.switch_to(body_bb);
         self.terminated = false;
-        if let Some(name) = bind_name {
-            let i_cur = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
-            let elem_ptr = self.builder.build(
-                MirType::Ptr,
-                Op::Gep {
-                    ptr: base_ptr,
-                    index: i_cur,
-                    elem: elem_mir.clone(),
-                },
-            );
+        let elem_ptr = match bind {
+            ForBind::None => None,
+            ForBind::Name(_) | ForBind::Destructure(_) => {
+                let i_cur = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
+                Some(self.builder.build(
+                    MirType::Ptr,
+                    Op::Gep {
+                        ptr: base_ptr,
+                        index: i_cur,
+                        elem: elem_mir.clone(),
+                    },
+                ))
+            }
+        };
+        if let (ForBind::Destructure(p), Some(elem_ptr)) = (&bind, elem_ptr) {
+            // Bound at the element's place exactly as a match arm binds the same pattern: a
+            // scalar part copied into a fresh slot, an aggregate part by pointer.
+            self.bind_field_pattern(p, elem_ptr, &elem);
+        }
+        if let (ForBind::Name(name), Some(elem_ptr)) = (bind, elem_ptr) {
             if matches!(elem_mir, MirType::Array(..)) {
                 // An aggregate element (struct / tuple / array) binds **by pointer** — `x.field`
                 // / `x[k]` / `x.0` GEP off it — exactly as the `a[i]` aggregate read arm does.
