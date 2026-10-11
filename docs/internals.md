@@ -1394,9 +1394,17 @@ release builds. An entry whose pointer has no extent -- a NUL-terminated path or
 `wukong_parallel_for`'s opaque capture table, the handle `wukong_rt_free` takes -- carries
 `// SAFETY-EXEMPT: <reason>` instead, and the eight half-precision entries whose kernels detect and
 define overlap themselves (`wukong_axpby_{bf16,f16}`, `wukong_vmath_{bf16,f16}` and their narrowing
-`_out` forms, each pinned by an overlap test) check extents only. `safety::entry_law` scans every module's source (`include_str!`) and fails
-on an entry with neither a check nor an exemption, and on a `src/*.rs` file missing from its list.
-The debug corpus (`cargo test -p wukongc --test run`) runs green with every check armed.
+`_out` forms, each pinned by an overlap test) check extents only. `safety::entry_law` scans every
+module's source (`include_str!`) and fails on an entry with neither a check nor an exemption, on a
+`src/*.rs` file missing from its list, and on an entry whose doc block states an aliasing class
+(its `**Aliasing` paragraph) without calling that class's helper -- the eight half-precision
+entries are its exact, named allowlist. Every check is a no-op for a non-positive extent, and an
+entry that takes a shape wraps its checks in `if cfg!(debug_assertions) && <every dimension> > 0`
+(GEMM's `k` included), its own no-op condition negated: a derived extent is not enough, since two
+negative dimensions multiply to a positive span and a one-dimension extent stays positive while
+the other dimension is empty. A call the entry treats as a no-op therefore never asserts, whatever
+pointers it carries (`safety::tests::no_op_calls_never_assert`). The debug corpus
+(`cargo test -p wukongc --test run`) runs green with every check armed.
 
 Tests that require streaming execution derive their sizes from the actual policy, retain
 existing numerical cases/tail residues, and count executed non-temporal stores. Their

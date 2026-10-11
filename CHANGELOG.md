@@ -14,8 +14,15 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `#[track_caller]` helpers that compile out of release builds. Entries whose pointer has no extent
   (a NUL-terminated path or site string, `wukong_parallel_for`'s capture table, `wukong_rt_free`'s
   handle -- the other 5) carry a `// SAFETY-EXEMPT:` reason, and `safety::entry_law` fails on an
-  entry with neither and on a runtime module it does not scan. The debug corpus runs green with
-  every check armed.
+  entry with neither, on a runtime module it does not scan, and on an entry whose doc states an
+  aliasing class it never asserts (`every_documented_aliasing_rule_is_checked`; it caught
+  `wukong_vmath_f32` and `wukong_vmath2_f32`, which checked extents only). Only the eight
+  half-precision entries that detect and define overlap in-kernel are exempt, by name. A
+  shape-taking entry gates its checks on its own no-op condition (`rows > 0 && cols > 0`; the GEMM
+  family's `m`, `k` and `n`), because two negative dimensions multiply to a positive span and a
+  one-dimension extent stays positive when the other is empty: a call the entry treats as a no-op
+  never asserts (`no_op_calls_never_assert` sweeps every non-positive dimension mix with null and
+  with shifted operands). The debug corpus runs green with every check armed.
 - **Every `_parallel` kernel split honours `WUKONG_KERNEL_DYN` (P9.15).** The 34 bare rayon splits
   (30 row/column/channel/chunk maps across 28 kernel modules, and the GEMM's four pack-phase splits)
   fork through `par::for_each_unit`, and the fixed-`RCHUNK` reductions (`sreduce`, `argreduce`, the
