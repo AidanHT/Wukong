@@ -264,7 +264,6 @@ pub unsafe extern "C" fn wukong_sgemv_alpha_parallel(
     }
     #[cfg(target_arch = "x86_64")]
     {
-        use rayon::prelude::*;
         // A `@parallel` GEMV can be the process's FIRST rayon touch (a decode-step LM head runs
         // before any outlined region), so it must configure the global pool before forking — the
         // invariant `ensure_global_pool` states: whoever forks first decides the registry, and a
@@ -278,7 +277,7 @@ pub unsafe extern "C" fn wukong_sgemv_alpha_parallel(
             return;
         }
         let (a_addr, x_addr, y_addr) = (a as usize, x as usize, y as usize);
-        (0..mu.div_ceil(2)).into_par_iter().for_each(|pair| {
+        crate::par::for_each_unit(mu.div_ceil(2), |pair| {
             let i = pair * 2;
             // SAFETY: each task owns one disjoint pair of rows (or the final single row).
             unsafe {

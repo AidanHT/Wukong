@@ -27,8 +27,6 @@
 //! so the fused activation equals the unfused one exactly. Pinned by `simd_equals_scalar_twin` and
 //! `dequant_matches_rational_reference`.
 
-use rayon::prelude::*;
-
 // --- op codes (shared with the recognizer in wukong_mir_build) ------------------------------------
 // The low byte is the activation; a higher nibble selects the input element width. A recognized dequant
 // loop's element type and (optional) activation wrapper choose the code; the interpreter and the native
@@ -346,7 +344,7 @@ pub unsafe extern "C" fn wukong_dequant_f32_parallel(
     // (the NT prologue then peels ≤7 elements, disjointly from the previous chunk's tail).
     let chunk = n.div_ceil(workers);
     let chunk = chunk.div_ceil(8) * 8;
-    (0..workers).into_par_iter().for_each(|w| {
+    crate::par::for_each_unit(workers, |w| {
         let start = w * chunk;
         if start >= n {
             return;

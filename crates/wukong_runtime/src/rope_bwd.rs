@@ -41,8 +41,6 @@
 //! (The trig's lane-reassociation-free poly is the documented `vmath` sin/cos contract: every backend
 //! runs this same Cephes sequence, so they agree.)
 
-use rayon::prelude::*;
-
 // --- scalar twin (the AVX2 tail + the no-AVX2 fallback) -------------------------------------------
 
 /// One row of RoPE backward, scalar reference / AVX2 tail / no-AVX2 fallback.
@@ -208,7 +206,7 @@ pub unsafe extern "C" fn wukong_rope_bwd_f32_parallel(
     // outlined `@parallel` region bodies are left on undersized stacks. Idempotent (`Once`) and
     // provisioning-only: the work split below is unchanged, so serial == parallel stays bit-exact.
     crate::ensure_global_pool();
-    (0..r).into_par_iter().for_each(|row| {
+    crate::par::for_each_unit(r, |row| {
         let off = row * dim;
         // SAFETY: disjoint row slices; pointers re-derived from the captured addresses; inv_freq valid
         // for `h` by contract.

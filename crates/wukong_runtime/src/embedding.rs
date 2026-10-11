@@ -209,7 +209,6 @@ pub unsafe extern "C" fn wukong_embedding_f32_parallel(
         embedding_rows(out, weight, ids, h, v, 0, t);
         return;
     }
-    use rayon::prelude::*;
     // One chunk of rows per core; the last chunk absorbs the remainder. Raw pointers cross the rayon
     // boundary as integers (the pointees outlive this blocking call; chunks touch disjoint `out` rows).
     // This fork can be the process's FIRST rayon touch, so it must provision the global pool first —
@@ -223,7 +222,7 @@ pub unsafe extern "C" fn wukong_embedding_f32_parallel(
     let per = t.div_ceil(nthreads).max(1);
     let nchunks = t.div_ceil(per);
     let (out_addr, w_addr, ids_addr) = (out as usize, weight as usize, ids as usize);
-    (0..nchunks).into_par_iter().for_each(|c| {
+    crate::par::for_each_unit(nchunks, |c| {
         let t0 = c * per;
         let t1 = (t0 + per).min(t);
         // SAFETY: disjoint `out` row range per chunk; pointers re-derived from the captured addresses

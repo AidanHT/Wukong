@@ -128,7 +128,6 @@ pub unsafe extern "C" fn wukong_softmax_bwd_f32_parallel(
         wukong_softmax_bwd_f32(y, dy, dx, rows, cols);
         return;
     }
-    use rayon::prelude::*;
     let (y_addr, dy_addr, dx_addr) = (y as usize, dy as usize, dx as usize);
     // This fork can be the process's FIRST rayon touch, so it must provision the global pool first —
     // [`crate::ensure_global_pool`]'s stated precondition. Forking bare builds rayon's default
@@ -136,7 +135,7 @@ pub unsafe extern "C" fn wukong_softmax_bwd_f32_parallel(
     // outlined `@parallel` region bodies are left on undersized stacks. Idempotent (`Once`) and
     // provisioning-only: the work split below is unchanged, so serial == parallel stays bit-exact.
     crate::ensure_global_pool();
-    (0..r).into_par_iter().for_each(|row| {
+    crate::par::for_each_unit(r, |row| {
         let off = row * c;
         // SAFETY: disjoint row slices; pointers re-derived from the captured addresses.
         unsafe {

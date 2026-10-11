@@ -526,7 +526,6 @@ unsafe fn colreduce_parallel(x: *const f32, out: *mut f32, rows: i64, cols: i64,
         colreduce_range(x, out, r, c, 0, c, kind);
         return;
     }
-    use rayon::prelude::*;
     // This entry can be the process's FIRST rayon touch, so it must configure the global pool before
     // forking (crate::ensure_global_pool's stated contract): otherwise rayon lazily builds its default
     // 2 MiB-stack registry here and the runtime's 16 MiB build_global silently loses the race for the
@@ -546,7 +545,7 @@ unsafe fn colreduce_parallel(x: *const f32, out: *mut f32, rows: i64, cols: i64,
     let per = (c.div_ceil(nthreads)).next_multiple_of(32).max(32);
     let nstripes = c.div_ceil(per);
     let (x_addr, out_addr) = (x as usize, out as usize);
-    (0..nstripes).into_par_iter().for_each(|s| {
+    crate::par::for_each_unit(nstripes, |s| {
         let j0 = s * per;
         let j1 = (j0 + per).min(c);
         // SAFETY: disjoint out[] stripe per task; pointers re-derived from the captured addresses.

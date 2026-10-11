@@ -2590,26 +2590,24 @@ unsafe fn sgemm_2d_blocks_dyn(
                 }
             } else {
                 let chunks_ref = &chunks;
-                (0..chunks_ref.len() * mpanels)
-                    .into_par_iter()
-                    .for_each(|u| {
-                        let (ci, ip) = (u / mpanels, u % mpanels);
-                        let (pc, kc, off) = chunks_ref[ci];
-                        // SAFETY: each (chunk, panel) granule owns a disjoint `MR·kc` destination
-                        // slice; A is read-only; buffer sized `a_rows·k` above.
-                        unsafe {
-                            let (a_blk, lda) = a_origin(a_addr as *const f32, m, k, at, 0, pc);
-                            pack_a_panel(
-                                a_blk,
-                                lda,
-                                at,
-                                m,
-                                kc,
-                                ip,
-                                (ap_shared_addr as *mut f32).add(off + ip * kc * MR),
-                            );
-                        }
-                    });
+                crate::par::for_each_unit(chunks_ref.len() * mpanels, |u| {
+                    let (ci, ip) = (u / mpanels, u % mpanels);
+                    let (pc, kc, off) = chunks_ref[ci];
+                    // SAFETY: each (chunk, panel) granule owns a disjoint `MR·kc` destination
+                    // slice; A is read-only; buffer sized `a_rows·k` above.
+                    unsafe {
+                        let (a_blk, lda) = a_origin(a_addr as *const f32, m, k, at, 0, pc);
+                        pack_a_panel(
+                            a_blk,
+                            lda,
+                            at,
+                            m,
+                            kc,
+                            ip,
+                            (ap_shared_addr as *mut f32).add(off + ip * kc * MR),
+                        );
+                    }
+                });
             }
         }
         // One claim-loop task per worker — plain fork-join tasks, NOT `broadcast`: the loop never
@@ -3528,7 +3526,6 @@ unsafe fn pack_ab_par(
     ap: *mut f32,
     bp: *mut f32,
 ) {
-    use rayon::prelude::*;
     let mpanels = mc.div_ceil(MR);
     let npanels = nc.div_ceil(NR);
     let total_bytes = (round_up(mc, MR) + round_up(nc, NR)) * kc * 4;
@@ -3553,7 +3550,7 @@ unsafe fn pack_ab_par(
         *V.get_or_init(|| std::env::var("WUKONG_PACK_SPLIT_REGIONS").is_ok_and(|v| v == "1"))
     }
     if split_regions() {
-        (0..mpanels).into_par_iter().for_each(|ip| {
+        crate::par::for_each_unit(mpanels, |ip| {
             // SAFETY: disjoint output panel per task; pointers re-derived per task.
             unsafe {
                 pack_a_panel(
@@ -3567,7 +3564,7 @@ unsafe fn pack_ab_par(
                 );
             }
         });
-        (0..npanels).into_par_iter().for_each(|jp| {
+        crate::par::for_each_unit(npanels, |jp| {
             let panel = (bp_addr as *mut f32).add(jp * kc * NR);
             // SAFETY: disjoint output panel per task; pointers re-derived per task.
             unsafe {
@@ -3580,7 +3577,7 @@ unsafe fn pack_ab_par(
         });
         return;
     }
-    (0..mpanels + npanels).into_par_iter().for_each(|t| {
+    crate::par::for_each_unit(mpanels + npanels, |t| {
         // SAFETY: every task writes a disjoint packed panel; pointers re-derived per task.
         unsafe {
             if t < mpanels {

@@ -20,8 +20,6 @@
 //! are independent, the parallel path just maps the identical per-row routine across cores, so there is
 //! *no new reassociation* between serial and parallel; that one IS exact (`assert_eq!` on the bits).
 
-use rayon::prelude::*;
-
 /// Scalar twin / no-AVX2 fallback / numerical reference: strict left-to-right inclusive prefix sum of
 /// one row. `acc` starts at `0.0` and folds `x[base..base+cols]` in ascending order. The
 /// reassociated AVX2 path is checked *against* this within a relative tolerance (not bit-for-bit).
@@ -201,7 +199,7 @@ pub unsafe extern "C" fn wukong_cumsum_f32_parallel(
     // Raw pointers cross the rayon boundary as integers (same pattern as the parallel GEMM/norm); each
     // row is a disjoint sub-slice of out.
     let (xa, oa) = (x as usize, out as usize);
-    (0..rows).into_par_iter().for_each(|r| {
+    crate::par::for_each_unit(rows, |r| {
         // SAFETY: disjoint row r; pointers valid for rows*cols by contract.
         unsafe { cumsum_row(xa as *const f32, oa as *mut f32, r * cols, cols) };
     });

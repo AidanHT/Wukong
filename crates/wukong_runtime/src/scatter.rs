@@ -200,7 +200,6 @@ pub unsafe extern "C" fn wukong_scatter_add_f32_parallel(
         scatter_rows(grad_w, grad_out, ids, t, h, 0, v);
         return;
     }
-    use rayon::prelude::*;
     // One chunk of *output rows* per core; the last chunk absorbs the remainder. Each chunk owns a
     // disjoint `grad_w` row range `[r0, r1)` and re-scans all `T` ids, so writes never overlap across
     // chunks. Raw pointers cross the rayon boundary as integers (the pointees outlive this blocking call;
@@ -216,7 +215,7 @@ pub unsafe extern "C" fn wukong_scatter_add_f32_parallel(
     let per = v.div_ceil(nthreads).max(1);
     let nchunks = v.div_ceil(per);
     let (gw_addr, go_addr, ids_addr) = (grad_w as usize, grad_out as usize, ids as usize);
-    (0..nchunks).into_par_iter().for_each(|c| {
+    crate::par::for_each_unit(nchunks, |c| {
         let r0 = c * per;
         let r1 = (r0 + per).min(v);
         // SAFETY: disjoint `grad_w` row range per chunk (writes never overlap across chunks); pointers

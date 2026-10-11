@@ -34,8 +34,6 @@
 //! reassociation is the documented reassociated-reduction exception: every backend runs this same
 //! kernel, so they agree.)
 
-use rayon::prelude::*;
-
 /// Fixed-order horizontal sum of 8 lane accumulators — a balanced tree, identical in the scalar twin
 /// and the AVX2 path (which stores its `__m256` to `[f32; 8]` and calls this), so both give the same
 /// bits. Same shape as `norm::hsum8` / the reduction kernel's `hcombine8`.
@@ -383,7 +381,7 @@ pub unsafe extern "C" fn wukong_rmsnorm_bwd_f32_parallel(
     // outlined `@parallel` region bodies are left on undersized stacks. Idempotent (`Once`) and
     // provisioning-only: the work split below is unchanged, so serial == parallel stays bit-exact.
     crate::ensure_global_pool();
-    (0..r).into_par_iter().for_each(|row| {
+    crate::par::for_each_unit(r, |row| {
         let off = row * c;
         // SAFETY: disjoint row slices; pointers re-derived from the captured addresses; gamma valid
         // for `c` (or null) by contract.

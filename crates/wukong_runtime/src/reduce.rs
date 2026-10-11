@@ -61,8 +61,6 @@
 //! resolved at compile time instead of sitting in the loop body — the shape `velem.rs` and `vmath.rs`
 //! measured into their own kernels.
 
-use rayon::prelude::*;
-
 // Reduction op codes (shared with the recognizer in `wukong_mir_build`). For the unary ops (`SUM`,
 // `SUMSQ`) the recognizer passes `y == x` so `y` is always a valid pointer and the kernel simply
 // never reads it — no null-pointer marshalling anywhere.
@@ -420,16 +418,16 @@ pub unsafe extern "C" fn wukong_sreduce_f32_parallel(
     // (`run_on_wuk_pool`) — the fixed-`RCHUNK` decomposition and the ordered serial fold below are
     // what make the result thread-count- and pool-independent.
     let (xa, ya) = (x as usize, y as usize);
+    // The partial map is `par::map_units` (rayon's indexed collect by default, the claim queue under
+    // `WUKONG_KERNEL_DYN=1`): either way partial `c` lands in slot `c`, so the fold below is the
+    // same index-order fold.
     let partials: Vec<f32> = crate::run_on_wuk_pool(move || {
-        (0..nchunks)
-            .into_par_iter()
-            .map(|c| {
-                let lo = c * RCHUNK;
-                let hi = ((c + 1) * RCHUNK).min(n);
-                // SAFETY: disjoint read-only chunk; pointers valid for n by contract.
-                unsafe { reduce_chunk(xa as *const f32, ya as *const f32, lo, hi, op) }
-            })
-            .collect()
+        crate::par::map_units(nchunks, |c| {
+            let lo = c * RCHUNK;
+            let hi = ((c + 1) * RCHUNK).min(n);
+            // SAFETY: disjoint read-only chunk; pointers valid for n by contract.
+            unsafe { reduce_chunk(xa as *const f32, ya as *const f32, lo, hi, op) }
+        })
     });
     let mut acc = ident(op);
     for p in partials {
@@ -677,16 +675,14 @@ pub unsafe extern "C" fn wukong_argreduce_f32_parallel(x: *const f32, n: i64, op
     let xa = x as usize;
     // Unified kernel pool; fixed-`RCHUNK` chunks + lowest-index tie-break keep the result
     // pool- and thread-count-independent (see the module note above).
+    // `par::map_units`: partial `c` in slot `c` under either scheduler (see the sum form above).
     let partials: Vec<(f32, usize)> = crate::run_on_wuk_pool(move || {
-        (0..nchunks)
-            .into_par_iter()
-            .map(|c| {
-                let lo = c * RCHUNK;
-                let hi = ((c + 1) * RCHUNK).min(n);
-                // SAFETY: disjoint read-only chunk; pointer valid for n.
-                unsafe { argreduce_chunk(xa as *const f32, lo, hi, is_max) }
-            })
-            .collect()
+        crate::par::map_units(nchunks, |c| {
+            let lo = c * RCHUNK;
+            let hi = ((c + 1) * RCHUNK).min(n);
+            // SAFETY: disjoint read-only chunk; pointer valid for n.
+            unsafe { argreduce_chunk(xa as *const f32, lo, hi, is_max) }
+        })
     });
     let mut acc = (ident_v, usize::MAX);
     for p in partials {

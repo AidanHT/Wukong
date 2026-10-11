@@ -1092,13 +1092,12 @@ pub unsafe extern "C" fn wukong_vmath_f32_parallel(x: *const f32, out: *mut f32,
         unsafe { wukong_vmath_f32(x, out, n as i64, op) };
         return;
     }
-    use rayon::prelude::*;
     let nchunks = n.div_ceil(VMATH_CHUNK);
     // Raw pointers cross the rayon closure as integers (the parallel-reduce/norm/velem pattern); each
     // chunk owns a disjoint output sub-slice. Fixed `VMATH_CHUNK` spans keep the bits pool-invariant.
     let (xa, oa) = (x as usize, out as usize);
     crate::run_on_wuk_pool(move || {
-        (0..nchunks).into_par_iter().for_each(|ck| {
+        crate::par::for_each_unit(nchunks, |ck| {
             let lo = ck * VMATH_CHUNK;
             let hi = ((ck + 1) * VMATH_CHUNK).min(n);
             // SAFETY: disjoint sub-span [lo, hi) ⊆ [0, n); x/out valid for n f32.

@@ -32,8 +32,6 @@
 //! cross-chunk combine (pinned by `serial_matches_parallel_bit_for_bit`), and the interpreter (which
 //! calls the serial form) agrees regardless of core count.
 
-use rayon::prelude::*;
-
 // --- op codes (shared with the recognizer in wukong_mir_build) ------------------------------------
 // The low byte is the activation; `VE_USE_Y` (bit 8) flags that `y` is read (so a scale/ReLU that
 // never touches `y` can pass a null `y` pointer the kernel will not dereference).
@@ -559,7 +557,7 @@ pub unsafe extern "C" fn wukong_velem_f32_parallel(
     // the pool/worker count never touches the bits.
     let (xa, ya, oa) = (x as usize, y as usize, out as usize);
     crate::run_on_wuk_pool(move || {
-        (0..nchunks).into_par_iter().for_each(|ck| {
+        crate::par::for_each_unit(nchunks, |ck| {
             let lo = ck * VCHUNK;
             let hi = ((ck + 1) * VCHUNK).min(n);
             // SAFETY: disjoint output sub-slice [lo, hi) ⊆ [0, n); x/out valid for n. `y` is offset

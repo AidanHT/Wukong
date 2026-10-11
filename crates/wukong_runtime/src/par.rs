@@ -124,55 +124,71 @@ where
     if n == 0 {
         return;
     }
-    crate::run_on_wuk_pool(move || {
-        use rayon::prelude::*;
-        // Read the worker count INSIDE the installed context so it reflects the pool that actually
-        // runs the spans (the private physical-core pool under unification).
-        let workers = rayon::current_num_threads().max(1).min(n);
-        let min_granule = min_granule.max(1);
-        let g = if dynamic {
-            n.div_ceil(workers.saturating_mul(8)).max(min_granule)
-        } else {
-            n.div_ceil(workers).max(min_granule)
-        };
-        let ntasks = n.div_ceil(g);
-        if workers <= 1 || ntasks <= 1 {
-            body(0, n);
-            return;
-        }
-        let body = &body;
-        if dynamic {
-            // Cache-line-isolated (128 B: line + adjacent-line-prefetch pair) so the one shared
-            // write bounces only for the claims themselves.
-            #[repr(align(128))]
-            struct Claims(AtomicUsize);
-            let claims = Claims(AtomicUsize::new(0));
-            let claims = &claims;
-            (0..workers.min(ntasks)).into_par_iter().for_each(|_| loop {
-                // Relaxed suffices: the counter only hands out unique granules; the fork-join's
-                // join publishes every write the body made.
-                let c = claims.0.fetch_add(1, Ordering::Relaxed);
-                if c >= ntasks {
-                    break;
-                }
-                let start = c * g;
-                body(start, (start + g).min(n));
-            });
-        } else {
-            (0..ntasks).into_par_iter().for_each(|t| {
-                let start = t * g;
-                body(start, (start + g).min(n));
-            });
-        }
-    });
+    crate::run_on_wuk_pool(move || claim_on_current_pool(n, min_granule, dynamic, &body));
 }
 
-/// Kernel claim-queue instrument (`WUKONG_KERNEL_DYN=1`, read once, **default OFF**): route the
-/// row-mapped kernels that call [`for_each_row`] (today the fused-norm pair) through
-/// [`claim_chunks`] instead of rayon's adaptive per-row split. The claim queue A/B-won for the GEMM's
-/// coarse, heterogeneous 2D blocks and for `@parallel` regions; whether it also wins on uniform rows,
-/// where rayon's splitter already balances, is unmeasured — so it ships as the adjacent-run A/B knob,
-/// not as the default. Scheduling-only: which worker normalizes a row never changes its bits.
+/// [`claim_chunks`]'s schedule on the pool the CALLER is already running on (its worker count, its
+/// registry) instead of hopping to the unified kernel pool first. This is the claim loop itself;
+/// [`claim_chunks`] is this plus [`crate::run_on_wuk_pool`]. [`for_each_unit`] and [`map_units`]
+/// use it so the `WUKONG_KERNEL_DYN` A/B swaps the *schedule* only, never the pool.
+fn claim_on_current_pool<F>(n: usize, min_granule: usize, dynamic: bool, body: &F)
+where
+    F: Fn(usize, usize) + Sync + Send,
+{
+    use rayon::prelude::*;
+    if n == 0 {
+        return;
+    }
+    // Read the worker count INSIDE the running context so it reflects the pool that actually runs
+    // the spans (the private physical-core pool under unification).
+    let workers = rayon::current_num_threads().max(1).min(n);
+    let min_granule = min_granule.max(1);
+    let g = if dynamic {
+        n.div_ceil(workers.saturating_mul(8)).max(min_granule)
+    } else {
+        n.div_ceil(workers).max(min_granule)
+    };
+    let ntasks = n.div_ceil(g);
+    if workers <= 1 || ntasks <= 1 {
+        body(0, n);
+        return;
+    }
+    if dynamic {
+        // Cache-line-isolated (128 B: line + adjacent-line-prefetch pair) so the one shared
+        // write bounces only for the claims themselves.
+        #[repr(align(128))]
+        struct Claims(AtomicUsize);
+        let claims = Claims(AtomicUsize::new(0));
+        let claims = &claims;
+        (0..workers.min(ntasks)).into_par_iter().for_each(|_| loop {
+            // Relaxed suffices: the counter only hands out unique granules; the fork-join's
+            // join publishes every write the body made.
+            let c = claims.0.fetch_add(1, Ordering::Relaxed);
+            if c >= ntasks {
+                break;
+            }
+            let start = c * g;
+            body(start, (start + g).min(n));
+        });
+    } else {
+        (0..ntasks).into_par_iter().for_each(|t| {
+            let start = t * g;
+            body(start, (start + g).min(n));
+        });
+    }
+}
+
+/// Kernel claim-queue instrument (`WUKONG_KERNEL_DYN=1`, read once, **default OFF**): route every
+/// `_parallel` kernel split -- the row/column/channel/chunk maps that call [`for_each_row`] /
+/// [`for_each_unit`] and the fixed-chunk reductions that call [`map_units`] -- through the atomic
+/// claim queue instead of rayon's adaptive per-index split. The claim queue A/B-won for the GEMM's
+/// coarse, heterogeneous 2D blocks and for `@parallel` regions; whether it also wins on uniform
+/// rows, where rayon's splitter already balances, is unmeasured -- so it ships as the adjacent-run
+/// A/B knob, not as the default. Scheduling-only: every unit is independent (rows, stripes,
+/// channels, fixed `VCHUNK`/`VMATH_CHUNK` spans) or, for a reduction, a fixed-`RCHUNK` partial
+/// stored by its chunk index and folded in index order afterwards, so which worker ran a unit never
+/// changes a bit (P9.15). Default OFF runs exactly the pre-P9.15 rayon spelling, so default bits and
+/// default timing are unchanged.
 fn kernel_dyn() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("WUKONG_KERNEL_DYN").is_ok_and(|v| v == "1"))
@@ -192,6 +208,78 @@ where
             use rayon::prelude::*;
             (0..rows).into_par_iter().for_each(&row);
         });
+    }
+}
+
+/// Map `unit(i)` over `i in 0..n`, each index exactly once, returning when all have run -- on the
+/// pool the CALLER is running on. That is the global pool for a top-level call (after
+/// [`crate::ensure_global_pool`], which this provisions first: a `_parallel` kernel can be the
+/// process's first rayon touch), the enclosing pool for a call from inside an outlined `@parallel`
+/// region or a GEMM pack phase, and the unified pool inside an explicit
+/// [`crate::run_on_wuk_pool`]. Default: rayon's adaptive split, i.e. exactly the bare
+/// `(0..n).into_par_iter().for_each(unit)` every call site spelled before P9.15. Under
+/// `WUKONG_KERNEL_DYN=1`: the atomic claim queue on that same pool, so the A/B compares schedules
+/// on one pool. The caller has already decided to fork (a [`fork_units`]/[`fork_rows`] gate or its
+/// own crossover).
+pub(crate) fn for_each_unit<F>(n: usize, unit: F)
+where
+    F: Fn(usize) + Sync + Send,
+{
+    for_each_unit_sched(n, kernel_dyn(), unit);
+}
+
+/// [`for_each_unit`] with the scheduler chosen explicitly (the env read is once per process, so the
+/// tests drive both arms through here).
+fn for_each_unit_sched<F>(n: usize, dynamic: bool, unit: F)
+where
+    F: Fn(usize) + Sync + Send,
+{
+    crate::ensure_global_pool();
+    if dynamic {
+        claim_on_current_pool(n, 1, true, &|lo: usize, hi: usize| (lo..hi).for_each(&unit));
+    } else {
+        use rayon::prelude::*;
+        (0..n).into_par_iter().for_each(unit);
+    }
+}
+
+/// `(0..n).map(unit).collect()` with the `unit` calls run in parallel on the caller's pool -- the
+/// fixed-chunk reductions' partial map. Element `i` of the result is `unit(i)` whatever scheduled
+/// it: rayon's indexed `collect` by default (the pre-P9.15 spelling), and under
+/// `WUKONG_KERNEL_DYN=1` one slot per chunk index filled by the claim queue. The caller folds the
+/// partials in index order, so serial == parallel stays bit-exact under either scheduler.
+pub(crate) fn map_units<T, F>(n: usize, unit: F) -> Vec<T>
+where
+    T: Send + Sync,
+    F: Fn(usize) -> T + Sync + Send,
+{
+    map_units_sched(n, kernel_dyn(), unit)
+}
+
+/// [`map_units`] with the scheduler chosen explicitly (see [`for_each_unit_sched`]).
+fn map_units_sched<T, F>(n: usize, dynamic: bool, unit: F) -> Vec<T>
+where
+    T: Send + Sync,
+    F: Fn(usize) -> T + Sync + Send,
+{
+    if dynamic {
+        let slots: Vec<OnceLock<T>> = (0..n).map(|_| OnceLock::new()).collect();
+        claim_on_current_pool(n, 1, true, &|lo: usize, hi: usize| {
+            for (i, slot) in slots.iter().enumerate().take(hi).skip(lo) {
+                // Each index is claimed exactly once, so every `set` lands on an empty slot.
+                let _ = slot.set(unit(i));
+            }
+        });
+        slots
+            .into_iter()
+            .map(|s| {
+                s.into_inner()
+                    .expect("the claim queue runs every chunk index exactly once")
+            })
+            .collect()
+    } else {
+        use rayon::prelude::*;
+        (0..n).into_par_iter().map(unit).collect()
     }
 }
 
@@ -298,6 +386,38 @@ mod tests {
         }
         // n == 0 never calls the body.
         claim_chunks(0, 1, true, |_, _| panic!("empty range ran a span"));
+    }
+
+    /// P9.15: both schedulers of the shared kernel maps visit every unit exactly once, and the
+    /// partial map returns `unit(i)` at index `i` -- the property the fixed-`RCHUNK` reductions'
+    /// index-order fold rests on. Driven through the `_sched` forms so one process covers both arms
+    /// regardless of `WUKONG_KERNEL_DYN`.
+    #[test]
+    fn for_each_unit_and_map_units_cover_every_index_under_both_schedulers() {
+        for dynamic in [false, true] {
+            for n in [0usize, 1, 2, 7, 64, 1000, 4099] {
+                let hits: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+                for_each_unit_sched(n, dynamic, |i| {
+                    hits[i].fetch_add(1, Ordering::Relaxed);
+                });
+                assert!(
+                    hits.iter().all(|h| h.load(Ordering::Relaxed) == 1),
+                    "for_each_unit n={n} dynamic={dynamic}"
+                );
+                let got = map_units_sched(n, dynamic, |i| (i as u64) * 3 + 1);
+                let want: Vec<u64> = (0..n as u64).map(|i| i * 3 + 1).collect();
+                assert_eq!(got, want, "map_units n={n} dynamic={dynamic}");
+            }
+        }
+        // A float fold over map_units partials is bit-identical under both schedulers: the slot
+        // order, not the completion order, decides the fold.
+        let partial = |c: usize| ((c as f32) * 0.37).sin() * 1e3 + 1e-3;
+        let fold = |v: Vec<f32>| v.into_iter().fold(0.0f32, |a, b| a + b).to_bits();
+        let a = fold(map_units_sched(513, false, partial));
+        let b = fold(map_units_sched(513, true, partial));
+        let serial = (0..513).map(partial).fold(0.0f32, |a, b| a + b).to_bits();
+        assert_eq!(a, serial);
+        assert_eq!(b, serial);
     }
 
     #[test]

@@ -37,7 +37,6 @@
 use crate::vmath::log1;
 #[cfg(target_arch = "x86_64")]
 use crate::vmath::log8;
-use rayon::prelude::*;
 
 /// Fixed-order horizontal sum of 8 lane accumulators — a balanced tree, identical in the scalar twin
 /// and the AVX2 path (which stores its `__m256` to `[f32; 8]` and calls this), so both give the same
@@ -180,7 +179,7 @@ pub unsafe extern "C" fn wukong_entropy_f32_parallel(
     // outlined `@parallel` region bodies are left on undersized stacks. Idempotent (`Once`) and
     // provisioning-only: the work split below is unchanged, so serial == parallel stays bit-exact.
     crate::ensure_global_pool();
-    (0..r).into_par_iter().for_each(|row| {
+    crate::par::for_each_unit(r, |row| {
         // SAFETY: disjoint row data / out slot; pointers re-derived from the captured addresses, valid
         // for rows*cols / rows.
         unsafe { *(oa as *mut f32).add(row) = entropy_row((pa as *const f32).add(row * c), c) };

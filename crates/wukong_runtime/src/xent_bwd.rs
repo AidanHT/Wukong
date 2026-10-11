@@ -47,7 +47,6 @@
 use crate::vmath::exp1;
 #[cfg(target_arch = "x86_64")]
 use crate::vmath::exp8;
-use rayon::prelude::*;
 
 /// Fixed-order horizontal sum of 8 lane accumulators — a balanced tree, identical in the scalar twin
 /// and the AVX2 path (which stores its `__m256` to `[f32; 8]` and calls this), so both give the same
@@ -279,7 +278,7 @@ pub unsafe extern "C" fn wukong_xent_bwd_f32_parallel(
     // Raw pointers cross the rayon boundary as integers; each row is a disjoint sub-slice, `target`
     // indexed by row. (`dx` may alias `x`, but the per-row slices are disjoint across rows.)
     let (x_addr, t_addr, dx_addr) = (x as usize, target as usize, dx as usize);
-    (0..r).into_par_iter().for_each(|row| {
+    crate::par::for_each_unit(r, |row| {
         // SAFETY: disjoint row slices; pointers re-derived from the captured addresses; the label is
         // bounded by `xent_bwd_row`'s own `target < c` check, exactly as in the serial entry.
         unsafe {

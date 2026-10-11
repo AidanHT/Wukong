@@ -66,8 +66,6 @@
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-use rayon::prelude::*;
-
 use crate::bf16_bits_to_f32;
 
 /// IEEE f16 (stored bits) → f32. Lossless, so it equals the F16C `vcvtph2ps` result exactly. Thin
@@ -815,15 +813,14 @@ fn par_chunk_reduce(
     // `RCHUNK` decomposition and the ordered fold below are what fix the bits, so which pool runs the
     // map cannot change them. `per_chunk` is borrowed, not moved — `&P` is `Send` because `P: Sync`.
     let per_chunk = &per_chunk;
+    // `par::map_units`: partial `c` in slot `c` under either scheduler (`WUKONG_KERNEL_DYN`), so the
+    // index-order fold below is unchanged.
     let partials: Vec<f32> = crate::run_on_wuk_pool(move || {
-        (0..nchunks)
-            .into_par_iter()
-            .map(|c| {
-                let lo = c * crate::reduce::RCHUNK;
-                let hi = ((c + 1) * crate::reduce::RCHUNK).min(n);
-                per_chunk(lo, hi)
-            })
-            .collect()
+        crate::par::map_units(nchunks, |c| {
+            let lo = c * crate::reduce::RCHUNK;
+            let hi = ((c + 1) * crate::reduce::RCHUNK).min(n);
+            per_chunk(lo, hi)
+        })
     });
     let mut acc = ident;
     for p in partials {

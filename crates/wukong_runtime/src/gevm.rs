@@ -206,7 +206,6 @@ pub unsafe extern "C" fn wukong_sgevm_f32_parallel(
         gevm_range(w, a, out, r, c, 0, c, alpha);
         return;
     }
-    use rayon::prelude::*;
     // One stripe per core, each a multiple of 8 columns (keep the AVX2 main loop aligned to the
     // stripe boundary); the last stripe absorbs the remainder. The split does not affect the bits
     // (per-column chains are self-contained), only the work distribution.
@@ -221,7 +220,7 @@ pub unsafe extern "C" fn wukong_sgevm_f32_parallel(
     let per = (c.div_ceil(nthreads)).next_multiple_of(8).max(8);
     let nstripes = c.div_ceil(per);
     let (w_addr, a_addr, out_addr) = (w as usize, a as usize, out as usize);
-    (0..nstripes).into_par_iter().for_each(|s| {
+    crate::par::for_each_unit(nstripes, |s| {
         let j0 = s * per;
         let j1 = (j0 + per).min(c);
         // SAFETY: disjoint out[] stripe per task; pointers re-derived from the captured addresses.

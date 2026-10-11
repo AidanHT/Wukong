@@ -181,7 +181,6 @@ unsafe fn rowarg_par(x: *const f32, out: *mut i32, rows: i64, cols: i64, is_max:
         rowarg_serial(x, out, rows, cols, is_max);
         return;
     }
-    use rayon::prelude::*;
     // Raw pointers cross the rayon closure boundary as integers (the same pattern as the parallel
     // GEMM / reductions); every task reads a disjoint row of `x` and writes a disjoint `out[i]`.
     let (x_addr, out_addr) = (x as usize, out as usize);
@@ -191,7 +190,7 @@ unsafe fn rowarg_par(x: *const f32, out: *mut i32, rows: i64, cols: i64, is_max:
     // outlined `@parallel` region bodies are left on undersized stacks. Idempotent (`Once`) and
     // provisioning-only: the work split below is unchanged, so serial == parallel stays bit-exact.
     crate::ensure_global_pool();
-    (0..r).into_par_iter().for_each(|i| {
+    crate::par::for_each_unit(r, |i| {
         // SAFETY: disjoint row read + disjoint out[i] write; pointers re-derived from the addresses.
         unsafe {
             let xi = (x_addr as *const f32).add(i * c);

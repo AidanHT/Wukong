@@ -507,7 +507,6 @@ pub unsafe extern "C" fn wukong_transpose_f32_parallel(
         transpose_rows_f32(src, dst, r, c, 0, r);
         return;
     }
-    use rayon::prelude::*;
     // This fork can be the process's FIRST rayon touch, so it must provision the global pool first —
     // [`crate::ensure_global_pool`]'s stated precondition. Forking bare builds rayon's default
     // 2 MiB-stack registry, so the runtime's later 16 MiB `build_global` silently loses the race and
@@ -516,7 +515,7 @@ pub unsafe extern "C" fn wukong_transpose_f32_parallel(
     crate::ensure_global_pool();
     let nblocks = r.div_ceil(B);
     let (src_addr, dst_addr) = (src as usize, dst as usize);
-    (0..nblocks).into_par_iter().for_each(|blk| {
+    crate::par::for_each_unit(nblocks, |blk| {
         let i0 = blk * B;
         let i1 = (i0 + B).min(r);
         // SAFETY: disjoint dst-row range per block (dst[*, i] for i in [i0, i1)); pointers re-derived
@@ -572,12 +571,11 @@ pub unsafe extern "C" fn wukong_transpose_u16_parallel(
         transpose_rows_u16(src, dst, r, c, 0, r);
         return;
     }
-    use rayon::prelude::*;
     // Same first-rayon-touch precondition as the f32 entry: provision the global pool before forking.
     crate::ensure_global_pool();
     let nblocks = r.div_ceil(B);
     let (src_addr, dst_addr) = (src as usize, dst as usize);
-    (0..nblocks).into_par_iter().for_each(|blk| {
+    crate::par::for_each_unit(nblocks, |blk| {
         let i0 = blk * B;
         let i1 = (i0 + B).min(r);
         // SAFETY: disjoint dst-row range per block (dst[*, i] for i in [i0, i1)); pointers re-derived

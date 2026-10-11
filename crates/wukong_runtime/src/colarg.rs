@@ -346,7 +346,6 @@ unsafe fn colarg_par(x: *const f32, out: *mut i32, rows: i64, cols: i64, is_max:
         colarg_range(x, out, r, c, 0, c, is_max);
         return;
     }
-    use rayon::prelude::*;
     // This entry can be the process's FIRST rayon touch, so it must configure the global pool before
     // forking (crate::ensure_global_pool's stated contract): otherwise rayon lazily builds its default
     // 2 MiB-stack registry here and the runtime's 16 MiB build_global silently loses the race for the
@@ -370,7 +369,7 @@ unsafe fn colarg_par(x: *const f32, out: *mut i32, rows: i64, cols: i64, is_max:
         .max(COLARG_JB);
     let nstripes = c.div_ceil(per);
     let (x_addr, out_addr) = (x as usize, out as usize);
-    (0..nstripes).into_par_iter().for_each(|s| {
+    crate::par::for_each_unit(nstripes, |s| {
         let j0 = s * per;
         let j1 = (j0 + per).min(c);
         // SAFETY: disjoint out[] stripe per task; pointers re-derived from the captured addresses.

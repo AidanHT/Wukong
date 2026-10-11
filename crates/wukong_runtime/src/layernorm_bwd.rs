@@ -535,7 +535,6 @@ pub unsafe extern "C" fn wukong_layernorm_bwd_f32_parallel(
         return;
     }
     let eps = f32::from_bits(eps_bits as u32);
-    use rayon::prelude::*;
     // Raw pointers cross the rayon boundary as integers (null `gamma` round-trips through 0); rows are
     // disjoint, gamma is shared read-only — the same pattern as the parallel norm/reduce kernels.
     let (x_addr, dy_addr, g_addr, dx_addr) = (x as usize, dy as usize, gamma as usize, dx as usize);
@@ -545,7 +544,7 @@ pub unsafe extern "C" fn wukong_layernorm_bwd_f32_parallel(
     // outlined `@parallel` region bodies are left on undersized stacks. Idempotent (`Once`) and
     // provisioning-only: the work split below is unchanged, so serial == parallel stays bit-exact.
     crate::ensure_global_pool();
-    (0..r).into_par_iter().for_each(|row| {
+    crate::par::for_each_unit(r, |row| {
         let off = row * c;
         // SAFETY: disjoint row slice; pointers re-derived from the captured addresses; gamma shared.
         unsafe {
