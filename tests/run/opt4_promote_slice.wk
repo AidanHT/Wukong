@@ -1,0 +1,167 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0.5
+// EXPECT-OUT: 7
+// EXPECT-OUT: 9
+// EXPECT-OUT: 1.5
+// EXPECT-OUT: 7
+// EXPECT-OUT: 9
+// EXPECT-OUT: 7.5
+// EXPECT-OUT: 7
+// EXPECT-OUT: 9
+// EXPECT-OUT: 63.5
+// EXPECT-OUT: 7
+// EXPECT-OUT: 9
+// EXPECT-OUT: 127.5
+// EXPECT-OUT: 7
+// EXPECT-OUT: 9
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 300
+// EXPECT-OUT: 400
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 294
+// EXPECT-OUT: 400
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 309
+// EXPECT-OUT: 400
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 435
+// EXPECT-OUT: 400
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 2000
+// EXPECT-OUT: 3000
+// EXPECT-OUT: 4000
+// EXPECT-OUT: 5000
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 1998
+// EXPECT-OUT: 3000
+// EXPECT-OUT: 4034
+// EXPECT-OUT: 5000
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 2003
+// EXPECT-OUT: 3000
+// EXPECT-OUT: 4373
+// EXPECT-OUT: 5000
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 2045
+// EXPECT-OUT: 3000
+// EXPECT-OUT: 6393
+// EXPECT-OUT: 5000
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 11
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 22
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+module tests.run.opt4_promote_slice
+
+// Reductions written through one element of a `@noalias` slice, which `wukong_opt::promote` keeps
+// in a register at -O2. Bounds-check elimination first versions each loop into a checked and a
+// check-free copy that share one exit block; the write-back cannot go in that block (the checked
+// copy leaves through it too), so promotion puts it in a new block on the check-free copy's exit
+// edge. (At -O2 the four functions are inlined into `main`; the trip counts are loaded from arrays,
+// so the loops are still versioned, and the check-free copies still share their exits.) Every lane
+// of every output buffer is printed, so a write-back to the wrong lane, a missing one, or one on a
+// zero-trip entry shows.
+//
+// Expected values, from the scalar loops (each call starts from a fresh buffer):
+//   red_f32    a = [1, 2, 4, .., 64], o = [0.5, 7, 9]: o[0] = 0.5 + (2^n - 1) for n = 0, 1, 3, 6, 7.
+//   red_i64    a = [3, -5, 7, 11, -13, 17, 19, -23, 29], k = 3, out = [100, 200, 300, 400]:
+//              out[2] = 300 + 3 * (a[0] + .. + a[n-1]); prefix sums 0, -2, 3, 45 for n = 0, 2, 5, 9.
+//   red_two    the same a, out = [1000, 2000, 3000, 4000, 5000]: out[1] += the prefix sum and
+//              out[3] += the prefix sum of squares (0, 34, 373, 2393).
+//   red_alias  not `@noalias`, and called with `a` the same slice as `out` = [1, 2, 3, 4, 5, 6]:
+//              out[0] += out[i] for i < n, so n = 0, 1, 4, 6 give out[0] = 1, 2, 11, 22. Nothing
+//              may be promoted here: the loop reads the location through `a`.
+
+fn red_f32(@noalias mut out: []f32, a: []f32, n: i64) {
+    for i in 0..n {
+        out[0] += a[i];
+    }
+}
+
+fn red_i64(@noalias mut out: []i64, a: []i64, k: i64, n: i64) {
+    for i in 0..n {
+        out[2] = out[2] + a[i] * k;
+    }
+}
+
+fn red_two(@noalias mut out: []i64, a: []i64, n: i64) {
+    for i in 0..n {
+        out[1] += a[i];
+        out[3] += a[i] * a[i];
+    }
+}
+
+fn red_alias(mut out: []i64, a: []i64, n: i64) {
+    for i in 0..n {
+        out[0] += a[i];
+    }
+}
+
+fn main() -> i32 {
+    let af: [f32; 7] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0];
+    let saf: []f32 = af;
+    let nf: [i64; 5] = [0, 1, 3, 6, 7];
+    for q in 0..5 {
+        let mut o: [f32; 3] = [0.5, 7.0, 9.0];
+        let so: []f32 = o;
+        red_f32(so, saf, nf[q]);
+        for k in 0..3 {
+            print(o[k]);
+        }
+    }
+
+    let a: [i64; 9] = [3, -5, 7, 11, -13, 17, 19, -23, 29];
+    let sa: []i64 = a;
+    let ns: [i64; 4] = [0, 2, 5, 9];
+    for q in 0..4 {
+        let mut o: [i64; 4] = [100, 200, 300, 400];
+        let so: []i64 = o;
+        red_i64(so, sa, 3, ns[q]);
+        for k in 0..4 {
+            print(o[k]);
+        }
+    }
+    for q in 0..4 {
+        let mut o: [i64; 5] = [1000, 2000, 3000, 4000, 5000];
+        let so: []i64 = o;
+        red_two(so, sa, ns[q]);
+        for k in 0..5 {
+            print(o[k]);
+        }
+    }
+
+    let na: [i64; 4] = [0, 1, 4, 6];
+    for q in 0..4 {
+        let mut o: [i64; 6] = [1, 2, 3, 4, 5, 6];
+        let so: []i64 = o;
+        red_alias(so, so, na[q]);
+        for k in 0..6 {
+            print(o[k]);
+        }
+    }
+    return 0;
+}
