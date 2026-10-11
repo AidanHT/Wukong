@@ -279,6 +279,15 @@ diagnostic, never silence, which is why `@tile` on a loop form it cannot strip-m
 width that is not a positive integer literal, are both `E0309` (`tests/fail/tile_bad_form.wk`,
 `tile_zero_width.wk`, `tile_non_integer_width.wk`).
 
+**A new `ExprKind` variant is a sweep the compiler drives.** Every expression walker of the front
+end is an exhaustive `match` (28 of them when closures landed, across `wukong_ast`, the driver's
+loader, `wukong_sema` and `wukong_mir_build`), so building the workspace lists them all. Decide each
+arm instead of copying a leaf: a closure body is walked by name resolution, alias expansion, the
+attribute check and the lints' use tracking, but never by a divergence analysis
+(`block_diverges`, `expr_contains_break`, the lints' `stmt_diverges`), where its `return` would end
+the enclosing function. `wukong_mir_build`'s walkers can treat it as a leaf only because
+`closures::lift_module` rewrites every closure away before any of them runs.
+
 ## Adding a MIR `Op`
 
 Prefer *not* to: `abs`, `exp`, `silu` and friends are built from existing primitives in
