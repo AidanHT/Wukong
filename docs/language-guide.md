@@ -1444,12 +1444,14 @@ What the lowering guarantees on top of the kernel call:
   overlaps one: the call compares address ranges at run time and, on overlap, computes into scratch
   and copies the result out (`matmul::<2, 2, 2>(p, q, p)` is `p·q`). An elementwise or row-wise
   builtin spelled in place with one name (`softmax(x, x)`) runs in place with no test.
-- **`sdpa`'s static form.** With constant `s`/`d` and statically sized operands every extent check
-  is decided at compile time, and an input whose storage is provably apart from `out` — two
-  different fixed-array locals, a local and a fixed-array parameter, or two fixed-array parameters
+- **`sdpa`'s static form.** An input whose storage is provably apart from `out` — two different
+  fixed-array locals, a local and a fixed-array parameter, or two different fixed-array parameters
   that no call site binds to one array or that a `@noalias` promise separates — needs no overlap
-  test. When all three inputs are proved apart the call is one bare `wukong_attention_f32` with no
-  branch; a slice, a view or a may-alias pair keeps the guard.
+  test. When all three inputs are proved apart there is no branch: the call is one bare
+  `wukong_attention_f32`, preceded only by the extent checks that are not compile-time facts, as
+  straight-line `assert`s (with constant `s`/`d` and statically sized operands there are none). A
+  slice, a view, a may-alias pair or one array under two names (`match m { x => sdpa(x, x, x, m,
+  ..) }`, `tests/run/sdpa_match_alias.wk`) keeps the guard.
 - **Empty contractions.** `matmul` with `K = 0` is the zero matrix and `linear` the broadcast bias,
   although the GEMM kernels themselves write nothing for `K = 0`.
 - Inside a `@parallel` function each call uses the kernel's multicore twin, which is bit-identical.
@@ -2255,9 +2257,10 @@ the reason (`docs/roadmap.md`, *Automatic differentiation*). A named kernel buil
 output buffer other than its own input (`matmul(a, b, c)`, `softmax(x, y)`) lowers behind a
 run-time output-overlap dispatch — a branch — so a loss that calls one is not single-block and is
 refused; write that layer as the recognized loops to train it. `sdpa` is the exception when its
-static form applies — constant `s`/`d`, fixed-array operands, inputs proved apart from `out` (for
-example `@noalias` parameters): it is one bare kernel call, and a loss calling it differentiates
-and trains through the fused attention VJP (`tests/run/sdpa_loss_train.wk`).
+static form applies — fixed-array operands with every input proved apart from `out` (for example
+`@noalias` parameters): it is one bare kernel call, and a loss calling it differentiates and trains
+through the fused attention VJP (`tests/run/sdpa_loss_train.wk`). `s` and `d` need not be
+constants: their checks are straight-line `assert`s, which the tape passes through.
 
 **✅ AOT gradient:** `wukongc --emit=obj --grad-of=loss -o model.o model.wk` exports `loss_grad`
 next to `loss` (C ABI: the loss's parameters, then one caller-zeroed gradient buffer per

@@ -1176,17 +1176,22 @@ trainable frequency table), the embedding gather and the fused scaled-dot-produc
 (`wukong_attention_f32`, causal or not — its backward is the FlashAttention recompute: the weights
 are rebuilt with the α-scaled score GEMM and the row softmax, then `dV = Pᵀ·dO`, `dS =
 softmax_bwd(P, dO·Vᵀ)·scale`, `dQ = dS·K`, `dK = dSᵀ·Q`, all on the tuned GEMM and
-`wukong_softmax_bwd_f32` kernels). A source `sdpa(...)` call differentiates from source when its
-static form applies — constant `s`/`d`, fixed-array or static-tensor operands, and every input proved
-apart from the output (two different locals, a local and a parameter, or parameters the call-site
-alias fact or a `@noalias` promise separates): the lowering then emits one bare
-`wukong_attention_f32`, and `--emit=grad` / `--train` run through this VJP
+`wukong_softmax_bwd_f32` kernels). A source `sdpa(...)` call differentiates from source when every
+input is proved apart from the output — each of `q`, `k`, `v` and `out` a fixed-array local or a
+fixed-array / static-tensor parameter, and each input pair with `out` two different locals, a local
+and a parameter, or two different parameters the call-site alias fact or a `@noalias` promise
+separates. The lowering then emits no overlap test and the call is one bare `wukong_attention_f32`
+in a straight-line block; `--emit=grad` / `--train` run through this VJP
 (`tests/run/sdpa_loss_train.wk`, `crates/wukongc/tests/autodiff_attention.rs`, gated against the
-f64 central finite difference in `wukong_driver`'s `grad_model_tests`). Any other `sdpa` — a slice
-operand, a runtime `s`/`d`, a may-alias pair — and every other named kernel builtin that writes an
-output buffer other than its own input still lowers behind a run-time output-overlap dispatch (a
-branch), so a loss that makes such a call is not single-block and is refused by the straight-line
-contract; spell the layer with the recognized loops to train it from source.
+f64 central finite difference in `wukong_driver`'s `grad_model_tests`). `s` and `d` may be runtime
+values: their range checks and the operands' extent checks are then straight-line `assert` calls,
+which do not block differentiation (`sdpa_loss_with_runtime_dims_matches_f64_finite_differences`);
+constant `s`/`d` with static extents only removes those `assert`s. Any other `sdpa` — a slice
+operand, a view, a may-alias pair, one storage under two names (`match m { x => sdpa(x, x, x, m,
+..) }`) — and every other named kernel builtin that writes an output buffer other than its own
+input still lowers behind a run-time output-overlap dispatch (a branch), so a loss that makes such
+a call is not single-block and is refused by the straight-line contract; spell the layer with the
+recognized loops to train it from source.
 
 **The backward rides the tuned kernels.** The GEMM adjoints are the runtime's own transposed GEMM
 spellings (no synthesized transpose); softmax / LayerNorm / RMSNorm backward are the runtime's

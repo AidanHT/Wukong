@@ -45,10 +45,11 @@
 //!   separated only by the facts every recognizer already trusts, asked verbatim:
 //!   `alias::plan_kernel_alias` over the whole-program call-site bit, or a `@noalias` promise
 //!   (`promised_disjoint`). Anything else — a slice, a view, a projection, a may-alias pair, one
-//!   storage under two names — keeps the guard. With constant `s`/`d`
-//!   and statically sized operands the extent checks fold too, so such a call is ONE bare
-//!   `wukong_attention_f32` in a straight-line block, which is what lets `wukong_autodiff`
-//!   differentiate a loss calling `sdpa` (it accepts single-block functions only).
+//!   storage under two names — keeps the guard. With all three inputs proved apart there is no
+//!   branch: the call is ONE bare `wukong_attention_f32` in a straight-line block, which is what
+//!   lets `wukong_autodiff` differentiate a loss calling `sdpa` (it accepts single-block functions
+//!   only). The extent checks are `assert` calls in that same block, never a branch; with constant
+//!   `s`/`d` and statically sized operands they fold away too.
 //! * **Empty contractions.** The GEMM kernels return without writing anything when `K <= 0`, but
 //!   `A·B` over an empty contraction is the zero matrix (and `linear` is the broadcast bias), so a
 //!   `K` that is not a positive constant gets that fill on its `K == 0` path.
@@ -841,9 +842,10 @@ impl FnLowerer<'_> {
     /// The static form (see the module docs): a check whose outcome is a compile-time fact — a
     /// constant `s`/`d` inside the range, a fixed extent of at least a constant `s·d` — is not
     /// emitted, and an input [`Self::sdpa_storage_disjoint`] proves apart from `out` gets no overlap
-    /// test. When every check folds and all three inputs are proved apart, the call is one bare
-    /// `wukong_attention_f32` with no branch. A check that would fail statically is kept (it traps
-    /// at run time exactly as before), and so is every pair the proof cannot settle.
+    /// test. When all three inputs are proved apart, the call is one bare `wukong_attention_f32`
+    /// with no branch, after whatever checks remain as straight-line `assert`s (none when every
+    /// check folds). A check that would fail statically is kept (it traps at run time exactly as
+    /// before), and so is every pair the proof cannot settle.
     fn lower_sdpa_builtin(&mut self, e: &Expr, args: &[Expr]) -> ValueId {
         if args.len() != 8 {
             self.unsupported(

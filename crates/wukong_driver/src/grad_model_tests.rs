@@ -337,12 +337,12 @@ fn sdpa_loss_f64(
 }
 
 /// N83: a loss calling the `sdpa` builtin differentiates from source. The lowering's static form
-/// (constant `s`/`d`, fixed-array operands, every input proved apart from `o`) is one bare
-/// `wukong_attention_f32` in a straight-line function, which is what `build_grad` accepts; the
-/// guarded form used to be refused as "`loss` has 16 blocks". `dQ`, `dK` and `dV` are checked at
-/// every element against the f64 CENTRAL FINITE DIFFERENCE of [`sdpa_loss_f64`] — the source's
-/// loss re-evaluated in f64 at the same f32 inputs, so the difference is free of the f32 forward's
-/// rounding (step `h = 1e-4`: truncation `O(h²)`, cancellation `~1e-16/h`, both far below the band).
+/// (every input proved apart from `o`, here by `@noalias`) is one bare `wukong_attention_f32` in a
+/// straight-line function, which is what `build_grad` accepts; the guarded form used to be refused
+/// as "`loss` has 16 blocks". `dQ`, `dK` and `dV` are checked at every element against the f64
+/// CENTRAL FINITE DIFFERENCE of [`sdpa_loss_f64`] — the source's loss re-evaluated in f64 at the
+/// same f32 inputs, so the difference is free of the f32 forward's rounding (step `h = 1e-4`:
+/// truncation `O(h²)`, cancellation `~1e-16/h`, both far below the band).
 ///
 /// The band is DECLARED, not fitted: `3e-3 + 3e-3·|ref|`, the closed-form band
 /// `wukong_autodiff`'s `tape_gate` holds every buffer-tape VJP to against an f64 reference — the
@@ -351,7 +351,41 @@ fn sdpa_loss_f64(
 /// is what that band budgets for.
 #[test]
 fn sdpa_loss_from_source_matches_f64_finite_differences() {
-    let (s, d) = (4usize, 8usize);
+    for causal in [false, true] {
+        let src = SDPA_LOSS.replace("CAUSAL", &u8::from(causal).to_string());
+        assert_sdpa_loss_matches_fd(&src, &[], 4, 8, causal);
+    }
+}
+
+/// The same loss with RUNTIME `s`/`d`, read from a buffer the loss takes (`sd[0] as i64`). Neither
+/// dimension is a compile-time fact, so their range checks and the operands' extent checks stay —
+/// as straight-line `assert` calls, which the tape treats as effects — and only the overlap test is
+/// gone (every input is still proved apart from `o`). So the function is still one block and
+/// differentiates, and the VJP reads the dimensions as values. Checked at the shape of the test
+/// above and at a reshaped `s = 2`, `d = 16` over the same 32-element buffers, in the same band.
+#[test]
+fn sdpa_loss_with_runtime_dims_matches_f64_finite_differences() {
+    const SRC: &str = "@parallel\n\
+        fn loss(@noalias q: [f32; 32], @noalias k: [f32; 32], @noalias v: [f32; 32], \
+        mut o: [f32; 32], mut out: [f32; 1], sd: [f32; 2]) -> f32 {\n\
+        sdpa(q, k, v, o, sd[0] as i64, sd[1] as i64, 0.35355339, CAUSAL);\n\
+        let mut l: f32 = 0.0;\n\
+        for i in 0..32 { l = l + o[i] * o[i]; }\n\
+        out[0] = l;\n\
+        return l;\n\
+        }";
+    for (s, d) in [(4usize, 8usize), (2, 16)] {
+        for causal in [false, true] {
+            let src = SRC.replace("CAUSAL", &u8::from(causal).to_string());
+            assert_sdpa_loss_matches_fd(&src, &[vec![s as f32, d as f32]], s, d, causal);
+        }
+    }
+}
+
+/// Differentiate `loss(q, k, v, o, out, ..tail)` of `src` (an `s·d = 32` attention head and
+/// `L = Σ o²`) in `(q, k, v)` at `-O1` and `-O2`, and hold every gradient element to the declared
+/// band against the f64 central difference of [`sdpa_loss_f64`].
+fn assert_sdpa_loss_matches_fd(src: &str, tail: &[Vec<f32>], s: usize, d: usize, causal: bool) {
     let n = s * d;
     let scale_f32: f32 = 0.353_553_39;
     let scale = scale_f32 as f64;
@@ -361,38 +395,36 @@ fn sdpa_loss_from_source_matches_f64_finite_differences() {
             .map(|i| ((i * 37 + seed * 11) % 23) as f32 / 16.0 - 11.0 / 16.0)
             .collect()
     };
-    for causal in [0u8, 1] {
-        let src = SDPA_LOSS.replace("CAUSAL", &causal.to_string());
-        for level in [1u8, 2] {
-            let (program, mut it) = compile_at(&src, level, "loss");
-            let (prog, _f, g) = grad_program(&program, &mut it, "loss", &[0, 1, 2]);
-            let inputs = vec![fill(1), fill(2), fill(3), vec![0.0; n], vec![0.0]];
-            let grads = analytic(&prog, g, &inputs, &[0, 1, 2], &it);
-            assert!(
-                grads.iter().flatten().any(|x| x.abs() > 1e-2),
-                "causal={causal} -O{level}: the gradient is trivially zero"
-            );
-            let wide: Vec<Vec<f64>> = inputs[..3]
-                .iter()
-                .map(|b| b.iter().map(|&x| x as f64).collect())
-                .collect();
-            let h = 1e-4;
-            for (gi, grad) in grads.iter().enumerate() {
-                for j in 0..n {
-                    let at = |delta: f64| {
-                        let mut ops = wide.clone();
-                        ops[gi][j] += delta;
-                        sdpa_loss_f64(&ops[0], &ops[1], &ops[2], s, d, scale, causal == 1)
-                    };
-                    let fd = (at(h) - at(-h)) / (2.0 * h);
-                    let a = grad[j] as f64;
-                    assert!(
-                        (a - fd).abs() <= 3e-3 + 3e-3 * fd.abs(),
-                        "causal={causal} -O{level} d{}[{j}]: analytic {a} vs f64 central \
-                         difference {fd}",
-                        ["q", "k", "v"][gi]
-                    );
-                }
+    for level in [1u8, 2] {
+        let what = format!("s={s} d={d} causal={causal} -O{level}");
+        let (program, mut it) = compile_at(src, level, "loss");
+        let (prog, _f, g) = grad_program(&program, &mut it, "loss", &[0, 1, 2]);
+        let mut inputs = vec![fill(1), fill(2), fill(3), vec![0.0; n], vec![0.0]];
+        inputs.extend_from_slice(tail);
+        let grads = analytic(&prog, g, &inputs, &[0, 1, 2], &it);
+        assert!(
+            grads.iter().flatten().any(|x| x.abs() > 1e-2),
+            "{what}: the gradient is trivially zero"
+        );
+        let wide: Vec<Vec<f64>> = inputs[..3]
+            .iter()
+            .map(|b| b.iter().map(|&x| x as f64).collect())
+            .collect();
+        let h = 1e-4;
+        for (gi, grad) in grads.iter().enumerate() {
+            for j in 0..n {
+                let at = |delta: f64| {
+                    let mut ops = wide.clone();
+                    ops[gi][j] += delta;
+                    sdpa_loss_f64(&ops[0], &ops[1], &ops[2], s, d, scale, causal)
+                };
+                let fd = (at(h) - at(-h)) / (2.0 * h);
+                let a = grad[j] as f64;
+                assert!(
+                    (a - fd).abs() <= 3e-3 + 3e-3 * fd.abs(),
+                    "{what} d{}[{j}]: analytic {a} vs f64 central difference {fd}",
+                    ["q", "k", "v"][gi]
+                );
             }
         }
     }

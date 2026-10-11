@@ -155,10 +155,13 @@ runtime kernel behind runtime extent checks (trapping through `assert`) and an o
 (scratch + copy-out), independent of `@generic`/recognition. `sdpa` alone has a **static form**: a
 check whose outcome is a compile-time fact is not emitted, and an input whose `StorageRoot` (a
 fixed-array local's own `alloca`, or a fixed-array/static-tensor parameter bound to its storage —
-`noalias.rs`'s `param_is_its_storage`) is proved apart from `out`'s — different allocas, an alloca
-and a parameter, or two parameters `alias::plan_kernel_alias` answers `Dispatch` for or a `@noalias`
-promise separates — gets no overlap test, so a fully static call is one bare `wukong_attention_f32`
-in a straight-line block that `wukong_autodiff` differentiates. A dtype-generic `Tensor[T, ..]`
+`noalias.rs`'s `param_is_its_storage`; roots compare by VALUE, since a `match` binding gives one
+parameter a second name) is proved apart from `out`'s — different allocas, an alloca and a
+parameter, or two different parameters `alias::plan_kernel_alias` answers `Dispatch` for or a
+`@noalias` promise separates — gets no overlap test. With all three inputs proved apart the call
+is one bare `wukong_attention_f32` in a straight-line block that `wukong_autodiff` differentiates;
+the checks a runtime `s`/`d` or extent still needs are `assert` calls in that block, which the tape
+treats as effects. A dtype-generic `Tensor[T, ..]`
 operand of a kernel builtin or of the ML I/O family (`read_*`/`write_*`, `st_read_*`, `topk_f32`, …)
 is accepted in the generic body and re-checked per instance (`E0415` kernel / `E0416` I/O when `T`
 is not the builtin's element). That re-check stops at 512 instances while the monomorphizer lowers

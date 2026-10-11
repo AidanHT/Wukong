@@ -2,10 +2,10 @@
 //!
 //! `sdpa` used to lower to run-time extent checks plus a scratch-copy overlap guard, so a loss
 //! calling it was multi-block and `wukong_autodiff` refused it ("`loss` has 16 blocks") although
-//! `tape_attn.rs` carries the fused attention VJP. With constant `s`/`d`, fixed-array operands and
-//! every input proved apart from the output (here by `@noalias`), the lowering now emits one bare
-//! `wukong_attention_f32` (`wukong_mir_build::builtins`), and this file pins what that buys at the
-//! CLI:
+//! `tape_attn.rs` carries the fused attention VJP. With fixed-array operands and every input proved
+//! apart from the output (here by `@noalias`), the lowering now emits one bare
+//! `wukong_attention_f32` (`wukong_mir_build::builtins`) — here with constant `s`/`d`, so not even
+//! an extent `assert` precedes it — and this file pins what that buys at the CLI:
 //!
 //! * `--emit=grad` succeeds at every `-O` level, and the backward replays the forward attention
 //!   and then rides the FlashAttention recompute — every kernel of `tape_attn.rs`'s table. The
@@ -15,8 +15,9 @@
 //!   synthesized backward's only differential peer — and the loss descends.
 //!
 //! Gradient VALUES are gated in-crate against the f64 central finite difference of the same
-//! source loss (`wukong_driver::grad_model_tests::sdpa_loss_from_source_matches_f64_finite_differences`)
-//! and the f64 closed form on hand-built MIR (`wukong_autodiff`'s `tests/attention.rs`).
+//! source loss (`wukong_driver::grad_model_tests::sdpa_loss_from_source_matches_f64_finite_differences`,
+//! and `..._with_runtime_dims_...` for `s`/`d` read at run time) and the f64 closed form on
+//! hand-built MIR (`wukong_autodiff`'s `tests/attention.rs`).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
