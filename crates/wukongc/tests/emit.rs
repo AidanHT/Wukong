@@ -149,8 +149,47 @@ fn llvm_setup_doc_shows_the_emitted_fib_module() {
         body(&emitted),
         "docs/llvm-setup.md's fib module is stale; paste the current output"
     );
-    for text in [block, emitted.as_str()] {
-        assert!(text.contains("\ntarget datalayout = \"e-m:"), "{text}");
-        assert!(text.contains("\ntarget triple = \"x86_64-"), "{text}");
+    // The doc shows the module an x86-64 Windows host prints: layout, then triple.
+    assert!(
+        block.contains("\ntarget datalayout = \"e-m:w-")
+            && block.contains("\ntarget triple = \"x86_64-pc-windows-msvc\""),
+        "{block}"
+    );
+    // The emitted module names THIS host, whatever it is; the exact lines per host are pinned by
+    // `wukong_codegen_llvm`'s `module_names_the_host_target`. An aarch64 host prints its own triple
+    // and no layout, so only the shape is host-independent: the `target` lines come first, the
+    // layout (if any) before the triple, and the triple's architecture is the host's.
+    let target: Vec<&str> = emitted
+        .lines()
+        .skip(1)
+        .take_while(|l| l.starts_with("target "))
+        .collect();
+    let layout = target
+        .iter()
+        .position(|l| l.starts_with("target datalayout = \""));
+    let triple = target
+        .iter()
+        .position(|l| l.starts_with("target triple = \""));
+    assert_eq!(
+        emitted.matches("\ntarget ").count(),
+        target.len(),
+        "{emitted}"
+    );
+    if let (Some(layout), Some(triple)) = (layout, triple) {
+        assert!(layout < triple, "{emitted}");
+    }
+    if let Some(triple) = triple {
+        let arch = format!("target triple = \"{}-", std::env::consts::ARCH);
+        assert!(target[triple].starts_with(&arch), "{emitted}");
+    }
+    // The Tier 1 hosts (x86-64 Windows MSVC, x86-64 Linux GNU) carry both lines.
+    if cfg!(all(
+        target_arch = "x86_64",
+        any(
+            all(target_os = "windows", target_env = "msvc"),
+            all(target_os = "linux", target_env = "gnu")
+        )
+    )) {
+        assert!(layout.is_some() && triple.is_some(), "{emitted}");
     }
 }
