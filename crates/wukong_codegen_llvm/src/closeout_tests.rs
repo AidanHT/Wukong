@@ -613,6 +613,27 @@ fn matching(text: &str, open: usize) -> usize {
 /// Every `#[no_mangle]` (or `#[unsafe(no_mangle)]`) `extern "C" fn` in `text`, after expanding the
 /// file's own `macro_rules!` templates (the runtime stamps its typed file I/O entries from one).
 fn parse_c_definitions(text: &str, into: &mut CAbi) -> Result<(), String> {
+    // `type Name = <type>;` aliases in this file (e.g. a `extern "C" fn(..)` callback type), so a
+    // signature that spells the alias maps through what it names.
+    let aliases: Vec<(&str, &str)> = text
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim_start();
+            let rest = l
+                .strip_prefix("pub type ")
+                .or_else(|| l.strip_prefix("type "))?;
+            let (name, ty) = rest.split_once('=')?;
+            Some((name.trim(), ty.trim().strip_suffix(';')?))
+        })
+        .collect();
+    let c_type = |rust: &str| {
+        let t = rust.trim();
+        let named = aliases
+            .iter()
+            .find(|(n, _)| *n == t)
+            .map_or(t, |(_, ty)| *ty);
+        c_type(named)
+    };
     let mut sources = vec![text.to_string()];
     // A single-arm `macro_rules! m { ($a:ident, …) => { … } }` whose body defines a C entry: expand
     // each `m!(…)` invocation in this file by substituting its arguments.

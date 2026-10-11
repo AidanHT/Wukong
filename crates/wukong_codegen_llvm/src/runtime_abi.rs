@@ -138,6 +138,7 @@ pub(crate) const RUNTIME_ABI: &[(&str, &str, &[&str])] = &[
     ("wukong_rt_scratch_mark", "i64", &[]),
     ("wukong_rt_scratch_release", "void", &["i64"]),
     ("wukong_rt_st_read", "i64", &["ptr", "ptr", "ptr", "i64", "i64", "ptr", "i64"]),
+    ("wukong_rt_train_main", "i32", &["ptr", "i64", "ptr"]),
     ("wukong_rt_trig_f32", "float", &["float", "i64"]),
     ("wukong_rt_write_dt", "i64", &["ptr", "ptr", "i64", "i64"]),
     ("wukong_rt_write_f32", "i64", &["ptr", "ptr", "i64"]),
