@@ -27,7 +27,7 @@
 pub mod lints;
 
 mod attrs;
-pub use attrs::{parallel_grain, MAX_PARALLEL_GRAIN};
+pub use attrs::{align_value, parallel_grain, MAX_ALIGN, MAX_PARALLEL_GRAIN};
 mod builtins;
 mod constraints;
 mod dependency;
@@ -165,6 +165,15 @@ pub fn is_now_ns(name: &str) -> bool {
 /// Whether `name` is the cooperative thread-block barrier builtin (`sync_block()`).
 pub fn is_sync_block(name: &str) -> bool {
     name == "sync_block"
+}
+
+/// Whether `name` is the atomic integer add builtin, `atomic_add(place, v)`: a statement (type
+/// `()`) that adds `v` to the integer at `place` as one indivisible read-modify-write
+/// (`Op::AtomicAdd`). Shared by sema (which types it), the lints (which read its first argument as
+/// a place, not a value) and `mir_build` (which lowers it), so the three cannot drift. A
+/// user-defined `atomic_add` shadows it.
+pub fn is_atomic_add(name: &str) -> bool {
+    name == "atomic_add"
 }
 
 /// A resolved top-level definition.
@@ -2753,6 +2762,86 @@ impl<'a> Sema<'a> {
         }
     }
 
+    /// `@align(N)` on a `let` (its argument and placement are `attrs.rs`'s) aligns the binding's
+    /// own stack slot, so the binding must be one name whose type owns its storage: an array, a
+    /// tuple or a struct. A scalar lives in a register, a pointer, reference or `[]T` slice names
+    /// someone else's storage, and a tensor local is a view of a buffer it does not own; on any of
+    /// them the attribute would be a promise nothing keeps, so it is `E0306`. (Heap and scratch
+    /// memory is already 64-byte aligned.)
+    fn check_let_align(&mut self, s: &Stmt, pat: &Pattern, bound: &Ty) {
+        let Some(attr) = s.attrs.iter().find(|a| self.sym_str(a.name.sym) == "align") else {
+            return;
+        };
+        let owns_storage = match bound {
+            Ty::Array { .. } | Ty::Tuple(_) => true,
+            Ty::Named(n) => matches!(
+                self.defs.lookup(*n).map(|d| &d.kind),
+                Some(DefKind::Struct(_))
+            ),
+            Ty::Unknown | Ty::Error => return,
+            _ => false,
+        };
+        let single_name = matches!(pat.kind, PatKind::Ident(_));
+        if owns_storage && single_name {
+            return;
+        }
+        let what = if !single_name {
+            "a destructuring pattern, which binds several names and no slot of its own".to_string()
+        } else {
+            format!("a binding of type `{}`", bound.display(self.interner))
+        };
+        self.diags.push(
+            Diagnostic::error(format!(
+                "`@align` aligns a `let`'s own stack slot, but this is {what}"
+            ))
+            .with_code("E0306")
+            .primary(attr.span, "nothing here has a slot to align")
+            .help(
+                "put `@align(N)` on a `let` of an array, tuple or struct; a scalar lives in a \
+                 register, a slice, pointer or tensor local names storage it does not own, and \
+                 heap and scratch buffers are already 64-byte aligned",
+            ),
+        );
+    }
+
+    /// E0304 for a write through a projection (`p.f`, `t.0`, `p[i]`, `t[i, j]`) of a non-`mut`
+    /// aggregate parameter, and the write-through-a-tensor-view diagnostic: the projection half of
+    /// `=`'s mutability rule, shared by every statement that writes a place (`x = v`, `x op= v` and
+    /// `atomic_add(place, v)`). A no-op for any other target: a bare name has its own rule, and a
+    /// dereference (`*p`, `(*p).f`) writes a pointee, not the parameter.
+    pub(crate) fn check_projection_write(&mut self, target: &Expr) {
+        if !matches!(
+            target.kind,
+            ExprKind::Field { .. } | ExprKind::TupleField { .. } | ExprKind::Index { .. }
+        ) {
+            return;
+        }
+        let Some(root) = self.assign_root_param(target) else {
+            return;
+        };
+        let decl = self
+            .immutable_param_decl(root)
+            .filter(|_| self.param_is_aggregate(root));
+        if let Some(decl) = decl {
+            let nm = self.sym_str(root).to_string();
+            self.immutable_assignment(
+                target.span,
+                format!(
+                    "cannot mutate `{nm}` through a non-`mut` parameter; an aggregate parameter is \
+                     passed by reference, so this would mutate the caller's value — add `mut` \
+                     to the parameter (`fn …(mut {nm}: …)`) to allow in-place mutation"
+                ),
+                "this store would mutate the caller's value",
+                decl,
+                Some(Span::new(decl.source, decl.lo, decl.lo)),
+                "parameter",
+                false,
+            );
+        } else if let Some(param) = self.tensor_view_root(root) {
+            self.report_write_through_view(target.span, root, param);
+        }
+    }
+
     /// Whether parameter `name`'s declared type is an aggregate passed BY REFERENCE (struct / tuple /
     /// array / tensor / vector — and a `[]T` slice, whose elements live in the caller's buffer) — the
     /// kinds whose through-projection mutation reaches the caller. Implemented as the complement of
@@ -2882,6 +2971,7 @@ impl<'a> Sema<'a> {
                     (None, None) => Ty::Unknown,
                 };
                 let bound = self.checked_let_type(bound, s.span);
+                self.check_let_align(s, pat, &bound);
                 // What the binding views is read BEFORE the name is bound, so a shadowing view
                 // (`let a = a[0];`) still resolves its initializer to the parameter it reads.
                 self.note_tensor_view(pat, &bound, init.as_ref());
@@ -3066,35 +3156,8 @@ impl<'a> Sema<'a> {
                             );
                         }
                     }
-                    ExprKind::Field { .. }
-                    | ExprKind::TupleField { .. }
-                    | ExprKind::Index { .. } => {
-                        if let Some(root) = self.assign_root_param(target) {
-                            let decl = self
-                                .immutable_param_decl(root)
-                                .filter(|_| self.param_is_aggregate(root));
-                            if let Some(decl) = decl {
-                                let nm = self.sym_str(root).to_string();
-                                self.immutable_assignment(
-                                    target.span,
-                                    format!(
-                                        "cannot mutate `{nm}` through a non-`mut` parameter; an \
-                                         aggregate parameter is passed by reference, so this would \
-                                         mutate the caller's value — add `mut` to the parameter \
-                                         (`fn …(mut {nm}: …)`) to allow in-place mutation"
-                                    ),
-                                    "this store would mutate the caller's value",
-                                    decl,
-                                    Some(Span::new(decl.source, decl.lo, decl.lo)),
-                                    "parameter",
-                                    false,
-                                );
-                            } else if let Some(param) = self.tensor_view_root(root) {
-                                self.report_write_through_view(target.span, root, param);
-                            }
-                        }
-                    }
-                    _ => {}
+                    // A projection (`p.f`, `t.0`, `p[i]`): the rule `atomic_add`'s place shares.
+                    _ => self.check_projection_write(target),
                 }
                 // Assigning a pointer/aggregate into a scalar place (or vice versa) reinterprets the
                 // bits — `x = p` for `x: i32`, `p: *i32` stores a truncated address, which the
@@ -5495,6 +5558,114 @@ mod tests {
         assert!(
             msgs.iter().any(|m| needles.iter().all(|n| m.contains(n))),
             "no {code} message contains {needles:?}; got {msgs:?} for {src:?}"
+        );
+    }
+
+    /// `@align(N)` aligns a `let`'s own stack slot, so the binding must be one name of a type that
+    /// owns its storage. (Argument and placement errors are `attrs.rs`'s; they are E0306 too.)
+    #[test]
+    fn align_needs_a_let_that_owns_its_storage() {
+        for ok in [
+            "fn f() { @align(64) let a: [f32; 4] = [0.0; 4]; }",
+            "fn f() { @align(4096) let a: [[u8; 2]; 2] = [[0; 2]; 2]; }",
+            "fn f() { @align(16) let t: (i32, f64) = (1, 2.0); }",
+            "struct S { x: i32 } fn f() { @align(32) let s = S { x: 1 }; }",
+        ] {
+            let errs = errors(ok);
+            assert!(errs.is_empty(), "{errs:?} for {ok:?}");
+        }
+        for bad in [
+            "fn f() { @align(32) let x: i32 = 1; }",
+            "fn f(p: *mut f32) { @align(32) let q: *mut f32 = p; }",
+            "fn f(s: []f32) { @align(32) let t: []f32 = s; }",
+            "fn f(x: Tensor[f32, 4]) { @align(32) let v = x; }",
+            "fn f() { @align(32) let (a, b) = (1, 2); }",
+            "enum E { A, B } fn f() { @align(32) let e = E::A; }",
+        ] {
+            assert_eq!(errors(bad), ["E0306"], "{bad}");
+        }
+    }
+
+    /// `atomic_add(place, v)`: a place other than a bare name, of an integer type, plus a value of
+    /// that type. Every misuse has its code; every place form is accepted.
+    #[test]
+    fn atomic_add_is_typed_as_an_integer_place_statement() {
+        let clean = |src: &str| {
+            let errs = errors(src);
+            assert!(errs.is_empty(), "{errs:?} for {src:?}");
+        };
+        // Every place form, every integer width and signedness, an adapting literal, and a
+        // non-literal of the place's own type.
+        clean(
+            "struct S { a: u8, b: i64 } \
+             fn f(mut h: [i64; 4], p: *mut u16, mut s: []i32, k: i64) { \
+                 atomic_add(h[1], k); atomic_add(*p, 7); atomic_add(s[0], -1); \
+                 let mut st = S { a: 1, b: 2 }; atomic_add(st.a, 255); atomic_add(st.b, k); \
+                 let mut t: (usize, i8) = (0, 0); atomic_add(t.0, 3); atomic_add(t.1, -128); \
+                 let mut m: [[u32; 2]; 2] = [[0; 2]; 2]; atomic_add(m[1][0], 4000000000); }",
+        );
+        // A literal-initialized binding takes the place's type at this use.
+        clean("fn f(mut h: [i64; 4]) { let d = 5; atomic_add(h[0], d); }");
+        // Arity.
+        assert_eq!(
+            errors("fn f(mut h: [i64; 4]) { atomic_add(h[0]); }"),
+            ["E0503"]
+        );
+        assert_eq!(
+            errors("fn f(mut h: [i64; 4]) { atomic_add(h[0], 1, 2); }"),
+            ["E0503"]
+        );
+        // Not a place: a bare name, a call result, a literal.
+        assert_eq!(
+            errors("fn f() { let mut n: i32 = 0; atomic_add(n, 1); }"),
+            ["E0437"]
+        );
+        assert_eq!(
+            errors("fn g() -> i32 { return 1; } fn f() { atomic_add(g(), 1); }"),
+            ["E0437"]
+        );
+        // Not an integer place: float, bool, char.
+        assert_eq!(
+            errors("fn f(mut h: [f32; 4]) { atomic_add(h[0], 1.0); }"),
+            ["E0446"]
+        );
+        assert_eq!(
+            errors("fn f(mut h: [bool; 4]) { atomic_add(h[0], true); }"),
+            ["E0446"]
+        );
+        assert_eq!(
+            errors("fn f(mut h: [char; 4]) { atomic_add(h[0], 'a'); }"),
+            ["E0446"]
+        );
+        // A value of another integer type, and a non-integer value.
+        assert_eq!(
+            errors("fn f(mut h: [i64; 4], k: i32) { atomic_add(h[0], k); }"),
+            ["E0447"]
+        );
+        assert_eq!(
+            errors("fn f(mut h: [i64; 4], x: f64) { atomic_add(h[0], x); }"),
+            ["E0446"]
+        );
+        // An out-of-range literal for the place's type.
+        assert_eq!(
+            errors("fn f(mut h: [u8; 4]) { atomic_add(h[0], 256); }"),
+            ["E0431"]
+        );
+        assert_eq!(
+            errors("fn f(mut h: [i8; 4]) { atomic_add(h[0], -129); }"),
+            ["E0431"]
+        );
+        // The write obeys `=`'s mutability rule: a non-`mut` aggregate parameter is the caller's.
+        assert_eq!(
+            errors("fn f(h: [i64; 4]) { atomic_add(h[0], 1); }"),
+            ["E0304"]
+        );
+        // ...while a pointee is not the parameter's own storage.
+        clean("fn f(p: *mut i64) { atomic_add(*p, 1); }");
+        // A user function named `atomic_add` shadows the builtin.
+        clean(
+            "fn atomic_add(a: i32, b: i32) -> i32 { return a + b; } \
+             fn f() -> i32 { let n: i32 = 1; return atomic_add(n, 2); }",
         );
     }
 

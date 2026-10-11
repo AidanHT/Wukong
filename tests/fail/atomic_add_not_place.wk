@@ -1,0 +1,12 @@
+// EXPECT-CODE: E0437
+// EXPECT-COUNT: 1
+module tests.fail.atomic_add_not_place
+
+// The first argument of `atomic_add` is a place in memory other threads can share: an array or
+// slice element, a field, or a pointee. A bare local name has no such address -- it is private to
+// the thread running it -- so `atomic_add(n, 1)` would be a plain `n += 1` dressed up as an atomic.
+fn main() -> i32 {
+    let mut n: i32 = 0;
+    atomic_add(n, 1); //~ E0437
+    return n;
+}

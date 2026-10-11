@@ -77,12 +77,17 @@ not duplicate them. In summary, Wukong:
   an unsupported loop form, a width that is not a positive integer literal — is `E0309` rather than a
   silent drop, while `@parallel(grain = G)` sets the per-worker iteration run (any other `@parallel`
   argument is `E0306`; without it the CPU backends size a grain from a straight-line loop body, so a
-  short loop runs as one chunk with no fork), while `@simd`/`@align`/`@extern`/`@export` parse and are inert — layout is
+  short loop runs as one chunk with no fork), `@align(N)` on a `let` aligns that local's stack slot,
+  while `@simd`/`@extern`/`@export` parse and are inert — layout is
   enforced across call boundaries; the default row-major (contiguous) layout and `.col_major` both
   lower multi-dimensional indexing (`.col_major` is byte-identical to `a[i + j*M]`); `.strided` /
   `.tiled(…)` still reject indexing (`C0001`). Runtime-sized memory is `alloc_<T>`/`free` (64-byte
   aligned, zeroed) plus a per-thread LIFO scratch arena (`scratch_<T>(n)` / `scratch_mark()` /
   `scratch_release(m)`); there is no uninitialized or user-selectable allocator yet.
+  `atomic_add(place, v)` is an integer read-modify-write for combining across `@parallel`
+  iterations (histograms, counters): integer addition commutes, so the native run prints the
+  interpreter's serial answer bit for bit (`tests/run/atomic_add_histogram.wk`; integer-only, no
+  fetch-add, not lowered by `gpu-native`).
 - **Checked slices.** Every `s[i]` on a `[]T` slice is checked against the length in its fat pointer
   on every backend (`index out of bounds: the len is N but the index is I at file:line:col`, exit 1);
   `-O2` removes the checks from counted loops by versioning them on one preheader guard, and

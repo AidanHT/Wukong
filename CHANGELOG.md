@@ -80,6 +80,56 @@ All notable changes to Wukong are documented here. The format is loosely based o
   passes after the parser.
 - **A binding inside an or-pattern** (`E::A(v) | E::B(v) => v`) is refused once at the pattern
   (`C0001`, "a binding inside an or-pattern") instead of at every use of the name.
+### Atomic add and aligned stack locals (`gap5/mir-ops`)
+
+- **`Op::AtomicAdd` in MIR (P15.15).** `atomic.add vV, vP` is one indivisible, sequentially
+  consistent integer read-modify-write that adds a scalar `i8`..`i64` to the location `vP` points
+  at, wrapping at its width, with no result: the old value is deliberately unobservable, because
+  integer addition mod 2^n commutes and the final memory is then the same under every interleaving.
+  The verifier rejects a result, an `i1`, a float, a vector and a non-pointer address; the
+  interpreter adds and masks; Cranelift emits `atomic_rmw add` with plain flags and no alias region;
+  the LLVM text emits `atomicrmw add ... seq_cst`; `gpu-native` declines it as `UNSUPPORTED`. Every
+  optimizer pass treats it as the opaque memory effect `VecKernelCall` is. One hazard was confirmed
+  while auditing: `effects.rs` would have summarized a callee whose only write is an atomic add as
+  pure, and `dce` would have deleted its unused calls. `wukong_opt/src/atomic_tests.rs` pins that and
+  four more (store-to-load forwarding past the atomic, loop deletion, LICM of a load the loop
+  atomically updates, and vectorizing a loop that holds one), plus the escape scan publishing the
+  atomic's location. Removing one arm at a time, the `effects`, `cse`, `licm`, `has_side_effects`
+  and `loop_info::dependence` arms each fail a test. The escape scan has no arm of its own: its
+  fallback marks the operands escaped, and that is what the sixth test pins. The three
+  `vectorize.rs` arms sit behind `loop_info`'s verdict and the planner's `_ => return None`, so no
+  test can see one of them alone. A Cranelift stress test runs 2^16 adds into four counters, through `wukong_parallel_for`
+  and from 8 OS threads at once, 10 rounds each; replacing the RMW with a load/add/store loses
+  about two thirds of the updates there.
+- **`atomic_add(place, v)` (P15.15).** A statement builtin: `place = place + v`, wrapping at the
+  place's width, as one `Op::AtomicAdd`. `place` is an element (`b[i]`, `t[i, j]`, a slice
+  element, bounds-checked), a field (`s.f`, `t.0`) or a pointee (`*p`) of any integer type. A bare
+  name is `E0437`, a float/`bool`/`char` place `E0446`, a value of another integer type `E0447`, an
+  out-of-range literal `E0431`, wrong arity `E0503`, and a write through a non-`mut` aggregate
+  parameter `E0304`. The last uses `check_projection_write`, now shared with `=` and `op=`. The lints
+  read the first argument as a write, so a `mut` buffer updated only by atomics is not
+  `unwritten_output`. The `@parallel` region proof, shared by the whole-function outliner and
+  mid-function regions, now admits an atomic add to one element of a captured array that nothing
+  else in the loop reads or writes (nor any parameter that could be the same buffer). A histogram
+  is therefore really dispatched to `wukong_parallel_for`, and the native run prints the serial
+  answer bit for bit (`tests/run/atomic_add_histogram.wk`: three whole-function bodies, one
+  mid-function region and every place form at its wrap point; `tests/fail/atomic_add_float.wk`,
+  `tests/fail/atomic_add_not_place.wk`). Integer-only and without fetch-add by design;
+  `gpu-native` skips it as `UNSUPPORTED`.
+- **`@align(N)` on a `let` is honoured (P15.21's residual).** It used to be parsed and silently
+  discarded everywhere. Now it aligns that binding's stack slot to `N` bytes, a power of two up to
+  4096, via a new `align` field on `Op::Alloca`. `0` means natural alignment, every compiler-made
+  slot uses it, and it prints nothing, so existing MIR dumps are byte-identical. Cranelift
+  generalizes the 32-byte wide-slot scheme: it reserves `bytes + N - 16` and rounds the base up at
+  run time, and it emits the same CLIF as before for every slot without the attribute. A JIT probe
+  (`wukong_codegen_cranelift/tests/alloca_align.rs`) checks `align 64` and `align 32` bases in
+  every frame of a recursion at several stack parities. The LLVM text emits
+  `align max(natural, N)`, the interpreter ignores the field, and `gpu-native` declines `N > 8`. The
+  attribute is legal only on a `let` of one name of an array, tuple or struct. On a `fn`, a
+  parameter, a loop, another statement, a scalar, slice, pointer or tensor binding, or with an
+  argument that is not a power of two up to 4096, it is `E0306` (`tests/fail/align_bad_arg.wk`,
+  `tests/fail/align_misplaced.wk`). Every lane of `tests/run/align_local.wk` matches across
+  backends and `-O` levels.
 
 ### Type-lowering soundness (`gap4/sema-soundness`)
 

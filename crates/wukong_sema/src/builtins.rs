@@ -599,6 +599,7 @@ const FIXED_BUILTINS: &[&str] = &[
     "static_assert",
     "now_ns",
     "sync_block",
+    "atomic_add",
     "scratch_mark",
     "scratch_release",
     "file_size",
@@ -638,6 +639,7 @@ pub fn is_builtin_callee(name: &str) -> bool {
         || crate::scalar_builtin(name).is_some()
         || crate::is_now_ns(name)
         || crate::is_sync_block(name)
+        || crate::is_atomic_add(name)
 }
 
 /// Every builtin callee spelling, sorted and de-duplicated: the candidates of the "a function with

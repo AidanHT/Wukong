@@ -1163,7 +1163,7 @@ impl<'a> FnEmit<'a> {
         let mut sh_off = 0u64;
         for b in &self.func.blocks {
             for inst in &b.insts {
-                if let Op::Alloca { ty, space } = &inst.op {
+                if let Op::Alloca { ty, space, .. } = &inst.op {
                     if let Some(r) = inst.result {
                         let sz = size_of(ty).max(1);
                         let slot = sz.div_ceil(8) * 8;
@@ -1380,6 +1380,11 @@ impl<'a> FnEmit<'a> {
                     "{UNSUPPORTED} `VecKernelCall` (CPU raw-AVX2 kernel) not lowered to PTX"
                 ))
             }
+            // `atomic_add` has no PTX lowering yet (`atom.global.add` would also need the
+            // address-window proof every state-space-qualified op needs); decline, never guess.
+            Op::AtomicAdd { .. } => {
+                return Err(format!("{UNSUPPORTED} `AtomicAdd` not lowered to PTX"))
+            }
             _ => {}
         }
         let r = inst
@@ -1431,7 +1436,14 @@ impl<'a> FnEmit<'a> {
             }
             Op::Cast(kind, v, to) => self.lower_cast(*kind, *v, to, r)?,
             Op::Select(c, a, b) => self.lower_select(*c, *a, *b, &rty, r),
-            Op::Alloca { ty: _, space } => {
+            // Frame slots are packed at 8 bytes; a stricter `@align(N)` has no layout here yet, so
+            // it declines rather than hand out an address that breaks the promise.
+            Op::Alloca { align, .. } if *align > 8 => {
+                return Err(format!(
+                    "{UNSUPPORTED} `alloca` with alignment {align} (frame slots are 8-aligned)"
+                ))
+            }
+            Op::Alloca { ty: _, space, .. } => {
                 let d = self.reg(r);
                 match space {
                     wukong_mir::AddrSpace::Local => {
@@ -1561,7 +1573,11 @@ impl<'a> FnEmit<'a> {
                     "{UNSUPPORTED} `GlobalAddr` (static string data) not lowered to PTX"
                 ));
             }
-            Op::Store { .. } | Op::Call { .. } | Op::VecKernelCall { .. } | Op::Barrier => {
+            Op::Store { .. }
+            | Op::Call { .. }
+            | Op::VecKernelCall { .. }
+            | Op::Barrier
+            | Op::AtomicAdd { .. } => {
                 unreachable!("handled above")
             }
         }
@@ -5107,6 +5123,7 @@ pub fn local_frame_bytes(func: &Function) -> u64 {
             if let Op::Alloca {
                 ty,
                 space: wukong_mir::AddrSpace::Local,
+                ..
             } = &inst.op
             {
                 if inst.result.is_some() {

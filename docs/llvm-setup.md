@@ -71,9 +71,13 @@ The module implements the interpreter's language, not LLVM's defaults:
   `<n x i1>`;
 - a vector load or store promises only its lane's alignment (`align 4` for `<4 x float>`), because
   the vectorizer accesses vectors at every element offset, and a stack slot has the native
-  backend's alignment (its size rounded to a power of two, at most 16 bytes, 32 from 32 bytes up);
+  backend's alignment (its size rounded to a power of two, at most 16 bytes, 32 from 32 bytes up,
+  raised to `N` by an `@align(N)` on its `let`);
 - float literals are spelled in LLVM's exact hexadecimal form, so infinities, NaNs, tiny values and
-  decimals that are inexact in `float` are all valid IR.
+  decimals that are inexact in `float` are all valid IR;
+- `atomic_add(place, v)` (MIR `atomic.add`) is one `atomicrmw add ptr P, iN V seq_cst` whose old
+  value is named and never read — wrapping integer addition, sequentially consistent, exactly the
+  interpreter's add-and-mask and the Cranelift `atomic_rmw add`.
 
 It names the host's `target datalayout` and `target triple` (x86-64 Windows: `e-m:w-…` /
 `x86_64-pc-windows-msvc`; x86-64 Linux: `e-m:e-…` / `x86_64-unknown-linux-gnu`). The layout is the

@@ -367,7 +367,11 @@ fn clonable(f: &Function, forest: &LoopForest, l: &NaturalLoop) -> bool {
             n += 1;
             if matches!(
                 inst.op,
-                Op::Alloca { .. } | Op::Call { .. } | Op::VecKernelCall { .. } | Op::Barrier
+                Op::Alloca { .. }
+                    | Op::Call { .. }
+                    | Op::VecKernelCall { .. }
+                    | Op::Barrier
+                    | Op::AtomicAdd { .. }
             ) || inst.result.is_some_and(|r| f.value_type(r).is_vector())
             {
                 return false;

@@ -1,0 +1,14 @@
+// EXPECT-CODE: E0306
+// EXPECT-COUNT: 1
+module tests.fail.align_misplaced
+
+// `@align(N)` aligns one `let`'s stack slot and is read nowhere else. On a loop it would read as
+// "align this loop" (or its accesses), which nothing implements, so it is rejected instead of
+// being accepted and dropped.
+fn main() -> i32 {
+    let mut acc: [i32; 4] = [0; 4];
+    @align(32) for i in 0..4 { //~ E0306
+        acc[i] = i;
+    }
+    return acc[3];
+}

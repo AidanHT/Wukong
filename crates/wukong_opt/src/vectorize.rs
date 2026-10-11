@@ -1601,6 +1601,7 @@ fn linearize_region(
                 }
                 Op::Call { .. }
                 | Op::VecKernelCall { .. }
+                | Op::AtomicAdd { .. }
                 | Op::Alloca {
                     space: wukong_mir::AddrSpace::Local,
                     ..
@@ -1755,6 +1756,7 @@ fn never_faults(f: &Function, addr: ValueId, bytes: u64) -> bool {
             Some(Op::Alloca {
                 ty,
                 space: wukong_mir::AddrSpace::Local,
+                ..
             }) => match slot_bytes(ty) {
                 Some(n) => n,
                 None => return false,
@@ -1876,6 +1878,7 @@ impl TreeWalk<'_> {
                 }
                 Op::Call { .. }
                 | Op::VecKernelCall { .. }
+                | Op::AtomicAdd { .. }
                 | Op::Alloca {
                     space: wukong_mir::AddrSpace::Local,
                     ..
@@ -2709,6 +2712,7 @@ fn header_is_test_only(f: &Function, l: &NaturalLoop) -> bool {
                 | Op::Load(..)
                 | Op::Call { .. }
                 | Op::VecKernelCall { .. }
+                | Op::AtomicAdd { .. }
                 | Op::Alloca {
                     space: wukong_mir::AddrSpace::Local,
                     ..
@@ -4745,6 +4749,7 @@ impl GuardReads {
                     op: Op::Alloca {
                         ty: MirType::Ptr,
                         space: wukong_mir::AddrSpace::Local,
+                        align: 0,
                     },
                 },
             );
@@ -5591,6 +5596,7 @@ fn emit_body(
                 op: Op::Alloca {
                     ty,
                     space: wukong_mir::AddrSpace::Local,
+                    align: 0,
                 },
             },
         );

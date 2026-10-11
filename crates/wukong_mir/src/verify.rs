@@ -21,7 +21,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::{BinOp, CastKind, Function, MirType, Op, Program, Terminator, ValueId};
+use crate::{
+    BinOp, CastKind, Function, MirType, Op, Program, Terminator, ValueId, MAX_ALLOCA_ALIGN,
+};
 use wukong_span::Symbol;
 
 /// Declared signatures (parameter types, return type) of the functions defined in a program, so a
@@ -413,7 +415,11 @@ impl<'a> Verifier<'a> {
         // against the recipe below). Every other op must produce exactly one result.
         let must_produce = !matches!(
             op,
-            Op::Store { .. } | Op::Call { .. } | Op::VecKernelCall { .. } | Op::Barrier
+            Op::Store { .. }
+                | Op::Call { .. }
+                | Op::VecKernelCall { .. }
+                | Op::Barrier
+                | Op::AtomicAdd { .. }
         );
         if must_produce && result.is_none() {
             self.err(format!("operation {op:?} must produce a result value"));
@@ -554,7 +560,15 @@ impl<'a> Verifier<'a> {
                     self.expect_ty(*c, &MirType::I1, "select condition");
                 }
             }
-            Op::Alloca { .. } => self.check_result_is(result, &MirType::Ptr),
+            Op::Alloca { align, .. } => {
+                // `0` is natural alignment; anything else is a power of two up to a page.
+                if *align != 0 && (!align.is_power_of_two() || *align > MAX_ALLOCA_ALIGN) {
+                    self.err(format!(
+                        "alloca alignment {align} is not 0 or a power of two in 1..={MAX_ALLOCA_ALIGN}"
+                    ));
+                }
+                self.check_result_is(result, &MirType::Ptr)
+            }
             Op::Barrier => {
                 if result.is_some() {
                     self.err("barrier must not produce a value");
@@ -571,6 +585,27 @@ impl<'a> Verifier<'a> {
                     self.expect_ty(*ptr, &MirType::Ptr, "store pointer");
                 }
                 self.use_val(*value);
+            }
+            Op::AtomicAdd { ptr, value } => {
+                // No result: the old value is deliberately unobservable (see `Op::AtomicAdd`).
+                if result.is_some() {
+                    self.err("atomic.add must not produce a result value");
+                }
+                if self.use_val(*ptr) {
+                    self.expect_ty(*ptr, &MirType::Ptr, "atomic.add pointer");
+                }
+                // Integer addition mod 2^n is what makes the op order-independent, and every
+                // backend lowers exactly a scalar integer RMW; i1, floats and vectors have none.
+                if self.use_val(*value) {
+                    if let Some(t) = self.ty(*value) {
+                        if !matches!(t, MirType::I8 | MirType::I16 | MirType::I32 | MirType::I64) {
+                            self.err(format!(
+                                "atomic.add value must be a scalar i8/i16/i32/i64, got {}",
+                                t.display()
+                            ));
+                        }
+                    }
+                }
             }
             Op::Gep { ptr, index, .. } => {
                 if self.use_val(*ptr) {
@@ -1160,6 +1195,82 @@ mod tests {
         assert!(!int_unary_errors(Popcnt, MirType::I1).is_empty());
         assert!(!int_unary_errors(Clz, MirType::F32).is_empty());
         assert!(!int_unary_errors(Ctz, MirType::Vec(Box::new(MirType::I32), 4)).is_empty());
+    }
+
+    /// `atomic.add` on a `ptr_ty` pointer operand and a `val_ty` value; `with_result` gives the
+    /// instruction a (wrongly) produced value.
+    fn atomic_add_errors(ptr_ty: MirType, val_ty: MirType, with_result: bool) -> Vec<String> {
+        let mut i = Interner::new();
+        let mut b = Builder::new(i.intern("atomic"), MirType::Void);
+        let p = b.add_param(ptr_ty);
+        let v = b.add_param(val_ty.clone());
+        let op = Op::AtomicAdd { ptr: p, value: v };
+        if with_result {
+            b.build(val_ty, op);
+        } else {
+            b.build_void(op);
+        }
+        b.ret(None);
+        verify_function(&b.finish())
+    }
+
+    #[test]
+    fn atomic_add_is_a_void_scalar_integer_rmw_through_a_pointer() {
+        for ty in [MirType::I8, MirType::I16, MirType::I32, MirType::I64] {
+            let errors = atomic_add_errors(MirType::Ptr, ty.clone(), false);
+            assert!(errors.is_empty(), "atomic.add of {ty:?}: {errors:?}");
+        }
+        let has = |errors: Vec<String>, needle: &str| {
+            assert!(
+                errors.iter().any(|e| e.contains(needle)),
+                "expected `{needle}` in {errors:?}"
+            );
+        };
+        has(
+            atomic_add_errors(MirType::Ptr, MirType::I32, true),
+            "must not produce a result",
+        );
+        has(
+            atomic_add_errors(MirType::Ptr, MirType::I1, false),
+            "scalar i8/i16/i32/i64",
+        );
+        has(
+            atomic_add_errors(MirType::Ptr, MirType::F32, false),
+            "scalar i8/i16/i32/i64",
+        );
+        has(
+            atomic_add_errors(MirType::Ptr, MirType::Vec(Box::new(MirType::I32), 4), false),
+            "scalar i8/i16/i32/i64",
+        );
+        has(
+            atomic_add_errors(MirType::I64, MirType::I64, false),
+            "atomic.add pointer",
+        );
+    }
+
+    /// An `alloca`'s explicit alignment is `0` (natural) or a power of two up to a page.
+    #[test]
+    fn alloca_alignment_is_zero_or_a_power_of_two_up_to_a_page() {
+        let errors = |align: u32| {
+            let mut i = Interner::new();
+            let mut b = Builder::new(i.intern("slot"), MirType::Void);
+            b.alloca_aligned(
+                MirType::Array(Box::new(MirType::F32), 4),
+                crate::AddrSpace::Local,
+                align,
+            );
+            b.ret(None);
+            verify_function(&b.finish())
+        };
+        for ok in [0, 1, 2, 16, 64, 4096] {
+            assert!(errors(ok).is_empty(), "align {ok}: {:?}", errors(ok));
+        }
+        for bad in [3, 48, 8192, u32::MAX] {
+            assert!(
+                errors(bad).iter().any(|e| e.contains("alloca alignment")),
+                "align {bad} was accepted"
+            );
+        }
     }
 
     #[test]

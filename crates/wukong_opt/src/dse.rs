@@ -214,9 +214,10 @@ impl Pass for Dse {
                             )
                         });
                     }
-                    Op::Call { .. } | Op::VecKernelCall { .. } => {
+                    Op::Call { .. } | Op::VecKernelCall { .. } | Op::AtomicAdd { .. } => {
                         // A call may read through any pointer it was given, or any pointer reachable
                         // from one — but never a stack slot of this function that never escaped.
+                        // An atomic add reads its own location, which is escaped by construction.
                         pending.retain(|_, &mut (_, p)| alias.is_private_stack(p));
                     }
                     Op::Barrier => pending.clear(),
@@ -366,7 +367,7 @@ impl PathSearch {
                             return false;
                         }
                     }
-                    Op::Call { .. } | Op::VecKernelCall { .. } => {
+                    Op::Call { .. } | Op::VecKernelCall { .. } | Op::AtomicAdd { .. } => {
                         if !alias.is_private_stack(ptr) {
                             return false;
                         }

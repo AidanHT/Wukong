@@ -6825,3 +6825,193 @@ fn first_line_diff(got: &str, want: &str) -> String {
         None => format!("{} lines vs {} expected", g.len(), w.len()),
     }
 }
+
+// --- `Op::AtomicAdd` -----------------------------------------------------------------------------
+
+/// `atomic.add` lowers to a Cranelift `atomic_rmw add` of the value's own width, wrapping exactly as
+/// the interpreter's `mask` does. The expected values are hand-derived two's-complement truths:
+/// u8 200 + 100 = 300 = 44 (mod 2^8); i16 -1 + 2 = 1; i32 MAX + 1 = MIN; i64 MAX + 1 = MIN.
+#[test]
+fn atomic_add_matches_the_interpreter_at_every_width() {
+    use wukong_mir::{Builder, CastKind, MirType, Op, Program};
+    let cases: [(MirType, i128, i128, i64); 4] = [
+        (MirType::I8, 200, 100, 44),
+        (MirType::I16, -1, 2, 1),
+        (MirType::I32, i128::from(i32::MAX), 1, i64::from(i32::MIN)),
+        (MirType::I64, i128::from(i64::MAX), 1, i64::MIN),
+    ];
+    for (ty, init, add, want) in cases {
+        let mut interner = Interner::new();
+        let main = interner.intern("main");
+        let mut b = Builder::new(main, MirType::I64);
+        let slot = b.alloca(ty.clone());
+        let a = b.build(ty.clone(), Op::ConstInt(init, ty.clone()));
+        b.build_void(Op::Store {
+            ptr: slot,
+            value: a,
+        });
+        let v = b.build(ty.clone(), Op::ConstInt(add, ty.clone()));
+        b.atomic_add(slot, v);
+        let got = b.build(ty.clone(), Op::Load(slot, ty.clone()));
+        let wide = if ty == MirType::I64 {
+            got
+        } else {
+            b.build(MirType::I64, Op::Cast(CastKind::SExt, got, MirType::I64))
+        };
+        b.ret(Some(wide));
+        let mut base = Program::new();
+        base.funcs.push(b.finish());
+        for opt in [0u8, 2] {
+            let mut program = base.clone();
+            wukong_opt::optimize(&mut program, opt);
+            assert!(wukong_mir::verify::verify_program(&program).is_empty());
+            let oracle = wukong_interp::run(&program, main, &interner).expect("interp");
+            let native = crate::jit_run(&program, main, &interner).expect("jit").0;
+            assert_eq!(oracle, want, "interp, {ty:?} at -O{opt}");
+            assert_eq!(native, want, "native, {ty:?} at -O{opt}");
+        }
+    }
+}
+
+/// `body(start, end, env)` in the runtime's region ABI: `for i in start..end { atomic_add(env[i &
+/// 3], 1) }` over `i64` counters; `main` runs it over `0..n` through `wukong_parallel_for` and
+/// prints the four counters.
+fn atomic_histogram_program(n: i64) -> (wukong_mir::Program, Interner) {
+    use wukong_mir::{BinOp, Builder, CmpOp, MirType, Op, Program};
+    let mut interner = Interner::new();
+    let body_name = interner.intern("body");
+    let mut b = Builder::new(body_name, MirType::Void);
+    let start = b.add_param(MirType::I64);
+    let end = b.add_param(MirType::I64);
+    let env = b.add_param(MirType::Ptr);
+    let header = b.new_block();
+    let lp = b.new_block();
+    let exit = b.new_block();
+    b.br(header, vec![start]);
+    b.switch_to(header);
+    let i = b.block_param(header, MirType::I64);
+    let more = b.build(MirType::I1, Op::Cmp(CmpOp::Slt, i, end));
+    b.cond_br(more, lp, vec![], exit, vec![]);
+    b.switch_to(lp);
+    let three = b.build(MirType::I64, Op::ConstInt(3, MirType::I64));
+    let k = b.build(MirType::I64, Op::Bin(BinOp::And, i, three));
+    let at = b.build(
+        MirType::Ptr,
+        Op::Gep {
+            ptr: env,
+            index: k,
+            elem: MirType::I64,
+        },
+    );
+    let one = b.build(MirType::I64, Op::ConstInt(1, MirType::I64));
+    b.atomic_add(at, one);
+    let next = b.build(MirType::I64, Op::Bin(BinOp::Add, i, one));
+    b.br(header, vec![next]);
+    b.switch_to(exit);
+    b.ret(None);
+
+    let main = interner.intern("main");
+    let mut m = Builder::new(main, MirType::I64);
+    let counters = m.alloca(MirType::Array(Box::new(MirType::I64), 4));
+    let zero = m.build(MirType::I64, Op::ConstInt(0, MirType::I64));
+    let slots: Vec<_> = (0..4)
+        .map(|k| {
+            let idx = m.build(MirType::I64, Op::ConstInt(k, MirType::I64));
+            m.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: counters,
+                    index: idx,
+                    elem: MirType::I64,
+                },
+            )
+        })
+        .collect();
+    for &s in &slots {
+        m.build_void(Op::Store {
+            ptr: s,
+            value: zero,
+        });
+    }
+    let count = m.build(MirType::I64, Op::ConstInt(i128::from(n), MirType::I64));
+    let fp = m.build(MirType::Ptr, Op::FuncAddr(body_name));
+    m.build_void(Op::Call {
+        func: interner.intern("wukong_parallel_for"),
+        args: vec![count, fp, counters],
+    });
+    let print = interner.intern("print");
+    for &s in &slots {
+        let v = m.build(MirType::I64, Op::Load(s, MirType::I64));
+        m.build_void(Op::Call {
+            func: print,
+            args: vec![v],
+        });
+    }
+    m.ret(Some(zero));
+    let mut program = Program::new();
+    program.funcs.push(b.finish());
+    program.funcs.push(m.finish());
+    (program, interner)
+}
+
+/// The empirical proof that the lowering really is atomic. 2^16 iterations land in four `i64`
+/// counters, 2^14 each: through `wukong_parallel_for` on the runtime's pool (10 runs per level,
+/// each compared with the interpreter's serial answer), and then, so the thread count is not the
+/// pool's choice, with the JIT'd `body` called directly from 8 OS threads that all run the whole
+/// range at once (10 rounds; every counter must read exactly 8 * 2^14). A plain load/add/store
+/// loses updates under that contention; an `atomic_rmw add` cannot.
+#[test]
+fn atomic_add_is_atomic_under_contention() {
+    const N: i64 = 1 << 16;
+    const THREADS: i64 = 8;
+    let (base, mut interner) = atomic_histogram_program(N);
+    let main = interner.intern("main");
+    let body = interner.intern("body");
+    let want = "16384\n".repeat(4);
+    for opt in [0u8, 2] {
+        let mut program = base.clone();
+        wukong_opt::optimize(&mut program, opt);
+        assert!(wukong_mir::verify::verify_program(&program).is_empty());
+        let (code, out) = wukong_interp::run_with_output(&program, main, &interner).unwrap();
+        assert_eq!((code, String::from_utf8(out).unwrap()), (0, want.clone()));
+        let native = crate::jit_compile(&program, main, &interner).expect("jit");
+        for round in 0..10 {
+            let (code, out) = native.run().expect("run");
+            assert_eq!(
+                (code, String::from_utf8(out).unwrap()),
+                (0, want.clone()),
+                "wukong_parallel_for round {round} at -O{opt}"
+            );
+        }
+
+        let module = crate::jit_module(&program, &interner).expect("jit_module");
+        let ptr = module.func_ptr(body).expect("body is defined");
+        // SAFETY: `body` was built above with the region ABI `(i64, i64, ptr)` and no result, and
+        // `module` outlives every call below.
+        let body_fn: extern "C" fn(i64, i64, *const u8) = unsafe { std::mem::transmute(ptr) };
+        for round in 0..10 {
+            let mut counters = [0i64; 4];
+            let base = counters.as_mut_ptr();
+            let addr = base as usize;
+            let gate = std::sync::Barrier::new(THREADS as usize);
+            std::thread::scope(|s| {
+                for _ in 0..THREADS {
+                    let gate = &gate;
+                    s.spawn(move || {
+                        gate.wait();
+                        body_fn(0, N, addr as *const u8);
+                    });
+                }
+            });
+            // SAFETY: the threads wrote `counters` through `base` and have all joined; `k < 4`.
+            let seen: Vec<i64> = (0..4)
+                .map(|k| unsafe { std::ptr::read_volatile(base.add(k)) })
+                .collect();
+            assert_eq!(
+                seen,
+                vec![THREADS * N / 4; 4],
+                "{THREADS} threads, round {round} at -O{opt}: an update was lost"
+            );
+        }
+    }
+}

@@ -1230,9 +1230,11 @@ impl Emitter<'_> {
                 )
             }
             // The native backend's slot alignment (see `alloca_align`): it is what makes a
-            // byte-buffer aggregate's naturally aligned fields actually aligned.
-            Op::Alloca { ty, .. } => {
-                format!("{res}alloca {}, align {}", mem_ty(ty), alloca_align(ty))
+            // byte-buffer aggregate's naturally aligned fields actually aligned. An `@align(N)`
+            // local only ever raises it.
+            Op::Alloca { ty, align, .. } => {
+                let align = alloca_align(ty).max(u64::from(*align));
+                format!("{res}alloca {}, align {align}", mem_ty(ty))
             }
             Op::Cmp(op, l, r) => {
                 let opty = self.ty(*l);
@@ -1357,6 +1359,17 @@ impl Emitter<'_> {
                 } else {
                     format!("store {reg} {v}, ptr {p}{}", vector_align(vt))
                 }
+            }
+            // `atomic_add(place, v)`: a sequentially consistent RMW whose old value is named (so
+            // the function's implicit value numbering stays untouched) and never read.
+            Op::AtomicAdd { ptr, value } => {
+                let old = self.fresh();
+                format!(
+                    "{old} = atomicrmw add ptr {}, {} {} seq_cst",
+                    self.operand(*ptr),
+                    self.ty(*value),
+                    self.operand(*value)
+                )
             }
             Op::Gep { ptr, index, elem } => {
                 let idxty = self.ty(*index);

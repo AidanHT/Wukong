@@ -411,9 +411,11 @@ and exactly one `Terminator` (`Ret`, `Br`, `CondBr`, `Switch`, `Unreachable`). `
 branch on an `i8`..`i64` scrutinee whose case values are stored canonically (sign-extended from the
 type's width) and pairwise distinct; only `wukong_opt`'s late switch formation creates one, and the
 verifier, interpreter, Cranelift (`cranelift_frontend::Switch`), textual LLVM (`switch`) and every
-terminator visitor handle it (the `gpu-native` lowering declines it). `Op` has 28 variants: constants
+terminator visitor handle it (the `gpu-native` lowering declines it). `Op` has 29 variants: constants
 (`ConstInt`/`ConstFloat`), `Bin`/`Cmp`/`Cast`, the unary `Neg`/`Not`, `Select`, memory
-(`Alloca`/`Load`/`Store`/`Gep`), `Call`, `Barrier` (cooperative thread-block fence from
+(`Alloca`/`Load`/`Store`/`Gep`), `AtomicAdd` (`atomic.add vV, vP`: an indivisible, sequentially
+consistent integer read-modify-write from `atomic_add(place, v)`, wrapping at the value's width,
+with no result), `Call`, `Barrier` (cooperative thread-block fence from
 `sync_block()`), the float/SIMD primitives
 (`Splat`/`ExtractLane`/`Iota`/`Fma`/`Sqrt`/`Round`), the lane-moving SIMD ops
 (`Widen`/`Narrow`/`Shuffle`/`InsertLane`), `IntUnary` (`popcnt`/`clz`/`ctz`/`bswap` on a scalar
@@ -433,14 +435,40 @@ non-uniform vector *source*, since every other op is lane-wise and so any expres
 scalars is the same in every lane. The loop vectorizer needs it to widen a body that reads its
 induction variable as a value rather than as an address: lane `k` is scalar iteration `i + k`, so
 `if c == target` widens to `cmp.eq(splat(i) + iota, splat(target))`, a per-lane mask. Every op produces exactly one result
-except `Store` (never), `Call` (void callees such as `print`) and an elementwise `VecKernelCall`. A
+except `Store` and `AtomicAdd` (never), `Call` (void callees such as `print`) and an elementwise
+`VecKernelCall`. `AtomicAdd`'s value is a scalar `i8`..`i64` (never `i1`, a float or a vector — the
+verifier checks it), and its old value is deliberately unobservable: integer addition mod 2^n
+commutes, so the final memory is the same under every interleaving, which is what keeps `@parallel`
+code that combines into one location bit-identical between the serial interpreter and native. The
+interpreter adds and masks; Cranelift emits `atomic_rmw add` with plain flags (no alias region —
+the escape scan's fallback publishes the atomic's pointer, so its location is never private or
+`@noalias`-promised, and every other access to it is untagged too); the LLVM text emits
+`atomicrmw add ... seq_cst`; `gpu-native` declines it. Every optimizer pass treats it as an opaque
+memory effect, exactly where it treats `VecKernelCall` as one (see `CONTRIBUTING.md`, "Adding a MIR
+`Op`"; `wukong_opt/src/atomic_tests.rs` pins the hazards). The source builtin
+`atomic_add(place, v)` is typed in `wukong_sema` (`type_atomic_add`: a place other than a bare
+name, an integer place type, a value of that type, `=`'s projection-write rule via
+`check_projection_write`) and lowered in `wukong_mir_build/src/atomics.rs` with the compound
+assignment's evaluation order (value, then the place's GEP and slice bounds check). The `@parallel`
+region proof (`match_parallel_region`, shared by the whole-function outliner and mid-function
+regions) admits it on one element of a captured fixed-size array: such an array needs no
+disjointness proof, because the adds commute, but no other access in the region may touch it or any
+captured parameter that can share its storage (`noalias::could_share_storage` without a
+`promised_disjoint` promise). Every other place declines the region. A
 string literal lowers to a read-only `.rodata` blob in `Program::statics` (a `StaticData { name,
 bytes }`) addressed by `Op::GlobalAddr`, so a returned or threaded `*u8` stays valid after its
 defining frame is gone. `Op::VecKernelCall` — a call into a synthesized 256-bit AVX2 kernel — is
 covered under the vectorizer below.
 
 The front-end lowers in **clang style**: one `alloca` per local, with `load`/`store` on every use.
-`Op::Alloca` carries an `AddrSpace` (`Local` or `Shared`); `shared [T; N]` lowers to
+`Op::Alloca` carries an `align` (bytes; `0` = natural, which every compiler-made slot uses and
+which prints nothing, so dumps are unchanged; otherwise a power of two up to
+`MAX_ALLOCA_ALIGN = 4096`, checked by the verifier, from `@align(N)` on a `let` of an owned
+aggregate). It only ever raises the alignment: Cranelift reserves `bytes + want - 16` and rounds
+the base up at run time when the wanted alignment exceeds the stack pointer's 16 (the same scheme
+32-byte slots always used), the LLVM text emits `align max(natural, N)`, the interpreter ignores it
+and `gpu-native` declines anything above 8. `Op::Alloca` also carries an `AddrSpace` (`Local` or
+`Shared`); `shared [T; N]` lowers to
 `AddrSpace::Shared`. `sync_block()` lowers to `Op::Barrier`. On CPU backends shared is an ordinary
 stack slot and `Barrier` is a no-op (interpreter) or compiler fence (Cranelift). On gpu-native,
 `lower.rs` maps shared allocas to PTX `.shared __user_smem[]` and `Barrier` to `bar.sync 0` — no

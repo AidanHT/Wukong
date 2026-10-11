@@ -150,6 +150,10 @@ impl CastKind {
     }
 }
 
+/// The largest explicit [`Op::Alloca`] alignment, in bytes: one 4 KiB page. `@align(N)` accepts
+/// exactly the powers of two up to it.
+pub const MAX_ALLOCA_ALIGN: u32 = 4096;
+
 /// Where an [`Op::Alloca`] slot lives. CPU backends treat [`AddrSpace::Shared`] as ordinary local
 /// storage; the GPU backend maps it to PTX `.shared`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -179,10 +183,15 @@ pub enum Op {
     Not(ValueId),
     Cast(CastKind, ValueId, MirType),
     Select(ValueId, ValueId, ValueId),
-    /// A stack slot; result is a pointer.
+    /// A stack slot; result is a pointer. `align` is the minimum alignment in bytes the slot's
+    /// address must have: `0` means the type's natural alignment (every compiler-made slot), and
+    /// otherwise it is a power of two in `1..=4096` (the verifier checks it) that can only ever
+    /// raise the alignment, never lower it. It comes from `@align(N)` on a `let` of an owned
+    /// aggregate.
     Alloca {
         ty: MirType,
         space: AddrSpace,
+        align: u32,
     },
     /// A cooperative thread-block barrier (`sync_block()` in source). No result; a no-op on CPU.
     Barrier,
@@ -190,6 +199,21 @@ pub enum Op {
     Load(ValueId, MirType),
     /// Store `value` to `ptr` (no result).
     Store {
+        ptr: ValueId,
+        value: ValueId,
+    },
+    /// Atomically add `value` to the integer at `ptr` (`atomic_add(place, v)` in source): one
+    /// indivisible, sequentially consistent read-modify-write that wraps at the type's width. It
+    /// has **no result** — the old value is deliberately unobservable. Integer addition mod 2^n is
+    /// commutative and associative, so the final memory is the same under every interleaving of
+    /// concurrent adds, which is what lets `@parallel` code combine into one location and still
+    /// agree with the serial interpreter bit-for-bit. `value` is a scalar `i8`/`i16`/`i32`/`i64` —
+    /// never `i1`, a float or a vector; the verifier enforces that.
+    ///
+    /// Memory-effect rule: every pass that treats [`Op::VecKernelCall`] as an opaque memory effect
+    /// treats this op the same way (it reads *and* writes `ptr`, and must never be reordered across
+    /// another access to that location, hoisted, deleted or widened).
+    AtomicAdd {
         ptr: ValueId,
         value: ValueId,
     },

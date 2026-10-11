@@ -242,12 +242,17 @@ static CATALOG: &[Explanation] = &[
          `@noalias` describes one parameter's storage, so it is legal only on a parameter, takes no \
          arguments, and only on a parameter passed by pointer (an array, slice, tensor, pointer, \
          reference, tuple or struct) — on a scalar there is no storage to promise anything about. \
-         Arguments: `@parallel` takes nothing or exactly `grain = G` with `1 <= G <= 2^31` (each \
-         worker then claims runs of at least G iterations); an unknown key, a positional argument \
-         or an out-of-range grain is rejected instead of discarded. The lint-level attributes \
-         `@allow`, `@warn` and `@deny` are known too and legal anywhere; their arguments are lint \
-         names, and an unknown one is the warning `W0007`, not this error. The parsed-but-discarded \
-         attributes (`@inline`, `@simd`, `@align`, `@export`) stay legal wherever they parse."
+         `@align(N)` aligns one `let`'s stack slot, so it is legal only on a `let` that binds one \
+         name of an array, tuple or struct type (a scalar has no slot; a slice, pointer or tensor \
+         local names storage it does not own) and rejected on a `fn`, a parameter, a loop or any \
+         other statement. Arguments: `@parallel` takes nothing or exactly `grain = G` with \
+         `1 <= G <= 2^31` (each worker then claims runs of at least G iterations); an unknown key, \
+         a positional argument or an out-of-range grain is rejected instead of discarded. `@align` \
+         takes exactly one power of two from 1 to 4096 (`@align(48)` is rejected). The lint-level \
+         attributes `@allow`, `@warn` and `@deny` are known too and legal anywhere; their arguments \
+         are lint names, and an unknown one is the warning `W0007`, not this error. The \
+         parsed-but-discarded attributes (`@inline`, `@simd`, `@export`) stay legal wherever they \
+         parse."
     ),
     entry!(
         "E0307",
@@ -738,7 +743,10 @@ fn main() -> i32 {
          builtin a path that is not a `*u8` string, an offset that is not an integer, or a buffer \
          of the wrong element type or with a `?` dimension; an RNG builtin a float seed; a kernel \
          builtin (`matmul`, `sdpa`, …) an operand that is not an `f32` buffer or a non-integer \
-         dimension. The message names the argument and what it must be.",
+         dimension; `atomic_add` a first argument that is not a place in memory other threads can \
+         share (an element `b[i]`, a field `s.f` or `t.0`, or a pointee `*p` -- a bare local name \
+         is private to its thread, so use `+=`). The message names the argument and what it must \
+         be.",
         bad: "module ex.e0437\nfn main() -> i32 {\n    let s = alloc_f32(2.5);\n    free(s);\n    return 0;\n}\n",
         good: "module ex.e0437\nfn main() -> i32 {\n    let s = alloc_f32(4);\n    free(s);\n    return 0;\n}\n"
     ),
@@ -825,7 +833,10 @@ fn main() -> i32 {
          `bf16_from_bits` 16, `f8e4m3_to_f32`/`f8e5m2_to_f32` 8 (an unsuffixed literal adapts). \
          `sat_cast::<T>` converts to an integer type `T` only, and `ldexp`'s exponent must be an \
          integer. `widening_mul` of two 64-bit operands has no result type — there are no 128-bit \
-         integers — so use `mulhi` for the high half and `*` for the low half.",
+         integers — so use `mulhi` for the high half and `*` for the low half. `atomic_add` adds \
+         to an integer place only, with an integer value: integer addition commutes, so the total \
+         is the same in every thread schedule, while a float sum depends on the order of the adds \
+         (there is no atomic float add).",
         bad: "module ex.e0446\nfn ones(x: f32) -> i32 {\n    return popcount(x);\n}\nfn main() -> i32 {\n    return ones(1.5);\n}\n",
         good: "module ex.e0446\nfn ones(x: f32) -> i32 {\n    return popcount(bits(x)) as i32;\n}\nfn main() -> i32 {\n    return ones(1.5);\n}\n"
     ),
@@ -837,7 +848,8 @@ fn main() -> i32 {
          `i8` but 200 at `i32`. So two operands of different integer types are not silently \
          widened, as `+` would widen them; convert one with `as` to the type you mean. An \
          unsuffixed literal adapts to the other operand's type (`sat_add(x, 1)`), and is \
-         range-checked there.",
+         range-checked there. `atomic_add(place, v)` likewise adds a value of the place's own \
+         type, wrapping at the place's width.",
         bad: "module ex.e0447\nfn brighten(p: u8, delta: i32) -> u8 {\n    return sat_add(p, delta);\n}\nfn main() -> i32 {\n    return brighten(200, 100) as i32;\n}\n",
         good: "module ex.e0447\nfn brighten(p: u8, delta: u8) -> u8 {\n    return sat_add(p, delta);\n}\nfn main() -> i32 {\n    return brighten(200, 100) as i32;\n}\n"
     ),

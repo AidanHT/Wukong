@@ -135,6 +135,7 @@ impl Dummies {
             op: Op::Alloca {
                 ty: ty.clone(),
                 space: AddrSpace::Local,
+                align: 0,
             },
         });
         self.by_ty.insert(ty.clone(), v);
@@ -192,7 +193,11 @@ impl LoopMem {
                         .stores
                         .push((*ptr, type_bytes(f.value_type(*value)).unwrap_or(u32::MAX))),
                     Op::Call { func, .. } if mem.writes_nothing(*func) => {}
-                    Op::Call { .. } | Op::VecKernelCall { .. } => mem.has_call = true,
+                    // An atomic add writes its (escaped) location and may race other threads'
+                    // adds: opaque, like a call.
+                    Op::Call { .. } | Op::VecKernelCall { .. } | Op::AtomicAdd { .. } => {
+                        mem.has_call = true
+                    }
                     Op::Barrier => mem.has_barrier = true,
                     _ => {}
                 }
@@ -493,6 +498,7 @@ fn safe_to_hoist(op: &Op, mem: &LoopMem) -> bool {
         Op::Load(..)
         | Op::Store { .. }
         | Op::VecKernelCall { .. }
+        | Op::AtomicAdd { .. }
         | Op::Alloca { .. }
         | Op::Barrier => false,
     }

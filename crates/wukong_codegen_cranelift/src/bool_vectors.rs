@@ -122,7 +122,11 @@ fn scalarize(f: &mut Function) -> Result<(), String> {
             if inst.result.is_none()
                 && !matches!(
                     inst.op,
-                    Op::Store { .. } | Op::Call { .. } | Op::VecKernelCall { .. } | Op::Barrier
+                    Op::Store { .. }
+                        | Op::Call { .. }
+                        | Op::VecKernelCall { .. }
+                        | Op::Barrier
+                        | Op::AtomicAdd { .. }
                 )
             {
                 return Err("value-producing operation has no result".into());

@@ -906,9 +906,11 @@ fn plan(f: &Function, lo: &NaturalLoop, li: &NaturalLoop) -> Option<Nest> {
                 return None;
             }
             match &inst.op {
-                Op::Call { .. } | Op::VecKernelCall { .. } | Op::Barrier | Op::Alloca { .. } => {
-                    return None
-                }
+                Op::Call { .. }
+                | Op::VecKernelCall { .. }
+                | Op::AtomicAdd { .. }
+                | Op::Barrier
+                | Op::Alloca { .. } => return None,
                 // A division runs in a different order across rows; one that can trap must not.
                 Op::Bin(BinOp::SDiv | BinOp::UDiv | BinOp::SRem | BinOp::URem, _, d) => {
                     if !matches!(ctx.konst(*d), Some(c) if c != 0 && c != -1) {

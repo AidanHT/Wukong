@@ -560,7 +560,7 @@ pub(crate) fn map_op_uses(op: &mut Op, mut f: impl FnMut(ValueId) -> ValueId) {
             *a = f(*a);
             *b = f(*b);
         }
-        Op::Store { ptr, value } => {
+        Op::Store { ptr, value } | Op::AtomicAdd { ptr, value } => {
             *ptr = f(*ptr);
             *value = f(*value);
         }
@@ -657,7 +657,7 @@ pub(crate) fn each_op_use(op: &Op, f: &mut impl FnMut(ValueId)) {
             f(*a);
             f(*b);
         }
-        Op::Store { ptr, value } => {
+        Op::Store { ptr, value } | Op::AtomicAdd { ptr, value } => {
             f(*ptr);
             f(*value);
         }
@@ -720,9 +720,16 @@ pub(crate) fn each_term_use(t: &Terminator, f: &mut impl FnMut(ValueId)) {
 pub(crate) fn has_side_effects(op: &Op) -> bool {
     matches!(
         op,
-        Op::Store { .. } | Op::Call { .. } | Op::VecKernelCall { .. } | Op::Barrier
+        Op::Store { .. }
+            | Op::Call { .. }
+            | Op::VecKernelCall { .. }
+            | Op::Barrier
+            | Op::AtomicAdd { .. }
     )
 }
+
+#[cfg(test)]
+mod atomic_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1067,7 +1074,8 @@ mod tests {
                     i.op,
                     Op::Alloca {
                         ty: _,
-                        space: wukong_mir::AddrSpace::Local
+                        space: wukong_mir::AddrSpace::Local,
+                        ..
                     }
                 )
             })
@@ -1598,6 +1606,7 @@ mod tests {
                 Op::Alloca {
                     ty: MirType::Ptr,
                     space: wukong_mir::AddrSpace::Local,
+                    ..
                 } => slots += 1,
                 Op::Load(_, MirType::Ptr) => reloads += 1,
                 _ => {}

@@ -172,17 +172,29 @@ impl Builder {
 
     /// Allocate a local slot in `space` (shared arrays use [`AddrSpace::Shared`]).
     pub fn alloca_in(&mut self, ty: MirType, space: AddrSpace) -> ValueId {
+        self.alloca_aligned(ty, space, 0)
+    }
+
+    /// Allocate a local slot in `space` whose address is a multiple of `align` bytes (`0`: the
+    /// type's natural alignment; see [`Op::Alloca`]).
+    pub fn alloca_aligned(&mut self, ty: MirType, space: AddrSpace, align: u32) -> ValueId {
         let v = self.new_value(MirType::Ptr);
         let entry = self.entry.0 as usize;
         self.blocks[entry].insts.push(Inst {
             result: Some(v),
-            op: Op::Alloca { ty, space },
+            op: Op::Alloca { ty, space, align },
         });
         v
     }
 
     pub fn barrier(&mut self) {
         self.build_void(Op::Barrier);
+    }
+
+    /// Atomically add the scalar integer `value` to the location `ptr` points at ([`Op::AtomicAdd`]).
+    /// No result.
+    pub fn atomic_add(&mut self, ptr: ValueId, value: ValueId) {
+        self.build_void(Op::AtomicAdd { ptr, value });
     }
 
     pub fn set_term(&mut self, term: Terminator) {

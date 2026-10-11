@@ -100,16 +100,23 @@ fn fmt_op(op: &Op, interner: &Interner) -> String {
         Op::Not(v) => format!("not {}", val(*v)),
         Op::Cast(k, v, to) => format!("{} {} to {}", k.name(), val(*v), to.display()),
         Op::Select(c, a, b) => format!("select {}, {}, {}", val(*c), val(*a), val(*b)),
-        Op::Alloca { ty, space } => {
-            if *space == crate::AddrSpace::Shared {
+        Op::Alloca { ty, space, align } => {
+            let base = if *space == crate::AddrSpace::Shared {
                 format!("alloca.shared {}", ty.display())
             } else {
                 format!("alloca {}", ty.display())
+            };
+            // Natural alignment prints nothing, so every compiler-made slot's dump is unchanged.
+            if *align == 0 {
+                base
+            } else {
+                format!("{base} align {align}")
             }
         }
         Op::Barrier => "barrier".into(),
         Op::Load(p, ty) => format!("load {} {}", ty.display(), val(*p)),
         Op::Store { ptr, value } => format!("store {}, {}", val(*value), val(*ptr)),
+        Op::AtomicAdd { ptr, value } => format!("atomic.add {}, {}", val(*value), val(*ptr)),
         Op::Gep { ptr, index, elem } => {
             format!("gep {}, {} : {}", val(*ptr), val(*index), elem.display())
         }

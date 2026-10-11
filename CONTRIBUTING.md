@@ -324,6 +324,19 @@ Prefer *not* to: `abs`, `exp`, `silu` and friends are built from existing primit
    `cargo check --features gpu --all-targets` sees them); and `crates/wukong_autodiff/src/lib.rs` —
    `diff_inst`, `remap_op`, `op_name`.
 
+**A new op that touches memory has a second, silent list.** The compiler only finds the exhaustive
+matches; most memory walkers in `wukong_opt` end in a `_ => {}` arm, and an op that falls into it
+reads as "no effect". The rule `Op::AtomicAdd` established: wherever `Op::VecKernelCall` is named as
+an opaque memory effect, name the new op beside it (`grep -n 'VecKernelCall' crates/wukong_opt/src`
+— `effects.rs`, `cse.rs`, `dse.rs`, `licm.rs`, `fuse.rs`, `unroll.rs`, `unroll_jam.rs`,
+`unswitch.rs`, `jump_thread.rs`, `bce.rs`, `loop_info.rs`, `vectorize.rs`; plus
+`wukong_codegen_cranelift/src/bool_vectors.rs`, `wukong_codegen_llvm`'s call-signature helper and
+`wukong_codegen_gpu`'s `unreachable!("handled above")` arm). The confirmed hazard is `effects.rs`:
+its `_` arm would have summarized a callee whose only write is the new op as **pure**, and `dce`
+would then delete every call to it whose result is unused. Pin each such hazard with a program
+whose `-O0` answer differs from the miscompiled one, run at `-O0`/`-O1`/`-O2`
+(`wukong_opt/src/atomic_tests.rs` is the template).
+
 Front-end plumbing (`wukong_sema`'s intrinsic return type, `wukong_mir_build`'s intrinsic map and
 both vectorizer arms) closes the loop. Gate with `cargo test -p wukongc --test run`.
 

@@ -636,7 +636,7 @@ fn plan_loop(
         for inst in &f.block(*b).insts {
             if matches!(
                 inst.op,
-                Op::Call { .. } | Op::VecKernelCall { .. } | Op::Barrier
+                Op::Call { .. } | Op::VecKernelCall { .. } | Op::Barrier | Op::AtomicAdd { .. }
             ) {
                 return None;
             }

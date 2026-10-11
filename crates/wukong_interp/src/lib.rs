@@ -2000,6 +2000,22 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
                 Value::Unit
             }
+            // An integer read-modify-write, wrapping at the value's width. The oracle runs one
+            // thread, so "atomic" is free here; what it pins down is the arithmetic every native
+            // interleaving must reproduce (integer addition mod 2^n commutes, so they all do).
+            Op::AtomicAdd { ptr: p, value } => {
+                let idx = ptr(reg(regs, *p))?;
+                if self.is_null(idx) {
+                    return Err("null pointer dereference (atomic add)".into());
+                }
+                let add = reg(regs, *value).as_int();
+                let slot = self.memory.get_mut(idx).ok_or("atomic add out of bounds")?;
+                *slot = Value::Int(mask(
+                    slot.as_int().wrapping_add(add),
+                    func.value_type(*value),
+                ));
+                Value::Unit
+            }
             Op::Gep {
                 ptr: p,
                 index,
@@ -7402,6 +7418,69 @@ mod tests {
         let mut buf = [3.0f32, 5.0];
         run_kernel_f32(&program, k, &mut [&mut buf], &interner).unwrap();
         assert_eq!(buf, [4.0, 10.0]);
+    }
+
+    /// `atomic.add` wraps at the value's width, like the `add` it stands for. The expected values
+    /// are hand-derived two's-complement truths: u8 200 + 100 = 300 = 44 (mod 2^8); i16 -1 + 2 = 1;
+    /// i32 MAX + 1 = MIN; i64 MAX + 1 = MIN. Each is read back through an ordinary load.
+    #[test]
+    fn atomic_add_wraps_at_the_value_width() {
+        use wukong_mir::Builder;
+        let cases: [(MirType, i128, i128, i128); 4] = [
+            (MirType::I8, 200, 100, 44),
+            (MirType::I16, -1, 2, 1),
+            (MirType::I32, i128::from(i32::MAX), 1, i128::from(i32::MIN)),
+            (MirType::I64, i128::from(i64::MAX), 1, i128::from(i64::MIN)),
+        ];
+        for (ty, init, add, want) in cases {
+            let mut interner = Interner::new();
+            let name = interner.intern("main");
+            let mut b = Builder::new(name, MirType::I64);
+            let slot = b.alloca(ty.clone());
+            let a = b.build(ty.clone(), Op::ConstInt(init, ty.clone()));
+            b.build_void(Op::Store {
+                ptr: slot,
+                value: a,
+            });
+            let v = b.build(ty.clone(), Op::ConstInt(add, ty.clone()));
+            b.atomic_add(slot, v);
+            let got = b.build(ty.clone(), Op::Load(slot, ty.clone()));
+            let wide = if ty == MirType::I64 {
+                got
+            } else {
+                b.build(MirType::I64, Op::Cast(CastKind::SExt, got, MirType::I64))
+            };
+            b.ret(Some(wide));
+            let f = b.finish();
+            assert!(wukong_mir::verify::verify_function(&f).is_empty());
+            let mut program = Program::new();
+            program.funcs.push(f);
+            assert_eq!(
+                run(&program, name, &interner),
+                Ok(i64::try_from(want).unwrap()),
+                "{ty:?}: {init} + {add}"
+            );
+        }
+
+        // A null pointer is a diagnostic, not an add into the reserved slot.
+        let mut interner = Interner::new();
+        let name = interner.intern("main");
+        let mut b = Builder::new(name, MirType::I64);
+        let zero = b.build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        let null = b.build(
+            MirType::Ptr,
+            Op::Cast(CastKind::IntToPtr, zero, MirType::Ptr),
+        );
+        let one = b.build(MirType::I64, Op::ConstInt(1, MirType::I64));
+        b.atomic_add(null, one);
+        b.ret(Some(one));
+        let mut program = Program::new();
+        program.funcs.push(b.finish());
+        let err = run(&program, name, &interner).unwrap_err();
+        assert!(
+            err.contains("null pointer dereference (atomic add)"),
+            "{err}"
+        );
     }
 }
 

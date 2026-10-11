@@ -289,11 +289,15 @@ fn classify(f: &Function, table: &CallEffects, scc: &[Symbol]) -> Option<Local> 
                     Some(recipe) if recipe.reduce.is_some() => local.reads = true,
                     _ => return None,
                 },
+                // An atomic RMW is a write wherever it points (and exists to publish to other
+                // threads); without this arm the `_` below would summarize an atomics-only callee
+                // as pure and let its unused call be deleted.
                 Op::Alloca {
                     space: AddrSpace::Shared,
                     ..
                 }
-                | Op::Barrier => return None,
+                | Op::Barrier
+                | Op::AtomicAdd { .. } => return None,
                 Op::Bin(BinOp::SDiv | BinOp::UDiv | BinOp::SRem | BinOp::URem, ..) => {
                     local.speculatable = false;
                 }

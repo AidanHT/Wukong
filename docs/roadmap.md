@@ -272,8 +272,20 @@ another architecture or OS is not supported. A native-backend failure is a catal
   depth, so its memory stays bounded too. Lowered to opaque `wukong_rt_scratch_{alloc,mark,release}`
   calls like the heap builtins; misuse is E0437/E0503; use after release is undefined on native,
   like use after `free` (`tests/run/alloc_scratch_arena.wk`, also in the AOT gate). Not yet: an
-  uninitialized variant, an arena handle a program can pass around, and `@align(N)` (still parsed
-  and discarded — every heap and scratch allocation is already 64-byte aligned).
+  uninitialized variant and an arena handle a program can pass around. `@align(N)` on a `let`
+  (2026-10-12, `gap5/mir-ops`) aligns a local array, tuple or struct's stack slot to a power of two
+  up to 4096 (`Op::Alloca`'s `align`; Cranelift rounds the base up at run time, so it holds at
+  every call depth), while every heap and scratch allocation is already 64-byte aligned
+  (`tests/run/align_local.wk`).
+- **Atomic integer add** — `atomic_add(place, v)` (2026-10-12, `gap5/mir-ops`): `place = place +
+  v`, wrapping, as one sequentially consistent read-modify-write (`Op::AtomicAdd`; Cranelift
+  `atomic_rmw add`, LLVM `atomicrmw add seq_cst`). `place` is an element, field or pointee of an
+  integer type (a bare name is E0437, a float/`bool`/`char` place E0446, a value of another integer
+  type E0447). Integer addition commutes, so a `@parallel` histogram or counter prints the
+  interpreter's serial answer bit for bit on every backend; the parallel-region proof outlines a
+  loop whose only shared writes are atomic adds to a captured array nothing else in the loop touches
+  (`tests/run/atomic_add_histogram.wk`: three whole-function bodies and one mid-function region,
+  every lane printed).
 - **Typed file I/O** — `read_<T>(path, buf) -> i64`, `write_<T>(path, buf) -> i64`,
   `read_<T>_at(path, byte_off, buf) -> i64` and `file_size(path) -> i64` over **every fixed-width
   numeric dtype** (`f32 f64 f16 bf16 i8 i16 i32 i64 u8 u16 u32 u64`), where `path` is a `*u8` and
@@ -1314,7 +1326,7 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   lint-level `@allow`/`@warn`/`@deny`, legal anywhere, whose unknown lint names are `W0007`); unknown
   names and restricted-placement violations report `E0306`. `@noalias` (parameter-only) is consumed
   end to end — see the alias bullet below. Name acceptance does not promise execution: general
-  `@simd`/`@align`/`@export` behavior remains incomplete, and the attribute spelling of C interop
+  `@simd`/`@export` behavior remains incomplete (`@align(N)` is consumed on a `let` only), and the attribute spelling of C interop
   (`@extern("C")`) is still discarded — calling C goes through an `extern "C" { … }` block, which
   does execute. `@parallel` executes and consumes `grain = G` (every other `@parallel` argument is
   `E0306`); `@generic` opts out of recognizers. `@tile` performs loop
@@ -1401,6 +1413,16 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   instance. The call itself lowers as the `i64` extent everywhere. A binding initialized from it
   stays untyped, though, and arithmetic on it is `C0001` until the binding is annotated
   (`let k: i64 = x.len();`).
+
+- **Atomics are integer add only** (2026-10-12). `atomic_add` returns nothing (no fetch-add),
+  has one memory order (sequentially consistent), and has no float form: a float sum's bits depend
+  on the order of the adds, so a deterministic float combine needs privatized partials (the
+  reduction kernels' fixed chunks) instead. `--backend=gpu-native` does not lower it (the program
+  is an `UNSUPPORTED` skip, never wrong PTX). A `@parallel` loop that also *reads* an array it
+  atomically updates, or reads an array parameter of the same element type the caller could pass
+  as that buffer (no `@noalias` promise between them), stays serial; so does an atomic add to a
+  field, a pointee or a multi-index tensor element inside the loop. Reading a location other
+  iterations are still adding to is a race, as for a plain store.
 
 - **Scalar-type gaps** (2026-10-08). There is no 128-bit integer (`u128`/`i128` literal suffixes
   are `E0431`; Cranelift's x64 backend has no `i128` divide, so the type needs a runtime first), and

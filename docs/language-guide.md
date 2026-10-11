@@ -977,7 +977,6 @@ runtime size is outside the defined contract, like any runtime index
 @simd
 @tile(64, 64)
 @parallel(grain = 1)
-@align(32)
 @extern("C")
 @export("wukong_saxpy")
 fn k(@noalias mut out: []f32, x: []f32) { … }
@@ -994,7 +993,8 @@ the kernel recognizers (below), **`@strict_fp`** (✅), which evaluates the func
 arithmetic in source order (below), **`@tile`** (✅), which strip-mines loops (below), and
 **`@unchecked`** (✅), which removes the function's slice bounds checks (see *Memory and
 parallelism*; on anything but a `fn` item it is `E0306`). One has a consumer on a **parameter**:
-**`@noalias`** (✅), a promise about the storage the parameter points into (below).
+**`@noalias`** (✅), a promise about the storage the parameter points into (below). One has a
+consumer on a **`let`**: **`@align(N)`** (✅), which aligns that binding's stack slot (below).
 `@parallel(grain = G)` (✅) is consumed too: each worker claims runs of at least `G` consecutive
 iterations of the function's parallel loop (whole-function or mid-function region), the knob an
 OpenMP `schedule(dynamic, G)` or a TBB grain size gives — useful when one iteration is too cheap to be
@@ -1007,7 +1007,7 @@ body is straight-line code gets `G = ceil(2^14 / body size in MIR instructions)`
 single chunk that runs without a fork and a long one is claimed in chunks of at least that much work;
 a body with an inner loop or a call keeps one iteration per claim, and `--backend=gpu-native` always
 does (one GPU thread per iteration). Write `grain = 1` to opt a loop back into per-iteration claims.
-Everything else in the list above — `@inline`, `@simd`, `@align`, `@extern` and `@export` — is
+Everything else in the list above — `@inline`, `@simd`, `@extern` and `@export` — is
 parsed and discarded (🔵). `@tile` is consumed as loop
 strip-mining (see below), and when it cannot be applied it is **`E0309`**, not a silent drop. A
 *discarded* attribute on a statement or loop is dropped there too:
@@ -1288,6 +1288,36 @@ attribute-placement code `@generic` off a `fn` item carries, and for the same re
 `while` is the one worth calling out: a `while` has no induction variable and no range, so there is
 nothing to strip-mine, and the attribute used to sit there reading exactly as if it applied
 (`tests/fail/tile_on_while.wk`).
+
+### `@align(N)` — an aligned stack local ✅
+
+```wukong
+@align(64) let mut tile: [f32; 64] = [0.0; 64];   // base address is a multiple of 64
+```
+
+`@align(N)` on a `let` makes that binding's stack slot start at a multiple of `N` bytes, for a
+local scratch array that 256-bit or non-temporal accesses should not split across cache lines.
+`N` is one power of two from 1 to 4096; it only ever raises the alignment the slot would have had
+(a slot of 32 bytes or more is already 32-aligned, a smaller one aligned to its size up to 16) and
+never changes a value. Every lane of an aligned local reads and writes exactly as it would without
+the attribute, on every backend and at every `-O` level (`tests/run/align_local.wk`), and the
+native base address is a multiple of `N` in every frame, however deep the recursion
+(`wukong_codegen_cranelift/tests/alloca_align.rs`). `--emit=mir` prints the slot as
+`alloca [64 x f32] align 64`.
+
+Where it is legal (all other cases are **`E0306`**):
+
+- on a `let` only — on a `fn`, a parameter, a loop or any other statement nothing would honour it
+  (`tests/fail/align_misplaced.wk`);
+- with exactly one power-of-two argument up to 4096 — `@align(48)`, `@align(0)` and a bare `@align`
+  are rejected (`tests/fail/align_bad_arg.wk`);
+- on a binding of one name whose type **owns** its storage: an array, a tuple or a struct. A scalar
+  lives in a register, a `[]T` slice, pointer or reference names storage it does not own, and a
+  tensor local is a view of someone else's buffer. Heap and scratch buffers (`alloc_<T>`,
+  `scratch_<T>`) are already 64-byte aligned.
+
+The textual-LLVM path emits `alloca …, align N`; `--backend=gpu-native` lays frame slots out at 8
+bytes and declines an `@align` above 8 as `UNSUPPORTED` rather than break the promise.
 
 ### `@noalias` — a parameter's storage promise ✅
 
@@ -1923,6 +1953,47 @@ No garbage collector and no hidden allocations beyond what you `alloc_*` or `scr
 with `defer` (✅, below), and *named* allocator selection (`System`, `Pool` — 🔵) is still being
 wired to the surface.
 
+### Atomic integer add: `atomic_add` ✅
+
+`atomic_add(place, v)` adds `v` to the integer at `place` as one indivisible read-modify-write —
+`place = place + v`, wrapping at the place's width — and is a statement of type `()`. It is how
+iterations of a `@parallel` loop combine into one location (a histogram, a counter, a scatter
+count) without a data race:
+
+```wukong
+@parallel
+fn hist(x: [i32; 4096], mut h: [i64; 16]) {
+    for i in 0..4096 {
+        atomic_add(h[x[i] & 15], 1);
+    }
+}
+```
+
+- `place` is a place in memory other than a bare name: an element `b[i]` or `t[i, j]` (array, slice
+  or tensor), a field `s.f` or `t.0`, or a pointee `*p`. A bare local is private to the thread
+  running it, so `atomic_add(n, 1)` is **`E0437`** (write `n += 1`). The write obeys `=`'s rules: a
+  non-`mut` aggregate parameter is `E0304`, a slice index is bounds-checked.
+- The place's type is an integer of any width and signedness — `i8`..`i64`, `u8`..`u64`, `isize`,
+  `usize` — never `bool`, `char` or a float (**`E0446`**). Integer-only on purpose: integer addition
+  mod 2^n commutes, so every thread schedule leaves the same total, while a float sum depends on the
+  order of its adds.
+- `v` has the place's type. An unsuffixed literal adapts to it (out of range is `E0431`); a value of
+  another integer type is **`E0447`** (convert with `as`). Wrong arity is `E0503`.
+- Under `@parallel`, every iteration's add lands exactly once, so the native run prints the
+  interpreter's serial answer bit for bit. A loop whose only shared writes are atomic adds to a
+  captured fixed-size array is still outlined — whole-function or as a mid-function region — as
+  long as nothing else in the loop reads or writes that array, or any array parameter of the same
+  element type that the caller could pass as the same buffer (a `@noalias` promise rules that
+  out). Otherwise the loop runs serially, as for any write the proof cannot place.
+- Reading a location that other iterations are still adding to is a race, as for a plain store.
+  There is no fetch-add (the old value is not returned), no float atomic, and no other memory
+  order: every `atomic_add` is sequentially consistent.
+
+It is legal anywhere, not only under `@parallel`. On `--backend=gpu-native` it is not lowered
+(the program is skipped as `UNSUPPORTED`). A user function named `atomic_add` shadows the builtin
+(`tests/run/atomic_add_histogram.wk`; `tests/fail/atomic_add_float.wk`,
+`tests/fail/atomic_add_not_place.wk`).
+
 ### Scope-exit cleanup: `defer` ✅
 
 `defer <expr>;` runs `<expr>` when control leaves the enclosing block — however it leaves:
@@ -1984,8 +2055,9 @@ to hit a *captured fixed-size array* at an index carrying the loop variable as a
 (`hh*C + …`, or the tiled `t/C` / `t%C` pair); per-iteration scratch must be a `let` local inside the
 body. It declines — and the loop lowers serially — for a loop-carried accumulator (a write to a
 captured scalar), a non-affine or offset index, a local bound to a slice/pointer/reference (it might
-alias a capture), a call other than a pure math intrinsic or a counter-based RNG scalar (`rand_u32`,
-`rand_f32`, `randn_f32` — stateless, so chunking cannot change a lane; `print` would reorder output), a
+alias a capture), a call other than a pure math intrinsic, a counter-based RNG scalar (`rand_u32`,
+`rand_f32`, `randn_f32` — stateless, so chunking cannot change a lane; `print` would reorder output)
+or an `atomic_add` to a captured array element that nothing else in the loop touches (above), a
 `match`/`loop` expression in the body, a `return`/`defer`, and a labelled or loop-level
 `break`/`continue`. Two array **parameters** over the same element type may be one caller buffer
 whatever their declared lengths, so the proof covers the union of their accesses — unless a

@@ -27,6 +27,7 @@ alias_transpose_inplace8.wk: wukong_transpose_f32
 alias_unknown_republish.wk: veckernel*1 wukong_rt_alloc wukong_rt_alloc*4 wukong_sgemm wukong_sgemm*2
 alias_versioned_kernels.wk: wukong_cumsum_f32 wukong_cumsum_f32*2 wukong_sgemm wukong_sgemv wukong_transpose_f32 wukong_transpose_f32*2 wukong_velem_f32 wukong_velem_f32*2
 alias_view_binding_block_value.wk: veckernel*1 wukong_rt_alloc wukong_rt_alloc*5 wukong_sgemm wukong_sgemm*4
+align_local.wk:
 alloc_scratch_arena.wk: wukong_rt_alloc wukong_rt_free wukong_rt_scratch_alloc wukong_rt_scratch_alloc*5 wukong_rt_scratch_mark wukong_rt_scratch_mark*6 wukong_rt_scratch_release wukong_rt_scratch_release*4
 annotated_mixed_width_binop.wk:
 argmax.wk: wukong_argreduce_f32 wukong_argreduce_f32*3
@@ -42,6 +43,7 @@ assert_fail.wk:
 assert_fail_trailing_output.wk:
 atan.wk: wukong_vmath_f32
 atan2_hypot.wk: wukong_vmath2_f32
+atomic_add_histogram.wk: wukong_parallel_for wukong_parallel_for*4 wukong_rt_alloc wukong_rt_free
 attention.wk: wukong_norm_f32 wukong_sgemm wukong_sgemm_nt
 autodiff_train_helper.wk:
 autodiff_train_mlp.wk: wukong_sgemm_nt_epi_parallel wukong_sgemm_nt_epi_parallel*2 wukong_sreduce_f32_parallel

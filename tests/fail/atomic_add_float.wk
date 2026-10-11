@@ -1,0 +1,22 @@
+// EXPECT-CODE: E0446
+// EXPECT-COUNT: 1
+module tests.fail.atomic_add_float
+
+// `atomic_add` adds to an integer place only. A float sum depends on the order of the adds, so an
+// "atomic" float add under `@parallel` would print a different total from run to run, and never
+// reliably the interpreter's serial one; integer addition mod 2^n commutes, which is the whole
+// reason the builtin is deterministic.
+@parallel
+fn total(x: [f32; 64], mut acc: [f32; 1]) {
+    for i in 0..64 {
+        atomic_add(acc[0], x[i]); //~ E0446
+    }
+}
+
+fn main() -> i32 {
+    let x: [f32; 64] = [0.5; 64];
+    let mut acc: [f32; 1] = [0.0; 1];
+    total(x, acc);
+    print(acc[0]);
+    return 0;
+}
