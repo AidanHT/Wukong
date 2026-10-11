@@ -351,6 +351,46 @@ All notable changes to Wukong are documented here. The format is loosely based o
 - **CSE's remaining hot structures (P10.14).** Pending phis carry interned type ids instead of
   cloned `MirType`s, and the rewrite table is path-compressed; the `-O2` MIR is byte-identical over
   the corpus. (CSE is about 1-2% of optimizer time; the in-process effect is at the noise floor.)
+### Benchmark instrument and workspace lints (`gap4/infra-instrument`)
+
+- **xbench withholds a ratio no check has validated (P8.3).** A standing printed in a section where
+  nothing had yet compared Wukong's output with an independent reference used to print clean, and
+  the end-of-run summary certified the run. It now prints `-> UNCHECKED: ratio withheld`, the
+  section is listed in the `=== numerics gate ===` summary, and the run exits 4 as it does for a
+  SUSPECT section. The audit that came with it moved five sections' checks ahead of their first
+  standing (`matmul_skinny`, `matmul`, `matmul_tn`, `ffn`, `linear`), gave `linear` the vs-C check it
+  never had, made `ffn` check its single-core column, and checks `matmul`/`linear` against the
+  in-process tuned GEMM so a host without gcc or MKL still checks them; a source-scan test holds the
+  order.
+- **oneMKL library peers for TN GEMM, GEMV and transpose print standings and say why when absent
+  (P6.2).** `matmul_tn`, `gemv` and `transpose` already timed `cblas_sgemm_64` (TransA),
+  `cblas_sgemv_64` and `MKL_Somatcopy` behind a numerics filter; they now print `oneMKL(1 thread)` /
+  `oneMKL(all threads)` standings, and a host without MKL or the symbol prints the reason instead of
+  a bare `n/a`. No TN/GEMV/transpose-vs-MKL result has been measured.
+- **`wukong_bench cold-start` and `wukong_bench scaling` (P6.10).** A fresh-process compile plus first
+  run of a fixed program (min / median / p95 / max and the first child), and a `WUKONG_NUM_THREADS`
+  sweep 1, 2, 4, .., all of one workload in fresh processes (speedup and efficiency). Every child's
+  exit and output are checked. `analyze-sota-measure.py` parses both rows and gains `--self-test`.
+- **The recognition on/off premise is checked at measurement size (P12.24).**
+  `tests/run/premise_reduce_4096.wk`, `premise_norm_wide.wk` (768-wide RMSNorm) and
+  `premise_gemm_64.wk` print every lane at full precision against exact closed forms within a
+  declared `c*sqrt(K)*eps` bound, and `wukong_xbench compare` / `sota-check` first run each with
+  recognizers on and off on both backends; the tolerances are cited in `corpus_lint.rs`. They also
+  join `recognize.rs`'s corpus sweep, which holds every recognizer-dependent program's on/off output
+  byte for byte: the three get declared `2t/(1-t)` entries in its `REASSOCIATION_TOLERANCES`
+  (re-derived from each fixture's own APPROX bound by a test), since the 4096-term `@parallel`
+  sum of squares legitimately prints `4112.017` recognized and `4112.0166` lowered as written.
+- **xbench geomeans pool only ratios a standing would print.** A ratio withheld as UNCHECKED on its
+  own row was still pooled: a missing recognizer-on column left the `wk(gen)` buffer compared with
+  nothing, and a missing single-core transpose column left the `@parallel` one compared with
+  nothing, yet both ratios reached the recognition-off and transpose-regime geomeans. Every pool is
+  now gated on `numerics::section_may_pool` (neither SUSPECT nor UNCHECKED).
+- **`cargo clippy --workspace --all-targets` denies warnings locally (P13.15).** Every crate now opts
+  in to the workspace `-D warnings` lint table (`wukong_runtime` keeps its own), so a plain local
+  clippy fails on a rustc or Clippy warning without `RUSTFLAGS`, as CI does.
+- Docs: BENCHMARKS.md's checksum guarantee states what the gate enforces; the CPU evaluation lists
+  the TN weight-gradient lead as one over idiomatic C only (P6.21); `wukong_backend`'s README records
+  that the trait is a declared seam on purpose and cites its five contract tests (P7.25).
 
 ### Index-recording reductions (`gap3/vec-argmax`)
 

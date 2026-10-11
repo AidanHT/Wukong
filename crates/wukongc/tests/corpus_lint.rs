@@ -91,6 +91,30 @@ const DECLARED_TOLERANCES: &[(&str, &str)] = &[
          which at most doubles a relative error (4.1e-4 with the 32-term f32 sum). 5e-4 is that \
          bound rounded up, derived from the kernel's contract rather than its output.",
     ),
+    // The three premise_* entries below (P12.24) share one derivation: c*sqrt(K)*eps with c = 8 and
+    // eps = 2^-23, the in-tree bound for a reassociated f32 reduction
+    // (wukong_codegen_cranelift/src/tests.rs `p4_reduction_f64_reference`), at the fixture's own
+    // contraction length K, rounded UP to three significant figures. Each fixture's prose states
+    // whether that is also a worst-case bound for its data and what the simulated orders reach.
+    (
+        "6.11e-5",
+        "c*sqrt(K)*eps at K = 4096: 8 * 64 * 2^-23 = 2^-14 = 6.1035e-5, rounded up. \
+         premise_reduce_4096.wk (sum / dot / sum-of-squares over 4096 positive terms; the \
+         random-walk bound, with the sequential order and reduce.rs's 8x8x64 partition simulated \
+         at <= 3.6e-7).",
+    ),
+    (
+        "7.63e-6",
+        "c*sqrt(K)*eps at K = 64: 8 * 8 * 2^-23 = 2^-17 = 7.629e-6, rounded up. \
+         premise_gemm_64.wk (64x64x64 GEMM over positive inputs); at this K it also exceeds the \
+         worst case gamma_64 = 3.81e-6 for a positive dot product in any order.",
+    ),
+    (
+        "2.65e-5",
+        "c*sqrt(K)*eps at K = 768: 8 * sqrt(768) * 2^-23 = 2.643e-5, rounded up. \
+         premise_norm_wide.wk (one 768-wide RMSNorm row); it also exceeds that data's worst case, \
+         gamma_768 / 2 + 5u = 2.32e-5 (the square root halves the sum-of-squares error).",
+    ),
 ];
 
 /// `.wk`-adjacent extensions that must never appear in a corpus directory. Each gate collects

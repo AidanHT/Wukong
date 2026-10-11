@@ -61,6 +61,24 @@ the elementwise summary geomeans exclude SUSPECT rows by name. The run ends with
 peer column *dropped* for disagreeing (C++ vs C, a relaxed C(fast)/C(omp), an MKL ABI mismatch)
 prints no ratio, so it is not a mismatch.
 
+The gate also requires that a check RAN. `checked!()` marks each comparison of Wukong's buffer
+against an independent reference whose failure would be a `mismatch!` (a mismatch counts as one); a
+standing printed in a scope with no such check yet is withheld as `-> UNCHECKED: ratio withheld`,
+the norm/streaming cells read `UNCHECKED`, the section is listed in the summary, and the run exits 4
+exactly as for SUSPECT. The peer filters (`relaxed_peer_ok`, `cpp_checked`, the VML and MKL
+filters) do not count: their failure drops a column instead of flagging Wukong. Every timed section
+runs its check before its first standing - `every_section_checks_before_its_first_standing` scans
+`main.rs`/`model.rs` for the order (with a negative control), and
+`every_timed_general_and_compare_section_runs_the_f64_oracle` holds the cell-printing suites to their
+f64 oracle.
+
+**Library peers (P6.2).** Besides `cblas_sgemm_64` and the VML ops, `matmul_tn` (`cblas_sgemm_64`
+with `transa = CblasTrans`), `gemv` (`cblas_sgemv_64`) and `transpose` (`MKL_Somatcopy`) carry
+`MKL(1c)`/`MKL(all)` columns and `oneMKL(...)` standings. The GEMM/GEMV columns are held to the
+relaxed 1e-2 bar, the transpose column to bit equality, and a disagreeing column is dropped with a
+`!` line. Where MKL is absent (any non-Windows host, or no conda install) or does not export the
+symbol, the section prints `. MKL(1c)/MKL(all) columns n/a: <reason>`.
+
 **Dispersion, cold start and the main-suite control (`src/dispersion.rs`).** `time_ns` keeps every
 sample it takes (the cold first call, min, median, max, last), and each position-balanced rotation
 prints one `. dispersion` line: per slot, the pass-to-pass spread (the same binary in two positions),
@@ -113,6 +131,12 @@ cargo run -p wukong_xbench --release -- sota-check  # gate: sweep vs bench/sota/
 
 `compare` times timing-scale twins of the `tests/compare/` fixtures (recognition-off, `@generic`,
 census-witnessed) against the committed C peers' kernels on the round-interleaved pinned protocol.
+Before timing anything it runs the **recognition on/off premise check** (`compare::premise_check`,
+P12.24) over `tests/run/premise_{reduce_4096,norm_wide,gemm_64}.wk`: each fixture compiled with
+recognizers on and off, run on the interpreter and natively, every lane inside its own
+`EXPECT-OUT-APPROX` bound, interp == native bit for bit, and on vs off within `2t/(1-t)`. It prints how
+many printed lanes recognition moved and by how much; a breach makes `compare` exit 4 and
+`sota-check` fail.
 `sota-check` is part 11 of the language close-out verification gate: it re-runs the in-scope sweep
 (general + compare) and exits non-zero when a ratio falls below its recorded floor in
 `bench/sota/FLOOR.md`, when a program leaves the sweep, when a bar peer fails to compile, or when
@@ -141,8 +165,9 @@ runner having no stable clock. Read a green CI as saying nothing at all about pa
 The timed rows are the instrument and have no `cargo test` equivalent: Wukong output is checked
 against the interpreter oracle (bit-exact) inside each row as it runs. What `cargo test -p
 wukong_xbench` does cover is the *pure* half — the f64 comparison oracles, the round/spread
-statistics, `parse_floor`, and `evaluate`'s refusals — which is where a measurement instrument
-fails silently rather than loudly. Two properties worth keeping there: the oracles return infinity
+statistics, `parse_floor`, `evaluate`'s refusals and the numerics ledger's SUSPECT/UNCHECKED
+states — which is where a measurement instrument fails silently rather than loudly, plus one
+end-to-end run of the premise check over the committed fixtures. Two properties worth keeping there: the oracles return infinity
 for a non-finite deviation (`NaN > worst` is false, so a naive loop scores an all-NaN buffer as
 bit-exact), and `evaluate` refuses a run whose `C(twin)` control did not settle (`floor_factor`
 *grows* with a degraded control, so a wider tolerance would otherwise make the ratchet more

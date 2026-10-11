@@ -18,11 +18,13 @@
 //! cargo run -p wukong_bench --release -- tests/run examples bench/kernels
 //! ```
 //!
-//! The default report above is one of six modes; the first CLI argument selects among them
+//! The default report above is one of eight modes; the first CLI argument selects among them
 //! (`compile-time`, `compile-profile` and `spawn-overhead` — see the `compile_time` and `profile`
 //! modules — `compile-work`, the clock-invariant counting instrument in `compile_work`, plus
-//! `compile-vs`, see `compile_vs`). Anything that is not a mode word is a corpus directory, and
-//! with no arguments at all the corpus defaults to `tests/run`.
+//! `compile-vs`, see `compile_vs`, and the two process-level modes in `profile`: `cold-start`, a
+//! fresh-process compile plus first run of a fixed program, and `scaling`, a `WUKONG_NUM_THREADS`
+//! sweep in fresh processes). Anything that is not a mode word is a corpus directory, and with no
+//! arguments at all the corpus defaults to `tests/run`.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -63,6 +65,14 @@ fn main() {
         let mc = args.get(1).map(std::path::PathBuf::from);
         compile_vs::report(mc);
         return;
+    }
+    // `cold-start` / `scaling` (P6.10) time fresh `wukongc` processes and take options, not corpus
+    // directories, so they are dispatched before the corpus is collected. Each returns its own
+    // exit code: a child that failed or printed a different answer is not a sample.
+    match args.first().map(String::as_str) {
+        Some("cold-start") => std::process::exit(profile::cold_start_report(&args[1..])),
+        Some("scaling") => std::process::exit(profile::scaling_report(&args[1..])),
+        _ => {}
     }
 
     let ctime = matches!(

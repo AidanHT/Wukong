@@ -416,6 +416,57 @@ fn report_relaxed_ratio(
     }
 }
 
+/// An optional oneMKL entry point a section needs: its name, and whether the loaded library
+/// resolved it.
+type MklSymbol<'a> = (&'a str, fn(&MklApi) -> bool);
+
+/// Why a section's oneMKL columns cannot run on this host, or `None` when they can.
+///
+/// `symbol` names an entry point beyond the `cblas_sgemm_64` that [`mkl`] requires to load at all,
+/// with a predicate saying whether the loaded library resolved it (`cblas_sgemv_64` and
+/// `MKL_Somatcopy` are optional, like the VML ops). A missing library peer prints this reason
+/// instead of a bare `n/a`, so a log without a library column says WHY it has none (P6.2).
+fn mkl_absent_reason(symbol: Option<MklSymbol>) -> Option<String> {
+    match mkl() {
+        None => Some(
+            "oneMKL not found (Windows only; set WUKONG_MKL_DLL=<path to mkl_rt.dll>)".to_string(),
+        ),
+        Some(api) => match symbol {
+            Some((name, resolved)) if !resolved(api) => {
+                Some(format!("{} does not export `{name}`", api.path.display()))
+            }
+            _ => None,
+        },
+    }
+}
+
+/// The oneMKL standings of a section whose `MKL(1c)` / `MKL(all)` columns were already held to a
+/// numerics bar by the caller (a dropped column arrives as `None` and prints nothing), or the
+/// reason the columns are absent. Single-core Wukong is read against `MKL(1c)` and `@parallel`
+/// against `MKL(all)` - never across threading. `routine` names the MKL entry point timed.
+fn report_library_columns(
+    routine: &str,
+    absent: Option<String>,
+    wuk: &Option<Measure>,
+    wk_par: &Option<Measure>,
+    mkl_1c: &Option<Measure>,
+    mkl_all: &Option<Measure>,
+) {
+    if let Some(why) = absent {
+        println!(
+            "  . MKL(1c)/MKL(all) columns n/a: {why} - no library-grade standing in this section"
+        );
+        return;
+    }
+    report_relaxed_ratio(&format!("oneMKL(1 thread) {routine}"), wuk, &None, mkl_1c);
+    report_relaxed_ratio(
+        &format!("oneMKL(all threads) {routine}"),
+        &None,
+        wk_par,
+        mkl_all,
+    );
+}
+
 /// Print Wukong's standing vs the **C++ (g++)** column produced by [`build_c_cpp`]. Same shape as
 /// [`report_relaxed_ratio`] — which is a general peer-standing printer despite its name — but with
 /// its own entry point so the C++ label is spelled one way across ~40 benches, and so a reader can
@@ -663,8 +714,15 @@ fn main() {
     // (compare.rs); `sota-check` is part 11 of the verification gate (sota.rs) and is the one
     // subcommand here whose EXIT CODE is the product.
     if filter.as_deref() == Some("compare") {
+        // The recognition on/off premise at measurement size (P12.24) runs first: every
+        // recognizer-on vs recognition-off reading in this harness rests on it, and a failure
+        // turns the process exit into the numerics gate's code after the timed sweep is printed.
+        let premise_ok = compare::premise_check();
         let rows = compare::bench_compare(&cc, &dir);
         print_sota_scorecard(&rows);
+        if !premise_ok {
+            std::process::exit(numerics::NUMERICS_EXIT);
+        }
         return;
     }
     if filter.as_deref() == Some("sota-check") {
@@ -803,8 +861,13 @@ fn main() {
         // proving no `wukong_*` kernel survived. A divergence between the two lowerings of ONE
         // source is a compiler defect, not a timing: print it loudly and withhold the ratio.
         if let (Some(g), Some(census)) = (&wukgen, &wkgen_census) {
-            let checked = match &wukong {
+            // `agrees` is "no divergence was found", NOT "a check ran": with the recognizer-on
+            // column missing nothing compared the wk(gen) buffer with anything, so the row still
+            // prints (the ledger withholds its standing as UNCHECKED) but pools nothing - the
+            // geomean gate below is `section_may_pool`, which refuses an UNCHECKED section.
+            let agrees = match &wukong {
                 Some(m) => {
+                    checked!();
                     let (rel, at) = max_rel_err(&m.out, &g.out);
                     // Reduction rows get the relaxed bar: the recognized kernel legitimately
                     // reassociates the f32 sum the as-written serial loop performs.
@@ -828,10 +891,12 @@ fn main() {
                 }
                 None => true,
             };
-            // A section the numerics gate has marked SUSPECT contributes to no geomean: its ratios
-            // were withheld on their own lines, and pooling them into a headline would publish
-            // exactly what the gate refused to.
-            if checked && !numerics::section_suspect() {
+            // A section whose standings the numerics gate withholds - SUSPECT (a check failed) or
+            // UNCHECKED (none ran) - contributes to no geomean: its ratios were withheld on their
+            // own lines, and pooling them into a headline would publish exactly what the gate
+            // refused to. Read BEFORE the line is built, which is where the ratios are pooled.
+            let may_pool = numerics::section_may_pool();
+            if agrees && !numerics::section_suspect() {
                 let dir = |r: f64| -> (f64, &'static str) {
                     if r >= 1.0 {
                         (r, "faster")
@@ -852,10 +917,12 @@ fn main() {
                     if inside(v) {
                         line.push_str(" [INSIDE FLOOR]");
                     }
-                    if is_par {
-                        gen_par_ratios_c.push(r);
-                    } else {
-                        gen_ratios_c.push(r);
+                    if may_pool {
+                        if is_par {
+                            gen_par_ratios_c.push(r);
+                        } else {
+                            gen_ratios_c.push(r);
+                        }
                     }
                 }
                 if let Some(m) = &wukong {
@@ -869,16 +936,17 @@ fn main() {
                     line.push_str(&format!("; row floor {f:.2}x"));
                 }
                 // A ratio line like any other `->` standing: withheld if this row's section already
-                // reported a numerical mismatch.
+                // reported a numerical mismatch, or ran no check at all.
                 standing!("{line}");
                 println!("     wk(gen) dispatch: {census}");
             }
         }
-        let suspect = numerics::section_suspect();
-        if suspect {
+        if numerics::section_suspect() {
             suspect_rows.push(k.name);
         }
-        if let (false, Some(m), Some(c)) = (suspect, &wukong, &c) {
+        // The same gate as every standing: SUSPECT and UNCHECKED rows pool nothing.
+        let may_pool = numerics::section_may_pool();
+        if let (true, Some(m), Some(c)) = (may_pool, &wukong, &c) {
             let r = c.ns_per_call / m.ns_per_call; // >1 => Wukong faster
             if is_par {
                 par_ratios_c.push(r);
@@ -888,7 +956,7 @@ fn main() {
             }
             compile_ratios_c.push(c.compile.as_secs_f64() / m.compile.as_secs_f64());
         }
-        if let (false, Some(m), Some(cpp)) = (suspect, &wukong, &cpp) {
+        if let (true, Some(m), Some(cpp)) = (may_pool, &wukong, &cpp) {
             let r = cpp.ns_per_call / m.ns_per_call; // >1 => Wukong faster
             if is_par {
                 par_ratios_cpp.push(r);
@@ -1113,9 +1181,11 @@ fn main() {
         print_sota_scorecard(&rows);
     }
 
-    // THE NUMERICS GATE (P8.3). Every section that printed a numerical mismatch has already had
-    // its standings withheld (see `numerics.rs`); this lists them and turns them into the exit
-    // code, so a campaign runner records the process as not clean rather than publishing it.
+    // THE NUMERICS GATE (P8.3). Every section that printed a numerical mismatch (SUSPECT), and
+    // every section that printed a standing before any numerics check had run in it (UNCHECKED),
+    // has already had those standings withheld (see `numerics.rs`); this lists both and turns them
+    // into the exit code, so a campaign runner records the process as not clean rather than
+    // publishing it.
     let code = numerics::finish();
     if code != 0 {
         std::process::exit(code);
@@ -1510,17 +1580,12 @@ fn bench_matmul_skinny(cc: &str, dir: &Path, roof: f64) {
         );
         dispersion::twin_control(2, 3);
         dispersion::all_core_twin_control("MKL(all)", 8, 9);
-        if roof > 0.0 {
-            if let Some(w) = &wuk {
-                standing!(
-                    "  -> Wukong single-core = {:.0}% of measured roofline",
-                    (flops / w.ns_per_call) / roof * 100.0
-                );
-            }
-        }
+        // CHECKS FIRST (P8.3): every standing below - the roofline line included - is withheld
+        // unless a numerics check of Wukong's buffer has already run in this section.
         // The bit-exactness law exercised at the exact shape: serial and @parallel must agree
         // bit-for-bit (same per-(i,j) K order regardless of the parallel grid).
         if let (Some(s), Some(p)) = (&wuk, &wk_par) {
+            checked!();
             match s
                 .out
                 .iter()
@@ -1534,12 +1599,21 @@ fn bench_matmul_skinny(cc: &str, dir: &Path, roof: f64) {
         // Cross-language correctness against the naive C reference: the tiled kernel reassociates
         // the K-dot, so the bar is the suite's tight magnitude-normalized 1e-3, as in bench_matmul.
         if let (Some(mm), Some(c2)) = (&wuk, &cm) {
+            checked!();
             let (rel, at) = max_rel_err(&mm.out, &c2.out);
             if rel > 1e-3 {
                 mismatch!(
                     "  ! full-buffer mismatch vs C at [{at}]: Wukong={} C={} (rel {rel:.2e})",
                     mm.out[at],
                     c2.out[at]
+                );
+            }
+        }
+        if roof > 0.0 {
+            if let Some(w) = &wuk {
+                standing!(
+                    "  -> Wukong single-core = {:.0}% of measured roofline",
+                    (flops / w.ns_per_call) / roof * 100.0
                 );
             }
         }
@@ -1702,16 +1776,13 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize, roof: f64) {
     );
     dispersion::twin_control(2, 3);
     dispersion::all_core_twin_control("MKL(all)", 9, 10);
-    report_gemm_standing(&wuk, &tuned, roof, flops);
-    report_gemm_vs_mkl(&wuk, &wk_par, &mkl_1c, &mkl_all, flops);
-    if !run_naive {
-        println!(
-            "  -> naive C/Rust omitted at {ns}³ (multi-second per call; their loss widens monotonically\n     below — Wuk 1c is 2.4–3.8× naive C at 256–1024³ and naive C keeps falling on cache misses).\n     Correctness here is cross-checked vs MKL (above), the stronger oracle."
-        );
-    }
+    // CHECKS FIRST (P8.3): a standing is withheld unless a numerics check of Wukong's buffer has
+    // already run in this section, and `report_gemm_standing` used to print two standings here
+    // (vs tuned matrixmultiply, % of roofline) before any check had run.
     // Cross-language correctness: Wukong's C must match the C/gcc reference element-by-element. Uses
     // the single-core `wuk`; every timed column also retains its own output snapshot.
     if let (Some(m), Some(c)) = (&wuk, &cm) {
+        checked!();
         let (rel, at) = max_rel_err(&m.out, &c.out);
         if rel > 1e-3 {
             mismatch!(
@@ -1721,6 +1792,17 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize, roof: f64) {
                 rel
             );
         }
+    }
+    // The tuned matrixmultiply column is in-process and always present, so it is the one check
+    // that still runs at the sizes where the naive peers are skipped and MKL is absent (any
+    // non-Windows host). Its standing is printed below; it is now also an oracle for Wukong.
+    gemm_vs_tuned_check(&wuk, &tuned);
+    report_gemm_standing(&wuk, &tuned, roof, flops);
+    report_gemm_vs_mkl(&wuk, &wk_par, &mkl_1c, &mkl_all, flops);
+    if !run_naive {
+        println!(
+            "  -> naive C/Rust omitted at {ns}³ (multi-second per call; their loss widens monotonically\n     below — Wuk 1c is 2.4–3.8× naive C at 256–1024³ and naive C keeps falling on cache misses).\n     Correctness here is cross-checked vs tuned matrixmultiply and MKL (above)."
+        );
     }
     if let (Some(mp), Some(c)) = (&wk_par, &cm) {
         let r = flops / mp.ns_per_call / (flops / c.ns_per_call);
@@ -1950,18 +2032,12 @@ fn bench_matmul_tn(cc: &str, dir: &Path, roof: f64) {
         // only comparable within a run. The clock-invariant denominator is the roofline measured by
         // the SAME process (`measure_fma_roofline`) — print the percentage next to the table, as
         // `bench_matmul_skinny`/`bench_linear` already do.
-        if roof > 0.0 {
-            if let Some(w) = &wuk {
-                standing!(
-                    "  -> Wukong single-core = {:.0}% of measured roofline",
-                    (flops / w.ns_per_call) / roof * 100.0
-                );
-            }
-        }
-        // Cross-language correctness: the transpose-once-then-NN result must match the `kij` nest,
-        // in BOTH peers (each was re-spelled in the 2026-08-04 peer audit).
+        // Cross-language correctness FIRST (P8.3): the transpose-once-then-NN result must match
+        // the `kij` nest, in BOTH peers (each was re-spelled in the 2026-08-04 peer audit). The
+        // roofline standing used to print above this loop, i.e. before any check had run.
         for (lang, peer) in [("C", &cm), ("Rust", &rm)] {
             if let (Some(m), Some(c)) = (&wuk, peer) {
+                checked!();
                 let (rel, at) = max_rel_err(&m.out, &c.out);
                 if rel > 1e-3 {
                     mismatch!(
@@ -1969,6 +2045,14 @@ fn bench_matmul_tn(cc: &str, dir: &Path, roof: f64) {
                         m.out[at], c.out[at], rel
                     );
                 }
+            }
+        }
+        if roof > 0.0 {
+            if let Some(w) = &wuk {
+                standing!(
+                    "  -> Wukong single-core = {:.0}% of measured roofline",
+                    (flops / w.ns_per_call) / roof * 100.0
+                );
             }
         }
         if let (Some(ms), Some(c)) = (&wuk, &cm) {
@@ -1989,6 +2073,17 @@ fn bench_matmul_tn(cc: &str, dir: &Path, roof: f64) {
         }
         report_cpp_ratio(&wuk, &wk_par, &cm_cpp);
         report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
+        // The library bar (P6.2): `cblas_sgemm_64` with `transa = CblasTrans`, held to the relaxed
+        // 1e-2 bar above. Printed as standings so the TN lead can be read against the state of the
+        // art and not only against idiomatic C - or, with no MKL on this host, says why not.
+        report_library_columns(
+            "cblas_sgemm_64 (TransA)",
+            mkl_absent_reason(None),
+            &wuk,
+            &wk_par,
+            &mkl_1c,
+            &mkl_all,
+        );
         println!();
     }
 }
@@ -2179,6 +2274,7 @@ fn bench_gemv(cc: &str, dir: &Path) {
         // The 8-wide row dot reassociates → magnitude-normalized tolerance (max|Δ| / max|C|), not a
         // pointwise ratio (mean-zero inputs put outputs near 0). Same basis as the reduction cross-checks.
         if let (Some(a2), Some(c2)) = (&wuk, &cm) {
+            checked!();
             let maxabs = c2
                 .out
                 .iter()
@@ -2208,6 +2304,15 @@ fn bench_gemv(cc: &str, dir: &Path) {
         }
         report_cpp_ratio(&wuk, &wk_par, &cm_cpp);
         report_relaxed_ratio("C(fast) [-ffast-math]", &wuk, &wk_par, &cfast);
+        // The library bar (P6.2): `cblas_sgemv_64`, held to the relaxed 1e-2 bar above.
+        report_library_columns(
+            "cblas_sgemv_64",
+            mkl_absent_reason(Some(("cblas_sgemv_64", |api| api.sgemv.is_some()))),
+            &wuk,
+            &wk_par,
+            &mkl_1c,
+            &mkl_all,
+        );
         println!();
     }
 }
@@ -2340,6 +2445,7 @@ fn bench_scaled_gemm(cc: &str, dir: &Path) {
         // the same basis as gemv and the reduction cross-checks. The bit-exact gate is the runtime f64
         // reference + interp==native unit test; this is only a sanity ceiling.
         if let (Some(a2), Some(c2)) = (&wuk, &cm) {
+            checked!();
             let maxabs = c2
                 .out
                 .iter()
@@ -2561,6 +2667,22 @@ fn bench_linear(cc: &str, dir: &Path, roof: f64) {
         );
         dispersion::twin_control(2, 3);
         dispersion::all_core_twin_control("MKL(all)", 9, 10);
+        // CHECKS FIRST (P8.3). Until this audit the linear section never compared Wukong's buffer
+        // with its C peer at all: its only check was against MKL(1c) inside `report_gemm_vs_mkl`,
+        // which is absent on every non-Windows host, so there every standing below was a ratio
+        // against a peer nothing had compared Wukong with. Same bar and metric as `bench_matmul`.
+        if let (Some(m), Some(c2)) = (&wuk, &cm) {
+            checked!();
+            let (rel, at) = max_rel_err(&m.out, &c2.out);
+            if rel > 1e-3 {
+                mismatch!(
+                    "  ! full-buffer mismatch vs C at [{at}]: Wukong={} C={} (rel {rel:.2e})",
+                    m.out[at],
+                    c2.out[at]
+                );
+            }
+        }
+        gemm_vs_tuned_check(&wuk, &tuned);
         report_gemm_standing(&wuk, &tuned, roof, flops);
         report_gemm_vs_mkl(&wuk, &wk_par, &mkl_1c, &mkl_all, flops);
         if let (Some(mp), Some(c)) = (&wk_par, &cm) {
@@ -2772,23 +2894,29 @@ fn bench_ffn(cc: &str, dir: &Path, roof: f64) {
         // only comparable within a run. The clock-invariant denominator is the roofline measured by
         // the SAME process (`measure_fma_roofline`) — print the percentage next to the table, as
         // `bench_matmul_skinny`/`bench_linear` already do.
+        // Cross-language correctness over the whole buffer (silu(GEMM) — tight tolerance, see doc),
+        // FIRST (P8.3): the roofline standing below used to print before it. Both Wukong columns are
+        // checked - until this audit only the @parallel one was, while the single-core one carried
+        // the roofline and the single-core standing.
+        for (who, wk_col) in [("Wukong", &wuk), ("Wukong @parallel", &wk_par)] {
+            if let (Some(m), Some(c)) = (wk_col, &cm) {
+                checked!();
+                let (rel, at) = max_rel_err(&m.out, &c.out);
+                if rel > 1e-3 {
+                    mismatch!(
+                        "  ! full-buffer mismatch vs C at [{at}]: {who}={} C={} (rel {:.2e})",
+                        m.out[at],
+                        c.out[at],
+                        rel
+                    );
+                }
+            }
+        }
         if roof > 0.0 {
             if let Some(w) = &wuk {
                 standing!(
                     "  -> Wukong single-core = {:.0}% of measured roofline",
                     (flops / w.ns_per_call) / roof * 100.0
-                );
-            }
-        }
-        // Cross-language correctness over the whole buffer (silu(GEMM) — tight tolerance, see doc).
-        if let (Some(m), Some(c)) = (&wk_par, &cm) {
-            let (rel, at) = max_rel_err(&m.out, &c.out);
-            if rel > 1e-3 {
-                mismatch!(
-                    "  ! full-buffer mismatch vs C at [{at}]: Wukong={} C={} (rel {:.2e})",
-                    m.out[at],
-                    c.out[at],
-                    rel
                 );
             }
         }
@@ -2960,6 +3088,7 @@ fn bench_linear_bf16(cc: &str, dir: &Path) {
         // Sanity cross-check on c[0] (the bf16 widen is lossless, so all three compute the same GEMM
         // up to the documented float-reassociation tolerance).
         if let (Some(m), Some(c2)) = (&wuk, &cm) {
+            checked!();
             let rel = ((m.out - c2.out).abs() / c2.out.abs().max(1e-6)) as f64;
             if rel > 1e-2 {
                 mismatch!(
@@ -3250,11 +3379,13 @@ fn bench_transpose(cc: &str, dir: &Path) {
         // also what makes the non-square shape safe: a peer that muddled `rows`/`cols` would produce
         // a different buffer, not a faster one.
         if let (Some(m), Some(c2)) = (&wuk, &cm) {
+            checked!();
             if m.out != c2.out {
                 mismatch!("  ! transpose output mismatch vs C");
             }
         }
         if let (Some(m), Some(r2)) = (&wuk, &rm) {
+            checked!();
             if m.out != r2.out {
                 mismatch!("  ! transpose output mismatch vs Rust");
             }
@@ -3266,8 +3397,9 @@ fn bench_transpose(cc: &str, dir: &Path) {
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
             );
-            // A SUSPECT section's ratio was withheld above; it must not reach the regime geomean.
-            if !numerics::section_suspect() {
+            // A SUSPECT or UNCHECKED section's ratio was withheld above; it must not reach the
+            // regime geomean.
+            if numerics::section_may_pool() {
                 if aliasing {
                     alias_1c.push(r)
                 } else {
@@ -3278,7 +3410,9 @@ fn bench_transpose(cc: &str, dir: &Path) {
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r = c2.ns_per_call / mp.ns_per_call;
             par_standing("idiomatic single-threaded C", r);
-            if !numerics::section_suspect() {
+            // With no single-core column nothing was checked in this section (both checks above
+            // compare `wuk`), so the standing was withheld as UNCHECKED and must not pool either.
+            if numerics::section_may_pool() {
                 if aliasing {
                     alias_par.push(r)
                 } else {
@@ -3288,6 +3422,15 @@ fn bench_transpose(cc: &str, dir: &Path) {
         }
         report_cpp_ratio(&wuk, &wk_par, &cm_cpp);
         report_relaxed_ratio("C(omp) [-fopenmp, all cores]", &wuk, &wk_par, &comp);
+        // The library bar (P6.2): `MKL_Somatcopy`, held to BIT equality by `mkl_transpose_exact`.
+        report_library_columns(
+            "MKL_Somatcopy",
+            mkl_absent_reason(Some(("MKL_Somatcopy", |api| api.somatcopy.is_some()))),
+            &wuk,
+            &wk_par,
+            &mkl_1c,
+            &mkl_all,
+        );
         println!();
     }
     transpose_regime_summary(&alias_1c, &gen_1c, &alias_par, &gen_par);
@@ -3559,11 +3702,13 @@ fn bench_colsum(cc: &str, dir: &Path) {
         dispersion::all_core_twin_control("C(omp)", 6, 7);
         // Both sum each column in i-ascending order, so the full-buffer cross-check is bit equality.
         if let (Some(a), Some(c2)) = (&wuk, &cm) {
+            checked!();
             if a.out != c2.out {
                 mismatch!("  ! colsum output mismatch vs C");
             }
         }
         if let (Some(a), Some(r2)) = (&wuk, &rm) {
+            checked!();
             if a.out != r2.out {
                 mismatch!("  ! colsum output mismatch vs Rust");
             }
@@ -3725,6 +3870,7 @@ fn bench_biasadd(cc: &str, dir: &Path) {
         );
         dispersion::twin_control(2, 3);
         if let (Some(a), Some(c2)) = (&wuk, &cm) {
+            checked!();
             if a.out != c2.out {
                 mismatch!("  ! biasadd output mismatch vs C");
             }
@@ -3945,6 +4091,7 @@ fn bench_dequant(cc: &str, dir: &Path) {
 /// f32 buffer. A mismatch is a real miscompile, not tolerance.
 fn dequant_check(wuk: &Option<Measure>, peer: &Option<Measure>, lang: &str) {
     if let (Some(m), Some(p)) = (wuk, peer) {
+        checked!();
         if m.out != p.out {
             let at = m
                 .out
@@ -4160,11 +4307,13 @@ fn bench_colmax(cc: &str, dir: &Path) {
             );
             // Both fold each column i-ascending, so the full-buffer cross-check is bit equality.
             if let (Some(a), Some(c2)) = (&wuk, &cm) {
+                checked!();
                 if a.out != c2.out {
                     mismatch!("  ! {label} output mismatch vs C");
                 }
             }
             if let (Some(a), Some(r2)) = (&wuk, &rm) {
+                checked!();
                 if a.out != r2.out {
                     mismatch!("  ! {label} output mismatch vs Rust");
                 }
@@ -4371,11 +4520,13 @@ fn bench_rowarg(cc: &str, dir: &Path) {
             // (no tolerance: a per-row arg-selection is deterministic, lowest index winning on a tie).
             let as_i32 = |v: &[f32]| v.iter().map(|x| x.to_bits() as i32).collect::<Vec<i32>>();
             if let (Some(a), Some(c2)) = (&wuk, &cm) {
+                checked!();
                 if as_i32(&a.out) != as_i32(&c2.out) {
                     mismatch!("  ! {label} index mismatch vs C");
                 }
             }
             if let (Some(a), Some(r2)) = (&wuk, &rm) {
+                checked!();
                 if as_i32(&a.out) != as_i32(&r2.out) {
                     mismatch!("  ! {label} index mismatch vs Rust");
                 }
@@ -4551,11 +4702,13 @@ fn bench_colarg(cc: &str, dir: &Path) {
             );
             let as_i32 = |v: &[f32]| v.iter().map(|x| x.to_bits() as i32).collect::<Vec<i32>>();
             if let (Some(a), Some(c2)) = (&wuk, &cm) {
+                checked!();
                 if as_i32(&a.out) != as_i32(&c2.out) {
                     mismatch!("  ! {label} index mismatch vs C");
                 }
             }
             if let (Some(a), Some(r2)) = (&wuk, &rm) {
+                checked!();
                 if as_i32(&a.out) != as_i32(&r2.out) {
                     mismatch!("  ! {label} index mismatch vs Rust");
                 }
@@ -4729,6 +4882,7 @@ fn bench_lrscan(cc: &str, dir: &Path) {
             gbps(&rm)
         );
         if let (Some(a2), Some(c2)) = (&wuk, &cm) {
+            checked!();
             let maxabs = c2.out.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-6);
             let maxerr = a2
                 .out
@@ -4865,6 +5019,7 @@ fn bench_cumprod(cc: &str, dir: &Path) {
             gbps(&rm)
         );
         if let (Some(a), Some(c2)) = (&wuk, &cm) {
+            checked!();
             let maxabs = c2.out.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-6);
             let maxerr = a
                 .out
@@ -4991,6 +5146,7 @@ fn bench_cumsum(cc: &str, dir: &Path) {
         // random walk that crosses zero, where a pointwise ratio divides by ~0. Same basis as the norm
         // / reduction cross-checks.
         if let (Some(a), Some(c2)) = (&wuk, &cm) {
+            checked!();
             let maxabs = c2.out.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-6);
             let maxerr = a
                 .out
@@ -5129,11 +5285,13 @@ fn bench_cumminmax(cc: &str, dir: &Path) {
             );
             // max/min select a value → bit-exact cross-check (no reassociation tolerance).
             if let (Some(a), Some(c2)) = (&wuk, &cm) {
+                checked!();
                 if a.out != c2.out {
                     mismatch!("  ! {label} output mismatch vs C");
                 }
             }
             if let (Some(a), Some(r2)) = (&wuk, &rm) {
+                checked!();
                 if a.out != r2.out {
                     mismatch!("  ! {label} output mismatch vs Rust");
                 }
@@ -5269,11 +5427,13 @@ fn bench_colstat(cc: &str, dir: &Path) {
             // Both fold each column i-ascending and finalize with correctly-rounded /M and sqrt, so the
             // full-buffer cross-check is bit equality.
             if let (Some(a), Some(c2)) = (&wuk, &cm) {
+                checked!();
                 if a.out != c2.out {
                     mismatch!("  ! {label} output mismatch vs C");
                 }
             }
             if let (Some(a), Some(r2)) = (&wuk, &rm) {
+                checked!();
                 if a.out != r2.out {
                     mismatch!("  ! {label} output mismatch vs Rust");
                 }
@@ -5465,6 +5625,7 @@ fn bench_softmax_bwd(cc: &str, dir: &Path) {
         // *per-element* relative error is meaningless — normalize the max abs error by the max output
         // magnitude instead (the honest "is the whole vector close" metric).
         if let (Some(m), Some(c2)) = (&wuk, &cm) {
+            checked!();
             let maxabs = c2.out.iter().fold(0.0f32, |a, &v| a.max(v.abs())).max(1e-6);
             let maxerr = m
                 .out
@@ -5627,6 +5788,7 @@ fn bench_rmsnorm_bwd(cc: &str, dir: &Path) {
             gbps(&rm)
         );
         if let (Some(m), Some(c2)) = (&wuk, &cm) {
+            checked!();
             let maxabs = c2.out.iter().fold(0.0f32, |a, &v| a.max(v.abs())).max(1e-6);
             let maxerr = m
                 .out
@@ -5935,6 +6097,7 @@ fn bench_xent(cc: &str, dir: &Path) {
             gbps(&rm)
         );
         if let (Some(m), Some(c2)) = (&wuk, &cm) {
+            checked!();
             let maxabs = c2.out.iter().fold(0.0f32, |a, &v| a.max(v.abs())).max(1e-6);
             let maxerr = m
                 .out
@@ -6081,6 +6244,7 @@ fn bench_rope(cc: &str, dir: &Path) {
             gbps(&rm)
         );
         if let (Some(m), Some(c2)) = (&wuk, &cm) {
+            checked!();
             let maxabs = c2.out.iter().fold(0.0f32, |a, &v| a.max(v.abs())).max(1e-6);
             let maxerr = m
                 .out
@@ -6694,6 +6858,7 @@ fn report_ratio(
     println!("{hdr}");
     println!("{vals}");
     if let (Some(m), Some(c2)) = (wuk, cm) {
+        checked!();
         let maxabs = c2.out.iter().fold(0.0f32, |a, &v| a.max(v.abs())).max(1e-6);
         let maxerr = m
             .out
@@ -6815,6 +6980,7 @@ fn bench_act_backward_n(cc: &str, dir: &Path, n: usize) {
         // Same magnitude-normalized check as softmax_bwd: the poly sigmoid/tanh differs from libm by
         // ~1 ULP, and act'(x) has zeros where a per-element relative error is meaningless.
         if let (Some(m), Some(c2)) = (&wuk, &cm) {
+            checked!();
             let maxabs = c2.out.iter().fold(0.0f32, |a, &v| a.max(v.abs())).max(1e-6);
             let maxerr = m
                 .out
@@ -7018,6 +7184,7 @@ fn bench_i8gemm(cc: &str, dir: &Path) {
                 ("Rust", &rm),
             ] {
                 if let Some(o) = other {
+                    checked!();
                     if o.out != m.out {
                         let at = m
                             .out
@@ -7252,6 +7419,7 @@ fn bench_bf16(cc: &str, dir: &Path) {
                     ("C(fast)", &cfast, 1e-2),
                 ] {
                     if let Some(o2) = other {
+                        checked!();
                         let (a, b) = (m.out, o2.out);
                         let rel = (a - b).abs() as f64 / (a.abs().max(b.abs()).max(1e-6) as f64);
                         println!(
@@ -7448,6 +7616,7 @@ fn bench_axpby_half_out(cc: &str, dir: &Path) {
     if let Some(m) = &wk_half {
         for (lang, other) in [("C", &cm), ("C++", &cm_cpp), ("Rust", &rm)] {
             if let Some(o2) = other {
+                checked!();
                 let (rel, at) = max_rel_err(&m.out, &o2.out);
                 if rel > 8e-3 {
                     mismatch!(
@@ -7621,6 +7790,7 @@ fn bench_conv(cc: &str, dir: &Path) {
         gflops(&rm)
     );
     if let (Some(m), Some(c)) = (&wuk, &cm) {
+        checked!();
         let (rel, at) = max_rel_err(&m.out, &c.out);
         if rel > 1e-3 {
             mismatch!(
@@ -7823,7 +7993,7 @@ fn bench_norm(cc: &str, dir: &Path) {
             // Checked BEFORE the row is printed: this table carries its ratios in its own cells, so
             // a row that fails the check prints SUSPECT there instead of a clean "1.31x faster"
             // (the numerics gate, P8.3).
-            let failures = norm_row_failures(op, &wuk, &c, &rust);
+            let (failures, row_checks) = norm_row_failures(op, &wuk, &c, &rust);
             // Every column here is single-threaded, so the `C(twin)` floor qualifies every cell.
             let standing_vs = |peer: &Option<Measure>| {
                 // A row after an earlier row's mismatch in this section is withheld too: the
@@ -7832,6 +8002,10 @@ fn bench_norm(cc: &str, dir: &Path) {
                     return "SUSPECT".to_string();
                 }
                 if let (Some(m), Some(p)) = (&wuk, peer) {
+                    // No C or Rust buffer to compare this row with: its cells are withheld.
+                    if row_checks == 0 {
+                        return "UNCHECKED".to_string();
+                    }
                     dispersion::ratio_cell(p.ns_per_call, m.ns_per_call, floor)
                 } else {
                     "n/a".into()
@@ -7849,6 +8023,9 @@ fn bench_norm(cc: &str, dir: &Path) {
                 standing_vs(&c_cpp),
                 standing_vs(&cfast)
             );
+            if row_checks == 0 && wuk.is_some() && (c_cpp.is_some() || cfast.is_some()) {
+                numerics::report_unchecked_cells(op);
+            }
             for f in &failures {
                 mismatch!("{f}");
             }
@@ -7858,17 +8035,21 @@ fn bench_norm(cc: &str, dir: &Path) {
 }
 
 /// The norm tables' full-buffer cross-checks against C and Rust, as the `!` lines they would print
-/// (empty when both agree within the suite's 1e-3 bar). Computed before the row is printed so the
-/// row's own ratio cells can read SUSPECT - see the numerics gate in `numerics.rs`.
+/// (empty when both agree within the suite's 1e-3 bar), and how many checks ran. Computed before
+/// the row is printed so the row's own ratio cells can read SUSPECT (a check failed) or UNCHECKED
+/// (no check ran) - see the numerics gate in `numerics.rs`.
 fn norm_row_failures(
     label: &str,
     wuk: &Option<Measure>,
     c: &Option<Measure>,
     rust: &Option<Measure>,
-) -> Vec<String> {
+) -> (Vec<String>, usize) {
     let mut failures = Vec::new();
+    let mut checks = 0usize;
     for (lang, peer) in [("C", c), ("Rust", rust)] {
         if let (Some(m), Some(p)) = (wuk, peer) {
+            checked!();
+            checks += 1;
             let (rel, at) = max_rel_err(&m.out, &p.out);
             if rel > 1e-3 {
                 failures.push(format!(
@@ -7879,7 +8060,7 @@ fn norm_row_failures(
             }
         }
     }
-    failures
+    (failures, checks)
 }
 
 /// Wukong norm source: copy `x`→`out`, then the canonical in-place multi-pass form the recognizer
@@ -8155,7 +8336,7 @@ fn bench_norm_batched(cc: &str, dir: &Path) {
                 // Full-buffer cross-check (f32 tolerance: Wukong reassociates the per-row
                 // reductions), BEFORE the row prints - see `bench_norm`: a failing row prints
                 // SUSPECT in its ratio cells rather than a clean ratio.
-                let failures = norm_row_failures(&label, &wuk, &c, &rust);
+                let (failures, row_checks) = norm_row_failures(&label, &wuk, &c, &rust);
                 // The single-threaded `C(twin)` floor qualifies the single-threaded row only.
                 let floor = if suffix.is_empty() { twin_floor } else { None };
                 let standing_vs = |peer: &Option<Measure>| {
@@ -8164,6 +8345,10 @@ fn bench_norm_batched(cc: &str, dir: &Path) {
                         return "SUSPECT".to_string();
                     }
                     if let (Some(m), Some(p)) = (&wuk, peer) {
+                        // No C or Rust buffer to compare this row with: its cells are withheld.
+                        if row_checks == 0 {
+                            return "UNCHECKED".to_string();
+                        }
                         dispersion::ratio_cell(p.ns_per_call, m.ns_per_call, floor)
                     } else {
                         "n/a".into()
@@ -8181,6 +8366,9 @@ fn bench_norm_batched(cc: &str, dir: &Path) {
                     standing_vs(&c_cpp),
                     standing_vs(&cfast)
                 );
+                if row_checks == 0 && wuk.is_some() && (c_cpp.is_some() || cfast.is_some()) {
+                    numerics::report_unchecked_cells(&label);
+                }
                 for f in &failures {
                     mismatch!("{f}");
                 }
@@ -8334,6 +8522,7 @@ fn report(
     // caller (`relaxed_peer_ok`), so this loop covers C and C++ only.
     for (lang, peer) in [("C", c), ("C++", cpp)] {
         if let (Some(m), Some(p)) = (m, peer) {
+            checked!();
             let (rel, at) = max_rel_err(&m.out, &p.out);
             if rel > 1e-3 {
                 mismatch!(
@@ -9291,6 +9480,20 @@ fn time_ns(mut run: impl FnMut()) -> f64 {
     }
 }
 
+/// Cross-check Wukong's single-core GEMM buffer against the in-process tuned `matrixmultiply`
+/// column at the suite's like-for-like 1e-3 bar. Both reassociate the K-dot (KC-blocked), so the
+/// bar is the one the naive-C check uses. Called BEFORE [`report_gemm_standing`], which prints a
+/// standing against this column.
+fn gemm_vs_tuned_check(wuk: &Option<Measure>, tuned: &Measure) {
+    if let Some(m) = wuk {
+        checked!();
+        let (rel, at) = max_rel_err(&m.out, &tuned.out);
+        if rel > 1e-3 || m.out.len() != tuned.out.len() {
+            mismatch!("  ! full-buffer mismatch vs tuned matrixmultiply at [{at}] (rel {rel:.2e})");
+        }
+    }
+}
+
 /// Print where Wukong's single-core GEMM stands: vs the tuned library (the SOTA-parity check) and
 /// as a % of the measured AVX2-FMA roofline (clock-invariant — the honest figure on this box, whose
 /// absolute GFLOP/s swings with the power/thermal state).
@@ -9936,6 +10139,7 @@ fn report_gemm_vs_mkl(
         // Check BEFORE the standing (moved 2026-10-07): the numerics gate can withhold a ratio only
         // if the mismatch it depends on has already been reported. Printed after it, a divergent
         // GEMM's "1.05x faster than oneMKL" went out clean and the `!` line followed it.
+        checked!();
         let (rel, at) = max_rel_err(&m.out, &k.out);
         if rel > 1e-3 {
             mismatch!("  ! Wukong vs MKL full-buffer mismatch at [{at}] (rel {rel:.2e})");
@@ -11429,8 +11633,10 @@ fn bench_streaming_large(cc: &str, dir: &Path) {
         };
         // Full-buffer cross-check vs C, BEFORE the row prints: this table carries its ratios in its
         // own cells, so a failing row prints SUSPECT there instead of a clean ratio (P8.3).
+        let row_checked = wuk.is_some() && c.is_some();
         let failure = match (&wuk, &c) {
             (Some(m), Some(c)) => {
+                checked!();
                 let (rel, at) = max_rel_err(&m.out, &c.out);
                 (rel > 1e-4).then(|| {
                     format!(
@@ -11447,6 +11653,10 @@ fn bench_streaming_large(cc: &str, dir: &Path) {
                 return "SUSPECT".to_string();
             }
             if let (Some(m), Some(p)) = (&wuk, peer) {
+                // No C buffer to compare this row with: its cells are withheld.
+                if !row_checked {
+                    return "UNCHECKED".to_string();
+                }
                 let r = p.ns_per_call / m.ns_per_call;
                 format!(
                     "{:.2}x {}",
@@ -11467,6 +11677,9 @@ fn bench_streaming_large(cc: &str, dir: &Path) {
             standing_vs(&c),
             standing_vs(&c_cpp)
         );
+        if !row_checked && wuk.is_some() && c_cpp.is_some() {
+            numerics::report_unchecked_cells(name);
+        }
         if let Some(f) = &failure {
             mismatch!("{f}");
         }
@@ -13576,6 +13789,152 @@ mod tests {
         }
     }
 
+    /// The non-test part of a source file: everything before its `#[cfg(test)] mod tests`, so the
+    /// scanners below never read their own needle strings as harness code.
+    fn harness_source(src: &str) -> &str {
+        src.find("#[cfg(test)]\nmod ").map_or(src, |at| &src[..at])
+    }
+
+    /// Scan harness source for standings printed before the open section's first numerics check.
+    /// Returns the number of section headings seen and one `line: text` entry per violation. Calls
+    /// that print standings internally are classified by what they do FIRST: `report(k, ..)`,
+    /// `report_ratio(..)`, `dequant_check(..)`, `norm_row_failures(..)` and
+    /// `gemm_vs_tuned_check(..)` check before they print, while `report_gemm_vs_mkl(..)` checks
+    /// only when MKL is present and so counts as a standing here.
+    fn standings_before_checks(src: &str) -> (usize, Vec<String>) {
+        let checks = [
+            "checked!()",
+            "mismatch!(",
+            "report(k,",
+            "report_ratio(",
+            "dequant_check(",
+            "norm_row_failures(",
+            "gemm_vs_tuned_check(",
+            "check(&wk_m,",
+        ];
+        let standings = [
+            "standing!(",
+            "report_relaxed_ratio(",
+            "par_standing(",
+            "report_cpp_ratio(",
+            "report_gemm_standing(",
+            "report_gemm_vs_mkl(",
+            "dequant_ratio(",
+            "bf16_relaxed_ratio(",
+            "report_library_columns(",
+            "ratio_line(",
+        ];
+        let mut violations = Vec::new();
+        let mut sections = 0usize;
+        let mut func = String::new();
+        let mut in_section = false;
+        let mut checked = false;
+        for (n, line) in harness_source(src).lines().enumerate() {
+            let t = line.trim_start();
+            if line.starts_with("fn ") || line.starts_with("pub(crate) fn ") {
+                func = t.split('(').next().unwrap_or("").to_string();
+                in_section = false;
+                continue;
+            }
+            if t.starts_with("//") || t.starts_with("fn ") || t.starts_with("let ratio_line") {
+                continue;
+            }
+            if t.contains("section!(") {
+                in_section = true;
+                checked = false;
+                sections += 1;
+                continue;
+            }
+            if !in_section {
+                continue;
+            }
+            if checks.iter().any(|c| t.contains(c)) {
+                checked = true;
+            } else if !checked && standings.iter().any(|s| t.contains(s)) {
+                violations.push(format!("{} ({func}): {t}", n + 1));
+            }
+        }
+        (sections, violations)
+    }
+
+    /// P8.3's audit, held structurally: in every timed section of `main.rs` and `model.rs`, a
+    /// numerics check of Wukong's buffer runs BEFORE the section's first standing. The runtime gate
+    /// (`numerics.rs`) withholds a standing printed before any check as UNCHECKED, so a section that
+    /// regressed into check-after-standing order would fail every run's exit code; this test names
+    /// it at `cargo test` time instead. The negative control proves the scanner can fail.
+    #[test]
+    fn every_section_checks_before_its_first_standing() {
+        let control = "fn bench_x(cc: &str) {\n    section!(\"=== x ===\");\n    \
+                       standing!(\"  -> early\");\n    checked!();\n    standing!(\"  -> late\");\n}\n";
+        let (n, bad) = standings_before_checks(control);
+        assert_eq!(n, 1);
+        assert_eq!(
+            bad.len(),
+            1,
+            "the control's early standing must be caught: {bad:?}"
+        );
+        assert!(
+            bad[0].contains("early") && bad[0].contains("bench_x"),
+            "{bad:?}"
+        );
+
+        let mut violations = Vec::new();
+        let mut sections = 0usize;
+        for (file, src) in [
+            ("main.rs", include_str!("main.rs")),
+            ("model.rs", include_str!("model.rs")),
+        ] {
+            let (n, bad) = standings_before_checks(src);
+            sections += n;
+            violations.extend(bad.into_iter().map(|v| format!("{file}:{v}")));
+        }
+        assert!(
+            sections >= 40,
+            "the scan found only {sections} section heading(s)"
+        );
+        assert!(
+            violations.is_empty(),
+            "standing(s) printed before the section's first numerics check - the runtime gate \
+             would withhold each as UNCHECKED:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    /// The other half of the same audit: the general suite and the `tests/compare/` twins do not
+    /// print `standing!` lines (their ratios live in table cells and `SotaRow`s), so the ledger
+    /// cannot see them - every timed function there must run the f64 scalar oracle instead.
+    #[test]
+    fn every_timed_general_and_compare_section_runs_the_f64_oracle() {
+        let mut timed = 0usize;
+        for (file, src) in [
+            ("general.rs", include_str!("general.rs")),
+            ("compare.rs", include_str!("compare.rs")),
+        ] {
+            let body = harness_source(src);
+            let mut starts: Vec<usize> = body
+                .match_indices("\nfn ")
+                .map(|(i, _)| i)
+                .chain(body.match_indices("\npub(crate) fn ").map(|(i, _)| i))
+                .collect();
+            starts.sort_unstable();
+            starts.push(body.len());
+            for w in starts.windows(2) {
+                let f = &body[w[0]..w[1]];
+                if !(f.contains("Rounds::run(") || f.contains("Rounds::run_slots(")) {
+                    continue;
+                }
+                timed += 1;
+                let name = f.trim_start().lines().next().unwrap_or("");
+                assert!(
+                    f.contains("max_rel_vs_ref("),
+                    "{file}: `{name}` times columns but never checks them against the f64 \
+                     reference"
+                );
+            }
+        }
+        assert!(timed >= 4, "found only {timed} timed function(s)");
+    }
+
     /// Every VML row name must be a real elementwise-table row, or its library column silently
     /// never appears.
     #[test]
@@ -13599,6 +13958,32 @@ mod tests {
                 &la[3..],
                 "{name}: the two modes must name the same op"
             );
+        }
+    }
+
+    /// The MKL library arms (P6.2) say why they are absent instead of printing a bare `n/a`.
+    #[test]
+    fn a_missing_mkl_arm_has_a_printed_reason() {
+        // On a host with no MKL (every non-Windows host, and this one without conda) the base
+        // probe and every optional symbol report the same reason.
+        if mkl().is_none() {
+            let base = mkl_absent_reason(None).expect("no MKL must give a reason");
+            assert!(base.contains("WUKONG_MKL_DLL"), "{base}");
+            assert_eq!(
+                mkl_absent_reason(Some(("cblas_sgemv_64", |api| api.sgemv.is_some()))),
+                Some(base)
+            );
+        } else {
+            // With MKL loaded, the base GEMM symbol is present by construction (`mkl()` requires
+            // it), and an optional symbol reports absence only if it really did not resolve.
+            assert_eq!(mkl_absent_reason(None), None);
+            let api = mkl().unwrap();
+            assert_eq!(
+                mkl_absent_reason(Some(("MKL_Somatcopy", |api| api.somatcopy.is_some()))).is_none(),
+                api.somatcopy.is_some()
+            );
+            assert!(mkl_absent_reason(Some(("not-a-symbol", |_| false)))
+                .is_some_and(|why| why.contains("does not export `not-a-symbol`")));
         }
     }
 }

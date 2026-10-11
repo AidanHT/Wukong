@@ -6,6 +6,11 @@ license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+# Opt in to the workspace lint policy (`-D warnings`; see the workspace `Cargo.toml`), so a warning
+# here fails a plain local `cargo build` / `cargo clippy`, not only CI's `RUSTFLAGS`.
+[lints]
+workspace = true
+
 [dependencies]
 wukong_mir = { workspace = true }
 wukong_span = { workspace = true }

@@ -3013,6 +3013,7 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>, ga
     let unpassed = std::cell::RefCell::new(Vec::<String>::new());
     let check = |a: &Option<MeasureModel>, b: &Option<MeasureModel>, who: &str, tol: f64| {
         if let (Some(x), Some(z)) = (a, b) {
+            checked!();
             match cross_check_rel(&x.out, &z.out) {
                 Err(why) => {
                     mismatch!("  ! cross-check {who}: NOT RUN — {why}");
@@ -3054,6 +3055,7 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>, ga
     // twin (fixed chunking / row-mapped) and the outlined glue loops are deterministic, so this one
     // stays the strict per-element check — it is expected EXACT.
     if let (Some(x), Some(z)) = (&wk_m, &wk_par_m) {
+        checked!();
         if x.out.len() != z.out.len() || x.out.is_empty() {
             mismatch!(
                 "  ! cross-check Wukong serial vs @parallel: NOT RUN — buffer lengths {} vs {}",

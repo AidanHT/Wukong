@@ -29,6 +29,25 @@
 //! What is deliberately NOT a mismatch: a peer column DROPPED because it disagreed (C++ vs C, a
 //! relaxed C(fast)/C(omp) peer, an MKL ABI disagreement). A dropped column prints no ratio at all,
 //! so there is nothing to withhold, and those lines keep their plain `println!`.
+//!
+//! UNCHECKED (P8.3, second half). Withholding a ratio after a FAILED check is only half of the
+//! guarantee. The other half is that a check RAN: a section whose only comparison was skipped - the
+//! C peer did not build, the check sat after the standing, or the section never compared Wukong's
+//! buffer against anything - used to print `-> 1.31x faster` with no `!` line anywhere, and the
+//! clean end-of-run summary then certified it. So the ledger also counts the checks that ran in the
+//! open section:
+//!
+//! * [`checked!`] records that a numerics check of Wukong's output against an independent reference
+//!   ran. It sits where the comparison is made, BEFORE the branch that may `mismatch!`, so a check
+//!   that passes counts as well. A [`mismatch!`] counts as a check by itself.
+//! * A [`standing!`] in a section with ZERO checks is WITHHELD the same way a SUSPECT one is - the
+//!   reader sees `-> UNCHECKED: ratio withheld` and a `. withheld:` note - and the section is listed
+//!   in the end-of-run summary, which exits [`NUMERICS_EXIT`] (unless `XBENCH_NUMERICS=report`).
+//!
+//! What counts as a check is deliberately narrow: a comparison whose failure is a `mismatch!`. The
+//! peer filters (`relaxed_peer_ok`, the VML columns, `cpp_checked`, `mkl_transpose_exact`) do not
+//! count, because their failure DROPS a peer column rather than flagging Wukong - a section whose
+//! only comparison was one of those could print a ratio against a peer nothing compared Wukong with.
 
 use std::sync::Mutex;
 
@@ -43,10 +62,15 @@ pub(crate) struct Ledger {
     section: String,
     /// The open scope reported a numerical mismatch.
     suspect: bool,
+    /// Numerics checks that ran in the open scope ([`checked!`]; a [`mismatch!`] counts too).
+    checks: usize,
     /// Standings printed in the open scope while it was still clean.
     clean_standings: usize,
     /// Every heading that went SUSPECT, in order, without duplicates.
     suspect_sections: Vec<String>,
+    /// Every heading that printed a standing while no numerics check had run in it, in order,
+    /// without duplicates.
+    unchecked_sections: Vec<String>,
     /// The open scope's `C(twin)` single-thread floor (see `dispersion::twin_control`), if one ran.
     twin_floor: Option<f64>,
     /// The open scope's all-core twin floor (see `dispersion::all_core_twin_control`), if one ran.
@@ -58,8 +82,10 @@ impl Ledger {
         Ledger {
             section: String::new(),
             suspect: false,
+            checks: 0,
             clean_standings: 0,
             suspect_sections: Vec::new(),
+            unchecked_sections: Vec::new(),
             twin_floor: None,
             all_core_floor: None,
         }
@@ -69,6 +95,7 @@ impl Ledger {
     pub(crate) fn begin(&mut self, heading: &str) -> Vec<String> {
         self.section = heading.trim().to_string();
         self.suspect = false;
+        self.checks = 0;
         self.clean_standings = 0;
         self.twin_floor = None;
         self.all_core_floor = None;
@@ -94,13 +121,12 @@ impl Ledger {
     /// retroactive `!` line when standings were already printed in this scope.
     pub(crate) fn mismatch(&mut self, line: &str) -> Vec<String> {
         let mut out = vec![line.to_string()];
+        // A mismatch is the outcome of a check, so it is one: a section whose only check failed is
+        // SUSPECT, not UNCHECKED.
+        self.checks += 1;
         if !self.suspect {
             self.suspect = true;
-            let name = if self.section.is_empty() {
-                "(before the first section heading)".to_string()
-            } else {
-                self.section.clone()
-            };
+            let name = self.section_name();
             if !self.suspect_sections.contains(&name) {
                 self.suspect_sections.push(name);
             }
@@ -115,12 +141,41 @@ impl Ledger {
         out
     }
 
+    /// Record that a numerics check of Wukong's output ran in the open scope (see [`checked!`]).
+    pub(crate) fn check(&mut self) {
+        self.checks += 1;
+    }
+
+    /// The open scope's name for a summary list.
+    fn section_name(&self) -> String {
+        if self.section.is_empty() {
+            "(before the first section heading)".to_string()
+        } else {
+            self.section.clone()
+        }
+    }
+
     /// Route one standing line. Returns the lines to print.
     pub(crate) fn standing(&mut self, line: &str) -> Vec<String> {
         if self.suspect {
             return vec![
                 "  -> SUSPECT: ratio withheld - this section reported a numerical mismatch (see \
                  the `!` line above)"
+                    .to_string(),
+                format!("  . withheld: {}", line.trim_start()),
+            ];
+        }
+        // No check has run in this section yet: nothing compared the buffer this ratio was timed on
+        // against anything, so the ratio is not yet a measurement of the right computation. It is
+        // withheld exactly like a SUSPECT one, and the section is named in the summary.
+        if self.checks == 0 {
+            let name = self.section_name();
+            if !self.unchecked_sections.contains(&name) {
+                self.unchecked_sections.push(name);
+            }
+            return vec![
+                "  -> UNCHECKED: ratio withheld - no numerics check of Wukong's output ran in this \
+                 section before this standing"
                     .to_string(),
                 format!("  . withheld: {}", line.trim_start()),
             ];
@@ -162,10 +217,39 @@ impl Ledger {
         vec![out]
     }
 
-    /// Whether the open scope has reported a numerical mismatch. Summaries consult this so a
-    /// SUSPECT row is never pooled into a geomean whose own line would carry no warning.
+    /// A table row whose ratios live in its own CELLS (the norm and streaming tables) and for which
+    /// no numerics check ran: the row printed `UNCHECKED` in those cells instead of a ratio, and the
+    /// section is named in the summary exactly as a withheld [`standing!`] would name it. Returns
+    /// the line to print.
+    pub(crate) fn unchecked_cells(&mut self, row: &str) -> Vec<String> {
+        let name = self.section_name();
+        if !self.unchecked_sections.contains(&name) {
+            self.unchecked_sections.push(name);
+        }
+        vec![format!(
+            "  -> UNCHECKED: ratio withheld - no numerics check of Wukong's output ran for row \
+             `{row}`, so its ratio cells read UNCHECKED"
+        )]
+    }
+
+    /// Whether the open scope has reported a numerical mismatch. The cell tables consult this so a
+    /// row after an earlier row's mismatch prints SUSPECT in its cells too.
     pub(crate) fn is_suspect(&self) -> bool {
         self.suspect
+    }
+
+    /// Whether no numerics check has run in the open scope yet - the state in which a
+    /// [`standing!`] is withheld as UNCHECKED.
+    pub(crate) fn is_unchecked(&self) -> bool {
+        self.checks == 0
+    }
+
+    /// Whether a ratio computed in the open scope may be pooled into a geomean: exactly when a
+    /// [`standing!`] printed now would print its ratio, i.e. the scope is neither SUSPECT nor
+    /// UNCHECKED. A summary geomean is a standing too, so pooling a ratio whose own `->` line was
+    /// withheld would publish in the headline what the gate refused on the row.
+    pub(crate) fn may_pool(&self) -> bool {
+        !self.suspect && !self.is_unchecked()
     }
 
     #[cfg(test)]
@@ -173,25 +257,42 @@ impl Ledger {
         &self.suspect_sections
     }
 
+    #[cfg(test)]
+    pub(crate) fn unchecked_sections(&self) -> &[String] {
+        &self.unchecked_sections
+    }
+
     /// The end-of-run summary lines and the exit code it implies. `report_only` is
     /// `XBENCH_NUMERICS=report`.
     pub(crate) fn finish(&self, report_only: bool) -> (Vec<String>, i32) {
         let mut out = vec!["=== numerics gate ===".to_string()];
-        if self.suspect_sections.is_empty() {
+        if self.suspect_sections.is_empty() && self.unchecked_sections.is_empty() {
             out.push(
-                "  numerics gate: every cross-language check that ran in this process agreed; no \
-                 standing was withheld. (A check that never ran certifies nothing.)"
+                "  numerics gate: every section that printed a standing ran at least one numerics \
+                 check before it, and every check agreed; no standing was withheld."
                     .to_string(),
             );
             return (out, 0);
         }
-        out.push(format!(
-            "  ! NUMERICS GATE FAILED: {} section(s) reported a numerical mismatch, and every \
-             standing in them was withheld:",
-            self.suspect_sections.len()
-        ));
-        for s in &self.suspect_sections {
-            out.push(format!("  !   {s}"));
+        if !self.suspect_sections.is_empty() {
+            out.push(format!(
+                "  ! NUMERICS GATE FAILED: {} section(s) reported a numerical mismatch, and every \
+                 standing in them was withheld:",
+                self.suspect_sections.len()
+            ));
+            for s in &self.suspect_sections {
+                out.push(format!("  !   {s}"));
+            }
+        }
+        if !self.unchecked_sections.is_empty() {
+            out.push(format!(
+                "  ! NUMERICS GATE FAILED: {} section(s) printed a standing before any numerics \
+                 check ran in them - UNCHECKED, ratio withheld:",
+                self.unchecked_sections.len()
+            ));
+            for s in &self.unchecked_sections {
+                out.push(format!("  !   UNCHECKED {s}"));
+            }
         }
         if report_only {
             out.push(
@@ -273,6 +374,16 @@ pub(crate) fn report_standing(line: &str) {
     emit(with_ledger(|l| l.standing(line)));
 }
 
+/// Record that a numerics check ran in the open section (see [`Ledger::check`]).
+pub(crate) fn record_check() {
+    with_ledger(|l| l.check());
+}
+
+/// A cell-ratio table row printed `UNCHECKED` cells (see [`Ledger::unchecked_cells`]).
+pub(crate) fn report_unchecked_cells(row: &str) {
+    emit(with_ledger(|l| l.unchecked_cells(row)));
+}
+
 /// Record the open section's all-core twin floor (see [`Ledger::record_all_core_floor`]).
 pub(crate) fn record_all_core_floor(floor: f64) {
     with_ledger(|l| l.record_all_core_floor(floor));
@@ -286,6 +397,12 @@ pub(crate) fn record_twin_floor(floor: f64) {
 /// Whether the open section has reported a numerical mismatch (see [`Ledger::is_suspect`]).
 pub(crate) fn section_suspect() -> bool {
     with_ledger(|l| l.is_suspect())
+}
+
+/// Whether a ratio computed in the open section may enter a geomean (see [`Ledger::may_pool`]).
+/// Every summary pool is gated on this, never on [`section_suspect`] alone.
+pub(crate) fn section_may_pool() -> bool {
+    with_ledger(|l| l.may_pool())
 }
 
 /// Print the end-of-run summary and return the exit code the run should end with.
@@ -313,7 +430,16 @@ macro_rules! mismatch {
     };
 }
 
-/// Print a `->` standing, or withhold it when the open section is SUSPECT.
+/// Record that a numerics check of Wukong's output against an independent reference ran in the
+/// open section. Place it where the comparison is made, before the branch that may `mismatch!`, so
+/// a check that PASSES counts too. Prints nothing.
+macro_rules! checked {
+    () => {
+        $crate::numerics::record_check()
+    };
+}
+
+/// Print a `->` standing, or withhold it when the open section is SUSPECT or UNCHECKED.
 macro_rules! standing {
     ($($arg:tt)*) => {
         $crate::numerics::report_standing(&format!($($arg)*))
@@ -343,9 +469,11 @@ mod tests {
     fn a_clean_section_prints_its_standing_verbatim() {
         let mut l = Ledger::new();
         l.begin("=== colsum 1024x1024 ===");
+        l.check();
         let line = "  -> Wukong single-core is 1.31x faster than idiomatic C";
         assert_eq!(l.standing(line), vec![line.to_string()]);
         assert!(l.suspect_sections().is_empty());
+        assert!(l.unchecked_sections().is_empty());
     }
 
     #[test]
@@ -385,6 +513,7 @@ mod tests {
     fn a_single_threaded_standing_inside_the_twin_floor_is_tagged_not_hidden() {
         let mut l = Ledger::new();
         l.begin("=== colsum 1024x1024 ===");
+        l.check();
         l.record_twin_floor(1.03);
         let inside = l.standing("  -> Wukong single-core is 1.02x slower than idiomatic C");
         assert_eq!(inside.len(), 1);
@@ -407,6 +536,7 @@ mod tests {
     fn an_all_core_standing_is_judged_by_the_all_core_twin_not_the_single_one() {
         let mut l = Ledger::new();
         l.begin("=== matmul 512x512 ===");
+        l.check();
         l.record_twin_floor(1.02);
         // Only a single-threaded control: an all-core standing stays untagged.
         let par = l.standing("  -> Wukong @parallel is 1.05x slower than MKL(all)");
@@ -423,12 +553,14 @@ mod tests {
         // A cross-threading standing takes the wider of the two.
         let mut l = Ledger::new();
         l.begin("=== colsum ===");
+        l.check();
         l.record_twin_floor(1.08);
         l.record_all_core_floor(1.03);
         let cross =
             l.standing("  -> Wukong @parallel is 1.07x faster than idiomatic single-threaded C");
         assert!(cross[0].contains("ALL-CORE TWIN FLOOR 1.080x"), "{cross:?}");
         l.begin("=== next ===");
+        l.check();
         let cross =
             l.standing("  -> Wukong @parallel is 1.07x faster than idiomatic single-threaded C");
         assert!(
@@ -441,6 +573,7 @@ mod tests {
     fn an_all_core_section_heading_makes_its_unmarked_standings_all_core() {
         let mut l = Ledger::new();
         l.begin("=== saxpy@parallel (y = a*x + y, memory-bound) ===");
+        l.check();
         l.record_twin_floor(1.05);
         let s = l.standing("  -> Wukong runtime is 1.01x slower than C; compiles 3.0x faster");
         assert!(
@@ -456,6 +589,7 @@ mod tests {
     fn the_twin_floor_is_scoped_and_merges_conservatively() {
         let mut l = Ledger::new();
         l.begin("=== a ===");
+        l.check();
         l.record_twin_floor(1.02);
         l.record_twin_floor(1.05);
         l.record_twin_floor(1.01);
@@ -463,6 +597,7 @@ mod tests {
         let s = l.standing("  -> Wukong single-core is 1.04x faster than C");
         assert!(s[0].contains("FLOOR 1.050x"), "{s:?}");
         l.begin("=== b ===");
+        l.check();
         let s = l.standing("  -> Wukong single-core is 1.04x faster than C");
         assert!(
             !s[0].contains("FLOOR"),
@@ -491,6 +626,7 @@ mod tests {
         l.begin("=== a ===");
         l.mismatch("  ! a mismatch vs C");
         l.begin("=== b ===");
+        l.check();
         let line = "  -> Wukong single-core is 1.10x faster than idiomatic C";
         assert_eq!(l.standing(line), vec![line.to_string()]);
         assert_eq!(l.suspect_sections(), &["=== a ===".to_string()]);
@@ -500,6 +636,9 @@ mod tests {
     fn a_late_mismatch_flags_the_standings_already_printed() {
         let mut l = Ledger::new();
         l.begin("=== matmul 256x256 ===");
+        // A check ran and passed (the 1-thread MKL buffer agreed), the standing printed clean, and a
+        // LATER check failed.
+        l.check();
         l.standing("  -> Wukong 1-core is 1.05x faster than oneMKL(1 thread)");
         let out = l.mismatch("  ! Wukong vs MKL full-buffer mismatch at [3] (rel 1.0e-2)");
         assert_eq!(out.len(), 2, "{out:?}");
@@ -530,5 +669,193 @@ mod tests {
             lines.iter().all(|s| !s.trim_start().starts_with('!')),
             "{lines:?}"
         );
+    }
+
+    /// The defect this half of P8.3 closes: a section that printed a ratio while nothing had
+    /// compared Wukong's buffer against anything printed it CLEAN, and the end-of-run summary then
+    /// certified the run. Zero checks is now its own withheld state.
+    #[test]
+    fn a_standing_in_a_section_with_no_check_is_withheld_as_unchecked() {
+        let mut l = Ledger::new();
+        l.begin("=== linear 512x512 ===");
+        let out = l.standing("  -> Wukong single-core is 1.31x faster than idiomatic C");
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(
+            out[0].starts_with("  -> UNCHECKED: ratio withheld"),
+            "{out:?}"
+        );
+        assert!(
+            !out[0].contains("1.31x"),
+            "the withheld ratio must not be on the -> line: {out:?}"
+        );
+        assert_eq!(
+            out[1],
+            "  . withheld: -> Wukong single-core is 1.31x faster than idiomatic C"
+        );
+        assert!(!l.is_suspect(), "UNCHECKED is not a numerical mismatch");
+        assert_eq!(
+            l.unchecked_sections(),
+            &["=== linear 512x512 ===".to_string()]
+        );
+        assert!(l.suspect_sections().is_empty());
+        // A second standing in the same section is withheld too, and listed once.
+        let again = l.standing("  -> Wukong @parallel is 2.00x faster than idiomatic C");
+        assert!(again[0].contains("UNCHECKED"), "{again:?}");
+        assert_eq!(l.unchecked_sections().len(), 1);
+    }
+
+    /// Order matters, and it is the order the harness prints in: a standing printed BEFORE the
+    /// section's check is withheld even though a check runs later - which is what makes a
+    /// check-after-standing section show up instead of reading clean.
+    #[test]
+    fn a_check_counts_only_for_standings_printed_after_it() {
+        let mut l = Ledger::new();
+        l.begin("=== matmul_tn 256x256 ===");
+        let early = l.standing("  -> Wukong single-core = 85% of measured roofline");
+        assert!(early[0].contains("UNCHECKED"), "{early:?}");
+        l.check();
+        let line = "  -> Wukong single-core (SIMD) is 3.20x faster than C single-threaded";
+        assert_eq!(l.standing(line), vec![line.to_string()]);
+        assert_eq!(
+            l.unchecked_sections(),
+            &["=== matmul_tn 256x256 ===".to_string()],
+            "the early standing was withheld, so the section is still named"
+        );
+    }
+
+    /// The norm and streaming tables carry their ratios in cells, not in `standing!` lines; a row
+    /// with no check reports itself and lands in the same summary list.
+    #[test]
+    fn an_unchecked_cell_row_is_named_in_the_summary() {
+        let mut l = Ledger::new();
+        l.begin("=== norm (single row) ===");
+        let out = l.unchecked_cells("rmsnorm");
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].starts_with("  -> UNCHECKED: ratio withheld"),
+            "{out:?}"
+        );
+        assert!(out[0].contains("`rmsnorm`"), "{out:?}");
+        assert_eq!(
+            l.unchecked_sections(),
+            &["=== norm (single row) ===".to_string()]
+        );
+        l.unchecked_cells("layernorm");
+        assert_eq!(l.unchecked_sections().len(), 1, "one section, listed once");
+        assert_eq!(l.finish(false).1, NUMERICS_EXIT);
+    }
+
+    /// A failed check is still a check: the section is SUSPECT, never UNCHECKED, and the failure
+    /// withholds with the SUSPECT wording.
+    #[test]
+    fn a_mismatch_counts_as_the_check_that_ran() {
+        let mut l = Ledger::new();
+        l.begin("=== gemv 4096x4096 ===");
+        l.mismatch("  ! gemv mismatch vs C: max|d|/max|C| = 1.00e-2");
+        let out = l.standing("  -> Wukong single-core is 1.10x faster than idiomatic C");
+        assert!(out[0].contains("SUSPECT"), "{out:?}");
+        assert!(l.unchecked_sections().is_empty());
+        assert_eq!(l.suspect_sections().len(), 1);
+    }
+
+    /// A new heading resets the count: a check in one section certifies nothing in the next.
+    #[test]
+    fn the_check_count_is_scoped_to_the_open_section() {
+        let mut l = Ledger::new();
+        l.begin("=== a ===");
+        l.check();
+        let line = "  -> Wukong single-core is 1.10x faster than idiomatic C";
+        assert_eq!(l.standing(line), vec![line.to_string()]);
+        l.begin("=== b ===");
+        assert!(l.standing(line)[0].contains("UNCHECKED"));
+        assert_eq!(l.unchecked_sections(), &["=== b ===".to_string()]);
+    }
+
+    /// A standing withheld as UNCHECKED was never printed as a ratio, so a later mismatch in the
+    /// same section owes no retroactive `!` line for it.
+    #[test]
+    fn a_late_mismatch_does_not_double_count_an_unchecked_standing() {
+        let mut l = Ledger::new();
+        l.begin("=== ffn 512 ===");
+        l.standing("  -> Wukong single-core = 70% of measured roofline");
+        let out = l.mismatch("  ! full-buffer mismatch vs C at [0]");
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(l.unchecked_sections().len(), 1);
+        assert_eq!(l.suspect_sections().len(), 1);
+    }
+
+    /// The end-of-run summary names every UNCHECKED section, sets the exit code like a mismatch
+    /// does, and carries a `!` line the campaign analyser's numerical-warning scan recognises
+    /// (`analyze-sota-measure.py` keys on a leading `!` plus the word UNCHECKED).
+    #[test]
+    fn an_unchecked_section_fails_the_gate_unless_report_only() {
+        let mut l = Ledger::new();
+        l.begin("=== y ===");
+        l.standing("  -> Wukong single-core is 1.10x faster than idiomatic C");
+        let (lines, code) = l.finish(false);
+        assert_eq!(code, NUMERICS_EXIT);
+        assert!(
+            lines
+                .iter()
+                .any(|s| s.trim_start().starts_with('!') && s.contains("UNCHECKED")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|s| s.contains("UNCHECKED === y ===")),
+            "{lines:?}"
+        );
+        assert_eq!(l.finish(true).1, 0);
+        // Both lists print when both happened.
+        l.begin("=== z ===");
+        l.mismatch("  ! z mismatch vs C");
+        let (lines, code) = l.finish(false);
+        assert_eq!(code, NUMERICS_EXIT);
+        assert!(lines.iter().any(|s| s.contains("=== z ===")), "{lines:?}");
+        assert!(
+            lines.iter().any(|s| s.contains("UNCHECKED === y ===")),
+            "{lines:?}"
+        );
+    }
+
+    /// A summary geomean is a standing too, so the pool gate must be EXACTLY the standing gate.
+    /// The defect: the pools consulted `is_suspect()` alone, so a ratio withheld as UNCHECKED on its
+    /// own `->` line (the recognizer-on column missing, so nothing compared the wk(gen) or
+    /// `@parallel` buffer with anything) was still pushed into the wk(gen) and transpose-regime
+    /// geomeans and printed there as a clean number.
+    #[test]
+    fn a_ratio_may_be_pooled_exactly_when_its_standing_would_print() {
+        let line = "  -> Wukong single-core is 1.20x faster than idiomatic C";
+        // (checks before the standing, a mismatch before it)
+        for (checks, mismatch) in [(0, false), (1, false), (3, false), (0, true), (2, true)] {
+            let mut l = Ledger::new();
+            l.begin("=== transpose 1000x1000 ===");
+            for _ in 0..checks {
+                l.check();
+            }
+            if mismatch {
+                l.mismatch("  ! transpose output mismatch vs C");
+            }
+            let pool = l.may_pool();
+            let printed = l.standing(line);
+            let withheld = printed[0].contains("ratio withheld");
+            assert_eq!(
+                pool, !withheld,
+                "checks={checks} mismatch={mismatch}: may_pool={pool} but the standing printed \
+                 {printed:?}"
+            );
+        }
+        // The old gate admitted the UNCHECKED state; the new one does not.
+        let mut l = Ledger::new();
+        l.begin("=== wk(gen) row ===");
+        assert!(l.is_unchecked() && !l.is_suspect());
+        assert!(
+            !l.may_pool(),
+            "an UNCHECKED section is not SUSPECT, yet it must not pool"
+        );
+        l.check();
+        assert!(!l.is_unchecked() && l.may_pool());
+        // A new heading reopens the UNCHECKED state.
+        l.begin("=== next ===");
+        assert!(!l.may_pool());
     }
 }
