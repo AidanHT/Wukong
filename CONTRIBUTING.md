@@ -307,7 +307,12 @@ call to a hand-written `extern "C"` kernel in `wukong_runtime`. Six layers, all 
 1. **Kernel** — `crates/wukong_runtime/src/<family>.rs`: the AVX2 body, its **scalar twin**, the
    `#[no_mangle] pub unsafe extern "C"` serial entry, the `_parallel` twin, and `#[cfg(test)] mod
    tests` asserting AVX2 == scalar (including non-finite data), serial == parallel bit-for-bit, and
-   degenerate shapes (a non-positive extent must be a no-op). Extents are `i64`.
+   degenerate shapes (a non-positive extent must be a no-op). Extents are `i64`. Every
+   pointer-taking entry opens with `crate::safety::debug_*` checks of the extents and aliasing rule
+   its `# Safety` section states (or a `// SAFETY-EXEMPT: <reason>` comment), and a new module is
+   added to `safety.rs`'s `LAW_MODULES` -- `safety::entry_law` fails the build's tests otherwise. A
+   `_parallel` twin forks through `par::for_each_unit` / `par::for_each_row` / `par::map_units`,
+   never a bare `into_par_iter()`, so `WUKONG_KERNEL_DYN` reaches it.
 2. **Re-export** — `mod <family>;` + `pub use <family>::{…};` in `crates/wukong_runtime/src/lib.rs`,
    op-code constants included.
 3. **Cranelift seam** — `crates/wukong_codegen_cranelift/src/lib.rs`: the `const RT_*` name, a

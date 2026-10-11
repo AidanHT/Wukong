@@ -1123,7 +1123,7 @@ independently of that.
   block); a non-zero caller `beta` is a flag that makes the first block accumulate too (never a
   scale). The fused epilogue `act(alpha·x + bias[j])` is applied once, after the final block, and is
   bit-identical to the unfused sequence.
-- **Invariant under** `MC`, `NC`, the 6×16 register tile, packing (whole-panel or single-sweep,
+- **Invariant under** `MC`, `NC` (now host-derived, see below), the 6×16 register tile, packing (whole-panel or single-sweep,
   row-major or transposed A), edge-tile handling, the AVX-512 twin, every parallel schedule and
   thread count, every `WUKONG_GEMM_*` knob, and the AVX2-versus-portable choice: a host without
   AVX2+FMA — and every non-x86 target — runs `sgemm_scalar`, which follows the same order with a
@@ -1150,6 +1150,18 @@ independently of that.
   `tests/run/lang_generic_gemm_fma_order.wk`); beyond that they may differ in the last bits.
   `tests/run/gemm_blocked_every_lane.wk` uses integer data (exact in any order) to check all three
   f32 kernel forms lane by lane across three K-blocks and full and edge tiles end to end.
+
+**Cache blocking follows the host (P13.4).** The five-loop's A-panel height `mc` and B-panel width
+`nc` are resolved once per process (`gemm::gemm_blocking`): `WUKONG_GEMM_MC` / `WUKONG_GEMM_NC` when
+set to a positive multiple of `MR = 6` / `NR = 16` (at most 65536; anything else is ignored), else the
+measured `MC = 144` / `NC = 4080` scaled by the probed L2 / L3 against the 2 MiB / 24 MiB part they
+were measured on -- the panel keeps its measured share of its cache level, rounded down to the
+`MR`/`NR` grid and clamped to within 4x of the measurement, so the derivation is the identity on the
+reference part. It is licensed only by `mc_nc_blocking_never_changes_a_bit` (the serial kernel under
+blockings from one micro-panel to 4x the reference, every pack schedule, both transposes, both
+`beta` rules, a bias+ReLU epilogue) and `legacy_parallel_nc_never_changes_a_bit` (the fork-join and
+persistent-region schedules). `KC` and the reduction `RCHUNK` fix a summation order and stay
+constants (P13.9).
 
 ### Turning recognition off: `WUKONG_NO_RECOGNIZE` (an instrument, not a feature)
 
@@ -1342,6 +1354,49 @@ row block x column block grid, and whose fork gate counts (row x 4-column) cells
 so a single-token decode GEMM still forks) and per-channel dequant. `@parallel(grain = G)` is applied in
 `wukong_mir_build` (`par_grain.rs`): the call passes `ceil(n / G)` chunk indices and the outlined
 body maps its chunk span back to iterations, so the runtime ABI is unchanged.
+
+**How a `_parallel` entry forks (P9.15).** No kernel forks with a bare `into_par_iter()`. Row,
+column-stripe, channel and fixed-chunk maps go through `par::for_each_unit` (on the caller's pool --
+the global pool for a top-level call, the enclosing pool inside a region or a GEMM pack phase) or
+`par::for_each_row` (on the unified kernel pool); the fixed-`RCHUNK` reductions build their partials
+with `par::map_units`, which stores partial `c` in slot `c` whatever ran it, and fold them in index
+order. `WUKONG_KERNEL_DYN=1` (read once, default OFF) swaps all three from rayon's adaptive split to
+the atomic claim queue on the same pool, so the A/B compares schedules alone; OFF runs exactly the
+split the entries spelled before. The GEMM's compute grids keep their own `WUKONG_GEMM_DYN`.
+`WUKONG_KERNEL_DYN=1 cargo test -p wukong_runtime --lib` runs every serial == parallel test under
+the claim queue.
+
+**The implicit grain (P12.21).** A `@parallel` loop with no `grain` argument gets
+`G = max(1, ceil(MIN_CHUNK_OPS / body_ops))`, `MIN_CHUNK_OPS = 2^14`, where `body_ops` is the static
+MIR instruction count of its outlined body built at grain 1 (`par_grain::implicit_grain`). A body
+with an inner loop (a second back edge) or any call keeps `G = 1`: its static size is not its
+per-iteration cost, and a head-parallel region of GEMM calls must not collapse into one chunk. So an
+8-iteration straight-line region becomes a one-chunk call that `wukong_parallel_for` runs without a
+fork, and a long one is claimed in chunks of `G`. It is `LowerOptions::implicit_grain`, off for
+library callers and set by `wukong_driver` for every backend except `--backend=gpu-native`, whose
+PTX lowering maps one index to one thread. An explicit `@parallel(grain = G)`, `G = 1` included,
+always wins. Scheduling only, decided before the optimizer: `-O0` == `-O2` and the compile stays a
+pure function of its input (`tests/run/parallel_implicit_grain.wk` prints every lane of both
+outliner forms; its `--emit=mir -O2` shows each `wukong_parallel_for` trip operand as `1`).
+
+### Debug contract checks on the C entries (P14.5)
+
+Every exported pointer-taking `extern "C" fn wukong_*` in `wukong_runtime` opens with
+`crate::safety::debug_*` calls that check, in debug builds only, what its `# Safety` section
+documents: each nonempty extent's pointer is non-null and its span fits `isize`
+(`debug_extent`, `debug_extent_2d`, `debug_extent_bytes` for dtype-coded `*u8` buffers,
+`debug_extent_opt` for an optional operand such as a norm's `gamma` or a GEMM bias), and each
+aliasing rule holds -- `debug_disjoint` for "all operands disjoint", `debug_inplace_or_disjoint` for
+"exactly in place, otherwise disjoint". A failure panics at the entry's line (the helpers are
+`#[track_caller]`), which aborts the process because a panic cannot unwind out of an `extern "C"`
+function: in a debug build that is the alternative to undefined behaviour. The checks compile out of
+release builds. An entry whose pointer has no extent -- a NUL-terminated path or site string,
+`wukong_parallel_for`'s opaque capture table, the handle `wukong_rt_free` takes -- carries
+`// SAFETY-EXEMPT: <reason>` instead, and the eight half-precision entries whose kernels detect and
+define overlap themselves (`wukong_axpby_{bf16,f16}`, `wukong_vmath_{bf16,f16}` and their narrowing
+`_out` forms, each pinned by an overlap test) check extents only. `safety::entry_law` scans every module's source (`include_str!`) and fails
+on an entry with neither a check nor an exemption, and on a `src/*.rs` file missing from its list.
+The debug corpus (`cargo test -p wukongc --test run`) runs green with every check armed.
 
 Tests that require streaming execution derive their sizes from the actual policy, retain
 existing numerical cases/tail residues, and count executed non-temporal stores. Their

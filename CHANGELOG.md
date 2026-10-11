@@ -5,6 +5,39 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Runtime entries (`gap4/runtime-entries`)
+
+- **Every runtime C entry checks its contract in debug builds (P14.5).** 171 of the 176 exported
+  pointer-taking `wukong_*` entries (7 before) now assert, at their top, each pointer's documented
+  extent (a nonempty buffer is non-null and its span fits `isize`) and each aliasing rule of their
+  `# Safety` section -- all-disjoint, or exactly-in-place-otherwise-disjoint -- through
+  `#[track_caller]` helpers that compile out of release builds. Entries whose pointer has no extent
+  (a NUL-terminated path or site string, `wukong_parallel_for`'s capture table, `wukong_rt_free`'s
+  handle -- the other 5) carry a `// SAFETY-EXEMPT:` reason, and `safety::entry_law` fails on an
+  entry with neither and on a runtime module it does not scan. The debug corpus runs green with
+  every check armed.
+- **Every `_parallel` kernel split honours `WUKONG_KERNEL_DYN` (P9.15).** The 34 bare rayon splits
+  (30 row/column/channel/chunk maps across 28 kernel modules, and the GEMM's four pack-phase splits)
+  fork through `par::for_each_unit`, and the fixed-`RCHUNK` reductions (`sreduce`, `argreduce`, the
+  bf16/f16 reductions) build their partials through `par::map_units`, one slot per chunk index
+  folded in index order. Default OFF runs the same rayon split as before; `WUKONG_KERNEL_DYN=1` runs
+  the atomic claim queue on the same pool. Serial == parallel stays bit-exact under both.
+- **GEMM cache blocking follows the host (P13.4).** `WUKONG_GEMM_MC` / `WUKONG_GEMM_NC` (positive
+  multiples of 6 / 16, read once) override the A-panel height and B-panel width; unset, the measured
+  144 / 4080 scale with the probed L2 / L3 (the identity on the 2 MiB / 24 MiB reference part,
+  within 4x of it elsewhere). `mc_nc_blocking_never_changes_a_bit` and
+  `legacy_parallel_nc_never_changes_a_bit` prove no blocking moves a bit; `KC` and `RCHUNK` stay
+  fixed numeric-contract constants (P13.9).
+- **A `@parallel` loop without a grain gets one sized from its body (P12.21).** On the CPU backends
+  a straight-line outlined body of `b` MIR instructions gets `grain = max(1, ceil(2^14 / b))`, so a
+  10-iteration region is a one-chunk call that runs without a fork instead of ten claimable indices;
+  a body with an inner loop or a call keeps grain 1, an explicit `grain` (1 included) wins, and
+  `--backend=gpu-native` keeps one index per iteration (`LowerOptions::implicit_grain`;
+  `tests/run/parallel_implicit_grain.wk`).
+- Confirmed on main and closed: the attention kernel's `exp8`/`exp1` and blocked online softmax
+  (P9.1, P9.2), `f32::max` ReLU only in GEMM test code (P9.22), the `RCHUNK` numeric-contract doc
+  (P13.9).
+
 ### Index-recording reductions (`gap3/vec-argmax`)
 
 - **Argmax/argmin and FindLastIV loops vectorize.** `if x[i] > m { m = x[i]; at = i; }` (and its

@@ -711,11 +711,18 @@ another architecture or OS is not supported. A native-backend failure is a catal
   not flow-sensitive. Verify with `wukongc --emit=mir -O2 f.wk` and look for a `_parallel` symbol or a
   `wukong$par$` region.
   `@parallel(grain = G)` is consumed (each worker claims runs of at least `G` iterations; any other
-  `@parallel` argument is `E0306`), any number of regions per program is outlined (the old 32-region
+  `@parallel` argument is `E0306`), a loop with no `grain` gets an implicit one on the CPU backends
+  (`ceil(2^14 / body MIR size)` for a straight-line body, 1 for a body with an inner loop or a call;
+  `MIN_CHUNK_OPS` is a starting point, **not measured**), any number of regions per program is outlined (the old 32-region
   pool is grown on demand), and the thread count is set with `--threads=<n>` / `WUKONG_NUM_THREADS`.
   The runtime's `_parallel` kernels fork only when rows x columns x a per-element cost clears one
   shared work threshold (`WUKONG_PAR_MIN_WORK`); the threshold is anchored to the existing
-  velem/vmath crossovers, **not yet measured per family**. There is still no user-written
+  velem/vmath crossovers, **not yet measured per family**. Every such fork honours the
+  `WUKONG_KERNEL_DYN=1` claim-queue A/B knob (default off: rayon's split, unchanged); whether the
+  claim queue wins on uniform rows is **unmeasured**. GEMM `mc`/`nc` follow the probed L2/L3
+  (`WUKONG_GEMM_MC`/`_NC` override), proven bit-neutral; the per-host values are **not re-measured**
+  off the reference part. Debug builds check every runtime C entry's documented extents and
+  aliasing at its top (`safety::entry_law`). There is still no user-written
   cross-thread combine (no atomics, no `@reduce`): a loop-carried accumulator declines to serial.
 - **`@generic`** on a function turns the kernel recognizers **off for that function**: none of the
   four probe sites (whole-function interception, the per-loop `match_*` cascade, `lower_block`'s
