@@ -1755,9 +1755,13 @@ measurement reports retain the corpus sizes used for those runs.
   every program whose census line lists a `_parallel` symbol with the gate overrides at their
   smallest accepted values (`WUKONG_PAR_MIN_WORK=1`, `WUKONG_GEMM_PAR_MIN_MACS=1`,
   `WUKONG_VELEM_PAR_MIN=1`, `WUKONG_PACK_PAR_MIN_KB=0`) and requires native-forced == native-default
-  == interpreter, byte for byte. The two gates no knob opens (`TRANSPOSE_PAR_MIN`, `VMATH_PAR_MIN`)
-  and the fixed-`RCHUNK` reductions are reached by fixtures sized above them instead
-  (`cov4_par_transpose_wide.wk`, `cov4_par_lowp_dot.wk`).
+  == interpreter, byte for byte. The two gates no knob opens and the fixed-`RCHUNK` reductions are
+  reached by fixtures sized above them instead, one each: `TRANSPOSE_PAR_MIN` (65536) by
+  `cov4_par_transpose_wide.wk` (65792 elements), `VMATH_PAR_MIN` (16384) by `vmath_parallel.wk`
+  (20000 — the only corpus program whose `wukong_vmath_f32_parallel` call crosses it), and `RCHUNK`
+  (8192) by `cov4_par_lowp_dot.wk` and `parallel_argmax.wk` (20000). `FIXED_GATE_WITNESSES` in the
+  same file pins that list: a witness that leaves the corpus, stops dispatching the gated kernel, or
+  no longer spells its size fails `every_fixed_gate_has_a_witness_sized_above_it`.
 - **Emittable-surface census** (`recognize.rs`): every `wukong_*` symbol interned anywhere in
   `wukong_mir_build/src` must be emitted by some `tests/run` program at `-O2`, or be listed in
   `NEVER_EMITTED_ALLOWLIST` with a reason. The `tests/run/cov4_par_*.wk` fixtures are the witnesses

@@ -34,8 +34,12 @@
 //! Two gates are NOT environment-tunable and this lane cannot open them: `TRANSPOSE_PAR_MIN`
 //! (65536 elements, transpose.rs) and `VMATH_PAR_MIN` (16 Ki elements, vmath.rs); the fixed-chunk
 //! reductions (`RCHUNK` = 8192 in reduce.rs / lowp.rs) split by size alone. Those are reached by
-//! fixtures sized above them — `cov4_par_transpose_wide.wk` (65792 elements), `cov4_par_lowp_dot.wk`
-//! and `parallel_argmax.wk` (20000 > 8192) — rather than by this lane.
+//! fixtures sized above them rather than by this lane, one gate each: `TRANSPOSE_PAR_MIN` by
+//! `cov4_par_transpose_wide.wk` (65792 elements), `VMATH_PAR_MIN` by `vmath_parallel.wk` (20000 >
+//! 16384, the only corpus program whose `wukong_vmath_f32_parallel` call crosses it), and `RCHUNK`
+//! by `cov4_par_lowp_dot.wk` and `parallel_argmax.wk` (20000 > 8192). [`FIXED_GATE_WITNESSES`] pins
+//! that list, so a witness that is deleted, stops dispatching its kernel, or is shrunk below its
+//! size fails a test instead of leaving this paragraph quietly wrong.
 //!
 //! The set of programs is read from `tests/recognizer-census.txt`, which `recognizer_census.rs`
 //! holds byte-identical to what the compiler emits, so this lane cannot drift from the real
@@ -78,6 +82,66 @@ const AMBIENT: &[&str] = &[
 /// `_parallel` fixtures plus the `cov4_par_*` family. Raise it with the corpus; a census that stops
 /// listing `_parallel` symbols must not turn this lane silently vacuous.
 const MIN_PARALLEL_PROGRAMS: usize = 43;
+
+/// A fork gate no environment knob opens, and the corpus program that is the only thing crossing it.
+struct FixedGate {
+    /// The runtime constant and where it is defined.
+    gate: &'static str,
+    /// The size that must be exceeded for the `_parallel` entry to split into two or more pieces.
+    threshold: usize,
+    /// The `tests/run` program sized above it.
+    program: &'static str,
+    /// The `_parallel` kernel its census line must list.
+    symbol: &'static str,
+    /// The element count the program passes, spelled as a decimal literal in its source.
+    size: usize,
+}
+
+/// The witnesses for the gates this lane cannot force (see the module doc). Each threshold is the
+/// runtime's own constant: `TRANSPOSE_PAR_MIN = 1 << 16` (transpose.rs: `r * c < it` runs serial),
+/// `VMATH_PAR_MIN = VMATH_CHUNK = 1 << 14` (vmath.rs: `n < it` runs serial, and `n == it` is one
+/// chunk), `RCHUNK = 8192` (reduce.rs, which lowp.rs reuses: fewer than two chunks runs serial).
+const FIXED_GATE_WITNESSES: &[FixedGate] = &[
+    FixedGate {
+        gate: "TRANSPOSE_PAR_MIN (wukong_runtime/src/transpose.rs)",
+        threshold: 1 << 16,
+        program: "cov4_par_transpose_wide.wk",
+        symbol: "wukong_transpose_f32_parallel",
+        size: 65792,
+    },
+    FixedGate {
+        gate: "VMATH_PAR_MIN (wukong_runtime/src/vmath.rs)",
+        threshold: 1 << 14,
+        program: "vmath_parallel.wk",
+        symbol: "wukong_vmath_f32_parallel",
+        size: 20000,
+    },
+    FixedGate {
+        gate: "RCHUNK (wukong_runtime/src/reduce.rs, used by lowp.rs)",
+        threshold: 8192,
+        program: "cov4_par_lowp_dot.wk",
+        symbol: "wukong_dot_f16_parallel",
+        size: 20000,
+    },
+    FixedGate {
+        gate: "RCHUNK (wukong_runtime/src/reduce.rs)",
+        threshold: 8192,
+        program: "parallel_argmax.wk",
+        symbol: "wukong_argreduce_f32_parallel",
+        size: 20000,
+    },
+];
+
+/// Does `src` spell `n` as a standalone decimal literal (not a digit run inside a longer number)?
+fn spells_literal(src: &str, n: usize) -> bool {
+    let lit = n.to_string();
+    let bytes = src.as_bytes();
+    src.match_indices(&lit).any(|(i, _)| {
+        let before = i.checked_sub(1).map(|j| bytes[j]);
+        let after = bytes.get(i + lit.len()).copied();
+        !before.is_some_and(|b| b.is_ascii_digit()) && !after.is_some_and(|b| b.is_ascii_digit())
+    })
+}
 
 fn run_dir() -> PathBuf {
     common::repo_root().join("tests").join("run")
@@ -187,6 +251,53 @@ fn the_lane_selects_parallel_twins_and_nothing_else() {
     assert!(!is_parallel_kernel("wukong_parallel_for*2"));
     assert!(!is_parallel_kernel("wukong_colsum_f32"));
     assert!(!is_parallel_kernel("veckernel*1"));
+}
+
+/// The gates this lane cannot force are crossed by named corpus programs, and only by them — so
+/// each witness must still exist, still dispatch the gated `_parallel` kernel (per the census, which
+/// `recognizer_census.rs` holds to the compiler's real output), and still spell a size above the
+/// gate. Losing any of the three would leave that split executed by no gate in the repo.
+#[test]
+fn every_fixed_gate_has_a_witness_sized_above_it() {
+    let census = parallel_programs();
+    for w in FIXED_GATE_WITNESSES {
+        assert!(
+            w.size > w.threshold,
+            "{}: the witness size {} does not exceed the gate {} it is meant to cross",
+            w.gate,
+            w.size,
+            w.threshold
+        );
+        let path = run_dir().join(w.program);
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "{}: its witness tests/run/{} is unreadable ({e}) — no program crosses this gate",
+                w.gate, w.program
+            )
+        });
+        let dispatches = census
+            .iter()
+            .find(|(name, _)| name == w.program)
+            .is_some_and(|(_, kernels)| kernels.iter().any(|k| k == w.symbol));
+        assert!(
+            dispatches,
+            "{}: tests/recognizer-census.txt no longer lists {} for its witness {} — the gated \
+             kernel is no longer dispatched there",
+            w.gate, w.symbol, w.program
+        );
+        assert!(
+            spells_literal(&src, w.size),
+            "{}: its witness {} no longer spells the size {} that crosses the gate ({}); \
+             re-derive the witness or name another",
+            w.gate,
+            w.program,
+            w.size,
+            w.threshold
+        );
+    }
+    assert!(spells_literal("for k in 0..20000 {", 20000));
+    assert!(!spells_literal("[f32; 200000]", 20000));
+    assert!(!spells_literal("120000", 20000));
 }
 
 #[test]
