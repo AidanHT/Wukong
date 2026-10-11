@@ -32,6 +32,15 @@ All notable changes to Wukong are documented here. The format is loosely based o
 - **The cost model is enforced (N43).** A loop whose estimated vector group costs more than its `W`
   scalar iterations is declined (`WUKONG_VEC_COST=0` disables); over `tests/run` that declines two
   loops the nested if-converter had just started taking, and no loop widened before stops widening.
+- **An arm's read through a raw pointer is no longer speculated.** If-conversion read a `[]T` fat
+  pointer that only one arm touches once for the whole group, in the guard — and accepted any
+  parameter as that fat pointer's owner. `(*p).w[i] = v` in an arm reads the data pointer at `p`
+  itself, and `k(x, 0 as *mut Layer, 16)` with no lane taking the arm returned at `-O0` but stopped
+  with "null pointer dereference" at `-O2` (native: SIGSEGV); a checked arm's length re-read did the
+  same. Only a fat pointer that is live for the whole call is speculated now: a `[]T` parameter's
+  (`ParamAttrs::slice`, which `mir_build` now records on every slice parameter as a fact of its
+  type, not only beside `@noalias` — alias analysis still reads it only there) or a stack slot's
+  (`tests/run/vec4_speculation_raw_pointer.wk`).
 
 ### Index-recording reductions (`gap3/vec-argmax`)
 

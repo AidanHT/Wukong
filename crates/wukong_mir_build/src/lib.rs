@@ -3034,12 +3034,19 @@ fn lower_fn(
         }
         // A `@noalias` promise rides on the MIR parameter (`noalias.rs`).
         noalias::record_param(&mut fl.builder, p, pty, val, interner);
-        // So does a fixed-extent buffer's size — a type fact, recorded with or without the promise
-        // (`ParamAttrs::extent`; the vectorizer's search-loop speculation reads it).
+        // So do two facts of the parameter's type, recorded with or without the promise: a `[]T`
+        // points at its caller's live fat pointer (`ParamAttrs::slice`), and a fixed-extent buffer
+        // has a size (`ParamAttrs::extent`). The vectorizer's speculation reads both; alias
+        // analysis reads `slice` only alongside `@noalias`.
         let by_pointer = matches!(fl.builder.value_type(val), MirType::Ptr);
-        if let Some(extent) = buffer_param_extent(pty).filter(|_| by_pointer) {
+        let slice = by_pointer && matches!(pty, Ty::Slice(_));
+        let extent = buffer_param_extent(pty).filter(|_| by_pointer);
+        if slice || extent.is_some() {
             if let Some(mut attrs) = fl.builder.param_attrs_of(val) {
-                attrs.extent = Some(extent);
+                attrs.slice |= slice;
+                if extent.is_some() {
+                    attrs.extent = extent;
+                }
                 fl.builder.set_param_attrs(val, attrs);
             }
         }

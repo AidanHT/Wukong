@@ -8,8 +8,9 @@
 //!   `wukong_opt::alias`, the loop dependence test, the vectorizer's runtime alias guard and both
 //!   native backends read it. Those consumers reason about MIR *values* and track provenance, so
 //!   they handle every parameter spelling soundly — a slice whose fat pointer gets rewritten simply
-//!   loses its element provenance there. Nothing is recorded for a parameter without the
-//!   attribute, so a program that never writes `@noalias` lowers to byte-identical MIR.
+//!   loses its element provenance there. Without the attribute no promise is recorded: a parameter
+//!   carries only the facts of its own type (`ParamAttrs::slice`, `ParamAttrs::extent`, recorded by
+//!   `lower_fn`), which no consumer reads as a promise, and the printed MIR is unchanged.
 //! * **Answer "are these two operands disjoint?"** for the parts of lowering that reason about
 //!   operands by *name* rather than by MIR value — the kernel recognizers' disjointness guard
 //!   (`FnLowerer::all_provably_disjoint`) and the `@parallel` region outliner's grouping of
@@ -35,7 +36,8 @@ use crate::FnLowerer;
 /// Record the `@noalias` promise of source parameter `p` (declared type `ty`, lowered to the entry
 /// parameter `val`) on the function being built. A promise is only meaningful on a pointer the
 /// caller supplies — a generic parameter instantiated at a scalar arrives as a copy and carries
-/// nothing — and `slice` is recorded only alongside it, so an unannotated parameter adds no entry.
+/// nothing. (`slice` is set here too, and `lower_fn` sets it again on every `[]T` parameter with or
+/// without the promise: it is a fact of the type, which alias analysis reads only beside `noalias`.)
 pub(crate) fn record_param(
     builder: &mut Builder,
     p: &Param,
@@ -194,8 +196,10 @@ mod tests {
             .count()
     }
 
-    /// The attribute lands on the MIR parameter it was written on (marking a slice as one), and a
-    /// program that never writes it records nothing at all.
+    /// The attribute lands on the MIR parameter it was written on, and a program that never writes
+    /// it records no promise. The facts of a parameter's own type are recorded either way: every
+    /// `[]T` is marked a slice and every fixed-size buffer carries its extent, while a raw pointer
+    /// records nothing (`0 as *T` is null, so nothing about its target is known).
     #[test]
     fn the_promise_is_recorded_on_its_mir_parameter() {
         let src = "module m
@@ -203,11 +207,16 @@ fn k(@noalias mut o: []f32, x: []f32, @noalias mut w: [f32; 4], n: i64) {
     o[0] = x[0];
     w[0] = x[1];
 }
-fn plain(mut o: []f32, x: []f32) { o[0] = x[0]; }
+fn plain(mut o: []f32, x: []f32, q: *mut f32) { o[0] = x[0]; }
 fn main() -> i32 { return 0; }
 ";
         let (prog, mut it) = lower(src);
         let k = prog.function(it.intern("k")).expect("k");
+        let slice = ParamAttrs {
+            noalias: false,
+            slice: true,
+            extent: None,
+        };
         assert_eq!(
             k.param_attr(0),
             ParamAttrs {
@@ -216,9 +225,7 @@ fn main() -> i32 { return 0; }
                 extent: None,
             }
         );
-        assert_eq!(k.param_attr(1), ParamAttrs::default());
-        // A fixed-size array parameter also records its extent — a type fact, not a promise, and
-        // recorded with or without the attribute (`FnLowerer::record_buffer_extent`).
+        assert_eq!(k.param_attr(1), slice);
         assert_eq!(
             k.param_attr(2),
             ParamAttrs {
@@ -232,13 +239,15 @@ fn main() -> i32 { return 0; }
         );
         assert_eq!(k.param_attr(3), ParamAttrs::default());
         let plain = prog.function(it.intern("plain")).expect("plain");
-        assert!(plain.param_attrs.is_empty());
+        assert_eq!(plain.param_attr(0), slice);
+        assert_eq!(plain.param_attr(1), slice);
+        assert_eq!(plain.param_attr(2), ParamAttrs::default());
         assert!(
             prog.funcs
                 .iter()
                 .filter(|f| f.name != k.name)
-                .all(|f| f.param_attrs.is_empty()),
-            "only the annotated function records anything"
+                .all(|f| !f.has_noalias_params()),
+            "only the annotated function records a promise"
         );
     }
 

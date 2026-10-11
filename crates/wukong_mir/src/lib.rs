@@ -164,7 +164,12 @@ pub struct ParamAttrs {
     pub noalias: bool,
     /// The parameter is a `[]T` slice: its value points at the caller's 16-byte fat pointer (data
     /// pointer at offset 0, `i64` length at offset 8), which is a live object for the whole call.
-    /// A slice's elements never overlap its own fat pointer.
+    /// A slice's elements never overlap its own fat pointer. Unlike `noalias` this is a fact of
+    /// the parameter's type, so `mir_build` records it on every slice parameter, with or without
+    /// the attribute: alias analysis reads it only beside `noalias`, and the vectorizer reads it
+    /// alone, as the proof that reading the fat pointer cannot fault on a path the scalar loop
+    /// never takes (`wukong_opt::vectorize::never_faults`). A raw `*T` parameter never carries it —
+    /// `0 as *T` is null.
     pub slice: bool,
     /// The parameter is a fixed-extent buffer — a `[T; N]` array (nested arrays included) or a
     /// statically-shaped contiguous tensor of scalar `T` — so its value points at exactly
@@ -201,10 +206,10 @@ pub struct Function {
     /// interpreter marshals these lane-wise (the oracle); the Cranelift backend assembles each to
     /// raw AVX2 (`avx2.rs`). Empty for every function the vectorizer did not widen.
     pub vec_kernels: Vec<VecKernel>,
-    /// Per-parameter source facts, index-parallel to `params`. Usually empty: a missing entry means
+    /// Per-parameter source facts, index-parallel to `params`. Often empty: a missing entry means
     /// [`ParamAttrs::default`], so read it through [`Function::param_attr`], never by indexing.
-    /// Set by `mir_build` from a `@noalias` parameter; consumed by `wukong_opt::alias` and the
-    /// backends' alias annotations.
+    /// Set by `mir_build` from a `@noalias` parameter, a `[]T` slice and a fixed-extent buffer;
+    /// consumed by `wukong_opt::alias`, the backends' alias annotations and the vectorizer.
     pub param_attrs: Vec<ParamAttrs>,
 }
 

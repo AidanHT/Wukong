@@ -558,8 +558,13 @@ reads or writes an element the scalar loop leaves alone — unlike a read-modify
 could race with another thread writing the skipped elements or read past a shorter buffer. Stores
 in both arms must still pair into one masked store. Only affine element accesses are predicated; an
 arm that alone subscripts a `[]T` re-reads its data pointer from the fat pointer there, and that one
-load — a parameter's or a local slot's own storage, live for the whole call — is speculated and
-hoisted into the guard (`speculable_ptr_load`).
+load is speculated and hoisted into the guard only when the fat pointer is an object live for the
+whole call: a `[]T` parameter's (`ParamAttrs::slice`, now recorded on every slice parameter as a
+fact of its type, `@noalias` or not) or a stack slot of the function (`speculable_ptr_load`,
+`never_faults`). A pointer reached any other way may be null where no lane takes the arm —
+`(*p).w[i]` through a raw `p: *mut Layer` reads `p` itself, and the scalar loop survives
+`0 as *mut Layer` by never taking the arm — so such an arm declines. The same proof gates an arm's
+bounds check that re-reads its length (`LenSrc::Load`).
 
 **Nested if-conversion** (`linearize_tree`, tried when the single-diamond flattener declines): the
 body is walked as a structured DAG — each conditional's two sides meet at its immediate

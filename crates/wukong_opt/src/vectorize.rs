@@ -1700,25 +1700,65 @@ fn linearize_region(
 }
 
 /// May an if-converted arm's load run for every lane although only some lanes take the arm? A
-/// `[]T`'s data pointer, re-read from its fat pointer inside the arm that subscripts it, can: the
-/// fat pointer is a parameter's own storage, or a stack slot of this function, live for the whole
-/// call either way, and the vector body reads it once, in the guard ([`Plan::InvariantPtrLoad`]) —
-/// exactly what already happens to the same read outside an arm. Only a pointer-typed load at a
-/// parameter's or a local slot's own address qualifies.
+/// `[]T`'s data pointer, re-read from its fat pointer inside the arm that subscripts it, can when
+/// that fat pointer is an object [`never_faults`] proves live — a slice parameter's, or a stack slot
+/// of this function — and the vector body reads it once, in the guard ([`Plan::InvariantPtrLoad`]),
+/// exactly what already happens to the same read outside an arm. A pointer reached any other way
+/// may be null where no lane takes the arm: `(*p).w[i]` through a raw `p: *mut Layer` reads `p`
+/// itself, and `0 as *mut Layer` is a value the scalar loop survives by never taking the arm.
 fn speculable_ptr_load(f: &Function, a: &MemAccess) -> bool {
     let AddrForm::Invariant(MemBase::Outer(p)) = a.addr else {
         return false;
     };
-    a.kind == AccessKind::Load
-        && a.value_ty == MirType::Ptr
-        && (f.params.contains(&p)
-            || matches!(
-                op_of(f, p),
-                Some(Op::Alloca {
-                    space: wukong_mir::AddrSpace::Local,
-                    ..
-                })
-            ))
+    a.kind == AccessKind::Load && a.value_ty == MirType::Ptr && never_faults(f, p, 8)
+}
+
+/// Can `bytes` bytes at `addr` be read on a path the scalar program never takes, without faulting?
+/// Only inside an object that is live for the whole call whatever the program does: the 16-byte
+/// fat pointer a `[]T` parameter points at (`ParamAttrs::slice`, which `mir_build` records on every
+/// slice parameter as a fact of its type), or a local stack slot of this function. `addr` is the
+/// object itself or a constant byte offset into it (`gep obj, k : i8`, how a fat pointer's length
+/// field is reached), and the read must end inside it. Anything else — a raw `*T` parameter, a
+/// struct parameter's field, a pointer loaded from memory — is not known to be dereferenceable.
+fn never_faults(f: &Function, addr: ValueId, bytes: u64) -> bool {
+    let (obj, off) = match op_of(f, addr) {
+        Some(Op::Gep {
+            ptr,
+            index,
+            elem: MirType::I8,
+        }) => match const_of(f, *index) {
+            Some(k) => (*ptr, k),
+            None => return false,
+        },
+        _ => (addr, 0),
+    };
+    let size = match f.params.iter().position(|&q| q == obj) {
+        Some(i) if f.param_attr(i).slice => 16,
+        Some(_) => return false,
+        None => match op_of(f, obj) {
+            Some(Op::Alloca {
+                ty,
+                space: wukong_mir::AddrSpace::Local,
+            }) => match slot_bytes(ty) {
+                Some(n) => n,
+                None => return false,
+            },
+            _ => return false,
+        },
+    };
+    off >= 0 && off + i128::from(bytes) <= i128::from(size)
+}
+
+/// The byte size of a stack slot of type `t`, when it is a plain scalar, pointer or (nested) array
+/// of them.
+fn slot_bytes(t: &MirType) -> Option<u64> {
+    match t {
+        MirType::Array(e, n) => slot_bytes(e)?.checked_mul(u64::from(*n)),
+        MirType::Ptr => Some(8),
+        MirType::I1 => Some(1),
+        MirType::F16 | MirType::BF16 => Some(2),
+        t => lane_bytes(t).map(u64::from),
+    }
 }
 
 /// What [`linearize_tree`] hands back.
@@ -2049,7 +2089,9 @@ fn bounds_check_of(
         let Some(Op::Load(at, MirType::I64)) = op_of(f, len) else {
             return None;
         };
-        if in_loop(*at) {
+        // The guard re-reads the length whether or not any lane takes the arm, so it must be a
+        // read that cannot fault there: a slice parameter's or a stack slot's own length field.
+        if in_loop(*at) || !never_faults(f, *at, 8) {
             return None;
         }
         if reads_in_loop(f, l, len) == 1 {
@@ -2087,8 +2129,9 @@ fn bounds_check_of(
 ///   to its own element or to a scratch slot ([`Plan::TreePredStore`]). Stores before the first
 ///   conditional stay in place, ahead of everything the region sinks.
 /// * **Loads** in an arm are speculated when an access on every path (the unconditional blocks,
-///   the latch) touches the same place, or when they re-read a slice parameter's data pointer
-///   ([`speculable_ptr_load`]); any other affine load is predicated by its path predicate
+///   the latch) touches the same place, or when they re-read a data pointer from a fat pointer
+///   that cannot fault — a slice parameter's or a stack slot's ([`speculable_ptr_load`]); any
+///   other affine load is predicated by its path predicate
 ///   ([`LinInst::PredLoad`]); anything else declines.
 /// * **Order**: sinking a store moves it past every later instruction, so no load may sit on a
 ///   path after a store it could read — in the same block after it, or in a block reachable from
@@ -9063,6 +9106,43 @@ mod tests {
                    i = i + 1; } }";
         let shape = format!("{k} fn main() -> i32 {{ return 0; }}");
         assert!(is_widened(&shape, "k"), "a plain-slice one-armed store");
+    }
+
+    /// The same one-armed store through a RAW pointer's slice field: `(*p).w[i]` re-reads the data
+    /// pointer at `p` itself (the field is at offset 0), and `p` may be `0 as *mut Layer` exactly
+    /// when no lane takes the arm, since the scalar loop then never dereferences it. Speculating
+    /// that read, and hoisting it into the guard, stopped `-O2` with "null pointer dereference"
+    /// (native: SIGSEGV) where `-O0` returned; so did the checked spelling's length re-read. Only
+    /// a slice parameter's or a stack slot's fat pointer is provably live, so both arms decline.
+    /// `k` calls itself through `k2`, so the inliner leaves it out of line, where `p` is still a
+    /// parameter.
+    #[test]
+    fn an_arm_rereading_a_raw_pointers_slice_field_is_not_speculated() {
+        for attr in ["@unchecked ", ""] {
+            let k = format!(
+                "struct Layer {{ w: []f32, }} \
+                 {attr}fn k(x: []f32, p: *mut Layer, n: i64, d: i64) {{ \
+                   if d > 0 {{ k2(x, p, n, d - 1); return; }} let mut i: i64 = 0; \
+                   while i < n {{ let v: f32 = x[i]; if v > 0.0 {{ (*p).w[i] = v; }} \
+                     i = i + 1; }} }} \
+                 fn k2(x: []f32, p: *mut Layer, n: i64, d: i64) {{ k(x, p, n, d); }}"
+            );
+            let shape = format!("{k} fn main() -> i32 {{ return 0; }}");
+            assert!(
+                !is_widened(&shape, "k"),
+                "{attr}an arm's read through a raw pointer was speculated"
+            );
+            scalar_and_vector_agree(&format!(
+                "{k} fn main() -> i32 {{ let mut x: []f32 = alloc_f32(16); \
+                 let mut j: i64 = 0; while j < 16 {{ x[j] = -1.0; j = j + 1; }} \
+                 k(x, 0 as *mut Layer, 16, 1); \
+                 let mut wa: []f32 = alloc_f32(16); let mut l: Layer = Layer {{ w: wa }}; \
+                 j = 0; while j < 16 {{ x[j] = (j % 3) as f32 - 0.5; wa[j] = 9.0; j = j + 1; }} \
+                 k(x, &mut l, 16, 1); \
+                 j = 0; while j < 16 {{ print((wa[j] * 2.0) as i32); j = j + 1; }} \
+                 return 0; }}"
+            ));
+        }
     }
 
     /// A diamond inside one arm of another, the outer `else` storing nothing: three paths, two of
