@@ -355,6 +355,9 @@ fn collect_const_refs(e: &Expr, consts: &HashSet<Symbol>, out: &mut Vec<Symbol>)
         }
         ExprKind::Block(b) => collect_block_const_refs(b, consts, out),
         ExprKind::Loop { body, .. } => collect_block_const_refs(body, consts, out),
+        // A closure is never a legal const initializer (E0411), but what its body names still
+        // counts: a cycle through it would otherwise go unreported.
+        ExprKind::Closure { body, .. } => collect_const_refs(body, consts, out),
         ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Str(_)
@@ -4654,6 +4657,15 @@ impl<'a> Sema<'a> {
                 // The operand's type names must resolve (`E0324`) like any other type's.
                 self.check_type_expr_names(t);
                 Ty::Scalar(Scalar::Usize)
+            }
+            // Closure literals parse, but nothing checks or lowers one yet: refused everywhere.
+            ExprKind::Closure { .. } => {
+                self.error(
+                    e.span,
+                    "E0411",
+                    "a closure literal cannot be used here: closures are not supported yet",
+                );
+                Ty::Error
             }
         }
     }

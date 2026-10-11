@@ -473,6 +473,7 @@ fn for_each_child<'e>(e: &'e Expr, f: &mut dyn FnMut(Child<'e>)) {
                 f(Child::Expr(&a.body));
             }
         }
+        ExprKind::Closure { body, .. } => f(Child::Expr(body)),
     }
 }
 
@@ -947,6 +948,24 @@ impl<'a> FnLint<'a> {
                     self.scopes.pop();
                 }
             }
+            // A closure body is walked where it is written: a capture is a read of the enclosing
+            // binding (so it is never an unused variable), and the closure's parameters are
+            // parameters of its own scope. Its `return` leaves the closure only, so nothing here
+            // feeds the enclosing block's divergence (`stmt_diverges` does not descend).
+            ExprKind::Closure { params, ret, body } => {
+                self.scopes.push(Vec::new());
+                for p in params {
+                    if let Some(t) = &p.ty {
+                        self.type_expr(t);
+                    }
+                    self.bind(p.name.sym, p.name.span, BindKind::Param, false, false);
+                }
+                if let Some(r) = ret {
+                    self.type_expr(r);
+                }
+                self.expr(body);
+                self.scopes.pop();
+            }
             ExprKind::Int(_)
             | ExprKind::Float(_)
             | ExprKind::Str(_)
@@ -1208,7 +1227,8 @@ impl<'a> FnLint<'a> {
             | ExprKind::ArrayRepeat { .. }
             | ExprKind::StructLit { .. }
             | ExprKind::SizeOf(_)
-            | ExprKind::AlignOf(_) => ("statement has no effect".to_string(), None),
+            | ExprKind::AlignOf(_)
+            | ExprKind::Closure { .. } => ("statement has no effect".to_string(), None),
             // A call has effects; an index or a dereference can trap (a bounds or address check
             // is observable); a borrow, a block, a loop and a branch are control flow or effects.
             ExprKind::Unary { .. }

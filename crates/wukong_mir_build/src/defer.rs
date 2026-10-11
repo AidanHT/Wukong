@@ -583,7 +583,7 @@ impl Desugar<'_> {
                 self.frames.pop();
             }
             // Types carry expressions only as constant array lengths: no blocks to rewrite.
-            ExprKind::SizeOf(_) | ExprKind::AlignOf(_) => {}
+            ExprKind::SizeOf(_) | ExprKind::AlignOf(_) | ExprKind::Closure { .. } => {}
         }
     }
 
@@ -702,6 +702,8 @@ impl Desugar<'_> {
             }
             ExprKind::Loop { body, .. } => self.refresh_block(body),
             ExprKind::SizeOf(t) | ExprKind::AlignOf(t) => self.refresh_ty(t),
+            // Lifted away before this pass runs (`closures.rs`).
+            ExprKind::Closure { .. } => {}
         }
     }
 
@@ -934,7 +936,8 @@ fn mentions_expr(e: &Expr, out: &mut Vec<Symbol>) {
         | ExprKind::Char(_)
         | ExprKind::Bool(_)
         | ExprKind::SizeOf(_)
-        | ExprKind::AlignOf(_) => {}
+        | ExprKind::AlignOf(_)
+        | ExprKind::Closure { .. } => {}
         ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => mentions_expr(expr, out),
         ExprKind::Binary { lhs, rhs, .. } => {
             mentions_expr(lhs, out);
@@ -1112,7 +1115,8 @@ fn expr_has_defer(e: &Expr) -> bool {
         | ExprKind::Bool(_)
         | ExprKind::Path(_)
         | ExprKind::SizeOf(_)
-        | ExprKind::AlignOf(_) => false,
+        | ExprKind::AlignOf(_)
+        | ExprKind::Closure { .. } => false,
     }
 }
 

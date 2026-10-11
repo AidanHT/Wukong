@@ -787,6 +787,21 @@ impl AstPrinter<'_> {
             }
             ExprKind::SizeOf(ty) => self.line(format!("sizeof {}", self.type_str(ty))),
             ExprKind::AlignOf(ty) => self.line(format!("alignof {}", self.type_str(ty))),
+            ExprKind::Closure { params, ret, body } => {
+                let ps: Vec<String> = params
+                    .iter()
+                    .map(|p| match &p.ty {
+                        Some(t) => format!("{}: {}", self.sym(p.name.sym), self.type_str(t)),
+                        None => self.sym(p.name.sym).to_string(),
+                    })
+                    .collect();
+                let ret = ret
+                    .as_ref()
+                    .map(|r| format!(" -> {}", self.type_str(r)))
+                    .unwrap_or_default();
+                self.line(format!("closure |{}|{ret}", ps.join(", ")));
+                self.indented(|p| p.expr(body));
+            }
         }
     }
 }

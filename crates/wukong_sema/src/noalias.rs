@@ -552,6 +552,16 @@ impl Walker<'_> {
                     self.scopes.pop();
                 }
             }
+            // A closure body sees the enclosing bindings by value (a captured pointer still views
+            // what it viewed outside), and its parameters are fresh bindings that shadow them.
+            ExprKind::Closure { params, body, .. } => {
+                self.scopes.push(HashMap::default());
+                for p in params {
+                    self.bind(p.name.sym, Binding::default());
+                }
+                self.expr(body);
+                self.scopes.pop();
+            }
         }
     }
 

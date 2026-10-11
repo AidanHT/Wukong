@@ -379,7 +379,8 @@ fn expr_admits_any(e: &Expr, sema: &SemaResult) -> bool {
         | ExprKind::Bool(_)
         | ExprKind::Path(_)
         | ExprKind::SizeOf(_)
-        | ExprKind::AlignOf(_) => false,
+        | ExprKind::AlignOf(_)
+        | ExprKind::Closure { .. } => false,
     }
 }
 
@@ -630,7 +631,8 @@ fn canon_expr(e: &mut Expr, sema: &SemaResult) -> bool {
         | ExprKind::Bool(_)
         | ExprKind::Path(_)
         | ExprKind::SizeOf(_)
-        | ExprKind::AlignOf(_) => false,
+        | ExprKind::AlignOf(_)
+        | ExprKind::Closure { .. } => false,
     }
 }
 
@@ -849,7 +851,8 @@ impl UseScan<'_> {
             | ExprKind::Bool(_)
             | ExprKind::Path(_)
             | ExprKind::SizeOf(_)
-            | ExprKind::AlignOf(_) => {}
+            | ExprKind::AlignOf(_)
+            | ExprKind::Closure { .. } => {}
             ExprKind::Unary { expr, .. }
             | ExprKind::Cast { expr, .. }
             | ExprKind::Field { base: expr, .. }
@@ -981,7 +984,8 @@ fn subst_expr(e: &mut Expr, x: Symbol, init: &Expr) {
         | ExprKind::Bool(_)
         | ExprKind::Path(_)
         | ExprKind::SizeOf(_)
-        | ExprKind::AlignOf(_) => {}
+        | ExprKind::AlignOf(_)
+        | ExprKind::Closure { .. } => {}
         ExprKind::Unary { expr, .. }
         | ExprKind::Cast { expr, .. }
         | ExprKind::Field { base: expr, .. }
@@ -1171,7 +1175,8 @@ fn scan_expr(e: &Expr, f: &mut RegionFacts) {
         | ExprKind::Bool(_)
         | ExprKind::Path(_)
         | ExprKind::SizeOf(_)
-        | ExprKind::AlignOf(_) => {}
+        | ExprKind::AlignOf(_)
+        | ExprKind::Closure { .. } => {}
         ExprKind::Unary { op, expr } => {
             if matches!(op, UnOp::Ref | UnOp::RefMut) {
                 if let Some(root) = assign_root(expr) {

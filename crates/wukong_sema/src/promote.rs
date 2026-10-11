@@ -426,6 +426,9 @@ fn expr_writes(e: &Expr, name: Symbol) -> bool {
                         || expr_writes(&a.body, name)
                 })
         }
+        // A closure's capture is a read-only copy (assigning it is E0304), so only a `let` in its
+        // body can write the name; counting that errs toward "written", the safe answer.
+        ExprKind::Closure { body, .. } => expr_writes(body, name),
         ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Str(_)

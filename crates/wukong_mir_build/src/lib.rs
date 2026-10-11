@@ -564,7 +564,8 @@ impl MonoCollector<'_> {
             | ExprKind::Bool(_)
             | ExprKind::Path(_)
             | ExprKind::SizeOf(_)
-            | ExprKind::AlignOf(_) => {}
+            | ExprKind::AlignOf(_)
+            | ExprKind::Closure { .. } => {}
             ExprKind::Unary { expr, .. } => self.walk_expr(expr, subst),
             ExprKind::Binary { lhs, rhs, .. } => {
                 self.walk_expr(lhs, subst);
@@ -821,7 +822,8 @@ fn collect_str_expr(e: &Expr, out: &mut Vec<Symbol>) {
         | ExprKind::Bool(_)
         | ExprKind::Path(_)
         | ExprKind::SizeOf(_)
-        | ExprKind::AlignOf(_) => {}
+        | ExprKind::AlignOf(_)
+        | ExprKind::Closure { .. } => {}
         ExprKind::Unary { expr, .. } => collect_str_expr(expr, out),
         ExprKind::Binary { lhs, rhs, .. } => {
             collect_str_expr(lhs, out);
@@ -981,7 +983,8 @@ fn collect_field_bases_expr(e: &Expr, out: &mut Vec<(Symbol, Symbol)>) {
         | ExprKind::Bool(_)
         | ExprKind::Path(_)
         | ExprKind::SizeOf(_)
-        | ExprKind::AlignOf(_) => {}
+        | ExprKind::AlignOf(_)
+        | ExprKind::Closure { .. } => {}
         ExprKind::Unary { expr, .. } => collect_field_bases_expr(expr, out),
         ExprKind::Binary { lhs, rhs, .. } => {
             collect_field_bases_expr(lhs, out);
@@ -2618,7 +2621,8 @@ fn escapes_parallel_chunk_expr(e: &Expr, depth: u32) -> bool {
         | ExprKind::Bool(_)
         | ExprKind::Path(_)
         | ExprKind::SizeOf(_)
-        | ExprKind::AlignOf(_) => false,
+        | ExprKind::AlignOf(_)
+        | ExprKind::Closure { .. } => false,
         ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => {
             escapes_parallel_chunk_expr(expr, depth)
         }
@@ -15193,7 +15197,8 @@ impl FnLowerer<'_> {
             | ExprKind::Str(_)
             | ExprKind::Char(_)
             | ExprKind::SizeOf(_)
-            | ExprKind::AlignOf(_) => {}
+            | ExprKind::AlignOf(_)
+            | ExprKind::Closure { .. } => {}
             ExprKind::Path(p) => {
                 if p.is_single() {
                     // Fresh aggregate slots can still contain borrowed pointees. Reject those
@@ -27387,7 +27392,8 @@ impl GemmBiasAlias<'_> {
             | ExprKind::Bool(_)
             | ExprKind::Path(_)
             | ExprKind::SizeOf(_)
-            | ExprKind::AlignOf(_) => false,
+            | ExprKind::AlignOf(_)
+            | ExprKind::Closure { .. } => false,
             ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => self.expr(expr),
             ExprKind::Field { base, .. } | ExprKind::TupleField { base, .. } => self.expr(base),
             ExprKind::Binary { lhs, rhs, .. } => self.expr(lhs) || self.expr(rhs),
