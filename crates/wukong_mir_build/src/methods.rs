@@ -82,14 +82,15 @@ pub(crate) fn bound_fn(
 }
 
 /// The function an argument passed to a function-typed parameter denotes: the caller's own bound
-/// function-typed parameter, or a top-level function named directly.
+/// function-typed parameter, or a top-level function named directly (a lifted closure's value
+/// `(L, captures..)` names `L`, `closures.rs`).
 pub(crate) fn fn_value_of(
     arg: &Expr,
     subst: &HashMap<Symbol, Ty>,
     sema: &SemaResult,
     interner: &Interner,
 ) -> Option<Symbol> {
-    let ExprKind::Path(p) = &arg.kind else {
+    let ExprKind::Path(p) = &crate::closures::closure_code(arg).kind else {
         return None;
     };
     if !p.is_single() {
@@ -528,7 +529,7 @@ impl CallScan<'_> {
                     }
                 }
                 for a in args {
-                    if let ExprKind::Path(p) = &a.kind {
+                    if let ExprKind::Path(p) = &crate::closures::closure_code(a).kind {
                         if p.is_single() && self.is_fn(p.first().sym) {
                             self.values.push(p.first().sym);
                         }

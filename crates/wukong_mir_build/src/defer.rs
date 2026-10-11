@@ -36,8 +36,6 @@ use wukong_sema::{BuiltinCall, MethodCall, SemaResult};
 use wukong_span::{FxHashMap, Interner, Span, Symbol};
 use wukong_types::{Dim, Ty};
 
-use crate::closures::{add_capture_mentions, ClosureTable};
-
 /// Fresh `NodeId`s are minted DOWNWARD from here. The parser hands ids out upward from 0,
 /// `tindex` mints downward from `u32::MAX - 1` but never at or below `u32::MAX / 2`, and the method
 /// desugaring (`methods.rs`, which runs just before this pass) owns `(u32::MAX / 4, u32::MAX / 2)`,
@@ -86,7 +84,6 @@ impl DeferOverlay {
 pub(crate) fn lower_defers(
     module: &Module,
     sema: &SemaResult,
-    closures: &ClosureTable,
     interner: &mut Interner,
 ) -> Result<Option<(Module, DeferOverlay)>, Vec<Diagnostic>> {
     let has_defer = module.items.iter().any(|item| match &item.kind {
@@ -104,7 +101,6 @@ pub(crate) fn lower_defers(
         extra_call_dims: FxHashMap::default(),
         extra_builtin_calls: FxHashMap::default(),
         extra_method_calls: FxHashMap::default(),
-        closures,
         interner,
         next_id: DEFER_ID_TOP,
         diags: Vec::new(),
@@ -166,9 +162,6 @@ struct Desugar<'a> {
     extra_builtin_calls: FxHashMap<NodeId, BuiltinCall>,
     /// Method-call records of the copies this pass creates.
     extra_method_calls: FxHashMap<NodeId, MethodCall>,
-    /// The lifted closures (`closures.rs`): a closure argument of a deferred call reads its
-    /// captures when the call runs, so they count as names the call mentions.
-    closures: &'a ClosureTable,
     interner: &'a mut Interner,
     next_id: u32,
     diags: Vec<Diagnostic>,
@@ -225,7 +218,6 @@ impl Desugar<'_> {
                 self.frames.pop();
                 let mut mentions = Vec::new();
                 mentions_expr(e, &mut mentions);
-                add_capture_mentions(self.closures, &mut mentions);
                 let expr = e.clone();
                 if let Some(Frame::Block(pending)) = self.frames.last_mut() {
                     pending.push(Pending {
@@ -1145,7 +1137,7 @@ mod tests {
     /// The rewritten module as the AST printer renders it, trimmed to the lines that matter.
     fn rewritten_lines(src: &str, keep: impl Fn(&str) -> bool) -> Vec<String> {
         let (module, sema, mut interner) = analyze(src);
-        let (out, _) = lower_defers(&module, &sema, &Default::default(), &mut interner)
+        let (out, _) = lower_defers(&module, &sema, &mut interner)
             .expect("no E0314")
             .expect("the module has a defer");
         wukong_ast::print::print_module(&out, &interner)
@@ -1158,7 +1150,7 @@ mod tests {
 
     fn e0314(src: &str) -> usize {
         let (module, sema, mut interner) = analyze(src);
-        match lower_defers(&module, &sema, &Default::default(), &mut interner) {
+        match lower_defers(&module, &sema, &mut interner) {
             Ok(_) => 0,
             Err(diags) => {
                 assert!(diags.iter().all(|d| d.code == Some("E0314")), "{diags:?}");
@@ -1171,7 +1163,7 @@ mod tests {
     fn a_module_without_defer_is_not_cloned() {
         let (module, sema, mut interner) = analyze("fn f() -> i32 { return 1; }");
         assert!(matches!(
-            lower_defers(&module, &sema, &Default::default(), &mut interner),
+            lower_defers(&module, &sema, &mut interner),
             Ok(None)
         ));
     }

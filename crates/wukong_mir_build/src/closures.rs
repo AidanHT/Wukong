@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! fn main() { let a = 2.0; apply(|x| x * a, 3.0) }
-//!   =>  fn main() { let a = 2.0; apply(main$closure$0, 3.0) }
+//!   =>  fn main() { let a = 2.0; apply((main$closure$0, a), 3.0) }
 //!       fn main$closure$0(a: f32, x: f32) -> f32 { x * a }
 //! ```
 //!
@@ -15,13 +15,28 @@
 //! closure's own parameters. `main$closure$0` is a registered function (`DefMap::insert_synthetic`),
 //! so everything downstream already handles it: the function-typed parameter machinery of
 //! `methods.rs` specializes `apply` per bound function (`apply$main$closure$0`) and turns the call
-//! through `f` into a direct call. What closures add is the **environment ABI**:
+//! through `f` into a direct call.
+//!
+//! **The closure value keeps its captured reads in the tree.** A literal with captures becomes the
+//! tuple `(L, c0, c1, ..)` — the textbook closure conversion, code and environment — typed as the
+//! closure's function type; one without captures becomes the bare name `L`. Every pass below this
+//! one decides from what the tree mentions: `canon` inlines and deletes a `let` whose only reads are
+//! index positions and sinks an accumulator seed past the statements that do not mention it, the
+//! fused-window recognizers prove the scalars a kernel hides are not read afterwards
+//! (`block_mentions`), and `defer` checks that nothing a pending call reads is rebound. A bare `L`
+//! mentions none of the captures, so each of those passes would delete, move or hide a binding the
+//! closure still reads, and the capture copy would resolve to an outer binding of the same name (a
+//! wrong value on every backend and at every `-O` level) or to nothing. As tuple elements the
+//! captures are ordinary reads, at the point where the copy happens, for every walker at once.
+//! [`closure_code`] is the function such a value denotes.
+//!
+//! What closures add to lowering is the **environment ABI**:
 //!
 //! * an instance whose function-typed parameter `f` is bound to a closure with captures declares
 //!   one hidden MIR parameter per capture at `f`'s position (`lower_fn`), and binds them as
 //!   `$env$f$0`, `$env$f$1`, … (spellings no identifier can take);
 //! * a call passing a function-typed argument passes, at that position, the closure's capture
-//!   values: copied from the enclosing locals at the literal's own site (`capture_args`), or
+//!   values: the tuple's captures, read from the enclosing locals at the literal's own site, or
 //!   forwarded from the caller's own `$env$g$j` when the argument is the caller's function-typed
 //!   parameter `g` (`lower_call`);
 //! * a call through `f` calls the lifted function with `$env$f$..` first (`lower_dispatched_call`).
@@ -53,12 +68,19 @@ const LIFT_ID_FLOOR: u32 = u32::MAX / 16;
 
 /// What lowering needs about one lifted closure, keyed in [`ClosureTable`] by its function's name.
 pub(crate) struct ClosureLift {
-    /// One path per capture, in the lifted function's parameter order: lowered at the literal's own
-    /// call site, in the enclosing scope, to copy each captured value. Each is typed in sema.
-    pub(crate) capture_args: Vec<Expr>,
     /// The capture types: the lifted function's leading parameter types, and the types of the
     /// hidden parameters an instance bound to it declares.
     pub(crate) env_tys: Vec<Ty>,
+}
+
+/// The function a value passed to a function-typed parameter names: the first element of a
+/// closure value `(L, captures..)`, or the expression itself (a function's name, a forwarded
+/// function-typed parameter, or a capture-free closure's `L`).
+pub(crate) fn closure_code(a: &Expr) -> &Expr {
+    match &a.kind {
+        ExprKind::TupleLit(xs) => xs.first().unwrap_or(a),
+        _ => a,
+    }
 }
 
 /// Every lifted closure, by the name of its function (`main$closure$0`).
@@ -318,7 +340,8 @@ impl Lifter<'_> {
         }
     }
 
-    /// Replace the closure literal `e` (its body already lifted) by the name of a new function.
+    /// Replace the closure literal `e` (its body already lifted) by the value of a new function:
+    /// `(L, captures..)`, or the bare `L` when it captures nothing (see the module docs).
     fn lift(&mut self, e: &mut Expr) {
         let Some(info) = self.sema.closures.get(&e.id) else {
             self.failed = true;
@@ -330,19 +353,32 @@ impl Lifter<'_> {
             .interner
             .intern(&format!("{}$closure${}", self.prefix, self.counter));
         self.counter += 1;
-        let path = self.path(
-            name,
-            span,
-            Ty::Fn {
-                params: info.params.clone(),
-                ret: Box::new(info.ret.clone()),
-            },
-        );
-        let ExprKind::Closure { params, ret, body } = std::mem::replace(&mut e.kind, path.kind)
-        else {
+        let fn_ty = Ty::Fn {
+            params: info.params.clone(),
+            ret: Box::new(info.ret.clone()),
+        };
+        let code = self.path(name, span, fn_ty.clone());
+        let value = if info.captures.is_empty() {
+            code
+        } else {
+            // Each capture is read where its copy is taken, in the enclosing scope, so every pass
+            // that asks what this statement reads sees it.
+            let mut elems = Vec::with_capacity(info.captures.len() + 1);
+            elems.push(code);
+            for (sym, ty) in &info.captures {
+                elems.push(self.path(*sym, span, ty.clone()));
+            }
+            let id = self.fresh();
+            self.types.push((id, fn_ty));
+            Expr {
+                id,
+                kind: ExprKind::TupleLit(elems),
+                span,
+            }
+        };
+        let ExprKind::Closure { params, ret, body } = std::mem::replace(e, value).kind else {
             unreachable!("lift is called on a closure literal");
         };
-        e.id = path.id;
 
         // `Param::ty` is read only for an `extern` function (`externs.rs`); `lower_fn` takes every
         // parameter type from the registered signature, so an unannotated parameter's is a
@@ -353,8 +389,7 @@ impl Lifter<'_> {
             span,
         };
         let mut fparams = Vec::with_capacity(info.captures.len() + params.len());
-        let mut capture_args = Vec::with_capacity(info.captures.len());
-        for (sym, ty) in &info.captures {
+        for (sym, _) in &info.captures {
             fparams.push(Param {
                 id: self.fresh(),
                 attrs: Vec::new(),
@@ -363,7 +398,6 @@ impl Lifter<'_> {
                 ty: placeholder(span),
                 span,
             });
-            capture_args.push(self.path(*sym, span, ty.clone()));
         }
         for p in params {
             fparams.push(Param {
@@ -418,33 +452,9 @@ impl Lifter<'_> {
         self.table.insert(
             name,
             ClosureLift {
-                capture_args,
                 env_tys: info.captures.into_iter().map(|(_, t)| t).collect(),
             },
         );
-    }
-}
-
-/// `defer`'s rebinding check (`E0314`) must see the names a deferred call reads through a closure
-/// argument: each lifted closure `mentions` names stands for its captures too.
-pub(crate) fn add_capture_mentions(table: &ClosureTable, mentions: &mut Vec<Symbol>) {
-    if table.is_empty() {
-        return;
-    }
-    let mut extra: Vec<Symbol> = Vec::new();
-    for m in mentions.iter() {
-        if let Some(lift) = table.get(m) {
-            for c in &lift.capture_args {
-                if let ExprKind::Path(p) = &c.kind {
-                    extra.push(p.first().sym);
-                }
-            }
-        }
-    }
-    for s in extra {
-        if !mentions.contains(&s) {
-            mentions.push(s);
-        }
     }
 }
 
@@ -458,8 +468,9 @@ impl<'a> FnLowerer<'a> {
 
     /// The hidden arguments a function-typed argument `a` passes: the captured values of the
     /// closure it denotes (empty for a named function or a capture-free closure). At the literal's
-    /// own site each capture is copied from the enclosing local now — so a later argument cannot
-    /// change it — and a forwarded function-typed parameter passes on what it received.
+    /// own site — the closure value `(L, captures..)` — each capture is copied from the enclosing
+    /// local now, so a later argument cannot change it; a forwarded function-typed parameter passes
+    /// on what it received.
     pub(crate) fn closure_env_values(&mut self, a: &Expr) -> Vec<ValueId> {
         let Some(l) = methods::fn_value_of(a, &self.subst, self.sema, self.interner) else {
             return Vec::new();
@@ -467,19 +478,20 @@ impl<'a> FnLowerer<'a> {
         let Some(lift) = self.closure_env(l) else {
             return Vec::new();
         };
-        let ExprKind::Path(p) = &a.kind else {
-            return Vec::new();
-        };
-        let name = p.first().sym;
-        if name == l {
-            lift.capture_args
-                .iter()
-                .map(|c| self.lower_expr(c))
-                .collect()
-        } else {
-            (0..lift.env_tys.len())
-                .map(|j| self.load_env(name, j, a.span))
-                .collect()
+        match &a.kind {
+            ExprKind::TupleLit(xs) if xs.len() == lift.env_tys.len() + 1 => {
+                xs[1..].iter().map(|c| self.lower_expr(c)).collect()
+            }
+            ExprKind::Path(p) => {
+                let name = p.first().sym;
+                (0..lift.env_tys.len())
+                    .map(|j| self.load_env(name, j, a.span))
+                    .collect()
+            }
+            _ => {
+                self.unsupported(a.span, "closure environment");
+                Vec::new()
+            }
         }
     }
 
@@ -647,6 +659,126 @@ mod tests {
         let (_prog, diags) = lower_program(&module, &sema, &mut interner);
         let codes: Vec<_> = diags.iter().filter_map(|d| d.code).collect();
         assert_eq!(codes, vec!["E0314"], "{diags:?}");
+    }
+
+    /// The statements of the first nested block of `main`, after the lift and `canon` — the passes
+    /// that run before any recognizer, in that order — as `let` / `expr` / `for` / `other`.
+    fn inner_block_after_canon(src: &str) -> Vec<&'static str> {
+        use wukong_ast::{ExprKind, ItemKind, StmtKind};
+        let mut interner = Interner::new();
+        let (module, pdiags) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pdiags.is_empty(), "parse: {pdiags:?}");
+        let (sema, sdiags) = wukong_sema::check(&module, &interner);
+        assert!(sdiags.iter().all(|d| !d.is_error()), "sema: {sdiags:?}");
+        let (lifted, lsema, _) =
+            super::lift_module(&module, &sema, &mut interner).expect("the module has a closure");
+        let out = crate::canon::canonicalize_module(&lifted, &lsema).unwrap_or(lifted);
+        let main = out
+            .items
+            .iter()
+            .find_map(|it| match &it.kind {
+                ItemKind::Fn(f) if interner.resolve(f.name.sym) == "main" => f.body.as_ref(),
+                _ => None,
+            })
+            .expect("main");
+        let inner = main
+            .stmts
+            .iter()
+            .find_map(|s| match &s.kind {
+                StmtKind::Expr(e) => match &e.kind {
+                    ExprKind::Block(b) => Some(b),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("a nested block");
+        inner
+            .stmts
+            .iter()
+            .map(|s| match &s.kind {
+                StmtKind::Let { .. } => "let",
+                StmtKind::Expr(_) => "expr",
+                StmtKind::For { .. } => "for",
+                _ => "other",
+            })
+            .collect()
+    }
+
+    /// `canon` inlines an integer `let` whose every read is an index, then deletes it. A closure
+    /// that captures it reads it too, at its call: deleting the `let` left the capture to resolve
+    /// to the OUTER `k` (`30 / 103 / 3` where `30 / 102 / 3` is right, on every backend).
+    #[test]
+    fn canon_keeps_a_let_a_closure_captures() {
+        let src = |closure: &str| {
+            format!(
+                "fn applyi(f: fn(i64) -> i64, x: i64) -> i64 {{ return f(x); }} \
+                 fn main() -> i32 {{ let a: [i64; 4] = [10, 20, 30, 40]; let j: i64 = 1; \
+                 let k: i64 = 3; {{ let k = j + 1; print(a[k]); print(applyi({closure}, 100)); }} \
+                 print(k); return 0; }}"
+            )
+        };
+        assert_eq!(
+            inner_block_after_canon(&src("|x| x + k")),
+            vec!["let", "expr", "expr"]
+        );
+        // The control: a closure that does not read `k` leaves only the index read, which canon
+        // rewrites — so the test above exercises the rewrite it guards against.
+        assert_eq!(
+            inner_block_after_canon(&src("|x| x + j")),
+            vec!["expr", "expr"]
+        );
+    }
+
+    /// `canon` sinks a literal accumulator seed to the first statement that mentions it. A closure
+    /// reading the seed before its loop mentions it: sinking past the read made the capture see an
+    /// outer `s` (`11` where `1` is right).
+    #[test]
+    fn canon_does_not_sink_a_seed_past_a_closure_that_reads_it() {
+        let src = |closure: &str| {
+            format!(
+                "fn apply(f: fn(f32) -> f32, x: f32) -> f32 {{ return f(x); }} \
+                 fn main() -> i32 {{ let xs: [f32; 4] = [1.0, 2.0, 3.0, 4.0]; let s: f32 = 50.0; \
+                 {{ let mut s = 0.0; print(apply({closure}, 1.0)); \
+                 for i in 0..4 {{ s = s + xs[i]; }} print(s); }} print(s); return 0; }}"
+            )
+        };
+        assert_eq!(
+            inner_block_after_canon(&src("|x| x + s")),
+            vec!["let", "expr", "for", "expr"]
+        );
+        // The control: with no read of `s` in the closure the seed does move down to its loop.
+        assert_eq!(
+            inner_block_after_canon(&src("|x| x + 1.0")),
+            vec!["expr", "let", "for", "expr"]
+        );
+    }
+
+    /// A fused-window recognizer replaces a running sum by `wukong_cumsum_f32` only when nothing
+    /// after the window reads the accumulator the kernel hides. A closure capturing it reads it:
+    /// the kernel fired anyway, the `let` was never lowered, and the capture read the outer `acc`
+    /// (`100` where `10` is right).
+    #[test]
+    fn a_window_kernel_does_not_hide_a_scalar_a_closure_captures() {
+        let src = |closure: &str| {
+            format!(
+                "fn apply(f: fn(f32) -> f32, x: f32) -> f32 {{ return f(x); }} \
+                 fn main() -> i32 {{ let x: [f32; 4] = [1.0, 2.0, 3.0, 4.0]; \
+                 let mut out: [f32; 4] = [0.0; 4]; let acc: f32 = 100.0; \
+                 {{ let mut acc: f32 = 0.0; for i in 0..4 {{ acc = acc + x[i]; out[i] = acc; }} \
+                 print(apply({closure}, 0.0)); }} print(out[3]); print(acc); return 0; }}"
+            )
+        };
+        let funcs = lower(&src("|v| v + acc"));
+        assert!(
+            !body(&funcs, "main").contains("wukong_cumsum_f32"),
+            "{funcs:?}"
+        );
+        // The control: the same window followed by a closure that does not read `acc` dispatches.
+        let funcs = lower(&src("|v| v + 1.0"));
+        assert!(
+            body(&funcs, "main").contains("wukong_cumsum_f32"),
+            "{funcs:?}"
+        );
     }
 
     #[test]

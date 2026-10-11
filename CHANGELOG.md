@@ -28,6 +28,15 @@ All notable changes to Wukong are documented here. The format is loosely based o
   it. `E0411` for a closure anywhere but a call argument (a `let`, a `return`, a method-call
   argument, a `const`), and `E0304` for assigning a capture or taking `&mut` of it. A deferred call
   with a closure argument counts the closure's captures as names it reads (`E0314` on rebinding one).
+- **Fixed before merge: captured reads were invisible to the passes after the lift.** The lift
+  replaced a literal by the bare name of its function, so its captures existed only in a side table.
+  `canon` then deleted an index-only `let` a closure captured or sank an accumulator seed below the
+  closure that read it, and a fused-window recognizer (`wukong_cumsum_f32`, the norm and softmax
+  windows, …) hid an accumulator a later closure captured. The capture copy then read an outer
+  binding of the same name: `{ let k = j + 1; print(a[k]); print(applyi(|x| x + k, 100)); }` printed
+  `103` instead of `102`, identically on every backend and at every `-O`. With no outer binding it
+  failed to lower (`C0001`). A closure with captures now lowers to the value `(L, captures..)`, so
+  every pass sees each captured read where the copy is taken (`tests/run/closure_hidden_reads.wk`).
 
 ### Type-lowering soundness (`gap4/sema-soundness`)
 

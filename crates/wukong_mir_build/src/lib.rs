@@ -1284,7 +1284,7 @@ fn lower_program_pooled(
     // call it became; every copy carries its original's sema records (types, call dimensions,
     // builtin calls, trait-bound method calls) under its fresh id. `None` — nothing cloned — for
     // the common module without a `defer`.
-    let deferred = match defer::lower_defers(module, sema, &closure_table, interner) {
+    let deferred = match defer::lower_defers(module, sema, interner) {
         Ok(d) => d,
         Err(diags) => return (Program::new(), diags, false),
     };
@@ -25831,7 +25831,11 @@ fn expr_mentions(e: &Expr, sym: Symbol) -> bool {
         // sound: the literal uses exactly those sub-expressions). Without this an array-init `let`
         // (`let out = [0.0; N]`) in a scalar-escape window falsely reads as a use, so a preceding
         // norm/reduction declines (e.g. the dest declaration of an out-of-place `out = norm(x)`).
-        ExprKind::ArrayLit(items) => items.iter().any(|e| expr_mentions(e, sym)),
+        // Tuple literals likewise — among them a lifted closure's value `(L, captures..)`, whose
+        // captures are read exactly where the call takes their copy (`closures.rs`).
+        ExprKind::ArrayLit(items) | ExprKind::TupleLit(items) => {
+            items.iter().any(|e| expr_mentions(e, sym))
+        }
         ExprKind::ArrayRepeat { value, count } => {
             expr_mentions(value, sym) || expr_mentions(count, sym)
         }
