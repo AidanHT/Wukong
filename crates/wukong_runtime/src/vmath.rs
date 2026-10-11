@@ -1042,9 +1042,11 @@ unsafe fn vmath_scalar(x: *const f32, out: *mut f32, n: usize, op: i64) {
 /// is not the elementwise source loop.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_vmath_f32(x: *const f32, out: *mut f32, n: i64, op: i64) {
-    // P14.5: both buffers valid for `n` f32 (in-place `out == x` is permitted, so no disjointness).
+    // P14.5: both buffers valid for `n` f32; `out` is exactly `x` or disjoint from it -- the 8-lane
+    // body loads before it stores, so a shifted overlap is not the elementwise source loop.
     crate::safety::debug_extent(x, n);
     crate::safety::debug_extent(out, n);
+    crate::safety::debug_inplace_or_disjoint(out, n, x, n);
     if n <= 0 {
         return;
     }
@@ -1978,10 +1980,13 @@ pub unsafe extern "C" fn wukong_vmath2_f32(
     n: i64,
     op: i64,
 ) {
-    // P14.5: all three buffers valid for `n` f32 (in-place aliasing permitted, so no disjointness).
+    // P14.5: all three buffers valid for `n` f32; `out` is exactly `x`/`y` or disjoint from each --
+    // the 8-lane body loads before it stores, so a shifted overlap is not the source loop.
     crate::safety::debug_extent(x, n);
     crate::safety::debug_extent(y, n);
     crate::safety::debug_extent(out, n);
+    crate::safety::debug_inplace_or_disjoint(out, n, x, n);
+    crate::safety::debug_inplace_or_disjoint(out, n, y, n);
     if n <= 0 {
         return;
     }

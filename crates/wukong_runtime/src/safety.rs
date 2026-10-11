@@ -324,6 +324,20 @@ mod entry_law {
         ("xent_bwd.rs", include_str!("xent_bwd.rs")),
     ];
 
+    /// The aliasing rule an entry's doc block states in its `**Aliasing...` paragraph.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Alias {
+        /// No `**Aliasing` paragraph: the entry documents no aliasing rule.
+        Unstated,
+        /// `**Aliasing: none constrained**`: every operand is only read.
+        Unconstrained,
+        /// "all operands disjoint" or a named disjoint pair: [`super::debug_disjoint`]'s class.
+        Disjoint,
+        /// "exactly in place, otherwise disjoint" (or a "may be EXACTLY `x`" restatement):
+        /// [`super::debug_inplace_or_disjoint`]'s class.
+        InPlace,
+    }
+
     /// One scanned `#[no_mangle] ... fn wukong_*` entry.
     struct Entry {
         name: String,
@@ -331,6 +345,48 @@ mod entry_law {
         checked: bool,
         /// `Some(reason)` when the body carries `// SAFETY-EXEMPT: reason`.
         exempt: Option<String>,
+        /// The aliasing class the doc block above `#[no_mangle]` documents.
+        alias: Alias,
+        /// The body calls `safety::debug_disjoint` / `safety::debug_inplace_or_disjoint`.
+        checks_disjoint: bool,
+        checks_inplace: bool,
+    }
+
+    /// Entries whose kernel DETECTS a documented-forbidden overlap and defines the result itself,
+    /// each pinned by an overlap test (`mixed_width_overlap_matches_live_byte_reference`, the
+    /// `*_narrow_overlap_preserves_ascending_reads_and_writes` pair): asserting the documented class
+    /// would abort a call the kernel defines, so these eight check extents only. The list is exact --
+    /// a name here that does check its class, or that documents no rule, fails the law.
+    const ALIASING_DEFINED_IN_KERNEL: &[&str] = &[
+        "wukong_axpby_bf16",
+        "wukong_axpby_f16",
+        "wukong_axpby_bf16_out",
+        "wukong_axpby_f16_out",
+        "wukong_vmath_bf16",
+        "wukong_vmath_f16",
+        "wukong_vmath_bf16_out",
+        "wukong_vmath_f16_out",
+    ];
+
+    /// Classify the `**Aliasing` paragraph of a doc block (the `///` lines above `#[no_mangle]`):
+    /// from the line that opens it to the next blank doc line.
+    fn alias_class(doc: &[&str]) -> Alias {
+        let Some(start) = doc.iter().position(|l| l.contains("**Aliasing")) else {
+            return Alias::Unstated;
+        };
+        let para: Vec<&str> = doc[start..]
+            .iter()
+            .take_while(|l| !l.is_empty())
+            .copied()
+            .collect();
+        let para = para.join(" ");
+        if para.contains("none constrained") {
+            Alias::Unconstrained
+        } else if para.contains("exactly in place") || para.contains("EXACTLY") {
+            Alias::InPlace
+        } else {
+            Alias::Disjoint
+        }
     }
 
     /// Scan one module's text. An entry is a `#[no_mangle]` attribute line followed by an item
@@ -349,6 +405,17 @@ mod entry_law {
             if line.trim() != "#[no_mangle]" {
                 continue;
             }
+            // The doc block: the `///` lines (and attributes) directly above `#[no_mangle]`.
+            let mut doc: Vec<&str> = lines[..i]
+                .iter()
+                .rev()
+                .map(|l| l.trim())
+                .take_while(|l| l.starts_with("///") || l.starts_with("#["))
+                .filter_map(|l| l.strip_prefix("///"))
+                .map(str::trim)
+                .collect();
+            doc.reverse();
+            let alias = alias_class(&doc);
             // The item's `fn` line: the first later non-comment, non-attribute line naming a fn.
             let Some(fi) = (i + 1..lines.len()).find(|&j| {
                 let t = lines[j].trim_start();
@@ -414,6 +481,9 @@ mod entry_law {
                 takes_pointer,
                 checked,
                 exempt,
+                alias,
+                checks_disjoint: body.contains("safety::debug_disjoint("),
+                checks_inplace: body.contains("safety::debug_inplace_or_disjoint("),
             });
         }
         out
@@ -460,6 +530,84 @@ mod entry_law {
         assert!(
             pointer_entries >= 140 && checked >= 140,
             "scanned {pointer_entries} pointer entries, {checked} checked"
+        );
+    }
+
+    /// The aliasing half of the law: an entry whose doc states an aliasing rule asserts that rule,
+    /// not just its extents. "Calls some `safety::debug_*`" cannot see an entry that documents
+    /// "exactly in place, otherwise disjoint" and checks only extents -- `wukong_vmath_f32` and
+    /// `wukong_vmath2_f32` did exactly that while their `_parallel` twin checked the class.
+    #[test]
+    fn every_documented_aliasing_rule_is_checked() {
+        let mut violations = Vec::new();
+        let mut seen_allowed = Vec::new();
+        let (mut disjoint, mut inplace) = (0usize, 0usize);
+        for (module, src) in LAW_MODULES {
+            for e in scan(module, src) {
+                let allowed = ALIASING_DEFINED_IN_KERNEL.contains(&e.name.as_str());
+                let checks = match e.alias {
+                    Alias::Unstated | Alias::Unconstrained => {
+                        if allowed {
+                            violations.push(format!(
+                                "{module}: `{}` is in ALIASING_DEFINED_IN_KERNEL but documents no \
+                                 aliasing rule",
+                                e.name
+                            ));
+                        }
+                        continue;
+                    }
+                    Alias::Disjoint => {
+                        disjoint += 1;
+                        e.checks_disjoint
+                    }
+                    Alias::InPlace => {
+                        inplace += 1;
+                        e.checks_inplace
+                    }
+                };
+                match (checks, allowed) {
+                    (true, false) => {}
+                    (false, true) => seen_allowed.push(e.name.clone()),
+                    (true, true) => violations.push(format!(
+                        "{module}: `{}` checks its aliasing class; drop it from \
+                         ALIASING_DEFINED_IN_KERNEL",
+                        e.name
+                    )),
+                    (false, false) => {
+                        let (class, helper) = if e.alias == Alias::InPlace {
+                            ("exactly-in-place", "safety::debug_inplace_or_disjoint")
+                        } else {
+                            ("all-disjoint", "safety::debug_disjoint")
+                        };
+                        violations.push(format!(
+                            "{module}: `{}` documents the {class} aliasing rule but never \
+                             calls `{helper}`",
+                            e.name
+                        ))
+                    }
+                }
+            }
+        }
+        seen_allowed.sort();
+        let mut want: Vec<String> = ALIASING_DEFINED_IN_KERNEL
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+        want.sort();
+        if seen_allowed != want {
+            violations.push(format!(
+                "ALIASING_DEFINED_IN_KERNEL lists {want:?}, but the scan matched {seen_allowed:?}"
+            ));
+        }
+        assert!(
+            violations.is_empty(),
+            "P14.5 aliasing law violated:\n{}",
+            violations.join("\n")
+        );
+        // Floors, so a scanner that stops reading doc blocks cannot pass vacuously.
+        assert!(
+            disjoint >= 80 && inplace >= 25,
+            "classified only {disjoint} disjoint / {inplace} in-place entries"
         );
     }
 
@@ -512,11 +660,46 @@ mod entry_law {
             "    // SAFETY-EXEMPT: a NUL-terminated string has no extent.",
             "    let _ = s;",
             "}",
+            "",
+            "/// # Safety",
+            "/// **Aliasing: exactly in place, otherwise disjoint** -- `out` may be EXACTLY `x`.",
+            "#[no_mangle]",
+            "pub unsafe extern \"C\" fn wukong_inplace_unchecked(x: *const f32, out: *mut f32) {",
+            "    crate::safety::debug_extent(x, 1);",
+            "}",
+            "",
+            "/// **Aliasing:** that of [`wukong_inplace_unchecked`] -- `out` may be EXACTLY `x`.",
+            "#[no_mangle]",
+            "#[allow(clippy::too_many_arguments)]",
+            "pub unsafe extern \"C\" fn wukong_inplace_ok(x: *const f32, out: *mut f32) {",
+            "    crate::safety::debug_inplace_or_disjoint(out, 1, x, 1);",
+            "}",
+            "",
+            "/// **Aliasing: all operands disjoint** -- `out` does not overlap `x`.",
+            "///",
+            "/// A later paragraph that says EXACTLY is not part of the rule.",
+            "#[no_mangle]",
+            "pub unsafe extern \"C\" fn wukong_disjoint_ok(x: *const f32, out: *mut f32) {",
+            "    crate::safety::debug_disjoint(out, 1, x, 1);",
+            "}",
+            "",
+            "/// **Aliasing: none constrained** -- every operand is only read.",
+            "#[no_mangle]",
+            "pub unsafe extern \"C\" fn wukong_read_only(x: *const f32, y: *const f32) {",
+            "    crate::safety::debug_extent(x, 1);",
+            "}",
         ]
         .join("\n");
         let got: Vec<(String, bool, bool, bool)> = scan("demo.rs", &src)
-            .into_iter()
-            .map(|e| (e.name, e.takes_pointer, e.checked, e.exempt.is_some()))
+            .iter()
+            .map(|e| {
+                (
+                    e.name.clone(),
+                    e.takes_pointer,
+                    e.checked,
+                    e.exempt.is_some(),
+                )
+            })
             .collect();
         let want: Vec<(String, bool, bool, bool)> = [
             ("wukong_demo", true, false, false),
@@ -525,10 +708,33 @@ mod entry_law {
             // A returned pointer is not an operand.
             ("wukong_alloc", false, false, false),
             ("wukong_ex", true, false, true),
+            ("wukong_inplace_unchecked", true, true, false),
+            ("wukong_inplace_ok", true, true, false),
+            ("wukong_disjoint_ok", true, true, false),
+            ("wukong_read_only", true, true, false),
         ]
         .into_iter()
         .map(|(n, a, b, c)| (n.to_string(), a, b, c))
         .collect();
         assert_eq!(got, want);
+        // The aliasing class comes from the `**Aliasing` paragraph only, and the in-place entry that
+        // checks only extents is told apart from the one that checks its class.
+        let classes: Vec<(String, Alias, bool, bool)> = scan("demo.rs", &src)
+            .into_iter()
+            .map(|e| (e.name, e.alias, e.checks_disjoint, e.checks_inplace))
+            .filter(|(n, ..)| !["wukong_ok", "wukong_scalar", "wukong_alloc"].contains(&n.as_str()))
+            .collect();
+        let want: Vec<(String, Alias, bool, bool)> = [
+            ("wukong_demo", Alias::Unstated, false, false),
+            ("wukong_ex", Alias::Unstated, false, false),
+            ("wukong_inplace_unchecked", Alias::InPlace, false, false),
+            ("wukong_inplace_ok", Alias::InPlace, false, true),
+            ("wukong_disjoint_ok", Alias::Disjoint, true, false),
+            ("wukong_read_only", Alias::Unconstrained, false, false),
+        ]
+        .into_iter()
+        .map(|(n, a, d, i)| (n.to_string(), a, d, i))
+        .collect();
+        assert_eq!(classes, want);
     }
 }
