@@ -66,6 +66,47 @@ fn a_type_that_is_not_an_alias_takes_no_arguments() {
     );
 }
 
+/// The errors `src` checks to, as `(code, message)`.
+fn errors(src: &str) -> Vec<(&'static str, String)> {
+    let mut interner = Interner::new();
+    let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+    assert!(pd.is_empty(), "parse errors: {pd:?}");
+    crate::check(&module, &interner)
+        .1
+        .into_iter()
+        .filter(|d| d.is_error())
+        .map(|d| (d.code.unwrap_or("-"), d.message))
+        .collect()
+}
+
+#[test]
+fn a_generic_struct_given_arguments_is_an_unsupported_feature_not_a_non_generic_type() {
+    // `struct W<T>` declares a parameter, so "`W` takes no type arguments" (and its help, "write
+    // `W` alone", which leads to a struct with an unsized field) misdescribed it: generic structs
+    // and enums are what is missing.
+    for (src, what) in [
+        (
+            "struct W<T> { a: T } \
+             fn main() -> i32 { let y: W<f32> = W { a: 1.5 }; return 0; }",
+            "generic struct `W` cannot be instantiated",
+        ),
+        (
+            "enum O<T> { S(T), N } fn main() -> i32 { let o: O<f32>; return 0; }",
+            "generic enum `O` cannot be instantiated",
+        ),
+        // A function's type parameter that shadows a generic struct is a type parameter.
+        (
+            "struct W<T> { a: T } fn f<W>(x: W) -> i32 { let y: W<2>; return 0; }",
+            "type `W` takes no type arguments",
+        ),
+    ] {
+        let errs = errors(src);
+        assert_eq!(errs.len(), 1, "{src}: {errs:?}");
+        assert_eq!(errs[0].0, "E0327", "{src}: {errs:?}");
+        assert!(errs[0].1.contains(what), "{src}: {errs:?}");
+    }
+}
+
 #[test]
 fn an_unknown_type_survives_the_literal_inference_recheck() {
     // `let y: i64 = k` decides `k`, so the body is checked again — and the re-check used to drop

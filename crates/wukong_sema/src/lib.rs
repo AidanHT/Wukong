@@ -425,6 +425,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         immutable_params: Vec::new(),
         param_tys: HashMap::default(),
         generics: HashSet::default(),
+        generic_types: HashSet::default(),
         ret_ty: Ty::Unit,
         loop_ctx: Vec::new(),
         consts: HashMap::default(),
@@ -515,6 +516,10 @@ struct Sema<'a> {
     /// pointee (pointer/ref — legitimately mutable).
     param_tys: HashMap<Symbol, Ty>,
     generics: HashSet<Symbol>,
+    /// Every struct and enum that declares generic parameters (`struct Buf<T>`). They are not
+    /// supported yet, so `Buf<f32>` is `E0327`, and its message says that, instead of claiming
+    /// that `Buf` takes no type arguments.
+    generic_types: HashSet<Symbol>,
     ret_ty: Ty,
     /// The enclosing loops at the current point (innermost last). A `break`/`continue` with an empty
     /// stack is a hard error (E0303) — without it the lowerer emits an `unreachable` terminator,
@@ -644,6 +649,9 @@ impl<'a> Sema<'a> {
                         .map(|fl| (fl.name.sym, fl.name.span))
                         .collect();
                     self.check_unique_decl_names(&field_names, "struct field");
+                    if !s.generics.is_empty() {
+                        self.generic_types.insert(s.name.sym);
+                    }
                     self.generics = generic_names(&s.generics);
                     let fields = s
                         .fields
@@ -673,6 +681,9 @@ impl<'a> Sema<'a> {
                     }
                     // Payload field types are lowered in the enum's generic scope (like struct
                     // fields), so a generic-typed payload resolves its param names.
+                    if !e.generics.is_empty() {
+                        self.generic_types.insert(e.name.sym);
+                    }
                     self.generics = generic_names(&e.generics);
                     // Resolve each variant's integer discriminant: an explicit `= <int>` sets it,
                     // otherwise it auto-increments from the previous (starting at 0), as in C/Rust.
@@ -1293,12 +1304,33 @@ impl<'a> Sema<'a> {
                     // (the alias expander reports this only in a module that declares aliases).
                     if self.generics.contains(&name) || self.is_declared_named_ty(name) {
                         let nm = self.sym_str(name).to_string();
-                        self.report_type_once(
+                        // A struct or enum that declares parameters does take arguments, in
+                        // principle; it is the feature that is missing, and `write `W` alone`
+                        // would only lead to a struct with an unsized field.
+                        let d = if self.generic_types.contains(&name)
+                            && !self.generics.contains(&name)
+                        {
+                            let (kind, parts) = match self.defs.lookup(name).map(|d| &d.kind) {
+                                Some(DefKind::Enum(_)) => ("enum", "payload"),
+                                _ => ("struct", "field"),
+                            };
+                            Diagnostic::error(format!(
+                                "generic {kind} `{nm}` cannot be instantiated: generic structs \
+                                 and enums are not supported yet"
+                            ))
+                            .with_code("E0327")
+                            .primary(t.span, "only a generic type alias takes arguments")
+                            .help(format!(
+                                "declare `{nm}` with concrete {parts} types, one {kind} per \
+                                 element type you need"
+                            ))
+                        } else {
                             Diagnostic::error(format!("type `{nm}` takes no type arguments"))
                                 .with_code("E0327")
                                 .primary(t.span, "only a generic type alias takes arguments")
-                                .help(format!("write `{nm}` alone")),
-                        );
+                                .help(format!("write `{nm}` alone"))
+                        };
+                        self.report_type_once(d);
                     }
                 }
                 Ty::Error

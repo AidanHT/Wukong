@@ -39,7 +39,12 @@ All notable changes to Wukong are documented here. The format is loosely based o
 - **Type positions the checker let through.** An integer written as a type (`let x: 512 = 3;`) is
   `E0324` and a struct, enum or type parameter given arguments (`let p: P<2>`) is `E0327`; both typed
   as an error with no diagnostic and ran. An undeclared type's `E0324` is no longer lost when literal
-  inference re-checks the body (`let k = 7; let y: i64 = k; let mut x: Foo;` compiled).
+  inference re-checks the body (`let k = 7; let y: i64 = k; let mut x: Foo;` compiled). A
+  struct or enum that declares parameters is the exception: given arguments (`let y: W<f32>`), it
+  is reported as what it is, "generic struct `W` cannot be instantiated: generic structs and enums
+  are not supported yet". It is not reported as "`W` takes no type arguments", whose "write `W`
+  alone" only led to a struct with an unsized field. In a module that declares a type alias, the
+  alias expander still reports the older message first.
 - **Literal inference at struct fields and method arguments (N17).** A struct-literal field (also a
   struct-payload variant's) and a method-call, associated-function, trait-bound or function-typed
   parameter call argument now decide a literal-initialized binding, as a plain call argument does:
