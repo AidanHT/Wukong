@@ -36,6 +36,21 @@
 //! read inside an exit block entered only from the loop (the trap block reading the failing index)
 //! is rerouted through a new block parameter; any other read blocks the split.
 //!
+//! ## Derived guards
+//!
+//! The guard may also test a quantity *derived* from the induction variable, `ext(iv ± k) ⋈ n`
+//! with `k` loop-invariant and `ext` an optional sign or zero extension into a wider compare: the
+//! stencil edge `i + 1 < n`, the tile edge `jo + j < n` of a strip-mined loop (`jo` the enclosing
+//! counter, split at `n - jo`), a counter widened to its bound's type, or a counter compared with
+//! the other signedness than its exit test (`(i as u64) < m` on an `i64` counter). Such a guard is
+//! monotone only while `iv ± k` does not wrap, so [`plan_derived`] proves that first, from integer
+//! ranges ([`Ranges`]: constants, extensions, wrap-free arithmetic and the enclosing loops'
+//! counters, which their header tests bound) over the values the loop's counter takes; where the
+//! readings differ the values must also be non-negative, so an `i64` counter against a `usize`
+//! bound splits only from a start proved non-negative. Anything unproved declines -- a guard that
+//! wraps changes twice, and no split point is right for it. The split point itself
+//! ([`derived_split_point`]) is formed without an intermediate that can overflow.
+//!
 //! # Unswitching (LLVM SimpleLoopUnswitch, non-trivial)
 //!
 //! A branch inside the loop on an `i1` defined outside it — after LICM, any condition that does not
@@ -55,11 +70,11 @@
 //! before the vectorizer.
 
 use wukong_mir::{
-    BasicBlock, BinOp, BlockId, CmpOp, Function, Inst, MirType, Op, Terminator, ValueId,
+    BasicBlock, BinOp, BlockId, CastKind, CmpOp, Function, Inst, MirType, Op, Terminator, ValueId,
 };
 
 use crate::fxhash::{FxHashMap, FxHashSet};
-use crate::loop_info::{self, IvStep, LoopForest, NaturalLoop, Stages};
+use crate::loop_info::{self, IvStep, LoopForest, LoopId, NaturalLoop, Stages};
 use crate::{each_op_use, each_term_use, map_op_uses, map_term_uses, CfgAnalyses, Pass};
 
 /// The largest loop, in instructions, worth duplicating.
@@ -136,10 +151,161 @@ struct SplitPlan {
     end: Avail,
     guard: ValueId,
     kind: GuardKind,
+    /// What the guard compares against. For a [`DerivedGuard`] it has the compare's type.
     inv: Avail,
+    /// `Some` when the guard tests a quantity derived from the induction variable rather than the
+    /// induction variable itself (see [`DerivedGuard`]).
+    derived: Option<DerivedGuard>,
     /// Loop values the side-exit blocks read directly, to be passed as edge arguments instead
     /// (see [`exit_routes`]).
     routes: Vec<(u32, Vec<ValueId>)>,
+}
+
+/// A guard `ext(iv ± k) ⋈ n` on a quantity derived from the induction variable: a stencil's
+/// `i + 1 < n`, the tile edge `jo + j < n` with `jo` the enclosing loop's counter, a counter widened
+/// to the bound's type (`sext(j) < n`), or the counter read with the other signedness than its exit
+/// test (`(i as u64) < m`). [`plan_derived`] admits one only after proving that `iv ± k` never wraps
+/// on an iteration the loop runs, which is what makes the guard monotone; [`derived_split_point`]
+/// then computes where it changes without any intermediate that can overflow.
+#[derive(Clone)]
+struct DerivedGuard {
+    /// The loop-invariant addend, and whether it is subtracted. `None` for the bare counter.
+    k: Option<(Avail, bool)>,
+    /// The widening into the compare's type, when the compare is wider than the counter.
+    ext: Option<CastKind>,
+    /// The compare's operand type (the counter's type when `ext` is `None`).
+    wty: MirType,
+    /// The compare's signedness, which may differ from the exit test's.
+    signed: bool,
+}
+
+/// An enclosing loop's induction variable, with the facts that bound the values it takes: it starts
+/// at `start`, steps by `step > 0`, and the enclosing loop's header leaves unless `value < bound`
+/// (`signed` is that compare's signedness). See [`Ranges`].
+#[derive(Clone, Copy)]
+struct OuterIv {
+    value: ValueId,
+    start: ValueId,
+    step: i64,
+    bound: ValueId,
+    signed: bool,
+}
+
+/// How deep [`Ranges::known`] follows operands.
+const RANGE_DEPTH: u32 = 8;
+
+/// The width of an integer type in bits.
+fn int_bits(ty: &MirType) -> Option<u32> {
+    Some(match ty {
+        MirType::I1 => 1,
+        MirType::I8 => 8,
+        MirType::I16 => 16,
+        MirType::I32 => 32,
+        MirType::I64 => 64,
+        _ => return None,
+    })
+}
+
+/// The values a `bits`-wide integer can hold under its signed or unsigned reading.
+fn type_bounds(bits: u32, signed: bool) -> (i128, i128) {
+    if signed {
+        (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+    } else {
+        (0, (1i128 << bits) - 1)
+    }
+}
+
+/// The integer a constant's low `bits` bits denote under the given reading.
+fn interpret(n: i128, bits: u32, signed: bool) -> i128 {
+    let m = n & ((1i128 << bits) - 1);
+    if signed && m >= (1i128 << (bits - 1)) {
+        m - (1i128 << bits)
+    } else {
+        m
+    }
+}
+
+/// Integer value ranges, just strong enough to prove that `iv ± k` cannot wrap: constants,
+/// sign/zero extension, `add`/`sub`/`mul`/`and` without wrap, and the induction variables of the
+/// enclosing loops (whose header test bounds them). Every answer is an exact interval of integers
+/// under the requested reading of the value's type, and a sound over-approximation of every value
+/// the instruction can produce; an operation that could wrap answers "unknown", never a range.
+struct Ranges<'a> {
+    f: &'a Function,
+    defs: &'a [Option<(usize, usize)>],
+    outer: &'a [OuterIv],
+}
+
+impl Ranges<'_> {
+    /// [`Ranges::known`], or the whole type when nothing better is known.
+    fn or_full(&self, v: ValueId, signed: bool, depth: u32) -> Option<(i128, i128)> {
+        let bits = int_bits(self.f.value_type(v))?;
+        Some(
+            self.known(v, signed, depth)
+                .unwrap_or_else(|| type_bounds(bits, signed)),
+        )
+    }
+
+    fn known(&self, v: ValueId, signed: bool, depth: u32) -> Option<(i128, i128)> {
+        if depth > RANGE_DEPTH {
+            return None;
+        }
+        let bits = int_bits(self.f.value_type(v))?;
+        let (min, max) = type_bounds(bits, signed);
+        let fits = |r: (i128, i128)| (r.0 <= r.1 && r.0 >= min && r.1 <= max).then_some(r);
+        if let Some(o) = self.outer.iter().find(|o| o.value == v) {
+            // Every value is `start` or `p + step` for a `p < bound` (the latch is reached only
+            // through the header's staying arm), so nothing wraps while `bound - 1 + step` fits.
+            let (lo, hi_start) = self.or_full(o.start, o.signed, depth + 1)?;
+            let (_, hi_bound) = self.or_full(o.bound, o.signed, depth + 1)?;
+            let top = hi_bound - 1 + i128::from(o.step);
+            if top > type_bounds(bits, o.signed).1 {
+                return None;
+            }
+            return fits((lo, hi_start.max(top)));
+        }
+        let (bi, ii) = (*self.defs.get(v.0 as usize)?)?;
+        let d = depth + 1;
+        match &self.f.blocks[bi].insts[ii].op {
+            Op::ConstInt(n, _) => {
+                let x = interpret(*n, bits, signed);
+                Some((x, x))
+            }
+            // A sign extension keeps the signed value; read unsigned it is that value only when it
+            // is not negative (`fits` checks `min = 0`).
+            Op::Cast(CastKind::SExt, a, _) => fits(self.known(*a, true, d)?),
+            // A zero extension keeps the unsigned value, which the wider type holds either way.
+            Op::Cast(CastKind::ZExt, a, _) => fits(self.known(*a, false, d)?),
+            Op::Bin(BinOp::Add, a, b) => {
+                let (x, y) = (self.known(*a, signed, d)?, self.known(*b, signed, d)?);
+                fits((x.0 + y.0, x.1 + y.1))
+            }
+            Op::Bin(BinOp::Sub, a, b) => {
+                let (x, y) = (self.known(*a, signed, d)?, self.known(*b, signed, d)?);
+                fits((x.0 - y.1, x.1 - y.0))
+            }
+            Op::Bin(BinOp::Mul, a, b) => {
+                let (x, y) = (self.known(*a, signed, d)?, self.known(*b, signed, d)?);
+                let c = [
+                    x.0.checked_mul(y.0)?,
+                    x.0.checked_mul(y.1)?,
+                    x.1.checked_mul(y.0)?,
+                    x.1.checked_mul(y.1)?,
+                ];
+                fits((*c.iter().min()?, *c.iter().max()?))
+            }
+            // `a & b` is at most either operand when that operand is not negative.
+            Op::Bin(BinOp::And, a, b) => {
+                let nonneg = |r: Option<(i128, i128)>| r.filter(|r| r.0 >= 0).map(|r| r.1);
+                let caps = [
+                    nonneg(self.known(*a, signed, d)),
+                    nonneg(self.known(*b, signed, d)),
+                ];
+                fits((0, caps.iter().flatten().copied().min()?))
+            }
+            _ => None,
+        }
+    }
 }
 
 struct UnswitchPlan {
@@ -265,6 +431,7 @@ fn pick(f: &Function, mut forest: LoopForest) -> Option<Plan> {
             }
         }
         loop_info::analyze_one(f, &mut forest, idx, Stages::Ivs);
+        let outer = outer_ivs(f, &defs, &mut forest, id);
         let l = forest.get(id);
         let in_loop: FxHashSet<u32> = l.blocks.iter().map(|b| b.0).collect();
         let mut defined: FxHashSet<u32> = FxHashSet::default();
@@ -273,7 +440,12 @@ fn pick(f: &Function, mut forest: LoopForest) -> Option<Plan> {
             defined.extend(blk.params.iter().map(|p| p.0));
             defined.extend(blk.insts.iter().filter_map(|i| i.result.map(|r| r.0)));
         }
-        if let Some(p) = plan_split(f, l, &defs, &in_loop, &defined) {
+        let ranges = Ranges {
+            f,
+            defs: &defs,
+            outer: &outer,
+        };
+        if let Some(p) = plan_split(f, l, &defs, &in_loop, &defined, &ranges) {
             return Some(Plan::Split(p));
         }
         if let Some(p) = plan_unswitch(f, l, &defs, &in_loop, &defined) {
@@ -281,6 +453,57 @@ fn pick(f: &Function, mut forest: LoopForest) -> Option<Plan> {
         }
     }
     None
+}
+
+/// The induction variables of the loops enclosing `id` that [`Ranges`] can bound: a positive
+/// constant step, a known start, and a header that leaves on the false arm of `iv < bound`.
+fn outer_ivs(
+    f: &Function,
+    defs: &[Option<(usize, usize)>],
+    forest: &mut LoopForest,
+    id: LoopId,
+) -> Vec<OuterIv> {
+    let mut out = Vec::new();
+    let mut cur = forest.get(id).parent;
+    while let Some(p) = cur {
+        loop_info::analyze_one(f, forest, p.0 as usize, Stages::Ivs);
+        let l = forest.get(p);
+        cur = l.parent;
+        let Terminator::CondBr {
+            cond,
+            then_blk,
+            else_blk,
+            ..
+        } = &f.block(l.header).term
+        else {
+            continue;
+        };
+        if !l.blocks.contains(then_blk) || l.blocks.contains(else_blk) {
+            continue;
+        }
+        let Some(Op::Cmp(pred @ (CmpOp::Slt | CmpOp::Ult), a, bound)) = op_of(f, defs, *cond)
+        else {
+            continue;
+        };
+        for iv in &l.ivs {
+            if iv.value != *a {
+                continue;
+            }
+            let (Some(start), IvStep::Const(step)) = (iv.start, iv.step) else {
+                continue;
+            };
+            if step > 0 {
+                out.push(OuterIv {
+                    value: iv.value,
+                    start,
+                    step,
+                    bound: *bound,
+                    signed: *pred == CmpOp::Slt,
+                });
+            }
+        }
+    }
+    out
 }
 
 /// `v` as something the preheader can read (see [`Avail`]).
@@ -321,6 +544,7 @@ fn plan_split(
     defs: &[Option<(usize, usize)>],
     in_loop: &FxHashSet<u32>,
     defined: &FxHashSet<u32>,
+    ranges: &Ranges<'_>,
 ) -> Option<SplitPlan> {
     let iv = l.primary()?;
     if iv.step != IvStep::Const(1) || !iv.ty.is_int() || iv.ty == MirType::I1 {
@@ -367,6 +591,10 @@ fn plan_split(
         _ => return None,
     };
     let end = avail(f, defs, defined, *end)?;
+    let Terminator::Br { args, .. } = &f.block(preheader).term else {
+        return None;
+    };
+    let start = *args.get(iv.param_index)?;
     for b in &l.blocks {
         if *b == l.header {
             continue;
@@ -395,27 +623,23 @@ fn plan_split(
             if !defined.contains(&v.0) || (v != *g && g_in_header) {
                 continue;
             }
-            let Some(Op::Cmp(p, x, y)) = op_of(f, defs, v) else {
-                continue;
-            };
-            let (p, other) = if *x == iv.value && *y != iv.value {
-                (*p, *y)
-            } else if *y == iv.value && *x != iv.value {
-                let Some(sp) = swapped(*p) else {
-                    continue;
-                };
-                (sp, *x)
-            } else {
-                continue;
-            };
-            let kind = match (signed, p) {
-                (true, CmpOp::Slt) | (false, CmpOp::Ult) => GuardKind::Lt,
-                (true, CmpOp::Sle) | (false, CmpOp::Ule) => GuardKind::Le,
-                (true, CmpOp::Sgt) | (false, CmpOp::Ugt) => GuardKind::Gt,
-                (true, CmpOp::Sge) | (false, CmpOp::Uge) => GuardKind::Ge,
-                _ => continue,
-            };
-            let Some(inv) = avail(f, defs, defined, other) else {
+            let found = plain_guard(f, defs, defined, iv.value, signed, v)
+                .map(|(kind, inv)| (kind, inv, None))
+                .or_else(|| {
+                    let cx = DerivedCx {
+                        f,
+                        defs,
+                        defined,
+                        ranges,
+                        iv: iv.value,
+                        ty: &iv.ty,
+                        exit_signed: signed,
+                        start,
+                        end,
+                    };
+                    plan_derived(&cx, v).map(|(kind, inv, d)| (kind, inv, Some(d)))
+                });
+            let Some((kind, inv, derived)) = found else {
                 continue;
             };
             return Some(SplitPlan {
@@ -429,11 +653,181 @@ fn plan_split(
                 guard: v,
                 kind,
                 inv,
+                derived,
                 routes,
             });
         }
     }
     None
+}
+
+/// `iv ⋈ inv` with the exit test's signedness: the guard on the induction variable itself.
+fn plain_guard(
+    f: &Function,
+    defs: &[Option<(usize, usize)>],
+    defined: &FxHashSet<u32>,
+    iv: ValueId,
+    signed: bool,
+    v: ValueId,
+) -> Option<(GuardKind, Avail)> {
+    let Some(Op::Cmp(p, x, y)) = op_of(f, defs, v) else {
+        return None;
+    };
+    let (p, other) = if *x == iv && *y != iv {
+        (*p, *y)
+    } else if *y == iv && *x != iv {
+        (swapped(*p)?, *x)
+    } else {
+        return None;
+    };
+    let kind = match (signed, p) {
+        (true, CmpOp::Slt) | (false, CmpOp::Ult) => GuardKind::Lt,
+        (true, CmpOp::Sle) | (false, CmpOp::Ule) => GuardKind::Le,
+        (true, CmpOp::Sgt) | (false, CmpOp::Ugt) => GuardKind::Gt,
+        (true, CmpOp::Sge) | (false, CmpOp::Uge) => GuardKind::Ge,
+        _ => return None,
+    };
+    Some((kind, avail(f, defs, defined, other)?))
+}
+
+/// What [`plan_derived`] needs to know about the loop being split.
+struct DerivedCx<'a> {
+    f: &'a Function,
+    defs: &'a [Option<(usize, usize)>],
+    defined: &'a FxHashSet<u32>,
+    ranges: &'a Ranges<'a>,
+    iv: ValueId,
+    ty: &'a MirType,
+    exit_signed: bool,
+    /// The induction variable's start (the preheader's argument) and the exit test's bound.
+    start: ValueId,
+    end: Avail,
+}
+
+/// A guard `ext(iv ± k) ⋈ n` (see [`DerivedGuard`]), when it is monotone along the iterations.
+///
+/// Iteration `t` of the loop runs with `iv = start + t`, exactly (the header admits it only below
+/// `end`, so the increment never wraps). The guard is monotone when `x = iv ± k` never wraps either,
+/// in the reading the comparison sees it with: then `x` also grows by exactly one per iteration, and
+/// a sign extension (signed reading) or zero extension (unsigned reading) carries that exact value
+/// into the compare's type. So the proof obligation is one interval check: over the values `iv`
+/// takes while the body runs (`[start, end - 1]` in the exit test's reading) and the values `k` can
+/// have, `iv ± k` stays inside the type. Where the two readings differ -- a signed counter compared
+/// unsigned, or the reverse; a sign-extended counter compared unsigned -- the values must also be
+/// non-negative, where both readings agree. An `i64` counter tested against a `usize` bound
+/// (`(i as u64) < m`) therefore splits only when its start is proved non-negative, and a guard
+/// whose range is not proved declines: wrap would make it non-monotone, and no split point is
+/// right for a guard that changes twice.
+fn plan_derived(cx: &DerivedCx<'_>, v: ValueId) -> Option<(GuardKind, Avail, DerivedGuard)> {
+    let (f, defs, defined) = (cx.f, cx.defs, cx.defined);
+    let Some(Op::Cmp(p, a, b)) = op_of(f, defs, v) else {
+        return None;
+    };
+    // The derived side on the left, the invariant on the right.
+    let (p, d, n) = match (avail(f, defs, defined, *a), avail(f, defs, defined, *b)) {
+        (None, Some(n)) => (*p, *a, n),
+        (Some(n), None) => (swapped(*p)?, *b, n),
+        _ => return None,
+    };
+    let (gsigned, kind) = match p {
+        CmpOp::Slt => (true, GuardKind::Lt),
+        CmpOp::Sle => (true, GuardKind::Le),
+        CmpOp::Sgt => (true, GuardKind::Gt),
+        CmpOp::Sge => (true, GuardKind::Ge),
+        CmpOp::Ult => (false, GuardKind::Lt),
+        CmpOp::Ule => (false, GuardKind::Le),
+        CmpOp::Ugt => (false, GuardKind::Gt),
+        CmpOp::Uge => (false, GuardKind::Ge),
+        _ => return None,
+    };
+    let wty = f.value_type(d).clone();
+    let (x, ext) = match op_of(f, defs, d) {
+        Some(Op::Cast(k @ (CastKind::SExt | CastKind::ZExt), x, _)) => (*x, Some(*k)),
+        _ => (d, None),
+    };
+    if f.value_type(x) != cx.ty {
+        return None;
+    }
+    let (tb, wb) = (int_bits(cx.ty)?, int_bits(&wty)?);
+    if ext.is_some() && wb <= tb {
+        return None;
+    }
+    let k = if x == cx.iv {
+        None
+    } else {
+        let addend = |k: ValueId| {
+            if k == cx.iv {
+                None
+            } else {
+                avail(f, defs, defined, k)
+            }
+        };
+        match op_of(f, defs, x)? {
+            Op::Bin(BinOp::Add, a, b) if *a == cx.iv => Some((addend(*b)?, false)),
+            Op::Bin(BinOp::Add, a, b) if *b == cx.iv => Some((addend(*a)?, false)),
+            Op::Bin(BinOp::Sub, a, b) if *a == cx.iv => Some((addend(*b)?, true)),
+            _ => return None,
+        }
+    };
+    // The plain guard on the counter itself is `plain_guard`'s.
+    if ext.is_none() && k.is_none() && gsigned == cx.exit_signed {
+        return None;
+    }
+
+    // The reading `x` is compared in: the extension's, or the compare's own.
+    let sx = match ext {
+        Some(CastKind::SExt) => true,
+        Some(_) => false,
+        None => gsigned,
+    };
+    let lo_iv = cx.ranges.or_full(cx.start, cx.exit_signed, 0)?.0;
+    let hi_end = match cx.end {
+        Avail::Const(c) => interpret(c, tb, cx.exit_signed),
+        Avail::Outside(e) => cx.ranges.or_full(e, cx.exit_signed, 0)?.1,
+    };
+    let hi_iv = hi_end - 1;
+    if hi_iv < lo_iv {
+        return None; // the body never runs: nothing to gain
+    }
+    let smax = type_bounds(tb, true).1;
+    if sx != cx.exit_signed && (lo_iv < 0 || hi_iv > smax) {
+        return None;
+    }
+    let (xlo, xhi) = match k {
+        None => (lo_iv, hi_iv),
+        Some((k, sub)) => {
+            let (klo, khi) = match k {
+                Avail::Const(c) => {
+                    let c = interpret(c, tb, sx);
+                    (c, c)
+                }
+                Avail::Outside(kv) => cx.ranges.or_full(kv, sx, 0)?,
+            };
+            if sub {
+                (lo_iv - khi, hi_iv - klo)
+            } else {
+                (lo_iv + klo, hi_iv + khi)
+            }
+        }
+    };
+    let (min, max) = type_bounds(tb, sx);
+    if xlo < min || xhi > max {
+        return None; // `iv ± k` may wrap: the guard need not be monotone
+    }
+    // A sign-extended value compared unsigned is monotone only while it is not negative.
+    if ext == Some(CastKind::SExt) && !gsigned && xlo < 0 {
+        return None;
+    }
+    Some((
+        kind,
+        n,
+        DerivedGuard {
+            k,
+            ext,
+            wty,
+            signed: gsigned,
+        },
+    ))
 }
 
 fn plan_unswitch(
@@ -730,6 +1124,88 @@ fn materialize(f: &mut Function, out: &mut Vec<Inst>, a: Avail, ty: &MirType) ->
     }
 }
 
+/// The preheader values a split point is computed from: the induction variable's start, the exit
+/// test's bound, the guard's invariant side, and the exit test's predicate.
+#[derive(Clone, Copy)]
+struct SplitBounds {
+    start: ValueId,
+    end: ValueId,
+    inv: ValueId,
+    lt: CmpOp,
+}
+
+/// The first iteration where a [`DerivedGuard`] `x ⋈ n` changes, clamped into `[start, end]`.
+///
+/// With `x` growing by exactly one per iteration from `base = ext(start ± k)` (what
+/// [`plan_derived`] proved), the guard keeps its first value for `n - base` iterations (`<`, `>=`)
+/// or `n - base + 1` (`<=`, `>`), and for none when `n` is already past `base`. Every quantity is
+/// formed so that it cannot overflow: `n - base` is taken only when `n` is not below `base`, where
+/// it is an exact unsigned count of the compare's width, and it is compared with the trip count
+/// `end - start` (exact unsigned, since `start < end`) before anything is added to `start`. An empty
+/// range splits at `start`.
+fn derived_split_point(
+    f: &mut Function,
+    out: &mut Vec<Inst>,
+    d: &DerivedGuard,
+    kind: GuardKind,
+    b: SplitBounds,
+) -> ValueId {
+    let ity = f.value_type(b.start).clone();
+    let wty = d.wty.clone();
+    let x0 = match d.k {
+        None => b.start,
+        Some((k, sub)) => {
+            let kv = materialize(f, out, k, &ity);
+            let op = if sub { BinOp::Sub } else { BinOp::Add };
+            emit(f, out, ity.clone(), Op::Bin(op, b.start, kv))
+        }
+    };
+    let base = match d.ext {
+        None => x0,
+        Some(kind) => emit(f, out, wty.clone(), Op::Cast(kind, x0, wty.clone())),
+    };
+    // `<=` and `>` keep their first value one iteration longer than `<` and `>=`.
+    let extra = matches!(kind, GuardKind::Le | GuardKind::Gt);
+    let at_once = match (d.signed, extra) {
+        (true, false) => CmpOp::Sle,
+        (true, true) => CmpOp::Slt,
+        (false, false) => CmpOp::Ule,
+        (false, true) => CmpOp::Ult,
+    };
+    // The guard already has its second value on the first iteration.
+    let early = emit(f, out, MirType::I1, Op::Cmp(at_once, b.inv, base));
+    let dist = emit(f, out, wty.clone(), Op::Bin(BinOp::Sub, b.inv, base));
+    let trip = emit(f, out, ity.clone(), Op::Bin(BinOp::Sub, b.end, b.start));
+    let trip_w = match d.ext {
+        None => trip,
+        Some(_) => emit(
+            f,
+            out,
+            wty.clone(),
+            Op::Cast(CastKind::ZExt, trip, wty.clone()),
+        ),
+    };
+    let inside = emit(f, out, MirType::I1, Op::Cmp(CmpOp::Ult, dist, trip_w));
+    let dist_t = match d.ext {
+        None => dist,
+        Some(_) => emit(
+            f,
+            out,
+            ity.clone(),
+            Op::Cast(CastKind::Trunc, dist, ity.clone()),
+        ),
+    };
+    let mut at = emit(f, out, ity.clone(), Op::Bin(BinOp::Add, b.start, dist_t));
+    if extra {
+        let one = emit(f, out, ity.clone(), Op::ConstInt(1, ity.clone()));
+        at = emit(f, out, ity.clone(), Op::Bin(BinOp::Add, at, one));
+    }
+    let within = emit(f, out, ity.clone(), Op::Select(inside, at, b.end));
+    let split = emit(f, out, ity.clone(), Op::Select(early, b.start, within));
+    let runs = emit(f, out, MirType::I1, Op::Cmp(b.lt, b.start, b.end));
+    emit(f, out, ity, Op::Select(runs, split, b.start))
+}
+
 fn apply_split(f: &mut Function, p: SplitPlan) {
     route_exit_values(f, &p.routes);
     let ph = p.preheader.0 as usize;
@@ -740,17 +1216,28 @@ fn apply_split(f: &mut Function, p: SplitPlan) {
     let start = args[p.iv_index];
     let mut out = Vec::new();
     let end = materialize(f, &mut out, p.end, &ity);
-    let inv = materialize(f, &mut out, p.inv, &ity);
+    let inv_ty = p
+        .derived
+        .as_ref()
+        .map_or_else(|| ity.clone(), |d| d.wty.clone());
+    let inv = materialize(f, &mut out, p.inv, &inv_ty);
     let lt = if p.signed { CmpOp::Slt } else { CmpOp::Ult };
+    let bounds = SplitBounds {
+        start,
+        end,
+        inv,
+        lt,
+    };
     // The first iteration where the guard changes, clamped into [start, end].
-    let split = match p.kind {
-        GuardKind::Lt | GuardKind::Ge => {
+    let split = match (&p.derived, p.kind) {
+        (Some(d), kind) => derived_split_point(f, &mut out, d, kind, bounds),
+        (None, GuardKind::Lt | GuardKind::Ge) => {
             let inv_lt_end = emit(f, &mut out, MirType::I1, Op::Cmp(lt, inv, end));
             let lo = emit(f, &mut out, ity.clone(), Op::Select(inv_lt_end, inv, end));
             let lo_lt_start = emit(f, &mut out, MirType::I1, Op::Cmp(lt, lo, start));
             emit(f, &mut out, ity.clone(), Op::Select(lo_lt_start, start, lo))
         }
-        GuardKind::Le | GuardKind::Gt => {
+        (None, GuardKind::Le | GuardKind::Gt) => {
             let one = emit(f, &mut out, ity.clone(), Op::ConstInt(1, ity.clone()));
             let next = emit(f, &mut out, ity.clone(), Op::Bin(BinOp::Add, inv, one));
             let inv_lt_end = emit(f, &mut out, MirType::I1, Op::Cmp(lt, inv, end));
@@ -1361,5 +1848,392 @@ mod tests {
             assert_eq!(exit, 0);
             assert_eq!(String::from_utf8(stdout).unwrap(), expected, "O{level}");
         }
+    }
+
+    // ---- guards on quantities derived from the induction variable ----
+
+    /// What the guard of [`derived_loop`] tests, `j` being the counter and `n`, `k` parameters.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Derived {
+        /// `j + c ⋈ n`.
+        AddConst(i128),
+        /// `j - c ⋈ n`.
+        SubConst(i128),
+        /// `(k & 15) + j ⋈ n` -- a bounded invariant addend, the tile edge's shape.
+        AddMasked,
+        /// `k + j ⋈ n` with nothing known about `k`.
+        AddParam,
+        /// `sext(j) ⋈ sext(n)` in `i64`.
+        Sext,
+        /// `sext(j + 1) ⋈ sext(n)` in `i64`.
+        SextAddOne,
+        /// `j ⋈ n` with the other signedness than the exit test.
+        Mixed,
+    }
+
+    /// Where [`derived_loop`]'s counter starts and stops.
+    #[derive(Clone, Copy, Debug)]
+    enum Bound {
+        Const(i128),
+        /// The third parameter `e`.
+        Param,
+    }
+
+    /// `f(n, k, e) -> i32`: `for j in start..end` (`exit` the header's predicate), updating an
+    /// order-dependent accumulator when the derived guard holds.
+    ///
+    /// ```text
+    ///   entry: km = k & 15; n64 = sext n; br H(start, 7)
+    ///   H(j, acc):  cond_br (j <exit end), B, X(acc)
+    ///   B:          x = <shape>; cond_br (x ⋈ n), T, L(acc)
+    ///   T:          br L(acc * 3 + j)
+    ///   L(p):       br H(j + 1, p)
+    ///   X(r):       ret r
+    /// ```
+    fn derived_loop(
+        it: &mut Interner,
+        exit: CmpOp,
+        pred: CmpOp,
+        shape: Derived,
+        start: Bound,
+        end: Bound,
+        swap: bool,
+    ) -> Function {
+        let mut b = Builder::new(it.intern("f"), MirType::I32);
+        let n = b.add_param(MirType::I32);
+        let k = b.add_param(MirType::I32);
+        let e = b.add_param(MirType::I32);
+        let fifteen = b.build(MirType::I32, Op::ConstInt(15, MirType::I32));
+        let km = b.build(MirType::I32, Op::Bin(BinOp::And, k, fifteen));
+        let n64 = b.build(MirType::I64, Op::Cast(CastKind::SExt, n, MirType::I64));
+        let seven = b.build(MirType::I32, Op::ConstInt(7, MirType::I32));
+        let bound = |b: &mut Builder, x: Bound| match x {
+            Bound::Const(c) => b.build(MirType::I32, Op::ConstInt(c, MirType::I32)),
+            Bound::Param => e,
+        };
+        let s = bound(&mut b, start);
+        let end_v = bound(&mut b, end);
+        let h = b.new_block();
+        let j = b.block_param(h, MirType::I32);
+        let acc = b.block_param(h, MirType::I32);
+        let body = b.new_block();
+        let then = b.new_block();
+        let latch = b.new_block();
+        let p = b.block_param(latch, MirType::I32);
+        let exit_blk = b.new_block();
+        let r = b.block_param(exit_blk, MirType::I32);
+        b.br(h, vec![s, seven]);
+        b.switch_to(h);
+        let c = b.build(MirType::I1, Op::Cmp(exit, j, end_v));
+        b.cond_br(c, body, vec![], exit_blk, vec![acc]);
+        b.switch_to(body);
+        let konst = |b: &mut Builder, c: i128| b.build(MirType::I32, Op::ConstInt(c, MirType::I32));
+        let (x, rhs) = match shape {
+            Derived::AddConst(c) => {
+                let cv = konst(&mut b, c);
+                (b.build(MirType::I32, Op::Bin(BinOp::Add, j, cv)), n)
+            }
+            Derived::SubConst(c) => {
+                let cv = konst(&mut b, c);
+                (b.build(MirType::I32, Op::Bin(BinOp::Sub, j, cv)), n)
+            }
+            Derived::AddMasked => (b.build(MirType::I32, Op::Bin(BinOp::Add, km, j)), n),
+            Derived::AddParam => (b.build(MirType::I32, Op::Bin(BinOp::Add, k, j)), n),
+            Derived::Sext => (
+                b.build(MirType::I64, Op::Cast(CastKind::SExt, j, MirType::I64)),
+                n64,
+            ),
+            Derived::SextAddOne => {
+                let one = konst(&mut b, 1);
+                let j1 = b.build(MirType::I32, Op::Bin(BinOp::Add, j, one));
+                (
+                    b.build(MirType::I64, Op::Cast(CastKind::SExt, j1, MirType::I64)),
+                    n64,
+                )
+            }
+            Derived::Mixed => (j, n),
+        };
+        let g = if swap {
+            b.build(MirType::I1, Op::Cmp(swapped(pred).unwrap(), rhs, x))
+        } else {
+            b.build(MirType::I1, Op::Cmp(pred, x, rhs))
+        };
+        b.cond_br(g, then, vec![], latch, vec![acc]);
+        b.switch_to(then);
+        let three = konst(&mut b, 3);
+        let m = b.build(MirType::I32, Op::Bin(BinOp::Mul, acc, three));
+        let sum = b.build(MirType::I32, Op::Bin(BinOp::Add, m, j));
+        b.br(latch, vec![sum]);
+        b.switch_to(latch);
+        let one = konst(&mut b, 1);
+        let j2 = b.build(MirType::I32, Op::Bin(BinOp::Add, j, one));
+        b.br(h, vec![j2, p]);
+        b.switch_to(exit_blk);
+        b.ret(Some(r));
+        b.finish()
+    }
+
+    /// Every `(n, k, e)`: `n` before, inside and past the range and at the type's extremes, `k`
+    /// negative and positive, `e` empty, short and full.
+    fn derived_grid() -> Vec<(i128, i128, i128)> {
+        let ns: &[i128] = &[
+            -2147483648,
+            -2147483647,
+            -5,
+            -1,
+            0,
+            1,
+            3,
+            7,
+            11,
+            12,
+            13,
+            20,
+            2147483646,
+            2147483647,
+        ];
+        let mut g = Vec::new();
+        for &n in ns {
+            for k in [-3, 0, 5, 37] {
+                for e in [0, 9, 12] {
+                    g.push((n, k, e));
+                }
+            }
+        }
+        g
+    }
+
+    fn cond_branches(f: &Function) -> usize {
+        f.blocks
+            .iter()
+            .filter(|b| matches!(b.term, Terminator::CondBr { .. }))
+            .count()
+    }
+
+    /// The unsigned predicate with the same shape as a signed one, and back.
+    fn other_signedness(p: CmpOp) -> CmpOp {
+        use CmpOp::*;
+        match p {
+            Slt => Ult,
+            Sle => Ule,
+            Sgt => Ugt,
+            Sge => Uge,
+            Ult => Slt,
+            Ule => Sle,
+            Ugt => Sgt,
+            Uge => Sge,
+            other => other,
+        }
+    }
+
+    /// Guards on `j ± c`, `(k & 15) + j`, `sext(j)`, `sext(j + 1)`, and `j` read with the other
+    /// signedness, under both exit signednesses and all four predicates (and with the operands
+    /// exchanged): each splits, the copies' bodies lose the guard, and every answer is unchanged --
+    /// including invariants at the type's extremes, where a split point computed carelessly
+    /// overflows.
+    #[test]
+    fn derived_guards_split_and_keep_every_answer() {
+        use CmpOp::*;
+        let inputs = derived_grid();
+        let shapes = [
+            Derived::AddConst(1),
+            Derived::AddConst(3),
+            Derived::SubConst(2),
+            Derived::AddMasked,
+            Derived::Sext,
+            Derived::SextAddOne,
+            Derived::Mixed,
+        ];
+        for exit in [Slt, Ult] {
+            for shape in shapes {
+                // `j - 2` read unsigned wraps below 2: that one is the decline test's.
+                if exit == Ult && shape == Derived::SubConst(2) {
+                    continue;
+                }
+                for base in [Slt, Sle, Sgt, Sge] {
+                    // The guard's own signedness: the exit test's, except for the mixed shape.
+                    let same = if exit == Ult {
+                        other_signedness(base)
+                    } else {
+                        base
+                    };
+                    let pred = if shape == Derived::Mixed {
+                        other_signedness(same)
+                    } else if matches!(shape, Derived::Sext | Derived::SextAddOne) {
+                        base // compared in i64, signed: the sign extension's own reading
+                    } else {
+                        same
+                    };
+                    for swap in [false, true] {
+                        let mut it = Interner::new();
+                        let mut f = derived_loop(
+                            &mut it,
+                            exit,
+                            pred,
+                            shape,
+                            Bound::Const(0),
+                            Bound::Const(12),
+                            swap,
+                        );
+                        let tag = format!("{exit:?}/{shape:?}/{pred:?}/swap={swap}");
+                        let before = run3(&f, &mut it, &inputs);
+                        assert!(
+                            LoopUnswitch.run_function(&mut f, &mut CfgAnalyses::default()),
+                            "{tag}: the derived guard is splittable\n{}",
+                            wukong_mir::print::print_function(&f, &it)
+                        );
+                        assert!(wukong_mir::verify::verify_function(&f).is_empty(), "{tag}");
+                        assert_eq!(run3(&f, &mut it, &inputs), before, "{tag}");
+                        cleanup(&mut f);
+                        assert_eq!(
+                            cond_branches(&f),
+                            2,
+                            "{tag}: only the two exit tests remain\n{}",
+                            wukong_mir::print::print_function(&f, &it)
+                        );
+                        assert_eq!(run3(&f, &mut it, &inputs), before, "{tag}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Against a runtime bound `e` nothing caps the counter below the type's top except the exit
+    /// test itself, which keeps `j + 1` from wrapping (`j <= e - 1`): the stencil guard `j + 1 ⋈ n`
+    /// splits, and the answers hold for every `e`.
+    #[test]
+    fn a_unit_addend_splits_against_a_runtime_bound() {
+        use CmpOp::*;
+        let inputs = derived_grid();
+        for pred in [Slt, Sle, Sgt, Sge] {
+            let mut it = Interner::new();
+            let mut f = derived_loop(
+                &mut it,
+                Slt,
+                pred,
+                Derived::AddConst(1),
+                Bound::Const(0),
+                Bound::Param,
+                false,
+            );
+            let before = run3(&f, &mut it, &inputs);
+            assert!(
+                LoopUnswitch.run_function(&mut f, &mut CfgAnalyses::default()),
+                "{pred:?}: `j + 1` cannot wrap below a runtime bound"
+            );
+            assert!(wukong_mir::verify::verify_function(&f).is_empty());
+            assert_eq!(run3(&f, &mut it, &inputs), before, "{pred:?}");
+            cleanup(&mut f);
+            assert_eq!(cond_branches(&f), 2, "{pred:?}");
+            assert_eq!(run3(&f, &mut it, &inputs), before, "{pred:?}");
+        }
+    }
+
+    /// Guards whose derived quantity may wrap -- so they may change twice along the iterations --
+    /// are left alone: `j + 3` below a runtime bound (`j = e - 1` near the top wraps), `j - 2` from
+    /// a runtime start (near the bottom), `k + j` with nothing known about `k`, and a signed counter
+    /// read unsigned from a start that may be negative (the "`i64` index against a `usize` bound"
+    /// case). With the start a non-negative constant the mixed guard does split (the test above).
+    #[test]
+    fn derived_guards_that_may_wrap_are_not_split() {
+        use CmpOp::*;
+        let cases = [
+            (Slt, Derived::AddConst(3), Bound::Const(0), Bound::Param),
+            (Slt, Derived::SubConst(2), Bound::Param, Bound::Const(12)),
+            (Slt, Derived::AddParam, Bound::Const(0), Bound::Const(12)),
+            (Ult, Derived::Mixed, Bound::Param, Bound::Const(12)),
+            (
+                Ult,
+                Derived::AddConst(-1),
+                Bound::Const(0),
+                Bound::Const(12),
+            ),
+        ];
+        for (pred, shape, start, end) in cases {
+            let mut it = Interner::new();
+            // `start = Param` reuses `e`; the test only asks whether the pass fires.
+            let mut f = derived_loop(&mut it, Slt, pred, shape, start, end, false);
+            assert!(
+                !LoopUnswitch.run_function(&mut f, &mut CfgAnalyses::default()),
+                "{shape:?}/{pred:?}: a guard that may wrap must not be split\n{}",
+                wukong_mir::print::print_function(&f, &it)
+            );
+        }
+    }
+
+    /// From source, the tile-edge guard `jo + j < n` of a strip-mined loop: `jo` is the enclosing
+    /// loop's counter (stepping by 8 below 24, so `jo + j` stays small), the inner loop splits at
+    /// `n - jo`, and no compare against `n` is left in any innermost loop. Every level prints the
+    /// lanes the scalar loop says.
+    #[test]
+    fn source_tile_edge_guard_splits_on_the_enclosing_counter() {
+        let src = concat!(
+            "fn tile(mut out: [i32; 24], n: i64) { for jo in 0..24 step 8 { for j in 0..8 { ",
+            "if jo + j < n { out[jo + j] = (jo + j) * 2 + 1; } } } }\n",
+            "fn main() -> i32 { let mut out: [i32; 24] = [0; 24]; ",
+            "let ns: [i64; 6] = [0 - 4, 0, 5, 13, 24, 30]; ",
+            "for t in 0..6 { for i in 0..24 { out[i] = 0 - 1; } tile(out, ns[t]); ",
+            "for i in 0..24 { print(out[i]); } } return 0; }\n",
+        );
+        let mut interner = Interner::new();
+        let (module, parse) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(parse.iter().all(|d| !d.is_error()), "{parse:?}");
+        let (sema, check) = wukong_sema::check(&module, &interner);
+        assert!(check.iter().all(|d| !d.is_error()), "{check:?}");
+        let (program, lower) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        assert!(lower.iter().all(|d| !d.is_error()), "{lower:?}");
+        let mut expected = String::new();
+        for n in [-4i64, 0, 5, 13, 24, 30] {
+            for i in 0..24i64 {
+                let v = if i < n { i * 2 + 1 } else { -1 };
+                expected.push_str(&format!("{v}\n"));
+            }
+        }
+        let main = interner.intern("main");
+        for level in [0u8, 1, 2] {
+            let mut optimized = program.clone();
+            crate::optimize(&mut optimized, level);
+            assert!(wukong_mir::verify::verify_program(&optimized).is_empty());
+            let (exit, stdout) =
+                wukong_interp::run_with_output(&optimized, main, &interner).unwrap();
+            assert_eq!(exit, 0);
+            assert_eq!(String::from_utf8(stdout).unwrap(), expected, "O{level}");
+        }
+        // The function on its own (no inlining), through the -O2 fixpoint.
+        let mut optimized = program.clone();
+        crate::PassManager::standard(2).run(&mut optimized);
+        let tile = optimized.function(interner.intern("tile")).unwrap();
+        let n = tile.blocks[tile.entry.0 as usize].params[1];
+        let forest = crate::loop_info::analyze_function(tile);
+        let mut innermost = 0;
+        let mut inner_blocks = FxHashSet::default();
+        for l in forest.loops.iter().filter(|l| l.children.is_empty()) {
+            innermost += 1;
+            inner_blocks.extend(l.blocks.iter().map(|b| b.0));
+            for b in &l.blocks {
+                for inst in &tile.block(*b).insts {
+                    let reads_n = matches!(inst.op, Op::Cmp(_, x, y) if x == n || y == n);
+                    assert!(
+                        !reads_n,
+                        "an innermost loop still tests the edge:\n{}",
+                        wukong_mir::print::print_function(tile, &interner)
+                    );
+                }
+            }
+        }
+        // The half of the split where the guard is false stores nothing, so loop deletion removes
+        // it; what proves the split is the split point's own test of `n` in the inner preheader.
+        assert!(innermost >= 1);
+        let split_point_reads_n = tile.blocks.iter().any(|b| {
+            !inner_blocks.contains(&b.id.0)
+                && b.insts
+                    .iter()
+                    .any(|i| matches!(i.op, Op::Cmp(_, x, y) if x == n || y == n))
+        });
+        assert!(
+            split_point_reads_n,
+            "{}",
+            wukong_mir::print::print_function(tile, &interner)
+        );
     }
 }
