@@ -852,3 +852,62 @@ fn nested(x: [f32; 64], mut o: [f32; 64], mut t: [f32; 4]) {
         "attributed to the inner loop"
     );
 }
+
+// ---- P12.4: a multi-statement `@parallel` function selects every row/column arm's `_parallel` twin
+
+/// The vehicle every `tests/run/cov4_par_*.wk` fixture relies on, pinned structurally: a `@parallel`
+/// function whose body is more than one statement is not outlined (`parallel_spec` wants exactly one
+/// loop), so it is lowered whole with `parallel_fn` set and each recognizer arm in `lower_for`
+/// emits its `_parallel` kernel. The same nests in a plain function emit the serial kernels, so the
+/// twin choice — not the recognition — is what this pins. If the outliner ever starts taking
+/// multi-statement bodies, or an arm hardcodes its serial symbol, this fails by family instead of
+/// the corpus silently losing its only witnesses for those `_parallel` entries.
+#[test]
+fn a_multi_statement_parallel_fn_selects_the_parallel_twin_of_each_arm() {
+    let body = "
+    for j in 0..40 {
+        let mut a: f32 = 0.0;
+        for i in 0..3 { a = a + x[i * 40 + j]; }
+        cs[j] = a;
+    }
+    for r in 0..3 {
+        let mut acc: f32 = 0.0;
+        for i in 0..40 { acc = acc + x[r * 40 + i]; sc[r * 40 + i] = acc; }
+    }
+    for r in 0..3 {
+        let mut bv: f32 = x[r * 40];
+        let mut bi: i32 = 0;
+        for j in 1..40 { if x[r * 40 + j] > bv { bv = x[r * 40 + j]; bi = j; } }
+        am[r] = bi;
+    }
+    for i in 0..3 {
+        for j in 0..40 { tr[j * 3 + i] = x[i * 40 + j]; }
+    }
+";
+    let sig = "(x: [f32; 120], mut cs: [f32; 40], mut sc: [f32; 120], mut am: [i32; 3], \
+               mut tr: [f32; 120])";
+    let src = format!("module m\n@parallel\nfn par{sig} {{{body}}}\nfn ser{sig} {{{body}}}\n");
+    let (prog, _, interner) = lower_src(&src);
+    let serial = [
+        "wukong_colsum_f32",
+        "wukong_cumsum_f32",
+        "wukong_rowargmax_i32",
+        "wukong_transpose_f32",
+    ];
+    let par = kernels(func(&prog, &interner, "par"), &interner);
+    let ser = kernels(func(&prog, &interner, "ser"), &interner);
+    for k in serial {
+        assert!(
+            par.contains(&format!("{k}_parallel")),
+            "@parallel fn lost the `{k}_parallel` twin; got {par:?}"
+        );
+        assert!(
+            !par.iter().any(|c| c == k),
+            "@parallel fn emitted the SERIAL `{k}`; got {par:?}"
+        );
+        assert!(
+            ser.iter().any(|c| c == k),
+            "the plain twin no longer recognizes `{k}` (the comparison is vacuous); got {ser:?}"
+        );
+    }
+}

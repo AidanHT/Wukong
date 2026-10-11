@@ -1,3 +1,5 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 55
 module examples.fib
 
 /// Classic recursive Fibonacci — exercises calls, branches, and arithmetic end to end.

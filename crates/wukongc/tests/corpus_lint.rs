@@ -43,13 +43,45 @@ use std::path::{Path, PathBuf};
 /// tolerance it likes, and the corpus will refuse it until its provenance is written down here.
 /// The token is matched **as text**, so `2e-7` and `0.0000002` are different entries and a silent
 /// re-spelling cannot slip a different number past review.
-const DECLARED_TOLERANCES: &[(&str, &str)] = &[(
-    "1.625e-7",
-    "wukong_runtime/src/vmath.rs:124 and :261 — the exp kernel's maximum relative error against \
-     f64 `exp`, measured EXHAUSTIVELY over every f32 in [-87, 88.37626] by \
-     `vmath_exp_log_exhaustive_ulp` (1.625e-7, about 1.4 ULP; max 2 ULP). It is the kernel's own \
-     published contract, not a number chosen to make a fixture pass.",
-)];
+const DECLARED_TOLERANCES: &[(&str, &str)] = &[
+    (
+        "1.625e-7",
+        "wukong_runtime/src/vmath.rs:124 and :261 — the exp kernel's maximum relative error against \
+         f64 `exp`, measured EXHAUSTIVELY over every f32 in [-87, 88.37626] by \
+         `vmath_exp_log_exhaustive_ulp` (1.625e-7, about 1.4 ULP; max 2 ULP). It is the kernel's own \
+         published contract, not a number chosen to make a fixture pass.",
+    ),
+    // The three row-kernel decades below share one derivation. Each transcendental row kernel's
+    // `matches_f64_reference` test publishes `|got - ref| <= B * max(|ref|, 1)` against an f64
+    // recompute (or an absolute `< B`, which implies it). A fixture prints raw lanes and compares
+    // them RELATIVELY, so a lane's tolerance is that bound divided by `min(|ref|, 1)`, rounded up to
+    // the next decade: `B` itself where |ref| >= 1, one decade looser where 0.1 <= |ref| < 1, two
+    // where 0.01 <= |ref| < 0.1. The cov4 generators assign each APPROX line exactly that decade,
+    // and keep every lane at |ref| >= 0.01 (no cancellation lanes), so no line is looser than its
+    // kernel's own published contract implies at that magnitude.
+    (
+        "1e-5",
+        "B = 1e-5, at |ref| >= 1: the row-loss kernels' f64-reference bound — \
+         wukong_runtime/src/entropy.rs:262, kldiv.rs:280, kd_loss.rs:390, xent.rs:342 and \
+         xent_bwd.rs:380 (`|got - ref| / max(|ref|, 1) <= 1e-5`) and logsoftmax.rs:466 (log-sum-exp, \
+         absolute `< 1e-5`). Used by cov4_par_loss.wk and cov4_rowkernels_wide.wk on lanes whose \
+         independent f64 reference has |ref| >= 1.",
+    ),
+    (
+        "1e-4",
+        "B = 1e-4 at |ref| >= 1: softmax_bwd.rs:302 (`|got - ref| / max(|ref|, 1) <= 1e-4`), \
+         rope.rs:354 and rope_bwd.rs:367 (absolute `max_err < 1e-4`); or one of the B = 1e-5 kernels \
+         above (entropy.rs:262 ... xent_bwd.rs:380, logsoftmax.rs:466) at 0.1 <= |ref| < 1, where \
+         1e-5 / 0.1 = 1e-4. Used by cov4_par_loss.wk, cov4_par_rope.wk and cov4_rowkernels_wide.wk.",
+    ),
+    (
+        "1e-3",
+        "A B = 1e-4 kernel (softmax_bwd.rs:302, rope.rs:354, rope_bwd.rs:367) at 0.1 <= |ref| < 1, \
+         or a B = 1e-5 kernel (entropy.rs:262 ... xent_bwd.rs:380) at 0.01 <= |ref| < 0.1: in the \
+         corpus, RoPE outputs between 0.38 and 1 and cross-entropy-backward probabilities down to \
+         0.01 (cov4_par_loss.wk, cov4_par_rope.wk, cov4_rowkernels_wide.wk).",
+    ),
+];
 
 /// `.wk`-adjacent extensions that must never appear in a corpus directory. Each gate collects
 /// fixtures with `extension == \"wk\"`, so `foo.wk.bak` is silently not a fixture: renaming is the

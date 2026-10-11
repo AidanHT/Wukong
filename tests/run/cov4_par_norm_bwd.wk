@@ -1,0 +1,115 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// softmax backward dx [3, 19], one row per line
+// EXPECT-OUT-VALUES: 28 -15 -3 1 18 -16 -4 -0 10 12 -3 -6 4 6 -28 -10 -0 2 24
+// EXPECT-OUT-VALUES: 19 72 -88 -40 -0 46 84 -57 -24 22 60 -72 -46 -0 38 96 -66 -20 18
+// EXPECT-OUT-VALUES: -10 -0 16 24 -12 -2 7 15 -12 -16 -0 8 8 -21 -5 3 24 -24 -8
+// RMSNorm backward dx [3, 16], one row per line
+// EXPECT-OUT-VALUES: -2.2460938 -2 -0.24609375 1 -6 -0.119140625 -1.8730469 0.24414063 -1.3730469 -0.25390625 2.6191406 -3.6230469 0.74609375 0.8808594 1 6.3808594
+// EXPECT-OUT-VALUES: -0.40625 10 1.796875 0 7.796875 -3.796875 5.203125 -0.953125 4 2 -0.796875 4.203125 -5 -1.796875 -2.40625 -9
+// EXPECT-OUT-VALUES: -0.11791992 0.11791992 -0.77075195 -0.576416 -0.36791992 0.42358398 -2.194336 0.19458008 0.22924805 -0.7570801 -2.423584 -1.2849121 -0.25 1.229248 -0.5 0.2915039
+// LayerNorm backward dx [3, 16], one row per line
+// EXPECT-OUT-VALUES: -4.4375 5.5625 -0.5625 -0.0625 -7.6875 3.5625 -3.5625 -0.4375 0.1875 0.6875 7.3125 1.9375 2.3125 -2.5625 3.3125 -5.5625
+// EXPECT-OUT-VALUES: -0.01953125 -1.6328125 1.4335938 0.70703125 2.4804688 -0.1796875 1.2539063 -1.2460938 0.75390625 -0.4296875 -1.0664063 -2.7695313 -2.2929688 0.70703125 -0.29296875 2.59375
+// EXPECT-OUT-VALUES: -0.28515625 2.5253906 -0.33789063 0.041015625 -1.3378906 -0.9589844 -1.0957031 0.52734375 -0.33007813 0.59765625 1.9199219 0.7910156 0.5253906 -0.33789063 -0.640625 -1.6035156
+module tests.run.cov4_par_norm_bwd
+
+// P12.4: wukong_softmax_bwd_f32_parallel, wukong_rmsnorm_bwd_f32_parallel and
+// wukong_layernorm_bwd_f32_parallel. The three backward nests sit in one multi-statement `@parallel`
+// function, which is lowered whole with `parallel_fn` set, so each arm emits its `_parallel` twin
+// (`--emit=mir -O2`, census). Three rows each, so the forced-parallel lane forks over rows.
+//
+// Every expected lane is EXACT, from the scalar loops:
+//   * softmax backward [3, 19]: y[r, j] = ((3r + 7j) % 9) - 4 and dy[r, j] = ((5r + 2j) % 7) - 3 are
+//     integers (the recognizer does not require y to be a distribution), so s = sum_j y*dy and
+//     dx = y * (dy - s) are integers; the kernel's 8-wide dot cannot round. 19 columns cross two
+//     8-lane blocks into a 3-lane tail.
+//   * RMSNorm backward [3, 16], epsilon 0: row r of x has sum of squares 16 * 4^k (k = 1, 0, 2), so
+//     ms = 4^k and rinv = 1/sqrt(ms) = 2^-k exactly; with integer dy[r, i] = ((7r + 3i) % 11) - 5 and
+//     a short-dyadic gamma, sg, coef = rinv^2 * sg / 16 and dx = rinv * (dy*g - x*coef) are dyadic.
+//   * LayerNorm backward [3, 16], epsilon 0: x = mean + d with integer mean (3, -2, 5), sum d = 0 and
+//     sum d^2 = 16 * 4^k (k = 0, 1, 2), so var = 4^k, rstd = 2^-k exactly, and with integer
+//     dy[r, i] = ((5r + 7i) % 9) - 4 every term of rstd * (dy*g - m1 - xhat*m2) is dyadic.
+// The x rows were drawn by a seeded search for integer vectors with those sums; each property is a
+// one-line hand check. Outputs are poisoned first. EVERY lane is printed (57 + 48 + 48).
+
+@parallel
+fn bwd(y: [f32; 57], dys: [f32; 57], xr: [f32; 48], dyr: [f32; 48], xl: [f32; 48],
+       dyl: [f32; 48], gamma: [f32; 16], mut sdx: [f32; 57], mut rdx: [f32; 48],
+       mut ldx: [f32; 48]) {
+    for r in 0..3 {
+        let mut s: f32 = 0.0;
+        for j in 0..19 { s = s + y[r * 19 + j] * dys[r * 19 + j]; }
+        for i in 0..19 { sdx[r * 19 + i] = y[r * 19 + i] * (dys[r * 19 + i] - s); }
+    }
+    for r in 0..3 {
+        let mut ms: f32 = 0.0;
+        for i in 0..16 { ms = ms + xr[r * 16 + i] * xr[r * 16 + i]; }
+        let rinv: f32 = 1.0 / sqrt(ms / 16.0 + 0.0);
+        let mut sg: f32 = 0.0;
+        for i in 0..16 { sg = sg + dyr[r * 16 + i] * gamma[i] * xr[r * 16 + i]; }
+        let coef: f32 = rinv * rinv * sg / 16.0;
+        for i in 0..16 {
+            rdx[r * 16 + i] = rinv * (dyr[r * 16 + i] * gamma[i] - xr[r * 16 + i] * coef);
+        }
+    }
+    for r in 0..3 {
+        let mut sm: f32 = 0.0;
+        for i in 0..16 { sm = sm + xl[r * 16 + i]; }
+        let mean: f32 = sm / 16.0;
+        let mut vv: f32 = 0.0;
+        for i in 0..16 { vv = vv + (xl[r * 16 + i] - mean) * (xl[r * 16 + i] - mean); }
+        let rstd: f32 = 1.0 / sqrt(vv / 16.0 + 0.0);
+        let mut s1: f32 = 0.0;
+        for i in 0..16 { s1 = s1 + dyl[r * 16 + i] * gamma[i]; }
+        let mut s2: f32 = 0.0;
+        for i in 0..16 { s2 = s2 + dyl[r * 16 + i] * gamma[i] * ((xl[r * 16 + i] - mean) * rstd); }
+        let m1: f32 = s1 / 16.0;
+        let m2: f32 = s2 / 16.0;
+        for i in 0..16 {
+            ldx[r * 16 + i] = rstd * (dyl[r * 16 + i] * gamma[i] - m1 - ((xl[r * 16 + i] - mean) * rstd) * m2);
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut y: [f32; 57] = [0.0; 57];
+    let mut dys: [f32; 57] = [0.0; 57];
+    for r in 0..3 {
+        for j in 0..19 {
+            y[r * 19 + j] = (((r * 3 + j * 7) % 9) as f32) - 4.0;
+            dys[r * 19 + j] = (((r * 5 + j * 2) % 7) as f32) - 3.0;
+        }
+    }
+    // RMSNorm rows: sums of squares 64, 16, 256 (ms = 4, 1, 16).
+    let xr: [f32; 48] = [
+        2.0, 0.0, 2.0, 0.0, 0.0, 3.0, 1.0, -3.0, 1.0, -2.0, -3.0, 1.0, -2.0, 3.0, 0.0, 3.0,
+        -2.0, 0.0, -1.0, 0.0, -1.0, 1.0, 1.0, -1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, -2.0, 0.0,
+        5.0, -5.0, 3.0, -1.0, 5.0, -1.0, 4.0, 5.0, 3.0, -5.0, 1.0, -7.0, 0.0, 3.0, 0.0, -6.0,
+    ];
+    // LayerNorm rows: means 3, -2, 5; centered sums of squares 16, 64, 256 (var = 1, 4, 16).
+    let xl: [f32; 48] = [
+        4.0, 4.0, 3.0, 3.0, 2.0, 4.0, 3.0, 4.0, 1.0, 5.0, 2.0, 3.0, 2.0, 3.0, 2.0, 3.0,
+        -3.0, -4.0, 1.0, -1.0, -3.0, 0.0, -5.0, -5.0, -5.0, 0.0, 1.0, -3.0, -1.0, -1.0, -1.0, -2.0,
+        1.0, 0.0, 6.0, 8.0, 6.0, 8.0, 2.0, 1.0, 10.0, 5.0, 10.0, 8.0, 0.0, 6.0, 11.0, -2.0,
+    ];
+    let mut dyr: [f32; 48] = [0.0; 48];
+    let mut dyl: [f32; 48] = [0.0; 48];
+    for r in 0..3 {
+        for i in 0..16 {
+            dyr[r * 16 + i] = (((r * 7 + i * 3) % 11) as f32) - 5.0;
+            dyl[r * 16 + i] = (((r * 5 + i * 7) % 9) as f32) - 4.0;
+        }
+    }
+    let gamma: [f32; 16] = [
+        1.0, 2.0, -1.0, 0.5, 3.0, 1.0, -2.0, 0.25, 1.0, -0.5, 2.0, 1.5, -1.0, 1.0, 0.5, -3.0,
+    ];
+    let mut sdx: [f32; 57] = [-1000.0; 57];
+    let mut rdx: [f32; 48] = [-1000.0; 48];
+    let mut ldx: [f32; 48] = [-1000.0; 48];
+    bwd(y, dys, xr, dyr, xl, dyl, gamma, sdx, rdx, ldx);
+    for k in 0..57 { print(sdx[k]); }
+    for k in 0..48 { print(rdx[k]); }
+    for k in 0..48 { print(ldx[k]); }
+    return 0;
+}

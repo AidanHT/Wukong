@@ -1,0 +1,75 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// lanes of dst that differ from the scalar definition: f32, then bf16
+// EXPECT-OUT-VALUES: 0 0
+// f32 sentinels dst[j*256 + i] for (i, j) = (0,0) (0,256) (255,0) (255,256) (31,32) (32,31) (128,200)
+// EXPECT-OUT-VALUES: 0 256 65535 65791 7999 8255 33096
+// bf16 sentinels, same (i, j)
+// EXPECT-OUT-VALUES: -127 -120 -127 -120 21 28 5
+module tests.run.cov4_par_transpose_wide
+
+// P1.17 companion to cov4_par_transpose.wk. wukong_transpose_{f32,u16}_parallel run serial below a
+// FIXED TRANSPOSE_PAR_MIN = 65536 elements (wukong_runtime/src/transpose.rs) that no environment knob
+// lowers, so the forced-parallel lane in parallel_lane.rs cannot make a small transpose fork. This
+// [256, 257] = 65792-element transpose is above the gate, so the row blocks really split across
+// cores here, on every native run.
+//
+// 65792 lanes cannot be printed one per line, so EVERY lane is instead CHECKED against its scalar
+// definition and the number of lanes that differ is printed (0, 0). The check is per lane, not a
+// reduction of values: for f32, src[t] = t, so dst[j*256 + i] must equal the integer i*257 + j
+// (computed independently of src, exact below 2^24); for bf16, src[t] = ((7t) % 255) - 127 and
+// dst[j*256 + i] must equal src[i*257 + j]. Seven sentinel lanes per type (the four corners, both
+// sides of the 32-wide block seam, an interior lane) are also printed, with values derived from the
+// same definitions. The outputs are poisoned first. Every lane of the small shape is printed in
+// cov4_par_transpose.wk.
+
+@parallel
+fn tr(src: [f32; 65792], hs: [bf16; 65792], mut dst: [f32; 65792], mut hd: [bf16; 65792]) {
+    for i in 0..256 {
+        for j in 0..257 { dst[j * 256 + i] = src[i * 257 + j]; }
+    }
+    for i in 0..256 {
+        for j in 0..257 { hd[j * 256 + i] = hs[i * 257 + j]; }
+    }
+}
+
+fn main() -> i32 {
+    let mut src: [f32; 65792] = [0.0; 65792];
+    let mut hs: [bf16; 65792] = [0.0 as bf16; 65792];
+    for t in 0..65792 {
+        src[t] = t as f32;
+        hs[t] = ((((t * 7) % 255) as f32) - 127.0) as bf16;
+    }
+    let mut dst: [f32; 65792] = [-1.0; 65792];
+    let mut hd: [bf16; 65792] = [-1000.0 as bf16; 65792];
+    tr(src, hs, dst, hd);
+    let mut bad: i32 = 0;
+    let mut bad16: i32 = 0;
+    let mut i: i32 = 0;
+    while i < 256 {
+        let mut j: i32 = 0;
+        while j < 257 {
+            if dst[j * 256 + i] != ((i * 257 + j) as f32) { bad = bad + 1; }
+            if (hd[j * 256 + i] as f32) != (hs[i * 257 + j] as f32) { bad16 = bad16 + 1; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    print(bad);
+    print(bad16);
+    print(dst[0 * 256 + 0]);
+    print(dst[256 * 256 + 0]);
+    print(dst[0 * 256 + 255]);
+    print(dst[256 * 256 + 255]);
+    print(dst[32 * 256 + 31]);
+    print(dst[31 * 256 + 32]);
+    print(dst[200 * 256 + 128]);
+    print(hd[0 * 256 + 0] as f32);
+    print(hd[256 * 256 + 0] as f32);
+    print(hd[0 * 256 + 255] as f32);
+    print(hd[256 * 256 + 255] as f32);
+    print(hd[32 * 256 + 31] as f32);
+    print(hd[31 * 256 + 32] as f32);
+    print(hd[200 * 256 + 128] as f32);
+    return 0;
+}

@@ -54,6 +54,14 @@ global ld/st smoke on gpu-native.
 | `gpt2.wk`          | GPT-2 decoder block: LayerNorm + multi-head causal attention + GELU MLP + residuals. Readable *shape* spec; measured, it dispatches only the 2 LayerNorms, the 6 non-attention projections and the 2 residual adds — see `gpt2_forward_bench_small.wk` for the full recognized surface | `-1113 1099 677 -264` |
 | `llama_block.wk`   | Llama block: RMSNorm + RoPE + multi-head attention + SwiGLU FFN + residuals | `-1227 1204 593 -404` |
 
+Every example that runs carries its expected output **in the file**, as header directives in the
+`tests/run` grammar (`// EXPECT-EXIT: 0`, `// EXPECT-OUT-VALUES: 4 5 10 11`), and
+`crates/wukongc/tests/examples.rs` fails any runnable example that lacks them or prints something
+else. The values are derived from the program's own scalar semantics: by hand for the small
+programs, and from an independent float64 evaluation for the transformer blocks, whose headers state
+how far the closest printed value sits from a rounding boundary. A new runnable example needs the
+same header.
+
 The end-to-end test programs under [`../tests/run`](../tests/run) are also runnable and cover
 arrays, a flat GEMM, transpose, bubble sort, gcd, casts, floats, and more. Heavier programs for
 the benchmark harness live in [`../bench/kernels`](../bench/kernels).

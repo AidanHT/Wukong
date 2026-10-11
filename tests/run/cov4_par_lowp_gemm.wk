@@ -1,0 +1,135 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// bf16 C = A B^T [3, 17], one row per line
+// EXPECT-OUT-VALUES: 1 -65 -66 -2 -3 -4 21 20 32 31 30 3 2 1 -65 -66 -2
+// EXPECT-OUT-VALUES: 33 -6 -6 -58 -58 -58 -6 -6 33 33 33 33 33 33 -6 -6 -58
+// EXPECT-OUT-VALUES: 32 20 21 -4 -3 -2 -66 -65 1 2 3 30 31 32 20 21 -4
+// f16 C = A B^T [3, 17] (same integer data, same values)
+// EXPECT-OUT-VALUES: 1 -65 -66 -2 -3 -4 21 20 32 31 30 3 2 1 -65 -66 -2
+// EXPECT-OUT-VALUES: 33 -6 -6 -58 -58 -58 -6 -6 33 33 33 33 33 33 -6 -6 -58
+// EXPECT-OUT-VALUES: 32 20 21 -4 -3 -2 -66 -65 1 2 3 30 31 32 20 21 -4
+// bf16 relu(A B^T + bias) [3, 17]
+// EXPECT-OUT-VALUES: 0 0 0 0 0 0 22 17 32 34 29 5 0 2 0 0 1
+// EXPECT-OUT-VALUES: 30 0 0 0 0 0 0 0 33 36 32 35 31 34 0 0 0
+// EXPECT-OUT-VALUES: 29 20 24 0 0 0 0 0 1 5 2 32 29 33 17 21 0
+// f16 relu(A B^T + bias) [3, 17]
+// EXPECT-OUT-VALUES: 0 0 0 0 0 0 22 17 32 34 29 5 0 2 0 0 1
+// EXPECT-OUT-VALUES: 30 0 0 0 0 0 0 0 33 36 32 35 31 34 0 0 0
+// EXPECT-OUT-VALUES: 29 20 24 0 0 0 0 0 1 5 2 32 29 33 17 21 0
+// bf16 C = A^T B [3, 17]
+// EXPECT-OUT-VALUES: 13 19 -1 31 -28 -61 49 -10 22 -37 -18 40 -19 13 19 -1 31
+// EXPECT-OUT-VALUES: -5 8 -5 -5 -5 21 -5 -5 -5 -5 21 -5 -5 -5 8 -5 -5
+// EXPECT-OUT-VALUES: -1 19 13 -19 40 -18 -37 22 -10 49 -61 -28 31 -1 19 13 -19
+// f16 C = A^T B [3, 17]
+// EXPECT-OUT-VALUES: 13 19 -1 31 -28 -61 49 -10 22 -37 -18 40 -19 13 19 -1 31
+// EXPECT-OUT-VALUES: -5 8 -5 -5 -5 21 -5 -5 -5 -5 21 -5 -5 -5 8 -5 -5
+// EXPECT-OUT-VALUES: -1 19 13 -19 40 -18 -37 22 -10 49 -61 -28 31 -1 19 13 -19
+module tests.run.cov4_par_lowp_gemm
+
+// P12.4: the six `_parallel` mixed-precision GEMMs -- wukong_sgemm_{bf16,f16}_nt_parallel,
+// wukong_sgemm_{bf16,f16}_nt_epi_parallel (GEMM + fused bias/ReLU epilogue) and
+// wukong_sgemm_{bf16,f16}_tn_parallel. All six nests (plus the two epilogue loops) sit in one
+// multi-statement `@parallel` function, lowered whole with `parallel_fn` set, so each half-GEMM arm
+// emits its `_parallel` twin (`--emit=mir -O2`, census).
+//
+// [M, N, K] = [3, 17, 5]: 17 output columns are two 16-wide blocks of the 2D grid, so the
+// forced-parallel lane (WUKONG_GEMM_PAR_MIN_MACS=1) really splits the half GEMMs.
+//
+// Data: a[t] = ((7t) % 11) - 5 (15 values) and b[t] = ((5t) % 13) - 6 (85 values), small integers
+// exact in BOTH bf16 and f16, so the widen is exact and the same integers feed the bf16 and the f16
+// twins -- each pair must print identical lanes. The NT forms read a as [3, 5] and b as [17, 5]; the
+// TN forms read a as [5, 3] and b as [5, 17]. bias[j] = ((3j) % 7) - 3. Every dot product is an
+// integer of magnitude < 200, exact in f32 under any accumulation order; the epilogue is
+// relu(c + bias), also an integer. Expected lanes are the scalar loops evaluated in order.
+// Outputs are poisoned first. EVERY lane is printed (6 x 51).
+
+@parallel
+fn lg(a: [bf16; 15], b: [bf16; 85], ah: [f16; 15], bh: [f16; 85], bias: [f32; 17],
+      mut c1: [f32; 51], mut c2: [f32; 51], mut c3: [f32; 51], mut c4: [f32; 51],
+      mut c5: [f32; 51], mut c6: [f32; 51]) {
+    for i in 0..3 {
+        for j in 0..17 {
+            let mut s: f32 = 0.0;
+            for k in 0..5 { s = s + (a[i * 5 + k] as f32) * (b[j * 5 + k] as f32); }
+            c1[i * 17 + j] = s;
+        }
+    }
+    for i in 0..3 {
+        for j in 0..17 {
+            let mut s: f32 = 0.0;
+            for k in 0..5 { s = s + (ah[i * 5 + k] as f32) * (bh[j * 5 + k] as f32); }
+            c2[i * 17 + j] = s;
+        }
+    }
+    for i in 0..3 {
+        for j in 0..17 {
+            let mut s: f32 = 0.0;
+            for k in 0..5 { s = s + (a[i * 5 + k] as f32) * (b[j * 5 + k] as f32); }
+            c3[i * 17 + j] = s;
+        }
+    }
+    for i in 0..3 {
+        for j in 0..17 {
+            c3[i * 17 + j] = fmax(c3[i * 17 + j] + bias[j], 0.0);
+        }
+    }
+    for i in 0..3 {
+        for j in 0..17 {
+            let mut s: f32 = 0.0;
+            for k in 0..5 { s = s + (ah[i * 5 + k] as f32) * (bh[j * 5 + k] as f32); }
+            c4[i * 17 + j] = s;
+        }
+    }
+    for i in 0..3 {
+        for j in 0..17 {
+            c4[i * 17 + j] = fmax(c4[i * 17 + j] + bias[j], 0.0);
+        }
+    }
+    for i in 0..3 {
+        for j in 0..17 {
+            let mut s: f32 = 0.0;
+            for p in 0..5 { s = s + (a[p * 3 + i] as f32) * (b[p * 17 + j] as f32); }
+            c5[i * 17 + j] = s;
+        }
+    }
+    for i in 0..3 {
+        for j in 0..17 {
+            let mut s: f32 = 0.0;
+            for p in 0..5 { s = s + (ah[p * 3 + i] as f32) * (bh[p * 17 + j] as f32); }
+            c6[i * 17 + j] = s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut a: [bf16; 15] = [0.0 as bf16; 15];
+    let mut ah: [f16; 15] = [0.0 as f16; 15];
+    for t in 0..15 {
+        let v: f32 = (((t * 7) % 11) as f32) - 5.0;
+        a[t] = v as bf16;
+        ah[t] = v as f16;
+    }
+    let mut b: [bf16; 85] = [0.0 as bf16; 85];
+    let mut bh: [f16; 85] = [0.0 as f16; 85];
+    for t in 0..85 {
+        let v: f32 = (((t * 5) % 13) as f32) - 6.0;
+        b[t] = v as bf16;
+        bh[t] = v as f16;
+    }
+    let mut bias: [f32; 17] = [0.0; 17];
+    for j in 0..17 { bias[j] = (((j * 3) % 7) as f32) - 3.0; }
+    let mut c1: [f32; 51] = [-1000.0; 51];
+    let mut c2: [f32; 51] = [-1000.0; 51];
+    let mut c3: [f32; 51] = [-1000.0; 51];
+    let mut c4: [f32; 51] = [-1000.0; 51];
+    let mut c5: [f32; 51] = [-1000.0; 51];
+    let mut c6: [f32; 51] = [-1000.0; 51];
+    lg(a, b, ah, bh, bias, c1, c2, c3, c4, c5, c6);
+    for x in 0..51 { print(c1[x]); }
+    for x in 0..51 { print(c2[x]); }
+    for x in 0..51 { print(c3[x]); }
+    for x in 0..51 { print(c4[x]); }
+    for x in 0..51 { print(c5[x]); }
+    for x in 0..51 { print(c6[x]); }
+    return 0;
+}

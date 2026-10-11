@@ -1,0 +1,216 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// RoPE forward out [4, 18] row-major
+// EXPECT-OUT-APPROX: -3.5 1e-4
+// EXPECT-OUT-APPROX: 2.5 1e-4
+// EXPECT-OUT-APPROX: -2.5 1e-4
+// EXPECT-OUT-APPROX: 3.5 1e-4
+// EXPECT-OUT-APPROX: -1.5 1e-4
+// EXPECT-OUT-APPROX: 4.5 1e-4
+// EXPECT-OUT-APPROX: -0.5 1e-3
+// EXPECT-OUT-APPROX: 5.5 1e-4
+// EXPECT-OUT-APPROX: 0.5 1e-3
+// EXPECT-OUT-APPROX: -4.5 1e-4
+// EXPECT-OUT-APPROX: 1.5 1e-4
+// EXPECT-OUT-APPROX: -3.5 1e-4
+// EXPECT-OUT-APPROX: 2.5 1e-4
+// EXPECT-OUT-APPROX: -2.5 1e-4
+// EXPECT-OUT-APPROX: 3.5 1e-4
+// EXPECT-OUT-APPROX: -1.5 1e-4
+// EXPECT-OUT-APPROX: 4.5 1e-4
+// EXPECT-OUT-APPROX: -0.5 1e-3
+// EXPECT-OUT-APPROX: 0.3897179664 1e-3
+// EXPECT-OUT-APPROX: -0.9141240429 1e-3
+// EXPECT-OUT-APPROX: 2.051175115 1e-4
+// EXPECT-OUT-APPROX: -2.044132601 1e-4
+// EXPECT-OUT-APPROX: 3.337017993 1e-4
+// EXPECT-OUT-APPROX: -1.421155353 1e-4
+// EXPECT-OUT-APPROX: 4.44476542 1e-4
+// EXPECT-OUT-APPROX: -0.4882661105 1e-3
+// EXPECT-OUT-APPROX: 5.482379958 1e-4
+// EXPECT-OUT-APPROX: 1.53235763 1e-4
+// EXPECT-OUT-APPROX: -5.627110914 1e-4
+// EXPECT-OUT-APPROX: 2.071878531 1e-4
+// EXPECT-OUT-APPROX: -3.784378669 1e-4
+// EXPECT-OUT-APPROX: 2.713726389 1e-4
+// EXPECT-OUT-APPROX: -2.545646767 1e-4
+// EXPECT-OUT-APPROX: 3.569882402 1e-4
+// EXPECT-OUT-APPROX: -1.503860434 1e-4
+// EXPECT-OUT-APPROX: 4.521449988 1e-4
+// EXPECT-OUT-APPROX: -3.128475083 1e-4
+// EXPECT-OUT-APPROX: 0.3897179664 1e-3
+// EXPECT-OUT-APPROX: -0.9141240429 1e-3
+// EXPECT-OUT-APPROX: 2.051175115 1e-4
+// EXPECT-OUT-APPROX: -2.044132601 1e-4
+// EXPECT-OUT-APPROX: 3.337017993 1e-4
+// EXPECT-OUT-APPROX: -1.421155353 1e-4
+// EXPECT-OUT-APPROX: 4.44476542 1e-4
+// EXPECT-OUT-APPROX: -0.4882661105 1e-3
+// EXPECT-OUT-APPROX: -6.380646022 1e-4
+// EXPECT-OUT-APPROX: 1.53235763 1e-4
+// EXPECT-OUT-APPROX: -5.627110914 1e-4
+// EXPECT-OUT-APPROX: 2.071878531 1e-4
+// EXPECT-OUT-APPROX: -3.784378669 1e-4
+// EXPECT-OUT-APPROX: 2.713726389 1e-4
+// EXPECT-OUT-APPROX: -2.545646767 1e-4
+// EXPECT-OUT-APPROX: 3.569882402 1e-4
+// EXPECT-OUT-APPROX: -1.503860434 1e-4
+// EXPECT-OUT-APPROX: -0.4244362443 1e-3
+// EXPECT-OUT-APPROX: -5.804539834 1e-4
+// EXPECT-OUT-APPROX: 0.7567139233 1e-3
+// EXPECT-OUT-APPROX: -1.608550296 1e-4
+// EXPECT-OUT-APPROX: 2.176578338 1e-4
+// EXPECT-OUT-APPROX: -2.161377157 1e-4
+// EXPECT-OUT-APPROX: 3.3790109 1e-4
+// EXPECT-OUT-APPROX: -1.440999646 1e-4
+// EXPECT-OUT-APPROX: 4.458676327 1e-4
+// EXPECT-OUT-APPROX: 0.5655562523 1e-3
+// EXPECT-OUT-APPROX: -4.099672831 1e-4
+// EXPECT-OUT-APPROX: 1.388302574 1e-4
+// EXPECT-OUT-APPROX: -5.46923815 1e-4
+// EXPECT-OUT-APPROX: 1.939718212 1e-4
+// EXPECT-OUT-APPROX: -3.718662231 1e-4
+// EXPECT-OUT-APPROX: 2.661256346 1e-4
+// EXPECT-OUT-APPROX: -2.534466417 1e-4
+// EXPECT-OUT-APPROX: 3.552492845 1e-4
+// RoPE backward dx [4, 18] row-major
+// EXPECT-OUT-APPROX: -3.5 1e-4
+// EXPECT-OUT-APPROX: 2.5 1e-4
+// EXPECT-OUT-APPROX: -2.5 1e-4
+// EXPECT-OUT-APPROX: 3.5 1e-4
+// EXPECT-OUT-APPROX: -1.5 1e-4
+// EXPECT-OUT-APPROX: 4.5 1e-4
+// EXPECT-OUT-APPROX: -0.5 1e-3
+// EXPECT-OUT-APPROX: 5.5 1e-4
+// EXPECT-OUT-APPROX: 0.5 1e-3
+// EXPECT-OUT-APPROX: -4.5 1e-4
+// EXPECT-OUT-APPROX: 1.5 1e-4
+// EXPECT-OUT-APPROX: -3.5 1e-4
+// EXPECT-OUT-APPROX: 2.5 1e-4
+// EXPECT-OUT-APPROX: -2.5 1e-4
+// EXPECT-OUT-APPROX: 3.5 1e-4
+// EXPECT-OUT-APPROX: -1.5 1e-4
+// EXPECT-OUT-APPROX: 4.5 1e-4
+// EXPECT-OUT-APPROX: -0.5 1e-3
+// EXPECT-OUT-APPROX: 1.231188951 1e-4
+// EXPECT-OUT-APPROX: -5.22895389 1e-4
+// EXPECT-OUT-APPROX: 2.793386993 1e-4
+// EXPECT-OUT-APPROX: -2.916855735 1e-4
+// EXPECT-OUT-APPROX: 3.649314582 1e-4
+// EXPECT-OUT-APPROX: -1.577379923 1e-4
+// EXPECT-OUT-APPROX: 4.55413597 1e-4
+// EXPECT-OUT-APPROX: -0.5117033721 1e-3
+// EXPECT-OUT-APPROX: 5.517536119 1e-4
+// EXPECT-OUT-APPROX: -0.9920553243 1e-3
+// EXPECT-OUT-APPROX: -2.271132143 1e-4
+// EXPECT-OUT-APPROX: 0.8348587344 1e-3
+// EXPECT-OUT-APPROX: -3.161005002 1e-4
+// EXPECT-OUT-APPROX: 2.276511164 1e-4
+// EXPECT-OUT-APPROX: -2.451912025 1e-4
+// EXPECT-OUT-APPROX: 3.429263124 1e-4
+// EXPECT-OUT-APPROX: -1.496048014 1e-4
+// EXPECT-OUT-APPROX: 4.478481347 1e-4
+// EXPECT-OUT-APPROX: 6.873796612 1e-4
+// EXPECT-OUT-APPROX: 1.231188951 1e-4
+// EXPECT-OUT-APPROX: -5.22895389 1e-4
+// EXPECT-OUT-APPROX: 2.793386993 1e-4
+// EXPECT-OUT-APPROX: -2.916855735 1e-4
+// EXPECT-OUT-APPROX: 3.649314582 1e-4
+// EXPECT-OUT-APPROX: -1.577379923 1e-4
+// EXPECT-OUT-APPROX: 4.55413597 1e-4
+// EXPECT-OUT-APPROX: -0.5117033721 1e-3
+// EXPECT-OUT-APPROX: 1.80303082 1e-4
+// EXPECT-OUT-APPROX: -0.9920553243 1e-3
+// EXPECT-OUT-APPROX: -2.271132143 1e-4
+// EXPECT-OUT-APPROX: 0.8348587344 1e-3
+// EXPECT-OUT-APPROX: -3.161005002 1e-4
+// EXPECT-OUT-APPROX: 2.276511164 1e-4
+// EXPECT-OUT-APPROX: -2.451912025 1e-4
+// EXPECT-OUT-APPROX: 3.429263124 1e-4
+// EXPECT-OUT-APPROX: -1.496048014 1e-4
+// EXPECT-OUT-APPROX: -0.5655562523 1e-3
+// EXPECT-OUT-APPROX: 5.167905019 1e-4
+// EXPECT-OUT-APPROX: 1.438352683 1e-4
+// EXPECT-OUT-APPROX: -4.905003058 1e-4
+// EXPECT-OUT-APPROX: 2.735788228 1e-4
+// EXPECT-OUT-APPROX: -2.816666275 1e-4
+// EXPECT-OUT-APPROX: 3.613300079 1e-4
+// EXPECT-OUT-APPROX: -1.558176417 1e-4
+// EXPECT-OUT-APPROX: 4.540705699 1e-4
+// EXPECT-OUT-APPROX: 0.4244362443 1e-3
+// EXPECT-OUT-APPROX: 4.877782049 1e-4
+// EXPECT-OUT-APPROX: -0.6566137056 1e-3
+// EXPECT-OUT-APPROX: -2.905330447 1e-4
+// EXPECT-OUT-APPROX: 1.007701728 1e-4
+// EXPECT-OUT-APPROX: -3.250598575 1e-4
+// EXPECT-OUT-APPROX: 2.333251496 1e-4
+// EXPECT-OUT-APPROX: -2.464160354 1e-4
+// EXPECT-OUT-APPROX: 3.447026509 1e-4
+module tests.run.cov4_par_rope
+
+// P12.4: wukong_rope_f32_parallel and wukong_rope_bwd_f32_parallel. Both rotation nests sit in one
+// multi-statement `@parallel` function, lowered whole with `parallel_fn` set, so the RoPE arm emits
+// the `_parallel` forward and backward kernels (`--emit=mir -O2`, census).
+//
+// Shape: 4 rows (positions 0..3) of 9 rotation pairs (row width 18): four rows so the forced-parallel
+// lane forks over rows, nine pairs so the kernel's 8-pair sin/cos block runs once and then a 1-pair
+// tail.
+//
+// The kernels evaluate sin/cos with a ~1-ULP f32 polynomial, so every lane is EXPECT-OUT-APPROX
+// against an INDEPENDENT f64 reference of the rotation, out = (a cos t - b sin t, b cos t + a sin t)
+// (backward: the transpose rotation, (a cos t + b sin t, b cos t - a sin t)), computed by a scratch
+// script outside the repository from the exact f32 inputs. The tolerance is the kernels' documented
+// f64-reference bound (rope.rs / rope_bwd.rs: absolute 1e-4 at unit scale) converted to a relative
+// tolerance at each lane's magnitude and rounded up to a decade; see DECLARED_TOLERANCES.
+//
+// Inputs: x[r, k] = ((5r + 6k + 1) % 11) - 4.5 (half-integers, never 0; the pattern was chosen so
+// no output lane cancels below 0.38), inv_freq[j] = 2^-j, and
+// theta = r * inv_freq[j] is an exact f32 product. Row 0 (theta = 0) is the identity rotation.
+// The outputs are poisoned first. EVERY lane is printed (2 x 72).
+
+@parallel
+fn ropes(x: [f32; 72], inv_freq: [f32; 9], mut out: [f32; 72], mut dx: [f32; 72]) {
+    for r in 0..4 {
+        for j in 0..9 {
+            let theta: f32 = (r as f32) * inv_freq[j];
+            let c: f32 = cos(theta);
+            let s: f32 = sin(theta);
+            let a: f32 = x[r * 18 + j];
+            let b: f32 = x[r * 18 + j + 9];
+            out[r * 18 + j] = a * c - b * s;
+            out[r * 18 + j + 9] = b * c + a * s;
+        }
+    }
+    for r in 0..4 {
+        for j in 0..9 {
+            let theta: f32 = (r as f32) * inv_freq[j];
+            let c: f32 = cos(theta);
+            let s: f32 = sin(theta);
+            let a: f32 = x[r * 18 + j];
+            let b: f32 = x[r * 18 + j + 9];
+            dx[r * 18 + j] = a * c + b * s;
+            dx[r * 18 + j + 9] = b * c - a * s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 72] = [0.0; 72];
+    for r in 0..4 {
+        for k in 0..18 {
+            x[r * 18 + k] = (((r * 5 + k * 6 + 1) % 11) as f32) - 4.5;
+        }
+    }
+    let mut inv_freq: [f32; 9] = [0.0; 9];
+    let mut f: f32 = 1.0;
+    for j in 0..9 {
+        inv_freq[j] = f;
+        f = f * 0.5;
+    }
+    let mut out: [f32; 72] = [-1000.0; 72];
+    let mut dx: [f32; 72] = [-1000.0; 72];
+    ropes(x, inv_freq, out, dx);
+    for k in 0..72 { print(out[k]); }
+    for k in 0..72 { print(dx[k]); }
+    return 0;
+}

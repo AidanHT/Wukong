@@ -1,3 +1,5 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT-VALUES: 1 8 12 16 20 24 28 8
 module examples.lang_unknown_op
 
 // Few-shot idiom: a user-invented three-point stencil, not a named operation.

@@ -12,7 +12,9 @@ prove the compiler works as a user would invoke it — zero mocked stages.
 | `warn.rs` | `tests/warn/*.wk` compile and produce exactly the lint diagnostics their `// EXPECT-WARN:` / `// EXPECT-ERROR:` / `// EXPECT-NONE` lines list (the whole JSON stream, in order, plus the exit status); `corpus_is_warning_free` (`tests/run` + `examples`) is `#[ignore]`d until the corpus is brought to zero warnings |
 | `determinism.rs` | compiler is a pure function across fresh processes — MIR bytes, object bytes, JSON diagnostic order |
 | `exe.rs` | `--emit=exe` AOT path matches `--run` (linked exe vs interpreter oracle) |
-| `recognize.rs` | the recognizers are **switchable**: one witness per cascade head loses its kernel under `WUKONG_NO_RECOGNIZE`, `@generic` removes it for one function only (a MIR count over the `lang_generic_*` twin pairs), the program still prints the same bytes on both backends, autodiff refuses to run under the instrument, and a **corpus sweep** holds every `tests/run` program that loses a `wukong_*` call under the instrument to its generic lowering (`-O2` interp, `-O2` native, `-O0` interp), with the dependent-program and distinct-kernel counts pinned as floors |
+| `recognize.rs` | the recognizers are **switchable**: one witness per cascade head loses its kernel under `WUKONG_NO_RECOGNIZE`, `@generic` removes it for one function only (a MIR count over the `lang_generic_*` twin pairs), the program still prints the same bytes on both backends, autodiff refuses to run under the instrument, and a **corpus sweep** holds every `tests/run` program that loses a `wukong_*` call under the instrument to its generic lowering (`-O2` interp, `-O2` native, `-O0` interp), with the dependent-program and distinct-kernel counts pinned as floors; the **emittable-surface census** fails when a `wukong_*` symbol interned anywhere in `wukong_mir_build` is emitted by no `tests/run` program (`NEVER_EMITTED_ALLOWLIST`, empty, holds the reasoned exceptions) |
+| `recognizer_census.rs` | `tests/recognizer-census.txt`: the `wukong_*` calls every `tests/run` fixture emits at `--emit=mir -O2`, byte-pinned (`WUKONG_UPDATE_CENSUS=1` rewrites it and fails on purpose) |
+| `parallel_lane.rs` | the **forced-parallel lane**: every census program that dispatches a `_parallel` kernel runs on native with the runtime's fork gates forced open (`WUKONG_PAR_MIN_WORK=1`, `WUKONG_GEMM_PAR_MIN_MACS=1`, `WUKONG_VELEM_PAR_MIN=1`, `WUKONG_PACK_PAR_MIN_KB=0`) and must print exactly what default-gate native and the interpreter print — corpus fixtures are far below the gates, so without it no gate ever ran a `_parallel` kernel's split |
 
 Focused gate for lowering/optimizer/backend work:
 
@@ -25,7 +27,8 @@ cargo test -p wukongc --test run
 | file | role |
 |---|---|
 | `emit.rs` | intermediate `--emit` stages produce expected artifacts |
-| `examples.rs` | `examples/*.wk` smoke through the CLI |
+| `examples.rs` | `examples/*.wk` through the CLI: each declared class holds, interp == native, `-O` invariance, and every runnable example's in-file `EXPECT-EXIT` / `EXPECT-OUT*` header (the `tests/run` grammar via `common/mod.rs`) matches its output |
+| `corpus_lint.rs` | static corpus checks: every directive parses, every `EXPECT-OUT-APPROX` tolerance is in `DECLARED_TOLERANCES` with a cited source, the comparator's own mutation controls |
 | `diag_json.rs` | `--error-format=json` schema v1 against the real binary: the v0 prefix is unchanged and the v1 fields (end positions, byte range, `suggestions`, `children`, `rendered`, `version`) are present |
 | `explain.rs` | `--explain` lists every code, prints each entry, and every catalogue `bad:`/`good:` example is compiled under `--emit=check` (bad yields exactly its code first, good checks clean) |
 | `gpt2_config.rs` | GPT-2 config fixture |

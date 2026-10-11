@@ -1,3 +1,9 @@
+// EXPECT-EXIT: 0
+// round(logits[s, v] * 10000) for (s, v) = (0, 0), (0, 31), (7, 0), (7, 31), then argmax of row 7.
+// Derived from an independent float64 evaluation of this model's formulas on these synthetic
+// weights (0.24986, 1.61422, -1.43523, 0.95213; argmax 15 beats runner-up 11 by 0.433), not from
+// compiler output; the closest value lies 0.09 of a printed unit from a rounding boundary.
+// EXPECT-OUT-VALUES: 2499 16142 -14352 9521 15
 module examples.gpt2_infer_small
 
 // =====================================================================================

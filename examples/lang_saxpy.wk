@@ -1,3 +1,5 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT-VALUES: 12 24 36 48 60 72 84 96
 module examples.lang_saxpy
 
 // Few-shot idiom: write the scalar loop and use @generic to request no named

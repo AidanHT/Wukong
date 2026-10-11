@@ -1,0 +1,52 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// flat i32 dequant, lanes 0..39
+// EXPECT-OUT-VALUES: -25 -15.75 -6.5 2.75 12 21.25 -19.75 -10.5 -1.25 8
+// EXPECT-OUT-VALUES: 17.25 -23.75 -14.5 -5.25 4 13.25 22.5 -18.5 -9.25 0
+// EXPECT-OUT-VALUES: 9.25 18.5 -22.5 -13.25 -4 5.25 14.5 23.75 -17.25 -8
+// EXPECT-OUT-VALUES: 1.25 10.5 19.75 -21.25 -12 -2.75 6.5 15.75 25 -16
+// per-channel i8 dequant [3, 12], one row per line
+// EXPECT-OUT-VALUES: -127 -49 -17.25 -80 -1.375 72 35.25 -76 6.5625 -363 46 -39.375
+// EXPECT-OUT-VALUES: -34 -2.5 6 106 10.25 444 -86.25 86 -3.5625 -84 -0.5 18.75
+// EXPECT-OUT-VALUES: 59 44 29.25 -218 -10 -204 -16.5 -7 2.25 195 -47 76.875
+module tests.run.cov4_par_dequant
+
+// P12.4: wukong_dequant_f32_parallel (flat) and wukong_dequant_perchan_f32_parallel (per-channel).
+// Both loops sit in one multi-statement `@parallel` function (lowered whole with `parallel_fn` set),
+// so each dequant arm emits its `_parallel` twin (`--emit=mir -O2`, census).
+//
+// Sizes: the flat kernel forks over 8-element blocks, so 40 elements are five units; the
+// per-channel kernel forks over rows, so [3, 12] is three rows each crossing an 8-wide block into a
+// 4-column tail. Both shapes really fork in the forced-parallel lane.
+//
+// q[k] = ((37k) % 201) - 100 (i32) and w[k] = ((29k) % 255) - 127 (i8, the full signed range but
+// -128). Each lane is the scalar loop's one multiply: q * 0.25, and w * scale[j] with every scale a
+// short dyadic (1, 1/2, 1/4, 2, 1/8, 4, 3/4, -1, 1/16, 3, -1/2, 5/8), so every product is exact in
+// f32. Outputs are poisoned first. EVERY lane is printed.
+
+@parallel
+fn deq(q: [i32; 40], w: [i8; 36], scale: [f32; 12], mut o1: [f32; 40], mut o2: [f32; 36]) {
+    let sc: f32 = 0.25;
+    for j in 0..40 {
+        o1[j] = (q[j] as f32) * sc;
+    }
+    for i in 0..3 {
+        for j in 0..12 {
+            o2[i * 12 + j] = (w[i * 12 + j] as f32) * scale[j];
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut q: [i32; 40] = [0; 40];
+    for k in 0..40 { q[k] = ((k * 37) % 201) - 100; }
+    let mut w: [i8; 36] = [0 as i8; 36];
+    for k in 0..36 { w[k] = (((k * 29) % 255) - 127) as i8; }
+    let scale: [f32; 12] = [1.0, 0.5, 0.25, 2.0, 0.125, 4.0, 0.75, -1.0, 0.0625, 3.0, -0.5, 0.625];
+    let mut o1: [f32; 40] = [-1000.0; 40];
+    let mut o2: [f32; 36] = [-1000.0; 36];
+    deq(q, w, scale, o1, o2);
+    for k in 0..40 { print(o1[k]); }
+    for k in 0..36 { print(o2[k]); }
+    return 0;
+}

@@ -1,0 +1,53 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// out = (A B^T as f32) * 0.5 * scale_b[j] + bias[j], [3, 8]
+// EXPECT-OUT-VALUES: -1224.625 -3146.5 -2960 10176.25 -718.875 -5341.375 1903.25 265.6875
+// EXPECT-OUT-VALUES: -4345.125 -6401 -3496 21050.25 1249.25 -10281.625 2210.25 600.625
+// EXPECT-OUT-VALUES: -5769.625 -6263.5 2752 45492.25 -14.625 -10133.875 -874.75 1359.5625
+module tests.run.cov4_par_i8gemm_deq
+
+// P12.4: wukong_i8gemm_nt_deq_parallel, the int8 GEMM fused with its per-channel dequant epilogue.
+// The fusion fires when the i32 accumulator `c` is a `let`-local that is dead after the dequant
+// loop (`try_fuse_i8matmul_dequant_epilogue`); inside a multi-statement `@parallel` function the
+// `_parallel` kernel is chosen (`--emit=mir -O2`, census).
+//
+// [M, N, K] = [3, 8, 6]: the kernel forks over (row, 4-column group) units, so 3 x 2 = 6 units and
+// the forced-parallel lane (WUKONG_PAR_MIN_WORK=1) really splits.
+//
+// a[t] = (37t) % 256 (u8) and b[t] = ((53t) % 255) - 127 (i8): the i32 dot products are exact
+// integers (|c| < 2^18); scale_a = 1/2, scale_b and bias are short dyadics, so
+// out = (c as f32) * 0.5 * scale_b[j] + bias[j] is exact in f32. Expected lanes are that scalar
+// loop evaluated in order. The output is poisoned first. EVERY lane is printed.
+
+@parallel
+fn i8d(a: [u8; 18], b: [i8; 48], sb: [f32; 8], bias: [f32; 8], mut out: [f32; 24]) {
+    let mut c: [i32; 24] = [0; 24];
+    let scale_a: f32 = 0.5;
+    for i in 0..3 {
+        for j in 0..8 {
+            let mut s: i32 = 0;
+            for k in 0..6 {
+                s = s + (a[i * 6 + k] as i32) * (b[j * 6 + k] as i32);
+            }
+            c[i * 8 + j] = s;
+        }
+    }
+    for i in 0..3 {
+        for j in 0..8 {
+            out[i * 8 + j] = (c[i * 8 + j] as f32) * scale_a * sb[j] + bias[j];
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut a: [u8; 18] = [0 as u8; 18];
+    for t in 0..18 { a[t] = ((t * 37) % 256) as u8; }
+    let mut b: [i8; 48] = [0 as i8; 48];
+    for t in 0..48 { b[t] = (((t * 53) % 255) - 127) as i8; }
+    let sb: [f32; 8] = [0.25, 0.5, 1.0, 2.0, 0.125, 0.75, -0.5, 0.0625];
+    let bias: [f32; 8] = [1.0, -1.5, 0.0, 1.25, -2.0, 0.5, 7.0, -0.25];
+    let mut out: [f32; 24] = [-1000.0; 24];
+    i8d(a, b, sb, bias, out);
+    for x in 0..24 { print(out[x]); }
+    return 0;
+}

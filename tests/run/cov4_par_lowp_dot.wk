@@ -1,0 +1,41 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 39982
+// EXPECT-OUT: 39997
+module tests.run.cov4_par_lowp_dot
+
+// P12.4: wukong_dot_f16_parallel (the f16 dot, never emitted by the corpus before) plus its sibling
+// wukong_sum_f16_parallel. A `@parallel` function whose body is a reduction is lowered whole with
+// `parallel_fn` set, so the f16 reduction arm emits the `_parallel` twins (`--emit=mir -O2`, census).
+//
+// n = 20000 spans three fixed RCHUNK = 8192 chunks, so the parallel fold really combines partials
+// (independently of the forced-parallel env, which does not gate this kernel).
+//
+// x[k] = ((13k) % 23) - 9 and y[k] = ((7k) % 5) - 1 are small integers, exact in f16, every product
+// is an integer and every partial sum stays far below 2^24, so the dot and the sum are exact whatever
+// the chunking: dot = sum_k x[k]*y[k] = 39982, sum = sum_k x[k] = 39997 (evaluated from the scalar
+// definition). Both lanes are printed.
+
+@parallel
+fn d16(x: [f16; 20000], y: [f16; 20000], mut o: [f32; 2]) {
+    let mut d: f32 = 0.0;
+    for k in 0..20000 { d = d + (x[k] as f32) * (y[k] as f32); }
+    o[0] = d;
+    let mut s: f32 = 0.0;
+    for k in 0..20000 { s = s + (x[k] as f32); }
+    o[1] = s;
+}
+
+fn main() -> i32 {
+    let mut x: [f16; 20000] = [0.0 as f16; 20000];
+    let mut y: [f16; 20000] = [0.0 as f16; 20000];
+    for k in 0..20000 {
+        x[k] = ((((k * 13) % 23) as f32) - 9.0) as f16;
+        y[k] = ((((k * 7) % 5) as f32) - 1.0) as f16;
+    }
+    let mut o: [f32; 2] = [-1000.0; 2];
+    d16(x, y, o);
+    print(o[0]);
+    print(o[1]);
+    return 0;
+}

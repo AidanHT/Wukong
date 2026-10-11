@@ -30,7 +30,10 @@ mod common;
 /// this suite, both invariance gates and the native differential with no failure anywhere. That is
 /// the cheapest way in the repo to turn a red gate green. Adding fixtures never trips this; only
 /// losing one does. **Raise it in the same commit that adds fixtures.**
-const MIN_FIXTURES: usize = 390;
+///
+/// 517: the measured top-level count once the eighteen `cov4_*` coverage fixtures joined the 499
+/// on main (the floor had been left at 390 while the tree grew past it, 109 fixtures of slack).
+const MIN_FIXTURES: usize = 517;
 
 /// Monotonic counter handing every spawned `wukongc` a distinct scratch directory.
 static WORK_SEQ: AtomicU64 = AtomicU64::new(0);

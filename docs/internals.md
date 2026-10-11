@@ -1277,9 +1277,17 @@ Two rules about it:
 `crates/wukongc/tests/recognize.rs` gates all of this: one witness fixture per cascade head (its
 kernel is dispatched by default and gone with the variable set — the first half matters, or the
 second is vacuous), no `call wukong_` at all survives for `tensor_matmul.wk`, the program still prints
-the same bytes on both backends at `-O0` and `-O2`, and autodiff is refused. The 361 `tests/run`
-fixtures present when the switch landed were swept on/off for byte-identical stdout; that historical
-sweep does not establish recognition-on/off agreement for the current corpus.
+the same bytes on both backends at `-O0` and `-O2`, and autodiff is refused. Corpus-wide,
+`every_recognizer_dependent_program_agrees_with_its_generic_lowering` takes every `tests/run`
+program whose MIR loses a `wukong_*` call with the variable set (a count floored by
+`the_recognizer_dependent_corpus_holds_its_floor`) and runs it with recognition on and off at `-O2`
+on the interpreter, `-O2` on native and `-O0` on the interpreter: same exit code, and stdout
+byte-identical unless the fixture is listed in `REASSOCIATION_TOLERANCES` with a derived relative
+bound. A listed fixture's recognition-off stdout must then also satisfy the fixture's own
+`EXPECT-OUT*` lines (`judge_on_off`), so the flat on/off bound — sized for its loosest line — never
+loosens a tighter lane's contract on the one column no other gate executes. (The 361 fixtures
+present when the switch landed were also swept on/off by hand; that sweep is history, this test is
+the gate.)
 
 ### Aliased buffers: the kernel only where the operands are disjoint
 
@@ -1781,7 +1789,13 @@ measurement reports retain the corpus sizes used for those runs.
   against independent scalar references across remainder-exercising sizes. Two randomized fuzzers run in
   the default `cargo test` too: a **full-buffer** differential (`wukong_codegen_cranelift::fuzz`) that
   drives the typed kernel-entry ABI on both backends over identical random buffers and requires the
-  *entire* output buffer to be bit-identical (f32 and int8), and a **grammar** fuzzer (`fuzz_grammar`)
+  *entire* output buffer to be bit-identical (f32 and int8) — plus a **recognition-off arm** that lowers
+  each kernel again with `LowerOptions { recognize: false, .. }`, runs it on the interpreter, and holds
+  the recognized native output to that second opinion (bit-exact for the elementwise kernels, within a
+  derived `2*gamma_n*S` bound for the reductions and GEMMs, within twice the documented f64 bound for
+  the norms — a bound on magnitude only: a non-finite lane and a zero lane are held to their exact
+  bits, sign of zero included, in every class; the lane classes where a kernel is known to disagree with its source loop are listed with
+  reproducers in `KNOWN_OFF_DIVERGENCES` and fail the run once they stop reproducing) — and a **grammar** fuzzer (`fuzz_grammar`)
   that generates random well-typed programs through the real pipeline and asserts interpreter == native
   and -O0 == -O2 == -O3 on (exit, stdout). Both use a seeded PRNG, so a failure reproduces exactly from
   the seed it prints; `WUKONG_FUZZ_PROGRAMS=N` deepens the grammar run and an unusable value falls back
@@ -1815,7 +1829,28 @@ measurement reports retain the corpus sizes used for those runs.
   interpreter-vs-native differential fixture *and* carries a declared execution class (`Runs`,
   `NotLowered`, `NoEntry`, `DataGuarded`), because a program that fails to compile trivially satisfies
   agreement on both backends. `Runs` is the default, so a new example must actually execute or be
-  declared otherwise.
+  declared otherwise — and a `Runs` example must carry its expected output in the file, as
+  `EXPECT-EXIT` / `EXPECT-OUT*` header directives in the `tests/run` grammar (one shared parser,
+  `common/mod.rs`), with values derived from the program's own scalar semantics.
+- **Forced-parallel lane** (`crates/wukongc/tests/parallel_lane.rs`): every `_parallel` kernel in
+  `wukong_runtime` falls back to its serial sibling below a work gate sized for real models, and no
+  corpus fixture is that large, so no other gate ever runs a `_parallel` split. This lane reruns
+  every program whose census line lists a `_parallel` symbol with the gate overrides at their
+  smallest accepted values (`WUKONG_PAR_MIN_WORK=1`, `WUKONG_GEMM_PAR_MIN_MACS=1`,
+  `WUKONG_VELEM_PAR_MIN=1`, `WUKONG_PACK_PAR_MIN_KB=0`) and requires native-forced == native-default
+  == interpreter, byte for byte. The two gates no knob opens and the fixed-`RCHUNK` reductions are
+  reached by fixtures sized above them instead, one each: `TRANSPOSE_PAR_MIN` (65536) by
+  `cov4_par_transpose_wide.wk` (65792 elements), `VMATH_PAR_MIN` (16384) by `vmath_parallel.wk`
+  (20000 — the only corpus program whose `wukong_vmath_f32_parallel` call crosses it), and `RCHUNK`
+  (8192) by `cov4_par_lowp_dot.wk` and `parallel_argmax.wk` (20000). `FIXED_GATE_WITNESSES` in the
+  same file pins that list: a witness that leaves the corpus, stops dispatching the gated kernel, or
+  no longer spells its size fails `every_fixed_gate_has_a_witness_sized_above_it`.
+- **Emittable-surface census** (`recognize.rs`): every `wukong_*` symbol interned anywhere in
+  `wukong_mir_build/src` must be emitted by some `tests/run` program at `-O2`, or be listed in
+  `NEVER_EMITTED_ALLOWLIST` with a reason. The `tests/run/cov4_par_*.wk` fixtures are the witnesses
+  for the `_parallel` twins: a multi-statement `@parallel` function is lowered whole with
+  `parallel_fn` set (the outliner takes only a single-loop body), so each recognizer arm in it emits
+  its `_parallel` kernel; every lane is printed against hand-derived values.
 - **Emit stages** (`crates/wukongc/tests/emit.rs`): `--emit=tokens|ast` over the examples and the run
   suite, and `--emit=mir-high|mir|llvm-ir` over the run suite at -O0 and -O2 — which is also what keeps
   the MIR verifier and the pretty-printers honest.
