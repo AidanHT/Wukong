@@ -1,0 +1,29 @@
+// EXPECT-CODE: E0438
+// EXPECT-COUNT: 6
+module tests.fail.f8_literal_out_of_range
+
+// An 8-bit float literal is worth its rounding onto the format's grid, so one that rounds past the
+// largest finite value, or a nonzero one that rounds to zero, would silently be a different number:
+// `500.0f8e4m3` would be 448 (E4M3FN has no infinity and saturates), `70000.0f8e5m2` infinity, and
+// `0.0001f8e4m3` zero (E4M3FN's least value is 2^-9). Each is E0438 — suffixed, or unsuffixed where it
+// adapts to an f8 annotation, parameter, field or compound-assignment place. 464.0 is in range: it is
+// the midpoint of 448 and the absent 480, which ties to the even 448.
+struct S {
+    w: f8e4m3,
+}
+
+fn f(x: f8e5m2) -> f8e5m2 {
+    return x;
+}
+
+fn main() -> i32 {
+    let a = 500.0f8e4m3; //~ E0438
+    let b = 70000.0f8e5m2; //~ E0438
+    let c: f8e4m3 = 0.0001; //~ E0438
+    let ok = 464.0f8e4m3;
+    let d = f(1e6); //~ E0438
+    let s = S { w: -999.0 }; //~ E0438
+    let mut e: f8e4m3 = 1.0;
+    e += 1000.0; //~ E0438
+    return (a as i32) + (b as i32) + (c as i32) + (ok as i32) + (d as i32) + (s.w as i32) + (e as i32);
+}

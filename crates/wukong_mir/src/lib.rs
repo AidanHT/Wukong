@@ -67,6 +67,16 @@ pub enum MirType {
     I128,
     F16,
     BF16,
+    /// OCP FP8 E4M3FN (`f8e4m3` in source). Like `F16`/`BF16` it is a narrow float that every
+    /// backend holds in an `f32` register on its grid and stores as its 1-byte code: a constant, a
+    /// load, an `FpTrunc` to it and an `FpExt` from it round onto the grid (`wukong_runtime::fp8`'s
+    /// bit-level codec, saturating at ±448), and arithmetic computes in `f32` with `mir_build`
+    /// rounding each result by a same-type `FpTrunc`. Scalar only: no vector has f8 lanes and no
+    /// bitcast reinterprets one (the verifier rejects both), since its register is not its code.
+    F8E4M3,
+    /// OCP FP8 E5M2 (`f8e5m2` in source): the top byte of an `f16`, with infinities. Held and
+    /// rounded exactly as [`MirType::F8E4M3`] is.
+    F8E5M2,
     F32,
     F64,
     Ptr,
@@ -93,6 +103,8 @@ impl MirType {
             I128 | U128 => MirType::I128,
             F16 => MirType::F16,
             Bf16 => MirType::BF16,
+            F8E4M3 => MirType::F8E4M3,
+            F8E5M2 => MirType::F8E5M2,
             F32 => MirType::F32,
             F64 => MirType::F64,
             // A Unicode scalar value is a 32-bit integer in MIR (signless, like every int).
@@ -110,7 +122,27 @@ impl MirType {
     pub fn is_float(&self) -> bool {
         matches!(
             self,
-            MirType::F16 | MirType::BF16 | MirType::F32 | MirType::F64
+            MirType::F16
+                | MirType::BF16
+                | MirType::F8E4M3
+                | MirType::F8E5M2
+                | MirType::F32
+                | MirType::F64
+        )
+    }
+
+    /// The two 8-bit floats (scalar only, so never a vector lane).
+    pub fn is_f8(&self) -> bool {
+        matches!(self, MirType::F8E4M3 | MirType::F8E5M2)
+    }
+
+    /// A float narrower than `f32` that lives in an `f32` register and is rounded onto its own
+    /// grid at every observation boundary: `f16`, `bf16`, `f8e4m3`, `f8e5m2` (or a vector of a
+    /// 16-bit one).
+    pub fn is_sub_f32_float(&self) -> bool {
+        matches!(
+            self.lane_type(),
+            MirType::F16 | MirType::BF16 | MirType::F8E4M3 | MirType::F8E5M2
         )
     }
 
@@ -137,6 +169,8 @@ impl MirType {
             MirType::I128 => "i128".into(),
             MirType::F16 => "f16".into(),
             MirType::BF16 => "bf16".into(),
+            MirType::F8E4M3 => "f8e4m3".into(),
+            MirType::F8E5M2 => "f8e5m2".into(),
             MirType::F32 => "f32".into(),
             MirType::F64 => "f64".into(),
             MirType::Ptr => "ptr".into(),

@@ -266,3 +266,45 @@ fn atomic_add_is_one_seq_cst_atomicrmw() {
         );
     }
 }
+
+/// The 8-bit floats' codec, spelled in IR (`fp8.rs`). `verify_semantics.py` runs these modules on
+/// every code and on thousands of `f32`/`f64` bit patterns (every midpoint and its neighbours,
+/// ties, saturation, overflow, subnormals, NaNs) against an exact transcription of the runtime's
+/// reference encoder, so the module rounds exactly as the interpreter does:
+///
+/// * `f8_{e4m3,e5m2}_code_{f32,f64}(src: *f32|*f64) -> i8`: the stored code of `(*src) as f8`
+///   (an `fptrunc` to the type, a store, the byte read back);
+/// * `f8_{e4m3,e5m2}_value(src: *i8) -> i32`: the `f32` bits of a stored code widened to `f32`
+///   (a load decoding the byte, an `fpext` rounding it on the way out).
+#[test]
+fn f8_codec_modules() {
+    let mut i = Interner::new();
+    for (fname, f8) in [("e4m3", MirType::F8E4M3), ("e5m2", MirType::F8E5M2)] {
+        for (sname, src_ty) in [("f32", MirType::F32), ("f64", MirType::F64)] {
+            let mut b = Builder::new(i.intern(&format!("f8_{fname}_code_{sname}")), MirType::I8);
+            let src = b.add_param(MirType::Ptr);
+            let x = b.build(src_ty.clone(), Op::Load(src, src_ty.clone()));
+            let h = b.build(f8.clone(), Op::Cast(CastKind::FpTrunc, x, f8.clone()));
+            let slot = b.alloca(f8.clone());
+            b.build_void(Op::Store {
+                ptr: slot,
+                value: h,
+            });
+            let code = b.build(MirType::I8, Op::Load(slot, MirType::I8));
+            b.ret(Some(code));
+            let text = emit(b.finish(), &i);
+            assert!(text.contains(&format!("@llvm.roundeven.{sname}")), "{text}");
+            assert!(text.contains("store i8"), "{text}");
+            assert!(!text.contains("fptrunc"), "{text}");
+        }
+        let mut b = Builder::new(i.intern(&format!("f8_{fname}_value")), MirType::I32);
+        let src = b.add_param(MirType::Ptr);
+        let v = b.build(f8.clone(), Op::Load(src, f8.clone()));
+        let w = b.build(MirType::F32, Op::Cast(CastKind::FpExt, v, MirType::F32));
+        let bits = b.build(MirType::I32, Op::Cast(CastKind::Bitcast, w, MirType::I32));
+        b.ret(Some(bits));
+        let text = emit(b.finish(), &i);
+        assert!(text.contains("load i8, ptr %v0"), "{text}");
+        assert!(!text.contains("fpext"), "{text}");
+    }
+}

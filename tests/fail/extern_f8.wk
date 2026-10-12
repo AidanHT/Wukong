@@ -1,0 +1,16 @@
+// EXPECT-CODE: C0001
+// EXPECT-COUNT: 2
+module tests.fail.extern_f8
+
+// An `extern "C"` signature cannot carry an 8-bit float: C has no FP8 type, and the value lives in
+// an f32 register rather than as its code, so no C type is right for it. The declaration is refused
+// (C0001) for a parameter and for a result alike; pass the code as a `u8` (`bits(x)`, and
+// `f8e4m3_from_bits(b)` on the way back) instead.
+extern "C" {
+    fn take(x: f8e4m3) -> i32; //~ C0001
+    fn make(c: u8) -> f8e5m2; //~ C0001
+}
+
+fn main() -> i32 {
+    return 0;
+}

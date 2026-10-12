@@ -76,7 +76,8 @@ pub enum ScalarBuiltin {
     OverflowingMul,
     /// `bits(x)` — a float's bit pattern as the same-width unsigned integer.
     Bits,
-    /// `f32_from_bits(u)` / `f64_from_bits` / `f16_from_bits` / `bf16_from_bits` — the inverse.
+    /// `f32_from_bits(u)` / `f64_from_bits` / `f16_from_bits` / `bf16_from_bits` /
+    /// `f8e4m3_from_bits` / `f8e5m2_from_bits` — the inverse.
     FromBits(Scalar),
     /// `isnan(x)`.
     IsNan,
@@ -131,6 +132,8 @@ pub fn scalar_builtin(name: &str) -> Option<ScalarBuiltin> {
         "f64_from_bits" => FromBits(Scalar::F64),
         "f16_from_bits" => FromBits(Scalar::F16),
         "bf16_from_bits" => FromBits(Scalar::Bf16),
+        "f8e4m3_from_bits" => FromBits(Scalar::F8E4M3),
+        "f8e5m2_from_bits" => FromBits(Scalar::F8E5M2),
         "isnan" => IsNan,
         "isinf" => IsInf,
         "isfinite" => IsFinite,
@@ -162,11 +165,13 @@ pub fn scalar_builtin_arity(b: ScalarBuiltin) -> usize {
     }
 }
 
-/// The unsigned integer type holding `f`'s bits (`f32` → `u32`, the 16-bit floats → `u16`).
+/// The unsigned integer type holding `f`'s bits (`f32` → `u32`, the 16-bit floats → `u16`, the
+/// 8-bit floats → `u8`, their OCP code).
 pub fn float_bits_type(f: Scalar) -> Scalar {
     match f {
         Scalar::F64 => Scalar::U64,
         Scalar::F16 | Scalar::Bf16 => Scalar::U16,
+        Scalar::F8E4M3 | Scalar::F8E5M2 => Scalar::U8,
         _ => Scalar::U32,
     }
 }

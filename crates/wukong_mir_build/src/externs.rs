@@ -129,7 +129,9 @@ pub(crate) fn lower_externs(
 fn c_abi(ty: &Ty, is_ret: bool) -> Option<ExternParam> {
     let (ty, signed) = match ty {
         Ty::Unit if is_ret => (MirType::Void, false),
-        Ty::Scalar(Scalar::F16 | Scalar::Bf16) => return None,
+        // A half or an 8-bit float has no C type (C23's `_Float16` is not `bf16`, and the f8
+        // formats have none at all).
+        Ty::Scalar(Scalar::F16 | Scalar::Bf16 | Scalar::F8E4M3 | Scalar::F8E5M2) => return None,
         // C has no standard 128-bit integer, and the compilers that offer `__int128` disagree on
         // how it is passed (a register pair, or by reference on Windows).
         Ty::Scalar(Scalar::I128 | Scalar::U128) => return None,

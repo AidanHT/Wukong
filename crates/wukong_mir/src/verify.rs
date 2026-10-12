@@ -107,7 +107,7 @@ const NO_IDOM: u32 = u32::MAX;
 fn cast_bits(ty: &MirType) -> Option<u64> {
     Some(match ty {
         MirType::I1 => 1,
-        MirType::I8 => 8,
+        MirType::I8 | MirType::F8E4M3 | MirType::F8E5M2 => 8,
         MirType::I16 | MirType::F16 | MirType::BF16 => 16,
         MirType::I32 | MirType::F32 => 32,
         MirType::I64 | MirType::F64 => 64,
@@ -119,18 +119,39 @@ fn cast_bits(ty: &MirType) -> Option<u64> {
     })
 }
 
-/// Whether `t` is (or contains) a vector whose lanes are `i128`.
-fn has_i128_lanes(t: &MirType) -> bool {
+/// Whether `t` is (or contains) a vector whose lanes are a scalar-only type: `i128` or an f8.
+fn has_scalar_only_lanes(t: &MirType) -> bool {
     match t {
-        MirType::Vec(lane, _) => **lane == MirType::I128 || has_i128_lanes(lane),
-        MirType::Array(elem, _) => has_i128_lanes(elem),
+        MirType::Vec(lane, _) => {
+            **lane == MirType::I128 || lane.is_f8() || has_scalar_only_lanes(lane)
+        }
+        MirType::Array(elem, _) => has_scalar_only_lanes(elem),
         _ => false,
+    }
+}
+
+/// Whether `t` is, or has lanes of, an 8-bit float.
+fn mentions_f8(t: &MirType) -> bool {
+    t.lane_type().is_f8()
+}
+
+/// The scalar-only lane type a malformed vector `t` carries, for the message.
+fn scalar_only_name(t: &MirType) -> String {
+    match t {
+        MirType::Vec(lane, _) if **lane == MirType::I128 || lane.is_f8() => lane.display(),
+        MirType::Vec(lane, _) | MirType::Array(lane, _) => scalar_only_name(lane),
+        other => other.display(),
     }
 }
 
 fn valid_cast(kind: CastKind, from: &MirType, to: &MirType) -> bool {
     use CastKind::*;
     if kind == Bitcast {
+        // An f8 value lives in an f32 register, not as its code, so no bitcast reinterprets one
+        // (`bits`/`f8e4m3_from_bits` convert through the codec instead).
+        if mentions_f8(from) || mentions_f8(to) {
+            return false;
+        }
         return (from == &MirType::Ptr && to == &MirType::Ptr)
             || cast_bits(from).is_some_and(|bits| Some(bits) == cast_bits(to));
     }
@@ -196,21 +217,24 @@ impl<'a> Verifier<'a> {
             }
         }
 
-        // `i128` is a scalar-only type: no backend has a vector of 128-bit lanes (Cranelift's x64
-        // ISA has none, and the interpreter's lane arms compute at most 64-bit lanes), so a vector
-        // of them is malformed wherever it appears.
+        // `i128` and the f8 floats are scalar-only types: no backend has a vector of 128-bit lanes
+        // (Cranelift's x64 ISA has none, and the interpreter's lane arms compute at most 64-bit
+        // lanes), and no backend rounds an f8 lane onto its grid, so a vector of either is
+        // malformed wherever it appears.
         for (i, t) in f.value_types.iter().enumerate() {
-            if has_i128_lanes(t) {
+            if has_scalar_only_lanes(t) {
                 self.err(format!(
-                    "value v{i} has type {}, but i128 has no vector form",
-                    t.display()
+                    "value v{i} has type {}, but {} has no vector form",
+                    t.display(),
+                    scalar_only_name(t)
                 ));
             }
         }
-        if has_i128_lanes(&f.ret) {
+        if has_scalar_only_lanes(&f.ret) {
             self.err(format!(
-                "the function returns {}, but i128 has no vector form",
-                f.ret.display()
+                "the function returns {}, but {} has no vector form",
+                f.ret.display(),
+                scalar_only_name(&f.ret)
             ));
         }
 
@@ -1274,6 +1298,59 @@ mod tests {
         assert!(cast_errors(CastKind::SiToFp, MirType::I128, MirType::F32).is_empty());
         assert!(cast_errors(CastKind::FpToUi, MirType::F64, MirType::I128).is_empty());
         assert!(!cast_errors(CastKind::Bitcast, MirType::I128, MirType::F64).is_empty());
+    }
+
+    /// The f8 floats are scalar-only like `i128`, and since an f8 value lives in an `f32` register
+    /// rather than as its code, no bitcast reinterprets one; every float cast to and from them is
+    /// checked by width (the two formats are both 8 bits, so either may round to the other).
+    #[test]
+    fn f8_is_a_scalar_only_float() {
+        use CastKind::*;
+        use MirType::*;
+        let mut i = wukong_span::Interner::new();
+        let mut b = crate::Builder::new(i.intern("narrow"), F8E4M3);
+        let x = b.add_param(F8E4M3);
+        let y = b.build(F8E4M3, Op::Bin(BinOp::FMul, x, x));
+        let r = b.build(F8E4M3, Op::Cast(FpTrunc, y, F8E4M3));
+        b.ret(Some(r));
+        let f = b.finish();
+        assert!(verify_function(&f).is_empty(), "{:?}", verify_function(&f));
+
+        for fmt in [F8E4M3, F8E5M2] {
+            let mut b = crate::Builder::new(i.intern("lanes"), Void);
+            let x = b.add_param(fmt.clone());
+            b.build(Vec(Box::new(fmt.clone()), 4), Op::Splat(x));
+            b.ret(None);
+            let errors = verify_function(&b.finish());
+            let want = format!("{} has no vector form", fmt.display());
+            assert!(errors.iter().any(|e| e.contains(&want)), "{errors:?}");
+
+            for (kind, from, to) in [
+                (FpTrunc, F32, fmt.clone()),
+                (FpTrunc, F64, fmt.clone()),
+                (FpTrunc, BF16, fmt.clone()),
+                (FpTrunc, fmt.clone(), fmt.clone()),
+                (FpTrunc, F8E4M3, F8E5M2),
+                (FpTrunc, F8E5M2, F8E4M3),
+                (FpExt, fmt.clone(), F32),
+                (FpExt, fmt.clone(), F16),
+                (FpToSi, fmt.clone(), I8),
+                (UiToFp, I64, fmt.clone()),
+            ] {
+                let errors = cast_errors(kind, from.clone(), to.clone());
+                assert!(errors.is_empty(), "{kind:?} {from:?} -> {to:?}: {errors:?}");
+            }
+            for (kind, from, to) in [
+                (Bitcast, fmt.clone(), I8),
+                (Bitcast, I8, fmt.clone()),
+                (FpExt, F32, fmt.clone()),
+                (FpTrunc, fmt.clone(), F32),
+                (SExt, fmt.clone(), I32),
+            ] {
+                let errors = cast_errors(kind, from.clone(), to.clone());
+                assert!(!errors.is_empty(), "{kind:?} {from:?} -> {to:?}");
+            }
+        }
     }
 
     /// `atomic.add` on a `ptr_ty` pointer operand and a `val_ty` value; `with_result` gives the

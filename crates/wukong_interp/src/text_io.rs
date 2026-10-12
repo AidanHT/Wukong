@@ -367,6 +367,10 @@ mod tests {
         assert_eq!(st::PRINT_DT_CHAR, rt::DT_CHAR);
         assert_eq!(st::PRINT_DT_I128, rt::DT_I128);
         assert_eq!(st::PRINT_DT_U128, rt::DT_U128);
+        assert_eq!(st::PRINT_DT_F8E4M3, rt::DT_F8E4M3);
+        assert_eq!(st::PRINT_DT_F8E5M2, rt::DT_F8E5M2);
+        assert_eq!(rt::elem_size(rt::DT_F8E4M3), Some(1));
+        assert_eq!(rt::elem_size(rt::DT_F8E5M2), Some(1));
         assert_eq!(rt::elem_size(rt::DT_I128), Some(16));
         assert_eq!(rt::elem_size(rt::DT_U128), Some(16));
         assert_eq!(st::SUMMARIZE_THRESHOLD as usize, rt::SUMMARIZE_THRESHOLD);

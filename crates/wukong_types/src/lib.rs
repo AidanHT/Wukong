@@ -39,6 +39,15 @@ pub enum Scalar {
     Isize,
     F16,
     Bf16,
+    /// OCP FP8 E4M3FN: 1 sign, 4 exponent (bias 7) and 3 mantissa bits in one byte; no infinity
+    /// (a finite overflow saturates to ±448) and one NaN code per sign (`S.1111.111`). Arithmetic
+    /// is carried out in `f32` and every result is rounded to the E4M3FN grid (nearest, ties to
+    /// even) — the rule of the `f32_to_f8e4m3` builtin. Stored as its 8-bit code.
+    F8E4M3,
+    /// OCP FP8 E5M2: 1 sign, 5 exponent (bias 15) and 2 mantissa bits in one byte — the top byte of
+    /// an IEEE `f16`, with its infinities and NaNs. Arithmetic is carried out in `f32` and every
+    /// result rounds to the E5M2 grid, overflowing to ±∞ (the `f32_to_f8e5m2` builtin's rule).
+    F8E5M2,
     F32,
     F64,
     Bool,
@@ -65,6 +74,8 @@ impl Scalar {
             "isize" => Isize,
             "f16" => F16,
             "bf16" => Bf16,
+            "f8e4m3" => F8E4M3,
+            "f8e5m2" => F8E5M2,
             "f32" => F32,
             "f64" => F64,
             "bool" => Bool,
@@ -90,6 +101,8 @@ impl Scalar {
             Isize => "isize",
             F16 => "f16",
             Bf16 => "bf16",
+            F8E4M3 => "f8e4m3",
+            F8E5M2 => "f8e5m2",
             F32 => "f32",
             F64 => "f64",
             Bool => "bool",
@@ -101,7 +114,7 @@ impl Scalar {
     pub fn size(self) -> u64 {
         use Scalar::*;
         match self {
-            I8 | U8 | Bool => 1,
+            I8 | U8 | Bool | F8E4M3 | F8E5M2 => 1,
             I16 | U16 | F16 | Bf16 => 2,
             I32 | U32 | F32 | Char => 4,
             I64 | U64 | F64 | Usize | Isize => 8,
@@ -114,7 +127,20 @@ impl Scalar {
     }
 
     pub fn is_float(self) -> bool {
-        matches!(self, Scalar::F16 | Scalar::Bf16 | Scalar::F32 | Scalar::F64)
+        matches!(
+            self,
+            Scalar::F8E4M3
+                | Scalar::F8E5M2
+                | Scalar::F16
+                | Scalar::Bf16
+                | Scalar::F32
+                | Scalar::F64
+        )
+    }
+
+    /// The two 8-bit floats, `f8e4m3` and `f8e5m2`.
+    pub fn is_f8(self) -> bool {
+        matches!(self, Scalar::F8E4M3 | Scalar::F8E5M2)
     }
 
     /// Every non-float, non-`Bool` scalar — so `Char` counts as an integer here (it lowers to a
@@ -138,7 +164,7 @@ impl Scalar {
             I32 | U32 | Char => 32,
             I64 | U64 | Usize | Isize => 64,
             I128 | U128 => 128,
-            F16 | Bf16 | F32 | F64 => return None,
+            F8E4M3 | F8E5M2 | F16 | Bf16 | F32 | F64 => return None,
         })
     }
 
@@ -678,6 +704,11 @@ mod tests {
         assert_eq!(Scalar::F32.size(), 4);
         assert_eq!(Scalar::F64.align(), 8);
         assert_eq!(Scalar::Bf16.size(), 2);
+        assert_eq!(Scalar::F8E4M3.size(), 1);
+        assert_eq!(Scalar::F8E5M2.align(), 1);
+        assert!(Scalar::F8E4M3.is_float() && Scalar::F8E5M2.is_float());
+        assert!(!Scalar::F8E4M3.is_int() && Scalar::F8E5M2.int_bits().is_none());
+        assert!(Scalar::F8E5M2.is_f8() && !Scalar::Bf16.is_f8());
         assert!(Scalar::F32.is_float());
         assert!(Scalar::I32.is_signed());
         assert!(!Scalar::U32.is_signed());
@@ -780,6 +811,8 @@ mod tests {
             Scalar::Usize,
             Scalar::F16,
             Scalar::Bf16,
+            Scalar::F8E4M3,
+            Scalar::F8E5M2,
             Scalar::F32,
             Scalar::F64,
         ] {

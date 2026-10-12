@@ -5,6 +5,46 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### First-class 8-bit floats: `f8e4m3` and `f8e5m2` (`gap7/f8-types`, N25)
+
+- **Added: the `f8e4m3` and `f8e5m2` scalar types** — OCP E4M3FN (bias 7, 3 mantissa bits, no
+  infinity, saturating at ±448, one NaN per sign) and OCP E5M2 (bias 15, 2 mantissa bits, IEEE
+  infinities), one byte each, in every position `bf16` takes: locals, parameters and results, struct
+  and tuple fields, arrays, slices, `alloc::<f8e4m3>(n)`, generic instantiations and tensor
+  elements, on the interpreter, the native backend (JIT and `--emit=obj|exe`) and the LLVM text
+  emitter. A value computes in `f32` and every result rounds to nearest, ties to even, onto its own
+  grid by the rule of the `f32_to_f8e4m3`/`f32_to_f8e5m2` builtins (E4M3FN saturates, E5M2
+  overflows to ±∞, a NaN becomes the canonical NaN of its sign), so each of `+ - * /` is the
+  correctly rounded f8 result and `-O0` and `-O2` agree. Before this FP8 was `u8` codes and
+  conversion builtins only.
+- **Literals, conversions, printing.** `1.5f8e4m3` / `3f8e5m2` suffixes and unsuffixed literals
+  adapting to an f8 type; a literal that would saturate, overflow or round to zero is the new
+  **`E0438`**. `as` reaches every integer and float type in one rounding — an `f64` is encoded from
+  its own bits, never through `f32` (which would round twice) — and an f8 widens losslessly in mixed
+  arithmetic to `f16`, `bf16`, `f32`, `f64`; `f8e4m3` with `f8e5m2`, or with an integer, is `E0440`.
+  An f8 prints as the `f32` it holds, in `print`, `printf` and aggregates. `bits(x)` is the OCP code
+  (`u8`) and `f8e4m3_from_bits` / `f8e5m2_from_bits` take one back; the float builtins (`sqrt`,
+  `exp`, `fma`, `ldexp`, `isinf`, …) compute in `f32` and round once.
+- **One codec, inline everywhere.** `wukong_runtime::fp8` gains a bit-level encoder (from `f32` and
+  from `f64`) and decoder, pinned to its exact reference on every code, every midpoint and its
+  neighbours and a 262144-pattern sweep. The interpreter calls it; Cranelift and the LLVM emitter
+  emit the identical integer sequence inline (no runtime call, no new link symbol). The native and
+  interpreted type is checked against the runtime on all 256 codes of both formats, every midpoint,
+  4096 `f32` patterns, an `f64` sweep and strided arithmetic at `-O0`/`-O2`
+  (`wukong_codegen_cranelift` `fp8_tests`); the LLVM codec is JIT-checked against a transcription
+  of the reference (`semantic_tests::f8_codec_modules`, 10556 checks under `verify_semantics.py`).
+- **Not 8-bit (documented):** SIMD lanes (`vec[f8e4m3, N]` is `E0302`, a loop over f8 data stays
+  scalar), kernel builtins, `atomic_add` (`E0446`), `extern "C"` (`C0001`), and
+  `--backend=gpu-native`, which declines a function holding one. Autodiff treats an f8 like a
+  `bf16`: straight-through rounding, adjoints in the value's type.
+- **Fixed: an integer converted to `bf16`/`f16` was not rounded at the value.** `sitofp`/`uitofp`
+  produce the `f32`, and only a store rounded it to the half grid, so once mem2reg forwarded the
+  value past its store, `print(i as bf16)` of 257 printed 257 at `-O2` (native and interpreter
+  alike) where `-O0` printed 256. The conversion now rounds at the value, for the 8-bit floats too.
+- Fixtures: `tests/run/f8_scalar.wk`, `f8_aggregates.wk`, `f8_code_round_trip.wk`;
+  `tests/fail/f8_literal_out_of_range.wk` (E0438), `f8_format_mix.wk` (E0440),
+  `f8_vector_lane.wk` (E0302), `extern_f8.wk` (C0001).
+
 ### First-class 128-bit integers: `i128` and `u128` (`gap6/i128`, N25)
 
 - **Added: the `i128` and `u128` scalar types.** 16 bytes, 16-byte aligned, in every position a

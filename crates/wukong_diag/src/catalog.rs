@@ -193,7 +193,8 @@ static CATALOG: &[Explanation] = &[
         "invalid element type",
         "The element type of a SIMD vector or tensor must be a scalar (e.g. `f32`, `i32`), not a \
          compound type. A SIMD vector's lanes are at most 64 bits wide: no vector instruction set \
-         has `i128`/`u128` lanes."
+         has `i128`/`u128` lanes. An 8-bit float (`f8e4m3`, `f8e5m2`) is a scalar type with no \
+         vector form either: use `f32` lanes and convert with `as`."
     ),
     entry!(
         "E0303",
@@ -879,18 +880,37 @@ fn main() -> i32 {
         good: "module ex.e0437\nfn main() -> i32 {\n    let s = alloc_f32(4);\n    free(s);\n    return 0;\n}\n"
     ),
     entry!(
+        "E0438",
+        "8-bit float literal out of range",
+        "A literal of an 8-bit float type — suffixed (`1.5f8e4m3`, `0.25f8e5m2`), or unsuffixed \
+         where it takes an `f8e4m3`/`f8e5m2` type from an annotation, a parameter, a field, a \
+         return type or a compound-assignment place — is worth its rounding onto the format's grid \
+         (nearest, ties to even). Two roundings would silently turn it into a different number, \
+         so both are rejected: a magnitude that rounds past the largest finite value (448 for \
+         `f8e4m3`, which has no infinity and saturates there; 57344 for `f8e5m2`, which would \
+         become infinity), and a nonzero literal that rounds to zero (below half the least value, \
+         2^-9 for `f8e4m3` and 2^-16 for `f8e5m2`). Losing digits is the format's precision and \
+         fine (`0.1f8e4m3` is 0.1015625). Write a value in range, `0.0` for zero, or keep the \
+         value in a wider float and convert it with `as`, which saturates or overflows by \
+         definition.",
+        bad: "module ex.e0438\nfn main() -> i32 {\n    let w: f8e4m3 = 500.0;\n    return w as i32;\n}\n",
+        good: "module ex.e0438\nfn main() -> i32 {\n    let w: f8e4m3 = 448.0;\n    return w as i32;\n}\n"
+    ),
+    entry!(
         "E0440",
         "mixed-type arithmetic with no lossless common type",
         "An arithmetic or bitwise operator combines two values of different scalar types, and no \
          type holds every value of both: `i32` with `u32` (or any signed with an unsigned type at \
          least as wide), an integer with a float that cannot represent all of it exactly (`i32` \
-         with `f32`, `i64` with `f64`), `f16` with `bf16`, or `char` with any other type. Such an \
-         operation used to pick a type by width and then by operand ORDER, so `a / b` and `b / a` \
+         with `f32`, `i64` with `f64`), `f16` with `bf16`, `f8e4m3` with `f8e5m2` (or an 8-bit \
+         float with any integer), or `char` with any other type. Such an operation used to pick a \
+         type by width and then by operand ORDER, so `a / b` and `b / a` \
          could compute in different types and `u32 / i64` divided UNSIGNED (`7 / -2 == 0`). \
          Implicit promotion now only widens, and in either order: integers of one signedness to the \
          wider one, an unsigned integer to a strictly wider signed one (`u32 + i64` is `i64`), \
-         `f16`/`bf16` to `f32` to `f64`, and an integer to a float that holds it exactly (8- and \
-         16-bit integers to `f32`, up to 32-bit integers to `f64`). A signed value known never to \
+         `f8e4m3`/`f8e5m2` to `f16`/`bf16` to `f32` to `f64`, and an integer to a float that \
+         holds it exactly (8- and 16-bit integers to `f32`, up to 32-bit integers to `f64`). A \
+         signed value known never to \
          be negative — a `for` counter that starts at a non-negative literal and is never \
          assigned, or a non-negative `const` — also converts to an unsigned type at least as wide, \
          so `i * n` with `n: usize` stays legal. An unsuffixed literal adapts to the other operand \

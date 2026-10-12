@@ -63,6 +63,7 @@ use wukong_mir::{
 };
 use wukong_span::{Interner, Symbol};
 
+mod fp8;
 mod runtime_abi;
 mod vec_kernels;
 
@@ -348,7 +349,9 @@ impl Intrinsic {
     fn classify(name: &str, first: Option<&MirType>) -> Option<Intrinsic> {
         match name {
             "print" | "println" => Some(match first {
-                Some(MirType::F32 | MirType::F16 | MirType::BF16) => Intrinsic::PrintF32,
+                Some(
+                    MirType::F32 | MirType::F16 | MirType::BF16 | MirType::F8E4M3 | MirType::F8E5M2,
+                ) => Intrinsic::PrintF32,
                 Some(t) if t.is_float() => Intrinsic::PrintFloat,
                 _ => Intrinsic::PrintInt,
             }),
@@ -426,7 +429,7 @@ fn callee(
 /// docs), everything else is itself.
 fn reg_mir(t: &MirType) -> MirType {
     match t {
-        MirType::F16 | MirType::BF16 => MirType::F32,
+        MirType::F16 | MirType::BF16 | MirType::F8E4M3 | MirType::F8E5M2 => MirType::F32,
         MirType::Vec(lane, n) if is_half(lane) => MirType::Vec(Box::new(MirType::F32), *n),
         other => other.clone(),
     }
@@ -462,7 +465,7 @@ fn mem_ty(t: &MirType) -> String {
 /// it out.
 fn mem_size(t: &MirType) -> u64 {
     match t {
-        MirType::I1 | MirType::I8 => 1,
+        MirType::I1 | MirType::I8 | MirType::F8E4M3 | MirType::F8E5M2 => 1,
         MirType::I16 | MirType::F16 | MirType::BF16 => 2,
         MirType::I32 | MirType::F32 => 4,
         MirType::I64 | MirType::F64 | MirType::Ptr => 8,
@@ -563,6 +566,9 @@ fn declarations(
             }
         }
         for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+            if let Some(src) = fp8::encoder_source(f, &inst.op) {
+                required.extend(fp8::encoder_intrinsics(&src));
+            }
             let call: Option<(String, Signature)> = match &inst.op {
                 Op::Call { func, args } => {
                     let name = interner.resolve(*func).to_owned();
@@ -1344,6 +1350,14 @@ impl Emitter<'_> {
             Op::Load(p, ty) => {
                 let r = inst.result.expect("a load has a result").0;
                 let ptr = self.operand(*p);
+                if let Some(fmt) = fp8::f8_format(ty) {
+                    // An f8 is stored as its `i8` code: decode it exactly into its `float`.
+                    let _ = writeln!(out, "  %v{r}.mem = load i8, ptr {ptr}");
+                    let _ = writeln!(out, "  %v{r}.code = zext i8 %v{r}.mem to i32");
+                    let f = self.f8_decode(out, &format!("%v{r}.code"), fmt);
+                    self.bind(out, &format!("%v{r}"), "float", &f);
+                    return;
+                }
                 if is_half(ty) || ty.lane_type() == &MirType::I1 {
                     // Narrow storage: load the stored bits, then widen to the register form (a
                     // half/bfloat widens exactly; a boolean byte keeps only its low bit, as the
@@ -1365,7 +1379,14 @@ impl Emitter<'_> {
                 let reg = self.ty(*value);
                 let v = self.operand(*value);
                 let p = self.operand(*ptr);
-                if is_half(vt) || vt.lane_type() == &MirType::I1 {
+                if let Some(fmt) = fp8::f8_format(vt) {
+                    // Encode the `float` (rounding it, should it be off the grid) and store the
+                    // `i8` code.
+                    let code = self.f8_encode(out, &v, &MirType::F32, fmt);
+                    let byte = self.fresh();
+                    let _ = writeln!(out, "  {byte} = trunc i32 {code} to i8");
+                    format!("store i8 {byte}, ptr {p}")
+                } else if is_half(vt) || vt.lane_type() == &MirType::I1 {
                     // Round to the stored grid (or widen a boolean to its byte) and store narrow.
                     let mem = mem_ty(vt);
                     let t = if is_half(vt) {
@@ -1673,6 +1694,17 @@ impl Emitter<'_> {
                         llvm_ty(to)
                     );
                 }
+            }
+            CastKind::FpExt if from.is_f8() => {
+                let fmt = fp8::f8_format(&from).expect("an f8 type");
+                let rounded = self.round_to_f8(out, &src, &from_reg, fmt);
+                self.convert_float(out, &dst, &rounded, &from_reg, &to_reg);
+            }
+            // One rounding from the source's own precision, a `double` included (`fp8.rs`).
+            CastKind::FpTrunc if to.is_f8() => {
+                let fmt = fp8::f8_format(to).expect("an f8 type");
+                let rounded = self.round_to_f8(out, &src, &from_reg, fmt);
+                self.bind(out, &dst, "float", &rounded);
             }
             CastKind::FpExt if is_half(&from) => {
                 let rounded = self.round_to_grid(out, &src, &from_reg, &from);
@@ -2018,6 +2050,8 @@ fn llvm_ty(t: &MirType) -> String {
         MirType::I128 => "i128".into(),
         MirType::F16 => "half".into(),
         MirType::BF16 => "bfloat".into(),
+        // An f8 has no LLVM type: in memory it is its `i8` code (its register is a `float`).
+        MirType::F8E4M3 | MirType::F8E5M2 => "i8".into(),
         MirType::F32 => "float".into(),
         MirType::F64 => "double".into(),
         MirType::Ptr => "ptr".into(),
@@ -2129,6 +2163,14 @@ fn fmt_float(v: f64, ty: &MirType) -> String {
     let x = match ty {
         MirType::F16 => wukong_runtime::round_f16(v as f32) as f64,
         MirType::BF16 => wukong_runtime::round_bf16(v as f32) as f64,
+        // An f8 constant: the literal rounded once onto the grid (`fp8.rs`).
+        t @ (MirType::F8E4M3 | MirType::F8E5M2) => {
+            let fmt = fp8::f8_format(t).expect("an f8 type");
+            f64::from(wukong_runtime::fp8::decode_f32(
+                wukong_runtime::fp8::encode_f64(v, fmt),
+                fmt,
+            ))
+        }
         MirType::F32 => v as f32 as f64,
         MirType::F64 => v,
         _ => unreachable!("floating constant has non-floating type"),

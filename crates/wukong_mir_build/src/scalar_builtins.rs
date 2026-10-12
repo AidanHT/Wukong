@@ -182,6 +182,16 @@ impl FnLowerer<'_> {
             IsNan | IsInf | IsFinite | SignBit => {
                 let ft = self.sb_float_operand_ty(&args[0]);
                 let x = self.sb_operand(&args[0], &ft);
+                // An 8-bit float is classified as the `f32` it widens to exactly: E4M3FN has no
+                // infinity to compare against (a `+inf` constant of the type saturates to 448).
+                let (x, ft) = if ft.is_f8() {
+                    (
+                        self.sb_cast(CastKind::FpExt, x, &MirType::F32),
+                        MirType::F32,
+                    )
+                } else {
+                    (x, ft)
+                };
                 Some(match b {
                     IsNan => self.sb_cmp(CmpOp::Fone, x, x),
                     IsInf => {
@@ -617,6 +627,17 @@ impl FnLowerer<'_> {
                 let b = self.sb_cast(CastKind::Bitcast, x, &i32t);
                 self.sb_quiet(b, &i32t)
             }
+            // An 8-bit float's bits are its OCP code: the f32 it lives as, encoded (exact — the
+            // value is on the grid — and a NaN is its format's one canonical NaN code).
+            MirType::F8E4M3 | MirType::F8E5M2 => {
+                let w = self.sb_cast(CastKind::FpExt, x, &MirType::F32);
+                let fmt = if *ft == MirType::F8E4M3 {
+                    Fp8::E4M3
+                } else {
+                    Fp8::E5M2
+                };
+                self.sb_fp8_encode(w, fmt)
+            }
             // A half lives as the f32 of its value (widening is exact, and its NaNs are already
             // quiet): bf16 is the top half of those bits, f16 is re-encoded from them.
             MirType::BF16 => {
@@ -702,11 +723,23 @@ impl FnLowerer<'_> {
         self.sb_bin(BinOp::Or, sign, mag, &t)
     }
 
-    /// `f32_from_bits` / `f64_from_bits` / `bf16_from_bits` / `f16_from_bits` of the integer `u`
-    /// (already the float's width).
+    /// `f32_from_bits` / `f64_from_bits` / `bf16_from_bits` / `f16_from_bits` /
+    /// `f8e4m3_from_bits` / `f8e5m2_from_bits` of the integer `u` (already the float's width).
     fn sb_from_bits(&mut self, u: ValueId, f: Scalar) -> ValueId {
         let i32t = MirType::I32;
         match f {
+            // The code decoded exactly, then held on the grid like every value of the type (a NaN
+            // code becomes the format's canonical NaN, as rounding any NaN does).
+            Scalar::F8E4M3 | Scalar::F8E5M2 => {
+                let fmt = if f == Scalar::F8E4M3 {
+                    Fp8::E4M3
+                } else {
+                    Fp8::E5M2
+                };
+                let w = self.sb_fp8_decode(u, fmt);
+                let ty = MirType::from_scalar(f);
+                self.sb_cast(CastKind::FpTrunc, w, &ty)
+            }
             Scalar::F64 => {
                 let q = self.sb_quiet(u, &MirType::I64);
                 self.sb_cast(CastKind::Bitcast, q, &MirType::F64)
@@ -920,7 +953,10 @@ impl FnLowerer<'_> {
     /// infinities included) is `a + ln 2`, and a NaN propagates. Built on the shared `exp`/`log1p`
     /// (the f32 polynomials or the f64 library); a half computes in `f32` and rounds once.
     fn sb_logaddexp(&mut self, a: ValueId, b: ValueId, ty: &MirType) -> ValueId {
-        let half = matches!(ty, MirType::F16 | MirType::BF16);
+        let half = matches!(
+            ty,
+            MirType::F16 | MirType::BF16 | MirType::F8E4M3 | MirType::F8E5M2
+        );
         let ct = if half { MirType::F32 } else { ty.clone() };
         let (a, b) = if half {
             (

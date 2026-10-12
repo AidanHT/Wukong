@@ -147,12 +147,12 @@ impl Pass for Simplify {
                             // >= 2^(w-1) (or an `as iW` reinterpret) folds against the raw i128 and
                             // -O2 disagrees with -O0.
                             let oty = f.value_types[l.0 as usize].clone();
-                            // Do not fold a bf16/f16 comparison, for the same reason `fold_bin`
-                            // refuses bf16/f16 arithmetic: `round_float_to_ty` rounds these to the
+                            // Do not fold a bf16/f16/f8 comparison, for the same reason `fold_bin`
+                            // refuses their arithmetic: `round_float_to_ty` rounds these to the
                             // f32 grid, not the narrow grid the backends round to at runtime. Two
                             // distinct f32 literals sharing one bf16 grid point compare EQUAL when
                             // the op runs and "not equal" when folded here — an -O0/-O2 branch flip.
-                            if !matches!(oty, MirType::BF16 | MirType::F16) {
+                            if !oty.is_sub_f32_float() {
                                 let val = fold_cmp(c, a, bv, &oty);
                                 set_const(f, bi, ii, CV::Int(val), &MirType::I1);
                                 put(&mut consts, res, CV::Int(val));
@@ -272,7 +272,9 @@ fn set_const(f: &mut Function, bi: usize, ii: usize, cv: CV, ty: &MirType) {
 /// result, so an f32 operand and the running value stay at f32 precision through the whole chain.
 fn round_float_to_ty(v: f64, ty: &MirType) -> f64 {
     match ty {
-        MirType::F32 | MirType::F16 | MirType::BF16 => v as f32 as f64,
+        MirType::F32 | MirType::F16 | MirType::BF16 | MirType::F8E4M3 | MirType::F8E5M2 => {
+            v as f32 as f64
+        }
         _ => v,
     }
 }
@@ -306,15 +308,13 @@ fn fold_int_cast(k: CastKind, x: i128, from: &MirType, to: &MirType) -> Option<i
 fn fold_bin(b: BinOp, a: CV, c: CV, ty: &MirType) -> Option<CV> {
     match (a, c) {
         (CV::Int(x), CV::Int(y)) if !b.is_float() => fold_int(b, x, y, ty).map(CV::Int),
-        // Do not fold bf16/f16 arithmetic. The backends compute these in f32 and round to the narrow
+        // Do not fold bf16/f16/f8 arithmetic. The backends compute these in f32 and round to the narrow
         // grid only at the store/cast, so a *runtime* `a + b` of two grid consts rounds correctly — but
         // folding here would combine the UNROUNDED `ConstFloat` operands (the MIR const carries the
         // literal f32, not its bf16-grid value) and bake a wrong-grid constant, making -O2 disagree
         // with -O0. Leaving the op to run keeps both levels identical (and bf16/f16 are storage
         // formats — seldom compile-time-constant operands, so the lost fold barely matters).
-        (CV::Float(x), CV::Float(y))
-            if b.is_float() && !matches!(ty, MirType::BF16 | MirType::F16) =>
-        {
+        (CV::Float(x), CV::Float(y)) if b.is_float() && !ty.is_sub_f32_float() => {
             Some(CV::Float(round_float_to_ty(fold_float(b, x, y), ty)))
         }
         _ => None,

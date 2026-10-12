@@ -1295,3 +1295,28 @@ fn law_d_sees_a_lost_keyword_or_at_sign() {
         assert!(e.contains(&format!("`{lost}`")), "{src}: {e}");
     }
 }
+
+/// The 8-bit float types and literal suffixes are tokens like any other: a type name in every type
+/// position and a suffix that stays glued to its literal (an `e` inside `f8e4m3` is not an
+/// exponent, and `3f8e5m2` is a float literal), with the usual spacing and parenthesization.
+#[test]
+fn f8_types_and_suffixes_keep_their_spelling() {
+    golden(
+        "fn f( x : f8e4m3 , y:[f8e5m2;4] ) -> f8e5m2 {
+    let a = 1.5f8e4m3 ;
+    let b: f8e5m2 = -0.25e1f8e5m2 + 3f8e5m2;
+    let c = ( x as f8e5m2 ) * y[ 0 ];
+    let d: (f8e4m3,[]f8e5m2) = (a, y);
+    return c;
+}
+",
+        "fn f(x: f8e4m3, y: [f8e5m2; 4]) -> f8e5m2 {
+    let a = 1.5f8e4m3;
+    let b: f8e5m2 = -0.25e1f8e5m2 + 3f8e5m2;
+    let c = x as f8e5m2 * y[0];
+    let d: (f8e4m3, []f8e5m2) = (a, y);
+    return c;
+}
+",
+    );
+}
