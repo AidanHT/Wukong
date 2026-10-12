@@ -74,7 +74,9 @@
 //!   accumulates into its output, or reads it in place, kills nothing;
 //! * **a synthesized vector kernel** (`Op::VecKernelCall`) whose recipe stores to a stream it never
 //!   loads, over a vector part long enough to cover the slot, when the stream's table entry is the
-//!   slot's own address and no other stream is.
+//!   slot's own address and nothing the kernel reads reaches the slot: another stream into it must
+//!   be write-only too, and neither the scalars nor an address held in a slot the kernel reaches
+//!   may lead to it.
 //!
 //! The kill is a property of the instruction or edge, so it ends the slot's lifetime there on every
 //! path: backward liveness is classic gen/kill (reads generate, full overwrites kill, partial writes

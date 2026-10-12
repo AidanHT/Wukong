@@ -1246,8 +1246,9 @@ impl<'a> Proof<'a> {
     }
 
     /// The slots a vector-kernel call at instruction `at` of block `b` writes completely: each one a
-    /// write-only stream names exactly (offset 0, nothing else reaching it) over a vector part at
-    /// least as long as the slot.
+    /// write-only stream names exactly (offset 0) over a vector part at least as long as the slot,
+    /// when nothing the kernel reads reaches it (`vec_writes_only`: other write-only streams into
+    /// it may).
     fn vec_kernel_kills(&self, b: u32, at: usize) -> Vec<u32> {
         let mut out = Vec::new();
         let Some(call) = self.vec_call(b, at, &Scope::default()) else {

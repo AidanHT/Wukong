@@ -542,8 +542,10 @@ enum VecCall {
     Accumulates,
     /// The vector part covers 32 of the 64 floats.
     Short,
-    /// Both streams are `s`.
+    /// Both streams are `s`, and stream 0 is loaded.
     Aliased,
+    /// Both streams name the output and both are only stored: `out[i] = 2`, twice.
+    TwoOutputs,
 }
 
 /// `s` and `t` are written at the top, then each is filled through a vector kernel and read. Do they
@@ -565,7 +567,13 @@ fn vec_scratch(how: VecCall) -> bool {
     write_at(&mut b, src, 0);
     write_at(&mut b, s, 0);
     write_at(&mut b, t, 0);
-    let store1 = if how == VecCall::Accumulates {
+    let store1 = if how == VecCall::TwoOutputs {
+        vec![
+            VecOp::Splat { scalar: 0 },
+            VecOp::Store { stream: 0, val: 0 },
+            VecOp::Store { stream: 1, val: 0 },
+        ]
+    } else if how == VecCall::Accumulates {
         vec![
             VecOp::Load { stream: 0 },
             VecOp::Load { stream: 1 },
@@ -606,10 +614,10 @@ fn vec_scratch(how: VecCall) -> bool {
         (tables[0], s, if how == VecCall::Short { 32 } else { 64 }),
         (tables[1], t, 64),
     ] {
-        let first = if how == VecCall::Aliased && out == s {
-            s
-        } else {
-            src
+        let first = match how {
+            VecCall::Aliased if out == s => s,
+            VecCall::TwoOutputs => out,
+            _ => src,
         };
         b.build_void(Op::Store {
             ptr: table,
@@ -647,11 +655,14 @@ fn vec_scratch(how: VecCall) -> bool {
 }
 
 /// A vector kernel that stores a stream it never loads, over a vector part as long as the slot the
-/// stream's table entry names, overwrites that slot; one that accumulates into the stream, covers
-/// part of it, or reaches the slot through two streams does not.
+/// stream's table entry names, overwrites that slot, even when a second write-only stream names it
+/// too; one that accumulates into the stream, covers part of it, or also reaches the slot through
+/// a stream it loads does not.
 #[test]
 fn a_vector_kernel_output_stream_is_a_full_overwrite() {
-    assert!(!vec_scratch(VecCall::Overwrites));
+    for how in [VecCall::Overwrites, VecCall::TwoOutputs] {
+        assert!(!vec_scratch(how), "{how:?} must end the lifetime");
+    }
     for how in [VecCall::Accumulates, VecCall::Short, VecCall::Aliased] {
         assert!(vec_scratch(how), "{how:?} must not end the lifetime");
     }
