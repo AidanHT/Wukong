@@ -183,8 +183,9 @@ All notable changes to Wukong are documented here. The format is loosely based o
   the bytes; `==`/`!=` compare length then bytes; `print`/`println`/`print_raw`/`eprint`/`eprintln`
   and every `printf` placeholder print the text (`{:?}` quotes it). A `str` is a valid parameter,
   return value, `const`, struct field and array element (`tests/run/str_basics.wk`).
-- **Immutable by type.** A `str`'s bytes are never a place: `s[i] = b`, `s[i] += b` and `&mut s[i]`
-  are `E0304` (`tests/fail/str_immutable.wk`). It converts to and from nothing — not `[]u8`, not
+- **Immutable by type.** A `str`'s bytes are never a place: `s[i] = b`, `s[i] += b`,
+  `atomic_add(s[i], v)` and `&mut s[i]` are `E0304` (`tests/fail/str_immutable.wk`,
+  `tests/fail/str_atomic_add.wk`). It converts to and from nothing — not `[]u8`, not
   `*u8`, not by `as` (`E0401`) — so a `str` only ever views a literal or a slice of one. `<`,
   arithmetic and `==` against a non-`str` are `E0433`; a `str` inside a printed aggregate is
   `E0448`.

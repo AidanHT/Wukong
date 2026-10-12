@@ -341,7 +341,8 @@ another architecture or OS is not supported. A native-backend failure is a catal
   (and as an `==` operand or a range-index base); `s.len()`, bounds-checked `s[i] -> u8`,
   `for b in s`, `==`/`!=` (length, then bytes), and printing the text (`{:?}` quotes it) all run.
   A `str` can be a parameter, a return value, a `const`, a struct field or an array element
-  (`tests/run/str_basics.wk`). Its bytes are never written (`s[i] = b` and `&mut s[i]` are `E0304`)
+  (`tests/run/str_basics.wk`). Its bytes are never written (`s[i] = b`, `atomic_add(s[i], v)` and `&mut s[i]`
+  are `E0304`)
   and it converts to and from nothing (`E0401`). Sema erases `str` to `[]u8` when it publishes its
   types, so lowering, the optimizer and every backend run the existing slice machinery; the new
   lowerings are the byte-compare loop for `==` and the sub-slice.

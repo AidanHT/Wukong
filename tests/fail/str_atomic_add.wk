@@ -1,0 +1,13 @@
+// EXPECT-CODE: E0304
+module tests.fail.str_atomic_add
+
+// `atomic_add(place, v)` writes its place exactly as `place += v` does, so a byte of a `str` is no
+// more a place for it than for `=`: the `str` views a string literal's read-only `.rodata` bytes.
+// Before the check ran for `atomic_add`, this printed `xukong` on the interpreter and segfaulted
+// natively.
+fn main() -> i32 {
+    let s: str = "wukong";
+    atomic_add(s[0], 1);
+    println(s);
+    return 0;
+}

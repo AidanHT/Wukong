@@ -214,8 +214,9 @@ static CATALOG: &[Explanation] = &[
          `fn f(p: S) { p.a = 9; }` would write into the caller's value — add `mut` to the parameter \
          (`fn f(mut p: S)`). Writing through a pointer parameter (`*p = …`) needs no `mut`, because \
          the pointer itself is not being reassigned. The bytes of a `str` are never a place at \
-         all: `s[i] = …`, `s[i] += …` and `&mut s[i]` are rejected, because a `str` views a string \
-         literal's read-only storage (a `mut` binding may still be re-pointed, `s = t`).",
+         all: `s[i] = …`, `s[i] += …`, `atomic_add(s[i], …)` and `&mut s[i]` are rejected, \
+         because a `str` views a string literal's read-only storage (a `mut` binding may still be \
+         re-pointed, `s = t`).",
         bad: "module ex.e0304\nfn main() -> i32 {\n    let x: i32 = 5;\n    x = 10;\n    return x;\n}\n",
         good: "module ex.e0304\nfn main() -> i32 {\n    let mut x: i32 = 5;\n    x = 10;\n    return x;\n}\n"
     ),

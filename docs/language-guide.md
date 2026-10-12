@@ -443,8 +443,8 @@ printf("[{}|{:?}]\n", s, s[..2]);   // [wukong|"wu"]
 - **Printing.** `print`, `println`, `print_raw`, `eprint`, `eprintln` and the `printf` / `eprintf` /
   `sprintf` placeholders print the text, and `{:?}` quotes it, as for a `*u8`. A `str` inside a
   printed aggregate (a struct, tuple or array holding one) is `E0448` for now: print the field.
-- **Immutable.** A `str`'s bytes are never a place: `s[i] = b`, `s[i] += b` and `&mut s[i]` are
-  `E0304`. A `mut` binding can still be re-pointed (`s = s[1..];`).
+- **Immutable.** A `str`'s bytes are never a place: `s[i] = b`, `s[i] += b`,
+  `atomic_add(s[i], v)` and `&mut s[i]` are `E0304`. A `mut` binding can still be re-pointed (`s = s[1..];`).
 - **No conversions.** A `str` converts to and from nothing: not `[]u8`, not `*u8`, not by `as`
   (`E0401`). There is no concatenation yet.
 - **Not generic.** A `str` cannot bind a type parameter (`id(s)` with `fn id<T>(x: T) -> T` is

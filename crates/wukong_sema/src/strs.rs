@@ -6,8 +6,8 @@
 //!
 //! * no conversion exists between `str` and `[]u8` or `*u8`, in either direction (`E0401`; an `as`
 //!   cast is rejected by `cast_is_valid`);
-//! * an element store `s[i] = b`, a compound one, and `&mut s[i]` are `E0304`
-//!   ([`Sema::check_str_write`]);
+//! * an element store `s[i] = b`, a compound one, `atomic_add(s[i], v)` and `&mut s[i]` are
+//!   `E0304` ([`Sema::check_str_write`], called from `check_projection_write` and `&mut`);
 //! * a `str` comes only from a string literal (a `.rodata` blob) or from slicing a `str`, so there
 //!   is no writable storage behind one to begin with.
 //!
@@ -117,8 +117,9 @@ impl Sema<'_> {
         );
     }
 
-    /// `E0304` when the place `target` (of an assignment, a compound assignment, or `&mut`) is a
-    /// byte of a `str`: a `str` views a string literal's read-only storage, or a slice of one.
+    /// `E0304` when the place `target` (of an assignment, a compound assignment, `atomic_add` or
+    /// `&mut`) is a byte of a `str`: a `str` views a string literal's read-only storage, or a
+    /// slice of one.
     pub(crate) fn check_str_write(&mut self, target: &Expr) {
         let ExprKind::Index { base, .. } = &target.kind else {
             return;
@@ -553,6 +554,15 @@ fn main() -> i32 {
         );
         rejects(
             "fn f(mut s: str) { s[0] = 1; } fn main() -> i32 { return 0; }",
+            "E0304",
+        );
+        // `atomic_add` writes its place like `=` does: on a `str` it would write `.rodata`.
+        rejects(
+            "fn main() -> i32 { let s: str = \"abc\"; atomic_add(s[0], 1); return 0; }",
+            "E0304",
+        );
+        rejects(
+            "fn main() -> i32 { let s: str = \"abc\"; atomic_add(s[1..][0], 1); return 0; }",
             "E0304",
         );
         // Re-pointing a `mut` binding is not a write into the bytes.

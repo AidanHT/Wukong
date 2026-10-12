@@ -151,7 +151,8 @@ and the instance re-check reports a wrong binding (`Sema::rechecking_instance`, 
 call's bound dimensions by `wukong_sema::constraints`; `static_assert` lowers to nothing.
 **`str` is erased at the sema boundary.** `Ty::Str` exists only inside `wukong_sema`, which is
 the single authority that a `str` is never written (no conversion to or from `[]u8`/`*u8`; an
-element store or `&mut s[i]` is `E0304`; a `str` comes only from a literal or from slicing a
+element store, `atomic_add(s[i], v)` or `&mut s[i]` is `E0304`, through the one
+`check_projection_write` hook every place-writing statement shares; a `str` comes only from a literal or from slicing a
 `str`). `check` publishes every type through `Ty::erase_str` (`strs::erase_published`: the type
 table, function signatures, `const` types, struct fields, enum payloads), so `mir_build`, the
 optimizer and every backend see the `[]u8` fat pointer they already run; a published `Ty::Str` is

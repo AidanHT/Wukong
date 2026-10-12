@@ -2843,11 +2843,15 @@ impl<'a> Sema<'a> {
     }
 
     /// E0304 for a write through a projection (`p.f`, `t.0`, `p[i]`, `t[i, j]`) of a non-`mut`
-    /// aggregate parameter, and the write-through-a-tensor-view diagnostic: the projection half of
-    /// `=`'s mutability rule, shared by every statement that writes a place (`x = v`, `x op= v` and
-    /// `atomic_add(place, v)`). A no-op for any other target: a bare name has its own rule, and a
-    /// dereference (`*p`, `(*p).f`) writes a pointee, not the parameter.
+    /// aggregate parameter, or into a byte of a `str` (`strs.rs`), and the write-through-a-tensor-
+    /// view diagnostic: the projection half of `=`'s mutability rule, shared by every statement
+    /// that writes a place (`x = v`, `x op= v` and `atomic_add(place, v)`). A no-op for any other
+    /// target: a bare name has its own rule, and a dereference (`*p`, `(*p).f`) writes a pointee,
+    /// not the parameter.
     pub(crate) fn check_projection_write(&mut self, target: &Expr) {
+        // A byte of a `str` is never a place, whatever its root: a `str` views a string literal's
+        // read-only storage.
+        self.check_str_write(target);
         if !matches!(
             target.kind,
             ExprKind::Field { .. } | ExprKind::TupleField { .. } | ExprKind::Index { .. }
@@ -3151,8 +3155,6 @@ impl<'a> Sema<'a> {
                         self.check_compound_operand(*op, target, value, ts, vs);
                     }
                 }
-                // A byte of a `str` is never a place (`strs.rs`).
-                self.check_str_write(target);
                 // Reassigning an immutable binding requires `mut`, but it was never enforced. Two
                 // cases, both E0304:
                 //   • Direct rebind of a single name (`x = …`): rejected for a non-`mut` `let` AND a
