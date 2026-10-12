@@ -10,6 +10,7 @@ oracle).
 
 ```rust
 grad(func: &Function, wrt: &[usize], interner: &mut Interner) -> Result<Function, String>
+grad_program(program, func, wrt, interner) -> Result<Gradient, String>   // + @parallel regions
 inline_calls(program: &Program, func: &Function) -> Function          // splice straight-line helpers
 grad_dot(func, wrt, interner) -> Result<Function, String>             // <v, ∇L>, single-block
 hvp(func, wrt, interner) -> Result<(Function, Function), String>      // (grad_dot, Hessian·v)
@@ -50,11 +51,26 @@ the fused `wukong_vmath2_f32` backward codes, `wukong_xent_bwd_f32`, `wukong_rop
 accumulate across fan-out (`Vjp::begin`/`end`, a GEMM's `beta = 1`); scratch is zeroed heap
 (`wukong_rt_alloc`), released before the gradient returns.
 
+## `@parallel` regions (`region.rs`)
+
+`grad_program` is `grad` for a loss that runs `wukong_parallel_for(n, &P, env)` — a loop region of a
+`@parallel` function, or a whole-function `@parallel` helper spliced in. `program` supplies `P`,
+which must be the canonical `-O1` counted loop with ONE straight-line iteration block (the driver
+re-optimizes outlined bodies at `-O1` for a gradient compile). The result's `support` holds, per
+region, `{name}_grad$par<i>$it(hh, env, gc)` — one iteration recomputed and differentiated by the
+single-block rules in region mode (captured buffers are bases whose gradients arrive in `gc`; every
+contribution accumulates; the replay never rewrites a captured buffer) — and the chunk driver
+`{name}_grad$par<i>(cs, ce, benv)` the gradient hands to `wukong_parallel_for`. A buffer several
+iterations read gets `K = min(N, 16)` private zeroed adjoint copies, added back in chunk order; the
+chunks depend on `N` only, so the gradient's bits do not depend on the thread count or the backend.
+Declines (by name): control flow in the iteration, a region reading what it writes, a captured buffer
+the loss rewrites after the region, a shared buffer of unknown extent, second order.
+
 ## LANDMINE — the recognizer ↔ autodiff coupling
 
 Every `"wukong_*"` symbol `wukong_mir_build` can emit must be in `tape::FORWARD_KERNELS` (with a VJP
-rule), in `coverage::SCALAR_CORE`, or in `coverage::NOT_DIFFERENTIABLE` with the reason a decline
-reports. `tests/mirror.rs` scans `wukong_mir_build`'s sources and fails the build otherwise — a new
+rule), in `coverage::SCALAR_CORE`, in `coverage::REGION_CALLS` (`wukong_parallel_for`, the region
+rule), or in `coverage::NOT_DIFFERENTIABLE` with the reason a decline reports. `tests/mirror.rs` scans `wukong_mir_build`'s sources and fails the build otherwise — a new
 recognizer arm (serial or `_parallel`) cannot land without an autodiff disposition. Runtime op codes
 (`VM_*`, `VM2_*`, `RED_*`, `NORM_*`, `VE_*`, `EPI_*`) at the top of `tape.rs` mirror
 `wukong_runtime` — a renumber there silently changes which rule fires.

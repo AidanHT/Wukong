@@ -5,7 +5,7 @@
 //! generic "no VJP rule" refusal (the historical `norm_f32_parallel` hole). Now every `"wukong_*"`
 //! symbol in `wukong_mir_build`'s source must be exactly one of: a forward kernel the tape
 //! differentiates (`tape::FORWARD_KERNELS`), a routine the scalar core differentiates
-//! (`SCALAR_CORE`), or an entry below — and `tests.rs`
+//! (`SCALAR_CORE`), the `@parallel` region call (`REGION_CALLS`), or an entry below — and `tests.rs`
 //! (`every_emitted_kernel_symbol_is_differentiable_or_declined_by_name`) fails the build otherwise,
 //! in both directions (a new symbol with no disposition, a stale entry for a symbol that is gone).
 //!
@@ -22,6 +22,11 @@ pub(crate) const SCALAR_CORE: &[&str] = &[
     "wukong_rt_math_f64",
     "wukong_rt_math2_f64",
 ];
+
+/// Runtime entries the region rule (`region.rs`) differentiates: the `@parallel` loop region,
+/// whose backward is a region over the same iterations. (Read only by the coupling test.)
+#[cfg(test)]
+pub(crate) const REGION_CALLS: &[&str] = &["wukong_parallel_for"];
 
 const INDEX_VALUED: &str = "returns an index (argmax / argmin): piecewise constant, so its \
                             derivative is zero almost everywhere and undefined at a tie";
@@ -152,11 +157,6 @@ pub(crate) const NOT_DIFFERENTIABLE: &[(&str, &str)] = &[
     (
         "wukong_vhorner_f32",
         "the streaming Horner polynomial has no VJP rule yet",
-    ),
-    (
-        "wukong_parallel_for",
-        "a mid-function @parallel region: the outlined body is opaque to the tape; keep loops \
-         whose gradient is wanted in the serial spelling (whole-function @parallel is fine)",
     ),
     ("wukong_now_ns", NO_GRADIENT),
     ("wukong_rt_alloc", NO_GRADIENT),

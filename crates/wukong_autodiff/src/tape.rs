@@ -318,6 +318,7 @@ pub(crate) fn pick(serial: Symbol, parallel: Symbol, par: bool) -> Symbol {
 
 /// Interned symbols for the kernels we recognize (forward) and emit (backward). Interning dedups,
 /// so these compare equal to the symbols a forward tape was built with.
+#[derive(Clone)]
 pub(crate) struct Syms {
     /// Forward recognition: symbol -> (family, `@parallel` spelling). Built from [`FORWARD_KERNELS`];
     /// only ever looked up, never iterated, so its hash order cannot reach the emitted MIR.
@@ -372,6 +373,9 @@ pub(crate) struct Syms {
     /// ever read uninitialized memory (a `0·NaN` garbage fill is NaN).
     pub rt_alloc: Symbol,
     pub rt_free: Symbol,
+    /// `wukong_parallel_for(n, body, env)`: a `@parallel` region in the forward, and the call that
+    /// runs its backward (`region.rs`).
+    pub pfor: Symbol,
 }
 
 impl Syms {
@@ -417,6 +421,7 @@ impl Syms {
             scatter_add_par: it.intern("wukong_scatter_add_f32_parallel"),
             rt_alloc: it.intern("wukong_rt_alloc"),
             rt_free: it.intern("wukong_rt_free"),
+            pfor: it.intern("wukong_parallel_for"),
         }
     }
 
@@ -490,6 +495,24 @@ impl<'a> Vjp<'a> {
         // Forward order, so the LAST writer of a buffer is the one recorded.
         for (out, kind, args) in outs {
             self.kernel_out.insert(out, (kind, args));
+        }
+        // A buffer a `@parallel` region writes has another writer like a stored-into one (the
+        // write-after-write rule), and a written parameter needs a gradient when it is read later.
+        let regions = self.regions;
+        for r in regions {
+            for (k, v) in r.slots.iter().enumerate() {
+                let (Some(v), Some(u)) = (v, r.body.slots.get(k)) else {
+                    continue;
+                };
+                if !u.write {
+                    continue;
+                }
+                let base = self.canon(*v);
+                self.store_written.insert(base);
+                if self.fwd.params.contains(&base) {
+                    self.region_out.insert(base);
+                }
+            }
         }
         self.multi_written
             .extend(writes.into_iter().filter(|&(_, c)| c > 1).map(|(b, _)| b));
@@ -603,7 +626,8 @@ impl<'a> Vjp<'a> {
         };
         let out = args[oi];
         let base = self.store_base(out);
-        if base != out && self.buf_adj.contains_key(&base) {
+        // A slice of a region's captured buffer is keyed on its own (`Vjp::region_setup`).
+        if base != out && self.buf_adj.contains_key(&base) && !self.buf_adj.contains_key(&out) {
             return Err(format!(
                 "autodiff: `{}` writes a sub-slice (v{}) of buffer v{}, whose gradient is live; \
                  the buffer tape keeps one gradient per whole buffer, so the kernel's output \
@@ -629,8 +653,11 @@ impl<'a> Vjp<'a> {
             return;
         };
         let out = args[oi];
-        let has_other_writer =
-            self.multi_written.contains(&out) || self.store_written.contains(&out);
+        // In a region's iteration, a write into a captured buffer overwrote what the forward held
+        // there before the region: that slice's adjoint stops here.
+        let has_other_writer = self.multi_written.contains(&out)
+            || self.store_written.contains(&out)
+            || self.region_written(out);
         if !has_other_writer || self.kernel_reads_output(kind, args) {
             return;
         }
@@ -1425,11 +1452,44 @@ impl<'a> Vjp<'a> {
         if let Some(&g) = self.buf_adj.get(&buf) {
             return Ok(Some(g));
         }
+        // Region mode: a captured buffer's gradient is the pointer the chunk driver handed in.
+        if let Some(target) = self.region_grad_target(buf) {
+            return target;
+        }
         if let Some(&gp) = self.grad_buf.get(&buf) {
             self.buf_adj.insert(buf, gp);
             return Ok(Some(gp));
         }
         if self.fwd.params.contains(&buf) {
+            if !self.kernel_out.contains_key(&buf) && self.region_out.contains(&buf) {
+                // A parameter only a region writes: size its gradient from the declared extent,
+                // in its own element type (a region may compute in `f64`).
+                let sized = [F32, MirType::F64]
+                    .into_iter()
+                    .find_map(|e| Some((self.region_buffer_size(buf, &e)?, e)));
+                let (n, elem) = sized.ok_or_else(|| {
+                    format!(
+                        "autodiff: buffer v{} is written by a @parallel region and read later, \
+                         but it is not in the differentiated (`wrt`) set and its extent is not a \
+                         fixed float length — add v{} to the wrt list",
+                        buf.0, buf.0
+                    )
+                })?;
+                let count = self.cint(n as i64);
+                let width = self.cint(if elem == MirType::F64 { 8 } else { 4 });
+                let is_float = self.cint(1);
+                let f = self.syms.rt_alloc;
+                let g = self.b.build(
+                    PTR,
+                    Op::Call {
+                        func: f,
+                        args: vec![count, width, is_float],
+                    },
+                );
+                self.scratch.push(g);
+                self.buf_adj.insert(buf, g);
+                return Ok(Some(g));
+            }
             let Some((kind, args)) = self.kernel_out.get(&buf).copied() else {
                 return Ok(None); // a non-differentiated input (e.g. the target labels)
             };

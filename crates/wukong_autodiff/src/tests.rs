@@ -20,6 +20,7 @@ mod calls;
 mod kernels;
 mod memory;
 mod mirror;
+mod regions;
 mod writes;
 use wukong_mir::{BinOp, Builder, Function, MirType, Op, Program, ValueId};
 use wukong_span::{Interner, Symbol};
@@ -1777,13 +1778,12 @@ fn mlp2_adamw_decreases_loss() {
     );
 }
 
-/// The tape.rs coupling contract for mid-function `@parallel` loop regions (mir_build's
-/// `try_emit_parallel_region`): a forward function containing a region — an `Op::FuncAddr` of the
-/// outlined body plus a void `wukong_parallel_for` call — must DECLINE loudly. The runtime
-/// dispatch writes buffers no VJP rule models, so `grad` must surface the existing
-/// unrecognized-buffer-writing-call error instead of silently emitting a zero gradient. A function
-/// whose backward is wanted must keep its loops in the serial spelling (exactly the behavior the
-/// whole-function `@parallel` wrapper already has).
+/// A forward function containing a mid-function `@parallel` loop region (mir_build's
+/// `try_emit_parallel_region`) — an `Op::FuncAddr` of the outlined body plus a void
+/// `wukong_parallel_for` call — is differentiated by `grad_program`, which is handed the program
+/// holding the outlined body (`tests/regions.rs`). Plain `grad` has no program to find the body in,
+/// so it must DECLINE loudly, naming the route, instead of silently emitting a zero gradient for the
+/// buffers the region writes.
 #[test]
 fn parallel_region_declines_loudly() {
     let mut it = Interner::default();
@@ -1829,10 +1829,10 @@ fn parallel_region_declines_loudly() {
     b.ret(Some(loss));
     let fwd = b.finish();
 
-    let err = grad(&fwd, &[0], &mut it).expect_err("a parallel region must not tape");
+    let err = grad(&fwd, &[0], &mut it).expect_err("a region with no body in sight must not tape");
     assert!(
-        err.contains("no VJP rule"),
-        "the decline must be the loud unrecognized-call error, got: {err}"
+        err.contains("no VJP rule") && err.contains("wukong$par$0") && err.contains("grad_program"),
+        "the decline must name the region and the route, got: {err}"
     );
 }
 

@@ -1,12 +1,13 @@
 //! P12.15: the recognizer ↔ autodiff coupling, enforced. Every `"wukong_*"` runtime symbol
 //! `wukong_mir_build` can emit must be a forward kernel the tape differentiates
-//! (`tape::FORWARD_KERNELS`), a routine the scalar core differentiates (`coverage::SCALAR_CORE`), or a
-//! named, reasoned entry in `coverage::NOT_DIFFERENTIABLE` — and nothing else. A recognizer arm that
+//! (`tape::FORWARD_KERNELS`), a routine the scalar core differentiates (`coverage::SCALAR_CORE`), the
+//! `@parallel` region call the region rule differentiates (`coverage::REGION_CALLS`), or a named,
+//! reasoned entry in `coverage::NOT_DIFFERENTIABLE` — and nothing else. A recognizer arm that
 //! lands without a mirror (the historical `norm_f32_parallel` hole, where a model differentiated in
 //! its serial spelling and not in its `@parallel` one) now fails here instead of in a user's
 //! `--train`.
 
-use crate::coverage::{NOT_DIFFERENTIABLE, SCALAR_CORE};
+use crate::coverage::{NOT_DIFFERENTIABLE, REGION_CALLS, SCALAR_CORE};
 use crate::tape::FORWARD_KERNELS;
 use std::collections::{BTreeSet, HashSet};
 
@@ -54,12 +55,14 @@ fn every_emitted_kernel_symbol_is_differentiable_or_declined_by_name() {
     );
     let forward: HashSet<&str> = FORWARD_KERNELS.iter().map(|&(n, _, _)| n).collect();
     let scalar: HashSet<&str> = SCALAR_CORE.iter().copied().collect();
+    let region: HashSet<&str> = REGION_CALLS.iter().copied().collect();
     let declined: HashSet<&str> = NOT_DIFFERENTIABLE.iter().map(|&(n, _)| n).collect();
     let mut problems = Vec::new();
     for s in &emitted {
         let homes = [
             ("FORWARD_KERNELS", forward.contains(s.as_str())),
             ("SCALAR_CORE", scalar.contains(s.as_str())),
+            ("REGION_CALLS", region.contains(s.as_str())),
             ("NOT_DIFFERENTIABLE", declined.contains(s.as_str())),
         ];
         let found: Vec<&str> = homes.iter().filter(|h| h.1).map(|h| h.0).collect();
@@ -75,7 +78,7 @@ fn every_emitted_kernel_symbol_is_differentiable_or_declined_by_name() {
     }
     // No stale entries: a declined or scalar symbol mir_build no longer emits is dead weight that
     // would hide a renamed recognizer.
-    for name in declined.iter().chain(scalar.iter()) {
+    for name in declined.iter().chain(scalar.iter()).chain(region.iter()) {
         if !emitted.contains(*name) {
             problems.push(format!(
                 "`{name}` is listed as non-differentiable but wukong_mir_build no longer emits it"
