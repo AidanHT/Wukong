@@ -276,7 +276,7 @@ fn float_print_object_emission_remains_available() {
     };
     let mut timer = report::PassTimer::new(&opts);
     assert_eq!(
-        emit_native(&program, &interner, &opts, &mut timer),
+        emit_native(&program, &interner, &opts, &mut timer, None),
         exit::OK
     );
     assert!(std::fs::metadata(object).unwrap().len() > 0);

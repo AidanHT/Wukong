@@ -35,7 +35,10 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
 native code (default `native`, the host's features); below x86-64-v3 the raw-AVX2 loop kernels are
 not used, so an object built on an AVX2 machine runs on a baseline x86-64 CPU. Cross-compilation to
 another architecture or OS is not supported. A native-backend failure is a catalogued diagnostic
-(`C0002` for a single layout above 4 GiB, `C0001` for a by-design decline) in both `--error-format`s.
+(`C0002` for a single layout above 4 GiB, `C0001` for a by-design decline) in both `--error-format`s,
+and it points at the source construct being lowered (the oversized `let`, the unsupported call):
+every MIR value remembers its source span through every `-O` level into Cranelift's per-instruction
+source locations. A DWARF line table built from them is not emitted yet.
 
 - **Multi-file modules with real namespaces**: `import a.b` loads `a/b.wk` (resolved against the
   *root* source file's directory); files load once each — an import cycle or diamond dedups by

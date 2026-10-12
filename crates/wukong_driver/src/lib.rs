@@ -661,7 +661,10 @@ pub fn compile(opts: &Options) -> i32 {
     // the "aborting due to" summary below.
     emit_diags(&lint_diags, opts, &renderer, &sm);
     drop(lint_diags);
-    drop(sm);
+    // The native backend reports its failures (`C0002`, `C0001`, an ICE) at the source construct
+    // it was lowering (`NativeFailure::site`), so the source map stays alive on the paths that
+    // reach Cranelift; every other path releases it here, before optimization.
+    let native_sm = native_reachable(opts).then_some(sm);
     let lowering_failed = lower_errors > 0;
     drop(lower_diags);
 
@@ -888,12 +891,13 @@ pub fn compile(opts: &Options) -> i32 {
                         timer.begin("run");
                         (compiled.run_streaming(line_buffered), Vec::new())
                     }
-                    Err(message) => {
+                    Err(failure) => {
+                        let sm = native_sm.as_ref();
                         emit_diag(
-                            &native_failure_diag(&message, &opts.input),
+                            &native_failure_diag(&failure, &opts.input, sm),
                             opts.error_format,
                             &renderer,
-                            &SourceMap::new(),
+                            sm.unwrap_or(&SourceMap::new()),
                         );
                         return exit::COMPILE_ERROR;
                     }
@@ -969,10 +973,17 @@ pub fn compile(opts: &Options) -> i32 {
         };
     }
     if matches!(opts.emit, EmitStage::Obj | EmitStage::Exe) {
-        return emit_native(&program, &interner, opts, &mut timer);
+        return emit_native(&program, &interner, opts, &mut timer, native_sm.as_ref());
     }
 
     exit::OK
+}
+
+/// Can this compile reach the Cranelift backend — `--run --backend=native`, `--emit=obj` or
+/// `--emit=exe`? Only those keep the source map past lowering, to locate a native failure.
+fn native_reachable(opts: &Options) -> bool {
+    (opts.run && opts.backend == BackendKind::Native)
+        || matches!(opts.emit, EmitStage::Obj | EmitStage::Exe)
 }
 
 /// Execute `entry` on the GPU backend: the interpreter tree-walks the program while recognized kernel
@@ -1605,6 +1616,7 @@ fn emit_native(
     interner: &Interner,
     opts: &Options,
     timer: &mut report::PassTimer,
+    sm: Option<&SourceMap>,
 ) -> i32 {
     timer.begin("codegen");
     let backend = wukong_codegen_cranelift::BackendOpt::for_level(opts.opt_level);
@@ -1639,12 +1651,12 @@ fn emit_native(
     };
     let obj = match emitted {
         Ok(b) => b,
-        Err(e) => {
+        Err(failure) => {
             emit_diag(
-                &native_failure_diag(&e, &opts.input),
+                &native_failure_diag(&failure, &opts.input, sm),
                 opts.error_format,
                 &Renderer::new(opts.color),
-                &SourceMap::new(),
+                sm.unwrap_or(&SourceMap::new()),
             );
             return exit::COMPILE_ERROR;
         }
@@ -1731,27 +1743,55 @@ fn emit_native(
 }
 
 /// A native-backend (Cranelift) failure as a diagnostic, so it reaches `--error-format=json` and
-/// `--explain` like every front-end error instead of escaping as a bare `error:` line. MIR carries no
-/// source spans, so the diagnostic names the program and — for a layout failure — the offending type
-/// and the function that declares it (the backend puts both in the message).
-fn native_failure_diag(message: &str, input: &Path) -> Diagnostic {
+/// `--explain` like every front-end error instead of escaping as a bare `error:` line. The message
+/// names the program and — for a layout failure — the offending type and the function that
+/// declares it; the primary label points at the construct the backend was lowering
+/// ([`wukong_codegen_cranelift::NativeFailure::site`]) when `sm` holds its file.
+fn native_failure_diag(
+    failure: &wukong_codegen_cranelift::NativeFailure,
+    input: &Path,
+    sm: Option<&SourceMap>,
+) -> Diagnostic {
     use wukong_codegen_cranelift::NativeErrorKind;
+    let message = failure.message.as_str();
     let program = format!(
         "while compiling `{}` for the native backend",
         input.display()
     );
+    // Both renderers index the source map by the span, so only a span inside a file the map
+    // holds becomes a label (the guard `locate` uses in `compile`).
+    let site = failure.site.filter(|span| {
+        sm.is_some_and(|sm| {
+            !span.is_dummy()
+                && (span.source.0 as usize) < sm.file_count()
+                && span.lo <= span.hi
+                && span.hi as usize <= sm.source(span.source).len()
+        })
+    });
+    let at = |d: Diagnostic, label: &str| match site {
+        Some(span) => d.primary(span, label),
+        None => d,
+    };
     match wukong_codegen_cranelift::classify_error(message) {
-        NativeErrorKind::LayoutTooLarge => Diagnostic::error(message)
-            .with_code("C0002")
-            .note(program)
-            .help(
-                "allocate the buffer on the heap (`alloc_f32(n)` and its siblings) or split it; \
-                 `--run` (the interpreter) has no byte-layout limit",
-            ),
-        NativeErrorKind::Unsupported => Diagnostic::error(message).with_code("C0001").note(program),
-        NativeErrorKind::Internal => {
-            Diagnostic::bug(format!("native code generation failed: {message}")).note(program)
-        }
+        NativeErrorKind::LayoutTooLarge => at(
+            Diagnostic::error(message).with_code("C0002"),
+            "laid out here",
+        )
+        .note(program)
+        .help(
+            "allocate the buffer on the heap (`alloc_f32(n)` and its siblings) or split it; \
+             `--run` (the interpreter) has no byte-layout limit",
+        ),
+        NativeErrorKind::Unsupported => at(
+            Diagnostic::error(message).with_code("C0001"),
+            "the native backend cannot lower this",
+        )
+        .note(program),
+        NativeErrorKind::Internal => at(
+            Diagnostic::bug(format!("native code generation failed: {message}")),
+            "while lowering this",
+        )
+        .note(program),
     }
 }
 
@@ -2964,7 +3004,9 @@ fn emit_train_artifact(
     // --backend=native` JIT compiles the same dispatcher with.
     let mut aot = opts.clone();
     aot.opt_level = opts.opt_level.max(1);
-    emit_native(&artifact, interner, &aot, timer)
+    // Training artifacts stay span-less: the source map is not threaded through the training
+    // path, and most of this program (the kernels, the dispatcher, `main`) is synthesized.
+    emit_native(&artifact, interner, &aot, timer, None)
 }
 
 /// The program a training artifact is code-generated from: [`build_training`]'s kernels, the
