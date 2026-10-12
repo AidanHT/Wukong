@@ -42,6 +42,11 @@ use wukong_span::Interner;
 /// The first line of every typed dump; the version names this format.
 pub const HEADER: &str = "; wukong mir text v1";
 
+/// The largest value arena a parsed function may ask for: the arena is sized by the largest id the
+/// text mentions, so one mistyped `v4000000000` must be an error, not a multi-gigabyte allocation.
+/// Far above any function the compiler builds.
+pub const MAX_VALUES: u32 = 1 << 24;
+
 /// The message for a `veckernel` line, which has no textual form.
 pub const VECKERNEL_UNREPRESENTABLE: &str =
     "vector-kernel recipes have no textual form; dump with --target-cpu=x86-64-v2";
@@ -400,6 +405,13 @@ impl FnParser {
     /// Read a value id, `vN`, noting it for the arena size.
     fn value(&mut self, s: &str) -> Result<ValueId, String> {
         let v = parse_value(s)?;
+        if v.0 >= MAX_VALUES {
+            return Err(format!(
+                "v{} is past the largest value id this parser accepts (v{})",
+                v.0,
+                MAX_VALUES - 1
+            ));
+        }
         self.max_value = Some(self.max_value.map_or(v.0, |m| m.max(v.0)));
         Ok(v)
     }
@@ -446,7 +458,13 @@ impl FnParser {
             if !self.blocks.is_empty() || self.open.is_some() || self.arena.is_some() {
                 return Err("`values` must come before the first block".to_string());
             }
-            self.arena = Some(parse_num(rest, "value count")?);
+            let n: u32 = parse_num(rest, "value count")?;
+            if n > MAX_VALUES {
+                return Err(format!(
+                    "`values {n}` is past the largest arena this parser accepts ({MAX_VALUES})"
+                ));
+            }
+            self.arena = Some(n as usize);
             return Ok(());
         }
         if is_block_header(text) {
@@ -1653,6 +1671,9 @@ mod tests {
         assert_eq!((e.line, e.msg.as_str()), (4, "v0 is defined twice"));
         let e = error_in("    v1: i32 = add v0");
         assert!(e.msg.contains("expected 2 operand(s)"), "{e}");
+        let e = error_in("    v4000000000: i32 = add v0, v0");
+        assert_eq!(e.line, 4);
+        assert!(e.msg.contains("past the largest value id"), "{e}");
 
         let blocks = format!("{HEADER}\nfn f() -> void {{\n  bb1:\n    ret\n}}\n");
         let e = parse_program(&blocks, &mut Interner::new()).unwrap_err();
