@@ -25,10 +25,15 @@
 //! statements of every accepted statement input, in order, ahead of the new input, in the same
 //! `main`: a later `let` of the same name shadows an earlier one, as in any block. The replay's
 //! standard output and standard error are captured and dropped, so only the new input's output
-//! shows. What a replay cannot undo it repeats, and that is the documented cost: it re-executes the
-//! earlier inputs (one that took a second costs a second on every later input), re-writes the files
-//! they wrote, and reads the clock anew. A program in a session reads end of input from standard
-//! input, which the session itself is reading ([`wukong_runtime::process::detach_stdin`]).
+//! shows. A binding is therefore not a stored value but its statements, re-run on every input
+//! against the items as they are then: redefining an item a binding was computed from changes the
+//! binding's value from the next input on, without an error (unless the replay breaks). What a
+//! replay cannot undo it repeats, and that is the documented cost: it re-executes the earlier
+//! inputs (one that took a second costs a second on every later input), re-writes the files they
+//! wrote, reads the clock anew, and allocates their heap buffers again — on the native JIT a buffer
+//! an input never `free`s stays allocated until the session ends (the interpreter's memory is per
+//! run). A program in a session reads end of input from standard input, which the session itself
+//! is reading ([`wukong_runtime::process::detach_stdin`]).
 //!
 //! An input is **accepted** — kept for later inputs — only when it compiles and, for statements,
 //! runs to its end. One that fails to compile, fails at run time (a failed `assert`, an index out
@@ -83,9 +88,10 @@ value. An input continues on the next line while a bracket or a block comment is
 while it is only `@attributes` (they belong to the item or statement after them).
 
 Earlier `let` bindings persist: each input runs after a silent replay of every earlier statement
-input, so their side effects (work done, files written) repeat, while their output is hidden.
-An input that fails to compile or to run is not kept. A new item replaces an earlier item of
-the same name.
+input, so their side effects (work done, files written, memory allocated) repeat, while their
+output is hidden. A binding is recomputed by every replay, so redefining an item it was computed
+from changes its value. An input that fails to compile or to run is not kept. A new item
+replaces an earlier item of the same name.
 
 Commands:
   :help          this text

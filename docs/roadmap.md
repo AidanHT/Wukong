@@ -866,8 +866,11 @@ line table built from them is not emitted yet.
   and `:type <expr>` (sema's type, nothing runs). Every input is its own file `<repl:N>`, so
   diagnostics point into it; a failing input (compile, run time, `exit`) is dropped and the session
   goes on (`crates/wukongc/tests/repl.rs`, both backends). 🟡 Sharp edges, by design of the replay:
-  every input re-executes the earlier ones (their time, their file writes, their clock reads), and an
-  input's output appears when it finishes, not as it runs. A top-level `return`/`defer` is refused,
+  every input re-executes the earlier ones (their time, their file writes, their clock reads, their
+  heap allocations — on the native JIT a buffer never `free`d stays allocated until the session
+  ends), a binding is recomputed by every replay, so redefining an item it was computed from
+  changes its value without an error, and an input's output appears when it finishes, not as it
+  runs. A top-level `return`/`defer` is refused,
   a program reads end of input from `read_stdin_u8`, and the GPU backends are not offered.
 - **`--run` streams stdout** on the interpreter and the native JIT — per line on a terminal, in
   64 KiB blocks into a pipe — instead of holding everything until the program ends, so a training

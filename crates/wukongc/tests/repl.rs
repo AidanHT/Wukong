@@ -354,6 +354,28 @@ q + r
     );
 }
 
+/// A binding is not a stored value: every input recomputes it by replaying the statements that made
+/// it, against the items as they are then. A redefinition that breaks nothing is accepted, without a
+/// word, and changes every binding computed from the item it replaces.
+#[test]
+fn a_redefinition_recomputes_the_bindings_made_from_it() {
+    let transcript = "\
+fn rate() -> i32 { 2 }
+let tax = 100 * rate();
+tax
+fn rate() -> i32 { 3 }
+tax
+";
+    for mode in MODES {
+        let (code, out, err) = repl(&mode, transcript);
+        assert_eq!(code, Some(0), "{mode:?}: {err}");
+        // 100 * 2 when `tax` was made; 100 * 3 once `rate` is redefined, though no input assigned
+        // to `tax` in between.
+        assert_eq!(out, "200\n300\n", "{mode:?}: {err}");
+        assert_eq!(err, "", "{mode:?}: the redefinition is accepted silently");
+    }
+}
+
 /// A value with no printed form shows its type; a top-level `return` or `defer`, and a `main`, are
 /// refused; `:quit` ends the session before the lines after it.
 #[test]

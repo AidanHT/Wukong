@@ -2699,11 +2699,17 @@ angle brackets (`<fn(f32) -> f32>`). Imports resolve against the current directo
 **Bindings persist by replay.** Each statement input runs after a replay of every earlier statement
 input that was kept, in order, in the same `main` — so `let` bindings, and every later assignment to
 them, carry forward, and a later `let` of a name shadows the earlier one as it would in a block. The
-replay's stdout and stderr are captured and dropped, so only the new input's output shows. What the
-replay cannot undo it repeats: the earlier inputs' work is redone on every input (an input that took
-a second costs a second each time after), files they wrote are written again, and a clock read reads
-anew. A program in the REPL reads end of input from `read_stdin_u8` — standard input is the
-session's. Output appears when the input finishes running.
+replay's stdout and stderr are captured and dropped, so only the new input's output shows. A
+binding is therefore not a stored value, as it is in Python or Julia, but its statements, re-run on
+every input against the items as they are then: after `fn rate() -> i32 { 2 }` and
+`let tax = 100 * rate();`, `tax` is `200`, and once `fn rate() -> i32 { 3 }` replaces `rate`, `tax`
+is `300` — no input assigned to it, and the redefinition is accepted without a word because the
+replay still runs. What the replay cannot undo it repeats: the earlier inputs' work is redone on
+every input (an input that took a second costs a second each time after), files they wrote are
+written again, a clock read reads anew, and their heap buffers are allocated again — on the native
+JIT a buffer an input never `free`s stays allocated until the session ends (the interpreter's
+memory lasts one run). A program in the REPL reads end of input from `read_stdin_u8` — standard
+input is the session's. Output appears when the input finishes running.
 
 **An input that fails is not kept.** One that fails to compile, fails at run time (a failed
 `assert`, an index out of bounds) or ends the program early (`exit(c)`, a `return` inside a block)

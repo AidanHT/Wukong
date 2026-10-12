@@ -31,9 +31,12 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `--backend=native`; an input ending in an expression prints its value `{:?}`-style (a value with
   no printed form prints its type, `<fn(f32) -> f32>`). Bindings persist by replay: each input runs
   after every earlier accepted statement input, whose stdout and stderr are captured and dropped —
-  so the earlier inputs' work, file writes and clock reads repeat, and that cost is documented. An
-  input that fails to compile, fails at run time or calls `exit` is reported and not kept; a new
-  item is compiled and replayed with the session, so a redefinition that breaks an earlier input is
+  so the earlier inputs' work, file writes, clock reads and heap allocations repeat (on the native
+  JIT a buffer never `free`d stays allocated until the session ends), and that cost is documented.
+  A binding is its statements, recomputed by every replay, not a stored value: redefining an item
+  it was computed from changes its value from the next input on, without an error. An input that
+  fails to compile, fails at run time or calls `exit` is reported and not kept; a new item is
+  compiled and replayed with the session, so a redefinition that breaks an earlier input is
   refused. Every input is its own source file `<repl:N>`, so diagnostics point into the input with
   lines counted from its own first line; warnings show for the new input only, and
   `unused_variables`, `unused_mut`, `unused_imports` and `dead_code` are off. Commands: `:help`,
