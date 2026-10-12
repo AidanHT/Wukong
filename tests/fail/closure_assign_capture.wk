@@ -1,0 +1,21 @@
+// EXPECT-CODE: E0304
+// EXPECT-COUNT: 1
+module tests.fail.closure_assign_capture
+
+// A closure captures `count` by value: the copy is read-only, so assigning it inside the closure
+// would update nothing the caller can see. Capturing a pointer (`let pc = &mut count;`, then
+// `*pc = *pc + 1.0;` in the closure) is the way to update the caller's variable.
+
+fn apply(f: fn(f32) -> f32, x: f32) -> f32 {
+    return f(x);
+}
+
+fn main() -> i32 {
+    let mut count = 0.0;
+    print(apply(|x| {
+        count = count + 1.0; //~ E0304
+        x
+    }, 2.0));
+    print(count);
+    return 0;
+}

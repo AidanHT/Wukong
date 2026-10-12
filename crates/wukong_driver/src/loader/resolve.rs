@@ -1125,6 +1125,24 @@ impl Rewriter<'_> {
             }
             ExprKind::Loop { body, .. } => self.block(body),
             ExprKind::SizeOf(t) | ExprKind::AlignOf(t) => self.ty(t),
+            // A closure's parameters are locals of its body, so one shadows an imported name
+            // there exactly as a `match` arm's binding does.
+            ExprKind::Closure { params, ret, body } => {
+                for p in params.iter_mut() {
+                    if let Some(t) = &mut p.ty {
+                        self.ty(t);
+                    }
+                }
+                if let Some(r) = ret {
+                    self.ty(r);
+                }
+                self.locals.push(Vec::new());
+                for p in params.iter() {
+                    self.bind(p.name.sym);
+                }
+                self.expr(body);
+                self.locals.pop();
+            }
         }
     }
 }

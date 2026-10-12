@@ -30,6 +30,7 @@ mod alias;
 mod bounds;
 mod builtins;
 mod canon;
+mod closures;
 mod colacc;
 #[cfg(test)]
 mod coverage_tests;
@@ -148,6 +149,9 @@ struct Mono {
     /// so no per-call-site plumbing is needed; a probe/kernel lowerer (`mono == None`) falls back to
     /// the frame-local byte buffer (fine — those never return a string literal).
     strings: HashMap<Vec<u8>, Symbol>,
+    /// Every lifted closure, by its function's name (`closures.rs`): what an instance bound to one
+    /// declares as its environment, and what a call passing one copies into it.
+    closures: closures::ClosureTable,
 }
 
 impl Mono {
@@ -571,7 +575,8 @@ impl MonoCollector<'_> {
             | ExprKind::Bool(_)
             | ExprKind::Path(_)
             | ExprKind::SizeOf(_)
-            | ExprKind::AlignOf(_) => {}
+            | ExprKind::AlignOf(_)
+            | ExprKind::Closure { .. } => {}
             ExprKind::Unary { expr, .. } => self.walk_expr(expr, subst),
             ExprKind::Binary { lhs, rhs, .. } => {
                 self.walk_expr(lhs, subst);
@@ -709,6 +714,8 @@ fn collect_mono(module: &Module, sema: &SemaResult, interner: &mut Interner) -> 
         // Populated separately by the caller (`lower_program`) via `collect_static_strings`, which
         // also needs `&mut interner`; kept out of the generic-collection walk to avoid coupling.
         strings: HashMap::default(),
+        // Set by the caller from `closures::lift_module`, like `strings`.
+        closures: closures::ClosureTable::default(),
     }
 }
 
@@ -828,7 +835,8 @@ fn collect_str_expr(e: &Expr, out: &mut Vec<Symbol>) {
         | ExprKind::Bool(_)
         | ExprKind::Path(_)
         | ExprKind::SizeOf(_)
-        | ExprKind::AlignOf(_) => {}
+        | ExprKind::AlignOf(_)
+        | ExprKind::Closure { .. } => {}
         ExprKind::Unary { expr, .. } => collect_str_expr(expr, out),
         ExprKind::Binary { lhs, rhs, .. } => {
             collect_str_expr(lhs, out);
@@ -988,7 +996,8 @@ fn collect_field_bases_expr(e: &Expr, out: &mut Vec<(Symbol, Symbol)>) {
         | ExprKind::Bool(_)
         | ExprKind::Path(_)
         | ExprKind::SizeOf(_)
-        | ExprKind::AlignOf(_) => {}
+        | ExprKind::AlignOf(_)
+        | ExprKind::Closure { .. } => {}
         ExprKind::Unary { expr, .. } => collect_field_bases_expr(expr, out),
         ExprKind::Binary { lhs, rhs, .. } => {
             collect_field_bases_expr(lhs, out);
@@ -1253,8 +1262,19 @@ fn lower_program_pooled(
     report: bool,
     pool: usize,
 ) -> (Program, Vec<Diagnostic>, bool) {
-    // First of all, before the two normalizations below: every method call whose target sema
-    // resolved becomes the plain call of its function, so everything below sees an ordinary call
+    // First of all: every closure literal becomes the name of a lifted top-level function
+    // (`closures.rs`), so everything below — the method desugaring included — sees only ordinary
+    // functions and calls. `None`, nothing cloned, for a module without closures.
+    let mut lifted = closures::lift_module(module, sema, interner);
+    let closure_table = lifted
+        .as_mut()
+        .map(|(_, _, t)| std::mem::take(t))
+        .unwrap_or_default();
+    let module: &Module = lifted.as_ref().map(|(m, _, _)| m).unwrap_or(module);
+    let sema: &SemaResult = lifted.as_ref().map(|(_, s, _)| s).unwrap_or(sema);
+
+    // Then, before the two normalizations below: every method call whose target sema resolved
+    // becomes the plain call of its function, so everything below sees an ordinary call
     // (`methods.rs`).
     let desugared = methods::desugar_module(module, sema);
     let desugared_sema = desugared.as_ref().map(|(_, extra)| {
@@ -1514,6 +1534,7 @@ fn lower_program_pooled(
     // intern the instance names), then lower the module. A type-generic function is NOT lowered here
     // (a generic type param has no single MIR type); its specialized copies are emitted afterward.
     let mut mono = collect_mono(module, sema, interner);
+    mono.closures = closure_table;
     // Intern every unique string literal into a read-only `.rodata` blob (deduped by content) and
     // hand the content->symbol table to the lowerer via `mono`, so `ExprKind::Str` yields a stable
     // `Op::GlobalAddr` address instead of a per-use stack buffer (a returned `*u8` no longer dangles).
@@ -2625,7 +2646,8 @@ fn escapes_parallel_chunk_expr(e: &Expr, depth: u32) -> bool {
         | ExprKind::Bool(_)
         | ExprKind::Path(_)
         | ExprKind::SizeOf(_)
-        | ExprKind::AlignOf(_) => false,
+        | ExprKind::AlignOf(_)
+        | ExprKind::Closure { .. } => false,
         ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => {
             escapes_parallel_chunk_expr(expr, depth)
         }
@@ -3049,15 +3071,25 @@ fn lower_fn(
     // type — the free `mir_ty` falls back to `I32`, which mistyped a struct param as a scalar (the
     // root of the by-value-struct miscompile and the `mem2reg` panic that promoted that bogus slot).
     // A function-typed parameter has no runtime value (it is specialized away, `methods.rs`), so
-    // it declares no MIR parameter.
-    let param_abis: Vec<Option<MirType>> = param_tys
-        .iter()
-        .map(|pty| methods::param_has_value(pty).then(|| fl.param_abi(pty)))
-        .collect();
-    let param_vals: Vec<Option<ValueId>> = param_abis
-        .iter()
-        .map(|abi| abi.as_ref().map(|abi| fl.builder.add_param(abi.clone())))
-        .collect();
+    // it declares no MIR parameter of its own — but when this instance binds it to a closure with
+    // captures, the closure's environment takes its place: one parameter per captured value, in
+    // the order `lower_call` passes them (`closures.rs`).
+    let mut param_vals: Vec<Option<ValueId>> = Vec::with_capacity(param_tys.len());
+    let mut closure_env: Vec<(Symbol, usize, ValueId, Ty)> = Vec::new();
+    for (p, pty) in f.params.iter().zip(&param_tys) {
+        if methods::param_has_value(pty) {
+            let abi = fl.param_abi(pty);
+            param_vals.push(Some(fl.builder.add_param(abi)));
+            continue;
+        }
+        param_vals.push(None);
+        let lift = methods::bound_fn(p.name.sym, subst, interner).and_then(|l| fl.closure_env(l));
+        for (j, ty) in lift.map_or(&[][..], |l| &l.env_tys[..]).iter().enumerate() {
+            let abi = fl.param_abi(ty);
+            let v = fl.builder.add_param(abi);
+            closure_env.push((p.name.sym, j, v, ty.clone()));
+        }
+    }
     for (pi, ((p, pty), val)) in f.params.iter().zip(&param_tys).zip(param_vals).enumerate() {
         let Some(val) = val else {
             continue;
@@ -3110,6 +3142,7 @@ fn lower_fn(
             fl.record_param_extents(&dyn_params, pi, slot, p.name.sym, body);
         }
     }
+    fl.bind_closure_env(closure_env);
 
     let tail = fl.lower_block(body);
     if !fl.terminated {
@@ -15298,7 +15331,8 @@ impl FnLowerer<'_> {
             | ExprKind::Str(_)
             | ExprKind::Char(_)
             | ExprKind::SizeOf(_)
-            | ExprKind::AlignOf(_) => {}
+            | ExprKind::AlignOf(_)
+            | ExprKind::Closure { .. } => {}
             ExprKind::Path(p) => {
                 if p.is_single() {
                     // Fresh aggregate slots can still contain borrowed pointees. Reject those
@@ -22938,12 +22972,19 @@ impl FnLowerer<'_> {
                         Some(DefKind::Fn(sig)) => sig.params.clone(),
                         _ => Vec::new(),
                     };
-                    let argvals: Vec<ValueId> = args
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| param_tys.get(*i).is_none_or(methods::param_has_value))
-                        .map(|(i, a)| self.lower_arg_coerced(a, param_tys.get(i)))
-                        .collect();
+                    // A function-typed argument has no value of its own; a closure passes its
+                    // captured values in its place, left to right with the other arguments
+                    // (`closures.rs`).
+                    let mut argvals: Vec<ValueId> = Vec::with_capacity(args.len());
+                    for (i, a) in args.iter().enumerate() {
+                        match param_tys.get(i) {
+                            Some(pty) if !methods::param_has_value(pty) => {
+                                let env = self.closure_env_values(a);
+                                argvals.extend(env);
+                            }
+                            pty => argvals.push(self.lower_arg_coerced(a, pty)),
+                        }
+                    }
                     // A call to a type-generic function is redirected to its monomorphized instance
                     // (`id` -> `id$f32`), and the call's MIR return type is taken from the instance's
                     // concrete return (not the generic template), so the sret/void/scalar dispatch
@@ -25994,7 +26035,11 @@ fn expr_mentions(e: &Expr, sym: Symbol) -> bool {
         // sound: the literal uses exactly those sub-expressions). Without this an array-init `let`
         // (`let out = [0.0; N]`) in a scalar-escape window falsely reads as a use, so a preceding
         // norm/reduction declines (e.g. the dest declaration of an out-of-place `out = norm(x)`).
-        ExprKind::ArrayLit(items) => items.iter().any(|e| expr_mentions(e, sym)),
+        // Tuple literals likewise — among them a lifted closure's value `(L, captures..)`, whose
+        // captures are read exactly where the call takes their copy (`closures.rs`).
+        ExprKind::ArrayLit(items) | ExprKind::TupleLit(items) => {
+            items.iter().any(|e| expr_mentions(e, sym))
+        }
         ExprKind::ArrayRepeat { value, count } => {
             expr_mentions(value, sym) || expr_mentions(count, sym)
         }
@@ -27596,7 +27641,8 @@ impl GemmBiasAlias<'_> {
             | ExprKind::Bool(_)
             | ExprKind::Path(_)
             | ExprKind::SizeOf(_)
-            | ExprKind::AlignOf(_) => false,
+            | ExprKind::AlignOf(_)
+            | ExprKind::Closure { .. } => false,
             ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => self.expr(expr),
             ExprKind::Field { base, .. } | ExprKind::TupleField { base, .. } => self.expr(base),
             ExprKind::Binary { lhs, rhs, .. } => self.expr(lhs) || self.expr(rhs),

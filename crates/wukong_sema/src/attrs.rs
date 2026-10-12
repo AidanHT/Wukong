@@ -478,6 +478,8 @@ fn check_expr(e: &Expr, interner: &Interner, diags: &mut Vec<Diagnostic>) {
                 check_expr(&arm.body, interner, diags);
             }
         }
+        // A closure body is statements like any other; an attribute on one is checked there.
+        ExprKind::Closure { body, .. } => check_expr(body, interner, diags),
     }
 }
 

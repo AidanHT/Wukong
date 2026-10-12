@@ -973,6 +973,11 @@ impl<'a> Parser<'a> {
 
     fn parse_prefix_inner(&mut self) -> Expr {
         let start = self.span();
+        // A closure literal. A `|`/`||` in prefix position was "expected an expression" (E0202)
+        // before closures existed, so this claims no spelling that used to parse.
+        if matches!(self.kind(), T::Pipe | T::PipePipe) {
+            return self.parse_closure();
+        }
         let op = match self.kind() {
             T::Minus => Some(UnOp::Neg),
             // `!` and `~` both lower to `UnOp::Not` (MIR `Op::Not`), which is bitwise complement on
@@ -1000,6 +1005,96 @@ impl<'a> Parser<'a> {
         }
         let primary = self.parse_primary();
         self.parse_postfix(primary)
+    }
+
+    /// A closure literal, at its opening `|` or `||`: `|a, b: T| expr`, `|| expr`, or
+    /// `|x: T| -> R { block }`. Each parameter is a name with an optional `: Type` (a trailing
+    /// comma is allowed); a pattern or a `mut` parameter is refused. With `-> R` the body must be a
+    /// `{ … }` block; without it the body is a whole expression, so `|x| x + 1` closes over the
+    /// `+`. Where a closure may appear is sema's question (`E0411` outside a call argument).
+    fn parse_closure(&mut self) -> Expr {
+        let start = self.span();
+        let mut params = Vec::new();
+        if !self.eat(T::PipePipe) {
+            self.bump(); // the opening `|`
+            while !self.at(T::Pipe) && !self.at(T::Eof) {
+                if self.at(T::Mut) {
+                    let sp = self.span();
+                    self.error(
+                        sp,
+                        "E0201",
+                        "a closure parameter cannot be `mut`: it is an immutable copy of the \
+                         argument (bind a `let mut` copy of it in the body instead)",
+                    );
+                    self.bump();
+                }
+                let pstart = self.span();
+                let before = self.pos;
+                let name = self.ident();
+                let ty = if self.eat(T::Colon) {
+                    Some(self.parse_type())
+                } else {
+                    None
+                };
+                params.push(ClosureParam {
+                    id: self.nid(),
+                    name,
+                    ty,
+                    span: pstart.to(self.prev_span()),
+                });
+                // A pattern (`|(a, b)|`) is not a parameter: `ident` reported it without consuming
+                // anything, so stop here and let the closing `|` be expected.
+                if self.pos == before || !self.eat(T::Comma) {
+                    break;
+                }
+            }
+            self.expect(T::Pipe);
+        }
+        let (ret, body) = if self.eat(T::Arrow) {
+            let ret = self.parse_type();
+            let body = if self.at(T::LBrace) {
+                let bstart = self.span();
+                let b = self.parse_block();
+                self.finish_expr(bstart, ExprKind::Block(b))
+            } else {
+                let sp = self.span();
+                self.error(
+                    sp,
+                    "E0200",
+                    format!(
+                        "expected `{{` after a closure's return type, found {}: with `-> R` the \
+                         body must be a block (`|x| -> f32 {{ x * 2.0 }}`)",
+                        self.found()
+                    ),
+                );
+                // Recover with the expression as the block's tail, keeping the AST's invariant
+                // that a closure with a return type has a block body.
+                let e = self.parse_expr();
+                let span = e.span;
+                let block = Block {
+                    id: self.nid(),
+                    stmts: Vec::new(),
+                    tail: Some(Box::new(e)),
+                    span,
+                };
+                Expr {
+                    id: self.nid(),
+                    kind: ExprKind::Block(block),
+                    span,
+                }
+            };
+            (Some(Box::new(ret)), body)
+        } else {
+            (None, self.parse_expr())
+        };
+        self.finish_expr(
+            start,
+            ExprKind::Closure {
+                params,
+                ret,
+                body: Box::new(body),
+            },
+        )
     }
 
     fn parse_postfix(&mut self, mut lhs: Expr) -> Expr {
@@ -3851,5 +3946,51 @@ mod tests {
         let mut i = Interner::new();
         let (_m, d) = parse_module("fn f() { let y: i32 = 2 }", SourceId(0), &mut i);
         assert!(d.is_empty(), "{d:?}");
+    }
+
+    /// The error codes `src` parses to as an expression (the closure tests).
+    fn closure_codes(src: &str) -> Vec<&'static str> {
+        let mut i = Interner::new();
+        let (_e, d) = parse_expr_str(src, SourceId(0), &mut i);
+        d.iter().filter_map(|x| x.code).collect()
+    }
+
+    /// Closure literals: `|..| expr`, `|| expr` and the block-bodied `|..| -> R { .. }`. The body of
+    /// an unannotated closure is a whole expression, so `|x| x + 1` closes over the `+`.
+    #[test]
+    fn closure_literals_parse() {
+        assert_eq!(
+            expr("|x| x + 1"),
+            "closure |x|\n  binary +\n    path x\n    int 1\n"
+        );
+        assert_eq!(expr("|| 0"), "closure ||\n  int 0\n");
+        assert_eq!(
+            expr("|x: f32, y| -> f32 { x * y }"),
+            "closure |x: f32, y| -> f32\n  block\n    tail\n      binary *\n        path x\n        \
+             path y\n"
+        );
+        // A trailing comma closes the parameter list like any other comma-separated list.
+        assert_eq!(expr("|a, b,| a"), "closure |a, b|\n  path a\n");
+        // As a call argument, the body stops at the argument's `,`.
+        assert_eq!(
+            expr("g(|x| x * k, 3)"),
+            "call\n  path g\n  closure |x|\n    binary *\n      path x\n      path k\n  int 3\n"
+        );
+    }
+
+    /// With `-> R` the body must be a block (E0200), and a parameter is a plain name: `mut` is
+    /// refused (E0201) once, and the closure still parses.
+    #[test]
+    fn closure_literal_errors() {
+        assert_eq!(closure_codes("|x| -> f32 x"), vec!["E0200"]);
+        assert_eq!(closure_codes("|mut x| x"), vec!["E0201"]);
+        assert!(closure_codes("|(a, b)| a").contains(&"E0201"));
+    }
+
+    /// `|` and `||` after an operand are still the binary operators.
+    #[test]
+    fn pipes_after_an_operand_stay_binary_operators() {
+        assert_eq!(expr("a || b"), "binary ||\n  path a\n  path b\n");
+        assert_eq!(expr("a | b"), "binary |\n  path a\n  path b\n");
     }
 }

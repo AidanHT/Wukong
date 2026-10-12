@@ -79,6 +79,13 @@ another architecture or OS is not supported. A native-backend failure is a catal
   function (`apply$square`), so no function pointer exists at run time (`E0411` outside a parameter).
   Calls such a specialization makes are invisible to the alias analysis, so every function they can
   reach forgoes disjointness-requiring kernels (`tests/run/{methods_impl,traits_static_dispatch,fn_params}.wk`).
+- **Closures** (2026-10-12, `gap5/closures`). `|x| x * k`, `|| 0`, `|x: f32| -> f32 { .. }` passed to
+  a function-typed parameter: captures are copied by value when the argument is evaluated, the
+  literal is lifted to a function whose leading parameters are its captures, and the callee is
+  specialized per closure (`apply$main$closure$0`), so a call through the parameter stays a direct
+  call with no function pointer (interp and native, every `-O`; `tests/run/closures.wk`). `E0418`
+  for an uncopyable capture, `E0419` for a parameter type a callee generic leaves open, `E0411`
+  outside a call argument, `E0304` for assigning a capture. See the guide's "Closures".
 - **Diagnostics and tooling surface.** `--emit=check` runs the front end (lex/parse/imports/sema,
   then the lints) and stops before lowering — a fast editor loop with no `C0001` lowering limits.
   `--error-format=json`
@@ -1472,6 +1479,15 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   as that buffer (no `@noalias` promise between them), stays serial; so does an atomic add to a
   field, a pointee or a multi-index tensor element inside the loop. Reading a location other
   iterations are still adding to is a race, as for a plain store.
+
+- **Closures are non-escaping and capture only scalars and pointers** (2026-10-12). A closure is
+  legal only as a direct argument of a plain call to a function-typed parameter: it cannot be stored,
+  returned, bound to a `let`, or passed to a method call (`x.m(|v| ..)` is `E0411` — the method
+  call path does not specialize per closure yet). A capture is a by-value copy of a scalar, C-style
+  enum, pointer or reference; an aggregate is read through a captured pointer (`(*pa)[i]`), and
+  there are no by-reference captures (`&mut` of a capture is `E0304`). An unannotated parameter is
+  typed only from the parameter's declared function type, never from the call's other arguments,
+  so a closure passed to `fold3<T>`'s `fn(T, T) -> T` needs its parameters annotated (`E0419`).
 
 - **Scalar-type gaps** (2026-10-08). There is no 128-bit integer (`u128`/`i128` literal suffixes
   are `E0431`; Cranelift's x64 backend has no `i128` divide, so the type needs a runtime first), and

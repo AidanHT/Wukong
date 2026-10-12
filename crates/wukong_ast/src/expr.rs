@@ -89,6 +89,26 @@ pub enum ExprKind {
     },
     SizeOf(TypeExpr),
     AlignOf(TypeExpr),
+    /// A non-escaping closure literal: `|a, b: T| expr`, `|| expr`, `|x: T| -> R { block }`. It is
+    /// legal only as a direct argument of a plain call to a function-typed parameter; sema records
+    /// its parameter, return and capture types (`wukong_sema::ClosureInfo`), and `mir_build`
+    /// lifts it to a top-level function whose leading parameters are its by-value captures before
+    /// anything else looks at the tree. With `ret` the body is always a `Block`.
+    Closure {
+        params: Vec<ClosureParam>,
+        ret: Option<Box<TypeExpr>>,
+        body: Box<Expr>,
+    },
+}
+
+/// One parameter of a closure literal: a name with an optional type annotation. A parameter
+/// without one takes its type from the function type the closure is passed to.
+#[derive(Clone, Debug)]
+pub struct ClosureParam {
+    pub id: NodeId,
+    pub name: Ident,
+    pub ty: Option<TypeExpr>,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug)]

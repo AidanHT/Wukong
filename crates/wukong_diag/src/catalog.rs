@@ -625,7 +625,11 @@ fn main() -> i32 {
          function-typed parameter; a function may not be bound to a `let` or passed to a \
          non-function parameter; and a function-typed parameter may be neither `mut` nor named \
          after a builtin (`gelu`, `print`, …), whose name the compiler reads as the builtin. Pass \
-         the function directly at each call instead."
+         the function directly at each call instead. A closure literal (`|x| x * k`) is the other \
+         value such a parameter accepts, and only there: as a direct argument of a plain call to a \
+         function whose parameter has a function type. Anywhere else — a `let`, a `return`, a \
+         field or element, an operand, a method-call argument, a `const` initializer, a `where` \
+         predicate or a `static_assert` — a closure is this error too."
     ),
     entry!(
         "E0415",
@@ -656,6 +660,37 @@ fn main() -> i32 {
          builtin's element.",
         bad: "module ex.e0416\nfn save<T>(x: Tensor[T, 4]) -> i64 {\n    return write_f32(\"e0416.bin\", x);\n}\nfn main() -> i32 {\n    let x: [f64; 4] = [1.0; 4];\n    return save(x) as i32;\n}\n",
         good: "module ex.e0416\nfn save<T>(x: Tensor[T, 4]) -> i64 {\n    return write_f32(\"e0416.bin\", x);\n}\nfn main() -> i32 {\n    let x: [f32; 4] = [1.0; 4];\n    return save(x) as i32;\n}\n"
+    ),
+    entry!(
+        "E0418",
+        "closure captures a value it cannot copy",
+        "A closure captures every local of the enclosing code that its body reads, by value: the \
+         value is copied when the call evaluates the closure argument, and the closure is lifted \
+         to a function that receives each copy as a parameter. Only a value that fits one such \
+         parameter can be copied — a number, `bool` or `char`, a C-style enum, a raw pointer or a \
+         reference. An array, slice, tuple, struct, data-carrying enum, tensor or SIMD vector \
+         cannot, and neither can the enclosing function's function-typed parameter (it has no \
+         run-time value) or anything that names one of the enclosing function's generic \
+         parameters (the lifted function is not generic). To read an aggregate, capture a \
+         pointer to it (`let pa = &a;` before the call, then `(*pa)[i]` in the closure) or pass \
+         it to the callee as an ordinary parameter; to use a generic dimension, bind it to a \
+         local first (`let n = N;`).",
+        bad: "module ex.e0418\nfn apply(f: fn(f32) -> f32, x: f32) -> f32 {\n    return f(x);\n}\nfn main() -> i32 {\n    let w: [f32; 2] = [2.0, 3.0];\n    return apply(|x| x * w[1], 2.0) as i32;\n}\n",
+        good: "module ex.e0418\nfn apply(f: fn(f32) -> f32, x: f32) -> f32 {\n    return f(x);\n}\nfn main() -> i32 {\n    let w: [f32; 2] = [2.0, 3.0];\n    let pw = &w;\n    return apply(|x| x * (*pw)[1], 2.0) as i32;\n}\n"
+    ),
+    entry!(
+        "E0419",
+        "closure parameter type cannot be inferred",
+        "A closure parameter without an annotation takes its type from the function type of the \
+         parameter the closure is passed to. When that type names a generic parameter of the \
+         callee, as the type itself (`fn fold3<T>(f: fn(T, T) -> T, ..)`) or as a tensor's \
+         element type or dimension (`fn(Tensor[T, N]) -> f32`), nothing has fixed it yet — the \
+         closure is checked before the call's other arguments bind it — so the parameter needs \
+         an annotation: `|a: i32, b: i32| a + b`. The same holds for the return type of a closure \
+         whose body uses `return` while the expected return type is generic: annotate it \
+         (`|..| -> i32 { .. }`).",
+        bad: "module ex.e0419\nfn fold3<T>(f: fn(T, T) -> T, a: T, b: T, c: T) -> T {\n    return f(f(a, b), c);\n}\nfn main() -> i32 {\n    return fold3(|a, b| a + b, 1, 2, 3);\n}\n",
+        good: "module ex.e0419\nfn fold3<T>(f: fn(T, T) -> T, a: T, b: T, c: T) -> T {\n    return f(f(a, b), c);\n}\nfn main() -> i32 {\n    return fold3(|a: i32, b: i32| a + b, 1, 2, 3);\n}\n"
     ),
     entry!(
         "E0420",

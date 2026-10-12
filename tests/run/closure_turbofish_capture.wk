@@ -1,0 +1,32 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6.5
+module tests.run.closure_turbofish_capture
+
+// A local named in a turbofish (`sumn::<n>(..)`) is read for the dimension's value, so inside a
+// closure it is captured like any other read. Expectations by hand: with n = 3 the callee sums the
+// first three elements of [1, 2, 3, 4], 1 + 2 + 3 = 6, both outside the closure and inside it
+// (0.5 + 6 = 6.5). Uncaptured, the lifted closure had no `n` and the dimension silently came from
+// the argument's shape: 0.5 + 10.
+
+fn sumn<N>(a: [f32; N]) -> f32 {
+    let mut s = 0.0;
+    for i in 0..N {
+        s = s + a[i];
+    }
+    return s;
+}
+
+fn apply(f: fn(f32) -> f32, x: f32) -> f32 {
+    return f(x);
+}
+
+fn main() -> i32 {
+    let xs: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let px = &xs;
+    let n = 3;
+    print(sumn::<n>(xs));
+    print(apply(|x| x + sumn::<n>(*px), 0.5));
+    return 0;
+}

@@ -29,6 +29,8 @@ pub mod lints;
 mod attrs;
 pub use attrs::{align_value, parallel_grain, MAX_ALIGN, MAX_PARALLEL_GRAIN};
 mod builtins;
+mod closures;
+pub use closures::ClosureInfo;
 mod constraints;
 mod dependency;
 mod dtype;
@@ -250,6 +252,18 @@ impl DefMap {
     pub fn lookup(&self, name: Symbol) -> Option<&Def> {
         self.by_name.get(&name).map(|&i| &self.defs[i])
     }
+
+    /// Register a definition the compiler synthesized after checking (`wukong_mir_build` lifts each
+    /// closure literal to a function, `main$closure$0`, and registers its signature here). The name
+    /// must be new: a synthesized name is spelled with a `$`, which no source identifier can hold.
+    pub fn insert_synthetic(&mut self, def: Def) {
+        assert!(
+            !self.by_name.contains_key(&def.name),
+            "a synthesized definition must not shadow an existing one"
+        );
+        self.by_name.insert(def.name, self.defs.len());
+        self.defs.push(def);
+    }
 }
 
 /// The result of analyzing a module: types attached to expression nodes, and the def map.
@@ -291,6 +305,10 @@ pub struct SemaResult {
     /// (`strs.rs`), each `None` when the program never spells that form. They let a pass that
     /// holds no interner recognize a range index: see [`SemaResult::is_range_slice_call`].
     pub range_slice_callees: [Option<Symbol>; 2],
+
+    /// Every closure literal that checked cleanly, keyed by the literal's `NodeId`: its parameter,
+    /// return and capture types, which `wukong_mir_build` lifts it with (see `closures.rs`).
+    pub closures: HashMap<NodeId, ClosureInfo>,
 }
 
 /// Collect the struct names a type contains *by value* — directly (`Ty::Named`) or nested inside an
@@ -379,6 +397,9 @@ fn collect_const_refs(e: &Expr, consts: &HashSet<Symbol>, out: &mut Vec<Symbol>)
         }
         ExprKind::Block(b) => collect_block_const_refs(b, consts, out),
         ExprKind::Loop { body, .. } => collect_block_const_refs(body, consts, out),
+        // A closure is never a legal const initializer (E0411), but what its body names still
+        // counts: a cycle through it would otherwise go unreported.
+        ExprKind::Closure { body, .. } => collect_const_refs(body, consts, out),
         ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Str(_)
@@ -474,6 +495,10 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         assert_conds: HashSet::default(),
         match_verdicts: HashMap::default(),
         str_print_args: HashSet::default(),
+
+        closure_ctx: Vec::new(),
+        closures: HashMap::default(),
+        in_fn_body: false,
     };
     // Attribute legality (`attrs`): an attribute names no value and has no type, so this walk needs
     // nothing the collection pass builds and runs first — an unknown `@bogus` is reported even in a
@@ -525,6 +550,8 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
             .collect(),
         str_print_args: s.str_print_args,
         range_slice_callees: [interner.get(RANGE_SLICE), interner.get(RANGE_SLICE_FROM)],
+
+        closures: s.closures,
     };
     // `str` does not leave sema: every published type is erased to its `[]u8` layout (`strs.rs`).
     strs::erase_published(&mut result);
@@ -676,6 +703,16 @@ struct Sema<'a> {
     match_verdicts: HashMap<NodeId, bool>,
     /// The print and format arguments of type `str`, published as [`SemaResult::str_print_args`].
     str_print_args: HashSet<NodeId>,
+
+    /// The closures whose bodies are being checked, innermost last (`closures.rs`). Empty at the
+    /// start of every function pass.
+    closure_ctx: Vec<closures::ClosureCtx>,
+    /// Each closure literal's recorded types, published as [`SemaResult::closures`]. A later pass
+    /// over the same body overwrites an earlier one's record.
+    closures: HashMap<NodeId, ClosureInfo>,
+    /// True only while a function body is being checked — the one place a closure literal can be
+    /// legal (`E0411` in a `const` initializer, a `where` predicate or a `static_assert`).
+    in_fn_body: bool,
 }
 
 /// One entry of [`Sema::loop_ctx`] — a loop currently being type-checked.
@@ -1385,6 +1422,10 @@ impl<'a> Sema<'a> {
                 } else if self.names_str(p) {
                     Ty::Str
                 } else {
+                    // An enclosing generic named inside a closure (`closures.rs`).
+                    if p.is_single() && self.generics.contains(&name) {
+                        self.note_generic_use(name, t.span);
+                    }
                     // A generic type variable or a (possibly later-defined) named type. Once every
                     // item is registered, a name that is neither is `E0324` (`resolve.rs`) — it used
                     // to be accepted here and lowered as an `i32` slot.
@@ -1539,6 +1580,8 @@ impl<'a> Sema<'a> {
                 // precedence over a same-named `const` (a generic shadows an outer const, matching
                 // lexical scoping), so check it first and keep it a `Var`.
                 if self.generics.contains(s) {
+                    // ...which a closure cannot name (`closures.rs`).
+                    self.note_generic_use(*s, d.span);
                     return Dim::Var(*s);
                 }
                 // A top-level `const` used as a dimension resolves to its integer *value* — a fixed
@@ -2091,7 +2134,10 @@ impl<'a> Sema<'a> {
             Some(t) => self.lower_type(t),
             None => Ty::Unit,
         };
+        self.closure_ctx.clear();
+        self.in_fn_body = true;
         let body_ty = self.type_block(body);
+        self.in_fn_body = false;
         // The body's tail expression is the implicit return — check its shape against the declared
         // return type (an explicit `return` is checked at its `StmtKind::Return` site).
         if let Some(tail) = &body.tail {
@@ -2923,6 +2969,16 @@ impl<'a> Sema<'a> {
         None
     }
 
+    /// [`Self::lookup_local`], plus the index in `scopes` of the scope that binds `name` — which
+    /// tells a closure's own locals (at or above its base scope) from its captures (`closures.rs`).
+    fn lookup_local_depth(&self, name: Symbol) -> Option<(usize, Ty)> {
+        self.scopes
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, scope)| scope.get(&name).map(|t| (i, t.clone())))
+    }
+
     /// Resolve a single-segment name to a type, or `None` if genuinely unresolved.
     fn resolve_value(&self, name: Symbol) -> Option<Ty> {
         if let Some(t) = self.lookup_local(name) {
@@ -3165,7 +3221,10 @@ impl<'a> Sema<'a> {
                 //     CALLER's value. `mut` opts into that (visible, in-place). A dereference breaks
                 //     the chain (`*p`, `(*p).f`) — that mutates a pointee, not the parameter — so
                 //     `assign_root_param` returns `None` and pointer/ref params stay lenient.
+                // A closure's capture is a read-only copy (`closures.rs`); nothing below applies.
+                let capture_write = self.check_capture_write(target, false);
                 match &target.kind {
+                    _ if capture_write => {}
                     ExprKind::Path(p) if p.is_single() => {
                         let sym = p.first().sym;
                         if let Some(decl) = self.immutable_param_decl(sym) {
@@ -3247,6 +3306,7 @@ impl<'a> Sema<'a> {
                 }
             }
             StmtKind::Return(opt) => {
+                self.note_closure_return();
                 let ret = self.ret_ty.clone();
                 match opt {
                     Some(e) => {
@@ -4139,7 +4199,11 @@ impl<'a> Sema<'a> {
             ExprKind::Path(p) => {
                 if p.is_single() {
                     match self.resolve_value(p.first().sym) {
-                        Some(t) => t,
+                        Some(t) => {
+                            // Inside a closure, a local of the enclosing code is a capture.
+                            self.note_value_use(p.first().sym, p.span);
+                            t
+                        }
                         None => {
                             self.error(
                                 p.span,
@@ -4190,6 +4254,7 @@ impl<'a> Sema<'a> {
                     },
                     UnOp::RefMut => {
                         self.check_str_write(expr);
+                        self.check_capture_write(expr, true);
                         Ty::Ptr {
                             mutable: true,
                             pointee: Box::new(t),
@@ -4814,6 +4879,9 @@ impl<'a> Sema<'a> {
                 self.check_type_expr_names(t);
                 Ty::Scalar(Scalar::Usize)
             }
+            // A closure argument of a function-typed parameter is checked by `type_call_args`;
+            // anywhere else it is `E0411` (`closures.rs`).
+            ExprKind::Closure { .. } => self.misplaced_closure(e),
         }
     }
 

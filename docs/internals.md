@@ -128,7 +128,35 @@ source
                  | textual LLVM IR (--emit=llvm-ir)
 ```
 
-Two front-end surfaces lower to plain calls before any recognizer sees the tree. **Methods**: the
+Three front-end surfaces lower to plain calls before any recognizer sees the tree. **Closures**:
+`wukong_sema::closures` checks each `|x| body` literal where it is written — only as an argument of
+a function-typed parameter, `E0411` elsewhere — typing its parameters from that parameter's
+function type and recording, per literal, its parameter, return and capture types
+(`SemaResult::closures`). A capture is every enclosing local the body reads: `note_local_use` sees
+each local read with the index of the scope that binds it, and a binding below a closure's base
+scope is a capture of that closure (and of every closure it is nested in); only a scalar, C-style
+enum, pointer or reference can be captured (`E0418`), and writing one is `E0304`. The **first**
+rewrite of `wukong_mir_build::lower_program` (`closures::lift_module`, before the method
+desugaring) lifts each literal, innermost first, to a registered top-level function
+`<fn>$closure$<k>` whose leading parameters are the captures, and replaces the literal by its
+**value**: the tuple `(L, c0, c1, ..)` of the function and the captured locals (closure conversion,
+typed as the closure's function type), or the bare name `L` when it captures nothing. Every pass
+below sees the function-typed-parameter machinery it already has (`closures::closure_code` is the
+function a value names), and sees each captured read where its copy is taken. That second half is
+load-bearing: `canon` inlines and deletes an index-only `let` and sinks an accumulator seed to its
+first mention, the fused-window recognizers prove the scalars a kernel hides are not read after the
+window (`block_mentions`), and `defer` refuses to rebind a name a pending call reads — all from what
+the tree mentions. With a bare `L` in the tree a capture was invisible to all three, the `let` it
+read was deleted, moved or hidden, and the copy resolved to an outer binding of the same name
+(`tests/run/closure_hidden_reads.wk`). The lifted item inherits the enclosing function's
+`@strict_fp`, `@generic` and `@unchecked`, which lowering keys by item: the closure body is that
+function's code (`tests/run/closure_strict_fp.wk`). The **environment ABI**: an instance whose function-typed
+parameter `f` is bound to a closure with captures declares one hidden MIR parameter per capture at
+`f`'s position and binds them as `$env$f$<j>`; `lower_call` passes, at a function-typed argument's
+position, the capture values — the value's captures, lowered at the literal's own site, or
+forwarded from the caller's `$env$g$<j>` — and a call through `f` calls the lifted function with
+`$env$f$..` first. No function pointer, no new MIR construct.
+**Methods**: the
 parser flattens each `impl` method into a top-level function `Type.method` (receiver desugared to a
 `self: Type` parameter) beside an `ItemKind::Impl` marker; `wukong_sema::methods` builds the method
 tables, checks trait conformance and bounds, and records every resolved call; `wukong_mir_build`'s

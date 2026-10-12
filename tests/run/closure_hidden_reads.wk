@@ -1,0 +1,89 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 30
+// EXPECT-OUT: 102
+// EXPECT-OUT: 3
+// EXPECT-OUT: 40
+// EXPECT-OUT: 103
+// EXPECT-OUT: 1
+// EXPECT-OUT: 10
+// EXPECT-OUT: 50
+// EXPECT-OUT: 10
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 10
+// EXPECT-OUT: 100
+module tests.run.closure_hidden_reads
+
+// A closure reads its captures where the call takes their copy. The passes that run before any
+// recognizer, and the recognizers themselves, decide from what the tree mentions, so each case
+// here is a binding one of them would delete, move or hide if the closure's reads were invisible
+// to it. Every miss reads an OUTER binding of the same name, a wrong value on every backend.
+// Expectations by hand:
+//   inner k = j + 1 = 2: a[2] = 30, then 100 + 2 = 102; the outer k is still 3
+//   m = j + 2 = 3 with no outer `m`: a[3] = 40, then 100 + 3 = 103
+//   inner s = 0 is read before the loop: 1 + 0 = 1; then s = 1 + 2 + 3 + 4 = 10; outer s = 50
+//   running sum with acc read after the window: 0 + 10 = 10; out = 1 3 6 10; outer acc = 100
+
+fn applyi(f: fn(i64) -> i64, x: i64) -> i64 {
+    return f(x);
+}
+
+fn apply(f: fn(f32) -> f32, x: f32) -> f32 {
+    return f(x);
+}
+
+fn main() -> i32 {
+    let a: [i64; 4] = [10, 20, 30, 40];
+    let j: i64 = 1;
+
+    // An integer `let` whose only other read is an index: `canon` would inline and delete it.
+    let k: i64 = 3;
+    {
+        let k = j + 1;
+        print(a[k]);
+        print(applyi(|x| x + k, 100));
+    }
+    print(k);
+
+    // The same with no outer binding of the name.
+    {
+        let m = j + 2;
+        print(a[m]);
+        print(applyi(|x| x + m, 100));
+    }
+
+    // A literal accumulator seed read by a closure before its loop: `canon` would sink it below
+    // the read.
+    let xs: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let s: f32 = 50.0;
+    {
+        let mut s = 0.0;
+        print(apply(|x| x + s, 1.0));
+        for i in 0..4 {
+            s = s + xs[i];
+        }
+        print(s);
+    }
+    print(s);
+
+    // A running-sum window whose accumulator a closure reads afterwards: the cumsum kernel hides
+    // that scalar, so it must not replace this window.
+    let mut out: [f32; 4] = [0.0; 4];
+    let acc: f32 = 100.0;
+    {
+        let mut acc: f32 = 0.0;
+        for i in 0..4 {
+            acc = acc + xs[i];
+            out[i] = acc;
+        }
+        print(apply(|v| v + acc, 0.0));
+    }
+    print(out[0]);
+    print(out[1]);
+    print(out[2]);
+    print(out[3]);
+    print(acc);
+    return 0;
+}

@@ -687,6 +687,18 @@ impl Expander<'_> {
             }
             ExprKind::Loop { body, .. } => self.block(body),
             ExprKind::SizeOf(t) | ExprKind::AlignOf(t) => self.ty(t),
+            // A closure's annotations are types like any other, and its body may name an alias.
+            ExprKind::Closure { params, ret, body } => {
+                for p in params {
+                    if let Some(t) = &mut p.ty {
+                        self.ty(t);
+                    }
+                }
+                if let Some(r) = ret {
+                    self.ty(r);
+                }
+                self.expr(body);
+            }
         }
     }
 }
@@ -1007,6 +1019,21 @@ mod tests {
         let unique: FxHashSet<NodeId> = ids.iter().copied().collect();
         assert_eq!(unique.len(), ids.len(), "{ids:?}");
         assert!(ids.iter().all(|id| *id != NodeId::DUMMY));
+    }
+
+    /// A closure literal's parameter and return annotations are types like any other, and its body
+    /// may name an alias too.
+    #[test]
+    fn a_closure_literal_expands_its_annotations_and_body() {
+        let (out, codes) = expand(
+            "type Real = f32;\n\
+             fn apply(f: fn(Real) -> Real, x: Real) -> Real { return f(x); }\n\
+             fn main() -> i32 { return apply(|x: Real| -> Real { x * (2 as Real) }, 1.0) as i32; }\n",
+        );
+        assert!(codes.is_empty(), "{codes:?}");
+        assert!(out.contains("closure |x: f32| -> f32"), "{out}");
+        assert!(out.contains("cast f32"), "{out}");
+        assert!(!out.contains("Real"), "{out}");
     }
 
     #[test]

@@ -1,0 +1,16 @@
+// EXPECT-CODE: E0419
+// EXPECT-COUNT: 1
+module tests.fail.closure_param_infer
+
+// An unannotated closure parameter takes its type from the function type it is passed as. Here
+// that type is `fn(T, T) -> T`, and `T` is a generic parameter of `fold3` that only the call's
+// later arguments would bind: the closure is checked first, so `a` and `b` need annotations
+// (`|a: i32, b: i32| a + b`). Reported once, at the first parameter it cannot type.
+
+fn fold3<T>(f: fn(T, T) -> T, a: T, b: T, c: T) -> T {
+    return f(f(a, b), c);
+}
+
+fn main() -> i32 {
+    return fold3(|a, b| a + b, 1, 2, 3); //~ E0419
+}

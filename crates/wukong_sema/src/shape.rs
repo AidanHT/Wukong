@@ -286,7 +286,8 @@ impl Sema<'_> {
         args: &[Expr],
         span: Span,
     ) -> Ty {
-        let mut arg_tys: Vec<Ty> = args.iter().map(|a| self.type_expr(a)).collect();
+        // A closure argument is checked against its function-typed parameter (`closures.rs`).
+        let mut arg_tys: Vec<Ty> = self.type_call_args(callee, args);
 
         if let ExprKind::Path(p) = &callee.kind {
             if p.is_single() {
@@ -758,6 +759,10 @@ impl Sema<'_> {
                                 let d = if is_const {
                                     Dim::Const(self.const_length(nm, 0))
                                 } else {
+                                    // A local named here is READ for the dimension's value, so in
+                                    // a closure it is a capture (and an enclosing generic is
+                                    // `E0418`), exactly as in an expression (`closures.rs`).
+                                    self.note_value_use(nm, ga.span);
                                     Dim::Var(nm)
                                 };
                                 dims.insert(*g, d);

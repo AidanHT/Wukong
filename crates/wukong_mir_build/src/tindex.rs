@@ -419,7 +419,8 @@ impl Linearizer<'_> {
             | ExprKind::Bool(_)
             | ExprKind::Path(_)
             | ExprKind::SizeOf(_)
-            | ExprKind::AlignOf(_) => {}
+            | ExprKind::AlignOf(_)
+            | ExprKind::Closure { .. } => {}
             ExprKind::Unary { expr, .. }
             | ExprKind::Field { base: expr, .. }
             | ExprKind::TupleField { base: expr, .. }

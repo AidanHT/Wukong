@@ -82,14 +82,15 @@ pub(crate) fn bound_fn(
 }
 
 /// The function an argument passed to a function-typed parameter denotes: the caller's own bound
-/// function-typed parameter, or a top-level function named directly.
+/// function-typed parameter, or a top-level function named directly (a lifted closure's value
+/// `(L, captures..)` names `L`, `closures.rs`).
 pub(crate) fn fn_value_of(
     arg: &Expr,
     subst: &HashMap<Symbol, Ty>,
     sema: &SemaResult,
     interner: &Interner,
 ) -> Option<Symbol> {
-    let ExprKind::Path(p) = &arg.kind else {
+    let ExprKind::Path(p) = &crate::closures::closure_code(arg).kind else {
         return None;
     };
     if !p.is_single() {
@@ -248,7 +249,8 @@ impl Desugar<'_> {
             | ExprKind::Bool(_)
             | ExprKind::Path(_)
             | ExprKind::SizeOf(_)
-            | ExprKind::AlignOf(_) => {}
+            | ExprKind::AlignOf(_)
+            | ExprKind::Closure { .. } => {}
             ExprKind::Unary { expr, .. }
             | ExprKind::Field { base: expr, .. }
             | ExprKind::TupleField { base: expr, .. }
@@ -491,7 +493,8 @@ impl CallScan<'_> {
             | ExprKind::Bool(_)
             | ExprKind::Path(_)
             | ExprKind::SizeOf(_)
-            | ExprKind::AlignOf(_) => {}
+            | ExprKind::AlignOf(_)
+            | ExprKind::Closure { .. } => {}
             ExprKind::Unary { expr, .. }
             | ExprKind::Field { base: expr, .. }
             | ExprKind::TupleField { base: expr, .. }
@@ -526,7 +529,7 @@ impl CallScan<'_> {
                     }
                 }
                 for a in args {
-                    if let ExprKind::Path(p) = &a.kind {
+                    if let ExprKind::Path(p) = &crate::closures::closure_code(a).kind {
                         if p.is_single() && self.is_fn(p.first().sym) {
                             self.values.push(p.first().sym);
                         }
@@ -622,6 +625,14 @@ impl FnLowerer<'_> {
             span,
         };
         let args = full.as_deref().unwrap_or(args);
+        // A call through a parameter bound to a closure with captures passes the environment this
+        // instance received for that parameter first: the lifted function's leading parameters
+        // (`closures.rs`).
+        if let (ExprKind::Path(p), Some(lift)) = (&callee.kind, self.closure_env(target)) {
+            let mut with_env = self.env_arg_exprs(p.first().sym, lift, span);
+            with_env.extend(args.iter().cloned());
+            return Some(self.lower_call(&path, generic_args, &with_env, e));
+        }
         Some(self.lower_call(&path, generic_args, args, e))
     }
 }

@@ -225,6 +225,57 @@ All notable changes to Wukong are documented here. The format is loosely based o
   for an imported alias (`type f32 = i64;`), as for the root file (`E0300`,
   `tests/fail/import_str_struct.wk`, `tests/fail/import_str_alias.wk`).
 
+### Closures (`gap5/closures`, N27)
+
+- **Added: non-escaping closure literals.** `|x| x * k`, `|| 0`, `|a, b: i32| a + b` and the block
+  form `|x: f32| -> f32 { .. }` may be passed directly to a function-typed parameter of a plain
+  call (`apply(|x| x * scale, 4.0)`). An unannotated parameter takes the parameter's declared type;
+  every enclosing local the body reads is captured by value, copied when the call evaluates the
+  argument; `return` returns from the closure, and `break`/`continue` cannot cross it. Before this,
+  `|` in prefix position was `E0202` ("expected an expression"), so every map, predicate or reduction
+  needing a run-time scalar had to be a separate named function plus a threaded parameter.
+- **Zero-cost lowering.** `wukong_mir_build` lifts each literal, before any other rewrite, to a
+  top-level function `<fn>$closure$<k>` whose leading parameters are its captures, and the callee is
+  specialized per closure (`apply$main$closure$0`) with one hidden parameter per capture at the
+  function-typed parameter's position. A call through the parameter is a direct call: no function
+  pointer, no heap environment and no new MIR construct, so the interpreter, Cranelift, the LLVM
+  emitter and the GPU lowering are unchanged, and `-O2` inlines it like any call
+  (`tests/run/closures.wk`, interp == native at every `-O`).
+- **Diagnostics.** `E0418` (new) for a capture that cannot be copied into a scalar parameter (an
+  array, slice, tuple, struct, data enum, tensor or vector, the enclosing function's function-typed
+  parameter, anything naming an enclosing generic): capture a pointer instead. `E0419` (new) for a
+  parameter, or a `return`-using body's return type, that only a callee generic would fix: annotate
+  it. `E0411` for a closure anywhere but a call argument (a `let`, a `return`, a method-call
+  argument, a `const`), and `E0304` for assigning a capture or taking `&mut` of it. A deferred call
+  with a closure argument counts the closure's captures as names it reads (`E0314` on rebinding one).
+- **Fixed before merge: captured reads were invisible to the passes after the lift.** The lift
+  replaced a literal by the bare name of its function, so its captures existed only in a side table.
+  `canon` then deleted an index-only `let` a closure captured or sank an accumulator seed below the
+  closure that read it, and a fused-window recognizer (`wukong_cumsum_f32`, the norm and softmax
+  windows, …) hid an accumulator a later closure captured. The capture copy then read an outer
+  binding of the same name: `{ let k = j + 1; print(a[k]); print(applyi(|x| x + k, 100)); }` printed
+  `103` instead of `102`, identically on every backend and at every `-O`. With no outer binding it
+  failed to lower (`C0001`). A closure with captures now lowers to the value `(L, captures..)`, so
+  every pass sees each captured read where the copy is taken (`tests/run/closure_hidden_reads.wk`).
+- **Fixed before merge: a closure body ignored its function's `@strict_fp`, `@generic` and
+  `@unchecked`.** Lowering keys the three by item, and the lifted item had no attributes, so
+  `@strict_fp fn g(a: f32, b: f32) -> f32 { return apply(|x| x * a + b, 3.0); }` contracted the
+  closure's `x * a + b` to one `Fma` and `g(0.1, -0.3)` printed `-0.000000007450581` instead of the
+  separately rounded `0`; a `@generic` function's closure was recognized. The lifted item now carries
+  those three attributes (not `@parallel` or `@tile`) (`tests/run/closure_strict_fp.wk`).
+- **Fixed before merge: a turbofish local inside a closure was not captured.** `sumn::<n>(..)` and a
+  builtin's `sum::<n>(..)` read the local `n` through the type checker's dimension binding, not
+  through an expression, so the closure neither captured it nor rejected it. The lifted function had
+  no `n`, and the dimension silently came from the argument's shape: `apply(|x| x + sumn::<n>(*px),
+  0.5)` with `n = 3` over four elements printed `10.5` instead of `6.5`. Such a local is now a
+  capture, and an enclosing generic named in a closure's turbofish is `E0418` like any other use of
+  one (`tests/run/closure_turbofish_capture.wk`).
+- **Fixed before merge: `E0419` missed a callee generic inside a tensor type.** The check that an
+  unannotated parameter's expected type names no callee generic did not look at a tensor's element
+  type or dimensions, so `first(|t| .., xs)` against `fn(Tensor[T, 4]) -> f32` or
+  `fn(Tensor[f32, N]) -> f32` gave the closure parameter the callee's own `T` or `N`, which then
+  leaked into the lifted function's non-generic signature. It is `E0419` now.
+
 ### Type-lowering soundness (`gap4/sema-soundness`)
 
 - **No silent `i32` slots (N2).** MIR lowering classified any type it did not recognize as `i32`

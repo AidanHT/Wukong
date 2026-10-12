@@ -1823,6 +1823,7 @@ fn walk_expr(e: &Expr, f: &mut impl FnMut(Node<'_>)) {
         | ExprKind::Bool(_)
         | ExprKind::Path(_)
         | ExprKind::SizeOf(_)
-        | ExprKind::AlignOf(_) => {}
+        | ExprKind::AlignOf(_)
+        | ExprKind::Closure { .. } => {}
     }
 }
