@@ -98,11 +98,18 @@ impl Interp<'_, '_> {
         })
     }
 
-    /// Copy `bytes` into fresh slots, NUL-terminated, and return their base: a `*u8` string.
+    /// Copy `bytes` into fresh slots, NUL-terminated, and return their base: a `*u8` string. Each
+    /// byte is held as the canonical `u8` slot value a `read_u8` decodes (sign-extended from 8
+    /// bits), the form a string literal's bytes and every stored byte take: a `u8 == u8` compares
+    /// slots without widening, so a zero-extended `arg`/`env` byte at or above 0x80 compared unequal
+    /// to the same byte of a literal on this backend only.
     fn text_alloc_str(&mut self, bytes: &[u8]) -> Value {
         let base = self.memory.len();
-        self.memory
-            .extend(bytes.iter().map(|&b| Value::Int(i128::from(b))));
+        self.memory.extend(
+            bytes
+                .iter()
+                .map(|&b| crate::ml_io::decode_elem(DT_U8, &[b])),
+        );
         self.memory.push(Value::Int(0));
         self.slots.live.insert(base, bytes.len() + 1);
         Value::Ptr(base)

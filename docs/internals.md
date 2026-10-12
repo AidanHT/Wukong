@@ -642,9 +642,10 @@ captured parameter that can share its storage (`noalias::could_share_storage` wi
 string literal lowers to a read-only `.rodata` blob in `Program::statics` (a `StaticData { name,
 bytes }`) addressed by `Op::GlobalAddr`, so a returned or threaded `*u8` stays valid after its
 defining frame is gone. The interpreter materializes a blob's bytes as sign-extended `i8` slot
-values, the representation every other byte slot holds (an `I8` store, a runtime byte write): a
-load is verbatim, so zero-extended blob bytes compared unequal to the same bytes stored anywhere
-else, on that backend only. **Run-time checks** share one failure-edge shape — `cond_br ok, cont,
+values, the representation every other byte slot holds (an `I8` store, a runtime byte write, the
+`arg`/`env` strings it allocates): a load is verbatim and a `u8 == u8` compares slots unwidened,
+so zero-extended bytes compared unequal to the same bytes held anywhere else, on that backend
+only. **Run-time checks** share one failure-edge shape — `cond_br ok, cont,
 fail` into a dead-end block that calls a reporting entry and is `unreachable` — and one message
 formatter per entry in `wukong_runtime::safety`: `wukong_rt_bounds_fail(index, len, site)` for an
 element access (the edge `bce` keys on) and `wukong_rt_check_fail(kind, a, b, site)` for

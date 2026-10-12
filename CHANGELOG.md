@@ -59,7 +59,9 @@ All notable changes to Wukong are documented here. The format is loosely based o
   holds the sign-extended `i8` an `I8` store leaves, and a load is verbatim, so a literal's byte
   above 0x7F compared unequal to the same byte anywhere else on the interpreter only:
   `s[0] == t[0]` for `s: str = "\u{e9}"` and `t` viewing `[0xC3, 0xA9]` was false there and true
-  natively. String comparisons also compare zero-extended bytes now
+  natively. The strings `arg(i)` and `env(name)` return hold their bytes the same way, so a
+  non-ASCII argument or environment byte equals the same byte of a literal on every backend
+  (`crates/wukongc/tests/process_io.rs`). String comparisons also compare zero-extended bytes now
   (`tests/run/literal_byte_equality.wk`).
 - **Not done:** an unannotated literal is still a `*u8`; there is no growable `String` (each
   `str_concat`/`str_format` allocates anew); `as_bytes()`/`as_ptr()` are writable at the type level,
