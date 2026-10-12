@@ -23325,9 +23325,14 @@ impl FnLowerer<'_> {
     /// interpreter's `round_bf16`/`round_f16`), and the optimizer never const-folds half arithmetic
     /// or half casts, so the rounding survives every opt level. Re-rounding an already-rounded
     /// value is the identity, so the (surviving) store's own narrowing stays byte-identical.
-    /// No-op for every non-half type.
+    /// The 8-bit floats (`f8e4m3`, `f8e5m2`) live in an `f32` register the same way and round
+    /// onto their own grid by the same cast (`wukong_runtime::fp8`'s codec in every backend).
+    /// No-op for every other type.
     fn round_half_result(&mut self, v: ValueId, ty: &MirType) -> ValueId {
-        if matches!(ty, MirType::BF16 | MirType::F16) {
+        if matches!(
+            ty,
+            MirType::BF16 | MirType::F16 | MirType::F8E4M3 | MirType::F8E5M2
+        ) {
             self.builder
                 .build(ty.clone(), Op::Cast(CastKind::FpTrunc, v, ty.clone()))
         } else {
@@ -23348,8 +23353,31 @@ impl FnLowerer<'_> {
             return self.saturate_i128_to_i64(v, signed);
         }
         let kind = cast_kind(from, to, signed);
-        self.builder
-            .build(to.clone(), Op::Cast(kind, v, to.clone()))
+        let cast = self
+            .builder
+            .build(to.clone(), Op::Cast(kind, v, to.clone()));
+        self.round_int_to_narrow_float(cast, kind, to)
+    }
+
+    /// An integer converted to a float narrower than `f32` (`bf16`, `f16`, `f8e4m3`, `f8e5m2`)
+    /// comes out of `sitofp`/`uitofp` as the `f32` the backends compute it in — rounded to `f32`,
+    /// not to the narrow grid. Round it at the value (see `round_half_result`): otherwise a later
+    /// observation that mem2reg forwards past the rounding store — `print(i as bf16)` of 257 at
+    /// `-O2` — saw `257`, where `-O0` printed the stored `256`. Both `lower_cast` (`as`) and
+    /// `coerce_to` round: the implicit conversion of an integer literal adapting to a half or f8
+    /// operand is selected and stored unrounded otherwise (`max(b, 257)`, `if c { 257 } else { b }`
+    /// printed 257 at `-O2` and 256 at `-O0`), and it makes the literal the operand type's value
+    /// before the operation, so `one_bf16 + 257` is 1 + 256. (Rounding the integer to `f32`
+    /// first costs nothing for `f16` and the 8-bit floats: their ranges end below `2^24`, where
+    /// `f32` stops holding integers exactly, and anything larger overflows either way. A `bf16`
+    /// reaches `f32`'s range, so an integer above `2^24` is rounded to `f32` and then to `bf16`,
+    /// as the conversion has always been defined on every backend.)
+    fn round_int_to_narrow_float(&mut self, v: ValueId, kind: CastKind, to: &MirType) -> ValueId {
+        if matches!(kind, CastKind::SiToFp | CastKind::UiToFp) {
+            self.round_half_result(v, to)
+        } else {
+            v
+        }
     }
 
     /// The target symbol and MIR return type of a direct user-function call. For a type-generic
@@ -24134,6 +24162,26 @@ impl FnLowerer<'_> {
     fn lower_math_intrinsic(&mut self, name: Symbol, args: &[Expr], e: &Expr) -> Option<ValueId> {
         let op = math_intrinsic(self.interner.resolve(name))?;
         let rty = self.expr_mir(e);
+        // An 8-bit float computes the function in `f32` and rounds the result once onto its grid:
+        // the polynomials and constants below would otherwise be built at the f8 type, where a
+        // constant like `+inf` does not exist (E4M3FN saturates it to 448).
+        if rty.is_f8() {
+            let v = self.lower_math_intrinsic_at(op, args, MirType::F32)?;
+            return Some(
+                self.builder
+                    .build(rty.clone(), Op::Cast(CastKind::FpTrunc, v, rty)),
+            );
+        }
+        self.lower_math_intrinsic_at(op, args, rty)
+    }
+
+    /// [`Self::lower_math_intrinsic`] computing in the result type `rty`.
+    fn lower_math_intrinsic_at(
+        &mut self,
+        op: MathIntrinsic,
+        args: &[Expr],
+        rty: MirType,
+    ) -> Option<ValueId> {
         // `abs`/`round`/`floor`/`ceil`/`trunc` are type-preserving on integers (sema types them as
         // the argument's integer type): integer abs is `select(x < 0, -x, x)`; rounding an integer is
         // the identity. Without this they would emit float ops on an int operand — MIR the verifier
@@ -24461,7 +24509,7 @@ impl FnLowerer<'_> {
     /// Absolute value clears the sign bit, including on NaNs and negative zero, matching the
     /// runtime's scalar and SIMD forms. Arithmetic comparisons cannot implement this for NaNs.
     fn emit_abs(&mut self, x: ValueId, rty: &MirType) -> ValueId {
-        if matches!(rty.lane_type(), MirType::F16 | MirType::BF16) {
+        if rty.is_sub_f32_float() {
             // Native half values use f32 registers; the interpreter also has no half/i16
             // bitcast representation. Promote before manipulating bits, then round back.
             let wide = float_ty_like(rty, MirType::F32);
@@ -24490,7 +24538,7 @@ impl FnLowerer<'_> {
 
     /// Copy the sign bit without a floating comparison, retaining negative zero and NaN signs.
     fn emit_copysign(&mut self, magnitude: ValueId, sign: ValueId, rty: &MirType) -> ValueId {
-        if matches!(rty.lane_type(), MirType::F16 | MirType::BF16) {
+        if rty.is_sub_f32_float() {
             let wide = float_ty_like(rty, MirType::F32);
             let magnitude = self.builder.build(
                 wide.clone(),
@@ -26127,7 +26175,7 @@ impl FnLowerer<'_> {
     /// Select a quieted input NaN using integer bits so its sign and payload do not depend
     /// on which operand a backend chooses for an otherwise unobserved floating operation.
     fn emit_quiet_nan(&mut self, input: ValueId, ordinary: ValueId, fty: &MirType) -> ValueId {
-        if matches!(fty.lane_type(), MirType::F16 | MirType::BF16) {
+        if fty.is_sub_f32_float() {
             let wide = float_ty_like(fty, MirType::F32);
             let input = self
                 .builder
@@ -26248,7 +26296,10 @@ impl FnLowerer<'_> {
             self.signed(operand)
         };
         let kind = cast_kind(&from, &to, signed);
-        self.builder.build(to.clone(), Op::Cast(kind, v, to))
+        let cast = self
+            .builder
+            .build(to.clone(), Op::Cast(kind, v, to.clone()));
+        self.round_int_to_narrow_float(cast, kind, &to)
     }
 }
 
@@ -26347,7 +26398,7 @@ fn mir_byte_size(t: &MirType) -> u64 {
 
 fn checked_mir_byte_size(t: &MirType) -> Option<u64> {
     Some(match t {
-        MirType::I1 | MirType::I8 => 1,
+        MirType::I1 | MirType::I8 | MirType::F8E4M3 | MirType::F8E5M2 => 1,
         MirType::I16 | MirType::F16 | MirType::BF16 => 2,
         MirType::I32 | MirType::F32 => 4,
         MirType::I64 | MirType::F64 | MirType::Ptr => 8,
@@ -34084,7 +34135,7 @@ fn numeric_join(a: &MirType, b: &MirType) -> MirType {
     }
     let bits = |t: &MirType| match t {
         MirType::I1 => 1,
-        MirType::I8 => 8,
+        MirType::I8 | MirType::F8E4M3 | MirType::F8E5M2 => 8,
         MirType::I16 | MirType::F16 | MirType::BF16 => 16,
         MirType::I32 | MirType::F32 => 32,
         MirType::I128 => 128,
@@ -34114,6 +34165,7 @@ fn cast_kind(from: &MirType, to: &MirType, signed: bool) -> CastKind {
         _ => 0,
     };
     let fsz = |t: &MirType| match t {
+        MirType::F8E4M3 | MirType::F8E5M2 => 8,
         MirType::F16 | MirType::BF16 => 16,
         MirType::F32 => 32,
         MirType::F64 => 64,
@@ -34542,7 +34594,7 @@ fn parse_float(text: &str) -> f64 {
     // printed 0 on both backends with no diagnostic. Longer suffixes are tried first so `5f32`
     // strips `f32` rather than nothing (no float body ends in `f`, so the order is belt-and-braces).
     let mut core = text;
-    for suf in ["bf16", "f16", "f32", "f64", "f"] {
+    for suf in ["f8e4m3", "f8e5m2", "bf16", "f16", "f32", "f64", "f"] {
         if let Some(stripped) = core.strip_suffix(suf) {
             core = stripped;
             break;

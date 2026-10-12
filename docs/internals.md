@@ -293,7 +293,9 @@ them all, so each family's lowering refuses (`C0001`) an operand whose substitut
 wrong — `builtin_operands_are_f32` (kernel) and `MlBuiltin::buffer_elem` (I/O). The decode builtins
 have no such backstop and do not defer: a `Tensor[T, ..]` operand of one is `E0437` in the generic
 body. The **decode builtins** (`sdpa_kv`,
-`kv_append`, `gemv_bf16`/`gemv_f16`, `quantize_q{8,4}_0`, `gemv_q{8,4}_0`) are typed in
+`kv_append`, `gemv_bf16`/`gemv_f16`, `quantize_q{8,4}_0`, `gemv_q{8,4}_0`, and the group-wise int4
+`dequant_i4`/`dequant_u4`, whose entries in `quant.rs` are one scalar loop per group with an exact
+extent plan, `dequant_int4_plan`) are typed in
 `wukong_sema::decode_builtins` and lowered in `wukong_mir_build::decode_builtins` to one checked
 runtime call each (`wukong_runtime::{attention_kv, gemv_half, quant}`): their extents are values, so
 the entry validates them against the operand lengths and returns a status the lowering asserts is
@@ -628,7 +630,11 @@ greps for the literal substring `"code":"Ennnn"`, so key order and the absence o
 A `Function` owns a value arena (`ValueId -> MirType`), a list of `BasicBlock`s, and an entry block.
 Integers are signless `i1`/`i8`/`i16`/`i32`/`i64`/`i128` (signedness lives on the op, as in LLVM);
 `i128` is scalar-only — the verifier rejects a vector of `i128` lanes anywhere, and neither a
-`Switch` scrutinee nor an `AtomicAdd` value may be one. Each block has typed parameters, a straight-line list of `Inst { result: Option<ValueId>, op: Op }`,
+`Switch` scrutinee nor an `AtomicAdd` value may be one. Floats are `f8e4m3`/`f8e5m2`/`f16`/`bf16`/
+`f32`/`f64`; the four narrower than `f32` live in `f32` registers on their own grid
+(`MirType::is_sub_f32_float`), and the two 8-bit ones are scalar-only like `i128`: the verifier
+rejects a vector of f8 lanes and any `bitcast` to or from an f8 (its register is not its code; the
+`bits` builtin encodes instead). Each block has typed parameters, a straight-line list of `Inst { result: Option<ValueId>, op: Op }`,
 and exactly one `Terminator` (`Ret`, `Br`, `CondBr`, `Switch`, `Unreachable`). `Switch` is a multi-way
 branch on an `i8`..`i64` scrutinee whose case values are stored canonically (sign-extended from the
 type's width) and pairwise distinct; only `wukong_opt`'s late switch formation creates one, and the
@@ -1637,6 +1643,52 @@ it is typed (a signed minimum only under a unary minus, `Sema::negated_literal`)
 unsuffixed literal is typed by its value (`i64` for exactly 2^63, else `i128`; past 2^127,
 `E0431`). An array length that is a literal past `u64` saturates in both mirrors
 (`eval_usize_depth`, `const_usize_depth`) so it is out of range rather than `0`.
+
+### 8-bit floats (`fp8.rs` in three crates)
+
+`f8e4m3` (OCP E4M3FN) and `f8e5m2` (OCP E5M2) are `Scalar::F8E4M3`/`F8E5M2` (one byte, byte-aligned)
+and `MirType::F8E4M3`/`F8E5M2`. They follow the `f16`/`bf16` model rather than being erased to `i8`
+storage in `mir_build`: a value is an `f32` register on the format's grid, stored as its 1-byte
+code, so every arithmetic, compare and select site that already handles the narrow floats handles
+them, and the grid is reached at the same observation boundaries — a `ConstFloat`, a `Load` (decode
+the byte), a `Store` (encode the register), an `FpTrunc` to an f8 (the source rounded once, an
+`f64` from its own bits) and an `FpExt` from one (the source re-rounded before widening, so a value
+an optimizer forwarded past its store is still on the grid). `mir_build` rounds every arithmetic
+result with a same-type `FpTrunc` (`round_half_result`), and an integer converted to a narrow float
+— an `f8` or a half — too (`round_int_to_narrow_float`: `sitofp` produces the `f32`, not the narrow
+grid, and an `-O2` forward of `257 as bf16` used to print 257 where `-O0` printed the stored 256),
+at an `as` (`lower_cast`) and at an implicit conversion (`coerce_to`) alike: an integer literal
+adapting to a half operand is the half's value, so `max(b, 257)` no longer splits the same way and
+`one_bf16 + 257` is 1 + 256.
+The math intrinsics compute an f8 operand in `f32` and round the result once
+(`lower_math_intrinsic_at`), since their constants would otherwise be built at the f8 type, where
+`+inf` does not exist; `isnan`/`isinf`/… widen the operand first for the same reason. The optimizer
+folds neither f8 arithmetic nor f8 comparisons and never forwards an f8 store into a load
+(`simplify`, `cse::forwardable`), as for the halves; `lane_bytes`/`vector_width` have no f8 lane.
+Unlike a half's, an f8 constant stays at its exact literal value in the fold table
+(`round_float_to_ty`): the backends round it once from the `f64`, and rounding it to `f32` first can
+land it on an f8 midpoint, so the one fold it reaches, a unary minus, would round twice
+(`-1.12500001f8e5m2` printed `-1` at `-O2` and `-1.25` at `-O0`). In sema (`f8.rs`), `E0438`
+judges a float literal where it adapts to an f8 and an unsuffixed integer literal where it converts
+to one beside an f8 value — the binary operators, compound assignment, `min`/`max`, `sb_adapt`
+(`clamp`, `fma`, `copysign`, `logaddexp`) and `if`/`match` arms (`range_check_f8_int_literal`) —
+since `mir_build` converts such an integer with `sitofp` and rounds it onto the f8 grid silently.
+
+The codec is `wukong_runtime::fp8`'s bit-level `encode_f32`/`encode_f64`/`decode_f32`: a normal
+result rounds on the source's bit pattern (add `half − 1` plus the kept lsb below the format's last
+mantissa bit, so a carry bumps the exponent), rebiases and clamps to the largest code (448's `0x7E`
+for E4M3FN, the infinity `0x7C` for E5M2); one below the least normal scales `|x|` by `2^k` (exact)
+and rounds that to an integer, ties to even; a NaN gets the format's NaN code with its sign. The
+interpreter calls it (`round_f8`); Cranelift (`wukong_codegen_cranelift/src/fp8.rs`) and the LLVM
+emitter (`wukong_codegen_llvm/src/fp8.rs`, which declares `llvm.roundeven` and `llvm.fptosi.sat` for
+the subnormal branch) emit the same instructions inline, so there is no runtime call and no new
+link symbol. Its oracles: the runtime's own tests pin it to the exact reference encoder on every code,
+every midpoint and both neighbours, and a sweep of 262144 `f32` patterns and `f64` near-midpoints;
+`wukong_codegen_cranelift`'s `fp8_tests` run the type on the interpreter and natively at `-O0`/`-O2`
+against the runtime (every code through `from_bits`/`bits`/memory/`f64`, every midpoint, 4096
+patterns, an `f64` sweep and strided arithmetic); and `semantic_tests::f8_codec_modules` exports the
+LLVM codec for `tools/verify_semantics.py` to JIT against a transcription of the reference.
+`--backend=gpu-native` declines a function holding an f8 (`decline_f8`).
 
 ### Debug info (`-g`) and the JIT perf map
 

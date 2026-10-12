@@ -61,6 +61,86 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `exit`s, which also ends the thread inside a called function. The run reports `assertion failed`
   as the interpreter does when an `assert(false)` came first, and the interpreter's
   ``execution reached `unreachable` `` for a bare one.
+### int4: packing builtins and group-wise dequantization (`gap7/f8-types`, N25)
+
+- **Added: `pack_i4(lo, hi)`, `pack_u4(lo, hi)`, `unpack_i4(b)`, `unpack_u4(b)`.** Two 4-bit
+  integers per `u8`, `lo` in bits 0..4 and `hi` in bits 4..8 (ONNX `Int4` / PyTorch `quint4x2`
+  order); `unpack_i4` sign-extends each nibble to an `i8`, `unpack_u4` zero-extends to a `u8`, both
+  returning `(lo, hi)`. A run-time operand keeps its low four bits, as `as` would; a literal a
+  nibble cannot hold (`pack_u4(16, 0)`, `pack_u4(16u8, 0)`, `pack_i4(8, 0)`, `pack_u4(8 + 8, 0)`) is
+  the new **`E0439`**. Plain shifts and
+  masks in MIR, identical on every backend.
+- **Added: the `dequant_i4(q, scale, group, out)` / `dequant_u4(q, scale, zero, group, out)`
+  decode builtins** for the weight-only int4 layout GPTQ, AWQ and ONNX checkpoints share: element
+  `i` is nibble `i & 1` of byte `i >> 1`, group `i / group`, and the output is `q * scale[g]`
+  (signed) or `(q - zero[g]) * scale[g]` (unsigned) in `f32`, one rounding per operation in that
+  order. One runtime call (`wukong_runtime::quant::wukong_dequant_{i4,u4}_f32`) validates the exact
+  extents first (`ceil(n/2)` bytes, `ceil(n/group)` scales and zero points, a short last group
+  allowed) and traps like a failed `assert` otherwise; an output overlapping an input is computed
+  from the inputs as they were. Not differentiable (autodiff refuses it, as it does the other
+  quantized kernels).
+- A sub-byte `int4` *type* and an int4 GEMV are not part of this; neither are constructible SIMD
+  values, which stay open (N25).
+- Fixtures: `tests/run/int4_pack.wk` (all 16 values of each nibble kind through both halves),
+  `tests/run/int4_dequant.wk` (both forms, a short last group, an odd count, a slice and heap
+  buffer, and the same expansion written as a loop over `unpack_i4`);
+  `tests/fail/int4_nibble_out_of_range.wk` (E0439).
+
+### First-class 8-bit floats: `f8e4m3` and `f8e5m2` (`gap7/f8-types`, N25)
+
+- **Added: the `f8e4m3` and `f8e5m2` scalar types** — OCP E4M3FN (bias 7, 3 mantissa bits, no
+  infinity, saturating at ±448, one NaN per sign) and OCP E5M2 (bias 15, 2 mantissa bits, IEEE
+  infinities), one byte each, in every position `bf16` takes: locals, parameters and results, struct
+  and tuple fields, arrays, slices, `alloc::<f8e4m3>(n)`, generic instantiations and tensor
+  elements, on the interpreter, the native backend (JIT and `--emit=obj|exe`) and the LLVM text
+  emitter. A value computes in `f32` and every result rounds to nearest, ties to even, onto its own
+  grid by the rule of the `f32_to_f8e4m3`/`f32_to_f8e5m2` builtins (E4M3FN saturates, E5M2
+  overflows to ±∞, a NaN becomes the canonical NaN of its sign), so each of `+ - * /` is the
+  correctly rounded f8 result and `-O0` and `-O2` agree. Before this FP8 was `u8` codes and
+  conversion builtins only.
+- **Literals, conversions, printing.** `1.5f8e4m3` / `3f8e5m2` suffixes and unsuffixed literals
+  adapting to an f8 type; a literal that would saturate, overflow or round to zero is the new
+  **`E0438`** — and so is an unsuffixed integer literal that converts to an f8 beside an f8 value
+  (`x * 1000`, `x < 1000`, `e += 1000`, `max(x, 1000)`, `clamp`, `fma`, an `if`/`match` arm),
+  which would otherwise silently be 448 or infinity. `as` reaches every integer and float type in one rounding — an `f64` is encoded from
+  its own bits, never through `f32` (which would round twice) — and an f8 widens losslessly in mixed
+  arithmetic to `f16`, `bf16`, `f32`, `f64`; `f8e4m3` with `f8e5m2`, or with an integer, is `E0440`.
+  An f8 prints as the `f32` it holds, in `print`, `printf` and aggregates. `bits(x)` is the OCP code
+  (`u8`) and `f8e4m3_from_bits` / `f8e5m2_from_bits` take one back; the float builtins (`sqrt`,
+  `exp`, `fma`, `ldexp`, `isinf`, …) compute in `f32` and round once.
+- **One codec, inline everywhere.** `wukong_runtime::fp8` gains a bit-level encoder (from `f32` and
+  from `f64`) and decoder, pinned to its exact reference on every code, every midpoint and its
+  neighbours and a 262144-pattern sweep. The interpreter calls it; Cranelift and the LLVM emitter
+  emit the identical integer sequence inline (no runtime call, no new link symbol). The native and
+  interpreted type is checked against the runtime on all 256 codes of both formats, every midpoint,
+  4096 `f32` patterns, an `f64` sweep and strided arithmetic at `-O0`/`-O2`
+  (`wukong_codegen_cranelift` `fp8_tests`); the LLVM codec is JIT-checked against a transcription
+  of the reference (`semantic_tests::f8_codec_modules`, 10556 checks under `verify_semantics.py`).
+- **Not 8-bit (documented):** SIMD lanes (`vec[f8e4m3, N]` is `E0302`, a loop over f8 data stays
+  scalar), kernel builtins, `atomic_add` (`E0446`), `extern "C"` (`C0001`), and
+  `--backend=gpu-native`, which declines a function holding one. Autodiff treats an f8 like a
+  `bf16`: straight-through rounding, adjoints in the value's type.
+- **Fixed: an integer converted to `bf16`/`f16` was not rounded at the value.** `sitofp`/`uitofp`
+  produce the `f32`, and only a store rounded it to the half grid, so once mem2reg forwarded the
+  value past its store, `print(i as bf16)` of 257 printed 257 at `-O2` (native and interpreter
+  alike) where `-O0` printed 256. The conversion now rounds at the value, for the 8-bit floats too.
+- **Changed: an integer literal beside a `bf16`/`f16` is that type's value.** The implicit
+  conversion of an unsuffixed integer literal that adapts to a half operand rounds at the value as
+  well, so the literal is the number it adapts to, on the half grid, before the operation runs. This
+  fixes a second `-O0`/`-O2` split — `max(b, 257)` and `if c { 257 } else { b }` of a `bf16` printed
+  257 at `-O2` (the unrounded literal forwarded past its store) and 256 at `-O0` — and it changes
+  results that did not split: with `b: bf16 = 1.0`, `b + 257` is now 1 + 256 = 256 (it was the
+  `f32` sum 258, rounded once), and with `h: f16 = 2048.0`, `h < 2049` is now `false` (2049 is 2048
+  on the f16 grid; the compare used the exact `f32` 2049). A float literal stays `f32` and is
+  unaffected (`b + 257.0` is 258). Pinned by `tests/run/half_int_literal_operand.wk`; no corpus
+  program changes.
+- The optimizer keeps an f8 constant at its exact literal value, so folding a unary minus rounds it
+  once, as every backend does: `-1.12500001` as an `f8e5m2` is `-1.25` at every `-O` level (through
+  `f32` it was the tie `-1.125` and folded to `-1`).
+- Fixtures: `tests/run/f8_scalar.wk`, `f8_aggregates.wk`, `f8_code_round_trip.wk`,
+  `f8_negated_literal.wk`;
+  `tests/fail/f8_literal_out_of_range.wk` (E0438), `f8_format_mix.wk` (E0440),
+  `f8_vector_lane.wk` (E0302), `extern_f8.wk` (C0001).
 
 ### First-class 128-bit integers: `i128` and `u128` (`gap6/i128`, N25)
 

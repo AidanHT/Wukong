@@ -518,6 +518,20 @@ pub const DT_CHAR: i64 = 13;
 pub const DT_I128: i64 = 14;
 /// Element dtype code of a `u128` buffer.
 pub const DT_U128: i64 = 15;
+/// Element dtype code of an `f8e4m3` buffer (one OCP E4M3FN code per byte), printed as the `f32`
+/// each code decodes to.
+pub const DT_F8E4M3: i64 = 16;
+/// Element dtype code of an `f8e5m2` buffer (one OCP E5M2 code per byte).
+pub const DT_F8E5M2: i64 = 17;
+
+/// The FP8 format of an f8 buffer dtype, or `None` for any other code.
+fn f8_format(dt: i64) -> Option<crate::fp8::Fp8Format> {
+    match dt {
+        DT_F8E4M3 => Some(crate::fp8::Fp8Format::E4M3),
+        DT_F8E5M2 => Some(crate::fp8::Fp8Format::E5M2),
+        _ => None,
+    }
+}
 
 /// Buffers longer than this print summarized (NumPy's `threshold`).
 pub const SUMMARIZE_THRESHOLD: usize = 1000;
@@ -543,7 +557,7 @@ pub enum Elem {
 /// Byte width of a buffer element of dtype `dt`, or `None` for an unknown code.
 pub fn elem_size(dt: i64) -> Option<usize> {
     match dt {
-        DT_BOOL => Some(1),
+        DT_BOOL | DT_F8E4M3 | DT_F8E5M2 => Some(1),
         DT_CHAR => Some(4),
         DT_I128 | DT_U128 => Some(16),
         _ => crate::fileio::dtype_size(dt),
@@ -562,6 +576,11 @@ fn radix_style(style: u8) -> bool {
 /// The element of dtype `dt` whose integer image is `bits` (any extension of the element's own
 /// width — only the low bits are read) or whose float value is `float`.
 pub fn elem_of(dt: i64, bits: i64, float: f64, style: u8) -> Elem {
+    // An 8-bit float is read at its own precision, as a half is (the interpreter holds the value,
+    // a native buffer the code it rounds to).
+    if let Some(fmt) = f8_format(dt) {
+        return Elem::F32(crate::fp8::round_f32(float as f32, fmt));
+    }
     let width = match dt {
         DT_F32 => return Elem::F32(float as f32),
         // A half-precision element is read at its storage precision, as the interpreter's `Load`
@@ -615,6 +634,10 @@ pub unsafe fn read_elem(data: *const u8, i: usize, dt: i64, style: u8) -> Elem {
             DT_F16 => Elem::F32(crate::f16_bits_to_f32((p as *const u16).read_unaligned())),
             DT_BF16 => Elem::F32(crate::bf16_bits_to_f32((p as *const u16).read_unaligned())),
             DT_I128 | DT_U128 => elem_of_wide(dt, (p as *const i128).read_unaligned(), style),
+            DT_F8E4M3 | DT_F8E5M2 => match f8_format(dt) {
+                Some(fmt) => Elem::F32(crate::fp8::decode_f32(*p, fmt)),
+                None => Elem::F32(0.0),
+            },
             _ => {
                 let bits = match size {
                     1 => i64::from(*p),

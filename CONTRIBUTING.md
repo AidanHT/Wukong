@@ -457,6 +457,18 @@ suffix, an all-literal expression adapting as a whole, a `char`, an array length
 must range-check it against the type it lands in, or it silently keeps its low bits
 (`tests/fail/suffixed_literal_out_of_range.wk` and its siblings).
 
+A float narrower than `f32` (`f16`, `bf16`, and the 8-bit `f8e4m3`/`f8e5m2`) is the other worked
+example: it lives in an `f32` register on its own grid, so the audit is every **observation
+boundary** where a value can leave the grid unrounded — a constant, a load, a store, a conversion
+to it, a widening from it, and every value `mir_build` builds at the type (an arithmetic result, an
+integer converted to it, a math builtin's polynomial — whose constants, such as `+inf`, may not
+exist at the narrow type) — plus every optimizer rule that could forward or fold past one
+(`simplify`'s folds, `cse::forwardable`). `MirType::is_sub_f32_float` names the family; a missed
+boundary shows up as `-O0` != `-O2`, never as interp != native, so pin each with an opaque
+operand at both levels. A new format's codec needs a reference written differently from the
+production one (`wukong_runtime::fp8`'s exact-`f64` reference beside its bit-level codec) and a
+sweep of every code and every midpoint on each backend.
+
 ## Adding a runtime kernel (and its recognizer)
 
 A "recognized kernel" is a loop shape that `wukong_mir_build` pattern-matches and replaces with a

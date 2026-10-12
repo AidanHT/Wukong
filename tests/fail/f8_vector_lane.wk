@@ -1,0 +1,10 @@
+// EXPECT-CODE: E0302
+module tests.fail.f8_vector_lane
+
+// An 8-bit float is a scalar type: its value lives in an f32 register on the format's grid, and no
+// vector lowering rounds a lane onto that grid, so a SIMD vector of f8 lanes is E0302 (as one of
+// `i128` lanes is). Use `f32` lanes and convert with `as`.
+fn main() -> i32 {
+    let v: vec[f8e5m2, 4];
+    return 0;
+}

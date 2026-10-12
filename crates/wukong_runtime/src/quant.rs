@@ -604,6 +604,201 @@ pub unsafe extern "C" fn wukong_gemv_q4_0_f32_parallel(
     gemv_q_entry(w, w_len, x, x_len, y, y_len, QFormat::Q4, true)
 }
 
+// ---- Packed int4 with group-wise scales -------------------------------------------------------
+//
+// The runtime of the `dequant_i4` / `dequant_u4` builtins: the weight-only int4 layout GPTQ, AWQ
+// and ONNX `Int4` checkpoints share, as opposed to GGML's self-describing blocks above. Element
+// `i` of a packed buffer is nibble `i & 1` of byte `i >> 1`, the low nibble first (the order the
+// `pack_i4` / `pack_u4` builtins write); a signed nibble is two's complement (`-8..=7`), an
+// unsigned one `0..=15`. Element `i` belongs to group `g = i / group`, whose scale is `scale[g]`
+// (and, unsigned, whose zero point is `zero[g]`), and dequantizes to the f32 expression
+//
+// ```text
+// signed:   out[i] = (q_i as f32) * scale[g]
+// unsigned: out[i] = ((q_i as f32) - zero[g]) * scale[g]
+// ```
+//
+// each operation rounded once, in that order (no fused multiply-add) — exactly the scalar loop a
+// program would write, so the result does not depend on how the loop is vectorized.
+
+/// Validate a `dequant_i4` / `dequant_u4` call: `n = out_len` elements, `group >= 1`, the packed
+/// buffer exactly `ceil(n / 2)` bytes, and one scale (and zero point) per group, exactly
+/// `ceil(n / group)` of them (`zero_len < 0` means there are none: the signed form). Returns
+/// `(n, group)`, or [`QUANT_BAD_EXTENT`].
+pub fn dequant_int4_plan(
+    q_len: i64,
+    scale_len: i64,
+    zero_len: i64,
+    group: i64,
+    out_len: i64,
+) -> Result<(usize, usize), i64> {
+    if q_len < 0 || scale_len < 0 || out_len < 0 || group < 1 {
+        return Err(QUANT_BAD_EXTENT);
+    }
+    let (n, g) = (out_len as u64, group as u64);
+    let groups = n.div_ceil(g);
+    if q_len as u64 != n.div_ceil(2)
+        || scale_len as u64 != groups
+        || (zero_len >= 0 && zero_len as u64 != groups)
+    {
+        return Err(QUANT_BAD_EXTENT);
+    }
+    Ok((n as usize, g as usize))
+}
+
+/// Dequantize `out.len()` packed 4-bit elements (see the section docs). The scalar definition,
+/// one group at a time so the scale is loaded once per group.
+fn dequant_int4_into(q: &[u8], scale: &[f32], zero: Option<&[f32]>, group: usize, out: &mut [f32]) {
+    // The value of one nibble: sign-extended (shift it to the top of an i8, then arithmetically
+    // back) for the signed form, or less the group's zero point.
+    let value = |nib: u8, s: f32, z: Option<f32>| match z {
+        None => f32::from(((nib << 4) as i8) >> 4) * s,
+        Some(z) => (f32::from(nib) - z) * s,
+    };
+    if group.is_multiple_of(2) {
+        // An even group never splits a byte: decode whole bytes, two outputs each, one scale (and
+        // zero point) per group — a straight-line body the compiler vectorizes. Each element is
+        // the same expression as below, so the two paths agree bit for bit.
+        for (g, chunk) in out.chunks_mut(group).enumerate() {
+            let (s, z) = (scale[g], zero.map(|z| z[g]));
+            let bytes = &q[g * group / 2..];
+            let full = chunk.len() / 2;
+            let mut pairs = chunk.chunks_exact_mut(2);
+            for (pair, &b) in (&mut pairs).zip(bytes) {
+                pair[0] = value(b & 0x0f, s, z);
+                pair[1] = value(b >> 4, s, z);
+            }
+            // An odd last group (the end of an odd count) ends on a low nibble.
+            if let [last] = pairs.into_remainder() {
+                *last = value(bytes[full] & 0x0f, s, z);
+            }
+        }
+        return;
+    }
+    for (g, chunk) in out.chunks_mut(group).enumerate() {
+        let (s, z) = (scale[g], zero.map(|z| z[g]));
+        let base = g * group;
+        for (k, o) in chunk.iter_mut().enumerate() {
+            let i = base + k;
+            let b = q[i >> 1];
+            let nib = if i & 1 == 0 { b & 0x0f } else { b >> 4 };
+            *o = value(nib, s, z);
+        }
+    }
+}
+
+/// The shared body of the two int4 entries (`zero` null with `zero_len < 0` for the signed form).
+///
+/// # Safety
+/// Each pointer addresses its length of elements (`out` writable); a zero-length operand is never
+/// dereferenced.
+#[allow(clippy::too_many_arguments)]
+unsafe fn dequant_int4_entry(
+    q: *const u8,
+    q_len: i64,
+    scale: *const f32,
+    scale_len: i64,
+    zero: *const f32,
+    zero_len: i64,
+    group: i64,
+    out: *mut f32,
+    out_len: i64,
+) -> i64 {
+    let (n, group) = match dequant_int4_plan(q_len, scale_len, zero_len, group, out_len) {
+        Ok(ng) => ng,
+        Err(code) => return code,
+    };
+    if n == 0 {
+        return QUANT_OK;
+    }
+    let groups = n.div_ceil(group);
+    let qs = std::slice::from_raw_parts(q, n.div_ceil(2));
+    let ss = std::slice::from_raw_parts(scale, groups);
+    let zs = (zero_len >= 0).then(|| std::slice::from_raw_parts(zero, groups));
+    // Value semantics: an output overlapping an input is written only after every input was read.
+    let overlaps = bytes_overlap(out as usize, n * 4, q as usize, qs.len())
+        || bytes_overlap(out as usize, n * 4, scale as usize, groups * 4)
+        || (zs.is_some() && bytes_overlap(out as usize, n * 4, zero as usize, groups * 4));
+    if overlaps {
+        let mut tmp = vec![0.0f32; n];
+        dequant_int4_into(qs, ss, zs, group, &mut tmp);
+        std::ptr::copy_nonoverlapping(tmp.as_ptr(), out, n);
+    } else {
+        dequant_int4_into(qs, ss, zs, group, std::slice::from_raw_parts_mut(out, n));
+    }
+    QUANT_OK
+}
+
+/// `out[i] = (q_i as f32) * scale[i / group]` over a packed signed-int4 buffer `q` (two's
+/// complement nibbles, element `i` in nibble `i & 1` of byte `i >> 1`, low first) — the
+/// `dequant_i4(q, scale, group, out)` builtin. Returns [`QUANT_OK`] or [`QUANT_BAD_EXTENT`]
+/// (nothing written) unless `q` is exactly `ceil(n/2)` bytes and `scale` exactly
+/// `ceil(n/group)` values, `n = out_len`, `group >= 1`.
+///
+/// # Safety
+/// `q` addresses `q_len` bytes, `scale` `scale_len` f32 and `out` `out_len` writable f32 (a
+/// zero-length operand may be null). An output overlapping an input is handled (value semantics).
+#[no_mangle]
+pub unsafe extern "C" fn wukong_dequant_i4_f32(
+    q: *const u8,
+    q_len: i64,
+    scale: *const f32,
+    scale_len: i64,
+    group: i64,
+    out: *mut f32,
+    out_len: i64,
+) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above); aliasing is allowed
+    // explicitly, an output overlapping an input is handled (value semantics).
+    crate::safety::debug_extent(q, q_len);
+    crate::safety::debug_extent(scale, scale_len);
+    crate::safety::debug_extent(out, out_len);
+    dequant_int4_entry(
+        q,
+        q_len,
+        scale,
+        scale_len,
+        std::ptr::null(),
+        -1,
+        group,
+        out,
+        out_len,
+    )
+}
+
+/// `out[i] = ((q_i as f32) - zero[g]) * scale[g]`, `g = i / group`, over a packed unsigned-int4
+/// buffer `q` — the `dequant_u4(q, scale, zero, group, out)` builtin. The extents of
+/// [`wukong_dequant_i4_f32`], with `zero` exactly as long as `scale`.
+///
+/// # Safety
+/// The contract of [`wukong_dequant_i4_f32`], and `zero` addresses `zero_len` f32.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn wukong_dequant_u4_f32(
+    q: *const u8,
+    q_len: i64,
+    scale: *const f32,
+    scale_len: i64,
+    zero: *const f32,
+    zero_len: i64,
+    group: i64,
+    out: *mut f32,
+    out_len: i64,
+) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above); aliasing is allowed
+    // explicitly, an output overlapping an input is handled (value semantics).
+    crate::safety::debug_extent(q, q_len);
+    crate::safety::debug_extent(scale, scale_len);
+    crate::safety::debug_extent(zero, zero_len);
+    crate::safety::debug_extent(out, out_len);
+    if zero_len < 0 {
+        return QUANT_BAD_EXTENT;
+    }
+    dequant_int4_entry(
+        q, q_len, scale, scale_len, zero, zero_len, group, out, out_len,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -901,5 +1096,117 @@ mod tests {
         let code =
             unsafe { wukong_gemv_q4_0_f32(w.as_ptr(), 35, x.as_ptr(), 40, y.as_mut_ptr(), 1) };
         assert_eq!(code, QUANT_BAD_EXTENT);
+    }
+
+    /// The value of element `i` of a packed int4 buffer, written independently of the entry:
+    /// extract the nibble arithmetically and map the signed range by subtraction.
+    fn nibble_value(q: &[u8], i: usize, signed: bool) -> i32 {
+        let divisor = if i.is_multiple_of(2) { 1 } else { 16 };
+        let nib = (i32::from(q[i / 2]) / divisor) % 16;
+        if signed && nib >= 8 {
+            nib - 16
+        } else {
+            nib
+        }
+    }
+
+    /// Every element of both forms against the definition, over odd and even lengths, a group
+    /// size that divides `n` and one that leaves a short last group, every byte value and signed
+    /// zero points and scales (NaN and infinity included, which pass through the arithmetic).
+    #[test]
+    fn dequant_int4_matches_the_definition() {
+        for (n, group) in [(1usize, 1usize), (7, 3), (64, 32), (257, 16), (300, 128)] {
+            let q: Vec<u8> = (0..n.div_ceil(2)).map(|j| (j * 37 + 11) as u8).collect();
+            let groups = n.div_ceil(group);
+            let mut scale: Vec<f32> = fill(5, groups).iter().map(|v| v * 0.25).collect();
+            let mut zero: Vec<f32> = (0..groups).map(|g| (g % 16) as f32 - 0.5).collect();
+            if groups > 2 {
+                scale[1] = f32::INFINITY;
+                zero[2] = f32::NAN;
+            }
+            let mut out_i = vec![0.0f32; n];
+            let mut out_u = vec![0.0f32; n];
+            // SAFETY: every buffer is sized to its length.
+            let (ci, cu) = unsafe {
+                (
+                    wukong_dequant_i4_f32(
+                        q.as_ptr(),
+                        q.len() as i64,
+                        scale.as_ptr(),
+                        groups as i64,
+                        group as i64,
+                        out_i.as_mut_ptr(),
+                        n as i64,
+                    ),
+                    wukong_dequant_u4_f32(
+                        q.as_ptr(),
+                        q.len() as i64,
+                        scale.as_ptr(),
+                        groups as i64,
+                        zero.as_ptr(),
+                        groups as i64,
+                        group as i64,
+                        out_u.as_mut_ptr(),
+                        n as i64,
+                    ),
+                )
+            };
+            assert_eq!((ci, cu), (QUANT_OK, QUANT_OK));
+            for i in 0..n {
+                let g = i / group;
+                let wi = nibble_value(&q, i, true) as f32 * scale[g];
+                let wu = (nibble_value(&q, i, false) as f32 - zero[g]) * scale[g];
+                assert_eq!(out_i[i].to_bits(), wi.to_bits(), "i4 n={n} i={i}");
+                assert_eq!(out_u[i].to_bits(), wu.to_bits(), "u4 n={n} i={i}");
+            }
+        }
+    }
+
+    /// The extents are exact: `ceil(n/2)` packed bytes, `ceil(n/group)` scales and zero points,
+    /// `group >= 1`; anything else writes nothing and returns `QUANT_BAD_EXTENT`.
+    #[test]
+    fn dequant_int4_rejects_inconsistent_extents() {
+        assert_eq!(dequant_int4_plan(3, 2, -1, 3, 5), Ok((5, 3)));
+        assert_eq!(dequant_int4_plan(3, 2, 2, 3, 5), Ok((5, 3)));
+        assert_eq!(dequant_int4_plan(0, 0, 0, 1, 0), Ok((0, 1)));
+        for (q, s, z, g, n) in [
+            (2, 2, -1, 3, 5),
+            (4, 2, -1, 3, 5),
+            (3, 1, -1, 3, 5),
+            (3, 3, -1, 3, 5),
+            (3, 2, 1, 3, 5),
+            (3, 2, -1, 0, 5),
+            (3, 2, -1, -4, 5),
+            (-1, 2, -1, 3, 5),
+        ] {
+            assert_eq!(
+                dequant_int4_plan(q, s, z, g, n),
+                Err(QUANT_BAD_EXTENT),
+                "{q} {s} {z} {g} {n}"
+            );
+        }
+        let q = [0x21u8; 2];
+        let scale = [1.0f32; 2];
+        let mut out = [7.0f32; 4];
+        // SAFETY: sized buffers; one scale is too few for 4 elements in groups of 3, so the call
+        // must refuse before writing.
+        let code = unsafe {
+            wukong_dequant_i4_f32(q.as_ptr(), 2, scale.as_ptr(), 1, 3, out.as_mut_ptr(), 4)
+        };
+        assert_eq!(code, QUANT_BAD_EXTENT);
+        assert_eq!(out, [7.0; 4]);
+    }
+
+    /// An output that overlaps the scales is written only after they were read.
+    #[test]
+    fn dequant_int4_output_may_alias_its_scales() {
+        let q = [0x21u8, 0x43];
+        let mut buf = [2.0f32, 3.0, 0.0, 0.0];
+        // SAFETY: `scale` is buf[0..2] and `out` is all of buf: an allowed overlap.
+        let code = unsafe {
+            wukong_dequant_i4_f32(q.as_ptr(), 2, buf.as_ptr(), 2, 2, buf.as_mut_ptr(), 4)
+        };
+        assert_eq!(code, QUANT_OK);
+        assert_eq!(buf, [2.0, 4.0, 9.0, 12.0]);
     }
 }

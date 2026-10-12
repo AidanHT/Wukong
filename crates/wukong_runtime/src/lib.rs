@@ -218,8 +218,9 @@ pub use gemv_half::{
 };
 pub mod quant;
 pub use quant::{
-    wukong_gemv_q4_0_f32, wukong_gemv_q4_0_f32_parallel, wukong_gemv_q8_0_f32,
-    wukong_gemv_q8_0_f32_parallel, wukong_quantize_q4_0_f32, wukong_quantize_q8_0_f32,
+    wukong_dequant_i4_f32, wukong_dequant_u4_f32, wukong_gemv_q4_0_f32,
+    wukong_gemv_q4_0_f32_parallel, wukong_gemv_q8_0_f32, wukong_gemv_q8_0_f32_parallel,
+    wukong_quantize_q4_0_f32, wukong_quantize_q8_0_f32,
 };
 
 mod cumprod;

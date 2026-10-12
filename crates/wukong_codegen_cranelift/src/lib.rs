@@ -52,6 +52,8 @@ mod ml_rt;
 mod text_rt;
 // The `i128` operations x64 has no instruction for: wide constants, division, float conversion.
 mod int128;
+// The 8-bit floats' inline codec (`f8e4m3`, `f8e5m2`).
+mod fp8;
 
 // Where each function's machine code went: the DWARF of a `-g` object and the JIT's perf map
 // (`WUKONG_PERF_MAP=1`).
@@ -786,7 +788,9 @@ enum Intrinsic {
 fn classify_intrinsic(name: &str, arg: Option<&MirType>) -> Option<Intrinsic> {
     match name {
         "print" | "println" => Some(match arg {
-            Some(MirType::F32 | MirType::F16 | MirType::BF16) => Intrinsic::PrintF32,
+            Some(
+                MirType::F32 | MirType::F16 | MirType::BF16 | MirType::F8E4M3 | MirType::F8E5M2,
+            ) => Intrinsic::PrintF32,
             Some(t) if t.is_float() => Intrinsic::PrintFloat,
             _ => Intrinsic::PrintInt,
         }),
@@ -810,8 +814,9 @@ fn is_bf16_x4(t: &MirType) -> bool {
     matches!(t, MirType::Vec(lane, 4) if **lane == MirType::BF16)
 }
 
-/// Map a MIR type to its Cranelift type, or `None` for `Void`. `i1` becomes `i8`; `f16`/`bf16` are
-/// computed as `f32` (matching the interpreter's promotion of sub-`f32` floats).
+/// Map a MIR type to its Cranelift type, or `None` for `Void`. `i1` becomes `i8`; `f16`/`bf16` and
+/// the 8-bit floats are computed as `f32` (matching the interpreter's promotion of sub-`f32`
+/// floats).
 fn cl_type(t: &MirType, ptr_ty: Type) -> Option<Type> {
     Some(match t {
         MirType::I1 | MirType::I8 => types::I8,
@@ -819,7 +824,9 @@ fn cl_type(t: &MirType, ptr_ty: Type) -> Option<Type> {
         MirType::I32 => types::I32,
         MirType::I64 => types::I64,
         MirType::I128 => types::I128,
-        MirType::F16 | MirType::BF16 | MirType::F32 => types::F32,
+        MirType::F16 | MirType::BF16 | MirType::F8E4M3 | MirType::F8E5M2 | MirType::F32 => {
+            types::F32
+        }
         MirType::F64 => types::F64,
         MirType::Ptr => ptr_ty,
         MirType::Vec(elem, n) => {
@@ -838,7 +845,7 @@ fn cl_type(t: &MirType, ptr_ty: Type) -> Option<Type> {
 /// letting the `u32` multiply overflow-panic.
 fn size_of(t: &MirType) -> Option<u32> {
     Some(match t {
-        MirType::I1 | MirType::I8 => 1,
+        MirType::I1 | MirType::I8 | MirType::F8E4M3 | MirType::F8E5M2 => 1,
         MirType::I16 | MirType::F16 | MirType::BF16 => 2,
         MirType::I32 | MirType::F32 => 4,
         MirType::I64 | MirType::F64 | MirType::Ptr => 8,
@@ -1293,6 +1300,14 @@ impl<'a> FnTranslator<'a> {
                     .builder
                     .ins()
                     .f32const(wukong_runtime::round_f16(*v as f32)),
+                // An f8 const is the literal rounded once from its f64 value (`fp8.rs`).
+                MirType::F8E4M3 | MirType::F8E5M2 => {
+                    let fmt = fp8::f8_format(ty).expect("an f8 type");
+                    let code = wukong_runtime::fp8::encode_f64(*v, fmt);
+                    self.builder
+                        .ins()
+                        .f32const(wukong_runtime::fp8::decode_f32(code, fmt))
+                }
                 _ => self.builder.ins().f32const(*v as f32),
             },
             Op::Bin(op, l, r) => {
@@ -1431,6 +1446,10 @@ impl<'a> FnTranslator<'a> {
                     self.builder
                         .ins()
                         .bitcast(types::F32, MemFlags::new(), shifted)
+                } else if let Some(fmt) = fp8::f8_format(ty) {
+                    // An f8 is stored as its 1-byte code; decode it exactly into its f32 register.
+                    let code = self.builder.ins().uload8(types::I32, flags, addr, 0);
+                    self.f8_decode(code, fmt)
                 } else if matches!(ty, MirType::F16) {
                     // f16 storage is 2 bytes; widen via the runtime shim (no cheap inline bit-extend
                     // like bf16). Register type is f32.
@@ -1470,6 +1489,13 @@ impl<'a> FnTranslator<'a> {
                     let hi = self.builder.ins().ushr_imm(bits, 16);
                     let half = self.builder.ins().ireduce(types::I16, hi);
                     self.builder.ins().store(flags, half, addr, 0);
+                } else if let Some(fmt) = fp8::f8_format(self.ty_of(*value)) {
+                    // Encode the f32 register (rounding it, should it be off the grid) and store
+                    // the 1-byte code.
+                    let v = self.val(*value);
+                    let code = self.f8_encode(v, fmt);
+                    let byte = self.builder.ins().ireduce(types::I8, code);
+                    self.builder.ins().store(flags, byte, addr, 0);
                 } else if matches!(self.ty_of(*value), MirType::F16) {
                     // Round the f32 register to f16 via the runtime shim, store the 16 bits (2 bytes).
                     let v = self.val(*value);
@@ -1784,6 +1810,10 @@ impl<'a> FnTranslator<'a> {
                 let xr = match self.ty_of(v) {
                     MirType::BF16 => self.round_to_bf16(x),
                     MirType::F16 => self.round_to_f16(x),
+                    t @ (MirType::F8E4M3 | MirType::F8E5M2) => {
+                        let fmt = fp8::f8_format(t).expect("an f8 type");
+                        self.round_to_f8(x, fmt)
+                    }
                     _ => x,
                 };
                 let xr_ty = self.dfg_ty(xr);
@@ -1794,7 +1824,10 @@ impl<'a> FnTranslator<'a> {
                 }
             }
             FpTrunc => {
-                if matches!(to, MirType::BF16) {
+                if let Some(fmt) = fp8::f8_format(to) {
+                    // One rounding from the source's own precision, `f64` included (`fp8.rs`).
+                    self.round_to_f8(x, fmt)
+                } else if matches!(to, MirType::BF16) {
                     // bf16's register type is f32; demote an f64 source first, then round to bf16.
                     let f = if from_ty == types::F64 {
                         self.builder.ins().fdemote(types::F32, x)
@@ -5320,7 +5353,7 @@ unsafe fn invoke_code(code: usize, ret: &MirType) -> i64 {
         // [127:32]. Reading those 64 bits as an `f64` reinterprets a live float as a denormal —
         // `fn main() -> f32 { return 42.9; }` (XMM0[31:0] = 0x422b_999a) came out as 5.4e-315,
         // which `as i64` saturates to 0, while the interpreter oracle exits 42.
-        MirType::F32 | MirType::F16 | MirType::BF16 => {
+        MirType::F32 | MirType::F16 | MirType::BF16 | MirType::F8E4M3 | MirType::F8E5M2 => {
             let f: extern "C" fn() -> f32 = std::mem::transmute(code);
             f() as i64
         }
@@ -6969,6 +7002,9 @@ mod tests;
 
 #[cfg(test)]
 mod lane_op_tests;
+
+#[cfg(test)]
+mod fp8_tests;
 
 #[cfg(test)]
 mod assertion_tests;

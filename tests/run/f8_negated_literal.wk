@@ -1,0 +1,40 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -1.25
+// EXPECT-OUT: 189
+// EXPECT-OUT: -57344
+// EXPECT-OUT: 251
+// EXPECT-OUT: -1.125
+// EXPECT-OUT: 185
+// EXPECT-OUT: 1.25
+// EXPECT-OUT: -1.25
+module tests.run.f8_negated_literal
+
+// An f8 literal rounds onto the 8-bit grid ONCE, from its exact decimal value. Each literal below
+// sits just past an f8 midpoint, closer to it than half an f32 ulp, so routing it through f32 first
+// lands it exactly ON the midpoint and the tie-to-even picks the other neighbour. The optimizer used
+// to do exactly that when it folded the unary minus, so -O2 printed -1, -inf and -1 where -O0 printed
+// the values below.
+//
+// Expected by hand. E5M2 has 3 significant bits: on [1, 2) its step is 0.25, so 1.12500001 is above
+// the midpoint 1.125 of 1 and 1.25 and rounds to 1.25; code = sign 1, exponent 15 (01111), mantissa
+// 01 = 0b1_01111_01 = 189. The largest finite E5M2 value is 57344 (1.75 * 2^15) and the overflow
+// midpoint is 61440, so 61439.999 rounds down to 57344; code = 1_11110_11 = 251. E4M3FN has 4
+// significant bits: on [1, 2) its step is 0.125, so 1.06250001 is above the midpoint 1.0625 and
+// rounds to 1.125; code = 1_0111_001 = 185. The positive literal takes the same grid point, and
+// negating it at run time is exact.
+fn main() -> i32 {
+    let v: f8e5m2 = -1.12500001;
+    print(v);
+    print(bits(v));
+    let big = -61439.999f8e5m2;
+    print(big);
+    print(bits(big));
+    let w: f8e4m3 = -1.06250001;
+    print(w);
+    print(bits(w));
+    let p: f8e5m2 = 1.12500001;
+    print(p);
+    print(-p);
+    return 0;
+}

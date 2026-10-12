@@ -435,9 +435,11 @@ unsuffixed literal is typed by its value, the narrowest signed type that holds i
 `-170141183460469231731687303715884105728` (`i128::MIN`) are `i128`, and a magnitude past `2^127`
 fits no integer type and is `E0431` (`tests/run/i128_negated_literals.wk`,
 `tests/fail/negated_literal_past_i128.wk`). A **float literal** takes `_` separators and an optional
-exponent, and its suffix may be `f32`, `f64`, `f16`, `bf16`, or the bare C-style `f` (= `f32`);
-unsuffixed it defaults to **`f32`** (`5f`, `1.5`, `1_000.5e-3`, `0.5bf16`). A malformed one — `1.5z`,
-an incomplete exponent `1.5e`, a doubled suffix `5ff` — is `E0431`, never silently `0.0`. A
+exponent, and its suffix may be `f32`, `f64`, `f16`, `bf16`, `f8e4m3`, `f8e5m2`, or the bare C-style
+`f` (= `f32`); unsuffixed it defaults to **`f32`** (`5f`, `1.5`, `1_000.5e-3`, `0.5bf16`,
+`1.5f8e4m3`). A malformed one — `1.5z`, an incomplete exponent `1.5e`, a doubled suffix `5ff` — is
+`E0431`, never silently `0.0`; an 8-bit float literal that would saturate, overflow or vanish on its
+narrow grid is `E0438` ([8-bit floats](#8-bit-floats-f8e4m3-and-f8e5m2-)). A
 **char literal** `'A'` has type **`char`** (a 32-bit Unicode scalar value) — covering the
 one-character escapes (`\n` `\r` `\t` `\\` `\'` `\"` `\0`), `\xHH` hex, and `\u{…}` Unicode escapes. A
 char literal holds **exactly one** Unicode scalar value, and the compiler enforces it: an empty `''`
@@ -465,7 +467,7 @@ stack frame), a `*u8` can be **returned from a function and threaded across call
 |-------------|-----------------------------------------------------|--------|
 | Integers    | `i8 i16 i32 i64 i128`, `u8 u16 u32 u64 u128`, `usize isize` ([128-bit integers](#128-bit-integers-i128-and-u128-)) | ✅     |
 | Floats      | `f16 bf16 f32 f64`                                   | ✅ scalar |
-| FP8         | E4M3FN / E5M2 codes stored as `u8`, converted with the [scalar builtins](#scalar-builtins-) (`f8e4m3_to_f32`, `f32_to_f8e4m3`, …); no first-class `f8` type | 🟡 storage |
+| FP8         | `f8e4m3` (OCP E4M3FN) and `f8e5m2` (OCP E5M2), one byte each ([8-bit floats](#8-bit-floats-f8e4m3-and-f8e5m2-)); raw `u8` codes convert with the [scalar builtins](#scalar-builtins-) | ✅ scalar |
 | Boolean     | `bool`                                               | ✅     |
 | Pointers    | `*T`, `*mut T`, deref `*p`, address-of `&x`/`&mut x`; `&T`/`&mut T` accepted as a parameter type | ✅ |
 | Arrays      | fixed-size `[T; N]` (literal/repeat init, indexed load/store) | ✅ |
@@ -545,6 +547,76 @@ On the native backend a 128-bit value lives in a register pair. Addition, multip
 bitwise operations, shifts and compares are inline instructions; x86-64 has no 128-bit divide and no
 128-bit integer/float conversion, so those are a call into the runtime (`wukong_runtime::int128`) that
 computes exactly what the interpreter computes.
+
+### 8-bit floats: `f8e4m3` and `f8e5m2` ✅
+
+`f8e4m3` and `f8e5m2` are the two OCP 8-bit floating-point formats every FP8 checkpoint ships in
+(DeepSeek-V3, Llama 3 FP8, Transformer Engine), as first-class scalar types: one byte, byte-aligned,
+usable everywhere `bf16` is — locals, parameters and results, struct and tuple fields, array and
+slice elements, `alloc::<f8e4m3>(n)` buffers, generic instantiations, `Tensor[f8e4m3, …]` elements.
+
+| type | OCP name | sign / exponent / mantissa | bias | largest finite | least normal | least subnormal | infinity | NaN |
+|---|---|---|---|---|---|---|---|---|
+| `f8e4m3` | E4M3FN | 1 / 4 / 3 | 7 | 448 | 2⁻⁶ | 2⁻⁹ | none: saturates to ±448 | `S.1111.111` only |
+| `f8e5m2` | E5M2 | 1 / 5 / 2 | 15 | 57344 | 2⁻¹⁴ | 2⁻¹⁶ | ±∞ | `S.11111.{01,10,11}` |
+
+- **Rounding.** A value is computed in `f32` and every result — of `+ - * / %`, a builtin, a
+  conversion — is rounded to nearest, ties to even, onto its own grid, exactly as the
+  [`f32_to_f8e4m3` / `f32_to_f8e5m2` builtins](#scalar-builtins-) define: an `f8e4m3` result past
+  ±448 (or ±∞, e.g. `1.0 / 0.0`) **saturates** to ±448, an `f8e5m2` one that rounds past 57344
+  **overflows** to ±∞, and a NaN becomes the format's canonical NaN of its sign (`0x7F`/`0xFF` for
+  E4M3FN, `0x7E`/`0xFE` for E5M2). Computing in `f32` and rounding once gives the correctly rounded
+  f8 result of each of `+ - * /` (`f32` has more than twice the precision), so a chain of f8
+  operations means exactly what it says and `-O0` and `-O2` agree. Unary `-` flips the sign bit.
+  `x + y` with `x = 2.75`, `y = 0.4375` is 3.25 (3.1875 rounds up on the 0.25 grid), and 300 +
+  300 in `f8e4m3` is 448 (`tests/run/f8_scalar.wk`).
+- **Literals** take a `f8e4m3`/`f8e5m2` suffix (`1.5f8e4m3`, `3f8e5m2`, `0.25e1f8e5m2`) or adapt,
+  unsuffixed, to an f8 annotation, parameter, field or return type (`let w: f8e4m3 = 0.1;` holds
+  0.1015625). A literal is worth its rounding, so one that rounds past the largest finite value
+  (`500.0f8e4m3` would saturate, `70000.0f8e5m2` overflow) or a nonzero one that rounds to zero
+  (`0.0001f8e4m3`) is **`E0438`** (`tests/fail/f8_literal_out_of_range.wk`); `464.0f8e4m3` is fine —
+  it is the midpoint of 448 and the absent 480 and ties to the even 448. In arithmetic an unsuffixed
+  float literal stays `f32`, as with `bf16`: `x * 2.0` of an `f8e4m3` is an `f32` product, and
+  `x * 2.0f8e4m3` an f8 one. An unsuffixed *integer* literal beside an f8 value converts to the
+  f8 (`x * 2` is an f8 product), so the same rule holds for it as an arithmetic, comparison,
+  compound-assignment, `min`/`max`/`clamp`/`fma` operand or an `if`/`match` arm: `x * 1000`,
+  `x < 1000` and `e += 1000` of an `f8e4m3` are `E0438`, where they would silently use 448 (an
+  all-integer expression is judged by its value, `2 * 300` by 600).
+- **Mixed arithmetic** promotes losslessly: every f8 value is exactly an `f16`, a `bf16`, an `f32`
+  and an `f64`, so `x_f8 + y_f32` is `f32`; `f8e4m3` with `f8e5m2` (each holds values the other
+  cannot) and an f8 with any integer are `E0440` (`tests/fail/f8_format_mix.wk`).
+- **`as`** converts to and from every integer and float type, rounding once: an `f64` is rounded
+  straight to the f8 grid, never through `f32` (`1.0625 + 1e-10` as an `f64` becomes 1.125; through
+  `f32` it would be exactly 1.0625 and tie to 1.0), an integer is exact in `f32` over the whole f8
+  range, so it too rounds once (`17 as f8e4m3` is the even 16), and an f8 to an integer truncates
+  and saturates, NaN to `0`. `f8e4m3` to `f8e5m2` rounds like any narrowing (`1.375f8e4m3 as
+  f8e5m2` ties to 1.5).
+- **Comparisons** are IEEE-ordered on the values (`-0 == 0`, NaN unordered).
+- **Printing.** An f8 prints as the `f32` it holds — the shortest decimal that reads back to that
+  `f32` (`0.1015625`, `448`, `inf`, `NaN`, `-0`) — through `print`, `println`, `printf` and every
+  aggregate holding one (`[0.875, 1.75, 2.5]`, `Q { s: 1.25, n: -3, w: 0.375 }`;
+  `tests/run/f8_aggregates.wk`).
+- **The OCP code.** `bits(x)` of an f8 is its code as a `u8` (`bits(2.75f8e4m3)` is `0x43`), and
+  `f8e4m3_from_bits(b)` / `f8e5m2_from_bits(b)` take one back (an E5M2 NaN code holds as the
+  canonical `0x7E`/`0xFE`). Every one of the 256 codes of both formats round-trips through the type,
+  through memory and through `f64` (`tests/run/f8_code_round_trip.wk`). The `u8`-storage builtins
+  (`f8e4m3_to_f32(b)`, `f32_to_f8e4m3(x)`, …) remain for raw code buffers read from a file.
+- **The float builtins** (`sqrt`, `exp`, …, `fma`, `copysign`, `ldexp`, `isnan`, …) take an f8
+  operand: the function is computed in `f32` and its result rounded once onto the operand's grid.
+- **Autodiff** treats an f8 value as it treats a `bf16`: the gradient passes straight through each
+  rounding (its derivative taken as 1), and an adjoint is carried in the value's own type, rounded
+  where it widens.
+- **Not 8-bit:** a SIMD vector has no f8 lanes (`vec[f8e4m3, 4]` is `E0302`;
+  `tests/fail/f8_vector_lane.wk` — a loop over f8 data stays scalar), `atomic_add` adds integers only
+  (`E0446`), an `extern "C"` signature cannot carry one (`C0001`; pass the `u8` code), no kernel
+  builtin (`matmul`, `softmax`, …) takes an f8 buffer — widen it into an `f32` one first — and
+  `--backend=gpu-native` declines a function that holds one.
+
+On every backend an f8 value lives in an `f32` register on its grid and is stored as its 1-byte code.
+It reaches the grid at each observation boundary — a constant, a load, a store, a conversion to it
+and a widening from it — by one bit-level codec (`wukong_runtime::fp8`): the interpreter calls it,
+and the native backend and the LLVM emitter emit the same integer sequence inline, so the three agree
+bit for bit with no runtime call.
 
 ### Strings: `str` ✅
 
@@ -747,13 +819,15 @@ convert the operand down to the place and accumulate in the narrower type
 **Mixed-type arithmetic** (✅) promotes only where nothing is lost and the operand order cannot
 matter: two integers of one signedness compute in the wider (`i32 + i64` is `i64`); an unsigned
 integer and a *strictly wider* signed one compute in the signed type (`u32 + i64` is `i64`, so
-`u32 / i64` is a signed divide: `7 / -2 == -3`); `f16`/`bf16` widen to `f32` and `f32` to `f64`;
+`u32 / i64` is a signed divide: `7 / -2 == -3`); `f8e4m3`/`f8e5m2` widen to `f16`, `bf16`, `f32`
+or `f64`, `f16`/`bf16` to `f32` and `f32` to `f64`;
 an integer meets a float only when the float holds every value of it exactly (8- and 16-bit
 integers with `f32`, up to 32-bit integers with `f64`). A signed value known never to be negative —
 a `for` counter that starts at a non-negative literal and is never assigned, or a non-negative
 `const` — also converts to an unsigned type at least as wide, so `for i in 0..m { … i * n … }` with
 `n: usize` needs no cast. Every other mix — `i32` with `u32`, `i64` with `f32`, `f16` with `bf16`,
-`char` with an integer — is `E0440`; write the `as` that says which type you mean. An unsuffixed
+`f8e4m3` with `f8e5m2`, an 8-bit float with any integer, `char` with an integer — is `E0440`; write
+the `as` that says which type you mean. An unsuffixed
 literal operand adapts to the other operand and never needs a cast (`x * 2`, `2.0 * x`), and with
 an equally wide typed operand it takes that operand's type on either side (`1 + x` is `u32` for
 `x: u32`). `/` and `%` divide with the signedness of that common type. A shift amount is a count
@@ -1780,8 +1854,8 @@ lowers to PTX `.shared` SMEM and `sync_block()` to `bar.sync 0` (`wukong_codegen
   - a float prints the **shortest** decimal that parses back to the same value *at its own
     precision*, positionally (`inf`, `-inf`, `NaN`, `-0` spelled out): `print(0.1)` of an `f32`
     prints `0.1`, not the `0.10000000149011612` of the `f64` it widens to. `f16`/`bf16` values live
-    in `f32` registers and print as that `f32` (as the `half` crate's `Display` does); write
-    `x as f64` to see the widened value;
+    in `f32` registers and print as that `f32` (as the `half` crate's `Display` does), and so do
+    the 8-bit floats `f8e4m3`/`f8e5m2`; write `x as f64` to see the widened value;
   - a `bool` prints `true` / `false`; a `char` prints its glyph, UTF-8 encoded (a value that is not
     a Unicode scalar value — a surrogate, or above U+10FFFF via `as char` — prints U+FFFD); `c as
     i32` prints the code point;
@@ -1958,8 +2032,9 @@ every lane against hand-derived values; `tests/fail/builtin_dim_uninferable.wk`,
 ### Decode builtins ✅
 
 The kernels an autoregressive decode step is made of — attention over a KV cache (one sequence,
-or a padded batch of them), appending to the cache, and matrix-vector products over half-precision
-or block-quantized weights — are builtins too. Most of their shapes are *values* (lengths, head
+or a padded batch of them), appending to the cache, matrix-vector products over half-precision
+or block-quantized weights, and the expansion of group-wise int4 weights — are builtins too. Most of
+their shapes are *values* (lengths, head
 counts, strides), so each call is checked at run time against its operands' lengths before anything
 is read or written: a geometry that does not fit traps like a failed `assert` (exit 1, `assertion
 failed at` the call's site) on every backend (`tests/run/decode_shape_trap.wk`). The batched attention `sdpa_kv_batch`
@@ -1978,6 +2053,7 @@ contiguous `Tensor[T, …]`. Each returns `()`.
 | `gemv_bf16(w, x, y)`, `gemv_f16(w, x, y)` | `bf16`/`f16` weight `[N·K]`; `f32` `x[K]`, `y[N]` | `wukong_sgemv_{bf16,f16}` |
 | `quantize_q8_0(x, q, k)`, `quantize_q4_0(x, q, k)` | `f32` rows of `k` values; `u8` blocks | `wukong_quantize_{q8_0,q4_0}_f32` |
 | `gemv_q8_0(w, x, y)`, `gemv_q4_0(w, x, y)` | `u8` blocks `W[N, K]`; `f32` `x[K]`, `y[N]` | `wukong_gemv_{q8_0,q4_0}_f32` |
+| `dequant_i4(q, scale, group, out)`, `dequant_u4(q, scale, zero, group, out)` | packed `u8` nibbles `q`; `f32` `scale` (and `zero`), one per group; an integer group size; `f32` `out` | `wukong_dequant_{i4,u4}_f32` |
 
 - **`sdpa_kv`** is attention of `sq` query rows against a cache of `skv` key/value rows: head `h` of
   query row `i` is the `d` elements at `q[i·q_stride + h·d ..]` (and is written to the same place in
@@ -2037,6 +2113,15 @@ contiguous `Tensor[T, …]`. Each returns `()`.
   kept as exact `f32`), each block's integer dot is exact, and the row accumulates
   `(d_w·d_x)·Σ w_q·x_q` in block order (`tests/run/decode_gemv_quant.wk`). The result is therefore a
   quantized approximation of `W·x` — the activation's rounding is part of the definition.
+- **`dequant_i4` / `dequant_u4`** expand group-wise int4 weights — the layout GPTQ, AWQ and ONNX
+  `Int4` checkpoints share, as opposed to GGML's self-describing blocks — into `f32`. Element `i` of
+  `out` is nibble `i & 1` of byte `i >> 1` of `q`, the low nibble first (the order
+  [`pack_i4`/`pack_u4`](#scalar-builtins-) write), in group `g = i / group`: `dequant_i4` writes
+  `(q_i as f32) * scale[g]` for a two's-complement nibble (`-8..=7`), `dequant_u4` writes
+  `((q_i as f32) - zero[g]) * scale[g]` for an unsigned one (`0..=15`), each operation rounded once
+  in that order — exactly the scalar loop over `unpack_i4` a program would write. `q` must be
+  exactly `ceil(n/2)` bytes and `scale` (and `zero`) exactly `ceil(n/group)` values for
+  `n = len(out)`, `group >= 1`, the last group possibly short (`tests/run/int4_dequant.wk`).
 - Together they make a decode loop: `tests/run/decode_tiny_lm.wk` generates six tokens greedily with
   bf16 projections, `kv_append` into growing caches, GQA `sdpa_kv` and a `Q8_0` LM head.
 - Every result is bit-identical on the interpreter and natively, and between each kernel's AVX2 path
@@ -2154,8 +2239,8 @@ shadows any of them.
 | `mulhi(a, b)` | the high half of the double-width product (`floor(a·b / 2^w)`) | `T` |
 | `widening_mul(a, b)` | the exact product one width up (`i8`→`i16` … `u64`→`u128`; 128-bit operands are `E0446`) | `2T` |
 | `overflowing_add/_sub/_mul(a, b)` | the wrapped result and whether it overflowed | `(T, bool)` |
-| `bits(x)` | a float's IEEE bit pattern (`f32`→`u32`, `f64`→`u64`, `f16`/`bf16`→`u16`) | unsigned int |
-| `f32_from_bits(u)`, `f64_from_bits`, `f16_from_bits`, `bf16_from_bits` | the float with those bits (an integer of exactly that width) | the float |
+| `bits(x)` | a float's IEEE bit pattern (`f32`→`u32`, `f64`→`u64`, `f16`/`bf16`→`u16`); an `f8e4m3`/`f8e5m2`'s OCP code (`u8`) | unsigned int |
+| `f32_from_bits(u)`, `f64_from_bits`, `f16_from_bits`, `bf16_from_bits`, `f8e4m3_from_bits`, `f8e5m2_from_bits` | the float with those bits (an integer of exactly that width); an f8 NaN code holds as its format's canonical NaN | the float |
 | `isnan(x)`, `isinf(x)`, `isfinite(x)`, `signbit(x)` | classification; `signbit(-0.0)` is true | `bool` |
 | `copysign(x, y)` | `x`'s magnitude with `y`'s sign bit (NaNs included) | float |
 | `ldexp(x, n)` | `x·2ⁿ` rounded once to nearest even, subnormals and overflow included | `x`'s type |
@@ -2166,13 +2251,24 @@ shadows any of them.
 | `logaddexp(a, b)` | `ln(eᵃ + eᵇ)` without overflow; `a == b` gives `a + ln 2` | float |
 | `f8e4m3_to_f32(b)`, `f8e5m2_to_f32(b)` | decode an OCP FP8 code held in a `u8` (exact) | `f32` |
 | `f32_to_f8e4m3(x)`, `f32_to_f8e5m2(x)` | encode, round to nearest even; E4M3FN **saturates** at ±448 (NaN → `0x7F`), E5M2 overflows to ±∞ (NaN → `0x7E`) | `u8` |
+| `pack_i4(lo, hi)`, `pack_u4(lo, hi)` | two 4-bit integers in one byte: `lo`'s low four bits in bits 0..4, `hi`'s in bits 4..8 (a literal, suffixed or not, must be `-8..=7` / `0..=15`: `E0439`; a run-time value keeps its low four bits) | `u8` |
+| `unpack_i4(b)`, `unpack_u4(b)` | the byte's two nibbles `(bits 0..4, bits 4..8)`, sign-extended from the fourth bit / zero-extended | `(i8, i8)` / `(u8, u8)` |
 
 `erfc`, `erfinv` and `lgamma` evaluate in double precision (the runtime's `special.rs`): an `f32`
 argument widens, computes and rounds once. `logaddexp` uses the shared `exp`/`log1p` of its type.
 The **bit builtins never produce or report a signaling NaN**: `*_from_bits` of a signaling pattern
 returns it with the quiet bit set, other payload bits kept, and `bits` reports any NaN quiet (the
-interpreter holds an `f32` as an `f64`, which cannot carry a signaling `f32` NaN). FP8 values are
-stored as raw `u8` (`alloc_u8`, `read_u8`, …) — there is no first-class `f8` scalar type yet.
+interpreter holds an `f32` as an `f64`, which cannot carry a signaling `f32` NaN). The FP8
+conversion builtins work on raw `u8` codes (`alloc_u8`, `read_u8`, …); the first-class
+[`f8e4m3`/`f8e5m2` types](#8-bit-floats-f8e4m3-and-f8e5m2-) hold the same codes and round by the same
+rules.
+
+**4-bit integers** have no sub-byte type: int4 weights live two to a `u8`, element `2k` in the low
+nibble of byte `k` and element `2k + 1` in the high one (ONNX's `Int4` and PyTorch's `quint4x2`
+order). `pack_i4`/`pack_u4` build a byte, `unpack_i4`/`unpack_u4` take it apart, and the
+[decode builtins](#decode-builtins-) `dequant_i4`/`dequant_u4` expand a whole packed buffer with
+per-group scales (`tests/run/int4_pack.wk`, `tests/run/int4_dequant.wk`). All four scalar builtins
+are plain shifts and masks in MIR, identical on every backend.
 
 Misuse has its own codes: an integer variable passed to a floating-point builtin (including
 `fmax`/`fmin`) is `E0445`; a non-integer to an integer builtin, or a bit pattern of the wrong width
@@ -2194,7 +2290,14 @@ none of them. Everything else holds in both modes:
   signed zero follow IEEE: nothing assumes finite math or ignores the sign of zero. The optimizer
   applies **no algebraic float rewrite** (`x + 0.0`, `x * 0.0`, `x / c → x * (1/c)`, `x - x` are
   left alone) and constant-folds each operation at its own precision.
-- `bf16`/`f16` arithmetic is carried out in `f32` and rounded to the half grid at every value.
+- `bf16`/`f16` arithmetic is carried out in `f32` and rounded to the half grid at every value, and
+  so is `f8e4m3`/`f8e5m2` arithmetic onto its 8-bit grid (E4M3FN saturating at ±448, E5M2
+  overflowing to ±∞). An integer converted to one of these types is rounded onto its grid at the
+  value too — by `as`, and an unsuffixed integer literal adapting to such an operand, which is the
+  operand type's value before the operation runs: with `b: bf16 = 1.0`, `b + 257` is 1 + 256 (257
+  ties to 256 on the bf16 grid), so 256, and `max(b, 257)` is 256; with `h: f16 = 2048.0`,
+  `h < 2049` is `false` (2049 is 2048 on the f16 grid). A float literal stays `f32` instead
+  (`b + 257.0` is the `f32` 258; `tests/run/half_int_literal_operand.wk`).
 - Comparisons are IEEE-ordered: `==`, `<`, `<=`, `>`, `>=` are false when either side is NaN and
   `!=` is true. `fmax(a, b)` is `a > b ? a : b` and `fmin(a, b)` is `a < b ? a : b` — the x86
   `maxps`/`minps` rule, *not* IEEE `maxNum`: with a NaN in either operand, or a `+0`/`-0` tie, they
@@ -2547,7 +2650,8 @@ An `extern "C"` block declares C functions by their C symbol names; calls type-c
 declared signature like any other call (`tests/run/extern_c_libm.wk`). A signature may use integers
 (signedness is honored for narrow ones), `bool`, `f32`, `f64`, and raw pointers / references; anything
 without a C mapping — a slice, array, tuple, struct, enum, tensor, SIMD vector, `f16`/`bf16`, an
-`i128`/`u128` (C has no standard 128-bit integer; `tests/fail/extern_i128.wk`), or a generic
+8-bit float (`tests/fail/extern_f8.wk`; pass its `u8` code), an `i128`/`u128` (C has no standard
+128-bit integer; `tests/fail/extern_i128.wk`), or a generic
 signature — is **C0001** at the declaration (pass `*T` plus a length instead). Variadic C
 functions (`printf`) cannot be declared.
 

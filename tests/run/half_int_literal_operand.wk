@@ -1,0 +1,50 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 256
+// EXPECT-OUT: 256
+// EXPECT-OUT: 256
+// EXPECT-OUT: 256
+// EXPECT-OUT: 258
+// EXPECT-OUT: false
+// EXPECT-OUT: true
+// EXPECT-OUT: 2048
+// EXPECT-OUT: 2048
+// EXPECT-OUT: 16
+module tests.run.half_int_literal_operand
+
+// An unsuffixed integer literal beside a `bf16`, `f16` or 8-bit float value adapts to that value's
+// type, so it is a number ON that type's grid, rounded once, before the operation runs — the same
+// number `257.0` would be at a `bf16` annotation. `max(b, 257)` and an `if` arm used to carry the
+// literal's exact `f32` instead, and once mem2reg forwarded it past the store that rounds, -O2
+// printed 257 where -O0 printed the stored 256.
+//
+// Expected by hand. bf16 has 8 significant bits, so on [256, 512) its step is 2 and 257 ties between
+// 256 (even mantissa) and 258, going to 256. Then `b + 257` is 1 + 256 = 257, which ties to 256 again;
+// `max(b, 257)` is 256; the `if` arm is 256; `a += 257` is 1 + 256, so 256. A float literal does NOT
+// adapt — it stays `f32`, so `b + 257.0` is the `f32` sum 258. f16 has 11 significant bits, step 2 on
+// [2048, 4096): 2049 ties to 2048, so `h < 2049` is 2048 < 2048, false, and `h == 2049` is true;
+// `max(h, 2049)` and `h + 1` (1 is exact; 2049 ties to 2048) are 2048. f8e4m3 has 4 significant bits,
+// step 2 on [16, 32): 17 ties to 16, and `g * 17` with g = 1 is 16.
+fn main() -> i32 {
+    let z: i64 = arg_count() - 1;
+    let b: bf16 = 1.0;
+    let c: bool = z == 0;
+    print(b + 257);
+    let m = max(b, 257);
+    print(m);
+    let v = if c { 257 } else { b };
+    print(v);
+    let mut a: bf16 = 1.0;
+    a += 257;
+    print(a);
+    print(b + 257.0);
+    let h: f16 = 2048.0;
+    print(h < 2049);
+    print(h == 2049);
+    let n = max(h, 2049);
+    print(n);
+    print(h + 1);
+    let g: f8e4m3 = 1.0;
+    print(g * 17);
+    return 0;
+}

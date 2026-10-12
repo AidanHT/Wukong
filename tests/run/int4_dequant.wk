@@ -1,0 +1,56 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: [-0.5, 3.5, 0.0, -4.0, 0.25, 0.5, -0.75, -0.5, 8.0, -6.0]
+// EXPECT-OUT: [3.5, -0.5, -4.0, 0.0, -1.625, -1.375, 1.375, 1.625, -24.0, -6.0]
+// EXPECT-OUT: [3.5, -0.5, -4.0, 0.0, -1.625, -1.375, 1.375, 1.625, -24.0]
+// EXPECT-OUT: [-0.125, 0.875, 0.0, -1.0, 0.125, 0.25, -0.375, -0.25, -0.5, 0.375]
+// EXPECT-OUT: [-0.5, 3.5, 0.0, -4.0, 0.25, 0.5, -0.75, -0.5, 8.0, -6.0]
+module tests.run.int4_dequant
+
+// Group-wise int4 dequantization, the weight-only layout GPTQ/AWQ/ONNX int4 checkpoints share:
+// element i of a packed `[]u8` is nibble `i & 1` of byte `i >> 1` (low nibble first, as `pack_i4`
+// writes it), its group is `i / group`, and `dequant_i4(q, scale, group, out)` writes
+// `q_i * scale[g]` (two's complement nibbles) while `dequant_u4(q, scale, zero, group, out)` writes
+// `(q_i - zero[g]) * scale[g]` (unsigned nibbles), each in f32, one rounding per operation.
+//
+// The ten elements of `w` = [0x7F, 0x80, 0x21, 0xED, 0x3C] are, low nibble first, the unsigned
+// nibbles 15 7 0 8 1 2 13 14 12 3 -- signed -1 7 0 -8 1 2 -3 -2 -4 3. In groups of four (the last
+// group holds two) with scales 0.5, 0.25, -2.0 the signed values are -0.5 3.5 0 -4, 0.25 0.5 -0.75
+// -0.5, 8 -6; with zero points 8, 7.5, 0 the unsigned ones are (15-8)/2 = 3.5, -0.5, -4, 0, then
+// (1-7.5)/4 = -1.625, -1.375, 1.375, 1.625, then -24 and -6 -- every one exact in f32. An odd
+// count (9) reads only the low nibble of the last byte. One group of ten with scale 0.125 gives
+// each signed value / 8, through a `[]u8` slice and a heap output. The last line is the same
+// dequantization written as a loop over `unpack_i4`, which must agree with the builtin exactly.
+fn main() -> i32 {
+    let w: [u8; 5] = [0x7f, 0x80, 0x21, 0xed, 0x3c];
+    let s: [f32; 3] = [0.5, 0.25, -2.0];
+    let zr: [f32; 3] = [8.0, 7.5, 0.0];
+
+    let mut a: [f32; 10] = [0.0; 10];
+    dequant_i4(w, s, 4, a);
+    print(a);
+
+    let mut b: [f32; 10] = [0.0; 10];
+    dequant_u4(w, s, zr, 4, b);
+    print(b);
+
+    let mut odd: [f32; 9] = [0.0; 9];
+    dequant_u4(w, s, zr, 4, odd);
+    print(odd);
+
+    let ws: []u8 = w;
+    let one: [f32; 1] = [0.125];
+    let c = alloc::<f32>(10);
+    dequant_i4(ws, one, 10, c);
+    print(c);
+    free(c);
+
+    let mut h: [f32; 10] = [0.0; 10];
+    for k in 0..5 {
+        let (lo, hi) = unpack_i4(w[k]);
+        h[2 * k] = (lo as f32) * s[(2 * k) / 4];
+        h[2 * k + 1] = (hi as f32) * s[(2 * k + 1) / 4];
+    }
+    print(h);
+    return 0;
+}

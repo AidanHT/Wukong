@@ -182,6 +182,16 @@ impl FnLowerer<'_> {
             IsNan | IsInf | IsFinite | SignBit => {
                 let ft = self.sb_float_operand_ty(&args[0]);
                 let x = self.sb_operand(&args[0], &ft);
+                // An 8-bit float is classified as the `f32` it widens to exactly: E4M3FN has no
+                // infinity to compare against (a `+inf` constant of the type saturates to 448).
+                let (x, ft) = if ft.is_f8() {
+                    (
+                        self.sb_cast(CastKind::FpExt, x, &MirType::F32),
+                        MirType::F32,
+                    )
+                } else {
+                    (x, ft)
+                };
                 Some(match b {
                     IsNan => self.sb_cmp(CmpOp::Fone, x, x),
                     IsInf => {
@@ -257,7 +267,54 @@ impl FnLowerer<'_> {
                 let x = self.sb_operand(&args[0], &MirType::F32);
                 Some(self.sb_fp8_encode(x, fmt))
             }
+            PackI4 | PackU4 => {
+                let t = MirType::I32;
+                let lo = self.sb_operand(&args[0], &t);
+                let hi = self.sb_operand(&args[1], &t);
+                Some(self.sb_pack_nibbles(lo, hi))
+            }
+            UnpackI4 | UnpackU4 => {
+                let byte = self.sb_operand(&args[0], &MirType::I8);
+                let (lo, hi) = self.sb_unpack_nibbles(byte, b == UnpackI4);
+                self.sb_tuple(e, &[lo, hi])
+            }
         }
+    }
+
+    // --- 4-bit integers -----------------------------------------------------------------------
+
+    /// `pack_i4` / `pack_u4`: `lo`'s low four bits in bits 0..4 of the byte, `hi`'s in bits 4..8
+    /// (both `i32`; a signed nibble is its two's-complement bits, so the one lowering serves both).
+    fn sb_pack_nibbles(&mut self, lo: ValueId, hi: ValueId) -> ValueId {
+        let t = MirType::I32;
+        let l = self.sb_bin_k(BinOp::And, lo, 0xf, &t);
+        let h = self.sb_bin_k(BinOp::And, hi, 0xf, &t);
+        let hs = self.sb_bin_k(BinOp::Shl, h, 4, &t);
+        let v = self.sb_bin(BinOp::Or, l, hs, &t);
+        self.sb_cast(CastKind::Trunc, v, &MirType::I8)
+    }
+
+    /// `unpack_i4` / `unpack_u4`: the nibbles of the `i8` `byte` as two `i8`s, `(bits 0..4, bits
+    /// 4..8)` — each sign-extended from its fourth bit when `signed` (shift it to the top of an
+    /// `i32`, then arithmetically back), zero-extended otherwise.
+    fn sb_unpack_nibbles(&mut self, byte: ValueId, signed: bool) -> (ValueId, ValueId) {
+        let t = MirType::I32;
+        let bz = self.sb_cast(CastKind::ZExt, byte, &t);
+        let (lo, hi) = if signed {
+            let l = self.sb_bin_k(BinOp::Shl, bz, 28, &t);
+            let lo = self.sb_bin_k(BinOp::AShr, l, 28, &t);
+            let h = self.sb_bin_k(BinOp::Shl, bz, 24, &t);
+            let hi = self.sb_bin_k(BinOp::AShr, h, 28, &t);
+            (lo, hi)
+        } else {
+            let lo = self.sb_bin_k(BinOp::And, bz, 0xf, &t);
+            let hi = self.sb_bin_k(BinOp::LShr, bz, 4, &t);
+            (lo, hi)
+        };
+        (
+            self.sb_cast(CastKind::Trunc, lo, &MirType::I8),
+            self.sb_cast(CastKind::Trunc, hi, &MirType::I8),
+        )
     }
 
     // --- small builders ---------------------------------------------------------------------
@@ -617,6 +674,17 @@ impl FnLowerer<'_> {
                 let b = self.sb_cast(CastKind::Bitcast, x, &i32t);
                 self.sb_quiet(b, &i32t)
             }
+            // An 8-bit float's bits are its OCP code: the f32 it lives as, encoded (exact — the
+            // value is on the grid — and a NaN is its format's one canonical NaN code).
+            MirType::F8E4M3 | MirType::F8E5M2 => {
+                let w = self.sb_cast(CastKind::FpExt, x, &MirType::F32);
+                let fmt = if *ft == MirType::F8E4M3 {
+                    Fp8::E4M3
+                } else {
+                    Fp8::E5M2
+                };
+                self.sb_fp8_encode(w, fmt)
+            }
             // A half lives as the f32 of its value (widening is exact, and its NaNs are already
             // quiet): bf16 is the top half of those bits, f16 is re-encoded from them.
             MirType::BF16 => {
@@ -702,11 +770,23 @@ impl FnLowerer<'_> {
         self.sb_bin(BinOp::Or, sign, mag, &t)
     }
 
-    /// `f32_from_bits` / `f64_from_bits` / `bf16_from_bits` / `f16_from_bits` of the integer `u`
-    /// (already the float's width).
+    /// `f32_from_bits` / `f64_from_bits` / `bf16_from_bits` / `f16_from_bits` /
+    /// `f8e4m3_from_bits` / `f8e5m2_from_bits` of the integer `u` (already the float's width).
     fn sb_from_bits(&mut self, u: ValueId, f: Scalar) -> ValueId {
         let i32t = MirType::I32;
         match f {
+            // The code decoded exactly, then held on the grid like every value of the type (a NaN
+            // code becomes the format's canonical NaN, as rounding any NaN does).
+            Scalar::F8E4M3 | Scalar::F8E5M2 => {
+                let fmt = if f == Scalar::F8E4M3 {
+                    Fp8::E4M3
+                } else {
+                    Fp8::E5M2
+                };
+                let w = self.sb_fp8_decode(u, fmt);
+                let ty = MirType::from_scalar(f);
+                self.sb_cast(CastKind::FpTrunc, w, &ty)
+            }
             Scalar::F64 => {
                 let q = self.sb_quiet(u, &MirType::I64);
                 self.sb_cast(CastKind::Bitcast, q, &MirType::F64)
@@ -920,7 +1000,10 @@ impl FnLowerer<'_> {
     /// infinities included) is `a + ln 2`, and a NaN propagates. Built on the shared `exp`/`log1p`
     /// (the f32 polynomials or the f64 library); a half computes in `f32` and rounds once.
     fn sb_logaddexp(&mut self, a: ValueId, b: ValueId, ty: &MirType) -> ValueId {
-        let half = matches!(ty, MirType::F16 | MirType::BF16);
+        let half = matches!(
+            ty,
+            MirType::F16 | MirType::BF16 | MirType::F8E4M3 | MirType::F8E5M2
+        );
         let ct = if half { MirType::F32 } else { ty.clone() };
         let (a, b) = if half {
             (

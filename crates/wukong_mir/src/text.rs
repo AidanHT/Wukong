@@ -940,6 +940,8 @@ pub fn parse_type(s: &str) -> Result<MirType, String> {
         "i128" => Some(MirType::I128),
         "f16" => Some(MirType::F16),
         "bf16" => Some(MirType::BF16),
+        "f8e4m3" => Some(MirType::F8E4M3),
+        "f8e5m2" => Some(MirType::F8E5M2),
         "f32" => Some(MirType::F32),
         "f64" => Some(MirType::F64),
         "ptr" => Some(MirType::Ptr),
@@ -1322,6 +1324,9 @@ mod tests {
         b.build(F32, Op::ConstFloat(-0.0, F32));
         let h = b.build(F16, Op::ConstFloat(0.5, F16));
         b.build(BF16, Op::ConstFloat(-2.0, BF16));
+        let q4 = b.build(F8E4M3, Op::ConstFloat(0.1, F8E4M3));
+        let q5 = b.build(F8E5M2, Op::ConstFloat(-57344.0, F8E5M2));
+        b.build(F8E4M3, Op::Bin(BinOp::FMul, q4, q4));
 
         for op in BIN_OPS {
             if op.is_float() {
@@ -1356,6 +1361,9 @@ mod tests {
             (CastKind::UiToFp, c_min, F32),
             (CastKind::FpExt, h, F32),
             (CastKind::FpTrunc, fv, BF16),
+            (CastKind::FpTrunc, d, F8E4M3),
+            (CastKind::FpTrunc, q4, F8E5M2),
+            (CastKind::FpExt, q5, F64),
             (CastKind::Bitcast, x, F32),
             (CastKind::IntToPtr, p64, Ptr),
         ] {
@@ -1753,8 +1761,11 @@ mod tests {
         for t in [
             MirType::I1,
             MirType::BF16,
+            MirType::F8E4M3,
+            MirType::F8E5M2,
             MirType::Void,
             vec(MirType::F32, 4),
+            arr(MirType::F8E5M2, 7),
             arr(arr(MirType::I8, 3), 2),
             arr(vec(MirType::F64, 2), 5),
         ] {

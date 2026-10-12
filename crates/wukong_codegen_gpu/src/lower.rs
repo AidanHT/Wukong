@@ -806,6 +806,38 @@ fn decline_i128(func: &Function, interner: &Interner) -> Result<(), String> {
     Ok(())
 }
 
+/// An 8-bit float (`f8e4m3`, `f8e5m2`) lives in an `f32` register on its grid and is stored as
+/// its 1-byte code, which every host backend reaches with the `wukong_runtime::fp8` codec at each
+/// load, store, constant and cast. This lowering has no PTX twin of that codec yet, so a function
+/// that holds an f8 anywhere declines as a whole (a SKIP) rather than computing with unrounded
+/// `f32` values or storing a 4-byte float into a 1-byte slot.
+fn decline_f8(func: &Function, interner: &Interner) -> Result<(), String> {
+    fn mentions(t: &MirType) -> bool {
+        match t {
+            MirType::F8E4M3 | MirType::F8E5M2 => true,
+            MirType::Vec(e, _) | MirType::Array(e, _) => mentions(e),
+            _ => false,
+        }
+    }
+    let slot = func
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .any(|i| match &i.op {
+            Op::Alloca { ty, .. } | Op::Load(_, ty) | Op::Cast(_, _, ty) => mentions(ty),
+            Op::Gep { elem, .. } => mentions(elem),
+            Op::ConstFloat(_, ty) => mentions(ty),
+            _ => false,
+        });
+    if slot || mentions(&func.ret) || func.value_types.iter().any(mentions) {
+        return Err(format!(
+            "{UNSUPPORTED} an 8-bit float in `{}` (no PTX lowering of the f8 codec)",
+            interner.resolve(func.name)
+        ));
+    }
+    Ok(())
+}
+
 fn int_bits(t: &MirType) -> u32 {
     match t {
         MirType::I1 => 1,
@@ -819,7 +851,7 @@ fn int_bits(t: &MirType) -> u32 {
 /// Size in bytes of a MIR type (for `gep` scaling and `alloca` frame sizing); mirrors Cranelift's.
 fn size_of(t: &MirType) -> u64 {
     match t {
-        MirType::I1 | MirType::I8 => 1,
+        MirType::I1 | MirType::I8 | MirType::F8E4M3 | MirType::F8E5M2 => 1,
         MirType::I16 | MirType::F16 | MirType::BF16 => 2,
         MirType::I32 | MirType::F32 => 4,
         MirType::I64 | MirType::F64 | MirType::Ptr => 8,
@@ -930,6 +962,7 @@ impl<'a> FnEmit<'a> {
         interner: &'a Interner,
     ) -> Result<String, String> {
         decline_i128(func, interner)?;
+        decline_f8(func, interner)?;
         let mut e = FnEmit {
             func,
             program,
@@ -998,6 +1031,7 @@ impl<'a> FnEmit<'a> {
         interner: &'a Interner,
     ) -> Result<String, String> {
         decline_i128(func, interner)?;
+        decline_f8(func, interner)?;
         let mut e = FnEmit {
             func,
             program,
@@ -1064,6 +1098,7 @@ impl<'a> FnEmit<'a> {
         interner: &'a Interner,
     ) -> Result<String, String> {
         decline_i128(func, interner)?;
+        decline_f8(func, interner)?;
         let mut e = FnEmit {
             func,
             program,
@@ -2149,6 +2184,10 @@ impl<'a> FnEmit<'a> {
             }
             // `decline_i128` refuses the function before any load is lowered.
             MirType::I128 => return Err(format!("{UNSUPPORTED} load of an i128")),
+            // `decline_f8` likewise refuses any function that holds an 8-bit float.
+            MirType::F8E4M3 | MirType::F8E5M2 => {
+                return Err(format!("{UNSUPPORTED} load of an 8-bit float"))
+            }
         }
         Ok(())
     }
@@ -2276,6 +2315,10 @@ impl<'a> FnEmit<'a> {
             }
             // `decline_i128` refuses the function before any store is lowered.
             MirType::I128 => return Err(format!("{UNSUPPORTED} store of an i128")),
+            // `decline_f8` likewise refuses any function that holds an 8-bit float.
+            MirType::F8E4M3 | MirType::F8E5M2 => {
+                return Err(format!("{UNSUPPORTED} store of an 8-bit float"))
+            }
         }
         Ok(())
     }

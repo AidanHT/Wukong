@@ -149,7 +149,7 @@ pub fn type_bytes(t: &MirType) -> Option<u32> {
 
 fn byte_size(t: &MirType) -> Option<u32> {
     Some(match t {
-        MirType::I1 | MirType::I8 => 1,
+        MirType::I1 | MirType::I8 | MirType::F8E4M3 | MirType::F8E5M2 => 1,
         MirType::I16 | MirType::F16 | MirType::BF16 => 2,
         MirType::I32 | MirType::F32 => 4,
         MirType::I64 | MirType::F64 | MirType::Ptr => 8,

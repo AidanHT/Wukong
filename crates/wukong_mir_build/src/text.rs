@@ -155,7 +155,11 @@ impl FnLowerer<'_> {
         let syms = self.gemm.text;
         // A 128-bit integer has no per-type printer: it prints through the formatting entry, then
         // the newline every integer `print` ends with (`printf("{}\n", x)`).
-        if let ty @ Ty::Scalar(Scalar::I128 | Scalar::U128) = self.expr_ty(arg) {
+        // An 8-bit float prints as its `f32` value (exact: every f8 value is an `f32`), through
+        // the same formatting entry, so no backend's `print` needs an f8 arm.
+        if let ty @ Ty::Scalar(Scalar::I128 | Scalar::U128 | Scalar::F8E4M3 | Scalar::F8E5M2) =
+            self.expr_ty(arg)
+        {
             let mut sink = self.text_stream(false, arg.span);
             let v = self.lower_expr(arg);
             self.text_scalar(&mut sink, v, &ty, &FmtSpec::default());
@@ -783,6 +787,8 @@ impl FnLowerer<'_> {
                     MirType::F32 => Scalar::F32,
                     MirType::F16 => Scalar::F16,
                     MirType::BF16 => Scalar::Bf16,
+                    MirType::F8E4M3 => Scalar::F8E4M3,
+                    MirType::F8E5M2 => Scalar::F8E5M2,
                     MirType::I1 => Scalar::Bool,
                     MirType::I8 => Scalar::I8,
                     MirType::I16 => Scalar::I16,

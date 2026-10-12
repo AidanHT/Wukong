@@ -200,7 +200,12 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
   in fields, arrays, slices, `match`, `printf` and the integer builtins, with wrapping arithmetic,
   zero-divisor and `MIN / -1` division, shifts modulo 128 and once-rounded float conversions
   pinned on both backends by `tests/run/i128_*.wk`), `bool`, `char` (a 32-bit Unicode scalar,
-  interconvertible with the integers via `as`; `tests/run/char_type.wk`), and floats. `f32` is computed at **`f32`
+  interconvertible with the integers via `as`; `tests/run/char_type.wk`), the **8-bit floats
+  `f8e4m3`/`f8e5m2`** (OCP E4M3FN and E5M2 — one byte of storage, `f32` compute, every result
+  rounded to nearest-even onto its own grid with E4M3FN saturating at ±448 and E5M2 overflowing to
+  ±∞, an `f64` converted in one rounding; every code of both formats round-trips, pinned on both
+  backends by `tests/run/f8_*.wk`, and the inline codec is JIT-checked in the LLVM text too), and
+  floats. `f32` is computed at **`f32`
   precision** (interpreter and native agree exactly); **both `bf16` and `f16` are real 2-byte storage**
   rounded to that grid (round-to-nearest-even) on store and on the cast, with `f32` compute. bf16 rounds
   with cheap inline bit-math (it's the top 16 bits of an `f32`); f16's IEEE-half layout has no such
@@ -852,7 +857,12 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
   E5M2 pair). All but the bit counts and the special functions are plain compare/select/shift MIR, so
   they agree on every backend by construction. `fmax`/`fmin` on an integer variable is now `E0445`
   (`max`/`min` keep the type); `E0446`/`E0447` reject a wrong operand kind or a mixed-type saturating
-  operation (`tests/run/scalar_*.wk`, `tests/run/fp8_convert.wk`).
+  operation (`tests/run/scalar_*.wk`, `tests/run/fp8_convert.wk`). Since 2026-10-14 (`gap7/f8-types`)
+  also **int4 packing**: `pack_i4`/`pack_u4` and `unpack_i4`/`unpack_u4` put two 4-bit integers in a
+  byte (low nibble first; a literal a nibble cannot hold is `E0439`), and the decode builtins
+  `dequant_i4(q, scale, group, out)` / `dequant_u4(q, scale, zero, group, out)` expand a packed
+  buffer with per-group scales and zero points, `(q - zero) * scale` in `f32`, one runtime call
+  (`tests/run/int4_pack.wk`, `tests/run/int4_dequant.wk`).
 - **Convolution via im2col + GEMM**: a conv written as an im2col gather followed by a matmul has its
   matmul recognized and dispatched to the tuned GEMM microkernel (the XLA/cuDNN lowering), so Wukong
   runs a 3×3 conv **~1.55× faster** than a hand-written direct convolution in C — and 1.12× *slower*
@@ -1777,9 +1787,19 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   one piece, and the call's "may touch any memory" verdict keeps it scalar. The copy that keeps the
   calls stays scalar too.
 
-- **Scalar-type gaps** (2026-10-08; `i128`/`u128` landed 2026-10-12). FP8 is storage-only —
-  E4M3FN/E5M2 codes in `u8` with conversion builtins, no `f8` scalar type that loads, stores and
-  promotes by itself; packed `int4` and constructible SIMD values are not started. The 128-bit
+- **Scalar-type gaps** (2026-10-08; `i128`/`u128` landed 2026-10-12, `f8e4m3`/`f8e5m2` and the
+  int4 packing builtins 2026-10-14). Constructible SIMD values are not started — a `vec[T, N]` /
+  `f32x4` value still cannot be built in source (left for later: SIMD reaches programs through the
+  loop vectorizers and the recognized kernels). int4 has no sub-byte *type*: it is two nibbles per
+  `u8` with `pack_i4`/`pack_u4`/`unpack_i4`/`unpack_u4` and the group-wise `dequant_i4`/`dequant_u4`
+  decode builtins (one scalar runtime loop, not yet a hand-written AVX2 kernel, and no int4 GEMV:
+  dequantize to `f32` and use `matmul` or a recognized GEMV loop, or `gemv_q4_0` for GGML
+  blocks). The 8-bit floats run everywhere a `bf16` does except
+  in vector lanes (a loop over f8 data stays scalar: neither vectorizer widens an f8 lane, and
+  `vec[f8e4m3, N]` is `E0302`), the kernel builtins (which take `f32` buffers), `extern "C"`
+  (`C0001`) and `gpu-native` (which declines a function holding one: PTX has no twin of the codec
+  yet); each f8 operation is an inline integer encode/decode around its `f32` op, not one
+  instruction (no x86 CPU has FP8 arithmetic). The 128-bit
   integers run everywhere but in four places: `atomic_add` takes at most 64 bits (`E0446`), an
   `extern "C"` signature cannot carry one (`C0001`), the loop vectorizers never widen them (a loop
   over `i128` data stays scalar — no ISA has 128-bit integer lanes — and a loop driven by an

@@ -125,6 +125,13 @@ not duplicate them. In summary, Wukong:
   arrays, `match`, `printf` and the integer builtins (`widening_mul` of two `u64` is a `u128`).
   Native code keeps one in a register pair and calls the runtime only for division and float
   conversion (`tests/run/i128_*.wk`).
+- **8-bit floats.** `f8e4m3` and `f8e5m2` — the OCP E4M3FN and E5M2 formats FP8 checkpoints ship in —
+  are first-class one-byte types: `f32` compute with every result rounded to nearest-even onto its
+  grid (E4M3FN saturating at ±448, E5M2 overflowing to ±∞), literals with a suffix, `as` to and from
+  every numeric type in one rounding, arrays, structs, slices and printing; the codec is inline
+  integer code on every backend, and all 256 codes of each format round-trip
+  (`tests/run/f8_*.wk`). int4 weights pack two to a byte (`pack_i4`/`unpack_u4`, …) and expand with
+  per-group scales and zero points in one call (`dequant_i4`/`dequant_u4`; `tests/run/int4_*.wk`).
 - **Abstraction without indirection.** `impl` blocks give structs and enums methods and associated
   functions; traits with bounds (`<T: Shape>`, `where`), function-typed parameters
   (`f: fn(f32) -> f32`) and compile-time-resolved closures (`apply(|x| x * scale, v)`, `let f = |x: f32| x * k;`, `v.map(|a| a * k)`; a read

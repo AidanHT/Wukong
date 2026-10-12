@@ -67,6 +67,10 @@ The module implements the interpreter's language, not LLVM's defaults:
   the runtime's own integer arithmetic (`wukong_runtime::f32_to_bf16_bits`, NaN payloads included),
   because LLVM's `fptrunc … to bfloat` is a call to `__truncsfbf2`, which neither the Rust runtime
   link nor an MSVC link provides;
+- the 8-bit floats `f8e4m3`/`f8e5m2` have no LLVM type at all: a value is a `float` register on its
+  grid and is stored as its `i8` code, and the rounding is `wukong_runtime::fp8`'s bit-level codec
+  written out inline (integer ops, plus `llvm.roundeven` and `llvm.fptosi.sat` for a result below the
+  least normal) — an `fptrunc` from a `double` encodes the double's own bits, so it rounds once;
 - booleans occupy a byte in memory (`i8` storage, low bit significant), never LLVM's bit-packed
   `<n x i1>`;
 - a vector load or store promises only its lane's alignment (`align 4` for `<4 x float>`), because
@@ -186,7 +190,8 @@ entries), which the `--emit=exe` link supplies (the rustc-driven shim plus the `
 rlib, or the C runtime for a kernel-free program).
 
 Beyond the module's own `declare`s, LLVM's code generator itself calls the C library for an
-intrinsic the target CPU has no instruction for: at the baseline x86-64 level `llvm.roundeven`,
+intrinsic the target CPU has no instruction for (an f8 conversion needs `llvm.roundeven` too): at
+the baseline x86-64 level `llvm.roundeven`,
 `llvm.floor`/`ceil`, `llvm.fma` and `half` conversions become calls to `roundevenf`, `floorf`/`ceilf`,
 `fmaf` and `__truncsfhf2`/`__extendhfsf2`. Compile with `-march=x86-64-v3` (or at least
 `-msse4.1 -mfma -mf16c`) to get instructions instead — the MSVC C runtime has no `roundevenf`.
