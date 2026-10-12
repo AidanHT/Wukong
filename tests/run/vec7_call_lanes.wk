@@ -33,6 +33,17 @@
 // EXPECT-OUT: 3144
 // EXPECT-OUT: 3505
 // EXPECT-OUT: 3866
+// EXPECT-OUT: 28
+// EXPECT-OUT: 104
+// EXPECT-OUT: 64
+// EXPECT-OUT: 40
+// EXPECT-OUT: 124
+// EXPECT-OUT: 84
+// EXPECT-OUT: 52
+// EXPECT-OUT: 28
+// EXPECT-OUT: 104
+// EXPECT-OUT: 64
+// EXPECT-OUT: 40
 module tests.run.vec7_call_lanes
 
 // Calls inside widened loops (-O2). A call to a function the optimizer's effect summaries prove
@@ -62,12 +73,28 @@ module tests.run.vec7_call_lanes
 //   call_uniform: o[j] = x[j] * tri(c, 2) + y[j] with c = 3: tri(3, 2) = 393/64 (one call per
 //             group: its argument is the same in every lane); x[j] = j/4, y[j] = 1 - j/8,
 //             printed as o[j] * 256.
+//   call_bool: a widened compare handed to a `bool` parameter - each lane passes its own truth.
+//             sel(b, v, 0) = b ? v : 0 - v;  sel(b, v, d) = sel(b, v/2, d - 1) + 1, so
+//             sel(b, v, 2) = (b ? v/4 : -v/4) + 2 and o[j] = sel(x > 0, 2x, 2)/2 + x is
+//             5x/4 + 1 where x > 0 and 3x/4 + 1 where x <= 0. x[j] = (5j mod 7)/4 - 3/4:
+//             -3/4, 1/2, 0, -1/2 | 3/4, 1/4, -1/4, -3/4 | 1/2, 0, -1/2 (each group mixes
+//             both answers), printed as o[j] * 64.
 
 fn tri(x: f32, d: i64) -> f32 {
     if d <= 0 {
         return x;
     }
     return tri(x * 0.5 + 1.0, d - 1) * 0.75 + x;
+}
+
+fn sel(b: bool, v: f32, d: i64) -> f32 {
+    if d <= 0 {
+        if b {
+            return v;
+        }
+        return 0.0 - v;
+    }
+    return sel(b, v * 0.5, d - 1) + 1.0;
 }
 
 fn h(i: i64, d: i64) -> i64 {
@@ -116,12 +143,27 @@ fn call_uniform(x: []f32, y: []f32, mut o: []f32, n: i64, c: f32, z: i64) {
     }
 }
 
+@unchecked
+fn call_bool(x: []f32, @noalias mut o: []f32, n: i64, z: i64) {
+    if z > 0 {
+        again(z - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        o[i] = sel(x[i] > 0.0, x[i] * 2.0, 2) * 0.5 + x[i];
+        i = i + 1;
+    }
+}
+
 fn again(z: i64) {
     let mut t: []f32 = alloc_f32(1);
     let mut u: []i64 = alloc_i64(1);
+    let mut v: []f32 = alloc_f32(1);
     call_f32(t, t, t, 1, 0, z);
     call_i64(u, u, 1, z);
     call_uniform(t, t, t, 1, 1.0, z);
+    call_bool(t, v, 1, z);
 }
 
 fn main() -> i32 {
@@ -153,6 +195,18 @@ fn main() -> i32 {
     j = 0;
     while j < 11 {
         print((o[j] * 256.0) as i64);
+        j = j + 1;
+    }
+    let mut xb: []f32 = alloc_f32(11);
+    j = 0;
+    while j < 11 {
+        xb[j] = (((j * 5) % 7) as f32) * 0.25 - 0.75;
+        j = j + 1;
+    }
+    call_bool(xb, o, 11, 0);
+    j = 0;
+    while j < 11 {
+        print((o[j] * 64.0) as i64);
         j = j + 1;
     }
     return 0;

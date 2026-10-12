@@ -69,6 +69,12 @@
 // EXPECT-OUT: 34
 // EXPECT-OUT: 22
 // EXPECT-OUT: 118
+// EXPECT-OUT: 530368
+// EXPECT-OUT: 733690
+// EXPECT-OUT: 0
+// EXPECT-OUT: 735952
+// EXPECT-OUT: 994984
+// EXPECT-OUT: 0
 module tests.run.vec7_lane_serial
 
 // Lane-serial regions (-O2). A read-modify-write scatter `h[q[i]] += v`, two scatters into one
@@ -97,6 +103,13 @@ module tests.run.vec7_lane_serial
 //             j < 13; printed o[k] * 16 then y[j] * 16.
 //   checked:  o[k] = k/2 (14 slots), ix[j] = (9j + 4) mod 14; o[j] = o[ix[j]] * 2 + 1 through
 //             checked slices for j < 14 - the gather reads o itself; printed o[k] * 2.
+//   hist_sel: the histogram's arrays, h[0..6] = 0; c = 2x + y/2 - 1 = 3j/4 + 1/2, e = c*c - y,
+//             and h[q[j]] = sel(c > 4, h[q[j]] + e, 1) for j < 23, where sel(b, v, 0) = b ? v :
+//             0 - v and sel(b, v, d) = sel(b, v/2, d - 1) + 1, so the update is (h + e)/2 + 1
+//             for j >= 5 and 1 - (h + e)/2 below. The compare is widened before the region and
+//             reaches each lane's call as that lane's `bool`; folding the 23 updates bin by bin
+//             in j order gives h = 8287/64, 366845/2048, 0, 45997/256, 124373/512, 0 (bins 2
+//             and 5 are never hit); printed h[b] * 4096.
 
 @unchecked
 fn hist(@noalias mut h: []f32, q: []i32, x: []f32, y: []f32, n: i64, z: i64) {
@@ -172,6 +185,34 @@ fn checked(ix: []i32, x: []f32, mut o: []f32, n: i64, z: i64) {
     }
 }
 
+fn sel(b: bool, v: f32, d: i64) -> f32 {
+    if d <= 0 {
+        if b {
+            return v;
+        }
+        return 0.0 - v;
+    }
+    return sel(b, v * 0.5, d - 1) + 1.0;
+}
+
+@unchecked
+fn hist_sel(@noalias mut h: []f32, q: []i32, x: []f32, y: []f32, n: i64, z: i64) {
+    if z > 0 {
+        again(z - 1);
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        let c: f32 = x[i] * 2.0 + y[i] * 0.5 - 1.0;
+        let e: f32 = c * c - y[i];
+        let pos: bool = c > 4.0;
+        let j: i64 = q[i] as i64;
+        let g: f32 = h[j];
+        h[j] = sel(pos, g + e, 1);
+        i = i + 1;
+    }
+}
+
 fn again(z: i64) {
     let mut t: []f32 = alloc_f32(1);
     let mut u: []f32 = alloc_f32(1);
@@ -182,6 +223,7 @@ fn again(z: i64) {
     beside(u, t, q, 1, z);
     alias(t, q, t, t, u, 1, z);
     checked(q, t, t, 1, z);
+    hist_sel(u, q, t, t, 1, z);
 }
 
 fn main() -> i32 {
@@ -278,6 +320,14 @@ fn main() -> i32 {
     j = 0;
     while j < 14 {
         print((co[j] * 2.0) as i64);
+        j = j + 1;
+    }
+
+    let mut hs: []f32 = alloc_f32(6);
+    hist_sel(hs, hq, hx, hy, 23, 0);
+    j = 0;
+    while j < 6 {
+        print((hs[j] * 4096.0) as i64);
         j = j + 1;
     }
     return 0;

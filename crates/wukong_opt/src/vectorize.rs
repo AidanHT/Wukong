@@ -6170,8 +6170,8 @@ fn emit_body(
                 let r = inst.result;
                 let ty = r.map(|r| e.f.value_type(r).clone());
                 // Each operand's `W` per-lane values: the counter's `i + k` where this step reads
-                // it as a value, otherwise extracted from a vector, a replicated value's own lanes,
-                // or a uniform value repeated.
+                // it as a value, otherwise extracted from a vector (a compare's mask as each
+                // lane's `bool`), a replicated value's own lanes, or a uniform value repeated.
                 let mut uses = Vec::new();
                 each_op_use(&inst.op, &mut |u| uses.push(u));
                 let mut table: FxHashMap<u32, Vec<ValueId>> = FxHashMap::default();
@@ -6186,7 +6186,7 @@ fn emit_body(
                             })
                             .clone()
                     } else {
-                        lane_values(e, vb, &map, u, p.w)
+                        scalar_lanes(e, vb, &map, u, p.w)
                     };
                     table.insert(u.0, lanes);
                 }
@@ -6519,7 +6519,8 @@ fn emit_serial_region(
         (Op::Load(ptr, _), true) | (Op::Store { ptr, .. }, true) => Some(*ptr),
         _ => None,
     };
-    // Lane values of everything the region reads from outside it, read once, before lane 0.
+    // Lane values of everything the region reads from outside it, read once, before lane 0 — a
+    // compare widened before the region as each lane's `bool` ([`scalar_lanes`]).
     let mut table: FxHashMap<u32, Vec<ValueId>> = FxHashMap::default();
     for (i, inst, contiguous) in &steps {
         let mut uses = Vec::new();
@@ -6534,7 +6535,7 @@ fn emit_serial_region(
             } else if u == p.ramp.iv {
                 table.insert(u.0, vec![iv_scalar; p.w as usize]);
             } else if let std::collections::hash_map::Entry::Vacant(slot) = table.entry(u.0) {
-                slot.insert(lane_values(e, vb, map, u, p.w));
+                slot.insert(scalar_lanes(e, vb, map, u, p.w));
             }
         }
     }
@@ -7793,6 +7794,26 @@ fn lane_values(
     }
 }
 
+/// A value's `w` per-lane scalars **of its own scalar type**, for a step that runs once per lane
+/// on them — a replicated op, a per-lane call, a lane-serial step: [`lane_values`], except that a
+/// widened `bool` — a lane mask, whose lanes are integers at its compare's operand width — is read
+/// as each lane's truth ([`mask_lane_bools`]), the `i1` the scalar step takes. The raw mask lane
+/// is an `i32` (or wider) where the step, a call's `bool` parameter or a `select`'s condition,
+/// declares `i1`: the MIR verifier refuses it.
+fn scalar_lanes(
+    e: &mut Emit<'_>,
+    vb: BlockId,
+    map: &FxHashMap<u32, Wide>,
+    v: ValueId,
+    w: u32,
+) -> Vec<ValueId> {
+    if *e.f.value_type(v) == MirType::I1 && matches!(map.get(&v.0), Some(Wide::Vector(_))) {
+        mask_lane_bools(e, vb, map, v, w)
+    } else {
+        lane_values(e, vb, map, v, w)
+    }
+}
+
 /// The induction variable's value in each lane of the group: `i + k`, wrapping exactly as the
 /// scalar loop's `i + 1` chain does.
 fn iv_lane_values(
@@ -7869,13 +7890,15 @@ mod tests {
         (program, interner)
     }
 
+    /// `src` lowered and optimized at `level`, then verified as a whole program — the check the
+    /// driver runs before every backend (`verify_or_ice`). Per function, the verifier cannot hold
+    /// a call's arguments against its callee's signature, and a lane value of the wrong type
+    /// handed to a per-lane call is exactly what it would miss.
     fn optimized(src: &str, level: u8) -> (Program, Interner) {
         let (mut program, interner) = lower(src);
         crate::optimize(&mut program, level);
-        for f in &program.funcs {
-            let errs = wukong_mir::verify::verify_function(f);
-            assert!(errs.is_empty(), "MIR invalid after -O{level}: {errs:?}");
-        }
+        let errs = wukong_mir::verify::verify_program(&program);
+        assert!(errs.is_empty(), "MIR invalid after -O{level}: {errs:?}");
         (program, interner)
     }
 
@@ -10989,6 +11012,81 @@ mod tests {
              let mut b: []f32 = alloc_f32(10); let mut j: i64 = 0; \
              while j < 10 {{ a[j] = (j as f32) * 0.5; b[j] = 2.0 - (j as f32) * 0.25; j = j + 1; }} \
              print(k(a, b, 10)); free(a); free(b); return 0; }}"
+        ));
+    }
+
+    /// A pure function the inliner never splices, taking a `bool`: what a compare in a widened
+    /// body hands a per-lane call.
+    const SEL: &str = "fn sel(b: bool, v: f32, d: i64) -> f32 { if d <= 0 { if b { return v; } \
+                       return 0.0 - v; } return sel(b, v * 0.5, d - 1) + 1.0; } ";
+
+    /// A compare widened beside a per-lane call is a lane mask — integer lanes at its operands'
+    /// width, `1` in the interpreter and all-ones natively — while the call takes a `bool`. Each
+    /// lane's argument must be that lane's truth (`lane != 0`), not the raw mask lane: an `i32`
+    /// passed where the callee declares `i1` fails the MIR verifier, an internal compiler error on
+    /// a program `-O0` runs.
+    #[test]
+    fn a_compare_reaches_a_per_lane_call_as_each_lanes_bool() {
+        let k = format!(
+            "{SEL} @unchecked fn k(x: []f32, @noalias mut o: []f32, n: i64) {{ \
+             let mut i: i64 = 0; \
+             while i < n {{ o[i] = sel(x[i] > 0.0, x[i] * 2.0, 2) * 0.5 + x[i]; i = i + 1; }} }} "
+        );
+        let shape = format!("{k} fn main() -> i32 {{ return 0; }}");
+        assert!(
+            is_widened(&shape, "k"),
+            "the call on a compare was declined"
+        );
+        assert!(
+            calls_to(&shape, "k", "sel") >= 5,
+            "four lane calls in the vector body and one in the epilogue"
+        );
+        // x[j] = j - 4 for j < 9: negative, zero and positive lanes in each group, and a tail.
+        scalar_and_vector_agree(&format!(
+            "{k} fn main() -> i32 {{ let mut x: []f32 = alloc_f32(9); \
+             let mut o: []f32 = alloc_f32(9); let mut j: i64 = 0; \
+             while j < 9 {{ x[j] = (j as f32) - 4.0; j = j + 1; }} \
+             k(x, o, 9); j = 0; while j < 9 {{ print(o[j]); j = j + 1; }} \
+             free(x); free(o); return 0; }}"
+        ));
+    }
+
+    /// The same inside a lane-serial region: the call reads the gathered bin (so it runs lane by
+    /// lane with the region) and a compare the widened work before the region computed, which
+    /// reaches each lane as that lane's `bool`.
+    #[test]
+    fn a_lane_serial_call_reads_an_earlier_compare_as_each_lanes_bool() {
+        // `k` and `again` call each other, so the inliner never splices `k` into `main`, where its
+        // `@noalias` promise would be lost and the loop declined.
+        let k = format!(
+            "{SEL} @unchecked fn k(@noalias mut h: []f32, q: []i32, x: []f32, y: []f32, n: i64, \
+               z: i64) {{ \
+             if z > 0 {{ again(z - 1); return; }} let mut i: i64 = 0; \
+             while i < n {{ let c: f32 = x[i] * 2.0 + y[i] * 0.5 - 1.0; \
+               let e: f32 = c * c - y[i]; let pos: bool = c > 4.0; let j: i64 = q[i] as i64; \
+               let g: f32 = h[j]; h[j] = sel(pos, g + e, 1); i = i + 1; }} }} \
+             fn again(z: i64) {{ let mut t: []f32 = alloc_f32(1); let mut u: []f32 = alloc_f32(1); \
+               let mut q: []i32 = alloc_i32(1); k(u, q, t, t, 1, z); }} "
+        );
+        let shape = format!("{k} fn main() -> i32 {{ return 0; }}");
+        assert!(
+            is_widened(&shape, "k"),
+            "the region around the call was declined"
+        );
+        assert!(
+            calls_to(&shape, "k", "sel") >= 5,
+            "four lane calls in the vector body and one in the epilogue"
+        );
+        // q[j] = j^2 mod 5 for j < 11: each group hits one bin twice (j = 2, 3 and j = 4, 6),
+        // and a tail of three.
+        scalar_and_vector_agree(&format!(
+            "{k} fn main() -> i32 {{ let mut h: []f32 = alloc_f32(5); \
+             let mut q: []i32 = alloc_i32(11); let mut x: []f32 = alloc_f32(11); \
+             let mut y: []f32 = alloc_f32(11); let mut j: i64 = 0; \
+             while j < 11 {{ q[j] = ((j * j) % 5) as i32; x[j] = (j as f32) * 0.5; \
+               y[j] = 1.0 - (j as f32) * 0.25; j = j + 1; }} \
+             k(h, q, x, y, 11, 0); j = 0; while j < 5 {{ print(h[j]); j = j + 1; }} \
+             free(h); free(q); free(x); free(y); return 0; }}"
         ));
     }
 

@@ -83,6 +83,15 @@ fn a_pure_call_is_called_once_per_lane_beside_widened_work() {
     let uni = function(&m, "call_uniform");
     assert!(uni.contains("<4 x f32>"), "call_uniform was not widened");
     assert!(uni.matches("call tri(").count() >= 2);
+    // A widened compare as a `bool` argument: each lane's call takes that lane's truth, so the
+    // listing verifies (an `i32` mask lane passed to `sel`'s `bool` would be a MIR-verify ICE).
+    let cb = function(&m, "call_bool");
+    assert!(cb.contains("<4 x f32>"), "call_bool was not widened");
+    assert!(
+        cb.matches("call sel(").count() >= 5,
+        "call_bool does not call `sel` once per lane:
+{cb}"
+    );
 }
 
 #[test]
@@ -104,7 +113,7 @@ fn a_checked_gather_is_tested_per_group() {
 #[test]
 fn lane_serial_regions_widen_around_the_serial_accesses() {
     let m = mir("vec7_lane_serial.wk", &[]);
-    for k in ["hist", "two_scat", "beside", "alias", "checked"] {
+    for k in ["hist", "two_scat", "beside", "alias", "checked", "hist_sel"] {
         assert!(
             function(&m, k).contains("<4 x"),
             "{k} was not widened around its lane-serial region"
@@ -115,7 +124,7 @@ fn lane_serial_regions_widen_around_the_serial_accesses() {
     assert!(hist.matches("store ").count() >= 5, "{hist}");
     // The kill switch restores the decline, region by region.
     let off = mir("vec7_lane_serial.wk", &[("WUKONG_NO_LANE_SERIAL", "1")]);
-    for k in ["hist", "two_scat", "beside", "alias", "checked"] {
+    for k in ["hist", "two_scat", "beside", "alias", "checked", "hist_sel"] {
         assert!(
             !function(&off, k).contains("<4 x"),
             "{k} widened with WUKONG_NO_LANE_SERIAL set"
