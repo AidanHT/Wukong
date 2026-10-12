@@ -324,6 +324,18 @@ impl PassManager {
             .unwrap_or_else(|failure| panic!("{failure}"));
     }
 
+    /// [`PassManager::run_subset`] with fallible verification in every build profile: each pass
+    /// that ran is checked, and the first failure names it and the function — exactly the check
+    /// [`optimize_verified`] gives its unroll and SLP cleanup sweeps, so a replica of that can
+    /// report a failure the same way.
+    pub fn run_subset_verified(
+        &self,
+        program: &mut Program,
+        funcs: &[usize],
+    ) -> Result<(), VerificationFailure> {
+        self.run_subset_checked(program, funcs, true)
+    }
+
     fn run_subset_checked(
         &self,
         program: &mut Program,

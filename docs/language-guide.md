@@ -2455,8 +2455,12 @@ wukongc [OPTIONS] -e <source>    the program is the <source> argument itself
                       native = Cranelift JIT; gpu / gpu-native require --features gpu + a CUDA device
                       aliases: interpreter = interp, cranelift = native, cuda = gpu,
                       gpu-lower = gpu-native; any other value is a usage error (exit 2)
---emit=<stage>        tokens | ast | check | mir-high | mir (alias mir-low) | grad | llvm-ir | obj | exe
-                      (default: exe)
+--emit=<stage>        tokens | ast | check | mir-high | mir (alias mir-low) | mir-text | grad |
+                      llvm-ir | obj | exe   (default: exe)
+                      mir-text = the optimized MIR with every type, float constant bits, static,
+                      extern signedness and parameter promise spelled out. An input ending in
+                      .mir is such a dump: `wukongc --emit=mir|mir-text [-O<n>] [--passes=..]
+                      f.mir` parses, verifies, optimizes and prints it (no other stage, no --run)
 --target-cpu=<c>      native | x86-64 | x86-64-v2 | x86-64-v3 | x86-64-v4   (default: native)
                       instruction-set level for native code (--emit=obj/exe, --backend=native).
                       native = every feature of the compiling host; a named level is exact and
@@ -2490,6 +2494,18 @@ wukongc [OPTIONS] -e <source>    the program is the <source> argument itself
 --train-warmup=<n>    ramp the learning rate linearly over the first n updates   (default: 0)
 --train-schedule=<s>  constant | cosine: the learning rate after the warmup (default: constant)
 -O0|-O1|-O2|-O3       optimization level (default: -O0; -O3 currently runs the -O2 pipeline)
+--passes=<list>       run exactly this comma-separated optimizer pass list instead of the -O
+                      level's (-O still sets the native code generator's level); `--passes=`
+                      runs none. Function passes (run together to a fixpoint): sroa, mem2reg,
+                      simplify, jump-thread, simplify-cfg, simplify-phis, dce, tre, cse, dse,
+                      loop-canon, loop-delete, fuse, licm, bce, unswitch, promote, vectorize;
+                      program steps (run once where named): inline, unroll, slp, form-switches.
+                      An unknown name is a usage error (exit 2) that lists them all
+--print-after=<p>     print the MIR to stderr after each run of pass <p> on a function (a run
+                      that changed nothing is one `unchanged` line), or after program step <p>;
+                      `all` matches every one. Stdout is unchanged. Both flags are rejected with
+                      --emit=tokens/ast/check/mir-high and on --emit=grad, --train and
+                      --emit=obj --grad-of
 --fp=<mode>           fast | strict   (default: fast). strict = @strict_fp on every function: no
                       FMA contraction, source-order float reductions, no kernel recognizers (see
                       "Floating-point semantics"). Rejected with --emit=grad and --train (exit 1).

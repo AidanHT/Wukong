@@ -23,7 +23,12 @@ OPTIONS:
                        read (the root and each import); its target is the -o artifact for
                        --emit=obj/exe, otherwise <f> itself (not with --emit=tokens/ast)
     --emit=<stage>     Emit an intermediate artifact and stop. One of:
-                       tokens, ast, check, mir-high, mir, grad, llvm-ir, obj, exe  (default: exe)
+                       tokens, ast, check, mir-high, mir, mir-text, grad, llvm-ir, obj, exe
+                       (default: exe)
+                       (mir-text = the optimized MIR with every type, float bits and parameter
+                       promise spelled out; `wukongc --emit=mir|mir-text [-O<n>] [--passes=..]
+                       f.mir` reads it back, verifies, optimizes and prints it. A .mir input takes
+                       no other stage and no --run)
                        (grad = reverse-mode backward MIR of a loss fn; see --grad-of/--grad-wrt)
                        (check = run lex/parse/imports/sema only, report diagnostics, no lowering)
     --grad-of=<fn>     Function to differentiate for --emit=grad / --train  (default: loss).
@@ -63,6 +68,19 @@ OPTIONS:
     -o <path>          Write the artifact to <path>. Only --emit=obj and --emit=exe write a
                        file; every other stage prints its artifact on stdout.
     -O0|-O1|-O2|-O3    Optimization level (default: -O0)
+    --passes=<list>    Run exactly this comma-separated optimizer pass list instead of the -O
+                       level's (-O still sets the native code generator's level); `--passes=`
+                       runs none. Consecutive function passes run together to a fixpoint:
+                       sroa, mem2reg, simplify, jump-thread, simplify-cfg, simplify-phis, dce,
+                       tre, cse, dse, loop-canon, loop-delete, fuse, licm, bce, unswitch,
+                       promote, vectorize. Program steps run once where named: inline, unroll,
+                       slp, form-switches. -O2 is the list `inline,sroa,...,vectorize,unroll,
+                       slp,form-switches` (docs/internals.md). Not with --emit=tokens, ast,
+                       check, mir-high or grad, --train or --grad-of
+    --print-after=<p>  Print the MIR to stderr after each run of pass <p> on a function (a run
+                       that changed nothing prints a one-line note), or after program step <p>;
+                       `all` matches every pass and step. Runs the -O level's list unless
+                       --passes names one. Same restrictions as --passes
     --fp=<mode>        Floating-point mode: fast, strict  (default: fast)
                        fast contracts `x + y*z` into one FMA, reassociates vectorized float
                        reductions and dispatches recognized kernels; strict evaluates every
@@ -433,6 +451,17 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                     )
                 })?;
             }
+            _ if arg.starts_with("--passes=") => {
+                let list = &arg["--passes=".len()..];
+                wukong_driver::passes::parse_spec(list).map_err(|e| format!("--passes: {e}"))?;
+                opts.passes = Some(list.to_string());
+            }
+            _ if arg.starts_with("--print-after=") => {
+                let pass = &arg["--print-after=".len()..];
+                wukong_driver::passes::check_print_after(pass)
+                    .map_err(|e| format!("--print-after: {e}"))?;
+                opts.print_after = Some(pass.to_string());
+            }
             "-O0" => opts.opt_level = 0,
             "-O1" => opts.opt_level = 1,
             "-O2" => opts.opt_level = 2,
@@ -675,6 +704,62 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 "`-o` is only supported with `--emit=obj` and `--emit=exe`: every other stage \
                  prints its artifact on stdout (redirect it instead)"
                     .to_string(),
+            );
+        }
+    }
+
+    // `--passes` / `--print-after` act on the optimizer, so a stage that stops before it would
+    // silently ignore them. A gradient compile is refused because the pass-list replica has no
+    // autodiff roots: the forward autodiff takes is always the standard pipeline's.
+    if opts.passes.is_some() || opts.print_after.is_some() {
+        let flag = if opts.passes.is_some() {
+            "--passes"
+        } else {
+            "--print-after"
+        };
+        let early = match opts.emit {
+            EmitStage::Tokens => Some("tokens"),
+            EmitStage::Ast => Some("ast"),
+            EmitStage::Check => Some("check"),
+            EmitStage::MirHigh => Some("mir-high"),
+            _ => None,
+        };
+        if let Some(stage) = early {
+            return Err(format!(
+                "`{flag}` has no effect with `--emit={stage}`, which stops before the optimizer runs"
+            ));
+        }
+        if opts.emit == EmitStage::Grad
+            || opts.grad.train
+            || (opts.emit == EmitStage::Obj && opts.grad.of.is_some())
+        {
+            return Err(format!(
+                "`{flag}` cannot be combined with a gradient compile (`--emit=grad`, `--train`, \
+                 `--emit=obj --grad-of`): autodiff always differentiates the standard pipeline's \
+                 forward"
+            ));
+        }
+    }
+
+    // A `.mir` input is a typed MIR dump (`--emit=mir-text`): the driver reads it back, optimizes
+    // it and prints MIR. It has no front end to lint or link against, so every other stage — and
+    // running it — is out of scope rather than silently something else.
+    if opts.source.is_none() && opts.input.extension().is_some_and(|e| e == "mir") {
+        if opts.run {
+            return Err(
+                "a `.mir` input cannot be run: it is read only by `--emit=mir` and \
+                 `--emit=mir-text`"
+                    .to_string(),
+            );
+        }
+        if !emit_explicit || !matches!(opts.emit, EmitStage::Mir | EmitStage::MirText) {
+            return Err(
+                "a `.mir` input is read only by `--emit=mir` and `--emit=mir-text`".to_string(),
+            );
+        }
+        if opts.depfile.is_some() {
+            return Err(
+                "`--depfile` needs an import graph, which a `.mir` input has none of".into(),
             );
         }
     }
@@ -1000,6 +1085,95 @@ mod tests {
         );
         assert!(parse_args(&["--remarks=all", "input.wk"].map(str::to_owned)).is_err());
         assert!(USAGE.contains("--remarks=dispatch"));
+    }
+
+    /// `--passes` and `--print-after` take only names the optimizer knows, an unknown one is a
+    /// usage error that lists them all, and both are refused where no optimizer runs or where
+    /// autodiff needs the standard pipeline. USAGE lists every name.
+    #[test]
+    fn passes_and_print_after_parse_and_reject_misuse() {
+        let parse = |a: &[&str]| parse_args(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let o = parse(&["--passes=mem2reg,simplify,dce", "--emit=mir", "p.wk"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(o.passes.as_deref(), Some("mem2reg,simplify,dce"));
+        assert_eq!(o.print_after, None);
+        let o = parse(&["-O2", "--print-after=licm", "--run", "p.wk"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(o.print_after.as_deref(), Some("licm"));
+        assert_eq!(o.passes, None);
+        assert_eq!(
+            parse(&["--passes=", "p.wk"])
+                .unwrap()
+                .unwrap()
+                .passes
+                .as_deref(),
+            Some("")
+        );
+        assert!(parse(&["--print-after=all", "--passes=inline,slp", "p.wk"]).is_ok());
+        let none = parse(&["p.wk"]).unwrap().unwrap();
+        assert!(none.passes.is_none() && none.print_after.is_none());
+        let err = parse(&["--passes=mem2reg,bogus", "p.wk"]).unwrap_err();
+        assert!(err.contains("bogus") && err.contains("vectorize"), "{err}");
+        let err = parse(&["--print-after=bogus", "p.wk"]).unwrap_err();
+        assert!(
+            err.contains("bogus") && err.contains("form-switches"),
+            "{err}"
+        );
+        for flag in ["--passes=dce", "--print-after=dce"] {
+            for stage in ["tokens", "ast", "check", "mir-high", "grad"] {
+                let emit = format!("--emit={stage}");
+                assert!(parse(&[flag, &emit, "p.wk"]).is_err(), "{flag} {emit}");
+            }
+            assert!(parse(&[flag, "--train", "p.wk"]).is_err(), "{flag} --train");
+            assert!(
+                parse(&[flag, "--emit=obj", "--grad-of=loss", "-o", "l.o", "p.wk"]).is_err(),
+                "{flag} --grad-of"
+            );
+            for ok in ["--emit=mir", "--emit=llvm-ir", "--emit=obj", "--run"] {
+                assert!(parse(&[flag, ok, "p.wk"]).is_ok(), "{flag} {ok}");
+            }
+        }
+        for name in wukong_driver::passes::FUNCTION_PASSES
+            .iter()
+            .chain(wukong_driver::passes::PROGRAM_STEPS)
+        {
+            assert!(USAGE.contains(name), "USAGE must list {name}");
+        }
+        assert!(USAGE.contains("--passes=<list>") && USAGE.contains("--print-after=<p>"));
+    }
+
+    /// `--emit=mir-text` is a stage, and a `.mir` input admits exactly the two MIR stages: no
+    /// other stage, no default `exe`, no `--run`.
+    #[test]
+    fn mir_text_stage_and_mir_input_parse() {
+        let parse = |a: &[&str]| parse_args(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let o = parse(&["--emit=mir-text", "-O2", "p.wk"]).unwrap().unwrap();
+        assert_eq!(o.emit, EmitStage::MirText);
+        for stage in ["mir", "mir-text"] {
+            let emit = format!("--emit={stage}");
+            let o = parse(&[&emit, "-O2", "--passes=dce", "--print-after=dce", "x.mir"])
+                .unwrap()
+                .unwrap();
+            assert_eq!(o.input, PathBuf::from("x.mir"));
+        }
+        for bad in [
+            &["x.mir"][..],
+            &["--run", "x.mir"][..],
+            &["--emit=exe", "x.mir"][..],
+            &["--emit=obj", "-o", "x.o", "x.mir"][..],
+            &["--emit=llvm-ir", "x.mir"][..],
+            &["--emit=mir-high", "x.mir"][..],
+            &["--emit=ast", "x.mir"][..],
+            &["--emit=mir", "--depfile=x.d", "x.mir"][..],
+        ] {
+            let err = parse(bad).unwrap_err();
+            assert!(err.contains(".mir"), "{bad:?}: {err}");
+        }
+        assert!(parse(&["--run", "--emit=mir-text", "p.wk"]).is_err());
+        assert!(parse(&["--emit=mir-text", "-o", "p.txt", "p.wk"]).is_err());
+        assert!(USAGE.contains("mir-text") && USAGE.contains("f.mir"));
     }
 
     #[test]

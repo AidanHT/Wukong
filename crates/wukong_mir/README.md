@@ -18,7 +18,8 @@ wukong_mir_build → wukong_opt → wukong_interp | wukong_codegen_cranelift | w
 
 `wukong_driver::verify_or_ice` calls `verify_program` before every backend entry. `--emit=mir` /
 `--emit=mir-high` print via `print_program` (`src/print.rs`). Note: `--emit=mir-high` means
-*pre-optimization* MIR, not `MirLevel::High`.
+*pre-optimization* MIR, not `MirLevel::High`. `--emit=mir-text` prints via `print_program_typed`
+(`src/text.rs`), and `wukongc <file>.mir` reads that form back with `parse_program`.
 
 ## Key files
 
@@ -28,6 +29,7 @@ wukong_mir_build → wukong_opt → wukong_interp | wukong_codegen_cranelift | w
 | `src/inst.rs` | `Op` (20 variants), `BinOp`, `CmpOp`, `CastKind`, `Inst`, `Terminator` |
 | `src/builder.rs` | imperative `Builder` for one `Function` |
 | `src/print.rs` | `print_program` / `print_function` — grep surface for vectorization |
+| `src/text.rs` | `print_program_typed` / `parse_program` — typed textual MIR that reads back (`--emit=mir-text`, `.mir` input); laws: `typed(parse(typed(p))) == typed(p)`, `print_program(parse(typed(p))) == print_program(p)` |
 | `src/verify.rs` | `verify_function`, `verify_program` — well-formedness gate |
 | `src/vec_kernel.rs` | `VecKernel` — backend-agnostic 256-bit AVX2 loop recipe |
 

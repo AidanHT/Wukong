@@ -12,6 +12,7 @@ mod inst;
 #[cfg(test)]
 mod lane_op_tests;
 pub mod print;
+pub mod text;
 pub mod vec_kernel;
 pub mod verify;
 

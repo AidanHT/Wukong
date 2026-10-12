@@ -209,6 +209,13 @@ after every pass that ran and panics naming the culprit, so run the tests in a d
 Add a test asserting both an effect (e.g. instruction-count reduction) and that results are
 unchanged. The opt-level differential test (`crates/wukongc/tests/run.rs`) will also exercise it.
 
+Then name the pass in `crates/wukong_driver/src/passes.rs`: `FUNCTION_PASSES`, `make_pass`, and
+`standard_spec` for each level that runs it. That module is the `--passes` replica of the standard
+pipeline, and its `standard_spec_replica_matches_optimize_at_every_level` test holds it
+byte-identical to `wukong_opt::optimize`, so it fails until you do. A new whole-program stage in
+`optimize_preserving` (as `slp` was) becomes a `passes::Step` the same way, with a
+`verify_program_stage` under `--verify-each`.
+
 Two transforms deliberately sit **outside** the fixpoint, in `optimize` itself: `inline_program`
 before it (it needs whole-program information) and `unroll_program` after it (it needs the canonical
 two-block loop the fixpoint produces, and re-running it on its own output would unroll the same loop
@@ -223,6 +230,34 @@ Chrome trace JSON); it changes neither the output nor the emitted object.
 multiple-accumulator reduction unroll — computes a different number, which breaks both the
 interp-vs-native bit-exactness gate and `-O0` ≡ `-O{1,2,3}`. `wukong_opt::unroll` unrolls without
 reassociating for exactly this reason, and takes the smaller win.
+
+## Debugging an optimizer bug
+
+When `-O0` and `-O2` disagree (`cargo test -p wukongc --test run` names the program), reduce the
+problem to MIR and a pass list:
+
+```sh
+# 1. Dump the unoptimized program in the typed form. Below x86-64-v3 no vector-kernel recipe is
+#    built, and a recipe has no textual form.
+wukongc --emit=mir-text -O0 --target-cpu=x86-64-v2 bug.wk > bug.mir
+# 2. The -O2 list (docs/internals.md, "Running a chosen pass list") reproduces -O2 exactly. Delete
+#    names until the output stops changing: the last one removed is the culprit, or one it feeds.
+wukongc --emit=mir --passes=inline,sroa,mem2reg,simplify,...,form-switches bug.mir
+# 3. Watch it: every run of that pass, per function, on stderr.
+wukongc --emit=mir --passes=<the reduced list> --print-after=licm bug.mir
+# 4. A pass that leaves invalid MIR: --verify-each names it and the function.
+wukongc --emit=mir --passes=<the reduced list> --verify-each bug.mir
+```
+
+A dump is a faithful reproducer: `-O2` of a parsed `-O0` dump, and the `-O2` list cut in two
+through a dump, both equal `-O2` byte for byte over the whole run corpus
+(`crates/wukongc/tests/mir_text.rs`). To cut the program down, delete functions and blocks from the
+`.mir` file itself and re-run step 2 (`wukongc --emit=mir bug.mir` first, to make sure it still
+verifies). The reduced `.mir` and its list are the regression test: a Rust test can read it with
+`wukong_mir::text::parse_program`, run `wukong_driver::passes::run_steps`, and compare the result
+through `wukong_interp`, with no `Builder` code. Any future post-pipeline stage in
+`optimize_preserving` must become a `passes::Step` (see "Adding an optimizer pass"), or step 2 stops
+reproducing `-O2`.
 
 ## Adding a language feature
 
@@ -332,6 +367,10 @@ Prefer *not* to: `abs`, `exp`, `silu` and friends are built from existing primit
    `op_operands` in `src/fusion.rs` (these live behind `--features gpu`, so only
    `cargo check --features gpu --all-targets` sees them); and `crates/wukong_autodiff/src/lib.rs` —
    `diff_inst`, `remap_op`, `op_name`.
+10. `crates/wukong_mir/src/text.rs` — the typed textual form (`--emit=mir-text`, `.mir` input)
+    prints through `fmt_op`, so the printer follows step 3 by itself, but `FnParser::op` must read
+    the new spelling back. Its tests' exhaustive `op_slot` match stops compiling until the variant
+    has a slot, and `every_op_program` must then build one, or the round-trip test fails.
 
 **A new op that touches memory has a second, silent list.** The compiler only finds the exhaustive
 matches; most memory walkers in `wukong_opt` end in a `_ => {}` arm, and an op that falls into it

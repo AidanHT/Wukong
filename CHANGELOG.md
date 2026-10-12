@@ -5,6 +5,40 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Optimizer pass lists and typed textual MIR (`gap5/mir-text-passes`)
+
+- **`--passes=<list>` runs a chosen optimizer pipeline (N71).** The list names function passes by
+  their `Pass::name()` (`sroa`, `mem2reg`, `simplify`, `jump-thread`, `simplify-cfg`, `simplify-phis`,
+  `dce`, `tre`, `cse`, `dse`, `loop-canon`, `loop-delete`, `fuse`, `licm`, `bce`, `unswitch`,
+  `promote`, `vectorize`), which run together to a fixpoint, and the program steps `inline`, `unroll`,
+  `slp` and `form-switches`, which run once where named. `--passes=` runs nothing; an unknown name
+  is a usage error (exit 2) that lists every name. `-O` still sets the native code generator's
+  level. Each `-O` level is such a list (`docs/internals.md`, "Running a chosen pass list"), and a
+  driver test holds the replica byte-identical to `wukong_opt::optimize` at `-O0`..`-O3`, so the list
+  is an executable specification of the standard pipeline: bisect an optimizer bug by deleting names.
+- **`--print-after=<pass|all>` shows the MIR right after a pass.** On stderr, after each run of the
+  named function pass, the function it left, or one `unchanged` line when that run did nothing; after
+  a named program step, the whole program. Stdout is byte-identical with or without it. Both flags
+  are refused with `--emit=tokens|ast|check|mir-high` and on gradient compiles (`--emit=grad`,
+  `--train`, `--emit=obj --grad-of`), whose forward is always the standard pipeline's.
+- **`--verify-each` on a pass list names the pass and the function, cleanup sweeps included.** The
+  sweeps inside `unroll` and `slp` run through the new `wukong_opt::PassManager::run_subset_verified`
+  under `--verify-each`, which verifies every pass in every build profile, so a cleanup pass that
+  leaves invalid MIR is reported by pass and function name (exit 1), exactly as plain
+  `-O2 --verify-each` reports it, rather than as a Rust panic naming `sym#N` (exit 101, debug
+  `wukongc`) or as a failure of the whole `unroll cleanup` stage with no pass named (release).
+- **`--emit=mir-text` prints MIR that reads back, and a `.mir` input is optimized from it.** The
+  typed form (`wukong_mir::text`) is `--emit=mir` plus a type on every result, float constants as
+  bits (a NaN keeps its payload), the statics, `extern` signedness, parameter promises, a non-`bb0`
+  entry and the value-arena length. `wukongc --emit=mir|mir-text [-O<n>] [--passes=..]
+  [--print-after=..] f.mir` parses it (`f.mir:<line>: invalid MIR: <msg>`, exit 1), verifies it,
+  optimizes it and prints it; no other stage, and no `--run`, takes a `.mir` input (exit 2). On all
+  548 compiling `tests/run` programs, re-reading a dump reproduces it byte for byte, `-O2` of a
+  parsed unoptimized dump equals `-O2`, and the `-O2` list cut in two through a dump equals `-O2`
+  (`crates/wukongc/tests/mir_text.rs`; the default gate runs the last two on every second
+  program, `WUKONG_MIR_TEXT_ALL=1` on all): an optimizer bug is now a `.mir` file and a pass list.
+  A `veckernel` line has no textual form; dump with `--target-cpu=x86-64-v2`.
+
 ### Diagnostics: multi-line spans (`gap5/diag-multiline-spans`)
 
 - **Multi-line spans are drawn whole, with rustc-style connectors (N6).** The human renderer used to

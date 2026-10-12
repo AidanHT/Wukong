@@ -92,9 +92,9 @@ reads the predecessor slice in place (it borrows the cache, not the function). B
 `wukong-bench compile-work`, which counts allocations per pass and per call.
 
 Under `debug_assertions`, `wukong_mir::verify::verify_function` runs after every pass that executed
-and panics naming the culprit through the legacy API. `optimize_verified` and
-`PassManager::run_verified` instead return a structured `VerificationFailure`, in debug and release
-alike. The CLI exposes this as `--verify-each`; pass failures stop compilation with a human or JSON
+and panics naming the culprit through the legacy API. `optimize_verified`,
+`PassManager::run_verified` and `PassManager::run_subset_verified` (the unroll/SLP cleanup sweep)
+instead return a structured `VerificationFailure`, in debug and release alike. The CLI exposes this as `--verify-each`; pass failures stop compilation with a human or JSON
 internal-error diagnostic. Input/output and inlining/unrolling boundaries also check whole-program
 callee signatures, including at O0. Per-pass checks cover individual functions, not external runtime
 signatures or semantic correctness. A panic inside a transform itself is not intercepted.
