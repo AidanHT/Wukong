@@ -568,6 +568,153 @@ fn vector_recipe_streams_sharing_a_base_forward_stores_between_them() {
     assert_eq!(&interp.memory[16..24], &[F(9.0); 8]);
 }
 
+/// A one-function program whose body is a single elementwise f32 `VecKernelCall(ptrs, scalars, n)`
+/// of a recipe with `streams` streams, `scalars` invariants and body `ops`.
+fn one_recipe_program(
+    interner: &mut Interner,
+    streams: u32,
+    scalars: u32,
+    ops: Vec<VecOp>,
+) -> Program {
+    let name = interner.intern("one_recipe");
+    let mut b = Builder::new(name, MirType::Void);
+    let ptrs = b.add_param(MirType::Ptr);
+    let scalars_ptr = b.add_param(MirType::Ptr);
+    let n = b.add_param(MirType::I64);
+    b.build_void(Op::VecKernelCall {
+        kernel: 0,
+        ptrs,
+        scalars: scalars_ptr,
+        n,
+    });
+    b.ret(None);
+    let mut func = b.finish();
+    func.vec_kernels.push(VecKernel {
+        name,
+        lane: wukong_mir::VecLane::F32,
+        streams,
+        scalars,
+        unroll: 1,
+        reduce: None,
+        ops,
+    });
+    let mut program = Program::new();
+    program.funcs.push(func);
+    assert!(wukong_mir::verify::verify_program(&program).is_empty());
+    program
+}
+
+/// Memory is the truth for every load, including a reload of a stream that has its OWN earlier
+/// store. Streams 0 (`o`) and 1 (`p`) share a base, and the body is the scalar loop's
+/// `o[i] = x[i] * 2; p[i] = x[i] + 1; y[i] = o[i] * 3`. The reload of `o` comes after `p`'s store
+/// to the same element, so it reads `x + 1`, and `y = 3(x + 1)`. That is what the machine code
+/// (which re-reads memory) and `-O0` compute. Forwarding `o`'s own store first gave `y = 6x`: the
+/// reference evaluator served it from `stored[o]` and never asked the marshalling.
+///
+/// The second recipe loads stream 0 only after a store to stream 1 on its base, over slots that
+/// were never written. That load is forwarded, so it must not consume the slot: reading the
+/// snapshot refused the uninitialized value.
+#[test]
+fn vector_recipe_reload_after_a_store_to_a_base_sharing_stream_reads_the_latest_store() {
+    let mut interner = Interner::new();
+    let program = one_recipe_program(
+        &mut interner,
+        4,
+        3,
+        vec![
+            VecOp::Load { stream: 2 },  // 0: x
+            VecOp::Splat { scalar: 0 }, // 1: 2.0
+            VecOp::Bin {
+                op: VecBin::Mul,
+                a: 0,
+                b: 1,
+            }, // 2: x * 2
+            VecOp::Store { stream: 0, val: 2 }, // o = x * 2
+            VecOp::Splat { scalar: 1 }, // 4: 1.0
+            VecOp::Bin {
+                op: VecBin::Add,
+                a: 0,
+                b: 4,
+            }, // 5: x + 1
+            VecOp::Store { stream: 1, val: 5 }, // p = x + 1 (the same element as o)
+            VecOp::Load { stream: 0 },  // 7: o, which now holds x + 1
+            VecOp::Splat { scalar: 2 }, // 8: 3.0
+            VecOp::Bin {
+                op: VecBin::Mul,
+                a: 7,
+                b: 8,
+            }, // 9: o * 3
+            VecOp::Store { stream: 3, val: 9 }, // y
+        ],
+    );
+    let xs: Vec<f32> = (0..8).map(|k| k as f32 + 2.0).collect();
+    let mut interp = interpreter(&program, &interner);
+    // [0..4) stream table, [4..7) scalars, [7..15) o == p (never written), [15..23) x, [23..31) y.
+    let mut memory = vec![Value::Unit; 31];
+    memory[0] = P(7);
+    memory[1] = P(7);
+    memory[2] = P(15);
+    memory[3] = P(23);
+    memory[4] = F(2.0);
+    memory[5] = F(1.0);
+    memory[6] = F(3.0);
+    for (k, &x) in xs.iter().enumerate() {
+        memory[15 + k] = F(f64::from(x));
+    }
+    interp.memory = memory;
+    interp
+        .run_function(&program.funcs[0], &[P(0), P(4), I(8)])
+        .unwrap();
+    let want_o: Vec<Value> = xs.iter().map(|&x| F(f64::from(x + 1.0))).collect();
+    let want_y: Vec<Value> = xs.iter().map(|&x| F(f64::from((x + 1.0) * 3.0))).collect();
+    assert_eq!(
+        &interp.memory[7..15],
+        &want_o[..],
+        "o == p holds p's later store"
+    );
+    assert_eq!(
+        &interp.memory[23..31],
+        &want_y[..],
+        "y = 3(x + 1) in every lane"
+    );
+
+    // A load of stream 0 forwarded from stream 1's store, over never-written slots.
+    let mut interner = Interner::new();
+    let program = one_recipe_program(
+        &mut interner,
+        3,
+        1,
+        vec![
+            VecOp::Load { stream: 2 },          // 0: x
+            VecOp::Store { stream: 1, val: 0 }, // p = x
+            VecOp::Load { stream: 0 },          // 2: o == p, so x
+            VecOp::Splat { scalar: 0 },         // 3: 2.0
+            VecOp::Bin {
+                op: VecBin::Mul,
+                a: 2,
+                b: 3,
+            },
+            VecOp::Store { stream: 0, val: 4 }, // o = 2x
+        ],
+    );
+    let mut interp = interpreter(&program, &interner);
+    // [0..3) stream table, [3] scalar, [4..12) o == p (never written), [12..20) x.
+    let mut memory = vec![Value::Unit; 20];
+    memory[0] = P(4);
+    memory[1] = P(4);
+    memory[2] = P(12);
+    memory[3] = F(2.0);
+    for (k, &x) in xs.iter().enumerate() {
+        memory[12 + k] = F(f64::from(x));
+    }
+    interp.memory = memory;
+    interp
+        .run_function(&program.funcs[0], &[P(0), P(3), I(8)])
+        .unwrap();
+    let want: Vec<Value> = xs.iter().map(|&x| F(f64::from(x * 2.0))).collect();
+    assert_eq!(&interp.memory[4..12], &want[..]);
+}
+
 #[test]
 fn host_float_buffers_reject_pointer_copyback_and_preserve_untouched_nan_bits() {
     let mut interner = Interner::new();

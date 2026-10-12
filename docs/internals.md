@@ -902,9 +902,11 @@ crossed. Two accesses to one element are one stream (a slice's data pointer is r
 fat pointer between a store and a load, so the two pointers are different values, and two streams
 let the interpreter read the element stale), and two objects the alias guard admits as possibly one
 buffer (`guard_allows_equal`) are two streams that may share a base: the interpreter's marshalling
-(`run_vec_kernel`) now forwards a lane's store to a later load of *any* stream with the same base,
-as the machine code does by re-reading memory (`tests/run/vec256_opt_aliased.wk`). The rewrite: a
-guard block computes `n`, the trip rounded down to the recipe's lanes and
+(`run_vec_kernel`) evaluates the recipe with alias classes (`VecKernel::eval_lane_aliased`, a class
+per base), so every load reads the lane's latest earlier store to *any* stream of its class, its
+own included, as the machine code does by re-reading memory (`tests/run/vec256_opt_aliased.wk`; a
+reload of a stored stream after a store to its twin, `tests/run/vec256_opt_aliased_reload.wk`).
+The rewrite: a guard block computes `n`, the trip rounded down to the recipe's lanes and
 zero below the gate or when the alias check fails, and `start + n`; a call block (entered only when
 `n != 0`) rebuilds each stream's address and each invariant from the body's own scalar steps with
 the counter at `start`, stores them into two entry-block tables (`[k x ptr]`, `[m x lane]`) and calls

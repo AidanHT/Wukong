@@ -75,9 +75,12 @@
 //! fat pointer between a store and a load, so the two pointers are different values), and the
 //! recipe forwards a store to a later load of its stream. Two *objects* the runtime alias guard
 //! admits as possibly the same buffer (`guard_allows_equal`: every access at one offset) are two
-//! streams that may share a base; the machine code re-reads memory, and the interpreter forwards a
-//! lane's store to a load of any stream with the same base, so a load after such a store reads it
-//! on both (`tests/run/vec256_opt_aliased.wk`).
+//! streams that may share a base. The machine code re-reads memory. The interpreter marshals the
+//! recipe through `VecKernel::eval_lane_aliased`, which serves every load from the lane's latest
+//! earlier store to any stream with the same base, the stream's own included, so both read what
+//! memory holds. That covers a load after a store to the other stream
+//! (`tests/run/vec256_opt_aliased.wk`), and a reload of a stored stream after a later store to its
+//! twin (`tests/run/vec256_opt_aliased_reload.wk`).
 //!
 //! `WUKONG_P4_NO_256=1` turns this path off exactly as it turns off `mir_build`'s, and so does the
 //! pipeline's own switch ([`crate::OptimizeOptions::vec_kernels`] — off for the PTX backend, whose

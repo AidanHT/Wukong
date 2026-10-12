@@ -40,11 +40,17 @@ All notable changes to Wukong are documented here. The format is loosely based o
   streams of one recipe may start at the same element — the optimizer's runtime alias guard admits
   two slices that are one buffer when every access sits at one element — and a load of one after a
   store to the other must read the stored value, as the machine code does by re-reading memory.
-  `run_vec_kernel` used to serve that load from the lane's pre-read snapshot (stale); it now takes
-  the lane's latest earlier store to any stream with the same base. No front-end recipe has two
-  streams on one base, so no existing program's output changes (`tests/run/vec256_opt_aliased.wk`
-  passes one buffer as both `x` and `o`). Accesses to one element through two pointer values are
-  also one stream now, which the same reload of a slice's data pointer otherwise splits.
+  `run_vec_kernel` used to serve that load from the lane's pre-read snapshot (stale). It now
+  evaluates the recipe with alias classes (`VecKernel::eval_lane_aliased`, one class per base), so
+  every load takes the lane's latest earlier store to any stream of its class, its own included.
+  A first fix forwarded only to a stream with no store of its own. A kernel that stores `o[i]`,
+  then `p[i]`, then reloads `o[i]` with `o` and `p` one buffer still printed `6v` at interp `-O2`
+  where `-O0` and native print `3v + 3`: the evaluator served the reload from `o`'s own older
+  store. No front-end recipe has two streams on one base, so no existing program's output changes
+  (`tests/run/vec256_opt_aliased.wk` passes one buffer as both `x` and `o`;
+  `tests/run/vec256_opt_aliased_reload.wk` as both `o` and `p`, every lane). Accesses to one
+  element through two pointer values are also one stream now, which the same reload of a slice's
+  data pointer otherwise splits.
 - **bf16 general loops vectorize (P15.7).** The MIR vectorizer refused every bf16 body, because
   the interpreter's vector load did not round to the bf16 grid as its scalar load does. A bf16 lane
   is an `f32` lane in a register — every backend computes bf16 in `f32` and rounds only at a load,

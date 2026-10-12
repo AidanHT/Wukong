@@ -600,11 +600,9 @@ impl VecKernel {
     /// which must model [`Self::lane`]; a float `Fma` is single-rounded via `mul_add`; a float `Neg`
     /// flips the sign bit; each compare follows the matching Rust operator — see [`VecCmp`]).
     ///
-    /// A store is forwarded to a later load of its own stream. Two streams whose bases are equal at
-    /// run time (the general vectorizer's alias guard admits that for two buffers accessed at one
-    /// element) name one element per lane, and the machine code, which re-reads memory, lets a load
-    /// of one observe an earlier store to the other: that is the `load` callback's job — the
-    /// interpreter returns the lane's latest earlier store to any stream with the same base.
+    /// A store is forwarded to a later load of its own stream: every stream is assumed disjoint
+    /// from every other. Streams that may share a base at run time need
+    /// [`Self::eval_lane_aliased`].
     pub fn eval_lane<T: VecValue>(
         &self,
         load: impl FnMut(u32) -> T,
@@ -623,14 +621,41 @@ impl VecKernel {
         scalar: impl Fn(u32) -> T,
         store: impl FnMut(u32, T),
     ) {
-        self.eval_all(scratch, load, scalar, store);
+        self.eval_all(scratch, None, load, scalar, store);
+    }
+
+    /// [`Self::eval_lane_with_scratch`] for streams that may share a base at run time. The general
+    /// vectorizer's alias guard admits two buffers that are the same buffer when every access sits
+    /// at one element. Such streams name one element per lane, and the machine code, which re-reads
+    /// memory, lets every load see the lane's latest earlier store to that element through any of
+    /// them. `alias[s]` is stream `s`'s class: streams in one class have equal bases, and must be
+    /// exactly those. A load is served from the latest earlier store to any stream of its class,
+    /// its own included, and `load` is called only when the class has none. Every class must be a
+    /// stream index (below [`Self::streams`]). The identity map is
+    /// [`Self::eval_lane_with_scratch`].
+    pub fn eval_lane_aliased<T: VecValue>(
+        &self,
+        scratch: &mut VecKernelScratch<T>,
+        alias: &[u32],
+        load: impl FnMut(u32) -> T,
+        scalar: impl Fn(u32) -> T,
+        store: impl FnMut(u32, T),
+    ) {
+        debug_assert_eq!(alias.len(), self.streams as usize, "one class per stream");
+        debug_assert!(
+            alias.iter().all(|&c| c < self.streams),
+            "a class is a stream"
+        );
+        self.eval_all(scratch, Some(alias), load, scalar, store);
     }
 
     /// Evaluate every op for one lane, retaining all its values in scratch (the reference used by both
     /// [`Self::eval_lane`] for elementwise kernels and [`Self::eval_reduction`] for reductions).
+    /// `alias` maps a stream to its class ([`Self::eval_lane_aliased`]); `None` is the identity.
     fn eval_all<T: VecValue>(
         &self,
         scratch: &mut VecKernelScratch<T>,
+        alias: Option<&[u32]>,
         mut load: impl FnMut(u32) -> T,
         scalar: impl Fn(u32) -> T,
         mut store: impl FnMut(u32, T),
@@ -642,14 +667,17 @@ impl VecKernel {
         // Store-to-load forwarding within the lane: the assembler stores each stream to memory and a
         // later `Load` of that stream re-reads the same address, so a body that writes then reads a
         // stream — e.g. a fused `t[k] = …; o[k] = f(t[k])` — observes the just-written value. Mirror
-        // that here so the interpreter oracle matches the machine code bit-for-bit. `self.streams`
-        // bounds every stream index.
+        // that here so the interpreter oracle matches the machine code bit-for-bit. The table is
+        // keyed by alias class, not by stream: a store to any stream of a class is the element's
+        // latest value for a load of every stream in it. `self.streams` bounds every stream index
+        // and every class.
         // Reset even when the stream count is unchanged: forwarding never crosses a lane boundary.
         stored.clear();
         stored.resize(self.streams as usize, None);
+        let class = |s: u32| alias.map_or(s, |a| a[s as usize]) as usize;
         for op in &self.ops {
             let v = match *op {
-                VecOp::Load { stream } => stored[stream as usize].unwrap_or_else(|| load(stream)),
+                VecOp::Load { stream } => stored[class(stream)].unwrap_or_else(|| load(stream)),
                 VecOp::Splat { scalar: k } => scalar(k),
                 VecOp::Const { bits } => T::from_const_bits(bits),
                 VecOp::Bin { op, a, b } => T::bin(op, vals[a as usize], vals[b as usize]),
@@ -670,7 +698,7 @@ impl VecKernel {
                 }
                 VecOp::Store { stream, val } => {
                     let x = vals[val as usize];
-                    stored[stream as usize] = Some(x); // forward to later loads of this stream
+                    stored[class(stream)] = Some(x); // forward to later loads of its class
                     store(stream, x);
                     T::unused() // stores carry no value; never referenced
                 }
@@ -748,7 +776,7 @@ impl VecKernel {
             for cu in 0..u {
                 for lane in 0..lanes {
                     let e = i + cu * lanes + lane;
-                    self.eval_all(&mut scratch, |s| load(s, e), &scalar, |_, _| {});
+                    self.eval_all(&mut scratch, None, |s| load(s, e), &scalar, |_, _| {});
                     let idx = cu * lanes + lane;
                     acc[idx] = addend(acc[idx], &scratch.vals);
                 }
@@ -759,7 +787,7 @@ impl VecKernel {
         while i + lanes <= n {
             for (lane, a) in acc.iter_mut().take(lanes).enumerate() {
                 let e = i + lane;
-                self.eval_all(&mut scratch, |s| load(s, e), &scalar, |_, _| {});
+                self.eval_all(&mut scratch, None, |s| load(s, e), &scalar, |_, _| {});
                 *a = addend(*a, &scratch.vals);
             }
             i += lanes;
@@ -1005,4 +1033,66 @@ pub fn op_produces_value(op: &VecOp) -> bool {
         op,
         VecOp::Store { .. } | VecOp::Splat { .. } | VecOp::Const { .. }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `s0 = a; s1 = b; t = s0; s2 = t`: two stores to streams 0 and 1, then a reload of stream 0.
+    fn reload_after_two_stores() -> VecKernel {
+        VecKernel {
+            name: Symbol(0),
+            lane: VecLane::F32,
+            streams: 3,
+            scalars: 2,
+            unroll: 1,
+            reduce: None,
+            ops: vec![
+                VecOp::Splat { scalar: 0 },
+                VecOp::Store { stream: 0, val: 0 },
+                VecOp::Splat { scalar: 1 },
+                VecOp::Store { stream: 1, val: 2 },
+                VecOp::Load { stream: 0 },
+                VecOp::Store { stream: 2, val: 4 },
+            ],
+        }
+    }
+
+    /// The value stream 2 receives, with `alias` as the classes (`None`: `eval_lane_with_scratch`).
+    fn reloaded(k: &VecKernel, alias: Option<&[u32]>) -> f32 {
+        let mut scratch = VecKernelScratch::<f32>::default();
+        let mut out = None;
+        let scalar = |s: u32| [1.0f32, 2.0][s as usize];
+        let load = |_: u32| -> f32 { panic!("every load here is forwarded") };
+        let store = |s: u32, v: f32| {
+            if s == 2 {
+                out = Some(v);
+            }
+        };
+        match alias {
+            Some(a) => k.eval_lane_aliased(&mut scratch, a, load, scalar, store),
+            None => k.eval_lane_with_scratch(&mut scratch, load, scalar, store),
+        }
+        out.expect("stream 2 is stored")
+    }
+
+    /// A load is served from the latest earlier store to its alias CLASS, its own stream's store
+    /// included. When streams 0 and 1 share a base, the reload of stream 0 after stream 1's store
+    /// reads stream 1's value, as memory does. A table keyed by stream returned stream 0's own
+    /// older store. Disjoint streams (the identity classes) keep per-stream forwarding.
+    #[test]
+    fn a_reload_reads_the_latest_store_to_its_alias_class() {
+        let k = reload_after_two_stores();
+        assert!(k.validate().is_empty(), "{:?}", k.validate());
+        assert_eq!(reloaded(&k, None), 1.0);
+        assert_eq!(reloaded(&k, Some(&[0, 1, 2])), 1.0);
+        assert_eq!(reloaded(&k, Some(&[0, 0, 2])), 2.0);
+        // The same with the two stores swapped: stream 0's own store is now the latest.
+        let mut swapped = k.clone();
+        swapped.ops[1] = VecOp::Store { stream: 1, val: 0 };
+        swapped.ops[3] = VecOp::Store { stream: 0, val: 2 };
+        assert_eq!(reloaded(&swapped, Some(&[0, 0, 2])), 2.0);
+        assert_eq!(reloaded(&swapped, None), 2.0);
+    }
 }
