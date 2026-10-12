@@ -149,7 +149,8 @@ impl Pass for Simplify {
                             let oty = f.value_types[l.0 as usize].clone();
                             // Do not fold a bf16/f16/f8 comparison, for the same reason `fold_bin`
                             // refuses their arithmetic: `round_float_to_ty` rounds these to the
-                            // f32 grid, not the narrow grid the backends round to at runtime. Two
+                            // f32 grid (an f8 not at all), not the narrow grid the backends round
+                            // to at runtime. Two
                             // distinct f32 literals sharing one bf16 grid point compare EQUAL when
                             // the op runs and "not equal" when folded here — an -O0/-O2 branch flip.
                             if !oty.is_sub_f32_float() {
@@ -270,11 +271,18 @@ fn set_const(f: &mut Function, bi: usize, ii: usize, cv: CV, ty: &MirType) {
 /// — e.g. `(2^24 + 1) - 2^24` is `0` in f32 but `1` in f64. (f16/bf16 are computed as f32 here, like
 /// the backends.) Applied both when a `ConstFloat` is read into the fold table and on every fold
 /// result, so an f32 operand and the running value stay at f32 precision through the whole chain.
+///
+/// An f8 constant is left at its f64 value: every backend rounds an f8 `ConstFloat` onto the 8-bit
+/// grid ONCE, from the f64 (`wukong_runtime::fp8::encode_f64`), whereas f16/bf16 constants are
+/// materialized through f32 first. Rounding an f8 literal to f32 here adds a second rounding that
+/// can move it onto an f8 midpoint — `-1.12500001` as f32 is the E5M2 tie `-1.125`, which goes to
+/// even (`-1`) where the literal itself rounds to `-1.25` — so a folded `Neg` would disagree with
+/// `-O0`. The only fold an f8 constant reaches is `Neg` (`fold_bin`, `Act::Cmp` and the float casts
+/// all decline the sub-f32 floats), and round-to-nearest-even and saturation are symmetric in the
+/// sign, so `encode(-v) == -encode(v)` and carrying the unrounded `-v` is exact.
 fn round_float_to_ty(v: f64, ty: &MirType) -> f64 {
     match ty {
-        MirType::F32 | MirType::F16 | MirType::BF16 | MirType::F8E4M3 | MirType::F8E5M2 => {
-            v as f32 as f64
-        }
+        MirType::F32 | MirType::F16 | MirType::BF16 => v as f32 as f64,
         _ => v,
     }
 }

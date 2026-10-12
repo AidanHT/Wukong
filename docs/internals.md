@@ -1623,6 +1623,10 @@ The math intrinsics compute an f8 operand in `f32` and round the result once
 `+inf` does not exist; `isnan`/`isinf`/… widen the operand first for the same reason. The optimizer
 folds neither f8 arithmetic nor f8 comparisons and never forwards an f8 store into a load
 (`simplify`, `cse::forwardable`), as for the halves; `lane_bytes`/`vector_width` have no f8 lane.
+Unlike a half's, an f8 constant stays at its exact literal value in the fold table
+(`round_float_to_ty`): the backends round it once from the `f64`, and rounding it to `f32` first can
+land it on an f8 midpoint, so the one fold it reaches, a unary minus, would round twice
+(`-1.12500001f8e5m2` printed `-1` at `-O2` and `-1.25` at `-O0`).
 
 The codec is `wukong_runtime::fp8`'s bit-level `encode_f32`/`encode_f64`/`decode_f32`: a normal
 result rounds on the source's bit pattern (add `half − 1` plus the kept lsb below the format's last

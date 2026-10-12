@@ -65,7 +65,11 @@ All notable changes to Wukong are documented here. The format is loosely based o
   produce the `f32`, and only a store rounded it to the half grid, so once mem2reg forwarded the
   value past its store, `print(i as bf16)` of 257 printed 257 at `-O2` (native and interpreter
   alike) where `-O0` printed 256. The conversion now rounds at the value, for the 8-bit floats too.
-- Fixtures: `tests/run/f8_scalar.wk`, `f8_aggregates.wk`, `f8_code_round_trip.wk`;
+- The optimizer keeps an f8 constant at its exact literal value, so folding a unary minus rounds it
+  once, as every backend does: `-1.12500001` as an `f8e5m2` is `-1.25` at every `-O` level (through
+  `f32` it was the tie `-1.125` and folded to `-1`).
+- Fixtures: `tests/run/f8_scalar.wk`, `f8_aggregates.wk`, `f8_code_round_trip.wk`,
+  `f8_negated_literal.wk`;
   `tests/fail/f8_literal_out_of_range.wk` (E0438), `f8_format_mix.wk` (E0440),
   `f8_vector_lane.wk` (E0302), `extern_f8.wk` (C0001).
 

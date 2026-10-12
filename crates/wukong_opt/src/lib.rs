@@ -1344,6 +1344,40 @@ mod tests {
     }
 
     #[test]
+    fn negated_f8_constants_round_once_from_the_literal() {
+        // Every backend rounds an f8 `ConstFloat` ONCE, from its f64 value, onto the 8-bit grid. A
+        // literal just past an f8 midpoint can sit within f32 half-ulp of it, so first rounding it
+        // to f32 lands exactly on the tie and the tie-to-even picks the other neighbour. Folding a
+        // `Neg` of such a constant must therefore not route the value through f32. Each case
+        // returns the stored code (`bits`), so the exact grid point is checked, not an approximation.
+        let cases = [
+            // 1.12500001 is above the E5M2 midpoint 1.125 of 1.0 / 1.25 -> -1.25 = 0xBD. Through
+            // f32 it is the tie 1.125 itself, which goes to the even -1.0 = 0xBC.
+            (
+                "fn main() -> i32 { let v: f8e5m2 = -1.12500001; return bits(v) as i32; }",
+                0xBD,
+            ),
+            // 61439.999 is below the E5M2 tie 61440 between 57344 and infinity -> -57344 = 0xFB.
+            // Through f32 it is 61440, which rounds to -inf = 0xFC.
+            (
+                "fn main() -> i32 { let v = -61439.999f8e5m2; return bits(v) as i32; }",
+                0xFB,
+            ),
+            // 1.06250001 is above the E4M3FN midpoint 1.0625 of 1.0 / 1.125 -> -1.125 = 0xB9.
+            // Through f32 it is the tie, which goes to the even -1.0 = 0xB8.
+            (
+                "fn main() -> i32 { let v: f8e4m3 = -1.06250001; return bits(v) as i32; }",
+                0xB9,
+            ),
+        ];
+        for (src, expect) in cases {
+            for lvl in [0, 1, 2, 3] {
+                assert_eq!(run_main_opt(src, lvl), expect as i64, "O{lvl}: {src}");
+            }
+        }
+    }
+
+    #[test]
     fn folds_and_dces_constants() {
         // main computes (2*3 + 4) entirely from constants; after -O2 the body should be tiny.
         let src = "fn main() -> i32 { let x: i32 = 2 * 3 + 4; return x; }";
