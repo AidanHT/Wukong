@@ -5,6 +5,35 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Stack-slot coloring (`gap6/stack-coloring`)
+
+- **Allocas with disjoint lifetimes share one native frame slot (N86).** The Cranelift backend
+  (JIT and `--emit=obj|exe` alike) colors frame slots greedily, largest first, so a frame holds the
+  largest set of simultaneously-live slots instead of every slot the function declares. Over
+  `tests/run` the static slot bytes drop 5.8% at `-O0` (1,721,496 -> 1,621,300; 440 of 557 programs
+  shrink) and 4.8% at `-O2` (1,679,512 -> 1,599,388; 150 shrink); `examples/` gains 0.3% / 0.1%.
+  A function in which nothing shares lowers to byte-identical code, and the interpreter oracle keeps
+  one slot per alloca, so the run corpus's interp-vs-native differential checks every coloring.
+  `WUKONG_STACK_COLOR=0` turns it off. `cargo test -p wukong_codegen_cranelift --lib
+  corpus_frame_bytes -- --ignored --nocapture` prints the report.
+- **The lifetimes are a MIR analysis, with no lifetime-marker op** (`wukong_opt::slot_lifetime`).
+  A slot is live at a point reachable from a use and able to reach one (around the whole loop when it
+  is used inside one), following its address through `gep`, `select`, block parameters, pointer
+  casts and slots it was stored into; it is dead before a counted loop that overwrites every byte of
+  it, so scratch arrays declared one after another inside a loop body stop overlapping. An address
+  stored to untracked memory, returned, cast to an integer, passed to `extern "C"` code, to a user
+  function that may retain it (`CaptureSummary`, a greatest fixpoint over the call graph) or into a
+  `@parallel` region keeps its slot live for the whole function. At `-O1`+ a shared slot holds only
+  private or only non-private slots (one Cranelift alias region per location); at `-O0`, where
+  Cranelift runs no alias analysis, they mix and the private members give up their region.
+- **Not separated yet:** scratch declared and zero-initialized at the top of a function and
+  overwritten later by a 2-D loop nest, a runtime kernel or (at `-O2`) an unrolled or fused loop stays
+  live from the top — `examples/llama_block.wk` saves 56 bytes of 305,084.
+- `tests/run/stack_color_phases.wk` prints every lane of arrays that share and of one that overlaps
+  them; unit tests cover escapes, loops, derived pointers, `@parallel` captures, vector-kernel stream
+  tables and every way a fill loop can fail to be a full overwrite, and a machine-frame probe measures
+  the frame shrinking by the two 4 KiB slots it no longer reserves.
+
 ### Source locations through MIR into native code (`gap5/native-source-locations`)
 
 - **Native-backend failures point at the source (P11.8).** A `C0002` (a slot above the native

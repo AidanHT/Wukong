@@ -46,7 +46,7 @@ Generated code calls:
 |---|---|
 | `wukong_mir`, `wukong_span`, `wukong_backend` | MIR lowering seam |
 | `wukong_runtime` | kernel symbols for JIT binding / object imports |
-| `wukong_opt` | `alias` provenance → Cranelift `AliasRegion` on loads/stores |
+| `wukong_opt` | `alias` provenance → Cranelift `AliasRegion` on loads/stores; `slot_lifetime` → stack-slot coloring |
 | `cranelift-*` 0.124 | codegen, frontend, JIT, object emission |
 | `iced-x86` | raw AVX2 assembler (`code_asm` feature) |
 | `rayon` | optional parallel per-function codegen in `emit_object` (`WUKONG_PAR_CODEGEN=0` kills) |
@@ -55,7 +55,7 @@ Generated code calls:
 
 | path | contents |
 |---|---|
-| [`src/`](src/) | `lib.rs` (lowering + JIT + object), `backend.rs`, `avx2.rs`, tests |
+| [`src/`](src/) | `lib.rs` (lowering + JIT + object), `backend.rs`, `avx2.rs`, `stack_color.rs` (frame-slot sharing; `WUKONG_STACK_COLOR=0` turns it off), tests |
 
 ## Tests
 
