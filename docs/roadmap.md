@@ -350,6 +350,13 @@ line table built from them is not emitted yet.
   semantics of both is "a buffer filled from the file". Empty on any failure.
   `tests/run/io_map.wk`; runtime tests check a view mapped from inside a 64 KiB granule, the
   copy fallback and copy-on-write.
+- **Run-time file and tensor names** (2026-10-12) — every path / tensor-name operand also takes a
+  `[]u8` / `[u8; N]` buffer holding a NUL-terminated string (what `sprintf` writes), through a
+  `wukong_rt_cstr` check that turns an unterminated buffer into the null string
+  (`tests/run/io_buffer_names.wk`). `examples/gpt2_infer.wk` uses it to load all 196 GPT-2 tensors
+  by name from the safetensors export (`h{l}.wq`, …) into the flat buffer it computes on — logits
+  bit-identical to the flat-blob load. A string literal is now fresh storage to the matmul
+  recognizers' alias planner, so a `*u8` path local no longer costs its function every kernel.
 - **Counter-based RNG** — `rand_u32` / `rand_f32` / `randn_f32(seed, ctr)` are Philox4x32-10 (key
   = the seed's two words, counter = `(ctr lo, ctr hi, 0, 0)`; `rand_u32(0, 0)` is Random123's known
   answer `0x6627e8d5`), lowered to plain integer MIR (`zext`/`mul`/`lshr`/`trunc`/`xor`), so they are

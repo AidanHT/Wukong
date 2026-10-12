@@ -40,7 +40,11 @@ import struct
 import sys
 
 import numpy as np
-import torch
+
+try:
+    import torch
+except ImportError:  # `--safetensors-from-blob` is the one mode that runs without PyTorch
+    torch = None
 
 # ------------------------------------------------------------------------------------------
 # Frozen config (see scratchpad/gpt2-layout.md).
@@ -69,8 +73,13 @@ CONFIG_WK = os.path.join(REPO, "examples", "gpt2_config.wk")
 # exporter and the verifier agree on one directory on ANY checkout: $GPT2_DATA_DIR, then argv[1],
 # then `<this repo>/data/gpt2`. It must stay a real path on the running machine — the .wk programs
 # read the RELATIVE path `data/gpt2/...`, so exporting anywhere else makes them print -1/-2.
+# `--safetensors-from-blob` (anywhere on the command line) rewrites only gpt2_124m.safetensors, from
+# an existing flat blob: an export made before this script wrote safetensors gains the named file
+# without PyTorch or a download (see `safetensors_from_blob`).
+FROM_BLOB = "--safetensors-from-blob" in sys.argv[1:]
+ARGS = [a for a in sys.argv[1:] if a != "--safetensors-from-blob"]
 OUT_DIR = os.environ.get("GPT2_DATA_DIR") or (
-    sys.argv[1] if len(sys.argv) > 1 else os.path.join(REPO, "data", "gpt2")
+    ARGS[0] if ARGS else os.path.join(REPO, "data", "gpt2")
 )
 # MANIFEST.md is a small COMMITTED artifact and belongs next to the blobs it describes, so it is
 # written into OUT_DIR. When OUT_DIR is the default `<repo>/data/gpt2` that is the version-
@@ -166,6 +175,20 @@ LAYER_TENSORS = [
     ("W1", DFF * D), ("B1", DFF),
     ("W2", D * DFF), ("B2", D),
 ]
+
+
+def layout_shapes():
+    """`(name, shape)` of every tensor in the frozen blob order — exactly `build_layout`'s names and
+    shapes (`main` asserts the two agree), derived from the config alone, so the flat blob can be
+    split by name without loading the model."""
+    mats = {"WQ": (D, D), "WK": (D, D), "WV": (D, D), "WO": (D, D),
+            "W1": (DFF, D), "W2": (D, DFF)}
+    out = [("wte", (VOCAB, D)), ("wpe", (POS, D))]
+    for l in range(LAYERS):
+        for key, n in LAYER_TENSORS:
+            out.append((f"h{l}.{key.lower()}", mats.get(key, (n,))))
+    out += [("ln_f_g", (D,)), ("ln_f_b", (D,))]
+    return out
 
 
 def compute_offsets():
@@ -431,13 +454,37 @@ def emit_manifest(offs, parts):
 # ------------------------------------------------------------------------------------------
 # Main.
 # ------------------------------------------------------------------------------------------
+def safetensors_from_blob():
+    """Write gpt2_124m.safetensors from the flat blob already in OUT_DIR: split it by
+    `layout_shapes` (the blob is the tensors back to back in that order), write the file with the
+    same `write_safetensors` a full export uses, and re-read it with `check_safetensors`. Needs only
+    numpy; the blob itself must come from a full export."""
+    offs = compute_offsets()
+    blob = np.fromfile(WEIGHTS_BIN, dtype="<f4")
+    assert blob.size == offs["TOTAL_WEIGHTS"], \
+        f"{WEIGHTS_BIN}: {blob.size} f32, expected {offs['TOTAL_WEIGHTS']}"
+    parts, off = [], 0
+    for name, shape in layout_shapes():
+        n = int(np.prod(shape))
+        parts.append((name, blob[off:off + n].reshape(shape)))
+        off += n
+    assert off == blob.size
+    write_safetensors(WEIGHTS_ST, parts)
+    check_safetensors(WEIGHTS_ST, parts, blob)
+
+
 def main():
+    if torch is None:
+        raise SystemExit("export_gpt2.py needs PyTorch and transformers; only "
+                         "--safetensors-from-blob runs without them")
     os.makedirs(OUT_DIR, exist_ok=True)
     os.makedirs(os.path.dirname(MANIFEST), exist_ok=True)
     offs = compute_offsets()
 
     # --- build layout + flat blob ---
     model, parts = build_layout()
+    got = [(name, tuple(arr.shape)) for name, arr in parts]
+    assert got == layout_shapes(), "build_layout and layout_shapes disagree"
 
     # Cross-check the running offsets against the computed formula (proves the offset
     # table that lands in gpt2_config.wk matches the actual concatenation order).
@@ -514,4 +561,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if FROM_BLOB:
+        safetensors_from_blob()
+    else:
+        main()

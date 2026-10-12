@@ -166,10 +166,10 @@ not duplicate them. In summary, Wukong:
 
 Wukong compiles and runs **GPT-2 124M inference end-to-end as an ordinary `.wk` program**
 ([`examples/gpt2_infer.wk`](examples/gpt2_infer.wk)) on the native Cranelift-JIT backend. It loads the
-**real pretrained OpenAI GPT-2 weights** — all **124,439,808** parameters — from a flat little-endian
-f32 blob on disk (exported from HuggingFace `transformers` by
-[`tools/export_gpt2.py`](tools/export_gpt2.py)) through the new `read_f32` file-I/O intrinsic, with the
-prompt's token ids read via `read_i32`, and runs the full forward pass in Wukong source: token +
+**real pretrained OpenAI GPT-2 weights** — all **124,439,808** parameters — **by name** from a
+safetensors file on disk (exported from HuggingFace `transformers` by
+[`tools/export_gpt2.py`](tools/export_gpt2.py)): each tensor goes through `st_read_f32`, which checks
+its name, dtype and element count as it loads, with the prompt's token ids read via `read_i32`, and runs the full forward pass in Wukong source: token +
 learned positional embedding, 12 pre-LayerNorm decoder blocks (biased QKV, 12-head causal attention,
 tanh-GELU MLP, residuals), the final LayerNorm, and the tied LM head → logits `[5, 50257]`.
 
@@ -177,13 +177,15 @@ tanh-GELU MLP, residuals), the final LayerNorm, and the tied LM head → logits 
 logits with the exported HuggingFace reference and reports `max|Δ| / max|ref|`. Its existing gate
 requires relative error at most `1e-3` and both last-position argmaxes to equal **1757 (" John")**
 for *"Hello, my name is"*. Earlier documentation quoted conflicting relative errors without a
-shared run receipt; those figures are withdrawn. The current CPU closeout has not rerun the full
-model, so it establishes no fresh GPT-2 numerical result.
+shared run receipt; those figures are withdrawn. One fresh receipt (2026-10-12,
+`gap6/tensor-io-gguf`, `--backend=native` at `-O2` and `-O0`, weights loaded by name from the
+safetensors file): `verify_gpt2.py` reports relative error `1.46e-6` and argmax 1757, and the logits
+are bit-identical to the same program's flat-blob load.
 
 Reproduce it — one export, one run, one check — from the repo root:
 
 ```sh
-python tools/export_gpt2.py                             # HF GPT-2 → data/gpt2/*.bin (+ reference logits)
+python tools/export_gpt2.py                             # HF GPT-2 → data/gpt2/ (.safetensors, .bin, reference logits)
 wukongc --run --backend=native examples/gpt2_infer.wk   # runs the model, writes logits to disk
 python tools/verify_gpt2.py                             # reports this run's error and argmax; exits nonzero on failure
 ```

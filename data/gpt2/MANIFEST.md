@@ -17,6 +17,7 @@ GELU = tanh-approx ('gelu_new'). LM head is tied to `wte`.
 | file | dtype | shape | bytes |
 |------|-------|-------|-------|
 | gpt2_124m_weights.bin | f32 LE | [124439808] (flat) | 497759232 |
+| gpt2_124m.safetensors | F32 | every tensor below, by name and shape | 497759232 + header |
 | gpt2_tokens.bin | i32 LE | [5] | 20 |
 | gpt2_ref_logits.bin | f32 LE | [5, 50257] | 1005140 |
 

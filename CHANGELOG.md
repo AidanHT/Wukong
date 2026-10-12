@@ -53,6 +53,12 @@ All notable changes to Wukong are documented here. The format is loosely based o
   through the new `wukong_rt_cstr(data, len)`, which yields the null string for a buffer with no
   NUL (an open failure, or the empty name) instead of letting the runtime read past its end.
   `tests/run/io_buffer_names.wk`.
+- **`examples/gpt2_infer.wk` loads GPT-2 by name** from `data/gpt2/gpt2_124m.safetensors`: each of
+  the 196 tensors goes through `st_read_f32` into its slot of the flat weight buffer, checked for
+  name, dtype and exact element count; the compute is unchanged, and the run's logits are
+  bit-identical to the flat-blob load (`tools/verify_gpt2.py`: rel 1.46e-6, argmax 1757).
+  `tools/export_gpt2.py --safetensors-from-blob` writes the safetensors file from an existing blob
+  without PyTorch.
 - **Fix: a `*u8` path local no longer costs a function its kernels.** The alias planner classified
   a string literal's initializer as unknown storage, so `let p: *u8 = "w.bin";` tainted the whole
   function and every recognized GEMM / elementwise kernel in it fell back to its scalar loop
