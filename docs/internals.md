@@ -1297,11 +1297,14 @@ with its **source** name — not the `_WK<len><name>` symbol of an executable, s
 a function by `DW_AT_linkage_name` when it has one and then `break f` finds nothing — its declaration
 file and line, `low_pc`/`high_pc`, and `DW_AT_external` for an exported symbol; a vector kernel is
 `DW_AT_artificial`. The entry thunk and the C `main` get call frames but no subprogram, so `main`
-names one function, the user's. Each user function is one line-program sequence: offset 0 is the
-declaration line; each srcloc range whose `ValueId` is located starts a row at its line and column
-(the first one `prologue_end`, identical neighbours merged, two rows at one address resolved to the
-later); a range with no location continues the row before it, so no address has line 0; an inlined
-callee's code keeps the callee's lines. A file joins the line program's file table on first use,
+names one subprogram, the user's (gdb still offers the C `main` symbol as a second `break main`
+location). Each user function is one line-program sequence: offset 0 is the declaration line; each
+srcloc range whose `ValueId` is located starts a row at its line and column (identical neighbours
+merged, two rows at one address resolved to the later); a range with no location continues the row
+before it, so no address has line 0; an inlined callee's code keeps the callee's lines. The first
+row after the declaration's — past the frame setup and an `-O0` function's parameter spills, which
+are located at the declaration — is `prologue_end`, so a debugger's `break f` stops at the body's
+first statement. A file joins the line program's file table on first use,
 split at its last `/` or `\` into a directory entry and a name, so a multi-file program's table
 names every file it reads. `.debug_frame` has one CIE (`TargetIsa::create_systemv_cie`) and one FDE
 per function Cranelift compiled; the System V rules describe the hardware frame, so they serve a
@@ -1321,9 +1324,9 @@ the source map is not threaded through `run_train`).
 What a debugger gets (MSYS2 gdb 15 on a `-g` executable): `break fib`, `break fib.wk:7`, `next` by
 line, `info frame` with the saved registers, and a backtrace `fib () at fib.wk:7` ← `fib () at
 fib.wk:10` ← `main () at fib.wk:14` ← `wukong_entry_thunk` ← the Rust runtime frames. Not emitted:
-variables, types, lexical scopes and inlined-subroutine entries, so it cannot print a local. gdb
-places a function breakpoint at the function's first instruction (the declaration line): it trusts
-a line table's prologue marks only from producers it knows.
+variables, types, lexical scopes and inlined-subroutine entries, so it cannot print a local.
+`break fib` stops at `fib.wk:7`, the body's first statement, because gdb 13 and later place a
+function breakpoint at the line table's `prologue_end` mark.
 
 **Tests.** `dwarf_tests` builds objects on an ISA of each triple (`x86_64-pc-windows-msvc`,
 `x86_64-unknown-linux-gnu`) through `emit_object_for_isa`, so both containers are covered on any

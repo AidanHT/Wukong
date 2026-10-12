@@ -539,7 +539,17 @@ fn line_table_maps_functions_to_their_source_lines() {
             assert_eq!(rows_in(&d, scale)[0].address, scale.low);
             assert_eq!(scale_lines[0], scale_decl);
             assert_eq!(main_lines[0], main_decl);
-            assert!(rows_in(&d, main).iter().any(|r| r.prologue_end));
+            // ... `prologue_end` marks exactly one row, the body's first statement, past the
+            // frame setup and the parameter spills (located at the declaration) ...
+            for (s, first) in [(scale, "let y = x * k;"), (main, "let mut acc: i32 = 0;")] {
+                let marked: Vec<&LineRow> = rows_in(&d, s)
+                    .into_iter()
+                    .filter(|r| r.prologue_end)
+                    .collect();
+                assert_eq!(marked.len(), 1, "{triple}: {s:?} {marked:?}");
+                assert_eq!(marked[0].line, line_of(FIXTURE, first), "{triple}: {s:?}");
+                assert!(marked[0].address > s.low, "{triple}: {s:?}");
+            }
             // ... and each statement is there, at its line.
             for needle in ["let y = x * k;", "return y + 1;"] {
                 let l = line_of(FIXTURE, needle);

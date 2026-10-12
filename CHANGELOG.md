@@ -16,12 +16,13 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `break fib` finds `fib`), its declaration file and line, and `low_pc`/`high_pc`. The line
   program maps every function's machine code to `file:line:column` through the per-instruction
   source locations `gap5/native-source-locations` landed: the prologue is the declaration line,
-  each located range starts a row (the first marked `prologue_end`), code an optimizer pass
+  each located range starts a row, the body's first statement is marked `prologue_end` (so
+  `break fib` stops there, past the frame setup and the parameter spills), code an optimizer pass
   created without a location continues the row before it, and inlined code keeps its callee's
   lines. `.debug_frame` carries an FDE for every Cranelift-compiled function, the executable's
   entry thunk and C `main` included, from Cranelift's own unwind information, so a debugger
-  unwinds through every Wukong frame. With MSYS2 gdb 15 on a `-g` executable: `break fib`,
-  `break fib.wk:7`, `next` by source line, and a backtrace `fib () at fib.wk:7` ← `fib () at
+  unwinds through every Wukong frame. With MSYS2 gdb 15 on a `-g` executable: `break fib` (it
+  stops at `fib.wk:7`), `break fib.wk:7`, `next` by source line, and a backtrace `fib () at fib.wk:7` ← `fib () at
   fib.wk:10` ← `main () at fib.wk:14` ← `wukong_entry_thunk` ← the Rust runtime.
 - **The machine code does not change.** Without `-g` an object is byte-identical to before (nothing
   is recorded); with it, `.text` is byte-identical to the plain object's (both pinned in
@@ -36,7 +37,8 @@ All notable changes to Wukong are documented here. The format is loosely based o
   exactly its function with the caller's frame (`CFA = rsp + 8`, return address at `CFA - 8`) at
   its first instruction. When GNU `objdump` runs, its `--dwarf=decodedline` must show the same
   lines (skipped when absent). Every `tests/run` program compiles with `-g` exactly when it
-  compiles without it, at `-O0` and `-O2`, and `objdump` decodes all 560 `-g -O2` objects cleanly.
+  compiles without it, at `-O0` and `-O2`, and `objdump --dwarf` (info, lines, ranges, strings,
+  frames) decodes all 1120 of those `-g` objects without a warning.
 - **A `-g` executable keeps the DWARF.** On the MSVC host `link.exe` keeps unknown sections but
   truncates their names to eight characters in the image (`.debug_line` → `.debug_l`), where no
   debugger looks; a `-g` link therefore runs rustc with the toolchain's own `rust-lld` as `lld-link`

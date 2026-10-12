@@ -25,8 +25,9 @@
 //! that into a file, a line and a column. Rows:
 //!
 //! * offset 0 is the function's declaration line (the prologue);
-//! * each located range starts a row at its own line and column, the first one marked
-//!   `prologue_end`;
+//! * each located range starts a row at its own line and column; the first row after the
+//!   declaration's (past the frame setup and an `-O0` function's parameter spills, which are
+//!   located at the declaration) is marked `prologue_end`, where a debugger's `break f` stops;
 //! * a range whose value has no location (values a pass other than inlining and unrolling created,
 //!   about a quarter of them at `-O2`) continues the row before it rather than claiming a line;
 //! * an inlined callee's code keeps the callee's lines, which is what a line table means for
@@ -308,7 +309,10 @@ fn function_rows(
             prologue_end: false,
         });
     }
-    let mut in_body = false;
+    // `prologue_end` goes on the first row after the declaration's: the first code of the body
+    // proper, past the frame setup and anything located at the declaration itself (an `-O0`
+    // function's parameter spills), which is where a debugger's `break f` should stop.
+    let mut marked = false;
     for &(start, end, bits) in srclocs {
         if start >= end {
             continue;
@@ -320,19 +324,27 @@ fn function_rows(
             // Unknown: the row before covers it.
             continue;
         };
-        let row = Row {
+        let mut row = Row {
             offset: u64::from(start),
             file,
             line,
             column,
-            prologue_end: !in_body && start > 0,
+            prologue_end: false,
         };
-        in_body = true;
         match rows.last_mut() {
             Some(last) if (last.file, last.line, last.column) == (file, line, column) => {}
-            // Two rows at one address: the later one is the location of that code.
-            Some(last) if last.offset == row.offset => *last = row,
-            _ => rows.push(row),
+            // Two rows at one address (ranges never overlap, so this is the declaration's row at
+            // offset 0 and a function with no prologue): the later one is that code's location.
+            Some(last) if last.offset == row.offset => {
+                row.prologue_end = !marked;
+                marked = true;
+                *last = row;
+            }
+            _ => {
+                row.prologue_end = !marked;
+                marked = true;
+                rows.push(row);
+            }
         }
     }
     rows
