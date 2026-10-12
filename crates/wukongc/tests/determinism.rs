@@ -176,8 +176,9 @@ fn emit_obj_o2(
 /// hermeticity arm below is grounded rather than guessing: `WUKONG_NO_RECOGNIZE` removes recognizer
 /// dispatch (`wukong_driver`), `WUKONG_P4_NO_256` disables the 256-bit veckernel recipe
 /// (`wukong_mir_build` and `wukong_opt`), `WUKONG_VEC256_MIN_TRIP` moves the optimizer's 256-bit
-/// trip gate, and the four optimizer kill-switches gate vectorization, unrolling, the
-/// induction-variable ramp and straight-line SLP (`wukong_opt`). Pure tracing switches
+/// trip gate, and the five optimizer kill-switches gate vectorization, unrolling, the
+/// induction-variable ramp, straight-line SLP and the vectorizer's lane-serial regions
+/// (`wukong_opt`). Pure tracing switches
 /// (`WUKONG_VEC_TRACE`, `WUKONG_SLP_TRACE`), the linker
 /// (`WUKONG_BUILD_RUSTC`), the optimizer's thread count (`WUKONG_OPT_THREADS`, which the corpus
 /// sweeps vary on purpose) and the GPU-only variables are deliberately excluded: they do not alter
@@ -189,6 +190,7 @@ const MIR_AFFECTING_ENV: &[&str] = &[
     "WUKONG_NO_UNROLL",
     "WUKONG_NO_IV_RAMP",
     "WUKONG_NO_SLP",
+    "WUKONG_NO_LANE_SERIAL",
     "WUKONG_VEC256_MIN_TRIP",
 ];
 

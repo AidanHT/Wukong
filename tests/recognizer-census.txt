@@ -579,6 +579,10 @@ vec4_speculation_raw_pointer.wk: veckernel*2 wukong_rt_alloc wukong_rt_alloc*2
 vec4_zero_trip_reductions.wk: veckernel*5 wukong_rt_alloc wukong_rt_alloc*19 wukong_rt_free wukong_rt_free*19
 vec5_scatter.wk: wukong_rt_alloc wukong_rt_alloc*16 wukong_rt_free wukong_rt_free*16
 vec5_slp_bundles.wk:
+vec7_call_lanes.wk: wukong_rt_alloc wukong_rt_alloc*7
+vec7_checked_gather.wk: wukong_rt_alloc wukong_rt_alloc*13
+vec7_checked_gather_trap.wk: wukong_rt_alloc wukong_rt_alloc*7
+vec7_lane_serial.wk: wukong_rt_alloc wukong_rt_alloc*21
 vec_argmax_reductions.wk: wukong_rt_alloc wukong_rt_alloc*5 wukong_rt_free wukong_rt_free*5
 vec_bf16_lanes.wk: wukong_rt_alloc wukong_rt_alloc*7 wukong_rt_fmt_int wukong_rt_fmt_int*5 wukong_rt_fmt_str wukong_rt_fmt_str*10 wukong_rt_free wukong_rt_free*7
 vec_exp.wk:
