@@ -19,15 +19,15 @@
 //!   body's type (and a body that then uses `return` is `E0419` too: nothing fixes what it
 //!   returns). The closure's type `fn(P..) -> R` must equal the expected one after the call's
 //!   generic binding — the existing `E0401` of `check_fn_value_args`.
-//! * **Captures.** Every enclosing local the body reads is captured BY VALUE, copied where the
-//!   closure is created (when the call evaluates the argument, or at the `let`). Only what can be
-//!   copied into a scalar parameter may be captured: a scalar, a C-style enum, a raw pointer or a
-//!   reference. Anything else — an aggregate, a slice, a tensor, a vector, the enclosing function's
-//!   function-typed parameter, a value whose type names an enclosing generic — is `E0418`, as is
-//!   any use of an enclosing generic parameter (the lifted function is not generic). A capture is
-//!   read-only: assigning it or taking `&mut` of it is `E0304`; writing THROUGH a captured pointer
-//!   is the way to update the caller's data. A closure-bound local is captured through its closure
-//!   ([`ClosureInfo::bound`]).
+//! * **Captures.** Every enclosing local the body reads is captured. One it only reads is COPIED
+//!   where the closure is created (when the call evaluates the argument, or at the `let`): a
+//!   scalar, an enum, a raw pointer or reference, a fixed-size array, a tuple or a struct. One it
+//!   writes is captured BY REFERENCE ([`ClosureInfo::by_ref`], [`Sema::note_capture_write`]): the
+//!   closure and the enclosing function share it, and its own mutability rules apply (`E0304` for
+//!   an immutable binding, as outside the closure). A slice, `str`, tensor or vector, the enclosing
+//!   function's function-typed parameter, and a value whose type names an enclosing generic are
+//!   `E0418`, as is any use of an enclosing generic parameter (the lifted function is not generic).
+//!   A closure-bound local is captured through its closure ([`ClosureInfo::bound`]).
 //! * **Control.** `return` leaves the closure; `break`/`continue` cannot cross it (`E0303`, the
 //!   enclosing loops are hidden while its body is checked). Nested closures are allowed: a name an
 //!   inner closure captures is captured by every closure it crosses.
@@ -47,9 +47,12 @@ pub struct ClosureInfo {
     pub params: Vec<Ty>,
     /// Its return type.
     pub ret: Ty,
-    /// Every enclosing local it captures (by value, copied when the closure is created), in order
-    /// of first use, with its type.
+    /// Every enclosing local it captures, in order of first use, with its type. A capture is
+    /// copied when the closure is created unless it is in [`Self::by_ref`].
     pub captures: Vec<(Symbol, Ty)>,
+    /// The captures the closure writes (`c = ..`, `&mut c`, `a[i] = ..`): captured BY REFERENCE,
+    /// so the closure and the enclosing function share the variable.
+    pub by_ref: Vec<Symbol>,
     /// The captures that are locals bound to a closure (`let f = |..| ..;` outside, `f(x)` inside),
     /// with the literal each denotes: the lifted function receives that closure's captures instead.
     pub bound: Vec<(Symbol, NodeId)>,
@@ -61,6 +64,8 @@ pub(crate) struct ClosureCtx {
     /// below this index belongs to the enclosing code, so reading it is a capture.
     base: usize,
     captures: Vec<(Symbol, Ty)>,
+    /// The captures written in the body (published as [`ClosureInfo::by_ref`]).
+    by_ref: Vec<Symbol>,
     /// The captures that are closure-bound locals (published as [`ClosureInfo::bound`]).
     bound: Vec<(Symbol, NodeId)>,
     /// Names already reported (`E0418`) for this closure: one report per closure and name.
@@ -328,6 +333,7 @@ impl Sema<'_> {
         self.closure_ctx.push(ClosureCtx {
             base: self.scopes.len(),
             captures: Vec::new(),
+            by_ref: Vec::new(),
             bound: Vec::new(),
             reported: Vec::new(),
             failed: false,
@@ -537,6 +543,7 @@ impl Sema<'_> {
                     params: ptys.clone(),
                     ret: ret.clone(),
                     captures: ctx.captures,
+                    by_ref: ctx.by_ref,
                     bound: ctx.bound,
                 },
             );
@@ -655,8 +662,9 @@ impl Sema<'_> {
             .with_code("E0418")
             .primary(span, "captured here")
             .note(
-                "a closure captures by value, and only a scalar, a C-style enum, a raw pointer \
-                 or a reference can be copied into it",
+                "a closure copies what it captures: a scalar, an enum, a pointer or reference, a \
+                 fixed-size array, a tuple or a struct; a slice, `str`, tensor or SIMD vector \
+                 views or holds storage a copy cannot carry",
             )
             .help(format!(
                 "capture a pointer instead (`let p{nm} = &{nm};` before the call, then \
@@ -721,56 +729,42 @@ impl Sema<'_> {
         );
     }
 
-    /// `E0304` for a write to a capture: `c = ..` / `c op= ..` (`borrow == false`) or `&mut c`
-    /// (`borrow == true`) where `c` is a bare name the innermost closure captured. A projection
-    /// (`p.x = ..`, `(*p)[i] = ..`) writes through a captured pointer and is not checked here.
-    /// Returns whether it reported.
-    pub(crate) fn check_capture_write(&mut self, target: &Expr, borrow: bool) -> bool {
-        let Some(base) = self.closure_ctx.last().map(|c| c.base) else {
-            return false;
-        };
-        let ExprKind::Path(p) = &target.kind else {
-            return false;
-        };
-        if !p.is_single() {
-            return false;
+    /// A write to the place `target` (`c = ..`, `c op= ..`, `&mut c`, `a[i] = ..`, `s.f = ..`,
+    /// `atomic_add(a[i], ..)`, a `mut self` method on `v`): when its root is a variable a closure
+    /// being checked captures, that closure captures it BY REFERENCE — it receives a pointer to the
+    /// variable, so the write reaches the enclosing function (and every closure in between captures
+    /// it the same way). A projection through a pointer or reference (`p.x = ..`, `(*p)[i] = ..`)
+    /// writes a pointee, not the captured variable, which stays a copy.
+    pub(crate) fn note_capture_write(&mut self, target: &Expr) {
+        if self.closure_ctx.is_empty() {
+            return;
         }
-        let name = p.first().sym;
-        match self.lookup_local_depth(name) {
-            Some((depth, _)) if depth < base => {}
-            _ => return false,
-        }
-        if !self.inst_subst.is_empty() {
-            return true;
-        }
-        let nm = self.sym_str(name).to_string();
-        let (msg, label) = if borrow {
-            (
-                format!(
-                    "cannot borrow `{nm}` mutably: the closure captured a copy of it, which is \
-                     read-only"
-                ),
-                "mutable borrow of a captured value",
-            )
-        } else {
-            (
-                format!(
-                    "cannot assign to `{nm}`: the closure captured a copy of it, which is \
-                     read-only"
-                ),
-                "assignment to a captured value",
-            )
+        let Some(name) = self.written_root(target) else {
+            return;
         };
-        self.diags.push(
-            Diagnostic::error(msg)
-                .with_code("E0304")
-                .primary(target.span, label)
-                .help(format!(
-                    "to update the caller's variable, capture a pointer to it: `let p{nm} = &mut \
-                     {nm};` before the call, then `*p{nm} = ..` in the closure"
-                )),
-        );
-        true
+        let Some((depth, _)) = self.lookup_local_depth(name) else {
+            return;
+        };
+        for c in &mut self.closure_ctx {
+            if depth < c.base && !c.by_ref.contains(&name) {
+                c.by_ref.push(name);
+            }
+        }
+    }
+
+    /// The variable whose own storage a write to `e` changes, if `e` is a name or a field / element
+    /// projection of one that does not pass through a pointer or reference.
+    fn written_root(&self, e: &Expr) -> Option<Symbol> {
+        match &e.kind {
+            ExprKind::Path(p) if p.is_single() => Some(p.first().sym),
+            ExprKind::Field { base, .. }
+            | ExprKind::TupleField { base, .. }
+            | ExprKind::Index { base, .. } => match self.types.get(&base.id) {
+                Some(Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Slice(_)) => None,
+                _ => self.written_root(base),
+            },
+            _ => None,
+        }
     }
 
     /// Whether the assignment target `target` is a bare closure-bound local (`f = ..`).
@@ -830,12 +824,17 @@ impl Sema<'_> {
                 }
             }
             Ty::Named(n) if self.generics.contains(n) => Err(NoCopy::Generic),
+            // A C-style enum is its discriminant; a struct or a data-carrying enum is copied whole.
             Ty::Named(n) => match self.defs.lookup(*n).map(|d| &d.kind) {
-                Some(DefKind::Enum(vs)) if vs.iter().all(|v| v.payload.is_unit()) => Ok(()),
+                Some(DefKind::Enum(_) | DefKind::Struct(_)) => Ok(()),
                 _ => Err(NoCopy::Value),
             },
             Ty::Fn { .. } => Err(NoCopy::FnParam),
             _ if self.mentions_enclosing_generic(ty) => Err(NoCopy::Generic),
+            // A fixed-size array or a tuple is copied whole, into a buffer the lifted function
+            // receives by pointer. A `shared` (GPU block-shared) array is not a value to copy, and
+            // an element whose extent is only known at run time cannot be laid out.
+            Ty::Array { shared: false, .. } | Ty::Tuple(_) if !has_runtime_extent(ty) => Ok(()),
             _ => Err(NoCopy::Value),
         }
     }
@@ -994,11 +993,11 @@ mod tests {
 
     #[test]
     fn uncopyable_captures_are_e0418() {
-        // An array.
+        // A slice views storage a copy cannot carry.
         assert_eq!(
             error_codes(&format!(
-                "{APPLY} fn main() -> i32 {{ let a: [f32; 2] = [1.0, 2.0]; \
-                 return apply(|x| x + a[0], 1.0) as i32; }}"
+                "{APPLY} fn main() -> i32 {{ let s = alloc_f32(2); \
+                 let r = apply(|x| x + s[0], 1.0) as i32; free(s); return r; }}"
             )),
             vec!["E0418"]
         );
@@ -1028,14 +1027,33 @@ mod tests {
             )),
             Vec::<&str>::new()
         );
-        // A pointer to the array is the way to read it.
+        // A pointer to the slice is the way to read it.
         assert_eq!(
             error_codes(&format!(
-                "{APPLY} fn main() -> i32 {{ let a: [f32; 2] = [1.0, 2.0]; let pa = &a; \
-                 return apply(|x| x + (*pa)[1], 1.0) as i32; }}"
+                "{APPLY} fn main() -> i32 {{ let s = alloc_f32(2); let ps = &s; \
+                 let r = apply(|x| x + (*ps)[1], 1.0) as i32; free(s); return r; }}"
             )),
             Vec::<&str>::new()
         );
+    }
+
+    /// An array, a tuple, a struct and a data-carrying enum are copied whole: each is a capture
+    /// of its own type, read in the body like the original.
+    #[test]
+    fn aggregates_are_captured_by_value() {
+        let src = format!(
+            "{APPLY} struct P {{ x: f32, y: f32 }} enum E {{ A(f32), B }} \
+             fn main() -> i32 {{ let w: [f32; 2] = [1.0, 2.0]; let t = (3.0, 4.0); \
+             let p = P {{ x: 5.0, y: 6.0 }}; let e = E::A(7.0); \
+             let k = match e {{ E::A(v) => v, E::B => 0.0 }}; \
+             return apply(|x| x + w[1] + t.0 + p.y + k + (match e {{ E::A(v) => v, E::B => 0.0 }}), \
+             1.0) as i32; }}"
+        );
+        let got = infos(&src);
+        let mut names = got[0].0.clone();
+        names.sort();
+        assert_eq!(names, vec!["e", "k", "p", "t", "w"]);
+        assert!(got[0].1.by_ref.is_empty());
     }
 
     /// A local named in a turbofish is read for the dimension's value, so in a closure it is a
@@ -1285,30 +1303,57 @@ mod tests {
         assert_eq!(outer.bound[0].1, f_lit);
     }
 
+    /// A closure that writes a variable it captures — `c = ..`, `c += ..`, `&mut c`, an element
+    /// or field of it — captures it BY REFERENCE (`ClosureInfo::by_ref`): the variable's own
+    /// mutability rules apply, so an immutable binding is `E0304` as it is outside the closure.
+    /// Writing through a captured pointer writes a pointee, and leaves the pointer a copy.
     #[test]
     fn writing_a_capture_is_e0304_and_writing_through_one_is_not() {
+        let by_ref = |body: &str| -> Vec<String> {
+            let src = format!(
+                "{APPLY} fn bump(p: *mut f32) {{ *p = *p + 1.0; }} \
+                 struct P {{ x: f32 }} \
+                 fn main() -> i32 {{ let mut c = 1.0; let mut a: [f32; 2] = [1.0, 2.0]; \
+                 let mut p = P {{ x: 1.0 }}; let mut total = 0.0; let pt = &mut total; \
+                 let r = apply(|x| {{ {body} x }}, 1.0); \
+                 return (r + c + a[0] + p.x + total) as i32; }}"
+            );
+            let (_m, res, diags, interner) = check(&src);
+            assert!(diags.iter().all(|d| !d.is_error()), "{body}: {diags:?}");
+            let info = res.closures.values().next().expect("a closure");
+            let mut names: Vec<String> = info
+                .by_ref
+                .iter()
+                .map(|s| interner.resolve(*s).to_string())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(by_ref("c = x;"), vec!["c"]);
+        assert_eq!(by_ref("c += x;"), vec!["c"]);
+        assert_eq!(by_ref("bump(&mut c);"), vec!["c"]);
+        assert_eq!(by_ref("a[1] = x;"), vec!["a"]);
+        assert_eq!(by_ref("p.x = x;"), vec!["p"]);
+        assert_eq!(by_ref("let y = c + a[0] + p.x; c = y;"), vec!["c"]);
+        // Through a captured pointer: the pointer is a copy.
+        assert_eq!(by_ref("*pt = *pt + x;"), Vec::<String>::new());
+        // An immutable binding cannot be written, inside a closure or out.
         assert_eq!(
             error_codes(&format!(
-                "{APPLY} fn main() -> i32 {{ let mut c = 1.0; \
+                "{APPLY} fn main() -> i32 {{ let c = 1.0; \
                  return apply(|x| {{ c = x; x }}, 1.0) as i32; }}"
             )),
             vec!["E0304"]
         );
-        assert_eq!(
-            error_codes(&format!(
-                "{APPLY} fn bump(p: *mut f32) {{ *p = *p + 1.0; }} \
-                 fn main() -> i32 {{ let mut c = 1.0; \
-                 return apply(|x| {{ bump(&mut c); x }}, 1.0) as i32; }}"
-            )),
-            vec!["E0304"]
+        // A nested closure's write is a by-reference capture of every closure it crosses.
+        let src = format!(
+            "{APPLY} fn main() -> i32 {{ let mut z = 0.0; \
+             let r = apply(|x| apply(|y| {{ z = z + y; y }}, x) + z, 2.0); \
+             return (r + z) as i32; }}"
         );
-        assert_eq!(
-            error_codes(&format!(
-                "{APPLY} fn main() -> i32 {{ let mut total = 0.0; let pt = &mut total; \
-                 let r = apply(|x| {{ *pt = *pt + x; x }}, 1.0); return (r + total) as i32; }}"
-            )),
-            Vec::<&str>::new()
-        );
+        let (_m, res, diags, _i) = check(&src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(res.closures.values().all(|c| c.by_ref.len() == 1));
     }
 
     #[test]

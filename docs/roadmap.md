@@ -98,7 +98,9 @@ line table built from them is not emitted yet.
   captures copied once, at the `let`, and every use resolved statically (`E0421` for any other use,
   `E0422` for a `mut`, pattern or reassigned binding); a closure argument of a method or associated
   function (`v.map(|a| a * k)`, `V::make(..)`) specializes the method like a free function
-  (`tests/run/{closure_let,closure_method}.wk`). Interp and native agree at every `-O`.
+  (`tests/run/{closure_let,closure_method}.wk`). A closure captures an array, tuple, struct or
+  data-carrying enum by value (a copy), and a variable it writes by reference — the enclosing
+  function sees the write (`tests/run/closure_captures.wk`). Interp and native agree at every `-O`.
 - **Diagnostics and tooling surface.** `--emit=check` runs the front end (lex/parse/imports/sema,
   then the lints) and stops before lowering — a fast editor loop with no `C0001` lowering limits.
   `--error-format=json`
@@ -1520,16 +1522,15 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   field, a pointee or a multi-index tensor element inside the loop. Reading a location other
   iterations are still adding to is a race, as for a plain store.
 
-- **Closures are resolved at compile time and capture only scalars and pointers** (2026-10-13). A
-  closure is a call argument or a `let` initializer; there are no run-time function values, so a
-  closure (or a closure-bound local) cannot be returned, stored in a field, element or tuple, or
-  used as an operand. A closure argument of a call through a trait bound is not supported (a trait
-  method cannot declare a function-typed parameter). A capture is a by-value copy of a scalar,
-  C-style enum, pointer or reference; an aggregate is read through a captured pointer (`(*pa)[i]`),
-  and there are no by-reference captures (`&mut` of a capture is `E0304`). An unannotated
-  parameter is typed only from the parameter's declared function type, never from the call's other
-  arguments, so a closure passed to `fold3<T>`'s `fn(T, T) -> T` needs its parameters annotated
-  (`E0419`).
+- **Closures are resolved at compile time** (2026-10-13). A closure is a call argument or a `let`
+  initializer; there are no run-time function values, so a closure (or a closure-bound local)
+  cannot be returned, stored in a field, element or tuple, or used as an operand, and a function
+  type is not a field, element or return type. A closure argument of a call through a trait bound
+  is not supported (a trait method cannot declare a function-typed parameter). A slice, `str`,
+  tensor or vector cannot be captured (`E0418`; capture a pointer), nor the enclosing function's
+  function-typed parameter. An unannotated parameter is typed only from the parameter's declared
+  function type, never from the call's other arguments, so a closure passed to `fold3<T>`'s
+  `fn(T, T) -> T` needs its parameters annotated (`E0419`).
 
 - **Loop fusion over branching bodies is bounded** (2026-10-12). A body that still branches fuses
   only up to 8 blocks per loop, with one latch and no exit but the header's test: a `break`, an

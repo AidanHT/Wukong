@@ -206,18 +206,22 @@ fn main() -> i32 {
   body's type, and a body that uses `return` then needs the annotation (`E0419`). With `->` the body
   must be a block. The closure's type must equal the parameter's once the call binds the callee's
   generics (`E0401`).
-- **Captures.** Every enclosing local the body reads is captured **by value**, copied where the
-  closure is created — when the call evaluates that argument (left to right with the other
-  arguments), or at the `let` — so a later write to the variable is not seen; a local named as a
-  dimension in a turbofish (`sumn::<n>(..)`, `sum::<n>(..)`) is read too, and captured the same way. A
-  scalar (including `bool` and `char`), a C-style enum, a raw pointer or a reference can be captured.
-  An array, slice, tuple, struct, data-carrying enum, tensor or vector, the enclosing function's
-  function-typed parameter, and anything naming one of its generic parameters cannot (`E0418`):
-  capture a pointer instead (`let pa = &a;`, then `(*pa)[i]`), and bind a generic dimension to a
-  local first (`let n = N;`). A capture is read-only — assigning it or taking `&mut` of it is
-  `E0304` — but writing *through* a captured pointer updates the caller's data
-  (`let pt = &mut total;` … `*pt = *pt + x`). A closure-bound local is captured through its closure:
-  the inner closure receives what the outer one captured.
+- **Captures.** Every enclosing local the body reads is captured. One it only **reads** is copied
+  where the closure is created — when the call evaluates that argument (left to right with the
+  other arguments), or at the `let` — so a later write to the variable is not seen: a scalar
+  (including `bool` and `char`), an enum, a raw pointer or reference, a fixed-size array, a tuple or
+  a struct, the last four copied whole. One it **writes** — `c = ..`, `c += ..`, `&mut c`, an element
+  or field (`a[i] = ..`, `p.x = ..`), `atomic_add(a[i], ..)`, a `mut self` method — is captured **by
+  reference**: the closure and the enclosing function share the variable, so the write is seen after
+  the call (and by every later call of a `let`-bound closure), and the variable's own rules apply
+  (`E0304` for an immutable binding, exactly as outside the closure). Writing through a captured
+  pointer (`*pt = ..`) writes the pointee, and the pointer stays a copy. A local named as a
+  dimension in a turbofish (`sumn::<n>(..)`, `sum::<n>(..)`) is read too. A slice or `str` (a view
+  of storage its copy would not carry), a tensor or vector, the enclosing function's function-typed
+  parameter, and anything naming one of its generic parameters cannot be captured (`E0418`):
+  capture a pointer instead (`let ps = &s;`, then `(*ps)[i]`), and bind a generic dimension to a
+  local first (`let n = N;`). A closure-bound local is captured through its closure: the inner
+  closure receives what the outer one captured.
 - **Control flow.** `return` returns from the closure; `break`/`continue` cannot cross it (`E0303`).
   Closures nest, and a name an inner closure captures is captured by every closure around it.
 - **Attributes.** A closure body is code of the function it is written in, so that function's
@@ -225,10 +229,10 @@ fn main() -> i32 {
   and `@unchecked` apply to it as well (`tests/run/closure_strict_fp.wk`).
 
 It costs nothing at run time: the closure is lifted to a function whose leading parameters are its
-captures (each an ordinary scalar argument), and the callee is specialized per closure exactly as per named
+captures (a pointer for one it writes), and the callee is specialized per closure exactly as per named
 function (`apply$main$closure$0`), so a call through `f`, or through a closure-bound local, is a
 direct call — no function pointer, no heap environment, and inlined like any call at `-O2`.
-`tests/run/{closures,closure_let,closure_method}.wk`.
+`tests/run/{closures,closure_let,closure_method,closure_captures}.wk`.
 
 ### Generic functions and dtype-generic tensors ✅
 

@@ -3266,10 +3266,11 @@ impl<'a> Sema<'a> {
                 //     CALLER's value. `mut` opts into that (visible, in-place). A dereference breaks
                 //     the chain (`*p`, `(*p).f`) — that mutates a pointee, not the parameter — so
                 //     `assign_root_param` returns `None` and pointer/ref params stay lenient.
-                // A closure's capture is a read-only copy (`closures.rs`); nothing below applies.
-                let capture_write = self.check_capture_write(target, false);
+                // A closure that writes a variable it captures shares it with the enclosing
+                // function (captured by reference, `closures.rs`); the rules below are the
+                // variable's own.
+                self.note_capture_write(target);
                 match &target.kind {
-                    _ if capture_write => {}
                     ExprKind::Path(p) if p.is_single() => {
                         let sym = p.first().sym;
                         if let Some(decl) = self.immutable_param_decl(sym) {
@@ -4303,7 +4304,7 @@ impl<'a> Sema<'a> {
                     },
                     UnOp::RefMut => {
                         self.check_str_write(expr);
-                        self.check_capture_write(expr, true);
+                        self.note_capture_write(expr);
                         Ty::Ptr {
                             mutable: true,
                             pointee: Box::new(t),

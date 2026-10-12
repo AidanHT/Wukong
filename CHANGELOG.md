@@ -20,6 +20,14 @@ All notable changes to Wukong are documented here. The format is loosely based o
   (`pv.reduce(..)`) and as an associated function (`V::make(|i| ..)`), specializes the method per
   closure exactly like a free function (`V.map$main$closure$0`); it was `E0411`
   (`tests/run/closure_method.wk`).
+- **Added: aggregate and by-reference captures.** A closure captures an array, tuple, struct or
+  data-carrying enum by value — a copy taken where the closure is created, so a later write to the
+  original is not seen — where it was `E0418`. A variable the closure writes (`c = ..`, `c += ..`,
+  `&mut c`, `a[i] = ..`, `p.x = ..`, `atomic_add`, a `mut self` method) is captured by reference: the
+  lifted function receives a pointer to it, and the enclosing function sees every write on interp
+  and native alike; the variable's own mutability rules apply (`E0304` for an immutable binding),
+  where every write to a capture used to be `E0304`. A slice, `str`, tensor or vector still cannot
+  be captured (`E0418`, `tests/fail/closure_capture_slice.wk`; `tests/run/closure_captures.wk`).
 
 ### Source locations through MIR into native code (`gap5/native-source-locations`)
 

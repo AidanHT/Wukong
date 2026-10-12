@@ -830,6 +830,8 @@ impl Sema<'_> {
                 return Some(Ty::Error);
             }
             if !deref && self.methods.mut_receivers.contains(&target) {
+                // A closure calling a `mut self` method on a variable it captures shares it.
+                self.note_capture_write(base);
                 self.check_mut_receiver(base, method);
             }
             let ret = self.type_resolved_method(

@@ -665,19 +665,20 @@ fn main() -> i32 {
     entry!(
         "E0418",
         "closure captures a value it cannot copy",
-        "A closure captures every local of the enclosing code that its body reads, by value: the \
-         value is copied when the call evaluates the closure argument, and the closure is lifted \
-         to a function that receives each copy as a parameter. Only a value that fits one such \
-         parameter can be copied — a number, `bool` or `char`, a C-style enum, a raw pointer or a \
-         reference. An array, slice, tuple, struct, data-carrying enum, tensor or SIMD vector \
-         cannot, and neither can the enclosing function's function-typed parameter (it has no \
-         run-time value) or anything that names one of the enclosing function's generic \
-         parameters (the lifted function is not generic). To read an aggregate, capture a \
-         pointer to it (`let pa = &a;` before the call, then `(*pa)[i]` in the closure) or pass \
-         it to the callee as an ordinary parameter; to use a generic dimension, bind it to a \
-         local first (`let n = N;`).",
-        bad: "module ex.e0418\nfn apply(f: fn(f32) -> f32, x: f32) -> f32 {\n    return f(x);\n}\nfn main() -> i32 {\n    let w: [f32; 2] = [2.0, 3.0];\n    return apply(|x| x * w[1], 2.0) as i32;\n}\n",
-        good: "module ex.e0418\nfn apply(f: fn(f32) -> f32, x: f32) -> f32 {\n    return f(x);\n}\nfn main() -> i32 {\n    let w: [f32; 2] = [2.0, 3.0];\n    let pw = &w;\n    return apply(|x| x * (*pw)[1], 2.0) as i32;\n}\n"
+        "A closure captures every local of the enclosing code that its body reads. One it only \
+         reads is copied where the closure is created (when the call evaluates a closure \
+         argument, or at the `let` that binds it), and the closure is lifted to a function that \
+         receives each copy as a parameter; one it writes is shared by reference. What can be \
+         captured is a number, `bool` or `char`, an enum, a raw pointer or reference, a \
+         fixed-size array, a tuple or a struct. A slice or `str` (a view of storage the copy \
+         would not carry), a tensor or a SIMD vector cannot, and neither can the enclosing \
+         function's function-typed parameter (it has no run-time value) or anything that names \
+         one of the enclosing function's generic parameters (the lifted function is not \
+         generic). To read a slice, capture a pointer to it (`let ps = &s;` before the closure, \
+         then `(*ps)[i]` in it) or pass it to the callee as an ordinary parameter; to use a \
+         generic dimension, bind it to a local first (`let n = N;`).",
+        bad: "module ex.e0418\nfn apply(f: fn(f32) -> f32, x: f32) -> f32 {\n    return f(x);\n}\nfn main() -> i32 {\n    let w = alloc_f32(2);\n    let r = apply(|x| x * w[1], 2.0) as i32;\n    free(w);\n    return r;\n}\n",
+        good: "module ex.e0418\nfn apply(f: fn(f32) -> f32, x: f32) -> f32 {\n    return f(x);\n}\nfn main() -> i32 {\n    let w = alloc_f32(2);\n    let pw = &w;\n    let r = apply(|x| x * (*pw)[1], 2.0) as i32;\n    free(w);\n    return r;\n}\n"
     ),
     entry!(
         "E0419",

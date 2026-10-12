@@ -1,0 +1,165 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 11
+// EXPECT-OUT: 4.5
+// EXPECT-OUT: 7
+// EXPECT-OUT: 6
+// EXPECT-OUT: 0
+// EXPECT-OUT: 10
+// EXPECT-OUT: 5
+// EXPECT-OUT: 10
+// EXPECT-OUT: 3
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 6
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 50
+// EXPECT-OUT: 4
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 99
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 0
+module tests.run.closure_captures
+
+// What a closure captures. One it only reads is COPIED where the closure is created — a scalar,
+// or a fixed-size array, a tuple, a struct or a data-carrying enum, copied whole. One it WRITES
+// is captured by reference: the closure receives a pointer to the variable, so the enclosing
+// function sees every write. Expectations by hand:
+//   apply(|x| x * w[2] + w[0], 2) over w = [1, 2, 3]: 2 * 3 + 1              = 7
+//   apply(|x| x * p.x + p.y, 3) with p = (2, 5): 6 + 5                        = 11
+//   apply(|x| x * t.0 + t.1, 1) with t = (4, 0.5)                             = 4.5
+//   the area of Rect(2, 3) plus 1                                             = 7
+//   apply(|x| x + m[0], zero_first(&mut m)): the closure argument is copied first, with
+//   m[0] = 5; then zero_first sets m[0] = 0 and gives 1: 1 + 5 = 6, and m[0] is 0
+//   apply(|x| { total += x; x * 2 }, 5) = 10, leaving total = 5
+//   each 0..5 adding i to count: 0 + 1 + 2 + 3 + 4                           = 10
+//   each 0..7 counting i % 3 into hist: [3, 2, 2]
+//   each 0..4 into the struct q: q.x = 0 + 1 + 2 + 3 = 6, q.y = 3 (the last i)
+//   the `let`-bound mul shares acc: 1 * 2 * 3 = 6; then acc = 10 and mul(5)  = 50
+//   an inner closure's write is shared through the outer one: z becomes 2, the inner call
+//   gives 2, and the outer closure then reads z = 2: 2 + 2 = 4, then z = 2
+//   the `let`-bound pick copied grid = [1, 2] at its `let`: pick(0) = 1, while grid[0] = 99
+//   a method's closure counting its calls in a shared `hits`: v.scale's 2 calls, and the scaled
+//   copy (2, 0) of v = (1, 0) sums to 2
+//   and a Circle of radius 0 has area 0
+
+fn apply(f: fn(f32) -> f32, x: f32) -> f32 {
+    return f(x);
+}
+
+fn each(f: fn(i32), n: i32) {
+    for i in 0..n {
+        f(i);
+    }
+}
+
+fn zero_first(p: *mut [f32; 3]) -> f32 {
+    (*p)[0] = 0.0;
+    return 1.0;
+}
+
+struct P {
+    x: f32,
+    y: f32,
+}
+
+enum Shape {
+    Circle(f32),
+    Rect(f32, f32),
+}
+
+fn area(s: Shape) -> f32 {
+    return match s {
+        Shape::Circle(r) => 3.0 * r * r,
+        Shape::Rect(a, b) => a * b,
+    };
+}
+
+impl P {
+    fn scale(self, f: fn(f32) -> f32) -> P {
+        return P { x: f(self.x), y: f(self.y) };
+    }
+}
+
+fn main() -> i32 {
+    let w: [f32; 3] = [1.0, 2.0, 3.0];
+    print(apply(|x| x * w[2] + w[0], 2.0));
+    let p = P { x: 2.0, y: 5.0 };
+    print(apply(|x| x * p.x + p.y, 3.0));
+    let t = (4.0, 0.5);
+    print(apply(|x| x * t.0 + t.1, 1.0));
+    let s = Shape::Rect(2.0, 3.0);
+    print(apply(|x| x + area(s), 1.0));
+
+    let mut m: [f32; 3] = [5.0, 6.0, 7.0];
+    print(apply(|x| x + m[0], zero_first(&mut m)));
+    print(m[0]);
+
+    let mut total = 0.0;
+    print(apply(|x| {
+        total = total + x;
+        x * 2.0
+    }, 5.0));
+    print(total);
+
+    let mut count = 0;
+    each(|i| {
+        count += i;
+    }, 5);
+    print(count);
+
+    let mut hist: [i32; 3] = [0, 0, 0];
+    each(|i| {
+        hist[i % 3] += 1;
+    }, 7);
+    print(hist[0]);
+    print(hist[1]);
+    print(hist[2]);
+
+    let mut q = P { x: 0.0, y: 0.0 };
+    each(|i| {
+        q.x = q.x + (i as f32);
+        q.y = i as f32;
+    }, 4);
+    print(q.x);
+    print(q.y);
+
+    let mut acc = 1;
+    let mul = |k: i32| {
+        acc = acc * k;
+    };
+    mul(2);
+    mul(3);
+    print(acc);
+    acc = 10;
+    mul(5);
+    print(acc);
+
+    let mut z = 0.0;
+    print(apply(|x| apply(|y| {
+        z = z + y;
+        y
+    }, x) + z, 2.0));
+    print(z);
+
+    let mut grid: [i32; 2] = [1, 2];
+    let pick = |i: i32| grid[i];
+    grid[0] = 99;
+    print(pick(0));
+    print(grid[0]);
+
+    let mut hits = 0;
+    let v = P { x: 1.0, y: 0.0 };
+    let c = v.scale(|a| {
+        hits += 1;
+        a * 2.0
+    });
+    print(hits);
+    print(c.x + c.y);
+    print(area(Shape::Circle(0.0)));
+    return 0;
+}

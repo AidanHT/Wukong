@@ -1,0 +1,20 @@
+// EXPECT-CODE: E0418
+// EXPECT-COUNT: 1
+module tests.fail.closure_capture_slice
+
+// A closure copies what it captures. A scalar, an enum, a pointer, a fixed-size array, a tuple and
+// a struct can be copied into a parameter of the function the closure is lifted to; a slice only
+// views storage its copy would not carry, so reading the slice `w` inside the closure is rejected
+// where it is read. Capturing a pointer to it (`let pw = &w;`, then `(*pw)[1]`) is the fix.
+// tests/run/closure_captures.wk is the positive control.
+
+fn apply(f: fn(f32) -> f32, x: f32) -> f32 {
+    return f(x);
+}
+
+fn main() -> i32 {
+    let w = alloc_f32(2);
+    print(apply(|x| x * w[1], 2.0)); //~ E0418
+    free(w);
+    return 0;
+}

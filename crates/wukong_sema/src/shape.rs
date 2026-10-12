@@ -221,6 +221,8 @@ impl Sema<'_> {
             );
             return;
         }
+        // A closure adding to an element of a variable it captures shares the variable.
+        self.note_capture_write(place);
         let elem = match &arg_tys[0] {
             Ty::Scalar(s) if s.is_int() && *s != Scalar::Char => *s,
             Ty::Unknown | Ty::Error => {

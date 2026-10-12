@@ -3095,10 +3095,16 @@ fn lower_fn(
             closure_env.push((p.name.sym, j, v, ty.clone()));
         }
     }
+    // A lifted closure's leading parameters that point at a variable it writes (`closures.rs`).
+    let by_ref = fl.by_ref_params(f.name.sym);
     for (pi, ((p, pty), val)) in f.params.iter().zip(&param_tys).zip(param_vals).enumerate() {
         let Some(val) = val else {
             continue;
         };
+        if let (Some(true), Ty::Ptr { pointee, .. }) = (by_ref.get(pi).copied(), pty) {
+            fl.bind_by_ref(p.name.sym, val, pointee);
+            continue;
+        }
         if ty_is_buffer_param(pty) {
             fl.param_arrays.push((val, pty.clone()));
         }
