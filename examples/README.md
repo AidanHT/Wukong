@@ -75,7 +75,12 @@ the benchmark harness live in [`../bench/kernels`](../bench/kernels).
 
 The real pretrained OpenAI GPT-2 124M can run as a Wukong program. The
 [verification workflow](../README.md#runs-the-real-gpt-2-124m-end-to-end) checks each run against
-HuggingFace. Earlier conflicting error figures are withdrawn; the current CPU closeout has not
+HuggingFace. `gpt2_generate.wk` decodes greedily over the same weights with a KV cache: a batch of
+two sequences at different positions (one joins at step 2) shares one `sdpa_kv_batch` call per
+layer through padded per-layer caches, its prompt-position logits are compared with HuggingFace's,
+and its 24 generated ids match an independent float64 NumPy evaluation (the expected ids and text
+are in its header). Like the other GPT-2 programs it is native-only and prints `-1` without the
+data. Earlier conflicting error figures are withdrawn; the current CPU closeout has not
 rerun the full model. This is an inference capability with external tokenization; no fresh numerical
 or speed result is claimed here (see also [BENCHMARKS.md](../BENCHMARKS.md)).
 

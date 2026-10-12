@@ -1608,8 +1608,11 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   no split-K across the keys (a one-sequence MQA step parallelizes over at most `H / 8` head
   blocks), and neither has a backward kernel (autodiff refuses them). A whole greedy decode loop runs
   as a gated toy model (`tests/run/decode_tiny_lm.wk`: bf16 projections, a growing KV cache, GQA attention, a Q8_0 LM head,
-  six tokens checked against an f64 reference); the multi-token GPT-2 example over real weights is
-  still to be written. None of the decode kernels is measured yet.
+  six tokens checked against an f64 reference), and `examples/gpt2_generate.wk` decodes the real
+  GPT-2 124M weights with KV caches: two sequences at different positions share one
+  `sdpa_kv_batch` call per layer through padded caches, and their 24 greedy tokens match a float64
+  NumPy evaluation (native-only; needs the uncommitted `data/gpt2/` blob). None of the decode
+  kernels is measured yet.
 - **ML I/O and randomness gaps.** No memory-mapped load yet (`map_<T>`: every checkpoint load copies
   once, straight into the destination) and no GGUF reader (the `Q8_0` / `Q4_0` block layouts exist as
   the decode builtins' packers and GEMVs, and a raw block blob loads with `read_u8`); `.npy` reads

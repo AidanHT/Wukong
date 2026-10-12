@@ -83,9 +83,10 @@ fn class_of(name: &str) -> Class {
     match name {
         "matmul.wk" | "softmax.wk" | "vadd.wk" => Class::NotLowered,
         "gpt2_config.wk" => Class::NoEntry,
-        "gpt2_infer.wk" | "gpt2_forward_bench.wk" | "gpt2_forward_bench_par.wk" => {
-            Class::DataGuarded
-        }
+        "gpt2_infer.wk"
+        | "gpt2_forward_bench.wk"
+        | "gpt2_forward_bench_par.wk"
+        | "gpt2_generate.wk" => Class::DataGuarded,
         _ => Class::Runs,
     }
 }

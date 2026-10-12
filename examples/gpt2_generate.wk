@@ -1,0 +1,295 @@
+module examples.gpt2_generate
+
+// =====================================================================================
+// GPT-2 124M multi-token generation — a batched, KV-cached decode loop in Wukong.
+// =====================================================================================
+//
+// Loads the REAL HuggingFace GPT-2 small weights (the flat f32 blob tools/export_gpt2.py writes)
+// and the frozen prompt "Hello, my name is" (ids 15496 11 616 1438 318), then decodes greedily one
+// position per step for a batch of TWO sequences that share one call per kernel:
+//   sequence 0 starts at step 0 from the whole prompt,
+//   sequence 1 joins the batch at step 2 from the prefix "Hello, my" (the first three ids) —
+//   continuous batching: at every step the two sequences sit at DIFFERENT positions, so their KV
+//   caches hold different numbers of valid rows inside one padded [2, MAXT, 12, 64] cache per layer.
+// Each step embeds both sequences' current tokens, runs the 12 pre-LayerNorm blocks with the
+// named kernels — `layernorm`, `linear` (x·Wᵀ + b, nn.Linear layout), `kv_append` into each
+// sequence's cache rows, ONE `sdpa_kv_batch` per layer with kv_lens = [pos0 + 1, pos1 + 1] and
+// q_pos = [pos0, pos1] (before sequence 1 joins, kv_lens[1] = 0: its row is fully masked and
+// ignored), tanh-GELU, the residual adds — then the final LayerNorm and the tied LM head
+// (`matmul_nt` against wte), and takes the argmax of each active sequence's logits row as its next
+// token once its prompt is consumed.
+//
+// Verification, printed:
+//   1. round(1e5 · max |logit − HF reference|) over every prompt position of both sequences — the
+//      reference is data/gpt2/gpt2_ref_logits.bin (HuggingFace's logits for the 5-token prompt;
+//      a causal LM's logits at position t depend only on tokens ≤ t, so its rows 0..2 also cover
+//      sequence 1's prefix).
+//   2. sequence 0's 12 generated ids, then sequence 1's 12 generated ids. The first of sequence 0
+//      is 1757 (" John"), HF's argmax for this prompt; all 24 were checked against an independent
+//      float64 NumPy evaluation of the same model from the same blob (greedy, a full recompute per
+//      token, no cache, no batch), whose smallest top-2 logit margin over the 24 choices is 0.0129 —
+//      two orders of magnitude above the f32 error printed in 1:
+//        sequence 0: 1757 13 314 1101 257 6260 11 290 314 1101 257 6260
+//                    " John. I'm a writer, and I'm a writer"
+//        sequence 1: 1438 318 1757 13 314 1101 257 6260 11 290 314 1101
+//                    " name is John. I'm a writer, and I'm"
+//      Measured on the 2026-10-12 build (native, -O0 and -O2 identical): line 1 printed 19
+//      (max |diff| = 1.9e-4 on logits of magnitude ~100; NumPy's f64 forward is 9.8e-5 from HF).
+// Native-only, like examples/gpt2_infer.wk: the interpreter's slot memory cannot hold 124M
+// parameters. Run from the repo root with the data present:
+//   cargo run -q -p wukongc -- --run --backend=native examples/gpt2_generate.wk
+// With data/gpt2/ absent it prints -1 and exits 1 before allocating anything large.
+
+import gpt2_config;
+
+// Sequences in the batch, cache capacity per sequence (positions), decode steps, and the step at
+// which sequence 1 joins.
+const NB: i64 = 2;
+const MAXT: i64 = 16;
+const NSTEPS: i64 = 16;
+const JOIN1: i64 = 2;
+// Prompt lengths: the whole frozen prompt, and its three-token prefix.
+const PLEN0: i64 = 5;
+const PLEN1: i64 = 3;
+
+fn main() -> i32 {
+    // ---- 1. prompt ids and the HF reference logits (small; read FIRST, so a data-absent run exits
+    //         identically on both backends before the ~500 MB weight allocation) ----
+    let mut ids: []i32 = alloc_i32(GPT2_SEQ);
+    let ngot: i64 = read_i32("data/gpt2/gpt2_tokens.bin", ids);
+    if ngot != GPT2_SEQ {
+        print(-1);
+        free(ids);
+        return 1;
+    }
+    let mut refl: []f32 = alloc_f32(GPT2_SEQ * GPT2_VOCAB);
+    let rgot: i64 = read_f32("data/gpt2/gpt2_ref_logits.bin", refl);
+    if rgot != GPT2_SEQ * GPT2_VOCAB {
+        print(-1);
+        free(refl);
+        free(ids);
+        return 1;
+    }
+
+    // ---- 2. weights ----
+    let mut w: []f32 = alloc_f32(GPT2_TOTAL_WEIGHTS);
+    let wgot: i64 = read_f32("data/gpt2/gpt2_124m_weights.bin", w);
+    if wgot != GPT2_TOTAL_WEIGHTS {
+        print(-2);
+        free(w);
+        free(refl);
+        free(ids);
+        return 1;
+    }
+
+    // ---- 3. state: per-sequence token streams, per-layer padded KV caches, activations ----
+    let d: i64 = GPT2_D;
+    let mut toks0: [i64; 17] = [0; 17];
+    let mut toks1: [i64; 17] = [0; 17];
+    for t in 0..PLEN0 {
+        toks0[t] = ids[t] as i64;
+    }
+    for t in 0..PLEN1 {
+        toks1[t] = ids[t] as i64;
+    }
+    let cache_per_layer: i64 = NB * MAXT * d;
+    let mut kc: []f32 = alloc_f32(GPT2_LAYERS * cache_per_layer);
+    let mut vc: []f32 = alloc_f32(GPT2_LAYERS * cache_per_layer);
+    let mut x: []f32 = alloc_f32(NB * d);
+    let mut nrm: []f32 = alloc_f32(NB * d);
+    let mut q: []f32 = alloc_f32(NB * d);
+    let mut krow: []f32 = alloc_f32(NB * d);
+    let mut vrow: []f32 = alloc_f32(NB * d);
+    let mut att: []f32 = alloc_f32(NB * d);
+    let mut a: []f32 = alloc_f32(NB * d);
+    let mut ff: []f32 = alloc_f32(NB * GPT2_DFF);
+    let mut logits: []f32 = alloc_f32(NB * GPT2_VOCAB);
+    let mut lens: [i32; 2] = [0, 0];
+    let mut pos: [i32; 2] = [0, 0];
+    let mut maxdiff: f32 = 0.0;
+
+    // ---- 4. the decode loop: one position per active sequence per iteration ----
+    for t in 0i64..NSTEPS {
+        // Sequence 0 sits at position t; sequence 1 at t - JOIN1 once it has joined.
+        let p0: i64 = t;
+        let p1: i64 = t - JOIN1;
+        let live1: bool = p1 >= 0;
+        lens[0] = (p0 + 1) as i32;
+        pos[0] = p0 as i32;
+        if live1 {
+            lens[1] = (p1 + 1) as i32;
+            pos[1] = p1 as i32;
+        }
+
+        // Embeddings: x[b] = wte[token] + wpe[position] (a row of zeros for a sequence not yet in).
+        let id0: i64 = toks0[p0];
+        for c in 0..GPT2_D {
+            x[c] = w[GPT2_OFF_WTE + id0 * d + c] + w[GPT2_OFF_WPE + p0 * d + c];
+            x[d + c] = 0.0;
+        }
+        if live1 {
+            let id1: i64 = toks1[p1];
+            for c in 0..GPT2_D {
+                x[d + c] = w[GPT2_OFF_WTE + id1 * d + c] + w[GPT2_OFF_WPE + p1 * d + c];
+            }
+        }
+
+        for l in 0..GPT2_LAYERS {
+            let base: i64 = GPT2_OFF_LAYER0 + l * GPT2_LAYER_STRIDE;
+            let c0: i64 = l * cache_per_layer;
+            // LN1, then the Q/K/V projections of both rows at once.
+            layernorm::<2, 768>(
+                x,
+                w[base + GPT2_REL_LN1G..base + GPT2_REL_LN1G + d],
+                w[base + GPT2_REL_LN1B..base + GPT2_REL_LN1B + d],
+                nrm,
+                0.00001,
+            );
+            linear::<2, 768, 768>(
+                nrm,
+                w[base + GPT2_REL_WQ..base + GPT2_REL_WQ + d * d],
+                w[base + GPT2_REL_BQ..base + GPT2_REL_BQ + d],
+                q,
+            );
+            linear::<2, 768, 768>(
+                nrm,
+                w[base + GPT2_REL_WK..base + GPT2_REL_WK + d * d],
+                w[base + GPT2_REL_BK..base + GPT2_REL_BK + d],
+                krow,
+            );
+            linear::<2, 768, 768>(
+                nrm,
+                w[base + GPT2_REL_WV..base + GPT2_REL_WV + d * d],
+                w[base + GPT2_REL_BV..base + GPT2_REL_BV + d],
+                vrow,
+            );
+            // Each live sequence appends its key/value row at its own position: cache row
+            // b * MAXT + position of this layer's [2, MAXT, 768] block.
+            kv_append(kc[c0..c0 + cache_per_layer], krow[0..d], p0, d);
+            kv_append(vc[c0..c0 + cache_per_layer], vrow[0..d], p0, d);
+            if live1 {
+                kv_append(kc[c0..c0 + cache_per_layer], krow[d..2 * d], MAXT + p1, d);
+                kv_append(vc[c0..c0 + cache_per_layer], vrow[d..2 * d], MAXT + p1, d);
+            }
+            // One batched, padded, causal attention call for both sequences: 12 heads of 64.
+            sdpa_kv_batch::<2, 1, 16, 12, 12, 64>(
+                q,
+                kc[c0..c0 + cache_per_layer],
+                vc[c0..c0 + cache_per_layer],
+                att,
+                lens,
+                pos,
+                0.125,
+                true,
+            );
+            // Output projection, residual.
+            linear::<2, 768, 768>(
+                att,
+                w[base + GPT2_REL_WO..base + GPT2_REL_WO + d * d],
+                w[base + GPT2_REL_BO..base + GPT2_REL_BO + d],
+                a,
+            );
+            for i in 0..NB * d {
+                a[i] = x[i] + a[i];
+            }
+            // LN2, the MLP with tanh-GELU (gelu_new), residual.
+            layernorm::<2, 768>(
+                a,
+                w[base + GPT2_REL_LN2G..base + GPT2_REL_LN2G + d],
+                w[base + GPT2_REL_LN2B..base + GPT2_REL_LN2B + d],
+                nrm,
+                0.00001,
+            );
+            linear::<2, 768, 3072>(
+                nrm,
+                w[base + GPT2_REL_W1..base + GPT2_REL_W1 + GPT2_DFF * d],
+                w[base + GPT2_REL_B1..base + GPT2_REL_B1 + GPT2_DFF],
+                ff,
+            );
+            for i in 0..NB * GPT2_DFF {
+                let u: f32 = 0.7978845608 * (ff[i] + 0.044715 * ff[i] * ff[i] * ff[i]);
+                let th: f32 = 1.0 - 2.0 / (exp(2.0 * u) + 1.0);
+                ff[i] = 0.5 * ff[i] * (1.0 + th);
+            }
+            linear::<2, 3072, 768>(
+                ff,
+                w[base + GPT2_REL_W2..base + GPT2_REL_W2 + d * GPT2_DFF],
+                w[base + GPT2_REL_B2..base + GPT2_REL_B2 + d],
+                x,
+            );
+            for i in 0..NB * d {
+                x[i] = a[i] + x[i];
+            }
+        }
+
+        // Final LayerNorm and the tied LM head: logits[b, v] = Σ_c xf[b, c] · wte[v, c].
+        layernorm::<2, 768>(
+            x,
+            w[GPT2_OFF_LNFG..GPT2_OFF_LNFG + d],
+            w[GPT2_OFF_LNFB..GPT2_OFF_LNFB + d],
+            nrm,
+            0.00001,
+        );
+        matmul_nt::<2, 768, 50257>(nrm, w[GPT2_OFF_WTE..GPT2_OFF_WTE + GPT2_VOCAB * d], logits);
+
+        // Prompt positions: compare against HuggingFace's logits row for the same position.
+        if p0 < PLEN0 {
+            for v in 0..GPT2_VOCAB {
+                maxdiff = fmax(maxdiff, abs(logits[v] - refl[p0 * GPT2_VOCAB + v]));
+            }
+        }
+        if live1 && p1 < PLEN1 {
+            for v in 0..GPT2_VOCAB {
+                maxdiff = fmax(maxdiff, abs(logits[GPT2_VOCAB + v] - refl[p1 * GPT2_VOCAB + v]));
+            }
+        }
+        // Greedy: once a sequence's prompt is consumed, its argmax is its next token.
+        if p0 + 1 >= PLEN0 {
+            let mut best: f32 = logits[0];
+            let mut bi: i64 = 0;
+            for v in 0i64..GPT2_VOCAB {
+                if logits[v] > best {
+                    best = logits[v];
+                    bi = v;
+                }
+            }
+            toks0[p0 + 1] = bi;
+        }
+        if live1 && p1 + 1 >= PLEN1 {
+            let mut best: f32 = logits[GPT2_VOCAB];
+            let mut bi: i64 = 0;
+            for v in 0i64..GPT2_VOCAB {
+                if logits[GPT2_VOCAB + v] > best {
+                    best = logits[GPT2_VOCAB + v];
+                    bi = v;
+                }
+            }
+            toks1[p1 + 1] = bi;
+        }
+    }
+
+    // ---- 5. report ----
+    print(round(maxdiff * 100000.0) as i32);
+    for t in PLEN0..PLEN0 + 12 {
+        print(toks0[t]);
+    }
+    for t in PLEN1..PLEN1 + 12 {
+        print(toks1[t]);
+    }
+
+    free(w);
+    free(refl);
+    free(ids);
+    free(kc);
+    free(vc);
+    free(x);
+    free(nrm);
+    free(q);
+    free(krow);
+    free(vrow);
+    free(att);
+    free(a);
+    free(ff);
+    free(logits);
+    return 0;
+}

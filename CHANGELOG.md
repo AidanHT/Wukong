@@ -36,6 +36,13 @@ All notable changes to Wukong are documented here. The format is loosely based o
   pass against the same code one head at a time (best of 15 each, ratio only, bit-equality
   asserted): `cargo test -p wukong_runtime --release --lib gqa_group_blocking_ab -- --ignored
   --nocapture`.
+- **Added: `examples/gpt2_generate.wk`, multi-token generation over the real GPT-2 124M weights.**
+  Two sequences at different positions (one joins at step 2, continuous batching) decode greedily
+  through padded per-layer KV caches with one `sdpa_kv_batch` per layer and the named `layernorm` /
+  `linear` / `matmul_nt` kernels. Its prompt-position logits are within 1.9e-4 of HuggingFace's
+  (logits of magnitude ~100), and all 24 generated ids (" John. I'm a writer, and I'm a writer";
+  " name is John. I'm a writer, and I'm") match an independent float64 NumPy evaluation whose
+  smallest top-2 margin is 0.0129. Native-only and data-guarded like `gpt2_infer.wk`.
 - **Runtime** `wukong_attention_kv_batch_f32[_parallel]` with `kv_batch_plan` /
   `kv_batch_check_lens` (shared by the interpreter twin), Cranelift and textual-LLVM ABI rows, and
   autodiff refusing it like `sdpa_kv`.
