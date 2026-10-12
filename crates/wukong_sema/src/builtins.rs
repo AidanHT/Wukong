@@ -711,6 +711,8 @@ impl Sema<'_> {
     /// non-`mut` aggregate parameter would mutate the caller's value — the same `E0304` an
     /// assignment `p[i] = …` through that parameter gets.
     fn check_builtin_output_mutable(&mut self, out: &Expr, builtin: &str) {
+        // A closure writing a variable it captures this way shares it (`closures.rs`).
+        self.note_capture_write(out);
         let Some(root) = self.assign_root_param(out) else {
             return;
         };

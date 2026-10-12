@@ -99,8 +99,9 @@ line table built from them is not emitted yet.
   `E0422` for a `mut`, pattern or reassigned binding); a closure argument of a method or associated
   function (`v.map(|a| a * k)`, `V::make(..)`) specializes the method like a free function
   (`tests/run/{closure_let,closure_method}.wk`). A closure captures an array, tuple, struct or
-  data-carrying enum by value (a copy), and a variable it writes by reference — the enclosing
-  function sees the write (`tests/run/closure_captures.wk`). An unannotated closure parameter is
+  data-carrying enum by value (a copy), and a variable it writes by reference — by assignment,
+  `&mut`, a `mut` parameter or a builtin's output operand — and the enclosing function sees the
+  write (`tests/run/{closure_captures,closure_capture_out_params}.wk`). An unannotated closure parameter is
   typed from the call's other arguments when the expected type names a callee generic, and a
   function-typed parameter over a dimension generic (`fn(Tensor[f32, N]) -> f32`) binds it from the
   function passed (`tests/run/closure_infer.wk`). Interp and native agree at every `-O`.

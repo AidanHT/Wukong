@@ -23,9 +23,10 @@
 //! * **Captures.** Every enclosing local the body reads is captured. One it only reads is COPIED
 //!   where the closure is created (when the call evaluates the argument, or at the `let`): a
 //!   scalar, an enum, a raw pointer or reference, a fixed-size array, a tuple or a struct. One it
-//!   writes is captured BY REFERENCE ([`ClosureInfo::by_ref`], [`Sema::note_capture_write`]): the
-//!   closure and the enclosing function share it, and its own mutability rules apply (`E0304` for
-//!   an immutable binding, as outside the closure). A slice, `str`, tensor or vector, the enclosing
+//!   writes — assigns, takes `&mut` of, or passes as an aggregate to a `mut` parameter or as a
+//!   builtin's output operand — is captured BY REFERENCE ([`ClosureInfo::by_ref`],
+//!   [`Sema::note_capture_write`]): the closure and the enclosing function share it, and its own
+//!   mutability rules apply (`E0304` for an immutable binding, as outside the closure). A slice, `str`, tensor or vector, the enclosing
 //!   function's function-typed parameter, and a value whose type names an enclosing generic are
 //!   `E0418`, as is any use of an enclosing generic parameter (the lifted function is not generic).
 //!   A closure-bound local is captured through its closure ([`ClosureInfo::bound`]).
@@ -51,8 +52,9 @@ pub struct ClosureInfo {
     /// Every enclosing local it captures, in order of first use, with its type. A capture is
     /// copied when the closure is created unless it is in [`Self::by_ref`].
     pub captures: Vec<(Symbol, Ty)>,
-    /// The captures the closure writes (`c = ..`, `&mut c`, `a[i] = ..`): captured BY REFERENCE,
-    /// so the closure and the enclosing function share the variable.
+    /// The captures the closure writes (`c = ..`, `&mut c`, `a[i] = ..`, `relu6(x, out)` into a
+    /// `mut` parameter, `softmax(x, out)`): captured BY REFERENCE, so the closure and the enclosing
+    /// function share the variable.
     pub by_ref: Vec<Symbol>,
     /// The captures that are locals bound to a closure (`let f = |..| ..;` outside, `f(x)` inside),
     /// with the literal each denotes: the lifted function receives that closure's captures instead.
@@ -787,11 +789,12 @@ impl Sema<'_> {
     }
 
     /// A write to the place `target` (`c = ..`, `c op= ..`, `&mut c`, `a[i] = ..`, `s.f = ..`,
-    /// `atomic_add(a[i], ..)`, a `mut self` method on `v`): when its root is a variable a closure
-    /// being checked captures, that closure captures it BY REFERENCE — it receives a pointer to the
-    /// variable, so the write reaches the enclosing function (and every closure in between captures
-    /// it the same way). A projection through a pointer or reference (`p.x = ..`, `(*p)[i] = ..`)
-    /// writes a pointee, not the captured variable, which stays a copy.
+    /// `atomic_add(a[i], ..)`, a `mut self` method on `v`, an aggregate passed to a `mut` parameter
+    /// ([`Self::note_mut_arg_writes`]), a builtin's output operand such as `relu(x, out)`): when its
+    /// root is a variable a closure being checked captures, that closure captures it BY REFERENCE —
+    /// it receives a pointer to the variable, so the write reaches the enclosing function (and every
+    /// closure in between captures it the same way). A projection through a pointer or reference
+    /// (`p.x = ..`, `(*p)[i] = ..`) writes a pointee, not the captured variable, which stays a copy.
     pub(crate) fn note_capture_write(&mut self, target: &Expr) {
         if self.closure_ctx.is_empty() {
             return;
@@ -805,6 +808,34 @@ impl Sema<'_> {
         for c in &mut self.closure_ctx {
             if depth < c.base && !c.by_ref.contains(&name) {
                 c.by_ref.push(name);
+            }
+        }
+    }
+
+    /// The arguments `args` of a call of the function `callee`, bound to its parameters from
+    /// position `offset` on (a method call's receiver takes position 0). An aggregate is passed by
+    /// reference and the callee's `mut` is what lets it write one, so an aggregate argument of a
+    /// `mut` parameter is written in place: `relu6(x, out)` writes `out` exactly as `out[i] = ..`
+    /// would, and a closure passing a variable it captures there shares it.
+    pub(crate) fn note_mut_arg_writes(&mut self, callee: Symbol, args: &[Expr], offset: usize) {
+        if self.closure_ctx.is_empty() {
+            return;
+        }
+        let Some(muts) = self.methods.mut_params.get(&callee).cloned() else {
+            return;
+        };
+        for k in muts {
+            let Some(a) = k.checked_sub(offset).and_then(|i| args.get(i)) else {
+                continue;
+            };
+            // A scalar or a pointer is copied into the callee; a slice is a view whose elements a
+            // write reaches without changing the variable.
+            let by_reference = self
+                .types
+                .get(&a.id)
+                .is_some_and(|t| self.is_aggregate_ty(t) && !matches!(t, Ty::Slice(_) | Ty::Str));
+            if by_reference {
+                self.note_capture_write(a);
             }
         }
     }
@@ -1566,6 +1597,52 @@ mod tests {
         let (_m, res, diags, _i) = check(&src);
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
         assert!(res.closures.values().all(|c| c.by_ref.len() == 1));
+    }
+
+    /// A call writes an aggregate argument in place when it is bound to a `mut` parameter (of a
+    /// function, a method or an associated function) or is a builtin's output operand: a closure
+    /// passing a variable it captures there writes it, so it captures it by reference. A non-`mut`
+    /// parameter, a scalar `mut` parameter (a copy) and a builtin's input only read.
+    #[test]
+    fn an_aggregate_a_call_writes_is_captured_by_reference() {
+        let by_ref = |body: &str| -> Vec<String> {
+            let src = format!(
+                "fn each(f: fn(i32), n: i32) {{ for i in 0..n {{ f(i); }} }} \
+                 fn fill(mut o: [f32; 4], v: f32) {{ for i in 0..4 {{ o[i] = v; }} }} \
+                 fn peek(o: [f32; 4]) -> f32 {{ return o[0]; }} \
+                 fn bump(mut k: i32) -> i32 {{ k += 1; return k; }} \
+                 struct S {{ o: [f32; 4] }} \
+                 impl S {{ fn put(self, mut o: [f32; 4]) {{ o[0] = self.o[0]; }} }} \
+                 fn main() -> i32 {{ let x: [f32; 4] = [1.0, -2.0, 3.0, -4.0]; \
+                 let mut out: [f32; 4] = [0.0; 4]; let mut s = S {{ o: [0.0; 4] }}; \
+                 let n = 2; let mut ix: [i64; 4] = [0; 4]; let mut buf: [u8; 8] = [0; 8]; \
+                 each(|i| {{ {body} print(i); }}, 1); \
+                 return (out[0] + s.o[0]) as i32 + n + (ix[0] as i32) + (buf[0] as i32); }}"
+            );
+            let (_m, res, diags, interner) = check(&src);
+            assert!(diags.iter().all(|d| !d.is_error()), "{body}: {diags:?}");
+            let info = res.closures.values().next().expect("a closure");
+            let mut names: Vec<String> = info
+                .by_ref
+                .iter()
+                .map(|s| interner.resolve(*s).to_string())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(by_ref("fill(out, 1.0);"), vec!["out"]);
+        assert_eq!(by_ref("fill(s.o, 1.0);"), vec!["s"]);
+        assert_eq!(by_ref("s.put(out);"), vec!["out"]);
+        assert_eq!(by_ref("S::put(s, out);"), vec!["out"]);
+        // The kernel, ML and text builtins' output operands.
+        assert_eq!(by_ref("relu(x, out);"), vec!["out"]);
+        assert_eq!(by_ref("softmax(x, out);"), vec!["out"]);
+        assert_eq!(by_ref("argsort_f32(x, ix);"), vec!["ix"]);
+        assert_eq!(by_ref("sprintf(buf, \"hi\");"), vec!["buf"]);
+        // Read only: the copy stays a copy.
+        assert_eq!(by_ref("print(peek(out));"), Vec::<String>::new());
+        assert_eq!(by_ref("print(bump(n));"), Vec::<String>::new());
+        assert_eq!(by_ref("print(peek(s.o) + x[0]);"), Vec::<String>::new());
     }
 
     #[test]

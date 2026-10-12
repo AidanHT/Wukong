@@ -84,6 +84,7 @@ cbrt.wk: wukong_vmath_f32 wukong_vmath_f32*2
 char_literals.wk:
 char_match.wk:
 char_type.wk:
+closure_capture_out_params.wk: wukong_argsort_f32 wukong_rt_alloc wukong_rt_fmt_lit wukong_rt_fmt_str wukong_rt_free wukong_vmath_f32 wukong_vmath_f32*2
 closure_captures.wk:
 closure_hidden_reads.wk:
 closure_infer.wk:

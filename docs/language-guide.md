@@ -219,7 +219,9 @@ fn main() -> i32 {
   other arguments), or at the `let` — so a later write to the variable is not seen: a scalar
   (including `bool` and `char`), an enum, a raw pointer or reference, a fixed-size array, a tuple or
   a struct, the last four copied whole. One it **writes** — `c = ..`, `c += ..`, `&mut c`, an element
-  or field (`a[i] = ..`, `p.x = ..`), `atomic_add(a[i], ..)`, a `mut self` method — is captured **by
+  or field (`a[i] = ..`, `p.x = ..`), `atomic_add(a[i], ..)`, a `mut self` method, an aggregate passed
+  to a `mut` parameter (`relu6(x, out)`, which writes `out` in place), or a builtin's output operand
+  (`relu(x, out)`, `argsort_f32(x, idx)`, `sprintf(buf, ..)`) — is captured **by
   reference**: the closure and the enclosing function share the variable, so the write is seen after
   the call (and by every later call of a `let`-bound closure), and the variable's own rules apply
   (`E0304` for an immutable binding, exactly as outside the closure). Writing through a captured
@@ -240,7 +242,7 @@ It costs nothing at run time: the closure is lifted to a function whose leading 
 captures (a pointer for one it writes), and the callee is specialized per closure exactly as per named
 function (`apply$main$closure$0`), so a call through `f`, or through a closure-bound local, is a
 direct call — no function pointer, no heap environment, and inlined like any call at `-O2`.
-`tests/run/{closures,closure_let,closure_method,closure_captures,closure_infer}.wk`.
+`tests/run/{closures,closure_let,closure_method,closure_captures,closure_capture_out_params,closure_infer}.wk`.
 
 ### Generic functions and dtype-generic tensors ✅
 

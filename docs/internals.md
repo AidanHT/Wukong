@@ -144,8 +144,10 @@ each local read with the index of the scope that binds it, and a binding below a
 scope is a capture of that closure (and of every closure it is nested in); a slice, `str`, tensor,
 vector or function-typed parameter cannot be captured (`E0418`). A write to a captured variable
 (`note_capture_write`: an assignment, `&mut`, an element or field store not through a pointer,
-`atomic_add`, a `mut self` receiver) makes it a **by-reference** capture of every closure it
-crosses (`ClosureInfo::by_ref`). The **first**
+`atomic_add`, a `mut self` receiver, an aggregate argument of a `mut` parameter —
+`note_mut_arg_writes`, from the per-function positions `collect_methods` records — or a builtin's
+output operand) makes it a **by-reference** capture of every closure it crosses
+(`ClosureInfo::by_ref`). The **first**
 rewrite of `wukong_mir_build::lower_program` (`closures::lift_module`, before the method
 desugaring) lifts each literal, innermost first, to a registered top-level function
 `<fn>$closure$<k>` whose leading parameters are the captures, and replaces the literal by its

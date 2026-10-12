@@ -1,0 +1,185 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 5
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 8
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 5
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 8
+// EXPECT-OUT: 0
+// EXPECT-OUT: 4
+// EXPECT-OUT: 11
+// EXPECT-OUT: 18
+// EXPECT-OUT: 25
+// EXPECT-OUT: 32
+// EXPECT-OUT: 39
+// EXPECT-OUT: 0
+// EXPECT-OUT: 5
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 8
+// EXPECT-OUT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 4.5
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 104
+// EXPECT-OUT: 105
+// EXPECT-OUT: 0
+// EXPECT-OUT: 9
+// EXPECT-OUT: 0
+// EXPECT-OUT: 5
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 8
+// EXPECT-OUT: 0
+// EXPECT-OUT: 21
+// EXPECT-OUT: 100
+module tests.run.closure_capture_out_params
+
+// A call that writes an aggregate argument in place -- one bound to a `mut` parameter of a
+// function or a method, or a builtin's output operand -- writes the variable the argument names.
+// Inside a closure that variable is a capture, and the closure captures it by reference, so the
+// enclosing function sees the write exactly as it sees the same call written outside the closure.
+// Expectations by hand, every lane printed:
+//   relu6 over x = [-3, 5, -1, 0, 8, -7] keeps the positive lanes:           0 5 0 0 8 0
+//     once through a closure literal into `out`, once through a `let`-bound closure into `out2`
+//     (which starts at all 9s, so every lane it prints was written)
+//   a method's `mut` parameter, called for i in 0..3 with dst[j] = 2 * dst[j] + i + j + base
+//     (base 0): i = 0 gives [0, 1, 2, 3, 4, 5], i = 1 [1, 4, 7, 10, 13, 16], i = 2
+//                                                                              4 11 18 25 32 39
+//   a struct field: relu6(x, h.row) writes h.row, and h.tag stays 7:          0 5 0 0 8 0, 7
+//   the builtin relu(xf, of) over xf = [-1.5, 2, -3, 4.5]:                     0 2 0 4.5
+//   the builtin argsort_f32 over [3, 1, 2], ascending:                         1 2 0
+//   the builtin sprintf of "hi" into [9, 9, 9, 9], NUL-terminated:            104 105 0 9
+//   an inner closure writing `deep` through the closure around it:            0 5 0 0 8 0
+//   a capture passed to a non-`mut` parameter is only read, so it stays a copy: the `let`-bound
+//   `total` copied snap = [1, 2, 3, 4, 5, 6] at its `let`, and sums 21 after snap[0] = 100
+
+fn relu6(x: [i32; 6], mut out: [i32; 6]) {
+    for i in 0..6 {
+        if x[i] > 0 {
+            out[i] = x[i];
+        } else {
+            out[i] = 0;
+        }
+    }
+}
+
+fn total6(v: [i32; 6]) -> i32 {
+    let mut s = 0;
+    for i in 0..6 {
+        s += v[i];
+    }
+    return s;
+}
+
+fn each(f: fn(i32), n: i32) {
+    for i in 0..n {
+        f(i);
+    }
+}
+
+struct Grid {
+    base: i32,
+}
+
+impl Grid {
+    fn spread(self, mut dst: [i32; 6], i: i32) {
+        for j in 0..6 {
+            dst[j] = 2 * dst[j] + i + j + self.base;
+        }
+    }
+}
+
+struct Holder {
+    row: [i32; 6],
+    tag: i32,
+}
+
+fn show6(v: [i32; 6]) {
+    for i in 0..6 {
+        print(v[i]);
+    }
+}
+
+fn main() -> i32 {
+    let x: [i32; 6] = [-3, 5, -1, 0, 8, -7];
+
+    let mut out: [i32; 6] = [0; 6];
+    each(|_i| {
+        relu6(x, out);
+    }, 1);
+    show6(out);
+
+    let mut out2: [i32; 6] = [9; 6];
+    let run = |_i: i32| {
+        relu6(x, out2);
+    };
+    run(0);
+    show6(out2);
+
+    let g = Grid { base: 0 };
+    let mut m: [i32; 6] = [0; 6];
+    each(|i| {
+        g.spread(m, i);
+    }, 3);
+    show6(m);
+
+    let mut h = Holder { row: [0; 6], tag: 7 };
+    each(|_i| {
+        relu6(x, h.row);
+    }, 1);
+    show6(h.row);
+    print(h.tag);
+
+    let xf: [f32; 4] = [-1.5, 2.0, -3.0, 4.5];
+    let mut of: [f32; 4] = [9.0; 4];
+    each(|_i| {
+        relu(xf, of);
+    }, 1);
+    for i in 0..4 {
+        print(of[i]);
+    }
+
+    let keys: [f32; 3] = [3.0, 1.0, 2.0];
+    let mut idx: [i64; 3] = [7; 3];
+    each(|_i| {
+        argsort_f32(keys, idx);
+    }, 1);
+    for i in 0..3 {
+        print(idx[i]);
+    }
+
+    let mut buf: [u8; 4] = [9; 4];
+    each(|_i| {
+        sprintf(buf, "hi");
+    }, 1);
+    for i in 0..4 {
+        print(buf[i]);
+    }
+
+    let mut deep: [i32; 6] = [9; 6];
+    each(|_i| {
+        each(|_j| {
+            relu6(x, deep);
+        }, 1);
+    }, 1);
+    show6(deep);
+
+    let mut snap: [i32; 6] = [1, 2, 3, 4, 5, 6];
+    let total = |_i: i32| total6(snap);
+    snap[0] = 100;
+    print(total(0));
+    print(snap[0]);
+    return 0;
+}

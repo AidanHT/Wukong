@@ -23,11 +23,14 @@ All notable changes to Wukong are documented here. The format is loosely based o
 - **Added: aggregate and by-reference captures.** A closure captures an array, tuple, struct or
   data-carrying enum by value — a copy taken where the closure is created, so a later write to the
   original is not seen — where it was `E0418`. A variable the closure writes (`c = ..`, `c += ..`,
-  `&mut c`, `a[i] = ..`, `p.x = ..`, `atomic_add`, a `mut self` method) is captured by reference: the
-  lifted function receives a pointer to it, and the enclosing function sees every write on interp
-  and native alike; the variable's own mutability rules apply (`E0304` for an immutable binding),
-  where every write to a capture used to be `E0304`. A slice, `str`, tensor or vector still cannot
-  be captured (`E0418`, `tests/fail/closure_capture_slice.wk`; `tests/run/closure_captures.wk`).
+  `&mut c`, `a[i] = ..`, `p.x = ..`, `atomic_add`, a `mut self` method, an aggregate passed to a
+  `mut` parameter such as `relu6(x, out)`, or a builtin's output operand such as `relu(x, out)`,
+  `argsort_f32(x, idx)` or `sprintf(buf, ..)`) is captured by reference: the lifted function
+  receives a pointer to it, and the enclosing function sees every write on interp and native alike;
+  the variable's own mutability rules apply (`E0304` for an immutable binding), where every write to
+  a capture used to be `E0304`. A slice, `str`, tensor or vector still cannot be captured (`E0418`,
+  `tests/fail/closure_capture_slice.wk`; `tests/run/closure_captures.wk`,
+  `tests/run/closure_capture_out_params.wk`).
 - **Added: closure parameters inferred from the call's other arguments.** When the expected type
   names a callee generic, the other arguments bind it first (non-literals, then literals at their
   default type), so `fold3(|a, b| a * 10 + b, x, y, 3)` with `x: i64` types `a, b: i64` and

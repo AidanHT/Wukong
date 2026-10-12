@@ -94,6 +94,10 @@ pub(crate) struct MethodState {
     receivers: HashSet<Symbol>,
     /// The subset of `receivers` whose receiver is `mut self` / `&mut self`.
     mut_receivers: HashSet<Symbol>,
+    /// Each function's `mut` parameters, by position (a receiver is position 0). An aggregate
+    /// argument is passed by reference, so the callee writes one bound there in place
+    /// (`closures.rs`, [`Sema::note_mut_arg_writes`]).
+    pub(crate) mut_params: HashMap<Symbol, Vec<usize>>,
     /// `(trait, type)` for every `impl Trait for Type`.
     impls: HashSet<(Symbol, Symbol)>,
     /// Each function's trait bounds: `(generic, traits)` in declaration order.
@@ -260,6 +264,12 @@ impl Sema<'_> {
         for item in &module.items {
             if let ItemKind::Fn(f) = &item.kind {
                 decls.insert(f.name.sym, f);
+                let muts: Vec<usize> = (0..f.params.len())
+                    .filter(|&i| f.params[i].mutable)
+                    .collect();
+                if !muts.is_empty() {
+                    self.methods.mut_params.insert(f.name.sym, muts);
+                }
                 if f.params
                     .first()
                     .is_some_and(|p| Some(p.name.sym) == self_word)
@@ -968,6 +978,8 @@ impl Sema<'_> {
             }
         }
         self.adapt_scalar_literals(&sig.params, args, &mut arg_tys, offset);
+        // A closure passing a variable it captures to a `mut` aggregate parameter shares it.
+        self.note_mut_arg_writes(target, args, offset);
         // The receiver is no function value; check the written arguments against the parameters
         // after it.
         let rest = FnSig {
