@@ -1862,6 +1862,21 @@ a read that may come from a buffer the kernel writes keeps the loop. An elementw
 (one per statement of a fused body) is guarded over every operand of every pass, because loop
 fission is itself an alias-sensitive transformation.
 
+**The GEMM bias preflight.** A recognized GEMM whose fused epilogue reads its per-column bias from
+the GEMM's own output (or from a buffer the whole-program alias facts cannot separate from it) must
+keep the source order of those reads, and dispatching or outlining an ENCLOSING loop first would
+hide the dependency from the inner loop's decline. So before a loop is lowered, `GemmBiasAlias`
+walks its whole subtree (every loop nest, and every GEMM + bias/dequant epilogue statement window);
+a hit lowers the subtree with recognition and `@parallel` off, and a hit window keeps its two
+statements in source order even with recognition off. `lower_for` asks at every loop, so the walk is
+memoized (`bias_memo.rs`, N65): each loop and block it proves clean is recorded by ADDRESS for the
+dynamic extent of the `lower_for` whose borrow keeps the node alive, and a nested loop, or a block's
+per-statement window probe, that an enclosing walk already covered is answered from the record.
+Recognizer probes grow linearly with nest depth instead of quadratically. A `NodeId` key would be
+unsound — a fused body reuses its first member's id and synthesized tails carry `NodeId::DUMMY` —
+and only negative answers are cached, so the memo changes no MIR
+(`corpus_mir_is_identical_with_and_without_the_bias_alias_memo`).
+
 **Empty ranges.** A recognized reduction keeps what the source loop writes for a zero or negative
 extent: the storing reductions dispatch only on a positive reduction extent and lower the source
 otherwise (`emit_nonempty_reduction`), and the value-returning ones (`wukong_sreduce_f32_parallel`,

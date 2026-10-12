@@ -5,6 +5,27 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Compile time: the GEMM bias-alias preflight walks each loop once (`gap6/gemm-bias-memo`, N65)
+
+- **Fixed: quadratic recognizer work on deep loop nests.** Before any kernel is substituted or a
+  loop outlined, lowering checks the loop's whole subtree for a recognized GEMM whose fused epilogue
+  rereads its own output as the per-column bias. Every `for` asked again, so a loop at depth `k` was
+  walked by each of its `k` ancestors: a `d`-deep nest with one loop and one two-statement window
+  per level took `d² + d - 1` recognizer probes (one probe runs the GEMM recognizers on one loop or
+  window); it now takes `2d - 1`. The walk records every loop and block it proves clean, keyed by
+  the node's ADDRESS for exactly as long as the `lower_for` borrow that keeps the node alive (a
+  `NodeId` key is unsound: a fused body reuses its first member's id and synthesized tails carry
+  `NodeId::DUMMY`), and an inner loop, or a block's per-statement window probe, already covered by
+  an enclosing walk is answered from that record. A 6-deep nest now takes 11 probes instead of 41
+  (8-deep: 15 instead of 71; in a `@parallel` function, whose outliner eligibility check walks the
+  body once more, 22 instead of 52); over the 580 corpus programs the lib harness lowers, 4,652
+  instead of 5,407, and `examples/gpt2_forward_bench_small.wk` 111 instead of 230.
+- **No dispatch change.** Only negative answers are recorded and the preflight is a pure function
+  of the AST, so lowering is unchanged: `tests/recognizer-census.txt` regenerates byte-identical,
+  and `corpus_mir_is_identical_with_and_without_the_bias_alias_memo` lowers every corpus program
+  with the memo on and off and compares the printed MIR. `cargo test -p wukong_mir_build --lib
+  bias_memo -- --nocapture` prints the counts; the linear-growth test pins them.
+
 ### Stack-slot coloring (`gap6/stack-coloring`)
 
 - **Allocas with disjoint lifetimes share one native frame slot (N86).** The Cranelift backend
