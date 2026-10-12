@@ -11,7 +11,10 @@ All notable changes to Wukong are documented here. The format is loosely based o
   files — or every `*.wk` under a directory, in sorted order — in one canonical style, keeping every
   comment. Files are rewritten only when they change (through `<file>.fmt.tmp` and a rename);
   `--check` writes nothing, lists the files that would change and exits 1; `--stdout` prints one
-  file's result; `-` formats standard input to standard output. A syntax error exits 1 with the
+  file's result; `-` formats standard input to standard output. A rewritten file keeps its
+  permissions. A `.wk` symbolic link, named directly or found in a directory, is rewritten at the
+  file it points to and stays a link. A read-only file is refused (exit 3, untouched), and a link
+  to a directory found inside a searched directory is not followed. A syntax error exits 1 with the
   compiler's own diagnostics, an unreadable path exits 3, a usage error exits 2. `fmt` is a
   subcommand only as the first argument; compile a file literally named `fmt` as `./fmt`.
 - **It never changes what a program means.** Every output is re-lexed and re-parsed and must give

@@ -373,8 +373,10 @@ and declares every runtime symbol with the signature `wukong_runtime` defines it
 `.wk` files (or every `*.wk` under a directory) into one canonical style and keeps every comment.
 It never changes what a program means: each result is re-parsed and must give the identical AST,
 the same comments and the same identifiers, literals and keywords, or the file is left untouched
-and reported (exit 2). `--check` writes nothing and lists the files that would change (exit 1). The
-repository's own corpus is not reformatted yet, so `fmt --check` on it lists files.
+and reported (exit 2). `--check` writes nothing and lists the files that would change (exit 1). A
+rewritten file keeps its permissions, a symbolic link is rewritten at the file it points to and
+stays a link, and a read-only file is refused (exit 3). The repository's own corpus is not
+reformatted yet, so `fmt --check` on it lists files.
 
 The GPU backend is the only opt-in part of the tree, so `cargo test` neither compiles nor runs it:
 pair every run with `cargo check --features gpu --all-targets`. With `--features gpu` on a machine

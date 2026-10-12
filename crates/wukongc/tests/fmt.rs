@@ -209,6 +209,132 @@ fn usage_errors_exit_2_and_io_errors_exit_3() {
     assert_eq!(code, Some(3), "{err}");
 }
 
+/// Make `link` a symbolic link to the file `target`. False where this account cannot create one
+/// (Windows without Developer Mode or the symbolic-link privilege).
+#[cfg(unix)]
+fn symlink_file(target: &Path, link: &Path) -> bool {
+    std::os::unix::fs::symlink(target, link).is_ok()
+}
+#[cfg(windows)]
+fn symlink_file(target: &Path, link: &Path) -> bool {
+    std::os::windows::fs::symlink_file(target, link).is_ok()
+}
+
+/// Make `link` a symbolic link to the directory `target`.
+#[cfg(unix)]
+fn symlink_dir(target: &Path, link: &Path) -> bool {
+    std::os::unix::fs::symlink(target, link).is_ok()
+}
+#[cfg(windows)]
+fn symlink_dir(target: &Path, link: &Path) -> bool {
+    std::os::windows::fs::symlink_dir(target, link).is_ok()
+}
+
+/// A `.wk` file that is a symbolic link is rewritten at the file it points to, and the link stays
+/// a link. This holds whether the link is found in a searched directory or named directly.
+/// Renaming the formatted text over the link itself would replace the link with a regular file and
+/// leave its target unformatted. A link to a directory inside a searched directory is not
+/// followed: one pointing at an ancestor would otherwise recurse until the path is too long.
+#[test]
+fn a_symlinked_file_is_formatted_at_its_target_and_stays_a_link() {
+    let dir = scratch("symlink");
+    let shared = dir.join("shared");
+    let kernels = dir.join("kernels");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::create_dir_all(&kernels).unwrap();
+    let target = shared.join("kern.wk");
+    let link = kernels.join("kern.wk");
+    std::fs::write(&target, UNFORMATTED).unwrap();
+    if !symlink_file(&target, &link) {
+        eprintln!("SKIPPED: this account cannot create symbolic links");
+        return;
+    }
+    assert!(
+        symlink_dir(&dir, &kernels.join("loop")),
+        "a file link was created but a directory link was not"
+    );
+    let is_link = |p: &Path| {
+        std::fs::symlink_metadata(p)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    };
+
+    for arg in [&kernels, &link] {
+        std::fs::write(&target, UNFORMATTED).unwrap();
+        let (code, out, err) = wukongc(&["fmt", &s(arg)], "");
+        assert_eq!(code, Some(0), "fmt {arg:?}\nstdout: {out}\nstderr: {err}");
+        assert!(
+            is_link(&link),
+            "fmt {arg:?} replaced the link with a regular file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            FORMATTED,
+            "fmt {arg:?} left the link's target unformatted"
+        );
+        assert!(!shared.join("kern.wk.fmt.tmp").exists());
+        assert!(!kernels.join("kern.wk.fmt.tmp").exists());
+        let (code, out, _) = wukongc(&["fmt", "--check", &s(&shared)], "");
+        assert_eq!(code, Some(0), "the target still needs formatting: {out}");
+    }
+}
+
+/// A read-only file that would change is refused with exit 3 and left as it was: the same bytes,
+/// still read-only. Renaming over it would succeed on Unix and silently undo the protection.
+#[test]
+fn a_read_only_file_is_refused_and_left_unchanged() {
+    let dir = scratch("readonly");
+    let f = dir.join("ro.wk");
+    std::fs::write(&f, UNFORMATTED).unwrap();
+    let mut p = std::fs::metadata(&f).unwrap().permissions();
+    p.set_readonly(true);
+    std::fs::set_permissions(&f, p).unwrap();
+
+    let (code, out, err) = wukongc(&["fmt", &s(&f)], "");
+    let still_read_only = std::fs::metadata(&f).unwrap().permissions().readonly();
+    let text = std::fs::read_to_string(&f).unwrap();
+    let (check, listed, _) = wukongc(&["fmt", "--check", &s(&f)], "");
+    // Make the file writable again first, so a failed assertion still leaves a scratch directory
+    // that can be removed (Windows will not delete a read-only file).
+    let mut p = std::fs::metadata(&f).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    p.set_readonly(false);
+    std::fs::set_permissions(&f, p).unwrap();
+
+    assert_eq!(code, Some(3), "stdout: {out}\nstderr: {err}");
+    assert!(
+        err.contains("read-only") && err.contains("file left unchanged"),
+        "{err}"
+    );
+    assert!(still_read_only, "the file lost its read-only protection");
+    assert_eq!(text, UNFORMATTED);
+    assert!(
+        !dir.join("ro.wk.fmt.tmp").exists(),
+        "temporary file left behind"
+    );
+    // `--check` writes nothing, so it still works on a read-only file.
+    assert_eq!(check, Some(1));
+    assert!(listed.contains("ro.wk"), "{listed}");
+}
+
+/// A rewritten file keeps its permission bits (an exec bit, a group-only mode) instead of taking
+/// the defaults a newly created file gets.
+#[cfg(unix)]
+#[test]
+fn a_rewritten_file_keeps_its_permission_bits() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("mode");
+    let f = dir.join("exec.wk");
+    std::fs::write(&f, UNFORMATTED).unwrap();
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o750)).unwrap();
+    let (code, out, err) = wukongc(&["fmt", &s(&f)], "");
+    assert_eq!(code, Some(0), "stdout: {out}\nstderr: {err}");
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), FORMATTED);
+    let mode = std::fs::metadata(&f).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode, 0o750, "mode {mode:o}");
+}
+
 /// Copy `from` (recursively) into `to`.
 fn copy_tree(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();

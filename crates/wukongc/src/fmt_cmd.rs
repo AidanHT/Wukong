@@ -3,7 +3,8 @@
 //! The formatter refuses rather than change a program's meaning: a file it cannot reprint with an
 //! identical AST, the same comments and the same identifier, literal and keyword tokens is left
 //! untouched and reported (exit 2). Files are rewritten only when their formatted text differs,
-//! through a `<file>.fmt.tmp` written next to the file and renamed over it.
+//! through a `<file>.fmt.tmp` written next to the file and renamed over it (see
+//! `write_atomically` for symbolic links, permissions and read-only files).
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -20,9 +21,12 @@ USAGE:
     wukongc fmt [--check] [--stdout] <path|->...
 
     Each <path> is a .wk file, or a directory searched recursively for *.wk files (in sorted
-    order). `-` reads one program from standard input and writes it to standard output. Files
-    are rewritten in place only when their formatted text differs. (`fmt` is a subcommand only
-    as the first argument: to compile a file literally named `fmt`, pass it as `./fmt`.)
+    order; a link to a directory found inside it is not followed). `-` reads one program from
+    standard input and writes it to standard output. Files are rewritten in place only when
+    their formatted text differs, keeping their permissions; a symbolic link is rewritten at
+    the file it points to and stays a link, and a read-only file is refused (exit 3). (`fmt` is
+    a subcommand only as the first argument: to compile a file literally named `fmt`, pass it
+    as `./fmt`.)
 
 OPTIONS:
     --check     Write nothing; print each file that would change, and exit 1 if any would
@@ -37,7 +41,7 @@ EXIT CODES:
     0  every file is formatted (or was rewritten)
     1  a syntax error, or --check found a file that would change
     2  a usage error, or a file the formatter cannot format without changing its meaning
-    3  a file or directory could not be read or written
+    3  a file or directory could not be read or written, or a file to rewrite is read-only
 ";
 
 /// Run `wukongc fmt <args>`. The printer and the self-check recurse with the program's nesting, so
@@ -149,15 +153,20 @@ fn run_inner(args: &[String]) -> i32 {
     code
 }
 
-/// Every `*.wk` file under `dir`, recursively, in sorted order.
+/// Every `*.wk` file under `dir`, recursively, in sorted order. A symbolic link to a directory is
+/// not followed: one that points at an ancestor would recurse until the path is too long, and one
+/// that points elsewhere would format files outside the tree that was named. A link to a `.wk`
+/// file is listed; `write_atomically` rewrites the file it points to.
 fn collect_wk(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?
-        .map(|e| e.map(|e| e.path()))
+    let mut entries: Vec<(PathBuf, std::fs::FileType)> = std::fs::read_dir(dir)?
+        .map(|e| e.and_then(|e| Ok((e.path(), e.file_type()?))))
         .collect::<std::io::Result<_>>()?;
-    entries.sort();
-    for p in entries {
-        if p.is_dir() {
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    for (p, kind) in entries {
+        if kind.is_dir() {
             collect_wk(&p, out)?;
+        } else if kind.is_symlink() && p.is_dir() {
+            // A linked directory: not followed.
         } else if p.extension().is_some_and(|x| x == "wk") {
             out.push(p);
         }
@@ -198,7 +207,7 @@ fn format_one(name: &str, path: Option<&Path>, src: &str, mode: &Mode) -> i32 {
             match write_atomically(path, &out) {
                 Ok(()) => exit::OK,
                 Err(e) => {
-                    eprintln!("wukongc fmt: cannot write {name}: {e}");
+                    eprintln!("wukongc fmt: cannot write {name}: {e}; file left unchanged");
                     exit::IO_ERROR
                 }
             }
@@ -221,16 +230,34 @@ fn format_one(name: &str, path: Option<&Path>, src: &str, mode: &Mode) -> i32 {
     }
 }
 
-/// Write `<file>.fmt.tmp` next to `path`, then rename it over `path`.
+/// Replace the contents of the file `path` names with `text`. The text is written to
+/// `<file>.fmt.tmp` next to that file, given the file's permissions, and renamed over it, so a
+/// failure at any step leaves the file as it was.
+///
+/// - `path` may be a symbolic link, named directly or found in a directory. The link is resolved
+///   first, so the file it points to is rewritten and the link stays a link. Renaming over the
+///   link itself would replace it with a regular file and leave its target unformatted.
+/// - The renamed file would otherwise get a new file's default mode, losing an exec bit or a
+///   restrictive mode, so the original's permissions are copied onto the temporary file first.
+/// - A read-only file is refused rather than replaced. The rename would succeed on Unix and
+///   silently undo the protection; on Windows it fails anyway.
 fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
-    let mut tmp = path.as_os_str().to_owned();
+    let target = std::fs::canonicalize(path)?;
+    let perms = std::fs::metadata(&target)?.permissions();
+    if perms.readonly() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "the file is read-only",
+        ));
+    }
+    let mut tmp = target.as_os_str().to_owned();
     tmp.push(".fmt.tmp");
     let tmp = PathBuf::from(tmp);
-    if let Err(e) = std::fs::write(&tmp, text) {
+    let written = std::fs::write(&tmp, text)
+        .and_then(|()| std::fs::set_permissions(&tmp, perms))
+        .and_then(|()| std::fs::rename(&tmp, &target));
+    if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
-        return Err(e);
     }
-    std::fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
+    written
 }
