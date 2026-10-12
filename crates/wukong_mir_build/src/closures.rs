@@ -298,12 +298,17 @@ impl Lifter<'_> {
         let StmtKind::Let {
             pat,
             init: Some(init),
+            mutable,
             ..
         } = &mut s.kind
         else {
             return None;
         };
-        if !matches!(init.kind, ExprKind::Closure { .. }) || !matches!(pat.kind, PatKind::Ident(_))
+        // A `let mut` of a closure is a function variable holding the lifted function's address
+        // (sema refuses one whose closure captures, `E0422`): lifted like a literal anywhere else.
+        if *mutable
+            || !matches!(init.kind, ExprKind::Closure { .. })
+            || !matches!(pat.kind, PatKind::Ident(_))
         {
             return None;
         }

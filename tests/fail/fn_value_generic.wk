@@ -1,0 +1,16 @@
+// EXPECT-CODE: E0429
+// EXPECT-COUNT: 1
+module tests.fail.fn_value_generic
+
+// A generic function is compiled once per instantiation, chosen at each call from its arguments,
+// so it has no single address to store. Wrap it in a non-generic function of the concrete type
+// (`fn id_i32(x: i32) -> i32 { return id(x); }`) and use that.
+
+fn id<T>(x: T) -> T {
+    return x;
+}
+
+fn main() -> i32 {
+    let f: fn(i32) -> i32 = id; //~ E0429
+    return f(3);
+}

@@ -627,7 +627,8 @@ mod tests {
     }
 
     /// Programs that between them reach every stage: inlining, the loop passes and the vectorizer,
-    /// complete unrolling, SLP packing, switch formation and tail-call elimination.
+    /// complete unrolling, SLP packing, switch formation, tail-call elimination and
+    /// devirtualization (which repeats the inlining and the fixpoint).
     const LAW_PROGRAMS: &[&str] = &[
         "examples/fib.wk",
         "examples/saxpy_array.wk",
@@ -638,6 +639,7 @@ mod tests {
         "tests/run/vec5_slp_bundles.wk",
         "tests/run/vec5_scatter.wk",
         "tests/run/scalar_gvn_unroll.wk",
+        "tests/run/fn_values_devirt.wk",
     ];
 
     fn lower(rel: &str) -> (Program, Interner) {

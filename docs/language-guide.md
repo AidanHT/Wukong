@@ -143,9 +143,9 @@ hijack kernel dispatch silently. The restriction applies to function names only 
 
 ### Function-typed parameters ✅
 
-A parameter may have a **function type**, `fn(A, B) -> R` (`fn(A)` for `()`), and every call binds it
-to a function **named at compile time** — a non-generic top-level function, or the caller's own
-function-typed parameter passed along:
+A parameter may have a **function type**, `fn(A, B) -> R` (`fn(A)` for `()`). A call that passes a
+function **named at compile time** — a non-generic top-level function, a closure literal, or the
+caller's own function-typed parameter passed along — binds it statically:
 
 ```wukong
 fn square(x: f32) -> f32 { return x * x; }
@@ -158,22 +158,76 @@ fn main() -> i32 {
 }
 ```
 
-There are no function pointers at run time: the callee is **specialized per bound function** exactly
-like a type-generic function is per type (`apply$square`), the function parameter carries no value,
-and a call through it is a direct call — inlinable, and visible to every kernel recognizer. A
+Such a call uses no function pointer: the callee is **specialized per bound function** exactly like a
+type-generic function is per type (`apply$square`), the function parameter carries no value, and a
+call through it is a direct call — inlinable, and visible to every kernel recognizer. A
 type-generic higher-order function binds its type parameters from the function argument too
-(`fn fold3<T>(op: fn(T, T) -> T, a: T, b: T, c: T) -> T`). The rules (`E0411` otherwise): a function
-type is only a parameter's type, or the annotation of a `let` that binds a closure
-(`let f: fn(f32) -> f32 = |x| x * k;`, see [Closures](#closures-)) — not another local's, a field's,
-an element's, a return type or an `extern` parameter's; a named function cannot be bound to a `let`
-(a closure can) or passed to a non-function parameter; the argument must name a function, not
-compute one; and a function-typed parameter is neither `mut` nor named after a builtin (`gelu`,
-`print`, …). A wrong signature is the ordinary `E0401` type mismatch. A parameter whose type
+(`fn fold3<T>(op: fn(T, T) -> T, a: T, b: T, c: T) -> T`). Any other argument of the function type —
+a [function value](#function-values-) held in a local, a field or an element, or returned by a
+call — is passed at run time: the callee gets one more instance that takes the pointer and calls
+through it (`apply$fn1$f32$to$f32`). The rules: a function-typed parameter is neither `mut` nor
+named after a builtin (`gelu`, `print`, …), and an `extern` signature cannot spell a function type
+(`E0411`); a generic function is no value to pass (`E0429`); a wrong signature is the ordinary
+`E0401` type mismatch. A parameter whose type
 names a dimension generic of the callee (`fn mapn<N>(f: fn(Tensor[f32, N]) -> f32, t: Tensor[f32, N])`)
 accepts a function of the extent the call binds: from the function itself (`fn head(t: Tensor[f32, 4])`
 binds `N = 4`) or from another argument, the first binding winning and every other argument checked
 against it (`E0401` at the function, `E0501` at a buffer). `tests/run/fn_params.wk`,
 `tests/run/closure_infer.wk`.
+
+### Function values ✅
+
+A function type is an ordinary **value type**: a local (`let`, `let mut`, reassigned), a struct
+field, an array or tuple element, a return value and a parameter can each hold a `fn(A, B) -> R`,
+and a call through any of them calls the function it holds:
+
+```wukong
+struct Op { code: i32, apply: fn(i32, i32) -> i32 }
+
+fn add(a: i32, b: i32) -> i32 { return a + b; }
+fn mul(a: i32, b: i32) -> i32 { return a * b; }
+fn pick(neg: bool) -> fn(i32) -> i32 {
+    if neg { return |x| 0 - x; }               // a closure that captures nothing
+    return |x| x;
+}
+
+fn main() -> i32 {
+    let ops: [fn(i32, i32) -> i32; 2] = [add, mul];
+    let mut f = ops[0];
+    print(f(2, 3));                            // 5
+    f = mul;
+    print(f(2, 3));                            // 6
+    let o = Op { code: 1, apply: add };
+    print(o.apply(o.code, 4));                 // 5: a field called like a method
+    print(pick(true)(9));                      // -9
+    return 0;
+}
+```
+
+- **What makes one.** A named non-generic function (`add`), a closure literal that captures
+  nothing (`|x| 0 - x`, typed from where it goes: a `let mut`, a `return`, an assignment, a field
+  or an element), or a closure-bound local whose closure captures nothing. A closure that
+  captures is not a value — the value is only a code address, with no room for what the closure
+  captured (`E0427`; such a closure can still be called through its `let` and passed directly to
+  a function-typed parameter); neither is a generic function, nor one with a tensor parameter of
+  run-time extent (`?`), nor an `extern` one (`E0429`). A function that itself takes
+  function-typed parameters is a value too: its address is the instance that takes each of them
+  at run time.
+- **What one does.** Called (`f(x)`, `ops[i](a, b)`, `pick(1)(3)`, `s.apply(x)` for a field that
+  is no method), passed to a function-typed parameter, copied, stored, returned, captured by a
+  closure (copied like a pointer). Comparing two (`==`, `<`) is `E0428`: which functions share an
+  address is the compiler's choice, so keep a tag beside the function and compare that. A value
+  has exactly its type: assigning, returning or storing one of another signature is `E0401`, and
+  so is giving one where a number, pointer or aggregate is expected. A local of function type
+  cannot be named after a builtin (`E0411`).
+- **What it costs.** A call through a value is one indirect call (`call_indirect` in
+  `--emit=mir`). Where the optimizer can see which function a value holds — a `let` of a named
+  function, a value passed into a function it inlined — the call becomes a direct call again
+  (`-O1`), which `-O2` inlines like any other. A value that crosses an `extern` boundary,
+  `--backend=gpu-native` (the function is declined, an `UNSUPPORTED` skip) and automatic
+  differentiation of a loss that calls through one (refused by name) are not supported.
+
+`tests/run/{fn_values,fn_values_dispatch,fn_values_devirt}.wk`.
 
 ### Closures ✅
 
@@ -197,13 +251,16 @@ fn main() -> i32 {
 - **Where.** As an argument of a function-typed parameter — of a call to a function, a method
   (`v.map(|a| a * k)`, `V::make(|i| ..)`), a function-typed parameter or a closure-bound local — or
   as the initializer of a `let`. A **closure-bound local** (`let f = |x: f32| x * k;`) can be called
-  (`f(2.0)`) and passed to a function-typed parameter (`apply(f, 3.0)`), and nothing else: copying,
-  returning, storing, printing or computing with it is `E0421`, because it has no run-time value —
-  every use is resolved to the closure at compile time. The binding is one immutable name
-  (`let mut`, a pattern or a reassignment `f = ..` is `E0422`); an annotation, if any, is its
-  function type (`let f: fn(f32) -> f32 = |x| x * k;`). Anywhere else — returned, stored in a field
-  or element, an operand, a `const` initializer, a `where` predicate or a `static_assert` — a
-  closure is `E0411`: there are no run-time function values.
+  (`f(2.0)`) and passed to a function-typed parameter (`apply(f, 3.0)`); every use is resolved to
+  the closure at compile time. When the closure captures, that is all: copying, returning, storing,
+  printing or computing with it is `E0421`, because a [function value](#function-values-) has no
+  room for the captured values, and the binding is one immutable name (a pattern, a reassignment
+  `f = ..`, or `let mut` of a capturing closure is `E0422`). A closure that captures nothing is a
+  function value as well. An annotation, if any, is its function type
+  (`let f: fn(f32) -> f32 = |x| x * k;`). Anywhere else in a function body — a `let mut`, returned,
+  assigned, stored in a field or element — a closure is a function value, legal when it captures
+  nothing (`E0427` otherwise); a `const` initializer, a `where` predicate or a `static_assert` cannot
+  hold one (`E0411`).
 - **Parameters and return type.** Each parameter is a name with an optional `: Type` (no patterns,
   no `mut`). An unannotated parameter takes the type the function-typed parameter declares for it.
   When that names a generic parameter of the callee (`fn fold3<T>(f: fn(T, T) -> T, a: T, ..)`), even
@@ -248,7 +305,8 @@ fn main() -> i32 {
 It costs nothing at run time: the closure is lifted to a function whose leading parameters are its
 captures (a pointer for one it writes), and the callee is specialized per closure exactly as per named
 function (`apply$main$closure$0`), so a call through `f`, or through a closure-bound local, is a
-direct call — no function pointer, no heap environment, and inlined like any call at `-O2`.
+direct call — no function pointer, no heap environment, and inlined like any call at `-O2`. Only a
+closure used as a function value is reached through a pointer, like any other function value.
 `tests/run/{closures,closure_let,closure_method,closure_captures,closure_capture_out_params,closure_wide_counter,closure_infer}.wk`.
 
 ### Generic functions and dtype-generic tensors ✅

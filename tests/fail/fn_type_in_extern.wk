@@ -1,0 +1,15 @@
+// EXPECT-CODE: E0411
+// EXPECT-COUNT: 1
+module tests.fail.fn_type_in_extern
+
+// A function type is an ordinary value type in Wukong code, but an `extern "C"` signature cannot
+// spell one: the C side has no Wukong function values (the interpreter's are not machine
+// addresses). Pass C callbacks through C.
+
+extern "C" {
+    fn qsort_like(cmp: fn(i32, i32) -> i32) -> i32; //~ E0411
+}
+
+fn main() -> i32 {
+    return 0;
+}

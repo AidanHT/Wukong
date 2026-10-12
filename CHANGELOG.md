@@ -5,6 +5,52 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### First-class function values and indirect calls (`gap7/fn-values`, N27)
+
+- **Added: function values.** A function type `fn(A, B) -> R` is an ordinary value type: a local
+  (`let`, `let mut`, reassigned), a struct field, an array or tuple element, a return value, a
+  closure's capture. A named non-generic function or a closure that captures nothing makes one; a
+  call through any of them (`f(x)`, `ops[i](a, b)`, `pick(1)(x)`, `s.op(x)` for a field that is no
+  method) calls the function it holds. A function-typed parameter given a run-time value gets one
+  more instance that takes the pointer (`apply$fn1$f32$to$f32`), so higher-order functions accept a
+  run-time choice; given a named function or a closure it is still specialized with no pointer.
+  The address of a function with function-typed parameters is that pointer-taking instance.
+  `tests/run/{fn_values,fn_values_dispatch,fn_values_devirt}.wk`, interp == native at `-O0`/`-O2`.
+- **Added: `Op::CallIndirect`**, `call_indirect vF(vA, ..) -> T`: the verifier (a pointer callee;
+  under `verify_program`, a visible `func_addr g` must have exactly `g`'s signature), the printer
+  and the typed MIR text, the interpreter (the `FUNC_TAG` index; anything else is an error), Cranelift
+  `call_indirect` for the JIT and objects (a caller polls the failure status after it, since the
+  callee may fail an assertion), the LLVM text (`call T %f(..)`); `gpu-native` declines it
+  (`UNSUPPORTED`), autodiff refuses a loss that makes one.
+- **Added: devirtualization.** An indirect call whose callee is a visible `func_addr` of a function
+  with its signature becomes a direct call after the per-function pipeline (`-O1`), and the program
+  is optimized again around it (inlined at `-O2`). It is a program step, not a pass: the call-effect
+  table a function's passes see is schedule-dependent for symbols other than its direct callees, so
+  a call created mid-fixpoint could make the MIR depend on the thread count. `--passes` has the new
+  program step `devirt`, in both `-O` lists.
+- **Changed: one effect classification for the optimizer.** `wukong_mir::Effects` (`Op::effects`,
+  exhaustive) says what each op may do — read, write, call out, trap, synchronize, allocate — and
+  every `wukong_opt` pass that kept its own opcode list beside a permissive `_` arm asks it instead
+  (alias, bce, cse, dce, dse, the call summaries, fuse, jump_thread, licm, loop_delete, loop_info,
+  slp, unroll, unroll_jam, unswitch, vec256, vectorize). No behaviour change: the corpus MIR is
+  byte-identical. `wukong_opt::indirect_tests` pins, per pass, what may not happen to an indirect
+  call (two identical calls kept and ordered, a store before one not dropped, none hoisted, a caller
+  of one not summarized pure, no loop around one deleted or vectorized).
+- **New diagnostics:** `E0427` a closure that captures used as a run-time function value (also
+  from lowering, for a function-typed parameter bound to one and used as a value); `E0428` two
+  function values compared; `E0429` a generic, `extern` or run-time-extent function used as a value.
+  `E0411` now covers only an `extern` signature with a function type, a `mut` or builtin-named
+  function-typed parameter or local, and a closure outside a function body; `E0421`/`E0422` apply to
+  closures that capture (a capture-free one is a value, and `let mut` of it a function variable).
+  `tests/fail/{closure_value_captures,closure_param_value_captures,fn_value_compare,fn_value_generic,fn_type_in_extern}.wk`;
+  `tests/fail/{closure_outside_argument,fn_value_binding,lower_function_value}.wk` are gone (each is
+  a legal program now).
+- **Fixed: inlining a call that discards a value-returning callee's result** branched every `ret v`
+  of the copy to a continuation with no parameter (legal MIR the inliner mishandled; a devirtualized
+  result-less indirect call produced it). The continuation now takes the value and drops it.
+- **Sharp edges (roadmap):** no C callbacks, no `gpu-native`, no autodiff through a function
+  value; a closure that captures still has no run-time value (no heap environment).
+
 ### First-class 128-bit integers: `i128` and `u128` (`gap6/i128`, N25)
 
 - **Added: the `i128` and `u128` scalar types.** 16 bytes, 16-byte aligned, in every position a

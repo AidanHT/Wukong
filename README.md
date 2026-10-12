@@ -128,7 +128,12 @@ not duplicate them. In summary, Wukong:
   (`f: fn(f32) -> f32`) and compile-time-resolved closures (`apply(|x| x * scale, v)`, `let f = |x: f32| x * k;`, `v.map(|a| a * k)`; a read
   capture is copied, a written one shared by reference) are dispatched statically — every generic and higher-order function is specialized per
   instantiation (and per closure), so no vtable or function pointer exists at run time
-  (`tests/run/{methods_impl,traits_static_dispatch,fn_params,closures}.wk`). Every concrete instantiation
+  (`tests/run/{methods_impl,traits_static_dispatch,fn_params,closures}.wk`). Where a program does
+  want one, a **function value** is an ordinary value: `fn(T) -> R` in a `let mut`, a field, an
+  array element or a return value, made from a named function or a closure that captures nothing,
+  and called through the pointer — a dispatch table `ops[op](a, b)`, a higher-order function given
+  a run-time choice — and the optimizer turns a call whose function it can see back into a direct
+  call (`tests/run/fn_values*.wk`). Every concrete instantiation
   is type-checked again at its types; a tensor may be generic over its element (`Tensor[T, N]`,
   with `alloc::<T>(n)` as the generic heap allocator), one instance per dtype, and its `T = f32`
   instance reaches the kernel builtins (`E0415`/`E0416` for any other binding); and

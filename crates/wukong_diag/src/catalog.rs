@@ -617,21 +617,18 @@ fn main() -> i32 {
     ),
     entry!(
         "E0411",
-        "function value outside a function-typed parameter",
-        "Functions are passed by name to parameters of function type (`fn apply(f: fn(f32) -> f32, \
-         x: f32)`), and the callee is specialized for that function at compile time — there are no \
-         function pointers at run time. So a function type may only be the type of a parameter of a \
-         function with a body (not a local, field, element, return type or `extern` parameter); the \
-         argument must name a non-generic top-level function or forward the caller's own \
-         function-typed parameter; a function may not be bound to a `let` or passed to a \
-         non-function parameter; and a function-typed parameter may be neither `mut` nor named \
-         after a builtin (`gelu`, `print`, …), whose name the compiler reads as the builtin. Pass \
-         the function directly at each call instead. A closure literal (`|x| x * k`) is the other \
-         value such a parameter accepts: as an argument of a function-typed parameter of a call \
-         or a method call, or as the initializer of a `let` (`let f = |x: f32| x * k;`), whose \
-         name can then be called or passed on. Anywhere else — a `return`, a field or element, an \
-         operand, a `const` initializer, a `where` predicate or a `static_assert` — a closure is \
-         this error too."
+        "function type or closure where it is not allowed",
+        "A function type `fn(T) -> R` is an ordinary value type: a local (`let mut f`), a field, an \
+         element, a return value and a parameter can each hold a function value, made from a named \
+         non-generic function or a closure that captures nothing, and calling one calls the \
+         function it holds. A few places cannot have one. An `extern` declaration, or a function \
+         declared without a body, cannot spell a function type: the C side has no Wukong function \
+         values. A function-typed parameter cannot be `mut` (it names the function each call \
+         binds; copy it to a `let mut` local to reassign it). A function-typed parameter or local \
+         cannot be named after a builtin (`gelu`, `print`, ...): kernel recognizers and the \
+         vectorizer read a call `gelu(x)` as the builtin unless a top-level function shadows it. \
+         And a closure literal is an expression of a function body: a `const` initializer, a \
+         `where` predicate or a `static_assert` cannot hold one."
     ),
     entry!(
         "E0415",
@@ -710,26 +707,29 @@ fn main() -> i32 {
     ),
     entry!(
         "E0421",
-        "a closure-bound local used as a value",
-        "A local bound to a closure (`let f = |x: f32| x * k;`) is resolved at compile time: each \
-         call `f(..)` is a direct call of the closure's code with the values it captured, and \
-         passing `f` to a function-typed parameter specializes the callee for it. So `f` has no \
-         run-time value, and the name can only be called or passed to a parameter of function \
-         type. Copying it to another local, returning it, storing it in a field, element or \
-         tuple, taking its address, printing it or computing with it is this error. Call it, or \
-         pass it on.",
-        bad: "module ex.e0421\nfn main() -> i32 {\n    let f = |x: i32| x + 1;\n    let g = f;\n    return g(1);\n}\n",
-        good: "module ex.e0421\nfn apply(f: fn(i32) -> i32, x: i32) -> i32 {\n    return f(x);\n}\nfn main() -> i32 {\n    let f = |x: i32| x + 1;\n    return apply(f, 1);\n}\n"
+        "a closure-bound local that captures, used as a value",
+        "A local bound to a closure that captures (`let f = |x: f32| x * k;`) is resolved at \
+         compile time: each call `f(..)` is a direct call of the closure's code with the values it \
+         captured, and passing `f` to a function-typed parameter specializes the callee for it. A \
+         run-time function value is only a code address, with no room for the captured values, so \
+         the name can only be called or passed to a parameter of function type. Copying it to \
+         another local, returning it, storing it in a field, element or tuple, taking its address, \
+         printing it or computing with it is this error. (A closure that captures nothing is an \
+         ordinary function value and can be used anywhere one can.) Call it, or pass it on.",
+        bad: "module ex.e0421\nfn main() -> i32 {\n    let k: i32 = 1;\n    let f = |x: i32| x + k;\n    let g = f;\n    return g(1);\n}\n",
+        good: "module ex.e0421\nfn apply(f: fn(i32) -> i32, x: i32) -> i32 {\n    return f(x);\n}\nfn main() -> i32 {\n    let k: i32 = 1;\n    let f = |x: i32| x + k;\n    return apply(f, 1);\n}\n"
     ),
     entry!(
         "E0422",
         "a closure bound by a `mut` binding or a pattern, or reassigned",
         "A closure-bound local names the one closure its `let` initializes it with, because every \
          call through it is resolved at compile time. So the binding must be a plain, immutable \
-         `let name = |..| ..;`: a `let mut`, a destructuring pattern, and an assignment `f = ..` \
-         to a closure-bound `f` are rejected. Bind each closure to a name of its own.",
-        bad: "module ex.e0422\nfn main() -> i32 {\n    let mut f = |x: i32| x + 1;\n    return f(1);\n}\n",
-        good: "module ex.e0422\nfn main() -> i32 {\n    let f = |x: i32| x + 1;\n    return f(1);\n}\n"
+         `let name = |..| ..;`: a destructuring pattern, an assignment `f = ..` to a \
+         closure-bound `f`, and a `let mut` of a closure that captures are rejected. (A `let mut` \
+         of a closure that captures nothing is an ordinary function variable, which can be \
+         reassigned.) Bind each closure to a name of its own.",
+        bad: "module ex.e0422\nfn main() -> i32 {\n    let k: i32 = 1;\n    let mut f = |x: i32| x + k;\n    return f(1);\n}\n",
+        good: "module ex.e0422\nfn main() -> i32 {\n    let k: i32 = 1;\n    let f = |x: i32| x + k;\n    return f(1);\n}\n"
     ),
     entry!(
         "E0423",
@@ -776,6 +776,47 @@ fn main() -> i32 {
          bind the text as a `str` first (`let s: str = ..`, or `str_from_utf8` of its bytes).",
         bad: "module ex.e0426\nfn main() -> i32 {\n    let n: i32 = 3;\n    return match n {\n        \"three\" => 1,\n        _ => 0,\n    };\n}\n",
         good: "module ex.e0426\nfn main() -> i32 {\n    let s: str = \"three\";\n    return match s {\n        \"three\" => 1,\n        _ => 0,\n    };\n}\n"
+    ),
+    entry!(
+        "E0427",
+        "a closure that captures used as a run-time function value",
+        "A run-time function value — a `fn(T) -> R` stored in a local, a field or an element, \
+         returned, or kept by the function it is passed to — is the address of code and nothing \
+         else. A named function or a closure that captures nothing can be one. A closure that \
+         reads or writes a local of the enclosing code needs that local (or a pointer to it) every \
+         time it runs, and the value has no room to carry it: there is no environment to allocate, \
+         keep alive or free. Such a closure can still be called through the `let` that binds it, or \
+         passed directly to a function-typed parameter the callee only calls or passes on (the \
+         callee is then specialized for it and receives the captured values). To store it, take \
+         the captured values as ordinary parameters, or capture nothing.",
+        bad: "module ex.e0427\nfn main() -> i32 {\n    let k: i32 = 3;\n    let mut f: fn(i32) -> i32 = |x| x;\n    f = |x| x + k;\n    return f(1);\n}\n",
+        good: "module ex.e0427\nfn main() -> i32 {\n    let mut f: fn(i32) -> i32 = |x| x;\n    f = |x| x + 3;\n    return f(1);\n}\n"
+    ),
+    entry!(
+        "E0428",
+        "function values cannot be compared",
+        "A function value is the address of compiled code, and which functions share an address \
+         is the compiler's choice, not the program's: the optimizer may merge, clone or inline a \
+         function, and the interpreter numbers functions where native code has addresses. So \
+         `f == g` (or `!=`, `<`, ...) on two function values would not mean the same thing on \
+         every backend and at every `-O` level, and is rejected. Keep a tag beside the function \
+         (an enum or an integer) and compare that.",
+        bad: "module ex.e0428\nfn one() -> i32 {\n    return 1;\n}\nfn main() -> i32 {\n    let f: fn() -> i32 = one;\n    let g: fn() -> i32 = one;\n    if f == g {\n        return 1;\n    }\n    return 0;\n}\n",
+        good: "module ex.e0428\nfn one() -> i32 {\n    return 1;\n}\nfn main() -> i32 {\n    let f: fn() -> i32 = one;\n    let g: fn() -> i32 = one;\n    if f() == g() {\n        return 1;\n    }\n    return 0;\n}\n"
+    ),
+    entry!(
+        "E0429",
+        "this function cannot be a run-time function value",
+        "A run-time function value is the address of one compiled function. A generic function \
+         (with type or dimension parameters) has no single address: it is compiled once per \
+         instantiation, chosen at each call from the arguments. An `extern` function, or one \
+         declared without a body, belongs to C, which the interpreter cannot call through a \
+         pointer. Neither can be stored, returned or passed as a value (a generic function is \
+         also refused as the argument of a function-typed parameter). Wrap it in a non-generic \
+         function of the concrete type (`fn id_i32(x: i32) -> i32 { return id(x); }`) and use \
+         that.",
+        bad: "module ex.e0429\nfn id<T>(x: T) -> T {\n    return x;\n}\nfn main() -> i32 {\n    let f: fn(i32) -> i32 = id;\n    return f(1);\n}\n",
+        good: "module ex.e0429\nfn id<T>(x: T) -> T {\n    return x;\n}\nfn id_i32(x: i32) -> i32 {\n    return id(x);\n}\nfn main() -> i32 {\n    let f: fn(i32) -> i32 = id_i32;\n    return f(1);\n}\n"
     ),
     entry!(
         "E0430",

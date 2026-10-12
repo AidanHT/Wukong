@@ -187,6 +187,9 @@ float_literal_suffix.wk:
 float_underscore.wk:
 fmax_int.wk:
 fn_params.wk:
+fn_values.wk:
+fn_values_devirt.wk:
+fn_values_dispatch.wk:
 for_array.wk:
 for_continue.wk:
 for_destructure.wk:

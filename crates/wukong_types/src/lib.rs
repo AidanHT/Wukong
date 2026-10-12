@@ -376,7 +376,8 @@ impl Ty {
         match self {
             Ty::Scalar(s) => Some(s.size()),
             Ty::Unit => Some(0),
-            Ty::Ptr { .. } | Ty::Ref { .. } => Some(8),
+            // A function value is one code address (`Op::FuncAddr`), the size of a pointer.
+            Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Fn { .. } => Some(8),
             Ty::Vector { elem, lanes } => Some(elem.size() * *lanes as u64),
             // A slice is a fat pointer — a `(data: *T, len: usize)` view — so it is a sized 16-byte
             // aggregate (8-byte pointer + 8-byte length), even though the *pointee* is unsized. This
@@ -406,7 +407,7 @@ impl Ty {
         match self {
             Ty::Scalar(s) => Some(s.align()),
             Ty::Unit => Some(1),
-            Ty::Ptr { .. } | Ty::Ref { .. } => Some(8),
+            Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Fn { .. } => Some(8),
             // An *alignment*, not the vector's size: `lanes` is documented as a power of two but
             // nothing rejects `f32x3`, and a 12-byte "alignment" makes the two aggregate-layout
             // authorities disagree. Identity for every power-of-two lane count.

@@ -364,6 +364,18 @@ fn mono_type_name(ty: &Ty, interner: &Interner) -> String {
             format!("t{}${}", fields.len(), parts.join("$"))
         }
         Ty::Unit => "unit".to_string(),
+        // A function type, spelled out: two generic instances at different function types (or a
+        // function-typed parameter bound to a run-time value of one, `methods::is_dynamic_fn`) must
+        // not share an instance name.
+        Ty::Fn { params, ret } => {
+            let parts: Vec<String> = params.iter().map(|t| mono_type_name(t, interner)).collect();
+            format!(
+                "fn{}${}$to${}",
+                params.len(),
+                parts.join("$"),
+                mono_type_name(ret, interner)
+            )
+        }
         _ => "x".to_string(),
     }
 }
@@ -508,17 +520,28 @@ impl MonoCollector<'_> {
             };
             bind_generics(pty, aty, tg, &mut subst);
         }
-        // Each function-typed parameter binds to the function its argument names.
+        // Each function-typed parameter binds to the function its argument names, or to a run-time
+        // function value of its type (`methods::fn_arg_binding`).
         if let Some(keys) = self.fn_value_keys.get(&name) {
             for &(i, key) in keys {
-                if let Some(f) = args
-                    .get(i)
-                    .and_then(|a| methods::fn_value_of(a, outer, self.sema, self.interner))
+                let (Some(a), Some(pty)) = (args.get(i), params.get(i)) else {
+                    continue;
+                };
+                if let Some(b) =
+                    methods::fn_arg_binding(a, pty, &subst, outer, self.sema, self.interner)
                 {
-                    subst.insert(key, Ty::Named(f));
+                    subst.insert(key, b);
                 }
             }
         }
+        self.register_instance(name, subst);
+    }
+
+    /// Register the instance of `name` under `subst`, if it is new.
+    fn register_instance(&mut self, name: Symbol, subst: HashMap<Symbol, Ty>) {
+        let Some(tg) = self.type_generics.get(&name) else {
+            return;
+        };
         let Some(canon) = canon_type_args(tg, &subst, self.interner) else {
             return;
         };
@@ -533,6 +556,51 @@ impl MonoCollector<'_> {
         self.instance_of.insert(key, mangled);
         self.instances.push((mangled, name, subst.clone()));
         self.worklist.push((name, subst));
+    }
+
+    /// The path `e` naming `sym` used as a value: when it names a function with function-typed
+    /// parameters (directly, or through this instance's binding of one), the function's address is
+    /// the instance that takes every such parameter at run time (`methods::dynamic_subst`).
+    fn note_fn_value(&mut self, e: &Expr, sym: Symbol, subst: &HashMap<Symbol, Ty>) {
+        let target = match methods::bound_fn(sym, subst, self.interner) {
+            Some(f) => f,
+            None if self.sema.fn_value_locals.contains(&e.id) => return,
+            None => sym,
+        };
+        if !matches!(self.sema.types.get(&e.id), Some(Ty::Fn { .. })) {
+            return;
+        }
+        let (Some(keys), Some(tg)) = (
+            self.fn_value_keys.get(&target),
+            self.type_generics.get(&target),
+        ) else {
+            return;
+        };
+        let Some(DefKind::Fn(sig)) = self.sema.defs.lookup(target).map(|d| &d.kind) else {
+            return;
+        };
+        if let Some(dynamic) = methods::dynamic_subst(keys, sig, tg) {
+            self.register_instance(target, dynamic);
+        }
+    }
+
+    /// The arguments of a call of `name` that bind its function-typed parameters at compile time
+    /// (`methods::fn_value_of`): their function is specialized into the callee, not taken as an
+    /// address, so they are not value uses.
+    fn static_fn_args(
+        &self,
+        name: Symbol,
+        args: &[Expr],
+        subst: &HashMap<Symbol, Ty>,
+    ) -> Vec<ast::NodeId> {
+        let Some(keys) = self.fn_value_keys.get(&name) else {
+            return Vec::new();
+        };
+        keys.iter()
+            .filter_map(|&(i, _)| args.get(i))
+            .filter(|a| methods::fn_value_of(a, subst, self.sema, self.interner).is_some())
+            .map(|a| a.id)
+            .collect()
     }
 
     fn walk_block(&mut self, b: &Block, subst: &HashMap<Symbol, Ty>) {
@@ -598,22 +666,48 @@ impl MonoCollector<'_> {
             | ExprKind::Str(_)
             | ExprKind::Char(_)
             | ExprKind::Bool(_)
-            | ExprKind::Path(_)
             | ExprKind::SizeOf(_)
             | ExprKind::AlignOf(_)
             | ExprKind::Closure { .. } => {}
+            ExprKind::Path(p) => {
+                if p.is_single() {
+                    self.note_fn_value(e, p.first().sym, subst);
+                }
+            }
             ExprKind::Unary { expr, .. } => self.walk_expr(expr, subst),
             ExprKind::Binary { lhs, rhs, .. } => {
                 self.walk_expr(lhs, subst);
                 self.walk_expr(rhs, subst);
             }
             ExprKind::Call { callee, args, .. } => {
-                self.walk_expr(callee, subst);
+                // A callee name is called, not taken as a value; neither is a function argument
+                // the callee is specialized for (only a closure value's captures are read).
+                let dispatched = methods::dispatch_in_instance(e, callee, args, subst, self.sema);
+                let statics = match (&dispatched, &callee.kind) {
+                    (Some((target, full)), _) => self.static_fn_args(*target, full, subst),
+                    (None, ExprKind::Path(p)) if p.is_single() => {
+                        let n = methods::bound_fn(p.first().sym, subst, self.interner)
+                            .unwrap_or_else(|| p.first().sym);
+                        self.static_fn_args(n, args, subst)
+                    }
+                    _ => Vec::new(),
+                };
+                if !matches!(callee.kind, ExprKind::Path(_)) {
+                    self.walk_expr(callee, subst);
+                }
                 for a in args {
-                    self.walk_expr(a, subst);
+                    match &a.kind {
+                        ExprKind::TupleLit(xs) if statics.contains(&a.id) => {
+                            for x in &xs[1..] {
+                                self.walk_expr(x, subst);
+                            }
+                        }
+                        _ if statics.contains(&a.id) => {}
+                        _ => self.walk_expr(a, subst),
+                    }
                 }
                 // A call through a trait bound reaches the instantiated type's method.
-                match methods::dispatch_in_instance(e, callee, args, subst, self.sema) {
+                match dispatched {
                     Some((target, full)) => self.handle_named_call(target, &full, subst),
                     None => self.handle_call(callee, args, subst),
                 }
@@ -3134,8 +3228,22 @@ fn lower_fn(
     // the order `lower_call` passes them (`closures.rs`).
     let mut param_vals: Vec<Option<ValueId>> = Vec::with_capacity(param_tys.len());
     let mut closure_env: Vec<(Symbol, usize, ValueId, Ty)> = Vec::new();
-    for (p, pty) in f.params.iter().zip(&param_tys) {
-        if methods::param_has_value(pty) {
+    // Which parameters are DECLARED function-typed (and so specialized): a generic parameter an
+    // instance binds to a function type is an ordinary run-time function value.
+    let declared_fn: Vec<bool> = match sema.defs.lookup(f.name.sym).map(|d| &d.kind) {
+        Some(DefKind::Fn(sig)) => sig
+            .params
+            .iter()
+            .map(|t| !methods::param_has_value(t))
+            .collect(),
+        _ => Vec::new(),
+    };
+    for (pi, (p, pty)) in f.params.iter().zip(&param_tys).enumerate() {
+        // A function-typed parameter this instance binds to a run-time function value receives
+        // the pointer and is an ordinary local (`methods::is_dynamic_fn`).
+        if !declared_fn.get(pi).copied().unwrap_or(false)
+            || methods::is_dynamic_fn(p.name.sym, subst, interner)
+        {
             let abi = fl.param_abi(pty);
             param_vals.push(Some(fl.builder.add_param(abi)));
             continue;
@@ -4343,8 +4451,6 @@ const HELP_UNBOUND_NAME: &str =
      not supported yet";
 /// The `C0001` help for a function used as a value (`[square, square]`, a bare `square;`). Sema
 /// rejects one bound to a local (`E0411`) but types it in other positions.
-const HELP_FN_VALUE: &str =
-    "a function can only be called, or passed to a parameter of function type";
 /// The `C0001` help for a type sema should have rejected (a release build's refusal).
 const HELP_UNREACHABLE_TYPE: &str =
     "the type checker accepted a type lowering cannot represent; this is a compiler bug";
@@ -4532,14 +4638,6 @@ impl FnLowerer<'_> {
                 "a value whose type was never determined (`_`)".to_string(),
                 span,
                 HELP_ANNOTATE,
-            ),
-            // Sema rejects a function bound to a local, a field or an element type (`E0411`), but
-            // a function name inside an array or tuple literal, or alone as a statement, types
-            // as a function value and reaches lowering.
-            Ty::Fn { .. } => self.unrepresentable(
-                format!("a function value of type `{}`", ty.display(self.interner)),
-                span,
-                HELP_FN_VALUE,
             ),
             _ => self.unreachable_type(
                 format!("a value of type `{}`", ty.display(self.interner)),
@@ -4986,11 +5084,13 @@ impl FnLowerer<'_> {
             // or a use of a `let x;` that has neither an annotation nor an initializer. Its storage
             // cannot be sized — the `i32` it used to get made `let mut x; x = 2.75;` hold `2`.
             Ty::Unknown => self.refuse_ty(ty, span),
-            // A function value has no storage: as a function-typed parameter it declares no MIR
-            // parameter (`methods::param_has_value`), and anywhere else it is refused. An `Error`
-            // type never survives sema: the driver stops on its diagnostic, and a `str` never
-            // leaves it (published as `[]u8`, `wukong_sema::strs`).
-            Ty::Fn { .. } | Ty::Error | Ty::Str => self.refuse_ty(ty, span),
+            // A function value is one code address (`Op::FuncAddr`, called by `Op::CallIndirect`).
+            // A function-typed parameter bound at compile time declares no MIR parameter at all
+            // (`methods::param_has_value`).
+            Ty::Fn { .. } => MirType::Ptr,
+            // An `Error` type never survives sema: the driver stops on its diagnostic, and a
+            // `str` never leaves it (published as `[]u8`, `wukong_sema::strs`).
+            Ty::Error | Ty::Str => self.refuse_ty(ty, span),
         }
     }
 
@@ -5099,11 +5199,8 @@ impl FnLowerer<'_> {
                 ),
                 Some(t.span),
             ),
-            // A function type is only a parameter's type, and a parameter is not annotated
-            // through here; a local, field, element or return of one is `E0411`.
-            Fn { .. } => {
-                self.unreachable_type("a value of function type".to_string(), Some(t.span))
-            }
+            // A function value is one code address.
+            Fn { .. } => MirType::Ptr,
             // Type arguments belong to a type alias, which the driver expands before sema; any
             // other `Name<..>` is `E0327` there (`E0324` when the name is no type at all).
             Generic { path, .. } => self.unreachable_type(
@@ -5159,7 +5256,8 @@ impl FnLowerer<'_> {
                     .collect(),
             ),
             Slice(_) => Ty::Slice(Box::new(Ty::Unknown)),
-            Pointer { .. } | Ref { .. } | Tensor { .. } => pointer(),
+            // A function value is laid out as the code address it is.
+            Pointer { .. } | Ref { .. } | Tensor { .. } | Fn { .. } => pointer(),
             Vector { elem, lanes } => match self.annotation_storage_ty(elem) {
                 Ty::Scalar(elem) => Ty::Vector {
                     elem,
@@ -5168,9 +5266,8 @@ impl FnLowerer<'_> {
                 _ => Ty::Error,
             },
             Unit => Ty::Unit,
-            // A function type is never a local's annotation (sema: E0411), and an alias
-            // application is expanded by the driver before sema.
-            Int(_) | Fn { .. } | Generic { .. } => Ty::Error,
+            // An alias application is expanded by the driver before sema.
+            Int(_) | Generic { .. } => Ty::Error,
         }
     }
 
@@ -21960,6 +22057,9 @@ impl FnLowerer<'_> {
                     // sema, so its nodes carry types and lower correctly; a const referencing another
                     // const recurses through this same arm.
                     self.lower_expr(&init)
+                } else if let Some(v) = self.lower_fn_value(p.first().sym, p.span) {
+                    // A function used as a value: its address.
+                    v
                 } else {
                     self.unsupported(p.span, "value reference");
                     let t = self.expr_mir(e);
@@ -23345,10 +23445,18 @@ impl FnLowerer<'_> {
                         }
                     }
                     for &(i, key) in mono.fn_value_keys.get(&name).map_or(&[][..], |v| &v[..]) {
-                        if let Some(f) = args.get(i).and_then(|a| {
-                            methods::fn_value_of(a, &self.subst, self.sema, self.interner)
-                        }) {
-                            subst.insert(key, Ty::Named(f));
+                        let (Some(a), Some(pty)) = (args.get(i), params.get(i)) else {
+                            continue;
+                        };
+                        if let Some(b) = methods::fn_arg_binding(
+                            a,
+                            pty,
+                            &subst,
+                            &self.subst,
+                            self.sema,
+                            self.interner,
+                        ) {
+                            subst.insert(key, b);
                         }
                     }
                     if let Some(canon) = canon_type_args(tg, &subst, self.interner) {
@@ -23585,6 +23693,10 @@ impl FnLowerer<'_> {
         if let Some(v) = self.lower_dispatched_call(callee, generic_args, args, e) {
             return v;
         }
+        // A call through a run-time function value: a local, a field, an element, a call's result.
+        if let Some(v) = self.lower_indirect_call(callee, args) {
+            return v;
+        }
         // A range index `s[a..b]`, desugared by the parser (`strs.rs`).
         if let Some(v) = self.lower_range_slice(callee, args, e) {
             return v;
@@ -23635,9 +23747,17 @@ impl FnLowerer<'_> {
                     let mut argvals: Vec<ValueId> = Vec::with_capacity(args.len());
                     for (i, a) in args.iter().enumerate() {
                         match param_tys.get(i) {
+                            // A function the callee is specialized for passes its captures; a
+                            // run-time function value passes the pointer (`methods.rs`).
                             Some(pty) if !methods::param_has_value(pty) => {
-                                let env = self.closure_env_values(a);
-                                argvals.extend(env);
+                                if methods::fn_value_of(a, &self.subst, self.sema, self.interner)
+                                    .is_some()
+                                {
+                                    let env = self.closure_env_values(a);
+                                    argvals.extend(env);
+                                } else {
+                                    argvals.push(self.lower_expr(a));
+                                }
                             }
                             pty => argvals.push(self.lower_arg_coerced(a, pty)),
                         }
@@ -26356,7 +26476,9 @@ fn mir_ty(ty: &Ty) -> Option<MirType> {
         Ty::Array { elem, len, .. } => {
             MirType::Array(Box::new(mir_ty(elem)?), u32::try_from(*len).ok()?)
         }
-        Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Tensor { .. } | Ty::Slice(_) => MirType::Ptr,
+        Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Tensor { .. } | Ty::Slice(_) | Ty::Fn { .. } => {
+            MirType::Ptr
+        }
         Ty::Vector { elem, lanes } => MirType::Vec(Box::new(MirType::from_scalar(*elem)), *lanes),
         Ty::Unit => MirType::Void,
         // A tuple is a flat byte buffer; its local *value* is the base pointer (like an array),
@@ -26365,7 +26487,7 @@ fn mir_ty(ty: &Ty) -> Option<MirType> {
         // 0-byte buffer).
         Ty::Tuple(_) => MirType::Array(Box::new(MirType::I8), u32::try_from(ty.size_of()?).ok()?),
         // A `str` never leaves sema (it is published as `[]u8`).
-        Ty::Named(_) | Ty::Fn { .. } | Ty::Unknown | Ty::Error | Ty::Str => return None,
+        Ty::Named(_) | Ty::Unknown | Ty::Error | Ty::Str => return None,
     })
 }
 

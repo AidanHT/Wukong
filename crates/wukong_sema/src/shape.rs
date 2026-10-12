@@ -712,6 +712,11 @@ impl Sema<'_> {
             {
                 return t;
             }
+            // A struct field of function type called like a method: a call through the function
+            // value it holds.
+            if let Some(fty) = self.struct_fn_field(&bty, name.sym) {
+                return self.type_value_call(callee, fty, args, &mut arg_tys, span);
+            }
             // Any other method of a builtin type, or a struct field called like a method
             // (`resolve.rs`). Struct and enum methods were typed by `type_method_call`; a type
             // used as a namespace (`T::m(..)` on a generic, `f32x8::load(..)`) stays lenient.
@@ -726,6 +731,10 @@ impl Sema<'_> {
         let t = self.type_expr(callee);
         if matches!(callee.kind, ExprKind::Path(_)) {
             return Ty::Unknown;
+        }
+        // An element, a call's result, ...: a call through the function value it is.
+        if matches!(t, Ty::Fn { .. }) {
+            return self.type_value_call(callee, t, args, &mut arg_tys, span);
         }
         self.check_value_callee(callee, &t)
     }
@@ -1309,6 +1318,36 @@ impl Sema<'_> {
             // unbound generic of the callee.
             (Ty::Fn { .. }, Ty::Fn { .. }) if !rigid => {
                 crate::closures::bind_dims(param, arg, &|_| true, dims);
+            }
+            // A body check (a returned function value) holds the signature exactly.
+            (Ty::Fn { .. }, Ty::Fn { .. }) => {
+                if param != arg {
+                    self.error(
+                        span,
+                        "E0401",
+                        format!(
+                            "type mismatch: expected `{}`, found `{}`",
+                            param.display(self.interner),
+                            arg.display(self.interner)
+                        ),
+                    );
+                }
+            }
+            // A function value given where a number, pointer or aggregate is expected: the two have
+            // different representations (a code address against the value itself). A bare generic
+            // type variable stays lenient (it is bound, not checked, here); a function-typed
+            // parameter fed something else is `check_fn_value_args`'s.
+            (other, Ty::Fn { .. }) if !matches!(other, Ty::Named(n) if !self.is_declared_named_ty(*n)) =>
+            {
+                self.error(
+                    span,
+                    "E0401",
+                    format!(
+                        "type mismatch: expected `{}`, found `{}`",
+                        param.display(self.interner),
+                        arg.display(self.interner)
+                    ),
+                );
             }
             // Two DECLARED nominal types are not interchangeable. `Ty::Named` also spells a bare
             // generic TYPE variable (`fn f<T>(x: T)`), which must stay lenient, so — exactly like

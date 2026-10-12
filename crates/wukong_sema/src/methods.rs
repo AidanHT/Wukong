@@ -17,12 +17,19 @@
 //!   (`E0410` otherwise). Dispatch is static: `mir_build` already specializes a type-generic
 //!   function per instantiation, and resolves a call through a bound against the instantiated
 //!   type's method table. A trait method has no default body (`E0410`).
-//! * **Function-typed parameters.** `fn apply(f: fn(f32) -> f32, x: f32)` — the only place a
-//!   function type may appear (`E0411` elsewhere). Every call must pass a named non-generic
-//!   function, a closure literal (`closures.rs`), or forward the caller's own function parameter;
-//!   `mir_build` specializes the callee per bound function (`apply$square`, `apply$main$closure$0`),
-//!   so a call through `f` is a direct call with no function pointer at run time and nothing a
-//!   kernel recognizer cannot see.
+//! * **Function-typed parameters.** `fn apply(f: fn(f32) -> f32, x: f32)`. A call that passes a
+//!   named non-generic function, a closure literal (`closures.rs`), or the caller's own
+//!   function-typed parameter is resolved at compile time: `mir_build` specializes the callee per
+//!   bound function (`apply$square`, `apply$main$closure$0`), so a call through `f` is a direct call
+//!   with no function pointer at run time and nothing a kernel recognizer cannot see. Any other
+//!   argument of function type is a **run-time function value** (a local, a field, an element, a
+//!   call's result), and the callee gets one more instance that receives the pointer and calls
+//!   through it (`Op::CallIndirect`).
+//! * **Function values.** A function type is an ordinary value type: a local (`let mut f`), a
+//!   field, an element and a return value can hold one, made from a named non-generic function or
+//!   a closure that captures nothing (`closures.rs`). A generic or body-less function has no single
+//!   address (`E0429`); two function values cannot be compared (`E0428`); an `extern` signature
+//!   cannot spell a function type (`E0411`).
 //!
 //! What is recorded here — the method tables and every resolved method call — is published in
 //! [`crate::SemaResult::methods`].
@@ -104,9 +111,9 @@ pub(crate) struct MethodState {
     fn_bounds: HashMap<Symbol, Vec<(Symbol, Vec<Symbol>)>>,
     /// The bounds of the function whose body is being checked.
     cur_bounds: HashMap<Symbol, Vec<Symbol>>,
-    /// Set only while lowering the type of a parameter of a function with a body — the one place a
-    /// function type is legal.
-    pub(crate) fn_type_ok: bool,
+    /// Set while lowering the signature of an `extern` function or a function declared without a
+    /// body: the one place a function type is not legal, at any depth (`E0411`).
+    pub(crate) fn_type_banned: bool,
 }
 
 impl MethodState {
@@ -159,14 +166,60 @@ pub(crate) fn mentions(t: &Ty, g: Symbol) -> bool {
 }
 
 impl Sema<'_> {
-    /// Lower a parameter's type. A function type is legal here — and only here, for a function
-    /// with a body (an `extern` callback has no compile-time-known callee). A shape-generic array
-    /// parameter (`[f32; N]`) is the tensor it denotes (`tensor::lower_shape_param_type`).
+    /// Lower a parameter's type. A function type is legal for a function with a body, and not in
+    /// an `extern` (or body-less) signature: the C side has no Wukong function values. A
+    /// shape-generic array parameter (`[f32; N]`) is the tensor it denotes
+    /// (`tensor::lower_shape_param_type`).
     pub(crate) fn lower_param_type(&mut self, has_body: bool, t: &TypeExpr) -> Ty {
-        self.methods.fn_type_ok = has_body;
+        let banned = std::mem::replace(&mut self.methods.fn_type_banned, !has_body);
         let ty = self.lower_shape_param_type(t);
-        self.methods.fn_type_ok = false;
+        self.methods.fn_type_banned = banned;
         ty
+    }
+
+    /// Lower the return type of a function declared with `has_body` (see
+    /// [`Self::lower_param_type`]).
+    pub(crate) fn lower_ret_type(&mut self, has_body: bool, t: &TypeExpr) -> Ty {
+        let banned = std::mem::replace(&mut self.methods.fn_type_banned, !has_body);
+        let ty = self.lower_type(t);
+        self.methods.fn_type_banned = banned;
+        ty
+    }
+
+    /// Whether `nm` names a builtin the compiler reads by name: a math or kernel intrinsic, a
+    /// scalar, heap, file-I/O or text builtin, or one of the statement builtins.
+    pub(crate) fn is_builtin_name(nm: &str) -> bool {
+        crate::shape::intrinsic_ret_ty(nm, &[]).is_some()
+            || crate::kernel_builtin(nm, 2).is_some()
+            || crate::scalar_builtin(nm).is_some()
+            || crate::heap_alloc_elem(nm).is_some()
+            || crate::file_io_elem(nm).is_some()
+            || crate::text::text_builtin(nm).is_some()
+            || matches!(
+                nm,
+                "print" | "println" | "assert" | "free" | "now_ns" | "sync_block" | "atomic_add"
+            )
+    }
+
+    /// A local of function type named after a builtin (`let gelu: fn(f32) -> f32 = ..`) would be
+    /// read as the builtin by every kernel recognizer and the vectorizer (`E0411`, as for a
+    /// function-typed parameter).
+    pub(crate) fn check_fn_binding_name(&mut self, name: Symbol, span: Span, ty: &Ty) {
+        if !matches!(ty, Ty::Fn { .. }) {
+            return;
+        }
+        let nm = self.sym_str(name);
+        if Self::is_builtin_name(nm) {
+            let nm = nm.to_string();
+            self.error(
+                span,
+                "E0411",
+                format!(
+                    "a local of function type cannot be named `{nm}`, the name of a builtin; \
+                     rename it"
+                ),
+            );
+        }
     }
 
     /// A function-typed parameter may not be `mut` (it names the function each call binds at
@@ -186,17 +239,7 @@ impl Sema<'_> {
             );
         }
         let nm = self.sym_str(p.name.sym);
-        let builtin = crate::shape::intrinsic_ret_ty(nm, &[]).is_some()
-            || crate::kernel_builtin(nm, 2).is_some()
-            || crate::scalar_builtin(nm).is_some()
-            || crate::heap_alloc_elem(nm).is_some()
-            || crate::file_io_elem(nm).is_some()
-            || crate::text::text_builtin(nm).is_some()
-            || matches!(
-                nm,
-                "print" | "println" | "assert" | "free" | "now_ns" | "sync_block" | "atomic_add"
-            );
-        if builtin {
+        if Self::is_builtin_name(nm) {
             let nm = nm.to_string();
             self.error(
                 p.name.span,
@@ -221,10 +264,8 @@ impl Sema<'_> {
             self.error(
                 span,
                 "E0411",
-                "a function type is only allowed as the type of a function parameter (bind it to a \
-                 named function or a closure at each call) or as the annotation of a `let` that \
-                 binds a closure; it cannot be another local, a field, element, return value or \
-                 `extern` parameter",
+                "a function type cannot appear in an `extern` declaration or a function without a \
+                 body: the C side has no Wukong function values",
             );
         }
         let params: Vec<Ty> = params.iter().map(|p| self.lower_type(p)).collect();
@@ -237,22 +278,6 @@ impl Sema<'_> {
         } else {
             Ty::Error
         }
-    }
-
-    /// A `let` may not bind a function value: it is not a compile-time-bound parameter, so nothing
-    /// could resolve a call through it. Returns the type to bind (`Error` in that case, so the name
-    /// cannot be called and cascade).
-    pub(crate) fn checked_let_type(&mut self, bound: Ty, span: Span) -> Ty {
-        if matches!(bound, Ty::Fn { .. }) {
-            self.error(
-                span,
-                "E0411",
-                "a function cannot be bound to a local; pass it directly to a parameter of \
-                 function type instead",
-            );
-            return Ty::Error;
-        }
-        bound
     }
 
     /// Collect the traits, the `impl` blocks and every function's trait bounds, and check each
@@ -609,10 +634,10 @@ impl Sema<'_> {
         }
     }
 
-    /// Validate the arguments bound to function-typed parameters, and refuse a function passed
-    /// anywhere else. A function argument must name a non-generic top-level function, or forward
-    /// the caller's own function-typed parameter, whose type equals the parameter's (with the
-    /// callee's type parameters substituted as the call binds them).
+    /// Validate the arguments bound to function-typed parameters: each must be a function value
+    /// whose type equals the parameter's (with the callee's type parameters substituted as the call
+    /// binds them). A named function, a closure literal or the caller's own function-typed
+    /// parameter is bound at compile time; anything else is a run-time function value.
     pub(crate) fn check_fn_value_args(&mut self, sig: &FnSig, args: &[Expr], arg_tys: &[Ty]) {
         // The call's bindings, in argument order (the order `check_fn_call` binds in): a function
         // argument binds what its own type fixes too, so `fn(Tensor[f32, N]) -> f32` accepts a
@@ -631,31 +656,6 @@ impl Sema<'_> {
             match (pty, aty) {
                 (Ty::Fn { .. }, Ty::Unknown | Ty::Error) => {}
                 (Ty::Fn { .. }, _) => {
-                    let named = match &a.kind {
-                        ExprKind::Path(p) if p.is_single() => Some(p.first().sym),
-                        _ => None,
-                    };
-                    // A closure literal is known too: `mir_build` lifts it to a function
-                    // (`closures.rs`), and its type is compared below like a named function's.
-                    let closure = matches!(a.kind, ExprKind::Closure { .. });
-                    let known = closure
-                        || named.is_some_and(|n| match self.lookup_local(n) {
-                            Some(t) => matches!(t, Ty::Fn { .. }),
-                            None => matches!(
-                                self.defs.lookup(n).map(|d| &d.kind),
-                                Some(DefKind::Fn(s)) if s.generics.is_empty()
-                            ),
-                        });
-                    if !known {
-                        self.error(
-                            a.span,
-                            "E0411",
-                            "a function-typed parameter must be given the name of a non-generic \
-                             function, a closure literal, or the caller's own function-typed \
-                             parameter, known at compile time",
-                        );
-                        continue;
-                    }
                     let want = crate::shape::apply_subst(pty, &dims, &tys);
                     let unresolved = sig.generics.iter().any(|g| mentions(&want, *g));
                     if !matches!(aty, Ty::Fn { .. }) || (!unresolved && *aty != want) {
@@ -666,13 +666,6 @@ impl Sema<'_> {
                             format!("type mismatch: expected a function `{w}`, found `{f}`"),
                         );
                     }
-                }
-                (_, Ty::Fn { .. }) if !matches!(pty, Ty::Unknown | Ty::Error) => {
-                    self.error(
-                        a.span,
-                        "E0411",
-                        "a function can only be passed to a parameter of function type",
-                    );
                 }
                 _ => {}
             }
@@ -720,6 +713,58 @@ impl Sema<'_> {
         self.check_fn_value_args(&sig, args, arg_tys);
         let site = CallSite::new(None, None, args);
         Some(self.check_fn_call(&sig, &[], arg_tys, span, callee.id, &site))
+    }
+
+    /// A call through a run-time function value of type `fty` that is not a single name: a struct
+    /// field of function type called like a method (`s.op(x)`), an element (`ops[i](x)`), a call's
+    /// result (`pick(1)(x)`). Typed like a call through a function-typed local
+    /// ([`Self::type_fn_param_call`]); `wukong_mir_build` lowers it to `Op::CallIndirect`.
+    pub(crate) fn type_value_call(
+        &mut self,
+        callee: &Expr,
+        fty: Ty,
+        args: &[Expr],
+        arg_tys: &mut [Ty],
+        span: Span,
+    ) -> Ty {
+        let Ty::Fn { params, ret } = fty else {
+            return Ty::Unknown;
+        };
+        self.types.insert(
+            callee.id,
+            Ty::Fn {
+                params: params.clone(),
+                ret: ret.clone(),
+            },
+        );
+        self.adapt_scalar_literals(&params, args, arg_tys, 0);
+        let sig = FnSig {
+            generics: Vec::new(),
+            params,
+            ret: *ret,
+        };
+        self.check_fn_value_args(&sig, args, arg_tys);
+        let site = CallSite::new(None, None, args);
+        self.check_fn_call(&sig, &[], arg_tys, span, callee.id, &site)
+    }
+
+    /// The type of the field `name` of the struct `recv` (or of the struct a reference or pointer
+    /// `recv` points at) when it is a function type: a field called like a method.
+    pub(crate) fn struct_fn_field(&self, recv: &Ty, name: Symbol) -> Option<Ty> {
+        let inner = match recv {
+            Ty::Ptr { pointee, .. } | Ty::Ref { pointee, .. } => pointee.as_ref(),
+            t => t,
+        };
+        let Ty::Named(n) = inner else {
+            return None;
+        };
+        match self.defs.lookup(*n).map(|d| &d.kind) {
+            Some(DefKind::Struct(fields)) => fields
+                .iter()
+                .find(|(f, t)| *f == name && matches!(t, Ty::Fn { .. }))
+                .map(|(_, t)| t.clone()),
+            _ => None,
+        }
     }
 
     /// Adapt each unsuffixed numeric literal argument to its concrete scalar parameter, exactly as
@@ -1352,28 +1397,71 @@ mod tests {
         assert!(codes(&forward).is_empty(), "{:?}", codes(&forward));
         let wrong = format!("{APPLY} fn main() -> i32 {{ return apply(to_i, 3.0) as i32; }}");
         assert!(codes(&wrong).contains(&"E0401"));
+        // A generic function has no single address, even for a parameter it would specialize.
         let generic = format!("{APPLY} fn main() -> i32 {{ return apply(id, 3.0) as i32; }}");
-        assert!(codes(&generic).contains(&"E0411"));
+        assert_eq!(codes(&generic), vec!["E0429"]);
         let value = format!("{APPLY} fn main() -> i32 {{ return apply(2.0, 3.0) as i32; }}");
-        assert!(codes(&value).contains(&"E0411"));
+        assert!(codes(&value).contains(&"E0401"));
+        // A run-time function value is accepted where a named function is.
+        let runtime = format!(
+            "{APPLY} fn main() -> i32 {{ let mut g = square; g = to_f; \
+             return apply(g, 3.0) as i32; }} fn to_f(x: f32) -> f32 {{ return x; }}"
+        );
+        assert!(codes(&runtime).is_empty(), "{:?}", codes(&runtime));
     }
 
+    /// A function type is an ordinary value type: a local, a field, an element and a return value
+    /// hold one, and a call through any of them is typed against it. An `extern` signature cannot
+    /// spell one (`E0411`), a generic function is no value (`E0429`), two values cannot be
+    /// compared (`E0428`), and a value is not a number (`E0401`).
     #[test]
-    fn a_function_type_is_only_a_parameter_type() {
-        let bound = format!("{APPLY} fn main() -> i32 {{ let g = square; return 0; }}");
-        assert!(codes(&bound).contains(&"E0411"));
-        let annotated =
-            format!("{APPLY} fn main() -> i32 {{ let g: fn(f32) -> f32 = square; return 0; }}");
-        assert!(codes(&annotated).contains(&"E0411"));
-        let field = "struct S { f: fn(f32) -> f32 }";
-        assert!(codes(field).contains(&"E0411"));
-        let ret = format!("{APPLY} fn pick() -> fn(f32) -> f32 {{ return square; }}");
-        assert!(codes(&ret).contains(&"E0411"));
+    fn a_function_type_is_a_value_type() {
+        for ok in [
+            format!("{APPLY} fn main() -> i32 {{ let g = square; return g(2.0) as i32; }}"),
+            format!(
+                "{APPLY} fn main() -> i32 {{ let g: fn(f32) -> f32 = square; \
+                 return g(2.0) as i32; }}"
+            ),
+            format!(
+                "{APPLY} struct S {{ f: fn(f32) -> f32 }} fn main() -> i32 {{ \
+                 let s = S {{ f: square }}; return s.f(2.0) as i32; }}"
+            ),
+            format!(
+                "{APPLY} fn pick() -> fn(f32) -> f32 {{ return square; }} \
+                 fn main() -> i32 {{ return pick()(2.0) as i32; }}"
+            ),
+            format!(
+                "{APPLY} fn main() -> i32 {{ let t: [fn(f32) -> f32; 2] = [square, square]; \
+                 return t[1](2.0) as i32; }}"
+            ),
+        ] {
+            assert!(codes(&ok).is_empty(), "{ok}: {:?}", codes(&ok));
+        }
         let passed = format!(
             "{APPLY} fn k(x: f32) -> f32 {{ return x; }} \
                               fn main() -> i32 {{ return k(square) as i32; }}"
         );
-        assert!(codes(&passed).contains(&"E0411"));
+        assert!(codes(&passed).contains(&"E0401"));
+        let wrong_arity =
+            format!("{APPLY} fn main() -> i32 {{ let g = square; return g(1.0, 2.0) as i32; }}");
+        assert!(
+            codes(&wrong_arity).contains(&"E0503"),
+            "{:?}",
+            codes(&wrong_arity)
+        );
+        let ext = "extern \"C\" { fn cb(f: fn(i32) -> i32) -> i32; }";
+        assert_eq!(codes(ext), vec!["E0411"]);
+        let compared = format!(
+            "{APPLY} fn main() -> i32 {{ let g = square; let h = square; \
+             if g == h {{ return 1; }} return 0; }}"
+        );
+        assert_eq!(codes(&compared), vec!["E0428"]);
+        let generic =
+            format!("{APPLY} fn main() -> i32 {{ let g: fn(f32) -> f32 = id; return 0; }}");
+        assert_eq!(codes(&generic), vec!["E0429"]);
+        let builtin_name =
+            format!("{APPLY} fn main() -> i32 {{ let gelu = square; return gelu(1.0) as i32; }}");
+        assert_eq!(codes(&builtin_name), vec!["E0411"]);
     }
 
     #[test]

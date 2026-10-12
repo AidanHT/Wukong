@@ -17,15 +17,22 @@
 //!   binding is `Ty::Named(<function>)` (see [`fn_value_keys`]). The parameter has no runtime
 //!   value at all: `lower_fn` declares no MIR parameter for it, `lower_call` passes no argument,
 //!   and a call through it is a direct call of the bound function.
+//! * Given a **run-time function value** instead (a local, a field, an element, a call's result —
+//!   anything [`fn_value_of`] cannot name), the key is bound to the parameter's own function type
+//!   (`Ty::Fn`, [`is_dynamic_fn`]): that instance declares a `Ptr` parameter for it, the call
+//!   passes the pointer, and a call through it is an `Op::CallIndirect`. Taking the address of a
+//!   function that has function-typed parameters names its instance with every key bound that
+//!   way ([`dynamic_subst`]).
 //!
 //! Neither kind of indirect call is visible to `alias.rs`, which reasons only about calls it can
 //! see. [`dispatch_taint`] therefore marks every function such a call can reach — and everything
 //! those call in turn — as not provably alias-free, the conservative answer.
 
 use wukong_ast::{self as ast, Block, Expr, ExprKind, FnDecl, ForIter, Module, NodeId, Stmt};
-use wukong_mir::ValueId;
+use wukong_diag::Diagnostic;
+use wukong_mir::{MirType, Op, ValueId};
 use wukong_sema::{DefKind, FnSig, SemaResult};
-use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet, Interner, Symbol};
+use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet, Interner, Span, Symbol};
 use wukong_types::Ty;
 
 use crate::{subst_ty, FnLowerer};
@@ -37,9 +44,63 @@ const FRESH_ID_TOP: u32 = u32::MAX / 2 - 1;
 const FRESH_ID_FLOOR: u32 = u32::MAX / 4;
 
 /// Whether a parameter of type `t` has a runtime value. A function-typed parameter does not: it is
-/// specialized away, so `lower_fn` declares no MIR parameter for it and `lower_call` passes none.
+/// specialized away, so `lower_fn` declares no MIR parameter for it and `lower_call` passes none —
+/// unless the instance binds it to a run-time function value ([`is_dynamic_fn`]).
 pub(crate) fn param_has_value(t: &Ty) -> bool {
     !matches!(t, Ty::Fn { .. })
+}
+
+/// Whether the function-typed parameter `name` of the instance whose substitution is `subst` is
+/// bound to a run-time function value — the instance receives a pointer for it and calls through
+/// it — rather than to a function known at compile time.
+pub(crate) fn is_dynamic_fn(
+    name: Symbol,
+    subst: &HashMap<Symbol, Ty>,
+    interner: &Interner,
+) -> bool {
+    if subst.is_empty() {
+        return false;
+    }
+    let Some(key) = interner.get(&fn_value_key(interner.resolve(name))) else {
+        return false;
+    };
+    matches!(subst.get(&key), Some(Ty::Fn { .. }))
+}
+
+/// The binding of a function-typed parameter of declared type `pty` given the argument `arg`: the
+/// function it names (`Ty::Named`, specialized at compile time), or — for a run-time function
+/// value — the parameter's own function type with the call's type bindings `bound` applied
+/// (`Ty::Fn`, [`is_dynamic_fn`]). `outer` is the caller's substitution.
+pub(crate) fn fn_arg_binding(
+    arg: &Expr,
+    pty: &Ty,
+    bound: &HashMap<Symbol, Ty>,
+    outer: &HashMap<Symbol, Ty>,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<Ty> {
+    if let Some(f) = fn_value_of(arg, outer, sema, interner) {
+        return Some(Ty::Named(f));
+    }
+    match subst_ty(pty, bound) {
+        t @ Ty::Fn { .. } => Some(t),
+        _ => None,
+    }
+}
+
+/// The substitution under which a function with function-typed parameters is compiled when its
+/// ADDRESS is taken: every such parameter bound to a run-time function value (its own type). `None`
+/// for a function with type generics, which has no single address (sema refuses one, `E0429`).
+pub(crate) fn dynamic_subst(
+    keys: &[(usize, Symbol)],
+    sig: &FnSig,
+    tg: &[Symbol],
+) -> Option<HashMap<Symbol, Ty>> {
+    let mut subst: HashMap<Symbol, Ty> = HashMap::default();
+    for &(i, key) in keys {
+        subst.insert(key, sig.params.get(i)?.clone());
+    }
+    tg.iter().all(|g| subst.contains_key(g)).then_some(subst)
 }
 
 /// The pseudo-generic a function-typed parameter named `param` is specialized under.
@@ -99,6 +160,13 @@ pub(crate) fn fn_value_of(
     let name = p.first().sym;
     if let Some(f) = bound_fn(name, subst, interner) {
         return Some(f);
+    }
+    // A local holding a run-time function value — even one named like a top-level function.
+    if sema
+        .fn_value_locals
+        .contains(&crate::closures::closure_code(arg).id)
+    {
+        return None;
     }
     matches!(
         sema.defs.lookup(name).map(|d| &d.kind),
@@ -361,7 +429,8 @@ impl Desugar<'_> {
 }
 
 /// Every function a call this module cannot see may reach — the targets of calls through trait
-/// bounds and the functions passed to function-typed parameters — closed over the calls those
+/// bounds, the functions passed to function-typed parameters, and every function used as a
+/// run-time value (an `Op::CallIndirect` may reach any of them) — closed over the calls those
 /// functions make. `alias.rs` cannot attribute such a call's arguments to its callee, so none of
 /// these functions may claim its buffer parameters are provably disjoint.
 pub(crate) fn dispatch_taint(module: &Module, sema: &SemaResult) -> HashSet<Symbol> {
@@ -492,10 +561,21 @@ impl CallScan<'_> {
             | ExprKind::Str(_)
             | ExprKind::Char(_)
             | ExprKind::Bool(_)
-            | ExprKind::Path(_)
             | ExprKind::SizeOf(_)
             | ExprKind::AlignOf(_)
             | ExprKind::Closure { .. } => {}
+            // A function used as a value (stored, returned, passed on): a call through the
+            // pointer may reach it with any arguments, so it is a root like a passed function. A
+            // local that shares a function's name (`let mut loss = 0.0;` in `fn loss`) is not.
+            ExprKind::Path(p) => {
+                if p.is_single()
+                    && self.is_fn(p.first().sym)
+                    && matches!(self.sema.types.get(&e.id), Some(Ty::Fn { .. }))
+                    && !self.sema.fn_value_locals.contains(&e.id)
+                {
+                    self.values.push(p.first().sym);
+                }
+            }
             ExprKind::Unary { expr, .. }
             | ExprKind::Field { base: expr, .. }
             | ExprKind::TupleField { base: expr, .. }
@@ -637,6 +717,131 @@ impl FnLowerer<'_> {
         }
         Some(self.lower_call(&path, generic_args, args, e))
     }
+
+    /// A call through a run-time function value: a local holding one (a function-typed parameter
+    /// this instance binds at compile time has no local, and is `lower_dispatched_call`'s), or any
+    /// other callee expression of function type — a field (`s.op(x)`), an element (`ops[i](x)`),
+    /// a call's result. Lowered to `Op::CallIndirect` with the ABI a direct call of the target
+    /// uses: an aggregate result through a leading destination buffer (`sret`), an aggregate
+    /// argument by its base pointer, a function argument as its address. `None` for every other
+    /// call.
+    pub(crate) fn lower_indirect_call(&mut self, callee: &Expr, args: &[Expr]) -> Option<ValueId> {
+        match &callee.kind {
+            ExprKind::Path(p) if p.is_single() && self.lookup(p.first().sym).is_some() => {}
+            ExprKind::Path(_) => return None,
+            _ => {}
+        }
+        let Ty::Fn { params, ret } = self.expr_ty(callee) else {
+            return None;
+        };
+        let target = self.lower_expr(callee);
+        let mut argv: Vec<ValueId> = Vec::with_capacity(args.len() + 1);
+        let ret_mir = self.mir_ty_of(&ret);
+        let sret =
+            matches!(ret_mir, MirType::Array(..)).then(|| self.builder.alloca(ret_mir.clone()));
+        argv.extend(sret);
+        for (a, pty) in args.iter().zip(&params) {
+            let v = self.lower_arg_coerced(a, Some(pty));
+            argv.push(v);
+        }
+        if let Some(dst) = sret {
+            self.builder.build_void(Op::CallIndirect {
+                callee: target,
+                args: argv,
+                ret: MirType::Void,
+            });
+            return Some(dst);
+        }
+        if ret_mir == MirType::Void {
+            self.builder.build_void(Op::CallIndirect {
+                callee: target,
+                args: argv,
+                ret: MirType::Void,
+            });
+            return Some(self.const_zero(MirType::I32));
+        }
+        Some(self.builder.build(
+            ret_mir.clone(),
+            Op::CallIndirect {
+                callee: target,
+                args: argv,
+                ret: ret_mir,
+            },
+        ))
+    }
+
+    /// A function used as a value (`let f = add1;`, a function-typed parameter of this instance
+    /// passed on as a value): its address. A function with function-typed parameters is compiled,
+    /// for its address, as the instance that takes each of them at run time
+    /// (`methods::dynamic_subst`). A parameter bound to a closure that captures has no address that
+    /// could carry the captured values (`E0427`). `None` when `name` is no function here.
+    pub(crate) fn lower_fn_value(&mut self, name: Symbol, span: Span) -> Option<ValueId> {
+        let target = match bound_fn(name, &self.subst, self.interner) {
+            Some(f) => {
+                if self.closure_env(f).is_some() {
+                    let nm = self.interner.resolve(name).to_string();
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "`{nm}` is bound to a closure that captures, which cannot be a \
+                             run-time function value"
+                        ))
+                        .with_code("E0427")
+                        .primary(span, "used as a value here")
+                        .note(
+                            "a function value is only the address of code; the values the \
+                             closure passed for this parameter captures have nowhere to live in it",
+                        )
+                        .help(
+                            "pass a named function or a closure that captures nothing, or only \
+                             call the parameter (and pass it on) instead of using it as a value",
+                        ),
+                    );
+                }
+                f
+            }
+            None => {
+                if !matches!(
+                    self.sema.defs.lookup(name).map(|d| &d.kind),
+                    Some(DefKind::Fn(_))
+                ) {
+                    return None;
+                }
+                name
+            }
+        };
+        let addr = self.fn_value_instance(target);
+        Some(self.builder.build(MirType::Ptr, Op::FuncAddr(addr)))
+    }
+
+    /// The function whose address `f` denotes: `f` itself, or — for a function with
+    /// function-typed parameters — its instance taking each of them at run time.
+    fn fn_value_instance(&self, f: Symbol) -> Symbol {
+        let Some(mono) = self.mono else {
+            return f;
+        };
+        let (Some(keys), Some(DefKind::Fn(sig))) = (
+            mono.fn_value_keys.get(&f),
+            self.sema.defs.lookup(f).map(|d| &d.kind),
+        ) else {
+            return f;
+        };
+        let tg = mono.tg(f);
+        methods_dynamic_instance(mono, f, keys, sig, tg, self.interner).unwrap_or(f)
+    }
+}
+
+/// The registered instance of `f` with every function-typed parameter bound to a run-time value.
+fn methods_dynamic_instance(
+    mono: &crate::Mono,
+    f: Symbol,
+    keys: &[(usize, Symbol)],
+    sig: &FnSig,
+    tg: &[Symbol],
+    interner: &Interner,
+) -> Option<Symbol> {
+    let subst = dynamic_subst(keys, sig, tg)?;
+    let canon = crate::canon_type_args(tg, &subst, interner)?;
+    mono.instance_of.get(&(f, canon)).copied()
 }
 
 #[cfg(test)]
@@ -707,6 +912,68 @@ mod tests {
         let twice = body(&funcs, "twice$square");
         assert_eq!(twice.matches("call apply$square(").count(), 2, "{twice}");
         assert!(body(&funcs, "main").contains("call apply$square("));
+    }
+
+    /// A function value is its address; a call through one is a call through the pointer; a
+    /// function-typed parameter given a run-time value gets an instance taking the pointer, and
+    /// one given a named function keeps its specialized instance.
+    #[test]
+    fn a_run_time_function_value_is_called_through_its_pointer() {
+        let funcs = lower(
+            "fn square(x: f32) -> f32 { return x * x; } \
+             fn apply(f: fn(f32) -> f32, x: f32) -> f32 { return f(x); } \
+             fn main() -> i32 { let mut g = square; let a = g(2.0); \
+                                return (a + apply(g, 3.0) + apply(square, 1.0)) as i32; }",
+        );
+        let main = body(&funcs, "main");
+        assert!(main.contains("func_addr square"), "{main}");
+        assert!(main.contains("call_indirect"), "{main}");
+        assert!(main.contains("call apply$fn1$f32$to$f32("), "{main}");
+        assert!(main.contains("call apply$square("), "{main}");
+        let dynamic = body(&funcs, "apply$fn1$f32$to$f32");
+        // The function-typed parameter is a pointer parameter of its own.
+        assert!(
+            dynamic.starts_with("fn apply$fn1$f32$to$f32(v0 ptr, v1 f32)"),
+            "{dynamic}"
+        );
+        assert!(dynamic.contains("call_indirect"), "{dynamic}");
+        assert!(body(&funcs, "apply$square").contains("call square("));
+    }
+
+    /// The address of a function with a function-typed parameter is its instance taking that
+    /// parameter at run time.
+    #[test]
+    fn the_address_of_a_higher_order_function_is_its_dynamic_instance() {
+        let funcs = lower(
+            "fn square(x: f32) -> f32 { return x * x; } \
+             fn apply(f: fn(f32) -> f32, x: f32) -> f32 { return f(x); } \
+             fn main() -> i32 { let h: fn(fn(f32) -> f32, f32) -> f32 = apply; \
+                                return h(square, 3.0) as i32; }",
+        );
+        let main = body(&funcs, "main");
+        assert!(main.contains("func_addr apply$fn1$f32$to$f32"), "{main}");
+        assert!(main.contains("func_addr square"), "{main}");
+    }
+
+    /// Every function used as a value may be called through a pointer with any arguments, so its
+    /// buffer parameters are not provably disjoint; a local that only shares a function's name is
+    /// no such use.
+    #[test]
+    fn a_function_used_as_a_value_is_dispatch_tainted() {
+        let src = "fn fill(mut a: [f32; 4], b: [f32; 4]) { for i in 0..4 { a[i] = b[i]; } } \
+                   fn loss(x: [f32; 4]) -> f32 { let mut loss: f32 = 0.0; \
+                       for i in 0..4 { loss = loss + x[i]; } return loss; } \
+                   fn main() -> i32 { let f: fn([f32; 4], [f32; 4]) = fill; \
+                       let mut a: [f32; 4] = [0.0; 4]; let b: [f32; 4] = [1.0; 4]; f(a, b); \
+                       return (a[0] + loss(b)) as i32; }";
+        let mut interner = Interner::new();
+        let (module, pdiags) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (sema, sdiags) = wukong_sema::check(&module, &interner);
+        assert!(sdiags.iter().all(|d| !d.is_error()), "{sdiags:?}");
+        let taint = super::dispatch_taint(&module, &sema);
+        assert!(taint.contains(&interner.intern("fill")), "{taint:?}");
+        assert!(!taint.contains(&interner.intern("loss")), "{taint:?}");
     }
 
     #[test]

@@ -326,8 +326,13 @@ pub struct SemaResult {
     /// Every use of a local bound to a closure (`let f = |x: f32| x * k;`), keyed by the use's
     /// `Path` expression: the closure literal the name denotes there. A call `f(..)` records its
     /// callee, an argument `g(f)` the argument; nothing else may name such a local (`E0421`), so
-    /// `wukong_mir_build` resolves every use statically (`closures.rs`).
+    /// `wukong_mir_build` resolves every use statically (`closures.rs`). A closure that captures
+    /// nothing may also be used as a function value; its uses are recorded the same way.
     pub closure_refs: HashMap<NodeId, NodeId>,
+    /// Every single-name `Path` that reads a LOCAL of function type (a run-time function value, or
+    /// a function-typed parameter) — never a top-level function of the same name. `wukong_mir_build`
+    /// tells a run-time value passed to a function-typed parameter from a named function by it.
+    pub fn_value_locals: HashSet<NodeId>,
 }
 
 /// Collect the struct names a type contains *by value* — directly (`Ty::Named`) or nested inside an
@@ -526,6 +531,8 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         fn_value_arg: None,
         range_counters: Vec::new(),
         negated_literal: None,
+        fn_value_locals: HashSet::default(),
+        bodyless_fns: HashSet::default(),
     };
     // Attribute legality (`attrs`): an attribute names no value and has no type, so this walk needs
     // nothing the collection pass builds and runs first — an unknown `@bogus` is reported even in a
@@ -589,6 +596,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
 
         closures: s.closures,
         closure_refs: s.closure_refs,
+        fn_value_locals: s.fn_value_locals,
     };
     // `str` does not leave sema: every published type is erased to its `[]u8` layout (`strs.rs`).
     strs::erase_published(&mut result);
@@ -769,6 +777,10 @@ struct Sema<'a> {
     /// The integer literal being typed as the operand of a unary minus, if any: the one place a
     /// suffixed literal may spell its type's minimum magnitude (`-128i8`, `-2^127` as `i128`).
     negated_literal: Option<NodeId>,
+    /// Published as [`SemaResult::fn_value_locals`].
+    fn_value_locals: HashSet<NodeId>,
+    /// The functions declared without a body (`extern` ones): no Wukong address (`E0429`).
+    bodyless_fns: HashSet<Symbol>,
 }
 
 /// One entry of [`Sema::loop_ctx`] — a loop currently being type-checked.
@@ -1027,7 +1039,7 @@ impl<'a> Sema<'a> {
         let ret = f
             .ret
             .as_ref()
-            .map(|t| self.lower_type(t))
+            .map(|t| self.lower_ret_type(f.body.is_some(), t))
             .unwrap_or(Ty::Unit);
         self.generics.clear();
         FnSig {
@@ -1091,7 +1103,7 @@ impl<'a> Sema<'a> {
                             self.lower_param_type(false, &p.ty);
                         }
                         if let Some(t) = &f.ret {
-                            self.lower_type(t);
+                            self.lower_ret_type(false, t);
                         }
                         self.generics.clear();
                     }
@@ -1104,7 +1116,7 @@ impl<'a> Sema<'a> {
                         self.lower_param_type(false, &p.ty);
                     }
                     if let Some(t) = &f.ret {
-                        self.lower_type(t);
+                        self.lower_ret_type(false, t);
                     }
                     self.generics.clear();
                 }
@@ -1296,9 +1308,13 @@ impl<'a> Sema<'a> {
             .map(|p| self.lower_param_type(f.body.is_some(), &p.ty))
             .collect();
         let ret = match &f.ret {
-            Some(t) => self.lower_type(t),
+            Some(t) => self.lower_ret_type(f.body.is_some(), t),
             None => Ty::Unit,
         };
+        // A function without a body (an `extern` one) has no Wukong address (`E0429`).
+        if f.body.is_none() {
+            self.bodyless_fns.insert(f.name.sym);
+        }
         // Declaration order is load-bearing: a turbofish `f::<2, 3>` binds each generic argument to
         // the parameter in the SAME position (`check_fn_call` zips `sig.generics` with the arguments).
         // Building this Vec from the `self.generics` HashSet collected it in per-process-random hash
@@ -1457,10 +1473,10 @@ impl<'a> Sema<'a> {
     }
 
     fn lower_type(&mut self, t: &TypeExpr) -> Ty {
-        // Only the outermost type of a parameter may be a function type: taking the flag here
-        // means every nested lowering (an element, a pointee, a function type's own parameters)
-        // sees it cleared.
-        let fn_ok = std::mem::take(&mut self.methods.fn_type_ok);
+        // A function type is a value type anywhere but an `extern` (or body-less) signature, where
+        // the ban covers every nested type too (an element, a pointee, a function type's own
+        // parameters).
+        let fn_ok = !self.methods.fn_type_banned;
         let ty = match &t.kind {
             TypeKind::Path(p) => {
                 let name = p.segments.last().unwrap().sym;
@@ -2308,6 +2324,8 @@ impl<'a> Sema<'a> {
             // cannot declare a return shape its body does not actually produce. (`rigid == true`.)
             self.unify(&ret, val_ty, &mut dims, span, true);
         }
+        // A returned function value has exactly the declared signature.
+        self.check_fn_value_type(&ret, val_ty, span);
         // Returning a pointer/aggregate where a scalar is declared (or vice versa) is not a numeric
         // coercion — the native backend builds a mismatched return ABI and ICEs (e.g. `return &a`
         // from `-> i32`), while the interpreter silently adapts: a divergence.
@@ -2364,6 +2382,10 @@ impl<'a> Sema<'a> {
     /// both are vectors: a tensor/scalar pairing stays lenient (scalar broadcast), and two scalars
     /// promote via `join` (mixed precision like `(i as f64) + 1.0` must not error).
     fn check_binop_shapes(&mut self, l: &Ty, r: &Ty, span: Span) {
+        // Two function values meeting (an `if`/`match` merge) have one signature.
+        if matches!((l, r), (Ty::Fn { .. }, Ty::Fn { .. })) {
+            self.check_fn_value_type(l, r, span);
+        }
         if matches!(
             (l, r),
             (Ty::Tensor { .. }, Ty::Tensor { .. }) | (Ty::Vector { .. }, Ty::Vector { .. })
@@ -2375,6 +2397,33 @@ impl<'a> Sema<'a> {
             // (`rigid == true`.)
             self.unify(l, r, &mut dims, span, true);
         }
+    }
+
+    /// A function value given where `want` is expected (or anything given where a function value
+    /// is): the two must be one type (`E0401`). A call through a value of the wrong signature would
+    /// pass arguments the callee does not read and read a result it does not produce. A bare
+    /// generic type variable stays lenient: it is bound at the call, not checked here.
+    fn check_fn_value_type(&mut self, want: &Ty, got: &Ty, span: Span) {
+        if !matches!(want, Ty::Fn { .. }) && !matches!(got, Ty::Fn { .. }) {
+            return;
+        }
+        let lenient = |t: &Ty| {
+            t.is_unknown()
+                || t.is_error()
+                || matches!(t, Ty::Named(n) if !self.is_declared_named_ty(*n))
+        };
+        if want == got || lenient(want) || lenient(got) {
+            return;
+        }
+        self.error(
+            span,
+            "E0401",
+            format!(
+                "type mismatch: expected `{}`, found `{}`",
+                want.display(self.interner),
+                got.display(self.interner)
+            ),
+        );
     }
 
     /// Whether the named type `sym` is a **data-carrying** (tagged-union) enum — a declared enum with
@@ -2782,6 +2831,7 @@ impl<'a> Sema<'a> {
                     // value — where the language demands an explicit `as`. The value's type is already
                     // in the side table (the `StructLit` arm types each field before this runs).
                     let vty = self.types.get(&f.value.id).cloned().unwrap_or(Ty::Unknown);
+                    self.check_fn_value_type(fty, &vty, f.value.span);
                     if let (Ty::Scalar(fs), Ty::Scalar(vs)) = (fty, &vty) {
                         if fs != vs && !self.literal_adapts(fty, &f.value) {
                             self.error(
@@ -3180,7 +3230,6 @@ impl<'a> Sema<'a> {
                     (None, Some(i)) => self.literal_let_type(pat, init.as_ref(), i),
                     (None, None) => Ty::Unknown,
                 };
-                let bound = self.checked_let_type(bound, s.span);
                 self.check_let_align(s, pat, &bound);
                 // What the binding views is read BEFORE the name is bound, so a shadowing view
                 // (`let a = a[0];`) still resolves its initializer to the parameter it reads.
@@ -3248,7 +3297,7 @@ impl<'a> Sema<'a> {
             }
             StmtKind::Assign { target, op, value } => {
                 let target_ty = self.type_expr(target);
-                let value_ty = self.type_expr(value);
+                let value_ty = self.type_expr_expecting(value, &target_ty);
                 // Either side may be a literal-initialized binding whose type this use fixes
                 // (`infer.rs`): `s = x` makes `s` an `x`, and so does `s += x` when `x` is wider.
                 // A shift amount is a count, not an operand of the promotion (as in the binary
@@ -3267,6 +3316,8 @@ impl<'a> Sema<'a> {
                 // Plain `=` only (a value store); the compound forms below are a different check, and
                 // the helpers no-op on a non-scalar/unknown place type.
                 if matches!(op, AssignOp::Assign) {
+                    // A function variable holds one signature (`E0401`).
+                    self.check_fn_value_type(&target_ty, &value_ty, value.span);
                     if self.literal_adapts(&target_ty, value) {
                         self.retype_adapted_literal(value, &target_ty);
                     }
@@ -3428,7 +3479,7 @@ impl<'a> Sema<'a> {
                 let ret = self.ret_ty.clone();
                 match opt {
                     Some(e) => {
-                        let t = self.type_expr(e);
+                        let t = self.type_expr_expecting(e, &ret);
                         // A value returned from a `-> ()` (or return-less) function: the native
                         // backend builds a `Void` return signature and rejects the value, while the
                         // interpreter silently discards it — a backend divergence. A returned `()`
@@ -3671,7 +3722,10 @@ impl<'a> Sema<'a> {
 
     fn bind_pattern(&mut self, pat: &Pattern, ty: &Ty) {
         match &pat.kind {
-            PatKind::Ident(s) => self.bind(*s, ty.clone()),
+            PatKind::Ident(s) => {
+                self.check_fn_binding_name(*s, pat.span, ty);
+                self.bind(*s, ty.clone())
+            }
             PatKind::Tuple(subs) => {
                 if let Ty::Tuple(elems) = ty {
                     for (p, t) in subs.iter().zip(elems) {
@@ -4474,7 +4528,7 @@ impl<'a> Sema<'a> {
                         Some(t) => {
                             // Inside a closure, a local of the enclosing code is a capture.
                             self.note_value_use(p.first().sym, p.span);
-                            t
+                            self.fn_value_use(e, p.first().sym, p.span, t)
                         }
                         None => {
                             self.error(
@@ -4637,6 +4691,10 @@ impl<'a> Sema<'a> {
                 // tensor indexed with fewer indices than its rank is a VIEW, so a forgotten index
                 // lands here: say which value it was and what it is.
                 if self.reject_tensor_operands(&l, &r, *op, e.span) {
+                    return Ty::Unknown;
+                }
+                // Which functions share an address is the compiler's choice (`E0428`).
+                if self.reject_fn_value_comparison(*op, &l, &r, e.span) {
                     return Ty::Unknown;
                 }
                 use BinOp::*;
@@ -4998,9 +5056,25 @@ impl<'a> Sema<'a> {
                 to
             }
             ExprKind::StructLit { path, fields, rest } => {
-                // Type each field value (populates their NodeId side-table entries for lowering).
+                // Type each field value (populates their NodeId side-table entries for lowering). A
+                // closure literal given to a field of function type takes the field's type.
+                let decl_fields: Vec<(Symbol, Ty)> =
+                    match path.segments.last().and_then(|s| self.defs.lookup(s.sym)) {
+                        Some(Def {
+                            kind: DefKind::Struct(decl),
+                            ..
+                        }) => decl.clone(),
+                        _ => Vec::new(),
+                    };
                 for f in fields {
-                    self.type_expr(&f.value);
+                    match decl_fields.iter().find(|(n, _)| *n == f.name.sym) {
+                        Some((_, want)) => {
+                            self.type_expr_expecting(&f.value, want);
+                        }
+                        None => {
+                            self.type_expr(&f.value);
+                        }
+                    }
                 }
                 if let Some(r) = rest {
                     self.type_expr(r);
@@ -5195,8 +5269,8 @@ impl<'a> Sema<'a> {
                 Ty::Scalar(Scalar::Usize)
             }
             // A closure argument of a function-typed parameter is checked by `type_call_args`;
-            // anywhere else it is `E0411` (`closures.rs`).
-            ExprKind::Closure { .. } => self.misplaced_closure(e),
+            // anywhere else in a function body it is a function value (`closures.rs`).
+            ExprKind::Closure { .. } => self.type_closure_value(e, None),
             // `let P = e` in an `if let` / `while let` chain, which the parser puts in the first
             // arm's guard: a test of `e` against `P`, so a `bool`, binding `P`'s names in the arm's
             // scope for the chain's later operands and the arm's body.

@@ -180,7 +180,21 @@ parameter `f` is bound to a closure with captures declares one hidden MIR parame
 `f`'s position and binds them as `$env$f$<j>`; `lower_call` passes, at a function-typed argument's
 position, the capture values — the value's captures, lowered at the literal's own site, or
 forwarded from the caller's `$env$g$<j>` — and a call through `f` calls the lifted function with
-`$env$f$..` first. No function pointer, no new MIR construct.
+`$env$f$..` first. No function pointer, no new MIR construct. **Function values** are the
+exception, by choice: a function type is an ordinary value type (`Ty::Fn` lays out as a pointer),
+a closure literal in any other value position is typed by `type_closure_value` (one that captures is
+`E0427`), and a closure-bound local whose closure captures nothing may be used as a value (its
+`closure_refs` entry rewrites to the bare `L`). Sema publishes `SemaResult::fn_value_locals`, the
+`Path`s that read a *local* of function type, so lowering never mistakes a run-time value for the
+top-level function of the same name. Lowering a function's name as a value is `func_addr`
+(`lower_fn_value`; for a function with function-typed parameters, the address of the instance that
+takes them all at run time, `methods::dynamic_subst`), and a call through anything of function type
+that is not a statically bound parameter is `Op::CallIndirect` (`lower_indirect_call`, with the
+direct call's ABI: an `sret` destination first, aggregates by pointer). A function-typed argument
+`methods::fn_value_of` cannot name binds the parameter's pseudo-generic to its own `Ty::Fn` instead
+of a `Ty::Named` (`fn_arg_binding`): that instance declares a `Ptr` parameter for it
+(`methods::is_dynamic_fn`) and calls through it. Every function used as a value is
+`dispatch_taint`ed (a call through a pointer may pass it any arguments).
 **Methods**: the
 parser flattens each `impl` method into a top-level function `Type.method` (receiver desugared to a
 `self: Type` parameter) beside an `ItemKind::Impl` marker; `wukong_sema::methods` builds the method
@@ -188,7 +202,8 @@ tables, checks trait conformance and bounds, and records every resolved call; `w
 `methods::desugar_module` then rewrites `x.m(a)` to `Type.m(x, a)` ahead of `tindex`/`canon`/alias
 analysis. A call through a trait bound resolves per monomorphized instance, and a function-typed
 parameter is a pseudo-generic (`$fn$<param>` bound to `Ty::Named(<fn>)`), specialized away with no
-runtime value; the functions such calls reach are excluded from the alias-free fact.
+runtime value — or, given a run-time function value, bound to its own `Ty::Fn` and passed as a
+pointer; the functions such calls reach are excluded from the alias-free fact.
 **Generic instances**: sema types a generic body once with each type parameter opaque, then
 `wukong_sema::instantiate` re-checks every concrete `(function, substitution)` a call requires
 (transitively, at most 512 per module) with `lower_type` reading the parameters through the
@@ -614,11 +629,12 @@ and exactly one `Terminator` (`Ret`, `Br`, `CondBr`, `Switch`, `Unreachable`). `
 branch on an `i8`..`i64` scrutinee whose case values are stored canonically (sign-extended from the
 type's width) and pairwise distinct; only `wukong_opt`'s late switch formation creates one, and the
 verifier, interpreter, Cranelift (`cranelift_frontend::Switch`), textual LLVM (`switch`) and every
-terminator visitor handle it (the `gpu-native` lowering declines it). `Op` has 29 variants: constants
+terminator visitor handle it (the `gpu-native` lowering declines it). `Op` has 30 variants: constants
 (`ConstInt`/`ConstFloat`), `Bin`/`Cmp`/`Cast`, the unary `Neg`/`Not`, `Select`, memory
 (`Alloca`/`Load`/`Store`/`Gep`), `AtomicAdd` (`atomic.add vV, vP`: an indivisible, sequentially
 consistent integer read-modify-write from `atomic_add(place, v)`, wrapping at the value's width,
-with no result), `Call`, `Barrier` (cooperative thread-block fence from
+with no result), `Call`, `CallIndirect` (a call through a function pointer: `call_indirect vF(vA, ..)
+-> T`, the signature being the argument types and `T`), `Barrier` (cooperative thread-block fence from
 `sync_block()`), the float/SIMD primitives
 (`Splat`/`ExtractLane`/`Iota`/`Fma`/`Sqrt`/`Round`), the lane-moving SIMD ops
 (`Widen`/`Narrow`/`Shuffle`/`InsertLane`), `IntUnary` (`popcnt`/`clz`/`ctz`/`bswap` on a scalar
@@ -676,6 +692,26 @@ function that can reach one polls the failure status after the call and stops; a
 from that list lets the caller run on), and a linked executable prints it and exits 1 (the `cc`
 fallback runtime carries C twins of both). `Op::VecKernelCall` — a call into a synthesized 256-bit
 AVX2 kernel — is covered under the vectorizer below.
+
+**`Op::CallIndirect`** calls the function a `Ptr` holds — a `func_addr` result, stored, reloaded or
+passed along — with `args`, yielding `ret` (`Void` for none; a value-returning one may discard its
+result). The verifier checks the callee is a pointer and no argument or result type is
+`void`/an array, and under `verify_program` a callee that is visibly `func_addr g` must have exactly
+`g`'s signature. The interpreter reads the callee as its `FUNC_TAG + index` tag (anything else is an
+error, never a jump); Cranelift emits `call_indirect` with the signature imported into the caller
+(JIT and AOT), and every caller of an indirect call polls the failure status after it like a call
+of an asserting function (`asserting_functions` seeds it), since the callee may fail; the LLVM text
+calls through the `ptr`; `gpu-native` declines it and autodiff refuses it.
+
+**What an op may do** is one exhaustive classification, `wukong_mir::Effects` (`Op::effects`, no
+`_` arm): reads/writes through its own pointer, calls out (opaque: any reachable memory, I/O, a
+trap, no return), may trap, synchronizes threads, allocates. Every optimizer pass that used to keep
+its own opcode list for "has an effect" asks the derived predicates instead (`is_call`,
+`may_read_memory`, `may_write_memory`, `may_trap`, `has_side_effects`, `is_pure`); a pass keeps an
+explicit arm only where it models an op precisely (a store's one destination, a summarized
+callee). So a new op is classified once, where the compiler forces it, rather than in a dozen
+`_ => {}` arms that each read it as pure (`wukong_opt/src/indirect_tests.rs` pins what each pass
+must not do to an indirect call).
 
 The front-end lowers in **clang style**: one `alloca` per local, with `load`/`store` on every use.
 `Op::Alloca` carries an `align` (bytes; `0` = natural, which every compiler-made slot uses and
@@ -950,6 +986,7 @@ invalidated, and the call-effect table for the callees optimized so far. A cache
 | `LoopUnswitch`| -O2   | after LICM: split a counted unit-step loop whose body branches on `iv` against an invariant at the clamped iteration where the guard changes (two back-to-back loops, each with the guard decided; side exits such as a slice bounds check's trap or a `break` are allowed, a loop value the trap block reads becoming an edge argument). The guard may test a **derived** quantity `ext(iv ± k) ⋈ n` -- the stencil `i + 1 < n`, the tile edge `jo + j < n` with `jo` the enclosing counter (split at `n - jo`), a counter sign/zero-extended to its bound's type, or a counter compared with the other signedness (`(i as u64) < m`) -- once a range analysis (constants, extensions, wrap-free arithmetic, enclosing counters bounded by their header tests) proves `iv ± k` cannot wrap on any iteration the body runs, values non-negative where the two signednesses must agree; an unproved guard declines, and the split point is computed without an intermediate that can overflow. Or unswitch a branch on an invariant `i1` into a preheader branch between the loop and a copy; innermost loops without frame slots, barriers, atomics or vector-kernel calls, size-capped. A loop holding calls is rewritten only when the decided condition is exactly some body block's branch condition and one of its arms -- not the latch, entered only from that block -- dominates every call block: one copy loses that arm, and every call, to simplify-cfg, so no call is duplicated (`calls_confined_to_one_arm`; `src/unswitch.rs`) |
 | `Promote`     | -O2   | scalar promotion: a loop-invariant location the loop both reads and writes, with no other possibly aliasing access, is loaded once in the preheader, accessed through a fresh slot (which `Mem2Reg` turns into a loop-carried value next sweep) and stored back on every exit -- in the exit block when the loop alone reaches it, otherwise in a new block on the loop's edges into it (bounds-check elimination's checked and check-free copies share one exit, so a slice reduction needs this) -- with the same speculation rules as `Licm` and a store-safety rule (private slot, or a store that runs whenever the loop does) |
 | `Vectorize`   | -O2   | widen eligible canonical MIR loops after LICM, then feed the result through the normal fixpoint cleanup |
+| `devirt` | -O1 | after the fixpoint: an `Op::CallIndirect` whose callee is a `func_addr g` of the same function, with `g`'s exact signature, becomes `call g(..)`; when any did, `-O2` inlines again and the pipeline re-runs over the program. A program step rather than a pass, because the call-effect table a function's passes see depends on the schedule for every symbol that is not one of its direct callees: a call made mid-fixpoint could name a function the parallel and sequential schedules have summarized differently (`src/devirt.rs`) |
 | `unroll_program`| -O2 | unroll a counted two-block loop: **completely** when its exact trip count is at most 32 and the copies total at most 128 instructions; otherwise 4x (body up to 16 instructions) or 2x (up to 32), with a wrap-safe guard and a remainder that is a loop for an unknown trip count, nothing when the factor divides a known one, and straight-line copies for a known leftover; runs **after** the function pipeline, and the functions it changed get a reduced simplify + simplify-cfg + simplify-phis + cse + dce cleanup sweep |
 | `unroll_jam` | -O2 | inside `unroll_program`, ahead of the unroller: a canonical two-deep nest whose inner loop carries a recurrence or reduction runs **four outer iterations side by side** — four row prologues, one shared inner counter, four inner bodies per iteration, four epilogues in row order — with the untouched nest as the remainder; nothing is reassociated, so each row's values are bit-identical. Legal only when every stored object is split into per-row slabs (row-major `x[r*P + t]` with the window checked, the pitch possibly the inner loop's runtime bound, or time-major `x[t*D + d]` with every row below `D`), objects that may be one buffer are range-checked once in the preheader, and nothing calls, allocates or can trap (`src/unroll_jam.rs`; `WUKONG_NO_UNROLL_JAM=1` turns it off) |
 | `slp_program` | -O2 | once, after unrolling and its cleanup: pack `W = 16 / bytes(T)` stores in one block to consecutive elements of one object (`f32`/`f64`/`i32`/`i64`), whose values are one lane-wise operation tree, into one 128-bit vector store; the packed functions get the unrolling cleanup sweep (`src/slp.rs`; see **Straight-line SLP** below) |

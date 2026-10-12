@@ -77,7 +77,10 @@ The module implements the interpreter's language, not LLVM's defaults:
   decimals that are inexact in `float` are all valid IR;
 - `atomic_add(place, v)` (MIR `atomic.add`) is one `atomicrmw add ptr P, iN V seq_cst` whose old
   value is named and never read — wrapping integer addition, sequentially consistent, exactly the
-  interpreter's add-and-mask and the Cranelift `atomic_rmw add`.
+  interpreter's add-and-mask and the Cranelift `atomic_rmw add`;
+- a call through a function value (MIR `call_indirect`) is a `call T %f(..)` through the `ptr`,
+  typed by the MIR signature (the argument types and the result), and a function's address is an
+  identity `getelementptr` of `@name`.
 
 It names the host's `target datalayout` and `target triple` (x86-64 Windows: `e-m:w-…` /
 `x86_64-pc-windows-msvc`; x86-64 Linux: `e-m:e-…` / `x86_64-unknown-linux-gnu`). The layout is the

@@ -391,18 +391,20 @@ Prefer *not* to: `abs`, `exp`, `silu` and friends are built from existing primit
    oracle: get it right first.
 5. `crates/wukong_codegen_cranelift/src/lib.rs` — a `lower_inst` arm.
 6. `crates/wukong_codegen_llvm/src/lib.rs` — an `emit_inst` arm (text only, not the oracle).
-7. `crates/wukong_opt/src/lib.rs` — `map_op_uses` **and** `each_op_use` (and
-   `map_term_uses`/`each_term_use` if you touched a terminator), plus `has_side_effects` if the op
-   writes memory or can trap. These helpers are the single source of truth for which operands an
-   `Op` reads; miss one and the passes silently corrupt SSA.
+7. `crates/wukong_mir/src/effects.rs` — the op's `Effects` in `Op::effects` (an exhaustive match:
+   reads, writes, calls out, traps, synchronizes, allocates). Every optimizer pass decides what it
+   may do with an op from these predicates, so this one classification is what keeps a writer from
+   being deleted, a reader from being value-numbered and a call from being hoisted; err toward "has
+   the effect". Then `crates/wukong_opt/src/lib.rs` — `map_op_uses` **and** `each_op_use` (and
+   `map_term_uses`/`each_term_use` if you touched a terminator). These helpers are the single
+   source of truth for which operands an `Op` reads; miss one and the passes silently corrupt SSA.
 8. `crates/wukong_opt/src/cse.rs` — a `pure_key` arm if the op is cacheable (include *every*
-   parameter in the key), and `safe_to_hoist` in `crates/wukong_opt/src/licm.rs` (default `false` if
-   it can trap or write memory). If the op **produces or consumes a pointer**, also
+   parameter in the key; `None` for anything with an effect). `licm`'s `safe_to_hoist` hoists what
+   `Op::effects` calls pure and needs no edit. If the op **produces or consumes a pointer**, also
    `crates/wukong_opt/src/alias.rs`: a new pointer-producing op must get a `Prov` (default
-   `Unknown`), and a new *writer* must be classified in `AliasInfo::may_clobber` — an op that writes
-   memory and is not listed as a writer is an unsound no-alias answer, i.e. a miscompile. That match
-   is **exhaustive with no `_` arm on purpose**, so the compiler stops you rather than letting the
-   omission pass silently; keep it that way. The escape scan needs no such care in the unsafe
+   `Unknown`). `AliasInfo::may_clobber` answers "may clobber" for any op `Op::effects` says writes
+   memory, unless an explicit arm places the write more precisely (a store, an atomic add); give a
+   new writer such an arm only to buy precision. The escape scan needs no such care in the unsafe
    direction — its fallback arm marks *every* operand as escaping, so a new op is conservative by
    default there; add an arm only to buy back precision for a pure *addressing* use.
 9. `crates/wukong_codegen_gpu/src/lower.rs` — `lower_inst` **and** `lower_vec_inst`, plus
@@ -414,18 +416,18 @@ Prefer *not* to: `abs`, `exp`, `silu` and friends are built from existing primit
     the new spelling back. Its tests' exhaustive `op_slot` match stops compiling until the variant
     has a slot, and `every_op_program` must then build one, or the round-trip test fails.
 
-**A new op that touches memory has a second, silent list.** The compiler only finds the exhaustive
-matches; most memory walkers in `wukong_opt` end in a `_ => {}` arm, and an op that falls into it
-reads as "no effect". The rule `Op::AtomicAdd` established: wherever `Op::VecKernelCall` is named as
-an opaque memory effect, name the new op beside it (`grep -n 'VecKernelCall' crates/wukong_opt/src`
-— `effects.rs`, `cse.rs`, `dse.rs`, `licm.rs`, `fuse.rs`, `unroll.rs`, `unroll_jam.rs`,
-`unswitch.rs`, `jump_thread.rs`, `bce.rs`, `loop_info.rs`, `vectorize.rs`; plus
-`wukong_codegen_cranelift/src/bool_vectors.rs`, `wukong_codegen_llvm`'s call-signature helper and
-`wukong_codegen_gpu`'s `unreachable!("handled above")` arm). The confirmed hazard is `effects.rs`:
-its `_` arm would have summarized a callee whose only write is the new op as **pure**, and `dce`
-would then delete every call to it whose result is unused. Pin each such hazard with a program
-whose `-O0` answer differs from the miscompiled one, run at `-O0`/`-O1`/`-O2`
-(`wukong_opt/src/atomic_tests.rs` is the template).
+**A new op that touches memory is classified once.** Every `wukong_opt` pass that walks memory asks
+`Op::effects` (step 7) — `effects.rs`'s call summaries, `cse`, `dse`, `licm`, `fuse`, `unroll`,
+`unroll_jam`, `unswitch`, `jump_thread`, `bce`, `loop_info`'s dependence test, `slp`, `vec256`,
+`vectorize`, `alias` — so an op classified correctly there is seen by all of them; before that
+classification existed, each pass's own opcode list ended in a `_ => {}` arm that read a forgotten
+op as pure (the confirmed hazard: `effects.rs` summarizing a callee whose only write is the new op
+as side-effect free, and `dce` deleting its unused calls). Outside `wukong_opt` the lists remain:
+`wukong_codegen_cranelift/src/bool_vectors.rs`, the Cranelift `void_op_reads` and
+`asserting_functions`, `wukong_codegen_llvm`'s call-signature helper, `wukong_autodiff/src/region.rs`
+and `wukong_codegen_gpu`'s `unreachable!("handled above")` arm and fusion scan. Pin each hazard with
+a program whose `-O0` answer differs from the miscompiled one, run at `-O0`/`-O1`/`-O2`
+(`wukong_opt/src/atomic_tests.rs` and `indirect_tests.rs` are the templates).
 
 Front-end plumbing (`wukong_sema`'s intrinsic return type, `wukong_mir_build`'s intrinsic map and
 both vectorizer arms) closes the loop. Gate with `cargo test -p wukongc --test run`.
