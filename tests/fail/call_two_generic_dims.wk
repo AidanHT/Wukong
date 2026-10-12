@@ -1,0 +1,25 @@
+// EXPECT-CODE: E0502
+// EXPECT-COUNT: 1
+module tests.fail.call_two_generic_dims
+
+// Two different dimensions of the caller cannot be assumed equal at a call. `dot(a, b)` bound the
+// callee's `N` to `P` from `a`, and then, comparing `b`'s `Q` against the substituted `P`, bound
+// `P := Q` instead of comparing: the call checked clean, and `dot(a3, b2)` read one past `b` (the
+// interpreter printed 14, native garbage).
+fn dot<N>(x: Tensor[i32, N], y: Tensor[i32, N]) -> i32 {
+    let mut s = 0;
+    for j in 0..N {
+        s = s + x[j] * y[j];
+    }
+    return s;
+}
+
+fn g<P, Q>(a: Tensor[i32, P], b: Tensor[i32, Q]) -> i32 {
+    return dot(a, b); //~ E0502
+}
+
+fn main() -> i32 {
+    let a: [i32; 3] = [1, 2, 3];
+    let b: [i32; 2] = [1, 2];
+    return g(a, b);
+}

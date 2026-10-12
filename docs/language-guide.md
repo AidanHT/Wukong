@@ -1056,7 +1056,10 @@ cannot be satisfied by the caller's own generic dim (`fn fwd<N>(a: Tensor[f32, N
 parameter `?` when the size is a runtime value). And a `?` argument never *binds* a callee's symbolic
 dim for checking, so a later concrete sibling still binds it and every subsequent operand is checked
 against that binding; when nothing else determines the dim, lowering passes the `?` argument's run-time
-extent (`tests/run/tensor_extent.wk`). A constant index past a static tensor dimension, like a fixed-size array, is `E0501`.
+extent (`tests/run/tensor_extent.wk`). Once a callee's dim is bound to one of the **caller's** dims, a
+later operand is *compared* against it, never re-bound: `dot(a, b)` with `a: Tensor[f32, P]` and
+`b: Tensor[f32, Q]` is `E0502`, where it used to bind `P := Q` and read past `b`
+(`tests/fail/call_two_generic_dims.wk`). A constant index past a static tensor dimension, like a fixed-size array, is `E0501`.
 
 **What runs today.** A tensor with **compile-time-constant shape** executes end-to-end on both
 backends: multi-dimensional indexing `a[i, j]` flattens to a row-major GEP off the base pointer (a

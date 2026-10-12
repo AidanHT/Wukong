@@ -7,6 +7,12 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ### Run-time turbofish dimensions (`gap6/generic-dims`, N21)
 
+- **A call compares the caller's dimensions instead of re-binding them.** Once a callee's `N` was
+  bound to a dimension of the caller, a later operand's dimension was bound in its place rather than
+  compared: `dot(a, b)` with `a: Tensor[i32, P]` and `b: Tensor[i32, Q]` checked clean and read past
+  `b` (interpreter 14, native garbage). It is `E0502` now (`tests/fail/call_two_generic_dims.wk`), as
+  is a caller's generic passed by turbofish against an array of a fixed length; a run-time turbofish
+  value against a fixed length stays the caller's claim, as before.
 - **The canonicalizer sees a turbofish read.** `let mut n = 3; let r = row::<2, n>(..); n = 1;`
   sank the `let` below the call (an accumulator seed whose first other mention assigns it), which
   then named no binding (`C0001`) or an outer `n`; and an index binding read by a turbofish was

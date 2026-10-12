@@ -1537,6 +1537,27 @@ impl Sema<'_> {
                         self.report_dim_conflict(span, msg, site, &want, &got);
                     }
                 }
+                // `v` is no generic of the callee still to infer but what the substitution put in
+                // its place: the declared `N` already bound, by the turbofish or an earlier
+                // argument, to a dimension of the CALLER. That is a comparison, never a binding.
+                // Binding `P := Q` here let `dot(a, b)` with `a: Tensor[i32, P]`,
+                // `b: Tensor[i32, Q]` check clean and read past `b` (the interpreter read the next
+                // slot, native garbage).
+                None if matches!(decl_dim, Some(Dim::Var(g)) if g != v) => {
+                    // A turbofish naming a run-time local meets a fixed extent at the run-time `?`
+                    // level: the turbofish is the caller's claim about the argument
+                    // (`rowsum::<m, n>(a, out)` with `out: [f32; 3]`), as it always was.
+                    let runtime_vs_fixed = !self.generics.contains(v)
+                        && self.lookup_local(*v).is_some()
+                        && matches!(ad, Dim::Const(_));
+                    if !runtime_vs_fixed && !dims_equal(pd, ad) {
+                        let (want, got) = (self.dim_str(pd), self.dim_str(ad));
+                        let at = self.dim_site(site);
+                        let msg =
+                            format!("dimension mismatch on {at}: expected {want}, found {got}");
+                        self.report_dim_conflict(span, msg, site, &want, &got);
+                    }
+                }
                 None => {
                     // Don't bind a symbolic dim to `?` (Dynamic): a deferred dim carries no value,
                     // so binding `N := ?` would make every later concrete sibling compare equal
