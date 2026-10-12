@@ -7,13 +7,17 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ### Source locations through MIR into native code (`gap5/native-source-locations`)
 
-- **Native-backend failures point at the source (P11.8).** `C0002` (a slot above the native
-  backend's 4 GiB layout), `C0001` (a construct Cranelift declines) and a native internal compiler
-  error now carry a primary span, in `--error-format=human` and `json` alike, on `--emit=obj|exe`
-  and `--run --backend=native` at every `-O` level: `tests/fail/native_layout_too_large.wk` reports
-  `--> tests/fail/native_layout_too_large.wk:11:5` with a caret under the `let` it could not lay
-  out (pinned with `//~ C0002` and by `crates/wukongc/tests/native_diag_spans.rs`). Before, these
-  diagnostics named only the program. A `--train --emit=obj|exe` artifact's failures stay span-less.
+- **Native-backend failures point at the source (P11.8).** A `C0002` (a slot above the native
+  backend's 4 GiB layout), `C0001` (a construct Cranelift declines) or native internal compiler
+  error raised inside one function now carries a primary span, in `--error-format=human` and `json`
+  alike, on `--emit=obj|exe` and `--run --backend=native` at every `-O` level: the construct whose
+  value was being lowered, else the function's declaration (also where a parameterized entry, a
+  declined boolean-vector legalization and a function Cranelift's verifier rejects are reported).
+  `tests/fail/native_layout_too_large.wk` reports `--> tests/fail/native_layout_too_large.wk:11:5`
+  with a caret under the `let` it could not lay out (pinned with `//~ C0002` and by
+  `crates/wukongc/tests/native_diag_spans.rs`). Before, these diagnostics named only the program.
+  Module-level failures (an unresolved `extern "C"` symbol, an unsupported target CPU) and a
+  `--train --emit=obj|exe` artifact's failures stay span-less.
 - **Every MIR value remembers where it came from (N70, the location table).** `Function::locs`
   (`wukong_mir::SourceLocs`) records the declaration span and one span per value; `mir_build`
   attributes each value to the innermost expression, place or statement that produced it, so every

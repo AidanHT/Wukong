@@ -275,11 +275,16 @@ Two combinations are usage errors rather than silently discarded work: `--run` w
 `obj`/`exe`. Diagnostics from every stage flow through a single `emit_diag` honoring
 `--error-format` — including native-backend failures, which `wukong_codegen_cranelift::classify_error`
 maps to `C0002` (a layout above 4 GiB), `C0001` (a by-design decline) or an internal-compiler-error
-diagnostic. Each carries a primary span: the source construct whose MIR value Cranelift was lowering
-when it failed (`NativeFailure::site`, read from the MIR source-location table — see "MIR"), else the
-failing function's declaration, so the driver keeps the source map alive past lowering on exactly the
-paths that reach Cranelift (`--run --backend=native`, `--emit=obj|exe`); a `--train` artifact's
-failures stay span-less. `--target-cpu` fixes the Cranelift ISA level for `--emit=obj|exe` and the native JIT and,
+diagnostic. A failure that belongs to one function carries a primary span (`NativeFailure::site`):
+one raised while lowering an instruction points at the source construct of the MIR value being
+lowered (read from the MIR source-location table — see "MIR"), else at the function's declaration,
+which is also where a parameterized entry point, a declined compact boolean-vector legalization and
+a function Cranelift's verifier rejects are reported. A module-level failure — an unresolved
+`extern "C"` symbol, a target CPU the host cannot run, an object-writer error — names no construct
+and has none. The driver keeps the source map alive past lowering only where it can use it
+(`--run --backend=native`, and `--emit=obj|exe` without `--run`); the interpreter and GPU runs and
+`--train` release it before optimization, and a `--train` artifact's failures stay span-less.
+`--target-cpu` fixes the Cranelift ISA level for `--emit=obj|exe` and the native JIT and,
 below x86-64-v3, builds the MIR without the raw-AVX2 recipes (`LowerOptions::vec_kernels`). The default
 `native` level is the host's flags narrowed by `WUKONG_MAX_ISA` (`wukong_runtime::isa`, read once per
 process): `scalar` gives the x86-64 baseline, `avx2`/`avx2_vnni` at most x86-64-v3, `avx512` at most
