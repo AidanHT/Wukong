@@ -858,6 +858,25 @@ folds read counter order as iteration order) and interleave groups stay with asc
 does a negative stride on an ascending counter (`x[n - 1 - i]`). `WUKONG_NO_REVERSE_VEC=1` restores
 the decline.
 
+**bf16 lanes** (P15.7). Every backend computes a `bf16` value in an `f32` register and rounds it
+to the bf16 grid at exactly four points — a load (the storage is 16 bits), a store, a constant and a
+cast (`fptrunc .. to bf16`, which `mir_build` puts after every bf16 operation, and `fpext` out of
+bf16) — so a bf16 lane is an `f32` lane: `lane_bytes(bf16)` is 4 and a bf16 value widens to
+`<4 x bf16>` parts that hold `f32x4` registers and move four 2-byte elements. The four rounding
+points stay where they were, lane by lane: the interpreter rounds each lane of a vector load as it
+rounds a scalar one; Cranelift loads with `uload16x4` and a 16-bit shift, stores four rounded top
+halves packed with `unarrow` into eight bytes, and rounds each lane of a bf16 `fptrunc`/`fpext` with
+the scalar path's integer round-to-nearest-even (`round_to_bf16_x4`; a NaN keeps its top half with
+the quiet bit set). The LLVM emitter already lowered half vectors, and `--backend=gpu-native`
+scalarizes them lane by lane through its scalar bf16 load, store and conversions. Only the three
+exact casts between `f32` and bf16 are lane-wise (`cast_route`); a bf16 cast through `f64`, to or
+from an integer, or a bitcast is replicated as the scalar instruction. A bf16 accumulator (it rounds
+inside its own recurrence) and a bf16 interleave group stay scalar, and `f16` stays scalar
+throughout: Cranelift has no vector half conversion, and its scalar path calls a runtime shim per
+element. Pinned by `tests/run/vec_bf16_lanes.wk` (NaN payloads, both zeros, both infinities, the
+smallest subnormal, the largest finite value and rounding ties; every lane's bits, hand-derived)
+and `bf16_lanes_agree_with_the_scalar_loop`.
+
 **256-bit kernels from the optimizer** (`src/vec256.rs`, a child module of `vectorize`). A loop the
 128-bit plan widens whose body also has a raw-AVX2 recipe form takes the same `Op::VecKernelCall`
 the front end builds for its own `for` loops (below), so a `while` over slices, a body that calls an

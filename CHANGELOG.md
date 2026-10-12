@@ -38,6 +38,18 @@ All notable changes to Wukong are documented here. The format is loosely based o
   streams on one base, so no existing program's output changes (`tests/run/vec256_opt_aliased.wk`
   passes one buffer as both `x` and `o`). Accesses to one element through two pointer values are
   also one stream now, which the same reload of a slice's data pointer otherwise splits.
+- **bf16 general loops vectorize (P15.7).** The MIR vectorizer refused every bf16 body, because
+  the interpreter's vector load did not round to the bf16 grid as its scalar load does. A bf16 lane
+  is an `f32` lane in a register — every backend computes bf16 in `f32` and rounds only at a load,
+  a store, a constant and a cast — so a bf16 body now widens to `<4 x bf16>`: the interpreter rounds
+  each lane of a vector load, and Cranelift loads four 2-byte elements into the top halves of an
+  `f32x4` (`uload16x4`), packs four rounded top halves on a store, and rounds a bf16
+  `fptrunc`/`fpext` lane-wise with the scalar path's integer round-to-nearest-even. Bit-exact with
+  the scalar loop: `tests/run/vec_bf16_lanes.wk` (a contracted multiply-add, a compare and
+  negation, division by zero and by infinity, `fpext` and `fptrunc` with ties, over NaN payloads,
+  signed zeros, infinities, the smallest subnormal and the largest finite value; every lane's bits,
+  hand-derived) on interp and native at `-O0` and `-O2`. 22 corpus programs with bf16 loops change
+  `-O2` MIR (no dispatch moves). `f16` stays scalar: Cranelift has no vector half conversion.
 - **`WUKONG_VEC256_MIN_TRIP=<n>`** moves the 2048-element gate (never below one register group): a
   result-identical test knob. `WUKONG_VEC256_MIN_TRIP=8 cargo test -p wukongc --test run` runs the
   interp/native differential and the `-O` invariance gates with a kernel on every eligible corpus

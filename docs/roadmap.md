@@ -664,9 +664,18 @@ line table built from them is not emitted yet.
   NaN payloads, signed zeros and one buffer passed as two slices included). Still 128-bit: reductions (an integer sum would be exact in
   the kernel's tree, but is not yet routed there), casts, gathers and scatters, shifts and bitwise
   ops, the counter read as a value, countdowns, search loops, interleave groups, unsigned compares,
-  `i64` multiplies and `bf16`/`f16` bodies. The 2048 gate is the crossover measured for the
+  `i64` multiplies and `bf16` bodies (no recipe lane). The 2048 gate is the crossover measured for the
   front end's out-of-line *reduction* kernel; the elementwise crossover is unmeasured and likely
   lower.
+  **bf16 bodies** widen too (P15.7): a bf16 lane is an `f32` lane in a register, so a bf16 loop
+  widens to `<4 x bf16>` — four 2-byte elements loaded into the top halves of an `f32x4`, the
+  arithmetic, compares and blends in `f32`, each lane rounded to the bf16 grid exactly where the
+  scalar loop rounds (a load, a store, a constant, an `fptrunc`/`fpext`) — bit-exact with the scalar
+  loop on interp and native (`tests/run/vec_bf16_lanes.wk` prints every lane's bits over NaN
+  payloads, signed zeros, infinities, subnormals and rounding ties). Still scalar: `f16` bodies
+  (Cranelift has no vector half conversion; each scalar `f16` load and store calls a runtime shim),
+  bf16 accumulators, bf16 interleave groups, and bf16 casts through `f64` or integers (replicated
+  lane by lane).
 - **Straight-line SLP** (`wukong_opt::slp`, `-O2`, after unrolling): `W` stores in one block to
   consecutive elements of one object whose values are one lane-wise operation tree pack into one
   128-bit vector store — `f32x4`, `i32x4`, `f64x2`, `i64x2` — over vector loads, splats and lane

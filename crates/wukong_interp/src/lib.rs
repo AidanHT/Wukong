@@ -1966,10 +1966,17 @@ impl<'a, 'k> Interp<'a, 'k> {
                             .ok_or("vector load out of bounds")?;
                         // I1 occupies one byte natively but represents only its low bit.
                         // Normalize before Select/branches observe a noncanonical stored byte.
-                        lanes.push(if **lane == MirType::I1 {
-                            mask_lane(value, lane)
-                        } else {
-                            value
+                        // A bf16/f16 lane rounds to its storage grid on read, exactly as the
+                        // scalar load below does (the native backend stores the 16 bits).
+                        lanes.push(match (&**lane, value) {
+                            (MirType::I1, _) => mask_lane(value, lane),
+                            (MirType::BF16, Value::Float(f)) => {
+                                Value::Float(wukong_runtime::round_bf16(f as f32) as f64)
+                            }
+                            (MirType::F16, Value::Float(f)) => {
+                                Value::Float(wukong_runtime::round_f16(f as f32) as f64)
+                            }
+                            _ => value,
                         });
                     }
                     self.push_vec(lanes)?
