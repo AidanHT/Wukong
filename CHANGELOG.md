@@ -5,7 +5,7 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
-### Slice patterns, `rest @ ..` and or-pattern bindings (`gap6/patterns-slices`)
+### Slice patterns, `rest @ ..`, or-pattern bindings and let chains (`gap6/patterns-slices`)
 
 - **Array patterns on `[]T` slices (N26).** `match s { [] => …, [x] => …, [first, .., last] => … }`
   now compiles; it was `E0401` ("test `s.len()` and index it instead"). On a slice an array pattern
@@ -31,6 +31,16 @@ All notable changes to Wukong are documented here. The format is loosely based o
   name through a block parameter (`tests/run/or_pattern_bindings.wk`,
   `tests/fail/or_pattern_unbound.wk`, `tests/fail/or_pattern_type_mismatch.wk`). Or-patterns also
   bind in `if let`, `while let` and an irrefutable `let`.
+- **`if let` / `while let` chains with more than one `let` (N26).**
+  `if let Shape::Circle(r) = a && r > 1 && let Shape::Square(w) = b && w > r { … }` and
+  `while let [h, t @ ..] = s && let 1..=9 = h { … }` now compile; a second `let` in a chain was
+  `E0200`. A later `let` is a new `ExprKind::Let` operand of the guard the parser makes of the
+  chain: it runs only when the operands before it held, tests its scrutinee against its pattern and
+  binds the pattern's names for the operands after it and the block (shadowing an earlier name);
+  when any operand fails the `else` runs, where none of them exist. The lowering branches operand
+  by operand (`mir_build::let_chain`); a guard with no `let` lowers as before
+  (`tests/run/let_chains.wk`). A chain must still open with its `let` (`if c && let P = e` is
+  not supported).
 - **A match binds an arm's names only after the arm's test passed.** The names used to be bound
   before the test, harmlessly while every place a pattern names was in bounds whatever the value; on
   a slice, `[a, b]` against a one-element slice would load past its end and `[x, ..]` against an

@@ -1688,11 +1688,12 @@ impl<'a> Parser<'a> {
         e
     }
 
-    /// The `&& c1 && c2 …` that may follow an `if let`/`while let` scrutinee, folded left into
-    /// one `&&` expression: the guard of the `match` arm the statement becomes, so the conditions
-    /// run only after the pattern matched, left to right with short-circuit, and see its bindings
-    /// (Rust's let chains, one `let` per chain). `None` when no `&&` follows. A second `let` in the
-    /// chain and a `||` after the condition are `E0200`; each is consumed to recover.
+    /// The `&& c1 && let Q = f && c2 …` that may follow an `if let`/`while let` scrutinee, folded
+    /// left into one `&&` expression: the guard of the `match` arm the statement becomes, so the
+    /// operands run only after the pattern matched, left to right with short-circuit, and see its
+    /// bindings (Rust's let chains). A later `let` is an `ExprKind::Let` operand, whose names the
+    /// operands after it and the block see too. `None` when no `&&` follows. A `||` after the
+    /// condition is `E0200`, consumed to recover.
     fn parse_let_chain_guard(&mut self) -> Option<Expr> {
         let prev = std::mem::replace(&mut self.no_struct_lit, true);
         let saved = self.depth;
@@ -1709,22 +1710,25 @@ impl<'a> Parser<'a> {
                 break;
             }
             self.bump(); // &&
-            if self.at(T::Let) {
-                let at = self.span();
-                self.chain_error(
-                    at,
-                    "only one `let` per `if let`/`while let` chain is supported; nest a second \
-                     `if let` in the block",
-                    "a second `let` in this condition",
-                );
+                         // A later `let P = e` operand tests `e` against `P` and binds its names for the
+                         // operands after it and the block (`ExprKind::Let`); its scrutinee, like the first
+                         // one's, stops before the next `&&`.
+            let rhs = if self.at(T::Let) {
+                let start = self.span();
                 self.bump(); // let
-                self.parse_pattern();
-                if self.eat(T::Eq) {
-                    self.parse_expr_bp(operand_bp);
-                }
-                continue;
-            }
-            let rhs = self.parse_expr_bp(operand_bp);
+                let pat = self.parse_pattern();
+                self.expect(T::Eq);
+                let scrutinee = self.parse_expr_bp(operand_bp);
+                self.finish_expr(
+                    start,
+                    ExprKind::Let {
+                        pat: Box::new(pat),
+                        scrutinee: Box::new(scrutinee),
+                    },
+                )
+            } else {
+                self.parse_expr_bp(operand_bp)
+            };
             guard = Some(match guard {
                 None => rhs,
                 Some(lhs) => {
@@ -3933,7 +3937,7 @@ mod tests {
     }
 
     #[test]
-    fn or_and_second_let_in_an_if_let_chain_are_e0200() {
+    fn or_in_an_if_let_chain_is_e0200() {
         let codes = |src: &str| -> Vec<&'static str> {
             let mut i = Interner::new();
             let (_e, d) = parse_expr_str(src, SourceId(0), &mut i);
@@ -3946,9 +3950,50 @@ mod tests {
             "one report, and the parse recovers"
         );
         assert_eq!(
-            codes("if let x = a && let y = b { 1 } else { 0 }"),
+            codes("if let x = a && let y = b || c { 1 } else { 0 }"),
             vec!["E0200"]
         );
+    }
+
+    /// A later `let` in a chain is a `Let` operand of the guard's `&&` fold, its scrutinee stopping
+    /// before the next `&&` like the first one's.
+    #[test]
+    fn a_second_let_in_a_chain_is_a_let_operand() {
+        let (scrutinee, guard) = if_let_parts(
+            "if let E::A(x) = s && x > 0 && let E::B(y) = t == u && y < x { 1 } else { 0 }",
+        );
+        assert!(matches!(scrutinee.kind, ExprKind::Path(_)), "{scrutinee:?}");
+        let guard = guard.expect("the chain is the guard");
+        let mut ops = Vec::new();
+        let mut cur = &guard;
+        while let ExprKind::Binary {
+            op: BinOp::And,
+            lhs,
+            rhs,
+        } = &cur.kind
+        {
+            ops.push(&**rhs);
+            cur = lhs;
+        }
+        ops.push(cur);
+        ops.reverse();
+        assert_eq!(ops.len(), 3, "{ops:?}");
+        let ExprKind::Let { pat, scrutinee } = &ops[1].kind else {
+            panic!("the second operand is the `let`: {:?}", ops[1])
+        };
+        assert!(matches!(pat.kind, PatKind::Variant { .. }), "{pat:?}");
+        assert!(
+            matches!(scrutinee.kind, ExprKind::Binary { op: BinOp::Eq, .. }),
+            "`t == u` is the scrutinee: {scrutinee:?}"
+        );
+        // `while let` takes the same chain.
+        let mut i = Interner::new();
+        let (_m, d) = parse_module(
+            "fn f(n: i32, m: i32) { let mut k = n; while let 1..=9 = k && let 0 = m { k = k + 1; } }",
+            SourceId(0),
+            &mut i,
+        );
+        assert!(d.is_empty(), "{d:?}");
     }
 
     /// A `{ … }` arm body ends at its `}`: an arm after it that opens with `[`, `(` or `-` is a new

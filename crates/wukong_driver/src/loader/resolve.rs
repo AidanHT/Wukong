@@ -1133,6 +1133,12 @@ impl Rewriter<'_> {
                 }
             }
             ExprKind::Loop { body, .. } => self.block(body),
+            // An `if let` chain's `let` binds into the arm's locals, which the `Match` arm above
+            // pushed, for the chain's later operands and the arm's body.
+            ExprKind::Let { pat, scrutinee } => {
+                self.expr(scrutinee);
+                self.pattern(pat);
+            }
             ExprKind::SizeOf(t) | ExprKind::AlignOf(t) => self.ty(t),
             // A closure's parameters are locals of its body, so one shadows an imported name
             // there exactly as a `match` arm's binding does.

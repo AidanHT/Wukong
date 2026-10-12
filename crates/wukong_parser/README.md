@@ -35,7 +35,7 @@ calls `parse_module_tokens_from`, so imported files get disjoint `NodeId` ranges
 
 | code | raised by |
 |---|---|
-| `E0200` | `expect()` — specific token required; `parse_let_chain_guard` — a `\|\|` after an `if let`/`while let` condition, or a second `let` in one chain |
+| `E0200` | `expect()` — specific token required; `parse_let_chain_guard` — a `\|\|` after an `if let`/`while let` condition |
 | `E0201` | `ident()` — name required; also `..base` rejection |
 | `E0202` | `parse_primary` fallthrough; tuple field index overflow |
 | `E0203` | `parse_type` fallthrough |

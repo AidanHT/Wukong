@@ -42,6 +42,8 @@ mod externs;
 #[cfg(test)]
 mod fp_contract_tests;
 mod kernel_guard;
+// The `let` operands of an `if let` / `while let` chain's guard (see the module docs).
+mod let_chain;
 #[cfg(test)]
 mod match_tests;
 mod methods;
@@ -648,6 +650,7 @@ impl MonoCollector<'_> {
                 }
             }
             ExprKind::Loop { body, .. } => self.walk_block(body, subst),
+            ExprKind::Let { scrutinee, .. } => self.walk_expr(scrutinee, subst),
         }
     }
 }
@@ -903,6 +906,7 @@ fn collect_str_expr(e: &Expr, out: &mut Vec<Symbol>) {
             }
         }
         ExprKind::Loop { body, .. } => collect_str_block(body, out),
+        ExprKind::Let { scrutinee, .. } => collect_str_expr(scrutinee, out),
     }
 }
 
@@ -1070,6 +1074,7 @@ fn collect_field_bases_expr(e: &Expr, out: &mut Vec<(Symbol, Symbol)>) {
             }
         }
         ExprKind::Loop { body, .. } => collect_field_bases_block(body, out),
+        ExprKind::Let { scrutinee, .. } => collect_field_bases_expr(scrutinee, out),
     }
 }
 
@@ -2703,6 +2708,7 @@ fn escapes_parallel_chunk_expr(e: &Expr, depth: u32) -> bool {
                 })
         }
         ExprKind::Loop { body, .. } => escapes_parallel_chunk_block(body, depth + 1),
+        ExprKind::Let { scrutinee, .. } => escapes_parallel_chunk_expr(scrutinee, depth),
     }
 }
 
@@ -21963,9 +21969,9 @@ impl FnLowerer<'_> {
         // The guard is normalized to `i1` like every other boolean condition (`if`/`while`/`&&`):
         // a non-bool guard (`match k { x if x => .. }`) would otherwise feed its raw `i32` into the
         // `cond_br`, MIR the verifier and Cranelift reject (the `lower_bool_cond` fix covered
-        // if/while/short-circuit/assert but not the match-guard path).
-        let gv = self.lower_bool_cond(g);
-        self.builder.cond_br(gv, body_bb, vec![], next_bb, vec![]);
+        // if/while/short-circuit/assert but not the match-guard path). An `if let` chain's later
+        // `let`s are lowered operand by operand instead (`let_chain.rs`).
+        self.emit_guard(g, body_bb, next_bb);
         self.builder.switch_to(body_bb);
         self.terminated = false;
     }
@@ -27771,6 +27777,7 @@ impl GemmBiasAlias<'_> {
                         arm.guard.as_ref().is_some_and(|e| self.expr(e)) || self.expr(&arm.body)
                     })
             }
+            ExprKind::Let { scrutinee, .. } => self.expr(scrutinee),
         }
     }
 }

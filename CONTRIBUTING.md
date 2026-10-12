@@ -354,7 +354,10 @@ arm instead of copying a leaf: a closure body is walked by name resolution, alia
 attribute check and the lints' use tracking, but never by a divergence analysis
 (`block_diverges`, `expr_contains_break`, the lints' `stmt_diverges`), where its `return` would end
 the enclosing function. `wukong_mir_build`'s walkers can treat it as a leaf only because
-`closures::lift_module` rewrites every closure away before any of them runs.
+`closures::lift_module` rewrites every closure away before any of them runs. `ExprKind::Let` (a later
+`let` of an `if let` chain, only ever an operand of a `match` guard's `&&` fold) is the one
+expression that binds names: a walker that tracks scopes must bind its pattern into the enclosing
+arm's scope, as the arm's own pattern is, or a shadowing goes unseen.
 
 ## Adding a MIR `Op`
 

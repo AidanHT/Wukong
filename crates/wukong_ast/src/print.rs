@@ -814,6 +814,13 @@ impl AstPrinter<'_> {
                 self.line(format!("closure |{}|{ret}", ps.join(", ")));
                 self.indented(|p| p.expr(body));
             }
+            ExprKind::Let { pat, scrutinee } => {
+                self.line("let");
+                self.indented(|p| {
+                    p.pattern(pat);
+                    p.expr(scrutinee);
+                });
+            }
         }
     }
 }

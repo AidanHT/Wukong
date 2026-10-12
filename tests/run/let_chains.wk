@@ -1,0 +1,114 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 4
+// EXPECT-OUT: 304
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -2
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 24
+// EXPECT-OUT: 10
+// EXPECT-OUT: 108
+// EXPECT-OUT: 206
+// EXPECT-OUT: 7
+// EXPECT-OUT: 5
+// EXPECT-OUT: 30
+// EXPECT-OUT: 5
+// EXPECT-OUT: 9
+// EXPECT-OUT: 0
+// EXPECT-OUT: 77
+module tests.run.let_chains
+
+// `if let` / `while let` chains with more than one `let`:
+// `if let P = e && c && let Q = f && d { A } else { B }`. The operands run left to right with
+// short-circuit, each `let` tests its scrutinee against its pattern and binds the pattern's names
+// for the operands after it and for `A`; when any operand fails, `B` runs and none of the names
+// exist there. A later `let` may shadow an earlier binding.
+
+enum Shape {
+    Circle(i32),
+    Square(i32),
+    Empty,
+}
+
+struct P {
+    x: i32,
+    y: i32,
+}
+
+// Prints its argument, so the output shows which operands ran.
+fn noisy(t: i32) -> bool {
+    println(t);
+    return t > 0;
+}
+
+fn both(a: Shape, b: Shape) -> i32 {
+    if let Shape::Circle(r) = a && r > 1 && let Shape::Square(w) = b && noisy(w) {
+        return r * 100 + w;
+    } else {
+        return -1;
+    }
+}
+
+// A chain as a value, in an `else if`.
+fn pick(a: Shape, b: Shape) -> i32 {
+    let v = if let Shape::Square(s) = a && let Shape::Square(t) = b {
+        s + t
+    } else if let Shape::Circle(r) = a && let Shape::Empty = b {
+        r * 10
+    } else {
+        5
+    };
+    return v;
+}
+
+fn main() -> i32 {
+    println(both(Shape::Circle(3), Shape::Square(4)));
+    println(both(Shape::Circle(1), Shape::Square(4)));
+    println(both(Shape::Circle(3), Shape::Empty));
+    println(both(Shape::Circle(3), Shape::Square(-2)));
+    println(both(Shape::Empty, Shape::Square(4)));
+
+    // Slice, array and struct patterns in one chain.
+    let s: [i32; 4] = [5, 6, 7, 8];
+    let v: []i32 = s;
+    let pts: [P; 2] = [P { x: 1, y: 2 }, P { x: 3, y: 4 }];
+    if let [a, rest @ ..] = v && let [b, .., z] = rest && let [P { x, .. }, q] = pts {
+        println(a + b + z + x + q.y);
+    }
+
+    // `while let` re-tests the whole chain on every iteration.
+    let mut k: i32 = 0;
+    let mut m: i32 = 10;
+    while let 0..=4 = k && let 6..=20 = m {
+        println(k * 100 + m);
+        k = k + 1;
+        m = m - 2;
+    }
+
+    println(pick(Shape::Square(3), Shape::Square(4)));
+    println(pick(Shape::Circle(2), Shape::Square(4)));
+    println(pick(Shape::Circle(3), Shape::Empty));
+    println(pick(Shape::Empty, Shape::Empty));
+
+    // A later `let` shadows an earlier name, for the operands after it and the block.
+    let t: (i32, i32) = (4, 9);
+    if let (x, _) = t && x == 4 && let (_, x) = t {
+        println(x);
+    }
+    // A chain whose second `let` fails runs the `else`.
+    let e: []i32 = v[0..0];
+    if let (_, 9) = t && let [h, ..] = e {
+        println(h);
+    } else {
+        println(0);
+    }
+    // A chain nested in a block of a chain.
+    if let Shape::Square(w) = Shape::Square(7) && let (7, n) = (w, 11) {
+        if let 11 = n && let Shape::Circle(c) = Shape::Circle(w * n) {
+            println(c);
+        }
+    }
+    return 0;
+}

@@ -198,7 +198,9 @@ fn level(e: &Expr) -> u8 {
         | ExprKind::Match { .. }
         | ExprKind::Loop { .. }
         | ExprKind::SizeOf(_)
-        | ExprKind::AlignOf(_) => LVL_POSTFIX,
+        | ExprKind::AlignOf(_)
+        // Only ever an operand of an `if let` chain's `&&`, where it needs no parentheses.
+        | ExprKind::Let { .. } => LVL_POSTFIX,
     }
 }
 
@@ -1741,6 +1743,7 @@ impl<'a> Printer<'a> {
             ExprKind::Closure {
                 body, ret: None, ..
             } => self.ends_with_open_if(body),
+            ExprKind::Let { scrutinee, .. } => self.ends_with_open_if(scrutinee),
             ExprKind::Int(_)
             | ExprKind::Float(_)
             | ExprKind::Str(_)
@@ -1949,7 +1952,8 @@ impl<'a> Printer<'a> {
             | ExprKind::Match { .. }
             | ExprKind::Loop { .. }
             | ExprKind::SizeOf(_)
-            | ExprKind::AlignOf(_) => false,
+            | ExprKind::AlignOf(_)
+            | ExprKind::Let { .. } => false,
         }
     }
 
@@ -2441,6 +2445,13 @@ impl<'a> Printer<'a> {
                         self.expr(body, Cx::top(cx.ns));
                     }
                 }
+            }
+            // A later `let` of an `if let` chain: its scrutinee stops before `&&`, like the first.
+            ExprKind::Let { pat, scrutinee } => {
+                self.w("let ");
+                self.pat(pat);
+                self.w(" = ");
+                self.expr(scrutinee, Cx { ns: true, min: 3 });
             }
         }
     }

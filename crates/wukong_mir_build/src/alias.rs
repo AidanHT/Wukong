@@ -1362,6 +1362,17 @@ fn scan_body(body: &Block, sema: &SemaResult) -> BodyScan {
                     out.opaque_republish = true;
                 }
             }
+            // A `let P = e` of an `if let` chain binds into `e` exactly as a `match` arm does.
+            ExprKind::Let { pat, scrutinee } => {
+                if pattern_binds(pat)
+                    && sema
+                        .types
+                        .get(&scrutinee.id)
+                        .is_some_and(|t| ty_contains_borrowing(t, sema, 0))
+                {
+                    out.opaque_republish = true;
+                }
+            }
             ExprKind::Call { callee, args, .. } => {
                 let ExprKind::Path(p) = &callee.kind else {
                     return;
@@ -1822,6 +1833,7 @@ fn walk_expr(e: &Expr, f: &mut impl FnMut(Node<'_>)) {
                 walk_expr(&a.body, f);
             }
         }
+        ExprKind::Let { scrutinee, .. } => walk_expr(scrutinee, f),
         // Leaves. Spelled out rather than `_` so a new `ExprKind` is a compile error here.
         ExprKind::Int(_)
         | ExprKind::Float(_)

@@ -400,6 +400,7 @@ fn collect_const_refs(e: &Expr, consts: &HashSet<Symbol>, out: &mut Vec<Symbol>)
         // A closure is never a legal const initializer (E0411), but what its body names still
         // counts: a cycle through it would otherwise go unreported.
         ExprKind::Closure { body, .. } => collect_const_refs(body, consts, out),
+        ExprKind::Let { scrutinee, .. } => collect_const_refs(scrutinee, consts, out),
         ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Str(_)
@@ -4886,6 +4887,14 @@ impl<'a> Sema<'a> {
             // A closure argument of a function-typed parameter is checked by `type_call_args`;
             // anywhere else it is `E0411` (`closures.rs`).
             ExprKind::Closure { .. } => self.misplaced_closure(e),
+            // `let P = e` in an `if let` / `while let` chain, which the parser puts in the first
+            // arm's guard: a test of `e` against `P`, so a `bool`, binding `P`'s names in the arm's
+            // scope for the chain's later operands and the arm's body.
+            ExprKind::Let { pat, scrutinee } => {
+                let t = self.type_expr(scrutinee);
+                self.bind_pattern(pat, &t);
+                Ty::Scalar(Scalar::Bool)
+            }
         }
     }
 

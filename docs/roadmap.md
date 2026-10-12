@@ -222,18 +222,19 @@ line table built from them is not emitted yet.
   pattern matched.
   `if let`, `while let` and `let … else` (whose `else` must diverge) are rewritten by the parser into
   a `match`; `if let P = e && c1 && c2` / `while let P = e && c` put the `&&` chain on the pattern's
-  arm as its guard (Rust's let chains, one `let` per chain; a `||` after the condition is `E0200`),
+  arm as its guard (Rust's let chains: a later `let Q = f` operand tests and binds for the operands
+  after it and the block; a `||` after the condition is `E0200`),
   and a plain `let` pattern must be irrefutable (`E0442`). The scrutinee is evaluated once and the
   whole `match` lowers to an if-else chain; a match sema proves exhaustive (over a type whose
   all-zero value the analysis models) takes its last unguarded arm untested — no compare and no
   trap, at every `-O` level and on every backend — so an exhaustive `bool` match is one branch. At
   `-O2` four or more equality tests on one integer scrutinee become one MIR `switch` (a Cranelift
   jump table or search tree; the `gpu-native` backend declines it)
-  (`tests/run/{match_expr,match_patterns,match_tuple,match_dense_enum_switch,match_exhaustive_fallthrough,if_let_chain,patterns_struct_binding_slice,slice_patterns,or_pattern_bindings}.wk`).
+  (`tests/run/{match_expr,match_patterns,match_tuple,match_dense_enum_switch,match_exhaustive_fallthrough,if_let_chain,let_chains,patterns_struct_binding_slice,slice_patterns,or_pattern_bindings}.wk`).
   **Destructuring `for` heads** over an array or a slice — `for (i, x) in pairs`,
   `for Point { x, y } in pts` — bind each element as `let <pat> = a[i];` would; the pattern must be
-  irrefutable by its form (`E0442`; `tests/run/for_destructure.wk`). Not yet: more than one `let` in
-  an `if let` chain.
+  irrefutable by its form (`E0442`; `tests/run/for_destructure.wk`). Not yet: a chain that opens
+  with a condition rather than its `let` (`if c && let P = e`).
 - **C-style enums** `enum Code { Ok = 10, Err }` — explicit or auto-incrementing discriminants; a
   variant *is* its integer discriminant, usable in `let`, `==`, `as i32`, and as a `match` pattern
   (`tests/run/enum_cstyle.wk`).

@@ -742,23 +742,28 @@ while let 1..=100 = k { k = k - 7; }                         // loop { match k {
 let Shape::Circle(r) = s else { return 0; };                 // `r` is bound after this line
 if let Shape::Circle(r) = s && r > 2 && r < 9 { use(r); }    // match s { P if r > 2 && r < 9 => …, _ => … }
 while let 1..=9 = k && k != 5 { k = k + 1; }                 // the guard joins the loop's arm
+if let Shape::Circle(r) = s && let Shape::Square(w) = t && w > r { use(r, w); }   // a second `let`
 ```
 
 An **`&&` chain** after an `if let` / `while let` scrutinee (✅) becomes the guard of the pattern's
 arm: the conditions run only after the pattern matched, left to right with short-circuit, and see
-its bindings — Rust's let chains with one `let`. The scrutinee therefore stops before a top-level
-`&&` (`if let true = a == b && c` tests `a == b`, then `c`); a second `let` in the chain, or a `||`
-after the condition, is `E0200` (group it: `&& (a || b)`; `tests/run/if_let_chain.wk`,
-`tests/fail/if_let_chain_or.wk`). To match a whole `&&` or `||` expression, parenthesize it:
-`if let false = (a && b)` tests `a && b`, while `if let false = a && b` tests `a` and then
-requires `b` — the same result only for a `true` pattern.
+its bindings — Rust's let chains. A **later `let P = e`** in the chain (✅) tests `e` against `P`
+when the operands before it held, and binds `P`'s names for the operands after it and for the
+block (a name it rebinds shadows the earlier one); if any operand fails, the `else` runs, and none
+of the chain's names exist there (`tests/run/let_chains.wk`). Each scrutinee stops before a
+top-level `&&` (`if let true = a == b && c` tests `a == b`, then `c`); a `||` after the condition
+is `E0200` (group it: `&& (a || b)`; `tests/run/if_let_chain.wk`, `tests/fail/if_let_chain_or.wk`).
+The chain must start with its `let`: `if c && let P = e` is not supported. To match a whole `&&`
+or `||` expression, parenthesize it: `if let false = (a && b)` tests `a && b`, while
+`if let false = a && b` tests `a` and then requires `b` — the same result only for a `true`
+pattern.
 
 The `else` of a `let … else` must **diverge** — `return`, `break`, `continue`, or a `loop` with no
 exit — because the names its pattern binds do not exist on that path (`E0401` otherwise). A plain
 `let` pattern, in turn, must be **irrefutable**: `let Shape::Circle(r) = s;` would leave `r` unbound
 for every other shape, so it is `E0442`, with a witness naming a value it misses
 (`tests/run/patterns_struct_binding_slice.wk`, `tests/fail/let_refutable_pattern.wk`,
-`tests/fail/let_else_not_diverging.wk`). Not yet: more than one `let` in an `if let` chain.
+`tests/fail/let_else_not_diverging.wk`).
 
 A literal pattern must be **in range for the scrutinee's type**: `match n { 200 => … }` against an
 `i8` is an `E0431` ("literal `200` is out of range for `i8` (-128..=127)"), not a value truncated to

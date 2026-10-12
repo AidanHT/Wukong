@@ -749,6 +749,34 @@ fn rest_bindings_and_arms_after_a_block_body() {
     );
 }
 
+/// A later `let` of a chain prints in place, its scrutinee parenthesized past `&&` like the
+/// first one's.
+#[test]
+fn if_let_chains_with_several_lets() {
+    golden(
+        "fn f(s: Shape, t: Shape) {
+    if let Shape::Circle(r) = s && r > 2 && let Shape::Sq(w)=(a || b) && w > r { g(r); }
+    while let [h, ..] = v && let 1..=9 = h { g(h); }
+    if let Shape::Circle(x) = s && let (y, 0) = (x && c) { g(y); } else { g(0); }
+}
+",
+        "fn f(s: Shape, t: Shape) {
+    if let Shape::Circle(r) = s && r > 2 && let Shape::Sq(w) = (a || b) && w > r {
+        g(r);
+    }
+    while let [h, ..] = v && let 1..=9 = h {
+        g(h);
+    }
+    if let Shape::Circle(x) = s && let (y, 0) = (x && c) {
+        g(y);
+    } else {
+        g(0);
+    }
+}
+",
+    );
+}
+
 #[test]
 fn if_let_chains_and_their_parentheses() {
     golden(

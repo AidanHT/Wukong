@@ -899,6 +899,36 @@ mod tests {
         );
     }
 
+    /// A later `let` of an `if let` / `while let` chain binds for the operands after it and the
+    /// block, and nowhere else.
+    #[test]
+    fn let_chains_with_several_lets() {
+        assert_clean(&format!(
+            "{SHAPE}fn f(a: Shape, b: Shape) -> i32 {{ if let Shape::Circle(r) = a && r > 1 && \
+             let Shape::Square(w) = b && w > r {{ return r * 10 + w; }} return 0; }}"
+        ));
+        assert_clean(
+            "fn f(s: []i32, t: (i32, i32)) -> i32 { let mut k = 0; while let [h, ..] = s && \
+             let (0, v) = t && k < h { k = k + v; } return k; }",
+        );
+        // The second `let`'s names do not reach the `else`.
+        assert_code(
+            &format!(
+                "{SHAPE}fn f(a: Shape, b: Shape) -> i32 {{ if let Shape::Circle(r) = a && \
+                 let Shape::Square(w) = b {{ return r + w; }} else {{ return w; }} }}"
+            ),
+            "E0301",
+        );
+        // A later `let`'s pattern is checked against its own scrutinee.
+        assert_code(
+            &format!(
+                "{SHAPE}{POINT}fn f(a: Shape, p: Point) -> i32 {{ if let Shape::Circle(r) = a && \
+                 let Shape::Square(w) = p {{ return r + w; }} return 0; }}"
+            ),
+            "E0401",
+        );
+    }
+
     #[test]
     fn destructuring_for_heads() {
         // Tuples, structs, arrays, `@`, nesting and a one-variant enum, over arrays and slices.
