@@ -6456,6 +6456,7 @@ mod tests {
             entry: BlockId(0),
             vec_kernels: Vec::new(),
             param_attrs: Vec::new(),
+            locs: Default::default(),
         };
         let mut program = Program::new();
         program.funcs.push(f);

@@ -27,7 +27,7 @@ pub use vec_kernel::{
     VEC_NREG,
 };
 
-use wukong_span::Symbol;
+use wukong_span::{Span, Symbol};
 use wukong_types::Scalar;
 
 /// A single-assignment value (an instruction result or block parameter).
@@ -216,11 +216,89 @@ pub struct Function {
     /// Set by `mir_build` from a `@noalias` parameter, a `[]T` slice and a fixed-extent buffer;
     /// consumed by `wukong_opt::alias`, the backends' alias annotations and the vectorizer.
     pub param_attrs: Vec<ParamAttrs>,
+    /// Where each value came from in the source ([`SourceLocs`]). Read it through
+    /// [`Function::value_loc`] and [`Function::decl_span`], never by indexing.
+    pub locs: SourceLocs,
+}
+
+/// The source-location side table of a [`Function`]: the span each value was lowered from, and
+/// the span of the declaration the function was lowered from.
+///
+/// Like [`ParamAttrs`], this is a record of what the source said, never something a pass relies
+/// on, so the rule for every producer and consumer is the same:
+///
+/// - `values` is index-parallel to [`Function::value_types`] and may be **shorter**: a value past
+///   its end has no recorded location.
+/// - A [`Span::dummy`] entry (or decl) means *unknown*.
+/// - Dropping entries — truncating the vector, or resetting the whole table to its default — is
+///   always sound: it only forgets where a value came from. A **wrong** entry is a bug, because
+///   a diagnostic would then point the user at code that did not produce the value.
+/// - No pass renumbers a `ValueId` (`value_types` only ever grows, and a new value is appended
+///   at its end), so an entry can be lost but never transferred to another value.
+///
+/// `wukong_mir_build` fills it for every value it creates. Of the optimizer's passes only
+/// inlining (a callee's values keep the callee's spans) and loop unrolling (each copy keeps its
+/// original's span) carry locations onto values they create; every other new value stays unknown.
+/// The Cranelift backend tags each instruction with the `ValueId` it lowers (its `SourceLoc`), so
+/// a machine-code range maps back to a span through [`Function::value_loc`], and a backend
+/// failure points at the value it was lowering. The interpreter and the MIR printer ignore it, so
+/// `--emit=mir` is unchanged by it.
+#[derive(Clone, Debug)]
+pub struct SourceLocs {
+    /// The function's declaration: its name in a source function, the loop it was outlined from
+    /// in a `@parallel` region.
+    pub decl: Span,
+    /// The span each value was lowered from, indexed by `ValueId`.
+    pub values: Vec<Span>,
+}
+
+impl Default for SourceLocs {
+    fn default() -> SourceLocs {
+        SourceLocs {
+            decl: Span::dummy(),
+            values: Vec::new(),
+        }
+    }
 }
 
 impl Function {
     pub fn value_type(&self, v: ValueId) -> &MirType {
         &self.value_types[v.0 as usize]
+    }
+
+    /// The source span `v` was lowered from, or `None` when it has no recorded location (see
+    /// [`SourceLocs`]).
+    pub fn value_loc(&self, v: ValueId) -> Option<Span> {
+        self.locs
+            .values
+            .get(v.0 as usize)
+            .copied()
+            .filter(|s| !s.is_dummy())
+    }
+
+    /// Record that `v` was lowered from `s`, growing the table with unknown entries as needed.
+    pub fn set_value_loc(&mut self, v: ValueId, s: Span) {
+        let i = v.0 as usize;
+        if self.locs.values.len() <= i {
+            if s.is_dummy() {
+                return;
+            }
+            self.locs.values.resize(i + 1, Span::dummy());
+        }
+        self.locs.values[i] = s;
+    }
+
+    /// Give `to` the location of `from` — for a pass that creates `to` as a copy of `from`. A
+    /// no-op when `from` has no location.
+    pub fn copy_value_loc(&mut self, from: ValueId, to: ValueId) {
+        if let Some(s) = self.value_loc(from) {
+            self.set_value_loc(to, s);
+        }
+    }
+
+    /// The span of the declaration this function was lowered from, if it has one.
+    pub fn decl_span(&self) -> Option<Span> {
+        Some(self.locs.decl).filter(|s| !s.is_dummy())
     }
 
     /// The source facts for parameter number `i` (an index into `params`). A parameter with no

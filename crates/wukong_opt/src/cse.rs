@@ -1265,6 +1265,7 @@ mod tests {
             entry: BlockId(0),
             vec_kernels: Vec::new(),
             param_attrs: Vec::new(),
+            locs: Default::default(),
         };
         assert!(
             wukong_mir::verify::verify_function(&f).is_empty(),
@@ -1338,6 +1339,7 @@ mod tests {
             entry: BlockId(0),
             vec_kernels: Vec::new(),
             param_attrs: Vec::new(),
+            locs: Default::default(),
         };
         let mut cache = CfgAnalyses::default();
         Cse.run_function(&mut f, &mut cache);

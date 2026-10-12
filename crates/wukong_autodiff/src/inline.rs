@@ -127,6 +127,9 @@ fn flatten(program: &Program, f: &Function, stack: &mut Vec<Symbol>) -> Option<F
         entry: f.entry,
         vec_kernels: f.vec_kernels.clone(),
         param_attrs: f.param_attrs.clone(),
+        // `f`'s values keep their ids (the spliced callee values are appended after them), so its
+        // locations stay correct as a prefix; the spliced values have none.
+        locs: f.locs.clone(),
     })
 }
 

@@ -278,7 +278,16 @@ Two combinations are usage errors rather than silently discarded work: `--run` w
 `obj`/`exe`. Diagnostics from every stage flow through a single `emit_diag` honoring
 `--error-format` — including native-backend failures, which `wukong_codegen_cranelift::classify_error`
 maps to `C0002` (a layout above 4 GiB), `C0001` (a by-design decline) or an internal-compiler-error
-diagnostic. `--target-cpu` fixes the Cranelift ISA level for `--emit=obj|exe` and the native JIT and,
+diagnostic. A failure that belongs to one function carries a primary span (`NativeFailure::site`):
+one raised while lowering an instruction points at the source construct of the MIR value being
+lowered (read from the MIR source-location table — see "MIR"), else at the function's declaration,
+which is also where a parameterized entry point, a declined compact boolean-vector legalization and
+a function Cranelift's verifier rejects are reported. A module-level failure — an unresolved
+`extern "C"` symbol, a target CPU the host cannot run, an object-writer error — names no construct
+and has none. The driver keeps the source map alive past lowering only where it can use it
+(`--run --backend=native`, and `--emit=obj|exe` without `--run`); the interpreter and GPU runs and
+`--train` release it before optimization, and a `--train` artifact's failures stay span-less.
+`--target-cpu` fixes the Cranelift ISA level for `--emit=obj|exe` and the native JIT and,
 below x86-64-v3, builds the MIR without the raw-AVX2 recipes (`LowerOptions::vec_kernels`). The default
 `native` level is the host's flags narrowed by `WUKONG_MAX_ISA` (`wukong_runtime::isa`, read once per
 process): `scalar` gives the x86-64 baseline, `avx2`/`avx2_vnni` at most x86-64-v3, `avx512` at most
@@ -609,6 +618,36 @@ ICE always exits non-zero). In debug builds `wukong_opt` additionally asserts we
 every pass that ran; that check is `#[cfg(debug_assertions)]`, not a CLI flag, so it is compiled out
 of release. Note the pipeline calls `verify_function`, so `verify_program`'s call-vs-callee
 cross-check is exercised only by `wukong_mir`'s own tests.
+
+**Source locations.** Every `Function` carries a side table, `Function::locs`
+(`wukong_mir::SourceLocs`): the span of the declaration it was lowered from, and one span per value,
+index-parallel to `value_types`. Its contract mirrors `ParamAttrs`: the table may be shorter than the
+arena, a dummy span means unknown, and dropping entries is always sound — only a *wrong* entry is a
+bug, since a diagnostic would point at code that did not produce the value. No pass renumbers a
+`ValueId` (the arena only grows), so an entry can be lost but never transferred to another value; the
+verifier rejects a table longer than the arena. `mir_build` fills it through the `Builder`: every new
+value takes the builder's current location, and the lowering entry points (`lower_expr`,
+`lower_place`, `lower_stmt`, `lower_block`) are wrappers that make their node's span current while
+the `*_kind` body runs and restore the outer one after, so a value is attributed to the innermost
+construct that produced it, a synthesized node (a dummy span) inherits its surroundings, and a
+statement window a recognizer replaces with one kernel call is attributed to its first statement.
+Each source function starts at its name (`Builder::set_decl`; a generic instance at its template's,
+a lifted closure at its literal) and an outlined `@parallel` region at its loop, so straight out of
+lowering every value of a source function is located (`crates/wukong_opt/tests/source_locations.rs`
+pins 100% over `tests/run`). Of the optimizer's passes only inlining (the callee's values keep the
+callee's spans) and loop unrolling (each copy keeps its original's) carry locations onto the values
+they create; every other new value stays unknown, and the same census pins the share that survives
+`-O2` from below. The Cranelift backend gives each instruction it emits a `SourceLoc` that is a
+`ValueId` (`FnTranslator::translate`): an instruction with a result carries that value when it is
+located; a store or void call, which has no table entry of its own, carries the value it reads when
+that value was lowered just before it; a terminator carries its condition, scrutinee or return
+value. Everything else — an unlocated value's code, the head of a block, a call that reads nothing
+just lowered — carries the default (unknown) `SourceLoc`: a location is dropped, never borrowed from
+a neighbour. A machine-code range therefore maps back to a span through `Function::value_loc` — the
+input a DWARF line table needs (not emitted yet) — and a backend failure is reported at the span of
+the value being lowered, else at the function's declaration. Locations never change code: the
+object bytes with and without the table are pinned equal. The interpreter and the printer ignore
+the table, so `--emit=mir` is unchanged by it.
 
 `wukong_mir::print` renders MIR deterministically — the text behind `--emit=mir` and
 `--emit=mir-high`, and stable enough for snapshot tests. It is also the grep surface for checking what

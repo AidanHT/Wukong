@@ -52,6 +52,8 @@ mod par_grain;
 mod repr_tests;
 mod shape_ops;
 mod softmax_oop;
+#[cfg(test)]
+mod srcloc_tests;
 // `str`: the literal fat pointer, `==`, and range indexing (see the module docs).
 mod strs;
 mod tile;
@@ -3049,6 +3051,9 @@ fn lower_fn(
         param_arrays: vec![],
         dyn_extents: HashMap::default(),
     };
+    // Every value starts at the function's name (a generic instance: its template's; a lifted
+    // closure: its literal), so the parameters and the prologue are located too.
+    fl.builder.set_decl(f.name.span);
 
     // The sret pointer is parameter 0 — declared before the real params so the call site can prepend
     // the destination buffer to the argument list.
@@ -3366,6 +3371,7 @@ fn lower_parallel(
             param_arrays: vec![],
             dyn_extents: HashMap::default(),
         };
+        fl.builder.set_decl(f.name.span);
         let start = fl.builder.add_param(MirType::I64);
         let end = fl.builder.add_param(MirType::I64);
         let env = fl.builder.add_param(MirType::Ptr);
@@ -3463,6 +3469,7 @@ fn lower_parallel(
             param_arrays: vec![],
             dyn_extents: HashMap::default(),
         };
+        fl.builder.set_decl(f.name.span);
         let param_vals: Vec<ValueId> = param_tys
             .iter()
             .map(|pty| {
@@ -6079,7 +6086,16 @@ impl FnLowerer<'_> {
 
     // ---- blocks & statements ----
 
+    /// Lower a block. Each statement's values are attributed to that statement (the source-location
+    /// table, `wukong_mir::SourceLocs`), and the location around the block is restored afterwards.
     fn lower_block(&mut self, b: &Block) -> Option<ValueId> {
+        let outer = self.builder.current_loc();
+        let tail = self.lower_block_stmts(b);
+        self.builder.restore_loc(outer);
+        tail
+    }
+
+    fn lower_block_stmts(&mut self, b: &Block) -> Option<ValueId> {
         // The body of a loop that encloses a `@generic` loop gets recognition back for its own
         // statements (`dispatch.rs`); `any_generic` gates the per-position window check below.
         let resumed = self.resume_recognition();
@@ -6095,6 +6111,9 @@ impl FnLowerer<'_> {
                 break;
             }
             report = self.dispatch_mark(b.stmts[i].span);
+            // Whatever lowers at this position — the statement, or one kernel call that replaces a
+            // window of statements — is attributed to the statement it starts at.
+            self.builder.set_loc(b.stmts[i].span);
             // Keep both consumed statements in source order when the epilogue
             // rereads output as bias, even with recognition disabled. Declining
             // fusion alone would still allow an inner loop to be outlined.
@@ -10226,7 +10245,14 @@ impl FnLowerer<'_> {
         matches!(&e.kind, ExprKind::Float(t) if parse_float(self.interner.resolve(*t)) == 0.0)
     }
 
+    /// Lower one statement, attributing the values it creates to it (see [`Self::lower_expr`]).
     fn lower_stmt(&mut self, s: &Stmt) {
+        let outer = self.builder.set_loc(s.span);
+        self.lower_stmt_kind(s);
+        self.builder.restore_loc(outer);
+    }
+
+    fn lower_stmt_kind(&mut self, s: &Stmt) {
         match &s.kind {
             StmtKind::Let {
                 pat,
@@ -15651,6 +15677,8 @@ impl FnLowerer<'_> {
         // ---- outlined body: par_sym(start: i64, end: i64, env: ptr), at the grain `par_grain`
         // settles on (the user's, else the implicit grain when enabled, else 1) ----
         let mut tmp_diags: Vec<Diagnostic> = Vec::new();
+        // The outlined function is declared by the loop it was cut from.
+        let region_loc = self.builder.current_loc();
         let build_outlined = |grain: u64, diags: &mut Vec<Diagnostic>| -> Function {
             let chunks = par_grain::const_chunks(n, grain);
             let mut fl = FnLowerer {
@@ -15688,6 +15716,7 @@ impl FnLowerer<'_> {
                 param_arrays: vec![],
                 dyn_extents: HashMap::default(),
             };
+            fl.builder.set_decl(region_loc);
             let start = fl.builder.add_param(MirType::I64);
             let end = fl.builder.add_param(MirType::I64);
             let envp = fl.builder.add_param(MirType::Ptr);
@@ -21260,7 +21289,15 @@ impl FnLowerer<'_> {
         Some((p, elem_mir))
     }
 
+    /// The address of the place `e` names, attributed to `e` (see [`Self::lower_expr`]).
     fn lower_place(&mut self, e: &Expr) -> (ValueId, MirType) {
+        let outer = self.builder.set_loc(e.span);
+        let place = self.lower_place_kind(e);
+        self.builder.restore_loc(outer);
+        place
+    }
+
+    fn lower_place_kind(&mut self, e: &Expr) -> (ValueId, MirType) {
         match &e.kind {
             ExprKind::Path(p) if p.is_single() => {
                 if let Some((slot, ty)) = self.lookup(p.first().sym) {
@@ -21343,7 +21380,18 @@ impl FnLowerer<'_> {
 
     // ---- expressions ----
 
+    /// Lower `e` to a value. Every MIR value created while it lowers — and not inside a nested
+    /// expression, which names its own — is attributed to `e`'s span in the function's
+    /// source-location table (`wukong_mir::SourceLocs`), which the native backend reports a
+    /// failure at. A synthesized node (a dummy span) keeps the location around it.
     fn lower_expr(&mut self, e: &Expr) -> ValueId {
+        let outer = self.builder.set_loc(e.span);
+        let v = self.lower_expr_kind(e);
+        self.builder.restore_loc(outer);
+        v
+    }
+
+    fn lower_expr_kind(&mut self, e: &Expr) -> ValueId {
         match &e.kind {
             ExprKind::Int(s) => {
                 let ty = self.expr_mir(e);
@@ -29880,6 +29928,7 @@ fn lower_matmul_fn(
         param_arrays: vec![],
         dyn_extents: HashMap::default(),
     };
+    fl.builder.set_decl(f.name.span);
     // A symbolic-generic matmul (`fn matmul<M, N, K>(a: Tensor[f32, M, K], …)`) reaches this
     // whole-function path too. Bind its hidden runtime-dim params first (leading, before the real
     // params) so `emit_sgemm`'s `dim_value(Dim::Var(M))` → `lookup(M)` finds each dimension — the
@@ -32904,6 +32953,7 @@ fn lower_i8matmul_fn(
         param_arrays: vec![],
         dyn_extents: HashMap::default(),
     };
+    fl.builder.set_decl(f.name.span);
     // The hidden runtime-dim / `?`-extent parameters lead the real ones exactly as `lower_fn` and
     // `lower_matmul_fn` declare them, so a caller's `call_dim_args` matches this wrapper's ABI too.
     // A no-op for a constant-shape signature.

@@ -24,14 +24,14 @@ use std::sync::Mutex;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
     types, AbiParam, AliasRegion, AtomicRmwOp, Block, BlockArg, FuncRef, GlobalValue, InstBuilder,
-    MemFlags, Signature, StackSlotData, StackSlotKind, Type, Value,
+    MemFlags, Signature, SourceLoc, StackSlotData, StackSlotKind, Type, Value,
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 
 use wukong_mir::{BinOp, CastKind, CmpOp, Function, MirType, Op, Program, Terminator, ValueId};
-use wukong_span::{Interner, Symbol};
+use wukong_span::{Interner, Span, Symbol};
 
 mod backend;
 mod bool_vectors;
@@ -647,7 +647,8 @@ const UNSUPPORTED_PREFIXES: &[&str] = &[
 ];
 
 /// What a native-backend failure means to the user. Every Cranelift entry point reports failure as
-/// a `String`; this is how the driver turns one into a catalogued diagnostic (a stable code,
+/// a message (a `String`, or a [`NativeFailure`] that also says where); this is how the driver turns
+/// one into a catalogued diagnostic (a stable code,
 /// `--error-format=json`, `--explain`) instead of printing it bare. The phrases it keys on are
 /// produced in this crate, next to this function, so the two cannot drift apart unnoticed (pinned
 /// by `error_tests`).
@@ -659,6 +660,42 @@ pub enum NativeErrorKind {
     Unsupported,
     /// A failure inside the backend itself — an internal compiler error, not the user's program.
     Internal,
+}
+
+/// A native-backend failure together with the source construct it was raised on — what the
+/// driver-facing entry points ([`jit_compile_for_with`], [`emit_object_kind_for_with`] and
+/// [`emit_object_kind_timed_for_with`]) return, so `C0002`, `C0001` and a backend ICE can carry a
+/// primary span. `site` is the span of the MIR value being lowered when the failure was recorded
+/// ([`wukong_mir::Function::value_loc`]), else the failing function's declaration, else `None` (a
+/// hand-built program, or a failure no single function owns). Every other entry point still
+/// reports the message alone, through `From<NativeFailure> for String`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeFailure {
+    pub message: String,
+    pub site: Option<Span>,
+}
+
+impl std::fmt::Display for NativeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for NativeFailure {}
+
+impl From<String> for NativeFailure {
+    fn from(message: String) -> NativeFailure {
+        NativeFailure {
+            message,
+            site: None,
+        }
+    }
+}
+
+impl From<NativeFailure> for String {
+    fn from(failure: NativeFailure) -> String {
+        failure.message
+    }
 }
 
 /// Classify a failure returned by [`jit_compile`], [`jit_run`] or [`emit_object`].
@@ -873,6 +910,47 @@ struct FnTranslator<'a> {
     /// (instead of panicking, or silently dropping the instruction) so `populate_module` can abort
     /// with a clean error before the half-built function is finalized/defined.
     layout_err: Option<String>,
+    /// The located MIR value whose code is being emitted, or `None` when that code has no known
+    /// location (see [`FnTranslator::translate`] for which instructions carry which). Its `ValueId`
+    /// is also the Cranelift `SourceLoc` of every instruction emitted since, so a machine-code range
+    /// maps back to a span through [`Function::value_loc`] (what a DWARF line table consumes); code
+    /// with no location carries the default `SourceLoc`. Locations never change code:
+    /// `srcloc_tests` pins the object bytes with and without them.
+    cur_loc: Option<ValueId>,
+    /// Where `layout_err` was raised: the span of `cur_loc` at that moment, else the function's
+    /// declaration. Becomes [`NativeFailure::site`].
+    err_site: Option<Span>,
+}
+
+/// The value a terminator's code is attributed to: a branch's condition, a switch's scrutinee, a
+/// return's value.
+fn term_operand(term: &Terminator) -> Option<ValueId> {
+    match term {
+        Terminator::CondBr { cond, .. } => Some(*cond),
+        Terminator::Switch { scrutinee, .. } => Some(*scrutinee),
+        Terminator::Ret(v) => *v,
+        Terminator::Br { .. } | Terminator::Unreachable => None,
+    }
+}
+
+/// Does the result-less instruction `op` read `v`? Lists the ops that produce no value; any other
+/// op answers `false`, which drops a location rather than borrowing one.
+fn void_op_reads(op: &Op, v: ValueId) -> bool {
+    match op {
+        Op::Store { ptr, value } | Op::AtomicAdd { ptr, value } => *ptr == v || *value == v,
+        Op::Call { args, .. } => args.contains(&v),
+        Op::VecKernelCall {
+            ptrs, scalars, n, ..
+        } => [*ptrs, *scalars, *n].contains(&v),
+        _ => false,
+    }
+}
+
+/// Does `term` read `v` — as its condition, scrutinee or return value, or as an edge argument?
+fn term_reads(term: &Terminator, v: ValueId) -> bool {
+    let mut reads = term_operand(term) == Some(v);
+    term.for_each_edge(|_, args| reads |= args.contains(&v));
+    reads
 }
 
 impl<'a> FnTranslator<'a> {
@@ -988,6 +1066,50 @@ impl<'a> FnTranslator<'a> {
         post
     }
 
+    /// Attribute the instructions emitted from here on to the located value `v`.
+    fn mark(&mut self, v: ValueId) {
+        self.cur_loc = Some(v);
+        self.builder.set_srcloc(SourceLoc::new(v.0));
+    }
+
+    /// Attribute the instructions emitted from here on to nothing (the default `SourceLoc`).
+    fn unmark(&mut self) {
+        if self.cur_loc.take().is_some() {
+            self.builder.set_srcloc(SourceLoc::default());
+        }
+    }
+
+    /// Keep the current mark only when `reads` says the code about to be emitted reads the marked
+    /// value; otherwise drop it.
+    fn keep_mark_if(&mut self, reads: impl FnOnce(ValueId) -> bool) {
+        if !self.cur_loc.is_some_and(reads) {
+            self.unmark();
+        }
+    }
+
+    /// `v` when it has a recorded source location.
+    fn located(&self, v: Option<ValueId>) -> Option<ValueId> {
+        v.filter(|&v| self.func.value_loc(v).is_some())
+    }
+
+    /// The span a failure raised now is reported at: the value being lowered, else the
+    /// function's declaration.
+    fn current_site(&self) -> Option<Span> {
+        self.cur_loc
+            .and_then(|v| self.func.value_loc(v))
+            .or(self.func.decl_span())
+    }
+
+    /// Lower the whole function, attributing each Cranelift instruction to a MIR value
+    /// ([`FnTranslator::mark`]) — or to nothing. A location is dropped rather than borrowed, since a
+    /// wrong one would point a failure (and a debugger) at code that did not produce it:
+    /// - a block starts with no location, never the last one of the block RPO lowered before it;
+    /// - an instruction with a result carries that result's location, or none when it is unknown;
+    /// - an instruction without a result (a store, a void call) has no table entry of its own: it
+    ///   keeps the mark only while it reads the marked value (`store p, v` or `f(.., v)` right after
+    ///   `v`), and otherwise carries none;
+    /// - a terminator carries its condition's, scrutinee's or return value's location, else keeps the
+    ///   mark only while it reads the marked value (an edge argument).
     fn translate(&mut self) {
         // Give each Cranelift block its params (the entry block's are the function params).
         for (i, mb) in self.func.blocks.iter().enumerate() {
@@ -1013,13 +1135,24 @@ impl<'a> FnTranslator<'a> {
             let cb = self.blocks[bi as usize];
             self.builder.switch_to_block(cb);
             let mb = &func.blocks[bi as usize];
+            self.unmark();
             for inst in &mb.insts {
+                match (inst.result, self.located(inst.result)) {
+                    (_, Some(v)) => self.mark(v),
+                    (Some(_), None) => self.unmark(),
+                    (None, None) => self.keep_mark_if(|m| void_op_reads(&inst.op, m)),
+                }
                 self.lower_inst(inst);
                 if self.layout_err.is_some() {
+                    self.err_site = self.current_site();
                     // Failed value-producing calls do not populate vmap. Stop before any use
                     // (including the terminator) can obscure the diagnostic with a panic.
                     return;
                 }
+            }
+            match self.located(term_operand(&mb.term)) {
+                Some(v) => self.mark(v),
+                None => self.keep_mark_if(|m| term_reads(&mb.term, m)),
             }
             self.lower_term(&mb.term);
         }
@@ -3300,7 +3433,7 @@ fn populate_module<M: Module>(
     interner: &Interner,
     parallel: bool,
     mode: entry::SymbolMode,
-) -> Result<HashMap<Symbol, FuncId>, String> {
+) -> Result<HashMap<Symbol, FuncId>, NativeFailure> {
     // Compact boolean-vector casts are legalized per function inside `build_function_clif`.
     let asserting = asserting_functions(program, interner);
     let ptr_ty = module.target_config().pointer_type();
@@ -4432,10 +4565,11 @@ fn build_function_clif(
     fbctx: &mut FunctionBuilderContext,
     clif: &mut cranelift_codegen::ir::Function,
     scratch: &mut TranslationScratch,
-) -> Result<(), String> {
+) -> Result<(), NativeFailure> {
     // A function with a float-to-`i1`-vector cast is scalarized here, on its own codegen worker;
-    // every other function is borrowed as is (see `bool_vectors::legalize`).
-    let legalized = bool_vectors::legalize(f, interner)?;
+    // every other function is borrowed as is (see `bool_vectors::legalize`). A decline names no
+    // instruction, so it is reported at the function's declaration.
+    let legalized = bool_vectors::legalize(f, interner).map_err(|message| at_decl(f, message))?;
     let f: &Function = &legalized;
     clif.signature = signature_of(f, ptr_ty, call_conv);
     let TranslationScratch {
@@ -4506,20 +4640,34 @@ fn build_function_clif(
                 kernel_refs,
                 alias: wukong_opt::AliasInfo::analyze(f),
                 layout_err: None,
+                cur_loc: None,
+                err_site: None,
             };
             t.translate();
             // `layout_err` carries every unrecoverable lowering failure — a type whose byte layout
             // overflows `u32`, and a runtime kernel that reached `lower_call` with an arity no
             // dispatch arm accepts — recorded during lowering rather than panicking. Abort now,
             // before this half-built function is finalized/defined (the `?` at each
-            // `populate_module` call site surfaces it as `error: <msg>`, exit 1).
-            if let Some(e) = t.layout_err.take() {
-                return Err(e);
+            // `populate_module` call site surfaces it as `error: <msg>`, exit 1), at the source
+            // construct whose value was being lowered (`err_site`; a failure in a terminator is
+            // located here instead).
+            if let Some(message) = t.layout_err.take() {
+                let site = t.err_site.or_else(|| t.current_site());
+                return Err(NativeFailure { message, site });
             }
             t.builder.finalize();
         }
     }
     Ok(())
+}
+
+/// A failure that belongs to `f` as a whole rather than to one of its instructions (a declined
+/// legalization, a function Cranelift rejects): reported at `f`'s declaration.
+fn at_decl(f: &Function, message: String) -> NativeFailure {
+    NativeFailure {
+        message,
+        site: f.decl_span(),
+    }
 }
 
 /// A read-only view of a [`Module`]'s declarations, exposing exactly the two ref-import shims the
@@ -4601,7 +4749,7 @@ fn define_functions_serial<M: Module>(
     data_ids: &HashMap<Symbol, DataId>,
     kernel_ids: &[Vec<FuncId>],
     asserting: &HashSet<Symbol>,
-) -> Result<(), String> {
+) -> Result<(), NativeFailure> {
     let mut ctx = module.make_context();
     let mut fbctx = FunctionBuilderContext::new();
     let mut scratch = TranslationScratch::default();
@@ -4631,7 +4779,9 @@ fn define_functions_serial<M: Module>(
         }
         module
             .define_function(ids[&f.name], &mut ctx)
-            .map_err(|e| format!("cranelift define fn: {e:?}"))?;
+            .map_err(|e| at_decl(f, format!("cranelift define fn: {e:?}")))?;
+        #[cfg(test)]
+        srcloc_tests::capture(f.name, &ctx);
         module.clear_context(&mut ctx);
     }
     Ok(())
@@ -4655,7 +4805,7 @@ fn define_functions_parallel<M: Module>(
     data_ids: &HashMap<Symbol, DataId>,
     kernel_ids: &[Vec<FuncId>],
     asserting: &HashSet<Symbol>,
-) -> Result<(), String> {
+) -> Result<(), NativeFailure> {
     use cranelift_module::ModuleReloc;
     use rayon::prelude::*;
 
@@ -4681,7 +4831,7 @@ fn define_functions_parallel<M: Module>(
                         TranslationScratch::default(),
                     )
                 },
-                |(fbctx, ctx, scratch), (fi, f)| -> Result<_, String> {
+                |(fbctx, ctx, scratch), (fi, f)| -> Result<_, NativeFailure> {
                     let fid = ids[&f.name];
                     ctx.clear();
                     if let Err(error) = build_function_clif(
@@ -4708,7 +4858,7 @@ fn define_functions_parallel<M: Module>(
                     }
                     let mut cp = cranelift_codegen::control::ControlPlane::default();
                     ctx.compile(isa, &mut cp)
-                        .map_err(|e| format!("cranelift compile fn: {:?}", e.inner))?;
+                        .map_err(|e| at_decl(f, format!("cranelift compile fn: {:?}", e.inner)))?;
                     let cc = ctx.compiled_code().unwrap();
                     let alignment = cc.buffer.alignment as u64;
                     let bytes = cc.buffer.data().to_vec();
@@ -4729,15 +4879,15 @@ fn define_functions_parallel<M: Module>(
             // across identical invocations, while the serial path always reported `a()`. Indexing
             // the errors makes the parallel path report the same function the serial path does, so
             // the compiler is a pure function of its input (U3).
-            .collect::<Vec<Result<_, String>>>()
+            .collect::<Vec<Result<_, NativeFailure>>>()
             .into_iter()
-            .collect::<Result<Vec<_>, String>>()?
+            .collect::<Result<Vec<_>, NativeFailure>>()?
     };
 
-    for (fid, alignment, bytes, relocs) in compiled {
+    for ((fid, alignment, bytes, relocs), f) in compiled.into_iter().zip(&program.funcs) {
         module
             .define_function_bytes(fid, alignment, &bytes, &relocs)
-            .map_err(|e| format!("cranelift define fn bytes: {e:?}"))?;
+            .map_err(|e| at_decl(f, format!("cranelift define fn bytes: {e:?}")))?;
     }
     Ok(())
 }
@@ -4920,6 +5070,7 @@ pub fn jit_compile_for(
     target: TargetCpu,
 ) -> Result<JitProgram, String> {
     jit_compile_for_with(program, entry, interner, target, BackendOpt::default())
+        .map_err(String::from)
 }
 
 /// As [`jit_compile`], with an explicit backend configuration (the driver passes the source `-O`
@@ -4930,19 +5081,20 @@ pub fn jit_compile_with(
     interner: &Interner,
     backend: BackendOpt,
 ) -> Result<JitProgram, String> {
-    jit_compile_for_with(program, entry, interner, TargetCpu::Native, backend)
+    jit_compile_for_with(program, entry, interner, TargetCpu::Native, backend).map_err(String::from)
 }
 
 /// Both [`jit_compile_for`]'s instruction-set level and [`jit_compile_with`]'s backend
 /// configuration — what the driver uses for `--run --backend=native`, which honours both
-/// `--target-cpu` and `-O`.
+/// `--target-cpu` and `-O`. A failure carries the source construct it was raised on
+/// ([`NativeFailure::site`]).
 pub fn jit_compile_for_with(
     program: &Program,
     entry: Symbol,
     interner: &Interner,
     target: TargetCpu,
     backend: BackendOpt,
-) -> Result<JitProgram, String> {
+) -> Result<JitProgram, NativeFailure> {
     let missing = target::missing_on_host(target);
     if !missing.is_empty() {
         return Err(format!(
@@ -4950,7 +5102,8 @@ pub fn jit_compile_for_with(
              build for it",
             target.name(),
             missing.join(", ")
-        ));
+        )
+        .into());
     }
     jit_compile_entry(
         program,
@@ -4973,7 +5126,7 @@ fn jit_compile_entry(
     target: TargetCpu,
     backend: BackendOpt,
     parallel: bool,
-) -> Result<JitProgram, String> {
+) -> Result<JitProgram, NativeFailure> {
     use cranelift_jit::{JITBuilder, JITModule};
 
     target::check_vec_kernels(program, interner, target)?;
@@ -5531,12 +5684,15 @@ fn jit_compile_entry(
     };
     if !valid_entry {
         unsafe { module.free_memory() };
-        return Err(if buffer_dispatch {
-            "native buffer dispatcher must have signature (Ptr, I64) -> Void"
-        } else {
-            "native entry point must take no parameters"
-        }
-        .into());
+        return Err(NativeFailure {
+            message: if buffer_dispatch {
+                "native buffer dispatcher must have signature (Ptr, I64) -> Void"
+            } else {
+                "native entry point must take no parameters"
+            }
+            .into(),
+            site: entry_fn.decl_span(),
+        });
     }
     let entry_id = ids[&entry];
     let code = module.get_finalized_function(entry_id);
@@ -6240,19 +6396,21 @@ pub fn emit_object_for_with(
     backend: BackendOpt,
 ) -> Result<Vec<u8>, String> {
     emit_object_kind_for_with(program, interner, target, backend, ObjectKind::Library)
+        .map_err(String::from)
 }
 
 /// As [`emit_object_for_with`], for an object of `kind`. `--emit=exe` passes
 /// [`ObjectKind::Executable`]: every user function becomes an internal, mangled symbol, and the
 /// program's `main` runs behind a synthesized C `main` (see the `entry` module). Every object with
-/// a zero-parameter scalar `main` gets that C `main`, so it imports `wukong_rt_run_main`.
+/// a zero-parameter scalar `main` gets that C `main`, so it imports `wukong_rt_run_main`. A failure
+/// carries the source construct it was raised on ([`NativeFailure::site`]).
 pub fn emit_object_kind_for_with(
     program: &Program,
     interner: &Interner,
     target: TargetCpu,
     backend: BackendOpt,
     kind: ObjectKind,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, NativeFailure> {
     emit_object_full(
         program,
         interner,
@@ -6292,6 +6450,7 @@ pub fn emit_object_timed_for_with(
     backend: BackendOpt,
 ) -> Result<(Vec<u8>, ObjTimings), String> {
     emit_object_kind_timed_for_with(program, interner, target, backend, ObjectKind::Library)
+        .map_err(String::from)
 }
 
 /// As [`emit_object_timed_for_with`], for an object of `kind` (see [`emit_object_kind_for_with`]).
@@ -6301,7 +6460,7 @@ pub fn emit_object_kind_timed_for_with(
     target: TargetCpu,
     backend: BackendOpt,
     kind: ObjectKind,
-) -> Result<(Vec<u8>, ObjTimings), String> {
+) -> Result<(Vec<u8>, ObjTimings), NativeFailure> {
     emit_object_full(
         program,
         interner,
@@ -6325,6 +6484,7 @@ fn emit_object_ex(
         BackendOpt::default(),
         ObjectKind::Library,
     )
+    .map_err(String::from)
 }
 
 fn emit_object_full(
@@ -6334,7 +6494,7 @@ fn emit_object_full(
     target: TargetCpu,
     backend: BackendOpt,
     kind: ObjectKind,
-) -> Result<(Vec<u8>, ObjTimings), String> {
+) -> Result<(Vec<u8>, ObjTimings), NativeFailure> {
     use cranelift_object::{ObjectBuilder, ObjectModule};
     use std::time::Instant;
 
@@ -6378,6 +6538,9 @@ mod assertion_tests;
 
 #[cfg(test)]
 mod error_tests;
+
+#[cfg(test)]
+mod srcloc_tests;
 
 #[cfg(test)]
 mod target_tests;
