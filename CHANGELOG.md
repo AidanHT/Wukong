@@ -5,6 +5,13 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Run-time turbofish dimensions (`gap6/generic-dims`, N21)
+
+- **The canonicalizer sees a turbofish read.** `let mut n = 3; let r = row::<2, n>(..); n = 1;`
+  sank the `let` below the call (an accumulator seed whose first other mention assigns it), which
+  then named no binding (`C0001`) or an outer `n`; and an index binding read by a turbofish was
+  inlined and deleted. Both mention tests now count a turbofish name.
+
 ### Source locations through MIR into native code (`gap5/native-source-locations`)
 
 - **Native-backend failures point at the source (P11.8).** A `C0002` (a slot above the native

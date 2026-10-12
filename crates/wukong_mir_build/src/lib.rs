@@ -26069,8 +26069,15 @@ fn expr_mentions(e: &Expr, sym: Symbol) -> bool {
         | ExprKind::Bool(_) => false,
         ExprKind::Unary { expr, .. } => expr_mentions(expr, sym),
         ExprKind::Binary { lhs, rhs, .. } => expr_mentions(lhs, sym) || expr_mentions(rhs, sym),
-        ExprKind::Call { callee, args, .. } => {
-            expr_mentions(callee, sym) || args.iter().any(|a| expr_mentions(a, sym))
+        // A turbofish may name a local whose value the call reads (`f::<n>(..)`).
+        ExprKind::Call {
+            callee,
+            generic_args,
+            args,
+        } => {
+            expr_mentions(callee, sym)
+                || generic_args.iter().any(|g| turbofish_names(g, sym))
+                || args.iter().any(|a| expr_mentions(a, sym))
         }
         ExprKind::Index { base, indices } => {
             expr_mentions(base, sym) || indices.iter().any(|i| expr_mentions(i, sym))
@@ -26094,6 +26101,14 @@ fn expr_mentions(e: &Expr, sym: Symbol) -> bool {
         // struct literals, if/match/block exprs, method calls, ranges, …: assume a use.
         _ => true,
     }
+}
+
+/// Does the turbofish argument `g` name `sym`? A dimension generic given a local (`f::<n>(..)`)
+/// reads it when the call is made, so every pass that asks whether a statement mentions `n` must
+/// see it: the accumulator sink in `canon.rs` moved `let mut n = 3;` below `row::<2, n>(..)` when
+/// `n`'s next mention assigned it, and the call then named no binding (or an outer one).
+pub(crate) fn turbofish_names(g: &ast::TypeExpr, sym: Symbol) -> bool {
+    matches!(&g.kind, ast::TypeKind::Path(p) if p.is_single() && p.first().sym == sym)
 }
 
 /// Conservative "does any statement (or the tail) reference `sym`?" — companion to [`expr_mentions`].

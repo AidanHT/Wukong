@@ -861,7 +861,20 @@ impl UseScan<'_> {
                 self.expr(lhs, in_index);
                 self.expr(rhs, in_index);
             }
-            ExprKind::Call { callee, args, .. } => {
+            ExprKind::Call {
+                callee,
+                generic_args,
+                args,
+            } => {
+                // A turbofish reading the binding (`f::<x>(..)`) is no index position, and no
+                // expression could take its place there.
+                if generic_args
+                    .iter()
+                    .any(|g| crate::turbofish_names(g, self.name))
+                {
+                    self.ok = false;
+                    return;
+                }
                 self.expr(callee, in_index);
                 for a in args {
                     self.expr(a, in_index);
@@ -1483,5 +1496,47 @@ fn value_is_pure(e: &Expr, sema: &SemaResult, interner: &Interner) -> bool {
                 && args.iter().all(|a| value_is_pure(a, sema, interner))
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use wukong_diag::Diagnostic;
+    use wukong_span::{Interner, SourceId};
+
+    /// The diagnostics of lowering `src`, whose sema must be clean.
+    fn lower(src: &str) -> Vec<Diagnostic> {
+        let mut interner = Interner::new();
+        let (module, pdiags) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pdiags.is_empty(), "parse: {pdiags:?}");
+        let (sema, sdiags) = wukong_sema::check(&module, &interner);
+        assert!(sdiags.iter().all(|d| !d.is_error()), "sema: {sdiags:?}");
+        crate::lower_program(&module, &sema, &mut interner).1
+    }
+
+    const ROW: &str = "fn row<M, N>(a: Tensor[i32, M, N], i: i64) -> Tensor[i32, N] { \
+                       return a[i]; } ";
+
+    /// A `let mut n = <literal>;` whose first other mention assigns it is an accumulator seed this
+    /// pass sinks to that assignment, and a turbofish was no mention: the `let` landed below the
+    /// call, which then named no binding (`C0001`), or an outer `n`.
+    #[test]
+    fn a_turbofish_read_keeps_its_let_above_the_call() {
+        let diags = lower(&format!(
+            "{ROW}fn main() -> i32 {{ let buf: [i32; 6] = [1, 2, 3, 4, 5, 6]; let mut n = 3; \
+             let r = row::<2, n>(buf, 0); n = 1; print(n); return r[0]; }}"
+        ));
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+    }
+
+    /// A pure index binding is inlined into its index uses and deleted, and a turbofish reading it
+    /// was not counted as a use: the `let` went, and the call named no binding.
+    #[test]
+    fn a_turbofish_read_keeps_an_index_binding() {
+        let diags = lower(&format!(
+            "{ROW}fn main() -> i32 {{ let buf: [i32; 6] = [1, 2, 3, 4, 5, 6]; let i = 1; \
+             let k = i * 3; let r = row::<2, k>(buf, 0); return buf[k] + r[0]; }}"
+        ));
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
     }
 }
