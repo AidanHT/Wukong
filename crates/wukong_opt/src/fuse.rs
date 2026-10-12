@@ -263,14 +263,11 @@ fn shape_ok(f: &Function, l: &NaturalLoop) -> Option<Shape> {
         for inst in &blk.insts {
             n += 1;
             let bad = match &inst.op {
-                Op::Alloca { .. }
-                | Op::Call { .. }
-                | Op::VecKernelCall { .. }
-                | Op::Barrier
-                | Op::AtomicAdd { .. } => true,
                 // A pointer stored into memory could move a slice base another access reloads.
                 Op::Store { value, .. } => *f.value_type(*value) == MirType::Ptr,
-                _ => false,
+                // An allocation, or any other effect (`Op::effects`): a call of any kind, a
+                // barrier, an atomic.
+                op => matches!(op, Op::Alloca { .. }) || op.has_side_effects(),
             };
             if bad || inst.result.is_some_and(|r| f.value_type(r).is_vector()) {
                 return None;

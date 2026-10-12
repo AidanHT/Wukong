@@ -8,6 +8,7 @@
 //! type's note before building on the two-level design).
 
 mod builder;
+mod effects;
 mod inst;
 #[cfg(test)]
 mod lane_op_tests;
@@ -17,6 +18,7 @@ pub mod vec_kernel;
 pub mod verify;
 
 pub use builder::Builder;
+pub use effects::Effects;
 pub use inst::{
     narrow_result, switch_case_value, widen_result, AddrSpace, BinOp, CastKind, CmpOp, Half, Inst,
     IntUnOp, NarrowKind, Op, RoundMode, SwitchCase, Terminator, MAX_ALLOCA_ALIGN,

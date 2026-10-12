@@ -1141,18 +1141,6 @@ pub(crate) fn each_term_use(t: &Terminator, f: &mut impl FnMut(ValueId)) {
     }
 }
 
-/// Does this op have a side effect that prevents removing it even if its result is unused?
-pub(crate) fn has_side_effects(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::Store { .. }
-            | Op::Call { .. }
-            | Op::VecKernelCall { .. }
-            | Op::Barrier
-            | Op::AtomicAdd { .. }
-    )
-}
-
 #[cfg(test)]
 mod atomic_tests;
 

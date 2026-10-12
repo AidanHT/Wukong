@@ -683,13 +683,13 @@ impl Recipe<'_> {
         let inst = &self.f.blocks[block as usize].insts[idx];
         match &inst.op {
             Op::Load(_, MirType::Ptr) => {}
-            Op::Load(..)
-            | Op::Store { .. }
-            | Op::Call { .. }
-            | Op::VecKernelCall { .. }
-            | Op::AtomicAdd { .. }
-            | Op::Alloca { .. }
-            | Op::Barrier => return false,
+            // Any other memory access, allocation or effect (`Op::effects`).
+            op if op.may_read_memory()
+                || op.has_side_effects()
+                || matches!(op, Op::Alloca { .. }) =>
+            {
+                return false
+            }
             _ => {}
         }
         let mut ok = true;

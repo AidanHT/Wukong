@@ -906,11 +906,10 @@ fn plan(f: &Function, lo: &NaturalLoop, li: &NaturalLoop) -> Option<Nest> {
                 return None;
             }
             match &inst.op {
-                Op::Call { .. }
-                | Op::VecKernelCall { .. }
-                | Op::AtomicAdd { .. }
-                | Op::Barrier
-                | Op::Alloca { .. } => return None,
+                // An allocation, or any effect but a plain store (`Op::effects`): a call of any
+                // kind, a barrier, an atomic.
+                Op::Alloca { .. } => return None,
+                op if op.has_side_effects() && !matches!(op, Op::Store { .. }) => return None,
                 // A division runs in a different order across rows; one that can trap must not.
                 Op::Bin(BinOp::SDiv | BinOp::UDiv | BinOp::SRem | BinOp::URem, _, d) => {
                     if !matches!(ctx.konst(*d), Some(c) if c != 0 && c != -1) {

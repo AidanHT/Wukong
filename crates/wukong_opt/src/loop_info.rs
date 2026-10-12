@@ -2332,12 +2332,14 @@ fn dependence(ctx: &LoopCtx<'_>, l: &NaturalLoop, accesses: &[MemAccess]) -> Dep
     };
     // A call may read or write anything, and `VecKernelCall` writes through its output streams. An
     // `AtomicAdd` is a read-modify-write other threads may race, and no plan widens one.
+    // Every memory effect but a plain load or store (`Op::effects`), none of which the access
+    // list below models.
     for &b in &l.blocks {
         for inst in &ctx.f.blocks[b.0 as usize].insts {
-            if matches!(
-                inst.op,
-                Op::Call { .. } | Op::VecKernelCall { .. } | Op::AtomicAdd { .. }
-            ) {
+            let op = &inst.op;
+            if !matches!(op, Op::Load(..) | Op::Store { .. })
+                && (op.may_read_memory() || op.may_write_memory())
+            {
                 return carried("a call in the loop may touch any memory");
             }
         }

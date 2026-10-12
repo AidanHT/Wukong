@@ -634,10 +634,8 @@ fn plan_loop(
     // both paths' census. Neither is worth reasoning about inside a hot loop.
     for b in &l.blocks {
         for inst in &f.block(*b).insts {
-            if matches!(
-                inst.op,
-                Op::Call { .. } | Op::VecKernelCall { .. } | Op::Barrier | Op::AtomicAdd { .. }
-            ) {
+            // Every effect but a plain store: a call of any kind, a barrier, an atomic.
+            if inst.op.has_side_effects() && !matches!(inst.op, Op::Store { .. }) {
                 return None;
             }
         }
