@@ -688,6 +688,8 @@ fn clone_insts(f: &mut Function, src: &[Inst], map: &mut [Option<ValueId>], out:
         let result = inst.result.map(|r| {
             let ty = f.value_types[r.0 as usize].clone();
             let nv = fresh(f, ty);
+            // A copy of the loop body is the same source as the original.
+            f.copy_value_loc(r, nv);
             map[r.0 as usize] = Some(nv);
             nv
         });
@@ -888,6 +890,7 @@ fn apply_partial(f: &mut Function, c: &Candidate, parts: &LoopParts, factor: u32
             for &p in &parts.h_params {
                 let ty = f.value_types[p.0 as usize].clone();
                 let nv = fresh(f, ty);
+                f.copy_value_loc(p, nv);
                 rmap[p.0 as usize] = Some(nv);
                 r_params.push(nv);
             }
@@ -928,6 +931,7 @@ fn apply_partial(f: &mut Function, c: &Candidate, parts: &LoopParts, factor: u32
             for &p in &parts.h_params {
                 let ty = f.value_types[p.0 as usize].clone();
                 let nv = fresh(f, ty);
+                f.copy_value_loc(p, nv);
                 rmap[p.0 as usize] = Some(nv);
                 r_params.push(nv);
             }

@@ -559,10 +559,15 @@ fn inline_call_site(caller: &mut Function, callee: &Function, bi: usize, ii: usi
 
     // Fresh caller value id for every callee value (params included — they receive the call's
     // arguments through the entry block's parameters).
+    // Each copy keeps the callee value's source location: the inlined code is still the callee's
+    // source, so a backend failure inside it points there (`wukong_mir::SourceLocs`).
     let mut vmap: FxHashMap<u32, ValueId> = FxHashMap::default();
     for (vid, ty) in callee.value_types.iter().enumerate() {
         let nv = ValueId(caller.value_types.len() as u32);
         caller.value_types.push(ty.clone());
+        if let Some(s) = callee.value_loc(ValueId(vid as u32)) {
+            caller.set_value_loc(nv, s);
+        }
         vmap.insert(vid as u32, nv);
     }
     let mapv = |v: ValueId| -> ValueId { vmap[&v.0] };
