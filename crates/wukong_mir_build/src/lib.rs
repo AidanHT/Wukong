@@ -133,6 +133,12 @@ mod par_region_tests;
 // Run-time turbofish dimensions: `f::<n>(..)` reads `n` once, into a slot of its own.
 mod turbofish;
 
+// The `@parallel` reduction tree (P13.7): every `f32` reduction loop of a fast-mode `@parallel`
+// function computes the runtime reduction kernel's tree, whether a kernel fires or not.
+mod par_reduce;
+#[cfg(test)]
+mod par_reduce_tests;
+
 // ===== Type-generic monomorphization =====
 //
 // A function generic over a TYPE parameter (`fn id<T>(x: T) -> T`) cannot be lowered once: its MIR
@@ -1380,6 +1386,8 @@ fn lower_program_pooled(
         // Program-wide `--fp=strict`. Applied per function by `strict_fp_gemm` below, beside the
         // `@strict_fp` attribute it is the global spelling of.
         strict_fp: opts.strict_fp,
+        // Stamped per function by `par_reduce_gemm` (a `@parallel` function in fast mode).
+        par_reduce: false,
         // Overwritten per function, below. The module-level default is the conservative one, so a
         // recognizer reached through a path that forgot to set it declines rather than miscompiles.
         alias_free: false,
@@ -1640,6 +1648,17 @@ fn lower_program_pooled(
             _ => None,
         })
         .collect();
+    // Functions carrying `@parallel`, keyed by name for the same reason: a type-generic `@parallel`
+    // template's instances keep the parallel reduction tree (`par_reduce_gemm`).
+    let parallel_fns: HashSet<Symbol> = module
+        .items
+        .iter()
+        .filter(|item| has_parallel_attr(item, interner))
+        .filter_map(|item| match &item.kind {
+            ast::ItemKind::Fn(f) => Some(f.name.sym),
+            _ => None,
+        })
+        .collect();
     let fn_tiles: HashMap<Symbol, Vec<u64>> = module
         .items
         .iter()
@@ -1692,6 +1711,9 @@ fn lower_program_pooled(
                 // `@strict_fp` (or `--fp=strict`): no contraction, no float-reduction
                 // reassociation, no recognizers — for this function alone. See `strict_fp_gemm`.
                 let gemm = strict_fp_gemm(gemm, strict_fp_fns.contains(&f.name.sym));
+                // `@parallel` in fast mode: the function's `f32` reductions take the parallel tree
+                // on every path (P13.7). After `strict_fp_gemm`, which it must not override.
+                let gemm = par_reduce_gemm(gemm, has_parallel_attr(item, interner));
                 // Whole-program aliasing, stamped on beside the `@generic` opt-out: `false` here
                 // means some call site in this program can hand two of this function's buffer
                 // parameters the same array, so no recognizer inside it may emit a kernel whose
@@ -2490,6 +2512,8 @@ fn lower_program_pooled(
             let gemm = unchecked_gemm(gemm, unchecked_fns.contains(orig));
             // ...and so do the instances of a `@strict_fp` template.
             let gemm = strict_fp_gemm(gemm, strict_fp_fns.contains(orig));
+            // ...and the parallel reduction tree of a `@parallel` template (P13.7).
+            let gemm = par_reduce_gemm(gemm, parallel_fns.contains(orig));
             // Aliasing is a property of the ORIGINAL function's call sites: every instantiation of
             // a type-generic template shares them.
             let gemm = alias_gemm(
@@ -2615,6 +2639,16 @@ fn strict_fp_gemm(gemm: GemmSyms, is_strict: bool) -> GemmSyms {
         }
     } else {
         gemm
+    }
+}
+
+/// `gemm` with the parallel reduction tree switched on when the function being lowered carries
+/// `@parallel` and is not in strict floating-point mode (P13.7, `par_reduce.rs`). Strict mode keeps
+/// every float reduction in source order, so it wins: `@strict_fp @parallel` reductions stay serial.
+fn par_reduce_gemm(gemm: GemmSyms, is_parallel: bool) -> GemmSyms {
+    GemmSyms {
+        par_reduce: is_parallel && !gemm.strict_fp,
+        ..gemm
     }
 }
 
@@ -3680,6 +3714,14 @@ struct GemmSyms {
     /// 256-bit recipe's `Add` arm, the reduction accumulators) and at the float-reduction
     /// vectorizer gate in `try_vectorize_for`.
     strict_fp: bool,
+    /// The function being lowered is a fast-mode `@parallel` function (P13.7): every `f32` reduction
+    /// loop in it — top level, nested, inside an outlined region body or a versioned fallback —
+    /// computes the one documented **parallel reduction tree** (`par_reduce.rs`), whether a
+    /// multicore kernel fires or not. Rides here, like `strict_fp`, because this struct is copied
+    /// into every lowerer and outlined region of the function, so the contract cannot be dropped on
+    /// the way down; `parallel_fn` (which kernels may fork) is cleared in region bodies and versioned
+    /// fallbacks, this is not. Set only through [`par_reduce_gemm`]; never set under `strict_fp`.
+    par_reduce: bool,
     /// Whole-program answer to "can two DISTINCT names for a buffer in the function being lowered
     /// reach the same storage?" — either because a call site binds two of its buffer parameters to
     /// one array, or because two operand names in its own body resolve onto one buffer (a
@@ -13247,6 +13289,11 @@ impl FnLowerer<'_> {
         let Some((s, op, xb, yb)) = self.match_reduction_kernel(body, *k) else {
             return false;
         };
+        // The source re-evaluates `end` before every iteration; the kernel reads it once. An end that
+        // reads the accumulator (`for k in 0..(s as i64)`) is therefore not this loop.
+        if expr_mentions(end, s) {
+            return false;
+        }
         // Accumulator must be an in-scope f32 scalar; both arrays must be in scope (base pointers).
         let Some((s_slot, MirType::F32)) = self.lookup(s) else {
             return false;
@@ -13264,10 +13311,17 @@ impl FnLowerer<'_> {
         let opv = self
             .builder
             .build(MirType::I64, Op::ConstInt(op as i128, MirType::I64));
+        // The serial twin where this function may not fork (a region body, a versioned fallback):
+        // bit-identical to the multicore kernel, which is the point (P13.7).
+        let func = if self.parallel_fn {
+            self.gemm.sred_par
+        } else {
+            self.gemm.sred
+        };
         let result = self.builder.build(
             MirType::F32,
             Op::Call {
-                func: self.gemm.sred_par,
+                func,
                 args: vec![xv, yv, n, opv],
             },
         );
@@ -13982,6 +14036,10 @@ impl FnLowerer<'_> {
         let Some((s, red_op, xb, yb, is_f16)) = self.match_lowp_reduction(body, *k) else {
             return false;
         };
+        // As in `try_emit_parallel_reduction`: the kernel evaluates `end` once, the source each time.
+        if expr_mentions(end, s) {
+            return false;
+        }
         // Accumulator must be an in-scope f32 scalar; both arrays must be in scope (base pointers).
         let Some((s_slot, MirType::F32)) = self.lookup(s) else {
             return false;
@@ -13998,9 +14056,12 @@ impl FnLowerer<'_> {
         };
         // Pick the kernel by op and precision: additive dot/sum have dedicated symbols; the max-family
         // routes through the op-coded reduce kernel. f16 uses the F16C twins, bf16 the `<<16` ones.
-        // Inside a `@parallel` function the multicore `_parallel` twin fires instead (same ABI, a
-        // deterministic fixed-RCHUNK chunk fold), so a low-precision reduction also runs across cores.
-        let par = self.parallel_fn;
+        // Inside a `@parallel` function the multicore `_parallel` twin fires instead (same ABI): the
+        // `@parallel` reduction tree over the widened values, so a low-precision reduction also runs
+        // across cores. It is chosen by `par_reduce`, not `parallel_fn`, so a region body or a
+        // versioned fallback inside a `@parallel` function keeps that tree (P13.7) — the `_parallel`
+        // entry runs inline when called from a worker of the pool it would fork on.
+        let par = self.parallel_fn || self.gemm.par_reduce;
         let (func, args) = match red_op {
             RED_DOT => (
                 match (par, is_f16) {
@@ -14727,8 +14788,13 @@ impl FnLowerer<'_> {
                 }
             }
             // Inside a `@parallel` function, a recognized reduction loop (`s += x[k]*y[k]`, etc.) lowers
-            // to one multicore `wukong_sreduce_f32_parallel` call instead of the sequential vectorizer.
-            if self.parallel_fn && self.try_emit_parallel_reduction(pat, iter, body) {
+            // to one multicore `wukong_sreduce_f32_parallel` call instead of the sequential vectorizer
+            // — and to its serial twin `wukong_sreduce_f32` inside an outlined region body or a
+            // versioned fallback, which run with `parallel_fn` off but keep the parallel reduction
+            // tree (P13.7, `par_reduce.rs`).
+            if self.gemm.par_reduce && self.try_emit_parallel_reduction(pat, iter, body) {
+                #[cfg(test)]
+                par_reduce::trace(par_reduce::TreePath::Kernel);
                 return;
             }
             // A bf16 mixed-precision reduction `for k in 0..n { s += (x[k] as f32) [* (y[k] as f32)] }`
@@ -14736,6 +14802,12 @@ impl FnLowerer<'_> {
             // accumulate). bf16 storage is bit-exact across interp/native and both call the identical
             // kernel, so the differential gate stays exact (a reassociation exception, like the f32 path).
             if self.try_emit_lowp_reduction(pat, iter, body) {
+                #[cfg(test)]
+                {
+                    if self.gemm.par_reduce {
+                        par_reduce::trace(par_reduce::TreePath::Lowp);
+                    }
+                }
                 return;
             }
             // A bf16 mixed-precision elementwise `for k in 0..n { out[k] = a*(x[k] as f32) + b*(y[k] as
@@ -14828,6 +14900,14 @@ impl FnLowerer<'_> {
         // only on the tensor-param path, which the vectorizer declines.) The body's index arithmetic
         // widens with the counter. The `@parallel` range path already drives by the end's type.
         let (ity, signed) = self.range_counter_type(start, end);
+
+        // A `@parallel` `f32` reduction no kernel above took — any range form, any addend, with
+        // recognition on or off — still computes the parallel reduction tree (P13.7): the loop as
+        // written fills a chunk buffer and each chunk goes to the serial twin `wukong_sreduce_f32`.
+        // Before the vectorizer, which would give it the sequential lane tree instead.
+        if self.try_emit_tree_reduction(label, pat, iter, body) {
+            return;
+        }
 
         // argmax/argmin: `for k in 0..n { if x[k] CMP bv { bv = x[k]; bi = k } }` → one deterministic
         // `wukong_argreduce_f32` call + a branchless reconcile. Tried before the vectorizer (which
@@ -34901,7 +34981,9 @@ fn mm(a: [f32; 16], b: [f32; 16], mut c: [f32; 16]) {
 
     /// `@parallel` outlining is NOT a recognizer: it is an explicit request for threads, so it must
     /// survive with recognition off. (Inside the outlined body the kernels are gone, like everywhere
-    /// else.)
+    /// else.) Neither is the `@parallel` reduction tree (P13.7, `par_reduce.rs`): the head loop's
+    /// score reductions still compute it, through the serial twin `wukong_sreduce_f32`, so that
+    /// recognition cannot change a `@parallel` reduction's bits — that call is the only one left.
     #[test]
     fn recognize_off_keeps_parallel_outlining() {
         let src = head_loop_src("@parallel\n");
@@ -34919,7 +35001,7 @@ fn mm(a: [f32; 16], b: [f32; 16], mut c: [f32; 16]) {
         );
         let calls = kernel_calls(&prog, &interner);
         assert!(
-            calls.is_empty(),
+            calls.iter().all(|c| c == "wukong_sreduce_f32"),
             "recognize: false still emitted kernel call(s): {calls:?}"
         );
     }
