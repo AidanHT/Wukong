@@ -20,6 +20,7 @@ alias_for_each_element.wk: veckernel*1 wukong_rt_alloc wukong_rt_alloc*4 wukong_
 alias_gemv_inplace.wk: wukong_sgemv
 alias_hoisted_coefficient.wk:
 alias_matmul_inplace.wk: wukong_sgemm
+alias_pattern_rest_binding.wk: wukong_cumsum_f32 wukong_cumsum_f32*4
 alias_range_views.wk: wukong_sgemm
 alias_slice_params.wk: wukong_rt_alloc wukong_rt_free
 alias_struct_field_arg.wk: veckernel*1 wukong_rt_alloc wukong_rt_alloc*3 wukong_sgemm wukong_sgemm*2

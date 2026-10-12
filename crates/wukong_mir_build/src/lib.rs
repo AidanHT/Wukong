@@ -37265,6 +37265,101 @@ fn main() -> i32 {
         );
     }
 
+    /// A pattern that binds a part of an OWNED array by pointer — `rest @ ..`, here — gives the
+    /// scrutinee's storage a second name at an offset, whatever the scrutinee's type borrows.
+    /// Each spelling below was RUN before the rule: the scan reading `a[i]` and writing `mid[i]`
+    /// dispatched `wukong_cumsum_f32` with the two names as disjoint buffers (a shifted overlap),
+    /// which only the debug-build runtime contract check caught. The controls bind only a scalar,
+    /// or one name into a fresh copy, and keep their kernel unguarded.
+    #[test]
+    fn alias_analysis_sees_a_pattern_binding_into_an_owned_array() {
+        const SCAN: &str =
+            "let mut acc: f32 = 0.0; for i in 0..8 { acc = acc + a[i]; mid[i] = acc; }";
+        let local = |bind: &str| {
+            format!(
+                "module m
+fn main() -> i32 {{
+    let mut a: [f32; 9] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+    let z: i32 = 0;
+    {bind}
+    print(a[8] as i32);
+    return 0;
+}}
+"
+            )
+        };
+        let fresh = |bind: &str| {
+            format!(
+                "module m
+fn make() -> [f32; 9] {{ return [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]; }}
+fn pair() -> ([f32; 9], i32) {{ return (make(), 3); }}
+fn main() -> i32 {{
+    let mut c: [f32; 8] = [0.0; 8];
+    {bind}
+    print(c[7] as i32);
+    return 0;
+}}
+"
+            )
+        };
+        let tainted = [
+            local(&format!("match a {{ [_, mid @ ..] => {{ {SCAN} }} }}")),
+            local(&format!(
+                "if let 0 = z && let [_, mid @ ..] = a {{ {SCAN} }}"
+            )),
+            fresh(&format!("let mut a @ [_, mid @ ..] = make(); {SCAN}")),
+            fresh(&format!(
+                "let (a @ [_, mid @ ..], k) = pair(); {SCAN} c[0] = k as f32;"
+            )),
+        ];
+        for src in &tainted {
+            assert!(!alias_free_of(src, "main"), "{src}");
+            let (prog, diags, interner) = lower(src);
+            assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+            assert!(
+                !prog_calls_unguarded(&prog, &interner, "wukong_cumsum_f32"),
+                "a scan over two names for one array must not dispatch unguarded: {src}"
+            );
+        }
+        let controls = [
+            local(
+                "let mut c: [f32; 8] = [0.0; 8]; match a { [h, ..] => { let mut acc: f32 = 0.0; \
+                 for i in 0..8 { acc = acc + a[i]; c[i] = acc; } a[0] = c[7] + h; } }",
+            ),
+            // `mid` is recorded as a view of `a`, not as a taint: a function whose operands are
+            // `mid` and another array, and never `a` itself, names each buffer once.
+            "module m
+fn main() -> i32 {
+    let a: [f32; 9] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+    let mut c: [f32; 8] = [0.0; 8];
+    match a {
+        [_, mid @ ..] => {
+            let mut acc: f32 = 0.0;
+            for i in 0..8 { acc = acc + mid[i]; c[i] = acc; }
+        }
+    }
+    print(c[7] as i32);
+    return 0;
+}
+"
+            .to_string(),
+            fresh(
+                "let [_, mid @ ..] = make(); let mut acc: f32 = 0.0; \
+                 for i in 0..8 { acc = acc + mid[i]; c[i] = acc; }",
+            ),
+        ];
+        for src in &controls {
+            assert!(alias_free_of(src, "main"), "{src}");
+            let (prog, diags, interner) = lower(src);
+            assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+            assert!(
+                prog_calls_unguarded(&prog, &interner, "wukong_cumsum_f32"),
+                "the control must keep its kernel, got {:?}: {src}",
+                kernel_calls(&prog, &interner)
+            );
+        }
+    }
+
     /// **Two more republishing spellings, each executed as a live wrong answer on the binary before
     /// the arm that closes it, and each the exact counterpart of a rule already in the file.**
     ///

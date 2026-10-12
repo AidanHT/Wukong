@@ -60,6 +60,17 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `a` through an empty slice's null data pointer, or out of a slice of three rows. Such a pattern is
   now checked as a `for` head is: a slice length test, literal, range, path, or-pattern or
   multi-variant enum variant anywhere inside is `E0442` (`tests/fail/slice_let_wide_element.wk`).
+- **A pattern binding into an owned array is a second name for the kernel alias analysis.**
+  `rest @ ..` binds the sub-array IN PLACE, so after `match a { [_, mid @ ..] => … }` the names
+  `mid` and `a` are one buffer one element apart; `alias.rs` tainted a `match` only when its
+  scrutinee type could hold a borrowing leaf, so a scan reading `a[i]` and writing `mid[i]`
+  dispatched `wukong_cumsum_f32` over a shifted overlap with no overlap test (the debug-build
+  runtime contract check stopped it; a release build would have printed the prefix sums of the
+  original array). A `match` arm or `if let` chain `let` that binds a part of an owned aggregate by
+  pointer now records it as a view of its place in the scrutinee, so such a kernel is versioned
+  behind the run-time overlap test, and a destructuring `let` whose `name @ sub` names its own copy
+  twice taints the function (`tests/run/alias_pattern_rest_binding.wk`). The recognizer census is
+  unchanged apart from the new fixture.
 - **A block arm body ends its arm.** `X => { … }` followed by an arm that opens with `[`, `(` or `-`
   parsed as an index into, a call of or a subtraction from the block, so the two arms needed a comma
   between them (which the formatter always prints); it is now two arms, as in Rust. No `.wk` file in
