@@ -1,10 +1,11 @@
 //! The interpreter twins of the decode builtins' runtime entries: KV-cache attention
-//! (`wukong_attention_kv_f32`), the KV append, the half-weight GEMV (`wukong_sgemv_{bf16,f16}`) and
-//! the GGML Q8_0 / Q4_0 packers and GEMV.
+//! (`wukong_attention_kv_f32`, and its batched, padded form `wukong_attention_kv_batch_f32`), the
+//! KV append, the half-weight GEMV (`wukong_sgemv_{bf16,f16}`) and the GGML Q8_0 / Q4_0 packers and
+//! GEMV.
 //!
 //! Every arm first validates the call with the runtime's own plan function (`kv_attention_plan`,
-//! `gemv_half_plan`, `quantize_plan`, …), so a malformed shape returns exactly the status the native
-//! entry returns, with memory untouched. Then it marshals the operands out of slot memory, calls the
+//! `kv_batch_plan` + `kv_batch_check_lens`, `gemv_half_plan`, `quantize_plan`, …), so a malformed
+//! shape returns exactly the status the native entry returns, with memory untouched. Then it marshals the operands out of slot memory, calls the
 //! same **serial** runtime entry the native backend calls (the `_parallel` names too — every one is
 //! pinned bit-identical to its serial twin), and writes back only the elements that entry defines.
 //! Inputs are copied before any output is written, which is the value semantics the native entries
@@ -13,7 +14,9 @@
 //! Byte buffers (the quantized weights) live one slot per byte in the canonical sign-extended form
 //! (`0xC8` is `Int(-56)`, see `ml_io.rs`), so they are read `as u8` and written back `as i8`.
 
-use wukong_runtime::attention_kv::{kv_append_plan, kv_attention_plan, KV_OK};
+use wukong_runtime::attention_kv::{
+    kv_append_plan, kv_attention_plan, kv_batch_check_lens, kv_batch_plan, KV_OK,
+};
 use wukong_runtime::gemv_half::{gemv_half_plan, GEMV_OK};
 use wukong_runtime::quant::{gemv_q_plan, quantize_plan, QFormat, QUANT_OK};
 
@@ -55,6 +58,9 @@ impl Interp<'_, '_> {
         let name = id.name();
         Some(match id {
             I::AttentionKvF32 | I::AttentionKvF32Parallel => self.dec_attention_kv(name, args),
+            I::AttentionKvBatchF32 | I::AttentionKvBatchF32Parallel => {
+                self.dec_attention_kv_batch(name, args)
+            }
             I::KvAppendF32 => self.dec_kv_append(name, args),
             I::SgemvBf16 | I::SgemvBf16Parallel | I::SgemvF16 | I::SgemvF16Parallel => {
                 self.dec_sgemv_half(name, args)
@@ -141,6 +147,95 @@ impl Interp<'_, '_> {
                 marshal::write_f32(arena_mut!(self), 6, o_base + off, head, name)?;
             }
         }
+        marshal::recycle_f32(q);
+        marshal::recycle_f32(k);
+        marshal::recycle_f32(v);
+        marshal::recycle_f32(o);
+        Ok(status(KV_OK))
+    }
+
+    /// `wukong_attention_kv_batch_f32(q, nq, k, nk, v, nv, o, no, kv_lens, nl, q_pos, np, batch, sq,
+    /// skv, n_heads, n_kv_heads, d, scale, causal) -> i64`. The output is packed, so every element
+    /// of its extent is defined (a fully masked row is zeros) and all of it is written back.
+    fn dec_attention_kv_batch(&mut self, name: &str, args: &[Value]) -> Result<Value, String> {
+        let mut geo = [0i64; 6];
+        for (g, slot) in geo.iter_mut().enumerate() {
+            *slot = arg_i64(args, 12 + g);
+        }
+        let lens = [1, 3, 5, 7, 9, 11].map(|i| arg_i64(args, i));
+        let plan = match kv_batch_plan(lens[0], lens[1], lens[2], lens[3], lens[4], lens[5], geo) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return Ok(status(KV_OK)),
+            Err(code) => return Ok(status(code)),
+        };
+        let kv_lens = marshal::read_i32(
+            arena!(self),
+            8,
+            ptr_arg(args, 8, name, "kv_lens")?,
+            plan.batch,
+            name,
+        )?;
+        let q_pos = marshal::read_i32(
+            arena!(self),
+            10,
+            ptr_arg(args, 10, name, "q_pos")?,
+            plan.batch,
+            name,
+        )?;
+        if let Err(code) = kv_batch_check_lens(&plan, &kv_lens) {
+            return Ok(status(code));
+        }
+        let scale = args.get(18).map(|v| v.as_float() as f32).unwrap_or(0.0);
+        let causal = arg_i64(args, 19);
+        let q = marshal::read_f32(
+            arena!(self),
+            0,
+            ptr_arg(args, 0, name, "q")?,
+            plan.q_extent,
+            name,
+        )?;
+        let (k, v) = if plan.kv_extent == 0 {
+            (Vec::new(), Vec::new())
+        } else {
+            let kb = ptr_arg(args, 2, name, "k")?;
+            let vb = ptr_arg(args, 4, name, "v")?;
+            (
+                marshal::read_f32(arena!(self), 2, kb, plan.kv_extent, name)?,
+                marshal::read_f32(arena!(self), 4, vb, plan.kv_extent, name)?,
+            )
+        };
+        let o_base = ptr_arg(args, 6, name, "out")?;
+        let mut o = marshal::output_f32(arena!(self), 6, o_base, plan.q_extent, name)?;
+        // SAFETY: every host buffer holds exactly the extent the plan validated, and they are
+        // disjoint.
+        let code = unsafe {
+            wukong_runtime::wukong_attention_kv_batch_f32(
+                q.as_ptr(),
+                q.len() as i64,
+                k.as_ptr(),
+                k.len() as i64,
+                v.as_ptr(),
+                v.len() as i64,
+                o.as_mut_ptr(),
+                o.len() as i64,
+                kv_lens.as_ptr(),
+                kv_lens.len() as i64,
+                q_pos.as_ptr(),
+                q_pos.len() as i64,
+                geo[0],
+                geo[1],
+                geo[2],
+                geo[3],
+                geo[4],
+                geo[5],
+                scale,
+                causal,
+            )
+        };
+        if code != KV_OK {
+            return Err(refused(name, code));
+        }
+        marshal::write_f32(arena_mut!(self), 6, o_base, &o, name)?;
         marshal::recycle_f32(q);
         marshal::recycle_f32(k);
         marshal::recycle_f32(v);

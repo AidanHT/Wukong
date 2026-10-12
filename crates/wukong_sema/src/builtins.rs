@@ -86,6 +86,10 @@ pub enum KernelBuiltin {
     Dot,
     /// `sdpa(q, k, v, out, s, d, scale, causal)` — fused scaled-dot-product attention.
     Sdpa,
+    /// `sdpa_kv_batch(q, k, v, out, kv_lens, q_pos, scale, causal)` — batched, padded decode
+    /// attention over a KV cache. Typed in `decode_builtins.rs` (its sequence vectors are `i32` and
+    /// `causal` a flag, which `check_kernel_call` does not model) and recorded here.
+    SdpaKvBatch,
 }
 
 /// The elementwise activations exposed as two-argument buffer builtins.
@@ -315,6 +319,28 @@ const DOT: Spec = Spec {
     flat: true,
     returns_f32: true,
 };
+/// `sdpa_kv_batch`'s shape signature `<B, SQ, SKV, H, HKV, D>`: `q`, `out` are `[B, SQ, H, D]`,
+/// `k`, `v` are `[B, SKV, HKV, D]`, the `i32` vectors `kv_lens`, `q_pos` are `[B]`. Checked by
+/// `decode_builtins.rs`; listed here so the shape tables (`builtin_dims`, `builtin_operand_dims`,
+/// `builtin_output`) describe it like every other recorded builtin. `causal` is a flag, not a float;
+/// only its being a scalar matters to the tables.
+const SDPA_KV_BATCH: Spec = Spec {
+    name: "sdpa_kv_batch",
+    dims: &["B", "SQ", "SKV", "H", "HKV", "D"],
+    params: &[
+        buf("q", &[0, 1, 3, 5]),
+        buf("k", &[0, 2, 4, 5]),
+        buf("v", &[0, 2, 4, 5]),
+        buf("out", &[0, 1, 3, 5]),
+        buf("kv_lens", &[0]),
+        buf("q_pos", &[0]),
+        Param::Float("scale"),
+        Param::Float("causal"),
+    ],
+    rows: None,
+    flat: false,
+    returns_f32: false,
+};
 
 fn spec_of(kind: KernelBuiltin) -> &'static Spec {
     use KernelBuiltin::*;
@@ -331,6 +357,7 @@ fn spec_of(kind: KernelBuiltin) -> &'static Spec {
         Map(_) => &MAP,
         Sum | Amax | Amin => &REDUCE,
         Dot => &DOT,
+        SdpaKvBatch => &SDPA_KV_BATCH,
         // `sdpa` keeps its positional value-dimension ABI and is checked by `check_sdpa`.
         Sdpa => &MAP,
     }
@@ -350,7 +377,7 @@ pub fn builtin_output(kind: KernelBuiltin) -> Option<usize> {
     use KernelBuiltin::*;
     match kind {
         Matmul | MatmulNt | MatmulTn | RmsNorm => Some(2),
-        Linear | LayerNorm | Sdpa => Some(3),
+        Linear | LayerNorm | Sdpa | SdpaKvBatch => Some(3),
         Transpose | Softmax | LogSoftmax | Map(_) => Some(1),
         Sum | Amax | Amin | Dot => None,
     }
@@ -434,7 +461,7 @@ fn array_leaf(t: &Ty) -> &Ty {
 
 /// Two extents provably equal: the normal form makes structural equality semantic for constants,
 /// variables and derived extents alike (`2*N` and `N + N` are one `Dim`); a `?` equals nothing.
-fn dims_same(a: &Dim, b: &Dim) -> bool {
+pub(crate) fn dims_same(a: &Dim, b: &Dim) -> bool {
     match (a, b) {
         (Dim::Const(x), Dim::Const(y)) => x == y,
         (Dim::Var(x), Dim::Var(y)) => x == y,
@@ -694,7 +721,7 @@ impl Sema<'_> {
         // `decode_builtins.rs`.
         let interner = self.interner;
         if let Some(t) =
-            self.type_decode_builtin(interner.resolve(name), callee, generic_args, args)
+            self.type_decode_builtin(interner.resolve(name), call, callee, generic_args, args)
         {
             return Some(t);
         }
@@ -767,7 +794,11 @@ impl Sema<'_> {
     /// Resolve one turbofish argument of a builtin to a dimension: an integer literal, a generic
     /// dimension in scope, an in-scope integer variable (a runtime extent), or a top-level `const`.
     /// The flag is `true` for an *unsigned* integer variable, which must zero-extend at run time.
-    fn builtin_turbofish_dim(&mut self, ga: &TypeExpr, builtin: &str) -> Option<(Dim, bool)> {
+    pub(crate) fn builtin_turbofish_dim(
+        &mut self,
+        ga: &TypeExpr,
+        builtin: &str,
+    ) -> Option<(Dim, bool)> {
         match &ga.kind {
             TypeKind::Int(s) => match crate::parse_u64_text(self.sym_str(*s)) {
                 Some(n) => Some((Dim::Const(n), false)),

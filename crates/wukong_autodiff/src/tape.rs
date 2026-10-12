@@ -1774,6 +1774,8 @@ pub(crate) fn ml_call_gradient(name: &str) -> Option<MlCallGradient> {
         // value-returning path would skip them and drop the gradient through that buffer: refuse.
         "wukong_attention_kv_f32"
         | "wukong_attention_kv_f32_parallel"
+        | "wukong_attention_kv_batch_f32"
+        | "wukong_attention_kv_batch_f32_parallel"
         | "wukong_kv_append_f32"
         | "wukong_sgemv_bf16"
         | "wukong_sgemv_bf16_parallel"

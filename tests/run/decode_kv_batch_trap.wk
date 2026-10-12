@@ -1,0 +1,36 @@
+// RUN: --run
+// EXPECT-EXIT: 1
+// EXPECT-OUT-NONE
+// EXPECT-STDERR: assertion failed
+module tests.run.decode_kv_batch_trap
+
+// `sdpa_kv_batch` is shape-checked like `matmul`: an operand whose length is only known at run
+// time - here a `[]f32` slice under the runtime cache capacity `cap` - must hold EXACTLY the
+// elements its shape names, `[B, SKV, HKV, D] = [2, cap, 1, 4]` for the caches. The caches below
+// are allocated for a capacity of 8 (2 * 8 * 1 * 4 = 64 floats). With `cap = 8` every operand
+// fits and the call runs. With `cap = 4` the caches hold 64 floats where the shape names 32:
+// "long enough" is not enough, because the packed layout has no stride to absorb the slack - the
+// kernel would take sequence 1's cache to begin at element 1 * 4 * 1 * 4 = 16, which is row 4 of
+// sequence 0's region, and attend over the wrong keys without a sound. The lowering's exact-length
+// check traps instead (exit 1, `assertion failed`, nothing printed), on the interpreter and
+// natively alike, so the `print` after the second call never runs.
+
+fn attend(q: []f32, k: []f32, v: []f32, mut o: []f32, lens: []i32, pos: []i32, cap: i64) {
+    sdpa_kv_batch::<2, 1, cap, 1, 1, 4>(q, k, v, o, lens, pos, 1.0, true);
+}
+
+fn main() -> i32 {
+    // Two sequences of one query row, one head of four lanes; caches sized for capacity 8.
+    let q: []f32 = alloc_f32(8);
+    let k: []f32 = alloc_f32(64);
+    let v: []f32 = alloc_f32(64);
+    let o: []f32 = alloc_f32(8);
+    let lens_a: [i32; 2] = [1, 1];
+    let pos_a: [i32; 2] = [0, 0];
+    let lens: []i32 = lens_a;
+    let pos: []i32 = pos_a;
+    attend(q, k, v, o, lens, pos, 8);
+    attend(q, k, v, o, lens, pos, 4);
+    print(o[0]);
+    return 0;
+}

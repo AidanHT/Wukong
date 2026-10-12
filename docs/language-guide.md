@@ -1791,19 +1791,23 @@ every lane against hand-derived values; `tests/fail/builtin_dim_uninferable.wk`,
 
 ### Decode builtins ✅
 
-The kernels an autoregressive decode step is made of — attention over a KV cache, appending to the
-cache, and matrix-vector products over half-precision or block-quantized weights — are builtins too.
-Their shapes are *values* (lengths, head counts, strides), so each call is checked at run time
-against its operands' lengths before anything is read or written: a geometry that does not fit
-traps like a failed `assert` (exit 1, `assertion failed`) on every backend
-(`tests/run/decode_shape_trap.wk`). Operand kinds are checked at compile time with the usual codes:
-a wrong arity or a turbofish is `E0503`, a wrong operand kind or element type `E0401`, and writing
-the output through a non-`mut` aggregate parameter `E0304`. A buffer is a `[]T` slice, a `[T; N]`
-array or a contiguous `Tensor[T, …]`. Each returns `()`.
+The kernels an autoregressive decode step is made of — attention over a KV cache (one sequence,
+or a padded batch of them), appending to the cache, and matrix-vector products over half-precision
+or block-quantized weights — are builtins too. Most of their shapes are *values* (lengths, head
+counts, strides), so each call is checked at run time against its operands' lengths before anything
+is read or written: a geometry that does not fit traps like a failed `assert` (exit 1, `assertion
+failed`) on every backend (`tests/run/decode_shape_trap.wk`). The batched attention `sdpa_kv_batch`
+has a real shape signature instead, checked at compile time (below). Operand kinds are checked at
+compile time with the usual codes: a wrong arity is `E0503`, and so is a turbofish — except
+`sdpa_kv_batch`'s, which is its list of six dimensions, where only a wrong count is `E0503`; a wrong
+operand kind or element type (an `i64` `kv_lens`, say) is `E0437`; and writing the output through a
+non-`mut` aggregate parameter is `E0304`. A buffer is a `[]T` slice, a `[T; N]` array or a
+contiguous `Tensor[T, …]`. Each returns `()`.
 
 | builtin | operands | runtime kernel |
 |---|---|---|
 | `sdpa_kv(q, k, v, out, sq, skv, d, q_pos0, n_heads, n_kv_heads, q_stride, kv_stride, scale, causal)` | `f32` buffers; integers; a float `scale`; an integer or `bool` `causal` | `wukong_attention_kv_f32` |
+| `sdpa_kv_batch::<B, SQ, SKV, H, HKV, D>(q, k, v, out, kv_lens, q_pos, scale, causal)` | `f32` `q, out: [B, SQ, H, D]`, `k, v: [B, SKV, HKV, D]`; `i32` `kv_lens, q_pos: [B]`; a float `scale`; an integer or `bool` `causal` | `wukong_attention_kv_batch_f32` |
 | `kv_append(cache, row, pos, stride)` | `f32` buffers; integers | `wukong_kv_append_f32` |
 | `gemv_bf16(w, x, y)`, `gemv_f16(w, x, y)` | `bf16`/`f16` weight `[N·K]`; `f32` `x[K]`, `y[N]` | `wukong_sgemv_{bf16,f16}` |
 | `quantize_q8_0(x, q, k)`, `quantize_q4_0(x, q, k)` | `f32` rows of `k` values; `u8` blocks | `wukong_quantize_{q8_0,q4_0}_f32` |
@@ -1821,6 +1825,32 @@ array or a contiguous `Tensor[T, …]`. Each returns `()`.
   `exp`, the same blocks for every query position, so decoding a sequence one token at a time
   produces bit-for-bit the rows a causal prefill of the whole sequence produces
   (`tests/run/decode_kv_attention.wk`).
+- **`sdpa_kv_batch`** runs `B` sequences in one call — a server's batched decode step, or a batch of
+  chunked prefills — over packed tensors: `q` and `out` are `[B, SQ, H, D]` (sequence, query row,
+  head, lane), the caches `k` and `v` are `[B, SKV, HKV, D]` with `SKV` the capacity every sequence
+  is padded to. It is **shape-checked like `matmul`**: the six dimensions come from a turbofish
+  (`sdpa_kv_batch::<2, 1, 512, 32, 8, 128>(…)`; a literal, a `const`, a generic dimension or an
+  integer variable), from the shapes of `Tensor` operands, and from the length of a fixed array
+  (which fixes the one dimension of its shape still free); disagreeing operands are `E0502` (a wrong
+  rank `E0501`), an array that does not hold its shape exactly `E0501`, constant head counts that do
+  not group (`H` not a multiple of `HKV`) `E0502`, and a dimension nothing fixes `E0409` (a slice's
+  length fixes none). As for `matmul`, an operand whose length is only known at run time (a slice,
+  or an array against a runtime dimension) must hold *exactly* its shape's elements, or the call
+  traps like a failed `assert`: a cache allocated for a larger capacity than the `SKV` passed is
+  refused, not read at the wrong per-sequence offsets (`tests/run/decode_kv_batch_trap.wk`). The
+  `i32` vector `kv_lens[b]` (`0 ..= SKV`, checked at run time) is how many leading cache rows of
+  sequence `b` hold real keys, and `q_pos[b]` is the position of its first query row: row `i` sees
+  keys `j < kv_lens[b]` and, with `causal`, `j <= q_pos[b] + i`. A decode step is `q_pos[b] =
+  kv_lens[b] - 1`; FlashAttention's bottom-right mask is `kv_lens[b] - SQ`; a right-padded prompt is
+  `0`; a negative position is allowed (those rows see nothing yet).
+  **Masked keys contribute exactly zero probability** — they are never read, so the padding may hold
+  anything, NaN included — and each row is bit-for-bit the row `sdpa_kv` computes over that
+  sequence alone. **A fully masked row** (an empty sequence, or a causal row before position 0) is
+  defined to be exactly `0` in every lane, FlashAttention's convention rather than the NaN of a
+  softmax over nothing (`tests/run/decode_kv_batch.wk`, `tests/run/decode_kv_batch_gqa.wk`).
+- **GQA-group blocking.** Both attention builtins process the query heads that share a KV head
+  together (up to eight per pass), so each cached key and value row is loaded once for the whole
+  group instead of once per head; the result is bit-for-bit the per-head computation.
 - **`kv_append(cache, row, pos, stride)`** copies `row` into `cache[pos·stride ..]` (`stride` at least
   `len(row)`); appending token `t`'s keys is `kv_append(k_cache, k_row, t, kv_stride)`.
 - **`gemv_bf16` / `gemv_f16`**: `y[j] = Σ_p x[p]·w[j·K + p]` with `N = len(y)`, `K = len(x)`, and `w`

@@ -25,6 +25,52 @@ All notable changes to Wukong are documented here. The format is loosely based o
   and `corpus_mir_is_identical_with_and_without_the_bias_alias_memo` lowers every corpus program
   with the memo on and off and compares the printed MIR. `cargo test -p wukong_mir_build --lib
   bias_memo -- --nocapture` prints the counts; the linear-growth test pins them.
+### Batched decode attention and GQA-group blocking (`gap6/decode-attention-2`, N81)
+
+- **Added: `sdpa_kv_batch`, batched and padded KV-cache attention.** `sdpa_kv_batch(q, k, v, out,
+  kv_lens, q_pos, scale, causal)` attends `B` sequences in one call over packed tensors: `q`/`out`
+  `[B, SQ, H, D]`, caches `k`/`v` `[B, SKV, HKV, D]` padded to one capacity `SKV`, and two `i32`
+  vectors of `B` entries — `kv_lens[b]` real cached keys (`0..=SKV`, checked at run time) and
+  `q_pos[b]` the position of the sequence's first query row (decode: `kv_lens[b] - 1`;
+  FlashAttention's bottom-right mask: `kv_lens[b] - SQ`; a right-padded prompt: `0`; negative
+  allowed). Row `i` sees keys `j < kv_lens[b]` and, causally, `j <= q_pos[b] + i`. Masked keys are
+  never read, so they contribute exactly zero probability whatever the padding holds (NaN included)
+  and every row is bit-for-bit the single-sequence `sdpa_kv` row; a fully masked row (an empty
+  sequence, a causal row before position 0) is defined as exactly `0` in every lane
+  (`tests/run/decode_kv_batch.wk`).
+- **Shape-checked like a kernel builtin.** Its dimensions `<B, SQ, SKV, H, HKV, D>` come from a
+  turbofish (literals, `const`s, generic dimensions, integer variables), the shapes of `Tensor`
+  operands and the lengths of fixed arrays; disagreeing operands are `E0502`, a wrong rank or an
+  array that does not hold its shape `E0501`, head counts that do not group `E0502`, an unfixed
+  dimension `E0409` — no new codes. As for `matmul`, an operand whose length is only known at run
+  time (a slice, or an array under a runtime dimension) must hold exactly its shape's elements, or
+  the call traps like a failed `assert` — the runtime alone refuses only a short operand, and would
+  read a cache allocated for a larger capacity than the `SKV` passed at the wrong per-sequence
+  offsets (`tests/run/decode_kv_batch_trap.wk`). A shape-generic
+  `fn f<B, S>(q: Tensor[f32, B, 1, 8, 4], ..)` calls it with runtime sizes, and a `@parallel`
+  function calls the multicore twin (`tests/run/decode_kv_batch_gqa.wk`,
+  `tests/fail/sdpa_kv_batch_head_dim.wk`). The resolution is recorded in `builtin_calls`
+  (`KernelBuiltin::SdpaKvBatch`), so deferred and copied calls keep it.
+- **GQA-group blocking in both attention kernels.** The AVX2 path processes up to eight query heads
+  sharing a KV head together: each key row is loaded once and dotted into a register tile of
+  `keys x heads` accumulators, each value row loaded once and accumulated for every head, so a GQA
+  step reads its cache up to 8x less often. Every (row, head) keeps the exact per-head operation
+  order, so the grouped pass equals the per-head scalar twin bit for bit (pinned over GQA ratios
+  1, 2, 3, 4, 5, 7, 8, 12 and 16, every `d % 8` tail and both sides of the 64-key block). Not yet
+  measured: no throughput claim is made. The instrument is an ignored same-run A/B of the grouped
+  pass against the same code one head at a time (best of 15 each, ratio only, bit-equality
+  asserted): `cargo test -p wukong_runtime --release --lib gqa_group_blocking_ab -- --ignored
+  --nocapture`.
+- **Added: `examples/gpt2_generate.wk`, multi-token generation over the real GPT-2 124M weights.**
+  Two sequences at different positions (one joins at step 2, continuous batching) decode greedily
+  through padded per-layer KV caches with one `sdpa_kv_batch` per layer and the named `layernorm` /
+  `linear` / `matmul_nt` kernels. Its prompt-position logits are within 1.9e-4 of HuggingFace's
+  (logits of magnitude ~100), and all 24 generated ids (" John. I'm a writer, and I'm a writer";
+  " name is John. I'm a writer, and I'm") match an independent float64 NumPy evaluation whose
+  smallest top-2 margin is 0.0129. Native-only and data-guarded like `gpt2_infer.wk`.
+- **Runtime** `wukong_attention_kv_batch_f32[_parallel]` with `kv_batch_plan` /
+  `kv_batch_check_lens` (shared by the interpreter twin), Cranelift and textual-LLVM ABI rows, and
+  autodiff refusing it like `sdpa_kv`.
 
 ### Stack-slot coloring (`gap6/stack-coloring`)
 

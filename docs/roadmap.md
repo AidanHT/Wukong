@@ -603,8 +603,12 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
 - **Autoregressive decode primitives (CPU)**: `sdpa_kv` attends `sq` query rows against a KV cache of
   `skv` rows at a position offset, with grouped-query / multi-query heads and explicit row strides
   (`wukong_attention_kv_f32`; decoding one token at a time is bit-identical to a causal prefill), and
-  `kv_append` grows the cache. `gemv_bf16` / `gemv_f16` multiply by half-precision weights without
-  ever materializing an f32 copy; the loop nest `y[j] = Σ x[p]·(w[j*K + p] as f32)` over a bf16/f16
+  `kv_append` grows the cache. `sdpa_kv_batch` runs a padded batch of sequences in one call with a
+  compile-time shape signature `<B, SQ, SKV, H, HKV, D>`, per-sequence key lengths and query
+  positions (masked keys are never read, so they contribute exactly zero probability; a fully
+  masked row is defined as `0`), and both kernels process the query heads sharing a KV head together
+  so the cache is read once per group (bit-identical to the per-head scalar twin). `gemv_bf16` /
+  `gemv_f16` multiply by half-precision weights without ever materializing an f32 copy; the loop nest `y[j] = Σ x[p]·(w[j*K + p] as f32)` over a bf16/f16
   weight is recognized into them, and a recognized bf16/f16 `nn.Linear` with one to four rows now
   takes the same streaming path (bit-identical to the old widen-then-GEMM result). `quantize_q8_0` /
   `quantize_q4_0` pack weights into llama.cpp's `Q8_0` / `Q4_0` blocks and `gemv_q8_0` / `gemv_q4_0`
@@ -1692,12 +1696,16 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   recognized (a scaled store `y[j] = s * c` stays a loop), and a quantized GEMV has no loop spelling
   at all — its per-call activation quantization is part of its definition, so call `gemv_q4_0` by
   name; the K-quant family
-  (`Q4_K`, `Q6_K`) and a quantized KV cache are not implemented; `sdpa_kv` has no padding mask or
-  per-sequence batch dimension, takes the output's stride from the query's, and has no backward
-  kernel (autodiff refuses it). A whole greedy decode loop runs as a gated toy model
-  (`tests/run/decode_tiny_lm.wk`: bf16 projections, a growing KV cache, GQA attention, a Q8_0 LM head,
-  six tokens checked against an f64 reference); the multi-token GPT-2 example over real weights is
-  still to be written. None of the decode kernels is measured yet.
+  (`Q4_K`, `Q6_K`) and a quantized KV cache are not implemented; `sdpa_kv` takes the output's stride
+  from the query's, `sdpa_kv_batch` takes packed tensors only (no row strides, no paged cache) and
+  no split-K across the keys (a one-sequence MQA step parallelizes over at most `H / 8` head
+  blocks), and neither has a backward kernel (autodiff refuses them). A whole greedy decode loop runs
+  as a gated toy model (`tests/run/decode_tiny_lm.wk`: bf16 projections, a growing KV cache, GQA attention, a Q8_0 LM head,
+  six tokens checked against an f64 reference), and `examples/gpt2_generate.wk` decodes the real
+  GPT-2 124M weights with KV caches: two sequences at different positions share one
+  `sdpa_kv_batch` call per layer through padded caches, and their 24 greedy tokens match a float64
+  NumPy evaluation (native-only; needs the uncommitted `data/gpt2/` blob). None of the decode
+  kernels is measured yet.
 - **ML I/O and randomness gaps.** No memory-mapped load yet (`map_<T>`: every checkpoint load copies
   once, straight into the destination) and no GGUF reader (the `Q8_0` / `Q4_0` block layouts exist as
   the decode builtins' packers and GEMVs, and a raw block blob loads with `read_u8`); `.npy` reads

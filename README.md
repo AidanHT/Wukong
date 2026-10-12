@@ -136,7 +136,8 @@ not duplicate them. In summary, Wukong:
   The decode builtins `sdpa_kv`
   (KV-cache / grouped-query attention), `kv_append`, `gemv_bf16`/`gemv_f16` and the llama.cpp
   `Q8_0`/`Q4_0` packers and GEMVs check their geometry against their operands at run time
-  (`tests/run/decode_*.wk`).
+  (`tests/run/decode_*.wk`); `sdpa_kv_batch` attends a padded batch of sequences with a compile-time
+  shape signature and per-sequence key-length masks.
 - **Zero hidden cost.** No GC, no implicit copies of large aggregates, no surprise allocations.
 - **Domain-aware optimization (implementation today).** The compiler **recognizes a matmul nest** (the
   `ikj` accumulate and `ijk` dot-product forms, incl. `nn.Linear` `A·Bᵀ`, written naively or

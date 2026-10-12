@@ -202,7 +202,8 @@ pub use topk::{wukong_argsort_f32, wukong_sample_categorical_f32, wukong_topk_f3
 // half GEMM), and the GGML Q8_0 / Q4_0 block formats. Public for the interpreter's shape checks.
 pub mod attention_kv;
 pub use attention_kv::{
-    wukong_attention_kv_f32, wukong_attention_kv_f32_parallel, wukong_kv_append_f32,
+    wukong_attention_kv_batch_f32, wukong_attention_kv_batch_f32_parallel, wukong_attention_kv_f32,
+    wukong_attention_kv_f32_parallel, wukong_kv_append_f32,
 };
 pub mod gemv_half;
 pub use gemv_half::{

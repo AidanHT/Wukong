@@ -1,0 +1,195 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 20
+// EXPECT-OUT: 21
+// EXPECT-OUT: 22
+// EXPECT-OUT: 23
+// EXPECT-OUT: 100
+// EXPECT-OUT: 101
+// EXPECT-OUT: 102
+// EXPECT-OUT: 103
+// EXPECT-OUT: 110
+// EXPECT-OUT: 111
+// EXPECT-OUT: 112
+// EXPECT-OUT: 113
+// EXPECT-OUT: 30
+// EXPECT-OUT: 31
+// EXPECT-OUT: 32
+// EXPECT-OUT: 33
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 18
+// EXPECT-OUT: 120
+// EXPECT-OUT: 121
+// EXPECT-OUT: 122
+// EXPECT-OUT: 123
+// EXPECT-OUT: 115
+// EXPECT-OUT: 116
+// EXPECT-OUT: 117
+// EXPECT-OUT: 118
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 1001
+// EXPECT-OUT: 1002
+// EXPECT-OUT: 1003
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 1001
+// EXPECT-OUT: 1002
+// EXPECT-OUT: 1003
+// EXPECT-OUT: 1100
+// EXPECT-OUT: 1101
+// EXPECT-OUT: 1102
+// EXPECT-OUT: 1103
+// EXPECT-OUT: 1100
+// EXPECT-OUT: 1101
+// EXPECT-OUT: 1102
+// EXPECT-OUT: 1103
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+module tests.run.decode_kv_batch
+
+// Batched, padded decode attention (`sdpa_kv_batch`): three sequences in one call over packed
+// tensors, every output lane printed. Shape `<B, SQ, SKV, H, HKV, D> = <3, 2, 4, 4, 2, 4>`: q and
+// out are [3, 2, 4, 4] (sequence, query row, head, lane), the K and V caches [3, 4, 2, 4]
+// (sequence, cached row, KV head, lane); four query heads over two KV heads (heads 0-1 read KV
+// head 0, heads 2-3 KV head 1); scale 1; causal. The dimensions come from the turbofish and every
+// array length is checked against them at compile time.
+//
+// The sequences: kv_lens = [4, 1, 0] valid cached keys, q_pos = [2, -1, 0] the position of each
+// sequence's first query row. So row i of sequence b sees the keys j < kv_lens[b] with
+// j <= q_pos[b] + i:
+//   sequence 0: row 0 (position 2) sees keys 0..2, row 1 (position 3) all four;
+//   sequence 1: row 0 (position -1) sees NOTHING, row 1 (position 0) sees key 0;
+//   sequence 2: an empty cache - both rows see nothing.
+// Every cache row past kv_lens[b] (the padding) holds NaN in K and V. A masked key contributes
+// exactly zero probability because it is never read, so not one NaN may reach an output; and a
+// row that sees no key is defined to be exactly 0 in every lane (the output starts at -1, so each
+// such 0 was written).
+//
+// Valid key j of sequence b is one-hot (e_j) on both KV heads, and its values encode (sequence, KV
+// head, row, lane): V[b][j][g][c] = 1000b + 100g + 10j + c. A query of 200 along lane t scores 200
+// on key t and 0 on the others; exp(-200) (and exp(-100)) flushes to exactly 0 in the kernel's exp,
+// so that key's weight is exactly 1 and the output is its value row exactly. A zero query scores
+// every visible key alike: the mean, exact here over four small integers. Expected values are
+// those definitions evaluated by hand, never read back from a backend:
+//   sequence 0, row 0 (keys 0-2):
+//     head 0 aims 200 at key 3 (causally masked) and 100 at key 1: key 1 -> 10..13;
+//     head 1 picks key 2 -> 20..23; head 2 picks key 0 of KV head 1 -> 100..103;
+//     head 3 picks key 1 of KV head 1 -> 110..113.
+//   sequence 0, row 1 (keys 0-3):
+//     head 0 picks key 3 -> 30..33; head 1 is a zero query: (0+10+20+30)/4 + c -> 15..18;
+//     head 2 picks key 2 of KV head 1 -> 120..123; head 3 zero: 100 + 15 + c -> 115..118.
+//   sequence 1, row 0: fully masked whatever its queries (200 on lane 0) -> sixteen 0s.
+//   sequence 1, row 1 (key 0 only): one visible key has weight 1 whatever the query (head 0 aims
+//     200 at the padded key 3, which is never scored): heads 0-1 -> 1000..1003, heads 2-3 ->
+//     1100..1103.
+//   sequence 2: both rows fully masked (queries all 1) -> thirty-two 0s.
+// A leaked padding key prints NaN; an off-by-one length or position, a wrong KV-head mapping or a
+// stride slip changes a lane. The census pins the dispatch: one `wukong_attention_kv_batch_f32`
+// call site.
+
+fn qi(b: i64, i: i64, h: i64, c: i64) -> i64 {
+    return ((b * 2 + i) * 4 + h) * 4 + c;
+}
+
+fn main() -> i32 {
+    let nan: f32 = f32_from_bits(0x7fc00000);
+    let lens: [i32; 3] = [4, 1, 0];
+    let pos: [i32; 3] = [2, -1, 0];
+    let mut k: [f32; 96] = [0.0; 96];
+    let mut v: [f32; 96] = [0.0; 96];
+    for b in 0..3 {
+        for j in 0..4 {
+            for g in 0..2 {
+                for c in 0..4 {
+                    let at = ((b * 4 + j) * 2 + g) * 4 + c;
+                    if j < (lens[b] as i64) {
+                        k[at] = if c == j { 1.0 } else { 0.0 };
+                        v[at] = (1000 * b + 100 * g + 10 * j + c) as f32;
+                    } else {
+                        k[at] = nan;
+                        v[at] = nan;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut q: [f32; 96] = [0.0; 96];
+    // Sequence 0, row 0.
+    q[qi(0, 0, 0, 3)] = 200.0;
+    q[qi(0, 0, 0, 1)] = 100.0;
+    q[qi(0, 0, 1, 2)] = 200.0;
+    q[qi(0, 0, 2, 0)] = 200.0;
+    q[qi(0, 0, 3, 1)] = 200.0;
+    // Sequence 0, row 1 (heads 1 and 3 stay zero queries).
+    q[qi(0, 1, 0, 3)] = 200.0;
+    q[qi(0, 1, 2, 2)] = 200.0;
+    // Sequence 1: row 0 sees nothing; row 1 sees key 0 only.
+    for h in 0..4 {
+        q[qi(1, 0, h as i64, 0)] = 200.0;
+    }
+    q[qi(1, 1, 0, 3)] = 200.0;
+    q[qi(1, 1, 1, 0)] = 200.0;
+    // Sequence 2: an empty cache.
+    for x in 64..96 {
+        q[x] = 1.0;
+    }
+
+    let mut o: [f32; 96] = [-1.0; 96];
+    sdpa_kv_batch::<3, 2, 4, 4, 2, 4>(q, k, v, o, lens, pos, 1.0, true);
+    for e in 0..96 {
+        print(o[e]);
+    }
+    return 0;
+}

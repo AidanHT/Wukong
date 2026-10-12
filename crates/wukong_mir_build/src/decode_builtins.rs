@@ -1,5 +1,6 @@
-//! Lowering of the decode builtins `wukong_sema::decode_builtins` types: `sdpa_kv`, `kv_append`,
-//! `gemv_bf16` / `gemv_f16`, `quantize_q8_0` / `quantize_q4_0` and `gemv_q8_0` / `gemv_q4_0`.
+//! Lowering of the decode builtins `wukong_sema::decode_builtins` types: `sdpa_kv`,
+//! `sdpa_kv_batch`, `kv_append`, `gemv_bf16` / `gemv_f16`, `quantize_q8_0` / `quantize_q4_0` and
+//! `gemv_q8_0` / `gemv_q4_0`.
 //!
 //! **Calls.** Each builtin lowers to one `Op::Call` of its `wukong_runtime` entry. A buffer operand —
 //! a `[]T` slice, a `[T; N]` array or a contiguous `Tensor[T, …]` — becomes its data pointer and its
@@ -7,6 +8,16 @@
 //! own signedness, and the scale to `f32`; so every call site of one entry has the same MIR
 //! signature, which the textual-LLVM backend relies on. Inside a `@parallel` function the
 //! multicore twin is called (`sdpa_kv` and the GEMVs; each is bit-identical to its serial entry).
+//!
+//! **`sdpa_kv_batch`** is shape-checked by sema, which records its six dimensions `<B, SQ, SKV, H,
+//! HKV, D>` like a named kernel builtin's ([`wukong_sema::BuiltinCall`]); `builtins.rs` hands the
+//! recorded call to [`FnLowerer::lower_sdpa_kv_batch`], which passes each dimension as an `i64` (a
+//! constant, a turbofish variable or generic dimension read through its binding, or a derived
+//! extent evaluated from the bindings) after the six buffers. Like a `matmul` operand, a buffer
+//! whose length is not a type-level fact — a `[]T` slice, or an array under a runtime dimension —
+//! must hold exactly the elements its shape names, which the lowering asserts before the call (the
+//! runtime alone would accept a longer one and read it at the wrong per-sequence offsets); the
+//! runtime then checks every `kv_lens[b]` against `SKV`.
 //!
 //! **Shapes.** The runtime validates every extent against the operand lengths before it reads or
 //! writes anything and returns a status; the lowering asserts that status is `0`, so an
@@ -25,10 +36,13 @@
 //! their per-call activation quantization is part of their definition, so no plain loop means them.
 
 use wukong_ast::{self as ast, Block, Expr, ExprKind, ForIter, Pattern, StmtKind};
-use wukong_mir::{CmpOp, MirType, Op, ValueId};
-use wukong_sema::{decode_builtin, DecodeBuiltin, SemaResult};
+use wukong_mir::{BinOp, CmpOp, MirType, Op, ValueId};
+use wukong_sema::{
+    builtin_operand_dims, decode_builtin, BuiltinCall, BuiltinDim, DecodeBuiltin, KernelBuiltin,
+    SemaResult,
+};
 use wukong_span::{Interner, Span, Symbol};
-use wukong_types::Scalar;
+use wukong_types::{Scalar, Ty};
 
 use crate::alias::OperandPair;
 use crate::kernel_guard::GuardOperand;
@@ -37,12 +51,26 @@ use crate::{
     range_bounds, scalar_of, single_path, Dim, FnLowerer,
 };
 
+/// When an `sdpa_kv_batch` operand's length is known only at run time, by its sema type.
+#[derive(Clone, Copy)]
+enum RuntimeLen {
+    /// A `[]T` slice.
+    Always,
+    /// A `[T; N]` array: a type-level fact when every dimension of its shape is a constant (sema
+    /// checked it, `E0501`), a run-time one otherwise.
+    UnlessConst,
+    /// A `Tensor`: its shape was unified with the call's dimensions by sema.
+    Never,
+}
+
 /// The runtime entries this module lowers to, interned once at the top of `lower_program` and
 /// carried on `GemmSyms` (`FnLowerer` holds only a shared `&Interner`).
 #[derive(Clone, Copy)]
 pub(crate) struct DecodeSyms {
     attn_kv: Symbol,
     attn_kv_par: Symbol,
+    attn_kv_batch: Symbol,
+    attn_kv_batch_par: Symbol,
     kv_append: Symbol,
     sgemv_bf16: Symbol,
     sgemv_bf16_par: Symbol,
@@ -61,6 +89,8 @@ impl DecodeSyms {
         DecodeSyms {
             attn_kv: interner.intern("wukong_attention_kv_f32"),
             attn_kv_par: interner.intern("wukong_attention_kv_f32_parallel"),
+            attn_kv_batch: interner.intern("wukong_attention_kv_batch_f32"),
+            attn_kv_batch_par: interner.intern("wukong_attention_kv_batch_f32_parallel"),
             kv_append: interner.intern("wukong_kv_append_f32"),
             sgemv_bf16: interner.intern("wukong_sgemv_bf16"),
             sgemv_bf16_par: interner.intern("wukong_sgemv_bf16_parallel"),
@@ -87,6 +117,11 @@ impl FnLowerer<'_> {
         span: Span,
     ) -> Option<ValueId> {
         let b = decode_builtin(self.interner.resolve(name))?;
+        if b == DecodeBuiltin::SdpaKvBatch {
+            // Lowered from sema's shape record (`lower_kernel_builtin`); a call without one never
+            // type-checked.
+            return None;
+        }
         let s = self.gemm.decode;
         let par = self.parallel_fn;
         let pick = |serial: Symbol, parallel: Symbol| if par { parallel } else { serial };
@@ -153,9 +188,14 @@ impl FnLowerer<'_> {
                 };
                 self.ml_call(func, vec![x.data, x.len, q.data, q.len, k])
             }
+            DecodeBuiltin::SdpaKvBatch => return None,
         };
-        // The entry ran iff it returned 0; a refused shape stops the program like a failed
-        // `assert`.
+        Some(self.assert_decode_status(status, span))
+    }
+
+    /// The entry ran iff it returned 0; a refused shape stops the program like a failed `assert`.
+    /// Returns the call's unit value.
+    fn assert_decode_status(&mut self, status: ValueId, span: Span) -> ValueId {
         let zero = self.ml_i64_const(0);
         let ok = self
             .builder
@@ -166,7 +206,120 @@ impl FnLowerer<'_> {
                 "a decode builtin in a program that defines its own `assert`",
             );
         }
-        Some(self.const_zero(MirType::I32))
+        self.const_zero(MirType::I32)
+    }
+
+    /// `sdpa_kv_batch(q, k, v, out, kv_lens, q_pos, scale, causal)` from sema's record `call`:
+    /// `wukong_attention_kv_batch_f32[_parallel](q, nq, k, nk, v, nv, out, nout, kv_lens, nl, q_pos,
+    /// np, B, SQ, SKV, H, HKV, D, scale, causal) -> i64`, preceded by the exact-length assert of
+    /// every operand whose length is only known at run time, its status asserted zero. Every operand
+    /// is lowered once, in source order, before the dimensions are read.
+    pub(crate) fn lower_sdpa_kv_batch(
+        &mut self,
+        e: &Expr,
+        args: &[Expr],
+        call: &BuiltinCall,
+    ) -> ValueId {
+        if args.len() != 8 || call.dims.len() != 6 {
+            self.unsupported(e.span, "an `sdpa_kv_batch` call sema did not resolve");
+            return self.const_zero(MirType::I32);
+        }
+        let mut bufs = Vec::with_capacity(6);
+        let mut kinds = Vec::with_capacity(6);
+        for a in &args[..6] {
+            kinds.push(match self.expr_ty(a) {
+                Ty::Slice(_) => RuntimeLen::Always,
+                Ty::Array { .. } => RuntimeLen::UnlessConst,
+                _ => RuntimeLen::Never,
+            });
+            let Some(b) = self.ml_buffer(a) else {
+                self.unsupported(a.span, "an `sdpa_kv_batch` operand that is not a buffer");
+                return self.const_zero(MirType::I32);
+            };
+            bufs.push(b);
+        }
+        let scale = self.ml_f32_arg(&args[6]);
+        let causal = self.ml_i64_arg(&args[7]);
+        let mut dims = Vec::with_capacity(6);
+        for d in &call.dims {
+            let v = match d {
+                BuiltinDim::Const(n) => i64::try_from(*n).ok().map(|n| self.ml_i64_const(n)),
+                &BuiltinDim::Named { name, signed } => self.lookup(name).map(|(slot, ty)| {
+                    let v = self.builder.build(ty.clone(), Op::Load(slot, ty.clone()));
+                    self.coerce_to(v, &ty, &MirType::I64, signed)
+                }),
+                BuiltinDim::Derived(dim) => self.tensor_dim_value(dim),
+                BuiltinDim::SliceLen { .. } => None,
+            };
+            let Some(v) = v else {
+                self.unsupported(
+                    e.span,
+                    "an `sdpa_kv_batch` dimension with no binding in scope or outside the \
+                     kernel's signed 64-bit ABI",
+                );
+                return self.const_zero(MirType::I32);
+            };
+            dims.push(v);
+        }
+        // The exact-length check `lower_kernel_builtin` makes for a `matmul` operand: an operand
+        // whose length is not a type-level fact must hold exactly the elements its shape names. (A
+        // tensor's shape was unified with the call, and a fully static array checked against it,
+        // by sema.) The runtime alone refuses only a SHORT operand, and the packed layout has no
+        // stride to absorb slack: a cache sized for another capacity would be read at the wrong
+        // per-sequence offsets. The counts are `i64` products; one that wraps can only pass for an
+        // operand the runtime's exact `i128` extent test then refuses as short (or, in a call with
+        // nothing to compute, never touches).
+        let operand_dims = builtin_operand_dims(KernelBuiltin::SdpaKvBatch);
+        let mut checks = Vec::new();
+        for (i, (buf, kind)) in bufs.iter().zip(&kinds).enumerate() {
+            let Some(Some(od)) = operand_dims.get(i) else {
+                continue;
+            };
+            let const_shape = od
+                .iter()
+                .all(|&d| matches!(call.dims.get(d), Some(BuiltinDim::Const(_))));
+            let runtime_len = match kind {
+                RuntimeLen::Always => true,
+                RuntimeLen::UnlessConst => !const_shape,
+                RuntimeLen::Never => false,
+            };
+            if !runtime_len {
+                continue;
+            }
+            let mut count = self.ml_i64_const(1);
+            for &d in od.iter() {
+                count = self
+                    .builder
+                    .build(MirType::I64, Op::Bin(BinOp::Mul, count, dims[d]));
+            }
+            checks.push(
+                self.builder
+                    .build(MirType::I1, Op::Cmp(CmpOp::Eq, buf.len, count)),
+            );
+        }
+        if !self.emit_builtin_checks(checks) {
+            self.unsupported(
+                e.span,
+                "a decode builtin in a program that defines its own `assert`",
+            );
+            return self.const_zero(MirType::I32);
+        }
+        let s = self.gemm.decode;
+        let func = if self.parallel_fn {
+            s.attn_kv_batch_par
+        } else {
+            s.attn_kv_batch
+        };
+        let mut callargs = Vec::with_capacity(20);
+        for b in &bufs {
+            callargs.push(b.data);
+            callargs.push(b.len);
+        }
+        callargs.extend(dims);
+        callargs.push(scale);
+        callargs.push(causal);
+        let status = self.ml_call(func, callargs);
+        self.assert_decode_status(status, e.span)
     }
 
     /// `func(w, len(w), x, len(x), y, len(y)) -> i64` — the checked GEMV ABI shared by the half and
@@ -440,6 +593,52 @@ mod tests {
         // One status check per call.
         assert_eq!(text.matches("call assert(").count(), 9, "{text}");
         assert!(!text.contains("_parallel("), "{text}");
+    }
+
+    /// `sdpa_kv_batch` lowers from sema's shape record: one checked call per site whose six
+    /// dimensions follow the buffers — constants, a generic dimension read through its hidden
+    /// parameter — and the multicore twin inside `@parallel`.
+    #[test]
+    fn sdpa_kv_batch_is_one_checked_call_with_its_recorded_dimensions() {
+        let (text, diags) = mir(
+            "fn decode_one<B, S>(q: Tensor[f32, B, 1, 4, 8], k: Tensor[f32, B, S, 2, 8],              v: Tensor[f32, B, S, 2, 8], mut o: Tensor[f32, B, 1, 4, 8], l: Tensor[i32, B],              p: Tensor[i32, B]) { sdpa_kv_batch(q, k, v, o, l, p, 0.35355339, true); }              fn flat(q: [f32; 64], k: [f32; 512], v: [f32; 512], mut o: [f32; 64],              l: [i32; 2], p: [i32; 2]) {              sdpa_kv_batch::<2, 1, 16, 4, 2, 8>(q, k, v, o, l, p, 0.5, 0); }              @parallel fn par(q: [f32; 64], k: [f32; 512], v: [f32; 512], mut o: [f32; 64],              l: [i32; 2], p: [i32; 2]) {              sdpa_kv_batch::<2, 1, 16, 4, 2, 8>(q, k, v, o, l, p, 0.5, 0); }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(
+            text.matches("call wukong_attention_kv_batch_f32(").count(),
+            2,
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("call wukong_attention_kv_batch_f32_parallel(")
+                .count(),
+            1,
+            "{text}"
+        );
+        // One status check per call and no length check: a tensor's shape was unified with the
+        // call and a fully static array checked against it by sema.
+        assert_eq!(text.matches("call assert(").count(), 3, "{text}");
+    }
+
+    /// An operand whose length is only known at run time — a `[]T` slice, or an array under a
+    /// runtime dimension — must hold exactly its shape's elements, as a `matmul` operand must: one
+    /// exact-length assert each, ahead of the status check. (The runtime only refuses a SHORT
+    /// operand, so a cache sized for another capacity would be read at the wrong per-sequence
+    /// offsets.)
+    #[test]
+    fn sdpa_kv_batch_checks_every_runtime_length_operand_exactly() {
+        let (text, diags) = mir(
+            "fn sl(q: []f32, k: []f32, v: []f32, mut o: []f32, l: []i32, p: []i32, cap: i64) { \
+             sdpa_kv_batch::<2, 1, cap, 4, 2, 8>(q, k, v, o, l, p, 0.35, true); } \
+             fn arr(q: [f32; 64], k: [f32; 512], v: [f32; 512], mut o: [f32; 64], \
+             l: [i32; 2], p: [i32; 2], cap: i64) { \
+             sdpa_kv_batch::<2, 1, cap, 4, 2, 8>(q, k, v, o, l, p, 0.35, true); }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        // `sl`: six slices + the status; `arr`: the caches `k`, `v` (under the runtime `cap`) + the
+        // status — `q`, `out`, `kv_lens`, `q_pos` have constant shapes sema checked.
+        assert_eq!(text.matches("call assert(").count(), 7 + 3, "{text}");
+        assert_eq!(text.matches("cmp.eq ").count(), 10, "{text}");
     }
 
     #[test]
