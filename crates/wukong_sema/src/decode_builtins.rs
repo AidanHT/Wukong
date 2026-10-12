@@ -24,8 +24,9 @@
 //! `Tensor[T, ..]` operand unified axis by axis (a conflict is `E0502`, a rank other than the
 //! parameter's `E0501`), and the length of a fixed array operand, which fixes the one dimension of its
 //! shape still free (not a whole number of rows: `E0501`). A dimension none of those fixes is `E0409`
-//! — a `[]T` slice's length fixes nothing here, it is only checked at run time. A fully static array
-//! must hold exactly its shape's elements (`E0501`), and constant head counts must group (`H` a
+//! — a `[]T` slice's length fixes nothing here. A fully static array must hold exactly its shape's
+//! elements (`E0501`); a slice, or an array under a runtime dimension, must too, which `mir_build`
+//! asserts at run time like a `matmul` operand's length. Constant head counts must group (`H` a
 //! multiple of `HKV`, else `E0502`). The resolution is recorded in `builtin_calls` as
 //! [`crate::KernelBuiltin::SdpaKvBatch`], so `mir_build` lowers the call from the dimensions decided
 //! here (and a copied or deferred call keeps them). The per-sequence `kv_lens` values are data: the
@@ -390,7 +391,7 @@ impl Sema<'_> {
                 .iter()
                 .all(|&d| matches!(state[d], Some(Dim::Const(_))));
             if !all_const {
-                // A runtime dimension: the runtime checks the length.
+                // A runtime dimension: `mir_build` asserts the exact length at run time.
                 continue;
             }
             let mut need: Option<u64> = Some(1);

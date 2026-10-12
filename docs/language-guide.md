@@ -1767,11 +1767,15 @@ array or a contiguous `Tensor[T, …]`. Each returns `()`.
   (which fixes the one dimension of its shape still free); disagreeing operands are `E0502` (a wrong
   rank `E0501`), an array that does not hold its shape exactly `E0501`, constant head counts that do
   not group (`H` not a multiple of `HKV`) `E0502`, and a dimension nothing fixes `E0409` (a slice's
-  length fixes none). The `i32` vector `kv_lens[b]` (`0 ..= SKV`, checked at run time) is how many
-  leading cache rows of sequence `b` hold real keys, and `q_pos[b]` is the position of its first
-  query row: row `i` sees keys `j < kv_lens[b]` and, with `causal`, `j <= q_pos[b] + i`. A decode
-  step is `q_pos[b] = kv_lens[b] - 1`; FlashAttention's bottom-right mask is `kv_lens[b] - SQ`; a
-  right-padded prompt is `0`; a negative position is allowed (those rows see nothing yet).
+  length fixes none). As for `matmul`, an operand whose length is only known at run time (a slice,
+  or an array against a runtime dimension) must hold *exactly* its shape's elements, or the call
+  traps like a failed `assert`: a cache allocated for a larger capacity than the `SKV` passed is
+  refused, not read at the wrong per-sequence offsets (`tests/run/decode_kv_batch_trap.wk`). The
+  `i32` vector `kv_lens[b]` (`0 ..= SKV`, checked at run time) is how many leading cache rows of
+  sequence `b` hold real keys, and `q_pos[b]` is the position of its first query row: row `i` sees
+  keys `j < kv_lens[b]` and, with `causal`, `j <= q_pos[b] + i`. A decode step is `q_pos[b] =
+  kv_lens[b] - 1`; FlashAttention's bottom-right mask is `kv_lens[b] - SQ`; a right-padded prompt is
+  `0`; a negative position is allowed (those rows see nothing yet).
   **Masked keys contribute exactly zero probability** — they are never read, so the padding may hold
   anything, NaN included — and each row is bit-for-bit the row `sdpa_kv` computes over that
   sequence alone. **A fully masked row** (an empty sequence, or a causal row before position 0) is

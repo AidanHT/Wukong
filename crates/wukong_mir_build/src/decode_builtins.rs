@@ -13,8 +13,11 @@
 //! HKV, D>` like a named kernel builtin's ([`wukong_sema::BuiltinCall`]); `builtins.rs` hands the
 //! recorded call to [`FnLowerer::lower_sdpa_kv_batch`], which passes each dimension as an `i64` (a
 //! constant, a turbofish variable or generic dimension read through its binding, or a derived
-//! extent evaluated from the bindings) after the six buffers. Its runtime checks the operand
-//! lengths against those dimensions and every `kv_lens[b]` against `SKV`.
+//! extent evaluated from the bindings) after the six buffers. Like a `matmul` operand, a buffer
+//! whose length is not a type-level fact — a `[]T` slice, or an array under a runtime dimension —
+//! must hold exactly the elements its shape names, which the lowering asserts before the call (the
+//! runtime alone would accept a longer one and read it at the wrong per-sequence offsets); the
+//! runtime then checks every `kv_lens[b]` against `SKV`.
 //!
 //! **Shapes.** The runtime validates every extent against the operand lengths before it reads or
 //! writes anything and returns a status; the lowering asserts that status is `0`, so an
@@ -33,10 +36,13 @@
 //! their per-call activation quantization is part of their definition, so no plain loop means them.
 
 use wukong_ast::{self as ast, Block, Expr, ExprKind, ForIter, Pattern, StmtKind};
-use wukong_mir::{CmpOp, MirType, Op, ValueId};
-use wukong_sema::{decode_builtin, BuiltinCall, BuiltinDim, DecodeBuiltin, SemaResult};
+use wukong_mir::{BinOp, CmpOp, MirType, Op, ValueId};
+use wukong_sema::{
+    builtin_operand_dims, decode_builtin, BuiltinCall, BuiltinDim, DecodeBuiltin, KernelBuiltin,
+    SemaResult,
+};
 use wukong_span::{Interner, Span, Symbol};
-use wukong_types::Scalar;
+use wukong_types::{Scalar, Ty};
 
 use crate::alias::OperandPair;
 use crate::kernel_guard::GuardOperand;
@@ -44,6 +50,18 @@ use crate::{
     as_dim, as_index1, as_int_lit, fusable_for, is_f32_expr, is_float_zero, match_row_col,
     range_bounds, scalar_of, single_path, Dim, FnLowerer,
 };
+
+/// When an `sdpa_kv_batch` operand's length is known only at run time, by its sema type.
+#[derive(Clone, Copy)]
+enum RuntimeLen {
+    /// A `[]T` slice.
+    Always,
+    /// A `[T; N]` array: a type-level fact when every dimension of its shape is a constant (sema
+    /// checked it, `E0501`), a run-time one otherwise.
+    UnlessConst,
+    /// A `Tensor`: its shape was unified with the call's dimensions by sema.
+    Never,
+}
 
 /// The runtime entries this module lowers to, interned once at the top of `lower_program` and
 /// carried on `GemmSyms` (`FnLowerer` holds only a shared `&Interner`).
@@ -193,8 +211,9 @@ impl FnLowerer<'_> {
 
     /// `sdpa_kv_batch(q, k, v, out, kv_lens, q_pos, scale, causal)` from sema's record `call`:
     /// `wukong_attention_kv_batch_f32[_parallel](q, nq, k, nk, v, nv, out, nout, kv_lens, nl, q_pos,
-    /// np, B, SQ, SKV, H, HKV, D, scale, causal) -> i64`, its status asserted zero. Every operand is
-    /// lowered once, in source order, before the dimensions are read.
+    /// np, B, SQ, SKV, H, HKV, D, scale, causal) -> i64`, preceded by the exact-length assert of
+    /// every operand whose length is only known at run time, its status asserted zero. Every operand
+    /// is lowered once, in source order, before the dimensions are read.
     pub(crate) fn lower_sdpa_kv_batch(
         &mut self,
         e: &Expr,
@@ -206,7 +225,13 @@ impl FnLowerer<'_> {
             return self.const_zero(MirType::I32);
         }
         let mut bufs = Vec::with_capacity(6);
+        let mut kinds = Vec::with_capacity(6);
         for a in &args[..6] {
+            kinds.push(match self.expr_ty(a) {
+                Ty::Slice(_) => RuntimeLen::Always,
+                Ty::Array { .. } => RuntimeLen::UnlessConst,
+                _ => RuntimeLen::Never,
+            });
             let Some(b) = self.ml_buffer(a) else {
                 self.unsupported(a.span, "an `sdpa_kv_batch` operand that is not a buffer");
                 return self.const_zero(MirType::I32);
@@ -235,6 +260,49 @@ impl FnLowerer<'_> {
                 return self.const_zero(MirType::I32);
             };
             dims.push(v);
+        }
+        // The exact-length check `lower_kernel_builtin` makes for a `matmul` operand: an operand
+        // whose length is not a type-level fact must hold exactly the elements its shape names. (A
+        // tensor's shape was unified with the call, and a fully static array checked against it,
+        // by sema.) The runtime alone refuses only a SHORT operand, and the packed layout has no
+        // stride to absorb slack: a cache sized for another capacity would be read at the wrong
+        // per-sequence offsets. The counts are `i64` products; one that wraps can only pass for an
+        // operand the runtime's exact `i128` extent test then refuses as short (or, in a call with
+        // nothing to compute, never touches).
+        let operand_dims = builtin_operand_dims(KernelBuiltin::SdpaKvBatch);
+        let mut checks = Vec::new();
+        for (i, (buf, kind)) in bufs.iter().zip(&kinds).enumerate() {
+            let Some(Some(od)) = operand_dims.get(i) else {
+                continue;
+            };
+            let const_shape = od
+                .iter()
+                .all(|&d| matches!(call.dims.get(d), Some(BuiltinDim::Const(_))));
+            let runtime_len = match kind {
+                RuntimeLen::Always => true,
+                RuntimeLen::UnlessConst => !const_shape,
+                RuntimeLen::Never => false,
+            };
+            if !runtime_len {
+                continue;
+            }
+            let mut count = self.ml_i64_const(1);
+            for &d in od.iter() {
+                count = self
+                    .builder
+                    .build(MirType::I64, Op::Bin(BinOp::Mul, count, dims[d]));
+            }
+            checks.push(
+                self.builder
+                    .build(MirType::I1, Op::Cmp(CmpOp::Eq, buf.len, count)),
+            );
+        }
+        if !self.emit_builtin_checks(checks) {
+            self.unsupported(
+                e.span,
+                "a decode builtin in a program that defines its own `assert`",
+            );
+            return self.const_zero(MirType::I32);
         }
         let s = self.gemm.decode;
         let func = if self.parallel_fn {
@@ -547,8 +615,30 @@ mod tests {
             1,
             "{text}"
         );
-        // One status check per call, and no other extent check: the runtime validates the shapes.
+        // One status check per call and no length check: a tensor's shape was unified with the
+        // call and a fully static array checked against it by sema.
         assert_eq!(text.matches("call assert(").count(), 3, "{text}");
+    }
+
+    /// An operand whose length is only known at run time — a `[]T` slice, or an array under a
+    /// runtime dimension — must hold exactly its shape's elements, as a `matmul` operand must: one
+    /// exact-length assert each, ahead of the status check. (The runtime only refuses a SHORT
+    /// operand, so a cache sized for another capacity would be read at the wrong per-sequence
+    /// offsets.)
+    #[test]
+    fn sdpa_kv_batch_checks_every_runtime_length_operand_exactly() {
+        let (text, diags) = mir(
+            "fn sl(q: []f32, k: []f32, v: []f32, mut o: []f32, l: []i32, p: []i32, cap: i64) { \
+             sdpa_kv_batch::<2, 1, cap, 4, 2, 8>(q, k, v, o, l, p, 0.35, true); } \
+             fn arr(q: [f32; 64], k: [f32; 512], v: [f32; 512], mut o: [f32; 64], \
+             l: [i32; 2], p: [i32; 2], cap: i64) { \
+             sdpa_kv_batch::<2, 1, cap, 4, 2, 8>(q, k, v, o, l, p, 0.35, true); }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        // `sl`: six slices + the status; `arr`: the caches `k`, `v` (under the runtime `cap`) + the
+        // status — `q`, `out`, `kv_lens`, `q_pos` have constant shapes sema checked.
+        assert_eq!(text.matches("call assert(").count(), 7 + 3, "{text}");
+        assert_eq!(text.matches("cmp.eq ").count(), 10, "{text}");
     }
 
     #[test]

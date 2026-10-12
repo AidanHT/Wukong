@@ -22,10 +22,15 @@ All notable changes to Wukong are documented here. The format is loosely based o
   turbofish (literals, `const`s, generic dimensions, integer variables), the shapes of `Tensor`
   operands and the lengths of fixed arrays; disagreeing operands are `E0502`, a wrong rank or an
   array that does not hold its shape `E0501`, head counts that do not group `E0502`, an unfixed
-  dimension `E0409` — no new codes. A shape-generic `fn f<B, S>(q: Tensor[f32, B, 1, 8, 4], ..)`
-  calls it with runtime sizes, and a `@parallel` function calls the multicore twin
-  (`tests/run/decode_kv_batch_gqa.wk`, `tests/fail/sdpa_kv_batch_head_dim.wk`). The resolution is
-  recorded in `builtin_calls` (`KernelBuiltin::SdpaKvBatch`), so deferred and copied calls keep it.
+  dimension `E0409` — no new codes. As for `matmul`, an operand whose length is only known at run
+  time (a slice, or an array under a runtime dimension) must hold exactly its shape's elements, or
+  the call traps like a failed `assert` — the runtime alone refuses only a short operand, and would
+  read a cache allocated for a larger capacity than the `SKV` passed at the wrong per-sequence
+  offsets (`tests/run/decode_kv_batch_trap.wk`). A shape-generic
+  `fn f<B, S>(q: Tensor[f32, B, 1, 8, 4], ..)` calls it with runtime sizes, and a `@parallel`
+  function calls the multicore twin (`tests/run/decode_kv_batch_gqa.wk`,
+  `tests/fail/sdpa_kv_batch_head_dim.wk`). The resolution is recorded in `builtin_calls`
+  (`KernelBuiltin::SdpaKvBatch`), so deferred and copied calls keep it.
 - **GQA-group blocking in both attention kernels.** The AVX2 path processes up to eight query heads
   sharing a KV head together: each key row is loaded once and dotted into a register tile of
   `keys x heads` accumulators, each value row loaded once and accumulated for every head, so a GQA

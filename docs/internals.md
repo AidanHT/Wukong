@@ -272,8 +272,11 @@ zero; the interpreter runs the same validation and calls the same serial entry. 
 `sdpa_kv_batch` is the exception that has a shape signature: sema resolves its `<B, SQ, SKV, H, HKV,
 D>` like a kernel builtin's and records it in `builtin_calls` as `KernelBuiltin::SdpaKvBatch` (so a
 deferred or copied call keeps it), `mir_build::builtins` hands the record to `decode_builtins`, and the
-call passes the six dimensions after its six `(buffer, length)` pairs; the runtime still checks the
-lengths and every `kv_lens[b]`. Both attention entries share one driver whose unit of work is
+call passes the six dimensions after its six `(buffer, length)` pairs. As for a `matmul` operand, the
+lowering asserts that every operand whose length is not a type-level fact (a slice, or an array under
+a runtime dimension) holds exactly its shape's elements — the runtime alone refuses only a short
+operand, and the packed layout has no stride to absorb a longer one — and the runtime checks every
+`kv_lens[b]`. Both attention entries share one driver whose unit of work is
 (sequence, query row, KV head, block of up to 8 of its query heads): the AVX2 pass loads each key and
 value row once per block (register tiles of at most eight accumulators), and every (row, head) keeps
 the exact per-head operation order, so it is bit-identical to the portable per-head twin.
