@@ -20,17 +20,63 @@ use wukong_span::{SourceId, Span};
 /// Tokenize an entire source file. Returns the tokens (always ending in [`TokenKind::Eof`])
 /// and any diagnostics produced during scanning.
 pub fn tokenize(src: &str, source: SourceId) -> (Vec<Token>, Vec<Diagnostic>) {
-    let mut lx = Lexer::new(src, source);
-    let mut tokens = Vec::new();
-    loop {
-        let t = lx.next_token();
-        let eof = t.kind == TokenKind::Eof;
-        tokens.push(t);
-        if eof {
-            break;
-        }
-    }
+    let mut lx = Lexer::new(src, source, None);
+    let tokens = lx.run();
     (tokens, lx.diags)
+}
+
+/// [`tokenize`], plus every comment the scan skipped, in source order: the side channel a
+/// formatter (or doc tooling) needs, since the token stream itself carries no trivia. The tokens
+/// and diagnostics are exactly the ones [`tokenize`] returns for the same input; collecting the
+/// comments is the only difference, and [`tokenize`] does not pay for it.
+pub fn tokenize_with_comments(
+    src: &str,
+    source: SourceId,
+) -> (Vec<Token>, Vec<Comment>, Vec<Diagnostic>) {
+    let mut lx = Lexer::new(src, source, Some(Vec::new()));
+    let tokens = lx.run();
+    let comments = lx.comments.take().unwrap_or_default();
+    (tokens, comments, lx.diags)
+}
+
+/// Which spelling a [`Comment`] used.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CommentKind {
+    /// `// …` to the end of the line (including the doc forms `///` and `//!`).
+    Line,
+    /// `/* … */`, which nests: `/* a /* b */ c */` is one comment.
+    Block,
+}
+
+/// One comment, as [`tokenize_with_comments`] found it.
+///
+/// A [`CommentKind::Line`] span runs from its `//` up to, but not including, the `\n` that ends
+/// the line (a `\r` before that `\n` is inside the span; [`Comment::text`] drops it). A
+/// [`CommentKind::Block`] span runs from its `/*` through the `*/` that closes it, counting
+/// nesting; an unterminated block comment (E0103) runs to the end of the file.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Comment {
+    pub kind: CommentKind,
+    pub span: Span,
+}
+
+impl Comment {
+    /// The comment's text in `src` (the source it was lexed from), minus one trailing `\r`: the
+    /// CR of a CRLF line ending is not part of a line comment's text.
+    pub fn text<'s>(&self, src: &'s str) -> &'s str {
+        let t = &src[self.span.lo as usize..self.span.hi as usize];
+        t.strip_suffix('\r').unwrap_or(t)
+    }
+
+    /// Whether this is a doc comment: `///` (outer) or `//!` (inner). `////…` is an ordinary
+    /// comment, as in Rust.
+    pub fn is_doc(&self, src: &str) -> bool {
+        if self.kind != CommentKind::Line {
+            return false;
+        }
+        let t = self.text(src);
+        t.starts_with("//!") || (t.starts_with("///") && !t.starts_with("////"))
+    }
 }
 
 /// Render a token stream as one `Kind "text"` line per token. Used by `--emit=tokens` and
@@ -50,10 +96,13 @@ struct Lexer<'a> {
     pos: usize,
     source: SourceId,
     diags: Vec<Diagnostic>,
+    /// `Some` only for [`tokenize_with_comments`]: every comment [`Lexer::skip_trivia`] skips is
+    /// recorded here. `None` (plain [`tokenize`]) records nothing.
+    comments: Option<Vec<Comment>>,
 }
 
 impl<'a> Lexer<'a> {
-    fn new(src: &'a str, source: SourceId) -> Lexer<'a> {
+    fn new(src: &'a str, source: SourceId, comments: Option<Vec<Comment>>) -> Lexer<'a> {
         Lexer {
             src,
             bytes: src.as_bytes(),
@@ -66,6 +115,32 @@ impl<'a> Lexer<'a> {
             },
             source,
             diags: Vec::new(),
+            comments,
+        }
+    }
+
+    /// Scan the whole input: every token, ending in [`TokenKind::Eof`].
+    fn run(&mut self) -> Vec<Token> {
+        let mut tokens = Vec::new();
+        loop {
+            let t = self.next_token();
+            let eof = t.kind == TokenKind::Eof;
+            tokens.push(t);
+            if eof {
+                break;
+            }
+        }
+        tokens
+    }
+
+    /// Record a skipped comment that began at `start` and ends at the cursor, when comments are
+    /// being collected.
+    fn note_comment(&mut self, kind: CommentKind, start: usize) {
+        if self.comments.is_some() {
+            let span = self.span(start);
+            if let Some(cs) = self.comments.as_mut() {
+                cs.push(Comment { kind, span });
+            }
         }
     }
 
@@ -196,12 +271,14 @@ impl<'a> Lexer<'a> {
             match self.peek_at(0) {
                 Some(b' ' | b'\t' | b'\r' | b'\n') => self.bump(),
                 Some(b'/') if self.peek_at(1) == Some(b'/') => {
+                    let start = self.pos;
                     while let Some(c) = self.peek_at(0) {
                         if c == b'\n' {
                             break;
                         }
                         self.bump();
                     }
+                    self.note_comment(CommentKind::Line, start);
                 }
                 Some(b'/') if self.peek_at(1) == Some(b'*') => {
                     let start = self.pos;
@@ -228,6 +305,7 @@ impl<'a> Lexer<'a> {
                             }
                         }
                     }
+                    self.note_comment(CommentKind::Block, start);
                 }
                 _ => break,
             }
@@ -641,6 +719,80 @@ mod tests {
             kinds("a // line comment\n b /* block /* nested */ */ c"),
             vec![Ident, Ident, Ident]
         );
+    }
+
+    /// `tokenize_with_comments` is `tokenize` plus a side channel: on input that mixes comments
+    /// with every lexer-error path (an unterminated block comment E0103, a stray character, an
+    /// unterminated string), CRLF line endings and a BOM, its tokens and diagnostics are exactly
+    /// `tokenize`'s.
+    #[test]
+    fn tokenize_with_comments_matches_tokenize() {
+        let inputs = [
+            "fn f() { // c\n  let x = 1; /* b */ }\n",
+            "\u{FEFF}fn f() -> i32 {\r\n    return 1; // crlf\r\n}\r\n",
+            "a # b // tail\n\"open\n/* never /* closed */",
+            "/// doc\n//! inner\nfn g() {}\n",
+            "",
+        ];
+        for src in inputs {
+            let (t1, d1) = tokenize(src, SourceId(3));
+            let (t2, _c, d2) = tokenize_with_comments(src, SourceId(3));
+            assert_eq!(t1, t2, "tokens differ for {src:?}");
+            let codes = |d: &[Diagnostic]| {
+                d.iter()
+                    .map(|x| (x.code, x.message.clone(), x.primary_span()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(codes(&d1), codes(&d2), "diagnostics differ for {src:?}");
+        }
+        let (_, _, d) = tokenize_with_comments("x /* a /* b */", SourceId(0));
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].code, Some("E0103"));
+    }
+
+    /// Spans and kinds: a line comment stops before its `\n` (keeping a CR, which `text` drops), a
+    /// nested block comment is one comment through its outer `*/`, doc comments are flagged, and a
+    /// comment trailing code on the same line is found too.
+    #[test]
+    fn comment_spans_and_kinds() {
+        let src = "/// doc\nlet x = 1; // trail\r\n/* a /* nested */ b */ //! inner\n//// not doc";
+        let (toks, cs, d) = tokenize_with_comments(src, SourceId(0));
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(
+            toks.iter().map(|t| t.kind).collect::<Vec<_>>(),
+            vec![
+                TokenKind::Let,
+                TokenKind::Ident,
+                TokenKind::Eq,
+                TokenKind::Int,
+                TokenKind::Semi,
+                TokenKind::Eof
+            ]
+        );
+        let got: Vec<(CommentKind, &str, bool)> = cs
+            .iter()
+            .map(|c| (c.kind, c.text(src), c.is_doc(src)))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (CommentKind::Line, "/// doc", true),
+                (CommentKind::Line, "// trail", false),
+                (CommentKind::Block, "/* a /* nested */ b */", false),
+                (CommentKind::Line, "//! inner", true),
+                (CommentKind::Line, "//// not doc", false),
+            ]
+        );
+        // The raw span keeps the CR; only `text` strips it.
+        let trail = cs[1].span;
+        assert_eq!(&src[trail.lo as usize..trail.hi as usize], "// trail\r");
+        assert_eq!(cs[0].span.lo, 0);
+        assert_eq!(cs[0].span.hi, 7);
+        // Spans are in source order.
+        assert!(cs.windows(2).all(|w| w[0].span.hi <= w[1].span.lo));
+        // An unterminated block comment runs to end of file.
+        let (_, cs, _) = tokenize_with_comments("a /* open", SourceId(0));
+        assert_eq!((cs[0].span.lo, cs[0].span.hi), (2, 9));
     }
 
     #[test]

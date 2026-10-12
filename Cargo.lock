@@ -983,6 +983,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wukong_fmt"
+version = "0.1.0"
+dependencies = [
+ "wukong_ast",
+ "wukong_diag",
+ "wukong_lexer",
+ "wukong_parser",
+ "wukong_span",
+]
+
+[[package]]
 name = "wukong_interp"
 version = "0.1.0"
 dependencies = [
@@ -1098,8 +1109,11 @@ dependencies = [
 name = "wukongc"
 version = "0.1.0"
 dependencies = [
+ "wukong_diag",
  "wukong_driver",
+ "wukong_fmt",
  "wukong_mir",
+ "wukong_span",
 ]
 
 [[package]]

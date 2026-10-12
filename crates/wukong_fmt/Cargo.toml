@@ -1,0 +1,20 @@
+[package]
+name = "wukong_fmt"
+description = "The Wukong source formatter (`wukongc fmt`): an AST pretty-printer that keeps comments and refuses rather than change a program's meaning."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+# Opt in to the workspace lint policy (`-D warnings`; see the workspace `Cargo.toml`), so a warning
+# here fails a plain local `cargo build` / `cargo clippy`, not only CI's `RUSTFLAGS`.
+[lints]
+workspace = true
+
+[dependencies]
+wukong_span = { workspace = true }
+wukong_diag = { workspace = true }
+wukong_lexer = { workspace = true }
+wukong_ast = { workspace = true }
+wukong_parser = { workspace = true }

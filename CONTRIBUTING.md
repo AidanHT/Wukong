@@ -277,6 +277,16 @@ Prefer to land it end to end: parse → type/shape-check → lower → run via t
   LLVM emitter declares it with its real signature.
 - **A program whose point is that it is rejected goes in `tests/fail`**, with
   `// EXPECT-CODE: <code>` on line 1 — not in `tests/run`.
+- **Run `cargo run -q -p wukongc -- fmt --check <your new .wk files>`** and format them with
+  `wukongc fmt` (it rewrites only files that change, and refuses rather than change a program's
+  meaning). The existing corpus is *not* reformatted yet, so check the files you add, not whole
+  directories.
+- **New syntax must be printable by `wukong_fmt` in the same commit.** Its printer matches every AST
+  enum exhaustively (a new variant fails its build), and `cargo test -p wukong_fmt` formats the whole
+  corpus with zero refusals — a fixture that uses syntax the printer cannot reprint fails it. If the
+  parser desugars the new form, teach `crates/wukong_fmt/src/printer.rs` to recognize the desugared
+  shape and print the surface form; the self-check refuses anything else (see `docs/internals.md`,
+  Formatter).
 
 `examples/` is a gated corpus, not a scratch directory. `crates/wukongc/tests/examples.rs` runs
 every example through the real binary and requires the interpreter and the Cranelift backend to
