@@ -887,9 +887,14 @@ stores of one lane type (`f32`, `f64`, `i32`, `i64`), `fadd`/`fsub`/`fmul`/`fdiv
 `add`/`sub`/`mul` on an integer lane), `fma`, `sqrt`, `neg`, a compare whose only reader is a blend
 (`Folt..Foge`/`Foeq` ordered, `Fone` unordered — Rust's `!=` — or the signed integer compares), a
 `select`, an if-converted masked store or merge, and invariants splatted from a scalar table.
-Anything else — a reduction (the recipe would reassociate a float sum), a cast, a gather or scatter,
-a shift or bitwise op, the counter read as a value, a countdown, a search loop, an interleave group,
-an unsigned compare, an `i64` multiply — keeps the 128-bit loop. One rule is added: every object the
+One reduction is taken as well: an **integer sum** (`s = s + e(i)` over `i32`/`i64`, nothing
+stored) becomes a reduction recipe whose wrapping result `kc` adds to the accumulator, which reaches
+the resumed loop through a block parameter of `kj` — integer addition is associative, so the
+kernel's canonical grouping is the scalar loop's sum bit for bit (`tests/run/vec256_opt_int_sum.wk`,
+every trip from 2040 to 2064). Anything else — a float sum (the recipe would reassociate it), any
+other reduction kind, a cast, a gather or scatter, a shift or bitwise op, the counter read as a
+value, a countdown, a search loop, an interleave group, an unsigned compare, an `i64` multiply —
+keeps the 128-bit loop. One rule is added: every object the
 loop stores is accessed **only at the stored element** (`o[i] = o[i] * 2` is fine), because the
 kernel runs four unrolled groups of eight lanes whose loads may run ahead of the previous copy's
 stores, so no dependence distance — not even one the 128-bit plan would accept at `W = 4` — may be

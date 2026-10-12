@@ -661,8 +661,10 @@ line table built from them is not emitted yet.
   (`OptimizeOptions::vec_kernels`, cleared for `--backend=gpu-native` and below
   `--target-cpu=x86-64-v3`); `WUKONG_P4_NO_256` turns it off and `WUKONG_VEC256_MIN_TRIP` moves the
   gate, both result-identical (`tests/run/vec256_opt_{lanes,specials,aliased}.wk` print every lane,
-  NaN payloads, signed zeros and one buffer passed as two slices included). Still 128-bit: reductions (an integer sum would be exact in
-  the kernel's tree, but is not yet routed there), casts, gathers and scatters, shifts and bitwise
+  NaN payloads, signed zeros and one buffer passed as two slices included). An **integer sum** takes
+  a reduction kernel too — wrapping addition is exact under the kernel's grouping
+  (`tests/run/vec256_opt_int_sum.wk`). Still 128-bit: float sums and every other reduction kind
+  (the kernel would reassociate them), casts, gathers and scatters, shifts and bitwise
   ops, the counter read as a value, countdowns, search loops, interleave groups, unsigned compares,
   `i64` multiplies and `bf16` bodies (no recipe lane). The 2048 gate is the crossover measured for the
   front end's out-of-line *reduction* kernel; the elementwise crossover is unmeasured and likely

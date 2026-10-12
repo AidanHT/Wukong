@@ -15,7 +15,10 @@ All notable changes to Wukong are documented here. The format is loosely based o
   more. Loops the front end leaves scalar reach 256 bits this way: a `while` over slices, a body
   that calls a helper the optimizer inlines, a `let` merge. The original loop stays as the remainder
   and is still widened at 128 bits, so a shorter trip (tested on entry when it is a runtime value)
-  runs exactly the loop it ran before. Over `tests/run` and `examples/` at `-O2`, 45 programs gain
+  runs exactly the loop it ran before. An integer sum (`s = s + e(i)` over `i32`/`i64`) takes a
+  reduction kernel, whose wrapping result is exact under any grouping (`tests/run/vec256_opt_int_sum.wk`,
+  every trip from 2040 to 2064); a float sum keeps the in-order 128-bit fold. Over `tests/run` and
+  `examples/` at `-O2`, 45 programs gain
   kernels (the census's `veckernel*N` rows; no recognizer dispatch is lost). Bit-exact by
   construction — every op is lane-wise, a contracted multiply-add stays one `fma`, `Fone` keeps
   Rust's unordered `!=` — and pinned by `tests/run/vec256_opt_lanes.wk` (f32/i32/f64, trips 2053

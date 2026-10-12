@@ -14,21 +14,30 @@
 //! * **It already widens at 128 bits.** [`plan`] reads the 128-bit plan ([`VecPlan`]) and only
 //!   restates it: every step must have a recipe form, so the legality argument is the 128-bit one
 //!   — the dependence verdict, the runtime alias guard, the if-conversion — plus the memory rule
-//!   below. A body outside the recipe's coverage (a cast, a gather, a reduction, a shift, the
-//!   counter read as a value, a countdown) keeps the 128-bit loop exactly as before.
+//!   below. A body outside the recipe's coverage (a cast, a gather, a float or non-sum reduction, a
+//!   shift, the counter read as a value, a countdown) keeps the 128-bit loop exactly as before.
 //! * **Every object the loop stores is touched at one element per iteration.** The kernel runs its
 //!   groups unrolled ([`KERNEL_UNROLL`] copies of eight lanes) and its loads may run ahead of the
-//!   previous copy's stores, so a dependence the 128-bit plan accepts at a distance of four or more
-//!   (`o[i + 4] = o[i] * 2`) is not one the kernel may cross. Requiring every access to a stored
-//!   object to be at the stored element itself — `o[i] = o[i] * 2` is fine — removes distance from
-//!   the question: each lane then reads and writes only its own element of that object, in
-//!   program order, whatever the grouping. It is the rule `mir_build`'s recipe path holds its
-//!   bodies to.
+//!   previous copy's stores, so no dependence distance at all may be crossed — not even one a
+//!   128-bit plan could accept at a distance of four or more (`o[i + 4] = o[i] * 2`; today's
+//!   dependence test declines that too, and this rule keeps the kernel from relying on it).
+//!   Requiring every access to a stored object to be at the stored element itself — `o[i] = o[i] *
+//!   2` is fine — removes distance from the question: each lane then reads and writes only its own
+//!   element of that object, in program order, whatever the grouping. It is the rule `mir_build`'s
+//!   recipe path holds its bodies to.
 //! * **The trip is long enough to pay for an out-of-line call.** The call marshals a pointer table,
 //!   saves the callee-saved vector registers and runs `vzeroupper` — overhead the inlined 128-bit
 //!   loop does not pay. [`KERNEL_MIN_TRIP`] is the crossover `mir_build` measured for its
 //!   out-of-line 256-bit reduction kernel, `VEC256_REDUCTION_MIN_TRIP`; a compile-time trip below it
 //!   keeps the 128-bit loop, and a runtime trip is tested on entry.
+//!
+//! A loop whose one carried value besides the counter is an **integer sum** (`s = s + e(i)` over
+//! `i32` or `i64`, nothing stored) takes a reduction kernel: the recipe folds `e` into `U`
+//! accumulators of eight (or four) lanes and returns their wrapping sum, which `kc` adds to the
+//! accumulator's value on entry. Integer addition wraps and is associative, so the kernel's
+//! grouping is the scalar loop's answer bit for bit. A float sum is not — `(a + b) + c` and `a +
+//! (b + c)` differ, and the scalar loop's order is the program — so it keeps the 128-bit path's
+//! in-order fold, and so does every other reduction kind.
 //!
 //! # The rewrite
 //!
@@ -42,7 +51,8 @@
 //! [`KERNEL_MIN_TRIP`], or when a runtime alias check fails — and the counter `start + n` the
 //! original loop resumes at. `kc` runs only when `n` is not zero: it rebuilds each stream's address
 //! at the loop's first counter and each invariant the body splats, stores them into two stack
-//! tables, and calls the kernel over `[start, start + n)`. The original loop then runs the rest.
+//! tables, and calls the kernel over `[start, start + n)` (an integer sum's result is added to the
+//! accumulator, which reaches `kj` as a block parameter). The original loop then runs the rest.
 //!
 //! That remainder is where every trip below the crossover goes, so it must not stay scalar: it is
 //! still the 128-bit vectorizer's to widen, and only the 256-bit path is told to leave it alone
@@ -76,7 +86,7 @@
 
 use wukong_mir::{
     BinOp, CastKind, CmpOp, Function, Inst, MirType, Op, Terminator, ValueId, VecBin, VecCmp,
-    VecKernel, VecLane, VecOp,
+    VecKernel, VecLane, VecOp, VecRedOp, VecReduce,
 };
 
 use super::{
@@ -85,7 +95,9 @@ use super::{
 };
 use crate::each_op_use;
 use crate::fxhash::{FxHashMap, FxHashSet};
-use crate::loop_info::{AccessKind, AddrForm, AffineExpr, MemBase, NaturalLoop, TripCount};
+use crate::loop_info::{
+    AccessKind, AddrForm, AffineExpr, MemBase, NaturalLoop, RedKind, TripCount,
+};
 
 /// The shortest trip that takes the kernel: `mir_build`'s `VEC256_REDUCTION_MIN_TRIP`, the
 /// same-run A/B crossover of its out-of-line 256-bit kernel against the inlined 128-bit form
@@ -134,6 +146,9 @@ pub(super) struct KernelPlan {
     /// The shortest trip the kernel runs: a runtime trip below it is tested on entry and leaves
     /// every iteration to the 128-bit loop ([`min_trip`]).
     pub(super) min_trip: u64,
+    /// For an integer-sum kernel, the header parameter index of the accumulator the kernel's
+    /// result is added to.
+    pub(super) sum: Option<usize>,
 }
 
 /// May `f` take another kernel from this pass?
@@ -195,9 +210,23 @@ pub(super) fn plan(f: &Function, l: &NaturalLoop, p: &VecPlan) -> Result<KernelP
     if !p.len_checks.is_empty() {
         return Err("a bounds check inside an arm");
     }
-    if !p.reductions.is_empty() {
-        return Err("a reduction (the recipe would reassociate it)");
-    }
+    // A reduction kernel regroups its addends (`wukong_mir::vec_kernel`'s canonical tree), which
+    // computes the scalar loop's serial fold exactly for one kind only: an integer sum, which wraps
+    // and is the same under any grouping. A float sum stays with the 128-bit path's in-order fold.
+    let red = match p.reductions.as_slice() {
+        [] => None,
+        [r] if r.kind == RedKind::Add
+            && matches!(r.ty, MirType::I32 | MirType::I64)
+            && r.guard.is_none()
+            && r.arg.is_none()
+            && !r.find_last
+            && r.select.is_none()
+            && r.fma_factors.is_none() =>
+        {
+            Some(r)
+        }
+        _ => return Err("a reduction other than one plain integer sum"),
+    };
     if !p.groups.is_empty() {
         return Err("an interleave group");
     }
@@ -224,6 +253,9 @@ pub(super) fn plan(f: &Function, l: &NaturalLoop, p: &VecPlan) -> Result<KernelP
         })
         .ok_or("no contiguous access")?;
     let lane = VecLane::of(&lane_ty).ok_or("a lane type the AVX2 recipe does not cover")?;
+    if red.is_some_and(|r| r.ty != lane_ty) {
+        return Err("a sum of another lane type than the loads");
+    }
 
     // ---- trip ---------------------------------------------------------------------------------
     // Below the crossover a compile-time trip keeps the 128-bit loop outright; a runtime trip is
@@ -381,12 +413,26 @@ pub(super) fn plan(f: &Function, l: &NaturalLoop, p: &VecPlan) -> Result<KernelP
                 let v = b.select(*cond, *then_arg, *else_arg)?;
                 b.val.insert(param.0, v);
             }
+            // The sum's combine: folded by the kernel's tree, not an op of the body.
+            (Plan::Reduce, LinInst::Real { .. }) if red.is_some() => {}
             _ => return Err("a step the recipe has no form for"),
         }
     }
-    if !b.ops.iter().any(|o| matches!(o, VecOp::Store { .. })) {
-        return Err("no store");
-    }
+    let stores = b.ops.iter().any(|o| matches!(o, VecOp::Store { .. }));
+    let reduce = match red {
+        // A reduction kernel writes no memory: it returns its fold.
+        Some(_) if stores => return Err("a sum beside a store"),
+        Some(r) => {
+            let (addend, _) = r.addend.ok_or("a sum without an addend")?;
+            Some(VecReduce {
+                op: VecRedOp::Add,
+                value: b.value(addend)?,
+                fma: None,
+            })
+        }
+        None if !stores => return Err("no store"),
+        None => None,
+    };
     let kernel = VecKernel {
         name: f.name,
         lane,
@@ -394,12 +440,18 @@ pub(super) fn plan(f: &Function, l: &NaturalLoop, p: &VecPlan) -> Result<KernelP
         scalars: b.scalars.len() as u32,
         ops: b.ops,
         unroll: KERNEL_UNROLL,
-        reduce: None,
+        reduce,
     };
     // The single-sourced coverage and register gate the assembler plans with: at most
-    // `VEC_MAX_STREAMS` streams, no 64-bit integer multiply, every mask read only by a blend,
-    // and one register group plus the hoisted broadcasts in sixteen registers.
-    if !kernel.pressure().is_some_and(|q| q.fits()) {
+    // `VEC_MAX_STREAMS` streams, no 64-bit integer multiply, every mask read only by a blend, and
+    // one register group plus the hoisted broadcasts (and a reduction's accumulators) in sixteen
+    // registers.
+    let fits = if kernel.reduce.is_some() {
+        kernel.reduction_fits()
+    } else {
+        kernel.pressure().is_some_and(|q| q.fits())
+    };
+    if !fits {
         return Err("outside the AVX2 emitter's coverage or register file");
     }
     Ok(KernelPlan {
@@ -408,6 +460,7 @@ pub(super) fn plan(f: &Function, l: &NaturalLoop, p: &VecPlan) -> Result<KernelP
         scalars: b.scalars,
         trip,
         min_trip: min,
+        sum: red.map(|r| r.param_index),
     })
 }
 
@@ -705,7 +758,10 @@ pub(super) fn apply(f: &mut Function, p: &VecPlan, k: &KernelPlan) {
     let gp: Vec<ValueId> = header_tys.iter().map(|t| e.value(t.clone())).collect();
     let kg = e.block(gp.clone(), Terminator::Unreachable);
     let kc = e.block(Vec::new(), Terminator::Unreachable);
-    let kj = e.block(Vec::new(), Terminator::Unreachable);
+    // An integer-sum kernel's accumulator arrives at `kj` from both sides: unchanged when the
+    // kernel does not run, plus the kernel's sum when it does.
+    let sum_in = k.sum.map(|ix| e.value(header_tys[ix].clone()));
+    let kj = e.block(sum_in.into_iter().collect(), Terminator::Unreachable);
 
     // ---- kg: how many elements does the kernel own? -------------------------------------------
     let start = gp[p.iv_index];
@@ -726,7 +782,7 @@ pub(super) fn apply(f: &mut Function, p: &VecPlan, k: &KernelPlan) {
         then_blk: kc,
         then_args: Vec::new(),
         else_blk: kj,
-        else_args: Vec::new(),
+        else_args: k.sum.map(|ix| gp[ix]).into_iter().collect(),
     };
 
     // ---- kc: the two tables and the call ------------------------------------------------------
@@ -798,23 +854,35 @@ pub(super) fn apply(f: &mut Function, p: &VecPlan, k: &KernelPlan) {
     };
     let kernel = e.f.vec_kernels.len() as u32;
     e.f.vec_kernels.push(k.kernel.clone());
-    e.push_void(
-        kc,
-        Op::VecKernelCall {
-            kernel,
-            ptrs,
-            scalars,
-            n,
-        },
-    );
+    let call = Op::VecKernelCall {
+        kernel,
+        ptrs,
+        scalars,
+        n,
+    };
+    let kc_args = match k.sum {
+        // The kernel returns the wrapping sum of its addends; added to the accumulator's value on
+        // entry it is the accumulator after the first `n` iterations, in any grouping.
+        Some(ix) => {
+            let r = e.push(kc, lane_ty.clone(), call);
+            vec![e.push(kc, lane_ty.clone(), Op::Bin(BinOp::Add, gp[ix], r))]
+        }
+        None => {
+            e.push_void(kc, call);
+            Vec::new()
+        }
+    };
     e.f.blocks[kc.0 as usize].term = Terminator::Br {
         target: kj,
-        args: Vec::new(),
+        args: kc_args,
     };
 
     // ---- kj: the original loop resumes where the kernel stopped --------------------------------
     let mut args = gp.clone();
     args[p.iv_index] = resume;
+    if let (Some(ix), Some(acc)) = (k.sum, sum_in) {
+        args[ix] = acc;
+    }
     e.f.blocks[kj.0 as usize].term = Terminator::Br {
         target: p.header,
         args,
@@ -1020,12 +1088,26 @@ mod tests {
                  while i < 37 { o[i] = x[i] * 2.0; i = i + 1; } } \
                  fn main() -> i32 { return 0; }",
             ),
-            // A reduction (the recipe's would reassociate a float sum; an integer one is exact,
-            // but stays 128-bit for now).
+            // A float sum: the kernel's tree would reassociate it.
             (
-                "reduction",
-                "fn k(x: []i32, n: i64) -> i32 { let mut s: i32 = 0; let mut i: i64 = 0; \
-                 while i < n { s = s + x[i] * 3; i = i + 1; } return s; } \
+                "float sum",
+                "fn k(x: []f32, n: i64) -> f32 { let mut s: f32 = 0.0; let mut i: i64 = 0; \
+                 while i < n { s = s + x[i]; i = i + 1; } return s; } \
+                 fn main() -> i32 { return 0; }",
+            ),
+            // An integer product: the recipe folds sums only.
+            (
+                "integer product",
+                "fn k(x: []i32, n: i64) -> i32 { let mut s: i32 = 1; let mut i: i64 = 0; \
+                 while i < n { s = s * (x[i] + 2); i = i + 1; } return s; } \
+                 fn main() -> i32 { return 0; }",
+            ),
+            // An integer sum beside a store: a reduction kernel writes no memory.
+            (
+                "sum beside a store",
+                "fn k(x: []i32, mut o: []i32, n: i64) -> i32 { let mut s: i32 = 0; \
+                 let mut i: i64 = 0; \
+                 while i < n { o[i] = x[i] * 2; s = s + x[i]; i = i + 1; } return s; } \
                  fn main() -> i32 { return 0; }",
             ),
             // The counter read as a value.
@@ -1253,6 +1335,72 @@ mod tests {
             usize::from(host_kernels())
         );
         assert_eq!(run(&p0, &mut i0), run(&p2, &mut i2), "-O0 and -O2 disagree");
+    }
+
+    /// Two integer sums, `i32` and `i64`, whose addends overflow, at every trip from 2040 to 2064:
+    /// below the gate the 128-bit loop does everything; from 2048 on the reduction kernel folds the
+    /// whole groups (its own grouping — four accumulators of eight or four lanes) and the 128-bit
+    /// loop and the scalar tail the remainder, for every remainder length. Integer addition wraps
+    /// and is associative, so `-O2` must print the scalar loop's sums exactly — and it must be the
+    /// kernel doing it: zeroing its addend changes the answer.
+    #[test]
+    fn an_integer_sum_takes_a_reduction_kernel_and_wraps_like_the_loop() {
+        // `s32`/`s64` and `again` call each other (never, here), so neither is a leaf the inliner
+        // would splice into `main`.
+        let src = "fn s32(x: []i32, y: []i32, n: i64, d: i64) -> i32 { \
+                   if d > 0 { return again(d - 1) as i32; } \
+                   let mut s: i32 = 7; let mut i: i64 = 0; \
+                   while i < n { s = s + (x[i] * 3 - y[i]); i = i + 1; } return s; } \
+                   fn s64(z: []i64, n: i64, d: i64) -> i64 { \
+                   if d > 0 { return again(d - 1); } \
+                   let mut s: i64 = -5; let mut i: i64 = 0; \
+                   while i < n { s = s + (z[i] - 9); i = i + 1; } return s; } \
+                   fn again(d: i64) -> i64 { let mut a: []i32 = alloc_i32(1); \
+                     let mut b: []i64 = alloc_i64(1); \
+                     return (s32(a, a, 1, d) as i64) + s64(b, 1, d); } \
+                   fn main() -> i32 { let m: i64 = 2064; \
+                     let mut x: []i32 = alloc_i32(m); let mut y: []i32 = alloc_i32(m); \
+                     let mut z: []i64 = alloc_i64(m); let mut i: i64 = 0; \
+                     while i < m { x[i] = (i * 2654435761 % 2000000000) as i32; \
+                       y[i] = (i * 40503 % 1000 - 500) as i32; \
+                       z[i] = i * 4611686018427387 + 17; i = i + 1; } \
+                     let mut n: i64 = 2040; \
+                     while n <= m { print(s32(x, y, n, 0)); print(s64(z, n, 0)); n = n + 1; } \
+                     return 0; }";
+        let (p0, mut i0) = optimized(src, 0, true);
+        let (mut p2, mut i2) = optimized(src, 2, true);
+        for (f, lane) in [("s32", VecLane::I32), ("s64", VecLane::I64)] {
+            let ks = kernels_of(&p2, &mut i2, f);
+            if !host_kernels() {
+                assert!(ks.is_empty(), "{f}: {ks:?}");
+                continue;
+            }
+            assert_eq!(ks.len(), 1, "{f}: {ks:?}");
+            assert_eq!(ks[0].lane, lane, "{f}");
+            assert!(ks[0].reduce.is_some(), "{f}: not a reduction kernel");
+        }
+        let want = run(&p0, &mut i0);
+        assert_eq!(want.1.lines().count(), 50);
+        assert_eq!(want, run(&p2, &mut i2), "-O0 and -O2 disagree");
+        if !host_kernels() {
+            return;
+        }
+        // Fold a load instead of the addend: the kernel's sum changes, so the output must.
+        for f in &mut p2.funcs {
+            for k in &mut f.vec_kernels {
+                if let (Some(red), Some(load)) = (
+                    k.reduce.as_mut(),
+                    k.ops.iter().position(|o| matches!(o, VecOp::Load { .. })),
+                ) {
+                    red.value = load as u32;
+                }
+            }
+        }
+        assert_ne!(
+            want,
+            run(&p2, &mut i2),
+            "corrupting the sum kernels changed nothing: they never ran"
+        );
     }
 
     /// The tables are typed: a stream table of pointers, a scalar table of the lane type.
