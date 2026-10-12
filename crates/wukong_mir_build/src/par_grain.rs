@@ -175,6 +175,45 @@ pub(crate) fn outline_with_grain(
     (build(g, diags), g)
 }
 
+/// The stack every runtime worker that can run an outlined `@parallel` body is built with:
+/// `wukong_runtime` builds each pool `wukong_parallel_for` forks onto (`ensure_global_pool`,
+/// `region_pool`, the GEMM pool) with `stack_size(16 * 1024 * 1024)`.
+const WORKER_STACK_BYTES: u64 = 16 << 20;
+
+/// The largest static frame an outlined `@parallel` body may have and still be outlined: half the
+/// worker stack. The other half is for what the frame size cannot see -- Cranelift's spill slots,
+/// the frames of the runtime kernels and math intrinsics the body calls (neither outliner admits a
+/// call to a user function, whose frame could be any size) and the pool's own frames. A loop whose
+/// body declares more scratch than this (`let t: [f32; 5000000]`, 20 MB) stays serial, where it
+/// runs on the calling thread -- the 256 MiB `--run` thread -- as it would without `@parallel`;
+/// outlined, the body's frame would overflow a 16 MiB worker (a native stack-overflow abort the
+/// interpreter, which runs regions in order on its own heap-backed slots, never shows).
+pub(crate) const OUTLINED_FRAME_BUDGET: u64 = WORKER_STACK_BYTES / 2;
+
+/// The static frame of `f` in bytes: every `Alloca` slot (the builder hoists them all to the entry
+/// block, and each is its own slot), with its explicit alignment counted as padding. Saturating, so
+/// an unrepresentable slot reads as over any budget.
+pub(crate) fn frame_bytes(f: &Function) -> u64 {
+    f.blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter_map(|i| match &i.op {
+            Op::Alloca { ty, align, .. } => Some(
+                crate::checked_mir_byte_size(ty)
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(u64::from(*align)),
+            ),
+            _ => None,
+        })
+        .fold(0u64, u64::saturating_add)
+}
+
+/// Whether an outlined body's static frame fits [`OUTLINED_FRAME_BUDGET`]; both outliners (the
+/// whole-function `lower_parallel` and the mid-function region) keep the loop serial otherwise.
+pub(crate) fn frame_fits_worker_stack(outlined: &Function) -> bool {
+    frame_bytes(outlined) <= OUTLINED_FRAME_BUDGET
+}
+
 /// The chunk count for a compile-time trip count: `ceil(n / g)` for `n > 0`, else `n` unchanged
 /// (a non-positive trip count runs nothing either way).
 pub(crate) fn const_chunks(n: i64, g: u64) -> i64 {

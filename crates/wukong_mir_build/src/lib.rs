@@ -2368,7 +2368,9 @@ fn lower_program_pooled(
                         // The outlined chunk body is the one loop's body: a `@generic` on that loop
                         // opts the whole chunk out of recognition.
                         let gemm = generic_gemm(gemm, loop_opt_out);
-                        let (outlined, wrapper) = lower_parallel(
+                        // `None`: the body's frame is over the worker-stack budget, so the function
+                        // is lowered normally below and the loop stays on the calling thread.
+                        if let Some((outlined, wrapper)) = lower_parallel(
                             f,
                             par_sym,
                             pfor_sym,
@@ -2381,19 +2383,20 @@ fn lower_program_pooled(
                             par_regions.grain,
                             par_regions.implicit,
                             &mut diags,
-                        );
-                        // Both halves are built with an empty tile queue (`lower_parallel`), so a
-                        // function-item `@tile` never reaches `lower_for` at all -- no tiling, and
-                        // no diagnostic either.
-                        tile::report_unapplied_tiles(
-                            &mut diags,
-                            f.name.span,
-                            fn_tiles.get(&f.name.sym).map_or(&[][..], |v| &v[..]),
-                            "the `@parallel` outliner rewrites this loop into runtime chunks",
-                        );
-                        program.funcs.push(outlined);
-                        program.funcs.push(wrapper);
-                        continue;
+                        ) {
+                            // Both halves are built with an empty tile queue (`lower_parallel`), so
+                            // a function-item `@tile` never reaches `lower_for` at all -- no
+                            // tiling, and no diagnostic either.
+                            tile::report_unapplied_tiles(
+                                &mut diags,
+                                f.name.span,
+                                fn_tiles.get(&f.name.sym).map_or(&[][..], |v| &v[..]),
+                                "the `@parallel` outliner rewrites this loop into runtime chunks",
+                            );
+                            program.funcs.push(outlined);
+                            program.funcs.push(wrapper);
+                            continue;
+                        }
                     }
                     // A `@parallel` function that is not a single elementwise loop — e.g. a reduction
                     // (`let mut s = 0; for k { s += x[k]*y[k] }; …`). Lower it normally, but with any
@@ -3326,6 +3329,10 @@ fn merge_repr_ty(result_ty: &MirType) -> MirType {
 /// `ceil(hi / G)` chunks instead and appends the address of a stack slot holding `hi` to `env`; the
 /// body loads it and maps its chunk span back to iterations. `hi` is evaluated once, in the
 /// wrapper, either way.
+///
+/// `None` (nothing reported) when the outlined body's static frame is over
+/// [`par_grain::OUTLINED_FRAME_BUDGET`]: it would run on a 16 MiB runtime worker stack, so the
+/// caller lowers the function normally and the loop runs on the calling thread.
 #[allow(clippy::too_many_arguments)]
 fn lower_parallel(
     f: &FnDecl,
@@ -3340,7 +3347,7 @@ fn lower_parallel(
     user_grain: Option<u64>,
     implicit_grain: bool,
     diags: &mut Vec<Diagnostic>,
-) -> (Function, Function) {
+) -> Option<(Function, Function)> {
     let (param_tys, ret_ty) = match sema.defs.lookup(f.name.sym).map(|d| &d.kind) {
         Some(DefKind::Fn(sig)) => (sig.params.clone(), sig.ret.clone()),
         _ => (
@@ -3446,8 +3453,16 @@ fn lower_parallel(
         }
         fl.finish()
     };
+    let mut body_diags = Vec::new();
     let (outlined, grain) =
-        par_grain::outline_with_grain(user_grain, implicit_grain, diags, build_outlined);
+        par_grain::outline_with_grain(user_grain, implicit_grain, &mut body_diags, build_outlined);
+    // A body with more scratch than a worker's stack holds stays serial (`par_grain::
+    // OUTLINED_FRAME_BUDGET`); the caller lowers the function normally, which reports the body's
+    // diagnostics itself.
+    if !par_grain::frame_fits_worker_stack(&outlined) {
+        return None;
+    }
+    diags.extend(body_diags);
 
     // ---- wrapper: f.name(params…) ----
     let wrapper = {
@@ -3556,7 +3571,7 @@ fn lower_parallel(
         fl.finish()
     };
 
-    (outlined, wrapper)
+    Some((outlined, wrapper))
 }
 
 /// Initial size of the outlined mid-function `@parallel` region symbol pool. The outlined-body
@@ -14952,15 +14967,17 @@ impl FnLowerer<'_> {
         if self.par.is_none() {
             return false;
         }
-        let verdict = self.region_verdict(pat, start, end, (ity, signed), body);
-        #[cfg(test)]
-        par_region::trace(verdict.as_ref().map(|_| ()).map_err(|why| *why));
-        match verdict {
+        // The proof's verdict, then the outlined body's frame budget (`emit_parallel_region`):
+        // either may keep the loop serial, and the trace records whichever did.
+        let outcome = match self.region_verdict(pat, start, end, (ity, signed), body) {
             Ok((hh, trip, plan)) => {
                 self.emit_parallel_region(hh, trip, (ity, signed), (end, body), &plan)
             }
-            Err(_) => false,
-        }
+            Err(why) => Err(why),
+        };
+        #[cfg(test)]
+        par_region::trace(outcome.map(|_| ()));
+        outcome.unwrap_or(false)
     }
 
     /// The whole legality verdict for one candidate region loop: the region variable, the trip
@@ -15852,12 +15869,17 @@ impl FnLowerer<'_> {
     /// untouched loop body under `lower_ranged_loop`, captures re-bound from env). Mirrors
     /// [`lower_parallel`]'s two halves, but as a *statement* inside a larger function.
     ///
-    /// Returns `false` — emitting nothing, so the caller lowers the loop serially — when the module's
-    /// pre-interned region-symbol pool is exhausted; that is recorded, and `lower_program_with`
-    /// redoes the lowering with a larger pool, so the final program never keeps a region serial for
-    /// that reason. A captured `[]T` slice must
-    /// have its `slice_slots` record carried across the env into the outlined body's re-bind, or
-    /// `kernel_base_ptr` in there would mistake the fat-pointer buffer for the data.
+    /// Returns `Ok(false)` — emitting nothing, so the caller lowers the loop serially — when the
+    /// module's pre-interned region-symbol pool is exhausted; that is recorded, and
+    /// `lower_program_with` redoes the lowering with a larger pool, so the final program never keeps
+    /// a region serial for that reason. Returns `Err(reason)`, again emitting nothing, when the
+    /// built body's static frame is over [`par_grain::OUTLINED_FRAME_BUDGET`]: outlined, it would
+    /// run on a 16 MiB runtime worker stack instead of this function's frame on the calling thread,
+    /// and a body-local `[f32; 5000000]` would abort natively with a stack overflow.
+    ///
+    /// A captured `[]T` slice must have its `slice_slots` record carried across the env into the
+    /// outlined body's re-bind, or `kernel_base_ptr` in there would mistake the fat-pointer buffer
+    /// for the data.
     ///
     /// A run-time trip count is `end`, evaluated once here (`region_verdict` proved it pure); with
     /// a grain it reaches the outlined body through one more env slot, as in [`lower_parallel`].
@@ -15872,7 +15894,7 @@ impl FnLowerer<'_> {
         (ity, signed): (&MirType, bool),
         (end, body): (&Expr, &Block),
         plan: &par_region::RegionPlan,
-    ) -> bool {
+    ) -> Result<bool, &'static str> {
         // Reserve an outlined-body symbol from the pool. Pool exhausted -> stay serial in THIS
         // attempt and flag it; `lower_program_with` then redoes the lowering with a larger pool.
         let (par_sym, pfor, user_grain, implicit) = match self.par.as_deref_mut() {
@@ -15883,9 +15905,9 @@ impl FnLowerer<'_> {
             }
             Some(p) => {
                 p.exhausted = true;
-                return false;
+                return Ok(false);
             }
-            None => return false,
+            None => return Ok(false),
         };
         // A captured array's bound ValueId IS its base pointer; a captured scalar's is its alloca
         // slot pointer. Both are pointer-shaped, so the env is a uniform pointer table. Scalars are
@@ -15902,15 +15924,6 @@ impl FnLowerer<'_> {
                 (*s, v, t, is_slice)
             })
             .collect();
-        // The run-time trip count, evaluated once in the counter's type and widened to the
-        // runtime's i64 (a signed counter: `region_verdict`).
-        let runtime_n = match trip {
-            par_region::RegionTrip::Const(_) => None,
-            par_region::RegionTrip::Runtime => {
-                let v = self.lower_range_bound(end, ity, signed);
-                Some(self.coerce_to(v, ity, &MirType::I64, signed))
-            }
-        };
         let ncap = caps.len();
 
         // ---- outlined body: par_sym(start: i64, end: i64, env: ptr), at the grain `par_grain`
@@ -16016,8 +16029,25 @@ impl FnLowerer<'_> {
         };
         let (outlined, grain) =
             par_grain::outline_with_grain(user_grain, implicit, &mut tmp_diags, build_outlined);
+        // Too much scratch for a worker's stack: keep the loop serial, in this function's frame.
+        // Nothing has been emitted here yet, and no other symbol was reserved since ours (the
+        // outlined body is built with no pool), so handing it back keeps the pool's numbering
+        // dense. `tmp_diags` is dropped: the serial lowering reports the body's diagnostics.
+        if !par_grain::frame_fits_worker_stack(&outlined) {
+            self.par.as_deref_mut().expect("reserved above").next -= 1;
+            return Err("the outlined body's static frame exceeds the worker-stack budget");
+        }
 
         // ---- call site: env pack + wukong_parallel_for(N, &body, env) ----
+        // The run-time trip count, evaluated once in the counter's type and widened to the
+        // runtime's i64 (a signed counter: `region_verdict`).
+        let runtime_n = match trip {
+            par_region::RegionTrip::Const(_) => None,
+            par_region::RegionTrip::Runtime => {
+                let v = self.lower_range_bound(end, ity, signed);
+                Some(self.coerce_to(v, ity, &MirType::I64, signed))
+            }
+        };
         let publish_n = runtime_n.is_some() && grain > 1;
         let k = (ncap + usize::from(publish_n)).max(1) as u32;
         let env = self
@@ -16113,7 +16143,7 @@ impl FnLowerer<'_> {
             .expect("reserved above")
             .funcs
             .push(outlined);
-        true
+        Ok(true)
     }
 
     /// Desugar `for <pat> in <array>` — iterate the elements of a fixed-size array or a slice —

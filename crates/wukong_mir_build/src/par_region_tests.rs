@@ -15,7 +15,7 @@ use wukong_mir::verify::verify_function;
 use wukong_mir::{CastKind, Function, Op, Program};
 use wukong_span::{Interner, SourceId};
 
-use crate::{lower_program_with, par_region, LowerOptions};
+use crate::{lower_program_with, par_grain, par_region, LowerOptions};
 
 fn lower(src: &str) -> (Program, Interner, Vec<Result<(), &'static str>>) {
     let mut interner = Interner::new();
@@ -569,6 +569,109 @@ fn hist(x: []i32, mut h: []i64) {
     );
 }
 
+/// The decline the frame budget names (`emit_parallel_region`).
+const OVER_BUDGET: &str = "the outlined body's static frame exceeds the worker-stack budget";
+
+/// A region whose body declares `let t: [f32; LEN]` of per-iteration scratch, over slices (so the
+/// whole-function outliner never sees it). The leading statement keeps the loop a mid-function
+/// region.
+const SCRATCH_ROWS: &str = "module m
+@parallel
+fn rows(x: []f32, mut out: []f32) {
+    let mut guard: i32 = 0;
+    guard = guard + 1;
+    for r in 0..4 {
+        let mut t: [f32; LEN] = [0.0; LEN];
+        for j in 0..8 { t[j] = x[r * 8 + j]; }
+        for j in 0..8 { out[r * 8 + j] = t[j] + 1.0; }
+    }
+}
+";
+
+/// The frame budget. Outlined, a region body's scratch lives in ITS frame, which runs on a 16 MiB
+/// runtime worker stack; serial, it lives in the enclosing function's frame on the calling thread
+/// (256 MiB under `--run`). So a body over `OUTLINED_FRAME_BUDGET` (half a worker stack) stays
+/// serial: `[f32; 5000000]` threaded aborted natively with a stack overflow while the interpreter,
+/// which runs regions in order on heap-backed slots, printed the right answer. Under the budget it
+/// still outlines.
+#[test]
+fn a_region_body_over_the_worker_stack_budget_stays_serial() {
+    // 1,000,000 f32 = 4 MB of scratch: outlined.
+    let (prog, it, trace) = lower(&SCRATCH_ROWS.replace("LEN", "1000000"));
+    assert_eq!(trace, vec![Ok(())]);
+    assert_eq!(pfor(&prog, &it), 1);
+    let frame = par_grain::frame_bytes(region_body(&prog, &it));
+    assert!(
+        (4_000_000..=par_grain::OUTLINED_FRAME_BUDGET).contains(&frame),
+        "the body's frame is its scratch plus a few slots: {frame}"
+    );
+    // 3,000,000 f32 = 12 MB: serial, for the budget's reason, and no body is kept.
+    let (prog, it, trace) = lower(&SCRATCH_ROWS.replace("LEN", "3000000"));
+    assert_eq!(trace, vec![Err(OVER_BUDGET)]);
+    assert_eq!(pfor(&prog, &it), 0);
+    assert!(
+        prog.funcs
+            .iter()
+            .all(|f| !it.resolve(f.name).starts_with("wukong$par$")),
+        "a declined region leaves no outlined body"
+    );
+}
+
+/// A declined region hands its pool symbol back: the next region in the function is still
+/// `wukong$par$0`, so the module's region numbering does not depend on what was declined.
+#[test]
+fn a_region_over_the_budget_hands_its_symbol_back() {
+    let src = "module m
+@parallel
+fn two(x: []f32, mut out: []f32, mut y: []f32) {
+    let mut guard: i32 = 0;
+    guard = guard + 1;
+    for r in 0..4 {
+        let mut t: [f32; 3000000] = [0.0; 3000000];
+        for j in 0..8 { t[j] = x[r * 8 + j]; }
+        for j in 0..8 { out[r * 8 + j] = t[j]; }
+    }
+    for r in 0..4 {
+        for j in 0..8 { y[r * 8 + j] = x[r * 8 + j] * 2.0; }
+    }
+}
+";
+    let (prog, it, trace) = lower(src);
+    assert_eq!(trace, vec![Err(OVER_BUDGET), Ok(())]);
+    assert_eq!(pfor(&prog, &it), 1);
+    assert_eq!(it.resolve(region_body(&prog, &it).name), "wukong$par$0");
+}
+
+/// The whole-function outliner (`lower_parallel`, a `@parallel` function whose body is one loop over
+/// array parameters) has the same budget. Over it, the function lowers normally; the region
+/// outliner then sees the loop and declines it for the same reason, so it runs serially.
+#[test]
+fn a_whole_function_body_over_the_worker_stack_budget_stays_serial() {
+    let src = "module m
+@parallel
+fn rows(x: [f32; 32], mut out: [f32; 32]) {
+    for r in 0..4 {
+        let mut t: [f32; LEN] = [0.0; LEN];
+        for j in 0..8 { t[j] = x[r * 8 + j]; }
+        for j in 0..8 { out[r * 8 + j] = t[j] + 1.0; }
+    }
+}
+";
+    let outlined =
+        |prog: &Program, it: &Interner| prog.funcs.iter().any(|f| it.resolve(f.name) == "rows$par");
+    let (prog, it, trace) = lower(&src.replace("LEN", "1000000"));
+    assert!(
+        outlined(&prog, &it),
+        "under the budget: the whole-function outliner"
+    );
+    assert!(trace.is_empty(), "no region verdict: {trace:?}");
+    assert_eq!(pfor(&prog, &it), 1);
+    let (prog, it, trace) = lower(&src.replace("LEN", "3000000"));
+    assert!(!outlined(&prog, &it));
+    assert_eq!(trace, vec![Err(OVER_BUDGET)]);
+    assert_eq!(pfor(&prog, &it), 0);
+}
+
 /// The region verdicts of one corpus program, or `None` when it does not lower clean on its own
 /// (the driver's front end does more than this harness).
 fn corpus_trace(src: &str) -> Option<Vec<Result<(), &'static str>>> {
@@ -662,4 +765,12 @@ fn corpus_region_declines() {
             by_reason[unmodeled]
         );
     }
+    // No corpus region's scratch comes near a worker's stack (the largest, the per-head scratch of
+    // examples/gpt2_forward_bench_par.wk, is about 1.6 MB), so the frame budget costs the corpus
+    // no threading; a region that starts declining for it is a lost speedup to look at.
+    assert!(
+        !by_reason.contains_key(OVER_BUDGET),
+        "a corpus region declines for the frame budget: {:?}",
+        by_reason[OVER_BUDGET]
+    );
 }

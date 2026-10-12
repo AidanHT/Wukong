@@ -1891,6 +1891,23 @@ none of which weakens it:
 first refusal); `par_region_tests::corpus_region_declines` prints the corpus table and pins that no
 region declines for one of the slice / kernel-builtin corners left unmodeled.
 
+**The frame budget.** Legality is not the only reason to stay serial. An outlined body's locals are
+`alloca` slots in the outlined function, and that function runs on a `wukong_runtime` pool worker,
+whose stack is 16 MiB (`stack_size(16 * 1024 * 1024)` on every pool `wukong_parallel_for` forks
+onto); serial, the same scratch sits in the enclosing frame on the calling thread (256 MiB under
+`--run`). So after building the body, both outliners measure its static frame
+(`par_grain::frame_bytes`: every `Alloca`'s size plus its explicit alignment, saturating) and keep the
+loop serial above `par_grain::OUTLINED_FRAME_BUDGET`, half a worker stack. The region outliner
+(`emit_parallel_region`) hands its pool symbol back, so region numbering does not depend on a decline,
+and records the decline by name in the `cfg(test)` trace; the whole-function `lower_parallel` returns
+`None` and the function is lowered normally (where the region outliner then declines the same loop).
+The other half of the stack is headroom for spills and the runtime kernels and math intrinsics the
+body calls; the shared proof admits no call to a user function, whose frame could be any size.
+Without the budget, a body declaring `let t: [f32; 5000000]` aborted natively with a stack overflow
+on a worker while the interpreter, whose slots are heap-backed, printed the right answer — a defect
+no differential gate could see; `crates/wukongc/tests/parallel_frame_budget.rs` runs both shapes
+natively.
+
 ## CPU training execution
 
 `--train` validates concrete dense f32 buffer types and checked byte extents before allocating

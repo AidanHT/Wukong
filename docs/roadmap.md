@@ -803,7 +803,9 @@ line table built from them is not emitted yet.
   aggregates, an unsigned run-time trip count (a symbolic-generic dimension is `usize`), a kernel
   operand `s[lo..]` or of run-time length, and a run-time trip count with an index term only a
   constant `N` erases. `crates/wukong_mir_build/src/par_region_tests.rs::corpus_region_declines`
-  prints every corpus region's verdict by reason.
+  prints every corpus region's verdict by reason. Either outliner also keeps a loop serial when the
+  outlined body's own locals exceed 8 MiB (half the runtime's 16 MiB worker stack), since outlined
+  they would sit on a worker's stack instead of the calling thread's.
   `@parallel(grain = G)` is consumed (each worker claims runs of at least `G` iterations; any other
   `@parallel` argument is `E0306`), a loop with no `grain` gets an implicit one on the CPU backends
   (`ceil(2^14 / body MIR size)` for a straight-line body, 1 for a body with an inner loop or a call;

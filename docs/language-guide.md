@@ -2186,6 +2186,16 @@ unless a `@noalias` promise separates the pair, which lets a gather from one par
 thread. There is no cap on the number of regions per program (the compiler used to keep
 every region past the 32nd serial, silently).
 
+**Scratch and the worker stack.** Both vehicles move the loop body into its own function, so the
+body's `let` locals — per-iteration scratch arrays included — live in *that* function's frame, and it
+runs on the runtime's pool workers, whose stacks are 16 MiB, rather than on the calling thread
+(256 MiB under `wukongc --run`). A loop whose outlined body would declare more than **8 MiB** of
+locals (half a worker stack; `let mut t: [f32; 5000000]` is 20 MB) is therefore not outlined: it
+runs serially, with its scratch in the enclosing function's frame, exactly as without `@parallel`.
+The rest of the worker stack is headroom for what the count cannot see — spill slots and the runtime
+kernels and math intrinsics the body calls (neither vehicle outlines a body that calls a user
+function).
+
 **Slices in a region** (✅). A `[]T` capture (parameter or local) is indexed through its fat pointer,
 which nothing in a region can re-point, but its *name* says nothing about where it points: two slices
 of one element type — or a slice and an array — may view one buffer at any offset

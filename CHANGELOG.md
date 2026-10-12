@@ -32,6 +32,19 @@ All notable changes to Wukong are documented here. The format is loosely based o
 - **One band per buffer.** The single-digit proof accepts an index whose non-digit terms lie in any
   one band `[k·C, k·C + C)` common to the buffer's accesses (`out[(h + 1)*8 + j]`), not only
   `[0, C)`; a buffer read at one band and written at another still declines.
+- **A loop body with more scratch than a worker's stack holds stays serial.** Outlined, a body's
+  locals live in the outlined function's frame, which runs on a runtime pool worker with a 16 MiB
+  stack, not in the enclosing frame on the calling thread (256 MiB under `--run`). A slice-based
+  `@parallel` function the region outliner used to decline, `rows(x: []f32, mut out: []f32, n: i64)`
+  whose loop body declares `let mut t: [f32; 5000000]` (20 MB), therefore aborted with a stack
+  overflow under `--backend=native` once it threaded, while the interpreter, which runs a region in
+  order on heap-backed slots, printed the right answer; the whole-function outliner already did the
+  same to an array-only loop of that shape. Both outliners now keep a loop serial when the outlined
+  body's static frame (its `alloca` slots) exceeds half a worker stack, 8 MiB
+  (`par_grain::OUTLINED_FRAME_BUDGET`). No corpus loop comes near it: the largest region scratch,
+  `examples/gpt2_forward_bench_par.wk`'s per head, is about 1.6 MB. Tests:
+  `crates/wukongc/tests/parallel_frame_budget.rs` (both shapes, native at `-O0`/`-O2`) and the
+  budget tests in `par_region_tests.rs`.
 - No `_parallel` recognizer arm was added, so `wukong_autodiff/src/tape.rs` and
   `wukong_interp::intrinsic` need no mirror. No existing fixture gained or lost a dispatch in the
   recognizer census; it gains only the two new fixtures' lines. Unit tests:
