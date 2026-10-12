@@ -1120,6 +1120,7 @@ fn scan_pattern(p: &Pattern, f: &mut RegionFacts) {
         | PatKind::Unit
         | PatKind::Int { .. }
         | PatKind::Char(_)
+        | PatKind::Str(_)
         | PatKind::Bool(_)
         | PatKind::Path(_)
         | PatKind::Range { .. } => {}

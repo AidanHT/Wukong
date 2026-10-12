@@ -1,0 +1,13 @@
+// EXPECT-CODE: E0425
+module tests.fail.str_chars_value
+
+// `s.chars()` is legal only as the iterable of a `for` head: the language has no iterator values,
+// so the loop decodes the text in place. Bound to a name it would have nothing to be.
+fn main() -> i32 {
+    let s: str = "abc";
+    let it = s.chars();
+    for c in it {
+        println(c);
+    }
+    return 0;
+}

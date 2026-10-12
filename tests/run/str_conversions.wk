@@ -1,0 +1,90 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 4
+// EXPECT-OUT: 87
+// EXPECT-OUT: 117
+// EXPECT-OUT: 195
+// EXPECT-OUT: 169
+// EXPECT-OUT: 568
+// EXPECT-OUT: 87
+// EXPECT-OUT: 117
+// EXPECT-OUT: true
+// EXPECT-OUT: false
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: hi!
+// EXPECT-OUT: 3
+// EXPECT-OUT: 2
+// EXPECT-OUT: true
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 4
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+module tests.run.str_conversions
+
+// The conversions between `str` and bytes. Every expected line follows from the UTF-8 encoding
+// of the text, not from a run:
+// * `s = "Wu\u{e9}"` is the bytes 87 ('W'), 117 ('u') and 195 169 (U+00E9 is C3 A9), 4 in all;
+//   `s.as_bytes()` views exactly those, and they sum to 87 + 117 + 195 + 169 = 568.
+// * `s.as_ptr()` is the data pointer: `*` of it is the first byte, 87; a sub-`str` `s[1..2]`
+//   starts one byte in, at 117; `s[0..]` shares `s`'s pointer and `s[1..]` does not.
+// * `raw = [104, 105, 33, 0xE2, 0x82]` is "hi!" and then a 3-byte sequence cut short, so its
+//   longest valid prefix is 3 bytes, and so is the prefix's own; `str_from_utf8` of that prefix
+//   is "hi!", 3 bytes.
+// * `[0xC3, 0xA9]` is a valid U+00E9: 2 bytes, equal to the literal "\u{e9}".
+// * `utf8_valid_up_to` of ill-formed input is the index of the first bad sequence: 1 for
+//   `a FF b` (FF never starts a character); 0 for the overlong `C0 80` and for the surrogate
+//   `ED A0 80`; 4 for `F4 8F BF BF` (U+10FFFF, the last scalar value); 0 for `F4 90 80 80`
+//   (above U+10FFFF).
+
+fn sum_bytes(b: []u8) -> i64 {
+    let mut n: i64 = 0;
+    for x in b {
+        n = n + x as i64;
+    }
+    return n;
+}
+
+fn main() -> i32 {
+    let s: str = "Wu\u{e9}";
+    let b: []u8 = s.as_bytes();
+    println(b.len());
+    for x in b {
+        println(x);
+    }
+    println(sum_bytes(s.as_bytes()));
+
+    println(*s.as_ptr());
+    let mid = s[1..2];
+    println(*mid.as_ptr());
+    println(s[0..].as_ptr() == s.as_ptr());
+    println(s[1..].as_ptr() == s.as_ptr());
+
+    let raw: [u8; 5] = [104, 105, 33, 0xE2, 0x82];
+    let all: []u8 = raw;
+    println(utf8_valid_up_to(raw));
+    println(utf8_valid_up_to(all[..3]));
+    let t: str = str_from_utf8(all[..3]);
+    println(t);
+    println(t.len());
+
+    let e: [u8; 2] = [0xC3, 0xA9];
+    let es = str_from_utf8(e);
+    println(es.len());
+    println(es == "\u{e9}");
+
+    let bad1: [u8; 3] = [0x61, 0xFF, 0x62];
+    let bad2: [u8; 2] = [0xC0, 0x80];
+    let bad3: [u8; 3] = [0xED, 0xA0, 0x80];
+    let max: [u8; 4] = [0xF4, 0x8F, 0xBF, 0xBF];
+    let over: [u8; 4] = [0xF4, 0x90, 0x80, 0x80];
+    println(utf8_valid_up_to(bad1));
+    println(utf8_valid_up_to(bad2));
+    println(utf8_valid_up_to(bad3));
+    println(utf8_valid_up_to(max));
+    println(utf8_valid_up_to(over));
+    println(utf8_valid_up_to(all[3..4]));
+    return 0;
+}

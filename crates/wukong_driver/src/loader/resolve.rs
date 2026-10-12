@@ -1021,6 +1021,7 @@ impl Rewriter<'_> {
             | PatKind::Unit
             | PatKind::Int { .. }
             | PatKind::Char(_)
+            | PatKind::Str(_)
             | PatKind::Bool(_) => {}
         }
     }

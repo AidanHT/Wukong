@@ -32,7 +32,7 @@ use wukong_ast::{
     StmtKind, TypeExpr, TypeKind, UnOp, VariantPat,
 };
 use wukong_diag::Diagnostic;
-use wukong_sema::{BuiltinCall, MethodCall, SemaResult};
+use wukong_sema::{BuiltinCall, MethodCall, SemaResult, StrOp};
 use wukong_span::{FxHashMap, FxHashSet, Interner, Span, Symbol};
 use wukong_types::{Dim, Ty};
 
@@ -63,6 +63,13 @@ pub(crate) struct DeferOverlay {
     /// Entries layered over `sema.str_print_args`: a copied `str` print argument (`defer
     /// println(s)`) still prints as text, not as the `[]u8` it is published as.
     pub(crate) str_print_args: FxHashSet<NodeId>,
+    /// Entries layered over `sema.str_info.ops` (keyed by a call's CALLEE id): a copied `str`
+    /// method or builtin call (`defer free(str_concat(..))`, `defer println(s.char_count())`)
+    /// keeps the tag its lowering reads.
+    pub(crate) str_ops: FxHashMap<NodeId, StrOp>,
+    /// Entries layered over `sema.str_info.print_types`: a copied print argument holding a `str`
+    /// inside an aggregate still prints it as text.
+    pub(crate) str_print_types: FxHashMap<NodeId, Ty>,
 }
 
 impl DeferOverlay {
@@ -78,6 +85,12 @@ impl DeferOverlay {
             .calls
             .extend(self.method_calls.iter().map(|(id, c)| (*id, c.clone())));
         s.str_print_args.extend(self.str_print_args.iter().copied());
+        s.str_info
+            .ops
+            .extend(self.str_ops.iter().map(|(id, op)| (*id, *op)));
+        s.str_info
+            .print_types
+            .extend(self.str_print_types.iter().map(|(id, t)| (*id, t.clone())));
     }
 }
 
@@ -106,6 +119,8 @@ pub(crate) fn lower_defers(
         extra_builtin_calls: FxHashMap::default(),
         extra_method_calls: FxHashMap::default(),
         extra_str_print_args: FxHashSet::default(),
+        extra_str_ops: FxHashMap::default(),
+        extra_str_print_types: FxHashMap::default(),
         interner,
         next_id: DEFER_ID_TOP,
         diags: Vec::new(),
@@ -131,6 +146,8 @@ pub(crate) fn lower_defers(
                 builtin_calls: d.extra_builtin_calls,
                 method_calls: d.extra_method_calls,
                 str_print_args: d.extra_str_print_args,
+                str_ops: d.extra_str_ops,
+                str_print_types: d.extra_str_print_types,
             },
         )))
     } else {
@@ -170,6 +187,10 @@ struct Desugar<'a> {
     extra_method_calls: FxHashMap<NodeId, MethodCall>,
     /// The copies this pass creates of a `str` print argument.
     extra_str_print_args: FxHashSet<NodeId>,
+    /// The `str` operation tags of the copies this pass creates.
+    extra_str_ops: FxHashMap<NodeId, StrOp>,
+    /// The unerased print types of the copies this pass creates.
+    extra_str_print_types: FxHashMap<NodeId, Ty>,
     interner: &'a mut Interner,
     next_id: u32,
     diags: Vec<Diagnostic>,
@@ -634,6 +655,22 @@ impl Desugar<'_> {
         if self.extra_str_print_args.contains(id) || self.sema.str_print_args.contains(id) {
             self.extra_str_print_args.insert(new);
         }
+        let str_op = self
+            .extra_str_ops
+            .get(id)
+            .or_else(|| self.sema.str_info.ops.get(id))
+            .copied();
+        if let Some(op) = str_op {
+            self.extra_str_ops.insert(new, op);
+        }
+        let print_ty = self
+            .extra_str_print_types
+            .get(id)
+            .or_else(|| self.sema.str_info.print_types.get(id))
+            .cloned();
+        if let Some(t) = print_ty {
+            self.extra_str_print_types.insert(new, t);
+        }
         *id = new;
     }
 
@@ -836,6 +873,7 @@ impl Desugar<'_> {
             | PatKind::Unit
             | PatKind::Int { .. }
             | PatKind::Char(_)
+            | PatKind::Str(_)
             | PatKind::Bool(_)
             | PatKind::Path(_) => {}
         }
@@ -951,6 +989,7 @@ fn pattern_bindings(p: &Pattern, out: &mut Vec<Symbol>) {
         | PatKind::Unit
         | PatKind::Int { .. }
         | PatKind::Char(_)
+        | PatKind::Str(_)
         | PatKind::Bool(_)
         | PatKind::Path(_) => {}
     }

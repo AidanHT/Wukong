@@ -147,9 +147,10 @@ impl FnLowerer<'_> {
 
 /// `wukong_rt_check_fail` kinds — the values of `wukong_runtime::safety::CHECK_*`, which this crate
 /// does not depend on; the run fixtures that print each message pin the pairing end to end
-/// (`tests/run/str_slice_bounds.wk`, `str_range_order.wk`).
+/// (`tests/run/str_slice_bounds.wk`, `str_range_order.wk`, `str_from_utf8_invalid.wk`).
 pub(crate) const CHECK_RANGE_ORDER: i64 = 1;
 pub(crate) const CHECK_RANGE_END: i64 = 2;
+pub(crate) const CHECK_UTF8: i64 = 3;
 
 /// Rewrite every failure call's placeholder site operand into the address of a static
 /// `file:line:col` string, deduplicated by content. `failures` names each failure entry with its

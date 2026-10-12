@@ -1,0 +1,101 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: hello, ada!
+// EXPECT-OUT: 11
+// EXPECT-OUT: true
+// EXPECT-OUT: 0
+// EXPECT-OUT: true
+// EXPECT-OUT: id-007-2.50
+// EXPECT-OUT: 11
+// EXPECT-OUT: "hello, ada!" 11
+// EXPECT-OUT: 5
+// EXPECT-OUT: 3
+// EXPECT-OUT: 17
+// EXPECT-OUT: id-
+// EXPECT-OUT: hey!!
+// EXPECT-OUT: 5
+// EXPECT-OUT: 5
+// EXPECT-OUT: 25
+// EXPECT-OUT: 52
+// EXPECT-OUT: 1
+module tests.run.str_build
+
+// Building strings. `str_concat(a, b, …)` and `str_format(fmt, args…)` return a `str` in a fresh
+// heap allocation (the `alloc_<T>` allocator) that the program releases with `free`, as it
+// releases an `alloc_<T>` buffer; `defer free(t)` pairs the two in one scope. Each line by hand:
+// * greet("ada") is "hello, " + "ada" + "!": 7 + 3 + 1 = 11 bytes, equal to the literal.
+// * joining two empty strings gives the empty string.
+// * "{}-{:03}-{:.2}" of "id", 7, 2.5 is "id-007-2.50", 11 bytes, as Rust's `format!` renders it.
+// * "{:?} {}" quotes the `str` and prints a count: `"hello, ada!" 11` (11 characters in f).
+// * "\u{e9}t\u{e9}" is 5 bytes and 3 characters; f + "/" + that is 11 + 1 + 5 = 17 bytes, and
+//   its first 3 bytes are "id-".
+// * shout("hey") prints "hey!!", and on the way out its deferred statements run in reverse: the
+//   character count, 5, then the `free`; main then prints the 5 bytes it returned.
+// * five formatted "item0".."item4", each freed in the loop, total 5 * 5 = 25 bytes.
+// * a built `str` is followed by a NUL, so its `as_ptr()` is also a C string: "42" starts with
+//   '4' (52), and it matches the pattern "42".
+
+fn greet(name: str) -> str {
+    return str_concat("hello, ", name, "!");
+}
+
+fn shout(s: str) -> i64 {
+    let t = str_concat(s, "!!");
+    defer free(t);
+    defer println(t.char_count());
+    println(t);
+    return t.len();
+}
+
+fn main() -> i32 {
+    let g = greet("ada");
+    println(g);
+    println(g.len());
+    println(g == "hello, ada!");
+
+    let e = str_concat("", "");
+    println(e.len());
+    println(e == "");
+
+    let f = str_format("{}-{:03}-{:.2}", "id", 7, 2.5);
+    println(f);
+    println(f.len());
+    let q = str_format("{:?} {}", g, f.char_count());
+    println(q);
+
+    let u = str_format("{}", "\u{e9}t\u{e9}");
+    println(u.len());
+    println(u.char_count());
+    let joined = str_concat(f, "/", u);
+    println(joined.len());
+    println(joined[..3]);
+
+    println(shout("hey"));
+    free(joined);
+    free(u);
+    free(q);
+    free(f);
+    free(e);
+    free(g);
+
+    let mut total: i64 = 0;
+    for i in 0..5 {
+        let s = str_format("item{}", i);
+        total = total + s.len();
+        free(s);
+    }
+    println(total);
+
+    let c = str_format("{}{}", 4, 2);
+    println(*c.as_ptr());
+    match c {
+        "42" => {
+            println(1);
+        }
+        _ => {
+            println(0);
+        }
+    }
+    free(c);
+    return 0;
+}

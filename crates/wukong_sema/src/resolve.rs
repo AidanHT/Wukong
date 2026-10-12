@@ -74,7 +74,8 @@ fn recv_of(t: &Ty) -> Recv {
 fn builtin_methods_of(r: Recv) -> &'static [&'static str] {
     match r {
         Recv::Array => &["dim", "len"],
-        Recv::Slice | Recv::Str => &["len"],
+        Recv::Slice => &["len"],
+        Recv::Str => crate::STR_METHODS,
         Recv::Tensor => &["dim", "len", "row_ptr"],
         Recv::Pointer => &["offset"],
         Recv::Vector => &["fma", "store"],

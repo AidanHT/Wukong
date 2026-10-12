@@ -663,6 +663,42 @@ fn every_pattern_kind() {
     );
 }
 
+/// A string-literal pattern prints exactly as written — escapes included, since `"l\x65t"` and
+/// `"let"` are the same pattern only after decoding — alone, in an or-pattern, under `name @`, and
+/// nested in a tuple, a struct and a slice pattern.
+#[test]
+fn string_literal_patterns() {
+    golden(
+        "fn f(s: str, t: (str, i32), c: Cmd, v: []str) -> i32 {
+    match s { \"let\"|\"l\\x65t\" => 1, w @ \"\\u{e9}\" => 2, \"\" => 3, _ => 0 }
+    if let (\"add\", 2) = t { return 4; }
+    match c { Cmd { op: \"push\", .. } => 5, _ => 0 }
+    match v { [\"run\", f] => 6, _ => 0 }
+}
+",
+        "fn f(s: str, t: (str, i32), c: Cmd, v: []str) -> i32 {
+    match s {
+        \"let\" | \"l\\x65t\" => 1,
+        w @ \"\\u{e9}\" => 2,
+        \"\" => 3,
+        _ => 0,
+    }
+    if let (\"add\", 2) = t {
+        return 4;
+    }
+    match c {
+        Cmd { op: \"push\", .. } => 5,
+        _ => 0,
+    }
+    match v {
+        [\"run\", f] => 6,
+        _ => 0,
+    }
+}
+",
+    );
+}
+
 #[test]
 fn match_guards_and_block_bodied_arms() {
     golden(

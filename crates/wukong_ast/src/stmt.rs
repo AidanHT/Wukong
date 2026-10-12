@@ -93,6 +93,10 @@ pub enum PatKind {
     /// any escape) is stored like `ExprKind::Char` and decoded to a code point later; it matches by
     /// comparing the scrutinee to that code point, exactly like an integer-literal pattern.
     Char(Symbol),
+    /// A string-literal pattern, e.g. `"add"` in a `match` over a `str`. The raw source text
+    /// (quotes and escapes included) is stored like `ExprKind::Str` and decoded later; it matches a
+    /// `str` whose bytes equal the decoded literal's — the same test as `s == "add"`.
+    Str(Symbol),
     /// A boolean literal pattern (`true` / `false`).
     Bool(bool),
     /// An or-pattern `A | B | C` — matches if any alternative matches. Every alternative binds the

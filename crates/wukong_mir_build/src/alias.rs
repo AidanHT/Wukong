@@ -502,6 +502,14 @@ fn origin_of(e: &Expr, sema: &SemaResult) -> Origin {
         ExprKind::Call { callee, args, .. } if sema.is_range_slice_call(callee) => args
             .first()
             .map_or(Origin::Unknown, |base| project(e, base, Proj::Index, sema)),
+        // `s.as_bytes()`, `s.as_ptr()` and `str_from_utf8(b)` hand back their operand's bytes,
+        // copying nothing (`strs.rs`): a place in that operand, exactly as a whole-range index is.
+        ExprKind::Call { callee, args, .. } if sema.str_view_operand(callee, args).is_some() => {
+            match sema.str_view_operand(callee, args) {
+                Some(base) => project(e, base, Proj::Index, sema),
+                None => Origin::Unknown,
+            }
+        }
         // A call's value is fresh unless the callee's return type is a *borrowing* one, in which
         // case it can be one of the callee's own arguments coming back out.
         ExprKind::Call { .. } => match sema.types.get(&e.id) {
@@ -550,7 +558,9 @@ fn project(whole: &Expr, base: &Expr, step: Proj, sema: &SemaResult) -> Origin {
 /// exactly as `x[i]`'s does.
 fn origin_unknown_is_a_call(e: &Expr, sema: &SemaResult) -> bool {
     match &e.kind {
-        ExprKind::Call { callee, .. } => !sema.is_range_slice_call(callee),
+        ExprKind::Call { callee, args, .. } => {
+            !sema.is_range_slice_call(callee) && sema.str_view_operand(callee, args).is_none()
+        }
         ExprKind::Cast { expr, .. }
         | ExprKind::Unary {
             op: ast::UnOp::Ref | ast::UnOp::RefMut | ast::UnOp::Deref,
@@ -1432,6 +1442,7 @@ fn pattern_binds(p: &ast::Pattern) -> bool {
         | ast::PatKind::Unit
         | ast::PatKind::Int { .. }
         | ast::PatKind::Char(_)
+        | ast::PatKind::Str(_)
         | ast::PatKind::Bool(_)
         | ast::PatKind::Path(_) => false,
     }
@@ -1637,6 +1648,7 @@ fn note_pattern_views(
         | ast::PatKind::Unit
         | ast::PatKind::Int { .. }
         | ast::PatKind::Char(_)
+        | ast::PatKind::Str(_)
         | ast::PatKind::Bool(_)
         | ast::PatKind::Path(_) => {}
     }
@@ -1719,6 +1731,7 @@ fn pattern_binds_by_pointer(p: &ast::Pattern, ty: &Ty, sema: &SemaResult, depth:
         | ast::PatKind::Unit
         | ast::PatKind::Int { .. }
         | ast::PatKind::Char(_)
+        | ast::PatKind::Str(_)
         | ast::PatKind::Bool(_)
         | ast::PatKind::Path(_) => false,
     }
@@ -1751,6 +1764,7 @@ fn pattern_has_at(p: &ast::Pattern) -> bool {
         | ast::PatKind::Unit
         | ast::PatKind::Int { .. }
         | ast::PatKind::Char(_)
+        | ast::PatKind::Str(_)
         | ast::PatKind::Bool(_)
         | ast::PatKind::Path(_) => false,
     }

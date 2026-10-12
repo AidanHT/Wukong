@@ -22,7 +22,8 @@
 //! | `enum` | one per discriminant; a payload variant's fields are sub-columns ([`VariantPayload::field_tys`]) |
 //! | tuple, `()`, struct, array `[T; N]` (up to 32 fields) | the single constructor whose fields are the elements |
 //! | slice `[]T` | one per length — split as below — whose fields are the elements |
-//! | anything else — floats, `str`, pointers, tensors, generics | none the analysis can name: only `_` or a binding covers it |
+//! | `str` | one per distinct string literal a row names (by its decoded bytes), and the infinitely many other strings, which only `_` or a binding covers |
+//! | anything else — floats, pointers, tensors, generics | none the analysis can name: only `_` or a binding covers it |
 //!
 //! A slice column has a constructor per length, infinitely many, which the split makes finite the
 //! way rustc does: with `L` past every length a row pins down — longer than any `[a, b]` without
@@ -58,6 +59,8 @@
 //! trapping. `wukong_opt`'s `exhaustive_int_match_agrees_with_rust_on_every_value` pins the integer
 //! side on every `u8` and `i8` value; the two `char`-literal decoders (`char_value` here,
 //! `decode_char_literal` there) are the remaining unpinned half.
+
+use std::cell::RefCell;
 
 use wukong_ast::{MatchArm, PatKind, Path, Pattern, VariantPat};
 use wukong_span::{Interner, Symbol};
@@ -106,6 +109,7 @@ pub(crate) fn analyze(
         defs,
         interner,
         budget: BUDGET,
+        strs: RefCell::default(),
     };
     let mut pats = Vec::with_capacity(arms.len());
     for a in arms {
@@ -157,6 +161,7 @@ pub(crate) fn refutable(
         defs,
         interner,
         budget: BUDGET,
+        strs: RefCell::default(),
     };
     let p = cx.lower(pat, ty)?;
     let tys = [ty.clone()];
@@ -177,6 +182,7 @@ pub(crate) fn placeable(defs: &DefMap, interner: &Interner, ty: &Ty, pat: &Patte
         defs,
         interner,
         budget: BUDGET,
+        strs: RefCell::default(),
     };
     cx.lower(pat, ty).is_some()
 }
@@ -238,6 +244,9 @@ enum DPat {
     Variant(usize, Vec<DPat>),
     /// The single constructor of a tuple or `()`, with its fields.
     Product(Vec<DPat>),
+    /// A string literal on a `str` column: an index into [`Cx::strs`], one per distinct byte
+    /// string, so `"a"` and `"\x61"` are one constructor.
+    Str(u32),
     /// An array pattern on a `[]T`: without `..` (`var: false`, `suffix` empty) it matches the
     /// slices of exactly `prefix.len()` elements; with one, those of at least
     /// `prefix.len() + suffix.len()`.
@@ -264,6 +273,8 @@ enum Ctor {
     SliceFixed(usize),
     /// The slices of at least `p + s` elements, whose fields are the first `p` and the last `s`.
     SliceVar(usize, usize),
+    /// The one `str` a string literal names (an index into [`Cx::strs`]).
+    Str(u32),
 }
 
 /// A witness under construction: one per column.
@@ -292,6 +303,8 @@ enum Space {
     Product(Product),
     /// A `[]T` slice of this element type, one constructor per length (see the module docs).
     Slice(Ty),
+    /// A `str`: one constructor per string literal, and infinitely many no pattern names.
+    Str,
     /// No constructors the analysis can name.
     Opaque,
 }
@@ -349,6 +362,9 @@ struct Cx<'a> {
     defs: &'a DefMap,
     interner: &'a Interner,
     budget: u32,
+    /// The decoded bytes of every string literal lowered so far; [`DPat::Str`] and [`Ctor::Str`]
+    /// index it. A `RefCell` because lowering takes `&self`.
+    strs: RefCell<Vec<Vec<u8>>>,
 }
 
 impl Cx<'_> {
@@ -385,7 +401,22 @@ impl Cx<'_> {
                 _ => Space::Opaque,
             },
             Ty::Slice(elem) => Space::Slice((**elem).clone()),
+            Ty::Str => Space::Str,
             _ => Space::Opaque,
+        }
+    }
+
+    /// The constructor index of the string literal `sym` (its raw source text): equal decoded
+    /// bytes share one index — `mir_build` compares bytes, so must this.
+    fn str_id(&self, sym: Symbol) -> u32 {
+        let bytes = crate::text::decode_string_literal(self.interner.resolve(sym));
+        let mut strs = self.strs.borrow_mut();
+        match strs.iter().position(|b| *b == bytes) {
+            Some(i) => i as u32,
+            None => {
+                strs.push(bytes);
+                (strs.len() - 1) as u32
+            }
         }
     }
 
@@ -406,6 +437,16 @@ impl Cx<'_> {
             ),
             PatKind::Bool(b) => match ty {
                 Ty::Scalar(Scalar::Bool) => DPat::Bool(*b),
+                _ => return None,
+            },
+            // On a `str` — or on the `[]u8` it is published as, which is how the lints, which run
+            // on the published types, see one: sema admits a string-literal pattern only against a
+            // `str` (E0426), so no real `[]u8` column ever holds one.
+            PatKind::Str(sym) => match ty {
+                Ty::Str => DPat::Str(self.str_id(*sym)),
+                Ty::Slice(e) if matches!(e.as_ref(), Ty::Scalar(Scalar::U8)) => {
+                    DPat::Str(self.str_id(*sym))
+                }
                 _ => return None,
             },
             PatKind::Int { .. } | PatKind::Char(_) => {
@@ -741,6 +782,10 @@ impl Cx<'_> {
                     }
                 }
             },
+            (_, Ctor::Str(k)) => match self.strs.borrow().get(k as usize) {
+                Some(b) => format!("{:?}", String::from_utf8_lossy(b)),
+                None => "_".to_string(),
+            },
             (Space::Slice(_), Ctor::SliceFixed(_)) => format!("[{}]", subs.join(", ")),
             (Space::Slice(_), Ctor::SliceVar(p, _)) => {
                 let mut parts: Vec<&str> = subs[..p].iter().map(String::as_str).collect();
@@ -821,6 +866,7 @@ fn specialize(row: &[DPat], c: Ctor, arity: usize) -> Option<Vec<DPat>> {
         (DPat::Range(lo, hi), Ctor::Seg(a, b)) if *lo <= a && b <= *hi => Vec::new(),
         (DPat::Variant(k, subs), Ctor::Class(x)) if *k == x => subs.clone(),
         (DPat::Product(subs), Ctor::Single) => subs.clone(),
+        (DPat::Str(a), Ctor::Str(b)) if *a == b => Vec::new(),
         (
             DPat::Slice {
                 prefix, var: false, ..
@@ -936,7 +982,8 @@ fn split_column(space: &Space, heads: &[&DPat]) -> Split {
                 Split::Incomplete(missing)
             }
         }
-        Space::Opaque => Split::Incomplete(Vec::new()),
+        // No set of literals covers every `str`: only the wildcard-headed rows can decide.
+        Space::Str | Space::Opaque => Split::Incomplete(Vec::new()),
     }
 }
 
@@ -1010,6 +1057,7 @@ fn head_ctors(space: &Space, head: &DPat, heads: &[&DPat]) -> Vec<Ctor> {
         }
         DPat::Variant(k, _) => vec![Ctor::Class(*k)],
         DPat::Product(_) => vec![Ctor::Single],
+        DPat::Str(k) => vec![Ctor::Str(*k)],
         // The split counts this head too, so the variable-length constructor's `p`/`s` cover it.
         DPat::Slice { .. } => {
             let mut all: Vec<&DPat> = heads.to_vec();

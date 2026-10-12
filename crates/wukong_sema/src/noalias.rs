@@ -115,6 +115,7 @@ pub(crate) fn check(
     interner: &Interner,
     defs: &DefMap,
     types: &HashMap<NodeId, Ty>,
+    str_ops: &HashMap<NodeId, crate::StrOp>,
     diags: &mut Vec<Diagnostic>,
 ) {
     let mut promises: HashMap<Symbol, Vec<Promise>> = HashMap::default();
@@ -141,6 +142,7 @@ pub(crate) fn check(
                     interner,
                     defs,
                     types,
+                    str_ops,
                     promises: &promises,
                     diags: &mut *diags,
                     scopes: Vec::new(),
@@ -279,6 +281,8 @@ struct Walker<'a> {
     interner: &'a Interner,
     defs: &'a DefMap,
     types: &'a HashMap<NodeId, Ty>,
+    /// The `str` operations sema typed (`strs.rs`), for the ones whose result views an operand.
+    str_ops: &'a HashMap<NodeId, crate::StrOp>,
     promises: &'a HashMap<Symbol, Vec<Promise>>,
     diags: &'a mut Vec<Diagnostic>,
     /// Lexical scopes, innermost last: name -> binding id (an index into `bindings`).
@@ -365,6 +369,7 @@ impl Walker<'_> {
             | PatKind::Unit
             | PatKind::Int { .. }
             | PatKind::Char(_)
+            | PatKind::Str(_)
             | PatKind::Bool(_)
             | PatKind::Path(_)
             | PatKind::Range { .. } => {}
@@ -508,6 +513,7 @@ impl Walker<'_> {
             | PatKind::Unit
             | PatKind::Int { .. }
             | PatKind::Char(_)
+            | PatKind::Str(_)
             | PatKind::Bool(_)
             | PatKind::Path(_)
             | PatKind::Range { .. } => {}
@@ -657,10 +663,12 @@ impl Walker<'_> {
     /// For an immutable `let` binding of a view: what it points at, when the initializer names it.
     fn view_init(&self, ann: Option<&TypeExpr>, init: &Expr) -> Option<Root> {
         let bound_is_view = match ann {
-            Some(t) => matches!(
-                t.kind,
-                TypeKind::Slice(_) | TypeKind::Pointer { .. } | TypeKind::Ref { .. }
-            ),
+            // A `str` is a view too (`is_view_ty`), spelled as a path.
+            Some(t) => match &t.kind {
+                TypeKind::Slice(_) | TypeKind::Pointer { .. } | TypeKind::Ref { .. } => true,
+                TypeKind::Path(p) => p.is_single() && self.interner.resolve(p.first().sym) == "str",
+                _ => false,
+            },
             None => self.is_view(init),
         };
         if !bound_is_view {
@@ -948,6 +956,13 @@ impl Walker<'_> {
             ExprKind::Call { callee, args, .. } if self.is_range_slice_call(callee) => {
                 self.root_of(args.first()?)
             }
+            // `s.as_bytes()`, `s.as_ptr()` and `str_from_utf8(b)` view their operand's bytes
+            // (`strs.rs`), so `ks(b, str_from_utf8(b).as_bytes())` names one buffer twice.
+            ExprKind::Call { callee, args, .. } => self.root_of(crate::strs::str_view_operand_in(
+                self.str_ops,
+                callee,
+                args,
+            )?),
             ExprKind::Binary {
                 op: AstBinOp::Add | AstBinOp::Sub,
                 lhs,
@@ -1044,6 +1059,36 @@ fn kp(@noalias mut o: [f32; 4], q: P) { o[0] = q.a[0]; }
             in_main(&format!("{one} let t: []f32 = b; ks(s[0..2], t[1..3]);")),
             Vec::<&str>::new()
         );
+    }
+
+    /// `s.as_bytes()` and `str_from_utf8(b)` view their operand (`strs.rs`), as a range index views
+    /// its base: a `str` built over a buffer, passed back beside that buffer, is the same storage.
+    #[test]
+    fn str_views_of_a_buffer_are_its_storage() {
+        let src = |call: &str| {
+            format!(
+                "fn kb(@noalias mut o: []u8, x: []u8) {{ o[0] = x[0]; }}\n\
+                 fn main() -> i32 {{\n\
+                 let mut buf: [u8; 4] = [97, 98, 99, 100];\n\
+                 let mut other: [u8; 4] = [97, 98, 99, 100];\n\
+                 let b: []u8 = buf;\n\
+                 let c: []u8 = other;\n\
+                 let s: str = str_from_utf8(b);\n\
+                 let t: str = \"lit\";\n\
+                 {call}\n\
+                 return 0;\n}}"
+            )
+        };
+        for call in [
+            "kb(b, s.as_bytes());",
+            "kb(b, str_from_utf8(b).as_bytes());",
+            "kb(b, s[1..].as_bytes());",
+        ] {
+            assert_eq!(codes(&src(call)), vec!["E0316"], "{call}");
+        }
+        for call in ["kb(c, s.as_bytes());", "kb(b, t.as_bytes());"] {
+            assert_eq!(codes(&src(call)), Vec::<&str>::new(), "{call}");
+        }
     }
 
     #[test]

@@ -1,0 +1,87 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: on
+// EXPECT-OUT: 2
+// EXPECT-OUT: ccc
+// EXPECT-OUT: 3
+// EXPECT-OUT: no
+// EXPECT-OUT: one
+// EXPECT-OUT: many
+// EXPECT-OUT: lit
+// EXPECT-OUT: 3
+// EXPECT-OUT: other
+// EXPECT-OUT: xon
+module tests.run.str_literal_arms
+
+// An `if` or `match` whose every arm is a string literal is a `str` wherever one is expected —
+// a `let` annotation, a function's `str` tail, a `str` argument — exactly as a single literal is;
+// and a literal arm beside a `str` arm is a `str` too, on either side. (It used to stay `*u8`, so
+// `let s: str = if c { "on" } else { "off" };` was E0401.) By hand: `c` is true and `k` is 3, so
+// `s` is "on" (2 bytes); the match takes `_`, whose `if` gives "ccc" (3 bytes); yes_no(false) is
+// "no"; grade(1) is "one" and grade(7) "many"; `u` takes its literal first arm, "lit" (3 bytes);
+// `v` takes the literal `_` arm, "other"; and the concatenation of the `if`'s "x" and `s` is "xon".
+
+fn yes_no(b: bool) -> str {
+    if b {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn grade(n: i32) -> str {
+    match n {
+        0 => "zero",
+        1 => "one",
+        _ => "many",
+    }
+}
+
+fn main() -> i32 {
+    let c = true;
+    let s: str = if c {
+        "on"
+    } else {
+        "off"
+    };
+    println(s);
+    println(s.len());
+    let k = 3;
+    let t: str = match k {
+        1 => "a",
+        2 => {
+            "bb"
+        }
+        _ => if c {
+            "ccc"
+        } else {
+            "dddd"
+        },
+    };
+    println(t);
+    println(t.len());
+    println(yes_no(false));
+    println(grade(1));
+    println(grade(7));
+    let base: str = "base";
+    let u = if c {
+        "lit"
+    } else {
+        base
+    };
+    println(u);
+    println(u.len());
+    let v = match k {
+        1 => base,
+        _ => "other",
+    };
+    println(v);
+    let w = str_concat(if c {
+        "x"
+    } else {
+        "y"
+    }, s);
+    println(w);
+    free(w);
+    return 0;
+}

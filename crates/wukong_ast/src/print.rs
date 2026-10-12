@@ -577,7 +577,7 @@ impl AstPrinter<'_> {
                 let s = self.sym(*sym);
                 self.line(format!("pat {}{}", if *neg { "-" } else { "" }, s));
             }
-            PatKind::Char(sym) => {
+            PatKind::Char(sym) | PatKind::Str(sym) => {
                 let s = self.sym(*sym);
                 self.line(format!("pat {s}"));
             }
