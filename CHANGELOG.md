@@ -238,6 +238,7 @@ All notable changes to Wukong are documented here. The format is loosely based o
   stderr, which the interpreter now writes through the runtime's `write_stream` like the JIT and an
   executable do; `wukong_runtime::process::detach_stdin` gives every later program an empty
   standard input.
+
 ### Slice patterns, `rest @ ..`, or-pattern bindings and let chains (`gap6/patterns-slices`)
 
 - **Array patterns on `[]T` slices (N26).** `match s { [] => …, [x] => …, [first, .., last] => … }`
