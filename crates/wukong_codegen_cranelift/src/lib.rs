@@ -24,7 +24,7 @@ use std::sync::Mutex;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
     types, AbiParam, AliasRegion, AtomicRmwOp, Block, BlockArg, FuncRef, GlobalValue, InstBuilder,
-    MemFlags, Signature, SourceLoc, StackSlotData, StackSlotKind, Type, Value,
+    MemFlags, Signature, SourceLoc, StackSlot, StackSlotData, StackSlotKind, Type, Value,
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -55,6 +55,10 @@ mod text_rt;
 // policy (internal, mangled user functions in an executable).
 mod entry;
 pub use entry::ObjectKind;
+
+// Stack-slot coloring: allocas with disjoint lifetimes share one frame slot.
+mod stack_color;
+pub use stack_color::{frame_bytes, FrameBytes};
 
 // --- The minimal runtime the generated code calls back into ---------------------------------
 //
@@ -608,7 +612,10 @@ fn mem_flags() -> MemFlags {
 /// categories within a function. A slot that never escapes can, by the definition of escaping, only
 /// be reached through values whose provenance is that same `alloca` — its address never becomes a
 /// store's value, a call argument, a branch argument or an integer — so every access to it is tagged
-/// here, and no untracked pointer can name it. Every *other* access keeps `None`.
+/// here, and no untracked pointer can name it. Every *other* access keeps `None`. A frame slot that
+/// [`stack_color`] shares between allocas with disjoint lifetimes keeps the rule: at `-O1`+ its
+/// members are all private or all not, and at `-O0` a private member of a mixed slot is demoted to
+/// `None` ([`FnTranslator::demoted_slot`]).
 const PRIVATE_STACK_REGION: AliasRegion = AliasRegion::Vmctx;
 
 /// The alias region of every access to **`@noalias` parameter storage this function writes** and
@@ -920,6 +927,10 @@ struct FnTranslator<'a> {
     /// Where `layout_err` was raised: the span of `cur_loc` at that moment, else the function's
     /// declaration. Becomes [`NativeFailure::site`].
     err_site: Option<Span>,
+    /// Which allocas share a frame slot ([`stack_color`]); empty when coloring is off.
+    slot_plan: stack_color::SlotPlan,
+    /// The Cranelift slot of each shared color, created when its first member is lowered.
+    color_slots: Vec<Option<StackSlot>>,
 }
 
 /// The value a terminator's code is attributed to: a branch's condition, a switch's scrutinee, a
@@ -977,6 +988,36 @@ impl<'a> FnTranslator<'a> {
         self.vmap[v.0 as usize] = Some(cv);
     }
 
+    /// The Cranelift stack slot the alloca `res` lives in: its color's shared slot when
+    /// [`stack_color`] put it in one (created by the first member lowered, at the color's size and
+    /// alignment, which cover `spec`), else a slot of its own shaped `spec`.
+    fn alloca_stack_slot(
+        &mut self,
+        res: Option<ValueId>,
+        spec: stack_color::SlotSpec,
+    ) -> StackSlot {
+        let shared = res.and_then(|v| self.slot_plan.color_of(v));
+        if let Some((c, _)) = shared {
+            if let Some(slot) = self.color_slots.get(c as usize).copied().flatten() {
+                return slot;
+            }
+        }
+        let shape = shared.map_or(spec, |(_, color)| color);
+        let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            shape.bytes,
+            shape.align_shift,
+        ));
+        if let Some((c, _)) = shared {
+            let c = c as usize;
+            if self.color_slots.len() <= c {
+                self.color_slots.resize(c + 1, None);
+            }
+            self.color_slots[c] = Some(slot);
+        }
+        slot
+    }
+
     /// Byte size of `ty` for stack-slot sizing / `gep` scaling. On an unrepresentable (overflowing)
     /// layout it records a clean compiler error and returns a harmless 1-byte placeholder so the
     /// half-built Cranelift IR stays well-formed; `populate_module` checks `layout_err` right after
@@ -1009,7 +1050,7 @@ impl<'a> FnTranslator<'a> {
     /// is sound. Every other access keeps `None`.
     fn mem_flags_for(&self, ptr: ValueId) -> MemFlags {
         let mut fl = mem_flags();
-        if self.alias.is_private_stack(ptr) {
+        if self.alias.is_private_stack(ptr) && !self.demoted_slot(ptr) {
             fl.set_alias_region(Some(PRIVATE_STACK_REGION));
         } else if let Some(s) = self.alias.promised_storage(ptr) {
             fl.set_alias_region(Some(match s {
@@ -1018,6 +1059,15 @@ impl<'a> FnTranslator<'a> {
             }));
         }
         fl
+    }
+
+    /// Does `ptr` point into a private slot that [`stack_color`] shares with a non-private one, so
+    /// that it must give up [`PRIVATE_STACK_REGION`] (only at `-O0`; see `SlotPlan::demotes`)?
+    fn demoted_slot(&self, ptr: ValueId) -> bool {
+        match self.alias.prov(ptr) {
+            wukong_opt::Prov::Alloca(a) => self.slot_plan.demotes(a),
+            _ => false,
+        }
     }
 
     /// [`Self::mem_flags_for`] for a load of `ty` through `ptr`. A load from the fat pointer of a
@@ -1265,28 +1315,18 @@ impl<'a> FnTranslator<'a> {
             }
             Op::Alloca { ty, align, .. } => {
                 let bytes = self.size_of_or_err(ty).max(1);
-                let natural = align_shift(bytes);
                 // `align` (from `@align(N)`) only ever raises the slot's alignment; `0` is natural.
-                let want = (1u32 << natural).max(*align);
+                let (spec, want) = stack_color::alloca_slot(bytes, *align);
+                let slot = self.alloca_stack_slot(res, spec);
+                let base = self.builder.ins().stack_addr(self.ptr_ty, slot, 0);
                 if want > FRAME_ALIGN {
-                    // Past the stack pointer's own alignment the base needs a run-time round-up:
-                    // see `over_aligned_slot_bytes`.
+                    // Past the stack pointer's own alignment the base needs a run-time round-up
+                    // inside the slot's slack: see `over_aligned_slot_bytes`.
                     let slack = want - FRAME_ALIGN;
-                    let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
-                        StackSlotKind::ExplicitSlot,
-                        over_aligned_slot_bytes(bytes, want),
-                        natural.max(FRAME_ALIGN.trailing_zeros() as u8),
-                    ));
-                    let base = self.builder.ins().stack_addr(self.ptr_ty, slot, 0);
                     let bumped = self.builder.ins().iadd_imm(base, i64::from(slack));
                     self.builder.ins().band_imm(bumped, -i64::from(want))
                 } else {
-                    let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
-                        StackSlotKind::ExplicitSlot,
-                        bytes,
-                        want.trailing_zeros() as u8,
-                    ));
-                    self.builder.ins().stack_addr(self.ptr_ty, slot, 0)
+                    base
                 }
             }
             Op::Barrier => {
@@ -3436,6 +3476,8 @@ fn populate_module<M: Module>(
 ) -> Result<HashMap<Symbol, FuncId>, NativeFailure> {
     // Compact boolean-vector casts are legalized per function inside `build_function_clif`.
     let asserting = asserting_functions(program, interner);
+    // Stack-slot coloring needs to know which calls may retain a pointer (`stack_color`).
+    let captures = stack_color::enabled().then(|| wukong_opt::CaptureSummary::analyze(program));
     let ptr_ty = module.target_config().pointer_type();
     let call_conv = module.target_config().default_call_conv;
 
@@ -4521,6 +4563,7 @@ fn populate_module<M: Module>(
             &data_ids,
             &kernel_ids,
             &asserting,
+            captures.as_ref(),
         )?;
     } else {
         define_functions_serial(
@@ -4534,6 +4577,7 @@ fn populate_module<M: Module>(
             &data_ids,
             &kernel_ids,
             &asserting,
+            captures.as_ref(),
         )?;
     }
     if let Some(main) = entry_name {
@@ -4623,6 +4667,11 @@ fn build_function_clif(
                     .map(|&kid| module.declare_func_in_func(kid, builder.func)),
             );
             blocks.extend(f.blocks.iter().map(|_| builder.create_block()));
+            let alias = wukong_opt::AliasInfo::analyze(f);
+            let slot_plan = module
+                .coloring
+                .map(|cfg| stack_color::SlotPlan::new(f, cfg, &alias))
+                .unwrap_or_default();
             let mut t = FnTranslator {
                 builder,
                 func: f,
@@ -4638,10 +4687,12 @@ fn build_function_clif(
                 branch_args,
                 data_refs,
                 kernel_refs,
-                alias: wukong_opt::AliasInfo::analyze(f),
+                alias,
                 layout_err: None,
                 cur_loc: None,
                 err_site: None,
+                slot_plan,
+                color_slots: Vec::new(),
             };
             t.translate();
             // `layout_err` carries every unrecoverable lowering failure — a type whose byte layout
@@ -4678,8 +4729,23 @@ fn at_decl(f: &Function, message: String) -> NativeFailure {
 struct Decls<'a> {
     d: &'a cranelift_module::ModuleDeclarations,
     asserting: &'a HashSet<Symbol>,
+    /// What stack-slot coloring needs when it is on ([`stack_color`]).
+    coloring: Option<stack_color::ColorConfig<'a>>,
     /// Whether the target ISA has SSSE3 (`pshufb`), which decides how `Op::Shuffle` is lowered.
     ssse3: bool,
+}
+
+/// The stack-coloring configuration for code generated by `isa`: on when the program's capture
+/// summary was built, mixing alias regions only where Cranelift runs no alias analysis
+/// (`opt_level=none`, the source `-O0`; see [`stack_color`]).
+fn color_config<'a>(
+    captures: Option<&'a wukong_opt::CaptureSummary>,
+    isa: &dyn cranelift_codegen::isa::TargetIsa,
+) -> Option<stack_color::ColorConfig<'a>> {
+    captures.map(|calls| stack_color::ColorConfig {
+        calls,
+        mix_regions: isa.flags().opt_level() == settings::OptLevel::None,
+    })
 }
 
 /// Does `isa` have SSSE3? Read off the ISA's own flags, so `--target-cpu` levels and host detection
@@ -4749,6 +4815,7 @@ fn define_functions_serial<M: Module>(
     data_ids: &HashMap<Symbol, DataId>,
     kernel_ids: &[Vec<FuncId>],
     asserting: &HashSet<Symbol>,
+    captures: Option<&wukong_opt::CaptureSummary>,
 ) -> Result<(), NativeFailure> {
     let mut ctx = module.make_context();
     let mut fbctx = FunctionBuilderContext::new();
@@ -4759,6 +4826,7 @@ fn define_functions_serial<M: Module>(
             let decls = Decls {
                 d: module.declarations(),
                 asserting,
+                coloring: color_config(captures, module.isa()),
                 ssse3,
             };
             build_function_clif(
@@ -4805,6 +4873,7 @@ fn define_functions_parallel<M: Module>(
     data_ids: &HashMap<Symbol, DataId>,
     kernel_ids: &[Vec<FuncId>],
     asserting: &HashSet<Symbol>,
+    captures: Option<&wukong_opt::CaptureSummary>,
 ) -> Result<(), NativeFailure> {
     use cranelift_module::ModuleReloc;
     use rayon::prelude::*;
@@ -4816,6 +4885,7 @@ fn define_functions_parallel<M: Module>(
         let decls = Decls {
             d: module.declarations(),
             asserting,
+            coloring: color_config(captures, module.isa()),
             ssse3: isa_has_ssse3(module.isa()),
         };
         let isa = module.isa();
