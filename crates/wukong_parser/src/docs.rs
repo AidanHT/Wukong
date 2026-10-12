@@ -21,7 +21,7 @@ use wukong_span::{Interner, Span};
 pub struct DoctestOutput {
     /// The example's items, in order.
     pub items: Vec<Item>,
-    /// The statements after them (with the tail expression, when the example ends in one).
+    /// Its statements, in order (with the tail expression, when the example ends in one).
     pub block: Block,
     /// Parser errors (the lexer's diagnostics are the caller's).
     pub diags: Vec<Diagnostic>,
@@ -29,11 +29,11 @@ pub struct DoctestOutput {
     pub next_node: u32,
 }
 
-/// Parse a doc example (`wukongc --doctest`): its items first — anything that starts like one
-/// (`fn`, `struct`, `enum`, `const`, `type`, `trait`, `impl`, `extern`, `import`, `pub`, after any
-/// attributes) — then statements to the end of input, the body of the `main` the runner wraps
-/// them in. `NodeId`s are allocated from `first_node_id`, as for
-/// [`crate::parse_module_tokens_from`].
+/// Parse a doc example (`wukongc --doctest`): its items — anything at the top level that starts
+/// like one (`fn`, `struct`, `enum`, `const`, `type`, `trait`, `impl`, `extern`, `import`, `pub`,
+/// after any attributes) — and, in between, its statements, which become the body of the `main`
+/// the runner wraps them in (in order; the last expression with no `;` is the tail). `NodeId`s are
+/// allocated from `first_node_id`, as for [`crate::parse_module_tokens_from`].
 pub fn parse_doctest_tokens(
     tokens: &[Token],
     src: &str,
@@ -42,15 +42,49 @@ pub fn parse_doctest_tokens(
 ) -> DoctestOutput {
     let mut p = Parser::new(tokens, src, interner);
     p.next_node = first_node_id;
+    p.items_end_stmts = true;
+    let start = p.span();
+    let block_id = p.nid();
     let mut items = Vec::new();
-    while p.at_item_start() {
-        let before = p.pos;
-        items.extend(p.parse_item());
-        if p.pos == before {
+    let mut stmts = Vec::new();
+    let mut tail = None;
+    loop {
+        while p.at_item_start() {
+            let before = p.pos;
+            items.extend(p.parse_item());
+            if p.pos == before {
+                break;
+            }
+        }
+        if p.at(TokenKind::Eof) {
             break;
         }
+        let before = p.pos;
+        let (mut more, t) = p.block_contents(TokenKind::Eof);
+        stmts.append(&mut more);
+        // An expression that ends right before an item is a statement of its own; only the
+        // example's last expression is its tail.
+        if let Some(e) = tail.replace(t).flatten() {
+            stmts.push(p.expr_stmt(*e));
+        }
+        if p.pos == before {
+            // A stray closer (`}`) the statement list stops at: report it and step over it.
+            let sp = p.span();
+            p.error(
+                sp,
+                "E0202",
+                format!("expected a statement or an item, found {}", p.found()),
+            );
+            p.bump();
+        }
     }
-    let block = p.stmts_to_eof();
+    let tail = tail.flatten();
+    let block = Block {
+        id: block_id,
+        stmts,
+        tail,
+        span: start.to(p.prev_span()),
+    };
     p.report_stray_docs();
     DoctestOutput {
         items,
@@ -210,6 +244,23 @@ impl Parser<'_> {
                 Applicability::MachineApplicable,
             ),
             _ => d.help("make each line a plain comment: `//`"),
+        }
+    }
+
+    /// In a doc example's top-level statement list, does an item start here? (Always false
+    /// outside one: see `Parser::items_end_stmts`.)
+    pub(crate) fn at_doctest_item(&self) -> bool {
+        self.items_end_stmts && self.delims.is_empty() && self.at_item_start()
+    }
+
+    /// `e;` as a statement of its own.
+    fn expr_stmt(&mut self, e: wukong_ast::Expr) -> wukong_ast::Stmt {
+        let span = e.span;
+        wukong_ast::Stmt {
+            id: self.nid(),
+            attrs: Vec::new(),
+            kind: wukong_ast::StmtKind::Expr(e),
+            span,
         }
     }
 

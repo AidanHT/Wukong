@@ -21,8 +21,8 @@
 //! example's items, and a `main`: the example's own `fn main` when it declares one (it then takes
 //! no other statements), otherwise `fn main() -> i32 { <the example's statements>; return 0; }`,
 //! rustdoc-style. So an example on `fn add` simply calls `add(1, 2)`, private items included, and
-//! its imports resolve as the file's do (relative to the file's directory). An example's items
-//! must come before its statements.
+//! its imports resolve as the file's do (relative to the file's directory). The example's own
+//! items may come before, between or after its statements, which run in order.
 //!
 //! The example is its own source file in the compile, but one laid out over the documented file's
 //! lines: each code line sits at its own line and column (the `/// ` prefix is blanked), so a

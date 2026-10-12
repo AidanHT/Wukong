@@ -117,20 +117,21 @@ fn emit_doc_succeeds_on_the_corpus() {
 // ---- --doctest ----
 
 const GEOMETRY_REPORT: &str = "\
-running 6 doctests in tests/doc/geometry.wk
+running 7 doctests in tests/doc/geometry.wk
 doctest tests/doc/geometry.wk:3 (the file) ... ok
 doctest tests/doc/geometry.wk:18 (fn area_of) ... ok
 doctest tests/doc/geometry.wk:29 (fn double) ... ok
 doctest tests/doc/geometry.wk:35 (fn double) ... ok
 doctest tests/doc/geometry.wk:56 (fn spin) ... ok
 doctest tests/doc/geometry.wk:62 (fn spin) ... ignored
+doctest tests/doc/geometry.wk:89 (fn larger) ... ok
 
-doctest result: ok. 5 passed; 0 failed; 1 ignored
+doctest result: ok. 6 passed; 0 failed; 1 ignored
 ";
 
 /// Every kind of passing example — the file's, one that runs, `compile_fail` with a code, one with
-/// its own `main`, `no_run`, `ignore` — on the interpreter and the native JIT, at -O0 and -O2. The
-/// `text` fence is not an example.
+/// its own `main`, `no_run`, `ignore`, one whose own item sits between its statements — on the
+/// interpreter and the native JIT, at -O0 and -O2. The `text` fence is not an example.
 #[test]
 fn doctests_pass_run_no_run_compile_fail_and_ignore() {
     for args in [

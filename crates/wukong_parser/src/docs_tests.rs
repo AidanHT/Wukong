@@ -248,10 +248,10 @@ fn a_statement_list_rejects_doc_comments() {
     assert_eq!(codes, ["E0210"]);
 }
 
-/// A doc example parses as its items, then its statements: an attribute before a statement keeps
+/// A doc example parses as its items and its statements: an attribute before a statement keeps
 /// it a statement, and a tail expression stays the block's tail.
 #[test]
-fn a_doc_example_is_items_then_statements() {
+fn a_doc_example_is_items_and_statements() {
     let src = "struct P { x: i32 }\n@inline\nfn get(p: P) -> i32 { return p.x; }\n\
                let p = P { x: 3 };\n@parallel\nfor i in 0..4 { }\nget(p)\n";
     let (tokens, lex) = wukong_lexer::tokenize(src, SourceId(0));
@@ -262,10 +262,18 @@ fn a_doc_example_is_items_then_statements() {
     assert_eq!(out.items.len(), 2);
     assert_eq!(out.block.stmts.len(), 2);
     assert!(out.block.tail.is_some());
-    // Statements only, and items only.
+    // Statements only, items only, and the two interleaved: an expression before an item is a
+    // statement of its own, and only the last one is the tail. A `const` inside a nested block
+    // stays a local `const` statement.
     for (src, items, stmts) in [
         ("let x = 1;\nx + 1;\n", 0, 2),
         ("fn f() {}\ntype T = i32;\n", 2, 0),
+        (
+            "let x = 1;\nfn g() -> i32 { return 2; }\nx + g()\nstruct S { a: i32 }\nlet s = S { a: 1 };\n",
+            2,
+            3,
+        ),
+        ("if true { const K: i32 = 1; print(K); }\nprint(0);\n", 0, 2),
     ] {
         let (tokens, _) = wukong_lexer::tokenize(src, SourceId(0));
         let out = crate::parse_doctest_tokens(&tokens, src, &mut Interner::new(), 0);

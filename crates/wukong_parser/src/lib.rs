@@ -130,6 +130,9 @@ pub(crate) struct Parser<'a> {
     /// Every doc comment of the source, in order, with the token it precedes and whether a
     /// construct has claimed it (see `docs.rs`).
     doc_slots: Vec<docs::DocSlot>,
+    /// Parsing a doc example (`parse_doctest_tokens`): a top-level statement list ends where an
+    /// item starts, so the example's items and statements may interleave.
+    items_end_stmts: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -151,6 +154,7 @@ impl<'a> Parser<'a> {
             expected: Vec::new(),
             lints: Vec::new(),
             doc_slots: docs::scan(tokens, src),
+            items_end_stmts: false,
         }
     }
 
@@ -2028,7 +2032,7 @@ impl<'a> Parser<'a> {
     fn block_contents(&mut self, closer: TokenKind) -> (Vec<Stmt>, Option<Box<Expr>>) {
         let mut stmts = Vec::new();
         let mut tail = None;
-        while !self.at(T::RBrace) && !self.at(T::Eof) {
+        while !self.at(T::RBrace) && !self.at(T::Eof) && !self.at_doctest_item() {
             let before = self.pos;
             // The error count when this statement began: `missing_semi` stays quiet about a
             // statement that has already been reported as broken.

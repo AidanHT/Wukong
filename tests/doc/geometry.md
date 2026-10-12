@@ -118,3 +118,17 @@ fn spin_if(go: bool)
 ```
 
 Spins when `go` is true.
+
+## `fn larger`
+
+```wk
+fn larger(a: i32, b: i32) -> i32
+```
+
+The larger of `a` and `b`. An example's own items may sit between its statements:
+
+```wk
+let a = larger(3, 9);
+fn twice(x: i32) -> i32 { return x * 2; }
+assert(twice(a) == 18);
+```
