@@ -664,6 +664,11 @@ enum Fill {
     Conditional,
     /// The body can leave the loop early (a `break` to the code after it).
     EarlyExit,
+    /// Every store is guarded by the shape of a slice bounds check: `i < 64` or an edge into a
+    /// block that touches no slot and ends in `unreachable`. A path into that block never comes
+    /// back to read the slot, but the loop has two exits, so `loop_info` computes no trip count for
+    /// it and the overwrite is not recognized.
+    AbortExit,
     /// The store is `s[i + 1]`: shifted, so `s[0]` is never written.
     Shifted,
     /// Unrolled by two: `i` steps by 2 and the body stores `s[i]` and `s[i + 1]`.
@@ -737,6 +742,20 @@ fn fill_loop(b: &mut Builder, slot: ValueId, how: Fill) {
             let ten = i64c(b, 10);
             let stop = b.build(MirType::I1, Op::Cmp(CmpOp::Eq, iv, ten));
             b.cond_br(stop, exit, vec![], latch, vec![]);
+        }
+        Fill::AbortExit => {
+            let ok = b.build(MirType::I1, Op::Cmp(CmpOp::Ult, idx, n));
+            let write = b.new_block();
+            let trap = b.new_block();
+            b.cond_br(ok, write, vec![], trap, vec![]);
+            b.switch_to(trap);
+            b.set_term(Terminator::Unreachable);
+            b.switch_to(write);
+            b.build_void(Op::Store {
+                ptr: at,
+                value: one,
+            });
+            b.br(latch, vec![]);
         }
         Fill::Unrolled => {
             b.build_void(Op::Store {
@@ -813,7 +832,9 @@ fn per_iteration_scratch(how: Fill) -> bool {
 
 /// A full overwrite at the top of every iteration kills the previous iteration's contents, so two
 /// per-iteration scratch arrays used one after the other share; every way the overwrite can fail
-/// to be full keeps the slot live around the outer loop, and the two interfere again.
+/// to be full keeps the slot live around the outer loop, and the two interfere again. So does a
+/// fill loop with any exit besides its header test, even one that only traps (`AbortExit`): it is
+/// not recognized.
 #[test]
 fn a_full_overwrite_separates_per_iteration_scratch() {
     for how in [Fill::Full, Fill::Unrolled] {
@@ -827,12 +848,13 @@ fn a_full_overwrite_separates_per_iteration_scratch() {
         Fill::ReadsInside,
         Fill::Conditional,
         Fill::EarlyExit,
+        Fill::AbortExit,
         Fill::Shifted,
         Fill::Strided,
     ] {
         assert!(
             per_iteration_scratch(how),
-            "{how:?} does not overwrite every byte before a read, so it kills nothing"
+            "{how:?} is not recognized as overwriting every byte before a read, so it kills nothing"
         );
     }
 }

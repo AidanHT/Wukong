@@ -902,9 +902,12 @@ fn is_address_op(op: &Op) -> bool {
 ///   one iteration's stores cover form a single run at least `k` elements long — so the `n`
 ///   iterations tile `[0, size)` without a gap (one store per iteration, or the `k` copies an
 ///   unroll by `k` leaves, or a vector store covering `k` lanes);
-/// * every way out of the loop is the header's exit test, or an edge into a block that touches no
-///   slot and ends in `unreachable` (a bounds-check failure): a path that leaves early never comes
-///   back to read the slot.
+/// * the loop's only way out is the header's exit test. A loop with any other exit is not
+///   recognized — a `break`, and also an edge into a block that touches no slot and ends in
+///   `unreachable` (a slice bounds-check failure), although a path into one never comes back to
+///   read the slot: `loop_info` computes no trip count for a loop with a second exit. That costs
+///   nothing today, because a bounds-checked store goes through the slice's data pointer, never
+///   through the slot's own address, which the address test below requires.
 fn full_overwrite_kills(f: &Function, flow: &Flow) -> Vec<(u32, u32, u32)> {
     // The slot a store may write as part of a full overwrite: through a pointer derived from that
     // slot alone, storing a value that holds no slot's address.
@@ -989,13 +992,10 @@ fn full_overwrite_kills(f: &Function, flow: &Flow) -> Vec<(u32, u32, u32)> {
         {
             continue;
         }
-        let exits_ok = l.abnormal_exits.is_empty()
-            && l.exits.iter().all(|&(from, to)| {
-                from == l.header
-                    || (matches!(f.block(to).term, Terminator::Unreachable)
-                        && flow.touches[to.0 as usize].is_empty())
-            });
-        if !exits_ok {
+        // `loop_info` already computes a constant trip count only for a loop whose one exit is the
+        // header's test and that has no `ret`/`unreachable` inside; checked again here so the kill
+        // does not rest on that contract alone.
+        if !l.abnormal_exits.is_empty() || l.exits.iter().any(|&(from, _)| from != l.header) {
             continue;
         }
         'slot: for (x, stores) in cands {
