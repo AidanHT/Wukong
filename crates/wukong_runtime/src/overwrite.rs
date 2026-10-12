@@ -30,12 +30,19 @@
 //! # How the table is held to the code
 //!
 //! `every_contract_holds_on_the_kernel` runs each entry on several shapes and every allowed `fixed`
-//! value, twice — once over an output pre-filled with a NaN pattern, once over a large finite
-//! pattern — and requires the two results to be bit-identical over the whole stated extent. An
-//! element the kernel leaves alone keeps two different fills; an element computed from its old value
-//! almost always differs too. Every integer operand an entry leaves unconstrained (an activation or
-//! op code, an `eps`, a `causal` flag) is also probed at 0 and -1, so an early exit on a value the
-//! entry admits fails the test as well.
+//! value, once per output pre-fill — a quiet NaN, `-3.0e30`, `+3.0e30`, and a pattern that varies
+//! per element over both signs and tiny and huge magnitudes — and requires every run to give the
+//! same bits over the whole stated extent. An element the kernel leaves alone keeps different
+//! fills. An element computed from its old value differs unless every fill is an identity of that
+//! computation, and the fills are chosen so that none is an identity of a fold a kernel would
+//! plausibly seed from its output: the NaN breaks a sum or a product, `-3.0e30` a running min,
+//! `+3.0e30` a running max or max of magnitudes (for which the NaN and `-3.0e30` are both
+//! identities under the x86 max rule), and the per-element pattern a min of magnitudes
+//! (`the_fills_catch_a_fold_seeded_from_the_output` holds each of those claims). It is a test, not
+//! a proof: a read of the old value through a computation for which every fill happens to be an
+//! identity still passes, so a new entry's kernel is read, not only run. Every integer operand an
+//! entry leaves unconstrained (an activation or op code, an `eps`, a `causal` flag) is also probed
+//! at 0 and -1, so an early exit on a value the entry admits fails the test as well.
 
 /// One kernel entry point's output contract (see the module note).
 #[derive(Clone, Copy, Debug)]
@@ -618,14 +625,80 @@ mod tests {
     /// misstates the output must make the test fail, not write past the buffer.
     const OUT_ROOM: usize = 1 << 16;
 
+    /// Element `i` of output pre-fill number `fill`. A kernel that writes an element before it reads
+    /// it leaves the same bits there under every fill, so the test compares them all. No finite set
+    /// of fills sees every read of the old value — a fold whose identity each fill happens to be
+    /// passes them all — so each fill here breaks a fold the others leave alone. The test inputs lie
+    /// in about [-1, 1], and the runtime's max and min follow x86 `maxps`/`minps`, which return the
+    /// second operand when the first is a NaN:
+    ///
+    /// 0. a quiet NaN poisons a sum or a product, but `max(old, x)` and `min(old, x)` return `x`;
+    /// 1. `-3.0e30` survives a sum and a running min, but is the identity of a running max;
+    /// 2. `+3.0e30` survives a running max and a max of magnitudes `max(old, |x|)`;
+    /// 3. a pattern that varies per element — both signs, tiny and huge magnitudes, `-0.0` and a
+    ///    second NaN payload, with period 7 so neighbouring lanes of a vector differ — survives a
+    ///    min of magnitudes `min(|old|, |x|)`, for which every uniform fill above is the identity.
+    ///
+    /// `the_fills_catch_a_fold_seeded_from_the_output` pins each of those claims.
+    fn prefill(fill: usize, i: usize) -> f32 {
+        const MIXED: [f32; 7] = [
+            7.0e-31,
+            -2.5e30,
+            f32::from_bits(0x7fc0_5678),
+            2.5e30,
+            -0.0,
+            -7.0e-31,
+            0.5,
+        ];
+        match fill {
+            0 => f32::from_bits(0x7fc0_1234),
+            1 => -3.0e30,
+            2 => 3.0e30,
+            _ => MIXED[i % MIXED.len()],
+        }
+    }
+
+    /// How many output pre-fills the contract is checked under (see [`prefill`]).
+    const FILLS: usize = 4;
+
+    /// Every pre-fill, `room` elements each.
+    fn fill_buffers(room: usize) -> Vec<Vec<f32>> {
+        (0..FILLS)
+            .map(|f| (0..room).map(|i| prefill(f, i)).collect())
+            .collect()
+    }
+
+    /// Run `kernel` once per buffer of `fills`, each time over a fresh copy of that buffer's first
+    /// `room` elements, and return the first element of `[0, len)` whose bits differ between two
+    /// runs, with its bits in each. `None`: the result there did not depend on the fill.
+    fn fill_dependence(
+        fills: &[Vec<f32>],
+        room: usize,
+        len: usize,
+        mut kernel: impl FnMut(&mut [f32]),
+    ) -> Option<(usize, Vec<u32>)> {
+        let results: Vec<Vec<u32>> = fills
+            .iter()
+            .map(|fill| {
+                let mut out = fill[..room].to_vec();
+                kernel(&mut out);
+                out[..len].iter().map(|v| v.to_bits()).collect()
+            })
+            .collect();
+        (0..len)
+            .find(|&i| results.iter().any(|r| r[i] != results[0][i]))
+            .map(|i| (i, results.iter().map(|r| r[i]).collect()))
+    }
+
     /// Every entry's contract holds on the kernel itself: for each test call that meets the entry's
-    /// conditions, the stated output extent comes out bit-identical whether the buffer held a NaN
-    /// pattern or a large finite one before the call — every element is written, and none is
-    /// computed from its old value. Each call is also run with every integer operand the entry
-    /// leaves unconstrained set to 0 and to -1: a value the entry admits must not reach an early
-    /// exit. See the module note.
+    /// conditions, the stated output extent comes out bit-identical under every [`prefill`] — every
+    /// element is written, and none is computed from its old value by a fold the fills tell apart
+    /// (the module note says what that leaves). Each call is also run with every integer operand
+    /// the entry leaves unconstrained set to 0 and to -1: a value the entry admits must not reach an
+    /// early exit.
     #[test]
     fn every_contract_holds_on_the_kernel() {
+        let fills = fill_buffers(OUT_ROOM);
         let mut checked = 0usize;
         for c in OVERWRITES {
             let cases = calls(c.symbol);
@@ -667,18 +740,19 @@ mod tests {
                 );
                 let len: usize = c.extent.iter().map(|&k| int(k) as usize).product();
                 assert!(len <= OUT_ROOM, "{}", c.symbol);
-                let mut results: Vec<Vec<u32>> = Vec::new();
-                for fill in [f32::from_bits(0x7fc0_1234), -3.0e30f32] {
-                    let mut inputs: Vec<Vec<f32>> = args
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(k, a)| match a {
-                            Arg::In(n) => Some(input(*n, k)),
-                            _ => None,
-                        })
-                        .collect();
-                    let mut outbuf = vec![fill; OUT_ROOM];
-                    let mut ins = inputs.iter_mut();
+                let inputs: Vec<Vec<f32>> = args
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(k, a)| match a {
+                        Arg::In(n) => Some(input(*n, k)),
+                        _ => None,
+                    })
+                    .collect();
+                let found = fill_dependence(&fills, OUT_ROOM, len, |outbuf| {
+                    // A fresh copy of the inputs per run, so a kernel that wrongly wrote one cannot
+                    // feed the next run different operands.
+                    let mut owned = inputs.clone();
+                    let mut ins = owned.iter_mut();
                     let vals: Vec<Val> = args
                         .iter()
                         .map(|a| match a {
@@ -691,19 +765,113 @@ mod tests {
                     // SAFETY: every input is sized by `calls` for the shape it is passed with, and
                     // the output buffer is larger than any output a test shape produces.
                     unsafe { invoke(c.symbol, &vals) };
-                    results.push(outbuf[..len].iter().map(|v| v.to_bits()).collect());
-                }
-                if let Some(i) = (0..len).find(|&i| results[0][i] != results[1][i]) {
+                });
+                if let Some((i, bits)) = found {
+                    let bits: Vec<String> = bits.iter().map(|b| format!("{b:#010x}")).collect();
                     panic!(
                         "{}: element {i} of {len} depends on the output's old contents \
-                         ({:#010x} vs {:#010x}) for operands {args:?}",
-                        c.symbol, results[0][i], results[1][i]
+                         ({}) for operands {args:?}",
+                        c.symbol,
+                        bits.join(" vs ")
                     );
                 }
                 checked += 1;
             }
         }
         assert!(checked >= 3000, "only {checked} calls checked");
+    }
+
+    /// The fills catch a kernel that folds into its output instead of seeding the fold from its input.
+    /// Each mutant is a column reduction `out[j] = fold(out[j], x[i, j])` over every row `i` — what
+    /// `wukong_colmax_f32` would be without its row-0 seed — with the runtime's scalar max and min
+    /// rule (`(a > b) ? a : b`, the twin of `_mm256_max_ps(a, b)`, which returns `b` when `a` is a
+    /// NaN). Every one reads its output, so the fills must tell each apart; the real kernel, which
+    /// seeds from row 0, must pass. The pins at the end hold [`prefill`]'s note to the fills: each
+    /// extra fill is there because the fills before it pass a fold.
+    #[test]
+    fn the_fills_catch_a_fold_seeded_from_the_output() {
+        fn max(a: f32, b: f32) -> f32 {
+            if a > b {
+                a
+            } else {
+                b
+            }
+        }
+        fn min(a: f32, b: f32) -> f32 {
+            if a < b {
+                a
+            } else {
+                b
+            }
+        }
+        fn running_max(o: f32, v: f32) -> f32 {
+            max(o, v)
+        }
+        fn running_max_abs(o: f32, v: f32) -> f32 {
+            max(o, v.abs())
+        }
+        fn running_min(o: f32, v: f32) -> f32 {
+            min(o, v)
+        }
+        fn running_min_of_magnitudes(o: f32, v: f32) -> f32 {
+            min(o.abs(), v.abs())
+        }
+        fn running_sum(o: f32, v: f32) -> f32 {
+            o + v
+        }
+        fn running_product(o: f32, v: f32) -> f32 {
+            o * v
+        }
+        type Fold = fn(f32, f32) -> f32;
+        /// `out[j] = fold(out[j], x[i, j])` for every row `i` of a `[rows, cols]` matrix.
+        fn fold_columns(out: &mut [f32], x: &[f32], rows: usize, cols: usize, fold: Fold) {
+            for i in 0..rows {
+                for j in 0..cols {
+                    out[j] = fold(out[j], x[i * cols + j]);
+                }
+            }
+        }
+        let folds: [(&str, Fold); 6] = [
+            ("max", running_max),
+            ("max of magnitudes", running_max_abs),
+            ("min", running_min),
+            ("min of magnitudes", running_min_of_magnitudes),
+            ("sum", running_sum),
+            ("product", running_product),
+        ];
+        let fills = fill_buffers(OUT_ROOM);
+        for (rows, cols) in [(1usize, 1usize), (5, 3), (33, 40)] {
+            let x = input(rows * cols, 0);
+            for (name, fold) in folds {
+                assert!(
+                    fill_dependence(&fills, OUT_ROOM, cols, |out| {
+                        fold_columns(out, &x, rows, cols, fold)
+                    })
+                    .is_some(),
+                    "a running {name} seeded from the output passes every fill ({rows}x{cols})"
+                );
+            }
+            let colmax = |out: &mut [f32]| {
+                // SAFETY: `x` holds rows*cols elements and `out` at least `cols`.
+                unsafe { wukong_colmax_f32(x.as_ptr(), out.as_mut_ptr(), rows as i64, cols as i64) }
+            };
+            assert_eq!(fill_dependence(&fills, OUT_ROOM, cols, colmax), None);
+        }
+        // The pins: which prefix of the fills first catches the folds the earlier fills pass.
+        let (rows, cols) = (33, 40);
+        let x = input(rows * cols, 0);
+        let caught = |n: usize, fold: Fold| {
+            fill_dependence(&fills[..n], OUT_ROOM, cols, |out| {
+                fold_columns(out, &x, rows, cols, fold)
+            })
+            .is_some()
+        };
+        // The NaN and -3e30 both pass a running max and a max of magnitudes; +3e30 catches them.
+        for fold in [running_max, running_max_abs] {
+            assert!(!caught(2, fold) && caught(3, fold));
+        }
+        // Every uniform fill passes a min of magnitudes; the per-element pattern catches it.
+        assert!(!caught(3, running_min_of_magnitudes) && caught(4, running_min_of_magnitudes));
     }
 
     /// The table is well-formed: one entry per symbol, and every operand index it names is inside
