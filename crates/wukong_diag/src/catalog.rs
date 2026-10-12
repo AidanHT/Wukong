@@ -753,6 +753,30 @@ fn main() -> i32 {
         good: "module ex.e0424\nenum Num { Int(i32), Real(f32) }\nfn val(n: Num) -> f32 {\n    return match n {\n        Num::Int(v) => v as f32,\n        Num::Real(v) => v,\n    };\n}\nfn main() -> i32 {\n    return val(Num::Int(2)) as i32;\n}\n"
     ),
     entry!(
+        "E0425",
+        "`.chars()` outside a `for` head",
+        "`s.chars()` decodes a `str` one character at a time, and it is legal only as the \
+         iterable of a `for` loop: `for c in s.chars() { .. }`, where each `c` is a `char`. The \
+         language has no iterator values, so the loop decodes the text in place and there is \
+         nothing for `s.chars()` to be anywhere else — bound to a name, passed, or called a method \
+         on. Iterate it directly; `s.char_count()` counts the characters, `s.len()` the bytes, and \
+         `s[i]` reads a byte.",
+        bad: "module ex.e0425\nfn main() -> i32 {\n    let s: str = \"hi\";\n    let it = s.chars();\n    return 0;\n}\n",
+        good: "module ex.e0425\nfn main() -> i32 {\n    let s: str = \"hi\";\n    let mut n: i32 = 0;\n    for c in s.chars() {\n        n = n + (c as i32);\n    }\n    return n;\n}\n"
+    ),
+    entry!(
+        "E0426",
+        "string-literal pattern against a value that is not a `str`",
+        "A string-literal pattern (`\"add\" =>`) matches a `str` whose bytes equal the literal's, \
+         and a `str` is matched by string literals (and by names, `_` and or-patterns of them). A \
+         string literal against any other type, or an integer, `char`, `bool` or range pattern \
+         against a `str`, could never match. A `*u8` — an unannotated literal, `arg(i)`, \
+         `env(name)` — is a C string whose literal patterns would compare addresses, not text: \
+         bind the text as a `str` first (`let s: str = ..`, or `str_from_utf8` of its bytes).",
+        bad: "module ex.e0426\nfn main() -> i32 {\n    let n: i32 = 3;\n    return match n {\n        \"three\" => 1,\n        _ => 0,\n    };\n}\n",
+        good: "module ex.e0426\nfn main() -> i32 {\n    let s: str = \"three\";\n    return match s {\n        \"three\" => 1,\n        _ => 0,\n    };\n}\n"
+    ),
+    entry!(
         "E0430",
         "struct literal field error",
         "A struct literal (and a struct-payload enum variant, `E::V { .. }`) initializes every field \

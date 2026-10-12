@@ -456,7 +456,7 @@ stack frame), a `*u8` can be **returned from a function and threaded across call
 | Structs     | `struct S { … }`, literal `S { f: v }`, field `s.f`  | ✅     |
 | Enums       | C-style `enum E { A = 10, B }` (variant = its `i32` discriminant) **and data-carrying** `V(i32)` / `V { f: T }` variants | ✅ |
 | Slices      | `[]T` — fat pointer `{data, len}`; `.len()`, **bounds-checked** indexed load/store, iteration, array→slice unsizing, range indexing `s[a..b]` | ✅ |
-| Strings     | `str` — an immutable UTF-8 byte string, a `[]u8`-shaped fat pointer; literals, `.len()`, bounds-checked byte indexing, `s[a..b]`, `==`/`!=`, printing ([below](#strings-str-)) | ✅ |
+| Strings     | `str` — an immutable UTF-8 byte string, a `[]u8`-shaped fat pointer; literals, `.len()`, bounds-checked byte indexing, `s[a..b]`, `==`/`!=`/`<`/`.cmp()`, `for c in s.chars()`, string-literal patterns, `as_bytes`/`as_ptr`/`str_from_utf8`, `str_concat`/`str_format`, printing ([below](#strings-str-)) | ✅ |
 | SIMD vectors| `f32x4`/`i32x4`, generic `vec[T, N]` — the type **parses and type-checks** (a non-scalar element is `E0302`, a lane/element mismatch at a call is `E0401`), but no vector value can be constructed in source (`f32x4::load(p)` is `C0001`) and float-vector arithmetic is an internal error, so nothing uses it. SIMD ships through the **automatic** 128-bit/256-bit loop vectorizer, which needs no vector type in source. | 🔵 |
 | Tensors     | `Tensor[f32, M, N]` — shape checking, and **indexing** (`a[i, j]`) for both const and symbolic-generic dims, on the default `contiguous` layout. A constant-shape tensor costs **nothing** over the hand-flattened `[f32; M*N]` + `a[i*N + j]` spelling: the two compile to byte-identical MIR, same kernel dispatch and same vectorization. `.col_major` indexing executes for constant-shape tensors (`a[i, j]` is byte-identical to `a[i + j*M]`). `.strided`/`.tiled(…)` type-check but cannot be indexed (`C0001`). Whole-tensor arithmetic (`a + b`) is `E0433` — operate elementwise. | ✅ |
 
@@ -475,9 +475,10 @@ view, SIMD vector or function value is `E0436`.
 ### Strings: `str` ✅
 
 `str` is an **immutable UTF-8 byte string**: a 16-byte fat pointer `(data, byte length)` — the
-layout of a `[]u8` slice — over a string literal's read-only `.rodata` bytes, or over part of
-another `str`. It passes and returns like a `[]T`, and can be a struct field, a tuple field or an
-array element (`tests/run/str_basics.wk`).
+layout of a `[]u8` slice — that **views** bytes it does not own: a string literal's read-only
+`.rodata` bytes, part of another `str`, a byte buffer `str_from_utf8` checked, or a heap string
+`str_concat` / `str_format` built. It passes and returns like a `[]T`, and can be a struct field, a
+tuple field, an array element or an enum payload (`tests/run/str_basics.wk`).
 
 ```wukong
 const GREETING: str = "hello";
@@ -497,39 +498,119 @@ println(s.len());                   // 6: bytes, not characters
 println(s[1]);                      // 117: a u8, bounds-checked
 println(s[1..4]);                   // uko: a str viewing the same bytes
 println(s == "wukong");             // true: length, then bytes
+println("apple" < s);               // true: bytewise order
 printf("[{}|{:?}]\n", s, s[..2]);   // [wukong|"wu"]
 ```
 
 - **Literals.** A string literal is a `str` wherever the context expects one: exactly where a
   numeric literal adapts to its annotation (a `let`/`const` annotation, a call or method argument,
   a `return` of either spelling, a struct field, an assignment, an array or tuple element), as an
-  `==`/`!=` operand against a `str`, and as the base of a range index. In an array literal it
-  becomes a `str` beside one on either side (`[s, "y"]` and `["x", s]` are both `[str; 2]`,
-  `tests/run/str_array_elems.wk`): every element of an array literal has the one element type, so
-  a `*u8` value or a `[]u8` beside a `str` is `E0401`. Unannotated, a literal is still the
-  NUL-terminated `*u8` (`let p = "x";`). As with numbers, an `if`/`match` whose arms are all
-  literals takes its type from those arms (`*u8`), and annotating the `let` does not change that
-  (`let s: str = if c { "a" } else { "b" };` is `E0401`). Make the FIRST arm a `str` and the later
-  literal arms adapt to it (`let yes: str = "yes";` then `if c { yes } else { "no" }`), or `return`
-  each literal from a function that returns `str`.
+  operand of a comparison against a `str`, as the base of a range index, as the receiver of a `str`
+  method (`"abc".len()`, `"xy".chars()`), and as a `match` scrutinee tested against string-literal
+  patterns. In an array literal it becomes a `str` beside one on either side (`[s, "y"]` and
+  `["x", s]` are both `[str; 2]`, `tests/run/str_array_elems.wk`): every element of an array
+  literal has the one element type, so a `*u8` value or a `[]u8` beside a `str` is `E0401`. An
+  `if`/`match` whose arms are all string literals adapts like one literal
+  (`let s: str = if c { "on" } else { "off" };`), and a literal arm beside a `str` arm is a `str`
+  on either side (`if c { "lit" } else { s }`, `tests/run/str_literal_arms.wk`). Unannotated and
+  with no `str` in sight, a literal is still the NUL-terminated `*u8` (`let p = "x";`) that
+  `printf`, file paths and `extern "C"` take. Every literal is valid UTF-8: an escape names a code
+  point, re-encoded (`"\xff"` is U+00FF, the two bytes C3 BF), and an invalid `\u{…}` is `E0432`.
 - **Bytes.** `s.len()` is the byte length, an `i64`. `s[i]` is a `u8`, bounds-checked exactly like
   a slice element (the same `index out of bounds` failure, exit 1). `for b in s` yields each byte.
-  The bytes are UTF-8 (`"h\u{e9}llo"` is 6 bytes long), and nothing decodes characters yet.
+  The bytes are UTF-8 (`"h\u{e9}llo"` is 6 bytes long).
+- **Characters.** `for c in s.chars()` decodes the text one `char` (a Unicode scalar value) per
+  iteration, and `s.char_count()` is how many it yields (`tests/run/str_chars.wk`):
+
+  ```wukong
+  for c in "a\u{e9}\u{20ac}".chars() {   // 'a', U+00E9, U+20AC
+      println(c as u32);                 // 97, 233, 8364
+  }
+  ```
+
+  ASCII is decoded inline; any other character is one call into the runtime's decoder. `.chars()`
+  is legal only as the iterable of a `for` head — there are no iterator values — and anywhere else
+  is `E0425`; `break` and `continue` work as in any loop. Decoding never fails: a `str` views its
+  bytes and the language has no borrow checker, so the buffer behind a `str_from_utf8` result can be
+  rewritten afterwards (and `as_bytes()` hands out any `str`'s bytes). Each ill-formed sequence then
+  decodes as one U+FFFD REPLACEMENT CHARACTER covering its maximal subpart — exactly what Rust's
+  `String::from_utf8_lossy` and the WHATWG decoder produce — and `char_count` counts it once.
 - **Range indexing.** `s[a..b]`, `s[a..]`, `s[..b]` and `s[..]` are `str` views of the half-open
   byte range — no copy. The same range index works on any slice `[]T` and gives a `[]T`
   (`tests/run/slice_range_index.wk`). The bounds are integers, checked at run time as
-  `a <= b <= len` (`tests/run/str_slice_bounds.wk`) unless the function is `@unchecked`. `..=`, and
-  a range mixed with other indices (`t[0, 1..2]`), are `E0202`; a range index of an array is
-  `E0437` (bind it to a `[]T` first); a bound that is not an integer is `E0446`.
-- **Equality.** `==` and `!=` between two `str`s compare the lengths, then the bytes. `<`,
-  arithmetic, and a `str` compared with anything but a `str` are `E0433`.
+  `a <= b <= len` unless the function is `@unchecked`, with Rust's wording: `range end index 9 out
+  of range for slice of length 6` (`tests/run/str_slice_bounds.wk`) and `slice index starts at 5
+  but ends at 3` (`tests/run/str_range_order.wk`), exit 1. `..=`, and a range mixed with other
+  indices (`t[0, 1..2]`), are `E0202`; a range index of an array is `E0437` (bind it to a `[]T`
+  first); a bound that is not an integer is `E0446`. A range of a `str` is a byte range: it may cut
+  a character in two, and `chars()` then decodes each half as U+FFFD.
+- **Comparison.** `==` and `!=` between two `str`s compare the lengths, then the bytes. `<`, `<=`,
+  `>` and `>=` order them by their bytes, lexicographically: the first differing byte decides,
+  compared as an unsigned value, and a proper prefix is less (`"ab" < "abc"`) — Rust's `Ord for
+  str`; UTF-8 preserves code-point order, so this is code-point order too. `a.cmp(b)` is the same
+  three-way comparison as an `i32`: `-1`, `0` or `1` (`tests/run/str_ordering.wk`). Arithmetic, and
+  a `str` compared with anything but a `str`, are `E0433`.
+- **Patterns.** A string literal is a pattern: it matches a `str` whose bytes equal the literal's
+  (the test `s == "…"` makes, so `"l\x65t"` and `"let"` are the same pattern), and nests anywhere a
+  pattern does — or-patterns, `name @ "lit"`, guards, tuples, struct fields, enum payloads, slice
+  elements, `if let`, `while let` (`tests/run/str_match.wk`):
+
+  ```wukong
+  fn arity(op: str) -> i32 {
+      match op {
+          "neg" | "not" => 1,
+          "add" | "sub" | "mul" => 2,
+          _ => 0,                  // required: no list of literals covers every `str`
+      }
+  }
+  ```
+
+  A `str` match is exhaustive only with a catch-all (`_` or a binding), else `E0405` with the
+  witness `_`; a literal repeated in a later arm is the unreachable-pattern warning `W0020`. A
+  string-literal pattern against a value that is not a `str`, or an integer, `char`, `bool` or range
+  pattern against a `str`, is `E0426`.
+- **Conversions.** `s.as_bytes()` is the `[]u8` view of the same bytes and `s.as_ptr()` the `*u8`
+  data pointer — no copy either way. `str_from_utf8(b)` turns a `[]u8` or `[u8; N]` into a `str`
+  viewing the same bytes after checking that they are UTF-8; when they are not, the program stops
+  with `str_from_utf8: invalid utf-8 sequence of 1 bytes from index 2 (the len is 4) at
+  file.wk:line:col` (or `incomplete utf-8 byte sequence`, for a character the bytes cut short) and
+  exit status 1, identically on every backend and in a linked executable — the stop a slice index
+  out of bounds makes (`tests/run/str_from_utf8_invalid.wk`). `utf8_valid_up_to(b)` is the check
+  without the stop: the length of the longest valid prefix, `b.len()` when all of it is valid
+  (`tests/run/str_conversions.wk`). `s.as_ptr()` is NUL-terminated only for a whole literal or a
+  `str_concat` / `str_format` result; pair it with `s.len()`. Nothing converts implicitly: a `str`
+  is not a `[]u8` or a `*u8` and an `as` cast between them is `E0401`.
+- **Immutable through the `str`.** A `str`'s bytes are never a place: `s[i] = b`, `s[i] += b`,
+  `atomic_add(s[i], v)` and `&mut s[i]` are `E0304`. A `mut` binding can still be re-pointed
+  (`s = s[1..];`). The bytes it views are not frozen, though: a `str` from `str_from_utf8` sees
+  later writes to its buffer, as any slice view does. Writing through `as_bytes()` / `as_ptr()` is
+  allowed by the type checker, like writing through any `[]u8` or `*u8`, but a string literal lives
+  in read-only memory: writing into a literal's bytes — through those views, or through a literal's
+  own `*u8` — is **undefined behaviour** on the native backend (a fault) and outside the
+  differential contract, as a use after `free` is.
+- **Building strings.** `str_concat(a, b, …)` joins one or more `str`s and `str_format(fmt, args…)`
+  formats exactly as `printf` does (the same compile-time-checked format string, `E0449`/`E0450`);
+  each returns a `str` in a fresh allocation from the `alloc_<T>` heap, which the program releases
+  with `free(s)` — the ownership rule of [heap allocation](#memory-and-parallelism), and the cleanup
+  `defer free(s);` pairs with. Arguments are evaluated once, in order; `str_format` measures the
+  text, allocates exactly that many bytes plus a NUL, and writes it. There is no hidden
+  allocation: `+` on two `str`s stays `E0433` (`tests/run/str_build.wk`).
+
+  ```wukong
+  let path = str_format("layer_{:03}.bin", i);   // "layer_007.bin"
+  defer free(path);
+  let greeting = str_concat("hello, ", name, "!");
+  ```
+
+  Freeing a `str` that did not come from `str_concat` / `str_format` (a literal, a view) is
+  undefined behaviour on the native backend, exactly as freeing a slice that did not come from
+  `alloc_*` is.
 - **Printing.** `print`, `println`, `print_raw`, `eprint`, `eprintln` and the `printf` / `eprintf` /
-  `sprintf` placeholders print the text, and `{:?}` quotes it, as for a `*u8`. A `str` inside a
-  printed aggregate (a struct, tuple or array holding one) is `E0448` for now: print the field.
-- **Immutable.** A `str`'s bytes are never a place: `s[i] = b`, `s[i] += b`,
-  `atomic_add(s[i], v)` and `&mut s[i]` are `E0304`. A `mut` binding can still be re-pointed (`s = s[1..];`).
-- **No conversions.** A `str` converts to and from nothing: not `[]u8`, not `*u8`, not by `as`
-  (`E0401`). There is no concatenation yet.
+  `sprintf` / `str_format` placeholders print the text, and `{:?}` quotes it, as for a `*u8`. A
+  `str` inside a printed aggregate prints too, quoted and escaped as Rust's `{:?}` prints a string
+  element: `User { name: "ada", id: 1 }`, `("x", 2)`, `["a", "b\"c"]`
+  (`tests/run/str_print_aggregate.wk`). A slice of `str`s, like any slice of non-scalars, is
+  `E0448`: print its elements in a loop.
 - **Not generic.** A `str` cannot bind a type parameter (`id(s)` with `fn id<T>(x: T) -> T` is
   `E0420`, `tests/fail/str_generic_param.wk`); write the function for `str` itself. A struct, enum,
   trait, type alias or generic parameter named `str` is `E0300`, in an imported module too.
@@ -697,7 +778,8 @@ after its arm's pattern matched, so it may call functions with effects and read 
 unguarded arm without testing it: a value that failed every arm before it can only match that one.
 An exhaustive `bool` match is one branch and an N-variant enum dispatch N − 1 tests, identically at
 every `-O` level and on every backend (`tests/run/match_exhaustive_fallthrough.wk`). Patterns are
-integer/bool **literals**, **or-patterns** `A | B | C`, half-open `lo..hi` / inclusive `lo..=hi`
+integer/bool/char **literals**, **string literals** on a `str` (matched by its bytes; a `str` match
+needs a catch-all — see [Strings](#strings-str-)), **or-patterns** `A | B | C`, half-open `lo..hi` / inclusive `lo..=hi`
 **ranges** whose bounds are integer or char **literals** (a `const` bound such as `0..N` parses but
 does not lower — it reports `C0001` at the pattern; inline the literal), **enum-variant** patterns
 `Color::Red` (matched by discriminant), **tuple** patterns
@@ -1661,6 +1743,7 @@ lowers to PTX `.shared` SMEM and `sync_block()` to `bar.sync 0` (`wukong_codegen
 |---|---|---|
 | `printf(fmt, args…)` / `eprintf(fmt, args…)` | stdout / stderr, **no** trailing newline | — |
 | `sprintf(buf, fmt, args…)` | the `[]u8` / `[u8; N]` buffer `buf`, NUL-terminated | `i64` length |
+| `str_format(fmt, args…)` | a fresh heap allocation, released with `free` ([Strings](#strings-str-)) | the `str` |
 | `print_raw(x)` | one value to stdout, no newline | — |
 | `eprint(x)` / `eprintln(x)` | one value to stderr, then a newline (both, like `print`/`println`) | — |
 | `write_stdout(buf, n)` / `write_stderr(buf, n)` | the first `n` bytes of a `u8` buffer, verbatim | `i64` count |
@@ -2192,8 +2275,9 @@ differential contract exactly like a use after `free`. Zero-length requests and 
 behave as for `alloc_<T>` (null data natively, a diagnostic in the interpreter) and still count
 toward the mark (`tests/run/alloc_scratch_arena.wk`).
 
-No garbage collector and no hidden allocations beyond what you `alloc_*` or `scratch_*`; cleanup pairs
-with `defer` (✅, below), and *named* allocator selection (`System`, `Pool` — 🔵) is still being
+No garbage collector and no hidden allocations beyond what you `alloc_*` or `scratch_*` (or ask
+`str_concat` / `str_format` for, which allocate on the same heap and are released by the same
+`free`); cleanup pairs with `defer` (✅, below), and *named* allocator selection (`System`, `Pool` — 🔵) is still being
 wired to the surface.
 
 ### Atomic integer add: `atomic_add` ✅

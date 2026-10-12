@@ -2832,6 +2832,12 @@ impl<'a> Parser<'a> {
                 self.bump();
                 PatKind::Char(sym)
             }
+            // String-literal pattern (`"add" =>`): matches a `str` whose bytes equal the literal's.
+            T::Str => {
+                let sym = self.intern_span(start);
+                self.bump();
+                PatKind::Str(sym)
+            }
             // Negative integer literal pattern (`-1 =>`); fold the sign into the pattern since a
             // literal pattern has no sub-expression to negate.
             T::Minus => {
@@ -3065,6 +3071,7 @@ fn pattern_bindings(p: &Pattern, out: &mut Vec<(Symbol, Span)>) {
         | PatKind::Unit
         | PatKind::Int { .. }
         | PatKind::Char(_)
+        | PatKind::Str(_)
         | PatKind::Bool(_)
         | PatKind::Path(_)
         | PatKind::Range { .. } => {}

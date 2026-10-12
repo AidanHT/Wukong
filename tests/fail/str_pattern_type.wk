@@ -1,0 +1,14 @@
+// EXPECT-CODE: E0426
+module tests.fail.str_pattern_type
+
+// A string-literal pattern matches only a `str`. Against an integer it could never match, and
+// against a `*u8` (an unannotated literal, `arg(i)`, `env(name)`) it would compare a C string's
+// address, not its text.
+fn main() -> i32 {
+    let code: i32 = 3;
+    let n = match code {
+        "three" => 1,
+        _ => 0,
+    };
+    return n;
+}

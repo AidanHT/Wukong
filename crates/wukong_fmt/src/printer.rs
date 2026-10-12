@@ -1354,7 +1354,7 @@ impl<'a> Printer<'a> {
                 let t = self.sym(*sym);
                 self.w(t);
             }
-            PatKind::Char(s) => {
+            PatKind::Char(s) | PatKind::Str(s) => {
                 let t = self.sym(*s);
                 self.w(t);
             }
@@ -2511,6 +2511,7 @@ fn pat_starts_with_open(p: &Pattern) -> bool {
         PatKind::Wildcard
         | PatKind::Ident(_)
         | PatKind::Char(_)
+        | PatKind::Str(_)
         | PatKind::Bool(_)
         | PatKind::Path(_)
         | PatKind::Variant { .. }

@@ -288,3 +288,105 @@ fn raw_jit_accepts_bounds_checked_code_and_runs_it_in_range() {
         assert_eq!(unsafe { entry(fat.as_ptr(), i) }, want);
     }
 }
+
+#[test]
+fn a_run_time_check_failing_in_a_callee_stops_its_caller() {
+    // A failed range index and a failed `str_from_utf8` both stop the run through
+    // `wukong_rt_check_fail`. When the check sits in a helper, the JIT records the failure and the
+    // helper returns, so its caller must poll the failure status after the call exactly as it
+    // does for a failed assert or element index: nothing after the call may run (`99` is never
+    // printed), and nothing may read the result the helper never wrote. `e` reaches 9 through a
+    // loop so no folding decides the check; -O2 may inline the helper, -O0 keeps the call.
+    for (src, message) in [
+        (
+            "fn mid(s: str, a: i64, b: i64) -> str { return s[a..b]; }
+             fn main() -> i32 {
+                 let s: str = \"wukong\";
+                 let mut e: i64 = 0;
+                 for _ in 0..9 { e = e + 1; }
+                 print(mid(s, 2, 4).len());
+                 let t = mid(s, 2, e);
+                 print(99);
+                 print(t.len());
+                 return 0;
+             }",
+            "range end index 9 out of range for slice of length 6",
+        ),
+        (
+            "fn conv(b: []u8) -> str { return str_from_utf8(b); }
+             fn main() -> i32 {
+                 let good: [u8; 2] = [104, 105];
+                 print(conv(good).len());
+                 let bad: [u8; 2] = [0xC3, 0x28];
+                 let t = conv(bad);
+                 print(99);
+                 print(t.len());
+                 return 0;
+             }",
+            "str_from_utf8: invalid utf-8 sequence of 1 bytes from index 0 (the len is 2)",
+        ),
+    ] {
+        for opt in [0, 2] {
+            let (program, interner, main) = lower(src, opt);
+            let failed: Result<i64, String> = Err(message.to_owned());
+            let printed = b"2\n".to_vec();
+            assert_eq!(
+                wukong_interp::run_capturing(&program, main, &interner),
+                (failed.clone(), printed.clone()),
+                "interp opt={opt}: {src}"
+            );
+            let native = jit_compile(&program, main, &interner).unwrap();
+            assert_eq!(
+                native.run_capturing(),
+                (failed, printed),
+                "native opt={opt}: {src}"
+            );
+            assert_eq!(native.call(), 1, "opt={opt}");
+        }
+    }
+    // The helper is in the polled set at -O0, where no inlining hides the call.
+    let (program, mut interner, _) = lower(
+        "fn mid(s: str, a: i64, b: i64) -> str { return s[a..b]; }
+         fn main() -> i32 { let s: str = \"wukong\"; return mid(s, 1, 2).len() as i32; }",
+        0,
+    );
+    let asserting = asserting_functions(&program, &interner);
+    assert!(asserting.contains(&interner.intern("mid")), "{asserting:?}");
+    assert!(
+        asserting.contains(&interner.intern("main")),
+        "{asserting:?}"
+    );
+
+    // A parallel region whose body holds a range index can fail the same way, so the function
+    // running the region (`drive`) and its caller are polled too: the region is an edge from
+    // `body` to `drive` in the same set.
+    let (mut program, mut interner, _) = lower(
+        "fn body(start: i64, end: i64, env: *mut u8) {
+             let a: [i32; 4] = [1; 4];
+             let v: []i32 = a;
+             print(v[start..end].len());
+         }
+         fn drive() { }
+         fn main() -> i32 { drive(); return 0; }",
+        0,
+    );
+    let drive = interner.intern("drive");
+    let mut region = Builder::new(drive, MirType::Void);
+    let n = region.build(MirType::I64, Op::ConstInt(8, MirType::I64));
+    let body = region.build(MirType::Ptr, Op::FuncAddr(interner.intern("body")));
+    let env = region.alloca(MirType::I64);
+    region.build_void(Op::Call {
+        func: interner.intern("wukong_parallel_for"),
+        args: vec![n, body, env],
+    });
+    region.ret(None);
+    let placeholder = program.funcs.iter_mut().find(|f| f.name == drive).unwrap();
+    *placeholder = region.finish();
+    let asserting = asserting_functions(&program, &interner);
+    for name in ["body", "drive", "main"] {
+        assert!(
+            asserting.contains(&interner.intern(name)),
+            "{name}: {asserting:?}"
+        );
+    }
+}

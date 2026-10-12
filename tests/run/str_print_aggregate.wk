@@ -1,0 +1,50 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: User { name: "ada", id: 1 }
+// EXPECT-OUT: Team { lead: User { name: "ada", id: 1 }, tag: "core" }
+// EXPECT-OUT: ("x", 2)
+// EXPECT-OUT: ["a", "b\"c", "tab\there"]
+// EXPECT-OUT: ("x", 2)|User { name: "ada", id: 1 }
+// EXPECT-OUT: ref
+// EXPECT-OUT: (("k", "v"), 3)
+// EXPECT-OUT: [("p", 1), ("q", 2)]
+module tests.run.str_print_aggregate
+
+// A `str` inside a printed aggregate prints its text, quoted and escaped as Rust's `{:?}` prints
+// a string element (`"b\"c"`, `"tab\there"`) — in a struct field, a nested struct, a tuple, an
+// array, an array of tuples, and through `printf`. A `&str` parameter prints what it refers to,
+// unquoted, like the `str` itself. (A `str` here used to be E0448: sema erases `str` to the
+// `[]u8` it is laid out as, so the printer had no way to tell its bytes were text.)
+
+struct User {
+    name: str,
+    id: i32,
+}
+
+struct Team {
+    lead: User,
+    tag: str,
+}
+
+fn show(r: &str) {
+    println(r);
+}
+
+fn main() -> i32 {
+    let u = User { name: "ada", id: 1 };
+    println(u);
+    let t = Team { lead: u, tag: "core" };
+    println(t);
+    let p: (str, i32) = ("x", 2);
+    println(p);
+    let a: [str; 3] = ["a", "b\"c", "tab\there"];
+    println(a);
+    printf("{:?}|{}\n", p, u);
+    let s: str = "ref";
+    show(&s);
+    let nested: ((str, str), i32) = (("k", "v"), 3);
+    println(nested);
+    let rows: [(str, i32); 2] = [("p", 1), ("q", 2)];
+    println(rows);
+    return 0;
+}

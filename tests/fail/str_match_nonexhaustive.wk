@@ -1,0 +1,15 @@
+// EXPECT-CODE: E0405
+module tests.fail.str_match_nonexhaustive
+
+// No list of string literals covers every `str`, so a `match` over one needs a catch-all arm
+// (`_` or a binding); the missing values are reported as `_`.
+fn arity(op: str) -> i32 {
+    return match op {
+        "neg" => 1,
+        "add" | "sub" => 2,
+    };
+}
+
+fn main() -> i32 {
+    return arity("neg");
+}

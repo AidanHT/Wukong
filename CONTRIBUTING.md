@@ -503,3 +503,21 @@ recipe's `Add` arm, `vec_accumulate` / `scalar_accumulate`, and the float-reduct
 `try_vectorize_for`. A new contraction or reassociation site must check `self.gemm.strict_fp` too, or
 a strict function silently goes back to fast-mode bits. Pin it with a case in
 `crates/wukong_mir_build/src/fp_contract_tests.rs`.
+
+## Adding a run-time check
+
+A check that stops the program at run time (a range index, `str_from_utf8`) is a dead-end failure
+edge: `bounds::emit_check_fail_unless(ok, kind, a, b, span)` in `wukong_mir_build` branches to a
+block that calls `wukong_rt_check_fail(kind, a, b, site)`. A new check adds a `CHECK_*` kind and its
+message to `check_failure_message` in `crates/wukong_runtime/src/safety.rs` (with a unit test), the
+same constant in `crates/wukong_mir_build/src/bounds.rs`, and the C twin's arm in the `cc` fallback
+runtime (`WUKONG_RT_C` in `crates/wukong_driver/src/lib.rs`); the interpreter, both JIT builders and
+the AOT link already route every kind through the one formatter. Pin the message with a `tests/run`
+fixture's `// EXPECT-STDERR:` lines, and fail it inside a helper function too, with output after the
+call, so the differential gate sees a caller that runs on. An element access keeps
+`wukong_rt_bounds_fail`, which `wukong_opt::bce` keys on. A new failure *entry* (a runtime function
+that stops the run, rather than a new kind of the existing one) must also join
+`is_failure_intrinsic` in `crates/wukong_codegen_cranelift/src/lib.rs`: the JIT returns a failure
+through its callers, and a call is followed by a status poll only when the callee is known to be
+able to fail, so a missing entry lets the caller keep running and read the result the callee never
+wrote.

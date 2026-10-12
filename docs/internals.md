@@ -226,6 +226,30 @@ call's fresh result: `@noalias` roots it at its base's storage, so `k(s[0..2], s
 like `s[i]`, so `let va = s[..]; let vc = s[..];` are two names for one buffer and a recognized
 kernel over both is guarded (`tests/run/alias_range_views.wk`). It recognizes the callee without an
 interner through `SemaResult::range_slice_callees` / `is_range_slice_call`.
+**The `str` operations cross the boundary as `SemaResult::str_info`** (`wukong_sema::StrInfo`):
+`ops`, the `StrOp` of every `str` method call (`as_bytes`, `as_ptr`, `chars`, `char_count`, `cmp`)
+and `str` builtin (`str_from_utf8`, `utf8_valid_up_to`, `str_concat`), keyed by the callee's
+`NodeId` — after erasure a receiver is only a `[]u8`, so lowering keys on the tag, never on the
+type; `print_types`, the UNERASED type of each print or format argument that holds a `str` inside
+an aggregate or behind a reference, and `struct_fields`, the unerased field types of each struct
+with a `str` field, which only `text.rs`'s structural printer walks (it lays fields out from the
+erased types: a `str` and its `[]u8` share one layout). `mir_build::strs` lowers them:
+`as_bytes`/`as_ptr` re-wrap or read the fat pointer; `char_count` and `str_from_utf8`'s check call
+`wukong_runtime::utf8` (`wukong_rt_utf8_count`, `wukong_rt_utf8_check`); the ordering operators
+and `cmp` are a block-parameter loop like `==`'s, comparing bytes zero-extended to `i32`; a
+string-literal pattern (`PatKind::Str`) is `==` against the literal's `.rodata` blob, whose bytes
+`collect_static_strings` also gathers from patterns; `for c in s.chars()` (`lower_for_chars`) is a
+loop that decodes ASCII inline and calls `wukong_rt_utf8_decode` for anything else;
+`str_concat` sums the lengths, allocates `len + 1` bytes from `wukong_rt_alloc` and copies each
+operand; `str_format` (`text.rs`) evaluates its arguments once and formats them twice, into no
+buffer (measuring) and into the allocation. Usefulness gives `str` a constructor per distinct
+decoded literal plus an unnamed rest, so only a catch-all completes a `str` column; it also accepts
+a string-literal pattern on a `[]u8` column, which is how the lints, running on erased types, see
+a `str` (sema rejects a string literal against a real `[]u8`, `E0426`). A literal and an
+`if`/`match` of literal arms adapt to `str` through `literal_adapts` / `retype_str_arms`; at a
+merge, `adapt_str_arm` re-stamps every literal arm once some arm is a `str`. The
+`str_view_operand` of `s.as_bytes()`, `s.as_ptr()` and `str_from_utf8(b)` is the operand whose
+bytes the result views, which `alias.rs::origin_of` projects exactly like a range index.
 **Storage classification is total.** `wukong_mir_build` sizes every value's slot through
 `FnLowerer::mir_ty_of` (a `Ty`) and `mir_ty_of_ann` (an annotation), each with an arm per form and
 no `_ => I32` fallback: a C-style enum is the one `Ty::Named` whose representation is `i32`; the
@@ -634,8 +658,22 @@ captured parameter that can share its storage (`noalias::could_share_storage` wi
 `promised_disjoint` promise). Every other place declines the region. A
 string literal lowers to a read-only `.rodata` blob in `Program::statics` (a `StaticData { name,
 bytes }`) addressed by `Op::GlobalAddr`, so a returned or threaded `*u8` stays valid after its
-defining frame is gone. `Op::VecKernelCall` — a call into a synthesized 256-bit AVX2 kernel — is
-covered under the vectorizer below.
+defining frame is gone. The interpreter materializes a blob's bytes as sign-extended `i8` slot
+values, the representation every other byte slot holds (an `I8` store, a runtime byte write, the
+`arg`/`env` strings it allocates): a load is verbatim and a `u8 == u8` compares slots unwidened,
+so zero-extended bytes compared unequal to the same bytes held anywhere else, on that backend
+only. **Run-time checks** share one failure-edge shape — `cond_br ok, cont,
+fail` into a dead-end block that calls a reporting entry and is `unreachable` — and one message
+formatter per entry in `wukong_runtime::safety`: `wukong_rt_bounds_fail(index, len, site)` for an
+element access (the edge `bce` keys on) and `wukong_rt_check_fail(kind, a, b, site)` for
+everything else (a range index's end and order, `str_from_utf8`; `bounds::emit_check_fail_unless`).
+`bounds::attach_sites` turns the trailing placeholder of both into a `file:line:col` blob. The
+interpreter returns the message as its run error, the JIT records it and returns through its
+callers like a failed `assert` (both entries are `is_failure_intrinsic`s, so a caller of any
+function that can reach one polls the failure status after the call and stops; an entry missing
+from that list lets the caller run on), and a linked executable prints it and exits 1 (the `cc`
+fallback runtime carries C twins of both). `Op::VecKernelCall` — a call into a synthesized 256-bit
+AVX2 kernel — is covered under the vectorizer below.
 
 The front-end lowers in **clang style**: one `alloca` per local, with `load`/`store` on every use.
 `Op::Alloca` carries an `align` (bytes; `0` = natural, which every compiler-made slot uses and

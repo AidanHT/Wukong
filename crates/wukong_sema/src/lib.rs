@@ -46,7 +46,7 @@ mod provenance;
 mod resolve;
 mod shape;
 mod strs;
-pub use strs::{is_range_slice, RANGE_SLICE, RANGE_SLICE_FROM};
+pub use strs::{is_range_slice, StrInfo, StrOp, RANGE_SLICE, RANGE_SLICE_FROM, STR_METHODS};
 mod tensor;
 mod turbofish;
 pub use turbofish::DimSnapshot;
@@ -316,6 +316,9 @@ pub struct SemaResult {
     /// (`strs.rs`), each `None` when the program never spells that form. They let a pass that
     /// holds no interner recognize a range index: see [`SemaResult::is_range_slice_call`].
     pub range_slice_callees: [Option<Symbol>; 2],
+    /// The `str` operations (`strs.rs`): every `str` method call and builtin, and the unerased
+    /// types the structural printer needs to print a `str` inside an aggregate as text.
+    pub str_info: StrInfo,
 
     /// Every closure literal that checked cleanly, keyed by the literal's `NodeId`: its parameter,
     /// return and capture types, which `wukong_mir_build` lifts it with (see `closures.rs`).
@@ -513,6 +516,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         assert_conds: HashSet::default(),
         match_verdicts: HashMap::default(),
         str_print_args: HashSet::default(),
+        str_state: strs::StrState::default(),
 
         closure_ctx: Vec::new(),
         closures: HashMap::default(),
@@ -551,7 +555,14 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
     s.check_instantiations(module);
     // The `@noalias` rules (`noalias`): they compare argument storage, so they read the types the
     // body pass just recorded.
-    noalias::check(module, interner, &s.defs, &s.types, &mut s.diags);
+    noalias::check(
+        module,
+        interner,
+        &s.defs,
+        &s.types,
+        &s.str_state.info.ops,
+        &mut s.diags,
+    );
     // The program entry's signature (`entry`, E0331): it reads the resolved signatures only.
     entry::check(module, interner, &s.defs, &mut s.diags);
     let mut result = SemaResult {
@@ -573,6 +584,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
             .collect(),
         str_print_args: s.str_print_args,
         range_slice_callees: [interner.get(RANGE_SLICE), interner.get(RANGE_SLICE_FROM)],
+        str_info: s.str_state.info,
 
         closures: s.closures,
         closure_refs: s.closure_refs,
@@ -729,6 +741,8 @@ struct Sema<'a> {
     match_verdicts: HashMap<NodeId, bool>,
     /// The print and format arguments of type `str`, published as [`SemaResult::str_print_args`].
     str_print_args: HashSet<NodeId>,
+    /// The `str` operations typed so far, published as [`SemaResult::str_info`] (`strs.rs`).
+    str_state: strs::StrState,
 
     /// The closures whose bodies are being checked, innermost last (`closures.rs`). Empty at the
     /// start of every function pass.
@@ -3532,6 +3546,8 @@ impl<'a> Sema<'a> {
                 label,
                 ..
             } => {
+                // `for c in s.chars()` is the one place `.chars()` may appear (`strs.rs`).
+                self.mark_chars_head(iter);
                 let elem = self.type_for_iter(iter);
                 self.push_scope();
                 self.bind_pattern(pat, &elem);
@@ -3583,7 +3599,12 @@ impl<'a> Sema<'a> {
                 // body type-checks (`for x in [T; N]` ⇒ `x: T`). A slice iterates the same way
                 // (`for x in s` ⇒ `x: T` for `s: []T`). Any other iterand stays `Unknown` (lenient
                 // — we don't newly reject other iterables here).
-                match self.type_expr(e) {
+                let t = self.type_expr(e);
+                // `for c in s.chars()` yields each character as a `char` (`strs.rs`).
+                if let Some(c) = self.for_chars_elem(e) {
+                    return c;
+                }
+                match t {
                     Ty::Array { elem, .. } | Ty::Slice(elem) => *elem,
                     // A `str` iterates its bytes.
                     Ty::Str => Ty::Scalar(Scalar::U8),
@@ -3644,12 +3665,20 @@ impl<'a> Sema<'a> {
             // scrutinee `match x { 4294967296 => 1, 0 => 2, _ => 0 }` returned 1 for `x == 0`, and on
             // an `i8` scrutinee `200 => 1` matched `-56`. The same literal in `let`/`const`/`return`/
             // argument position is already rejected — apply that rule here too.
-            PatKind::Int { .. } => self.range_check_int_pattern(pat, ty),
+            PatKind::Int { .. } => {
+                self.check_str_literal_pattern(pat, ty);
+                self.range_check_int_pattern(pat, ty);
+            }
             PatKind::Range { lo, hi, .. } => {
+                self.check_str_literal_pattern(pat, ty);
                 self.range_check_int_pattern(lo, ty);
                 self.range_check_int_pattern(hi, ty);
             }
-            PatKind::Char(_) | PatKind::Bool(_) | PatKind::Path(_) => {}
+            // A string literal matches a `str`, and a `str` only string literals (`strs.rs`).
+            PatKind::Char(_) | PatKind::Bool(_) | PatKind::Str(_) => {
+                self.check_str_literal_pattern(pat, ty)
+            }
+            PatKind::Path(_) => {}
             // `Point { x, .. }`, `n @ 1..=9`, `[a, .., z]` (`patterns.rs`).
             PatKind::Struct { path, fields, .. } => {
                 self.check_struct_pattern(path, fields, ty, pat.span)
@@ -4009,8 +4038,12 @@ impl<'a> Sema<'a> {
     fn literal_adapts(&self, ann: &Ty, init: &Expr) -> bool {
         match (&init.kind, ann) {
             (ExprKind::Int(s), Ty::Scalar(sc)) => sc.is_int() && !has_int_suffix(self.sym_str(*s)),
-            // A string literal is a `str` wherever one is expected (`strs.rs`).
+            // A string literal is a `str` wherever one is expected (`strs.rs`) — and so is an
+            // `if`/`match`/block whose every value is one (`let s: str = if c { "a" } else { "b" }`).
             (ExprKind::Str(_), Ty::Str) => true,
+            (ExprKind::If { .. } | ExprKind::Match { .. } | ExprKind::Block(_), Ty::Str) => {
+                self.str_literal_arms(init)
+            }
             (ExprKind::Float(s), Ty::Scalar(sc)) => {
                 sc.is_float() && !has_float_suffix(self.sym_str(*s))
             }
@@ -4134,6 +4167,8 @@ impl<'a> Sema<'a> {
                     self.retype_adapted_literal(tail, ann);
                 }
             }
+            // An `if`/`match` of string literals adapting to `str` (`strs.rs`).
+            (ExprKind::If { .. } | ExprKind::Match { .. }, Ty::Str) => self.retype_str_arms(e),
             _ => {}
         }
     }
@@ -4427,6 +4462,11 @@ impl<'a> Sema<'a> {
                     return Ty::Unknown;
                 }
                 use BinOp::*;
+                // Two `str`s are ordered by their bytes (`strs.rs`); a `str` against anything else
+                // is E0433 there.
+                if matches!(op, Lt | Le | Gt | Ge) && self.check_str_eq(*op, &l, &r, e.span) {
+                    return Ty::Scalar(Scalar::Bool);
+                }
                 // No binary operator other than `==`/`!=` (which has its own message below) is
                 // defined on an aggregate (struct/tuple/array), `()` (a void call's result), or a
                 // function value: arithmetic/bitwise/shift/ordering/logical on one lowers to an op on
@@ -4525,7 +4565,7 @@ impl<'a> Sema<'a> {
                     // struct/tuple/array operands are rejected.
                     Eq | Ne => {
                         // Two `str`s compare by value (`strs.rs`), the one aggregate that does.
-                        if !self.check_str_eq(&l, &r, e.span)
+                        if !self.check_str_eq(*op, &l, &r, e.span)
                             && (self.is_aggregate_ty(&l) || self.is_aggregate_ty(&r))
                         {
                             self.error(
@@ -4892,9 +4932,13 @@ impl<'a> Sema<'a> {
                 else_branch,
             } => {
                 self.check_condition(cond);
-                let then_ty = self.type_block(then_branch);
+                let mut then_ty = self.type_block(then_branch);
                 if let Some(else_expr) = else_branch {
-                    let else_ty = self.type_expr(else_expr);
+                    let mut else_ty = self.type_expr(else_expr);
+                    // A string-literal arm beside a `str` arm is a `str`, on either side (`strs.rs`).
+                    let any_str = matches!(then_ty, Ty::Str) || matches!(else_ty, Ty::Str);
+                    self.adapt_str_block_arm(then_branch, &mut then_ty, any_str);
+                    self.adapt_str_arm(else_expr, &mut else_ty, any_str);
                     // The two arms merge into ONE value, so — like a binary operator's operands, a
                     // call's arguments, and a `return` — their tensor/vector SHAPES (and element
                     // types) must agree. `join` alone picks the then-arm's type and lets a mismatched
@@ -4910,8 +4954,11 @@ impl<'a> Sema<'a> {
                 }
             }
             ExprKind::Match { scrutinee, arms } => {
-                let scrut_ty = self.type_expr(scrutinee);
+                let mut scrut_ty = self.type_expr(scrutinee);
+                // A string-literal scrutinee matched against string literals is a `str` (`strs.rs`).
+                self.adapt_str_scrutinee(scrutinee, &mut scrut_ty, arms);
                 let mut result = Ty::Unknown;
+                let mut arm_tys = Vec::with_capacity(arms.len());
                 for arm in arms {
                     // Each arm gets its own scope: an `Ident` pattern binds the scrutinee value for
                     // the arm's guard and body; a literal/`_` pattern binds nothing.
@@ -4922,8 +4969,15 @@ impl<'a> Sema<'a> {
                     if let Some(g) = &arm.guard {
                         self.check_condition(g);
                     }
-                    let t = self.type_expr(&arm.body);
+                    arm_tys.push(self.type_expr(&arm.body));
                     self.pop_scope();
+                }
+                // A string-literal arm beside a `str` arm is a `str`, wherever it sits (`strs.rs`).
+                let any_str = arm_tys.iter().any(|t| matches!(t, Ty::Str));
+                for (arm, t) in arms.iter().zip(arm_tys.iter_mut()) {
+                    self.adapt_str_arm(&arm.body, t, any_str);
+                }
+                for (arm, t) in arms.iter().zip(arm_tys) {
                     // Arms merge into one value: their tensor/vector shapes (and element types) must
                     // agree, exactly as the `if` arms above (see `check_binop_shapes`). Unify each arm
                     // against the running result before `join` folds it in, so a shape-mismatched arm

@@ -275,6 +275,15 @@ pub(crate) const NOT_DIFFERENTIABLE: &[(&str, &str)] = &[
         "wukong_rt_bounds_fail",
         "the failure edge of a slice bounds check: it never returns, so it carries no gradient",
     ),
+    (
+        "wukong_rt_check_fail",
+        "the failure edge of a range-index or UTF-8 check: it never returns, so it carries no \
+         gradient",
+    ),
+    // The `str` operations' UTF-8 entries: text, not numbers on the gradient path.
+    ("wukong_rt_utf8_check", NO_GRADIENT),
+    ("wukong_rt_utf8_decode", NO_GRADIENT),
+    ("wukong_rt_utf8_count", NO_GRADIENT),
 ];
 
 /// The reason `name` is not differentiable, when the table knows it.

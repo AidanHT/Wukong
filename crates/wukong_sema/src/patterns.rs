@@ -365,6 +365,19 @@ impl Sema<'_> {
             }
             ForIter::Expr(it) => it,
         };
+        if self.is_chars_iter(it) {
+            self.diags.push(
+                Diagnostic::error(
+                    "a `for` over `.chars()` yields each character as a `char`, which cannot be \
+                     destructured"
+                        .to_string(),
+                )
+                .with_code("E0401")
+                .primary(pat.span, "this pattern destructures each character")
+                .help("bind a name (`for c in s.chars()`); each `c` is a `char`"),
+            );
+            return;
+        }
         match self.types.get(&it.id) {
             Some(Ty::Array { .. } | Ty::Slice(_) | Ty::Unknown | Ty::Error) | None => {}
             // A `str` is laid out as a `[]u8`, but its element is a byte: nothing to destructure.
@@ -626,6 +639,7 @@ fn binding_names(p: &Pattern, out: &mut Vec<(Symbol, Span)>) {
         | PatKind::Unit
         | PatKind::Int { .. }
         | PatKind::Char(_)
+        | PatKind::Str(_)
         | PatKind::Bool(_)
         | PatKind::Path(_)
         | PatKind::Range { .. } => {}
@@ -660,6 +674,7 @@ fn refutable_form<'p>(pat: &'p Pattern, defs: &DefMap) -> Option<&'p Pattern> {
         PatKind::Wildcard | PatKind::Ident(_) | PatKind::Unit => None,
         PatKind::Int { .. }
         | PatKind::Char(_)
+        | PatKind::Str(_)
         | PatKind::Bool(_)
         | PatKind::Range { .. }
         | PatKind::Path(_)

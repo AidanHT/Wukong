@@ -378,6 +378,9 @@ pub enum TextBuiltin {
     Printf { stderr: bool },
     /// `sprintf(buf, fmt, args…) -> i64`.
     Sprintf,
+    /// `str_format(fmt, args…) -> str`: the formatted text in a fresh heap allocation, released
+    /// with `free`.
+    StrFormat,
     /// `print_raw(x)` (stdout, no newline) / `eprint(x)` and `eprintln(x)` (stderr, newline).
     PrintValue { stderr: bool, newline: bool },
     /// `write_stdout(buf, n) -> i64` / `write_stderr(buf, n) -> i64`.
@@ -407,6 +410,7 @@ pub fn text_builtin(name: &str) -> Option<TextBuiltin> {
         "printf" => TextBuiltin::Printf { stderr: false },
         "eprintf" => TextBuiltin::Printf { stderr: true },
         "sprintf" => TextBuiltin::Sprintf,
+        "str_format" => TextBuiltin::StrFormat,
         "print_raw" => TextBuiltin::PrintValue {
             stderr: false,
             newline: false,
@@ -530,14 +534,10 @@ impl Sema<'_> {
                     .into(),
             ),
             Ty::Array { elem, .. } => self.unprintable(elem, false),
-            // A `str` prints its text; inside an aggregate (or behind a reference) it would print
-            // as the `[]u8` it erases to, so that is refused until those print `str`s as text.
-            Ty::Str if top => None,
-            Ty::Str => Some(
-                "a `str` inside an aggregate or behind a reference does not print yet; print the \
-                 `str` itself (the field, or `*r`)"
-                    .into(),
-            ),
+            // A `str` prints its text — inside an aggregate too, where it is quoted like every
+            // string element (`User { name: "ada" }`), from the unerased type sema records for the
+            // printer (`strs.rs`).
+            Ty::Str => None,
             Ty::Slice(elem) => match elem.as_ref() {
                 Ty::Scalar(_) => None,
                 _ => Some(
@@ -596,6 +596,10 @@ impl Sema<'_> {
             // to print it as text (`strs.rs`).
             if matches!(ty, Ty::Str) {
                 self.str_print_args.insert(arg.id);
+            } else if ty.mentions_str() {
+                // A `str` inside an aggregate or behind a reference: the printer walks the
+                // unerased type to find it (`strs.rs`).
+                self.str_state.info.print_types.insert(arg.id, ty.clone());
             }
             return true;
         };
@@ -701,6 +705,18 @@ impl Sema<'_> {
                     self.check_format(name, &args[1], &args[2..], &arg_tys[2..], span);
                 }
                 i64_ty
+            }
+            TextBuiltin::StrFormat => {
+                if args.is_empty() {
+                    self.error(
+                        span,
+                        "E0503",
+                        format!("`{name}` takes a format string literal, then its arguments"),
+                    );
+                } else {
+                    self.check_format(name, &args[0], &args[1..], &arg_tys[1..], span);
+                }
+                Ty::Str
             }
             TextBuiltin::PrintValue { .. } => {
                 self.check_print_args(name, args, arg_tys, span);
@@ -928,7 +944,14 @@ impl Sema<'_> {
 
     /// A `[]u8` slice or `[u8; N]` array operand (argument `i`). When the builtin writes it, a
     /// non-`mut` by-reference parameter is `E0304`, as `p[i] = …` through it would be.
-    fn check_u8_buffer(&mut self, name: &str, arg: &Expr, ty: &Ty, i: usize, written: bool) {
+    pub(crate) fn check_u8_buffer(
+        &mut self,
+        name: &str,
+        arg: &Expr,
+        ty: &Ty,
+        i: usize,
+        written: bool,
+    ) {
         let u8_ty = Ty::Scalar(Scalar::U8);
         let ok = match ty {
             Ty::Slice(e) | Ty::Array { elem: e, .. } => **e == u8_ty,

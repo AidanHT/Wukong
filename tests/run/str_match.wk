@@ -1,0 +1,164 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 11
+// EXPECT-OUT: 3
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 3
+// EXPECT-OUT: 100
+// EXPECT-OUT: 5
+// EXPECT-OUT: 7
+// EXPECT-OUT: 4
+// EXPECT-OUT: -1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 31
+// EXPECT-OUT: 0
+// EXPECT-OUT: 20
+// EXPECT-OUT: 17
+// EXPECT-OUT: 20
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+module tests.run.str_match
+
+// String-literal patterns. A literal matches a `str` whose bytes equal the literal's decoded
+// bytes (the test `s == "…"` makes), so `"l\x65t"` is the same text as `"let"`. They nest
+// anywhere a pattern does — or-patterns, `name @ lit`, guards, tuples, struct fields, enum
+// payloads, slice elements, `if let` — and a `str` match needs a catch-all (`_` or a binding),
+// since no list of literals covers every string. Each expected line, by hand:
+// * classify: "let"/"fn"/"match" are 1; "" is 2; "x" binds `w` and is 1 + 10 = 11; "long_word"
+//   (9 bytes > 3) takes the guard, 3; "ab" falls to `_`, 0; "l\x65t" is "let", 1; "\u{e9}t\u{e9}"
+//   ("ete" with acute accents) is its own arm, 4; with the last letter U+00EA instead it differs
+//   in its last byte and, at 5 bytes, takes the guard, 3.
+// * tok: the payload "let" is 100; "hello" binds and is 5 bytes; `Num(7)` is 7.
+// * run: op "push" binds n = 4; "pop" is -1; "peek" is 0.
+// * args, over slices of `["help", "me"]` and `["run", "main.wk", "-O2"]`: ["help"] is 1;
+//   ["help", "me"] binds rest = ["me"], 30 + 1 = 31; [] is 0; ["run"] is 20 (the `..` arm; the
+//   two-element arm needs two); ["run", "main.wk"] binds file, 10 + 7 = 17; all three is 20.
+// * pair: ("add", 2) is 1; ("neg", 1) is 2; ("add", 5) is 3; ("neg", 2) is 0.
+// * `if let "go" = word` holds and `if let "stop"` does not; a literal scrutinee matched against
+//   string literals is a `str` itself, and "abc" matches its own arm.
+
+enum Tok {
+    Word(str),
+    Num(i32),
+}
+
+struct Cmd {
+    op: str,
+    n: i32,
+}
+
+fn classify(s: str) -> i32 {
+    match s {
+        "let" | "fn" | "match" => 1,
+        "" => 2,
+        w @ "x" => w.len() as i32 + 10,
+        "\u{e9}t\u{e9}" => 4,
+        other if other.len() > 3 => 3,
+        _ => 0,
+    }
+}
+
+fn tok(t: Tok) -> i32 {
+    match t {
+        Tok::Word("let") => 100,
+        Tok::Word(w) => w.len() as i32,
+        Tok::Num(n) => n,
+    }
+}
+
+fn run(c: Cmd) -> i32 {
+    match c {
+        Cmd { op: "push", n } => n,
+        Cmd { op: "pop", .. } => -1,
+        _ => 0,
+    }
+}
+
+fn args(v: []str) -> i32 {
+    match v {
+        [] => 0,
+        ["help"] => 1,
+        ["run", file] => 10 + file.len() as i32,
+        ["run", ..] => 20,
+        [_, rest @ ..] => 30 + rest.len() as i32,
+    }
+}
+
+fn pair(op: str, n: i32) -> i32 {
+    match (op, n) {
+        ("add", 2) => 1,
+        ("neg", 1) => 2,
+        ("add", _) => 3,
+        (_, _) => 0,
+    }
+}
+
+fn main() -> i32 {
+    println(classify("let"));
+    println(classify("fn"));
+    println(classify("match"));
+    println(classify(""));
+    println(classify("x"));
+    println(classify("long_word"));
+    println(classify("ab"));
+    println(classify("l\x65t"));
+    println(classify("\u{e9}t\u{e9}"));
+    println(classify("\u{e9}t\u{ea}"));
+
+    println(tok(Tok::Word("let")));
+    println(tok(Tok::Word("hello")));
+    println(tok(Tok::Num(7)));
+
+    println(run(Cmd { op: "push", n: 4 }));
+    println(run(Cmd { op: "pop", n: 4 }));
+    println(run(Cmd { op: "peek", n: 4 }));
+
+    let h: [str; 2] = ["help", "me"];
+    let hv: []str = h;
+    let r: [str; 3] = ["run", "main.wk", "-O2"];
+    let rv: []str = r;
+    println(args(hv[..1]));
+    println(args(hv));
+    println(args(rv[..0]));
+    println(args(rv[..1]));
+    println(args(rv[..2]));
+    println(args(rv));
+
+    println(pair("add", 2));
+    println(pair("neg", 1));
+    println(pair("add", 5));
+    println(pair("neg", 2));
+
+    let word: str = "go";
+    if let "go" = word {
+        println(1);
+    } else {
+        println(0);
+    }
+    if let "stop" = word {
+        println(1);
+    } else {
+        println(0);
+    }
+    match "abc" {
+        "abc" => {
+            println(1);
+        }
+        _ => {
+            println(0);
+        }
+    }
+    return 0;
+}

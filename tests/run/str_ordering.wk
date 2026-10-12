@@ -1,0 +1,72 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: true true false false -1
+// EXPECT-OUT: false true false true 0
+// EXPECT-OUT: true true false false -1
+// EXPECT-OUT: false false true true 1
+// EXPECT-OUT: true true false false -1
+// EXPECT-OUT: false true false true 0
+// EXPECT-OUT: true true false false -1
+// EXPECT-OUT: true true false false -1
+// EXPECT-OUT: true true false false -1
+// EXPECT-OUT: true true false false -1
+// EXPECT-OUT: Apple
+// EXPECT-OUT: app
+// EXPECT-OUT: apple
+// EXPECT-OUT: banana
+// EXPECT-OUT: fig
+// EXPECT-OUT: pear
+// EXPECT-OUT: true
+// EXPECT-OUT: false
+module tests.run.str_ordering
+
+// `<`, `<=`, `>`, `>=` and `.cmp()` order two `str`s by their bytes: the first differing byte
+// decides, compared as an unsigned value, and a proper prefix is less than the longer string —
+// Rust's `Ord for str`. UTF-8 preserves code-point order, so this is also code-point order. Each
+// `report` line is `a < b`, `a <= b`, `a > b`, `a >= b`, `a.cmp(b)`, derived by hand:
+// * apple / banana: 'a' (97) < 'b' (98);
+// * abc / abc: equal;
+// * ab / abc and abc / ab: the prefix is less;
+// * "" / a: the empty string is a prefix of everything; "" / "": equal;
+// * z / U+00E9: 0x7A < 0xC3 (the lead byte of C3 A9);
+// * B / a: 0x42 < 0x61 (upper case sorts first);
+// * U+00E9 / U+00EA: C3 A9 < C3 AA, decided by the second byte;
+// * U+00FF / U+0100: C3 BF < C4 80, decided by the lead byte, as the code points order them.
+// The insertion sort orders six words bytewise: "Apple" (0x41) first, then "app" before its
+// extension "apple". A literal adapts on either side of an ordering: "m" <= "pear" is true and
+// "pear" < "m" is false.
+
+fn report(a: str, b: str) {
+    printf("{} {} {} {} {}\n", a < b, a <= b, a > b, a >= b, a.cmp(b));
+}
+
+fn main() -> i32 {
+    report("apple", "banana");
+    report("abc", "abc");
+    report("ab", "abc");
+    report("abc", "ab");
+    report("", "a");
+    report("", "");
+    report("z", "\u{e9}");
+    report("B", "a");
+    report("\u{e9}", "\u{ea}");
+    report("\u{ff}", "\u{100}");
+
+    let mut words: [str; 6] = ["pear", "apple", "fig", "banana", "Apple", "app"];
+    for i in 1..6 {
+        let mut j = i;
+        while j > 0 && words[j] < words[j - 1] {
+            let t = words[j];
+            words[j] = words[j - 1];
+            words[j - 1] = t;
+            j = j - 1;
+        }
+    }
+    for w in words {
+        println(w);
+    }
+    let last: str = words[5];
+    println("m" <= last);
+    println(last < "m");
+    return 0;
+}

@@ -1465,6 +1465,7 @@ fn pattern_names(p: &Pattern, out: &mut Vec<(Symbol, Span)>) {
         | PatKind::Unit
         | PatKind::Int { .. }
         | PatKind::Char(_)
+        | PatKind::Str(_)
         | PatKind::Bool(_)
         | PatKind::Path(_)
         | PatKind::Range { .. } => {}

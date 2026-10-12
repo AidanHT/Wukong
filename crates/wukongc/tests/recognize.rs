@@ -577,8 +577,11 @@ fn kernel_symbols(mir: &str) -> BTreeSet<String> {
             let end = sym
                 .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
                 .unwrap_or(sym.len());
-            // The slice bounds-failure edge is a safety check, not a recognized kernel.
-            if &sym[..end] != "wukong_rt_bounds_fail" {
+            // The bounds- and check-failure edges are safety checks, not recognized kernels.
+            if !matches!(
+                &sym[..end],
+                "wukong_rt_bounds_fail" | "wukong_rt_check_fail"
+            ) {
                 out.insert(sym[..end].to_string());
             }
             rest = &sym[end..];

@@ -916,6 +916,8 @@ fn collect_str_expr(e: &Expr, out: &mut Vec<Symbol>) {
         ExprKind::Match { scrutinee, arms } => {
             collect_str_expr(scrutinee, out);
             for arm in arms {
+                // A string-literal pattern compares against the literal's static bytes.
+                strs::collect_str_pat(&arm.pat, out);
                 if let Some(g) = &arm.guard {
                     collect_str_expr(g, out);
                 }
@@ -923,7 +925,10 @@ fn collect_str_expr(e: &Expr, out: &mut Vec<Symbol>) {
             }
         }
         ExprKind::Loop { body, .. } => collect_str_block(body, out),
-        ExprKind::Let { scrutinee, .. } => collect_str_expr(scrutinee, out),
+        ExprKind::Let { pat, scrutinee } => {
+            strs::collect_str_pat(pat, out);
+            collect_str_expr(scrutinee, out)
+        }
     }
 }
 
@@ -1554,6 +1559,8 @@ fn lower_program_pooled(
         rt_write_i8: interner.intern("wukong_rt_write_i8"),
         now_ns: interner.intern("wukong_now_ns"),
         bounds_fail: interner.intern("wukong_rt_bounds_fail"),
+        check_fail: interner.intern("wukong_rt_check_fail"),
+        str_syms: strs::StrSyms::new(interner),
         // Overwritten per function by `@unchecked`, below; checked is the default.
         bounds_checks: true,
         unroll_for_autodiff: opts.unroll_for_autodiff,
@@ -2510,7 +2517,12 @@ fn lower_program_pooled(
     // the functions above. Appended last — backends resolve functions by name, so order is free.
     program.funcs.append(&mut par_regions.funcs);
     // Give every slice bounds failure its `file:line:col` (a `.rodata` string; see `bounds.rs`).
-    bounds::attach_sites(&mut program, interner, gemm.bounds_fail, locate);
+    bounds::attach_sites(
+        &mut program,
+        interner,
+        &[(gemm.bounds_fail, 3), (gemm.check_fail, 4)],
+        locate,
+    );
     (program, diags, par_regions.exhausted)
 }
 
@@ -4140,6 +4152,12 @@ struct GemmSyms {
     /// The failure edge of a checked slice access: `wukong_rt_bounds_fail(index: i64, len: i64,
     /// site: *u8)`, which never returns normally (see `bounds.rs`).
     bounds_fail: Symbol,
+    /// The failure edge of every other run-time check — a range index, `str_from_utf8`:
+    /// `wukong_rt_check_fail(kind: i64, a: i64, b: i64, site: *u8)`, which never returns normally
+    /// either (see `bounds.rs`).
+    check_fail: Symbol,
+    /// The runtime entries of the `str` operations (`strs.rs`).
+    str_syms: strs::StrSyms,
     /// Emit slice bounds checks (`true`, the default). Cleared per function by `@unchecked`, at the
     /// same place `@generic` clears `recognize`; it rides here for the same reason that does.
     bounds_checks: bool,
@@ -14771,6 +14789,10 @@ impl FnLowerer<'_> {
                 // iterates its leading axis (`lower_for_tensor`); anything else (a literal head, an
                 // iterand of another type) declines and stays unsupported.
                 if let ForIter::Expr(e) = iter {
+                    // `for c in s.chars()` decodes the text (`strs.rs`).
+                    if self.lower_for_chars(label, pat, e, body) {
+                        return;
+                    }
                     if self.lower_for_array(label, pat, e, body) {
                         return;
                     }
@@ -21845,34 +21867,12 @@ impl FnLowerer<'_> {
                 // A returned/threaded `*u8` then points at stable read-only storage, valid after the
                 // callee's frame is gone (interp==native) — the dangling-string divergence closed.
                 // The lookup key is the decoded bytes plus the trailing NUL (how blobs are stored).
-                let mut key = decode_string_literal(self.interner.resolve(*s));
-                key.push(0);
-                let data = if let Some(sym) = self.mono.and_then(|m| m.strings.get(&key)).copied() {
-                    self.builder.build(MirType::Ptr, Op::GlobalAddr(sym))
-                } else {
-                    // Fallback (a probe/kernel lowerer without the table, or a literal the collector
-                    // did not pre-scan): materialize a frame-local NUL-terminated byte buffer and
-                    // yield its base — correct, just frame-local (the pre-`.rodata` behavior).
-                    let bytes = &key[..key.len() - 1];
-                    let elem = MirType::I8;
-                    let n = key.len() as u32; // bytes + NUL terminator
-                    let base = self
-                        .builder
-                        .alloca(MirType::Array(Box::new(elem.clone()), n));
-                    for (i, b) in bytes.iter().enumerate() {
-                        let v = self
-                            .builder
-                            .build(MirType::I8, Op::ConstInt(*b as i128, MirType::I8));
-                        self.store_element(base, &elem, i as i128, v);
-                    }
-                    let nul = self
-                        .builder
-                        .build(MirType::I8, Op::ConstInt(0, MirType::I8));
-                    self.store_element(base, &elem, bytes.len() as i128, nul);
-                    base
-                };
+                // Fallback (a probe/kernel lowerer without the table, or a literal the collector did
+                // not pre-scan): a frame-local NUL-terminated byte buffer — correct, just
+                // frame-local (the pre-`.rodata` behavior). See `strs::str_literal_data`.
+                let (data, len) = self.str_literal_data(*s);
                 // A literal sema adapted to `str` is a fat pointer over those bytes (`strs.rs`).
-                self.str_literal_value(e, data, key.len() as u64 - 1)
+                self.str_literal_value(e, data, len)
             }
             ExprKind::Path(p) if p.is_single() => {
                 if let Some((slot, ty)) = self.lookup(p.first().sym) {
@@ -22445,6 +22445,9 @@ impl FnLowerer<'_> {
                         .build(MirType::I1, Op::Cmp(CmpOp::Eq, scrut, c)),
                 )
             }
+            // A string-literal pattern: the `str` scrutinee (a fat pointer, tested at its address)
+            // equals the literal's bytes (`strs.rs`).
+            ast::PatKind::Str(sym) => Some(self.str_pattern_cond(*sym, scrut)),
             // A bool pattern's constant is `i1`, so the scrutinee must be one too: `match x { true =>
             // .. }` on an `i32` scrutinee emitted `cmp i32, i1`, which the verifier rejected with raw
             // internal text (`cmp operands differ: i32 vs i1`). That is the match-position mirror of a
@@ -22729,8 +22732,9 @@ impl FnLowerer<'_> {
             ast::PatKind::Tuple(_) => true,
             // A variant pattern tests against the enum buffer's *address*, not a loaded value.
             ast::PatKind::Variant { .. } => true,
-            // So do struct and array patterns; `name @ sub` needs what `sub` needs.
-            ast::PatKind::Struct { .. } | ast::PatKind::Slice { .. } => true,
+            // So do struct and array patterns, and a string literal (a `str` is a fat pointer);
+            // `name @ sub` needs what `sub` needs.
+            ast::PatKind::Struct { .. } | ast::PatKind::Slice { .. } | ast::PatKind::Str(_) => true,
             ast::PatKind::Binding { sub, .. } => Self::pattern_needs_ptr(sub),
             ast::PatKind::Or(alts) => alts.iter().any(Self::pattern_needs_ptr),
             _ => false,
@@ -23023,9 +23027,18 @@ impl FnLowerer<'_> {
     fn lower_binary(&mut self, op: ast::BinOp, lhs: &Expr, rhs: &Expr, e: &Expr) -> ValueId {
         use ast::BinOp::*;
         match op {
-            // Sema admits `==`/`!=` on a slice only for two `str`s, which compare by value.
+            // Sema admits a comparison of slices only for two `str`s, which compare by value.
             Eq | Ne if matches!(self.expr_ty(lhs), Ty::Slice(_)) => {
                 self.lower_str_eq(lhs, rhs, op == Ne)
+            }
+            Lt | Le | Gt | Ge if matches!(self.expr_ty(lhs), Ty::Slice(_)) => {
+                let pred = match op {
+                    Lt => CmpOp::Slt,
+                    Le => CmpOp::Sle,
+                    Gt => CmpOp::Sgt,
+                    _ => CmpOp::Sge,
+                };
+                self.lower_str_order(pred, lhs, rhs)
             }
             Eq | Ne | Lt | Le | Gt | Ge => {
                 let l = self.lower_expr(lhs);
@@ -23492,6 +23505,10 @@ impl FnLowerer<'_> {
         }
         // A range index `s[a..b]`, desugared by the parser (`strs.rs`).
         if let Some(v) = self.lower_range_slice(callee, args, e) {
+            return v;
+        }
+        // A `str` method or builtin sema typed (`strs.rs`): `s.as_bytes()`, `str_from_utf8(b)`, …
+        if let Some(v) = self.lower_str_op(callee, args, e) {
             return v;
         }
         // `Enum::Variant(args)` constructing a data-carrying tuple-payload variant: build its buffer
@@ -26671,6 +26688,7 @@ fn pattern_has_binding(p: &ast::Pattern) -> bool {
         | ast::PatKind::Unit
         | ast::PatKind::Int { .. }
         | ast::PatKind::Char(_)
+        | ast::PatKind::Str(_)
         | ast::PatKind::Bool(_)
         | ast::PatKind::Path(_)
         | ast::PatKind::Range { .. } => false,

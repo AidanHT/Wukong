@@ -1,7 +1,8 @@
 //! The process interface through the real binary, on the interpreter and the native JIT at `-O0`
 //! and `-O2`: program arguments after `--` (`arg_count`, `arg`, `arg_i64`, `arg_f32`), standard
-//! input (`read_stdin_u8`), `exit` from inside a nested call, a program read from standard input
-//! (`wukongc -`), a program given inline (`wukongc -e`), and the usage errors around them.
+//! input (`read_stdin_u8`), an environment variable (`env`), `exit` from inside a nested call, a
+//! program read from standard input (`wukongc -`), a program given inline (`wukongc -e`), and the
+//! usage errors around them.
 //!
 //! `tests/run` cannot carry these: its harness runs every fixture with no program arguments and
 //! no standard input (`tests/run/process_exit.wk` covers that case). Each expected line here is
@@ -88,6 +89,50 @@ fn program_arguments_reach_the_program() {
         assert_eq!(
             lines[1..],
             ["5", "alpha", "42", "3.5", "-x", "-1", ""],
+            "{backend} {opt}"
+        );
+    }
+}
+
+#[test]
+fn argument_and_environment_bytes_equal_the_same_bytes_in_a_literal() {
+    // U+00E9 is C3 A9 in UTF-8, whether it arrives as program argument 1, as an environment
+    // variable, or as a string literal, so each first byte is the one `u8` value 195 and the
+    // byte-to-byte comparisons are all true. A `u8 == u8` compares the two 8-bit values directly
+    // (no widening), so it sees how each byte is held: the interpreter held a literal's bytes
+    // sign-extended (as every stored byte) but `arg`/`env` bytes zero-extended, and each
+    // comparison was false there and true natively. Printed, the byte is 195 either way.
+    let path = program(
+        "bytes",
+        "fn main() -> i32 {
+    let a = arg(1);
+    let e = env(\"WUKONG_PROCESS_IO_BYTES\");
+    let lit = \"\u{e9}\";
+    let s: str = \"\u{e9}\";
+    println(*a == *lit);
+    println(*e == *lit);
+    println(*a == s[0]);
+    println(*e == s[0]);
+    println(*a == *e);
+    println(*a);
+    println(*e);
+    return 0;
+}
+",
+    );
+    let path_s = path.to_string_lossy().into_owned();
+    for (backend, opt) in MODES {
+        let out = Command::new(env!("CARGO_BIN_EXE_wukongc"))
+            .args(["--run", backend, opt, &path_s, "--", "\u{e9}"])
+            .env("WUKONG_PROCESS_IO_BYTES", "\u{e9}")
+            .stdin(Stdio::null())
+            .output()
+            .expect("run wukongc");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{backend} {opt}: {stderr}");
+        assert_eq!(
+            stdout, "true\ntrue\ntrue\ntrue\ntrue\n195\n195\n",
             "{backend} {opt}"
         );
     }

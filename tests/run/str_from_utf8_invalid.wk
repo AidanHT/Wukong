@@ -1,0 +1,23 @@
+// RUN: --run
+// EXPECT-EXIT: 1
+// EXPECT-OUT: 2
+// EXPECT-STDERR: str_from_utf8: invalid utf-8 sequence of 1 bytes from index 2 (the len is 4) at
+// EXPECT-STDERR: str_from_utf8_invalid.wk:20:13
+module tests.run.str_from_utf8_invalid
+
+// `str_from_utf8` checks its bytes at run time and stops the program when they are not UTF-8 —
+// the same stop, on every backend and in a linked executable, as a slice index out of bounds:
+// the message on stderr, exit status 1, nothing after it runs. The bytes are "ok", then 0xFF
+// (which never starts a UTF-8 sequence, so the bad sequence is that one byte), then "!": the
+// longest valid prefix is 2 bytes, which `utf8_valid_up_to` reports without stopping, and the
+// failure names index 2 of 4, at line 20, column 13 — the start of the `str_from_utf8` call.
+// The non-trapping check comes first, so a program can test before it converts.
+
+fn main() -> i32 {
+    let a: [u8; 4] = [111, 107, 0xFF, 33];
+    let b: []u8 = a;
+    println(utf8_valid_up_to(b));
+    let s = str_from_utf8(b);
+    println(s);
+    return 0;
+}

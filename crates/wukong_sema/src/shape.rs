@@ -368,6 +368,12 @@ impl Sema<'_> {
                     self.types.insert(callee.id, Ty::Unknown);
                     return ret;
                 }
+                // `str_from_utf8`, `utf8_valid_up_to`, `str_concat` (`strs.rs`).
+                if let Some(ret) =
+                    self.type_str_builtin(interner.resolve(name), callee, args, &mut arg_tys, span)
+                {
+                    return ret;
+                }
                 // A few math builtins are lowered directly by the backends, so their *result*
                 // type is real rather than `Unknown` — this lets `let e = exp(x)` infer `f32`
                 // and the lowerer pick the right result type. The callee path itself stays
@@ -490,7 +496,8 @@ impl Sema<'_> {
                         );
                     } else {
                         match &arg_tys[0] {
-                            Ty::Slice(_) | Ty::Unknown | Ty::Error => {}
+                            // A `str` from `str_concat` / `str_format` is released the same way.
+                            Ty::Slice(_) | Ty::Str | Ty::Unknown | Ty::Error => {}
                             other => self.error(
                                 span,
                                 "E0437",
@@ -684,6 +691,12 @@ impl Sema<'_> {
                     self.types.insert(callee.id, Ty::Unknown);
                     return t;
                 }
+            }
+            // `s.as_bytes()`, `s.as_ptr()`, `s.chars()`, `s.char_count()`, `s.cmp(t)` (`strs.rs`).
+            if let Some(t) =
+                self.type_str_method(&bty, base, callee, *name, args, &mut arg_tys, span)
+            {
+                return t;
             }
             // Any other method of a builtin type, or a struct field called like a method
             // (`resolve.rs`). Struct and enum methods were typed by `type_method_call`; a type

@@ -193,6 +193,7 @@ pub(crate) fn pattern_tests(p: &Pattern) -> bool {
         | ast::PatKind::Or(_)
         | ast::PatKind::Int { .. }
         | ast::PatKind::Char(_)
+        | ast::PatKind::Str(_)
         | ast::PatKind::Bool(_)
         | ast::PatKind::Path(_)
         | ast::PatKind::Range { .. } => true,

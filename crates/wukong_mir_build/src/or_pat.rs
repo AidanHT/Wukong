@@ -254,6 +254,7 @@ pub(crate) fn has_binding_or(p: &Pattern) -> bool {
         | PatKind::Unit
         | PatKind::Int { .. }
         | PatKind::Char(_)
+        | PatKind::Str(_)
         | PatKind::Bool(_)
         | PatKind::Path(_)
         | PatKind::Range { .. } => false,
@@ -352,6 +353,7 @@ fn expand_binding_ors(p: &Pattern, cap: usize) -> Vec<Pattern> {
         | PatKind::Unit
         | PatKind::Int { .. }
         | PatKind::Char(_)
+        | PatKind::Str(_)
         | PatKind::Bool(_)
         | PatKind::Path(_)
         | PatKind::Range { .. } => vec![p.clone()],
@@ -434,6 +436,7 @@ fn binding_order(p: &Pattern, out: &mut Vec<Symbol>) {
         | PatKind::Unit
         | PatKind::Int { .. }
         | PatKind::Char(_)
+        | PatKind::Str(_)
         | PatKind::Bool(_)
         | PatKind::Path(_)
         | PatKind::Range { .. } => {}

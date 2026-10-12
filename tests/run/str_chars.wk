@@ -1,0 +1,99 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 10
+// EXPECT-OUT: 4
+// EXPECT-OUT: 97
+// EXPECT-OUT: 233
+// EXPECT-OUT: 8364
+// EXPECT-OUT: 128512
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1114111
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: x
+// EXPECT-OUT: y
+// EXPECT-OUT: 97
+// EXPECT-OUT: 65533
+// EXPECT-OUT: 65533
+// EXPECT-OUT: 100
+// EXPECT-OUT: 4
+// EXPECT-OUT: 1
+// EXPECT-OUT: 97
+// EXPECT-OUT: 65533
+// EXPECT-OUT: 2
+module tests.run.str_chars
+
+// `for c in s.chars()` decodes UTF-8, one `char` (a Unicode scalar value) per iteration, and
+// `s.char_count()` counts them. Each expected line follows from the encoding:
+// * "a\u{e9}\u{20ac}\u{1F600}" is 'a' (1 byte), U+00E9 (2), U+20AC (3) and U+1F600 (4): 10
+//   bytes, 4 characters, the code points 97, 233, 8364 and 128512.
+// * `continue` skips U+00E9 and `break` stops at U+20AC, so only 'a' is counted: 1.
+// * "\u{10FFFF}" is the last scalar value, one 4-byte character.
+// * "" yields nothing: 0 characters, and the loop body never runs (the counter stays 0).
+// * a literal receiver works directly: "xy".chars() is 'x', 'y'.
+// * A `str` views its bytes, and the language has no borrow checker: `v` is
+//   `str_from_utf8(buf)` while `buf` is "abcd", and then `buf[1]` and `buf[2]` are overwritten
+//   with 0xFF and 0xE2. Decoding never fails: each ill-formed sequence is one U+FFFD (65533), as
+//   Rust's `String::from_utf8_lossy` decodes it — 0xFF never starts a character, and 0xE2 starts
+//   a 3-byte one that 'd' (0x64) does not continue — so `v` is 'a', U+FFFD, U+FFFD, 'd': 4
+//   characters, valid up to byte 1.
+// * "ab" with its 'b' overwritten by 0xC3 is 'a' (97) and then a lead byte with nothing after
+//   it — an incomplete character, one U+FFFD (65533): 2 characters.
+
+fn main() -> i32 {
+    let s: str = "a\u{e9}\u{20ac}\u{1F600}";
+    println(s.len());
+    println(s.char_count());
+    for c in s.chars() {
+        println(c as u32);
+    }
+    let mut n: i32 = 0;
+    for c in s.chars() {
+        if c == '\u{e9}' {
+            continue;
+        }
+        if c == '\u{20ac}' {
+            break;
+        }
+        n = n + 1;
+    }
+    println(n);
+
+    let top: str = "\u{10FFFF}";
+    for c in top.chars() {
+        println(c as u32);
+    }
+    println(top.char_count());
+
+    let empty: str = "";
+    let mut seen: i32 = 0;
+    for _ in empty.chars() {
+        seen = seen + 1;
+    }
+    println(empty.char_count());
+    println(seen);
+
+    for c in "xy".chars() {
+        println(c);
+    }
+
+    let mut buf: [u8; 4] = [0x61, 0x62, 0x63, 0x64];
+    let v: str = str_from_utf8(buf);
+    buf[1] = 0xFF;
+    buf[2] = 0xE2;
+    for c in v.chars() {
+        println(c as u32);
+    }
+    println(v.char_count());
+    println(utf8_valid_up_to(v.as_bytes()));
+
+    let mut buf2: [u8; 2] = [0x61, 0x62];
+    let x: str = str_from_utf8(buf2);
+    buf2[1] = 0xC3;
+    for c in x.chars() {
+        println(c as u32);
+    }
+    println(x.char_count());
+    return 0;
+}

@@ -30,7 +30,12 @@
 //! * A **`str`** prints its text — `wukong_rt_fmt_str` over its data pointer and byte length, read
 //!   from the fat pointer — wherever a `*u8` string would print. Sema publishes a `str` as the
 //!   `[]u8` it is laid out as, so the type cannot say which slices are text: the arguments sema
-//!   recorded in `SemaResult::str_print_args` can, and they are routed here by their `NodeId`.
+//!   recorded in `SemaResult::str_print_args` can, and they are routed here by their `NodeId`. A
+//!   `str` INSIDE a printed aggregate (a field, an element, behind a reference) is found by walking
+//!   the argument's unerased type, which sema keeps for exactly this (`StrInfo::print_types` and
+//!   `StrInfo::struct_fields`); it prints quoted, as every string element does.
+//! * **`str_format(fmt, args…)`** formats twice over the same evaluated arguments: once into no
+//!   buffer, which measures, then into a fresh heap allocation of that size plus a NUL.
 //!
 //! **The process interface** (`arg_count`, `arg`, `arg_i64`, `arg_f32`, `env`, `read_stdin_u8`,
 //! `exit`) lowers to one call each of a `wukong_rt_*` entry of `wukong_runtime::process`, its
@@ -42,7 +47,7 @@
 //! calls (the usual UNSUPPORTED skip).
 
 use wukong_ast::{Expr, ExprKind};
-use wukong_mir::{CmpOp, MirType, Op, ValueId};
+use wukong_mir::{BinOp, CmpOp, MirType, Op, ValueId};
 use wukong_sema::text::{self as st, FmtPiece, FmtSpec, TextBuiltin};
 use wukong_sema::DefKind;
 use wukong_span::{Interner, Span, Symbol};
@@ -166,7 +171,7 @@ impl FnLowerer<'_> {
     /// newline (both spellings append one). `None` for a scalar or a string, which keep their
     /// per-type printers.
     pub(crate) fn lower_print_value(&mut self, arg: &Expr, span: Span) -> Option<ValueId> {
-        let ty = self.expr_ty(arg);
+        let ty = self.print_ty(arg);
         if !matches!(ty, Ty::Ref { .. }) && !self.text_by_pointer(&ty) {
             return None;
         }
@@ -215,10 +220,44 @@ impl FnLowerer<'_> {
                 self.text_format(&mut sink, fmt, rest)?;
                 Some(sink.pos)
             }
+            TextBuiltin::StrFormat => {
+                let (fmt, rest) = args.split_first()?;
+                // Every argument once, in order; then the pieces twice over those values: into
+                // no buffer (capacity 0 writes nothing and returns the full length), and into a
+                // fresh allocation of that length plus the NUL every buffer write leaves.
+                let vals = self.text_format_args(rest);
+                let target = self.text_const(0);
+                let zero = self.text_const(0);
+                let mut measure = Sink {
+                    target,
+                    buf: zero,
+                    cap: zero,
+                    pos: zero,
+                    buffered: true,
+                    span,
+                };
+                self.text_format_pieces(&mut measure, fmt, &vals)?;
+                let len = measure.pos;
+                let data = self.heap_bytes(len);
+                let one = self.text_const(1);
+                let cap = self
+                    .builder
+                    .build(MirType::I64, Op::Bin(BinOp::Add, len, one));
+                let mut sink = Sink {
+                    target,
+                    buf: data,
+                    cap,
+                    pos: zero,
+                    buffered: true,
+                    span,
+                };
+                self.text_format_pieces(&mut sink, fmt, &vals)?;
+                Some(self.fat_ptr(data, len))
+            }
             TextBuiltin::PrintValue { stderr, newline } => {
                 let mut sink = self.text_stream(stderr, span);
                 if let Some(arg) = args.first() {
-                    let ty = self.expr_ty(arg);
+                    let ty = self.print_ty(arg);
                     let v = self.lower_expr(arg);
                     if self.is_str_print_arg(arg) {
                         self.text_str(&mut sink, v, &FmtSpec::default());
@@ -371,7 +410,7 @@ impl FnLowerer<'_> {
     /// an array, a tuple, a slice's fat pointer, a struct or a data-carrying enum?
     fn text_by_pointer(&self, t: &Ty) -> bool {
         match t {
-            Ty::Array { .. } | Ty::Tuple(_) | Ty::Slice(_) => true,
+            Ty::Array { .. } | Ty::Tuple(_) | Ty::Slice(_) | Ty::Str => true,
             Ty::Named(n) => {
                 matches!(
                     self.sema.defs.lookup(*n).map(|d| &d.kind),
@@ -383,7 +422,7 @@ impl FnLowerer<'_> {
     }
 
     /// The data pointer and `i64` element count of a `[]u8` / `[u8; N]` operand.
-    fn text_u8_buffer(&mut self, e: &Expr) -> Option<(ValueId, ValueId)> {
+    pub(crate) fn text_u8_buffer(&mut self, e: &Expr) -> Option<(ValueId, ValueId)> {
         match self.expr_ty(e) {
             Ty::Slice(_) => {
                 let s = self.lower_expr(e);
@@ -423,20 +462,36 @@ impl FnLowerer<'_> {
 
     /// The pieces of a format string literal and their arguments.
     fn text_format(&mut self, sink: &mut Sink, fmt: &Expr, args: &[Expr]) -> Option<()> {
+        let vals = self.text_format_args(args);
+        self.text_format_pieces(sink, fmt, &vals)
+    }
+
+    /// Every format argument, evaluated in order before anything prints, with the type it prints
+    /// at. A `str` argument is flagged here, while its node is at hand: its type alone reads as
+    /// `[]u8`.
+    fn text_format_args(&mut self, args: &[Expr]) -> Vec<(ValueId, Ty, bool)> {
+        let mut vals: Vec<(ValueId, Ty, bool)> = Vec::with_capacity(args.len());
+        for a in args {
+            let t = self.print_ty(a);
+            let is_str = self.is_str_print_arg(a);
+            let v = self.lower_expr(a);
+            vals.push((v, t, is_str));
+        }
+        vals
+    }
+
+    /// The pieces of the format string literal `fmt`, over the evaluated arguments `vals`.
+    fn text_format_pieces(
+        &mut self,
+        sink: &mut Sink,
+        fmt: &Expr,
+        vals: &[(ValueId, Ty, bool)],
+    ) -> Option<()> {
         let ExprKind::Str(sym) = &fmt.kind else {
             return None;
         };
         let bytes = crate::decode_string_literal(self.interner.resolve(*sym));
         let pieces = st::parse_format(&bytes).ok()?;
-        // Every argument is evaluated, in order, before anything prints. A `str` argument is
-        // flagged here, while its node is at hand: its type alone reads as `[]u8`.
-        let mut vals: Vec<(ValueId, Ty, bool)> = Vec::with_capacity(args.len());
-        for a in args {
-            let t = self.expr_ty(a);
-            let is_str = self.is_str_print_arg(a);
-            let v = self.lower_expr(a);
-            vals.push((v, t, is_str));
-        }
         let base = self.lower_expr(fmt);
         let f = self.gemm.text.fmt_str;
         let mut next = vals.iter();
@@ -474,6 +529,16 @@ impl FnLowerer<'_> {
         self.sema.str_print_args.contains(&arg.id)
     }
 
+    /// The type a print or format argument prints at: its unerased type when it holds a `str`
+    /// inside an aggregate or behind a reference (`StrInfo::print_types`), else its own. Only the
+    /// printer reads it; a `str` and the `[]u8` it erases to have one layout.
+    fn print_ty(&self, arg: &Expr) -> Ty {
+        match self.sema.str_info.print_types.get(&arg.id) {
+            Some(t) => t.clone(),
+            None => self.expr_ty(arg),
+        }
+    }
+
     /// The text of the `str` whose fat pointer is `v`, per `spec` — the `*u8` string's printer,
     /// with the byte length from the fat pointer in place of the NUL scan.
     fn text_str(&mut self, sink: &mut Sink, v: ValueId, spec: &FmtSpec) {
@@ -497,6 +562,8 @@ impl FnLowerer<'_> {
                 self.text_value(sink, inner, pointee, spec);
             }
             Ty::Array { elem, len, .. } => self.text_array(sink, v, elem, *len, spec),
+            // A `str` inside an aggregate (the unerased print type): its text.
+            Ty::Str => self.text_str(sink, v, spec),
             Ty::Slice(elem) => {
                 let (data, len) = self.text_slice_parts(v);
                 match elem.as_ref() {
@@ -505,7 +572,9 @@ impl FnLowerer<'_> {
                 }
             }
             Ty::Tuple(fields) => {
-                let Some((offsets, _, _)) = self.aggregate_layout(fields) else {
+                // A `str` field is laid out as the `[]u8` it erases to.
+                let erased: Vec<Ty> = fields.iter().map(Ty::erase_str).collect();
+                let Some((offsets, _, _)) = self.aggregate_layout(&erased) else {
                     self.unsupported(sink.span, "printing an unsized tuple");
                     return;
                 };
@@ -556,6 +625,15 @@ impl FnLowerer<'_> {
             self.unsupported(sink.span, "printing a value of this type");
             return;
         };
+        // A struct with a `str` field: print each field at its unerased type (`strs.rs`).
+        let layout: Vec<(u64, Ty)> = match self.sema.str_info.struct_fields.get(&name) {
+            Some(tys) if tys.len() == layout.len() => layout
+                .into_iter()
+                .zip(tys)
+                .map(|((off, _), t)| (off, t.clone()))
+                .collect(),
+            _ => layout,
+        };
         let tname = short_name(self.interner.resolve(name)).to_string();
         self.text_lit(sink, tname.as_bytes());
         if names.is_empty() {
@@ -583,7 +661,7 @@ impl FnLowerer<'_> {
             return;
         }
         let espec = element_spec(spec);
-        let emty = self.mir_ty_of(elem);
+        let emty = self.mir_ty_of(&elem.erase_str());
         let summarize = len > st::SUMMARIZE_THRESHOLD;
         let indices: Vec<u64> = if summarize {
             (0..st::EDGE_ITEMS)

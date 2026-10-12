@@ -87,10 +87,11 @@ impl FnLowerer<'_> {
     /// Emit the bounds check of a range index `s[lo..hi]` over a slice of length `len` (all three
     /// already lowered `i64`s): `hi <= len`, then `lo <= hi`, each compared unsigned (a negative
     /// bound is huge, so it fails) with its own dead-end failure block, as
-    /// [`Self::emit_slice_bounds_check`] builds one. A failure reports the bound and the limit it
-    /// passed: `the len is 6 but the index is 9` for `hi`, and `hi` in the role of the length for
-    /// `lo`. Leaves the builder in the in-bounds continuation; a no-op inside an `@unchecked`
-    /// function.
+    /// [`Self::emit_slice_bounds_check`] builds one. A failure calls `wukong_rt_check_fail` with
+    /// Rust's wording for each: `range end index 9 out of range for slice of length 6` for `hi`,
+    /// and `slice index starts at 5 but ends at 3` for `lo` (it used to reuse the element-access
+    /// wording, with `hi` in the role of the length). Leaves the builder in the in-bounds
+    /// continuation; a no-op inside an `@unchecked` function.
     ///
     /// The comparisons are `ule`, never the `ult` of an element access, so `wukong_opt::bce` (which
     /// keys on `ult`) never hoists or removes one: a range check stays exactly where it was written.
@@ -104,34 +105,62 @@ impl FnLowerer<'_> {
         if !self.gemm.bounds_checks {
             return;
         }
-        for (bound, limit) in [(hi, len), (lo, hi)] {
+        for (kind, bound, limit) in [(CHECK_RANGE_END, hi, len), (CHECK_RANGE_ORDER, lo, hi)] {
             let ok = self
                 .builder
                 .build(MirType::I1, Op::Cmp(CmpOp::Ule, bound, limit));
-            let cont = self.builder.new_block();
-            let fail = self.builder.new_block();
-            self.builder.cond_br(ok, cont, vec![], fail, vec![]);
-            self.builder.switch_to(fail);
-            let site = self
-                .builder
-                .build(MirType::I64, Op::ConstInt(site_key(span), MirType::I64));
-            let func = self.gemm.bounds_fail;
-            self.builder.build_void(Op::Call {
-                func,
-                args: vec![bound, limit, site],
-            });
-            self.builder.switch_to(cont);
+            self.emit_check_fail_unless(ok, kind, bound, limit, span);
         }
+    }
+
+    /// Branch on `ok`: continue when it holds, otherwise call
+    /// `wukong_rt_check_fail(kind, a, b, site)` in a dead-end block — the shape of every bounds
+    /// failure edge, so the optimizer and the backends treat it the same way. Leaves the builder in
+    /// the continuation.
+    pub(crate) fn emit_check_fail_unless(
+        &mut self,
+        ok: ValueId,
+        kind: i64,
+        a: ValueId,
+        b: ValueId,
+        span: Span,
+    ) {
+        let cont = self.builder.new_block();
+        let fail = self.builder.new_block();
+        self.builder.cond_br(ok, cont, vec![], fail, vec![]);
+        self.builder.switch_to(fail);
+        let k = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(i128::from(kind), MirType::I64));
+        let site = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(site_key(span), MirType::I64));
+        let func = self.gemm.check_fail;
+        self.builder.build_void(Op::Call {
+            func,
+            args: vec![k, a, b, site],
+        });
+        // A fresh block's terminator is already `Unreachable`: the call never returns normally.
+        self.builder.switch_to(cont);
     }
 }
 
-/// Rewrite every bounds-failure call's placeholder site operand into the address of a static
-/// `file:line:col` string, deduplicated by content. `locate` renders a span start; an empty string
+/// `wukong_rt_check_fail` kinds — the values of `wukong_runtime::safety::CHECK_*`, which this crate
+/// does not depend on; the run fixtures that print each message pin the pairing end to end
+/// (`tests/run/str_slice_bounds.wk`, `str_range_order.wk`, `str_from_utf8_invalid.wk`).
+pub(crate) const CHECK_RANGE_ORDER: i64 = 1;
+pub(crate) const CHECK_RANGE_END: i64 = 2;
+pub(crate) const CHECK_UTF8: i64 = 3;
+
+/// Rewrite every failure call's placeholder site operand into the address of a static
+/// `file:line:col` string, deduplicated by content. `failures` names each failure entry with its
+/// arity; the site is its last operand (`wukong_rt_bounds_fail(index, len, site)`,
+/// `wukong_rt_check_fail(kind, a, b, site)`). `locate` renders a span start; an empty string
 /// means "no site" and the runtime message then omits it.
 pub(crate) fn attach_sites(
     program: &mut Program,
     interner: &mut Interner,
-    bounds_fail: Symbol,
+    failures: &[(Symbol, usize)],
     locate: &dyn Fn(Span) -> String,
 ) {
     let mut by_text: HashMap<String, Symbol> = HashMap::default();
@@ -142,8 +171,8 @@ pub(crate) fn attach_sites(
         for b in &f.blocks {
             for inst in &b.insts {
                 if let Op::Call { func, args } = &inst.op {
-                    if *func == bounds_fail && args.len() == 3 {
-                        placeholders.insert(args[2].0);
+                    if failures.contains(&(*func, args.len())) {
+                        placeholders.insert(args[args.len() - 1].0);
                     }
                 }
             }
