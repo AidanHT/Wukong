@@ -212,6 +212,20 @@ impl Sema<'_> {
         };
         match self.types.get(&it.id) {
             Some(Ty::Array { .. } | Ty::Slice(_) | Ty::Unknown | Ty::Error) | None => {}
+            // A `str` is laid out as a `[]u8`, but its element is a byte: nothing to destructure.
+            Some(Ty::Str) => {
+                self.diags.push(
+                    Diagnostic::error(
+                        "a `for` over a `str` yields each byte as a `u8`, which cannot be \
+                         destructured"
+                            .to_string(),
+                    )
+                    .with_code("E0401")
+                    .primary(pat.span, "this pattern destructures each byte")
+                    .help("bind a name (`for b in s`); each `b` is a `u8`"),
+                );
+                return;
+            }
             Some(other) => {
                 let shown = other.display(self.interner);
                 self.diags.push(
@@ -660,6 +674,18 @@ mod tests {
             "fn f(ps: [i32; 2]) -> i32 { let mut t = 0; for (a, b) in ps { t = t + a + b; } \
              return t; }",
             "E0401",
+        );
+        // A `str` is laid out as a `[]u8`, but each element is a `u8` byte, and the message says
+        // so rather than suggesting to destructure inside the body.
+        let d = check(
+            "fn f(s: str) -> i32 { let mut t = 0; for (a, b) in s { t = t + a + b; } \
+             return t; }",
+        );
+        assert!(
+            d.iter().any(|d| d.code == Some("E0401")
+                && d.message
+                    .contains("a `for` over a `str` yields each byte as a `u8`")),
+            "{d:?}"
         );
     }
 
