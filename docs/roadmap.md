@@ -329,8 +329,9 @@ line table built from them is not emitted yet.
   byte by byte and print every lane.
 - **GGUF reader** (2026-10-12, `gap6/tensor-io-gguf`) — `gguf_read_<T>(path, name, buf)` loads one
   tensor of a llama.cpp GGUF file (v2/v3; every metadata value type parsed, arrays of arrays
-  included; `general.alignment` honoured) and `gguf_find` / `gguf_rank` / `gguf_dim` / `gguf_type`
-  query its tensor table, dims reported outermost first. Plain tensors load verbatim (`F16`/`BF16`
+  included; `general.alignment` honoured), `gguf_find` / `gguf_rank` / `gguf_dim` / `gguf_type`
+  query its tensor table, dims reported outermost first, and `gguf_meta_type` / `_len` / `_i64` /
+  `_f64` / `_str` read its metadata by key. Plain tensors load verbatim (`F16`/`BF16`
   also widen into `f32`); `Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q2_K Q3_K Q4_K Q5_K Q6_K Q8_K IQ4_NL IQ4_XS`
   dequantize into `f32` by ggml's reference `dequantize_row_*` (no FMA, one rounding per operation),
   and any block type loads its raw blocks into `u8` — the operand of `gemv_q8_0` / `gemv_q4_0`, the
@@ -1596,9 +1597,9 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   no converting map (a `BF16` tensor maps only as `[]bf16`), and no error code on the map itself
   (it is empty; the matching `*_read_<T>` names the cause). The GGUF reader has no dequantizer for
   the grid-based i-quants (`IQ1_*`, `IQ2_*`, `IQ3_*`), `Q8_1`, `TQ1_0`/`TQ2_0` or `MXFP4` (they
-  load only as raw blocks; into `f32` they are `-7`), its metadata values are parsed but not
-  readable from a program, and every call re-opens and re-parses the header (a large tokenizer
-  vocabulary is re-read per tensor); `.npy` reads little-endian arrays only.
+  load only as raw blocks; into `f32` they are `-7`), and every call re-opens and re-parses the
+  header (a large tokenizer vocabulary is re-read per tensor and per `gguf_meta_*` call); `.npy`
+  reads little-endian arrays only.
   A fill loop `for i { out[i] = rand_f32(seed, base + i) }` is not recognized into `rand_fill_f32`,
   and the loop vectorizer declines it (mixed 32/64-bit widths), so the scalar builtins run one
   element at a time; `randn_f32` has no fill kernel.

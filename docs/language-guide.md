@@ -2367,8 +2367,35 @@ alignment that is not a `u32` power of two, a row that is not a whole number of 
 off the alignment, or anything that runs past the end of the file — and **`-7`** a type with no
 decoder. On every negative code but `-2` the destination is untouched. The reader parses every
 metadata value (all thirteen GGUF value types, arrays of arrays included: the tensor table follows
-them) and honours `general.alignment`; the metadata values themselves are not yet readable from a
-program. `tests/run/io_gguf.wk` writes a file byte by byte with `write_u8` and reads it back.
+them) and honours `general.alignment`. `tests/run/io_gguf.wk` writes a file byte by byte with
+`write_u8` and reads it back.
+
+The metadata — a model's hyperparameters and its tokenizer — is read by key:
+
+| builtin | result |
+|---|---|
+| `gguf_meta_type(path, key)` | the value's GGUF type id: `0` u8, `1` i8, `2` u16, `3` i16, `4` u32, `5` i32, `6` f32, `7` bool, `8` string, `9` array, `10` u64, `11` i64, `12` f64 |
+| `gguf_meta_len(path, key)` | an array's element count, a string's byte length, `1` for any other value |
+| `gguf_meta_i64(path, key, i, default)` | an integer or `bool` value (a `u64` keeps its bits), else `default` |
+| `gguf_meta_f64(path, key, i, default)` | a numeric value as an `f64` (a float exactly, an integer converted), else `default` |
+| `gguf_meta_str(path, key, i, buf)` | a string copied into the `u8` buffer `buf` as `sprintf` copies (truncated to `len - 1` bytes, always NUL-terminated); the full byte length |
+
+`i` selects element `i` of an array and must be `0` for a single value. The two queries answer
+`-5` for a missing key (and `-1`/`-2`/`-6` for the file); the two value reads answer their
+`default` for anything they cannot read — a missing file or key, an index outside the value, a value
+of another kind — so pick one the key cannot hold, or ask `gguf_meta_type` first; `gguf_meta_str`
+answers `-3` for a value that is not a string, `-4` for an index outside it, `-5`, or the file's
+code, and leaves `buf` as it was:
+
+```wukong
+let layers: i64 = gguf_meta_i64(path, "llama.block_count", 0, -1);
+let theta: f64 = gguf_meta_f64(path, "llama.rope.freq_base", 0, 10000.0);
+let mut tok: [u8; 64] = [0; 64];
+let n: i64 = gguf_meta_str(path, "tokenizer.ggml.tokens", 15043, tok);   // one vocabulary entry
+```
+
+`tests/run/io_gguf_meta.wk`. Every call re-reads the header, so a loop over a 128k-entry vocabulary
+re-parses it 128k times; read the strings once, up front.
 
 ### Memory-mapped loads ✅
 

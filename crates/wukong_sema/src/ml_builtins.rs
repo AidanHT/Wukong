@@ -57,6 +57,10 @@ pub enum MlBuiltin {
     /// `gguf_find` / `gguf_rank` / `gguf_type(path: *u8, name: *u8) -> i64` and
     /// `gguf_dim(path: *u8, name: *u8, k: int) -> i64` — a GGUF tensor-table lookup.
     GgufQuery(GgufQuery),
+    /// `gguf_meta_type` / `gguf_meta_len(path, key) -> i64`, `gguf_meta_i64(path, key, i,
+    /// default) -> i64`, `gguf_meta_f64(path, key, i, default) -> f64` and `gguf_meta_str(path,
+    /// key, i, buf) -> i64` — a GGUF metadata value.
+    GgufMeta(GgufMeta),
     /// `map_<T>(path: *u8) -> []T`, `st_map_<T>(path: *u8, name: *u8) -> []T`,
     /// `npy_map_<T>(path: *u8) -> []T` and `gguf_map_<T>(path: *u8, name: *u8) -> []T` — a file's
     /// bytes (or one stored tensor's, in its own element type) as a slice, memory-mapped
@@ -103,6 +107,35 @@ impl GgufQuery {
             GgufQuery::Rank => 1,
             GgufQuery::Dim => 2,
             GgufQuery::Type => 3,
+        }
+    }
+}
+
+/// Which GGUF metadata accessor.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GgufMeta {
+    /// `gguf_meta_type`: the value's GGUF type id (`9` for an array).
+    Type,
+    /// `gguf_meta_len`: an array's length, a string's byte length, `1` otherwise.
+    Len,
+    /// `gguf_meta_i64`: an integer or `bool` value, or the default.
+    I64,
+    /// `gguf_meta_f64`: a numeric value, or the default.
+    F64,
+    /// `gguf_meta_str`: a string value copied into a `u8` buffer.
+    Str,
+}
+
+impl GgufMeta {
+    /// The runtime's accessor code for the `wukong_rt_gguf_meta` entry — the compiler's copy of
+    /// `wukong_runtime::gguf::GGUF_M_*` (pinned by a test in `wukong_interp`); `-1` for the two
+    /// accessors with entries of their own.
+    pub fn code(self) -> i64 {
+        match self {
+            GgufMeta::Type => 0,
+            GgufMeta::Len => 1,
+            GgufMeta::I64 => 2,
+            GgufMeta::F64 | GgufMeta::Str => -1,
         }
     }
 }
@@ -216,6 +249,11 @@ pub fn ml_builtin(name: &str) -> Option<MlBuiltin> {
         "gguf_rank" => MlBuiltin::GgufQuery(GgufQuery::Rank),
         "gguf_dim" => MlBuiltin::GgufQuery(GgufQuery::Dim),
         "gguf_type" => MlBuiltin::GgufQuery(GgufQuery::Type),
+        "gguf_meta_type" => MlBuiltin::GgufMeta(GgufMeta::Type),
+        "gguf_meta_len" => MlBuiltin::GgufMeta(GgufMeta::Len),
+        "gguf_meta_i64" => MlBuiltin::GgufMeta(GgufMeta::I64),
+        "gguf_meta_f64" => MlBuiltin::GgufMeta(GgufMeta::F64),
+        "gguf_meta_str" => MlBuiltin::GgufMeta(GgufMeta::Str),
         "rand_u32" => MlBuiltin::RandU32,
         "rand_f32" => MlBuiltin::RandF32,
         "randn_f32" => MlBuiltin::RandnF32,
@@ -252,6 +290,8 @@ enum Arg {
     Int(&'static str),
     /// A floating-point scalar (`f32` ABI).
     Float(&'static str),
+    /// A floating-point scalar (`f64` ABI).
+    Double(&'static str),
     /// A buffer of this element type; `true` when the builtin writes it.
     Buf(Scalar, bool),
 }
@@ -260,7 +300,7 @@ enum Arg {
 /// ([`Sema::type_ml_builtin`]) and the lowering's element backstop ([`MlBuiltin::buffer_elem`])
 /// read.
 fn signature(b: MlBuiltin) -> (Vec<Arg>, Ty) {
-    use Arg::{Buf, Float, Int, Str};
+    use Arg::{Buf, Double, Float, Int, Str};
     let i64_ty = Ty::Scalar(Scalar::I64);
     let f32_ty = Ty::Scalar(Scalar::F32);
     match b {
@@ -276,6 +316,25 @@ fn signature(b: MlBuiltin) -> (Vec<Arg>, Ty) {
             i64_ty,
         ),
         MlBuiltin::GgufQuery(_) => (vec![Str("path"), Str("tensor name")], i64_ty),
+        MlBuiltin::GgufMeta(GgufMeta::Type | GgufMeta::Len) => {
+            (vec![Str("path"), Str("metadata key")], i64_ty)
+        }
+        MlBuiltin::GgufMeta(m) => {
+            let last = match m {
+                GgufMeta::F64 => Double("default"),
+                GgufMeta::Str => Buf(Scalar::U8, true),
+                _ => Int("default"),
+            };
+            let ret = if m == GgufMeta::F64 {
+                Ty::Scalar(Scalar::F64)
+            } else {
+                i64_ty
+            };
+            (
+                vec![Str("path"), Str("metadata key"), Int("array index"), last],
+                ret,
+            )
+        }
         MlBuiltin::Map(src, t) => {
             let args = if src.named() {
                 vec![Str("path"), Str("tensor name")]
@@ -344,7 +403,7 @@ impl Sema<'_> {
         arg_tys: &mut [Ty],
         span: Span,
     ) -> Option<Ty> {
-        use Arg::{Buf, Float, Int, Str};
+        use Arg::{Buf, Double, Float, Int, Str};
         let b = ml_builtin(name)?;
         let (sig, ret) = signature(b);
         if args.len() != sig.len() {
@@ -353,7 +412,7 @@ impl Sema<'_> {
                 .map(|a| match a {
                     Str(what) => format!("a `*u8` {what}"),
                     Int(what) => format!("an integer {what}"),
-                    Float(what) => format!("a float {what}"),
+                    Float(what) | Double(what) => format!("a float {what}"),
                     Buf(t, _) => format!("a {} buffer", buffer_desc(*t)),
                 })
                 .collect();
@@ -375,6 +434,9 @@ impl Sema<'_> {
                 Str(what) => self.ml_str_arg(name, &args[i], &arg_tys[i], i, what),
                 Int(what) => self.ml_scalar_arg(name, &args[i], &mut arg_tys[i], false, what),
                 Float(what) => self.ml_scalar_arg(name, &args[i], &mut arg_tys[i], true, what),
+                Double(what) => {
+                    self.ml_scalar_arg_to(name, &args[i], &mut arg_tys[i], Scalar::F64, what)
+                }
                 Buf(t, written) => self.ml_buffer_arg(name, &args[i], &arg_tys[i], t, i, written),
             }
         }
@@ -416,7 +478,23 @@ impl Sema<'_> {
         float: bool,
         what: &str,
     ) {
-        let target = Ty::Scalar(if float { Scalar::F32 } else { Scalar::I64 });
+        let target = if float { Scalar::F32 } else { Scalar::I64 };
+        self.ml_scalar_arg_to(name, arg, ty, target, what);
+    }
+
+    /// [`Self::ml_scalar_arg`] at an explicit ABI width: an unsuffixed literal adapts to `target`,
+    /// and the operand must be of `target`'s kind (any float for a float, any integer for an
+    /// integer).
+    fn ml_scalar_arg_to(
+        &mut self,
+        name: &str,
+        arg: &Expr,
+        ty: &mut Ty,
+        target: Scalar,
+        what: &str,
+    ) {
+        let float = target.is_float();
+        let target = Ty::Scalar(target);
         if self.literal_adapts(&target, arg) {
             self.retype_adapted_literal(arg, &target);
             self.range_check_int_literal(arg, &target);
@@ -741,6 +819,43 @@ mod tests {
             ),
             // The result is a typed `i64`.
             ("fn f() { let x: f32 = gguf_type(\"a\", \"w\"); }", "E0401"),
+        ]);
+    }
+
+    #[test]
+    fn gguf_metadata_accessors_are_typed() {
+        assert_eq!(
+            ml_builtin("gguf_meta_f64"),
+            Some(MlBuiltin::GgufMeta(GgufMeta::F64))
+        );
+        let ok = "fn f(mut b: [u8; 32]) -> f64 { \
+                  let t: i64 = gguf_meta_type(\"m.gguf\", \"general.name\") \
+                      + gguf_meta_len(\"m.gguf\", \"tokens\") \
+                      + gguf_meta_i64(\"m.gguf\", \"llama.block_count\", 0, -1) \
+                      + gguf_meta_str(\"m.gguf\", \"tokens\", 3, b); \
+                  let e: f64 = gguf_meta_f64(\"m.gguf\", \"llama.rope.freq_base\", 0, 0.0); \
+                  return e + t as f64; }";
+        assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
+        assert_rejected(&[
+            // The f64 default is a float; the i64 default an integer.
+            (
+                "fn f() -> f64 { return gguf_meta_f64(\"m\", \"k\", 0, 1); }",
+                "E0437",
+            ),
+            (
+                "fn f() -> i64 { return gguf_meta_i64(\"m\", \"k\", 0, 1.5); }",
+                "E0437",
+            ),
+            // The string read writes a u8 buffer.
+            (
+                "fn f(b: [u8; 8]) -> i64 { return gguf_meta_str(\"m\", \"k\", 0, b); }",
+                "E0304",
+            ),
+            ("fn f() -> i64 { return gguf_meta_len(\"m\"); }", "E0503"),
+            (
+                "fn f() { let x: i64 = gguf_meta_f64(\"m\", \"k\", 0, 0.0); }",
+                "E0401",
+            ),
         ]);
     }
 

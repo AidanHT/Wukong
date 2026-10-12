@@ -35,7 +35,9 @@
 
 use wukong_ast::Expr;
 use wukong_mir::{BinOp, CastKind, MirType, Op, ValueId};
-use wukong_sema::{io_dtype_code, ml_builtin, ml_builtin_is_pure, DefKind, GgufQuery, MlBuiltin};
+use wukong_sema::{
+    io_dtype_code, ml_builtin, ml_builtin_is_pure, DefKind, GgufMeta, GgufQuery, MlBuiltin,
+};
 use wukong_span::{Interner, Symbol};
 use wukong_types::{Scalar, Ty};
 
@@ -63,6 +65,9 @@ pub(crate) struct MlSyms {
     npy_read: Symbol,
     gguf_read: Symbol,
     gguf_query: Symbol,
+    gguf_meta: Symbol,
+    gguf_meta_f64: Symbol,
+    gguf_meta_str: Symbol,
     map: Symbol,
     cstr: Symbol,
     rand_fill: Symbol,
@@ -81,6 +86,9 @@ impl MlSyms {
             npy_read: interner.intern("wukong_rt_npy_read"),
             gguf_read: interner.intern("wukong_rt_gguf_read"),
             gguf_query: interner.intern("wukong_rt_gguf_query"),
+            gguf_meta: interner.intern("wukong_rt_gguf_meta"),
+            gguf_meta_f64: interner.intern("wukong_rt_gguf_meta_f64"),
+            gguf_meta_str: interner.intern("wukong_rt_gguf_meta_str"),
             map: interner.intern("wukong_rt_map"),
             cstr: interner.intern("wukong_rt_cstr"),
             rand_fill: interner.intern("wukong_rand_fill_f32"),
@@ -197,6 +205,44 @@ impl FnLowerer<'_> {
                     self.ml_i64_const(0)
                 };
                 Some(self.ml_call(syms.gguf_query, vec![path, tensor, what, k]))
+            }
+            MlBuiltin::GgufMeta(m) => {
+                let value = !matches!(m, GgufMeta::Type | GgufMeta::Len);
+                if args.len() != 2 + 2 * usize::from(value) {
+                    return None;
+                }
+                let path = self.ml_str(&args[0]);
+                let key = self.ml_str(&args[1]);
+                let i = if value {
+                    self.ml_i64_arg(&args[2])
+                } else {
+                    self.ml_i64_const(0)
+                };
+                Some(match m {
+                    GgufMeta::F64 => {
+                        let d = self.ml_f64_arg(&args[3]);
+                        self.builder.build(
+                            MirType::F64,
+                            Op::Call {
+                                func: syms.gguf_meta_f64,
+                                args: vec![path, key, i, d],
+                            },
+                        )
+                    }
+                    GgufMeta::Str => {
+                        let buf = self.ml_buffer(&args[3])?;
+                        self.ml_call(syms.gguf_meta_str, vec![path, key, i, buf.data, buf.len])
+                    }
+                    _ => {
+                        let what = self.ml_i64_const(m.code());
+                        let d = if value {
+                            self.ml_i64_arg(&args[3])
+                        } else {
+                            self.ml_i64_const(0)
+                        };
+                        self.ml_call(syms.gguf_meta, vec![path, key, what, i, d])
+                    }
+                })
             }
             MlBuiltin::Map(src, t) => {
                 if args.len() != 1 + usize::from(src.named()) {
@@ -370,6 +416,14 @@ impl FnLowerer<'_> {
         let signed = self.signed(e);
         let v = self.lower_expr(e);
         self.coerce_to(v, &from, &MirType::I64, signed)
+    }
+
+    /// A float operand converted to `f64`.
+    fn ml_f64_arg(&mut self, e: &Expr) -> ValueId {
+        let from = self.expr_mir(e);
+        let signed = self.signed(e);
+        let v = self.lower_expr(e);
+        self.coerce_to(v, &from, &MirType::F64, signed)
     }
 
     /// A float operand converted to `f32`.

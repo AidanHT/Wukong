@@ -201,6 +201,9 @@ pub(crate) const NOT_DIFFERENTIABLE: &[(&str, &str)] = &[
     ("wukong_rt_write_dt", NO_GRADIENT),
     ("wukong_rt_file_size", NO_GRADIENT),
     ("wukong_rt_gguf_query", NO_GRADIENT),
+    ("wukong_rt_gguf_meta", NO_GRADIENT),
+    ("wukong_rt_gguf_meta_f64", NO_GRADIENT),
+    ("wukong_rt_gguf_meta_str", NO_GRADIENT),
     (
         "wukong_rand_fill_f32",
         "counter-based random numbers depend on no input; the fill carries no gradient",

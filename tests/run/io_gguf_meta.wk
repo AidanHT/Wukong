@@ -1,0 +1,161 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 345
+// EXPECT-OUT: 345
+// EXPECT-OUT: 4
+// EXPECT-OUT: 9
+// EXPECT-OUT: 8
+// EXPECT-OUT: -5
+// EXPECT-OUT: 5
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 12
+// EXPECT-OUT: -5
+// EXPECT-OUT: 1
+// EXPECT-OUT: -1
+// EXPECT-OUT: -4
+// EXPECT-OUT: 99
+// EXPECT-OUT: 98
+// EXPECT-OUT: 10000
+// EXPECT-OUT: 125
+// EXPECT-OUT: -125
+// EXPECT-OUT: 12
+// EXPECT-OUT: 75
+// EXPECT-OUT: 5
+// EXPECT-OUT: 108
+// EXPECT-OUT: 108
+// EXPECT-OUT: 97
+// EXPECT-OUT: 109
+// EXPECT-OUT: 97
+// EXPECT-OUT: 0
+// EXPECT-OUT: 6
+// EXPECT-OUT: 119
+// EXPECT-OUT: 117
+// EXPECT-OUT: 107
+// EXPECT-OUT: 0
+// EXPECT-OUT: -3
+// EXPECT-OUT: -4
+// EXPECT-OUT: -5
+// EXPECT-OUT: 7
+// EXPECT-OUT: -1
+// EXPECT-OUT: -1
+// EXPECT-OUT: 42
+// EXPECT-OUT: 25
+module tests.run.io_gguf_meta
+
+// The GGUF metadata accessors read a file's key/value section: `gguf_meta_type` (the value's GGUF
+// type id, 9 for an array), `gguf_meta_len` (an array's length, a string's bytes, else 1),
+// `gguf_meta_i64` / `gguf_meta_f64(path, key, i, default)` (value i of an array, or the value
+// itself at i = 0; the default for anything else) and `gguf_meta_str(path, key, i, buf)` (copied
+// as `sprintf` copies: truncated to the buffer, always NUL-terminated, returning the full length).
+// The file -- 345 bytes, ten pairs and no tensors -- is assembled byte by byte here:
+//   general.architecture STRING "llama"   llama.block_count U32 12
+//   llama.rope.freq_base F32 10000 (bits 461C4000)   eps F64 0.125 (bits 3FC0000000000000)
+//   neg I8 -5   flag BOOL 1   big U64 all-ones   tokens [STRING] "<s>" "wukong"
+//   scores [F32] 0.5 -1.25 (bits 3F000000 BFA00000)   ids [I32] 3 -4
+// Types: block_count is a U32 (4), tokens an array (9), architecture a STRING (8); a missing key
+// is -5.
+// Integers: 12, -5, a bool 1, a u64's bits -1, ids[1] -4, ids[2] past the end -> its default 99,
+// a float -> its default 98. Floats: 10000, eps * 1000 = 125, scores[1] * 100 = -125, an integer
+// converts (12), a string -> its default 7.5 (times 10). Strings: "llama" into 16 bytes (5, then
+// every byte and the NUL), tokens[1] = "wukong" into 4 bytes (6, "wuk" and the NUL); ids is not
+// a string -3, tokens[2] -4, a missing key -5 -- each leaving the buffer as it was (7 stays 7).
+// A missing file: its type -1, its string -1, an integer read its default 42, a float read its
+// default 2.5 (times 10).
+
+fn put_le(mut buf: []u8, at: i64, v: i64, n: i64) -> i64 {
+    let mut x: i64 = v;
+    let mut k: i64 = 0;
+    while k < n {
+        buf[at + k] = (x & 255) as u8;
+        x = x >> 8;
+        k = k + 1;
+    }
+    return at + n;
+}
+
+// A GGUF string at byte `at`: the u64 byte length of `s`, then its bytes.
+fn put_gstr(mut buf: []u8, at: i64, s: *u8) -> i64 {
+    let mut n: i64 = 0;
+    while s[n] != 0 {
+        buf[at + 8 + n] = s[n];
+        n = n + 1;
+    }
+    put_le(buf, at, n, 8);
+    return at + 8 + n;
+}
+
+// A key and its value type id.
+fn put_key(mut buf: []u8, at: i64, key: *u8, ty: i64) -> i64 {
+    return put_le(buf, put_gstr(buf, at, key), ty, 4);
+}
+
+fn main() -> i32 {
+    let path: *u8 = "io_test_gguf_meta.bin";
+    let mut f: []u8 = alloc_u8(345);
+    let mut c: i64 = put_le(f, 0, 0x46554747, 4);
+    c = put_le(f, c, 3, 4);
+    c = put_le(f, c, 0, 8);
+    c = put_le(f, c, 10, 8);
+    c = put_gstr(f, put_key(f, c, "general.architecture", 8), "llama");
+    c = put_le(f, put_key(f, c, "llama.block_count", 4), 12, 4);
+    c = put_le(f, put_key(f, c, "llama.rope.freq_base", 6), 0x461C4000, 4);
+    c = put_le(f, put_key(f, c, "eps", 12), 0x3FC0000000000000, 8);
+    c = put_le(f, put_key(f, c, "neg", 1), -5, 1);
+    c = put_le(f, put_key(f, c, "flag", 7), 1, 1);
+    c = put_le(f, put_key(f, c, "big", 10), -1, 8);
+    c = put_le(f, put_le(f, put_key(f, c, "tokens", 9), 8, 4), 2, 8);
+    c = put_gstr(f, put_gstr(f, c, "<s>"), "wukong");
+    c = put_le(f, put_le(f, put_key(f, c, "scores", 9), 6, 4), 2, 8);
+    c = put_le(f, put_le(f, c, 0x3F000000, 4), 0xBFA00000, 4);
+    c = put_le(f, put_le(f, put_key(f, c, "ids", 9), 5, 4), 2, 8);
+    c = put_le(f, put_le(f, c, 3, 4), -4, 4);
+    print(c);
+    print(write_u8(path, f));
+
+    print(gguf_meta_type(path, "llama.block_count"));
+    print(gguf_meta_type(path, "tokens"));
+    print(gguf_meta_type(path, "general.architecture"));
+    print(gguf_meta_type(path, "nope"));
+    print(gguf_meta_len(path, "general.architecture"));
+    print(gguf_meta_len(path, "tokens"));
+    print(gguf_meta_len(path, "flag"));
+
+    print(gguf_meta_i64(path, "llama.block_count", 0, -1));
+    print(gguf_meta_i64(path, "neg", 0, 0));
+    print(gguf_meta_i64(path, "flag", 0, 0));
+    print(gguf_meta_i64(path, "big", 0, 0));
+    print(gguf_meta_i64(path, "ids", 1, 0));
+    print(gguf_meta_i64(path, "ids", 2, 99));
+    print(gguf_meta_i64(path, "scores", 0, 98));
+
+    print(gguf_meta_f64(path, "llama.rope.freq_base", 0, -1.0) as i64);
+    print((gguf_meta_f64(path, "eps", 0, -1.0) * 1000.0) as i64);
+    print((gguf_meta_f64(path, "scores", 1, 0.0) * 100.0) as i64);
+    print(gguf_meta_f64(path, "llama.block_count", 0, 0.0) as i64);
+    print((gguf_meta_f64(path, "general.architecture", 0, 7.5) * 10.0) as i64);
+
+    let mut b: [u8; 16] = [7; 16];
+    print(gguf_meta_str(path, "general.architecture", 0, b));
+    for i in 0..6 {
+        print(b[i] as i32);
+    }
+    let mut s: [u8; 4] = [7; 4];
+    print(gguf_meta_str(path, "tokens", 1, s));
+    for i in 0..4 {
+        print(s[i] as i32);
+    }
+    let mut keep: [u8; 4] = [7; 4];
+    print(gguf_meta_str(path, "ids", 0, keep));
+    print(gguf_meta_str(path, "tokens", 2, keep));
+    print(gguf_meta_str(path, "nope", 0, keep));
+    print(keep[0] as i32);
+
+    let absent: *u8 = "io_test_gguf_meta_absent_zz.bin";
+    print(gguf_meta_type(absent, "llama.block_count"));
+    print(gguf_meta_str(absent, "general.architecture", 0, keep));
+    print(gguf_meta_i64(absent, "llama.block_count", 0, 42));
+    print((gguf_meta_f64(absent, "eps", 0, 2.5) * 10.0) as i64);
+    free(f);
+    return 0;
+}

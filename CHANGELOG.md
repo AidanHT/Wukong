@@ -22,6 +22,11 @@ All notable changes to Wukong are documented here. The format is loosely based o
   id outside ggml's table) read into `f32`.
 - **`gguf_find` / `gguf_rank` / `gguf_dim` / `gguf_type(path, name[, k])`** answer the tensor
   table: the tensor's index, rank, dimension `k` (outermost first) and ggml type id.
+- **The metadata is readable by key**: `gguf_meta_type` / `gguf_meta_len(path, key)`,
+  `gguf_meta_i64` / `gguf_meta_f64(path, key, i, default)` (a scalar, or element `i` of an array;
+  the default for anything they cannot read) and `gguf_meta_str(path, key, i, buf)` (copied with
+  `sprintf`'s truncation, returning the full length; `-3`/`-4`/`-5` otherwise) — a model's
+  hyperparameters and its tokenizer vocabulary. `tests/run/io_gguf_meta.wk`.
 - **The parser is strict where llama.cpp's is**: bad magic, a version other than 2/3, an unknown
   value type, a duplicated key or tensor name, more than four dimensions, a dimension above
   `i64::MAX`, a `general.alignment` that is not a `u32` power of two, an unaligned offset, a row that

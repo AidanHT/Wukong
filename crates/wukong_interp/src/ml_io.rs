@@ -26,7 +26,10 @@ use wukong_runtime::fileio::{
     check_dest, dtype_size, open_container, plan_raw_read, Container, DT_BF16, DT_F16, DT_F32,
     DT_F64, DT_I16, DT_I32, DT_I8, DT_U16, DT_U32, DT_U8, IO_ERROR, IO_OPEN_FAILED,
 };
-use wukong_runtime::gguf::{gguf_open_tensor, gguf_query_path, gguf_transfer};
+use wukong_runtime::gguf::{
+    copy_c_string, gguf_meta_f64_path, gguf_meta_path, gguf_meta_str_path, gguf_open_tensor,
+    gguf_query_path, gguf_transfer,
+};
 use wukong_runtime::mmap::{map_plan, MAP_GGUF, MAP_SAFETENSORS};
 
 use crate::{
@@ -127,6 +130,9 @@ impl Interp<'_, '_> {
             I::RtNpyRead => self.ml_container_read(args, false),
             I::RtGgufRead => self.ml_gguf_read(args),
             I::RtGgufQuery => self.ml_gguf_query(args),
+            I::RtGgufMeta => self.ml_gguf_meta(args),
+            I::RtGgufMetaF64 => self.ml_gguf_meta_f64(args),
+            I::RtGgufMetaStr => self.ml_gguf_meta_str(args),
             I::RtMap => self.ml_map(args),
             I::RtCstr => self.ml_cstr(args),
             I::RandFillF32 => self.ml_rand_fill(args),
@@ -439,6 +445,49 @@ impl Interp<'_, '_> {
         Ok(out.0)
     }
 
+    /// `wukong_rt_gguf_meta(path, key, what, i, default) -> i64`.
+    fn ml_gguf_meta(&mut self, args: &[Value]) -> Result<Value, String> {
+        const CTX: &str = "gguf_meta";
+        let path = str_arg(&self.memory, args, 0, CTX)?;
+        let key = str_arg(&self.memory, args, 1, CTX)?;
+        let (what, i, default) = (arg_i64(args, 2), arg_i64(args, 3), arg_i64(args, 4));
+        let got = gguf_meta_path(Path::new(&path), key.as_bytes(), what, i, default);
+        Ok(Value::Int(got as i128))
+    }
+
+    /// `wukong_rt_gguf_meta_f64(path, key, i, default) -> f64`.
+    fn ml_gguf_meta_f64(&mut self, args: &[Value]) -> Result<Value, String> {
+        const CTX: &str = "gguf_meta_f64";
+        let path = str_arg(&self.memory, args, 0, CTX)?;
+        let key = str_arg(&self.memory, args, 1, CTX)?;
+        let i = arg_i64(args, 2);
+        let default = args.get(3).map(|v| v.as_float()).unwrap_or(0.0);
+        let got = gguf_meta_f64_path(Path::new(&path), key.as_bytes(), i, default);
+        Ok(Value::Float(got))
+    }
+
+    /// `wukong_rt_gguf_meta_str(path, key, i, buf, len) -> i64`: the runtime's own lookup, then
+    /// the same `snprintf` copy into the buffer's slots (each byte the canonical `u8` slot value).
+    fn ml_gguf_meta_str(&mut self, args: &[Value]) -> Result<Value, String> {
+        const CTX: &str = "gguf_meta_str";
+        let path = str_arg(&self.memory, args, 0, CTX)?;
+        let key = str_arg(&self.memory, args, 1, CTX)?;
+        let i = arg_i64(args, 2);
+        let len = count(arg_i64(args, 4));
+        match gguf_meta_str_path(Path::new(&path), key.as_bytes(), i) {
+            Ok(s) => {
+                if len > 0 {
+                    let base = ptr_arg(args, 3, CTX, "buffer")?;
+                    self.ml_check_extent(3, base, len, CTX)?;
+                    let memory = &mut self.memory;
+                    copy_c_string(&s, len, |k, b| memory[base + k] = decode_elem(DT_U8, &[b]));
+                }
+                Ok(Value::Int(s.len() as i128))
+            }
+            Err(code) => Ok(Value::Int(code as i128)),
+        }
+    }
+
     /// `n` `f32` slots of operand `k` from `base`, marshalled for a host kernel.
     fn ml_f32_buffer(
         &self,
@@ -584,6 +633,21 @@ mod tests {
             (Q::Type, g::GGUF_Q_TYPE),
         ] {
             assert_eq!(q.code(), code, "{q:?}");
+        }
+    }
+
+    /// The GGUF metadata accessor codes (`wukong_sema::GgufMeta::code`) are the runtime's
+    /// `GGUF_M_*`.
+    #[test]
+    fn compiler_and_runtime_gguf_meta_codes_agree() {
+        use wukong_runtime::gguf as g;
+        use wukong_sema::GgufMeta as M;
+        for (m, code) in [
+            (M::Type, g::GGUF_M_TYPE),
+            (M::Len, g::GGUF_M_LEN),
+            (M::I64, g::GGUF_M_I64),
+        ] {
+            assert_eq!(m.code(), code, "{m:?}");
         }
     }
 

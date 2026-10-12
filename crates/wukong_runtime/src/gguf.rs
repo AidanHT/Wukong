@@ -823,6 +823,200 @@ pub unsafe extern "C" fn wukong_rt_gguf_query(
     }
 }
 
+// --- metadata ---------------------------------------------------------------------------------
+
+/// `gguf_meta_type`: the value's type id ([`vt`]; `9` for an array).
+pub const GGUF_M_TYPE: i64 = 0;
+/// `gguf_meta_len`: an array's element count, a string's byte length, `1` for any other value.
+pub const GGUF_M_LEN: i64 = 1;
+/// `gguf_meta_i64`: an integer or `bool` value (or array element), else the default.
+pub const GGUF_M_I64: i64 = 2;
+
+/// Value `i` of metadata key `key`: element `i` of an array, or the value itself when `i == 0`.
+/// `Err(-5)` for a missing key, `Err(-4)` for an index outside the value.
+pub fn meta_elem<'a>(g: &'a Gguf, key: &[u8], i: i64) -> Result<&'a MetaValue, i64> {
+    let v = g.meta(key).ok_or(IO_NAME_NOT_FOUND)?;
+    let at = usize::try_from(i).map_err(|_| IO_SHAPE_MISMATCH)?;
+    match v {
+        MetaValue::Arr(_, items) => items.get(at).ok_or(IO_SHAPE_MISMATCH),
+        _ if at == 0 => Ok(v),
+        _ => Err(IO_SHAPE_MISMATCH),
+    }
+}
+
+/// An integer or `bool` value as an `i64` (a `u64` keeps its bits, as `x as i64` would).
+pub fn meta_as_i64(v: &MetaValue) -> Option<i64> {
+    Some(match *v {
+        MetaValue::U8(x) => i64::from(x),
+        MetaValue::I8(x) => i64::from(x),
+        MetaValue::U16(x) => i64::from(x),
+        MetaValue::I16(x) => i64::from(x),
+        MetaValue::U32(x) => i64::from(x),
+        MetaValue::I32(x) => i64::from(x),
+        MetaValue::U64(x) => x as i64,
+        MetaValue::I64(x) => x,
+        MetaValue::Bool(b) => i64::from(b),
+        _ => return None,
+    })
+}
+
+/// A numeric value as an `f64`: a float exactly, an integer as `x as f64` (a `u64` by its unsigned
+/// value; a `bool` is not a number).
+pub fn meta_as_f64(v: &MetaValue) -> Option<f64> {
+    Some(match *v {
+        MetaValue::F32(x) => f64::from(x),
+        MetaValue::F64(x) => x,
+        MetaValue::U64(x) => x as f64,
+        MetaValue::Bool(_) => return None,
+        _ => meta_as_i64(v)? as f64,
+    })
+}
+
+/// Answer `gguf_meta_type` / `gguf_meta_len` (`what`) about key `key`, or `gguf_meta_i64` of value
+/// `i` falling back to `default`. The two queries report `-5` for a missing key; the value read
+/// reports nothing but its default.
+pub fn gguf_meta(g: &Gguf, key: &[u8], what: i64, i: i64, default: i64) -> i64 {
+    match what {
+        GGUF_M_TYPE => g
+            .meta(key)
+            .map_or(IO_NAME_NOT_FOUND, |v| i64::from(v.type_id())),
+        GGUF_M_LEN => g.meta(key).map_or(IO_NAME_NOT_FOUND, |v| match v {
+            MetaValue::Str(s) => s.len() as i64,
+            MetaValue::Arr(_, items) => items.len() as i64,
+            _ => 1,
+        }),
+        GGUF_M_I64 => meta_elem(g, key, i)
+            .ok()
+            .and_then(meta_as_i64)
+            .unwrap_or(default),
+        _ => IO_ERROR,
+    }
+}
+
+/// [`gguf_meta`] on the file at `path`; a file that cannot be opened, sized or parsed answers its
+/// code to the two queries and the default to the value read. Shared by both backends.
+pub fn gguf_meta_path(path: &Path, key: &[u8], what: i64, i: i64, default: i64) -> i64 {
+    match gguf_open(path) {
+        Ok((_, g, _)) => gguf_meta(&g, key, what, i, default),
+        Err(_) if what == GGUF_M_I64 => default,
+        Err(code) => code,
+    }
+}
+
+/// `gguf_meta_f64`: value `i` of key `key` as an `f64`, or `default` (a missing file, key or
+/// index, or a value that is not a number). Shared by both backends.
+pub fn gguf_meta_f64_path(path: &Path, key: &[u8], i: i64, default: f64) -> f64 {
+    let Ok((_, g, _)) = gguf_open(path) else {
+        return default;
+    };
+    meta_elem(&g, key, i)
+        .ok()
+        .and_then(meta_as_f64)
+        .unwrap_or(default)
+}
+
+/// `gguf_meta_str`: the bytes of string value `i` of key `key` (a string, or element `i` of a
+/// string array): `Err(-5)` for a missing key, `-3` for a value that is not a string, `-4` for an
+/// index outside the value, or the file's own code. Shared by both backends.
+pub fn gguf_meta_str_path(path: &Path, key: &[u8], i: i64) -> Result<Vec<u8>, i64> {
+    let (_, g, _) = gguf_open(path)?;
+    match meta_elem(&g, key, i)? {
+        MetaValue::Str(s) => Ok(s.clone()),
+        _ => Err(IO_DTYPE_MISMATCH),
+    }
+}
+
+/// `wukong_rt_gguf_meta(path, key, what, i, default) -> i64` — `gguf_meta_type`,
+/// `gguf_meta_len` and `gguf_meta_i64` ([`gguf_meta_path`]).
+///
+/// # Safety
+/// `path` and `key` must be null or NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn wukong_rt_gguf_meta(
+    path: *const u8,
+    key: *const u8,
+    what: i64,
+    i: i64,
+    default: i64,
+) -> i64 {
+    // SAFETY-EXEMPT: `path` and `key` are NUL-terminated strings -- they carry no extent to check.
+    // SAFETY: forwarded from this function's contract.
+    let (path, key) = unsafe { (crate::rt_path(path), fileio::cstr_lossy(key)) };
+    match path {
+        Some(path) => gguf_meta_path(&path, key.as_bytes(), what, i, default),
+        None if what == GGUF_M_I64 => default,
+        None => IO_OPEN_FAILED,
+    }
+}
+
+/// `wukong_rt_gguf_meta_f64(path, key, i, default) -> f64` — `gguf_meta_f64`
+/// ([`gguf_meta_f64_path`]).
+///
+/// # Safety
+/// `path` and `key` must be null or NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn wukong_rt_gguf_meta_f64(
+    path: *const u8,
+    key: *const u8,
+    i: i64,
+    default: f64,
+) -> f64 {
+    // SAFETY-EXEMPT: `path` and `key` are NUL-terminated strings -- they carry no extent to check.
+    // SAFETY: forwarded from this function's contract.
+    let (path, key) = unsafe { (crate::rt_path(path), fileio::cstr_lossy(key)) };
+    match path {
+        Some(path) => gguf_meta_f64_path(&path, key.as_bytes(), i, default),
+        None => default,
+    }
+}
+
+/// Copy `s` into a `len`-byte buffer with `snprintf` semantics — at most `len - 1` bytes, then a
+/// NUL; nothing for `len <= 0` — returning how many bytes were copied (the NUL not counted).
+pub fn copy_c_string(s: &[u8], len: usize, mut put: impl FnMut(usize, u8)) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let n = s.len().min(len - 1);
+    for (k, &b) in s[..n].iter().enumerate() {
+        put(k, b);
+    }
+    put(n, 0);
+    n
+}
+
+/// `wukong_rt_gguf_meta_str(path, key, i, buf, len) -> i64` — `gguf_meta_str`: copy string value
+/// `i` of key `key` into the `len`-byte `buf` as `sprintf` does (truncated to `len - 1` bytes and
+/// always NUL-terminated) and return its full byte length, or a negative code
+/// ([`gguf_meta_str_path`]); `buf` is untouched on a negative code.
+///
+/// # Safety
+/// `path` and `key` must be null or NUL-terminated; `buf` must address `len` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn wukong_rt_gguf_meta_str(
+    path: *const u8,
+    key: *const u8,
+    i: i64,
+    buf: *mut u8,
+    len: i64,
+) -> i64 {
+    crate::safety::debug_extent(buf, len);
+    // SAFETY: forwarded from this function's contract.
+    let (path, key) = unsafe { (crate::rt_path(path), fileio::cstr_lossy(key)) };
+    let Some(path) = path else {
+        return IO_OPEN_FAILED;
+    };
+    match gguf_meta_str_path(&path, key.as_bytes(), i) {
+        Ok(s) => {
+            let len = usize::try_from(len).unwrap_or(0);
+            // SAFETY: `copy_c_string` writes only at offsets below `len`, which the caller
+            // guarantees are writable.
+            copy_c_string(&s, len, |k, b| unsafe { buf.add(k).write(b) });
+            s.len() as i64
+        }
+        Err(code) => code,
+    }
+}
+
 // --- dequantization ----------------------------------------------------------------------------
 
 /// The 16 non-uniform levels of `IQ4_NL` / `IQ4_XS` (ggml's `kvalues_iq4nl`).
@@ -1841,6 +2035,108 @@ mod tests {
             })
             .collect();
         assert_lanes(&dq(Dequant::IQ4_XS, &blk), &want, "IQ4_XS");
+    }
+
+    #[test]
+    fn metadata_accessors_read_every_kind_and_fall_back_to_the_default() {
+        use MetaValue as V;
+        let mut b = Gb::new();
+        b.kv("general.architecture", &V::Str(b"llama".to_vec()))
+            .kv("llama.block_count", &V::U32(12))
+            .kv("llama.rope.freq_base", &V::F32(10000.0))
+            .kv("big", &V::U64(u64::MAX))
+            .kv("flag", &V::Bool(true))
+            .kv("neg", &V::I8(-5))
+            .kv(
+                "tokens",
+                &V::Arr(
+                    vt::STRING,
+                    vec![V::Str(b"<s>".to_vec()), V::Str(b"wukong".to_vec())],
+                ),
+            )
+            .kv("scores", &V::Arr(vt::F32, vec![V::F32(0.5), V::F32(-1.25)]))
+            .kv("ids", &V::Arr(vt::I32, vec![V::I32(3), V::I32(-4)]));
+        let g = parse(&b.bytes()).unwrap();
+        let q = |k: &str, what: i64| gguf_meta(&g, k.as_bytes(), what, 0, 0);
+        assert_eq!(q("llama.block_count", GGUF_M_TYPE), i64::from(vt::U32));
+        assert_eq!(q("tokens", GGUF_M_TYPE), i64::from(vt::ARRAY));
+        assert_eq!(q("absent", GGUF_M_TYPE), IO_NAME_NOT_FOUND);
+        assert_eq!(q("general.architecture", GGUF_M_LEN), 5);
+        assert_eq!(q("tokens", GGUF_M_LEN), 2);
+        assert_eq!(q("flag", GGUF_M_LEN), 1);
+        assert_eq!(q("absent", GGUF_M_LEN), IO_NAME_NOT_FOUND);
+        let int = |k: &str, i: i64| gguf_meta(&g, k.as_bytes(), GGUF_M_I64, i, -77);
+        assert_eq!(int("llama.block_count", 0), 12);
+        assert_eq!(int("big", 0), -1, "a u64 keeps its bits");
+        assert_eq!(int("flag", 0), 1);
+        assert_eq!(int("neg", 0), -5);
+        assert_eq!(int("ids", 1), -4);
+        for (k, i) in [
+            ("ids", 2),
+            ("ids", -1),
+            ("llama.block_count", 1),
+            ("llama.rope.freq_base", 0),
+            ("tokens", 0),
+            ("absent", 0),
+        ] {
+            assert_eq!(int(k, i), -77, "{k}[{i}]");
+        }
+        let f = Scratch::new("gguf_meta", &b.bytes());
+        let fl = |k: &str, i: i64| gguf_meta_f64_path(&f.0, k.as_bytes(), i, -0.5);
+        assert_eq!(fl("llama.rope.freq_base", 0), 10000.0);
+        assert_eq!(fl("scores", 1), -1.25);
+        assert_eq!(fl("llama.block_count", 0), 12.0, "an integer converts");
+        assert_eq!(
+            fl("big", 0),
+            u64::MAX as f64,
+            "a u64 converts by its unsigned value"
+        );
+        assert_eq!(fl("flag", 0), -0.5, "a bool is not a number");
+        assert_eq!(fl("general.architecture", 0), -0.5);
+        assert_eq!(
+            gguf_meta_str_path(&f.0, b"tokens", 1),
+            Ok(b"wukong".to_vec())
+        );
+        assert_eq!(
+            gguf_meta_str_path(&f.0, b"tokens", 2),
+            Err(IO_SHAPE_MISMATCH)
+        );
+        assert_eq!(gguf_meta_str_path(&f.0, b"ids", 0), Err(IO_DTYPE_MISMATCH));
+        assert_eq!(
+            gguf_meta_str_path(&f.0, b"absent", 0),
+            Err(IO_NAME_NOT_FOUND)
+        );
+        // The native entries, including snprintf truncation and the untouched buffer on a code.
+        let key = std::ffi::CString::new("general.architecture").unwrap();
+        let kp = key.as_ptr() as *const u8;
+        let mut buf = [0xAAu8; 4];
+        // SAFETY: `buf` holds 4 writable bytes; both strings are NUL-terminated.
+        let n = unsafe { wukong_rt_gguf_meta_str(f.ptr(), kp, 0, buf.as_mut_ptr(), 4) };
+        assert_eq!((n, buf), (5, *b"lla\0"));
+        let bad = std::ffi::CString::new("ids").unwrap();
+        let mut keep = [0xAAu8; 4];
+        // SAFETY: as above.
+        let n = unsafe {
+            wukong_rt_gguf_meta_str(f.ptr(), bad.as_ptr() as *const u8, 0, keep.as_mut_ptr(), 4)
+        };
+        assert_eq!((n, keep), (IO_DTYPE_MISMATCH, [0xAA; 4]));
+        // SAFETY: both strings are NUL-terminated.
+        unsafe {
+            assert_eq!(wukong_rt_gguf_meta(f.ptr(), kp, GGUF_M_LEN, 0, 0), 5);
+            assert_eq!(
+                wukong_rt_gguf_meta(std::ptr::null(), kp, GGUF_M_I64, 0, 9),
+                9
+            );
+            assert_eq!(
+                wukong_rt_gguf_meta(std::ptr::null(), kp, GGUF_M_TYPE, 0, 9),
+                IO_OPEN_FAILED
+            );
+            assert_eq!(wukong_rt_gguf_meta_f64(std::ptr::null(), kp, 0, 2.5), 2.5);
+        }
+        assert_eq!(
+            copy_c_string(b"abc", 0, |_, _| panic!("nothing is written")),
+            0
+        );
     }
 
     // --- the entry point ----------------------------------------------------------------------

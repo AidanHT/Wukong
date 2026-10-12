@@ -30,6 +30,8 @@ pub(crate) enum Abi {
     I64,
     /// An `f32`; an `f64` argument is demoted to it.
     F32,
+    /// An `f64`; an `f32` argument is promoted to it.
+    F64,
 }
 
 impl Abi {
@@ -38,6 +40,7 @@ impl Abi {
             Abi::Ptr => ptr_ty,
             Abi::I64 => types::I64,
             Abi::F32 => types::F32,
+            Abi::F64 => types::F64,
         }
     }
 }
@@ -53,8 +56,8 @@ pub(crate) struct Entry {
 
 /// The table. The addresses are taken here, at run time, because a function-pointer-to-raw-pointer
 /// cast is not a constant expression.
-pub(crate) fn entries() -> [Entry; 26] {
-    use Abi::{Ptr, F32, I64};
+pub(crate) fn entries() -> [Entry; 29] {
+    use Abi::{Ptr, F32, F64, I64};
     [
         // (path, byte_off, data, len, dtype) -> i64: `read_<T>` outside the frozen six, and every
         // `read_<T>_at`.
@@ -105,6 +108,28 @@ pub(crate) fn entries() -> [Entry; 26] {
             params: &[Ptr, Ptr, I64, I64],
             ret: Some(I64),
             addr: wukong_runtime::wukong_rt_gguf_query as *const u8,
+        },
+        // (path, key, what, i, default) -> i64: `gguf_meta_type` / `gguf_meta_len` /
+        // `gguf_meta_i64`.
+        Entry {
+            name: "wukong_rt_gguf_meta",
+            params: &[Ptr, Ptr, I64, I64, I64],
+            ret: Some(I64),
+            addr: wukong_runtime::wukong_rt_gguf_meta as *const u8,
+        },
+        // (path, key, i, default) -> f64: `gguf_meta_f64`.
+        Entry {
+            name: "wukong_rt_gguf_meta_f64",
+            params: &[Ptr, Ptr, I64, F64],
+            ret: Some(F64),
+            addr: wukong_runtime::wukong_rt_gguf_meta_f64 as *const u8,
+        },
+        // (path, key, i, buf, len) -> i64: `gguf_meta_str`.
+        Entry {
+            name: "wukong_rt_gguf_meta_str",
+            params: &[Ptr, Ptr, I64, Ptr, I64],
+            ret: Some(I64),
+            addr: wukong_runtime::wukong_rt_gguf_meta_str as *const u8,
         },
         // (data, len) -> data or null: a `[]u8` / `[u8; N]` path or tensor name.
         Entry {
@@ -313,6 +338,7 @@ impl FnTranslator<'_> {
                 Abi::Ptr => self.val(a),
                 Abi::I64 => self.coerce_to_i64(a),
                 Abi::F32 => self.coerce_to_f32(a),
+                Abi::F64 => self.coerce_to_f64(a),
             });
         }
         let fref = self.runtime_ref(e.name);
