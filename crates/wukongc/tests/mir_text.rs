@@ -129,14 +129,23 @@ fn ok(args: &[&str]) -> String {
 
 /// The checks of the module docs for one program: 1-3, and 4-6 too when `full`. `Ok(false)` =
 /// skipped (does not compile without its RUN flags); `Err` = a failed law, described.
+///
+/// Whether to skip is decided by the plain `--emit=mir` compile, never by `--emit=mir-text`
+/// itself: a typed-printer failure on a program that compiles is a broken law, not a skip, or a
+/// regression confined to a rare op would hide under the skipped count.
 fn check(program: &Path, scratch: &Path, full: bool) -> Result<bool, String> {
     let wk = program.to_str().expect("utf-8 path");
     let name = program.file_name().unwrap().to_string_lossy().into_owned();
-    let (code, typed, _) = wukongc(&["--emit=mir-text", "-O2", CPU, wk]);
+    let (code, plain, _) = wukongc(&["--emit=mir", "-O2", CPU, wk]);
     if code != 0 {
         return Ok(false);
     }
-    let plain = ok(&["--emit=mir", "-O2", CPU, wk]);
+    let (code, typed, err) = wukongc(&["--emit=mir-text", "-O2", CPU, wk]);
+    if code != 0 {
+        return Err(format!(
+            "{name}: --emit=mir-text failed (exit {code}) where --emit=mir succeeded:\n{err}"
+        ));
+    }
     let x = scratch.join(format!("{name}.O2.mir"));
     std::fs::write(&x, &typed).expect("write the dump");
     let x = x.to_str().unwrap();
@@ -229,11 +238,11 @@ fn typed_mir_round_trips_and_the_pass_list_is_the_pipeline() {
             .collect()
     });
     let checked = results.iter().filter(|(_, r)| *r == Ok(true)).count();
+    let skipped = results.iter().filter(|(_, r)| *r == Ok(false)).count();
     eprintln!(
-        "mir_text: {checked} of {} programs checked ({} skipped: they compile only with their \
-         RUN flags)",
+        "mir_text: {checked} of {} programs checked ({skipped} skipped: they compile only with \
+         their RUN flags)",
         programs.len(),
-        programs.len() - checked
     );
     let failures: Vec<&String> = results
         .iter()
