@@ -118,6 +118,12 @@ mod repeat;
 // The vectorizer's statement scan and the same-range loop-fusion planner built on it.
 mod fuse;
 
+// The `@parallel` region outliner's slice captures, run-time overlap guards, run-time trip counts
+// and kernel-builtin operands (beside the region scan in this file; see the module docs).
+mod par_region;
+#[cfg(test)]
+mod par_region_tests;
+
 // ===== Type-generic monomorphization =====
 //
 // A function generic over a TYPE parameter (`fn id<T>(x: T) -> T`) cannot be lowered once: its MIR
@@ -2854,7 +2860,12 @@ fn parallel_spec<'a>(
     if n < 2 {
         return None;
     }
-    proof.match_parallel_region(*name, n, lb)?;
+    // Every capture here is a fixed-array parameter (checked above), so no pair needs a run-time
+    // guard; a plan that asks for one is declined rather than threaded unguarded.
+    let plan = proof.match_parallel_region(*name, Some(n), lb).ok()?;
+    if !plan.guards.is_empty() {
+        return None;
+    }
     Some((*name, end, lb))
 }
 
@@ -14750,7 +14761,7 @@ impl FnLowerer<'_> {
         if self.parallel_fn
             && !inclusive
             && step.is_none()
-            && self.try_emit_parallel_region(pat, start, end, &ity, body)
+            && self.try_emit_parallel_region(pat, (start, end), (&ity, signed), body)
         {
             return;
         }
@@ -14854,6 +14865,15 @@ impl FnLowerer<'_> {
     //    constants) sum below `C`. Then `index mod C·N ∈ [hh·C, hh·C + C)` recovers `hh`, so two
     //    different iterations can never touch the same element — reads of a written array pass the
     //    same proof (with the array's common `C`), so no iteration reads another's writes either.
+    //    More generally the non-outer terms of every access of one buffer may lie in any ONE band
+    //    `[k·C, k·C + C)` (constants of either sign): `out[(hh + 1)·C + j]` is band 1, and a
+    //    buffer read at one band and written at another — the shift `out[hh+1] = out[hh]` — still
+    //    declines.
+    //  * **A trip count known only at run time** (`for r in 0..rows`, `0..s.len()`: a pure bound
+    //    of a signed counter, evaluated once at the call site — `try_emit_parallel_region`) has no
+    //    modulus, so NO term is outer: every non-digit term must be bounded, and the bounded terms
+    //    must sum below `C`, which puts every index of iteration `hh` inside `[hh·C, hh·C + C)`. The
+    //    two-digit form keeps only `hh / C` as the high digit (its range is unbounded).
     //  * **Tiled iteration spaces** spelled with div/mod by a literal (`for t in 0..H*T { let hh =
     //    t / T; let tile = t % T; … }`) pass a two-digit form of the same proof. `t ↦ (t/C, t%C)`
     //    is injective (`t = (t/C)·C + t%C`), so an index decomposing as `(t/C)·qc + (t%C)·rc +
@@ -14877,12 +14897,20 @@ impl FnLowerer<'_> {
     //    capture that may share its storage (the parameter rule below), has any other access in
     //    the loop. A read there would see a schedule-dependent count. A field, pointee or
     //    multi-index place declines.
-    //  * Anything the proof cannot cover declines (`match_parallel_region` returns `None`) and the
-    //    loop lowers serially exactly as before: captured-scalar writes (loop-carried reductions),
-    //    non-affine / offset indices, `break`/`continue` targeting the region loop, `return`,
-    //    calls other than pure math intrinsics and `atomic_add` (`print` would reorder output),
-    //    slices / tensors / pointers (may alias), `match` / `loop` expressions, shadowing of
-    //    classification vars.
+    //  * **Kernel builtins** (`softmax(x[r*C..r*C + C], out[r*C..r*C + C])`, `matmul`, `rmsnorm`,
+    //    `sum`, …) are calls the region admits (`par_region::scan_region_builtin`), because sema's
+    //    shape record and the lowering's run-time extent checks pin what the kernel touches: every
+    //    element of each buffer operand, nothing else, writing only the output operand. An operand
+    //    that is a range view `s[lo..hi]` of a captured slice with constant `hi - lo = L` is the
+    //    range access `s[lo + j]`, `j ∈ [0, L)` — the proof places it like any element access (the
+    //    output's write set must be the iteration's own partition). A whole captured buffer is an
+    //    opaque access (fine to read, never to write); a body-local array is private.
+    //  * Anything the proof cannot cover declines (`match_parallel_region` returns the reason) and
+    //    the loop lowers serially exactly as before: captured-scalar writes (loop-carried
+    //    reductions), non-affine / offset indices, `break`/`continue` targeting the region loop,
+    //    `return`, calls other than pure math intrinsics, kernel builtins and `atomic_add`
+    //    (`print` would reorder output), tensors / pointers / a slice VALUE escaping into the body
+    //    (may alias), `match` / `loop` expressions, shadowing of classification vars.
     //  * Inside the outlined body `parallel_fn` is false, so each iteration dispatches the SERIAL
     //    kernels — the identical per-iteration op sequence the non-`@parallel` spelling runs; only
     //    cross-iteration scheduling differs. Iterations never overlap plain writes, and overlapping
@@ -14894,6 +14922,17 @@ impl FnLowerer<'_> {
     //    their accesses — unless a `@noalias` promise separates the pair. Derived pointers and
     //    aggregate parameters decline because their overlapping subobjects need an offset-aware
     //    proof.
+    //  * **Slices** (`[]T` of a scalar, parameter or local) are captured as `(data, len)` behind
+    //    their fat pointer, which no region statement can re-point (a capture is never assigned
+    //    whole), so every iteration indexes the same data. Their accesses take the per-buffer
+    //    proof like an array's. What a NAME cannot say is where a slice points: two slices, or a
+    //    slice and an array, of one element scalar may overlap at ANY offset, so the same-base
+    //    union proof is not a proof about them. Such a pair is settled at RUN TIME
+    //    (`par_region::emit_region_guard`, the `LoopVersioning` shape `kernel_guard.rs` uses): the
+    //    region is threaded only when the two element ranges are disjoint — or start at the same
+    //    address when the union of their accesses passed the proof (`f(x, x)`, in place) — and
+    //    otherwise the SAME outlined body runs once over `[0, N)` on the calling thread, which is
+    //    the serial loop.
     //
     // Autodiff note: a function containing a region tapes to an `Op::Call` of
     // `wukong_parallel_for` (a void call with no VJP rule), so `--emit=grad`/`--train` over such a
@@ -14906,43 +14945,86 @@ impl FnLowerer<'_> {
     fn try_emit_parallel_region(
         &mut self,
         pat: &Pattern,
-        start: &Expr,
-        end: &Expr,
-        ity: &MirType,
+        (start, end): (&Expr, &Expr),
+        (ity, signed): (&MirType, bool),
         body: &Block,
     ) -> bool {
         if self.par.is_none() {
             return false;
         }
+        let verdict = self.region_verdict(pat, start, end, (ity, signed), body);
+        #[cfg(test)]
+        par_region::trace(verdict.as_ref().map(|_| ()).map_err(|why| *why));
+        match verdict {
+            Ok((hh, trip, plan)) => {
+                self.emit_parallel_region(hh, trip, (ity, signed), (end, body), &plan)
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// The whole legality verdict for one candidate region loop: the region variable, the trip
+    /// count, and the proved [`par_region::RegionPlan`], or the reason it stays serial.
+    fn region_verdict(
+        &self,
+        pat: &Pattern,
+        start: &Expr,
+        end: &Expr,
+        (ity, signed): (&MirType, bool),
+        body: &Block,
+    ) -> Result<(Symbol, par_region::RegionTrip, par_region::RegionPlan), &'static str> {
         let ast::PatKind::Ident(hh) = pat.kind else {
-            return false;
+            return Err("the loop pattern is not a plain name");
         };
-        // The runtime iterates [0, N): require a literal-0 start and a literal trip count. A
-        // 0/1-trip loop gains nothing from threading, so it stays serial.
+        // The runtime iterates [0, N): require a literal-0 start.
         if as_int_lit(start, self.interner) != Some(0) {
-            return false;
+            return Err("the range does not start at literal 0");
         }
-        let Some(n) = as_int_lit(end, self.interner) else {
-            return false;
+        let max = (1i128 << (mir_byte_size(ity) * 8 - 1)) - 1;
+        let constant = as_int_lit(end, self.interner)
+            .map(|n| n as i128)
+            .or_else(|| self.const_runtime_u64_expr(end).map(i128::from));
+        let trip = match constant {
+            // A 0/1-trip loop gains nothing from threading, so it stays serial.
+            Some(n) if n < 2 => return Err("a constant trip count below 2"),
+            Some(n) if n > max => return Err("a constant trip count the counter cannot hold"),
+            Some(n) => par_region::RegionTrip::Const(n as i64),
+            // A run-time trip count: the runtime's `[0, n)` is the loop's iteration space only
+            // for a signed counter (`lower_ranged_loop` compares signed), and evaluating the bound
+            // ONCE at the call site is the loop's meaning only when re-evaluating it in the header
+            // could not change it — a pure bound (`is_reevaluable_bound`: literals, names, their
+            // arithmetic, a slice's `.len()`). No region statement writes a capture as a whole, so
+            // none can change a name the bound reads.
+            None if !signed || !ity.is_int() => {
+                return Err("a run-time trip count of an unsigned counter")
+            }
+            None if !self.is_reevaluable_bound(end) => {
+                return Err("a run-time trip count that is not a pure bound")
+            }
+            None => par_region::RegionTrip::Runtime,
         };
-        if n < 2 || (n as i128) > (1i128 << (mir_byte_size(ity) * 8 - 1)) - 1 {
-            return false;
-        }
-        let Some(captures) = self.match_parallel_region(hh, n as i128, body) else {
-            return false;
-        };
-        self.emit_parallel_region(hh, n, ity, body, &captures)
+        let plan = self.match_parallel_region(hh, trip.constant().map(i128::from), body)?;
+        Ok((hh, trip, plan))
     }
 
     /// The pure legality analysis: walk the loop body, collecting captures (enclosing-scope
-    /// bindings) and every access to a captured array, then prove all plain writes (and all reads
-    /// of written arrays) per-iteration disjoint via the mixed-radix digit argument — the single
-    /// direct `hh*C` digit, or the tiled two-digit `(hh/C)·qc + (hh%C)·rc` form (see the section
-    /// comment above). Arrays updated by `atomic_add` skip that proof and instead must have no
-    /// other access through any name that can share their storage. Conservative: any construct the
-    /// walk does not explicitly model declines.
-    /// Returns the captures in first-appearance order (the deterministic env layout) on success.
-    fn match_parallel_region(&self, hh: Symbol, n: i128, body: &Block) -> Option<Vec<Symbol>> {
+    /// bindings) and every access to a captured array or slice, then prove all plain writes (and
+    /// all reads of written buffers) per-iteration disjoint via the mixed-radix digit argument —
+    /// the single direct `hh*C` digit, or the tiled two-digit `(hh/C)·qc + (hh%C)·rc` form (see
+    /// the section comment above). Buffers updated by `atomic_add` skip that proof and instead must
+    /// have no other access through any name that can share their storage. `n` is the trip count,
+    /// `None` when it is known only at run time. Conservative: any construct the walk does not
+    /// explicitly model declines, with its reason.
+    ///
+    /// Returns the captures in first-appearance order (the deterministic env layout) and the pairs
+    /// of captures only a run-time range test can separate (see `par_region`).
+    fn match_parallel_region(
+        &self,
+        hh: Symbol,
+        n: Option<i128>,
+        body: &Block,
+    ) -> Result<par_region::RegionPlan, &'static str> {
+        use par_region::{RegionGuard, RegionRelation};
         let mut sc = RegionScan {
             hh,
             locals: Vec::new(),
@@ -14953,70 +15035,102 @@ impl FnLowerer<'_> {
             env: Vec::new(),
             derived: HashMap::default(),
             depth: 0,
+            cap_tys: HashMap::default(),
             ok: true,
+            why: "",
         };
         self.scan_region_block(body, &mut sc);
         if !sc.ok {
-            return None;
+            return Err(sc.why);
         }
-        // An atomically updated array is safe to split across chunks only if no iteration
+        let mut guards: Vec<RegionGuard> = Vec::new();
+        // An atomically updated buffer is safe to split across chunks only if no iteration
         // observes it in between: no plain read or write of it, and none of any capture that may
-        // be the same buffer (the parameter storage-class rule below). A read of a counter other
-        // iterations are still adding to would see a schedule-dependent value; such a region
-        // stays serial.
+        // be the same buffer (the storage-class relation, `region_relation`). A read of a counter
+        // other iterations are still adding to would see a schedule-dependent value; such a region
+        // stays serial — or, for a pair whose overlap only the run time knows, runs serially
+        // unless the two ranges are disjoint.
         for arr in &sc.atomic {
             if sc.accesses.contains_key(arr) {
-                return None;
+                return Err("an atomically updated buffer is also read or written plainly");
             }
-            let (base, _) = self.lookup(*arr)?;
-            let aty = self.buffer_param_ty(*arr);
-            let shares = |c: Symbol| {
-                self.lookup(c).is_some_and(|(other, _)| other == base)
-                    || (aty.is_some_and(|a| {
-                        self.buffer_param_ty(c)
-                            .is_some_and(|t| noalias::could_share_storage(a, t))
-                    }) && !self.promised_disjoint(*arr, c))
-            };
-            if sc
-                .captures
-                .iter()
-                .any(|c| c != arr && shares(*c) && sc.accesses.contains_key(c))
-            {
-                return None;
+            for c in &sc.captures {
+                if c == arr || !sc.accesses.contains_key(c) {
+                    continue;
+                }
+                match self.region_relation(*arr, *c, &sc) {
+                    RegionRelation::Distinct => {}
+                    RegionRelation::Union => {
+                        return Err("an atomically updated buffer may be a buffer the loop reads")
+                    }
+                    RegionRelation::Runtime => {
+                        par_region::push_guard(&mut guards, *arr, *c, false);
+                    }
+                }
             }
         }
         for arr in &sc.written {
-            let accs = sc.accesses.get(arr)?;
-            self.prove_region_slices(hh, n, &accs.iter().collect::<Vec<_>>())?;
+            let accs = sc
+                .accesses
+                .get(arr)
+                .ok_or("a written buffer has no access record")?;
+            self.prove_region_slices(hh, n, &accs.iter().collect::<Vec<_>>())
+                .ok_or("a written buffer's accesses are not per-iteration disjoint")?;
         }
         // Prove the union for aliases of one MIR base, including aggregate match bindings, and
         // for parameters that the caller may bind to one array. "May" is decided by storage class,
         // not by `Ty` equality (P1.20): a declared length is no evidence that two array parameters
         // are different buffers, so every parameter over the same element scalar joins the group —
         // unless a `@noalias` promise separates the two (`noalias.rs`). `region_capture` only admits
-        // direct scalar-element array parameters or fresh allocas: derived pointers and aggregate
-        // parameters could overlap at different offsets or element sizes and decline.
+        // direct scalar-element array parameters, fresh allocas and scalar slices: derived pointers
+        // and aggregate parameters could overlap at different offsets or element sizes and decline.
+        // A pair with a SLICE in it may overlap at any offset, so the union proof is no proof about
+        // it: it becomes a run-time guard, which also accepts one start address when the union of
+        // the pair's accesses passes the proof (the in-place `f(x, x)`).
         for arr in &sc.written {
-            let (base, _) = self.lookup(*arr)?;
-            let wty = self.buffer_param_ty(*arr);
-            let group: Vec<&Vec<RegionAccess>> = sc
-                .captures
-                .iter()
-                .filter(|c| {
-                    self.lookup(**c).is_some_and(|(other, _)| other == base)
-                        || (wty.is_some_and(|w| {
-                            self.buffer_param_ty(**c)
-                                .is_some_and(|t| noalias::could_share_storage(w, t))
-                        }) && !self.promised_disjoint(*arr, **c))
-                })
-                .filter_map(|c| sc.accesses.get(c))
-                .collect();
-            if group.len() < 2 {
+            let mut group: Vec<&RegionAccess> = Vec::new();
+            let mut members = 0usize;
+            for c in &sc.captures {
+                let Some(caccs) = sc.accesses.get(c) else {
+                    continue;
+                };
+                let relation = if c == arr {
+                    RegionRelation::Union
+                } else {
+                    self.region_relation(*arr, *c, &sc)
+                };
+                match relation {
+                    RegionRelation::Distinct => {}
+                    RegionRelation::Union => {
+                        group.extend(caccs.iter());
+                        members += 1;
+                    }
+                    RegionRelation::Runtime => {
+                        let same_base_ok = self.region_same_elements(*arr, *c, &sc)
+                            && sc.accesses.get(arr).is_some_and(|w| {
+                                let both: Vec<&RegionAccess> = w.iter().chain(caccs).collect();
+                                self.prove_region_slices(hh, n, &both).is_some()
+                            });
+                        par_region::push_guard(&mut guards, *arr, *c, same_base_ok);
+                    }
+                }
+            }
+            if members < 2 {
                 continue;
             }
-            self.prove_region_slices(hh, n, &group.into_iter().flatten().collect::<Vec<_>>())?;
+            self.prove_region_slices(hh, n, &group)
+                .ok_or("buffers that may be one buffer are not jointly per-iteration disjoint")?;
         }
-        Some(sc.captures)
+        let tys = guards
+            .iter()
+            .flat_map(|g| [g.a, g.b])
+            .filter_map(|s| Some((s, self.region_capture_ty(s, &sc)?.clone())))
+            .collect();
+        Ok(par_region::RegionPlan {
+            captures: sc.captures,
+            guards,
+            tys,
+        })
     }
 
     /// The parameter type behind the current binding's base pointer, including direct aliases.
@@ -15032,16 +15146,31 @@ impl FnLowerer<'_> {
     /// establishes that no two iterations touch the same element, `None` declines. Called once per
     /// written array (accesses to that symbol), and once more per group of parameters that may be
     /// the same buffer (the union of their accesses) — see [`FnLowerer::match_parallel_region`].
-    fn prove_region_slices(&self, hh: Symbol, n: i128, accs: &[&RegionAccess<'_>]) -> Option<()> {
+    /// `n` is the trip count, `None` when only the run time knows it (then no term is outer).
+    fn prove_region_slices(
+        &self,
+        hh: Symbol,
+        n: Option<i128>,
+        accs: &[&RegionAccess<'_>],
+    ) -> Option<()> {
         // Pass 1: every access must carry the loop var under ONE common signature for this
         // buffer, reads and writes alike (a read decomposing under a different signature could
         // reach another iteration's slice): a single direct `hh`/`hh * <lit>` digit, or the
-        // tiled `(hh/C)·qc + (hh%C)·rc` digit pair.
+        // tiled `(hh/C)·qc + (hh%C)·rc` digit pair. A range access `base[lo..hi]` decomposes
+        // both ends under that signature; its constant length `L = hi - lo` adds the bounded
+        // term `j ∈ [0, L)` (`RegionRest::Span`).
         let mut sig: Option<RegionSig> = None;
         let mut parsed: Vec<(Vec<RegionRest>, &RegionAccess)> = Vec::new();
         for &a in accs {
             let idx = a.idx?; // opaque access (whole-array / multi-index) to a covered buffer
-            let (asig, rest) = region_access_sig(idx, a, hh, self.interner)?;
+            let (asig, mut rest) = region_access_sig(idx, a, hh, self.interner)?;
+            if let Some(hi) = a.hi {
+                let (hsig, hrest) = region_access_sig(hi, a, hh, self.interner)?;
+                if hsig != asig {
+                    return None;
+                }
+                rest.push(RegionRest::Span(par_region::region_span(&rest, &hrest)?));
+            }
             match sig {
                 Some(s) if s != asig => return None,
                 _ => sig = Some(asig),
@@ -15053,26 +15182,50 @@ impl FnLowerer<'_> {
         // constants and inner `for` vars with literal ranges) — and bound each digit's slot.
         match sig? {
             RegionSig::T(c) => {
-                let m = c.checked_mul(n)?;
+                // A run-time trip count has no modulus: nothing is outer.
+                let m = match n {
+                    Some(n) => Some(c.checked_mul(n)?),
+                    None => None,
+                };
+                // Everything that is not outer must stay inside ONE band `[k·C, k·C + C)` of the
+                // digit's stride, with one `k` for every access of the buffer: iteration `hh`
+                // then touches only `[(hh+k)·C, (hh+k)·C + C)` (mod C·N when outer terms exist,
+                // where `hh ↦ hh + k` is still a bijection of the N residues), so two iterations
+                // never meet. `k = 0` is the original form; `out[(h + 1)·C + j]` — every access of
+                // the buffer one row up — is `k = 1`, and a buffer read at band 0 and written at
+                // band 1 (the loop-carried shift) still declines.
+                let mut band: Option<i128> = None;
                 for (rest, a) in &parsed {
-                    // Everything that is not outer must stay inside the digit's stride C.
-                    let (total, _) = region_extent(rest, a, m, None)?;
-                    if total >= c {
+                    let (lo, hi) = region_reach(rest, a, m)?;
+                    let k = lo.div_euclid(c);
+                    if hi >= k.checked_add(1)?.checked_mul(c)? || band.is_some_and(|b| b != k) {
                         return None;
                     }
+                    band = Some(k);
                 }
             }
             RegionSig::DivMod { c, qc, rc } => {
                 // Digit ranges from the trip count: q = hh/c ∈ [0, q_max], r = hh%c ∈
-                // [0, r_max]. H/L order the two digit terms by coefficient.
-                let q_max = (n - 1) / c;
-                let r_max = (c - 1).min(n - 1);
-                let (h, h_max, l, l_max) = if rc > qc {
-                    (rc, r_max, qc, q_max)
-                } else {
-                    (qc, q_max, rc, r_max)
+                // [0, r_max]. H/L order the two digit terms by coefficient. A run-time trip
+                // count leaves q unbounded, so q must be the HIGH digit (nothing above it, so no
+                // outer term) and r is bounded by the divisor alone.
+                let (h, h_max, l, l_max) = match n {
+                    Some(n) => {
+                        let q_max = (n - 1) / c;
+                        let r_max = (c - 1).min(n - 1);
+                        if rc > qc {
+                            (rc, Some(r_max), qc, q_max)
+                        } else {
+                            (qc, Some(q_max), rc, r_max)
+                        }
+                    }
+                    None if rc > qc => return None,
+                    None => (qc, None, rc, c - 1),
                 };
-                let m = h.checked_mul(h_max.checked_add(1)?)?;
+                let m = match h_max {
+                    Some(h_max) => Some(h.checked_mul(h_max.checked_add(1)?)?),
+                    None => None,
+                };
                 let sm = l.checked_mul(l_max.checked_add(1)?)?;
                 for (rest, a) in &parsed {
                     let (total, low) = region_extent(rest, a, m, Some(sm))?;
@@ -15114,7 +15267,7 @@ impl FnLowerer<'_> {
                     // Copying a tuple/array/struct containing an indirection copies its pointer,
                     // not the pointee. Destructuring cannot make that shared storage private.
                     if !self.region_value_is_owned(&self.expr_ty(e)) {
-                        sc.ok = false;
+                        sc.decline("a `let` copies a value that holds an indirection");
                     }
                 }
                 if let Some(ann) = ty {
@@ -15124,7 +15277,7 @@ impl FnLowerer<'_> {
                             | ast::TypeKind::Pointer { .. }
                             | ast::TypeKind::Ref { .. }
                     ) {
-                        sc.ok = false;
+                        sc.decline("a `let` annotated as a slice, pointer or reference");
                     }
                 }
                 if sc.ok {
@@ -15157,18 +15310,18 @@ impl FnLowerer<'_> {
             }
             StmtKind::Expr(e) => self.scan_region_expr(e, sc),
             // `return` exits all remaining iterations; `defer` sequencing is not modeled.
-            StmtKind::Return(_) | StmtKind::Defer(_) => sc.ok = false,
+            StmtKind::Return(_) | StmtKind::Defer(_) => sc.decline("a `return` or `defer`"),
             // An unlabeled break/continue inside an inner loop is that loop's own control flow; one
             // at region depth would cut short *other* iterations (serial semantics) — decline.
             // Labels are not matched structurally, so any labeled form declines.
             StmtKind::Break(label, val) => {
                 if label.is_some() || val.is_some() || sc.depth == 0 {
-                    sc.ok = false;
+                    sc.decline("a `break` out of the region loop, labelled, or with a value");
                 }
             }
             StmtKind::Continue(label) => {
                 if label.is_some() || sc.depth == 0 {
-                    sc.ok = false;
+                    sc.decline("a `continue` of the region loop, or labelled");
                 }
             }
             StmtKind::While { cond, body, .. } => {
@@ -15216,7 +15369,7 @@ impl FnLowerer<'_> {
                     // lowering. Treating the element name as a private body-local would hide
                     // writes to a shared capture (`for row in rows { row[0] = h; }`). Until the
                     // scan models those aliases, only range iterators establish private locals.
-                    ForIter::Expr(_) => sc.ok = false,
+                    ForIter::Expr(_) => sc.decline("a for-each loop over a collection"),
                 }
                 if !sc.ok {
                     return;
@@ -15230,7 +15383,7 @@ impl FnLowerer<'_> {
                     }
                     ast::PatKind::Wildcard => false,
                     _ => {
-                        sc.ok = false;
+                        sc.decline("an inner loop pattern that is not a name");
                         false
                     }
                 };
@@ -15266,12 +15419,14 @@ impl FnLowerer<'_> {
                     // nondeterministic run to run, and never the interpreter's answer). Assigning a
                     // modeled name declines the whole region; the loop then lowers serially.
                     if sc.derived.contains_key(&sym) || sc.env.iter().any(|(v, _)| *v == sym) {
-                        sc.ok = false;
+                        sc.decline("an assignment to a local the proof models");
                         return;
                     }
                     return;
                 }
-                sc.ok = false;
+                sc.decline(
+                    "an assignment to a captured scalar, the loop variable or a whole buffer",
+                );
             }
             ExprKind::Index { base, indices } => {
                 for ix in indices {
@@ -15281,28 +15436,57 @@ impl FnLowerer<'_> {
                     return;
                 }
                 let Some(bsym) = single_path(base) else {
-                    sc.ok = false;
+                    sc.decline("a write through a computed base");
                     return;
                 };
                 if sc.is_local(bsym) {
                     // A local slice/pointer can be extracted from an aggregate. Its slot is
                     // private, but indexing follows a pointee that may still be shared.
-                    sc.ok = matches!(self.expr_ty(base), Ty::Array { .. })
-                        && self.region_value_is_owned(&self.expr_ty(base));
+                    if !(matches!(self.expr_ty(base), Ty::Array { .. })
+                        && self.region_value_is_owned(&self.expr_ty(base)))
+                    {
+                        sc.decline("a write through a body-local that views shared storage");
+                    }
                     return;
                 }
-                if !self.region_capture(bsym, sc)
-                    || !matches!(self.expr_ty(base), Ty::Array { .. })
-                    || !self.region_value_is_owned(&self.expr_ty(base))
-                    || indices.len() != 1
-                {
-                    sc.ok = false;
+                if indices.len() != 1 {
+                    sc.decline("a multi-index write to a captured buffer");
                     return;
                 }
-                sc.record(bsym, Some(&indices[0]), true);
+                if !self.region_index_capture(bsym, base, sc) {
+                    return;
+                }
+                sc.record(bsym, Some(&indices[0]), None, true);
             }
-            _ => sc.ok = false,
+            _ => sc.decline("a write to a place that is not a name or an element"),
         }
+    }
+
+    /// May the captured name `bsym` (spelled by `base`) be indexed element by element inside a
+    /// region? An owned fixed-size array, or a slice of scalars — whose fat pointer no region
+    /// statement can re-point, so every iteration indexes the same `(data, len)` — and whose
+    /// storage [`FnLowerer::region_capture`] can identify. Declines (with the reason) otherwise.
+    fn region_index_capture(&self, bsym: Symbol, base: &Expr, sc: &mut RegionScan<'_>) -> bool {
+        let ty = self.expr_ty(base);
+        let indexable = match &ty {
+            Ty::Array { .. } => self.region_value_is_owned(&ty),
+            Ty::Slice(elem) => matches!(elem.as_ref(), Ty::Scalar(_)),
+            _ => false,
+        };
+        if !indexable {
+            sc.decline(if matches!(ty, Ty::Slice(_)) {
+                "an indexed slice of non-scalar elements"
+            } else {
+                "an indexed capture that is not an owned array or a scalar slice"
+            });
+            return false;
+        }
+        sc.note_ty(bsym, ty);
+        if !self.region_capture(bsym, sc) {
+            sc.decline("a captured buffer whose storage cannot be identified");
+            return false;
+        }
+        true
     }
 
     /// `atomic_add(place, value)` in a region body. The value and the place's index are ordinary
@@ -15314,7 +15498,7 @@ impl FnLowerer<'_> {
     fn scan_region_atomic<'e>(&self, place: &'e Expr, value: &'e Expr, sc: &mut RegionScan<'e>) {
         self.scan_region_expr(value, sc);
         let ExprKind::Index { base, indices } = &place.kind else {
-            sc.ok = false;
+            sc.decline("an atomic add to a place that is not an element");
             return;
         };
         for ix in indices {
@@ -15324,21 +15508,22 @@ impl FnLowerer<'_> {
             return;
         }
         let Some(bsym) = single_path(base) else {
-            sc.ok = false;
+            sc.decline("an atomic add through a computed base");
             return;
         };
         let owned_array = matches!(self.expr_ty(base), Ty::Array { .. })
             && self.region_value_is_owned(&self.expr_ty(base));
         if bsym != sc.hh && sc.is_local(bsym) {
-            sc.ok = owned_array;
+            if !owned_array {
+                sc.decline("an atomic add through a body-local that views shared storage");
+            }
             return;
         }
-        if self.lookup(bsym).is_none()
-            || !self.region_capture(bsym, sc)
-            || !owned_array
-            || indices.len() != 1
-        {
-            sc.ok = false;
+        if self.lookup(bsym).is_none() || indices.len() != 1 {
+            sc.decline("an atomic add to a place that is not one element of a captured buffer");
+            return;
+        }
+        if !self.region_index_capture(bsym, base, sc) {
             return;
         }
         if !sc.atomic.contains(&bsym) {
@@ -15366,25 +15551,28 @@ impl FnLowerer<'_> {
                     if self.lookup(p.first().sym).is_some()
                         && !self.region_value_is_owned(&self.expr_ty(e))
                     {
-                        sc.ok = false;
+                        sc.decline("a slice, pointer or reference value used whole");
                         return;
                     }
-                    self.scan_region_read_path(p.first().sym, sc);
+                    self.scan_region_read_path(p.first().sym, self.expr_ty(e), sc);
                 }
                 // A multi-segment path (enum variant, namespaced const) is a compile-time value.
             }
             ExprKind::Unary { op, expr } => match op {
-                ast::UnOp::Deref | ast::UnOp::Ref | ast::UnOp::RefMut => sc.ok = false,
+                ast::UnOp::Deref | ast::UnOp::Ref | ast::UnOp::RefMut => {
+                    sc.decline("a dereference or a borrow")
+                }
                 _ => self.scan_region_expr(expr, sc),
             },
             ExprKind::Binary { lhs, rhs, .. } => {
                 self.scan_region_expr(lhs, sc);
                 self.scan_region_expr(rhs, sc);
             }
-            // Only pure scalar math intrinsics: a user call could write captured buffers, and
-            // `print`/`assert` have cross-iteration-ordered side effects. A named kernel builtin
-            // shares its name with a scalar intrinsic (`gelu(x, out)` vs `gelu(x)`) but writes a
-            // whole buffer, so it is never pure here.
+            // Only pure scalar math intrinsics, kernel builtins and `atomic_add`: a user call could
+            // write captured buffers, and `print`/`assert` have cross-iteration-ordered side
+            // effects. A named kernel builtin shares its name with a scalar intrinsic (`gelu(x,
+            // out)` vs `gelu(x)`) but writes a whole buffer, so it is never pure: it is admitted
+            // only as the reads and writes of its operands (`scan_region_builtin`).
             ExprKind::Call { callee, args, .. } => {
                 // `atomic_add(arr[i], v)`: the one impure call a region admits (see
                 // `scan_region_atomic`). A user function or local of that name is an ordinary
@@ -15402,6 +15590,18 @@ impl FnLowerer<'_> {
                         return;
                     }
                 }
+                // A kernel builtin (`softmax(x, out)`, `matmul(a, b, c)`, `sum(x)`, …): sema's shape
+                // record pins every operand's extent, so the call is exactly its operands' reads
+                // and the output's writes (`par_region`).
+                if let Some(call) = self.sema.builtin_calls.get(&e.id) {
+                    self.scan_region_builtin(call, args, sc);
+                    return;
+                }
+                // `s.len()` of a captured slice: a read of its fat pointer, which no region
+                // statement writes.
+                if self.region_slice_len(callee, args, sc) {
+                    return;
+                }
                 // The RNG scalars (`rand_f32(seed, i)`, …) are pure too: counter-based, no state.
                 let pure_math = !self.sema.builtin_calls.contains_key(&e.id)
                     && single_path(callee)
@@ -15412,7 +15612,9 @@ impl FnLowerer<'_> {
                         })
                         .unwrap_or(false);
                 if !pure_math {
-                    sc.ok = false;
+                    sc.decline(
+                        "a call that is not a pure intrinsic, a kernel builtin or `atomic_add`",
+                    );
                     return;
                 }
                 for a in args {
@@ -15427,23 +15629,22 @@ impl FnLowerer<'_> {
                     return;
                 }
                 let Some(bsym) = single_path(base) else {
-                    sc.ok = false;
+                    sc.decline("an index of a computed base");
                     return;
                 };
                 if bsym == sc.hh || sc.is_local(bsym) {
-                    sc.ok = matches!(self.expr_ty(base), Ty::Array { .. })
-                        && self.region_value_is_owned(&self.expr_ty(base));
+                    if !(matches!(self.expr_ty(base), Ty::Array { .. })
+                        && self.region_value_is_owned(&self.expr_ty(base)))
+                    {
+                        sc.decline("an index of a body-local that views shared storage");
+                    }
                     return;
                 }
                 if self.lookup(bsym).is_none() {
-                    sc.ok = false; // indexing something that is not a runtime binding
+                    sc.decline("an index of something that is not a runtime binding");
                     return;
                 }
-                if !self.region_capture(bsym, sc)
-                    || !matches!(self.expr_ty(base), Ty::Array { .. })
-                    || !self.region_value_is_owned(&self.expr_ty(base))
-                {
-                    sc.ok = false;
+                if !self.region_index_capture(bsym, base, sc) {
                     return;
                 }
                 let idx = if indices.len() == 1 {
@@ -15451,7 +15652,7 @@ impl FnLowerer<'_> {
                 } else {
                     None // multi-index read: opaque (fine unless the array is written)
                 };
-                sc.record(bsym, idx, false);
+                sc.record(bsym, idx, None, false);
             }
             ExprKind::Field { base, .. } | ExprKind::TupleField { base, .. } => {
                 self.scan_region_expr(base, sc);
@@ -15488,26 +15689,29 @@ impl FnLowerer<'_> {
             }
             // `match` arms bind patterns and `loop` carries break values — not modeled; decline.
             // The catch-all keeps any future expression kind conservative by default.
-            _ => sc.ok = false,
+            _ => sc.decline("a `match`, `loop` or other unmodeled expression"),
         }
     }
 
     /// A bare read of a name: region var and body-locals are free; a name that is not a runtime
     /// binding (top-level const, enum variant, intrinsic) inlines at lowering; anything else is a
     /// capture — a whole-array read records an opaque access (fatal only if that array is written).
-    fn scan_region_read_path(&self, sym: Symbol, sc: &mut RegionScan<'_>) {
+    fn scan_region_read_path(&self, sym: Symbol, ty: Ty, sc: &mut RegionScan<'_>) {
         if sym == sc.hh || sc.is_local(sym) {
             return;
         }
         let Some((_, mty)) = self.lookup(sym) else {
             return;
         };
+        if matches!(ty, Ty::Array { .. }) {
+            sc.note_ty(sym, ty);
+        }
         if !self.region_capture(sym, sc) {
-            sc.ok = false;
+            sc.decline("a captured name whose storage cannot be identified");
             return;
         }
         if matches!(mty, MirType::Array(..)) {
-            sc.record(sym, None, false);
+            sc.record(sym, None, None, false);
         }
     }
 
@@ -15570,6 +15774,12 @@ impl FnLowerer<'_> {
     /// direct scalar-element array parameter. Derived pointers (match payloads, aggregate foreach
     /// bindings, merge values) decline. Aggregate parameters decline too: `f(rows, rows[0])` can
     /// overlap differently typed buffers, which the element-index proof cannot compare.
+    ///
+    /// A `[]T` slice of scalars — parameter or local — is a capture too: its binding is the
+    /// fat-pointer buffer `slice_slots` records (the sema type, never the slot's MIR shape, says
+    /// it is a slice), and where its data lies is a run-time fact `region_relation` settles. A
+    /// slice-typed name whose binding is NOT recorded as a slice declines: treating its 16-byte
+    /// slot as a "fresh alloca" would call its pointee private storage.
     fn region_capture(&self, sym: Symbol, sc: &mut RegionScan<'_>) -> bool {
         if sc.captures.contains(&sym) {
             return true;
@@ -15577,6 +15787,17 @@ impl FnLowerer<'_> {
         let Some((base, mty)) = self.lookup(sym) else {
             return false;
         };
+        let sema_ty = self.buffer_param_ty(sym).or_else(|| sc.cap_tys.get(&sym));
+        let slice_ty = matches!(sema_ty, Some(Ty::Slice(_)));
+        if slice_ty || self.slice_slots.contains(&base) {
+            let scalar_slice =
+                matches!(sema_ty, Some(Ty::Slice(elem)) if matches!(elem.as_ref(), Ty::Scalar(_)));
+            if scalar_slice && self.slice_slots.contains(&base) {
+                sc.captures.push(sym);
+                return true;
+            }
+            return false;
+        }
         let supported_array = if matches!(mty, MirType::Array(..)) {
             match self.buffer_param_ty(sym) {
                 Some(Ty::Array { elem, .. }) => matches!(elem.as_ref(), Ty::Scalar(_)),
@@ -15603,7 +15824,7 @@ impl FnLowerer<'_> {
     /// so those decline the region.
     fn region_bind(&self, sym: Symbol, sc: &mut RegionScan<'_>) {
         if sym == sc.hh || sc.env.iter().any(|(v, _)| *v == sym) {
-            sc.ok = false;
+            sc.decline("a binding that shadows the region or an inner loop variable");
             return;
         }
         // Rebinding a name sheds any digit-derived model the OLD binding had — the name now means
@@ -15622,7 +15843,7 @@ impl FnLowerer<'_> {
                     self.bind_region_pat(p, sc);
                 }
             }
-            _ => sc.ok = false,
+            _ => sc.decline("a `let` pattern that is not a name or a tuple"),
         }
     }
 
@@ -15637,13 +15858,20 @@ impl FnLowerer<'_> {
     /// that reason. A captured `[]T` slice must
     /// have its `slice_slots` record carried across the env into the outlined body's re-bind, or
     /// `kernel_base_ptr` in there would mistake the fat-pointer buffer for the data.
+    ///
+    /// A run-time trip count is `end`, evaluated once here (`region_verdict` proved it pure); with
+    /// a grain it reaches the outlined body through one more env slot, as in [`lower_parallel`].
+    /// When the plan carries run-time guards, the call is versioned: the threaded call runs only
+    /// when every guarded pair is apart (`par_region::emit_region_guard`), and otherwise the SAME
+    /// outlined body is called directly over every chunk, on this thread and in order — exactly
+    /// what the interpreter does for `wukong_parallel_for`, so both arms are the serial loop there.
     fn emit_parallel_region(
         &mut self,
         hh: Symbol,
-        n: i64,
-        ity: &MirType,
-        body: &Block,
-        captures: &[Symbol],
+        trip: par_region::RegionTrip,
+        (ity, signed): (&MirType, bool),
+        (end, body): (&Expr, &Block),
+        plan: &par_region::RegionPlan,
     ) -> bool {
         // Reserve an outlined-body symbol from the pool. Pool exhausted -> stay serial in THIS
         // attempt and flag it; `lower_program_with` then redoes the lowering with a larger pool.
@@ -15665,7 +15893,8 @@ impl FnLowerer<'_> {
         // A captured `[]T` slice puts the address of *its fat-pointer buffer* in the env (the bound
         // value of a slice is that buffer), so the re-bind inside the outlined body must carry the
         // slice record forward or `kernel_base_ptr` would take the buffer for the data itself.
-        let caps: Vec<(Symbol, ValueId, MirType, bool)> = captures
+        let caps: Vec<(Symbol, ValueId, MirType, bool)> = plan
+            .captures
             .iter()
             .map(|s| {
                 let (v, t) = self.lookup(*s).expect("region capture must be in scope");
@@ -15673,6 +15902,16 @@ impl FnLowerer<'_> {
                 (*s, v, t, is_slice)
             })
             .collect();
+        // The run-time trip count, evaluated once in the counter's type and widened to the
+        // runtime's i64 (a signed counter: `region_verdict`).
+        let runtime_n = match trip {
+            par_region::RegionTrip::Const(_) => None,
+            par_region::RegionTrip::Runtime => {
+                let v = self.lower_range_bound(end, ity, signed);
+                Some(self.coerce_to(v, ity, &MirType::I64, signed))
+            }
+        };
+        let ncap = caps.len();
 
         // ---- outlined body: par_sym(start: i64, end: i64, env: ptr), at the grain `par_grain`
         // settles on (the user's, else the implicit grain when enabled, else 1) ----
@@ -15680,7 +15919,6 @@ impl FnLowerer<'_> {
         // The outlined function is declared by the loop it was cut from.
         let region_loc = self.builder.current_loc();
         let build_outlined = |grain: u64, diags: &mut Vec<Diagnostic>| -> Function {
-            let chunks = par_grain::const_chunks(n, grain);
             let mut fl = FnLowerer {
                 builder: Builder::new(par_sym, MirType::Void),
                 preserve_aggregate_blocks: false,
@@ -15735,14 +15973,37 @@ impl FnLowerer<'_> {
                 let base = fl.builder.build(MirType::Ptr, Op::Load(slot, MirType::Ptr));
                 fl.bind_slice(*sym, base, mty.clone(), *is_slice);
             }
-            // Grain > 1: map the runtime's chunk span back to iterations of the literal trip count.
+            // Grain > 1: map the runtime's chunk span back to iterations of the trip count — the
+            // constant, or the run-time count the call site published behind `env[ncap]`.
             let (start, end) = if grain > 1 {
-                let nc = fl
-                    .builder
-                    .build(MirType::I64, Op::ConstInt(n as i128, MirType::I64));
-                let cc = fl
-                    .builder
-                    .build(MirType::I64, Op::ConstInt(chunks as i128, MirType::I64));
+                let (nc, cc) = match trip {
+                    par_region::RegionTrip::Const(n) => {
+                        let chunks = par_grain::const_chunks(n, grain);
+                        let nc = fl
+                            .builder
+                            .build(MirType::I64, Op::ConstInt(n as i128, MirType::I64));
+                        let cc = fl
+                            .builder
+                            .build(MirType::I64, Op::ConstInt(chunks as i128, MirType::I64));
+                        (nc, cc)
+                    }
+                    par_region::RegionTrip::Runtime => {
+                        let kidx = fl
+                            .builder
+                            .build(MirType::I64, Op::ConstInt(ncap as i128, MirType::I64));
+                        let slot = fl.builder.build(
+                            MirType::Ptr,
+                            Op::Gep {
+                                ptr: envp,
+                                index: kidx,
+                                elem: MirType::Ptr,
+                            },
+                        );
+                        let np = fl.builder.build(MirType::Ptr, Op::Load(slot, MirType::Ptr));
+                        let nc = fl.builder.build(MirType::I64, Op::Load(np, MirType::I64));
+                        (nc, par_grain::emit_chunks(&mut fl.builder, nc, grain))
+                    }
+                };
                 par_grain::emit_iteration_bounds(&mut fl.builder, start, end, nc, cc, grain)
             } else {
                 (start, end)
@@ -15755,11 +16016,10 @@ impl FnLowerer<'_> {
         };
         let (outlined, grain) =
             par_grain::outline_with_grain(user_grain, implicit, &mut tmp_diags, build_outlined);
-        // The call passes ceil(n / G) chunk indices (see `par_grain`).
-        let chunks = par_grain::const_chunks(n, grain);
 
         // ---- call site: env pack + wukong_parallel_for(N, &body, env) ----
-        let k = caps.len().max(1) as u32;
+        let publish_n = runtime_n.is_some() && grain > 1;
+        let k = (ncap + usize::from(publish_n)).max(1) as u32;
         let env = self
             .builder
             .alloca(MirType::Array(Box::new(MirType::Ptr), k));
@@ -15780,14 +16040,72 @@ impl FnLowerer<'_> {
                 value: *vid,
             });
         }
-        let nv = self
-            .builder
-            .build(MirType::I64, Op::ConstInt(chunks as i128, MirType::I64));
+        // The call passes ceil(n / G) chunk indices (see `par_grain`).
+        let nv = match (trip, runtime_n) {
+            (par_region::RegionTrip::Runtime, Some(n)) if grain > 1 => {
+                // Publish the trip count to the body through `env[ncap]`.
+                let nslot = self.builder.alloca(MirType::I64);
+                self.builder.build_void(Op::Store {
+                    ptr: nslot,
+                    value: n,
+                });
+                let kidx = self
+                    .builder
+                    .build(MirType::I64, Op::ConstInt(ncap as i128, MirType::I64));
+                let slot = self.builder.build(
+                    MirType::Ptr,
+                    Op::Gep {
+                        ptr: env,
+                        index: kidx,
+                        elem: MirType::Ptr,
+                    },
+                );
+                self.builder.build_void(Op::Store {
+                    ptr: slot,
+                    value: nslot,
+                });
+                par_grain::emit_chunks(&mut self.builder, n, grain)
+            }
+            (_, Some(n)) => n,
+            (par_region::RegionTrip::Const(n), None) => {
+                let chunks = par_grain::const_chunks(n, grain);
+                self.builder
+                    .build(MirType::I64, Op::ConstInt(chunks as i128, MirType::I64))
+            }
+            (par_region::RegionTrip::Runtime, None) => unreachable!("evaluated above"),
+        };
         let addr = self.builder.build(MirType::Ptr, Op::FuncAddr(par_sym));
-        self.builder.build_void(Op::Call {
-            func: pfor,
-            args: vec![nv, addr, env],
-        });
+        if plan.guards.is_empty() {
+            self.builder.build_void(Op::Call {
+                func: pfor,
+                args: vec![nv, addr, env],
+            });
+        } else {
+            let apart = self.emit_region_guard(plan);
+            let threaded = self.builder.new_block();
+            let serial = self.builder.new_block();
+            let join = self.builder.new_block();
+            self.builder
+                .cond_br(apart, threaded, vec![], serial, vec![]);
+            self.builder.switch_to(threaded);
+            self.builder.build_void(Op::Call {
+                func: pfor,
+                args: vec![nv, addr, env],
+            });
+            self.builder.br(join, vec![]);
+            // May overlap: every chunk, in order, on this thread — the serial loop.
+            self.builder.switch_to(serial);
+            let zero = self
+                .builder
+                .build(MirType::I64, Op::ConstInt(0, MirType::I64));
+            self.builder.build_void(Op::Call {
+                func: par_sym,
+                args: vec![zero, nv, env],
+            });
+            self.builder.br(join, vec![]);
+            self.builder.switch_to(join);
+            self.terminated = false;
+        }
 
         self.diags.extend(tmp_diags);
         self.par
@@ -26584,6 +26902,10 @@ fn match_row_col(idx: &Expr, row: Symbol, interner: &Interner) -> Option<(Dim, S
 struct RegionAccess<'a> {
     /// The flat index expression; `None` for an opaque access (whole-array read, multi-index).
     idx: Option<&'a Expr>,
+    /// For a RANGE access -- a kernel builtin's `base[idx..hi]` operand, which the kernel reads or
+    /// writes element by element -- the exclusive end; `None` for a single element `base[idx]`.
+    /// The proof needs `hi - idx` to be a positive constant (`par_region::region_span`).
+    hi: Option<&'a Expr>,
     /// Snapshot of the *inner* `for` variables in scope at the access site (innermost last), each
     /// with its literal `[lo, hi)` range when the bounds are literals (`None` = outer-terms-only).
     env: Vec<(Symbol, Option<(i128, i128)>)>,
@@ -26614,7 +26936,13 @@ struct RegionScan<'a> {
     derived: HashMap<Symbol, RegionDigits>,
     /// Loop-nesting depth *inside* the region body (break/continue legality).
     depth: usize,
+    /// The sema type of each captured buffer, as an access spelled it -- the only source of a
+    /// captured LOCAL's type (a parameter's comes from `param_arrays`). Read by the storage-class
+    /// relation between captures (`par_region`).
+    cap_tys: HashMap<Symbol, Ty>,
     ok: bool,
+    /// The first reason the scan declined (see [`RegionScan::decline`]); empty while `ok`.
+    why: &'static str,
 }
 
 impl<'a> RegionScan<'a> {
@@ -26622,12 +26950,29 @@ impl<'a> RegionScan<'a> {
         self.locals.iter().any(|s| s.contains(&sym))
     }
 
-    fn record(&mut self, sym: Symbol, idx: Option<&'a Expr>, write: bool) {
+    /// Refuse the region, keeping the FIRST reason: the decline census
+    /// (`par_region_tests::corpus_region_declines`) and the negative unit tests read it, so a test
+    /// can tell "declined because the proof failed" from "declined because the construct is not
+    /// modeled at all".
+    fn decline(&mut self, why: &'static str) {
+        if self.ok {
+            self.ok = false;
+            self.why = why;
+        }
+    }
+
+    /// Remember the sema type an access gave a captured buffer.
+    fn note_ty(&mut self, sym: Symbol, ty: Ty) {
+        self.cap_tys.entry(sym).or_insert(ty);
+    }
+
+    fn record(&mut self, sym: Symbol, idx: Option<&'a Expr>, hi: Option<&'a Expr>, write: bool) {
         if write && !self.written.contains(&sym) {
             self.written.push(sym);
         }
         self.accesses.entry(sym).or_default().push(RegionAccess {
             idx,
+            hi,
             env: self.env.clone(),
             derived: self.derived.clone(),
         });
@@ -26749,6 +27094,9 @@ enum RegionSig {
 enum RegionRest {
     Lit(i128),
     Var(Symbol, i128),
+    /// The offset within a range access of constant length `L` (`base[lo..lo + L]`): every value
+    /// in `[0, L)` at stride 1 -- exactly an inner `for` variable over a literal `0..L`.
+    Span(i128),
 }
 
 /// Decompose one flat index of a written captured array into its region-var [`RegionSig`] and the
@@ -26841,23 +27189,26 @@ fn region_merge_digit(
 
 /// Bound the non-digit terms of one region access. Each term is either **outer** — stride ≡ 0 mod
 /// `m` (the full modulus), erased for ANY integer factor value — or **bounded**: a non-negative
-/// literal, or an inner `for` var with a literal `[lo, hi)` range at the access site (max reach
-/// `s·(hi-1)`). Returns `(total, low)`: the summed maxima of all bounded terms, and of the subset
-/// whose stride is NOT a multiple of `sm` (the sub-digit modulus — those live inside the low
-/// digit's slot; `sm = None` for the single-digit form, where the split is unused). `None` when
-/// any term is unbounded, negative, or overflows.
+/// literal, an inner `for` var with a literal `[lo, hi)` range at the access site (max reach
+/// `s·(hi-1)`), or a range access's span (max reach `L-1`). Returns `(total, low)`: the summed
+/// maxima of all bounded terms, and of the subset whose stride is NOT a multiple of `sm` (the
+/// sub-digit modulus — those live inside the low digit's slot; `sm = None` for the single-digit
+/// form, where the split is unused). `m = None` — a trip count known only at run time, so no
+/// modulus exists — makes every term bounded: nothing is erased. `None` when any term is
+/// unbounded, negative, or overflows.
 fn region_extent(
     rest: &[RegionRest],
     a: &RegionAccess<'_>,
-    m: i128,
+    m: Option<i128>,
     sm: Option<i128>,
 ) -> Option<(i128, i128)> {
+    let outer = |k: i128| m.is_some_and(|m| k.rem_euclid(m) == 0);
     let mut total: i128 = 0;
     let mut low: i128 = 0;
     for term in rest {
         let (stride, mx) = match *term {
             RegionRest::Lit(k) => {
-                if k.rem_euclid(m) == 0 {
+                if outer(k) {
                     continue; // outer constant
                 }
                 if k < 0 {
@@ -26865,8 +27216,14 @@ fn region_extent(
                 }
                 (k, k)
             }
+            RegionRest::Span(len) => {
+                if len < 1 {
+                    return None;
+                }
+                (1, len - 1)
+            }
             RegionRest::Var(v, s) => {
-                if s.rem_euclid(m) == 0 {
+                if outer(s) {
                     continue; // outer: (v*s) mod m == 0 for any integer v
                 }
                 if s < 1 {
@@ -26892,6 +27249,46 @@ fn region_extent(
         }
     }
     Some((total, low))
+}
+
+/// The `[min, max]` reach of the non-outer terms of one access in the single-digit form: each term
+/// outer (stride ≡ 0 mod `m`, erased; `m = None` erases nothing) or bounded — a literal (of either
+/// sign), an inner `for` var with a literal range at the access site (stride ≥ 1), or a range
+/// access's span. `None` when a term is unbounded or the sum overflows.
+fn region_reach(
+    rest: &[RegionRest],
+    a: &RegionAccess<'_>,
+    m: Option<i128>,
+) -> Option<(i128, i128)> {
+    let outer = |k: i128| m.is_some_and(|m| k.rem_euclid(m) == 0);
+    let (mut lo, mut hi) = (0i128, 0i128);
+    for term in rest {
+        let (tlo, thi) = match *term {
+            RegionRest::Lit(k) if outer(k) => continue,
+            RegionRest::Lit(k) => (k, k),
+            RegionRest::Span(len) if len >= 1 => (0, len - 1),
+            RegionRest::Span(_) => return None,
+            RegionRest::Var(_, s) if outer(s) => continue,
+            RegionRest::Var(v, s) => {
+                if s < 1 {
+                    return None;
+                }
+                let (vlo, vhi) = a
+                    .env
+                    .iter()
+                    .rev()
+                    .find(|(sym, _)| *sym == v)
+                    .and_then(|(_, r)| *r)?;
+                if vlo < 0 || vhi <= vlo {
+                    return None;
+                }
+                (s.checked_mul(vlo)?, s.checked_mul(vhi - 1)?)
+            }
+        };
+        lo = lo.checked_add(tlo)?;
+        hi = hi.checked_add(thi)?;
+    }
+    Some((lo, hi))
 }
 
 /// [`flatten_add_terms`] extended to **distribute literal multiplication over `+`**:
@@ -34389,8 +34786,9 @@ fn mm(a: [f32; 16], b: [f32; 16], mut c: [f32; 16]) {
     fn parallel_region_declines_cross_iteration_dep() {
         // `out[(h+1)*2 + …]` writes what iteration h+1 reads — a genuine loop-carried chain. The
         // write index distributes to `h*2 + 2 + …`: the +2 offset is not a multiple of C·N = 6,
-        // so it counts toward the in-slot extent, which reaches C = 2 — the mixed-radix bound
-        // rejects it and the loop stays serial. (Spelled without an inner `for j` loop: for a
+        // so it puts the write in band 1 (`[2, 4)` past `h*2`) while the read `out[h*2 + …]` is in
+        // band 0 — two bands for one buffer, which the mixed-radix proof rejects, so the loop
+        // stays serial. (Spelled without an inner `for j` loop: for a
         // FIXED h the two element updates are mutually disjoint, so a j-loop would itself be a
         // legal — if useless — 2-trip region, masking what this test pins.)
         let src = "module m

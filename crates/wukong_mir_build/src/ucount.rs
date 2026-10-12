@@ -185,7 +185,7 @@ impl FnLowerer<'_> {
     /// May `end` be evaluated twice — once for the range test, once by the fallback loop — with the
     /// same value and no effect? [`is_pure_loop_bound`]'s whitelist, plus a slice's `.len()`, the
     /// one call that is a plain field read of the fat pointer.
-    fn is_reevaluable_bound(&self, end: &Expr) -> bool {
+    pub(crate) fn is_reevaluable_bound(&self, end: &Expr) -> bool {
         if is_pure_loop_bound(end) {
             return true;
         }
