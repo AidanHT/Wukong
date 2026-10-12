@@ -57,7 +57,7 @@
 //! it — or leaves the loop, and leaving is only possible at the header. An inner loop could spin
 //! forever before reaching the load, so a loop with one is refused.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::alias::{type_bytes, AliasInfo, Prov};
 use crate::effects::CallEffects;
@@ -169,14 +169,14 @@ pub(crate) struct LoopMem {
     /// may itself be hoisted (see the `effects` module). `None` treats every call as a writer —
     /// what `promote` passes, because a summarized callee may still *read* the location it keeps
     /// in a register, and the pending register value is invisible to that read.
-    effects: Option<Rc<CallEffects>>,
+    effects: Option<Arc<CallEffects>>,
 }
 
 impl LoopMem {
     pub(crate) fn of(
         f: &Function,
         body: &FxHashSet<u32>,
-        effects: Option<Rc<CallEffects>>,
+        effects: Option<Arc<CallEffects>>,
     ) -> LoopMem {
         let mut mem = LoopMem {
             stores: Vec::new(),

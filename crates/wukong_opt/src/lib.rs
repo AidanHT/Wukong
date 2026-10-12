@@ -129,7 +129,7 @@ pub use switch_form::{form_switches, FormSwitches};
 pub use tre::Tre;
 pub use unswitch::LoopUnswitch;
 
-use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use effects::{CallEffects, CallGraph};
@@ -357,13 +357,13 @@ impl PassManager {
         if funcs.is_empty() || self.passes.is_empty() {
             return Ok(());
         }
-        let effects = Rc::new(CallEffects::of(program));
+        let effects = Arc::new(CallEffects::of(program));
         for &i in funcs {
             self.run_function_checked(
                 &mut program.funcs[i],
                 None,
                 verify_each,
-                Some(Rc::clone(&effects)),
+                Some(Arc::clone(&effects)),
             )?;
         }
         Ok(())
@@ -382,7 +382,7 @@ impl PassManager {
         if self.passes.is_empty() {
             return Ok(());
         }
-        let mut effects = Rc::new(CallEffects::default());
+        let mut effects = Arc::new(CallEffects::default());
         let graph = CallGraph::of(program);
         for (scc, members) in graph.sccs.iter().enumerate() {
             for &i in members {
@@ -390,12 +390,12 @@ impl PassManager {
                     &mut program.funcs[i as usize],
                     timings.as_deref_mut(),
                     verify_each,
-                    Some(Rc::clone(&effects)),
+                    Some(Arc::clone(&effects)),
                 )?;
             }
             // Every function's cache (and its handle on the table) is gone by now, so this updates
             // the table in place.
-            graph.summarize(program, scc, Rc::make_mut(&mut effects));
+            graph.summarize(program, scc, Arc::make_mut(&mut effects));
         }
         Ok(())
     }
@@ -408,7 +408,7 @@ impl PassManager {
         f: &mut wukong_mir::Function,
         mut timings: Option<&mut Timings>,
         verify_each: bool,
-        effects: Option<Rc<CallEffects>>,
+        effects: Option<Arc<CallEffects>>,
     ) -> Result<(), VerificationFailure> {
         // One analysis cache per function, shared across every pass and every fixpoint iteration.
         // It is invalidated by the passes that restructure the CFG (see their `run_function`), so it

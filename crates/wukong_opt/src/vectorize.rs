@@ -124,7 +124,7 @@
 //! reports a change, and `pick` re-walks *every* loop of the function on each of those iterations —
 //! so a loop that is declined is re-declined, with the identical message, once per fixpoint
 //! iteration after the one that widened something. A `WIDEN` line appears once (the header goes
-//! into [`Vectorize::done`]); a `declined` line appears as many times as the fixpoint ran.
+//! into the function's [`DoneSets`]); a `declined` line appears as many times as the fixpoint ran.
 //!
 //! Measured on this tree, the two `wukong_xbench` general programs at their default dimensions:
 //!
@@ -178,9 +178,11 @@ use crate::{each_op_use, CfgAnalyses, Pass};
 /// * [`is_someones_epilogue`] — structural. The epilogue's only preheader is the exit block of a
 ///   loop that holds vector values, an arrangement nothing else in the pipeline builds. This
 ///   survives block renumbering and needs no state.
-/// * [`Vectorize::done`] — a record of the header blocks already widened in the function being
-///   optimized, reset whenever the pass is handed a different function. A stale entry after
-///   `cfg::prune_unreachable` renumbers blocks can only *skip* a loop, never widen one twice.
+/// * [`DoneSets`] — a record of the header blocks already widened in the function being
+///   optimized, kept in that function's [`CfgAnalyses`] (so it lives exactly as long as the
+///   function's fixpoint, and the pass itself holds no state a thread could share) and reset if a
+///   cache is ever handed a different function. A stale entry after `cfg::prune_unreachable`
+///   renumbers blocks can only *skip* a loop, never widen one twice.
 ///
 /// A loop handed to a 256-bit kernel ([`vec256`]) is not widened in place: the original loop stays
 /// behind as the kernel's remainder, and the 128-bit path is still allowed to widen *that*. The
@@ -188,17 +190,15 @@ use crate::{each_op_use, CfgAnalyses, Pass};
 /// resumes at the kernel's count) and a second header record — plus a cap on the kernels one
 /// function may receive.
 pub struct Vectorize {
-    /// `(function, headers already widened, headers already given a kernel)` for the function
-    /// currently being optimized.
-    done: std::cell::RefCell<Option<DoneSets>>,
     /// May a widened loop take the 256-bit raw-AVX2 recipe instead ([`vec256`])? The pipeline's
     /// switch ([`crate::OptimizeOptions::vec_kernels`]); the host gate and `WUKONG_P4_NO_256` are
     /// the other two conjuncts ([`Vectorize::kernels_enabled`]).
     kernels: bool,
 }
 
-/// [`Vectorize::done`]'s record for one function.
-struct DoneSets {
+/// The record [`Vectorize`] keeps for one function, in its [`CfgAnalyses`]: the function, the
+/// headers already widened, and the headers already given a kernel.
+pub(crate) struct DoneSets {
     func: wukong_span::Symbol,
     widened: FxHashSet<u32>,
     kernels: FxHashSet<u32>,
@@ -216,10 +216,7 @@ impl Vectorize {
     /// The pass, with the 256-bit kernel path on or off. Off leaves every loop on the 128-bit
     /// path, which computes the same values ([`vec256`]).
     pub fn new(kernels: bool) -> Vectorize {
-        Vectorize {
-            done: std::cell::RefCell::new(None),
-            kernels,
-        }
+        Vectorize { kernels }
     }
 
     /// The three conjuncts of the 256-bit path, read once per call: this pass's switch, the host
@@ -267,20 +264,21 @@ impl Pass for Vectorize {
             return false;
         }
         let kernels = self.kernels_enabled();
-        let mut slot = self.done.borrow_mut();
-        if slot.as_ref().is_none_or(|d| d.func != f.name) {
-            *slot = Some(DoneSets {
+        // Taken out of the cache for the duration (the loop below also asks the cache for
+        // dominators) and put back before returning.
+        let mut done = match cache.vectorized.take() {
+            Some(d) if d.func == f.name => d,
+            _ => DoneSets {
                 func: f.name,
                 widened: FxHashSet::default(),
                 kernels: FxHashSet::default(),
-            });
-        }
-        let done = slot.as_mut().expect("just set");
+            },
+        };
         let mut changed = false;
         for _ in 0..MAX_LOOPS_PER_CALL {
             let (idom, preds) = cache.idoms_and_preds(f);
             let mut forest = loop_info::structure_with(f, idom, preds);
-            match pick(f, &mut forest, done, kernels) {
+            match pick(f, &mut forest, &done, kernels) {
                 None => break,
                 Some(Picked::Widen(plan)) => {
                     done.widened.insert(plan.header.0);
@@ -296,6 +294,7 @@ impl Pass for Vectorize {
             cache.invalidate();
             changed = true;
         }
+        cache.vectorized = Some(done);
         changed
     }
 }
