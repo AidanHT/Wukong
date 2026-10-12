@@ -1703,7 +1703,7 @@ impl<'a, 'k> Interp<'a, 'k> {
         let mut stored_streams = read_streams.clone();
         let mut read_scalars = kernel_scratch(scalars, "veckernel scalars")?;
         read_scalars.resize(scalars, false);
-        for (index, op) in kern.ops.iter().enumerate() {
+        for op in &kern.ops {
             if let VecOp::Splat { scalar } = op {
                 *read_scalars
                     .get_mut(*scalar as usize)
@@ -1715,15 +1715,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                     .ok_or("veckernel store stream out of bounds")? = true;
             }
             if let VecOp::Load { stream } = op {
-                let reads = read_streams
-                    .get_mut(*stream as usize)
-                    .ok_or("veckernel load stream out of bounds")?;
-                // eval_lane forwards a preceding store of this stream; that load never
-                // consumes the original destination slot, which may be undefined.
-                if !kern.ops[..index].iter().any(|previous| {
-                    matches!(previous, VecOp::Store { stream: written, .. } if written == stream)
-                }) {
-                    *reads = true;
+                if *stream as usize >= streams {
+                    return Err("veckernel load stream out of bounds".into());
                 }
             }
         }
@@ -1733,6 +1726,30 @@ impl<'a, 'k> Interp<'a, 'k> {
         let mut stream_bases: Vec<usize> = kernel_scratch(streams, "veckernel ptrs")?;
         for &slot in ptr_slots {
             stream_bases.push(ptr(slot)?);
+        }
+        // Each stream's alias class: the first stream with the same base. Two streams may share a
+        // base, because the optimizer's runtime alias guard admits two slices that are one buffer
+        // when every access sits at one element (`wukong_opt::vectorize`'s `guard_allows_equal`).
+        // They then name one element per lane, and the evaluator forwards a store to a later load
+        // of any stream of its class (`VecKernel::eval_lane_aliased`), as the machine code does by
+        // re-reading memory.
+        let mut alias: Vec<u32> = kernel_scratch(streams, "veckernel streams")?;
+        for &b in &stream_bases {
+            let first = stream_bases.iter().position(|&c| c == b).unwrap_or(0);
+            alias.push(first as u32);
+        }
+        for (index, op) in kern.ops.iter().enumerate() {
+            if let VecOp::Load { stream } = op {
+                // The evaluator forwards a preceding store to this stream's class; that load never
+                // consumes the original slot, which may be undefined.
+                let class = alias[*stream as usize];
+                if !kern.ops[..index].iter().any(|previous| {
+                    matches!(previous, VecOp::Store { stream: written, .. }
+                        if alias[*written as usize] == class)
+                }) {
+                    read_streams[*stream as usize] = true;
+                }
+            }
         }
         let used_scalars = read_scalars
             .iter()
@@ -1797,12 +1814,15 @@ impl<'a, 'k> Interp<'a, 'k> {
             );
             Ok(r.write())
         } else {
-            // Elementwise: one `eval_lane` per element — snapshot this lane's stream inputs,
-            // run the recipe, write its stores back. Load-before-store within a lane keeps
+            // Elementwise: one `eval_lane_aliased` per element — snapshot this lane's stream
+            // inputs, run the recipe, write its stores back. Load-before-store within a lane keeps
             // in-place streams exact; distinct lanes never alias (the vectorizer's no-alias
-            // precondition), so no hazard. Every stream the recipe loads or stores is checked
-            // over all `count` elements first, so a stream that would run past its allocation is
-            // refused before the first store.
+            // precondition), so no hazard. Streams that share a BASE name one element per lane,
+            // so the evaluator serves a load from the lane's latest earlier store to any stream of
+            // its alias class (its own included) and reads the snapshot only when there is none:
+            // memory, as the machine code reads it, decides every load. Every stream the recipe
+            // loads or stores is checked over all `count` elements first, so a stream that would
+            // run past its allocation is refused before the first store.
             //
             // A zero-trip call touches nothing and so checks nothing: `marshal_vec_kernel` passes
             // `n = 0` for a short or empty range but still offsets each base to the range START,
@@ -1842,8 +1862,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                     });
                 }
                 stores.clear();
-                kern.eval_lane_with_scratch(
+                kern.eval_lane_aliased(
                     &mut scratch,
+                    &alias,
                     |s| loads[s as usize],
                     |k| scalar_vals[k as usize],
                     |s, v| stores.push((s, v)),
@@ -1952,10 +1973,17 @@ impl<'a, 'k> Interp<'a, 'k> {
                             .ok_or("vector load out of bounds")?;
                         // I1 occupies one byte natively but represents only its low bit.
                         // Normalize before Select/branches observe a noncanonical stored byte.
-                        lanes.push(if **lane == MirType::I1 {
-                            mask_lane(value, lane)
-                        } else {
-                            value
+                        // A bf16/f16 lane rounds to its storage grid on read, exactly as the
+                        // scalar load below does (the native backend stores the 16 bits).
+                        lanes.push(match (&**lane, value) {
+                            (MirType::I1, _) => mask_lane(value, lane),
+                            (MirType::BF16, Value::Float(f)) => {
+                                Value::Float(wukong_runtime::round_bf16(f as f32) as f64)
+                            }
+                            (MirType::F16, Value::Float(f)) => {
+                                Value::Float(wukong_runtime::round_f16(f as f32) as f64)
+                            }
+                            _ => value,
                         });
                     }
                     self.push_vec(lanes)?

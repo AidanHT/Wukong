@@ -677,6 +677,35 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
   loop, when the rows provably touch disjoint memory (`tests/run/unroll_jam_nests.wk`). Its speed-up
   is not yet measured; deeper nests, triangular inner bounds and a nest whose inner loop the
   bounds-check versioning split stay as written.
+  **256-bit from the optimizer**: a loop this pass widens whose body has a raw-AVX2 recipe form —
+  one `f32`/`f64`/`i32`/`i64` lane type, contiguous loads and stores, `+ - * /`, `fma`, `sqrt`,
+  negation, an ordered (or `!=`) compare feeding a blend, an if-converted masked store or merge,
+  splatted invariants — and a trip of **2048 or more** calls the same `Op::VecKernelCall` the front
+  end builds for its own `for` loops, so a `while` over slices or a body calling an inlined helper
+  reaches 256 bits too. The kernel runs the multiple-of-eight (f64/i64: four) part; the original loop
+  stays as the remainder, which this pass still widens at 128 bits, so a trip below 2048 runs exactly
+  the 128-bit loop it ran before (the gate is tested on entry for a runtime trip). Every stored object
+  must be touched only at the stored element. Interp and native are compiled with the same switch
+  (`OptimizeOptions::vec_kernels`, cleared for `--backend=gpu-native` and below
+  `--target-cpu=x86-64-v3`); `WUKONG_P4_NO_256` turns it off and `WUKONG_VEC256_MIN_TRIP` moves the
+  gate, both result-identical (`tests/run/vec256_opt_{lanes,specials,aliased}.wk` print every lane,
+  NaN payloads, signed zeros and one buffer passed as two slices included). An **integer sum** takes
+  a reduction kernel too — wrapping addition is exact under the kernel's grouping
+  (`tests/run/vec256_opt_int_sum.wk`). Still 128-bit: float sums and every other reduction kind
+  (the kernel would reassociate them), casts, gathers and scatters, shifts and bitwise
+  ops, the counter read as a value, countdowns, search loops, interleave groups, unsigned compares,
+  `i64` multiplies and `bf16` bodies (no recipe lane). The 2048 gate is the crossover measured for the
+  front end's out-of-line *reduction* kernel; the elementwise crossover is unmeasured and likely
+  lower.
+  **bf16 bodies** widen too (P15.7): a bf16 lane is an `f32` lane in a register, so a bf16 loop
+  widens to `<4 x bf16>` — four 2-byte elements loaded into the top halves of an `f32x4`, the
+  arithmetic, compares and blends in `f32`, each lane rounded to the bf16 grid exactly where the
+  scalar loop rounds (a load, a store, a constant, an `fptrunc`/`fpext`) — bit-exact with the scalar
+  loop on interp and native (`tests/run/vec_bf16_lanes.wk` prints every lane's bits over NaN
+  payloads, signed zeros, infinities, subnormals and rounding ties). Still scalar: `f16` bodies
+  (Cranelift has no vector half conversion; each scalar `f16` load and store calls a runtime shim),
+  bf16 accumulators, bf16 interleave groups, and bf16 casts through `f64` or integers (replicated
+  lane by lane).
 - **Straight-line SLP** (`wukong_opt::slp`, `-O2`, after unrolling): `W` stores in one block to
   consecutive elements of one object whose values are one lane-wise operation tree pack into one
   128-bit vector store — `f32x4`, `i32x4`, `f64x2`, `i64x2` — over vector loads, splats and lane

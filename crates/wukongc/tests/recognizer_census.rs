@@ -60,6 +60,7 @@ const COMPILER_ENV: &[&str] = &[
     "WUKONG_NO_IV_RAMP",
     "WUKONG_NO_SLP",
     "WUKONG_P4_NO_256",
+    "WUKONG_VEC256_MIN_TRIP",
     "WUKONG_VEC_TRACE",
     "WUKONG_SLP_TRACE",
     // Below `avx2` it turns off the raw-AVX2 loop kernels (`veckernel*N` on Windows).

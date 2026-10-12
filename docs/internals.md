@@ -954,6 +954,79 @@ folds read counter order as iteration order) and interleave groups stay with asc
 does a negative stride on an ascending counter (`x[n - 1 - i]`). `WUKONG_NO_REVERSE_VEC=1` restores
 the decline.
 
+**bf16 lanes** (P15.7). Every backend computes a `bf16` value in an `f32` register and rounds it
+to the bf16 grid at exactly four points — a load (the storage is 16 bits), a store, a constant and a
+cast (`fptrunc .. to bf16`, which `mir_build` puts after every bf16 operation, and `fpext` out of
+bf16) — so a bf16 lane is an `f32` lane: `lane_bytes(bf16)` is 4 and a bf16 value widens to
+`<4 x bf16>` parts that hold `f32x4` registers and move four 2-byte elements. The four rounding
+points stay where they were, lane by lane: the interpreter rounds each lane of a vector load as it
+rounds a scalar one; Cranelift loads with `uload16x4` and a 16-bit shift, stores four rounded top
+halves packed with `unarrow` into eight bytes, and rounds each lane of a bf16 `fptrunc`/`fpext` with
+the scalar path's integer round-to-nearest-even (`round_to_bf16_x4`; a NaN keeps its top half with
+the quiet bit set). The LLVM emitter already lowered half vectors, and `--backend=gpu-native`
+scalarizes them lane by lane through its scalar bf16 load, store and conversions. Only the three
+exact casts between `f32` and bf16 are lane-wise (`cast_route`); a bf16 cast through `f64`, to or
+from an integer, or a bitcast is replicated as the scalar instruction. A bf16 accumulator (it rounds
+inside its own recurrence) and a bf16 interleave group stay scalar, and `f16` stays scalar
+throughout: Cranelift has no vector half conversion, and its scalar path calls a runtime shim per
+element. Pinned by `tests/run/vec_bf16_lanes.wk` (NaN payloads, both zeros, both infinities, the
+smallest subnormal, the largest finite value and rounding ties; every lane's bits, hand-derived)
+and `bf16_lanes_agree_with_the_scalar_loop`.
+
+**256-bit kernels from the optimizer** (`src/vec256.rs`, a child module of `vectorize`). A loop the
+128-bit plan widens whose body also has a raw-AVX2 recipe form takes the same `Op::VecKernelCall`
+the front end builds for its own `for` loops (below), so a `while` over slices, a body that calls an
+inlined helper or a `let` merge reaches 256 bits too. `vec256::plan` *restates* the 128-bit plan —
+the dependence verdict, the runtime alias guard, the if-conversion and the speculation proof are
+reused, not re-derived — and accepts only steps with a lane-wise recipe op: contiguous loads and
+stores of one lane type (`f32`, `f64`, `i32`, `i64`), `fadd`/`fsub`/`fmul`/`fdiv` (or wrapping
+`add`/`sub`/`mul` on an integer lane), `fma`, `sqrt`, `neg`, a compare whose only reader is a blend
+(`Folt..Foge`/`Foeq` ordered, `Fone` unordered — Rust's `!=` — or the signed integer compares), a
+`select`, an if-converted masked store or merge, and invariants splatted from a scalar table.
+One reduction is taken as well: an **integer sum** (`s = s + e(i)` over `i32`/`i64`, nothing
+stored) becomes a reduction recipe whose wrapping result `kc` adds to the accumulator, which reaches
+the resumed loop through a block parameter of `kj` — integer addition is associative, so the
+kernel's canonical grouping is the scalar loop's sum bit for bit (`tests/run/vec256_opt_int_sum.wk`,
+every trip from 2040 to 2064). Anything else — a float sum (the recipe would reassociate it), any
+other reduction kind, a cast, a gather or scatter, a shift or bitwise op, the counter read as a
+value, a countdown, a search loop, an interleave group, an unsigned compare, an `i64` multiply —
+keeps the 128-bit loop. One rule is added: every object the
+loop stores is accessed **only at the stored element** (`o[i] = o[i] * 2` is fine), because the
+kernel runs four unrolled groups of eight lanes whose loads may run ahead of the previous copy's
+stores, so no dependence distance — not even one the 128-bit plan would accept at `W = 4` — may be
+crossed. Two accesses to one element are one stream (a slice's data pointer is re-read from its
+fat pointer between a store and a load, so the two pointers are different values, and two streams
+let the interpreter read the element stale), and two objects the alias guard admits as possibly one
+buffer (`guard_allows_equal`) are two streams that may share a base: the interpreter's marshalling
+(`run_vec_kernel`) evaluates the recipe with alias classes (`VecKernel::eval_lane_aliased`, a class
+per base), so every load reads the lane's latest earlier store to *any* stream of its class, its
+own included, as the machine code does by re-reading memory (`tests/run/vec256_opt_aliased.wk`; a
+reload of a stored stream after a store to its twin, `tests/run/vec256_opt_aliased_reload.wk`).
+The rewrite: a guard block computes `n`, the trip rounded down to the recipe's lanes and
+zero below the gate or when the alias check fails, and `start + n`; a call block (entered only when
+`n != 0`) rebuilds each stream's address and each invariant from the body's own scalar steps with
+the counter at `start`, stores them into two entry-block tables (`[k x ptr]`, `[m x lane]`) and calls
+the kernel; the original loop resumes at `start + n`. That remainder is still the **128-bit
+vectorizer's** to widen — a trip below the gate runs exactly the 128-bit loop it ran before — and only
+the kernel path skips it: `vec256::is_remainder` recognizes a loop whose counter starts at a kernel's
+count (`start + n`, `n` itself, or `n` narrowed or widened), which also covers `mir_build`'s scalar
+tails. The gate is `KERNEL_MIN_TRIP` = 2048, the crossover `mir_build` measured for its out-of-line
+reduction kernel; it is conservative for an elementwise call and re-measuring it is owed. The path
+needs all three of `OptimizeOptions::vec_kernels` (set by `wukong_driver` exactly as
+`LowerOptions::vec_kernels`: off for `--backend=gpu-native` and below `--target-cpu=x86-64-v3`, and
+off in `OptimizeOptions::AUTODIFF_INPUT`; the backward `build_grad` generates is optimized by a call
+of its own and takes the same switch, `backward_optimize_options`, because the tape's fill and
+ReLU-backward loops are kernel-shaped), `wukong_mir::host_supports_vec_kernels()` and an unset
+`WUKONG_P4_NO_256`. `WUKONG_VEC256_MIN_TRIP=<n>` moves the gate (never below one register group): a
+result-identical test knob — `WUKONG_VEC256_MIN_TRIP=8 cargo test -p wukongc --test run` puts every
+eligible corpus loop of eight or more iterations through a kernel, and passed when this landed.
+`WUKONG_VEC_TRACE=1` prints `vectorize: KERNEL bb<N> lane=… streams=… scalars=… ops=… guards=…`, or
+`no 256-bit kernel for bb<N>: <reason>` before the `WIDEN` line. Pinned by `tests/run/vec256_opt_lanes.wk`
+(f32, i32, f64; trips 2053 and 2047, every lane), `tests/run/vec256_opt_specials.wk` (NaN payloads,
+both zeros, both infinities, a subnormal; every lane's bits), `crates/wukongc/tests/vec256_opt.rs`
+(the front end builds none, `-O2` builds three, every switch removes them) and the `vec256` unit
+tests, one of which corrupts every recipe and requires the output to change.
+
 **Trip counts.** A runtime trip is `end - start` in the counter's own type, which wraps: an `i32`
 loop from `2147483600` to `-2147483600` runs no iteration but that difference is `96`. So the guard
 also tests `start < end` under the header's own signedness (`start > end` for a countdown) before
@@ -1119,7 +1192,8 @@ forward it hands to autodiff without it: the driver passes `OptimizeOptions::AUT
 `optimize_preserving_with` / `optimize_verified_preserving_with`, because `wukong_autodiff`
 differentiates one scalar at a time and has no VJP rule for a vector load or store — a packed store
 into a buffer whose gradient is live is a hard error there. The generated backward, which nothing
-differentiates, is packed as usual. It adds no MIR op and changed no backend; over `tests/run` and `examples` it packs
+differentiates, is packed as usual (`OptimizeOptions::FULL` under the invocation's 256-bit kernel
+switch). It adds no MIR op and changed no backend; over `tests/run` and `examples` it packs
 `tensor_dim_arith.wk` and `type_alias.wk` and costs 0.2% of optimizer time (debug `--time-passes`,
 summed in process). Its vector loads and stores sit **outside loops, frame slots included**, which
 `gpu-native` takes through its generic scalar-lane path — only the on-device suite (gate part 10)

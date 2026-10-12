@@ -84,8 +84,11 @@
 //! fails the compile; the repo's 256-bit path is a separate mechanism (`VecKernel` +
 //! `codegen_cranelift::avx2`, raw assembled AVX2) that `mir_build` builds for the `for` loops it
 //! vectorizes itself — f32/f64/i32/i64 elementwise bodies and reductions, over arrays, slices and
-//! tensors. With AVX enabled Cranelift VEX-encodes the 128-bit ops, and two of them retire per
-//! cycle, so a memory-bound loop saturates the same bandwidth a 256-bit one would.
+//! tensors — and that this pass builds too, for a loop it widens whose body has a recipe form and
+//! whose trip reaches the out-of-line call's crossover ([`vec256`]): the kernel then runs the
+//! multiple-of-lanes part and this pass's 128-bit loop the remainder. With AVX enabled Cranelift
+//! VEX-encodes the 128-bit ops, and two of them retire per cycle, so a memory-bound loop saturates
+//! the same bandwidth a 256-bit one would.
 //!
 //! The **group width** `W` — how many scalar iterations one vector iteration covers — is set by the
 //! *narrowest* lane the widened body holds: `W = 16 / narrowest_bytes`, LLVM LoopVectorize's rule.
@@ -96,12 +99,23 @@
 //! saturating quantize and an `i8` dot into an `i32` accumulator all widen. A value is never split
 //! across more than [`MAX_PARTS`] vectors.
 //!
-//! # `bf16` / `f16` are deliberately excluded
+//! # `bf16` widens as `f32` lanes; `f16` stays scalar
 //!
-//! The interpreter rounds a **scalar** `bf16`/`f16` load to the storage grid on read
-//! (`wukong_interp`'s `Op::Load` arm) but its **vector** load gathers slots verbatim. Widening a
-//! half-precision load would therefore drop a rounding the scalar path performs — a silent
-//! interp-vs-native divergence, the worst possible outcome. [`lane_bytes`] refuses them.
+//! Every backend computes a `bf16` value in an `f32` register and rounds it to the bf16 grid at
+//! exactly four points: a load (the storage holds 16 bits), a store, a constant, and a cast
+//! (`fptrunc .. to bf16`, which `mir_build` places after every bf16 operation, and an `fpext` out
+//! of bf16). Arithmetic in between is plain `f32`. So a bf16 lane is an `f32` lane — four to a
+//! 128-bit register, [`lane_bytes`] `4` — and `<4 x bf16>` keeps the same four rounding points
+//! lane by lane: the interpreter rounds each lane of a vector load as it rounds a scalar one, and
+//! Cranelift loads four 2-byte elements into the top halves of an `f32x4` (`uload16x4`), packs
+//! four rounded top halves on a store, and rounds each lane of a bf16 `fptrunc`/`fpext` with the
+//! scalar path's integer round-to-nearest-even. The arithmetic, compares and blends between them
+//! are the `f32x4` ones, and only the three exact casts between `f32` and bf16 are lane-wise
+//! ([`cast_route`]); every other bf16 cast is replicated as the scalar instruction. Reductions
+//! with a bf16 accumulator and bf16 interleave groups stay scalar.
+//!
+//! `f16` stays scalar: Cranelift has no vector half conversion, and the scalar path converts
+//! through runtime shims one element at a time.
 //!
 //! # Reading `WUKONG_VEC_TRACE=1`
 //!
@@ -167,11 +181,61 @@ use crate::{each_op_use, CfgAnalyses, Pass};
 /// * [`Vectorize::done`] — a record of the header blocks already widened in the function being
 ///   optimized, reset whenever the pass is handed a different function. A stale entry after
 ///   `cfg::prune_unreachable` renumbers blocks can only *skip* a loop, never widen one twice.
-#[derive(Default)]
+///
+/// A loop handed to a 256-bit kernel ([`vec256`]) is not widened in place: the original loop stays
+/// behind as the kernel's remainder, and the 128-bit path is still allowed to widen *that*. The
+/// stops for the kernel path are the same two in kind — [`vec256::is_remainder`] (the counter
+/// resumes at the kernel's count) and a second header record — plus a cap on the kernels one
+/// function may receive.
 pub struct Vectorize {
-    /// `(function, headers already widened)` for the function currently being optimized.
-    done: std::cell::RefCell<Option<(wukong_span::Symbol, FxHashSet<u32>)>>,
+    /// `(function, headers already widened, headers already given a kernel)` for the function
+    /// currently being optimized.
+    done: std::cell::RefCell<Option<DoneSets>>,
+    /// May a widened loop take the 256-bit raw-AVX2 recipe instead ([`vec256`])? The pipeline's
+    /// switch ([`crate::OptimizeOptions::vec_kernels`]); the host gate and `WUKONG_P4_NO_256` are
+    /// the other two conjuncts ([`Vectorize::kernels_enabled`]).
+    kernels: bool,
 }
+
+/// [`Vectorize::done`]'s record for one function.
+struct DoneSets {
+    func: wukong_span::Symbol,
+    widened: FxHashSet<u32>,
+    kernels: FxHashSet<u32>,
+}
+
+impl Default for Vectorize {
+    /// The pass as [`crate::optimize`] runs it: 256-bit kernels allowed wherever the host and the
+    /// environment allow them — the same default as `wukong_mir_build::LowerOptions`.
+    fn default() -> Vectorize {
+        Vectorize::new(true)
+    }
+}
+
+impl Vectorize {
+    /// The pass, with the 256-bit kernel path on or off. Off leaves every loop on the 128-bit
+    /// path, which computes the same values ([`vec256`]).
+    pub fn new(kernels: bool) -> Vectorize {
+        Vectorize {
+            done: std::cell::RefCell::new(None),
+            kernels,
+        }
+    }
+
+    /// The three conjuncts of the 256-bit path, read once per call: this pass's switch, the host
+    /// gate the assembler refuses on (`wukong_mir::host_supports_vec_kernels` — Win64 with AVX2 and
+    /// FMA3, single-sourced with `mir_build` and the Cranelift assembler), and the
+    /// `WUKONG_P4_NO_256` kill-switch both front-end recipe sites read too.
+    fn kernels_enabled(&self) -> bool {
+        self.kernels
+            && wukong_mir::host_supports_vec_kernels()
+            && std::env::var_os("WUKONG_P4_NO_256").is_none()
+    }
+}
+
+/// The 256-bit raw-AVX2 form of a widened loop (`Op::VecKernelCall`).
+#[path = "vec256.rs"]
+mod vec256;
 
 /// The SIMD register width the backend can legalize, in bytes. Cranelift's x64 vector ISA tops out
 /// at 128 bits — see the module docs for the measurement that established it.
@@ -202,23 +266,33 @@ impl Pass for Vectorize {
         if std::env::var_os("WUKONG_NO_VECTORIZE").is_some() {
             return false;
         }
+        let kernels = self.kernels_enabled();
         let mut slot = self.done.borrow_mut();
-        let done = match slot.as_mut() {
-            Some((name, set)) if *name == f.name => set,
-            _ => {
-                *slot = Some((f.name, FxHashSet::default()));
-                &mut slot.as_mut().expect("just set").1
-            }
-        };
+        if slot.as_ref().is_none_or(|d| d.func != f.name) {
+            *slot = Some(DoneSets {
+                func: f.name,
+                widened: FxHashSet::default(),
+                kernels: FxHashSet::default(),
+            });
+        }
+        let done = slot.as_mut().expect("just set");
         let mut changed = false;
         for _ in 0..MAX_LOOPS_PER_CALL {
             let (idom, preds) = cache.idoms_and_preds(f);
             let mut forest = loop_info::structure_with(f, idom, preds);
-            let Some(plan) = pick(f, &mut forest, done) else {
-                break;
-            };
-            done.insert(plan.header.0);
-            apply(f, &plan);
+            match pick(f, &mut forest, done, kernels) {
+                None => break,
+                Some(Picked::Widen(plan)) => {
+                    done.widened.insert(plan.header.0);
+                    apply(f, &plan);
+                }
+                // The header is NOT recorded as widened: the loop left behind is the kernel's
+                // remainder, which the 128-bit path may still widen (`vec256` module docs).
+                Some(Picked::Kernel(plan, kernel)) => {
+                    done.kernels.insert(plan.header.0);
+                    vec256::apply(f, &plan, &kernel);
+                }
+            }
             cache.invalidate();
             changed = true;
         }
@@ -233,14 +307,14 @@ impl Pass for Vectorize {
 /// Byte width of a lane type this pass will widen, or `None` for one it refuses.
 ///
 /// `I1` is out because a boolean vector is a *mask*, whose machine representation is one all-ones
-/// lane per element of the value it selects, not a one-bit lane. `bf16`/`f16` are out because the
-/// interpreter's vector load does not apply the storage-grid rounding its scalar load does (module
-/// docs). Pointers and aggregates have no lane-wise arithmetic at all.
+/// lane per element of the value it selects, not a one-bit lane. A `bf16` lane is its *register*
+/// width, an `f32`'s, though it is stored in two bytes (module docs); `f16` is out. Pointers and
+/// aggregates have no lane-wise arithmetic at all.
 fn lane_bytes(t: &MirType) -> Option<u32> {
     Some(match t {
         MirType::I8 => 1,
         MirType::I16 => 2,
-        MirType::I32 | MirType::F32 => 4,
+        MirType::I32 | MirType::F32 | MirType::BF16 => 4,
         MirType::I64 | MirType::F64 => 8,
         _ => return None,
     })
@@ -810,7 +884,7 @@ type AccessKey = (u32, usize);
 /// [`crate::loop_info::Stages`]'s unrun stages leave *conservative* defaults — `dep` reads
 /// `MemDep::Carried`, so a loop whose memory was never analyzed cannot be widened by accident —
 /// and because both early filters call the same code `plan_loop` does.
-fn pick(f: &Function, forest: &mut LoopForest, done: &FxHashSet<u32>) -> Option<VecPlan> {
+fn pick(f: &Function, forest: &mut LoopForest, done: &DoneSets, kernels: bool) -> Option<Picked> {
     // `WUKONG_VEC_TRACE=1` prints one line per decision. Note that this whole function re-runs on
     // every fixpoint iteration of the pass manager, so a DECLINE repeats once per iteration while a
     // WIDEN appears once — see the module docs before quoting the stream anywhere.
@@ -825,7 +899,7 @@ fn pick(f: &Function, forest: &mut LoopForest, done: &FxHashSet<u32>) -> Option<
         // Structure first: no value analysis has run yet, and none of these checks needs one.
         {
             let l = forest.get(id);
-            if done.contains(&l.header.0) || already_vector(f, l) {
+            if done.widened.contains(&l.header.0) || already_vector(f, l) {
                 continue;
             }
             if is_someones_epilogue(f, forest, l) {
@@ -851,25 +925,69 @@ fn pick(f: &Function, forest: &mut LoopForest, done: &FxHashSet<u32>) -> Option<
         loop_info::analyze_one(f, forest, idx, loop_info::Stages::Memory);
         let l = forest.get(id);
         match plan_loop(f, l) {
-            Ok(p) => {
-                if trace {
-                    eprintln!(
-                        "vectorize: WIDEN bb{} w={} lin={} guards={} reds={} cost={}/{}",
-                        p.header.0,
-                        p.w,
-                        p.lin.len(),
-                        p.guards.len() + p.point_guards.len() + p.len_checks.len(),
-                        p.reductions.len(),
-                        p.cost.0,
-                        p.cost.1
-                    );
+            // The 256-bit form of the same plan, when the body has one ([`vec256`]). Never for a
+            // kernel's own remainder, which keeps the 128-bit loop below.
+            Ok(mut p)
+                if kernels
+                    && !done.kernels.contains(&l.header.0)
+                    && vec256::has_room(f)
+                    && !vec256::is_remainder(f, l) =>
+            {
+                match vec256::plan(f, l, &p) {
+                    Ok(k) => {
+                        if trace {
+                            eprintln!(
+                                "vectorize: KERNEL bb{} lane={:?} streams={} scalars={} ops={} guards={}",
+                                p.header.0,
+                                k.kernel.lane,
+                                k.kernel.streams,
+                                k.kernel.scalars,
+                                k.kernel.ops.len(),
+                                p.guards.len() + p.point_guards.len()
+                            );
+                        }
+                        p.w = k.kernel.lane.lanes();
+                        p.trip = k.trip.clone();
+                        return Some(Picked::Kernel(p, k));
+                    }
+                    Err(why) => {
+                        if trace {
+                            eprintln!("vectorize: no 256-bit kernel for bb{}: {why}", p.header.0);
+                        }
+                        return Some(Picked::Widen(widen_traced(p, trace)));
+                    }
                 }
-                return Some(p);
             }
+            Ok(p) => return Some(Picked::Widen(widen_traced(p, trace))),
             Err(why) => decline(l.header.0, why),
         }
     }
     None
+}
+
+/// What [`pick`] chose to do with a loop.
+enum Picked {
+    /// Widen it to 128-bit vectors in place ([`apply`]).
+    Widen(VecPlan),
+    /// Call a 256-bit kernel ahead of it, its trip and width already the kernel's ([`vec256`]).
+    Kernel(VecPlan, vec256::KernelPlan),
+}
+
+/// `p`, after printing its `WUKONG_VEC_TRACE` line.
+fn widen_traced(p: VecPlan, trace: bool) -> VecPlan {
+    if trace {
+        eprintln!(
+            "vectorize: WIDEN bb{} w={} lin={} guards={} reds={} cost={}/{}",
+            p.header.0,
+            p.w,
+            p.lin.len(),
+            p.guards.len() + p.point_guards.len() + p.len_checks.len(),
+            p.reductions.len(),
+            p.cost.0,
+            p.cost.1
+        );
+    }
+    p
 }
 
 /// Does this loop already hold vector values? Then it is either the vector loop this pass just
@@ -1116,6 +1234,9 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
     let (groups, member) = interleave_groups(l)?;
     if dir == -1 && !groups.is_empty() {
         return Err("an interleave group in a countdown");
+    }
+    if groups.iter().any(|g| g.elem == MirType::BF16) {
+        return Err("a bf16 interleave group");
     }
     access_shape_verdict(l, &member)?;
     group_order_verdict(l, &lin, groups.len(), &member)?;
@@ -3990,6 +4111,11 @@ fn plan_body(
     // must be a real lane mask: a uniform `i1` cannot blend vectors.
     for r in &reductions {
         lane_bytes(&r.ty)?;
+        // A bf16 accumulate rounds to the grid inside its own recurrence (`fptrunc` after the
+        // combine), which no fold form here reproduces.
+        if r.ty == MirType::BF16 {
+            return None;
+        }
         if let Some((cond, _)) = r.guard {
             if !is_vec(&vector_ty, cond) {
                 return None;
@@ -4119,6 +4245,17 @@ fn cast_widenable(k: CastKind, to: &MirType) -> bool {
 fn cast_route(kind: CastKind, from: &MirType, to: &MirType) -> Option<CastRoute> {
     use CastKind::*;
     let (fb, tb) = (lane_bytes(from)?, lane_bytes(to)?);
+    // A bf16 lane is an `f32` lane in a register, so the casts that only round it to the bf16 grid
+    // are lane-wise: `fpext bf16 -> f32` (rounds the source first) and `fptrunc` from `f32` or bf16
+    // (the rounding `mir_build` places after every bf16 operation). Any other bf16 cast — through
+    // `f64`, to or from an integer, a bitcast — has no exact lane-wise form here and is replicated.
+    if *from == MirType::BF16 || *to == MirType::BF16 {
+        return match (kind, from, to) {
+            (FpExt, MirType::BF16, MirType::F32)
+            | (FpTrunc, MirType::F32 | MirType::BF16, MirType::BF16) => Some(CastRoute::Same),
+            _ => None,
+        };
+    }
     Some(match kind {
         SExt | ZExt | Trunc if from.is_int() && to.is_int() && fb == tb => CastRoute::Identity,
         _ if fb == tb => {
@@ -7572,15 +7709,77 @@ mod tests {
         );
     }
 
-    /// `bf16` is refused on purpose: the interpreter rounds a scalar half-precision load to the
-    /// storage grid and its vector load does not, so widening one would be a silent
-    /// interp-vs-native divergence rather than a missed optimization.
+    /// A bf16 lane is an `f32` lane in a register (module docs): a bf16 body widens to
+    /// `<4 x bf16>` parts — four lanes per 128-bit register, stored as four 2-byte elements — and to
+    /// nothing else.
     #[test]
-    fn a_bf16_loop_is_refused() {
-        let src = "fn k(x: []bf16, mut o: []bf16, n: i64) { let mut i: i64 = 0; \
-                   while i < n { o[i] = x[i]; i = i + 1; } } \
+    fn a_bf16_loop_widens_as_four_f32_lanes() {
+        let src = "fn k(x: []bf16, y: []bf16, mut o: []bf16, n: i64) { let mut i: i64 = 0; \
+                   while i < n { o[i] = x[i] * y[i] + x[i]; i = i + 1; } } \
                    fn main() -> i32 { return 0; }";
-        assert!(!is_widened(src, "k"), "bf16 must not be widened");
+        let vs = vector_values(src, "k");
+        assert!(!vs.is_empty(), "a bf16 body was not widened");
+        assert!(
+            vs.iter().all(|(l, n)| *l == MirType::BF16 && *n == 4),
+            "{vs:?}"
+        );
+    }
+
+    /// Every lane of five bf16 bodies, `-O0` (the scalar loops) against `-O2` (`<4 x bf16>` groups
+    /// and the scalar epilogue), printed as raw bits: the contracted `x * y + x` and its rounding,
+    /// an ordered compare choosing `x` or `-y`, a division (0/0, inf/inf, x/0), `fpext` to `f32`
+    /// and `fptrunc` back with ties to even — over NaN payloads, both zeros, both infinities, the
+    /// smallest subnormal and the largest finite value. The four rounding points a bf16 value has
+    /// (load, store, constant, cast) must land on the same lanes in both programs.
+    #[test]
+    fn bf16_lanes_agree_with_the_scalar_loop() {
+        scalar_and_vector_agree(
+            "fn pick(a: bf16, b: bf16) -> bf16 { if a > b { return a; } return -b; } \
+             @unchecked fn k(x: []bf16, y: []bf16, mut o1: []bf16, mut o2: []bf16, \
+               mut o3: []bf16, mut f: []f32, mut o5: []bf16, n: i64, d: i64) { \
+               if d > 0 { k(x, y, o1, o2, o3, f, o5, n, d - 1); return; } \
+               let mut i: i64 = 0; \
+               while i < n { o1[i] = x[i] * y[i] + x[i]; i = i + 1; } \
+               i = 0; while i < n { o2[i] = pick(x[i], y[i]); i = i + 1; } \
+               i = 0; while i < n { o3[i] = x[i] / y[i]; i = i + 1; } \
+               i = 0; while i < n { f[i] = (x[i] as f32) * 0.5; i = i + 1; } \
+               i = 0; while i < n { o5[i] = (f[i] * 3.0) as bf16; i = i + 1; } } \
+             fn xs(r: i64) -> u16 { let t: [u16; 16] = [32705, 32768, 0, 32640, 65408, 16320, \
+               49168, 1, 32639, 16257, 16457, 49024, 16000, 17152, 16256, 16672]; return t[r]; } \
+             fn ys(r: i64) -> u16 { let t: [u16; 16] = [16256, 16384, 0, 32768, 32640, 16257, \
+               16255, 49216, 128, 19328, 16128, 32512, 48640, 16800, 16383, 32706]; return t[r]; } \
+             fn main() -> i32 { let n: i64 = 37; \
+               let mut x: []bf16 = alloc_bf16(n); let mut y: []bf16 = alloc_bf16(n); \
+               let mut o1: []bf16 = alloc_bf16(n); let mut o2: []bf16 = alloc_bf16(n); \
+               let mut o3: []bf16 = alloc_bf16(n); let mut o5: []bf16 = alloc_bf16(n); \
+               let mut f: []f32 = alloc_f32(n); let mut i: i64 = 0; \
+               while i < n { x[i] = bf16_from_bits(xs(i % 16)); \
+                 y[i] = bf16_from_bits(ys((5 * i + 3) % 16)); i = i + 1; } \
+               k(x, y, o1, o2, o3, f, o5, n, 0); i = 0; \
+               while i < n { print(bits(o1[i])); print(bits(o2[i])); print(bits(o3[i])); \
+                 print(bits(f[i])); print(bits(o5[i])); i = i + 1; } \
+               return 0; }",
+        );
+    }
+
+    /// A bf16 accumulator rounds to the grid inside its own recurrence (`fptrunc` after every
+    /// combine), which no fold form reproduces, so the loop stays scalar.
+    #[test]
+    fn a_bf16_reduction_stays_scalar() {
+        let src = "fn k(x: []bf16, n: i64) -> bf16 { let mut s: bf16 = 0.0; let mut i: i64 = 0; \
+                   while i < n { s = s + x[i]; i = i + 1; } return s; } \
+                   fn main() -> i32 { return 0; }";
+        assert!(!is_widened(src, "k"), "a bf16 sum must not be widened");
+    }
+
+    /// `f16` is refused: Cranelift has no vector half conversion, and its scalar path converts
+    /// through runtime shims one element at a time.
+    #[test]
+    fn an_f16_loop_is_refused() {
+        let src = "fn k(x: []f16, mut o: []f16, n: i64) { let mut i: i64 = 0; \
+                   while i < n { o[i] = x[i] * x[i]; i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        assert!(!is_widened(src, "k"), "f16 must not be widened");
     }
 
     // ---- min/max reductions --------------------------------------------------------------------

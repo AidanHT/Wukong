@@ -288,8 +288,9 @@ interpreter marshalling coverage remain incomplete. One platform caveat, and it 
 one only: the raw 256-bit AVX2 vec-kernel emitter hardcodes the Win64 argument registers and VEX.256
 AVX2+FMA encodings, so it requires an **x86-64 Windows host with AVX2 + FMA**
 (`wukong_mir::host_supports_vec_kernels`, which `avx2::host_supports_kernels` delegates to). On any
-other host the vectorizer consults that same predicate and never builds a 256-bit recipe in the first
-place, so those loops stay on the portable 128-bit CLIF path — the identical lowering
+other host both vectorizers — `mir_build`'s and the optimizer's MIR loop vectorizer, which builds the
+same recipe for loops the front end leaves scalar — consult that same predicate and never build a
+256-bit recipe in the first place, so those loops stay on the portable 128-bit CLIF path — the identical lowering
 `WUKONG_P4_NO_256=1` forces, and result-identical by construction: elementwise lanes carry no
 reassociation, and a vectorized reduction computes the same canonical summation tree in both forms
 (`docs/internals.md`, "The canonical reduction tree"). Everything still compiles and runs; only the

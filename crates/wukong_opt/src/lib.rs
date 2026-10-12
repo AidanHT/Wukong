@@ -27,7 +27,10 @@
 //!  * **promote** — keep a loop-invariant memory location the loop reads and writes in a register:
 //!    one load in the preheader, one store per exit (`-O2`).
 //!  * **vectorize** — widen a canonical loop body to 128-bit SIMD (if-converting a conditional
-//!    body to a lane mask), with the original loop kept as its scalar epilogue (`-O2`).
+//!    body to a lane mask), with the original loop kept as its scalar epilogue (`-O2`). A body
+//!    with a raw-AVX2 recipe form and a trip of 2048 or more instead calls a 256-bit kernel
+//!    (`Op::VecKernelCall`) ahead of the original loop, which the 128-bit path then widens as the
+//!    remainder ([`OptimizeOptions::vec_kernels`]).
 //!
 //! `cse`, `dse` and `licm` all consult [`alias`], the provenance analysis that answers *can a store
 //! through `q` be seen by a load through `p`?* — the question `mir_build`'s type erasure
@@ -214,6 +217,13 @@ impl PassManager {
     /// `>= 1` and `>= 2`, so `-O3` builds the identical pipeline as `-O2` — a contract the
     /// differential gates rely on; do not add an `-O3`-only pass without revisiting it.
     pub fn standard(opt_level: u8) -> PassManager {
+        PassManager::standard_with(opt_level, OptimizeOptions::FULL)
+    }
+
+    /// [`PassManager::standard`] with the per-pass switches `options` carries: today only whether
+    /// the vectorizer may emit a 256-bit kernel ([`OptimizeOptions::vec_kernels`]). Every pass and
+    /// their order are the same for every `options`.
+    pub fn standard_with(opt_level: u8, options: OptimizeOptions) -> PassManager {
         let mut pm = PassManager::new();
         if opt_level >= 1 {
             // Promotion comes first: every later pass is far more effective on SSA values than on
@@ -270,7 +280,7 @@ impl PassManager {
             // one latch and one exit-test polarity, invariants already hoisted, and dead code gone.
             // Everything it emits is fed back through the fixpoint, so the vector body gets the
             // same simplification, CSE and DCE the scalar body did.
-            pm.add(Box::new(Vectorize::default()));
+            pm.add(Box::new(Vectorize::new(options.vec_kernels)));
         }
         pm
     }
@@ -471,11 +481,23 @@ impl Default for PassManager {
 pub struct OptimizeOptions {
     /// Straight-line SLP ([`slp_program`]) after unrolling, at `-O2` and above.
     pub slp: bool,
+    /// May the vectorizer hand a widened loop to a 256-bit raw-AVX2 kernel (`Op::VecKernelCall`,
+    /// `wukong_mir::vec_kernel`) instead of 128-bit vectors? The same switch as
+    /// `wukong_mir_build::LowerOptions::vec_kernels`, and set from the same place: a kernel carries
+    /// Win64 AVX2 machine code, which no PTX lowering can consume (`--backend=gpu-native` clears
+    /// it) and a `--target-cpu` below x86-64-v3 must not receive. The host gate and the
+    /// `WUKONG_P4_NO_256` kill-switch still apply when it is on; every setting computes the same
+    /// values. The interpreter and the native backend are compiled with the same setting, so the
+    /// differential compares one MIR.
+    pub vec_kernels: bool,
 }
 
 impl OptimizeOptions {
     /// Every stage the level enables.
-    pub const FULL: OptimizeOptions = OptimizeOptions { slp: true };
+    pub const FULL: OptimizeOptions = OptimizeOptions {
+        slp: true,
+        vec_kernels: true,
+    };
     /// The pipeline for a program `wukong_autodiff` will differentiate (`--emit=grad`, `--train`,
     /// `--emit=obj --grad-of`): everything but SLP. Autodiff takes the *optimized* single-block
     /// forward and differentiates it one scalar at a time; it has no VJP rule for a vector load or
@@ -484,8 +506,25 @@ impl OptimizeOptions {
     /// error. The gradient-compile lowering (`unroll_for_autodiff`) and complete unrolling produce
     /// exactly the straight-line copies SLP packs, so this is the common case there, not an edge.
     /// The generated backward is never differentiated again, so it is optimized with
-    /// [`OptimizeOptions::FULL`].
-    pub const AUTODIFF_INPUT: OptimizeOptions = OptimizeOptions { slp: false };
+    /// [`OptimizeOptions::FULL`] under the invocation's kernel switch
+    /// ([`OptimizeOptions::with_vec_kernels`]). The tape's own fill and ReLU-backward loops are
+    /// plain elementwise bodies the vectorizer turns into kernels, so the backward needs the same
+    /// target gate as the forward.
+    ///
+    /// No 256-bit kernels either: autodiff has no VJP rule for an `Op::VecKernelCall` and refuses
+    /// one by name, so the forward keeps the 128-bit form it differentiated before.
+    pub const AUTODIFF_INPUT: OptimizeOptions = OptimizeOptions {
+        slp: false,
+        vec_kernels: false,
+    };
+
+    /// These options with the vectorizer's 256-bit kernels switched on or off.
+    pub const fn with_vec_kernels(self, vec_kernels: bool) -> OptimizeOptions {
+        OptimizeOptions {
+            vec_kernels,
+            ..self
+        }
+    }
 }
 
 impl Default for OptimizeOptions {
@@ -517,7 +556,7 @@ pub fn optimize_preserving_with(
     if opt_level >= 2 {
         inline::inline_program_preserving(program, roots);
     }
-    PassManager::standard(opt_level).run(program);
+    PassManager::standard_with(opt_level, options).run(program);
     // Unrolling runs after the pipeline, not inside its fixpoint: it needs the canonical two-block
     // counted loop that mem2reg/simplify-cfg produce, and re-running it on its own output would
     // unroll the same loop again every sweep. Only the functions it touched are re-optimized, so a
@@ -566,7 +605,7 @@ pub fn optimize_verified_preserving_with(
         inline::inline_program_preserving(program, roots);
         verify_program_stage(program, "inline")?;
     }
-    PassManager::standard(opt_level).run_verified(program)?;
+    PassManager::standard_with(opt_level, options).run_verified(program)?;
     if opt_level >= 2 {
         let changed = unroll_program(program);
         verify_program_stage(program, "unroll")?;
@@ -587,6 +626,16 @@ pub fn optimize_verified_preserving_with(
 /// [`optimize`] — it runs the same pipeline in the same order, only wrapped in `Instant` timing.
 /// For the bench harness; the production compile path uses [`optimize`] and pays no timing cost.
 pub fn optimize_timed(program: &mut Program, opt_level: u8) -> Timings {
+    optimize_timed_with(program, opt_level, OptimizeOptions::FULL)
+}
+
+/// Like [`optimize_timed`], running only the stages `options` leaves on — byte-identical to
+/// [`optimize_preserving_with`] with no extra roots and the same `options`.
+pub fn optimize_timed_with(
+    program: &mut Program,
+    opt_level: u8,
+    options: OptimizeOptions,
+) -> Timings {
     let mut t = Timings::default();
     let start = Instant::now();
     if opt_level >= 2 {
@@ -594,7 +643,7 @@ pub fn optimize_timed(program: &mut Program, opt_level: u8) -> Timings {
         inline_program(program);
         t.inline = i0.elapsed();
     }
-    PassManager::standard(opt_level)
+    PassManager::standard_with(opt_level, options)
         .run_program(program, Some(&mut t), cfg!(debug_assertions))
         .unwrap_or_else(|failure| panic!("{failure}"));
     if opt_level >= 2 {
@@ -608,10 +657,12 @@ pub fn optimize_timed(program: &mut Program, opt_level: u8) -> Timings {
         PassManager::unroll_cleanup().run_subset(program, &changed);
         t.unroll = u0.elapsed();
         // The SLP bucket, likewise, is the stage and its cleanup.
-        let s0 = Instant::now();
-        let packed = slp::slp_program(program);
-        PassManager::unroll_cleanup().run_subset(program, &packed);
-        t.slp = s0.elapsed();
+        if options.slp {
+            let s0 = Instant::now();
+            let packed = slp::slp_program(program);
+            PassManager::unroll_cleanup().run_subset(program, &packed);
+            t.slp = s0.elapsed();
+        }
         // Counted in `total` only: one scan per function, and a cleanup only where one formed.
         switch_form::form_switches(program);
     }

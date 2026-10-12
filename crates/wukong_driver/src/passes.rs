@@ -59,9 +59,19 @@ pub const PROGRAM_STEPS: &[&str] = &["inline", "unroll", "slp", "form-switches"]
 /// The `--print-after` name that matches every pass and every program step.
 pub const PRINT_ALL: &str = "all";
 
-/// A fresh instance of the function pass named `name` (a [`FUNCTION_PASSES`] entry).
+/// A fresh instance of the function pass named `name` (a [`FUNCTION_PASSES`] entry), as the
+/// standard pipeline builds it by default (`wukong_opt::OptimizeOptions::FULL`).
 pub fn make_pass(name: &str) -> Option<Box<dyn Pass>> {
+    make_pass_with(name, true)
+}
+
+/// [`make_pass`], with the vectorizer's 256-bit kernels on or off
+/// (`wukong_opt::OptimizeOptions::vec_kernels`) — the one per-pass switch the pipeline carries.
+pub fn make_pass_with(name: &str, vec_kernels: bool) -> Option<Box<dyn Pass>> {
     use wukong_opt::*;
+    if name == "vectorize" {
+        return Some(Box::new(Vectorize::new(vec_kernels)));
+    }
     Some(match name {
         "sroa" => Box::new(Sroa),
         "mem2reg" => Box::new(Mem2Reg),
@@ -80,7 +90,6 @@ pub fn make_pass(name: &str) -> Option<Box<dyn Pass>> {
         "bce" => Box::new(Bce),
         "unswitch" => Box::new(LoopUnswitch),
         "promote" => Box::new(Promote),
-        "vectorize" => Box::new(Vectorize::default()),
         _ => return None,
     })
 }
@@ -283,7 +292,9 @@ impl Pass for Observed {
 /// `unchanged` note), and after the named program step, the whole program. The fixpoint driver
 /// skips a pass that has nothing new to see, so a pass runs on a function only as often as the
 /// rest of its group keeps changing it. `typed` prints the snapshots in the `--emit=mir-text`
-/// form.
+/// form. `vec_kernels` is the vectorizer's 256-bit kernel switch
+/// (`wukong_opt::OptimizeOptions::vec_kernels`), so a `--passes` list compiles for the backend
+/// it was asked for exactly as the standard pipeline does.
 pub fn run_steps(
     program: &mut Program,
     steps: &[Step],
@@ -291,6 +302,7 @@ pub fn run_steps(
     print_after: Option<&str>,
     interner: &Interner,
     typed: bool,
+    vec_kernels: bool,
 ) -> Result<(), VerificationFailure> {
     run_steps_to(
         program,
@@ -299,11 +311,13 @@ pub fn run_steps(
         print_after,
         interner,
         typed,
+        vec_kernels,
         Box::new(to_stderr),
     )
 }
 
 /// [`run_steps`], writing the snapshots to `sink`.
+#[allow(clippy::too_many_arguments)]
 fn run_steps_to(
     program: &mut Program,
     steps: &[Step],
@@ -311,6 +325,7 @@ fn run_steps_to(
     print_after: Option<&str>,
     interner: &Interner,
     typed: bool,
+    vec_kernels: bool,
     sink: Sink,
 ) -> Result<(), VerificationFailure> {
     let printer = print_after.map(|filter| Rc::new(Printer::new(filter, interner, typed, sink)));
@@ -322,7 +337,8 @@ fn run_steps_to(
             Step::Fixpoint(names) => {
                 let mut pm = PassManager::new();
                 for name in names {
-                    let inner = make_pass(name).expect("parse_spec admits only known passes");
+                    let inner = make_pass_with(name, vec_kernels)
+                        .expect("parse_spec admits only known passes");
                     match &printer {
                         Some(printer) if printer.wants(name) => pm.add(Box::new(Observed {
                             inner,
@@ -473,6 +489,7 @@ pub(crate) fn compile_mir_text(opts: &Options) -> i32 {
         opts.print_after.as_deref(),
         &interner,
         typed,
+        crate::lower_options_for(opts).vec_kernels,
     ) {
         crate::emit_diag(
             &crate::optimization_failure_diag(&failure, &interner),
@@ -625,7 +642,7 @@ mod tests {
                 let steps = parse_spec(standard_spec(level)).unwrap();
                 for verify_each in [false, true] {
                     let mut got = program.clone();
-                    run_steps(&mut got, &steps, verify_each, None, &interner, false).unwrap();
+                    run_steps(&mut got, &steps, verify_each, None, &interner, false, true).unwrap();
                     let got = wukong_mir::print::print_program(&got, &interner);
                     assert!(
                         got == want,
@@ -654,6 +671,7 @@ mod tests {
             None,
             &interner,
             false,
+            true,
             Box::new(|_| {}),
         )
         .unwrap();
@@ -667,6 +685,7 @@ mod tests {
             Some(filter),
             &interner,
             typed,
+            true,
             Box::new(move |s| sink.borrow_mut().push_str(s)),
         )
         .unwrap();

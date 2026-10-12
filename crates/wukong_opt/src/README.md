@@ -21,6 +21,7 @@
 | `bce.rs` | `Bce` — slice bounds-check elimination: versions an innermost counted loop on a preheader guard so a check-free copy runs when every check is proved |
 | `promote.rs` | `Promote` — keep a loop-invariant location the loop reads and writes in a register (preheader load, exit stores; a shared exit block gets a dedicated copy for the store) |
 | `vectorize.rs` | `Vectorize` — 128-bit SIMD widening with scalar epilogue; constant `i16`/`i32` left shifts use wrapping multiply |
+| `vec256.rs` | child module of `vectorize`: restates a widened loop as a 256-bit raw-AVX2 `VecKernel` recipe (`Op::VecKernelCall`) when the body has one and the trip reaches 2048 (`KERNEL_MIN_TRIP`; `WUKONG_VEC256_MIN_TRIP` moves it), leaving the original loop as a remainder the 128-bit path still widens; off under `OptimizeOptions::vec_kernels = false`, off the Win64 AVX2 host and under `WUKONG_P4_NO_256` |
 | `inline.rs` | `inline_program` — bottom-up call-graph SCC inlining with per-site growth budgets |
 | `unroll.rs` | `unroll_program` — complete (small known trip count) or partial loop unrolling at `-O2`+ |
 | `slp.rs` | `slp_program` — straight-line SLP at `-O2`+, after unrolling: packs `W` isomorphic stores to consecutive elements of one object, with the lane-wise arithmetic and contiguous loads feeding them, into one 128-bit vector store; legality is a crossing rule over `AliasInfo` (`WUKONG_NO_SLP`, `WUKONG_SLP_TRACE`) |

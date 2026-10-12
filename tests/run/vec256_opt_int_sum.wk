@@ -1,0 +1,104 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 892649607 -1014570924055889145
+// EXPECT-OUT: -255459989 8393268553535980343
+// EXPECT-OUT: 559737195 -641024356563274398
+// EXPECT-OUT: 1633209455 8776038493065449864
+// EXPECT-OUT: 375021199 -249031044996950103
+// EXPECT-OUT: 1080140723 9177255176668628933
+// EXPECT-OUT: 2043534323 161409010643083740
+// EXPECT-OUT: 675268407 -8849825469364034066
+// EXPECT-OUT: 1270309271 590295810356827131
+// EXPECT-OUT: 2123625211 -8411715297613435901
+// EXPECT-OUT: 645280635 1037629354144280070
+// EXPECT-OUT: 1130243839 -7955158381789128188
+// EXPECT-OUT: 1873481119 1503409642005442557
+// EXPECT-OUT: 285058883 -7480154721891110927
+// EXPECT-OUT: 659943427 1987636673940314592
+// EXPECT-OUT: 1293103047 -6986704317919384118
+// EXPECT-OUT: -405397849 2490310449948896175
+// EXPECT-OUT: -140590965 -6474807169873947761
+// EXPECT-OUT: 382489995 3011430970031187306
+// EXPECT-OUT: -1426088561 -5944463277754801856
+// EXPECT-OUT: -1271360337 3550998234187187985
+// EXPECT-OUT: -858357037 -5395672641561946403
+// EXPECT-OUT: 1517953043 4109012242416898212
+// EXPECT-OUT: 1562603607 -4828435261295381402
+// EXPECT-OUT: 1865528247 4685472994720317987
+module tests.run.vec256_opt_int_sum
+
+// Integer sums the optimizer hands to a 256-bit REDUCTION kernel (-O2): `s = s + e(i)` over i32 and
+// i64 slices, the loop the 128-bit vectorizer widens with lane-parallel partials, now folded for
+// its whole register groups by the raw-AVX2 recipe (four accumulators of eight or four lanes) and
+// the remainder by the 128-bit loop and the scalar tail. Integer addition wraps and is
+// associative, so any grouping is the scalar loop's sum; the addends here overflow (`x * 3` in
+// i32, `i * 4611686018427387` in i64) so a grouping or width mistake cannot cancel out.
+//
+// Each line is one trip n = 2040 .. 2064: below 2048 the kernel is skipped at run time and the
+// 128-bit loop sums everything; from 2048 the kernel takes n rounded down to whole groups, and the
+// remainder is every length from 0 to 16. Each sum is kept OUT of line (the sums and `again` call
+// each other, so the inliner splices neither into `main`), so its trip is a runtime value.
+//
+// Expected values, derived by hand from the scalar loops with two's-complement wrapping:
+//   x[i] = (i * 2654435761) % 2000000000, y[i] = (i * 40503) % 1000 - 500   (as i32)
+//   z[i] = i * 4611686018427387 + 17                                        (i64, wrapping)
+//   s32(n) = 7 + sum_{i<n} (3 * x[i] - y[i])  mod 2^32, printed signed
+//   s64(n) = -5 + sum_{i<n} (z[i] - 9)        mod 2^64, printed signed
+
+fn s32(x: []i32, y: []i32, n: i64, d: i64) -> i32 {
+    if d > 0 {
+        return again(d - 1) as i32;
+    }
+    let mut s: i32 = 7;
+    let mut i: i64 = 0;
+    while i < n {
+        s = s + (x[i] * 3 - y[i]);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn s64(z: []i64, n: i64, d: i64) -> i64 {
+    if d > 0 {
+        return again(d - 1);
+    }
+    let mut s: i64 = -5;
+    let mut i: i64 = 0;
+    while i < n {
+        s = s + (z[i] - 9);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn again(d: i64) -> i64 {
+    let mut a: []i32 = alloc_i32(1);
+    let mut b: []i64 = alloc_i64(1);
+    return s32(a, a, 1, d) as i64 + s64(b, 1, d);
+}
+
+fn main() -> i32 {
+    let m: i64 = 2064;
+    let mut x: []i32 = alloc_i32(m);
+    let mut y: []i32 = alloc_i32(m);
+    let mut z: []i64 = alloc_i64(m);
+    let mut i: i64 = 0;
+    while i < m {
+        x[i] = (i * 2654435761 % 2000000000) as i32;
+        y[i] = (i * 40503 % 1000 - 500) as i32;
+        z[i] = i * 4611686018427387 + 17;
+        i = i + 1;
+    }
+    let mut n: i64 = 2040;
+    while n <= m {
+        print_raw(s32(x, y, n, 0));
+        print_raw(" ");
+        print_raw(s64(z, n, 0));
+        print_raw("\n");
+        n = n + 1;
+    }
+    free(x);
+    free(y);
+    free(z);
+    return 0;
+}
