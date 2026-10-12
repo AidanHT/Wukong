@@ -333,8 +333,19 @@ takes that arm. Change one and you must change the other. `wukong_opt`'s
 `exhaustive_int_match_agrees_with_rust_on_every_value` runs every `u8`/`i8` value through both and
 against Rust's own `match`; the two `char`-literal decoders (`usefulness::char_value` and
 `decode_char_literal`) are **not** pinned by any test, so an escape-syntax change must touch both. A
-new way to forge a value the analysis does not model (the one today is the zero fill of
-`let e: E;`, handled by `zero_value_modeled`) needs the same treatment.
+slice pattern's length rule is the third half-pair: `usefulness::slice_covers` and
+`mir_build::slice_pat::slice_view_pattern_cond` must agree that `[a, b]` means `len == 2` and
+`[a, .., z]` means `len >= 2`. A new way to forge a value the analysis does not model (the one
+today is the zero fill of `let e: E;`, handled by `zero_value_modeled`) needs the same treatment.
+
+LANDMINE: **a `match` arm binds its names only after its test passed.** `bind_match_ident` loads
+every place its pattern names — `data[1]` for `[a, b]` on a slice, through the data pointer of an
+empty one for `[x, ..]` — so calling it before the arm's test (as `lower_match` did until slice
+patterns existed, harmlessly while every place was in bounds whatever the value) reads past a
+slice's end on the interpreter and faults natively. `emit_match_arm_test` binds on the test's
+success edge and leaves the builder where the body starts; a pattern test that needs a place to
+exist (a slice's elements) must likewise test in a block only the guarding test reaches, not AND an
+eager load into it.
 
 **A new `ExprKind` variant is a sweep the compiler drives.** Every expression walker of the front
 end is an exhaustive `match` (28 of them when closures landed, across `wukong_ast`, the driver's

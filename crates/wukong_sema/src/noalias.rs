@@ -351,8 +351,13 @@ impl Walker<'_> {
                 self.bind(*name, Binding::default());
                 self.bind_pattern(sub, Binding::default());
             }
-            PatKind::Slice { prefix, suffix, .. } => {
-                for q in prefix.iter().chain(suffix) {
+            PatKind::Slice {
+                prefix,
+                rest_binding,
+                suffix,
+                ..
+            } => {
+                for q in prefix.iter().chain(rest_binding.as_deref()).chain(suffix) {
                     self.bind_pattern(q, Binding::default());
                 }
             }
@@ -457,15 +462,43 @@ impl Walker<'_> {
                     }
                 }
             }
-            PatKind::Slice { prefix, suffix, .. } => {
-                let elem = match ty {
-                    Some(Ty::Array { elem, .. }) => Some(&**elem),
-                    _ => None,
-                };
-                for q in prefix.iter().chain(suffix) {
-                    self.bind_place_pattern(q, elem, Some(root.clone()));
+            // On a `[]T` view the listed elements live in the storage the view points at, and
+            // `rest @ ..` is a narrower view of that same storage.
+            PatKind::Slice {
+                prefix,
+                rest_binding,
+                suffix,
+                ..
+            } => match ty {
+                Some(Ty::Slice(elem)) => {
+                    let target = self.place_view_target(&root);
+                    for q in prefix.iter().chain(suffix) {
+                        self.bind_place_pattern(q, Some(elem), Some(target.clone()));
+                    }
+                    if let Some(PatKind::Ident(s)) = rest_binding.as_deref().map(|b| &b.kind) {
+                        self.bind(
+                            *s,
+                            Binding {
+                                view_of: Some(target),
+                                storage_of: None,
+                            },
+                        );
+                    }
                 }
-            }
+                // An array's elements and its `rest @ ..` sub-array are places inside it.
+                _ => {
+                    let elem = match ty {
+                        Some(Ty::Array { elem, .. }) => Some(&**elem),
+                        _ => None,
+                    };
+                    for q in prefix.iter().chain(suffix) {
+                        self.bind_place_pattern(q, elem, Some(root.clone()));
+                    }
+                    if let Some(b) = rest_binding.as_deref() {
+                        self.bind_place_pattern(b, ty, Some(root.clone()));
+                    }
+                }
+            },
             PatKind::Or(ps) => {
                 for q in ps {
                     self.bind_place_pattern(q, ty, Some(root.clone()));
@@ -478,6 +511,20 @@ impl Walker<'_> {
             | PatKind::Bool(_)
             | PatKind::Path(_)
             | PatKind::Range { .. } => {}
+        }
+    }
+
+    /// The storage the view value held at the place `root` points at: a plain view binding's
+    /// recorded target, the view at an exact field place, or — past a view already — the whole
+    /// pointee.
+    fn place_view_target(&self, root: &Root) -> Root {
+        match root {
+            Root::Storage(b, path) if path.is_empty() => self.bindings[*b as usize]
+                .view_of
+                .clone()
+                .unwrap_or_else(|| Root::Target(*b, Vec::new())),
+            Root::Storage(b, path) => Root::Target(*b, path.clone()),
+            target @ Root::Target(..) => target.clone(),
         }
     }
 
@@ -702,10 +749,12 @@ impl Walker<'_> {
                 // bound by pointer into it (`bind_place_pattern`). A view scrutinee is the view
                 // value itself, which an arm binds as a copy.
                 let ty = self.ty(scrutinee).cloned();
-                let root = if ty.as_ref().is_some_and(is_view_ty) {
-                    None
-                } else {
-                    self.root_of(scrutinee)
+                let root = match ty.as_ref() {
+                    // A `[]T` scrutinee is matched through the place holding the view: an array
+                    // pattern binds into what the view points at ([`Walker::place_view_target`]).
+                    Some(Ty::Slice(_)) => self.place_storage(scrutinee),
+                    Some(t) if is_view_ty(t) => None,
+                    _ => self.root_of(scrutinee),
                 };
                 for arm in arms {
                     self.scopes.push(HashMap::default());

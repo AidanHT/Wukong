@@ -808,8 +808,17 @@ impl Desugar<'_> {
                 }
             }
             PatKind::Binding { sub, .. } => self.refresh_pattern(sub),
-            PatKind::Slice { prefix, suffix, .. } => {
-                for sub in prefix.iter_mut().chain(suffix.iter_mut()) {
+            PatKind::Slice {
+                prefix,
+                rest_binding,
+                suffix,
+                ..
+            } => {
+                for sub in prefix
+                    .iter_mut()
+                    .chain(rest_binding.as_deref_mut())
+                    .chain(suffix.iter_mut())
+                {
                     self.refresh_pattern(sub);
                 }
             }
@@ -918,8 +927,13 @@ fn pattern_bindings(p: &Pattern, out: &mut Vec<Symbol>) {
             out.push(*name);
             pattern_bindings(sub, out);
         }
-        PatKind::Slice { prefix, suffix, .. } => {
-            for sub in prefix.iter().chain(suffix) {
+        PatKind::Slice {
+            prefix,
+            rest_binding,
+            suffix,
+            ..
+        } => {
+            for sub in prefix.iter().chain(rest_binding.as_deref()).chain(suffix) {
                 pattern_bindings(sub, out);
             }
         }

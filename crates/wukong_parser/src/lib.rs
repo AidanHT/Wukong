@@ -1877,7 +1877,16 @@ impl<'a> Parser<'a> {
                 None
             };
             self.expect(T::FatArrow);
-            let body = self.parse_expr();
+            // A `{ … }` body ends the arm at its `}` (Rust's rule, as for a block-like statement),
+            // so the comma after it is optional and the next arm may open with `[`, `(` or `-`:
+            // `[x, ..] => { … } [] => …` is two arms, not an index into the block.
+            let body = if self.at(T::LBrace) {
+                let open = self.span();
+                let b = self.parse_block();
+                self.finish_expr(open, ExprKind::Block(b))
+            } else {
+                self.parse_expr()
+            };
             arms.push(MatchArm {
                 pat,
                 guard,
@@ -2662,15 +2671,42 @@ impl<'a> Parser<'a> {
                 }
             }
             // `[a, b, .., z]` — an array pattern: the first elements, optionally a `..` standing
-            // for the unconstrained middle, and the last elements.
+            // for the unconstrained middle (`rest @ ..` also binds it), and the last elements.
             T::LBracket => {
                 self.bump(); // [
                 let mut prefix = Vec::new();
                 let mut suffix = Vec::new();
                 let mut rest = false;
+                let mut rest_binding = None;
                 while !self.at(T::RBracket) && !self.at(T::Eof) {
-                    if !rest && self.eat(T::DotDot) {
-                        rest = true;
+                    let named_rest =
+                        self.at(T::Ident) && self.nth(1) == T::At && self.nth(2) == T::DotDot && {
+                            let sp = self.span();
+                            &self.src[sp.lo as usize..sp.hi as usize] != "_"
+                        };
+                    if self.at(T::DotDot) || named_rest {
+                        let at = self.span();
+                        let binding = named_rest.then(|| {
+                            let name = self.intern_span(at);
+                            self.bump(); // name
+                            self.bump(); // @
+                            Box::new(Pattern {
+                                id: self.nid(),
+                                kind: PatKind::Ident(name),
+                                span: at,
+                            })
+                        });
+                        self.bump(); // ..
+                        if rest {
+                            self.error(
+                                at.to(self.prev_span()),
+                                "E0206",
+                                "an array pattern has at most one `..`",
+                            );
+                        } else {
+                            rest = true;
+                            rest_binding = binding;
+                        }
                     } else if rest {
                         suffix.push(self.parse_pattern());
                     } else {
@@ -2684,6 +2720,7 @@ impl<'a> Parser<'a> {
                 PatKind::Slice {
                     prefix,
                     rest,
+                    rest_binding,
                     suffix,
                 }
             }
@@ -2935,8 +2972,14 @@ fn pattern_bindings(p: &Pattern, out: &mut Vec<(Symbol, Span)>) {
         PatKind::Struct { fields, .. } => {
             fields.iter().for_each(|fp| pattern_bindings(&fp.pat, out))
         }
-        PatKind::Slice { prefix, suffix, .. } => prefix
+        PatKind::Slice {
+            prefix,
+            rest_binding,
+            suffix,
+            ..
+        } => prefix
             .iter()
+            .chain(rest_binding.as_deref())
             .chain(suffix)
             .for_each(|s| pattern_bindings(s, out)),
         PatKind::Wildcard
@@ -3905,6 +3948,74 @@ mod tests {
         assert_eq!(
             codes("if let x = a && let y = b { 1 } else { 0 }"),
             vec!["E0200"]
+        );
+    }
+
+    /// A `{ … }` arm body ends at its `}`: an arm after it that opens with `[`, `(` or `-` is a new
+    /// arm, not an index, a call or a subtraction continuing the block.
+    #[test]
+    fn a_block_body_ends_its_arm() {
+        for src in [
+            "match s { [a, ..] => { a } [] => 0 }",
+            "match t { (0, y) => { y } (x, _) => x }",
+            "match k { 1 => { 2 } -1 => { 3 } _ => 4 }",
+        ] {
+            let mut i = Interner::new();
+            let (e, d) = parse_expr_str(src, SourceId(0), &mut i);
+            assert!(d.is_empty(), "{src}: {d:?}");
+            let ExprKind::Match { arms, .. } = &e.kind else {
+                panic!("{src}: {e:?}")
+            };
+            assert!(arms.len() >= 2, "{src}: {} arm(s)", arms.len());
+            assert!(matches!(arms[0].body.kind, ExprKind::Block(_)), "{src}");
+        }
+    }
+
+    #[test]
+    fn rest_bindings_in_array_patterns() {
+        let mut i = Interner::new();
+        let (e, d) = parse_expr_str(
+            "match s { [a, rest @ .., z] => 1, [whole @ ..] => 2, [x, ..] => 3, _ => 4 }",
+            SourceId(0),
+            &mut i,
+        );
+        assert!(d.is_empty(), "{d:?}");
+        let ExprKind::Match { arms, .. } = &e.kind else {
+            panic!("{e:?}")
+        };
+        let shape = |p: &Pattern| match &p.kind {
+            PatKind::Slice {
+                prefix,
+                rest,
+                rest_binding,
+                suffix,
+            } => (
+                prefix.len(),
+                *rest,
+                rest_binding.as_deref().map(|b| match b.kind {
+                    PatKind::Ident(s) => i.resolve(s).to_string(),
+                    _ => panic!("a rest binding is a name: {b:?}"),
+                }),
+                suffix.len(),
+            ),
+            other => panic!("not an array pattern: {other:?}"),
+        };
+        assert_eq!(shape(&arms[0].pat), (1, true, Some("rest".to_string()), 1));
+        assert_eq!(shape(&arms[1].pat), (0, true, Some("whole".to_string()), 0));
+        assert_eq!(shape(&arms[2].pat), (1, true, None, 0));
+        // At most one `..`, named or not.
+        let codes = |src: &str| -> Vec<&'static str> {
+            let mut i = Interner::new();
+            let (_e, d) = parse_expr_str(src, SourceId(0), &mut i);
+            d.into_iter().filter_map(|d| d.code).collect()
+        };
+        assert_eq!(
+            codes("match s { [a, .., b, ..] => 1, _ => 0 }"),
+            vec!["E0206"]
+        );
+        assert_eq!(
+            codes("match s { [r @ .., t @ ..] => 1, _ => 0 }"),
+            vec!["E0206"]
         );
     }
 

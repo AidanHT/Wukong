@@ -1089,8 +1089,13 @@ fn scan_pattern(p: &Pattern, f: &mut RegionFacts) {
             f.declared.insert(*name);
             scan_pattern(sub, f);
         }
-        PatKind::Slice { prefix, suffix, .. } => {
-            for s in prefix.iter().chain(suffix) {
+        PatKind::Slice {
+            prefix,
+            rest_binding,
+            suffix,
+            ..
+        } => {
+            for s in prefix.iter().chain(rest_binding.as_deref()).chain(suffix) {
                 scan_pattern(s, f);
             }
         }

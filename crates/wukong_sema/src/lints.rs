@@ -1442,8 +1442,13 @@ fn pattern_names(p: &Pattern, out: &mut Vec<(Symbol, Span)>) {
             }
             pattern_names(sub, out);
         }
-        PatKind::Slice { prefix, suffix, .. } => {
-            for s in prefix.iter().chain(suffix) {
+        PatKind::Slice {
+            prefix,
+            rest_binding,
+            suffix,
+            ..
+        } => {
+            for s in prefix.iter().chain(rest_binding.as_deref()).chain(suffix) {
                 pattern_names(s, out);
             }
         }

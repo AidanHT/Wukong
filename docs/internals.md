@@ -253,8 +253,16 @@ the entry validates them against the operand lengths and returns a status the lo
 zero; the interpreter runs the same validation and calls the same serial entry.
 
 **Match lowering and the exhaustiveness verdict.** `lower_match` lowers a `match` to an if-else chain
-of arm tests (`pattern_cond`); an arm's guard is lowered in a block only the pattern's success edge
-reaches, so it runs only after the pattern matched. Sema's pattern-usefulness analysis
+of arm tests (`pattern_cond`); an arm's names are bound, and its guard is lowered, in a block only
+the pattern's success edge reaches (`emit_match_arm_test`), so the guard runs only after the pattern
+matched and a binding never reads a place the test has not proven exists. An array pattern on a
+`[]T` (`mir_build::slice_pat`) is a length test (`len == listed`, or `>=` with `..`) followed — in a
+block only a passing length test reaches, joined by an `i1` block parameter — by the elements'
+tests at `data[i]` and `data[len - suffix + j]`; `rest @ ..` binds a fresh fat pointer
+`{ data + prefix, len - listed }` on a slice and the address of element `prefix`, typed
+`[T; N - listed]`, on an array. The usefulness analysis gives a slice column one constructor per
+length below `L` and one variable-length constructor for every length `>= L` (rustc's split, `L`
+past every length a row pins down). Sema's pattern-usefulness analysis
 (`wukong_sema::usefulness`) decides E0405 and W0020, and it also publishes a positive verdict,
 `SemaResult::exhaustive_matches`: the `Match` ids it proved exhaustive over a concrete scrutinee type
 whose all-zero value it models (`zero_value_modeled` — mir_build zero-fills `let e: E;`, so an enum
@@ -2373,7 +2381,8 @@ surface form again:
 attributes stay inline. Structs and enums put one field or variant per line with a trailing comma.
 Blocks are always multi-line except an empty, comment-free `{}`. `} else if c {` / `} else {`. A
 match arm is `pat[ if g] => body,`; a block-bodied arm drops the comma unless the next arm's pattern
-starts with `(`, `[` or `-` (which would continue the block as a call, an index or a subtraction).
+starts with `(`, `[` or `-`. (The parser ends a block arm body at its `}`, so that comma is not
+needed to parse; it keeps the text from reading as a call, an index or a subtraction.)
 A statement ends in `;` unless it is a block-like expression (`{…}`, `if`, `match`, `loop`), `while`,
 `for` or `while let`; a block-like expression statement still gets one when it is the block's last
 statement with no tail (else it would re-parse as the tail) or when the next statement starts with a

@@ -1003,8 +1003,17 @@ impl Rewriter<'_> {
                 self.bind(*name);
                 self.pattern(sub);
             }
-            PatKind::Slice { prefix, suffix, .. } => {
-                for sub in prefix.iter_mut().chain(suffix.iter_mut()) {
+            PatKind::Slice {
+                prefix,
+                rest_binding,
+                suffix,
+                ..
+            } => {
+                for sub in prefix
+                    .iter_mut()
+                    .chain(rest_binding.as_deref_mut())
+                    .chain(suffix.iter_mut())
+                {
                     self.pattern(sub);
                 }
             }

@@ -5,6 +5,34 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Slice patterns, `rest @ ..` and or-pattern bindings (`gap6/patterns-slices`)
+
+- **Array patterns on `[]T` slices (N26).** `match s { [] => …, [x] => …, [first, .., last] => … }`
+  now compiles; it was `E0401` ("test `s.len()` and index it instead"). On a slice an array pattern
+  is a run-time length test — `len == listed` without `..`, `len >= listed` with one — and only then
+  its elements' own tests, the suffix counted from the end. Exhaustiveness splits a slice column by
+  length as rustc does: `[] | [_, ..]` is exhaustive, `[] | [x]` is `E0405` with the witness
+  `[_, _, ..]`, and `W0020` sees an arm a `[..]` before it covers. A `let` or a `for` head whose
+  slice pattern tests a length is `E0442` (`[]` not covered); `[..]` and `[all @ ..]` match every
+  slice. Slice patterns work in `match`, `if let` / `while let` (with `&&` chains) and `let … else`
+  (`tests/run/slice_patterns.wk`, `tests/fail/slice_match_nonexhaustive.wk`,
+  `tests/fail/slice_let_refutable.wk`).
+- **`rest @ ..` binds the elements the `..` stands for, in place.** On a slice it is the sub-slice
+  `{ data + prefix, len - listed }` over the same storage, so `[head, rest @ ..] => head + sum(rest)`
+  recurses without copying; on an array `[T; N]` it is the sub-array `[T; N - listed]` at its
+  place, its length part of its type (passing it where another length is expected is `E0501`). In a
+  `match` that place is the scrutinee's, as for every aggregate a pattern binds; a `let` copies its
+  initializer into its own slot first, so `let [_, tail @ ..] = v;` does not see a later `v[1] = …`.
+- **A match binds an arm's names only after the arm's test passed.** The names used to be bound
+  before the test, harmlessly while every place a pattern names was in bounds whatever the value; on
+  a slice, `[a, b]` against a one-element slice would load past its end and `[x, ..]` against an
+  empty one through a null data pointer. Bindings now sit on the test's success edge, before the
+  guard. The recognizer census is unchanged.
+- **A block arm body ends its arm.** `X => { … }` followed by an arm that opens with `[`, `(` or `-`
+  parsed as an index into, a call of or a subtraction from the block, so the two arms needed a comma
+  between them (which the formatter always prints); it is now two arms, as in Rust. No `.wk` file in
+  the repository relied on the old reading.
+
 ### Source locations through MIR into native code (`gap5/native-source-locations`)
 
 - **Native-backend failures point at the source (P11.8).** A `C0002` (a slot above the native

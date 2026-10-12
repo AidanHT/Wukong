@@ -668,7 +668,9 @@ does not lower — it reports `C0001` at the pattern; inline the literal), **enu
 `Color::Red` (matched by discriminant), **tuple** patterns
 `(0, _) => …` (each field tested and bound, nesting allowed — and these compose, e.g. `(0 | 1, y)`),
 an **identifier** binding (binds the scrutinee or field), and the wildcard `_`. Any arm may carry an
-optional `if` guard, and `match` works in both value and statement position. See
+optional `if` guard, and `match` works in both value and statement position. An arm binds its
+names only once its pattern matched, and a `{ … }` arm body ends the arm at its `}`, so the comma
+after it is optional even before an arm that opens with `[`, `(` or `-`. See
 `tests/run/{match_expr,match_patterns,match_tuple}.wk`.
 
 ```wukong
@@ -694,9 +696,30 @@ fn describe(p: Point, n: i32, a: [i32; 4]) -> i32 {
 Three more pattern forms (✅): a **struct** pattern `Point { x: 0, y, .. }` on a value of that
 struct (an unlisted field is unconstrained), a **binding** `name @ sub` that binds the whole value
 `sub` matches (also nested: `(a @ 1..=5, b)`), and an **array** pattern `[a, b, .., z]` on a
-fixed-size array — without `..` it lists every element. All three also destructure in a `let`
-(`let Point { x, y } = p;`, `let [first, .., last] = a;`). An array pattern on a `[]T` slice is
-`E0401`: its length is a run-time value, so test `s.len()` and index instead. A struct pattern names
+fixed-size array `[T; N]` or a `[]T` slice — without `..` it lists every element. All three also
+destructure in a `let` (`let Point { x, y } = p;`, `let [first, .., last] = a;`).
+
+```wukong
+fn sum(s: []i32) -> i32 {
+    return match s {
+        [] => 0,
+        [head, rest @ ..] => head + sum(rest),   // `rest` views the tail; nothing is copied
+    };
+}
+```
+
+On a **slice** (✅) an array pattern is a run-time **length test** — `[a, b]` matches exactly two
+elements, `[a, .., z]` at least two — and only then its elements' own tests, the suffix counted
+from the end; an element is never read from a slice too short to have it. A slice match is
+exhaustive only when every length is covered: `[] | [_, ..]` is, `[] | [x]` is `E0405` with the
+witness `[_, _, ..]` (`tests/fail/slice_match_nonexhaustive.wk`). A `let` or a `for` head over
+slices must not test a length, so only `[..]` and `[all @ ..]` fit there (`E0442`,
+`tests/fail/slice_let_refutable.wk`); use `let … else` or a `match`. **`rest @ ..`** (✅) binds the
+elements the `..` stands for, in place: a sub-slice view of a slice, and the sub-array
+`[T; N - listed]` of an array, whose length is part of its type. In a `match` that place is the
+scrutinee's, as for every aggregate a pattern binds (a write to the scrutinee shows through it); a
+`let` first copies its initializer into its own slot, so `let [_, tail @ ..] = v;` keeps `v`'s
+elements as they were (`tests/run/slice_patterns.wk`). A struct pattern names
 its struct and a data-carrying variant pattern (`Shape::Circle(r)`) its enum, and the value matched
 must be of that type — `E0401` otherwise, in a `match`, a `let` and a `for` head alike
 (`tests/fail/for_head_variant_mismatch.wk`).
@@ -726,9 +749,8 @@ exit — because the names its pattern binds do not exist on that path (`E0401` 
 `let` pattern, in turn, must be **irrefutable**: `let Shape::Circle(r) = s;` would leave `r` unbound
 for every other shape, so it is `E0442`, with a witness naming a value it misses
 (`tests/run/patterns_struct_binding_slice.wk`, `tests/fail/let_refutable_pattern.wk`,
-`tests/fail/let_else_not_diverging.wk`). Not yet: a `rest @ ..` sub-array binding, a binding
-inside an or-pattern (`C0001` at the pattern), an array pattern on a `[]T` slice, and more than one
-`let` in an `if let` chain.
+`tests/fail/let_else_not_diverging.wk`). Not yet: a binding inside an or-pattern (`C0001` at the
+pattern), and more than one `let` in an `if let` chain.
 
 A literal pattern must be **in range for the scrutinee's type**: `match n { 200 => … }` against an
 `i8` is an `E0431` ("literal `200` is out of range for `i8` (-128..=127)"), not a value truncated to

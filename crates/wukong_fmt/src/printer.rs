@@ -1405,6 +1405,7 @@ impl<'a> Printer<'a> {
             PatKind::Slice {
                 prefix,
                 rest,
+                rest_binding,
                 suffix,
             } => {
                 self.w("[");
@@ -1421,6 +1422,10 @@ impl<'a> Printer<'a> {
                 }
                 if *rest {
                     sep(self);
+                    if let Some(b) = rest_binding {
+                        self.pat(b);
+                        self.w(" @ ");
+                    }
                     self.w("..");
                 }
                 for s in suffix {
@@ -2464,8 +2469,9 @@ impl<'a> Printer<'a> {
             match &a.body.kind {
                 ExprKind::Block(b) => {
                     self.block(b, ns);
-                    // After a block body a comma is optional — unless the next arm's pattern
-                    // would continue the block as a call, an index or a subtraction.
+                    // After a block body a comma is optional. Before an arm whose pattern opens
+                    // like a call, an index or a subtraction one is printed anyway: the parser
+                    // ends the arm at the `}` either way, but the text then cannot be misread.
                     let cont = arms
                         .get(k + 1)
                         .is_some_and(|n| pat_starts_with_open(&n.pat));

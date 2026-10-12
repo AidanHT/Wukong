@@ -3590,8 +3590,16 @@ impl<'a> Sema<'a> {
             PatKind::Slice {
                 prefix,
                 rest,
+                rest_binding,
                 suffix,
-            } => self.check_slice_pattern(prefix, *rest, suffix, ty, pat.span),
+            } => self.check_slice_pattern(
+                prefix,
+                *rest,
+                rest_binding.as_deref(),
+                suffix,
+                ty,
+                pat.span,
+            ),
         }
     }
 

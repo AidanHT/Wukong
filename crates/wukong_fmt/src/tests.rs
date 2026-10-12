@@ -699,6 +699,56 @@ fn match_guards_and_block_bodied_arms() {
     );
 }
 
+/// `name @ ..` prints with a space around the `@`. A block body ends its arm, so an arm after one
+/// may open with `[`, `(` or `-` without a comma between them; the printer still puts one there.
+#[test]
+fn rest_bindings_and_arms_after_a_block_body() {
+    golden(
+        "fn f(s: []i32, t: (i32, i32)) -> i32 {
+    match s {
+        [h, rest   @  .., t] => { g(rest); }
+        [x] => x,
+        [all@..] => { g(all); }
+        [] => 0
+    }
+    match t {
+        (0, y) => { g(y); }
+        (x, _) => x
+    }
+    match k { 1 => { a(); } -1 => { b(); } _ => {} }
+}
+",
+        "fn f(s: []i32, t: (i32, i32)) -> i32 {
+    match s {
+        [h, rest @ .., t] => {
+            g(rest);
+        },
+        [x] => x,
+        [all @ ..] => {
+            g(all);
+        },
+        [] => 0,
+    }
+    match t {
+        (0, y) => {
+            g(y);
+        },
+        (x, _) => x,
+    }
+    match k {
+        1 => {
+            a();
+        },
+        -1 => {
+            b();
+        }
+        _ => {}
+    }
+}
+",
+    );
+}
+
 #[test]
 fn if_let_chains_and_their_parentheses() {
     golden(

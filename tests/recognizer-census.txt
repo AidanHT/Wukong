@@ -446,6 +446,7 @@ slice_bounds_oob.wk:
 slice_destination_spellings.wk:
 slice_len_loop.wk: veckernel*2
 slice_param_kernel_base.wk: veckernel*1 wukong_sgemm_nt
+slice_patterns.wk:
 slice_range_index.wk:
 softmax.wk: wukong_norm_f32
 softmax_bwd.wk: wukong_softmax_bwd_f32

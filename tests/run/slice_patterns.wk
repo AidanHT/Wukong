@@ -1,0 +1,202 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 101
+// EXPECT-OUT: 223
+// EXPECT-OUT: 315
+// EXPECT-OUT: 335
+// EXPECT-OUT: 15
+// EXPECT-OUT: 9
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 2
+// EXPECT-OUT: 705
+// EXPECT-OUT: 5
+// EXPECT-OUT: -1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 0
+// EXPECT-OUT: -1
+// EXPECT-OUT: 16
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 12
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 42
+// EXPECT-OUT: 1
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+// EXPECT-OUT: 7
+// EXPECT-OUT: 27
+// EXPECT-OUT: 2
+// EXPECT-OUT: 60
+// EXPECT-OUT: 3
+// EXPECT-OUT: 2
+module tests.run.slice_patterns
+
+// Array patterns over a `[]T` slice, and `rest @ ..`.
+//
+// On a slice an array pattern is a run-time LENGTH test — `[a, b]` matches exactly two elements,
+// `[a, .., z]` at least two — and only then the listed elements' own tests, the suffix counted
+// from the end. A match is exhaustive only when every length is covered (`[] | [_, ..]`).
+// `rest @ ..` binds the elements the `..` stands for in place: on a slice a narrower view of the
+// same storage, on an array `[T; N]` the sub-array `[T; N - listed]` at its place. In a `match`
+// that place is the scrutinee's; a `let` first copies its initializer into its own slot.
+
+struct P {
+    x: i32,
+    y: i32,
+}
+
+// One arm per length, the last for every length from three up.
+fn classify(s: []i32) -> i32 {
+    return match s {
+        [] => 0,
+        [x] => 100 + x,
+        [a, b] => 200 + a * 10 + b,
+        [first, .., last] => 300 + first * 10 + last,
+    };
+}
+
+// Structural recursion over the tail, a sub-slice viewing the same elements.
+fn sum(s: []i32) -> i32 {
+    return match s {
+        [] => 0,
+        [head, rest @ ..] => head + sum(rest),
+    };
+}
+
+// `[0, ..]` reads `s[0]` only on a slice that has one: an empty slice's data pointer is null.
+fn lead_zero(s: []i32) -> i32 {
+    return match s {
+        [0, ..] => 1,
+        [a, b] => a + b,
+        _ => 2,
+    };
+}
+
+// Patterns on aggregate elements; the suffix is the last element whatever the length.
+fn pts(s: []P) -> i32 {
+    return match s {
+        [P { x: 0, y }, .., last] => y * 100 + last.x,
+        [only] => only.x + only.y,
+        _ => -1,
+    };
+}
+
+// Prefix, `rest @ ..` and suffix together: the middle is a sub-slice.
+fn middle(s: []i32) -> i64 {
+    return match s {
+        [_, mid @ .., _] => mid.len(),
+        _ => -1,
+    };
+}
+
+// Array patterns nest: the first row's first element and the last row's last.
+fn corners(rows: [][i32; 2]) -> i32 {
+    return match rows {
+        [[a, _], .., [_, z]] => a * 10 + z,
+        _ => 0,
+    };
+}
+
+// `let … else` leaves when the slice is too short.
+fn head_or(s: []i32, d: i32) -> i32 {
+    let [h, ..] = s else {
+        return d;
+    };
+    return h;
+}
+
+fn main() -> i32 {
+    let a: [i32; 5] = [1, 2, 3, 4, 5];
+    let s: []i32 = a;
+    // Zero-initialized: no data pointer, length 0.
+    let e: []i32;
+    println(classify(s[0..0]));
+    println(classify(s[0..1]));
+    println(classify(s[1..3]));
+    println(classify(s));
+    println(classify(s[2..5]));
+    println(sum(s));
+    println(sum(s[3..5]));
+    println(lead_zero(e));
+    let z: [i32; 3] = [0, 9, 9];
+    println(lead_zero(z));
+    println(lead_zero(s[0..2]));
+    println(lead_zero(s[0..1]));
+    let ps: [P; 3] = [P { x: 0, y: 7 }, P { x: 1, y: 1 }, P { x: 5, y: 6 }];
+    println(pts(ps));
+    let p1: [P; 1] = [P { x: 2, y: 3 }];
+    println(pts(p1));
+    let p2: [P; 2] = [P { x: 4, y: 0 }, P { x: 0, y: 0 }];
+    println(pts(p2));
+    println(middle(s));
+    println(middle(s[0..2]));
+    println(middle(s[0..1]));
+    let grid: [[i32; 2]; 3] = [[1, 2], [3, 4], [5, 6]];
+    println(corners(grid));
+
+    // Every lane of a rest binding.
+    match s {
+        [first, rest @ ..] => {
+            println(first);
+            println(rest.len());
+            for v in rest {
+                println(v);
+            }
+        }
+        [] => println(-9),
+    }
+
+    // `if let … && cond` and `while let` take slice patterns too.
+    if let [x, y, ..] = s && x < y {
+        println(x * 10 + y);
+    }
+    let mut k: []i32 = s;
+    while let [h, t @ ..] = k {
+        println(h);
+        k = t;
+    }
+    println(head_or(e, 42));
+    println(head_or(s, 42));
+
+    // On a fixed-size array `rest @ ..` is a sub-array, its length in its type.
+    let w: [i32; 4] = [7, 8, 9, 10];
+    match w {
+        [p, mid @ .., q] => {
+            println(p);
+            println(mid[0]);
+            println(mid[1]);
+            println(q);
+        }
+    }
+    let [lo, hi @ ..] = w;
+    println(lo);
+    println(sum(hi));
+
+    // A `let` binds into its own copy; a `match` binds in place, into the scrutinee.
+    let mut v: [i32; 3] = [1, 2, 3];
+    let [_, tail @ ..] = v;
+    v[1] = 50;
+    println(tail[0]);
+    match v {
+        [_, view @ ..] => {
+            v[1] = 60;
+            println(view[0]);
+            println(view[1]);
+        }
+    }
+    println(tail[0]);
+    return 0;
+}

@@ -51,6 +51,8 @@ mod par_grain;
 #[cfg(test)]
 mod repr_tests;
 mod shape_ops;
+// Array patterns over a `[]T` slice (a run-time length test) and `rest @ ..` (see the module docs).
+mod slice_pat;
 mod softmax_oop;
 #[cfg(test)]
 mod srcloc_tests;
@@ -21649,10 +21651,9 @@ impl FnLowerer<'_> {
 
             let body_bb = self.builder.new_block();
             let next_bb = self.builder.new_block();
-            // Bind first so an `Ident` pattern's guard can reference the binding; the binding is
-            // scoped to this arm (popped after the body).
+            // The test binds the pattern's names once it passed, so the guard and the body can
+            // read them; they are scoped to this arm (popped after the body).
             self.push_scope();
-            self.bind_match_ident(&arm.pat, scrut, &scrut_mir, &scrut_ty);
             self.emit_match_arm_test(
                 &arm.pat,
                 (scrut, &scrut_mir, &scrut_ty),
@@ -21660,9 +21661,7 @@ impl FnLowerer<'_> {
                 body_bb,
                 next_bb,
             );
-
-            self.builder.switch_to(body_bb);
-            self.terminated = false;
+            // The test left the builder where the body starts: `body_bb`, after any bindings.
             merge_reachable |= self.emit_match_arm_body(&arm.body, merge, merge_param, &merge_ty);
             self.pop_scope();
 
@@ -21776,11 +21775,30 @@ impl FnLowerer<'_> {
                     self.bind_field_pattern(sub, fptr, &fty);
                 }
             }
-            ast::PatKind::Slice { prefix, suffix, .. } => {
+            // On a `[]T` the elements sit behind the fat pointer at `scrut` (`slice_pat.rs`).
+            ast::PatKind::Slice {
+                prefix,
+                rest_binding,
+                suffix,
+                ..
+            } => {
+                if let Ty::Slice(elem) = scrut_ty {
+                    self.bind_slice_view_pattern(
+                        prefix,
+                        rest_binding.as_deref(),
+                        suffix,
+                        scrut,
+                        elem,
+                    );
+                    return;
+                }
                 for (index, ety, sub) in Self::slice_pattern_elems(scrut_ty, prefix, suffix) {
                     let emir = self.mir_ty_of(&ety);
                     let eptr = self.gep_elem(scrut, &emir, index);
                     self.bind_field_pattern(sub, eptr, &ety);
+                }
+                if let Some(b) = rest_binding {
+                    self.bind_array_rest(b, scrut, scrut_ty, prefix.len(), suffix.len());
                 }
             }
             _ => {}
@@ -21901,7 +21919,16 @@ impl FnLowerer<'_> {
 
     /// End the current (test) block in the branch a match arm takes: to `body_bb` when `pat`
     /// matches the scrutinee `(value, MIR type, sema type)` and its guard, if any, holds; to
-    /// `next_bb` otherwise. The bindings were made before this, so the guard may read them.
+    /// `next_bb` otherwise. The pattern's names are bound in the scope the caller pushed, on the
+    /// success edge of the test, so the guard and the body may read them. The builder is left
+    /// where the body starts — without a guard that is after the bindings, so the body must not
+    /// re-enter `body_bb` itself.
+    ///
+    /// Binding only after the test is what makes an array pattern over a `[]T` safe: `[a, b]`
+    /// against a one-element slice must not load `data[1]`, and `[x, ..]` against an empty one
+    /// must not load through its (possibly null) data pointer. (Bindings used to be made before
+    /// the test, harmlessly while every pattern's places were in bounds whether it matched or
+    /// not.)
     ///
     /// The guard is lowered in a block of its own that only the pattern's success reaches, so it
     /// runs only after the pattern matched — Rust's order, and the one `if let P = e && c` promises.
@@ -21923,6 +21950,9 @@ impl FnLowerer<'_> {
                     .build(MirType::I1, Op::ConstInt(1, MirType::I1))
             });
             self.builder.cond_br(c, body_bb, vec![], next_bb, vec![]);
+            self.builder.switch_to(body_bb);
+            self.terminated = false;
+            self.bind_match_ident(pat, scrut, scrut_mir, scrut_ty);
             return;
         };
         if let Some(pc) = pat_cond {
@@ -21931,12 +21961,15 @@ impl FnLowerer<'_> {
             self.builder.switch_to(guard_bb);
             self.terminated = false;
         }
+        self.bind_match_ident(pat, scrut, scrut_mir, scrut_ty);
         // The guard is normalized to `i1` like every other boolean condition (`if`/`while`/`&&`):
         // a non-bool guard (`match k { x if x => .. }`) would otherwise feed its raw `i32` into the
         // `cond_br`, MIR the verifier and Cranelift reject (the `lower_bool_cond` fix covered
         // if/while/short-circuit/assert but not the match-guard path).
         let gv = self.lower_bool_cond(g);
         self.builder.cond_br(gv, body_bb, vec![], next_bb, vec![]);
+        self.builder.switch_to(body_bb);
+        self.terminated = false;
     }
 
     /// The i1 condition under which `pat` matches the scrutinee. For a scalar pattern `scrut` is the
@@ -22110,7 +22143,16 @@ impl FnLowerer<'_> {
                 }
                 acc
             }
-            ast::PatKind::Slice { prefix, suffix, .. } => {
+            ast::PatKind::Slice {
+                prefix,
+                rest,
+                suffix,
+                ..
+            } => {
+                // A `[]T` slice: a run-time length test, then the elements (`slice_pat.rs`).
+                if let Ty::Slice(elem) = scrut_ty {
+                    return Some(self.slice_view_pattern_cond(prefix, *rest, suffix, scrut, elem));
+                }
                 let mut acc: Option<ValueId> = None;
                 for (index, ety, sub) in Self::slice_pattern_elems(scrut_ty, prefix, suffix) {
                     let emir = self.mir_ty_of(&ety);
@@ -26132,9 +26174,16 @@ fn pattern_has_binding(p: &ast::Pattern) -> bool {
             VariantPat::Struct(fps) => fps.iter().any(|fp| pattern_has_binding(&fp.pat)),
         },
         ast::PatKind::Struct { fields, .. } => fields.iter().any(|fp| pattern_has_binding(&fp.pat)),
-        ast::PatKind::Slice { prefix, suffix, .. } => {
-            prefix.iter().chain(suffix).any(pattern_has_binding)
-        }
+        ast::PatKind::Slice {
+            prefix,
+            rest_binding,
+            suffix,
+            ..
+        } => prefix
+            .iter()
+            .chain(rest_binding.as_deref())
+            .chain(suffix)
+            .any(pattern_has_binding),
         ast::PatKind::Wildcard
         | ast::PatKind::Unit
         | ast::PatKind::Int { .. }

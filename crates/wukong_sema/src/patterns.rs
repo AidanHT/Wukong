@@ -7,8 +7,9 @@
 //!   field binds through its sub-pattern at the field's declared type, and an unlisted field is
 //!   unconstrained.
 //! * An array pattern matches a fixed-size array `[T; N]`: without `..` it lists all `N` elements,
-//!   with one at most `N`. A `[]T` slice's length is known only at run time, so it is rejected
-//!   with a pointer to `s.len()`.
+//!   with one at most `N`. On a `[]T` slice it is a run-time length test instead, which a `let` or
+//!   a `for` head may not make (`E0442`). `rest @ ..` binds the elements the `..` stands for: the
+//!   sub-array `[T; N - listed]` of an array, a `[]T` sub-slice of a slice.
 //! * The `else` of a `let … else` must diverge — `return`, `break`, `continue`, or a `loop` with no
 //!   way out — since the names the pattern binds do not exist on that path.
 //! * A plain `let` pattern must be irrefutable (`E0442`, Rust's E0005): `let Shape::Circle { r } =
@@ -93,17 +94,22 @@ impl Sema<'_> {
         }
     }
 
-    /// Type-check and bind an array pattern `[prefix.., (..), suffix..]` against `ty`.
+    /// Type-check and bind an array pattern `[prefix.., (rest @ ..), suffix..]` against `ty`, a
+    /// fixed-size array `[T; N]` or a `[]T` slice. On an array the element count is checked here;
+    /// on a slice it is a run-time length test (`len == listed` without `..`, `len >= listed` with
+    /// one). `rest @ ..` binds the elements the `..` stands for: a `[T; N - listed]` sub-array of
+    /// an array, a `[]T` sub-slice of a slice — in place, never a copy of the elements.
     pub(crate) fn check_slice_pattern(
         &mut self,
         prefix: &[Pattern],
         rest: bool,
+        rest_binding: Option<&Pattern>,
         suffix: &[Pattern],
         ty: &Ty,
         span: Span,
     ) {
         let listed = (prefix.len() + suffix.len()) as u64;
-        let elem = match ty {
+        let (elem, rest_ty) = match ty {
             Ty::Array { elem, len, .. } => {
                 if (!rest && listed != *len) || (rest && listed > *len) {
                     let what = if rest { "at least " } else { "" };
@@ -116,19 +122,15 @@ impl Sema<'_> {
                         ),
                     );
                 }
-                (**elem).clone()
+                let rest_ty = Ty::Array {
+                    elem: elem.clone(),
+                    len: len.saturating_sub(listed),
+                    shared: false,
+                };
+                ((**elem).clone(), rest_ty)
             }
-            Ty::Unknown | Ty::Error => Ty::Unknown,
-            Ty::Slice(_) => {
-                self.error(
-                    span,
-                    "E0401",
-                    "an array pattern matches a fixed-size array `[T; N]`; a `[]T` slice's length \
-                     is known only at run time — test `s.len()` and index it instead"
-                        .to_string(),
-                );
-                Ty::Unknown
-            }
+            Ty::Slice(elem) => ((**elem).clone(), ty.clone()),
+            Ty::Unknown | Ty::Error => (Ty::Unknown, Ty::Unknown),
             other => {
                 self.error(
                     span,
@@ -138,10 +140,16 @@ impl Sema<'_> {
                         other.display(self.interner)
                     ),
                 );
-                Ty::Unknown
+                (Ty::Unknown, Ty::Unknown)
             }
         };
-        for p in prefix.iter().chain(suffix) {
+        for p in prefix {
+            self.bind_pattern(p, &elem);
+        }
+        if let Some(b) = rest_binding {
+            self.bind_pattern(b, &rest_ty);
+        }
+        for p in suffix {
             self.bind_pattern(p, &elem);
         }
     }
@@ -243,8 +251,17 @@ impl Sema<'_> {
         if !self.check_pattern_shape(pat, elem) {
             return;
         }
-        let Some(r) = refutable_form(pat, &self.defs) else {
-            return;
+        // A form that tests the element, or an array pattern that lists an element of a `[]T`
+        // (it tests the slice's run-time length).
+        let (r, what) = match refutable_form(pat, &self.defs) {
+            Some(r) => (
+                r,
+                "a literal, range, path, or-pattern or enum variant tests the element",
+            ),
+            None => match self.slice_length_test(pat, elem) {
+                Some(r) => (r, "an array pattern on a `[]T` tests its length"),
+                None => return,
+            },
         };
         if !self.check_irrefutable(pat, elem, PatSite::ForHead) {
             self.diags.push(
@@ -252,12 +269,57 @@ impl Sema<'_> {
                     "refutable pattern in `for` head: this pattern tests each element",
                 )
                 .with_code("E0442")
-                .primary(
-                    r.span,
-                    "a literal, range, path, or-pattern or enum variant tests the element",
-                )
+                .primary(r.span, what)
                 .help(PatSite::ForHead.help()),
             );
+        }
+    }
+
+    /// The first array pattern inside `pat` (matched against `ty`) that lists an element of a
+    /// `[]T` slice, and so tests the slice's length at run time; `[..]` and `[rest @ ..]` match
+    /// every slice. Struct, variant, tuple and array sub-patterns reach their field types.
+    fn slice_length_test<'p>(&self, pat: &'p Pattern, ty: &Ty) -> Option<&'p Pattern> {
+        match (&pat.kind, ty) {
+            (PatKind::Slice { prefix, suffix, .. }, Ty::Slice(_))
+                if !prefix.is_empty() || !suffix.is_empty() =>
+            {
+                Some(pat)
+            }
+            (PatKind::Slice { prefix, suffix, .. }, Ty::Array { elem, .. }) => prefix
+                .iter()
+                .chain(suffix)
+                .find_map(|p| self.slice_length_test(p, elem)),
+            (PatKind::Tuple(subs), Ty::Tuple(tys)) => subs
+                .iter()
+                .zip(tys)
+                .find_map(|(p, t)| self.slice_length_test(p, t)),
+            (PatKind::Binding { sub, .. }, _) => self.slice_length_test(sub, ty),
+            (PatKind::Struct { fields, .. }, Ty::Named(n)) => {
+                let Some(DefKind::Struct(decl)) = self.defs.lookup(*n).map(|d| &d.kind) else {
+                    return None;
+                };
+                fields.iter().find_map(|fp| {
+                    let (_, t) = decl.iter().find(|(f, _)| *f == fp.name)?;
+                    self.slice_length_test(&fp.pat, t)
+                })
+            }
+            (PatKind::Variant { path, fields }, _) => {
+                let payload = variant_payload(path, &self.defs)?;
+                match (fields, payload) {
+                    (VariantPat::Tuple(subs), VariantPayload::Tuple(tys)) => subs
+                        .iter()
+                        .zip(&tys)
+                        .find_map(|(p, t)| self.slice_length_test(p, t)),
+                    (VariantPat::Struct(fps), VariantPayload::Struct(named)) => {
+                        fps.iter().find_map(|fp| {
+                            let (_, t) = named.iter().find(|(n, _)| *n == fp.name)?;
+                            self.slice_length_test(&fp.pat, t)
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
         }
     }
 
@@ -294,7 +356,7 @@ impl Sema<'_> {
             },
             PatKind::Binding { sub, .. } => self.check_pattern_shape(sub, ty),
             PatKind::Slice { prefix, suffix, .. } => {
-                let Ty::Array { elem, .. } = ty else {
+                let (Ty::Array { elem, .. } | Ty::Slice(elem)) = ty else {
                     return true;
                 };
                 let elem = (**elem).clone();
@@ -537,7 +599,7 @@ mod tests {
             "fn f(a: [i32; 4]) -> i32 { return match a { [0, .., 0] => 0, [h, .., t] => h + t }; }",
         );
         assert_clean("fn f(a: [i32; 3]) -> i32 { let [p, q, r] = a; return p + q + r; }");
-        // The element count must fit the array; a slice's length is not static.
+        // The element count must fit the array.
         assert_code(
             "fn f(a: [i32; 3]) -> i32 { let [p, q] = a; return p + q; }",
             "E0401",
@@ -546,8 +608,13 @@ mod tests {
             "fn f(a: [i32; 2]) -> i32 { return match a { [p, q, r, ..] => p, _ => 0 }; }",
             "E0401",
         );
+        // Neither a `str` nor a scalar is an array.
         assert_code(
-            "fn f(s: []i32) -> i32 { return match s { [p, ..] => p, _ => 0 }; }",
+            "fn f(s: str) -> i32 { return match s { [b, ..] => b as i32, _ => 0 }; }",
+            "E0401",
+        );
+        assert_code(
+            "fn f(x: i32) -> i32 { return match x { [b, ..] => b, _ => 0 }; }",
             "E0401",
         );
         let d = check(
@@ -558,6 +625,51 @@ mod tests {
                 .any(|d| d.code == Some("E0405") && d.message.contains("[false, true]")),
             "{d:?}"
         );
+    }
+
+    /// An array pattern on a `[]T` tests its length at run time; `rest @ ..` binds the elements
+    /// the `..` stands for: a sub-slice of a slice, a `[T; N - listed]` sub-array of an array.
+    #[test]
+    fn slice_patterns_and_rest_bindings() {
+        assert_clean(
+            "fn f(s: []i32) -> i32 { return match s { [] => 0, [x] => x, [a, .., z] => a + z }; }",
+        );
+        assert_clean(
+            "fn sum(s: []i32) -> i32 { return match s { [] => 0, [h, t @ ..] => h + sum(t) }; }",
+        );
+        assert_clean(
+            "struct P { x: i32 } fn f(s: []P) -> i32 { return match s { [P { x: 0 }, ..] => 1,              [p, .., q] => p.x + q.x, _ => 2 }; }",
+        );
+        // A sub-array has the remaining length, `[i32; 2]` out of a `[i32; 4]`, checked like any
+        // other array length (a shape error, `E0501`).
+        assert_clean(
+            "fn g(m: [i32; 2]) -> i32 { return m[0] + m[1]; }              fn f(a: [i32; 4]) -> i32 { let [x, mid @ .., y] = a; return x + g(mid) + y; }",
+        );
+        assert_code(
+            "fn g(m: [i32; 3]) -> i32 { return m[0]; }              fn f(a: [i32; 4]) -> i32 { let [x, mid @ .., y] = a; return x + g(mid) + y; }",
+            "E0501",
+        );
+        // A sub-slice is a `[]T`.
+        assert_code(
+            "fn f(s: []i32) -> i32 { return match s { [_, t @ ..] => t, _ => 0 }; }",
+            "E0401",
+        );
+        // A refutable slice pattern in `let` or a `for` head names the slice it misses.
+        let d = check("fn f(s: []i32) -> i32 { let [a, r @ ..] = s; return a + r[0]; }");
+        assert!(
+            d.iter()
+                .any(|d| d.code == Some("E0442") && d.message.contains("`[]` not covered")),
+            "{d:?}"
+        );
+        assert_code(
+            "fn f(ss: [[]i32; 2]) -> i32 { let mut t = 0; for [a, ..] in ss { t = t + a; }              return t; }",
+            "E0442",
+        );
+        // `[..]` and `[all @ ..]` match every slice.
+        assert_clean(
+            "fn f(ss: [[]i32; 2]) -> i64 { let mut t: i64 = 0; for [all @ ..] in ss {              t = t + all.len(); } return t; }",
+        );
+        assert_clean("fn f(s: []i32) -> i64 { let [..] = s; let [r @ ..] = s; return r.len(); }");
     }
 
     #[test]

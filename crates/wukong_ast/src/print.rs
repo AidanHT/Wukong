@@ -634,6 +634,7 @@ impl AstPrinter<'_> {
             PatKind::Slice {
                 prefix,
                 rest,
+                rest_binding,
                 suffix,
             } => {
                 self.line("pat slice");
@@ -641,8 +642,19 @@ impl AstPrinter<'_> {
                     for s in prefix {
                         p.pattern(s);
                     }
-                    if *rest {
-                        p.line("..");
+                    match (rest, rest_binding.as_deref()) {
+                        (
+                            true,
+                            Some(Pattern {
+                                kind: PatKind::Ident(s),
+                                ..
+                            }),
+                        ) => {
+                            let nm = p.sym(*s);
+                            p.line(format!("{nm} @ .."));
+                        }
+                        (true, _) => p.line(".."),
+                        (false, _) => {}
                     }
                     for s in suffix {
                         p.pattern(s);
