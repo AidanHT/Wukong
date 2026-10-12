@@ -23,9 +23,10 @@
 //!   (`sat_add`, `sat_sub`, `mulhi`, `widening_mul`, `overflowing_*`) is **`E0447`** — saturating
 //!   at `i8` and at `i32` give different answers, so neither may be chosen silently. An unsuffixed
 //!   literal adapts to the other operand's type, so `sat_add(x, 1)` needs no suffix;
-//! * a literal operand of `pack_i4` / `pack_u4` that is not a 4-bit value of the nibble's
-//!   signedness (`pack_u4(16, 0)`, `pack_i4(8, 0)`) is **`E0439`** — a run-time operand keeps its
-//!   low four bits, as `as` would, but a literal outside the range can only be a mistake.
+//! * a literal operand of `pack_i4` / `pack_u4` — suffixed or not, or an expression of literals —
+//!   that is not a 4-bit value of the nibble's signedness (`pack_u4(16, 0)`, `pack_u4(16u8, 0)`,
+//!   `pack_i4(8, 0)`) is **`E0439`** — a run-time operand keeps its low four bits, as `as` would,
+//!   but a literal outside the range can only be a mistake.
 //!
 //! Anything else that is not a scalar is the usual `E0401`, a wrong argument count `E0503`.
 
@@ -428,8 +429,12 @@ impl Sema<'_> {
                 let mut ok = true;
                 for i in 0..2 {
                     match self.sb_int(name, args, arg_tys, i) {
-                        Opnd::Literal(_) => ok &= self.sb_nibble_literal(name, &args[i], i, signed),
-                        Opnd::Known(_) | Opnd::Lenient => {}
+                        // A suffixed literal (`16u8`) is `Known`, but its value is as fixed as an
+                        // unsuffixed one's; `sb_nibble_literal` judges any operand that folds.
+                        Opnd::Literal(_) | Opnd::Known(_) => {
+                            ok &= self.sb_nibble_literal(name, &args[i], i, signed)
+                        }
+                        Opnd::Lenient => {}
                         Opnd::Bad => ok = false,
                     }
                 }
@@ -458,8 +463,10 @@ impl Sema<'_> {
     /// `E0439` unless the literal operand `i` of `pack_i4` / `pack_u4` is a 4-bit value of the
     /// nibble's signedness (`-8..=7` signed, `0..=15` unsigned). A run-time operand keeps its low
     /// four bits, as `as` would; a literal outside the range is a value the nibble cannot hold, so
-    /// it is rejected instead of silently wrapping (`pack_u4(16, 0)` would pack `0`). Returns
-    /// whether the literal is in range.
+    /// it is rejected instead of silently wrapping (`pack_u4(16, 0)` would pack `0`). A literal is
+    /// any operand `eval_const_int` folds: unsuffixed or suffixed (`16u8`), negated, or an
+    /// expression of literals (`8 + 8`); anything else is a run-time operand. Returns whether the
+    /// literal is in range.
     fn sb_nibble_literal(&mut self, name: &str, arg: &Expr, i: usize, signed: bool) -> bool {
         let (lo, hi) = if signed { (-8, 7) } else { (0, 15) };
         match crate::eval_const_int(arg, self.interner) {
@@ -996,6 +1003,15 @@ mod tests {
             errors("fn f() -> u8 { return pack_u4(16, 0) + pack_i4(-9, 8); }"),
             ["E0439", "E0439", "E0439"]
         );
+        // A suffixed literal, and an expression of literals, is still a value the program wrote.
+        assert_eq!(
+            errors(
+                "fn f() -> u8 { return pack_u4(16u8, 3) + pack_i4(8i8, 0) + pack_u4(-1i8, 0) \
+                 + pack_u4(0, 8 + 8); }"
+            ),
+            ["E0439", "E0439", "E0439", "E0439"]
+        );
+        assert_clean("fn f() -> u8 { return pack_u4(15u8, 0u8) + pack_i4(-8i8, 7i64); }");
         assert_eq!(
             errors("fn f(h: u16) -> i8 { let (a, b) = unpack_i4(h); return a + b; }"),
             ["E0446"]

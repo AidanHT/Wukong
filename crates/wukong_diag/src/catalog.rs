@@ -903,7 +903,8 @@ fn main() -> i32 {
         "E0439",
         "4-bit value out of range",
         "`pack_i4(lo, hi)` and `pack_u4(lo, hi)` put two 4-bit integers in one byte, so a literal \
-         operand must be a value a nibble holds: `-8..=7` for `pack_i4` (two's complement) and \
+         operand (suffixed like `16u8` or not, or an expression of literals like `8 + 8`) must be \
+         a value a nibble holds: `-8..=7` for `pack_i4` (two's complement) and \
          `0..=15` for `pack_u4`. A run-time operand keeps its low four bits, exactly as an `as` \
          conversion keeps the low bits, but a literal outside the range can only be a mistake — \
          `pack_u4(16, 0)` would pack `0`, and `pack_i4(8, 0)` the nibble `-8` — so it is rejected \

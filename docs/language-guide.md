@@ -2242,7 +2242,7 @@ shadows any of them.
 | `logaddexp(a, b)` | `ln(eᵃ + eᵇ)` without overflow; `a == b` gives `a + ln 2` | float |
 | `f8e4m3_to_f32(b)`, `f8e5m2_to_f32(b)` | decode an OCP FP8 code held in a `u8` (exact) | `f32` |
 | `f32_to_f8e4m3(x)`, `f32_to_f8e5m2(x)` | encode, round to nearest even; E4M3FN **saturates** at ±448 (NaN → `0x7F`), E5M2 overflows to ±∞ (NaN → `0x7E`) | `u8` |
-| `pack_i4(lo, hi)`, `pack_u4(lo, hi)` | two 4-bit integers in one byte: `lo`'s low four bits in bits 0..4, `hi`'s in bits 4..8 (a literal must be `-8..=7` / `0..=15`: `E0439`; a run-time value keeps its low four bits) | `u8` |
+| `pack_i4(lo, hi)`, `pack_u4(lo, hi)` | two 4-bit integers in one byte: `lo`'s low four bits in bits 0..4, `hi`'s in bits 4..8 (a literal, suffixed or not, must be `-8..=7` / `0..=15`: `E0439`; a run-time value keeps its low four bits) | `u8` |
 | `unpack_i4(b)`, `unpack_u4(b)` | the byte's two nibbles `(bits 0..4, bits 4..8)`, sign-extended from the fourth bit / zero-extended | `(i8, i8)` / `(u8, u8)` |
 
 `erfc`, `erfinv` and `lgamma` evaluate in double precision (the runtime's `special.rs`): an `f32`

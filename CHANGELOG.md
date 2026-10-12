@@ -11,7 +11,8 @@ All notable changes to Wukong are documented here. The format is loosely based o
   integers per `u8`, `lo` in bits 0..4 and `hi` in bits 4..8 (ONNX `Int4` / PyTorch `quint4x2`
   order); `unpack_i4` sign-extends each nibble to an `i8`, `unpack_u4` zero-extends to a `u8`, both
   returning `(lo, hi)`. A run-time operand keeps its low four bits, as `as` would; a literal a
-  nibble cannot hold (`pack_u4(16, 0)`, `pack_i4(8, 0)`) is the new **`E0439`**. Plain shifts and
+  nibble cannot hold (`pack_u4(16, 0)`, `pack_u4(16u8, 0)`, `pack_i4(8, 0)`, `pack_u4(8 + 8, 0)`) is
+  the new **`E0439`**. Plain shifts and
   masks in MIR, identical on every backend.
 - **Added: the `dequant_i4(q, scale, group, out)` / `dequant_u4(q, scale, zero, group, out)`
   decode builtins** for the weight-only int4 layout GPTQ, AWQ and ONNX checkpoints share: element
