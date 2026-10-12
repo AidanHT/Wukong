@@ -26,7 +26,7 @@ a.out
 
 # File-I/O test-suite scratch files: tests/run/io_*.wk write a temp `.bin` in the process cwd and
 # read it back for the differential round-trip. Regenerated on every run; never committed.
-io_test_*.bin
+io_test_*
 # tests/run/io_buffer_names.wk writes its named buffers the same way.
 io_names*.bin
 io_names.safetensors
