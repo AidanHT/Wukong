@@ -51,7 +51,10 @@ All notable changes to Wukong are documented here. The format is loosely based o
   starts at 5 but ends at 3` — it reused the element-access wording, with the end as the length —
   and an end past the length `range end index 9 out of range for slice of length 6`, through the
   new failure entry `wukong_rt_check_fail(kind, a, b, site)` that `str_from_utf8` shares
-  (`tests/run/str_range_order.wk`, `tests/run/str_slice_bounds.wk`).
+  (`tests/run/str_range_order.wk`, `tests/run/str_slice_bounds.wk`). Like every failure entry it
+  stops the caller of a failing helper on the JIT too: nothing after the call runs and nothing
+  reads the result the helper never wrote (`tests/run/str_range_fail_in_callee.wk`,
+  `tests/run/str_from_utf8_fail_in_callee.wk`).
 - **Fixed: the interpreter held a string literal's bytes zero-extended.** Every other byte slot
   holds the sign-extended `i8` an `I8` store leaves, and a load is verbatim, so a literal's byte
   above 0x7F compared unequal to the same byte anywhere else on the interpreter only:

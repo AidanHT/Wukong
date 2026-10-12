@@ -651,9 +651,11 @@ element access (the edge `bce` keys on) and `wukong_rt_check_fail(kind, a, b, si
 everything else (a range index's end and order, `str_from_utf8`; `bounds::emit_check_fail_unless`).
 `bounds::attach_sites` turns the trailing placeholder of both into a `file:line:col` blob. The
 interpreter returns the message as its run error, the JIT records it and returns through its
-callers like a failed `assert`, and a linked executable prints it and exits 1 (the `cc` fallback
-runtime carries C twins of both). `Op::VecKernelCall` — a call into a synthesized 256-bit AVX2 kernel — is
-covered under the vectorizer below.
+callers like a failed `assert` (both entries are `is_failure_intrinsic`s, so a caller of any
+function that can reach one polls the failure status after the call and stops; an entry missing
+from that list lets the caller run on), and a linked executable prints it and exits 1 (the `cc`
+fallback runtime carries C twins of both). `Op::VecKernelCall` — a call into a synthesized 256-bit
+AVX2 kernel — is covered under the vectorizer below.
 
 The front-end lowers in **clang style**: one `alloca` per local, with `load`/`store` on every use.
 `Op::Alloca` carries an `align` (bytes; `0` = natural, which every compiler-made slot uses and

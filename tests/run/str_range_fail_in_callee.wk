@@ -1,0 +1,30 @@
+// RUN: --run
+// EXPECT-EXIT: 1
+// EXPECT-OUT: ko
+// EXPECT-STDERR: range end index 9 out of range for slice of length 6 at
+// EXPECT-STDERR: str_range_fail_in_callee.wk:29:12
+module tests.run.str_range_fail_in_callee
+
+// A range index that fails inside a helper stops the whole program, not just the helper: nothing
+// after the failing call runs, on every backend. "wukong" is w u k o n g, so `mid(s, 2, 4)` is
+// "ko"; `e` reaches 9 through a loop so no folding can decide the check early, and `mid(s, 2, e)`
+// fails its range end (9 > 6) at line 29, column 12. The native JIT returns a failure through its
+// callers, so `main` must poll after the call: it used to skip that poll for this failure entry
+// and run on, printing 42 and a length read from the str `mid` never wrote.
+
+fn main() -> i32 {
+    let s: str = "wukong";
+    let mut e: i64 = 0;
+    for _ in 0..9 {
+        e = e + 1;
+    }
+    println(mid(s, 2, 4));
+    let t = mid(s, 2, e);
+    println(42);
+    println(t.len());
+    return 0;
+}
+
+fn mid(s: str, a: i64, b: i64) -> str {
+    return s[a..b];
+}

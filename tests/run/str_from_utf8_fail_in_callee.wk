@@ -1,0 +1,28 @@
+// RUN: --run
+// EXPECT-EXIT: 1
+// EXPECT-OUT: hi
+// EXPECT-STDERR: str_from_utf8: invalid utf-8 sequence of 1 bytes from index 0 (the len is 2) at
+// EXPECT-STDERR: str_from_utf8_fail_in_callee.wk:27:12
+module tests.run.str_from_utf8_fail_in_callee
+
+// A `str_from_utf8` that fails inside a helper stops the whole program, not just the helper:
+// nothing after the failing call runs, on every backend. `[104, 105]` is "hi". In `[0xC3, 0x28]`
+// the lead byte 0xC3 opens a two-byte sequence but 0x28 ("(") is not a continuation byte, so the
+// bad sequence is the one byte at index 0 of 2, reported at line 27, column 12 -- the start of the
+// `str_from_utf8` call in `conv`. The native JIT returns a failure through its callers, so `main`
+// must poll after the call: it used to skip that poll for this failure entry and run on, printing
+// 42 and a length read from the str `conv` never wrote.
+
+fn main() -> i32 {
+    let good: [u8; 2] = [104, 105];
+    println(conv(good));
+    let bad: [u8; 2] = [0xC3, 0x28];
+    let t = conv(bad);
+    println(42);
+    println(t.len());
+    return 0;
+}
+
+fn conv(b: []u8) -> str {
+    return str_from_utf8(b);
+}

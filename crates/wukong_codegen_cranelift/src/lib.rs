@@ -3412,17 +3412,21 @@ fn make_isa_full(
 }
 
 /// Is `func` (not a user function) one of the runtime failure intrinsics — a builtin `assert`, the
-/// failure edge of a checked slice access, or `exit`? Each one stops the run.
+/// failure edge of a checked slice access, the failure edge of any other run-time check (a range
+/// index, `str_from_utf8`), or `exit`? Each one stops the run. A failure entry missing here is a
+/// silent JIT divergence: the callee records the failure and returns, and its caller, never
+/// polled, runs on and reads whatever the callee did not write.
 fn is_failure_intrinsic(func: Symbol, interner: &Interner) -> bool {
     matches!(
         interner.resolve(func),
-        "assert" | RT_BOUNDS_FAIL | text_rt::RT_EXIT
+        "assert" | RT_BOUNDS_FAIL | RT_CHECK_FAIL | text_rt::RT_EXIT
     )
 }
 
 /// The functions that can stop the run and so must be polled after every call to them: one that
-/// calls a runtime failure intrinsic (a builtin `assert`, a slice bounds failure), calls such a
-/// function, or runs a parallel region whose body is one. A region body's failure comes back
+/// calls a runtime failure intrinsic ([`is_failure_intrinsic`]: a builtin `assert`, a slice bounds
+/// failure, any other run-time check's failure, `exit`), calls such a function, or runs a parallel
+/// region whose body is one. A region body's failure comes back
 /// through the JIT's `rt_parallel_for` (the cancellation ABI, see there) to the caller of
 /// `wukong_parallel_for`; in a linked executable it exits the process where it happens.
 ///

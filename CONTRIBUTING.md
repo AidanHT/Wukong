@@ -503,5 +503,11 @@ message to `check_failure_message` in `crates/wukong_runtime/src/safety.rs` (wit
 same constant in `crates/wukong_mir_build/src/bounds.rs`, and the C twin's arm in the `cc` fallback
 runtime (`WUKONG_RT_C` in `crates/wukong_driver/src/lib.rs`); the interpreter, both JIT builders and
 the AOT link already route every kind through the one formatter. Pin the message with a `tests/run`
-fixture's `// EXPECT-STDERR:` lines. An element access keeps `wukong_rt_bounds_fail`, which
-`wukong_opt::bce` keys on.
+fixture's `// EXPECT-STDERR:` lines, and fail it inside a helper function too, with output after the
+call, so the differential gate sees a caller that runs on. An element access keeps
+`wukong_rt_bounds_fail`, which `wukong_opt::bce` keys on. A new failure *entry* (a runtime function
+that stops the run, rather than a new kind of the existing one) must also join
+`is_failure_intrinsic` in `crates/wukong_codegen_cranelift/src/lib.rs`: the JIT returns a failure
+through its callers, and a call is followed by a status poll only when the callee is known to be
+able to fail, so a missing entry lets the caller keep running and read the result the callee never
+wrote.
