@@ -14,6 +14,11 @@
 //! restated here exactly as `wukong_mir_build`'s own `fn_calls_unguarded` test helper states it:
 //! a guarded call sits in a block whose every predecessor is a `cond_br` on an alias-guard
 //! condition with that block as its `then` arm.
+//!
+//! The `@parallel` region outliner versions a threaded region on the same test
+//! (`wukong_mir_build::par_region::emit_region_guard`): `wukong_parallel_for` in the `then` arm, a
+//! direct call of the outlined body over every iteration on the calling thread in the other, so
+//! [`is_guarded_block`] answers for a region call as well.
 
 use std::collections::HashMap;
 use wukong_mir::{BinOp, BlockId, CastKind, CmpOp, Function, Op, Program, Terminator, ValueId};
@@ -48,13 +53,9 @@ fn successors(term: &Terminator) -> Vec<BlockId> {
     }
 }
 
-/// The callees, among those `is_kernel` selects, that `f` calls from a block NOT behind a run-time
-/// alias guard.
-fn unguarded_in(
-    f: &Function,
-    interner: &Interner,
-    is_kernel: &dyn Fn(&str) -> bool,
-) -> Vec<String> {
+/// Is block `id` of `f` behind a run-time alias guard: does every predecessor reach it as the
+/// `then` arm (and only that arm) of a `cond_br` on an alias-guard condition?
+pub fn is_guarded_block(f: &Function, id: BlockId) -> bool {
     let mut defs: HashMap<ValueId, &Op> = HashMap::new();
     for block in &f.blocks {
         for inst in &block.insts {
@@ -63,25 +64,34 @@ fn unguarded_in(
             }
         }
     }
+    let preds: Vec<&Terminator> = f
+        .blocks
+        .iter()
+        .map(|p| &p.term)
+        .filter(|term| successors(term).contains(&id))
+        .collect();
+    !preds.is_empty()
+        && preds.iter().all(|term| {
+            matches!(
+                term,
+                Terminator::CondBr { cond, then_blk, else_blk, .. }
+                    if *then_blk == id
+                        && *else_blk != id
+                        && is_alias_guard_cond(&defs, *cond, 0)
+            )
+        })
+}
+
+/// The callees, among those `is_kernel` selects, that `f` calls from a block NOT behind a run-time
+/// alias guard.
+fn unguarded_in(
+    f: &Function,
+    interner: &Interner,
+    is_kernel: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
     let mut unguarded = Vec::new();
     for block in &f.blocks {
-        let preds: Vec<&Terminator> = f
-            .blocks
-            .iter()
-            .map(|p| &p.term)
-            .filter(|term| successors(term).contains(&block.id))
-            .collect();
-        let guarded = !preds.is_empty()
-            && preds.iter().all(|term| {
-                matches!(
-                    term,
-                    Terminator::CondBr { cond, then_blk, else_blk, .. }
-                        if *then_blk == block.id
-                            && *else_blk != block.id
-                            && is_alias_guard_cond(&defs, *cond, 0)
-                )
-            });
-        if guarded {
+        if is_guarded_block(f, block.id) {
             continue;
         }
         for inst in &block.insts {

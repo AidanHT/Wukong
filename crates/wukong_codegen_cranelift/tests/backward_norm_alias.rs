@@ -237,37 +237,125 @@ fn unguarded_dispatches(program: &Program, interner: &Interner) -> Vec<String> {
     alias_guard::unguarded_dispatches(program, interner, &is_norm_bwd_kernel)
 }
 
-fn assert_gamma_rows_stay_sequential(program: &Program, interner: &Interner, label: &str) {
-    for function in &program.funcs {
-        for inst in function.blocks.iter().flat_map(|block| &block.insts) {
-            let Op::Call { func, args } = &inst.op else {
-                continue;
-            };
-            if interner.resolve(*func) != "wukong_parallel_for" {
-                continue;
-            }
-            let extent = function
-                .blocks
-                .iter()
-                .flat_map(|block| &block.insts)
-                .find_map(|definition| {
-                    if definition.result == Some(args[0]) {
-                        if let Op::ConstInt(value, _) = &definition.op {
-                            return Some(*value);
+/// The `wukong_parallel_for` calls in `program` that are not an apply over the eight independent
+/// columns, as (function index, block index, instruction index).
+///
+/// gamma[i] aliases output[i]: row zero must finish before row one reads it. An inner apply over
+/// the eight independent columns is safe. Threading the two dependent rows is not, so a region
+/// over them is accepted only behind the region outliner's run-time overlap guard
+/// (`wukong_mir_build::par_region`: `wukong_parallel_for` in the `then` arm of a `ptrtoint` range
+/// test, the outlined body called directly over every row on the calling thread otherwise). This
+/// pins that structure before execution; [`assert_guard_takes_serial_arm`] then proves by
+/// execution that the guard sends this aliasing input to the serial arm.
+fn guarded_row_regions(
+    program: &Program,
+    interner: &Interner,
+    label: &str,
+) -> Vec<(usize, usize, usize)> {
+    let mut regions = Vec::new();
+    for (fi, function) in program.funcs.iter().enumerate() {
+        for (bi, block) in function.blocks.iter().enumerate() {
+            for (ii, inst) in block.insts.iter().enumerate() {
+                let Op::Call { func, args } = &inst.op else {
+                    continue;
+                };
+                if interner.resolve(*func) != "wukong_parallel_for" {
+                    continue;
+                }
+                let extent = function
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.insts)
+                    .find_map(|definition| {
+                        if definition.result == Some(args[0]) {
+                            if let Op::ConstInt(value, _) = &definition.op {
+                                return Some(*value);
+                            }
                         }
-                    }
-                    None
-                });
-            // gamma[i] aliases output[i]: row zero must finish before row one reads it.
-            // An inner apply over the eight independent columns is safe; outlining the
-            // two dependent rows is not. Pin the actual region extent before execution.
+                        None
+                    });
+                if extent == Some(COLS as i128) {
+                    continue;
+                }
+                assert!(
+                    alias_guard::is_guarded_block(function, block.id),
+                    "{label}: gamma alias outlined dependent rows (extent {extent:?}) with no \
+                     run-time overlap guard"
+                );
+                regions.push((fi, bi, ii));
+            }
+        }
+    }
+    regions
+}
+
+/// Run `program`'s `entry` over a fresh copy of the input on the interpreter and on the native
+/// backend.
+fn execute(
+    program: &Program,
+    interner: &mut Interner,
+    family: Family,
+    alias: Alias,
+) -> [(&'static str, Vec<f32>); 2] {
+    let entry = interner.intern("entry");
+    let mut interpreted = input(family, alias);
+    wukong_interp::run_kernel_f32(program, entry, &mut [&mut interpreted], interner).unwrap();
+    let module = wukong_codegen_cranelift::jit_module(program, interner).unwrap();
+    // entry has one fixed f32 array parameter (pointer ABI) and no return.
+    let function: unsafe extern "C" fn(*mut f32) =
+        unsafe { std::mem::transmute(module.func_ptr(entry).expect("entry remains present")) };
+    let mut native = input(family, alias);
+    unsafe { function(native.as_mut_ptr()) };
+    [("interpreter", interpreted), ("native", native)]
+}
+
+fn assert_every_lane(results: [(&str, Vec<f32>); 2], expected: &[f32], label: &str) {
+    for (backend, actual) in results {
+        assert_eq!(actual.len(), expected.len(), "{label} {backend}");
+        for (lane, (actual, expected)) in actual.iter().zip(expected).enumerate() {
             assert_eq!(
-                extent,
-                Some(COLS as i128),
-                "{label}: gamma alias outlined dependent rows"
+                actual.to_bits(),
+                expected.to_bits(),
+                "{label} {backend} lane {lane}: {actual} != {expected}"
             );
         }
     }
+}
+
+/// The guard's verdict on this input, by execution: delete the threaded arm's `wukong_parallel_for`
+/// of every guarded row region, so the rows run only if the guard chooses the serial arm. Had it
+/// judged the gamma view and the output apart, nothing would write the rows and every lane would
+/// keep its input value, which `expected` differs from. Unlike a timing-dependent race, this
+/// cannot pass by luck.
+fn assert_guard_takes_serial_arm(
+    program: &Program,
+    interner: &mut Interner,
+    regions: &[(usize, usize, usize)],
+    (family, alias): (Family, Alias),
+    expected: &[f32],
+    label: &str,
+) {
+    if regions.is_empty() {
+        return;
+    }
+    let initial = input(family, alias);
+    assert_ne!(
+        initial[..ROWS * COLS],
+        expected[..ROWS * COLS],
+        "{label}: a region that never ran must be visible"
+    );
+    let mut serial_only = program.clone();
+    // Highest instruction index first, so earlier indices in one block stay valid.
+    let mut regions = regions.to_vec();
+    regions.sort_unstable_by(|a, b| b.cmp(a));
+    for (fi, bi, ii) in regions {
+        serial_only.funcs[fi].blocks[bi].insts.remove(ii);
+    }
+    assert_every_lane(
+        execute(&serial_only, interner, family, alias),
+        expected,
+        &format!("{label} threaded arm removed"),
+    );
 }
 
 fn check(family: Family, local_view: bool) {
@@ -297,7 +385,7 @@ fn check(family: Family, local_view: bool) {
                 let label = format!("{family:?} alias={alias:?} local_view={local_view} parallel={parallel} recognize={recognize}");
                 let (program, mut interner) = lower(&source, recognize);
                 if alias == Alias::Gamma {
-                    assert_gamma_rows_stay_sequential(&program, &interner, &label);
+                    guarded_row_regions(&program, &interner, &label);
                 }
                 let calls = dispatches(&program, &interner);
                 if recognize && alias == Alias::None {
@@ -318,15 +406,19 @@ fn check(family: Family, local_view: bool) {
                 } else {
                     assert!(calls.is_empty(), "{label}: unexpected dispatch {calls:?}");
                 }
-                let entry = interner.intern("entry");
                 for level in [0, 2] {
                     let mut optimized = program.clone();
                     wukong_opt::optimize_verified(&mut optimized, level).unwrap();
                     if alias == Alias::Gamma {
-                        assert_gamma_rows_stay_sequential(
+                        let label = format!("{label} O{level}");
+                        let regions = guarded_row_regions(&optimized, &interner, &label);
+                        assert_guard_takes_serial_arm(
                             &optimized,
-                            &interner,
-                            &format!("{label} O{level}"),
+                            &mut interner,
+                            &regions,
+                            (family, alias),
+                            &expected,
+                            &label,
                         );
                     }
                     let optimized_calls = dispatches(&optimized, &interner);
@@ -347,32 +439,11 @@ fn check(family: Family, local_view: bool) {
                         optimized_calls.iter().all(|call| calls.contains(call)),
                         "{label} O{level}: unexpected dispatch {optimized_calls:?}"
                     );
-                    let mut interpreted = input(family, alias);
-                    wukong_interp::run_kernel_f32(
-                        &optimized,
-                        entry,
-                        &mut [&mut interpreted],
-                        &interner,
-                    )
-                    .unwrap();
-                    let module =
-                        wukong_codegen_cranelift::jit_module(&optimized, &interner).unwrap();
-                    // entry has one fixed f32 array parameter (pointer ABI) and no return.
-                    let function: unsafe extern "C" fn(*mut f32) = unsafe {
-                        std::mem::transmute(module.func_ptr(entry).expect("entry remains present"))
-                    };
-                    let mut native = input(family, alias);
-                    unsafe { function(native.as_mut_ptr()) };
-                    for (backend, actual) in [("interpreter", interpreted), ("native", native)] {
-                        assert_eq!(actual.len(), expected.len(), "{label} O{level} {backend}");
-                        for (lane, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
-                            assert_eq!(
-                                actual.to_bits(),
-                                expected.to_bits(),
-                                "{label} O{level} {backend} lane {lane}: {actual} != {expected}"
-                            );
-                        }
-                    }
+                    assert_every_lane(
+                        execute(&optimized, &mut interner, family, alias),
+                        &expected,
+                        &format!("{label} O{level}"),
+                    );
                 }
             }
         }
