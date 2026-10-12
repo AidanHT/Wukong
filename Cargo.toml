@@ -37,6 +37,7 @@ wukong_codegen_cranelift = { path = "crates/wukong_codegen_cranelift" }
 wukong_codegen_gpu = { path = "crates/wukong_codegen_gpu" }
 wukong_runtime = { path = "crates/wukong_runtime" }
 wukong_autodiff = { path = "crates/wukong_autodiff" }
+wukong_fmt = { path = "crates/wukong_fmt" }
 
 # The `-D warnings` policy, in the one place every invocation sees it.
 #
@@ -50,7 +51,7 @@ wukong_autodiff = { path = "crates/wukong_autodiff" }
 # cargo's fingerprint three ways over three different `RUSTFLAGS` values.
 #
 # SCOPE (P13.15, 2026-10-11): a `[workspace.lints]` table is a TEMPLATE that binds only the crates
-# that opt in, and EVERY manifest under `crates/` now does. Twenty use `[lints] workspace = true`;
+# that opt in, and EVERY manifest under `crates/` now does. Twenty-one use `[lints] workspace = true`;
 # `crates/wukong_runtime` keeps its own table instead (`warnings = "deny"` plus Clippy's
 # `undocumented_unsafe_blocks`), because a crate cannot combine `workspace = true` with a lint of its
 # own. A new crate must add the same two lines - nothing enforces it but review.
