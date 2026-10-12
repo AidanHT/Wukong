@@ -4567,8 +4567,9 @@ fn build_function_clif(
     scratch: &mut TranslationScratch,
 ) -> Result<(), NativeFailure> {
     // A function with a float-to-`i1`-vector cast is scalarized here, on its own codegen worker;
-    // every other function is borrowed as is (see `bool_vectors::legalize`).
-    let legalized = bool_vectors::legalize(f, interner)?;
+    // every other function is borrowed as is (see `bool_vectors::legalize`). A decline names no
+    // instruction, so it is reported at the function's declaration.
+    let legalized = bool_vectors::legalize(f, interner).map_err(|message| at_decl(f, message))?;
     let f: &Function = &legalized;
     clif.signature = signature_of(f, ptr_ty, call_conv);
     let TranslationScratch {
@@ -4658,6 +4659,15 @@ fn build_function_clif(
         }
     }
     Ok(())
+}
+
+/// A failure that belongs to `f` as a whole rather than to one of its instructions (a declined
+/// legalization, a function Cranelift rejects): reported at `f`'s declaration.
+fn at_decl(f: &Function, message: String) -> NativeFailure {
+    NativeFailure {
+        message,
+        site: f.decl_span(),
+    }
 }
 
 /// A read-only view of a [`Module`]'s declarations, exposing exactly the two ref-import shims the
@@ -4769,7 +4779,7 @@ fn define_functions_serial<M: Module>(
         }
         module
             .define_function(ids[&f.name], &mut ctx)
-            .map_err(|e| format!("cranelift define fn: {e:?}"))?;
+            .map_err(|e| at_decl(f, format!("cranelift define fn: {e:?}")))?;
         #[cfg(test)]
         srcloc_tests::capture(f.name, &ctx);
         module.clear_context(&mut ctx);
@@ -4848,7 +4858,7 @@ fn define_functions_parallel<M: Module>(
                     }
                     let mut cp = cranelift_codegen::control::ControlPlane::default();
                     ctx.compile(isa, &mut cp)
-                        .map_err(|e| format!("cranelift compile fn: {:?}", e.inner))?;
+                        .map_err(|e| at_decl(f, format!("cranelift compile fn: {:?}", e.inner)))?;
                     let cc = ctx.compiled_code().unwrap();
                     let alignment = cc.buffer.alignment as u64;
                     let bytes = cc.buffer.data().to_vec();
@@ -4874,10 +4884,10 @@ fn define_functions_parallel<M: Module>(
             .collect::<Result<Vec<_>, NativeFailure>>()?
     };
 
-    for (fid, alignment, bytes, relocs) in compiled {
+    for ((fid, alignment, bytes, relocs), f) in compiled.into_iter().zip(&program.funcs) {
         module
             .define_function_bytes(fid, alignment, &bytes, &relocs)
-            .map_err(|e| format!("cranelift define fn bytes: {e:?}"))?;
+            .map_err(|e| at_decl(f, format!("cranelift define fn bytes: {e:?}")))?;
     }
     Ok(())
 }

@@ -294,3 +294,73 @@ fn a_parameterized_entry_points_at_its_declaration() {
     assert_eq!(classify_error(&err.message), NativeErrorKind::Unsupported);
     assert_eq!(err.site, Some(span(3)));
 }
+
+/// A failure that is not raised while lowering one instruction but still belongs to one function —
+/// a declined compact boolean-vector legalization (`C0001`) — is reported at that function's
+/// declaration, not span-less.
+#[test]
+fn a_declined_legalization_points_at_the_declaration() {
+    let mut i = Interner::new();
+    let mut b = Builder::new(i.intern("unsupported_abi"), MirType::Void);
+    let source = MirType::Vec(Box::new(MirType::F32), 4);
+    let target = MirType::Vec(Box::new(MirType::I1), 4);
+    let input = b.add_param(source);
+    b.build(
+        target.clone(),
+        Op::Cast(wukong_mir::CastKind::FpToSi, input, target),
+    );
+    b.ret(None);
+    let mut f = b.finish();
+    f.locs.decl = span(1);
+    let err = emit_object_kind_for_with(
+        &program_with(f),
+        &i,
+        TargetCpu::Native,
+        BackendOpt::default(),
+        ObjectKind::Library,
+    )
+    .unwrap_err();
+    assert!(err.message.contains("require a vector ABI"), "{err:?}");
+    assert_eq!(classify_error(&err.message), NativeErrorKind::Unsupported);
+    assert_eq!(err.site, Some(span(1)), "{err:?}");
+}
+
+/// A function Cranelift itself rejects (its verifier: an `i32` function that returns nothing) is an
+/// internal compiler error at that function's declaration — on the serial definer and the parallel
+/// one, which compiles each function on its own worker.
+#[test]
+fn a_rejected_function_points_at_its_declaration() {
+    let mut i = Interner::new();
+    let mut ok = Builder::new(i.intern("fine"), MirType::Void);
+    ok.ret(None);
+    let mut ok = ok.finish();
+    ok.locs.decl = span(30);
+    let mut bad = Builder::new(i.intern("main"), MirType::I32);
+    bad.ret(None);
+    let mut bad = bad.finish();
+    bad.locs.decl = span(1);
+    let mut p = Program::new();
+    p.funcs.push(ok);
+    p.funcs.push(bad);
+    for parallel in [false, true] {
+        let err = emit_object_full(
+            &p,
+            &i,
+            EmitOptions {
+                verify: true,
+                parallel,
+            },
+            TargetCpu::Native,
+            BackendOpt::default(),
+            ObjectKind::Library,
+        )
+        .err()
+        .expect("the verifier rejects a value-less return");
+        assert_eq!(
+            classify_error(&err.message),
+            NativeErrorKind::Internal,
+            "{err:?}"
+        );
+        assert_eq!(err.site, Some(span(1)), "parallel {parallel}: {err:?}");
+    }
+}
