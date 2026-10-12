@@ -2283,7 +2283,12 @@ none of them. Everything else holds in both modes:
   left alone) and constant-folds each operation at its own precision.
 - `bf16`/`f16` arithmetic is carried out in `f32` and rounded to the half grid at every value, and
   so is `f8e4m3`/`f8e5m2` arithmetic onto its 8-bit grid (E4M3FN saturating at ±448, E5M2
-  overflowing to ±∞).
+  overflowing to ±∞). An integer converted to one of these types is rounded onto its grid at the
+  value too — by `as`, and an unsuffixed integer literal adapting to such an operand, which is the
+  operand type's value before the operation runs: with `b: bf16 = 1.0`, `b + 257` is 1 + 256 (257
+  ties to 256 on the bf16 grid), so 256, and `max(b, 257)` is 256; with `h: f16 = 2048.0`,
+  `h < 2049` is `false` (2049 is 2048 on the f16 grid). A float literal stays `f32` instead
+  (`b + 257.0` is the `f32` 258; `tests/run/half_int_literal_operand.wk`).
 - Comparisons are IEEE-ordered: `==`, `<`, `<=`, `>`, `>=` are false when either side is NaN and
   `!=` is true. `fmax(a, b)` is `a > b ? a : b` and `fmin(a, b)` is `a < b ? a : b` — the x86
   `maxps`/`minps` rule, *not* IEEE `maxNum`: with a NaN in either operand, or a `+0`/`-0` tie, they

@@ -68,6 +68,16 @@ All notable changes to Wukong are documented here. The format is loosely based o
   produce the `f32`, and only a store rounded it to the half grid, so once mem2reg forwarded the
   value past its store, `print(i as bf16)` of 257 printed 257 at `-O2` (native and interpreter
   alike) where `-O0` printed 256. The conversion now rounds at the value, for the 8-bit floats too.
+- **Changed: an integer literal beside a `bf16`/`f16` is that type's value.** The implicit
+  conversion of an unsuffixed integer literal that adapts to a half operand rounds at the value as
+  well, so the literal is the number it adapts to, on the half grid, before the operation runs. This
+  fixes a second `-O0`/`-O2` split — `max(b, 257)` and `if c { 257 } else { b }` of a `bf16` printed
+  257 at `-O2` (the unrounded literal forwarded past its store) and 256 at `-O0` — and it changes
+  results that did not split: with `b: bf16 = 1.0`, `b + 257` is now 1 + 256 = 256 (it was the
+  `f32` sum 258, rounded once), and with `h: f16 = 2048.0`, `h < 2049` is now `false` (2049 is 2048
+  on the f16 grid; the compare used the exact `f32` 2049). A float literal stays `f32` and is
+  unaffected (`b + 257.0` is 258). Pinned by `tests/run/half_int_literal_operand.wk`; no corpus
+  program changes.
 - The optimizer keeps an f8 constant at its exact literal value, so folding a unary minus rounds it
   once, as every backend does: `-1.12500001` as an `f8e5m2` is `-1.25` at every `-O` level (through
   `f32` it was the tie `-1.125` and folded to `-1`).

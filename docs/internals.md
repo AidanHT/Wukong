@@ -1617,7 +1617,10 @@ the byte), a `Store` (encode the register), an `FpTrunc` to an f8 (the source ro
 an optimizer forwarded past its store is still on the grid). `mir_build` rounds every arithmetic
 result with a same-type `FpTrunc` (`round_half_result`), and an integer converted to a narrow float
 — an `f8` or a half — too (`round_int_to_narrow_float`: `sitofp` produces the `f32`, not the narrow
-grid, and an `-O2` forward of `257 as bf16` used to print 257 where `-O0` printed the stored 256).
+grid, and an `-O2` forward of `257 as bf16` used to print 257 where `-O0` printed the stored 256),
+at an `as` (`lower_cast`) and at an implicit conversion (`coerce_to`) alike: an integer literal
+adapting to a half operand is the half's value, so `max(b, 257)` no longer splits the same way and
+`one_bf16 + 257` is 1 + 256.
 The math intrinsics compute an f8 operand in `f32` and round the result once
 (`lower_math_intrinsic_at`), since their constants would otherwise be built at the f8 type, where
 `+inf` does not exist; `isnan`/`isinf`/… widen the operand first for the same reason. The optimizer

@@ -23337,7 +23337,11 @@ impl FnLowerer<'_> {
     /// comes out of `sitofp`/`uitofp` as the `f32` the backends compute it in — rounded to `f32`,
     /// not to the narrow grid. Round it at the value (see `round_half_result`): otherwise a later
     /// observation that mem2reg forwards past the rounding store — `print(i as bf16)` of 257 at
-    /// `-O2` — saw `257`, where `-O0` printed the stored `256`. (Rounding the integer to `f32`
+    /// `-O2` — saw `257`, where `-O0` printed the stored `256`. Both `lower_cast` (`as`) and
+    /// `coerce_to` round: the implicit conversion of an integer literal adapting to a half or f8
+    /// operand is selected and stored unrounded otherwise (`max(b, 257)`, `if c { 257 } else { b }`
+    /// printed 257 at `-O2` and 256 at `-O0`), and it makes the literal the operand type's value
+    /// before the operation, so `one_bf16 + 257` is 1 + 256. (Rounding the integer to `f32`
     /// first costs nothing for `f16` and the 8-bit floats: their ranges end below `2^24`, where
     /// `f32` stops holding integers exactly, and anything larger overflows either way. A `bf16`
     /// reaches `f32`'s range, so an integer above `2^24` is rounded to `f32` and then to `bf16`,
