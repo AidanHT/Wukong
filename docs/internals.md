@@ -375,7 +375,8 @@ drops every function `main` cannot reach through calls or `FuncAddr` after lower
 (`wukong_driver::prune`); `--emit=obj` exports everything and the MIR dumps, autodiff stages and
 `--backend=gpu-native` keep the whole program. The native backend follows the source level:
 `-O0` builds the Cranelift ISA at `opt_level=none`, `-O1`+ at `speed` (`BackendOpt`), and both the JIT
-and the object path compile functions in parallel (`WUKONG_PAR_CODEGEN=0` serializes). Lowering
+and the object path compile functions in parallel (`WUKONG_PAR_CODEGEN=0` serializes), as does the
+optimizer's per-function work (`WUKONG_OPT_THREADS=1` serializes; see **Optimizer**). Lowering
 keeps aggregate copies straight-line only when a gradient was requested
 (`LowerOptions::unroll_for_autodiff`), capped at 1 KiB per operation. `--time-passes` (stderr table,
 or one JSON line under `--error-format=json`) and `--time-trace=<f>` (Chrome trace JSON) report what a
@@ -845,6 +846,33 @@ change" cannot fire again until some *other* pass mutates the function; clean pa
 any mutation re-dirties all of them. That changes only how often a pass runs, never the sequence of
 mutations, so the resulting MIR is identical to the naive fixpoint — which is exactly why a new pass
 must stay deterministic and must report `changed` honestly.
+
+**The per-function phases run in parallel (`src/parallel.rs`).** Inlining, the call graph and the
+call-effect summaries are whole-program and stay on the calling thread; everything else is one
+function at a time and runs on a private `rayon` pool (never the global one, which the runtime
+configures with 16 MiB stacks for `@parallel` bodies; the optimizer's workers get the compile
+thread's 256 MiB). The fixpoint pipeline goes one call-graph **level** at a time — an SCC's level is
+one more than the deepest SCC it calls — so every function of a level is optimized against the
+summaries of all its callees, the same entries the one-SCC-at-a-time order showed it (a pass asks
+the table only about the symbols its own calls name, and no pass can mint a new one), and the
+level's SCCs are then summarized in SCC order. Unrolling, straight-line SLP, their cleanup sweeps
+and switch formation are per function outright. Results go back in program order, so the MIR is
+byte-identical for every thread count; a verifier failure or a panic is the earliest one in
+sequential order. A task's panic is caught and held as a failure value (`parallel::Failed`), so the
+level schedule weighs it against failures in later levels and resumes it only if it is still the
+earliest, and a task not yet started when an earlier one fails is skipped; the one thing that
+cannot be taken back is a message — a task the sequential schedule would never have reached can
+still print its panic on stderr, though it is never the failure reported. `WUKONG_OPT_THREADS=<n>` (`OptimizeOptions::threads`, `PassManager::set_threads`)
+sets the count: `1` is the old sequential schedule exactly, unset or `0` is automatic (the host's
+parallelism, at most 8, only for a batch whose functions other than the largest hold at least 256
+instructions), and an explicit `n > 1` sends every batch of two or more functions to the pool.
+`WUKONG_VEC_TRACE`/`WUKONG_SLP_TRACE` pin one thread so a trace stays in program order. A pass joins
+the parallel pipelines through `PassManager::add_shared` and must be `Send + Sync`, keeping anything
+it remembers about a function in that function's `CfgAnalyses` (the vectorizer's record of widened
+headers lives there); a pass added with `add` — the bench's counting wrappers, `--print-after`'s
+printer — keeps its manager on the calling thread in the original order. Most programs collapse to
+a function or two once `-O2` has inlined, so the gain is in programs that keep many functions (and
+at `-O1`, which inlines nothing).
 
 Two shared analyses back them: `cfg` (successors/predecessors, reverse postorder, reachability,
 unreachable-block pruning) and `dom` (Cooper–Harvey–Kennedy immediate dominators, dominance frontiers,
@@ -2926,9 +2954,11 @@ measurement reports retain the corpus sizes used for those runs.
   input. Three *fresh processes* per compile (each with its own `HashMap` hash seed) must agree
   byte-for-byte on `--emit=mir -O2`, on `--emit=obj -O2` (and the `WUKONG_PAR_CODEGEN=0` serial object
   path must equal the parallel one), and on the `--error-format=json` diagnostic stream over the
-  compile-fail corpus. Stated limit: the seed mechanism only bites std `HashMap`/`HashSet`; the
-  optimizer's FxHash maps have a fixed seed, so these gates say nothing about insertion-order dependence
-  there.
+  compile-fail corpus. The three processes of the MIR, object and `-g` arms run the optimizer on
+  `WUKONG_OPT_THREADS=1`, the automatic count and `4`, and a separate arm compares `--emit=mir -O1`
+  (no inlining, so the widest call-graph levels) on 1 against 4 threads over the whole corpus.
+  Stated limit: the seed mechanism only bites std `HashMap`/`HashSet`; the optimizer's FxHash maps
+  have a fixed seed, so these gates say nothing about insertion-order dependence there.
 - **AOT executables** (`crates/wukongc/tests/exe.rs`): curated fixtures (including
   `print_float_display.wk`, which pins how every float prints) are linked with `--emit=exe` and
   their stdout/exit compared against `--run`, extending the differential gate to the linked exe (string

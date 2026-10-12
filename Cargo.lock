@@ -1040,6 +1040,7 @@ dependencies = [
 name = "wukong_opt"
 version = "0.1.0"
 dependencies = [
+ "rayon",
  "wukong_interp",
  "wukong_mir",
  "wukong_mir_build",

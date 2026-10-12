@@ -1076,7 +1076,12 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
   compile: without `exe` (and without `--grad-of` on a list ending in `obj`) every artifact is
   byte-identical to its stage alone; with `exe` the MIR/IR shown is the pruned program the
   executable links, and with `obj` and `--grad-of` the gradient export (`<fn>_grad` appended, at
-  least `-O1`) the object is built from. Not yet: per-function timing in the trace, or a parallel optimizer.
+  least `-O1`) the object is built from. The optimizer's per-function work — the fixpoint over each
+  call-graph level, unrolling, SLP, their cleanups and switch formation — runs on several threads
+  with byte-identical output (`WUKONG_OPT_THREADS=<n>`; `1` is the sequential schedule), checked over
+  the whole corpus by the determinism gate. Not yet: per-function timing in the trace, or parallel
+  lowering (`mir_build` interns names as it lowers, so a per-function split needs a deterministic
+  interning plan first).
 - Optimizer debugging from the command line: `--passes=<list>` runs any list of the optimizer's
   function passes and program steps, and `--print-after=<pass|all>` prints the MIR after each run of
   a pass. Each `-O` level is such a list, held byte-identical to `optimize` by a driver test. Sharp

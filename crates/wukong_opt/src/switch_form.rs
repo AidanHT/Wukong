@@ -53,6 +53,7 @@ use wukong_mir::{
     switch_case_value, BlockId, CmpOp, Function, Op, SwitchCase, Terminator, ValueId,
 };
 
+use crate::parallel::{self, Parallelism};
 use crate::{CfgAnalyses, Pass};
 
 /// The fewest distinct case values worth a `switch`. Up to three, Cranelift's own switch lowering
@@ -380,12 +381,20 @@ fn apply(f: &mut Function, chain: Chain) {
 /// switches in every function, then — only where one formed — prune the link blocks it bypassed
 /// and drop their dead compares. Not a member of `PassManager::standard`: a multi-way branch is the
 /// one shape the loop passes do not model, so it may only appear once they are done. Public so a
-/// replica of `optimize` (the bench's `compile-work` attribution) can run the same stage.
+/// replica of `optimize` (the bench's `compile-work` attribution) can run the same stage. One
+/// function at a time, on the calling thread; `optimize` runs it over several functions at once,
+/// with the same result.
 pub fn form_switches(program: &mut wukong_mir::Program) {
-    for f in &mut program.funcs {
+    form_switches_with(program, Parallelism::SEQUENTIAL);
+}
+
+/// [`form_switches`] on up to `par`'s threads: each function is rewritten from its own body alone.
+pub(crate) fn form_switches_with(program: &mut wukong_mir::Program, par: Parallelism) {
+    let all: Vec<usize> = (0..program.funcs.len()).collect();
+    parallel::map(par, parallel::select_mut(&mut program.funcs, &all), |f| {
         let mut cache = CfgAnalyses::default();
         if !FormSwitches.run_function(f, &mut cache) {
-            continue;
+            return;
         }
         // Pruning exposes the dead compares, and removing them changes nothing structural, so this
         // settles in one or two rounds; the bound only guards a hypothetical oscillation.
@@ -396,7 +405,7 @@ pub fn form_switches(program: &mut wukong_mir::Program) {
                 break;
             }
         }
-    }
+    });
 }
 
 #[cfg(test)]

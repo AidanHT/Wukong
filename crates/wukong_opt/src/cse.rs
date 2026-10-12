@@ -96,7 +96,7 @@ impl Pass for Cse {
             cfg::prune_unreachable(f);
             cache.invalidate(); // pruning renumbered blocks
         }
-        // Taken before the dominator borrows below: `Rc`s, so they borrow nothing.
+        // Taken before the dominator borrows below: shared handles, so they borrow nothing.
         let alias = cache.alias(f);
         let effects = cache.call_effects();
         let (children, preds, idom) = cache.gvn_inputs(f);
@@ -1837,7 +1837,7 @@ mod tests {
         assert_eq!(calls(&opaque), 3);
 
         let table = crate::effects::CallEffects::of(&program);
-        let mut cache = CfgAnalyses::managed(Some(std::rc::Rc::new(table)));
+        let mut cache = CfgAnalyses::managed(Some(std::sync::Arc::new(table)));
         let f = &mut program.funcs[1];
         assert!(Cse.run_function(f, &mut cache));
         Dce.run_function(f, &mut cache);

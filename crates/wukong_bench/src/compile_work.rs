@@ -715,12 +715,22 @@ fn measure_one(path: &Path) -> Meas {
             w
         }),
     );
-    // Optimize: clone the unoptimized program (uncounted), count `optimize` alone.
+    // Optimize: clone the unoptimized program (uncounted), count `optimize` alone. On ONE thread:
+    // the counters are thread-local, and the default schedule hands independent functions to the
+    // optimizer's worker pool, whose allocations this thread would never see. The MIR is the same
+    // on any thread count, so this is the same work, all of it counted.
     set(
         4,
         repeat(|| {
             let mut p = p0.clone();
-            let (_, w) = counted(|| wukong_opt::optimize(&mut p, LEVEL));
+            let (_, w) = counted(|| {
+                wukong_opt::optimize_preserving_with(
+                    &mut p,
+                    LEVEL,
+                    &[],
+                    wukong_opt::OptimizeOptions::FULL.with_threads(1),
+                )
+            });
             w
         }),
     );

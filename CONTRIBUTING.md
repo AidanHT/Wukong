@@ -196,10 +196,17 @@ with a one-line reason where the warned construct is the fixture's point).
 
 ## Adding an optimizer pass
 
-Implement `wukong_opt::Pass` and register it in `PassManager::standard` — the level tests there are
-exactly `>= 1` and `>= 2`, so **`-O3` adds nothing and must stay byte-identical to `-O2`**; put the
-pass in one of those two arms rather than adding a third. `run_function` loops the whole list to a
-fixpoint, so return `true` from your `run_function` only when you actually changed the function. The
+Implement `wukong_opt::Pass` and register it in `PassManager::standard` with `add_shared` — the level
+tests there are exactly `>= 1` and `>= 2`, so **`-O3` adds nothing and must stay byte-identical to
+`-O2`**; put the pass in one of those two arms rather than adding a third. `run_function` loops the
+whole list to a fixpoint, so return `true` from your `run_function` only when you actually changed
+the function. The standard pipeline optimizes the independent functions of a call-graph level on
+several threads at once, so the pass must be `Send + Sync` and hold **no state of its own**: what it
+must remember about a function between runs belongs in that function's `CfgAnalyses` (the
+vectorizer's widened-loop record is the example), and it may read nothing but the function it is
+handed and the call-effect table's entries for that function's own calls. The determinism gate
+(`crates/wukongc/tests/determinism.rs`) compares one thread against several over the whole corpus;
+`WUKONG_OPT_THREADS=1` runs the old sequential schedule when you need to tell the two apart. The
 `CfgAnalyses` cache is shared across every pass and every iteration: **if your pass changes the
 block set or any successor edge it must call `cache.invalidate()`**
 (`crates/wukong_opt/src/cache.rs`) — a stale dominator tree silently corrupts CSE/LICM/mem2reg and

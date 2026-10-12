@@ -143,6 +143,14 @@ impl PassTimer {
             "optimizer: at most {} fixpoint sweep(s) in any function",
             t.max_iterations
         ));
+        if t.threads > 1 {
+            // Each pass's time is summed over the threads that ran it, so the breakdown can add up
+            // to more than the stage's wall time (`WUKONG_OPT_THREADS=1` keeps one thread).
+            self.notes.push(format!(
+                "optimizer: functions ran on up to {} threads; per-pass times are summed over them",
+                t.threads
+            ));
+        }
     }
 
     /// Record Cranelift's codegen / object-write split, as part of the running `codegen` stage.

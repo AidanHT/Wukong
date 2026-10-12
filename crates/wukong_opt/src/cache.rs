@@ -37,9 +37,19 @@
 //!
 //! A managed cache also carries the program-level [`CallEffects`] table the manager has built so
 //! far (see [`crate::effects`]). It is a property of *other* functions, so nothing this function's
-//! passes do can invalidate it.
+//! passes do can invalidate it. It is shared by `Arc`, so one frozen table can serve functions
+//! optimized on several threads at once.
+//!
+//! # Pass state
+//!
+//! The vectorizer records which loop headers it already widened in the function it is working on
+//! (`vectorize`'s termination note). That record lives here, beside the analyses of the same
+//! function, rather than in the pass: a pass then holds no state of its own, so one instance can
+//! serve several functions at once, and a record per function lives exactly as long as the cache.
+//! Nothing that invalidates the analyses clears it.
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use wukong_mir::Function;
 
@@ -62,13 +72,16 @@ pub struct CfgAnalyses {
     alias: Option<Rc<AliasInfo>>,
     managed: bool,
     /// The summaries of the callees optimized so far; `None` treats every call as opaque.
-    effects: Option<Rc<CallEffects>>,
+    effects: Option<Arc<CallEffects>>,
+    /// The vectorizer's record of the loops it already handled in this function (see the module
+    /// note); taken and put back by `Vectorize::run_function`.
+    pub(crate) vectorized: Option<crate::vectorize::DoneSets>,
 }
 
 impl CfgAnalyses {
     /// A cache driven by the pass manager, which reports every mutation through
     /// [`CfgAnalyses::note_mutation`] and may therefore share instruction-level facts across passes.
-    pub(crate) fn managed(effects: Option<Rc<CallEffects>>) -> CfgAnalyses {
+    pub(crate) fn managed(effects: Option<Arc<CallEffects>>) -> CfgAnalyses {
         CfgAnalyses {
             managed: true,
             effects,
@@ -77,7 +90,7 @@ impl CfgAnalyses {
     }
 
     /// The call-effect summaries available to this function's passes, if any.
-    pub(crate) fn call_effects(&self) -> Option<Rc<CallEffects>> {
+    pub(crate) fn call_effects(&self) -> Option<Arc<CallEffects>> {
         self.effects.clone()
     }
 

@@ -79,6 +79,7 @@ mod loop_canon;
 mod loop_delete;
 pub mod loop_info;
 mod mem2reg;
+mod parallel;
 mod phi;
 mod promote;
 mod simplify;
@@ -129,11 +130,12 @@ pub use switch_form::{form_switches, FormSwitches};
 pub use tre::Tre;
 pub use unswitch::LoopUnswitch;
 
-use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use effects::{CallEffects, CallGraph};
-use wukong_mir::{Op, Program, Terminator, ValueId};
+use parallel::Parallelism;
+use wukong_mir::{Function, Op, Program, Terminator, ValueId};
 
 /// A function-level transform. Returns whether it changed anything.
 ///
@@ -141,6 +143,10 @@ use wukong_mir::{Op, Program, Terminator, ValueId};
 /// pass reads whatever it needs from it (computed lazily, once) and — if it changes the block set or
 /// any terminator's successor edges — must call [`CfgAnalyses::invalidate`]. Passes that only touch
 /// instructions, block parameters, or edge arguments leave the cache alone.
+///
+/// A pass that is also `Send + Sync` and keeps no state between calls (anything it must remember
+/// about one function belongs in that function's `cache`) can be handed to
+/// [`PassManager::add_shared`], and then runs on several functions at once.
 pub trait Pass {
     fn name(&self) -> &'static str;
     fn run_function(&self, f: &mut wukong_mir::Function, cache: &mut CfgAnalyses) -> bool;
@@ -152,7 +158,9 @@ pub trait Pass {
 /// The production [`optimize`] path pays zero timing overhead (the timing branch is never taken).
 #[derive(Clone, Default)]
 pub struct Timings {
-    /// Per-pass accumulated wall time and invocation count, in pipeline order.
+    /// Per-pass accumulated wall time and invocation count, in pipeline order. When functions were
+    /// optimized on several threads ([`Timings::threads`] above 1) each pass's time is the sum over
+    /// those threads, so the column can add up to more than [`Timings::total`].
     pub per_pass: Vec<PassStat>,
     /// Whole-program inlining time (runs at `-O2`+).
     pub inline: Duration,
@@ -169,6 +177,9 @@ pub struct Timings {
     pub total: Duration,
     /// The largest per-function fixpoint iteration count observed across the program.
     pub max_iterations: u32,
+    /// The most threads one batch of the function pipeline ran on: 1 when every function was
+    /// optimized on the calling thread ([`OptimizeOptions::threads`]).
+    pub threads: usize,
 }
 
 /// One pass's accumulated cost over a whole `optimize_timed` run.
@@ -197,20 +208,98 @@ impl Timings {
         s.time += dur;
         s.calls += 1;
     }
+
+    /// Fold in the timings one function's fixpoint gathered on its own (a parallel batch times each
+    /// function separately). Sums and a maximum, so the order functions are folded in is immaterial.
+    fn absorb(&mut self, other: Timings) {
+        for (idx, stat) in other.per_pass.into_iter().enumerate() {
+            if self.per_pass.len() <= idx {
+                self.per_pass.resize(
+                    idx + 1,
+                    PassStat {
+                        name: stat.name,
+                        time: Duration::ZERO,
+                        calls: 0,
+                    },
+                );
+            }
+            let s = &mut self.per_pass[idx];
+            if stat.calls > 0 {
+                s.name = stat.name;
+            }
+            s.time += stat.time;
+            s.calls += stat.calls;
+        }
+        self.max_iterations = self.max_iterations.max(other.max_iterations);
+    }
 }
 
 /// An ordered list of passes, run to a per-function fixpoint.
+///
+/// A manager whose passes were all added with [`PassManager::add_shared`] optimizes the independent
+/// functions of a program on several threads at once ([`OptimizeOptions::threads`]), with output
+/// byte-identical to one thread. A single pass added with [`PassManager::add`] — which may hold
+/// thread-confined state, like a counting or printing wrapper — keeps the whole manager on the
+/// calling thread, running functions one at a time in the original order.
 pub struct PassManager {
-    passes: Vec<Box<dyn Pass>>,
+    passes: PassList,
+    /// `0`: defer to `WUKONG_OPT_THREADS`, then the host ([`OptimizeOptions::threads`]).
+    threads: u32,
+}
+
+/// The passes of a [`PassManager`], in order.
+enum PassList {
+    /// Every pass may run on several functions at once from different threads.
+    Shared(Vec<Box<dyn Pass + Send + Sync>>),
+    /// At least one pass is confined to the calling thread.
+    Local(Vec<Box<dyn Pass>>),
 }
 
 impl PassManager {
     pub fn new() -> PassManager {
-        PassManager { passes: Vec::new() }
+        PassManager {
+            passes: PassList::Shared(Vec::new()),
+            threads: 0,
+        }
     }
 
+    /// Append a pass. It may hold state confined to the calling thread (an `Rc`, a `Cell`, a
+    /// thread-local), so a manager holding one runs every function on the calling thread, in the
+    /// order it always has.
     pub fn add(&mut self, p: Box<dyn Pass>) {
-        self.passes.push(p);
+        if let PassList::Shared(shared) = &mut self.passes {
+            let local: Vec<Box<dyn Pass>> = std::mem::take(shared)
+                .into_iter()
+                .map(|q| -> Box<dyn Pass> { q })
+                .collect();
+            self.passes = PassList::Local(local);
+        }
+        match &mut self.passes {
+            PassList::Local(local) => local.push(p),
+            PassList::Shared(_) => unreachable!("converted above"),
+        }
+    }
+
+    /// Append a pass that can run on several functions at once, each on its own thread with its own
+    /// [`CfgAnalyses`]. Every pass of the standard pipelines is one.
+    pub fn add_shared(&mut self, p: Box<dyn Pass + Send + Sync>) {
+        match &mut self.passes {
+            PassList::Shared(shared) => shared.push(p),
+            PassList::Local(local) => local.push(p),
+        }
+    }
+
+    /// Set how many threads the per-function work may use: `0` (the default) defers to the
+    /// `WUKONG_OPT_THREADS` environment variable and then to the host, `1` is the sequential
+    /// schedule ([`OptimizeOptions::threads`]). Never changes the output.
+    pub fn set_threads(&mut self, threads: u32) {
+        self.threads = threads;
+    }
+
+    /// [`PassManager::set_threads`], by value.
+    pub fn with_threads(mut self, threads: u32) -> PassManager {
+        self.threads = threads;
+        self
     }
 
     /// The standard pipeline for an optimization level. `-O0` does nothing. The only level tests are
@@ -220,67 +309,67 @@ impl PassManager {
         PassManager::standard_with(opt_level, OptimizeOptions::FULL)
     }
 
-    /// [`PassManager::standard`] with the per-pass switches `options` carries: today only whether
-    /// the vectorizer may emit a 256-bit kernel ([`OptimizeOptions::vec_kernels`]). Every pass and
-    /// their order are the same for every `options`.
+    /// [`PassManager::standard`] with the per-pass switches `options` carries: whether the
+    /// vectorizer may emit a 256-bit kernel ([`OptimizeOptions::vec_kernels`]), and the thread count
+    /// ([`OptimizeOptions::threads`]). Every pass and their order are the same for every `options`.
     pub fn standard_with(opt_level: u8, options: OptimizeOptions) -> PassManager {
-        let mut pm = PassManager::new();
+        let mut pm = PassManager::new().with_threads(options.threads);
         if opt_level >= 1 {
             // Promotion comes first: every later pass is far more effective on SSA values than on
             // memory traffic. The whole list then runs to a fixpoint. At `-O2` scalar replacement
             // runs just ahead of mem2reg, so an aggregate it splits is promoted in the same sweep.
             // `-O1` keeps the plain promotion shape the autodiff transform is built against.
             if opt_level >= 2 {
-                pm.add(Box::new(Sroa));
+                pm.add_shared(Box::new(Sroa));
             }
-            pm.add(Box::new(Mem2Reg));
-            pm.add(Box::new(Simplify));
+            pm.add_shared(Box::new(Mem2Reg));
+            pm.add_shared(Box::new(Simplify));
             if opt_level >= 2 {
                 // An edge that already decides a block's branch skips it, through a private copy
                 // of the block (`jump_thread`); simplify-cfg then merges the copy into its
                 // predecessor and removes whatever the threading left without predecessors.
-                pm.add(Box::new(JumpThread));
+                pm.add_shared(Box::new(JumpThread));
             }
-            pm.add(Box::new(SimplifyCfg));
-            pm.add(Box::new(SimplifyPhis));
-            pm.add(Box::new(Dce));
+            pm.add_shared(Box::new(SimplifyCfg));
+            pm.add_shared(Box::new(SimplifyPhis));
+            pm.add_shared(Box::new(Dce));
             // A self-call in tail position becomes a branch back to the top (`tre`).
-            pm.add(Box::new(Tre));
+            pm.add_shared(Box::new(Tre));
         }
         if opt_level >= 2 {
             // CSE feeds Simplify/DCE more constants and dead values; the fixpoint loop reruns all.
-            pm.add(Box::new(Cse));
-            pm.add(Box::new(Dse));
+            pm.add_shared(Box::new(Cse));
+            pm.add_shared(Box::new(Dse));
             // Put every loop into one shape before LICM runs: LICM hoists only into a preheader
             // that already exists, so a loop given one here becomes hoistable in the same sweep.
-            pm.add(Box::new(LoopCanon));
+            pm.add_shared(Box::new(LoopCanon));
             // A loop dse emptied still runs every trip; with a preheader now guaranteed, delete
             // whichever loops provably terminate without doing anything observable.
-            pm.add(Box::new(LoopDelete));
+            pm.add_shared(Box::new(LoopDelete));
             // Fuse adjacent counted loops over the same range once they are canonical, before LICM
             // fills the second loop's preheader with loads (`fuse`).
-            pm.add(Box::new(LoopFuse));
+            pm.add_shared(Box::new(LoopFuse));
             // LICM hoists invariant work out of loops; rerunning the pipeline then cleans up and
             // can expose further invariants (e.g. across nested loops).
-            pm.add(Box::new(Licm));
+            pm.add_shared(Box::new(Licm));
             // Slice bounds checks are extra loop exits, which no later loop transform accepts:
             // version each counted loop on one preheader guard so its proved checks disappear
             // (`bce.rs`). After LICM, so invariant addresses and lengths are already hoisted; before
             // unswitching and the vectorizer, so the check-free, single-exit copy is what they see.
-            pm.add(Box::new(Bce));
+            pm.add_shared(Box::new(Bce));
             // With invariant conditions hoisted, decide a guard on the induction variable or on an
             // invariant once, by splitting or unswitching the loop, so the vectorizer below sees
             // branch-free bodies (`unswitch`).
-            pm.add(Box::new(LoopUnswitch));
+            pm.add_shared(Box::new(LoopUnswitch));
             // With the invariant loads hoisted (and a slice loop versioned into a check-free copy
             // with a single exit), a location the loop still both reads and writes is a
             // memory-carried reduction: keep it in a register for the loop's duration.
-            pm.add(Box::new(Promote));
+            pm.add_shared(Box::new(Promote));
             // Widening comes last, on the cleanest MIR the pipeline produces: canonical loops with
             // one latch and one exit-test polarity, invariants already hoisted, and dead code gone.
             // Everything it emits is fed back through the fixpoint, so the vector body gets the
             // same simplification, CSE and DCE the scalar body did.
-            pm.add(Box::new(Vectorize::new(options.vec_kernels)));
+            pm.add_shared(Box::new(Vectorize::new(options.vec_kernels)));
         }
         pm
     }
@@ -303,26 +392,38 @@ impl PassManager {
     /// wrap exactly these passes and drive them exactly as `optimize` does.
     pub fn unroll_cleanup() -> PassManager {
         let mut pm = PassManager::new();
-        pm.add(Box::new(Simplify));
-        pm.add(Box::new(SimplifyCfg));
-        pm.add(Box::new(SimplifyPhis));
-        pm.add(Box::new(Cse));
-        pm.add(Box::new(Dce));
+        pm.add_shared(Box::new(Simplify));
+        pm.add_shared(Box::new(SimplifyCfg));
+        pm.add_shared(Box::new(SimplifyPhis));
+        pm.add_shared(Box::new(Cse));
+        pm.add_shared(Box::new(Dce));
         pm
+    }
+
+    fn is_empty(&self) -> bool {
+        match &self.passes {
+            PassList::Shared(passes) => passes.is_empty(),
+            PassList::Local(passes) => passes.is_empty(),
+        }
     }
 
     pub fn run(&self, program: &mut Program) {
         // Preserve the legacy library API's debug assertion, while the fallible API below is
         // available to release callers and never turns a verifier error into a panic.
-        self.run_program(program, None, cfg!(debug_assertions))
-            .unwrap_or_else(|failure| panic!("{failure}"));
+        self.run_program(
+            program,
+            None,
+            cfg!(debug_assertions),
+            Parallelism::resolve(self.threads),
+        )
+        .unwrap_or_else(|failure| panic!("{failure}"));
     }
 
     /// Run with fallible verification in every build profile. Check each pass that actually ran,
     /// including one reporting no mutation, and whole-program call signatures at the boundaries.
     pub fn run_verified(&self, program: &mut Program) -> Result<(), VerificationFailure> {
         verify_program_stage(program, "pipeline input")?;
-        self.run_program(program, None, true)?;
+        self.run_program(program, None, true, Parallelism::resolve(self.threads))?;
         verify_program_stage(program, "pipeline output")
     }
 
@@ -332,8 +433,13 @@ impl PassManager {
     /// away is judged by its new body. Public so a measurement replica that wraps these passes runs
     /// the identical sequence (`wukong_bench compile-work` checks it byte for byte).
     pub fn run_subset(&self, program: &mut Program, funcs: &[usize]) {
-        self.run_subset_checked(program, funcs, cfg!(debug_assertions))
-            .unwrap_or_else(|failure| panic!("{failure}"));
+        self.run_subset_checked(
+            program,
+            funcs,
+            cfg!(debug_assertions),
+            Parallelism::resolve(self.threads),
+        )
+        .unwrap_or_else(|failure| panic!("{failure}"));
     }
 
     /// [`PassManager::run_subset`] with fallible verification in every build profile: each pass
@@ -345,126 +451,60 @@ impl PassManager {
         program: &mut Program,
         funcs: &[usize],
     ) -> Result<(), VerificationFailure> {
-        self.run_subset_checked(program, funcs, true)
+        self.run_subset_checked(program, funcs, true, Parallelism::resolve(self.threads))
     }
 
+    /// The subset sweep. The call-effect table is summarized once, before any of `funcs` changes,
+    /// and nothing updates it while they run — so the functions are independent of one another and
+    /// may be optimized at once. A repeated index is optimized twice, in order, on the calling
+    /// thread.
     fn run_subset_checked(
         &self,
         program: &mut Program,
         funcs: &[usize],
         verify_each: bool,
+        par: Parallelism,
     ) -> Result<(), VerificationFailure> {
-        if funcs.is_empty() || self.passes.is_empty() {
+        if funcs.is_empty() || self.is_empty() {
             return Ok(());
         }
-        let effects = Rc::new(CallEffects::of(program));
-        for &i in funcs {
-            self.run_function_checked(
-                &mut program.funcs[i],
-                None,
-                verify_each,
-                Some(Rc::clone(&effects)),
-            )?;
+        let effects = Arc::new(CallEffects::of(program));
+        match &self.passes {
+            PassList::Shared(passes) if !par.is_sequential() && all_distinct(funcs) => {
+                let (results, _) =
+                    parallel::try_map(par, parallel::select_mut(&mut program.funcs, funcs), |f| {
+                        fixpoint(passes, f, None, verify_each, Some(Arc::clone(&effects)))
+                    });
+                results.into_iter().collect()
+            }
+            PassList::Shared(passes) => {
+                subset_sequential(passes, program, funcs, verify_each, &effects)
+            }
+            PassList::Local(passes) => {
+                subset_sequential(passes, program, funcs, verify_each, &effects)
+            }
         }
-        Ok(())
     }
 
     /// Run the pipeline over every function, callees before callers, summarizing each call-graph
     /// SCC as soon as its members are optimized so that their callers — processed later — can treat
-    /// side-effect-free calls like instructions. The order is a pure function of the program, so
-    /// the output is as deterministic as before; only which function is optimized first changed.
+    /// side-effect-free calls like instructions. On one thread (or with a thread-confined pass) that
+    /// is one SCC after another in callees-first order; otherwise one call-graph level after another,
+    /// a level's functions at once ([`program_by_levels`]). The MIR is the same either way.
     fn run_program(
         &self,
         program: &mut Program,
-        mut timings: Option<&mut Timings>,
+        timings: Option<&mut Timings>,
         verify_each: bool,
+        par: Parallelism,
     ) -> Result<(), VerificationFailure> {
-        if self.passes.is_empty() {
-            return Ok(());
-        }
-        let mut effects = Rc::new(CallEffects::default());
-        let graph = CallGraph::of(program);
-        for (scc, members) in graph.sccs.iter().enumerate() {
-            for &i in members {
-                self.run_function_checked(
-                    &mut program.funcs[i as usize],
-                    timings.as_deref_mut(),
-                    verify_each,
-                    Some(Rc::clone(&effects)),
-                )?;
+        match &self.passes {
+            PassList::Shared(passes) if !par.is_sequential() => {
+                program_by_levels(passes, program, timings, verify_each, par)
             }
-            // Every function's cache (and its handle on the table) is gone by now, so this updates
-            // the table in place.
-            graph.summarize(program, scc, Rc::make_mut(&mut effects));
+            PassList::Shared(passes) => program_sequential(passes, program, timings, verify_each),
+            PassList::Local(passes) => program_sequential(passes, program, timings, verify_each),
         }
-        Ok(())
-    }
-
-    /// The fixpoint driver. `timings` is `None` on the production path (zero overhead); the bench
-    /// harness passes `Some(..)` to accumulate per-pass wall time. The `timings` branch does not
-    /// change which passes run or in what order, so the resulting MIR is identical either way.
-    fn run_function_checked(
-        &self,
-        f: &mut wukong_mir::Function,
-        mut timings: Option<&mut Timings>,
-        verify_each: bool,
-        effects: Option<Rc<CallEffects>>,
-    ) -> Result<(), VerificationFailure> {
-        // One analysis cache per function, shared across every pass and every fixpoint iteration.
-        // It is invalidated by the passes that restructure the CFG (see their `run_function`), so it
-        // stays valid — and reused — across the long tail of the fixpoint where only instructions
-        // move. The cache never changes what a pass computes, only how often it recomputes it. It is
-        // *managed*: every reported mutation is passed on below, which is what lets it hand one
-        // function's alias facts to several memory passes in a row. It also carries the call
-        // effects of the functions optimized so far.
-        let mut cache = CfgAnalyses::managed(effects);
-        // Fixpoint with per-pass clean-tracking. A pass is a *deterministic* function of the MIR, so a
-        // pass that ran and reported "no change" cannot do anything until some OTHER pass mutates the
-        // function — re-running it on identical MIR would again be a no-op. We therefore skip
-        // known-clean passes, and a mutation re-dirties every pass (conservatively). This skips the
-        // optimizer's final all-passes no-op *confirmation* sweep (and any pass already at fixpoint
-        // mid-run) WITHOUT changing the sequence of mutations, so the resulting MIR is bit-identical
-        // to the naive "run everything every sweep" fixpoint — the differential gate (-O0 ≡ -O{1,2,3},
-        // interp ≡ native) and the debug verify below both still hold. ~20% off optimizer time.
-        let mut clean = vec![false; self.passes.len()];
-        let mut iterations = 0;
-        loop {
-            let mut changed = false;
-            for (i, p) in self.passes.iter().enumerate() {
-                if clean[i] {
-                    continue; // at fixpoint: nothing has mutated the MIR since this pass last ran
-                }
-                let did = match timings.as_deref_mut() {
-                    Some(t) => {
-                        let t0 = Instant::now();
-                        let did = p.run_function(f, &mut cache);
-                        t.record(i, p.name(), t0.elapsed());
-                        did
-                    }
-                    None => p.run_function(f, &mut cache),
-                };
-                if did {
-                    changed = true;
-                    cache.note_mutation();
-                    // A mutation may have created work for every pass again (including earlier ones
-                    // already run this sweep, and `p` itself). Re-dirty all; they re-run next sweep.
-                    clean.iter_mut().for_each(|c| *c = false);
-                } else {
-                    clean[i] = true;
-                }
-                if verify_each {
-                    verify_each::verify_function_stage(f, p.name())?;
-                }
-            }
-            iterations += 1;
-            if !changed || iterations > 100 {
-                break;
-            }
-        }
-        if let Some(t) = timings {
-            t.max_iterations = t.max_iterations.max(iterations);
-        }
-        Ok(())
     }
 }
 
@@ -474,9 +514,218 @@ impl Default for PassManager {
     }
 }
 
-/// The optimizer stages a caller can switch off independently of the `-O` level. Every entry point
-/// without a `_with` suffix runs [`OptimizeOptions::FULL`] (also the [`Default`]); the level still
-/// decides whether a stage can run at all (SLP needs `-O2`).
+/// Is every index of `funcs` different?
+fn all_distinct(funcs: &[usize]) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
+    funcs.iter().all(|&i| seen.insert(i))
+}
+
+/// The sequential subset sweep: `funcs` in order, stopping at the first failure.
+fn subset_sequential<P: Pass + ?Sized>(
+    passes: &[Box<P>],
+    program: &mut Program,
+    funcs: &[usize],
+    verify_each: bool,
+    effects: &Arc<CallEffects>,
+) -> Result<(), VerificationFailure> {
+    for &i in funcs {
+        fixpoint(
+            passes,
+            &mut program.funcs[i],
+            None,
+            verify_each,
+            Some(Arc::clone(effects)),
+        )?;
+    }
+    Ok(())
+}
+
+/// The sequential schedule: one SCC after another in callees-first order, each summarized as soon
+/// as its members are done.
+fn program_sequential<P: Pass + ?Sized>(
+    passes: &[Box<P>],
+    program: &mut Program,
+    mut timings: Option<&mut Timings>,
+    verify_each: bool,
+) -> Result<(), VerificationFailure> {
+    if passes.is_empty() {
+        return Ok(());
+    }
+    let mut effects = Arc::new(CallEffects::default());
+    let graph = CallGraph::of(program);
+    for (scc, members) in graph.sccs.iter().enumerate() {
+        for &i in members {
+            fixpoint(
+                passes,
+                &mut program.funcs[i as usize],
+                timings.as_deref_mut(),
+                verify_each,
+                Some(Arc::clone(&effects)),
+            )?;
+        }
+        // Every function's cache (and its handle on the table) is gone by now, so this updates
+        // the table in place.
+        graph.summarize(program, scc, Arc::make_mut(&mut effects));
+    }
+    Ok(())
+}
+
+/// The parallel schedule: one call-graph *level* at a time ([`CallGraph::levels`]). Every function
+/// of a level is optimized against the table as it stands after the levels below — which holds the
+/// final summary of every callee any of them has, exactly as the sequential schedule would show it
+/// (`effects` module note) — so a level's functions are independent tasks ([`parallel::try_map`]),
+/// and its SCCs are then summarized in SCC order.
+///
+/// A failure is reported as the sequential schedule would report it: the earliest failing function
+/// in SCC order, whether it failed verification or panicked. A panic comes back from its batch as a
+/// value ([`parallel::Failed::Panic`]) and is recorded exactly like a verifier failure; after
+/// either, only SCCs earlier than it are still optimized — any of them could fail first in
+/// sequential order, and none of them can call it — and only once every level is done is the
+/// earliest failure returned, or resumed if it was a panic.
+fn program_by_levels(
+    passes: &[Box<dyn Pass + Send + Sync>],
+    program: &mut Program,
+    mut timings: Option<&mut Timings>,
+    verify_each: bool,
+    par: Parallelism,
+) -> Result<(), VerificationFailure> {
+    if passes.is_empty() {
+        return Ok(());
+    }
+    let graph = CallGraph::of(program);
+    let mut effects = Arc::new(CallEffects::default());
+    let mut failed: Option<(usize, parallel::Failed<VerificationFailure>)> = None;
+    let timed = timings.is_some();
+    for level in graph.levels() {
+        let bound = failed.as_ref().map_or(usize::MAX, |(scc, _)| *scc);
+        let sccs: Vec<usize> = level.into_iter().filter(|&scc| scc < bound).collect();
+        if sccs.is_empty() {
+            continue;
+        }
+        // The level's functions in sequential order: SCC order, members in SCC order.
+        let tasks: Vec<(usize, usize)> = sccs
+            .iter()
+            .flat_map(|&scc| graph.sccs[scc].iter().map(move |&m| (scc, m as usize)))
+            .collect();
+        let indices: Vec<usize> = tasks.iter().map(|&(_, i)| i).collect();
+        let table = &effects;
+        let (results, threads) = parallel::try_map_caught(
+            par,
+            parallel::select_mut(&mut program.funcs, &indices),
+            |f| {
+                let mut own = timed.then(Timings::default);
+                fixpoint(
+                    passes,
+                    f,
+                    own.as_mut(),
+                    verify_each,
+                    Some(Arc::clone(table)),
+                )
+                .map(|()| own)
+            },
+        );
+        // `try_map_caught` reports up to the first failure (or panic) in this order, which is the
+        // earliest of the level; anything already recorded is later still, or it would have
+        // filtered this level.
+        for (k, result) in results.into_iter().enumerate() {
+            match result {
+                Ok(own) => {
+                    if let (Some(acc), Some(own)) = (timings.as_deref_mut(), own) {
+                        acc.absorb(own);
+                    }
+                }
+                Err(failure) => failed = Some((tasks[k].0, failure)),
+            }
+        }
+        if let Some(acc) = timings.as_deref_mut() {
+            acc.threads = acc.threads.max(threads);
+        }
+        let bound = failed.as_ref().map_or(usize::MAX, |(scc, _)| *scc);
+        for &scc in &sccs {
+            if scc < bound {
+                // Every task's handle on the table was dropped with its cache, so this updates
+                // the table in place.
+                graph.summarize(program, scc, Arc::make_mut(&mut effects));
+            }
+        }
+    }
+    match failed {
+        Some((_, failure)) => Err(failure.into_err()),
+        None => Ok(()),
+    }
+}
+
+/// The fixpoint driver. `timings` is `None` on the production path (zero overhead); the bench
+/// harness passes `Some(..)` to accumulate per-pass wall time. The `timings` branch does not
+/// change which passes run or in what order, so the resulting MIR is identical either way.
+fn fixpoint<P: Pass + ?Sized>(
+    passes: &[Box<P>],
+    f: &mut Function,
+    mut timings: Option<&mut Timings>,
+    verify_each: bool,
+    effects: Option<Arc<CallEffects>>,
+) -> Result<(), VerificationFailure> {
+    // One analysis cache per function, shared across every pass and every fixpoint iteration.
+    // It is invalidated by the passes that restructure the CFG (see their `run_function`), so it
+    // stays valid — and reused — across the long tail of the fixpoint where only instructions
+    // move. The cache never changes what a pass computes, only how often it recomputes it. It is
+    // *managed*: every reported mutation is passed on below, which is what lets it hand one
+    // function's alias facts to several memory passes in a row. It also carries the call
+    // effects of the functions optimized so far.
+    let mut cache = CfgAnalyses::managed(effects);
+    // Fixpoint with per-pass clean-tracking. A pass is a *deterministic* function of the MIR, so a
+    // pass that ran and reported "no change" cannot do anything until some OTHER pass mutates the
+    // function — re-running it on identical MIR would again be a no-op. We therefore skip
+    // known-clean passes, and a mutation re-dirties every pass (conservatively). This skips the
+    // optimizer's final all-passes no-op *confirmation* sweep (and any pass already at fixpoint
+    // mid-run) WITHOUT changing the sequence of mutations, so the resulting MIR is bit-identical
+    // to the naive "run everything every sweep" fixpoint — the differential gate (-O0 ≡ -O{1,2,3},
+    // interp ≡ native) and the debug verify below both still hold. ~20% off optimizer time.
+    let mut clean = vec![false; passes.len()];
+    let mut iterations = 0;
+    loop {
+        let mut changed = false;
+        for (i, p) in passes.iter().enumerate() {
+            if clean[i] {
+                continue; // at fixpoint: nothing has mutated the MIR since this pass last ran
+            }
+            let did = match timings.as_deref_mut() {
+                Some(t) => {
+                    let t0 = Instant::now();
+                    let did = p.run_function(f, &mut cache);
+                    t.record(i, p.name(), t0.elapsed());
+                    did
+                }
+                None => p.run_function(f, &mut cache),
+            };
+            if did {
+                changed = true;
+                cache.note_mutation();
+                // A mutation may have created work for every pass again (including earlier ones
+                // already run this sweep, and `p` itself). Re-dirty all; they re-run next sweep.
+                clean.iter_mut().for_each(|c| *c = false);
+            } else {
+                clean[i] = true;
+            }
+            if verify_each {
+                verify_each::verify_function_stage(f, p.name())?;
+            }
+        }
+        iterations += 1;
+        if !changed || iterations > 100 {
+            break;
+        }
+    }
+    if let Some(t) = timings {
+        t.max_iterations = t.max_iterations.max(iterations);
+    }
+    Ok(())
+}
+
+/// The optimizer stages a caller can switch off independently of the `-O` level, and how many
+/// threads the per-function work may use. Every entry point without a `_with` suffix runs
+/// [`OptimizeOptions::FULL`] (also the [`Default`]); the level still decides whether a stage can
+/// run at all (SLP needs `-O2`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OptimizeOptions {
     /// Straight-line SLP ([`slp_program`]) after unrolling, at `-O2` and above.
@@ -490,13 +739,22 @@ pub struct OptimizeOptions {
     /// values. The interpreter and the native backend are compiled with the same setting, so the
     /// differential compares one MIR.
     pub vec_kernels: bool,
+    /// How many threads the per-function phases may use — the fixpoint pipeline over the functions
+    /// of one call-graph level, unrolling, SLP, their cleanup sweeps and switch formation
+    /// (`parallel` module). `0` defers to the `WUKONG_OPT_THREADS` environment variable, and an
+    /// unset, `0` or unparseable variable means automatic: the host's parallelism (at most 8),
+    /// used only for a batch with enough work to share. `1` is the sequential schedule; a larger
+    /// count uses the pool for every batch of two or more functions. **The output never depends on
+    /// it**: every setting produces byte-identical MIR.
+    pub threads: u32,
 }
 
 impl OptimizeOptions {
-    /// Every stage the level enables.
+    /// Every stage the level enables, on the automatic thread count.
     pub const FULL: OptimizeOptions = OptimizeOptions {
         slp: true,
         vec_kernels: true,
+        threads: 0,
     };
     /// The pipeline for a program `wukong_autodiff` will differentiate (`--emit=grad`, `--train`,
     /// `--emit=obj --grad-of`): everything but SLP. Autodiff takes the *optimized* single-block
@@ -516,6 +774,7 @@ impl OptimizeOptions {
     pub const AUTODIFF_INPUT: OptimizeOptions = OptimizeOptions {
         slp: false,
         vec_kernels: false,
+        threads: 0,
     };
 
     /// These options with the vectorizer's 256-bit kernels switched on or off.
@@ -524,6 +783,11 @@ impl OptimizeOptions {
             vec_kernels,
             ..self
         }
+    }
+
+    /// These options with the thread count set ([`OptimizeOptions::threads`]; `1` is sequential).
+    pub const fn with_threads(self, threads: u32) -> OptimizeOptions {
+        OptimizeOptions { threads, ..self }
     }
 }
 
@@ -551,27 +815,35 @@ pub fn optimize_preserving_with(
     roots: &[wukong_span::Symbol],
     options: OptimizeOptions,
 ) {
+    let par = Parallelism::resolve(options.threads);
+    let debug = cfg!(debug_assertions);
     // Inlining is a whole-program transform (it needs callee bodies), so it runs before the
     // function-level pipeline — which then optimizes the spliced-in code in context.
     if opt_level >= 2 {
         inline::inline_program_preserving(program, roots);
     }
-    PassManager::standard_with(opt_level, options).run(program);
+    PassManager::standard_with(opt_level, options)
+        .run_program(program, None, debug, par)
+        .unwrap_or_else(|failure| panic!("{failure}"));
     // Unrolling runs after the pipeline, not inside its fixpoint: it needs the canonical two-block
     // counted loop that mem2reg/simplify-cfg produce, and re-running it on its own output would
     // unroll the same loop again every sweep. Only the functions it touched are re-optimized, so a
     // program with no unrollable loop pays one scan and nothing more.
     if opt_level >= 2 {
-        let changed = unroll_program(program);
-        PassManager::unroll_cleanup().run_subset(program, &changed);
+        let changed = unroll::unroll_program_with(program, par);
+        PassManager::unroll_cleanup()
+            .run_subset_checked(program, &changed, debug, par)
+            .unwrap_or_else(|failure| panic!("{failure}"));
         // Straight-line SLP, after unrolling so a complete unroll's copies are visible with their
         // counters folded; the packed functions get the same cleanup (`slp`).
         if options.slp {
-            let packed = slp::slp_program(program);
-            PassManager::unroll_cleanup().run_subset(program, &packed);
+            let packed = slp::slp_program_with(program, par);
+            PassManager::unroll_cleanup()
+                .run_subset_checked(program, &packed, debug, par)
+                .unwrap_or_else(|failure| panic!("{failure}"));
         }
         // Last, and outside the fixpoint: a multi-way branch must not reach the loop passes.
-        switch_form::form_switches(program);
+        switch_form::form_switches_with(program, par);
     }
 }
 
@@ -599,23 +871,27 @@ pub fn optimize_verified_preserving_with(
     roots: &[wukong_span::Symbol],
     options: OptimizeOptions,
 ) -> Result<(), VerificationFailure> {
+    let par = Parallelism::resolve(options.threads);
     // O0 still validates its input; a malformed lowering must not reach even the first transform.
     verify_program_stage(program, "optimization input")?;
     if opt_level >= 2 {
         inline::inline_program_preserving(program, roots);
         verify_program_stage(program, "inline")?;
     }
-    PassManager::standard_with(opt_level, options).run_verified(program)?;
+    let pm = PassManager::standard_with(opt_level, options);
+    verify_program_stage(program, "pipeline input")?;
+    pm.run_program(program, None, true, par)?;
+    verify_program_stage(program, "pipeline output")?;
     if opt_level >= 2 {
-        let changed = unroll_program(program);
+        let changed = unroll::unroll_program_with(program, par);
         verify_program_stage(program, "unroll")?;
-        PassManager::unroll_cleanup().run_subset_checked(program, &changed, true)?;
+        PassManager::unroll_cleanup().run_subset_checked(program, &changed, true, par)?;
         if options.slp {
-            let packed = slp::slp_program(program);
+            let packed = slp::slp_program_with(program, par);
             verify_program_stage(program, "slp")?;
-            PassManager::unroll_cleanup().run_subset_checked(program, &packed, true)?;
+            PassManager::unroll_cleanup().run_subset_checked(program, &packed, true, par)?;
         }
-        switch_form::form_switches(program);
+        switch_form::form_switches_with(program, par);
         verify_program_stage(program, "form-switches")?;
     }
     verify_program_stage(program, "optimization output")
@@ -630,13 +906,18 @@ pub fn optimize_timed(program: &mut Program, opt_level: u8) -> Timings {
 }
 
 /// Like [`optimize_timed`], running only the stages `options` leaves on — byte-identical to
-/// [`optimize_preserving_with`] with no extra roots and the same `options`.
+/// [`optimize_preserving_with`] with no extra roots and the same `options`, on the same threads.
 pub fn optimize_timed_with(
     program: &mut Program,
     opt_level: u8,
     options: OptimizeOptions,
 ) -> Timings {
-    let mut t = Timings::default();
+    let par = Parallelism::resolve(options.threads);
+    let debug = cfg!(debug_assertions);
+    let mut t = Timings {
+        threads: 1,
+        ..Timings::default()
+    };
     let start = Instant::now();
     if opt_level >= 2 {
         let i0 = Instant::now();
@@ -644,7 +925,7 @@ pub fn optimize_timed_with(
         t.inline = i0.elapsed();
     }
     PassManager::standard_with(opt_level, options)
-        .run_program(program, Some(&mut t), cfg!(debug_assertions))
+        .run_program(program, Some(&mut t), debug, par)
         .unwrap_or_else(|failure| panic!("{failure}"));
     if opt_level >= 2 {
         // The unroll bucket is the pass *and* its cleanup sweep: that sum is the cost unrolling
@@ -653,18 +934,22 @@ pub fn optimize_timed_with(
         // (`Timings::record` keys by pass index, and the two pipelines number their passes
         // differently).
         let u0 = Instant::now();
-        let changed = unroll_program(program);
-        PassManager::unroll_cleanup().run_subset(program, &changed);
+        let changed = unroll::unroll_program_with(program, par);
+        PassManager::unroll_cleanup()
+            .run_subset_checked(program, &changed, debug, par)
+            .unwrap_or_else(|failure| panic!("{failure}"));
         t.unroll = u0.elapsed();
         // The SLP bucket, likewise, is the stage and its cleanup.
         if options.slp {
             let s0 = Instant::now();
-            let packed = slp::slp_program(program);
-            PassManager::unroll_cleanup().run_subset(program, &packed);
+            let packed = slp::slp_program_with(program, par);
+            PassManager::unroll_cleanup()
+                .run_subset_checked(program, &packed, debug, par)
+                .unwrap_or_else(|failure| panic!("{failure}"));
             t.slp = s0.elapsed();
         }
         // Counted in `total` only: one scan per function, and a cleanup only where one formed.
-        switch_form::form_switches(program);
+        switch_form::form_switches_with(program, par);
     }
     t.total = start.elapsed();
     t
@@ -870,6 +1155,9 @@ pub(crate) fn has_side_effects(op: &Op) -> bool {
 
 #[cfg(test)]
 mod atomic_tests;
+
+#[cfg(test)]
+mod parallel_tests;
 
 #[cfg(test)]
 mod tests {
