@@ -601,8 +601,9 @@ no aggregate ever rides in a register and the two backends still agree
 `f::<n>(..)` with `n` a local gives the callee's dimension a *fresh* symbol, minted through the shared
 `&Interner` sema holds (`Interner::fresh`, which prints as `n` but is never found by its text) — one
 per read, or one per immutable binding that nothing in the function borrows — and records it per call
-in `SemaResult::dim_snapshots`. Every shape the call returns names that symbol, so it unifies with
-another read only when both read that one binding. `lower_call` reads each such local before the
+in `SemaResult::dim_snapshots` (keyed by the callee id like `call_dims`, and carried with it onto every
+fresh-id copy `defer` lowering makes of a deferred call). Every shape the call returns names that
+symbol, so it unifies with another read only when both read that one binding. `lower_call` reads each such local before the
 call's arguments into an `i64` slot bound under the symbol in the function's outermost scope (zeroed
 in the entry block), and `call_dim_args` passes the slot's value as the hidden dimension.
 `dim_var_value` resolves a type's dimension, and takes a function's own generic from the outermost

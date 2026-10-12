@@ -32,7 +32,7 @@ use wukong_ast::{
     StmtKind, TypeExpr, TypeKind, UnOp, VariantPat,
 };
 use wukong_diag::Diagnostic;
-use wukong_sema::{BuiltinCall, MethodCall, SemaResult};
+use wukong_sema::{BuiltinCall, DimSnapshot, MethodCall, SemaResult};
 use wukong_span::{FxHashMap, FxHashSet, Interner, Span, Symbol};
 use wukong_types::{Dim, Ty};
 
@@ -53,6 +53,12 @@ pub(crate) struct DeferOverlay {
     /// shape-generic function keeps the dimension bindings sema solved for the original, which
     /// the hidden runtime-dim ABI reads.
     pub(crate) call_dims: FxHashMap<NodeId, Vec<(Symbol, Dim)>>,
+    /// Entries layered over `sema.dim_snapshots` (keyed by a call's CALLEE id, like `call_dims`):
+    /// a copied call whose turbofish names a local (`f::<n>(..)`) reads it into its dimension's
+    /// slot itself. Without the record the copy wrote nothing there, while its `call_dims` and
+    /// result type still named the dimension: reading the result's extent was `C0001`, or read 0
+    /// when another read of the same binding had made the slot on a path that did not run.
+    pub(crate) dim_snapshots: FxHashMap<NodeId, Vec<DimSnapshot>>,
     /// Entries layered over `sema.builtin_calls` (keyed by the CALL id): a copied named-kernel
     /// builtin call (`matmul(..)`) keeps the resolution its lowering reads.
     pub(crate) builtin_calls: FxHashMap<NodeId, BuiltinCall>,
@@ -72,6 +78,8 @@ impl DeferOverlay {
             .extend(self.types.iter().map(|(id, t)| (*id, t.clone())));
         s.call_dims
             .extend(self.call_dims.iter().map(|(id, d)| (*id, d.clone())));
+        s.dim_snapshots
+            .extend(self.dim_snapshots.iter().map(|(id, d)| (*id, d.clone())));
         s.builtin_calls
             .extend(self.builtin_calls.iter().map(|(id, c)| (*id, c.clone())));
         s.methods
@@ -103,6 +111,7 @@ pub(crate) fn lower_defers(
         extra: FxHashMap::default(),
         sema,
         extra_call_dims: FxHashMap::default(),
+        extra_dim_snapshots: FxHashMap::default(),
         extra_builtin_calls: FxHashMap::default(),
         extra_method_calls: FxHashMap::default(),
         extra_str_print_args: FxHashSet::default(),
@@ -128,6 +137,7 @@ pub(crate) fn lower_defers(
             DeferOverlay {
                 types: d.extra,
                 call_dims: d.extra_call_dims,
+                dim_snapshots: d.extra_dim_snapshots,
                 builtin_calls: d.extra_builtin_calls,
                 method_calls: d.extra_method_calls,
                 str_print_args: d.extra_str_print_args,
@@ -159,11 +169,13 @@ struct Desugar<'a> {
     base: &'a FxHashMap<NodeId, Ty>,
     /// Types of the nodes this pass creates.
     extra: FxHashMap<NodeId, Ty>,
-    /// Sema's id-keyed records for the original nodes (call dimensions, builtin calls, method
-    /// calls), which every copy inherits under its fresh id.
+    /// Sema's id-keyed records for the original nodes (call dimensions, run-time turbofish reads,
+    /// builtin calls, method calls), which every copy inherits under its fresh id.
     sema: &'a SemaResult,
     /// Call dimension bindings of the copies this pass creates.
     extra_call_dims: FxHashMap<NodeId, Vec<(Symbol, Dim)>>,
+    /// Run-time turbofish reads of the copies this pass creates.
+    extra_dim_snapshots: FxHashMap<NodeId, Vec<DimSnapshot>>,
     /// Builtin-call resolutions of the copies this pass creates.
     extra_builtin_calls: FxHashMap<NodeId, BuiltinCall>,
     /// Method-call records of the copies this pass creates.
@@ -610,6 +622,14 @@ impl Desugar<'_> {
         if let Some(dims) = dims {
             self.extra_call_dims.insert(new, dims);
         }
+        let snaps = self
+            .extra_dim_snapshots
+            .get(id)
+            .or_else(|| self.sema.dim_snapshots.get(id))
+            .cloned();
+        if let Some(snaps) = snaps {
+            self.extra_dim_snapshots.insert(new, snaps);
+        }
         let builtin = self
             .extra_builtin_calls
             .get(id)
@@ -954,8 +974,21 @@ fn mentions_expr(e: &Expr, out: &mut Vec<Symbol>) {
             mentions_expr(lhs, out);
             mentions_expr(rhs, out);
         }
-        ExprKind::Call { callee, args, .. } => {
+        ExprKind::Call {
+            callee,
+            generic_args,
+            args,
+        } => {
             mentions_expr(callee, out);
+            // A turbofish dimension may name a local the call reads (`f::<n>(..)`), at the exit
+            // where the copy runs, by name.
+            for g in generic_args {
+                if let TypeKind::Path(p) = &g.kind {
+                    if p.is_single() && !out.contains(&p.segments[0].sym) {
+                        out.push(p.segments[0].sym);
+                    }
+                }
+            }
             for a in args {
                 mentions_expr(a, out);
             }
@@ -1258,6 +1291,51 @@ mod tests {
             e0314("fn g(x: i32) {} fn f() { let x = 1; if true { defer g(x); } let x = 2; g(x); }"),
             0
         );
+        // A turbofish reads the local it names when the defer runs (`f::<n>(..)`): the copy at
+        // the exit would read the new `n` where sema typed the outer one.
+        assert_eq!(
+            e0314(&format!(
+                "{ROW}fn f(buf: [i32; 6]) {{ let n = 3; defer print(row::<2, n>(buf, 1)[0]); \
+                 let n = 2; print(n); }}"
+            )),
+            1
+        );
+    }
+
+    const ROW: &str = "fn row<M, N>(a: Tensor[i32, M, N], i: i64) -> Tensor[i32, N] { \
+                       return a[i]; }\n";
+
+    /// Every copy of a deferred call whose turbofish reads a local carries the record of that read
+    /// under its fresh id, so it writes the dimension's slot itself. Without it a copy read the
+    /// slot unwritten: `C0001` when nothing else made the slot, 0 when another read of `n` had.
+    #[test]
+    fn a_copied_turbofish_call_reads_its_own_dimension() {
+        let src = format!(
+            "{ROW}fn f(buf: [i32; 6], c: bool) -> i64 {{ let n = 3; \
+             defer print(row::<2, n>(buf, 1).dim(0)); if c {{ return 1; }} return 2; }}"
+        );
+        let (module, sema, mut interner) = analyze(&src);
+        let (_, overlay) = lower_defers(&module, &sema, &mut interner)
+            .expect("no E0314")
+            .expect("the module has a defer");
+        let original: Vec<_> = sema.dim_snapshots.values().collect();
+        assert_eq!(original.len(), 1, "{original:?}");
+        // One copy per exit (`return 1`, `return 2`), each with the original's reads.
+        assert_eq!(
+            overlay.dim_snapshots.len(),
+            2,
+            "{:?}",
+            overlay.dim_snapshots
+        );
+        for snaps in overlay.dim_snapshots.values() {
+            assert_eq!(snaps, original[0]);
+        }
+        let (program, diags) = crate::lower_program(&module, &sema, &mut interner);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        for f in &program.funcs {
+            let errs = wukong_mir::verify::verify_function(f);
+            assert!(errs.is_empty(), "{errs:?}");
+        }
     }
 
     /// The whole pipeline lowers a `defer` program to verifier-clean MIR with no C0001.

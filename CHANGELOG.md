@@ -32,6 +32,12 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `x = 2.5`) was converted and ran with `N = 2`; it is `E0401`. A name that is nothing in scope
   (`first::<lne>(a)`) was dropped in favour of the argument's length; it is `E0504`
   (`tests/fail/turbofish_dim_not_integer.wk`, `tests/fail/turbofish_unknown_dim.wk`).
+- **A deferred turbofish call reads its own dimension.** `defer` lowering copies the deferred
+  expression onto every exit under fresh node ids, and the copies did not carry the record of which
+  local a turbofish reads: `defer print(row::<2, n>(buf, 1).dim(0));` was `C0001`, and printed 0
+  when another read of `n` had made the dimension's slot on a branch that did not run. Each copy
+  now reads `n` when the defer runs, and a name a deferred turbofish reads is one the defer uses, so
+  rebinding it while the defer is pending is `E0314` (`tests/run/turbofish_runtime_defer.wk`).
 - **The canonicalizer sees a turbofish read.** `let mut n = 3; let r = row::<2, n>(..); n = 1;`
   sank the `let` below the call (an accumulator seed whose first other mention assigns it), which
   then named no binding (`C0001`) or an outer `n`; and an index binding read by a turbofish was

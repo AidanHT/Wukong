@@ -2153,7 +2153,9 @@ fn sum_scratch(n: i64) -> i32 {
 - `<expr>` may be any expression, including a block, and `defer x += 1;` defers an assignment.
 - **E0314**: a deferred expression may not leave itself (`return`, or `break`/`continue` to a loop
   outside it), and a name it uses may not be rebound (`let`, `for`, a match binding) while it is
-  pending — its copies at the exits would silently read the new binding.
+  pending — its copies at the exits would silently read the new binding. A local a turbofish
+  names is used too: `defer show(row::<2, n>(buf, 1));` reads `n` when the defer runs, and the row
+  it returns is that wide (`tests/run/turbofish_runtime_defer.wk`).
 - A failed `assert` aborts without running defers.
 
 `defer` runs on every backend (`tests/run/defer_scope_exit.wk`): it is lowered by copying the
