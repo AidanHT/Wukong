@@ -131,6 +131,7 @@ All notable changes to Wukong are documented here. The format is loosely based o
   recognizer census; it gains only the two new fixtures' lines. Unit tests:
   `crates/wukong_mir_build/src/par_region_tests.rs` (every accept with its reject, and the corpus
   decline census by reason).
+
 ### DWARF for `-g` objects and executables, and a JIT perf map (`gap6/dwarf-perfmap`)
 
 - **`-g` puts DWARF in `--emit=obj|exe` (N70).** The object gains `.debug_info`, `.debug_abbrev`,
