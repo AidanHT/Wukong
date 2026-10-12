@@ -88,10 +88,12 @@ load-bearing.
 can be seen by a load through `p`. The Cranelift backend uses it too.
 
 `slot_lifetime` is the other analysis only a backend consumes: per `alloca`, the program points at
-which its storage may still be read (reachable from a use and able to reach one, killed on entry to
-a counted loop that overwrites every byte of it), and which slots escape (live for the whole
-function); `CaptureSummary` says which call arguments a callee may retain. The Cranelift backend
-colors frame slots with it (`stack_color.rs`). Pure analysis; no MIR op marks a lifetime.
+which its storage may still be read (reachable from a use and able to reach a read, killed at a
+full overwrite — `slot_lifetime/kills.rs`: a region of counted loops, nests included, that write
+every byte of it before any read, a runtime kernel call the backend's `KernelOverwrite` promises
+say overwrites it, or a vector kernel's write-only stream), and which slots escape (live for the
+whole function); `CaptureSummary` says which call arguments a callee may retain. The Cranelift
+backend colors frame slots with it (`stack_color.rs`). Pure analysis; no MIR op marks a lifetime.
 
 ## Analysis cache (`CfgAnalyses`)
 

@@ -1700,18 +1700,23 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   contracted while `s = s + y*z` is; a strict function that wants a single-rounding multiply-add
   writes the explicit `fma(a, b, c)`, which is one rounding in every mode.
 
-- **Stack-slot coloring follows uses, not scopes** (2026-10-12, `gap6/stack-coloring`). The native
-  backend lets allocas whose lifetimes never overlap share one frame slot (`tests/run`: 5.8% fewer
-  static slot bytes at `-O0`, 4.8% at `-O2`). A slot is live from a use to a later use — around the
-  whole loop when it is used inside one — and dead before a counted loop that overwrites every byte of
-  it (the `[v; N]` re-initialization of a `let` inside a loop body), so per-iteration scratch arrays
-  share at `-O0`. What it does not separate: scratch declared and zero-initialized at the top of a
-  function and overwritten later by a 2-D loop nest, a runtime kernel or, at `-O2`, an unrolled or
-  fused loop — those slots are live from the top (`examples/llama_block.wk`'s ten scratch arrays
-  share nothing); and at `-O1`+ a slot handed to a runtime kernel never shares with one accessed only
-  in place, since the two sit in different Cranelift alias regions. An address passed to a user
-  function that may keep it, to `extern "C"` code or into a `@parallel` region keeps its slot for the
-  whole function. The interpreter (the oracle) keeps one slot per alloca.
+- **Stack-slot coloring follows reads and full overwrites, not scopes** (2026-10-12,
+  `gap6/stack-coloring`; 2026-10-12, `gap7/slot-coloring-2`). The native backend lets allocas whose
+  lifetimes never overlap share one frame slot (`tests/run`: 6.5% fewer static slot bytes at `-O0`,
+  5.2% at `-O2`; `examples/llama_block.wk`'s kernel frame 27.5% smaller). A slot is live from a use
+  to a later read — around the whole loop when it is read inside one — and dead before a full
+  overwrite: a region of counted loops that only write it and cover every byte (`[v; N]`
+  initializers, whole-array `for` loops, nests tiling it in either order, and the vector, unrolled
+  and remainder loops the optimizer leaves, at `-O0` and `-O2`), a runtime kernel promised to
+  overwrite its output (`wukong_runtime::OVERWRITES`: GEMM with `beta = 0`, GEMV, elementwise maps,
+  norms, bias, transpose, cumsum, column reductions, attention), or a vector kernel's write-only
+  stream. What it does not separate: a slot rewritten by a loop whose trip count or start is not a
+  compile-time constant (symbolic dimensions, triangular nests) or by a kernel outside the table
+  (embedding, RoPE, the half-precision and int8 GEMMs); and at `-O1`+ a slot handed to a runtime
+  kernel never shares with one accessed only in place, since the two sit in different Cranelift
+  alias regions (measured: 0.2% of the `-O2` corpus). An address passed to a user function that may
+  keep it, to `extern "C"` code or into a `@parallel` region keeps its slot for the whole function.
+  The interpreter (the oracle) keeps one slot per alloca.
 
 - **Generics sharp edges** (2026-10-11, `gap4/sema-soundness`). By design, a `const` generic
   parameter is a compile-time *dimension*, so it is `usize` and nothing else (`E0523` for

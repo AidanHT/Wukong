@@ -5,6 +5,61 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Stack-slot coloring ends lifetimes at full overwrites (`gap7/slot-coloring-2`, N86)
+
+- **Scratch zeroed at the top of a kernel and filled for real later no longer stays live from the
+  top.** The lifetime analysis (`wukong_opt::slot_lifetime`) ends a slot's lifetime at every *full
+  overwrite* it can prove — a point after which nothing can read the old contents — and the native
+  backend's frame coloring shares more slots as a result. `examples/llama_block.wk`'s
+  `llama_block` frame drops from 37,964 to 27,520 slot bytes at `-O0` and from 37,884 to 27,448 at
+  `-O2` (27.5%; the whole program saved 56 and 112 bytes before, 10,456 and 10,540 now), close to
+  the floor its FFN sets (`gate`, `up`, `h` and the residual live at once). Over `tests/run` the
+  static slot bytes saved go from 6.3% to 6.5% at `-O0` and from 5.0% to 5.2% at `-O2` (609
+  programs, 1,745,802 -> 1,632,872 and 1,695,139 -> 1,607,057), `examples/` from 0.3% / 0.1% to
+  3.4% / 3.3%; most corpus programs keep their few arrays live together.
+- **Full overwrites recognized:**
+  - **loop nests** whose iteration space tiles the array, in either order (`x[i*W + j]`,
+    `x[j*H + i]`): a mixed-radix coverage proof — a loop's stride closes into the run the loops
+    inside it cover when it is no wider — with every intermediate index range checked against its
+    integer type, so no "indices do not wrap" assumption is taken;
+  - **the shapes the vectorizers and the unroller leave**: a vector body whose induction variable
+    is tested with `!=`, an unrolled body advancing it through a chain of adds, unrolled stores at
+    a stride wider than an element, a synthesized vector kernel over each row (`Op::VecKernelCall`,
+    with its count folded from the vectorizer's `and`/`select` arithmetic), and the remainder loops
+    that follow — loops forced to run one after another count as one overwrite;
+  - **`-O0` `for` loops**, whose variable the front end keeps in a counter slot (a slot loaded
+    directly and stored only by the latch's increment is read as an induction variable), and
+    `let`s kept in memory within a block;
+  - **runtime kernel calls** that overwrite their output — GEMM with `beta = 0`, GEMV, the
+    elementwise maps (`vmath`, `vmath2`, `velem`), norms, bias, transpose, cumsum, the column
+    reductions and attention, serial and `_parallel` — whole, or row by row inside a counted loop.
+    The facts come from a new contract table next to the kernels, `wukong_runtime::OVERWRITES`:
+    per exact symbol, the operand written, its extent, and the operand values under which the
+    overwrite holds (`beta` the constant 0, `K >= 1` for a GEMM, a norm's op code one it
+    implements — an unknown one writes nothing). Its test runs every entry against its kernel over
+    an output pre-filled with two different patterns and requires bit-identical results (4,954
+    calls, every integer operand an entry leaves free also probed at 0 and -1); an entry that
+    overstates its extent fails it. A kernel that accumulates or reads its output in place kills
+    nothing, and so does a call whose output is also reachable through another operand.
+- **Liveness is driven by reads.** A store is a use but not a read, so a slot whose stored values
+  are all overwritten before any read occupies its storage only at the stores themselves: arrays
+  zeroed together in one fused loop and rewritten before they are read no longer interfere.
+- **Private and non-private slots still do not share at `-O1`+.** Measured: allowing it would save
+  0.2% more of the `-O2` corpus (1,604,237 bytes instead of 1,607,057). It would compute the same
+  values under Cranelift 0.124's alias analysis, but it violates the IR contract Cranelift states
+  for alias regions, and demoting the private slot instead costs its load forwarding; the
+  reasoning is in `stack_color.rs`.
+- **Not separated yet:** loops whose trip count or start is not a compile-time constant (symbolic
+  dimensions, triangular nests), runtime kernels outside the table (embedding, RoPE, the
+  half-precision and int8 GEMMs, ...), and an index that goes through a `let` stored in another
+  block at `-O0`.
+- `tests/run/stack_color_kills.wk` prints every lane of arrays rewritten by nests, by a vectorized
+  nest, by a recognized GEMM and by a recognized elementwise kernel, and of the arrays they must not
+  share with; unit tests cover each kill and each way it can fail (rows one short, gaps,
+  read-before-write, triangular and conditional nests, an `!=` test the variable steps over, a short
+  remainder, accumulating, in-place, short and aliased kernels, a promise for a user function's
+  name).
+
 ### First-class 128-bit integers: `i128` and `u128` (`gap6/i128`, N25)
 
 - **Added: the `i128` and `u128` scalar types.** 16 bytes, 16-byte aligned, in every position a
