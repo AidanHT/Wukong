@@ -2019,8 +2019,9 @@ every lane against hand-derived values; `tests/fail/builtin_dim_uninferable.wk`,
 ### Decode builtins ✅
 
 The kernels an autoregressive decode step is made of — attention over a KV cache (one sequence,
-or a padded batch of them), appending to the cache, and matrix-vector products over half-precision
-or block-quantized weights — are builtins too. Most of their shapes are *values* (lengths, head
+or a padded batch of them), appending to the cache, matrix-vector products over half-precision
+or block-quantized weights, and the expansion of group-wise int4 weights — are builtins too. Most of
+their shapes are *values* (lengths, head
 counts, strides), so each call is checked at run time against its operands' lengths before anything
 is read or written: a geometry that does not fit traps like a failed `assert` (exit 1, `assertion
 failed`) on every backend (`tests/run/decode_shape_trap.wk`). The batched attention `sdpa_kv_batch`
@@ -2039,6 +2040,7 @@ contiguous `Tensor[T, …]`. Each returns `()`.
 | `gemv_bf16(w, x, y)`, `gemv_f16(w, x, y)` | `bf16`/`f16` weight `[N·K]`; `f32` `x[K]`, `y[N]` | `wukong_sgemv_{bf16,f16}` |
 | `quantize_q8_0(x, q, k)`, `quantize_q4_0(x, q, k)` | `f32` rows of `k` values; `u8` blocks | `wukong_quantize_{q8_0,q4_0}_f32` |
 | `gemv_q8_0(w, x, y)`, `gemv_q4_0(w, x, y)` | `u8` blocks `W[N, K]`; `f32` `x[K]`, `y[N]` | `wukong_gemv_{q8_0,q4_0}_f32` |
+| `dequant_i4(q, scale, group, out)`, `dequant_u4(q, scale, zero, group, out)` | packed `u8` nibbles `q`; `f32` `scale` (and `zero`), one per group; an integer group size; `f32` `out` | `wukong_dequant_{i4,u4}_f32` |
 
 - **`sdpa_kv`** is attention of `sq` query rows against a cache of `skv` key/value rows: head `h` of
   query row `i` is the `d` elements at `q[i·q_stride + h·d ..]` (and is written to the same place in
@@ -2098,6 +2100,15 @@ contiguous `Tensor[T, …]`. Each returns `()`.
   kept as exact `f32`), each block's integer dot is exact, and the row accumulates
   `(d_w·d_x)·Σ w_q·x_q` in block order (`tests/run/decode_gemv_quant.wk`). The result is therefore a
   quantized approximation of `W·x` — the activation's rounding is part of the definition.
+- **`dequant_i4` / `dequant_u4`** expand group-wise int4 weights — the layout GPTQ, AWQ and ONNX
+  `Int4` checkpoints share, as opposed to GGML's self-describing blocks — into `f32`. Element `i` of
+  `out` is nibble `i & 1` of byte `i >> 1` of `q`, the low nibble first (the order
+  [`pack_i4`/`pack_u4`](#scalar-builtins-) write), in group `g = i / group`: `dequant_i4` writes
+  `(q_i as f32) * scale[g]` for a two's-complement nibble (`-8..=7`), `dequant_u4` writes
+  `((q_i as f32) - zero[g]) * scale[g]` for an unsigned one (`0..=15`), each operation rounded once
+  in that order — exactly the scalar loop over `unpack_i4` a program would write. `q` must be
+  exactly `ceil(n/2)` bytes and `scale` (and `zero`) exactly `ceil(n/group)` values for
+  `n = len(out)`, `group >= 1`, the last group possibly short (`tests/run/int4_dequant.wk`).
 - Together they make a decode loop: `tests/run/decode_tiny_lm.wk` generates six tokens greedily with
   bf16 projections, `kv_append` into growing caches, GQA `sdpa_kv` and a `Q8_0` LM head.
 - Every result is bit-identical on the interpreter and natively, and between each kernel's AVX2 path
@@ -2227,6 +2238,8 @@ shadows any of them.
 | `logaddexp(a, b)` | `ln(eᵃ + eᵇ)` without overflow; `a == b` gives `a + ln 2` | float |
 | `f8e4m3_to_f32(b)`, `f8e5m2_to_f32(b)` | decode an OCP FP8 code held in a `u8` (exact) | `f32` |
 | `f32_to_f8e4m3(x)`, `f32_to_f8e5m2(x)` | encode, round to nearest even; E4M3FN **saturates** at ±448 (NaN → `0x7F`), E5M2 overflows to ±∞ (NaN → `0x7E`) | `u8` |
+| `pack_i4(lo, hi)`, `pack_u4(lo, hi)` | two 4-bit integers in one byte: `lo`'s low four bits in bits 0..4, `hi`'s in bits 4..8 (a literal must be `-8..=7` / `0..=15`: `E0439`; a run-time value keeps its low four bits) | `u8` |
+| `unpack_i4(b)`, `unpack_u4(b)` | the byte's two nibbles `(bits 0..4, bits 4..8)`, sign-extended from the fourth bit / zero-extended | `(i8, i8)` / `(u8, u8)` |
 
 `erfc`, `erfinv` and `lgamma` evaluate in double precision (the runtime's `special.rs`): an `f32`
 argument widens, computes and rounds once. `logaddexp` uses the shared `exp`/`log1p` of its type.
@@ -2236,6 +2249,13 @@ interpreter holds an `f32` as an `f64`, which cannot carry a signaling `f32` NaN
 conversion builtins work on raw `u8` codes (`alloc_u8`, `read_u8`, …); the first-class
 [`f8e4m3`/`f8e5m2` types](#8-bit-floats-f8e4m3-and-f8e5m2-) hold the same codes and round by the same
 rules.
+
+**4-bit integers** have no sub-byte type: int4 weights live two to a `u8`, element `2k` in the low
+nibble of byte `k` and element `2k + 1` in the high one (ONNX's `Int4` and PyTorch's `quint4x2`
+order). `pack_i4`/`pack_u4` build a byte, `unpack_i4`/`unpack_u4` take it apart, and the
+[decode builtins](#decode-builtins-) `dequant_i4`/`dequant_u4` expand a whole packed buffer with
+per-group scales (`tests/run/int4_pack.wk`, `tests/run/int4_dequant.wk`). All four scalar builtins
+are plain shifts and masks in MIR, identical on every backend.
 
 Misuse has its own codes: an integer variable passed to a floating-point builtin (including
 `fmax`/`fmin`) is `E0445`; a non-integer to an integer builtin, or a bit pattern of the wrong width

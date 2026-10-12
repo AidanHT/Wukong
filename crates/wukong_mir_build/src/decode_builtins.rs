@@ -1,6 +1,6 @@
 //! Lowering of the decode builtins `wukong_sema::decode_builtins` types: `sdpa_kv`,
-//! `sdpa_kv_batch`, `kv_append`, `gemv_bf16` / `gemv_f16`, `quantize_q8_0` / `quantize_q4_0` and
-//! `gemv_q8_0` / `gemv_q4_0`.
+//! `sdpa_kv_batch`, `kv_append`, `gemv_bf16` / `gemv_f16`, `quantize_q8_0` / `quantize_q4_0`,
+//! `gemv_q8_0` / `gemv_q4_0` and the int4 dequantizers `dequant_i4` / `dequant_u4`.
 //!
 //! **Calls.** Each builtin lowers to one `Op::Call` of its `wukong_runtime` entry. A buffer operand —
 //! a `[]T` slice, a `[T; N]` array or a contiguous `Tensor[T, …]` — becomes its data pointer and its
@@ -82,6 +82,8 @@ pub(crate) struct DecodeSyms {
     gemv_q4_par: Symbol,
     quant_q8: Symbol,
     quant_q4: Symbol,
+    dequant_i4: Symbol,
+    dequant_u4: Symbol,
 }
 
 impl DecodeSyms {
@@ -102,6 +104,8 @@ impl DecodeSyms {
             gemv_q4_par: interner.intern("wukong_gemv_q4_0_f32_parallel"),
             quant_q8: interner.intern("wukong_quantize_q8_0_f32"),
             quant_q4: interner.intern("wukong_quantize_q4_0_f32"),
+            dequant_i4: interner.intern("wukong_dequant_i4_f32"),
+            dequant_u4: interner.intern("wukong_dequant_u4_f32"),
         }
     }
 }
@@ -187,6 +191,38 @@ impl FnLowerer<'_> {
                     s.quant_q4
                 };
                 self.ml_call(func, vec![x.data, x.len, q.data, q.len, k])
+            }
+            DecodeBuiltin::DequantI4 => {
+                if args.len() != 4 {
+                    return None;
+                }
+                let q = self.ml_buffer(&args[0])?;
+                let scale = self.ml_buffer(&args[1])?;
+                let group = self.ml_i64_arg(&args[2]);
+                let out = self.ml_buffer(&args[3])?;
+                self.ml_call(
+                    s.dequant_i4,
+                    vec![
+                        q.data, q.len, scale.data, scale.len, group, out.data, out.len,
+                    ],
+                )
+            }
+            DecodeBuiltin::DequantU4 => {
+                if args.len() != 5 {
+                    return None;
+                }
+                let q = self.ml_buffer(&args[0])?;
+                let scale = self.ml_buffer(&args[1])?;
+                let zero = self.ml_buffer(&args[2])?;
+                let group = self.ml_i64_arg(&args[3]);
+                let out = self.ml_buffer(&args[4])?;
+                self.ml_call(
+                    s.dequant_u4,
+                    vec![
+                        q.data, q.len, scale.data, scale.len, zero.data, zero.len, group, out.data,
+                        out.len,
+                    ],
+                )
             }
             DecodeBuiltin::SdpaKvBatch => return None,
         };
@@ -571,10 +607,13 @@ mod tests {
              fn proj(w: []bf16, h: []f16, wq: []u8, x: []f32, mut y: []f32, mut q: []u8) { \
              gemv_bf16(w, x, y); gemv_f16(h, x, y); \
              quantize_q8_0(x, q, 32); gemv_q8_0(wq, x, y); \
-             quantize_q4_0(x, q, 32); gemv_q4_0(wq, x, y); }",
+             quantize_q4_0(x, q, 32); gemv_q4_0(wq, x, y); \
+             dequant_i4(wq, x, 32, y); dequant_u4(wq, x, x, 32, y); }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         for (sym, count) in [
+            ("wukong_dequant_i4_f32", 1),
+            ("wukong_dequant_u4_f32", 1),
             ("wukong_kv_append_f32", 2),
             ("wukong_attention_kv_f32", 1),
             ("wukong_sgemv_bf16", 1),
@@ -591,7 +630,7 @@ mod tests {
             );
         }
         // One status check per call.
-        assert_eq!(text.matches("call assert(").count(), 9, "{text}");
+        assert_eq!(text.matches("call assert(").count(), 11, "{text}");
         assert!(!text.contains("_parallel("), "{text}");
     }
 

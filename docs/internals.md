@@ -293,7 +293,9 @@ them all, so each family's lowering refuses (`C0001`) an operand whose substitut
 wrong — `builtin_operands_are_f32` (kernel) and `MlBuiltin::buffer_elem` (I/O). The decode builtins
 have no such backstop and do not defer: a `Tensor[T, ..]` operand of one is `E0437` in the generic
 body. The **decode builtins** (`sdpa_kv`,
-`kv_append`, `gemv_bf16`/`gemv_f16`, `quantize_q{8,4}_0`, `gemv_q{8,4}_0`) are typed in
+`kv_append`, `gemv_bf16`/`gemv_f16`, `quantize_q{8,4}_0`, `gemv_q{8,4}_0`, and the group-wise int4
+`dequant_i4`/`dequant_u4`, whose entries in `quant.rs` are one scalar loop per group with an exact
+extent plan, `dequant_int4_plan`) are typed in
 `wukong_sema::decode_builtins` and lowered in `wukong_mir_build::decode_builtins` to one checked
 runtime call each (`wukong_runtime::{attention_kv, gemv_half, quant}`): their extents are values, so
 the entry validates them against the operand lengths and returns a status the lowering asserts is

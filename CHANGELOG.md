@@ -5,6 +5,30 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### int4: packing builtins and group-wise dequantization (`gap7/f8-types`, N25)
+
+- **Added: `pack_i4(lo, hi)`, `pack_u4(lo, hi)`, `unpack_i4(b)`, `unpack_u4(b)`.** Two 4-bit
+  integers per `u8`, `lo` in bits 0..4 and `hi` in bits 4..8 (ONNX `Int4` / PyTorch `quint4x2`
+  order); `unpack_i4` sign-extends each nibble to an `i8`, `unpack_u4` zero-extends to a `u8`, both
+  returning `(lo, hi)`. A run-time operand keeps its low four bits, as `as` would; a literal a
+  nibble cannot hold (`pack_u4(16, 0)`, `pack_i4(8, 0)`) is the new **`E0439`**. Plain shifts and
+  masks in MIR, identical on every backend.
+- **Added: the `dequant_i4(q, scale, group, out)` / `dequant_u4(q, scale, zero, group, out)`
+  decode builtins** for the weight-only int4 layout GPTQ, AWQ and ONNX checkpoints share: element
+  `i` is nibble `i & 1` of byte `i >> 1`, group `i / group`, and the output is `q * scale[g]`
+  (signed) or `(q - zero[g]) * scale[g]` (unsigned) in `f32`, one rounding per operation in that
+  order. One runtime call (`wukong_runtime::quant::wukong_dequant_{i4,u4}_f32`) validates the exact
+  extents first (`ceil(n/2)` bytes, `ceil(n/group)` scales and zero points, a short last group
+  allowed) and traps like a failed `assert` otherwise; an output overlapping an input is computed
+  from the inputs as they were. Not differentiable (autodiff refuses it, as it does the other
+  quantized kernels).
+- A sub-byte `int4` *type* and an int4 GEMV are not part of this; neither are constructible SIMD
+  values, which stay open (N25).
+- Fixtures: `tests/run/int4_pack.wk` (all 16 values of each nibble kind through both halves),
+  `tests/run/int4_dequant.wk` (both forms, a short last group, an odd count, a slice and heap
+  buffer, and the same expansion written as a loop over `unpack_i4`);
+  `tests/fail/int4_nibble_out_of_range.wk` (E0439).
+
 ### First-class 8-bit floats: `f8e4m3` and `f8e5m2` (`gap7/f8-types`, N25)
 
 - **Added: the `f8e4m3` and `f8e5m2` scalar types** — OCP E4M3FN (bias 7, 3 mantissa bits, no

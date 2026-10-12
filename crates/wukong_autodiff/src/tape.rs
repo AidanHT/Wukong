@@ -1847,7 +1847,9 @@ pub(crate) fn ml_call_gradient(name: &str) -> Option<MlCallGradient> {
         | "wukong_gemv_q8_0_f32"
         | "wukong_gemv_q8_0_f32_parallel"
         | "wukong_gemv_q4_0_f32"
-        | "wukong_gemv_q4_0_f32_parallel" => Some(MlCallGradient::Refuse),
+        | "wukong_gemv_q4_0_f32_parallel"
+        | "wukong_dequant_i4_f32"
+        | "wukong_dequant_u4_f32" => Some(MlCallGradient::Refuse),
         _ => None,
     }
 }

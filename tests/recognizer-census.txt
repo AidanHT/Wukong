@@ -254,6 +254,8 @@ if_match_value.wk:
 ihyp.wk: wukong_vmath_f32
 import_multi.wk:
 import_namespaces.wk:
+int4_dequant.wk: wukong_dequant_i4_f32 wukong_dequant_i4_f32*2 wukong_dequant_u4_f32 wukong_dequant_u4_f32*2 wukong_rt_alloc wukong_rt_fmt_lit wukong_rt_fmt_lit*5 wukong_rt_fmt_slice wukong_rt_fmt_slice*5 wukong_rt_free
+int4_pack.wk: wukong_rt_arg_count wukong_rt_fmt_int wukong_rt_fmt_int*22 wukong_rt_fmt_lit wukong_rt_fmt_lit*28 wukong_rt_fmt_str wukong_rt_fmt_str*8
 int_literal_widen.wk:
 int_math.wk:
 int_min_literal.wk:

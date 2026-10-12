@@ -267,7 +267,54 @@ impl FnLowerer<'_> {
                 let x = self.sb_operand(&args[0], &MirType::F32);
                 Some(self.sb_fp8_encode(x, fmt))
             }
+            PackI4 | PackU4 => {
+                let t = MirType::I32;
+                let lo = self.sb_operand(&args[0], &t);
+                let hi = self.sb_operand(&args[1], &t);
+                Some(self.sb_pack_nibbles(lo, hi))
+            }
+            UnpackI4 | UnpackU4 => {
+                let byte = self.sb_operand(&args[0], &MirType::I8);
+                let (lo, hi) = self.sb_unpack_nibbles(byte, b == UnpackI4);
+                self.sb_tuple(e, &[lo, hi])
+            }
         }
+    }
+
+    // --- 4-bit integers -----------------------------------------------------------------------
+
+    /// `pack_i4` / `pack_u4`: `lo`'s low four bits in bits 0..4 of the byte, `hi`'s in bits 4..8
+    /// (both `i32`; a signed nibble is its two's-complement bits, so the one lowering serves both).
+    fn sb_pack_nibbles(&mut self, lo: ValueId, hi: ValueId) -> ValueId {
+        let t = MirType::I32;
+        let l = self.sb_bin_k(BinOp::And, lo, 0xf, &t);
+        let h = self.sb_bin_k(BinOp::And, hi, 0xf, &t);
+        let hs = self.sb_bin_k(BinOp::Shl, h, 4, &t);
+        let v = self.sb_bin(BinOp::Or, l, hs, &t);
+        self.sb_cast(CastKind::Trunc, v, &MirType::I8)
+    }
+
+    /// `unpack_i4` / `unpack_u4`: the nibbles of the `i8` `byte` as two `i8`s, `(bits 0..4, bits
+    /// 4..8)` — each sign-extended from its fourth bit when `signed` (shift it to the top of an
+    /// `i32`, then arithmetically back), zero-extended otherwise.
+    fn sb_unpack_nibbles(&mut self, byte: ValueId, signed: bool) -> (ValueId, ValueId) {
+        let t = MirType::I32;
+        let bz = self.sb_cast(CastKind::ZExt, byte, &t);
+        let (lo, hi) = if signed {
+            let l = self.sb_bin_k(BinOp::Shl, bz, 28, &t);
+            let lo = self.sb_bin_k(BinOp::AShr, l, 28, &t);
+            let h = self.sb_bin_k(BinOp::Shl, bz, 24, &t);
+            let hi = self.sb_bin_k(BinOp::AShr, h, 28, &t);
+            (lo, hi)
+        } else {
+            let lo = self.sb_bin_k(BinOp::And, bz, 0xf, &t);
+            let hi = self.sb_bin_k(BinOp::LShr, bz, 4, &t);
+            (lo, hi)
+        };
+        (
+            self.sb_cast(CastKind::Trunc, lo, &MirType::I8),
+            self.sb_cast(CastKind::Trunc, hi, &MirType::I8),
+        )
     }
 
     // --- small builders ---------------------------------------------------------------------

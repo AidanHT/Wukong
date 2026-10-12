@@ -3,7 +3,9 @@
 //! operations (`popcount`, `clz`, `ctz`, `bswap`, `rotl`, `rotr`), saturating, widening and
 //! overflow-reporting arithmetic, float bit access and classification (`bits`, `f32_from_bits`, …,
 //! `isnan`, `isinf`, `isfinite`, `signbit`, `copysign`, `ldexp`, `frexp`), the special functions
-//! (`erfc`, `erfinv`, `lgamma`, `logaddexp`), and the FP8 conversions on `u8` storage.
+//! (`erfc`, `erfinv`, `lgamma`, `logaddexp`), the FP8 conversions on `u8` storage, and the 4-bit
+//! integer packing of int4 weights (`pack_i4`, `pack_u4`, `unpack_i4`, `unpack_u4`: two nibbles per
+//! byte, the first in the low four bits).
 //!
 //! [`scalar_builtin`] is the one name table; `wukong_mir_build::scalar_builtins` lowers exactly the
 //! names it accepts, from the types recorded here. A user function (or an `extern` one) of the same
@@ -20,7 +22,10 @@
 //! * two operands of different integer types where the type *is* the operation's meaning
 //!   (`sat_add`, `sat_sub`, `mulhi`, `widening_mul`, `overflowing_*`) is **`E0447`** — saturating
 //!   at `i8` and at `i32` give different answers, so neither may be chosen silently. An unsuffixed
-//!   literal adapts to the other operand's type, so `sat_add(x, 1)` needs no suffix.
+//!   literal adapts to the other operand's type, so `sat_add(x, 1)` needs no suffix;
+//! * a literal operand of `pack_i4` / `pack_u4` that is not a 4-bit value of the nibble's
+//!   signedness (`pack_u4(16, 0)`, `pack_i4(8, 0)`) is **`E0439`** — a run-time operand keeps its
+//!   low four bits, as `as` would, but a literal outside the range can only be a mistake.
 //!
 //! Anything else that is not a scalar is the usual `E0401`, a wrong argument count `E0503`.
 
@@ -105,6 +110,16 @@ pub enum ScalarBuiltin {
     Fp8ToF32(Fp8),
     /// `f32_to_f8e4m3(x)` / `f32_to_f8e5m2(x)` — encode to an FP8 code (round to nearest even).
     F32ToFp8(Fp8),
+    /// `pack_i4(lo, hi)` — two signed 4-bit values (`-8..=7`) in one byte, `lo` in bits 0..4 and
+    /// `hi` in bits 4..8 (each operand's low four bits, two's complement).
+    PackI4,
+    /// `pack_u4(lo, hi)` — two unsigned 4-bit values (`0..=15`) in one byte, `lo` first.
+    PackU4,
+    /// `unpack_i4(b) -> (i8, i8)` — the two signed 4-bit values of a byte, each sign-extended,
+    /// `(bits 0..4, bits 4..8)`.
+    UnpackI4,
+    /// `unpack_u4(b) -> (u8, u8)` — the two unsigned 4-bit values of a byte, `(low, high)`.
+    UnpackU4,
 }
 
 /// The scalar builtin `name` denotes, or `None`.
@@ -149,6 +164,10 @@ pub fn scalar_builtin(name: &str) -> Option<ScalarBuiltin> {
         "f8e5m2_to_f32" => Fp8ToF32(Fp8::E5M2),
         "f32_to_f8e4m3" => F32ToFp8(Fp8::E4M3),
         "f32_to_f8e5m2" => F32ToFp8(Fp8::E5M2),
+        "pack_i4" => PackI4,
+        "pack_u4" => PackU4,
+        "unpack_i4" => UnpackI4,
+        "unpack_u4" => UnpackU4,
         _ => return None,
     })
 }
@@ -161,7 +180,9 @@ pub fn scalar_builtin_arity(b: ScalarBuiltin) -> usize {
         Rotl | Rotr | SatAdd | SatSub | MulHi | WideningMul | OverflowingAdd | OverflowingSub
         | OverflowingMul | CopySign | Ldexp | LogAddExp => 2,
         Popcount | Clz | Ctz | Bswap | SatCast | Bits | FromBits(_) | IsNan | IsInf | IsFinite
-        | SignBit | Frexp | Erfc | Erfinv | Lgamma | Fp8ToF32(_) | F32ToFp8(_) => 1,
+        | SignBit | Frexp | Erfc | Erfinv | Lgamma | Fp8ToF32(_) | F32ToFp8(_) | UnpackI4
+        | UnpackU4 => 1,
+        PackI4 | PackU4 => 2,
     }
 }
 
@@ -402,8 +423,61 @@ impl Sema<'_> {
                 Opnd::Bad => Ty::Unknown,
                 _ => Ty::Scalar(Scalar::U8),
             },
+            PackI4 | PackU4 => {
+                let signed = b == PackI4;
+                let mut ok = true;
+                for i in 0..2 {
+                    match self.sb_int(name, args, arg_tys, i) {
+                        Opnd::Literal(_) => ok &= self.sb_nibble_literal(name, &args[i], i, signed),
+                        Opnd::Known(_) | Opnd::Lenient => {}
+                        Opnd::Bad => ok = false,
+                    }
+                }
+                if ok {
+                    Ty::Scalar(Scalar::U8)
+                } else {
+                    Ty::Unknown
+                }
+            }
+            UnpackI4 | UnpackU4 => {
+                if self.sb_bit_pattern(name, args, arg_tys, Scalar::U8) {
+                    let half = if b == UnpackI4 {
+                        Scalar::I8
+                    } else {
+                        Scalar::U8
+                    };
+                    Ty::Tuple(vec![Ty::Scalar(half), Ty::Scalar(half)])
+                } else {
+                    Ty::Unknown
+                }
+            }
         };
         Some(ty)
+    }
+
+    /// `E0439` unless the literal operand `i` of `pack_i4` / `pack_u4` is a 4-bit value of the
+    /// nibble's signedness (`-8..=7` signed, `0..=15` unsigned). A run-time operand keeps its low
+    /// four bits, as `as` would; a literal outside the range is a value the nibble cannot hold, so
+    /// it is rejected instead of silently wrapping (`pack_u4(16, 0)` would pack `0`). Returns
+    /// whether the literal is in range.
+    fn sb_nibble_literal(&mut self, name: &str, arg: &Expr, i: usize, signed: bool) -> bool {
+        let (lo, hi) = if signed { (-8, 7) } else { (0, 15) };
+        match crate::eval_const_int(arg, self.interner) {
+            Some(v) if v < lo || v > hi => {
+                let kind = if signed { "signed" } else { "unsigned" };
+                self.error(
+                    arg.span,
+                    "E0439",
+                    format!(
+                        "the {} operand of `{name}` is {v}, outside the {kind} 4-bit range \
+                         {lo}..={hi}",
+                        ordinal(i)
+                    ),
+                );
+                false
+            }
+            _ => true,
+        }
     }
 
     /// Classify float operand `i` of a floating-point builtin: a float, or an unsuffixed integer
@@ -894,5 +968,40 @@ mod tests {
         );
         // A user function of the same name shadows the builtin.
         assert_clean("fn clamp(x: i32) -> i32 { return x; } fn f() -> i32 { return clamp(4); }");
+    }
+
+    /// The 8-bit floats' bit builtins, and the 4-bit packing builtins: their result types, the
+    /// operand rules (`E0446` for a wrong-width pattern), and `E0439` for a literal a nibble cannot
+    /// hold while a run-time operand of any integer type is accepted.
+    #[test]
+    fn f8_bits_and_int4_packing_are_typed() {
+        assert_eq!(float_bits_type(Scalar::F8E4M3), Scalar::U8);
+        assert_eq!(scalar_builtin("pack_i4"), Some(ScalarBuiltin::PackI4));
+        assert_eq!(scalar_builtin_arity(ScalarBuiltin::PackU4), 2);
+        assert_eq!(scalar_builtin_arity(ScalarBuiltin::UnpackI4), 1);
+        assert_clean(
+            "fn f(x: f8e4m3, y: f8e5m2, q: u8, i: i64, j: i8) { \
+             let a: u8 = bits(x); let b: u8 = bits(y); \
+             let c: f8e4m3 = f8e4m3_from_bits(q); let d: f8e5m2 = f8e5m2_from_bits(0x7c); \
+             let p: u8 = pack_i4(-8, 7); let u: u8 = pack_u4(0, 15); \
+             let r: u8 = pack_i4(i, j); let t: u8 = pack_u4(q, i); \
+             let (lo, hi): (i8, i8) = unpack_i4(p); let w: (u8, u8) = unpack_u4(0xff); }",
+        );
+        assert_eq!(
+            errors("fn f() -> u8 { return pack_u4(16, 0) + pack_i4(-9, 8); }"),
+            ["E0439", "E0439", "E0439"]
+        );
+        assert_eq!(
+            errors("fn f(h: u16) -> i8 { let (a, b) = unpack_i4(h); return a + b; }"),
+            ["E0446"]
+        );
+        assert_eq!(
+            errors("fn f(x: f32) -> u8 { return pack_u4(x, 1); }"),
+            ["E0446"]
+        );
+        assert_eq!(
+            errors("fn f(h: u16) -> f8e4m3 { return f8e4m3_from_bits(h); }"),
+            ["E0446"]
+        );
     }
 }
