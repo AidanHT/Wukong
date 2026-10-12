@@ -730,13 +730,19 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
   (`o[q[i]] = v`: a permutation or unpermute, an `index_put`, an embedding-row write, a sparse-to-dense
   fill) widens everything around it and stores lane by lane in iteration order, so the last writer
   of a repeated index is the scalar loop's, when nothing else in the loop can touch the scattered
-  object — a `@noalias` destination or a local table (`tests/run/vec5_scatter.wk`). Still scalar: an
+  object — a `@noalias` destination or a local table (`tests/run/vec5_scatter.wk`). A
+  **read-modify-write** histogram, two scatters into one object, a scatter beside a store to its
+  object and a gather beside a store it may read run lane by lane in a **lane-serial region** while
+  the arithmetic around them stays 4-wide (`tests/run/vec7_lane_serial.wk`); a **call** to a
+  side-effect-free function is replicated per lane (`tests/run/vec7_call_lanes.wk`); and a **checked
+  gather** is tested per group, a failing group handing its iterations to the scalar loop, which
+  stops with the scalar loop's message (`tests/run/vec7_checked_gather{,_trap}.wk`). Still scalar: an
   `else`-arm argmax update and 64-bit argmax values, stores to different places in one nested
   region, nested guarded reductions, and in a countdown a search, an argmax or an interleave group;
-  and among scatters a read-modify-write histogram (the `scatter_add` recognizer's), two scatters
-  into one object, a scatter beside any other access of its own object, a **predicated** scatter
-  (one inside an `if` arm), a **checked** scatter (its bounds check is on data, not the counter), and
-  an unpromised destination the analysis cannot prove apart. There is no hardware gather or scatter:
+  and among scatters a **predicated** scatter (one inside an `if` arm), a **checked** scatter (its
+  bounds check is on data, not the counter), and a body every access of which would run lane by
+  lane (an unpromised scatter, a bare histogram — the replication rule declines it); a call with an
+  effect, or two calls that may not return. There is no hardware gather or scatter:
   each lane is a scalar access (AVX2's `vgatherdps` is not emitted, and AVX2 has no scatter).
   The per-lane accesses are scalar under Cranelift (no masked vector memory op is emitted yet). A
   loop needing more than eight runtime alias checks stays scalar, and so does one whose estimated
@@ -745,7 +751,14 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
   instead: four rows run side by side as four independent chains, each bit-identical to the scalar
   loop, when the rows provably touch disjoint memory (`tests/run/unroll_jam_nests.wk`). Its speed-up
   is not yet measured; deeper nests, triangular inner bounds and a nest whose inner loop the
-  bounds-check versioning split stay as written.
+  bounds-check versioning split stay as written. **Outer-loop vectorization** takes the nests the
+  inner path would fold serially — a row's float sum (a matrix-vector product), float min/max — and
+  recurrences over rows a group loads as whole vectors (column-major): lane `k` runs row `r + k`'s
+  inner loop with its own accumulator, bit-exact per row, the rows past the last group in the
+  original nest (`tests/run/vec7_outer_loops.wk`; `WUKONG_NO_OUTER_VEC`). It needs a row-invariant
+  inner trip, stores only before or after the inner loop at the row's own element into provably
+  separate objects, a straight-line inner body with no call, and an `i64` counter (an `i32` one
+  indexing through `sext` stays out); it is not timed.
   **256-bit from the optimizer**: a loop this pass widens whose body has a raw-AVX2 recipe form —
   one `f32`/`f64`/`i32`/`i64` lane type, contiguous loads and stores, `+ - * /`, `fma`, `sqrt`,
   negation, an ordered (or `!=`) compare feeding a blend, an if-converted masked store or merge,
@@ -1921,15 +1934,16 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
 - **What the general MIR loop vectorizer still leaves scalar** (`wukong_opt::vectorize`): a loop
   stepping by anything but `+1` or `-1`, and a negative stride on an ascending counter
   (`x[n - 1 - i]`); a strided access outside a *complete* interleave group (a gap, or a stride above
-  4), or any interleave group in a countdown; a scatter (a store through a data-dependent index)
-  that something else in the loop may touch — a read-modify-write histogram (`h[q[i]] += x`), two
-  scatters into one object, a scatter beside another access of its object, a scatter in an `if`
-  arm, a checked scatter, or an unpromised destination (when nothing else can touch the object, a
-  `@noalias` destination or a local table, the loop widens around the store, which runs once per
-  lane in iteration order: 2026-10-12, `gap5/vectorizer-scatter-slp`); and a gather whose
-  index is bounds-checked (a checked slice keeps a data-dependent check no guard can cover — the
-  gather widens from an array, or under `@unchecked`) or whose object a store in the loop may reach
-  (two unpromised slices may be one buffer). Replication is a heuristic, not a measurement: a body
+  4), or any interleave group in a countdown; a scatter in an `if` arm, or a checked scatter (its
+  check is on data, not the counter); a lane test (a checked gather's per-group bounds test) after
+  a store or inside a lane-serial region; a body every access of which would run lane by lane (an
+  unpromised scatter, a bare histogram: the replication rule declines it); and a call with an
+  effect, or a second call that may trap or never return. (A scatter nothing else in the loop
+  touches widens around its per-lane stores since 2026-10-12, `gap5/vectorizer-scatter-slp`; a
+  read-modify-write, two scatters into one object, a scatter beside a store to its object and a
+  gather beside a store it may read run lane by lane in a lane-serial region, a checked gather is
+  tested per group and a side-effect-free call is replicated per lane since `gap7/vectorizer-3`.)
+  Replication is a heuristic, not a measurement: a body
   whose only work is the replicated step (`o[i] = lut[q[i]]`, `o[i] = x[i] as i64` from `f64`)
   stays scalar, and every replicated gather or scatter lane is still a scalar load or store: no AVX2
   `vgatherdps` is ever emitted. None of these forms has been timed.

@@ -1034,12 +1034,55 @@ element the later iteration lands last, exactly as in the scalar loop. It is leg
 other access in the loop** — load or store, affine, invariant, gathered or scattered — can touch the
 scattered object (`loop_info::dependence` records the object in `MemAccess::gather_base` and tests
 every other access's object against it with the gather's apart test), because then nothing in the
-loop can observe the order. A read-modify-write histogram (`h[q[i]] += x`, which the `scatter_add`
-recognizer covers), two scatters into one object, a scatter beside any other access of its own
-object, an object the analysis cannot prove apart, a scatter inside an if-converted arm and a
-checked scatter (its bounds check is not on the counter) stay scalar
-(`tests/run/vec5_scatter.wk`). Gapped groups, strides above 4 and masked group accesses stay scalar
-too.
+loop can observe the order (`tests/run/vec5_scatter.wk`). A read-modify-write histogram
+(`h[q[i]] += x`), two scatters into one object and a scatter beside another access of its own object
+run in a lane-serial region instead (below); a scatter inside an if-converted arm and a checked
+scatter (its bounds check is not on the counter) stay scalar. Gapped groups, strides above 4 and
+masked group accesses stay scalar too.
+
+**Calls** (`Plan::Call`): `loop_info::dependence` takes the call-effect summaries
+(`DepFacts::calls`, from the `CfgAnalyses` the pass manager threads); a call to a callee they prove
+side-effect free is no memory access, and one that reads memory is a load from anywhere (carried
+beside any store). `plan_body` replicates such a call per lane (one call per group when its
+arguments are uniform). `call_verdict`: at most one call that may trap or never return (then the
+one step that can stop the program — it stops at the scalar loop's iteration, and what the vector
+body stored before is never seen again), and only `speculatable` calls before a lane test.
+
+**Lane tests** (`checked_spine`, `linearize_spine`, `spine_verdict`): a body that passes checks to
+dead ends on every iteration — what `bce` leaves of a gathered `t[q[i]]` — is flattened. A check on
+`iv + k` becomes a `LenCheck` in the guard; any other is a lane test at its place in the body, the
+search loop's early exit aimed at a dead end: a group with a failing lane leaves for the scalar loop
+at its first iteration, which re-runs at most `W` iterations and stops where it always did. Before
+the last test nothing stores, and every load reads memory that exists: an invariant address, a
+`[]T` element under a new `LenSrc::Header` guard on its slice's length, a `speculation_safe` extent,
+or a gather whose index an earlier test checked against its own object (`checked_by_test`). `bce`'s
+slow copies (its `ugt` marker), `unswitch`'s constant checks and any loop `bce::would_version`
+would version next are left alone, so a checked body is widened only once `bce` has done all it can.
+
+**Lane-serial regions** (`SerialRegion`, `Plan::Serial`): asked for (`DepFacts::serial`),
+`dependence` lists a gather or scatter that may meet another access, and that access
+(`DepSummary::serial`), instead of failing. The span of the flattened body between the first and
+the last listed access runs lane by lane: every memory access in it and every step reading what it
+computed is `Plan::Serial`, emitted for lane 0, then lane 1, ... (`emit_serial_region`), so the
+listed accesses happen in the scalar loop's order, iteration by iteration, and a repeated index sees
+the earlier lane's write. The region's pure steps that read nothing it computed keep their plans and
+run first. Every pair with at most one listed access is still checked as before. A typed element
+store never lands on a slice header (no type punning), so a slice's data-pointer reads stay out of
+the region. `WUKONG_NO_LANE_SERIAL` restores the decline.
+
+**Outer-loop vectorization** (`outer_vec.rs`, a child module): a two-deep nest — outer header, one
+straight block before the inner loop, a one-block inner loop, the outer latch after it — is widened
+across its outer counter. Each value is uniform (the inner counter, a read the rows share), a ramp
+(`r + u`, what a row-contiguous address indexes by), row-varying (a vector, or per-lane scalars
+where no packed form exists), or a row-varying address (one vector access for a ramp index, one
+scalar access per lane otherwise). The inner loop's test must be uniform, so the group's lanes run
+it in lockstep and lane `k` computes row `r + k` exactly as the scalar nest does; a row-varying
+carried value becomes a vector header parameter. Stores sit before or after the inner loop, at the
+row's own element, in objects provably apart from everything else (the same element of the same
+row excepted); a slice data pointer `licm` hoisted under a first-iteration guard
+(`select(c, hdr, dummy)`) is read as `hdr`'s. Taken only when the inner loop carries a strict-order
+reduction, or a recurrence over rows a group can load as whole vectors (over gathered rows,
+`unroll_jam` already runs four scalar chains). `WUKONG_NO_OUTER_VEC` turns it off.
 
 **Countdowns** (`VecPlan::dir`): `while i > 0 { i = i - 1; .. }` and `while i >= 0 { ..; i = i - 1
 }` widen with the group walking down. Lane `k` is still the group's `k`-th iteration (counter

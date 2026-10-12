@@ -56,7 +56,11 @@ load-bearing.
   only into an existing preheader.
 - **licm** — hoist loop-invariant non-trapping ops into that preheader.
 - **vectorize** — widen a canonical loop body to 128-bit SIMD (if-converting conditionals to lane
-  masks), keeping the original loop as scalar epilogue. Constant integer left shifts use wrapping
+  masks), keeping the original loop as scalar epilogue. A side-effect-free call is replicated per
+  lane, a check `bce` cannot prove (a gathered index) is a per-group lane test, gathers and scatters
+  that may meet run lane by lane (`WUKONG_NO_LANE_SERIAL`), and a two-deep nest whose inner loop
+  carries a row's float sum or recurrence is widened across its rows (`src/outer_vec.rs`,
+  `WUKONG_NO_OUTER_VEC`). Constant integer left shifts use wrapping
   vector multiplication at `i16`/`i32` widths; other shifts retain scalar lowering. A widened body
   with a raw-AVX2 recipe form (one `f32`/`f64`/`i32`/`i64` lane type, lane-wise ops only, every
   stored object touched at the stored element) and a trip of 2048 or more instead calls a 256-bit

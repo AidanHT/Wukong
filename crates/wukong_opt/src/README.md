@@ -19,9 +19,10 @@
 | `loop_canon.rs` | `LoopCanon` — canonical loop shape (preheader, latch, exit polarity) |
 | `loop_delete.rs` | `LoopDelete` — remove a provably finite loop with no observable effect |
 | `licm.rs` | `Licm` — hoist loop-invariant non-trapping ops into an existing preheader; loads by dereferenceability, header position, or guaranteed execution under a first-iteration guard |
-| `bce.rs` | `Bce` — slice bounds-check elimination: versions an innermost counted loop on a preheader guard so a check-free copy runs when every check is proved |
+| `bce.rs` | `Bce` — slice bounds-check elimination: versions an innermost counted loop on a preheader guard so a check-free copy runs when every check is proved (calls allowed when the effect summaries prove them side-effect free and always returning); `would_version` tells the vectorizer which checked bodies it will still version |
 | `promote.rs` | `Promote` — keep a loop-invariant location the loop reads and writes in a register (preheader load, exit stores; a shared exit block gets a dedicated copy for the store) |
-| `vectorize.rs` | `Vectorize` — 128-bit SIMD widening with scalar epilogue; constant `i16`/`i32` left shifts use wrapping multiply |
+| `vectorize.rs` | `Vectorize` — 128-bit SIMD widening with scalar epilogue; constant `i16`/`i32` left shifts use wrapping multiply; side-effect-free calls replicated per lane, checked bodies tested per group (lane tests), conflicting gathers/scatters run lane by lane (lane-serial regions, `WUKONG_NO_LANE_SERIAL`) |
+| `outer_vec.rs` | child module of `vectorize` (`outer`): a two-deep nest widened across its outer counter, each lane one row's inner loop with its own accumulator, when the inner loop carries a strict-order reduction or a recurrence over row-contiguous loads (`WUKONG_NO_OUTER_VEC`) |
 | `vec256.rs` | child module of `vectorize`: restates a widened loop as a 256-bit raw-AVX2 `VecKernel` recipe (`Op::VecKernelCall`) when the body has one and the trip reaches 2048 (`KERNEL_MIN_TRIP`; `WUKONG_VEC256_MIN_TRIP` moves it), leaving the original loop as a remainder the 128-bit path still widens; off under `OptimizeOptions::vec_kernels = false`, off the Win64 AVX2 host and under `WUKONG_P4_NO_256` |
 | `inline.rs` | `inline_program` — bottom-up call-graph SCC inlining with per-site growth budgets |
 | `unroll.rs` | `unroll_program` — complete (small known trip count) or partial loop unrolling at `-O2`+ |
