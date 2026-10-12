@@ -265,8 +265,14 @@ fn optimize_attributed(p: &mut wukong_mir::Program) -> Vec<PassWork> {
         acc.clear();
         acc.resize(SLOTS, PassWork::default());
     });
-    let (_, inline) = counted(|| wukong_opt::inline_program(p));
+    let (_, mut inline) = counted(|| wukong_opt::inline_program(p));
     attributed_standard().run(p);
+    // `optimize`'s devirtualization step: when it rewrote a call, inline and the pipeline again.
+    if !wukong_opt::devirtualize_program(p).is_empty() {
+        let (_, again) = counted(|| wukong_opt::inline_program(p));
+        inline.add(again);
+        attributed_standard().run(p);
+    }
     let cleanup = attributed_cleanup();
     let (changed, unroll) = counted(|| wukong_opt::unroll_program(p));
     cleanup.run_subset(p, &changed);

@@ -2964,7 +2964,8 @@ wukongc --repl [OPTIONS]         an interactive session on standard input (see "
                       runs none. Function passes (run together to a fixpoint): sroa, mem2reg,
                       simplify, jump-thread, simplify-cfg, simplify-phis, dce, tre, cse, dse,
                       loop-canon, loop-delete, fuse, licm, bce, unswitch, promote, vectorize;
-                      program steps (run once where named): inline, unroll, slp, form-switches.
+                      program steps (run once where named): inline, devirt, unroll, slp,
+                      form-switches.
                       An unknown name is a usage error (exit 2) that lists them all
 --print-after=<p>     print the MIR to stderr after each run of pass <p> on a function (a run
                       that changed nothing is one `unchanged` line), or after program step <p>;

@@ -1038,6 +1038,7 @@ impl Numbering<'_> {
             Op::Load(..)
             | Op::Store { .. }
             | Op::Call { .. }
+            | Op::CallIndirect { .. }
             | Op::VecKernelCall { .. }
             | Op::AtomicAdd { .. }
             | Op::Alloca { .. }

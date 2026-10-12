@@ -1546,6 +1546,12 @@ impl<'a, 'k> Interp<'a, 'k> {
                             CallOutcome::Done(v) => v,
                         }
                     }
+                    Op::CallIndirect { callee, args, .. } => {
+                        let target = self.indirect_target(reg(&frame.regs, *callee))?;
+                        let mut argv = self.call_args.pop().unwrap_or_default();
+                        argv.extend(args.iter().map(|a| reg(&frame.regs, *a)));
+                        return Ok(Flow::Call(target, argv, false));
+                    }
                     op => {
                         let rty = inst.result.map(|r| func.value_type(r));
                         self.eval(op, func, &frame.regs, rty)?
@@ -1656,6 +1662,18 @@ impl<'a, 'k> Interp<'a, 'k> {
         argv.clear();
         self.call_args.push(argv);
         result.map(CallOutcome::Done)
+    }
+
+    /// The function an `Op::CallIndirect` reaches: a function address is the tag `FUNC_TAG + index`
+    /// (`Op::FuncAddr`), so anything else — a data pointer, an index past the program — is no
+    /// function, and calling it is an error rather than a jump into memory.
+    fn indirect_target(&self, callee: Value) -> Result<usize, String> {
+        match callee {
+            Value::Ptr(p) if p >= FUNC_TAG && p - FUNC_TAG < self.program.funcs.len() => {
+                Ok(p - FUNC_TAG)
+            }
+            _ => Err("indirect call through a pointer that is not a function address".into()),
+        }
     }
 
     /// The body of a `wukong_parallel_for(n, body, env)` call and the arguments it runs on: the
@@ -2060,7 +2078,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             Op::Barrier => Value::Unit,
             // Calls never reach `eval`: `exec_frame` dispatches every `Op::Call` (`dispatch_call`)
             // so a Wukong callee gets a frame on the explicit stack rather than a host recursion.
-            Op::Call { .. } => {
+            Op::Call { .. } | Op::CallIndirect { .. } => {
                 return Err("calls are dispatched by the frame loop, not `eval`".into())
             }
             // A synthesized 256-bit AVX2 vector kernel (the general vectorizer's output). The native
@@ -7574,3 +7592,6 @@ mod runtime_surface_tests;
 
 #[cfg(test)]
 mod slot_reuse_tests;
+
+#[cfg(test)]
+mod indirect_tests;

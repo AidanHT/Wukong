@@ -36,12 +36,13 @@ use std::process::Command;
 const O2_LIST: &str =
     "inline,sroa,mem2reg,simplify,jump-thread,simplify-cfg,simplify-phis,dce,tre,\
                        cse,dse,loop-canon,loop-delete,fuse,licm,bce,unswitch,promote,vectorize,\
-                       unroll,slp,form-switches";
+                       devirt,unroll,slp,form-switches";
 
-/// The two halves of [`O2_LIST`] for law 6: every function pass, then the program steps after them.
+/// The two halves of [`O2_LIST`] for law 6: every function pass and `devirt` (which repeats the
+/// `inline` and fixpoint before it when it rewrote a call), then the program steps after them.
 const FIRST_HALF: &str = "inline,sroa,mem2reg,simplify,jump-thread,simplify-cfg,simplify-phis,\
                           dce,tre,cse,dse,loop-canon,loop-delete,fuse,licm,bce,unswitch,promote,\
-                          vectorize";
+                          vectorize,devirt";
 const SECOND_HALF: &str = "unroll,slp,form-switches";
 
 /// Programs that always get all six checks: between them, every optimizer stage, every MIR type

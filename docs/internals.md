@@ -863,7 +863,7 @@ harness landed:
 2. `--emit=mir` of a dump is the original compile's `--emit=mir`;
 3. `-O0 --passes=<the -O2 list>` is `-O2` (the replica law of "Running a chosen pass list");
 4. `-O2` of the *unoptimized* dump is `-O2` of the program;
-5. the `-O2` list cut in two through a dump (its function passes, then
+5. the `-O2` list cut in two through a dump (its function passes and `devirt`, then
    `unroll,slp,form-switches` on the `.mir`) is `-O2`. About a third of those halfway dumps need
    their `values N` line for this to hold.
 
@@ -970,9 +970,12 @@ command line. `--passes=<list>` takes comma-separated names:
   per-function fixpoint exactly as `PassManager::run` runs the standard list (callees first, call
   effects summarized per SCC, clean-tracking). A name may repeat.
 - **Program steps**, run once where named, each closing the group before it: `inline`
-  (`inline_program`), `unroll` (`unroll_program` plus `PassManager::unroll_cleanup` over the functions
-  it changed), `slp` (`slp_program` plus the same cleanup; `WUKONG_NO_SLP` still applies) and
-  `form-switches`. Under `--verify-each` every pass of those cleanup sweeps is verified as
+  (`inline_program`), `devirt` (`devirtualize_program`: an indirect call whose callee is a visible
+  `func_addr` of a function with its signature becomes a direct call; when one did, the list's
+  earlier `inline`, if it has one, and the fixpoint group before it run again, as `optimize`
+  re-optimizes around the new direct calls), `unroll` (`unroll_program` plus
+  `PassManager::unroll_cleanup` over the functions it changed), `slp` (`slp_program` plus the same
+  cleanup; `WUKONG_NO_SLP` still applies) and `form-switches`. Under `--verify-each` every pass of those cleanup sweeps is verified as
   `optimize_verified` verifies it (`PassManager::run_subset_verified`), so a failure there names
   the cleanup pass and the function, like a failure in a group.
 
@@ -981,8 +984,8 @@ Each `-O` level is one such list (`passes::standard_spec`):
 | Level | List |
 |---|---|
 | `-O0` | (empty) |
-| `-O1` | `mem2reg,simplify,simplify-cfg,simplify-phis,dce,tre` |
-| `-O2`, `-O3` | `inline,sroa,mem2reg,simplify,jump-thread,simplify-cfg,simplify-phis,dce,tre,cse,dse,loop-canon,loop-delete,fuse,licm,bce,unswitch,promote,vectorize,unroll,slp,form-switches` |
+| `-O1` | `mem2reg,simplify,simplify-cfg,simplify-phis,dce,tre,devirt` |
+| `-O2`, `-O3` | `inline,sroa,mem2reg,simplify,jump-thread,simplify-cfg,simplify-phis,dce,tre,cse,dse,loop-canon,loop-delete,fuse,licm,bce,unswitch,promote,vectorize,devirt,unroll,slp,form-switches` |
 
 **The law:** `run_steps(parse_spec(standard_spec(l)))` leaves MIR byte-identical to
 `wukong_opt::optimize(p, l)` at every level, with and without `--verify-each`

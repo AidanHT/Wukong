@@ -1428,6 +1428,21 @@ impl Emitter<'_> {
                     .collect();
                 format!("{res}call {ret_ty} @{name}({})", argstr.join(", "))
             }
+            // A call through a function pointer: LLVM's `call` takes the callee as an operand and
+            // the signature from the call itself — the argument types and `ret`, exactly the MIR
+            // signature. A discarded result is still produced by the callee.
+            Op::CallIndirect { callee, args, ret } => {
+                let argstr: Vec<String> = args
+                    .iter()
+                    .map(|a| format!("{} {}", self.ty(*a), self.operand(*a)))
+                    .collect();
+                format!(
+                    "{res}call {} {}({})",
+                    reg_ty(ret),
+                    self.operand(*callee),
+                    argstr.join(", ")
+                )
+            }
             Op::FuncAddr(func) => {
                 // The address of a function as a `ptr` (an identity GEP keeps it valid IR).
                 format!(
@@ -2138,6 +2153,9 @@ fn fmt_float(v: f64, ty: &MirType) -> String {
 
 #[cfg(test)]
 mod closeout_tests;
+
+#[cfg(test)]
+mod indirect_tests;
 
 #[cfg(test)]
 mod semantic_tests;

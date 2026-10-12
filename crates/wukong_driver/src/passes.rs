@@ -51,10 +51,12 @@ pub const FUNCTION_PASSES: &[&str] = &[
 ];
 
 /// The whole-program steps `--passes` accepts. Each runs once where it is named and closes the
-/// fixpoint group before it: `inline` (`wukong_opt::inline_program`), `unroll`
-/// (`unroll_program` plus its cleanup sweep over the functions it changed), `slp` (`slp_program`
-/// plus the same cleanup) and `form-switches`.
-pub const PROGRAM_STEPS: &[&str] = &["inline", "unroll", "slp", "form-switches"];
+/// fixpoint group before it: `inline` (`wukong_opt::inline_program`), `devirt`
+/// (`devirtualize_program`; when it rewrote a call, the list's earlier `inline`, if it has one,
+/// and the fixpoint group before it run again, as `optimize` re-optimizes around the new direct
+/// calls), `unroll` (`unroll_program` plus its cleanup sweep over the functions it changed),
+/// `slp` (`slp_program` plus the same cleanup) and `form-switches`.
+pub const PROGRAM_STEPS: &[&str] = &["inline", "devirt", "unroll", "slp", "form-switches"];
 
 /// The `--print-after` name that matches every pass and every program step.
 pub const PRINT_ALL: &str = "all";
@@ -102,6 +104,7 @@ pub enum Step {
     /// call-graph SCC).
     Fixpoint(Vec<&'static str>),
     Inline,
+    Devirt,
     Unroll,
     Slp,
     FormSwitches,
@@ -111,6 +114,7 @@ impl Step {
     fn program_step(name: &str) -> Option<Step> {
         Some(match name {
             "inline" => Step::Inline,
+            "devirt" => Step::Devirt,
             "unroll" => Step::Unroll,
             "slp" => Step::Slp,
             "form-switches" => Step::FormSwitches,
@@ -122,6 +126,7 @@ impl Step {
         match self {
             Step::Fixpoint(_) => "fixpoint",
             Step::Inline => "inline",
+            Step::Devirt => "devirt",
             Step::Unroll => "unroll",
             Step::Slp => "slp",
             Step::FormSwitches => "form-switches",
@@ -184,10 +189,10 @@ pub fn check_print_after(name: &str) -> Result<(), String> {
 pub fn standard_spec(level: u8) -> &'static str {
     match level {
         0 => "",
-        1 => "mem2reg,simplify,simplify-cfg,simplify-phis,dce,tre",
+        1 => "mem2reg,simplify,simplify-cfg,simplify-phis,dce,tre,devirt",
         _ => {
             "inline,sroa,mem2reg,simplify,jump-thread,simplify-cfg,simplify-phis,dce,tre,cse,dse,\
-             loop-canon,loop-delete,fuse,licm,bce,unswitch,promote,vectorize,unroll,slp,\
+             loop-canon,loop-delete,fuse,licm,bce,unswitch,promote,vectorize,devirt,unroll,slp,\
              form-switches"
         }
     }
@@ -332,32 +337,60 @@ fn run_steps_to(
     if verify_each {
         wukong_opt::verify_program_stage(program, "optimization input")?;
     }
+    // One fixpoint group, run as `PassManager::run` runs the standard pipeline.
+    let run_group = |program: &mut Program, names: &[&'static str]| {
+        let mut pm = PassManager::new();
+        for name in names {
+            let inner =
+                make_pass_with(name, vec_kernels).expect("parse_spec admits only known passes");
+            match &printer {
+                Some(printer) if printer.wants(name) => pm.add(Box::new(Observed {
+                    inner,
+                    printer: Rc::clone(printer),
+                })),
+                _ => pm.add(inner),
+            }
+        }
+        if verify_each {
+            pm.run_verified(program)
+        } else {
+            pm.run(program);
+            Ok(())
+        }
+    };
+    // What `devirt` repeats when it rewrote a call: the last fixpoint group, after the list's
+    // `inline` if one ran before it.
+    let mut last_group: Option<&[&'static str]> = None;
+    let mut inlined = false;
     for step in steps {
         match step {
             Step::Fixpoint(names) => {
-                let mut pm = PassManager::new();
-                for name in names {
-                    let inner = make_pass_with(name, vec_kernels)
-                        .expect("parse_spec admits only known passes");
-                    match &printer {
-                        Some(printer) if printer.wants(name) => pm.add(Box::new(Observed {
-                            inner,
-                            printer: Rc::clone(printer),
-                        })),
-                        _ => pm.add(inner),
-                    }
-                }
-                if verify_each {
-                    pm.run_verified(program)?;
-                } else {
-                    pm.run(program);
-                }
+                run_group(program, names)?;
+                last_group = Some(names);
                 continue;
             }
             Step::Inline => {
                 wukong_opt::inline_program(program);
+                inlined = true;
                 if verify_each {
                     wukong_opt::verify_program_stage(program, "inline")?;
+                }
+            }
+            Step::Devirt => {
+                let changed = wukong_opt::devirtualize_program(program);
+                if verify_each {
+                    wukong_opt::verify_program_stage(program, "devirt")?;
+                }
+                if !changed.is_empty() {
+                    if inlined {
+                        wukong_opt::inline_program(program);
+                        if verify_each {
+                            wukong_opt::verify_program_stage(program, "inline")?;
+                        }
+                    }
+                    if let Some(names) = last_group {
+                        run_group(program, names)?;
+                    }
                 }
             }
             Step::Unroll => {
@@ -585,6 +618,7 @@ mod tests {
             o2[1..],
             [
                 Step::Fixpoint(FUNCTION_PASSES.to_vec()),
+                Step::Devirt,
                 Step::Unroll,
                 Step::Slp,
                 Step::FormSwitches,

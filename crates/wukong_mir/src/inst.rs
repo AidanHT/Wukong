@@ -228,8 +228,31 @@ pub enum Op {
         func: Symbol,
         args: Vec<ValueId>,
     },
+    /// A call through a function pointer: `callee` is a `Ptr` holding a function's address — an
+    /// [`Op::FuncAddr`] result, possibly stored, reloaded or passed along — and the call passes
+    /// `args` and yields a value of type `ret` (`Void` for none). The **signature is the types of
+    /// `args` and `ret`**: the front end only builds one from a source function type, so the
+    /// function the pointer names was lowered with exactly those parameter and return types (the
+    /// verifier checks that against the target when the callee is a visible `func_addr`). Like a
+    /// direct `call`, a value-returning one may discard its result.
+    ///
+    /// The callee is unknown to every pass, so the op has every effect a call can have
+    /// ([`Op::effects`]): it may read and write any memory reachable from an escaped address or an
+    /// argument, perform I/O, trap or never return — it is never value-numbered, hoisted, sunk,
+    /// deleted or duplicated as if it were pure. The optimizer turns it into a direct `call` once
+    /// the callee is a known `func_addr` of a function with this signature.
+    ///
+    /// The interpreter reads the callee as its tagged function index; the Cranelift backend emits
+    /// `call_indirect` with the signature imported into the caller; the textual-LLVM emitter calls
+    /// through the `ptr`; the GPU lowering declines it.
+    CallIndirect {
+        callee: ValueId,
+        args: Vec<ValueId>,
+        ret: MirType,
+    },
     /// The machine address of a function (a `Ptr`), for passing it to a runtime that calls it back
-    /// — e.g. the outlined body of a `@parallel for`. Pure and side-effect-free.
+    /// — e.g. the outlined body of a `@parallel for` — or for calling it through
+    /// [`Op::CallIndirect`]. Pure and side-effect-free.
     FuncAddr(Symbol),
     /// The read-only address (a `Ptr`) of a named static-data blob in `Program::statics` — how a
     /// string literal is materialized: its NUL-terminated UTF-8 bytes live once in `.rodata`, and

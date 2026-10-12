@@ -986,6 +986,7 @@ fn void_op_reads(op: &Op, v: ValueId) -> bool {
     match op {
         Op::Store { ptr, value } | Op::AtomicAdd { ptr, value } => *ptr == v || *value == v,
         Op::Call { args, .. } => args.contains(&v),
+        Op::CallIndirect { callee, args, .. } => *callee == v || args.contains(&v),
         Op::VecKernelCall {
             ptrs, scalars, n, ..
         } => [*ptrs, *scalars, *n].contains(&v),
@@ -1475,6 +1476,12 @@ impl<'a> FnTranslator<'a> {
                 Some(v) => v,
                 None => return,
             },
+            Op::CallIndirect { callee, args, ret } => {
+                match self.lower_call_indirect(*callee, args, ret) {
+                    Some(v) if res.is_some() => v,
+                    _ => return,
+                }
+            }
             // A synthesized 256-bit AVX2 vector kernel. The kernel is installed as raw machine code
             // (see `avx2::assemble_kernel` + `define_function_bytes`) under the module's default call
             // conv (Win64 here: ptrs->RCX, scalars->RDX, n->R8), so a plain Cranelift `call` reaches
@@ -2058,6 +2065,47 @@ impl<'a> FnTranslator<'a> {
         let x = self.val(index);
         let from = self.dfg_ty(x);
         self.resize_int(x, from, self.ptr_ty, true)
+    }
+
+    /// A call through a function pointer: `call_indirect` with the signature the MIR states — the
+    /// argument types and `ret`, mapped exactly as [`signature_of`] maps a defined function's, so
+    /// it is the signature the callee was compiled with — imported into this function. The callee
+    /// is unknown, so it may stop the run (an assertion, a bounds failure, `exit`): poll after it
+    /// as after a call to an asserting function (`asserting_functions` seeds every caller of an
+    /// indirect call).
+    fn lower_call_indirect(
+        &mut self,
+        callee: ValueId,
+        args: &[ValueId],
+        ret: &MirType,
+    ) -> Option<Value> {
+        let mut sig = Signature::new(self.builder.func.signature.call_conv);
+        for &a in args {
+            if let Some(t) = cl_type(self.func.value_type(a), self.ptr_ty) {
+                sig.params.push(AbiParam::new(t));
+            }
+        }
+        if let Some(t) = cl_type(ret, self.ptr_ty) {
+            sig.returns.push(AbiParam::new(t));
+        }
+        let sigref = self.builder.import_signature(sig);
+        let target = self.val(callee);
+        self.call_args.clear();
+        self.call_args.reserve(args.len());
+        for &arg in args {
+            let value = self.val(arg);
+            self.call_args.push(value);
+        }
+        let call = self
+            .builder
+            .ins()
+            .call_indirect(sigref, target, self.call_args);
+        let result = self.builder.inst_results(call).first().copied();
+        let status = self.runtime_ref(RT_ASSERT_FAILED);
+        let check = self.builder.ins().call(status, &[]);
+        let failed = self.builder.inst_results(check)[0];
+        self.return_on_assert_failure(failed, false);
+        result
     }
 
     fn lower_call(&mut self, func: Symbol, args: &[ValueId]) -> Option<Value> {
@@ -3549,6 +3597,13 @@ fn asserting_functions(program: &Program, interner: &Interner) -> HashSet<Symbol
     let mut work = Vec::new();
     for f in &program.funcs {
         for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+            // An indirect call may reach any function, so its caller is assumed to fail.
+            if matches!(inst.op, Op::CallIndirect { .. }) {
+                if asserting.insert(f.name) {
+                    work.push(f.name);
+                }
+                continue;
+            }
             let Op::Call { func, args } = &inst.op else {
                 continue;
             };
@@ -6932,6 +6987,9 @@ mod lane_op_tests;
 
 #[cfg(test)]
 mod assertion_tests;
+
+#[cfg(test)]
+mod indirect_tests;
 
 #[cfg(test)]
 mod error_tests;

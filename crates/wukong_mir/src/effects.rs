@@ -110,7 +110,7 @@ impl Op {
                 syncs: true,
                 ..none
             },
-            Op::Call { .. } | Op::VecKernelCall { .. } => Effects {
+            Op::Call { .. } | Op::CallIndirect { .. } | Op::VecKernelCall { .. } => Effects {
                 calls: true,
                 ..none
             },
