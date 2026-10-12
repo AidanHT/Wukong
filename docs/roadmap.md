@@ -857,8 +857,9 @@ line table built from them is not emitted yet.
   (`tests/run/process_exit.wk`, `crates/wukongc/tests/process_io.rs`). 🟡 A program reads
   standard input a buffer at a time (`read_stdin_u8`); there is no line-reading builtin.
 - **Interactive REPL**: `wukongc --repl` reads standard input a line at a time — an input runs on
-  over the next lines while a bracket or a block comment is open — on the interpreter or the
-  native JIT. Items (`fn`, `struct`, `enum`, `const`, `import`, `impl`, …) are kept and a later item
+  over the next lines while a bracket or a block comment is open, or while it is only
+  `@attributes` (an attribute on its own line stays on the item after it) — on the interpreter or
+  the native JIT. Items (`fn`, `struct`, `enum`, `const`, `import`, `impl`, …) are kept and a later item
   of the same name replaces an earlier one; statements run in a synthesized `main` after a replay of
   every earlier statement input whose stdout and stderr are dropped, so `let` bindings persist; an
   input ending in an expression prints its value `{:?}`-style. `:help`, `:quit`, `:reset`, `:items`

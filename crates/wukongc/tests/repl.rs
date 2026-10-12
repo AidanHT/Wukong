@@ -120,7 +120,9 @@ a[2]
 
 /// An input continues on the next line while a `(`, `[` or `{` is open, or a block comment is; a
 /// bracket inside a string or a comment does not count, and a string that is not closed on its
-/// line is that input's error rather than a reason to keep reading.
+/// line is that input's error rather than a reason to keep reading — even after a bracket opened
+/// before it on its line, which the broken string leaves nothing to close. A bracket opened on an
+/// earlier line still holds the input open, so a function with a broken string is one input.
 #[test]
 fn an_input_continues_while_a_bracket_or_comment_is_open() {
     let transcript = "\
@@ -142,18 +144,89 @@ s
 // a line with nothing but a comment is no input
 let bad = \"no end
 7 * 6
+print(\"no end
+1 + 1
+fn h() -> i32 {
+    let t = \"no end
+    5
+}
+h()
 ";
     let (code, out, err) = repl(&[], transcript);
     assert_eq!(code, Some(0), "{err}");
     // 3! and 5!; the string, quoted; the comment's two lines are one input whose value is 7; the
-    // unclosed string is input 7 (the comment-only line took no number) and the next line runs.
+    // unclosed string is input 7 (the comment-only line took no number) and the next line runs;
+    // so does the line after `print("no end` (input 9). `fn h` is input 11, all four lines of it:
+    // its `5` is not an input of its own (it would print), and `h` is never defined (input 12).
     assert_eq!(
-        out, "[6, 120]\n\"an open ( inside a string\"\n7\n42\n",
+        out, "[6, 120]\n\"an open ( inside a string\"\n7\n42\n2\n",
         "{err}"
     );
-    assert!(err.contains("error[E0102]"), "{err}");
-    assert!(err.contains("--> <repl:7>:1:11"), "{err}");
-    assert_eq!(err.matches("error[").count(), 1, "{err}");
+    for want in [
+        "--> <repl:7>:1:11",
+        "--> <repl:9>:1:7",
+        "--> <repl:11>:2:13",
+        "cannot find function `h`",
+    ] {
+        assert!(err.contains(want), "missing {want:?} in:\n{err}");
+    }
+    assert_eq!(err.matches("error[E0102]").count(), 3, "{err}");
+    // Every diagnostic is in one of the four failing inputs.
+    for line in err.lines().filter(|l| l.contains("--> <repl:")) {
+        assert!(
+            ["<repl:7>:", "<repl:9>:", "<repl:11>:", "<repl:12>:"]
+                .iter()
+                .any(|at| line.contains(at)),
+            "{line}\nin:\n{err}"
+        );
+    }
+}
+
+/// An attribute on a line of its own — the corpus's usual layout — waits for the item or statement
+/// on the lines after it, blank lines included, and stays on it: the item keeps its attributes
+/// (`:items` shows them, and sema checks them: an unknown one is refused), and a loop keeps
+/// `@generic`.
+#[test]
+fn an_attribute_on_its_own_line_belongs_to_what_follows() {
+    let transcript = "\
+@strict_fp
+fn f(a: f32) -> f32 { a * 2.0 }
+f(1.5)
+@export(\"twice\")
+@inline
+
+fn g(a: i32) -> i32 { a + a }
+g(4)
+let mut s = 0;
+@generic
+for i in 0..4 { s = s + i; }
+s
+@bogus
+fn k() -> i32 { 1 }
+k()
+:items
+";
+    for mode in MODES {
+        let (code, out, err) = repl(&mode, transcript);
+        assert_eq!(code, Some(0), "{mode:?}: {err}");
+        // 1.5 * 2.0; 4 + 4; 0 + 1 + 2 + 3; then `:items`, each item from its first attribute.
+        assert_eq!(
+            out,
+            "3.0\n8\n6\n\
+             @strict_fp\nfn f(a: f32) -> f32 { a * 2.0 }\n\
+             @export(\"twice\")\n@inline\n\nfn g(a: i32) -> i32 { a + a }\n",
+            "{mode:?}: {err}"
+        );
+        // `@bogus` reaches sema with `fn k` (input 8), which is refused, so input 9 finds no `k`.
+        for want in [
+            "error[E0306]",
+            "--> <repl:8>:1:",
+            "cannot find function `k`",
+        ] {
+            assert!(err.contains(want), "{mode:?}: missing {want:?} in:\n{err}");
+        }
+        assert_eq!(err.matches("error[").count(), 2, "{mode:?}: {err}");
+    }
 }
 
 /// `:items` prints the kept items in definition order; a later item of the same name replaces the

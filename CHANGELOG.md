@@ -22,7 +22,10 @@ All notable changes to Wukong are documented here. The format is loosely based o
   an executable there, and a `.mir` input now also takes `--emit=mir,mir-text`. The `--time-passes`
   header spells a stage as the command line does (`--emit=mir-high`, not `--emit=mirhigh`).
 - **`wukongc --repl` (N72).** An interactive session on standard input, read a line at a time; an
-  input continues while a bracket or a block comment is open. Items (`fn`, `struct`, `enum`,
+  input continues while a bracket or a block comment is open, or while it is only `@attributes`
+  (an attribute on its own line stays on the item or statement after it). A string left open on
+  its line is that input's error at once, even after a bracket opened before it on that line
+  (`print("abc` does not swallow the lines after it). Items (`fn`, `struct`, `enum`,
   `const`, `import`, `extern`, `trait`, `impl`, `type`) are kept, and a later item of the same name
   replaces an earlier one. Statements run in a synthesized `main` on the interpreter or
   `--backend=native`; an input ending in an expression prints its value `{:?}`-style (a value with

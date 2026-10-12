@@ -363,8 +363,12 @@ refused; items are grouped (an `impl` marker with its flattened methods) and key
 later group with the same key drops the earlier one. A tail's value is printed when sema accepts it
 as a `printf("{:?}")` argument (a second check of the printing program decides, so the REPL never
 re-derives which types print); otherwise its type is shown. `wukong_runtime::process::detach_stdin`
-gives every program the session runs an empty standard input. The rules a user sees are in the
-language guide, "The REPL".
+gives every program the session runs an empty standard input. Where an input ends is decided on
+the lexer's tokens (`repl::needs_more`): a stack of the brackets still open, from which an
+unterminated string (`E0102`; a string ends at its line) drops every bracket opened on its line
+before it, an open block comment (`E0103`), and an input that is so far only attributes
+(`repl::after_attributes`, the skipper `classify` also uses) all read on. The rules a user sees
+are in the language guide, "The REPL".
 
 ## Diagnostics
 

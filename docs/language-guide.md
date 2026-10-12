@@ -2682,7 +2682,12 @@ wk[7]> :type a
 ```
 
 An input runs to the end of a line, or on over the next lines while a `(`, `[` or `{` (or a block
-comment) is still open; a bracket inside a string or a comment does not count. An input whose first token — after any `@attributes` — starts an
+comment) is still open; a bracket inside a string or a comment does not count. An input that is so
+far only `@attributes` also runs on, so an attribute on a line of its own (`@strict_fp`, then the
+`fn` on the next line) stays on the item or statement after it. A string cannot span lines: one
+left open on its line is that input's error, reported at once, and a bracket opened before it on
+that line (`print("abc`) does not hold the input open — one opened on an earlier line (the body
+the string sits in) still does. An input whose first token — after any `@attributes` — starts an
 item (`fn`, `struct`, `enum`, `const`, `import`, `extern`, `trait`, `impl`, `type`, `pub`) is
 **kept** for every later input; an item named like an earlier one **replaces** it (an `impl` block
 replaces the earlier `impl` of the same type and trait). Any other input is **statements**: they run

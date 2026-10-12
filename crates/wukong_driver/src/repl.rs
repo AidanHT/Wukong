@@ -6,8 +6,10 @@
 //! for every new input — a REPL over a whole-program compiler, through the same front end,
 //! lowering, optimizer and backends as `wukongc --run`. An input is one or more lines: it is
 //! complete when no `(`, `[` or `{` is left open (and no block comment is), so a function body
-//! can span lines. Each input is one of two kinds, decided by its first token after
-//! any `@attributes`:
+//! can span lines, and when it holds more than `@attributes`, so an attribute on its own line
+//! stays with the item or statement after it. A string cannot span lines: one left open on its
+//! line is that input's error, and a bracket opened before it on that line does not hold the input
+//! open. Each input is one of two kinds, decided by its first token after any `@attributes`:
 //!
 //! * **items** — `fn`, `struct`, `enum`, `const`, `import`, `extern`, `trait`, `impl`, `type`,
 //!   `pub` — are kept for every later input. An item named like an earlier one *replaces* it; an
@@ -77,7 +79,8 @@ const VALUE: &str = "__wukong_repl_value";
 const HELP: &str = "\
 Wukong REPL. Type items (fn, struct, enum, const, import, extern, trait, impl, type) to keep
 them; type statements to run them. An input that ends in an expression without `;` prints its
-value. An input continues on the next line while a bracket or a block comment is open.
+value. An input continues on the next line while a bracket or a block comment is open, or
+while it is only `@attributes` (they belong to the item or statement after them).
 
 Earlier `let` bindings persist: each input runs after a silent replay of every earlier statement
 input, so their side effects (work done, files written) repeat, while their output is hidden.
@@ -164,23 +167,83 @@ pub fn run(opts: &Options) -> i32 {
     crate::exit::OK
 }
 
-/// Is `text` an unfinished input: a `(`, `[` or `{` still open, or a block comment running to the
-/// end? Decided by the lexer, so a bracket inside a string or a comment is not counted. A string
-/// literal cannot span lines, so an unclosed one is complete — and the lexer's error to report.
+/// Is `text` an unfinished input: a `(`, `[` or `{` still open, a block comment running to the
+/// end, or nothing yet but `@attributes` (an attribute on its own line, the usual layout, belongs to
+/// the item or statement on the lines after it)? Decided by the lexer, so a bracket inside a string
+/// or a comment is not counted. A string literal cannot span lines, so one left open on its line is
+/// broken whatever follows — the lexer's error to report — and a bracket opened before it on that
+/// line (`print("abc`) is no reason to keep reading; a bracket opened on an earlier line (the body
+/// the string sits in) still is.
 fn needs_more(text: &str) -> bool {
     let (tokens, diags) = wukong_lexer::tokenize(text, SourceId(0));
     if diags.iter().any(|d| d.code == Some("E0103")) {
         return true;
     }
-    let mut depth: i64 = 0;
+    // Each broken string: where it starts, and where its line starts; in source order.
+    let mut broken: Vec<(u32, u32)> = diags
+        .iter()
+        .filter(|d| d.code == Some("E0102"))
+        .filter_map(Diagnostic::primary_span)
+        .map(|s| {
+            let line = text[..s.lo as usize]
+                .rfind('\n')
+                .map_or(0, |nl| nl as u32 + 1);
+            (s.lo, line)
+        })
+        .collect();
+    broken.sort_unstable();
+    let mut broken = broken.into_iter().peekable();
+    // The offsets of the brackets still open, innermost last.
+    let mut open: Vec<u32> = Vec::new();
     for t in &tokens {
+        // Past a broken string, nothing opened on its line before it can be closed any more:
+        // forget those brackets.
+        while let Some((_, line)) = broken.next_if(|&(at, _)| at < t.span.lo) {
+            while open.last().is_some_and(|&at| at >= line) {
+                open.pop();
+            }
+        }
         match t.kind {
-            TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => depth += 1,
-            TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => depth -= 1,
+            TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => open.push(t.span.lo),
+            TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                open.pop();
+            }
             _ => {}
         }
     }
-    depth > 0
+    if !open.is_empty() {
+        return true;
+    }
+    let after = after_attributes(&tokens);
+    after > 0 && tokens.get(after).is_none_or(|t| t.kind == TokenKind::Eof)
+}
+
+/// The index of the first token after the leading attributes of `tokens`: each an `@`, the
+/// attribute's name, and an optional balanced `(..)` argument list. An `@` with no name after it,
+/// or whose argument list is still open at the end, ends the attributes at that `@`.
+fn after_attributes(tokens: &[wukong_lexer::Token]) -> usize {
+    let kind = |i: usize| tokens.get(i).map_or(TokenKind::Eof, |t| t.kind);
+    let mut i = 0;
+    while kind(i) == TokenKind::At && kind(i + 1) != TokenKind::Eof {
+        let mut next = i + 2;
+        if kind(next) == TokenKind::LParen {
+            let mut depth = 0i64;
+            loop {
+                match kind(next) {
+                    TokenKind::LParen => depth += 1,
+                    TokenKind::RParen => depth -= 1,
+                    TokenKind::Eof => return i,
+                    _ => {}
+                }
+                next += 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+        }
+        i = next;
+    }
+    i
 }
 
 /// What an input is: items to keep, or statements to run.
@@ -194,26 +257,7 @@ enum Kind {
 fn classify(text: &str) -> Kind {
     let (tokens, _) = wukong_lexer::tokenize(text, SourceId(0));
     let kind = |i: usize| tokens.get(i).map_or(TokenKind::Eof, |t| t.kind);
-    let mut i = 0;
-    while kind(i) == TokenKind::At {
-        // `@`, the attribute's name, then an optional balanced argument list.
-        i += 2;
-        if kind(i) == TokenKind::LParen {
-            let mut depth = 0i64;
-            loop {
-                match kind(i) {
-                    TokenKind::LParen => depth += 1,
-                    TokenKind::RParen => depth -= 1,
-                    TokenKind::Eof => break,
-                    _ => {}
-                }
-                i += 1;
-                if depth == 0 {
-                    break;
-                }
-            }
-        }
-    }
+    let i = after_attributes(&tokens);
     let word = |i: usize| {
         tokens
             .get(i)
@@ -1086,8 +1130,16 @@ mod tests {
             "fn f() -> i32 { 1 }\n",
             "let s = \"{\";\n",
             "// (\n",
-            // A string ends at its line: waiting for its quote would swallow every later line.
+            // A string ends at its line: waiting for its quote would swallow every later line,
+            // and so would a bracket opened before it on that line, which the broken string
+            // leaves no way to close.
             "let s = \"abc (\n",
+            "print(\"abc\n",
+            "f(g(\"abc\n",
+            "foo(\n  x), bar(\"abc\n",
+            "@export(\"abc\n",
+            // An `@` with no name is nothing to wait on.
+            "@\n",
         ] {
             assert!(!needs_more(done), "{done:?}");
         }
@@ -1097,6 +1149,14 @@ mod tests {
             "print((1 +\n",
             "/* note\n",
             "/* note (\n*/ f(\n",
+            // A bracket opened on an earlier line than the broken string still holds it open.
+            "fn f() -> i32 {\n    let s = \"abc\n",
+            // Attributes alone wait for the item or statement they belong to.
+            "@parallel\n",
+            "@strict_fp\n@export(\"k\")\n",
+            "@unchecked // bounds are checked by the caller\n\n",
+            "@tile(64, 64)\n",
+            "@extern(\"C\")\n",
         ] {
             assert!(needs_more(more), "{more:?}");
         }
