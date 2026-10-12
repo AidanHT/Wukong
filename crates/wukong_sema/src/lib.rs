@@ -48,6 +48,8 @@ mod shape;
 mod strs;
 pub use strs::{is_range_slice, RANGE_SLICE, RANGE_SLICE_FROM};
 mod tensor;
+mod turbofish;
+pub use turbofish::DimSnapshot;
 #[cfg(test)]
 mod type_position_tests;
 mod usefulness;
@@ -285,6 +287,12 @@ pub struct SemaResult {
     /// `mir_build` reads it for a hidden runtime-dim argument no argument shape spells directly — a
     /// dimension solved from a derived extent (`Tensor[f32, 2*N]` fed 8 elements binds `N = 4`).
     pub call_dims: HashMap<NodeId, Vec<(Symbol, Dim)>>,
+    /// Every call whose turbofish gives a dimension a run-time local's value (`f::<n>(..)`), keyed
+    /// like [`SemaResult::call_dims`]: the fresh dimension the call's types name that value by, and
+    /// the local to read. `mir_build` reads each local once, before the call's arguments, into a slot
+    /// the dimension names from then on (`turbofish.rs`), so a later assignment or shadowing of the
+    /// local cannot change a shape that was checked.
+    pub dim_snapshots: HashMap<NodeId, Vec<DimSnapshot>>,
     /// Every call to a named kernel builtin (`matmul`, `softmax`, `sdpa`, …) that shape-checked
     /// cleanly, keyed by the call expression: which builtin, and how each of its dimensions was
     /// resolved. `mir_build` lowers the call from this record, so the two crates cannot disagree on
@@ -480,6 +488,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         parallel_fn: false,
         pending_dims: Vec::new(),
         call_dims: HashMap::default(),
+        snapshots: turbofish::SnapshotState::default(),
         tensor_views: Vec::new(),
         local_facts: Vec::new(),
         infer_overrides: HashMap::default(),
@@ -541,6 +550,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
             .map(|(name, init)| (name, init.clone()))
             .collect(),
         call_dims: s.call_dims,
+        dim_snapshots: s.snapshots.calls,
         builtin_calls: s.builtin_calls,
         methods: s.methods.resolution,
         exhaustive_matches: s
@@ -662,6 +672,8 @@ struct Sema<'a> {
     pending_dims: Vec<tensor::PendingDimEq>,
     /// Each resolved call's dimension bindings, published as [`SemaResult::call_dims`].
     call_dims: HashMap<NodeId, Vec<(Symbol, Dim)>>,
+    /// The run-time turbofish dimensions (`turbofish.rs`).
+    snapshots: turbofish::SnapshotState,
     /// Per-scope map, kept 1:1 with `scopes`: a tensor local that VIEWS a non-`mut` aggregate
     /// parameter (`let r = a[i];`, `for row in a`) -> that parameter. Writing through the view
     /// mutates the caller's buffer exactly like writing `a[i, j]` does, so it is held to the same
@@ -2134,6 +2146,8 @@ impl<'a> Sema<'a> {
             Some(t) => self.lower_type(t),
             None => Ty::Unit,
         };
+        // A run-time turbofish dimension of a borrowed local is one read, never the binding's.
+        self.enter_snapshot_body(body);
         self.closure_ctx.clear();
         self.in_fn_body = true;
         let body_ty = self.type_block(body);

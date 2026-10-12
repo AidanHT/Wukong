@@ -509,6 +509,7 @@ trig.wk: wukong_rt_trig_f32 wukong_rt_trig_f32*6 wukong_vmath_f32 wukong_vmath_f
 trig_inverse.wk: wukong_rt_trig_f32 wukong_rt_trig_f32*2 wukong_vmath_f32
 tuple.wk:
 turbofish_const_dim.wk:
+turbofish_runtime_snapshot.wk:
 type_alias.wk: wukong_rt_alloc wukong_rt_free wukong_velem_f32
 type_alias_import.wk:
 u64_literal.wk:

@@ -7,12 +7,26 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ### Run-time turbofish dimensions (`gap6/generic-dims`, N21)
 
+- **A run-time turbofish dimension is the value read at the call.** `f::<n>(..)` with `n` a local
+  reads `n` once, before the call's arguments, and the shapes the call returns are shapes of that
+  value: assigning or shadowing `n` afterwards no longer changes them. The dimension used to be the
+  variable `n` itself, re-read at every use, so after `let r = row::<2, n>(buf, 0); n = 5;` the row
+  reported `r.dim(0) == 5` and a loop to it read past the row (the interpreter trapped, native read
+  on), and the results of two `f::<n>` calls taken around an assignment unified as one shape. Two
+  reads are the same dimension only when they read one immutable binding (a `let` or parameter
+  without `mut`) that nothing borrows; any other two reads meeting in a shape check are `E0502`, each
+  read labelled, with a help to read the value once into an immutable binding
+  (`tests/run/turbofish_runtime_snapshot.wk`, `tests/fail/turbofish_runtime_two_reads.wk`). Sema mints
+  the dimension through the shared interner (`Interner::fresh`) and publishes each call's reads as
+  `SemaResult::dim_snapshots`.
 - **A call compares the caller's dimensions instead of re-binding them.** Once a callee's `N` was
   bound to a dimension of the caller, a later operand's dimension was bound in its place rather than
   compared: `dot(a, b)` with `a: Tensor[i32, P]` and `b: Tensor[i32, Q]` checked clean and read past
   `b` (interpreter 14, native garbage). It is `E0502` now (`tests/fail/call_two_generic_dims.wk`), as
   is a caller's generic passed by turbofish against an array of a fixed length; a run-time turbofish
   value against a fixed length stays the caller's claim, as before.
+- **A turbofish dimension names an integer.** A float local (`first::<x>(a)` with `x = 2.5`) was
+  converted and ran with `N = 2`; it is `E0401` (`tests/fail/turbofish_dim_not_integer.wk`).
 - **The canonicalizer sees a turbofish read.** `let mut n = 3; let r = row::<2, n>(..); n = 1;`
   sank the `let` below the call (an accumulator seed whose first other mention assigns it), which
   then named no binding (`C0001`) or an outer `n`; and an index binding read by a turbofish was

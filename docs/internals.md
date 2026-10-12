@@ -597,6 +597,18 @@ site allocates the buffer, passes it as the hidden first argument, and uses it a
 no aggregate ever rides in a register and the two backends still agree
 (`differential_struct_across_fns`/`differential_struct_return`).
 
+**Run-time turbofish dimensions** (`wukong_sema::turbofish`, `wukong_mir_build::turbofish`):
+`f::<n>(..)` with `n` a local gives the callee's dimension a *fresh* symbol, minted through the shared
+`&Interner` sema holds (`Interner::fresh`, which prints as `n` but is never found by its text) — one
+per read, or one per immutable binding that nothing in the function borrows — and records it per call
+in `SemaResult::dim_snapshots`. Every shape the call returns names that symbol, so it unifies with
+another read only when both read that one binding. `lower_call` reads each such local before the
+call's arguments into an `i64` slot bound under the symbol in the function's outermost scope (zeroed
+in the entry block), and `call_dim_args` passes the slot's value as the hidden dimension.
+`dim_var_value` resolves a type's dimension through that slot, so neither a later assignment nor a
+shadowing of `n` changes an extent or a stride. The canonicalizer's mention tests
+(`expr_mentions`, `canon`'s use scan) count a turbofish name as a read of the local it names.
+
 The **verifier** (`wukong_mir::verify`) enforces true SSA plus per-op typing: every value is defined
 exactly once and inside the value arena; every use is *dominated* by its definition (a real dominator
 tree — DFS postorder, a Cooper–Harvey–Kennedy idom fixpoint, then an explicit-stack preorder walk);

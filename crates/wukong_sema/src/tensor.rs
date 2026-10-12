@@ -321,9 +321,9 @@ impl Sema<'_> {
     }
 
     /// Is `s`, appearing in a dimension binding, a run-time integer VALUE (a local named in a
-    /// turbofish) rather than a dimension of the enclosing function?
+    /// turbofish, `turbofish.rs`) rather than a dimension of the enclosing function?
     fn is_runtime_dim_value(&self, s: Symbol) -> bool {
-        !self.generics.contains(&s) && self.lookup_local(s).is_some()
+        self.is_dim_snapshot(s)
     }
 
     /// After a call's dimensions are bound, every derived extent in `ty` (the call's result type)

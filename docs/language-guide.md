@@ -1084,6 +1084,20 @@ For such dims the compile-time shape checks degrade gracefully to the runtime-`?
 runtime size is outside the defined contract, like any runtime index
 (`tests/run/generic_shape_runtime.wk`).
 
+**A runtime dimension is a value, read once** (✅). `f::<n>(..)` reads `n` when the call is made,
+before its arguments are evaluated, and the shapes the call returns are shapes of *that value*:
+assigning `n` or shadowing it afterwards changes nothing about them (after
+`let r = row::<2, n>(buf, 0); n = 5;`, `r` is exactly as wide as it was, and so is every loop over
+`r.dim(0)`). Two reads are the same dimension only when they read one **immutable** binding — a `let`
+without `mut`, or a parameter without `mut` — whose name nothing in the function borrows (`&n`): the
+rows of `row::<2, n>(buf, 0)` and `row::<2, n>(buf, 1)` then meet in a shape-checked call. Any other
+two reads (of a `mut` local, a borrowed one, or two bindings that shadow each other) are two
+dimensions, so their shapes do not meet: that is `E0502`, with each read labelled and a help to read
+the value once into an immutable binding (`let n2 = n;`) and name that in every turbofish whose shapes
+must agree. The variable must be an integer (`E0401`), and an unsigned one zero-extends
+(`tests/run/turbofish_runtime_snapshot.wk`, `tests/fail/turbofish_runtime_two_reads.wk`,
+`tests/fail/turbofish_dim_not_integer.wk`).
+
 ## Attributes 🟡
 
 ```wukong

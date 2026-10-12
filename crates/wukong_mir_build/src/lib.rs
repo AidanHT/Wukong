@@ -118,6 +118,9 @@ mod repeat;
 // The vectorizer's statement scan and the same-range loop-fusion planner built on it.
 mod fuse;
 
+// Run-time turbofish dimensions: `f::<n>(..)` reads `n` once, into a slot of its own.
+mod turbofish;
+
 // ===== Type-generic monomorphization =====
 //
 // A function generic over a TYPE parameter (`fn id<T>(x: T) -> T`) cannot be lowered once: its MIR
@@ -22803,10 +22806,15 @@ impl FnLowerer<'_> {
         let mut dim_map: HashMap<Symbol, ValueId> = HashMap::default();
         // (a) Turbofish: `sig.generics` zipped positionally with the supplied type args. Only a
         // generic that is one of the hidden *dimension* generics is read here (a type generic's
-        // turbofish is for monomorphization, handled elsewhere).
+        // turbofish is for monomorphization, handled elsewhere). A local named there was read into
+        // its own slot before the arguments (`turbofish.rs`); the callee gets exactly that value.
         for (g, ga) in generics.iter().zip(generic_args) {
             if hidden.contains(g) && !dim_map.contains_key(g) {
-                if let Some(v) = self.turbofish_dim_value(ga) {
+                let v = match self.turbofish_snapshot(callee_id, *g) {
+                    Some(dim) => self.dim_var_value(dim),
+                    None => self.turbofish_dim_value(ga),
+                };
+                if let Some(v) = v {
                     dim_map.insert(*g, v);
                 }
             }
@@ -22976,6 +22984,9 @@ impl FnLowerer<'_> {
         args: &[Expr],
         e: &Expr,
     ) -> ValueId {
+        // A local named in the turbofish (`f::<n>(..)`) is read now, ahead of the arguments, into
+        // the slot the call's shapes name (`turbofish.rs`).
+        self.snapshot_turbofish_dims(callee.id);
         // A call through a function-typed parameter or a trait bound (`methods.rs`).
         if let Some(v) = self.lower_dispatched_call(callee, generic_args, args, e) {
             return v;

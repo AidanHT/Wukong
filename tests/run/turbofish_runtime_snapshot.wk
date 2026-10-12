@@ -1,0 +1,138 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 4
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 4
+// EXPECT-OUT: 2
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 10
+// EXPECT-OUT: 22
+// EXPECT-OUT: 36
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+module tests.run.turbofish_runtime_snapshot
+
+// A turbofish naming a local (`row::<4, n>(..)`) gives the dimension the VALUE `n` holds when the
+// call is made, and the shapes the call returns keep that value: assigning or shadowing `n` later
+// changes nothing about them. The dimension used to be `n` itself, read again at every use, so
+// `r.dim(0)` below printed the new value and `show(r)` read past the row. Every expected value is
+// the scalar meaning of the source: `buf` is 1..=12, so row `i` of `buf` viewed as `M x N` holds
+// `i*N + 1 ..= i*N + N`.
+
+fn row<M, N>(a: Tensor[i32, M, N], i: i64) -> Tensor[i32, N] {
+    return a[i];
+}
+
+fn show<N>(r: Tensor[i32, N]) {
+    for j in 0..N {
+        print(r[j]);
+    }
+}
+
+fn lanes<N>(x: Tensor[i32, N], y: Tensor[i32, N]) {
+    for j in 0..N {
+        print(x[j] * y[j]);
+    }
+}
+
+fn bump(p: *mut i64) -> i64 {
+    *p = *p + 1;
+    return 0;
+}
+
+// A `mut` local, reassigned after the call. Its `let` is also the one an accumulator-seed rewrite
+// used to sink below the call (the turbofish was no mention of it), so the call read the OUTER `n`
+// (4) and returned row 1 of a 4x4 view. Prints 4 (the outer `n`), the width 3, row 1 of the 4x3
+// view (4 5 6), then the reassigned 6.
+fn reassigned(buf: [i32; 12]) {
+    let n = 4;
+    print(n);
+    let mut n = 3;
+    let r = row::<4, n>(buf, 1);
+    n = 6;
+    print(r.dim(0));
+    show(r);
+    print(n);
+}
+
+// Shadowed after the call: prints the new `n` (4), the width 2, row 2 of the 6x2 view (5 6).
+fn shadowed(buf: [i32; 12]) {
+    let n = 2;
+    let r = row::<6, n>(buf, 2);
+    let n = 4;
+    print(n);
+    print(r.dim(0));
+    show(r);
+}
+
+// One call site in a loop reads the width afresh on every iteration, then it grows: widths 1, 2, 3,
+// each followed by that prefix of row 0 (1 / 1 2 / 1 2 3).
+fn widening(buf: [i32; 12]) {
+    let mut w = 1;
+    for _ in 0..3 {
+        let r = row::<1, w>(buf, 0);
+        w = w + 1;
+        print(r.dim(0));
+        show(r);
+    }
+}
+
+// Two reads of one immutable binding are one dimension, so their rows meet at `lanes`: rows 0 and 3
+// of the 4x3 view, 1 2 3 and 10 11 12, lane by lane 10 22 36.
+fn same_binding(buf: [i32; 12]) {
+    let n = 3;
+    let a = row::<4, n>(buf, 0);
+    let b = row::<4, n>(buf, 3);
+    lanes(a, b);
+}
+
+// The turbofish is read before the arguments, in source order: `m` is 2 when it is read, and the
+// argument then makes it 3. Prints the width 2, row 0 of the 6x2 view (1 2), then `m` (3).
+fn read_first(buf: [i32; 12]) {
+    let mut m: i64 = 2;
+    let pm = &mut m;
+    let q = row::<6, m>(buf, bump(pm));
+    print(q.dim(0));
+    show(q);
+    print(m);
+}
+
+// An unsigned local zero-extends to the dimension: width 4, row 2 of the 3x4 view (9 10 11 12).
+fn unsigned_width(buf: [i32; 12]) {
+    let u: u32 = 4;
+    let r = row::<3, u>(buf, 2);
+    print(r.dim(0));
+    show(r);
+}
+
+fn main() -> i32 {
+    let buf: [i32; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+    reassigned(buf);
+    shadowed(buf);
+    widening(buf);
+    same_binding(buf);
+    read_first(buf);
+    unsigned_width(buf);
+    return 0;
+}

@@ -120,9 +120,23 @@ line table built from them is not emitted yet.
   at the call (with the turbofish to write), instead of the lowering-time `C0001` it used to be
   (`tests/fail/dim_uninferable.wk`). A `const` named in a turbofish is its value, as in a type — it
   used to be an opaque variable that lowering replaced with a `?` argument's run-time extent
-  (`tests/run/turbofish_const_dim.wk`). Still open: a turbofish naming a run-time *variable*
-  (`f::<n>(..)`) binds the dimension to that variable by name, so an escaping result type re-reads
-  `n` — mutating or shadowing `n` after the call changes that tensor's extent.
+  (`tests/run/turbofish_const_dim.wk`).
+- **A run-time turbofish dimension is the value read at the call** (2026-10-12,
+  `gap6/generic-dims`). `f::<n>(..)` reads `n` once, before the call's arguments, into a slot of its
+  own, and the call's shapes name that value through a fresh dimension symbol
+  (`wukong_span::Interner::fresh`, published per call as `SemaResult::dim_snapshots`), never the
+  variable: assigning or shadowing `n` later no longer changes the extent of a tensor the call
+  returned. It used to: `r.dim(0)` printed the new value, a loop to it read past the row (the
+  interpreter trapped, native read on), and the results of two `f::<n>` calls around an assignment
+  unified as one shape. Two reads are one dimension only when they read one immutable,
+  never-borrowed binding; other reads meeting in a shape check are `E0502` with both reads labelled
+  (`tests/run/turbofish_runtime_snapshot.wk`, `tests/fail/turbofish_runtime_two_reads.wk`). With it:
+  a call compares, never re-binds, a callee dimension already bound to one of the caller's (`dot(a,
+  b)` over `Tensor[i32, P]` and `Tensor[i32, Q]` checked clean and read past `b`;
+  `tests/fail/call_two_generic_dims.wk`); a turbofish dimension must
+  be an integer (`E0401`); and the canonicalizer counts a turbofish as a
+  mention of the local it reads (it sank `let mut n = 3;` below `f::<n>(..)`, a `C0001`, or a read of
+  an outer `n`).
 - **`E0401` is a plain type mismatch again.** The catch-all was split by rule, each with its own
   `--explain` page and a compile-tested erroneous/fixed example: `E0430` struct-literal fields, `E0431`
   malformed or out-of-range literals (and enum discriminants), `E0432` invalid escapes, `E0433`
@@ -1467,6 +1481,15 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   and discards it), and any token inside an `extern { .. }` block that is not part of a declaration
   (the parser skips it silently). The corpus and `examples/` are not reformatted yet, so
   `wukongc fmt --check` on the repository lists files.
+
+- **A run-time turbofish dimension is trusted against a fixed extent.** `rowsum::<m, n>(a, out)` with
+  `out: [f32; 3]` binds `M` to the value of `m` with no check that it is 3: the turbofish is the
+  caller's claim about the argument, as a `?` extent is, and a wrong value is outside the defined
+  contract (only the named kernel builtins test such extents at run time). A run-time assertion where
+  a turbofish value meets a fixed extent would close it; the value is already in a slot of its own
+  there. Separately, an `if`/`match` whose arms are a turbofish-shaped tensor and a `?` tensor takes
+  the first arm's shape, as any merge with a `?` arm does, so a `dim(0)` of the merge read on the `?`
+  arm's path reads 0 (the slot's entry value) rather than that tensor's extent.
 
 - **A `?` argument binds a fixed-extent parameter unchecked.** `fn find(x: [f32; 37])` called with a
   `Tensor[f32, ?]` (or an array that decayed to one) compiles with no diagnostic and no run-time

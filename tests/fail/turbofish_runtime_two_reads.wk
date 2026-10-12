@@ -1,0 +1,29 @@
+// EXPECT-CODE: E0502
+// EXPECT-COUNT: 1
+module tests.fail.turbofish_runtime_two_reads
+
+// A turbofish naming a local gives the dimension the value the local holds when the call is made.
+// Two reads of a `mut` local are two dimensions, because it can change in between, as it does here:
+// `a` is 3 wide and `b` 2 wide. Both were the dimension `n` itself, so `lanes(a, b)` unified them,
+// checked clean, and read `b[2]` past its row. Each read is labelled, with a help to read the value
+// once into an immutable binding.
+fn row<M, N>(a: Tensor[i32, M, N], i: i64) -> Tensor[i32, N] {
+    return a[i];
+}
+
+fn lanes<N>(x: Tensor[i32, N], y: Tensor[i32, N]) -> i32 {
+    let mut s = 0;
+    for j in 0..N {
+        s = s + x[j] * y[j];
+    }
+    return s;
+}
+
+fn main() -> i32 {
+    let buf: [i32; 6] = [1, 2, 3, 4, 5, 6];
+    let mut n = 3;
+    let a = row::<2, n>(buf, 0);
+    n = 2;
+    let b = row::<3, n>(buf, 0);
+    return lanes(a, b); //~ E0502
+}

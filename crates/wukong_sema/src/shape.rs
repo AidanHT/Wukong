@@ -726,6 +726,8 @@ impl Sema<'_> {
         // or turbofish that fixed it (`provenance.rs`).
         let outer_call = self.begin_call(site);
         let errors_before = self.diags.len();
+        // The run-time values the turbofish reads (`f::<n>`), published for lowering below.
+        let mut snaps: Vec<crate::DimSnapshot> = Vec::new();
         if !generic_args.is_empty() {
             for (g, ga) in sig.generics.iter().zip(generic_args) {
                 match &ga.kind {
@@ -748,24 +750,35 @@ impl Sema<'_> {
                                 tys.insert(*g, Ty::Scalar(sc));
                             }
                             None => {
-                                // A top-level `const` (not shadowed by a local or one of the
-                                // caller's generics) is its VALUE, exactly as a `const` dimension
-                                // in a type is (`lower_dim`). Bound as `Var(C)` it named no slot,
-                                // so lowering fell back to a `?` argument's run-time extent and
-                                // `f::<C>(t)` disagreed with `f::<4>(t)`.
-                                let is_const = !self.generics.contains(&nm)
-                                    && self.lookup_local(nm).is_none()
-                                    && self.consts.contains_key(&nm);
-                                let d = if is_const {
-                                    Dim::Const(self.const_length(nm, 0))
-                                } else {
+                                if let Some(lty) = self.lookup_local(nm) {
                                     // A local named here is READ for the dimension's value, so in
-                                    // a closure it is a capture (and an enclosing generic is
-                                    // `E0418`), exactly as in an expression (`closures.rs`).
+                                    // a closure it is a capture (`closures.rs`), exactly as in an
+                                    // expression. The call's types name the value it holds when
+                                    // the call is made, never the variable: bound as `Var(n)`, a
+                                    // later `n = ..` or `let n = ..` changed the extent of every
+                                    // shape the call returned (`turbofish.rs`).
                                     self.note_value_use(nm, ga.span);
-                                    Dim::Var(nm)
-                                };
-                                dims.insert(*g, d);
+                                    if let Some(snap) =
+                                        self.turbofish_local_dim(nm, &lty, *g, call_id, ga.span)
+                                    {
+                                        dims.insert(*g, Dim::Var(snap.dim));
+                                        snaps.push(snap);
+                                    }
+                                } else if !self.generics.contains(&nm)
+                                    && self.consts.contains_key(&nm)
+                                {
+                                    // A top-level `const` (not shadowed by a local or one of the
+                                    // caller's generics) is its VALUE, exactly as a `const`
+                                    // dimension in a type is (`lower_dim`). Bound as `Var(C)` it
+                                    // named no slot, so lowering fell back to a `?` argument's
+                                    // run-time extent and `f::<C>(t)` disagreed with `f::<4>(t)`.
+                                    dims.insert(*g, Dim::Const(self.const_length(nm, 0)));
+                                } else {
+                                    // One of the caller's own dimensions, fixed for its whole
+                                    // body (in a closure, an enclosing generic is `E0418`).
+                                    self.note_value_use(nm, ga.span);
+                                    dims.insert(*g, Dim::Var(nm));
+                                }
                                 self.note_turbofish_dim(*g, ga.span);
                             }
                         }
@@ -777,6 +790,7 @@ impl Sema<'_> {
                 }
             }
         }
+        self.record_dim_snapshots(call_id, snaps);
 
         // A derived parameter extent (`Tensor[f32, 2*N]`) binds nothing while the parameters are
         // walked: `unify_dim` queues its equation, and `solve_pending_dims` solves the queue once every
@@ -1503,6 +1517,7 @@ impl Sema<'_> {
                         self.dim_str(ad)
                     ),
                 );
+                self.explain_dim_snapshots(pd, ad);
             }
             return;
         }
@@ -1535,27 +1550,28 @@ impl Sema<'_> {
                         let msg =
                             format!("dimension mismatch on {at}: expected {want}, found {got}");
                         self.report_dim_conflict(span, msg, site, &want, &got);
+                        self.explain_dim_snapshots(bound, ad);
                     }
                 }
                 // `v` is no generic of the callee still to infer but what the substitution put in
                 // its place: the declared `N` already bound, by the turbofish or an earlier
-                // argument, to a dimension of the CALLER. That is a comparison, never a binding.
-                // Binding `P := Q` here let `dot(a, b)` with `a: Tensor[i32, P]`,
-                // `b: Tensor[i32, Q]` check clean and read past `b` (the interpreter read the next
-                // slot, native garbage).
+                // argument, to a dimension of the CALLER (`P`, or a run-time turbofish value). That
+                // is a comparison, never a binding. Binding `P := Q` here let `dot(a, b)` with
+                // `a: Tensor[i32, P]`, `b: Tensor[i32, Q]` check clean and read past `b` (the
+                // interpreter read the next slot, native garbage), and let two reads of a
+                // changing variable unify as one shape (`turbofish.rs`).
                 None if matches!(decl_dim, Some(Dim::Var(g)) if g != v) => {
-                    // A turbofish naming a run-time local meets a fixed extent at the run-time `?`
-                    // level: the turbofish is the caller's claim about the argument
-                    // (`rowsum::<m, n>(a, out)` with `out: [f32; 3]`), as it always was.
-                    let runtime_vs_fixed = !self.generics.contains(v)
-                        && self.lookup_local(*v).is_some()
-                        && matches!(ad, Dim::Const(_));
+                    // A run-time turbofish value meets a fixed extent at the run-time `?` level:
+                    // the turbofish is the caller's claim about the argument (`rowsum::<m, n>(a,
+                    // out)` with `out: [f32; 3]`), as it always was.
+                    let runtime_vs_fixed = self.is_dim_snapshot(*v) && matches!(ad, Dim::Const(_));
                     if !runtime_vs_fixed && !dims_equal(pd, ad) {
                         let (want, got) = (self.dim_str(pd), self.dim_str(ad));
                         let at = self.dim_site(site);
                         let msg =
                             format!("dimension mismatch on {at}: expected {want}, found {got}");
                         self.report_dim_conflict(span, msg, site, &want, &got);
+                        self.explain_dim_snapshots(pd, ad);
                     }
                 }
                 None => {
@@ -1585,13 +1601,21 @@ impl Sema<'_> {
                 Dim::Var(_) | Dim::Expr(_) => {
                     let name = self.dim_str(ad);
                     let at = self.dim_site(site);
+                    // A run-time turbofish value is no generic dimension, but it is no better known
+                    // here than one (`turbofish.rs`).
+                    let what = if ad.vars().iter().any(|v| self.is_dim_snapshot(*v)) {
+                        "the run-time dimension"
+                    } else {
+                        "the generic dimension"
+                    };
                     let msg = format!(
-                        "dimension mismatch on {at}: expected {pc}, found the generic dimension \
-                         `{name}` (a universally-quantified dimension cannot be assumed equal \
-                         to {pc}; declare the parameter `?` if the size is a runtime value)"
+                        "dimension mismatch on {at}: expected {pc}, found {what} `{name}` (a \
+                         universally-quantified dimension cannot be assumed equal to {pc}; \
+                         declare the parameter `?` if the size is a runtime value)"
                     );
                     let found = format!("`{name}`");
                     self.report_dim_conflict(span, msg, site, &pc.to_string(), &found);
+                    self.explain_dim_snapshots(pd, ad);
                 }
                 _ => {}
             },
@@ -1604,6 +1628,7 @@ impl Sema<'_> {
                     let at = self.dim_site(site);
                     let msg = format!("dimension mismatch on {at}: expected {want}, found {got}");
                     self.report_dim_conflict(span, msg, site, &want, &got);
+                    self.explain_dim_snapshots(pd, ad);
                 }
             }
             Dim::Dynamic => {}

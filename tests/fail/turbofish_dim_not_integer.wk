@@ -1,0 +1,15 @@
+// EXPECT-CODE: E0401
+// EXPECT-COUNT: 1
+module tests.fail.turbofish_dim_not_integer
+
+// A turbofish may give a dimension a local's run-time value, and a dimension is an integer. A float
+// local used to be accepted and converted, so `first::<x>(a)` with `x = 2.5` ran with `N = 2`.
+fn first<N>(a: Tensor[i32, N]) -> i32 {
+    return a[N - 1];
+}
+
+fn main() -> i32 {
+    let a: [i32; 6] = [1, 2, 3, 4, 5, 6];
+    let x = 2.5;
+    return first::<x>(a); //~ E0401
+}
