@@ -94,6 +94,83 @@ fn every_switch_that_turns_the_recipes_off_turns_off_the_optimizers() {
     }
 }
 
+/// A loss whose forward is a recognized 4096-element SUM: its backward is the tape's
+/// `fill(dx, 4096, g)`, a plain f32 splat-store loop the optimizer hands to a raw-AVX2 recipe.
+const SUM_LOSS: &str = "module sum_loss\n\
+    \n\
+    @parallel\n\
+    fn loss(x: [f32; 4096], mut out: [f32; 1]) -> f32 {\n\
+        let mut l: f32 = 0.0;\n\
+        for i in 0..4096 { l = l + x[i]; }\n\
+        out[0] = l;\n\
+        return l;\n\
+    }\n\
+    \n\
+    fn main() -> i32 { return 0; }\n";
+
+/// Run `wukongc args… <path>` with every compiler variable scrubbed.
+fn wukongc(args: &[&str], path: &Path) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_wukongc"));
+    for v in COMPILER_ENV {
+        cmd.env_remove(v);
+    }
+    cmd.args(args).arg(path).output().expect("spawn wukongc")
+}
+
+/// The backward `--emit=grad`, `--grad-of` and `--train` generate is optimized by a call of its
+/// own, after the forward, and it follows the same switch. It used to run the optimizer's default
+/// pipeline, which has the kernels on, so under `--target-cpu=x86-64-v2` the backward carried one.
+/// `--emit=grad` printed it, and `--emit=obj --grad-of` and `--train --emit=obj` failed Cranelift's
+/// target check (`function 'loss_grad' carries raw AVX2+FMA vector kernels`).
+#[test]
+fn the_generated_backward_follows_the_switch() {
+    let dir = std::env::temp_dir().join(format!("wukong-vec256-opt-grad-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    let src = dir.join("sum_loss.wk");
+    std::fs::write(&src, SUM_LOSS).expect("write source");
+
+    let grad_kernels = |extra: &[&str]| -> usize {
+        let mut args = vec!["--emit=grad", "-O2"];
+        args.extend_from_slice(extra);
+        let out = wukongc(&args, &src);
+        assert!(
+            out.status.success(),
+            "wukongc {args:?} failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .matches("veckernel #")
+            .count()
+    };
+    assert_eq!(grad_kernels(&["--target-cpu=x86-64-v2"]), 0, "x86-64-v2");
+    assert_eq!(grad_kernels(&["--backend=gpu-native"]), 0, "gpu-native");
+    // Where the recipe can exist the same backward takes one, so the zeros are the switch's.
+    if host() {
+        assert!(
+            grad_kernels(&[]) > 0,
+            "the backward's fill no longer takes a kernel; the zeros above prove nothing"
+        );
+    }
+
+    for (what, args) in [
+        ("--grad-of", &["--emit=obj", "--grad-of=loss"][..]),
+        ("--train", &["--emit=obj", "--train"][..]),
+    ] {
+        let obj = dir.join(format!("{}.o", what.trim_start_matches('-')));
+        let obj_arg = obj.to_str().expect("utf-8 scratch path");
+        let mut full = vec!["-O2", "--target-cpu=x86-64-v2", "-o", obj_arg];
+        full.extend_from_slice(args);
+        let out = wukongc(&full, &src);
+        assert!(
+            out.status.success(),
+            "{what}: wukongc {full:?} failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(obj.is_file(), "{what}: no object at {}", obj.display());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A `--passes` list builds the vectorizer the backend asked for, as the standard pipeline does.
 #[test]
 fn a_pass_list_follows_the_backend() {

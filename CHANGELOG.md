@@ -29,7 +29,11 @@ All notable changes to Wukong are documented here. The format is loosely based o
   sets it exactly as `LowerOptions::vec_kernels` — off for `--backend=gpu-native` (whose PTX
   lowering declines a `VecKernelCall`), below `--target-cpu=x86-64-v3`, and for a program autodiff
   differentiates — so the interpreter and the native backend compile the same MIR and gpu-native
-  gets no CPU recipe from either stage. `PassManager::standard_with`, `optimize_timed_with` and
+  gets no CPU recipe from either stage. The backward that `--emit=grad`, `--grad-of` and `--train`
+  generate is optimized by a separate call, and it takes the same switch. The tape's `fill` and
+  ReLU-backward loops are kernel-shaped, so under the optimizer's default the backward of a
+  4096-element sum carried a kernel at `--target-cpu=x86-64-v2`, and `--emit=obj --grad-of` failed
+  Cranelift's target check. `PassManager::standard_with`, `optimize_timed_with` and
   `Vectorize::new(bool)` carry it; `--passes` lists honour it too. `WUKONG_P4_NO_256` and the host
   gate (`wukong_mir::host_supports_vec_kernels`) apply unchanged.
 - **The interpreter's kernel marshalling forwards a store across streams that share a base.** Two

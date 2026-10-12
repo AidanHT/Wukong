@@ -504,7 +504,10 @@ impl OptimizeOptions {
     /// error. The gradient-compile lowering (`unroll_for_autodiff`) and complete unrolling produce
     /// exactly the straight-line copies SLP packs, so this is the common case there, not an edge.
     /// The generated backward is never differentiated again, so it is optimized with
-    /// [`OptimizeOptions::FULL`].
+    /// [`OptimizeOptions::FULL`] under the invocation's kernel switch
+    /// ([`OptimizeOptions::with_vec_kernels`]). The tape's own fill and ReLU-backward loops are
+    /// plain elementwise bodies the vectorizer turns into kernels, so the backward needs the same
+    /// target gate as the forward.
     ///
     /// No 256-bit kernels either: autodiff has no VJP rule for an `Op::VecKernelCall` and refuses
     /// one by name, so the forward keeps the 128-bit form it differentiated before.

@@ -916,7 +916,9 @@ tails. The gate is `KERNEL_MIN_TRIP` = 2048, the crossover `mir_build` measured 
 reduction kernel; it is conservative for an elementwise call and re-measuring it is owed. The path
 needs all three of `OptimizeOptions::vec_kernels` (set by `wukong_driver` exactly as
 `LowerOptions::vec_kernels`: off for `--backend=gpu-native` and below `--target-cpu=x86-64-v3`, and
-off in `OptimizeOptions::AUTODIFF_INPUT`), `wukong_mir::host_supports_vec_kernels()` and an unset
+off in `OptimizeOptions::AUTODIFF_INPUT`; the backward `build_grad` generates is optimized by a call
+of its own and takes the same switch, `backward_optimize_options`, because the tape's fill and
+ReLU-backward loops are kernel-shaped), `wukong_mir::host_supports_vec_kernels()` and an unset
 `WUKONG_P4_NO_256`. `WUKONG_VEC256_MIN_TRIP=<n>` moves the gate (never below one register group): a
 result-identical test knob — `WUKONG_VEC256_MIN_TRIP=8 cargo test -p wukongc --test run` puts every
 eligible corpus loop of eight or more iterations through a kernel, and passed when this landed.
@@ -1092,7 +1094,8 @@ forward it hands to autodiff without it: the driver passes `OptimizeOptions::AUT
 `optimize_preserving_with` / `optimize_verified_preserving_with`, because `wukong_autodiff`
 differentiates one scalar at a time and has no VJP rule for a vector load or store — a packed store
 into a buffer whose gradient is live is a hard error there. The generated backward, which nothing
-differentiates, is packed as usual. It adds no MIR op and changed no backend; over `tests/run` and `examples` it packs
+differentiates, is packed as usual (`OptimizeOptions::FULL` under the invocation's 256-bit kernel
+switch). It adds no MIR op and changed no backend; over `tests/run` and `examples` it packs
 `tensor_dim_arith.wk` and `type_alias.wk` and costs 0.2% of optimizer time (debug `--time-passes`,
 summed in process). Its vector loads and stores sit **outside loops, frame slots included**, which
 `gpu-native` takes through its generic scalar-lane path — only the on-device suite (gate part 10)

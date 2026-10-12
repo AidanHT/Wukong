@@ -383,6 +383,16 @@ fn optimize_options_for(
     }
 }
 
+/// The optimizer options for the backward [`build_grad`] generates. Nothing differentiates the
+/// backward again, so it takes every stage, SLP included. The 256-bit kernel switch is still the
+/// invocation's, as it is for the forward ([`optimize_options_for`]). The tape's own loops
+/// (`fill`, `sign_fill`, the ReLU and extremum backwards) are plain f32 elementwise bodies the
+/// vectorizer hands to a raw-AVX2 recipe. A hardwired `FULL` gave the backward kernels under
+/// `--target-cpu=x86-64-v2` and gpu-native, which neither target can run.
+fn backward_optimize_options(opts: &Options) -> wukong_opt::OptimizeOptions {
+    wukong_opt::OptimizeOptions::FULL.with_vec_kernels(lower_options_for(opts).vec_kernels)
+}
+
 /// Does this compile read its program from standard input (`wukongc -` with no `-e`)?
 fn reads_stdin(opts: &Options) -> bool {
     opts.source.is_none() && opts.input == Path::new("-")
@@ -2580,7 +2590,8 @@ fn build_grad(
     // Optimize only newly generated MIR: rerunning the pipeline over the input program could
     // change the forward or inline/delete its callees after the caller has selected them. The
     // backward still gets the requested local passes and unrolling, with the same O1 floor used
-    // to prepare the forward for autodiff, and SLP too: nothing differentiates the backward.
+    // to prepare the forward for autodiff, and SLP too: nothing differentiates the backward. The
+    // 256-bit kernels follow the invocation (`backward_optimize_options`).
     // Preserve its externally invoked entry point explicitly.
     let grad_name = gradfn.name;
     let mut generated = wukong_mir::Program {
@@ -2590,11 +2601,12 @@ fn build_grad(
         externs: program.externs.clone(),
     };
     let level = opts.opt_level.max(1);
+    let options = backward_optimize_options(opts);
     if opts.verify_each {
-        wukong_opt::optimize_verified_preserving(&mut generated, level, &[grad_name])
+        wukong_opt::optimize_verified_preserving_with(&mut generated, level, &[grad_name], options)
             .map_err(|failure| failure.to_string())?;
     } else {
-        wukong_opt::optimize_preserving(&mut generated, level, &[grad_name]);
+        wukong_opt::optimize_preserving_with(&mut generated, level, &[grad_name], options);
     }
     let gradfn = generated
         .funcs
@@ -3406,6 +3418,19 @@ mod lower_options_tests {
                 let o = optimize_options_for(&opts, &lower);
                 assert_eq!(o.vec_kernels, lower.vec_kernels, "{backend:?} / {target:?}");
                 assert!(o.slp, "{backend:?} / {target:?}");
+                // The generated backward: full pipeline, the same kernel switch, whether or not
+                // the invocation is a gradient compile.
+                for emit in [EmitStage::Grad, EmitStage::Exe] {
+                    let grad = Options {
+                        emit,
+                        ..opts.clone()
+                    };
+                    assert_eq!(
+                        backward_optimize_options(&grad),
+                        wukong_opt::OptimizeOptions::FULL.with_vec_kernels(lower.vec_kernels),
+                        "{backend:?} / {target:?} / {emit:?}"
+                    );
+                }
             }
         }
         let grad = Options {
@@ -3711,6 +3736,78 @@ mod grad_cli_tests {
         assert!(autodiff_roots(&program, &mut interner, &opts)
             .unwrap()
             .is_empty());
+    }
+
+    /// The generated backward is optimized after the forward, by a separate optimizer call, and that
+    /// call must apply the invocation's 256-bit kernel switch too. The autodiff tape's own loops
+    /// (`fill`, `sign_fill`, the ReLU and extremum backwards) are plain f32 elementwise bodies,
+    /// exactly what the vectorizer hands to a raw-AVX2 recipe. The backward of a recognized SUM over
+    /// 4096 elements is `fill(dx, 4096, g)`. Optimized with a hardwired `OptimizeOptions::FULL`, it
+    /// carried a kernel under `--target-cpu=x86-64-v2`. `--emit=obj --grad-of` and
+    /// `--train --emit=obj|exe` then failed Cranelift's target check, and `--emit=grad` printed a
+    /// `veckernel #` the docs say a level below x86-64-v3 never gets. gpu-native, whose PTX lowering
+    /// declines a `VecKernelCall`, must get none either.
+    #[test]
+    fn the_backward_takes_the_invocations_vec_kernel_switch() {
+        const SRC: &str = "@parallel\n\
+             fn loss(x: [f32; 4096], mut out: [f32; 1]) -> f32 {\n\
+                 let mut l: f32 = 0.0;\n\
+                 for i in 0..4096 { l = l + x[i]; }\n\
+                 out[0] = l;\n\
+                 return l;\n\
+             }\n";
+        let kernels = |backend: BackendKind, target_cpu: TargetCpu, verify_each: bool| -> usize {
+            let (program, mut interner) = compile_o1(SRC);
+            let mut opts = Options {
+                emit: EmitStage::Grad,
+                backend,
+                target_cpu,
+                opt_level: 2,
+                verify_each,
+                ..Options::default()
+            };
+            opts.grad.wrt = vec![0];
+            let (_, g) = build_grad(&program, &mut interner, &opts).unwrap();
+            let calls = g
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter(|i| matches!(i.op, wukong_mir::Op::VecKernelCall { .. }))
+                .count();
+            calls.max(g.vec_kernels.len())
+        };
+        for verify_each in [false, true] {
+            for (backend, target) in [
+                (BackendKind::Interp, TargetCpu::X86_64V2),
+                (BackendKind::Native, TargetCpu::X86_64V2),
+                (BackendKind::Native, TargetCpu::X86_64),
+                (BackendKind::GpuLower, TargetCpu::Native),
+            ] {
+                assert_eq!(
+                    kernels(backend, target, verify_each),
+                    0,
+                    "{backend:?} / {target:?} (verify_each={verify_each}): the backward must carry \
+                     no raw-AVX2 kernel where the forward may not"
+                );
+            }
+            // The arm that makes the zeros evidence: where the recipes can fire, the same backward
+            // under the CPU options does take one, so the zero above is the switch's doing.
+            let can_fire = wukong_mir::host_supports_vec_kernels()
+                && [
+                    "WUKONG_P4_NO_256",
+                    "WUKONG_VEC256_MIN_TRIP",
+                    "WUKONG_NO_VECTORIZE",
+                ]
+                .iter()
+                .all(|v| std::env::var_os(v).is_none());
+            if can_fire {
+                assert!(
+                    kernels(BackendKind::Native, TargetCpu::Native, verify_each) > 0,
+                    "the backward's 4096-element fill no longer takes a 256-bit kernel, so the \
+                     zeros above no longer prove anything"
+                );
+            }
+        }
     }
 
     /// Lex → parse → sema → mir_build → opt(1). Panics with the offending stage's diagnostics.
