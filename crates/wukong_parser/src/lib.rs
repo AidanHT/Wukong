@@ -46,6 +46,41 @@ pub fn parse_type_str(
     (t, diags)
 }
 
+/// What [`parse_stmts_tokens_with_lints`] produces: a statement list as one [`Block`], with the
+/// same companions as a module parse ([`ParseOutput`]).
+pub struct StmtsOutput {
+    /// Every statement, and the tail expression when the input ends in an expression with no `;`.
+    pub block: Block,
+    /// Parser errors (the lexer's diagnostics are the caller's).
+    pub diags: Vec<Diagnostic>,
+    /// The first `NodeId` after the last one allocated.
+    pub next_node: u32,
+    /// The parser's lint findings (`W0030`, `W0031`), levels not applied.
+    pub lints: Vec<Diagnostic>,
+}
+
+/// Parse already-lexed tokens as a bare **statement list** running to the end of input — the body
+/// of a block without its braces, which is what a REPL input that is not an item is. `NodeId`s are
+/// allocated from `first_node_id` (see [`parse_module_tokens_from`]), so the result can be spliced
+/// into a module parsed separately. An input whose last statement is an expression with no `;`
+/// has it as the block's `tail`.
+pub fn parse_stmts_tokens_with_lints(
+    tokens: &[Token],
+    src: &str,
+    interner: &mut Interner,
+    first_node_id: u32,
+) -> StmtsOutput {
+    let mut p = Parser::new(tokens, src, interner);
+    p.next_node = first_node_id;
+    let block = p.stmts_to_eof();
+    StmtsOutput {
+        block,
+        diags: std::mem::take(&mut p.diags),
+        next_node: p.next_node,
+        lints: std::mem::take(&mut p.lints),
+    }
+}
+
 pub(crate) struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
@@ -1924,6 +1959,53 @@ impl<'a> Parser<'a> {
             };
         }
         self.expect(T::LBrace);
+        let (stmts, tail) = self.block_contents(T::RBrace);
+        self.expect(T::RBrace);
+        self.depth = saved;
+        Block {
+            id,
+            stmts,
+            tail,
+            span: start.to(self.prev_span()),
+        }
+    }
+
+    /// A bare statement list running to the end of input — a REPL input — as one [`Block`]: every
+    /// statement, and the tail expression when the last one has no `;`. A `}` that closes nothing
+    /// is reported (`E0202`, no statement starts with it) and skipped.
+    pub(crate) fn stmts_to_eof(&mut self) -> Block {
+        let start = self.span();
+        let id = self.nid();
+        let mut stmts = Vec::new();
+        let tail = loop {
+            let (mut more, tail) = self.block_contents(T::Eof);
+            stmts.append(&mut more);
+            if self.at(T::Eof) {
+                break tail;
+            }
+            let sp = self.span();
+            self.error(
+                sp,
+                "E0202",
+                format!(
+                    "expected a statement or an expression, found {}",
+                    self.found()
+                ),
+            );
+            self.bump();
+        };
+        Block {
+            id,
+            stmts,
+            tail,
+            span: start.to(self.prev_span()),
+        }
+    }
+
+    /// The statements of a block and its tail expression, up to (not consuming) `closer`: the
+    /// block's `}`, or [`T::Eof`] for a bare statement list ([`parse_stmts_tokens_with_lints`], a
+    /// REPL input). The tail is an expression with no `;` directly before `closer`.
+    fn block_contents(&mut self, closer: TokenKind) -> (Vec<Stmt>, Option<Box<Expr>>) {
         let mut stmts = Vec::new();
         let mut tail = None;
         while !self.at(T::RBrace) && !self.at(T::Eof) {
@@ -1963,7 +2045,7 @@ impl<'a> Parser<'a> {
                 }
                 T::Return => {
                     self.bump();
-                    let e = if self.at(T::Semi) || self.at(T::RBrace) {
+                    let e = if self.at(T::Semi) || self.at(T::RBrace) || self.at(closer) {
                         None
                     } else {
                         Some(self.parse_expr())
@@ -1981,7 +2063,7 @@ impl<'a> Parser<'a> {
                     };
                     // Optional break value: `break v;` yields `v` from a value-producing `loop`.
                     // Absent before `;`/`}` (a plain `break`); otherwise the trailing expression.
-                    let value = if self.at(T::Semi) || self.at(T::RBrace) {
+                    let value = if self.at(T::Semi) || self.at(T::RBrace) || self.at(closer) {
                         None
                     } else {
                         Some(self.parse_expr())
@@ -2079,7 +2161,7 @@ impl<'a> Parser<'a> {
                         ));
                     } else if self.eat(T::Semi) {
                         stmts.push(self.mk_stmt(attrs, StmtKind::Expr(e), stmt_start));
-                    } else if self.at(T::RBrace) {
+                    } else if self.at(closer) {
                         tail = Some(Box::new(e));
                         break;
                     } else {
@@ -2099,14 +2181,7 @@ impl<'a> Parser<'a> {
                 self.bump();
             }
         }
-        self.expect(T::RBrace);
-        self.depth = saved;
-        Block {
-            id,
-            stmts,
-            tail,
-            span: start.to(self.prev_span()),
-        }
+        (stmts, tail)
     }
 
     fn mk_stmt(&mut self, attrs: Vec<Attr>, kind: StmtKind, start: Span) -> Stmt {
@@ -3680,6 +3755,52 @@ mod tests {
 
     /// Parse `src` as a module through the driver's entry point; return the error codes and the
     /// lint codes separately.
+    /// A bare statement list (a REPL input) parses like a block body without its braces: the
+    /// statements, a tail when the input ends in an expression with no `;`, node ids from the
+    /// given watermark, the block's lints, and a `}` that closes nothing reported (`E0202`) and
+    /// skipped.
+    #[test]
+    fn statement_lists_parse_to_the_end_of_input() {
+        let parse = |src: &str| {
+            let mut i = Interner::new();
+            let (tokens, lexed) = wukong_lexer::tokenize(src, SourceId(0));
+            assert!(lexed.is_empty(), "{lexed:?}");
+            parse_stmts_tokens_with_lints(&tokens, src, &mut i, 100)
+        };
+        let out = parse("let x = 1;\nx + 2");
+        assert!(out.diags.is_empty(), "{:?}", out.diags);
+        assert_eq!(out.block.stmts.len(), 1);
+        assert!(matches!(
+            out.block.tail.as_deref().map(|e| &e.kind),
+            Some(ExprKind::Binary { .. })
+        ));
+        assert!(out.block.id.0 >= 100 && out.next_node > out.block.id.0);
+        // A `;` makes the last expression a statement; a block-like one needs none.
+        let out = parse("print(1);\nfor i in 0..2 { print(i); }");
+        assert!(out.diags.is_empty() && out.block.tail.is_none());
+        assert_eq!(out.block.stmts.len(), 2);
+        // `return` and `break` with nothing after them end at the end of input.
+        let out = parse("return");
+        assert!(out.diags.is_empty(), "{:?}", out.diags);
+        assert!(matches!(out.block.stmts[0].kind, StmtKind::Return(None)));
+        // The block's lints come back: a `let` missing its `;` before another statement.
+        let out = parse("let a = 3\nprint(a)");
+        assert!(out.diags.is_empty());
+        assert_eq!(
+            out.lints.iter().filter_map(|d| d.code).collect::<Vec<_>>(),
+            ["W0030"]
+        );
+        // A stray `}` is an error, and the statements on both sides of it still parse.
+        let out = parse("let a = 1;\n}\nlet b = 2;\na + b");
+        let codes: Vec<_> = out.diags.iter().filter_map(|d| d.code).collect();
+        assert_eq!(codes, ["E0202"], "{:?}", out.diags);
+        assert_eq!(out.block.stmts.len(), 2);
+        assert!(out.block.tail.is_some());
+        // An empty input is an empty block.
+        let out = parse("");
+        assert!(out.diags.is_empty() && out.block.stmts.is_empty() && out.block.tail.is_none());
+    }
+
     fn lint_codes(src: &str) -> (Vec<&'static str>, Vec<&'static str>) {
         let mut i = Interner::new();
         let (tokens, lexed) = wukong_lexer::tokenize(src, SourceId(0));

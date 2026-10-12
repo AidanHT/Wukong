@@ -11,8 +11,6 @@
 //! canonical `u8` slot value a `read_u8` would decode (`ml_io::decode_elem`), and a string or a
 //! buffer is read back out of slots the way `print_str` reads them.
 
-use std::io::Write;
-
 use wukong_runtime::fileio::DT_U8;
 use wukong_runtime::fmt::{self, Spec, TARGET_BUFFER, TARGET_STDERR};
 use wukong_runtime::process;
@@ -134,7 +132,9 @@ impl Interp<'_, '_> {
         let pos = int(args, 3);
         if target != TARGET_BUFFER {
             if target == TARGET_STDERR {
-                let _ = std::io::stderr().lock().write_all(bytes);
+                // The runtime's own stream writer, which a linked executable and the JIT use too
+                // (and which honours a capture: `fmt::begin_stderr_capture`).
+                fmt::write_stream(TARGET_STDERR, bytes);
             } else {
                 self.emit_stdout(bytes);
             }

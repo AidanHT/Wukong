@@ -151,11 +151,41 @@ pub unsafe fn write_buffer(buf: *mut u8, cap: i64, pos: i64, bytes: &[u8]) -> i6
     w.end
 }
 
+/// A program's standard error, collected rather than written while it is `Some`: see
+/// [`begin_stderr_capture`].
+static STDERR_CAPTURE: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
+
+/// From now until [`end_stderr_capture`], collect what programs write to standard error (through
+/// [`write_stream`], which the interpreter and the JIT both write it with) instead of writing it.
+/// The run's standard output is already captured by the run APIs; `wukongc --repl` captures this
+/// stream too, because a session replays earlier inputs and shows only the current input's part.
+pub fn begin_stderr_capture() {
+    *STDERR_CAPTURE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
+}
+
+/// Stop capturing standard error ([`begin_stderr_capture`]) and return what was collected.
+pub fn end_stderr_capture() -> Vec<u8> {
+    STDERR_CAPTURE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .unwrap_or_default()
+}
+
 /// Write `bytes` to the process's standard error ([`TARGET_STDERR`]) or standard output (any other
 /// stream target) — the streams of a linked executable. A write error is ignored, as a failed
-/// `print` is everywhere else.
+/// `print` is everywhere else. Standard error goes to the capture buffer instead while one is open
+/// ([`begin_stderr_capture`]).
 pub fn write_stream(target: i64, bytes: &[u8]) {
     if target == TARGET_STDERR {
+        if let Some(captured) = STDERR_CAPTURE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            captured.extend_from_slice(bytes);
+            return;
+        }
         let _ = std::io::stderr().lock().write_all(bytes);
     } else {
         flush_stdout_at_exit();
@@ -838,6 +868,20 @@ pub unsafe extern "C" fn wukong_rt_fmt_slice(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// While a capture is open, standard error written through `write_stream` (and `emit`) is
+    /// collected in order instead of written; closing it returns the bytes, and a second close
+    /// returns nothing.
+    #[test]
+    fn stderr_capture_collects_what_a_program_writes() {
+        begin_stderr_capture();
+        write_stream(TARGET_STDERR, b"first ");
+        // SAFETY: a stream target touches no buffer.
+        let end = unsafe { emit(TARGET_STDERR, std::ptr::null_mut(), 0, 5, b"second") };
+        assert_eq!(end, 11);
+        assert_eq!(end_stderr_capture(), b"first second");
+        assert!(end_stderr_capture().is_empty());
+    }
 
     fn int(x: i64, spec: Spec) -> String {
         let mut out = Vec::new();
