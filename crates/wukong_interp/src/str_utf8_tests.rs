@@ -128,6 +128,61 @@ fn boundary_bytes_at_three_and_four_bytes_match_std() {
 }
 
 #[test]
+fn decoding_at_every_index_of_a_longer_string_matches_the_whole_string() {
+    // The interpreter's decode reads only the four bytes from `i` (a step never looks further), so
+    // it must agree with `utf8::decode_at` over the WHOLE string at every index, including
+    // continuation bytes and the incomplete sequences at the end, for strings longer than the
+    // window. The fragments are well-formed 1- to 4-byte characters, truncated and ill-formed
+    // sequences, a surrogate, and lone continuation and lead bytes; every ordered triple of them
+    // is a string of 3 to 12 bytes.
+    const FRAGMENTS: &[&[u8]] = &[
+        b"a",
+        &[0xC3, 0xA9],
+        &[0xE2, 0x82, 0xAC],
+        &[0xF0, 0x9F, 0x98, 0x80],
+        &[0xF0, 0x9F, 0x98],
+        &[0xE2, 0x82],
+        &[0xC3],
+        &[0xED, 0xA0, 0x80],
+        &[0x80],
+        &[0xFF],
+    ];
+    let program = Program::new();
+    let interner = Interner::new();
+    let mut interp = interpreter(&program, &interner);
+    for a in FRAGMENTS {
+        for b in FRAGMENTS {
+            for c in FRAGMENTS {
+                let bytes: Vec<u8> = [*a, *b, *c].concat();
+                let n = bytes.len() as i128;
+                for sign_extended in [true, false] {
+                    let base = place(&mut interp, &bytes, sign_extended);
+                    for i in 0..bytes.len() {
+                        let (cp, w) = utf8::decode_at(&bytes, i);
+                        let got = interp.call_intrinsic(
+                            Intrinsic::RtUtf8Decode,
+                            &[P(base), I(n), I(i as i128)],
+                        );
+                        assert_eq!(
+                            got,
+                            Ok(I(i128::from(utf8::pack_char(cp, w)))),
+                            "decode {bytes:02X?} at {i} (sign-extended: {sign_extended})"
+                        );
+                    }
+                    // Past either end: U+FFFD of width 1, as natively.
+                    for i in [-1, n, n + 7] {
+                        let got =
+                            interp.call_intrinsic(Intrinsic::RtUtf8Decode, &[P(base), I(n), I(i)]);
+                        let want = utf8::pack_char(utf8::REPLACEMENT, 1);
+                        assert_eq!(got, Ok(I(i128::from(want))), "{bytes:02X?} at {i}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn a_null_or_empty_operand_is_valid_and_empty() {
     let program = Program::new();
     let interner = Interner::new();

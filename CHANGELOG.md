@@ -30,9 +30,10 @@ All notable changes to Wukong are documented here. The format is loosely based o
 - **Added: UTF-8 decoding.** `for c in s.chars()` yields each character as a `char` (ASCII decoded
   inline, anything else by one runtime call), and `s.char_count()` counts them. Decoding never
   fails: an ill-formed sequence (the bytes a `str` views can be rewritten, there being no borrow
-  checker) is one U+FFFD per maximal subpart, as `String::from_utf8_lossy` decodes it. `.chars()`
-  anywhere but a `for` head is the new `E0425` (`tests/run/str_chars.wk`,
-  `tests/fail/str_chars_value.wk`). The validator and decoder are one implementation,
+  checker) is one U+FFFD per maximal subpart, as `String::from_utf8_lossy` decodes it; the loop is
+  linear on every backend (the interpreter's decode reads the at most four bytes a character
+  spans, not the whole string). `.chars()` anywhere but a `for` head is the new `E0425`
+  (`tests/run/str_chars.wk`, `tests/fail/str_chars_value.wk`). The validator and decoder are one implementation,
   `wukong_runtime::utf8`, tested against `std::str::from_utf8` and `<[u8]>::utf8_chunks` over every
   byte string of up to three bytes, every scalar value, and four-byte strings over the
   well-formedness boundary bytes.

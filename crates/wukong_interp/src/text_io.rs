@@ -84,16 +84,7 @@ impl Interp<'_, '_> {
             I::RtUtf8Count => self
                 .utf8_operand(args)
                 .map(|b| Value::Int(utf8::char_count(&b) as i128)),
-            I::RtUtf8Decode => self.utf8_operand(args).map(|b| {
-                let packed = match usize::try_from(int(args, 2)) {
-                    Ok(i) if i < b.len() => {
-                        let (cp, w) = utf8::decode_at(&b, i);
-                        utf8::pack_char(cp, w)
-                    }
-                    _ => utf8::pack_char(utf8::REPLACEMENT, 1),
-                };
-                Value::Int(i128::from(packed))
-            }),
+            I::RtUtf8Decode => self.text_utf8_decode(args),
             _ => return None,
         })
     }
@@ -191,30 +182,68 @@ impl Interp<'_, '_> {
     /// `n` bytes of the string at slot `base` (the call's operand `k`), or up to its NUL when
     /// `n < 0`. An explicit length must stay inside the string's allocation.
     fn text_read_bytes(&self, k: usize, base: usize, n: i64) -> Result<Vec<u8>, String> {
-        let tail = self.memory.get(base..).unwrap_or(&[]);
-        let len = match usize::try_from(n) {
-            Ok(n) if n > tail.len() => return Err("text format: string out of bounds".into()),
-            Ok(n) => {
-                self.slots.live.check("text format", k, base, n)?;
-                n
+        let slots = match usize::try_from(n) {
+            Ok(n) => self.text_slots(k, base, n)?,
+            Err(_) => {
+                let tail = self.memory.get(base..).unwrap_or(&[]);
+                let len = tail
+                    .iter()
+                    .position(|v| v.as_int() as u8 == 0)
+                    .unwrap_or(tail.len());
+                &tail[..len]
             }
-            Err(_) => tail
-                .iter()
-                .position(|v| v.as_int() as u8 == 0)
-                .unwrap_or(tail.len()),
         };
-        Ok(tail[..len].iter().map(|v| v.as_int() as u8).collect())
+        Ok(slots.iter().map(|v| v.as_int() as u8).collect())
+    }
+
+    /// The `n` byte slots from slot `base` (the call's operand `k`), checked to lie inside the
+    /// string's one allocation, without copying them out.
+    fn text_slots(&self, k: usize, base: usize, n: usize) -> Result<&[Value], String> {
+        let tail = self.memory.get(base..).unwrap_or(&[]);
+        if n > tail.len() {
+            return Err("text format: string out of bounds".into());
+        }
+        self.slots.live.check("text format", k, base, n)?;
+        Ok(&tail[..n])
     }
 
     /// The bytes `(data, len)` a `wukong_rt_utf8_*` entry reads (its operands 0 and 1): none for a
     /// null pointer or a non-positive length, as natively.
     fn utf8_operand(&self, args: &[Value]) -> Result<Vec<u8>, String> {
-        match args.first() {
-            Some(Value::Ptr(p)) if !self.is_null(*p) && int(args, 1) > 0 => {
-                self.text_read_bytes(0, *p, int(args, 1))
-            }
-            _ => Ok(Vec::new()),
+        let slots = self.utf8_slots(args)?;
+        Ok(slots.iter().map(|v| v.as_int() as u8).collect())
+    }
+
+    /// The byte slots of a `wukong_rt_utf8_*` entry's `(data, len)` operands, checked as
+    /// [`Self::utf8_operand`] checks them, without the copy.
+    fn utf8_slots(&self, args: &[Value]) -> Result<&[Value], String> {
+        match (args.first(), usize::try_from(int(args, 1))) {
+            (Some(Value::Ptr(p)), Ok(n)) if !self.is_null(*p) && n > 0 => self.text_slots(0, *p, n),
+            _ => Ok(&[]),
         }
+    }
+
+    /// `wukong_rt_utf8_decode(data, len, i)`: the character at byte `i` of `data[..len]`, packed by
+    /// `utf8::pack_char`, and U+FFFD of width 1 for an `i` outside `0..len`, as natively. The whole
+    /// `(data, len)` extent is checked, but only the window `data[i..i + 4]` (clipped to `len`) is
+    /// read: a decode step never looks past a lead byte's three continuation bytes, so the window
+    /// decodes exactly as the whole string does. `for c in s.chars()` calls this once per
+    /// non-ASCII character, so copying the whole string per call made the loop quadratic here
+    /// while it is linear natively.
+    fn text_utf8_decode(&self, args: &[Value]) -> Result<Value, String> {
+        let slots = self.utf8_slots(args)?;
+        let packed = match usize::try_from(int(args, 2)) {
+            Ok(i) if i < slots.len() => {
+                let window: Vec<u8> = slots[i..slots.len().min(i + 4)]
+                    .iter()
+                    .map(|v| v.as_int() as u8)
+                    .collect();
+                let (cp, w) = utf8::decode_at(&window, 0);
+                utf8::pack_char(cp, w)
+            }
+            _ => utf8::pack_char(utf8::REPLACEMENT, 1),
+        };
+        Ok(Value::Int(i128::from(packed)))
     }
 
     /// `wukong_rt_fmt_str(target, buf, cap, pos, s, n, spec)`.
