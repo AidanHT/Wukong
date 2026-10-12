@@ -177,12 +177,25 @@ impl FnLowerer<'_> {
 }
 
 /// Whether `p` may test the value it matches — `false` only for the forms that match everything
-/// (`_`, a name, `name @ _`), so a slice pattern of those needs no element block.
-fn pattern_tests(p: &Pattern) -> bool {
+/// (`_`, a name, `()`, `name @ _`, and the tuples and structs built only from those), so a slice
+/// pattern of those needs no element block and a variant pattern of those no payload block
+/// (`FnLowerer::pattern_cond`). Conservative: an array pattern always counts, since on a `[]T` it
+/// is a length test whatever it lists. Wildcard-free over `PatKind`, so a new pattern form is a
+/// compile error here rather than a test lowered where nothing guards it.
+pub(crate) fn pattern_tests(p: &Pattern) -> bool {
     match &p.kind {
-        ast::PatKind::Wildcard | ast::PatKind::Ident(_) => false,
+        ast::PatKind::Wildcard | ast::PatKind::Ident(_) | ast::PatKind::Unit => false,
         ast::PatKind::Binding { sub, .. } => pattern_tests(sub),
-        _ => true,
+        ast::PatKind::Tuple(subs) => subs.iter().any(pattern_tests),
+        ast::PatKind::Struct { fields, .. } => fields.iter().any(|f| pattern_tests(&f.pat)),
+        ast::PatKind::Slice { .. }
+        | ast::PatKind::Variant { .. }
+        | ast::PatKind::Or(_)
+        | ast::PatKind::Int { .. }
+        | ast::PatKind::Char(_)
+        | ast::PatKind::Bool(_)
+        | ast::PatKind::Path(_)
+        | ast::PatKind::Range { .. } => true,
     }
 }
 
@@ -280,6 +293,43 @@ mod tests {
             .filter(|b| has(b, |o| matches!(o, Op::Bin(wukong_mir::BinOp::Sub, ..))))
             .count();
         assert_eq!(subs, 1, "one `len - listed`");
+    }
+
+    /// A `[]T` array pattern inside a variant's payload reads the fat pointer, its length and the
+    /// element behind it only once the discriminant said the value IS that variant: for any other
+    /// variant those payload bytes are its own fields (`V::P(4096, 3)` read as `data = 4096`,
+    /// `len = 3`). The discriminant is tested in the entry block; nothing of the slice is.
+    #[test]
+    fn a_payload_slice_is_read_only_after_its_discriminant_matched() {
+        for arm in [
+            "V::L([7, ..]) => 1",
+            "V::L([7, ..]) | V::P(0, _) => 1",
+            "V::L([x, 7]) | V::P(_, x) => x as i32",
+        ] {
+            let (p, i) = lowered(&format!(
+                "enum V {{ L([]i64), P(i64, i64) }}
+                 fn f(v: V) -> i32 {{ return match v {{ {arm}, _ => 0 }}; }}
+                 fn main() -> i32 {{ return 0; }}"
+            ));
+            let f = func(&p, &i, "f");
+            let entry = &f.blocks[0];
+            assert!(
+                has(entry, |o| matches!(o, Op::Load(_, MirType::I32))),
+                "{arm}: the discriminant is tested first"
+            );
+            assert!(
+                !has(entry, |o| matches!(o, Op::Load(_, MirType::Ptr))),
+                "{arm}: the payload's data pointer is read before the discriminant is known"
+            );
+            assert!(
+                !has(entry, |o| matches!(o, Op::Load(_, MirType::I64))),
+                "{arm}: a payload field is read before the discriminant is known"
+            );
+            assert!(f
+                .blocks
+                .iter()
+                .any(|b| has(b, |o| matches!(o, Op::Load(_, MirType::Ptr)))));
+        }
     }
 
     /// `rest @ ..` of an array is the address of its first unlisted element, typed as the

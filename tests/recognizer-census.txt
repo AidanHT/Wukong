@@ -519,6 +519,7 @@ uninit_zero.wk:
 unroll_jam_nests.wk:
 unsigned.wk:
 unsigned_print.wk:
+variant_payload_slice_pattern.wk:
 vec256_general.wk: veckernel*1 wukong_velem_f32 wukong_velem_f32*2
 vec256_lane_types.wk: veckernel*2
 vec256_runtime_streams.wk: veckernel*3 wukong_rt_alloc wukong_rt_alloc*6 wukong_rt_free wukong_rt_free*6

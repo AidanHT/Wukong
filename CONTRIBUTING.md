@@ -345,7 +345,10 @@ patterns existed, harmlessly while every place was in bounds whatever the value)
 slice's end on the interpreter and faults natively. `emit_match_arm_test` binds on the test's
 success edge and leaves the builder where the body starts, which binding itself may have moved (an
 or-pattern's alternatives branch); a pattern test that needs a place to exist (a slice's elements)
-must likewise test in a block only the guarding test reaches, not AND an eager load into it.
+must likewise test in a block only the guarding test reaches, not AND an eager load into it. A
+variant pattern's payload is such a place: `pattern_cond` tests it only once the discriminant
+matched, because for any other variant those bytes are that variant's fields (`V::L([7, ..])`
+against `V::P(4096, 3)` read `4096` as L's data pointer and loaded through it).
 
 **A new `ExprKind` variant is a sweep the compiler drives.** Every expression walker of the front
 end is an exhaustive `match` (28 of them when closures landed, across `wukong_ast`, the driver's

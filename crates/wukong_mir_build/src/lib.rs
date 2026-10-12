@@ -22055,7 +22055,18 @@ impl FnLowerer<'_> {
                 Some(self.enum_disc_eq(scrut, scrut_mir, disc))
             }
             // `Enum::Variant(a, b)` / `Enum::Variant { f }` — a data-carrying variant pattern: the
-            // discriminant test AND each payload sub-pattern's test (GEPed off the buffer base).
+            // discriminant test, then each payload sub-pattern's test (GEPed off the buffer base)
+            // in a block only a matching discriminant reaches.
+            //
+            // The payload's fields exist only for its own variant: for any other, those bytes are
+            // that variant's fields. ANDing the payload tests into the discriminant test ran them
+            // regardless, which was harmless while every such test only loaded and compared a
+            // scalar inside the buffer, and not once a `[]T` array pattern could sit in the payload:
+            // `V::L([7, ..])` against `V::P(4096, 3)` read P's two `i64`s as L's fat pointer,
+            // passed the length test (`3 >= 1`) and loaded an `i32` from address 4096 — an access
+            // violation natively, a trap on the interpreter. A nested variant, an or-pattern's
+            // alternative, an or-binding's re-test and an `if let` chain's `let` all test through
+            // here, so they are guarded too.
             ast::PatKind::Variant { path, fields } => {
                 let Some(disc) = self.enum_path_value(path) else {
                     self.unsupported(span, "enum-variant pattern");
@@ -22064,15 +22075,36 @@ impl FnLowerer<'_> {
                             .build(MirType::I1, Op::ConstInt(0, MirType::I1)),
                     );
                 };
-                let mut cond = self.enum_disc_eq(scrut, scrut_mir, disc);
+                let disc_ok = self.enum_disc_eq(scrut, scrut_mir, disc);
+                let subs: Vec<&Pattern> = match fields {
+                    VariantPat::Tuple(subs) => subs.iter().collect(),
+                    VariantPat::Struct(fps) => fps.iter().map(|fp| &fp.pat).collect(),
+                };
+                if !subs.into_iter().any(slice_pat::pattern_tests) {
+                    return Some(disc_ok);
+                }
                 let enum_sym = path.segments[0].sym;
                 let vname = path.segments.last().unwrap().sym;
-                if let Some(fc) = self.variant_pattern_cond(scrut, enum_sym, vname, fields, span) {
-                    cond = self
-                        .builder
-                        .build(MirType::I1, Op::Bin(BinOp::And, cond, fc));
-                }
-                Some(cond)
+                let payload_bb = self.builder.new_block();
+                let join = self.builder.new_block();
+                let result = self.builder.block_param(join, MirType::I1);
+                let no = self
+                    .builder
+                    .build(MirType::I1, Op::ConstInt(0, MirType::I1));
+                self.builder
+                    .cond_br(disc_ok, payload_bb, vec![], join, vec![no]);
+                self.builder.switch_to(payload_bb);
+                self.terminated = false;
+                let fc = self
+                    .variant_pattern_cond(scrut, enum_sym, vname, fields, span)
+                    .unwrap_or_else(|| {
+                        self.builder
+                            .build(MirType::I1, Op::ConstInt(1, MirType::I1))
+                    });
+                self.builder.br(join, vec![fc]);
+                self.builder.switch_to(join);
+                self.terminated = false;
+                Some(result)
             }
             // A range pattern `lo..hi` / `lo..=hi`: `lo <= scrut` AND `scrut < hi` (or `<= hi`),
             // with the comparison signedness taken from the scrutinee's type.

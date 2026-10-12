@@ -46,6 +46,13 @@ All notable changes to Wukong are documented here. The format is loosely based o
   a slice, `[a, b]` against a one-element slice would load past its end and `[x, ..]` against an
   empty one through a null data pointer. Bindings now sit on the test's success edge, before the
   guard. The recognizer census is unchanged.
+- **A variant pattern tests its payload only once its discriminant matched.** The payload tests
+  were ANDed into the discriminant test, so they ran for every variant; once a `[]T` array pattern
+  could sit in a payload, `V::L([7, ..])` against `V::P(4096, 3)` read P's two `i64`s as L's fat
+  pointer, passed the length test and loaded from address 4096 (a native access violation, an
+  interpreter trap). They now run in a block only a matching discriminant reaches, which also
+  guards an or-pattern's alternatives, an or-binding's re-tests and an `if let` chain's `let`s
+  (`tests/run/variant_payload_slice_pattern.wk`).
 - **A block arm body ends its arm.** `X => { … }` followed by an arm that opens with `[`, `(` or `-`
   parsed as an index into, a call of or a subtraction from the block, so the two arms needed a comma
   between them (which the formatter always prints); it is now two arms, as in Rust. No `.wk` file in

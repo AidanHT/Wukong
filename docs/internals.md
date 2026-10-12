@@ -260,7 +260,10 @@ matched and a binding never reads a place the test has not proven exists. An arr
 block only a passing length test reaches, joined by an `i1` block parameter — by the elements'
 tests at `data[i]` and `data[len - suffix + j]`; `rest @ ..` binds a fresh fat pointer
 `{ data + prefix, len - listed }` on a slice and the address of element `prefix`, typed
-`[T; N - listed]`, on an array. The usefulness analysis gives a slice column one constructor per
+`[T; N - listed]`, on an array. A data-carrying variant pattern tests its payload the same way, in
+a block only a matching discriminant reaches: another variant's payload bytes are that variant's
+fields, and `V::L([7, ..])` against `V::P(4096, 3)` would read them as a fat pointer and load
+through it. The usefulness analysis gives a slice column one constructor per
 length below `L` and one variable-length constructor for every length `>= L` (rustc's split, `L`
 past every length a row pins down). A name bound inside an or-pattern (`mir_build::or_pat`) is bound
 after the arm's test like any other, so some alternative is known to match: the alternatives before
