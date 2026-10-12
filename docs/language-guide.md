@@ -2648,14 +2648,20 @@ written to `<stem>.<ext>` (the `-o` path with its extension replaced) and a `wro
 to stderr for each: `.tokens`, `.ast`, `.mir-high`, `.mir-low` for `mir`, `.mir` for `mir-text` (the
 form a `.mir` input is read back as), `.grad`, `.ll` for `llvm-ir`, `.o` for `obj`, and the host's
 executable extension for `exe` (`.exe` on Windows, none on unix). `--depfile` names every file
-written as the rule's targets. Without `exe`, each artifact of a list is byte-for-byte what that
+written as the rule's targets. The list's last stage decides what is compiled. Without `exe`, and
+without `--grad-of` on a list that ends in `obj`, each artifact of a list is byte-for-byte what that
 stage prints alone. With `exe` the compile is the executable's: like `--emit=exe` it keeps only what
 `main` reaches, so the `mir`, `mir-text` and `llvm-ir` it also emits show exactly the program the
-executable was linked from. A stage that fails stops the compile, after the artifacts before it.
+executable was linked from. With `obj` and `--grad-of=<fn>` the compile is the gradient export's,
+like `--emit=obj --grad-of=<fn>`: its `mir-high` shows the lowering autodiff takes, and its `mir`,
+`mir-text` and `llvm-ir` show the program the object is built from — at least `-O1`, with the
+generated `<fn>_grad` — which no stage prints alone (a lone `--emit=mir` ignores `--grad-of`). A
+stage that fails stops the compile, after the artifacts before it.
 
 Refused, as usage errors (exit 2): an unknown or empty element, a stage named twice (`mir,mir-low`
-included), `check` or `grad` with any stage but `tokens`/`ast` (`check` stops before lowering; a
-gradient compile is its own pipeline — at least `-O1`, autodiff lowering, no pruning), `obj` with
+included), `check` or `grad` with any stage but `tokens`/`ast` (`check` stops before lowering;
+`--emit=grad` is a pipeline of its own — at least `-O1`, autodiff lowering, no pruning — that ends
+where it prints the backward MIR, before any MIR or IR stage prints), `obj` with
 `exe` (a library object exports every function under its source name, an executable keeps what
 `main` reaches, mangled: two builds), and a list with `--train`. A `.mir` input takes `mir`,
 `mir-text` or both.

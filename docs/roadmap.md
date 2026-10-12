@@ -951,9 +951,11 @@ line table built from them is not emitted yet.
   only what `main` reaches; `-O0` native code is built at Cranelift `opt_level=none`, and the JIT
   compiles functions in parallel. `--emit=a,b,..` emits several artifacts from one compile, in
   pipeline order — on stdout under `==> <stage> <==` headers, or each at `<stem>.<ext>` with
-  `-o <stem>` (a `--depfile` rule then names every file written); without `exe` every artifact is
-  byte-identical to its stage alone, and with `exe` the MIR/IR shown is the pruned program the
-  executable links. Not yet: per-function timing in the trace, or a parallel optimizer.
+  `-o <stem>` (a `--depfile` rule then names every file written). The last stage decides the
+  compile: without `exe` (and without `--grad-of` on a list ending in `obj`) every artifact is
+  byte-identical to its stage alone; with `exe` the MIR/IR shown is the pruned program the
+  executable links, and with `obj` and `--grad-of` the gradient export (`<fn>_grad` appended, at
+  least `-O1`) the object is built from. Not yet: per-function timing in the trace, or a parallel optimizer.
 - Optimizer debugging from the command line: `--passes=<list>` runs any list of the optimizer's
   function passes and program steps, and `--print-after=<pass|all>` prints the MIR after each run of
   a pass. Each `-O` level is such a list, held byte-identical to `optimize` by a driver test. Sharp

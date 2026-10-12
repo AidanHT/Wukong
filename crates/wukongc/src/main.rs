@@ -44,9 +44,10 @@ OPTIONS:
                        <stem>.<ext> instead: .tokens, .ast, .mir-high, .mir-low (mir), .mir
                        (mir-text), .grad, .ll (llvm-ir), .o (obj), the host's executable
                        extension (exe). obj or exe in a list needs -o; check and grad combine
-                       only with tokens/ast; obj not with exe. With exe in the list the compile
-                       is the executable's: mir/mir-text/llvm-ir show the program pruned to
-                       what main reaches
+                       only with tokens/ast; obj not with exe. The last stage decides the
+                       compile: with exe, mir/mir-text/llvm-ir show the program pruned to what
+                       main reaches; with obj and --grad-of, the gradient export (<fn>_grad
+                       included, at least -O1)
     --grad-of=<fn>     Function to differentiate for --emit=grad / --train  (default: loss).
                        With --emit=obj, the object also exports the gradient as <fn>_grad
     --grad-wrt=<i,..>  Comma-separated parameter indices to differentiate w.r.t. (default: all

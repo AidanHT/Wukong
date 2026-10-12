@@ -12,11 +12,14 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `==> <stage> <==` header line; with `-o <stem>` every artifact goes to `<stem>.<ext>` (`.tokens`,
   `.ast`, `.mir-high`, `.mir-low` for `mir`, `.mir` for `mir-text` — the form a `.mir` input reads
   back — `.grad`, `.ll`, `.o`, and the host's executable extension) with a `wrote <file>` note each,
-  and a `--depfile` rule names every file written. Without `exe` each artifact is byte-identical to
-  its stage alone (`crates/wukongc/tests/emit.rs`: six text stages, four programs, `-O0`/`-O2`, and
+  and a `--depfile` rule names every file written. The last stage decides what is compiled: without
+  `exe` (and without `--grad-of` on a list ending in `obj`) each artifact is byte-identical to its
+  stage alone (`crates/wukongc/tests/emit.rs`: six text stages, four programs, `-O0`/`-O2`, and
   an object identical to `--emit=obj`'s); with `exe` the compile is the executable's, so the MIR/IR
   shown is the program pruned to what `main` reaches, the one the executable links
-  (`tests/exe.rs`). Usage errors (exit 2): an unknown, empty or repeated stage, `check` or `grad`
+  (`tests/exe.rs`); with `obj` and `--grad-of=<fn>` it is the gradient export's, so the MIR/IR
+  shown is the program the object is built from — autodiff lowering, at least `-O1`, `<fn>_grad`
+  appended — which a lone `--emit=mir` (it ignores `--grad-of`) does not show (`emit.rs`). Usage errors (exit 2): an unknown, empty or repeated stage, `check` or `grad`
   with any stage but `tokens`/`ast`, `obj` with `exe`, `obj`/`exe` in a list without `-o`, and a
   list with `--train`. A single `--emit=<stage>` is unchanged, `-o` still names only an object or
   an executable there, and a `.mir` input now also takes `--emit=mir,mir-text`. The `--time-passes`

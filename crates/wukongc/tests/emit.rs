@@ -264,6 +264,76 @@ fn multi_artifact_emit_writes_every_artifact_at_the_stem() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A list that ends in `obj` with `--grad-of=<fn>` is the gradient export's compile, as `exe` makes
+/// a list the executable's: its object is `--emit=obj --grad-of`'s, byte for byte, and the MIR and
+/// IR it also writes are the program that object is built from — the generated `<fn>_grad`
+/// included — not what `--emit=mir` prints alone (a lone `mir` or `llvm-ir` ignores `--grad-of`).
+#[test]
+fn multi_artifact_emit_ending_in_a_gradient_export_shows_that_compile() {
+    let dir = std::env::temp_dir().join(format!("wukong-emit-grad-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let program = dir.join("cubic.wk");
+    std::fs::write(
+        &program,
+        "fn loss(x: [f32; 1], mut out: [f32; 1]) -> f32 {\n    let a: f32 = x[0];\n    \
+         let l: f32 = a * a * a;\n    out[0] = l;\n    return l;\n}\n",
+    )
+    .unwrap();
+    // Autodiff refuses to run with kernel recognition off; this test is about the artifacts.
+    let wukongc = |args: &[&std::ffi::OsStr]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_wukongc"))
+            .env_remove(wukong_driver::NO_RECOGNIZE_ENV)
+            .args(args)
+            .output()
+            .expect("spawn wukongc");
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let stem = dir.join("k");
+    wukongc(&[
+        "--emit=mir,llvm-ir,obj".as_ref(),
+        "--grad-of=loss".as_ref(),
+        "-O0".as_ref(),
+        "-o".as_ref(),
+        stem.as_os_str(),
+        program.as_os_str(),
+    ]);
+    let mir = std::fs::read_to_string(stem.with_extension("mir-low")).unwrap();
+    let ll = std::fs::read_to_string(stem.with_extension("ll")).unwrap();
+    assert!(mir.contains("fn loss_grad("), "{mir}");
+    assert!(ll.contains("@loss_grad("), "{ll}");
+    let single = dir.join("single.o");
+    wukongc(&[
+        "--emit=obj".as_ref(),
+        "--grad-of=loss".as_ref(),
+        "-O0".as_ref(),
+        "-o".as_ref(),
+        single.as_os_str(),
+        program.as_os_str(),
+    ]);
+    assert_eq!(
+        std::fs::read(stem.with_extension("o")).unwrap(),
+        std::fs::read(&single).unwrap(),
+        "the list's object is --emit=obj --grad-of's object"
+    );
+    for stage in ["mir", "llvm-ir"] {
+        let single = format!("--emit={stage}");
+        let alone = wukongc(&[
+            single.as_ref(),
+            "--grad-of=loss".as_ref(),
+            "-O0".as_ref(),
+            program.as_os_str(),
+        ]);
+        assert!(!alone.contains("loss_grad"), "{single} --grad-of: {alone}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `docs/llvm-setup.md` shows the module `--emit=llvm-ir -O2 examples/fib.wk` prints, for readers
 /// to compile by hand; it must be exactly what the compiler emits. The `target` lines name the
 /// host, so they are compared only for shape.

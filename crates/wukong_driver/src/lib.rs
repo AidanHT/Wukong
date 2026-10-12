@@ -154,11 +154,14 @@ impl EmitStage {
     ///
     /// A list is refused where no single compile could honour it: an unknown or empty element, a
     /// stage named twice (an alias included: `mir,mir-low`), `check` or `grad` with any stage but
-    /// `tokens`/`ast` (`check` stops before lowering; a gradient compile is its own pipeline —
-    /// forced `-O1`, autodiff lowering, no pruning), and `obj` with `exe` (a library object exports
-    /// every function under its source name, an executable keeps what `main` reaches, mangled:
-    /// two different builds). `tokens` and `ast` dump the root file before anything else runs, so
-    /// they combine with every stage.
+    /// `tokens`/`ast` (`check` stops before lowering; `grad` is a pipeline of its own — at least
+    /// `-O1`, autodiff lowering, no pruning — that ends where it prints the backward MIR, before
+    /// any MIR or IR stage prints), and `obj` with `exe` (a library object exports every function
+    /// under its source name, an executable keeps what `main` reaches, mangled: two different
+    /// builds). `tokens` and `ast` dump the root file before anything else runs, so they combine
+    /// with every stage. The last stage decides what is compiled, so a list ending in `exe` shows
+    /// the pruned executable's MIR and IR, and one ending in `obj` with `--grad-of` the gradient
+    /// export's (`<fn>_grad` appended) — neither is what that stage prints alone.
     pub fn parse_list(list: &str) -> Result<(EmitStage, Vec<EmitStage>), String> {
         let mut stages: Vec<EmitStage> = Vec::new();
         for part in list.split(',') {
@@ -190,8 +193,8 @@ impl EmitStage {
                     if lone == EmitStage::Check {
                         "it stops before lowering, so no later stage runs"
                     } else {
-                        "a gradient compile is its own pipeline (at least -O1, autodiff lowering, \
-                         no pruning), not the one the other stages describe"
+                        "a gradient compile (at least -O1, autodiff lowering, no pruning) ends \
+                         where it prints the backward MIR, before any MIR or IR stage prints"
                     }
                 ));
             }

@@ -331,13 +331,20 @@ splits it into `Options::emit`, the stage the compile runs to (the last), and `O
 the stages emitted on the way. `compile` is unchanged for a single stage: every stage stop asks
 `opts.emits(stage)` and returns only when the stage is `emit` (or failed), and everything that
 decides *what* is compiled — the autodiff lowering, pruning to `main`, `lint_options_for`'s library
-roots, `native_reachable`, the object kind — still keys on `emit`. That is why `check` and `grad`
-combine only with `tokens`/`ast` (no later stage runs after `check`; a gradient compile lowers,
-optimizes and roots differently) and why `obj` and `exe` exclude each other (library object vs
-pruned, mangled executable): any other list is one compile whose every artifact, without `exe`, is
-byte-identical to that stage alone (`crates/wukongc/tests/emit.rs` checks all six text stages on
-four programs at `-O0` and `-O2`). With `exe` the compile is the executable's, so the MIR and IR it
-also emits are the pruned program it links. Artifacts leave through one function, `put_artifact`:
+roots, `native_reachable`, the object kind, `exports_gradient` — still keys on `emit`, so the
+list's last stage decides what is compiled. That is why `check` and `grad` combine only with
+`tokens`/`ast` (no later stage runs after `check`; `--emit=grad` returns from `compile` where
+`emit_grad` prints the backward MIR, before the MIR and IR stages print) and why `obj` and `exe`
+exclude each other (library object vs pruned, mangled executable): any other list is one compile
+whose every artifact, without `exe` and without `--grad-of` on an `obj` list, is byte-identical to
+that stage alone (`crates/wukongc/tests/emit.rs` checks all six text stages on four programs at
+`-O0` and `-O2`). With `exe` the compile is the executable's, so the MIR and IR it also emits are
+the pruned program it links. With `obj` and `--grad-of` it is the gradient export's
+(`exports_gradient`): `unroll_for_autodiff` lowering (so `mir-high` differs too), at least `-O1`
+with `OptimizeOptions::AUTODIFF_INPUT`, and `append_gradient`'s `<fn>_grad` in the `mir`,
+`mir-text` and `llvm-ir` — the program the object is built from, which a lone `--emit=mir`
+(it ignores `--grad-of`) does not show (`emit.rs` pins the object against `--emit=obj --grad-of`'s
+and the gradient in the MIR and IR). Artifacts leave through one function, `put_artifact`:
 stdout for a single stage (byte-for-byte the old path), stdout under a `==> <stage> <==` header for
 a list, or `Options::artifact_path` — `-o`'s path with the stage's `EmitStage::extension` — for a
 list with `-o`; the object and executable reach `emit_native` through a clone of the options whose
