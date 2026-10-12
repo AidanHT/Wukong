@@ -85,6 +85,7 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `N` from the function too (first binding wins, every other argument checked against it), and a
   dimension named only by the function parameter is passed to the instance as a hidden dimension
   argument (`tests/run/closure_infer.wk`).
+
 ### `@parallel` regions over slices, run-time trip counts and kernel builtins (`gap6/outliner-slices-kernels`)
 
 - **A `@parallel` loop region may capture `[]T` slices (N85).** The mid-function region outliner used
