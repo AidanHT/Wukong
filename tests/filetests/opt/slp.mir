@@ -1,0 +1,94 @@
+; RUN: wukongc --emit=mir --passes=slp %s | filecheck %s
+;
+; Straight-line SLP (`slp`) packs W = 16 / 4 = 4 stores of f32 to consecutive elements of one
+; object, whose values are one lane-wise operation tree, into one 128-bit vector store; its
+; cleanup sweep then removes the scalar code the packed tree replaced. Lanes that do different
+; operations are not one tree and stay scalar.
+
+; z[k] = x[k] + y[k] for k = 0..3, written out: one <4 x f32> load per operand, one fadd, one
+; store.
+; CHECK-LABEL: fn add4(
+; CHECK-NEXT:    bb0(
+; CHECK-NEXT:    [[X:v[0-9]+]] = load <4 x f32> v0
+; CHECK-NEXT:    [[Y:v[0-9]+]] = load <4 x f32> v1
+; CHECK-NEXT:    [[S:v[0-9]+]] = fadd [[X]], [[Y]]
+; CHECK-NEXT:    store [[S]], v2
+; CHECK-NEXT:    ret
+fn add4(v0 ptr noalias, v1 ptr noalias, v2 ptr noalias) -> void {
+  bb0(v0 ptr, v1 ptr, v2 ptr):
+    v3: i64 = const.i64 0
+    v4: ptr = gep v0, v3 : f32
+    v5: f32 = load f32 v4
+    v6: ptr = gep v1, v3 : f32
+    v7: f32 = load f32 v6
+    v8: f32 = fadd v5, v7
+    v9: ptr = gep v2, v3 : f32
+    store v8, v9
+    v10: i64 = const.i64 1
+    v11: ptr = gep v0, v10 : f32
+    v12: f32 = load f32 v11
+    v13: ptr = gep v1, v10 : f32
+    v14: f32 = load f32 v13
+    v15: f32 = fadd v12, v14
+    v16: ptr = gep v2, v10 : f32
+    store v15, v16
+    v17: i64 = const.i64 2
+    v18: ptr = gep v0, v17 : f32
+    v19: f32 = load f32 v18
+    v20: ptr = gep v1, v17 : f32
+    v21: f32 = load f32 v20
+    v22: f32 = fadd v19, v21
+    v23: ptr = gep v2, v17 : f32
+    store v22, v23
+    v24: i64 = const.i64 3
+    v25: ptr = gep v0, v24 : f32
+    v26: f32 = load f32 v25
+    v27: ptr = gep v1, v24 : f32
+    v28: f32 = load f32 v27
+    v29: f32 = fadd v26, v28
+    v30: ptr = gep v2, v24 : f32
+    store v29, v30
+    ret
+}
+
+; The third lane multiplies: no packing.
+; CHECK-LABEL: fn mixed(
+; CHECK-NOT:     <4 x f32>
+; CHECK-COUNT-4: store
+; CHECK-NOT:     <4 x f32>
+fn mixed(v0 ptr noalias, v1 ptr noalias, v2 ptr noalias) -> void {
+  bb0(v0 ptr, v1 ptr, v2 ptr):
+    v3: i64 = const.i64 0
+    v4: ptr = gep v0, v3 : f32
+    v5: f32 = load f32 v4
+    v6: ptr = gep v1, v3 : f32
+    v7: f32 = load f32 v6
+    v8: f32 = fadd v5, v7
+    v9: ptr = gep v2, v3 : f32
+    store v8, v9
+    v10: i64 = const.i64 1
+    v11: ptr = gep v0, v10 : f32
+    v12: f32 = load f32 v11
+    v13: ptr = gep v1, v10 : f32
+    v14: f32 = load f32 v13
+    v15: f32 = fadd v12, v14
+    v16: ptr = gep v2, v10 : f32
+    store v15, v16
+    v17: i64 = const.i64 2
+    v18: ptr = gep v0, v17 : f32
+    v19: f32 = load f32 v18
+    v20: ptr = gep v1, v17 : f32
+    v21: f32 = load f32 v20
+    v22: f32 = fmul v19, v21
+    v23: ptr = gep v2, v17 : f32
+    store v22, v23
+    v24: i64 = const.i64 3
+    v25: ptr = gep v0, v24 : f32
+    v26: f32 = load f32 v25
+    v27: ptr = gep v1, v24 : f32
+    v28: f32 = load f32 v27
+    v29: f32 = fadd v26, v28
+    v30: ptr = gep v2, v24 : f32
+    store v29, v30
+    ret
+}

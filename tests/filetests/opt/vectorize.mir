@@ -1,0 +1,110 @@
+; RUN: wukongc --emit=mir --target-cpu=x86-64-v2 --passes=vectorize %s | filecheck %s
+;
+; The MIR loop vectorizer widens a counted loop into 128-bit vectors (W = 16 / 4 = 4 lanes of f32),
+; keeping the original loop as the scalar epilogue for the leftover iterations. Lane k of a vector
+; iteration does exactly what scalar iteration i + k would. Below x86-64-v3 no 256-bit kernel is
+; built, so this is the vectorizer's own 128-bit form on every host.
+
+; y[i] = x[i] * a + y[i], with x and y `noalias`.
+; CHECK-LABEL: fn axpy(
+; CHECK:         br [[VPRE:bb[0-9]+]](
+; The scalar loop survives, unchanged, as the epilogue.
+; CHECK:       [[SCALAR:bb[0-9]+]]({{v[0-9]+}} i64):
+; CHECK:         load f32
+; CHECK:       [[VPRE]]({{v[0-9]+}} i64):
+; The vector part covers the trip count rounded down to a multiple of 4.
+; CHECK:         const.i64 -4
+; CHECK:         br [[VHEAD:bb[0-9]+]](
+; One vector iteration: four lanes of x and y, the scalar a splatted, the four results stored.
+; CHECK:       [[VHEAD]]([[I:v[0-9]+]] i64):
+; CHECK:         cond_br
+; CHECK:         [[XP:v[0-9]+]] = gep v0, [[I]] : f32
+; CHECK:         [[X:v[0-9]+]] = load <4 x f32> [[XP]]
+; CHECK-DAG:     [[A:v[0-9]+]] = splat v2
+; CHECK-DAG:     [[XA:v[0-9]+]] = fmul [[X]], [[A]]
+; CHECK-DAG:     [[YP:v[0-9]+]] = gep v1, [[I]] : f32
+; CHECK:         [[Y:v[0-9]+]] = load <4 x f32> [[YP]]
+; CHECK:         [[S:v[0-9]+]] = fadd [[XA]], [[Y]]
+; CHECK:         store [[S]], [[YP]]
+; ... and the counter advances by the four lanes.
+; CHECK:         [[FOUR:v[0-9]+]] = const.i64 4
+; CHECK-NEXT:    [[NEXT:v[0-9]+]] = add [[I]], [[FOUR]]
+; CHECK-NEXT:    br [[VHEAD]]([[NEXT]])
+; The vector loop hands its counter to the scalar epilogue.
+; CHECK:         br [[SCALAR]]([[I]])
+fn axpy(v0 ptr noalias, v1 ptr noalias, v2 f32, v3 i64) -> void {
+  bb0(v0 ptr, v1 ptr, v2 f32, v3 i64):
+    v4: i64 = const.i64 0
+    br bb1(v4)
+  bb1(v5 i64):
+    v6: i1 = cmp.slt v5, v3
+    cond_br v6, bb2, bb3
+  bb2:
+    v7: ptr = gep v0, v5 : f32
+    v8: f32 = load f32 v7
+    v9: f32 = fmul v8, v2
+    v10: ptr = gep v1, v5 : f32
+    v11: f32 = load f32 v10
+    v12: f32 = fadd v9, v11
+    store v12, v10
+    v13: i64 = const.i64 1
+    v14: i64 = add v5, v13
+    br bb1(v14)
+  bb3:
+    ret
+}
+
+; Without `noalias` the two ranges are compared at run time (as integers): the vector loop runs
+; only when they are disjoint (or identical, where lane-wise is still exact); otherwise its trip
+; count is zero and the scalar loop does everything.
+; CHECK-LABEL: fn may_alias(
+; CHECK-COUNT-4: ptrtoint
+; CHECK:         cmp.ule
+; CHECK:         cmp.ule
+; CHECK:         select
+; CHECK:         load <4 x f32>
+; CHECK:         store
+fn may_alias(v0 ptr, v1 ptr, v2 f32, v3 i64) -> void {
+  bb0(v0 ptr, v1 ptr, v2 f32, v3 i64):
+    v4: i64 = const.i64 0
+    br bb1(v4)
+  bb1(v5 i64):
+    v6: i1 = cmp.slt v5, v3
+    cond_br v6, bb2, bb3
+  bb2:
+    v7: ptr = gep v0, v5 : f32
+    v8: f32 = load f32 v7
+    v9: f32 = fmul v8, v2
+    v10: ptr = gep v1, v5 : f32
+    store v9, v10
+    v13: i64 = const.i64 1
+    v14: i64 = add v5, v13
+    br bb1(v14)
+  bb3:
+    ret
+}
+
+; x[i + 1] = x[i] + x[i] carries a value from each iteration to the next: no lane may run ahead.
+; CHECK-LABEL: fn recurrence(
+; CHECK-NOT:     <4 x f32>
+; CHECK:         load f32
+; CHECK-NOT:     <4 x f32>
+fn recurrence(v0 ptr, v1 i64) -> void {
+  bb0(v0 ptr, v1 i64):
+    v4: i64 = const.i64 0
+    br bb1(v4)
+  bb1(v5 i64):
+    v6: i1 = cmp.slt v5, v1
+    cond_br v6, bb2, bb3
+  bb2:
+    v7: ptr = gep v0, v5 : f32
+    v8: f32 = load f32 v7
+    v9: f32 = fadd v8, v8
+    v13: i64 = const.i64 1
+    v14: i64 = add v5, v13
+    v10: ptr = gep v0, v14 : f32
+    store v9, v10
+    br bb1(v14)
+  bb3:
+    ret
+}

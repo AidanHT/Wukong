@@ -1,0 +1,67 @@
+; RUN: wukongc --emit=mir --passes=simplify,dce %s | filecheck %s
+;
+; `simplify` folds constants in the width of their type and applies the algebraic identities
+; (x+0, x*1, x|x, x^x) and integer self-comparison folding; `dce` then sweeps what they orphaned,
+; so each function below ends as one constant (or its parameter) and a `ret`.
+
+; 6 * 7 is computed at compile time.
+; CHECK-LABEL: fn product()
+; CHECK-NOT:     mul
+; CHECK:         [[C:v[0-9]+]] = const.i32 42
+; CHECK-NEXT:    ret [[C]]
+fn product() -> i32 {
+  bb0:
+    v0: i32 = const.i32 6
+    v1: i32 = const.i32 7
+    v2: i32 = mul v0, v1
+    ret v2
+}
+
+; ((x + 0) * 1) | itself is x.
+; CHECK-LABEL: fn identities(
+; CHECK-NEXT:    bb0(v0 i32):
+; CHECK-NEXT:    ret v0
+fn identities(v0 i32) -> i32 {
+  bb0(v0 i32):
+    v1: i32 = const.i32 0
+    v2: i32 = add v0, v1
+    v3: i32 = const.i32 1
+    v4: i32 = mul v2, v3
+    v5: i32 = or v4, v4
+    ret v5
+}
+
+; CHECK-LABEL: fn xor_self(
+; CHECK-NOT:     xor
+; CHECK:         [[Z:v[0-9]+]] = const.i64 0
+; CHECK-NEXT:    ret [[Z]]
+fn xor_self(v0 i64) -> i64 {
+  bb0(v0 i64):
+    v1: i64 = xor v0, v0
+    ret v1
+}
+
+; Folding wraps in the result's width: an i8 127 + 1 is -128, not 128.
+; CHECK-LABEL: fn wraps()
+; CHECK:         [[W:v[0-9]+]] = const.i8 -128
+; CHECK-NEXT:    ret [[W]]
+fn wraps() -> i8 {
+  bb0:
+    v0: i8 = const.i8 127
+    v1: i8 = const.i8 1
+    v2: i8 = add v0, v1
+    ret v2
+}
+
+; x <= x is true and x < x is false, whatever x is, so their `and` is false.
+; CHECK-LABEL: fn self_compare(
+; CHECK-NOT:     cmp
+; CHECK:         [[F:v[0-9]+]] = const.i1 0
+; CHECK-NEXT:    ret [[F]]
+fn self_compare(v0 i32) -> i1 {
+  bb0(v0 i32):
+    v1: i1 = cmp.sle v0, v0
+    v2: i1 = cmp.slt v0, v0
+    v3: i1 = and v1, v2
+    ret v3
+}

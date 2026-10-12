@@ -1,0 +1,77 @@
+; RUN: wukongc --emit=mir --passes=unroll %s | filecheck %s
+;
+; Unroll-and-jam (inside the `unroll` step, ahead of the unroller) runs four outer iterations of a
+; two-deep nest side by side when the inner loop carries a serial chain: four row prologues, one
+; shared inner counter with four independent chains in its body, four epilogues, and the outer
+; counter advanced by 4. Each row keeps its own values, so nothing is reassociated. The rows left
+; over (and every row when a guard fails) run in the untouched original nest.
+;
+; Here row r computes h = h * 3 - x[r*64 + t] for t in 0..64 and stores each h to y[r*64 + t]:
+; every row owns its own 64-element slab of x and y, which is what makes the rows independent.
+
+; CHECK-LABEL: fn rows(
+; The jam bound is R - 3, replaced by the smallest i64 when that subtraction would wrap.
+; CHECK:         [[LIM0:v[0-9]+]] = sub v2, v6
+; CHECK-NEXT:    [[NOWRAP:v[0-9]+]] = cmp.slt [[LIM0]], v2
+; CHECK:         [[LIM:v[0-9]+]] = select [[NOWRAP]], [[LIM0]], {{v[0-9]+}}
+; CHECK:       bb1([[R:v[0-9]+]] i64):
+; CHECK-NEXT:    [[GO:v[0-9]+]] = cmp.slt [[R]], [[LIM]]
+; CHECK-NEXT:    cond_br [[GO]], [[JAM:bb[0-9]+]], [[REST:bb[0-9]+]]([[R]])
+; The remainder is the original nest, entered at the first row not yet run.
+; CHECK:       [[REST]]({{v[0-9]+}} i64):
+; CHECK-NEXT:    cmp.slt {{v[0-9]+}}, v2
+; Four row prologues: the slab bases r*64, (r+1)*64, (r+2)*64, (r+3)*64.
+; CHECK:       [[JAM]]:
+; CHECK-COUNT-4: mul {{v[0-9]+}}, v5
+; CHECK:         br [[HEAD:bb[0-9]+]](v4, v4, v4, v4, v3)
+; One shared inner counter, four chains.
+; CHECK:       [[HEAD]]([[H0:v[0-9]+]] i64, [[H1:v[0-9]+]] i64, [[H2:v[0-9]+]] i64, [[H3:v[0-9]+]] i64, [[T:v[0-9]+]] i64):
+; CHECK-NEXT:    cmp.slt [[T]], v5
+; CHECK-NEXT:    cond_br
+; CHECK-NOT:     cond_br
+; CHECK:         mul [[H0]], v6
+; CHECK:         [[N0:v[0-9]+]] = sub
+; CHECK:         mul [[H1]], v6
+; CHECK:         [[N1:v[0-9]+]] = sub
+; CHECK:         mul [[H2]], v6
+; CHECK:         [[N2:v[0-9]+]] = sub
+; CHECK:         mul [[H3]], v6
+; CHECK:         [[N3:v[0-9]+]] = sub
+; CHECK-NOT:     cond_br
+; CHECK:         br [[HEAD]]([[N0]], [[N1]], [[N2]], [[N3]], {{v[0-9]+}})
+; Four rows done: the outer counter moves on by 4.
+; CHECK:         [[FOUR:v[0-9]+]] = const.i64 4
+; CHECK-NEXT:    [[NEXT:v[0-9]+]] = add [[R]], [[FOUR]]
+; CHECK-NEXT:    br bb1([[NEXT]])
+fn rows(v0 ptr noalias, v1 ptr noalias, v2 i64) -> void {
+  bb0(v0 ptr, v1 ptr, v2 i64):
+    v3: i64 = const.i64 0
+    v4: i64 = const.i64 1
+    v5: i64 = const.i64 64
+    v6: i64 = const.i64 3
+    br bb1(v3)
+  bb1(v7 i64):
+    v8: i1 = cmp.slt v7, v2
+    cond_br v8, bb2, bb3
+  bb2:
+    v9: i64 = mul v7, v5
+    br bb4(v4, v3)
+  bb3:
+    ret
+  bb4(v10 i64, v11 i64):
+    v12: i1 = cmp.slt v11, v5
+    cond_br v12, bb5, bb6
+  bb5:
+    v13: i64 = mul v10, v6
+    v14: i64 = add v9, v11
+    v15: ptr = gep v0, v14 : i64
+    v16: i64 = load i64 v15
+    v17: i64 = sub v13, v16
+    v18: ptr = gep v1, v14 : i64
+    store v17, v18
+    v19: i64 = add v11, v4
+    br bb4(v17, v19)
+  bb6:
+    v20: i64 = add v7, v4
+    br bb1(v20)
+}

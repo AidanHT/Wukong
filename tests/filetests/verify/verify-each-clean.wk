@@ -1,0 +1,31 @@
+// RUN: wukongc --emit=mir -O2 --target-cpu=x86-64-v2 --verify-each %s > %t.verified
+// RUN: wukongc --emit=mir -O2 --target-cpu=x86-64-v2 %s > %t.plain
+// RUN: diff %t.verified %t.plain
+// RUN: filecheck %s --input-file=%t.verified
+//
+// --verify-each runs the MIR verifier after every pass and program step of -O2 (inlining, the
+// fixpoint group, unrolling, SLP, switch formation and their cleanup sweeps) and changes nothing:
+// a program that verifies at every boundary compiles to byte-identical MIR. These kernels reach
+// the loop passes, the vectorizer, bounds-check elimination and the unroller (`@generic` keeps
+// the elementwise loop a loop instead of a recognized runtime-kernel call).
+
+// CHECK-LABEL: fn total(
+// CHECK:         <2 x i64>
+// CHECK-LABEL: fn saxpy(
+// CHECK:         <4 x f32>
+fn total(xs: []i64, n: i64) -> i64 {
+    let mut s: i64 = 0;
+    let mut i: i64 = 0;
+    while i < n {
+        s = s + xs[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+@generic
+fn saxpy(x: [f32; 64], mut y: [f32; 64], a: f32) {
+    for i in 0..64 {
+        y[i] = a * x[i] + y[i];
+    }
+}

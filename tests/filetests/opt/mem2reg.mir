@@ -1,0 +1,68 @@
+; RUN: wukongc --emit=mir --passes=mem2reg %s | filecheck %s
+;
+; `mem2reg` promotes scalar stack slots to SSA values: each load becomes the value reaching it, and
+; a join (or a loop header) gets a block parameter fed by the value on each incoming edge.
+
+; The slot holds v0, or v1 when that is larger: the join takes the value from each edge.
+; CHECK-LABEL: fn select_max(
+; CHECK-NOT:     alloca
+; CHECK-NOT:     store
+; CHECK:         cond_br {{v[0-9]+}}, bb1, bb2(v0)
+; CHECK:       bb1:
+; CHECK-NEXT:    br bb2(v1)
+; CHECK:       bb2([[M:v[0-9]+]] i32):
+; CHECK-NOT:     load
+; CHECK-NEXT:    ret [[M]]
+fn select_max(v0 i32, v1 i32) -> i32 {
+  bb0(v0 i32, v1 i32):
+    v2: ptr = alloca i32
+    store v0, v2
+    v3: i1 = cmp.sgt v1, v0
+    cond_br v3, bb1, bb2
+  bb1:
+    store v1, v2
+    br bb2
+  bb2:
+    v4: i32 = load i32 v2
+    ret v4
+}
+
+; A counter and an accumulator in slots become two loop-carried header parameters.
+; CHECK-LABEL: fn count(
+; CHECK-NOT:     alloca
+; CHECK:         [[ZERO:v[0-9]+]] = const.i32 0
+; CHECK-NEXT:    br bb1([[ZERO]], [[ZERO]])
+; CHECK:       bb1([[I:v[0-9]+]] i32, [[ACC:v[0-9]+]] i32):
+; CHECK-NEXT:    cmp.slt [[I]], v0
+; CHECK:       bb2:
+; CHECK-NEXT:    [[NEXT_ACC:v[0-9]+]] = add [[ACC]], [[I]]
+; CHECK:         [[NEXT_I:v[0-9]+]] = add [[I]],
+; CHECK-NEXT:    br bb1([[NEXT_I]], [[NEXT_ACC]])
+; CHECK:       bb3:
+; CHECK-NEXT:    ret [[ACC]]
+; CHECK-NOT:     load
+; CHECK-NOT:     store
+fn count(v0 i32) -> i32 {
+  bb0(v0 i32):
+    v1: ptr = alloca i32
+    v2: ptr = alloca i32
+    v3: i32 = const.i32 0
+    store v3, v1
+    store v3, v2
+    br bb1
+  bb1:
+    v4: i32 = load i32 v1
+    v5: i1 = cmp.slt v4, v0
+    cond_br v5, bb2, bb3
+  bb2:
+    v6: i32 = load i32 v2
+    v7: i32 = add v6, v4
+    store v7, v2
+    v8: i32 = const.i32 1
+    v9: i32 = add v4, v8
+    store v9, v1
+    br bb1
+  bb3:
+    v10: i32 = load i32 v2
+    ret v10
+}

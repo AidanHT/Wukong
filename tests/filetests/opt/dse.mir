@@ -1,0 +1,63 @@
+; RUN: wukongc --emit=mir --passes=dse %s | filecheck %s
+;
+; `dse` deletes a store that nothing can read before the location is written again: overwritten
+; in the same block, overwritten on every path out of its block, or written into a private slot
+; that is never read. A load in between keeps it.
+
+; CHECK-LABEL: fn overwritten(
+; CHECK-NOT:     store v1, v0
+; CHECK:         store v2, v0
+; CHECK-NEXT:    ret
+fn overwritten(v0 ptr, v1 f32, v2 f32) -> void {
+  bb0(v0 ptr, v1 f32, v2 f32):
+    store v1, v0
+    store v2, v0
+    ret
+}
+
+; CHECK-LABEL: fn read_between(
+; CHECK:         store v1, v0
+; CHECK-NEXT:    load f32 v0
+; CHECK-NEXT:    store v2, v0
+fn read_between(v0 ptr, v1 f32, v2 f32) -> f32 {
+  bb0(v0 ptr, v1 f32, v2 f32):
+    store v1, v0
+    v3: f32 = load f32 v0
+    store v2, v0
+    ret v3
+}
+
+; Both successors overwrite *v0 before anything reads it.
+; CHECK-LABEL: fn every_path(
+; CHECK:       bb0(
+; CHECK-NOT:     store
+; CHECK:         cond_br
+; CHECK:       bb1:
+; CHECK-NEXT:    store v3, v0
+; CHECK:       bb2:
+; CHECK-NEXT:    store v4, v0
+fn every_path(v0 ptr, v1 i1, v2 f32, v3 f32, v4 f32) -> void {
+  bb0(v0 ptr, v1 i1, v2 f32, v3 f32, v4 f32):
+    store v2, v0
+    cond_br v1, bb1, bb2
+  bb1:
+    store v3, v0
+    ret
+  bb2:
+    store v4, v0
+    ret
+}
+
+; A slot no load reads and no callee can name: its store (at a constant in-bounds offset) is dead.
+; CHECK-LABEL: fn private_slot(
+; CHECK:         alloca [4 x f32]
+; CHECK-NOT:     store
+; CHECK:         ret v0
+fn private_slot(v0 f32) -> f32 {
+  bb0(v0 f32):
+    v1: ptr = alloca [4 x f32]
+    v2: i64 = const.i64 1
+    v3: ptr = gep v1, v2 : f32
+    store v0, v3
+    ret v0
+}

@@ -1,0 +1,15 @@
+; RUN: not wukongc --emit=mir --verify-each %s 2>&1 | filecheck %s
+;
+; In SSA form, a value defined in one arm of a branch does not dominate the join, so the join
+; cannot use it (it would need a block parameter).
+
+; CHECK: internal compiler error (MIR verify): use of v2 is not dominated by its definition
+fn f(v0 i32, v1 i1) -> i32 {
+  bb0(v0 i32, v1 i1):
+    cond_br v1, bb1, bb2
+  bb1:
+    v2: i32 = add v0, v0
+    br bb2
+  bb2:
+    ret v2
+}
