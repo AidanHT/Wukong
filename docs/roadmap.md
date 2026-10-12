@@ -1774,11 +1774,12 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   promotes by itself; packed `int4` and constructible SIMD values are not started. The 128-bit
   integers run everywhere but in four places: `atomic_add` takes at most 64 bits (`E0446`), an
   `extern "C"` signature cannot carry one (`C0001`), the loop vectorizers never widen them (a loop
-  over `i128` data stays scalar — no ISA has 128-bit integer lanes), and `gpu-native` declines a
-  function holding one. On the native backend a 128-bit divide or integer/float conversion is one
-  runtime call (`wukong_runtime::int128`), not an inline sequence; the cc-fallback runtime of
-  `--emit=exe` (used only without a Rust toolchain) does not carry those entries or the 128-bit
-  printer, so such a program links only through the default rustc path.
+  over `i128` data stays scalar — no ISA has 128-bit integer lanes — and a loop driven by an
+  `i128`/`u128` counter stays scalar and serial: no vectorizer, kernel or `@parallel` region takes
+  it), and `gpu-native` declines a function holding one. On the native backend a 128-bit divide or
+  integer/float conversion is one runtime call (`wukong_runtime::int128`), not an inline sequence;
+  the cc-fallback runtime of `--emit=exe` (used only without a Rust toolchain) does not carry those
+  entries or the 128-bit printer, so such a program links only through the default rustc path.
   The bit-count builtins (`popcount`, `clz`, `ctz`, `bswap`) keep a loop scalar (the vectorizer does
   not widen `Op::IntUnary`), `gpu-native` declines them, and `erfc`/`erfinv`/`lgamma` are one
   scalar runtime call per element at every precision.

@@ -1581,7 +1581,11 @@ never truncates a 128-bit index or count implicitly: `wukong_mir_build`'s `lower
 or a builtin's 64-bit operand, so an index past `i64` stays out of bounds; only an explicit `as`
 truncates. The loop
 vectorizers have no 128-bit lane (`lane_bytes`/`vector_width` decline it), so a loop over `i128`
-data stays scalar, and `wukong_codegen_gpu::lower` declines any function holding an `i128`
+data stays scalar, and a `for` loop with a 128-bit counter is declined by name everywhere a bound is
+computed at the counter's width — `try_vectorize_for`, every kernel recognizer
+(`kernel_range_supported`) and both `@parallel` paths (`parallel_spec`, `region_verdict`) — where
+`-(1 << 127)` and `(1 << 127) - 1` overflow `i128` and a debug-build compiler panicked.
+`wukong_codegen_gpu::lower` declines any function holding an `i128`
 (`decline_i128`: PTX integers stop at 64 bits).
 
 ### Debug info (`-g`) and the JIT perf map

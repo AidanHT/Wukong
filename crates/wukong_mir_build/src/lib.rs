@@ -15100,7 +15100,11 @@ impl FnLowerer<'_> {
         if as_int_lit(start, self.interner) != Some(0) {
             return Err("the range does not start at literal 0");
         }
-        let max = (1i128 << (mir_byte_size(ity) * 8 - 1)) - 1;
+        // The runtime's iteration space is 64-bit (`parallel_spec` declines the same counter).
+        if mir_byte_size(ity) > 8 {
+            return Err("a 128-bit counter");
+        }
+        let max = i128::MAX >> (128 - mir_byte_size(ity) * 8);
         let constant = as_int_lit(end, self.interner)
             .map(|n| n as i128)
             .or_else(|| self.const_runtime_u64_expr(end).map(i128::from));
@@ -18254,6 +18258,12 @@ impl FnLowerer<'_> {
         if !ity.is_int() || !self.expr_mir(start).is_int() || !self.expr_mir(end).is_int() {
             return false;
         }
+        // A 128-bit counter has no vector form (no ISA has 128-bit integer lanes, and the strips'
+        // saturated limits are computed at the counter width): it stays the scalar loop, exactly
+        // as `kernel_range_supported` keeps it off every kernel.
+        if mir_byte_size(&ity) > 8 {
+            return false;
+        }
         // The five arms below are kernel *recognizers* that happen to be probed from here (they all
         // beat the generic vectorizer on width or store path), so they answer to the recognition
         // switch exactly like the `lower_for` cascade: with recognition off, an elementwise loop is
@@ -19730,7 +19740,7 @@ impl FnLowerer<'_> {
         let span = (unroll * w) as i128;
         // Saturate end-(span-1) at the signed minimum. If subtraction would underflow,
         // even the smallest counter leaves fewer than span elements, so no vector fits.
-        let min = -(1i128 << (mir_byte_size(ity) * 8 - 1));
+        let min = i128::MIN >> (128 - mir_byte_size(ity) * 8);
         let off = self
             .builder
             .build(ity.clone(), Op::ConstInt(span - 1, ity.clone()));
@@ -20291,7 +20301,7 @@ impl FnLowerer<'_> {
         let span = (unroll * w) as i128;
         // Saturate end-(span-1) at the signed minimum. If subtraction would underflow,
         // even the smallest counter leaves fewer than span elements, so no vector fits.
-        let min = -(1i128 << (mir_byte_size(ity) * 8 - 1));
+        let min = i128::MIN >> (128 - mir_byte_size(ity) * 8);
         let off = self
             .builder
             .build(ity.clone(), Op::ConstInt(span - 1, ity.clone()));

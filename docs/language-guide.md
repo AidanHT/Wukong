@@ -519,8 +519,10 @@ literal, and reach exactly the full ranges: `-1701411834604692317316873037158841
 - **Not 128-bit:** `atomic_add` adds to places of at most 64 bits (a 128-bit place is `E0446`);
   an `extern "C"` signature cannot carry one (`C0001`, `tests/fail/extern_i128.wk` — C has no
   standard 128-bit integer, so pass it by pointer); a SIMD vector has no 128-bit lanes (a loop over
-  `i128` data stays scalar); and `--backend=gpu-native` declines a function that holds one (PTX
-  integers stop at 64 bits).
+  `i128` data stays scalar, and a `for` loop whose counter is `i128`/`u128` stays the scalar, serial
+  loop it was written as — never vectorized, dispatched to a kernel or split across threads by
+  `@parallel`; `tests/run/i128_loop_counters.wk`); and `--backend=gpu-native` declines a function
+  that holds one (PTX integers stop at 64 bits).
 
 On the native backend a 128-bit value lives in a register pair. Addition, multiplication, the
 bitwise operations, shifts and compares are inline instructions; x86-64 has no 128-bit divide and no

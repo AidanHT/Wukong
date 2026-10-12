@@ -1,0 +1,112 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 136
+// EXPECT-OUT: 15
+// EXPECT-OUT: 0
+// EXPECT-OUT: 136
+// EXPECT-OUT: [3.0, 5.0, 7.0, 9.0, 0.0, 0.0, 0.0, 0.0]
+// EXPECT-OUT: [2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 0.0, 0.0]
+// EXPECT-OUT: [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]
+// EXPECT-OUT: [6, 7, 8, 9, 26, 27, 28, 29]
+// EXPECT-OUT: [6, 7, 8, 9, 26, 27, 28, 29]
+module tests.run.i128_loop_counters
+
+// A `for` range whose counter is 128 bits wide (`0..n` with `n: i128` or `u128`, or the literal
+// `0i128..4i128`) has no vector or kernel form — no ISA has 128-bit integer lanes, and the runtime's
+// `@parallel` iteration space is 64-bit — so each loop below stays the scalar loop it was written
+// as. The vectorizer's strips and the `@parallel` region outliner used to compute their saturated
+// bounds at the counter's width, where `-(1 << 127)` and `(1 << 127) - 1` overflow `i128`: a debug
+// build of the compiler panicked on every one of these loops, at every -O level, on both backends.
+//
+// Expected values are the scalar loops evaluated by hand; every lane is printed.
+//   total(x, n) = 1 + 2 + ... + n over x[j] = j + 1:   n = 16 -> 136, n = 5 -> 15, n = 0 -> 0.
+//   total_u(x, 16) is the same sum over a `u128` counter: 136.
+//   odd[j] = 2 x[j] + 1 for j in 0..4 (x = 1, 2, 3, 4): 3, 5, 7, 9; the rest stay 0.
+//   inc[j] = x[j] + 1 for j in 0..6: 2..7; the last two stay 0.
+//   ten[j] = 10 x[j] for j in 0..8 over a `u128` counter: 10, 20, ..., 80.
+//   rows: head h sums row h of src = 0..7 (row 0: 0+1+2+3 = 6, row 1: 4+5+6+7 = 22) and writes
+//   dst[4h + j] = src[4h + j] + sum: 6 7 8 9 and 26 27 28 29 — for an `i128` and a `u128` trip count.
+
+fn total(x: [f32; 16], n: i128) -> f32 {
+    let mut s = 0.0;
+    for j in 0..n {
+        s += x[j];
+    }
+    return s;
+}
+
+fn total_u(x: [f32; 16], n: u128) -> f32 {
+    let mut s = 0.0;
+    for j in 0..n {
+        s += x[j];
+    }
+    return s;
+}
+
+@parallel
+fn rows(src: []i32, mut dst: []i32, n: i128) {
+    for h in 0..n {
+        let mut s: i32 = 0;
+        for j in 0..4 {
+            s = s + src[h * 4 + j];
+        }
+        for j in 0..4 {
+            dst[h * 4 + j] = src[h * 4 + j] + s;
+        }
+    }
+}
+
+@parallel
+fn rows_u(src: []i32, mut dst: []i32, n: u128) {
+    for h in 0..n {
+        let mut s: i32 = 0;
+        for j in 0..4 {
+            s = s + src[h * 4 + j];
+        }
+        for j in 0..4 {
+            dst[h * 4 + j] = src[h * 4 + j] + s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    let x = [
+        1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
+    ];
+    println(total(x, 16));
+    println(total(x, 5));
+    println(total(x, 0));
+    println(total_u(x, 16));
+
+    let mut odd = [0.0; 8];
+    for j in 0i128..4i128 {
+        odd[j] = x[j] * 2.0 + 1.0;
+    }
+    println(odd);
+
+    let six: i128 = 6;
+    let mut inc = [0.0; 8];
+    for j in 0..six {
+        inc[j] = x[j] + 1.0;
+    }
+    println(inc);
+
+    let eight: u128 = 8;
+    let mut ten = [0.0; 8];
+    for j in 0..eight {
+        ten[j] = x[j] * 10.0;
+    }
+    println(ten);
+
+    let a = [0, 1, 2, 3, 4, 5, 6, 7];
+    let mut b = [0; 8];
+    let mut c = [0; 8];
+    let sa: []i32 = a;
+    let sb: []i32 = b;
+    let sc: []i32 = c;
+    rows(sa, sb, 2);
+    println(b);
+    rows_u(sa, sc, 2);
+    println(c);
+    return 0;
+}

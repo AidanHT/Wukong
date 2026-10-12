@@ -43,6 +43,13 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `i64`'s range before forming the address, so `s[2^64 + 1]` fails its bounds check instead of
   reading `s[1]`, and a constant one past `i64` on an array is `E0501`; a 128-bit count handed to a
   builtin's 64-bit operand (`alloc_i32(n)`) clamps the same way. An `as i64` still truncates.
+- **Fixed (review): a 128-bit loop counter panicked the compiler.** A `for` loop whose counter is
+  `i128`/`u128` (`for j in 0..n` with `n: i128`, `0i128..4i128`) still reached the AST vectorizer
+  and the `@parallel` region outliner, which compute saturated bounds at the counter's width:
+  `-(1 << 127)` and `(1 << 127) - 1` overflow, so a debug-build compiler panicked on a valid
+  program at every `-O` level (and a release build vectorized over an `i128` counter by accident).
+  Both now decline such a counter, as the kernel recognizers and `parallel_spec` already did; the
+  loop stays scalar and serial (`tests/run/i128_loop_counters.wk`).
 - **Tests.** `tests/run/i128_{arith,casts,aggregates,match_builtins,index_clamp}.wk` pin every
   operation at both range ends with operands the optimizer cannot fold, interpreter == native at
   every `-O` (expected values from Python's integers, not compiler output); six new `tests/fail`
