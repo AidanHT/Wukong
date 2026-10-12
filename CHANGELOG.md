@@ -37,6 +37,14 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `tests/run/vec256_f16_lanes.wk` runs five f16 kernels over 2048 lanes each and prints every
   lane's bits (hand-derived). Census: `vec256_f16_lanes`, `vec_f16_lanes` (a runtime trip) and
   `cov4_par_lowp_dot` gain kernels; nothing is lost.
+- **Half casts through `f64` and integers, and half interleave groups, vectorize.** A bf16 or f16
+  cast through `f64` or to or from an integer used to run lane by lane (extract, scalar cast,
+  insert), and a bf16/f16 interleave group (`o[2i]`, `o[2i + 1]`) declined the loop. The casts now
+  convert lane-wise in the scalar cast's own steps — the half-grid rounding, then the
+  `f32 <-> f64` widen or narrow; or the `f32` integer route, since an integer-to-half cast rounds
+  only when stored — and the groups widen like 32-bit ones. `tests/run/vec_half_casts.wk` (ten
+  casts and a complex multiply in each half type; every lane's bits, hand-derived; interp and native
+  at `-O0` and `-O2`). No corpus program's `-O2` MIR changes but the new fixture's.
 
 ### First-class 128-bit integers: `i128` and `u128` (`gap6/i128`, N25)
 

@@ -780,9 +780,11 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
   once in SSE2 integer arithmetic (`codegen_cranelift::half_lanes`), bit-identical to the scalar
   path's runtime shims on all 65536 f16 encodings and a dense cover of `f32` inputs (every exponent,
   every tie position, every subnormal boundary, every NaN payload), under the host ISA and the
-  x86-64 baseline (`tests/run/vec_f16_lanes.wk`, every lane's bits). Still scalar: bf16 and f16
-  accumulators (they round inside the recurrence), half interleave groups, and half casts through
-  `f64` or integers (replicated lane by lane).
+  x86-64 baseline (`tests/run/vec_f16_lanes.wk`, every lane's bits). Half casts through `f64` and
+  to and from integers convert lane-wise in the scalar cast's own steps, and bf16/f16 interleave
+  groups widen like 32-bit ones (`tests/run/vec_half_casts.wk`, every lane's bits). Still scalar:
+  bf16 and f16 accumulators (they round inside the recurrence, which no fold reproduces) and a
+  bitcast to or from a half type (replicated lane by lane).
 - **Straight-line SLP** (`wukong_opt::slp`, `-O2`, after unrolling): `W` stores in one block to
   consecutive elements of one object whose values are one lane-wise operation tree pack into one
   128-bit vector store — `f32x4`, `i32x4`, `f64x2`, `i64x2` — over vector loads, splats and lane

@@ -586,6 +586,7 @@ vec_exp.wk:
 vec_f16_lanes.wk: veckernel*5 wukong_rt_alloc wukong_rt_alloc*7 wukong_rt_fmt_int wukong_rt_fmt_int*2 wukong_rt_fmt_str wukong_rt_fmt_str*4 wukong_rt_free wukong_rt_free*7
 vec_find_last.wk: veckernel*1 wukong_rt_alloc wukong_rt_alloc*2 wukong_rt_free wukong_rt_free*2
 vec_guarded_shifted_read.wk:
+vec_half_casts.wk: wukong_rt_alloc wukong_rt_alloc*21 wukong_rt_fmt_int wukong_rt_fmt_int*9 wukong_rt_fmt_str wukong_rt_fmt_str*18
 vec_int_div.wk: veckernel*1
 vec_kernel_zero_trip.wk: veckernel*2 wukong_rt_alloc
 vec_math.wk: veckernel*1

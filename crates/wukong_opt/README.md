@@ -67,6 +67,8 @@ load-bearing.
   to the half grid at the load, the store and each half cast exactly as the scalar loop rounds; the
   f16 conversions are SSE2 integer code in `codegen_cranelift::half_lanes`). An f16 body's
   256-bit recipe is an `f32` one with F16C conversions (`VecOp::LoadF16`/`StoreF16`/`RoundF16`).
+  Half casts through `f64` and to and from integers convert lane-wise, and half interleave groups
+  widen.
 
 **Whole-program stages at `-O2`+ (not `Pass` traits):**
 

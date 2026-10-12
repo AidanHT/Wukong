@@ -112,10 +112,14 @@
 //! four lanes on a store, and rounds each lane of a half `fptrunc`/`fpext`. The bf16 rounding is the
 //! scalar path's integer round-to-nearest-even; the f16 one is an SSE2 integer form of the scalar
 //! path's runtime shims (the `half` crate), checked against them on every f16 encoding and a dense
-//! cover of `f32` inputs. The arithmetic, compares and blends between them are the `f32x4` ones,
-//! and only the exact grid-rounding casts between `f32`, bf16 and f16 are lane-wise
-//! ([`cast_route`]); every other half cast is replicated as the scalar instruction. Reductions with
-//! a half accumulator (it rounds inside its own recurrence) and half interleave groups stay scalar.
+//! cover of `f32` inputs. The arithmetic, compares and blends between them are the `f32x4` ones.
+//! Every half cast but a bitcast is lane-wise ([`cast_route`]) in the scalar cast's own steps: the
+//! grid-rounding casts between `f32`, bf16 and f16 directly, a cast through `f64` as that rounding
+//! plus the `f32 <-> f64` widen or narrow, and a cast to or from an integer as the `f32` one (the
+//! scalar cast rounds nothing at the half grid there). Half interleave groups widen like 32-bit
+//! ones: their loads and stores round where the scalar ones do, and the shuffles between them move
+//! `f32` lanes. Reductions with a half accumulator (it rounds inside its own recurrence) stay
+//! scalar.
 //!
 //! # Reading `WUKONG_VEC_TRACE=1`
 //!
@@ -417,6 +421,13 @@ enum CastRoute {
     FpExt,
     /// `f64 -> f32`: pairs of parts joined (`Op::Narrow`).
     FpTrunc,
+    /// bf16/f16 `-> f64`: each part rounded to its half grid as an `f32` lane (the lane-wise
+    /// `fpext .. to f32`, the rounding the scalar `fpext` applies to its source), then
+    /// [`CastRoute::FpExt`].
+    HalfToF64,
+    /// `f64 ->` bf16/f16: [`CastRoute::FpTrunc`] to `f32` lanes, then each rounded to the half grid
+    /// (the lane-wise `fptrunc`) — the scalar cast's demote, then round.
+    F64ToHalf,
 }
 
 /// How one instruction of the scalar body is reproduced in the vector body.
@@ -1239,9 +1250,6 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
     let (groups, member) = interleave_groups(l)?;
     if dir == -1 && !groups.is_empty() {
         return Err("an interleave group in a countdown");
-    }
-    if groups.iter().any(|g| is_half(&g.elem)) {
-        return Err("a bf16 or f16 interleave group");
     }
     access_shape_verdict(l, &member)?;
     group_order_verdict(l, &lin, groups.len(), &member)?;
@@ -4254,13 +4262,27 @@ fn cast_route(kind: CastKind, from: &MirType, to: &MirType) -> Option<CastRoute>
     // grid are lane-wise: an `fpext` out of a half type (it rounds the source to its grid first)
     // and an `fptrunc` into one (the rounding `mir_build` places after every half operation), each
     // between two of `f32`, bf16 and f16 — the backends round exactly where the scalar cast does.
-    // Any other half cast — through `f64`, to or from an integer, a bitcast — has no exact
-    // lane-wise form here and is replicated.
+    // Through `f64` the cast is that rounding and the `f32 <-> f64` lane-count change, in the
+    // scalar cast's order (`HalfToF64`, `F64ToHalf`). To and from an integer, a half lane converts
+    // exactly as an `f32` lane does — the scalar cast rounds nothing at the half grid there (an
+    // integer becomes an `f32` and is rounded only when stored or cast again; a half value is
+    // truncated from its `f32` register) — so the `f32` route serves, with the half lane type at the
+    // half end. A bitcast has no lane-wise form and is replicated.
     if is_half(from) || is_half(to) {
         let float32 = |t: &MirType| *t == MirType::F32 || is_half(t);
+        let as_f32 = |t: &MirType| {
+            if is_half(t) {
+                MirType::F32
+            } else {
+                t.clone()
+            }
+        };
         return match kind {
             FpExt if is_half(from) && float32(to) => Some(CastRoute::Same),
             FpTrunc if is_half(to) && float32(from) => Some(CastRoute::Same),
+            FpExt if is_half(from) && *to == MirType::F64 => Some(CastRoute::HalfToF64),
+            FpTrunc if *from == MirType::F64 && is_half(to) => Some(CastRoute::F64ToHalf),
+            SiToFp | UiToFp | FpToSi | FpToUi => cast_route(kind, &as_f32(from), &as_f32(to)),
             _ => None,
         };
     }
@@ -6813,6 +6835,14 @@ fn emit_cast(
         }
         CastRoute::FpExt => widen_chain(e, vb, xs, from, to, CastKind::FpExt),
         CastRoute::FpTrunc => narrow_chain(e, vb, xs, from, to, |_| NarrowKind::FpTrunc),
+        CastRoute::HalfToF64 => {
+            let rounded = cast_parts(e, vb, CastKind::FpExt, xs, &MirType::F32);
+            widen_chain(e, vb, rounded, &MirType::F32, to, CastKind::FpExt)
+        }
+        CastRoute::F64ToHalf => {
+            let demoted = narrow_chain(e, vb, xs, from, &MirType::F32, |_| NarrowKind::FpTrunc);
+            cast_parts(e, vb, CastKind::FpTrunc, demoted, to)
+        }
     }
 }
 
@@ -7784,7 +7814,9 @@ mod tests {
     /// `<4 x f16>` parts and to nothing else.
     #[test]
     fn an_f16_loop_widens_as_four_f32_lanes() {
-        let src = "fn k(x: []f16, y: []f16, mut o: []f16, n: i64) { let mut i: i64 = 0;                    while i < n { o[i] = x[i] * y[i] + x[i]; i = i + 1; } }                    fn main() -> i32 { return 0; }";
+        let src = "fn k(x: []f16, y: []f16, mut o: []f16, n: i64) { let mut i: i64 = 0; \
+                   while i < n { o[i] = x[i] * y[i] + x[i]; i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
         let vs = vector_values(src, "k");
         assert!(!vs.is_empty(), "an f16 body was not widened");
         assert!(
@@ -7800,7 +7832,31 @@ mod tests {
     #[test]
     fn f16_lanes_agree_with_the_scalar_loop() {
         scalar_and_vector_agree(
-            "fn pick(a: f16, b: f16) -> f16 { if a > b { return a; } return -b; }              @unchecked fn k(x: []f16, y: []f16, mut o1: []f16, mut o2: []f16,                mut o3: []f16, mut f: []f32, mut o5: []f16, n: i64, d: i64) {                if d > 0 { k(x, y, o1, o2, o3, f, o5, n, d - 1); return; }                let mut i: i64 = 0;                while i < n { o1[i] = x[i] * y[i] + x[i]; i = i + 1; }                i = 0; while i < n { o2[i] = pick(x[i], y[i]); i = i + 1; }                i = 0; while i < n { o3[i] = x[i] / y[i]; i = i + 1; }                i = 0; while i < n { f[i] = (x[i] as f32) * 0.5; i = i + 1; }                i = 0; while i < n { o5[i] = (f[i] * 3.0) as f16; i = i + 1; } }              fn xs(r: i64) -> u16 { let t: [u16; 16] = [32257, 32000, 32768, 0, 31744, 64512,                15872, 49280, 1, 31743, 15361, 16968, 48128, 13312, 22528, 18688]; return t[r]; }              fn ys(r: i64) -> u16 { let t: [u16; 16] = [15360, 16384, 0, 32768, 31744, 15361,                15359, 49664, 1024, 27648, 14336, 30720, 45056, 19712, 16383, 32258]; return t[r]; }              fn main() -> i32 { let n: i64 = 37;                let mut x: []f16 = alloc_f16(n); let mut y: []f16 = alloc_f16(n);                let mut o1: []f16 = alloc_f16(n); let mut o2: []f16 = alloc_f16(n);                let mut o3: []f16 = alloc_f16(n); let mut o5: []f16 = alloc_f16(n);                let mut f: []f32 = alloc_f32(n); let mut i: i64 = 0;                while i < n { x[i] = f16_from_bits(xs(i % 16));                  y[i] = f16_from_bits(ys((5 * i + 3) % 16)); i = i + 1; }                k(x, y, o1, o2, o3, f, o5, n, 0); i = 0;                while i < n { print(bits(o1[i])); print(bits(o2[i])); print(bits(o3[i]));                  print(bits(f[i])); print(bits(o5[i])); i = i + 1; }                return 0; }",
+            "fn pick(a: f16, b: f16) -> f16 { if a > b { return a; } return -b; } \
+             @unchecked fn k(x: []f16, y: []f16, mut o1: []f16, mut o2: []f16, \
+               mut o3: []f16, mut f: []f32, mut o5: []f16, n: i64, d: i64) { \
+               if d > 0 { k(x, y, o1, o2, o3, f, o5, n, d - 1); return; } \
+               let mut i: i64 = 0; \
+               while i < n { o1[i] = x[i] * y[i] + x[i]; i = i + 1; } \
+               i = 0; while i < n { o2[i] = pick(x[i], y[i]); i = i + 1; } \
+               i = 0; while i < n { o3[i] = x[i] / y[i]; i = i + 1; } \
+               i = 0; while i < n { f[i] = (x[i] as f32) * 0.5; i = i + 1; } \
+               i = 0; while i < n { o5[i] = (f[i] * 3.0) as f16; i = i + 1; } } \
+             fn xs(r: i64) -> u16 { let t: [u16; 16] = [32257, 32000, 32768, 0, 31744, 64512, \
+               15872, 49280, 1, 31743, 15361, 16968, 48128, 13312, 22528, 18688]; return t[r]; } \
+             fn ys(r: i64) -> u16 { let t: [u16; 16] = [15360, 16384, 0, 32768, 31744, 15361, \
+               15359, 49664, 1024, 27648, 14336, 30720, 45056, 19712, 16383, 32258]; return t[r]; } \
+             fn main() -> i32 { let n: i64 = 37; \
+               let mut x: []f16 = alloc_f16(n); let mut y: []f16 = alloc_f16(n); \
+               let mut o1: []f16 = alloc_f16(n); let mut o2: []f16 = alloc_f16(n); \
+               let mut o3: []f16 = alloc_f16(n); let mut o5: []f16 = alloc_f16(n); \
+               let mut f: []f32 = alloc_f32(n); let mut i: i64 = 0; \
+               while i < n { x[i] = f16_from_bits(xs(i % 16)); \
+                 y[i] = f16_from_bits(ys((5 * i + 3) % 16)); i = i + 1; } \
+               k(x, y, o1, o2, o3, f, o5, n, 0); i = 0; \
+               while i < n { print(bits(o1[i])); print(bits(o2[i])); print(bits(o3[i])); \
+                 print(bits(f[i])); print(bits(o5[i])); i = i + 1; } \
+               return 0; }",
         );
     }
 
@@ -7808,8 +7864,140 @@ mod tests {
     /// loop stays scalar.
     #[test]
     fn an_f16_reduction_stays_scalar() {
-        let src = "fn k(x: []f16, n: i64) -> f16 { let mut s: f16 = 0.0; let mut i: i64 = 0;                    while i < n { s = s + x[i]; i = i + 1; } return s; }                    fn main() -> i32 { return 0; }";
+        let src = "fn k(x: []f16, n: i64) -> f16 { let mut s: f16 = 0.0; let mut i: i64 = 0; \
+                   while i < n { s = s + x[i]; i = i + 1; } return s; } \
+                   fn main() -> i32 { return 0; }";
         assert!(!is_widened(src, "k"), "an f16 sum must not be widened");
+    }
+
+    /// Does `func` at `-O2` replicate any step — pack a lane with `Op::InsertLane` — or does every
+    /// step it widened run on whole vectors?
+    fn replicates(src: &str, func: &str) -> bool {
+        let (program, mut interner) = optimized(src, 2);
+        let f = program
+            .function(interner.intern(func))
+            .unwrap_or_else(|| panic!("no fn {func}"));
+        f.blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(i.op, Op::InsertLane(..)))
+    }
+
+    /// Half casts through `f64` and to and from integers convert lane-wise — the half end rounds
+    /// (or not) exactly where the scalar cast does, the `f32 <-> f64` end is a widen or a narrow —
+    /// where each lane used to be extracted, converted by the scalar instruction and packed again.
+    /// Each body widens with no lane replicated at all.
+    #[test]
+    fn half_casts_through_f64_and_integers_convert_lane_wise() {
+        for (name, ty, from, to, expr) in [
+            ("f16 to f64", "f16", "f16", "f64", "x[i] as f64 * 0.5"),
+            ("bf16 to f64", "bf16", "bf16", "f64", "x[i] as f64 - 1.0"),
+            ("f64 to f16", "f16", "f64", "f16", "(x[i] * 3.0) as f16"),
+            ("f64 to bf16", "bf16", "f64", "bf16", "(x[i] * 3.0) as bf16"),
+            ("f16 to i32", "f16", "f16", "i32", "x[i] as i32"),
+            ("bf16 to i32", "bf16", "bf16", "i32", "x[i] as i32"),
+            ("f16 to u8", "f16", "f16", "u8", "x[i] as u8"),
+            ("f16 to u32", "f16", "f16", "u32", "x[i] as u32"),
+            ("i32 to f16", "f16", "i32", "f16", "x[i] as f16"),
+            ("i32 to bf16", "bf16", "i32", "bf16", "x[i] as bf16"),
+            ("i16 to f16", "f16", "i16", "f16", "x[i] as f16"),
+            ("u8 to bf16", "bf16", "u8", "bf16", "x[i] as bf16"),
+        ] {
+            let src = format!(
+                "fn k(x: []{from}, mut o: []{to}, n: i64) {{ let mut i: i64 = 0; \
+                 while i < n {{ o[i] = {expr}; i = i + 1; }} }} \
+                 fn main() -> i32 {{ return 0; }}"
+            );
+            let vs = vector_values(&src, "k");
+            assert!(
+                vs.iter().any(|(l, _)| l.display() == ty),
+                "{name}: no {ty} vector: {vs:?}"
+            );
+            assert!(!replicates(&src, "k"), "{name}: a cast is still replicated");
+        }
+    }
+
+    /// Every lane of those casts, `-O0` against `-O2`, over every class a half holds — NaN
+    /// payloads, both zeros and infinities, subnormals, the largest finite values — and integers
+    /// at and past the half ranges (f16 saturates to infinity from 65520; bf16 rounds 2^24 + 2^16
+    /// + 1 through `f32`). Runtime trips, so the vector loop and the scalar tail both run.
+    #[test]
+    fn half_cast_lanes_agree_with_the_scalar_loop() {
+        scalar_and_vector_agree(
+            "@unchecked fn k(x: []f16, b: []bf16, p: []i32, s: []i16, mut d: []f64, \
+               mut e: []f64, mut x2: []f16, mut b2: []bf16, mut pi: []i32, mut qi: []i32, \
+               mut u: []u8, mut x3: []f16, mut b3: []bf16, mut y3: []f16, n: i64, z: i64) { \
+               if z > 0 { k(x, b, p, s, d, e, x2, b2, pi, qi, u, x3, b3, y3, n, z - 1); return; } \
+               let mut i: i64 = 0; \
+               while i < n { d[i] = x[i] as f64 * 0.5; i = i + 1; } \
+               i = 0; while i < n { e[i] = b[i] as f64 - 1.0; i = i + 1; } \
+               i = 0; while i < n { x2[i] = (d[i] * 3.0) as f16; i = i + 1; } \
+               i = 0; while i < n { b2[i] = (e[i] * 3.0) as bf16; i = i + 1; } \
+               i = 0; while i < n { pi[i] = x[i] as i32; i = i + 1; } \
+               i = 0; while i < n { qi[i] = b[i] as i32; i = i + 1; } \
+               i = 0; while i < n { u[i] = x[i] as u8; i = i + 1; } \
+               i = 0; while i < n { x3[i] = p[i] as f16; i = i + 1; } \
+               i = 0; while i < n { b3[i] = p[i] as bf16; i = i + 1; } \
+               i = 0; while i < n { y3[i] = s[i] as f16; i = i + 1; } } \
+             fn main() -> i32 { let n: i64 = 67; \
+               let mut x: []f16 = alloc_f16(n); let mut b: []bf16 = alloc_bf16(n); \
+               let mut p: []i32 = alloc_i32(n); let mut s: []i16 = alloc_i16(n); \
+               let mut d: []f64 = alloc_f64(n); let mut e: []f64 = alloc_f64(n); \
+               let mut x2: []f16 = alloc_f16(n); let mut b2: []bf16 = alloc_bf16(n); \
+               let mut pi: []i32 = alloc_i32(n); let mut qi: []i32 = alloc_i32(n); \
+               let mut u: []u8 = alloc_u8(n); let mut x3: []f16 = alloc_f16(n); \
+               let mut b3: []bf16 = alloc_bf16(n); let mut y3: []f16 = alloc_f16(n); \
+               let mut i: i64 = 0; \
+               while i < n { x[i] = f16_from_bits(((i * 2731 + 1) % 65536) as u16); \
+                 b[i] = bf16_from_bits(((i * 4099 + 7) % 65536) as u16); \
+                 p[i] = ((i * 1000003) % 33554432 - 16777216) as i32; \
+                 s[i] = ((i * 977) % 65536 - 32768) as i16; i = i + 1; } \
+               p[3] = 2049; p[4] = 65519; p[5] = 65520; p[6] = -70000; p[7] = 16842753; \
+               k(x, b, p, s, d, e, x2, b2, pi, qi, u, x3, b3, y3, n, 0); i = 0; \
+               while i < n { print(bits(d[i])); print(bits(e[i])); print(bits(x2[i])); \
+                 print(bits(b2[i])); print(pi[i]); print(qi[i]); print(u[i]); \
+                 print(bits(x3[i])); print(bits(b3[i])); print(bits(y3[i])); i = i + 1; } \
+               return 0; }",
+        );
+    }
+
+    /// bf16 and f16 interleave groups widen like the 32-bit ones: a complex multiply over
+    /// interleaved real and imaginary parts, its stride-2 loads and stores split and merged by
+    /// lane shuffles, every lane `-O0` against `-O2` over special values.
+    #[test]
+    fn half_interleave_groups_widen_and_agree_with_the_scalar_loop() {
+        let src = "@unchecked fn kh(a: []f16, c: []f16, mut o: []f16, n: i64, z: i64) { \
+               if z > 0 { kh(a, c, o, n, z - 1); return; } let mut i: i64 = 0; \
+               while i < n { \
+                 o[2 * i] = a[2 * i] * c[2 * i] - a[2 * i + 1] * c[2 * i + 1]; \
+                 o[2 * i + 1] = a[2 * i] * c[2 * i + 1] + a[2 * i + 1] * c[2 * i]; \
+                 i = i + 1; } } \
+             @unchecked fn kb(a: []bf16, c: []bf16, mut o: []bf16, n: i64, z: i64) { \
+               if z > 0 { kb(a, c, o, n, z - 1); return; } let mut i: i64 = 0; \
+               while i < n { \
+                 o[2 * i] = a[2 * i] * c[2 * i] - a[2 * i + 1] * c[2 * i + 1]; \
+                 o[2 * i + 1] = a[2 * i] * c[2 * i + 1] + a[2 * i + 1] * c[2 * i]; \
+                 i = i + 1; } } \
+             fn main() -> i32 { let n: i64 = 37; let m: i64 = 2 * n; \
+               let mut a: []f16 = alloc_f16(m); let mut c: []f16 = alloc_f16(m); \
+               let mut o: []f16 = alloc_f16(m); let mut a2: []bf16 = alloc_bf16(m); \
+               let mut c2: []bf16 = alloc_bf16(m); let mut o2: []bf16 = alloc_bf16(m); \
+               let mut i: i64 = 0; \
+               while i < m { a[i] = f16_from_bits(((i * 2731 + 1) % 65536) as u16); \
+                 c[i] = f16_from_bits(((i * 3517 + 5) % 65536) as u16); \
+                 a2[i] = bf16_from_bits(((i * 4099 + 7) % 65536) as u16); \
+                 c2[i] = bf16_from_bits(((i * 1543 + 3) % 65536) as u16); i = i + 1; } \
+               kh(a, c, o, n, 0); kb(a2, c2, o2, n, 0); i = 0; \
+               while i < m { print(bits(o[i])); print(bits(o2[i])); i = i + 1; } \
+               return 0; }";
+        for (f, lane) in [("kh", MirType::F16), ("kb", MirType::BF16)] {
+            let vs = vector_values(src, f);
+            assert!(
+                vs.iter().any(|(l, _)| *l == lane),
+                "{f}: the group was not widened: {vs:?}"
+            );
+        }
+        scalar_and_vector_agree(src);
     }
 
     // ---- min/max reductions --------------------------------------------------------------------
