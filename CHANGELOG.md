@@ -33,6 +33,7 @@ All notable changes to Wukong are documented here. The format is loosely based o
   them; unit tests cover escapes, loops, derived pointers, `@parallel` captures, vector-kernel stream
   tables and every way a fill loop can fail to be a full overwrite, and a machine-frame probe measures
   the frame shrinking by the two 4 KiB slots it no longer reserves.
+
 ### Closures beyond the call argument (`gap6/closures-escaping`, N27)
 
 - **Added: closures bound by `let`.** `let f = |x: f32| x * k;` binds a closure; `f(2.0)` calls it
