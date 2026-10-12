@@ -5,12 +5,17 @@
 //! *inside* one process, on the same in-memory data: it lowers each program once, then times the
 //! front-end (parse + sema + mir_build) and the optimizer (`optimize`) each with a best-of-N loop
 //! (the minimum single-run time is the least perturbed by scheduler noise), and separately runs one
-//! instrumented [`wukong_opt::optimize_timed`] pass to attribute time per optimizer pass.
+//! instrumented [`wukong_opt::optimize_timed_with`] pass to attribute time per optimizer pass.
+//!
+//! The headline `opt-O3` column is the production `optimize`, on the optimizer's automatic thread
+//! count — what a compile pays in wall time. The per-pass attribution runs on **one** optimizer
+//! thread (`attribute`): on several, each fixpoint pass's time would be summed over the workers
+//! while the unroll and SLP buckets stay wall clock, and the shares would mix the two.
 //!
 //! That instrumented pass is also gated: `measure_one` renders both the `optimize` and the
-//! `optimize_timed` program with `wukong_mir::print::print_program` and requires the two texts to be
-//! byte-identical, so the timing path can never quietly become a second optimizer. A divergence is
-//! reported as `*** FAILED` and this mode exits 1.
+//! `optimize_timed_with` program with `wukong_mir::print::print_program` and requires the two texts
+//! to be byte-identical, so the timing path can never quietly become a second optimizer (nor the
+//! thread count change the MIR). A divergence is reported as `*** FAILED` and this mode exits 1.
 //!
 //! Because ~80–85% of front→O2 compile time is the optimizer, the per-pass table is the map of where
 //! the time goes — the thing this harness exists to expose so it can be cut. Run with:
@@ -98,7 +103,7 @@ pub fn report(files: &[PathBuf]) {
     // headline opt time above is the clean best-of-N.
     let timed_total: Duration =
         agg.iter().map(|p| p.time).sum::<Duration>() + tot_inline + tot_unroll + tot_slp;
-    println!("\nper-pass share of the optimizer (summed over corpus):");
+    println!("\nper-pass share of the optimizer (one optimizer thread, summed over corpus):");
     println!(
         "  {:<14} {:>10} {:>7} {:>10}",
         "pass", "time", "%opt", "calls"
@@ -143,7 +148,7 @@ enum Meas {
     Ran(Sample),
     /// Does not lower to runnable MIR (uses unsupported constructs) — not a regression.
     Skipped,
-    /// `optimize_timed` produced different MIR than `optimize` — would mean the timing path is not
+    /// `optimize_timed_with` produced different MIR than `optimize` — would mean the timing path is not
     /// measurement-only. Must never happen; guards against future divergence.
     Failed(String),
 }
@@ -171,11 +176,11 @@ fn measure_one(path: &Path) -> Meas {
     let mut a = p0.clone();
     wukong_opt::optimize(&mut a, LEVEL);
     let mut b = p0.clone();
-    let _ = wukong_opt::optimize_timed(&mut b, LEVEL);
+    let _ = attribute(&mut b);
     if wukong_mir::print::print_program(&a, &interner)
         != wukong_mir::print::print_program(&b, &interner)
     {
-        return Meas::Failed("optimize_timed diverged from optimize".into());
+        return Meas::Failed("optimize_timed_with diverged from optimize".into());
     }
 
     // ops counts (context for how much MIR each pass chews on).
@@ -205,7 +210,7 @@ fn measure_one(path: &Path) -> Meas {
 
     // One instrumented run for the per-pass attribution.
     let mut c = p0.clone();
-    let timed = wukong_opt::optimize_timed(&mut c, LEVEL);
+    let timed = attribute(&mut c);
 
     Meas::Ran(Sample {
         front,
@@ -214,6 +219,19 @@ fn measure_one(path: &Path) -> Meas {
         ops3,
         timed,
     })
+}
+
+/// The instrumented optimizer run the per-pass table is built from (and the self-check's timed
+/// side), on ONE optimizer thread. The table adds the fixpoint passes' buckets to the unroll and
+/// SLP buckets under one `%opt` denominator, so every bucket must be the same kind of time. On the
+/// automatic thread count a batch that reaches the optimizer's pool reports each fixpoint pass
+/// summed over its workers (CPU time) while the unroll and SLP buckets stay wall clock, which
+/// skews every share toward the fixpoint passes and breaks comparison with earlier,
+/// single-threaded attribution runs. The MIR is the same on any thread count, so this attributes
+/// the same work — and the self-check, comparing it with the automatic-count `optimize`, also
+/// checks that.
+fn attribute(p: &mut wukong_mir::Program) -> wukong_opt::Timings {
+    wukong_opt::optimize_timed_with(p, LEVEL, wukong_opt::OptimizeOptions::FULL.with_threads(1))
 }
 
 /// Parse + sema + mir_build. `None` if the program does not lower to runnable MIR.
@@ -289,4 +307,23 @@ fn fmt(d: Duration) -> String {
 
 fn short(p: &Path) -> String {
     p.file_name().unwrap().to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The per-pass table adds the fixpoint passes' times to the unroll and SLP buckets, so they
+    /// must all be the same kind of time: one thread's. On the automatic count a batch on the
+    /// optimizer's pool sums each pass over its workers while the unroll and SLP buckets stay wall
+    /// clock. `opt5_fuse_multiblock.wk` keeps enough functions after `-O3` inlining for the
+    /// automatic count to share them.
+    #[test]
+    fn the_attribution_run_is_single_threaded() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/run/opt5_fuse_multiblock.wk");
+        let src = std::fs::read_to_string(&path).expect("the corpus program");
+        let (mut p, _) = lower(&src).expect("it lowers");
+        assert_eq!(attribute(&mut p).threads, 1);
+    }
 }

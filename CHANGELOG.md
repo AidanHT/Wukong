@@ -51,7 +51,10 @@ All notable changes to Wukong are documented here. The format is loosely based o
   interleaved `-O2` pass) the stage sums to 33.2 s on one thread and 31.7 s automatic (1.05x).
 - `--time-passes` notes when functions ran on several threads (each pass's time is then summed over
   them). `wukong_bench compile-work` counts the optimize stage on one thread, since its allocation
-  counters are per thread.
+  counters are per thread. `wukong_bench compile-time` takes its per-pass share table from a run on
+  one thread for a similar reason. On the pool each fixpoint pass is summed over the workers, while
+  the unroll and SLP buckets stay wall clock, and one `%opt` denominator would mix the two. Its
+  headline `opt-O3` column is still the production schedule.
 - **Not done:** `mir_build` lowering stays sequential. It interns names as it lowers (outlined
   regions, monomorphs, closure environments), so a per-function split needs a deterministic
   interning plan before symbol numbering can stop depending on the schedule.

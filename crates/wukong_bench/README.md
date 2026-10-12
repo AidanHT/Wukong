@@ -54,10 +54,18 @@ first-call initialisation, and the per-pass attribution is checked byte-identica
 where work moved. This binary installs a counting `#[global_allocator]` (three thread-local `Cell`
 updates per allocation, no atomics) for that mode; the other modes pay that and nothing else.
 
+The optimizer can run a program's independent functions on several threads (`WUKONG_OPT_THREADS`;
+the MIR is the same on every count). `compile-work` counts its optimize stage on one thread, since
+its counters are per thread. `compile-time`'s headline `opt-O3` column is the production `optimize`
+on the automatic count, so it is the wall time a compile pays. Its per-pass share table is measured
+on one optimizer thread. On several threads each fixpoint pass would be summed over the workers
+while the unroll and SLP buckets stayed wall clock, and the shares would mix the two kinds of time.
+
 ## Testing
 
 The measurements themselves have no `cargo test` equivalent; correctness is embedded in each run's
 `-O0`/`-O3` equivalence check and in the process modes' exit/stdout checks. `cargo test -p
 wukong_bench` covers the pure parts of the process modes: the min/median/p95 statistics, the thread
 sweep, option parsing, the pinned report-line spellings, and that both built-in programs still
-compile and dispatch `wukong_sgemm_parallel`.
+compile and dispatch `wukong_sgemm_parallel`. It also checks that `compile-time`'s per-pass
+attribution runs on one optimizer thread.
