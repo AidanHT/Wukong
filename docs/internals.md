@@ -343,6 +343,58 @@ The timer is inert unless asked for and reports from its `Drop`, so every exit p
 `--depfile=<f>` writes a Make rule over the `SourceMap`'s files — exactly the root and each import
 the loader read — with gcc `-MP`-style empty rules for the imports.
 
+**Several artifacts, one compile (`--emit=a,b,..`).** `EmitStage::parse_list` sorts the list into
+pipeline order — `EmitStage`'s declaration order, which its derived `Ord` makes load-bearing — and
+splits it into `Options::emit`, the stage the compile runs to (the last), and `Options::emit_also`,
+the stages emitted on the way. `compile` is unchanged for a single stage: every stage stop asks
+`opts.emits(stage)` and returns only when the stage is `emit` (or failed), and everything that
+decides *what* is compiled — the autodiff lowering, pruning to `main`, `lint_options_for`'s library
+roots, `native_reachable`, the object kind, `exports_gradient` — still keys on `emit`, so the
+list's last stage decides what is compiled. That is why `check` and `grad` combine only with
+`tokens`/`ast` (no later stage runs after `check`; `--emit=grad` returns from `compile` where
+`emit_grad` prints the backward MIR, before the MIR and IR stages print) and why `obj` and `exe`
+exclude each other (library object vs pruned, mangled executable): any other list is one compile
+whose every artifact, without `exe` and without `--grad-of` on an `obj` list, is byte-identical to
+that stage alone (`crates/wukongc/tests/emit.rs` checks all six text stages on four programs at
+`-O0` and `-O2`). With `exe` the compile is the executable's, so the MIR and IR it also emits are
+the pruned program it links. With `obj` and `--grad-of` it is the gradient export's
+(`exports_gradient`): `unroll_for_autodiff` lowering (so `mir-high` differs too), at least `-O1`
+with `OptimizeOptions::AUTODIFF_INPUT`, and `append_gradient`'s `<fn>_grad` in the `mir`,
+`mir-text` and `llvm-ir` — the program the object is built from, which a lone `--emit=mir`
+(it ignores `--grad-of`) does not show (`emit.rs` pins the object against `--emit=obj --grad-of`'s
+and the gradient in the MIR and IR). Artifacts leave through one function, `put_artifact`:
+stdout for a single stage (byte-for-byte the old path), stdout under a `==> <stage> <==` header for
+a list, or `Options::artifact_path` — `-o`'s path with the stage's `EmitStage::extension` — for a
+list with `-o`; the object and executable reach `emit_native` through a clone of the options whose
+`output` is that path. `report::depfile_targets` names every file written. The combination rules
+that involve other flags (`-o`, `--run`, `--train`, `--depfile`, `--passes`, a `.mir` input) stay in
+`wukongc`'s `parse_args`.
+
+**The REPL (`wukong_driver::repl`).** `wukongc --repl` keeps the inputs it accepted as source text
+and, for every new input, compiles a whole program from them through the same front end, lowering,
+optimizer and backends as `--run`. Each input is its own `SourceMap` file, `<repl:N>`, so diagnostics
+need no remapping: an item input parses with `parse_module_tokens_with_lints`, a statement input
+with `wukong_parser::parse_stmts_tokens_with_lints` (a block body to end of input, the tail
+expression kept), and the wrapper `main` is parsed from source too — `fn main() -> i32 {
+__wukong_repl_replay; printf(MARK); eprintf(MARK); __wukong_repl_input; [printf("{:?}\n",
+__wukong_repl_value);] printf(END); return 0; }` — and its placeholders are replaced by the parsed
+statements of every earlier statement input (the replay), the new input's statements, and its tail.
+The run captures stdout (`run_capturing` on either backend) and stderr
+(`wukong_runtime::fmt::begin_stderr_capture`, which `write_stream` and the interpreter's stderr
+path honour); only what follows `MARK` is shown, and `END` present is how the session knows the
+input ran to its end (an `exit(0)` is otherwise indistinguishable from completion). An item input is
+compiled with the replay and the replay is run, so a redefinition that breaks an earlier input is
+refused; items are grouped (an `impl` marker with its flattened methods) and keyed by name, and a
+later group with the same key drops the earlier one. A tail's value is printed when sema accepts it
+as a `printf("{:?}")` argument (a second check of the printing program decides, so the REPL never
+re-derives which types print); otherwise its type is shown. `wukong_runtime::process::detach_stdin`
+gives every program the session runs an empty standard input. Where an input ends is decided on
+the lexer's tokens (`repl::needs_more`): a stack of the brackets still open, from which an
+unterminated string (`E0102`; a string ends at its line) drops every bracket opened on its line
+before it, an open block comment (`E0103`), and an input that is so far only attributes
+(`repl::after_attributes`, the skipper `classify` also uses) all read on. The rules a user sees
+are in the language guide, "The REPL".
+
 ## Diagnostics
 
 Every diagnostic has a stable code (`E01xx` lexer, `E02xx` parser, `E03xx` name res, `E04xx` types,

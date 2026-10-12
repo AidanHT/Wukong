@@ -127,10 +127,24 @@ pub fn env_cstr(name: &[u8]) -> &'static CStr {
     leaked
 }
 
+/// Set once a host that owns this process's standard input itself — `wukongc --repl`, which reads
+/// its inputs from it — has detached the program from it: a program then reads end of input.
+static STDIN_DETACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Detach every program this process runs from standard input, for good: `read_stdin_u8` reads
+/// nothing (end of input) from now on. `wukongc --repl` calls it, so a program it evaluates cannot
+/// consume the session's own input lines.
+pub fn detach_stdin() {
+    STDIN_DETACHED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Read standard input into `buf` until it is full or input ends; the byte count, or
-/// `fileio::IO_ERROR` (`-2`) when reading fails.
+/// `fileio::IO_ERROR` (`-2`) when reading fails. `0` once [`detach_stdin`] was called.
 pub fn read_stdin_into(buf: &mut [u8]) -> i64 {
     use std::io::Read;
+    if STDIN_DETACHED.load(std::sync::atomic::Ordering::Relaxed) {
+        return 0;
+    }
     let mut stdin = std::io::stdin().lock();
     let mut n = 0usize;
     while n < buf.len() {

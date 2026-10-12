@@ -14,6 +14,7 @@ USAGE:
     wukongc [OPTIONS] <input.wk> [-- <program args>...]
     wukongc [OPTIONS] -              (read the program from standard input)
     wukongc [OPTIONS] -e <source>    (the program is the <source> argument)
+    wukongc --repl [OPTIONS]         (an interactive session on standard input; `:help` inside)
     wukongc fmt [--check] [--stdout] <path|->...   (format source files; `wukongc fmt --help`)
 
 OPTIONS:
@@ -23,17 +24,30 @@ OPTIONS:
     --time-trace=<f>   Write the same timings to <f> as Chrome trace-event JSON
                        (chrome://tracing, Perfetto, speedscope)
     --depfile=<f>      Write a Make-syntax dependency file to <f> naming every source file
-                       read (the root and each import); its target is the -o artifact for
-                       --emit=obj/exe, otherwise <f> itself (not with --emit=tokens/ast)
+                       read (the root and each import); its targets are the files the compile
+                       writes (the -o artifact of --emit=obj/exe, each <stem>.<ext> of an
+                       --emit list with -o), otherwise <f> itself (not when the last stage is
+                       tokens or ast)
     --emit=<stage>     Emit an intermediate artifact and stop. One of:
                        tokens, ast, check, mir-high, mir, mir-text, grad, llvm-ir, obj, exe
                        (default: exe)
                        (mir-text = the optimized MIR with every type, float bits and parameter
                        promise spelled out; `wukongc --emit=mir|mir-text [-O<n>] [--passes=..]
                        f.mir` reads it back, verifies, optimizes and prints it. A .mir input takes
-                       no other stage and no --run)
+                       only those two stages and no --run)
                        (grad = reverse-mode backward MIR of a loss fn; see --grad-of/--grad-wrt)
                        (check = run lex/parse/imports/sema only, report diagnostics, no lowering)
+    --emit=<stage>,<stage>...
+                       Emit several artifacts from ONE compile, in pipeline order whatever the
+                       written order. Text artifacts go to stdout, each under a
+                       `==> <stage> <==` header line; with -o <stem> every artifact goes to
+                       <stem>.<ext> instead: .tokens, .ast, .mir-high, .mir-low (mir), .mir
+                       (mir-text), .grad, .ll (llvm-ir), .o (obj), the host's executable
+                       extension (exe). obj or exe in a list needs -o; check and grad combine
+                       only with tokens/ast; obj not with exe. The last stage decides the
+                       compile: with exe, mir/mir-text/llvm-ir show the program pruned to what
+                       main reaches; with obj and --grad-of, the gradient export (<fn>_grad
+                       included, at least -O1)
     --grad-of=<fn>     Function to differentiate for --emit=grad / --train  (default: loss).
                        With --emit=obj, the object also exports the gradient as <fn>_grad
     --grad-wrt=<i,..>  Comma-separated parameter indices to differentiate w.r.t. (default: all
@@ -60,6 +74,12 @@ OPTIONS:
     --run              Compile and run (interpreter by default; see --backend). The program's
                        stdout streams as it runs: per line on a terminal, in blocks into a pipe
                        or a file
+    --repl             Read standard input a line at a time and evaluate it: items (fn, struct,
+                       enum, const, import, impl, ...) are kept; a statement runs and an
+                       expression prints its value; an input continues while a bracket is open.
+                       Commands: :help, :quit, :reset, :items, :type <expr>. Takes --backend
+                       (interp, native), -O, --fp, --target-cpu, -A/-W/-D, --color,
+                       --error-format, --error-limit and --threads
     --backend=<b>      Execution backend: interp, native, gpu, gpu-native  (default: interp)
                        (gpu/gpu-native require --features gpu and a CUDA device; gpu is the
                        recognizer offload, gpu-native lowers the whole program's MIR to PTX)
@@ -69,7 +89,8 @@ OPTIONS:
                        so the object runs on any CPU of that level; the JIT refuses a level the
                        host lacks.
     -o <path>          Write the artifact to <path>. Only --emit=obj and --emit=exe write a
-                       file; every other stage prints its artifact on stdout.
+                       file; every other stage prints its artifact on stdout. With several
+                       --emit stages <path> is the stem every artifact is written under
     -g                 Put DWARF debug info in an --emit=obj/exe artifact: a line table mapping
                        every function's machine code to its source file:line:column, and one
                        subprogram per function. The machine code is unchanged; other stages and
@@ -129,6 +150,8 @@ EXAMPLES:
     wukongc --train --train-opt=adamw --emit=exe -o train.exe model.wk
     wukongc --run model.wk -- data/weights.bin 64
     wukongc --run -e 'fn main() -> i32 { printf(\"{}\\n\", 6 * 7); return 0; }'
+    wukongc --emit=mir,llvm-ir,obj -O2 -o kernel kernel.wk
+    wukongc --repl --backend=native
 ";
 
 fn main() -> ExitCode {
@@ -173,7 +196,14 @@ fn run_compile(opts: Options) -> i32 {
     std::thread::Builder::new()
         .name("wukongc-compile".to_string())
         .stack_size(STACK_SIZE)
-        .spawn(move || compile(&opts))
+        // The REPL compiles every input on this same roomy stack.
+        .spawn(move || {
+            if opts.repl {
+                wukong_driver::repl::run(&opts)
+            } else {
+                compile(&opts)
+            }
+        })
         .expect("failed to spawn compiler thread")
         .join()
         .unwrap_or(wukong_driver::exit::COMPILE_ERROR)
@@ -365,6 +395,66 @@ fn indexed_path(flag: &str, v: &str) -> Result<(usize, PathBuf), String> {
     Ok((index, PathBuf::from(path)))
 }
 
+/// `--repl` evaluates standard input on the interpreter or the native JIT. It honours the flags
+/// that shape how an input compiles and runs — `--backend=interp|native`, `-O<n>`, `--fp`,
+/// `--target-cpu`, `-A/-W/-D`, `--color`, `--error-format`, `--error-limit` and `--threads` — and
+/// refuses every other one by name, rather than ignoring it.
+fn check_repl_flags(opts: &Options, has_input: bool, emit_explicit: bool) -> Result<(), String> {
+    let defaults = Options::default();
+    let refused = [
+        (has_input, "an input file or `-e`"),
+        (opts.run, "`--run`"),
+        (emit_explicit, "`--emit`"),
+        (opts.output.is_some(), "`-o`"),
+        (!opts.program_args.is_empty(), "`--` program arguments"),
+        (opts.grad.train, "`--train`"),
+        (
+            opts.grad.of.is_some() || !opts.grad.wrt.is_empty(),
+            "`--grad-of` / `--grad-wrt`",
+        ),
+        (opts.depfile.is_some(), "`--depfile`"),
+        (
+            opts.time_passes || opts.time_trace.is_some(),
+            "`--time-passes` / `--time-trace`",
+        ),
+        (
+            opts.passes.is_some() || opts.print_after.is_some(),
+            "`--passes` / `--print-after`",
+        ),
+        (opts.verify_each, "`--verify-each`"),
+        (opts.remarks_dispatch, "`--remarks`"),
+        (
+            matches!(
+                opts.backend,
+                wukong_driver::BackendKind::Gpu | wukong_driver::BackendKind::GpuLower
+            ),
+            "a GPU `--backend` (the REPL runs on interp or native)",
+        ),
+    ];
+    if let Some((_, what)) = refused.iter().find(|(given, _)| *given) {
+        return Err(format!("`--repl` does not take {what}"));
+    }
+    // The training knobs only mean something with `--train`, which is refused above; a
+    // non-default value given alongside `--repl` is refused rather than dropped.
+    let g = &opts.grad;
+    let d = &defaults.grad;
+    if g.train_steps != d.train_steps
+        || g.train_lr != d.train_lr
+        || g.train_weight_decay != d.train_weight_decay
+        || g.train_opt != d.train_opt
+        || g.train_seed != d.train_seed
+        || !g.train_init.is_empty()
+        || !g.train_data.is_empty()
+        || !g.train_save.is_empty()
+        || g.train_clip.is_some()
+        || g.train_warmup != d.train_warmup
+        || g.train_schedule != d.train_schedule
+    {
+        return Err("`--repl` does not take the `--train-*` options".into());
+    }
+    Ok(())
+}
+
 /// Parse CLI arguments. `Ok(None)` means a help / version / `--explain` message was already printed
 /// and we should exit successfully without compiling. The two rejected flag *combinations* are
 /// checked at the end, after the whole argv has been seen.
@@ -398,6 +488,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 return Ok(None);
             }
             "--run" => opts.run = true,
+            "--repl" => opts.repl = true,
             // Everything after `--` belongs to the program `--run` executes, not to the compiler.
             "--" => {
                 opts.program_args = args[i + 1..].to_vec();
@@ -497,9 +588,12 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 opts.output = Some(PathBuf::from(path));
             }
             _ if arg.starts_with("--emit=") => {
-                let stage = &arg["--emit=".len()..];
-                opts.emit = EmitStage::parse(stage)
-                    .ok_or_else(|| format!("unknown --emit target `{stage}`"))?;
+                // One stage, or several from one compile (`--emit=mir,llvm-ir`): the last in
+                // pipeline order is the stage the compile runs to, the rest are emitted on the way.
+                let list = &arg["--emit=".len()..];
+                let (last, also) = EmitStage::parse_list(list)?;
+                opts.emit = last;
+                opts.emit_also = also;
                 emit_explicit = true;
             }
             _ if arg.starts_with("--grad-of=") => {
@@ -649,6 +743,18 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     // NO_COLOR / CLICOLOR_FORCE / TERM conventions, and VT setup on Windows.
     opts.color = resolve_color(color_choice);
 
+    // `--repl` reads its program from standard input, an input at a time: no input file, no stage
+    // and no artifact. What it does honour is checked in one place.
+    if opts.repl {
+        check_repl_flags(
+            &opts,
+            input.is_some() || inline_source.is_some(),
+            emit_explicit,
+        )?;
+        opts.input = PathBuf::from("<repl>");
+        return Ok(Some(opts));
+    }
+
     match (input, inline_source) {
         (Some(_), Some(_)) => {
             return Err(
@@ -684,6 +790,13 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     // `--train` either runs now or, with `--emit=exe|obj` (or `-o`, whose default stage is `exe`),
     // is built into an artifact that runs the same loop. No other stage is a training artifact.
     if opts.grad.train {
+        if opts.multi_emit() {
+            return Err(
+                "`--train` builds one artifact (`--emit=exe` or `--emit=obj`), not an \
+                 `--emit=<stage>,<stage>` list"
+                    .into(),
+            );
+        }
         if emit_explicit && !matches!(opts.emit, EmitStage::Obj | EmitStage::Exe) {
             return Err(
                 "`--train` cannot be combined with `--emit=<stage>` other than `exe` or `obj`: \
@@ -705,7 +818,9 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     // `-o` names an artifact FILE, and only the two artifact stages write one. For every textual
     // stage the driver prints to stdout and the flag was silently ignored — no file appeared and
     // the process still exited 0, so `wukongc --emit=llvm-ir -o out.ll p.wk && llc out.ll` failed
-    // at the *next* command with a missing-file error naming the wrong culprit.
+    // at the *next* command with a missing-file error naming the wrong culprit. A multi-artifact
+    // `--emit=a,b` is the exception: there `-o` names the stem every artifact is written under
+    // (`<stem>.<ext>`), the text ones included.
     if opts.output.is_some() {
         if opts.run {
             return Err(
@@ -713,13 +828,27 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                     .to_string(),
             );
         }
-        if !matches!(opts.emit, EmitStage::Obj | EmitStage::Exe) {
+        if !opts.multi_emit() && !matches!(opts.emit, EmitStage::Obj | EmitStage::Exe) {
             return Err(
                 "`-o` is only supported with `--emit=obj` and `--emit=exe`: every other stage \
                  prints its artifact on stdout (redirect it instead)"
                     .to_string(),
             );
         }
+    }
+
+    // Without `-o` a multi-artifact compile prints its text artifacts on stdout, one after another;
+    // an object or an executable has no place in that stream.
+    if opts.multi_emit() && opts.emit.is_binary() && opts.output.is_none() {
+        return Err(format!(
+            "`--emit={}` with `{}` writes every artifact to a file: give `-o <stem>` (each \
+             artifact is written to `<stem>.<ext>`)",
+            opts.emit_stages()
+                .map(EmitStage::name)
+                .collect::<Vec<_>>()
+                .join(","),
+            opts.emit.name()
+        ));
     }
 
     // `--passes` / `--print-after` act on the optimizer, so a stage that stops before it would
@@ -766,7 +895,11 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                     .to_string(),
             );
         }
-        if !emit_explicit || !matches!(opts.emit, EmitStage::Mir | EmitStage::MirText) {
+        if !emit_explicit
+            || !opts
+                .emit_stages()
+                .all(|s| matches!(s, EmitStage::Mir | EmitStage::MirText))
+        {
             return Err(
                 "a `.mir` input is read only by `--emit=mir` and `--emit=mir-text`".to_string(),
             );
@@ -1201,6 +1334,158 @@ mod tests {
         assert!(parse(&["--run", "--emit=mir-text", "p.wk"]).is_err());
         assert!(parse(&["--emit=mir-text", "-o", "p.txt", "p.wk"]).is_err());
         assert!(USAGE.contains("mir-text") && USAGE.contains("f.mir"));
+    }
+
+    /// `--emit=a,b`: one compile whose stages sort into pipeline order (the last is the stage the
+    /// compile runs to, the others are emitted on the way), with `-o` naming the stem of every
+    /// artifact. A list one compile cannot honour, and a flag a list contradicts, is a usage error.
+    #[test]
+    fn multi_artifact_emit_lists_parse_and_reject_contradictions() {
+        let parse = |a: &[&str]| parse_args(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let o = parse(&["--emit=llvm-ir,mir,tokens", "p.wk"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(o.emit, EmitStage::LlvmIr);
+        assert_eq!(o.emit_also, [EmitStage::Tokens, EmitStage::Mir]);
+        assert!(o.multi_emit() && o.output.is_none());
+        let o = parse(&["--emit=exe,mir-text", "-o", "out/k", "p.wk"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (o.emit, &o.emit_also[..]),
+            (EmitStage::Exe, &[EmitStage::MirText][..])
+        );
+        assert_eq!(
+            o.artifact_path(EmitStage::MirText),
+            Some(PathBuf::from("out/k.mir"))
+        );
+        let o = parse(&["--emit=mir,llvm-ir,mir-high", "-o", "out/k.v2", "p.wk"])
+            .unwrap()
+            .unwrap();
+        for (stage, file) in [
+            (EmitStage::MirHigh, "out/k.mir-high"),
+            (EmitStage::Mir, "out/k.mir-low"),
+            (EmitStage::LlvmIr, "out/k.ll"),
+        ] {
+            assert_eq!(o.artifact_path(stage), Some(PathBuf::from(file)));
+        }
+        // A single stage is exactly what it was: no list, and `-o` only for obj/exe.
+        let single = parse(&["--emit=mir", "p.wk"]).unwrap().unwrap();
+        assert!(!single.multi_emit() && single.artifact_path(EmitStage::Mir).is_none());
+        assert!(parse(&["--emit=mir", "-o", "k", "p.wk"]).is_err());
+        for (bad, says) in [
+            (&["--emit=mir,", "p.wk"][..], "empty stage"),
+            (&["--emit=mir,bogus", "p.wk"][..], "bogus"),
+            (&["--emit=mir,mir-low", "p.wk"][..], "twice"),
+            (&["--emit=check,mir", "p.wk"][..], "combines only"),
+            (&["--emit=grad,llvm-ir", "p.wk"][..], "combines only"),
+            (
+                &["--emit=obj,exe", "-o", "k", "p.wk"][..],
+                "two different builds",
+            ),
+            (&["--emit=mir,obj", "p.wk"][..], "-o <stem>"),
+            (&["--emit=mir,exe", "p.wk"][..], "-o <stem>"),
+            (
+                &["--train", "--emit=mir,exe", "-o", "k", "p.wk"][..],
+                "one artifact",
+            ),
+            (&["--run", "--emit=mir,llvm-ir", "p.wk"][..], "--run"),
+            (
+                &["--emit=tokens,ast", "--depfile=p.d", "p.wk"][..],
+                "--depfile",
+            ),
+            (&["--emit=mir-high,mir", "x.mir"][..], ".mir"),
+            (
+                &["--passes=dce", "--emit=tokens,mir-high", "p.wk"][..],
+                "--passes",
+            ),
+            (
+                &[
+                    "--passes=dce",
+                    "--emit=mir,obj",
+                    "--grad-of=loss",
+                    "-o",
+                    "k",
+                    "p.wk",
+                ][..],
+                "gradient",
+            ),
+        ] {
+            let err = parse(bad).unwrap_err();
+            assert!(err.contains(says), "{bad:?}: {err}");
+        }
+        for ok in [
+            &["--emit=tokens,check", "p.wk"][..],
+            &["--emit=ast,grad", "p.wk"][..],
+            &["--emit=mir,mir-text", "x.mir"][..],
+            &["--emit=mir,mir-text", "-o", "k", "x.mir"][..],
+            &["--emit=tokens,mir", "--depfile=p.d", "p.wk"][..],
+            &["--emit=mir-high,mir", "--passes=dce", "p.wk"][..],
+            &["--emit=mir,obj", "--grad-of=loss", "-o", "k", "p.wk"][..],
+        ] {
+            assert!(parse(ok).is_ok(), "{ok:?}: {:?}", parse(ok).err());
+        }
+        for doc in [
+            "--emit=<stage>,<stage>...",
+            "==> <stage> <==",
+            ".mir-low",
+            "<stem>",
+        ] {
+            assert!(USAGE.contains(doc), "USAGE must document {doc}");
+        }
+    }
+
+    /// `--repl` takes the flags that shape how an input compiles and runs, and refuses every other
+    /// one by name; the no-argument invocation is still the "no input file" usage error.
+    #[test]
+    fn repl_takes_the_run_shaping_flags_and_refuses_the_rest() {
+        let parse = |a: &[&str]| parse_args(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let o = parse(&["--repl"]).unwrap().unwrap();
+        assert!(o.repl && !o.run && o.backend == wukong_driver::BackendKind::Interp);
+        assert_eq!(o.input, PathBuf::from("<repl>"));
+        let o = parse(&[
+            "--backend=native",
+            "-O2",
+            "--repl",
+            "--fp=strict",
+            "--target-cpu=x86-64-v2",
+            "-D",
+            "warnings",
+            "--color=never",
+            "--error-format=json",
+            "--error-limit=3",
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(o.repl && o.opt_level == 2 && o.strict_fp);
+        assert_eq!(o.backend, wukong_driver::BackendKind::Native);
+        assert_eq!(o.error_format, wukong_driver::ErrorFormat::Json);
+        assert_eq!(o.error_limit, Some(3));
+        for bad in [
+            &["--repl", "p.wk"][..],
+            &["--repl", "-"][..],
+            &["--repl", "-e", "1"][..],
+            &["--repl", "--run"][..],
+            &["--repl", "--emit=mir"][..],
+            &["--repl", "-o", "k"][..],
+            &["--repl", "--", "a"][..],
+            &["--repl", "--train"][..],
+            &["--repl", "--train-steps=3"][..],
+            &["--repl", "--grad-of=f"][..],
+            &["--repl", "--backend=gpu"][..],
+            &["--repl", "--depfile=k.d"][..],
+            &["--repl", "--time-passes"][..],
+            &["--repl", "--passes=dce"][..],
+            &["--repl", "--verify-each"][..],
+            &["--repl", "--remarks=dispatch"][..],
+        ] {
+            let err = parse(bad).unwrap_err();
+            assert!(err.contains("--repl"), "{bad:?}: {err}");
+        }
+        assert_eq!(parse(&[]).unwrap_err(), "no input file given");
+        for doc in ["--repl", ":type <expr>", ":reset", ":items"] {
+            assert!(USAGE.contains(doc), "USAGE must document {doc}");
+        }
     }
 
     #[test]

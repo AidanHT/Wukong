@@ -2517,6 +2517,7 @@ continue a long subtraction and is not reported.
 wukongc [OPTIONS] <input.wk> [-- <program args>...]
 wukongc [OPTIONS] -              read the program from standard input (named <stdin>)
 wukongc [OPTIONS] -e <source>    the program is the <source> argument itself
+wukongc --repl [OPTIONS]         an interactive session on standard input (see "The REPL")
 
 --                    everything after it is passed to the program --run executes: arg(1),
                       arg(2), ... (arg(0) is the program); without --run it is a usage error
@@ -2532,6 +2533,9 @@ wukongc [OPTIONS] -e <source>    the program is the <source> argument itself
                       gpu-lower = gpu-native; any other value is a usage error (exit 2)
 --emit=<stage>        tokens | ast | check | mir-high | mir (alias mir-low) | mir-text | grad |
                       llvm-ir | obj | exe   (default: exe)
+--emit=<s>,<s>,...    several artifacts from ONE compile, emitted in pipeline order whatever the
+                      written order: text ones on stdout, each under a `==> <stage> <==` line, or
+                      with -o <stem> every one at <stem>.<ext> (see "Several artifacts at once")
                       mir-text = the optimized MIR with every type, float constant bits, static,
                       extern signedness and parameter promise spelled out. An input ending in
                       .mir is such a dump: `wukongc --emit=mir|mir-text [-O<n>] [--passes=..]
@@ -2586,8 +2590,9 @@ wukongc [OPTIONS] -e <source>    the program is the <source> argument itself
                       "Floating-point semantics"). Rejected with --emit=grad and --train (exit 1).
 -o <path>             write the artifact to <path> — only with --emit=obj or --emit=exe (default:
                       <stem>.o for objects; executables get <stem>.exe on Windows and plain <stem>
-                      on unix). Rejected with --run and with every other stage, which print their
-                      artifact on stdout — redirect instead.
+                      on unix). Rejected with --run and with every other single stage, which print
+                      their artifact on stdout — redirect instead. With several --emit stages,
+                      <path> is the stem every artifact is written under.
 -g                    put DWARF debug info in an --emit=obj/exe artifact: a line table from every
                       function's machine code to file:line:column, a subprogram per function and
                       call frames; the machine code is unchanged. Other stages and --train ignore
@@ -2599,8 +2604,10 @@ wukongc [OPTIONS] -e <source>    the program is the <source> argument itself
 --time-trace=<f>      write the same timings to <f> as Chrome trace-event JSON
                       (chrome://tracing, Perfetto, speedscope)
 --depfile=<f>         write a Make-syntax dependency file (root + every import, plus an empty rule
-                      per import as gcc -MP does); target = the -o artifact for --emit=obj/exe,
-                      otherwise <f> itself. Rejected with --emit=tokens/ast (they stop before imports)
+                      per import as gcc -MP does); targets = every file the compile writes (the -o
+                      artifact of --emit=obj/exe, each <stem>.<ext> of an --emit list with -o),
+                      otherwise <f> itself. Rejected when the last stage is tokens or ast (they stop
+                      before imports)
 --error-format=<f>    human | json   (default: human)
                       json spans carry byte/line end positions, plus suggestions, children,
                       a rendered field and "version":1 (the v0 severity/code/message prefix is
@@ -2615,6 +2622,9 @@ wukongc [OPTIONS] -e <source>    the program is the <source> argument itself
                       auto honours NO_COLOR, CLICOLOR_FORCE and TERM=dumb, and enables Windows VT
 --remarks=dispatch    print a note (stderr) at every statement — or function — the compiler replaced
                       with a recognized runtime kernel call, naming the kernel; output is unchanged
+--repl                read standard input a line at a time and evaluate it (see "The REPL"); takes
+                      --backend=interp|native, -O, --fp, --target-cpu, -A/-W/-D, --color,
+                      --error-format, --error-limit and --threads, and refuses every other flag
 -h, --help            print the usage text and exit 0
 -V, --version         print the version and exit 0
 ```
@@ -2708,3 +2718,120 @@ the report. A loss that fails at run time (a failed `assert`, a bounds failure) 
 `--train --run` trains the selected loss without calling `main`. Combining `--train` with any
 other explicit `--emit=<stage>` is a usage error (exit 2). GPU training selectors are unsupported
 by this CPU trainer, and no training speedup is established by the correctness checks.
+
+### Several artifacts at once ✅
+
+`--emit=<stage>,<stage>,...` produces several artifacts from **one** compile, in pipeline order
+(`tokens`, `ast`, `mir-high`, `mir`, `mir-text`, `llvm-ir`, `obj` / `exe`) whatever order the list
+is written in:
+
+```
+wukongc --emit=mir,llvm-ir -O2 kernel.wk                # both on stdout, each under its header
+wukongc --emit=ast,mir-text,obj -O2 -o kernel kernel.wk   # kernel.ast, kernel.mir, kernel.o
+```
+
+Without `-o` every artifact goes to stdout after a `==> <stage> <==` header line (each artifact ends
+in a newline, so the stream splits at the headers); an object or an executable cannot go there, so a
+list with `obj` or `exe` needs `-o`. With `-o <stem>` every artifact — text ones included — is
+written to `<stem>.<ext>` (the `-o` path with its extension replaced) and a `wrote <file>` line goes
+to stderr for each: `.tokens`, `.ast`, `.mir-high`, `.mir-low` for `mir`, `.mir` for `mir-text` (the
+form a `.mir` input is read back as), `.grad`, `.ll` for `llvm-ir`, `.o` for `obj`, and the host's
+executable extension for `exe` (`.exe` on Windows, none on unix). `--depfile` names every file
+written as the rule's targets. The list's last stage decides what is compiled. Without `exe`, and
+without `--grad-of` on a list that ends in `obj`, each artifact of a list is byte-for-byte what that
+stage prints alone. With `exe` the compile is the executable's: like `--emit=exe` it keeps only what
+`main` reaches, so the `mir`, `mir-text` and `llvm-ir` it also emits show exactly the program the
+executable was linked from. With `obj` and `--grad-of=<fn>` the compile is the gradient export's,
+like `--emit=obj --grad-of=<fn>`: its `mir-high` shows the lowering autodiff takes, and its `mir`,
+`mir-text` and `llvm-ir` show the program the object is built from — at least `-O1`, with the
+generated `<fn>_grad` — which no stage prints alone (a lone `--emit=mir` ignores `--grad-of`). A
+stage that fails stops the compile, after the artifacts before it.
+
+Refused, as usage errors (exit 2): an unknown or empty element, a stage named twice (`mir,mir-low`
+included), `check` or `grad` with any stage but `tokens`/`ast` (`check` stops before lowering;
+`--emit=grad` is a pipeline of its own — at least `-O1`, autodiff lowering, no pruning — that ends
+where it prints the backward MIR, before any MIR or IR stage prints), `obj` with
+`exe` (a library object exports every function under its source name, an executable keeps what
+`main` reaches, mangled: two builds), and a list with `--train`. A `.mir` input takes `mir`,
+`mir-text` or both.
+
+### The REPL ✅
+
+`wukongc --repl` reads standard input a line at a time and evaluates it on the interpreter, or on
+the native JIT with `--backend=native`:
+
+```
+$ wukongc --repl
+wk[1]> fn sq(x: f32) -> f32 { x * x }
+wk[2]> let a = [1.0, 2.0, 3.0];
+wk[3]> sq(a[2])
+9.0
+wk[4]> let mut total = 0.0;
+wk[5]> for i in 0..3 {
+   ...>     total = total + sq(a[i]);
+   ...> }
+wk[6]> total
+14.0
+wk[7]> :type a
+[f32; 3]
+```
+
+An input runs to the end of a line, or on over the next lines while a `(`, `[` or `{` (or a block
+comment) is still open; a bracket inside a string or a comment does not count. An input that is so
+far only `@attributes` also runs on, so an attribute on a line of its own (`@strict_fp`, then the
+`fn` on the next line) stays on the item or statement after it. A string cannot span lines: one
+left open on its line is that input's error, reported at once, and a bracket opened before it on
+that line (`print("abc`) does not hold the input open — one opened on an earlier line (the body
+the string sits in) still does. An input whose first token — after any `@attributes` — starts an
+item (`fn`, `struct`, `enum`, `const`, `import`, `extern`, `trait`, `impl`, `type`, `pub`) is
+**kept** for every later input; an item named like an earlier one **replaces** it (an `impl` block
+replaces the earlier `impl` of the same type and trait). Any other input is **statements**: they run
+as the body of a synthesized `main`, and an input that ends in an expression with no `;` prints the
+expression's value in `{:?}` style (`9.0`, `"hi"`, `[1, 2]`, `P { x: 1 }`); a `()` value prints
+nothing, and a value with no printed form (a pointer, a tensor, a function) prints its type in
+angle brackets (`<fn(f32) -> f32>`). Imports resolve against the current directory.
+
+**Bindings persist by replay.** Each statement input runs after a replay of every earlier statement
+input that was kept, in order, in the same `main` — so `let` bindings, and every later assignment to
+them, carry forward, and a later `let` of a name shadows the earlier one as it would in a block. The
+replay's stdout and stderr are captured and dropped, so only the new input's output shows. A
+binding is therefore not a stored value, as it is in Python or Julia, but its statements, re-run on
+every input against the items as they are then: after `fn rate() -> i32 { 2 }` and
+`let tax = 100 * rate();`, `tax` is `200`, and once `fn rate() -> i32 { 3 }` replaces `rate`, `tax`
+is `300` — no input assigned to it, and the redefinition is accepted without a word because the
+replay still runs. What the replay cannot undo it repeats: the earlier inputs' work is redone on
+every input (an input that took a second costs a second each time after), files they wrote are
+written again, a clock read reads anew, and their heap buffers are allocated again — on the native
+JIT a buffer an input never `free`s stays allocated until the session ends (the interpreter's
+memory lasts one run). A program in the REPL reads end of input from `read_stdin_u8` — standard
+input is the session's. Output appears when the input finishes running.
+
+**An input that fails is not kept.** One that fails to compile, fails at run time (a failed
+`assert`, an index out of bounds) or ends the program early (`exit(c)`, a `return` inside a block)
+is reported and dropped; the session continues from where it was. A new item is compiled with every
+kept input and the replay is run, so a redefinition that would break an earlier input — a changed
+signature, an `assert` that now fails — is refused. A top-level `return` or `defer`, and a function
+named `main`, are refused outright: `main` is the session's.
+
+**Diagnostics point into the REPL buffer.** Every input is its own source file, `<repl:N>` (`N`
+counts the inputs, as the prompt shows), so an error reads `--> <repl:5>:2:9` — line 2 of input 5 —
+with that input's line under it. Errors show wherever they are (a redefinition that breaks input 3
+shows the break in `<repl:3>`); warnings show for the new input only. `unused_variables`,
+`unused_mut` and `unused_imports` are off (a binding or an import is made for later inputs) and
+`dead_code` has nothing to measure against.
+
+| command | does |
+|---|---|
+| `:help` | print the commands and these rules |
+| `:quit` (`:q`, `:exit`, end of input) | leave the session (exit status 0) |
+| `:reset` | forget every item and binding |
+| `:items` | print the source of every item the session keeps, in definition order |
+| `:type <expr>` | print the type sema gives `<expr>` after the kept inputs, without running it |
+
+The REPL takes the flags that shape how an input compiles and runs (`--backend=interp|native`,
+`-O<n>`, `--fp`, `--target-cpu`, `-A`/`-W`/`-D`, `--color`, `--error-format`, `--error-limit`,
+`--threads`) and refuses the rest (an input file, `-e`, `--run`, `--emit`, `-o`, `--train`, …) as a
+usage error. On a terminal it prints a banner and the `wk[N]>` / `...>` prompts to stderr; with
+standard input a pipe it prints neither, so `wukongc --repl < session.txt` writes only values and
+program output to stdout. `wukongc` with no arguments is still the "no input file given" usage
+error.

@@ -693,3 +693,71 @@ fn main() -> i32 {
     }
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// `--emit=mir,exe -o <stem>` is the executable's compile: it links `<stem>` plus the host's
+/// executable extension, which runs exactly as `--run` does, and the MIR it writes beside it is the
+/// program that executable was linked from — pruned to what `main` reaches, so a function nothing
+/// calls is in `--emit=mir` alone but not in the list's MIR. The program needs only the
+/// `wukong_rt_*` runtime, which both link paths provide.
+#[test]
+fn multi_artifact_emit_links_the_program_its_mir_shows() {
+    let link = probe_link_path();
+    if link == LinkPath::None {
+        eprintln!(
+            "multi_artifact_emit_links_the_program_its_mir_shows: neither `rustc` + a \
+             `wukong_runtime` rlib nor a C compiler runs on this box - skipped"
+        );
+        return;
+    }
+    let tmp = std::env::temp_dir()
+        .join("wukong_exe_multi_emit")
+        .join(std::process::id().to_string());
+    std::fs::create_dir_all(&tmp).expect("create multi-emit scratch dir");
+    let src = tmp.join("pruned.wk");
+    std::fs::write(
+        &src,
+        "fn used(x: i32) -> i32 {
+    return x * 3;
+}
+
+@allow(dead_code)
+fn never_called(x: i32) -> i32 {
+    return x - 1;
+}
+
+fn main() -> i32 {
+    print(used(14));
+    return 0;
+}
+",
+    )
+    .unwrap();
+    let stem = tmp.join("pruned_multi");
+    let emitted = outcome(
+        Command::new(env!("CARGO_BIN_EXE_wukongc"))
+            .current_dir(&tmp)
+            .arg("--emit=mir,exe")
+            .arg("-o")
+            .arg(&stem)
+            .arg(&src),
+    );
+    assert_eq!(emitted.0, Some(0), "{link:?}:\n{}", emitted.2);
+    assert!(emitted.1.is_empty(), "with -o nothing goes to stdout");
+    let exe = stem.with_extension(std::env::consts::EXE_EXTENSION);
+    let ran = outcome(&mut Command::new(&exe));
+    assert_eq!((ran.0, ran.1.as_str()), (Some(0), "42\n"), "{}", ran.2);
+    assert_eq!(run_interp(&src), (Some(0), "42\n".to_string()));
+    let listed = std::fs::read_to_string(stem.with_extension("mir-low")).unwrap();
+    let alone = outcome(
+        Command::new(env!("CARGO_BIN_EXE_wukongc"))
+            .arg("--emit=mir")
+            .arg(&src),
+    );
+    assert_eq!(alone.0, Some(0), "{}", alone.2);
+    assert!(
+        listed.contains("used") && !listed.contains("never_called"),
+        "{listed}"
+    );
+    assert!(alone.1.contains("never_called"), "{}", alone.1);
+    let _ = std::fs::remove_dir_all(&tmp);
+}

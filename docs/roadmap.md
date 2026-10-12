@@ -891,8 +891,24 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
   `wukongc --run prog.wk -- …`, or a linked executable's own `argv`), `env`, `read_stdin_u8` and
   `exit(code)` (which returns through every caller on the JIT, like a failed `assert`).
   `wukongc -` reads the program from standard input and `wukongc -e <source>` takes it inline
-  (`tests/run/process_exit.wk`, `crates/wukongc/tests/process_io.rs`). 🟡 No interactive REPL yet,
-  and no line-at-a-time stdin read.
+  (`tests/run/process_exit.wk`, `crates/wukongc/tests/process_io.rs`). 🟡 A program reads
+  standard input a buffer at a time (`read_stdin_u8`); there is no line-reading builtin.
+- **Interactive REPL**: `wukongc --repl` reads standard input a line at a time — an input runs on
+  over the next lines while a bracket or a block comment is open, or while it is only
+  `@attributes` (an attribute on its own line stays on the item after it) — on the interpreter or
+  the native JIT. Items (`fn`, `struct`, `enum`, `const`, `import`, `impl`, …) are kept and a later item
+  of the same name replaces an earlier one; statements run in a synthesized `main` after a replay of
+  every earlier statement input whose stdout and stderr are dropped, so `let` bindings persist; an
+  input ending in an expression prints its value `{:?}`-style. `:help`, `:quit`, `:reset`, `:items`
+  and `:type <expr>` (sema's type, nothing runs). Every input is its own file `<repl:N>`, so
+  diagnostics point into it; a failing input (compile, run time, `exit`) is dropped and the session
+  goes on (`crates/wukongc/tests/repl.rs`, both backends). 🟡 Sharp edges, by design of the replay:
+  every input re-executes the earlier ones (their time, their file writes, their clock reads, their
+  heap allocations — on the native JIT a buffer never `free`d stays allocated until the session
+  ends), a binding is recomputed by every replay, so redefining an item it was computed from
+  changes its value without an error, and an input's output appears when it finishes, not as it
+  runs. A top-level `return`/`defer` is refused,
+  a program reads end of input from `read_stdin_u8`, and the GPU backends are not offered.
 - **`--run` streams stdout** on the interpreter and the native JIT — per line on a terminal, in
   64 KiB blocks into a pipe — instead of holding everything until the program ends, so a training
   loop shows its progress and output printed before a runtime failure is already out. The GPU
@@ -970,8 +986,13 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
   one JSON line under `--error-format=json`), `--time-trace=<f>` (Chrome trace-event JSON) and
   `--depfile=<f>` (Make rule naming the root and every imported file). `--run`/`--emit=exe` compile
   only what `main` reaches; `-O0` native code is built at Cranelift `opt_level=none`, and the JIT
-  compiles functions in parallel. Not yet: several artifacts from one `--emit=a,b` invocation (each
-  stage is still its own compile), per-function timing in the trace, or a parallel optimizer.
+  compiles functions in parallel. `--emit=a,b,..` emits several artifacts from one compile, in
+  pipeline order — on stdout under `==> <stage> <==` headers, or each at `<stem>.<ext>` with
+  `-o <stem>` (a `--depfile` rule then names every file written). The last stage decides the
+  compile: without `exe` (and without `--grad-of` on a list ending in `obj`) every artifact is
+  byte-identical to its stage alone; with `exe` the MIR/IR shown is the pruned program the
+  executable links, and with `obj` and `--grad-of` the gradient export (`<fn>_grad` appended, at
+  least `-O1`) the object is built from. Not yet: per-function timing in the trace, or a parallel optimizer.
 - Optimizer debugging from the command line: `--passes=<list>` runs any list of the optimizer's
   function passes and program steps, and `--print-after=<pass|all>` prints the MIR after each run of
   a pass. Each `-O` level is such a list, held byte-identical to `optimize` by a driver test. Sharp

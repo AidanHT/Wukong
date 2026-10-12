@@ -189,6 +189,56 @@ All notable changes to Wukong are documented here. The format is loosely based o
   version and features `cranelift-codegen` already locks, is now a direct dependency of
   `wukong_codegen_cranelift` (no new crate is downloaded).
 
+### Several artifacts from one compile, and a REPL (`gap6/cli-repl-multiemit`)
+
+- **`--emit=<stage>,<stage>,...` (N67).** One compile emits several artifacts, in pipeline order
+  whatever the written order. Without `-o` the text artifacts go to stdout, each under a
+  `==> <stage> <==` header line; with `-o <stem>` every artifact goes to `<stem>.<ext>` (`.tokens`,
+  `.ast`, `.mir-high`, `.mir-low` for `mir`, `.mir` for `mir-text` — the form a `.mir` input reads
+  back — `.grad`, `.ll`, `.o`, and the host's executable extension) with a `wrote <file>` note each,
+  and a `--depfile` rule names every file written. The last stage decides what is compiled: without
+  `exe` (and without `--grad-of` on a list ending in `obj`) each artifact is byte-identical to its
+  stage alone (`crates/wukongc/tests/emit.rs`: six text stages, four programs, `-O0`/`-O2`, and
+  an object identical to `--emit=obj`'s); with `exe` the compile is the executable's, so the MIR/IR
+  shown is the program pruned to what `main` reaches, the one the executable links
+  (`tests/exe.rs`); with `obj` and `--grad-of=<fn>` it is the gradient export's, so the MIR/IR
+  shown is the program the object is built from — autodiff lowering, at least `-O1`, `<fn>_grad`
+  appended — which a lone `--emit=mir` (it ignores `--grad-of`) does not show (`emit.rs`). Usage errors (exit 2): an unknown, empty or repeated stage, `check` or `grad`
+  with any stage but `tokens`/`ast`, `obj` with `exe`, `obj`/`exe` in a list without `-o`, and a
+  list with `--train`. A single `--emit=<stage>` is unchanged, `-o` still names only an object or
+  an executable there, and a `.mir` input now also takes `--emit=mir,mir-text`. The `--time-passes`
+  header spells a stage as the command line does (`--emit=mir-high`, not `--emit=mirhigh`).
+- **`wukongc --repl` (N72).** An interactive session on standard input, read a line at a time; an
+  input continues while a bracket or a block comment is open, or while it is only `@attributes`
+  (an attribute on its own line stays on the item or statement after it). A string left open on
+  its line is that input's error at once, even after a bracket opened before it on that line
+  (`print("abc` does not swallow the lines after it). Items (`fn`, `struct`, `enum`,
+  `const`, `import`, `extern`, `trait`, `impl`, `type`) are kept, and a later item of the same name
+  replaces an earlier one. Statements run in a synthesized `main` on the interpreter or
+  `--backend=native`; an input ending in an expression prints its value `{:?}`-style (a value with
+  no printed form prints its type, `<fn(f32) -> f32>`). Bindings persist by replay: each input runs
+  after every earlier accepted statement input, whose stdout and stderr are captured and dropped —
+  so the earlier inputs' work, file writes, clock reads and heap allocations repeat (on the native
+  JIT a buffer never `free`d stays allocated until the session ends), and that cost is documented.
+  A binding is its statements, recomputed by every replay, not a stored value: redefining an item
+  it was computed from changes its value from the next input on, without an error. An input that
+  fails to compile, fails at run time or calls `exit` is reported and not kept; a new item is
+  compiled and replayed with the session, so a redefinition that breaks an earlier input is
+  refused. Every input is its own source file `<repl:N>`, so diagnostics point into the input with
+  lines counted from its own first line; warnings show for the new input only, and
+  `unused_variables`, `unused_mut`, `unused_imports` and `dead_code` are off. Commands: `:help`,
+  `:quit`, `:reset`, `:items`, `:type <expr>` (sema's type; nothing runs). The REPL takes
+  `--backend=interp|native`, `-O`, `--fp`, `--target-cpu`, `-A/-W/-D`, `--color`,
+  `--error-format`, `--error-limit` and `--threads`, and refuses every other flag; a bare `wukongc`
+  is still the "no input file" usage error. Driven through piped stdin by
+  `crates/wukongc/tests/repl.rs` on both backends.
+- **Support for the REPL, usable on its own.** `wukong_parser::parse_stmts_tokens_with_lints` parses
+  a bare statement list to end of input (a block body without braces, tail kept; a stray `}` is
+  `E0202`). `wukong_runtime::fmt::begin_stderr_capture` / `end_stderr_capture` collect a program's
+  stderr, which the interpreter now writes through the runtime's `write_stream` like the JIT and an
+  executable do; `wukong_runtime::process::detach_stdin` gives every later program an empty
+  standard input.
+
 ### Source locations through MIR into native code (`gap5/native-source-locations`)
 
 - **Native-backend failures point at the source (P11.8).** A `C0002` (a slot above the native
