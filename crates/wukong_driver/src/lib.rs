@@ -663,7 +663,8 @@ pub fn compile(opts: &Options) -> i32 {
     drop(lint_diags);
     // The native backend reports its failures (`C0002`, `C0001`, an ICE) at the source construct
     // it was lowering (`NativeFailure::site`), so the source map stays alive on the paths that
-    // reach Cranelift; every other path releases it here, before optimization.
+    // reach Cranelift with it (`native_reachable`); every other path, the interpreter and GPU runs
+    // and `--train` among them, releases it here, before optimization.
     let native_sm = native_reachable(opts).then_some(sm);
     let lowering_failed = lower_errors > 0;
     drop(lower_diags);
@@ -979,11 +980,56 @@ pub fn compile(opts: &Options) -> i32 {
     exit::OK
 }
 
-/// Can this compile reach the Cranelift backend — `--run --backend=native`, `--emit=obj` or
-/// `--emit=exe`? Only those keep the source map past lowering, to locate a native failure.
+/// Can this compile reach the Cranelift backend with a source map — `--run --backend=native`, or
+/// `--emit=obj|exe` without `--run`? Only those keep the source map past lowering, to locate a
+/// native failure. A `--run` decides by its backend alone: it leaves `emit` at the default `Exe`.
+/// `--train` (which runs, or writes an artifact) never passes the map on, so it releases it too.
 fn native_reachable(opts: &Options) -> bool {
-    (opts.run && opts.backend == BackendKind::Native)
-        || matches!(opts.emit, EmitStage::Obj | EmitStage::Exe)
+    if opts.grad.train {
+        false
+    } else if opts.run {
+        opts.backend == BackendKind::Native
+    } else {
+        matches!(opts.emit, EmitStage::Obj | EmitStage::Exe)
+    }
+}
+
+#[cfg(test)]
+mod native_reachable_tests {
+    use super::*;
+
+    /// Does a compile with these options keep the source map?
+    fn keeps(run: bool, backend: BackendKind, emit: EmitStage, train: bool) -> bool {
+        let mut o = Options {
+            run,
+            backend,
+            emit,
+            ..Options::default()
+        };
+        o.grad.train = train;
+        native_reachable(&o)
+    }
+
+    /// The source map outlives lowering exactly where Cranelift reports a failure with it. `--run`
+    /// leaves `emit` at its default `Exe` (`parse_args` rejects an explicit stage with `--run`), so
+    /// the stage alone must not decide a run; `--train` passes no map to its backend.
+    #[test]
+    fn only_paths_that_reach_cranelift_keep_the_source_map() {
+        use BackendKind::*;
+        use EmitStage::*;
+        assert!(keeps(true, Native, Exe, false));
+        for backend in [Interp, Gpu, GpuLower] {
+            assert!(!keeps(true, backend, Exe, false), "--run {backend:?}");
+        }
+        for emit in [Obj, Exe] {
+            assert!(keeps(false, Interp, emit, false), "{emit:?}");
+            assert!(!keeps(false, Interp, emit, true), "--train {emit:?}");
+        }
+        assert!(!keeps(true, Native, Exe, true));
+        for emit in [Mir, LlvmIr, Grad] {
+            assert!(!keeps(false, Native, emit, false), "{emit:?}");
+        }
+    }
 }
 
 /// Execute `entry` on the GPU backend: the interpreter tree-walks the program while recognized kernel
