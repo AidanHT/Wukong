@@ -1179,6 +1179,7 @@ fn route_exit_values(f: &mut Function, routes: &[(u32, Vec<ValueId>)]) {
         for v in vals {
             let ty = f.value_type(*v).clone();
             let p = fresh(f, ty);
+            f.copy_value_loc(*v, p);
             f.blocks[bi].params.push(p);
             subst.insert(v.0, p);
         }
@@ -1243,6 +1244,8 @@ fn clone_loop(
         for v in defs {
             let ty = f.value_type(v).clone();
             let nv = fresh(f, ty);
+            // The copy is the same source as the loop it copies.
+            f.copy_value_loc(v, nv);
             vmap.insert(v.0, nv);
         }
     }
