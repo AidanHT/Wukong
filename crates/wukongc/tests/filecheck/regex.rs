@@ -547,6 +547,23 @@ impl<'t> Matcher<'t> {
         }
     }
 
+    /// When `node` matches exactly one character (a literal, `.` or a class): how many
+    /// consecutive characters from `i` it matches, at most `max`. `None` for any other node.
+    fn single_char_run(&self, node: &Node, i: usize, max: Option<u32>) -> Option<usize> {
+        let one = |c: char| match node {
+            Node::Char(x) => c == *x,
+            Node::Any => c != '\n',
+            Node::Class(cl) => cl.matches(c),
+            _ => unreachable!("only one-character nodes reach here"),
+        };
+        if !matches!(node, Node::Char(_) | Node::Any | Node::Class(_)) {
+            return None;
+        }
+        let limit = max.map_or(usize::MAX, |m| m as usize);
+        let rest = self.text.get(i..).unwrap_or(&[]);
+        Some(rest.iter().take(limit).take_while(|&&c| one(c)).count())
+    }
+
     fn seq(&mut self, nodes: &[Node], i: usize, k: &mut Cont<'_, 't>) -> bool {
         match nodes.split_first() {
             None => k(self, i),
@@ -567,6 +584,28 @@ impl<'t> Matcher<'t> {
         i: usize,
         k: &mut Cont<'_, 't>,
     ) -> bool {
+        if let Some(run) = self.single_char_run(node, i, max) {
+            // `.*`, `[0-9]+`, `x{2,}`: every iteration is one character, so the candidate ends
+            // are `i + min ..= i + run` and are tried in a loop, not one stack frame per
+            // character — a long line (a big `static` blob) cannot exhaust the stack.
+            debug_assert_eq!(count, 0, "a one-character repetition never recurses");
+            let need = min as usize;
+            if run < need {
+                return false;
+            }
+            let mut try_end = |s: &mut Matcher<'t>, n: usize| {
+                s.steps += 1;
+                if s.steps > STEP_LIMIT {
+                    s.exhausted = true;
+                }
+                !s.exhausted && k(s, i + n)
+            };
+            return if greedy {
+                (need..=run).rev().any(|n| try_end(self, n))
+            } else {
+                (need..=run).any(|n| try_end(self, n))
+            };
+        }
         let can_more = max.is_none_or(|m| count < m);
         let can_stop = count >= min;
         let one_more = |s: &mut Matcher<'t>, k: &mut Cont<'_, 't>| {

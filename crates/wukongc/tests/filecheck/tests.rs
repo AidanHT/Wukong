@@ -156,6 +156,19 @@ fn regex_step_budget_turns_blowup_into_an_error() {
     assert!(err.0.contains("backtracking steps"), "{err}");
 }
 
+/// A one-character repetition tries its ends in a loop, not one stack frame per character: on
+/// this test thread's default stack, a 300 000-character line would overflow a recursive `.*`.
+#[test]
+fn regex_long_lines_do_not_recurse_per_character() {
+    let line = format!("a{}b", "c".repeat(300_000));
+    assert_eq!(search("a.*b", &line), Some((0, 300_002)));
+    assert_eq!(search("a.*?b", &line), Some((0, 300_002)));
+    assert_eq!(search("c{2,5}b", &line), Some((299_996, 300_002)));
+    let hex = format!("static blob = hex {}\n", "0f".repeat(100_000));
+    ok("CHECK: static {{.*}} = hex {{[0-9a-f]+}}{{$}}", &hex);
+    fail("CHECK: static {{.*}} = hex {{[0-9a-f]+}}g", &hex);
+}
+
 // ---------------------------------------------------------------------------------------------
 // CHECK, CHECK-NEXT, CHECK-SAME, CHECK-EMPTY, CHECK-COUNT.
 // ---------------------------------------------------------------------------------------------

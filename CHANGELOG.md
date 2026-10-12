@@ -24,7 +24,7 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `file:line:col`, where the scan started, the input line most like the pattern ("possible
   intended match"), the variables it used, and the whole input, numbered. A misspelled directive
   (`CHECK-NXT:`, `CHECK-NEXT` without its colon) and a comment directive for a prefix no `RUN:`
-  line checks are errors, not silently ignored lines. 40 unit tests pin the matcher and the
+  line checks are errors, not silently ignored lines. 41 unit tests pin the matcher and the
   harness, including a wrong `CHECK` that must fail with its location.
 - **Seeded with 37 files.** 24 under `opt/`, each a pass's essential property (most with a
   hand-written `.mir` input run through that one pass, so the lowering cannot drift under it):
