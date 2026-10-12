@@ -68,6 +68,13 @@ pub(crate) fn erase_published(r: &mut SemaResult) {
     for t in r.types.values_mut() {
         erase(t);
     }
+    // A closure's recorded types are what `wukong_mir_build` gives its lifted function's signature
+    // (`closures.rs`): a `str` parameter or return erases like a named function's.
+    for info in r.closures.values_mut() {
+        info.params.iter_mut().for_each(erase);
+        erase(&mut info.ret);
+        info.captures.iter_mut().for_each(|(_, t)| erase(t));
+    }
     for def in &mut r.defs.defs {
         match &mut def.kind {
             DefKind::Fn(sig) => {
@@ -478,6 +485,31 @@ fn main() -> i32 {
         assert!(matches!(&vs[0].payload, VariantPayload::Tuple(ts) if !ts[0].mentions_str()));
         // Both printed `str`s, and both format arguments, are recorded as text.
         assert_eq!(res.str_print_args.len(), 3, "{:?}", res.str_print_args);
+    }
+
+    #[test]
+    fn a_closures_recorded_types_are_erased_too() {
+        // `wukong_mir_build` builds a lifted closure's signature from `SemaResult::closures`, so a
+        // `str` parameter, return or pointer capture left there reached MIR lowering (an ICE).
+        let (res, codes, _) = check(
+            "fn apply_s(f: fn(str) -> i64, s: str) -> i64 { return f(s); }
+             fn name_of(f: fn(i64) -> str, i: i64) -> str { return f(i); }
+             fn main() -> i32 {
+                 let s: str = \"hi\";
+                 let ps = &s;
+                 let n = apply_s(|t| t.len() + (*ps).len(), s);
+                 let m = name_of(|i| -> str { if i > 0 { return \"a\"; } return \"b\"; }, n);
+                 return m.len() as i32;
+             }",
+        );
+        assert!(codes.is_empty(), "unexpected {codes:?}");
+        assert_eq!(res.closures.len(), 2);
+        for info in res.closures.values() {
+            let tys = info.params.iter().chain([&info.ret]);
+            for t in tys.chain(info.captures.iter().map(|(_, t)| t)) {
+                assert!(!t.mentions_str(), "a closure still records {t:?}");
+            }
+        }
     }
 
     #[test]
