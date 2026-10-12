@@ -1861,10 +1861,49 @@ out-of-bounds slice access or an overlap, i.e. a program whose scalar semantics 
 must not change) the whole loop is the strict left fold the source spells; and a loop the front end
 does not vectorize (a `while`, or a body it declines) reaches `wukong_opt::vectorize`, which never
 reassociates a float accumulate. Recognized kernels (`wukong_sreduce_*` and friends) define their own
-documented reduction order, chosen by the program's spelling and never by the host. Reductions
-vectorize only on the sequential path, never the `@parallel` one (folding into a shared accumulator
-across threads would race). The tree is a build contract, not a promise of strict source-order
-summation or stability across compiler releases.
+documented reduction order, chosen by the program's spelling and never by the host. In a fast
+`@parallel` function an `f32` reduction takes the parallel reduction tree instead of this one (next
+section). The tree is a build contract, not a promise of strict source-order summation or stability
+across compiler releases.
+
+### The `@parallel` reduction tree (P13.7)
+
+`@parallel` licenses one reassociation of an `f32` fold, and every lowering of such a loop computes
+it: the runtime's reduction tree (`wukong_runtime::reduce::tree` — fixed `RCHUNK` = 8192-element
+chunks, inside each the `RBLOCK` = 64-element, eight-accumulator partition, the halving combine, the
+lane combine `hcombine8`, the chunk partials folded in slot order from the identity), over the loop's
+addends in iteration order, folded into the seed once. `GemmSyms::par_reduce`, stamped by
+`par_reduce_gemm` on every fast-mode `@parallel` function and its type-generic instances (never under
+`@strict_fp`), carries the contract; unlike `parallel_fn` it is not cleared in an outlined region body,
+the whole-function outliner's chunk body or a versioned kernel's fallback, so a reduction there keeps
+the tree. Four lowerings compute it:
+
+| lowering | where |
+|---|---|
+| `wukong_sreduce_f32_parallel` (native) / `wukong_sreduce_f32` (interpreter) | the kernel shape `for k in 0..n { s += f(x[k], y[k]) }` in the function body (`try_emit_parallel_reduction`) |
+| `wukong_sreduce_f32`, the serial twin | the same shape where the function may not fork: a region body, a chunk body, a versioned fallback |
+| `wukong_{sum,dot,reduce}_{bf16,f16}_parallel` | a `bf16`/`f16` array read through `as f32` (`try_emit_lowp_reduction`); `reduce::tree` over `TreeElem` = `Bf16`/`F16`, so bit-for-bit the f32 tree of the widened values |
+| the chunk-buffer lowering (`par_reduce.rs`) | every other `f32` fold the vectorizer would reassociate: any range form (`..=`, `step`, a non-zero start, an unsigned or narrow counter), any pure addend, recognition off or `@generic` |
+
+The chunk-buffer lowering keeps the source loop's control exactly (the start once, the end at every
+header, `i += step` in the latch) and replaces the body: it stores the addend — or, for a top-level
+product, its two factors, which the kernel fuses as `RED_DOT` — into a stack buffer of one chunk (or of
+the trip, when that is a smaller constant), and each full buffer and the final partial one go to
+`wukong_sreduce_f32`. A single-chunk call returns `ident ⊕ partial`, and folding those into a total
+from `ident` is the kernel's `ident ⊕ p0 ⊕ p1 ⊕ …` bit for bit: the running `+` total is never `-0.0`,
+so `t + (0.0 + p)` equals `t + p` even for `p = -0.0`, and `ident ⊕ p` is `p` for max/min. The tree is
+therefore implemented once, in the runtime, and the compiler never imitates it. It declines (the loop
+lowers as before) on a non-`f32` accumulator, a body that is not one fold statement, an addend with a
+user call, and an addend or bound that reads the accumulator; both kernel arms now decline the last
+case too, since the source re-evaluates the bound every iteration and a kernel reads it once.
+
+Gates: `par_reduce_tests.rs` (which lowering each spelling takes, and the corpus census of paths),
+`reduce.rs`'s `the_kernel_is_the_documented_tree` and
+`tree_is_independent_of_thread_count_and_completion_order`, `lowp.rs`'s
+`lowp_parallel_is_the_f32_tree_of_the_widened_values`, the hand-evaluated
+`tests/run/parallel_reduce_order{,_lowp}.wk`, and `parallel_lane.rs`'s
+`parallel_reductions_do_not_depend_on_threads_backend_or_recognition`, which reruns both programs on 1,
+2, 3 and 8 threads, with recognition off and with the fork gates forced open.
 
 The contraction rule is exact and syntactic (`FnLowerer::try_contract_fma`, mirrored by `vec_try_fma`
 and the 256-bit recipe's `Add` arm): only a binary `+` with a `*` operand contracts; `x - y*z`, a

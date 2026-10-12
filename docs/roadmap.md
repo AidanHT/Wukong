@@ -214,9 +214,10 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
   - **max/min/absmax** (`wukong_reduce_{bf16,f16}[_parallel](x,n,op)`) — the per-tensor absmax is the
     symmetric-quantization scale; exact (max/min round nothing) (`reduce_bf16_minmax.wk`). Inside a
     `@parallel` function each of dot/sum/max/min/absmax dispatches to its multicore `_parallel` twin —
-    a deterministic fixed-`RCHUNK` chunk fold (the per-chunk serial kernel + an ascending partial
-    combine), bit-identical regardless of thread count and the bf16/f16 analog of the f32
-    `wukong_sreduce_f32_parallel` (`tests/run/parallel_reduce_lowp.wk`);
+    the f32 `wukong_sreduce_f32_parallel` tree over the exactly widened values (fixed `RCHUNK` chunks,
+    the 64-element partition, an ascending partial combine), bit-identical regardless of thread count
+    and to the f32 kernel over a widened copy (`tests/run/parallel_reduce_lowp.wk`,
+    `parallel_reduce_order_lowp.wk`);
   - **streaming axpby** `out = a·x + b·y` (`wukong_axpby_{bf16,f16}`), half-in/f32-out, ~1.3× ≫ L3
     (requires two additive terms; a 1-term scale would force a `0*inf` the source lacks);
   - **activations** — the full **36**-op transcendental set over a half-precision input
@@ -803,7 +804,11 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
   multicore reduction kernel** (`wukong_sreduce_f32_parallel`), spreading the stream across cores to
   aggregate memory bandwidth — `dot@parallel` ~7.9×, `ssd@parallel` ~8.6× faster than single-threaded
   C. The parallel sum is bit-identical to the serial one (fixed-size chunks independent of core count
-  + ascending partial combine), so the differential oracle holds.
+  + ascending partial combine), so the differential oracle holds. A spelling no kernel matches (an
+  `..=` range, a `step`, an offset index, an addend with no kernel, a loop in an outlined region,
+  `@generic`) runs single-threaded but returns the same bits: the compiler fills a chunk buffer with
+  its addends and hands each chunk to the serial twin (`wukong_mir_build::par_reduce`,
+  `tests/run/parallel_reduce_order.wk`).
 - **Transcendental intrinsics**: `sqrt`/`rsqrt`/`cbrt` (the root family; `cbrt` for LAB color /
   variance-stabilizing transforms), `exp`/`log`/`exp2`/`log2`/`exp10`/`log10` (≈1-ULP `f32`
   minimax polynomials; base-10 for decibel/log-scale features), `expm1`/`log1p` (Kahan-stable `eˣ−1` / `ln(1+x)`, ≈1-ULP near 0),
@@ -1690,15 +1695,23 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   the interpreter). A run-time length assertion where a `?` extent meets a fixed one would close the
   gap. The extent is already in hand there, since a `?` axis travels as a hidden argument.
 
-- **Fast-mode float results depend on how a reduction is compiled.** Under the default `--fp=fast`
-  an `f32` reduction is evaluated on one of three trees — the source fold (a loop nothing
-  vectorizes), the sequential vectorizer's lane partition, or the `@parallel` kernel's fixed
-  8,192-element chunks — and adding or removing `@parallel`, or a reduction declining its kernel,
-  moves it between them, changing low-order bits with no diagnostic. Each tree is deterministic
-  (independent of threads, `-O` level, backend and host). Use `@strict_fp` where bits must not
-  depend on the spelling. Also by design: a compound `s += y*z` outside a vectorized reduction is not
-  contracted while `s = s + y*z` is; a strict function that wants a single-rounding multiply-add
-  writes the explicit `fma(a, b, c)`, which is one rounding in every mode.
+- **FMA contraction is per expression.** Under the default `--fp=fast` a compound `s += y*z` outside
+  a vectorized reduction is not contracted while `s = s + y*z` is; a strict function that wants a
+  single-rounding multiply-add writes the explicit `fma(a, b, c)`, which is one rounding in every
+  mode. (The reduction-order edge that stood here is closed, 2026-10-12, `gap7/parallel-reduce-order`:
+  a `@parallel` `f32` reduction is the parallel reduction tree on every path — kernel or not, any range
+  spelling or addend, inside an outlined region or not, `@generic` or not, any thread count — and a
+  `bf16`/`f16` one is that tree on the widened values. Only adding or removing `@parallel` itself, or
+  `@strict_fp`, changes a reduction's tree; the language guide's table under Attributes states it.)
+
+- **A `@parallel` reduction no kernel matches runs on one thread.** Its bits are the parallel tree's
+  (above), but the chunk-buffer lowering (`wukong_mir_build::par_reduce`) fills one buffer and folds
+  the chunks in order on the calling thread: an `..=` range, a `step`, an offset index or an addend
+  with no kernel costs the multicore speedup, and a loop with a run-time trip carries a 32 KB buffer
+  (64 KB for a product) in its frame. Reducing the chunks on the pool into a partial array — the
+  kernel's own schedule — would close it. No example or `bench/kernels` program reaches the fallback
+  today; in `tests/run` only `parallel_reduce_elem_bf16.wk`, `parallel_region_reassigned_local.wk` and
+  the `parallel_reduce_order*.wk` fixtures do.
 
 - **Stack-slot coloring follows uses, not scopes** (2026-10-12, `gap6/stack-coloring`). The native
   backend lets allocas whose lifetimes never overlap share one frame slot (`tests/run`: 5.8% fewer

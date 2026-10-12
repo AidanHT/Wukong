@@ -5,6 +5,40 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### A `@parallel` reduction has one value, whichever way it runs (`gap7/parallel-reduce-order`, P13.7)
+
+- **Changed: every `f32` reduction loop of a fast `@parallel` function computes the parallel
+  reduction tree**, the 8,192-element-chunk tree of the runtime's reduction kernel, over its addends
+  in iteration order. Before, only the kernel shape `for k in 0..n { s += f(x[k], y[k]) }` did; an
+  `..=` range, a `step`, a non-zero start, an offset index, an addend with no kernel, `@generic`,
+  `WUKONG_NO_RECOGNIZE`, an unsigned counter — and the kernel shape itself inside an outlined region
+  body — silently fell back to the vectorizer's lane tree or the source fold: on the data of
+  `tests/run/parallel_reduce_order.wk`, `0..n` printed 3704.34375, `0..=n - 1` 3700.2056 (a left fold)
+  and the same `0..n` loop inside an outlined region 3698.0 (the lane tree). All of them now print
+  3704.34375, on any thread count, both backends and every `-O` level. A spelling no kernel matches runs on one thread: the
+  loop fills a chunk buffer with its addends and hands each chunk to the serial twin
+  `wukong_sreduce_f32` (`wukong_mir_build::par_reduce`). `f64`/integer reductions, `@strict_fp`, a
+  body that is not one fold statement, `while` and `for x in array` loops keep their orders; the
+  language guide's table under Attributes gives the whole rule, and the guide no longer calls a
+  decline "always correct" without saying which bits.
+- **Changed: the `bf16`/`f16` `_parallel` reductions are the `f32` tree on the widened values**
+  (`wukong_{sum,dot,reduce}_{bf16,f16}_parallel`): one chunk reducer over `TreeElem` (`f32`, `Bf16`,
+  `F16`) in `reduce.rs`, so a half reduction is bit-for-bit `wukong_sreduce_f32` on a widened copy,
+  and the uncast spelling `s = s + x[k]` (formerly a source-order scalar loop) agrees with the cast
+  one. Their low bits move where the old per-chunk half partitions rounded differently (the sum of
+  the first 100 bf16 values of `parallel_reduce_order_lowp.wk` was 2615542.25 and is 2615542.5); the
+  serial half kernels outside `@parallel` are unchanged.
+- **Fixed: a reduction kernel no longer fires on a range whose end reads the accumulator**
+  (`for k in 0..(s as i64) { s += x[k] }`): the source re-evaluates the end every iteration, the kernel
+  read it once.
+- Tests: `tests/run/parallel_reduce_order.wk` and `parallel_reduce_order_lowp.wk` (hand-evaluated
+  bits; the tree, the vectorizer's tree and a left fold are three different numbers on their data),
+  `parallel_lane.rs`'s thread-count / backend / recognition-off sweep, `par_reduce_tests.rs`, and the
+  runtime's `the_kernel_is_the_documented_tree`, `tree_is_independent_of_thread_count_and_completion_
+  order` and `lowp_parallel_is_the_f32_tree_of_the_widened_values`. Census: `parallel_reduce_elem_bf16`
+  gains the tree's `wukong_sreduce_f32*2`; `parallel_region_reassigned_local` trades one 256-bit
+  `veckernel` (a lane-tree reduction inside a `@parallel` region) for `wukong_sreduce_f32*4`.
+
 ### First-class 128-bit integers: `i128` and `u128` (`gap6/i128`, N25)
 
 - **Added: the `i128` and `u128` scalar types.** 16 bytes, 16-byte aligned, in every position a

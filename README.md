@@ -158,7 +158,9 @@ not duplicate them. In summary, Wukong:
   elementwise loops (incl. branchy ones via if-conversion) and **reductions** to SIMD, contracts
   `x + y*z` to a **fused multiply-add** (a documented, deterministic floating-point contract;
   `@strict_fp` / `--fp=strict` evaluate in source order instead), **fuses** adjacent elementwise loops, and
-  **auto-parallelizes** `@parallel` loops across cores. Underneath, an SSA optimizer (inlining, SROA,
+  **auto-parallelizes** `@parallel` loops across cores — a `@parallel` `f32` reduction has one
+  documented summation tree however it runs (multicore kernel, one thread, any spelling), so a loop
+  the compiler cannot split costs speed, never bits. Underneath, an SSA optimizer (inlining, SROA,
   mem2reg, const-fold, CSE, DSE, DCE, loop deletion, LICM, scalar promotion, loop unrolling,
   straight-line SLP packing) runs at
   `-O1` and above. Op-graph fusion across
