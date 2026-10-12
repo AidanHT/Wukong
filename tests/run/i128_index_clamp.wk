@@ -1,0 +1,21 @@
+// RUN: --run
+// EXPECT-EXIT: 1
+// EXPECT-OUT: 9
+// EXPECT-STDERR: index out of bounds: the len is 4 but the index is 9223372036854775807
+module tests.run.i128_index_clamp
+
+// A 128-bit index is clamped to `i64`'s range before the address is formed, never truncated.
+// 18446744073709551617 is 2^64 + 1, whose low 64 bits are the in-bounds index 1: truncating it
+// would silently read `s[1]` (9). Clamped, it is i64::MAX, past every extent, so the slice check
+// fails and reports that index; the in-range index 1 before it reads 9 as usual.
+fn get(s: []i32, i: i128) -> i32 {
+    return s[i];
+}
+
+fn main() -> i32 {
+    let mut h: []i32 = alloc_i32(4);
+    h[1] = 9;
+    println(get(h, 1));
+    println(get(h, 18446744073709551617));
+    return 0;
+}

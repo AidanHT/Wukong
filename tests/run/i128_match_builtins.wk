@@ -1,0 +1,139 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 56
+// EXPECT-OUT: 7
+// EXPECT-OUT: 0
+// EXPECT-OUT: 128
+// EXPECT-OUT: 128
+// EXPECT-OUT: 7766554433221100efcdab8967452301
+// EXPECT-OUT: 23456789abcdef001122334455667701
+// EXPECT-OUT: ef00112233445566770123456789abcd
+// EXPECT-OUT: 1
+// EXPECT-OUT: 340282366920938463463374607431768211455
+// EXPECT-OUT: 0
+// EXPECT-OUT: 170141183460469231731687303715884105727
+// EXPECT-OUT: -170141183460469231731687303715884105728
+// EXPECT-OUT: -170141183460469231731687303715884105721
+// EXPECT-OUT: 340282366920938463463374607431768211454
+// EXPECT-OUT: 85070591730234615865843651857942052863
+// EXPECT-OUT: -85070591730234615865843651857942052864
+// EXPECT-OUT: 340282366920938463426481119284349108225
+// EXPECT-OUT: -85070591730234615856620279821087277056
+// EXPECT-OUT: (-2, true)
+// EXPECT-OUT: (340282366920938463463374607431768211455, false)
+// EXPECT-OUT: (0, true)
+// EXPECT-OUT: (170141183460469231731687303715884105727, true)
+// EXPECT-OUT: 9223372036854775807
+// EXPECT-OUT: 0
+// EXPECT-OUT: 170141183460469231731687303715884105727
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: -170141183460469231731687303715884105728
+// EXPECT-OUT: 340282366920938463463374607431768211455
+// EXPECT-OUT: 5
+module tests.run.i128_match_builtins
+
+// `match` over the 128-bit ranges and the integer builtins at 128 bits. Expected lines are each
+// builtin's definition evaluated independently on the 128-bit bit patterns (Python integers mod 2^128),
+// never compiler output:
+//
+// * `classify` and `bucket` cover their type's whole range with literal and range arms and no `_`, so
+//   they are exhaustive exactly because the arms reach i128::MIN / u128::MAX; the arms are tested at
+//   both ends and around every boundary;
+// * `popcount`/`clz`/`ctz` count over 128 bits, `bswap` reverses 16 bytes, `rotl`/`rotr` rotate
+//   modulo 128 (the amount 200 is 72);
+// * `sat_add`/`sat_sub` clamp at the 128-bit ends; `mulhi` is the high 128 bits of the 256-bit
+//   product (u128::MAX^2 = 2^256 - 2^129 + 1, whose high half is 2^128 - 2); `widening_mul` of two
+//   64-bit operands is their exact 128-bit product; `overflowing_mul` reports a 128-bit overflow;
+//   `sat_cast` clamps into and out of the 128-bit ranges; `min`/`max`/`clamp` compare all 128 bits.
+//
+// Operands are runtime values (`arg_count()` is 1 on every backend, opaque to the optimizer).
+fn classify(v: i128) -> i32 {
+    match v {
+        -170141183460469231731687303715884105728 => 0,
+        -170141183460469231731687303715884105727..=-1 => 1,
+        0 => 2,
+        1..=18446744073709551615 => 3,
+        18446744073709551616..=170141183460469231731687303715884105726 => 4,
+        170141183460469231731687303715884105727 => 5,
+    }
+}
+
+fn bucket(v: u128) -> i32 {
+    match v {
+        0..=255 => 0,
+        256..=170141183460469231731687303715884105727 => 1,
+        170141183460469231731687303715884105728..=340282366920938463463374607431768211454 => 2,
+        340282366920938463463374607431768211455 => 3,
+    }
+}
+
+fn main() -> i32 {
+    let o: i128 = (arg_count() - 1) as i128;
+    let uo: u128 = o as u128;
+    let min: i128 = -170141183460469231731687303715884105728 + o;
+    let max: i128 = 170141183460469231731687303715884105727 + o;
+    let umax: u128 = 340282366920938463463374607431768211455 + uo;
+
+    println(classify(min));
+    println(classify(min + 1));
+    println(classify(o - 1));
+    println(classify(o));
+    println(classify(o + 18446744073709551615));
+    println(classify(o + 18446744073709551616));
+    println(classify(max - 1));
+    println(classify(max));
+    println(bucket(uo + 255));
+    println(bucket(uo + 256));
+    println(bucket((max as u128) + 1));
+    println(bucket(umax - 1));
+    println(bucket(umax));
+
+    let x: u128 = 0x0123_4567_89ab_cdef_0011_2233_4455_6677 + uo;
+    println(popcount(x));
+    println(clz(x));
+    println(ctz(x));
+    println(ctz(uo));
+    println(clz(uo));
+    printf("{:x}\n", bswap(x));
+    printf("{:x}\n", rotl(x, 8));
+    printf("{:x}\n", rotr(x, 200));
+    println(popcount(min));
+
+    println(sat_add(umax, uo + 5));
+    println(sat_sub(uo, 5));
+    println(sat_add(max, o + 1));
+    println(sat_sub(min, o + 2));
+    println(sat_add(min, o + 7));
+    println(mulhi(umax, umax));
+    println(mulhi(max, max));
+    println(mulhi(min, max));
+    println(widening_mul((o + 18446744073709551615) as u64, (o + 18446744073709551615) as u64));
+    println(widening_mul((o - 9223372036854775808) as i64, (o + 9223372036854775807) as i64));
+    println(overflowing_mul(max, o + 2));
+    println(overflowing_mul(umax, uo + 1));
+    println(overflowing_add(umax, uo + 1));
+    println(overflowing_sub(min, o + 1));
+    println(sat_cast::<i64>(max));
+    println(sat_cast::<u8>(min));
+    println(sat_cast::<i128>(umax));
+    println(sat_cast::<u128>(min));
+    println(sat_cast::<u128>((o - 3) as i64));
+    println(min(max, min));
+    println(max(umax, uo));
+    println(clamp(max, o - 5, o + 5));
+    return 0;
+}

@@ -1,0 +1,19 @@
+// EXPECT-CODE: E0431
+// EXPECT-COUNT: 2
+module tests.fail.u128_literal_past_u128
+
+// The widest integer literal Wukong reads is u128::MAX, 2^128 - 1 =
+// 340282366920938463463374607431768211455. One more has no type at all: it is a malformed literal,
+// not a value that wraps to 0 (which is what a decoder that stops at its width would produce) — in
+// an expression and in a pattern alike. The pattern used to lower as `0` and match the wrong value.
+fn pick(x: u128) -> i32 {
+    match x {
+        340282366920938463463374607431768211456 => 1, //~ E0431
+        _ => 0,
+    }
+}
+
+fn main() -> i32 {
+    let x: u128 = 340282366920938463463374607431768211456; //~ E0431
+    return pick(x);
+}

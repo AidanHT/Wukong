@@ -1,0 +1,14 @@
+// EXPECT-CODE: E0440
+// EXPECT-COUNT: 1
+module tests.fail.i128_unsigned_mix
+
+// The 128-bit integers follow the lossless-promotion rule of every other width: `i64 + i128` is an
+// `i128` (every i64 is an i128), but `u128 + i64` has no common type — neither holds every value of
+// the other, and the sum would depend on which operand's signedness the add took.
+fn total(a: u128, b: i64) -> u128 {
+    return a + b; //~ E0440
+}
+
+fn main() -> i32 {
+    return total(1, 2) as i32;
+}

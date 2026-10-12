@@ -1,0 +1,13 @@
+// EXPECT-CODE: E0431
+// EXPECT-COUNT: 2
+module tests.fail.literal_past_u64_into_narrow
+
+// A literal past u64::MAX is now a well-formed 128-bit value, so it can adapt to a narrower
+// annotation — where it must be rejected, not truncated: 2^64 does not fit `u64` (its low 64 bits are
+// 0) and 10^20 does not fit `i32`. The narrow range check reads literals as `i64`, which cannot hold
+// either, so it is the 128-bit check that has to fire here.
+fn main() -> i32 {
+    let a: u64 = 18446744073709551616; //~ E0431
+    let b: i32 = 100000000000000000000; //~ E0431
+    return (a as i32) + b;
+}

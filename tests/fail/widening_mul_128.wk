@@ -1,0 +1,14 @@
+// EXPECT-CODE: E0446
+// EXPECT-COUNT: 1
+module tests.fail.widening_mul_128
+
+// `widening_mul` returns the full double-width product: two `u64` operands give a `u128`. Two 128-bit
+// operands would need a 256-bit result, which Wukong does not have, so the call is rejected (use
+// `mulhi` for the high half and `*` for the low half) rather than silently truncated.
+fn wide(a: u128, b: u128) -> u128 {
+    return widening_mul(a, b); //~ E0446
+}
+
+fn main() -> i32 {
+    return wide(3, 4) as i32;
+}

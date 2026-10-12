@@ -1,0 +1,129 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: Rec { tag: 7, v: -170141183460469231731687303715884105727, n: 4000000000, w: 340282366920938463463374607431768211454 }
+// EXPECT-OUT: Rec { tag: 8, v: 170141183460469231731687303715884105727, n: 3705032704, w: 340282366920938463463374607431768211455 }
+// EXPECT-OUT: 170141183460469231731687303715884105727
+// EXPECT-OUT: 340282366920938463463374607431768211455
+// EXPECT-OUT: 7
+// EXPECT-OUT: -170141183460469231731687303715884105727
+// EXPECT-OUT: 4000000000
+// EXPECT-OUT: 340282366920938463463374607431768211454
+// EXPECT-OUT: 8
+// EXPECT-OUT: 170141183460469231731687303715884105727
+// EXPECT-OUT: 3705032704
+// EXPECT-OUT: 340282366920938463463374607431768211455
+// EXPECT-OUT: 255
+// EXPECT-OUT: 1000000000000000000000000000000
+// EXPECT-OUT: 4000000000
+// EXPECT-OUT: 340282366920938463463374607431768211454
+// EXPECT-OUT: [-61728394506172839450617283945, 61728394506172839450617283945, 185185183518518518351851851835, 308641972530864197253086419725, 432098761543209876154320987615]
+// EXPECT-OUT: 925925917592592591759259259175
+// EXPECT-OUT: [1, 1099511627776, 1208925819614629174706176, 1329227995784915872903807060280344576]
+// EXPECT-OUT: 1329227995784915872903807060280344576
+// EXPECT-OUT: [0.0, 3.0, 6.0, 9.0, 12.0, 15.0, 18.0, 21.0]
+// EXPECT-OUT: (9, -1, true)
+// EXPECT-OUT: 0
+// EXPECT-OUT: 170141183460469231731687303715884105726
+// EXPECT-OUT: [     -170141183460469231731687303715884105727] [5     ] [+42] [0xfffffffffffffffffffffffffffffffe] [0b101]
+module tests.run.i128_aggregates
+
+// `i128` / `u128` as values in memory and across calls: struct fields, array elements, tuple
+// fields, a heap buffer, parameters and results. `wukong_types` lays a 128-bit integer out at 16
+// bytes and 16-byte alignment, so `Rec { tag: u8, v: i128, n: u32, w: u128 }` puts `v` at byte 16 and
+// `w` at byte 48 in a 64-byte record, and an array of them strides by 64; the interpreter keeps one
+// slot per field, so a field overlap or a wrong stride on the native backend shows up as a
+// mismatch, not a crash. `mix` takes six 128-bit parameters — more than the four (Windows) or six
+// (System V) integer argument registers can hold as register pairs — so some travel on the stack.
+//
+// Expected lines are the values the program assigns, worked by hand (Python integers for the
+// products and sums), printed in Rust's `{:?}` style for the aggregates — never compiler output.
+struct Rec {
+    tag: u8,
+    v: i128,
+    n: u32,
+    w: u128,
+}
+
+fn mix(a: i128, b: i128, c: i128, d: u128, e: u128, f: i128) -> i128 {
+    return a - b * c + (d as i128) - (e as i128) + f;
+}
+
+fn scale(r: Rec, k: i128) -> Rec {
+    return Rec { tag: r.tag + 1u8, v: r.v * k, n: r.n * 2, w: r.w + 1 };
+}
+
+// Indexes a slice, so every access has a bounds check whose failure path returns a dummy `u128`.
+fn largest(xs: []u128) -> u128 {
+    let mut m: u128 = 0;
+    for i in 0..xs.len() {
+        if xs[i] > m {
+            m = xs[i];
+        }
+    }
+    return m;
+}
+
+fn sum(xs: []i128) -> i128 {
+    let mut s: i128 = 0;
+    for x in xs {
+        s += x;
+    }
+    return s;
+}
+
+fn main() -> i32 {
+    let o: i128 = (arg_count() - 1) as i128;
+    let uo: u128 = o as u128;
+
+    let r = Rec {
+        tag: 7,
+        v: -170141183460469231731687303715884105727 + o,
+        n: 4000000000,
+        w: 340282366920938463463374607431768211454 + uo,
+    };
+    println(r);
+    let s = scale(r, -1 + o);
+    println(s);
+    println(s.v);
+    println(s.w);
+
+    let mut recs: [Rec; 3] = [r, s, r];
+    recs[2].v = 1000000000000000000000000000000 + o;
+    recs[2].tag = 255;
+    for i in 0..3 {
+        println(recs[i].tag);
+        println(recs[i].v);
+        println(recs[i].n);
+        println(recs[i].w);
+    }
+
+    let mut a: [i128; 5] = [0; 5];
+    for i in 0..5 {
+        a[i] = ((i as i128) + o) * 123456789012345678901234567890 - 61728394506172839450617283945;
+    }
+    println(a);
+    println(sum(a));
+
+    let mut h: []u128 = alloc::<u128>(4);
+    for i in 0..4 {
+        h[i] = (uo + 1) << (40 * (i as u128));
+    }
+    println(h);
+    println(largest(h));
+    free(h);
+
+    // An `f32` store loop fed by 128-bit values: the vectorizers have no 128-bit lane, so the
+    // conversion stays scalar, but the loop around it must still run.
+    let mut g: [f32; 8] = [0.0; 8];
+    for i in 0..8 {
+        g[i] = (((i as i128) + o) * 3) as f32;
+    }
+    println(g);
+
+    let t: (u8, i128, bool) = (9u8, -1 + o, true);
+    println(t);
+    println(mix(1 + o, 2, 3, 4, 5, 6));
+    println(mix(170141183460469231731687303715884105727 + o, -1, 1, 340282366920938463463374607431768211455, 1, 0));
+    printf("[{:>45}] [{:<6}] [{:+}] [{:#x}] [{:#b}]\n", r.v, 5i128 + o, 42u128 + uo, r.w, 5u128 + uo);
+    return 0;
+}

@@ -1,0 +1,13 @@
+// EXPECT-CODE: E0431
+// EXPECT-COUNT: 2
+module tests.fail.i128_literal_out_of_range
+
+// A 128-bit literal is range-checked against the type it lands in, exactly as a narrow one is. The
+// signed 128-bit range is -2^127..=2^127 - 1, so 2^127 (170141183460469231731687303715884105728)
+// fits `u128` but not `i128`, and -2^127 - 1 fits neither; both used to be impossible to write,
+// since a literal past u64 was simply malformed. Without the check the first would wrap to i128::MIN.
+fn main() -> i32 {
+    let big: i128 = 170141183460469231731687303715884105728; //~ E0431
+    let low: i128 = -170141183460469231731687303715884105729; //~ E0431
+    return (big + low) as i32;
+}
