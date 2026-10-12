@@ -34,6 +34,12 @@
 //! tree; integer folds are exact in any order), a body that is not a single fold statement, an
 //! addend that calls anything but a math intrinsic or reads the accumulator, a `while` loop and a
 //! `for x in array` loop (both keep the source fold, as they do without `@parallel`).
+//!
+//! The GPU backends are outside the contract, like every recognized kernel there: `--backend=gpu`
+//! offloads the ops of `wukong_sreduce_f32` it supports to a device reduction of its own order, and
+//! `--backend=gpu-native` lowers the call to a device helper (`mrt_sreduce`) that folds
+//! sequentially; both are gated by the CPU<->GPU tolerance, not by bits.
+//! The helper reads its operands with generic `ld`, so a chunk buffer in the `.local` frame is legal.
 
 use std::borrow::Cow;
 
