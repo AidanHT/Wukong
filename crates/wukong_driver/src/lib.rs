@@ -1344,7 +1344,8 @@ fn run_on_gpu_lower(
 /// loudly), and on a Windows host the MinGW linker cannot consume an MSVC object's data relocations.
 ///
 /// It also carries the slice bounds-failure report (`wukong_rt_bounds_fail`, byte-identical to
-/// `wukong_runtime::bounds_failure_message`) and the runtime's 64-byte heap alignment
+/// `wukong_runtime::bounds_failure_message`; `wukong_rt_check_fail` likewise mirrors
+/// `wukong_runtime::check_failure_message`) and the runtime's 64-byte heap alignment
 /// (`HEAP_ALIGN`), so a linked executable fails and aligns exactly as `--run` does.
 const WUKONG_RT_C: &str = r#"#define __USE_MINGW_ANSI_STDIO 1
 #include <stdio.h>
@@ -1510,6 +1511,23 @@ void wukong_rt_bounds_fail(long long index, long long len, const char* site) {
     fflush(stdout);
     if (site && site[0]) fprintf(stderr, "error: index out of bounds: the len is %lld but the index is %lld at %s\n", len, index, site);
     else fprintf(stderr, "error: index out of bounds: the len is %lld but the index is %lld\n", len, index);
+    exit(1);
+}
+/* Every other failed run-time check (a range index, `str_from_utf8`). Mirrors
+   `wukong_runtime::check_failure_message` byte for byte. */
+void wukong_rt_check_fail(long long kind, long long a, long long b, const char* site) {
+    fflush(stdout);
+    fprintf(stderr, "error: ");
+    if (kind == 1) fprintf(stderr, "slice index starts at %lld but ends at %lld", a, b);
+    else if (kind == 2) fprintf(stderr, "range end index %lld out of range for slice of length %lld", a, b);
+    else if (kind == 3 && a < 0) fprintf(stderr, "str_from_utf8: invalid utf-8 (the len is %lld)", b);
+    else if (kind == 3) {
+        long long at = a & ((1LL << 56) - 1), n = a >> 56;
+        if (n) fprintf(stderr, "str_from_utf8: invalid utf-8 sequence of %lld bytes from index %lld (the len is %lld)", n, at, b);
+        else fprintf(stderr, "str_from_utf8: incomplete utf-8 byte sequence from index %lld (the len is %lld)", at, b);
+    } else fprintf(stderr, "run-time check %lld failed (%lld, %lld)", kind, a, b);
+    if (site && site[0]) fprintf(stderr, " at %s", site);
+    fprintf(stderr, "\n");
     exit(1);
 }
 double wukong_rt_fmod_f64(double a, double b) { return fmod(a, b); }

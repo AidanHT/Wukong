@@ -63,6 +63,7 @@ intrinsic_table! {
     PrintlnStr = "println_str",
     Assert = "assert",
     RtBoundsFail = "wukong_rt_bounds_fail",
+    RtCheckFail = "wukong_rt_check_fail",
 
     // Heap and scratch allocation, the clock (`Interp::call_intrinsic`).
     RtAlloc = "wukong_rt_alloc",
@@ -249,6 +250,11 @@ intrinsic_table! {
     RtEnv = "wukong_rt_env",
     RtReadStdin = "wukong_rt_read_stdin",
     RtExit = "wukong_rt_exit",
+
+    // The `str` operations' UTF-8 validation, decoding and counting (`text_io.rs`).
+    RtUtf8Check = "wukong_rt_utf8_check",
+    RtUtf8Decode = "wukong_rt_utf8_decode",
+    RtUtf8Count = "wukong_rt_utf8_count",
 
     // ML I/O, sampling and sorting builtins (`ml_io.rs`).
     RtReadDt = "wukong_rt_read_dt",

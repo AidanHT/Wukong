@@ -257,6 +257,25 @@ extern "C" fn rt_assert(cond: i64) {
     }
 }
 
+// Every other failed run-time check — a range index `s[a..b]`, `str_from_utf8` of bytes that are
+// not UTF-8 — reported and returned through exactly as a failed bounds check is below.
+extern "C" fn rt_check_fail(kind: i64, a: i64, b: i64, site: *const u8) {
+    // SAFETY: `site` is a NUL-terminated `.rodata` string emitted by the compiler.
+    let site = unsafe { wukong_runtime::site_str(site) };
+    record_failure(|| wukong_runtime::check_failure_message(kind, a, b, &site));
+}
+
+// The raw-function-pointer binding of `wukong_rt_check_fail`: fatal, as `rt_bounds_fail_abort`.
+extern "C" fn rt_check_fail_abort(kind: i64, a: i64, b: i64, site: *const u8) {
+    // SAFETY: as in `rt_check_fail`.
+    let site = unsafe { wukong_runtime::site_str(site) };
+    eprintln!(
+        "error: {}",
+        wukong_runtime::check_failure_message(kind, a, b, &site)
+    );
+    std::process::abort();
+}
+
 // A slice index failed its bounds check — the failure edge `mir_build` emits for every checked
 // `s[i]` (see `wukong_mir_build/src/bounds.rs`). Record the shared diagnostic and raise the failure
 // flag; the generated code then returns through its callers exactly as for a failed `assert`, so
@@ -405,6 +424,8 @@ const RT_ASSERT: &str = "wukong_rt_assert";
 const RT_ASSERT_FAILED: &str = "wukong_rt_assert_failed";
 // The failure edge of a checked slice access: (index: i64, len: i64, site: ptr) -> void.
 const RT_BOUNDS_FAIL: &str = "wukong_rt_bounds_fail";
+// Any other failed run-time check (a range index, `str_from_utf8`): (kind, a, b: i64, site: ptr).
+const RT_CHECK_FAIL: &str = "wukong_rt_check_fail";
 // The heap builtins: zeroed allocation (count, elem_size, elem_is_float) -> ptr, and its release.
 const RT_ALLOC: &str = "wukong_rt_alloc";
 const RT_FREE: &str = "wukong_rt_free";
@@ -2452,6 +2473,19 @@ impl<'a> FnTranslator<'a> {
             self.return_on_assert_failure(failed, false);
             return None;
         }
+        // Every other failed run-time check: wukong_rt_check_fail(kind, a, b, site), the same
+        // record-and-return as a bounds failure.
+        if name == RT_CHECK_FAIL && args.len() == 4 {
+            let kind = self.coerce_to_i64(args[0]);
+            let a = self.coerce_to_i64(args[1]);
+            let b = self.coerce_to_i64(args[2]);
+            let site = self.val(args[3]);
+            let fref = self.runtime_ref(RT_CHECK_FAIL);
+            self.builder.ins().call(fref, &[kind, a, b, site]);
+            let failed = self.builder.ins().iconst(types::I8, 1);
+            self.return_on_assert_failure(failed, false);
+            return None;
+        }
         // The file-I/O intrinsics: wukong_rt_{read,write}_{f32,f64,i32,i64,i8,u8}(path, data, len) -> i64.
         // All twelve share one ABI — the NUL-terminated path pointer, the slice's data pointer, and
         // an i64 element count — so one branch keyed on `name` emits the call. Returns the i64
@@ -2997,6 +3031,7 @@ struct RtFuncs {
     assert: FuncId,
     assert_failed: FuncId,
     bounds_fail: FuncId,
+    check_fail: FuncId,
     rt_alloc: FuncId,
     rt_free: FuncId,
     rt_scratch_alloc: FuncId,
@@ -3756,6 +3791,12 @@ fn populate_module<M: Module>(
     sig_bounds_fail.params.push(AbiParam::new(types::I64));
     sig_bounds_fail.params.push(AbiParam::new(types::I64));
     sig_bounds_fail.params.push(AbiParam::new(ptr_ty));
+    // wukong_rt_check_fail(kind: i64, a: i64, b: i64, site: ptr)
+    let mut sig_check_fail = Signature::new(call_conv);
+    for _ in 0..3 {
+        sig_check_fail.params.push(AbiParam::new(types::I64));
+    }
+    sig_check_fail.params.push(AbiParam::new(ptr_ty));
     let rt = RtFuncs {
         print_i64: module
             .declare_function(RT_PRINT_I64, Linkage::Import, &sig_i)
@@ -3777,6 +3818,9 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         bounds_fail: module
             .declare_function(RT_BOUNDS_FAIL, Linkage::Import, &sig_bounds_fail)
+            .map_err(|e| e.to_string())?,
+        check_fail: module
+            .declare_function(RT_CHECK_FAIL, Linkage::Import, &sig_check_fail)
             .map_err(|e| e.to_string())?,
         rt_alloc: module
             .declare_function(RT_ALLOC, Linkage::Import, &sig_rt_alloc)
@@ -4303,6 +4347,7 @@ fn populate_module<M: Module>(
         (RT_ASSERT, rt.assert),
         (RT_ASSERT_FAILED, rt.assert_failed),
         (RT_BOUNDS_FAIL, rt.bounds_fail),
+        (RT_CHECK_FAIL, rt.check_fail),
         (RT_ALLOC, rt.rt_alloc),
         (RT_FREE, rt.rt_free),
         (RT_SCRATCH_ALLOC, rt.rt_scratch_alloc),
@@ -5278,6 +5323,7 @@ fn jit_compile_entry_mapped(
     builder.symbol(RT_ASSERT, rt_assert as *const u8);
     builder.symbol(RT_ASSERT_FAILED, rt_assert_failed as *const u8);
     builder.symbol(RT_BOUNDS_FAIL, rt_bounds_fail as *const u8);
+    builder.symbol(RT_CHECK_FAIL, rt_check_fail as *const u8);
     builder.symbol(RT_ALLOC, wukong_runtime::wukong_rt_alloc as *const u8);
     builder.symbol(RT_FREE, wukong_runtime::wukong_rt_free as *const u8);
     builder.symbol(
@@ -5954,6 +6000,7 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     // flag a concurrent guarded run may have raised.
     builder.symbol(RT_ASSERT_FAILED, rt_assert_never_failed as *const u8);
     builder.symbol(RT_BOUNDS_FAIL, rt_bounds_fail_abort as *const u8);
+    builder.symbol(RT_CHECK_FAIL, rt_check_fail_abort as *const u8);
     builder.symbol(RT_ALLOC, wukong_runtime::wukong_rt_alloc as *const u8);
     builder.symbol(RT_FREE, wukong_runtime::wukong_rt_free as *const u8);
     builder.symbol(

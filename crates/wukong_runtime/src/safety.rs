@@ -24,6 +24,47 @@ pub fn bounds_failure_message(index: i64, len: i64, site: &str) -> String {
     }
 }
 
+/// [`check_failure_message`] kind: a range index `s[lo..hi]` whose start is past its end
+/// (`a = lo`, `b = hi`).
+pub const CHECK_RANGE_ORDER: i64 = 1;
+/// [`check_failure_message`] kind: a range index whose end is past the slice's length
+/// (`a = hi`, `b = len`).
+pub const CHECK_RANGE_END: i64 = 2;
+/// [`check_failure_message`] kind: `str_from_utf8` of bytes that are not UTF-8 (`a` = the packed
+/// fault of `crate::utf8::pack_fault`, `b` = the byte length).
+pub const CHECK_UTF8: i64 = 3;
+
+/// The diagnostic for a failed run-time check other than an element access (which keeps
+/// [`bounds_failure_message`]): `wukong_rt_check_fail(kind, a, b, site)`. The wording of the range
+/// checks is Rust's, so `s[5..3]` no longer reports its start as an "index" against a "len" that is
+/// really its end.
+pub fn check_failure_message(kind: i64, a: i64, b: i64, site: &str) -> String {
+    let what = match kind {
+        CHECK_RANGE_ORDER => format!("slice index starts at {a} but ends at {b}"),
+        CHECK_RANGE_END => format!("range end index {a} out of range for slice of length {b}"),
+        CHECK_UTF8 => match crate::utf8::unpack_fault(a) {
+            Some(crate::utf8::Utf8Fault {
+                valid_up_to,
+                error_len: Some(n),
+            }) => format!(
+                "str_from_utf8: invalid utf-8 sequence of {n} bytes from index {valid_up_to} \
+                 (the len is {b})"
+            ),
+            Some(f) => format!(
+                "str_from_utf8: incomplete utf-8 byte sequence from index {} (the len is {b})",
+                f.valid_up_to
+            ),
+            None => format!("str_from_utf8: invalid utf-8 (the len is {b})"),
+        },
+        _ => format!("run-time check {kind} failed ({a}, {b})"),
+    };
+    if site.is_empty() {
+        what
+    } else {
+        format!("{what} at {site}")
+    }
+}
+
 /// Read a NUL-terminated site string. Lossy, because the compiler only ever writes UTF-8 here.
 ///
 /// # Safety
@@ -52,6 +93,20 @@ pub extern "C" fn wukong_rt_bounds_fail(index: i64, len: i64, site: *const u8) {
     let site = unsafe { site_str(site) };
     let _ = std::io::stdout().flush();
     eprintln!("error: {}", bounds_failure_message(index, len, &site));
+    std::process::exit(1);
+}
+
+/// The ahead-of-time entry for every other failed run-time check (a range index, `str_from_utf8`):
+/// [`check_failure_message`], printed and exited on exactly as [`wukong_rt_bounds_fail`] does. The
+/// JIT binds its own recording entry instead.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[no_mangle]
+pub extern "C" fn wukong_rt_check_fail(kind: i64, a: i64, b: i64, site: *const u8) {
+    // SAFETY-EXEMPT: `site` is a compiler-emitted NUL-terminated `.rodata` string -- no extent.
+    // SAFETY: `site` is a `.rodata` string the compiler emitted with a NUL terminator.
+    let site = unsafe { site_str(site) };
+    let _ = std::io::stdout().flush();
+    eprintln!("error: {}", check_failure_message(kind, a, b, &site));
     std::process::exit(1);
 }
 
@@ -472,6 +527,28 @@ mod tests {
             bounds_failure_message(-1, 3, "main.wk:7:12"),
             "index out of bounds: the len is 3 but the index is -1 at main.wk:7:12"
         );
+        assert_eq!(
+            check_failure_message(CHECK_RANGE_ORDER, 5, 3, "m.wk:2:9"),
+            "slice index starts at 5 but ends at 3 at m.wk:2:9"
+        );
+        assert_eq!(
+            check_failure_message(CHECK_RANGE_END, 9, 6, ""),
+            "range end index 9 out of range for slice of length 6"
+        );
+        let fault = |valid_up_to, error_len| {
+            crate::utf8::pack_fault(Some(crate::utf8::Utf8Fault {
+                valid_up_to,
+                error_len,
+            }))
+        };
+        assert_eq!(
+            check_failure_message(CHECK_UTF8, fault(3, Some(1)), 7, ""),
+            "str_from_utf8: invalid utf-8 sequence of 1 bytes from index 3 (the len is 7)"
+        );
+        assert_eq!(
+            check_failure_message(CHECK_UTF8, fault(5, None), 6, "a.wk:3:1"),
+            "str_from_utf8: incomplete utf-8 byte sequence from index 5 (the len is 6) at a.wk:3:1"
+        );
         let site = b"a.wk:1:2\0";
         // SAFETY: `site` points at a NUL-terminated byte string valid for the call.
         assert_eq!(unsafe { site_str(site.as_ptr()) }, "a.wk:1:2");
@@ -543,6 +620,7 @@ mod entry_law {
         ("topology.rs", include_str!("topology.rs")),
         ("train.rs", include_str!("train.rs")),
         ("transpose.rs", include_str!("transpose.rs")),
+        ("utf8.rs", include_str!("utf8.rs")),
         ("velem.rs", include_str!("velem.rs")),
         ("vmath.rs", include_str!("vmath.rs")),
         ("xent.rs", include_str!("xent.rs")),

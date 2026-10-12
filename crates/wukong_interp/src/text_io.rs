@@ -14,6 +14,7 @@
 use wukong_runtime::fileio::DT_U8;
 use wukong_runtime::fmt::{self, Spec, TARGET_BUFFER, TARGET_STDERR};
 use wukong_runtime::process;
+use wukong_runtime::utf8;
 
 use crate::{Interp, Intrinsic, Value};
 
@@ -77,6 +78,22 @@ impl Interp<'_, '_> {
             I::RtReadStdin => self.text_read_stdin(args),
             // The run stops here; `run_capturing` / `run_streaming` report the code as its result.
             I::RtExit => Err(format!("{}{}", process::EXIT_SENTINEL, int(args, 0))),
+            I::RtUtf8Check => self
+                .utf8_operand(args)
+                .map(|b| Value::Int(i128::from(utf8::pack_fault(utf8::validate(&b))))),
+            I::RtUtf8Count => self
+                .utf8_operand(args)
+                .map(|b| Value::Int(utf8::char_count(&b) as i128)),
+            I::RtUtf8Decode => self.utf8_operand(args).map(|b| {
+                let packed = match usize::try_from(int(args, 2)) {
+                    Ok(i) if i < b.len() => {
+                        let (cp, w) = utf8::decode_at(&b, i);
+                        utf8::pack_char(cp, w)
+                    }
+                    _ => utf8::pack_char(utf8::REPLACEMENT, 1),
+                };
+                Value::Int(i128::from(packed))
+            }),
             _ => return None,
         })
     }
@@ -180,6 +197,17 @@ impl Interp<'_, '_> {
                 .unwrap_or(tail.len()),
         };
         Ok(tail[..len].iter().map(|v| v.as_int() as u8).collect())
+    }
+
+    /// The bytes `(data, len)` a `wukong_rt_utf8_*` entry reads (its operands 0 and 1): none for a
+    /// null pointer or a non-positive length, as natively.
+    fn utf8_operand(&self, args: &[Value]) -> Result<Vec<u8>, String> {
+        match args.first() {
+            Some(Value::Ptr(p)) if !self.is_null(*p) && int(args, 1) > 0 => {
+                self.text_read_bytes(0, *p, int(args, 1))
+            }
+            _ => Ok(Vec::new()),
+        }
     }
 
     /// `wukong_rt_fmt_str(target, buf, cap, pos, s, n, spec)`.

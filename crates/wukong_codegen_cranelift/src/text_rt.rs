@@ -14,6 +14,10 @@
 //! as the runtime's own entry writes it, stdout goes to the run's captured output (so its bytes
 //! interleave with every other print in program order), stderr to the process's stderr. A linked
 //! executable resolves them from `wukong_runtime`'s rlib, which writes to the real streams.
+//!
+//! The UTF-8 entries of the `str` operations (`wukong_rt_utf8_*`) read their bytes and return a
+//! number, so the JIT binds the runtime's own entries and a linked executable resolves the same
+//! ones from the rlib.
 
 use std::collections::HashMap;
 
@@ -193,7 +197,7 @@ extern "C" fn rt_fmt_slice(
 
 /// The table. The addresses are taken here, at run time, because a function-pointer-to-raw-pointer
 /// cast is not a constant expression.
-pub(crate) fn entries() -> [Entry; 16] {
+pub(crate) fn entries() -> [Entry; 19] {
     use Abi::{Ptr, F32, F64, I64};
     [
         Entry {
@@ -295,6 +299,26 @@ pub(crate) fn entries() -> [Entry; 16] {
             params: &[I64],
             ret: None,
             addr: rt_exit as *const u8,
+        },
+        // The `str` operations' UTF-8 entries (`wukong_runtime::utf8`): pure functions of the
+        // bytes, so the JIT binds the runtime's own entries.
+        Entry {
+            name: "wukong_rt_utf8_check",
+            params: &[Ptr, I64],
+            ret: Some(I64),
+            addr: wukong_runtime::utf8::wukong_rt_utf8_check as *const u8,
+        },
+        Entry {
+            name: "wukong_rt_utf8_decode",
+            params: &[Ptr, I64, I64],
+            ret: Some(I64),
+            addr: wukong_runtime::utf8::wukong_rt_utf8_decode as *const u8,
+        },
+        Entry {
+            name: "wukong_rt_utf8_count",
+            params: &[Ptr, I64],
+            ret: Some(I64),
+            addr: wukong_runtime::utf8::wukong_rt_utf8_count as *const u8,
         },
     ]
 }

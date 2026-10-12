@@ -2611,6 +2611,24 @@ impl<'a, 'k> Interp<'a, 'k> {
                 };
                 Err(wukong_runtime::bounds_failure_message(index, len, &site))
             }
+            // `wukong_rt_check_fail(kind, a, b, site)` — every other failed run-time check (a
+            // range index, `str_from_utf8`), reported through the runtime's one formatter exactly
+            // as a bounds failure is above.
+            I::RtCheckFail => {
+                let int = |i: usize| args.get(i).map_or(0, |v| v.as_int()) as i64;
+                let site = match args.get(3).copied() {
+                    Some(Value::Ptr(base)) if !self.is_null(base) => {
+                        file_read_path(&self.memory, base)?
+                    }
+                    _ => String::new(),
+                };
+                Err(wukong_runtime::check_failure_message(
+                    int(0),
+                    int(1),
+                    int(2),
+                    &site,
+                ))
+            }
             // `wukong_rt_alloc(count, elem_size, elem_is_float) -> ptr` — the heap allocation
             // backing the `alloc_<T>(n)` builtins. A heap object in the slot-indexed memory model
             // is exactly an alloca-shaped run: `count` contiguous typed-zero slots (one per scalar
@@ -7502,6 +7520,9 @@ mod kernel_extent_marshalling_tests;
 
 #[cfg(test)]
 mod transfer_bounds_tests;
+
+#[cfg(test)]
+mod str_utf8_tests;
 
 #[cfg(test)]
 mod scratch_tests;
