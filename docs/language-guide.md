@@ -3041,7 +3041,10 @@ described yet, so a debugger cannot print a variable. For profiling the JIT,
 `perf report` uses to name samples in JIT-compiled functions.
 
 Diagnostics render rustc-style: a label in another file gets its own `::: file:line:col` header, and
-a diagnostic may carry a `help:` suggestion (a concrete replacement). `--error-format=json` emits
+a diagnostic may carry a `help:` suggestion (a concrete replacement). A source line prints once
+however many labels it carries — their underlines share a row and the messages that do not fit on
+it hang below on `|` bars — and every label that spans lines is drawn whole, with its own connector
+column in the left margin. `--error-format=json` emits
 one object per diagnostic whose spans include byte and line/column end positions, plus `suggestions`,
 `children`, a `rendered` plain-text copy and `"version":1`; the `severity`/`code`/`message` prefix is
 stable. `--color=auto` honours `NO_COLOR`, `CLICOLOR_FORCE` and `TERM=dumb` and turns on Windows VT

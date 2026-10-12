@@ -550,15 +550,33 @@ land under the construct in tab-indented source. East-Asian wide characters coun
 columns past the end of a line count one each. If you touch `TAB_WIDTH`, `rendered_width` or
 `expand_tabs`, touch all three.
 
+Labels render in **one frame per source file, a source line at a time** (`render.rs`): every line
+that carries a label prints once, with all of its labels beneath it. Single-line labels on one line
+share an underline row, drawn widest first and a primary over a secondary of the same width, so a
+label nested in another stays visible inside it. The rightmost label's message ends that row when no
+underline reaches past its own; every other message hangs below on a `|` bar at its label's first
+column, the rightmost first (`single_line_rows`):
+
+```text
+18 |     return dot(a, b);
+   |                -  ^ `N` (axis 0) is Q in argument 2
+   |                |
+   |                `N` = P was fixed here, by axis 0 of argument 1
+```
+
 A multi-line span is drawn whole, with rustc-style connectors. A label ends at its *last* character,
 the one before `hi`, so a span whose `hi` is column 1 of the next line ends on the line before. A
-label is multi-line when that character is on a later line than its first. At most one label per
-diagnostic gets connectors: the primary label if it is multi-line, else the first multi-line label
-in position order. Such a diagnostic gives every echoed line and underline a 2-column margin after
-`| `. The connector label's first line is marked `/` when only whitespace precedes the span.
-Otherwise a start-marker line of `_` runs to a `^` (`-` for a secondary label) under its first
-character. Its later lines carry `|`, and an end-marker line `|___^ message` points at its last
-character:
+label is multi-line when that character is on a later line than its first. **Every** multi-line
+label gets connectors, each in a connector column of the left margin (`assign_connector_columns`:
+the leftmost column no label already there shares a line with, taking labels by first line, then
+column, then the longer first, so an enclosing label sits left of the ones it encloses and labels on
+disjoint lines share a column). The margin is one column per concurrently open label plus a space,
+on every echoed line and annotation row of the diagnostic, and absent when no label spans lines. A
+connector's first line is marked `/` when only whitespace precedes the span. Otherwise a
+start-marker row of `_` runs from its column to a `^` (`-` for a secondary label) under its first
+character. Its later lines carry `|`, and an end-marker row `|___^ message` points at its last
+character. Under one line, the single-line labels' rows come first, then the end markers (innermost
+first), then the start markers (outermost first):
 
 ```text
  9 |   fn pick(n: i32) -> i32 {
@@ -576,13 +594,14 @@ character:
    | |_^
 ```
 
-A label longer than 6 lines prints its first two and last two lines around one `...` gutter line,
-and the gutter is then at least 3 wide. The gutter also widens to fit the label's last line. Other
-labels keep their own frames at their sorted positions and are not interleaved into the connector
-frame (rustc interleaves them). Any other multi-line label is cut at the end of its first line,
-underlined to one column past it. A diagnostic with no multi-line label renders exactly as it did
-before connectors existed. Only the human form, and JSON's `rendered` copy of it, changes: the JSON
-span positions never depend on the renderer.
+The lines between two labelled lines print only when a connector spans the gap; a gap of more
+than 4 lines keeps its first and last line around one `...` gutter line (so a lone label longer than
+6 lines prints its first two and last two), and the gutter is then at least 3 wide. The gutter also
+widens to fit every printed line. A single-line label inside a connector's lines is interleaved on
+its line, under the connector's `|`, and a second multi-line label is no longer cut. A diagnostic
+whose labels are all single-line and on distinct lines renders exactly as it did before. Only the
+human form, and JSON's `rendered` copy of it, changes: the JSON span positions never depend on the
+renderer.
 
 The printed `-->`/`:::` column is the 1-based *char* column, the same number as JSON `col`. That is
 the editor/LSP jump contract, and it is kept by decision (N6): display width (tabs, wide characters)

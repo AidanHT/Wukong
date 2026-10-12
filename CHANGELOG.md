@@ -5,6 +5,19 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Diagnostics: labels on one source line share one frame (`gap7/diag-locations`, N6)
+
+- **Each labelled source line prints once.** The human renderer drew one frame per label, so two
+  labels on a line printed that line twice. Now the labels of a line share one underline row (`^`
+  primary, `-` secondary; a label nested in another stays visible inside it), the rightmost
+  message ends that row and the others hang below on `|` bars, rustc-style.
+- **Every multi-line label gets connectors.** Overlapping ones each take their own column of the
+  left margin, so a second multi-line label is no longer cut to its first line, and a single-line
+  label inside a connector's lines is drawn on its line instead of in a second frame after it.
+  The lines between two labelled lines print only inside a connector, eliding a long gap around
+  `...` as before. A diagnostic whose labels are single-line and on distinct lines renders
+  byte-for-byte as before; JSON is unchanged except for `rendered`, which carries the new form.
+
 ### Runtime traps name their source site (`gap7/diag-locations`, N89)
 
 - **A failed `assert` names its site on every CPU backend.** It used to print a bare `assertion
