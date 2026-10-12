@@ -1732,10 +1732,12 @@ or block-quantized weights — are builtins too. Most of their shapes are *value
 counts, strides), so each call is checked at run time against its operands' lengths before anything
 is read or written: a geometry that does not fit traps like a failed `assert` (exit 1, `assertion
 failed`) on every backend (`tests/run/decode_shape_trap.wk`). The batched attention `sdpa_kv_batch`
-has a real shape signature instead, checked at compile time (below). Operand kinds are checked at compile time with the usual codes:
-a wrong arity or a turbofish is `E0503`, a wrong operand kind or element type `E0401`, and writing
-the output through a non-`mut` aggregate parameter `E0304`. A buffer is a `[]T` slice, a `[T; N]`
-array or a contiguous `Tensor[T, …]`. Each returns `()`.
+has a real shape signature instead, checked at compile time (below). Operand kinds are checked at
+compile time with the usual codes: a wrong arity is `E0503`, and so is a turbofish — except
+`sdpa_kv_batch`'s, which is its list of six dimensions, where only a wrong count is `E0503`; a wrong
+operand kind or element type (an `i64` `kv_lens`, say) is `E0437`; and writing the output through a
+non-`mut` aggregate parameter is `E0304`. A buffer is a `[]T` slice, a `[T; N]` array or a
+contiguous `Tensor[T, …]`. Each returns `()`.
 
 | builtin | operands | runtime kernel |
 |---|---|---|
