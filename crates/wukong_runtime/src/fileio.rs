@@ -353,6 +353,29 @@ pub(crate) unsafe fn dims_arg<'a>(dims: *const i64, rank: i64) -> Option<&'a [i6
     }
 }
 
+/// `wukong_rt_cstr(data, len) -> *const u8` — a `[]u8` / `[u8; N]` buffer used as a path or tensor
+/// name: `data` when one of its first `len` bytes is NUL (the bytes before it are the string, as
+/// `sprintf` leaves them), else null, which a path reports as an open failure (`-1`) and a name
+/// reads as the empty name. The check is what lets a buffer stand where a NUL-terminated `*u8` is
+/// expected without a read past its end.
+///
+/// # Safety
+/// `data` must address `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn wukong_rt_cstr(data: *const u8, len: i64) -> *const u8 {
+    crate::safety::debug_extent(data, len);
+    if len <= 0 || data.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: the caller guarantees `len` readable bytes at `data`.
+    let bytes = unsafe { std::slice::from_raw_parts(data, len as usize) };
+    if bytes.contains(&0) {
+        data
+    } else {
+        std::ptr::null()
+    }
+}
+
 /// A NUL-terminated name argument, decoded lossily (an invalid UTF-8 sequence becomes U+FFFD —
 /// exactly how the interpreter reconstructs the same bytes from its slots). Null is the empty name.
 ///
@@ -623,6 +646,23 @@ mod tests {
         let n = unsafe { wukong_rt_write_dt(f.ptr(), std::ptr::null(), 0, DT_F16) };
         assert_eq!(n, 0);
         assert_eq!(std::fs::read(&f.0).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn cstr_passes_a_terminated_buffer_and_nulls_an_unterminated_one() {
+        let named = *b"h3.wq\0junk";
+        // SAFETY: each call reads at most the `len` bytes of `named` it is given.
+        unsafe {
+            assert_eq!(wukong_rt_cstr(named.as_ptr(), 10), named.as_ptr());
+            assert_eq!(cstr_lossy(wukong_rt_cstr(named.as_ptr(), 10)), "h3.wq");
+            assert!(
+                wukong_rt_cstr(named.as_ptr(), 5).is_null(),
+                "the NUL is past `len`"
+            );
+            assert!(wukong_rt_cstr(named.as_ptr(), 0).is_null());
+            assert_eq!(cstr_lossy(std::ptr::null()), "");
+            assert!(crate::rt_path(std::ptr::null()).is_none());
+        }
     }
 
     #[test]

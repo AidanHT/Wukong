@@ -188,7 +188,7 @@ pub use scatter::{wukong_scatter_add_f32, wukong_scatter_add_f32_parallel};
 // The ML builtins' runtime: one module per family (see each module's docs). Public, because the
 // interpreter calls their pure helpers directly.
 pub mod fileio;
-pub use fileio::{wukong_rt_file_size, wukong_rt_read_dt, wukong_rt_write_dt};
+pub use fileio::{wukong_rt_cstr, wukong_rt_file_size, wukong_rt_read_dt, wukong_rt_write_dt};
 pub mod gguf;
 pub use gguf::{wukong_rt_gguf_query, wukong_rt_gguf_read};
 pub mod mmap;

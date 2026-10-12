@@ -53,7 +53,7 @@ pub(crate) struct Entry {
 
 /// The table. The addresses are taken here, at run time, because a function-pointer-to-raw-pointer
 /// cast is not a constant expression.
-pub(crate) fn entries() -> [Entry; 25] {
+pub(crate) fn entries() -> [Entry; 26] {
     use Abi::{Ptr, F32, I64};
     [
         // (path, byte_off, data, len, dtype) -> i64: `read_<T>` outside the frozen six, and every
@@ -105,6 +105,13 @@ pub(crate) fn entries() -> [Entry; 25] {
             params: &[Ptr, Ptr, I64, I64],
             ret: Some(I64),
             addr: wukong_runtime::wukong_rt_gguf_query as *const u8,
+        },
+        // (data, len) -> data or null: a `[]u8` / `[u8; N]` path or tensor name.
+        Entry {
+            name: "wukong_rt_cstr",
+            params: &[Ptr, I64],
+            ret: Some(Ptr),
+            addr: wukong_runtime::wukong_rt_cstr as *const u8,
         },
         // (path, name, container, dtype, out_len) -> data: `map_<T>` / `st_map_<T>` /
         // `npy_map_<T>` / `gguf_map_<T>`.

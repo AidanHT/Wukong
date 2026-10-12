@@ -1,0 +1,109 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 14
+// EXPECT-OUT: 2
+// EXPECT-OUT: 14
+// EXPECT-OUT: 2
+// EXPECT-OUT: 14
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 2
+// EXPECT-OUT: 21
+// EXPECT-OUT: 22
+// EXPECT-OUT: 114
+// EXPECT-OUT: 138
+// EXPECT-OUT: 2
+// EXPECT-OUT: 50
+// EXPECT-OUT: 150
+// EXPECT-OUT: 2
+// EXPECT-OUT: -200
+// EXPECT-OUT: 400
+// EXPECT-OUT: 2
+// EXPECT-OUT: -1
+// EXPECT-OUT: -5
+// EXPECT-OUT: 0
+module tests.run.io_buffer_names
+
+// A path or a tensor name may be a `[]u8` / `[u8; N]` buffer holding a NUL-terminated string --
+// what `sprintf` writes -- so names are built at run time; the bytes before the first NUL are the
+// string. A buffer with no NUL is the null string: no byte past its end is read, a path that
+// cannot be opened is -1 and an empty name matches no tensor. Every expected value is the
+// program's own data:
+//  1. Three i32 files named "io_names_<k>.bin" (14 bytes, sprintf's result) are written ([10k + 1,
+//     10k + 2], 2 elements each) and read back through the same buffer.
+//  2. A safetensors file (header 114 bytes, file 8 + 114 + 16 = 138) holding "h0.w" = [0.5, 1.5]
+//     and "h1.w" = [-2, 4] (F32 [2]); both are loaded in a loop by `sprintf(name, "h{}.w", l)`
+//     (printed times 100), and the same names map with `st_map_f32` (2 lanes).
+//  3. "h0.w" spelled in a 4-byte array with no terminator: as a path it is -1, as a tensor name the
+//     empty name, -5, and as a map name the empty slice.
+
+fn put_str(mut buf: []u8, at: i64, s: *u8) -> i64 {
+    let mut i: i64 = 0;
+    while s[i] != 0 {
+        buf[at + i] = s[i];
+        i = i + 1;
+    }
+    return i;
+}
+
+fn put_le(mut buf: []u8, at: i64, v: i64, n: i64) {
+    let mut x: i64 = v;
+    let mut k: i64 = 0;
+    while k < n {
+        buf[at + k] = (x & 255) as u8;
+        x = x >> 8;
+        k = k + 1;
+    }
+}
+
+fn main() -> i32 {
+    let mut path: [u8; 32] = [0; 32];
+    for k in 0..3 {
+        print(sprintf(path, "io_names_{}.bin", k));
+        let v: [i32; 2] = [k * 10 + 1, k * 10 + 2];
+        print(write_i32(path, v));
+    }
+    for k in 0..3 {
+        sprintf(path, "io_names_{}.bin", k);
+        let mut r: [i32; 2] = [0; 2];
+        print(read_i32(path, r));
+        print(r[0]);
+        print(r[1]);
+    }
+
+    let st: *u8 = "io_names.safetensors";
+    let mut file: []u8 = alloc_u8(138);
+    let h: i64 = put_str(file, 8, "{\"h0.w\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]},\"h1.w\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[8,16]}}");
+    print(h);
+    put_le(file, 0, h, 8);
+    put_le(file, 8 + h, 0x3F000000, 4);
+    put_le(file, 12 + h, 0x3FC00000, 4);
+    put_le(file, 16 + h, 0xC0000000, 4);
+    put_le(file, 20 + h, 0x40800000, 4);
+    print(write_u8(st, file));
+    let mut name: [u8; 8] = [0; 8];
+    let mut w: [f32; 2] = [0.0; 2];
+    for l in 0..2 {
+        sprintf(name, "h{}.w", l);
+        print(st_read_f32(st, name, w));
+        print((w[0] * 100.0) as i32);
+        print((w[1] * 100.0) as i32);
+    }
+    let m: []f32 = st_map_f32(st, name);
+    print(m.len());
+
+    let bare: [u8; 4] = [104, 48, 46, 119];
+    print(file_size(bare));
+    print(st_read_f32(st, bare, w));
+    let none: []f32 = st_map_f32(st, bare);
+    print(none.len());
+    free(file);
+    free(m);
+    free(none);
+    return 0;
+}

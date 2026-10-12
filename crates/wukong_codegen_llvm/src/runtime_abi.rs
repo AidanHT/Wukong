@@ -113,6 +113,7 @@ pub(crate) const RUNTIME_ABI: &[(&str, &str, &[&str])] = &[
     ("wukong_rt_arg_f32", "float", &["i64", "float"]),
     ("wukong_rt_arg_i64", "i64", &["i64", "i64"]),
     ("wukong_rt_bounds_fail", "void", &["i64", "i64", "ptr"]),
+    ("wukong_rt_cstr", "ptr", &["ptr", "i64"]),
     ("wukong_rt_env", "ptr", &["ptr"]),
     ("wukong_rt_exit", "void", &["i64"]),
     ("wukong_rt_file_size", "i64", &["ptr"]),

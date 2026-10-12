@@ -19,6 +19,11 @@
 //! dtype-generic `Tensor[T, …]` is checked per instantiation (`dtype.rs`): an instance binding `T`
 //! to the builtin's element reaches it like the concrete function, any other binding is `E0416`.
 //!
+//! **Strings.** A path or tensor name is a NUL-terminated `*u8` (a literal), or a `[]u8` /
+//! `[u8; N]` buffer holding one — what `sprintf` writes, so a name can be built at run time. The
+//! lowering passes a buffer through `wukong_rt_cstr`, which turns one with no NUL into the null
+//! string rather than letting the runtime read past it.
+//!
 //! **Integers.** Byte offsets, seeds and counters accept any integer type (the value's bits, as
 //! `x as u64` would give them); an unsuffixed literal adapts to `i64`.
 //!
@@ -376,17 +381,23 @@ impl Sema<'_> {
         Some(ret)
     }
 
-    /// A NUL-terminated `*u8` string (a literal or a `*u8` binding); anything else is `E0437`.
+    /// A string operand: a NUL-terminated `*u8` (a literal or a `*u8` binding), or a `[]u8` /
+    /// `[u8; N]` buffer holding one — what `sprintf` writes, so a path or tensor name can be built
+    /// at run time (`sprintf(name, "h{}.wq", l)`). The bytes up to the buffer's first NUL are the
+    /// string; a buffer with no NUL is the null string (the lowering checks, so nothing reads past
+    /// its end). Anything else is `E0437`.
     fn ml_str_arg(&mut self, name: &str, arg: &Expr, ty: &Ty, i: usize, what: &str) {
+        let u8_ty = |t: &Ty| matches!(t, Ty::Scalar(Scalar::U8));
         match ty {
-            Ty::Ptr { pointee, .. } if matches!(pointee.as_ref(), Ty::Scalar(Scalar::U8)) => {}
+            Ty::Ptr { pointee, .. } if u8_ty(pointee) => {}
+            Ty::Slice(e) | Ty::Array { elem: e, .. } if u8_ty(e) => {}
             Ty::Unknown | Ty::Error => {}
             other => self.error(
                 arg.span,
                 "E0437",
                 format!(
-                    "`{name}` expects a `*u8` {what} as its {} argument, found a value of type \
-                     `{}`",
+                    "`{name}` expects a `*u8` {what} (or a NUL-terminated `[]u8` / `[u8; N]` \
+                     buffer) as its {} argument, found a value of type `{}`",
                     ordinal(i),
                     other.display(self.interner)
                 ),
@@ -730,6 +741,23 @@ mod tests {
             ),
             // The result is a typed `i64`.
             ("fn f() { let x: f32 = gguf_type(\"a\", \"w\"); }", "E0401"),
+        ]);
+    }
+
+    #[test]
+    fn a_u8_buffer_is_a_string_operand() {
+        let ok = "fn f(p: []u8, mut w: [f32; 4]) -> i64 { \
+                  let mut name: [u8; 16] = [0; 16]; \
+                  sprintf(name, \"h{}.wq\", 3); \
+                  return st_read_f32(p, name, w) + gguf_dim(p, name, 0) + file_size(name); }";
+        assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
+        assert_rejected(&[
+            // Only bytes spell a string.
+            (
+                "fn f(p: []i8, mut w: [f32; 4]) -> i64 { return read_f32(p, w); }",
+                "E0437",
+            ),
+            ("fn f(p: [u16; 8]) -> i64 { return file_size(p); }", "E0437"),
         ]);
     }
 

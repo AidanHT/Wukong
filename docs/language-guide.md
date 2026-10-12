@@ -2271,7 +2271,12 @@ stride). A builtin that writes `buf` through a non-`mut` slice, array or tensor 
   **`-2`** on an io error).
 
 `path` is any NUL-terminated `*u8` — usually a string literal (the `.rodata` pointer described under
-*Literals*), but a `*u8` binding works too. Anything else is `E0437`, and a wrong arity is `E0503`.
+*Literals*), but a `*u8` binding works too — or a `[]u8` / `[u8; N]` buffer holding one, which is how
+a name is built at run time: `sprintf(path, "shard_{:03}.bin", i)` then `read_f32(path, w)`. The bytes
+before the buffer's first NUL are the string; a buffer with no NUL is the null string (an open
+failure, `-1`), never a read past its end. The same goes for the tensor name of every checkpoint
+builtin below (`tests/run/io_buffer_names.wk`). Anything else is `E0437`, and a wrong arity is
+`E0503`.
 Both directions are implemented by the `wukong_runtime` layer on the native backend and mirrored by
 the interpreter on the same planning code — the return codes, the little-endian layout, the narrowing
 store, and the canonical value of every element read (a `u8`/`u16`/`u32` read from a file compares

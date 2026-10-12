@@ -47,7 +47,12 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `--emit=exe` rustc link cannot see); `wukong_rt_free` unmaps a registered mapping (one atomic load
   while none is live). `tests/run/io_map.wk` (raw, safetensors, `.npy`, GGUF, copy-on-write, a
   mapped weight through `gemv_q8_0`).
-
+- **A path or tensor name may be a `[]u8` / `[u8; N]` buffer** holding a NUL-terminated string —
+  what `sprintf` writes — for every file-I/O, checkpoint and map builtin, so names are built at run
+  time (`sprintf(name, "h{}.wq", l); st_read_f32(path, name, w)`). The lowering passes a buffer
+  through the new `wukong_rt_cstr(data, len)`, which yields the null string for a buffer with no
+  NUL (an open failure, or the empty name) instead of letting the runtime read past its end.
+  `tests/run/io_buffer_names.wk`.
 ### Source locations through MIR into native code (`gap5/native-source-locations`)
 
 - **Native-backend failures point at the source (P11.8).** A `C0002` (a slot above the native

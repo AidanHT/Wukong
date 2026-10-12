@@ -95,9 +95,14 @@ fn ptr_arg(args: &[Value], i: usize, ctx: &str, what: &str) -> Result<usize, Str
 }
 
 /// The `*u8` string argument at `i`, reconstructed with the same lossy rule as the frozen family
-/// (and as the native entries' lossy C-string decode).
+/// (and as the native entries' lossy C-string decode). The null pointer — a `[]u8` operand with no
+/// NUL, through `wukong_rt_cstr` — is the empty string, as natively: an empty path cannot be
+/// opened (`-1`) and an empty name is just a name.
 fn str_arg(memory: &[Value], args: &[Value], i: usize, ctx: &str) -> Result<String, String> {
-    file_read_path(memory, ptr_arg(args, i, ctx, "string")?)
+    match ptr_arg(args, i, ctx, "string")? {
+        crate::NULL_SLOT => Ok(String::new()),
+        p => file_read_path(memory, p),
+    }
 }
 
 /// A non-negative element count as a slot count.
@@ -123,6 +128,7 @@ impl Interp<'_, '_> {
             I::RtGgufRead => self.ml_gguf_read(args),
             I::RtGgufQuery => self.ml_gguf_query(args),
             I::RtMap => self.ml_map(args),
+            I::RtCstr => self.ml_cstr(args),
             I::RandFillF32 => self.ml_rand_fill(args),
             I::TopkF32 => self.ml_topk(args),
             I::ArgsortF32 => self.ml_argsort(args),
@@ -358,6 +364,22 @@ impl Interp<'_, '_> {
         let (what, k) = (arg_i64(args, 2), arg_i64(args, 3));
         let got = gguf_query_path(Path::new(&path), name.as_bytes(), what, k);
         Ok(Value::Int(got as i128))
+    }
+
+    /// `wukong_rt_cstr(data, len) -> data | null`: the buffer when one of its first `len` slots
+    /// holds a zero byte (the low byte, as `file_read_path` reads it), else the null pointer.
+    fn ml_cstr(&mut self, args: &[Value]) -> Result<Value, String> {
+        const CTX: &str = "string operand";
+        let n = count(arg_i64(args, 1));
+        if n == 0 {
+            return Ok(Value::Ptr(crate::NULL_SLOT));
+        }
+        let base = ptr_arg(args, 0, CTX, "data")?;
+        self.ml_check_extent(0, base, n, CTX)?;
+        let terminated = self.memory[base..base + n]
+            .iter()
+            .any(|v| v.as_int() as u8 == 0);
+        Ok(Value::Ptr(if terminated { base } else { crate::NULL_SLOT }))
     }
 
     /// `wukong_rt_map(path, name, container, dtype, out_len) -> data`: the runtime's own

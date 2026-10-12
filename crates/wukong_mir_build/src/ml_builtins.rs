@@ -64,6 +64,7 @@ pub(crate) struct MlSyms {
     gguf_read: Symbol,
     gguf_query: Symbol,
     map: Symbol,
+    cstr: Symbol,
     rand_fill: Symbol,
     topk: Symbol,
     argsort: Symbol,
@@ -81,6 +82,7 @@ impl MlSyms {
             gguf_read: interner.intern("wukong_rt_gguf_read"),
             gguf_query: interner.intern("wukong_rt_gguf_query"),
             map: interner.intern("wukong_rt_map"),
+            cstr: interner.intern("wukong_rt_cstr"),
             rand_fill: interner.intern("wukong_rand_fill_f32"),
             topk: interner.intern("wukong_topk_f32"),
             argsort: interner.intern("wukong_argsort_f32"),
@@ -135,7 +137,7 @@ impl FnLowerer<'_> {
                 if args.len() != 2 {
                     return None;
                 }
-                let path = self.lower_expr(&args[0]);
+                let path = self.ml_str(&args[0]);
                 let buf = self.ml_buffer(&args[1])?;
                 let read = matches!(b, MlBuiltin::Read(_));
                 if let Some(func) = self.ml_frozen_symbol(t, read) {
@@ -153,7 +155,7 @@ impl FnLowerer<'_> {
                 if args.len() != 3 {
                     return None;
                 }
-                let path = self.lower_expr(&args[0]);
+                let path = self.ml_str(&args[0]);
                 let off = self.ml_i64_arg(&args[1]);
                 let buf = self.ml_buffer(&args[2])?;
                 let dt = self.ml_i64_const(io_dtype_code(t));
@@ -163,15 +165,15 @@ impl FnLowerer<'_> {
                 if args.len() != 1 {
                     return None;
                 }
-                let path = self.lower_expr(&args[0]);
+                let path = self.ml_str(&args[0]);
                 Some(self.ml_call(syms.file_size, vec![path]))
             }
             MlBuiltin::StRead(t) | MlBuiltin::GgufRead(t) => {
                 if args.len() != 3 {
                     return None;
                 }
-                let path = self.lower_expr(&args[0]);
-                let tensor = self.lower_expr(&args[1]);
+                let path = self.ml_str(&args[0]);
+                let tensor = self.ml_str(&args[1]);
                 let buf = self.ml_buffer(&args[2])?;
                 let dt = self.ml_i64_const(io_dtype_code(t));
                 let (dims, rank) = self.ml_dims_arg(&buf);
@@ -186,8 +188,8 @@ impl FnLowerer<'_> {
                 if args.len() != 2 + usize::from(dim) {
                     return None;
                 }
-                let path = self.lower_expr(&args[0]);
-                let tensor = self.lower_expr(&args[1]);
+                let path = self.ml_str(&args[0]);
+                let tensor = self.ml_str(&args[1]);
                 let what = self.ml_i64_const(q.code());
                 let k = if dim {
                     self.ml_i64_arg(&args[2])
@@ -200,11 +202,11 @@ impl FnLowerer<'_> {
                 if args.len() != 1 + usize::from(src.named()) {
                     return None;
                 }
-                let path = self.lower_expr(&args[0]);
+                let path = self.ml_str(&args[0]);
                 // The whole-file maps have no name; the runtime reads the operand only for the
                 // named containers, so the path stands in for it.
                 let name = if src.named() {
-                    self.lower_expr(&args[1])
+                    self.ml_str(&args[1])
                 } else {
                     path
                 };
@@ -227,7 +229,7 @@ impl FnLowerer<'_> {
                 if args.len() != 2 {
                     return None;
                 }
-                let path = self.lower_expr(&args[0]);
+                let path = self.ml_str(&args[0]);
                 let buf = self.ml_buffer(&args[1])?;
                 let dt = self.ml_i64_const(io_dtype_code(t));
                 let (dims, rank) = self.ml_dims_arg(&buf);
@@ -310,6 +312,27 @@ impl FnLowerer<'_> {
             (Scalar::U8, false) => g.rt_write_u8,
             _ => return None,
         })
+    }
+
+    /// A string operand (a path or a tensor name): a `*u8` as it is; a `[]u8` / `[u8; N]` buffer
+    /// through `wukong_rt_cstr(data, len)`, which yields the buffer's data pointer only when a NUL
+    /// lies inside it — so a name `sprintf` wrote reaches the runtime as the C string it holds, and
+    /// a buffer with no terminator as the null string (an open failure for a path, the empty name),
+    /// never as a read past its end.
+    fn ml_str(&mut self, e: &Expr) -> ValueId {
+        if matches!(self.expr_ty(e), Ty::Slice(_) | Ty::Array { .. }) {
+            if let Some(buf) = self.ml_buffer(e) {
+                let func = self.gemm.ml.cstr;
+                return self.builder.build(
+                    MirType::Ptr,
+                    Op::Call {
+                        func,
+                        args: vec![buf.data, buf.len],
+                    },
+                );
+            }
+        }
+        self.lower_expr(e)
     }
 
     /// A fresh 16-byte slice fat pointer `{ data, len }` — the value-position slice convention
