@@ -80,7 +80,9 @@
 //! loop (its scalar epilogue) is left alone. Each rewrite removes its condition from both copies, so
 //! every loop is rewritten at most once per guard it holds, and the function cap bounds the total.
 //! At `-O2`, after LICM (which hoists invariant conditions and bounds into the preheader) and
-//! before the vectorizer.
+//! before the vectorizer. Loop fusion runs ahead of both, and asks [`may_decide_a_branch`] before
+//! fusing two loops the vectorizer cannot widen, so that it never welds a loop this pass could
+//! still turn into widenable copies to work that would keep every copy scalar.
 
 use wukong_mir::{
     BasicBlock, BinOp, BlockId, CastKind, CmpOp, Function, Inst, MirType, Op, Terminator, ValueId,
@@ -490,6 +492,136 @@ fn calls_confined_to_one_arm(
                 && call_blocks.iter().all(|&c| dominates(arm.0, c, idom))
         })
     })
+}
+
+/// Might this pass, later in the sweep, split or unswitch the innermost loop `l` (counter `iv`) as
+/// [`LoopFuse`](crate::LoopFuse) sees it, ahead of LICM? An over-approximation of what
+/// [`plan_split`] and [`plan_unswitch`] accept once LICM has hoisted what it can: some body block
+/// branches, with two distinct arms, on a condition -- or on one operand of an `and`/`or` condition
+/// -- that is
+///
+/// * *invariant*: defined outside the loop, or computed in it only from such values by operations
+///   LICM may hoist (a load included, since one that nothing in the loop writes is hoisted too) --
+///   the flag `if dbg`, compared in the loop until LICM moves the compare out; or
+/// * a comparison of the counter, or of a quantity derived from it (`ext(iv ± k)`, any cast or
+///   any invariant addend), with an invariant -- the split guard `i < m`, `i + 1 < m`.
+///
+/// Fusion asks this before pairing a branching loop with another loop the vectorizer cannot widen:
+/// split or unswitched alone, the branching loop may become copies the vectorizer widens, while
+/// fused, every copy would carry the other loop's unwidenable work. It is deliberately wider than
+/// the planners -- no size, range or exit-routing proof -- and misses only a condition whose
+/// computation inside the loop runs deeper than its walk ([`RANGE_DEPTH`] operations); a `true`
+/// only costs fusion a pair. (Every operation a loop fusion accepts is in its hoistable set or has
+/// no result; vectors, calls and frame slots never reach it.)
+pub(crate) fn may_decide_a_branch(f: &Function, l: &NaturalLoop, iv: ValueId) -> bool {
+    let defs = def_sites(f);
+    let mut defined: FxHashSet<u32> = FxHashSet::default();
+    for b in &l.blocks {
+        let blk = f.block(*b);
+        defined.extend(blk.params.iter().map(|p| p.0));
+        defined.extend(blk.insts.iter().filter_map(|i| i.result.map(|r| r.0)));
+    }
+    let cx = Hoistable {
+        f,
+        defs: &defs,
+        defined: &defined,
+    };
+    let decidable = |c: ValueId| match op_of(f, &defs, c) {
+        Some(Op::ConstInt(..)) => false,
+        Some(Op::Cmp(_, x, y))
+            if (cx.derived(iv, *x, RANGE_DEPTH) && cx.invariant(*y, RANGE_DEPTH))
+                || (cx.invariant(*x, RANGE_DEPTH) && cx.derived(iv, *y, RANGE_DEPTH)) =>
+        {
+            true
+        }
+        _ => *f.value_type(c) == MirType::I1 && cx.invariant(c, RANGE_DEPTH),
+    };
+    l.blocks.iter().any(|b| {
+        if *b == l.header {
+            return false;
+        }
+        let Terminator::CondBr {
+            cond,
+            then_blk,
+            else_blk,
+            ..
+        } = &f.block(*b).term
+        else {
+            return false;
+        };
+        then_blk != else_blk
+            && branch_conditions(f, &defs, *cond)
+                .into_iter()
+                .any(decidable)
+    })
+}
+
+/// What [`may_decide_a_branch`] asks of a loop's values.
+struct Hoistable<'a> {
+    f: &'a Function,
+    defs: &'a [Option<(usize, usize)>],
+    /// The values the loop defines: its blocks' parameters and instruction results.
+    defined: &'a FxHashSet<u32>,
+}
+
+impl Hoistable<'_> {
+    /// Is `v` defined outside the loop, or computed in it only from such values by scalar
+    /// operations LICM may hoist? `depth` bounds the walk; running out answers `false`.
+    fn invariant(&self, v: ValueId, depth: u32) -> bool {
+        if !self.defined.contains(&v.0) {
+            return true;
+        }
+        // A loop block's parameter has no defining instruction: it varies.
+        let Some(op) = op_of(self.f, self.defs, v) else {
+            return false;
+        };
+        if depth == 0
+            || !matches!(
+                op,
+                Op::ConstInt(..)
+                    | Op::ConstFloat(..)
+                    | Op::Bin(..)
+                    | Op::Cmp(..)
+                    | Op::Neg(_)
+                    | Op::Not(_)
+                    | Op::Cast(..)
+                    | Op::Select(..)
+                    | Op::Load(..)
+                    | Op::Gep { .. }
+                    | Op::FuncAddr(_)
+                    | Op::GlobalAddr(_)
+                    | Op::Fma(..)
+                    | Op::Sqrt(_)
+                    | Op::Round(..)
+                    | Op::IntUnary(..)
+            )
+        {
+            return false;
+        }
+        let mut all = true;
+        each_op_use(op, &mut |u| all = all && self.invariant(u, depth - 1));
+        all
+    }
+
+    /// Is `v` the counter `iv`, or the counter cast or offset by an invariant?
+    fn derived(&self, iv: ValueId, v: ValueId, depth: u32) -> bool {
+        if v == iv {
+            return true;
+        }
+        if depth == 0 {
+            return false;
+        }
+        let d = depth - 1;
+        match op_of(self.f, self.defs, v) {
+            Some(Op::Cast(_, x, _)) => self.derived(iv, *x, d),
+            Some(Op::Bin(BinOp::Add, a, b)) => {
+                (self.derived(iv, *a, d) && self.invariant(*b, d))
+                    || (self.invariant(*a, d) && self.derived(iv, *b, d))
+            }
+            Some(Op::Bin(BinOp::Sub, a, b)) => self.derived(iv, *a, d) && self.invariant(*b, d),
+            _ => false,
+        }
+    }
 }
 
 /// The conditions a branch on `cond` decides: `cond` itself and, when it is an `i1` `and`/`or`,

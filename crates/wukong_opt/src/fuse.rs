@@ -69,13 +69,22 @@
 //! * **Profit.** A loop the vectorizer can widen is never fused with one it cannot, and two
 //!   widenable loops fuse only when every access has one width -- and, when either body branches,
 //!   only when the vectorizer still widens the fused loop (tried on a copy of the function: an
-//!   if-converted region sinks its stores to one address, which two bodies' stores may not share)
-//!   -- so fusion never costs a loop its vectorization.
+//!   if-converted region sinks its stores to one address, which two bodies' stores may not share).
+//!   Two loops it cannot widen fuse unless either body branches on a condition `unswitch` may
+//!   decide later in the sweep, once LICM has run -- an invariant, or the counter (or
+//!   `ext(iv ± k)`) against an invariant ([`may_decide_a_branch`]): split or unswitched alone, that
+//!   loop may become copies the vectorizer widens, while fused, every copy would carry the other
+//!   loop's unwidenable work. That test is conservative -- such a pair stays apart even when no
+//!   copy would widen -- and every verdict is taken on the loops as fusion sees them, so fusion
+//!   never costs a loop the vector body that the vectorizer, directly or after a split or unswitch,
+//!   would give it there.
 //!
 //! The fused loop evaluates every operation of both loops on the same values, in an order whose
 //! only change is the interleaving the memory rule just proved unobservable, so results are
 //! bit-identical. The intermediate's store and reload then sit in one block, where load forwarding
 //! removes the reload; dead-store elimination of the buffer itself is a separate pass.
+//!
+//! [`may_decide_a_branch`]: crate::unswitch::may_decide_a_branch
 
 use wukong_mir::{BinOp, BlockId, CastKind, CmpOp, Function, MirType, Op, Terminator, ValueId};
 
@@ -586,6 +595,17 @@ fn plan_pair(
         crate::vectorize::would_widen(f, l2),
     );
     if w1 != w2 {
+        return None;
+    }
+    // Two loops it cannot widen as they stand: a branching one that `unswitch` may still split or
+    // unswitch, later in this sweep, could become copies the vectorizer widens -- unless fusion has
+    // put the other loop's unwidenable work into every copy. Keep such a loop alone.
+    if !two_block
+        && !w1
+        && [(l1, c1.iv), (l2, c2.iv)]
+            .into_iter()
+            .any(|(l, iv)| crate::unswitch::may_decide_a_branch(f, l, iv))
+    {
         return None;
     }
     if w1 {
@@ -1775,6 +1795,160 @@ mod tests {
                     assert!(
                         ok.contains(&loops) && widened == vector,
                         "{name} at -O2: {loops} loops, widened {widened}\n{}",
+                        wukong_mir::print::print_function(f, &interner)
+                    );
+                }
+            }
+            let (exit, stdout) =
+                wukong_interp::run_with_output(&optimized, main, &interner).unwrap();
+            assert_eq!(exit, 0);
+            outputs.push(stdout);
+        }
+        assert!(!outputs[0].is_empty());
+        assert_eq!(outputs[0], outputs[1]);
+    }
+
+    /// A branching first loop beside a recurrence loop no vectorizer widens. Each arm stores to an
+    /// array of its own, so the branching loop does not widen as it stands either ("both arms
+    /// store, to different places") -- but `split`, `flag` and `derived` branch on a condition
+    /// `unswitch` decides later in the sweep: the counter against a parameter, a parameter flag
+    /// (compared inside the loop until LICM hoists it), the counter's successor against a
+    /// parameter. Split or unswitched alone, the loop becomes the copies `t[i] = a[i] * 3` and
+    /// `u[i] = a[i] * 5 - 1`, which widen. (Arms that divide would not show it: `t[i] = a[i] / 3`
+    /// alone is declined, "most of the body would run lane by lane".) `data` branches on a loaded
+    /// value instead, which nothing decides.
+    const DECIDABLE_KERNELS: &str = concat!(
+        "fn split(a: [i32; 32], @noalias mut t: [i32; 32], @noalias mut u: [i32; 32], ",
+        "@noalias mut o: [i32; 32], n: i32, m: i32) { ",
+        "for i in 0..n { if i < m { t[i] = a[i] * 3; } else { u[i] = a[i] * 5 - 1; } } ",
+        "let mut h: i32 = 0; ",
+        "for j in 0..n { o[j] = t[j] / 2 + h; h = (h * 5 + 1) % 7; } }\n",
+        "fn flag(a: [i32; 32], @noalias mut t: [i32; 32], @noalias mut u: [i32; 32], ",
+        "@noalias mut o: [i32; 32], n: i32, m: i32) { ",
+        "for i in 0..n { if m > 0 { t[i] = a[i] * 3; } else { u[i] = a[i] * 5 - 1; } } ",
+        "let mut h: i32 = 0; ",
+        "for j in 0..n { o[j] = t[j] / 2 + h; h = (h * 5 + 1) % 7; } }\n",
+        "fn derived(a: [i32; 32], @noalias mut t: [i32; 32], @noalias mut u: [i32; 32], ",
+        "@noalias mut o: [i32; 32], n: i32, m: i32) { ",
+        "for i in 0..n { if i + 1 < m { t[i] = a[i] * 3; } else { u[i] = a[i] * 5 - 1; } } ",
+        "let mut h: i32 = 0; ",
+        "for j in 0..n { o[j] = t[j] / 2 + h; h = (h * 5 + 1) % 7; } }\n",
+        "fn data(a: [i32; 32], @noalias mut t: [i32; 32], @noalias mut u: [i32; 32], ",
+        "@noalias mut o: [i32; 32], n: i32, m: i32) { ",
+        "for i in 0..n { if a[i] < m { t[i] = a[i] * 3; } else { u[i] = a[i] * 5 - 1; } } ",
+        "let mut h: i32 = 0; ",
+        "for j in 0..n { o[j] = t[j] / 2 + h; h = (h * 5 + 1) % 7; } }\n",
+    );
+
+    /// Two loops neither of which widens may still cost a loop its vector body: a branching one
+    /// that `unswitch` splits or unswitches later in the sweep becomes copies the vectorizer widens,
+    /// unless fusion has already put the other loop's unwidenable work into every copy. So such a
+    /// pair stays apart, while the same pair branching on a loaded value -- which nothing decides --
+    /// still fuses (the accesses are identical across the four kernels, so legality is not what
+    /// decides).
+    #[test]
+    fn a_branch_unswitch_would_decide_keeps_its_loop_out_of_an_unwidenable_fusion() {
+        let src = format!("{DECIDABLE_KERNELS}fn main() -> i32 {{ return 0; }}\n");
+        let (mut program, mut interner) = before_fuse(&src);
+        for (name, fuses) in [
+            ("split", false),
+            ("flag", false),
+            ("derived", false),
+            ("data", true),
+        ] {
+            let sym = interner.intern(name);
+            let f = program
+                .funcs
+                .iter_mut()
+                .find(|f| f.name == sym)
+                .expect("defined above");
+            let forest = crate::loop_info::analyze_function(f);
+            assert_eq!(forest.loops.len(), 2, "{name}");
+            assert!(
+                forest.loops.iter().any(|l| l.blocks.len() > 2),
+                "{name}: no branching body"
+            );
+            assert!(
+                forest
+                    .loops
+                    .iter()
+                    .all(|l| !crate::vectorize::would_widen(f, l)),
+                "{name}: neither loop widens as fusion sees it"
+            );
+            let fused = LoopFuse.run_function(f, &mut CfgAnalyses::default());
+            assert_eq!(
+                fused,
+                fuses,
+                "{name}\n{}",
+                wukong_mir::print::print_function(f, &interner)
+            );
+            assert!(wukong_mir::verify::verify_function(f).is_empty(), "{name}");
+            assert_eq!(loop_count(f), if fuses { 1 } else { 2 }, "{name}");
+        }
+    }
+
+    /// The same kernels through the whole `-O2` pipeline, kept out of line: the decidable ones
+    /// end up with a vector body (their split or unswitched copies widen), and every one agrees
+    /// with `-O0` on every lane of `t`, `u` and `o`, over trip counts and split points on both
+    /// sides of every edge (0 and 1 iterations, `m` below, inside and past the range).
+    #[test]
+    fn a_loop_unswitch_would_decide_keeps_its_vector_body() {
+        let kernels = DECIDABLE_KERNELS.replace(
+            ", n: i32, m: i32) { ",
+            ", n: i32, m: i32, d: i64) { if d > 0 { again(d - 1); return; } ",
+        );
+        let src = format!(
+            "{kernels}{}",
+            concat!(
+                "fn again(d: i64) { let a: [i32; 32] = [0; 32]; let mut t: [i32; 32] = [0; 32]; ",
+                "let mut u: [i32; 32] = [0; 32]; let mut o: [i32; 32] = [0; 32]; ",
+                "split(a, t, u, o, 0, 0, d); flag(a, t, u, o, 0, 0, d); ",
+                "derived(a, t, u, o, 0, 0, d); data(a, t, u, o, 0, 0, d); }\n",
+                "fn show(t: [i32; 32], u: [i32; 32], o: [i32; 32]) { ",
+                "for k in 0..32 { print(t[k]); print(u[k]); print(o[k]); } }\n",
+                "fn reset(mut t: [i32; 32], mut u: [i32; 32], mut o: [i32; 32]) { ",
+                "for k in 0..32 { t[k] = 1000 + k; u[k] = 0 - 1; o[k] = 0 - 2; } }\n",
+                "fn main() -> i32 { let mut a: [i32; 32] = [0; 32]; ",
+                "for k in 0..32 { a[k] = (k * 7) % 23 - 11; } ",
+                "let mut t: [i32; 32] = [0; 32]; let mut u: [i32; 32] = [0; 32]; ",
+                "let mut o: [i32; 32] = [0; 32]; ",
+                "let ns: [i32; 4] = [0, 1, 7, 32]; let ms: [i32; 5] = [0 - 3, 0, 1, 5, 40]; ",
+                "for q in 0..4 { for r in 0..5 { let n = ns[q]; let m = ms[r]; ",
+                "reset(t, u, o); split(a, t, u, o, n, m, 0); show(t, u, o); ",
+                "reset(t, u, o); flag(a, t, u, o, n, m, 0); show(t, u, o); ",
+                "reset(t, u, o); derived(a, t, u, o, n, m, 0); show(t, u, o); ",
+                "reset(t, u, o); data(a, t, u, o, n, m, 0); show(t, u, o); } } ",
+                "return 0; }\n",
+            )
+        );
+        let mut interner = Interner::new();
+        let (module, parse) = wukong_parser::parse_module(&src, SourceId(0), &mut interner);
+        assert!(parse.iter().all(|d| !d.is_error()), "{parse:?}");
+        let (sema, check) = wukong_sema::check(&module, &interner);
+        assert!(check.iter().all(|d| !d.is_error()), "{check:?}");
+        let (program, lower) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        assert!(lower.iter().all(|d| !d.is_error()), "{lower:?}");
+        let main = interner.intern("main");
+        let mut outputs = Vec::new();
+        for level in [0u8, 2] {
+            let mut optimized = program.clone();
+            crate::optimize(&mut optimized, level);
+            assert!(wukong_mir::verify::verify_program(&optimized).is_empty());
+            if level == 2 {
+                for (name, vector) in [
+                    ("split", true),
+                    ("flag", true),
+                    ("derived", true),
+                    ("data", false),
+                ] {
+                    let f = optimized
+                        .function(interner.intern(name))
+                        .expect("kept out of line");
+                    let widened = f.value_types.iter().any(MirType::is_vector);
+                    assert_eq!(
+                        widened,
+                        vector,
+                        "{name} at -O2\n{}",
                         wukong_mir::print::print_function(f, &interner)
                     );
                 }
