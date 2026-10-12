@@ -1488,9 +1488,16 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   caller's claim about the argument, as a `?` extent is, and a wrong value is outside the defined
   contract (only the named kernel builtins test such extents at run time). A run-time assertion where
   a turbofish value meets a fixed extent would close it; the value is already in a slot of its own
-  there. Separately, an `if`/`match` whose arms are a turbofish-shaped tensor and a `?` tensor takes
-  the first arm's shape, as any merge with a `?` arm does, so a `dim(0)` of the merge read on the `?`
-  arm's path reads 0 (the slot's entry value) rather than that tensor's extent.
+  there. Separately, an `if`/`match` takes its first arm's shape when a later arm is a `?` tensor,
+  as it does for a fixed (`3`) or generic (`N`) first arm, so on the `?` arm's path `t.dim(0)`
+  reports the first arm's extent, not the `?` tensor's. For a turbofish-shaped first arm that is the
+  value its dimension's slot last received: 0 only while no call has written it, otherwise the
+  latest value any call wrote there, such as the turbofish arm on an earlier loop iteration or
+  another read of the same immutable binding (they share the slot). A loop to that extent reads past
+  the `?` tensor on both backends: in
+  `for i in 0..2 { let t = if i == 0 { row::<2, n>(buf, 0) } else { d }; .. }` with a one-element
+  `d`, iteration 1 reports 3 and reads `d[1]` and `d[2]`. Typing such a merge as `?`, or rejecting it,
+  would close it. (With the `?` arm first the merge is `?`, and its `dim(0)` is `C0001`.)
 
 - **A `?` argument binds a fixed-extent parameter unchecked.** `fn find(x: [f32; 37])` called with a
   `Tensor[f32, ?]` (or an array that decayed to one) compiles with no diagnostic and no run-time

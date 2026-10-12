@@ -53,9 +53,13 @@ impl FnLowerer<'_> {
     /// The slot the run-time dimension `dim` is read into, made on first use: an `i64` in the
     /// entry block, zeroed there, and bound under `dim` in the function's outermost scope, which no
     /// source name can shadow (`dim` is a fresh symbol). The zero is for the one way a shape can
-    /// reach a use without passing its call — an `if`/`match` whose other arm is a `?` tensor gives
-    /// the whole merge the first arm's shape — so that use reads a defined 0 on every backend
-    /// rather than an uninitialized slot.
+    /// reach a use without passing its call — an `if`/`match` whose first arm is the call and whose
+    /// other arm is a `?` tensor gives the whole merge the first arm's shape — so that use reads a
+    /// defined value on every backend rather than an uninitialized slot. It is NOT the `?` tensor's
+    /// extent: the slot is zeroed once and never reset, so the use reads 0 only while no call has
+    /// written it, and otherwise the last value any call wrote (an earlier loop iteration's, or
+    /// another read's of the same immutable binding, which shares the slot). A loop bounded by it
+    /// can run past the `?` tensor (`docs/roadmap.md`, the run-time turbofish sharp edge).
     fn snapshot_slot(&mut self, dim: Symbol) -> ValueId {
         if let Some((slot, _)) = self.scopes.first().and_then(|s| s.get(&dim)) {
             return *slot;
