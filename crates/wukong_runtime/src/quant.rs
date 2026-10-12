@@ -649,19 +649,40 @@ pub fn dequant_int4_plan(
 /// Dequantize `out.len()` packed 4-bit elements (see the section docs). The scalar definition,
 /// one group at a time so the scale is loaded once per group.
 fn dequant_int4_into(q: &[u8], scale: &[f32], zero: Option<&[f32]>, group: usize, out: &mut [f32]) {
+    // The value of one nibble: sign-extended (shift it to the top of an i8, then arithmetically
+    // back) for the signed form, or less the group's zero point.
+    let value = |nib: u8, s: f32, z: Option<f32>| match z {
+        None => f32::from(((nib << 4) as i8) >> 4) * s,
+        Some(z) => (f32::from(nib) - z) * s,
+    };
+    if group.is_multiple_of(2) {
+        // An even group never splits a byte: decode whole bytes, two outputs each, one scale (and
+        // zero point) per group — a straight-line body the compiler vectorizes. Each element is
+        // the same expression as below, so the two paths agree bit for bit.
+        for (g, chunk) in out.chunks_mut(group).enumerate() {
+            let (s, z) = (scale[g], zero.map(|z| z[g]));
+            let bytes = &q[g * group / 2..];
+            let full = chunk.len() / 2;
+            let mut pairs = chunk.chunks_exact_mut(2);
+            for (pair, &b) in (&mut pairs).zip(bytes) {
+                pair[0] = value(b & 0x0f, s, z);
+                pair[1] = value(b >> 4, s, z);
+            }
+            // An odd last group (the end of an odd count) ends on a low nibble.
+            if let [last] = pairs.into_remainder() {
+                *last = value(bytes[full] & 0x0f, s, z);
+            }
+        }
+        return;
+    }
     for (g, chunk) in out.chunks_mut(group).enumerate() {
-        let s = scale[g];
-        let z = zero.map(|z| z[g]);
+        let (s, z) = (scale[g], zero.map(|z| z[g]));
         let base = g * group;
         for (k, o) in chunk.iter_mut().enumerate() {
             let i = base + k;
             let b = q[i >> 1];
             let nib = if i & 1 == 0 { b & 0x0f } else { b >> 4 };
-            *o = match z {
-                // Sign-extend the nibble: shift it to the top of an i8, then arithmetically back.
-                None => f32::from(((nib << 4) as i8) >> 4) * s,
-                Some(z) => (f32::from(nib) - z) * s,
-            };
+            *o = value(nib, s, z);
         }
     }
 }
