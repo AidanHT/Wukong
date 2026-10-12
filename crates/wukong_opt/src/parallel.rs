@@ -19,10 +19,15 @@
 //! whole corpus (one, the automatic count, and four threads).
 //!
 //! Failures keep their sequential identity too. Under the sequential schedule the first task to
-//! fail (a verifier failure, or a panic) stops the batch; here every task runs, and the batch then
-//! reports the failure — or resumes the panic — of the earliest task in sequential order, ignoring
-//! whatever any later task did. (A later task's panic message may still reach stderr from its
-//! worker; only the earliest one is propagated.)
+//! fail (a verifier failure, or a panic) stops the batch. Here a task does not start once one
+//! earlier in sequential order is known to have failed, the batch is reported up to the failure of
+//! the earliest failing task, and whatever any later task did is ignored. A panic is caught on the
+//! thread that ran it and handed back as a value ([`Failed::Panic`]), not resumed straight away,
+//! so the level-by-level fixpoint can weigh it against a failure in a *later* level that the
+//! sequential schedule meets first, and resume it only if it is still the earliest. What cannot be
+//! taken back is a message: the panic hook prints as the panic happens, so a task the sequential
+//! schedule would never have reached — one already running in the same batch, or one in a lower
+//! level — can still leave its panic message on stderr. It is never the failure reported.
 //!
 //! # The knob
 //!
@@ -46,6 +51,7 @@
 //! above the pool's width shares its threads. A pool that cannot be built leaves every batch on the
 //! calling thread, which computes the same MIR.
 
+use std::any::Any;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
@@ -161,26 +167,58 @@ fn weight(f: &Function) -> usize {
     f.blocks.iter().map(|b| b.insts.len()).sum()
 }
 
+/// Why a task produced no value: it returned an error, or it panicked — the payload, caught on the
+/// thread that ran the task and not yet resumed, so a caller can weigh it against failures in
+/// other batches before deciding which one the sequential schedule would have met first.
+pub(crate) enum Failed<E> {
+    Err(E),
+    Panic(Box<dyn Any + Send + 'static>),
+}
+
+impl<E> Failed<E> {
+    /// The error — or, for a panic, the panic resumed on this thread (its message was printed when
+    /// it happened; resuming does not print it again).
+    pub(crate) fn into_err(self) -> E {
+        match self {
+            Failed::Err(e) => e,
+            Failed::Panic(payload) => panic::resume_unwind(payload),
+        }
+    }
+}
+
+/// Run one task, a panic caught as a [`Failed::Panic`].
+fn run_caught<R, E>(task: impl FnOnce() -> Result<R, E>) -> Result<R, Failed<E>> {
+    match panic::catch_unwind(AssertUnwindSafe(task)) {
+        Ok(r) => r.map_err(Failed::Err),
+        Err(payload) => Err(Failed::Panic(payload)),
+    }
+}
+
 /// One task's state while a batch runs.
-enum Slot<'a, T> {
+enum Slot<'a, T, E> {
     Pending(&'a mut Function),
     Running,
-    Done(std::thread::Result<T>),
+    Done(Result<T, Failed<E>>),
+    /// Never started: a task earlier in `funcs` order had already failed, so the sequential
+    /// schedule would not have reached this one.
+    Skipped,
 }
 
 /// Apply `task` to each of `funcs` and return the results in `funcs` order, as the sequential
-/// schedule would: up to and including the first `Err`, after which nothing more is reported (the
+/// schedule would: up to and including the first failure — an `Err`, or a panic, which comes back
+/// as a [`Failed::Panic`] rather than being resumed — after which nothing more is reported (the
 /// sequential schedule never ran the rest). With `par` engaged for this batch the calling thread and
 /// up to `workers - 1` pool threads take tasks off one queue, largest first — the caller starts
 /// before any worker has woken, so the largest task, the one that decides how long the batch takes,
-/// usually stays on the thread that was already running; a panic in a task is resumed here, the
-/// earliest in `funcs` order, after the whole batch has finished. Also returns how many threads the
-/// batch was given (1: the caller's alone).
-pub(crate) fn try_map<R, E, F>(
+/// usually stays on the thread that was already running. A task not yet started when one earlier in
+/// `funcs` order has failed is skipped; one already running finishes, and its result (or the
+/// message of its panic, which the panic hook prints as it happens) goes nowhere. Also returns how
+/// many threads the batch was given (1: the caller's alone).
+pub(crate) fn try_map_caught<R, E, F>(
     par: Parallelism,
     funcs: Vec<&mut Function>,
     task: F,
-) -> (Vec<Result<R, E>>, usize)
+) -> (Vec<Result<R, Failed<E>>>, usize)
 where
     R: Send,
     E: Send,
@@ -191,7 +229,7 @@ where
     let Some(pool) = pool else {
         let mut out = Vec::with_capacity(funcs.len());
         for f in funcs {
-            let r = task(f);
+            let r = run_caught(|| task(f));
             let failed = r.is_err();
             out.push(r);
             if failed {
@@ -205,11 +243,13 @@ where
     // program order. Only the start order depends on this — every result lands in its own slot.
     let mut order: Vec<usize> = (0..funcs.len()).collect();
     order.sort_by(|&a, &b| weights[b].cmp(&weights[a]).then(a.cmp(&b)));
-    let slots: Vec<Mutex<Slot<'_, Result<R, E>>>> = funcs
+    let slots: Vec<Mutex<Slot<'_, R, E>>> = funcs
         .into_iter()
         .map(|f| Mutex::new(Slot::Pending(f)))
         .collect();
     let next = AtomicUsize::new(0);
+    // The earliest index, in `funcs` order, of a task known to have failed.
+    let first_failed = AtomicUsize::new(usize::MAX);
     let jobs = par.workers.min(slots.len());
     let work = || loop {
         let k = next.fetch_add(1, Ordering::Relaxed);
@@ -217,10 +257,18 @@ where
             break;
         };
         let mut slot = slots[i].lock().unwrap_or_else(PoisonError::into_inner);
+        if i > first_failed.load(Ordering::Acquire) {
+            *slot = Slot::Skipped;
+            continue;
+        }
         let Slot::Pending(f) = std::mem::replace(&mut *slot, Slot::Running) else {
             unreachable!("each task is handed out once");
         };
-        *slot = Slot::Done(panic::catch_unwind(AssertUnwindSafe(|| task(f))));
+        let r = run_caught(|| task(f));
+        if r.is_err() {
+            first_failed.fetch_min(i, Ordering::AcqRel);
+        }
+        *slot = Slot::Done(r);
     };
     pool.in_place_scope(|scope| {
         for _ in 1..jobs {
@@ -232,18 +280,40 @@ where
     let mut out = Vec::with_capacity(slots.len());
     for slot in slots {
         match slot.into_inner().unwrap_or_else(PoisonError::into_inner) {
-            Slot::Done(Ok(r)) => {
+            Slot::Done(r) => {
                 let failed = r.is_err();
                 out.push(r);
                 if failed {
                     break;
                 }
             }
-            Slot::Done(Err(payload)) => panic::resume_unwind(payload),
+            Slot::Skipped => {
+                unreachable!("a task is skipped only after an earlier one failed, which ends this")
+            }
             Slot::Pending(_) | Slot::Running => unreachable!("the scope ran every task"),
         }
     }
     (out, jobs)
+}
+
+/// [`try_map_caught`] for a caller with nothing to weigh a panic against: the earliest failure in
+/// `funcs` order ends the report as an `Err`, or is resumed here if it was a panic.
+pub(crate) fn try_map<R, E, F>(
+    par: Parallelism,
+    funcs: Vec<&mut Function>,
+    task: F,
+) -> (Vec<Result<R, E>>, usize)
+where
+    R: Send,
+    E: Send,
+    F: Fn(&mut Function) -> Result<R, E> + Sync,
+{
+    let (results, threads) = try_map_caught(par, funcs, task);
+    let results = results
+        .into_iter()
+        .map(|r| r.map_err(Failed::into_err))
+        .collect();
+    (results, threads)
 }
 
 /// [`try_map`] for a task that cannot fail.
@@ -414,5 +484,82 @@ mod tests {
         }));
         let payload = caught.expect_err("a task panicked");
         assert_eq!(payload.downcast_ref::<usize>(), Some(&2));
+    }
+
+    /// What one task of a batch came to, comparably.
+    #[derive(Debug, PartialEq)]
+    enum Did {
+        Ok(wukong_span::Symbol),
+        Err(wukong_span::Symbol),
+        Panic(wukong_span::Symbol),
+    }
+
+    fn did(results: Vec<Result<wukong_span::Symbol, Failed<wukong_span::Symbol>>>) -> Vec<Did> {
+        results
+            .into_iter()
+            .map(|r| match r {
+                Ok(s) => Did::Ok(s),
+                Err(Failed::Err(s)) => Did::Err(s),
+                Err(Failed::Panic(payload)) => Did::Panic(
+                    *payload
+                        .downcast_ref::<wukong_span::Symbol>()
+                        .expect("the task's own payload"),
+                ),
+            })
+            .collect()
+    }
+
+    /// A panic comes back as a value in its sequential place, never resumed: for many mixes of
+    /// errors and panics, the pool reports exactly the sequential schedule's prefix — every result
+    /// up to the earliest failure, panic or not, and nothing after it (the skipped tasks among
+    /// them).
+    #[test]
+    fn a_panic_is_a_failure_value_in_its_sequential_place() {
+        let mut it = Interner::new();
+        let mut funcs: Vec<Function> = (0..10)
+            .map(|i| func(&mut it, &format!("q{i}"), 1 + i % 3))
+            .collect();
+        let names: Vec<_> = funcs.iter().map(|f| f.name).collect();
+        let all: Vec<usize> = (0..funcs.len()).collect();
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut mixed = 0;
+        for round in 0..200 {
+            // Each task fails with probability 1/16 and panics with probability 1/16.
+            let kinds: Vec<u64> = (0..funcs.len())
+                .map(|_| {
+                    seed = seed
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    (seed >> 33) % 16
+                })
+                .collect();
+            let task = |f: &mut Function| {
+                let k = names.iter().position(|&n| n == f.name).unwrap();
+                match kinds[k] {
+                    0 => Err(f.name),
+                    // `resume_unwind` skips the panic hook, so the test prints nothing.
+                    1 => panic::resume_unwind(Box::new(f.name)),
+                    _ => Ok(f.name),
+                }
+            };
+            let (want, threads) =
+                try_map_caught(Parallelism::SEQUENTIAL, select_mut(&mut funcs, &all), task);
+            assert_eq!(threads, 1);
+            let want = did(want);
+            mixed += usize::from(want.iter().any(|d| matches!(d, Did::Panic(_))));
+            for workers in [2, 4] {
+                let par = Parallelism {
+                    workers,
+                    forced: true,
+                };
+                let (got, _) = try_map_caught(par, select_mut(&mut funcs, &all), task);
+                assert_eq!(
+                    did(got),
+                    want,
+                    "round {round}, {workers} workers, kinds {kinds:?}"
+                );
+            }
+        }
+        assert!(mixed > 20, "the rounds hardly ever panicked: {mixed}");
     }
 }

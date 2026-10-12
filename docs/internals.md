@@ -828,7 +828,11 @@ the table only about the symbols its own calls name, and no pass can mint a new 
 level's SCCs are then summarized in SCC order. Unrolling, straight-line SLP, their cleanup sweeps
 and switch formation are per function outright. Results go back in program order, so the MIR is
 byte-identical for every thread count; a verifier failure or a panic is the earliest one in
-sequential order. `WUKONG_OPT_THREADS=<n>` (`OptimizeOptions::threads`, `PassManager::set_threads`)
+sequential order. A task's panic is caught and held as a failure value (`parallel::Failed`), so the
+level schedule weighs it against failures in later levels and resumes it only if it is still the
+earliest, and a task not yet started when an earlier one fails is skipped; the one thing that
+cannot be taken back is a message — a task the sequential schedule would never have reached can
+still print its panic on stderr, though it is never the failure reported. `WUKONG_OPT_THREADS=<n>` (`OptimizeOptions::threads`, `PassManager::set_threads`)
 sets the count: `1` is the old sequential schedule exactly, unset or `0` is automatic (the host's
 parallelism, at most 8, only for a batch whose functions other than the largest hold at least 256
 instructions), and an explicit `n > 1` sends every batch of two or more functions to the pool.

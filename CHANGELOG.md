@@ -15,7 +15,12 @@ All notable changes to Wukong are documented here. The format is loosely based o
   it, and the level's SCCs are summarized in SCC order afterwards. Unrolling, straight-line SLP,
   their cleanup sweeps and switch formation run per function outright. Results go back in program
   order, so the MIR is byte-identical for every thread count, and a verifier failure or a panic is
-  the one the sequential schedule meets first.
+  the one the sequential schedule meets first: a task's panic is caught and held as a failure, so a
+  panic in a lower level never pre-empts a verifier failure (a `--verify-each` diagnostic) that the
+  sequential schedule reaches earlier in a higher one, and a task that has not started when an
+  earlier one fails is skipped. Only a message cannot be taken back: a task the sequential schedule
+  would never have reached may still print its panic message on stderr, though it is never the
+  failure reported.
 - **`WUKONG_OPT_THREADS=<n>`** picks the count (`OptimizeOptions::threads`,
   `PassManager::set_threads` in the library): `1` is the previous sequential schedule exactly;
   unset or `0` is automatic — the host's parallelism, at most 8, used for a batch only when its

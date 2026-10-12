@@ -577,8 +577,11 @@ fn program_sequential<P: Pass + ?Sized>(
 /// and its SCCs are then summarized in SCC order.
 ///
 /// A failure is reported as the sequential schedule would report it: the earliest failing function
-/// in SCC order. After one, only SCCs earlier than it are still optimized — any of them could fail
-/// first in sequential order, and none of them can call it.
+/// in SCC order, whether it failed verification or panicked. A panic comes back from its batch as a
+/// value ([`parallel::Failed::Panic`]) and is recorded exactly like a verifier failure; after
+/// either, only SCCs earlier than it are still optimized — any of them could fail first in
+/// sequential order, and none of them can call it — and only once every level is done is the
+/// earliest failure returned, or resumed if it was a panic.
 fn program_by_levels(
     passes: &[Box<dyn Pass + Send + Sync>],
     program: &mut Program,
@@ -591,7 +594,7 @@ fn program_by_levels(
     }
     let graph = CallGraph::of(program);
     let mut effects = Arc::new(CallEffects::default());
-    let mut failed: Option<(usize, VerificationFailure)> = None;
+    let mut failed: Option<(usize, parallel::Failed<VerificationFailure>)> = None;
     let timed = timings.is_some();
     for level in graph.levels() {
         let bound = failed.as_ref().map_or(usize::MAX, |(scc, _)| *scc);
@@ -606,7 +609,7 @@ fn program_by_levels(
             .collect();
         let indices: Vec<usize> = tasks.iter().map(|&(_, i)| i).collect();
         let table = &effects;
-        let (results, threads) = parallel::try_map(
+        let (results, threads) = parallel::try_map_caught(
             par,
             parallel::select_mut(&mut program.funcs, &indices),
             |f| {
@@ -621,8 +624,9 @@ fn program_by_levels(
                 .map(|()| own)
             },
         );
-        // `try_map` reports up to the first failure in this order, which is the earliest of the
-        // level; anything already recorded is later still, or it would have filtered this level.
+        // `try_map_caught` reports up to the first failure (or panic) in this order, which is the
+        // earliest of the level; anything already recorded is later still, or it would have
+        // filtered this level.
         for (k, result) in results.into_iter().enumerate() {
             match result {
                 Ok(own) => {
@@ -646,7 +650,7 @@ fn program_by_levels(
         }
     }
     match failed {
-        Some((_, failure)) => Err(failure),
+        Some((_, failure)) => Err(failure.into_err()),
         None => Ok(()),
     }
 }

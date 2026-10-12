@@ -6,7 +6,7 @@
 | `cfg.rs` | `successors`, `predecessors`, `reverse_postorder`, `reachable`, `prune_unreachable` |
 | `dom.rs` | Cooper–Harvey–Kennedy dominators: `idoms_from`, `dominance_frontiers_from`, `dom_children` |
 | `cache.rs` | `CfgAnalyses` — lazily computed, structurally-invalidated per-function analysis cache; also holds the per-function state a pass keeps between runs (the vectorizer's widened headers) |
-| `parallel.rs` | the deterministic parallel schedule: `Parallelism` (`OptimizeOptions::threads` / `WUKONG_OPT_THREADS`), a private `rayon` pool, `try_map` (results in program order, the earliest failure wins) — used by the level-by-level fixpoint and the per-function unroll/SLP/switch stages |
+| `parallel.rs` | the deterministic parallel schedule: `Parallelism` (`OptimizeOptions::threads` / `WUKONG_OPT_THREADS`), a private `rayon` pool, `try_map` and `try_map_caught` (results in program order; the earliest failure wins, and a panic is a failure held as a value until the caller resumes it) — used by the level-by-level fixpoint and the per-function unroll/SLP/switch stages |
 | `sroa.rs` | `Sroa` — split a constant-indexed aggregate slot into scalar leaf slots for mem2reg (`-O2`) |
 | `mem2reg.rs` | `Mem2Reg` — scalar alloca/load/store → block-parameter SSA |
 | `simplify.rs` | `Simplify` — constant folding + algebraic identities |

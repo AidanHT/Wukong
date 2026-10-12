@@ -2,6 +2,7 @@
 //! one the sequential schedule reports, and a pass that cannot leave its thread never does.
 
 use std::collections::BTreeSet;
+use std::panic::AssertUnwindSafe;
 use std::sync::Mutex;
 
 use wukong_mir::{Builder, Function, MirType, Op, Program, Terminator, ValueId};
@@ -252,6 +253,85 @@ fn a_failure_is_the_one_the_sequential_schedule_reports() {
         reports.push(failure);
     }
     assert!(reports.windows(2).all(|w| w[0] == w[1]), "{reports:?}");
+}
+
+/// Panics on every function it names, with that function's symbol as the payload.
+struct PanicNamed {
+    names: Vec<Symbol>,
+}
+
+impl Pass for PanicNamed {
+    fn name(&self) -> &'static str {
+        "panic-named"
+    }
+
+    fn run_function(&self, f: &mut Function, _: &mut CfgAnalyses) -> bool {
+        if self.names.contains(&f.name) {
+            std::panic::panic_any(f.name);
+        }
+        false
+    }
+}
+
+/// How a verified run over `chain` ends.
+#[derive(Debug, PartialEq)]
+enum Outcome {
+    Ok,
+    /// A verifier failure in this function.
+    Failed(Option<Symbol>),
+    /// A panic out of [`PanicNamed`] on this function.
+    Panicked(Symbol),
+}
+
+fn outcome(program: &Program, threads: u32, broken: &[Symbol], panicking: &[Symbol]) -> Outcome {
+    let mut pm = PassManager::new().with_threads(threads);
+    pm.add_shared(Box::new(BreakNamed {
+        names: broken.to_vec(),
+    }));
+    pm.add_shared(Box::new(PanicNamed {
+        names: panicking.to_vec(),
+    }));
+    let mut p = program.clone();
+    match std::panic::catch_unwind(AssertUnwindSafe(|| pm.run_verified(&mut p))) {
+        Ok(Ok(())) => Outcome::Ok,
+        Ok(Err(failure)) => Outcome::Failed(failure.function),
+        Err(payload) => Outcome::Panicked(
+            *payload
+                .downcast_ref::<Symbol>()
+                .expect("the payload PanicNamed panicked with"),
+        ),
+    }
+}
+
+/// A panic is a failure like any other: whatever the thread count, the run ends in the failure the
+/// sequential schedule meets first, verifier failure or panic — across levels, where the level
+/// schedule reaches `leaf2` (SCC 2, level 0) before `mid` (SCC 1, level 1), and within one level.
+#[test]
+fn a_panic_is_resumed_only_where_the_sequential_schedule_meets_it() {
+    let mut it = Interner::new();
+    let program = chain(&mut it);
+    let [mid, leaf1, leaf2] = ["mid", "leaf1", "leaf2"].map(|n| it.intern(n));
+    let cases = [
+        // `mid` fails verification and `leaf2` panics: `mid` comes first, so nothing panics.
+        (vec![mid], vec![leaf2], Outcome::Failed(Some(mid))),
+        // The other way round: `mid`'s panic comes first.
+        (vec![leaf2], vec![mid], Outcome::Panicked(mid)),
+        // Two panics: `mid`'s.
+        (vec![], vec![mid, leaf2], Outcome::Panicked(mid)),
+        // One level, a failure before a panic and a panic before a failure.
+        (vec![leaf1], vec![leaf2], Outcome::Failed(Some(leaf1))),
+        (vec![leaf2], vec![leaf1], Outcome::Panicked(leaf1)),
+        (vec![], vec![], Outcome::Ok),
+    ];
+    for (broken, panicking, want) in &cases {
+        for threads in [1u32, 0, 2, 4] {
+            assert_eq!(
+                outcome(&program, threads, broken, panicking),
+                *want,
+                "{threads} threads, broken {broken:?}, panicking {panicking:?}"
+            );
+        }
+    }
 }
 
 /// Records which thread ran each function. The functions it names meet before going on: each waits
