@@ -729,6 +729,8 @@ fn main() -> i32 {
          to a closure-bound `f` are rejected. Bind each closure to a name of its own.",
         bad: "module ex.e0422\nfn main() -> i32 {\n    let mut f = |x: i32| x + 1;\n    return f(1);\n}\n",
         good: "module ex.e0422\nfn main() -> i32 {\n    let f = |x: i32| x + 1;\n    return f(1);\n}\n"
+    ),
+    entry!(
         "E0423",
         "or-pattern alternatives bind different names",
         "An or-pattern `A | B` matches when any alternative does, and its arm then reads the names \
