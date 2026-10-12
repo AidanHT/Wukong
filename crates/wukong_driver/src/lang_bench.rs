@@ -134,7 +134,14 @@ fn compile_fixture(path: &Path, opt: u8) -> Result<Fixture, String> {
         }
         let high = program.clone();
         let mut low = program;
-        wukong_opt::optimize(&mut low, opt);
+        // The optimizer's 256-bit kernels follow the lowering's switch, as `wukong_driver::compile`
+        // sets them: gpu-native gets none from either stage.
+        wukong_opt::optimize_preserving_with(
+            &mut low,
+            opt,
+            &[],
+            wukong_opt::OptimizeOptions::FULL.with_vec_kernels(lower_opts.vec_kernels),
+        );
         Ok((high, low))
     };
 

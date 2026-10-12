@@ -14,9 +14,10 @@
 //! 4. `wukongc --emit=mir -O0 --passes=<the -O2 list> --target-cpu=x86-64-v2 p.wk` is that same
 //!    `--emit=mir` output: the pass-list replica is the standard pipeline (lowering reads no `-O`
 //!    level, so the two compiles start from the same MIR);
-//! 5. `wukongc --emit=mir -O2 y.mir`, where `y.mir` is the *unoptimized* typed dump, is that same
-//!    output too: optimizing a parsed dump is optimizing the program, which is what makes a dump
-//!    a reproducer for an optimizer bug;
+//! 5. `wukongc --emit=mir -O2 --target-cpu=x86-64-v2 y.mir`, where `y.mir` is the *unoptimized*
+//!    typed dump, is that same output too: optimizing a parsed dump is optimizing the program,
+//!    which is what makes a dump a reproducer for an optimizer bug (the optimizer builds 256-bit
+//!    recipes of its own, so this compile names the same level as `F`);
 //! 6. and so is the pipeline cut in two through a dump: `--passes=<the fixpoint half>
 //!    --emit=mir-text p.wk` into `z.mir`, then `--passes=unroll,slp,form-switches --emit=mir
 //!    z.mir`. A pass deletes values, so this dump's arena outlives its last value, and the
@@ -65,6 +66,7 @@ const COMPILER_ENV: &[&str] = &[
     "WUKONG_NO_UNROLL",
     "WUKONG_NO_IV_RAMP",
     "WUKONG_NO_SLP",
+    "WUKONG_VEC256_MIN_TRIP",
     "WUKONG_VEC_TRACE",
     "WUKONG_SLP_TRACE",
 ];
@@ -180,7 +182,7 @@ fn check(program: &Path, scratch: &Path, full: bool) -> Result<bool, String> {
     let lowered = ok(&["--emit=mir-text", "-O0", CPU, wk]);
     let y = scratch.join(format!("{name}.O0.mir"));
     std::fs::write(&y, &lowered).expect("write the dump");
-    let optimized = ok(&["--emit=mir", "-O2", y.to_str().unwrap()]);
+    let optimized = ok(&["--emit=mir", "-O2", CPU, y.to_str().unwrap()]);
     if optimized != plain {
         return Err(diff("-O2 of the unoptimized dump", &plain, &optimized));
     }

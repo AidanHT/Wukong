@@ -84,8 +84,11 @@
 //! fails the compile; the repo's 256-bit path is a separate mechanism (`VecKernel` +
 //! `codegen_cranelift::avx2`, raw assembled AVX2) that `mir_build` builds for the `for` loops it
 //! vectorizes itself — f32/f64/i32/i64 elementwise bodies and reductions, over arrays, slices and
-//! tensors. With AVX enabled Cranelift VEX-encodes the 128-bit ops, and two of them retire per
-//! cycle, so a memory-bound loop saturates the same bandwidth a 256-bit one would.
+//! tensors — and that this pass builds too, for a loop it widens whose body has a recipe form and
+//! whose trip reaches the out-of-line call's crossover ([`vec256`]): the kernel then runs the
+//! multiple-of-lanes part and this pass's 128-bit loop the remainder. With AVX enabled Cranelift
+//! VEX-encodes the 128-bit ops, and two of them retire per cycle, so a memory-bound loop saturates
+//! the same bandwidth a 256-bit one would.
 //!
 //! The **group width** `W` — how many scalar iterations one vector iteration covers — is set by the
 //! *narrowest* lane the widened body holds: `W = 16 / narrowest_bytes`, LLVM LoopVectorize's rule.
@@ -167,11 +170,61 @@ use crate::{each_op_use, CfgAnalyses, Pass};
 /// * [`Vectorize::done`] — a record of the header blocks already widened in the function being
 ///   optimized, reset whenever the pass is handed a different function. A stale entry after
 ///   `cfg::prune_unreachable` renumbers blocks can only *skip* a loop, never widen one twice.
-#[derive(Default)]
+///
+/// A loop handed to a 256-bit kernel ([`vec256`]) is not widened in place: the original loop stays
+/// behind as the kernel's remainder, and the 128-bit path is still allowed to widen *that*. The
+/// stops for the kernel path are the same two in kind — [`vec256::is_remainder`] (the counter
+/// resumes at the kernel's count) and a second header record — plus a cap on the kernels one
+/// function may receive.
 pub struct Vectorize {
-    /// `(function, headers already widened)` for the function currently being optimized.
-    done: std::cell::RefCell<Option<(wukong_span::Symbol, FxHashSet<u32>)>>,
+    /// `(function, headers already widened, headers already given a kernel)` for the function
+    /// currently being optimized.
+    done: std::cell::RefCell<Option<DoneSets>>,
+    /// May a widened loop take the 256-bit raw-AVX2 recipe instead ([`vec256`])? The pipeline's
+    /// switch ([`crate::OptimizeOptions::vec_kernels`]); the host gate and `WUKONG_P4_NO_256` are
+    /// the other two conjuncts ([`Vectorize::kernels_enabled`]).
+    kernels: bool,
 }
+
+/// [`Vectorize::done`]'s record for one function.
+struct DoneSets {
+    func: wukong_span::Symbol,
+    widened: FxHashSet<u32>,
+    kernels: FxHashSet<u32>,
+}
+
+impl Default for Vectorize {
+    /// The pass as [`crate::optimize`] runs it: 256-bit kernels allowed wherever the host and the
+    /// environment allow them — the same default as `wukong_mir_build::LowerOptions`.
+    fn default() -> Vectorize {
+        Vectorize::new(true)
+    }
+}
+
+impl Vectorize {
+    /// The pass, with the 256-bit kernel path on or off. Off leaves every loop on the 128-bit
+    /// path, which computes the same values ([`vec256`]).
+    pub fn new(kernels: bool) -> Vectorize {
+        Vectorize {
+            done: std::cell::RefCell::new(None),
+            kernels,
+        }
+    }
+
+    /// The three conjuncts of the 256-bit path, read once per call: this pass's switch, the host
+    /// gate the assembler refuses on (`wukong_mir::host_supports_vec_kernels` — Win64 with AVX2 and
+    /// FMA3, single-sourced with `mir_build` and the Cranelift assembler), and the
+    /// `WUKONG_P4_NO_256` kill-switch both front-end recipe sites read too.
+    fn kernels_enabled(&self) -> bool {
+        self.kernels
+            && wukong_mir::host_supports_vec_kernels()
+            && std::env::var_os("WUKONG_P4_NO_256").is_none()
+    }
+}
+
+/// The 256-bit raw-AVX2 form of a widened loop (`Op::VecKernelCall`).
+#[path = "vec256.rs"]
+mod vec256;
 
 /// The SIMD register width the backend can legalize, in bytes. Cranelift's x64 vector ISA tops out
 /// at 128 bits — see the module docs for the measurement that established it.
@@ -202,23 +255,33 @@ impl Pass for Vectorize {
         if std::env::var_os("WUKONG_NO_VECTORIZE").is_some() {
             return false;
         }
+        let kernels = self.kernels_enabled();
         let mut slot = self.done.borrow_mut();
-        let done = match slot.as_mut() {
-            Some((name, set)) if *name == f.name => set,
-            _ => {
-                *slot = Some((f.name, FxHashSet::default()));
-                &mut slot.as_mut().expect("just set").1
-            }
-        };
+        if slot.as_ref().is_none_or(|d| d.func != f.name) {
+            *slot = Some(DoneSets {
+                func: f.name,
+                widened: FxHashSet::default(),
+                kernels: FxHashSet::default(),
+            });
+        }
+        let done = slot.as_mut().expect("just set");
         let mut changed = false;
         for _ in 0..MAX_LOOPS_PER_CALL {
             let (idom, preds) = cache.idoms_and_preds(f);
             let mut forest = loop_info::structure_with(f, idom, preds);
-            let Some(plan) = pick(f, &mut forest, done) else {
-                break;
-            };
-            done.insert(plan.header.0);
-            apply(f, &plan);
+            match pick(f, &mut forest, done, kernels) {
+                None => break,
+                Some(Picked::Widen(plan)) => {
+                    done.widened.insert(plan.header.0);
+                    apply(f, &plan);
+                }
+                // The header is NOT recorded as widened: the loop left behind is the kernel's
+                // remainder, which the 128-bit path may still widen (`vec256` module docs).
+                Some(Picked::Kernel(plan, kernel)) => {
+                    done.kernels.insert(plan.header.0);
+                    vec256::apply(f, &plan, &kernel);
+                }
+            }
             cache.invalidate();
             changed = true;
         }
@@ -810,7 +873,7 @@ type AccessKey = (u32, usize);
 /// [`crate::loop_info::Stages`]'s unrun stages leave *conservative* defaults — `dep` reads
 /// `MemDep::Carried`, so a loop whose memory was never analyzed cannot be widened by accident —
 /// and because both early filters call the same code `plan_loop` does.
-fn pick(f: &Function, forest: &mut LoopForest, done: &FxHashSet<u32>) -> Option<VecPlan> {
+fn pick(f: &Function, forest: &mut LoopForest, done: &DoneSets, kernels: bool) -> Option<Picked> {
     // `WUKONG_VEC_TRACE=1` prints one line per decision. Note that this whole function re-runs on
     // every fixpoint iteration of the pass manager, so a DECLINE repeats once per iteration while a
     // WIDEN appears once — see the module docs before quoting the stream anywhere.
@@ -825,7 +888,7 @@ fn pick(f: &Function, forest: &mut LoopForest, done: &FxHashSet<u32>) -> Option<
         // Structure first: no value analysis has run yet, and none of these checks needs one.
         {
             let l = forest.get(id);
-            if done.contains(&l.header.0) || already_vector(f, l) {
+            if done.widened.contains(&l.header.0) || already_vector(f, l) {
                 continue;
             }
             if is_someones_epilogue(f, forest, l) {
@@ -851,25 +914,69 @@ fn pick(f: &Function, forest: &mut LoopForest, done: &FxHashSet<u32>) -> Option<
         loop_info::analyze_one(f, forest, idx, loop_info::Stages::Memory);
         let l = forest.get(id);
         match plan_loop(f, l) {
-            Ok(p) => {
-                if trace {
-                    eprintln!(
-                        "vectorize: WIDEN bb{} w={} lin={} guards={} reds={} cost={}/{}",
-                        p.header.0,
-                        p.w,
-                        p.lin.len(),
-                        p.guards.len() + p.point_guards.len() + p.len_checks.len(),
-                        p.reductions.len(),
-                        p.cost.0,
-                        p.cost.1
-                    );
+            // The 256-bit form of the same plan, when the body has one ([`vec256`]). Never for a
+            // kernel's own remainder, which keeps the 128-bit loop below.
+            Ok(mut p)
+                if kernels
+                    && !done.kernels.contains(&l.header.0)
+                    && vec256::has_room(f)
+                    && !vec256::is_remainder(f, l) =>
+            {
+                match vec256::plan(f, l, &p) {
+                    Ok(k) => {
+                        if trace {
+                            eprintln!(
+                                "vectorize: KERNEL bb{} lane={:?} streams={} scalars={} ops={} guards={}",
+                                p.header.0,
+                                k.kernel.lane,
+                                k.kernel.streams,
+                                k.kernel.scalars,
+                                k.kernel.ops.len(),
+                                p.guards.len() + p.point_guards.len()
+                            );
+                        }
+                        p.w = k.kernel.lane.lanes();
+                        p.trip = k.trip.clone();
+                        return Some(Picked::Kernel(p, k));
+                    }
+                    Err(why) => {
+                        if trace {
+                            eprintln!("vectorize: no 256-bit kernel for bb{}: {why}", p.header.0);
+                        }
+                        return Some(Picked::Widen(widen_traced(p, trace)));
+                    }
                 }
-                return Some(p);
             }
+            Ok(p) => return Some(Picked::Widen(widen_traced(p, trace))),
             Err(why) => decline(l.header.0, why),
         }
     }
     None
+}
+
+/// What [`pick`] chose to do with a loop.
+enum Picked {
+    /// Widen it to 128-bit vectors in place ([`apply`]).
+    Widen(VecPlan),
+    /// Call a 256-bit kernel ahead of it, its trip and width already the kernel's ([`vec256`]).
+    Kernel(VecPlan, vec256::KernelPlan),
+}
+
+/// `p`, after printing its `WUKONG_VEC_TRACE` line.
+fn widen_traced(p: VecPlan, trace: bool) -> VecPlan {
+    if trace {
+        eprintln!(
+            "vectorize: WIDEN bb{} w={} lin={} guards={} reds={} cost={}/{}",
+            p.header.0,
+            p.w,
+            p.lin.len(),
+            p.guards.len() + p.point_guards.len() + p.len_checks.len(),
+            p.reductions.len(),
+            p.cost.0,
+            p.cost.1
+        );
+    }
+    p
 }
 
 /// Does this loop already hold vector values? Then it is either the vector loop this pass just

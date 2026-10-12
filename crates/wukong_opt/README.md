@@ -57,7 +57,11 @@ load-bearing.
 - **licm** — hoist loop-invariant non-trapping ops into that preheader.
 - **vectorize** — widen a canonical loop body to 128-bit SIMD (if-converting conditionals to lane
   masks), keeping the original loop as scalar epilogue. Constant integer left shifts use wrapping
-  vector multiplication at `i16`/`i32` widths; other shifts retain scalar lowering.
+  vector multiplication at `i16`/`i32` widths; other shifts retain scalar lowering. A widened body
+  with a raw-AVX2 recipe form (one `f32`/`f64`/`i32`/`i64` lane type, lane-wise ops only, every
+  stored object touched at the stored element) and a trip of 2048 or more instead calls a 256-bit
+  `Op::VecKernelCall` ahead of the original loop, which stays as the 128-bit-widened remainder
+  (`src/vec256.rs`; `OptimizeOptions::vec_kernels`, `WUKONG_P4_NO_256`, `WUKONG_VEC256_MIN_TRIP`).
 
 **Whole-program stages at `-O2`+ (not `Pass` traits):**
 

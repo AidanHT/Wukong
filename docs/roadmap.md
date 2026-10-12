@@ -649,6 +649,24 @@ line table built from them is not emitted yet.
   loop, when the rows provably touch disjoint memory (`tests/run/unroll_jam_nests.wk`). Its speed-up
   is not yet measured; deeper nests, triangular inner bounds and a nest whose inner loop the
   bounds-check versioning split stay as written.
+  **256-bit from the optimizer**: a loop this pass widens whose body has a raw-AVX2 recipe form —
+  one `f32`/`f64`/`i32`/`i64` lane type, contiguous loads and stores, `+ - * /`, `fma`, `sqrt`,
+  negation, an ordered (or `!=`) compare feeding a blend, an if-converted masked store or merge,
+  splatted invariants — and a trip of **2048 or more** calls the same `Op::VecKernelCall` the front
+  end builds for its own `for` loops, so a `while` over slices or a body calling an inlined helper
+  reaches 256 bits too. The kernel runs the multiple-of-eight (f64/i64: four) part; the original loop
+  stays as the remainder, which this pass still widens at 128 bits, so a trip below 2048 runs exactly
+  the 128-bit loop it ran before (the gate is tested on entry for a runtime trip). Every stored object
+  must be touched only at the stored element. Interp and native are compiled with the same switch
+  (`OptimizeOptions::vec_kernels`, cleared for `--backend=gpu-native` and below
+  `--target-cpu=x86-64-v3`); `WUKONG_P4_NO_256` turns it off and `WUKONG_VEC256_MIN_TRIP` moves the
+  gate, both result-identical (`tests/run/vec256_opt_{lanes,specials,aliased}.wk` print every lane,
+  NaN payloads, signed zeros and one buffer passed as two slices included). Still 128-bit: reductions (an integer sum would be exact in
+  the kernel's tree, but is not yet routed there), casts, gathers and scatters, shifts and bitwise
+  ops, the counter read as a value, countdowns, search loops, interleave groups, unsigned compares,
+  `i64` multiplies and `bf16`/`f16` bodies. The 2048 gate is the crossover measured for the
+  front end's out-of-line *reduction* kernel; the elementwise crossover is unmeasured and likely
+  lower.
 - **Straight-line SLP** (`wukong_opt::slp`, `-O2`, after unrolling): `W` stores in one block to
   consecutive elements of one object whose values are one lane-wise operation tree pack into one
   128-bit vector store — `f32x4`, `i32x4`, `f64x2`, `i64x2` — over vector loads, splats and lane

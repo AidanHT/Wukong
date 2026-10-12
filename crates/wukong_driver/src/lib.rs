@@ -362,6 +362,27 @@ fn lower_options_for(opts: &Options) -> wukong_mir_build::LowerOptions {
     }
 }
 
+/// The optimizer options for this invocation, beside [`lower_options_for`] and for the same reason:
+/// the 256-bit kernel switch changes what the MIR contains, so it is the pipeline's choice.
+///
+/// * A program autodiff will differentiate takes [`wukong_opt::OptimizeOptions::AUTODIFF_INPUT`]
+///   (no SLP, no 256-bit kernels: neither has a VJP rule).
+/// * Every other compile takes the full pipeline, with the vectorizer's 256-bit kernels exactly
+///   where `mir_build`'s are allowed (`LowerOptions::vec_kernels`): not for `--backend=gpu-native`,
+///   whose PTX lowering declines a `VecKernelCall`, and not below `--target-cpu=x86-64-v3`. The
+///   interpreter and the native backend get the same value, so the differential gate compares the
+///   two backends on one MIR.
+fn optimize_options_for(
+    opts: &Options,
+    lower: &wukong_mir_build::LowerOptions,
+) -> wukong_opt::OptimizeOptions {
+    if opts.emit == EmitStage::Grad || opts.grad.train || exports_gradient(opts) {
+        wukong_opt::OptimizeOptions::AUTODIFF_INPUT
+    } else {
+        wukong_opt::OptimizeOptions::FULL.with_vec_kernels(lower.vec_kernels)
+    }
+}
+
 /// Does this compile read its program from standard input (`wukongc -` with no `-e`)?
 fn reads_stdin(opts: &Options) -> bool {
     opts.source.is_none() && opts.input == Path::new("-")
@@ -721,14 +742,12 @@ pub fn compile(opts: &Options) -> i32 {
     // time, so the forward it takes is optimized without straight-line SLP, whose vector stores
     // have no VJP rule (`OptimizeOptions::AUTODIFF_INPUT`).
     let feeds_autodiff = opts.emit == EmitStage::Grad || opts.grad.train || exports_gradient(opts);
-    let (opt_level, opt_options) = if feeds_autodiff {
-        (
-            opts.opt_level.max(1),
-            wukong_opt::OptimizeOptions::AUTODIFF_INPUT,
-        )
+    let opt_level = if feeds_autodiff {
+        opts.opt_level.max(1)
     } else {
-        (opts.opt_level, wukong_opt::OptimizeOptions::FULL)
+        opts.opt_level
     };
+    let opt_options = optimize_options_for(opts, &lower_opts);
     timer.begin("optimize");
     if opts.passes.is_some() || opts.print_after.is_some() {
         // A chosen pass list, or the level's own list run through the same replica so a pass can
@@ -760,6 +779,7 @@ pub fn compile(opts: &Options) -> i32 {
             opts.print_after.as_deref(),
             &interner,
             opts.emit == EmitStage::MirText,
+            opt_options.vec_kernels,
         ) {
             emit_diag(
                 &optimization_failure_diag(&failure, &interner),
@@ -786,10 +806,9 @@ pub fn compile(opts: &Options) -> i32 {
         }
     } else if timer.enabled() && roots.is_empty() {
         // The timed optimizer runs the identical pipeline (byte-identical MIR) with a clock around
-        // each pass; with no extra roots it is exactly `optimize_preserving(.., &[])`. That is the
-        // full pipeline, SLP included; a gradient compile always roots its loss, so never gets here.
-        debug_assert_eq!(opt_options, wukong_opt::OptimizeOptions::FULL);
-        let timings = wukong_opt::optimize_timed(&mut program, opt_level);
+        // each pass; with no extra roots it is exactly `optimize_preserving_with(.., &[], ..)` under
+        // the same options. A gradient compile always roots its loss, so never gets here.
+        let timings = wukong_opt::optimize_timed_with(&mut program, opt_level, opt_options);
         timer.optimizer_passes(&timings);
     } else {
         wukong_opt::optimize_preserving_with(&mut program, opt_level, &roots, opt_options);
@@ -3364,6 +3383,86 @@ mod lower_options_tests {
             !lower_options_for(&opts_for(BackendKind::GpuLower)).vec_kernels,
             "gpu-native lowers the whole program to PTX and cannot lower Win64 machine code"
         );
+    }
+
+    /// The optimizer's 256-bit kernels follow the lowering's switch exactly, so the interpreter and
+    /// the native backend compile one MIR and gpu-native gets none from either stage; a program
+    /// autodiff will differentiate gets none at all (`AUTODIFF_INPUT`).
+    #[test]
+    fn the_optimizer_kernels_follow_the_lowering_switch() {
+        for backend in [
+            BackendKind::Interp,
+            BackendKind::Native,
+            BackendKind::Gpu,
+            BackendKind::GpuLower,
+        ] {
+            for target in [TargetCpu::Native, TargetCpu::X86_64V2, TargetCpu::X86_64V3] {
+                let opts = Options {
+                    backend,
+                    target_cpu: target,
+                    ..Options::default()
+                };
+                let lower = lower_options_for(&opts);
+                let o = optimize_options_for(&opts, &lower);
+                assert_eq!(o.vec_kernels, lower.vec_kernels, "{backend:?} / {target:?}");
+                assert!(o.slp, "{backend:?} / {target:?}");
+            }
+        }
+        let grad = Options {
+            emit: EmitStage::Grad,
+            ..Options::default()
+        };
+        assert_eq!(
+            optimize_options_for(&grad, &lower_options_for(&grad)),
+            wukong_opt::OptimizeOptions::AUTODIFF_INPUT
+        );
+        const { assert!(!wukong_opt::OptimizeOptions::AUTODIFF_INPUT.vec_kernels) };
+    }
+
+    /// The same property on real MIR: a `while` loop over slices that calls a helper is one the
+    /// front end leaves scalar and the optimizer gives a 256-bit kernel — for the CPU pipeline,
+    /// never for gpu-native.
+    #[test]
+    fn a_loop_only_the_optimizer_vectorizes_reaches_gpu_native_without_a_cpu_recipe() {
+        const SRC: &str = "module t\n\
+             fn affine(v: f32, s: f32) -> f32 { return v * s + 1.0; }\n\
+             fn k(x: []f32, mut o: []f32, s: f32, n: i64) {\n\
+                 let mut i: i64 = 0;\n\
+                 while i < n { o[i] = affine(x[i], s); i = i + 1; }\n\
+             }\n\
+             fn main() -> i32 { return 0; }\n";
+        let count = |backend: BackendKind| -> usize {
+            let opts = opts_for(backend);
+            let lower = lower_options_for(&opts);
+            let mut sm = SourceMap::new();
+            let id = sm.add("opt_kernels.wk".to_string(), SRC.to_string());
+            let (tokens, _) = wukong_lexer::tokenize(sm.source(id), id);
+            let mut interner = Interner::new();
+            let (module, pd) =
+                wukong_parser::parse_module_tokens(&tokens, sm.source(id), &mut interner);
+            assert!(!pd.iter().any(|d| d.is_error()), "parse errors: {pd:?}");
+            let (sema, sd) = wukong_sema::check(&module, &interner);
+            assert!(!sd.iter().any(|d| d.is_error()), "sema errors: {sd:?}");
+            let (mut program, _) =
+                wukong_mir_build::lower_program_with(&module, &sema, &mut interner, lower);
+            wukong_opt::optimize_preserving_with(
+                &mut program,
+                2,
+                &[],
+                optimize_options_for(&opts, &lower),
+            );
+            program
+                .funcs
+                .iter()
+                .flat_map(|f| f.blocks.iter())
+                .flat_map(|b| b.insts.iter())
+                .filter(|i| matches!(i.op, wukong_mir::Op::VecKernelCall { .. }))
+                .count()
+        };
+        assert_eq!(count(BackendKind::GpuLower), 0);
+        let can_fire = wukong_mir::host_supports_vec_kernels()
+            && std::env::var_os("WUKONG_P4_NO_256").is_none();
+        assert_eq!(count(BackendKind::Native), usize::from(can_fire));
     }
 
     /// `--target-cpu` below x86-64-v3 must never receive the raw AVX2+FMA recipes: they are

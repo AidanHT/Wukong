@@ -69,6 +69,7 @@ const AMBIENT: &[&str] = &[
     "WUKONG_NO_IV_RAMP",
     "WUKONG_NO_SLP",
     "WUKONG_P4_NO_256",
+    "WUKONG_VEC256_MIN_TRIP",
     "WUKONG_VEC_TRACE",
     "WUKONG_SLP_TRACE",
     "WUKONG_MAX_ISA",

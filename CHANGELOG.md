@@ -5,6 +5,44 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### 256-bit kernels from the general MIR vectorizer (`gap6/vec256-opt`)
+
+- **`wukong_opt::vectorize` emits 256-bit raw-AVX2 kernels (P10.10).** A loop the MIR vectorizer
+  widens whose body has a recipe form — one `f32`/`f64`/`i32`/`i64` lane type, contiguous loads and
+  stores, `+ - * /`, `fma`, `sqrt`, negation, an ordered compare or `!=` feeding a blend, an
+  if-converted masked store or merge, splatted invariants — now calls the same `Op::VecKernelCall`
+  `mir_build` builds for its own `for` loops, for the multiple-of-lanes part of a trip of 2048 or
+  more. Loops the front end leaves scalar reach 256 bits this way: a `while` over slices, a body
+  that calls a helper the optimizer inlines, a `let` merge. The original loop stays as the remainder
+  and is still widened at 128 bits, so a shorter trip (tested on entry when it is a runtime value)
+  runs exactly the loop it ran before. Over `tests/run` and `examples/` at `-O2`, 45 programs gain
+  kernels (the census's `veckernel*N` rows; no recognizer dispatch is lost). Bit-exact by
+  construction — every op is lane-wise, a contracted multiply-add stays one `fma`, `Fone` keeps
+  Rust's unordered `!=` — and pinned by `tests/run/vec256_opt_lanes.wk` (f32/i32/f64, trips 2053
+  and 2047, every lane), `tests/run/vec256_opt_specials.wk` (NaN payloads, both zeros, both
+  infinities, a subnormal; every lane's bits) and `tests/run/vec256_opt_aliased.wk` on interp and
+  native at `-O0` and `-O2`.
+- **The optimizer takes the backend's capability (`OptimizeOptions::vec_kernels`).** The driver
+  sets it exactly as `LowerOptions::vec_kernels` — off for `--backend=gpu-native` (whose PTX
+  lowering declines a `VecKernelCall`), below `--target-cpu=x86-64-v3`, and for a program autodiff
+  differentiates — so the interpreter and the native backend compile the same MIR and gpu-native
+  gets no CPU recipe from either stage. `PassManager::standard_with`, `optimize_timed_with` and
+  `Vectorize::new(bool)` carry it; `--passes` lists honour it too. `WUKONG_P4_NO_256` and the host
+  gate (`wukong_mir::host_supports_vec_kernels`) apply unchanged.
+- **The interpreter's kernel marshalling forwards a store across streams that share a base.** Two
+  streams of one recipe may start at the same element — the optimizer's runtime alias guard admits
+  two slices that are one buffer when every access sits at one element — and a load of one after a
+  store to the other must read the stored value, as the machine code does by re-reading memory.
+  `run_vec_kernel` used to serve that load from the lane's pre-read snapshot (stale); it now takes
+  the lane's latest earlier store to any stream with the same base. No front-end recipe has two
+  streams on one base, so no existing program's output changes (`tests/run/vec256_opt_aliased.wk`
+  passes one buffer as both `x` and `o`). Accesses to one element through two pointer values are
+  also one stream now, which the same reload of a slice's data pointer otherwise splits.
+- **`WUKONG_VEC256_MIN_TRIP=<n>`** moves the 2048-element gate (never below one register group): a
+  result-identical test knob. `WUKONG_VEC256_MIN_TRIP=8 cargo test -p wukongc --test run` runs the
+  interp/native differential and the `-O` invariance gates with a kernel on every eligible corpus
+  loop of eight or more iterations; it passed when this landed.
+
 ### Source locations through MIR into native code (`gap5/native-source-locations`)
 
 - **Native-backend failures point at the source (P11.8).** A `C0002` (a slot above the native
