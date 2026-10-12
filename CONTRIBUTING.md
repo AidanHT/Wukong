@@ -330,6 +330,10 @@ Prefer *not* to: `abs`, `exp`, `silu` and friends are built from existing primit
    `op_operands` in `src/fusion.rs` (these live behind `--features gpu`, so only
    `cargo check --features gpu --all-targets` sees them); and `crates/wukong_autodiff/src/lib.rs` —
    `diff_inst`, `remap_op`, `op_name`.
+10. `crates/wukong_mir/src/text.rs` — the typed textual form (`--emit=mir-text`, `.mir` input)
+    prints through `fmt_op`, so the printer follows step 3 by itself, but `FnParser::op` must read
+    the new spelling back. Its tests' exhaustive `op_slot` match stops compiling until the variant
+    has a slot, and `every_op_program` must then build one, or the round-trip test fails.
 
 **A new op that touches memory has a second, silent list.** The compiler only finds the exhaustive
 matches; most memory walkers in `wukong_opt` end in a `_ => {}` arm, and an op that falls into it
