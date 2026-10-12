@@ -424,6 +424,10 @@ fn check_repl_flags(opts: &Options, has_input: bool, emit_explicit: bool) -> Res
         (opts.verify_each, "`--verify-each`"),
         (opts.remarks_dispatch, "`--remarks`"),
         (
+            opts.debug_info,
+            "`-g` (it puts DWARF in an object or executable, and the REPL writes neither)",
+        ),
+        (
             matches!(
                 opts.backend,
                 wukong_driver::BackendKind::Gpu | wukong_driver::BackendKind::GpuLower
@@ -1478,6 +1482,7 @@ mod tests {
             &["--repl", "--passes=dce"][..],
             &["--repl", "--verify-each"][..],
             &["--repl", "--remarks=dispatch"][..],
+            &["--repl", "-g"][..],
         ] {
             let err = parse(bad).unwrap_err();
             assert!(err.contains("--repl"), "{bad:?}: {err}");
