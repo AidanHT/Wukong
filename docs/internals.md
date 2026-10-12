@@ -70,7 +70,11 @@ wukong_runtime   the AVX2/FMA microkernels the recognizers dispatch to (GEMM/GEM
                   LIFO arena behind `scratch_<T>`/`scratch_mark`/`scratch_release`; the
                   interpreter mirrors its mark count and region reuse). The bump `Arena` and the
                   sequential `parallel_for` are reference surface with no caller anywhere in the
-                  workspace (the kernels use thread-local `Vec` scratch)
+                  workspace (the kernels use thread-local `Vec` scratch). The ML I/O readers
+                  (`fileio`, `safetensors`, `npy`, `gguf` — the GGUF parser and the ggml block
+                  dequantizers — and `mmap`, the copy-on-write `map_<T>` loads) are public
+                  modules the interpreter calls directly, so a parsed header, a return code and a
+                  dequantized value are one implementation
 wukong_diag      Diagnostic, Severity, error-code catalog, JSON + terminal renderers
 wukong_lexer     &str -> tokens (+ @attributes, error recovery); `tokenize_with_comments` adds the
                   comment side channel the formatter needs (plain `tokenize` is unchanged)
@@ -257,7 +261,8 @@ parameter, or two different parameters `alias::plan_kernel_alias` answers `Dispa
 is one bare `wukong_attention_f32` in a straight-line block that `wukong_autodiff` differentiates;
 the checks a runtime `s`/`d` or extent still needs are `assert` calls in that block, which the tape
 treats as effects. A dtype-generic `Tensor[T, ..]`
-operand of a kernel builtin or of the ML I/O family (`read_*`/`write_*`, `st_read_*`, `topk_f32`, …)
+operand of a kernel builtin or of the ML I/O family (`read_*`/`write_*`, `st_read_*`, `gguf_read_*`,
+`topk_f32`, …)
 is accepted in the generic body and re-checked per instance (`E0415` kernel / `E0416` I/O when `T`
 is not the builtin's element). That re-check stops at 512 instances while the monomorphizer lowers
 them all, so each family's lowering refuses (`C0001`) an operand whose substituted element is still

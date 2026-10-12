@@ -1752,7 +1752,8 @@ impl<'a> Vjp<'a> {
 /// What the reverse walk does at a call to one of the ML I/O and randomness runtime entries, none of
 /// which is a tensor kernel with a VJP. The decision is explicit per entry so a new one is a choice,
 /// not a fall-through:
-/// * the typed reads (`wukong_rt_read_*`, `wukong_rt_st_read`, `wukong_rt_npy_read`), `argsort` and
+/// * the typed reads (`wukong_rt_read_*`, `wukong_rt_st_read`, `wukong_rt_npy_read`,
+///   `wukong_rt_gguf_read`) and the GGUF table queries (`wukong_rt_gguf_query`), `argsort` and
 ///   `sample_categorical` return an `i64` and are left to the scalar path: what they produce — file
 ///   data, integer indices — is constant with respect to every input, so it carries no gradient;
 /// * [`MlCallGradient::Constant`]: `wukong_rand_fill_f32` writes counter-based random numbers that

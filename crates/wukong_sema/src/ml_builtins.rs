@@ -1,6 +1,7 @@
 //! Typing for the ML I/O and randomness builtins: the typed file-I/O family over every element type
-//! (whole-file and byte-offset reads, writes, `file_size`), the safetensors / `.npy` container
-//! readers, the Philox counter-based RNG, and the top-k / argsort / categorical-sampling kernels.
+//! (whole-file and byte-offset reads, writes, `file_size`), the safetensors / `.npy` / GGUF
+//! container readers and the GGUF tensor-table queries, the memory-mapped loads, the Philox
+//! counter-based RNG, and the top-k / argsort / categorical-sampling kernels.
 //!
 //! Like the heap and timing builtins, these are typed nominally here — the call's result is a
 //! concrete type, so `let n = read_bf16_at(p, off, w)` composes in arithmetic — and every misuse is
@@ -17,6 +18,11 @@
 //! read into a *tensor* also checks the file's shape against the tensor's dims at load time. A
 //! dtype-generic `Tensor[T, …]` is checked per instantiation (`dtype.rs`): an instance binding `T`
 //! to the builtin's element reaches it like the concrete function, any other binding is `E0416`.
+//!
+//! **Strings.** A path or tensor name is a NUL-terminated `*u8` (a literal), or a `[]u8` /
+//! `[u8; N]` buffer holding one — what `sprintf` writes, so a name can be built at run time. The
+//! lowering passes a buffer through `wukong_rt_cstr`, which turns one with no NUL into the null
+//! string rather than letting the runtime read past it.
 //!
 //! **Integers.** Byte offsets, seeds and counters accept any integer type (the value's bits, as
 //! `x as u64` would give them); an unsuffixed literal adapts to `i64`.
@@ -45,6 +51,21 @@ pub enum MlBuiltin {
     StRead(Scalar),
     /// `npy_read_<T>(path: *u8, buf) -> i64` — the array of a NumPy `.npy` file.
     NpyRead(Scalar),
+    /// `gguf_read_<T>(path: *u8, name: *u8, buf) -> i64` — one tensor of a GGUF file: verbatim,
+    /// widened or dequantized into `f32`, or as raw quantized blocks into `u8`.
+    GgufRead(Scalar),
+    /// `gguf_find` / `gguf_rank` / `gguf_type(path: *u8, name: *u8) -> i64` and
+    /// `gguf_dim(path: *u8, name: *u8, k: int) -> i64` — a GGUF tensor-table lookup.
+    GgufQuery(GgufQuery),
+    /// `gguf_meta_type` / `gguf_meta_len(path, key) -> i64`, `gguf_meta_i64(path, key, i,
+    /// default) -> i64`, `gguf_meta_f64(path, key, i, default) -> f64` and `gguf_meta_str(path,
+    /// key, i, buf) -> i64` — a GGUF metadata value.
+    GgufMeta(GgufMeta),
+    /// `map_<T>(path: *u8) -> []T`, `st_map_<T>(path: *u8, name: *u8) -> []T`,
+    /// `npy_map_<T>(path: *u8) -> []T` and `gguf_map_<T>(path: *u8, name: *u8) -> []T` — a file's
+    /// bytes (or one stored tensor's, in its own element type) as a slice, memory-mapped
+    /// copy-on-write where the OS allows; released with `free`, empty on any failure.
+    Map(MapSource, Scalar),
     /// `rand_u32(seed: int, ctr: int) -> u32` — Philox4x32-10, word 0.
     RandU32,
     /// `rand_f32(seed: int, ctr: int) -> f32` — uniform in `[0, 1)`.
@@ -62,6 +83,92 @@ pub enum MlBuiltin {
     },
     /// `sample_categorical(probs, u: float) -> i64` — an inverse-CDF draw.
     SampleCategorical,
+}
+
+/// What a GGUF tensor-table query asks for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GgufQuery {
+    /// `gguf_find`: the tensor's index in the file's tensor table.
+    Find,
+    /// `gguf_rank`: its number of dimensions.
+    Rank,
+    /// `gguf_dim`: dimension `k`, outermost first.
+    Dim,
+    /// `gguf_type`: its ggml type id (`0` F32, `1` F16, `2` Q4_0, `8` Q8_0, `30` BF16, …).
+    Type,
+}
+
+impl GgufQuery {
+    /// The runtime's query code — the compiler's copy of `wukong_runtime::gguf::GGUF_Q_*` (a test
+    /// in `wukong_interp`, which sees both, pins every row).
+    pub fn code(self) -> i64 {
+        match self {
+            GgufQuery::Find => 0,
+            GgufQuery::Rank => 1,
+            GgufQuery::Dim => 2,
+            GgufQuery::Type => 3,
+        }
+    }
+}
+
+/// Which GGUF metadata accessor.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GgufMeta {
+    /// `gguf_meta_type`: the value's GGUF type id (`9` for an array).
+    Type,
+    /// `gguf_meta_len`: an array's length, a string's byte length, `1` otherwise.
+    Len,
+    /// `gguf_meta_i64`: an integer or `bool` value, or the default.
+    I64,
+    /// `gguf_meta_f64`: a numeric value, or the default.
+    F64,
+    /// `gguf_meta_str`: a string value copied into a `u8` buffer.
+    Str,
+}
+
+impl GgufMeta {
+    /// The runtime's accessor code for the `wukong_rt_gguf_meta` entry — the compiler's copy of
+    /// `wukong_runtime::gguf::GGUF_M_*` (pinned by a test in `wukong_interp`); `-1` for the two
+    /// accessors with entries of their own.
+    pub fn code(self) -> i64 {
+        match self {
+            GgufMeta::Type => 0,
+            GgufMeta::Len => 1,
+            GgufMeta::I64 => 2,
+            GgufMeta::F64 | GgufMeta::Str => -1,
+        }
+    }
+}
+
+/// What a memory-mapped load maps.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MapSource {
+    /// `map_<T>`: the whole file.
+    File,
+    /// `st_map_<T>`: one safetensors tensor.
+    Safetensors,
+    /// `npy_map_<T>`: the array of a `.npy` file.
+    Npy,
+    /// `gguf_map_<T>`: one GGUF tensor (its raw blocks, for a quantized one).
+    Gguf,
+}
+
+impl MapSource {
+    /// The runtime's container code — the compiler's copy of `wukong_runtime::mmap::MAP_*` (pinned
+    /// by a test in `wukong_interp`).
+    pub fn code(self) -> i64 {
+        match self {
+            MapSource::File => 0,
+            MapSource::Safetensors => 1,
+            MapSource::Npy => 2,
+            MapSource::Gguf => 3,
+        }
+    }
+
+    /// Whether the map names a tensor (`st_map_<T>`, `gguf_map_<T>`).
+    pub fn named(self) -> bool {
+        matches!(self, MapSource::Safetensors | MapSource::Gguf)
+    }
 }
 
 /// The element type a file-I/O name suffix denotes (`f32`, `bf16`, `u64`, …), or `None`. The twelve
@@ -123,8 +230,30 @@ pub fn ml_builtin(name: &str) -> Option<MlBuiltin> {
     if let Some(rest) = name.strip_prefix("npy_read_") {
         return io_dtype(rest).map(MlBuiltin::NpyRead);
     }
+    if let Some(rest) = name.strip_prefix("gguf_read_") {
+        return io_dtype(rest).map(MlBuiltin::GgufRead);
+    }
+    for (prefix, src) in [
+        ("map_", MapSource::File),
+        ("st_map_", MapSource::Safetensors),
+        ("npy_map_", MapSource::Npy),
+        ("gguf_map_", MapSource::Gguf),
+    ] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            return io_dtype(rest).map(|t| MlBuiltin::Map(src, t));
+        }
+    }
     Some(match name {
         "file_size" => MlBuiltin::FileSize,
+        "gguf_find" => MlBuiltin::GgufQuery(GgufQuery::Find),
+        "gguf_rank" => MlBuiltin::GgufQuery(GgufQuery::Rank),
+        "gguf_dim" => MlBuiltin::GgufQuery(GgufQuery::Dim),
+        "gguf_type" => MlBuiltin::GgufQuery(GgufQuery::Type),
+        "gguf_meta_type" => MlBuiltin::GgufMeta(GgufMeta::Type),
+        "gguf_meta_len" => MlBuiltin::GgufMeta(GgufMeta::Len),
+        "gguf_meta_i64" => MlBuiltin::GgufMeta(GgufMeta::I64),
+        "gguf_meta_f64" => MlBuiltin::GgufMeta(GgufMeta::F64),
+        "gguf_meta_str" => MlBuiltin::GgufMeta(GgufMeta::Str),
         "rand_u32" => MlBuiltin::RandU32,
         "rand_f32" => MlBuiltin::RandF32,
         "randn_f32" => MlBuiltin::RandnF32,
@@ -161,6 +290,8 @@ enum Arg {
     Int(&'static str),
     /// A floating-point scalar (`f32` ABI).
     Float(&'static str),
+    /// A floating-point scalar (`f64` ABI).
+    Double(&'static str),
     /// A buffer of this element type; `true` when the builtin writes it.
     Buf(Scalar, bool),
 }
@@ -169,7 +300,7 @@ enum Arg {
 /// ([`Sema::type_ml_builtin`]) and the lowering's element backstop ([`MlBuiltin::buffer_elem`])
 /// read.
 fn signature(b: MlBuiltin) -> (Vec<Arg>, Ty) {
-    use Arg::{Buf, Float, Int, Str};
+    use Arg::{Buf, Double, Float, Int, Str};
     let i64_ty = Ty::Scalar(Scalar::I64);
     let f32_ty = Ty::Scalar(Scalar::F32);
     match b {
@@ -177,7 +308,41 @@ fn signature(b: MlBuiltin) -> (Vec<Arg>, Ty) {
         MlBuiltin::Write(t) => (vec![Str("path"), Buf(t, false)], i64_ty),
         MlBuiltin::ReadAt(t) => (vec![Str("path"), Int("byte offset"), Buf(t, true)], i64_ty),
         MlBuiltin::FileSize => (vec![Str("path")], i64_ty),
-        MlBuiltin::StRead(t) => (vec![Str("path"), Str("tensor name"), Buf(t, true)], i64_ty),
+        MlBuiltin::StRead(t) | MlBuiltin::GgufRead(t) => {
+            (vec![Str("path"), Str("tensor name"), Buf(t, true)], i64_ty)
+        }
+        MlBuiltin::GgufQuery(GgufQuery::Dim) => (
+            vec![Str("path"), Str("tensor name"), Int("dimension index")],
+            i64_ty,
+        ),
+        MlBuiltin::GgufQuery(_) => (vec![Str("path"), Str("tensor name")], i64_ty),
+        MlBuiltin::GgufMeta(GgufMeta::Type | GgufMeta::Len) => {
+            (vec![Str("path"), Str("metadata key")], i64_ty)
+        }
+        MlBuiltin::GgufMeta(m) => {
+            let last = match m {
+                GgufMeta::F64 => Double("default"),
+                GgufMeta::Str => Buf(Scalar::U8, true),
+                _ => Int("default"),
+            };
+            let ret = if m == GgufMeta::F64 {
+                Ty::Scalar(Scalar::F64)
+            } else {
+                i64_ty
+            };
+            (
+                vec![Str("path"), Str("metadata key"), Int("array index"), last],
+                ret,
+            )
+        }
+        MlBuiltin::Map(src, t) => {
+            let args = if src.named() {
+                vec![Str("path"), Str("tensor name")]
+            } else {
+                vec![Str("path")]
+            };
+            (args, Ty::Slice(Box::new(Ty::Scalar(t))))
+        }
         MlBuiltin::RandU32 => (vec![Int("seed"), Int("counter")], Ty::Scalar(Scalar::U32)),
         MlBuiltin::RandF32 | MlBuiltin::RandnF32 => (vec![Int("seed"), Int("counter")], f32_ty),
         MlBuiltin::RandFill => (
@@ -238,7 +403,7 @@ impl Sema<'_> {
         arg_tys: &mut [Ty],
         span: Span,
     ) -> Option<Ty> {
-        use Arg::{Buf, Float, Int, Str};
+        use Arg::{Buf, Double, Float, Int, Str};
         let b = ml_builtin(name)?;
         let (sig, ret) = signature(b);
         if args.len() != sig.len() {
@@ -247,7 +412,7 @@ impl Sema<'_> {
                 .map(|a| match a {
                     Str(what) => format!("a `*u8` {what}"),
                     Int(what) => format!("an integer {what}"),
-                    Float(what) => format!("a float {what}"),
+                    Float(what) | Double(what) => format!("a float {what}"),
                     Buf(t, _) => format!("a {} buffer", buffer_desc(*t)),
                 })
                 .collect();
@@ -269,23 +434,32 @@ impl Sema<'_> {
                 Str(what) => self.ml_str_arg(name, &args[i], &arg_tys[i], i, what),
                 Int(what) => self.ml_scalar_arg(name, &args[i], &mut arg_tys[i], false, what),
                 Float(what) => self.ml_scalar_arg(name, &args[i], &mut arg_tys[i], true, what),
+                Double(what) => {
+                    self.ml_scalar_arg_to(name, &args[i], &mut arg_tys[i], Scalar::F64, what)
+                }
                 Buf(t, written) => self.ml_buffer_arg(name, &args[i], &arg_tys[i], t, i, written),
             }
         }
         Some(ret)
     }
 
-    /// A NUL-terminated `*u8` string (a literal or a `*u8` binding); anything else is `E0437`.
+    /// A string operand: a NUL-terminated `*u8` (a literal or a `*u8` binding), or a `[]u8` /
+    /// `[u8; N]` buffer holding one — what `sprintf` writes, so a path or tensor name can be built
+    /// at run time (`sprintf(name, "h{}.wq", l)`). The bytes up to the buffer's first NUL are the
+    /// string; a buffer with no NUL is the null string (the lowering checks, so nothing reads past
+    /// its end). Anything else is `E0437`.
     fn ml_str_arg(&mut self, name: &str, arg: &Expr, ty: &Ty, i: usize, what: &str) {
+        let u8_ty = |t: &Ty| matches!(t, Ty::Scalar(Scalar::U8));
         match ty {
-            Ty::Ptr { pointee, .. } if matches!(pointee.as_ref(), Ty::Scalar(Scalar::U8)) => {}
+            Ty::Ptr { pointee, .. } if u8_ty(pointee) => {}
+            Ty::Slice(e) | Ty::Array { elem: e, .. } if u8_ty(e) => {}
             Ty::Unknown | Ty::Error => {}
             other => self.error(
                 arg.span,
                 "E0437",
                 format!(
-                    "`{name}` expects a `*u8` {what} as its {} argument, found a value of type \
-                     `{}`",
+                    "`{name}` expects a `*u8` {what} (or a NUL-terminated `[]u8` / `[u8; N]` \
+                     buffer) as its {} argument, found a value of type `{}`",
                     ordinal(i),
                     other.display(self.interner)
                 ),
@@ -304,7 +478,23 @@ impl Sema<'_> {
         float: bool,
         what: &str,
     ) {
-        let target = Ty::Scalar(if float { Scalar::F32 } else { Scalar::I64 });
+        let target = if float { Scalar::F32 } else { Scalar::I64 };
+        self.ml_scalar_arg_to(name, arg, ty, target, what);
+    }
+
+    /// [`Self::ml_scalar_arg`] at an explicit ABI width: an unsuffixed literal adapts to `target`,
+    /// and the operand must be of `target`'s kind (any float for a float, any integer for an
+    /// integer).
+    fn ml_scalar_arg_to(
+        &mut self,
+        name: &str,
+        arg: &Expr,
+        ty: &mut Ty,
+        target: Scalar,
+        what: &str,
+    ) {
+        let float = target.is_float();
+        let target = Ty::Scalar(target);
         if self.literal_adapts(&target, arg) {
             self.retype_adapted_literal(arg, &target);
             self.range_check_int_literal(arg, &target);
@@ -572,6 +762,171 @@ mod tests {
             ),
             // Arity.
             ("fn f() -> i64 { return file_size(); }", "E0503"),
+        ]);
+    }
+
+    #[test]
+    fn gguf_builtins_are_named_and_typed() {
+        assert_eq!(
+            ml_builtin("gguf_read_f32"),
+            Some(MlBuiltin::GgufRead(Scalar::F32))
+        );
+        assert_eq!(
+            ml_builtin("gguf_read_u8"),
+            Some(MlBuiltin::GgufRead(Scalar::U8))
+        );
+        assert_eq!(
+            ml_builtin("gguf_dim"),
+            Some(MlBuiltin::GgufQuery(GgufQuery::Dim))
+        );
+        for not_one in [
+            "gguf_read",
+            "gguf_read_bool",
+            "gguf_read_f32_at",
+            "gguf_shape",
+        ] {
+            assert_eq!(ml_builtin(not_one), None, "{not_one}");
+        }
+        let ok = "fn f(mut t: Tensor[f32, 2, 3], mut q: []u8, mut h: [bf16; 4]) -> i64 { \
+                  let k: u32 = 1; \
+                  return gguf_read_f32(\"m.gguf\", \"w\", t) + gguf_read_u8(\"m.gguf\", \"q\", q) \
+                      + gguf_read_bf16(\"m.gguf\", \"h\", h) + gguf_find(\"m.gguf\", \"w\") \
+                      + gguf_rank(\"m.gguf\", \"w\") + gguf_dim(\"m.gguf\", \"w\", k) \
+                      + gguf_dim(\"m.gguf\", \"w\", 0) + gguf_type(\"m.gguf\", \"w\"); }";
+        assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
+        assert_rejected(&[
+            // The read writes its buffer.
+            (
+                "fn f(t: Tensor[f32, 4]) -> i64 { return gguf_read_f32(\"a\", \"w\", t); }",
+                "E0304",
+            ),
+            // A tensor name is a string, a dimension index an integer, the element type exact.
+            (
+                "fn f(mut w: [f32; 4]) -> i64 { return gguf_read_f32(\"a\", 3, w); }",
+                "E0437",
+            ),
+            (
+                "fn f() -> i64 { return gguf_dim(\"a\", \"w\", 1.5); }",
+                "E0437",
+            ),
+            (
+                "fn f(mut w: []i32) -> i64 { return gguf_read_f32(\"a\", \"w\", w); }",
+                "E0437",
+            ),
+            // Arity.
+            ("fn f() -> i64 { return gguf_dim(\"a\", \"w\"); }", "E0503"),
+            (
+                "fn f() -> i64 { return gguf_rank(\"a\", \"w\", 0); }",
+                "E0503",
+            ),
+            // The result is a typed `i64`.
+            ("fn f() { let x: f32 = gguf_type(\"a\", \"w\"); }", "E0401"),
+        ]);
+    }
+
+    #[test]
+    fn gguf_metadata_accessors_are_typed() {
+        assert_eq!(
+            ml_builtin("gguf_meta_f64"),
+            Some(MlBuiltin::GgufMeta(GgufMeta::F64))
+        );
+        let ok = "fn f(mut b: [u8; 32]) -> f64 { \
+                  let t: i64 = gguf_meta_type(\"m.gguf\", \"general.name\") \
+                      + gguf_meta_len(\"m.gguf\", \"tokens\") \
+                      + gguf_meta_i64(\"m.gguf\", \"llama.block_count\", 0, -1) \
+                      + gguf_meta_str(\"m.gguf\", \"tokens\", 3, b); \
+                  let e: f64 = gguf_meta_f64(\"m.gguf\", \"llama.rope.freq_base\", 0, 0.0); \
+                  return e + t as f64; }";
+        assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
+        assert_rejected(&[
+            // The f64 default is a float; the i64 default an integer.
+            (
+                "fn f() -> f64 { return gguf_meta_f64(\"m\", \"k\", 0, 1); }",
+                "E0437",
+            ),
+            (
+                "fn f() -> i64 { return gguf_meta_i64(\"m\", \"k\", 0, 1.5); }",
+                "E0437",
+            ),
+            // The string read writes a u8 buffer.
+            (
+                "fn f(b: [u8; 8]) -> i64 { return gguf_meta_str(\"m\", \"k\", 0, b); }",
+                "E0304",
+            ),
+            ("fn f() -> i64 { return gguf_meta_len(\"m\"); }", "E0503"),
+            (
+                "fn f() { let x: i64 = gguf_meta_f64(\"m\", \"k\", 0, 0.0); }",
+                "E0401",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn a_u8_buffer_is_a_string_operand() {
+        let ok = "fn f(p: []u8, mut w: [f32; 4]) -> i64 { \
+                  let mut name: [u8; 16] = [0; 16]; \
+                  sprintf(name, \"h{}.wq\", 3); \
+                  return st_read_f32(p, name, w) + gguf_dim(p, name, 0) + file_size(name); }";
+        assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
+        assert_rejected(&[
+            // Only bytes spell a string.
+            (
+                "fn f(p: []i8, mut w: [f32; 4]) -> i64 { return read_f32(p, w); }",
+                "E0437",
+            ),
+            ("fn f(p: [u16; 8]) -> i64 { return file_size(p); }", "E0437"),
+        ]);
+    }
+
+    #[test]
+    fn map_builtins_are_named_and_typed() {
+        assert_eq!(
+            ml_builtin("map_f32"),
+            Some(MlBuiltin::Map(MapSource::File, Scalar::F32))
+        );
+        assert_eq!(
+            ml_builtin("st_map_bf16"),
+            Some(MlBuiltin::Map(MapSource::Safetensors, Scalar::Bf16))
+        );
+        assert_eq!(
+            ml_builtin("npy_map_i16"),
+            Some(MlBuiltin::Map(MapSource::Npy, Scalar::I16))
+        );
+        assert_eq!(
+            ml_builtin("gguf_map_u8"),
+            Some(MlBuiltin::Map(MapSource::Gguf, Scalar::U8))
+        );
+        for not_one in ["map_", "map_bool", "map", "st_map", "map_f32_at"] {
+            assert_eq!(ml_builtin(not_one), None, "{not_one}");
+        }
+        let ok = "fn f() -> i64 { \
+                  let a: []f32 = map_f32(\"w.bin\"); \
+                  let b: []bf16 = st_map_bf16(\"m.st\", \"w\"); \
+                  let c: []i16 = npy_map_i16(\"a.npy\"); \
+                  let d: []u8 = gguf_map_u8(\"m.gguf\", \"q\"); \
+                  let n: i64 = a.len() + b.len() + c.len() + d.len(); \
+                  free(a); free(b); free(c); free(d); \
+                  return n; }";
+        assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
+        assert_rejected(&[
+            // The result is the stored element type's slice.
+            (
+                "fn f() { let a: []f64 = map_f32(\"w.bin\"); free(a); }",
+                "E0401",
+            ),
+            // A tensor name is a string; the whole-file maps take none.
+            (
+                "fn f() { let a: []f32 = st_map_f32(\"m.st\", 1); free(a); }",
+                "E0437",
+            ),
+            (
+                "fn f() { let a: []f32 = map_f32(\"w.bin\", \"w\"); free(a); }",
+                "E0503",
+            ),
+            (
+                "fn f() { let a: []f32 = gguf_map_f32(\"m.gguf\"); free(a); }",
+                "E0503",
+            ),
         ]);
     }
 

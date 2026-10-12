@@ -1,8 +1,8 @@
 //! The runtime entry points of the ML I/O and randomness builtins — dtype-coded file I/O,
-//! `file_size`, the safetensors / `.npy` readers, the Philox fill and the top-k / argsort /
-//! categorical-sampling kernels — and of the decode builtins (KV-cache attention, the KV append,
-//! the half-weight and Q8_0 / Q4_0 GEMVs and packers), declared, JIT-bound and called from **one
-//! table**.
+//! `file_size`, the safetensors / `.npy` / GGUF readers, the GGUF tensor-table queries and the
+//! memory-mapped loads, the Philox fill and the top-k / argsort / categorical-sampling kernels — and of the decode builtins
+//! (KV-cache attention, the KV append, the half-weight and Q8_0 / Q4_0 GEMVs and packers),
+//! declared, JIT-bound and called from **one table**.
 //!
 //! Every other runtime family in this crate is spelled out four times: a name constant, a
 //! `Signature` built by hand in `populate_module`, an `rt_ids` row, and a `builder.symbol` line in
@@ -30,6 +30,8 @@ pub(crate) enum Abi {
     I64,
     /// An `f32`; an `f64` argument is demoted to it.
     F32,
+    /// An `f64`; an `f32` argument is promoted to it.
+    F64,
 }
 
 impl Abi {
@@ -38,6 +40,7 @@ impl Abi {
             Abi::Ptr => ptr_ty,
             Abi::I64 => types::I64,
             Abi::F32 => types::F32,
+            Abi::F64 => types::F64,
         }
     }
 }
@@ -53,8 +56,8 @@ pub(crate) struct Entry {
 
 /// The table. The addresses are taken here, at run time, because a function-pointer-to-raw-pointer
 /// cast is not a constant expression.
-pub(crate) fn entries() -> [Entry; 24] {
-    use Abi::{Ptr, F32, I64};
+pub(crate) fn entries() -> [Entry; 31] {
+    use Abi::{Ptr, F32, F64, I64};
     [
         // (path, byte_off, data, len, dtype) -> i64: `read_<T>` outside the frozen six, and every
         // `read_<T>_at`.
@@ -91,6 +94,57 @@ pub(crate) fn entries() -> [Entry; 24] {
             params: &[Ptr, Ptr, I64, I64, Ptr, I64],
             ret: Some(I64),
             addr: wukong_runtime::wukong_rt_npy_read as *const u8,
+        },
+        // (path, name, data, len, dtype, dims, rank) -> i64: `gguf_read_<T>`.
+        Entry {
+            name: "wukong_rt_gguf_read",
+            params: &[Ptr, Ptr, Ptr, I64, I64, Ptr, I64],
+            ret: Some(I64),
+            addr: wukong_runtime::wukong_rt_gguf_read as *const u8,
+        },
+        // (path, name, what, k) -> i64: `gguf_find` / `gguf_rank` / `gguf_dim` / `gguf_type`.
+        Entry {
+            name: "wukong_rt_gguf_query",
+            params: &[Ptr, Ptr, I64, I64],
+            ret: Some(I64),
+            addr: wukong_runtime::wukong_rt_gguf_query as *const u8,
+        },
+        // (path, key, what, i, default) -> i64: `gguf_meta_type` / `gguf_meta_len` /
+        // `gguf_meta_i64`.
+        Entry {
+            name: "wukong_rt_gguf_meta",
+            params: &[Ptr, Ptr, I64, I64, I64],
+            ret: Some(I64),
+            addr: wukong_runtime::wukong_rt_gguf_meta as *const u8,
+        },
+        // (path, key, i, default) -> f64: `gguf_meta_f64`.
+        Entry {
+            name: "wukong_rt_gguf_meta_f64",
+            params: &[Ptr, Ptr, I64, F64],
+            ret: Some(F64),
+            addr: wukong_runtime::wukong_rt_gguf_meta_f64 as *const u8,
+        },
+        // (path, key, i, buf, len) -> i64: `gguf_meta_str`.
+        Entry {
+            name: "wukong_rt_gguf_meta_str",
+            params: &[Ptr, Ptr, I64, Ptr, I64],
+            ret: Some(I64),
+            addr: wukong_runtime::wukong_rt_gguf_meta_str as *const u8,
+        },
+        // (data, len) -> data or null: a `[]u8` / `[u8; N]` path or tensor name.
+        Entry {
+            name: "wukong_rt_cstr",
+            params: &[Ptr, I64],
+            ret: Some(Ptr),
+            addr: wukong_runtime::wukong_rt_cstr as *const u8,
+        },
+        // (path, name, container, dtype, out_len) -> data: `map_<T>` / `st_map_<T>` /
+        // `npy_map_<T>` / `gguf_map_<T>`.
+        Entry {
+            name: "wukong_rt_map",
+            params: &[Ptr, Ptr, I64, I64, Ptr],
+            ret: Some(Ptr),
+            addr: wukong_runtime::wukong_rt_map as *const u8,
         },
         // (out, n, seed, ctr0): `rand_fill_f32`.
         Entry {
@@ -322,6 +376,7 @@ impl FnTranslator<'_> {
                 Abi::Ptr => self.val(a),
                 Abi::I64 => self.coerce_to_i64(a),
                 Abi::F32 => self.coerce_to_f32(a),
+                Abi::F64 => self.coerce_to_f64(a),
             });
         }
         let fref = self.runtime_ref(e.name);

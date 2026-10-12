@@ -370,6 +370,37 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
   `-5` name, `-6` malformed header; the destination is untouched on every one but `-2`. Runtime unit
   tests cover the parsers and every code; `tests/run/io_safetensors.wk` and `io_npy.wk` assemble files
   byte by byte and print every lane.
+- **GGUF reader** (2026-10-12, `gap6/tensor-io-gguf`) — `gguf_read_<T>(path, name, buf)` loads one
+  tensor of a llama.cpp GGUF file (v2/v3; every metadata value type parsed, arrays of arrays
+  included; `general.alignment` honoured), `gguf_find` / `gguf_rank` / `gguf_dim` / `gguf_type`
+  query its tensor table, dims reported outermost first, and `gguf_meta_type` / `_len` / `_i64` /
+  `_f64` / `_str` read its metadata by key. Plain tensors load verbatim (`F16`/`BF16`
+  also widen into `f32`); `Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q2_K Q3_K Q4_K Q5_K Q6_K Q8_K IQ4_NL IQ4_XS`
+  dequantize into `f32` by ggml's reference `dequantize_row_*` (no FMA, one rounding per operation),
+  and any block type loads its raw blocks into `u8` — the operand of `gemv_q8_0` / `gemv_q4_0`, the
+  same row-of-blocks layout. Codes as the safetensors reader's plus `-7` (a type with no decoder).
+  The parser, the plan and the dequantizing transfer are one runtime module (`wukong_runtime::gguf`)
+  the interpreter calls too, so interp == native bit for bit; runtime tests build every file and
+  block by hand (each block packed by a transcription of ggml's quantizer, the inverse direction),
+  round-trip all thirteen metadata types and every malformed-header case, and
+  `tests/run/io_gguf.wk` writes a GGUF with `write_u8` and reads it back on both backends.
+- **Memory-mapped loads** (2026-10-12, `gap6/tensor-io-gguf`) — `map_<T>(path)`,
+  `st_map_<T>(path, name)`, `npy_map_<T>(path)` and `gguf_map_<T>(path, name)` return a `[]T`
+  holding a whole file or one stored tensor (in its own element type; `u8` raw blocks for a
+  quantized GGUF tensor), released by `free`. Natively it is a copy-on-write private mapping
+  (`mmap(MAP_PRIVATE)` / `MapViewOfFile(FILE_MAP_COPY)`, declared directly against the C library
+  and `kernel32`, no new dependency) registered so `wukong_rt_free` unmaps it; a payload misaligned
+  for its element is a heap copy instead, and the interpreter always copies — the observable
+  semantics of both is "a buffer filled from the file". Empty on any failure.
+  `tests/run/io_map.wk`; runtime tests check a view mapped from inside a 64 KiB granule, the
+  copy fallback and copy-on-write.
+- **Run-time file and tensor names** (2026-10-12) — every path / tensor-name operand also takes a
+  `[]u8` / `[u8; N]` buffer holding a NUL-terminated string (what `sprintf` writes), through a
+  `wukong_rt_cstr` check that turns an unterminated buffer into the null string
+  (`tests/run/io_buffer_names.wk`). `examples/gpt2_infer.wk` uses it to load all 196 GPT-2 tensors
+  by name from the safetensors export (`h{l}.wq`, …) into the flat buffer it computes on — logits
+  bit-identical to the flat-blob load. A string literal is now fresh storage to the matmul
+  recognizers' alias planner, so a `*u8` path local no longer costs its function every kernel.
 - **Counter-based RNG** — `rand_u32` / `rand_f32` / `randn_f32(seed, ctr)` are Philox4x32-10 (key
   = the seed's two words, counter = `(ctr lo, ctr hi, 0, 0)`; `rand_u32(0, 0)` is Random123's known
   answer `0x6627e8d5`), lowered to plain integer MIR (`zext`/`mul`/`lshr`/`trunc`/`xor`), so they are
@@ -1696,20 +1727,26 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   recognized (a scaled store `y[j] = s * c` stays a loop), and a quantized GEMV has no loop spelling
   at all — its per-call activation quantization is part of its definition, so call `gemv_q4_0` by
   name; the K-quant family
-  (`Q4_K`, `Q6_K`) and a quantized KV cache are not implemented; `sdpa_kv` takes the output's stride
-  from the query's, `sdpa_kv_batch` takes packed tensors only (no row strides, no paged cache) and
-  no split-K across the keys (a one-sequence MQA step parallelizes over at most `H / 8` head
-  blocks), and neither has a backward kernel (autodiff refuses them). A whole greedy decode loop runs
-  as a gated toy model (`tests/run/decode_tiny_lm.wk`: bf16 projections, a growing KV cache, GQA attention, a Q8_0 LM head,
+  (`Q4_K`, `Q6_K`) has no GEMV (a GGUF K-quant tensor dequantizes to `f32` as it loads) and a
+  quantized KV cache is not implemented; `sdpa_kv` takes the output's stride from the query's,
+  `sdpa_kv_batch` takes packed tensors only (no row strides, no paged cache) and no split-K across
+  the keys (a one-sequence MQA step parallelizes over at most `H / 8` head blocks), and neither has
+  a backward kernel (autodiff refuses them). A whole greedy decode loop runs as a gated toy model
+  (`tests/run/decode_tiny_lm.wk`: bf16 projections, a growing KV cache, GQA attention, a Q8_0 LM head,
   six tokens checked against an f64 reference), and `examples/gpt2_generate.wk` decodes the real
   GPT-2 124M weights with KV caches: two sequences at different positions share one
   `sdpa_kv_batch` call per layer through padded caches, and their 24 greedy tokens match a float64
   NumPy evaluation (native-only; needs the uncommitted `data/gpt2/` blob). None of the decode
   kernels is measured yet.
-- **ML I/O and randomness gaps.** No memory-mapped load yet (`map_<T>`: every checkpoint load copies
-  once, straight into the destination) and no GGUF reader (the `Q8_0` / `Q4_0` block layouts exist as
-  the decode builtins' packers and GEMVs, and a raw block blob loads with `read_u8`); `.npy` reads
-  little-endian arrays only.
+- **ML I/O and randomness gaps.** A memory-mapped load is a flat slice of the stored element type:
+  there is no shape-typed `Tensor` view of a mapping (check `gguf_dim`, or load with `*_read_<T>`),
+  no converting map (a `BF16` tensor maps only as `[]bf16`), and no error code on the map itself
+  (it is empty; the matching `*_read_<T>` names the cause). The GGUF reader has no dequantizer for
+  the grid-based i-quants (`IQ1_*`, `IQ2_*`, `IQ3_*`), `Q8_1`, `TQ1_0`/`TQ2_0` or `MXFP4` (they
+  load only as raw blocks; into `f32` they are `-7`), and every call re-opens the file and re-walks
+  its header: a tensor read, query or map steps over the metadata without keeping any of it, but a
+  large tokenizer vocabulary is still read once per call (and fully parsed per `gguf_meta_*` call);
+  there is no cross-call header cache. `.npy` reads little-endian arrays only.
   A fill loop `for i { out[i] = rand_f32(seed, base + i) }` is not recognized into `rand_fill_f32`,
   and the loop vectorizer declines it (mixed 32/64-bit widths), so the scalar builtins run one
   element at a time; `randn_f32` has no fill kernel.

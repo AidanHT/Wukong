@@ -841,7 +841,8 @@ fn main() -> i32 {
         "A builtin was given an argument of a kind it cannot take: a math function (`sqrt`, `exp`, \
          …) a struct, pointer or whole tensor; `alloc_<T>`/`scratch_<T>` a non-integer count; \
          `free` something that is not a slice; `print` a `()` value or a whole tensor; a file-I/O \
-         builtin a path that is not a `*u8` string, an offset that is not an integer, or a buffer \
+         builtin a path or tensor name that is neither a `*u8` string nor a NUL-terminated `[]u8` \
+         / `[u8; N]` buffer (what `sprintf` writes), an offset that is not an integer, or a buffer \
          of the wrong element type or with a `?` dimension; an RNG builtin a float seed; a kernel \
          builtin (`matmul`, `sdpa`, …) an operand that is not an `f32` buffer or a non-integer \
          dimension; `atomic_add` a first argument that is not a place in memory other threads can \

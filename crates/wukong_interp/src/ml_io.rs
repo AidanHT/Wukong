@@ -1,9 +1,10 @@
 //! The interpreter twins of the ML I/O and randomness runtime entries: dtype-coded file I/O,
-//! `file_size`, the safetensors / `.npy` container readers, the Philox fill, and the top-k /
-//! argsort / categorical-sampling kernels.
+//! `file_size`, the safetensors / `.npy` / GGUF container readers and the GGUF tensor-table
+//! queries, the Philox fill, and the top-k / argsort / categorical-sampling kernels.
 //!
 //! Every arm here mirrors one `wukong_runtime` entry and shares that entry's *pure* code — the
-//! transfer plan and the container parsers in `wukong_runtime::fileio`, the generator in
+//! transfer plan and the container parsers in `wukong_runtime::fileio` (for GGUF, the parser, the
+//! plan and the dequantizing transfer in `wukong_runtime::gguf`), the generator in
 //! `wukong_runtime::random`, the selection functions in `wukong_runtime::topk` — so the return code,
 //! the element count and every value cannot drift between the two backends; only the destination
 //! differs. Native memory holds raw element bytes; this interpreter's memory holds one typed
@@ -25,6 +26,11 @@ use wukong_runtime::fileio::{
     check_dest, dtype_size, open_container, plan_raw_read, Container, DT_BF16, DT_F16, DT_F32,
     DT_F64, DT_I16, DT_I32, DT_I8, DT_U16, DT_U32, DT_U8, IO_ERROR, IO_OPEN_FAILED,
 };
+use wukong_runtime::gguf::{
+    copy_c_string, gguf_meta_f64_path, gguf_meta_path, gguf_meta_str_path, gguf_open_tensor,
+    gguf_query_path, gguf_transfer,
+};
+use wukong_runtime::mmap::{map_plan, MAP_GGUF, MAP_SAFETENSORS};
 
 use crate::{
     file_read_path, kernel_buffer, kernel_scratch, kernel_values, Interp, Intrinsic, Value,
@@ -92,9 +98,14 @@ fn ptr_arg(args: &[Value], i: usize, ctx: &str, what: &str) -> Result<usize, Str
 }
 
 /// The `*u8` string argument at `i`, reconstructed with the same lossy rule as the frozen family
-/// (and as the native entries' lossy C-string decode).
+/// (and as the native entries' lossy C-string decode). The null pointer — a `[]u8` operand with no
+/// NUL, through `wukong_rt_cstr` — is the empty string, as natively: an empty path cannot be
+/// opened (`-1`) and an empty name is just a name.
 fn str_arg(memory: &[Value], args: &[Value], i: usize, ctx: &str) -> Result<String, String> {
-    file_read_path(memory, ptr_arg(args, i, ctx, "string")?)
+    match ptr_arg(args, i, ctx, "string")? {
+        crate::NULL_SLOT => Ok(String::new()),
+        p => file_read_path(memory, p),
+    }
 }
 
 /// A non-negative element count as a slot count.
@@ -117,6 +128,13 @@ impl Interp<'_, '_> {
             I::RtFileSize => self.ml_file_size(args),
             I::RtStRead => self.ml_container_read(args, true),
             I::RtNpyRead => self.ml_container_read(args, false),
+            I::RtGgufRead => self.ml_gguf_read(args),
+            I::RtGgufQuery => self.ml_gguf_query(args),
+            I::RtGgufMeta => self.ml_gguf_meta(args),
+            I::RtGgufMetaF64 => self.ml_gguf_meta_f64(args),
+            I::RtGgufMetaStr => self.ml_gguf_meta_str(args),
+            I::RtMap => self.ml_map(args),
+            I::RtCstr => self.ml_cstr(args),
             I::RandFillF32 => self.ml_rand_fill(args),
             I::TopkF32 => self.ml_topk(args),
             I::ArgsortF32 => self.ml_argsort(args),
@@ -263,14 +281,7 @@ impl Interp<'_, '_> {
         };
         let len = arg_i64(args, at + 2);
         let dt = arg_i64(args, at + 3);
-        let rank = arg_i64(args, at + 5);
-        let dims: Option<Vec<i64>> = if rank < 0 {
-            None
-        } else {
-            let base = ptr_arg(args, at + 4, ctx, "dims")?;
-            let vals = kernel_values(arena!(self), at + 4, base, 1, count(rank), ctx)?;
-            Some(vals.iter().map(|v| v.as_int() as i64).collect())
-        };
+        let dims = self.ml_dims(args, at + 4, ctx)?;
         let container = match &name {
             Some(n) => Container::Safetensors(n),
             None => Container::Npy,
@@ -297,6 +308,184 @@ impl Interp<'_, '_> {
                 None => Value::Int(IO_ERROR as i128),
             },
         )
+    }
+
+    /// The `(dims, rank)` operands at `at` / `at + 1`: `None` for a flat destination (`rank < 0`),
+    /// else the tensor view's dims.
+    fn ml_dims(&self, args: &[Value], at: usize, ctx: &str) -> Result<Option<Vec<i64>>, String> {
+        let rank = arg_i64(args, at + 1);
+        if rank < 0 {
+            return Ok(None);
+        }
+        let base = ptr_arg(args, at, ctx, "dims")?;
+        let vals = kernel_values(arena!(self), at, base, 1, count(rank), ctx)?;
+        Ok(Some(vals.iter().map(|v| v.as_int() as i64).collect()))
+    }
+
+    /// `wukong_rt_gguf_read(path, name, data, len, dtype, dims, rank) -> i64`: the runtime's own
+    /// open / locate / plan ([`gguf_open_tensor`]) and transfer ([`gguf_transfer`]) into a host
+    /// buffer of the destination's little-endian bytes, then decoded slot by slot — so a widened or
+    /// dequantized value is the native read's, bit for bit.
+    fn ml_gguf_read(&mut self, args: &[Value]) -> Result<Value, String> {
+        const CTX: &str = "gguf_read";
+        let path = str_arg(&self.memory, args, 0, CTX)?;
+        let name = str_arg(&self.memory, args, 1, CTX)?;
+        let len = arg_i64(args, 3);
+        let dt = arg_i64(args, 4);
+        let dims = self.ml_dims(args, 5, CTX)?;
+        let (mut file, loc, plan) =
+            match gguf_open_tensor(Path::new(&path), name.as_bytes(), dt, len, dims.as_deref()) {
+                Ok(found) => found,
+                Err(code) => return Ok(Value::Int(code as i128)),
+            };
+        let n = plan.count();
+        if n == 0 {
+            return Ok(Value::Int(0));
+        }
+        let sz = dtype_size(dt).ok_or_else(|| format!("{CTX}: unknown dtype {dt}"))?;
+        let base = ptr_arg(args, 2, CTX, "data")?;
+        self.ml_check_extent(2, base, n, CTX)?;
+        let byte_len = n
+            .checked_mul(sz)
+            .ok_or_else(|| format!("{CTX}: byte extent overflow"))?;
+        let mut bytes = kernel_scratch(byte_len, CTX)?;
+        bytes.resize(byte_len, 0u8);
+        if let Err(code) = gguf_transfer(&mut file, &loc, plan, &mut bytes) {
+            return Ok(Value::Int(code as i128));
+        }
+        for (slot, elem) in self.memory[base..base + n]
+            .iter_mut()
+            .zip(bytes.chunks_exact(sz))
+        {
+            *slot = decode_elem(dt, elem);
+        }
+        Ok(Value::Int(n as i128))
+    }
+
+    /// `wukong_rt_gguf_query(path, name, what, k) -> i64`.
+    fn ml_gguf_query(&mut self, args: &[Value]) -> Result<Value, String> {
+        const CTX: &str = "gguf_query";
+        let path = str_arg(&self.memory, args, 0, CTX)?;
+        let name = str_arg(&self.memory, args, 1, CTX)?;
+        let (what, k) = (arg_i64(args, 2), arg_i64(args, 3));
+        let got = gguf_query_path(Path::new(&path), name.as_bytes(), what, k);
+        Ok(Value::Int(got as i128))
+    }
+
+    /// `wukong_rt_cstr(data, len) -> data | null`: the buffer when one of its first `len` slots
+    /// holds a zero byte (the low byte, as `file_read_path` reads it), else the null pointer.
+    fn ml_cstr(&mut self, args: &[Value]) -> Result<Value, String> {
+        const CTX: &str = "string operand";
+        let n = count(arg_i64(args, 1));
+        if n == 0 {
+            return Ok(Value::Ptr(crate::NULL_SLOT));
+        }
+        let base = ptr_arg(args, 0, CTX, "data")?;
+        self.ml_check_extent(0, base, n, CTX)?;
+        let terminated = self.memory[base..base + n]
+            .iter()
+            .any(|v| v.as_int() as u8 == 0);
+        Ok(Value::Ptr(if terminated { base } else { crate::NULL_SLOT }))
+    }
+
+    /// `wukong_rt_map(path, name, container, dtype, out_len) -> data`: the runtime's own
+    /// [`map_plan`], then a block of slots made exactly as `alloc_<T>` makes one (so `free`
+    /// releases and reuses it) holding the decoded payload — the copy that native's copy-on-write
+    /// mapping is indistinguishable from. Any failure, and an empty payload, is the null pointer
+    /// with length 0, as natively.
+    fn ml_map(&mut self, args: &[Value]) -> Result<Value, String> {
+        use std::io::Read;
+        const CTX: &str = "map";
+        let path = str_arg(&self.memory, args, 0, CTX)?;
+        let container = arg_i64(args, 2);
+        let name = if matches!(container, MAP_SAFETENSORS | MAP_GGUF) {
+            str_arg(&self.memory, args, 1, CTX)?
+        } else {
+            String::new()
+        };
+        let dt = arg_i64(args, 3);
+        let len_slot = ptr_arg(args, 4, CTX, "length")?;
+        self.ml_check_extent(4, len_slot, 1, CTX)?;
+        let mut out = (Value::Ptr(crate::NULL_SLOT), 0usize);
+        if let (Ok(plan), Some(sz)) = (
+            map_plan(Path::new(&path), container, &name, dt),
+            dtype_size(dt),
+        ) {
+            if plan.count > 0 {
+                let byte_len = plan
+                    .count
+                    .checked_mul(sz)
+                    .ok_or_else(|| format!("{CTX}: byte extent overflow"))?;
+                let mut bytes = kernel_scratch(byte_len, CTX)?;
+                bytes.resize(byte_len, 0u8);
+                let mut file = plan.file;
+                let read = file.seek(SeekFrom::Start(plan.off)).is_ok()
+                    && file.read_exact(&mut bytes).is_ok();
+                if read {
+                    let is_float = matches!(dt, DT_F32 | DT_F64 | DT_F16 | DT_BF16);
+                    let alloc = [
+                        Value::Int(plan.count as i128),
+                        Value::Int(sz as i128),
+                        Value::Int(i128::from(is_float)),
+                    ];
+                    let block = self.call_intrinsic(Intrinsic::RtAlloc, &alloc)?;
+                    if let Value::Ptr(base) = block {
+                        for (slot, elem) in self.memory[base..base + plan.count]
+                            .iter_mut()
+                            .zip(bytes.chunks_exact(sz))
+                        {
+                            *slot = decode_elem(dt, elem);
+                        }
+                        out = (block, plan.count);
+                    }
+                }
+            }
+        }
+        self.memory[len_slot] = Value::Int(out.1 as i128);
+        Ok(out.0)
+    }
+
+    /// `wukong_rt_gguf_meta(path, key, what, i, default) -> i64`.
+    fn ml_gguf_meta(&mut self, args: &[Value]) -> Result<Value, String> {
+        const CTX: &str = "gguf_meta";
+        let path = str_arg(&self.memory, args, 0, CTX)?;
+        let key = str_arg(&self.memory, args, 1, CTX)?;
+        let (what, i, default) = (arg_i64(args, 2), arg_i64(args, 3), arg_i64(args, 4));
+        let got = gguf_meta_path(Path::new(&path), key.as_bytes(), what, i, default);
+        Ok(Value::Int(got as i128))
+    }
+
+    /// `wukong_rt_gguf_meta_f64(path, key, i, default) -> f64`.
+    fn ml_gguf_meta_f64(&mut self, args: &[Value]) -> Result<Value, String> {
+        const CTX: &str = "gguf_meta_f64";
+        let path = str_arg(&self.memory, args, 0, CTX)?;
+        let key = str_arg(&self.memory, args, 1, CTX)?;
+        let i = arg_i64(args, 2);
+        let default = args.get(3).map(|v| v.as_float()).unwrap_or(0.0);
+        let got = gguf_meta_f64_path(Path::new(&path), key.as_bytes(), i, default);
+        Ok(Value::Float(got))
+    }
+
+    /// `wukong_rt_gguf_meta_str(path, key, i, buf, len) -> i64`: the runtime's own lookup, then
+    /// the same `snprintf` copy into the buffer's slots (each byte the canonical `u8` slot value).
+    fn ml_gguf_meta_str(&mut self, args: &[Value]) -> Result<Value, String> {
+        const CTX: &str = "gguf_meta_str";
+        let path = str_arg(&self.memory, args, 0, CTX)?;
+        let key = str_arg(&self.memory, args, 1, CTX)?;
+        let i = arg_i64(args, 2);
+        let len = count(arg_i64(args, 4));
+        match gguf_meta_str_path(Path::new(&path), key.as_bytes(), i) {
+            Ok(s) => {
+                if len > 0 {
+                    let base = ptr_arg(args, 3, CTX, "buffer")?;
+                    self.ml_check_extent(3, base, len, CTX)?;
+                    let memory = &mut self.memory;
+                    copy_c_string(&s, len, |k, b| memory[base + k] = decode_elem(DT_U8, &[b]));
+                }
+                Ok(Value::Int(s.len() as i128))
+            }
+            Err(code) => Ok(Value::Int(code as i128)),
+        }
     }
 
     /// `n` `f32` slots of operand `k` from `base`, marshalled for a host kernel.
@@ -428,6 +617,57 @@ mod tests {
         for (suffix, dt) in rows {
             let s = wukong_sema::io_dtype(suffix).unwrap();
             assert_eq!(wukong_sema::io_dtype_code(s), dt, "{suffix}");
+        }
+    }
+
+    /// The GGUF query codes (`wukong_sema::GgufQuery::code`, emitted as MIR constants) are the
+    /// runtime's `GGUF_Q_*`.
+    #[test]
+    fn compiler_and_runtime_gguf_query_codes_agree() {
+        use wukong_runtime::gguf as g;
+        use wukong_sema::GgufQuery as Q;
+        for (q, code) in [
+            (Q::Find, g::GGUF_Q_FIND),
+            (Q::Rank, g::GGUF_Q_RANK),
+            (Q::Dim, g::GGUF_Q_DIM),
+            (Q::Type, g::GGUF_Q_TYPE),
+        ] {
+            assert_eq!(q.code(), code, "{q:?}");
+        }
+    }
+
+    /// The GGUF metadata accessor codes (`wukong_sema::GgufMeta::code`) are the runtime's
+    /// `GGUF_M_*`.
+    #[test]
+    fn compiler_and_runtime_gguf_meta_codes_agree() {
+        use wukong_runtime::gguf as g;
+        use wukong_sema::GgufMeta as M;
+        for (m, code) in [
+            (M::Type, g::GGUF_M_TYPE),
+            (M::Len, g::GGUF_M_LEN),
+            (M::I64, g::GGUF_M_I64),
+        ] {
+            assert_eq!(m.code(), code, "{m:?}");
+        }
+    }
+
+    /// The map container codes (`wukong_sema::MapSource::code`) are the runtime's `MAP_*`.
+    #[test]
+    fn compiler_and_runtime_map_codes_agree() {
+        use wukong_runtime::mmap as m;
+        use wukong_sema::MapSource as S;
+        for (s, code) in [
+            (S::File, m::MAP_FILE),
+            (S::Safetensors, m::MAP_SAFETENSORS),
+            (S::Npy, m::MAP_NPY),
+            (S::Gguf, m::MAP_GGUF),
+        ] {
+            assert_eq!(s.code(), code, "{s:?}");
+            assert_eq!(
+                s.named(),
+                matches!(code, m::MAP_SAFETENSORS | m::MAP_GGUF),
+                "{s:?}"
+            );
         }
     }
 

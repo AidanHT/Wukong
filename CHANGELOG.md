@@ -491,6 +491,71 @@ All notable changes to Wukong are documented here. The format is loosely based o
   turbofish is not such a read (it is its value there, and is never deleted), so it still folds
   into the rest of the function, whose loops keep a literal trip count.
 
+### GGUF checkpoints, quantized blocks and memory-mapped loads (`gap6/tensor-io-gguf`, N77)
+
+- **`gguf_read_<T>(path, name, buf)` loads one tensor of a GGUF file** (llama.cpp's format, versions
+  2 and 3) for the twelve I/O element types and the usual buffer forms, checked against the
+  destination at load time like `st_read_<T>`: a plain tensor (`F32 F16 BF16 F64 I8 I16 I32 I64`)
+  loads verbatim, `F16`/`BF16` also widen exactly into `f32`; a block-quantized tensor
+  **dequantizes into `f32`** — `Q4_0 Q4_1 Q5_0 Q5_1 Q8_0`, the K-quants `Q2_K Q3_K Q4_K Q5_K Q6_K
+  Q8_K`, `IQ4_NL`, `IQ4_XS` — by ggml's reference `dequantize_row_*` (same unpacking, same `f32`
+  operations in the same order, no fused multiply-add), or loads its **raw blocks into `u8`**, the
+  operand `gemv_q8_0` / `gemv_q4_0` take (a `Tensor[u8, …]` destination is checked against the
+  storage shape, the innermost dimension in bytes). Shapes are reported **outermost first** (GGUF
+  stores `ne[0]` innermost), so GGUF dims `[4096, 11008]` load into `Tensor[f32, 11008, 4096]`.
+  Codes: `-1` open, `-2` I/O, `-3` dtype, `-4` shape/count, `-5` no such tensor, `-6` malformed
+  file, and the new `-7` for a type with no decoder (the grid i-quants, `Q8_1`, `TQ*`, `MXFP4`, an
+  id outside ggml's table) read into `f32`.
+- **`gguf_find` / `gguf_rank` / `gguf_dim` / `gguf_type(path, name[, k])`** answer the tensor
+  table: the tensor's index, rank, dimension `k` (outermost first) and ggml type id.
+- **The metadata is readable by key**: `gguf_meta_type` / `gguf_meta_len(path, key)`,
+  `gguf_meta_i64` / `gguf_meta_f64(path, key, i, default)` (a scalar, or element `i` of an array;
+  the default for anything they cannot read) and `gguf_meta_str(path, key, i, buf)` (copied with
+  `sprintf`'s truncation, returning the full length; `-3`/`-4`/`-5` otherwise) — a model's
+  hyperparameters and its tokenizer vocabulary. `tests/run/io_gguf_meta.wk`.
+- **The parser is strict where llama.cpp's is**: bad magic, a version other than 2/3, an unknown
+  value type, a duplicated key or tensor name, more than four dimensions, a dimension above
+  `i64::MAX`, a `general.alignment` that is not a `u32` power of two, an unaligned offset, a row that
+  is not a whole number of blocks and any length past the end of the file are `-6`; every metadata
+  value (all thirteen types, arrays of arrays) is parsed, so the tensor table is always reached.
+- **One implementation, every backend.** `wukong_runtime::gguf` holds the parser, the read plan and
+  the chunked dequantizing transfer; the native entries `wukong_rt_gguf_read` /
+  `wukong_rt_gguf_query` and the interpreter both call it, so a dequantized value is the same bits on
+  `interp`, `native`, the textual-LLVM declaration and an `--emit=exe` binary (gpu-native declines,
+  as for every I/O call). Runtime unit tests assemble every file and block by hand — blocks packed by
+  transcriptions of ggml's quantizers, values chosen so every product is exact — and cover all
+  thirteen metadata types, every malformed-header case and a file cut at every header byte;
+  `tests/run/io_gguf.wk` writes a GGUF with `write_u8` and reads every lane back.
+- **Memory-mapped loads: `map_<T>(path)`, `st_map_<T>(path, name)`, `npy_map_<T>(path)`,
+  `gguf_map_<T>(path, name)`** return a `[]T` holding a whole file or one stored tensor, released by
+  `free`. The slice behaves as a buffer filled from the file (writable; a write never reaches the
+  file): natively a copy-on-write private mapping (`mmap(MAP_PRIVATE)` /
+  `MapViewOfFile(FILE_MAP_COPY)`) that reads nothing until a page is touched, a heap copy where the
+  payload is misaligned for its element; the interpreter copies. A map never converts — the stored
+  element type, or `u8` raw blocks for a quantized GGUF tensor, which go straight to `gemv_q8_0` —
+  and is the empty slice on any failure. The OS calls are declared directly against the C library
+  and `kernel32` (no new dependency: `windows-sys` would link through import libraries the
+  `--emit=exe` rustc link cannot see); `wukong_rt_free` unmaps a registered mapping (one atomic load
+  while none is live). `tests/run/io_map.wk` (raw, safetensors, `.npy`, GGUF, copy-on-write, a
+  mapped weight through `gemv_q8_0`).
+- **A path or tensor name may be a `[]u8` / `[u8; N]` buffer** holding a NUL-terminated string —
+  what `sprintf` writes — for every file-I/O, checkpoint and map builtin, so names are built at run
+  time (`sprintf(name, "h{}.wq", l); st_read_f32(path, name, w)`). The lowering passes a buffer
+  through the new `wukong_rt_cstr(data, len)`, which yields the null string for a buffer with no
+  NUL (an open failure, or the empty name) instead of letting the runtime read past its end.
+  `tests/run/io_buffer_names.wk`.
+- **`examples/gpt2_infer.wk` loads GPT-2 by name** from `data/gpt2/gpt2_124m.safetensors`: each of
+  the 196 tensors goes through `st_read_f32` into its slot of the flat weight buffer, checked for
+  name, dtype and exact element count; the compute is unchanged, and the run's logits are
+  bit-identical to the flat-blob load (`tools/verify_gpt2.py`: rel 1.46e-6, argmax 1757).
+  `tools/export_gpt2.py --safetensors-from-blob` writes the safetensors file from an existing blob
+  without PyTorch.
+- **Fix: a `*u8` path local no longer costs a function its kernels.** The alias planner classified
+  a string literal's initializer as unknown storage, so `let p: *u8 = "w.bin";` tainted the whole
+  function and every recognized GEMM / elementwise kernel in it fell back to its scalar loop
+  (`tests/run/gemm_fused_bias_slice.wk` with a path local lost both `sgemm_nt_epi`). A string
+  literal now counts as fresh storage — static, read-only bytes no buffer can be.
+
 ### Source locations through MIR into native code (`gap5/native-source-locations`)
 
 - **Native-backend failures point at the source (P11.8).** A `C0002` (a slot above the native

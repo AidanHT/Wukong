@@ -82,6 +82,10 @@ pub const IO_NAME_NOT_FOUND: i64 = -5;
 /// The container's header is malformed: bad magic, unparseable header, a payload outside the
 /// file, or a payload whose byte length disagrees with its dtype and shape.
 pub const IO_BAD_HEADER: i64 = -6;
+/// The tensor's storage type has no decoder for this read: a GGUF type id outside the ggml table
+/// (or one ggml retired), or a block-quantized type with no dequantizer (an i-quant) read into
+/// `f32` ([`crate::gguf`]).
+pub const IO_UNSUPPORTED_TYPE: i64 = -7;
 
 /// Elements per staged chunk of a widening load (128 KiB of half-precision input).
 const WIDEN_CHUNK: usize = 1 << 16;
@@ -199,15 +203,23 @@ pub fn check_dest(
     } else {
         return Err(IO_DTYPE_MISMATCH);
     };
-    let count = shape_count(&loc.shape)?;
     if loc.fortran && loc.shape.len() >= 2 {
+        shape_count(&loc.shape)?;
         return Err(IO_SHAPE_MISMATCH);
     }
+    Ok((check_shape(&loc.shape, dest_len, dims)?, widen))
+}
+
+/// The shape half of [`check_dest`], shared with the GGUF reader: a tensor-view destination's rank
+/// and every dimension must equal `shape` (outermost first), and the destination's element count
+/// must equal `shape`'s exactly. Returns that count.
+pub fn check_shape(shape: &[u64], dest_len: i64, dims: Option<&[i64]>) -> Result<usize, i64> {
+    let count = shape_count(shape)?;
     if let Some(dims) = dims {
-        let same = dims.len() == loc.shape.len()
+        let same = dims.len() == shape.len()
             && dims
                 .iter()
-                .zip(&loc.shape)
+                .zip(shape)
                 .all(|(&d, &s)| u64::try_from(d).ok() == Some(s));
         if !same {
             return Err(IO_SHAPE_MISMATCH);
@@ -216,8 +228,7 @@ pub fn check_dest(
     if u64::try_from(dest_len).ok() != Some(count) {
         return Err(IO_SHAPE_MISMATCH);
     }
-    let count = usize::try_from(count).map_err(|_| IO_SHAPE_MISMATCH)?;
-    Ok((count, widen))
+    usize::try_from(count).map_err(|_| IO_SHAPE_MISMATCH)
 }
 
 /// Which container a typed load parses, with the tensor name a safetensors file is indexed by.
@@ -339,6 +350,29 @@ pub(crate) unsafe fn dims_arg<'a>(dims: *const i64, rank: i64) -> Option<&'a [i6
         0 => Some(&[]),
         // SAFETY: forwarded from this function's contract.
         r => Some(unsafe { std::slice::from_raw_parts(dims, r as usize) }),
+    }
+}
+
+/// `wukong_rt_cstr(data, len) -> *const u8` — a `[]u8` / `[u8; N]` buffer used as a path or tensor
+/// name: `data` when one of its first `len` bytes is NUL (the bytes before it are the string, as
+/// `sprintf` leaves them), else null, which a path reports as an open failure (`-1`) and a name
+/// reads as the empty name. The check is what lets a buffer stand where a NUL-terminated `*u8` is
+/// expected without a read past its end.
+///
+/// # Safety
+/// `data` must address `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn wukong_rt_cstr(data: *const u8, len: i64) -> *const u8 {
+    crate::safety::debug_extent(data, len);
+    if len <= 0 || data.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: the caller guarantees `len` readable bytes at `data`.
+    let bytes = unsafe { std::slice::from_raw_parts(data, len as usize) };
+    if bytes.contains(&0) {
+        data
+    } else {
+        std::ptr::null()
     }
 }
 
@@ -612,6 +646,23 @@ mod tests {
         let n = unsafe { wukong_rt_write_dt(f.ptr(), std::ptr::null(), 0, DT_F16) };
         assert_eq!(n, 0);
         assert_eq!(std::fs::read(&f.0).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn cstr_passes_a_terminated_buffer_and_nulls_an_unterminated_one() {
+        let named = *b"h3.wq\0junk";
+        // SAFETY: each call reads at most the `len` bytes of `named` it is given.
+        unsafe {
+            assert_eq!(wukong_rt_cstr(named.as_ptr(), 10), named.as_ptr());
+            assert_eq!(cstr_lossy(wukong_rt_cstr(named.as_ptr(), 10)), "h3.wq");
+            assert!(
+                wukong_rt_cstr(named.as_ptr(), 5).is_null(),
+                "the NUL is past `len`"
+            );
+            assert!(wukong_rt_cstr(named.as_ptr(), 0).is_null());
+            assert_eq!(cstr_lossy(std::ptr::null()), "");
+            assert!(crate::rt_path(std::ptr::null()).is_none());
+        }
     }
 
     #[test]

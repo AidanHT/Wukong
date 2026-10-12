@@ -1,0 +1,286 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 318
+// EXPECT-OUT: 514
+// EXPECT-OUT: 6
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -2000
+// EXPECT-OUT: 3000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -250
+// EXPECT-OUT: 8000
+// EXPECT-OUT: 4
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -500
+// EXPECT-OUT: 3140
+// EXPECT-OUT: 65504000
+// EXPECT-OUT: 32
+// EXPECT-OUT: -80
+// EXPECT-OUT: -75
+// EXPECT-OUT: -70
+// EXPECT-OUT: -65
+// EXPECT-OUT: -60
+// EXPECT-OUT: -55
+// EXPECT-OUT: -50
+// EXPECT-OUT: -45
+// EXPECT-OUT: -40
+// EXPECT-OUT: -35
+// EXPECT-OUT: -30
+// EXPECT-OUT: -25
+// EXPECT-OUT: -20
+// EXPECT-OUT: -15
+// EXPECT-OUT: -10
+// EXPECT-OUT: -5
+// EXPECT-OUT: 0
+// EXPECT-OUT: 5
+// EXPECT-OUT: 10
+// EXPECT-OUT: 15
+// EXPECT-OUT: 20
+// EXPECT-OUT: 25
+// EXPECT-OUT: 30
+// EXPECT-OUT: 35
+// EXPECT-OUT: 40
+// EXPECT-OUT: 45
+// EXPECT-OUT: 50
+// EXPECT-OUT: 55
+// EXPECT-OUT: 60
+// EXPECT-OUT: 65
+// EXPECT-OUT: 70
+// EXPECT-OUT: 75
+// EXPECT-OUT: 32
+// EXPECT-OUT: 16
+// EXPECT-OUT: 14
+// EXPECT-OUT: 12
+// EXPECT-OUT: 10
+// EXPECT-OUT: 8
+// EXPECT-OUT: 6
+// EXPECT-OUT: 4
+// EXPECT-OUT: 2
+// EXPECT-OUT: 0
+// EXPECT-OUT: -2
+// EXPECT-OUT: -4
+// EXPECT-OUT: -6
+// EXPECT-OUT: -8
+// EXPECT-OUT: -10
+// EXPECT-OUT: -12
+// EXPECT-OUT: -14
+// EXPECT-OUT: -14
+// EXPECT-OUT: -12
+// EXPECT-OUT: -10
+// EXPECT-OUT: -8
+// EXPECT-OUT: -6
+// EXPECT-OUT: -4
+// EXPECT-OUT: -2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 6
+// EXPECT-OUT: 8
+// EXPECT-OUT: 10
+// EXPECT-OUT: 12
+// EXPECT-OUT: 14
+// EXPECT-OUT: 16
+// EXPECT-OUT: 34
+// EXPECT-OUT: 0
+// EXPECT-OUT: 56
+// EXPECT-OUT: 240
+// EXPECT-OUT: 15
+// EXPECT-OUT: 3
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: -4
+// EXPECT-OUT: 2
+// EXPECT-OUT: 16
+// EXPECT-OUT: -5
+// EXPECT-OUT: -4
+// EXPECT-OUT: 9
+// EXPECT-OUT: -4
+// EXPECT-OUT: -3
+// EXPECT-OUT: -7
+// EXPECT-OUT: -5
+// EXPECT-OUT: -1
+// EXPECT-OUT: 8
+// EXPECT-OUT: -6
+module tests.run.io_gguf
+
+// `gguf_read_<T>(path, name, buf)` loads one tensor of a GGUF file (llama.cpp's checkpoint
+// container) and dequantizes ggml's block formats into f32; `gguf_find` / `gguf_rank` /
+// `gguf_dim` / `gguf_type` query its tensor table. The file is assembled byte by byte below with
+// `write_u8` (nothing is recorded from a backend), so every expected value is the payload's own
+// definition:
+//   header: "GGUF", version 3, 5 tensors, 3 metadata pairs (a string, `general.alignment` = 16 as a
+//     u32, an i32 array) -- the tensor table ends at byte 318, the data starts at 320 (the next
+//     multiple of 16), and the file is 320 + 194 = 514 bytes.
+//   w  F32  ne [3, 2] (so the tensor is [2, 3]) at data offset 0  = 1 -2 3 0.5 -0.25 8
+//   h  F16  ne [4]  at 32 = bits 3C00 B800 4248 7BFF = 1 -0.5 3.140625 65504
+//   q8 Q8_0 ne [32] at 48 = scale f16 3800 (0.5), quants q_j = j - 16 -> value (j - 16) * 0.5
+//   q4 Q4_0 ne [32] at 96 = scale f16 C000 (-2), byte j = j | (15 - j) << 4 -> element j is
+//      (j - 8) * -2 and element j + 16 is (7 - j) * -2
+//   iq IQ2_XXS ne [256] at 128 = 66 zero bytes (a grid-based i-quant: no dequantizer here)
+//  1. w into a `Tensor[f32, 2, 3]` parameter, verbatim (printed times 1000).
+//  2. h widened exactly into f32 (times 1000, truncated: 3140.625 -> 3140).
+//  3. q8 dequantized (times 10) and q4 dequantized, every lane.
+//  4. q8's raw block bytes into a `[u8; 34]`: scale bytes 00 38, then the quants (-16 is 240).
+//  5. The table queries: q4 is tensor 3; w has rank 2 and dims [2, 3] outermost first; dimension 2
+//     does not exist (-4); q4 is ggml type 2 (Q4_0) and iq type 16; an absent name is -5.
+//  6. Errors, each leaving the destination untouched: w into a `Tensor[f32, 3, 2]` (-4), w into 5
+//     elements (-4), Q8_0 into i32 (-3), the i-quant into f32 (-7), an absent name (-5), an absent
+//     file (-1), and an 8-byte file whose version is 1 (-6).
+
+// Store the low `n` bytes of `v` little-endian at byte `at`; returns the cursor after them.
+fn put_le(mut buf: []u8, at: i64, v: i64, n: i64) -> i64 {
+    let mut x: i64 = v;
+    let mut k: i64 = 0;
+    while k < n {
+        buf[at + k] = (x & 255) as u8;
+        x = x >> 8;
+        k = k + 1;
+    }
+    return at + n;
+}
+
+// A GGUF string at byte `at`: the u64 byte length of the NUL-terminated `s`, then its bytes.
+fn put_gstr(mut buf: []u8, at: i64, s: *u8) -> i64 {
+    let mut n: i64 = 0;
+    while s[n] != 0 {
+        buf[at + 8 + n] = s[n];
+        n = n + 1;
+    }
+    put_le(buf, at, n, 8);
+    return at + 8 + n;
+}
+
+// One tensor-table entry: name, rank, the dims innermost first (`ne1 == 0` means rank 1), the ggml
+// type and the data-section offset.
+fn put_tensor(mut buf: []u8, at: i64, name: *u8, ne0: i64, ne1: i64, ty: i64, off: i64) -> i64 {
+    let mut c: i64 = put_gstr(buf, at, name);
+    if ne1 > 0 {
+        c = put_le(buf, c, 2, 4);
+        c = put_le(buf, c, ne0, 8);
+        c = put_le(buf, c, ne1, 8);
+    } else {
+        c = put_le(buf, c, 1, 4);
+        c = put_le(buf, c, ne0, 8);
+    }
+    c = put_le(buf, c, ty, 4);
+    return put_le(buf, c, off, 8);
+}
+
+fn load_w(path: *u8, mut t: Tensor[f32, 2, 3]) -> i64 {
+    return gguf_read_f32(path, "w", t);
+}
+
+fn load_w_as_3x2(path: *u8, mut t: Tensor[f32, 3, 2]) -> i64 {
+    return gguf_read_f32(path, "w", t);
+}
+
+fn main() -> i32 {
+    let path: *u8 = "io_test_gguf.bin";
+    let mut f: []u8 = alloc_u8(514);
+    let mut c: i64 = put_le(f, 0, 0x46554747, 4);
+    c = put_le(f, c, 3, 4);
+    c = put_le(f, c, 5, 8);
+    c = put_le(f, c, 3, 8);
+    c = put_gstr(f, c, "general.architecture");
+    c = put_le(f, c, 8, 4);
+    c = put_gstr(f, c, "tiny");
+    c = put_gstr(f, c, "general.alignment");
+    c = put_le(f, c, 4, 4);
+    c = put_le(f, c, 16, 4);
+    c = put_gstr(f, c, "tiny.dims");
+    c = put_le(f, c, 9, 4);
+    c = put_le(f, c, 5, 4);
+    c = put_le(f, c, 2, 8);
+    c = put_le(f, c, 3, 4);
+    c = put_le(f, c, -2, 4);
+    c = put_tensor(f, c, "w", 3, 2, 0, 0);
+    c = put_tensor(f, c, "h", 4, 0, 1, 32);
+    c = put_tensor(f, c, "q8", 32, 0, 8, 48);
+    c = put_tensor(f, c, "q4", 32, 0, 2, 96);
+    c = put_tensor(f, c, "iq", 256, 0, 16, 128);
+    print(c);
+    let base: i64 = 320;
+    put_le(f, base, 0x3F800000, 4);
+    put_le(f, base + 4, 0xC0000000, 4);
+    put_le(f, base + 8, 0x40400000, 4);
+    put_le(f, base + 12, 0x3F000000, 4);
+    put_le(f, base + 16, 0xBE800000, 4);
+    put_le(f, base + 20, 0x41000000, 4);
+    put_le(f, base + 32, 0x3C00, 2);
+    put_le(f, base + 34, 0xB800, 2);
+    put_le(f, base + 36, 0x4248, 2);
+    put_le(f, base + 38, 0x7BFF, 2);
+    put_le(f, base + 48, 0x3800, 2);
+    for j in 0i64..32 {
+        put_le(f, base + 50 + j, j - 16, 1);
+    }
+    put_le(f, base + 96, 0xC000, 2);
+    for j in 0i64..16 {
+        put_le(f, base + 98 + j, j + (15 - j) * 16, 1);
+    }
+    print(write_u8(path, f));
+
+    let mut w: [f32; 6] = [0.0; 6];
+    print(load_w(path, w));
+    for i in 0..6 {
+        print((w[i] * 1000.0) as i32);
+    }
+
+    let mut h: [f32; 4] = [0.0; 4];
+    print(gguf_read_f32(path, "h", h));
+    for i in 0..4 {
+        print((h[i] * 1000.0) as i32);
+    }
+
+    let mut q8: [f32; 32] = [0.0; 32];
+    print(gguf_read_f32(path, "q8", q8));
+    for i in 0..32 {
+        print((q8[i] * 10.0) as i32);
+    }
+
+    let mut q4: [f32; 32] = [0.0; 32];
+    print(gguf_read_f32(path, "q4", q4));
+    for i in 0..32 {
+        print(q4[i] as i32);
+    }
+
+    let mut raw: [u8; 34] = [0; 34];
+    print(gguf_read_u8(path, "q8", raw));
+    print(raw[0] as i32);
+    print(raw[1] as i32);
+    print(raw[2] as i32);
+    print(raw[33] as i32);
+
+    print(gguf_find(path, "q4"));
+    print(gguf_rank(path, "w"));
+    print(gguf_dim(path, "w", 0));
+    print(gguf_dim(path, "w", 1));
+    print(gguf_dim(path, "w", 2));
+    print(gguf_type(path, "q4"));
+    print(gguf_type(path, "iq"));
+    print(gguf_find(path, "nope"));
+
+    let mut wt: [f32; 6] = [9.0; 6];
+    print(load_w_as_3x2(path, wt));
+    print(wt[0] as i32);
+    let mut five: []f32 = alloc_f32(5);
+    print(gguf_read_f32(path, "w", five));
+    let mut qi: [i32; 32] = [0; 32];
+    print(gguf_read_i32(path, "q8", qi));
+    let mut iq: []f32 = alloc_f32(256);
+    print(gguf_read_f32(path, "iq", iq));
+    print(gguf_read_f32(path, "missing", w));
+    print(gguf_read_f32("io_test_gguf_absent_zz.bin", "w", w));
+    let mut bad: []u8 = alloc_u8(8);
+    put_le(bad, 0, 0x46554747, 4);
+    put_le(bad, 4, 1, 4);
+    print(write_u8("io_test_gguf_bad.bin", bad));
+    print(gguf_read_f32("io_test_gguf_bad.bin", "w", w));
+
+    free(f);
+    free(five);
+    free(iq);
+    free(bad);
+    return 0;
+}

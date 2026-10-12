@@ -188,7 +188,14 @@ pub use scatter::{wukong_scatter_add_f32, wukong_scatter_add_f32_parallel};
 // The ML builtins' runtime: one module per family (see each module's docs). Public, because the
 // interpreter calls their pure helpers directly.
 pub mod fileio;
-pub use fileio::{wukong_rt_file_size, wukong_rt_read_dt, wukong_rt_write_dt};
+pub use fileio::{wukong_rt_cstr, wukong_rt_file_size, wukong_rt_read_dt, wukong_rt_write_dt};
+pub mod gguf;
+pub use gguf::{
+    wukong_rt_gguf_meta, wukong_rt_gguf_meta_f64, wukong_rt_gguf_meta_str, wukong_rt_gguf_query,
+    wukong_rt_gguf_read,
+};
+pub mod mmap;
+pub use mmap::wukong_rt_map;
 pub mod npy;
 pub use npy::wukong_rt_npy_read;
 pub mod random;
@@ -694,8 +701,9 @@ pub extern "C" fn wukong_rt_alloc(count: i64, elem_size: i64, _elem_is_float: i6
     }
 }
 
-/// Release an allocation previously returned by [`wukong_rt_alloc`] (the Wukong `free(s)`
-/// builtin). Null — the zero-length or failed allocation — is a no-op. Passing any other pointer,
+/// Release an allocation previously returned by [`wukong_rt_alloc`] or a memory-mapped slice from
+/// [`mmap::wukong_rt_map`] (the Wukong `free(s)` builtin). Null — the zero-length or failed
+/// allocation — is a no-op. Passing any other pointer,
 /// double-freeing, or touching the slice after the free is **undefined behavior** on the native
 /// backend; the interpreter ignores a free of anything that is not a live block (and reuses a
 /// freed block, re-zeroed, for the next allocation that fits it), so such programs never crash
@@ -709,6 +717,10 @@ pub extern "C" fn wukong_rt_alloc(count: i64, elem_size: i64, _elem_is_float: i6
 pub extern "C" fn wukong_rt_free(data: *mut u8) {
     // SAFETY-EXEMPT: `data` is null or a `wukong_rt_alloc` pointer -- a handle, not an extent.
     if data.is_null() {
+        return;
+    }
+    // A memory-mapped `map_<T>` slice is unmapped, not handed to the heap (`mmap.rs`).
+    if mmap::release(data) {
         return;
     }
     // SAFETY: `data` came from `wukong_rt_alloc`, whose header records the total layout size.

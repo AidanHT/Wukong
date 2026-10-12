@@ -138,6 +138,12 @@ not duplicate them. In summary, Wukong:
   `Q8_0`/`Q4_0` packers and GEMVs check their geometry against their operands at run time
   (`tests/run/decode_*.wk`); `sdpa_kv_batch` attends a padded batch of sequences with a compile-time
   shape signature and per-sequence key-length masks.
+- **Checkpoints in, shape-checked at load time.** `st_read_<T>` (safetensors), `npy_read_<T>`
+  (`.npy`) and `gguf_read_<T>` (llama.cpp GGUF) compare the stored dtype and every dimension with the
+  destination `Tensor[…]` as they load; a GGUF tensor in ggml's `Q4_0`…`Q8_0` or K-quant blocks
+  dequantizes into `f32`, or loads its raw blocks for the quantized GEMVs. `map_<T>` /
+  `st_map_<T>` / `npy_map_<T>` / `gguf_map_<T>` instead map a file or one tensor copy-on-write, so
+  only the pages a run touches are ever read (`tests/run/io_{safetensors,npy,gguf,map}.wk`).
 - **Zero hidden cost.** No GC, no implicit copies of large aggregates, no surprise allocations.
 - **Domain-aware optimization (implementation today).** The compiler **recognizes a matmul nest** (the
   `ikj` accumulate and `ijk` dot-product forms, incl. `nn.Linear` `A·Bᵀ`, written naively or
@@ -175,10 +181,10 @@ not duplicate them. In summary, Wukong:
 
 Wukong compiles and runs **GPT-2 124M inference end-to-end as an ordinary `.wk` program**
 ([`examples/gpt2_infer.wk`](examples/gpt2_infer.wk)) on the native Cranelift-JIT backend. It loads the
-**real pretrained OpenAI GPT-2 weights** — all **124,439,808** parameters — from a flat little-endian
-f32 blob on disk (exported from HuggingFace `transformers` by
-[`tools/export_gpt2.py`](tools/export_gpt2.py)) through the new `read_f32` file-I/O intrinsic, with the
-prompt's token ids read via `read_i32`, and runs the full forward pass in Wukong source: token +
+**real pretrained OpenAI GPT-2 weights** — all **124,439,808** parameters — **by name** from a
+safetensors file on disk (exported from HuggingFace `transformers` by
+[`tools/export_gpt2.py`](tools/export_gpt2.py)): each tensor goes through `st_read_f32`, which checks
+its name, dtype and element count as it loads, with the prompt's token ids read via `read_i32`, and runs the full forward pass in Wukong source: token +
 learned positional embedding, 12 pre-LayerNorm decoder blocks (biased QKV, 12-head causal attention,
 tanh-GELU MLP, residuals), the final LayerNorm, and the tied LM head → logits `[5, 50257]`.
 
@@ -186,13 +192,15 @@ tanh-GELU MLP, residuals), the final LayerNorm, and the tied LM head → logits 
 logits with the exported HuggingFace reference and reports `max|Δ| / max|ref|`. Its existing gate
 requires relative error at most `1e-3` and both last-position argmaxes to equal **1757 (" John")**
 for *"Hello, my name is"*. Earlier documentation quoted conflicting relative errors without a
-shared run receipt; those figures are withdrawn. The current CPU closeout has not rerun the full
-model, so it establishes no fresh GPT-2 numerical result.
+shared run receipt; those figures are withdrawn. One fresh receipt (2026-10-12,
+`gap6/tensor-io-gguf`, `--backend=native` at `-O2` and `-O0`, weights loaded by name from the
+safetensors file): `verify_gpt2.py` reports relative error `1.46e-6` and argmax 1757, and the logits
+are bit-identical to the same program's flat-blob load.
 
 Reproduce it — one export, one run, one check — from the repo root:
 
 ```sh
-python tools/export_gpt2.py                             # HF GPT-2 → data/gpt2/*.bin (+ reference logits)
+python tools/export_gpt2.py                             # HF GPT-2 → data/gpt2/ (.safetensors, .bin, reference logits)
 wukongc --run --backend=native examples/gpt2_infer.wk   # runs the model, writes logits to disk
 python tools/verify_gpt2.py                             # reports this run's error and argmax; exits nonzero on failure
 ```

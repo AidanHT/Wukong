@@ -1,6 +1,7 @@
 //! Lowering of the ML I/O and randomness builtins that `wukong_sema::ml_builtins` types: typed file
-//! I/O over every element type, the safetensors / `.npy` container readers, the Philox4x32-10
-//! counter-based RNG, and the top-k / argsort / categorical-sampling kernels.
+//! I/O over every element type, the safetensors / `.npy` / GGUF container readers and the GGUF
+//! tensor-table queries, the Philox4x32-10 counter-based RNG, and the top-k / argsort /
+//! categorical-sampling kernels.
 //!
 //! **Calls.** Every builtin but the RNG scalars lowers to one opaque `Op::Call` of a
 //! `wukong_runtime` entry. Integer operands are widened to `i64` (by their own signedness), float
@@ -21,6 +22,11 @@
 //! (`wukong_rt_read_f32`, …), so their MIR is unchanged; every other element type and every
 //! offset read goes through the dtype-coded `wukong_rt_read_dt` / `wukong_rt_write_dt`.
 //!
+//! **Maps.** `map_<T>` / `st_map_<T>` / `npy_map_<T>` / `gguf_map_<T>` lower to one
+//! `wukong_rt_map(path, name, container, dtype, &len) -> data` call (a whole-file map passes the
+//! path again for the unused name) and a fresh `{ data, len }` slice — the shape `alloc_<T>` builds,
+//! so the result is freed by `free`.
+//!
 //! **RNG.** `rand_u32` / `rand_f32` / `randn_f32` lower to plain integer MIR — the Philox round is a
 //! 32×32→64 multiply (`zext`, `mul`, `lshr`, `trunc`), xors and adds — so they need no runtime call,
 //! are bit-identical on every backend by construction, and are safe in a `@parallel` region (no
@@ -29,11 +35,13 @@
 
 use wukong_ast::Expr;
 use wukong_mir::{BinOp, CastKind, MirType, Op, ValueId};
-use wukong_sema::{io_dtype_code, ml_builtin, ml_builtin_is_pure, DefKind, MlBuiltin};
+use wukong_sema::{
+    io_dtype_code, ml_builtin, ml_builtin_is_pure, DefKind, GgufMeta, GgufQuery, MlBuiltin,
+};
 use wukong_span::{Interner, Symbol};
 use wukong_types::{Scalar, Ty};
 
-use crate::{FnLowerer, SLICE_LEN_OFF, SLICE_PTR_OFF};
+use crate::{FnLowerer, SLICE_LEN_OFF, SLICE_PTR_OFF, SLICE_SIZE};
 
 /// Philox4x32 round multipliers and key increments — `wukong_runtime::random`'s constants (this
 /// crate does not depend on the runtime; the interpreter's differential test pins the lowering to
@@ -55,6 +63,13 @@ pub(crate) struct MlSyms {
     file_size: Symbol,
     st_read: Symbol,
     npy_read: Symbol,
+    gguf_read: Symbol,
+    gguf_query: Symbol,
+    gguf_meta: Symbol,
+    gguf_meta_f64: Symbol,
+    gguf_meta_str: Symbol,
+    map: Symbol,
+    cstr: Symbol,
     rand_fill: Symbol,
     topk: Symbol,
     argsort: Symbol,
@@ -69,6 +84,13 @@ impl MlSyms {
             file_size: interner.intern("wukong_rt_file_size"),
             st_read: interner.intern("wukong_rt_st_read"),
             npy_read: interner.intern("wukong_rt_npy_read"),
+            gguf_read: interner.intern("wukong_rt_gguf_read"),
+            gguf_query: interner.intern("wukong_rt_gguf_query"),
+            gguf_meta: interner.intern("wukong_rt_gguf_meta"),
+            gguf_meta_f64: interner.intern("wukong_rt_gguf_meta_f64"),
+            gguf_meta_str: interner.intern("wukong_rt_gguf_meta_str"),
+            map: interner.intern("wukong_rt_map"),
+            cstr: interner.intern("wukong_rt_cstr"),
             rand_fill: interner.intern("wukong_rand_fill_f32"),
             topk: interner.intern("wukong_topk_f32"),
             argsort: interner.intern("wukong_argsort_f32"),
@@ -123,7 +145,7 @@ impl FnLowerer<'_> {
                 if args.len() != 2 {
                     return None;
                 }
-                let path = self.lower_expr(&args[0]);
+                let path = self.ml_str(&args[0]);
                 let buf = self.ml_buffer(&args[1])?;
                 let read = matches!(b, MlBuiltin::Read(_));
                 if let Some(func) = self.ml_frozen_symbol(t, read) {
@@ -141,7 +163,7 @@ impl FnLowerer<'_> {
                 if args.len() != 3 {
                     return None;
                 }
-                let path = self.lower_expr(&args[0]);
+                let path = self.ml_str(&args[0]);
                 let off = self.ml_i64_arg(&args[1]);
                 let buf = self.ml_buffer(&args[2])?;
                 let dt = self.ml_i64_const(io_dtype_code(t));
@@ -151,28 +173,109 @@ impl FnLowerer<'_> {
                 if args.len() != 1 {
                     return None;
                 }
-                let path = self.lower_expr(&args[0]);
+                let path = self.ml_str(&args[0]);
                 Some(self.ml_call(syms.file_size, vec![path]))
             }
-            MlBuiltin::StRead(t) => {
+            MlBuiltin::StRead(t) | MlBuiltin::GgufRead(t) => {
                 if args.len() != 3 {
                     return None;
                 }
-                let path = self.lower_expr(&args[0]);
-                let tensor = self.lower_expr(&args[1]);
+                let path = self.ml_str(&args[0]);
+                let tensor = self.ml_str(&args[1]);
                 let buf = self.ml_buffer(&args[2])?;
                 let dt = self.ml_i64_const(io_dtype_code(t));
                 let (dims, rank) = self.ml_dims_arg(&buf);
-                Some(self.ml_call(
-                    syms.st_read,
-                    vec![path, tensor, buf.data, buf.len, dt, dims, rank],
-                ))
+                let func = match b {
+                    MlBuiltin::StRead(_) => syms.st_read,
+                    _ => syms.gguf_read,
+                };
+                Some(self.ml_call(func, vec![path, tensor, buf.data, buf.len, dt, dims, rank]))
+            }
+            MlBuiltin::GgufQuery(q) => {
+                let dim = q == GgufQuery::Dim;
+                if args.len() != 2 + usize::from(dim) {
+                    return None;
+                }
+                let path = self.ml_str(&args[0]);
+                let tensor = self.ml_str(&args[1]);
+                let what = self.ml_i64_const(q.code());
+                let k = if dim {
+                    self.ml_i64_arg(&args[2])
+                } else {
+                    self.ml_i64_const(0)
+                };
+                Some(self.ml_call(syms.gguf_query, vec![path, tensor, what, k]))
+            }
+            MlBuiltin::GgufMeta(m) => {
+                let value = !matches!(m, GgufMeta::Type | GgufMeta::Len);
+                if args.len() != 2 + 2 * usize::from(value) {
+                    return None;
+                }
+                let path = self.ml_str(&args[0]);
+                let key = self.ml_str(&args[1]);
+                let i = if value {
+                    self.ml_i64_arg(&args[2])
+                } else {
+                    self.ml_i64_const(0)
+                };
+                Some(match m {
+                    GgufMeta::F64 => {
+                        let d = self.ml_f64_arg(&args[3]);
+                        self.builder.build(
+                            MirType::F64,
+                            Op::Call {
+                                func: syms.gguf_meta_f64,
+                                args: vec![path, key, i, d],
+                            },
+                        )
+                    }
+                    GgufMeta::Str => {
+                        let buf = self.ml_buffer(&args[3])?;
+                        self.ml_call(syms.gguf_meta_str, vec![path, key, i, buf.data, buf.len])
+                    }
+                    _ => {
+                        let what = self.ml_i64_const(m.code());
+                        let d = if value {
+                            self.ml_i64_arg(&args[3])
+                        } else {
+                            self.ml_i64_const(0)
+                        };
+                        self.ml_call(syms.gguf_meta, vec![path, key, what, i, d])
+                    }
+                })
+            }
+            MlBuiltin::Map(src, t) => {
+                if args.len() != 1 + usize::from(src.named()) {
+                    return None;
+                }
+                let path = self.ml_str(&args[0]);
+                // The whole-file maps have no name; the runtime reads the operand only for the
+                // named containers, so the path stands in for it.
+                let name = if src.named() {
+                    self.ml_str(&args[1])
+                } else {
+                    path
+                };
+                let kind = self.ml_i64_const(src.code());
+                let dt = self.ml_i64_const(io_dtype_code(t));
+                let len_slot = self.builder.alloca(MirType::I64);
+                let data = self.builder.build(
+                    MirType::Ptr,
+                    Op::Call {
+                        func: syms.map,
+                        args: vec![path, name, kind, dt, len_slot],
+                    },
+                );
+                let len = self
+                    .builder
+                    .build(MirType::I64, Op::Load(len_slot, MirType::I64));
+                Some(self.ml_slice(data, len))
             }
             MlBuiltin::NpyRead(t) => {
                 if args.len() != 2 {
                     return None;
                 }
-                let path = self.lower_expr(&args[0]);
+                let path = self.ml_str(&args[0]);
                 let buf = self.ml_buffer(&args[1])?;
                 let dt = self.ml_i64_const(io_dtype_code(t));
                 let (dims, rank) = self.ml_dims_arg(&buf);
@@ -257,6 +360,46 @@ impl FnLowerer<'_> {
         })
     }
 
+    /// A string operand (a path or a tensor name): a `*u8` as it is; a `[]u8` / `[u8; N]` buffer
+    /// through `wukong_rt_cstr(data, len)`, which yields the buffer's data pointer only when a NUL
+    /// lies inside it — so a name `sprintf` wrote reaches the runtime as the C string it holds, and
+    /// a buffer with no terminator as the null string (an open failure for a path, the empty name),
+    /// never as a read past its end.
+    fn ml_str(&mut self, e: &Expr) -> ValueId {
+        if matches!(self.expr_ty(e), Ty::Slice(_) | Ty::Array { .. }) {
+            if let Some(buf) = self.ml_buffer(e) {
+                let func = self.gemm.ml.cstr;
+                return self.builder.build(
+                    MirType::Ptr,
+                    Op::Call {
+                        func,
+                        args: vec![buf.data, buf.len],
+                    },
+                );
+            }
+        }
+        self.lower_expr(e)
+    }
+
+    /// A fresh 16-byte slice fat pointer `{ data, len }` — the value-position slice convention
+    /// `alloc_<T>` builds, so the result binds, passes, indexes and `free`s like any `[]T`.
+    fn ml_slice(&mut self, data: ValueId, len: ValueId) -> ValueId {
+        let sbuf = self
+            .builder
+            .alloca(MirType::Array(Box::new(MirType::I8), SLICE_SIZE as u32));
+        let dp = self.field_ptr(sbuf, SLICE_PTR_OFF);
+        self.builder.build_void(Op::Store {
+            ptr: dp,
+            value: data,
+        });
+        let lp = self.field_ptr(sbuf, SLICE_LEN_OFF);
+        self.builder.build_void(Op::Store {
+            ptr: lp,
+            value: len,
+        });
+        sbuf
+    }
+
     /// An `i64`-returning runtime call.
     pub(crate) fn ml_call(&mut self, func: Symbol, args: Vec<ValueId>) -> ValueId {
         self.builder.build(MirType::I64, Op::Call { func, args })
@@ -273,6 +416,14 @@ impl FnLowerer<'_> {
         let signed = self.signed(e);
         let v = self.lower_expr(e);
         self.coerce_to(v, &from, &MirType::I64, signed)
+    }
+
+    /// A float operand converted to `f64`.
+    fn ml_f64_arg(&mut self, e: &Expr) -> ValueId {
+        let from = self.expr_mir(e);
+        let signed = self.signed(e);
+        let v = self.lower_expr(e);
+        self.coerce_to(v, &from, &MirType::F64, signed)
     }
 
     /// A float operand converted to `f32`.
@@ -580,6 +731,45 @@ pub(crate) mod tests {
         );
         assert_eq!(calls(&prog, &it, "wukong_rt_write_f32"), 0);
         assert_eq!(calls(&prog, &it, "wukong_rt_read_f32"), 0);
+    }
+
+    /// A program that names its file in a `*u8` local keeps its kernels: the alias planner reads a
+    /// string literal as fresh storage. It used to taint the whole function (`let p: *u8 = …` is a
+    /// view binding whose initializer it could not classify), so the fused-bias GEMM below — and
+    /// every projection of `examples/gpt2_infer.wk` once it held its checkpoint path in a local —
+    /// fell back to the scalar loop.
+    #[test]
+    fn a_path_local_does_not_cost_the_functions_kernels() {
+        let nest = "fn main() -> i32 { \
+                    let mut a: []f32 = alloc_f32(15); \
+                    let mut w: []f32 = alloc_f32(64); \
+                    let mut b: []f32 = alloc_f32(4); \
+                    let mut c: []f32 = alloc_f32(12); \
+                    PATH \
+                    for i in 0..3 { for j in 0..4 { \
+                      let mut s: f32 = 0.0; \
+                      for p in 0..5 { s = s + a[i * 5 + p] * w[j * 5 + p]; } \
+                      c[i * 4 + j] = b[j] + s; \
+                    } } \
+                    free(a); free(w); free(b); free(c); return 0; }";
+        for (path, what) in [
+            ("", "no path"),
+            (
+                "let p: *u8 = \"w.bin\"; print(file_size(p));",
+                "a *u8 path local",
+            ),
+            (
+                "let mut q: [u8; 8] = [0; 8]; sprintf(q, \"w.bin\"); print(file_size(q));",
+                "a buffer path",
+            ),
+        ] {
+            let (sema, lower, prog, it) = check_and_lower(&nest.replace("PATH", path));
+            assert!(
+                sema.is_empty() && lower.is_empty(),
+                "{what}: {sema:?} {lower:?}"
+            );
+            assert_eq!(calls(&prog, &it, "wukong_sgemm_nt_epi"), 1, "{what}");
+        }
     }
 
     /// Control: the same budget-spent module at `T = f32` lowers cleanly to the runtime calls.
