@@ -116,7 +116,9 @@ not duplicate them. In summary, Wukong:
   `-O2` removes the checks from counted loops by versioning them on one preheader guard, and
   `@unchecked` on a `fn` is the explicit opt-out. Runtime indices into fixed-size arrays and
   constant-shape tensors, and the extents handed to recognized runtime kernels, are not yet checked.
-  A pointer used as a condition (`if p`) is a null test.
+  A pointer used as a condition (`if p`) is a null test. A failed `assert(cond)` names its site the
+  same way (`assertion failed at file:line:col`, or `assertion failed: msg at …` for
+  `assert(cond, "msg")`), on the interpreter, the JIT and a linked executable alike.
 - **128-bit integers.** `i128` and `u128` are first-class: literals up to `u128::MAX` (range-checked
   at every width), wrapping arithmetic, division and shifts with the same zero-divisor, `MIN / -1`
   and modulo-width rules as every other integer, once-rounded float conversions, struct fields,

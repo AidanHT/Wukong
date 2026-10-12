@@ -1206,19 +1206,22 @@ pub fn lower_program(
 /// examples, both benches, every backend's tests) want the defaults and should not have to say so.
 ///
 /// Runtime safety failures (a slice index out of bounds) carry no source location through this
-/// entry point; [`lower_program_located`] attaches one.
+/// entry point, and a failed `assert(cond)` keeps its bare one-operand call (no site operand at
+/// all, so every MIR consumer that never had a source map sees exactly the call it always did);
+/// [`lower_program_located`] attaches both.
 pub fn lower_program_with(
     module: &Module,
     sema: &SemaResult,
     interner: &mut Interner,
     opts: LowerOptions,
 ) -> (Program, Vec<Diagnostic>) {
-    lower_program_located(module, sema, interner, opts, &|_| String::new())
+    lower_program_impl(module, sema, interner, opts, None, false)
 }
 
 /// [`lower_program_with`], plus the source location every runtime safety failure reports.
 /// `locate` renders a span start as `file:line:col` (an empty string means "unknown"); the driver
-/// passes its source map's view, so an out-of-bounds slice access prints where it happened on the
+/// passes its source map's view, so an out-of-bounds slice access and a failed `assert` (or a
+/// kernel builtin's extent check, which traps through it) print where they happened on the
 /// interpreter, the JIT and a linked executable alike. A separate entry point for the same reason
 /// `lower_program_with` is one: only the driver has a source map to offer.
 pub fn lower_program_located(
@@ -1228,7 +1231,7 @@ pub fn lower_program_located(
     opts: LowerOptions,
     locate: &dyn Fn(Span) -> String,
 ) -> (Program, Vec<Diagnostic>) {
-    lower_program_impl(module, sema, interner, opts, locate, false)
+    lower_program_impl(module, sema, interner, opts, Some(locate), false)
 }
 
 /// [`lower_program_with`], plus one `note` diagnostic per recognized kernel dispatch: at each
@@ -1242,7 +1245,7 @@ pub fn lower_program_reporting_dispatch(
     interner: &mut Interner,
     opts: LowerOptions,
 ) -> (Program, Vec<Diagnostic>) {
-    lower_program_reporting_dispatch_located(module, sema, interner, opts, &|_| String::new())
+    lower_program_impl(module, sema, interner, opts, None, true)
 }
 
 /// [`lower_program_reporting_dispatch`] with [`lower_program_located`]'s source locations — what
@@ -1255,7 +1258,7 @@ pub fn lower_program_reporting_dispatch_located(
     opts: LowerOptions,
     locate: &dyn Fn(Span) -> String,
 ) -> (Program, Vec<Diagnostic>) {
-    lower_program_impl(module, sema, interner, opts, locate, true)
+    lower_program_impl(module, sema, interner, opts, Some(locate), true)
 }
 
 fn lower_program_impl(
@@ -1263,7 +1266,7 @@ fn lower_program_impl(
     sema: &SemaResult,
     interner: &mut Interner,
     opts: LowerOptions,
-    locate: &dyn Fn(Span) -> String,
+    locate: Option<&dyn Fn(Span) -> String>,
     report: bool,
 ) -> (Program, Vec<Diagnostic>) {
     // The outlined-region symbols must be interned before lowering starts (the lowerer holds only a
@@ -1291,7 +1294,7 @@ fn lower_program_pooled(
     sema: &SemaResult,
     interner: &mut Interner,
     opts: LowerOptions,
-    locate: &dyn Fn(Span) -> String,
+    locate: Option<&dyn Fn(Span) -> String>,
     report: bool,
     pool: usize,
 ) -> (Program, Vec<Diagnostic>, bool) {
@@ -1386,6 +1389,9 @@ fn lower_program_pooled(
         // No versioning context until `emit_alias_versioned` opens one around a single emitter.
         guard: KernelGuard::Off,
         report,
+        // A failed `assert` names its call site only when there is a source map to render one;
+        // without it the call keeps its historical one-operand form (`lower_program_with`).
+        assert_sites: locate.is_some(),
         resume: false,
         proven_end: None,
         mm: interner.intern("wukong_sgemm"),
@@ -2516,12 +2522,20 @@ fn lower_program_pooled(
     // The outlined bodies of every mid-function `@parallel` loop region, collected while lowering
     // the functions above. Appended last — backends resolve functions by name, so order is free.
     program.funcs.append(&mut par_regions.funcs);
-    // Give every slice bounds failure its `file:line:col` (a `.rodata` string; see `bounds.rs`).
+    // Give every slice bounds failure, range and UTF-8 check failure and failed `assert` its
+    // `file:line:col` (a `.rodata` string; see `bounds.rs`). Each entry is (callee, arity, index of
+    // the site operand); an `assert` carries its site second, before an optional message.
+    let no_locator = |_: Span| String::new();
     bounds::attach_sites(
         &mut program,
         interner,
-        &[(gemm.bounds_fail, 3), (gemm.check_fail, 4)],
-        locate,
+        &[
+            (gemm.bounds_fail, 3, 2),
+            (gemm.check_fail, 4, 3),
+            (gemm.assert_fn, 2, 1),
+            (gemm.assert_fn, 3, 1),
+        ],
+        locate.unwrap_or(&no_locator),
     );
     (program, diags, par_regions.exhausted)
 }
@@ -3725,6 +3739,12 @@ struct GemmSyms {
     println_u: Symbol,
     /// The `assert` intrinsic, through which a kernel builtin's runtime extent check traps.
     assert_fn: Symbol,
+    /// Whether an `assert` call carries its source site: `assert(cond, site)` (`bounds.rs`
+    /// rewrites the placeholder into a `.rodata` `file:line:col`). Set when the caller supplied a
+    /// source locator ([`lower_program_located`]); without one the call stays `assert(cond)`.
+    /// Rides here because this struct already reaches every lowerer, the kernel-builtin checks
+    /// ([`FnLowerer::emit_builtin_checks`]) among them.
+    assert_sites: bool,
     nt: Symbol,
     nt_par: Symbol,
     /// The transposed-A weight-gradient kernel (`wukong_sgemm_tn[_parallel]`): `C = Aᵀ·B`, where A is
@@ -22171,9 +22191,15 @@ impl FnLowerer<'_> {
         // param → an ICE the verifier/`mem2reg` rejected). A unit/statement match has no value to
         // merge and just falls through. (A genuinely value-producing match always has a
         // value-producing arm that branches to `merge`, so the merge param never lacks a provider.)
+        //
+        // The trap names the `match` (`bounds.rs`, `emit_match_fallthrough_trap`): a failed
+        // `assert` whose message is `no `match` arm matched its value`, before the `unreachable`.
         if !handled_default && !self.terminated {
             match merge_param {
-                Some(_) => self.builder.set_term(wukong_mir::Terminator::Unreachable),
+                Some(_) => {
+                    self.emit_match_fallthrough_trap(e.span);
+                    self.builder.set_term(wukong_mir::Terminator::Unreachable)
+                }
                 None => {
                     self.builder.br(merge, vec![]);
                     merge_reachable = true;
@@ -23811,11 +23837,24 @@ impl FnLowerer<'_> {
                     // `cond != 0.0` (an `i1`) so a fractional `assert(0.5)` is *true* on both
                     // backends, rather than native truncating `0.5 -> 0` and trapping while the
                     // interpreter's `f != 0.0` passes. The integer/`i1` path is unchanged.
-                    if nm == "assert" && args.len() == 1 {
+                    //
+                    // A failure names its site: with a source locator the call is
+                    // `assert(cond, site)`, or `assert(cond, site, message)` for the
+                    // `assert(cond, "message")` form sema admits, whose message is the literal's
+                    // `.rodata` blob (`bounds.rs`).
+                    let message = match args.get(1).map(|a| &a.kind) {
+                        Some(ExprKind::Str(s)) => Some(*s),
+                        _ => None,
+                    };
+                    if nm == "assert" && (args.len() == 1 || (args.len() == 2 && message.is_some()))
+                    {
                         let c = self.lower_bool_cond(&args[0]);
+                        let message = message.map(|s| self.str_literal_data(s).0);
+                        let mut call_args = vec![c];
+                        call_args.extend(self.assert_site_operands(e.span, message));
                         self.builder.build_void(Op::Call {
                             func: name,
-                            args: vec![c],
+                            args: call_args,
                         });
                         return self.const_zero(MirType::I32);
                     }

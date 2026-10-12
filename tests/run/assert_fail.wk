@@ -1,7 +1,8 @@
 // RUN: --run
 // EXPECT-EXIT: 1
 // EXPECT-OUT-NONE
-// EXPECT-STDERR: assertion failed
+// EXPECT-STDERR: assertion failed at
+// EXPECT-STDERR: assert_fail.wk:22:5
 module tests.run.assert_fail
 
 /// A failing assertion traps with a nonzero exit code and no stdout.
@@ -11,8 +12,8 @@ module tests.run.assert_fail
 /// that stopped compiling produced byte-identically the asserted outcome — exit 1, empty stdout —
 /// and this, the corpus's only proof that a failing `assert` traps at all, was green. The stderr
 /// substring separates the two: a compile error says `error[Ennnn]`, a trapped assert says
-/// `assertion failed` (`wukong_interp/src/lib.rs:1229` and `wukong_driver/src/lib.rs:802`; the
-/// Cranelift JIT raises the same string at `wukong_codegen_cranelift/src/lib.rs:3656`).
+/// `assertion failed at <file>:<line>:<col>` — the site of the `assert` call (line 22, column 5
+/// below), which every CPU backend reports through `wukong_runtime::assert_failure_message`.
 ///
 /// `EXPECT-OUT-NONE` pins the other half the docstring claimed and nothing checked: stdout empty.
 /// It is a positive assertion, not the absence of a directive — the absence used to mean the

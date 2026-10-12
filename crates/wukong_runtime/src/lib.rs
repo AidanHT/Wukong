@@ -230,8 +230,8 @@ pub use bias::{wukong_bias_bcast_f32, wukong_bias_bcast_f32_parallel, BIAS_ACT_N
 
 mod safety;
 pub use safety::{
-    bounds_failure_message, check_failure_message, site_str, wukong_rt_bounds_fail,
-    wukong_rt_check_fail, CHECK_RANGE_END, CHECK_RANGE_ORDER, CHECK_UTF8,
+    assert_failure_message, bounds_failure_message, check_failure_message, site_str,
+    wukong_rt_bounds_fail, wukong_rt_check_fail, CHECK_RANGE_END, CHECK_RANGE_ORDER, CHECK_UTF8,
 };
 
 /// UTF-8 validation, decoding and counting for the `str` operations, shared by the interpreter,

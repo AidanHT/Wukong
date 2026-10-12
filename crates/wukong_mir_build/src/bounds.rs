@@ -29,11 +29,19 @@
 //! source id and start offset, and [`attach_sites`] — run once by `lower_program_located`, which
 //! owns the interner and the caller's source locator — rewrites each placeholder into the
 //! `GlobalAddr` of a deduplicated static string.
+//!
+//! A failed `assert` reports its site the same way: with a source locator the intrinsic call is
+//! `assert(cond, site)`, or `assert(cond, site, message)` for `assert(cond, "message")`, whose
+//! message operand is the literal's own `.rodata` blob. Every CPU backend hands both to
+//! `wukong_runtime::assert_failure_message`. A kernel builtin's run-time extent check traps through
+//! the same intrinsic ([`FnLowerer::emit_builtin_checks`]), so it names the builtin call, and so
+//! does a value `match` no arm of which matched ([`FnLowerer::emit_match_fallthrough_trap`]),
+//! naming the `match`.
 
 use wukong_mir::{CmpOp, MirType, Op, Program, StaticData, ValueId};
 use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet, Interner, SourceId, Span, Symbol};
 
-use crate::{FnLowerer, SLICE_LEN_OFF};
+use crate::{DefKind, FnLowerer, SLICE_LEN_OFF};
 
 /// The placeholder site operand for `span`: source id in the high half, start offset in the low.
 /// A compiler-synthesized node (dummy span) gets `-1`, which [`attach_sites`] renders as no site.
@@ -56,6 +64,63 @@ fn site_span(key: i128) -> Option<Span> {
 }
 
 impl FnLowerer<'_> {
+    /// The placeholder site operand of a runtime failure at `span` (an `i64` constant
+    /// [`attach_sites`] rewrites into the address of its `file:line:col` string).
+    pub(crate) fn site_placeholder(&mut self, span: Span) -> ValueId {
+        self.builder
+            .build(MirType::I64, Op::ConstInt(site_key(span), MirType::I64))
+    }
+
+    /// The operands after the condition of an `assert` call at `span`: its site placeholder when
+    /// the lowering has a source locator (or a message needs the slot), then `message` — the
+    /// address of the call's message literal — when it has one. Empty for a bare `assert(cond)`
+    /// lowered without a locator, which keeps the call's historical one-operand form.
+    pub(crate) fn assert_site_operands(
+        &mut self,
+        span: Span,
+        message: Option<ValueId>,
+    ) -> Vec<ValueId> {
+        let mut ops = Vec::new();
+        if self.gemm.assert_sites || message.is_some() {
+            ops.push(self.site_placeholder(span));
+        }
+        ops.extend(message);
+        ops
+    }
+
+    /// The block a value `match` falls into when no arm matched (one sema could not prove
+    /// exhaustive, so it keeps every test -- a zero-filled `let e: E;` of an enum with no
+    /// discriminant 0 reaches it): stop the run through the `assert` intrinsic, naming the `match`
+    /// at `span` (`assertion failed: no `match` arm matched its value at file:line:col`) before the
+    /// block's `unreachable`. That terminator alone was `execution reached unreachable` on the
+    /// interpreter and a hardware trap natively (`SIGILL`: the process killed, its output lost).
+    /// Without a source locator the call is a bare `assert(false)`; when a user function named
+    /// `assert` shadows the intrinsic, nothing is emitted and the block keeps its bare trap.
+    pub(crate) fn emit_match_fallthrough_trap(&mut self, span: Span) {
+        let assert_fn = self.gemm.assert_fn;
+        if matches!(
+            self.sema.defs.lookup(assert_fn).map(|d| &d.kind),
+            Some(DefKind::Fn(_))
+        ) {
+            return;
+        }
+        let never = self
+            .builder
+            .build(MirType::I1, Op::ConstInt(0, MirType::I1));
+        let mut args = vec![never];
+        if self.gemm.assert_sites {
+            args.push(self.site_placeholder(span));
+            args.push(self.builder.build(
+                MirType::I64,
+                Op::ConstInt(MATCH_FALLTHROUGH_KEY, MirType::I64),
+            ));
+        }
+        self.builder.build_void(Op::Call {
+            func: assert_fn,
+            args,
+        });
+    }
+
     /// Emit the bounds check for a slice access whose fat pointer is at `sbuf` and whose already
     /// lowered `i64` index is `idx`, leaving the builder in the in-bounds continuation block. A
     /// no-op inside an `@unchecked` function.
@@ -72,9 +137,7 @@ impl FnLowerer<'_> {
         let fail = self.builder.new_block();
         self.builder.cond_br(ok, cont, vec![], fail, vec![]);
         self.builder.switch_to(fail);
-        let site = self
-            .builder
-            .build(MirType::I64, Op::ConstInt(site_key(span), MirType::I64));
+        let site = self.site_placeholder(span);
         let func = self.gemm.bounds_fail;
         self.builder.build_void(Op::Call {
             func,
@@ -132,9 +195,7 @@ impl FnLowerer<'_> {
         let k = self
             .builder
             .build(MirType::I64, Op::ConstInt(i128::from(kind), MirType::I64));
-        let site = self
-            .builder
-            .build(MirType::I64, Op::ConstInt(site_key(span), MirType::I64));
+        let site = self.site_placeholder(span);
         let func = self.gemm.check_fail;
         self.builder.build_void(Op::Call {
             func,
@@ -145,6 +206,14 @@ impl FnLowerer<'_> {
     }
 }
 
+/// The message placeholder of a `match` that no arm matched ([`attach_sites`] rewrites it into the
+/// address of [`MATCH_FALLTHROUGH_MESSAGE`]). Negative and below the dummy site key (-1), so no
+/// span's key is ever mistaken for it.
+const MATCH_FALLTHROUGH_KEY: i128 = -2;
+
+/// The message a `match` that no arm matched fails with.
+const MATCH_FALLTHROUGH_MESSAGE: &str = "no `match` arm matched its value";
+
 /// `wukong_rt_check_fail` kinds — the values of `wukong_runtime::safety::CHECK_*`, which this crate
 /// does not depend on; the run fixtures that print each message pin the pairing end to end
 /// (`tests/run/str_slice_bounds.wk`, `str_range_order.wk`, `str_from_utf8_invalid.wk`).
@@ -153,26 +222,45 @@ pub(crate) const CHECK_RANGE_END: i64 = 2;
 pub(crate) const CHECK_UTF8: i64 = 3;
 
 /// Rewrite every failure call's placeholder site operand into the address of a static
-/// `file:line:col` string, deduplicated by content. `failures` names each failure entry with its
-/// arity; the site is its last operand (`wukong_rt_bounds_fail(index, len, site)`,
-/// `wukong_rt_check_fail(kind, a, b, site)`). `locate` renders a span start; an empty string
-/// means "no site" and the runtime message then omits it.
+/// `file:line:col` string, deduplicated by content. `failures` names each failure entry as
+/// `(callee, arity, site operand index)`: `wukong_rt_bounds_fail(index, len, site)`,
+/// `wukong_rt_check_fail(kind, a, b, site)`, and the `assert` intrinsic's `assert(cond, site)` /
+/// `assert(cond, site, message)`. `locate` renders a span start; an empty string means "no site"
+/// and the runtime message then omits it. The operand after an `assert`'s site is its message: a
+/// literal's blob already, or the compiler's own [`MATCH_FALLTHROUGH_KEY`] placeholder, rewritten
+/// here into a blob of [`MATCH_FALLTHROUGH_MESSAGE`].
+///
+/// A callee the program itself defines is skipped: a user function named `assert` shadows the
+/// intrinsic, and its integer arguments are the program's values, not placeholders.
 pub(crate) fn attach_sites(
     program: &mut Program,
     interner: &mut Interner,
-    failures: &[(Symbol, usize)],
+    failures: &[(Symbol, usize, usize)],
     locate: &dyn Fn(Span) -> String,
 ) {
+    let defined: HashSet<Symbol> = program.funcs.iter().map(|f| f.name).collect();
+    let failures: Vec<(Symbol, usize, usize)> = failures
+        .iter()
+        .copied()
+        .filter(|(callee, _, _)| !defined.contains(callee))
+        .collect();
     let mut by_text: HashMap<String, Symbol> = HashMap::default();
     let mut statics: Vec<StaticData> = Vec::new();
     for f in &mut program.funcs {
-        // The placeholder site operand of every bounds-failure call in this function.
+        // The placeholder site operand of every runtime-failure call in this function, and the
+        // operand after it (an `assert`'s message) where there is one.
         let mut placeholders: HashSet<u32> = HashSet::default();
+        let mut messages: HashSet<u32> = HashSet::default();
         for b in &f.blocks {
             for inst in &b.insts {
                 if let Op::Call { func, args } = &inst.op {
-                    if failures.contains(&(*func, args.len())) {
-                        placeholders.insert(args[args.len() - 1].0);
+                    for &(callee, arity, site) in &failures {
+                        if *func == callee && args.len() == arity {
+                            placeholders.insert(args[site].0);
+                            if let Some(m) = args.get(site + 1) {
+                                messages.insert(m.0);
+                            }
+                        }
                     }
                 }
             }
@@ -183,13 +271,16 @@ pub(crate) fn attach_sites(
         for b in &mut f.blocks {
             for inst in &mut b.insts {
                 let Some(r) = inst.result else { continue };
-                if !placeholders.contains(&r.0) {
-                    continue;
-                }
                 let Op::ConstInt(key, MirType::I64) = inst.op else {
                     continue;
                 };
-                let text = site_span(key).map(locate).unwrap_or_default();
+                let text = if placeholders.contains(&r.0) {
+                    site_span(key).map(locate).unwrap_or_default()
+                } else if messages.contains(&r.0) && key == MATCH_FALLTHROUGH_KEY {
+                    MATCH_FALLTHROUGH_MESSAGE.to_string()
+                } else {
+                    continue;
+                };
                 let sym = *by_text.entry(text).or_insert_with_key(|text| {
                     let name = interner.intern(&format!("wukong$loc${}", statics.len()));
                     let mut bytes = text.as_bytes().to_vec();

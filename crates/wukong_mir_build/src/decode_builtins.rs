@@ -200,7 +200,7 @@ impl FnLowerer<'_> {
         let ok = self
             .builder
             .build(MirType::I1, Op::Cmp(CmpOp::Eq, status, zero));
-        if !self.emit_builtin_checks(vec![ok]) {
+        if !self.emit_builtin_checks(vec![ok], span) {
             self.unsupported(
                 span,
                 "a decode builtin in a program that defines its own `assert`",
@@ -297,7 +297,7 @@ impl FnLowerer<'_> {
                     .build(MirType::I1, Op::Cmp(CmpOp::Eq, buf.len, count)),
             );
         }
-        if !self.emit_builtin_checks(checks) {
+        if !self.emit_builtin_checks(checks, e.span) {
             self.unsupported(
                 e.span,
                 "a decode builtin in a program that defines its own `assert`",

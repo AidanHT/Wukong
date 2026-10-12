@@ -28,7 +28,15 @@ only the `wukong_*` kernels, a link error), and `exe.rs` compares a slice of the
 executables with `--run`. A runtime failure (a failed `assert`, a slice index out of bounds) stops
 the program at the same statement on every path — interpreter, JIT, linked executable, and inside
 a `@parallel` region (the earliest failing iteration is reported) — keeping the output printed
-before it, with exit status 1 (`tests/run/assert_fail_trailing_output.wk`).
+before it, with exit status 1 (`tests/run/assert_fail_trailing_output.wk`). Every such trap names
+its source site on every CPU path: a failed `assert` (`assertion failed at file:line:col`, with an
+optional literal message, `assert(cond, "msg")`), a kernel builtin's run-time extent check (which
+traps through `assert` and names the builtin call), a value `match` no arm of which matched, a
+slice index out of bounds, a range index and `str_from_utf8`
+(`crates/wukongc/tests/runtime_sites.rs`). 🟡 `--backend=gpu-native` still reports a bare
+`assertion failed`: it keeps one assert-failed flag on the device and is handed a copy of the
+program without the site operands (`wukong_opt::strip_assert_sites`). It stops at a `match` no arm
+matched as well, rather than failing the launch with a CUDA error.
 Cranelift provides JIT execution with `--run --backend=native` and object/exe output with
 `--emit=obj|exe`, with **no LLVM toolchain required**. See `BENCHMARKS.md` for cross-language numbers.
 `--target-cpu=<native|x86-64|x86-64-v2|x86-64-v3|x86-64-v4>` picks the instruction-set level of that

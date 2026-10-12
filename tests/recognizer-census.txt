@@ -43,6 +43,7 @@ array_repeat_aggregate_once.wk:
 assert.wk:
 assert_fail.wk:
 assert_fail_trailing_output.wk:
+assert_message.wk:
 atan.wk: wukong_vmath_f32
 atan2_hypot.wk: wukong_vmath2_f32
 atomic_add_histogram.wk: veckernel*1 wukong_parallel_for wukong_parallel_for*4 wukong_rt_alloc wukong_rt_free
@@ -338,6 +339,7 @@ match_exhaustive_fallthrough.wk:
 match_expr.wk:
 match_guard_order.wk:
 match_guard_truthy.wk:
+match_no_arm_trap.wk:
 match_pattern_widths.wk:
 match_patterns.wk:
 match_tuple.wk:

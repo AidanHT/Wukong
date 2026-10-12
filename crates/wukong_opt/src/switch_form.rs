@@ -42,12 +42,16 @@
 //! *certain* miss and gives no verdict on a `match` it cannot reason about — a range bound that is
 //! not a literal, an integer pattern on a tagged union, a pattern of the wrong type, or a
 //! scrutinee whose zero value (an uninitialized `let e: E;` of an enum with no discriminant 0) no
-//! arm models — so such a `match` is accepted with a fall-through that real inputs may reach, and
-//! `lower_match` ends that fall-through in `unreachable`. The interpreter, which is the language
-//! specification, stops there with "execution reached `unreachable`", and native code traps.
-//! Treating the edge as dead would turn that loud stop into a silently wrong arm at `-O1` and
-//! above. So a chain whose last test falls into a trap keeps the trap as the `switch`'s default; a
-//! jump table makes that default free anyway.
+//! arm models — so such a `match` is accepted with a fall-through that real inputs may reach.
+//! `lower_match` makes that fall-through a stop: `emit_match_fallthrough_trap` (mir_build's
+//! `bounds.rs`) calls the `assert` intrinsic with a false condition, naming the `match`, and the
+//! block ends in `unreachable` after it (only the `unreachable` when a user function named
+//! `assert` shadows the intrinsic). Every CPU backend stops there the way a failed `assert`
+//! stops (``assertion failed: no `match` arm matched its value at <site>``, exit 1), and
+//! gpu-native sets its assert flag and exits. Treating the edge as dead would turn that loud stop into a
+//! silently wrong arm at `-O1` and above. So a chain whose last test falls into the trap keeps the
+//! trap as the `switch`'s default, which is what keeps `-O0` and `-O2` in agreement; a jump table
+//! makes that default free anyway.
 
 use wukong_mir::{
     switch_case_value, BlockId, CmpOp, Function, Op, SwitchCase, Terminator, ValueId,

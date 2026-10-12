@@ -2621,7 +2621,20 @@ impl<'a, 'k> Interp<'a, 'k> {
                 if ok {
                     Ok(Value::Unit)
                 } else {
-                    Err("assertion failed".to_string())
+                    // `assert(cond, site[, message])`: the lowering appends the call's `.rodata`
+                    // `file:line:col` (when it had a source map) and the message literal (when the
+                    // program wrote one); a bare `assert(cond)` carries neither. The runtime's one
+                    // formatter words it, as for the JIT and a linked executable.
+                    let text = |i: usize| -> Result<String, String> {
+                        match args.get(i).copied() {
+                            Some(Value::Ptr(base)) if !self.is_null(base) => {
+                                file_read_path(&self.memory, base)
+                            }
+                            _ => Ok(String::new()),
+                        }
+                    };
+                    let (site, message) = (text(1)?, text(2)?);
+                    Err(wukong_runtime::assert_failure_message(&site, &message))
                 }
             }
             // `wukong_rt_bounds_fail(index, len, site)` — the failure edge of a checked slice access
@@ -7538,6 +7551,63 @@ mod tests {
         assert!(
             err.contains("null pointer dereference (atomic add)"),
             "{err}"
+        );
+    }
+
+    /// N89: a failed `assert` reports the site the lowering attached (and its message literal),
+    /// and so does a value `match` no arm matched, naming the `match`, instead of reaching a bare
+    /// `unreachable`. Without a source locator a bare `assert(cond)` keeps its old message.
+    #[test]
+    fn a_failed_assert_and_an_unmatched_match_name_their_sites() {
+        let run_src = |src: &str, located: bool| -> Result<i64, String> {
+            let mut sm = wukong_span::SourceMap::new();
+            let id = sm.add("t.wk".to_string(), src.to_string());
+            let mut interner = Interner::new();
+            let (module, pd) = wukong_parser::parse_module(src, id, &mut interner);
+            assert!(pd.is_empty(), "parse: {pd:?}");
+            let (sema, sd) = wukong_sema::check(&module, &interner);
+            assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
+            let locate = |span: wukong_span::Span| {
+                let loc = sm.span_location(span);
+                format!("{}:{}:{}", sm.name(span.source), loc.line, loc.col)
+            };
+            let opts = wukong_mir_build::LowerOptions::default();
+            let (program, ld) = if located {
+                wukong_mir_build::lower_program_located(
+                    &module,
+                    &sema,
+                    &mut interner,
+                    opts,
+                    &locate,
+                )
+            } else {
+                wukong_mir_build::lower_program_with(&module, &sema, &mut interner, opts)
+            };
+            assert!(ld.iter().all(|d| !d.is_error()), "lower: {ld:?}");
+            let main = interner.intern("main");
+            run(&program, main, &interner)
+        };
+        let bare = "fn main() -> i32 {\n    assert(1 > 2);\n    return 0;\n}\n";
+        assert_eq!(
+            run_src(bare, true),
+            Err("assertion failed at t.wk:2:5".to_string())
+        );
+        assert_eq!(run_src(bare, false), Err("assertion failed".to_string()));
+        assert_eq!(
+            run_src(
+                "fn main() -> i32 {\n    assert(1 > 2, \"one is not two\");\n    return 0;\n}\n",
+                true
+            ),
+            Err("assertion failed: one is not two at t.wk:2:5".to_string())
+        );
+        // `    return ` is 11 characters, so the `match` opens column 12 of line 4.
+        assert_eq!(
+            run_src(
+                "enum E { A = 1, B = 2 }\nfn main() -> i32 {\n    let e: E;\n    \
+                 return match e { E::A => 1, E::B => 2 };\n}\n",
+                true
+            ),
+            Err("assertion failed: no `match` arm matched its value at t.wk:4:12".to_string())
         );
     }
 }

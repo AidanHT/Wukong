@@ -390,3 +390,64 @@ fn a_run_time_check_failing_in_a_callee_stops_its_caller() {
         );
     }
 }
+
+/// N89: lowered with a source locator, a failed `assert` hands its `.rodata` site (and message
+/// literal) to `wukong_rt_assert`, so the JIT reports exactly the interpreter's text, at -O0 and
+/// after -O2 inlined the callee; a value `match` no arm matched stops the same way, naming the
+/// `match`, where it used to execute a hardware trap.
+#[test]
+fn failed_assert_and_unmatched_match_report_the_interpreters_site() {
+    let lower_located = |src: &str, opt: u8| {
+        let mut sm = wukong_span::SourceMap::new();
+        let id = sm.add("t.wk".to_string(), src.to_string());
+        let mut interner = Interner::new();
+        let (module, parsed) = wukong_parser::parse_module(src, id, &mut interner);
+        assert!(parsed.iter().all(|d| !d.is_error()), "{parsed:?}");
+        let (sema, checked) = wukong_sema::check(&module, &interner);
+        assert!(checked.iter().all(|d| !d.is_error()), "{checked:?}");
+        let locate = |span: wukong_span::Span| {
+            let loc = sm.span_location(span);
+            format!("{}:{}:{}", sm.name(span.source), loc.line, loc.col)
+        };
+        let (mut program, lowered) = wukong_mir_build::lower_program_located(
+            &module,
+            &sema,
+            &mut interner,
+            wukong_mir_build::LowerOptions::default(),
+            &locate,
+        );
+        assert!(lowered.iter().all(|d| !d.is_error()), "{lowered:?}");
+        wukong_opt::optimize(&mut program, opt);
+        assert!(wukong_mir::verify::verify_program(&program).is_empty());
+        let main = interner.intern("main");
+        (program, interner, main)
+    };
+    // Every site is read off its source: `assert` opens column 5 of line 2 in `check`; the
+    // `match` opens column 13 of line 3 in `pick` (`    let v = ` is 12 characters).
+    for (src, want) in [
+        (
+            "fn check(x: i32) -> i32 {\n    assert(x < 15, \"x must stay small\");\n    \
+             return x;\n}\nfn main() -> i32 { print(check(1)); print(check(20)); return 0; }\n",
+            "assertion failed: x must stay small at t.wk:2:5",
+        ),
+        (
+            "enum E { A = 1, B = 2 }\nfn pick(e: E) -> i32 {\n    let v = match e { E::A => 1, \
+             E::B => 2 };\n    return v;\n}\nfn main() -> i32 { let z: E; print(pick(E::B)); \
+             print(pick(z)); return 0; }\n",
+            "assertion failed: no `match` arm matched its value at t.wk:3:13",
+        ),
+    ] {
+        for opt in [0, 2] {
+            let (program, interner, main) = lower_located(src, opt);
+            let native = jit_compile(&program, main, &interner).unwrap();
+            assert_eq!(native.run().err().as_deref(), Some(want), "opt={opt}");
+            assert_eq!(
+                wukong_interp::run_with_output(&program, main, &interner)
+                    .err()
+                    .as_deref(),
+                Some(want),
+                "opt={opt}"
+            );
+        }
+    }
+}

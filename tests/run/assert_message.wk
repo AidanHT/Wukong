@@ -1,0 +1,29 @@
+// RUN: --run
+// EXPECT-EXIT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-STDERR: assertion failed: n must be even at
+// EXPECT-STDERR: assert_message.wk:19:5
+module tests.run.assert_message
+
+// `assert(cond, "message")`: a failed assertion prints its message literal after
+// `assertion failed:` and then the site of the `assert` call, on every CPU backend.
+//
+// * `half(4)` and `half(8)` pass and print 2 and 4.
+// * `half(7)`: 7 % 2 == 1, so the assertion on line 19 (column 5, the `assert`) fails before
+//   `half` returns; neither `main`'s third `print` nor the `print(99)` after it runs, and the
+//   exit status is 1.
+//
+// Stdout is therefore exactly 2, 4 (derived from the statement order above).
+fn half(n: i64) -> i64 {
+    assert(n % 2 == 0, "n must be even");
+    return n / 2;
+}
+
+fn main() -> i32 {
+    print(half(4));
+    print(half(8));
+    print(half(7));
+    print(99);
+    return 0;
+}
