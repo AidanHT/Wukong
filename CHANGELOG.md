@@ -53,6 +53,13 @@ All notable changes to Wukong are documented here. The format is loosely based o
   interpreter trap). They now run in a block only a matching discriminant reaches, which also
   guards an or-pattern's alternatives, an or-binding's re-tests and an `if let` chain's `let`s
   (`tests/run/variant_payload_slice_pattern.wk`).
+- **A `let` pattern the exhaustiveness analysis cannot place is checked by form.** The analysis is
+  silent on a non-wildcard sub-pattern over a type it has no constructors for (an array of more
+  than 32 elements, a struct of more than 32 fields), and that silence passed for "irrefutable"; a
+  `let` binds without testing, so `let [[a, ..]] = rows;` over a `[][f32; 64]` compiled and read
+  `a` through an empty slice's null data pointer, or out of a slice of three rows. Such a pattern is
+  now checked as a `for` head is: a slice length test, literal, range, path, or-pattern or
+  multi-variant enum variant anywhere inside is `E0442` (`tests/fail/slice_let_wide_element.wk`).
 - **A block arm body ends its arm.** `X => { … }` followed by an arm that opens with `[`, `(` or `-`
   parsed as an index into, a call of or a subtraction from the block, so the two arms needed a comma
   between them (which the formatter always prints); it is now two arms, as in Rust. No `.wk` file in

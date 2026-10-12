@@ -224,7 +224,8 @@ line table built from them is not emitted yet.
   a `match`; `if let P = e && c1 && c2` / `while let P = e && c` put the `&&` chain on the pattern's
   arm as its guard (Rust's let chains: a later `let Q = f` operand tests and binds for the operands
   after it and the block; a `||` after the condition is `E0200`),
-  and a plain `let` pattern must be irrefutable (`E0442`). The scrutinee is evaluated once and the
+  and a plain `let` pattern must be irrefutable (`E0442`; checked by form where the exhaustiveness
+  analysis cannot place the pattern, e.g. inside a `[f32; 64]`). The scrutinee is evaluated once and the
   whole `match` lowers to an if-else chain; a match sema proves exhaustive (over a type whose
   all-zero value the analysis models) takes its last unguarded arm untested — no compare and no
   trap, at every `-O` level and on every backend — so an exhaustive `bool` match is one branch. At

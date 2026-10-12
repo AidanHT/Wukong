@@ -763,7 +763,11 @@ exit — because the names its pattern binds do not exist on that path (`E0401` 
 `let` pattern, in turn, must be **irrefutable**: `let Shape::Circle(r) = s;` would leave `r` unbound
 for every other shape, so it is `E0442`, with a witness naming a value it misses
 (`tests/run/patterns_struct_binding_slice.wk`, `tests/fail/let_refutable_pattern.wk`,
-`tests/fail/let_else_not_diverging.wk`).
+`tests/fail/let_else_not_diverging.wk`). Where that analysis cannot see inside a type (an array of
+more than 32 elements, a struct of more than 32 fields), a `let` pattern is checked by its form, as
+a `for` head is: a literal, range, path, or-pattern, variant of a multi-variant enum, or array
+pattern listing an element of a `[]T` anywhere inside is `E0442` — `let [[a, ..]] = rows;` over a
+`[][f32; 64]` tests that `rows` has one row (`tests/fail/slice_let_wide_element.wk`).
 
 A literal pattern must be **in range for the scrutinee's type**: `match n { 200 => … }` against an
 `i8` is an `E0431` ("literal `200` is out of range for `i8` (-128..=127)"), not a value truncated to

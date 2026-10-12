@@ -3074,12 +3074,14 @@ impl<'a> Sema<'a> {
                 // What the binding views is read BEFORE the name is bound, so a shadowing view
                 // (`let a = a[0];`) still resolves its initializer to the parameter it reads.
                 self.note_tensor_view(pat, &bound, init.as_ref());
+                let before_bind = self.diags.len();
                 self.bind_pattern(pat, &bound);
+                let pattern_typed = !self.diags[before_bind..].iter().any(|d| d.is_error());
                 self.note_literal_binding(pat, ty.as_ref(), init.as_ref(), &bound);
                 // A `let` pattern must match every value (E0442; `let … else` is the refutable
                 // form, and the parser has already rewritten it).
                 if !matches!(pat.kind, PatKind::Ident(_) | PatKind::Wildcard) {
-                    self.check_irrefutable(pat, &bound, patterns::PatSite::Let);
+                    self.check_let_pattern(pat, &bound, pattern_typed);
                 }
                 if let Ty::Array {
                     shared: true,

@@ -1,0 +1,19 @@
+// EXPECT-CODE: E0442
+// EXPECT-COUNT: 1
+module tests.fail.slice_let_wide_element
+
+// A plain `let` binds without testing, so its pattern must match every value. `[[a, ..]]` lists
+// one row of a `[][f32; 64]`: a run-time length test (`len == 1`) that misses the empty slice and
+// every slice of two rows or more. The exhaustiveness analysis cannot split a 64-element array, so
+// it cannot name a missed value here; the pattern is checked by its form instead, as a `for` head
+// is, and an array pattern that lists an element of a `[]T` is refutable by form.
+fn first(rows: [][f32; 64]) -> f32 {
+    let [[a, ..]] = rows; //~ E0442
+    return a;
+}
+
+fn main() -> i32 {
+    let m: [[f32; 64]; 3] = [[1.0; 64]; 3];
+    print(first(m) as i32);
+    return 0;
+}

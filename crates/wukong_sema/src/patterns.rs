@@ -13,7 +13,9 @@
 //! * The `else` of a `let … else` must diverge — `return`, `break`, `continue`, or a `loop` with no
 //!   way out — since the names the pattern binds do not exist on that path.
 //! * A plain `let` pattern must be irrefutable (`E0442`, Rust's E0005): `let Shape::Circle { r } =
-//!   s;` would leave `r` unbound for every other shape. The witness names a value it misses.
+//!   s;` would leave `r` unbound for every other shape. The witness names a value it misses. A
+//!   pattern the analysis cannot place (inside an array of more than 32 elements, say) is checked
+//!   by form instead, as a `for` head is ([`Sema::check_let_pattern`]).
 //! * A destructuring `for` head (`for (i, x) in pairs`, `for Point { x, y } in pts`) binds each
 //!   element as `let <pat> = a[i];` would, over an array or slice only (`E0401` for a range or any
 //!   other iterand), and is never tested, so it must be irrefutable by its form (`E0442`).
@@ -297,6 +299,48 @@ impl Sema<'_> {
             .help(site.help()),
         );
         true
+    }
+
+    /// `E0442` when the pattern of a plain `let` does not match every value of `ty`.
+    ///
+    /// The usefulness analysis decides that for every pattern it can place, and is silent on one
+    /// it cannot: a non-wildcard sub-pattern on a type it has no constructors for, such as an
+    /// array of more than 32 elements or a struct of more than 32 fields. Silence was taken as
+    /// "irrefutable", but a `let` tests nothing — it binds each name at its place — so
+    /// `let [[a, ..]] = rows;` over a `[][f32; 64]` compiled, and bound `a` through the data
+    /// pointer of an empty slice (null) or out of a slice of three rows that `[x]` does not
+    /// match. A pattern the analysis cannot place is therefore checked by FORM, like a `for` head:
+    /// an array pattern listing an element of a `[]T` tests its length, and a literal, range,
+    /// path, or-pattern or variant of a multi-variant enum tests the value. (Such a pattern that
+    /// happens to cover every value, `true | false` on a `bool` field of a 33-field struct, is
+    /// rejected too: the rule leaves nothing for lowering to test.) `pattern_typed` is whether
+    /// binding the pattern reported no error: a pattern of the wrong type is unplaceable too, and
+    /// its own error is the one to read.
+    pub(crate) fn check_let_pattern(&mut self, pat: &Pattern, ty: &Ty, pattern_typed: bool) {
+        if self.check_irrefutable(pat, ty, PatSite::Let)
+            || !pattern_typed
+            || matches!(ty, Ty::Unknown | Ty::Error)
+            || usefulness::placeable(&self.defs, self.interner, ty, pat)
+        {
+            return;
+        }
+        let found = match self.slice_length_test(pat, ty) {
+            Some(r) => Some((r, "an array pattern on a `[]T` tests its length")),
+            None => refutable_form(pat, &self.defs).map(|r| {
+                (
+                    r,
+                    "a literal, range, path, or-pattern or enum variant tests the value",
+                )
+            }),
+        };
+        if let Some((r, what)) = found {
+            self.diags.push(
+                Diagnostic::error("refutable pattern in `let`: this pattern tests the value")
+                    .with_code("E0442")
+                    .primary(r.span, what)
+                    .help(PatSite::Let.help()),
+            );
+        }
     }
 
     /// The destructuring pattern of `for <pat> in <iter>` (anything but a name or `_`), whose
@@ -865,6 +909,48 @@ mod tests {
         );
         // A one-variant enum's variant is irrefutable.
         assert_clean("enum W { Only(i32) } fn f(w: W) -> i32 { let W::Only(v) = w; return v; }");
+    }
+
+    /// A `let` pattern the analysis cannot place — a non-wildcard sub-pattern on an array of more
+    /// than 32 elements or a struct of more than 32 fields — is checked by form, as a `for` head
+    /// is. The analysis used to be silent on it, which passed for "irrefutable", and a `let` binds
+    /// without testing: `let [[a, ..]] = rows` read `a` through an empty slice's null data pointer.
+    #[test]
+    fn an_unplaceable_let_pattern_is_checked_by_form() {
+        let fields: String = (0..33).map(|i| format!("x{i}: i32, ")).collect();
+        let big = format!("{SHAPE}struct Big {{ {fields}s: Shape }} ");
+        let refutable = |src: &str| {
+            let d = check(src);
+            assert!(
+                d.iter()
+                    .any(|d| d.code == Some("E0442")
+                        && d.message.contains("refutable pattern in `let`")),
+                "{src}: {d:?}"
+            );
+        };
+        // A length test on a `[]T` whose element the analysis cannot split.
+        refutable("fn f(rows: [][f32; 64]) -> f32 { let [[a, ..]] = rows; return a; }");
+        refutable(&format!(
+            "{big}fn f(bs: []Big) -> i32 {{ let [Big {{ x0, .. }}] = bs; return x0; }}"
+        ));
+        // A literal, and a variant of a multi-variant enum, inside the 33-field struct.
+        refutable(&format!(
+            "{big}fn f(b: Big) -> i32 {{ let Big {{ x0: 0, x1, .. }} = b; return x1; }}"
+        ));
+        refutable(&format!(
+            "{big}fn f(b: Big) -> i32 {{ let Big {{ s: Shape::Circle(r), .. }} = b; return r; }}"
+        ));
+        // Names, `_` and `..` stay irrefutable however wide the type.
+        assert_clean("fn f(a: [f32; 64]) -> f32 { let [x, .., y] = a; return x + y; }");
+        assert_clean(&format!(
+            "{big}fn f(b: Big) -> i32 {{ let Big {{ x0, x31: z, .. }} = b; return x0 + z; }}"
+        ));
+        // A pattern of the wrong type reports that, and nothing more.
+        let d = check(&format!(
+            "{SHAPE}{POINT}fn f(p: Point) -> i32 {{ let Shape::Circle(r) = p; return r; }}"
+        ));
+        let codes: Vec<_> = d.iter().filter_map(|d| d.code).collect();
+        assert_eq!(codes, ["E0401"], "{d:?}");
     }
 
     #[test]

@@ -169,6 +169,18 @@ pub(crate) fn refutable(
     Some(Witness { pattern, more })
 }
 
+/// Whether the analysis can place `pat` against a value of type `ty` at all. When it cannot,
+/// [`refutable`] answers `None` without having proved the pattern matches everything, and a caller
+/// that must not let a refutable pattern through decides by some other rule.
+pub(crate) fn placeable(defs: &DefMap, interner: &Interner, ty: &Ty, pat: &Pattern) -> bool {
+    let cx = Cx {
+        defs,
+        interner,
+        budget: BUDGET,
+    };
+    cx.lower(pat, ty).is_some()
+}
+
 /// How deep [`zero_value_modeled`] follows nested types before it gives up (answering `false`).
 const ZERO_DEPTH: u32 = 64;
 

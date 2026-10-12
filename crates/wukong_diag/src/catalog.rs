@@ -871,7 +871,11 @@ fn main() -> i32 {
         "The pattern of a plain `let` must match every value of its type, because the names it binds \
          have to exist afterwards. `let Shape::Circle { r } = s;` leaves `r` unbound when `s` is \
          any other shape, and `let (0, x) = t;` when `t.0` is not 0, so both are rejected; the \
-         diagnostic names a value the pattern misses, found by the same analysis as E0405. Use \
+         diagnostic names a value the pattern misses, found by the same analysis as E0405. Where \
+         that analysis cannot see inside the type (an array of more than 32 elements, a struct of \
+         more than 32 fields), the pattern is checked by form instead, as a `for` head is (below): \
+         `let [[a, ..]] = rows;` over a `[][f32; 64]` is rejected because `[x]` on a slice tests \
+         its length. Use \
          `let … else` to leave the enclosing function or loop when the value does not match — \
          `let Shape::Circle { r } = s else { return 0.0; };` — or a `match`. Destructuring patterns \
          that cannot fail are fine: a tuple, struct or array of names (`let (a, b) = t;`, \
@@ -880,7 +884,8 @@ fn main() -> i32 {
          (`for (i, x) in pairs`), which binds every element of an array or slice without testing \
          it: there it is checked by form, so a literal, range, path, or-pattern or variant of a \
          multi-variant enum anywhere inside (`for (0, x) in pairs`) is rejected even when it \
-         happens to cover every value. Match inside the loop body instead.",
+         happens to cover every value, and so is an array pattern that lists an element of a \
+         `[]T` (a run-time length test). Match inside the loop body instead.",
         bad: "module ex.e0442\nenum Shape { Circle(i32), Square(i32) }\nfn radius(s: Shape) -> i32 {\n    let Shape::Circle(r) = s;\n    return r;\n}\nfn main() -> i32 {\n    return radius(Shape::Circle(3));\n}\n",
         good: "module ex.e0442\nenum Shape { Circle(i32), Square(i32) }\nfn radius(s: Shape) -> i32 {\n    let Shape::Circle(r) = s else {\n        return 0;\n    };\n    return r;\n}\nfn main() -> i32 {\n    return radius(Shape::Circle(3));\n}\n"
     ),
