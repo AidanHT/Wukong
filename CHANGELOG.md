@@ -5,6 +5,52 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Parallel per-function optimization (`gap6/parallel-optimizer`, N61)
+
+- **The optimizer's per-function work runs on several threads, and its output does not depend on
+  how many.** Inlining, the call graph and the call-effect summaries stay whole-program, on the
+  calling thread. The fixpoint pipeline then goes one call-graph *level* at a time (an SCC's level
+  is one more than the deepest SCC it calls): every function of a level is optimized at once against
+  the summaries of all its callees, which are exactly the entries the one-SCC-at-a-time order showed
+  it, and the level's SCCs are summarized in SCC order afterwards. Unrolling, straight-line SLP,
+  their cleanup sweeps and switch formation run per function outright. Results go back in program
+  order, so the MIR is byte-identical for every thread count, and a verifier failure or a panic is
+  the one the sequential schedule meets first.
+- **`WUKONG_OPT_THREADS=<n>`** picks the count (`OptimizeOptions::threads`,
+  `PassManager::set_threads` in the library): `1` is the previous sequential schedule exactly;
+  unset or `0` is automatic — the host's parallelism, at most 8, used for a batch only when its
+  functions other than the largest hold 256 instructions or more; an explicit `n > 1` sends every
+  batch of two or more functions to the pool. `WUKONG_VEC_TRACE`/`WUKONG_SLP_TRACE` pin one thread
+  so their traces stay in program order. The pool is a private `rayon` pool with the compile
+  thread's 256 MiB stacks, never the global pool the runtime configures, and the calling thread
+  takes tasks too.
+- **Passes:** `PassManager::add_shared` takes a `Send + Sync` pass; a manager holding only such
+  passes may run functions in parallel, while one pass added with `add` (a counting or printing
+  wrapper) keeps it on the calling thread in the original order. The vectorizer's record of the
+  loops it already widened moved from the pass into the function's `CfgAnalyses`, and the
+  call-effect table is shared by `Arc`.
+- **Checked:** the determinism gate's `--emit=mir -O2`, `--emit=obj -O2` and `-g` sweeps run their
+  three fresh processes on 1, the automatic count and 4 threads, and a new arm compares
+  `--emit=mir -O1` (nothing inlined, so the widest levels) on 1 against 4 threads over the whole
+  corpus; `wukong_opt` tests compare 1, 2, 3 and 8 threads through the plain, verified and timed
+  entry points at `-O1` and `-O2`, the failure identity, and that a pass added with `add` never
+  leaves the calling thread. `--emit=mir` at `-O1` and `-O2` over `tests/run`, `examples` and
+  `bench/kernels` (606 programs) is byte-identical to the previous compiler at every count.
+- **Measured (debug build — an indication only; release numbers are still owed):** `optimize`
+  stage, best of 5, one thread → automatic: `reduction_canonical_tree.wk` 281 → 188 ms (1.50x),
+  `opt5_fuse_multiblock.wk` 122 → 94 ms (1.30x), `vec4_speculation_raw_pointer.wk` 105 → 86 ms
+  (1.23x), `vectorized_declines.wk` 397 → 360 ms (1.10x); at `-O1`, where nothing is inlined,
+  `opt5_fuse_multiblock.wk` 12.6 → 6.0 ms and `vectorized_declines.wk` 9.7 → 4.9 ms. Most programs
+  are one function once `-O2` has inlined (518 of the 605 corpus programs that lower), and those do
+  not change: `gpt2_forward_bench.wk` 439 → 439 ms. Over the whole corpus (606 programs, one
+  interleaved `-O2` pass) the stage sums to 33.2 s on one thread and 31.7 s automatic (1.05x).
+- `--time-passes` notes when functions ran on several threads (each pass's time is then summed over
+  them). `wukong_bench compile-work` counts the optimize stage on one thread, since its allocation
+  counters are per thread.
+- **Not done:** `mir_build` lowering stays sequential. It interns names as it lowers (outlined
+  regions, monomorphs, closure environments), so a per-function split needs a deterministic
+  interning plan before symbol numbering can stop depending on the schedule.
+
 ### Stack-slot coloring (`gap6/stack-coloring`)
 
 - **Allocas with disjoint lifetimes share one native frame slot (N86).** The Cranelift backend
