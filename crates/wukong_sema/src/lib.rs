@@ -1571,6 +1571,19 @@ impl<'a> Sema<'a> {
             }
             TypeKind::Tuple(items) => Ty::Tuple(items.iter().map(|i| self.lower_type(i)).collect()),
             TypeKind::Vector { elem, lanes } => match self.lower_type(elem) {
+                // No vector ISA has 128-bit integer lanes, and MIR has no vector of them.
+                Ty::Scalar(s) if s.is_128() => {
+                    self.error(
+                        t.span,
+                        "E0302",
+                        format!(
+                            "a SIMD vector cannot have `{}` lanes; the widest integer lane is 64 \
+                             bits",
+                            s.name()
+                        ),
+                    );
+                    Ty::Error
+                }
                 Ty::Scalar(s) => Ty::Vector {
                     elem: s,
                     lanes: *lanes,
@@ -3704,11 +3717,29 @@ impl<'a> Sema<'a> {
     }
 
     /// The pattern counterpart of [`Sema::range_check_int_literal`]: an integer literal *pattern* that
-    /// does not fit the scrutinee's narrow type. Same rule, same code, same wording — only types whose
-    /// whole range fits in `i64` are checked (i8..u32), so an `i64`/`u64`/`usize` scrutinee is never
-    /// flagged.
+    /// does not fit the scrutinee's narrow type. Same rule, same code, same wording — the narrow
+    /// types (i8..u32) by value, and through [`Sema::range_check_wide`] a 128-bit scrutinee's range
+    /// and any literal past `u64` — so a 64-bit literal on an `i64`/`u64`/`usize` scrutinee is
+    /// never flagged; a malformed pattern literal (past `u128`) is `E0431` as in an expression.
     fn range_check_int_pattern(&mut self, pat: &Pattern, ty: &Ty) {
         let Ty::Scalar(sc) = ty else { return };
+        if let PatKind::Int { sym, neg } = &pat.kind {
+            match parse_u128_text(self.sym_str(*sym)) {
+                Some(mag) => self.range_check_wide(pat.span, *sc, *neg, mag),
+                // A pattern literal past `u128` (or a garbled one) is malformed exactly as the same
+                // literal in an expression is; lowering would otherwise read it as `0`.
+                None if sc.is_int() => {
+                    let text = self.sym_str(*sym).to_string();
+                    self.error(
+                        pat.span,
+                        "E0431",
+                        format!("invalid integer literal `{text}`"),
+                    );
+                    return;
+                }
+                None => {}
+            }
+        }
         let Some((lo, hi)) = int_lit_range(*sc) else {
             return;
         };
@@ -4174,9 +4205,10 @@ impl<'a> Sema<'a> {
     }
 
     /// Diagnose an unsuffixed integer literal that does not fit the narrow type it adapts to
-    /// (`let x: i8 = 200;`). Only types whose whole range fits in `i64` are checked (i8..u32), and
-    /// only a literal `eval_const_int` can read (incl. a leading `-`) — so a runtime value, a float,
-    /// or an `i64`/`u64`/`usize` literal is never flagged. Rust rejects this; without it the value
+    /// (`let x: i8 = 200;`). Only types whose whole range fits in `i64` are checked by value (i8..u32),
+    /// and only a literal `eval_const_int` can read (incl. a leading `-`) — so a runtime value, a
+    /// float, or a 64-bit literal on an `i64`/`u64`/`usize` is never flagged; a 128-bit type's range,
+    /// and a literal past `u64` at any width, are [`Sema::range_check_wide`]'s. Rust rejects this; without it the value
     /// silently wraps (`200 as i8 == -56`), a quiet footgun in a safety-first language. Call at each
     /// site a literal adapts to a type — `let`, `const`, a struct-literal field, an argument, an
     /// assignment, a `return` (both spellings, inside `check_return_shape`) and a merge arm
@@ -4205,6 +4237,9 @@ impl<'a> Sema<'a> {
             _ => {}
         }
         let Ty::Scalar(sc) = ty else { return };
+        if let Some((neg, mag)) = wide_lit_value(e, self.interner) {
+            self.range_check_wide(e.span, *sc, neg, mag);
+        }
         let Some((lo, hi)) = int_lit_range(*sc) else {
             return;
         };
@@ -4220,6 +4255,50 @@ impl<'a> Sema<'a> {
                 );
             }
         }
+    }
+
+    /// The literal `-mag` (`neg`) or `mag` against the integer type `sc`, for the values the
+    /// `i64` evaluator behind [`Sema::range_check_int_literal`] cannot hold: a 128-bit type's
+    /// whole range, and any literal past `u64::MAX`, which fits no narrower type. A literal that
+    /// fits `i64`/`u64` is left to the narrow check (`i64`/`u64` themselves are not re-checked here,
+    /// as before: a 64-bit literal adapts to either signedness).
+    fn range_check_wide(&mut self, span: Span, sc: Scalar, neg: bool, mag: u128) {
+        if !sc.is_int() || sc == Scalar::Char {
+            return;
+        }
+        let neg = neg && mag != 0;
+        let fits = match sc {
+            Scalar::I128 => mag <= i128::MAX as u128 || (neg && mag == 1u128 << 127),
+            Scalar::U128 => !neg,
+            _ => mag <= u128::from(u64::MAX),
+        };
+        if fits {
+            return;
+        }
+        let (lo, hi) = match sc {
+            Scalar::I128 => (i128::MIN.to_string(), i128::MAX.to_string()),
+            Scalar::U128 => ("0".to_string(), u128::MAX.to_string()),
+            s => {
+                let bits = s.int_bits().unwrap_or(64);
+                if s.is_signed() {
+                    (
+                        (-(1i128 << (bits - 1))).to_string(),
+                        ((1i128 << (bits - 1)) - 1).to_string(),
+                    )
+                } else {
+                    ("0".to_string(), ((1u128 << bits) - 1).to_string())
+                }
+            }
+        };
+        let sign = if neg { "-" } else { "" };
+        self.error(
+            span,
+            "E0431",
+            format!(
+                "literal `{sign}{mag}` is out of range for `{}` ({lo}..={hi})",
+                sc.name()
+            ),
+        );
     }
 
     /// Validate a char/string literal's escapes, keeping the established split (sema validates
@@ -4262,25 +4341,11 @@ impl<'a> Sema<'a> {
         match &e.kind {
             ExprKind::Int(s) => {
                 // A malformed integer literal — a mistyped radix like `0z123`, an empty radix `0x`,
-                // a bad digit `0b2`, or a value beyond u64 — lexes as one `Int` token, fails to
+                // a bad digit `0b2`, or a value beyond u128 — lexes as one `Int` token, fails to
                 // parse, and used to lower *silently to 0* (both backends agreed on the wrong value,
                 // so the differential gate was blind). Reject it instead of miscompiling.
                 let text = self.sym_str(*s).to_string();
-                // `u128`/`i128` lex and parse as integer suffixes, but Wukong has no 128-bit
-                // integer, and `int_lit_scalar` knew neither: `5u128` became an unsuffixed `i32`
-                // that adapted to whatever was around it. (No hex digit is `i`/`u`, so a literal
-                // ending in one of these is always suffixed.) A malformed literal, so `E0431`.
-                if text.ends_with("u128") || text.ends_with("i128") {
-                    self.error(
-                        e.span,
-                        "E0431",
-                        format!(
-                            "integer literal `{text}` has a 128-bit suffix, but Wukong has no \
-                             128-bit integer type; the widest are `i64` and `u64`"
-                        ),
-                    );
-                    Ty::Error
-                } else if int_literal_well_formed(&text) {
+                if int_literal_well_formed(&text) {
                     Ty::Scalar(int_lit_scalar(&text))
                 } else {
                     self.error(e.span, "E0431", format!("invalid integer literal `{text}`"));
@@ -5175,6 +5240,7 @@ fn scalar_bits(s: Scalar) -> u32 {
         I16 | U16 | F16 | Bf16 => 16,
         I32 | U32 | F32 | Char => 32,
         I64 | U64 | Usize | Isize | F64 => 64,
+        I128 | U128 => 128,
     }
 }
 
@@ -5422,6 +5488,8 @@ fn int_lit_scalar(text: &str) -> Scalar {
     for (suf, sc) in [
         ("usize", Scalar::Usize),
         ("isize", Scalar::Isize),
+        ("i128", Scalar::I128),
+        ("u128", Scalar::U128),
         ("i8", Scalar::I8),
         ("i16", Scalar::I16),
         ("i32", Scalar::I32),
@@ -5452,7 +5520,13 @@ fn int_lit_scalar(text: &str) -> Scalar {
         // literal in `(i64::MAX, u64::MAX]`), default to u64; a value past u64 is malformed and is
         // already rejected by `int_literal_well_formed`, so the i32 fallback there is unreachable.
         None if parse_u64_text(text).is_some() => Scalar::U64,
-        None => Scalar::I32,
+        // Past u64 the same rule climbs to the 128-bit rungs: `i128` while the magnitude fits it,
+        // then `u128`. A value past u128 is malformed (`int_literal_well_formed`).
+        None => match parse_u128_text(text) {
+            Some(m) if m <= i128::MAX as u128 => Scalar::I128,
+            Some(_) => Scalar::U128,
+            None => Scalar::I32,
+        },
     }
 }
 
@@ -5470,7 +5544,7 @@ fn float_lit_scalar(text: &str) -> Scalar {
 
 fn has_int_suffix(text: &str) -> bool {
     [
-        "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "usize", "isize",
+        "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128", "usize", "isize",
     ]
     .iter()
     .any(|s| text.ends_with(s))
@@ -5541,10 +5615,12 @@ fn eval_const_int(e: &Expr, interner: &Interner) -> Option<i64> {
 }
 
 /// Whether an integer literal's text denotes a value Wukong can represent — it parses, after the
-/// optional sign / type suffix / `_` separators and in its radix, as an i64 *or* a u64. A mistyped
-/// radix like `0z123` (lexed as one `Int` token with a bogus `z123` suffix), an empty/garbled radix
-/// body, or a value past u64 parses as neither; such a literal used to lower silently to 0. Mirrors
-/// `parse_int_text`'s stripping so the two agree on what a well-formed literal is.
+/// optional sign / type suffix / `_` separators and in its radix, as a magnitude of at most
+/// `u128::MAX`. A mistyped radix like `0z123` (lexed as one `Int` token with a bogus `z123`
+/// suffix), an empty/garbled radix body, or a value past u128 parses as none; such a literal used
+/// to lower silently to 0. Whether the value fits the type it ends up with is a separate check
+/// (`range_check_int_literal`). Mirrors `parse_int_text`'s stripping so the two agree on what a
+/// well-formed literal is.
 fn int_literal_well_formed(text: &str) -> bool {
     let mut s = text.trim();
     if s.starts_with('-') || s.starts_with('+') {
@@ -5576,9 +5652,7 @@ fn int_literal_well_formed(text: &str) -> bool {
         } else {
             (body, 10)
         };
-    !digits.is_empty()
-        && (i64::from_str_radix(digits, radix).is_ok()
-            || u64::from_str_radix(digits, radix).is_ok())
+    !digits.is_empty() && u128::from_str_radix(digits, radix).is_ok()
 }
 
 /// Whether a float literal's text parses as an `f64` after stripping the optional sign, a float type
@@ -5745,6 +5819,56 @@ fn parse_int_text(text: &str) -> Option<i64> {
     }
     .ok()?;
     Some(if neg { -v } else { v })
+}
+
+/// The value of a plain integer literal, or a negated one (`-170141183460469231731687303715884105728`),
+/// as its sign and its `u128` magnitude — the literals too wide for [`eval_const_int`]. `None` for
+/// any other expression.
+fn wide_lit_value(e: &Expr, interner: &Interner) -> Option<(bool, u128)> {
+    match &e.kind {
+        ExprKind::Int(s) => parse_u128_text(interner.resolve(*s)).map(|m| (false, m)),
+        ExprKind::Unary {
+            op: UnOp::Neg,
+            expr,
+        } => wide_lit_value(expr, interner).map(|(neg, m)| (!neg, m)),
+        _ => None,
+    }
+}
+
+/// Parse an integer literal's MAGNITUDE as a `u128` — [`parse_u64_text`]'s grammar with the
+/// 128-bit range: the literals past `u64::MAX` an `i128`/`u128` can hold.
+pub(crate) fn parse_u128_text(text: &str) -> Option<u128> {
+    let mut s = text.trim();
+    if s.starts_with('-') {
+        return None;
+    }
+    if s.starts_with('+') {
+        s = &s[1..];
+    }
+    for suf in [
+        "usize", "isize", "u128", "i128", "u64", "i64", "u32", "i32", "u16", "i16", "u8", "i8",
+    ] {
+        if let Some(x) = s.strip_suffix(suf) {
+            s = x;
+            break;
+        }
+    }
+    let normalized;
+    let body = if s.contains('_') {
+        normalized = s.replace('_', "");
+        normalized.as_str()
+    } else {
+        s
+    };
+    if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        u128::from_str_radix(h, 16).ok()
+    } else if let Some(o) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
+        u128::from_str_radix(o, 8).ok()
+    } else if let Some(b) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
+        u128::from_str_radix(b, 2).ok()
+    } else {
+        body.parse::<u128>().ok()
+    }
 }
 
 /// Parse an integer literal's MAGNITUDE as a `u64` (no sign — a negative value fits `i64` and is
@@ -7771,5 +7895,106 @@ mod tests {
             "u32::MAX must remain a legal length: {:?}",
             errors(ok)
         );
+    }
+
+    /// `i128` / `u128`: their literals reach the full 128-bit ranges and no further, an unsuffixed
+    /// literal past `u64` widens to them (never truncating), their arithmetic follows the lossless
+    /// promotion rule like every other integer, and a 128-bit `match` is exhaustive exactly when it
+    /// covers the type's range.
+    #[test]
+    fn i128_and_u128_are_first_class_integers() {
+        let clean = |src: &str| {
+            let errs = errors(src);
+            assert!(errs.is_empty(), "{errs:?} for {src:?}");
+        };
+        // Boundary literals, suffixed and adapting, in every radix.
+        clean(
+            "fn f() -> i32 { \
+                 let a: i128 = 170141183460469231731687303715884105727; \
+                 let b: i128 = -170141183460469231731687303715884105728; \
+                 let c: u128 = 340282366920938463463374607431768211455; \
+                 let d = 5u128; let e = -7i128; \
+                 let h: u128 = 0xffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff; \
+                 let o: i128 = 0o7; let g: u128 = 0b1; \
+                 return 0; }",
+        );
+        // One past each end, and a literal past u128 itself.
+        for bad in [
+            "fn f() { let a: i128 = 170141183460469231731687303715884105728; }",
+            "fn f() { let a: i128 = -170141183460469231731687303715884105729; }",
+            "fn f() { let a: u128 = 340282366920938463463374607431768211456; }",
+            "fn f() { let a: u128 = -1; }",
+            "fn f() { let a: u64 = 18446744073709551616; }",
+            "fn f() { let a: i32 = 100000000000000000000; }",
+            "fn f(x: u128) -> i32 { match x { 340282366920938463463374607431768211456 => 1, _ => 0 } }",
+            "fn f(x: i128) -> i32 { match x { 170141183460469231731687303715884105728 => 1, _ => 0 } }",
+        ] {
+            assert_eq!(errors(bad), ["E0431"], "{bad}");
+        }
+        // Lossless promotion: a narrower integer widens into a 128-bit one of compatible
+        // signedness; a mix with no common type is E0440, a mixed-signedness compare E0433, and a
+        // 128-bit value never narrows implicitly.
+        clean("fn f(a: i128, b: i64, c: u64) -> i128 { return a + b * (c as i128); }");
+        clean("fn f(a: u128, b: u32) -> u128 { return a * b; }");
+        clean("fn f(a: i128, b: u64) -> i128 { return a + b; }");
+        assert_eq!(
+            errors("fn f(a: u128, b: i64) -> u128 { return a + b; }"),
+            ["E0440"]
+        );
+        assert_eq!(
+            errors("fn f(a: i128, b: f64) -> f64 { return a + b; }"),
+            ["E0440"]
+        );
+        assert_eq!(
+            errors("fn f(a: i128, b: u128) -> bool { return a < b; }"),
+            ["E0433"]
+        );
+        assert_eq!(errors("fn f(a: i128) -> i64 { return a; }"), ["E0401"]);
+        // Every cast is explicit and allowed.
+        clean(
+            "fn f(a: i128, x: f32, y: f64, b: bool) -> u8 { \
+                 let p = a as u128; let q = x as i128; let r = y as u128; \
+                 let s = a as f32; let t = p as f64; let u = b as i128; \
+                 return (a as u8) + (p as u8); }",
+        );
+        // Exhaustiveness over the 128-bit ranges.
+        clean(
+            "fn f(x: u128) -> i32 { match x { \
+                 0 => 0, 1..=340282366920938463463374607431768211454 => 1, \
+                 340282366920938463463374607431768211455 => 2 } }",
+        );
+        clean(
+            "fn f(x: i128) -> i32 { match x { \
+                 -170141183460469231731687303715884105728..=-1 => 0, 0 => 1, \
+                 1..=170141183460469231731687303715884105727 => 2 } }",
+        );
+        assert_message_has(
+            "fn f(x: u128) -> i32 { match x { 0..=99 => 0, 101..=340282366920938463463374607431768211455 => 1 } }",
+            "E0405",
+            &["100"],
+        );
+        assert_message_has(
+            "fn f(x: u128) -> i32 { match x { 0..=99 => 0 } }",
+            "E0405",
+            &["u128::MAX"],
+        );
+        assert_message_has(
+            "fn f(x: i128) -> i32 { match x { 0 => 0, 1..=170141183460469231731687303715884105727 => 1 } }",
+            "E0405",
+            &["i128::MIN"],
+        );
+        // No 128-bit atomic add, and no vector of 128-bit lanes.
+        assert_eq!(
+            errors("fn f(mut h: [u128; 2]) { atomic_add(h[0], 1); }"),
+            ["E0446"]
+        );
+        assert_eq!(errors("fn f() { let v: vec[i128, 2]; }"), ["E0302"]);
+        // A 128-bit index is clamped to `i64`'s range, so a constant one past it is still out of
+        // bounds at compile time (it was a run-time out-of-bounds load).
+        assert_eq!(
+            errors("fn f() -> i32 { let a: [i32; 4] = [0; 4]; return a[18446744073709551617]; }"),
+            ["E0501"]
+        );
+        clean("fn f(a: [i32; 4], i: i128) -> i32 { return a[i]; }");
     }
 }

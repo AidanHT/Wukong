@@ -1926,7 +1926,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             Op::Cmp(c, l, r) => Value::Int(apply_cmp(*c, reg(regs, *l), reg(regs, *r)) as i128),
             Op::Neg(v) => match reg(regs, *v) {
                 Value::Float(f) => Value::Float(-f),
-                other => Value::Int(-other.as_int()),
+                other => Value::Int(other.as_int().wrapping_neg()),
             },
             Op::Not(v) => match reg(regs, *v) {
                 Value::Int(i) => Value::Int(!i),
@@ -2179,12 +2179,12 @@ impl<'a, 'k> Interp<'a, 'k> {
             Op::Sqrt(v) => apply_sqrt(reg(regs, *v), rty),
             Op::Round(mode, v) => apply_round(*mode, reg(regs, *v), rty),
             // Bit counting / byte reversal on the operand's own-width bit pattern (the verifier
-            // admits scalar i8..i64 only). `IntUnOp::eval` is the definition the hardware
+            // admits scalar i8..i128 only). `IntUnOp::eval_wide` is the definition the hardware
             // instruction computes; `exec` re-canonicalizes the result to the type's width.
             Op::IntUnary(op, v) => {
                 let bits = rty.map(int_bits).unwrap_or(64);
-                let x = uval(reg(regs, *v).as_int(), bits) as u64;
-                Value::Int(i128::from(op.eval(x, bits)))
+                let x = uval(reg(regs, *v).as_int(), bits);
+                Value::Int(op.eval_wide(x, bits) as i128)
             }
         })
     }
@@ -2322,7 +2322,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         Value::Float(-xs[i].as_float())
                     } else {
                         // Wrap at the lane width: negating `i32::MIN` is `i32::MIN`.
-                        mask_lane(Value::Int(-xs[i].as_int()), lane)
+                        mask_lane(Value::Int(xs[i].as_int().wrapping_neg()), lane)
                     }
                 }))?;
                 self.push_vec(lanes)?
@@ -5847,7 +5847,8 @@ fn extern_ret_class(ext: &wukong_mir::ExternFn) -> Result<wukong_runtime::cffi::
         ));
     }
     for p in &ext.params {
-        if !(p.ty.is_int() || matches!(p.ty, MirType::F32 | MirType::F64)) {
+        if p.ty == MirType::I128 || !(p.ty.is_int() || matches!(p.ty, MirType::F32 | MirType::F64))
+        {
             return Err(format!(
                 "a `{}` parameter cannot leave the interpreter's slot memory",
                 p.ty.display()
@@ -6015,6 +6016,7 @@ fn int_bits(ty: &MirType) -> u32 {
         MirType::I16 => 16,
         MirType::I32 => 32,
         MirType::I64 => 64,
+        MirType::I128 => 128,
         _ => 64,
     }
 }
@@ -6293,6 +6295,7 @@ fn apply_cast(kind: CastKind, v: Value, from: &MirType, to: &MirType) -> Value {
                 MirType::I8 => f as i8 as i128,
                 MirType::I16 => f as i16 as i128,
                 MirType::I64 => f as i64 as i128,
+                MirType::I128 => f as i128,
                 _ => f as i32 as i128, // I32 (and the I1 fallback)
             };
             Value::Int(mask(i, to))
@@ -6303,6 +6306,8 @@ fn apply_cast(kind: CastKind, v: Value, from: &MirType, to: &MirType) -> Value {
                 MirType::I8 => f as u8 as i128,
                 MirType::I16 => f as u16 as i128,
                 MirType::I64 => f as u64 as i128,
+                // The u128 bit pattern, held (like every 128-bit value) as its i128 reinterpretation.
+                MirType::I128 => f as u128 as i128,
                 _ => f as u32 as i128, // I32 (and the I1 fallback)
             };
             Value::Int(mask(i, to))

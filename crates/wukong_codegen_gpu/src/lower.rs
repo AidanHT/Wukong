@@ -767,6 +767,35 @@ fn mov_ty(rc: RC) -> &'static str {
 }
 
 /// Width in bits of an integer MIR type (mirrors `wukong_interp::int_bits`).
+/// `i128` has no PTX register class (PTX integers stop at 64 bits), so a function that holds one
+/// anywhere -- a value, a parameter, its result or a stack slot -- declines as a whole rather than
+/// lowering a 128-bit value through a 64-bit register.
+fn decline_i128(func: &Function, interner: &Interner) -> Result<(), String> {
+    fn mentions(t: &MirType) -> bool {
+        match t {
+            MirType::I128 => true,
+            MirType::Vec(e, _) | MirType::Array(e, _) => mentions(e),
+            _ => false,
+        }
+    }
+    let slot = func
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .any(|i| match &i.op {
+            Op::Alloca { ty, .. } | Op::Load(_, ty) | Op::Cast(_, _, ty) => mentions(ty),
+            Op::Gep { elem, .. } => mentions(elem),
+            _ => false,
+        });
+    if slot || mentions(&func.ret) || func.value_types.iter().any(mentions) {
+        return Err(format!(
+            "{UNSUPPORTED} `i128` in `{}` (PTX has no 128-bit integer registers)",
+            interner.resolve(func.name)
+        ));
+    }
+    Ok(())
+}
+
 fn int_bits(t: &MirType) -> u32 {
     match t {
         MirType::I1 => 1,
@@ -784,6 +813,7 @@ fn size_of(t: &MirType) -> u64 {
         MirType::I16 | MirType::F16 | MirType::BF16 => 2,
         MirType::I32 | MirType::F32 => 4,
         MirType::I64 | MirType::F64 | MirType::Ptr => 8,
+        MirType::I128 => 16,
         MirType::Vec(e, n) | MirType::Array(e, n) => size_of(e) * (*n as u64),
         MirType::Void => 0,
     }
@@ -889,6 +919,7 @@ impl<'a> FnEmit<'a> {
         program: &'a Program,
         interner: &'a Interner,
     ) -> Result<String, String> {
+        decline_i128(func, interner)?;
         let mut e = FnEmit {
             func,
             program,
@@ -956,6 +987,7 @@ impl<'a> FnEmit<'a> {
         program: &'a Program,
         interner: &'a Interner,
     ) -> Result<String, String> {
+        decline_i128(func, interner)?;
         let mut e = FnEmit {
             func,
             program,
@@ -1021,6 +1053,7 @@ impl<'a> FnEmit<'a> {
         program: &'a Program,
         interner: &'a Interner,
     ) -> Result<String, String> {
+        decline_i128(func, interner)?;
         let mut e = FnEmit {
             func,
             program,
@@ -2104,6 +2137,8 @@ impl<'a> FnEmit<'a> {
             MirType::Vec(..) | MirType::Array(..) | MirType::Void => {
                 return Err(format!("{UNSUPPORTED} load of aggregate type {ty:?}"))
             }
+            // `decline_i128` refuses the function before any load is lowered.
+            MirType::I128 => return Err(format!("{UNSUPPORTED} load of an i128")),
         }
         Ok(())
     }
@@ -2229,6 +2264,8 @@ impl<'a> FnEmit<'a> {
             MirType::Vec(..) | MirType::Array(..) | MirType::Void => {
                 return Err(format!("{UNSUPPORTED} store of aggregate type {ty:?}"))
             }
+            // `decline_i128` refuses the function before any store is lowered.
+            MirType::I128 => return Err(format!("{UNSUPPORTED} store of an i128")),
         }
         Ok(())
     }

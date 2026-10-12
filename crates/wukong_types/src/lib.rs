@@ -25,10 +25,16 @@ pub enum Scalar {
     I16,
     I32,
     I64,
+    /// A 128-bit two's-complement integer: 16 bytes, 16-byte aligned (the x86-64 psABI's
+    /// `__int128` and Rust's `i128`). One `i128` MIR value; the native backend legalizes the
+    /// operations x64 has no instruction for (division, float conversion) into runtime calls.
+    I128,
     U8,
     U16,
     U32,
     U64,
+    /// The unsigned 128-bit integer (see [`Scalar::I128`]).
+    U128,
     Usize,
     Isize,
     F16,
@@ -49,10 +55,12 @@ impl Scalar {
             "i16" => I16,
             "i32" => I32,
             "i64" => I64,
+            "i128" => I128,
             "u8" => U8,
             "u16" => U16,
             "u32" => U32,
             "u64" => U64,
+            "u128" => U128,
             "usize" => Usize,
             "isize" => Isize,
             "f16" => F16,
@@ -72,10 +80,12 @@ impl Scalar {
             I16 => "i16",
             I32 => "i32",
             I64 => "i64",
+            I128 => "i128",
             U8 => "u8",
             U16 => "u16",
             U32 => "u32",
             U64 => "u64",
+            U128 => "u128",
             Usize => "usize",
             Isize => "isize",
             F16 => "f16",
@@ -95,6 +105,7 @@ impl Scalar {
             I16 | U16 | F16 | Bf16 => 2,
             I32 | U32 | F32 | Char => 4,
             I64 | U64 | F64 | Usize | Isize => 8,
+            I128 | U128 => 16,
         }
     }
 
@@ -114,7 +125,26 @@ impl Scalar {
 
     pub fn is_signed(self) -> bool {
         use Scalar::*;
-        matches!(self, I8 | I16 | I32 | I64 | Isize)
+        matches!(self, I8 | I16 | I32 | I64 | I128 | Isize)
+    }
+
+    /// The width in bits of an integer scalar (`char` is 32, `bool` 1), `None` for a float.
+    pub fn int_bits(self) -> Option<u32> {
+        use Scalar::*;
+        Some(match self {
+            Bool => 1,
+            I8 | U8 => 8,
+            I16 | U16 => 16,
+            I32 | U32 | Char => 32,
+            I64 | U64 | Usize | Isize => 64,
+            I128 | U128 => 128,
+            F16 | Bf16 | F32 | F64 => return None,
+        })
+    }
+
+    /// The 128-bit integers, `i128` and `u128`.
+    pub fn is_128(self) -> bool {
+        matches!(self, Scalar::I128 | Scalar::U128)
     }
 }
 
@@ -745,6 +775,8 @@ mod tests {
             Scalar::U8,
             Scalar::I32,
             Scalar::U64,
+            Scalar::I128,
+            Scalar::U128,
             Scalar::Usize,
             Scalar::F16,
             Scalar::Bf16,

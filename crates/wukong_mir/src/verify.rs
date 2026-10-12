@@ -111,11 +111,21 @@ fn cast_bits(ty: &MirType) -> Option<u64> {
         MirType::I16 | MirType::F16 | MirType::BF16 => 16,
         MirType::I32 | MirType::F32 => 32,
         MirType::I64 | MirType::F64 => 64,
+        MirType::I128 => 128,
         MirType::Vec(elem, lanes) if *lanes != 0 => {
             cast_bits(elem)?.checked_mul(u64::from(*lanes))?
         }
         _ => return None,
     })
+}
+
+/// Whether `t` is (or contains) a vector whose lanes are `i128`.
+fn has_i128_lanes(t: &MirType) -> bool {
+    match t {
+        MirType::Vec(lane, _) => **lane == MirType::I128 || has_i128_lanes(lane),
+        MirType::Array(elem, _) => has_i128_lanes(elem),
+        _ => false,
+    }
 }
 
 fn valid_cast(kind: CastKind, from: &MirType, to: &MirType) -> bool {
@@ -184,6 +194,24 @@ impl<'a> Verifier<'a> {
                     self.define(r);
                 }
             }
+        }
+
+        // `i128` is a scalar-only type: no backend has a vector of 128-bit lanes (Cranelift's x64
+        // ISA has none, and the interpreter's lane arms compute at most 64-bit lanes), so a vector
+        // of them is malformed wherever it appears.
+        for (i, t) in f.value_types.iter().enumerate() {
+            if has_i128_lanes(t) {
+                self.err(format!(
+                    "value v{i} has type {}, but i128 has no vector form",
+                    t.display()
+                ));
+            }
+        }
+        if has_i128_lanes(&f.ret) {
+            self.err(format!(
+                "the function returns {}, but i128 has no vector form",
+                f.ret.display()
+            ));
         }
 
         // The source-location table may be shorter than the value arena, never longer: an entry
@@ -772,17 +800,18 @@ impl<'a> Verifier<'a> {
                 }
             }
             // A scalar integer of a real machine width: the backends lower each operation to one
-            // scalar instruction and the interpreter has no lane arm for it, so a vector or an `i1`
-            // here is malformed MIR. Cranelift has no 8-bit `bswap`.
+            // scalar instruction (a register pair's worth for `i128`) and the interpreter has no
+            // lane arm for it, so a vector or an `i1` here is malformed MIR. Cranelift has no 8-bit
+            // `bswap`.
             Op::IntUnary(op, a) => {
                 let ok = self.use_val(*a);
                 if let Some(res) = self.result_ty(result) {
                     if !matches!(
                         res,
-                        MirType::I8 | MirType::I16 | MirType::I32 | MirType::I64
+                        MirType::I8 | MirType::I16 | MirType::I32 | MirType::I64 | MirType::I128
                     ) {
                         self.err(format!(
-                            "{} needs a scalar i8/i16/i32/i64, got {}",
+                            "{} needs a scalar i8/i16/i32/i64/i128, got {}",
                             op.name(),
                             res.display()
                         ));
@@ -1192,13 +1221,19 @@ mod tests {
     #[test]
     fn int_unary_needs_a_scalar_machine_integer() {
         use crate::IntUnOp::{Bswap, Clz, Ctz, Popcnt};
-        for ty in [MirType::I8, MirType::I16, MirType::I32, MirType::I64] {
+        for ty in [
+            MirType::I8,
+            MirType::I16,
+            MirType::I32,
+            MirType::I64,
+            MirType::I128,
+        ] {
             for op in [Popcnt, Clz, Ctz] {
                 let errors = int_unary_errors(op, ty.clone());
                 assert!(errors.is_empty(), "{op:?} on {ty:?}: {errors:?}");
             }
         }
-        for ty in [MirType::I16, MirType::I32, MirType::I64] {
+        for ty in [MirType::I16, MirType::I32, MirType::I64, MirType::I128] {
             let errors = int_unary_errors(Bswap, ty.clone());
             assert!(errors.is_empty(), "bswap on {ty:?}: {errors:?}");
         }
@@ -1206,6 +1241,39 @@ mod tests {
         assert!(!int_unary_errors(Popcnt, MirType::I1).is_empty());
         assert!(!int_unary_errors(Clz, MirType::F32).is_empty());
         assert!(!int_unary_errors(Ctz, MirType::Vec(Box::new(MirType::I32), 4)).is_empty());
+    }
+
+    /// `i128` is a scalar-only type: a vector of `i128` lanes is malformed wherever it appears, an
+    /// `i128` is no `atomic.add` operand, and the 128-bit integer casts are checked by width like
+    /// every other.
+    #[test]
+    fn i128_is_a_scalar_only_integer() {
+        let mut i = wukong_span::Interner::new();
+        let mut b = crate::Builder::new(i.intern("wide"), MirType::I128);
+        let x = b.add_param(MirType::I128);
+        let y = b.build(MirType::I128, Op::Bin(BinOp::Mul, x, x));
+        b.ret(Some(y));
+        let f = b.finish();
+        assert!(verify_function(&f).is_empty(), "{:?}", verify_function(&f));
+
+        let lanes = MirType::Vec(Box::new(MirType::I128), 2);
+        let mut b = crate::Builder::new(i.intern("lanes"), MirType::Void);
+        let x = b.add_param(MirType::I128);
+        b.build(lanes.clone(), Op::Splat(x));
+        b.ret(None);
+        let errors = verify_function(&b.finish());
+        assert!(
+            errors.iter().any(|e| e.contains("i128 has no vector form")),
+            "{errors:?}"
+        );
+
+        assert!(!atomic_add_errors(MirType::Ptr, MirType::I128, false).is_empty());
+        assert!(cast_errors(CastKind::SExt, MirType::I64, MirType::I128).is_empty());
+        assert!(cast_errors(CastKind::Trunc, MirType::I128, MirType::I8).is_empty());
+        assert!(!cast_errors(CastKind::SExt, MirType::I128, MirType::I64).is_empty());
+        assert!(cast_errors(CastKind::SiToFp, MirType::I128, MirType::F32).is_empty());
+        assert!(cast_errors(CastKind::FpToUi, MirType::F64, MirType::I128).is_empty());
+        assert!(!cast_errors(CastKind::Bitcast, MirType::I128, MirType::F64).is_empty());
     }
 
     /// `atomic.add` on a `ptr_ty` pointer operand and a `val_ty` value; `with_result` gives the

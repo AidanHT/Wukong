@@ -580,12 +580,18 @@ impl Cx<'_> {
         })
     }
 
-    /// The integer value of an integer- or char-literal pattern (a range bound included).
+    /// The integer value of an integer- or char-literal pattern (a range bound included). A
+    /// literal past `i128::MAX` (which only a `u128` can hold) is its 128-bit pattern, read back
+    /// as unsigned by [`wrap`].
     fn lit_value(&self, p: &Pattern) -> Option<i128> {
         match &p.kind {
             PatKind::Int { sym, neg } => {
-                let m = i128::from(crate::parse_u64_text(self.interner.resolve(*sym))?);
-                Some(if *neg { -m } else { m })
+                let m = crate::parse_u128_text(self.interner.resolve(*sym))?;
+                match i128::try_from(m) {
+                    Ok(v) => Some(if *neg { -v } else { v }),
+                    Err(_) if *neg => (m == 1u128 << 127).then_some(i128::MIN),
+                    Err(_) => Some(m as i128),
+                }
             }
             PatKind::Char(sym) => char_value(self.interner.resolve(*sym)),
             _ => None,
@@ -600,7 +606,12 @@ impl Cx<'_> {
         // then does an exclusive upper bound stop one short, so `0..0` matches nothing.
         let bounds = |s: Scalar| -> Option<(i128, i128)> {
             let (l, h) = (wrap(lo, s)?, wrap(hi, s)?);
-            Some((l, if inclusive { h } else { h - 1 }))
+            Some(match (inclusive, h.checked_sub(1)) {
+                (true, _) => (l, h),
+                (false, Some(below)) => (l, below),
+                // `..MIN` of a 128-bit type: no value lies below its least one.
+                (false, None) => (1, 0),
+            })
         };
         match self.space(ty) {
             Space::Int(s) => {
@@ -1088,7 +1099,10 @@ fn segments(domain: &[(i128, i128)], ranges: &[(i128, i128)]) -> Vec<(i128, i128
     let mut cuts: Vec<i128> = Vec::with_capacity(ranges.len() * 2);
     for &(lo, hi) in ranges {
         cuts.push(lo);
-        cuts.push(hi + 1);
+        // A range up to a 128-bit type's top value ends with its domain: no cut past it.
+        if let Some(next) = hi.checked_add(1) {
+            cuts.push(next);
+        }
     }
     cuts.sort_unstable();
     cuts.dedup();
@@ -1109,7 +1123,7 @@ fn merge_adjacent(segs: impl Iterator<Item = (i128, i128)>) -> Vec<(i128, i128)>
     let mut out: Vec<(i128, i128)> = Vec::new();
     for (a, b) in segs {
         match out.last_mut() {
-            Some(last) if last.1 + 1 == a => last.1 = b,
+            Some(last) if last.1.checked_add(1) == Some(a) => last.1 = b,
             _ => out.push((a, b)),
         }
     }
@@ -1118,7 +1132,13 @@ fn merge_adjacent(segs: impl Iterator<Item = (i128, i128)>) -> Vec<(i128, i128)>
 
 /// The values a scalar of type `s` can hold, as sorted inclusive ranges. A `char` can hold any
 /// 32-bit value: `x as char` does not check that `x` is a Unicode scalar value.
+///
+/// A 128-bit type's values are its *keys* ([`wrap`]): an `i128` is itself, and a `u128` is offset
+/// by `-2^127` so its range fits `i128` in order. Either way the domain is all of `i128`.
 fn int_domain(s: Scalar) -> Vec<(i128, i128)> {
+    if s.is_128() {
+        return vec![(i128::MIN, i128::MAX)];
+    }
     let bits = s.size() as u32 * 8;
     if s.is_signed() {
         vec![(-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)]
@@ -1132,6 +1152,11 @@ fn int_domain(s: Scalar) -> Vec<(i128, i128)> {
 /// width and compares bit patterns (`-1` on a `u64` scrutinee is `u64::MAX`); outside that band it
 /// rejects the pattern, and so does this (`None`).
 fn wrap(v: i128, s: Scalar) -> Option<i128> {
+    // A 128-bit literal is already its bit pattern (`lit_value`); a `u128`'s key is that pattern
+    // offset by `-2^127` (flipping the top bit), which orders the unsigned values as `i128`s.
+    if s.is_128() {
+        return Some(if s.is_signed() { v } else { v ^ i128::MIN });
+    }
     let bits = s.size() as u32 * 8;
     let modulus = 1i128 << bits;
     if v < -(modulus >> 1) || v >= modulus {
@@ -1187,6 +1212,15 @@ fn int_text(v: i128, s: Scalar) -> String {
             Some(c) => format!("'\\u{{{:x}}}'", c as u32),
             // Not a Unicode scalar value: only an integer pattern can name it.
             None => v.to_string(),
+        };
+    }
+    if s == Scalar::U128 {
+        // The key back to its value (`wrap`).
+        let u = (v ^ i128::MIN) as u128;
+        return if u == u128::MAX {
+            "u128::MAX".to_string()
+        } else {
+            u.to_string()
         };
     }
     let (lo, hi) = int_domain(s)[0];

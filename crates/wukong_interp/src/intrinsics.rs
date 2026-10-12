@@ -238,6 +238,7 @@ intrinsic_table! {
 
     // Text formatting and the process interface (`text_io.rs`).
     RtFmtInt = "wukong_rt_fmt_int",
+    RtFmtI128 = "wukong_rt_fmt_i128",
     RtFmtF64 = "wukong_rt_fmt_f64",
     RtFmtF32 = "wukong_rt_fmt_f32",
     RtFmtStr = "wukong_rt_fmt_str",

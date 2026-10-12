@@ -50,6 +50,8 @@ mod ml_rt;
 
 // The runtime entries of the text builtins (the per-type scalar printers), the same way.
 mod text_rt;
+// The `i128` operations x64 has no instruction for: wide constants, division, float conversion.
+mod int128;
 
 // Where each function's machine code went: the DWARF of a `-g` object and the JIT's perf map
 // (`WUKONG_PERF_MAP=1`).
@@ -796,6 +798,7 @@ fn cl_type(t: &MirType, ptr_ty: Type) -> Option<Type> {
         MirType::I16 => types::I16,
         MirType::I32 => types::I32,
         MirType::I64 => types::I64,
+        MirType::I128 => types::I128,
         MirType::F16 | MirType::BF16 | MirType::F32 => types::F32,
         MirType::F64 => types::F64,
         MirType::Ptr => ptr_ty,
@@ -819,6 +822,7 @@ fn size_of(t: &MirType) -> Option<u32> {
         MirType::I16 | MirType::F16 | MirType::BF16 => 2,
         MirType::I32 | MirType::F32 => 4,
         MirType::I64 | MirType::F64 | MirType::Ptr => 8,
+        MirType::I128 => 16,
         MirType::Vec(e, n) | MirType::Array(e, n) => size_of(e)?.checked_mul(*n)?,
         MirType::Void => 0,
     })
@@ -1247,6 +1251,8 @@ impl<'a> FnTranslator<'a> {
             Op::ConstInt(v, ty) => {
                 if matches!(ty, MirType::I1) {
                     self.builder.ins().iconst(types::I8, (*v as i64) & 1)
+                } else if matches!(ty, MirType::I128) {
+                    self.i128_const(*v)
                 } else {
                     let t = cl_type(ty, self.ptr_ty).unwrap_or(types::I64);
                     self.builder.ins().iconst(t, *v as i64)
@@ -1342,7 +1348,14 @@ impl<'a> FnTranslator<'a> {
                     } else {
                         (av0, bv0)
                     };
-                    self.builder.ins().select(cc, av, bv)
+                    if self.dfg_ty(av) == types::I128 {
+                        // Cranelift's mid-end rewrites `select(icmp(x, y), x, y)` into
+                        // `smin`/`umax`/..., which x64 cannot lower at 128 bits; selecting each
+                        // half on its own is the same value and gives the rewrite no `x`/`y`.
+                        self.i128_select(cc, av, bv)
+                    } else {
+                        self.builder.ins().select(cc, av, bv)
+                    }
                 }
             }
             Op::Alloca { ty, align, .. } => {
@@ -1657,6 +1670,11 @@ impl<'a> FnTranslator<'a> {
             Shl => self.builder.ins().ishl(a, b),
             LShr => self.builder.ins().ushr(a, b),
             AShr => self.builder.ins().sshr(a, b),
+            // x64 has no 128-bit divide; the runtime entry carries the zero/overflow guards below
+            // itself (`int128.rs`).
+            SDiv | UDiv | SRem | URem if self.dfg_ty(a) == types::I128 => {
+                self.i128_divrem(op, a, b)
+            }
             // Guard the divisor so a zero yields 0 instead of trapping, matching the interpreter.
             // Signed div/rem additionally trap the hardware on `INT_MIN / -1` (2's-complement
             // overflow), so fold a -1 divisor into the guard and patch the result to the
@@ -1715,6 +1733,11 @@ impl<'a> FnTranslator<'a> {
         match kind {
             SExt => self.resize_int(x, from_ty, to_ty, true),
             ZExt | Trunc => self.resize_int(x, from_ty, to_ty, false),
+            // x64 converts no 128-bit integer to or from a float (`int128.rs`).
+            SiToFp | UiToFp if from_ty == types::I128 => {
+                self.i128_to_float(x, to_ty, kind == SiToFp)
+            }
+            FpToSi | FpToUi if to_ty == types::I128 => self.float_to_i128(x, kind == FpToSi),
             FpToSi => self.fcvt_to_int_sat(x, to_ty, true),
             FpToUi => self.fcvt_to_int_sat(x, to_ty, false),
             SiToFp => self.builder.ins().fcvt_from_sint(to_ty, x),
@@ -2908,6 +2931,11 @@ impl<'a> FnTranslator<'a> {
                         self.builder.ins().fcmp(FloatCC::Equal, value, zero)
                     } else if ty.is_vector() {
                         self.builder.ins().iconst(types::I8, 1)
+                    } else if ty == types::I128 {
+                        // `icmp_imm` legalizes through an `iconst` of the operand's type, which
+                        // has no 128-bit form.
+                        let zero = self.i128_const(0);
+                        self.builder.ins().icmp(IntCC::Equal, value, zero)
                     } else {
                         self.builder.ins().icmp_imm(IntCC::Equal, value, 0)
                     }
@@ -2942,6 +2970,9 @@ impl<'a> FnTranslator<'a> {
                     self.builder.ins().f32const(0.0)
                 } else if lane == types::F64 {
                     self.builder.ins().f64const(0.0)
+                } else if lane == types::I128 {
+                    // `iconst` has no 128-bit form (`int128.rs`).
+                    self.i128_const(0)
                 } else {
                     self.builder.ins().iconst(lane, 0)
                 };
@@ -3466,6 +3497,16 @@ fn make_isa_full(
         .map_err(|e| e.to_string())?;
     flag_builder
         .set("probestack_strategy", "inline")
+        .map_err(|e| e.to_string())?;
+    // An `i128` parameter or result of a Wukong function travels as two consecutive 64-bit
+    // registers (or stack words), low half first — LLVM's convention, which Cranelift's x64 ABI
+    // implements only under this flag and otherwise refuses with a panic. Every caller and callee of
+    // such a signature is code this backend generates, so the convention only has to agree with
+    // itself; the runtime entries take `i128` operands as explicit halves and never see it. Beyond
+    // `i128` (and the `f16`/`f128` this backend never passes) the flag changes nothing but the
+    // third integer return register of a multi-value SysV return, which no Wukong signature has.
+    flag_builder
+        .set("enable_llvm_abi_extensions", "true")
         .map_err(|e| e.to_string())?;
     // `WUKONG_MAX_ISA` narrows `native` (read once per process by `wukong_runtime::isa::cap`), so
     // every JIT and object entry point that targets the host inherits the cap from this one place.

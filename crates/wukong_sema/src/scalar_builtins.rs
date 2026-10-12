@@ -15,8 +15,8 @@
 //!   `erfc`, `f32_to_f8e4m3`, …) is **`E0445`**; an unsuffixed integer *literal* is still accepted
 //!   and converted, as for `sqrt(2)`;
 //! * a non-integer operand of an integer builtin, a bit pattern of the wrong width
-//!   (`f32_from_bits(x_u16)`, `f8e4m3_to_f32(x_i32)`), a non-integer `sat_cast` target, or a 64-bit
-//!   `widening_mul` (there is no 128-bit result type) is **`E0446`**;
+//!   (`f32_from_bits(x_u16)`, `f8e4m3_to_f32(x_i32)`), a non-integer `sat_cast` target, or a
+//!   128-bit `widening_mul` (there is no 256-bit result type) is **`E0446`**;
 //! * two operands of different integer types where the type *is* the operation's meaning
 //!   (`sat_add`, `sat_sub`, `mulhi`, `widening_mul`, `overflowing_*`) is **`E0447`** — saturating
 //!   at `i8` and at `i32` give different answers, so neither may be chosen silently. An unsuffixed
@@ -171,7 +171,7 @@ pub fn float_bits_type(f: Scalar) -> Scalar {
     }
 }
 
-/// The type a `widening_mul` of two `s` operands produces, or `None` for a 64-bit operand.
+/// The type a `widening_mul` of two `s` operands produces, or `None` for a 128-bit operand.
 pub fn widened_int(s: Scalar) -> Option<Scalar> {
     Some(match s {
         Scalar::I8 => Scalar::I16,
@@ -180,6 +180,8 @@ pub fn widened_int(s: Scalar) -> Option<Scalar> {
         Scalar::U16 => Scalar::U32,
         Scalar::I32 => Scalar::I64,
         Scalar::U32 => Scalar::U64,
+        Scalar::I64 | Scalar::Isize => Scalar::I128,
+        Scalar::U64 | Scalar::Usize => Scalar::U128,
         _ => return None,
     })
 }
@@ -322,7 +324,7 @@ impl Sema<'_> {
                                 span,
                                 "E0446",
                                 format!(
-                                    "`widening_mul` of two `{}` operands would need a 128-bit \
+                                    "`widening_mul` of two `{}` operands would need a 256-bit \
                                      result, which Wukong does not have; use `mulhi` for the high \
                                      half and `*` for the low half",
                                     s.name()
@@ -767,7 +769,9 @@ mod tests {
         assert_eq!(scalar_builtin_arity(ScalarBuiltin::Ldexp), 2);
         assert_eq!(scalar_builtin_arity(ScalarBuiltin::Frexp), 1);
         assert_eq!(widened_int(Scalar::U32), Some(Scalar::U64));
-        assert_eq!(widened_int(Scalar::I64), None);
+        assert_eq!(widened_int(Scalar::I64), Some(Scalar::I128));
+        assert_eq!(widened_int(Scalar::Usize), Some(Scalar::U128));
+        assert_eq!(widened_int(Scalar::I128), None);
         assert_eq!(float_bits_type(Scalar::Bf16), Scalar::U16);
     }
 
@@ -832,8 +836,11 @@ mod tests {
             errors("fn f(u: i32) -> f32 { return f8e4m3_to_f32(u); }"),
             ["E0446"]
         );
+        // A 64-bit `widening_mul` has its 128-bit result; a 128-bit one has none.
+        assert!(errors("fn f(a: u64) -> u128 { return widening_mul(a, a); }").is_empty());
+        assert!(errors("fn f(a: i64) -> i128 { return widening_mul(a, a); }").is_empty());
         assert_eq!(
-            errors("fn f(a: u64) -> u64 { return widening_mul(a, a); }"),
+            errors("fn f(a: u128) -> u128 { return widening_mul(a, a); }"),
             ["E0446"]
         );
         assert_eq!(

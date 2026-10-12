@@ -215,6 +215,33 @@ mod tests {
             .collect()
     }
 
+    /// An unsuffixed literal past `u64` is an `i128` while it fits one, then a `u128` — never a
+    /// truncated `i32` — and a 128-bit suffix types it as written.
+    #[test]
+    fn a_literal_past_u64_widens_to_a_128_bit_integer() {
+        assert_eq!(
+            first_let_init_ty("fn f() { let x = 18446744073709551616; }"),
+            Ty::Scalar(Scalar::I128)
+        );
+        assert_eq!(
+            first_let_init_ty("fn f() { let x = 170141183460469231731687303715884105728; }"),
+            Ty::Scalar(Scalar::U128)
+        );
+        assert_eq!(
+            first_let_init_ty("fn f() { let x = 5u128; }"),
+            Ty::Scalar(Scalar::U128)
+        );
+        assert_eq!(
+            first_let_init_ty("fn f() { let x = 5i128; }"),
+            Ty::Scalar(Scalar::I128)
+        );
+        // A 128-bit first use decides a literal binding's type, as any width does.
+        assert_eq!(
+            first_let_init_ty("fn f(x: u128) -> u128 { let k = 3; return x * k; }"),
+            Ty::Scalar(Scalar::U128)
+        );
+    }
+
     #[test]
     fn a_literal_binding_takes_the_type_its_first_use_needs() {
         // Compound accumulation over f64 data: the accumulator becomes f64 (it used to stay f32 and

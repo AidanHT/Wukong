@@ -223,6 +223,7 @@ pub(crate) const NOT_DIFFERENTIABLE: &[(&str, &str)] = &[
     ),
     // The formatting entries `printf` / `sprintf` / a structural `print` lower to (`text.rs`).
     ("wukong_rt_fmt_int", TEXT_OUTPUT),
+    ("wukong_rt_fmt_i128", TEXT_OUTPUT),
     ("wukong_rt_fmt_f64", TEXT_OUTPUT),
     ("wukong_rt_fmt_f32", TEXT_OUTPUT),
     ("wukong_rt_fmt_str", TEXT_OUTPUT),

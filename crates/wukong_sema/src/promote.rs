@@ -119,6 +119,7 @@ fn suggested_type(a: Scalar, b: Scalar) -> Scalar {
         (false, false) => match a.size().max(b.size()) {
             1 => Scalar::I16,
             2 => Scalar::I32,
+            16 => Scalar::I128,
             _ => Scalar::I64,
         },
     }
