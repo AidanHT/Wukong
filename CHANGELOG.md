@@ -5,7 +5,7 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
-### GGUF checkpoints and quantized blocks (`gap6/tensor-io-gguf`, N77)
+### GGUF checkpoints, quantized blocks and memory-mapped loads (`gap6/tensor-io-gguf`, N77)
 
 - **`gguf_read_<T>(path, name, buf)` loads one tensor of a GGUF file** (llama.cpp's format, versions
   2 and 3) for the twelve I/O element types and the usual buffer forms, checked against the
@@ -35,6 +35,18 @@ All notable changes to Wukong are documented here. The format is loosely based o
   transcriptions of ggml's quantizers, values chosen so every product is exact — and cover all
   thirteen metadata types, every malformed-header case and a file cut at every header byte;
   `tests/run/io_gguf.wk` writes a GGUF with `write_u8` and reads every lane back.
+- **Memory-mapped loads: `map_<T>(path)`, `st_map_<T>(path, name)`, `npy_map_<T>(path)`,
+  `gguf_map_<T>(path, name)`** return a `[]T` holding a whole file or one stored tensor, released by
+  `free`. The slice behaves as a buffer filled from the file (writable; a write never reaches the
+  file): natively a copy-on-write private mapping (`mmap(MAP_PRIVATE)` /
+  `MapViewOfFile(FILE_MAP_COPY)`) that reads nothing until a page is touched, a heap copy where the
+  payload is misaligned for its element; the interpreter copies. A map never converts — the stored
+  element type, or `u8` raw blocks for a quantized GGUF tensor, which go straight to `gemv_q8_0` —
+  and is the empty slice on any failure. The OS calls are declared directly against the C library
+  and `kernel32` (no new dependency: `windows-sys` would link through import libraries the
+  `--emit=exe` rustc link cannot see); `wukong_rt_free` unmaps a registered mapping (one atomic load
+  while none is live). `tests/run/io_map.wk` (raw, safetensors, `.npy`, GGUF, copy-on-write, a
+  mapped weight through `gemv_q8_0`).
 
 ### Source locations through MIR into native code (`gap5/native-source-locations`)
 

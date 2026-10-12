@@ -125,6 +125,7 @@ pub(crate) const RUNTIME_ABI: &[(&str, &str, &[&str])] = &[
     ("wukong_rt_free", "void", &["ptr"]),
     ("wukong_rt_gguf_query", "i64", &["ptr", "ptr", "i64", "i64"]),
     ("wukong_rt_gguf_read", "i64", &["ptr", "ptr", "ptr", "i64", "i64", "ptr", "i64"]),
+    ("wukong_rt_map", "ptr", &["ptr", "ptr", "i64", "i64", "ptr"]),
     ("wukong_rt_math2_f64", "double", &["double", "double", "i64"]),
     ("wukong_rt_math_f64", "double", &["double", "i64"]),
     ("wukong_rt_npy_read", "i64", &["ptr", "ptr", "i64", "i64", "ptr", "i64"]),

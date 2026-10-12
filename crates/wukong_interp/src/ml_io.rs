@@ -27,6 +27,7 @@ use wukong_runtime::fileio::{
     DT_F64, DT_I16, DT_I32, DT_I8, DT_U16, DT_U32, DT_U8, IO_ERROR, IO_OPEN_FAILED,
 };
 use wukong_runtime::gguf::{gguf_open_tensor, gguf_query_path, gguf_transfer};
+use wukong_runtime::mmap::{map_plan, MAP_GGUF, MAP_SAFETENSORS};
 
 use crate::{
     file_read_path, kernel_buffer, kernel_scratch, kernel_values, Interp, Intrinsic, Value,
@@ -121,6 +122,7 @@ impl Interp<'_, '_> {
             I::RtNpyRead => self.ml_container_read(args, false),
             I::RtGgufRead => self.ml_gguf_read(args),
             I::RtGgufQuery => self.ml_gguf_query(args),
+            I::RtMap => self.ml_map(args),
             I::RandFillF32 => self.ml_rand_fill(args),
             I::TopkF32 => self.ml_topk(args),
             I::ArgsortF32 => self.ml_argsort(args),
@@ -358,6 +360,63 @@ impl Interp<'_, '_> {
         Ok(Value::Int(got as i128))
     }
 
+    /// `wukong_rt_map(path, name, container, dtype, out_len) -> data`: the runtime's own
+    /// [`map_plan`], then a block of slots made exactly as `alloc_<T>` makes one (so `free`
+    /// releases and reuses it) holding the decoded payload — the copy that native's copy-on-write
+    /// mapping is indistinguishable from. Any failure, and an empty payload, is the null pointer
+    /// with length 0, as natively.
+    fn ml_map(&mut self, args: &[Value]) -> Result<Value, String> {
+        use std::io::Read;
+        const CTX: &str = "map";
+        let path = str_arg(&self.memory, args, 0, CTX)?;
+        let container = arg_i64(args, 2);
+        let name = if matches!(container, MAP_SAFETENSORS | MAP_GGUF) {
+            str_arg(&self.memory, args, 1, CTX)?
+        } else {
+            String::new()
+        };
+        let dt = arg_i64(args, 3);
+        let len_slot = ptr_arg(args, 4, CTX, "length")?;
+        self.ml_check_extent(4, len_slot, 1, CTX)?;
+        let mut out = (Value::Ptr(crate::NULL_SLOT), 0usize);
+        if let (Ok(plan), Some(sz)) = (
+            map_plan(Path::new(&path), container, &name, dt),
+            dtype_size(dt),
+        ) {
+            if plan.count > 0 {
+                let byte_len = plan
+                    .count
+                    .checked_mul(sz)
+                    .ok_or_else(|| format!("{CTX}: byte extent overflow"))?;
+                let mut bytes = kernel_scratch(byte_len, CTX)?;
+                bytes.resize(byte_len, 0u8);
+                let mut file = plan.file;
+                let read = file.seek(SeekFrom::Start(plan.off)).is_ok()
+                    && file.read_exact(&mut bytes).is_ok();
+                if read {
+                    let is_float = matches!(dt, DT_F32 | DT_F64 | DT_F16 | DT_BF16);
+                    let alloc = [
+                        Value::Int(plan.count as i128),
+                        Value::Int(sz as i128),
+                        Value::Int(i128::from(is_float)),
+                    ];
+                    let block = self.call_intrinsic(Intrinsic::RtAlloc, &alloc)?;
+                    if let Value::Ptr(base) = block {
+                        for (slot, elem) in self.memory[base..base + plan.count]
+                            .iter_mut()
+                            .zip(bytes.chunks_exact(sz))
+                        {
+                            *slot = decode_elem(dt, elem);
+                        }
+                        out = (block, plan.count);
+                    }
+                }
+            }
+        }
+        self.memory[len_slot] = Value::Int(out.1 as i128);
+        Ok(out.0)
+    }
+
     /// `n` `f32` slots of operand `k` from `base`, marshalled for a host kernel.
     fn ml_f32_buffer(
         &self,
@@ -503,6 +562,26 @@ mod tests {
             (Q::Type, g::GGUF_Q_TYPE),
         ] {
             assert_eq!(q.code(), code, "{q:?}");
+        }
+    }
+
+    /// The map container codes (`wukong_sema::MapSource::code`) are the runtime's `MAP_*`.
+    #[test]
+    fn compiler_and_runtime_map_codes_agree() {
+        use wukong_runtime::mmap as m;
+        use wukong_sema::MapSource as S;
+        for (s, code) in [
+            (S::File, m::MAP_FILE),
+            (S::Safetensors, m::MAP_SAFETENSORS),
+            (S::Npy, m::MAP_NPY),
+            (S::Gguf, m::MAP_GGUF),
+        ] {
+            assert_eq!(s.code(), code, "{s:?}");
+            assert_eq!(
+                s.named(),
+                matches!(code, m::MAP_SAFETENSORS | m::MAP_GGUF),
+                "{s:?}"
+            );
         }
     }
 

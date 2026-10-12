@@ -521,6 +521,7 @@ mod entry_law {
         ("lowp.rs", include_str!("lowp.rs")),
         ("lrscan.rs", include_str!("lrscan.rs")),
         ("math64.rs", include_str!("math64.rs")),
+        ("mmap.rs", include_str!("mmap.rs")),
         ("norm.rs", include_str!("norm.rs")),
         ("npy.rs", include_str!("npy.rs")),
         ("nt_policy.rs", include_str!("nt_policy.rs")),

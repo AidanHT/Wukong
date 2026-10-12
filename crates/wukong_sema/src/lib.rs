@@ -73,7 +73,7 @@ use wukong_types::{Dim, Layout, Scalar, Shape, Ty};
 // `wukong_mir_build` lowers exactly the set sema types.
 mod ml_builtins;
 pub use ml_builtins::{
-    io_dtype, io_dtype_code, ml_builtin, ml_builtin_is_pure, GgufQuery, MlBuiltin,
+    io_dtype, io_dtype_code, ml_builtin, ml_builtin_is_pure, GgufQuery, MapSource, MlBuiltin,
 };
 // The scalar builtins (see `scalar_builtins.rs`), likewise shared with `wukong_mir_build`.
 mod scalar_builtins;

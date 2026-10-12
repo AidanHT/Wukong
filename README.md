@@ -126,8 +126,9 @@ not duplicate them. In summary, Wukong:
 - **Checkpoints in, shape-checked at load time.** `st_read_<T>` (safetensors), `npy_read_<T>`
   (`.npy`) and `gguf_read_<T>` (llama.cpp GGUF) compare the stored dtype and every dimension with the
   destination `Tensor[…]` as they load; a GGUF tensor in ggml's `Q4_0`…`Q8_0` or K-quant blocks
-  dequantizes into `f32`, or loads its raw blocks for the quantized GEMVs
-  (`tests/run/io_{safetensors,npy,gguf}.wk`).
+  dequantizes into `f32`, or loads its raw blocks for the quantized GEMVs. `map_<T>` /
+  `st_map_<T>` / `npy_map_<T>` / `gguf_map_<T>` instead map a file or one tensor copy-on-write, so
+  only the pages a run touches are ever read (`tests/run/io_{safetensors,npy,gguf,map}.wk`).
 - **Zero hidden cost.** No GC, no implicit copies of large aggregates, no surprise allocations.
 - **Domain-aware optimization (implementation today).** The compiler **recognizes a matmul nest** (the
   `ikj` accumulate and `ijk` dot-product forms, incl. `nn.Linear` `A·Bᵀ`, written naively or

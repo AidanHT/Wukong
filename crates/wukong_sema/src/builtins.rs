@@ -663,6 +663,10 @@ pub fn builtin_callee_names() -> Vec<String> {
         names.push(format!("st_read_{t}"));
         names.push(format!("npy_read_{t}"));
         names.push(format!("gguf_read_{t}"));
+        names.push(format!("map_{t}"));
+        names.push(format!("st_map_{t}"));
+        names.push(format!("npy_map_{t}"));
+        names.push(format!("gguf_map_{t}"));
         names.push(format!("alloc_{t}"));
     }
     for t in SCRATCH_DTYPES {

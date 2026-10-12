@@ -196,6 +196,7 @@ pub(crate) const NOT_DIFFERENTIABLE: &[(&str, &str)] = &[
     ("wukong_rt_st_read", FILE_READ),
     ("wukong_rt_npy_read", FILE_READ),
     ("wukong_rt_gguf_read", FILE_READ),
+    ("wukong_rt_map", FILE_READ),
     ("wukong_rt_write_dt", NO_GRADIENT),
     ("wukong_rt_file_size", NO_GRADIENT),
     ("wukong_rt_gguf_query", NO_GRADIENT),

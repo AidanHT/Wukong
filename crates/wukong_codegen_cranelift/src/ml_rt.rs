@@ -1,6 +1,6 @@
 //! The runtime entry points of the ML I/O and randomness builtins — dtype-coded file I/O,
-//! `file_size`, the safetensors / `.npy` / GGUF readers and the GGUF tensor-table queries, the
-//! Philox fill and the top-k / argsort / categorical-sampling kernels — and of the decode builtins
+//! `file_size`, the safetensors / `.npy` / GGUF readers, the GGUF tensor-table queries and the
+//! memory-mapped loads, the Philox fill and the top-k / argsort / categorical-sampling kernels — and of the decode builtins
 //! (KV-cache attention, the KV append, the half-weight and Q8_0 / Q4_0 GEMVs and packers),
 //! declared, JIT-bound and called from **one table**.
 //!
@@ -53,7 +53,7 @@ pub(crate) struct Entry {
 
 /// The table. The addresses are taken here, at run time, because a function-pointer-to-raw-pointer
 /// cast is not a constant expression.
-pub(crate) fn entries() -> [Entry; 24] {
+pub(crate) fn entries() -> [Entry; 25] {
     use Abi::{Ptr, F32, I64};
     [
         // (path, byte_off, data, len, dtype) -> i64: `read_<T>` outside the frozen six, and every
@@ -105,6 +105,14 @@ pub(crate) fn entries() -> [Entry; 24] {
             params: &[Ptr, Ptr, I64, I64],
             ret: Some(I64),
             addr: wukong_runtime::wukong_rt_gguf_query as *const u8,
+        },
+        // (path, name, container, dtype, out_len) -> data: `map_<T>` / `st_map_<T>` /
+        // `npy_map_<T>` / `gguf_map_<T>`.
+        Entry {
+            name: "wukong_rt_map",
+            params: &[Ptr, Ptr, I64, I64, Ptr],
+            ret: Some(Ptr),
+            addr: wukong_runtime::wukong_rt_map as *const u8,
         },
         // (out, n, seed, ctr0): `rand_fill_f32`.
         Entry {

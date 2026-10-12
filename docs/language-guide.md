@@ -2306,8 +2306,9 @@ dtype mismatch, **`-4`** shape or count mismatch, **`-5`** no tensor of that nam
 with dtype × shape, a duplicated name). On every negative code but `-2` the destination is untouched.
 Supported stored dtypes are `F32 F64 F16 BF16 I8 I16 I32 I64 U8 U16 U32 U64` (safetensors) and the
 little-endian `f2 f4 f8 i1 i2 i4 i8 u1 u2 u4 u8` descrs (`.npy`); `BOOL`, the fp8 formats, a
-big-endian array and a structured dtype parse and then report `-3`. A memory-mapped, zero-copy load
-(`map_<T>`) is not implemented yet: every load copies once, straight into the destination.
+big-endian array and a structured dtype parse and then report `-3`. Each of these loads copies
+once, straight into the destination; for a load that reads only the pages a run touches, see
+*Memory-mapped loads* below.
 
 ### GGUF checkpoints and quantized blocks ✅
 
@@ -2363,6 +2364,47 @@ decoder. On every negative code but `-2` the destination is untouched. The reade
 metadata value (all thirteen GGUF value types, arrays of arrays included: the tensor table follows
 them) and honours `general.alignment`; the metadata values themselves are not yet readable from a
 program. `tests/run/io_gguf.wk` writes a file byte by byte with `write_u8` and reads it back.
+
+### Memory-mapped loads ✅
+
+`map_<T>(path: *u8) -> []T`, `st_map_<T>(path: *u8, name: *u8) -> []T`,
+`npy_map_<T>(path: *u8) -> []T` and `gguf_map_<T>(path: *u8, name: *u8) -> []T` return a slice
+holding a file's bytes — the whole file (`file_size / sizeof(T)` elements; a trailing partial
+element is not part of it) or one stored tensor — for the same twelve `T`. `free` releases it, as
+it releases an `alloc_<T>` buffer:
+
+```wukong
+let w: []bf16 = st_map_bf16("gpt2.safetensors", "h0.w1");   // nothing is read yet
+if w.len() == 0 { return 1; }                               // missing, malformed or another dtype
+let v: f32 = w[17] as f32;                                  // this page is read now
+free(w);                                                    // unmapped
+```
+
+The slice behaves exactly like a heap buffer that was filled from the file when the call returned:
+it can be read and written, and a write changes the buffer, never the file. Natively it is a
+**copy-on-write private mapping** (`mmap(MAP_PRIVATE)` on Unix, `MapViewOfFile(FILE_MAP_COPY)` on
+Windows): the call reads nothing, a page comes from the OS page cache the first time it is touched,
+and an untouched page costs no memory of its own — a multi-gigabyte checkpoint "loads" at once, and
+only the tensors a run touches are ever read. Where a payload cannot be mapped — an offset that is
+not a multiple of the element size (a safetensors tensor after an odd-length half-precision one), a
+big-endian host, an OS that declines — the native backend copies it into a heap block instead, and
+the interpreter always copies; no program can tell which happened. The one rule a mapping adds: a
+file must not be truncated or rewritten while a slice of it is live (on Unix a page past a
+truncated end faults, and Windows refuses the write) — such a program is outside the differential
+contract.
+
+A map **never converts**: `T` must be the stored element type — a safetensors or `.npy` tensor's own
+dtype, a plain GGUF tensor's own type — or `u8` for a block-quantized GGUF tensor's raw blocks, the
+weight operand of `gemv_q8_0` / `gemv_q4_0`. (`st_read_f32` is the converting load: it widens a
+`BF16` tensor, of which `st_map_f32` is empty.) Any failure — the file cannot be opened, the header
+is malformed, no tensor has that name, `T` is not the stored type, a column-major `.npy` — returns
+the **empty slice**, as does an empty payload, and `free` accepts it. The matching reader names the
+cause: `st_read_f32(path, name, empty)` is `-1`, `-3`, `-5` or `-6`, and `-4` when it could load the
+tensor. A map is a flat slice, so no shape is checked against it — where the shape matters, check
+`gguf_dim`, or load into a `Tensor` with the `*_read_<T>` builtin. `--backend=gpu-native` declines a
+program that maps, and the `cc` fallback link of `--emit=exe` has no map runtime (it fails to link,
+loudly). `tests/run/io_map.wk` maps a raw file, a safetensors, a `.npy` and a GGUF file, writes
+through a mapping, and runs `gemv_q8_0` on a mapped `Q8_0` weight.
 
 ## Random numbers and sampling ✅
 

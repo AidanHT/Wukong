@@ -340,6 +340,16 @@ line table built from them is not emitted yet.
   block by hand (each block packed by a transcription of ggml's quantizer, the inverse direction),
   round-trip all thirteen metadata types and every malformed-header case, and
   `tests/run/io_gguf.wk` writes a GGUF with `write_u8` and reads it back on both backends.
+- **Memory-mapped loads** (2026-10-12, `gap6/tensor-io-gguf`) — `map_<T>(path)`,
+  `st_map_<T>(path, name)`, `npy_map_<T>(path)` and `gguf_map_<T>(path, name)` return a `[]T`
+  holding a whole file or one stored tensor (in its own element type; `u8` raw blocks for a
+  quantized GGUF tensor), released by `free`. Natively it is a copy-on-write private mapping
+  (`mmap(MAP_PRIVATE)` / `MapViewOfFile(FILE_MAP_COPY)`, declared directly against the C library
+  and `kernel32`, no new dependency) registered so `wukong_rt_free` unmaps it; a payload misaligned
+  for its element is a heap copy instead, and the interpreter always copies — the observable
+  semantics of both is "a buffer filled from the file". Empty on any failure.
+  `tests/run/io_map.wk`; runtime tests check a view mapped from inside a 64 KiB granule, the
+  copy fallback and copy-on-write.
 - **Counter-based RNG** — `rand_u32` / `rand_f32` / `randn_f32(seed, ctr)` are Philox4x32-10 (key
   = the seed's two words, counter = `(ctr lo, ctr hi, 0, 0)`; `rand_u32(0, 0)` is Random123's known
   answer `0x6627e8d5`), lowered to plain integer MIR (`zext`/`mul`/`lshr`/`trunc`/`xor`), so they are
@@ -1574,12 +1584,14 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   (`tests/run/decode_tiny_lm.wk`: bf16 projections, a growing KV cache, GQA attention, a Q8_0 LM head,
   six tokens checked against an f64 reference); the multi-token GPT-2 example over real weights is
   still to be written. None of the decode kernels is measured yet.
-- **ML I/O and randomness gaps.** No memory-mapped load yet (`map_<T>`: every checkpoint load copies
-  once, straight into the destination). The GGUF reader has no dequantizer for the grid-based
-  i-quants (`IQ1_*`, `IQ2_*`, `IQ3_*`), `Q8_1`, `TQ1_0`/`TQ2_0` or `MXFP4` (they load only as raw
-  blocks; into `f32` they are `-7`), its metadata values are parsed but not readable from a program,
-  and every call re-opens and re-parses the header (a large tokenizer vocabulary is re-read per
-  tensor); `.npy` reads little-endian arrays only.
+- **ML I/O and randomness gaps.** A memory-mapped load is a flat slice of the stored element type:
+  there is no shape-typed `Tensor` view of a mapping (check `gguf_dim`, or load with `*_read_<T>`),
+  no converting map (a `BF16` tensor maps only as `[]bf16`), and no error code on the map itself
+  (it is empty; the matching `*_read_<T>` names the cause). The GGUF reader has no dequantizer for
+  the grid-based i-quants (`IQ1_*`, `IQ2_*`, `IQ3_*`), `Q8_1`, `TQ1_0`/`TQ2_0` or `MXFP4` (they
+  load only as raw blocks; into `f32` they are `-7`), its metadata values are parsed but not
+  readable from a program, and every call re-opens and re-parses the header (a large tokenizer
+  vocabulary is re-read per tensor); `.npy` reads little-endian arrays only.
   A fill loop `for i { out[i] = rand_f32(seed, base + i) }` is not recognized into `rand_fill_f32`,
   and the loop vectorizer declines it (mixed 32/64-bit widths), so the scalar builtins run one
   element at a time; `randn_f32` has no fill kernel.

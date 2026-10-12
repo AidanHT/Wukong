@@ -1,7 +1,7 @@
 //! Typing for the ML I/O and randomness builtins: the typed file-I/O family over every element type
 //! (whole-file and byte-offset reads, writes, `file_size`), the safetensors / `.npy` / GGUF
-//! container readers and the GGUF tensor-table queries, the Philox counter-based RNG, and the
-//! top-k / argsort / categorical-sampling kernels.
+//! container readers and the GGUF tensor-table queries, the memory-mapped loads, the Philox
+//! counter-based RNG, and the top-k / argsort / categorical-sampling kernels.
 //!
 //! Like the heap and timing builtins, these are typed nominally here — the call's result is a
 //! concrete type, so `let n = read_bf16_at(p, off, w)` composes in arithmetic — and every misuse is
@@ -52,6 +52,11 @@ pub enum MlBuiltin {
     /// `gguf_find` / `gguf_rank` / `gguf_type(path: *u8, name: *u8) -> i64` and
     /// `gguf_dim(path: *u8, name: *u8, k: int) -> i64` — a GGUF tensor-table lookup.
     GgufQuery(GgufQuery),
+    /// `map_<T>(path: *u8) -> []T`, `st_map_<T>(path: *u8, name: *u8) -> []T`,
+    /// `npy_map_<T>(path: *u8) -> []T` and `gguf_map_<T>(path: *u8, name: *u8) -> []T` — a file's
+    /// bytes (or one stored tensor's, in its own element type) as a slice, memory-mapped
+    /// copy-on-write where the OS allows; released with `free`, empty on any failure.
+    Map(MapSource, Scalar),
     /// `rand_u32(seed: int, ctr: int) -> u32` — Philox4x32-10, word 0.
     RandU32,
     /// `rand_f32(seed: int, ctr: int) -> f32` — uniform in `[0, 1)`.
@@ -94,6 +99,37 @@ impl GgufQuery {
             GgufQuery::Dim => 2,
             GgufQuery::Type => 3,
         }
+    }
+}
+
+/// What a memory-mapped load maps.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MapSource {
+    /// `map_<T>`: the whole file.
+    File,
+    /// `st_map_<T>`: one safetensors tensor.
+    Safetensors,
+    /// `npy_map_<T>`: the array of a `.npy` file.
+    Npy,
+    /// `gguf_map_<T>`: one GGUF tensor (its raw blocks, for a quantized one).
+    Gguf,
+}
+
+impl MapSource {
+    /// The runtime's container code — the compiler's copy of `wukong_runtime::mmap::MAP_*` (pinned
+    /// by a test in `wukong_interp`).
+    pub fn code(self) -> i64 {
+        match self {
+            MapSource::File => 0,
+            MapSource::Safetensors => 1,
+            MapSource::Npy => 2,
+            MapSource::Gguf => 3,
+        }
+    }
+
+    /// Whether the map names a tensor (`st_map_<T>`, `gguf_map_<T>`).
+    pub fn named(self) -> bool {
+        matches!(self, MapSource::Safetensors | MapSource::Gguf)
     }
 }
 
@@ -158,6 +194,16 @@ pub fn ml_builtin(name: &str) -> Option<MlBuiltin> {
     }
     if let Some(rest) = name.strip_prefix("gguf_read_") {
         return io_dtype(rest).map(MlBuiltin::GgufRead);
+    }
+    for (prefix, src) in [
+        ("map_", MapSource::File),
+        ("st_map_", MapSource::Safetensors),
+        ("npy_map_", MapSource::Npy),
+        ("gguf_map_", MapSource::Gguf),
+    ] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            return io_dtype(rest).map(|t| MlBuiltin::Map(src, t));
+        }
     }
     Some(match name {
         "file_size" => MlBuiltin::FileSize,
@@ -225,6 +271,14 @@ fn signature(b: MlBuiltin) -> (Vec<Arg>, Ty) {
             i64_ty,
         ),
         MlBuiltin::GgufQuery(_) => (vec![Str("path"), Str("tensor name")], i64_ty),
+        MlBuiltin::Map(src, t) => {
+            let args = if src.named() {
+                vec![Str("path"), Str("tensor name")]
+            } else {
+                vec![Str("path")]
+            };
+            (args, Ty::Slice(Box::new(Ty::Scalar(t))))
+        }
         MlBuiltin::RandU32 => (vec![Int("seed"), Int("counter")], Ty::Scalar(Scalar::U32)),
         MlBuiltin::RandF32 | MlBuiltin::RandnF32 => (vec![Int("seed"), Int("counter")], f32_ty),
         MlBuiltin::RandFill => (
@@ -676,6 +730,58 @@ mod tests {
             ),
             // The result is a typed `i64`.
             ("fn f() { let x: f32 = gguf_type(\"a\", \"w\"); }", "E0401"),
+        ]);
+    }
+
+    #[test]
+    fn map_builtins_are_named_and_typed() {
+        assert_eq!(
+            ml_builtin("map_f32"),
+            Some(MlBuiltin::Map(MapSource::File, Scalar::F32))
+        );
+        assert_eq!(
+            ml_builtin("st_map_bf16"),
+            Some(MlBuiltin::Map(MapSource::Safetensors, Scalar::Bf16))
+        );
+        assert_eq!(
+            ml_builtin("npy_map_i16"),
+            Some(MlBuiltin::Map(MapSource::Npy, Scalar::I16))
+        );
+        assert_eq!(
+            ml_builtin("gguf_map_u8"),
+            Some(MlBuiltin::Map(MapSource::Gguf, Scalar::U8))
+        );
+        for not_one in ["map_", "map_bool", "map", "st_map", "map_f32_at"] {
+            assert_eq!(ml_builtin(not_one), None, "{not_one}");
+        }
+        let ok = "fn f() -> i64 { \
+                  let a: []f32 = map_f32(\"w.bin\"); \
+                  let b: []bf16 = st_map_bf16(\"m.st\", \"w\"); \
+                  let c: []i16 = npy_map_i16(\"a.npy\"); \
+                  let d: []u8 = gguf_map_u8(\"m.gguf\", \"q\"); \
+                  let n: i64 = a.len() + b.len() + c.len() + d.len(); \
+                  free(a); free(b); free(c); free(d); \
+                  return n; }";
+        assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
+        assert_rejected(&[
+            // The result is the stored element type's slice.
+            (
+                "fn f() { let a: []f64 = map_f32(\"w.bin\"); free(a); }",
+                "E0401",
+            ),
+            // A tensor name is a string; the whole-file maps take none.
+            (
+                "fn f() { let a: []f32 = st_map_f32(\"m.st\", 1); free(a); }",
+                "E0437",
+            ),
+            (
+                "fn f() { let a: []f32 = map_f32(\"w.bin\", \"w\"); free(a); }",
+                "E0503",
+            ),
+            (
+                "fn f() { let a: []f32 = gguf_map_f32(\"m.gguf\"); free(a); }",
+                "E0503",
+            ),
         ]);
     }
 

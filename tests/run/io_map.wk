@@ -1,0 +1,240 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 150
+// EXPECT-OUT: -200
+// EXPECT-OUT: 325
+// EXPECT-OUT: 0
+// EXPECT-OUT: 700
+// EXPECT-OUT: 150
+// EXPECT-OUT: 8
+// EXPECT-OUT: 16320
+// EXPECT-OUT: 0
+// EXPECT-OUT: 111
+// EXPECT-OUT: 141
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -2000
+// EXPECT-OUT: 3000
+// EXPECT-OUT: 4
+// EXPECT-OUT: 50
+// EXPECT-OUT: -800
+// EXPECT-OUT: 25
+// EXPECT-OUT: 10000
+// EXPECT-OUT: 0
+// EXPECT-OUT: -4
+// EXPECT-OUT: 0
+// EXPECT-OUT: -5
+// EXPECT-OUT: 134
+// EXPECT-OUT: 3
+// EXPECT-OUT: -1
+// EXPECT-OUT: 300
+// EXPECT-OUT: -32768
+// EXPECT-OUT: 90
+// EXPECT-OUT: 162
+// EXPECT-OUT: 2
+// EXPECT-OUT: 125
+// EXPECT-OUT: -400
+// EXPECT-OUT: 34
+// EXPECT-OUT: 0
+// EXPECT-OUT: 56
+// EXPECT-OUT: 240
+// EXPECT-OUT: 15
+// EXPECT-OUT: 0
+// EXPECT-OUT: -8
+module tests.run.io_map
+
+// The memory-mapped loads return a `[]T` slice holding a file's bytes -- `map_<T>(path)` the whole
+// file, `st_map_<T>` / `npy_map_<T>` / `gguf_map_<T>` one stored tensor in its OWN element type --
+// that `free` releases like an `alloc_<T>` buffer. Natively the slice is a copy-on-write mapping
+// (or, where a payload is misaligned for its element, a heap copy); the interpreter copies. Either
+// way it behaves as a buffer filled from the file, which is all this program can observe. Every
+// file is assembled here, so each expected value is the payload's own definition:
+//  1. A raw f32 file 1.5 -2 3.25 0 (16 bytes): mapped as 4 lanes (times 100). A write lands in
+//     the slice, not the file -- a second map still reads 1.5. As u16 it is 8 lanes; lane 1 is the
+//     high half of 1.5f32 = 0x3FC00000, i.e. 0x3FC0 = 16320. A missing file maps to 0 lanes.
+//  2. A safetensors file (header 111 bytes, file 8 + 111 + 22 = 141): "b" BF16 [3] = 1 -2 3
+//     (times 1000), "w" F32 [2, 2] = 0.5 -8 0.25 100 (times 100; its payload starts at byte 125,
+//     not a multiple of 4, so natively it is the heap copy). A map never converts: "b" as f32 is
+//     empty, while `st_read_f32` -- which widens bf16 -- finds nothing wrong but the empty
+//     buffer's count, -4; a missing name maps empty, and `st_read_f32` names the cause, -5.
+//  3. A '<i2' (3,) `.npy` (a 128-byte preamble, 134 bytes) = -1 300 -32768.
+//  4. A GGUF with no metadata: "w" F32 ne [2] = 1.25 -4 and "q" Q8_0 ne [32] (scale f16 3800 =
+//     0.5, quants j - 16). Its tensor table ends at byte 90, the data starts at 96, and "q" sits 32
+//     bytes in: 96 + 32 + 34 = 162 bytes. "w" maps as 2 f32 (times 100); "q" maps as its 34 raw
+//     block bytes (00 38, then the quants: -16 is 240, 15 last) but not as f32 (no dequantizing in
+//     a map). The raw blocks are `gemv_q8_0`'s weight operand: with x = 32 ones (quantized per call
+//     to scale 1/127, every quant 127) the one output is (0.5 * (1/127)) * (127 * sum(j - 16)) =
+//     0.5 * -16 = -8 (the f32 rounding of 1/127 moves the product by under half an ulp of 8).
+
+fn put_str(mut buf: []u8, at: i64, s: *u8) -> i64 {
+    let mut i: i64 = 0;
+    while s[i] != 0 {
+        buf[at + i] = s[i];
+        i = i + 1;
+    }
+    return i;
+}
+
+// Store the low `n` bytes of `v` little-endian at byte `at`; returns the cursor after them.
+fn put_le(mut buf: []u8, at: i64, v: i64, n: i64) -> i64 {
+    let mut x: i64 = v;
+    let mut k: i64 = 0;
+    while k < n {
+        buf[at + k] = (x & 255) as u8;
+        x = x >> 8;
+        k = k + 1;
+    }
+    return at + n;
+}
+
+// A GGUF string at byte `at`: the u64 byte length of `s`, then its bytes.
+fn put_gstr(mut buf: []u8, at: i64, s: *u8) -> i64 {
+    let n: i64 = put_str(buf, at + 8, s);
+    put_le(buf, at, n, 8);
+    return at + 8 + n;
+}
+
+// A rank-1 GGUF tensor-table entry: name, rank 1, `ne0`, the ggml type, the data offset.
+fn put_tensor(mut buf: []u8, at: i64, name: *u8, ne0: i64, ty: i64, off: i64) -> i64 {
+    let mut c: i64 = put_gstr(buf, at, name);
+    c = put_le(buf, c, 1, 4);
+    c = put_le(buf, c, ne0, 8);
+    c = put_le(buf, c, ty, 4);
+    return put_le(buf, c, off, 8);
+}
+
+fn main() -> i32 {
+    // 1. A whole file.
+    let path: *u8 = "io_test_map.bin";
+    let src: [f32; 4] = [1.5, -2.0, 3.25, 0.0];
+    print(write_f32(path, src));
+    let mut m: []f32 = map_f32(path);
+    print(m.len());
+    for i in 0..4 {
+        print((m[i] * 100.0) as i32);
+    }
+    m[0] = 7.0;
+    print((m[0] * 100.0) as i32);
+    let m2: []f32 = map_f32(path);
+    print((m2[0] * 100.0) as i32);
+    let h: []u16 = map_u16(path);
+    print(h.len());
+    print(h[1] as i32);
+    let none: []f32 = map_f32("io_test_map_absent_zz.bin");
+    print(none.len());
+    free(m);
+    free(m2);
+    free(h);
+    free(none);
+
+    // 2. Safetensors.
+    let st_path: *u8 = "io_test_map.safetensors";
+    let mut st: []u8 = alloc_u8(141);
+    let hl: i64 = put_str(st, 8, "{\"b\":{\"dtype\":\"BF16\",\"shape\":[3],\"data_offsets\":[0,6]},\"w\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[6,22]}}");
+    print(hl);
+    put_le(st, 0, hl, 8);
+    let mut c: i64 = 8 + hl;
+    c = put_le(st, c, 0x3F80, 2);
+    c = put_le(st, c, 0xC000, 2);
+    c = put_le(st, c, 0x4040, 2);
+    c = put_le(st, c, 0x3F000000, 4);
+    c = put_le(st, c, 0xC1000000, 4);
+    c = put_le(st, c, 0x3E800000, 4);
+    put_le(st, c, 0x42C80000, 4);
+    print(write_u8(st_path, st));
+    let b: []bf16 = st_map_bf16(st_path, "b");
+    print(b.len());
+    for i in 0..3 {
+        print((b[i] as f32 * 1000.0) as i32);
+    }
+    let w: []f32 = st_map_f32(st_path, "w");
+    print(w.len());
+    for i in 0..4 {
+        print((w[i] * 100.0) as i32);
+    }
+    let bw: []f32 = st_map_f32(st_path, "b");
+    print(bw.len());
+    let mut empty: []f32 = alloc_f32(0);
+    print(st_read_f32(st_path, "b", empty));
+    let nope: []f32 = st_map_f32(st_path, "nope");
+    print(nope.len());
+    print(st_read_f32(st_path, "nope", empty));
+    free(st);
+    free(b);
+    free(w);
+    free(bw);
+    free(nope);
+    free(empty);
+
+    // 3. `.npy`: magic, version 1.0, a u16 header length of 118, the dict padded with spaces to
+    // byte 127 and a newline, then the array.
+    let npy_path: *u8 = "io_test_map.npy";
+    let mut np: []u8 = alloc_u8(134);
+    put_le(np, 0, 0x93, 1);
+    put_str(np, 1, "NUMPY");
+    put_le(np, 6, 1, 2);
+    put_le(np, 8, 118, 2);
+    let d: i64 = put_str(np, 10, "{'descr': '<i2', 'fortran_order': False, 'shape': (3,), }");
+    for k in 10i64 + d..127 {
+        np[k] = 32;
+    }
+    np[127] = 10;
+    c = put_le(np, 128, -1, 2);
+    c = put_le(np, c, 300, 2);
+    put_le(np, c, -32768, 2);
+    print(write_u8(npy_path, np));
+    let a: []i16 = npy_map_i16(npy_path);
+    print(a.len());
+    for i in 0..3 {
+        print(a[i]);
+    }
+    free(np);
+    free(a);
+
+    // 4. GGUF.
+    let g_path: *u8 = "io_test_map.gguf";
+    let mut g: []u8 = alloc_u8(162);
+    c = put_le(g, 0, 0x46554747, 4);
+    c = put_le(g, c, 3, 4);
+    c = put_le(g, c, 2, 8);
+    c = put_le(g, c, 0, 8);
+    c = put_tensor(g, c, "w", 2, 0, 0);
+    c = put_tensor(g, c, "q", 32, 8, 32);
+    print(c);
+    put_le(g, 96, 0x3FA00000, 4);
+    put_le(g, 100, 0xC0800000, 4);
+    put_le(g, 128, 0x3800, 2);
+    for j in 0i64..32 {
+        put_le(g, 130 + j, j - 16, 1);
+    }
+    print(write_u8(g_path, g));
+    let gw: []f32 = gguf_map_f32(g_path, "w");
+    print(gw.len());
+    for i in 0..2 {
+        print((gw[i] * 100.0) as i32);
+    }
+    let gq: []u8 = gguf_map_u8(g_path, "q");
+    print(gq.len());
+    print(gq[0] as i32);
+    print(gq[1] as i32);
+    print(gq[2] as i32);
+    print(gq[33] as i32);
+    let gf: []f32 = gguf_map_f32(g_path, "q");
+    print(gf.len());
+    let mut x: []f32 = alloc_f32(32);
+    for i in 0..32 {
+        x[i] = 1.0;
+    }
+    let mut y: []f32 = alloc_f32(1);
+    gemv_q8_0(gq, x, y);
+    print(y[0] as i32);
+    free(g);
+    free(gw);
+    free(gq);
+    free(gf);
+    free(x);
+    free(y);
+    return 0;
+}

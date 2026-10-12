@@ -72,8 +72,9 @@ wukong_runtime   the AVX2/FMA microkernels the recognizers dispatch to (GEMM/GEM
                   sequential `parallel_for` are reference surface with no caller anywhere in the
                   workspace (the kernels use thread-local `Vec` scratch). The ML I/O readers
                   (`fileio`, `safetensors`, `npy`, `gguf` — the GGUF parser and the ggml block
-                  dequantizers) are public modules the interpreter calls directly, so a parsed
-                  header, a return code and a dequantized value are one implementation
+                  dequantizers — and `mmap`, the copy-on-write `map_<T>` loads) are public
+                  modules the interpreter calls directly, so a parsed header, a return code and a
+                  dequantized value are one implementation
 wukong_diag      Diagnostic, Severity, error-code catalog, JSON + terminal renderers
 wukong_lexer     &str -> tokens (+ @attributes, error recovery); `tokenize_with_comments` adds the
                   comment side channel the formatter needs (plain `tokenize` is unchanged)

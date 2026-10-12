@@ -22,6 +22,11 @@
 //! (`wukong_rt_read_f32`, …), so their MIR is unchanged; every other element type and every
 //! offset read goes through the dtype-coded `wukong_rt_read_dt` / `wukong_rt_write_dt`.
 //!
+//! **Maps.** `map_<T>` / `st_map_<T>` / `npy_map_<T>` / `gguf_map_<T>` lower to one
+//! `wukong_rt_map(path, name, container, dtype, &len) -> data` call (a whole-file map passes the
+//! path again for the unused name) and a fresh `{ data, len }` slice — the shape `alloc_<T>` builds,
+//! so the result is freed by `free`.
+//!
 //! **RNG.** `rand_u32` / `rand_f32` / `randn_f32` lower to plain integer MIR — the Philox round is a
 //! 32×32→64 multiply (`zext`, `mul`, `lshr`, `trunc`), xors and adds — so they need no runtime call,
 //! are bit-identical on every backend by construction, and are safe in a `@parallel` region (no
@@ -34,7 +39,7 @@ use wukong_sema::{io_dtype_code, ml_builtin, ml_builtin_is_pure, DefKind, GgufQu
 use wukong_span::{Interner, Symbol};
 use wukong_types::{Scalar, Ty};
 
-use crate::{FnLowerer, SLICE_LEN_OFF, SLICE_PTR_OFF};
+use crate::{FnLowerer, SLICE_LEN_OFF, SLICE_PTR_OFF, SLICE_SIZE};
 
 /// Philox4x32 round multipliers and key increments — `wukong_runtime::random`'s constants (this
 /// crate does not depend on the runtime; the interpreter's differential test pins the lowering to
@@ -58,6 +63,7 @@ pub(crate) struct MlSyms {
     npy_read: Symbol,
     gguf_read: Symbol,
     gguf_query: Symbol,
+    map: Symbol,
     rand_fill: Symbol,
     topk: Symbol,
     argsort: Symbol,
@@ -74,6 +80,7 @@ impl MlSyms {
             npy_read: interner.intern("wukong_rt_npy_read"),
             gguf_read: interner.intern("wukong_rt_gguf_read"),
             gguf_query: interner.intern("wukong_rt_gguf_query"),
+            map: interner.intern("wukong_rt_map"),
             rand_fill: interner.intern("wukong_rand_fill_f32"),
             topk: interner.intern("wukong_topk_f32"),
             argsort: interner.intern("wukong_argsort_f32"),
@@ -189,6 +196,33 @@ impl FnLowerer<'_> {
                 };
                 Some(self.ml_call(syms.gguf_query, vec![path, tensor, what, k]))
             }
+            MlBuiltin::Map(src, t) => {
+                if args.len() != 1 + usize::from(src.named()) {
+                    return None;
+                }
+                let path = self.lower_expr(&args[0]);
+                // The whole-file maps have no name; the runtime reads the operand only for the
+                // named containers, so the path stands in for it.
+                let name = if src.named() {
+                    self.lower_expr(&args[1])
+                } else {
+                    path
+                };
+                let kind = self.ml_i64_const(src.code());
+                let dt = self.ml_i64_const(io_dtype_code(t));
+                let len_slot = self.builder.alloca(MirType::I64);
+                let data = self.builder.build(
+                    MirType::Ptr,
+                    Op::Call {
+                        func: syms.map,
+                        args: vec![path, name, kind, dt, len_slot],
+                    },
+                );
+                let len = self
+                    .builder
+                    .build(MirType::I64, Op::Load(len_slot, MirType::I64));
+                Some(self.ml_slice(data, len))
+            }
             MlBuiltin::NpyRead(t) => {
                 if args.len() != 2 {
                     return None;
@@ -276,6 +310,25 @@ impl FnLowerer<'_> {
             (Scalar::U8, false) => g.rt_write_u8,
             _ => return None,
         })
+    }
+
+    /// A fresh 16-byte slice fat pointer `{ data, len }` — the value-position slice convention
+    /// `alloc_<T>` builds, so the result binds, passes, indexes and `free`s like any `[]T`.
+    fn ml_slice(&mut self, data: ValueId, len: ValueId) -> ValueId {
+        let sbuf = self
+            .builder
+            .alloca(MirType::Array(Box::new(MirType::I8), SLICE_SIZE as u32));
+        let dp = self.field_ptr(sbuf, SLICE_PTR_OFF);
+        self.builder.build_void(Op::Store {
+            ptr: dp,
+            value: data,
+        });
+        let lp = self.field_ptr(sbuf, SLICE_LEN_OFF);
+        self.builder.build_void(Op::Store {
+            ptr: lp,
+            value: len,
+        });
+        sbuf
     }
 
     /// An `i64`-returning runtime call.

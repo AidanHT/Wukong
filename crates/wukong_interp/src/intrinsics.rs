@@ -258,6 +258,7 @@ intrinsic_table! {
     RtNpyRead = "wukong_rt_npy_read",
     RtGgufRead = "wukong_rt_gguf_read",
     RtGgufQuery = "wukong_rt_gguf_query",
+    RtMap = "wukong_rt_map",
     RandFillF32 = "wukong_rand_fill_f32",
     TopkF32 = "wukong_topk_f32",
     ArgsortF32 = "wukong_argsort_f32",
