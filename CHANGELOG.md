@@ -183,7 +183,13 @@ All notable changes to Wukong are documented here. The format is loosely based o
   access under a condition only removes executions, so proving every potential pair is enough. Two
   widenable loops fuse only when the vectorizer still widens the fused loop, asked on a fused copy of
   the function: an if-converted region sinks its stores to one address, so two widenable diamonds of
-  stores stay apart, while a widenable straight loop beside a diamond fuses into one widened loop. A
+  stores stay apart, while a widenable straight loop beside a diamond fuses into one widened loop.
+  Two unwidenable loops stay apart when either branches on a condition `unswitch` may decide later in
+  the sweep -- an invariant flag, or the counter against an invariant (`if i < m`): split or
+  unswitched alone, its copies may widen, while fused, each copy would carry the other loop's scalar
+  work: `if i < m { t[i] = a[i] * 3; } else { u[i] = a[i] * 5 - 1; }` beside a recurrence loop is
+  split into two widened loops, not fused into one loop that splits into two scalar ones. The
+  check is conservative: such a pair stays apart even when no copy would widen. A
   pair of two-block loops fuses exactly as before, byte for byte. A two-block loop fused into a
   branching one gives up the 4x partial unroll, which takes two-block loops only. No program in
   `tests/run` or `examples` has such a pair; `tests/run/opt5_fuse_multiblock.wk` covers a diamond in
