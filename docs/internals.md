@@ -325,6 +325,26 @@ The timer is inert unless asked for and reports from its `Drop`, so every exit p
 `--depfile=<f>` writes a Make rule over the `SourceMap`'s files — exactly the root and each import
 the loader read — with gcc `-MP`-style empty rules for the imports.
 
+**Several artifacts, one compile (`--emit=a,b,..`).** `EmitStage::parse_list` sorts the list into
+pipeline order — `EmitStage`'s declaration order, which its derived `Ord` makes load-bearing — and
+splits it into `Options::emit`, the stage the compile runs to (the last), and `Options::emit_also`,
+the stages emitted on the way. `compile` is unchanged for a single stage: every stage stop asks
+`opts.emits(stage)` and returns only when the stage is `emit` (or failed), and everything that
+decides *what* is compiled — the autodiff lowering, pruning to `main`, `lint_options_for`'s library
+roots, `native_reachable`, the object kind — still keys on `emit`. That is why `check` and `grad`
+combine only with `tokens`/`ast` (no later stage runs after `check`; a gradient compile lowers,
+optimizes and roots differently) and why `obj` and `exe` exclude each other (library object vs
+pruned, mangled executable): any other list is one compile whose every artifact, without `exe`, is
+byte-identical to that stage alone (`crates/wukongc/tests/emit.rs` checks all six text stages on
+four programs at `-O0` and `-O2`). With `exe` the compile is the executable's, so the MIR and IR it
+also emits are the pruned program it links. Artifacts leave through one function, `put_artifact`:
+stdout for a single stage (byte-for-byte the old path), stdout under a `==> <stage> <==` header for
+a list, or `Options::artifact_path` — `-o`'s path with the stage's `EmitStage::extension` — for a
+list with `-o`; the object and executable reach `emit_native` through a clone of the options whose
+`output` is that path. `report::depfile_targets` names every file written. The combination rules
+that involve other flags (`-o`, `--run`, `--train`, `--depfile`, `--passes`, a `.mir` input) stay in
+`wukongc`'s `parse_args`.
+
 ## Diagnostics
 
 Every diagnostic has a stable code (`E01xx` lexer, `E02xx` parser, `E03xx` name res, `E04xx` types,

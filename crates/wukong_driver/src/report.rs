@@ -304,14 +304,20 @@ impl Drop for PassTimer {
 
 /// What the compile was asked to do, for the report header.
 fn mode_name(opts: &Options) -> String {
+    let stages = || {
+        opts.emit_stages()
+            .map(EmitStage::name)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
     if opts.grad.train && opts.grad.train_artifact {
-        format!("--train --emit={:?}", opts.emit).to_lowercase()
+        format!("--train --emit={}", stages())
     } else if opts.grad.train {
         "--train".to_string()
     } else if opts.run {
         format!("--run, backend {:?}", opts.backend).to_lowercase()
     } else {
-        format!("--emit={:?}", opts.emit).to_lowercase()
+        format!("--emit={}", stages())
     }
 }
 
@@ -330,11 +336,32 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-/// The file a `--depfile` rule names as its target: the artifact this compile writes (`--emit=obj`
-/// or `--emit=exe`, at `-o` or its default name — a `--train --emit=obj|exe` training artifact
-/// included), or — for a mode that writes no artifact (`--run`, an in-process `--train`) — the
-/// dependency file itself, so a build system still reruns the command when an input changes.
-pub(crate) fn depfile_target(opts: &Options, depfile: &Path) -> PathBuf {
+/// The files a `--depfile` rule names as its targets: every artifact this compile writes — the
+/// `--emit=obj` or `--emit=exe` artifact at `-o` or its default name (a `--train --emit=obj|exe`
+/// training artifact included), or each `<stem>.<ext>` a multi-artifact `--emit=a,b -o <stem>`
+/// writes — or, for a compile that writes no file (`--run`, an in-process `--train`, a stage that
+/// prints on stdout), the dependency file itself, so a build system still reruns the command when
+/// an input changes.
+pub(crate) fn depfile_targets(opts: &Options, depfile: &Path) -> Vec<PathBuf> {
+    if opts.run || (opts.grad.train && !opts.grad.train_artifact) {
+        return vec![depfile.to_path_buf()];
+    }
+    if opts.multi_emit() {
+        let written: Vec<PathBuf> = opts
+            .emit_stages()
+            .filter_map(|stage| opts.artifact_path(stage))
+            .collect();
+        return if written.is_empty() {
+            vec![depfile.to_path_buf()]
+        } else {
+            written
+        };
+    }
+    vec![depfile_target(opts, depfile)]
+}
+
+/// [`depfile_targets`] of a single-stage compile: the one artifact it writes, or the depfile.
+fn depfile_target(opts: &Options, depfile: &Path) -> PathBuf {
     let stem = opts
         .input
         .file_stem()
@@ -356,14 +383,19 @@ pub(crate) fn depfile_target(opts: &Options, depfile: &Path) -> PathBuf {
     }
 }
 
-/// The Make-syntax dependency rule for `target`: every source file in `sm` — the root file and
-/// each imported file, exactly the set the compile read — followed by an empty rule per imported
-/// file, so a deleted import does not break the build (`gcc -MD -MP`).
-pub(crate) fn depfile_contents(target: &Path, sm: &SourceMap) -> String {
+/// The Make-syntax dependency rule for `targets` (one rule, several targets for a multi-artifact
+/// compile): every source file in `sm` — the root file and each imported file, exactly the set
+/// the compile read — followed by an empty rule per imported file, so a deleted import does not
+/// break the build (`gcc -MD -MP`).
+pub(crate) fn depfile_contents(targets: &[PathBuf], sm: &SourceMap) -> String {
     let files: Vec<&str> = (0..sm.file_count())
         .map(|i| sm.name(SourceId(i as u32)))
         .collect();
-    let mut out = format!("{}:", make_escape(&target.display().to_string()));
+    let targets: Vec<String> = targets
+        .iter()
+        .map(|t| make_escape(&t.display().to_string()))
+        .collect();
+    let mut out = format!("{}:", targets.join(" "));
     for f in &files {
         let _ = write!(out, " \\\n  {}", make_escape(f));
     }
@@ -398,7 +430,7 @@ mod tests {
         sm.add("dir/main.wk", "");
         sm.add("dir/lib/my math.wk", "");
         sm.add("dir/lib/$cost#1.wk", "");
-        let text = depfile_contents(Path::new("out/prog.o"), &sm);
+        let text = depfile_contents(&[PathBuf::from("out/prog.o")], &sm);
         assert_eq!(
             text,
             "out/prog.o: \\\n  dir/main.wk \\\n  dir/lib/my\\ math.wk \\\n  dir/lib/$$cost\\#1.wk\n\
@@ -447,6 +479,50 @@ mod tests {
         assert_eq!(mode_name(&opts), "--train --emit=obj");
         opts.grad.train_artifact = false;
         assert_eq!(mode_name(&opts), "--train");
+    }
+
+    /// A multi-artifact compile's rule names every file it writes, in pipeline order, as one
+    /// rule's targets; one that prints everything on stdout names the depfile, as a single text
+    /// stage does. The timing header spells the stage list as the command line does.
+    #[test]
+    fn multi_artifact_depfile_names_every_output() {
+        let dep = Path::new("build/prog.d");
+        let mut opts = Options {
+            input: PathBuf::from("src/prog.wk"),
+            emit: EmitStage::Exe,
+            emit_also: vec![EmitStage::MirHigh, EmitStage::LlvmIr],
+            output: Some(PathBuf::from("build/prog")),
+            ..Options::default()
+        };
+        let exe = PathBuf::from("build/prog").with_extension(std::env::consts::EXE_EXTENSION);
+        let targets = depfile_targets(&opts, dep);
+        assert_eq!(
+            targets,
+            [
+                PathBuf::from("build/prog.mir-high"),
+                PathBuf::from("build/prog.ll"),
+                exe.clone(),
+            ]
+        );
+        assert_eq!(mode_name(&opts), "--emit=mir-high,llvm-ir,exe");
+        let mut sm = SourceMap::new();
+        sm.add("src/prog.wk", "");
+        let rule = depfile_contents(&targets, &sm);
+        assert_eq!(
+            rule,
+            format!(
+                "build/prog.mir-high build/prog.ll {}: \\\n  src/prog.wk\n",
+                exe.display()
+            )
+        );
+        opts.emit = EmitStage::LlvmIr;
+        opts.emit_also = vec![EmitStage::Tokens, EmitStage::Mir];
+        opts.output = None;
+        assert_eq!(depfile_targets(&opts, dep), [dep.to_path_buf()]);
+        // A single stage keeps its one target.
+        opts.emit_also.clear();
+        opts.emit = EmitStage::Obj;
+        assert_eq!(depfile_targets(&opts, dep), [PathBuf::from("prog.o")]);
     }
 
     #[test]

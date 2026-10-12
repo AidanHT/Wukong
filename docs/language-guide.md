@@ -2457,6 +2457,9 @@ wukongc [OPTIONS] -e <source>    the program is the <source> argument itself
                       gpu-lower = gpu-native; any other value is a usage error (exit 2)
 --emit=<stage>        tokens | ast | check | mir-high | mir (alias mir-low) | mir-text | grad |
                       llvm-ir | obj | exe   (default: exe)
+--emit=<s>,<s>,...    several artifacts from ONE compile, emitted in pipeline order whatever the
+                      written order: text ones on stdout, each under a `==> <stage> <==` line, or
+                      with -o <stem> every one at <stem>.<ext> (see "Several artifacts at once")
                       mir-text = the optimized MIR with every type, float constant bits, static,
                       extern signedness and parameter promise spelled out. An input ending in
                       .mir is such a dump: `wukongc --emit=mir|mir-text [-O<n>] [--passes=..]
@@ -2511,8 +2514,9 @@ wukongc [OPTIONS] -e <source>    the program is the <source> argument itself
                       "Floating-point semantics"). Rejected with --emit=grad and --train (exit 1).
 -o <path>             write the artifact to <path> — only with --emit=obj or --emit=exe (default:
                       <stem>.o for objects; executables get <stem>.exe on Windows and plain <stem>
-                      on unix). Rejected with --run and with every other stage, which print their
-                      artifact on stdout — redirect instead.
+                      on unix). Rejected with --run and with every other single stage, which print
+                      their artifact on stdout — redirect instead. With several --emit stages,
+                      <path> is the stem every artifact is written under.
 --verify-each         verify MIR after every optimizer pass (also in release builds)
 --time-passes         print per-stage compile times to stderr when the compile ends, with the
                       optimizer's per-pass and Cranelift's codegen/object-write splits and a MIR
@@ -2520,8 +2524,10 @@ wukongc [OPTIONS] -e <source>    the program is the <source> argument itself
 --time-trace=<f>      write the same timings to <f> as Chrome trace-event JSON
                       (chrome://tracing, Perfetto, speedscope)
 --depfile=<f>         write a Make-syntax dependency file (root + every import, plus an empty rule
-                      per import as gcc -MP does); target = the -o artifact for --emit=obj/exe,
-                      otherwise <f> itself. Rejected with --emit=tokens/ast (they stop before imports)
+                      per import as gcc -MP does); targets = every file the compile writes (the -o
+                      artifact of --emit=obj/exe, each <stem>.<ext> of an --emit list with -o),
+                      otherwise <f> itself. Rejected when the last stage is tokens or ast (they stop
+                      before imports)
 --error-format=<f>    human | json   (default: human)
                       json spans carry byte/line end positions, plus suggestions, children,
                       a rendered field and "version":1 (the v0 severity/code/message prefix is
@@ -2619,3 +2625,33 @@ the report. A loss that fails at run time (a failed `assert`, a bounds failure) 
 `--train --run` trains the selected loss without calling `main`. Combining `--train` with any
 other explicit `--emit=<stage>` is a usage error (exit 2). GPU training selectors are unsupported
 by this CPU trainer, and no training speedup is established by the correctness checks.
+
+### Several artifacts at once ✅
+
+`--emit=<stage>,<stage>,...` produces several artifacts from **one** compile, in pipeline order
+(`tokens`, `ast`, `mir-high`, `mir`, `mir-text`, `llvm-ir`, `obj` / `exe`) whatever order the list
+is written in:
+
+```
+wukongc --emit=mir,llvm-ir -O2 kernel.wk                # both on stdout, each under its header
+wukongc --emit=ast,mir-text,obj -O2 -o kernel kernel.wk   # kernel.ast, kernel.mir, kernel.o
+```
+
+Without `-o` every artifact goes to stdout after a `==> <stage> <==` header line (each artifact ends
+in a newline, so the stream splits at the headers); an object or an executable cannot go there, so a
+list with `obj` or `exe` needs `-o`. With `-o <stem>` every artifact — text ones included — is
+written to `<stem>.<ext>` (the `-o` path with its extension replaced) and a `wrote <file>` line goes
+to stderr for each: `.tokens`, `.ast`, `.mir-high`, `.mir-low` for `mir`, `.mir` for `mir-text` (the
+form a `.mir` input is read back as), `.grad`, `.ll` for `llvm-ir`, `.o` for `obj`, and the host's
+executable extension for `exe` (`.exe` on Windows, none on unix). `--depfile` names every file
+written as the rule's targets. Without `exe`, each artifact of a list is byte-for-byte what that
+stage prints alone. With `exe` the compile is the executable's: like `--emit=exe` it keeps only what
+`main` reaches, so the `mir`, `mir-text` and `llvm-ir` it also emits show exactly the program the
+executable was linked from. A stage that fails stops the compile, after the artifacts before it.
+
+Refused, as usage errors (exit 2): an unknown or empty element, a stage named twice (`mir,mir-low`
+included), `check` or `grad` with any stage but `tokens`/`ast` (`check` stops before lowering; a
+gradient compile is its own pipeline — at least `-O1`, autodiff lowering, no pruning), `obj` with
+`exe` (a library object exports every function under its source name, an executable keeps what
+`main` reaches, mangled: two builds), and a list with `--train`. A `.mir` input takes `mir`,
+`mir-text` or both.

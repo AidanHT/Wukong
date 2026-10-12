@@ -38,6 +38,7 @@ wukongc --emit=mir --passes=mem2reg,simplify,dce examples/fib.wk  # a chosen pas
 wukongc --emit=mir-text --target-cpu=x86-64-v2 examples/fib.wk > fib.mir  # MIR that reads back
 wukongc --emit=mir -O2 fib.mir                       # optimize a MIR dump, no front end
 wukongc --emit=exe -O2 --target-cpu=x86-64 examples/fib.wk  # portable AOT executable
+wukongc --emit=mir,llvm-ir,obj -O2 -o fib examples/fib.wk  # fib.mir-low, fib.ll, fib.o
 ```
 
 `--run` defaults to the interpreter; add `--backend=native` for the Cranelift JIT. GPU backends
@@ -48,7 +49,9 @@ compile's time went, and `--depfile=<f>` writes a Make dependency rule over the 
 `--print-after=<pass>` prints the MIR to stderr after each run of a named pass (`docs/internals.md`,
 "Running a chosen pass list"). `--emit=mir-text` prints MIR with every type spelled out, and
 `wukongc --emit=mir|mir-text <file>.mir` reads it back, so an optimizer bug reproduces from a dump
-(`docs/internals.md`, "Typed textual MIR").
+(`docs/internals.md`, "Typed textual MIR"). `--emit=<stage>,<stage>,...` writes several artifacts
+from one compile — on stdout under `==> <stage> <==` headers, or each at `<stem>.<ext>` with
+`-o <stem>` (language guide, "Several artifacts at once").
 
 ## Why Wukong
 

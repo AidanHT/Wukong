@@ -23,17 +23,29 @@ OPTIONS:
     --time-trace=<f>   Write the same timings to <f> as Chrome trace-event JSON
                        (chrome://tracing, Perfetto, speedscope)
     --depfile=<f>      Write a Make-syntax dependency file to <f> naming every source file
-                       read (the root and each import); its target is the -o artifact for
-                       --emit=obj/exe, otherwise <f> itself (not with --emit=tokens/ast)
+                       read (the root and each import); its targets are the files the compile
+                       writes (the -o artifact of --emit=obj/exe, each <stem>.<ext> of an
+                       --emit list with -o), otherwise <f> itself (not when the last stage is
+                       tokens or ast)
     --emit=<stage>     Emit an intermediate artifact and stop. One of:
                        tokens, ast, check, mir-high, mir, mir-text, grad, llvm-ir, obj, exe
                        (default: exe)
                        (mir-text = the optimized MIR with every type, float bits and parameter
                        promise spelled out; `wukongc --emit=mir|mir-text [-O<n>] [--passes=..]
                        f.mir` reads it back, verifies, optimizes and prints it. A .mir input takes
-                       no other stage and no --run)
+                       only those two stages and no --run)
                        (grad = reverse-mode backward MIR of a loss fn; see --grad-of/--grad-wrt)
                        (check = run lex/parse/imports/sema only, report diagnostics, no lowering)
+    --emit=<stage>,<stage>...
+                       Emit several artifacts from ONE compile, in pipeline order whatever the
+                       written order. Text artifacts go to stdout, each under a
+                       `==> <stage> <==` header line; with -o <stem> every artifact goes to
+                       <stem>.<ext> instead: .tokens, .ast, .mir-high, .mir-low (mir), .mir
+                       (mir-text), .grad, .ll (llvm-ir), .o (obj), the host's executable
+                       extension (exe). obj or exe in a list needs -o; check and grad combine
+                       only with tokens/ast; obj not with exe. With exe in the list the compile
+                       is the executable's: mir/mir-text/llvm-ir show the program pruned to
+                       what main reaches
     --grad-of=<fn>     Function to differentiate for --emit=grad / --train  (default: loss).
                        With --emit=obj, the object also exports the gradient as <fn>_grad
     --grad-wrt=<i,..>  Comma-separated parameter indices to differentiate w.r.t. (default: all
@@ -69,7 +81,8 @@ OPTIONS:
                        so the object runs on any CPU of that level; the JIT refuses a level the
                        host lacks.
     -o <path>          Write the artifact to <path>. Only --emit=obj and --emit=exe write a
-                       file; every other stage prints its artifact on stdout.
+                       file; every other stage prints its artifact on stdout. With several
+                       --emit stages <path> is the stem every artifact is written under
     -O0|-O1|-O2|-O3    Optimization level (default: -O0)
     --passes=<list>    Run exactly this comma-separated optimizer pass list instead of the -O
                        level's (-O still sets the native code generator's level); `--passes=`
@@ -123,6 +136,7 @@ EXAMPLES:
     wukongc --train --train-opt=adamw --emit=exe -o train.exe model.wk
     wukongc --run model.wk -- data/weights.bin 64
     wukongc --run -e 'fn main() -> i32 { printf(\"{}\\n\", 6 * 7); return 0; }'
+    wukongc --emit=mir,llvm-ir,obj -O2 -o kernel kernel.wk
 ";
 
 fn main() -> ExitCode {
@@ -490,9 +504,12 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 opts.output = Some(PathBuf::from(path));
             }
             _ if arg.starts_with("--emit=") => {
-                let stage = &arg["--emit=".len()..];
-                opts.emit = EmitStage::parse(stage)
-                    .ok_or_else(|| format!("unknown --emit target `{stage}`"))?;
+                // One stage, or several from one compile (`--emit=mir,llvm-ir`): the last in
+                // pipeline order is the stage the compile runs to, the rest are emitted on the way.
+                let list = &arg["--emit=".len()..];
+                let (last, also) = EmitStage::parse_list(list)?;
+                opts.emit = last;
+                opts.emit_also = also;
                 emit_explicit = true;
             }
             _ if arg.starts_with("--grad-of=") => {
@@ -677,6 +694,13 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     // `--train` either runs now or, with `--emit=exe|obj` (or `-o`, whose default stage is `exe`),
     // is built into an artifact that runs the same loop. No other stage is a training artifact.
     if opts.grad.train {
+        if opts.multi_emit() {
+            return Err(
+                "`--train` builds one artifact (`--emit=exe` or `--emit=obj`), not an \
+                 `--emit=<stage>,<stage>` list"
+                    .into(),
+            );
+        }
         if emit_explicit && !matches!(opts.emit, EmitStage::Obj | EmitStage::Exe) {
             return Err(
                 "`--train` cannot be combined with `--emit=<stage>` other than `exe` or `obj`: \
@@ -698,7 +722,9 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     // `-o` names an artifact FILE, and only the two artifact stages write one. For every textual
     // stage the driver prints to stdout and the flag was silently ignored — no file appeared and
     // the process still exited 0, so `wukongc --emit=llvm-ir -o out.ll p.wk && llc out.ll` failed
-    // at the *next* command with a missing-file error naming the wrong culprit.
+    // at the *next* command with a missing-file error naming the wrong culprit. A multi-artifact
+    // `--emit=a,b` is the exception: there `-o` names the stem every artifact is written under
+    // (`<stem>.<ext>`), the text ones included.
     if opts.output.is_some() {
         if opts.run {
             return Err(
@@ -706,13 +732,27 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                     .to_string(),
             );
         }
-        if !matches!(opts.emit, EmitStage::Obj | EmitStage::Exe) {
+        if !opts.multi_emit() && !matches!(opts.emit, EmitStage::Obj | EmitStage::Exe) {
             return Err(
                 "`-o` is only supported with `--emit=obj` and `--emit=exe`: every other stage \
                  prints its artifact on stdout (redirect it instead)"
                     .to_string(),
             );
         }
+    }
+
+    // Without `-o` a multi-artifact compile prints its text artifacts on stdout, one after another;
+    // an object or an executable has no place in that stream.
+    if opts.multi_emit() && opts.emit.is_binary() && opts.output.is_none() {
+        return Err(format!(
+            "`--emit={}` with `{}` writes every artifact to a file: give `-o <stem>` (each \
+             artifact is written to `<stem>.<ext>`)",
+            opts.emit_stages()
+                .map(EmitStage::name)
+                .collect::<Vec<_>>()
+                .join(","),
+            opts.emit.name()
+        ));
     }
 
     // `--passes` / `--print-after` act on the optimizer, so a stage that stops before it would
@@ -759,7 +799,11 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                     .to_string(),
             );
         }
-        if !emit_explicit || !matches!(opts.emit, EmitStage::Mir | EmitStage::MirText) {
+        if !emit_explicit
+            || !opts
+                .emit_stages()
+                .all(|s| matches!(s, EmitStage::Mir | EmitStage::MirText))
+        {
             return Err(
                 "a `.mir` input is read only by `--emit=mir` and `--emit=mir-text`".to_string(),
             );
@@ -1194,6 +1238,105 @@ mod tests {
         assert!(parse(&["--run", "--emit=mir-text", "p.wk"]).is_err());
         assert!(parse(&["--emit=mir-text", "-o", "p.txt", "p.wk"]).is_err());
         assert!(USAGE.contains("mir-text") && USAGE.contains("f.mir"));
+    }
+
+    /// `--emit=a,b`: one compile whose stages sort into pipeline order (the last is the stage the
+    /// compile runs to, the others are emitted on the way), with `-o` naming the stem of every
+    /// artifact. A list one compile cannot honour, and a flag a list contradicts, is a usage error.
+    #[test]
+    fn multi_artifact_emit_lists_parse_and_reject_contradictions() {
+        let parse = |a: &[&str]| parse_args(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let o = parse(&["--emit=llvm-ir,mir,tokens", "p.wk"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(o.emit, EmitStage::LlvmIr);
+        assert_eq!(o.emit_also, [EmitStage::Tokens, EmitStage::Mir]);
+        assert!(o.multi_emit() && o.output.is_none());
+        let o = parse(&["--emit=exe,mir-text", "-o", "out/k", "p.wk"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (o.emit, &o.emit_also[..]),
+            (EmitStage::Exe, &[EmitStage::MirText][..])
+        );
+        assert_eq!(
+            o.artifact_path(EmitStage::MirText),
+            Some(PathBuf::from("out/k.mir"))
+        );
+        let o = parse(&["--emit=mir,llvm-ir,mir-high", "-o", "out/k.v2", "p.wk"])
+            .unwrap()
+            .unwrap();
+        for (stage, file) in [
+            (EmitStage::MirHigh, "out/k.mir-high"),
+            (EmitStage::Mir, "out/k.mir-low"),
+            (EmitStage::LlvmIr, "out/k.ll"),
+        ] {
+            assert_eq!(o.artifact_path(stage), Some(PathBuf::from(file)));
+        }
+        // A single stage is exactly what it was: no list, and `-o` only for obj/exe.
+        let single = parse(&["--emit=mir", "p.wk"]).unwrap().unwrap();
+        assert!(!single.multi_emit() && single.artifact_path(EmitStage::Mir).is_none());
+        assert!(parse(&["--emit=mir", "-o", "k", "p.wk"]).is_err());
+        for (bad, says) in [
+            (&["--emit=mir,", "p.wk"][..], "empty stage"),
+            (&["--emit=mir,bogus", "p.wk"][..], "bogus"),
+            (&["--emit=mir,mir-low", "p.wk"][..], "twice"),
+            (&["--emit=check,mir", "p.wk"][..], "combines only"),
+            (&["--emit=grad,llvm-ir", "p.wk"][..], "combines only"),
+            (
+                &["--emit=obj,exe", "-o", "k", "p.wk"][..],
+                "two different builds",
+            ),
+            (&["--emit=mir,obj", "p.wk"][..], "-o <stem>"),
+            (&["--emit=mir,exe", "p.wk"][..], "-o <stem>"),
+            (
+                &["--train", "--emit=mir,exe", "-o", "k", "p.wk"][..],
+                "one artifact",
+            ),
+            (&["--run", "--emit=mir,llvm-ir", "p.wk"][..], "--run"),
+            (
+                &["--emit=tokens,ast", "--depfile=p.d", "p.wk"][..],
+                "--depfile",
+            ),
+            (&["--emit=mir-high,mir", "x.mir"][..], ".mir"),
+            (
+                &["--passes=dce", "--emit=tokens,mir-high", "p.wk"][..],
+                "--passes",
+            ),
+            (
+                &[
+                    "--passes=dce",
+                    "--emit=mir,obj",
+                    "--grad-of=loss",
+                    "-o",
+                    "k",
+                    "p.wk",
+                ][..],
+                "gradient",
+            ),
+        ] {
+            let err = parse(bad).unwrap_err();
+            assert!(err.contains(says), "{bad:?}: {err}");
+        }
+        for ok in [
+            &["--emit=tokens,check", "p.wk"][..],
+            &["--emit=ast,grad", "p.wk"][..],
+            &["--emit=mir,mir-text", "x.mir"][..],
+            &["--emit=mir,mir-text", "-o", "k", "x.mir"][..],
+            &["--emit=tokens,mir", "--depfile=p.d", "p.wk"][..],
+            &["--emit=mir-high,mir", "--passes=dce", "p.wk"][..],
+            &["--emit=mir,obj", "--grad-of=loss", "-o", "k", "p.wk"][..],
+        ] {
+            assert!(parse(ok).is_ok(), "{ok:?}: {:?}", parse(ok).err());
+        }
+        for doc in [
+            "--emit=<stage>,<stage>...",
+            "==> <stage> <==",
+            ".mir-low",
+            "<stem>",
+        ] {
+            assert!(USAGE.contains(doc), "USAGE must document {doc}");
+        }
     }
 
     #[test]

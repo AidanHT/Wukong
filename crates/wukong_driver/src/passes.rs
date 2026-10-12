@@ -465,7 +465,7 @@ pub(crate) fn compile_mir_text(opts: &Options) -> i32 {
             return exit::UNIMPLEMENTED;
         }
     };
-    let typed = opts.emit == EmitStage::MirText;
+    let typed = opts.emits(EmitStage::MirText);
     if let Err(failure) = run_steps(
         &mut program,
         &steps,
@@ -484,21 +484,20 @@ pub(crate) fn compile_mir_text(opts: &Options) -> i32 {
     }
     timer.mir_summary(&program, &interner);
     timer.begin("emit-mir");
-    let verify_failed = match opts.emit {
-        EmitStage::MirText => crate::emit_mir_text(&program, &interner),
-        EmitStage::Mir => crate::emit_mir(&program, &interner),
-        _ => {
-            crate::emit_driver_error(
-                opts,
-                "a `.mir` input is read only by `--emit=mir` and `--emit=mir-text`",
-            );
-            return exit::UNIMPLEMENTED;
-        }
-    };
-    if verify_failed {
-        exit::COMPILE_ERROR
-    } else {
-        exit::OK
+    if !opts
+        .emit_stages()
+        .all(|s| matches!(s, EmitStage::Mir | EmitStage::MirText))
+    {
+        crate::emit_driver_error(
+            opts,
+            "a `.mir` input is read only by `--emit=mir` and `--emit=mir-text`",
+        );
+        return exit::UNIMPLEMENTED;
+    }
+    match crate::emit_optimized_mir(opts, &program, &interner) {
+        Ok(false) => exit::OK,
+        Ok(true) => exit::COMPILE_ERROR,
+        Err(code) => code,
     }
 }
 

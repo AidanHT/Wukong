@@ -246,6 +246,32 @@ fn representative_llvm_ir_emission_is_deterministic_across_processes() {
     }
 }
 
+/// A multi-artifact `--emit=a,b,..` stream (every text stage of one compile, under its headers) is
+/// as reproducible as each stage alone.
+#[test]
+fn representative_multi_artifact_emission_is_deterministic_across_processes() {
+    for name in ["generics_monomorphization.wk", "import_multi.wk"] {
+        let artifact = assert_representative_text_determinism(
+            &repo_dir("run").join(name),
+            &["--emit=tokens,ast,mir-high,mir,mir-text,llvm-ir", "-O2"],
+        );
+        let text = std::str::from_utf8(&artifact).expect("text artifacts must be UTF-8");
+        let headers: Vec<&str> = text.lines().filter(|l| l.starts_with("==> ")).collect();
+        assert_eq!(
+            headers,
+            [
+                "==> tokens <==",
+                "==> ast <==",
+                "==> mir-high <==",
+                "==> mir <==",
+                "==> mir-text <==",
+                "==> llvm-ir <==",
+            ],
+            "{name}"
+        );
+    }
+}
+
 #[test]
 fn representative_grad_emission_is_deterministic_across_processes() {
     let scratch = ScratchDir::new("grad");

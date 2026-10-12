@@ -55,7 +55,11 @@ mod prune;
 mod report;
 
 /// Which intermediate (or final) artifact the user asked to produce.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+///
+/// The declaration order is the **pipeline order** — the order the stages are reached in one
+/// compile — and the derived `Ord` is load-bearing: a multi-artifact `--emit=a,b` sorts its stages
+/// by it ([`EmitStage::parse_list`]) and emits them in that order.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum EmitStage {
     Tokens,
     Ast,
@@ -96,6 +100,109 @@ impl EmitStage {
             _ => return None,
         })
     }
+
+    /// The stage's `--emit` spelling (the canonical one where it has an alias: `mir`, not
+    /// `mir-low`).
+    pub fn name(self) -> &'static str {
+        match self {
+            EmitStage::Tokens => "tokens",
+            EmitStage::Ast => "ast",
+            EmitStage::Check => "check",
+            EmitStage::MirHigh => "mir-high",
+            EmitStage::Mir => "mir",
+            EmitStage::MirText => "mir-text",
+            EmitStage::Grad => "grad",
+            EmitStage::LlvmIr => "llvm-ir",
+            EmitStage::Obj => "obj",
+            EmitStage::Exe => "exe",
+        }
+    }
+
+    /// The file extension a multi-artifact `--emit=a,b -o <stem>` writes this stage's artifact
+    /// under: `<stem>.<extension>`. `None` for `check`, which writes no artifact. The typed MIR
+    /// (`mir-text`) owns `.mir` because a `.mir` input is read back as exactly that form; the
+    /// untyped dump is `.mir-low`, its alias's name. `exe` is the host's executable extension
+    /// (`exe` on Windows, none on unix, where the stem is the executable's name).
+    pub fn extension(self) -> Option<&'static str> {
+        Some(match self {
+            EmitStage::Tokens => "tokens",
+            EmitStage::Ast => "ast",
+            EmitStage::Check => return None,
+            EmitStage::MirHigh => "mir-high",
+            EmitStage::Mir => "mir-low",
+            EmitStage::MirText => "mir",
+            EmitStage::Grad => "grad",
+            EmitStage::LlvmIr => "ll",
+            EmitStage::Obj => "o",
+            EmitStage::Exe => std::env::consts::EXE_EXTENSION,
+        })
+    }
+
+    /// Does this stage write a binary artifact (an object or an executable) rather than text?
+    pub fn is_binary(self) -> bool {
+        matches!(self, EmitStage::Obj | EmitStage::Exe)
+    }
+
+    /// Parse the value of `--emit=<stage>[,<stage>...]`: one or more stages that ONE compile
+    /// produces. Returns the stages in pipeline order — the last is the stage the compile runs to
+    /// ([`Options::emit`]) and the others are the artifacts it emits on the way
+    /// ([`Options::emit_also`]). The written order does not matter.
+    ///
+    /// A list is refused where no single compile could honour it: an unknown or empty element, a
+    /// stage named twice (an alias included: `mir,mir-low`), `check` or `grad` with any stage but
+    /// `tokens`/`ast` (`check` stops before lowering; a gradient compile is its own pipeline —
+    /// forced `-O1`, autodiff lowering, no pruning), and `obj` with `exe` (a library object exports
+    /// every function under its source name, an executable keeps what `main` reaches, mangled:
+    /// two different builds). `tokens` and `ast` dump the root file before anything else runs, so
+    /// they combine with every stage.
+    pub fn parse_list(list: &str) -> Result<(EmitStage, Vec<EmitStage>), String> {
+        let mut stages: Vec<EmitStage> = Vec::new();
+        for part in list.split(',') {
+            if part.is_empty() {
+                return Err(format!("empty stage in `--emit={list}`"));
+            }
+            let stage =
+                EmitStage::parse(part).ok_or_else(|| format!("unknown --emit target `{part}`"))?;
+            if stages.contains(&stage) {
+                return Err(format!(
+                    "`--emit={list}` names the `{}` stage twice",
+                    stage.name()
+                ));
+            }
+            stages.push(stage);
+        }
+        stages.sort();
+        let several = stages.len() > 1;
+        for lone in [EmitStage::Check, EmitStage::Grad] {
+            if several
+                && stages.contains(&lone)
+                && stages
+                    .iter()
+                    .any(|s| !matches!(*s, EmitStage::Tokens | EmitStage::Ast) && *s != lone)
+            {
+                return Err(format!(
+                    "`--emit={}` combines only with `tokens` and `ast`: {}",
+                    lone.name(),
+                    if lone == EmitStage::Check {
+                        "it stops before lowering, so no later stage runs"
+                    } else {
+                        "a gradient compile is its own pipeline (at least -O1, autodiff lowering, \
+                         no pruning), not the one the other stages describe"
+                    }
+                ));
+            }
+        }
+        if stages.contains(&EmitStage::Obj) && stages.contains(&EmitStage::Exe) {
+            return Err(
+                "`--emit=obj,exe` asks for two different builds: an object exports every \
+                        function under its source name, an executable keeps only what `main` \
+                        reaches; run the compiler once for each"
+                    .to_string(),
+            );
+        }
+        let last = stages.pop().expect("a split yields at least one element");
+        Ok((last, stages))
+    }
 }
 
 /// How diagnostics are presented to the user.
@@ -129,7 +236,16 @@ pub enum BackendKind {
 pub struct Options {
     pub input: PathBuf,
     pub output: Option<PathBuf>,
+    /// The stage the compile runs to: the only stage of `--emit=<stage>`, or the last (in pipeline
+    /// order) of `--emit=a,b,..`.
     pub emit: EmitStage,
+    /// The other stages of a multi-artifact `--emit=a,b,..`, in pipeline order, each strictly
+    /// before [`Options::emit`]: the same compile emits each artifact as it passes that stage.
+    /// Empty for a single stage. With several stages every text artifact goes to stdout under a
+    /// `==> <stage> <==` header, or — with `-o <stem>` — every artifact to `<stem>.<ext>`
+    /// ([`EmitStage::extension`]). See [`EmitStage::parse_list`] for the lists one compile can
+    /// honour.
+    pub emit_also: Vec<EmitStage>,
     pub run: bool,
     pub opt_level: u8,
     /// Validate MIR after each optimizer pass, including in release builds (`--verify-each`).
@@ -268,6 +384,7 @@ impl Default for Options {
             input: PathBuf::new(),
             output: None,
             emit: EmitStage::Exe,
+            emit_also: Vec::new(),
             run: false,
             opt_level: 0,
             verify_each: false,
@@ -288,6 +405,38 @@ impl Default for Options {
             source: None,
             program_args: Vec::new(),
         }
+    }
+}
+
+impl Options {
+    /// Does this compile emit `stage`'s artifact — the stage it runs to, or one on the way?
+    pub fn emits(&self, stage: EmitStage) -> bool {
+        self.emit == stage || self.emit_also.contains(&stage)
+    }
+
+    /// Is this a multi-artifact compile (`--emit=a,b,..` with at least two stages)?
+    pub fn multi_emit(&self) -> bool {
+        !self.emit_also.is_empty()
+    }
+
+    /// Every stage this compile emits, in pipeline order.
+    pub fn emit_stages(&self) -> impl Iterator<Item = EmitStage> + '_ {
+        self.emit_also
+            .iter()
+            .copied()
+            .chain(std::iter::once(self.emit))
+    }
+
+    /// The file a multi-artifact compile with `-o <stem>` writes `stage`'s artifact to: the `-o`
+    /// path with its extension replaced by the stage's ([`EmitStage::extension`]). `None` for a
+    /// single-stage compile (whose `-o` names the one artifact itself), without `-o` (text goes to
+    /// stdout), and for `check`, which writes nothing.
+    pub fn artifact_path(&self, stage: EmitStage) -> Option<PathBuf> {
+        if !self.multi_emit() {
+            return None;
+        }
+        let stem = self.output.as_ref()?;
+        Some(stem.with_extension(stage.extension()?))
     }
 }
 
@@ -462,14 +611,27 @@ pub fn compile(opts: &Options) -> i32 {
         sink.emit(d);
     }
 
-    if opts.emit == EmitStage::Tokens {
-        render_all(opts, &renderer, &sink, &sm);
-        print_artifact(&wukong_lexer::dump(&tokens, sm.source(id)));
-        return if sink.has_errors() {
-            exit::COMPILE_ERROR
-        } else {
-            exit::OK
-        };
+    // On the way to a later stage (`--emit=tokens,..`) a clean lex just emits its dump: the lexer's
+    // diagnostics, if any, are rendered with the parser's below.
+    if opts.emits(EmitStage::Tokens) {
+        let stop = opts.emit == EmitStage::Tokens || sink.has_errors();
+        if stop {
+            render_all(opts, &renderer, &sink, &sm);
+        }
+        if let Err(code) = put_artifact(
+            opts,
+            EmitStage::Tokens,
+            &wukong_lexer::dump(&tokens, sm.source(id)),
+        ) {
+            return code;
+        }
+        if stop {
+            return if sink.has_errors() {
+                exit::COMPILE_ERROR
+            } else {
+                exit::OK
+            };
+        }
     }
 
     // --- Parsing ---
@@ -493,18 +655,35 @@ pub fn compile(opts: &Options) -> i32 {
     // these stages inspect the lex/parse of the exact file you point the compiler at, so imports
     // are not loaded or spliced here. The merged multi-file program is what every later stage
     // (`--emit=mir-high` onward, `--run`) sees.
-    if opts.emit == EmitStage::Ast {
+    if opts.emit == EmitStage::Ast || (opts.emits(EmitStage::Ast) && sink.has_errors()) {
         // The parser's lints print after the errors and before the summary, so the first
         // diagnostic is still the first error (the `tests/fail` contract).
         let errors = emit_diags(sink.diagnostics(), opts, &renderer, &sm);
         let denied = render_lints(parse_lints, &module, &interner, opts, &renderer, &sm);
         emit_summary(errors + denied, opts, &renderer);
-        print_artifact(&wukong_ast::print::print_module(&module, &interner));
+        if let Err(code) = put_artifact(
+            opts,
+            EmitStage::Ast,
+            &wukong_ast::print::print_module(&module, &interner),
+        ) {
+            return code;
+        }
         return if sink.has_errors() || denied > 0 {
             exit::COMPILE_ERROR
         } else {
             exit::OK
         };
+    }
+    // On the way to a later stage a clean parse just emits its dump; the parser's lints are
+    // resolved and rendered at the lint stage, as for any compile that gets that far.
+    if opts.emits(EmitStage::Ast) {
+        if let Err(code) = put_artifact(
+            opts,
+            EmitStage::Ast,
+            &wukong_ast::print::print_module(&module, &interner),
+        ) {
+            return code;
+        }
     }
 
     if sink.has_errors() {
@@ -549,8 +728,8 @@ pub fn compile(opts: &Options) -> i32 {
     drop(sink);
     // Every file the compile reads is in the SourceMap by now: the root and each import, once.
     if let Some(depfile) = &opts.depfile {
-        let target = report::depfile_target(opts, depfile);
-        if let Err(e) = std::fs::write(depfile, report::depfile_contents(&target, &sm)) {
+        let targets = report::depfile_targets(opts, depfile);
+        if let Err(e) = std::fs::write(depfile, report::depfile_contents(&targets, &sm)) {
             eprintln!("error: could not write `{}`: {e}", depfile.display());
             return exit::IO_ERROR;
         }
@@ -671,15 +850,22 @@ pub fn compile(opts: &Options) -> i32 {
 
     // High MIR is the pre-optimization form. It is still dumped for debugging even when lowering
     // failed, since seeing the partial MIR is useful.
-    if opts.emit == EmitStage::MirHigh {
+    if opts.emits(EmitStage::MirHigh) {
         // Dump the (possibly partial) MIR, then fail the process if lowering errored or the verifier
         // reported an internal-compiler-error — a printed ICE must never report success.
-        let verify_failed = emit_mir(&program, &interner);
-        return if verify_failed || lowering_failed {
-            exit::COMPILE_ERROR
-        } else {
-            exit::OK
-        };
+        let verify_failed =
+            match emit_mir_artifact(opts, EmitStage::MirHigh, &program, &interner, true) {
+                Ok(failed) => failed,
+                Err(code) => return code,
+            };
+        if opts.emit == EmitStage::MirHigh || verify_failed {
+            return if verify_failed || lowering_failed {
+                exit::COMPILE_ERROR
+            } else {
+                exit::OK
+            };
+        }
+        // On the way to a later stage, a lowering error stops the compile just below.
     }
 
     // A construct codegen could not lower leaves the MIR invalid, so do not optimize, run, or hand
@@ -704,7 +890,8 @@ pub fn compile(opts: &Options) -> i32 {
     // as do the autodiff stages (their entry point is the loss function, not `main`).
     // `--backend=gpu-native` also keeps everything: its whole-program PTX lowering declines a
     // program on any unsupported function, and pruning would silently change which corpus programs
-    // the device suite attempts.
+    // the device suite attempts. A multi-artifact `--emit=..,exe` is the executable's compile, so
+    // the `mir`/`mir-text`/`llvm-ir` it also emits show exactly the pruned program it links.
     let single_entry = opts.run || opts.emit == EmitStage::Exe;
     if single_entry && !opts.grad.train && opts.backend != BackendKind::GpuLower {
         let main = interner.intern("main");
@@ -759,7 +946,7 @@ pub fn compile(opts: &Options) -> i32 {
             opts.verify_each,
             opts.print_after.as_deref(),
             &interner,
-            opts.emit == EmitStage::MirText,
+            opts.emits(EmitStage::MirText),
         ) {
             emit_diag(
                 &optimization_failure_diag(&failure, &interner),
@@ -922,19 +1109,19 @@ pub fn compile(opts: &Options) -> i32 {
         };
     }
 
-    if matches!(opts.emit, EmitStage::Mir | EmitStage::MirText) {
+    if opts.emits(EmitStage::Mir) || opts.emits(EmitStage::MirText) {
         timer.begin("emit-mir");
         // A verifier failure means we just printed an internal-compiler-error; never report success.
-        let verify_failed = if opts.emit == EmitStage::MirText {
-            emit_mir_text(&program, &interner)
-        } else {
-            emit_mir(&program, &interner)
+        let verify_failed = match emit_optimized_mir(opts, &program, &interner) {
+            Ok(failed) => failed,
+            Err(code) => return code,
         };
-        return if verify_failed {
-            exit::COMPILE_ERROR
-        } else {
-            exit::OK
-        };
+        if verify_failed {
+            return exit::COMPILE_ERROR;
+        }
+        if matches!(opts.emit, EmitStage::Mir | EmitStage::MirText) {
+            return exit::OK;
+        }
     }
 
     // The AOT exits get the same gate as `--run` above. They used to have none: the verify loop was
@@ -942,8 +1129,8 @@ pub fn compile(opts: &Options) -> i32 {
     // `#[cfg(debug_assertions)]`, so a release `wukongc` handed unverified MIR to `emit_llvm_ir` and
     // to Cranelift — the one path where an invalid lowering became a raw backend assertion or a
     // silently miscompiled artifact instead of a diagnosable ICE. (`--emit=mir`/`mir-high` are
-    // deliberately *not* gated here: they verify inside `emit_mir` after dumping, so a broken program
-    // still prints the MIR that shows why.)
+    // deliberately *not* gated here: they verify in `emit_mir_artifact` as they dump, so a broken
+    // program still prints the MIR that shows why.)
     timer.begin("verify");
     if matches!(
         opts.emit,
@@ -954,12 +1141,16 @@ pub fn compile(opts: &Options) -> i32 {
     }
 
     // --- LLVM backend ---
-    if opts.emit == EmitStage::LlvmIr {
+    if opts.emits(EmitStage::LlvmIr) {
         timer.begin("llvm-ir");
-        return match wukong_codegen_llvm::try_emit_llvm_ir(&program, &interner) {
+        match wukong_codegen_llvm::try_emit_llvm_ir(&program, &interner) {
             Ok(ir) => {
-                print_artifact(&ir);
-                exit::OK
+                if let Err(code) = put_artifact(opts, EmitStage::LlvmIr, &ir) {
+                    return code;
+                }
+                if opts.emit == EmitStage::LlvmIr {
+                    return exit::OK;
+                }
             }
             Err(message) => {
                 emit_diag(
@@ -969,12 +1160,31 @@ pub fn compile(opts: &Options) -> i32 {
                     // Backend errors have no source labels; frontend sources were released.
                     &SourceMap::new(),
                 );
-                exit::UNIMPLEMENTED
+                return exit::UNIMPLEMENTED;
             }
-        };
+        }
     }
     if matches!(opts.emit, EmitStage::Obj | EmitStage::Exe) {
-        return emit_native(&program, &interner, opts, &mut timer, native_sm.as_ref());
+        // A multi-artifact compile writes its object or executable at `<stem>.<ext>`
+        // (`Options::artifact_path`); `emit_native` writes wherever `output` names.
+        let multi;
+        let native_opts = match opts.artifact_path(opts.emit) {
+            Some(path) => {
+                multi = Options {
+                    output: Some(path),
+                    ..opts.clone()
+                };
+                &multi
+            }
+            None => opts,
+        };
+        return emit_native(
+            &program,
+            &interner,
+            native_opts,
+            &mut timer,
+            native_sm.as_ref(),
+        );
     }
 
     exit::OK
@@ -2472,10 +2682,10 @@ fn emit_grad(program: &wukong_mir::Program, interner: &mut Interner, opts: &Opti
     };
     // A verifier failure means we just printed an internal-compiler-error; never report success —
     // the same mapping the `--emit=mir` / `--emit=mir-high` callers already apply.
-    if emit_mir(&out, interner) {
-        exit::COMPILE_ERROR
-    } else {
-        exit::OK
+    match emit_mir_artifact(opts, EmitStage::Grad, &out, interner, true) {
+        Ok(false) => exit::OK,
+        Ok(true) => exit::COMPILE_ERROR,
+        Err(code) => code,
     }
 }
 
@@ -3141,17 +3351,52 @@ fn build_train_artifact(
 /// `internal compiler error (MIR verify)` line to stderr. Returns `true` if the verifier reported
 /// at least one failure, so callers can map an internal-compiler-error to a nonzero process exit
 /// status instead of reporting success on invalid MIR.
-fn emit_mir(program: &wukong_mir::Program, interner: &Interner) -> bool {
-    let verify_failed = verify_or_ice(program);
-    print_artifact(&wukong_mir::print::print_program(program, interner));
-    verify_failed
+///
+/// `stage` is the MIR artifact: `mir-high` / `mir` print the untyped dump (verifier first), and
+/// `mir-text` the typed, parseable form (verifier after — a program the verifier rejects still
+/// prints, so the dump shows what is wrong). `verify: false` skips the verifier, for a second dump
+/// of a program one already verified. `Err` carries the exit code when the artifact could not be
+/// written ([`put_artifact`]).
+fn emit_mir_artifact(
+    opts: &Options,
+    stage: EmitStage,
+    program: &wukong_mir::Program,
+    interner: &Interner,
+    verify: bool,
+) -> Result<bool, i32> {
+    if stage == EmitStage::MirText {
+        put_artifact(
+            opts,
+            stage,
+            &wukong_mir::text::print_program_typed(program, interner),
+        )?;
+        return Ok(verify && verify_or_ice(program));
+    }
+    let verify_failed = verify && verify_or_ice(program);
+    put_artifact(
+        opts,
+        stage,
+        &wukong_mir::print::print_program(program, interner),
+    )?;
+    Ok(verify_failed)
 }
 
-/// [`emit_mir`]'s typed twin (`--emit=mir-text`): print the parseable form, then verify. A program
-/// the verifier rejects still prints, so the dump shows what is wrong, and the exit is non-zero.
-fn emit_mir_text(program: &wukong_mir::Program, interner: &Interner) -> bool {
-    print_artifact(&wukong_mir::text::print_program_typed(program, interner));
-    verify_or_ice(program)
+/// The optimized-MIR artifacts this compile asks for — `mir`, `mir-text`, or both — verified once.
+/// `Ok(true)` when the verifier reported an internal-compiler-error.
+fn emit_optimized_mir(
+    opts: &Options,
+    program: &wukong_mir::Program,
+    interner: &Interner,
+) -> Result<bool, i32> {
+    let mut verified = false;
+    let mut verify_failed = false;
+    for stage in [EmitStage::Mir, EmitStage::MirText] {
+        if opts.emits(stage) {
+            verify_failed |= emit_mir_artifact(opts, stage, program, interner, !verified)?;
+            verified = true;
+        }
+    }
+    Ok(verify_failed)
 }
 
 /// Run the MIR verifier over the program, including internal call signatures, reporting each violation as an
@@ -3178,6 +3423,33 @@ fn verify_or_ice(program: &wukong_mir::Program) -> bool {
 fn print_artifact(s: &str) {
     use std::io::Write;
     let _ = std::io::stdout().write_all(s.as_bytes());
+}
+
+/// Hand `stage`'s textual artifact to its destination. A single-stage compile prints it on stdout
+/// exactly as it always has. A multi-artifact compile (`--emit=a,b`) writes it to
+/// `<stem>.<ext>` under `-o <stem>` (with a `wrote <file>` note on stderr, as for an object), and
+/// otherwise prints it on stdout under a `==> <stage> <==` header line — the artifacts follow one
+/// another in pipeline order, each ending in a newline, so the stream splits at the headers.
+/// `Err` is the exit code after a write failure was reported.
+fn put_artifact(opts: &Options, stage: EmitStage, text: &str) -> Result<(), i32> {
+    if !opts.multi_emit() {
+        print_artifact(text);
+        return Ok(());
+    }
+    if let Some(path) = opts.artifact_path(stage) {
+        if let Err(e) = std::fs::write(&path, text) {
+            emit_driver_error(opts, format!("could not write `{}`: {e}", path.display()));
+            return Err(exit::IO_ERROR);
+        }
+        eprint_line(&format!("wrote {}", path.display()));
+        return Ok(());
+    }
+    print_artifact(&format!("==> {} <==\n", stage.name()));
+    print_artifact(text);
+    if !text.is_empty() && !text.ends_with('\n') {
+        print_artifact("\n");
+    }
+    Ok(())
 }
 
 /// One line of compiler output on stderr, fallible for the same reason as [`print_artifact`]: a
