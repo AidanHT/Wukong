@@ -540,10 +540,47 @@ fn loss(x: [f64; 16], w: [f64; 4], @noalias mut s: [f64; 4], mut out: [f64; 1]) 
     }
 }
 
+/// A region reading an integer mask through a slice (`@unchecked`, so the iteration is straight-line)
+/// still differentiates when what changes after it is provably elsewhere: the store through `zs`
+/// lands in `z`, which the slice `ms` cannot address. `h[i] = x[i]·m[i]`, `L = Σ h[i]²`:
+/// `dL/dx[i] = 2·x[i]·m[i]²` with `m = [1, 0, 1, 1, 0, 1, 0, 1]`.
+#[test]
+fn slice_mask_region_with_an_unrelated_later_write_differentiates() {
+    const SRC: &str = "@parallel @unchecked
+fn loss(x: [f32; 8], mut out: [f32; 1]) -> f32 {
+    let mk: [i32; 8] = [1, 0, 1, 1, 0, 1, 0, 1];
+    let ms: []i32 = mk;
+    let mut h: [f32; 8] = [0.0; 8];
+    for i in 0..8 {
+        h[i] = x[i] * (ms[i] as f32);
+    }
+    let mut z: [f32; 2] = [0.0; 2];
+    let mut zs: []f32 = z;
+    let l: f32 = h[0] * h[0] + h[1] * h[1] + h[2] * h[2] + h[3] * h[3] + h[4] * h[4] + h[5] * h[5] + h[6] * h[6] + h[7] * h[7];
+    zs[0] = l;
+    out[0] = l;
+    return l;
+}
+";
+    gate(
+        SRC,
+        &[8, 1],
+        &[0],
+        |inp| {
+            let m = [1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0];
+            let dx = (0..8)
+                .map(|i| 2.0 * inp[0][i] as f64 * m[i] * m[i])
+                .collect();
+            vec![dx]
+        },
+        "slice mask",
+    );
+}
+
 /// Every refusal names the region and the reason, instead of a silently wrong gradient.
 #[test]
 fn unsupported_regions_decline_by_name() {
-    let cases: [(&str, &str); 4] = [
+    let cases: [(&str, &str); 8] = [
         // In place: the iteration reads what it writes, which the forward has already overwritten.
         (
             "@parallel
@@ -601,6 +638,87 @@ fn loss(x: [f32; 16], mut out: [f32; 1]) -> f32 {
     let r: f32 = l + a[3];
     out[0] = r;
     return r;
+}
+",
+            "written again after it",
+        ),
+        // A runtime call after the region redraws a buffer it reads (dropout masks drawn into one
+        // buffer): `wukong_rand_fill_f32` is no recognized kernel, but it writes its operand.
+        (
+            "@parallel
+fn loss(x: [f32; 16], w: [f32; 4], mut out: [f32; 1]) -> f32 {
+    let mut m: [f32; 4] = [0.0; 4];
+    rand_fill_f32(m, 1, 0);
+    let mut s: [f32; 4] = [0.0; 4];
+    for r in 0..4 {
+        s[r] = x[r * 4] * w[0] * m[0] + x[r * 4 + 1] * w[1] * m[1] + x[r * 4 + 2] * w[2] * m[2] + x[r * 4 + 3] * w[3] * m[3];
+    }
+    rand_fill_f32(m, 2, 0);
+    let mut l: f32 = 0.0;
+    for r in 0..4 {
+        l = l + s[r] * s[r];
+    }
+    out[0] = l;
+    return l;
+}
+",
+            "written again after it",
+        ),
+        // A value-returning file read after the region overwrites a buffer it reads.
+        (
+            "@parallel
+fn loss(x: [f32; 16], w: [f32; 4], mut out: [f32; 1]) -> f32 {
+    let mut m: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let mut s: [f32; 4] = [0.0; 4];
+    for r in 0..4 {
+        s[r] = x[r * 4] * w[0] * m[0] + x[r * 4 + 1] * w[1] * m[1] + x[r * 4 + 2] * w[2] * m[2] + x[r * 4 + 3] * w[3] * m[3];
+    }
+    let n: i64 = read_f32(\"autodiff_region_absent_zz.bin\", m);
+    let mut l: f32 = 0.0;
+    for r in 0..4 {
+        l = l + s[r] * s[r];
+    }
+    out[0] = l + (n as f32) * 0.0;
+    return l;
+}
+",
+            "written again after it",
+        ),
+        // A store through a slice view of a buffer the region reads, after it.
+        (
+            "@parallel @unchecked
+fn loss(x: [f32; 16], w: [f32; 4], mut out: [f32; 1]) -> f32 {
+    let mut m: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let mut ms: []f32 = m;
+    let mut s: [f32; 4] = [0.0; 4];
+    for r in 0..4 {
+        s[r] = x[r * 4] * w[0] * m[0] + x[r * 4 + 1] * w[1] * m[1] + x[r * 4 + 2] * w[2] * m[2] + x[r * 4 + 3] * w[3] * m[3];
+    }
+    ms[1] = 7.0;
+    let mut l: f32 = 0.0;
+    for r in 0..4 {
+        l = l + s[r] * s[r];
+    }
+    out[0] = l;
+    return l;
+}
+",
+            "written again after it",
+        ),
+        // The region reads a mask through a slice, and the array behind the slice changes after it.
+        (
+            "@parallel @unchecked
+fn loss(x: [f32; 8], mut out: [f32; 1]) -> f32 {
+    let mut mk: [i32; 8] = [1, 0, 1, 1, 0, 1, 0, 1];
+    let ms: []i32 = mk;
+    let mut h: [f32; 8] = [0.0; 8];
+    for i in 0..8 {
+        h[i] = x[i] * (ms[i] as f32);
+    }
+    mk[2] = 0;
+    let l: f32 = h[0] * h[0] + h[1] * h[1] + h[2] * h[2] + h[3] * h[3] + h[4] * h[4] + h[5] * h[5] + h[6] * h[6] + h[7] * h[7];
+    out[0] = l + (mk[2] as f32);
+    return l;
 }
 ",
             "written again after it",

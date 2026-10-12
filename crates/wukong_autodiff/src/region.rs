@@ -37,10 +37,13 @@
 //! `cmp.slt|ult hh, bound`, ONE straight-line body block and a `ret`. An iteration with an inner
 //! loop, a run-time bounds check or an overlap guard has control flow in it and declines by name.
 //! Every other refusal is loud too: a captured buffer the region both reads and writes (an in-place
-//! update: the recompute would read the forward's result), a captured buffer something after the
-//! region writes again, a store through a captured slice (straight-line under `@unchecked`), a
-//! written slot that is a view into another buffer, a captured slice whose elements need a gradient,
-//! a shared buffer of no known size, and second-order differentiation.
+//! update: the recompute would read the forward's result), under one name or two (a slice and the
+//! array behind it); a captured buffer something after the region writes again, under any name (a
+//! store through a slice view, a kernel output, a later region, a runtime or user call handed it —
+//! `rand_fill_f32`, a file read); a pointer whose target the alias model cannot place (a slice whose
+//! address escapes, a slice of slices); a store through a captured slice (straight-line under
+//! `@unchecked`); a written slot that is a view into another buffer; a captured slice whose elements
+//! need a gradient; a shared buffer of no known size; and second-order differentiation.
 
 use crate::{map_operands, Mode, Vjp};
 use std::collections::{HashMap, HashSet};
@@ -115,6 +118,9 @@ pub(crate) struct SlotUse {
     pub(crate) other: bool,
     /// Its elements are reached through a slice's data pointer.
     pub(crate) via_slice: bool,
+    /// A pointer is loaded out of memory a loaded pointer addresses (a slice of slices): the alias
+    /// model of [`check_aliasing`] follows one level of pointers only.
+    pub(crate) deep: bool,
     /// The element type of its float loads, if they agree.
     pub(crate) elem: Option<MirType>,
     pub(crate) mixed_elem: bool,
@@ -276,7 +282,7 @@ pub(crate) fn scan<'a>(
             it_name,
         });
     }
-    check_no_later_writes(fwd, &out, it)?;
+    check_aliasing(fwd, &out, it)?;
     Ok(out)
 }
 
@@ -288,63 +294,341 @@ fn base_of(def: &HashMap<ValueId, &Op>, mut v: ValueId) -> ValueId {
     v
 }
 
-/// The iteration's backward recomputes it from the buffers the forward left behind, so every buffer
-/// a region READS must hold, at the end of the forward, what it held when the region ran: nothing
-/// after the call may store into it, write it as a kernel output, atomically update it, or write it
-/// from a later region. So must a buffer a kernel inside the region writes, whose rule reads that
-/// output back. (A buffer the region only stores into is free to change afterwards: the iteration's
-/// backward takes the stored values from its own recompute, never from memory.)
-fn check_no_later_writes(
-    fwd: &Function,
-    regions: &[RegionCall<'_>],
-    it: &Interner,
-) -> Result<(), String> {
-    let block = &fwd.blocks[0];
-    let def: HashMap<ValueId, &Op> = block
-        .insts
-        .iter()
-        .filter_map(|i| Some((i.result?, &i.op)))
-        .collect();
-    for r in regions {
-        let captured: HashSet<ValueId> = r
-            .slots
+/// What a forward pointer may address (see [`Aliases`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mem {
+    /// A buffer with storage of its own — a parameter, a local `alloca`, a global, or a
+    /// `wukong_rt_alloc` block — which no other `Buf` overlaps.
+    Buf(ValueId),
+    /// The caller's memory a pointer held in parameter `p` addresses (a slice parameter's
+    /// elements): none of the loss's own buffers, and — parameters do not alias, the assumption
+    /// the whole tape makes — no other parameter's.
+    View(ValueId),
+    /// The scratch arena (`wukong_rt_scratch_alloc`): `scratch_release` hands its blocks out again
+    /// without naming them, so every scratch block may be every other.
+    Scratch,
+}
+
+impl Mem {
+    fn describe(self) -> String {
+        match self {
+            Mem::Buf(b) => format!("buffer v{}", b.0),
+            Mem::View(p) => format!("the memory parameter v{} points to", p.0),
+            Mem::Scratch => "scratch memory".to_string(),
+        }
+    }
+}
+
+fn add_mems(into: &mut Vec<Mem>, from: Vec<Mem>) {
+    for m in from {
+        if !into.contains(&m) {
+            into.push(m);
+        }
+    }
+}
+
+/// The loss's pointers, resolved to the memories they may address — `None` when that is not known —
+/// for the two alias questions a region's backward rests on (see [`check_aliasing`]). A slice is a
+/// local holding a data pointer: a pointer loaded out of it addresses exactly the buffers the loss
+/// stores into it, provided every use of the slice is visible (its address never escapes).
+struct Aliases<'f> {
+    fwd: &'f Function,
+    def: HashMap<ValueId, &'f Op>,
+    /// The first `global_addr` of each global: every later one names the same memory.
+    globals: HashMap<Symbol, ValueId>,
+    /// The regions' env tables: a pointer stored there is read by its region alone.
+    envs: HashSet<ValueId>,
+    it: &'f Interner,
+}
+
+/// How many pointer loads [`Aliases::mems`] follows back to a buffer before giving up.
+const ALIAS_DEPTH: u32 = 4;
+
+impl<'f> Aliases<'f> {
+    fn new(fwd: &'f Function, regions: &[RegionCall<'_>], it: &'f Interner) -> Aliases<'f> {
+        let insts = &fwd.blocks[0].insts;
+        let def = insts
             .iter()
-            .enumerate()
-            .filter(|(k, _)| r.body.slots.get(*k).is_some_and(|u| u.read || u.call_write))
-            .filter_map(|(_, v)| v.map(|v| base_of(&def, v)))
+            .filter_map(|i| Some((i.result?, &i.op)))
             .collect();
+        let mut globals = HashMap::new();
+        for inst in insts {
+            if let (Some(r), Op::GlobalAddr(g)) = (inst.result, &inst.op) {
+                globals.entry(*g).or_insert(r);
+            }
+        }
+        Aliases {
+            fwd,
+            def,
+            globals,
+            envs: regions.iter().map(|r| r.env).collect(),
+            it,
+        }
+    }
+
+    /// The buffer `v` addresses with every `gep` peeled, one value per global.
+    fn base(&self, v: ValueId) -> ValueId {
+        let b = base_of(&self.def, v);
+        match self.def.get(&b) {
+            Some(Op::GlobalAddr(g)) => self.globals.get(g).copied().unwrap_or(b),
+            _ => b,
+        }
+    }
+
+    /// The memory the base `b` names, when it has storage of its own.
+    fn own(&self, b: ValueId) -> Option<Mem> {
+        if self.fwd.params.contains(&b) {
+            return Some(Mem::Buf(b));
+        }
+        match self.def.get(&b)? {
+            Op::Alloca { .. } | Op::GlobalAddr(_) => Some(Mem::Buf(b)),
+            Op::Call { func, .. } => match self.it.resolve(*func) {
+                "wukong_rt_alloc" => Some(Mem::Buf(b)),
+                "wukong_rt_scratch_alloc" => Some(Mem::Scratch),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// What the pointer `p` may address.
+    fn mems(&self, p: ValueId) -> Option<Vec<Mem>> {
+        self.mems_at(p, ALIAS_DEPTH)
+    }
+
+    fn mems_at(&self, p: ValueId, depth: u32) -> Option<Vec<Mem>> {
+        let b = self.base(p);
+        if let Some(m) = self.own(b) {
+            return Some(vec![m]);
+        }
+        match self.def.get(&b)? {
+            Op::Load(addr, MirType::Ptr) if depth > 0 => self.held_at(self.base(*addr), depth - 1),
+            _ => None,
+        }
+    }
+
+    /// What a pointer loaded out of the buffer `src` may address: for a parameter, the caller's
+    /// memory; for a local that never escapes, the buffers of the pointers the loss stores into it.
+    fn held(&self, src: ValueId) -> Option<Vec<Mem>> {
+        self.held_at(src, ALIAS_DEPTH)
+    }
+
+    fn held_at(&self, src: ValueId, depth: u32) -> Option<Vec<Mem>> {
+        if self.fwd.params.contains(&src) {
+            return Some(vec![Mem::View(src)]);
+        }
+        if !matches!(self.def.get(&src), Some(Op::Alloca { .. })) || self.escapes(src) {
+            return None;
+        }
+        let mut out = Vec::new();
+        for inst in &self.fwd.blocks[0].insts {
+            if let Op::Store { ptr, value } = &inst.op {
+                if self.base(*ptr) == src && *self.fwd.value_type(*value) == MirType::Ptr {
+                    add_mems(&mut out, self.mems_at(*value, depth)?);
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// Whether the address of the local `src` reaches anything but loads, `gep`s, stores into
+    /// `src`, a region's env table and the read-only effect calls — anything that could put a
+    /// pointer into it unseen.
+    fn escapes(&self, src: ValueId) -> bool {
+        let block = &self.fwd.blocks[0];
+        let is_src = |v: ValueId| self.base(v) == src;
+        let leaks = |op: &Op| match op {
+            Op::Load(..) | Op::Gep { .. } => false,
+            Op::Store { ptr, value } => is_src(*value) && !self.envs.contains(&self.base(*ptr)),
+            Op::Call { func, args } => {
+                !reads_only(self.it.resolve(*func)) && args.iter().any(|&a| is_src(a))
+            }
+            other => {
+                let mut hit = false;
+                let _ = map_operands(other, |v| {
+                    hit |= is_src(v);
+                    v
+                });
+                hit
+            }
+        };
+        block.insts.iter().any(|i| leaks(&i.op))
+            || matches!(block.term, Terminator::Ret(Some(v)) if is_src(v))
+    }
+
+    /// Whether the base `b` may hold pointers a call it is handed could write through: a parameter
+    /// (a slice or a struct of the caller's), or a local of pointers or bytes (a slice, a struct).
+    fn may_hold_pointers(&self, b: ValueId) -> bool {
+        fn holds(ty: &MirType) -> bool {
+            match ty {
+                MirType::Ptr | MirType::I8 => true,
+                MirType::Array(elem, _) | MirType::Vec(elem, _) => holds(elem),
+                _ => false,
+            }
+        }
+        self.fwd.params.contains(&b)
+            || matches!(self.def.get(&b), Some(Op::Alloca { ty, .. }) if holds(ty))
+    }
+
+    /// What one env slot of a region exposes to its iteration: the slot's buffer, and through a
+    /// slice's data pointer (or a call that may follow the pointers in it) what that buffer holds.
+    fn slot_mems(&self, v: ValueId, u: &SlotUse) -> Option<Vec<Mem>> {
+        if u.deep {
+            return None;
+        }
+        let mut out = self.mems(v)?;
+        let b = self.base(v);
+        if u.via_slice || (u.call_write && self.may_hold_pointers(b)) {
+            add_mems(&mut out, self.held(b)?);
+        }
+        Some(out)
+    }
+
+    /// What a call that is neither a region nor a recognized kernel may write: nothing for a
+    /// read-only effect call; otherwise everything a pointer argument addresses, and everything a
+    /// pointer held in one addresses.
+    fn call_writes(&self, callee: &str, args: &[ValueId]) -> Option<Vec<Mem>> {
+        let mut out = Vec::new();
+        if reads_only(callee) {
+            return Some(out);
+        }
+        for &a in args {
+            if *self.fwd.value_type(a) != MirType::Ptr {
+                continue;
+            }
+            add_mems(&mut out, self.mems(a)?);
+            let b = self.base(a);
+            if self.may_hold_pointers(b) {
+                add_mems(&mut out, self.held(b)?);
+            }
+        }
+        Some(out)
+    }
+}
+
+/// `print`, `assert`, a file write: calls that only read the buffers they are handed. (Releasing a
+/// buffer is not a read: the backward must not re-read freed memory.)
+fn reads_only(callee: &str) -> bool {
+    crate::coverage::is_effect_only(callee) && callee != "wukong_rt_free"
+}
+
+/// The two alias facts a region's backward rests on, checked on the loss's side.
+///
+/// * **No in-place update by another name.** The iteration's backward recomputes it from the
+///   buffers the forward left behind, so no buffer one env slot writes may be one another slot
+///   reads — a slice and the array behind it included. (One slot both read and written is refused
+///   when the body is taken apart.)
+/// * **Nothing after the region writes what it read.** Every buffer a region READS must hold, at
+///   the end of the forward, what it held when the region ran: nothing after the call may store
+///   into it, write it as a kernel output, atomically update it, write it from a later region, or
+///   hand it to a call that may write it (`rand_fill_f32`, a file read, a user function), under
+///   any name. So must a buffer a kernel inside the region writes, whose rule reads that output
+///   back. (A buffer the region only stores into is free to change afterwards: the iteration's
+///   backward takes the stored values from its own recompute, never from memory.)
+///
+/// A pointer whose target is not known (one loaded out of memory whose sources are not all
+/// visible) cannot be told apart from anything, so it is refused on either side.
+fn check_aliasing(fwd: &Function, regions: &[RegionCall<'_>], it: &Interner) -> Result<(), String> {
+    let al = Aliases::new(fwd, regions, it);
+    let block = &fwd.blocks[0];
+    for r in regions {
         let name = it.resolve(r.body.p.name);
+        let unknown = |k: usize| {
+            format!(
+                "autodiff: the @parallel region `{name}` reaches captured buffer #{k} through a \
+                 pointer whose target is not known (a slice whose address escapes, or a slice of \
+                 slices), so the buffers it reads cannot be told apart from the ones it writes or \
+                 from what the loss writes after it; capture the arrays themselves"
+            )
+        };
+        let mut writes: Vec<(usize, Vec<Mem>)> = Vec::new();
+        let mut reads: Vec<(usize, Vec<Mem>)> = Vec::new();
+        let mut captured: Vec<Mem> = Vec::new();
+        for (k, v) in r.slots.iter().enumerate() {
+            let (Some(v), Some(u)) = (v, r.body.slots.get(k)) else {
+                continue;
+            };
+            if !(u.read || u.write) {
+                continue;
+            }
+            let mems = al.slot_mems(*v, u).ok_or_else(|| unknown(k))?;
+            if u.write {
+                writes.push((k, mems.clone()));
+            }
+            if u.read {
+                reads.push((k, mems.clone()));
+            }
+            if u.read || u.call_write {
+                add_mems(&mut captured, mems);
+            }
+        }
+        for (a, wa) in &writes {
+            for (b, rb) in &reads {
+                if let Some(m) = wa.iter().find(|m| a != b && rb.contains(m)) {
+                    return Err(format!(
+                        "autodiff: the @parallel region `{name}` reads and writes {} through two \
+                         names (captured buffers #{b} and #{a}: an in-place update); its backward \
+                         recomputes each iteration from the buffers the forward left behind, so a \
+                         region's captured inputs and outputs must be distinct buffers",
+                        m.describe()
+                    ));
+                }
+            }
+        }
+        if captured.is_empty() {
+            continue;
+        }
         for (i, inst) in block.insts.iter().enumerate().skip(r.call + 1) {
-            let written: Vec<ValueId> = match &inst.op {
-                Op::Store { ptr, .. } | Op::AtomicAdd { ptr, .. } => vec![base_of(&def, *ptr)],
+            let (what, written) = match &inst.op {
+                Op::Store { ptr, .. } => ("a store".to_string(), al.mems(*ptr)),
+                Op::AtomicAdd { ptr, .. } => ("an atomic add".to_string(), al.mems(*ptr)),
                 Op::Call { func, args } => {
+                    let callee = it.resolve(*func);
                     if let Some(later) = regions.iter().find(|q| q.call == i) {
-                        later
-                            .slots
-                            .iter()
-                            .enumerate()
-                            .filter(|(k, _)| later.body.slots.get(*k).is_some_and(|s| s.write))
-                            .filter_map(|(_, v)| v.map(|v| base_of(&def, v)))
-                            .collect()
+                        let mut out = Some(Vec::new());
+                        for (k, v) in later.slots.iter().enumerate() {
+                            let (Some(v), Some(u)) = (v, later.body.slots.get(k)) else {
+                                continue;
+                            };
+                            if u.write {
+                                out = out.zip(al.slot_mems(*v, u)).map(|(mut o, m)| {
+                                    add_mems(&mut o, m);
+                                    o
+                                });
+                            }
+                        }
+                        let later_name = it.resolve(later.body.p.name);
+                        (format!("the @parallel region `{later_name}`"), out)
                     } else {
-                        match crate::tape::kernel_by_name(it.resolve(*func)) {
-                            Some(kind) if kind.arity() == args.len() => kind
-                                .out_index()
-                                .map(|oi| vec![base_of(&def, args[oi])])
-                                .unwrap_or_default(),
-                            _ => Vec::new(),
+                        let what = format!("a call to `{callee}`");
+                        match crate::tape::kernel_by_name(callee) {
+                            Some(kind) if kind.arity() == args.len() => match kind.out_index() {
+                                Some(oi) => (what, al.mems(args[oi])),
+                                None => (what, Some(Vec::new())),
+                            },
+                            _ => (what, al.call_writes(callee, args)),
                         }
                     }
                 }
-                _ => Vec::new(),
+                Op::VecKernelCall { .. } => ("a synthesized vector kernel".to_string(), None),
+                _ => continue,
             };
-            if let Some(b) = written.iter().find(|b| captured.contains(b)) {
+            let Some(written) = written else {
                 return Err(format!(
-                    "autodiff: buffer v{} is captured by the @parallel region `{name}` and \
-                     written again after it; the region's backward recomputes each iteration \
-                     from the buffers the forward leaves behind, so a captured buffer must not \
-                     change after the region (write the later value into a separate buffer)",
-                    b.0
+                    "autodiff: {what} after the @parallel region `{name}` writes through a \
+                     pointer whose target is not known (one loaded out of memory whose sources \
+                     are not all visible), so it may write a buffer the region captured again \
+                     after it; the region's backward recomputes each iteration from the buffers \
+                     the forward leaves behind (write through the array itself)"
+                ));
+            };
+            if let Some(m) = written.iter().find(|m| captured.contains(m)) {
+                return Err(format!(
+                    "autodiff: {} is captured by the @parallel region `{name}` and written again \
+                     after it (by {what}); the region's backward recomputes each iteration from \
+                     the buffers the forward leaves behind, so a captured buffer must not change \
+                     after the region (write the later value into a separate buffer)",
+                    m.describe()
                 ));
             }
         }
@@ -607,6 +891,8 @@ fn slot_uses(f: &Function, env: ValueId, nslots: usize, it: &Interner) -> Result
         .collect();
     let mut cap_of: HashMap<ValueId, usize> = HashMap::new();
     let mut root: HashMap<ValueId, usize> = HashMap::new();
+    // Every pointer in `root` that was loaded out of memory (or derives from one by `gep`).
+    let mut loaded: HashSet<ValueId> = HashSet::new();
     let mut slots = vec![SlotUse::default(); nslots];
     let slot_of_addr = |addr: ValueId| -> Option<usize> {
         if addr == env {
@@ -643,12 +929,19 @@ fn slot_uses(f: &Function, env: ValueId, nslots: usize, it: &Interner) -> Result
                     // A pointer loaded out of a captured buffer: a slice's data pointer.
                     slots[k].read = true;
                     slots[k].via_slice = true;
-                    root.insert(r.expect("a load has a result"), k);
+                    slots[k].deep |= loaded.contains(addr);
+                    let r = r.expect("a load has a result");
+                    root.insert(r, k);
+                    loaded.insert(r);
                 }
             }
             Op::Gep { ptr, .. } => {
                 if let Some(&k) = root.get(ptr) {
-                    root.insert(r.expect("a gep has a result"), k);
+                    let r = r.expect("a gep has a result");
+                    root.insert(r, k);
+                    if loaded.contains(ptr) {
+                        loaded.insert(r);
+                    }
                 }
             }
             Op::Load(addr, ty) => {
@@ -973,7 +1266,7 @@ pub(crate) fn build_bwd(
 impl<'a> Vjp<'a> {
     /// Region mode: which `F` instructions the recompute skips. A store, a kernel output, an atomic
     /// add or an unrecognized void call into a captured buffer already happened in the forward, and
-    /// the buffer still holds its result (`check_no_later_writes`); writing it again would only race
+    /// the buffer still holds its result (`check_aliasing`); writing it again would only race
     /// another chunk's reads of the same values. (A region never reads what it writes, so no
     /// recomputed value depends on the skipped write.)
     pub(crate) fn region_skips(&self, op: &Op) -> bool {
@@ -1209,25 +1502,8 @@ impl<'a> Vjp<'a> {
                 CapGrad::Unused
             };
         }
-        // Two env slots naming one buffer, one of them written: an in-place region by another name.
-        for a in 0..nslots {
-            for b in 0..nslots {
-                if a != b
-                    && bases[a].is_some()
-                    && bases[a] == bases[b]
-                    && rc.body.slots[a].write
-                    && rc.body.slots[b].read
-                {
-                    return Err(format!(
-                        "autodiff: the @parallel region `{name}` reads and writes buffer v{} \
-                         through two names (an in-place update); its backward recomputes each \
-                         iteration from the buffers the forward left behind, so a region's \
-                         captured inputs and outputs must be distinct buffers",
-                        bases[a].map_or(0, |v| v.0)
-                    ));
-                }
-            }
-        }
+        // (Two env slots naming one buffer, one written and one read — an in-place update by
+        // another name, a slice and the array behind it included — were refused by `scan`.)
         // 2. The iteration backward.
         let (it_fn, needed) = self.iteration_grad(rc, &kinds, &name)?;
         // 3. The loss-side gradient pointer of every slot the iteration uses.

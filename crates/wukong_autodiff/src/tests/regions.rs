@@ -271,6 +271,102 @@ fn a_region_writing_a_sub_view_declines_by_name() {
     }
 }
 
+/// A slice-like local `fat` (a pointer table holding `x`) whose address escapes into an opaque call
+/// can hold anything afterwards, so a pointer loaded out of it has no known target. Writing through
+/// one after a region that reads `x` may change what the region's backward recomputes from, and a
+/// region reading through one cannot be told apart from what it writes: both decline by name.
+#[test]
+fn pointers_of_unknown_target_decline_by_name() {
+    let n = 4u64;
+    let mut it = Interner::default();
+    let program = |loss: &Function, body: Function| Program {
+        funcs: vec![loss.clone(), body],
+        statics: Vec::new(),
+        externs: Vec::new(),
+        level: wukong_mir::MirLevel::Low,
+    };
+    // `fat = [x]`, handed to an opaque call: from here on, nothing is known about what it holds.
+    let escaped_table = |b: &mut Builder, it: &mut Interner, x: ValueId| {
+        let fat = b.alloca(MirType::Array(Box::new(PTR), 1));
+        b.build_void(Op::Store { ptr: fat, value: x });
+        let opaque = sym(it, "wukong_opaque_hold");
+        b.build_void(Op::Call {
+            func: opaque,
+            args: vec![fat],
+        });
+        fat
+    };
+    let sum_squares = |b: &mut Builder, s: ValueId, out: ValueId| {
+        let mut acc = b.build(F64, Op::ConstFloat(0.0, F64));
+        for i in 0..n as i64 {
+            let si = load_elem(b, s, i);
+            acc = b.build(F64, Op::Fma(si, si, acc));
+        }
+        b.build_void(Op::Store {
+            ptr: out,
+            value: acc,
+        });
+        b.ret(Some(acc));
+    };
+
+    // A store through a pointer loaded out of the escaped table, after the region.
+    let (_, body) = shared_weight_region(&mut it, n as usize);
+    let mut b = Builder::new(sym(&mut it, "late_store_loss"), F64);
+    let (x, w, s, out) = (
+        b.add_param(PTR),
+        b.add_param(PTR),
+        b.add_param(PTR),
+        b.add_param(PTR),
+    );
+    b.set_param_attrs(x, extent(n));
+    b.set_param_attrs(w, extent(2));
+    b.set_param_attrs(s, extent(n));
+    let fat = escaped_table(&mut b, &mut it, x);
+    call_region(&mut b, &mut it, "wukong$par$0", n as i64, &[x, w, s]);
+    let d = b.build(PTR, Op::Load(fat, PTR));
+    let zero = b.build(F64, Op::ConstFloat(0.0, F64));
+    b.build_void(Op::Store {
+        ptr: d,
+        value: zero,
+    });
+    sum_squares(&mut b, s, out);
+    let loss = b.finish();
+    let err = grad_program(&program(&loss, body), &loss, &[0, 1], &mut it)
+        .expect_err("a later store of unknown target");
+    assert!(
+        err.contains("wukong$par$0")
+            && err.contains("a store after")
+            && err.contains("target is not known"),
+        "{err}"
+    );
+
+    // A region reading `x` through the escaped table: `s[i] = fat[0][i]²`.
+    let body = outlined(&mut it, "wukong$par$0", 2, false, |b, hh, caps| {
+        let data = b.build(PTR, Op::Load(caps[0], PTR));
+        let xp = gep(b, data, hh, F64);
+        let xi = b.build(F64, Op::Load(xp, F64));
+        let sq = b.build(F64, Op::Bin(BinOp::FMul, xi, xi));
+        let sp = gep(b, caps[1], hh, F64);
+        b.build_void(Op::Store { ptr: sp, value: sq });
+    });
+    let mut b = Builder::new(sym(&mut it, "escaped_read_loss"), F64);
+    let (x, s, out) = (b.add_param(PTR), b.add_param(PTR), b.add_param(PTR));
+    b.set_param_attrs(x, extent(n));
+    b.set_param_attrs(s, extent(n));
+    let fat = escaped_table(&mut b, &mut it, x);
+    call_region(&mut b, &mut it, "wukong$par$0", n as i64, &[fat, s]);
+    sum_squares(&mut b, s, out);
+    let loss = b.finish();
+    let err = grad_program(&program(&loss, body), &loss, &[0], &mut it)
+        .expect_err("a region reading through an escaped table");
+    assert!(
+        err.contains("wukong$par$0")
+            && err.contains("captured buffer #0")
+            && err.contains("target is not known"),
+        "{err}"
+    );
+}
+
 /// A region the region rule cannot take apart says so by name: an iteration with control flow, a
 /// region reading and writing one buffer, a region in a second-order loss, and a region whose body
 /// the program does not hold.
