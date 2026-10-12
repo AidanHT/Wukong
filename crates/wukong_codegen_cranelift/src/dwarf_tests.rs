@@ -670,7 +670,9 @@ fn executable_objects_keep_source_names_and_frame_the_entry() {
 }
 
 /// `-g` adds sections and changes no machine code: the `.text` of a `-g` object is the plain
-/// object's; and with no debug info requested the object is byte-identical to `emit_object_full`'s.
+/// object's, and both are deterministic and the same from serial and parallel codegen. (That the
+/// plain object is the pre-`-g` one is pinned by
+/// [`no_debug_info_is_the_pre_debuginfo_object_and_recording_changes_no_byte`].)
 #[test]
 fn debug_info_changes_no_code_and_is_deterministic() {
     for (src, level) in [(FIXTURE, 0), (FIXTURE, 2), (SLICES, 2)] {
@@ -748,33 +750,123 @@ fn debug_info_changes_no_code_and_is_deterministic() {
             assert!(plain_file.section_by_name(".debug_line").is_none());
             assert!(plain_file.section_by_name(".debug_info").is_none());
         }
-        // The host path: no debug info is byte-identical to the shipping emitter.
-        let opts = EmitOptions {
-            verify: true,
-            parallel: true,
-        };
-        let full = emit_object_full(
-            &program,
-            &interner,
-            opts,
-            TargetCpu::Native,
-            BackendOpt::for_level(level),
-            ObjectKind::Library,
-        )
-        .unwrap()
-        .0;
-        let none = emit_object_debug_full(
-            &program,
-            &interner,
-            opts,
-            TargetCpu::Native,
-            BackendOpt::for_level(level),
-            ObjectKind::Library,
-            None,
-        )
-        .unwrap()
-        .0;
-        assert_eq!(full, none);
+    }
+}
+
+/// The object `emit_object_full` wrote before `-g` existed, rebuilt from its parts with nothing of
+/// `debuginfo` in the path: an `ObjectModule` on `isa`, populated (filling `log` when one is given),
+/// finished and emitted. Nothing is attached.
+fn reference_object(
+    isa: std::sync::Arc<dyn cranelift_codegen::isa::TargetIsa>,
+    program: &Program,
+    interner: &Interner,
+    parallel: bool,
+    kind: ObjectKind,
+    log: Option<&mut debuginfo::CodeLog>,
+) -> Vec<u8> {
+    use cranelift_object::{ObjectBuilder, ObjectModule};
+    let builder =
+        ObjectBuilder::new(isa, "wukong", cranelift_module::default_libcall_names()).unwrap();
+    let mut module = ObjectModule::new(builder);
+    populate_module(
+        &mut module,
+        program,
+        interner,
+        parallel,
+        entry::SymbolMode::Object(kind),
+        log,
+    )
+    .unwrap_or_else(|e| panic!("populate: {e}"));
+    module.finish().emit().unwrap()
+}
+
+/// Without `-g` the object is byte-identical to the pre-`-g` emitter's ([`reference_object`]), both
+/// through `emit_object_for_isa` on each container and through the shipping host entry
+/// `emit_object_full`. And recording a `CodeLog` — the only thing `-g` does before
+/// `attach_dwarf` — changes no byte of the object, serial or parallel, with or without srclocs, for
+/// a library and an executable: everything a `-g` object adds is what `attach_dwarf` adds.
+#[test]
+fn no_debug_info_is_the_pre_debuginfo_object_and_recording_changes_no_byte() {
+    for (src, level) in [(FIXTURE, 0), (FIXTURE, 2), (SLICES, 2)] {
+        let (program, interner, _) = lower(src, level);
+        for kind in [ObjectKind::Library, ObjectKind::Executable] {
+            for parallel in [true, false] {
+                let at = format!("-O{level} {kind:?} parallel={parallel}");
+                let host = emit_object_full(
+                    &program,
+                    &interner,
+                    EmitOptions {
+                        verify: true,
+                        parallel,
+                    },
+                    TargetCpu::Native,
+                    BackendOpt::for_level(level),
+                    kind,
+                )
+                .unwrap()
+                .0;
+                let host_isa =
+                    make_isa_full(true, true, TargetCpu::Native, BackendOpt::for_level(level))
+                        .unwrap();
+                let host_reference =
+                    reference_object(host_isa, &program, &interner, parallel, kind, None);
+                assert!(
+                    host == host_reference,
+                    "host {at}: the no-`-g` object is not the pre-debuginfo emitter's"
+                );
+                for triple in [COFF, ELF] {
+                    let plain = emit(&program, &interner, triple, level, parallel, kind, None);
+                    let reference = reference_object(
+                        isa_for(triple, level),
+                        &program,
+                        &interner,
+                        parallel,
+                        kind,
+                        None,
+                    );
+                    assert!(
+                        plain == reference,
+                        "{triple} {at}: the no-`-g` object is not the pre-debuginfo emitter's"
+                    );
+                    for srclocs in [false, true] {
+                        let mut log = debuginfo::CodeLog::new(srclocs);
+                        let logged = reference_object(
+                            isa_for(triple, level),
+                            &program,
+                            &interner,
+                            parallel,
+                            kind,
+                            Some(&mut log),
+                        );
+                        assert!(
+                            logged == plain,
+                            "{triple} {at}: recording a code log (srclocs={srclocs}) changed \
+                             the object"
+                        );
+                        // Not vacuous: the log saw every user function and the entry functions
+                        // (each fixture's `main` is a zero-parameter scalar one, so every object
+                        // gets the C `main`), and with srclocs it read their ranges.
+                        let users = log
+                            .defined
+                            .iter()
+                            .filter(|d| matches!(d.origin, debuginfo::CodeOrigin::User(_)))
+                            .count();
+                        assert_eq!(users, program.funcs.len(), "{triple} {at}");
+                        assert!(
+                            log.defined
+                                .iter()
+                                .any(|d| matches!(d.origin, debuginfo::CodeOrigin::Entry(_))),
+                            "{triple} {at}: no entry function recorded"
+                        );
+                        assert_eq!(
+                            log.defined.iter().any(|d| !d.srclocs.is_empty()),
+                            srclocs,
+                            "{triple} {at}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 

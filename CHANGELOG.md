@@ -24,10 +24,14 @@ All notable changes to Wukong are documented here. The format is loosely based o
   unwinds through every Wukong frame. With MSYS2 gdb 15 on a `-g` executable: `break fib` (it
   stops at `fib.wk:7`), `break fib.wk:7`, `next` by source line, and a backtrace `fib () at fib.wk:7` ← `fib () at
   fib.wk:10` ← `main () at fib.wk:14` ← `wukong_entry_thunk` ← the Rust runtime.
-- **The machine code does not change.** Without `-g` an object is byte-identical to before (nothing
-  is recorded); with it, `.text` is byte-identical to the plain object's (both pinned in
-  `crates/wukong_codegen_cranelift/src/dwarf_tests.rs`, on COFF and ELF, `-O0` and `-O2`, serial and
-  parallel codegen). A `-g` object is deterministic across processes and between the serial and
+- **The machine code does not change.** Without `-g` nothing is recorded or attached, and an object
+  is byte-identical to the one the emitter wrote before `-g` existed; recording the code log changes
+  no byte either, so a `-g` object differs from the plain one only by what `attach_dwarf` adds, and
+  its `.text` is byte-identical to the plain object's. `dwarf_tests.rs` in
+  `crates/wukong_codegen_cranelift/src` pins all three — the first against a reference emitter
+  rebuilt with nothing of `debuginfo` in its path (also through the shipping host entry point), the
+  second with a log recorded and not attached — on COFF and ELF, `-O0` and `-O2`, serial and
+  parallel codegen. A `-g` object is deterministic across processes and between the serial and
   parallel codegen paths (`crates/wukongc/tests/determinism.rs`,
   `debug_object_emission_is_deterministic_across_processes`).
 - **Read back, not just written.** `dwarf_tests` parses the object with the `object` crate,

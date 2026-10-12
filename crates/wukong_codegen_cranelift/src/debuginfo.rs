@@ -5,9 +5,11 @@
 //! The record is a [`CodeLog`]: `populate_module` fills it, when asked, as it defines functions —
 //! each one's `FuncId`, its machine-code size and, for DWARF, its sorted srcloc ranges and its
 //! call-frame information. Recording changes no emitted byte: it only reads the finished
-//! `CompiledCode` after `define_function`, so an object built without `-g` is byte-identical to one
-//! built before this module existed, and a `-g` object's `.text` is byte-identical to the plain
-//! one's (`dwarf_tests` pins both).
+//! `CompiledCode` after `define_function`. So an object built without `-g` is byte-identical to one
+//! built before this module existed, an object with a log recorded but no DWARF attached is
+//! byte-identical to it too, and a `-g` object's `.text` is byte-identical to the plain one's.
+//! `dwarf_tests` pins all three, the first against a reference emitter with nothing of this module
+//! in its path.
 //!
 //! # The DWARF a `-g` object carries
 //!

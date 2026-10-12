@@ -1279,9 +1279,11 @@ defined function's `FuncId`, origin (a user function, a raw-AVX2 vector kernel, 
 entry thunk and C `main`), machine-code size and, for `-g`, its sorted srcloc ranges and Cranelift's
 System V unwind information (`TargetIsa::emit_unwind_info`). It is read from the finished
 `CompiledCode` after `define_function` (or on the parallel codegen worker, then recorded in source
-order), so it changes no emitted byte: a plain object is byte-identical to one built without the
-log, and a `-g` object's `.text` is the plain one's (`dwarf_tests`, COFF and ELF, serial and
-parallel, `-O0` and `-O2`).
+order), so it changes no emitted byte: an object built with a log recorded and no DWARF attached is
+byte-identical to one built without the log, which is byte-identical to the pre-`-g` emitter's
+(rebuilt in `dwarf_tests` from `ObjectBuilder` and `populate_module`, nothing of `debuginfo` in its
+path, and compared through the shipping host entry point too); and a `-g` object's `.text` is the
+plain one's (`dwarf_tests`: COFF and ELF, serial and parallel, `-O0` and `-O2`).
 
 **DWARF.** `emit_object_debug_for_with(.., Some(&DebugInfo { sources, comp_dir }))` — what the
 driver calls for `--emit=obj|exe -g`, with the source map it keeps on native paths and the current
