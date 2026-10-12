@@ -19,8 +19,10 @@
 //! **SOUNDNESS FIRST.** An unsound no-alias answer is a miscompile; a spurious may-alias answer only
 //! costs speed. Every fact below is justified, and anything not on this list returns "may alias":
 //!
-//! * **Two distinct `alloca`s never alias.** Each `Op::Alloca` gets its own stack slot in Cranelift
-//!   (`create_sized_stack_slot`) and its own disjoint slot range in the interpreter. True regardless
+//! * **Two distinct `alloca`s never alias.** Each `Op::Alloca` is its own object: its own disjoint
+//!   slot range in the interpreter, and in Cranelift its own stack slot — or a slot shared only with
+//!   allocas whose lifetimes never overlap its own (`wukong_codegen_cranelift::stack_color`, computed
+//!   on the final MIR by [`crate::slot_lifetime`]), which no access can tell apart. True regardless
 //!   of escape.
 //! * **An `alloca` of *this* function never aliases a *parameter* of this function.** The slot is
 //!   created after entry, so its address cannot have been handed to us by the caller — not even
