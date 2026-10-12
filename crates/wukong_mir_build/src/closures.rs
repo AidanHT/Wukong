@@ -37,9 +37,10 @@
 //! `apply(f, ..)` the closure value `(L, $cap$L$0)` read from those locals. A closure that uses `f`
 //! captures those hidden locals instead (`ClosureInfo::bound`). No use of `f` survives this pass.
 //!
-//! **What a capture carries.** One the closure only reads is a copy: a scalar by value, an
-//! aggregate (an array, tuple, struct or data-carrying enum) as a fresh buffer filled when the
-//! closure value is evaluated (`capture_value`; a `let`'s hidden local already is one). One the
+//! **What a capture carries.** One the closure only reads is a copy: a scalar (or a function value)
+//! by value, an aggregate (an array, tuple, struct or data-carrying enum) as a fresh buffer filled
+//! when the closure value is evaluated, a slice or `str` as a fresh copy of its 16-byte fat pointer
+//! — another view of the same elements (`capture_value`; a `let`'s hidden local already is one). One the
 //! closure writes (`ClosureInfo::by_ref`) is the element `&mut c`: the lifted function's parameter
 //! is a `*mut T`, and `lower_fn` binds the name to the storage it points at (`bind_by_ref`), so the
 //! body reads and writes the enclosing variable itself. A capture's type is the width the variable

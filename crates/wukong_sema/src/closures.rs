@@ -26,16 +26,18 @@
 //!   generic binding — the existing `E0401` of `check_fn_value_args`.
 //! * **Captures.** Every enclosing local the body reads is captured. One it only reads is COPIED
 //!   where the closure is created (when the call evaluates the argument, or at the `let`): a
-//!   scalar, an enum, a raw pointer or reference, a fixed-size array, a tuple or a struct. One it
+//!   scalar, an enum, a raw pointer or reference, a fixed-size array, a tuple, a struct, a slice or
+//!   `str` (its fat pointer) or a function value. One it
 //!   writes — assigns, takes `&mut` of, or passes as an aggregate to a `mut` parameter or as a
 //!   builtin's output operand — is captured BY REFERENCE ([`ClosureInfo::by_ref`],
 //!   [`Sema::note_capture_write`]): the closure and the enclosing function share it, and its own
 //!   mutability rules apply (`E0304` for an immutable binding, as outside the closure). Either way
 //!   a capture has the type its variable is stored at: a `for` range counter's is its wider bound's
 //!   ([`Sema::enter_range_counter`]). A local holding a run-time function value is copied like a
-//!   pointer. A slice, `str`, tensor or vector, the enclosing function's function-typed parameter,
-//!   a value whose type names an enclosing generic and a range counter whose width one decides are
-//!   `E0418`, as is any use of an enclosing generic parameter (the lifted function is not generic).
+//!   pointer, and a slice or `str` as its fat pointer (another view of the same elements). A tensor
+//!   or vector, the enclosing function's function-typed parameter, a value whose type names an
+//!   enclosing generic and a range counter whose width one decides are `E0418`, as is any use of
+//!   an enclosing generic parameter (the lifted function is not generic).
 //!   A closure-bound local is captured through its closure ([`ClosureInfo::bound`]).
 //! * **Control.** `return` leaves the closure; `break`/`continue` cannot cross it (`E0303`, the
 //!   enclosing loops are hidden while its body is checked). Nested closures are allowed: a name an
@@ -1044,8 +1046,8 @@ impl Sema<'_> {
             .primary(span, "captured here")
             .note(
                 "a closure copies what it captures: a scalar, an enum, a pointer or reference, a \
-                 fixed-size array, a tuple or a struct; a slice, `str`, tensor or SIMD vector \
-                 views or holds storage a copy cannot carry",
+                 fixed-size array, a tuple, a struct, a slice or a `str` (its view); a tensor or \
+                 SIMD vector holds a shape or lanes a copy cannot carry",
             )
             .help(format!(
                 "capture a pointer instead (`let p{nm} = &{nm};` before the call, then \
@@ -1271,6 +1273,9 @@ impl Sema<'_> {
             },
             Ty::Fn { .. } => Err(NoCopy::FnParam),
             _ if self.mentions_enclosing_generic(ty) => Err(NoCopy::Generic),
+            // A slice or `str` is its 16-byte fat pointer `(data, len)`: a copy is another view of
+            // the same elements, exactly what passing it to a parameter makes.
+            Ty::Slice(_) | Ty::Str => Ok(()),
             // A fixed-size array or a tuple is copied whole, into a buffer the lifted function
             // receives by pointer. A `shared` (GPU block-shared) array is not a value to copy, and
             // an element whose extent is only known at run time cannot be laid out.
@@ -1497,11 +1502,20 @@ mod tests {
 
     #[test]
     fn uncopyable_captures_are_e0418() {
-        // A slice views storage a copy cannot carry.
+        // A slice or `str` is copied as its fat pointer: another view of the same elements.
         assert_eq!(
             error_codes(&format!(
-                "{APPLY} fn main() -> i32 {{ let s = alloc_f32(2); \
-                 let r = apply(|x| x + s[0], 1.0) as i32; free(s); return r; }}"
+                "{APPLY} fn main() -> i32 {{ let s = alloc_f32(2); let t: str = \"ab\"; \
+                 let r = apply(|x| x + s[0] + (t.len() as f32), 1.0) as i32; free(s); \
+                 return r; }}"
+            )),
+            Vec::<&str>::new()
+        );
+        // A tensor view holds a shape a copy cannot carry.
+        assert_eq!(
+            error_codes(&format!(
+                "{APPLY} fn g(t: Tensor[f32, 2]) -> f32 {{ return apply(|x| x * t[1], 2.0); }} \
+                 fn main() -> i32 {{ let a: [f32; 2] = [1.0, 2.0]; return g(a) as i32; }}"
             )),
             vec!["E0418"]
         );

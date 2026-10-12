@@ -668,15 +668,16 @@ fn main() -> i32 {
          argument, or at the `let` that binds it), and the closure is lifted to a function that \
          receives each copy as a parameter; one it writes is shared by reference. What can be \
          captured is a number, `bool` or `char`, an enum, a raw pointer or reference, a \
-         fixed-size array, a tuple or a struct. A slice or `str` (a view of storage the copy \
-         would not carry), a tensor or a SIMD vector cannot, and neither can the enclosing \
-         function's function-typed parameter (it has no run-time value) or anything that names \
-         one of the enclosing function's generic parameters (the lifted function is not \
-         generic). To read a slice, capture a pointer to it (`let ps = &s;` before the closure, \
-         then `(*ps)[i]` in it) or pass it to the callee as an ordinary parameter; to use a \
-         generic dimension, bind it to a local first (`let n = N;`).",
-        bad: "module ex.e0418\nfn apply(f: fn(f32) -> f32, x: f32) -> f32 {\n    return f(x);\n}\nfn main() -> i32 {\n    let w = alloc_f32(2);\n    let r = apply(|x| x * w[1], 2.0) as i32;\n    free(w);\n    return r;\n}\n",
-        good: "module ex.e0418\nfn apply(f: fn(f32) -> f32, x: f32) -> f32 {\n    return f(x);\n}\nfn main() -> i32 {\n    let w = alloc_f32(2);\n    let pw = &w;\n    let r = apply(|x| x * (*pw)[1], 2.0) as i32;\n    free(w);\n    return r;\n}\n"
+         fixed-size array, a tuple, a struct, a slice or a `str` (whose copy is its fat pointer: \
+         another view of the same elements), or a function value. A tensor or a SIMD vector \
+         cannot, and neither can the enclosing function's function-typed parameter (it has no \
+         run-time value) or anything that names one of the enclosing function's generic \
+         parameters (the lifted function is not generic). To read a tensor, capture a pointer \
+         to it (`let pt = &t;` before the closure, then `(*pt)[i]` in it) or pass it to the \
+         callee as an ordinary parameter; to use a generic dimension, bind it to a local first \
+         (`let n = N;`).",
+        bad: "module ex.e0418\nfn apply(f: fn(f32) -> f32, x: f32) -> f32 {\n    return f(x);\n}\nfn second(t: Tensor[f32, 2], x: f32) -> f32 {\n    return apply(|y| y * t[1], x);\n}\nfn main() -> i32 {\n    let a: [f32; 2] = [1.0, 2.0];\n    return second(a, 2.0) as i32;\n}\n",
+        good: "module ex.e0418\nfn apply(f: fn(f32) -> f32, x: f32) -> f32 {\n    return f(x);\n}\nfn second(t: Tensor[f32, 2], x: f32) -> f32 {\n    let w = t[1];\n    return apply(|y| y * w, x);\n}\nfn main() -> i32 {\n    let a: [f32; 2] = [1.0, 2.0];\n    return second(a, 2.0) as i32;\n}\n"
     ),
     entry!(
         "E0419",

@@ -1761,7 +1761,8 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   is no heap environment). A function-typed parameter bound to such a closure cannot be used as a
   value inside the callee either (`E0427` from lowering). A closure argument of a call through a
   trait bound is not supported (a trait method cannot declare a function-typed parameter). A
-  slice, `str`, tensor or vector cannot be captured (`E0418`; capture a pointer), nor the enclosing
+  tensor or vector cannot be captured (`E0418`; read the element first, or capture a pointer — a
+  slice or `str` is captured as its fat pointer since `gap7/fn-values`), nor the enclosing
   function's function-typed parameter, nor a `for` counter whose bound is of a generic type (its
   storage width is per instance; copy it to a local first). Inference of an unannotated parameter
   from the call's other arguments never reaches the enclosing statement: `fold3(|a, b| a + b, 1, 2,

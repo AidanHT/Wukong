@@ -287,11 +287,15 @@ fn main() -> i32 {
   closure), and the variable's own rules apply (`E0304` for an immutable binding, exactly as outside
   the closure). Writing through a captured
   pointer (`*pt = ..`) writes the pointee, and the pointer stays a copy. A local named as a
-  dimension in a turbofish (`sumn::<n>(..)`, `sum::<n>(..)`) is read too. A slice or `str` (a view
-  of storage its copy would not carry), a tensor or vector, the enclosing function's function-typed
-  parameter, and anything naming one of its generic parameters cannot be captured (`E0418`):
-  capture a pointer instead (`let ps = &s;`, then `(*ps)[i]`), and bind a generic dimension to a
-  local first (`let n = N;`). A `for` counter is captured at the width it is stored at, the wider
+  dimension in a turbofish (`sumn::<n>(..)`, `sum::<n>(..)`) is read too. A slice or `str` is
+  copied as its fat pointer `(data, len)` — another view of the same elements, as passing it to a
+  parameter makes: an element the closure writes (`xs[i] = ..`) is written in the shared storage,
+  and reassigning the variable afterwards leaves the closure's copy on the old view
+  (`tests/run/closure_capture_views.wk`). A function value is copied like a pointer. A tensor or
+  vector, the enclosing function's function-typed parameter, and anything naming one of its generic
+  parameters cannot be captured (`E0418`): read what you need first (`let w = t[1];`) or capture a
+  pointer (`let pt = &t;`, then `(*pt)[i]`), and bind a generic dimension to a local first
+  (`let n = N;`). A `for` counter is captured at the width it is stored at, the wider
   of its bounds' integer types (`for i in 0..n` with `n: i64` stores `i` in 8 bytes, and the
   closure reads and writes all of them), so a bound of a generic type, whose width each instance
   decides, makes the counter `E0418` too: copy it to a local first (`let k = i;`). A closure-bound

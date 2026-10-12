@@ -45,6 +45,11 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `tests/fail/{closure_value_captures,closure_param_value_captures,fn_value_compare,fn_value_generic,fn_type_in_extern}.wk`;
   `tests/fail/{closure_outside_argument,fn_value_binding,lower_function_value}.wk` are gone (each is
   a legal program now).
+- **Added: a closure captures a slice or a `str`** as its 16-byte fat pointer — another view of
+  the same elements, as passing it to a parameter makes (an element the closure writes is written
+  in the shared storage; reassigning the variable later leaves the closure on the old view). It was
+  `E0418`, which now covers a tensor or vector (`tests/run/closure_capture_views.wk`;
+  `tests/fail/closure_capture_slice.wk` became `closure_capture_tensor.wk`).
 - **Fixed: inlining a call that discards a value-returning callee's result** branched every `ret v`
   of the copy to a continuation with no parameter (legal MIR the inliner mishandled; a devirtualized
   result-less indirect call produced it). The continuation now takes the value and drops it.

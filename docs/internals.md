@@ -145,8 +145,10 @@ callee's generics, `type_args_against`) and recording, per literal, its paramete
 either a call or a function-typed argument, recorded with the literal it denotes
 (`SemaResult::closure_refs`), and anything else is `E0421`. A capture is every enclosing local the body reads: `note_local_use` sees
 each local read with the index of the scope that binds it, and a binding below a closure's base
-scope is a capture of that closure (and of every closure it is nested in); a slice, `str`, tensor,
-vector or function-typed parameter cannot be captured (`E0418`). A write to a captured variable
+scope is a capture of that closure (and of every closure it is nested in); a slice or `str` is
+captured as its 16-byte fat pointer (a copy is another view, `capture_value` copies the header), a
+function value as its pointer, and a tensor, vector or function-typed parameter cannot be captured
+(`E0418`). A write to a captured variable
 (`note_capture_write`: an assignment, `&mut`, an element or field store not through a pointer,
 `atomic_add`, a `mut self` receiver, an aggregate argument of a `mut` parameter —
 `note_mut_arg_writes`, from the per-function positions `collect_methods` records — or a builtin's
