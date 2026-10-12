@@ -589,6 +589,7 @@ mod entry_law {
         ("gevm.rs", include_str!("gevm.rs")),
         ("gguf.rs", include_str!("gguf.rs")),
         ("i8gemm.rs", include_str!("i8gemm.rs")),
+        ("int128.rs", include_str!("int128.rs")),
         ("isa.rs", include_str!("isa.rs")),
         ("kd_loss.rs", include_str!("kd_loss.rs")),
         ("kldiv.rs", include_str!("kldiv.rs")),

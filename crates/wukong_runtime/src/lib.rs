@@ -251,6 +251,9 @@ pub mod cffi;
 /// Text rendering: the one definition of how every printed value looks, shared by the
 /// interpreter, the JIT and a linked executable.
 pub mod fmt;
+/// The 128-bit integer operations the native backend legalizes into calls (division, float
+/// conversion), defined exactly as the interpreter computes them.
+pub mod int128;
 
 /// The process interface of a program — its arguments, environment, standard input and `exit` —
 /// shared by the interpreter, the JIT and a linked executable.

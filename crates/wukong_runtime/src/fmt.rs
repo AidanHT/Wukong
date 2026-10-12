@@ -387,27 +387,47 @@ fn pad_number(out: &mut Vec<u8>, sign: &str, prefix: &str, digits: &str, spec: &
 /// Render an integer register value per `spec` (its `kind` says how to read the bits).
 pub fn format_int(out: &mut Vec<u8>, x: i64, spec: Spec) {
     match spec.kind {
-        KIND_BOOL => {
-            pad_into(out, bool_text(x), &spec, false);
-            return;
-        }
-        KIND_CHAR => {
-            let c = char_glyph(x);
-            if spec.style == STYLE_DEBUG {
-                pad_into(out, &format!("{c:?}"), &spec, false);
-            } else {
-                let mut b = [0u8; 4];
-                pad_into(out, c.encode_utf8(&mut b), &spec, false);
-            }
-            return;
-        }
-        _ => {}
+        KIND_BOOL | KIND_CHAR => format_scalar_kind(out, x, spec),
+        KIND_UNSIGNED => format_magnitude(out, false, u128::from(x as u64), spec),
+        _ => format_magnitude(out, x < 0, u128::from(x.unsigned_abs()), spec),
     }
-    let (neg, mag) = if spec.kind == KIND_UNSIGNED {
-        (false, x as u64)
+}
+
+/// Render a 128-bit integer per `spec`: its bit pattern `x` read as a `u128` under
+/// [`KIND_UNSIGNED`], as an `i128` otherwise. Exactly what [`format_int`] prints for the same value
+/// at 64 bits, so `{:x}` of `-1i128` prints thirty-two `f`s as Rust's does.
+pub fn format_i128(out: &mut Vec<u8>, x: i128, spec: Spec) {
+    if spec.kind == KIND_UNSIGNED {
+        format_magnitude(out, false, x as u128, spec);
     } else {
-        (x < 0, x.unsigned_abs())
-    };
+        format_magnitude(out, x < 0, x.unsigned_abs(), spec);
+    }
+}
+
+/// The 128-bit value whose low and high 64-bit halves are `lo` and `hi` — how a native caller
+/// passes an `i128` to a runtime entry (two integer registers, never the platform's own `i128`
+/// convention, which C compilers disagree on).
+pub fn i128_from_halves(lo: i64, hi: i64) -> i128 {
+    (i128::from(hi) << 64) | i128::from(lo as u64)
+}
+
+/// A `bool` or a `char` per `spec`.
+fn format_scalar_kind(out: &mut Vec<u8>, x: i64, spec: Spec) {
+    if spec.kind == KIND_BOOL {
+        pad_into(out, bool_text(x), &spec, false);
+        return;
+    }
+    let c = char_glyph(x);
+    if spec.style == STYLE_DEBUG {
+        pad_into(out, &format!("{c:?}"), &spec, false);
+    } else {
+        let mut b = [0u8; 4];
+        pad_into(out, c.encode_utf8(&mut b), &spec, false);
+    }
+}
+
+/// An integer given as its sign and magnitude, per `spec`'s style, sign and padding.
+fn format_magnitude(out: &mut Vec<u8>, neg: bool, mag: u128, spec: Spec) {
     let digits = match spec.style {
         STYLE_LOWER_HEX => format!("{mag:x}"),
         STYLE_UPPER_HEX => format!("{mag:X}"),
@@ -494,6 +514,10 @@ pub fn format_str(out: &mut Vec<u8>, s: &[u8], spec: Spec) {
 pub const DT_BOOL: i64 = 12;
 /// Element dtype code of a `char` buffer (a 4-byte code point).
 pub const DT_CHAR: i64 = 13;
+/// Element dtype code of an `i128` buffer (16 bytes, little-endian).
+pub const DT_I128: i64 = 14;
+/// Element dtype code of a `u128` buffer.
+pub const DT_U128: i64 = 15;
 
 /// Buffers longer than this print summarized (NumPy's `threshold`).
 pub const SUMMARIZE_THRESHOLD: usize = 1000;
@@ -509,6 +533,11 @@ pub enum Elem {
     F64(f64),
     Bool(bool),
     Char(i64),
+    /// A 128-bit element's bit pattern, read as a `u128` when `unsigned`.
+    Wide {
+        bits: i128,
+        unsigned: bool,
+    },
 }
 
 /// Byte width of a buffer element of dtype `dt`, or `None` for an unknown code.
@@ -516,6 +545,7 @@ pub fn elem_size(dt: i64) -> Option<usize> {
     match dt {
         DT_BOOL => Some(1),
         DT_CHAR => Some(4),
+        DT_I128 | DT_U128 => Some(16),
         _ => crate::fileio::dtype_size(dt),
     }
 }
@@ -561,6 +591,15 @@ pub fn elem_of(dt: i64, bits: i64, float: f64, style: u8) -> Elem {
     }
 }
 
+/// The element of a 128-bit dtype (`DT_I128` / `DT_U128`) whose bit pattern is `bits`. A radix
+/// style prints a signed element's bits, as for every narrower integer.
+pub fn elem_of_wide(dt: i64, bits: i128, style: u8) -> Elem {
+    Elem::Wide {
+        bits,
+        unsigned: dt == DT_U128 || radix_style(style),
+    }
+}
+
 /// Read element `i` of a native buffer of dtype `dt`.
 ///
 /// # Safety
@@ -575,6 +614,7 @@ pub unsafe fn read_elem(data: *const u8, i: usize, dt: i64, style: u8) -> Elem {
             DT_F64 => Elem::F64(f64::from_bits((p as *const u64).read_unaligned())),
             DT_F16 => Elem::F32(crate::f16_bits_to_f32((p as *const u16).read_unaligned())),
             DT_BF16 => Elem::F32(crate::bf16_bits_to_f32((p as *const u16).read_unaligned())),
+            DT_I128 | DT_U128 => elem_of_wide(dt, (p as *const i128).read_unaligned(), style),
             _ => {
                 let bits = match size {
                     1 => i64::from(*p),
@@ -622,6 +662,14 @@ pub fn format_elem(out: &mut Vec<u8>, e: Elem, spec: Spec) {
             c,
             Spec {
                 kind: KIND_CHAR,
+                ..spec
+            },
+        ),
+        Elem::Wide { bits, unsigned } => format_i128(
+            out,
+            bits,
+            Spec {
+                kind: if unsigned { KIND_UNSIGNED } else { KIND_SIGNED },
                 ..spec
             },
         ),
@@ -712,6 +760,32 @@ pub unsafe extern "C" fn wukong_rt_fmt_int(
     }
     let mut s = Vec::new();
     format_int(&mut s, x, Spec::unpack(spec));
+    // SAFETY: forwarded from this function's contract.
+    unsafe { emit(target, buf, cap, pos, &s) }
+}
+
+/// `wukong_rt_fmt_i128(target, buf, cap, pos, lo, hi, spec) -> pos'`: a 128-bit integer passed as
+/// its low and high 64-bit halves ([`i128_from_halves`]); `spec`'s kind says signed or unsigned.
+///
+/// # Safety
+/// The sink operands obey [`emit`]'s contract.
+#[no_mangle]
+pub unsafe extern "C" fn wukong_rt_fmt_i128(
+    target: i64,
+    buf: *mut u8,
+    cap: i64,
+    pos: i64,
+    lo: i64,
+    hi: i64,
+    spec: i64,
+) -> i64 {
+    // P14.5: debug-build contract checks (the `# Safety` section above); a null buffer sink is the
+    // counting mode; a stream target ignores `buf`.
+    if target == TARGET_BUFFER {
+        crate::safety::debug_extent_opt(buf, cap);
+    }
+    let mut s = Vec::new();
+    format_i128(&mut s, i128_from_halves(lo, hi), Spec::unpack(spec));
     // SAFETY: forwarded from this function's contract.
     unsafe { emit(target, buf, cap, pos, &s) }
 }
@@ -959,6 +1033,43 @@ mod tests {
     }
 
     /// Each line is what Rust's `format!` prints for the same spec and type.
+    #[test]
+    fn i128_renders_like_rust_format() {
+        let d = Spec::default();
+        let render = |x: i128, spec: Spec| {
+            let mut out = Vec::new();
+            format_i128(&mut out, x, spec);
+            String::from_utf8(out).unwrap()
+        };
+        let unsigned = Spec {
+            kind: KIND_UNSIGNED,
+            ..d
+        };
+        for x in [0, 1, -1, i128::MAX, i128::MIN, 1 << 64, -(1 << 100) + 7] {
+            assert_eq!(render(x, d), format!("{x}"));
+            assert_eq!(render(x, unsigned), format!("{}", x as u128));
+            let hex = Spec {
+                style: STYLE_LOWER_HEX,
+                alt: true,
+                ..unsigned
+            };
+            assert_eq!(render(x, hex), format!("{:#x}", x as u128));
+            let padded = Spec {
+                width: 50,
+                zero: true,
+                plus: true,
+                ..d
+            };
+            assert_eq!(render(x, padded), format!("{x:+050}"));
+        }
+        // A 64-bit value prints the same through either entry.
+        let mut wide = Vec::new();
+        format_int(&mut wide, -5, d);
+        assert_eq!(render(-5, d).as_bytes(), &wide[..]);
+        assert_eq!(i128_from_halves(-1, i64::MAX), i128::MAX);
+        assert_eq!(i128_from_halves(0, i64::MIN), i128::MIN);
+    }
+
     #[test]
     fn specs_render_like_rust_format() {
         let d = Spec::default();
