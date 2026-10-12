@@ -355,7 +355,9 @@ norms, the scans, and the streaming elementwise kernels), top-level **`const`** 
 destructuring**, **radix `0xFF`/`0o17`/`0b1010` and char
 `'A'` literals**, **`"string"` literals** (a NUL-terminated `*u8`, rendered by `print`), and
 **`str`** — an immutable UTF-8 byte string with `.len()`, bounds-checked byte indexing, `s[a..b]`
-views, `==`/`!=` and printing, whose bytes the type checker never lets a program write. And
+views, `==`/`<`/`.cmp()`, string-literal `match` patterns, UTF-8 decoding (`for c in s.chars()`),
+zero-copy `as_bytes()` and a checked `str_from_utf8`, `str_concat`/`str_format` onto the heap, and
+printing (inside aggregates too); the type checker never lets a program write through a `str`. And
 **constant-shape tensors run** —
 a `Tensor[f32, R, C]` parameter passes by base pointer and a multi-dimensional index `a[i, j]`
 flattens to a row-major GEP, so the shape-typed surface *executes*, not just shape-checks — and a

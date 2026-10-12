@@ -5,6 +5,65 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### `str` operations (`gap6/str-ops`, N28)
+
+- **Added: conversions.** `s.as_bytes()` is the `[]u8` view of a `str`'s bytes and `s.as_ptr()`
+  its `*u8` data pointer, both without a copy. `str_from_utf8(b)` turns a `[]u8` or `[u8; N]` into
+  a `str` viewing the same bytes after a run-time UTF-8 check; bytes that are not UTF-8 stop the
+  program with `str_from_utf8: invalid utf-8 sequence of 1 bytes from index 2 (the len is 4) at
+  f.wk:5:13` (or `incomplete utf-8 byte sequence`) and exit 1, identically on the interpreter, the
+  JIT and a linked executable. `utf8_valid_up_to(b)` is the check without the stop
+  (`tests/run/str_conversions.wk`, `tests/run/str_from_utf8_invalid.wk`). Each of these views is
+  rooted at its operand, as a range index is, by `@noalias` (`E0316`) and by the kernel alias
+  analysis.
+- **Added: ordering.** `<`, `<=`, `>`, `>=` between two `str`s compare their bytes
+  lexicographically (a proper prefix is less; Rust's `Ord for str`, which is code-point order), and
+  `a.cmp(b)` returns `-1`/`0`/`1`; `<` used to be `E0433` (`tests/run/str_ordering.wk`).
+- **Added: string-literal patterns.** `"add" =>` matches a `str` with those bytes, in `match`,
+  `if let` and `while let`, nested in or-patterns, `name @ ..`, tuples, struct fields, enum payloads
+  and slice patterns. Exhaustiveness models one constructor per distinct literal and an unnamed
+  rest, so a `str` match needs a catch-all (`E0405`, witness `_`) and a repeated literal is
+  `W0020`. A string-literal pattern on a non-`str` — or a numeric/char/bool/range pattern on a
+  `str` — is the new `E0426`. A literal scrutinee matched against string literals is a `str`
+  (`tests/run/str_match.wk`, `tests/fail/str_pattern_type.wk`,
+  `tests/fail/str_match_nonexhaustive.wk`).
+- **Added: UTF-8 decoding.** `for c in s.chars()` yields each character as a `char` (ASCII decoded
+  inline, anything else by one runtime call), and `s.char_count()` counts them. Decoding never
+  fails: an ill-formed sequence (the bytes a `str` views can be rewritten, there being no borrow
+  checker) is one U+FFFD per maximal subpart, as `String::from_utf8_lossy` decodes it. `.chars()`
+  anywhere but a `for` head is the new `E0425` (`tests/run/str_chars.wk`,
+  `tests/fail/str_chars_value.wk`). The validator and decoder are one implementation,
+  `wukong_runtime::utf8`, tested against `std::str::from_utf8` and `<[u8]>::utf8_chunks` over every
+  byte string of up to three bytes, every scalar value, and four-byte strings over the
+  well-formedness boundary bytes.
+- **Added: building strings.** `str_concat(a, b, …)` and `str_format(fmt, args…)` (the `printf`
+  format language, checked at compile time) return a `str` in a fresh allocation on the
+  `alloc_<T>` heap, released with `free(s)` — `defer free(s);` pairs them. `+` stays `E0433`: no
+  hidden allocation (`tests/run/str_build.wk`).
+- **Added: a `str` inside a printed aggregate prints.** `User { name: "ada", id: 1 }`,
+  `("x", 2)`, `["a", "b\"c"]` — quoted and escaped like Rust's `{:?}` of a string element; it was
+  `E0448` (`tests/run/str_print_aggregate.wk`).
+- **Changed: an `if`/`match` whose arms are all string literals adapts to `str`** like one
+  literal (`let s: str = if c { "on" } else { "off" };` was `E0401`), and a literal arm beside a
+  `str` arm is a `str` on either side, the first arm included. A string literal is a `str` as the
+  receiver of a `str` method too (`"xy".chars()`, `"abc".len()`) (`tests/run/str_literal_arms.wk`).
+- **Changed: range-index failures use Rust's wording.** A start past the end reports `slice index
+  starts at 5 but ends at 3` — it reused the element-access wording, with the end as the length —
+  and an end past the length `range end index 9 out of range for slice of length 6`, through the
+  new failure entry `wukong_rt_check_fail(kind, a, b, site)` that `str_from_utf8` shares
+  (`tests/run/str_range_order.wk`, `tests/run/str_slice_bounds.wk`).
+- **Fixed: the interpreter held a string literal's bytes zero-extended.** Every other byte slot
+  holds the sign-extended `i8` an `I8` store leaves, and a load is verbatim, so a literal's byte
+  above 0x7F compared unequal to the same byte anywhere else on the interpreter only:
+  `s[0] == t[0]` for `s: str = "\u{e9}"` and `t` viewing `[0xC3, 0xA9]` was false there and true
+  natively. String comparisons also compare zero-extended bytes now
+  (`tests/run/literal_byte_equality.wk`).
+- **Not done:** an unannotated literal is still a `*u8`; there is no growable `String` (each
+  `str_concat`/`str_format` allocates anew); `as_bytes()`/`as_ptr()` are writable at the type level,
+  and writing into a string literal's bytes through them is undefined behaviour natively (read-only
+  memory), as through a literal's `*u8`; a `str` still cannot bind a type parameter (`E0420`); a
+  slice of `str`s does not print (`E0448`).
+
 ### Stack-slot coloring (`gap6/stack-coloring`)
 
 - **Allocas with disjoint lifetimes share one native frame slot (N86).** The Cranelift backend

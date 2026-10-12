@@ -379,18 +379,34 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
   `*u8` (a literal or a `let`-bound string) renders the bytes, not the pointer value
   (`tests/run/string_literal.wk`).
 - **`str`**: an immutable UTF-8 byte string, laid out as a `[]u8` fat pointer `(data, byte
-  length)`. A string literal adapts to `str` wherever a numeric literal adapts to its annotation
-  (and as an `==` operand or a range-index base); `s.len()`, bounds-checked `s[i] -> u8`,
-  `for b in s`, `==`/`!=` (length, then bytes), and printing the text (`{:?}` quotes it) all run.
-  A `str` can be a parameter, a return value, a `const`, a struct field or an array element
-  (`tests/run/str_basics.wk`). Its bytes are never written (`s[i] = b`, `atomic_add(s[i], v)` and `&mut s[i]`
-  are `E0304`)
-  and it converts to and from nothing (`E0401`). Sema erases `str` to `[]u8` when it publishes its
-  types, so lowering, the optimizer and every backend run the existing slice machinery; the new
-  lowerings are the byte-compare loop for `==` and the sub-slice.
+  length)` that views bytes it does not own. A string literal adapts to `str` wherever a numeric
+  literal adapts to its annotation (and as a comparison operand, a range-index base, a method
+  receiver, a scrutinee of string-literal patterns; an `if`/`match` of literal arms adapts like one
+  literal); `s.len()`, bounds-checked `s[i] -> u8`, `for b in s`, `==`/`!=` (length, then bytes)
+  and printing the text (`{:?}` quotes it, inside a printed aggregate too) all run. A `str` can be
+  a parameter, a return value, a `const`, a struct field, an array element or an enum payload
+  (`tests/run/str_basics.wk`, `tests/run/str_print_aggregate.wk`, `tests/run/str_literal_arms.wk`).
+  Its bytes are never written through it (`s[i] = b`, `atomic_add(s[i], v)` and `&mut s[i]` are
+  `E0304`) and nothing converts to or from it implicitly (`E0401`). Sema erases `str` to `[]u8`
+  when it publishes its types, so lowering, the optimizer and every backend run the existing slice
+  machinery, with a side table (`StrInfo`) of the operations below.
+- **`str` operations** (`tests/run/str_*.wk`): ordering `<` `<=` `>` `>=` and `a.cmp(b)` (bytewise,
+  Rust's `Ord for str`); string-literal **patterns** in `match` / `if let` / `while let`, nested
+  anywhere, with exhaustiveness (a `str` match needs a catch-all, `E0405`; a mismatched literal
+  pattern is `E0426`); **UTF-8 decoding** `for c in s.chars()` (a `char` per character, ASCII
+  inline, ill-formed bytes as U+FFFD per maximal subpart; `.chars()` elsewhere is `E0425`) and
+  `s.char_count()`; zero-copy **conversions** `s.as_bytes()`, `s.as_ptr()` and the checked
+  `str_from_utf8(b)` — invalid bytes stop the program with a `str_from_utf8: …` message, exit 1,
+  on every backend and in a linked executable — plus the non-stopping `utf8_valid_up_to(b)`; and
+  **building** `str_concat(a, b, …)` / `str_format(fmt, args…)` into a fresh `alloc_<T>`-heap
+  allocation released by `free`. The UTF-8 validator and decoder live once in
+  `wukong_runtime::utf8`, pinned against `std::str::from_utf8` and `String::from_utf8_lossy` over
+  every byte string of up to three bytes.
 - **Range indexing** `s[a..b]` / `s[a..]` / `s[..b]` / `s[..]` on a `str` or any `[]T`: a view of
-  the half-open range, no copy, checked `a <= b <= len` at run time with the slice index failure
-  (`tests/run/slice_range_index.wk`, `tests/run/str_slice_bounds.wk`).
+  the half-open range, no copy, checked `a <= b <= len` at run time with Rust's messages — `range
+  end index 9 out of range for slice of length 6`, `slice index starts at 5 but ends at 3`
+  (`tests/run/slice_range_index.wk`, `tests/run/str_slice_bounds.wk`,
+  `tests/run/str_range_order.wk`).
 - **Pointers & references**: `&x`/`&mut x` take an address, `*p` loads/stores through it, and a
   pointer parameter threads through calls — address-taken locals correctly stay in memory under the
   optimizer (`tests/run/pointer.wk`). `as` casts bind looser than `*`/unary, tighter than binary
@@ -889,9 +905,9 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
 - **Formatted output**: `printf` / `eprintf` / `sprintf` with a compile-time-checked format string
   (Rust's `format!` spec grammar; `E0449` malformed, `E0450` argument mismatch), `print_raw`,
   `eprint` / `eprintln`, and the raw byte writers `write_stdout` / `write_stderr` / `write_text`
-  (`tests/run/printf_format.wk`). A `str` argument prints its text. 🟡 The `cc` fallback link has no
-  formatting runtime, and a `sprintf` buffer is still a `[u8; N]` (nothing builds a `str` at run
-  time).
+  (`tests/run/printf_format.wk`). A `str` argument prints its text, and `str_format` formats into a
+  fresh `str` (`tests/run/str_build.wk`). 🟡 The `cc` fallback link has no formatting runtime (nor
+  the UTF-8 entries of the `str` operations).
 - **Process interface**: `arg_count` / `arg` / `arg_i64` / `arg_f32` (program arguments after
   `wukongc --run prog.wk -- …`, or a linked executable's own `argv`), `env`, `read_stdin_u8` and
   `exit(code)` (which returns through every caller on the JIT, like a failed `assert`).
@@ -1506,16 +1522,17 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
 
 ## Known limitations / sharp edges
 
-- **`str` is the first slice of a string type, not all of one.** An unannotated `let s = "x"` is
-  still the NUL-terminated `*u8` (a literal becomes a `str` only where a `str` is expected, and an
-  `if`/`match` whose arms are all literals is typed from its arms, as with numbers: an annotated
-  `let` does not reach into the arms, so the first arm must be a `str` for the later literal arms
-  to adapt). There are no conversions between `str`, `[]u8` and `*u8`, no concatenation or
-  formatting into a `str`, no character (UTF-8) decoding, no ordering (`<` is `E0433`) and no `str`
-  pattern in a `match`. A `str` cannot bind a type parameter (`E0420`: it is erased to `[]u8`
-  before monomorphization), and a `str` inside a printed aggregate is `E0448`. A failing range
-  START is reported in the index wording with the range end as the length (`s[4..2]` says "the len
-  is 2 but the index is 4").
+- **`str` is a view, not an owned, growable string.** An unannotated `let s = "x"` is still the
+  NUL-terminated `*u8` (a literal becomes a `str` only where a `str` is expected). There is no
+  growable `String`: `str_concat` / `str_format` build a new allocation each time, which the program
+  frees (`free`, `defer free(s)`), and nothing appends in place. A `str` views its bytes without a
+  borrow checker: one from `str_from_utf8` sees later writes to its buffer, and `as_bytes()` /
+  `as_ptr()` are writable at the type level — writing into a string literal's bytes through them
+  (or through a literal's `*u8`) is undefined behaviour on the native backend (read-only memory),
+  outside the differential contract like a use after `free`. `.chars()` exists only as a `for`
+  iterable (there are no iterator values, `E0425`). A `str` cannot bind a type parameter (`E0420`:
+  it is erased to `[]u8` before monomorphization), and a slice of `str`s does not print (`E0448`,
+  as for any slice of non-scalars).
 
 - **`wukongc fmt` refuses what it cannot reprint, and keeps a few comments only approximately.**
   The formatter never changes a program's meaning (every output must re-parse to the identical AST,
