@@ -83,7 +83,8 @@ line table built from them is not emitted yet.
   reference) lower to the plain function `Type.method`; `trait` + `impl Trait for Type` are checked
   for conformance (`E0410`), and a bounded type parameter (`<T: Shape>` / `where T: Shape`) calls
   trait methods through monomorphization; a `fn(A) -> R` parameter is specialized per bound
-  function (`apply$square`), so no function pointer exists at run time (`E0411` outside a parameter).
+  function (`apply$square`), so no function pointer exists at run time (`E0411` outside a parameter
+  or a closure `let`'s annotation).
   Calls such a specialization makes are invisible to the alias analysis, so every function they can
   reach forgoes disjointness-requiring kernels (`tests/run/{methods_impl,traits_static_dispatch,fn_params}.wk`).
 - **Closures** (2026-10-12, `gap5/closures`). `|x| x * k`, `|| 0`, `|x: f32| -> f32 { .. }` passed to
@@ -92,7 +93,22 @@ line table built from them is not emitted yet.
   specialized per closure (`apply$main$closure$0`), so a call through the parameter stays a direct
   call with no function pointer (interp and native, every `-O`; `tests/run/closures.wk`). `E0418`
   for an uncopyable capture, `E0419` for a parameter type a callee generic leaves open, `E0411`
-  outside a call argument, `E0304` for assigning a capture. See the guide's "Closures".
+  outside a call argument (a `let` initializer too since `gap6/closures-escaping`, below), and
+  `E0304` for writing a capture of an immutable binding — a write to a mutable one is a
+  by-reference capture since `gap6/closures-escaping`, where `gap5` rejected every capture write.
+  See the guide's "Closures".
+- **Closures beyond the call argument** (2026-10-13, `gap6/closures-escaping`). A closure bound by
+  `let` (`let f = |x: f32| x * k;`) is called (`f(2.0)`) and passed (`apply(f, 3.0)`) with its
+  captures copied once, at the `let`, and every use resolved statically (`E0421` for any other use,
+  `E0422` for a `mut`, pattern or reassigned binding); a closure argument of a method or associated
+  function (`v.map(|a| a * k)`, `V::make(..)`) specializes the method like a free function
+  (`tests/run/{closure_let,closure_method}.wk`). A closure captures an array, tuple, struct or
+  data-carrying enum by value (a copy), and a variable it writes by reference — by assignment,
+  `&mut`, a `mut` parameter or a builtin's output operand — and the enclosing function sees the
+  write (`tests/run/{closure_captures,closure_capture_out_params}.wk`). An unannotated closure parameter is
+  typed from the call's other arguments when the expected type names a callee generic, and a
+  function-typed parameter over a dimension generic (`fn(Tensor[f32, N]) -> f32`) binds it from the
+  function passed (`tests/run/closure_infer.wk`). Interp and native agree at every `-O`.
 - **Diagnostics and tooling surface.** `--emit=check` runs the front end (lex/parse/imports/sema,
   then the lints) and stops before lowering — a fast editor loop with no `C0001` lowering limits.
   `--error-format=json`
@@ -752,9 +768,12 @@ line table built from them is not emitted yet.
 - **int8 quantized `nn.Linear` → VNNI GEMM (+ fused dequant)**: a `u8`×`i8`→`i32` matmul nest in the
   `C = A·Bᵀ` spelling dispatches to `wukong_i8gemm_nt[_parallel]`, and when it is immediately followed
   by a per-channel dequant loop the two fold into one `wukong_i8gemm_nt_deq[_parallel]` call — the
-  scale applied in the GEMM's own writeback. Whole-function and statement forms both fire, and the
-  integer accumulate is exact mod 2^32, so interp == native bit-for-bit and `-O0` == `-O3`
-  (`tests/run/{i8_linear,i8_linear_dequant,i8_linear_parallel,dequant_perchan}.wk`). The
+  scale applied in the GEMM's own writeback. The fused form drops the i32 accumulator, so it fires
+  only when the accumulator is a local of the block that nothing names after the window and whose
+  address was never taken before it (a `let p = &mut c;` or a `let`-bound closure writing `c` keeps
+  the unfused GEMM, `tests/run/closure_i8_accumulator.wk`). Whole-function and statement forms both
+  fire, and the integer accumulate is exact mod 2^32, so interp == native bit-for-bit and `-O0` ==
+  `-O3` (`tests/run/{i8_linear,i8_linear_dequant,i8_linear_parallel,dequant_perchan}.wk`). The
   per-tensor/per-channel `absmax` that produces the symmetric quantization scale is the
   column-reduction family above.
 - **`@tile` strip-mining** on a half-open unit-step `for i in start..end`: `@tile(B)` on the function
@@ -1527,14 +1546,16 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   field, a pointee or a multi-index tensor element inside the loop. Reading a location other
   iterations are still adding to is a race, as for a plain store.
 
-- **Closures are non-escaping and capture only scalars and pointers** (2026-10-12). A closure is
-  legal only as a direct argument of a plain call to a function-typed parameter: it cannot be stored,
-  returned, bound to a `let`, or passed to a method call (`x.m(|v| ..)` is `E0411` — the method
-  call path does not specialize per closure yet). A capture is a by-value copy of a scalar, C-style
-  enum, pointer or reference; an aggregate is read through a captured pointer (`(*pa)[i]`), and
-  there are no by-reference captures (`&mut` of a capture is `E0304`). An unannotated parameter is
-  typed only from the parameter's declared function type, never from the call's other arguments,
-  so a closure passed to `fold3<T>`'s `fn(T, T) -> T` needs its parameters annotated (`E0419`).
+- **Closures are resolved at compile time** (2026-10-13). A closure is a call argument or a `let`
+  initializer; there are no run-time function values, so a closure (or a closure-bound local)
+  cannot be returned, stored in a field, element or tuple, or used as an operand, and a function
+  type is not a field, element or return type. A closure argument of a call through a trait bound
+  is not supported (a trait method cannot declare a function-typed parameter). A slice, `str`,
+  tensor or vector cannot be captured (`E0418`; capture a pointer), nor the enclosing function's
+  function-typed parameter, nor a `for` counter whose bound is of a generic type (its storage width
+  is per instance; copy it to a local first). Inference of an unannotated parameter from the call's
+  other arguments never reaches the enclosing statement: `fold3(|a, b| a + b, 1, 2, 3)` binds
+  `T = i32` from the literals, whatever the result is assigned to.
 
 - **Loop fusion over branching bodies is bounded** (2026-10-12). A body that still branches fuses
   only up to 8 blocks per loop, with one latch and no exit but the header's test: a `break`, an

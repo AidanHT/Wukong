@@ -299,6 +299,14 @@ fn collect_symbolic_dims(ty: &Ty, out: &mut Vec<Symbol>) {
                 collect_symbolic_dims(f, out);
             }
         }
+        // A function-typed parameter's dimensions (`f: fn(Tensor[f32, N]) -> f32`) are the
+        // callee's too: the call binds them from the function it passes.
+        Ty::Fn { params, ret } => {
+            for p in params {
+                collect_symbolic_dims(p, out);
+            }
+            collect_symbolic_dims(ret, out);
+        }
         _ => {}
     }
 }
@@ -3095,10 +3103,16 @@ fn lower_fn(
             closure_env.push((p.name.sym, j, v, ty.clone()));
         }
     }
+    // A lifted closure's leading parameters that point at a variable it writes (`closures.rs`).
+    let by_ref = fl.by_ref_params(f.name.sym);
     for (pi, ((p, pty), val)) in f.params.iter().zip(&param_tys).zip(param_vals).enumerate() {
         let Some(val) = val else {
             continue;
         };
+        if let (Some(true), Ty::Ptr { pointee, .. }) = (by_ref.get(pi).copied(), pty) {
+            fl.bind_by_ref(p.name.sym, val, pointee);
+            continue;
+        }
         if ty_is_buffer_param(pty) {
             fl.param_arrays.push((val, pty.clone()));
         }
@@ -12548,8 +12562,12 @@ impl FnLowerer<'_> {
         // Soundness: the fused kernel never writes `c` (it dequants in registers), so `c`'s separate
         // materialization may be dropped only if `c` is provably dead afterward. Require `c` to be a
         // `let`-local declared earlier in *this* block (lexical scoping then forbids it escaping to an
-        // outer scope) and unmentioned in every statement after the dequant loop (and the block tail).
+        // outer scope), unmentioned in every statement after the dequant loop (and the block tail),
+        // and never address-taken before the window: a pointer taken there (`let p = &mut c;`, or a
+        // `let`-bound closure's by-reference capture `let $cap$L$j = &mut c;`) reads `c` later
+        // without naming it (`p[0]`, `peek(0)` lowered to `L($cap$L$j, 0)`).
         if !block_declares_local(&b.stmts[..i], nest.c)
+            || canon::stmts_take_address(&b.stmts[..i], nest.c)
             || block_mentions(&b.stmts[i + 2..], b.tail.as_deref(), nest.c)
         {
             return None;

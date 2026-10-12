@@ -221,6 +221,8 @@ impl Sema<'_> {
             );
             return;
         }
+        // A closure adding to an element of a variable it captures shares the variable.
+        self.note_capture_write(place);
         let elem = match &arg_tys[0] {
             Ty::Scalar(s) if s.is_int() && *s != Scalar::Char => *s,
             Ty::Unknown | Ty::Error => {
@@ -337,6 +339,9 @@ impl Sema<'_> {
                         self.adapt_generic_literal_args(&sig, args, &mut arg_tys);
                         // Function-valued arguments and trait bounds (`methods.rs`).
                         self.check_fn_value_args(&sig, args, &arg_tys);
+                        // A closure passing a variable it captures to a `mut` aggregate parameter
+                        // shares it (`closures.rs`).
+                        self.note_mut_arg_writes(name, args, 0);
                         self.check_call_bounds(name, &sig, generic_args, &arg_tys, span);
                         let site = CallSite::new(Some(name), None, args);
                         return self.check_fn_call(
@@ -1252,6 +1257,15 @@ impl Sema<'_> {
                         self.unify_decl(p, a, d, dims, span, rigid);
                     }
                 }
+            }
+            // A function-typed parameter fed a function: its tensor extents bind the callee's
+            // dimension generics (`fn(Tensor[f32, N]) -> f32` fed a function of
+            // `Tensor[f32, 4]` binds `N = 4`), so later parameters are checked against them. Bind
+            // only: whether the function's type is the expected one is `check_fn_value_args`'s
+            // `E0401`. Every dimension variable still in the parameter after substitution is an
+            // unbound generic of the callee.
+            (Ty::Fn { .. }, Ty::Fn { .. }) if !rigid => {
+                crate::closures::bind_dims(param, arg, &|_| true, dims);
             }
             // Two DECLARED nominal types are not interchangeable. `Ty::Named` also spells a bare
             // generic TYPE variable (`fn f<T>(x: T)`), which must stay lenient, so — exactly like

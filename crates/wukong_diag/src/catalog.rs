@@ -626,10 +626,11 @@ fn main() -> i32 {
          non-function parameter; and a function-typed parameter may be neither `mut` nor named \
          after a builtin (`gelu`, `print`, …), whose name the compiler reads as the builtin. Pass \
          the function directly at each call instead. A closure literal (`|x| x * k`) is the other \
-         value such a parameter accepts, and only there: as a direct argument of a plain call to a \
-         function whose parameter has a function type. Anywhere else — a `let`, a `return`, a \
-         field or element, an operand, a method-call argument, a `const` initializer, a `where` \
-         predicate or a `static_assert` — a closure is this error too."
+         value such a parameter accepts: as an argument of a function-typed parameter of a call \
+         or a method call, or as the initializer of a `let` (`let f = |x: f32| x * k;`), whose \
+         name can then be called or passed on. Anywhere else — a `return`, a field or element, an \
+         operand, a `const` initializer, a `where` predicate or a `static_assert` — a closure is \
+         this error too."
     ),
     entry!(
         "E0415",
@@ -664,19 +665,20 @@ fn main() -> i32 {
     entry!(
         "E0418",
         "closure captures a value it cannot copy",
-        "A closure captures every local of the enclosing code that its body reads, by value: the \
-         value is copied when the call evaluates the closure argument, and the closure is lifted \
-         to a function that receives each copy as a parameter. Only a value that fits one such \
-         parameter can be copied — a number, `bool` or `char`, a C-style enum, a raw pointer or a \
-         reference. An array, slice, tuple, struct, data-carrying enum, tensor or SIMD vector \
-         cannot, and neither can the enclosing function's function-typed parameter (it has no \
-         run-time value) or anything that names one of the enclosing function's generic \
-         parameters (the lifted function is not generic). To read an aggregate, capture a \
-         pointer to it (`let pa = &a;` before the call, then `(*pa)[i]` in the closure) or pass \
-         it to the callee as an ordinary parameter; to use a generic dimension, bind it to a \
-         local first (`let n = N;`).",
-        bad: "module ex.e0418\nfn apply(f: fn(f32) -> f32, x: f32) -> f32 {\n    return f(x);\n}\nfn main() -> i32 {\n    let w: [f32; 2] = [2.0, 3.0];\n    return apply(|x| x * w[1], 2.0) as i32;\n}\n",
-        good: "module ex.e0418\nfn apply(f: fn(f32) -> f32, x: f32) -> f32 {\n    return f(x);\n}\nfn main() -> i32 {\n    let w: [f32; 2] = [2.0, 3.0];\n    let pw = &w;\n    return apply(|x| x * (*pw)[1], 2.0) as i32;\n}\n"
+        "A closure captures every local of the enclosing code that its body reads. One it only \
+         reads is copied where the closure is created (when the call evaluates a closure \
+         argument, or at the `let` that binds it), and the closure is lifted to a function that \
+         receives each copy as a parameter; one it writes is shared by reference. What can be \
+         captured is a number, `bool` or `char`, an enum, a raw pointer or reference, a \
+         fixed-size array, a tuple or a struct. A slice or `str` (a view of storage the copy \
+         would not carry), a tensor or a SIMD vector cannot, and neither can the enclosing \
+         function's function-typed parameter (it has no run-time value) or anything that names \
+         one of the enclosing function's generic parameters (the lifted function is not \
+         generic). To read a slice, capture a pointer to it (`let ps = &s;` before the closure, \
+         then `(*ps)[i]` in it) or pass it to the callee as an ordinary parameter; to use a \
+         generic dimension, bind it to a local first (`let n = N;`).",
+        bad: "module ex.e0418\nfn apply(f: fn(f32) -> f32, x: f32) -> f32 {\n    return f(x);\n}\nfn main() -> i32 {\n    let w = alloc_f32(2);\n    let r = apply(|x| x * w[1], 2.0) as i32;\n    free(w);\n    return r;\n}\n",
+        good: "module ex.e0418\nfn apply(f: fn(f32) -> f32, x: f32) -> f32 {\n    return f(x);\n}\nfn main() -> i32 {\n    let w = alloc_f32(2);\n    let pw = &w;\n    let r = apply(|x| x * (*pw)[1], 2.0) as i32;\n    free(w);\n    return r;\n}\n"
     ),
     entry!(
         "E0419",
@@ -684,13 +686,14 @@ fn main() -> i32 {
         "A closure parameter without an annotation takes its type from the function type of the \
          parameter the closure is passed to. When that type names a generic parameter of the \
          callee, as the type itself (`fn fold3<T>(f: fn(T, T) -> T, ..)`) or as a tensor's \
-         element type or dimension (`fn(Tensor[T, N]) -> f32`), nothing has fixed it yet — the \
-         closure is checked before the call's other arguments bind it — so the parameter needs \
-         an annotation: `|a: i32, b: i32| a + b`. The same holds for the return type of a closure \
-         whose body uses `return` while the expected return type is generic: annotate it \
-         (`|..| -> i32 { .. }`).",
-        bad: "module ex.e0419\nfn fold3<T>(f: fn(T, T) -> T, a: T, b: T, c: T) -> T {\n    return f(f(a, b), c);\n}\nfn main() -> i32 {\n    return fold3(|a, b| a + b, 1, 2, 3);\n}\n",
-        good: "module ex.e0419\nfn fold3<T>(f: fn(T, T) -> T, a: T, b: T, c: T) -> T {\n    return f(f(a, b), c);\n}\nfn main() -> i32 {\n    return fold3(|a: i32, b: i32| a + b, 1, 2, 3);\n}\n"
+         element type or dimension (`fn(Tensor[T, N]) -> f32`), the call's other arguments bind \
+         it first (`fold3(|a, b| a + b, x, y, z)` types `a` and `b` as `x`'s type). When none of \
+         them does, or the closure is bound by `let` and has no function type to take it from, \
+         the parameter needs an annotation: `|a: i32, b: i32| a + b`. The same holds for the \
+         return type of a closure whose body uses `return` while no return type is known: \
+         annotate it (`|..| -> i32 { .. }`).",
+        bad: "module ex.e0419\nfn twice<T>(_f: fn(T) -> T, n: i32) -> i32 {\n    return n * 2;\n}\nfn main() -> i32 {\n    return twice(|x| x, 1);\n}\n",
+        good: "module ex.e0419\nfn twice<T>(_f: fn(T) -> T, n: i32) -> i32 {\n    return n * 2;\n}\nfn main() -> i32 {\n    return twice(|x: i32| x, 1);\n}\n"
     ),
     entry!(
         "E0420",
@@ -703,6 +706,29 @@ fn main() -> i32 {
          `str` itself: a non-generic `fn f(s: str)`.",
         bad: "module ex.e0420\nfn first<T>(x: T) -> T {\n    return x;\n}\nfn main() -> i32 {\n    let s: str = \"hi\";\n    let t = first(s);\n    return t.len() as i32;\n}\n",
         good: "module ex.e0420\nfn first(x: str) -> str {\n    return x;\n}\nfn main() -> i32 {\n    let s: str = \"hi\";\n    let t = first(s);\n    return t.len() as i32;\n}\n"
+    ),
+    entry!(
+        "E0421",
+        "a closure-bound local used as a value",
+        "A local bound to a closure (`let f = |x: f32| x * k;`) is resolved at compile time: each \
+         call `f(..)` is a direct call of the closure's code with the values it captured, and \
+         passing `f` to a function-typed parameter specializes the callee for it. So `f` has no \
+         run-time value, and the name can only be called or passed to a parameter of function \
+         type. Copying it to another local, returning it, storing it in a field, element or \
+         tuple, taking its address, printing it or computing with it is this error. Call it, or \
+         pass it on.",
+        bad: "module ex.e0421\nfn main() -> i32 {\n    let f = |x: i32| x + 1;\n    let g = f;\n    return g(1);\n}\n",
+        good: "module ex.e0421\nfn apply(f: fn(i32) -> i32, x: i32) -> i32 {\n    return f(x);\n}\nfn main() -> i32 {\n    let f = |x: i32| x + 1;\n    return apply(f, 1);\n}\n"
+    ),
+    entry!(
+        "E0422",
+        "a closure bound by a `mut` binding or a pattern, or reassigned",
+        "A closure-bound local names the one closure its `let` initializes it with, because every \
+         call through it is resolved at compile time. So the binding must be a plain, immutable \
+         `let name = |..| ..;`: a `let mut`, a destructuring pattern, and an assignment `f = ..` \
+         to a closure-bound `f` are rejected. Bind each closure to a name of its own.",
+        bad: "module ex.e0422\nfn main() -> i32 {\n    let mut f = |x: i32| x + 1;\n    return f(1);\n}\n",
+        good: "module ex.e0422\nfn main() -> i32 {\n    let f = |x: i32| x + 1;\n    return f(1);\n}\n"
     ),
     entry!(
         "E0430",

@@ -433,6 +433,8 @@ impl Sema<'_> {
             return;
         }
         if written {
+            // A closure writing a variable it captures this way shares it (`closures.rs`).
+            self.note_capture_write(arg);
             if let ExprKind::Path(p) = &arg.kind {
                 if p.is_single() {
                     let sym = p.first().sym;

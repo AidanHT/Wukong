@@ -1,0 +1,84 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 123
+// EXPECT-OUT: 1
+// EXPECT-OUT: 6
+// EXPECT-OUT: 81
+// EXPECT-OUT: 1
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 8
+// EXPECT-OUT: 6
+// EXPECT-OUT: 204
+// EXPECT-OUT: 0.5
+// EXPECT-OUT: 4
+// EXPECT-OUT: 3
+module tests.run.closure_infer
+
+// An unannotated closure parameter whose expected type names a generic of the callee takes the
+// type the call's other arguments bind it to; a function-typed parameter whose type names a
+// dimension generic accepts a function, or a closure, of the extent the call binds. Expectations
+// by hand, with xs = [1, 2, 3, 4] and ys = [0.5, 0, 0, 0.5]:
+//   fold3(|a, b| a * 10 + b, 1, 2, 3) at T = i64: (1 * 10 + 2) * 10 + 3     = 123
+//   fold3(|a, b| a - b, 1.5, 0.25, 0.25) at T = f32: 1.5 - 0.25 - 0.25      = 1
+//   fold3(|a, b| a + b, 1, 2, 3), T from the literals (i32)                 = 6
+//   mk(3, |v| v * v) = (3 * 3) * (3 * 3)                                    = 81
+//   mk(0.5, |v| v + 0.25) = 0.5 + 0.25 + 0.25                               = 1
+//   mapn(head, xs), N = 4 from head: xs[0] + xs[3]                          = 5
+//   mapn(|t| t[1] * t[2], xs), t typed Tensor[f32, 4] from xs: 2 * 3        = 6
+//   both(head, xs, ys) = (1 + 4) - (0.5 + 0.5) + N                          = 8
+//   both(|t| t[1], xs, ys) = 2 - 0 + 4                                      = 6
+//   pick(xs, |t, i| t[i] * 100) = xs[1] * 100 + N                           = 204
+//   mapn(|t| t[0] * w, xs) with w = 0.5                                     = 0.5
+//   dims(head) and dims(|t: Tensor[f32, 3]| t[0]): N from the function alone = 4, then 3
+
+fn fold3<T>(f: fn(T, T) -> T, a: T, b: T, c: T) -> T {
+    return f(f(a, b), c);
+}
+
+fn mk<T>(x: T, f: fn(T) -> T) -> T {
+    return f(f(x));
+}
+
+fn mapn<N>(f: fn(Tensor[f32, N]) -> f32, t: Tensor[f32, N]) -> f32 {
+    return f(t);
+}
+
+fn both<N>(f: fn(Tensor[f32, N]) -> f32, a: Tensor[f32, N], b: Tensor[f32, N]) -> f32 {
+    return f(a) - f(b) + (N as f32);
+}
+
+fn pick<N>(t: Tensor[f32, N], f: fn(Tensor[f32, N], i64) -> f32) -> f32 {
+    return f(t, 1) + (N as f32);
+}
+
+fn dims<N>(_f: fn(Tensor[f32, N]) -> f32) -> i64 {
+    return N as i64;
+}
+
+fn head(t: Tensor[f32, 4]) -> f32 {
+    return t[0] + t[3];
+}
+
+fn main() -> i32 {
+    let x: i64 = 1;
+    let y: i64 = 2;
+    print(fold3(|a, b| a * 10 + b, x, y, 3));
+    print(fold3(|a, b| a - b, 1.5, 0.25, 0.25));
+    print(fold3(|a, b| a + b, 1, 2, 3));
+    print(mk(3, |v| v * v));
+    print(mk(0.5, |v| v + 0.25));
+
+    let xs: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let ys: [f32; 4] = [0.5, 0.0, 0.0, 0.5];
+    print(mapn(head, xs));
+    print(mapn(|t| t[1] * t[2], xs));
+    print(both(head, xs, ys));
+    print(both(|t| t[1], xs, ys));
+    print(pick(xs, |t, i| t[i] * 100.0));
+    let w: f32 = 0.5;
+    print(mapn(|t| t[0] * w, xs));
+    print(dims(head));
+    print(dims(|t: Tensor[f32, 3]| t[0]));
+    return 0;
+}

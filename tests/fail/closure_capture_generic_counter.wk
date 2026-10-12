@@ -1,0 +1,32 @@
+// EXPECT-CODE: E0418
+// EXPECT-COUNT: 1
+module tests.fail.closure_capture_generic_counter
+
+// A `for` counter is stored at the wider of its bounds' integer types. With the end bound `n: T`,
+// that width is decided per instance of `total_of` (an `i64` there gives an 8-byte counter), but a
+// closure is lifted to one non-generic function whose capture has a single width, so capturing `i`
+// is rejected where it is read. Copying it to a local first (`let k = i;`, a value of the counter's
+// own type) and capturing `k` is the fix. tests/run/closure_wide_counter.wk is the positive control
+// for a counter whose width is known.
+
+fn each(f: fn(i32), n: i32) {
+    for j in 0..n {
+        f(j);
+    }
+}
+
+fn total_of<T>(n: T) -> i32 {
+    let mut total = 0;
+    for i in 0..n {
+        each(|j| {
+            total += i * 10 + j; //~ E0418
+        }, 2);
+    }
+    return total;
+}
+
+fn main() -> i32 {
+    let n: i64 = 3;
+    print(total_of(n));
+    return 0;
+}

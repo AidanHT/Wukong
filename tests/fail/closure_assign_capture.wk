@@ -2,16 +2,17 @@
 // EXPECT-COUNT: 1
 module tests.fail.closure_assign_capture
 
-// A closure captures `count` by value: the copy is read-only, so assigning it inside the closure
-// would update nothing the caller can see. Capturing a pointer (`let pc = &mut count;`, then
-// `*pc = *pc + 1.0;` in the closure) is the way to update the caller's variable.
+// A closure that writes a variable it captures shares it with the enclosing function (it is
+// captured by reference), so the variable's own rules apply: `count` is an immutable binding, and
+// assigning it is rejected inside the closure exactly as it would be outside. `let mut count` is
+// the fix; tests/run/closure_captures.wk is the positive control.
 
 fn apply(f: fn(f32) -> f32, x: f32) -> f32 {
     return f(x);
 }
 
 fn main() -> i32 {
-    let mut count = 0.0;
+    let count = 0.0;
     print(apply(|x| {
         count = count + 1.0; //~ E0304
         x

@@ -1,0 +1,62 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: -6
+// EXPECT-OUT: 9
+// EXPECT-OUT: 1.5
+// EXPECT-OUT: 2.5
+// EXPECT-OUT: -1.5
+// EXPECT-OUT: 3
+// EXPECT-OUT: -2.5
+module tests.run.closure_method
+
+// Closures passed to methods: the method is specialized per closure exactly like a free function
+// (`V.map$main$closure$0`), whether it is called on a value, through a reference, or as an
+// associated function. Expectations by hand, with v = (1.5, -3) and k = 2:
+//   v.map(|a| a * k) = (3, -6)
+//   w.reduce(|a, b| a - b) = 3 - (-6)                                        = 9
+//   V::make(|i| i + 0.5) = (1.5, 2.5)
+//   v.map(neg), with the closure-bound neg = 0 - a: (-1.5, 3)
+//   (&v).reduce(|a, b| a * b + k) = 1.5 * -3 + 2                             = -2.5
+
+struct V {
+    x: f32,
+    y: f32,
+}
+
+impl V {
+    fn map(self, f: fn(f32) -> f32) -> V {
+        return V { x: f(self.x), y: f(self.y) };
+    }
+
+    fn reduce(self, f: fn(f32, f32) -> f32) -> f32 {
+        return f(self.x, self.y);
+    }
+
+    fn make(f: fn(i32) -> f32) -> V {
+        return V { x: f(1), y: f(2) };
+    }
+}
+
+fn main() -> i32 {
+    let k = 2.0;
+    let v = V { x: 1.5, y: -3.0 };
+    let w = v.map(|a| a * k);
+    print(w.x);
+    print(w.y);
+    print(w.reduce(|a, b| a - b));
+
+    let off = 0.5;
+    let m = V::make(|i| (i as f32) + off);
+    print(m.x);
+    print(m.y);
+
+    let neg = |a: f32| 0.0 - a;
+    let n = v.map(neg);
+    print(n.x);
+    print(n.y);
+
+    let pv = &v;
+    print(pv.reduce(|a, b| a * b + k));
+    return 0;
+}

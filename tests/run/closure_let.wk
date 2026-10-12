@@ -1,0 +1,110 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 6
+// EXPECT-OUT: 15
+// EXPECT-OUT: 9
+// EXPECT-OUT: 4.5
+// EXPECT-OUT: 15
+// EXPECT-OUT: -6
+// EXPECT-OUT: 10
+// EXPECT-OUT: 12
+// EXPECT-OUT: 2
+// EXPECT-OUT: 100
+// EXPECT-OUT: 10
+// EXPECT-OUT: 49
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2.5
+// EXPECT-OUT: 50
+// EXPECT-OUT: 11
+module tests.run.closure_let
+
+// Closures bound by `let`. Each is lifted to a function once; its `let` copies the captured values
+// into hidden locals, a call `f(x)` is a direct call of the lifted function with them, and passing
+// `f` to a function-typed parameter specializes the callee for it, exactly as for a literal
+// written at that call. Expectations by hand, with k = 3:
+//   scale(2) = 2 * 3                                                      = 6
+//   apply(scale, 5) = 5 * 3                                               = 15
+//   twice(scale, 1) = (1 * 3) * 3                                         = 9
+//   shifted(1) = scale(1) + 1.5, through the closure-bound `scale`         = 4.5
+//   apply(|y| shifted(y) * 2, 2) = (6 + 1.5) * 2                          = 15
+//   the inner block's own `scale` = x - 10: scale(4) = -6, apply(scale, 20) = 10
+//   after the block, the outer one again: scale(4) = 12
+//   add_base copied base = 1 at its `let`; base = 100 afterwards: add_base(1) = 2, then 100
+//   sum over i in 0..4 of count_if(v > i) over [0, 1, 2, 3, 4] = 4 + 3 + 2 + 1 = 10
+//   sq(7)                                                                 = 49
+//   clamp0(-2.5) returns early with 0; clamp0(2.5)                        = 0, then 2.5
+//   the deferred show(10) runs at the block's end, with d = 1 copied at the `let`, after
+//   d = 50 is printed: 50, then 10 + 1                                    = 11
+
+fn apply(f: fn(f32) -> f32, x: f32) -> f32 {
+    return f(x);
+}
+
+fn twice(f: fn(f32) -> f32, x: f32) -> f32 {
+    return apply(f, apply(f, x));
+}
+
+fn count_if(p: fn(i32) -> bool, xs: [i32; 5]) -> i32 {
+    let mut n = 0;
+    for i in 0..5 {
+        if p(xs[i]) {
+            n += 1;
+        }
+    }
+    return n;
+}
+
+fn main() -> i32 {
+    let k = 3.0;
+    let scale = |x: f32| x * k;
+    print(scale(2.0));
+    print(apply(scale, 5.0));
+    print(twice(scale, 1.0));
+
+    let off = 1.5;
+    let shifted: fn(f32) -> f32 = |x| scale(x) + off;
+    print(shifted(1.0));
+    print(apply(|y| shifted(y) * 2.0, 2.0));
+
+    {
+        let k = 10.0;
+        let scale = |x: f32| x - k;
+        print(scale(4.0));
+        print(apply(scale, 20.0));
+    }
+    print(scale(4.0));
+
+    let mut base = 1.0;
+    let add_base = |x: f32| x + base;
+    base = 100.0;
+    print(add_base(1.0));
+    print(base);
+
+    let mut s = 0;
+    for i in 0..4 {
+        let over = |v: i32| v > i;
+        s += count_if(over, [0, 1, 2, 3, 4]);
+    }
+    print(s);
+
+    let sq = |x: i32| x * x;
+    print(sq(7));
+
+    let clamp0 = |x: f32| -> f32 {
+        if x < 0.0 {
+            return 0.0;
+        }
+        x
+    };
+    print(clamp0(-2.5));
+    print(clamp0(2.5));
+
+    {
+        let mut d = 1;
+        let show = |x: i32| x + d;
+        defer print(show(10));
+        d = 50;
+        print(d);
+    }
+    return 0;
+}

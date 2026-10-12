@@ -3,14 +3,14 @@
 module tests.fail.closure_param_infer
 
 // An unannotated closure parameter takes its type from the function type it is passed as. Here
-// that type is `fn(T, T) -> T`, and `T` is a generic parameter of `fold3` that only the call's
-// later arguments would bind: the closure is checked first, so `a` and `b` need annotations
-// (`|a: i32, b: i32| a + b`). Reported once, at the first parameter it cannot type.
+// that type is `fn(T) -> T`, and `T` is a generic parameter of `twice` that no other argument of
+// the call binds (there is none), so `x` needs an annotation (`|x: i32| x * 2`). When another
+// argument does bind it, the closure is checked at that type: tests/run/closure_infer.wk.
 
-fn fold3<T>(f: fn(T, T) -> T, a: T, b: T, c: T) -> T {
-    return f(f(a, b), c);
+fn twice<T>(_f: fn(T) -> T) -> i32 {
+    return 2;
 }
 
 fn main() -> i32 {
-    return fold3(|a, b| a + b, 1, 2, 3); //~ E0419
+    return twice(|x| x * 2); //~ E0419
 }

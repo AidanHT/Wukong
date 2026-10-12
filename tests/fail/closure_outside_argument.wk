@@ -2,12 +2,12 @@
 // EXPECT-COUNT: 1
 module tests.fail.closure_outside_argument
 
-// A closure is non-escaping: it is legal only as a direct argument of a call whose parameter has
-// a function type, where the callee is specialized for it at compile time. Bound to a local it
-// would be a run-time function value, which Wukong does not have.
+// A closure is resolved at compile time: it is legal as an argument of a function-typed parameter
+// and as the initializer of a `let`, where every call through the name is a direct call of the
+// closure's code. An array element would be a run-time function value, which Wukong does not have.
 
 fn main() -> i32 {
-    let double = |x: f32| x * 2.0; //~ E0411
+    let fs = [|x: f32| x * 2.0]; //~ E0411
     print(3.0);
     return 0;
 }

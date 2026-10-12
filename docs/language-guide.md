@@ -163,15 +163,23 @@ like a type-generic function is per type (`apply$square`), the function paramete
 and a call through it is a direct call — inlinable, and visible to every kernel recognizer. A
 type-generic higher-order function binds its type parameters from the function argument too
 (`fn fold3<T>(op: fn(T, T) -> T, a: T, b: T, c: T) -> T`). The rules (`E0411` otherwise): a function
-type is only a parameter's type (not a local, field, element, return type or `extern` parameter); a
-function cannot be bound to a `let` or passed to a non-function parameter; the argument must name a
-function, not compute one; and a function-typed parameter is neither `mut` nor named after a builtin
-(`gelu`, `print`, …). A wrong signature is the ordinary `E0401` type mismatch. `tests/run/fn_params.wk`.
+type is only a parameter's type, or the annotation of a `let` that binds a closure
+(`let f: fn(f32) -> f32 = |x| x * k;`, see [Closures](#closures-)) — not another local's, a field's,
+an element's, a return type or an `extern` parameter's; a named function cannot be bound to a `let`
+(a closure can) or passed to a non-function parameter; the argument must name a function, not
+compute one; and a function-typed parameter is neither `mut` nor named after a builtin (`gelu`,
+`print`, …). A wrong signature is the ordinary `E0401` type mismatch. A parameter whose type
+names a dimension generic of the callee (`fn mapn<N>(f: fn(Tensor[f32, N]) -> f32, t: Tensor[f32, N])`)
+accepts a function of the extent the call binds: from the function itself (`fn head(t: Tensor[f32, 4])`
+binds `N = 4`) or from another argument, the first binding winning and every other argument checked
+against it (`E0401` at the function, `E0501` at a buffer). `tests/run/fn_params.wk`,
+`tests/run/closure_infer.wk`.
 
 ### Closures ✅
 
 A **closure literal** — `|x| x * k`, `|| 0`, `|a, b: i32| a + b`, or the block form
-`|x: f32| -> f32 { … }` — may be passed wherever a function-typed parameter expects a function:
+`|x: f32| -> f32 { … }` — may be passed wherever a function-typed parameter expects a function, or
+bound to a name with `let`:
 
 ```wukong
 fn apply(f: fn(f32) -> f32, x: f32) -> f32 { return f(x); }
@@ -180,30 +188,57 @@ fn main() -> i32 {
     let scale = 2.5;
     print(apply(|x| x * scale, 4.0));                                  // 10
     print(apply(|x| -> f32 { if x < 0.0 { return -x; } x }, -4.0));    // 4
+    let double = |x: f32| x * 2.0;
+    print(double(3.0) + apply(double, 1.0));                           // 8
     return 0;
 }
 ```
 
-- **Where.** Only as a direct argument of a plain call `g(..)` to a function whose parameter at that
-  position has a function type. Closures are **non-escaping**: one cannot be bound to a `let`,
-  returned, stored in a field or element, used as an operand, passed to a method call, or written in
-  a `const` initializer, a `where` predicate or a `static_assert` (`E0411`).
+- **Where.** As an argument of a function-typed parameter — of a call to a function, a method
+  (`v.map(|a| a * k)`, `V::make(|i| ..)`), a function-typed parameter or a closure-bound local — or
+  as the initializer of a `let`. A **closure-bound local** (`let f = |x: f32| x * k;`) can be called
+  (`f(2.0)`) and passed to a function-typed parameter (`apply(f, 3.0)`), and nothing else: copying,
+  returning, storing, printing or computing with it is `E0421`, because it has no run-time value —
+  every use is resolved to the closure at compile time. The binding is one immutable name
+  (`let mut`, a pattern or a reassignment `f = ..` is `E0422`); an annotation, if any, is its
+  function type (`let f: fn(f32) -> f32 = |x| x * k;`). Anywhere else — returned, stored in a field
+  or element, an operand, a `const` initializer, a `where` predicate or a `static_assert` — a
+  closure is `E0411`: there are no run-time function values.
 - **Parameters and return type.** Each parameter is a name with an optional `: Type` (no patterns,
-  no `mut`). An unannotated parameter takes the type the function-typed parameter declares for it;
-  when that names a generic parameter of the callee (`fn fold3<T>(f: fn(T, T) -> T, ..)`), even as a
-  tensor's element type or dimension (`fn(Tensor[T, N]) -> f32`), nothing has fixed it yet, and it
-  must be annotated (`E0419`). The return type is the annotation, else the
-  declared one, else the body's type. With `->` the body must be a block. The closure's type must
-  equal the parameter's once the call binds the callee's generics (`E0401`).
-- **Captures.** Every enclosing local the body reads is captured **by value**, copied when the call
-  evaluates that argument (left to right with the other arguments); a local named as a dimension in a
-  turbofish (`sumn::<n>(..)`, `sum::<n>(..)`) is read too, and captured the same way. A scalar (including `bool` and
-  `char`), a C-style enum, a raw pointer or a reference can be captured. An array, slice, tuple,
-  struct, data-carrying enum, tensor or vector, the enclosing function's function-typed parameter, and
-  anything naming one of its generic parameters cannot (`E0418`): capture a pointer instead
-  (`let pa = &a;`, then `(*pa)[i]`), and bind a generic dimension to a local first (`let n = N;`). A
-  capture is read-only — assigning it or taking `&mut` of it is `E0304` — but writing *through* a
-  captured pointer updates the caller's data (`let pt = &mut total;` … `*pt = *pt + x`).
+  no `mut`). An unannotated parameter takes the type the function-typed parameter declares for it.
+  When that names a generic parameter of the callee (`fn fold3<T>(f: fn(T, T) -> T, a: T, ..)`), even
+  as a tensor's element type or dimension (`fn(Tensor[T, N]) -> f32`), the call's other arguments
+  bind it first — the non-literal ones, then a literal at its default type — so
+  `fold3(|a, b| a * 10 + b, x, y, 3)` types `a` and `b` as `x`'s type. A generic none of them binds
+  needs an annotation (`E0419`), and so does every parameter of a `let`-bound closure without a
+  function-type annotation; one bound to the enclosing function's own generic is `E0418` (the
+  closure is not generic). The return type is the annotation, else the declared one, else the
+  body's type, and a body that uses `return` then needs the annotation (`E0419`). With `->` the body
+  must be a block. The closure's type must equal the parameter's once the call binds the callee's
+  generics (`E0401`).
+- **Captures.** Every enclosing local the body reads is captured. One it only **reads** is copied
+  where the closure is created — when the call evaluates that argument (left to right with the
+  other arguments), or at the `let` — so a later write to the variable is not seen: a scalar
+  (including `bool` and `char`), an enum, a raw pointer or reference, a fixed-size array, a tuple or
+  a struct, the last four copied whole. One it **writes** — `c = ..`, `c += ..`, `&mut c`, an element
+  or field (`a[i] = ..`, `p.x = ..`), `atomic_add(a[i], ..)`, a `mut self` method, an aggregate passed
+  to a `mut` parameter (`relu6(x, out)`, which writes `out` in place), or a builtin's output operand
+  (`relu(x, out)`, `argsort_f32(x, idx)`, `sprintf(buf, ..)`), directly or through a tensor view
+  of it (`relu(x, out as Tensor[f32, 2, 3])`; a view bound by `let` counts as a write, since it can
+  be written through) — is captured **by reference**: the closure and the enclosing function share
+  the variable, so the write is seen after the call (and by every later call of a `let`-bound
+  closure), and the variable's own rules apply (`E0304` for an immutable binding, exactly as outside
+  the closure). Writing through a captured
+  pointer (`*pt = ..`) writes the pointee, and the pointer stays a copy. A local named as a
+  dimension in a turbofish (`sumn::<n>(..)`, `sum::<n>(..)`) is read too. A slice or `str` (a view
+  of storage its copy would not carry), a tensor or vector, the enclosing function's function-typed
+  parameter, and anything naming one of its generic parameters cannot be captured (`E0418`):
+  capture a pointer instead (`let ps = &s;`, then `(*ps)[i]`), and bind a generic dimension to a
+  local first (`let n = N;`). A `for` counter is captured at the width it is stored at, the wider
+  of its bounds' integer types (`for i in 0..n` with `n: i64` stores `i` in 8 bytes, and the
+  closure reads and writes all of them), so a bound of a generic type, whose width each instance
+  decides, makes the counter `E0418` too: copy it to a local first (`let k = i;`). A closure-bound
+  local is captured through its closure: the inner closure receives what the outer one captured.
 - **Control flow.** `return` returns from the closure; `break`/`continue` cannot cross it (`E0303`).
   Closures nest, and a name an inner closure captures is captured by every closure around it.
 - **Attributes.** A closure body is code of the function it is written in, so that function's
@@ -211,10 +246,10 @@ fn main() -> i32 {
   and `@unchecked` apply to it as well (`tests/run/closure_strict_fp.wk`).
 
 It costs nothing at run time: the closure is lifted to a function whose leading parameters are its
-captures, and the callee is specialized per closure exactly as per named function
-(`apply$main$closure$0`), so a call through `f` is a direct call with the captures as ordinary scalar
-arguments — no function pointer, no heap environment, and inlined like any call at `-O2`.
-`tests/run/closures.wk`.
+captures (a pointer for one it writes), and the callee is specialized per closure exactly as per named
+function (`apply$main$closure$0`), so a call through `f`, or through a closure-bound local, is a
+direct call — no function pointer, no heap environment, and inlined like any call at `-O2`.
+`tests/run/{closures,closure_let,closure_method,closure_captures,closure_capture_out_params,closure_wide_counter,closure_infer}.wk`.
 
 ### Generic functions and dtype-generic tensors ✅
 

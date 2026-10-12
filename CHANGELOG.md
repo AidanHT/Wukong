@@ -33,6 +33,57 @@ All notable changes to Wukong are documented here. The format is loosely based o
   them; unit tests cover escapes, loops, derived pointers, `@parallel` captures, vector-kernel stream
   tables and every way a fill loop can fail to be a full overwrite, and a machine-frame probe measures
   the frame shrinking by the two 4 KiB slots it no longer reserves.
+### Closures beyond the call argument (`gap6/closures-escaping`, N27)
+
+- **Added: closures bound by `let`.** `let f = |x: f32| x * k;` binds a closure; `f(2.0)` calls it
+  and `apply(f, 3.0)` passes it to a function-typed parameter, with its captures copied once, at the
+  `let`. Each use is resolved at compile time: the `let` becomes one hidden local per captured value
+  and every call is a direct call of the lifted function, so there is still no function pointer.
+  An annotation is the closure's function type (`let f: fn(f32) -> f32 = |x| x * k;`); a closure
+  that calls `f` captures what `f` captured. Any other use of `f` (copied, returned, stored,
+  printed, an operand) is the new `E0421`; `let mut f = ..`, a pattern, or `f = ..` is the new
+  `E0422`. Before, a closure in a `let` was `E0411` (`tests/run/closure_let.wk`,
+  `tests/fail/closure_let_escape.wk`, `tests/fail/closure_let_mut.wk`).
+- **Added: closure arguments of methods.** `v.map(|a| a * k)`, through a reference
+  (`pv.reduce(..)`) and as an associated function (`V::make(|i| ..)`), specializes the method per
+  closure exactly like a free function (`V.map$main$closure$0`); it was `E0411`
+  (`tests/run/closure_method.wk`).
+- **Added: aggregate and by-reference captures.** A closure captures an array, tuple, struct or
+  data-carrying enum by value — a copy taken where the closure is created, so a later write to the
+  original is not seen — where it was `E0418`. A variable the closure writes (`c = ..`, `c += ..`,
+  `&mut c`, `a[i] = ..`, `p.x = ..`, `atomic_add`, a `mut self` method, an aggregate passed to a
+  `mut` parameter such as `relu6(x, out)`, or a builtin's output operand such as `relu(x, out)`,
+  `argsort_f32(x, idx)` or `sprintf(buf, ..)`, directly or through a tensor view of it such as
+  `out as Tensor[f32, 2, 3]`) is captured by reference: the lifted function receives a pointer to
+  it, and the enclosing function sees every write on interp and native alike; the variable's own
+  mutability rules apply (`E0304` for an immutable binding), where every write to a capture used to
+  be `E0304`. A `for` counter is captured at the width it is stored at, the wider
+  of its bounds' integer types, so `for i in 0..n` with `n: i64` gives the closure the 8-byte
+  counter, read or written (a 4-byte capture there was a MIR-verifier ICE by value, and by
+  reference left `4294967294` in the counter natively where the interpreter had `-2`); a bound of an
+  enclosing generic type, whose width each instance decides, makes the counter `E0418`. A slice,
+  `str`, tensor or vector still cannot be captured (`E0418`, `tests/fail/closure_capture_slice.wk`,
+  `tests/fail/closure_capture_generic_counter.wk`; `tests/run/closure_captures.wk`,
+  `tests/run/closure_capture_out_params.wk`, `tests/run/closure_wide_counter.wk`).
+- **Fixed: the int8 GEMM + dequant fusion dropped an accumulator a pointer still held.** The fused
+  `wukong_i8gemm_nt_deq` never writes the i32 accumulator `c`, and fired whenever nothing after the
+  window named `c`. A `let`-bound closure that writes `c` holds a pointer to it from its `let` on,
+  and a later call names only that pointer, so every lane it read back was 0 (on interp and native
+  at every `-O`, so no gate saw it); a raw `let pc = &mut c;` had the same hole. The fusion now also
+  requires that nothing before the window took `c`'s address, and keeps the unfused
+  `wukong_i8gemm_nt` otherwise (`tests/run/closure_i8_accumulator.wk`).
+- **Added: closure parameters inferred from the call's other arguments.** When the expected type
+  names a callee generic, the other arguments bind it first (non-literals, then literals at their
+  default type), so `fold3(|a, b| a * 10 + b, x, y, 3)` with `x: i64` types `a, b: i64` and
+  `mapn(|t| t[1] * t[2], xs)` types `t` as `Tensor[f32, 4]`. It was `E0419`, which now fires only
+  when nothing binds the generic (`tests/run/closure_infer.wk`, `tests/fail/closure_param_infer.wk`).
+- **Fixed: a function-typed parameter over a dimension generic rejected every function.**
+  `fn mapn<N>(f: fn(Tensor[f32, N]) -> f32, t: Tensor[f32, N])` called as `mapn(head, xs)` with
+  `head: fn(Tensor[f32, 4]) -> f32` was `E0401` ("expected `fn(Tensor[f32, N]) -> f32`"), because
+  the expected type was compared before the call's dimensions were substituted. The call now binds
+  `N` from the function too (first binding wins, every other argument checked against it), and a
+  dimension named only by the function parameter is passed to the instance as a hidden dimension
+  argument (`tests/run/closure_infer.wk`).
 
 ### Source locations through MIR into native code (`gap5/native-source-locations`)
 

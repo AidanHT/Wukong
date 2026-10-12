@@ -30,6 +30,22 @@
 //! captures are ordinary reads, at the point where the copy happens, for every walker at once.
 //! [`closure_code`] is the function such a value denotes.
 //!
+//! **A `let`-bound closure** (`let f = |x: f32| x * k;`) is lifted the same way, and its `let` is
+//! replaced by one hidden local per captured value, copied there (`let $cap$L$0 = k;`). Sema
+//! recorded which literal each use of `f` denotes (`SemaResult::closure_refs`), and each is
+//! rewritten in place: a call `f(x)` becomes the direct call `L($cap$L$0, x)`, and an argument
+//! `apply(f, ..)` the closure value `(L, $cap$L$0)` read from those locals. A closure that uses `f`
+//! captures those hidden locals instead (`ClosureInfo::bound`). No use of `f` survives this pass.
+//!
+//! **What a capture carries.** One the closure only reads is a copy: a scalar by value, an
+//! aggregate (an array, tuple, struct or data-carrying enum) as a fresh buffer filled when the
+//! closure value is evaluated (`capture_value`; a `let`'s hidden local already is one). One the
+//! closure writes (`ClosureInfo::by_ref`) is the element `&mut c`: the lifted function's parameter
+//! is a `*mut T`, and `lower_fn` binds the name to the storage it points at (`bind_by_ref`), so the
+//! body reads and writes the enclosing variable itself. A capture's type is the width the variable
+//! is stored at, which for a `for` range counter is its wider bound's type rather than its own
+//! (`lower_for`'s `range_counter_type`; sema records it), so a copy and a pointer both match the slot.
+//!
 //! What closures add to lowering is the **environment ABI**:
 //!
 //! * an instance whose function-typed parameter `f` is bound to a closure with captures declares
@@ -56,10 +72,10 @@
 
 use wukong_ast::{
     Attr, Block, Expr, ExprKind, FnDecl, ForIter, Ident, Item, ItemKind, Module, NodeId, Param,
-    Path, Stmt, StmtKind, TypeExpr, TypeKind,
+    PatKind, Path, Pattern, Stmt, StmtKind, TypeExpr, TypeKind, UnOp,
 };
 use wukong_mir::{MirType, Op, ValueId};
-use wukong_sema::{Def, DefKind, FnSig, SemaResult};
+use wukong_sema::{ClosureInfo, Def, DefKind, FnSig, SemaResult};
 use wukong_span::{FxHashMap as HashMap, Interner, Span, Symbol};
 use wukong_types::Ty;
 
@@ -76,6 +92,10 @@ pub(crate) struct ClosureLift {
     /// The capture types: the lifted function's leading parameter types, and the types of the
     /// hidden parameters an instance bound to it declares.
     pub(crate) env_tys: Vec<Ty>,
+    /// Per leading parameter: it is a pointer to the enclosing variable the closure writes (its
+    /// type is `*mut T`), and the lifted body names the variable itself — `lower_fn` binds the
+    /// name to the pointed-to storage instead of to a copy.
+    pub(crate) by_ref: Vec<bool>,
 }
 
 /// The attributes a lifted closure takes over from the function it is written in: the ones that
@@ -122,10 +142,11 @@ pub(crate) fn lift_module(
         prefix: String::new(),
         counter: 0,
         attrs: Vec::new(),
-        types: Vec::new(),
+        types: HashMap::default(),
         defs: Vec::new(),
         items: Vec::new(),
         table: ClosureTable::default(),
+        bound: HashMap::default(),
     };
     for item in &mut out.items {
         let Item { attrs, kind, .. } = item;
@@ -201,10 +222,31 @@ struct Lifter<'a> {
     /// The current top-level function's [`INHERITED_ATTRS`], which every closure in it carries.
     attrs: Vec<Attr>,
     /// Types of the nodes this pass creates.
-    types: Vec<(NodeId, Ty)>,
+    types: HashMap<NodeId, Ty>,
     defs: Vec<Def>,
     items: Vec<Item>,
     table: ClosureTable,
+    /// Every closure bound by a `let`, by its literal's id (see [`Bound`]).
+    bound: HashMap<NodeId, Bound>,
+}
+
+/// A closure bound by `let f = |..| ..;`: its lifted function, the function's type, and the hidden
+/// locals (`$cap$<L>$<j>`) its `let` became — one per captured value, copied there — with their
+/// types. A use of `f` reads those locals.
+struct Bound {
+    code: Symbol,
+    code_ty: Ty,
+    env: Vec<(Symbol, Ty)>,
+}
+
+/// One value a lifted closure receives ahead of its own parameters: the parameter's name and
+/// type, whether it stands for the enclosing variable itself (a pointer to it, `by_ref`), and the
+/// expression, in the enclosing scope, that produces it where the closure is created.
+struct Cap {
+    name: Symbol,
+    ty: Ty,
+    by_ref: bool,
+    value: Expr,
 }
 
 impl Lifter<'_> {
@@ -221,7 +263,7 @@ impl Lifter<'_> {
     /// A single-name path expression with a fresh id typed `ty`.
     fn path(&mut self, sym: Symbol, span: Span, ty: Ty) -> Expr {
         let id = self.fresh();
-        self.types.push((id, ty));
+        self.types.insert(id, ty);
         Expr {
             id,
             kind: ExprKind::Path(Path {
@@ -233,12 +275,115 @@ impl Lifter<'_> {
     }
 
     fn block(&mut self, b: &mut Block) {
-        for s in &mut b.stmts {
-            self.stmt(s);
+        let stmts = std::mem::take(&mut b.stmts);
+        let mut out = Vec::with_capacity(stmts.len());
+        for mut s in stmts {
+            if let Some(lets) = self.closure_let(&mut s) {
+                out.extend(lets);
+                continue;
+            }
+            self.stmt(&mut s);
+            out.push(s);
         }
+        b.stmts = out;
         if let Some(t) = &mut b.tail {
             self.expr(t);
         }
+    }
+
+    /// `let f = |..| ..;`: lift the literal, and replace the statement by one hidden `let` per
+    /// captured value (`let $cap$L$0 = k;`), where the closure is created. Every use of `f` reads
+    /// them (see [`Self::expr`]). `None` for every other statement.
+    fn closure_let(&mut self, s: &mut Stmt) -> Option<Vec<Stmt>> {
+        let StmtKind::Let {
+            pat,
+            init: Some(init),
+            ..
+        } = &mut s.kind
+        else {
+            return None;
+        };
+        if !matches!(init.kind, ExprKind::Closure { .. }) || !matches!(pat.kind, PatKind::Ident(_))
+        {
+            return None;
+        }
+        let lit = init.id;
+        let span = init.span;
+        // Lifted like a literal anywhere else; its value `(L, captures..)` is taken apart here.
+        self.expr(init);
+        let (code, code_ty, values) = match &init.kind {
+            ExprKind::TupleLit(xs) if !xs.is_empty() => {
+                let code = closure_code(init);
+                let ExprKind::Path(p) = &code.kind else {
+                    self.failed = true;
+                    return None;
+                };
+                (p.first().sym, self.ty_of(init.id), xs[1..].to_vec())
+            }
+            ExprKind::Path(p) => (p.first().sym, self.ty_of(init.id), Vec::new()),
+            _ => {
+                self.failed = true;
+                return None;
+            }
+        };
+        let base = self.interner.resolve(code).to_string();
+        let mut lets = Vec::with_capacity(values.len());
+        let mut env = Vec::with_capacity(values.len());
+        for (j, value) in values.into_iter().enumerate() {
+            let name = self.interner.intern(&format!("$cap${base}${j}"));
+            let ty = self.ty_of(value.id);
+            env.push((name, ty));
+            let pid = self.fresh();
+            lets.push(Stmt {
+                id: self.fresh(),
+                attrs: Vec::new(),
+                kind: StmtKind::Let {
+                    pat: Pattern {
+                        id: pid,
+                        kind: PatKind::Ident(name),
+                        span,
+                    },
+                    mutable: false,
+                    ty: None,
+                    init: Some(value),
+                },
+                span: s.span,
+            });
+        }
+        self.bound.insert(lit, Bound { code, code_ty, env });
+        Some(lets)
+    }
+
+    /// The type this pass gave a node it created (or sema gave an original one).
+    fn ty_of(&self, id: NodeId) -> Ty {
+        self.types
+            .get(&id)
+            .or_else(|| self.sema.types.get(&id))
+            .cloned()
+            .unwrap_or(Ty::Unknown)
+    }
+
+    /// The closure value `(L, env..)` — or the bare `L` — of the `let`-bound closure `b`, read from
+    /// its hidden locals: what a use of the bound name passes to a function-typed parameter.
+    fn bound_value(&mut self, lit: NodeId, span: Span) -> Option<Expr> {
+        let b = self.bound.get(&lit)?;
+        let (code, code_ty, env) = (b.code, b.code_ty.clone(), b.env.clone());
+        let code_path = self.path(code, span, code_ty.clone());
+        if env.is_empty() {
+            return Some(code_path);
+        }
+        let mut elems = Vec::with_capacity(env.len() + 1);
+        elems.push(code_path);
+        for (sym, ty) in env {
+            elems.push(self.path(sym, span, ty));
+        }
+        let id = self.fresh();
+        self.types.insert(id, code_ty);
+        Some(Expr {
+            id,
+            kind: ExprKind::TupleLit(elems),
+            span,
+        })
     }
 
     fn stmt(&mut self, s: &mut Stmt) {
@@ -285,12 +430,20 @@ impl Lifter<'_> {
 
     fn expr(&mut self, e: &mut Expr) {
         match &mut e.kind {
+            ExprKind::Path(_) => {
+                // A closure-bound local passed to a function-typed parameter: the closure's value.
+                if let Some(&lit) = self.sema.closure_refs.get(&e.id) {
+                    match self.bound_value(lit, e.span) {
+                        Some(v) => *e = v,
+                        None => self.failed = true,
+                    }
+                }
+            }
             ExprKind::Int(_)
             | ExprKind::Float(_)
             | ExprKind::Str(_)
             | ExprKind::Char(_)
             | ExprKind::Bool(_)
-            | ExprKind::Path(_)
             | ExprKind::SizeOf(_)
             | ExprKind::AlignOf(_) => {}
             ExprKind::Unary { expr, .. }
@@ -302,9 +455,26 @@ impl Lifter<'_> {
                 self.expr(rhs);
             }
             ExprKind::Call { callee, args, .. } => {
-                self.expr(callee);
-                for a in args {
+                for a in args.iter_mut() {
                     self.expr(a);
+                }
+                // A call through a closure-bound local `f(x)` is the direct call `L(env.., x)`.
+                match self.sema.closure_refs.get(&callee.id).copied() {
+                    Some(lit) => match self.bound.get(&lit) {
+                        Some(b) => {
+                            let (code, code_ty, env) = (b.code, b.code_ty.clone(), b.env.clone());
+                            let span = callee.span;
+                            **callee = self.path(code, span, code_ty);
+                            let mut full = Vec::with_capacity(env.len() + args.len());
+                            for (sym, ty) in env {
+                                full.push(self.path(sym, span, ty));
+                            }
+                            full.append(args);
+                            *args = full;
+                        }
+                        None => self.failed = true,
+                    },
+                    None => self.expr(callee),
                 }
             }
             ExprKind::Index { base, indices } => {
@@ -359,6 +529,60 @@ impl Lifter<'_> {
         }
     }
 
+    /// The values the closure `info` receives ahead of its own parameters (see [`Cap`]): each
+    /// capture by value, a written capture as a pointer to the variable (`&mut c`), and a captured
+    /// closure-bound local as that closure's own hidden values.
+    fn caps(&mut self, info: &ClosureInfo, span: Span) -> Vec<Cap> {
+        let mut caps = Vec::with_capacity(info.captures.len());
+        for (sym, ty) in &info.captures {
+            if let Some(&(_, lit)) = info.bound.iter().find(|(n, _)| n == sym) {
+                let Some(b) = self.bound.get(&lit) else {
+                    self.failed = true;
+                    continue;
+                };
+                for (h, hty) in b.env.clone() {
+                    let value = self.path(h, span, hty.clone());
+                    caps.push(Cap {
+                        name: h,
+                        ty: hty,
+                        by_ref: false,
+                        value,
+                    });
+                }
+            } else if info.by_ref.contains(sym) {
+                let pty = Ty::Ptr {
+                    mutable: true,
+                    pointee: Box::new(ty.clone()),
+                };
+                let inner = self.path(*sym, span, ty.clone());
+                let id = self.fresh();
+                self.types.insert(id, pty.clone());
+                caps.push(Cap {
+                    name: *sym,
+                    ty: pty,
+                    by_ref: true,
+                    value: Expr {
+                        id,
+                        kind: ExprKind::Unary {
+                            op: UnOp::RefMut,
+                            expr: Box::new(inner),
+                        },
+                        span,
+                    },
+                });
+            } else {
+                let value = self.path(*sym, span, ty.clone());
+                caps.push(Cap {
+                    name: *sym,
+                    ty: ty.clone(),
+                    by_ref: false,
+                    value,
+                });
+            }
+        }
+        caps
+    }
+
     /// Replace the closure literal `e` (its body already lifted) by the value of a new function:
     /// `(L, captures..)`, or the bare `L` when it captures nothing (see the module docs).
     fn lift(&mut self, e: &mut Expr) {
@@ -376,19 +600,18 @@ impl Lifter<'_> {
             params: info.params.clone(),
             ret: Box::new(info.ret.clone()),
         };
+        // Each capture is read where its copy is taken, in the enclosing scope, so every pass
+        // that asks what this statement reads sees it.
+        let caps = self.caps(&info, span);
         let code = self.path(name, span, fn_ty.clone());
-        let value = if info.captures.is_empty() {
+        let value = if caps.is_empty() {
             code
         } else {
-            // Each capture is read where its copy is taken, in the enclosing scope, so every pass
-            // that asks what this statement reads sees it.
-            let mut elems = Vec::with_capacity(info.captures.len() + 1);
+            let mut elems = Vec::with_capacity(caps.len() + 1);
             elems.push(code);
-            for (sym, ty) in &info.captures {
-                elems.push(self.path(*sym, span, ty.clone()));
-            }
+            elems.extend(caps.iter().map(|c| c.value.clone()));
             let id = self.fresh();
-            self.types.push((id, fn_ty));
+            self.types.insert(id, fn_ty);
             Expr {
                 id,
                 kind: ExprKind::TupleLit(elems),
@@ -407,13 +630,13 @@ impl Lifter<'_> {
             kind: TypeKind::Unit,
             span,
         };
-        let mut fparams = Vec::with_capacity(info.captures.len() + params.len());
-        for (sym, _) in &info.captures {
+        let mut fparams = Vec::with_capacity(caps.len() + params.len());
+        for c in &caps {
             fparams.push(Param {
                 id: self.fresh(),
                 attrs: Vec::new(),
                 mutable: false,
-                name: Ident { sym: *sym, span },
+                name: Ident { sym: c.name, span },
                 ty: placeholder(span),
                 span,
             });
@@ -440,7 +663,7 @@ impl Lifter<'_> {
                 }
             }
         };
-        let mut sig_params: Vec<Ty> = info.captures.iter().map(|(_, t)| t.clone()).collect();
+        let mut sig_params: Vec<Ty> = caps.iter().map(|c| c.ty.clone()).collect();
         sig_params.extend(info.params.iter().cloned());
         self.defs.push(Def {
             name,
@@ -471,13 +694,36 @@ impl Lifter<'_> {
         self.table.insert(
             name,
             ClosureLift {
-                env_tys: info.captures.into_iter().map(|(_, t)| t).collect(),
+                by_ref: caps.iter().map(|c| c.by_ref).collect(),
+                env_tys: caps.into_iter().map(|c| c.ty).collect(),
             },
         );
     }
 }
 
 impl<'a> FnLowerer<'a> {
+    /// For the lifted closure `f` being lowered: which of its leading parameters are pointers to a
+    /// variable it writes (captured by reference, [`ClosureLift::by_ref`]). Empty for any other
+    /// function.
+    pub(crate) fn by_ref_params(&self, f: Symbol) -> Vec<bool> {
+        self.mono
+            .and_then(|m| m.closures.get(&f))
+            .map(|c| c.by_ref.clone())
+            .unwrap_or_default()
+    }
+
+    /// Bind the by-reference capture `name`, whose parameter value `ptr` points at the enclosing
+    /// function's variable of type `pointee`: the name denotes that storage itself, so reads and
+    /// writes in the closure body go to the variable.
+    pub(crate) fn bind_by_ref(&mut self, name: Symbol, ptr: ValueId, pointee: &Ty) {
+        let mty = self.param_slot(pointee);
+        let aggregate = matches!(mty, MirType::Array(..));
+        self.bind_slice(name, ptr, mty, matches!(pointee, Ty::Slice(_)));
+        if aggregate {
+            self.bind_field_bases(name, ptr, pointee);
+        }
+    }
+
     /// The lifted closure `f` names, when it captures anything (a closure without captures needs no
     /// environment and is passed exactly like a named function).
     pub(crate) fn closure_env(&self, f: Symbol) -> Option<&'a ClosureLift> {
@@ -498,9 +744,11 @@ impl<'a> FnLowerer<'a> {
             return Vec::new();
         };
         match &a.kind {
-            ExprKind::TupleLit(xs) if xs.len() == lift.env_tys.len() + 1 => {
-                xs[1..].iter().map(|c| self.lower_expr(c)).collect()
-            }
+            ExprKind::TupleLit(xs) if xs.len() == lift.env_tys.len() + 1 => xs[1..]
+                .iter()
+                .zip(&lift.env_tys)
+                .map(|(c, ty)| self.capture_value(c, ty))
+                .collect(),
             ExprKind::Path(p) => {
                 let name = p.first().sym;
                 (0..lift.env_tys.len())
@@ -514,6 +762,28 @@ impl<'a> FnLowerer<'a> {
         }
     }
 
+    /// One captured value of a closure value `(L, captures..)`, copied now. An aggregate (an
+    /// array, tuple, struct or data-carrying enum) is a base pointer, so its copy is a fresh buffer
+    /// holding its contents: the closure must not see a later write to the original. A hidden
+    /// `$cap$` local of a `let`-bound closure already is such a copy, made at the `let`, and nothing
+    /// writes it. A scalar is passed as loaded: its capture type is the width it is stored at, which
+    /// for a `for` range counter is the wider bound's type, not the counter's own (sema's
+    /// `enter_range_counter`), so the value and the environment parameter agree.
+    fn capture_value(&mut self, c: &Expr, ty: &Ty) -> ValueId {
+        let v = self.lower_expr(c);
+        let mty = self.mir_ty_of(ty);
+        let hidden = match &c.kind {
+            ExprKind::Path(p) => self.interner.resolve(p.first().sym).starts_with("$cap$"),
+            _ => false,
+        };
+        if !matches!(mty, MirType::Array(..)) || hidden {
+            return v;
+        }
+        let dst = self.builder.alloca(mty);
+        self.emit_copy(dst, v, ty);
+        dst
+    }
+
     /// The `j`-th captured value the function-typed parameter `param` of this instance received.
     pub(crate) fn load_env(&mut self, param: Symbol, j: usize, span: Span) -> ValueId {
         let slot = self
@@ -521,6 +791,8 @@ impl<'a> FnLowerer<'a> {
             .get(&env_name(self.interner.resolve(param), j))
             .and_then(|s| self.lookup(s));
         match slot {
+            // An aggregate's binding is its buffer: its value is the base pointer.
+            Some((slot, MirType::Array(..))) => slot,
             Some((slot, ty)) => self.builder.build(ty.clone(), Op::Load(slot, ty)),
             None => {
                 self.unsupported(span, "closure environment");
@@ -530,8 +802,8 @@ impl<'a> FnLowerer<'a> {
     }
 
     /// Bind the hidden environment parameters `lower_fn` declared: each value is spilled to a slot
-    /// named `$env$<param>$<j>` (like an ordinary scalar parameter), where a call through the
-    /// parameter and a forwarding call read it.
+    /// named `$env$<param>$<j>` (like an ordinary scalar parameter; an aggregate is bound to the
+    /// buffer it points at), where a call through the parameter and a forwarding call read it.
     pub(crate) fn bind_closure_env(&mut self, env: Vec<(Symbol, usize, ValueId, Ty)>) {
         for (param, j, val, ty) in env {
             let Some(sym) = self
@@ -541,6 +813,11 @@ impl<'a> FnLowerer<'a> {
                 continue;
             };
             let mty = self.mir_ty_of(&ty);
+            // An aggregate arrives as the base pointer of the caller's copy, which is its storage.
+            if matches!(mty, MirType::Array(..)) {
+                self.bind(sym, val, mty);
+                continue;
+            }
             let slot = self.builder.alloca(mty.clone());
             self.builder.build_void(Op::Store {
                 ptr: slot,
@@ -800,6 +1077,45 @@ mod tests {
         );
     }
 
+    /// The int8 GEMM + dequant fusion never writes the i32 accumulator `c`, so it drops `c` only
+    /// when nothing after the window names `c`. A `let`-bound closure that writes `c` holds a
+    /// pointer to it from its `let` on (`let $cap$L$0 = &mut c;`), and a later call names only that
+    /// pointer: the fusion fired anyway, and every lane read back through the closure was 0. A raw
+    /// `let pc = &mut c;` had the same hole.
+    #[test]
+    fn the_int8_dequant_fusion_keeps_an_accumulator_a_pointer_holds() {
+        let src = |pre: &str, post: &str| {
+            format!(
+                "fn main() -> i32 {{ let mut a: [u8; 12] = [0 as u8; 12]; \
+                 let mut b: [i8; 12] = [0 as i8; 12]; let mut c: [i32; 9] = [0; 9]; \
+                 let mut out: [f32; 9] = [0.0; 9]; {pre} \
+                 for i in 0..12 {{ a[i] = (i + 1) as u8; b[i] = ((i as i32) - 6) as i8; }} \
+                 let scale_a: f32 = 0.5; let scale_b: [f32; 3] = [2.0, 1.0, 0.5]; \
+                 for i in 0..3 {{ for j in 0..3 {{ let mut s: i32 = 0; \
+                 for k in 0..4 {{ s = s + (a[i * 4 + k] as i32) * (b[j * 4 + k] as i32); }} \
+                 c[i * 3 + j] = s; }} }} \
+                 for i in 0..3 {{ for j in 0..3 {{ \
+                 out[i * 3 + j] = (c[i * 3 + j] as f32) * scale_a * scale_b[j]; }} }} \
+                 print(out[0]); {post} return 0; }}"
+            )
+        };
+        let fused = |pre: &str, post: &str| {
+            body(&lower(&src(pre, post)), "main").contains("wukong_i8gemm_nt_deq")
+        };
+        // The control: nothing holds `c`, so the window fuses.
+        assert!(fused("", ""));
+        assert!(!fused(
+            "let peek = |k: i32| -> i32 { c[k] = c[k] + 0; c[k] };",
+            "print(peek(0));"
+        ));
+        assert!(!fused("let pc = &mut c;", "print((*pc)[0]);"));
+        // A closure that only reads `c` copied it at its `let`: nothing holds `c` itself.
+        assert!(fused(
+            "let first = |k: i32| -> i32 { c[k] };",
+            "print(first(0));"
+        ));
+    }
+
     /// A closure body is code of the function it is written in, and lowering keys `@strict_fp`,
     /// `@generic` and `@unchecked` by item: the lifted item carries them, and nothing else.
     #[test]
@@ -861,5 +1177,132 @@ mod tests {
         );
         assert!(body(&funcs, "main$closure$0").starts_with("fn main$closure$0(v0 f32)"));
         assert!(body(&funcs, "apply$main$closure$0").starts_with("fn apply$main$closure$0(v0 f32)"));
+    }
+
+    /// `let f = |..| ..;` is lifted like any literal; its `let` becomes one hidden local per
+    /// captured value, copied there, and every use reads them: a call `f(x)` is the direct call
+    /// `L(env.., x)`, and an argument `apply(f, ..)` passes the closure value `(L, env..)`.
+    #[test]
+    fn a_let_bound_closure_is_called_directly_with_its_hidden_captures() {
+        let funcs = lower(
+            "fn apply(f: fn(f32) -> f32, x: f32) -> f32 { return f(x); } \
+             fn main() -> i32 { let k = 2.0; let f = |x: f32| x * k; \
+             return (f(1.0) + apply(f, 3.0)) as i32; }",
+        );
+        assert!(
+            body(&funcs, "main$closure$0").starts_with("fn main$closure$0(v0 f32, v1 f32)"),
+            "{funcs:?}"
+        );
+        let main = body(&funcs, "main");
+        assert!(main.contains("call main$closure$0("), "{main}");
+        assert!(main.contains("call apply$main$closure$0("), "{main}");
+        assert!(body(&funcs, "apply$main$closure$0").contains("call main$closure$0("));
+    }
+
+    /// The lift's view of a `let`-bound closure: the statement is replaced by its hidden locals
+    /// (none for a closure that captures nothing), and no use of the name survives.
+    #[test]
+    fn a_closure_let_becomes_its_hidden_captures() {
+        use wukong_ast::{ItemKind, PatKind, StmtKind};
+        let src = "fn apply(f: fn(f32) -> f32, x: f32) -> f32 { return f(x); } \
+                   fn main() -> i32 { let k = 2.0; let f = |x: f32| x * k; \
+                   let g = |x: f32| x + 1.0; return (f(1.0) + apply(g, 3.0)) as i32; }";
+        let mut interner = Interner::new();
+        let (module, pdiags) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pdiags.is_empty(), "parse: {pdiags:?}");
+        let (sema, sdiags) = wukong_sema::check(&module, &interner);
+        assert!(sdiags.iter().all(|d| !d.is_error()), "sema: {sdiags:?}");
+        let (out, _, table) =
+            super::lift_module(&module, &sema, &mut interner).expect("the module has closures");
+        let main = out
+            .items
+            .iter()
+            .find_map(|it| match &it.kind {
+                ItemKind::Fn(f) if interner.resolve(f.name.sym) == "main" => f.body.as_ref(),
+                _ => None,
+            })
+            .expect("main");
+        let lets: Vec<String> = main
+            .stmts
+            .iter()
+            .filter_map(|s| match &s.kind {
+                StmtKind::Let { pat, .. } => match &pat.kind {
+                    PatKind::Ident(n) => Some(interner.resolve(*n).to_string()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lets, vec!["k", "$cap$main$closure$0$0"]);
+        assert_eq!(table.len(), 2);
+    }
+
+    /// A capture the closure writes is passed as a pointer to the enclosing variable, and the
+    /// lifted body reads and writes the variable through it — no copy.
+    #[test]
+    fn a_written_capture_is_passed_by_reference() {
+        let funcs = lower(
+            "fn apply(f: fn(f32) -> f32, x: f32) -> f32 { return f(x); } \
+             fn main() -> i32 { let mut c = 0.0; \
+             let r = apply(|x| { c = c + x; x }, 1.0); return (r + c) as i32; }",
+        );
+        let lifted = body(&funcs, "main$closure$0");
+        assert!(
+            lifted.starts_with("fn main$closure$0(v0 ptr, v1 f32)"),
+            "{lifted}"
+        );
+        // The write goes to the incoming pointer itself.
+        assert!(lifted.contains(", v0\n"), "{lifted}");
+        assert!(!lifted.contains("alloca ptr"), "{lifted}");
+        // The instance forwards it, and `main` passes the variable's own slot.
+        assert!(body(&funcs, "apply$main$closure$0").starts_with("fn apply$main$closure$0(v0 ptr"));
+    }
+
+    /// An aggregate capture is copied where the closure is created: the call passes a fresh
+    /// buffer, so a later write to the original (here by the next argument) is not seen.
+    #[test]
+    fn an_aggregate_capture_is_copied_at_the_call() {
+        let funcs = lower(
+            "fn apply(f: fn(f32) -> f32, x: f32) -> f32 { return f(x); } \
+             fn zero(p: *mut [f32; 2]) -> f32 { (*p)[0] = 0.0; return 1.0; } \
+             fn main() -> i32 { let mut w: [f32; 2] = [1.0, 2.0]; \
+             return apply(|x| x * w[0], zero(&mut w)) as i32; }",
+        );
+        let main = body(&funcs, "main");
+        assert_eq!(main.matches("alloca [2 x f32]").count(), 2, "{main}");
+        assert!(
+            body(&funcs, "main$closure$0").starts_with("fn main$closure$0(v0 ptr, v1 f32)"),
+            "{funcs:?}"
+        );
+    }
+
+    /// A closure passed to a method is lifted and the method specialized for it, exactly as for a
+    /// free function.
+    #[test]
+    fn a_closure_argument_of_a_method_specializes_the_method() {
+        let funcs = lower(
+            "struct V { x: f32 } \
+             impl V { fn map(self, f: fn(f32) -> f32) -> f32 { return f(self.x); } } \
+             fn main() -> i32 { let k = 3.0; let v = V { x: 2.0 }; \
+             return v.map(|x| x * k) as i32; }",
+        );
+        assert!(body(&funcs, "main").contains("call V.map$main$closure$0("));
+        assert!(body(&funcs, "V.map$main$closure$0").contains("call main$closure$0("));
+    }
+
+    /// A dimension generic named by a function-typed parameter is a hidden dimension parameter
+    /// of the instance, bound at the call from the function passed.
+    #[test]
+    fn a_dimension_of_a_function_parameter_is_passed_to_the_instance() {
+        let funcs = lower(
+            "fn gen<N>(_f: fn(Tensor[f32, N]) -> f32) -> f32 { return N as f32; } \
+             fn head(t: Tensor[f32, 4]) -> f32 { return t[0]; } \
+             fn main() -> i32 { return gen(head) as i32; }",
+        );
+        assert!(
+            body(&funcs, "gen$head").starts_with("fn gen$head(v0 i64)"),
+            "{funcs:?}"
+        );
+        assert!(body(&funcs, "main").contains("const.i64 4"));
     }
 }

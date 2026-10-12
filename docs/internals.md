@@ -132,13 +132,26 @@ source
 ```
 
 Three front-end surfaces lower to plain calls before any recognizer sees the tree. **Closures**:
-`wukong_sema::closures` checks each `|x| body` literal where it is written — only as an argument of
-a function-typed parameter, `E0411` elsewhere — typing its parameters from that parameter's
-function type and recording, per literal, its parameter, return and capture types
-(`SemaResult::closures`). A capture is every enclosing local the body reads: `note_local_use` sees
+`wukong_sema::closures` checks each `|x| body` literal where it is written — as an argument of a
+function-typed parameter (of a function, a method, or a call through a function-typed parameter or
+closure-bound local) or a `let` initializer, `E0411` elsewhere — typing its parameters from that
+parameter's function type (after the call's other arguments bind what they can of the
+callee's generics, `type_args_against`) and recording, per literal, its parameter, return and capture types
+(`SemaResult::closures`). A `let`-bound name is tracked per scope (`closure_binds`): every use is
+either a call or a function-typed argument, recorded with the literal it denotes
+(`SemaResult::closure_refs`), and anything else is `E0421`. A capture is every enclosing local the body reads: `note_local_use` sees
 each local read with the index of the scope that binds it, and a binding below a closure's base
-scope is a capture of that closure (and of every closure it is nested in); only a scalar, C-style
-enum, pointer or reference can be captured (`E0418`), and writing one is `E0304`. The **first**
+scope is a capture of that closure (and of every closure it is nested in); a slice, `str`, tensor,
+vector or function-typed parameter cannot be captured (`E0418`). A write to a captured variable
+(`note_capture_write`: an assignment, `&mut`, an element or field store not through a pointer,
+`atomic_add`, a `mut self` receiver, an aggregate argument of a `mut` parameter —
+`note_mut_arg_writes`, from the per-function positions `collect_methods` records — or a builtin's
+output operand, each also through a tensor reshape `c as Tensor[..]`, and binding a tensor view of
+it, `note_capture_view`) makes it a **by-reference** capture of every closure it crosses
+(`ClosureInfo::by_ref`). A capture is typed at the width its variable is stored at: a `for` range
+counter's type is its start's, but `lower_for` stores it at the wider bound's
+(`range_counter_type`), so `enter_range_counter` records that width per counter scope and the
+capture takes it (a bound of an enclosing generic type, whose width is per instance, is `E0418`). The **first**
 rewrite of `wukong_mir_build::lower_program` (`closures::lift_module`, before the method
 desugaring) lifts each literal, innermost first, to a registered top-level function
 `<fn>$closure$<k>` whose leading parameters are the captures, and replaces the literal by its
@@ -153,7 +166,12 @@ the tree mentions. With a bare `L` in the tree a capture was invisible to all th
 read was deleted, moved or hidden, and the copy resolved to an outer binding of the same name
 (`tests/run/closure_hidden_reads.wk`). The lifted item inherits the enclosing function's
 `@strict_fp`, `@generic` and `@unchecked`, which lowering keys by item: the closure body is that
-function's code (`tests/run/closure_strict_fp.wk`). The **environment ABI**: an instance whose function-typed
+function's code (`tests/run/closure_strict_fp.wk`). A `let f = <closure>` is replaced by one hidden
+local per captured value (`$cap$L$<j>`, copied there), and each recorded use of `f` is rewritten:
+a call to `L($cap$L$.., args..)`, an argument to the value `(L, $cap$L$..)`; a closure that uses `f`
+captures those locals (`ClosureInfo::bound`). A capture the closure only reads is a copy (an
+aggregate's, a fresh buffer filled where the closure value is evaluated); one it writes is the
+element `&mut c`, a `*mut T` parameter that `lower_fn` binds as the variable's own storage. The **environment ABI**: an instance whose function-typed
 parameter `f` is bound to a closure with captures declares one hidden MIR parameter per capture at
 `f`'s position and binds them as `$env$f$<j>`; `lower_call` passes, at a function-typed argument's
 position, the capture values — the value's captures, lowered at the literal's own site, or

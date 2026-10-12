@@ -94,6 +94,10 @@ pub(crate) struct MethodState {
     receivers: HashSet<Symbol>,
     /// The subset of `receivers` whose receiver is `mut self` / `&mut self`.
     mut_receivers: HashSet<Symbol>,
+    /// Each function's `mut` parameters, by position (a receiver is position 0). An aggregate
+    /// argument is passed by reference, so the callee writes one bound there in place
+    /// (`closures.rs`, [`Sema::note_mut_arg_writes`]).
+    pub(crate) mut_params: HashMap<Symbol, Vec<usize>>,
     /// `(trait, type)` for every `impl Trait for Type`.
     impls: HashSet<(Symbol, Symbol)>,
     /// Each function's trait bounds: `(generic, traits)` in declaration order.
@@ -218,8 +222,9 @@ impl Sema<'_> {
                 span,
                 "E0411",
                 "a function type is only allowed as the type of a function parameter (bind it to a \
-                 named function at each call); it cannot be a local, field, element, return \
-                 value or `extern` parameter",
+                 named function or a closure at each call) or as the annotation of a `let` that \
+                 binds a closure; it cannot be another local, a field, element, return value or \
+                 `extern` parameter",
             );
         }
         let params: Vec<Ty> = params.iter().map(|p| self.lower_type(p)).collect();
@@ -260,6 +265,12 @@ impl Sema<'_> {
         for item in &module.items {
             if let ItemKind::Fn(f) = &item.kind {
                 decls.insert(f.name.sym, f);
+                let muts: Vec<usize> = (0..f.params.len())
+                    .filter(|&i| f.params[i].mutable)
+                    .collect();
+                if !muts.is_empty() {
+                    self.methods.mut_params.insert(f.name.sym, muts);
+                }
                 if f.params
                     .first()
                     .is_some_and(|p| Some(p.name.sym) == self_word)
@@ -603,9 +614,15 @@ impl Sema<'_> {
     /// the caller's own function-typed parameter, whose type equals the parameter's (with the
     /// callee's type parameters substituted as the call binds them).
     pub(crate) fn check_fn_value_args(&mut self, sig: &FnSig, args: &[Expr], arg_tys: &[Ty]) {
+        // The call's bindings, in argument order (the order `check_fn_call` binds in): a function
+        // argument binds what its own type fixes too, so `fn(Tensor[f32, N]) -> f32` accepts a
+        // function of `Tensor[f32, 4]` exactly when the call binds `N = 4`.
         let mut tys: HashMap<Symbol, Ty> = HashMap::default();
+        let mut dims: HashMap<Symbol, wukong_types::Dim> = HashMap::default();
+        let is_generic = |g: Symbol| sig.generics.contains(&g);
         for (p, a) in sig.params.iter().zip(arg_tys) {
             crate::shape::infer_type_generics(p, a, &sig.generics, &mut tys);
+            crate::closures::bind_dims(p, a, &is_generic, &mut dims);
         }
         for (i, a) in args.iter().enumerate() {
             let (Some(pty), Some(aty)) = (sig.params.get(i), arg_tys.get(i)) else {
@@ -639,7 +656,7 @@ impl Sema<'_> {
                         );
                         continue;
                     }
-                    let want = crate::shape::apply_subst(pty, &HashMap::default(), &tys);
+                    let want = crate::shape::apply_subst(pty, &dims, &tys);
                     let unresolved = sig.generics.iter().any(|g| mentions(&want, *g));
                     if !matches!(aty, Ty::Fn { .. }) || (!unresolved && *aty != want) {
                         let (w, f) = (want.display(self.interner), aty.display(self.interner));
@@ -676,8 +693,10 @@ impl Sema<'_> {
         let Some(Ty::Fn { params, ret }) = self.lookup_local(name) else {
             return None;
         };
-        // Inside a closure, the enclosing function's function-typed parameter cannot be captured.
+        // Inside a closure, the enclosing function's function-typed parameter cannot be captured
+        // (a closure-bound local can: `closures.rs`).
         self.note_local_use(name, callee.span);
+        self.note_closure_call(name, callee);
         self.types.insert(
             callee.id,
             Ty::Fn {
@@ -828,6 +847,8 @@ impl Sema<'_> {
                 return Some(Ty::Error);
             }
             if !deref && self.methods.mut_receivers.contains(&target) {
+                // A closure calling a `mut self` method on a variable it captures shares it.
+                self.note_capture_write(base);
                 self.check_mut_receiver(base, method);
             }
             let ret = self.type_resolved_method(
@@ -946,11 +967,20 @@ impl Sema<'_> {
         let offset = usize::from(recv.is_some());
         let mut arg_tys: Vec<Ty> = Vec::with_capacity(args.len() + offset);
         arg_tys.extend(recv);
-        for a in args {
-            let t = self.type_expr(a);
-            arg_tys.push(t);
+        // A closure argument is checked against its function-typed parameter, as at a plain call
+        // (`closures.rs`).
+        if self.args_need_params(args) {
+            let params = sig.params.get(offset..).unwrap_or(&[]);
+            arg_tys.extend(self.type_args_against(args, params, &sig.generics));
+        } else {
+            for a in args {
+                let t = self.type_expr(a);
+                arg_tys.push(t);
+            }
         }
         self.adapt_scalar_literals(&sig.params, args, &mut arg_tys, offset);
+        // A closure passing a variable it captures to a `mut` aggregate parameter shares it.
+        self.note_mut_arg_writes(target, args, offset);
         // The receiver is no function value; check the written arguments against the parameters
         // after it.
         let rest = FnSig {

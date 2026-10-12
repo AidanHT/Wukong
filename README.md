@@ -105,8 +105,8 @@ not duplicate them. In summary, Wukong:
   A pointer used as a condition (`if p`) is a null test.
 - **Abstraction without indirection.** `impl` blocks give structs and enums methods and associated
   functions; traits with bounds (`<T: Shape>`, `where`), function-typed parameters
-  (`f: fn(f32) -> f32`) and non-escaping closures (`apply(|x| x * scale, v)`, captures copied by
-  value) are dispatched statically — every generic and higher-order function is specialized per
+  (`f: fn(f32) -> f32`) and compile-time-resolved closures (`apply(|x| x * scale, v)`, `let f = |x: f32| x * k;`, `v.map(|a| a * k)`; a read
+  capture is copied, a written one shared by reference) are dispatched statically — every generic and higher-order function is specialized per
   instantiation (and per closure), so no vtable or function pointer exists at run time
   (`tests/run/{methods_impl,traits_static_dispatch,fn_params,closures}.wk`). Every concrete instantiation
   is type-checked again at its types; a tensor may be generic over its element (`Tensor[T, N]`,

@@ -84,10 +84,17 @@ cbrt.wk: wukong_vmath_f32 wukong_vmath_f32*2
 char_literals.wk:
 char_match.wk:
 char_type.wk:
+closure_capture_out_params.wk: wukong_argsort_f32 wukong_rt_alloc wukong_rt_alloc*2 wukong_rt_fmt_lit wukong_rt_fmt_str wukong_rt_free wukong_rt_free*2 wukong_vmath_f32 wukong_vmath_f32*4
+closure_captures.wk:
 closure_hidden_reads.wk:
+closure_i8_accumulator.wk: wukong_i8gemm_nt wukong_i8gemm_nt*2
+closure_infer.wk:
+closure_let.wk:
+closure_method.wk:
 closure_str.wk: wukong_rt_fmt_lit wukong_rt_fmt_lit*2 wukong_rt_fmt_str wukong_rt_fmt_str*2
 closure_strict_fp.wk:
 closure_turbofish_capture.wk:
+closure_wide_counter.wk:
 closures.wk:
 colargmax.wk: wukong_colargmax_i32 wukong_colargmin_i32
 coll2.wk: wukong_coll2_f32
