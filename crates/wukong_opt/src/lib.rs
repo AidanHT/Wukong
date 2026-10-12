@@ -119,7 +119,7 @@ pub use phi::SimplifyPhis;
 pub use promote::Promote;
 pub use simplify::Simplify;
 pub use simplify_cfg::SimplifyCfg;
-pub use slot_lifetime::{CaptureSummary, SlotLifetimes};
+pub use slot_lifetime::{CaptureSummary, KernelOverwrite, SlotLifetimes};
 pub use slp::slp_program;
 pub use sroa::Sroa;
 pub use unroll::unroll_program;

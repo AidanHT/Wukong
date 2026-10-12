@@ -22,36 +22,64 @@
 //!
 //! # Liveness
 //!
-//! A slot is live at a program point when the point is **reachable from a use and can reach a use**
-//! of it along control flow. This is exact for straight-line code (first use to last use) and
-//! CFG-aware everywhere else: a slot used inside a loop is live around the whole loop (every point
-//! of the cycle is both after and before a use), and a slot used before and after a loop is live
+//! A use **reads** the slot unless it is a store into it (or of its address into another tracked
+//! slot) or only computes an address from it. A slot is live at a program point when the point is
+//! **reachable from a use** of it **and can reach a read** of it along control flow — and at every
+//! point that uses it. This is exact for straight-line code (first use to last read) and CFG-aware
+//! everywhere else: a slot read inside a loop is live around the whole loop (every point of the
+//! cycle is both after and before a use), and a slot used before a loop and read after it is live
 //! through it. Both directions are one bitset dataflow over the blocks; inside a block the live set
-//! of a slot is then a single interval, so a slot's lifetime is a short sorted list of intervals
-//! over a global numbering of program points (block by block, each instruction one point and the
+//! of a slot is then a few intervals, so a slot's lifetime is a short sorted list of intervals over
+//! a global numbering of program points (block by block, each instruction one point and the
 //! terminator one more).
 //!
 //! Two slots **interfere** when their lifetimes intersect. The argument that sharing storage between
-//! two that do not is invisible: every read of a slot reads a value an earlier write of it left
-//! (on the path taken), both are uses, so every point between them is live for the slot — and a use
-//! of the other slot there would be a point where both are live.
+//! two that do not is invisible: every read of a slot reads bytes earlier writes of it left (on the
+//! path taken); every point from such a write to the read is reachable from a use and can reach the
+//! read, so it is live for the slot — and a use (a store above all) of the other slot there would be
+//! a point where both are live. A store whose value no read ever observes leaves the slot occupying
+//! its storage at the store alone: another slot may hold live data around it only if that data does
+//! not live *at* the store, which is the same point test.
 //!
 //! # Full overwrites
 //!
-//! Access-only liveness alone keeps a scratch array that is declared inside a loop — one per head,
-//! per row, per step — live around the *whole* loop, because its use in one iteration reaches its
-//! use in the next along the back edge; two such arrays then always interfere. But the array is
-//! re-initialized at its `let` on every iteration: its contents from the previous iteration are
-//! never read. The analysis recognizes that re-initialization when it is a counted loop that
-//! writes every byte of the slot before anything reads it (the `[v; N]` fill `mir_build` emits for
-//! an array initializer, or any `for i in 0..N { x[i] = .. }` over the whole array — see
-//! `full_overwrite_kills` for the exact conditions), and **kills** the slot on that loop's entering
-//! edges: walking backward from a later use, the "can reach a use" half of liveness stops there.
-//! The argument above still holds — a read observes the full overwrite (or a later write), never a
-//! value from before it, so nothing before the overwrite needs to be preserved. What is not
-//! recognized keeps the slot live: a 2-D loop nest, a runtime kernel that fills the slot, and at
-//! `-O2` the shapes the unroller and loop fusion leave (an induction variable advanced by a chain of
-//! adds, a vector body plus a scalar remainder).
+//! Liveness alone keeps a scratch array live from its first use to its last read, however often it
+//! is rewritten in between: an array declared inside a loop — one per head, per row, per step — is
+//! live around the *whole* loop (its write in one iteration reaches its read in the next along the
+//! back edge), and an array zeroed at the top of a function and read after being filled for real
+//! much later is live from the top. But an array whose every byte is written before anything reads
+//! it has no contents worth keeping before that write. The analysis recognizes such a **full
+//! overwrite** and **kills** the slot there: walking backward from a later read, the "can reach a
+//! read" half of liveness stops at the kill. The argument above still holds — a read observes the
+//! full overwrite (or a later write), never a value from before it, so nothing before the overwrite
+//! needs to be preserved. A full overwrite is one of (see the `kills` submodule for the exact
+//! conditions):
+//!
+//! * **a region of counted loops** that only ever write the slot and, between them, write every
+//!   byte: the `[v; N]` fill `mir_build` emits for an array initializer, a
+//!   `for i in 0..N { x[i] = .. }` over the whole array, a nest `x[i*W + j]` or `x[j*H + i]` whose
+//!   iteration space tiles the array (the coverage proof is mixed-radix: a stride closes into the
+//!   run when it is no wider than what the strides below it cover), and the shapes the vectorizers
+//!   and the unroller leave — a vector body whose induction variable is tested with `!=`, an
+//!   unrolled body that advances it by a chain of adds, a synthesized vector kernel over a row, and
+//!   the remainder loops after them. Induction variables are block parameters, or, at `-O0`, the
+//!   counter slots the front end keeps a `for` loop's variable in (a slot loaded only directly and
+//!   stored only by the latch's increment). The kill sits on the entering edges of the region's
+//!   first loop;
+//! * **a runtime kernel call** whose contract — a table in `wukong_runtime` (`OVERWRITES`) the
+//!   backend hands over through [`CaptureSummary::with_overwrites`], never a name pattern — says it
+//!   writes its whole output before reading any of it, under operand values the call has as
+//!   constants (a GEMM with `beta = 0` and every dimension at least 1, an elementwise map over `n`
+//!   elements), when the slot reaches the call through that output operand alone. A kernel that
+//!   accumulates into its output, or reads it in place, kills nothing;
+//! * **a synthesized vector kernel** (`Op::VecKernelCall`) whose recipe stores to a stream it never
+//!   loads, over a vector part long enough to cover the slot, when the stream's table entry is the
+//!   slot's own address and no other stream is.
+//!
+//! The kill is a property of the instruction or edge, so it ends the slot's lifetime there on every
+//! path: backward liveness is classic gen/kill (reads generate, full overwrites kill, partial writes
+//! pass liveness through), and a killing instruction is still a point at which the slot is live —
+//! it writes it.
 //!
 //! # Escapes
 //!
@@ -89,13 +117,35 @@
 //! is an entry point that calls user code back (see "Escapes"). A runtime entry point that ever broke
 //! this would have to be classified here.
 
-use wukong_mir::{BlockId, CastKind, Function, MirType, Op, Program, Terminator, ValueId};
+use wukong_mir::{CastKind, Function, MirType, Op, Program, Terminator, ValueId};
 use wukong_span::Symbol;
 
 use crate::alias::type_bytes;
 use crate::fxhash::{FxHashMap, FxHashSet};
-use crate::loop_info::{self, AccessKind, AddrForm, Coeff, MemBase, Stages, TripCount};
-use crate::{cfg, dom};
+
+mod kills;
+
+/// A runtime entry point's promise to **overwrite one of its buffers completely**: for a call with
+/// exactly `arity` operands, every operand of `extent` and `positive` a constant of at least 1, and
+/// every operand of `fixed` a constant among its listed values, the call writes every byte of
+/// `[out, out + elem_bytes · Π extent)` before it reads any of it. The table these come from lives
+/// next to the kernels (`wukong_runtime::OVERWRITES`, checked against the kernels by its own test);
+/// the analysis never infers one from a symbol's name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KernelOverwrite {
+    /// The operand count the promise is stated for.
+    pub arity: usize,
+    /// The operand the kernel writes.
+    pub out: usize,
+    /// Bytes per output element.
+    pub elem_bytes: u32,
+    /// Integer operands whose product is the output's element count.
+    pub extent: &'static [usize],
+    /// Further integer operands that must be at least 1.
+    pub positive: &'static [usize],
+    /// Integer operands that must be one of the listed values.
+    pub fixed: &'static [(usize, &'static [i64])],
+}
 
 /// What a call may do with the pointers it is handed, per user function and parameter position.
 ///
@@ -117,6 +167,9 @@ pub struct CaptureSummary {
     /// every call to one captures everything, even where its function argument is no longer a
     /// visible `func_addr`.
     callbacks: FxHashSet<Symbol>,
+    /// Runtime entry points that overwrite an output completely ([`KernelOverwrite`]). Empty unless
+    /// the code generator supplies the runtime's table ([`CaptureSummary::with_overwrites`]).
+    overwrites: FxHashMap<Symbol, KernelOverwrite>,
 }
 
 /// How a call treats its pointer arguments.
@@ -142,6 +195,7 @@ impl CaptureSummary {
                 .collect(),
             externs: program.externs.iter().map(|e| e.name).collect(),
             callbacks: FxHashSet::default(),
+            overwrites: FxHashMap::default(),
         };
         for f in &program.funcs {
             let fn_addr = func_addr_values(f);
@@ -226,6 +280,26 @@ impl CaptureSummary {
         }
     }
 
+    /// This summary, also knowing which runtime entry points overwrite an output completely. The
+    /// table is keyed by the program's own interned symbols, so it can only ever name the runtime
+    /// entry point the call resolves to; an entry for a symbol that is a user or `extern "C"`
+    /// function of the program is never consulted.
+    pub fn with_overwrites(
+        mut self,
+        entries: impl IntoIterator<Item = (Symbol, KernelOverwrite)>,
+    ) -> CaptureSummary {
+        self.overwrites.extend(entries);
+        self
+    }
+
+    /// The overwrite promise of a call to `sym`, when `sym` is a runtime entry point that has one.
+    fn overwrite(&self, sym: Symbol) -> Option<&KernelOverwrite> {
+        match self.callee(sym) {
+            Callee::Runtime => self.overwrites.get(&sym),
+            _ => None,
+        }
+    }
+
     fn callee(&self, sym: Symbol) -> Callee<'_> {
         if let Some(flags) = self.user.get(&sym) {
             Callee::User(flags)
@@ -282,8 +356,8 @@ impl SlotLifetimes {
         // One slot (or none) has nothing to share a frame range with, and an escaped slot is live
         // everywhere: only the remaining ones need the dataflow.
         if slots.iter().filter(|s| !s.escaped).count() >= 2 {
-            let kills = full_overwrite_kills(f, &flow);
-            let ranges = live_ranges(f, &flow.uses, &kills, na, &block_base);
+            let kills = kills::find(f, &flow, calls);
+            let ranges = live_ranges(f, &flow.events, &kills, na, &block_base);
             for (slot, live) in slots.iter_mut().zip(ranges) {
                 slot.live = live;
             }
@@ -431,8 +505,11 @@ struct Flow {
     escaped: Vec<bool>,
     /// Per value: may it be a function's address (see [`func_addr_values`])?
     func_addr: Vec<bool>,
-    /// Per block: `(alloca, first, last)` instruction positions of its uses there, in alloca order.
-    uses: Vec<Vec<(u32, u32, u32)>>,
+    /// Per block: `(position, alloca, reads)` of every use of an alloca there, in position order (a
+    /// position is an instruction index, or `insts.len()` for the terminator). `reads` is false for
+    /// a use that cannot observe the slot's contents: a plain store into it, or an instruction that
+    /// only computes an address from it.
+    events: Vec<Vec<(u32, u32, bool)>>,
     /// Per block: `(position, allocas)` of every instruction or terminator that does more with an
     /// alloca's address than compute another address from it (`gep`, `select`, a pointer cast) —
     /// an access, a call, a comparison, a branch carrying it.
@@ -487,7 +564,7 @@ impl Flow {
             contents: vec![Vec::new(); nroots],
             escaped: vec![false; nroots],
             func_addr,
-            uses: vec![Vec::new(); f.blocks.len()],
+            events: vec![Vec::new(); f.blocks.len()],
             touches: vec![Vec::new(); f.blocks.len()],
             allocas,
             alloca_bytes,
@@ -530,10 +607,10 @@ impl Flow {
         for (bi, b) in f.blocks.iter().enumerate() {
             for (ii, inst) in b.insts.iter().enumerate() {
                 let used = flow.classify(&inst.op, calls);
-                flow.note_uses(bi, ii as u32, &used, !is_address_op(&inst.op));
+                flow.note_uses(bi, ii as u32, &used, Some(&inst.op));
             }
             let used = flow.classify_term(&b.term);
-            flow.note_uses(bi, b.insts.len() as u32, &used, true);
+            flow.note_uses(bi, b.insts.len() as u32, &used, None);
         }
         // Whatever an escaped slot holds is reachable by whoever holds the slot.
         let mut work: Vec<usize> = (0..nroots).filter(|&r| flow.escaped[r]).collect();
@@ -805,20 +882,32 @@ impl Flow {
         used
     }
 
-    /// Record that position `at` of block `bi` uses the allocas among `used`.
-    fn note_uses(&mut self, bi: usize, at: u32, used: &[u32], touching: bool) {
+    /// Record that position `at` of block `bi` (instruction `op`, or the terminator when `None`)
+    /// uses the allocas among `used`.
+    fn note_uses(&mut self, bi: usize, at: u32, used: &[u32], op: Option<&Op>) {
         let na = self.allocas.len() as u32;
-        let list = &mut self.uses[bi];
         let mut slots: Roots = Vec::new();
         for &r in used.iter().filter(|&&r| r < na) {
             slots.push(r);
-            match list.iter_mut().find(|u| u.0 == r) {
-                Some(u) => u.2 = at,
-                None => list.push((r, at, at)),
-            }
+            let reads = op.is_none_or(|op| !self.writes_only(op, r));
+            self.events[bi].push((at, r, reads));
         }
+        let touching = op.is_none_or(|op| !is_address_op(op));
         if touching && !slots.is_empty() {
             self.touches[bi].push((at, slots));
+        }
+    }
+
+    /// Does `op` use alloca `x` without being able to observe its contents — a store into it, a
+    /// store of its address into another tracked slot (whoever reads the address back is a use of
+    /// its own), or an instruction that only computes an address from it? A store of its address
+    /// into itself is counted as a read, conservatively.
+    fn writes_only(&self, op: &Op, x: u32) -> bool {
+        match op {
+            Op::Store { ptr, value } => {
+                !(self.roots_of(*ptr).contains(&x) && self.roots_of(*value).contains(&x))
+            }
+            _ => is_address_op(op),
         }
     }
 }
@@ -888,185 +977,6 @@ fn is_address_op(op: &Op) -> bool {
     )
 }
 
-/// The entering edges `(from, header, alloca)` of every counted loop that **overwrites every byte
-/// of a slot before anything reads it** — see the module note ("Full overwrites"). Each loop is
-/// checked against everything that could make the overwrite partial or observable:
-///
-/// * inside the loop the slot is touched only by `store`s through pointers derived from that slot
-///   alone, of values that are no address of a slot — so nothing in the loop reads the old
-///   contents;
-/// * every one of those stores is in a block that dominates every latch, so it runs on every
-///   iteration, and the loop has a constant trip count `n >= 1` over a primary induction variable
-///   with a constant start and a positive constant step `k`, whose values stay far from wrapping;
-/// * each store's address is `slot + (iv + c)` elements of one common element size, and the bytes
-///   one iteration's stores cover form a single run at least `k` elements long — so the `n`
-///   iterations tile `[0, size)` without a gap (one store per iteration, or the `k` copies an
-///   unroll by `k` leaves, or a vector store covering `k` lanes);
-/// * the loop's only way out is the header's exit test. A loop with any other exit is not
-///   recognized — a `break`, and also an edge into a block that touches no slot and ends in
-///   `unreachable` (a slice bounds-check failure), although a path into one never comes back to
-///   read the slot: `loop_info` computes no trip count for a loop with a second exit. That costs
-///   nothing today, because a bounds-checked store goes through the slice's data pointer, never
-///   through the slot's own address, which the address test below requires.
-fn full_overwrite_kills(f: &Function, flow: &Flow) -> Vec<(u32, u32, u32)> {
-    // The slot a store may write as part of a full overwrite: through a pointer derived from that
-    // slot alone, storing a value that holds no slot's address.
-    let store_of = |b: usize, at: u32, slots: &[u32]| -> Option<u32> {
-        let [x] = slots else { return None };
-        let inst = f.blocks[b].insts.get(at as usize)?;
-        let Op::Store { ptr, value } = &inst.op else {
-            return None;
-        };
-        let alone = flow.roots_of(*ptr) == [*x] && !flow.other_of(*ptr);
-        let plain = !flow
-            .roots_of(*value)
-            .iter()
-            .any(|&r| (r as usize) < flow.allocas.len());
-        (alone && plain).then_some(*x)
-    };
-    if !flow.touches.iter().enumerate().any(|(b, list)| {
-        list.iter()
-            .any(|(at, slots)| store_of(b, *at, slots).is_some())
-    }) {
-        return Vec::new();
-    }
-    let rpo = cfg::reverse_postorder(f);
-    let preds = cfg::predecessors(f);
-    let idom = dom::idoms_from(f, &rpo, &preds);
-    let mut forest = loop_info::structure_with(f, &idom, &preds);
-    let mut consts: FxHashMap<ValueId, i128> = FxHashMap::default();
-    for inst in f.blocks.iter().flat_map(|b| &b.insts) {
-        if let (Some(r), Op::ConstInt(k, _)) = (inst.result, &inst.op) {
-            consts.insert(r, *k);
-        }
-    }
-    let mut kills = Vec::new();
-    for li in 0..forest.loops.len() {
-        // Per slot touched in the loop: its stores `(block, instruction)`, or `None` once anything
-        // else touches it.
-        let mut seen: Vec<(u32, Option<Vec<StoreAt>>)> = Vec::new();
-        for &b in &forest.loops[li].blocks {
-            let bi = b.0 as usize;
-            for (at, slots) in &flow.touches[bi] {
-                let store = store_of(bi, *at, slots);
-                for &x in slots {
-                    let at_store = store.map(|_| (b.0, *at));
-                    match seen.iter_mut().find(|e| e.0 == x) {
-                        Some(e) => match (&mut e.1, at_store) {
-                            (Some(list), Some(s)) => list.push(s),
-                            (entry, _) => *entry = None,
-                        },
-                        None => seen.push((x, at_store.map(|s| vec![s]))),
-                    }
-                }
-            }
-        }
-        let mut cands: Vec<(u32, Vec<StoreAt>)> = seen
-            .into_iter()
-            .filter(|(x, _)| !flow.escaped[*x as usize])
-            .filter_map(|(x, s)| s.map(|s| (x, s)))
-            .collect();
-        if cands.is_empty() {
-            continue;
-        }
-        cands.sort_unstable();
-        loop_info::analyze_one(f, &mut forest, li, Stages::Memory);
-        let l = &forest.loops[li];
-        let TripCount::Const(n) = l.trip else {
-            continue;
-        };
-        let Some(iv) = l.primary() else { continue };
-        let (Some(step), Some(&start)) =
-            (iv.step.as_const(), iv.start.and_then(|v| consts.get(&v)))
-        else {
-            continue;
-        };
-        let (n, step) = (i128::from(n), i128::from(step));
-        // Far from wrapping in any integer type an IV can have (`i32` or wider).
-        let small = |v: i128| (0..=i128::from(i32::MAX)).contains(&v);
-        if n == 0
-            || step <= 0
-            || !matches!(iv.ty, MirType::I32 | MirType::I64)
-            || !small(start)
-            || !small(start + n * step)
-        {
-            continue;
-        }
-        // `loop_info` already computes a constant trip count only for a loop whose one exit is the
-        // header's test and that has no `ret`/`unreachable` inside; checked again here so the kill
-        // does not rest on that contract alone.
-        if !l.abnormal_exits.is_empty() || l.exits.iter().any(|&(from, _)| from != l.header) {
-            continue;
-        }
-        'slot: for (x, stores) in cands {
-            let Some(size) = flow.alloca_bytes[x as usize] else {
-                continue;
-            };
-            // Each store's bytes, relative to `iv * elem`: `[c * elem, c * elem + value)`.
-            let mut elem_bytes: Option<i128> = None;
-            let mut runs: Vec<(i128, i128)> = Vec::new();
-            for (sb, at) in stores {
-                if !l.latches.iter().all(|latch| dominates(sb, latch.0, &idom)) {
-                    continue 'slot;
-                }
-                let Some(access) = l.accesses.iter().find(|a| {
-                    a.block == BlockId(sb) && a.inst == at as usize && a.kind == AccessKind::Store
-                }) else {
-                    continue 'slot;
-                };
-                let AddrForm::Affine {
-                    base: MemBase::Outer(base),
-                    index,
-                    elem,
-                } = &access.addr
-                else {
-                    continue 'slot;
-                };
-                let (Some(eb), Some(vb)) = (type_bytes(elem), type_bytes(&access.value_ty)) else {
-                    continue 'slot;
-                };
-                let eb = i128::from(eb);
-                if *base != flow.allocas[x as usize]
-                    || index.coeff != Coeff::Const(1)
-                    || !index.terms.is_empty()
-                    || eb == 0
-                    || elem_bytes.is_some_and(|e| e != eb)
-                {
-                    continue 'slot;
-                }
-                elem_bytes = Some(eb);
-                let lo = i128::from(index.konst) * eb;
-                runs.push((lo, lo + i128::from(vb)));
-            }
-            let Some(eb) = elem_bytes else { continue };
-            // One iteration's stores must form a single run of at least `step` elements.
-            runs.sort_unstable();
-            let (first, mut end) = runs[0];
-            for &(lo, hi) in &runs[1..] {
-                if lo > end {
-                    continue 'slot;
-                }
-                end = end.max(hi);
-            }
-            if end - first < step * eb {
-                continue;
-            }
-            let lo = start * eb + first;
-            let hi = (start + (n - 1) * step) * eb + end;
-            if lo != 0 || hi < i128::from(size) {
-                continue;
-            }
-            for p in &l.entering {
-                kills.push((p.0, l.header.0, x));
-            }
-        }
-    }
-    kills
-}
-
-/// A store's position: `(block, instruction)`.
-type StoreAt = (u32, u32);
-
 /// Does block `a` dominate block `b` (both reachable)?
 fn dominates(a: u32, b: u32, idom: &[u32]) -> bool {
     let mut x = b;
@@ -1081,21 +991,71 @@ fn dominates(a: u32, b: u32, idom: &[u32]) -> bool {
     }
 }
 
+/// How one use of a slot bears on its liveness.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Use {
+    /// It may observe the slot's contents: liveness flows back from it.
+    Read,
+    /// It only writes part of the slot or computes an address from it: the slot occupies its storage
+    /// at this point, but liveness flows through it unchanged.
+    Write,
+    /// It overwrites the whole slot before reading any of it: liveness stops here.
+    Kill,
+}
+
 /// Per alloca, its live ranges over the point numbering `block_base` defines — see the module
-/// note ("Liveness").
+/// note ("Liveness", "Full overwrites"). `events` are every block's alloca uses in position order;
+/// a use that `kills` lists as a point kill is a full overwrite of its slot.
+///
+/// A slot is live at a point that is reachable from one of its uses (of any kind) and from which a
+/// read of it is reachable without passing a full overwrite — and at every point that uses it. A
+/// store is a use but not a read: storing into a slot whose contents are never read again makes it
+/// occupy its storage only at the store itself, which is what lets two arrays zeroed in one fused
+/// loop and fully rewritten later share a slot. (Sharing is still sound: a read observes bytes some
+/// write left on the path, every point from that write to the read is live, and a store of the other
+/// slot at any of them would be a point both occupy.)
 fn live_ranges(
     f: &Function,
-    uses: &[Vec<(u32, u32, u32)>],
-    kills: &[(u32, u32, u32)],
+    events: &[Vec<(u32, u32, bool)>],
+    kills: &kills::Kills,
     na: usize,
     block_base: &[u32],
 ) -> Vec<Vec<(u32, u32)>> {
     let nb = f.blocks.len();
     let words = na.div_ceil(64);
+    // Per block, the `(position, alloca)` uses that overwrite their slot completely.
+    let mut points: Vec<Vec<(u32, u32)>> = vec![Vec::new(); nb];
+    for &(b, at, x) in &kills.points {
+        points[b as usize].push((at, x));
+    }
+    for list in &mut points {
+        list.sort_unstable();
+        list.dedup();
+    }
+    let kind = |b: usize, at: u32, a: u32, reads: bool| {
+        if points[b].binary_search(&(at, a)).is_ok() {
+            Use::Kill
+        } else if reads {
+            Use::Read
+        } else {
+            Use::Write
+        }
+    };
+    // use_bits[b]: the slot is used in b at all. exposed[b]: b reads it before any kill of it, so
+    // liveness at b's entry flows up into it. killed[b]: b overwrites it completely, so liveness at
+    // b's exit stops inside b.
     let mut use_bits = vec![0u64; nb * words];
-    for (b, list) in uses.iter().enumerate() {
-        for &(a, _, _) in list {
-            use_bits[b * words + a as usize / 64] |= 1 << (a % 64);
+    let mut exposed = vec![0u64; nb * words];
+    let mut killed = vec![0u64; nb * words];
+    for (b, list) in events.iter().enumerate() {
+        for &(at, a, reads) in list {
+            let (w, bit) = (b * words + a as usize / 64, 1u64 << (a % 64));
+            match kind(b, at, a, reads) {
+                Use::Read if killed[w] & bit == 0 => exposed[w] |= bit,
+                Use::Kill => killed[w] |= bit,
+                _ => {}
+            }
+            use_bits[w] |= bit;
         }
     }
     let preds = crate::cfg::predecessors(f);
@@ -1107,7 +1067,7 @@ fn live_ranges(
     // Per block: the successor edges along which a full overwrite kills some slots, as a mask of
     // the slots that survive the edge.
     let mut survive: Vec<Vec<(u32, Vec<u64>)>> = vec![Vec::new(); nb];
-    for &(from, to, x) in kills {
+    for &(from, to, x) in &kills.edges {
         let list = &mut survive[from as usize];
         let at = match list.iter().position(|e| e.0 == to) {
             Some(at) => at,
@@ -1127,8 +1087,8 @@ fn live_ranges(
     }
     order.extend((0..nb as u32).filter(|&b| !seen[b as usize]));
 
-    // reach_in[b]: some use of the slot reaches b's entry. reach_out[b]: from b's exit some use of
-    // the slot is reachable.
+    // reach_in[b]: some use of the slot reaches b's entry. reach_out[b]: from b's exit a read of
+    // the slot is reachable without passing a full overwrite of it first.
     let mut reach_in = vec![0u64; nb * words];
     let mut reach_out = vec![0u64; nb * words];
     let mut acc = vec![0u64; words];
@@ -1164,7 +1124,8 @@ fn live_ranges(
                 let mask = survive[b].iter().find(|e| e.0 == s).map(|e| &e.1[..]);
                 let s = s as usize;
                 for w in 0..words {
-                    let live = reach_out[s * words + w] | use_bits[s * words + w];
+                    let i = s * words + w;
+                    let live = exposed[i] | (reach_out[i] & !killed[i]);
                     acc[w] |= mask.map_or(live, |m| live & m[w]);
                 }
             }
@@ -1181,34 +1142,60 @@ fn live_ranges(
         }
     }
 
+    // Inside a block: every use is a live point, and a gap between two uses (or before the first,
+    // or after the last) is live when it is reachable from a use and the first read or kill after
+    // it is a read (or, past the last one, when liveness flows out).
     let mut live: Vec<Vec<(u32, u32)>> = vec![Vec::new(); na];
-    let mut first_last: Vec<Option<(u32, u32)>> = vec![None; na];
+    let mut by_slot: Vec<(u32, u32, Use)> = Vec::new();
+    let mut gap_live: Vec<bool> = Vec::new();
+    let mut used = vec![false; na];
     for (b, block) in f.blocks.iter().enumerate() {
         let term = block.insts.len() as u32;
-        for &(a, first, last) in &uses[b] {
-            first_last[a as usize] = Some((first, last));
-        }
+        let base = block_base[b];
         let bit = |bits: &[u64], a: usize| bits[b * words + a / 64] >> (a % 64) & 1 == 1;
-        for (a, slot_live) in live.iter_mut().enumerate() {
-            let used_here = first_last[a];
-            let lo = if bit(&reach_in, a) {
-                Some(0)
-            } else {
-                used_here.map(|u| u.0)
-            };
-            let hi = if bit(&reach_out, a) {
-                Some(term)
-            } else {
-                used_here.map(|u| u.1)
-            };
-            if let (Some(lo), Some(hi)) = (lo, hi) {
-                if lo <= hi {
-                    push_range(slot_live, (block_base[b] + lo, block_base[b] + hi));
+        by_slot.clear();
+        by_slot.extend(
+            events[b]
+                .iter()
+                .map(|&(at, a, reads)| (a, at, kind(b, at, a, reads))),
+        );
+        // Stable: each slot's uses stay in position order.
+        by_slot.sort_by_key(|e| e.0);
+        for run in by_slot.chunk_by(|x, y| x.0 == y.0) {
+            let a = run[0].0 as usize;
+            used[a] = true;
+            // gap_live[j]: is the gap just before use j live (the last entry: the gap after the
+            // last use)? Filled back to front from the first read or kill after each gap.
+            gap_live.clear();
+            gap_live.resize(run.len() + 1, false);
+            gap_live[run.len()] = bit(&reach_out, a);
+            for j in (0..run.len()).rev() {
+                gap_live[j] = match run[j].2 {
+                    Use::Read => true,
+                    Use::Kill => false,
+                    Use::Write => gap_live[j + 1],
+                };
+            }
+            let slot = &mut live[a];
+            let first = run[0].1;
+            if first > 0 && gap_live[0] && bit(&reach_in, a) {
+                push_range(slot, (base, base + first - 1));
+            }
+            for (j, &(_, at, _)) in run.iter().enumerate() {
+                push_range(slot, (base + at, base + at));
+                let next = run.get(j + 1).map_or(term + 1, |e| e.1);
+                if gap_live[j + 1] && at + 1 < next {
+                    push_range(slot, (base + at + 1, base + next - 1));
                 }
             }
         }
-        for &(a, _, _) in &uses[b] {
-            first_last[a as usize] = None;
+        for (a, slot) in live.iter_mut().enumerate() {
+            if std::mem::take(&mut used[a]) {
+                continue;
+            }
+            if bit(&reach_in, a) && bit(&reach_out, a) {
+                push_range(slot, (base, base + term));
+            }
         }
     }
     live
