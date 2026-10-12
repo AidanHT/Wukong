@@ -23338,8 +23338,10 @@ impl FnLowerer<'_> {
     /// not to the narrow grid. Round it at the value (see `round_half_result`): otherwise a later
     /// observation that mem2reg forwards past the rounding store — `print(i as bf16)` of 257 at
     /// `-O2` — saw `257`, where `-O0` printed the stored `256`. (Rounding the integer to `f32`
-    /// first is exact for every narrow format: each one's range ends below `2^24`, where `f32`
-    /// stops holding integers exactly, and anything larger overflows either way.)
+    /// first costs nothing for `f16` and the 8-bit floats: their ranges end below `2^24`, where
+    /// `f32` stops holding integers exactly, and anything larger overflows either way. A `bf16`
+    /// reaches `f32`'s range, so an integer above `2^24` is rounded to `f32` and then to `bf16`,
+    /// as the conversion has always been defined on every backend.)
     fn round_int_to_narrow_float(&mut self, v: ValueId, kind: CastKind, to: &MirType) -> ValueId {
         if matches!(kind, CastKind::SiToFp | CastKind::UiToFp) {
             self.round_half_result(v, to)
