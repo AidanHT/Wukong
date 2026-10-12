@@ -2374,13 +2374,13 @@ fn rustc_link(
         if bitcode_rlib {
             cmd.arg("-C").arg("lto=thin").arg("-C").arg("opt-level=3");
         }
+        cmd.args(&debug_args);
         // `.output()`, not `.status()`, for one reason: the E0514 note below has to READ rustc's
         // diagnostics to know whether to print itself. Everything rustc writes still reaches the same
         // descriptor, forwarded immediately after it exits - but two things about the SHAPE change. It
         // arrives as one block at the end rather than streaming, and rustc now sees a pipe instead of a
         // terminal, so its diagnostics come through UNCOLOURED. The link is a single short-lived child
         // at the end of compilation, so neither is something the user can act on.
-        cmd.args(&debug_args);
         cmd.arg("--extern")
             .arg(format!("wukong_runtime={}", rlib.display()))
             .arg("-L")
@@ -2439,26 +2439,11 @@ fn rustc_link(
     LinkOutcome::Failed(msg)
 }
 
-/// The `rustc` that drives the `--emit=exe` link.
-///
-/// **Not a bare name looked up on `PATH`.** A spawned child inherits the caller's working directory,
-/// and under rustup the `PATH` entry is a shim that resolves a toolchain from *that* directory - a
-/// `rust-toolchain.toml` beside it, or a `rustup override` on it - which has nothing to do with the
-/// toolchain that built the `wukong_runtime` rlib being linked. When the two differ, rustc rejects
-/// the rlib with `E0514: found crate wukong_runtime compiled by an incompatible version of rustc`,
-/// which reads like a Wukong bug and is a toolchain-resolution one. Running `wukongc --emit=exe`
-/// from any directory outside this workspace is enough to reach it.
-///
-/// `build.rs` records cargo's own `RUSTC`. In a rustup setup that is an absolute path to the
-/// toolchain binary itself and *not* the rustup shim (measured on this host,
-/// `.../.rustup/toolchains/stable-x86_64-pc-windows-msvc/bin/rustc.exe`), so it is immune
-/// to directory-based resolution - and it is the compiler cargo used to build THIS binary. It is
-/// not guaranteed to be the one that built the rlib the link picks: a `target/` tree accumulates
-/// rlibs from every toolchain it has ever seen, which is why [`rustc_link`] tries candidates in
-/// freshness order until one passes crate loading. The `PATH` fallback keeps a relocated or installed
-/// binary working; the
-/// E0514 note in [`rustc_link`] names the resolved path either way, so the failure is legible in
-/// both worlds.
+/// What a `-g` link on an MSVC host prints when no `rust-lld` is beside `rustc` ([`debug_link_args`]).
+const NO_RUST_LLD_WARNING: &str = "warning: `-g`: no `rust-lld` beside `rustc`, so the \
+     executable is linked by `link.exe`, which truncates the DWARF section names (debuggers will \
+     not find the line table); the `--emit=obj` object carries it intact";
+
 /// The extra `rustc` arguments a `-g` executable links with, so the object's DWARF reaches the
 /// executable intact:
 ///
@@ -2490,14 +2475,32 @@ fn debug_link_args(rustc: &Path) -> Vec<std::ffi::OsString> {
                 args.push(linker);
                 args.extend(["-C".into(), "link-arg=/debug:dwarf".into()]);
             }
-            None => eprint_line(
-                "warning: `-g`: no `rust-lld` beside `rustc`, so the executable is linked by                  `link.exe`, which truncates the DWARF section names (debuggers will not find the                  line table); the `--emit=obj` object carries it intact",
-            ),
+            None => eprint_line(NO_RUST_LLD_WARNING),
         }
     }
     args
 }
 
+/// The `rustc` that drives the `--emit=exe` link.
+///
+/// **Not a bare name looked up on `PATH`.** A spawned child inherits the caller's working directory,
+/// and under rustup the `PATH` entry is a shim that resolves a toolchain from *that* directory - a
+/// `rust-toolchain.toml` beside it, or a `rustup override` on it - which has nothing to do with the
+/// toolchain that built the `wukong_runtime` rlib being linked. When the two differ, rustc rejects
+/// the rlib with `E0514: found crate wukong_runtime compiled by an incompatible version of rustc`,
+/// which reads like a Wukong bug and is a toolchain-resolution one. Running `wukongc --emit=exe`
+/// from any directory outside this workspace is enough to reach it.
+///
+/// `build.rs` records cargo's own `RUSTC`. In a rustup setup that is an absolute path to the
+/// toolchain binary itself and *not* the rustup shim (measured on this host,
+/// `.../.rustup/toolchains/stable-x86_64-pc-windows-msvc/bin/rustc.exe`), so it is immune
+/// to directory-based resolution - and it is the compiler cargo used to build THIS binary. It is
+/// not guaranteed to be the one that built the rlib the link picks: a `target/` tree accumulates
+/// rlibs from every toolchain it has ever seen, which is why [`rustc_link`] tries candidates in
+/// freshness order until one passes crate loading. The `PATH` fallback keeps a relocated or installed
+/// binary working; the
+/// E0514 note in [`rustc_link`] names the resolved path either way, so the failure is legible in
+/// both worlds.
 fn link_rustc() -> PathBuf {
     match option_env!("WUKONG_BUILD_RUSTC") {
         Some(p) if !p.is_empty() && Path::new(p).is_file() => PathBuf::from(p),
@@ -4705,6 +4708,19 @@ mod native_link_tests {
             1,
             "there must be exactly one link-toolchain resolver"
         );
+    }
+
+    /// The `-g` "no `rust-lld`" warning is one sentence on one line. A string literal broken across
+    /// source lines without a `\` continuation keeps the next line's indentation, which once put two
+    /// runs of 18 spaces in the middle of this message.
+    #[test]
+    fn the_no_rust_lld_warning_reads_as_one_sentence() {
+        assert!(
+            !NO_RUST_LLD_WARNING.contains("  ") && !NO_RUST_LLD_WARNING.contains('\n'),
+            "{NO_RUST_LLD_WARNING:?}"
+        );
+        assert!(NO_RUST_LLD_WARNING.starts_with("warning: `-g`: "));
+        assert!(NO_RUST_LLD_WARNING.contains("`link.exe`"));
     }
 
     /// [`link_rustc`] must name something runnable. When `build.rs` recorded cargo's `RUSTC` and
