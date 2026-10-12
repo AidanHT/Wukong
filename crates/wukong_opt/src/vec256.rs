@@ -93,8 +93,8 @@ use wukong_mir::{
 };
 
 use super::{
-    const_of, emit_alias_checks, fits_in, op_of, retarget, Emit, GuardReads, LinInst, Plan,
-    TripPlan, VecPlan,
+    const_of, emit_alias_checks, fits_in, loop_loc, op_of, retarget, Emit, GuardReads, LinInst,
+    Plan, TripPlan, VecPlan,
 };
 use crate::each_op_use;
 use crate::fxhash::{FxHashMap, FxHashSet};
@@ -757,7 +757,10 @@ pub(super) fn apply(f: &mut Function, p: &VecPlan, k: &KernelPlan) {
     let lane_ty = k.kernel.lane.mir_type();
     let lanes = k.kernel.lane.lanes();
 
-    let mut e = Emit { f };
+    // Every value the splice creates belongs to the source loop; a rebuilt scalar step keeps its
+    // own span ([`rebuild`]).
+    let loop_at = loop_loc(f, p);
+    let mut e = Emit::new(f, loop_at);
     let gp: Vec<ValueId> = header_tys.iter().map(|t| e.value(t.clone())).collect();
     let kg = e.block(gp.clone(), Terminator::Unreachable);
     let kc = e.block(Vec::new(), Terminator::Unreachable);
@@ -946,7 +949,13 @@ fn rebuild(
     }
     crate::map_op_uses(&mut op, |u| memo.get(&u.0).copied().unwrap_or(u));
     let ty = e.f.value_type(v).clone();
+    // The copy is the body's own step, so it keeps that step's span (as unrolling's copies do).
+    let around = e.loc;
+    if let Some(s) = e.f.value_loc(v) {
+        e.loc = s;
+    }
     let r = e.push(blk, ty, op);
+    e.loc = around;
     memo.insert(v.0, r);
     r
 }

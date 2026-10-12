@@ -1,18 +1,26 @@
 //! The MIR source-location table (`wukong_mir::SourceLocs`) through the optimizer.
 //!
-//! Lowering locates every value of a source function. Two passes create values that are copies of
-//! located source — inlining (the callee's body, spliced into its caller) and loop unrolling (each
-//! copy of the body) — and both carry the original's location onto the copy. Every other pass's new
-//! values stay unknown, which is sound (an entry may be lost, never invented). The corpus census
-//! below measures what survives `-O2` across `tests/run`, and pins it from below.
+//! Lowering locates every value of a source function. The passes that create values as copies of
+//! located source carry the original's location onto the copy: inlining (the callee's body, spliced
+//! into its caller), loop unrolling and unroll-and-jam (each copy of the body), bounds-check
+//! versioning and unswitching (each copy of the loop) and jump threading (the private copy of a
+//! block). The vectorizer gives each widened step its scalar step's location, and the guard, trip
+//! and exit it adds the loop's. Every other new value stays unknown, which is sound (an entry may be
+//! lost, never invented). The corpus census below measures what survives `-O2` across `tests/run`,
+//! and pins it from below.
 
 use std::path::{Path, PathBuf};
 
-use wukong_mir::{BinOp, Function, Op, Program, ValueId};
+use wukong_mir::{BinOp, Function, MirType, Op, Program, ValueId};
 use wukong_span::{Interner, SourceId, SourceMap};
 
 /// Parse, check and lower `src` with the default options; `None` when any stage reports an error.
 fn lower(src: &str) -> Option<(Program, Interner)> {
+    lower_with(src, wukong_mir_build::LowerOptions::default())
+}
+
+/// [`lower`] with the given lowering options.
+fn lower_with(src: &str, options: wukong_mir_build::LowerOptions) -> Option<(Program, Interner)> {
     let mut interner = Interner::new();
     let (module, parsed) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
     if parsed.iter().any(|d| d.is_error()) {
@@ -22,12 +30,8 @@ fn lower(src: &str) -> Option<(Program, Interner)> {
     if checked.iter().any(|d| d.is_error()) {
         return None;
     }
-    let (program, lowered) = wukong_mir_build::lower_program_with(
-        &module,
-        &sema,
-        &mut interner,
-        wukong_mir_build::LowerOptions::default(),
-    );
+    let (program, lowered) =
+        wukong_mir_build::lower_program_with(&module, &sema, &mut interner, options);
     if lowered.iter().any(|d| d.is_error()) {
         return None;
     }
@@ -139,6 +143,51 @@ fn horner(a: [f32; 64], k: f32) -> f32 {
     }
 }
 
+/// (c) A loop the optimizer's vectorizer widens keeps the scalar body's line: every vector value
+/// of the widened loop is a lane-wise copy of a scalar step on line 4 — the loads, the compare,
+/// the multiply, the select that merges the two arms' stores and the splatted `a`. Lowering leaves
+/// a branchy body scalar; the MIR vectorizer if-converts and widens it (with the 256-bit kernels
+/// off, in lowering and in the optimizer alike, so the 128-bit form is what it emits).
+#[test]
+fn vectorized_values_keep_the_scalar_lines() {
+    let src = "fn clip(x: [f32; 64], mut y: [f32; 64], a: f32) {
+    let mut i: i64 = 0;
+    while i < 64 {
+        if x[i] > a { y[i] = x[i] * a; } else { y[i] = x[i]; }
+        i = i + 1;
+    }
+}
+";
+    let no_kernels = wukong_mir_build::LowerOptions {
+        vec_kernels: false,
+        ..Default::default()
+    };
+    let (mut p, interner) = lower_with(src, no_kernels).expect("the test program compiles");
+    let lowered = func(&p, &interner, "clip");
+    assert!(
+        !results(lowered).any(|(v, _)| matches!(lowered.value_type(v), MirType::Vec(..))),
+        "lowering left the loop scalar"
+    );
+    wukong_opt::optimize_preserving_with(
+        &mut p,
+        2,
+        &[],
+        wukong_opt::OptimizeOptions::FULL.with_vec_kernels(false),
+    );
+    assert!(wukong_mir::verify::verify_program(&p).is_empty());
+    let mut sm = SourceMap::new();
+    sm.add("t.wk", src);
+    let f = func(&p, &interner, "clip");
+    let vectors: Vec<ValueId> = results(f)
+        .filter(|(v, _)| matches!(f.value_type(*v), MirType::Vec(..)))
+        .map(|(v, _)| v)
+        .collect();
+    assert!(!vectors.is_empty(), "the loop was widened");
+    for v in vectors {
+        assert_eq!(line(&sm, f, v), Some(4), "{v:?} widens the body's line");
+    }
+}
+
 fn run_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -165,14 +214,15 @@ fn coverage(p: &Program) -> (usize, usize) {
 /// `type_alias.wk`, whose `type` aliases the driver's loader expands before sema. The allowance
 /// keeps an unrelated fixture of that kind from failing this census.
 const MAX_SKIPPED: usize = 3;
-/// Located share of result-bearing instructions after `-O2`, in whole percent: measured 74.78%
-/// (78886 of 105488 over 554 programs, with the SLP vectorizer in the pipeline), rounded down.
-/// The rest are the optimizer's own new values (vector widening, SLP packs, scalar replacement,
-/// loop canonicalization), which carry no location by design. A pass that clones located code
-/// should copy its locations (`Function::copy_value_loc`), as inlining and unrolling do.
-const O2_FLOOR_PERCENT: usize = 74;
+/// Located share of result-bearing instructions after `-O2`, in whole percent: measured 96.48%
+/// (120499 of 124890 over 608 programs, with the SLP vectorizer in the pipeline), rounded down.
+/// The rest are values the optimizer synthesizes with no source of their own: the
+/// unroller's wrap-safe limits and exit tests, the bounds-check and unswitch guards, LICM's
+/// selects, SLP packs. A pass that clones located code should copy its locations
+/// (`Function::copy_value_loc`), as inlining, unrolling and the loop-copying passes do.
+const O2_FLOOR_PERCENT: usize = 96;
 
-/// (c) Over the whole run corpus: lowering locates every result-bearing instruction of every
+/// (d) Over the whole run corpus: lowering locates every result-bearing instruction of every
 /// source function, and `-O2` keeps at least the measured share of them located.
 #[test]
 fn corpus_census() {
