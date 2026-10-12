@@ -237,6 +237,9 @@ pub(crate) struct Printer<'a> {
     pub(crate) block_start: bool,
     /// Flat mode (`flat_of`): one line, no comments; a block-like sub-expression fails it.
     pub(crate) flat: bool,
+    /// Keep the source's blank lines between elements (the formatter); off for a signature in
+    /// generated documentation, whose comments are not printed (`doc.rs`).
+    pub(crate) blank_lines: bool,
     pub(crate) failed: bool,
     pub(crate) err: Option<String>,
 }
@@ -270,6 +273,7 @@ impl<'a> Printer<'a> {
             last_end: 0,
             block_start: true,
             flat,
+            blank_lines: true,
             failed: false,
             err: None,
         }
@@ -335,7 +339,7 @@ impl<'a> Printer<'a> {
 
     /// One line with no comments: the text `f` prints, or `None` when it would need more than one
     /// line (a block-like sub-expression) or cannot be printed.
-    fn flat_of(&self, f: impl FnOnce(&mut Printer<'a>)) -> Option<String> {
+    pub(crate) fn flat_of(&self, f: impl FnOnce(&mut Printer<'a>)) -> Option<String> {
         let mut p = Printer::new(self.s, self.opts, true);
         f(&mut p);
         (!p.failed && p.err.is_none()).then_some(p.out)
@@ -387,7 +391,7 @@ impl<'a> Printer<'a> {
 
     /// The attribute line above a node (all of them, space-separated), as its own element.
     /// Returns where the node itself starts in the source.
-    fn attrs_line(&mut self, attrs: &[Attr], node_lo: u32) -> u32 {
+    pub(crate) fn attrs_line(&mut self, attrs: &[Attr], node_lo: u32) -> u32 {
         let Some(last) = attrs.last() else {
             return node_lo;
         };
@@ -439,7 +443,7 @@ impl<'a> Printer<'a> {
         self.w(")");
     }
 
-    fn item(&mut self, it: &Item, methods: &[Item], next_lo: u32) {
+    pub(crate) fn item(&mut self, it: &Item, methods: &[Item], next_lo: u32) {
         self.leading(it.span.lo);
         let body_lo = self.attrs_line(&it.attrs, it.span.lo);
         // `parse_item` eats a `pub` before any item, but `import` and `impl` do not store it.
@@ -552,7 +556,7 @@ impl<'a> Printer<'a> {
         from
     }
 
-    fn field_decl(&mut self, f: &Field) {
+    pub(crate) fn field_decl(&mut self, f: &Field) {
         self.pub_kw(f.is_pub);
         self.ident(&f.name);
         self.w(": ");
@@ -576,42 +580,47 @@ impl<'a> Printer<'a> {
         for (k, v) in d.variants.iter().enumerate() {
             let next = d.variants.get(k + 1).map(|n| n.span.lo).unwrap_or(close);
             self.leading(v.span.lo);
-            self.ident(&v.name);
-            match &v.data {
-                VariantData::Unit => {}
-                VariantData::Tuple(tys) => {
-                    self.w("(");
-                    for (j, t) in tys.iter().enumerate() {
-                        if j > 0 {
-                            self.w(", ");
-                        }
-                        self.ty(t);
-                    }
-                    self.w(")");
-                }
-                VariantData::Struct(fs) => {
-                    if fs.is_empty() {
-                        self.w(" {}");
-                    } else {
-                        self.w(" { ");
-                        for (j, f) in fs.iter().enumerate() {
-                            if j > 0 {
-                                self.w(", ");
-                            }
-                            self.field_decl(f);
-                        }
-                        self.w(" }");
-                    }
-                }
-            }
-            if let Some(disc) = &v.discriminant {
-                self.w(" = ");
-                self.expr(disc, Cx::top(false));
-            }
+            self.variant(v);
             self.w(",");
             self.trailing(v.span.hi, next);
         }
         self.close_at(close, "}");
+    }
+
+    /// One enum variant: its name, payload and discriminant (no `,`).
+    pub(crate) fn variant(&mut self, v: &Variant) {
+        self.ident(&v.name);
+        match &v.data {
+            VariantData::Unit => {}
+            VariantData::Tuple(tys) => {
+                self.w("(");
+                for (j, t) in tys.iter().enumerate() {
+                    if j > 0 {
+                        self.w(", ");
+                    }
+                    self.ty(t);
+                }
+                self.w(")");
+            }
+            VariantData::Struct(fs) => {
+                if fs.is_empty() {
+                    self.w(" {}");
+                } else {
+                    self.w(" { ");
+                    for (j, f) in fs.iter().enumerate() {
+                        if j > 0 {
+                            self.w(", ");
+                        }
+                        self.field_decl(f);
+                    }
+                    self.w(" }");
+                }
+            }
+        }
+        if let Some(disc) = &v.discriminant {
+            self.w(" = ");
+            self.expr(disc, Cx::top(false));
+        }
     }
 
     fn trait_decl(&mut self, t: &TraitDecl, span: Span) {
@@ -986,7 +995,9 @@ impl<'a> Printer<'a> {
         self.where_clause(f);
     }
 
-    fn fn_decl(&mut self, f: &FnDecl, name: &Ident) {
+    /// A function's signature, `fn` through its `where` clause: on one line, or with one
+    /// parameter per line when a comment sits in the list or the line would be too long.
+    pub(crate) fn fn_signature(&mut self, f: &FnDecl, name: &Ident) {
         let parens = self.param_parens(f);
         let mut vertical = None;
         if let Some((open, close)) = parens {
@@ -1000,6 +1011,10 @@ impl<'a> Printer<'a> {
             }
         }
         self.fn_head(f, name, vertical);
+    }
+
+    fn fn_decl(&mut self, f: &FnDecl, name: &Ident) {
+        self.fn_signature(f, name);
         match &f.body {
             None => self.w(";"),
             Some(b) => match b.tail.as_deref() {
@@ -1054,7 +1069,7 @@ impl<'a> Printer<'a> {
     // ---- Paths ----
 
     /// A path whose separators are always `.` (module, import, impl and bound paths).
-    fn dotted_path(&mut self, p: &Path) {
+    pub(crate) fn dotted_path(&mut self, p: &Path) {
         self.path_with(p, ".");
     }
 
