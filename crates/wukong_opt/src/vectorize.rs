@@ -99,23 +99,23 @@
 //! saturating quantize and an `i8` dot into an `i32` accumulator all widen. A value is never split
 //! across more than [`MAX_PARTS`] vectors.
 //!
-//! # `bf16` widens as `f32` lanes; `f16` stays scalar
+//! # `bf16` and `f16` widen as `f32` lanes
 //!
-//! Every backend computes a `bf16` value in an `f32` register and rounds it to the bf16 grid at
-//! exactly four points: a load (the storage holds 16 bits), a store, a constant, and a cast
-//! (`fptrunc .. to bf16`, which `mir_build` places after every bf16 operation, and an `fpext` out
-//! of bf16). Arithmetic in between is plain `f32`. So a bf16 lane is an `f32` lane — four to a
-//! 128-bit register, [`lane_bytes`] `4` — and `<4 x bf16>` keeps the same four rounding points
-//! lane by lane: the interpreter rounds each lane of a vector load as it rounds a scalar one, and
-//! Cranelift loads four 2-byte elements into the top halves of an `f32x4` (`uload16x4`), packs
-//! four rounded top halves on a store, and rounds each lane of a bf16 `fptrunc`/`fpext` with the
-//! scalar path's integer round-to-nearest-even. The arithmetic, compares and blends between them
-//! are the `f32x4` ones, and only the three exact casts between `f32` and bf16 are lane-wise
-//! ([`cast_route`]); every other bf16 cast is replicated as the scalar instruction. Reductions
-//! with a bf16 accumulator and bf16 interleave groups stay scalar.
-//!
-//! `f16` stays scalar: Cranelift has no vector half conversion, and the scalar path converts
-//! through runtime shims one element at a time.
+//! Every backend computes a `bf16` or `f16` value in an `f32` register and rounds it to its 16-bit
+//! grid at exactly four points: a load (the storage holds 16 bits), a store, a constant, and a cast
+//! (`fptrunc .. to bf16`/`f16`, which `mir_build` places after every half operation, and an
+//! `fpext` out of one). Arithmetic in between is plain `f32`. So a half lane is an `f32` lane —
+//! four to a 128-bit register, [`lane_bytes`] `4` — and `<4 x bf16>` / `<4 x f16>` keep the same
+//! four rounding points lane by lane: the interpreter rounds each lane of a vector load as it
+//! rounds a scalar one, and Cranelift (`codegen_cranelift::half_lanes`) loads four 2-byte elements
+//! into an `f32x4` (`uload16x4`, then a shift for bf16 or an integer f16 decode), rounds and packs
+//! four lanes on a store, and rounds each lane of a half `fptrunc`/`fpext`. The bf16 rounding is the
+//! scalar path's integer round-to-nearest-even; the f16 one is an SSE2 integer form of the scalar
+//! path's runtime shims (the `half` crate), checked against them on every f16 encoding and a dense
+//! cover of `f32` inputs. The arithmetic, compares and blends between them are the `f32x4` ones,
+//! and only the exact grid-rounding casts between `f32`, bf16 and f16 are lane-wise
+//! ([`cast_route`]); every other half cast is replicated as the scalar instruction. Reductions with
+//! a half accumulator (it rounds inside its own recurrence) and half interleave groups stay scalar.
 //!
 //! # Reading `WUKONG_VEC_TRACE=1`
 //!
@@ -306,17 +306,23 @@ impl Pass for Vectorize {
 /// Byte width of a lane type this pass will widen, or `None` for one it refuses.
 ///
 /// `I1` is out because a boolean vector is a *mask*, whose machine representation is one all-ones
-/// lane per element of the value it selects, not a one-bit lane. A `bf16` lane is its *register*
-/// width, an `f32`'s, though it is stored in two bytes (module docs); `f16` is out. Pointers and
+/// lane per element of the value it selects, not a one-bit lane. A `bf16` or `f16` lane is its
+/// *register* width, an `f32`'s, though it is stored in two bytes (module docs). Pointers and
 /// aggregates have no lane-wise arithmetic at all.
 fn lane_bytes(t: &MirType) -> Option<u32> {
     Some(match t {
         MirType::I8 => 1,
         MirType::I16 => 2,
-        MirType::I32 | MirType::F32 | MirType::BF16 => 4,
+        MirType::I32 | MirType::F32 | MirType::BF16 | MirType::F16 => 4,
         MirType::I64 | MirType::F64 => 8,
         _ => return None,
     })
+}
+
+/// Is `t` a half-precision float — bf16 or f16, an `f32` lane in a register and two bytes in
+/// memory, rounded to its grid at a load, a store, a constant and a cast (module docs)?
+fn is_half(t: &MirType) -> bool {
+    matches!(t, MirType::BF16 | MirType::F16)
 }
 
 /// Lanes per vector for a lane type.
@@ -1234,8 +1240,8 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
     if dir == -1 && !groups.is_empty() {
         return Err("an interleave group in a countdown");
     }
-    if groups.iter().any(|g| g.elem == MirType::BF16) {
-        return Err("a bf16 interleave group");
+    if groups.iter().any(|g| is_half(&g.elem)) {
+        return Err("a bf16 or f16 interleave group");
     }
     access_shape_verdict(l, &member)?;
     group_order_verdict(l, &lin, groups.len(), &member)?;
@@ -4110,9 +4116,9 @@ fn plan_body(
     // must be a real lane mask: a uniform `i1` cannot blend vectors.
     for r in &reductions {
         lane_bytes(&r.ty)?;
-        // A bf16 accumulate rounds to the grid inside its own recurrence (`fptrunc` after the
-        // combine), which no fold form here reproduces.
-        if r.ty == MirType::BF16 {
+        // A bf16 or f16 accumulate rounds to the grid inside its own recurrence (`fptrunc` after
+        // the combine), which no fold form here reproduces.
+        if is_half(&r.ty) {
             return None;
         }
         if let Some((cond, _)) = r.guard {
@@ -4244,14 +4250,17 @@ fn cast_widenable(k: CastKind, to: &MirType) -> bool {
 fn cast_route(kind: CastKind, from: &MirType, to: &MirType) -> Option<CastRoute> {
     use CastKind::*;
     let (fb, tb) = (lane_bytes(from)?, lane_bytes(to)?);
-    // A bf16 lane is an `f32` lane in a register, so the casts that only round it to the bf16 grid
-    // are lane-wise: `fpext bf16 -> f32` (rounds the source first) and `fptrunc` from `f32` or bf16
-    // (the rounding `mir_build` places after every bf16 operation). Any other bf16 cast — through
-    // `f64`, to or from an integer, a bitcast — has no exact lane-wise form here and is replicated.
-    if *from == MirType::BF16 || *to == MirType::BF16 {
-        return match (kind, from, to) {
-            (FpExt, MirType::BF16, MirType::F32)
-            | (FpTrunc, MirType::F32 | MirType::BF16, MirType::BF16) => Some(CastRoute::Same),
+    // A bf16 or f16 lane is an `f32` lane in a register, so the casts that only round it to a
+    // grid are lane-wise: an `fpext` out of a half type (it rounds the source to its grid first)
+    // and an `fptrunc` into one (the rounding `mir_build` places after every half operation), each
+    // between two of `f32`, bf16 and f16 — the backends round exactly where the scalar cast does.
+    // Any other half cast — through `f64`, to or from an integer, a bitcast — has no exact
+    // lane-wise form here and is replicated.
+    if is_half(from) || is_half(to) {
+        let float32 = |t: &MirType| *t == MirType::F32 || is_half(t);
+        return match kind {
+            FpExt if is_half(from) && float32(to) => Some(CastRoute::Same),
+            FpTrunc if is_half(to) && float32(from) => Some(CastRoute::Same),
             _ => None,
         };
     }
@@ -7771,14 +7780,36 @@ mod tests {
         assert!(!is_widened(src, "k"), "a bf16 sum must not be widened");
     }
 
-    /// `f16` is refused: Cranelift has no vector half conversion, and its scalar path converts
-    /// through runtime shims one element at a time.
+    /// An f16 lane is an `f32` lane in a register, like a bf16 one: an f16 body widens to
+    /// `<4 x f16>` parts and to nothing else.
     #[test]
-    fn an_f16_loop_is_refused() {
-        let src = "fn k(x: []f16, mut o: []f16, n: i64) { let mut i: i64 = 0; \
-                   while i < n { o[i] = x[i] * x[i]; i = i + 1; } } \
-                   fn main() -> i32 { return 0; }";
-        assert!(!is_widened(src, "k"), "f16 must not be widened");
+    fn an_f16_loop_widens_as_four_f32_lanes() {
+        let src = "fn k(x: []f16, y: []f16, mut o: []f16, n: i64) { let mut i: i64 = 0;                    while i < n { o[i] = x[i] * y[i] + x[i]; i = i + 1; } }                    fn main() -> i32 { return 0; }";
+        let vs = vector_values(src, "k");
+        assert!(!vs.is_empty(), "an f16 body was not widened");
+        assert!(
+            vs.iter().all(|(l, n)| *l == MirType::F16 && *n == 4),
+            "{vs:?}"
+        );
+    }
+
+    /// The f16 twin of [`bf16_lanes_agree_with_the_scalar_loop`]: every lane of five f16 bodies,
+    /// `-O0` against `-O2`, as raw bits — over NaN payloads (quiet and signalling), both zeros, both
+    /// infinities, the smallest subnormal and normal, the largest finite value (whose products
+    /// overflow) and rounding ties.
+    #[test]
+    fn f16_lanes_agree_with_the_scalar_loop() {
+        scalar_and_vector_agree(
+            "fn pick(a: f16, b: f16) -> f16 { if a > b { return a; } return -b; }              @unchecked fn k(x: []f16, y: []f16, mut o1: []f16, mut o2: []f16,                mut o3: []f16, mut f: []f32, mut o5: []f16, n: i64, d: i64) {                if d > 0 { k(x, y, o1, o2, o3, f, o5, n, d - 1); return; }                let mut i: i64 = 0;                while i < n { o1[i] = x[i] * y[i] + x[i]; i = i + 1; }                i = 0; while i < n { o2[i] = pick(x[i], y[i]); i = i + 1; }                i = 0; while i < n { o3[i] = x[i] / y[i]; i = i + 1; }                i = 0; while i < n { f[i] = (x[i] as f32) * 0.5; i = i + 1; }                i = 0; while i < n { o5[i] = (f[i] * 3.0) as f16; i = i + 1; } }              fn xs(r: i64) -> u16 { let t: [u16; 16] = [32257, 32000, 32768, 0, 31744, 64512,                15872, 49280, 1, 31743, 15361, 16968, 48128, 13312, 22528, 18688]; return t[r]; }              fn ys(r: i64) -> u16 { let t: [u16; 16] = [15360, 16384, 0, 32768, 31744, 15361,                15359, 49664, 1024, 27648, 14336, 30720, 45056, 19712, 16383, 32258]; return t[r]; }              fn main() -> i32 { let n: i64 = 37;                let mut x: []f16 = alloc_f16(n); let mut y: []f16 = alloc_f16(n);                let mut o1: []f16 = alloc_f16(n); let mut o2: []f16 = alloc_f16(n);                let mut o3: []f16 = alloc_f16(n); let mut o5: []f16 = alloc_f16(n);                let mut f: []f32 = alloc_f32(n); let mut i: i64 = 0;                while i < n { x[i] = f16_from_bits(xs(i % 16));                  y[i] = f16_from_bits(ys((5 * i + 3) % 16)); i = i + 1; }                k(x, y, o1, o2, o3, f, o5, n, 0); i = 0;                while i < n { print(bits(o1[i])); print(bits(o2[i])); print(bits(o3[i]));                  print(bits(f[i])); print(bits(o5[i])); i = i + 1; }                return 0; }",
+        );
+    }
+
+    /// An f16 accumulator rounds to its grid inside its own recurrence, like a bf16 one, so the
+    /// loop stays scalar.
+    #[test]
+    fn an_f16_reduction_stays_scalar() {
+        let src = "fn k(x: []f16, n: i64) -> f16 { let mut s: f16 = 0.0; let mut i: i64 = 0;                    while i < n { s = s + x[i]; i = i + 1; } return s; }                    fn main() -> i32 { return 0; }";
+        assert!(!is_widened(src, "k"), "an f16 sum must not be widened");
     }
 
     // ---- min/max reductions --------------------------------------------------------------------

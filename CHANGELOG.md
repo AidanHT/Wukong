@@ -5,6 +5,25 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### f16 general loops vectorize (`gap7/f16-vec`, P15.7)
+
+- **f16 general loops vectorize.** The MIR vectorizer widened bf16 bodies but refused every f16
+  one: Cranelift 0.124 has no vector half conversion, and the scalar path converts each f16 load
+  and store through a runtime shim (the `half` crate). An f16 body now widens to `<4 x f16>` like a
+  bf16 one, four f16 lanes in an `f32x4`, and the native backend converts four lanes at once in
+  SSE2 integer arithmetic (`wukong_codegen_cranelift::half_lanes`): a load widens four 2-byte
+  elements, a store rounds four lanes to nearest even and packs them, and a vector
+  `fptrunc`/`fpext` rounds each lane to the f16 grid. The conversions are bit-identical to the
+  shims on every input class — all 65536 f16 encodings, and every `f32` exponent with a one, a run
+  or a tie at every rounding position, every f16 midpoint and its neighbours, every NaN payload and
+  a million random patterns — under the host's ISA and the x86-64 baseline (`half_lane_tests`,
+  which also checks the shim against a transcription of the `half` crate's software routine, so a
+  host without F16C computes the same bits). `tests/run/vec_f16_lanes.wk` prints every lane's bits
+  of five f16 kernels (a contracted multiply-add, a compare and negation, a division, `fpext` and
+  `fptrunc`) over NaN payloads, signed zeros, infinities, subnormals, overflow and ties, hand-derived,
+  on interp and native at `-O0` and `-O2`. Six corpus programs gain `<4 x f16>` loops at `-O2`
+  (no dispatch moves).
+
 ### First-class 128-bit integers: `i128` and `u128` (`gap6/i128`, N25)
 
 - **Added: the `i128` and `u128` scalar types.** 16 bytes, 16-byte aligned, in every position a

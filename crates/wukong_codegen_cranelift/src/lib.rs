@@ -65,6 +65,11 @@ pub use entry::ObjectKind;
 
 // Stack-slot coloring: allocas with disjoint lifetimes share one frame slot.
 mod stack_color;
+
+// The general vectorizer's `<4 x bf16>` / `<4 x f16>` lanes: an `f32x4` in a register, four 2-byte
+// elements in memory, and the lane-wise grid roundings between the two.
+mod half_lanes;
+use half_lanes::half_x4;
 pub use stack_color::{frame_bytes, FrameBytes};
 
 // --- The minimal runtime the generated code calls back into ---------------------------------
@@ -784,12 +789,6 @@ fn classify_intrinsic(name: &str, arg: Option<&MirType>) -> Option<Intrinsic> {
 
 // --- Type and size mapping ------------------------------------------------------------------
 
-/// Is `t` the general vectorizer's `<4 x bf16>`: four bf16 lanes held as an `f32x4`, stored as four
-/// 2-byte elements? Its loads, stores and grid-rounding casts are lowered on their own.
-fn is_bf16_x4(t: &MirType) -> bool {
-    matches!(t, MirType::Vec(lane, 4) if **lane == MirType::BF16)
-}
-
 /// Map a MIR type to its Cranelift type, or `None` for `Void`. `i1` becomes `i8`; `f16`/`bf16` are
 /// computed as `f32` (matching the interpreter's promotion of sub-`f32` floats).
 fn cl_type(t: &MirType, ptr_ty: Type) -> Option<Type> {
@@ -1395,13 +1394,11 @@ impl<'a> FnTranslator<'a> {
             Op::Load(p, ty) => {
                 let addr = self.val(*p);
                 let flags = self.load_flags_for(*p, ty);
-                if is_bf16_x4(ty) {
-                    // `<4 x bf16>` (the general vectorizer's bf16 lanes): four 2-byte elements,
-                    // each widened exactly as the scalar load above widens one — zero-extended
-                    // into the top half of an f32 lane. Register type is `f32x4` (see `cl_type`).
-                    let ext = self.builder.ins().uload16x4(flags, addr, 0);
-                    let shifted = self.builder.ins().ishl_imm(ext, 16);
-                    self.vec_bitcast(types::F32X4, shifted)
+                if let Some(lane) = half_x4(ty) {
+                    // `<4 x bf16>` / `<4 x f16>` (the general vectorizer's half lanes): four 2-byte
+                    // elements, each widened exactly as the scalar load below widens one. Register
+                    // type is `f32x4` (see `cl_type`).
+                    half_lanes::load_x4(&mut self.builder, lane, flags, addr)
                 } else if matches!(ty, MirType::BF16) {
                     // bf16 storage is 2 bytes; load the 16 bits and widen to f32 exactly (the bits
                     // become the top half of the f32). Register type is f32 (see `cl_type`).
@@ -1427,18 +1424,11 @@ impl<'a> FnTranslator<'a> {
             Op::Store { ptr, value } => {
                 let addr = self.val(*ptr);
                 let flags = self.mem_flags_for(*ptr);
-                if is_bf16_x4(self.ty_of(*value)) {
-                    // Each lane rounded to bf16 exactly as the scalar store below rounds one, the
-                    // four top halves packed into 8 bytes. After the shift every lane is in
-                    // `0..=0xffff`, so the saturating pack (`packusdw`) is a plain truncation.
+                if let Some(lane) = half_x4(self.ty_of(*value)).cloned() {
+                    // Each lane rounded to its grid exactly as the scalar store below rounds one,
+                    // the four 16-bit encodings packed into 8 bytes.
                     let v = self.val(*value);
-                    let rounded = self.round_to_bf16_x4(v);
-                    let bits = self.vec_bitcast(types::I32X4, rounded);
-                    let hi = self.builder.ins().ushr_imm(bits, 16);
-                    let packed = self.builder.ins().unarrow(hi, hi);
-                    let wide = self.vec_bitcast(types::I64X2, packed);
-                    let low = self.builder.ins().extractlane(wide, 0);
-                    self.builder.ins().store(flags, low, addr, 0);
+                    half_lanes::store_x4(&mut self.builder, &lane, flags, v, addr);
                 } else if matches!(self.ty_of(*value), MirType::BF16) {
                     // Round the f32 register to bf16 and store the top 16 bits (2 bytes).
                     let v = self.val(*value);
@@ -1742,18 +1732,28 @@ impl<'a> FnTranslator<'a> {
             FpToUi => self.fcvt_to_int_sat(x, to_ty, false),
             SiToFp => self.builder.ins().fcvt_from_sint(to_ty, x),
             UiToFp => self.builder.ins().fcvt_from_uint(to_ty, x),
-            // The vectorizer's `<4 x bf16>` casts: a lane-wise `FpExt` to `f32` and `FpTrunc` to
-            // bf16 both round each lane to the bf16 grid, exactly as the scalar forms below do.
-            FpExt | FpTrunc if is_bf16_x4(self.ty_of(v)) || is_bf16_x4(to) => {
+            // The vectorizer's half-lane casts (`<4 x bf16>`, `<4 x f16>`): every lane is an `f32`
+            // in a register on both sides, so a lane-wise `FpExt` rounds each lane to the source's
+            // grid and an `FpTrunc` to the target's, exactly as the scalar forms below do.
+            FpExt | FpTrunc if half_x4(self.ty_of(v)).is_some() || half_x4(to).is_some() => {
+                let four_byte = |t: &MirType| {
+                    matches!(t.lane_type(), MirType::F32 | MirType::BF16 | MirType::F16)
+                };
                 debug_assert!(
-                    matches!(
-                        (kind, self.ty_of(v).lane_type(), to.lane_type()),
-                        (FpExt, MirType::BF16, MirType::F32)
-                            | (FpTrunc, MirType::F32 | MirType::BF16, MirType::BF16)
-                    ),
-                    "a bf16 vector cast the vectorizer never builds"
+                    four_byte(self.ty_of(v)) && four_byte(to),
+                    "a half-lane vector cast the vectorizer never builds"
                 );
-                self.round_to_bf16_x4(x)
+                let grid = if kind == FpExt {
+                    self.ty_of(v).lane_type().clone()
+                } else {
+                    to.lane_type().clone()
+                };
+                match grid {
+                    MirType::BF16 | MirType::F16 => {
+                        half_lanes::round_x4(&mut self.builder, &grid, x)
+                    }
+                    _ => x,
+                }
             }
             FpExt => {
                 // A bf16/f16 source must round to its grid before widening. bf16/f16 share f32's
@@ -1984,32 +1984,6 @@ impl<'a> FnTranslator<'a> {
         self.builder
             .ins()
             .bitcast(types::F32, MemFlags::new(), resbits)
-    }
-
-    /// [`Self::round_to_bf16`] on each lane of an `f32x4`: the same integer round-to-nearest-even on
-    /// the bits, and the same quiet-NaN rule (keep the top half, set the quiet bit), with a lane
-    /// mask from an unordered compare where the scalar form tests `|bits| > 0x7f800000`.
-    fn round_to_bf16_x4(&mut self, x: Value) -> Value {
-        let splat = |me: &mut Self, k: u32| {
-            let c = me.builder.ins().iconst(types::I32, i64::from(k as i32));
-            me.builder.ins().splat(types::I32X4, c)
-        };
-        let bits = self.vec_bitcast(types::I32X4, x);
-        let shr = self.builder.ins().ushr_imm(bits, 16);
-        let one = splat(self, 1);
-        let lsb = self.builder.ins().band(shr, one);
-        let half = splat(self, 0x7fff);
-        let bias = self.builder.ins().iadd(lsb, half);
-        let summed = self.builder.ins().iadd(bits, bias);
-        let top = splat(self, 0xffff_0000);
-        let nonnan = self.builder.ins().band(summed, top);
-        let masked = self.builder.ins().band(bits, top);
-        let quiet = splat(self, 0x0040_0000);
-        let nanres = self.builder.ins().bor(masked, quiet);
-        let isnan = self.builder.ins().fcmp(FloatCC::Unordered, x, x);
-        let isnan = self.vec_bitcast(types::I32X4, isnan);
-        let resbits = self.builder.ins().bitselect(isnan, nanres, nonnan);
-        self.vec_bitcast(types::F32X4, resbits)
     }
 
     /// Round an `f32` to f16 precision and back to `f32`, by calling the runtime shims
@@ -6929,6 +6903,9 @@ mod tests;
 
 #[cfg(test)]
 mod lane_op_tests;
+
+#[cfg(test)]
+mod half_lane_tests;
 
 #[cfg(test)]
 mod assertion_tests;

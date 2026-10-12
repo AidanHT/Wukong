@@ -771,10 +771,14 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
   arithmetic, compares and blends in `f32`, each lane rounded to the bf16 grid exactly where the
   scalar loop rounds (a load, a store, a constant, an `fptrunc`/`fpext`) — bit-exact with the scalar
   loop on interp and native (`tests/run/vec_bf16_lanes.wk` prints every lane's bits over NaN
-  payloads, signed zeros, infinities, subnormals and rounding ties). Still scalar: `f16` bodies
-  (Cranelift has no vector half conversion; each scalar `f16` load and store calls a runtime shim),
-  bf16 accumulators, bf16 interleave groups, and bf16 casts through `f64` or integers (replicated
-  lane by lane).
+  payloads, signed zeros, infinities, subnormals and rounding ties). **f16 bodies** widen the same
+  way to `<4 x f16>`: Cranelift has no vector half conversion, so the backend converts four lanes at
+  once in SSE2 integer arithmetic (`codegen_cranelift::half_lanes`), bit-identical to the scalar
+  path's runtime shims on all 65536 f16 encodings and a dense cover of `f32` inputs (every exponent,
+  every tie position, every subnormal boundary, every NaN payload), under the host ISA and the
+  x86-64 baseline (`tests/run/vec_f16_lanes.wk`, every lane's bits). Still scalar: bf16 and f16
+  accumulators (they round inside the recurrence), half interleave groups, and half casts through
+  `f64` or integers (replicated lane by lane).
 - **Straight-line SLP** (`wukong_opt::slp`, `-O2`, after unrolling): `W` stores in one block to
   consecutive elements of one object whose values are one lane-wise operation tree pack into one
   128-bit vector store — `f32x4`, `i32x4`, `f64x2`, `i64x2` — over vector loads, splats and lane

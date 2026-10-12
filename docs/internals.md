@@ -1065,11 +1065,34 @@ the quiet bit set). The LLVM emitter already lowered half vectors, and `--backen
 scalarizes them lane by lane through its scalar bf16 load, store and conversions. Only the three
 exact casts between `f32` and bf16 are lane-wise (`cast_route`); a bf16 cast through `f64`, to or
 from an integer, or a bitcast is replicated as the scalar instruction. A bf16 accumulator (it rounds
-inside its own recurrence) and a bf16 interleave group stay scalar, and `f16` stays scalar
-throughout: Cranelift has no vector half conversion, and its scalar path calls a runtime shim per
-element. Pinned by `tests/run/vec_bf16_lanes.wk` (NaN payloads, both zeros, both infinities, the
-smallest subnormal, the largest finite value and rounding ties; every lane's bits, hand-derived)
-and `bf16_lanes_agree_with_the_scalar_loop`.
+inside its own recurrence) and a bf16 interleave group stay scalar. Pinned by
+`tests/run/vec_bf16_lanes.wk` (NaN payloads, both zeros, both infinities, the smallest subnormal,
+the largest finite value and rounding ties; every lane's bits, hand-derived) and
+`bf16_lanes_agree_with_the_scalar_loop`.
+
+**f16 lanes** (P15.7). An `f16` lane is the same `f32` lane with a different grid, and `<4 x f16>`
+keeps the same four rounding points; the difference is the conversion. The scalar path calls the
+runtime shims `wukong_f32_to_f16_bits`/`wukong_f16_bits_to_f32` per element (the `half` crate: F16C
+`vcvtps2ph`/`vcvtph2ps` on a host that has it, an integer routine on one that does not), and
+Cranelift 0.124 has no vector half conversion, so `codegen_cranelift::half_lanes` builds both
+directions from SSE2 integer operations on four lanes at once: f16 to f32 rebiases the exponent,
+moves infinities and NaNs to exponent 255 (a NaN keeps its payload and gains the quiet bit) and
+forms a subnormal as `(2^-14 + m·2^-24) - 2^-14`, an exact `f32` subtraction; f32 to f16 rebiases
+and rounds a normal at bit 13 to nearest even with an integer add, rounds a subnormal by one `f32`
+addition of `0.5` (whose binade has the f16 subnormal spacing, so IEEE rounding is the rounding
+wanted), saturates `65520` and up to infinity, and narrows a NaN to its top ten payload bits with
+the quiet bit — F. Giesen's branch-free `float_to_half_fast3_rtne`/`half_to_float` with the `half`
+crate's NaN rule. A load is `uload16x4` plus the decode, a store the encode plus `unarrow`, and a
+`<4 x f16>` `fptrunc`/`fpext` the two back to back. Nothing depends on the host's half
+instructions, so `--target-cpu=x86-64` computes the same bits. `half_lane_tests` JIT-compiles the
+three under the host ISA and the SSE2 baseline and compares them bit for bit with the shim and with
+a transcription of the `half` crate's software routine: f16 to f32 on all 65536 encodings, f32 to
+f16 on every sign and exponent with a one, a run or a tie at every rounding position, every f16
+value's midpoint to the next and the `f32` neighbours of both, every NaN payload and a million
+random patterns. `tests/run/vec_f16_lanes.wk` is the program-level twin of the bf16 fixture (NaN
+payloads quiet and signalling, both zeros and infinities, subnormal inputs and results, overflow to
+infinity, ties at both ends; every lane's bits, hand-derived) on interp and native at `-O0` and
+`-O2`. An f16 accumulator and an f16 interleave group stay scalar, like their bf16 twins.
 
 **256-bit kernels from the optimizer** (`src/vec256.rs`, a child module of `vectorize`). A loop the
 128-bit plan widens whose body also has a raw-AVX2 recipe form takes the same `Op::VecKernelCall`
