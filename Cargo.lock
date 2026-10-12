@@ -1109,8 +1109,11 @@ dependencies = [
 name = "wukongc"
 version = "0.1.0"
 dependencies = [
+ "wukong_diag",
  "wukong_driver",
+ "wukong_fmt",
  "wukong_mir",
+ "wukong_span",
 ]
 
 [[package]]

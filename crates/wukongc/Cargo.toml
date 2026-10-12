@@ -18,6 +18,11 @@ path = "src/main.rs"
 
 [dependencies]
 wukong_driver = { workspace = true }
+# `wukongc fmt` (src/fmt_cmd.rs): the formatter, and the diagnostic renderer and source map its
+# syntax errors are shown with.
+wukong_fmt = { workspace = true }
+wukong_diag = { workspace = true }
+wukong_span = { workspace = true }
 
 [dev-dependencies]
 # `tests/tensor_parity.rs` asserts that a residual add reached the 256-bit `veckernel` recipe, and

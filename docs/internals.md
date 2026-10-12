@@ -72,11 +72,14 @@ wukong_runtime   the AVX2/FMA microkernels the recognizers dispatch to (GEMM/GEM
                   sequential `parallel_for` are reference surface with no caller anywhere in the
                   workspace (the kernels use thread-local `Vec` scratch)
 wukong_diag      Diagnostic, Severity, error-code catalog, JSON + terminal renderers
-wukong_lexer     &str -> tokens (+ @attributes, error recovery)
+wukong_lexer     &str -> tokens (+ @attributes, error recovery); `tokenize_with_comments` adds the
+                  comment side channel the formatter needs (plain `tokenize` is unchanged)
 wukong_ast       AST nodes, NodeId, pretty-printer; owns `BinOp::fold_const_len` +
                   `MAX_CONST_ARRAY_LEN` (= u32::MAX) — the const-array-length folder SHARED by
                   sema and mir_build so the two cannot disagree on a length
 wukong_parser    recursive-descent + Pratt expressions -> AST
+wukong_fmt       the source formatter behind `wukongc fmt`: AST + comments -> canonical text,
+                  self-checked to re-parse to the identical AST (see Formatter). Used only by wukongc
 wukong_types     Ty, Scalar, Shape/Dim/Layout — the shared semantic type vocabulary
 wukong_sema      name resolution + type checking + SHAPE checking
 wukong_mir       MIR data, builder, pretty-printer, verifier, `VecKernel` (the 256-bit AVX2
@@ -2172,6 +2175,115 @@ validated on-disk config cache), `paged_kv.rs` + `paged_attention.rs` + `serving
 warp-cooperative paged decode attention, batched decode and scheduler), `train_resident.rs` (a
 GPU-resident training step), and the `ptx_*` kernel-generator families. The compiler itself reaches the
 device only through `gpu_accel`'s five hooks and `lower.rs`.
+
+## Formatter (`wukong_fmt`, `wukongc fmt`)
+
+`wukongc fmt [--check] [--stdout] <path|->...` reprints `.wk` sources in one canonical style. The
+formatter is an AST pretty-printer that keeps comments, and its one guarantee is that **it never
+changes what a program means**: when it cannot prove that, it refuses (exit 2) and leaves the file
+untouched. It never emits a guess.
+
+**The comment side channel.** The token stream carries no trivia, so `wukong_lexer` grew
+`tokenize_with_comments(src, source) -> (tokens, comments, diags)`. It is `tokenize` plus a
+`Vec<Comment>` (`kind: Line | Block`, `span`): a line comment's span runs from `//` up to (not
+including) the `\n`, a block comment's from `/*` through its matching `*/`, counting nesting.
+`Comment::text` drops a trailing `\r`; `Comment::is_doc` is `///` (not `////`) or `//!`. It is an
+`Option<Vec<Comment>>` on the private `Lexer`, so plain `tokenize` (and `--emit=tokens`) records
+nothing and pays nothing; a unit test pins that the tokens and diagnostics of the two entry points
+are identical, BOM, CRLF and E0103 included.
+
+**Pipeline** (`wukong_fmt::format_source`): lex with comments (any lexer error is `Syntax`) →
+`parse_module_tokens_with_lints` (any parser *error* is `Syntax`; the input's `W0030`/`W0031` lints
+are allowed) → print → self-check → if the input's first line break is `\r\n`, write `\r\n`
+throughout; keep a leading BOM.
+
+**The printer** (`src/printer.rs`) matches exhaustively, with no `_ =>` arm, over every `ItemKind`,
+`StmtKind`, `ExprKind`, `PatKind`, `TypeKind`, `DimKind`, `Layout`, `AttrArg`, `AttrVal`,
+`GenericParamKind`, `VariantData`, `VariantPat` and `ForIter` variant, so a new AST variant fails
+this crate's build. Where the AST does not record a spelling, the printer reads it back from the
+token stream (binary search on `span.lo`): `::` vs `.` in a field or path, `~` vs `!` (both
+`UnOp::Not`), `f32x8` vs `vec[f32, 8]`, `Name::<..>` vs `Name<..>` (the only spelling after `as`),
+an extern ABI string only where one was written, the parentheses around a non-tuple type (the
+parser allocates a `NodeId` for them), field-pattern shorthand, a struct-variant pattern's `..`, a
+dimension's or tile extent's integer text, and a tuple index (`t.0.0` is one float token the parser
+splits; `t.1 .2` prints as `(t.1).2`). Expressions get minimal parentheses from the parser's
+binding powers (every operator left-associative; a cast binds tighter than any binary operator and
+looser than any prefix one), `& &x` never `&&x`, `(a,)` for a 1-tuple, and a struct literal is
+parenthesized wherever the parser has struct literals off (an `if`/`while` condition, a `match`
+scrutinee or guard, a `for` iterator, a `where` predicate, an `if let`/`while let` head) unless a
+delimiter re-enables them (call arguments, `(..)`, array literals, struct-literal fields — **not**
+index brackets, and not blocks).
+
+The parser desugars several constructs; the printer recognizes each desugared shape and prints the
+surface form again:
+
+| written | the AST the parser builds | how the printer recognizes it |
+|---|---|---|
+| `impl [Trait for] T { fn m … }` | an `ItemKind::Impl` marker, then one top-level `Fn` per method named `T.m` | the `Impl` item's `ImplMethod.fn_name`s, consumed in order |
+| `self` / `mut self` / `&self` / `&mut self` | a parameter `self: T` whose type span is the name's | `ty.span == name.span`; the tokens in the parameter span |
+| `Self` inside an `impl` | the type's own symbol | the identifier's source text is `Self` |
+| `if let P = e [&& g] { A } [else …]` | `match e { P [if g] => …, _ => … }`, second arm `ArmOrigin::LetFallthrough` | the arm origin; no `else` when both arm bodies share a span |
+| `[l:] while let P = e [&& g] { A }` | `[l:] loop { match e { P => { A }, _ => { break; } } }` | a `Loop` whose first token is `while` |
+| `let [mut] P = e else { B };` | `let names = match e { P => names, _ => { B } }` (or the bare `match` when `P` binds nothing) | the second arm's `ArmOrigin::LetElse` |
+| `const X: T = v;` in a block | an immutable `let` | the token before the pattern is `const` |
+| `defer t op= v;` | `defer { t op= v; }` | a `Defer` of a block whose first token is not `{` |
+| `fn f() -> T = e;` | a body block whose tail is `e` | the block's span equals its tail's |
+| `where T: A + B, N % 4 == 0` | `T`'s bounds (after `T`'s span) + `where_preds` | a bound past its parameter's span; merged with the predicates by position; a `+` before a bound continues the entry |
+| `s[a..b]`, `s[a..]`, `s[..b]`, `s[..]` | `$slice(s, a, b)` / `$slice_from(s, a)`; an elided `a` is a zero-width `0` | the `$`-named callee (never printed) |
+
+**Style.** 4-space indent, one final newline, no trailing whitespace on code. `module a.b` without
+`;`; `import x;` and `const …;` with one. A node's attributes go on one line above it; parameter
+attributes stay inline. Structs and enums put one field or variant per line with a trailing comma.
+Blocks are always multi-line except an empty, comment-free `{}`. `} else if c {` / `} else {`. A
+match arm is `pat[ if g] => body,`; a block-bodied arm drops the comma unless the next arm's pattern
+starts with `(`, `[` or `-` (which would continue the block as a call, an index or a subtraction).
+A statement ends in `;` unless it is a block-like expression (`{…}`, `if`, `match`, `loop`), `while`,
+`for` or `while let`; a block-like expression statement still gets one when it is the block's last
+statement with no tail (else it would re-parse as the tail) or when the next statement starts with a
+character that would continue it (`( [ - * & ! ~ . < > = + / % ^ |` or `as`) — Wukong's parser,
+unlike Rust's, keeps parsing postfix and binary operators after a block-like expression.
+
+**Wrapping** decisions use a pure `flat()` rendering, which fails on any block-like sub-expression
+and never consumes a comment. A signature puts one parameter per line (trailing comma) when its flat
+header exceeds `max_width` (100) or a comment lies inside the parameter list; the outermost call or
+struct literal of a statement does the same for its arguments/fields; an array literal of simple
+elements (literals, paths, negated literals) fills lines greedily and any other array goes one
+element per line. Nothing else wraps; a call holding a block-bodied closure (or any block-like
+argument) keeps its arguments inline and the block opens over the following lines.
+
+**Comments** are walked with one cursor in source order (`src/comments.rs`). Before an own-line
+element (item, attribute line, statement, tail, field, variant, arm, `impl` method, vertical
+parameter/argument/element, closing brace) every earlier comment goes on its own line; after the
+element's line come the comments that start before the next source line break (and the next
+element), plus any earlier one nothing has placed — so a comment inside an expression moves to the
+end of its line. A line carries at most one trailing line comment. A blank line is kept before an
+own-line element exactly when the source had two or more line breaks before it, never after `{` or
+before `}`.
+
+**The self-check** (`src/check.rs`) — `format_source` returns `Unsupported` unless all four hold:
+
+1. **(a)** re-lexing and re-parsing the output with the *same* `Interner` gives no error and no
+   parser lint (so `W0030`/`W0031` hazards never survive a format);
+2. **(b)** the re-parsed module's `Debug` equals the original's with every span masked — NodeIds
+   and symbols compared exactly, so a renumbered node or a different name is caught;
+3. **(c)** the comment texts are identical, in order;
+4. **(d)** the sorted multiset of `Ident`/`Int`/`Float`/`Str`/`Char`/`Label` token texts is
+   identical — the law for source text the AST drops: a struct field's or trait method's
+   attributes, an enum's discriminant repr (`enum E: u8`), tokens skipped inside an `extern` block.
+
+The message names the first failing law with about 80 characters of context. These laws are never
+relaxed to let a file through; the printer is fixed instead, or the file stays refused.
+
+**Adding syntax means extending `wukong_fmt` in the same commit.** The exhaustive matches fail the
+build on a new AST variant, and `crates/wukong_fmt/tests/corpus.rs` — every `.wk` under `tests/run`
+(with `lib/`), `examples`, `tests/imports`, `tests/warn` and `tests/fail` must format (`Syntax` is
+allowed in `tests/fail` only), with zero `Unsupported` and every output a fixed point — fails on a
+new fixture the printer cannot reprint. A second corpus test inserts comments at token boundaries
+and formats at 100 and 40 columns; comments cannot change an AST, so nothing may be refused.
+`crates/wukongc/tests/fmt.rs` holds the CLI contract and the **MIR-identity gate**: `tests/run`
+(with `lib/`) and `examples/` are formatted in a scratch copy, and every root program's
+`--emit=mir-high -O0` (and, for the examples, `--emit=mir -O2`) must be byte-identical before and
+after, exit code included.
 
 ## Testing strategy
 

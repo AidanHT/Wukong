@@ -20,6 +20,7 @@ seam every execution/emission target plugs into.
 | `wukong_lexer` | `&str` → flat `Vec<Token>` + diagnostics. Never aborts; owns E01xx. |
 | `wukong_ast` | Data-only AST + the deterministic pretty-printer. Sema annotates through `NodeId` side tables and never rewrites it. Owns `BinOp::fold_const_len`. |
 | `wukong_parser` | Recursive descent (items/stmts/types/patterns) + Pratt expressions → AST. Allocates `NodeId`s, recovers from everything; owns E02xx. |
+| `wukong_fmt` | The source formatter behind `wukongc fmt`: AST + the lexer's comment side channel → canonical text, self-checked to re-parse to the identical AST with the same comments and tokens (refuses otherwise). Used only by `wukongc`. |
 | `wukong_types` | The semantic type vocabulary (`Scalar`, `Dim`, `Shape`, `Layout`, `Ty`) and the **layout authority** (`size_of`/`align_of`/`tuple_offsets`). |
 | `wukong_sema` | Name resolution, type inference, generics, match exhaustiveness, and tensor **shape checking**. Owns E03xx/E04xx/E05xx (except E0305, and two `E0401` sites in `wukong_mir_build`). |
 | `wukong_mir` | The typed block-parameter SSA IR: types, `Builder`, printer, verifier, and `VecKernel` (the AVX2 recipe). No passes. |
@@ -32,7 +33,7 @@ seam every execution/emission target plugs into.
 | `wukong_codegen_cranelift` | The real native backend: MIR → CLIF → JIT (`jit_run`) or host object (`emit_object`), plus the raw-AVX2 256-bit encoder and both fuzzers. |
 | `wukong_codegen_gpu` | GPU backend behind `--features gpu`: PTX generators + `cudarc` driver-JIT, the recognizer offload, general MIR→PTX (`lower.rs`), the megakernel, serving/training stacks. |
 | `wukong_driver` | Sequences the pipeline; owns `SourceMap`/`Interner`/`DiagnosticSink`, the `Options` types, the import loader (E0305), the `--emit=exe` link, and `gpu_accel`. |
-| `wukongc` | The CLI binary. Parses argv, validates flag *combinations*, delegates to `wukong_driver::compile`. Its `tests/` hold every CLI-level gate. |
+| `wukongc` | The CLI binary. Parses argv, validates flag *combinations*, delegates to `wukong_driver::compile`; the `fmt` subcommand delegates to `wukong_fmt`. Its `tests/` hold every CLI-level gate. |
 | `wukong_bench` | Leaf binary `wukong-bench`: optimizer effectiveness, interp/native timing, per-pass and per-stage compile time, compiler-vs-compiler. |
 | `wukong_xbench` | Leaf binary `wukong-xbench`: cross-language benchmark (Wukong vs C/C++/Rust/MKL/matrixmultiply/PyTorch) through one harness. |
 

@@ -5,6 +5,29 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Source formatter (`gap5/source-formatter`)
+
+- **Added `wukongc fmt` (N14).** `wukongc fmt [--check] [--stdout] <path|->...` reprints `.wk`
+  files — or every `*.wk` under a directory, in sorted order — in one canonical style, keeping every
+  comment. Files are rewritten only when they change (through `<file>.fmt.tmp` and a rename);
+  `--check` writes nothing, lists the files that would change and exits 1; `--stdout` prints one
+  file's result; `-` formats standard input to standard output. A syntax error exits 1 with the
+  compiler's own diagnostics, an unreadable path exits 3, a usage error exits 2. `fmt` is a
+  subcommand only as the first argument; compile a file literally named `fmt` as `./fmt`.
+- **It never changes what a program means.** Every output is re-lexed and re-parsed and must give
+  the identical AST (NodeIds and symbols compared exactly, spans masked), the same comments in
+  order, and the same identifier and literal tokens, with no parse error or `W0030`/`W0031` lint.
+  Otherwise the file is refused (exit 2) and left untouched. Source text the AST drops — a struct
+  field's or trait method's attributes, an enum's `: u8` repr — is refused for that reason. The
+  whole corpus (`tests/run` with `lib/`, `examples`, `tests/imports`, `tests/warn`, `tests/fail`)
+  formats with zero refusals, and formatting `tests/run` and `examples` leaves every program's
+  `--emit=mir-high -O0` (and the examples' `--emit=mir -O2`) byte-identical. The corpus itself is
+  not reformatted by this change.
+- **New crate `wukong_fmt`** (`format_source`, `FmtOptions { max_width }`, `FmtError::{Syntax,
+  Unsupported}`), and **`wukong_lexer::tokenize_with_comments`**, which returns the comments the
+  lexer used to discard (`Comment { kind: Line | Block, span }`, `Comment::text`, `Comment::is_doc`);
+  plain `tokenize` is unchanged and records nothing.
+
 ### Diagnostics: multi-line spans (`gap5/diag-multiline-spans`)
 
 - **Multi-line spans are drawn whole, with rustc-style connectors (N6).** The human renderer used to

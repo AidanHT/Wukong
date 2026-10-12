@@ -5,6 +5,8 @@ use std::process::ExitCode;
 
 use wukong_driver::{compile, EmitStage, Options};
 
+mod fmt_cmd;
+
 const USAGE: &str = "\
 wukongc — the Wukong compiler
 
@@ -12,6 +14,7 @@ USAGE:
     wukongc [OPTIONS] <input.wk> [-- <program args>...]
     wukongc [OPTIONS] -              (read the program from standard input)
     wukongc [OPTIONS] -e <source>    (the program is the <source> argument)
+    wukongc fmt [--check] [--stdout] <path|->...   (format source files; `wukongc fmt --help`)
 
 OPTIONS:
     --verify-each     Verify MIR after every optimizer pass (also in release builds)
@@ -105,6 +108,10 @@ EXAMPLES:
 ";
 
 fn main() -> ExitCode {
+    // `wukongc fmt …` is a subcommand: it takes over before any compiler flag is read.
+    if std::env::args().nth(1).as_deref() == Some("fmt") {
+        return fmt_cmd::run(&std::env::args().skip(2).collect::<Vec<_>>());
+    }
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     // `--threads` configures the runtime this process links (the interpreter and the JIT call the
     // same `wukong_runtime` pools), so it is applied here, before any thread exists, rather than
@@ -695,6 +702,19 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `wukongc fmt` is a subcommand dispatched before flag parsing; USAGE (the only user-facing
+    /// flag doc) must name it, and its own help must document every option it accepts.
+    #[test]
+    fn usage_documents_the_fmt_subcommand() {
+        assert!(
+            USAGE.contains("wukongc fmt [--check] [--stdout] <path|->..."),
+            "{USAGE}"
+        );
+        for opt in ["--check", "--stdout", "-h, --help", "./fmt"] {
+            assert!(fmt_cmd::FMT_USAGE.contains(opt), "fmt usage lacks `{opt}`");
+        }
+    }
 
     /// `-A/-W/-D <lint>` (and the glued `-Dwarnings`) accept a lint name, its dashed spelling, its
     /// code or `warnings`; an unknown lint or a missing name is a usage error, not a silent no-op.
