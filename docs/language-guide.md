@@ -2309,6 +2309,61 @@ little-endian `f2 f4 f8 i1 i2 i4 i8 u1 u2 u4 u8` descrs (`.npy`); `BOOL`, the fp
 big-endian array and a structured dtype parse and then report `-3`. A memory-mapped, zero-copy load
 (`map_<T>`) is not implemented yet: every load copies once, straight into the destination.
 
+### GGUF checkpoints and quantized blocks ✅
+
+`gguf_read_<T>(path: *u8, name: *u8, buf) -> i64` loads the tensor called `name` from a **GGUF**
+file — llama.cpp's checkpoint format, versions 2 and 3 — for the same twelve `T` and the same
+buffer forms, and four queries read the file's tensor table:
+
+| builtin | result |
+|---|---|
+| `gguf_find(path, name)` | the tensor's index in the tensor table |
+| `gguf_rank(path, name)` | its number of dimensions |
+| `gguf_dim(path, name, k)` | dimension `k`, **outermost first** (`-4` outside `0..rank`; `k` any integer type) |
+| `gguf_type(path, name)` | its ggml type id: `0` F32, `1` F16, `2` Q4_0, `8` Q8_0, `12` Q4_K, `14` Q6_K, `30` BF16, … |
+
+GGUF stores a tensor's dimensions innermost first; Wukong spells a shape outermost first, like
+safetensors, NumPy and PyTorch — so the tensor whose GGUF dims are `[4096, 11008]` is a
+`Tensor[f32, 11008, 4096]`, and `gguf_dim(path, name, 0)` is `11008`.
+
+```wukong
+fn load_up(path: *u8, mut w: Tensor[f32, 11008, 4096]) -> i64 {
+    return gguf_read_f32(path, "blk.0.ffn_up.weight", w);   // a Q4_K tensor, dequantized
+}
+
+fn load_up_q8(path: *u8, mut w: Tensor[u8, 11008, 4352]) -> i64 {
+    return gguf_read_u8(path, "blk.0.ffn_up.weight", w);    // a Q8_0 tensor's raw blocks
+}
+```
+
+- A **plain** tensor — `F32 F16 BF16 F64 I8 I16 I32 I64` — loads verbatim into a buffer of its own
+  element type, and `F16`/`BF16` also **widen exactly** into `f32` (the safetensors rule).
+- A **block-quantized** tensor **dequantizes into `f32`**: `Q4_0 Q4_1 Q5_0 Q5_1 Q8_0`, the K-quants
+  `Q2_K Q3_K Q4_K Q5_K Q6_K Q8_K`, and `IQ4_NL` / `IQ4_XS`, each by ggml's reference
+  `dequantize_row_*` — the same `f16` scales, the same unpacking, the same `f32` operations in the
+  same order, each product and sum rounded once (no fused multiply-add). The interpreter runs the
+  very same runtime code, so a dequantized value is identical on every backend.
+- Or a block-quantized tensor loads its **raw blocks into a `u8` buffer** — exactly the operand
+  `gemv_q8_0` / `gemv_q4_0` take, since ggml stores a `[N, K]` matrix as `N` rows of blocks too: a
+  quantized weight goes from disk to the decode GEMV without being dequantized. A `Tensor[u8, …]`
+  destination is checked against the **storage shape**: the shape with its innermost dimension
+  replaced by one row's byte length (a `[N, 4096]` `Q8_0` tensor is `Tensor[u8, N, 4352]`: 128 blocks
+  of 34 bytes).
+- The other block formats — the grid-based i-quants (`IQ1_S IQ1_M IQ2_XXS IQ2_XS IQ2_S IQ3_XXS
+  IQ3_S`), `Q8_1`, `TQ1_0`/`TQ2_0` and `MXFP4` — load as raw blocks, but reading one into `f32` is
+  **`-7`** (no dequantizer), as is any type id outside ggml's table.
+
+The codes are the safetensors reader's, plus one: **`-1`** can't open, **`-2`** io error, **`-3`**
+dtype mismatch (no conversion exists but the ones above), **`-4`** shape or count mismatch, **`-5`**
+no tensor of that name, **`-6`** malformed file — a bad magic, a version other than 2 or 3, an
+unknown metadata value type, a duplicated key or tensor name, more than four dimensions, an
+alignment that is not a `u32` power of two, a row that is not a whole number of blocks, an offset
+off the alignment, or anything that runs past the end of the file — and **`-7`** a type with no
+decoder. On every negative code but `-2` the destination is untouched. The reader parses every
+metadata value (all thirteen GGUF value types, arrays of arrays included: the tensor table follows
+them) and honours `general.alignment`; the metadata values themselves are not yet readable from a
+program. `tests/run/io_gguf.wk` writes a file byte by byte with `write_u8` and reads it back.
+
 ## Random numbers and sampling ✅
 
 Wukong's random numbers are **counter-based** — Philox4x32-10, the generator of Random123, cuRAND and

@@ -603,6 +603,10 @@ const FIXED_BUILTINS: &[&str] = &[
     "scratch_mark",
     "scratch_release",
     "file_size",
+    "gguf_find",
+    "gguf_rank",
+    "gguf_dim",
+    "gguf_type",
     "rand_u32",
     "rand_f32",
     "randn_f32",
@@ -658,6 +662,7 @@ pub fn builtin_callee_names() -> Vec<String> {
         names.push(format!("write_{t}"));
         names.push(format!("st_read_{t}"));
         names.push(format!("npy_read_{t}"));
+        names.push(format!("gguf_read_{t}"));
         names.push(format!("alloc_{t}"));
     }
     for t in SCRATCH_DTYPES {

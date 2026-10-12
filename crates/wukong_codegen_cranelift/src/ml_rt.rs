@@ -1,8 +1,8 @@
 //! The runtime entry points of the ML I/O and randomness builtins — dtype-coded file I/O,
-//! `file_size`, the safetensors / `.npy` readers, the Philox fill and the top-k / argsort /
-//! categorical-sampling kernels — and of the decode builtins (KV-cache attention, the KV append,
-//! the half-weight and Q8_0 / Q4_0 GEMVs and packers), declared, JIT-bound and called from **one
-//! table**.
+//! `file_size`, the safetensors / `.npy` / GGUF readers and the GGUF tensor-table queries, the
+//! Philox fill and the top-k / argsort / categorical-sampling kernels — and of the decode builtins
+//! (KV-cache attention, the KV append, the half-weight and Q8_0 / Q4_0 GEMVs and packers),
+//! declared, JIT-bound and called from **one table**.
 //!
 //! Every other runtime family in this crate is spelled out four times: a name constant, a
 //! `Signature` built by hand in `populate_module`, an `rt_ids` row, and a `builder.symbol` line in
@@ -53,7 +53,7 @@ pub(crate) struct Entry {
 
 /// The table. The addresses are taken here, at run time, because a function-pointer-to-raw-pointer
 /// cast is not a constant expression.
-pub(crate) fn entries() -> [Entry; 22] {
+pub(crate) fn entries() -> [Entry; 24] {
     use Abi::{Ptr, F32, I64};
     [
         // (path, byte_off, data, len, dtype) -> i64: `read_<T>` outside the frozen six, and every
@@ -91,6 +91,20 @@ pub(crate) fn entries() -> [Entry; 22] {
             params: &[Ptr, Ptr, I64, I64, Ptr, I64],
             ret: Some(I64),
             addr: wukong_runtime::wukong_rt_npy_read as *const u8,
+        },
+        // (path, name, data, len, dtype, dims, rank) -> i64: `gguf_read_<T>`.
+        Entry {
+            name: "wukong_rt_gguf_read",
+            params: &[Ptr, Ptr, Ptr, I64, I64, Ptr, I64],
+            ret: Some(I64),
+            addr: wukong_runtime::wukong_rt_gguf_read as *const u8,
+        },
+        // (path, name, what, k) -> i64: `gguf_find` / `gguf_rank` / `gguf_dim` / `gguf_type`.
+        Entry {
+            name: "wukong_rt_gguf_query",
+            params: &[Ptr, Ptr, I64, I64],
+            ret: Some(I64),
+            addr: wukong_runtime::wukong_rt_gguf_query as *const u8,
         },
         // (out, n, seed, ctr0): `rand_fill_f32`.
         Entry {

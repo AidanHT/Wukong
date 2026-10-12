@@ -1,6 +1,7 @@
 //! Lowering of the ML I/O and randomness builtins that `wukong_sema::ml_builtins` types: typed file
-//! I/O over every element type, the safetensors / `.npy` container readers, the Philox4x32-10
-//! counter-based RNG, and the top-k / argsort / categorical-sampling kernels.
+//! I/O over every element type, the safetensors / `.npy` / GGUF container readers and the GGUF
+//! tensor-table queries, the Philox4x32-10 counter-based RNG, and the top-k / argsort /
+//! categorical-sampling kernels.
 //!
 //! **Calls.** Every builtin but the RNG scalars lowers to one opaque `Op::Call` of a
 //! `wukong_runtime` entry. Integer operands are widened to `i64` (by their own signedness), float
@@ -29,7 +30,7 @@
 
 use wukong_ast::Expr;
 use wukong_mir::{BinOp, CastKind, MirType, Op, ValueId};
-use wukong_sema::{io_dtype_code, ml_builtin, ml_builtin_is_pure, DefKind, MlBuiltin};
+use wukong_sema::{io_dtype_code, ml_builtin, ml_builtin_is_pure, DefKind, GgufQuery, MlBuiltin};
 use wukong_span::{Interner, Symbol};
 use wukong_types::{Scalar, Ty};
 
@@ -55,6 +56,8 @@ pub(crate) struct MlSyms {
     file_size: Symbol,
     st_read: Symbol,
     npy_read: Symbol,
+    gguf_read: Symbol,
+    gguf_query: Symbol,
     rand_fill: Symbol,
     topk: Symbol,
     argsort: Symbol,
@@ -69,6 +72,8 @@ impl MlSyms {
             file_size: interner.intern("wukong_rt_file_size"),
             st_read: interner.intern("wukong_rt_st_read"),
             npy_read: interner.intern("wukong_rt_npy_read"),
+            gguf_read: interner.intern("wukong_rt_gguf_read"),
+            gguf_query: interner.intern("wukong_rt_gguf_query"),
             rand_fill: interner.intern("wukong_rand_fill_f32"),
             topk: interner.intern("wukong_topk_f32"),
             argsort: interner.intern("wukong_argsort_f32"),
@@ -154,7 +159,7 @@ impl FnLowerer<'_> {
                 let path = self.lower_expr(&args[0]);
                 Some(self.ml_call(syms.file_size, vec![path]))
             }
-            MlBuiltin::StRead(t) => {
+            MlBuiltin::StRead(t) | MlBuiltin::GgufRead(t) => {
                 if args.len() != 3 {
                     return None;
                 }
@@ -163,10 +168,26 @@ impl FnLowerer<'_> {
                 let buf = self.ml_buffer(&args[2])?;
                 let dt = self.ml_i64_const(io_dtype_code(t));
                 let (dims, rank) = self.ml_dims_arg(&buf);
-                Some(self.ml_call(
-                    syms.st_read,
-                    vec![path, tensor, buf.data, buf.len, dt, dims, rank],
-                ))
+                let func = match b {
+                    MlBuiltin::StRead(_) => syms.st_read,
+                    _ => syms.gguf_read,
+                };
+                Some(self.ml_call(func, vec![path, tensor, buf.data, buf.len, dt, dims, rank]))
+            }
+            MlBuiltin::GgufQuery(q) => {
+                let dim = q == GgufQuery::Dim;
+                if args.len() != 2 + usize::from(dim) {
+                    return None;
+                }
+                let path = self.lower_expr(&args[0]);
+                let tensor = self.lower_expr(&args[1]);
+                let what = self.ml_i64_const(q.code());
+                let k = if dim {
+                    self.ml_i64_arg(&args[2])
+                } else {
+                    self.ml_i64_const(0)
+                };
+                Some(self.ml_call(syms.gguf_query, vec![path, tensor, what, k]))
             }
             MlBuiltin::NpyRead(t) => {
                 if args.len() != 2 {

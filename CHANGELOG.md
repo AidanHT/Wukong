@@ -5,6 +5,37 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### GGUF checkpoints and quantized blocks (`gap6/tensor-io-gguf`, N77)
+
+- **`gguf_read_<T>(path, name, buf)` loads one tensor of a GGUF file** (llama.cpp's format, versions
+  2 and 3) for the twelve I/O element types and the usual buffer forms, checked against the
+  destination at load time like `st_read_<T>`: a plain tensor (`F32 F16 BF16 F64 I8 I16 I32 I64`)
+  loads verbatim, `F16`/`BF16` also widen exactly into `f32`; a block-quantized tensor
+  **dequantizes into `f32`** — `Q4_0 Q4_1 Q5_0 Q5_1 Q8_0`, the K-quants `Q2_K Q3_K Q4_K Q5_K Q6_K
+  Q8_K`, `IQ4_NL`, `IQ4_XS` — by ggml's reference `dequantize_row_*` (same unpacking, same `f32`
+  operations in the same order, no fused multiply-add), or loads its **raw blocks into `u8`**, the
+  operand `gemv_q8_0` / `gemv_q4_0` take (a `Tensor[u8, …]` destination is checked against the
+  storage shape, the innermost dimension in bytes). Shapes are reported **outermost first** (GGUF
+  stores `ne[0]` innermost), so GGUF dims `[4096, 11008]` load into `Tensor[f32, 11008, 4096]`.
+  Codes: `-1` open, `-2` I/O, `-3` dtype, `-4` shape/count, `-5` no such tensor, `-6` malformed
+  file, and the new `-7` for a type with no decoder (the grid i-quants, `Q8_1`, `TQ*`, `MXFP4`, an
+  id outside ggml's table) read into `f32`.
+- **`gguf_find` / `gguf_rank` / `gguf_dim` / `gguf_type(path, name[, k])`** answer the tensor
+  table: the tensor's index, rank, dimension `k` (outermost first) and ggml type id.
+- **The parser is strict where llama.cpp's is**: bad magic, a version other than 2/3, an unknown
+  value type, a duplicated key or tensor name, more than four dimensions, a dimension above
+  `i64::MAX`, a `general.alignment` that is not a `u32` power of two, an unaligned offset, a row that
+  is not a whole number of blocks and any length past the end of the file are `-6`; every metadata
+  value (all thirteen types, arrays of arrays) is parsed, so the tensor table is always reached.
+- **One implementation, every backend.** `wukong_runtime::gguf` holds the parser, the read plan and
+  the chunked dequantizing transfer; the native entries `wukong_rt_gguf_read` /
+  `wukong_rt_gguf_query` and the interpreter both call it, so a dequantized value is the same bits on
+  `interp`, `native`, the textual-LLVM declaration and an `--emit=exe` binary (gpu-native declines,
+  as for every I/O call). Runtime unit tests assemble every file and block by hand — blocks packed by
+  transcriptions of ggml's quantizers, values chosen so every product is exact — and cover all
+  thirteen metadata types, every malformed-header case and a file cut at every header byte;
+  `tests/run/io_gguf.wk` writes a GGUF with `write_u8` and reads every lane back.
+
 ### Source locations through MIR into native code (`gap5/native-source-locations`)
 
 - **Native-backend failures point at the source (P11.8).** A `C0002` (a slot above the native

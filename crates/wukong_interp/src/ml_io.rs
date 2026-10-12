@@ -1,9 +1,10 @@
 //! The interpreter twins of the ML I/O and randomness runtime entries: dtype-coded file I/O,
-//! `file_size`, the safetensors / `.npy` container readers, the Philox fill, and the top-k /
-//! argsort / categorical-sampling kernels.
+//! `file_size`, the safetensors / `.npy` / GGUF container readers and the GGUF tensor-table
+//! queries, the Philox fill, and the top-k / argsort / categorical-sampling kernels.
 //!
 //! Every arm here mirrors one `wukong_runtime` entry and shares that entry's *pure* code — the
-//! transfer plan and the container parsers in `wukong_runtime::fileio`, the generator in
+//! transfer plan and the container parsers in `wukong_runtime::fileio` (for GGUF, the parser, the
+//! plan and the dequantizing transfer in `wukong_runtime::gguf`), the generator in
 //! `wukong_runtime::random`, the selection functions in `wukong_runtime::topk` — so the return code,
 //! the element count and every value cannot drift between the two backends; only the destination
 //! differs. Native memory holds raw element bytes; this interpreter's memory holds one typed
@@ -25,6 +26,7 @@ use wukong_runtime::fileio::{
     check_dest, dtype_size, open_container, plan_raw_read, Container, DT_BF16, DT_F16, DT_F32,
     DT_F64, DT_I16, DT_I32, DT_I8, DT_U16, DT_U32, DT_U8, IO_ERROR, IO_OPEN_FAILED,
 };
+use wukong_runtime::gguf::{gguf_open_tensor, gguf_query_path, gguf_transfer};
 
 use crate::{
     file_read_path, kernel_buffer, kernel_scratch, kernel_values, Interp, Intrinsic, Value,
@@ -117,6 +119,8 @@ impl Interp<'_, '_> {
             I::RtFileSize => self.ml_file_size(args),
             I::RtStRead => self.ml_container_read(args, true),
             I::RtNpyRead => self.ml_container_read(args, false),
+            I::RtGgufRead => self.ml_gguf_read(args),
+            I::RtGgufQuery => self.ml_gguf_query(args),
             I::RandFillF32 => self.ml_rand_fill(args),
             I::TopkF32 => self.ml_topk(args),
             I::ArgsortF32 => self.ml_argsort(args),
@@ -263,14 +267,7 @@ impl Interp<'_, '_> {
         };
         let len = arg_i64(args, at + 2);
         let dt = arg_i64(args, at + 3);
-        let rank = arg_i64(args, at + 5);
-        let dims: Option<Vec<i64>> = if rank < 0 {
-            None
-        } else {
-            let base = ptr_arg(args, at + 4, ctx, "dims")?;
-            let vals = kernel_values(arena!(self), at + 4, base, 1, count(rank), ctx)?;
-            Some(vals.iter().map(|v| v.as_int() as i64).collect())
-        };
+        let dims = self.ml_dims(args, at + 4, ctx)?;
         let container = match &name {
             Some(n) => Container::Safetensors(n),
             None => Container::Npy,
@@ -297,6 +294,68 @@ impl Interp<'_, '_> {
                 None => Value::Int(IO_ERROR as i128),
             },
         )
+    }
+
+    /// The `(dims, rank)` operands at `at` / `at + 1`: `None` for a flat destination (`rank < 0`),
+    /// else the tensor view's dims.
+    fn ml_dims(&self, args: &[Value], at: usize, ctx: &str) -> Result<Option<Vec<i64>>, String> {
+        let rank = arg_i64(args, at + 1);
+        if rank < 0 {
+            return Ok(None);
+        }
+        let base = ptr_arg(args, at, ctx, "dims")?;
+        let vals = kernel_values(arena!(self), at, base, 1, count(rank), ctx)?;
+        Ok(Some(vals.iter().map(|v| v.as_int() as i64).collect()))
+    }
+
+    /// `wukong_rt_gguf_read(path, name, data, len, dtype, dims, rank) -> i64`: the runtime's own
+    /// open / locate / plan ([`gguf_open_tensor`]) and transfer ([`gguf_transfer`]) into a host
+    /// buffer of the destination's little-endian bytes, then decoded slot by slot — so a widened or
+    /// dequantized value is the native read's, bit for bit.
+    fn ml_gguf_read(&mut self, args: &[Value]) -> Result<Value, String> {
+        const CTX: &str = "gguf_read";
+        let path = str_arg(&self.memory, args, 0, CTX)?;
+        let name = str_arg(&self.memory, args, 1, CTX)?;
+        let len = arg_i64(args, 3);
+        let dt = arg_i64(args, 4);
+        let dims = self.ml_dims(args, 5, CTX)?;
+        let (mut file, loc, plan) =
+            match gguf_open_tensor(Path::new(&path), name.as_bytes(), dt, len, dims.as_deref()) {
+                Ok(found) => found,
+                Err(code) => return Ok(Value::Int(code as i128)),
+            };
+        let n = plan.count();
+        if n == 0 {
+            return Ok(Value::Int(0));
+        }
+        let sz = dtype_size(dt).ok_or_else(|| format!("{CTX}: unknown dtype {dt}"))?;
+        let base = ptr_arg(args, 2, CTX, "data")?;
+        self.ml_check_extent(2, base, n, CTX)?;
+        let byte_len = n
+            .checked_mul(sz)
+            .ok_or_else(|| format!("{CTX}: byte extent overflow"))?;
+        let mut bytes = kernel_scratch(byte_len, CTX)?;
+        bytes.resize(byte_len, 0u8);
+        if let Err(code) = gguf_transfer(&mut file, &loc, plan, &mut bytes) {
+            return Ok(Value::Int(code as i128));
+        }
+        for (slot, elem) in self.memory[base..base + n]
+            .iter_mut()
+            .zip(bytes.chunks_exact(sz))
+        {
+            *slot = decode_elem(dt, elem);
+        }
+        Ok(Value::Int(n as i128))
+    }
+
+    /// `wukong_rt_gguf_query(path, name, what, k) -> i64`.
+    fn ml_gguf_query(&mut self, args: &[Value]) -> Result<Value, String> {
+        const CTX: &str = "gguf_query";
+        let path = str_arg(&self.memory, args, 0, CTX)?;
+        let name = str_arg(&self.memory, args, 1, CTX)?;
+        let (what, k) = (arg_i64(args, 2), arg_i64(args, 3));
+        let got = gguf_query_path(Path::new(&path), name.as_bytes(), what, k);
+        Ok(Value::Int(got as i128))
     }
 
     /// `n` `f32` slots of operand `k` from `base`, marshalled for a host kernel.
@@ -428,6 +487,22 @@ mod tests {
         for (suffix, dt) in rows {
             let s = wukong_sema::io_dtype(suffix).unwrap();
             assert_eq!(wukong_sema::io_dtype_code(s), dt, "{suffix}");
+        }
+    }
+
+    /// The GGUF query codes (`wukong_sema::GgufQuery::code`, emitted as MIR constants) are the
+    /// runtime's `GGUF_Q_*`.
+    #[test]
+    fn compiler_and_runtime_gguf_query_codes_agree() {
+        use wukong_runtime::gguf as g;
+        use wukong_sema::GgufQuery as Q;
+        for (q, code) in [
+            (Q::Find, g::GGUF_Q_FIND),
+            (Q::Rank, g::GGUF_Q_RANK),
+            (Q::Dim, g::GGUF_Q_DIM),
+            (Q::Type, g::GGUF_Q_TYPE),
+        ] {
+            assert_eq!(q.code(), code, "{q:?}");
         }
     }
 

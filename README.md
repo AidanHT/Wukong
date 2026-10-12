@@ -123,6 +123,11 @@ not duplicate them. In summary, Wukong:
   (KV-cache / grouped-query attention), `kv_append`, `gemv_bf16`/`gemv_f16` and the llama.cpp
   `Q8_0`/`Q4_0` packers and GEMVs check their geometry against their operands at run time
   (`tests/run/decode_*.wk`).
+- **Checkpoints in, shape-checked at load time.** `st_read_<T>` (safetensors), `npy_read_<T>`
+  (`.npy`) and `gguf_read_<T>` (llama.cpp GGUF) compare the stored dtype and every dimension with the
+  destination `Tensor[…]` as they load; a GGUF tensor in ggml's `Q4_0`…`Q8_0` or K-quant blocks
+  dequantizes into `f32`, or loads its raw blocks for the quantized GEMVs
+  (`tests/run/io_{safetensors,npy,gguf}.wk`).
 - **Zero hidden cost.** No GC, no implicit copies of large aggregates, no surprise allocations.
 - **Domain-aware optimization (implementation today).** The compiler **recognizes a matmul nest** (the
   `ikj` accumulate and `ijk` dot-product forms, incl. `nn.Linear` `A·Bᵀ`, written naively or
