@@ -817,10 +817,12 @@ VECTOR node, each single-use LOAD lane). Everything is emitted just before the c
 and the `W` scalar stores are deleted, so stores and LOAD loads move *down*; the soundness argument
 is one crossing rule, checked with `AliasInfo::may_alias_sized` on exact widths: every unmoved store
 a moved access passes, and every unmoved load a moved store passes, must be disjoint from it; a call
-in between declines unless the moved access is call-proof; a barrier declines; and a chunk store
-that preceded a LOAD lane must be disjoint from it, because the one vector load now runs before the
-one vector store. Blocks go in index order, seeds by their first store, the function is rescanned
-after every pack (64 packs at most; functions above 6000 instructions are skipped).
+in between declines unless the moved access is call-proof; an `atomic.add` in between declines
+unless the moved access is call-proof *and* disjoint from its location; a barrier declines; and a
+chunk store that preceded a LOAD lane must be disjoint from it, because the one vector load now
+runs before the one vector store. Blocks go in index order, seeds by their first store, the
+function is rescanned after every pack (64 packs at most; functions above 6000 instructions are
+skipped).
 `WUKONG_NO_SLP` (presence) turns it off — read inside `slp_program`, so `optimize`, the verified and
 timed paths and the `wukong_bench compile-work` replica all honour it — and `WUKONG_SLP_TRACE=1`
 prints `slp: PACK bb<N> ty=<T> w=<W> nodes=<n> cost=<V>/<S>` or `slp: declined bb<N>: <reason>`

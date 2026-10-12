@@ -71,7 +71,8 @@ load-bearing.
   whose values share one lane-wise operation tree become one 128-bit vector store over vector
   loads, splats and lane builds. It moves the chunk's stores and loads down to its last store, so
   every access they pass must be proved disjoint (`AliasInfo::may_alias_sized`), a call must find
-  them call-proof, and a barrier declines. Packed functions get the same reduced cleanup.
+  them call-proof, an `atomic.add` must find them call-proof and disjoint from its location, and a
+  barrier declines. Packed functions get the same reduced cleanup.
   `WUKONG_NO_SLP` turns it off; `WUKONG_SLP_TRACE=1` prints each decision. A program autodiff will
   differentiate is optimized with `OptimizeOptions::AUTODIFF_INPUT` (`optimize_preserving_with` /
   `optimize_verified_preserving_with`), which skips it: autodiff has no VJP rule for a vector store.
