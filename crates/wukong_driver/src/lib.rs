@@ -168,6 +168,11 @@ pub struct Options {
     /// `--emit=obj|exe` and `--run --backend=native`; a level below x86-64-v3 also builds the MIR
     /// without the raw-AVX2 vector recipes (see [`lower_options_for`]).
     pub target_cpu: TargetCpu,
+    /// `-g`: an `--emit=obj|exe` artifact also carries DWARF — a line table for every function's
+    /// machine code and a compile unit with one subprogram per function (see
+    /// `wukong_codegen_cranelift::DebugInfo`). The machine code is the same either way; every
+    /// other stage ignores it, and so does `--train --emit=obj|exe`, whose loop is synthesized.
+    pub debug_info: bool,
     /// Autodiff / training options (see [`GradOptions`]). Only consulted by `--emit=grad` and
     /// `--train`; inert for every other stage.
     pub grad: GradOptions,
@@ -282,6 +287,7 @@ impl Default for Options {
             error_limit: None,
             backend: BackendKind::Interp,
             target_cpu: TargetCpu::Native,
+            debug_info: false,
             grad: GradOptions::default(),
             strict_fp: false,
             remarks_dispatch: false,
@@ -1674,27 +1680,32 @@ fn emit_native(
     } else {
         wukong_codegen_cranelift::ObjectKind::Executable
     };
-    let emitted = if timer.enabled() {
-        wukong_codegen_cranelift::emit_object_kind_timed_for_with(
-            program,
-            interner,
-            opts.target_cpu,
-            backend,
-            kind,
-        )
-        .map(|(bytes, split)| {
-            timer.object_split(&split);
-            bytes
-        })
-    } else {
-        wukong_codegen_cranelift::emit_object_kind_for_with(
-            program,
-            interner,
-            opts.target_cpu,
-            backend,
-            kind,
-        )
+    // `-g`: DWARF needs the source map that locates every span. `DW_AT_comp_dir` is the directory
+    // the compiler runs in, which relative file names (as typed) are resolved against.
+    let comp_dir = std::env::current_dir()
+        .map(|d| d.display().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+    let debug = match sm {
+        Some(sources) if opts.debug_info => Some(wukong_codegen_cranelift::DebugInfo {
+            sources,
+            comp_dir: &comp_dir,
+        }),
+        _ => None,
     };
+    let emitted = wukong_codegen_cranelift::emit_object_debug_for_with(
+        program,
+        interner,
+        opts.target_cpu,
+        backend,
+        kind,
+        debug.as_ref(),
+    )
+    .map(|(bytes, split)| {
+        if timer.enabled() {
+            timer.object_split(&split);
+        }
+        bytes
+    });
     let obj = match emitted {
         Ok(b) => b,
         Err(failure) => {
@@ -1754,7 +1765,7 @@ fn emit_native(
     // the Rust runtime staticlib). Output is bit-identical to `--run`. Falls back to `cc` only when
     // rustc or the runtime rlib is unavailable (a scalar, no-data, no-kernel program still links).
     timer.begin("link");
-    match rustc_link(scratch.as_ref(), &stem, &obj_path, &out) {
+    match rustc_link(scratch.as_ref(), &stem, &obj_path, &out, debug.is_some()) {
         LinkOutcome::Linked => {
             eprintln!("wrote {}", out.display());
             return exit::OK;
@@ -2290,12 +2301,14 @@ fn rlib_holds_bitcode_members(path: &Path) -> bool {
 /// `cc` path can do here. The runtime rlib is located by [`runtime_rlib_in`] from the directory
 /// holding this compiler binary, and `deps/` next to it goes on `-L dependency=` for the runtime's
 /// own dependencies. Returns [`LinkOutcome::Unavailable`] when rustc or the rlib is absent so the
-/// caller can try the `cc` fallback.
+/// caller can try the `cc` fallback. `debug` (`-g`) keeps the object's DWARF in the executable (see
+/// [`debug_link_args`]).
 fn rustc_link(
     scratch: Option<&ScratchDir>,
     stem: &str,
     obj_path: &Path,
     out: &Path,
+    debug: bool,
 ) -> LinkOutcome {
     use std::process::Command;
 
@@ -2339,6 +2352,11 @@ fn rustc_link(
     // binary. `lto=thin` + `opt-level=3` mirrors the workspace `[profile.release]` the rlib was
     // built under, so the kernels land in the exe exactly as that profile compiled them.
     let rustc = link_rustc();
+    let debug_args = if debug {
+        debug_link_args(&rustc)
+    } else {
+        Vec::new()
+    };
     let run = try_runtime_rlibs(candidates, |rlib| {
         let bitcode_rlib = rlib_holds_bitcode_members(rlib);
         let mut cmd = Command::new(&rustc);
@@ -2362,6 +2380,7 @@ fn rustc_link(
         // arrives as one block at the end rather than streaming, and rustc now sees a pipe instead of a
         // terminal, so its diagnostics come through UNCOLOURED. The link is a single short-lived child
         // at the end of compilation, so neither is something the user can act on.
+        cmd.args(&debug_args);
         cmd.arg("--extern")
             .arg(format!("wukong_runtime={}", rlib.display()))
             .arg("-L")
@@ -2440,6 +2459,45 @@ fn rustc_link(
 /// binary working; the
 /// E0514 note in [`rustc_link`] names the resolved path either way, so the failure is legible in
 /// both worlds.
+/// The extra `rustc` arguments a `-g` executable links with, so the object's DWARF reaches the
+/// executable intact:
+///
+/// * `-C strip=none` — never let a default strip the debug sections.
+/// * On an MSVC host, link with the toolchain's own `rust-lld` as `lld-link` and `/debug:dwarf`.
+///   `link.exe` keeps unknown sections but truncates their names to eight characters in the
+///   image (`.debug_line` becomes `.debug_l`), so no debugger finds the line table; `lld-link`
+///   keeps the full names (in the COFF string table, as MinGW `ld` does), which gdb and lldb read.
+///   Without a `rust-lld` beside rustc the link goes ahead with `link.exe`, with a warning.
+fn debug_link_args(rustc: &Path) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec!["-C".into(), "strip=none".into()];
+    if cfg!(target_env = "msvc") {
+        // `<sysroot>/lib/rustlib/<host>/lib` -> `<sysroot>/lib/rustlib/<host>/bin/rust-lld.exe`.
+        let lld = std::process::Command::new(rustc)
+            .args(["--print", "target-libdir"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| {
+                let libdir = PathBuf::from(String::from_utf8_lossy(&o.stdout).trim());
+                let lld = libdir.parent()?.join("bin").join("rust-lld.exe");
+                lld.is_file().then_some(lld)
+            });
+        match lld {
+            Some(lld) => {
+                args.extend(["-C".into(), "linker-flavor=lld-link".into(), "-C".into()]);
+                let mut linker = std::ffi::OsString::from("linker=");
+                linker.push(lld.as_os_str());
+                args.push(linker);
+                args.extend(["-C".into(), "link-arg=/debug:dwarf".into()]);
+            }
+            None => eprint_line(
+                "warning: `-g`: no `rust-lld` beside `rustc`, so the executable is linked by                  `link.exe`, which truncates the DWARF section names (debuggers will not find the                  line table); the `--emit=obj` object carries it intact",
+            ),
+        }
+    }
+    args
+}
+
 fn link_rustc() -> PathBuf {
     match option_env!("WUKONG_BUILD_RUSTC") {
         Some(p) if !p.is_empty() && Path::new(p).is_file() => PathBuf::from(p),

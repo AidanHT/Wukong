@@ -41,8 +41,15 @@ and a failure inside one function points at the source construct being lowered (
 symbol, an unsupported target CPU) has no span. Every MIR value is located straight out of lowering,
 inlining and unrolling carry locations onto the values they copy, and values other passes create
 stay unknown (about 75% of the corpus's instructions are still located at `-O2`); Cranelift's
-per-instruction source locations follow the table and drop, never borrow, an unknown one. A DWARF
-line table built from them is not emitted yet.
+per-instruction source locations follow the table and drop, never borrow, an unknown one. `-g`
+turns them into DWARF in `--emit=obj|exe` (COFF and ELF): a line table (`file:line:column` per
+machine-code range; an unlocated range continues the row before it), one subprogram per function,
+and `.debug_frame` call frames, so gdb breaks by function or line, steps by line and backtraces
+through every Wukong frame; the machine code is byte-identical with and without it. On Windows a
+`-g` executable links with `rust-lld` (`/debug:dwarf`), because `link.exe` truncates the section
+names. Sharp edges: no variables, types or inlined-subroutine entries (a debugger cannot print a
+local), no DWARF in `--train --emit=obj|exe` artifacts, no Mach-O. `WUKONG_PERF_MAP=1` makes the
+native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JIT samples.
 
 - **Multi-file modules with real namespaces**: `import a.b` loads `a/b.wk` (resolved against the
   *root* source file's directory); files load once each — an import cycle or diamond dedups by

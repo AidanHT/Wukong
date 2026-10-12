@@ -644,8 +644,8 @@ that value was lowered just before it; a terminator carries its condition, scrut
 value. Everything else — an unlocated value's code, the head of a block, a call that reads nothing
 just lowered — carries the default (unknown) `SourceLoc`: a location is dropped, never borrowed from
 a neighbour. A machine-code range therefore maps back to a span through `Function::value_loc` — the
-input a DWARF line table needs (not emitted yet) — and a backend failure is reported at the span of
-the value being lowered, else at the function's declaration. Locations never change code: the
+input of the `-g` line table ("Debug info and the JIT perf map" below) — and a backend failure is
+reported at the span of the value being lowered, else at the function's declaration. Locations never change code: the
 object bytes with and without the table are pinned equal. The interpreter and the printer ignore
 the table, so `--emit=mir` is unchanged by it.
 
@@ -1271,6 +1271,78 @@ own temp directory, so a relative `-o hello.exe` fails with `LNK1181: cannot ope
 'hello.<crate>…rcgu.o.rcgu.o'`. Nothing here touches the debug path: a native rlib links exactly as
 before, with neither flag. The cost is confined to release AOT, where the link is a whole LTO of the
 runtime and std — tens of seconds per executable rather than under a second.
+
+### Debug info (`-g`) and the JIT perf map
+
+Both consume one record, `debuginfo::CodeLog`, that `populate_module` fills only when asked: each
+defined function's `FuncId`, origin (a user function, a raw-AVX2 vector kernel, or an executable's
+entry thunk and C `main`), machine-code size and, for `-g`, its sorted srcloc ranges and Cranelift's
+System V unwind information (`TargetIsa::emit_unwind_info`). It is read from the finished
+`CompiledCode` after `define_function` (or on the parallel codegen worker, then recorded in source
+order), so it changes no emitted byte: a plain object is byte-identical to one built without the
+log, and a `-g` object's `.text` is the plain one's (`dwarf_tests`, COFF and ELF, serial and
+parallel, `-O0` and `-O2`).
+
+**DWARF.** `emit_object_debug_for_with(.., Some(&DebugInfo { sources, comp_dir }))` — what the
+driver calls for `--emit=obj|exe -g`, with the source map it keeps on native paths and the current
+directory — finishes the `ObjectModule`, then `debuginfo::attach_dwarf` builds one DWARF 4 compile
+unit with `gimli::write` and adds `.debug_info`, `.debug_abbrev`, `.debug_line`, `.debug_str`,
+`.debug_ranges` and `.debug_frame` to the `ObjectProduct`, each gimli relocation becoming an object
+relocation: an address against the function's symbol (`R_X86_64_64` / `IMAGE_REL_AMD64_ADDR64`), a
+section offset against the target debug section's symbol (`R_X86_64_32` /
+`IMAGE_REL_AMD64_SECREL`). The compile unit names the root file and `DW_AT_comp_dir`, a vendor
+language code (`DW_LANG_WUKONG = 0x8057`: a debugger runs it as its minimal language), and
+`DW_AT_ranges` over the functions. Each user function and vector kernel is a `DW_TAG_subprogram`
+with its **source** name — not the `_WK<len><name>` symbol of an executable, since a debugger names
+a function by `DW_AT_linkage_name` when it has one and then `break f` finds nothing — its declaration
+file and line, `low_pc`/`high_pc`, and `DW_AT_external` for an exported symbol; a vector kernel is
+`DW_AT_artificial`. The entry thunk and the C `main` get call frames but no subprogram, so `main`
+names one function, the user's. Each user function is one line-program sequence: offset 0 is the
+declaration line; each srcloc range whose `ValueId` is located starts a row at its line and column
+(the first one `prologue_end`, identical neighbours merged, two rows at one address resolved to the
+later); a range with no location continues the row before it, so no address has line 0; an inlined
+callee's code keeps the callee's lines. A file joins the line program's file table on first use,
+split at its last `/` or `\` into a directory entry and a name, so a multi-file program's table
+names every file it reads. `.debug_frame` has one CIE (`TargetIsa::create_systemv_cie`) and one FDE
+per function Cranelift compiled; the System V rules describe the hardware frame, so they serve a
+fastcall function on Windows as well, where the object carries no `.pdata`. Everything is built in
+program order with insertion-ordered tables, so a `-g` object is deterministic
+(`crates/wukongc/tests/determinism.rs`). ELF and COFF only: any other object format is an error.
+
+`-g` executables need their linker to keep the sections. On the MSVC host `link.exe` copies them
+but truncates section names to eight characters in the image (`.debug_line` becomes `.debug_l`),
+which no debugger reads, so `rustc_link` adds `debug_link_args`: `-C strip=none` always, and on an
+MSVC host `-C linker-flavor=lld-link -C linker=<sysroot>/lib/rustlib/<host>/bin/rust-lld.exe -C
+link-arg=/debug:dwarf`, which keeps the full names in the COFF string table as MinGW `ld` does.
+Without a `rust-lld` the link goes ahead with `link.exe` and a warning. The `cc` fallback (GNU `ld`)
+keeps them as is. `--train --emit=obj|exe` artifacts carry no DWARF (their loop is synthesized and
+the source map is not threaded through `run_train`).
+
+What a debugger gets (MSYS2 gdb 15 on a `-g` executable): `break fib`, `break fib.wk:7`, `next` by
+line, `info frame` with the saved registers, and a backtrace `fib () at fib.wk:7` ← `fib () at
+fib.wk:10` ← `main () at fib.wk:14` ← `wukong_entry_thunk` ← the Rust runtime frames. Not emitted:
+variables, types, lexical scopes and inlined-subroutine entries, so it cannot print a local. gdb
+places a function breakpoint at the function's first instruction (the declaration line): it trusts
+a line table's prologue marks only from producers it knows.
+
+**Tests.** `dwarf_tests` builds objects on an ISA of each triple (`x86_64-pc-windows-msvc`,
+`x86_64-unknown-linux-gnu`) through `emit_object_for_isa`, so both containers are covered on any
+host; parses them with `object`; applies every relocation as a linker would; and decodes them with
+`gimli::read`. A fixture's lines are found by searching its text, never recorded from output. It
+checks: each subprogram at its symbol with the symbol's size; no overlap; the compile unit's ranges
+are exactly the subprograms; every sequence starts at a function, stays inside it and ends at its
+`high_pc`; each statement's line is present, and the row of `x * k` is at `x`'s column; every FDE
+covers exactly one function and at its first instruction `CFA = rsp + 8` and the return address is
+at `CFA - 8`. An optional cross-check runs GNU `objdump --dwarf=decodedline` when it exists.
+
+**Perf map.** `WUKONG_PERF_MAP=1` (exactly `1`) makes `jit_compile_entry` and `jit_module` keep a
+size-only `CodeLog` and, after `finalize_definitions`, append to `perf-<pid>.map` one
+`<start> <size> <name>` line per compiled user function and vector kernel — hex without `0x`, the
+format Linux `perf` reads for JIT code (`/tmp`, where perf looks, on Linux; `std::env::temp_dir()`
+elsewhere). Appends from concurrent compiles in one process are serialized and written in one call,
+so a process that JIT-compiles several programs lists them all. A write failure is a warning on
+stderr, never a failed run. `jit_perf_map_lists_every_function` checks the format, one line per
+function and kernel, no overlap, and `main` at the entry pointer.
 
 The only semantic bridges to stay identical to the interpreter: divide-by-zero yields 0, float→int
 casts saturate, and `i1` results are masked to their low bit. Two further contracts belong to the same

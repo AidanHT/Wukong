@@ -5,6 +5,57 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### DWARF for `-g` objects and executables, and a JIT perf map (`gap6/dwarf-perfmap`)
+
+- **`-g` puts DWARF in `--emit=obj|exe` (N70).** The object gains `.debug_info`, `.debug_abbrev`,
+  `.debug_line`, `.debug_str`, `.debug_ranges` and `.debug_frame`, relocated against the function
+  symbols and the debug sections, in COFF (Windows) and ELF (Linux) alike. One DWARF 4 compile
+  unit per object (the root file's name, `DW_AT_comp_dir`, producer `wukongc <version>`, a vendor
+  language code `0x8057`, `DW_AT_ranges` over every function) holds one `DW_TAG_subprogram` per
+  user function and vector kernel: its source name (never the `--emit=exe` mangled symbol, so
+  `break fib` finds `fib`), its declaration file and line, and `low_pc`/`high_pc`. The line
+  program maps every function's machine code to `file:line:column` through the per-instruction
+  source locations `gap5/native-source-locations` landed: the prologue is the declaration line,
+  each located range starts a row (the first marked `prologue_end`), code an optimizer pass
+  created without a location continues the row before it, and inlined code keeps its callee's
+  lines. `.debug_frame` carries an FDE for every Cranelift-compiled function, the executable's
+  entry thunk and C `main` included, from Cranelift's own unwind information, so a debugger
+  unwinds through every Wukong frame. With MSYS2 gdb 15 on a `-g` executable: `break fib`,
+  `break fib.wk:7`, `next` by source line, and a backtrace `fib () at fib.wk:7` ← `fib () at
+  fib.wk:10` ← `main () at fib.wk:14` ← `wukong_entry_thunk` ← the Rust runtime.
+- **The machine code does not change.** Without `-g` an object is byte-identical to before (nothing
+  is recorded); with it, `.text` is byte-identical to the plain object's (both pinned in
+  `crates/wukong_codegen_cranelift/src/dwarf_tests.rs`, on COFF and ELF, `-O0` and `-O2`, serial and
+  parallel codegen). A `-g` object is deterministic across processes and between the serial and
+  parallel codegen paths (`crates/wukongc/tests/determinism.rs`,
+  `debug_object_emission_is_deterministic_across_processes`).
+- **Read back, not just written.** `dwarf_tests` parses the object with the `object` crate,
+  relocates the debug sections as a linker would, decodes them with `gimli::read`, and checks a
+  fixture's functions against lines found in the fixture text: every row inside its function,
+  each statement's line present, a binary expression's row at its operand's column, every FDE over
+  exactly its function with the caller's frame (`CFA = rsp + 8`, return address at `CFA - 8`) at
+  its first instruction. When GNU `objdump` runs, its `--dwarf=decodedline` must show the same
+  lines (skipped when absent). Every `tests/run` program compiles with `-g` exactly when it
+  compiles without it, at `-O0` and `-O2`, and `objdump` decodes all 560 `-g -O2` objects cleanly.
+- **A `-g` executable keeps the DWARF.** On the MSVC host `link.exe` keeps unknown sections but
+  truncates their names to eight characters in the image (`.debug_line` → `.debug_l`), where no
+  debugger looks; a `-g` link therefore runs rustc with the toolchain's own `rust-lld` as `lld-link`
+  and `/debug:dwarf`, which keeps the full names (with a warning and the `link.exe` link when no
+  `rust-lld` is beside rustc). Every `-g` link adds `-C strip=none`. `crates/wukongc/tests/exe.rs`
+  (`debug_info_exe_runs_and_keeps_its_dwarf`) runs a `-g` executable at `-O0` and `-O2` against
+  the `--run` oracle and finds its `.debug_line`/`.debug_info` sections, producer and file name.
+- **`WUKONG_PERF_MAP=1`: a perf map for JIT code.** The native JIT (`--run --backend=native`, and
+  every `jit_compile*`/`jit_module` caller) appends one `<start> <size> <name>` line (hex, no `0x`)
+  per compiled function and raw-AVX2 vector kernel to `perf-<pid>.map` in `/tmp` on Linux, where
+  `perf report` looks, and in `std::env::temp_dir()` elsewhere. Off by default; writing changes no
+  code, and a write failure warns without failing the run. A test checks the format, one line per
+  function and kernel, no overlap, and `main` at the entry pointer, at `-O0` and `-O2`.
+- **Not covered:** variables, types, scopes and inlined-subroutine entries (a debugger cannot print
+  a local); `--train --emit=obj|exe` artifacts (their loop is synthesized; `-g` is ignored there);
+  Mach-O. `-g` with any other stage is accepted and has no effect. Dependency: `gimli` 0.32.3, the
+  version and features `cranelift-codegen` already locks, is now a direct dependency of
+  `wukong_codegen_cranelift` (no new crate is downloaded).
+
 ### Source locations through MIR into native code (`gap5/native-source-locations`)
 
 - **Native-backend failures point at the source (P11.8).** A `C0002` (a slot above the native

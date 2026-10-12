@@ -259,6 +259,14 @@ through `wukong_interp`, with no `Builder` code. Any future post-pipeline stage 
 `optimize_preserving` must become a `passes::Step` (see "Adding an optimizer pass"), or step 2 stops
 reproducing `-O2`.
 
+When only the native code misbehaves (a crash, or a wrong value the interpreter does not produce),
+build it with `-g` and use a debugger: `wukongc --emit=exe -g -O2 bug.wk -o bug.exe`, then
+`gdb bug.exe` breaks by function or `bug.wk:<line>`, steps by line and backtraces through every
+Wukong frame (`docs/internals.md`, "Debug info and the JIT perf map"); `-g` changes no machine code.
+A value a pass creates is attributed to a line only if the pass copies a location onto it
+(`Function::copy_value_loc`, as inlining and unrolling do); otherwise its code continues the line
+before it.
+
 ## Adding a language feature
 
 Prefer to land it end to end: parse → type/shape-check → lower → run via the interpreter, with a

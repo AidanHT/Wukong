@@ -38,6 +38,7 @@ wukongc --emit=mir --passes=mem2reg,simplify,dce examples/fib.wk  # a chosen pas
 wukongc --emit=mir-text --target-cpu=x86-64-v2 examples/fib.wk > fib.mir  # MIR that reads back
 wukongc --emit=mir -O2 fib.mir                       # optimize a MIR dump, no front end
 wukongc --emit=exe -O2 --target-cpu=x86-64 examples/fib.wk  # portable AOT executable
+wukongc --emit=exe -g examples/fib.wk && gdb fib.exe  # DWARF: break/step by line, backtraces
 ```
 
 `--run` defaults to the interpreter; add `--backend=native` for the Cranelift JIT. GPU backends
@@ -48,7 +49,11 @@ compile's time went, and `--depfile=<f>` writes a Make dependency rule over the 
 `--print-after=<pass>` prints the MIR to stderr after each run of a named pass (`docs/internals.md`,
 "Running a chosen pass list"). `--emit=mir-text` prints MIR with every type spelled out, and
 `wukongc --emit=mir|mir-text <file>.mir` reads it back, so an optimizer bug reproduces from a dump
-(`docs/internals.md`, "Typed textual MIR").
+(`docs/internals.md`, "Typed textual MIR"). `-g` puts DWARF in an `--emit=obj|exe` artifact — a
+line table from every function's machine code to `file:line:column`, a subprogram per function and
+call-frame information, with the machine code unchanged — so gdb or lldb can break, step and
+backtrace through Wukong code; `WUKONG_PERF_MAP=1` makes the native JIT write `perf-<pid>.map` for
+`perf` (`docs/internals.md`, "Debug info and the JIT perf map").
 
 ## Why Wukong
 
