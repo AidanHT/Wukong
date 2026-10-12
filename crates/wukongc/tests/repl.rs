@@ -414,6 +414,43 @@ sq(2.0)
     }
 }
 
+/// The optimizer compiles a session's program for the session's `--target-cpu`, as `compile` does.
+/// `kf`'s loop calls a helper, so the front end leaves it scalar, and at `-O2` the optimizer's
+/// vectorizer hands it to a 256-bit raw-AVX2 kernel when the 256-bit switch is on. Below
+/// x86-64-v3 the switch is off: a session that optimized with the switch hardwired on gave `kf` a
+/// kernel at `--target-cpu=x86-64-v2`, which the native JIT refused (`C0001`), so the call never
+/// ran. The values are the scalar loop's: `x[i] = (i % 61) / 4 - 4` and `o = 2x + 1/2`, so lane 0
+/// is `-7.5` and lane 4095 (`4095 % 61 = 8`) is `-3.5`.
+#[test]
+fn the_optimizer_takes_the_sessions_target_cpu() {
+    let transcript = "\
+fn axpb(v: f32, s: f32) -> f32 { return v * s + 0.5; }
+fn kf(x: []f32, mut o: []f32, s: f32, n: i64, d: i64) {
+    if d > 0 { kf(x, o, s, n, d - 1); return; }
+    let mut i: i64 = 0;
+    while i < n { o[i] = axpb(x[i], s); i = i + 1; }
+}
+let n: i64 = 4096;
+let mut x: []f32 = alloc_f32(n);
+let mut o: []f32 = alloc_f32(n);
+let mut i: i64 = 0;
+while i < n { x[i] = (i % 61) as f32 * 0.25 - 4.0; i = i + 1; }
+kf(x, o, 2.0, n, 0);
+o[0]
+o[4095]
+";
+    for mode in [
+        ["--backend=native", "-O2", "--target-cpu=x86-64-v2"],
+        ["--backend=interp", "-O2", "--target-cpu=x86-64-v2"],
+        ["--backend=native", "-O2", "--target-cpu=native"],
+    ] {
+        let (code, out, err) = repl(&mode, transcript);
+        assert_eq!(code, Some(0), "{mode:?}: {err}");
+        assert_eq!(out, "-7.5\n-3.5\n", "{mode:?}: {err}");
+        assert_eq!(err, "", "{mode:?}: a clean session reports nothing");
+    }
+}
+
 /// `--error-format=json` keeps the diagnostic stream one JSON object per line in a session too.
 #[test]
 fn json_diagnostics_stay_json() {

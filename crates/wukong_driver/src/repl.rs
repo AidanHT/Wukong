@@ -65,7 +65,8 @@ use wukong_types::{Scalar, Ty};
 
 use crate::{
     emit_diag, emit_diags, emit_driver_error, eprint_line, loader, lower_options_for,
-    native_failure_diag, prune, verify_or_ice, BackendKind, ErrorFormat, Options,
+    native_failure_diag, optimize_options_for, prune, verify_or_ice, BackendKind, ErrorFormat,
+    Options,
 };
 
 /// Written to the run's stdout and stderr between the replay and the new input: everything before
@@ -841,11 +842,12 @@ impl Session {
             let loc = sm.span_location(span);
             format!("{}:{}:{}", sm.name(id), loc.line, loc.col)
         };
+        let lower_opts = lower_options_for(&self.opts);
         let (mut program, lower_diags) = wukong_mir_build::lower_program_located(
             &module,
             &sema,
             &mut interner,
-            lower_options_for(&self.opts),
+            lower_opts,
             &locate,
         );
         drop(module);
@@ -863,11 +865,14 @@ impl Session {
 
         let main = interner.intern("main");
         prune::retain_reachable(&mut program, &[main]);
+        // The optimizer's 256-bit kernels follow the lowering's switch, as in `compile`: a
+        // hardwired `OptimizeOptions::FULL` gave a loop a raw-AVX2 kernel under
+        // `--target-cpu=x86-64-v2`, which the native JIT then refused.
         wukong_opt::optimize_preserving_with(
             &mut program,
             self.opts.opt_level,
             &[],
-            wukong_opt::OptimizeOptions::FULL,
+            optimize_options_for(&self.opts, &lower_opts),
         );
         if verify_or_ice(&program) {
             return None;
