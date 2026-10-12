@@ -275,6 +275,11 @@ All notable changes to Wukong are documented here. The format is loosely based o
   type or dimensions, so `first(|t| .., xs)` against `fn(Tensor[T, 4]) -> f32` or
   `fn(Tensor[f32, N]) -> f32` gave the closure parameter the callee's own `T` or `N`, which then
   leaked into the lifted function's non-generic signature. It is `E0419` now.
+- **Fixed at integration: a closure with a `str` parameter or return type stopped the compiler.**
+  `str`'s publish-time erasure to `[]u8` predated closures and skipped their recorded types, from
+  which the lifted function's signature is built, so `apply_s(|t| t.len() + k, s)` against
+  `fn(str) -> i64` reached lowering with a raw `str` (an internal error on every backend). The
+  closure record is erased too (`tests/run/closure_str.wk`).
 
 ### Type-lowering soundness (`gap4/sema-soundness`)
 
