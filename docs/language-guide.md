@@ -2588,6 +2588,10 @@ wukongc [OPTIONS] -e <source>    the program is the <source> argument itself
                       <stem>.o for objects; executables get <stem>.exe on Windows and plain <stem>
                       on unix). Rejected with --run and with every other stage, which print their
                       artifact on stdout — redirect instead.
+-g                    put DWARF debug info in an --emit=obj/exe artifact: a line table from every
+                      function's machine code to file:line:column, a subprogram per function and
+                      call frames; the machine code is unchanged. Other stages and --train ignore
+                      it. (WUKONG_PERF_MAP=1 makes --backend=native write perf-<pid>.map for perf)
 --verify-each         verify MIR after every optimizer pass (also in release builds)
 --time-passes         print per-stage compile times to stderr when the compile ends, with the
                       optimizer's per-pass and Cranelift's codegen/object-write splits and a MIR
@@ -2621,6 +2625,16 @@ kernel.wk` runs the front end (lex, parse, imports, sema, then the lints) and st
 lowering — the fast loop for an editor or `--error-format=json` consumer, with no `C0001` lowering
 limits in the way. `--run` and `--emit=<stage>` cannot be combined; pick one. A usage error prints `error: <msg>` plus the
 usage text on stderr and exits **2**.
+
+**✅ Debugging native code:** `wukongc --emit=exe -g prog.wk` (or `--emit=obj -g`) adds DWARF: a
+line table mapping each function's machine code to `file:line:column`, one subprogram per function
+under its source name, and call-frame information. gdb or lldb can then `break fib`, `break
+prog.wk:7`, step by line and print a backtrace with a source line in every Wukong frame, at any
+`-O` level (optimized code maps to the lines its instructions came from; inlined code to its
+callee's). The machine code is the same with and without `-g`. Locals, types and scopes are not
+described yet, so a debugger cannot print a variable. For profiling the JIT,
+`WUKONG_PERF_MAP=1 wukongc --run --backend=native prog.wk` writes `perf-<pid>.map`, which Linux
+`perf report` uses to name samples in JIT-compiled functions.
 
 Diagnostics render rustc-style: a label in another file gets its own `::: file:line:col` header, and
 a diagnostic may carry a `help:` suggestion (a concrete replacement). `--error-format=json` emits

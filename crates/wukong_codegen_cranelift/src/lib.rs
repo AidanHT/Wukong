@@ -51,6 +51,11 @@ mod ml_rt;
 // The runtime entries of the text builtins (the per-type scalar printers), the same way.
 mod text_rt;
 
+// Where each function's machine code went: the DWARF of a `-g` object and the JIT's perf map
+// (`WUKONG_PERF_MAP=1`).
+mod debuginfo;
+pub use debuginfo::{DebugInfo, DW_LANG_WUKONG};
+
 // The AOT entry contract (a synthesized C `main` on a big-stack worker) and the object's symbol
 // policy (internal, mangled user functions in an executable).
 mod entry;
@@ -3473,6 +3478,7 @@ fn populate_module<M: Module>(
     interner: &Interner,
     parallel: bool,
     mode: entry::SymbolMode,
+    mut log: Option<&mut debuginfo::CodeLog>,
 ) -> Result<HashMap<Symbol, FuncId>, NativeFailure> {
     // Compact boolean-vector casts are legalized per function inside `build_function_clif`.
     let asserting = asserting_functions(program, interner);
@@ -4546,6 +4552,14 @@ fn populate_module<M: Module>(
             module
                 .define_function_bytes(id, 16, &bytes, &[])
                 .map_err(|e| format!("cranelift define vec kernel {fi}.{ki}: {e:?}"))?;
+            if let Some(log) = log.as_deref_mut() {
+                let extent = debuginfo::Extent {
+                    size: bytes.len() as u32,
+                    srclocs: Vec::new(),
+                    cfi: None,
+                };
+                log.record(id, debuginfo::CodeOrigin::VecKernel(fi, ki), extent);
+            }
             per_fn.push(id);
         }
         kernel_ids.push(per_fn);
@@ -4564,6 +4578,7 @@ fn populate_module<M: Module>(
             &kernel_ids,
             &asserting,
             captures.as_ref(),
+            log.as_deref_mut(),
         )?;
     } else {
         define_functions_serial(
@@ -4578,10 +4593,11 @@ fn populate_module<M: Module>(
             &kernel_ids,
             &asserting,
             captures.as_ref(),
+            log.as_deref_mut(),
         )?;
     }
     if let Some(main) = entry_name {
-        entry::define_entry(module, ids[&main], ptr_ty, call_conv)?;
+        entry::define_entry(module, ids[&main], ptr_ty, call_conv, log)?;
     }
     for e in &program.externs {
         ids.remove(&e.name);
@@ -4816,6 +4832,7 @@ fn define_functions_serial<M: Module>(
     kernel_ids: &[Vec<FuncId>],
     asserting: &HashSet<Symbol>,
     captures: Option<&wukong_opt::CaptureSummary>,
+    mut log: Option<&mut debuginfo::CodeLog>,
 ) -> Result<(), NativeFailure> {
     let mut ctx = module.make_context();
     let mut fbctx = FunctionBuilderContext::new();
@@ -4850,6 +4867,13 @@ fn define_functions_serial<M: Module>(
             .map_err(|e| at_decl(f, format!("cranelift define fn: {e:?}")))?;
         #[cfg(test)]
         srcloc_tests::capture(f.name, &ctx);
+        if let Some(log) = log.as_deref_mut() {
+            let code = ctx
+                .compiled_code()
+                .expect("a defined function has machine code");
+            let origin = debuginfo::CodeOrigin::User(fi);
+            log.record_compiled(ids[&f.name], origin, code, module.isa());
+        }
         module.clear_context(&mut ctx);
     }
     Ok(())
@@ -4874,14 +4898,27 @@ fn define_functions_parallel<M: Module>(
     kernel_ids: &[Vec<FuncId>],
     asserting: &HashSet<Symbol>,
     captures: Option<&wukong_opt::CaptureSummary>,
+    mut log: Option<&mut debuginfo::CodeLog>,
 ) -> Result<(), NativeFailure> {
     use cranelift_module::ModuleReloc;
     use rayon::prelude::*;
 
+    // What each worker reports for the code log (`None`: nothing is being logged); `Some(true)`
+    // also takes the srcloc ranges and the call-frame information.
+    let want_log = log.as_deref().map(|l| l.srclocs);
     // Each worker owns its FunctionBuilderContext + Cranelift Context; `Decls` and the ISA are shared
     // immutable borrows of the module (both `Sync`). Produces owned bytes + relocs so nothing borrows
     // the module past the parallel region.
-    let compiled: Vec<(FuncId, u64, Vec<u8>, Vec<ModuleReloc>)> = {
+    // One worker's output: the function, its alignment, bytes and relocations, and what the code
+    // log records of it.
+    type Compiled = (
+        FuncId,
+        u64,
+        Vec<u8>,
+        Vec<ModuleReloc>,
+        Option<debuginfo::Extent>,
+    );
+    let compiled: Vec<Compiled> = {
         let decls = Decls {
             d: module.declarations(),
             asserting,
@@ -4938,7 +4975,9 @@ fn define_functions_parallel<M: Module>(
                         .iter()
                         .map(|r| ModuleReloc::from_mach_reloc(r, &ctx.func, fid))
                         .collect();
-                    Ok((fid, alignment, bytes, relocs))
+                    let extent =
+                        want_log.map(|full| debuginfo::compiled_extent(cc, full.then_some(isa)));
+                    Ok((fid, alignment, bytes, relocs, extent))
                 },
             )
             // Collect the per-function `Result`s **positionally**, then take the first `Err` in
@@ -4954,10 +4993,15 @@ fn define_functions_parallel<M: Module>(
             .collect::<Result<Vec<_>, NativeFailure>>()?
     };
 
-    for ((fid, alignment, bytes, relocs), f) in compiled.into_iter().zip(&program.funcs) {
+    for (fi, ((fid, alignment, bytes, relocs, extent), f)) in
+        compiled.into_iter().zip(&program.funcs).enumerate()
+    {
         module
             .define_function_bytes(fid, alignment, &bytes, &relocs)
             .map_err(|e| at_decl(f, format!("cranelift define fn bytes: {e:?}")))?;
+        if let (Some(log), Some(extent)) = (log.as_deref_mut(), extent) {
+            log.record(fid, debuginfo::CodeOrigin::User(fi), extent);
+        }
     }
     Ok(())
 }
@@ -5196,6 +5240,31 @@ fn jit_compile_entry(
     target: TargetCpu,
     backend: BackendOpt,
     parallel: bool,
+) -> Result<JitProgram, NativeFailure> {
+    jit_compile_entry_mapped(
+        program,
+        entry,
+        interner,
+        buffer_dispatch,
+        target,
+        backend,
+        parallel,
+        debuginfo::perf_map::from_env().as_deref(),
+    )
+}
+
+/// [`jit_compile_entry`], appending a line per compiled function to the perf map `perf_map` (see
+/// [`debuginfo::perf_map`]) when it is `Some`.
+#[allow(clippy::too_many_arguments)]
+fn jit_compile_entry_mapped(
+    program: &Program,
+    entry: Symbol,
+    interner: &Interner,
+    buffer_dispatch: bool,
+    target: TargetCpu,
+    backend: BackendOpt,
+    parallel: bool,
+    perf_map: Option<&std::path::Path>,
 ) -> Result<JitProgram, NativeFailure> {
     use cranelift_jit::{JITBuilder, JITModule};
 
@@ -5732,14 +5801,19 @@ fn jit_compile_entry(
     bind_extern_symbols(&mut builder, program, interner)?;
     let mut module = JITModule::new(builder);
 
+    let mut log = perf_map.map(|_| debuginfo::CodeLog::new(false));
     let ids = populate_module(
         &mut module,
         program,
         interner,
         parallel,
         entry::SymbolMode::Jit,
+        log.as_mut(),
     )?;
     module.finalize_definitions().map_err(|e| e.to_string())?;
+    if let (Some(path), Some(log)) = (perf_map, &log) {
+        write_perf_map(&module, log, program, interner, path);
+    }
 
     let entry_fn = program
         .function(entry)
@@ -5772,6 +5846,35 @@ fn jit_compile_entry(
         code,
         ret: entry_fn.ret.clone(),
     })
+}
+
+/// Append one perf-map line per function `log` recorded, at its finalized address in `module`. The
+/// map is a profiling aid: failing to write it warns and never fails the compile.
+fn write_perf_map(
+    module: &cranelift_jit::JITModule,
+    log: &debuginfo::CodeLog,
+    program: &Program,
+    interner: &Interner,
+    path: &std::path::Path,
+) {
+    let entries: Vec<(usize, u32, String)> = log
+        .defined
+        .iter()
+        .map(|code| {
+            (
+                module.get_finalized_function(code.id) as usize,
+                code.size,
+                debuginfo::display_name(code, program, interner),
+            )
+        })
+        .collect();
+    if let Err(e) = debuginfo::perf_map::append(path, &entries) {
+        eprintln!(
+            "warning: could not write the perf map `{}` ({}=1): {e}",
+            path.display(),
+            debuginfo::perf_map::ENV
+        );
+    }
 }
 
 /// JIT-compile and execute `entry`, returning its exit code and captured stdout.
@@ -6376,14 +6479,20 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(RT_FMOD_F32, rt_fmod_f32 as *const u8);
     bind_extern_symbols(&mut builder, program, interner)?;
     let mut module = JITModule::new(builder);
+    let perf_map = debuginfo::perf_map::from_env();
+    let mut log = perf_map.as_ref().map(|_| debuginfo::CodeLog::new(false));
     let ids = populate_module(
         &mut module,
         program,
         interner,
         default_parallel(),
         entry::SymbolMode::Jit,
+        log.as_mut(),
     )?;
     module.finalize_definitions().map_err(|e| e.to_string())?;
+    if let (Some(path), Some(log)) = (&perf_map, &log) {
+        write_perf_map(&module, log, program, interner, path);
+    }
     Ok(JitModuleHandle {
         module: Some(module),
         ids,
@@ -6541,6 +6650,30 @@ pub fn emit_object_kind_timed_for_with(
     )
 }
 
+/// As [`emit_object_kind_timed_for_with`], and with `debug` (`-g`) the object also carries DWARF:
+/// a line table mapping every function's machine code to the source lines it was lowered from and
+/// a compile unit with one subprogram per function (see the `debuginfo` module). The machine code
+/// is the same with or without it; with `debug` `None` the object is byte-identical to
+/// [`emit_object_kind_timed_for_with`]'s. ELF and COFF targets only.
+pub fn emit_object_debug_for_with(
+    program: &Program,
+    interner: &Interner,
+    target: TargetCpu,
+    backend: BackendOpt,
+    kind: ObjectKind,
+    debug: Option<&DebugInfo<'_>>,
+) -> Result<(Vec<u8>, ObjTimings), NativeFailure> {
+    emit_object_debug_full(
+        program,
+        interner,
+        EmitOptions::production(),
+        target,
+        backend,
+        kind,
+        debug,
+    )
+}
+
 fn emit_object_ex(
     program: &Program,
     interner: &Interner,
@@ -6565,26 +6698,64 @@ fn emit_object_full(
     backend: BackendOpt,
     kind: ObjectKind,
 ) -> Result<(Vec<u8>, ObjTimings), NativeFailure> {
+    emit_object_debug_full(program, interner, opts, target, backend, kind, None)
+}
+
+/// [`emit_object_full`], with DWARF when `debug` is `Some` (`-g`). Without it the object is
+/// byte-identical to [`emit_object_full`]'s: nothing is recorded and nothing is added.
+fn emit_object_debug_full(
+    program: &Program,
+    interner: &Interner,
+    opts: EmitOptions,
+    target: TargetCpu,
+    backend: BackendOpt,
+    kind: ObjectKind,
+    debug: Option<&DebugInfo<'_>>,
+) -> Result<(Vec<u8>, ObjTimings), NativeFailure> {
+    target::check_vec_kernels(program, interner, target)?;
+    let t_cg = std::time::Instant::now();
+    let isa = make_isa_full(true, opts.verify, target, backend)?;
+    emit_object_for_isa(isa, program, interner, opts.parallel, kind, debug, t_cg)
+}
+
+/// The object for `program` on `isa` (whose triple picks the container: COFF on Windows, ELF on
+/// Linux), plus its DWARF when `debug` is `Some`. `t_cg` is when codegen timing started. Split out
+/// so the DWARF tests can build an ELF object on a Windows host, and the reverse.
+fn emit_object_for_isa(
+    isa: std::sync::Arc<dyn cranelift_codegen::isa::TargetIsa>,
+    program: &Program,
+    interner: &Interner,
+    parallel: bool,
+    kind: ObjectKind,
+    debug: Option<&DebugInfo<'_>>,
+    t_cg: std::time::Instant,
+) -> Result<(Vec<u8>, ObjTimings), NativeFailure> {
     use cranelift_object::{ObjectBuilder, ObjectModule};
     use std::time::Instant;
 
-    target::check_vec_kernels(program, interner, target)?;
-    let t_cg = Instant::now();
-    let isa = make_isa_full(true, opts.verify, target, backend)?;
-    let builder = ObjectBuilder::new(isa, "wukong", cranelift_module::default_libcall_names())
-        .map_err(|e| e.to_string())?;
+    let builder = ObjectBuilder::new(
+        isa.clone(),
+        "wukong",
+        cranelift_module::default_libcall_names(),
+    )
+    .map_err(|e| e.to_string())?;
     let mut module = ObjectModule::new(builder);
+    let mut log = debug.map(|_| debuginfo::CodeLog::new(true));
     populate_module(
         &mut module,
         program,
         interner,
-        opts.parallel,
+        parallel,
         entry::SymbolMode::Object(kind),
+        log.as_mut(),
     )?;
     let codegen = t_cg.elapsed();
 
     let t_ow = Instant::now();
-    let product = module.finish();
+    let mut product = module.finish();
+    if let (Some(debug), Some(log)) = (debug, &log) {
+        debuginfo::attach_dwarf(&mut product, &*isa, program, interner, log, debug)?;
+    }
     let bytes = product.emit().map_err(|e| e.to_string())?;
     let object_write = t_ow.elapsed();
 
@@ -6611,6 +6782,9 @@ mod error_tests;
 
 #[cfg(test)]
 mod srcloc_tests;
+
+#[cfg(test)]
+mod dwarf_tests;
 
 #[cfg(test)]
 mod target_tests;

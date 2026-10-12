@@ -35,6 +35,12 @@ cranelift-object = "0.124"
 # (wukong_runtime's @parallel). Kill-switch: WUKONG_PAR_CODEGEN=0.
 rayon = "1"
 
+# DWARF for `-g` objects (`debuginfo.rs`): `gimli::write` builds .debug_info/.debug_abbrev/
+# .debug_line/.debug_str/.debug_ranges with their relocations, and the tests read them back with
+# `gimli::read`. Pinned to the version cranelift-codegen already locks, with the same features, so
+# nothing new is downloaded or built.
+gimli = { version = "=0.32.3", default-features = false, features = ["read", "write", "std"] }
+
 # Correct-by-construction x86-64 encoder for the P4 raw-AVX2 emitter (`avx2.rs`): the general
 # vectorizer's 256-bit path, which Cranelift's 128-bit CLIF vector ISA cannot legalize. `code_asm`
 # gives a labelled assembler (VEX/ModRM/branch fixups handled) so the differential gate only has to

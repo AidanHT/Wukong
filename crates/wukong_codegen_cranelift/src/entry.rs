@@ -117,13 +117,15 @@ pub(crate) fn entry_function<'p>(
 }
 
 /// Define the entry thunk and the exported C `main` that hands it to [`RT_RUN_MAIN`]. `user_id` is
-/// the (already defined) user `main`.
+/// the (already defined) user `main`. Both are recorded in `log` when one is kept (`-g`).
 pub(crate) fn define_entry<M: Module>(
     module: &mut M,
     user_id: FuncId,
     ptr_ty: Type,
     call_conv: cranelift_codegen::isa::CallConv,
+    mut log: Option<&mut crate::debuginfo::CodeLog>,
 ) -> Result<(), String> {
+    use crate::debuginfo::CodeOrigin;
     let mut code_sig = Signature::new(call_conv);
     code_sig.returns.push(AbiParam::new(types::I32));
     let mut run_sig = Signature::new(call_conv);
@@ -160,6 +162,9 @@ pub(crate) fn define_entry<M: Module>(
     module
         .define_function(thunk_id, &mut ctx)
         .map_err(|e| format!("cranelift define entry thunk: {e:?}"))?;
+    if let (Some(log), Some(code)) = (log.as_deref_mut(), ctx.compiled_code()) {
+        log.record_compiled(thunk_id, CodeOrigin::Entry(ENTRY_THUNK), code, module.isa());
+    }
     module.clear_context(&mut ctx);
 
     // The C `main`: run the thunk on the runtime's big-stack worker and return its code.
@@ -180,6 +185,9 @@ pub(crate) fn define_entry<M: Module>(
     module
         .define_function(main_id, &mut ctx)
         .map_err(|e| format!("cranelift define C main: {e:?}"))?;
+    if let (Some(log), Some(code)) = (log, ctx.compiled_code()) {
+        log.record_compiled(main_id, CodeOrigin::Entry("main"), code, module.isa());
+    }
     module.clear_context(&mut ctx);
     Ok(())
 }

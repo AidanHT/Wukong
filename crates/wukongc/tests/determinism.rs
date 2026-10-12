@@ -19,6 +19,8 @@
 //!   `wukong_codegen_cranelift` compile several times inside ONE process, so all their emissions
 //!   share a single `RandomState` seed and cannot see this axis at all; they cover a different one
 //!   (parallel-vs-serial, verify-vs-noverify) and are still worth keeping.
+//! * [`debug_object_emission_is_deterministic_across_processes`] — `--emit=obj -O2 -g`, the DWARF
+//!   a `-g` object adds, on a representative slice (the largest programs and a multi-file import).
 //! * [`diagnostic_emission_is_deterministic_across_processes`] — the JSON diagnostic stream of the
 //!   compile-fail corpus. A `HashMap<Symbol, _>` in name resolution or the renderer would reorder
 //!   the errors a multi-error program reports; `fail.rs` only asserts that ONE expected code is
@@ -408,6 +410,108 @@ fn object_emission_is_deterministic_across_processes() {
         programs.len(),
         serial_subset.len()
     );
+}
+
+/// `--emit=obj -O2 -g -o <dst>` in a fresh process (see [`emit_obj_o2`]).
+fn emit_obj_o2_debug(path: &Path, dst: &Path, serial_codegen: bool) -> Option<Vec<u8>> {
+    let _ = std::fs::remove_file(dst);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_wukongc"));
+    if serial_codegen {
+        cmd.env("WUKONG_PAR_CODEGEN", "0");
+    }
+    let out = cmd
+        .arg("--emit=obj")
+        .arg("-O2")
+        .arg("-g")
+        .arg("-o")
+        .arg(dst)
+        .arg(path)
+        .output()
+        .expect("failed to spawn wukongc");
+    if !out.status.success() {
+        return None;
+    }
+    std::fs::read(dst).ok()
+}
+
+/// `-g` objects are a pure function of the input too: the DWARF (string table, file table, line
+/// program, relocations) is built in program order with insertion-ordered tables, so three fresh
+/// processes and the serial codegen path must agree byte for byte. A representative slice — the 24
+/// largest programs (the most functions and srcloc ranges) and the multi-file import fixture, whose
+/// line table names every file it reads — keeps the cost of a fourth corpus sweep off the gate.
+#[test]
+fn debug_object_emission_is_deterministic_across_processes() {
+    let programs = collect_programs();
+    let mut by_size: Vec<(u64, PathBuf)> = programs
+        .iter()
+        .map(|p| {
+            (
+                std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+                p.clone(),
+            )
+        })
+        .collect();
+    by_size.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let mut slice: Vec<PathBuf> = by_size.into_iter().take(24).map(|(_, p)| p).collect();
+    let multi = repo_dir("run").join("import_multi.wk");
+    slice.push(multi.clone());
+
+    let scratch = ScratchDir::new("obj_g");
+    let mut failures = Vec::new();
+    let mut compared = 0usize;
+    for p in &slice {
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        let plain = emit_obj_o2(p, &scratch.0.join("plain.o"), false);
+        let g = [
+            emit_obj_o2_debug(p, &scratch.0.join("a.o"), false),
+            emit_obj_o2_debug(p, &scratch.0.join("b.o"), false),
+            emit_obj_o2_debug(p, &scratch.0.join("c.o"), false),
+            emit_obj_o2_debug(p, &scratch.0.join("s.o"), true),
+        ];
+        match (plain, &g) {
+            (None, [None, None, None, None]) => continue, // does not lower to an object
+            (Some(plain), [Some(a), Some(b), Some(c), Some(s)]) => {
+                compared += 1;
+                if a != b || b != c {
+                    failures.push(format!(
+                        "{name}: `-g` object bytes differ between processes"
+                    ));
+                } else if a != s {
+                    failures.push(format!("{name}: `-g` serial and parallel objects differ"));
+                } else if a.len() <= plain.len() {
+                    failures.push(format!(
+                        "{name}: the `-g` object is no larger than the plain one"
+                    ));
+                } else if !a.windows(11).any(|w| w == b".debug_line") {
+                    failures.push(format!("{name}: the `-g` object has no .debug_line"));
+                }
+            }
+            _ => failures.push(format!("{name}: `-g` changed whether the program compiles")),
+        }
+    }
+    // The import fixture's line table names all three files it reads (DWARF 4 file names are
+    // inline strings of `.debug_line`).
+    let multi_g = emit_obj_o2_debug(&multi, &scratch.0.join("m.o"), false).expect("import_multi");
+    for file in ["import_multi.wk", "mathlib.wk", "deep.wk"] {
+        assert!(
+            multi_g.windows(file.len()).any(|w| w == file.as_bytes()),
+            "the `-g` object of import_multi.wk does not name `{file}`"
+        );
+    }
+    assert!(
+        failures.is_empty(),
+        "`--emit=obj -O2 -g` is not deterministic:
+{}",
+        failures.join(
+            "
+"
+        )
+    );
+    assert!(
+        compared >= 20,
+        "the `-g` determinism slice compared only {compared} programs"
+    );
+    eprintln!("debug object determinism: compared {compared} programs x3 processes + serial");
 }
 
 /// Diagnostic ORDER must be deterministic too: a multi-error program has to report its errors in

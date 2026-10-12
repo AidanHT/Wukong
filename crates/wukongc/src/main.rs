@@ -70,6 +70,12 @@ OPTIONS:
                        host lacks.
     -o <path>          Write the artifact to <path>. Only --emit=obj and --emit=exe write a
                        file; every other stage prints its artifact on stdout.
+    -g                 Put DWARF debug info in an --emit=obj/exe artifact: a line table mapping
+                       every function's machine code to its source file:line:column, and one
+                       subprogram per function. The machine code is unchanged; other stages and
+                       --train ignore it. (JIT profiling: WUKONG_PERF_MAP=1 makes
+                       --backend=native write perf-<pid>.map, one `<start> <size> <name>` per
+                       function, to /tmp on Linux and the temp directory elsewhere)
     -O0|-O1|-O2|-O3    Optimization level (default: -O0)
     --passes=<list>    Run exactly this comma-separated optimizer pass list instead of the -O
                        level's (-O still sets the native code generator's level); `--passes=`
@@ -469,6 +475,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                     .map_err(|e| format!("--print-after: {e}"))?;
                 opts.print_after = Some(pass.to_string());
             }
+            "-g" => opts.debug_info = true,
             "-O0" => opts.opt_level = 0,
             "-O1" => opts.opt_level = 1,
             "-O2" => opts.opt_level = 2,
@@ -1220,6 +1227,28 @@ mod tests {
         assert!(
             err.contains("pentium4") && err.contains("x86-64-v3"),
             "{err}"
+        );
+    }
+
+    /// `-g` is off by default and accepted with every stage (only obj/exe carry DWARF); USAGE
+    /// documents it and the JIT perf map's environment variable.
+    #[test]
+    fn debug_info_flag_parses_and_is_documented() {
+        let parse = |a: &[&str]| {
+            parse_args(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                .unwrap()
+                .unwrap()
+        };
+        assert!(!parse(&["in.wk"]).debug_info);
+        for stage in ["--emit=obj", "--emit=exe", "--emit=mir", "--run"] {
+            assert!(parse(&["-g", stage, "in.wk"]).debug_info, "{stage}");
+        }
+        let o = parse(&["--emit=obj", "-o", "x.o", "-O2", "-g", "in.wk"]);
+        assert!(o.debug_info && o.opt_level == 2);
+        assert!(USAGE.contains("    -g  "), "USAGE must document -g");
+        assert!(
+            USAGE.contains("WUKONG_PERF_MAP=1"),
+            "USAGE must name the perf map switch"
         );
     }
 }

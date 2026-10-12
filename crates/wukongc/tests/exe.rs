@@ -616,3 +616,80 @@ fn cc_fallback_discovered_from_the_cli_matches_run() {
     assert_eq!((oracle.0, oracle.1.as_str()), (Some(3), expected));
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// `-g` executables: the program runs exactly as without `-g` (the machine code is the same), at
+/// `-O0` and `-O2`, and the executable still holds the object's DWARF under its full section names
+/// (`.debug_line`, `.debug_info`), with the compile unit's producer and the source file name.
+#[test]
+fn debug_info_exe_runs_and_keeps_its_dwarf() {
+    let link = probe_link_path();
+    if link == LinkPath::None {
+        eprintln!(
+            "debug_info_exe_runs_and_keeps_its_dwarf: neither `rustc` + a `wukong_runtime` rlib \
+             nor a C compiler runs on this box - skipped"
+        );
+        return;
+    }
+    let tmp = std::env::temp_dir()
+        .join("wukong_exe_debug_info")
+        .join(std::process::id().to_string());
+    std::fs::create_dir_all(&tmp).expect("create debug-info scratch dir");
+    let src = tmp.join("dbg_prog.wk");
+    std::fs::write(
+        &src,
+        "fn tri(n: i32) -> i32 {
+    let mut s: i32 = 0;
+    for i in 1..n + 1 {
+        s = s + i;
+    }
+    return s;
+}
+
+fn main() -> i32 {
+    print(tri(10));
+    print(tri(4));
+    return 7;
+}
+",
+    )
+    .unwrap();
+    // Hand-derived: 1 + .. + 10 = 55, 1 + .. + 4 = 10.
+    let expected = (Some(7), "55\n10\n".to_string());
+    assert_eq!(run_interp(&src), expected, "the `--run` oracle");
+    for level in ["-O0", "-O2"] {
+        let exe = tmp.join(format!("dbg_prog{level}{}", std::env::consts::EXE_SUFFIX));
+        let built = outcome(
+            Command::new(env!("CARGO_BIN_EXE_wukongc"))
+                .current_dir(&tmp)
+                .arg("--emit=exe")
+                .arg("-g")
+                .arg(level)
+                .arg("-o")
+                .arg(&exe)
+                .arg(&src),
+        );
+        assert_eq!(
+            built.0,
+            Some(0),
+            "{level} ({link:?}): `-g` link failed:\n{}",
+            built.2
+        );
+        let ran = outcome(Command::new(&exe).current_dir(&tmp));
+        assert_eq!((ran.0, ran.1), expected.clone(), "{level}: {}", ran.2);
+        let bytes = std::fs::read(&exe).unwrap();
+        let has = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+        for needle in [
+            &b".debug_line\0"[..],
+            b".debug_info\0",
+            b"wukongc ",
+            b"dbg_prog.wk",
+        ] {
+            assert!(
+                has(needle),
+                "{level} ({link:?}): the `-g` executable lacks `{}`",
+                String::from_utf8_lossy(needle)
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
