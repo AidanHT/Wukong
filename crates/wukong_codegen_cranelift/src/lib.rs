@@ -253,9 +253,19 @@ extern "C" fn rt_print_str(ptr: *const u8) {
     emit_stdout(&line);
 }
 
-extern "C" fn rt_assert(cond: i64) {
+// `wukong_rt_assert(cond, site, message)`: the lowering passes the `assert` call's `.rodata`
+// `file:line:col` and its message literal, each null when the MIR call carried none. A failure is
+// recorded like a bounds failure; the generated code then returns through its callers.
+extern "C" fn rt_assert(cond: i64, site: *const u8, message: *const u8) {
     if cond == 0 {
-        record_failure(|| "assertion failed".to_owned());
+        // SAFETY: each is null or a NUL-terminated `.rodata` string the compiler emitted.
+        let (site, message) = unsafe {
+            (
+                wukong_runtime::site_str(site),
+                wukong_runtime::site_str(message),
+            )
+        };
+        record_failure(|| wukong_runtime::assert_failure_message(&site, &message));
     }
 }
 
@@ -305,9 +315,19 @@ extern "C" fn rt_bounds_fail_abort(index: i64, len: i64, site: *const u8) {
 // there, a failed assertion is fatal (Rust's `panic = "abort"`): a raw caller has no run handle a
 // failure could be reported through, and returning a dummy value would be a silent wrong answer.
 // The assertion lowering only calls this on its failure edge, so `cond` is always 0 in practice.
-extern "C" fn rt_assert_abort(cond: i64) {
+extern "C" fn rt_assert_abort(cond: i64, site: *const u8, message: *const u8) {
     if cond == 0 {
-        eprintln!("error: assertion failed");
+        // SAFETY: as in `rt_assert`.
+        let (site, message) = unsafe {
+            (
+                wukong_runtime::site_str(site),
+                wukong_runtime::site_str(message),
+            )
+        };
+        eprintln!(
+            "error: {}",
+            wukong_runtime::assert_failure_message(&site, &message)
+        );
         std::process::abort();
     }
 }
@@ -2074,7 +2094,7 @@ impl<'a> FnTranslator<'a> {
                 let status = self.runtime_ref(RT_ASSERT_FAILED);
                 let check = self.builder.ins().call(status, &[]);
                 let failed = self.builder.inst_results(check)[0];
-                self.return_on_assert_failure(failed, false);
+                self.return_on_assert_failure(failed, None);
             }
             return result;
         }
@@ -2093,7 +2113,7 @@ impl<'a> FnTranslator<'a> {
                 let status = self.runtime_ref(RT_ASSERT_FAILED);
                 let check = self.builder.ins().call(status, &[]);
                 let failed = self.builder.inst_results(check)[0];
-                self.return_on_assert_failure(failed, false);
+                self.return_on_assert_failure(failed, None);
             }
             return None;
         }
@@ -2557,7 +2577,7 @@ impl<'a> FnTranslator<'a> {
             let fref = self.runtime_ref(RT_BOUNDS_FAIL);
             self.builder.ins().call(fref, &[index, len, site]);
             let failed = self.builder.ins().iconst(types::I8, 1);
-            self.return_on_assert_failure(failed, false);
+            self.return_on_assert_failure(failed, None);
             return None;
         }
         // Every other failed run-time check: wukong_rt_check_fail(kind, a, b, site), the same
@@ -2570,7 +2590,7 @@ impl<'a> FnTranslator<'a> {
             let fref = self.runtime_ref(RT_CHECK_FAIL);
             self.builder.ins().call(fref, &[kind, a, b, site]);
             let failed = self.builder.ins().iconst(types::I8, 1);
-            self.return_on_assert_failure(failed, false);
+            self.return_on_assert_failure(failed, None);
             return None;
         }
         // The file-I/O intrinsics: wukong_rt_{read,write}_{f32,f64,i32,i64,i8,u8}(path, data, len) -> i64.
@@ -2839,7 +2859,7 @@ impl<'a> FnTranslator<'a> {
             let status = self.runtime_ref(RT_ASSERT_FAILED);
             let check = self.builder.ins().call(status, &[]);
             let stopped = self.builder.inst_results(check)[0];
-            self.return_on_assert_failure(stopped, false);
+            self.return_on_assert_failure(stopped, None);
             return None;
         }
         // The text builtins' entries (the `text_rt` table).
@@ -2920,6 +2940,10 @@ impl<'a> FnTranslator<'a> {
                 }
             }
             Intrinsic::Assert => {
+                // `assert(cond[, site[, message]])`: the operands after the condition are the
+                // `.rodata` strings the failure reports (`wukong_mir_build/src/bounds.rs`).
+                let site = args.get(1).map(|&a| self.val(a));
+                let message = args.get(2).map(|&a| self.val(a));
                 let failed = if let Some(&a) = args.first() {
                     let value = self.val(a);
                     let ty = self.dfg_ty(value);
@@ -2942,7 +2966,7 @@ impl<'a> FnTranslator<'a> {
                 } else {
                     self.builder.ins().iconst(types::I8, 1)
                 };
-                self.return_on_assert_failure(failed, true);
+                self.return_on_assert_failure(failed, Some([site, message]));
             }
         }
         None
@@ -2950,15 +2974,26 @@ impl<'a> FnTranslator<'a> {
 
     /// Return normally through generated callers; never unwind Rust through an extern-C frame.
     /// A caller checks the shared failure flag before it can observe the dummy return value.
-    fn return_on_assert_failure(&mut self, failed: Value, record: bool) {
+    /// `record` is `Some([site, message])` for a failed `assert`, which the stop block reports
+    /// through `wukong_rt_assert(0, site, message)` (a missing operand passes null); `None` when
+    /// the failure was already recorded by the call that raised it.
+    fn return_on_assert_failure(&mut self, failed: Value, record: Option<[Option<Value>; 2]>) {
         let stop = self.builder.create_block();
         let resume = self.builder.create_block();
         self.builder.ins().brif(failed, stop, &[], resume, &[]);
         self.builder.switch_to_block(stop);
-        if record {
+        if let Some(operands) = record {
             let zero = self.builder.ins().iconst(types::I64, 0);
+            let mut call_args = vec![zero];
+            for operand in operands {
+                let v = match operand {
+                    Some(v) => v,
+                    None => self.builder.ins().iconst(self.ptr_ty, 0),
+                };
+                call_args.push(v);
+            }
             let assert = self.runtime_ref(RT_ASSERT);
-            self.builder.ins().call(assert, &[zero]);
+            self.builder.ins().call(assert, &call_args);
         }
         match cl_type(&self.func.ret, self.ptr_ty) {
             None => {
@@ -3906,6 +3941,11 @@ fn populate_module<M: Module>(
         sig_check_fail.params.push(AbiParam::new(types::I64));
     }
     sig_check_fail.params.push(AbiParam::new(ptr_ty));
+    // wukong_rt_assert(cond: i64, site: ptr, message: ptr) -- either pointer may be null
+    let mut sig_assert = Signature::new(call_conv);
+    sig_assert.params.push(AbiParam::new(types::I64));
+    sig_assert.params.push(AbiParam::new(ptr_ty));
+    sig_assert.params.push(AbiParam::new(ptr_ty));
     let rt = RtFuncs {
         print_i64: module
             .declare_function(RT_PRINT_I64, Linkage::Import, &sig_i)
@@ -3920,7 +3960,7 @@ fn populate_module<M: Module>(
             .declare_function(RT_PRINT_STR, Linkage::Import, &sig_print_str)
             .map_err(|e| e.to_string())?,
         assert: module
-            .declare_function(RT_ASSERT, Linkage::Import, &sig_i)
+            .declare_function(RT_ASSERT, Linkage::Import, &sig_assert)
             .map_err(|e| e.to_string())?,
         assert_failed: module
             .declare_function(RT_ASSERT_FAILED, Linkage::Import, &sig_now_ns)

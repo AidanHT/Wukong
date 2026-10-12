@@ -542,7 +542,13 @@ runtime (`WUKONG_RT_C` in `crates/wukong_driver/src/lib.rs`); the interpreter, b
 the AOT link already route every kind through the one formatter. Pin the message with a `tests/run`
 fixture's `// EXPECT-STDERR:` lines, and fail it inside a helper function too, with output after the
 call, so the differential gate sees a caller that runs on. An element access keeps
-`wukong_rt_bounds_fail`, which `wukong_opt::bce` keys on. A new failure *entry* (a runtime function
+`wukong_rt_bounds_fail`, which `wukong_opt::bce` keys on. A check whose condition is already an
+`i1` and that needs no operands in its message can instead trap through the `assert` intrinsic with
+the construct's site, as the kernel builtins' extent checks do
+(`emit_builtin_checks(checks, span)`): build its operands with `assert_site_operands(span, None)`,
+which appends the site placeholder only when the lowering has a source locator. Either way, add a
+case for the new trap to `crates/wukongc/tests/runtime_sites.rs`, so its exact message is pinned on
+the interpreter, the JIT and a linked executable. A new failure *entry* (a runtime function
 that stops the run, rather than a new kind of the existing one) must also join
 `is_failure_intrinsic` in `crates/wukong_codegen_cranelift/src/lib.rs`: the JIT returns a failure
 through its callers, and a call is followed by a status poll only when the callee is known to be

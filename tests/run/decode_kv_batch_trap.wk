@@ -1,7 +1,8 @@
 // RUN: --run
 // EXPECT-EXIT: 1
 // EXPECT-OUT-NONE
-// EXPECT-STDERR: assertion failed
+// EXPECT-STDERR: assertion failed at
+// EXPECT-STDERR: decode_kv_batch_trap.wk:21:5
 module tests.run.decode_kv_batch_trap
 
 // `sdpa_kv_batch` is shape-checked like `matmul`: an operand whose length is only known at run
@@ -12,8 +13,9 @@ module tests.run.decode_kv_batch_trap
 // "long enough" is not enough, because the packed layout has no stride to absorb the slack - the
 // kernel would take sequence 1's cache to begin at element 1 * 4 * 1 * 4 = 16, which is row 4 of
 // sequence 0's region, and attend over the wrong keys without a sound. The lowering's exact-length
-// check traps instead (exit 1, `assertion failed`, nothing printed), on the interpreter and
-// natively alike, so the `print` after the second call never runs.
+// check traps instead (exit 1, nothing printed), on the interpreter and natively alike, so the
+// `print` after the second call never runs. The failure names the `sdpa_kv_batch` call inside
+// `attend` (line 21, column 5) as its site.
 
 fn attend(q: []f32, k: []f32, v: []f32, mut o: []f32, lens: []i32, pos: []i32, cap: i64) {
     sdpa_kv_batch::<2, 1, cap, 1, 1, 4>(q, k, v, o, lens, pos, 1.0, true);

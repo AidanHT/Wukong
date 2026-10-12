@@ -62,6 +62,7 @@
 //! [`PassManager::standard`].
 
 pub mod alias;
+mod assert_sites;
 mod bce;
 mod cache;
 mod cfg;
@@ -101,6 +102,7 @@ mod unswitch;
 pub use verify_each::{verify_program_stage, VerificationFailure};
 
 pub use alias::{type_bytes, AliasInfo, Prov};
+pub use assert_sites::strip_assert_sites;
 pub use bce::Bce;
 pub use cache::CfgAnalyses;
 pub use coalesce::{

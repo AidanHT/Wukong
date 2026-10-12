@@ -323,7 +323,7 @@ fn prints_and_asserts_use_the_aot_runtime_abi() {
         "declare void @wukong_rt_print_f32(float)",
         "declare void @wukong_rt_print_u64(i64)",
         "declare void @wukong_rt_print_str(ptr)",
-        "declare void @wukong_rt_assert(i64)",
+        "declare void @wukong_rt_assert(i64, ptr, ptr)",
     ] {
         assert!(text.contains(decl), "{decl}:\n{text}");
     }
@@ -350,6 +350,55 @@ fn prints_and_asserts_use_the_aot_runtime_abi() {
         !text.contains("@print(") && !text.contains("__wukong_print"),
         "{text}"
     );
+}
+
+/// `assert(cond, site, message)` passes the failure's two `.rodata` strings to
+/// `wukong_rt_assert`, and a call without them passes null in their place: the entry always takes
+/// three parameters, as in the Cranelift object and the link shims.
+#[test]
+fn assert_passes_its_site_and_message_or_null() {
+    let mut i = Interner::new();
+    let assert = i.intern("assert");
+    let (site, message) = (i.intern("wukong$loc$0"), i.intern("wukong$rodata$0"));
+    let mut b = Builder::new(i.intern("asserts"), MirType::Void);
+    let c = b.add_param(MirType::I1);
+    b.build_void(Op::Call {
+        func: assert,
+        args: vec![c],
+    });
+    let s = b.build(MirType::Ptr, Op::GlobalAddr(site));
+    b.build_void(Op::Call {
+        func: assert,
+        args: vec![c, s],
+    });
+    let m = b.build(MirType::Ptr, Op::GlobalAddr(message));
+    b.build_void(Op::Call {
+        func: assert,
+        args: vec![c, s, m],
+    });
+    b.ret(None);
+    let mut p = Program::new();
+    p.funcs.push(b.finish());
+    for (name, text) in [(site, "t.wk:2:5\0"), (message, "boom\0")] {
+        p.statics.push(wukong_mir::StaticData {
+            name,
+            bytes: text.as_bytes().to_vec(),
+        });
+    }
+    let text = try_emit_llvm_ir(&p, &i).expect("representable MIR");
+    assert!(
+        text.contains("declare void @wukong_rt_assert(i64, ptr, ptr)"),
+        "{text}"
+    );
+    let calls: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("call void @wukong_rt_assert("))
+        .collect();
+    assert_eq!(calls.len(), 3, "{text}");
+    assert!(calls[0].ends_with(", ptr null, ptr null)"), "{}", calls[0]);
+    assert!(calls[1].contains(", ptr %v1, ptr null)"), "{}", calls[1]);
+    assert!(calls[2].contains(", ptr %v1, ptr %v2)"), "{}", calls[2]);
 }
 
 #[test]
@@ -884,7 +933,10 @@ fn print_and_assert_lower_to_the_link_shim_abi() {
     ] {
         assert_eq!(
             shim.get(intrinsic.symbol()),
-            Some(&("void".to_string(), vec![intrinsic.param().to_string()])),
+            Some(&(
+                "void".to_string(),
+                intrinsic.params().iter().map(|p| p.to_string()).collect()
+            )),
             "{intrinsic:?}"
         );
     }

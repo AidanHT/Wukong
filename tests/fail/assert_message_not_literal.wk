@@ -1,0 +1,12 @@
+// EXPECT-CODE: E0437
+// EXPECT-COUNT: 1
+module tests.fail.assert_message_not_literal
+
+// The optional second argument of `assert` is the failure's message, printed after
+// `assertion failed:` and before the call's site. It must be a string literal, as `static_assert`'s
+// is: the message is baked into the program's read-only data, so a run-time value has nowhere to go.
+fn main() -> i32 {
+    let code: i32 = 7;
+    assert(code > 0, code); //~ E0437
+    return 0;
+}

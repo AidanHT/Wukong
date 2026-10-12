@@ -674,7 +674,22 @@ interpreter returns the message as its run error, the JIT records it and returns
 callers like a failed `assert` (both entries are `is_failure_intrinsic`s, so a caller of any
 function that can reach one polls the failure status after the call and stops; an entry missing
 from that list lets the caller run on), and a linked executable prints it and exits 1 (the `cc`
-fallback runtime carries C twins of both). `Op::VecKernelCall` — a call into a synthesized 256-bit
+fallback runtime carries C twins of both). A failed **`assert`** names its site the same way,
+without a failure edge of its own: with a source locator (`lower_program_located`) the intrinsic
+call is `assert(cond, site)`, or `assert(cond, site, message)` for `assert(cond, "message")` (the
+message is the literal's `.rodata` blob), and `attach_sites` rewrites the site placeholder at
+operand 1. Without a locator (`lower_program_with`, every test and the GPU device gates) a bare
+`assert(cond)` keeps its one-operand form. Every CPU path formats the failure with
+`wukong_runtime::assert_failure_message`: the interpreter's `assert` intrinsic, the JIT's
+`wukong_rt_assert(cond, site, message)` (null for a missing operand), the textual LLVM's
+declaration of the same three-parameter entry, and both link shims (Rust and `cc`). Two other
+checks trap through the same intrinsic and so name their site: a kernel builtin's run-time extent
+check (`emit_builtin_checks(checks, span)`, the builtin call) and the block a value `match` falls
+into when no arm matched (`emit_match_fallthrough_trap`, the `match`; its message is a
+compiler-made placeholder `attach_sites` turns into a blob, and the block keeps its
+`unreachable`). `--backend=gpu-native` keeps one device assert flag and declines a `GlobalAddr`, so
+the driver hands it a copy stripped of the site and message operands
+(`wukong_opt::strip_assert_sites`). `Op::VecKernelCall` — a call into a synthesized 256-bit
 AVX2 kernel — is covered under the vectorizer below.
 
 The front-end lowers in **clang style**: one `alloca` per local, with `load`/`store` on every use.

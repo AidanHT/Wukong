@@ -5,6 +5,42 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Runtime traps name their source site (`gap7/diag-locations`, N89)
+
+- **A failed `assert` names its site on every CPU backend.** It used to print a bare `assertion
+  failed` everywhere, while a slice index out of bounds already said where it happened. Now
+  `error: assertion failed at <file>:<line>:<col>` — the `assert` call's site — goes to stderr on
+  the interpreter, the native JIT (every `-O` level) and a linked `--emit=exe` executable (the
+  rustc link and the `cc` fallback alike), with the same exit status 1 and the same stdout. The
+  lowering appends the call's `.rodata` site to the intrinsic (`assert(cond, site)`), as a bounds
+  failure carries one, and every path formats it with `wukong_runtime::assert_failure_message`;
+  `wukong_rt_assert` is now `(cond, site, message)` in the JIT, the textual LLVM, the Rust link
+  shim and the C fallback. A linked executable's message gains the `error: ` prefix `--run`
+  always printed.
+- **Added: `assert(cond, "message")`.** An optional string-literal message prints after
+  `assertion failed:` and before the site (`tests/run/assert_message.wk`). Any other second
+  argument is `E0437` (`tests/fail/assert_message_not_literal.wk`), as for `static_assert`'s
+  message; any other argument count stays `E0503`.
+- **Every other runtime trap was audited for its site.** A kernel builtin's run-time extent check
+  and the decode builtins' geometry checks trap through `assert` and now name the builtin call
+  (`tests/run/builtin_extent_trap.wk`, `decode_shape_trap.wk`, `decode_kv_batch_trap.wk`). A slice
+  index, a range index (end and order) and `str_from_utf8` already named theirs. Integer division
+  and remainder by zero do not trap (they return 0). `crates/wukongc/tests/runtime_sites.rs` pins
+  the exact message of each on the interpreter and the JIT at `-O0` and `-O2` and in a linked
+  executable (on whichever link path the machine has; it never needs the `cc` fallback).
+- **Fixed: a value `match` no arm matched killed the native process.** A match sema cannot prove
+  exhaustive (a zero-filled `let e: E;` of an enum with no discriminant 0 reaches it) ended in a
+  bare `unreachable`: the interpreter reported `execution reached unreachable` with no site, and
+  the JIT and a linked executable executed a hardware trap (`SIGILL`) that killed the process with
+  its buffered output. It now stops like a failed `assert` on every CPU backend, keeping that
+  output: `assertion failed: no `match` arm matched its value at <the match's site>`, exit 1
+  (`tests/run/match_no_arm_trap.wk`).
+- **`--backend=gpu-native` is unchanged.** It keeps one assert-failed flag on the device, reports a
+  bare `assertion failed` and declines a `GlobalAddr`, so the driver hands it a copy of the program
+  stripped of the site and message operands (`wukong_opt::strip_assert_sites`). MIR lowered
+  without a source locator (`lower_program_with`, the GPU device gates) keeps the one-operand
+  `assert(cond)`.
+
 ### First-class 128-bit integers: `i128` and `u128` (`gap6/i128`, N25)
 
 - **Added: the `i128` and `u128` scalar types.** 16 bytes, 16-byte aligned, in every position a

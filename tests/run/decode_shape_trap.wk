@@ -1,7 +1,8 @@
 // RUN: --run
 // EXPECT-EXIT: 1
 // EXPECT-OUT-NONE
-// EXPECT-STDERR: assertion failed
+// EXPECT-STDERR: assertion failed at
+// EXPECT-STDERR: decode_shape_trap.wk:19:5
 module tests.run.decode_shape_trap
 
 // The decode builtins validate their shapes at run time against the operands' lengths, before
@@ -9,7 +10,7 @@ module tests.run.decode_shape_trap
 // `assertion failed`, nothing printed) on the interpreter and natively alike. `kv_append(cache,
 // row, pos, stride)` writes cache[pos*stride ..][..len(row)]: position 3 of a four-row cache fits,
 // position 4 would write eight f32 past the end of `kc`, so the second call traps and the `print`
-// after it never runs.
+// after it never runs. The failure names that second `kv_append` (line 19, column 5) as its site.
 
 fn main() -> i32 {
     let mut kc: [f32; 32] = [0.0; 32];

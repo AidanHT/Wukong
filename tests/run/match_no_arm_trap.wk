@@ -1,0 +1,41 @@
+// RUN: --run
+// EXPECT-EXIT: 1
+// EXPECT-OUT: 10
+// EXPECT-STDERR: assertion failed: no `match` arm matched its value at
+// EXPECT-STDERR: match_no_arm_trap.wk:28:13
+module tests.run.match_no_arm_trap
+
+// A value `match` sema cannot prove exhaustive keeps every arm's test, and a value no arm matches
+// stops the program, naming the `match`: `let unset: Level;` is zero-filled, and no variant of
+// `Level` has discriminant 0 (Low is 1, High is 2), so the second call's `match` takes no arm.
+//
+// * `weight(Level::Low)` matches the first arm and prints 10.
+// * `weight(unset)` falls through every arm: the run stops at the `match` on line 28 (column 13,
+//   after `    let w = `), so neither that `print` nor `print(99)` runs, and the exit status is 1.
+//
+// Stdout is therefore exactly 10 (derived from the statement order in `main`). The fall-through
+// used to end in a bare `unreachable`: the interpreter reported `execution reached unreachable`
+// with no site, and the native backend executed a hardware trap that killed the process (`SIGILL`)
+// with everything it had printed still buffered.
+
+enum Level {
+    Low = 1,
+    High = 2,
+}
+
+fn weight(l: Level) -> i32 {
+    // The `match` below is line 28.
+    let w = match l {
+        Level::Low => 10,
+        Level::High => 20,
+    };
+    return w;
+}
+
+fn main() -> i32 {
+    print(weight(Level::Low));
+    let unset: Level;
+    print(weight(unset));
+    print(99);
+    return 0;
+}

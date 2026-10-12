@@ -374,16 +374,18 @@ impl Intrinsic {
         }
     }
 
-    fn param(self) -> &'static str {
+    /// The runtime entry's parameter types. `wukong_rt_assert(cond, site, message)` takes the
+    /// condition and the two `.rodata` strings a failure reports, either of which may be null.
+    fn params(self) -> &'static [&'static str] {
         match self {
             Intrinsic::PrintInt
             | Intrinsic::PrintUint
             | Intrinsic::PrintBool
-            | Intrinsic::PrintChar
-            | Intrinsic::Assert => "i64",
-            Intrinsic::PrintFloat => "double",
-            Intrinsic::PrintF32 => "float",
-            Intrinsic::PrintStr => "ptr",
+            | Intrinsic::PrintChar => &["i64"],
+            Intrinsic::Assert => &["i64", "ptr", "ptr"],
+            Intrinsic::PrintFloat => &["double"],
+            Intrinsic::PrintF32 => &["float"],
+            Intrinsic::PrintStr => &["ptr"],
         }
     }
 }
@@ -582,7 +584,10 @@ fn declarations(
                             }
                             Some((
                                 intrinsic.symbol().to_owned(),
-                                ("void".into(), vec![intrinsic.param().into()]),
+                                (
+                                    "void".into(),
+                                    intrinsic.params().iter().map(|&p| p.into()).collect(),
+                                ),
                             ))
                         }
                         // A symbol `wukong_runtime` defines is declared with its definition's C
@@ -1761,7 +1766,13 @@ impl Emitter<'_> {
                         w
                     }
                 };
-                format!("i64 {ok}")
+                // `assert(cond[, site[, message]])`: the failure's `.rodata` strings, null when
+                // the call carried none (`wukong_mir_build/src/bounds.rs`).
+                let string = |i: usize| match args.get(i) {
+                    Some(&a) => format!("ptr {}", self.operand(a)),
+                    None => "ptr null".to_string(),
+                };
+                format!("i64 {ok}, {}, {}", string(1), string(2))
             }
             // An argument-less print lowers to nothing, as in the Cranelift backend.
             _ => {

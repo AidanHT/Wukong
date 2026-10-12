@@ -3,7 +3,8 @@
 // EXPECT-OUT: 1
 // EXPECT-OUT: 10
 // EXPECT-OUT: 20
-// EXPECT-STDERR: assertion failed
+// EXPECT-STDERR: assertion failed at
+// EXPECT-STDERR: assert_fail_trailing_output.wk:26:5
 module tests.run.assert_fail_trailing_output
 
 // A failed `assert` stops the program at the assertion — on the interpreter, the native JIT and a

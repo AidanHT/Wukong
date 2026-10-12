@@ -24,6 +24,27 @@ pub fn bounds_failure_message(index: i64, len: i64, site: &str) -> String {
     }
 }
 
+/// The diagnostic for a failed `assert(cond)` / `assert(cond, "message")`. `site` is the
+/// `file:line:col` of the `assert` call the compiler recorded and `message` the call's string
+/// literal; either may be empty, and each is left out of the text when it is. A kernel builtin's
+/// run-time extent check traps through the same intrinsic, so it reports the builtin call's site.
+///
+/// Every CPU execution path formats the failure here (the `cc` fallback runtime mirrors it in C):
+/// the interpreter returns it as its run error, the JIT records it as it records a bounds failure,
+/// and a linked executable's `wukong_rt_assert` prints `error: {message}` and exits 1.
+pub fn assert_failure_message(site: &str, message: &str) -> String {
+    let mut text = String::from("assertion failed");
+    if !message.is_empty() {
+        text.push_str(": ");
+        text.push_str(message);
+    }
+    if !site.is_empty() {
+        text.push_str(" at ");
+        text.push_str(site);
+    }
+    text
+}
+
 /// [`check_failure_message`] kind: a range index `s[lo..hi]` whose start is past its end
 /// (`a = lo`, `b = hi`).
 pub const CHECK_RANGE_ORDER: i64 = 1;
@@ -518,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn bounds_message_names_len_index_and_site() {
+    fn failure_messages_name_their_operands_and_site() {
         assert_eq!(
             bounds_failure_message(4, 4, ""),
             "index out of bounds: the len is 4 but the index is 4"
@@ -548,6 +569,19 @@ mod tests {
         assert_eq!(
             check_failure_message(CHECK_UTF8, fault(5, None), 6, "a.wk:3:1"),
             "str_from_utf8: incomplete utf-8 byte sequence from index 5 (the len is 6) at a.wk:3:1"
+        );
+        assert_eq!(assert_failure_message("", ""), "assertion failed");
+        assert_eq!(
+            assert_failure_message("main.wk:4:5", ""),
+            "assertion failed at main.wk:4:5"
+        );
+        assert_eq!(
+            assert_failure_message("main.wk:4:5", "n must be even"),
+            "assertion failed: n must be even at main.wk:4:5"
+        );
+        assert_eq!(
+            assert_failure_message("", "n must be even"),
+            "assertion failed: n must be even"
         );
         let site = b"a.wk:1:2\0";
         // SAFETY: `site` points at a NUL-terminated byte string valid for the call.

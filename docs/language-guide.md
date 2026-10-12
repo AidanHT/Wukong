@@ -997,7 +997,10 @@ The proof that lets the last arm go untested covers only values the analysis mod
 escapes it: a `let e: E;` with no initializer is zero-filled, so an `enum E { A = 1, B = 2 }` local
 holds discriminant 0, which no variant has. A match over a type whose all-zero value is not one the
 analysis models (such an enum, or a struct or tuple holding one) is therefore not *proven*: it keeps
-every test, and the forged value takes no arm (a value `match` traps there, as before).
+every test, and the forged value takes no arm. A value `match` then stops the program like a failed
+`assert`, naming the `match`: `error: assertion failed: no `match` arm matched its value at
+<file>:<line>:<col>`, exit 1, on every CPU backend (`tests/run/match_no_arm_trap.wk`; the native
+backend used to execute a hardware trap there, which killed the process).
 
 ## Tuples and structs ✅
 
@@ -1797,14 +1800,19 @@ lowers to PTX `.shared` SMEM and `sync_block()` to `bar.sync 0` (`wukong_codegen
   `tests/run/print_scalar_types.wk`, `tests/run/print_float_display.wk`,
   `tests/run/print_aggregate.wk`.
 - `println(x)` — alias of `print` (both already append the newline).
-- `assert(cond)` — stop the program at once if `cond` is false (zero); a no-op otherwise. Exactly
-  one argument (`E0503` otherwise). A float condition means `cond != 0.0`, so `assert(0.5)` passes.
-  A failed assertion means the same thing on every execution path: no statement after it runs (in
-  the failing function or any caller), everything printed before it stays on stdout, `assertion
-  failed` goes to stderr and the exit status is `1` — under `wukongc --run` on the interpreter and
-  on `--backend=native`, and in an `--emit=exe` executable. Inside a `@parallel` region the run
-  reports the failure of the earliest iteration that fails, as the in-order interpreter does. A
-  slice index out of bounds stops the program the same way.
+- `assert(cond)` / `assert(cond, "message")` — stop the program at once if `cond` is false (zero);
+  a no-op otherwise. A condition and an optional message, which must be a string literal (`E0503`
+  for any other argument count, `E0437` for a message that is not a literal). A float condition
+  means `cond != 0.0`, so `assert(0.5)` passes. A failed assertion means the same thing on every
+  execution path: no statement after it runs (in the failing function or any caller), everything
+  printed before it stays on stdout, `error: assertion failed at <file>:<line>:<col>` — the site of
+  the `assert` call — goes to stderr (`error: assertion failed: <message> at …` with a message),
+  and the exit status is `1` — under `wukongc --run` on the interpreter and on `--backend=native`,
+  and in an `--emit=exe` executable (`tests/run/assert_fail.wk`, `tests/run/assert_message.wk`,
+  `crates/wukongc/tests/runtime_sites.rs`). 🟡 `--backend=gpu-native` keeps one assert-failed flag
+  on the device and reports a bare `assertion failed`. Inside a `@parallel` region the run reports
+  the failure of the earliest iteration that fails, as the in-order interpreter does. A slice index
+  out of bounds stops the program the same way, naming its site too.
 - `now_ns()` — a zero-argument monotonic nanosecond clock returning `i64`, for in-process timing
   (`let t1 = now_ns(); … let dt = now_ns() - t1;`). Any argument is `E0503`. Only *differences* between
   reads are meaningful, so a program's stdout stays backend-identical.
@@ -1916,8 +1924,8 @@ What the lowering guarantees on top of the kernel call:
 - **Runtime extents are checked.** A runtime dimension must lie in `0..=i32::MAX`, and an operand
   whose length is only known at run time (a slice, or an array against a runtime dimension) must hold
   exactly its shape's elements (`sdpa`: at least `s·d`). A violation traps like a failed `assert`
-  (exit 1, `assertion failed`) instead of reading or writing past a buffer
-  (`tests/run/builtin_extent_trap.wk`). A constant extent the kernels' signed 64-bit ABI cannot
+  (exit 1, `assertion failed at` the builtin call's `file:line:col`) instead of reading or writing
+  past a buffer (`tests/run/builtin_extent_trap.wk`). A constant extent the kernels' signed 64-bit ABI cannot
   carry is the codegen limit `C0001` (`tests/fail/sdpa_dimension_abi.wk`).
 - **Value semantics.** A builtin reads its inputs as they were before the call, even when the output
   overlaps one: the call compares address ranges at run time and, on overlap, computes into scratch
@@ -1953,7 +1961,7 @@ or a padded batch of them), appending to the cache, and matrix-vector products o
 or block-quantized weights — are builtins too. Most of their shapes are *values* (lengths, head
 counts, strides), so each call is checked at run time against its operands' lengths before anything
 is read or written: a geometry that does not fit traps like a failed `assert` (exit 1, `assertion
-failed`) on every backend (`tests/run/decode_shape_trap.wk`). The batched attention `sdpa_kv_batch`
+failed at` the call's site) on every backend (`tests/run/decode_shape_trap.wk`). The batched attention `sdpa_kv_batch`
 has a real shape signature instead, checked at compile time (below). Operand kinds are checked at
 compile time with the usual codes: a wrong arity is `E0503`, and so is a turbofish — except
 `sdpa_kv_batch`'s, which is its list of six dimensions, where only a wrong count is `E0503`; a wrong

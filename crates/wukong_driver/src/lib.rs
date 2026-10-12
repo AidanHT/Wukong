@@ -1159,7 +1159,16 @@ pub fn compile(opts: &Options) -> i32 {
                 }
             }
             BackendKind::Gpu => split(run_on_gpu(&program, main, &interner)),
-            BackendKind::GpuLower => split(run_on_gpu_lower(&program, main, &interner)),
+            // The general MIR->PTX backend keeps one assert-failed flag on the device and reports a
+            // bare `assertion failed`; it never lowered the `.rodata` site and message operands the
+            // CPU backends report, and declines a `GlobalAddr`, so it runs a copy without them.
+            BackendKind::GpuLower => {
+                let mut device_program = program.clone();
+                if let Some(assert) = interner.get("assert") {
+                    wukong_opt::strip_assert_sites(&mut device_program, assert);
+                }
+                split(run_on_gpu_lower(&device_program, main, &interner))
+            }
         };
         {
             use std::io::Write;
@@ -1552,7 +1561,17 @@ void wukong_rt_print_str(const char *s) {
     fputs(s, stdout);
     fputc('\n', stdout);
 }
-void wukong_rt_assert(long long c) { if (!c) { fprintf(stderr, "assertion failed\n"); exit(1); } }
+/* A failed `assert`. Mirrors `wukong_runtime::assert_failure_message` byte for byte: the message
+   literal, then the `file:line:col` site, each left out when null or empty. */
+void wukong_rt_assert(long long c, const char* site, const char* msg) {
+    if (c) return;
+    fflush(stdout);
+    fprintf(stderr, "error: assertion failed");
+    if (msg && msg[0]) fprintf(stderr, ": %s", msg);
+    if (site && site[0]) fprintf(stderr, " at %s", site);
+    fprintf(stderr, "\n");
+    exit(1);
+}
 long long wukong_rt_assert_failed(void) { return 0; }
 /* A failed slice bounds check. Mirrors `wukong_runtime::bounds_failure_message` byte for byte, and
    exits with the status `wukongc --run` reports for a runtime failure. */
@@ -2319,9 +2338,13 @@ pub extern "C" fn wukong_rt_print_str(p: *const u8) {
     }
 }
 #[no_mangle]
-pub extern "C" fn wukong_rt_assert(c: i64) {
+pub extern "C" fn wukong_rt_assert(c: i64, site: *const u8, message: *const u8) {
     if c == 0 {
-        eprintln!("assertion failed");
+        // SAFETY: each is null or a NUL-terminated `.rodata` string the compiler emitted.
+        let (site, message) =
+            unsafe { (wukong_runtime::site_str(site), wukong_runtime::site_str(message)) };
+        let _ = std::io::stdout().flush();
+        eprintln!("error: {}", wukong_runtime::assert_failure_message(&site, &message));
         std::process::exit(1);
     }
 }
