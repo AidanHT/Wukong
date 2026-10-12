@@ -33,7 +33,8 @@ All notable changes to Wukong are documented here. The format is loosely based o
   one band `[k·C, k·C + C)` common to the buffer's accesses (`out[(h + 1)*8 + j]`), not only
   `[0, C)`; a buffer read at one band and written at another still declines.
 - No `_parallel` recognizer arm was added, so `wukong_autodiff/src/tape.rs` and
-  `wukong_interp::intrinsic` need no mirror; the recognizer census is unchanged. Unit tests:
+  `wukong_interp::intrinsic` need no mirror. No existing fixture gained or lost a dispatch in the
+  recognizer census; it gains only the two new fixtures' lines. Unit tests:
   `crates/wukong_mir_build/src/par_region_tests.rs` (every accept with its reject, and the corpus
   decline census by reason).
 
