@@ -53,8 +53,9 @@
 //! of them can be the same storage. A **place** (`x`, `x[i]`, `s.w`, `&x`, and the range index
 //! `s[a..b]`, which projects like `s[i]`) carries its root symbol and its projection chain, so
 //! `f(l.wq, l.wk)` — the ordinary transformer-weights spelling — stays provably disjoint while
-//! `f(x, x)` and `f(m, m[0])` do not. A **fresh** value (a struct/array/tuple literal, or a call
-//! returning an aggregate by the sret ABI, or `alloc_f32(n)`) is storage nobody else holds.
+//! `f(x, x)` and `f(m, m[0])` do not. A **fresh** value (a struct/array/tuple literal, a string
+//! literal's static bytes, or a call returning an aggregate by the sret ABI, or `alloc_f32(n)`) is
+//! storage nobody else holds.
 //! Anything else is **unknown** and aliases conservatively.
 //!
 //! The result propagates transitively to a fixpoint: if `g`'s params `i`/`j` may alias and `g` calls
@@ -480,6 +481,13 @@ fn origin_of(e: &Expr, sema: &SemaResult) -> Origin {
         | ExprKind::ArrayRepeat { .. }
         | ExprKind::StructLit { .. }
         | ExprKind::TupleLit(_) => Origin::Fresh,
+        // A string literal names static, read-only bytes: no buffer of the program is (or can
+        // become) them, so a `*u8` / `str` view of one publishes no second name. It used to fall to
+        // the `_` arm below -- `*u8` is a buffer param -- and taint: `let p: *u8 = "w.bin";`
+        // anywhere in a function cost every recognized kernel in it (measured: both
+        // `sgemm_nt_epi` of `tests/run/gemm_fused_bias_slice.wk`, and 6 `sgemm_nt_epi` + 2
+        // `velem_f32` of `examples/gpt2_infer.wk` once it named its checkpoint in a local).
+        ExprKind::Str(_) => Origin::Fresh,
         // A range index `s[a..b]` -- the parser's `$slice(s, a, b)` -- offsets its base's data
         // pointer and copies nothing (`strs::lower_range_slice`), so it is a place IN its base,
         // projected exactly like `s[i]` and just as index-value-blind. Reaching the call arm below

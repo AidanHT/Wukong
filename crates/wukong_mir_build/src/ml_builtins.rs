@@ -679,6 +679,45 @@ pub(crate) mod tests {
         assert_eq!(calls(&prog, &it, "wukong_rt_read_f32"), 0);
     }
 
+    /// A program that names its file in a `*u8` local keeps its kernels: the alias planner reads a
+    /// string literal as fresh storage. It used to taint the whole function (`let p: *u8 = …` is a
+    /// view binding whose initializer it could not classify), so the fused-bias GEMM below — and
+    /// every projection of `examples/gpt2_infer.wk` once it held its checkpoint path in a local —
+    /// fell back to the scalar loop.
+    #[test]
+    fn a_path_local_does_not_cost_the_functions_kernels() {
+        let nest = "fn main() -> i32 { \
+                    let mut a: []f32 = alloc_f32(15); \
+                    let mut w: []f32 = alloc_f32(64); \
+                    let mut b: []f32 = alloc_f32(4); \
+                    let mut c: []f32 = alloc_f32(12); \
+                    PATH \
+                    for i in 0..3 { for j in 0..4 { \
+                      let mut s: f32 = 0.0; \
+                      for p in 0..5 { s = s + a[i * 5 + p] * w[j * 5 + p]; } \
+                      c[i * 4 + j] = b[j] + s; \
+                    } } \
+                    free(a); free(w); free(b); free(c); return 0; }";
+        for (path, what) in [
+            ("", "no path"),
+            (
+                "let p: *u8 = \"w.bin\"; print(file_size(p));",
+                "a *u8 path local",
+            ),
+            (
+                "let mut q: [u8; 8] = [0; 8]; sprintf(q, \"w.bin\"); print(file_size(q));",
+                "a buffer path",
+            ),
+        ] {
+            let (sema, lower, prog, it) = check_and_lower(&nest.replace("PATH", path));
+            assert!(
+                sema.is_empty() && lower.is_empty(),
+                "{what}: {sema:?} {lower:?}"
+            );
+            assert_eq!(calls(&prog, &it, "wukong_sgemm_nt_epi"), 1, "{what}");
+        }
+    }
+
     /// Control: the same budget-spent module at `T = f32` lowers cleanly to the runtime calls.
     #[test]
     fn an_unchecked_instance_at_the_builtins_element_still_lowers() {

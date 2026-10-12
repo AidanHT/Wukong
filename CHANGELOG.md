@@ -53,6 +53,12 @@ All notable changes to Wukong are documented here. The format is loosely based o
   through the new `wukong_rt_cstr(data, len)`, which yields the null string for a buffer with no
   NUL (an open failure, or the empty name) instead of letting the runtime read past its end.
   `tests/run/io_buffer_names.wk`.
+- **Fix: a `*u8` path local no longer costs a function its kernels.** The alias planner classified
+  a string literal's initializer as unknown storage, so `let p: *u8 = "w.bin";` tainted the whole
+  function and every recognized GEMM / elementwise kernel in it fell back to its scalar loop
+  (`tests/run/gemm_fused_bias_slice.wk` with a path local lost both `sgemm_nt_epi`). A string
+  literal now counts as fresh storage — static, read-only bytes no buffer can be.
+
 ### Source locations through MIR into native code (`gap5/native-source-locations`)
 
 - **Native-backend failures point at the source (P11.8).** A `C0002` (a slot above the native
