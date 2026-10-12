@@ -86,7 +86,10 @@ not duplicate them. In summary, Wukong:
   error* (E0501/E0502), not a segfault at 3 a.m. There is no whole-tensor `*` operator:
   whole-tensor arithmetic is rejected outright (E0433, "operate on elements in a loop"), and a
   matmul is written as an indexed loop nest — which the compiler then recognizes and dispatches
-  (below). C/C++ cannot express this; Rust cannot express it ergonomically.
+  (below). A dimension may be a run-time value (`rowsum::<m, n>(a, out)`): the call reads `n` once,
+  and the shapes it returns keep that value whatever later happens to `n`
+  (`tests/run/turbofish_runtime_snapshot.wk`). C/C++ cannot express this; Rust cannot express it
+  ergonomically.
 - **The knobs kernels need, as language constructs.** SIMD vector types (`vec[f32, 8]`), tensor data
   layout declared in the type (`Tensor[f32, 512, 512, .col_major]`, `.tiled(64, 64)`, strided) and
   parallel schedules (`@parallel`) are part of the language rather than a soup of intrinsics and

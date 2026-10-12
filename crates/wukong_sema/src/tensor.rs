@@ -321,9 +321,9 @@ impl Sema<'_> {
     }
 
     /// Is `s`, appearing in a dimension binding, a run-time integer VALUE (a local named in a
-    /// turbofish) rather than a dimension of the enclosing function?
+    /// turbofish, `turbofish.rs`) rather than a dimension of the enclosing function?
     fn is_runtime_dim_value(&self, s: Symbol) -> bool {
-        !self.generics.contains(&s) && self.lookup_local(s).is_some()
+        self.is_dim_snapshot(s)
     }
 
     /// After a call's dimensions are bound, every derived extent in `ty` (the call's result type)
@@ -1112,6 +1112,33 @@ mod tests {
             "fn take(a: [[f32; 3]; 2]) -> f32 { return a[1][2]; } \
              fn f(t: Tensor[f32, 7]) -> f32 { return take(t); }",
             "E0501",
+        );
+    }
+
+    /// A call compares a dimension the substitution put in place of the callee's generic, and
+    /// never binds it. Binding the CALLER's `P := Q` let `lanes(a, b)` check clean over two
+    /// different dimensions and read past the shorter operand.
+    #[test]
+    fn a_call_compares_the_callers_dimensions() {
+        let lanes = "fn lanes<N>(x: Tensor[i32, N], y: Tensor[i32, N]) -> i32 { \
+                     return x[0] * y[0]; } ";
+        rejects(
+            &format!(
+                "{lanes}fn g<P, Q>(a: Tensor[i32, P], b: Tensor[i32, Q]) -> i32 {{ \
+                 return lanes(a, b); }}"
+            ),
+            "E0502",
+        );
+        ok(&format!(
+            "{lanes}fn g<P>(a: Tensor[i32, P], b: Tensor[i32, P]) -> i32 {{ \
+             return lanes(a, b); }}"
+        ));
+        // Nor is a caller's dimension assumed equal to an array's length.
+        rejects(
+            "fn first<N>(a: Tensor[f32, N]) -> f32 { return a[0]; } \
+             fn g<P>(t: Tensor[f32, P]) -> f32 { let x: [f32; 6] = [0.0; 6]; \
+             return first::<P>(x) + t[0]; }",
+            "E0502",
         );
     }
 }

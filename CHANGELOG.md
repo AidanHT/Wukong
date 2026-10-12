@@ -383,6 +383,46 @@ All notable changes to Wukong are documented here. The format is loosely based o
   interp/native differential and the `-O` invariance gates with a kernel on every eligible corpus
   loop of eight or more iterations; it passed when this landed.
 
+### Run-time turbofish dimensions (`gap6/generic-dims`, N21)
+
+- **A run-time turbofish dimension is the value read at the call.** `f::<n>(..)` with `n` a local
+  reads `n` once, before the call's arguments, and the shapes the call returns are shapes of that
+  value: assigning or shadowing `n` afterwards no longer changes them. The dimension used to be the
+  variable `n` itself, re-read at every use, so after `let r = row::<2, n>(buf, 0); n = 5;` the row
+  reported `r.dim(0) == 5` and a loop to it read past the row (the interpreter trapped, native read
+  on), and the results of two `f::<n>` calls taken around an assignment unified as one shape. Two
+  reads are the same dimension only when they read one immutable binding (a `let` or parameter
+  without `mut`) that nothing borrows; any other two reads meeting in a shape check are `E0502`, each
+  read labelled, with a help to read the value once into an immutable binding
+  (`tests/run/turbofish_runtime_snapshot.wk`, `tests/fail/turbofish_runtime_two_reads.wk`). Sema mints
+  the dimension through the shared interner (`Interner::fresh`) and publishes each call's reads as
+  `SemaResult::dim_snapshots`.
+- **A call compares the caller's dimensions instead of re-binding them.** Once a callee's `N` was
+  bound to a dimension of the caller, a later operand's dimension was bound in its place rather than
+  compared: `dot(a, b)` with `a: Tensor[i32, P]` and `b: Tensor[i32, Q]` checked clean and read past
+  `b` (interpreter 14, native garbage). It is `E0502` now (`tests/fail/call_two_generic_dims.wk`), as
+  is a caller's generic passed by turbofish against an array of a fixed length; a run-time turbofish
+  value against a fixed length stays the caller's claim, as before.
+- **A local named like a generic dimension no longer changes it.** `let N = 2;` in `fn f<N>(a:
+  Tensor[i32, N])` made every later extent and stride of `a` read 2 (`a.dim(0)` printed 2); a type's
+  `N` is the generic again (`tests/run/generic_dim_shadowed.wk`).
+- **A turbofish dimension names an integer in scope.** A float local (`first::<x>(a)` with
+  `x = 2.5`) was converted and ran with `N = 2`; it is `E0401`. A name that is nothing in scope
+  (`first::<lne>(a)`) was dropped in favour of the argument's length; it is `E0504`
+  (`tests/fail/turbofish_dim_not_integer.wk`, `tests/fail/turbofish_unknown_dim.wk`).
+- **A deferred turbofish call reads its own dimension.** `defer` lowering copies the deferred
+  expression onto every exit under fresh node ids, and the copies did not carry the record of which
+  local a turbofish reads: `defer print(row::<2, n>(buf, 1).dim(0));` was `C0001`, and printed 0
+  when another read of `n` had made the dimension's slot on a branch that did not run. Each copy
+  now reads `n` when the defer runs, and a name a deferred turbofish reads is one the defer uses, so
+  rebinding it while the defer is pending is `E0314` (`tests/run/turbofish_runtime_defer.wk`).
+- **The canonicalizer sees a turbofish read.** `let mut n = 3; let r = row::<2, n>(..); n = 1;`
+  sank the `let` below the call (an accumulator seed whose first other mention assigns it), which
+  then named no binding (`C0001`) or an outer `n`; and an index binding read by a turbofish was
+  inlined and deleted. Both mention tests now count a turbofish name. A module `const` named in a
+  turbofish is not such a read (it is its value there, and is never deleted), so it still folds
+  into the rest of the function, whose loops keep a literal trip count.
+
 ### Source locations through MIR into native code (`gap5/native-source-locations`)
 
 - **Native-backend failures point at the source (P11.8).** A `C0002` (a slot above the native

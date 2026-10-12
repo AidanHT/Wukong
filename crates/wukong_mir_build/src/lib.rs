@@ -130,6 +130,9 @@ mod par_region;
 #[cfg(test)]
 mod par_region_tests;
 
+// Run-time turbofish dimensions: `f::<n>(..)` reads `n` once, into a slot of its own.
+mod turbofish;
+
 // ===== Type-generic monomorphization =====
 //
 // A function generic over a TYPE parameter (`fn id<T>(x: T) -> T`) cannot be lowered once: its MIR
@@ -23265,10 +23268,15 @@ impl FnLowerer<'_> {
         let mut dim_map: HashMap<Symbol, ValueId> = HashMap::default();
         // (a) Turbofish: `sig.generics` zipped positionally with the supplied type args. Only a
         // generic that is one of the hidden *dimension* generics is read here (a type generic's
-        // turbofish is for monomorphization, handled elsewhere).
+        // turbofish is for monomorphization, handled elsewhere). A local named there was read into
+        // its own slot before the arguments (`turbofish.rs`); the callee gets exactly that value.
         for (g, ga) in generics.iter().zip(generic_args) {
             if hidden.contains(g) && !dim_map.contains_key(g) {
-                if let Some(v) = self.turbofish_dim_value(ga) {
+                let v = match self.turbofish_snapshot(callee_id, *g) {
+                    Some(dim) => self.dim_var_value(dim),
+                    None => self.turbofish_dim_value(ga),
+                };
+                if let Some(v) = v {
                     dim_map.insert(*g, v);
                 }
             }
@@ -23438,6 +23446,9 @@ impl FnLowerer<'_> {
         args: &[Expr],
         e: &Expr,
     ) -> ValueId {
+        // A local named in the turbofish (`f::<n>(..)`) is read now, ahead of the arguments, into
+        // the slot the call's shapes name (`turbofish.rs`).
+        self.snapshot_turbofish_dims(callee.id);
         // A call through a function-typed parameter or a trait bound (`methods.rs`).
         if let Some(v) = self.lower_dispatched_call(callee, generic_args, args, e) {
             return v;
@@ -26531,8 +26542,15 @@ fn expr_mentions(e: &Expr, sym: Symbol) -> bool {
         | ExprKind::Bool(_) => false,
         ExprKind::Unary { expr, .. } => expr_mentions(expr, sym),
         ExprKind::Binary { lhs, rhs, .. } => expr_mentions(lhs, sym) || expr_mentions(rhs, sym),
-        ExprKind::Call { callee, args, .. } => {
-            expr_mentions(callee, sym) || args.iter().any(|a| expr_mentions(a, sym))
+        // A turbofish may name a local whose value the call reads (`f::<n>(..)`).
+        ExprKind::Call {
+            callee,
+            generic_args,
+            args,
+        } => {
+            expr_mentions(callee, sym)
+                || generic_args.iter().any(|g| turbofish_names(g, sym))
+                || args.iter().any(|a| expr_mentions(a, sym))
         }
         ExprKind::Index { base, indices } => {
             expr_mentions(base, sym) || indices.iter().any(|i| expr_mentions(i, sym))
@@ -26556,6 +26574,14 @@ fn expr_mentions(e: &Expr, sym: Symbol) -> bool {
         // struct literals, if/match/block exprs, method calls, ranges, …: assume a use.
         _ => true,
     }
+}
+
+/// Does the turbofish argument `g` name `sym`? A dimension generic given a local (`f::<n>(..)`)
+/// reads it when the call is made, so every pass that asks whether a statement mentions `n` must
+/// see it: the accumulator sink in `canon.rs` moved `let mut n = 3;` below `row::<2, n>(..)` when
+/// `n`'s next mention assigned it, and the call then named no binding (or an outer one).
+pub(crate) fn turbofish_names(g: &ast::TypeExpr, sym: Symbol) -> bool {
+    matches!(&g.kind, ast::TypeKind::Path(p) if p.is_single() && p.first().sym == sym)
 }
 
 /// Conservative "does any statement (or the tail) reference `sym`?" — companion to [`expr_mentions`].

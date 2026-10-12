@@ -401,13 +401,13 @@ fn walk_expr_stmts(e: &Expr, f: &mut dyn FnMut(&Stmt)) {
 }
 
 /// A direct child of an expression: a sub-expression or a sub-block.
-enum Child<'e> {
+pub(crate) enum Child<'e> {
     Expr(&'e Expr),
     Block(&'e Block),
 }
 
 /// Call `f` on every direct sub-expression and sub-block of `e`, in source order.
-fn for_each_child<'e>(e: &'e Expr, f: &mut dyn FnMut(Child<'e>)) {
+pub(crate) fn for_each_child<'e>(e: &'e Expr, f: &mut dyn FnMut(Child<'e>)) {
     match &e.kind {
         ExprKind::Int(_)
         | ExprKind::Float(_)

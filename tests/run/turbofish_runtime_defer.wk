@@ -1,0 +1,106 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 7
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 8
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+module tests.run.turbofish_runtime_defer
+
+// A deferred call whose turbofish names a local (`defer show(row::<2, n>(buf, 1))`) reads that
+// local when the defer RUNS, like every other name a deferred expression uses, and the row it
+// returns is exactly that wide. `defer` lowering places a copy of the expression on every exit,
+// and the copies used to lose the record of which local each turbofish reads: a copy then wrote
+// no value for the row's dimension, so reading its extent was `C0001`, or, when another read of the
+// same binding had made the dimension's storage on a branch that did not run, it read 0 and the
+// row printed as empty. Expected values are the scalar meaning of the source: `buf` is 1..=6 viewed
+// as 2 x n with n = 3, so row 0 is 1 2 3 and row 1 is 4 5 6; `show` prints the extent, then every
+// element.
+
+fn row<M, N>(a: Tensor[i32, M, N], i: i64) -> Tensor[i32, N] {
+    return a[i];
+}
+
+fn show<W>(t: Tensor[i32, W]) {
+    print(t.dim(0));
+    for j in 0..W {
+        print(t[j]);
+    }
+}
+
+// The extent of a deferred row, read straight off the call: 3.
+fn extent(buf: [i32; 6]) {
+    let n = 3;
+    defer print(row::<2, n>(buf, 1).dim(0));
+}
+
+// The only other read of `n` is on a branch that does not run (`buf[0]` is 1): 7, then row 1.
+fn untaken(buf: [i32; 6]) {
+    let n = 3;
+    defer show(row::<2, n>(buf, 1));
+    let flag = buf[0] == 9;
+    if flag {
+        let a = row::<2, n>(buf, 0);
+        print(a[0]);
+    }
+    print(7);
+}
+
+// `n` is 1 at the `defer` and 3 when it runs: 8, then row 1 of the 2 x 3 view.
+fn reassigned(buf: [i32; 6]) {
+    let mut n = 1;
+    defer show(row::<2, n>(buf, 1));
+    n = n + 2;
+    print(n + 5);
+}
+
+// A defer in a loop body runs once per iteration: row 0, then row 1.
+fn per_iteration(buf: [i32; 6]) {
+    let n = 3;
+    for i in 0..2 {
+        defer show(row::<2, n>(buf, i as i64));
+    }
+}
+
+// Two exits, two copies: each prints row 0.
+fn two_exits(buf: [i32; 6], early: bool) -> i32 {
+    let n = 3;
+    defer show(row::<2, n>(buf, 0));
+    if early {
+        return 1;
+    }
+    return 2;
+}
+
+fn main() -> i32 {
+    let buf: [i32; 6] = [1, 2, 3, 4, 5, 6];
+    extent(buf);
+    untaken(buf);
+    reassigned(buf);
+    per_iteration(buf);
+    let a = two_exits(buf, true);
+    let b = two_exits(buf, false);
+    return a + b - 3;
+}

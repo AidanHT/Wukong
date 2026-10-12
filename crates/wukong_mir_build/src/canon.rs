@@ -245,6 +245,7 @@ fn consts_to_fold<'a>(
                 init_ty: ty,
                 sema,
                 require_index: false,
+                is_const: true,
                 count: 0,
                 ok: true,
             };
@@ -693,6 +694,7 @@ fn region_admits(
         init_ty,
         sema,
         require_index: true,
+        is_const: false,
         count: 0,
         ok: true,
     };
@@ -776,6 +778,11 @@ struct UseScan<'a> {
     /// the blast-radius bound; false for a module `const`, whose value is a compile-time literal that
     /// `lower_expr` already inlines at *every* position, so there is nothing to restrict.
     require_index: bool,
+    /// The name is a module `const`, which stays declared after the fold, rather than a `let` the
+    /// rewrite deletes. A turbofish naming a const (`f::<N>(..)`) is its value (sema binds
+    /// `Dim::Const`), and `subst_expr` leaves generic arguments alone, so it neither counts as a
+    /// use nor stands in the fold's way.
+    is_const: bool,
     count: u32,
     ok: bool,
 }
@@ -863,7 +870,21 @@ impl UseScan<'_> {
                 self.expr(lhs, in_index);
                 self.expr(rhs, in_index);
             }
-            ExprKind::Call { callee, args, .. } => {
+            ExprKind::Call {
+                callee,
+                generic_args,
+                args,
+            } => {
+                // A turbofish reading a `let` binding (`f::<x>(..)`) is no index position, and no
+                // expression could take its place there, so the binding must stay.
+                if !self.is_const
+                    && generic_args
+                        .iter()
+                        .any(|g| crate::turbofish_names(g, self.name))
+                {
+                    self.ok = false;
+                    return;
+                }
                 self.expr(callee, in_index);
                 for a in args {
                     self.expr(a, in_index);
@@ -1440,6 +1461,7 @@ pub(crate) fn inline_value_lets(
             init_ty,
             sema,
             require_index: false,
+            is_const: false,
             count: 0,
             ok: true,
         };
@@ -1510,5 +1532,75 @@ fn value_is_pure(e: &Expr, sema: &SemaResult, interner: &Interner) -> bool {
                 && args.iter().all(|a| value_is_pure(a, sema, interner))
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use wukong_diag::Diagnostic;
+    use wukong_span::{Interner, SourceId};
+
+    /// The diagnostics of lowering `src`, whose sema must be clean.
+    fn lower(src: &str) -> Vec<Diagnostic> {
+        let mut interner = Interner::new();
+        let (module, pdiags) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pdiags.is_empty(), "parse: {pdiags:?}");
+        let (sema, sdiags) = wukong_sema::check(&module, &interner);
+        assert!(sdiags.iter().all(|d| !d.is_error()), "sema: {sdiags:?}");
+        crate::lower_program(&module, &sema, &mut interner).1
+    }
+
+    const ROW: &str = "fn row<M, N>(a: Tensor[i32, M, N], i: i64) -> Tensor[i32, N] { \
+                       return a[i]; } ";
+
+    /// A `let mut n = <literal>;` whose first other mention assigns it is an accumulator seed this
+    /// pass sinks to that assignment, and a turbofish was no mention: the `let` landed below the
+    /// call, which then named no binding (`C0001`), or an outer `n`.
+    #[test]
+    fn a_turbofish_read_keeps_its_let_above_the_call() {
+        let diags = lower(&format!(
+            "{ROW}fn main() -> i32 {{ let buf: [i32; 6] = [1, 2, 3, 4, 5, 6]; let mut n = 3; \
+             let r = row::<2, n>(buf, 0); n = 1; print(n); return r[0]; }}"
+        ));
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+    }
+
+    /// A pure index binding is inlined into its index uses and deleted, and a turbofish reading it
+    /// was not counted as a use: the `let` went, and the call named no binding.
+    #[test]
+    fn a_turbofish_read_keeps_an_index_binding() {
+        let diags = lower(&format!(
+            "{ROW}fn main() -> i32 {{ let buf: [i32; 6] = [1, 2, 3, 4, 5, 6]; let i = 1; \
+             let k = i * 3; let r = row::<2, k>(buf, 0); return buf[k] + r[0]; }}"
+        ));
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+    }
+
+    /// The MIR of `src`, whose sema and lowering must be clean.
+    fn mir(src: &str) -> String {
+        let mut interner = Interner::new();
+        let (module, pdiags) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pdiags.is_empty(), "parse: {pdiags:?}");
+        let (sema, sdiags) = wukong_sema::check(&module, &interner);
+        assert!(sdiags.iter().all(|d| !d.is_error()), "sema: {sdiags:?}");
+        let (prog, diags) = crate::lower_program(&module, &sema, &mut interner);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        wukong_mir::print::print_program(&prog, &interner)
+    }
+
+    /// A module `const` named in a turbofish is its value there (sema binds `Dim::Const`) and is
+    /// never deleted, so it is no reason to keep the const out of the rest of the body. Declined,
+    /// the loop below kept `0..N` as a path: the vectorizer saw no literal trip count and guarded
+    /// its 256-bit body with a run-time trip test the literal makes static.
+    #[test]
+    fn a_turbofish_naming_a_const_keeps_the_const_folded() {
+        let src = |dim: &str| {
+            format!(
+                "const N: i64 = 4096; fn first<D>(a: Tensor[f32, D]) -> f32 {{ return a[0]; }} \
+                 fn dot(a: [f32; 4096], b: [f32; 4096]) -> f32 {{ let mut s = 0.0; \
+                 for i in 0..N {{ s = s + a[i] * b[i]; }} return s + first::<{dim}>(a); }}"
+            )
+        };
+        assert_eq!(mir(&src("N")), mir(&src("4096")));
     }
 }

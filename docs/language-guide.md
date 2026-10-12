@@ -995,7 +995,8 @@ faults:
 - `E0503` — the wrong number of value arguments, **or** a turbofish whose generic-argument count does
   not match the declared generic list.
 - `E0504` — a tensor type named a dimension that is not a declared generic parameter, an integer
-  literal, `?`, or a `const` (reported with a did-you-mean hint against the nearest declared generic).
+  literal, `?`, or a `const` (reported with a did-you-mean hint against the nearest declared generic);
+  likewise a turbofish dimension that names nothing in scope (`first::<lne>(a)`).
 - `E0505` — a dimension expression that is not an extent: it folds to a negative constant, divides by
   zero, overflows, or uses `?` as an operand — at the declaration, or for the dimensions a call binds.
 - `E0506` — a reshape (`x as Tensor[…]`) whose element count is not provably unchanged.
@@ -1135,7 +1136,10 @@ cannot be satisfied by the caller's own generic dim (`fn fwd<N>(a: Tensor[f32, N
 parameter `?` when the size is a runtime value). And a `?` argument never *binds* a callee's symbolic
 dim for checking, so a later concrete sibling still binds it and every subsequent operand is checked
 against that binding; when nothing else determines the dim, lowering passes the `?` argument's run-time
-extent (`tests/run/tensor_extent.wk`). A constant index past a static tensor dimension, like a fixed-size array, is `E0501`.
+extent (`tests/run/tensor_extent.wk`). Once a callee's dim is bound to one of the **caller's** dims, a
+later operand is *compared* against it, never re-bound: `dot(a, b)` with `a: Tensor[f32, P]` and
+`b: Tensor[f32, Q]` is `E0502`, where it used to bind `P := Q` and read past `b`
+(`tests/fail/call_two_generic_dims.wk`). A constant index past a static tensor dimension, like a fixed-size array, is `E0501`.
 
 **What runs today.** A tensor with **compile-time-constant shape** executes end-to-end on both
 backends: multi-dimensional indexing `a[i, j]` flattens to a row-major GEP off the base pointer (a
@@ -1150,7 +1154,10 @@ hidden runtime `i64` parameters, so `a[i, j]`'s row stride (`i*N + j`, with `N` 
 the loop bounds (`0..M`) resolve at run time, and a turbofish supplies them (`add::<2, 3>(…)`)
 (`tests/run/generic_shape.wk`). Because the symbolic address arithmetic matches the constant-shape
 form, it is byte-identical to the same kernels written with literal dims — and even a matmul with
-runtime `m, n, k` dispatches to the tuned GEMM kernel (`tests/run/matmul_dynamic.wk`).
+runtime `m, n, k` dispatches to the tuned GEMM kernel (`tests/run/matmul_dynamic.wk`). A local may
+reuse a generic dimension's name (`let N = 2;` in `fn f<N>(..)`): the name in an *expression* is then
+the local, but `N` in a *type* is still the generic, so the extents and strides of `f`'s tensors do not
+change (`tests/run/generic_dim_shadowed.wk`).
 
 The turbofish also accepts a **runtime integer value**, not just a literal: `rowsum::<m, n>(a, out)`
 with `n` computed at run time threads the live value through the same hidden dim parameters, so a
@@ -1159,6 +1166,20 @@ shape-typed kernel serves sizes nobody knew at compile time (the serving-code st
 For such dims the compile-time shape checks degrade gracefully to the runtime-`?` level — a wrong
 runtime size is outside the defined contract, like any runtime index
 (`tests/run/generic_shape_runtime.wk`).
+
+**A runtime dimension is a value, read once** (✅). `f::<n>(..)` reads `n` when the call is made,
+before its arguments are evaluated, and the shapes the call returns are shapes of *that value*:
+assigning `n` or shadowing it afterwards changes nothing about them (after
+`let r = row::<2, n>(buf, 0); n = 5;`, `r` is exactly as wide as it was, and so is every loop over
+`r.dim(0)`). Two reads are the same dimension only when they read one **immutable** binding — a `let`
+without `mut`, or a parameter without `mut` — whose name nothing in the function borrows (`&n`): the
+rows of `row::<2, n>(buf, 0)` and `row::<2, n>(buf, 1)` then meet in a shape-checked call. Any other
+two reads (of a `mut` local, a borrowed one, or two bindings that shadow each other) are two
+dimensions, so their shapes do not meet: that is `E0502`, with each read labelled and a help to read
+the value once into an immutable binding (`let n2 = n;`) and name that in every turbofish whose shapes
+must agree. The variable must be an integer (`E0401`), and an unsigned one zero-extends
+(`tests/run/turbofish_runtime_snapshot.wk`, `tests/fail/turbofish_runtime_two_reads.wk`,
+`tests/fail/turbofish_dim_not_integer.wk`).
 
 ## Attributes 🟡
 
@@ -2211,7 +2232,9 @@ fn sum_scratch(n: i64) -> i32 {
 - `<expr>` may be any expression, including a block, and `defer x += 1;` defers an assignment.
 - **E0314**: a deferred expression may not leave itself (`return`, or `break`/`continue` to a loop
   outside it), and a name it uses may not be rebound (`let`, `for`, a match binding) while it is
-  pending — its copies at the exits would silently read the new binding.
+  pending — its copies at the exits would silently read the new binding. A local a turbofish
+  names is used too: `defer show(row::<2, n>(buf, 1));` reads `n` when the defer runs, and the row
+  it returns is that wide (`tests/run/turbofish_runtime_defer.wk`).
 - A failed `assert` aborts without running defers.
 
 `defer` runs on every backend (`tests/run/defer_scope_exit.wk`): it is lowered by copying the
