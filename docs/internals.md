@@ -1286,6 +1286,37 @@ Second, a float-returning entry point is invoked through the ABI its own width i
 they must not share the `f64` arm — reading those bits as an `f64` turns a live float into a denormal
 and the exit code diverges from the oracle.
 
+**Frame layout: stack-slot coloring (`stack_color.rs`).** Allocas whose lifetimes never overlap share
+one Cranelift stack slot, so a frame holds the largest set of simultaneously live slots rather than
+every slot the function declares; the JIT and the object path share the lowering, so both get it.
+Lifetimes come from `wukong_opt::slot_lifetime`, a pure MIR analysis — no lifetime-marker op exists:
+a slot is live at a point that is reachable from one of its uses and can reach one (so a slot used
+inside a loop is live around the whole loop), where a use is any instruction that handles its
+address or a pointer derived from it (`gep`, `select`, block parameters, pointer casts, a value
+loaded back out of a slot the address was stored into). The backward half stops on entry to a
+counted loop that writes every byte of the slot before anything reads it — the `[v; N]`
+initializer of a `let` inside a loop body — so per-iteration scratch arrays declared one after
+another stop overlapping. An address the analysis loses (stored to untracked memory, returned,
+`ptrtoint`, passed to an `extern "C"` function, to a user function whose parameter may retain it —
+`CaptureSummary`, a bottom-up greatest fixpoint over the call graph — or to a call that also takes a
+function address, i.e. an outlined `@parallel` region's environment) keeps its slot live for the
+whole function. Runtime kernels are assumed to retain nothing and to store no argument's address
+into another's memory. The coloring is greedy (largest slot first, layout order on ties, first color
+whose members it does not interfere with); a shared slot is as large and aligned as its largest and
+most aligned member, and an over-aligned member still rounds its own address up inside it. At
+`-O1`+ a color holds only private stack slots (Cranelift's `Vmctx` alias region) or only non-private
+ones, because Cranelift's alias analysis requires one location to be accessed under one region; at
+`-O0` Cranelift runs no alias analysis, so colors mix and a private member is demoted to the default
+region. A function in which nothing shares lowers to byte-identical code. The interpreter keeps one
+slot per alloca — it is the oracle, and `native_matches_interpreter` over the run corpus is what
+would see a wrong coloring. `WUKONG_STACK_COLOR=0` turns coloring off (a kill switch that can only
+change frame sizes). Over `tests/run` (557 programs) the static slot bytes drop 5.8% at `-O0` and
+4.8% at `-O2`; `cargo test -p wukong_codegen_cranelift --lib corpus_frame_bytes -- --ignored
+--nocapture` prints the report. Kernels that declare and zero all their scratch at the top of the
+function (`examples/llama_block.wk`) gain almost nothing: their slots are live from the top, because
+the later full overwrites are 2-D loop nests, runtime kernels or, at `-O2`, unrolled and fused loops
+the kill test does not recognize.
+
 SIMD **auto-vectorization** happens in `wukong_mir_build` while lowering a `for` loop: a
 straight-line elementwise body over unit-stride array accesses (plus loop-invariant splats, and
 `if`/`else` value-expressions via if-conversion to a vector compare + blend) lowers to vector
