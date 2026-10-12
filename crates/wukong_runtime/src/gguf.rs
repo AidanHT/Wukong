@@ -324,6 +324,8 @@ struct Cursor<R> {
     r: R,
     pos: u64,
     len: u64,
+    /// Where [`Self::skip`] reads the bytes it drops (allocated on the first skip).
+    scratch: Vec<u8>,
 }
 
 impl<R: Read> Cursor<R> {
@@ -353,6 +355,68 @@ impl<R: Read> Cursor<R> {
 
     fn u64(&mut self) -> Result<u64, i64> {
         Ok(u64::from_le_bytes(self.arr()?))
+    }
+
+    /// Skip `n` bytes, checked against the file like a read, without keeping them.
+    fn skip(&mut self, n: u64) -> Result<(), i64> {
+        const CHUNK: u64 = 4096;
+        self.need(n)?;
+        if self.scratch.is_empty() {
+            self.scratch.resize(CHUNK as usize, 0);
+        }
+        let mut left = n;
+        while left > 0 {
+            let k = left.min(CHUNK) as usize;
+            self.r
+                .read_exact(&mut self.scratch[..k])
+                .map_err(|_| IO_ERROR)?;
+            left -= k as u64;
+        }
+        self.pos += n;
+        Ok(())
+    }
+
+    /// Walk past a value of type `ty` with exactly [`Self::value`]'s checks, keeping nothing: the
+    /// tensor-table readers' path, which must step over a tokenizer vocabulary of a few hundred
+    /// thousand strings on every call and has no use for one of them.
+    fn skip_value(&mut self, ty: u32, depth: u32) -> Result<(), i64> {
+        let fixed = |t: u32| match t {
+            vt::U8 | vt::I8 | vt::BOOL => Some(1u64),
+            vt::U16 | vt::I16 => Some(2),
+            vt::U32 | vt::I32 | vt::F32 => Some(4),
+            vt::U64 | vt::I64 | vt::F64 => Some(8),
+            _ => None,
+        };
+        if let Some(sz) = fixed(ty) {
+            return self.skip(sz);
+        }
+        match ty {
+            vt::STRING => {
+                let n = self.u64()?;
+                self.skip(n)
+            }
+            vt::ARRAY => {
+                if depth >= MAX_NESTING {
+                    return Err(IO_BAD_HEADER);
+                }
+                let elem = self.u32()?;
+                let n = self.u64()?;
+                if let Some(sz) = fixed(elem) {
+                    return self.skip(n.checked_mul(sz).ok_or(IO_BAD_HEADER)?);
+                }
+                let min = match elem {
+                    vt::STRING => 8,
+                    vt::ARRAY => 12,
+                    _ => return Err(IO_BAD_HEADER),
+                };
+                self.need(n.checked_mul(min).ok_or(IO_BAD_HEADER)?)?;
+                for _ in 0..n {
+                    self.skip_value(elem, depth + 1)?;
+                }
+                Ok(())
+            }
+            _ => Err(IO_BAD_HEADER),
+        }
     }
 
     fn string(&mut self) -> Result<Vec<u8>, i64> {
@@ -414,10 +478,22 @@ impl<R: Read> Cursor<R> {
 /// the version, every metadata value and the whole tensor table (see the module docs for what is
 /// malformed). Nothing past the tensor table is read.
 pub fn gguf_parse<R: Read>(r: R, file_len: u64) -> Result<Gguf, i64> {
+    gguf_parse_with(r, file_len, true)
+}
+
+/// [`gguf_parse`] for the tensor-table readers: every metadata value is checked exactly as
+/// [`gguf_parse`] checks it, but only `general.alignment` is kept (`metadata` holds that one pair,
+/// when present) — the strings and arrays are stepped over without an allocation.
+pub fn gguf_parse_tensors<R: Read>(r: R, file_len: u64) -> Result<Gguf, i64> {
+    gguf_parse_with(r, file_len, false)
+}
+
+fn gguf_parse_with<R: Read>(r: R, file_len: u64, keep_meta: bool) -> Result<Gguf, i64> {
     let mut c = Cursor {
         r,
         pos: 0,
         len: file_len,
+        scratch: Vec::new(),
     };
     if c.arr::<4>()? != GGUF_MAGIC {
         return Err(IO_BAD_HEADER);
@@ -433,11 +509,19 @@ pub fn gguf_parse<R: Read>(r: R, file_len: u64) -> Result<Gguf, i64> {
     for _ in 0..n_kv {
         let key = c.string()?;
         let ty = c.u32()?;
-        let v = c.value(ty, 0)?;
+        let keep = keep_meta || key == b"general.alignment";
+        let v = if keep {
+            Some(c.value(ty, 0)?)
+        } else {
+            c.skip_value(ty, 0)?;
+            None
+        };
         if !keys.insert(key.clone()) {
             return Err(IO_BAD_HEADER);
         }
-        metadata.push((key, v));
+        if let Some(v) = v {
+            metadata.push((key, v));
+        }
     }
     let alignment = match metadata
         .iter()
@@ -491,10 +575,12 @@ pub fn gguf_parse<R: Read>(r: R, file_len: u64) -> Result<Gguf, i64> {
 
 /// Open `path`, size it and parse its GGUF header — `-1` if it cannot be opened, `-2` if it cannot
 /// be sized, else the parse's own result. The order is the contract both backends share.
-pub fn gguf_open(path: &Path) -> Result<(File, Gguf, u64), i64> {
+/// `keep_meta` keeps every metadata value ([`gguf_parse`]); without it only what the tensor table
+/// needs is kept ([`gguf_parse_tensors`]) — the same checks, the same codes, either way.
+pub fn gguf_open(path: &Path, keep_meta: bool) -> Result<(File, Gguf, u64), i64> {
     let mut file = File::open(path).map_err(|_| IO_OPEN_FAILED)?;
     let file_len = file.metadata().map_err(|_| IO_ERROR)?.len();
-    let g = gguf_parse(BufReader::new(&mut file), file_len)?;
+    let g = gguf_parse_with(BufReader::new(&mut file), file_len, keep_meta)?;
     Ok((file, g, file_len))
 }
 
@@ -697,7 +783,7 @@ pub fn gguf_open_tensor(
     dest_len: i64,
     dims: Option<&[i64]>,
 ) -> Result<(File, GgufLoc, GgufPlan), i64> {
-    let (file, g, file_len) = gguf_open(path)?;
+    let (file, g, file_len) = gguf_open(path, false)?;
     let loc = gguf_locate(&g, name, file_len)?;
     let plan = gguf_plan(&loc, dest_dt, dest_len, dims)?;
     Ok((file, loc, plan))
@@ -796,7 +882,7 @@ pub fn gguf_query(g: &Gguf, name: &[u8], what: i64, k: i64) -> i64 {
 /// [`gguf_query`] on the file at `path`: `-1` if it cannot be opened, `-2` if it cannot be sized,
 /// `-6` if its header is malformed. Shared by the native entry and the interpreter.
 pub fn gguf_query_path(path: &Path, name: &[u8], what: i64, k: i64) -> i64 {
-    match gguf_open(path) {
+    match gguf_open(path, false) {
         Ok((_, g, _)) => gguf_query(&g, name, what, k),
         Err(code) => code,
     }
@@ -896,7 +982,7 @@ pub fn gguf_meta(g: &Gguf, key: &[u8], what: i64, i: i64, default: i64) -> i64 {
 /// [`gguf_meta`] on the file at `path`; a file that cannot be opened, sized or parsed answers its
 /// code to the two queries and the default to the value read. Shared by both backends.
 pub fn gguf_meta_path(path: &Path, key: &[u8], what: i64, i: i64, default: i64) -> i64 {
-    match gguf_open(path) {
+    match gguf_open(path, true) {
         Ok((_, g, _)) => gguf_meta(&g, key, what, i, default),
         Err(_) if what == GGUF_M_I64 => default,
         Err(code) => code,
@@ -906,7 +992,7 @@ pub fn gguf_meta_path(path: &Path, key: &[u8], what: i64, i: i64, default: i64) 
 /// `gguf_meta_f64`: value `i` of key `key` as an `f64`, or `default` (a missing file, key or
 /// index, or a value that is not a number). Shared by both backends.
 pub fn gguf_meta_f64_path(path: &Path, key: &[u8], i: i64, default: f64) -> f64 {
-    let Ok((_, g, _)) = gguf_open(path) else {
+    let Ok((_, g, _)) = gguf_open(path, true) else {
         return default;
     };
     meta_elem(&g, key, i)
@@ -919,7 +1005,7 @@ pub fn gguf_meta_f64_path(path: &Path, key: &[u8], i: i64, default: f64) -> f64 
 /// string array): `Err(-5)` for a missing key, `-3` for a value that is not a string, `-4` for an
 /// index outside the value, or the file's own code. Shared by both backends.
 pub fn gguf_meta_str_path(path: &Path, key: &[u8], i: i64) -> Result<Vec<u8>, i64> {
-    let (_, g, _) = gguf_open(path)?;
+    let (_, g, _) = gguf_open(path, true)?;
     match meta_elem(&g, key, i)? {
         MetaValue::Str(s) => Ok(s.clone()),
         _ => Err(IO_DTYPE_MISMATCH),
@@ -1485,6 +1571,66 @@ mod tests {
             parse(&b.bytes()).unwrap().metadata[0].1,
             MetaValue::Bool(true)
         );
+    }
+
+    /// The tensor-table parse steps over every value with the full parse's checks: on every good
+    /// and every malformed header it reaches the same tensors, alignment and data start, or the
+    /// same code.
+    #[test]
+    fn the_skipping_parse_agrees_with_the_full_parse() {
+        let mut b = Gb::new();
+        b.align = 64;
+        for (k, v) in every_value() {
+            b.kv(k, &v);
+        }
+        b.kv("general.alignment", &MetaValue::U32(64))
+            .tensor("t", &[4], 0, &[0u8; 16]);
+        let good = b.bytes();
+        let full = parse(&good).unwrap();
+        let skim = gguf_parse_tensors(&good[..], good.len() as u64).unwrap();
+        assert_eq!(
+            (&skim.tensors, skim.alignment, skim.data_start, skim.version),
+            (&full.tensors, full.alignment, full.data_start, full.version)
+        );
+        assert_eq!(
+            skim.metadata,
+            vec![(b"general.alignment".to_vec(), MetaValue::U32(64))]
+        );
+        for cut in 0..b.header().len() {
+            let short = &good[..cut];
+            assert_eq!(
+                gguf_parse_tensors(short, cut as u64).err(),
+                parse(short).err(),
+                "cut at {cut}"
+            );
+        }
+        let mut deep = Vec::new();
+        for _ in 0..65 {
+            deep.extend_from_slice(&vt::ARRAY.to_le_bytes());
+            deep.extend_from_slice(&1u64.to_le_bytes());
+        }
+        deep.extend_from_slice(&vt::U8.to_le_bytes());
+        deep.extend_from_slice(&0u64.to_le_bytes());
+        for (key, ty, payload) in [
+            ("x", 13u32, vec![0u8; 8]),
+            ("deep", vt::ARRAY, deep),
+            ("s", vt::STRING, (1u64 << 62).to_le_bytes().to_vec()),
+            (
+                "a",
+                vt::ARRAY,
+                [&vt::STRING.to_le_bytes()[..], &(1u64 << 40).to_le_bytes()].concat(),
+            ),
+        ] {
+            let mut b = Gb::new();
+            b.kv_raw(key.as_bytes(), ty, &payload);
+            let bytes = b.bytes();
+            assert_eq!(parse(&bytes).err(), Some(IO_BAD_HEADER), "{key}");
+            assert_eq!(
+                gguf_parse_tensors(&bytes[..], bytes.len() as u64).err(),
+                Some(IO_BAD_HEADER),
+                "{key}"
+            );
+        }
     }
 
     #[test]

@@ -1597,9 +1597,10 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   no converting map (a `BF16` tensor maps only as `[]bf16`), and no error code on the map itself
   (it is empty; the matching `*_read_<T>` names the cause). The GGUF reader has no dequantizer for
   the grid-based i-quants (`IQ1_*`, `IQ2_*`, `IQ3_*`), `Q8_1`, `TQ1_0`/`TQ2_0` or `MXFP4` (they
-  load only as raw blocks; into `f32` they are `-7`), and every call re-opens and re-parses the
-  header (a large tokenizer vocabulary is re-read per tensor and per `gguf_meta_*` call); `.npy`
-  reads little-endian arrays only.
+  load only as raw blocks; into `f32` they are `-7`), and every call re-opens the file and re-walks
+  its header: a tensor read, query or map steps over the metadata without keeping any of it, but a
+  large tokenizer vocabulary is still read once per call (and fully parsed per `gguf_meta_*` call);
+  there is no cross-call header cache. `.npy` reads little-endian arrays only.
   A fill loop `for i { out[i] = rand_f32(seed, base + i) }` is not recognized into `rand_fill_f32`,
   and the loop vectorizer declines it (mixed 32/64-bit widths), so the scalar builtins run one
   element at a time; `randn_f32` has no fill kernel.

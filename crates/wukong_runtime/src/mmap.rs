@@ -119,7 +119,7 @@ pub fn map_plan(path: &Path, container: i64, name: &str, dt: i64) -> Result<MapP
             })
         }
         MAP_GGUF => {
-            let (file, g, file_len) = crate::gguf::gguf_open(path)?;
+            let (file, g, file_len) = crate::gguf::gguf_open(path, false)?;
             let loc = crate::gguf::gguf_locate(&g, name.as_bytes(), file_len)?;
             let n = match loc.ty.dt {
                 Some(t) if t == dt => fileio::shape_count(&loc.shape)?,
