@@ -136,6 +136,15 @@ OPTIONS:
                        @warn(..), @deny(..)
     --error-limit=<n>  Print at most n errors before suppressing the rest (0 = unlimited; default)
     --explain [CODE]   Print the extended explanation for an error code (no code: list all codes)
+    --print=runtime-cache
+                       Print the directory of the --emit=exe runtime cache and exit. The first
+                       link builds the program-independent runtime half there (the generated
+                       runtime shim; with a release-profile runtime, one fat-LTO static library
+                       of it) and every later link reuses it. WUKONG_CACHE_DIR sets the location
+                       (empty: no cache), else %LOCALAPPDATA%\\wukong\\cache on Windows and
+                       $XDG_CACHE_HOME/wukong or ~/.cache/wukong elsewhere; WUKONG_CACHE_TRACE=1
+                       prints each cache hit, miss and rebuild on stderr
+    --clear-cache      Remove every runtime cache entry and exit (the next --emit=exe rebuilds it)
     -e <source>        Compile the program text <source> instead of a file (`-` reads it
                        from standard input instead)
     -- <args>...       Everything after `--` is passed to the program `--run` executes:
@@ -160,6 +169,10 @@ fn main() -> ExitCode {
         return fmt_cmd::run(&std::env::args().skip(2).collect::<Vec<_>>());
     }
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // The runtime cache maintenance actions act and exit, like `--version`.
+    if let Some(code) = cache_command(&args) {
+        return ExitCode::from(code);
+    }
     // `--threads` configures the runtime this process links (the interpreter and the JIT call the
     // same `wukong_runtime` pools), so it is applied here, before any thread exists, rather than
     // carried through the driver's `Options`.
@@ -181,6 +194,62 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// `--print=runtime-cache` prints the `--emit=exe` runtime cache directory on stdout and
+/// `--clear-cache` removes its entries (see `wukong_driver::runtime_cache_dir`); either one acts on
+/// its own and ends the invocation, whatever else the command line holds (an unknown `--print=`
+/// value is a usage error). `None` when neither appears before a `--`.
+fn cache_command(args: &[String]) -> Option<u8> {
+    let mut print = false;
+    let mut clear = false;
+    for arg in args.iter().take_while(|a| a.as_str() != "--") {
+        match arg.as_str() {
+            "--print=runtime-cache" => print = true,
+            "--clear-cache" => clear = true,
+            _ => {
+                if let Some(what) = arg.strip_prefix("--print=") {
+                    eprintln!("error: unknown --print value `{what}` (expected runtime-cache)\n");
+                    eprint!("{USAGE}");
+                    return Some(2);
+                }
+            }
+        }
+    }
+    if !print && !clear {
+        return None;
+    }
+    let mut code = wukong_driver::exit::OK;
+    if clear {
+        match wukong_driver::clear_runtime_cache() {
+            Ok(report) => {
+                eprintln!(
+                    "removed {} runtime cache entr{} from {}",
+                    report.removed,
+                    if report.removed == 1 { "y" } else { "ies" },
+                    report.dir.display()
+                );
+                for (path, why) in &report.failed {
+                    eprintln!("error: could not remove `{}`: {why}", path.display());
+                    code = wukong_driver::exit::IO_ERROR;
+                }
+            }
+            Err(why) => {
+                eprintln!("error: {why}");
+                code = wukong_driver::exit::COMPILE_ERROR;
+            }
+        }
+    }
+    if print {
+        match wukong_driver::runtime_cache_dir() {
+            Ok(dir) => println!("{}", dir.display()),
+            Err(why) => {
+                eprintln!("error: {why}");
+                code = code.max(wukong_driver::exit::COMPILE_ERROR);
+            }
+        }
+    }
+    Some(code as u8)
 }
 
 /// Run the compile on a worker thread with a large stack.
@@ -931,6 +1000,25 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The runtime cache actions are documented, recognised only before `--`, and an unknown
+    /// `--print=` value is a usage error (exit 2). (Printing and clearing the cache itself are
+    /// exercised through the binary, with a private `WUKONG_CACHE_DIR`, in `tests/exe.rs`.)
+    #[test]
+    fn runtime_cache_actions_are_documented_and_scoped() {
+        for flag in ["--print=runtime-cache", "--clear-cache", "WUKONG_CACHE_DIR"] {
+            assert!(USAGE.contains(flag), "USAGE must document {flag}");
+        }
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(cache_command(&args(&["--run", "p.wk"])), None);
+        assert_eq!(cache_command(&args(&["--print-after=dce", "p.wk"])), None);
+        // After `--` it is the program's argument, not the compiler's.
+        assert_eq!(
+            cache_command(&args(&["--run", "p.wk", "--", "--clear-cache"])),
+            None
+        );
+        assert_eq!(cache_command(&args(&["--print=sysroot"])), Some(2));
+    }
 
     /// `wukongc fmt` is a subcommand dispatched before flag parsing; USAGE (the only user-facing
     /// flag doc) must name it, and its own help must document every option it accepts.

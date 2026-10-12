@@ -5,6 +5,36 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### The AOT runtime cache: `--emit=exe` stops re-LTOing the runtime on every link (`gap7/aot-link-cache`, N51)
+
+- **The runtime half of a link is built once.** Every `--emit=exe` link used to compile the
+  generated runtime shim against the `wukong_runtime` rlib, and against a release-profile rlib
+  (bitcode members, `lto = "thin"`) that meant a thin LTO of the whole runtime and `std` per link:
+  35-40 s for a one-line program on the development host. That half is now an entry in the AOT
+  runtime cache, built by the first link and reused: the shim compiled once as an rlib against a
+  dev-profile runtime, a **fat-LTO static library** of shim, runtime and `std` (at `opt-level=3`)
+  against a release one, the C runtime compiled once to an object on the `cc` fallback. rustc still
+  drives the final link — it compiles an empty driver crate, so no platform-linker locator is
+  needed — and nothing is LTO'd at link time. Debug-build indication (rustc 1.97.1, not a
+  measurement): a release runtime now costs one ~23-48 s archive build, then ~0.2-0.3 s per link; a
+  dev-profile runtime, which never LTO'd, links in ~0.5 s as before. Executables behave identically
+  (`tests/exe.rs` on the dev profile; by hand, a 122-program corpus slice linked against the fat-LTO
+  archive of a release runtime build matched `--run`, kernels, `@parallel` and `--train` included).
+- **Keyed by everything that changes it.** The toolchain (`rustc -vV`, or `$CC` and its
+  `--version`), the host, the runtime rlib's path, length and modification time, the shim (or C
+  runtime) source and the build recipe. The key material is stored in the entry and compared on
+  every hit, and a manifest of every file's length and content hash is validated too, so a
+  truncated or edited entry is detected and rebuilt. Entries are built in a private directory and
+  published with one `rename`, so concurrent compilers both succeed (the loser adopts the winner's
+  entry); at most 8 entries are kept, least recently used evicted.
+- **Added: `--print=runtime-cache` and `--clear-cache`.** The cache lives in
+  `WUKONG_CACHE_DIR` (empty: no cache, a private build per link), else `%LOCALAPPDATA%\wukong\cache`
+  on Windows and `$XDG_CACHE_HOME/wukong` or `~/.cache/wukong` elsewhere, under `aot-runtime/`;
+  `--print=runtime-cache` prints that directory and `--clear-cache` removes the entries.
+  `WUKONG_CACHE_TRACE=1` prints each hit, miss, rebuild and publish on stderr, and
+  `--time-passes` reports a `runtime-cache` stage before `link`. The test suites link through a
+  cache under the target directory and never touch the user's.
+
 ### Diagnostics: labels on one source line share one frame (`gap7/diag-locations`, N6)
 
 - **Each labelled source line prints once.** The human renderer drew one frame per label, so two
