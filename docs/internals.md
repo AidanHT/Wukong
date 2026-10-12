@@ -684,7 +684,9 @@ command line. `--passes=<list>` takes comma-separated names:
 - **Program steps**, run once where named, each closing the group before it: `inline`
   (`inline_program`), `unroll` (`unroll_program` plus `PassManager::unroll_cleanup` over the functions
   it changed), `slp` (`slp_program` plus the same cleanup; `WUKONG_NO_SLP` still applies) and
-  `form-switches`.
+  `form-switches`. Under `--verify-each` every pass of those cleanup sweeps is verified as
+  `optimize_verified` verifies it (`PassManager::run_subset_verified`), so a failure there names
+  the cleanup pass and the function, like a failure in a group.
 
 Each `-O` level is one such list (`passes::standard_spec`):
 

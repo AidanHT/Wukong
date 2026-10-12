@@ -21,6 +21,12 @@ All notable changes to Wukong are documented here. The format is loosely based o
   a named program step, the whole program. Stdout is byte-identical with or without it. Both flags
   are refused with `--emit=tokens|ast|check|mir-high` and on gradient compiles (`--emit=grad`,
   `--train`, `--emit=obj --grad-of`), whose forward is always the standard pipeline's.
+- **`--verify-each` on a pass list names the pass and the function, cleanup sweeps included.** The
+  sweeps inside `unroll` and `slp` run through the new `wukong_opt::PassManager::run_subset_verified`
+  under `--verify-each`, which verifies every pass in every build profile, so a cleanup pass that
+  leaves invalid MIR is reported by pass and function name (exit 1), exactly as plain
+  `-O2 --verify-each` reports it, rather than as a Rust panic naming `sym#N` (exit 101, debug
+  `wukongc`) or as a failure of the whole `unroll cleanup` stage with no pass named (release).
 - **`--emit=mir-text` prints MIR that reads back, and a `.mir` input is optimized from it.** The
   typed form (`wukong_mir::text`) is `--emit=mir` plus a type on every result, float constants as
   bits (a NaN keeps its payload), the statics, `extern` signedness, parameter promises, a non-`bb0`

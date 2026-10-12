@@ -111,6 +111,26 @@ mod tests {
     }
 
     #[test]
+    fn run_subset_verified_reports_broken_pass_and_function_without_panicking() {
+        let mut it = Interner::new();
+        let mut program = valid_program(&mut it);
+        let mut b = Builder::new(it.intern("swept"), MirType::I32);
+        let value = b.build(MirType::I32, Op::ConstInt(7, MirType::I32));
+        b.ret(Some(value));
+        program.funcs.push(b.finish());
+        let mut pm = PassManager::new();
+        pm.add(Box::new(BreakReturn(true)));
+        pm.add(Box::new(MustNotRun));
+        let failure = pm.run_subset_verified(&mut program, &[1]).unwrap_err();
+        assert_eq!(failure.pass, "break-return");
+        assert_eq!(failure.function, Some(program.funcs[1].name));
+        assert!(!failure.errors.is_empty());
+        // Only the subset is swept.
+        assert!(wukong_mir::verify::verify_function(&program.funcs[0]).is_empty());
+        assert_eq!(pm.run_subset_verified(&mut program, &[]), Ok(()));
+    }
+
+    #[test]
     fn verify_each_checks_input_before_any_pass_and_at_o0() {
         let mut it = Interner::new();
         let mut program = valid_program(&mut it);

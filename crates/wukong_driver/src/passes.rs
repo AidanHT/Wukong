@@ -276,7 +276,8 @@ impl Pass for Observed {
 
 /// Run `steps` over `program`. Under `verify_each` every pass and step is followed by the MIR
 /// verifier and the first failure is returned (the same boundaries
-/// `wukong_opt::optimize_verified` checks); otherwise passes verify only in debug builds, as
+/// `wukong_opt::optimize_verified` checks, the unroll and SLP cleanup sweeps included: a pass
+/// there is named with its function); otherwise passes verify only in debug builds, as
 /// `wukong_opt::optimize` does. `print_after` (a pass or step name, or `all`) prints to stderr:
 /// after each run of the named function pass, the function it changed (or a one-line
 /// `unchanged` note), and after the named program step, the whole program. The fixpoint driver
@@ -348,7 +349,12 @@ fn run_steps_to(
                 if verify_each {
                     wukong_opt::verify_program_stage(program, "unroll")?;
                 }
-                PassManager::unroll_cleanup().run_subset(program, &changed);
+                cleanup_sweep(
+                    &PassManager::unroll_cleanup(),
+                    program,
+                    &changed,
+                    verify_each,
+                )?;
                 if verify_each {
                     wukong_opt::verify_program_stage(program, "unroll cleanup")?;
                 }
@@ -360,7 +366,12 @@ fn run_steps_to(
                 if verify_each {
                     wukong_opt::verify_program_stage(program, "slp")?;
                 }
-                PassManager::unroll_cleanup().run_subset(program, &packed);
+                cleanup_sweep(
+                    &PassManager::unroll_cleanup(),
+                    program,
+                    &packed,
+                    verify_each,
+                )?;
                 if verify_each {
                     wukong_opt::verify_program_stage(program, "slp cleanup")?;
                 }
@@ -382,6 +393,24 @@ fn run_steps_to(
         wukong_opt::verify_program_stage(program, "optimization output")?;
     }
     Ok(())
+}
+
+/// The cleanup sweep after `unroll` or `slp`: `cleanup` (`PassManager::unroll_cleanup`) over just
+/// the functions the stage changed, as `optimize` runs it. Under `verify_each` every pass that
+/// runs is verified in every build profile and the first failure names the pass and the function,
+/// as `wukong_opt::optimize_verified` reports it; otherwise passes verify only in debug builds.
+fn cleanup_sweep(
+    cleanup: &PassManager,
+    program: &mut Program,
+    funcs: &[usize],
+    verify_each: bool,
+) -> Result<(), VerificationFailure> {
+    if verify_each {
+        cleanup.run_subset_verified(program, funcs)
+    } else {
+        cleanup.run_subset(program, funcs);
+        Ok(())
+    }
 }
 
 /// `wukongc [--emit=mir|mir-text] [-O<n>] [--passes=..] [--print-after=..] <file>.mir`: read a
@@ -701,6 +730,49 @@ mod tests {
             .next()
             .unwrap();
         assert_eq!(last, plain);
+    }
+
+    /// Under `--verify-each`, a cleanup pass that leaves a function invalid after `unroll` or
+    /// `slp` is reported the way `wukong_opt::optimize_verified` reports it: by pass and by
+    /// function, as a `VerificationFailure` — not as a panic (debug build) or as a failure of the
+    /// whole `unroll cleanup` stage with no pass or function named (release build).
+    #[test]
+    fn verify_each_names_the_cleanup_pass_and_function_that_broke_the_mir() {
+        struct BreakReturn;
+        impl Pass for BreakReturn {
+            fn name(&self) -> &'static str {
+                "break-return"
+            }
+            fn run_function(&self, f: &mut Function, _: &mut CfgAnalyses) -> bool {
+                let dangling = wukong_mir::ValueId(f.value_types.len() as u32 + 1);
+                f.blocks[0].term = wukong_mir::Terminator::Ret(Some(dangling));
+                true
+            }
+        }
+        let mut interner = Interner::new();
+        let mut program = Program::new();
+        for name in ["untouched", "unrolled"] {
+            let ty = wukong_mir::MirType::I32;
+            let mut b = wukong_mir::Builder::new(interner.intern(name), ty.clone());
+            let seven = b.build(ty.clone(), wukong_mir::Op::ConstInt(7, ty));
+            b.ret(Some(seven));
+            program.funcs.push(b.finish());
+        }
+        let mut sweep = PassManager::new();
+        sweep.add(Box::new(BreakReturn));
+        let failure = cleanup_sweep(&sweep, &mut program, &[1], true).unwrap_err();
+        assert_eq!(failure.pass, "break-return");
+        assert_eq!(failure.function, Some(program.funcs[1].name));
+        assert!(!failure.errors.is_empty());
+        assert!(
+            wukong_mir::verify::verify_function(&program.funcs[0]).is_empty(),
+            "the sweep runs only over the functions the stage changed"
+        );
+        let diag = crate::optimization_failure_diag(&failure, &interner);
+        assert_eq!(
+            diag.message,
+            "MIR verification failed after `break-return` in function `unrolled`"
+        );
     }
 
     #[test]
