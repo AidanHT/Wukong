@@ -376,7 +376,9 @@ parallel_reduce_lowp.wk: wukong_dot_bf16_parallel wukong_reduce_bf16_parallel wu
 parallel_reduce_minmax.wk: wukong_sreduce_f32_parallel wukong_sreduce_f32_parallel*2
 parallel_region_alias.wk:
 parallel_region_decline.wk: wukong_velem_f32_parallel
+parallel_region_kernels.wk: wukong_parallel_for wukong_parallel_for*3 wukong_rt_alloc wukong_rt_alloc*10 wukong_rt_free wukong_rt_free*10 wukong_sgemm wukong_sgemm*4 wukong_sreduce_f32 wukong_sreduce_f32*2 wukong_vmath_f32 wukong_vmath_f32*4
 parallel_region_reassigned_local.wk: veckernel*2
+parallel_region_slices.wk: veckernel*1 wukong_parallel_for wukong_parallel_for*3 wukong_rt_alloc wukong_rt_alloc*4 wukong_rt_free wukong_rt_free*4
 patterns_struct_binding_slice.wk:
 pointer.wk:
 pointer_null_condition.wk:
