@@ -117,6 +117,12 @@ not duplicate them. In summary, Wukong:
   `@unchecked` on a `fn` is the explicit opt-out. Runtime indices into fixed-size arrays and
   constant-shape tensors, and the extents handed to recognized runtime kernels, are not yet checked.
   A pointer used as a condition (`if p`) is a null test.
+- **128-bit integers.** `i128` and `u128` are first-class: literals up to `u128::MAX` (range-checked
+  at every width), wrapping arithmetic, division and shifts with the same zero-divisor, `MIN / -1`
+  and modulo-width rules as every other integer, once-rounded float conversions, struct fields,
+  arrays, `match`, `printf` and the integer builtins (`widening_mul` of two `u64` is a `u128`).
+  Native code keeps one in a register pair and calls the runtime only for division and float
+  conversion (`tests/run/i128_*.wk`).
 - **Abstraction without indirection.** `impl` blocks give structs and enums methods and associated
   functions; traits with bounds (`<T: Shape>`, `where`), function-typed parameters
   (`f: fn(f32) -> f32`) and compile-time-resolved closures (`apply(|x| x * scale, v)`, `let f = |x: f32| x * k;`, `v.map(|a| a * k)`; a read

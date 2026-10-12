@@ -416,8 +416,12 @@ Any other name is `E0301`, not a silent length of 0, and a fixed-size array may 
 Integer literals may be **decimal, hex `0xFF`, octal `0o17`, or binary `0b1010`**, with `_` digit
 separators (`1_000_000`) and an optional type suffix (`250u8`) (`tests/run/radix_literals.wk`). A
 malformed literal — a mistyped radix like `0z123`, an empty `0x`, a bad digit `0b2`, a garbled float
-`1.5z`, or a value past `u64` — is a compile error (`E0431`), never silently zeroed
-(`tests/fail/malformed_int_literal.wk`). A **float literal** takes `_` separators and an optional
+`1.5z`, or a value past `u128` — is a compile error (`E0431`), never silently zeroed
+(`tests/fail/malformed_int_literal.wk`, `tests/fail/u128_literal_past_u128.wk`). An unsuffixed
+integer literal is an `i32`, or the narrowest of `i64`, `u64`, `i128`, `u128` that holds it, and
+adapts to the integer type its context asks for — where a value that does not fit that type is
+`E0431` too, at every width (`let x: u64 = 18446744073709551616` and `let y: i128 =
+170141183460469231731687303715884105728` are both rejected, `tests/fail/literal_past_u64_into_narrow.wk`). A **float literal** takes `_` separators and an optional
 exponent, and its suffix may be `f32`, `f64`, `f16`, `bf16`, or the bare C-style `f` (= `f32`);
 unsuffixed it defaults to **`f32`** (`5f`, `1.5`, `1_000.5e-3`, `0.5bf16`). A malformed one — `1.5z`,
 an incomplete exponent `1.5e`, a doubled suffix `5ff` — is `E0431`, never silently `0.0`. A
@@ -446,7 +450,7 @@ stack frame), a `*u8` can be **returned from a function and threaded across call
 
 | Category    | Examples                                            | Status |
 |-------------|-----------------------------------------------------|--------|
-| Integers    | `i8 i16 i32 i64`, `u8 u16 u32 u64`, `usize isize` — no 128-bit type (a `u128`/`i128` literal suffix is `E0431`) | ✅     |
+| Integers    | `i8 i16 i32 i64 i128`, `u8 u16 u32 u64 u128`, `usize isize` ([128-bit integers](#128-bit-integers-i128-and-u128-)) | ✅     |
 | Floats      | `f16 bf16 f32 f64`                                   | ✅ scalar |
 | FP8         | E4M3FN / E5M2 codes stored as `u8`, converted with the [scalar builtins](#scalar-builtins-) (`f8e4m3_to_f32`, `f32_to_f8e4m3`, …); no first-class `f8` type | 🟡 storage |
 | Boolean     | `bool`                                               | ✅     |
@@ -471,6 +475,57 @@ interpreter reserves its address 0 as a never-allocated null so it agrees with n
 load or store through null is the interpreter diagnostic `null pointer dereference` (native faults).
 A condition must be a boolean, a number (nonzero is true) or a pointer: an aggregate, slice, tensor
 view, SIMD vector or function value is `E0436`.
+
+### 128-bit integers: `i128` and `u128` ✅
+
+`i128` and `u128` are ordinary integer types: 16 bytes, 16-byte aligned (the x86-64 psABI's
+`__int128`, Rust's `i128`), usable everywhere a narrower integer is — locals, parameters and
+results, struct and tuple fields, array and slice elements, `alloc::<i128>(n)` buffers, `match`
+scrutinees. Their literals are written with a `i128`/`u128` suffix or adapt like any unsuffixed
+literal, and reach exactly the full ranges: `-170141183460469231731687303715884105728` to
+`170141183460469231731687303715884105727`, and `0` to `340282366920938463463374607431768211455`
+(one past either end, or a literal past `u128`, is `E0431`; `tests/fail/i128_literal_out_of_range.wk`).
+
+- **Arithmetic** follows the integer rules of every width ([Operators](#operators-)): `+ - *` and
+  unary `-` wrap at 128 bits (`i128::MAX + 1` is `i128::MIN`, `0u128 - 1` is `u128::MAX`); `/` and
+  `%` truncate toward zero, a zero divisor gives `0`, and `i128::MIN / -1` wraps to `i128::MIN`
+  with remainder `0`; a shift amount is taken modulo 128 and `>>` is arithmetic on `i128`, logical
+  on `u128` (`tests/run/i128_arith.wk`).
+- **Mixed arithmetic** promotes losslessly, as for the narrower types: `i64 + i128` and
+  `u64 + i128` are `i128`, `u32 * u128` is `u128`; `u128 + i64` (neither holds the other) and any
+  128-bit integer with a float are `E0440`, and a mixed-signedness compare `i128 < u128` is `E0433`
+  (`tests/fail/i128_unsigned_mix.wk`). A 128-bit value never narrows implicitly.
+- **As an index** an `i128`/`u128` is clamped to `i64`'s range before the address is formed, never
+  truncated: `s[18446744073709551617]` is out of bounds (reported as index `i64::MAX`), not `s[1]`;
+  a constant index past `i64` is `E0501` on an array (`tests/run/i128_index_clamp.wk`). So is a
+  128-bit count or extent handed to a builtin that takes a 64-bit one (`alloc_i32(n)`, `ldexp`'s
+  exponent): `alloc_i32(2^64 + 4)` asks for `i64::MAX` elements, not 4. An explicit `as i64` still
+  keeps the low 64 bits.
+- **`as`** converts to and from every integer and float type: narrowing keeps the low bits,
+  widening extends by the source's signedness, an integer-to-float conversion rounds once (straight
+  to `f32`, never through `f64`), and a float-to-integer one truncates and saturates, NaN to `0`
+  (`tests/run/i128_casts.wk`).
+- **Printing.** `print`/`println` print the full decimal value, `printf`'s `{}`, `{:x}`, `{:#b}`,
+  `{:+}`, widths and fills apply, and an aggregate holding one prints it in place
+  (`tests/run/i128_aggregates.wk`).
+- **`match`** on a 128-bit value takes literal and range patterns over the whole range; a match is
+  exhaustive exactly when its arms cover `i128::MIN..=i128::MAX` (or `0..=u128::MAX`), with
+  the missing values named in `E0405` (`tests/run/i128_match_builtins.wk`).
+- **The integer [scalar builtins](#scalar-builtins-)** take 128-bit operands — `popcount`, `clz`,
+  `ctz`, `bswap`, `rotl`/`rotr`, `sat_add`/`sat_sub`, `mulhi`, `overflowing_*`, `sat_cast`,
+  `min`/`max`/`clamp` — and `widening_mul` of two 64-bit operands now has its result type
+  (`u64` × `u64` → `u128`, `i64` × `i64` → `i128`); a 128-bit `widening_mul` would need 256 bits
+  and is `E0446` (`tests/fail/widening_mul_128.wk`).
+- **Not 128-bit:** `atomic_add` adds to places of at most 64 bits (a 128-bit place is `E0446`);
+  an `extern "C"` signature cannot carry one (`C0001`, `tests/fail/extern_i128.wk` — C has no
+  standard 128-bit integer, so pass it by pointer); a SIMD vector has no 128-bit lanes (a loop over
+  `i128` data stays scalar); and `--backend=gpu-native` declines a function that holds one (PTX
+  integers stop at 64 bits).
+
+On the native backend a 128-bit value lives in a register pair. Addition, multiplication, the
+bitwise operations, shifts and compares are inline instructions; x86-64 has no 128-bit divide and no
+128-bit integer/float conversion, so those are a call into the runtime (`wukong_runtime::int128`) that
+computes exactly what the interpreter computes.
 
 ### Strings: `str` ✅
 
@@ -2069,7 +2124,7 @@ shadows any of them.
 | `sat_add(a, b)`, `sat_sub(a, b)` | `a ± b` clamped to the type's range | `T` |
 | `sat_cast::<T>(x)` | an integer clamped into the integer type `T`; a float converts as `as` does | `T` |
 | `mulhi(a, b)` | the high half of the double-width product (`floor(a·b / 2^w)`) | `T` |
-| `widening_mul(a, b)` | the exact product one width up (`i8`→`i16` … `u32`→`u64`; 64-bit operands are `E0446`) | `2T` |
+| `widening_mul(a, b)` | the exact product one width up (`i8`→`i16` … `u64`→`u128`; 128-bit operands are `E0446`) | `2T` |
 | `overflowing_add/_sub/_mul(a, b)` | the wrapped result and whether it overflowed | `(T, bool)` |
 | `bits(x)` | a float's IEEE bit pattern (`f32`→`u32`, `f64`→`u64`, `f16`/`bf16`→`u16`) | unsigned int |
 | `f32_from_bits(u)`, `f64_from_bits`, `f16_from_bits`, `bf16_from_bits` | the float with those bits (an integer of exactly that width) | the float |
@@ -2300,8 +2355,9 @@ fn hist(x: [i32; 4096], mut h: [i64; 16]) {
   or tensor), a field `s.f` or `t.0`, or a pointee `*p`. A bare local is private to the thread
   running it, so `atomic_add(n, 1)` is **`E0437`** (write `n += 1`). The write obeys `=`'s rules: a
   non-`mut` aggregate parameter is `E0304`, a slice index is bounds-checked.
-- The place's type is an integer of any width and signedness — `i8`..`i64`, `u8`..`u64`, `isize`,
-  `usize` — never `bool`, `char` or a float (**`E0446`**). Integer-only on purpose: integer addition
+- The place's type is an integer of at most 64 bits, of either signedness — `i8`..`i64`,
+  `u8`..`u64`, `isize`, `usize` — never `bool`, `char`, a float or an `i128`/`u128` (no machine has
+  a single-instruction 128-bit atomic add) (**`E0446`**). Integer-only on purpose: integer addition
   mod 2^n commutes, so every thread schedule leaves the same total, while a float sum depends on the
   order of its adds.
 - `v` has the place's type. An unsuffixed literal adapts to it (out of range is `E0431`); a value of
@@ -2462,8 +2518,9 @@ fn main() -> i32 {
 An `extern "C"` block declares C functions by their C symbol names; calls type-check against the
 declared signature like any other call (`tests/run/extern_c_libm.wk`). A signature may use integers
 (signedness is honored for narrow ones), `bool`, `f32`, `f64`, and raw pointers / references; anything
-without a C mapping — a slice, array, tuple, struct, enum, tensor, SIMD vector, `f16`/`bf16`, or a
-generic signature — is **C0001** at the declaration (pass `*T` plus a length instead). Variadic C
+without a C mapping — a slice, array, tuple, struct, enum, tensor, SIMD vector, `f16`/`bf16`, an
+`i128`/`u128` (C has no standard 128-bit integer; `tests/fail/extern_i128.wk`), or a generic
+signature — is **C0001** at the declaration (pass `*T` plus a length instead). Variadic C
 functions (`printf`) cannot be declared.
 
 - **Native** (`--backend=native`, `--emit=obj|exe`): the symbol is imported with the C ABI. The JIT

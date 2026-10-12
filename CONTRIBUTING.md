@@ -430,6 +430,25 @@ whose `-O0` answer differs from the miscompiled one, run at `-O0`/`-O1`/`-O2`
 Front-end plumbing (`wukong_sema`'s intrinsic return type, `wukong_mir_build`'s intrinsic map and
 both vectorizer arms) closes the loop. Gate with `cargo test -p wukongc --test run`.
 
+## Adding a scalar type or an integer width
+
+`i128`/`u128` (`Scalar::I128`/`U128`, `MirType::I128`) is the worked example. The exhaustive
+matches the compiler lists are the easy part (`cargo check --workspace --all-targets --keep-going`,
+then `cargo check -p wukong_codegen_gpu --features gpu --all-targets`). The silent list is every
+**width table with a default arm** — `int_bits`/`mask`/`uval` in the interpreter and
+`wukong_opt::simplify`, `cast_kind`/`numeric_join` in `wukong_mir_build`, the scalar builtins'
+`width`, the LLVM emitter's shift and constant tables — where a new width falls into `_ => 64` and
+computes at the wrong width on one backend only (`grep -rn 'MirType::I64 =>' crates`). Arithmetic
+that was safe on `i128` holding narrower values is not once a value can be `i128::MIN`: negate
+with `wrapping_neg`, and never write `1i128 << bits` for `bits == 128`. Passes that pattern-match a
+width (`switch_case_value`, the unroller, the vectorizers' `lane_bytes`) decline by default — keep
+it that way unless the width is supported end to end. Then check what each backend can actually
+lower (Cranelift's x64 ISLE rules; its mid-end rewrites can create ops the backend cannot lower),
+regenerate the LLVM emitter's runtime ABI table for any new runtime entry
+(`WUKONG_UPDATE_RUNTIME_ABI=1`), list a new runtime module in `safety.rs`'s `LAW_MODULES`, and
+pin every operation at both ends of the range on both backends at `-O0` and `-O2` with operands
+the optimizer cannot fold (`tests/run/i128_*.wk` take an opaque zero from `arg_count()`).
+
 ## Adding a runtime kernel (and its recognizer)
 
 A "recognized kernel" is a loop shape that `wukong_mir_build` pattern-matches and replaces with a

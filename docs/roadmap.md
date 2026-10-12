@@ -188,7 +188,10 @@ native JIT write a `perf-<pid>.map` (`<start> <size> <name>`) so `perf` names JI
   `const` used as a value** (its initializer inlined at every use site — arithmetic, array index,
   loop bound, **array length in a type** (`let a: [i32; N]`; `tests/run/const_array_length.wk`),
   const-referencing-const; `tests/run/top_level_const.wk`).
-- Integers (`i8..i64`, `u8..u64`, `usize`/`isize`), `bool`, `char` (a 32-bit Unicode scalar,
+- Integers (`i8..i64`, `u8..u64`, `usize`/`isize`, and **`i128`/`u128`** — 16 bytes, 16-aligned,
+  in fields, arrays, slices, `match`, `printf` and the integer builtins, with wrapping arithmetic,
+  zero-divisor and `MIN / -1` division, shifts modulo 128 and once-rounded float conversions
+  pinned on both backends by `tests/run/i128_*.wk`), `bool`, `char` (a 32-bit Unicode scalar,
   interconvertible with the integers via `as`; `tests/run/char_type.wk`), and floats. `f32` is computed at **`f32`
   precision** (interpreter and native agree exactly); **both `bf16` and `f16` are real 2-byte storage**
   rounded to that grid (round-to-nearest-even) on store and on the cast, with `f32` compute. bf16 rounds
@@ -1766,10 +1769,16 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   one piece, and the call's "may touch any memory" verdict keeps it scalar. The copy that keeps the
   calls stays scalar too.
 
-- **Scalar-type gaps** (2026-10-08). There is no 128-bit integer (`u128`/`i128` literal suffixes
-  are `E0431`; Cranelift's x64 backend has no `i128` divide, so the type needs a runtime first), and
-  FP8 is storage-only — E4M3FN/E5M2 codes in `u8` with conversion builtins, no `f8` scalar type that
-  loads, stores and promotes by itself; packed `int4` and constructible SIMD values are not started.
+- **Scalar-type gaps** (2026-10-08; `i128`/`u128` landed 2026-10-12). FP8 is storage-only —
+  E4M3FN/E5M2 codes in `u8` with conversion builtins, no `f8` scalar type that loads, stores and
+  promotes by itself; packed `int4` and constructible SIMD values are not started. The 128-bit
+  integers run everywhere but in four places: `atomic_add` takes at most 64 bits (`E0446`), an
+  `extern "C"` signature cannot carry one (`C0001`), the loop vectorizers never widen them (a loop
+  over `i128` data stays scalar — no ISA has 128-bit integer lanes), and `gpu-native` declines a
+  function holding one. On the native backend a 128-bit divide or integer/float conversion is one
+  runtime call (`wukong_runtime::int128`), not an inline sequence; the cc-fallback runtime of
+  `--emit=exe` (used only without a Rust toolchain) does not carry those entries or the 128-bit
+  printer, so such a program links only through the default rustc path.
   The bit-count builtins (`popcount`, `clz`, `ctz`, `bswap`) keep a loop scalar (the vectorizer does
   not widen `Op::IntUnary`), `gpu-native` declines them, and `erfc`/`erfinv`/`lgamma` are one
   scalar runtime call per element at every precision.

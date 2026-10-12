@@ -607,7 +607,9 @@ greps for the literal substring `"code":"Ennnn"`, so key order and the absence o
 ## MIR
 
 A `Function` owns a value arena (`ValueId -> MirType`), a list of `BasicBlock`s, and an entry block.
-Each block has typed parameters, a straight-line list of `Inst { result: Option<ValueId>, op: Op }`,
+Integers are signless `i1`/`i8`/`i16`/`i32`/`i64`/`i128` (signedness lives on the op, as in LLVM);
+`i128` is scalar-only — the verifier rejects a vector of `i128` lanes anywhere, and neither a
+`Switch` scrutinee nor an `AtomicAdd` value may be one. Each block has typed parameters, a straight-line list of `Inst { result: Option<ValueId>, op: Op }`,
 and exactly one `Terminator` (`Ret`, `Br`, `CondBr`, `Switch`, `Unreachable`). `Switch` is a multi-way
 branch on an `i8`..`i64` scrutinee whose case values are stored canonically (sign-extended from the
 type's width) and pairwise distinct; only `wukong_opt`'s late switch formation creates one, and the
@@ -620,7 +622,7 @@ with no result), `Call`, `Barrier` (cooperative thread-block fence from
 `sync_block()`), the float/SIMD primitives
 (`Splat`/`ExtractLane`/`Iota`/`Fma`/`Sqrt`/`Round`), the lane-moving SIMD ops
 (`Widen`/`Narrow`/`Shuffle`/`InsertLane`), `IntUnary` (`popcnt`/`clz`/`ctz`/`bswap` on a scalar
-`i8`..`i64`, semantics in `IntUnOp::eval`; no `i8` `bswap`, never widened by the vectorizer,
+`i8`..`i128`, semantics in `IntUnOp::eval_wide`; no `i8` `bswap`, never widened by the vectorizer,
 declined by `gpu-native`), the address-of ops (`FuncAddr`, `GlobalAddr`), and `VecKernelCall`.
 `Widen` converts one half of a vector's lanes to twice their width (`SExt`/`ZExt`
 /`FpExt`) and `Narrow` joins two vectors into one of half the lane width (truncating, saturating
@@ -1411,7 +1413,12 @@ heavy transformer/GEMM kernels)** and runs ~1.5–2.5x faster than -O0 under the
 `wukong_interp` is a from-scratch CFG walker over MIR that adds no external crate of its own — it
 depends only on `wukong_span`, `wukong_mir`, `wukong_backend` and `wukong_runtime`, the last so a
 recognized-kernel call executes the *identical* microkernel the native backend links. `Value` is
-`Int(i128) | Float(f64) | Ptr(usize) | VecRef(usize) | Unit`.
+`Int(i128) | Float(f64) | Ptr(usize) | VecRef(usize) | Unit`. A narrower integer is held
+sign-extended from its width and masked back after every op; an `i128`/`u128` *is* its 128-bit
+pattern (a `u128` above `i128::MAX` is held as the negative `i128` with the same bits), so the
+`i128` arithmetic wraps natively and every unsigned op (`udiv`, `urem`, `lshr`, `uitofp`, the
+unsigned compares) reads the pattern through `as u128`. The integer paths use wrapping `i128`
+operations throughout, since `-i128::MIN` is now a value a program can reach.
 
 Memory is a single flat `Vec<Value>`. Scalar MIR arrays use one typed slot per element. Source
 structs and tuples lower to byte buffers, which use **one slot per layout byte**, including padding;
@@ -1537,6 +1544,45 @@ own temp directory, so a relative `-o hello.exe` fails with `LNK1181: cannot ope
 'hello.<crate>…rcgu.o.rcgu.o'`. Nothing here touches the debug path: a native rlib links exactly as
 before, with neither flag. The cost is confined to release AOT, where the link is a whole LTO of the
 runtime and std — tens of seconds per executable rather than under a second.
+
+### 128-bit integers on Cranelift (`int128.rs`)
+
+An MIR `i128` is a CLIF `I128`, which x64 holds in a register pair and lowers by itself for
+`iadd`/`isub`/`imul`, the bitwise ops, shifts (amount modulo 128, the MIR rule), `ineg`/`bnot`,
+`icmp`, loads, stores, `sextend`/`uextend`/`ireduce` and `popcnt`/`clz`/`ctz`/`bswap`. Four things
+are legalized in `wukong_codegen_cranelift/src/int128.rs`:
+
+- **Constants.** `iconst.i128` takes a 64-bit immediate, so a constant is `iconcat` of its two
+  halves.
+- **Division and float conversion.** x64 has no 128-bit `sdiv`/`udiv`/`srem`/`urem` and no 128-bit
+  `fcvt_*`, so each is one call: `wukong_rt_i128_divrem(a_lo, a_hi, b_lo, b_hi, op, out)`,
+  `wukong_rt_i128_to_f64`/`_to_f32(lo, hi, signed)` and `wukong_rt_f64_to_i128(x, signed, out)`
+  (`wukong_runtime::int128`). An operand crosses as its two `i64` halves and a 128-bit result
+  comes back through a 16-byte stack slot, so no platform `i128` calling convention is involved
+  (compilers have disagreed on it). The entries carry the language's semantics — a zero divisor
+  is `0`, `MIN / -1` wraps, the conversion rounds once straight to the target precision and
+  saturates — and are unit-tested against Rust's own `i128` arithmetic; the interpreter computes
+  the same on its `i128` values. The JIT binds the runtime's own entries; a linked executable
+  resolves them from the rlib (the cc fallback runtime has no twins).
+- **`select`.** x64 lowers a 128-bit `select`, but Cranelift's mid-end rewrites
+  `select(icmp(x, y), x, y)` into `smin`/`umax`/…, which x64 cannot lower at 128 bits — so a plain
+  `min(a, b)` failed to compile at `-O2`. A 128-bit `select` is emitted as two 64-bit selects of the
+  halves, which that rewrite cannot match.
+- **Signatures.** A Wukong function with an `i128` parameter or result uses LLVM's convention (two
+  consecutive integer registers or stack words, low half first), which Cranelift's x64 ABI
+  implements only under `enable_llvm_abi_extensions` (it panics otherwise). Every caller and callee
+  of such a signature is code this backend generates, and the flag changes nothing else Wukong
+  emits; an `extern "C"` signature cannot carry an `i128` at all (`C0001`).
+
+Printing goes through the formatting runtime like `printf`'s `{}`: `wukong_rt_fmt_i128` takes the
+value as two `i64` halves (`text_rt`'s `Abi::I128` class splits the one MIR argument). Lowering
+never truncates a 128-bit index or count implicitly: `wukong_mir_build`'s `lower_index_i64` and
+`coerce_to` clamp an `i128` to `i64`'s range (`saturate_i128_to_i64`) before it becomes an address
+or a builtin's 64-bit operand, so an index past `i64` stays out of bounds; only an explicit `as`
+truncates. The loop
+vectorizers have no 128-bit lane (`lane_bytes`/`vector_width` decline it), so a loop over `i128`
+data stays scalar, and `wukong_codegen_gpu::lower` declines any function holding an `i128`
+(`decline_i128`: PTX integers stop at 64 bits).
 
 ### Debug info (`-g`) and the JIT perf map
 
@@ -1846,7 +1892,12 @@ structurally:
   each `wukong_*` declaration to equal its definition (print/assert against the `--emit=exe` link
   shim) and every symbol to have one signature across its `define`, `declare` and calls. With opaque
   pointers LLVM's verifier checks neither: the general vectorizer's f64/i32/i64 recipes were defined in
-  `float` and called as `double`/`i64`, and the corpus verified clean.
+  `float` and called as `double`/`i64`, and the corpus verified clean. An `i128` argument fills two
+  consecutive `i64` slots, low half first (`trunc` and `lshr`/`trunc`), as the Cranelift call passes
+  it; it is never narrowed into one slot. Inside a function `i128` is LLVM's own `i128`: the guarded
+  `sdiv`/`udiv`, `sitofp` and `llvm.fptosi.sat.i128` are what an LLVM backend lowers to the
+  `__divti3`/`__floattidf`/`__fixdfti` family, which the rustc link of `--emit=exe` provides through
+  `compiler_builtins`.
 - **Alignment.** A vector load or store carries `align <lane bytes>` — LLVM otherwise assumes the whole
   vector's alignment, and the vectorizer accesses `<4 x float>` at every element offset, so executing
   a module faulted in `movaps` — and a stack slot carries the native backend's alignment, which is
