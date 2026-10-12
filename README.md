@@ -39,6 +39,7 @@ wukongc --emit=mir-text --target-cpu=x86-64-v2 examples/fib.wk > fib.mir  # MIR 
 wukongc --emit=mir -O2 fib.mir                       # optimize a MIR dump, no front end
 wukongc --emit=exe -O2 --target-cpu=x86-64 examples/fib.wk  # portable AOT executable
 wukongc --emit=mir,llvm-ir,obj -O2 -o fib examples/fib.wk  # fib.mir-low, fib.ll, fib.o
+wukongc --repl                                       # interactive session (`:help` inside)
 ```
 
 `--run` defaults to the interpreter; add `--backend=native` for the Cranelift JIT. GPU backends
@@ -51,7 +52,9 @@ compile's time went, and `--depfile=<f>` writes a Make dependency rule over the 
 `wukongc --emit=mir|mir-text <file>.mir` reads it back, so an optimizer bug reproduces from a dump
 (`docs/internals.md`, "Typed textual MIR"). `--emit=<stage>,<stage>,...` writes several artifacts
 from one compile — on stdout under `==> <stage> <==` headers, or each at `<stem>.<ext>` with
-`-o <stem>` (language guide, "Several artifacts at once").
+`-o <stem>` (language guide, "Several artifacts at once"); `wukongc --repl` is an interactive
+session: items are kept, statements run, an expression prints its value, and `:type <expr>` asks
+sema (language guide, "The REPL").
 
 ## Why Wukong
 

@@ -854,8 +854,20 @@ line table built from them is not emitted yet.
   `wukongc --run prog.wk -- …`, or a linked executable's own `argv`), `env`, `read_stdin_u8` and
   `exit(code)` (which returns through every caller on the JIT, like a failed `assert`).
   `wukongc -` reads the program from standard input and `wukongc -e <source>` takes it inline
-  (`tests/run/process_exit.wk`, `crates/wukongc/tests/process_io.rs`). 🟡 No interactive REPL yet,
-  and no line-at-a-time stdin read.
+  (`tests/run/process_exit.wk`, `crates/wukongc/tests/process_io.rs`). 🟡 A program reads
+  standard input a buffer at a time (`read_stdin_u8`); there is no line-reading builtin.
+- **Interactive REPL**: `wukongc --repl` reads standard input a line at a time — an input runs on
+  over the next lines while a bracket or a block comment is open — on the interpreter or the
+  native JIT. Items (`fn`, `struct`, `enum`, `const`, `import`, `impl`, …) are kept and a later item
+  of the same name replaces an earlier one; statements run in a synthesized `main` after a replay of
+  every earlier statement input whose stdout and stderr are dropped, so `let` bindings persist; an
+  input ending in an expression prints its value `{:?}`-style. `:help`, `:quit`, `:reset`, `:items`
+  and `:type <expr>` (sema's type, nothing runs). Every input is its own file `<repl:N>`, so
+  diagnostics point into it; a failing input (compile, run time, `exit`) is dropped and the session
+  goes on (`crates/wukongc/tests/repl.rs`, both backends). 🟡 Sharp edges, by design of the replay:
+  every input re-executes the earlier ones (their time, their file writes, their clock reads), and an
+  input's output appears when it finishes, not as it runs. A top-level `return`/`defer` is refused,
+  a program reads end of input from `read_stdin_u8`, and the GPU backends are not offered.
 - **`--run` streams stdout** on the interpreter and the native JIT — per line on a terminal, in
   64 KiB blocks into a pipe — instead of holding everything until the program ends, so a training
   loop shows its progress and output printed before a runtime failure is already out. The GPU

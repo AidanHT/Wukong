@@ -51,6 +51,10 @@ pub mod passes;
 /// Whole-program reachability pruning ahead of optimization (`--run`, `--emit=exe`).
 mod prune;
 
+/// `wukongc --repl`: an interactive session that compiles and runs standard input an input at a
+/// time ([`repl::run`]).
+pub mod repl;
+
 /// `--time-passes` / `--time-trace` stage timing and `--depfile` dependency files.
 mod report;
 
@@ -247,6 +251,10 @@ pub struct Options {
     /// honour.
     pub emit_also: Vec<EmitStage>,
     pub run: bool,
+    /// `wukongc --repl`: read standard input a line at a time and evaluate it ([`repl`]). The
+    /// session honours the backend (`interp`/`native`), `-O`, `--fp`, `--target-cpu`, the lint
+    /// levels and the diagnostic format; `input` is unused.
+    pub repl: bool,
     pub opt_level: u8,
     /// Validate MIR after each optimizer pass, including in release builds (`--verify-each`).
     pub verify_each: bool,
@@ -386,6 +394,7 @@ impl Default for Options {
             emit: EmitStage::Exe,
             emit_also: Vec::new(),
             run: false,
+            repl: false,
             opt_level: 0,
             verify_each: false,
             passes: None,

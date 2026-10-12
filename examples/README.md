@@ -25,6 +25,9 @@ Several stages at once come from one compile: `--emit=mir,llvm-ir -O2 examples/d
 under `==> <stage> <==` headers, and `--emit=mir,llvm-ir,obj -O2 -o dot examples/dot.wk`
 writes `dot.mir-low`, `dot.ll` and `dot.o`.
 
+To try the language a line at a time, `cargo run -p wukongc -- --repl` starts an interactive
+session: paste a function from an example, then call it (`:help` lists the commands).
+
 `--run` and an explicit `--emit=<stage>` are mutually exclusive: the compiler honours exactly one of
 them, so the combination is rejected rather than silently discarding half the work.
 

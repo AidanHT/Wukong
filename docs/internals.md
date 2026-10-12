@@ -345,6 +345,27 @@ list with `-o`; the object and executable reach `emit_native` through a clone of
 that involve other flags (`-o`, `--run`, `--train`, `--depfile`, `--passes`, a `.mir` input) stay in
 `wukongc`'s `parse_args`.
 
+**The REPL (`wukong_driver::repl`).** `wukongc --repl` keeps the inputs it accepted as source text
+and, for every new input, compiles a whole program from them through the same front end, lowering,
+optimizer and backends as `--run`. Each input is its own `SourceMap` file, `<repl:N>`, so diagnostics
+need no remapping: an item input parses with `parse_module_tokens_with_lints`, a statement input
+with `wukong_parser::parse_stmts_tokens_with_lints` (a block body to end of input, the tail
+expression kept), and the wrapper `main` is parsed from source too — `fn main() -> i32 {
+__wukong_repl_replay; printf(MARK); eprintf(MARK); __wukong_repl_input; [printf("{:?}\n",
+__wukong_repl_value);] printf(END); return 0; }` — and its placeholders are replaced by the parsed
+statements of every earlier statement input (the replay), the new input's statements, and its tail.
+The run captures stdout (`run_capturing` on either backend) and stderr
+(`wukong_runtime::fmt::begin_stderr_capture`, which `write_stream` and the interpreter's stderr
+path honour); only what follows `MARK` is shown, and `END` present is how the session knows the
+input ran to its end (an `exit(0)` is otherwise indistinguishable from completion). An item input is
+compiled with the replay and the replay is run, so a redefinition that breaks an earlier input is
+refused; items are grouped (an `impl` marker with its flattened methods) and keyed by name, and a
+later group with the same key drops the earlier one. A tail's value is printed when sema accepts it
+as a `printf("{:?}")` argument (a second check of the printing program decides, so the REPL never
+re-derives which types print); otherwise its type is shown. `wukong_runtime::process::detach_stdin`
+gives every program the session runs an empty standard input. The rules a user sees are in the
+language guide, "The REPL".
+
 ## Diagnostics
 
 Every diagnostic has a stable code (`E01xx` lexer, `E02xx` parser, `E03xx` name res, `E04xx` types,

@@ -14,6 +14,7 @@ USAGE:
     wukongc [OPTIONS] <input.wk> [-- <program args>...]
     wukongc [OPTIONS] -              (read the program from standard input)
     wukongc [OPTIONS] -e <source>    (the program is the <source> argument)
+    wukongc --repl [OPTIONS]         (an interactive session on standard input; `:help` inside)
     wukongc fmt [--check] [--stdout] <path|->...   (format source files; `wukongc fmt --help`)
 
 OPTIONS:
@@ -72,6 +73,12 @@ OPTIONS:
     --run              Compile and run (interpreter by default; see --backend). The program's
                        stdout streams as it runs: per line on a terminal, in blocks into a pipe
                        or a file
+    --repl             Read standard input a line at a time and evaluate it: items (fn, struct,
+                       enum, const, import, impl, ...) are kept; a statement runs and an
+                       expression prints its value; an input continues while a bracket is open.
+                       Commands: :help, :quit, :reset, :items, :type <expr>. Takes --backend
+                       (interp, native), -O, --fp, --target-cpu, -A/-W/-D, --color,
+                       --error-format, --error-limit and --threads
     --backend=<b>      Execution backend: interp, native, gpu, gpu-native  (default: interp)
                        (gpu/gpu-native require --features gpu and a CUDA device; gpu is the
                        recognizer offload, gpu-native lowers the whole program's MIR to PTX)
@@ -137,6 +144,7 @@ EXAMPLES:
     wukongc --run model.wk -- data/weights.bin 64
     wukongc --run -e 'fn main() -> i32 { printf(\"{}\\n\", 6 * 7); return 0; }'
     wukongc --emit=mir,llvm-ir,obj -O2 -o kernel kernel.wk
+    wukongc --repl --backend=native
 ";
 
 fn main() -> ExitCode {
@@ -181,7 +189,14 @@ fn run_compile(opts: Options) -> i32 {
     std::thread::Builder::new()
         .name("wukongc-compile".to_string())
         .stack_size(STACK_SIZE)
-        .spawn(move || compile(&opts))
+        // The REPL compiles every input on this same roomy stack.
+        .spawn(move || {
+            if opts.repl {
+                wukong_driver::repl::run(&opts)
+            } else {
+                compile(&opts)
+            }
+        })
         .expect("failed to spawn compiler thread")
         .join()
         .unwrap_or(wukong_driver::exit::COMPILE_ERROR)
@@ -373,6 +388,66 @@ fn indexed_path(flag: &str, v: &str) -> Result<(usize, PathBuf), String> {
     Ok((index, PathBuf::from(path)))
 }
 
+/// `--repl` evaluates standard input on the interpreter or the native JIT. It honours the flags
+/// that shape how an input compiles and runs — `--backend=interp|native`, `-O<n>`, `--fp`,
+/// `--target-cpu`, `-A/-W/-D`, `--color`, `--error-format`, `--error-limit` and `--threads` — and
+/// refuses every other one by name, rather than ignoring it.
+fn check_repl_flags(opts: &Options, has_input: bool, emit_explicit: bool) -> Result<(), String> {
+    let defaults = Options::default();
+    let refused = [
+        (has_input, "an input file or `-e`"),
+        (opts.run, "`--run`"),
+        (emit_explicit, "`--emit`"),
+        (opts.output.is_some(), "`-o`"),
+        (!opts.program_args.is_empty(), "`--` program arguments"),
+        (opts.grad.train, "`--train`"),
+        (
+            opts.grad.of.is_some() || !opts.grad.wrt.is_empty(),
+            "`--grad-of` / `--grad-wrt`",
+        ),
+        (opts.depfile.is_some(), "`--depfile`"),
+        (
+            opts.time_passes || opts.time_trace.is_some(),
+            "`--time-passes` / `--time-trace`",
+        ),
+        (
+            opts.passes.is_some() || opts.print_after.is_some(),
+            "`--passes` / `--print-after`",
+        ),
+        (opts.verify_each, "`--verify-each`"),
+        (opts.remarks_dispatch, "`--remarks`"),
+        (
+            matches!(
+                opts.backend,
+                wukong_driver::BackendKind::Gpu | wukong_driver::BackendKind::GpuLower
+            ),
+            "a GPU `--backend` (the REPL runs on interp or native)",
+        ),
+    ];
+    if let Some((_, what)) = refused.iter().find(|(given, _)| *given) {
+        return Err(format!("`--repl` does not take {what}"));
+    }
+    // The training knobs only mean something with `--train`, which is refused above; a
+    // non-default value given alongside `--repl` is refused rather than dropped.
+    let g = &opts.grad;
+    let d = &defaults.grad;
+    if g.train_steps != d.train_steps
+        || g.train_lr != d.train_lr
+        || g.train_weight_decay != d.train_weight_decay
+        || g.train_opt != d.train_opt
+        || g.train_seed != d.train_seed
+        || !g.train_init.is_empty()
+        || !g.train_data.is_empty()
+        || !g.train_save.is_empty()
+        || g.train_clip.is_some()
+        || g.train_warmup != d.train_warmup
+        || g.train_schedule != d.train_schedule
+    {
+        return Err("`--repl` does not take the `--train-*` options".into());
+    }
+    Ok(())
+}
+
 /// Parse CLI arguments. `Ok(None)` means a help / version / `--explain` message was already printed
 /// and we should exit successfully without compiling. The two rejected flag *combinations* are
 /// checked at the end, after the whole argv has been seen.
@@ -406,6 +481,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 return Ok(None);
             }
             "--run" => opts.run = true,
+            "--repl" => opts.repl = true,
             // Everything after `--` belongs to the program `--run` executes, not to the compiler.
             "--" => {
                 opts.program_args = args[i + 1..].to_vec();
@@ -658,6 +734,18 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     // Resolve color once the whole environment is known: `--color` (or its `auto` default) plus the
     // NO_COLOR / CLICOLOR_FORCE / TERM conventions, and VT setup on Windows.
     opts.color = resolve_color(color_choice);
+
+    // `--repl` reads its program from standard input, an input at a time: no input file, no stage
+    // and no artifact. What it does honour is checked in one place.
+    if opts.repl {
+        check_repl_flags(
+            &opts,
+            input.is_some() || inline_source.is_some(),
+            emit_explicit,
+        )?;
+        opts.input = PathBuf::from("<repl>");
+        return Ok(Some(opts));
+    }
 
     match (input, inline_source) {
         (Some(_), Some(_)) => {
@@ -1335,6 +1423,59 @@ mod tests {
             ".mir-low",
             "<stem>",
         ] {
+            assert!(USAGE.contains(doc), "USAGE must document {doc}");
+        }
+    }
+
+    /// `--repl` takes the flags that shape how an input compiles and runs, and refuses every other
+    /// one by name; the no-argument invocation is still the "no input file" usage error.
+    #[test]
+    fn repl_takes_the_run_shaping_flags_and_refuses_the_rest() {
+        let parse = |a: &[&str]| parse_args(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let o = parse(&["--repl"]).unwrap().unwrap();
+        assert!(o.repl && !o.run && o.backend == wukong_driver::BackendKind::Interp);
+        assert_eq!(o.input, PathBuf::from("<repl>"));
+        let o = parse(&[
+            "--backend=native",
+            "-O2",
+            "--repl",
+            "--fp=strict",
+            "--target-cpu=x86-64-v2",
+            "-D",
+            "warnings",
+            "--color=never",
+            "--error-format=json",
+            "--error-limit=3",
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(o.repl && o.opt_level == 2 && o.strict_fp);
+        assert_eq!(o.backend, wukong_driver::BackendKind::Native);
+        assert_eq!(o.error_format, wukong_driver::ErrorFormat::Json);
+        assert_eq!(o.error_limit, Some(3));
+        for bad in [
+            &["--repl", "p.wk"][..],
+            &["--repl", "-"][..],
+            &["--repl", "-e", "1"][..],
+            &["--repl", "--run"][..],
+            &["--repl", "--emit=mir"][..],
+            &["--repl", "-o", "k"][..],
+            &["--repl", "--", "a"][..],
+            &["--repl", "--train"][..],
+            &["--repl", "--train-steps=3"][..],
+            &["--repl", "--grad-of=f"][..],
+            &["--repl", "--backend=gpu"][..],
+            &["--repl", "--depfile=k.d"][..],
+            &["--repl", "--time-passes"][..],
+            &["--repl", "--passes=dce"][..],
+            &["--repl", "--verify-each"][..],
+            &["--repl", "--remarks=dispatch"][..],
+        ] {
+            let err = parse(bad).unwrap_err();
+            assert!(err.contains("--repl"), "{bad:?}: {err}");
+        }
+        assert_eq!(parse(&[]).unwrap_err(), "no input file given");
+        for doc in ["--repl", ":type <expr>", ":reset", ":items"] {
             assert!(USAGE.contains(doc), "USAGE must document {doc}");
         }
     }

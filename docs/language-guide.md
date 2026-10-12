@@ -2442,6 +2442,7 @@ continue a long subtraction and is not reported.
 wukongc [OPTIONS] <input.wk> [-- <program args>...]
 wukongc [OPTIONS] -              read the program from standard input (named <stdin>)
 wukongc [OPTIONS] -e <source>    the program is the <source> argument itself
+wukongc --repl [OPTIONS]         an interactive session on standard input (see "The REPL")
 
 --                    everything after it is passed to the program --run executes: arg(1),
                       arg(2), ... (arg(0) is the program); without --run it is a usage error
@@ -2542,6 +2543,9 @@ wukongc [OPTIONS] -e <source>    the program is the <source> argument itself
                       auto honours NO_COLOR, CLICOLOR_FORCE and TERM=dumb, and enables Windows VT
 --remarks=dispatch    print a note (stderr) at every statement — or function — the compiler replaced
                       with a recognized runtime kernel call, naming the kernel; output is unchanged
+--repl                read standard input a line at a time and evaluate it (see "The REPL"); takes
+                      --backend=interp|native, -O, --fp, --target-cpu, -A/-W/-D, --color,
+                      --error-format, --error-limit and --threads, and refuses every other flag
 -h, --help            print the usage text and exit 0
 -V, --version         print the version and exit 0
 ```
@@ -2655,3 +2659,73 @@ gradient compile is its own pipeline — at least `-O1`, autodiff lowering, no p
 `exe` (a library object exports every function under its source name, an executable keeps what
 `main` reaches, mangled: two builds), and a list with `--train`. A `.mir` input takes `mir`,
 `mir-text` or both.
+
+### The REPL ✅
+
+`wukongc --repl` reads standard input a line at a time and evaluates it on the interpreter, or on
+the native JIT with `--backend=native`:
+
+```
+$ wukongc --repl
+wk[1]> fn sq(x: f32) -> f32 { x * x }
+wk[2]> let a = [1.0, 2.0, 3.0];
+wk[3]> sq(a[2])
+9.0
+wk[4]> let mut total = 0.0;
+wk[5]> for i in 0..3 {
+   ...>     total = total + sq(a[i]);
+   ...> }
+wk[6]> total
+14.0
+wk[7]> :type a
+[f32; 3]
+```
+
+An input runs to the end of a line, or on over the next lines while a `(`, `[` or `{` (or a block
+comment) is still open; a bracket inside a string or a comment does not count. An input whose first token — after any `@attributes` — starts an
+item (`fn`, `struct`, `enum`, `const`, `import`, `extern`, `trait`, `impl`, `type`, `pub`) is
+**kept** for every later input; an item named like an earlier one **replaces** it (an `impl` block
+replaces the earlier `impl` of the same type and trait). Any other input is **statements**: they run
+as the body of a synthesized `main`, and an input that ends in an expression with no `;` prints the
+expression's value in `{:?}` style (`9.0`, `"hi"`, `[1, 2]`, `P { x: 1 }`); a `()` value prints
+nothing, and a value with no printed form (a pointer, a tensor, a function) prints its type in
+angle brackets (`<fn(f32) -> f32>`). Imports resolve against the current directory.
+
+**Bindings persist by replay.** Each statement input runs after a replay of every earlier statement
+input that was kept, in order, in the same `main` — so `let` bindings, and every later assignment to
+them, carry forward, and a later `let` of a name shadows the earlier one as it would in a block. The
+replay's stdout and stderr are captured and dropped, so only the new input's output shows. What the
+replay cannot undo it repeats: the earlier inputs' work is redone on every input (an input that took
+a second costs a second each time after), files they wrote are written again, and a clock read reads
+anew. A program in the REPL reads end of input from `read_stdin_u8` — standard input is the
+session's. Output appears when the input finishes running.
+
+**An input that fails is not kept.** One that fails to compile, fails at run time (a failed
+`assert`, an index out of bounds) or ends the program early (`exit(c)`, a `return` inside a block)
+is reported and dropped; the session continues from where it was. A new item is compiled with every
+kept input and the replay is run, so a redefinition that would break an earlier input — a changed
+signature, an `assert` that now fails — is refused. A top-level `return` or `defer`, and a function
+named `main`, are refused outright: `main` is the session's.
+
+**Diagnostics point into the REPL buffer.** Every input is its own source file, `<repl:N>` (`N`
+counts the inputs, as the prompt shows), so an error reads `--> <repl:5>:2:9` — line 2 of input 5 —
+with that input's line under it. Errors show wherever they are (a redefinition that breaks input 3
+shows the break in `<repl:3>`); warnings show for the new input only. `unused_variables`,
+`unused_mut` and `unused_imports` are off (a binding or an import is made for later inputs) and
+`dead_code` has nothing to measure against.
+
+| command | does |
+|---|---|
+| `:help` | print the commands and these rules |
+| `:quit` (`:q`, `:exit`, end of input) | leave the session (exit status 0) |
+| `:reset` | forget every item and binding |
+| `:items` | print the source of every item the session keeps, in definition order |
+| `:type <expr>` | print the type sema gives `<expr>` after the kept inputs, without running it |
+
+The REPL takes the flags that shape how an input compiles and runs (`--backend=interp|native`,
+`-O<n>`, `--fp`, `--target-cpu`, `-A`/`-W`/`-D`, `--color`, `--error-format`, `--error-limit`,
+`--threads`) and refuses the rest (an input file, `-e`, `--run`, `--emit`, `-o`, `--train`, …) as a
+usage error. On a terminal it prints a banner and the `wk[N]>` / `...>` prompts to stderr; with
+standard input a pipe it prints neither, so `wukongc --repl < session.txt` writes only values and
+program output to stdout. `wukongc` with no arguments is still the "no input file given" usage
+error.
