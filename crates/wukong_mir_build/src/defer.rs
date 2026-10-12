@@ -33,7 +33,7 @@ use wukong_ast::{
 };
 use wukong_diag::Diagnostic;
 use wukong_sema::{BuiltinCall, MethodCall, SemaResult};
-use wukong_span::{FxHashMap, Interner, Span, Symbol};
+use wukong_span::{FxHashMap, FxHashSet, Interner, Span, Symbol};
 use wukong_types::{Dim, Ty};
 
 /// Fresh `NodeId`s are minted DOWNWARD from here. The parser hands ids out upward from 0,
@@ -60,6 +60,9 @@ pub(crate) struct DeferOverlay {
     /// (`x.area()` with `x: T`) keeps the record its per-instance dispatch reads. Method calls with
     /// a known target were already rewritten into plain calls before this pass.
     pub(crate) method_calls: FxHashMap<NodeId, MethodCall>,
+    /// Entries layered over `sema.str_print_args`: a copied `str` print argument (`defer
+    /// println(s)`) still prints as text, not as the `[]u8` it is published as.
+    pub(crate) str_print_args: FxHashSet<NodeId>,
 }
 
 impl DeferOverlay {
@@ -74,6 +77,7 @@ impl DeferOverlay {
         s.methods
             .calls
             .extend(self.method_calls.iter().map(|(id, c)| (*id, c.clone())));
+        s.str_print_args.extend(self.str_print_args.iter().copied());
     }
 }
 
@@ -101,6 +105,7 @@ pub(crate) fn lower_defers(
         extra_call_dims: FxHashMap::default(),
         extra_builtin_calls: FxHashMap::default(),
         extra_method_calls: FxHashMap::default(),
+        extra_str_print_args: FxHashSet::default(),
         interner,
         next_id: DEFER_ID_TOP,
         diags: Vec::new(),
@@ -125,6 +130,7 @@ pub(crate) fn lower_defers(
                 call_dims: d.extra_call_dims,
                 builtin_calls: d.extra_builtin_calls,
                 method_calls: d.extra_method_calls,
+                str_print_args: d.extra_str_print_args,
             },
         )))
     } else {
@@ -162,6 +168,8 @@ struct Desugar<'a> {
     extra_builtin_calls: FxHashMap<NodeId, BuiltinCall>,
     /// Method-call records of the copies this pass creates.
     extra_method_calls: FxHashMap<NodeId, MethodCall>,
+    /// The copies this pass creates of a `str` print argument.
+    extra_str_print_args: FxHashSet<NodeId>,
     interner: &'a mut Interner,
     next_id: u32,
     diags: Vec<Diagnostic>,
@@ -617,6 +625,9 @@ impl Desugar<'_> {
             .cloned();
         if let Some(m) = method {
             self.extra_method_calls.insert(new, m);
+        }
+        if self.extra_str_print_args.contains(id) || self.sema.str_print_args.contains(id) {
+            self.extra_str_print_args.insert(new);
         }
         *id = new;
     }

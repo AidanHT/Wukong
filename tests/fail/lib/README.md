@@ -10,5 +10,8 @@ Support modules for compile-fail import tests:
   (E0313).
 - `geom_assoc.wk` — a type `Pt` with an associated `norm`, called bare by
   `fail/import_assoc_fn_bare.wk` (E0320, whose help must say `Pt`, not `lib.geom_assoc.Pt`).
+- `str_struct.wk`, `str_alias.wk` — a `struct str` and a `type str = i32;`, imported by
+  `fail/import_str_struct.wk` and `fail/import_str_alias.wk`: the built-in name stays reserved
+  after the loader renames an imported item `lib.<module>.str` (E0300).
 
 **Not counted as fixtures.** Non-recursive `read_dir` on `tests/fail/` never enters `lib/`.

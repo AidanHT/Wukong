@@ -101,6 +101,7 @@ fn kind_name(t: &Ty) -> &'static str {
         Ty::Ref { .. } => "a reference",
         Ty::Tuple(_) => "a tuple",
         Ty::Slice(_) => "a slice",
+        Ty::Str => "a `str`",
         Ty::Named(_) => "a named type",
         _ => "a different type",
     }
@@ -121,6 +122,7 @@ fn is_structural_kind(t: &Ty) -> bool {
             | Ty::Array { .. }
             | Ty::Tuple(_)
             | Ty::Slice(_)
+            | Ty::Str
     )
 }
 
@@ -289,6 +291,10 @@ impl Sema<'_> {
         if let ExprKind::Path(p) = &callee.kind {
             if p.is_single() {
                 let name = p.first().sym;
+                // A range index `s[a..b]`, desugared by the parser (`strs.rs`).
+                if let Some(t) = self.type_range_slice(name, callee, args, &mut arg_tys) {
+                    return t;
+                }
                 // A call through a function-typed parameter (a local shadows a function of the
                 // same name).
                 if let Some(t) =
@@ -305,7 +311,7 @@ impl Sema<'_> {
                         // of erroring on the `i32`/`f32` literal default. Only concrete scalar params
                         // (not generics/tensors) and only adaptable literals are touched.
                         for (i, param) in sig.params.iter().enumerate() {
-                            if matches!(param, Ty::Scalar(_)) {
+                            if matches!(param, Ty::Scalar(_) | Ty::Str) {
                                 if let Some(arg) = args.get(i) {
                                     // A literal-initialized binding passed here takes the
                                     // parameter's type, if this is its first use (`infer.rs`).
@@ -733,7 +739,8 @@ impl Sema<'_> {
                         dims.insert(*g, Dim::Const(n));
                         self.note_turbofish_dim(*g, ga.span);
                     }
-                    TypeKind::Path(p) if p.is_single() => {
+                    // `str` is a type argument (`id::<str>(s)`), which the lowering below types.
+                    TypeKind::Path(p) if p.is_single() && !self.names_str(p) => {
                         let nm = p.first().sym;
                         match Scalar::from_name(self.sym_str(nm)) {
                             Some(sc) => {
@@ -800,6 +807,8 @@ impl Sema<'_> {
             self.unify_decl(p, arg, Some(param), &mut dims, arg_span, false);
         }
         self.set_call_arg(None);
+        // A type parameter cannot be a `str` (`strs.rs`, E0420).
+        self.reject_str_type_args(&sig.generics, &mut tys, span);
         let pending = std::mem::replace(&mut self.pending_dims, outer_pending);
         self.solve_pending_dims(&sig.generics, &mut dims, pending);
         // Every dimension the callee's parameters use must now be known — bound, solved, or a `?`
@@ -1278,6 +1287,20 @@ impl Sema<'_> {
                     ),
                 );
             }
+            // A `str` is satisfied by a `str` only: it converts to and from nothing — not a `[]u8`,
+            // a `*u8` or an array, though all share bytes with it (`strs.rs`).
+            (Ty::Str, Ty::Str) => {}
+            (Ty::Str, other) | (other, Ty::Str) if !matches!(other, Ty::Named(_)) => {
+                self.error(
+                    span,
+                    "E0401",
+                    format!(
+                        "type mismatch: expected `{}`, found `{}`",
+                        param.display(self.interner),
+                        arg.display(self.interner)
+                    ),
+                );
+            }
             // A slice parameter `[]T` accepts a slice `[]T` or — via unsizing — a fixed-size array
             // `[T; N]` argument; either way the element types must unify (a slice of a different
             // element type has a different stride, so `s[i]` would read the wrong bytes). The
@@ -1753,6 +1776,20 @@ impl Sema<'_> {
                     );
                 }
                 *e
+            }
+            // A `str` is a rank-1 sequence of UTF-8 bytes; its index is bounds-checked at run time.
+            Ty::Str => {
+                if indices.len() != 1 {
+                    self.error(
+                        span,
+                        "E0501",
+                        format!(
+                            "this `str` has rank 1 but is indexed with {} indices",
+                            indices.len()
+                        ),
+                    );
+                }
+                Ty::Scalar(Scalar::U8)
             }
             _ => Ty::Unknown,
         }

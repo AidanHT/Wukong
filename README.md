@@ -325,11 +325,13 @@ match takes its last arm untested, so an exhaustive `bool` match is one branch),
 **`while let`** (with `&& cond` chains), **`let … else`**, **destructuring `for` heads**
 (`for (i, x) in pairs`, `for Point { x, y } in pts`), **C-style and
 data-carrying (tagged-union) enums**, **slices `[]T`** (fat-pointer views with `.len()`, indexing,
-iteration, and array→slice unsizing — and, since every kernel operand resolves through one
-base-pointer helper, a legal operand to the whole recognized-kernel family: GEMM/GEMV, the fused
+iteration, array→slice unsizing and range indexing `s[a..b]` — and, since every kernel operand
+resolves through one base-pointer helper, a legal operand to the whole recognized-kernel family: GEMM/GEMV, the fused
 norms, the scans, and the streaming elementwise kernels), top-level **`const`** values, **`let` tuple
 destructuring**, **radix `0xFF`/`0o17`/`0b1010` and char
-`'A'` literals**, and **`"string"` literals** (typed `*u8`, rendered by `print`). And
+`'A'` literals**, **`"string"` literals** (a NUL-terminated `*u8`, rendered by `print`), and
+**`str`** — an immutable UTF-8 byte string with `.len()`, bounds-checked byte indexing, `s[a..b]`
+views, `==`/`!=` and printing, whose bytes the type checker never lets a program write. And
 **constant-shape tensors run** —
 a `Tensor[f32, R, C]` parameter passes by base pointer and a multi-dimensional index `a[i, j]`
 flattens to a row-major GEP, so the shape-typed surface *executes*, not just shape-checks — and a

@@ -1,0 +1,60 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: x
+// EXPECT-OUT: yy
+// EXPECT-OUT: 2
+// EXPECT-OUT: true
+// EXPECT-OUT: zzz
+// EXPECT-OUT: x
+// EXPECT-OUT: 3
+// EXPECT-OUT: true
+// EXPECT-OUT: x
+// EXPECT-OUT: ab
+// EXPECT-OUT: 5
+// EXPECT-OUT: x
+// EXPECT-OUT: q
+// EXPECT-OUT: 1
+module tests.run.str_array_elems
+
+/// An array literal holds every element at its ONE element type, so a string literal beside a
+/// `str` is a `str` too, on either side of it. Each element was once stored at its own type: in
+/// `[s, "yy"]` the `"yy"` stayed a `*u8`, one 8-byte pointer written into a 16-byte `str` slot
+/// whose length was never written, so `a[1]` printed nothing and `a[1].len()` read stack garbage
+/// natively. Every lane is printed, and each expected line follows from the literal text alone:
+/// * `a = [s, "yy"]` with `s = "x"`: lanes "x" and "yy", `a[1]` is 2 bytes and equals "yy";
+/// * `b = ["zzz", s]`: lanes "zzz" and "x", `b[0]` is 3 bytes and equals "zzz";
+/// * the annotated `[str; 2]` spelling: lanes "x" and "ab";
+/// * `total([s, "wxyz"])` sums the byte lengths 1 + 4 = 5;
+/// * the nested `[[s], ["q"]]`: lanes "x" and "q", and `n[1][0]` is 1 byte.
+
+fn total(w: [str; 2]) -> i64 {
+    return w[0].len() + w[1].len();
+}
+
+fn main() -> i32 {
+    let s: str = "x";
+
+    let a = [s, "yy"];
+    println(a[0]);
+    println(a[1]);
+    println(a[1].len());
+    println(a[1] == "yy");
+
+    let b = ["zzz", s];
+    println(b[0]);
+    println(b[1]);
+    println(b[0].len());
+    println(b[0] == "zzz");
+
+    let c: [str; 2] = [s, "ab"];
+    println(c[0]);
+    println(c[1]);
+
+    println(total([s, "wxyz"]));
+
+    let n = [[s], ["q"]];
+    println(n[0][0]);
+    println(n[1][0]);
+    println(n[1][0].len());
+    return 0;
+}

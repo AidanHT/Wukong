@@ -46,6 +46,7 @@ enum Recv {
     Vector,
     Array,
     Slice,
+    Str,
     Tensor,
     Tuple,
     Pointer,
@@ -58,6 +59,7 @@ fn recv_of(t: &Ty) -> Recv {
         Ty::Vector { .. } => Recv::Vector,
         Ty::Array { .. } => Recv::Array,
         Ty::Slice(_) => Recv::Slice,
+        Ty::Str => Recv::Str,
         Ty::Tensor { .. } => Recv::Tensor,
         Ty::Tuple(_) => Recv::Tuple,
         Ty::Ptr { .. } | Ty::Ref { .. } => Recv::Pointer,
@@ -72,7 +74,7 @@ fn recv_of(t: &Ty) -> Recv {
 fn builtin_methods_of(r: Recv) -> &'static [&'static str] {
     match r {
         Recv::Array => &["dim", "len"],
-        Recv::Slice => &["len"],
+        Recv::Slice | Recv::Str => &["len"],
         Recv::Tensor => &["dim", "len", "row_ptr"],
         Recv::Pointer => &["offset"],
         Recv::Vector => &["fma", "store"],
@@ -748,8 +750,8 @@ impl Sema<'_> {
         let last = self.sym_str(name).to_string();
         if let Some(w) = foreign_type_name(&last) {
             d = d.suggest(span, format!("Wukong spells this type `{w}`"), w);
-        } else if matches!(last.as_str(), "str" | "String" | "string") {
-            d = d.help("a string literal has type `*u8` (a NUL-terminated byte pointer)");
+        } else if matches!(last.as_str(), "String" | "string") {
+            d = d.suggest(span, "Wukong's string type is `str`", "str");
         } else {
             let candidates = self.type_names();
             if let Some(c) = did_you_mean(&last, candidates.iter().map(String::as_str)) {
@@ -771,7 +773,7 @@ impl Sema<'_> {
         match &t.kind {
             TypeKind::Path(p) => {
                 if let Some(last) = p.segments.last().map(|s| s.sym) {
-                    if Scalar::from_name(self.sym_str(last)).is_none() {
+                    if !wukong_types::is_builtin_type_name(self.sym_str(last)) {
                         self.check_type_name(p, last, t.span);
                     }
                 }
@@ -805,6 +807,7 @@ impl Sema<'_> {
     fn type_names(&self) -> Vec<String> {
         let mut names: Vec<String> = SCALAR_NAMES.iter().map(|s| s.to_string()).collect();
         names.push("Tensor".to_string());
+        names.push("str".to_string());
         for d in &self.defs.defs {
             if matches!(d.kind, DefKind::Struct(_) | DefKind::Enum(_)) {
                 let n = self.sym_str(d.name);

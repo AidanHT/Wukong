@@ -149,6 +149,29 @@ fixed-element builtin (kernel or typed I/O) accepts a `Tensor[T, ..]` operand in
 and the instance re-check reports a wrong binding (`Sema::rechecking_instance`, `E0415`/`E0416`).
 `where` dimension predicates and dimension `static_assert`s are collected and checked against each
 call's bound dimensions by `wukong_sema::constraints`; `static_assert` lowers to nothing.
+**`str` is erased at the sema boundary.** `Ty::Str` exists only inside `wukong_sema`, which is
+the single authority that a `str` is never written (no conversion to or from `[]u8`/`*u8`; an
+element store or `&mut s[i]` is `E0304`; a `str` comes only from a literal or from slicing a
+`str`). `check` publishes every type through `Ty::erase_str` (`strs::erase_published`: the type
+table, function signatures, `const` types, struct fields, enum payloads), so `mir_build`, the
+optimizer and every backend see the `[]u8` fat pointer they already run; a published `Ty::Str` is
+refused by `mir_ty_of` (a debug panic, `C0001` in release), never sized. Because the erasure
+precedes monomorphization, a type parameter bound to `str` is `E0420`. The one fact a slice cannot
+carry crosses as a side table: `SemaResult::str_print_args`, the `NodeId`s of every print or format
+argument of type `str`, which `mir_build`'s `text.rs` prints as text (`wukong_rt_fmt_str` over the
+fat pointer's data and length) rather than as a list of bytes; `defer`'s copies carry the
+membership (`DeferOverlay`). A literal sema adapted to `str` lowers to a fresh fat pointer over its
+`.rodata` bytes; `==` on two `str`s is a block-parameter byte loop (`mir_build::strs`). The range
+index `s[a..b]` is parsed as the call `$slice(s, a, b)` (`$slice_from(s, a)` with no upper bound; a
+missing lower bound is a zero-width `0` literal at the dots) — a name no identifier can spell —
+typed for a `str` or any `[]T` base, and lowered to `{ data + a, b - a }` behind
+`bounds::emit_range_bounds_check` (`hi <= len`, then `lo <= hi`, unsigned; `ule`, which
+`wukong_opt::bce` deliberately does not key on). A range view is a place in its base, never a
+call's fresh result: `@noalias` roots it at its base's storage, so `k(s[0..2], s[1..3])` is
+`E0316`, and `mir_build`'s whole-program kernel alias analysis (`alias.rs::origin_of`) projects it
+like `s[i]`, so `let va = s[..]; let vc = s[..];` are two names for one buffer and a recognized
+kernel over both is guarded (`tests/run/alias_range_views.wk`). It recognizes the callee without an
+interner through `SemaResult::range_slice_callees` / `is_range_slice_call`.
 **Storage classification is total.** `wukong_mir_build` sizes every value's slot through
 `FnLowerer::mir_ty_of` (a `Ty`) and `mir_ty_of_ann` (an annotation), each with an arm per form and
 no `_ => I32` fallback: a C-style enum is the one `Ty::Named` whose representation is `i32`; the

@@ -354,8 +354,10 @@ plus a trailing NUL) and its value is that blob's address (`Op::GlobalAddr`). Th
 of a `*u8` — a literal or a `let s = "hi";` binding — renders the bytes, while numeric `print` still
 prints numbers (`tests/run/string_literal.wk`). Because the blob lives in static data (not the
 stack frame), a `*u8` can be **returned from a function and threaded across calls** without dangling
-(`tests/run/string_return.wk`). There is still **no string type beyond `*u8`**: no
-concatenation/indexing/length operators — a string is a NUL-terminated `*u8` into `.rodata` (🟡).
+(`tests/run/string_return.wk`). Unannotated, a literal is that NUL-terminated `*u8` — the type
+`printf`, file paths and `extern "C"` take. Where a **`str`** is expected, the same literal is a
+`str` instead: a length-carrying, bounds-checked, immutable view of the same bytes (see
+[Strings: `str`](#strings-str-)).
 
 ## Types
 
@@ -370,7 +372,8 @@ concatenation/indexing/length operators — a string is a NUL-terminated `*u8` i
 | Tuples      | `(A, B, …)`, field access `t.0`, nested `t.0.1`       | ✅     |
 | Structs     | `struct S { … }`, literal `S { f: v }`, field `s.f`  | ✅     |
 | Enums       | C-style `enum E { A = 10, B }` (variant = its `i32` discriminant) **and data-carrying** `V(i32)` / `V { f: T }` variants | ✅ |
-| Slices      | `[]T` — fat pointer `{data, len}`; `.len()`, **bounds-checked** indexed load/store, iteration, array→slice unsizing | ✅ |
+| Slices      | `[]T` — fat pointer `{data, len}`; `.len()`, **bounds-checked** indexed load/store, iteration, array→slice unsizing, range indexing `s[a..b]` | ✅ |
+| Strings     | `str` — an immutable UTF-8 byte string, a `[]u8`-shaped fat pointer; literals, `.len()`, bounds-checked byte indexing, `s[a..b]`, `==`/`!=`, printing ([below](#strings-str-)) | ✅ |
 | SIMD vectors| `f32x4`/`i32x4`, generic `vec[T, N]` — the type **parses and type-checks** (a non-scalar element is `E0302`, a lane/element mismatch at a call is `E0401`), but no vector value can be constructed in source (`f32x4::load(p)` is `C0001`) and float-vector arithmetic is an internal error, so nothing uses it. SIMD ships through the **automatic** 128-bit/256-bit loop vectorizer, which needs no vector type in source. | 🔵 |
 | Tensors     | `Tensor[f32, M, N]` — shape checking, and **indexing** (`a[i, j]`) for both const and symbolic-generic dims, on the default `contiguous` layout. A constant-shape tensor costs **nothing** over the hand-flattened `[f32; M*N]` + `a[i*N + j]` spelling: the two compile to byte-identical MIR, same kernel dispatch and same vectorization. `.col_major` indexing executes for constant-shape tensors (`a[i, j]` is byte-identical to `a[i + j*M]`). `.strided`/`.tiled(…)` type-check but cannot be indexed (`C0001`). Whole-tensor arithmetic (`a + b`) is `E0433` — operate elementwise. | ✅ |
 
@@ -385,6 +388,68 @@ interpreter reserves its address 0 as a never-allocated null so it agrees with n
 load or store through null is the interpreter diagnostic `null pointer dereference` (native faults).
 A condition must be a boolean, a number (nonzero is true) or a pointer: an aggregate, slice, tensor
 view, SIMD vector or function value is `E0436`.
+
+### Strings: `str` ✅
+
+`str` is an **immutable UTF-8 byte string**: a 16-byte fat pointer `(data, byte length)` — the
+layout of a `[]u8` slice — over a string literal's read-only `.rodata` bytes, or over part of
+another `str`. It passes and returns like a `[]T`, and can be a struct field, a tuple field or an
+array element (`tests/run/str_basics.wk`).
+
+```wukong
+const GREETING: str = "hello";
+struct User { name: str }
+
+fn count_byte(s: str, target: u8) -> i64 {
+    let mut n: i64 = 0;
+    for b in s {                    // each byte, as a u8
+        if b == target { n = n + 1; }
+    }
+    return n;
+}
+
+let s: str = "wukong";
+println(s);                         // wukong
+println(s.len());                   // 6: bytes, not characters
+println(s[1]);                      // 117: a u8, bounds-checked
+println(s[1..4]);                   // uko: a str viewing the same bytes
+println(s == "wukong");             // true: length, then bytes
+printf("[{}|{:?}]\n", s, s[..2]);   // [wukong|"wu"]
+```
+
+- **Literals.** A string literal is a `str` wherever the context expects one: exactly where a
+  numeric literal adapts to its annotation (a `let`/`const` annotation, a call or method argument,
+  a `return` of either spelling, a struct field, an assignment, an array or tuple element), as an
+  `==`/`!=` operand against a `str`, and as the base of a range index. In an array literal it
+  becomes a `str` beside one on either side (`[s, "y"]` and `["x", s]` are both `[str; 2]`,
+  `tests/run/str_array_elems.wk`): every element of an array literal has the one element type, so
+  a `*u8` value or a `[]u8` beside a `str` is `E0401`. Unannotated, a literal is still the
+  NUL-terminated `*u8` (`let p = "x";`). As with numbers, an `if`/`match` whose arms are all
+  literals takes its type from those arms (`*u8`), and annotating the `let` does not change that
+  (`let s: str = if c { "a" } else { "b" };` is `E0401`). Make the FIRST arm a `str` and the later
+  literal arms adapt to it (`let yes: str = "yes";` then `if c { yes } else { "no" }`), or `return`
+  each literal from a function that returns `str`.
+- **Bytes.** `s.len()` is the byte length, an `i64`. `s[i]` is a `u8`, bounds-checked exactly like
+  a slice element (the same `index out of bounds` failure, exit 1). `for b in s` yields each byte.
+  The bytes are UTF-8 (`"h\u{e9}llo"` is 6 bytes long), and nothing decodes characters yet.
+- **Range indexing.** `s[a..b]`, `s[a..]`, `s[..b]` and `s[..]` are `str` views of the half-open
+  byte range — no copy. The same range index works on any slice `[]T` and gives a `[]T`
+  (`tests/run/slice_range_index.wk`). The bounds are integers, checked at run time as
+  `a <= b <= len` (`tests/run/str_slice_bounds.wk`) unless the function is `@unchecked`. `..=`, and
+  a range mixed with other indices (`t[0, 1..2]`), are `E0202`; a range index of an array is
+  `E0437` (bind it to a `[]T` first); a bound that is not an integer is `E0446`.
+- **Equality.** `==` and `!=` between two `str`s compare the lengths, then the bytes. `<`,
+  arithmetic, and a `str` compared with anything but a `str` are `E0433`.
+- **Printing.** `print`, `println`, `print_raw`, `eprint`, `eprintln` and the `printf` / `eprintf` /
+  `sprintf` placeholders print the text, and `{:?}` quotes it, as for a `*u8`. A `str` inside a
+  printed aggregate (a struct, tuple or array holding one) is `E0448` for now: print the field.
+- **Immutable.** A `str`'s bytes are never a place: `s[i] = b`, `s[i] += b` and `&mut s[i]` are
+  `E0304`. A `mut` binding can still be re-pointed (`s = s[1..];`).
+- **No conversions.** A `str` converts to and from nothing: not `[]u8`, not `*u8`, not by `as`
+  (`E0401`). There is no concatenation yet.
+- **Not generic.** A `str` cannot bind a type parameter (`id(s)` with `fn id<T>(x: T) -> T` is
+  `E0420`, `tests/fail/str_generic_param.wk`); write the function for `str` itself. A struct, enum,
+  trait, type alias or generic parameter named `str` is `E0300`, in an imported module too.
 
 ### Type aliases ✅
 
@@ -421,7 +486,7 @@ let r = x as Real;
 - Errors: an alias that reaches itself (`type A = [B; 2]; type B = A;`) is `E0326`; a wrong number
   or kind of arguments (`Mat<4>`, `f32<2>`, a type where the alias uses a dimension) is `E0327`; an
   alias body naming no type is `E0328`, reported even if the alias is unused; an alias named like a
-  built-in scalar or an existing struct/enum is `E0300`.
+  built-in scalar, `str`, or an existing struct/enum is `E0300`.
 
 ## Operators ✅
 

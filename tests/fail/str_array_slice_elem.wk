@@ -1,0 +1,16 @@
+// EXPECT-CODE: E0401
+module tests.fail.str_array_slice_elem
+
+// A `str` and a `[]u8` share a layout but not a type: an array literal holding both would make a
+// string literal's read-only bytes writable through the `[]u8` element (`v[1][0] = 65` changed
+// every "x" in the program, or faulted natively). Every element of an array literal has the one
+// element type, and `str` converts to and from nothing.
+fn main() -> i32 {
+    let s: str = "x";
+    let mut buf: [u8; 3] = [1, 2, 3];
+    let b: []u8 = buf;
+    let mut v = [b, s];
+    v[1][0] = 65;
+    println(s);
+    return 0;
+}

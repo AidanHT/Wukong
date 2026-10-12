@@ -83,6 +83,46 @@ impl FnLowerer<'_> {
         // A fresh block's terminator is already `Unreachable`: the call never returns normally.
         self.builder.switch_to(cont);
     }
+
+    /// Emit the bounds check of a range index `s[lo..hi]` over a slice of length `len` (all three
+    /// already lowered `i64`s): `hi <= len`, then `lo <= hi`, each compared unsigned (a negative
+    /// bound is huge, so it fails) with its own dead-end failure block, as
+    /// [`Self::emit_slice_bounds_check`] builds one. A failure reports the bound and the limit it
+    /// passed: `the len is 6 but the index is 9` for `hi`, and `hi` in the role of the length for
+    /// `lo`. Leaves the builder in the in-bounds continuation; a no-op inside an `@unchecked`
+    /// function.
+    ///
+    /// The comparisons are `ule`, never the `ult` of an element access, so `wukong_opt::bce` (which
+    /// keys on `ult`) never hoists or removes one: a range check stays exactly where it was written.
+    pub(crate) fn emit_range_bounds_check(
+        &mut self,
+        lo: ValueId,
+        hi: ValueId,
+        len: ValueId,
+        span: Span,
+    ) {
+        if !self.gemm.bounds_checks {
+            return;
+        }
+        for (bound, limit) in [(hi, len), (lo, hi)] {
+            let ok = self
+                .builder
+                .build(MirType::I1, Op::Cmp(CmpOp::Ule, bound, limit));
+            let cont = self.builder.new_block();
+            let fail = self.builder.new_block();
+            self.builder.cond_br(ok, cont, vec![], fail, vec![]);
+            self.builder.switch_to(fail);
+            let site = self
+                .builder
+                .build(MirType::I64, Op::ConstInt(site_key(span), MirType::I64));
+            let func = self.gemm.bounds_fail;
+            self.builder.build_void(Op::Call {
+                func,
+                args: vec![bound, limit, site],
+            });
+            self.builder.switch_to(cont);
+        }
+    }
 }
 
 /// Rewrite every bounds-failure call's placeholder site operand into the address of a static

@@ -51,6 +51,8 @@ mod par_grain;
 mod repr_tests;
 mod shape_ops;
 mod softmax_oop;
+// `str`: the literal fat pointer, `==`, and range indexing (see the module docs).
+mod strs;
 mod tile;
 mod tindex;
 mod ucount;
@@ -4534,6 +4536,7 @@ impl FnLowerer<'_> {
                 let sym = p.segments.last().unwrap().sym;
                 match self.subst.get(&sym) {
                     Some(concrete) => concrete.clone(),
+                    None if self.is_str_name(sym) => Self::str_ty(),
                     None => Ty::Named(sym),
                 }
             }
@@ -4856,8 +4859,9 @@ impl FnLowerer<'_> {
             Ty::Unknown => self.refuse_ty(ty, span),
             // A function value has no storage: as a function-typed parameter it declares no MIR
             // parameter (`methods::param_has_value`), and anywhere else it is refused. An `Error`
-            // type never survives sema: the driver stops on its diagnostic.
-            Ty::Fn { .. } | Ty::Error => self.refuse_ty(ty, span),
+            // type never survives sema: the driver stops on its diagnostic, and a `str` never
+            // leaves it (published as `[]u8`, `wukong_sema::strs`).
+            Ty::Fn { .. } | Ty::Error | Ty::Str => self.refuse_ty(ty, span),
         }
     }
 
@@ -4931,6 +4935,9 @@ impl FnLowerer<'_> {
                 let name = self.interner.resolve(sym);
                 if let Some(s) = wukong_types::Scalar::from_name(name) {
                     MirType::from_scalar(s)
+                } else if self.is_str_name(sym) {
+                    // A `str` is the 16-byte fat pointer of the `[]u8` it is published as.
+                    MirType::Array(Box::new(MirType::I8), SLICE_SIZE as u32)
                 } else {
                     // Every other name is a nominal type, sized exactly as a value of it is: a
                     // struct or a data-carrying enum is its byte buffer, a C-style enum its `i32`
@@ -5002,6 +5009,8 @@ impl FnLowerer<'_> {
                 }
                 if let Some(scalar) = wukong_types::Scalar::from_name(self.interner.resolve(sym)) {
                     Ty::Scalar(scalar)
+                } else if self.is_str_name(sym) {
+                    Self::str_ty()
                 } else {
                     Ty::Named(sym)
                 }
@@ -15490,6 +15499,7 @@ impl FnLowerer<'_> {
                 | Ty::Tensor { .. }
                 | Ty::Fn { .. }
                 | Ty::Unknown
+                | Ty::Str
                 | Ty::Error => return false,
             }
         }
@@ -21338,7 +21348,7 @@ impl FnLowerer<'_> {
                 // The lookup key is the decoded bytes plus the trailing NUL (how blobs are stored).
                 let mut key = decode_string_literal(self.interner.resolve(*s));
                 key.push(0);
-                if let Some(sym) = self.mono.and_then(|m| m.strings.get(&key)).copied() {
+                let data = if let Some(sym) = self.mono.and_then(|m| m.strings.get(&key)).copied() {
                     self.builder.build(MirType::Ptr, Op::GlobalAddr(sym))
                 } else {
                     // Fallback (a probe/kernel lowerer without the table, or a literal the collector
@@ -21361,7 +21371,9 @@ impl FnLowerer<'_> {
                         .build(MirType::I8, Op::ConstInt(0, MirType::I8));
                     self.store_element(base, &elem, bytes.len() as i128, nul);
                     base
-                }
+                };
+                // A literal sema adapted to `str` is a fat pointer over those bytes (`strs.rs`).
+                self.str_literal_value(e, data, key.len() as u64 - 1)
             }
             ExprKind::Path(p) if p.is_single() => {
                 if let Some((slot, ty)) = self.lookup(p.first().sym) {
@@ -22427,6 +22439,10 @@ impl FnLowerer<'_> {
     fn lower_binary(&mut self, op: ast::BinOp, lhs: &Expr, rhs: &Expr, e: &Expr) -> ValueId {
         use ast::BinOp::*;
         match op {
+            // Sema admits `==`/`!=` on a slice only for two `str`s, which compare by value.
+            Eq | Ne if matches!(self.expr_ty(lhs), Ty::Slice(_)) => {
+                self.lower_str_eq(lhs, rhs, op == Ne)
+            }
             Eq | Ne | Lt | Le | Gt | Ge => {
                 let l = self.lower_expr(lhs);
                 let r = self.lower_expr(rhs);
@@ -22880,6 +22896,10 @@ impl FnLowerer<'_> {
     ) -> ValueId {
         // A call through a function-typed parameter or a trait bound (`methods.rs`).
         if let Some(v) = self.lower_dispatched_call(callee, generic_args, args, e) {
+            return v;
+        }
+        // A range index `s[a..b]`, desugared by the parser (`strs.rs`).
+        if let Some(v) = self.lower_range_slice(callee, args, e) {
             return v;
         }
         // `Enum::Variant(args)` constructing a data-carrying tuple-payload variant: build its buffer
@@ -25645,7 +25665,8 @@ fn mir_ty(ty: &Ty) -> Option<MirType> {
         // A tuple with a field the structure cannot size has no answer here (it used to be a
         // 0-byte buffer).
         Ty::Tuple(_) => MirType::Array(Box::new(MirType::I8), u32::try_from(ty.size_of()?).ok()?),
-        Ty::Named(_) | Ty::Fn { .. } | Ty::Unknown | Ty::Error => return None,
+        // A `str` never leaves sema (it is published as `[]u8`).
+        Ty::Named(_) | Ty::Fn { .. } | Ty::Unknown | Ty::Error | Ty::Str => return None,
     })
 }
 
@@ -35765,6 +35786,61 @@ fn main() -> i32 {
         assert!(
             alias_free_of(copied, "f"),
             "`let b = a` on a fixed array deep-copies, so f(b, a) is two buffers"
+        );
+    }
+
+    /// A range index `s[a..b]` (the parser's `$slice(s, a, b)`) views its base's storage with no
+    /// copy, so it must resolve onto that base exactly as `let v: []f32 = s;` does, on both paths.
+    /// Classified as a borrowing CALL instead, it fell into `republish_of`'s `alloc_*` exemption:
+    /// `let va = s[..];` recorded no view and `va` became its own storage root, so two range views
+    /// of one buffer looked disjoint at a call site (`f(va, vc)`) and as operands in one body. The
+    /// bounds are not compared — the same conservative line element indices draw — and range
+    /// views of two different buffers stay disjoint.
+    #[test]
+    fn alias_analysis_roots_a_range_index_view_at_its_base() {
+        let call = "module m
+fn f(p: []f32, mut q: []f32) { q[0] = p[0]; }
+fn main() -> i32 {
+    let mut a: [f32; 4] = [0.0; 4];
+    let mut b: [f32; 4] = [0.0; 4];
+    let s: []f32 = a;
+    let t: []f32 = b;
+    let va = s[..];
+    let vq = OTHER;
+    f(va, vq);
+    return 0;
+}
+";
+        for other in ["s[1..]", "s[..2]", "s"] {
+            assert!(
+                !alias_free_of(&call.replace("OTHER", other), "f"),
+                "`s[..]` and `{other}` both view `a`, so f(va, vq) aliases"
+            );
+        }
+        assert!(
+            alias_free_of(&call.replace("OTHER", "t[1..3]"), "f"),
+            "range views of two different buffers are two buffers"
+        );
+
+        let body = "module m
+fn main() -> i32 {
+    let mut a: [f32; 4] = [1.0; 4];
+    let mut b: [f32; 4] = [2.0; 4];
+    let s: []f32 = a;
+    let t: []f32 = b;
+    let va = s[..];
+    let mut vc = OTHER;
+    vc[0] = va[0];
+    return 0;
+}
+";
+        assert!(
+            !alias_free_of(&body.replace("OTHER", "s[1..]"), "main"),
+            "`va` and `vc` are two operand names for `a`"
+        );
+        assert!(
+            alias_free_of(&body.replace("OTHER", "t[1..]"), "main"),
+            "`va` views `a` and `vc` views `b`"
         );
     }
 

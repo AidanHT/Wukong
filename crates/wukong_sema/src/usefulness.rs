@@ -165,9 +165,9 @@ const ZERO_DEPTH: u32 = 64;
 
 /// Whether the all-zero bit pattern of `ty` — what mir_build gives an uninitialized `let x: T;` —
 /// is a value this analysis models (see the module docs). A column patterns cannot constrain
-/// (a float, pointer, slice, tensor, vector, function) holds any value harmlessly; a product is
-/// modeled when every field is; an enum when some variant has discriminant 0 and that variant's
-/// payload is modeled. An unknown or generic type is not.
+/// (a float, pointer, slice, `str`, tensor, vector, function) holds any value harmlessly; a
+/// product is modeled when every field is; an enum when some variant has discriminant 0 and that
+/// variant's payload is modeled. An unknown or generic type is not.
 pub(crate) fn zero_value_modeled(defs: &DefMap, ty: &Ty) -> bool {
     zero_modeled_at(defs, ty, 0)
 }
@@ -183,6 +183,7 @@ fn zero_modeled_at(defs: &DefMap, ty: &Ty, depth: u32) -> bool {
         | Ty::Ptr { .. }
         | Ty::Ref { .. }
         | Ty::Slice(_)
+        | Ty::Str
         | Ty::Tensor { .. }
         | Ty::Vector { .. }
         | Ty::Fn { .. } => true,

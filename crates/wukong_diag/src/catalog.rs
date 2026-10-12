@@ -178,7 +178,9 @@ static CATALOG: &[Explanation] = &[
     entry!(
         "E0300",
         "duplicate definition",
-        "A name was defined more than once in the same scope. Rename one of the definitions."
+        "A name was defined more than once in the same scope. Rename one of the definitions. The \
+         same code rejects a declaration that takes a built-in type's name: a struct, enum, trait \
+         or generic parameter named `str`, or a type alias named `str` or after a scalar (`f32`)."
     ),
     entry!(
         "E0301",
@@ -211,7 +213,9 @@ static CATALOG: &[Explanation] = &[
          *aggregate parameter* is NOT: an aggregate parameter is passed by reference, so \
          `fn f(p: S) { p.a = 9; }` would write into the caller's value — add `mut` to the parameter \
          (`fn f(mut p: S)`). Writing through a pointer parameter (`*p = …`) needs no `mut`, because \
-         the pointer itself is not being reassigned.",
+         the pointer itself is not being reassigned. The bytes of a `str` are never a place at \
+         all: `s[i] = …`, `s[i] += …` and `&mut s[i]` are rejected, because a `str` views a string \
+         literal's read-only storage (a `mut` binding may still be re-pointed, `s = t`).",
         bad: "module ex.e0304\nfn main() -> i32 {\n    let x: i32 = 5;\n    x = 10;\n    return x;\n}\n",
         good: "module ex.e0304\nfn main() -> i32 {\n    let mut x: i32 = 5;\n    x = 10;\n    return x;\n}\n"
     ),
@@ -653,6 +657,18 @@ fn main() -> i32 {
         good: "module ex.e0416\nfn save<T>(x: Tensor[T, 4]) -> i64 {\n    return write_f32(\"e0416.bin\", x);\n}\nfn main() -> i32 {\n    let x: [f32; 4] = [1.0; 4];\n    return save(x) as i32;\n}\n"
     ),
     entry!(
+        "E0420",
+        "`str` cannot instantiate a type parameter",
+        "A call binds a generic function's type parameter to `str`, or to a type containing one \
+         (`(str, i32)`, `[str; 2]`, `*str`). Sema checks every `str` rule — immutability, no \
+         conversion to or from `[]u8` and `*u8`, printing as text — and then erases each `str` to \
+         the `[]u8` slice it is laid out as, before generic functions are instantiated; an \
+         instance at `str` could not tell its text from a byte slice. Write the function for \
+         `str` itself: a non-generic `fn f(s: str)`.",
+        bad: "module ex.e0420\nfn first<T>(x: T) -> T {\n    return x;\n}\nfn main() -> i32 {\n    let s: str = \"hi\";\n    let t = first(s);\n    return t.len() as i32;\n}\n",
+        good: "module ex.e0420\nfn first(x: str) -> str {\n    return x;\n}\nfn main() -> i32 {\n    let s: str = \"hi\";\n    let t = first(s);\n    return t.len() as i32;\n}\n"
+    ),
+    entry!(
         "E0430",
         "struct literal field error",
         "A struct literal (and a struct-payload enum variant, `E::V { .. }`) initializes every field \
@@ -696,7 +712,8 @@ fn main() -> i32 {
          shift operators on a struct, tuple, array, `()`, pointer (no pointer arithmetic — take \
          `&a[i]`) or whole tensor (operate elementwise); arithmetic or ordered comparison on \
          `bool`; bitwise, shift or `!`/`~` on a float; `==`/`!=` on an aggregate (compare its \
-         fields); a comparison of `bool` with a number or of signed with unsigned integers (a \
+         fields; two `str`s are the one exception, compared by value, and a `str` compares with \
+         nothing else); a comparison of `bool` with a number or of signed with unsigned integers (a \
          chained comparison `a < b < c` parses as `(a < b) < c`); a compound assignment such as \
          `a += b` on an aggregate; `*x` on a non-pointer; and indexing `x[i]` on a scalar, struct \
          or tuple, or with a `bool` index.",
@@ -745,8 +762,9 @@ fn main() -> i32 {
          builtin (`matmul`, `sdpa`, …) an operand that is not an `f32` buffer or a non-integer \
          dimension; `atomic_add` a first argument that is not a place in memory other threads can \
          share (an element `b[i]`, a field `s.f` or `t.0`, or a pointee `*p` -- a bare local name \
-         is private to its thread, so use `+=`). The message names the argument and what it must \
-         be.",
+         is private to its thread, so use `+=`); a range index `x[a..b]` a base that is neither a \
+         `str` nor a `[]T` slice (bind an array to a `[]T` first). The message names the argument \
+         and what it must be.",
         bad: "module ex.e0437\nfn main() -> i32 {\n    let s = alloc_f32(2.5);\n    free(s);\n    return 0;\n}\n",
         good: "module ex.e0437\nfn main() -> i32 {\n    let s = alloc_f32(4);\n    free(s);\n    return 0;\n}\n"
     ),
@@ -836,7 +854,8 @@ fn main() -> i32 {
          integers — so use `mulhi` for the high half and `*` for the low half. `atomic_add` adds \
          to an integer place only, with an integer value: integer addition commutes, so the total \
          is the same in every thread schedule, while a float sum depends on the order of the adds \
-         (there is no atomic float add).",
+         (there is no atomic float add). The bounds of a range index `s[a..b]` must be integers \
+         too.",
         bad: "module ex.e0446\nfn ones(x: f32) -> i32 {\n    return popcount(x);\n}\nfn main() -> i32 {\n    return ones(1.5);\n}\n",
         good: "module ex.e0446\nfn ones(x: f32) -> i32 {\n    return popcount(bits(x)) as i32;\n}\nfn main() -> i32 {\n    return ones(1.5);\n}\n"
     ),
@@ -858,14 +877,14 @@ fn main() -> i32 {
         "value has no printed form",
         "`print`, `println`, `print_raw`, `eprint`, `eprintln` and every `printf` / `eprintf` / \
          `sprintf` argument print a scalar (an integer, a float, a `bool`, a `char`), a `*u8` \
-         string, a C-style enum (its discriminant) or — structurally, like Rust's `{:?}` — an \
+         string or a `str` (its text), a C-style enum (its discriminant) or — structurally, like Rust's `{:?}` — an \
          array, a slice of scalars, a tuple or a struct whose every element prints; a reference \
          prints what it refers to. A value with no printed form is rejected instead of printing \
          something backend-dependent: a raw pointer other than `*u8` is an address (the \
          interpreter's slot index and a native run's machine address disagree), so dereference it; \
-         a data-carrying enum prints by matching on it; a slice of non-scalars, a reference inside \
-         an aggregate, a SIMD vector or a function value prints element by element, lane by lane \
-         or not at all. (A whole tensor and `()` are `E0437` under `print`.)",
+         a data-carrying enum prints by matching on it; a slice of non-scalars, a reference or a \
+         `str` inside an aggregate, a SIMD vector or a function value prints element by element, \
+         field by field, lane by lane or not at all. (A whole tensor and `()` are `E0437` under `print`.)",
         bad: "module ex.e0448\nfn main() -> i32 {\n    let mut x: i32 = 5;\n    let p: *mut i32 = &mut x;\n    print(p);\n    return 0;\n}\n",
         good: "module ex.e0448\nfn main() -> i32 {\n    let mut x: i32 = 5;\n    let p: *mut i32 = &mut x;\n    print(*p);\n    return 0;\n}\n"
     ),

@@ -23,7 +23,7 @@ use wukong_ast::{
 };
 use wukong_diag::{Diagnostic, DiagnosticSink};
 use wukong_span::{FxHashMap, FxHashSet, Interner, Span, Symbol};
-use wukong_types::Scalar;
+use wukong_types::is_builtin_type_name;
 
 /// One alias, its body expanded in place once [`Expander::resolve`] has visited it.
 struct Alias {
@@ -88,11 +88,16 @@ pub(crate) fn expand_type_aliases(
             );
             continue;
         }
-        if Scalar::from_name(&shown).is_some() {
+        // A scalar name or `str`: sema reads the name as the built-in type in every type position.
+        // Compared on the name the module WROTE, the last segment: an imported module's alias
+        // arrives renamed `<import.path>.<name>` (`resolve.rs`), and `lib.m.str` compared whole
+        // is no built-in name, so `type str = i32;` there made every `str` in it an `i32`.
+        let written = shown.rsplit('.').next().unwrap_or(&shown);
+        if is_builtin_type_name(written) {
             sink.emit(
-                Diagnostic::error(format!("a type alias cannot be named `{shown}`"))
+                Diagnostic::error(format!("a type alias cannot be named `{written}`"))
                     .with_code("E0300")
-                    .primary(name.span, format!("`{shown}` is a built-in type"))
+                    .primary(name.span, format!("`{written}` is a built-in type"))
                     .help("choose another name for the alias"),
             );
             continue;
@@ -198,7 +203,7 @@ impl Expander<'_> {
         self.generics.contains(&sym)
             || self.types.contains(&sym)
             || self.by_name.contains_key(&sym)
-            || Scalar::from_name(self.interner.resolve(sym)).is_some()
+            || is_builtin_type_name(self.interner.resolve(sym))
     }
 
     /// The alias a type path names here, if any.
@@ -1044,9 +1049,47 @@ mod tests {
         );
         assert_eq!(expand("type W = [Real; 8];\nfn f() {}\n").1, vec!["E0328"]);
         assert_eq!(expand("type f32 = i64;\nfn f() {}\n").1, vec!["E0300"]);
+        // `str` is a built-in type as well: it names no alias, and an alias may name it.
+        assert_eq!(expand("type str = i32;\nfn f() {}\n").1, vec!["E0300"]);
+        let (out, codes) = expand("type Name = str;\nfn f(n: Name) {}\n");
+        assert!(codes.is_empty(), "{codes:?}");
+        assert!(out.contains("n: str"), "{out}");
         assert_eq!(
             expand("struct S { x: i32 }\ntype S = i32;\nfn f() {}\n").1,
             vec!["E0300"]
         );
+    }
+
+    /// This pass runs after `load_imports` has renamed an imported module's items to
+    /// `<import.path>.<name>`, so a built-in name must be recognized in the name the module WROTE,
+    /// the last segment: `type str = i32;` in `lib/m.wk` arrives as `lib.m.str`, and compared
+    /// whole it was no built-in name, so inside that module every `str` silently meant `i32`.
+    #[test]
+    fn a_builtin_name_is_reserved_for_an_imported_alias_too() {
+        for (mangled, reserved) in [
+            ("lib.m.str", true),
+            ("lib.m.f32", true),
+            ("lib.m.strs", false),
+            ("lib.str.Name", false),
+        ] {
+            let mut interner = Interner::new();
+            let (mut module, pd) = wukong_parser::parse_module(
+                "type Name = i32;\nfn f(x: Name) {}\n",
+                wukong_span::SourceId(0),
+                &mut interner,
+            );
+            assert!(pd.is_empty(), "parse errors: {pd:?}");
+            let sym = interner.intern(mangled);
+            for item in &mut module.items {
+                if let ItemKind::TypeAlias(a) = &mut item.kind {
+                    a.name.sym = sym;
+                }
+            }
+            let mut sink = DiagnosticSink::new();
+            let mut next = 1_000_000;
+            expand_type_aliases(&mut module, &mut interner, &mut sink, &mut next);
+            let codes: Vec<_> = sink.diagnostics().iter().filter_map(|d| d.code).collect();
+            assert_eq!(codes.contains(&"E0300"), reserved, "{mangled}: {codes:?}");
+        }
     }
 }
