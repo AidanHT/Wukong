@@ -80,7 +80,8 @@
 //! # What it declines
 //!
 //! Loops with a call or a vector-kernel call (a call could rewrite a header, and cloning one would
-//! duplicate a dispatched kernel), with more than one normal exit, with an exit block shared with
+//! duplicate a dispatched kernel) — except a call the effect summaries prove side-effect free and
+//! always returning, which can do neither — with more than one normal exit, with an exit block shared with
 //! other code, larger than [`MAX_LOOP_INSTS`] instructions, or that are not innermost. An index that
 //! is not of the form above keeps its check — in both copies. Nothing here is a heuristic about
 //! *whether* a check can fail; every elimination is a proof plus a runtime guard.
@@ -97,6 +98,7 @@ use wukong_mir::{
 };
 
 use crate::alias::{type_bytes, AliasInfo};
+use crate::effects::CallEffects;
 use crate::fxhash::{FxHashMap, FxHashSet};
 use crate::loop_info::{self, IvStep, NaturalLoop, Stages};
 use crate::{cfg, each_op_use, each_term_use, map_op_uses, map_term_uses, CfgAnalyses, Pass};
@@ -134,10 +136,11 @@ impl Pass for Bce {
             cache.invalidate();
             changed = true;
         }
+        let effects = cache.call_effects();
         for _ in 0..MAX_VERSIONS_PER_CALL {
             let plan = {
                 let (idom, preds) = cache.idoms_and_preds(f);
-                find_plan(f, idom, preds)
+                find_plan(f, idom, preds, effects.as_deref())
             };
             let Some(plan) = plan else {
                 break;
@@ -303,7 +306,12 @@ struct Plan {
     ordered: Vec<CheckPlan>,
 }
 
-fn find_plan(f: &Function, idom: &[u32], preds: &[Vec<u32>]) -> Option<Plan> {
+fn find_plan(
+    f: &Function,
+    idom: &[u32],
+    preds: &[Vec<u32>],
+    effects: Option<&CallEffects>,
+) -> Option<Plan> {
     let mut forest = loop_info::structure_with(f, idom, preds);
     if forest.is_empty() {
         return None;
@@ -317,11 +325,31 @@ fn find_plan(f: &Function, idom: &[u32], preds: &[Vec<u32>]) -> Option<Plan> {
         }
         loop_info::analyze_one(f, &mut forest, idx, Stages::Ivs);
         let ai = alias.get_or_insert_with(|| AliasInfo::analyze(f));
-        if let Some(plan) = plan_loop(f, forest.get(id), idom, preds, &defs, ai) {
+        if let Some(plan) = plan_loop(f, forest.get(id), idom, preds, &defs, ai, effects) {
             return Some(plan);
         }
     }
     None
+}
+
+/// Would this pass version `l` as the function stands? `l` must be analyzed to at least
+/// `Stages::Ivs`. For the vectorizer, which widens a body that still checks on every iteration
+/// only when this pass cannot make it check-free first: widening a loop this pass would version
+/// next leaves an epilogue it versions afterwards, and a fast copy of that epilogue nothing marks
+/// as one.
+pub(crate) fn would_version(
+    f: &Function,
+    l: &NaturalLoop,
+    idom: &[u32],
+    preds: &[Vec<u32>],
+    effects: Option<&CallEffects>,
+) -> bool {
+    if !has_candidate_check(f) || !cheap_shape_ok(f, l) {
+        return false;
+    }
+    let defs = Defs::of(f);
+    let alias = AliasInfo::analyze(f);
+    plan_loop(f, l, idom, preds, &defs, &alias, effects).is_some()
 }
 
 /// The structural filters that need no value analysis.
@@ -582,6 +610,7 @@ fn plan_loop(
     preds: &[Vec<u32>],
     defs: &Defs,
     alias: &AliasInfo,
+    effects: Option<&CallEffects>,
 ) -> Option<Plan> {
     let in_loop: FxHashSet<u32> = l.blocks.iter().map(|b| b.0).collect();
     let header = l.header;
@@ -631,14 +660,23 @@ fn plan_loop(
     }
 
     // A call could rewrite a slice header behind the guard, and a cloned kernel call would run on
-    // both paths' census. Neither is worth reasoning about inside a hot loop.
+    // both paths' census. Neither is worth reasoning about inside a hot loop. A call the effect
+    // summaries prove side-effect free and always returning (`crate::effects`) does neither: it
+    // writes nothing, and it cannot stop an iteration before a check whose length the guard reads
+    // early.
+    let harmless = |func: &wukong_span::Symbol| {
+        effects
+            .and_then(|e| e.get(*func))
+            .is_some_and(|e| e.will_return)
+    };
     for b in &l.blocks {
         for inst in &f.block(*b).insts {
-            if matches!(
-                inst.op,
-                Op::Call { .. } | Op::VecKernelCall { .. } | Op::Barrier | Op::AtomicAdd { .. }
-            ) {
-                return None;
+            match &inst.op {
+                Op::Call { func, .. } if harmless(func) => {}
+                Op::Call { .. } | Op::VecKernelCall { .. } | Op::Barrier | Op::AtomicAdd { .. } => {
+                    return None
+                }
+                _ => {}
             }
         }
     }

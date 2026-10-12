@@ -26,7 +26,8 @@
 //!
 //! Every "unknown" answer is reported as the pessimistic one: an unrecognized address is
 //! [`AddrForm::Unknown`], an unrecognized loop-carried value is [`Carried::Recurrence`], and any
-//! call in the loop forces [`MemDep::Carried`]. The two places where the analysis takes a stated
+//! call in the loop forces [`MemDep::Carried`] — unless the caller hands in effect summaries that
+//! prove it side-effect free ([`DepFacts`]). The two places where the analysis takes a stated
 //! assumption rather than proving something are documented on [`AffineExpr`] (integer arithmetic
 //! does not wrap) and [`MemDep::IndependentIfBasesStable`] (a reloaded base pointer is stable).
 //! Nothing else is assumed.
@@ -128,10 +129,11 @@ impl NaturalLoop {
             MemDep::Independent
                 | MemDep::IndependentIfBasesStable
                 | MemDep::IndependentIfBasesDisjoint
-        ) && self
-            .carried
-            .iter()
-            .all(|c| !matches!(c.kind, Carried::Recurrence))
+        ) && self.dep.serial.is_empty()
+            && self
+                .carried
+                .iter()
+                .all(|c| !matches!(c.kind, Carried::Recurrence))
     }
 }
 
@@ -852,6 +854,14 @@ pub struct DepSummary {
     /// A short human-readable justification, for the dump. Always a literal: every forest rebuild
     /// constructs one per loop, and the production compile never reads it.
     pub reason: &'static str,
+    /// Indices into [`NaturalLoop::accesses`], ascending: the gathers and scatters that may touch
+    /// what another access of the loop touches in a *different* iteration, and those other
+    /// accesses. Only filled when the analysis is asked to ([`DepFacts::serial`]); otherwise such a
+    /// pair makes the verdict [`MemDep::Carried`]. When it is non-empty, [`Self::memory`] is the
+    /// verdict over every *other* pair, and it holds only for a consumer that performs these
+    /// accesses lane by lane in iteration order (the vectorizer's lane-serial region) — so
+    /// [`NaturalLoop::is_vectorizable_shape`] answers `false`.
+    pub serial: Vec<usize>,
 }
 
 impl Default for DepSummary {
@@ -859,8 +869,22 @@ impl Default for DepSummary {
         DepSummary {
             memory: MemDep::Carried,
             reason: "not analyzed",
+            serial: Vec::new(),
         }
     }
+}
+
+/// What the dependence stage may take from outside the loop's own instructions
+/// ([`analyze_one_with`]). The default is the plain analysis every other consumer runs.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DepFacts<'a> {
+    /// The call-effect summaries ([`crate::effects`]): a call to a callee they prove side-effect
+    /// free writes nothing the loop can see, and is a read from anywhere when it reads memory.
+    /// `None` keeps every call an opaque effect.
+    pub(crate) calls: Option<&'a crate::effects::CallEffects>,
+    /// Report a gather or scatter that may meet another access in [`DepSummary::serial`] instead of
+    /// failing the verdict.
+    pub(crate) serial: bool,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -882,7 +906,7 @@ pub fn analyze_function(f: &Function) -> LoopForest {
 pub(crate) fn analyze_with(f: &Function, idom: &[u32], preds: &[Vec<u32>]) -> LoopForest {
     let mut forest = find_loops(f, idom, preds);
     for i in 0..forest.loops.len() {
-        analyze_loop(f, &mut forest, i, Stages::All);
+        analyze_loop(f, &mut forest, i, Stages::All, DepFacts::default());
     }
     forest
 }
@@ -900,7 +924,20 @@ pub(crate) fn analyze_with(f: &Function, idom: &[u32], preds: &[Vec<u32>]) -> Lo
 /// deliberate, because the alternative is caching a half-analysis whose defaults no longer mean
 /// "not analyzed".
 pub(crate) fn analyze_one(f: &Function, forest: &mut LoopForest, idx: usize, stages: Stages) {
-    analyze_loop(f, forest, idx, stages);
+    analyze_loop(f, forest, idx, stages, DepFacts::default());
+}
+
+/// [`analyze_one`], with the dependence stage told what `facts` adds: which calls write nothing,
+/// and whether to report gather/scatter conflicts instead of failing on them. Only the vectorizer
+/// asks, because only it knows how to act on the answers.
+pub(crate) fn analyze_one_with(
+    f: &Function,
+    forest: &mut LoopForest,
+    idx: usize,
+    stages: Stages,
+    facts: DepFacts<'_>,
+) {
+    analyze_loop(f, forest, idx, stages, facts);
 }
 
 /// Loop **structure only** — headers, latches, block sets, preheaders, exits and the nesting forest
@@ -2325,22 +2362,40 @@ fn branch_merge(ctx: &LoopCtx<'_>, l: &NaturalLoop, m: ValueId) -> Option<Branch
 /// Pairs whose bases could not be related at all downgrade the verdict to
 /// [`MemDep::IndependentIfBasesDisjoint`] instead of failing it — see that variant for the
 /// obligation that creates.
-fn dependence(ctx: &LoopCtx<'_>, l: &NaturalLoop, accesses: &[MemAccess]) -> DepSummary {
+fn dependence(
+    ctx: &LoopCtx<'_>,
+    l: &NaturalLoop,
+    accesses: &[MemAccess],
+    facts: DepFacts<'_>,
+) -> DepSummary {
     let carried = |why: &'static str| DepSummary {
         memory: MemDep::Carried,
         reason: why,
+        serial: Vec::new(),
     };
     // A call may read or write anything, and `VecKernelCall` writes through its output streams. An
     // `AtomicAdd` is a read-modify-write other threads may race, and no plan widens one.
+    //
+    // The exception is a call the effect summaries prove side-effect free ([`DepFacts::calls`]):
+    // it writes nothing the loop can see, so it is no access at all — unless it reads memory, when
+    // it is a load from anywhere, and only a loop that stores nothing leaves what it reads alone.
+    let mut call_reads = false;
     for &b in &l.blocks {
         for inst in &ctx.f.blocks[b.0 as usize].insts {
-            if matches!(
-                inst.op,
-                Op::Call { .. } | Op::VecKernelCall { .. } | Op::AtomicAdd { .. }
-            ) {
-                return carried("a call in the loop may touch any memory");
+            match &inst.op {
+                Op::Call { func, .. } => match facts.calls.and_then(|e| e.get(*func)) {
+                    Some(effect) => call_reads |= effect.reads_memory,
+                    None => return carried("a call in the loop may touch any memory"),
+                },
+                Op::VecKernelCall { .. } | Op::AtomicAdd { .. } => {
+                    return carried("a call in the loop may touch any memory")
+                }
+                _ => {}
             }
         }
+    }
+    if call_reads && accesses.iter().any(|a| a.kind == AccessKind::Store) {
+        return carried("a call reads memory the loop may write");
     }
     let mut needs_runtime_check = false;
     let mut reloaded_base = false;
@@ -2366,15 +2421,20 @@ fn dependence(ctx: &LoopCtx<'_>, l: &NaturalLoop, accesses: &[MemAccess]) -> Dep
         MemBase::Outer(v) => v,
         MemBase::ReloadedOuter { value, .. } => value,
     };
-    for a in accesses
+    // Asked for ([`DepFacts::serial`]), a gather or scatter that may meet another access is not a
+    // verdict but a list: both accesses go here, and a consumer that performs every listed access
+    // lane by lane in iteration order keeps each such pair in the scalar loop's order.
+    let mut serial: Vec<usize> = Vec::new();
+    for (ai, a) in accesses
         .iter()
-        .filter(|a| matches!(a.addr, AddrForm::Unknown))
+        .enumerate()
+        .filter(|(_, a)| matches!(a.addr, AddrForm::Unknown))
     {
         let Some(gb) = a.gather_base else {
             return carried("an address the analysis could not decompose");
         };
         let scatter = a.kind == AccessKind::Store;
-        for s in accesses.iter().filter(|s| {
+        for (si, s) in accesses.iter().enumerate().filter(|(_, s)| {
             (s.block, s.inst) != (a.block, a.inst) && (scatter || s.kind == AccessKind::Store)
         }) {
             // A scatter has no `addr.base()`; its object is its `gather_base`.
@@ -2387,7 +2447,20 @@ fn dependence(ctx: &LoopCtx<'_>, l: &NaturalLoop, accesses: &[MemAccess]) -> Dep
                     || !alias
                         .get_or_insert_with(|| crate::alias::AliasInfo::analyze(ctx.f))
                         .may_alias(handle(gb), handle(sb)));
+            // A slice re-reading its data pointer out of its fat pointer, beside a scatter of a
+            // typed element: Wukong has no type punning, so an element stored through a `gep`
+            // counting in its own (non-pointer, non-byte) type never lands on a slice header —
+            // the rule `bce` reads lengths early by. The assumption every widened slice loop
+            // already takes ([`MemDep::IndependentIfBasesStable`]), made explicit for the one
+            // consumer that orders the rest lane by lane.
+            if !apart && facts.serial && scatter && header_read(s) && typed_element_store(ctx, a) {
+                continue;
+            }
             if !apart {
+                if facts.serial {
+                    serial.extend([ai, si]);
+                    continue;
+                }
                 return carried(if scatter {
                     "a scattered store may touch what the loop reads or writes"
                 } else {
@@ -2399,13 +2472,21 @@ fn dependence(ctx: &LoopCtx<'_>, l: &NaturalLoop, accesses: &[MemAccess]) -> Dep
             reloaded_base = true;
         }
     }
+    serial.sort_unstable();
+    serial.dedup();
+    let in_serial = |k: usize| serial.binary_search(&k).is_ok();
     for (i, a) in accesses.iter().enumerate() {
-        for b in &accesses[i + 1..] {
+        for (j, b) in accesses.iter().enumerate().skip(i + 1) {
             if a.kind == AccessKind::Load && b.kind == AccessKind::Load {
                 continue;
             }
             // A gather was settled against every store above.
             if matches!(a.addr, AddrForm::Unknown) || matches!(b.addr, AddrForm::Unknown) {
+                continue;
+            }
+            // Two accesses performed lane by lane in iteration order keep the scalar loop's order
+            // whatever they touch.
+            if in_serial(i) && in_serial(j) {
                 continue;
             }
             let (Some(ba), Some(bb)) = (a.addr.base(), b.addr.base()) else {
@@ -2457,6 +2538,9 @@ fn dependence(ctx: &LoopCtx<'_>, l: &NaturalLoop, accesses: &[MemAccess]) -> Dep
     DepSummary {
         memory,
         reason: match memory {
+            MemDep::Independent if !serial.is_empty() => {
+                "independent once the listed gathers and scatters run in iteration order"
+            }
             MemDep::Independent => "every conflicting pair is provably independent",
             MemDep::IndependentIfBasesStable => {
                 "independent, assuming a re-loaded base pointer does not change"
@@ -2466,6 +2550,7 @@ fn dependence(ctx: &LoopCtx<'_>, l: &NaturalLoop, accesses: &[MemAccess]) -> Dep
             }
             MemDep::Carried => unreachable!(),
         },
+        serial,
     }
 }
 
@@ -2523,6 +2608,24 @@ fn distinct_allocas(ctx: &LoopCtx<'_>, a: MemBase, b: MemBase) -> bool {
     is_alloca(a) && is_alloca(b) && !a.same_object(b)
 }
 
+/// A load of a pointer from a loop-invariant address: how a `[]T` slice re-reads its data pointer
+/// out of its fat pointer.
+fn header_read(s: &MemAccess) -> bool {
+    s.kind == AccessKind::Load
+        && s.value_ty == MirType::Ptr
+        && matches!(s.addr, AddrForm::Invariant(_))
+}
+
+/// A store of a scalar that is neither a pointer nor a byte, through a `gep` counting in that very
+/// type — an element of a typed array or slice, which by the language's no-punning rule is never a
+/// slice header's field.
+fn typed_element_store(ctx: &LoopCtx<'_>, a: &MemAccess) -> bool {
+    a.kind == AccessKind::Store
+        && !matches!(a.value_ty, MirType::Ptr | MirType::I8 | MirType::I1)
+        && (a.value_ty.is_int() || a.value_ty.is_float())
+        && matches!(ctx.op_of(a.ptr), Some(Op::Gep { elem, .. }) if *elem == a.value_ty)
+}
+
 /// How far [`analyze_loop`] runs. The stages are strictly nested, and each one is materially more
 /// expensive than the one before it, so a consumer that can decide from an early stage should stop
 /// there rather than pay for the rest.
@@ -2545,7 +2648,13 @@ pub(crate) enum Stages {
     All,
 }
 
-fn analyze_loop(f: &Function, forest: &mut LoopForest, idx: usize, stages: Stages) {
+fn analyze_loop(
+    f: &Function,
+    forest: &mut LoopForest,
+    idx: usize,
+    stages: Stages,
+    facts: DepFacts<'_>,
+) {
     let l = &forest.loops[idx];
     let mut ctx = LoopCtx::new(f, l);
 
@@ -2608,7 +2717,7 @@ fn analyze_loop(f: &Function, forest: &mut LoopForest, idx: usize, stages: Stage
     let (accesses, carried, reductions, dep) = if ctx.primary.is_some() {
         let accesses = collect_accesses(&ctx, l, &mut memo);
         let (carried, reductions) = classify_carried(&ctx, l, &ivs);
-        let dep = dependence(&ctx, l, &accesses);
+        let dep = dependence(&ctx, l, &accesses, facts);
         (accesses, carried, reductions, dep)
     } else {
         (Vec::new(), Vec::new(), Vec::new(), DepSummary::default())
@@ -3786,6 +3895,94 @@ mod tests {
                    fn main() -> i32 { return 0; }";
         let (_, l) = kernel_loop(src, "k");
         assert_eq!(l.dep.memory, MemDep::Carried, "{}", l.dep.reason);
+    }
+
+    /// [`kernel_loop`], re-analyzed the way the vectorizer asks: with the program's call-effect
+    /// summaries and with gather/scatter conflicts listed rather than failing the verdict.
+    fn serial_loop(src: &str, func: &str) -> (Function, NaturalLoop) {
+        let mut interner = Interner::new();
+        let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pd.iter().all(|d| !d.is_error()), "parse: {pd:?}");
+        let (sema, sd) = wukong_sema::check(&module, &interner);
+        assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
+        let (mut program, _) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        crate::optimize(&mut program, 1);
+        let effects = crate::effects::CallEffects::of(&program);
+        let f = program
+            .function(interner.intern(func))
+            .unwrap_or_else(|| panic!("no fn {func}"))
+            .clone();
+        let mut forest = analyze_function(&f);
+        let best = (0..forest.loops.len())
+            .max_by_key(|&i| {
+                let l = &forest.loops[i];
+                (l.accesses.len(), l.header.0)
+            })
+            .unwrap_or_else(|| panic!("no loop in {func}"));
+        let facts = DepFacts {
+            calls: Some(&effects),
+            serial: true,
+        };
+        analyze_one_with(&f, &mut forest, best, Stages::Memory, facts);
+        let l = forest.loops[best].clone();
+        (f, l)
+    }
+
+    /// A read-modify-write scatter is carried for every consumer but the one that asks for the
+    /// list: then the gather and the scatter are listed — and nothing else, `@noalias` keeping
+    /// the other accesses apart — and every other pair is independent.
+    #[test]
+    fn a_read_modify_write_scatter_is_listed_for_lane_order() {
+        let src = "@unchecked fn k(@noalias mut h: []f32, q: []i32, x: []f32, n: i64) { \
+                   let mut i: i64 = 0; \
+                   while i < n { h[q[i] as i64] = h[q[i] as i64] + x[i]; i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        let (_, plain) = kernel_loop(src, "k");
+        assert_eq!(plain.dep.memory, MemDep::Carried, "{}", plain.dep.reason);
+        let (_, l) = serial_loop(src, "k");
+        assert_ne!(l.dep.memory, MemDep::Carried, "{}", l.dep.reason);
+        let listed: Vec<&MemAccess> = l.dep.serial.iter().map(|&k| &l.accesses[k]).collect();
+        assert_eq!(listed.len(), 2, "{listed:?}");
+        assert!(listed
+            .iter()
+            .all(|a| matches!(a.addr, AddrForm::Unknown) && a.gather_base.is_some()));
+        assert!(
+            !l.is_vectorizable_shape(),
+            "a listed pair is not a plain widening licence"
+        );
+    }
+
+    /// A call is an opaque effect to every consumer without the summaries. With them, a call to a
+    /// side-effect-free callee is no access at all; one that reads memory is carried beside a
+    /// store (it may read what an earlier iteration stored) and free in a loop that stores nothing.
+    #[test]
+    fn a_summarized_call_is_no_access_unless_it_reads_beside_a_store() {
+        let pure = "fn sq(x: f32, d: i64) -> f32 { if d <= 0 { return x * x; } \
+                    return sq(x, d - 1) + 1.0; } \
+                    @unchecked fn k(x: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
+                    while i < n { o[i] = sq(x[i], 2); i = i + 1; } } \
+                    fn main() -> i32 { return 0; }";
+        let (_, plain) = kernel_loop(pure, "k");
+        assert_eq!(plain.dep.memory, MemDep::Carried, "{}", plain.dep.reason);
+        let (_, l) = serial_loop(pure, "k");
+        assert_ne!(l.dep.memory, MemDep::Carried, "{}", l.dep.reason);
+
+        let rd = "@unchecked fn rd(t: []f32, j: i64, d: i64) -> f32 { if d <= 0 { return t[j]; } \
+                  return rd(t, j, d - 1) * 0.5; } ";
+        let beside = format!(
+            "{rd} @unchecked fn k(t: []f32, x: []f32, mut o: []f32, n: i64) {{ \
+             let mut i: i64 = 0; while i < n {{ o[i] = rd(t, i, 1) + x[i]; i = i + 1; }} }} \
+             fn main() -> i32 {{ return 0; }}"
+        );
+        let (_, l) = serial_loop(&beside, "k");
+        assert_eq!(l.dep.memory, MemDep::Carried, "{}", l.dep.reason);
+        let alone = format!(
+            "{rd} @unchecked fn k(t: []f32, x: []f32, n: i64) -> f32 {{ let mut s: f32 = 0.0; \
+             let mut i: i64 = 0; while i < n {{ s = s + rd(t, i, 1) * x[i]; i = i + 1; }} \
+             return s; }} fn main() -> i32 {{ return 0; }}"
+        );
+        let (_, l) = serial_loop(&alone, "k");
+        assert_ne!(l.dep.memory, MemDep::Carried, "{}", l.dep.reason);
     }
 
     // ---- stage 4: carried values -------------------------------------------------------------
