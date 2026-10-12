@@ -124,12 +124,6 @@ mod par_region;
 #[cfg(test)]
 mod par_region_tests;
 
-// The address-keyed memo that walks each loop once for the GEMM bias-alias preflight
-// (`GemmBiasAlias`), instead of once per enclosing loop (see the module docs).
-mod bias_memo;
-#[cfg(test)]
-mod bias_memo_tests;
-
 // ===== Type-generic monomorphization =====
 //
 // A function generic over a TYPE parameter (`fn id<T>(x: T) -> T`) cannot be lowered once: its MIR
@@ -28078,6 +28072,13 @@ fn recognize_matmul<'a>(
         .or_else(|| match_matmul_ijk_memacc(pat, iter, body, sema, interner))
         .or_else(|| detile::match_matmul_ijk_cseed(pat, iter, body, sema, interner))
 }
+
+// The address-keyed memo that walks each loop once for the GEMM bias-alias preflight below,
+// instead of once per enclosing loop (see the module docs). Declared beside its one user, not with
+// the other `mod`s at the top, so it does not collide with the modules other branches add there.
+mod bias_memo;
+#[cfg(test)]
+mod bias_memo_tests;
 
 /// Source-only preflight for a recognized GEMM whose bias can overlap its output.
 /// Visit enclosing blocks too: outlining a batch first would hide the dependency
