@@ -1,0 +1,133 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// q[m] = p[31 - m] + 0.5, with p[n] = 10 * (n / 8) + n % 8
+// EXPECT-OUT-VALUES: 37.5 36.5 35.5 34.5 33.5 32.5 31.5 30.5
+// EXPECT-OUT-VALUES: 27.5 26.5 25.5 24.5 23.5 22.5 21.5 20.5
+// EXPECT-OUT-VALUES: 17.5 16.5 15.5 14.5 13.5 12.5 11.5 10.5
+// EXPECT-OUT-VALUES: 7.5 6.5 5.5 4.5 3.5 2.5 1.5 0.5
+// acc[k] = 204 + 48 * (k % 4) + 12 * (k / 4)
+// EXPECT-OUT-VALUES: 204 252 300 348 216 264 312 360
+// r[m] = 2 * q[m]
+// EXPECT-OUT-VALUES: 75 73 71 69 67 65 63 61
+// EXPECT-OUT-VALUES: 55 53 51 49 47 45 43 41
+// EXPECT-OUT-VALUES: 35 33 31 29 27 25 23 21
+// EXPECT-OUT-VALUES: 15 13 11 9 7 5 3 1
+// c[i][j] = 24i + 4ij + 56 + 6j
+// EXPECT-OUT-VALUES: 56 62 68 74 80 90 100 110
+// EXPECT-OUT-VALUES: 104 118 132 146 128 146 164 182
+// e[m] = r[m] / 2 + 0.25
+// EXPECT-OUT-VALUES: 37.75 36.75 35.75 34.75 33.75 32.75 31.75 30.75
+// EXPECT-OUT-VALUES: 27.75 26.75 25.75 24.75 23.75 22.75 21.75 20.75
+// EXPECT-OUT-VALUES: 17.75 16.75 15.75 14.75 13.75 12.75 11.75 10.75
+// EXPECT-OUT-VALUES: 7.75 6.75 5.75 4.75 3.75 2.75 1.75 0.75
+// keep[i] = 7i + 2
+// EXPECT-OUT-VALUES: 2 9 16 23 30 37 44 51
+module tests.run.stack_color_kills
+
+// Stack-slot coloring with full overwrites (N86): every scratch array here is zeroed at its `let`
+// and fully rewritten later — by a loop nest (row-major and column-major), by a recognized GEMM, by
+// a recognized elementwise kernel — before anything reads it, so its zeros are dead and the native
+// backend may let it share a frame slot with an array whose lifetime ended before the rewrite. The
+// arrays whose lifetimes overlap are printed lane by lane, so a coloring that shares the wrong pair
+// corrupts a printed value on one of the two backends:
+//
+// - `keep` is written first and read last: it shares with nothing;
+// - `q` is filled from `p` (both live there), `r` from `q`, `e` from `r`;
+// - `a` and `b` are filled after `p` and `q` are dead and read by the GEMM writing `c`;
+// - `w` and `v` are rewritten by nests on every iteration of the `h` loop (`v` from `w`), and `acc`
+//   accumulates across it.
+//
+// Expected values, from the scalar definitions: p[i*8 + j] = 10i + j; q[m] = p[31 - m] + 0.5;
+// r[m] = 2 q[m]; c = a·b with a[i][k] = i + k and b[k][j] = 4k + j, so
+// c[i][j] = sum_k (i + k)(4k + j) = 4i·6 + 4ij + 4·14 + 6j; e[m] = r[m]/2 + 0.25 = q[m] + 0.25;
+// v[m] = 2 w[(m % 4)*4 + m / 4] = 2(16h + 4(m % 4) + m / 4), so for k < 8
+// acc[k] = sum_h (v[k] + v[k + 8]) = sum_h (64h + 16(k % 4) + 4(k / 4) + 4). Every value is exact
+// in f32.
+fn main() -> i32 {
+    let mut keep: [i32; 8] = [0; 8];
+    for i in 0..8 {
+        keep[i] = i * 7 + 2;
+    }
+
+    let mut p: [f32; 32] = [0.0; 32];
+    let mut q: [f32; 32] = [0.0; 32];
+    let mut r: [f32; 32] = [0.0; 32];
+    let mut a: [f32; 16] = [0.0; 16];
+    let mut b: [f32; 16] = [0.0; 16];
+    let mut c: [f32; 16] = [0.0; 16];
+    let mut e: [f32; 32] = [0.0; 32];
+    let mut w: [f32; 16] = [0.0; 16];
+    let mut v: [f32; 16] = [0.0; 16];
+    let mut acc: [f32; 8] = [0.0; 8];
+
+    for i in 0..4 {
+        for j in 0..8 {
+            p[i * 8 + j] = (i * 10 + j) as f32;
+        }
+    }
+    for i in 0..4 {
+        for j in 0..8 {
+            q[j * 4 + i] = p[31 - (j * 4 + i)] + 0.5;
+        }
+    }
+    for i in 0..4 {
+        for j in 0..8 {
+            r[i * 8 + j] = q[i * 8 + j] * 2.0;
+        }
+    }
+    for m in 0..32 {
+        print(q[m]);
+    }
+
+    for h in 0..3 {
+        for i in 0..4 {
+            for j in 0..4 {
+                w[i * 4 + j] = (h * 16 + i * 4 + j) as f32;
+            }
+        }
+        for i in 0..4 {
+            for j in 0..4 {
+                v[j * 4 + i] = w[i * 4 + j] * 2.0;
+            }
+        }
+        for k in 0..8 {
+            acc[k] = acc[k] + v[k] + v[k + 8];
+        }
+    }
+    for k in 0..8 {
+        print(acc[k]);
+    }
+
+    for i in 0..4 {
+        for k in 0..4 {
+            a[i * 4 + k] = (i + k) as f32;
+            b[i * 4 + k] = (i * 4 + k) as f32;
+        }
+    }
+    for i in 0..4 {
+        for j in 0..4 {
+            let mut s: f32 = 0.0;
+            for k in 0..4 {
+                s = s + a[i * 4 + k] * b[k * 4 + j];
+            }
+            c[i * 4 + j] = s;
+        }
+    }
+    for m in 0..32 {
+        e[m] = r[m] * 0.5 + 0.25;
+    }
+
+    for m in 0..32 {
+        print(r[m]);
+    }
+    for m in 0..16 {
+        print(c[m]);
+    }
+    for m in 0..32 {
+        print(e[m]);
+    }
+    for i in 0..8 {
+        print(keep[i]);
+    }
+    return 0;
+}
