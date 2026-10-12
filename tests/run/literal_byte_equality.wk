@@ -1,0 +1,26 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: true
+// EXPECT-OUT: true
+// EXPECT-OUT: true
+// EXPECT-OUT: 195
+module tests.run.literal_byte_equality
+
+// A string literal's bytes are the same `u8` values as those bytes anywhere else. U+00E9 is
+// encoded C3 A9: the `str` literal's two bytes equal `[0xC3, 0xA9]` element by element, and so
+// does the first byte of the same literal read through its `*u8`. The interpreter used to hold a
+// literal's bytes zero-extended (195) while every other byte slot holds the sign-extended `i8`
+// (-61) an `I8` store leaves, and a load reads a slot verbatim, so each comparison here was false
+// on the interpreter and true natively. Printed as a `u8`, the byte is 195 on both.
+
+fn main() -> i32 {
+    let s: str = "\u{e9}";
+    let a: [u8; 2] = [0xC3, 0xA9];
+    let t: []u8 = a;
+    println(t[0] == s[0]);
+    println(t[1] == s[1]);
+    let p = "\u{e9}";
+    println(*p == a[0]);
+    println(s[0]);
+    return 0;
+}

@@ -2099,8 +2099,14 @@ impl<'a, 'k> Interp<'a, 'k> {
                         .ok_or("global_addr of unknown static data")?;
                     let bytes = &self.program.statics[index].bytes;
                     let base = self.memory.len();
+                    // Each byte in the representation every other byte slot holds — the
+                    // sign-extended `i8` an `I8` store or a runtime byte write leaves — because a
+                    // load is verbatim (`canonical_result`). Zero-extended here, the bytes of a
+                    // string literal compared unequal to the same bytes anywhere else on this
+                    // backend only: `s[0] == t[0]` for `s: str = "\u{e9}"` and `t` viewing
+                    // `[0xC3, 0xA9]` was false here and true natively.
                     self.memory
-                        .extend(bytes.iter().map(|&b| Value::Int(b as i128)));
+                        .extend(bytes.iter().map(|&b| Value::Int(i128::from(b as i8))));
                     self.slots.live.insert(base, bytes.len());
                     self.data_addrs.insert(*sym, base);
                     Value::Ptr(base)
