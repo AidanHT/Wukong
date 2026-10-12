@@ -42,7 +42,11 @@
 //! a proof: a read of the old value through a computation for which every fill happens to be an
 //! identity still passes, so a new entry's kernel is read, not only run. Every integer operand an
 //! entry leaves unconstrained (an activation or op code, an `eps`, a `causal` flag) is also probed
-//! at 0 and -1, so an early exit on a value the entry admits fails the test as well.
+//! at 0 and -1, so an early exit on a value the entry admits fails the test as well. A `_parallel`
+//! entry with a size gate of its own that `cfg(test)` leaves in force — the GEMMs' 2^23 MACs, the
+//! `vmath`, `velem` and transpose element counts — also runs one shape past it
+//! (`every_gated_parallel_entry_runs_past_its_gate`), so the test holds its parallel path and not
+//! only the serial kernel it falls back to below the gate.
 
 /// One kernel entry point's output contract (see the module note).
 #[derive(Clone, Copy, Debug)]
@@ -429,12 +433,21 @@ mod tests {
         }
     }
 
+    /// `(m, k, n)` of a GEMM past the parallel entries' 2^23-MAC gate (8.73M MACs), with three K
+    /// blocks — the first overwrites `C`, the later ones accumulate into what it wrote — and MR and
+    /// NR remainders.
+    const GEMM_PAST_GATE: (i64, i64, i64) = (97, 900, 100);
+
     /// Every operand list the test runs `symbol` with: each shape crossed with each value its
-    /// op-code operands take. The shapes include 1-element, odd and multi-tile sizes.
+    /// op-code operands take. The shapes include 1-element, odd and multi-tile sizes, and, for a
+    /// `_parallel` entry with a size gate of its own ([`past_size_gate`]), one shape past it: the
+    /// small shapes reach only the serial kernel such an entry falls back to.
     fn calls(symbol: &str) -> Vec<Vec<Arg>> {
         use Arg::*;
+        let par = symbol.ends_with("_parallel");
         let shapes3: [(i64, i64, i64); 5] =
             [(1, 1, 1), (3, 5, 7), (7, 13, 2), (17, 33, 9), (64, 70, 48)];
+        let shapes3 = shapes3.into_iter().chain(par.then_some(GEMM_PAST_GATE));
         let shapes2: [(i64, i64); 6] = [(1, 1), (1, 9), (5, 3), (9, 17), (33, 40), (70, 130)];
         let lens: [i64; 6] = [1, 7, 8, 13, 64, 1000];
         let u = |v: i64| v as usize;
@@ -446,7 +459,7 @@ mod tests {
             | "wukong_sgemm_nt_parallel"
             | "wukong_sgemm_tn"
             | "wukong_sgemm_tn_parallel" => {
-                for (m, k, n) in shapes3 {
+                for (m, k, n) in shapes3.clone() {
                     out.push(vec![
                         In(u(m * k)),
                         In(u(k * n)),
@@ -459,7 +472,7 @@ mod tests {
                 }
             }
             "wukong_sgemm_nt_alpha" | "wukong_sgemm_nt_alpha_parallel" => {
-                for (m, k, n) in shapes3 {
+                for (m, k, n) in shapes3.clone() {
                     out.push(vec![
                         In(u(m * k)),
                         In(u(k * n)),
@@ -473,7 +486,7 @@ mod tests {
                 }
             }
             "wukong_sgemm_nt_epi" | "wukong_sgemm_nt_epi_parallel" => {
-                for (m, k, n) in shapes3 {
+                for (m, k, n) in shapes3.clone() {
                     for act in [0, 1, 2, 3, 7] {
                         out.push(vec![
                             In(u(m * k)),
@@ -507,7 +520,8 @@ mod tests {
                 }
             }
             "wukong_vmath_f32" | "wukong_vmath_f32_parallel" => {
-                for n in lens {
+                // 40,000: two whole chunks of the parallel entry and a ragged third.
+                for n in lens.into_iter().chain(par.then_some(40_000)) {
                     for op in (0..=40).chain([-1, 1000]) {
                         out.push(vec![In(u(n)), Out, Int(n), Int(op)]);
                     }
@@ -521,7 +535,8 @@ mod tests {
                 }
             }
             "wukong_velem_f32" | "wukong_velem_f32_parallel" => {
-                for n in lens {
+                // 270,007: 32 whole chunks of the parallel entry and a ragged 33rd.
+                for n in lens.into_iter().chain(par.then_some(270_007)) {
                     for op in [0, 1, 2, 3, 256, 257, 258, 512, 513, 514, 1024, 1025, 1026] {
                         for (a, b, c) in [(1.0, 0.0, 0.0), (0.5, -2.0, 0.25)] {
                             out.push(vec![
@@ -570,9 +585,13 @@ mod tests {
                     }
                 }
             }
-            "wukong_transpose_f32"
-            | "wukong_transpose_f32_parallel"
-            | "wukong_cumsum_f32"
+            "wukong_transpose_f32" | "wukong_transpose_f32_parallel" => {
+                // 300x400: ragged 32-row blocks on both axes.
+                for (r, c) in shapes2.into_iter().chain(par.then_some((300, 400))) {
+                    out.push(vec![In(u(r * c)), Out, Int(r), Int(c)]);
+                }
+            }
+            "wukong_cumsum_f32"
             | "wukong_cumsum_f32_parallel"
             | "wukong_colsum_f32"
             | "wukong_colsum_f32_parallel"
@@ -621,9 +640,50 @@ mod tests {
             .collect()
     }
 
-    /// Room for any output a test shape can produce, whatever extent the table claims: an entry that
-    /// misstates the output must make the test fail, not write past the buffer.
+    /// Room for the output of a test call none of whose inputs is longer, whatever extent the table
+    /// claims: an entry that misstates the output must make the test fail, not write past the
+    /// buffer. A call with a longer input gets that input's length ([`room_for`]): every test call's
+    /// true output is no longer than one of the two.
     const OUT_ROOM: usize = 1 << 16;
+
+    /// The most room any test call gets: the pre-fills are built this long.
+    const MAX_ROOM: usize = 1 << 19;
+
+    /// The output room for a test call with operands `args` (see [`OUT_ROOM`]).
+    fn room_for(args: &[Arg]) -> usize {
+        args.iter().fold(OUT_ROOM, |room, a| match a {
+            Arg::In(n) => room.max(*n),
+            _ => room,
+        })
+    }
+
+    /// Does a call of the `_parallel` entry `symbol` with operands `args` pass the entry's own size
+    /// gate, one that `cfg(test)` leaves in force? `None` for an entry without one: the others fork
+    /// through `par::fork_units`/`fork_rows`, whose work threshold `cfg(test)` lowers to zero, at
+    /// any test shape with two or more rows, row pairs or column stripes (the broadcast bias at
+    /// more than one 8-row band).
+    fn past_size_gate(symbol: &str, args: &[Arg]) -> Option<bool> {
+        let int = |k: usize| match args[k] {
+            Arg::Int(v) => u64::try_from(v).unwrap_or(0),
+            other => panic!("{symbol}: operand {k} is {other:?}, not an integer"),
+        };
+        let at_least = |work: u64, gate: usize| Some(work >= gate as u64);
+        match symbol {
+            "wukong_sgemm_parallel"
+            | "wukong_sgemm_nt_parallel"
+            | "wukong_sgemm_tn_parallel"
+            | "wukong_sgemm_nt_alpha_parallel"
+            | "wukong_sgemm_nt_epi_parallel" => {
+                Some(int(3) * int(4) * int(5) >= crate::gemm::par_min_macs())
+            }
+            "wukong_vmath_f32_parallel" => at_least(int(2), crate::vmath::VMATH_PAR_MIN),
+            "wukong_velem_f32_parallel" => at_least(int(3), crate::velem::velem_par_min()),
+            "wukong_transpose_f32_parallel" => {
+                at_least(int(2) * int(3), crate::transpose::TRANSPOSE_PAR_MIN)
+            }
+            _ => None,
+        }
+    }
 
     /// Element `i` of output pre-fill number `fill`. A kernel that writes an element before it reads
     /// it leaves the same bits there under every fill, so the test compares them all. No finite set
@@ -698,7 +758,7 @@ mod tests {
     /// early exit.
     #[test]
     fn every_contract_holds_on_the_kernel() {
-        let fills = fill_buffers(OUT_ROOM);
+        let fills = fill_buffers(MAX_ROOM);
         let mut checked = 0usize;
         for c in OVERWRITES {
             let cases = calls(c.symbol);
@@ -739,7 +799,8 @@ mod tests {
                     c.symbol
                 );
                 let len: usize = c.extent.iter().map(|&k| int(k) as usize).product();
-                assert!(len <= OUT_ROOM, "{}", c.symbol);
+                let room = room_for(&args);
+                assert!(len <= room && room <= MAX_ROOM, "{}", c.symbol);
                 let inputs: Vec<Vec<f32>> = args
                     .iter()
                     .enumerate()
@@ -748,7 +809,7 @@ mod tests {
                         _ => None,
                     })
                     .collect();
-                let found = fill_dependence(&fills, OUT_ROOM, len, |outbuf| {
+                let found = fill_dependence(&fills, room, len, |outbuf| {
                     // A fresh copy of the inputs per run, so a kernel that wrongly wrote one cannot
                     // feed the next run different operands.
                     let mut owned = inputs.clone();
@@ -872,6 +933,34 @@ mod tests {
         }
         // Every uniform fill passes a min of magnitudes; the per-element pattern catches it.
         assert!(!caught(3, running_min_of_magnitudes) && caught(4, running_min_of_magnitudes));
+    }
+
+    /// Every `_parallel` entry with a size gate of its own runs past it on at least one test call, so
+    /// `every_contract_holds_on_the_kernel` holds its parallel path to the contract, not only the
+    /// serial kernel it falls back to below the gate.
+    #[test]
+    fn every_gated_parallel_entry_runs_past_its_gate() {
+        let mut gated = 0;
+        for c in OVERWRITES
+            .iter()
+            .filter(|c| c.symbol.ends_with("_parallel"))
+        {
+            let past: Vec<Option<bool>> = calls(c.symbol)
+                .iter()
+                .map(|args| past_size_gate(c.symbol, args))
+                .collect();
+            if past.iter().all(Option::is_none) {
+                continue;
+            }
+            gated += 1;
+            assert!(
+                past.contains(&Some(true)),
+                "{}: no test call reaches its parallel path",
+                c.symbol
+            );
+        }
+        // The five GEMMs, vmath, velem and transpose.
+        assert_eq!(gated, 8);
     }
 
     /// The table is well-formed: one entry per symbol, and every operand index it names is inside

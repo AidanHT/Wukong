@@ -453,7 +453,7 @@ unsafe fn transpose_rows_f32(
 
 /// Element count below which the parallel transpose just runs serially (the rayon split is not worth
 /// its overhead on a small, already-cache-resident matrix).
-const TRANSPOSE_PAR_MIN: usize = 1 << 16;
+pub(crate) const TRANSPOSE_PAR_MIN: usize = 1 << 16;
 
 /// `dst = srcᵀ` — transpose a `[rows, cols]` row-major f32 matrix into a `[cols, rows]` row-major one,
 /// cache-blocked, single-threaded.

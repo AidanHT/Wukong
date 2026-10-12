@@ -1070,7 +1070,7 @@ const VMATH_CHUNK: usize = 1 << 14; // 16384 f32 = 64 KiB per chunk
 
 /// Below this many elements a compute-bound activation pass does not amortize the fork/join wake, so
 /// the parallel entry runs the serial kernel instead.
-const VMATH_PAR_MIN: usize = VMATH_CHUNK;
+pub(crate) const VMATH_PAR_MIN: usize = VMATH_CHUNK;
 
 /// Multicore twin of [`wukong_vmath_f32`]: the identical per-element activation, chunked across the
 /// runtime pool. Each chunk is a disjoint `[lo, hi)` sub-span run through the serial kernel, so the
