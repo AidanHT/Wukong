@@ -50,6 +50,25 @@ All notable changes to Wukong are documented here. The format is loosely based o
   program at every `-O` level (and a release build vectorized over an `i128` counter by accident).
   Both now decline such a counter, as the kernel recognizers and `parallel_spec` already did; the
   loop stays scalar and serial (`tests/run/i128_loop_counters.wk`).
+- **Fixed (review): a negated literal takes its value's type.** The bare magnitude 2^127 types as
+  `u128` and (2^63, 2^64) as `u64`, and the unsigned negation wrapped back to the positive bits, so
+  the guide's own `-170141183460469231731687303715884105728` printed `+2^127`, compared `>= 0`,
+  divided unsigned and converted to a positive float, and `-9223372036854775809` printed
+  9223372036854775807 — on both backends alike. A negated unsuffixed literal is now `i64` for
+  exactly 2^63 and `i128` up to 2^127; past that it is `E0431`
+  (`tests/run/i128_negated_literals.wk`, `tests/fail/negated_literal_past_i128.wk`).
+- **Fixed (review): every literal past `u64` is range-checked where it stands.** Making such a
+  literal well-formed had left three forms that used to be `E0431` silently keeping their low bits:
+  a suffixed literal past its suffix (`0x1_2345_6789_abcd_ef01u64`, `18446744073709551616u64`,
+  `170141183460469231731687303715884105728i128`), an all-literal expression adapting to a narrower
+  type (`let x: u64 = 18446744073709551616 + 5` stored 5) and a `char` target. A suffixed literal is
+  now checked against its own type at every width — so `300u8`, `128i8` and `-5u32`, which always
+  kept their low bits, are `E0431` too, while `-128i8` stays the `i8` minimum — each wide literal of
+  an adapting expression is checked by itself, `char` takes a 32-bit code, and a lone literal is
+  read exactly from its 128-bit magnitude (`let x: i8 = 9223372036854775808` and
+  `let x: i64 = -9223372036854775809` used to pass). An array length past `u64` read as 0
+  (`[7; 2^64]` printed `[]`); it is `E0401` now
+  (`tests/fail/{suffixed_literal_out_of_range,wide_literal_arith_into_narrow,wide_literal_into_char,array_repeat_count_past_u64}.wk`).
 - **Fixed (review): a 128-bit shift or rotate count keeps its low bits.** The clamp for 128-bit
   indices and extents also caught the count of `<<=`/`>>=` and `rotl`/`rotr`, so on a 64-bit value a
   count at or past 2^63 became a shift by 63 (`x_i64 <<= 2^64 + 3` gave `i64::MIN`, not 8) while a

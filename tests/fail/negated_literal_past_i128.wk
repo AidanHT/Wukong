@@ -1,0 +1,13 @@
+// EXPECT-CODE: E0431
+// EXPECT-COUNT: 2
+module tests.fail.negated_literal_past_i128
+
+// A negated unsuffixed literal is typed by its value: `-2^63` is an `i64`, `-(2^63 + 1)` through
+// `-2^127` an `i128`. Past 2^127 no integer type holds the value — the bare magnitude is a `u128`,
+// whose negation wrapped `-(2^128 - 1)` to 1, silently — so it is E0431, reported once even where
+// it also adapts to an annotation.
+fn main() -> i32 {
+    println(-340282366920938463463374607431768211455); //~ E0431
+    let x: i128 = -170141183460469231731687303715884105729; //~ E0431
+    return x as i32;
+}

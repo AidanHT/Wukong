@@ -1589,6 +1589,16 @@ computed at the counter's width — `try_vectorize_for`, every kernel recognizer
 `wukong_codegen_gpu::lower` declines any function holding an `i128`
 (`decline_i128`: PTX integers stop at 64 bits).
 
+In `wukong_sema` a literal past `u64` is well-formed, so its range is read from its `u128`
+magnitude wherever it stands (`range_check_wide`, `int_literal_fits`): a lone literal adapting to a
+type is checked exactly at every width (with the 64-bit band `-2^63..=2^64 - 1` for an unsuffixed
+literal), each literal of an adapting all-literal expression that the `i64` fold cannot read is
+checked by itself (`range_check_wide_leaves`), a suffixed literal is checked against its suffix when
+it is typed (a signed minimum only under a unary minus, `Sema::negated_literal`), and a negated
+unsuffixed literal is typed by its value (`i64` for exactly 2^63, else `i128`; past 2^127,
+`E0431`). An array length that is a literal past `u64` saturates in both mirrors
+(`eval_usize_depth`, `const_usize_depth`) so it is out of range rather than `0`.
+
 ### Debug info (`-g`) and the JIT perf map
 
 Both consume one record, `debuginfo::CodeLog`, that `populate_module` fills only when asked: each

@@ -239,6 +239,7 @@ i128_casts.wk: wukong_rt_arg_count wukong_rt_fmt_i128 wukong_rt_fmt_i128*24 wuko
 i128_index_clamp.wk: wukong_rt_alloc
 i128_loop_counters.wk: wukong_rt_fmt_lit wukong_rt_fmt_lit*5 wukong_rt_fmt_slice wukong_rt_fmt_slice*5
 i128_match_builtins.wk: wukong_rt_arg_count wukong_rt_fmt_i128 wukong_rt_fmt_i128*29 wukong_rt_fmt_int wukong_rt_fmt_int*4 wukong_rt_fmt_lit wukong_rt_fmt_lit*38 wukong_rt_fmt_str wukong_rt_fmt_str*3
+i128_negated_literals.wk: wukong_rt_fmt_i128 wukong_rt_fmt_i128*8 wukong_rt_fmt_lit wukong_rt_fmt_lit*8
 i128_shift_counts.wk:
 i8_linear.wk: wukong_i8gemm_nt
 i8_linear_dequant.wk: veckernel*1 wukong_i8gemm_nt_deq

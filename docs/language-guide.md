@@ -363,9 +363,9 @@ literal and an array **repeat** initializer must both supply exactly the annotat
 that does not fit the type it adapts to
 is rejected (`E0431`, e.g. `let x: i8 = 200;`, or `s.x = 9000000000;` for an `i32` field), not
 silently wrapped. With **no** annotation an unsuffixed integer literal defaults to `i32`, but one that
-does not fit widens to the narrowest type that holds it — `i64`, and then `u64` for a magnitude in
-`(i64::MAX, u64::MAX]` — so its value is never silently truncated
-(`tests/run/int_literal_widen.wk`); a value past `u64` is malformed (`E0431`). Use a suffix
+does not fit widens to the narrowest type that holds it — `i64`, then `u64` for a magnitude in
+`(i64::MAX, u64::MAX]`, then `i128` and `u128` — so its value is never silently truncated
+(`tests/run/int_literal_widen.wk`); a value past `u128` is malformed (`E0431`). Use a suffix
 (`9000000000i64`, `3000000000u32`) to pick a specific type.
 
 **Literal inference** (✅): a `let` with no annotation whose initializer is only unsuffixed literals
@@ -421,7 +421,20 @@ malformed literal — a mistyped radix like `0z123`, an empty `0x`, a bad digit 
 integer literal is an `i32`, or the narrowest of `i64`, `u64`, `i128`, `u128` that holds it, and
 adapts to the integer type its context asks for — where a value that does not fit that type is
 `E0431` too, at every width (`let x: u64 = 18446744073709551616` and `let y: i128 =
-170141183460469231731687303715884105728` are both rejected, `tests/fail/literal_past_u64_into_narrow.wk`). A **float literal** takes `_` separators and an optional
+170141183460469231731687303715884105728` are both rejected, `tests/fail/literal_past_u64_into_narrow.wk`),
+including each literal of an all-literal expression that adapts as a whole (`let x: u64 =
+18446744073709551616 + 5`; `tests/fail/wide_literal_arith_into_narrow.wk`) and a `char`, which
+takes a 32-bit code (`tests/fail/wide_literal_into_char.wk`). The one leniency is at 64 bits: an
+unsuffixed literal in `-2^63..=2^64 - 1` adapts to either signedness (`let m: i64 =
+0xffff_ffff_ffff_ffff` is `-1`). A **suffixed** literal does not adapt, so it must be a value of its
+own suffix type — `300u8`, `128i8`, `-5u32` and a 17-hex-digit `0x1_2345_6789_abcd_ef01u64` are
+`E0431`, never their low bits — and only under a unary minus does a signed suffix reach its minimum
+(`-128i8`, `-2147483648i32`; `tests/fail/suffixed_literal_out_of_range.wk`). A **negated**
+unsuffixed literal is typed by its value, the narrowest signed type that holds it:
+`-9223372036854775808` is the `i64` minimum, `-9223372036854775809` through
+`-170141183460469231731687303715884105728` (`i128::MIN`) are `i128`, and a magnitude past `2^127`
+fits no integer type and is `E0431` (`tests/run/i128_negated_literals.wk`,
+`tests/fail/negated_literal_past_i128.wk`). A **float literal** takes `_` separators and an optional
 exponent, and its suffix may be `f32`, `f64`, `f16`, `bf16`, or the bare C-style `f` (= `f32`);
 unsuffixed it defaults to **`f32`** (`5f`, `1.5`, `1_000.5e-3`, `0.5bf16`). A malformed one — `1.5z`,
 an incomplete exponent `1.5e`, a doubled suffix `5ff` — is `E0431`, never silently `0.0`. A
@@ -502,7 +515,9 @@ literal, and reach exactly the full ranges: `-1701411834604692317316873037158841
   exponent): `alloc_i32(2^64 + 4)` asks for `i64::MAX` elements, not 4. An explicit `as i64` still
   keeps the low 64 bits, and so does a **shift or rotate count**, which is taken modulo the width of
   the value it shifts: `x_i64 <<= n` with `n = 2^64 + 3` shifts by 3 and `rotl(x_u64, 2^64 + 1)`
-  rotates by 1, exactly as on a 32-bit value (`tests/run/i128_shift_counts.wk`).
+  rotates by 1, exactly as on a 32-bit value (`tests/run/i128_shift_counts.wk`). An array length
+  past `u64` is out of range (`E0401`), not the empty array it once read as
+  (`tests/fail/array_repeat_count_past_u64.wk`).
 - **`as`** converts to and from every integer and float type: narrowing keeps the low bits,
   widening extends by the source's signedness, an integer-to-float conversion rounds once (straight
   to `f32`, never through `f64`), and a float-to-integer one truncates and saturates, NaN to `0`

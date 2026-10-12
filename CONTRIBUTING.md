@@ -452,6 +452,11 @@ backend cannot lower), regenerate the LLVM emitter's runtime ABI table for any n
 pin every operation at both ends of the range on both backends at `-O0` and `-O2` with operands
 the optimizer cannot fold (`tests/run/i128_*.wk` take an opaque zero from `arg_count()`).
 
+Literals need the same audit once a wider one is well-formed: every place a literal can stand — a
+suffix, an all-literal expression adapting as a whole, a `char`, an array length, a unary minus —
+must range-check it against the type it lands in, or it silently keeps its low bits
+(`tests/fail/suffixed_literal_out_of_range.wk` and its siblings).
+
 ## Adding a runtime kernel (and its recognizer)
 
 A "recognized kernel" is a loop shape that `wukong_mir_build` pattern-matches and replaces with a

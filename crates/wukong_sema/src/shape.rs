@@ -1710,7 +1710,7 @@ impl Sema<'_> {
         // A literal past `i64` (a 128-bit index) is clamped to `i64`'s range, exactly as lowering
         // clamps it (`saturate_i128_to_i64`), so the check still sees it out of bounds.
         crate::eval_const_int(e, self.interner).or_else(|| {
-            let (neg, mag) = crate::wide_lit_value(e, self.interner)?;
+            let (neg, mag, _) = crate::wide_lit_value(e, self.interner)?;
             (mag > i64::MAX as u128).then_some(if neg { i64::MIN } else { i64::MAX })
         })
     }

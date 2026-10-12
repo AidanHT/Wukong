@@ -26399,7 +26399,11 @@ fn const_usize_depth(
         return None;
     }
     match &e.kind {
-        ExprKind::Int(s) => Some(u64::try_from(parse_int(interner.resolve(*s))).unwrap_or(0)),
+        // A literal past `u64` saturates, mirroring sema's `eval_usize_depth` (which then rejects
+        // the length as out of range rather than reading it as `0`).
+        ExprKind::Int(s) => {
+            Some(u64::try_from(parse_int(interner.resolve(*s))).unwrap_or(u64::MAX))
+        }
         ExprKind::Path(p) if p.is_single() => {
             let name = p.first().sym;
             let init_depth = depth + 1;
